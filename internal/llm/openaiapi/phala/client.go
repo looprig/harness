@@ -155,7 +155,7 @@ func (c *Client) Stream(ctx context.Context, req llm.Request) (*llm.StreamReader
 		return nil, &llm.APIError{Status: resp.StatusCode, Body: respBody}
 	}
 	if ct := resp.Header.Get("Content-Type"); !strings.HasPrefix(ct, "text/event-stream") {
-		resp.Body.Close()
+		defer resp.Body.Close()
 		return nil, fmt.Errorf("phala: expected text/event-stream, got %q", ct)
 	}
 
