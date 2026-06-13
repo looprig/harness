@@ -63,7 +63,6 @@ func buildBlocks(msg chatMessage) []*content.Block {
 	}
 
 	for _, tc := range msg.ToolCalls {
-		tc := tc
 		blocks = append(blocks, &content.Block{
 			Type: content.TypeToolUse,
 			ToolUse: &content.ToolUseBlock{
