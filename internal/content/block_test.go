@@ -522,6 +522,22 @@ func TestAudioBlock(t *testing.T) {
 	}
 }
 
+// FuzzToolUseBlockInput exercises ToolUseBlock.Input with arbitrary provider-supplied bytes,
+// since Input is json.RawMessage that accepts any byte sequence from an external source.
+func FuzzToolUseBlockInput(f *testing.F) {
+	f.Add([]byte(`{"query":"go"}`))
+	f.Add([]byte(`null`))
+	f.Add([]byte(`{}`))
+	f.Fuzz(func(t *testing.T, data []byte) {
+		b := content.ToolUseBlock{
+			ID:    "fuzz",
+			Name:  "fn",
+			Input: json.RawMessage(data),
+		}
+		_ = b.Input
+	})
+}
+
 // TestDocumentBlock verifies DocumentBlock fields.
 func TestDocumentBlock(t *testing.T) {
 	t.Parallel()

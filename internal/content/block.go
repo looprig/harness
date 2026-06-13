@@ -5,7 +5,6 @@ package content
 
 import "encoding/json"
 
-// BlockType identifies which payload field of a Block is populated.
 type BlockType string
 
 const (
@@ -31,7 +30,6 @@ type Block struct {
 	ToolResult *ToolResultBlock
 }
 
-// TextBlock carries plain or formatted text.
 type TextBlock struct {
 	Text string
 }
@@ -43,13 +41,11 @@ type ImageSource struct {
 	Data []byte
 }
 
-// ImageBlock carries an image with its MIME type and source.
 type ImageBlock struct {
 	MediaType string
 	Source    ImageSource
 }
 
-// AudioBlock carries audio data with its MIME type.
 type AudioBlock struct {
 	MediaType string
 	Data      []byte
@@ -71,14 +67,12 @@ type ThinkingBlock struct {
 	Signature string
 }
 
-// ToolUseBlock carries a tool invocation request from the model.
 type ToolUseBlock struct {
 	ID    string
 	Name  string
 	Input json.RawMessage
 }
 
-// ToolResultBlock carries the result of a tool invocation.
 type ToolResultBlock struct {
 	ToolUseID string
 	Content   []*Block
