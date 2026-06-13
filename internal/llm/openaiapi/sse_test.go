@@ -160,20 +160,26 @@ func TestSSEReader_IgnoresNonDataLines(t *testing.T) {
 func TestSSEReader_ScannerError(t *testing.T) {
 	t.Parallel()
 
+	errConnectionReset := errors.New("connection reset")
+	errNetworkError := errors.New("network error")
+
 	cases := []struct {
 		name    string
 		prefix  string
 		readErr error
+		wantErr error
 	}{
 		{
 			name:    "error after partial data line",
 			prefix:  "data: {\"partial",
-			readErr: errors.New("connection reset"),
+			readErr: errConnectionReset,
+			wantErr: errConnectionReset,
 		},
 		{
 			name:    "error on first read",
 			prefix:  "",
-			readErr: errors.New("network error"),
+			readErr: errNetworkError,
+			wantErr: errNetworkError,
 		},
 	}
 
@@ -187,10 +193,8 @@ func TestSSEReader_ScannerError(t *testing.T) {
 			if gotErr == nil {
 				t.Fatal("expected error, got nil")
 			}
-			// Either the scan error or io.EOF is acceptable for the empty-prefix case,
-			// but for the partial-data case the scanner error must surface.
-			if tc.prefix != "" && errors.Is(gotErr, io.EOF) {
-				t.Errorf("expected non-EOF scan error to propagate, got io.EOF")
+			if !errors.Is(gotErr, tc.wantErr) {
+				t.Errorf("expected error %v, got %v", tc.wantErr, gotErr)
 			}
 		})
 	}
