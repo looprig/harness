@@ -22,3 +22,6 @@
 .idea/
 .vscode/
 *.swp
+
+# Git worktrees
+.worktrees/
