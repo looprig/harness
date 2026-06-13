@@ -243,12 +243,16 @@ func TestEncodeRequest_Messages(t *testing.T) {
 					t.Fatalf("expected 2 parts, got %d", len(parts))
 				}
 				var typ0 string
-				json.Unmarshal(parts[0]["type"], &typ0)
+				if err := json.Unmarshal(parts[0]["type"], &typ0); err != nil {
+					t.Fatalf("failed to unmarshal parts[0].type: %v", err)
+				}
 				if typ0 != "text" {
 					t.Errorf("parts[0].type = %q, want \"text\"", typ0)
 				}
 				var typ1 string
-				json.Unmarshal(parts[1]["type"], &typ1)
+				if err := json.Unmarshal(parts[1]["type"], &typ1); err != nil {
+					t.Fatalf("failed to unmarshal parts[1].type: %v", err)
+				}
 				if typ1 != "image_url" {
 					t.Errorf("parts[1].type = %q, want \"image_url\"", typ1)
 				}
@@ -408,7 +412,9 @@ func TestEncodeRequest_Tools(t *testing.T) {
 				}
 				// Verify shape: type and function fields exist
 				var typ string
-				json.Unmarshal(tools[0]["type"], &typ)
+				if err := json.Unmarshal(tools[0]["type"], &typ); err != nil {
+					t.Fatalf("failed to unmarshal tool type: %v", err)
+				}
 				if typ != "function" {
 					t.Errorf("tool type = %q, want \"function\"", typ)
 				}
@@ -526,19 +532,29 @@ func TestEncodeRequest_ImageBlock_DataURL(t *testing.T) {
 			found := false
 			for _, p := range parts {
 				var typ string
-				json.Unmarshal(p["type"], &typ)
+				if err := json.Unmarshal(p["type"], &typ); err != nil {
+					t.Fatalf("failed to unmarshal part type: %v", err)
+				}
 				if typ != "image_url" {
 					continue
 				}
 				found = true
 				var imgURL map[string]json.RawMessage
-				json.Unmarshal(p["image_url"], &imgURL)
+				if err := json.Unmarshal(p["image_url"], &imgURL); err != nil {
+					t.Fatalf("failed to unmarshal image_url object: %v", err)
+				}
 				var urlStr string
-				json.Unmarshal(imgURL["url"], &urlStr)
+				if err := json.Unmarshal(imgURL["url"], &urlStr); err != nil {
+					t.Fatalf("failed to unmarshal url string: %v", err)
+				}
 
 				expectedPrefix := "data:" + tc.mediaType + ";base64,"
 				if len(urlStr) < len(expectedPrefix) || urlStr[:len(expectedPrefix)] != expectedPrefix {
-					t.Errorf("URL prefix = %q, want prefix %q", urlStr[:min(len(urlStr), len(expectedPrefix)+10)], expectedPrefix)
+					snippet := urlStr
+					if len(snippet) > len(expectedPrefix)+10 {
+						snippet = snippet[:len(expectedPrefix)+10]
+					}
+					t.Errorf("URL prefix = %q, want prefix %q", snippet, expectedPrefix)
 				}
 				expectedB64 := base64.StdEncoding.EncodeToString(tc.data)
 				if urlStr != expectedPrefix+expectedB64 {
@@ -616,9 +632,3 @@ func TestEncodeRequest_ValidJSON(t *testing.T) {
 	}
 }
 
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
