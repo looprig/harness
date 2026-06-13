@@ -19,10 +19,11 @@ type chatRequest struct {
 }
 
 type chatMessage struct {
-	Role       string      `json:"role"`
-	Content    interface{} `json:"content"` // string or []chatContentPart; interface{} required at JSON serialization boundary
-	ToolCalls  []toolCall  `json:"tool_calls,omitempty"`
-	ToolCallID string      `json:"tool_call_id,omitempty"`
+	Role             string      `json:"role"`
+	Content          interface{} `json:"content"` // string or []chatContentPart; interface{} required at JSON serialization boundary
+	ReasoningContent string      `json:"reasoning_content,omitempty"` // DeepSeek / o-series
+	ToolCalls        []toolCall  `json:"tool_calls,omitempty"`
+	ToolCallID       string      `json:"tool_call_id,omitempty"`
 }
 
 type chatContentPart struct {
