@@ -42,19 +42,19 @@ type ImageSource struct {
 }
 
 type ImageBlock struct {
-	MediaType string
+	MediaType MediaType
 	Source    ImageSource
 }
 
 type AudioBlock struct {
-	MediaType string
+	MediaType MediaType
 	Data      []byte
 }
 
 // DocumentBlock carries document data. Either Data (binary) or Text (extracted
 // text) may be populated depending on how the document was provided.
 type DocumentBlock struct {
-	MediaType string
+	MediaType MediaType
 	Name      string
 	Data      []byte
 	Text      string

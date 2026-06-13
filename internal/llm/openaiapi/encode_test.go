@@ -72,12 +72,12 @@ func textBlock(s string) *content.Block {
 
 func imageURLBlock(url string) *content.Block {
 	return &content.Block{Type: content.TypeImage, Image: &content.ImageBlock{
-		MediaType: "image/jpeg",
+		MediaType: content.MediaTypeImageJPEG,
 		Source:    content.ImageSource{URL: url},
 	}}
 }
 
-func imageDataBlock(mediaType string, data []byte) *content.Block {
+func imageDataBlock(mediaType content.MediaType, data []byte) *content.Block {
 	return &content.Block{Type: content.TypeImage, Image: &content.ImageBlock{
 		MediaType: mediaType,
 		Source:    content.ImageSource{Data: data},
@@ -489,17 +489,17 @@ func TestEncodeRequest_ImageBlock_DataURL(t *testing.T) {
 
 	cases := []struct {
 		name      string
-		mediaType string
+		mediaType content.MediaType
 		data      []byte
 	}{
 		{
 			name:      "PNG data becomes data URI",
-			mediaType: "image/png",
+			mediaType: content.MediaTypeImagePNG,
 			data:      []byte{0x89, 0x50, 0x4E, 0x47},
 		},
 		{
 			name:      "JPEG data becomes data URI",
-			mediaType: "image/jpeg",
+			mediaType: content.MediaTypeImageJPEG,
 			data:      []byte{0xFF, 0xD8, 0xFF},
 		},
 	}
@@ -548,7 +548,7 @@ func TestEncodeRequest_ImageBlock_DataURL(t *testing.T) {
 					t.Fatalf("failed to unmarshal url string: %v", err)
 				}
 
-				expectedPrefix := "data:" + tc.mediaType + ";base64,"
+				expectedPrefix := "data:" + string(tc.mediaType) + ";base64,"
 				if len(urlStr) < len(expectedPrefix) || urlStr[:len(expectedPrefix)] != expectedPrefix {
 					snippet := urlStr
 					if len(snippet) > len(expectedPrefix)+10 {

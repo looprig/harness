@@ -153,7 +153,7 @@ func imageURL(img *content.ImageBlock) string {
 		return img.Source.URL
 	}
 	encoded := base64.StdEncoding.EncodeToString(img.Source.Data)
-	return "data:" + img.MediaType + ";base64," + encoded
+	return "data:" + string(img.MediaType) + ";base64," + encoded
 }
 
 // encodeAIMessage builds a chatMessage from an AIMessage, handling text,

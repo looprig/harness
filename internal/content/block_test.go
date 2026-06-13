@@ -7,6 +7,49 @@ import (
 	"github.com/inventivepotter/urvi/internal/content"
 )
 
+// TestMediaTypeConstants verifies that all MediaType constants have the correct IANA MIME string values.
+func TestMediaTypeConstants(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		got  content.MediaType
+		want content.MediaType
+	}{
+		// Image
+		{name: "ImageJPEG", got: content.MediaTypeImageJPEG, want: "image/jpeg"},
+		{name: "ImagePNG", got: content.MediaTypeImagePNG, want: "image/png"},
+		{name: "ImageGIF", got: content.MediaTypeImageGIF, want: "image/gif"},
+		{name: "ImageWebP", got: content.MediaTypeImageWebP, want: "image/webp"},
+		{name: "ImageSVG", got: content.MediaTypeImageSVG, want: "image/svg+xml"},
+		// Audio
+		{name: "AudioMPEG", got: content.MediaTypeAudioMPEG, want: "audio/mpeg"},
+		{name: "AudioWAV", got: content.MediaTypeAudioWAV, want: "audio/wav"},
+		{name: "AudioOGG", got: content.MediaTypeAudioOGG, want: "audio/ogg"},
+		{name: "AudioFLAC", got: content.MediaTypeAudioFLAC, want: "audio/flac"},
+		{name: "AudioAAC", got: content.MediaTypeAudioAAC, want: "audio/aac"},
+		{name: "AudioMP4", got: content.MediaTypeAudioMP4, want: "audio/mp4"},
+		{name: "AudioWebM", got: content.MediaTypeAudioWebM, want: "audio/webm"},
+		// Document
+		{name: "DocumentPDF", got: content.MediaTypeDocumentPDF, want: "application/pdf"},
+		{name: "DocumentText", got: content.MediaTypeDocumentText, want: "text/plain"},
+		{name: "DocumentHTML", got: content.MediaTypeDocumentHTML, want: "text/html"},
+		{name: "DocumentCSV", got: content.MediaTypeDocumentCSV, want: "text/csv"},
+		{name: "DocumentMarkdown", got: content.MediaTypeDocumentMarkdown, want: "text/markdown"},
+		{name: "DocumentDOCX", got: content.MediaTypeDocumentDOCX, want: "application/vnd.openxmlformats-officedocument.wordprocessingml.document"},
+		{name: "DocumentXLSX", got: content.MediaTypeDocumentXLSX, want: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if tt.got != tt.want {
+				t.Errorf("MediaType %s = %q, want %q", tt.name, tt.got, tt.want)
+			}
+		})
+	}
+}
+
 // TestBlockTypeConstants verifies all required BlockType constants exist and have expected string values.
 func TestBlockTypeConstants(t *testing.T) {
 	t.Parallel()
@@ -60,7 +103,7 @@ func TestBlockDiscriminatedUnion(t *testing.T) {
 			name: "image block has Type and non-nil Image field",
 			block: content.Block{
 				Type:  content.TypeImage,
-				Image: &content.ImageBlock{MediaType: "image/png", Source: content.ImageSource{URL: "https://example.com/img.png"}},
+				Image: &content.ImageBlock{MediaType: content.MediaTypeImagePNG, Source: content.ImageSource{URL: "https://example.com/img.png"}},
 			},
 			wantType:   content.TypeImage,
 			wantNonNil: "Image",
@@ -69,7 +112,7 @@ func TestBlockDiscriminatedUnion(t *testing.T) {
 			name: "audio block has Type and non-nil Audio field",
 			block: content.Block{
 				Type:  content.TypeAudio,
-				Audio: &content.AudioBlock{MediaType: "audio/mp3", Data: []byte{0x01}},
+				Audio: &content.AudioBlock{MediaType: content.MediaTypeAudioMPEG, Data: []byte{0x01}},
 			},
 			wantType:   content.TypeAudio,
 			wantNonNil: "Audio",
@@ -78,7 +121,7 @@ func TestBlockDiscriminatedUnion(t *testing.T) {
 			name: "document block has Type and non-nil Document field",
 			block: content.Block{
 				Type:     content.TypeDocument,
-				Document: &content.DocumentBlock{MediaType: "application/pdf", Name: "report.pdf", Data: []byte{0x25, 0x50, 0x44, 0x46}},
+				Document: &content.DocumentBlock{MediaType: content.MediaTypeDocumentPDF, Name: "report.pdf", Data: []byte{0x25, 0x50, 0x44, 0x46}},
 			},
 			wantType:   content.TypeDocument,
 			wantNonNil: "Document",
@@ -261,20 +304,30 @@ func TestImageBlock(t *testing.T) {
 	tests := []struct {
 		name          string
 		block         content.ImageBlock
-		wantMediaType string
+		wantMediaType content.MediaType
 	}{
 		{
-			name:          "happy path with URL source",
-			block:         content.ImageBlock{MediaType: "image/png", Source: content.ImageSource{URL: "https://example.com/a.png"}},
-			wantMediaType: "image/png",
+			name:          "PNG with URL source",
+			block:         content.ImageBlock{MediaType: content.MediaTypeImagePNG, Source: content.ImageSource{URL: "https://example.com/a.png"}},
+			wantMediaType: content.MediaTypeImagePNG,
 		},
 		{
-			name:          "happy path with inline data",
-			block:         content.ImageBlock{MediaType: "image/jpeg", Source: content.ImageSource{Data: []byte{0xFF, 0xD8}}},
-			wantMediaType: "image/jpeg",
+			name:          "JPEG with inline data",
+			block:         content.ImageBlock{MediaType: content.MediaTypeImageJPEG, Source: content.ImageSource{Data: []byte{0xFF, 0xD8}}},
+			wantMediaType: content.MediaTypeImageJPEG,
 		},
 		{
-			name:          "empty MediaType",
+			name:          "WebP with URL source",
+			block:         content.ImageBlock{MediaType: content.MediaTypeImageWebP, Source: content.ImageSource{URL: "https://example.com/a.webp"}},
+			wantMediaType: content.MediaTypeImageWebP,
+		},
+		{
+			name:          "SVG with inline data",
+			block:         content.ImageBlock{MediaType: content.MediaTypeImageSVG, Source: content.ImageSource{Data: []byte("<svg/>")}},
+			wantMediaType: content.MediaTypeImageSVG,
+		},
+		{
+			name:          "empty MediaType (zero value)",
 			block:         content.ImageBlock{MediaType: "", Source: content.ImageSource{URL: "https://example.com/a.png"}},
 			wantMediaType: "",
 		},
@@ -481,26 +534,32 @@ func TestAudioBlock(t *testing.T) {
 	tests := []struct {
 		name          string
 		block         content.AudioBlock
-		wantMediaType string
+		wantMediaType content.MediaType
 		wantDataLen   int
 	}{
 		{
-			name:          "happy path",
-			block:         content.AudioBlock{MediaType: "audio/mp3", Data: []byte{0x49, 0x44, 0x33}},
-			wantMediaType: "audio/mp3",
+			name:          "MP3 (audio/mpeg) with ID3 header bytes",
+			block:         content.AudioBlock{MediaType: content.MediaTypeAudioMPEG, Data: []byte{0x49, 0x44, 0x33}},
+			wantMediaType: content.MediaTypeAudioMPEG,
 			wantDataLen:   3,
 		},
 		{
-			name:          "empty data",
-			block:         content.AudioBlock{MediaType: "audio/wav", Data: []byte{}},
-			wantMediaType: "audio/wav",
+			name:          "WAV with empty data",
+			block:         content.AudioBlock{MediaType: content.MediaTypeAudioWAV, Data: []byte{}},
+			wantMediaType: content.MediaTypeAudioWAV,
 			wantDataLen:   0,
 		},
 		{
-			name:          "nil data (zero value)",
-			block:         content.AudioBlock{MediaType: "audio/ogg"},
-			wantMediaType: "audio/ogg",
+			name:          "OGG with nil data (zero value)",
+			block:         content.AudioBlock{MediaType: content.MediaTypeAudioOGG},
+			wantMediaType: content.MediaTypeAudioOGG,
 			wantDataLen:   0,
+		},
+		{
+			name:          "FLAC",
+			block:         content.AudioBlock{MediaType: content.MediaTypeAudioFLAC, Data: []byte{0x66, 0x4C, 0x61, 0x43}},
+			wantMediaType: content.MediaTypeAudioFLAC,
+			wantDataLen:   4,
 		},
 		{
 			name:  "zero-value block",
@@ -521,6 +580,7 @@ func TestAudioBlock(t *testing.T) {
 		})
 	}
 }
+
 
 // FuzzToolUseBlockInput exercises ToolUseBlock.Input with arbitrary provider-supplied bytes,
 // since Input is json.RawMessage that accepts any byte sequence from an external source.
@@ -545,24 +605,45 @@ func TestDocumentBlock(t *testing.T) {
 	tests := []struct {
 		name          string
 		block         content.DocumentBlock
-		wantMediaType string
+		wantMediaType content.MediaType
 		wantName      string
 		wantDataLen   int
 		wantText      string
 	}{
 		{
-			name:          "happy path with binary data",
-			block:         content.DocumentBlock{MediaType: "application/pdf", Name: "report.pdf", Data: []byte{0x25, 0x50, 0x44, 0x46}},
-			wantMediaType: "application/pdf",
+			name:          "PDF with binary data",
+			block:         content.DocumentBlock{MediaType: content.MediaTypeDocumentPDF, Name: "report.pdf", Data: []byte{0x25, 0x50, 0x44, 0x46}},
+			wantMediaType: content.MediaTypeDocumentPDF,
 			wantName:      "report.pdf",
 			wantDataLen:   4,
 		},
 		{
-			name:          "document with text content",
-			block:         content.DocumentBlock{MediaType: "text/plain", Name: "notes.txt", Text: "some text content"},
-			wantMediaType: "text/plain",
+			name:          "plain text document",
+			block:         content.DocumentBlock{MediaType: content.MediaTypeDocumentText, Name: "notes.txt", Text: "some text content"},
+			wantMediaType: content.MediaTypeDocumentText,
 			wantName:      "notes.txt",
 			wantText:      "some text content",
+		},
+		{
+			name:          "markdown document",
+			block:         content.DocumentBlock{MediaType: content.MediaTypeDocumentMarkdown, Name: "readme.md", Text: "# Title"},
+			wantMediaType: content.MediaTypeDocumentMarkdown,
+			wantName:      "readme.md",
+			wantText:      "# Title",
+		},
+		{
+			name:          "DOCX binary",
+			block:         content.DocumentBlock{MediaType: content.MediaTypeDocumentDOCX, Name: "doc.docx", Data: []byte{0x50, 0x4B}},
+			wantMediaType: content.MediaTypeDocumentDOCX,
+			wantName:      "doc.docx",
+			wantDataLen:   2,
+		},
+		{
+			name:          "CSV text",
+			block:         content.DocumentBlock{MediaType: content.MediaTypeDocumentCSV, Name: "data.csv", Text: "a,b\n1,2"},
+			wantMediaType: content.MediaTypeDocumentCSV,
+			wantName:      "data.csv",
+			wantText:      "a,b\n1,2",
 		},
 		{
 			name:  "zero-value block",
