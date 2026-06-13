@@ -23,9 +23,22 @@ const (
 	ReasoningEffortHigh   ReasoningEffort = "high"
 )
 
+// Provider names the concrete backend an internal/llm/auto factory dispatches on.
+type Provider string
+
+const (
+	ProviderLMStudio Provider = "lmstudio"
+	ProviderPhala    Provider = "phala"
+	ProviderChutes   Provider = "chutes"
+)
+
 // ModelSpec identifies a model and its sampling configuration.
 // Call Validate before encoding to catch self-contradictory combinations.
 type ModelSpec struct {
+	Provider Provider
+	BaseURL  string
+	APIKey   string
+
 	Model  string
 	System string
 

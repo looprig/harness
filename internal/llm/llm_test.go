@@ -236,6 +236,22 @@ func TestTool_Schema(t *testing.T) {
 	}
 }
 
+func TestModelSpecProviderFields(t *testing.T) {
+	t.Parallel()
+	spec := llm.ModelSpec{
+		Provider: llm.ProviderLMStudio,
+		BaseURL:  "http://localhost:1234",
+		APIKey:   "sk-test",
+		Model:    "qwen",
+	}
+	if spec.Provider != llm.ProviderLMStudio {
+		t.Errorf("Provider = %q, want %q", spec.Provider, llm.ProviderLMStudio)
+	}
+	if err := spec.Validate(); err != nil {
+		t.Errorf("Validate() on a benign spec = %v, want nil", err)
+	}
+}
+
 func TestUsage(t *testing.T) {
 	t.Parallel()
 
