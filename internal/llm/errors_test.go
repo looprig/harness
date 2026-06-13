@@ -80,6 +80,17 @@ func TestNetworkError(t *testing.T) {
 	})
 }
 
+func TestNetworkError_NilErrPanics(t *testing.T) {
+	t.Parallel()
+	defer func() {
+		if r := recover(); r == nil {
+			t.Error("expected panic on NetworkError{Err: nil}.Error(), got none")
+		}
+	}()
+	e := &llm.NetworkError{Err: nil}
+	_ = e.Error() // must panic
+}
+
 func TestAPIError(t *testing.T) {
 	t.Parallel()
 
