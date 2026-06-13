@@ -116,7 +116,10 @@ func (c *Client) doStream(ctx context.Context, body []byte) (*http.Response, err
 	}
 	if httpResp.StatusCode/100 != 2 {
 		defer httpResp.Body.Close()
-		b, _ := io.ReadAll(httpResp.Body)
+		b, readErr := io.ReadAll(httpResp.Body)
+		if readErr != nil {
+			return nil, &llm.NetworkError{Err: fmt.Errorf("reading error body (status %d): %w", httpResp.StatusCode, readErr)}
+		}
 		return nil, &llm.APIError{Status: httpResp.StatusCode, Message: fmt.Sprintf("lmstudio stream: %s", b), Body: b}
 	}
 	return httpResp, nil
