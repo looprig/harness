@@ -442,13 +442,23 @@ package loop
 // actor through the `!ok` path, skipping terminal delivery and shutdown acks.)
 // Done is closed when the actor has fully exited.
 // Direct callers must honor the command contracts, including non-nil reply
-// channels and non-nil Abandoned channels for StartTurn.
+// channels and non-nil Abandoned channels for StartTurn. Reply channels (the
+// Ack on each command) must be buffered (capacity >= 1) or always read promptly:
+// the actor sends acks synchronously, so a blocked ack send would stall the actor.
 type Loop struct {
     Commands chan<- Command
     Done     <-chan struct{}
 }
 
 const defaultDrainTimeout = 5 * time.Second
+
+// resolveDrainTimeout applies the default when the caller leaves DrainTimeout unset.
+func resolveDrainTimeout(d time.Duration) time.Duration {
+    if d <= 0 {
+        return defaultDrainTimeout
+    }
+    return d
+}
 
 func New(ctx context.Context, sessionID uuid.UUID, cfg Config) (*Loop, error) {
     if cfg.Client == nil {
@@ -457,9 +467,7 @@ func New(ctx context.Context, sessionID uuid.UUID, cfg Config) (*Loop, error) {
     if err := cfg.Model.Validate(); err != nil {
         return nil, &ConfigError{Kind: ConfigInvalidModel, Cause: err}
     }
-    if cfg.DrainTimeout <= 0 {
-        cfg.DrainTimeout = defaultDrainTimeout
-    }
+    cfg.DrainTimeout = resolveDrainTimeout(cfg.DrainTimeout)
     commands := make(chan Command)
     done     := make(chan struct{})
     go listen(ctx, sessionID, cfg, commands, done)
@@ -923,13 +931,24 @@ func (s *AgentSession) Invoke(ctx context.Context, input []*content.Block) (loop
         return nil, err
     }
 
-    for ev := range events {
-        switch ev.(type) {
-        case loop.TurnDone, loop.TurnFailed, loop.TurnInterrupted:
-            return ev, nil
+    for {
+        select {
+        case ev, ok := <-events:
+            if !ok {
+                return nil, &SessionError{Kind: SessionEventChannelClosed}
+            }
+            switch ev.(type) {
+            case loop.TurnDone, loop.TurnFailed, loop.TurnInterrupted:
+                return ev, nil
+            }
+        case <-s.loop.Done:
+            // Hard loop kill: on a DrainTimeout detach the actor never closes
+            // `events`, so without this escape Invoke would block forever (the
+            // same hazard the Stream reader's loop.Done case guards). The loop is
+            // gone, so no terminal can arrive.
+            return nil, &SessionError{Kind: SessionLoopExited}
         }
     }
-    return nil, &SessionError{Kind: SessionEventChannelClosed}
 }
 
 // Stream sends input and returns a StreamReader[loop.Event] that yields
@@ -969,11 +988,20 @@ func (s *AgentSession) Stream(ctx context.Context, input []*content.Block) (*llm
 
     return llm.NewStreamReader(
         func() (loop.Event, error) {
-            ev, ok := <-events
-            if !ok {
+            // The loop.Done case rescues a reader parked here if the loop is
+            // hard-killed mid-turn: on a DrainTimeout detach the actor never
+            // closes `events`, so without this escape a consumer would block
+            // until the hung provider returned (or forever). When the loop
+            // exits, no further events can arrive, so EOF is the correct signal.
+            select {
+            case ev, ok := <-events:
+                if !ok {
+                    return nil, io.EOF
+                }
+                return ev, nil
+            case <-s.loop.Done:
                 return nil, io.EOF
             }
-            return ev, nil
         },
         func() error {
             streamCancel()
