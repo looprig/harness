@@ -1,6 +1,7 @@
 package phala_test
 
 import (
+	"context"
 	"errors"
 	"testing"
 
@@ -53,9 +54,8 @@ func TestClient_ValidateCalledOnInvoke(t *testing.T) {
 				},
 			}
 
-			// Use nil context: if Validate() passes and the method tries
-			// to use ctx, it panics — proving short-circuit on error.
-			_, err := c.Invoke(nil, req) //nolint:staticcheck
+			// Validate() must short-circuit before any ctx use.
+			_, err := c.Invoke(context.Background(), req)
 			if tt.wantErr {
 				if err == nil {
 					t.Fatal("expected ValidationError, got nil")
@@ -111,9 +111,8 @@ func TestClient_Stream_ValidateCalledFirst(t *testing.T) {
 				},
 			}
 
-			// Use nil context: if Validate() passes and the method tries
-			// to use ctx, it panics — proving short-circuit on error.
-			_, err := c.Stream(nil, req) //nolint:staticcheck
+			// Validate() must short-circuit before any ctx use.
+			_, err := c.Stream(context.Background(), req)
 			if tt.wantErr {
 				if err == nil {
 					t.Fatal("expected ValidationError, got nil")

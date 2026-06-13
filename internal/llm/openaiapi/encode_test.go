@@ -10,9 +10,6 @@ import (
 	"github.com/inventivepotter/urvi/internal/llm/openaiapi"
 )
 
-// ptr returns a pointer to v, used for optional fields.
-func ptr[T any](v T) *T { return &v }
-
 // mustDecode unmarshals raw JSON into a map for field inspection.
 func mustDecode(t *testing.T, data []byte) map[string]json.RawMessage {
 	t.Helper()

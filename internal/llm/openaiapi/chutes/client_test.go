@@ -78,9 +78,8 @@ func TestClient_ValidateCalledOnInvoke(t *testing.T) {
 			}
 
 			if tt.wantErr {
-				// Use nil context: if Validate() passes and the method tries
-				// to use ctx, it panics — proving short-circuit on error.
-				_, err := c.Invoke(nil, req) //nolint:staticcheck
+				// Validate() must short-circuit before any ctx use.
+				_, err := c.Invoke(context.Background(), req)
 				if err == nil {
 					t.Fatal("Invoke() returned nil error, want ValidationError")
 				}
@@ -157,7 +156,7 @@ func TestClient_ValidateCalledOnStream(t *testing.T) {
 			}
 
 			if tt.wantErr {
-				_, err := c.Stream(nil, req) //nolint:staticcheck
+				_, err := c.Stream(context.Background(), req)
 				if err == nil {
 					t.Fatal("Stream() returned nil error, want ValidationError")
 				}
@@ -301,12 +300,6 @@ func (e *testEnclave) handler(t *testing.T, chuteID, model string) http.Handler 
 	return mux
 }
 
-func (e *testEnclave) counts() (models, instances, invoke int) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	return e.modelsHits, e.instancesHits, e.invokeHits
-}
-
 func invokeReq(model string) llm.Request {
 	return llm.Request{
 		Model: llm.ModelSpec{Model: model},
@@ -441,7 +434,7 @@ func TestClientInvoke_ValidateShortCircuit(t *testing.T) {
 			}
 
 			if tt.wantErr {
-				_, err := c.Invoke(nil, req) //nolint:staticcheck
+				_, err := c.Invoke(context.Background(), req)
 				if err == nil {
 					t.Fatal("Invoke() want error, got nil")
 				}
@@ -516,7 +509,7 @@ func TestClientStream_ValidateShortCircuit(t *testing.T) {
 			}
 
 			if tt.wantErr {
-				_, err := c.Stream(nil, req) //nolint:staticcheck
+				_, err := c.Stream(context.Background(), req)
 				if err == nil {
 					t.Fatal("Stream() want error, got nil")
 				}
