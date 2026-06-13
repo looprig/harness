@@ -24,27 +24,22 @@ func TestChunkTypeConstants(t *testing.T) {
 			got:      content.ChunkTypeThinking,
 			expected: "thinking_delta",
 		},
-		{
-			name:     "constants are distinct",
-			got:      content.ChunkTypeText,
-			expected: content.ChunkTypeThinking,
-		},
 	}
 
-	for i, tt := range tests {
+	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			// Last case intentionally tests inequality — skip equality check.
-			if i == 2 {
-				if tt.got == tt.expected {
-					t.Errorf("ChunkTypeText and ChunkTypeThinking must be distinct, both equal %q", tt.got)
-				}
-				return
-			}
 			if tt.got != tt.expected {
 				t.Errorf("got %q, want %q", tt.got, tt.expected)
 			}
 		})
+	}
+}
+
+func TestChunkTypeConstants_Distinct(t *testing.T) {
+	t.Parallel()
+	if content.ChunkTypeText == content.ChunkTypeThinking {
+		t.Errorf("ChunkTypeText and ChunkTypeThinking must be distinct, both equal %q", content.ChunkTypeText)
 	}
 }
 

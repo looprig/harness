@@ -1,6 +1,5 @@
 package content
 
-// ChunkType discriminates which payload field of a Chunk is populated.
 type ChunkType string
 
 const (
