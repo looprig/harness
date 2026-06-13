@@ -41,6 +41,7 @@
 - `golang.org/x/vuln/cmd/govulncheck` — official Go vulnerability scanner (dev/tool only)
 - `honnef.co/go/tools/cmd/staticcheck` — extended static analysis (dev/tool only)
 - `github.com/google/go-tdx-guest` — Intel TDX quote parsing and verification; required by internal/llm/tee for phala and chutes TEE attestation
+- `golang.org/x/crypto` — ChaCha20-Poly1305 AEAD; required by internal/llm/e2e for ML-KEM E2E envelope (stdlib has no chacha20poly1305)
 
 ## Secure Coding Patterns
 
