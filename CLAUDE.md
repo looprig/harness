@@ -38,6 +38,42 @@
 
 <!-- Approved external packages -->
 - `github.com/securego/gosec/v2` — security static analysis tool (dev/tool only)
+- `golang.org/x/vuln/cmd/govulncheck` — official Go vulnerability scanner (dev/tool only)
+- `honnef.co/go/tools/cmd/staticcheck` — extended static analysis (dev/tool only)
+
+## Secure Coding Patterns
+
+**Randomness** — Use `crypto/rand` for anything security-sensitive (tokens, nonces, IDs). Never use `math/rand` for secrets.
+
+**Queries** — Always use parameterized queries via `database/sql`. Never format SQL with `fmt.Sprintf` or string concatenation.
+
+**HTTP server** — Always set explicit timeouts. No naked `http.ListenAndServe` with default server:
+```go
+srv := &http.Server{
+    ReadTimeout:    5 * time.Second,
+    WriteTimeout:   10 * time.Second,
+    IdleTimeout:    60 * time.Second,
+    MaxHeaderBytes: 1 << 20,
+}
+```
+
+**TLS** — Never set `InsecureSkipVerify: true`. Never use TLS versions below 1.2. Default to `tls.Config{MinVersion: tls.VersionTLS12}`.
+
+**Context** — Every I/O call (HTTP, DB, file, external service) must use a `context.Context` with a timeout or deadline. No unbounded blocking.
+
+**Shell commands** — Never pass user input to `exec.Command` as a shell string. Always pass args as separate parameters.
+
+**File paths** — Always call `filepath.Clean` and verify the result stays within the expected root before opening files from user-supplied paths.
+
+## Build & Testing Requirements
+
+**Build** — Always build with `CGO_ENABLED=0 go build -trimpath`. Never ship a binary without `-trimpath` (leaks local paths).
+
+**Tests** — Always run with `-race`: `go test -race ./...`. A test that passes without `-race` but not with it is not passing.
+
+**Fuzzing** — For any function that parses external input, write a fuzz target: `go test -fuzz=FuzzXxx ./pkg -fuzztime=30s`.
+
+**Security checks** — Run `make secure` before every commit. It runs `lint` (vet + staticcheck + gosec) and `vuln` (go mod verify + govulncheck).
 
 ## Code Rules
 
