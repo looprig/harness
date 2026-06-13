@@ -116,6 +116,7 @@ func TestFoo(t *testing.T) {
 - **Strict typing everywhere.** Never use `any` or `interface{}` except at explicit serialization boundaries (JSON unmarshal, plugin APIs). Immediately narrow to a concrete type; never pass `any` deeper into business logic. No untyped magic numbers or strings — use named constants or typed enums. Prefer named types (`type UserID string`) over bare primitives when the value has domain meaning.
 - All domain concepts are typed structs — no `map[string]interface{}` for domain data.
 - Return errors explicitly; never swallow them with `_`.
+- **All errors must be typed.** Define a concrete error struct for every distinct failure mode. Never return `errors.New("...")` or `fmt.Errorf("...")` from package-level APIs — those lose type identity at the call site. Callers must be able to `errors.As` to the concrete type to inspect cause and context. Sentinel errors (`var ErrFoo = errors.New(...)`) are permitted only for leaf errors with no additional context fields.
 - Keep packages shallow and cohesive; avoid circular imports.
 - Write the interface first, then the implementation.
 - If a function exceeds ~30 lines, ask whether it violates SRP before adding more.

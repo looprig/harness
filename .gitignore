@@ -25,3 +25,6 @@
 
 # Git worktrees
 .worktrees/
+
+# Claude Code project settings
+.claude/
