@@ -6,6 +6,9 @@ import (
 	"github.com/inventivepotter/urvi/internal/content"
 )
 
+// Command is a request to the loop actor. Every command's Ack channel must be
+// buffered (capacity >= 1) or always read: the actor sends acks synchronously, so
+// a blocked ack send would stall the actor.
 type Command interface{ isCommand() }
 
 // StartTurn begins a new LLM turn. Ack receives nil on acceptance, a

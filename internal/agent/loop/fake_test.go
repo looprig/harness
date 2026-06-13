@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"sync"
 
 	"github.com/inventivepotter/urvi/internal/content"
 	"github.com/inventivepotter/urvi/internal/llm"
@@ -50,4 +51,45 @@ func (f *fakeLLM) Stream(ctx context.Context, req llm.Request) (*llm.StreamReade
 		return content.Chunk{}, io.EOF
 	}
 	return llm.NewStreamReader(next, nil), nil
+}
+
+// recordingLLM records each request it receives, then streams a fixed response.
+type recordingLLM struct {
+	mu     sync.Mutex
+	reqs   []llm.Request
+	chunks []content.Chunk
+}
+
+func (r *recordingLLM) Invoke(ctx context.Context, req llm.Request) (*llm.Response, error) {
+	return nil, errors.New("recordingLLM.Invoke not used")
+}
+func (r *recordingLLM) Stream(ctx context.Context, req llm.Request) (*llm.StreamReader[content.Chunk], error) {
+	r.mu.Lock()
+	r.reqs = append(r.reqs, req)
+	r.mu.Unlock()
+	i := 0
+	next := func() (content.Chunk, error) {
+		if i < len(r.chunks) {
+			c := r.chunks[i]
+			i++
+			return c, nil
+		}
+		return content.Chunk{}, io.EOF
+	}
+	return llm.NewStreamReader(next, nil), nil
+}
+func (r *recordingLLM) lastReq() llm.Request {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.reqs[len(r.reqs)-1]
+}
+
+// panicLLM panics inside Stream.
+type panicLLM struct{}
+
+func (panicLLM) Invoke(ctx context.Context, req llm.Request) (*llm.Response, error) {
+	return nil, errors.New("unused")
+}
+func (panicLLM) Stream(ctx context.Context, req llm.Request) (*llm.StreamReader[content.Chunk], error) {
+	panic("boom in Stream")
 }
