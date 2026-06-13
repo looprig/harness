@@ -37,7 +37,7 @@
 **Amend this file when approved.** Once a package is approved, add it here so future sessions know it is sanctioned:
 
 <!-- Approved external packages -->
-<!-- (none yet) -->
+- `github.com/securego/gosec/v2` — security static analysis tool (dev/tool only)
 
 ## Code Rules
 
