@@ -1,8 +1,11 @@
 package llm_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"log/slog"
+	"strings"
 	"testing"
 
 	"github.com/inventivepotter/urvi/internal/content"
@@ -238,17 +241,95 @@ func TestTool_Schema(t *testing.T) {
 
 func TestModelSpecProviderFields(t *testing.T) {
 	t.Parallel()
-	spec := llm.ModelSpec{
-		Provider: llm.ProviderLMStudio,
-		BaseURL:  "http://localhost:1234",
-		APIKey:   "sk-test",
-		Model:    "qwen",
+
+	cases := []struct {
+		name     string
+		provider llm.Provider
+		want     string
+	}{
+		{name: "lmstudio", provider: llm.ProviderLMStudio, want: "lmstudio"},
+		{name: "phala", provider: llm.ProviderPhala, want: "phala"},
+		{name: "chutes", provider: llm.ProviderChutes, want: "chutes"},
 	}
-	if spec.Provider != llm.ProviderLMStudio {
-		t.Errorf("Provider = %q, want %q", spec.Provider, llm.ProviderLMStudio)
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if string(tc.provider) != tc.want {
+				t.Errorf("Provider = %q, want %q", tc.provider, tc.want)
+			}
+			spec := llm.ModelSpec{
+				Provider: tc.provider,
+				BaseURL:  "http://localhost:1234",
+				APIKey:   "sk-test",
+				Model:    "qwen",
+			}
+			if err := spec.Validate(); err != nil {
+				t.Errorf("Validate() on a benign spec = %v, want nil", err)
+			}
+		})
 	}
-	if err := spec.Validate(); err != nil {
-		t.Errorf("Validate() on a benign spec = %v, want nil", err)
+
+	// Distinctness check: a copy-paste collision between two provider
+	// constants would make auto.New dispatch to the wrong backend.
+	// Done outside parallel subtests to avoid a shared-map data race.
+	t.Run("all_distinct", func(t *testing.T) {
+		t.Parallel()
+		all := []llm.Provider{llm.ProviderLMStudio, llm.ProviderPhala, llm.ProviderChutes}
+		seen := make(map[llm.Provider]bool, len(all))
+		for _, p := range all {
+			if seen[p] {
+				t.Errorf("duplicate Provider value: %q", p)
+			}
+			seen[p] = true
+		}
+	})
+}
+
+func TestModelSpec_Redaction(t *testing.T) {
+	t.Parallel()
+
+	const secret = "sk-supersecret"
+
+	cases := []struct {
+		name          string
+		apiKey        string
+		wantRedacted  bool // String()/log must contain "[REDACTED]" / "REDACTED"
+		wantSecretOut bool // never true; documents the security invariant
+	}{
+		{name: "non-empty key is redacted", apiKey: secret, wantRedacted: true},
+		{name: "empty key has no redaction marker", apiKey: "", wantRedacted: false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			spec := llm.ModelSpec{
+				Provider: llm.ProviderChutes,
+				BaseURL:  "http://x",
+				APIKey:   tc.apiKey,
+				Model:    "m",
+			}
+
+			got := spec.String()
+			if strings.Contains(got, secret) {
+				t.Errorf("String() leaked secret: %q", got)
+			}
+			if strings.Contains(got, "[REDACTED]") != tc.wantRedacted {
+				t.Errorf("String() = %q, wantRedacted %v", got, tc.wantRedacted)
+			}
+
+			var buf bytes.Buffer
+			logger := slog.New(slog.NewTextHandler(&buf, nil))
+			logger.Info("x", "spec", spec)
+			logged := buf.String()
+			if strings.Contains(logged, secret) {
+				t.Errorf("slog output leaked secret: %q", logged)
+			}
+			if strings.Contains(logged, "REDACTED") != tc.wantRedacted {
+				t.Errorf("slog output = %q, want REDACTED present=%v", logged, tc.wantRedacted)
+			}
+		})
 	}
 }
 

@@ -3,6 +3,8 @@ package llm
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"log/slog"
 
 	"github.com/inventivepotter/urvi/internal/content"
 )
@@ -24,6 +26,7 @@ const (
 )
 
 // Provider names the concrete backend an internal/llm/auto factory dispatches on.
+// Unknown values are rejected by auto.New, not Validate.
 type Provider string
 
 const (
@@ -71,6 +74,32 @@ func (s ModelSpec) Validate() error {
 		return &ValidationError{Field: "ReasoningEffort", Reason: "must be low, medium, or high"}
 	}
 	return nil
+}
+
+// redactKey returns "" for an empty key and "[REDACTED]" for any non-empty key,
+// so the raw APIKey never reaches a log line or formatted string.
+func redactKey(k string) string {
+	if k == "" {
+		return ""
+	}
+	return "[REDACTED]"
+}
+
+// LogValue implements slog.LogValuer so structured logging emits a compact,
+// secret-free summary of the spec. The APIKey is never logged in the clear.
+func (s ModelSpec) LogValue() slog.Value {
+	return slog.GroupValue(
+		slog.String("provider", string(s.Provider)),
+		slog.String("baseURL", s.BaseURL),
+		slog.String("model", s.Model),
+		slog.String("apiKey", redactKey(s.APIKey)),
+	)
+}
+
+// String implements fmt.Stringer so %v, %+v, and %s never expose the APIKey.
+func (s ModelSpec) String() string {
+	return fmt.Sprintf("ModelSpec{Provider:%s BaseURL:%s APIKey:%s Model:%s}",
+		s.Provider, s.BaseURL, redactKey(s.APIKey), s.Model)
 }
 
 // Request is the provider-neutral inference request.
