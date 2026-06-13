@@ -20,6 +20,7 @@ Single source of truth for all content types. Both the agent loop and the LLM la
 ### Blocks (complete, non-streaming)
 
 ```go
+// Block is a discriminated union: exactly one pointer field is non-nil; Type identifies which.
 type Block struct {
     Type       BlockType
     Text       *TextBlock
@@ -47,10 +48,15 @@ type TextBlock struct {
     Text string
 }
 
+// ImageSource is a sum type: set exactly one field.
+type ImageSource struct {
+    URL  string // non-empty → remote reference
+    Data []byte // non-nil  → inline bytes (e.g. base64-decoded PNG)
+}
+
 type ImageBlock struct {
     MediaType string
-    URL       string // mutually exclusive with Data
-    Data      []byte // mutually exclusive with URL
+    Source    ImageSource
 }
 
 type AudioBlock struct {
@@ -67,7 +73,7 @@ type DocumentBlock struct {
 
 type ThinkingBlock struct {
     Thinking  string
-    Signature string // Anthropic end-of-thinking marker; empty on partial/in-progress
+    Signature string // end-of-stream attestation marker; empty until the provider signals completion
 }
 
 type ToolUseBlock struct {
@@ -135,7 +141,7 @@ type AIMessage     struct{ Message }
 type SystemMessage struct{ Message }
 type ToolMessage   struct {
     Message
-    ToolCallID string
+    ToolUseID string
 }
 
 func (*UserMessage) isMessage()   {}
@@ -154,7 +160,7 @@ type AgenticMessages []Conversation
 
 ```
 internal/content/
-  block.go    — Block, BlockType, all *Block subtypes
+  block.go    — Block, BlockType, ImageSource, all *Block subtypes
   chunk.go    — Chunk, ChunkType, TextChunk, ThinkingChunk
   message.go  — Role, Message, UserMessage, AIMessage, SystemMessage, ToolMessage,
                  Conversation, AgenticMessages
@@ -177,7 +183,18 @@ type LLM interface {
     Stream(ctx context.Context, req Request) (*StreamReader[content.Chunk], error)
 }
 
+// ReasoningEffort selects o-series inference intensity. Zero value = disabled.
+// Silently ignored by providers that do not support it.
+type ReasoningEffort string
+
+const (
+    ReasoningEffortLow    ReasoningEffort = "low"
+    ReasoningEffortMedium ReasoningEffort = "medium"
+    ReasoningEffortHigh   ReasoningEffort = "high"
+)
+
 // ModelSpec identifies a model and its sampling configuration.
+// Call Validate before encoding to catch self-contradictory combinations.
 type ModelSpec struct {
     Model  string
     System string // system prompt
@@ -187,25 +204,22 @@ type ModelSpec struct {
     MaxTokens      *int
     Stop           []string
 
-    // ThinkingBudget enables Anthropic extended thinking (budget_tokens).
-    // When >0, Temperature must be exactly 1.0.
+    // ThinkingBudget enables extended thinking (budget_tokens).
+    // When >0, Temperature must be exactly 1.0; Validate enforces this.
     ThinkingBudget int
 
-    // ReasoningEffort selects OpenAI o-series intensity: "low", "medium", "high".
-    // Empty = disabled. Silently ignored by providers that do not support it.
-    ReasoningEffort string
-
-    // Extra carries provider-specific knobs not modelled above.
-    // Adapters read only the keys they understand; unknown keys are silently ignored.
-    Extra map[string]any
+    ReasoningEffort ReasoningEffort
 }
+
+// Validate returns an error if the spec contains self-contradictory values.
+// Every provider must call this at the top of Invoke and Stream before encoding.
+func (s ModelSpec) Validate() error { ... }
 
 // Request is the provider-neutral inference request.
 type Request struct {
     Model    ModelSpec
     Messages content.AgenticMessages
     Tools    []Tool
-    Stream   bool
 }
 
 // Response is the complete provider-neutral response.
@@ -233,7 +247,7 @@ type Usage struct {
 
 ```
 internal/llm/
-  llm.go        — LLM interface, Request, Response, ModelSpec, Tool, Usage
+  llm.go        — LLM interface, Request, Response, ModelSpec, ReasoningEffort, Tool, Usage
   stream.go     — StreamReader[T any]
   errors.go     — NetworkError, APIError, ValidationError, AttestationError
 
@@ -298,6 +312,6 @@ No provider subpackage may import another provider subpackage.
 
 - Anthropic native API provider (Anthropic SDK) — separate provider if needed later
 - Fallback/retry across providers — caller's responsibility via `llm.LLM` wrapping
-- Prompt caching (`CacheControl`) — added to `ModelSpec.Extra` until a provider needs it natively
+- Prompt caching (`CacheControl`) — deferred; add a typed field to `ModelSpec` when a provider requires it natively
 - Audio/video streaming chunks — `AudioChunk` added when a provider supports it
 - `ToolMessage` encoding for providers that fold tool results into user turns (Anthropic) — handled inside each provider's `encode.go`

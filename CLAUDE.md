@@ -77,6 +77,7 @@ srv := &http.Server{
 
 ## Code Rules
 
+- **Strict typing everywhere.** Never use `any` or `interface{}` except at explicit serialization boundaries (JSON unmarshal, plugin APIs). Immediately narrow to a concrete type; never pass `any` deeper into business logic. No untyped magic numbers or strings — use named constants or typed enums. Prefer named types (`type UserID string`) over bare primitives when the value has domain meaning.
 - All domain concepts are typed structs — no `map[string]interface{}` for domain data.
 - Return errors explicitly; never swallow them with `_`.
 - Keep packages shallow and cohesive; avoid circular imports.
