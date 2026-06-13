@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"time"
 
 	"github.com/inventivepotter/urvi/internal/content"
 	"github.com/inventivepotter/urvi/internal/llm"
@@ -51,7 +52,12 @@ func newCaptureStream(
 		}
 		responseHash := sha256Hex(raw)
 
-		receiptBody, err := fetchReceipt(context.Background(), client.http, client.apiBase, client.apiKey, chatID, model)
+		// Receipt fetch is independent of the caller's streaming context
+		// (which is already exhausted). Use a dedicated timeout so this
+		// I/O call is never unbounded.
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		receiptBody, err := fetchReceipt(ctx, client.http, client.apiBase, client.apiKey, chatID, model)
 		if err != nil {
 			client.evict(model)
 			return err

@@ -3,8 +3,10 @@ package openaiapi
 
 import "encoding/json"
 
-// chatRequest is the OpenAI chat completions wire request.
-type chatRequest struct {
+// ChatRequest is the OpenAI chat completions wire request. Exported so
+// provider packages can embed it in a typed extension struct (e.g. chutes adds
+// e2e_response_pk) without round-tripping through map[string]json.RawMessage.
+type ChatRequest struct {
 	Model       string        `json:"model"`
 	Messages    []chatMessage `json:"messages"`
 	Tools       []chatTool    `json:"tools,omitempty"`

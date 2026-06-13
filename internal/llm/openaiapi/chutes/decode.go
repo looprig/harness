@@ -107,11 +107,22 @@ func synthesizeOpaqueDetail(body []byte) []byte {
 	return out
 }
 
+// maxDumpBodySize caps how much of an undecryptable body we write to disk.
+// Prevents an adversarially large response from filling the temp filesystem.
+const maxDumpBodySize = 1 << 20 // 1 MiB
+
 // dumpUndecryptableBody persists a body we couldn't decrypt to a unique temp
 // file and logs the location. Cheap forensics: lets a maintainer compare the
 // real wire format against our assumed envelope. Best-effort; any IO failure
 // is silently ignored (we still surface the raw body to the caller).
 func dumpUndecryptableBody(body []byte) {
+	if len(body) > maxDumpBodySize {
+		slog.Warn("chutes: error body decryption failed; body too large to dump",
+			"size", len(body),
+			"limit", maxDumpBodySize,
+		)
+		return
+	}
 	f, err := os.CreateTemp("", "chutes-undecryptable-*.bin")
 	if err != nil {
 		return

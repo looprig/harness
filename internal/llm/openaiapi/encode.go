@@ -10,11 +10,11 @@ import (
 	"github.com/inventivepotter/urvi/internal/llm"
 )
 
-// EncodeRequest converts a provider-neutral llm.Request to an OpenAI chat
-// completions JSON body. stream=true adds "stream":true to the body.
-// ModelSpec.System is prepended as a system message if non-empty.
-func EncodeRequest(req llm.Request, stream bool) ([]byte, error) {
-	cr := chatRequest{
+// BuildChatRequest converts a provider-neutral llm.Request into a ChatRequest
+// struct. Exported so provider packages can embed or extend the result before
+// marshaling (e.g. chutes adds e2e_response_pk as a typed field).
+func BuildChatRequest(req llm.Request, stream bool) (ChatRequest, error) {
+	cr := ChatRequest{
 		Model:           req.Model.Model,
 		Temperature:     req.Model.Temperature,
 		TopP:            req.Model.TopP,
@@ -34,7 +34,7 @@ func EncodeRequest(req llm.Request, stream bool) ([]byte, error) {
 	for _, conv := range req.Messages {
 		msgs, err := encodeConversation(conv)
 		if err != nil {
-			return nil, err
+			return ChatRequest{}, err
 		}
 		cr.Messages = append(cr.Messages, msgs...)
 	}
@@ -50,6 +50,17 @@ func EncodeRequest(req llm.Request, stream bool) ([]byte, error) {
 		})
 	}
 
+	return cr, nil
+}
+
+// EncodeRequest converts a provider-neutral llm.Request to an OpenAI chat
+// completions JSON body. stream=true adds "stream":true to the body.
+// ModelSpec.System is prepended as a system message if non-empty.
+func EncodeRequest(req llm.Request, stream bool) ([]byte, error) {
+	cr, err := BuildChatRequest(req, stream)
+	if err != nil {
+		return nil, err
+	}
 	return json.Marshal(cr)
 }
 
