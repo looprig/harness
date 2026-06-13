@@ -40,6 +40,7 @@
 - `github.com/securego/gosec/v2` — security static analysis tool (dev/tool only)
 - `golang.org/x/vuln/cmd/govulncheck` — official Go vulnerability scanner (dev/tool only)
 - `honnef.co/go/tools/cmd/staticcheck` — extended static analysis (dev/tool only)
+- `github.com/google/go-tdx-guest` — Intel TDX quote parsing and verification; required by internal/llm/tee for phala and chutes TEE attestation
 
 ## Secure Coding Patterns
 
@@ -70,6 +71,41 @@ srv := &http.Server{
 **Build** — Always build with `CGO_ENABLED=0 go build -trimpath`. Never ship a binary without `-trimpath` (leaks local paths).
 
 **Tests** — Always run with `-race`: `go test -race ./...`. A test that passes without `-race` but not with it is not passing.
+
+**Table-driven tests (mandatory).** Every test function uses a `[]struct{ name string; ... }` table. Each table must cover:
+- Happy path (valid, expected input → expected output)
+- Boundary values (zero, empty, max, minimum valid)
+- Error cases (invalid input, missing required fields, wrong types)
+- Edge cases specific to the domain (e.g. nil blocks, empty message threads, unknown block types)
+
+```go
+func TestFoo(t *testing.T) {
+    tests := []struct {
+        name    string
+        input   Bar
+        want    Baz
+        wantErr bool
+    }{
+        {name: "happy path", ...},
+        {name: "empty input", ...},
+        {name: "nil field returns error", ..., wantErr: true},
+    }
+    for _, tt := range tests {
+        t.Run(tt.name, func(t *testing.T) {
+            t.Parallel()
+            got, err := Foo(tt.input)
+            if (err != nil) != tt.wantErr {
+                t.Fatalf("Foo() error = %v, wantErr %v", err, tt.wantErr)
+            }
+            if !tt.wantErr && got != tt.want {
+                t.Errorf("Foo() = %v, want %v", got, tt.want)
+            }
+        })
+    }
+}
+```
+
+**Integration tests** — Write integration tests (tagged `//go:build integration`) for any code that crosses a process boundary: HTTP providers, database queries, filesystem operations, TEE attestation. Integration tests live in `*_integration_test.go` files and are excluded from the default `go test ./...` run. Run them explicitly with `go test -tags integration -race ./...`.
 
 **Fuzzing** — For any function that parses external input, write a fuzz target: `go test -fuzz=FuzzXxx ./pkg -fuzztime=30s`.
 
