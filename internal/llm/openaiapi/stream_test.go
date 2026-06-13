@@ -21,19 +21,6 @@ func (c *closerSpy) Close() error {
 	return nil
 }
 
-// sseBody builds a minimal SSE stream string from the given data payloads,
-// terminating with "data: [DONE]".
-func sseBody(payloads ...string) io.ReadCloser {
-	var sb strings.Builder
-	for _, p := range payloads {
-		sb.WriteString("data: ")
-		sb.WriteString(p)
-		sb.WriteString("\n")
-	}
-	sb.WriteString("data: [DONE]\n")
-	return io.NopCloser(strings.NewReader(sb.String()))
-}
-
 func TestNewStream_TextChunks(t *testing.T) {
 	t.Parallel()
 
