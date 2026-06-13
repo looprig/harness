@@ -1,6 +1,6 @@
 module github.com/inventivepotter/urvi
 
-go 1.26.1
+go 1.26.4
 
 tool (
 	github.com/securego/gosec/v2/cmd/gosec
