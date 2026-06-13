@@ -150,6 +150,16 @@ func TestToolMessage_Fields(t *testing.T) {
 			wantToolUseID: "tu_2",
 			wantBlockLen:  0,
 		},
+		{
+			name: "empty ToolUseID",
+			msg: &content.ToolMessage{
+				Message:   content.Message{Role: content.RoleTool},
+				ToolUseID: "",
+			},
+			wantRole:      content.RoleTool,
+			wantToolUseID: "",
+			wantBlockLen:  0,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
