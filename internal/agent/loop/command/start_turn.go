@@ -49,9 +49,6 @@ type TurnBusyError struct{ Reason TurnBusyReason }
 
 func (e *TurnBusyError) Error() string { return "loop: " + string(e.Reason) }
 
-type CommandName string
-type CommandField string
-
 const (
 	CommandStartTurn CommandName = "StartTurn"
 
@@ -60,13 +57,3 @@ const (
 	StartTurnAbandoned CommandField = "Abandoned"
 	StartTurnAck       CommandField = "Ack"
 )
-
-// InvalidCommandError is returned when an internal caller violates a command contract.
-type InvalidCommandError struct {
-	Command CommandName
-	Field   CommandField
-}
-
-func (e *InvalidCommandError) Error() string {
-	return "loop: invalid command: " + string(e.Command) + "." + string(e.Field) + " is required"
-}

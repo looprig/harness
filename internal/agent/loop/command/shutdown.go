@@ -1,5 +1,10 @@
 package command
 
+const (
+	CommandShutdown CommandName  = "Shutdown"
+	ShutdownAck     CommandField = "Ack"
+)
+
 // Shutdown cancels the running turn (if any), delivers its terminal event, and
 // exits the actor. Ack receives nil after clean exit, or *LoopTerminatedError
 // if the loop's root context was cancelled before cleanup completed.
@@ -9,6 +14,14 @@ type Shutdown struct {
 }
 
 func (Shutdown) isCommand() {}
+
+// Validate checks that all required fields are non-nil.
+func (c Shutdown) Validate() error {
+	if c.Ack == nil {
+		return &InvalidCommandError{Command: CommandShutdown, Field: ShutdownAck}
+	}
+	return nil
+}
 
 // LoopTerminatedError is sent on Shutdown.Ack when the loop's root context was
 // cancelled before the actor finished cleanup.
