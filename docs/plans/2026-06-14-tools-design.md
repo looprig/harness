@@ -18,6 +18,22 @@ Date: 2026-06-14 · Status: approved (brainstorm)
 > (8) **Bash** kept as a shell-string tool with a *documented* security exception,
 > the denylist reframed as advisory (§4b); (9) **Terminate vs. abort** wording
 > reconciled (§2a, §2d).
+>
+> **Revision 2026-06-14 (review pass 2)** resolves a second review: (1) all
+> `PermissionRequest` concrete types (incl. `UnknownRequest`) **moved into
+> `internal/tool`** — a `tools/`-side type can't implement the unexported
+> `permissionRequest()` marker, and `loop` needs the fallback (§3a, §1); (2) gate
+> registration made **synchronous** (register → actor ack → emit) to close the
+> install-before-emit race (§2c); (3) `pendingGate` → **`pendingGates map[CallID]`**
+> since auto-approved `AskUser` gates can be open concurrently during parallel
+> execution (§2c); (4) session `Approve/Deny/ProvideUserInput` take **`ctx` + return
+> `error`** (unbuffered `Commands` could block forever) (§5c, §5d); (5) approval
+> match **generalized** to a tool-interpreted `Match` so `Fetch`/`WebSearch` grants
+> are representable (§3b, §3c); (6) observability events carry a **redacted `Summary`**,
+> never raw `ArgsJSON` (§2d, §5b); (7) the god-object `ToolDeps` **split** into a
+> runner-side `ToolSet` + **narrow per-tool deps** (least privilege; supersedes 7.md
+> Rule 2) (§3b, §4a, §4d); (8) `Glob`/`Grep` **exclude `DeniedReadPaths`** from
+> traversal/results (§4b).
 
 ## Scope
 
@@ -77,11 +93,12 @@ Strictly low→high, additive, no cycles:
 internal/content/                  Block (+ ToolUseBlock, ToolResultBlock), Chunk (+ ToolUseChunk)
     ↑                  ↑
 internal/tool/      internal/llm/  contracts: BaseTool, InvokableTool, ToolResult, ToolInfo,
-    ↑                              PermissionRequest (sealed), PermissionPrompter, ApprovalScope,
-    │                              Sequential, ToolMiddleware  — imports content only
+    ↑                              PermissionRequest (sealed) + ALL its concrete types
+    │                              (FileWriteRequest…UnknownRequest), PermissionPrompter,
+    │                              ApprovalScope, Sequential, ToolMiddleware — imports content only
 internal/agent/loop/event/         + PermissionRequested(tool.PermissionRequest), UserInputRequested,
     ↑                                ToolCallStarted, ToolCallCompleted
-internal/agent/loop/               runner.go, deps.go (ToolDeps, PermissionGate, Effect, ToolPolicy),
+internal/agent/loop/               runner.go, deps.go (ToolSet, PermissionGate, PathDenier, Effect, ToolPolicy),
     ↑                ↑               EmitFromContext; command/ + Approve/Deny/Provide; turn.go agentic loop
 tools/            internal/hashcache/   11 impls, PermissionChecker, SearchProvider; hashcache backs approvals
     ↑
@@ -96,7 +113,7 @@ cmd/cli/                           composition root (registry → agent → TUI)
 - **`EffectChecker` lives in `tools/`** (returns `loop.Effect`), keeping contracts
   loop-free.
 - **`loop` never imports `tools/`.** The concrete `*tools.PermissionChecker` and
-  `[]tool.InvokableTool` registry are injected via `loop.Config.Tools` (`ToolDeps`)
+  `[]tool.InvokableTool` registry are injected via `loop.Config.Tools` (`ToolSet`)
   at the composition root; the runner dispatches through interfaces only.
 - **`tools/` is root-level** (alongside `internal/`, `agents/`, `cmd/`); it imports
   `urvi/internal/...` freely. `Subagent` imports `internal/agent/session`
@@ -226,24 +243,37 @@ approval for a *previous* gate) fills the buffer, and the real approval's send t
 hits `default` and is silently dropped — the runner blocks until ctx-cancel. So
 instead:
 
-- Permission is resolved **sequentially**, so at most **one gate is open at a time**
-  per turn. `loopState` holds `pendingGate *struct{ callID uuid.UUID; reply chan<- command.Command }`
-  (nil when no gate is open).
-- When the runner opens a gate it creates `reply := make(chan command.Command, 1)`
-  and registers `{callID, reply}` with the actor over a dedicated internal channel
-  the actor's `listen` selects on (so only `listen` ever writes `loopState`). It
-  then blocks on `<-reply` / `<-ctx.Done()`.
-- `listen` matches control commands against the open gate and delivers exactly once
-  on the **dedicated** channel (the runner is its sole reader; written at most once
-  for that `callID`, so the valid reply is never dropped):
+- **Multiple gates can be open at once.** Permission *gates* are resolved
+  sequentially, but `AskUser` is auto-approved and blocks for input *during parallel
+  execution* — so two `AskUser` calls in one batch can be waiting simultaneously. A
+  single `pendingGate` would collide. `loopState` therefore holds
+  `pendingGates map[uuid.UUID]chan<- command.Command` (CallID → that gate's reply
+  channel), owned solely by `listen`.
+- **Registration is synchronous** (closes the install-before-emit race): the runner
+  creates `reply := make(chan command.Command, 1)`, sends
+  `{callID, reply, ack}` on the internal `gateReg` channel, and **blocks on `<-ack`**
+  until `listen` has installed it in `pendingGates`. Only then does it emit
+  `PermissionRequested`/`UserInputRequested` and block on `<-reply` / `<-ctx.Done()`.
+  Because the gate is provably installed before the request can reach the TUI, no
+  reply is ever dropped on a race.
+- `listen` routes each control command to the matching gate and delivers exactly
+  once on that gate's dedicated buffered(1) channel (runner is sole reader → never
+  blocks, never drops the match):
 
 ```go
+case gateRegistration:                 // {callID, reply, ack} from the runner
+    state.pendingGates[reg.callID] = reg.reply
+    close(reg.ack)                      // unblock the runner: gate is installed
+
 case command.ApproveToolCall, command.DenyToolCall, command.ProvideUserInput:
-    if g := state.pendingGate; g != nil && cmd.GateCallID() == g.callID {
-        g.reply <- cmd       // dedicated buffered(1) channel; runner is sole reader
-        state.pendingGate = nil
-    }                        // else: stale / wrong CallID / no open gate — drop (fail-safe)
+    if ch, ok := state.pendingGates[cmd.GateCallID()]; ok {
+        ch <- cmd                       // dedicated buffered(1) channel
+        delete(state.pendingGates, cmd.GateCallID())
+    }                                   // else: stale / wrong CallID / no such gate — drop (fail-safe)
 ```
+
+On turn end / cancellation `listen` clears `pendingGates` (any parked runner already
+unblocks via `<-ctx.Done()`).
 
 **The runner** generates a `CallID` (`uuid.New`) per tool call, injects it into
 `ctx` (package-private key), then:
@@ -251,15 +281,17 @@ case command.ApproveToolCall, command.DenyToolCall, command.ProvideUserInput:
 1. `effect := cfg.Tools.Permission.Check(ctx, t, name, argsJSON)`.
 2. If `EffectAsk`: build the typed request
    (`t.(tool.PermissionPrompter).BuildRequest` or fallback `UnknownRequest`),
-   **register the gate first, then** emit `event.PermissionRequested{CallID,
-   Request}`, then block on `<-reply` / `<-ctx.Done()`. (Register-before-emit means
-   `pendingGate` is set before the TUI can possibly receive the request and reply,
-   so no approval is ever dropped on a race. `CallID` is re-validated on receipt as
-   cheap defence.) On approval with `Scope != ScopeOnce` the runner calls
-   `gate.Grant(ctx, toolName, argsJSON, scope)` (§3b) using the `toolName`+`argsJSON`
-   it retained for *this* gate — so the command needs only `CallID`+`Scope`.
-3. `AskUser` registers a gate the same way for `ProvideUserInput`; the per-`CallID`
-   match is what lets gates and `AskUser` coexist without cross-talk.
+   **register the gate synchronously** (send to `gateReg`, wait for `<-ack`), *then*
+   emit `event.PermissionRequested{CallID, Request}`, then block on `<-reply` /
+   `<-ctx.Done()`. (The ack guarantees the gate is in `pendingGates` before the TUI
+   can receive the request, so no approval is dropped on a race. `CallID` is
+   re-validated on receipt as cheap defence.) On approval with `Scope != ScopeOnce`
+   the runner calls `gate.Grant(ctx, toolName, argsJSON, scope)` (§3b) using the
+   `toolName`+`argsJSON` it retained for *this* gate — so the command needs only
+   `CallID`+`Scope`.
+3. `AskUser` registers a gate the same way for `ProvideUserInput`. Because gates are
+   keyed by `CallID` in `pendingGates`, several `AskUser` calls in one parallel batch
+   each get their own entry and never collide.
 
 The `loopState` invariant is preserved: only `listen` touches `loop.Commands` and
 `loopState`; it *routes* the matching control command to the parked runner on that
@@ -276,7 +308,7 @@ gate's dedicated reply channel.
                           ┌──────────────────── Loop actor ────────────────────┐
 TUI ──Approve(callID)──► session ──► loop.Commands (inbound, always open) ─► listen()
                                                                                │ owns loopState
-                                                                               │ pendingGate.reply (per-gate, by CallID)
+                                                                               │ pendingGates[CallID] (per-gate reply chan)
                                                                                ▼
                                                                             runTurn goroutine
                                                                             (runner blocked on a gate)
@@ -310,9 +342,16 @@ keeps draining.
   `Interrupt`.
 
 **Observability events** (auto-approved tools execute silently otherwise):
-`event.ToolCallStarted{CallID, ToolName, ArgsJSON}` before run,
-`event.ToolCallCompleted{CallID, IsError}` after. Both carry `CallID`; today's TUI
-ignores unknown event types (additive).
+`event.ToolCallStarted{CallID, ToolName, Summary string}` before run,
+`event.ToolCallCompleted{CallID, IsError}` after. **`Summary` is a redacted, capped
+safe string — never raw `ArgsJSON`** (which can hold write-file contents, `Fetch`
+auth headers/cookies, a `Bash` command with an inline token, or PII; CLAUDE.md: *log
+security events, not secrets*). Tools supply it via an optional
+`tool.Auditable interface { AuditSummary(argsJSON string) string }`; a tool with no
+`AuditSummary` yields just its name. Per-tool redaction: `WriteFile` →
+`"WriteFile <path> (<n> bytes)"` (no content); `Fetch` → `"<METHOD> <host>"` (no
+headers/body); `ReadFile`/`Grep`/`Glob` → path/pattern only. Both events carry
+`CallID`; today's TUI ignores unknown event types (additive).
 
 ### §2e. Tool events via `ctx` (replaces 7.md's `ToolDeps.Events`)
 
@@ -325,10 +364,10 @@ helper in `loop` (not `internal/tool`, which must stay `event`-free):
 func EmitFromContext(ctx context.Context) (func(event.Event), bool)
 ```
 
-`AskUser` uses it to emit `UserInputRequested`. `ToolDeps` therefore keeps
-`SessionCtx` (needed at construction by background goroutines) but **drops the
-`Events` field**. With ShellSession deferred, no tool emits events that outlive a
-turn.
+`AskUser` uses it to emit `UserInputRequested`. There is **no session-wide `Events`
+field** anywhere (7.md's had one); per-turn emit comes from `ctx`, and the session
+root `ctx` is passed at construction only to tools that need it (`Subagent`). With
+ShellSession deferred, no tool emits events that outlive a turn.
 
 ---
 
@@ -354,6 +393,7 @@ func TextResult(s string) *ToolResult // one TextBlock, Terminate false
 // Optional capability interfaces (added, never folded into BaseTool — Rule 1):
 type Sequential        interface { Sequential() bool }
 type PermissionPrompter interface { BuildRequest(argsJSON string) (PermissionRequest, error) }
+type Auditable         interface { AuditSummary(argsJSON string) string } // redacted, capped; for ToolCallStarted
 
 type ToolMiddleware func(ctx context.Context, t InvokableTool, argsJSON string, next ToolExecuteFunc) (*ToolResult, error)
 type ToolExecuteFunc func(ctx context.Context, argsJSON string) (*ToolResult, error)
@@ -376,18 +416,29 @@ const (
 )
 ```
 
-Concrete requests live in `tools/permission.go`: `FileWriteRequest`,
-`BashRequest`, `FetchRequest`, `WebSearchRequest`, and the fallback
-`UnknownRequest{Tool, ArgsJSON}` (used when a tool implements no
-`PermissionPrompter` but `Check` returns `EffectAsk`). `StreamableTool` is
-**dropped**.
+**The concrete request types live in `internal/tool`, not `tools/`.** Because
+`permissionRequest()` is an *unexported* marker, only types in `internal/tool` can
+implement `PermissionRequest` (this is the sealing mechanism — a type in `tools/`
+*cannot* implement an unexported method from `internal/tool`, and would fail to
+compile). So `internal/tool` defines `FileWriteRequest`, `BashRequest`,
+`FetchRequest`, `WebSearchRequest`, and the fallback `UnknownRequest{Tool,
+Summary}`. A tool's `BuildRequest` (in `tools/`) *constructs* these exported structs
+(e.g. `return tool.FileWriteRequest{Path: p}, nil`); it does not define new
+implementers. This also lets the runner in `loop` build the `UnknownRequest`
+fallback (`loop` imports `internal/tool`, never `tools`). `StreamableTool` is
+**dropped**. (`UnknownRequest` carries a redacted `Summary`, not raw args — see
+finding-6 fix below.)
 
 ### §3b. Consumer surface — `internal/agent/loop/deps.go`
 
 ```go
 type Effect uint8 // EffectAutoApprove | EffectAsk | EffectDeny
 
-type ToolPolicy struct { Tool string; Effect Effect; Paths, Commands []string }
+type ToolPolicy struct {
+    Tool   string
+    Effect Effect
+    Match  []string // tool-interpreted patterns (path glob / cmd prefix / URL-host prefix); empty = all
+}
 
 type PermissionGate interface {
     Check(ctx context.Context, t tool.InvokableTool, toolName, argsJSON string) Effect
@@ -399,17 +450,39 @@ type PermissionGate interface {
     Grant(ctx context.Context, toolName, argsJSON string, scope tool.ApprovalScope) error
 }
 
-type ToolDeps struct {
-    WorkspaceRoot string
-    SessionCtx    context.Context      // wired by loop.New (root ctx)
-    Permission    PermissionGate
-    Registry      []tool.InvokableTool // runner looks up by Info().Name
-    Middlewares   []tool.ToolMiddleware
+// ToolSet is the RUNNER's view — the only thing loop.Config carries. Tools never
+// see it; they are not handed Permission/Registry/Middlewares (they don't call them).
+type ToolSet struct {
+    Permission  PermissionGate
+    Registry    []tool.InvokableTool // runner looks up by Info().Name, builds toolDefs
+    Middlewares []tool.ToolMiddleware
 }
+
+// PathDenier is the narrow read-deny check Glob/Grep/ReadFile use to filter
+// traversal + results; satisfied by *tools.PermissionChecker (its HardDeny config).
+type PathDenier interface { DeniedRead(absPath string) bool }
 ```
 
-`loop.Config` gains `Tools ToolDeps`. `loop.New` wires `SessionCtx`. `EffectChecker`
-(returns `loop.Effect`) lives in `tools/`, kept out of `internal/tool`.
+`loop.Config` gains `Tools ToolSet`. `EffectChecker` (returns `loop.Effect`) lives
+in `tools/`, kept out of `internal/tool`.
+
+**Tools are constructed with narrow, per-family deps — not a god-struct** (this
+*supersedes* 7.md's Rule 2 in favour of CLAUDE.md's "never pass a full config when a
+narrow interface suffices" / least privilege):
+
+| Tool family | Constructor deps |
+|---|---|
+| `ReadFile`, `Glob`, `Grep` | `root string`, `PathDenier` (filter denied paths in traversal/results) |
+| `WriteFile`, `EditFile`, `Bash` | `root string` (resolve path/workdir under it) |
+| `Fetch`, `WebSearch` | `*http.Client` (timeouts + `MinVersion: TLS1.2`); **no filesystem access at all** |
+| `AskUser`, `Todo` | none (use `ctx` / in-memory state) |
+| `Subagent` | a child-agent `Factory` + the session root `context.Context` |
+
+The win is real least privilege: a web tool literally cannot reach the workspace
+root, and `Todo` cannot touch the registry. The cost — adding a *shared* dep touches
+the relevant family rather than one struct — is the deliberate trade. The session
+root `ctx` (for `Subagent`) is the manifest's `rootCtx`, already in hand at
+construction (it builds tools before `session.NewAgent(rootCtx, cfg)`).
 
 ### §3c. The seven-stage `PermissionChecker` — `tools/permission.go`
 
@@ -463,11 +536,15 @@ type HardDenyRules struct {
     MaxReadBytes       int64    // default 1 MiB
 }
 type ApprovalRecord struct {
-    Tool          string `json:"tool"`
-    PathPattern   string `json:"path_pattern,omitempty"`
-    CommandPrefix string `json:"command_prefix,omitempty"`
-    Effect        Effect `json:"effect"`
+    Tool   string `json:"tool"`
+    Match  string `json:"match,omitempty"` // tool-interpreted; empty = all calls of this tool
+    Effect Effect `json:"effect"`
 }
+// Match is interpreted by the tool's matcher: a path glob (ReadFile/WriteFile/
+// EditFile/Glob/Grep), a command prefix (Bash), or a URL/host prefix (Fetch).
+// WebSearch ignores Match (a grant is tool-level — the query is not a boundary).
+// An empty Match means "all calls of this tool" — for high-risk tools (Fetch) a
+// scoped Match should be required rather than a blanket grant.
 type ApprovalsFile struct { Version int `json:"version"`; Approvals []ApprovalRecord `json:"approvals"` }
 
 type PermissionPolicy struct {
@@ -507,12 +584,13 @@ two instances (workspace + user approvals files).
 
 ## §4 — The 11 tools & the two manifests
 
-### §4a. Tool construction (Rule 2)
+### §4a. Tool construction (narrow deps — supersedes 7.md Rule 2)
 
-Every tool takes a single `loop.ToolDeps` at construction and ignores fields it
-doesn't use; adding a shared dependency = one new field, no constructor changes.
-Errors → tool-result strings; secrets never logged; `crypto/rand` IDs
-(`internal/uuid`).
+Each tool is constructed with **only the narrow deps its family needs** (§3b table),
+not a shared god-struct — per CLAUDE.md least privilege / interface segregation. The
+loop-side `ToolSet` (`Permission`/`Registry`/`Middlewares`) is the runner's, never
+handed to a tool. Errors → tool-result strings; secrets never logged (and never put
+in observability events — §2d); `crypto/rand` IDs (`internal/uuid`).
 
 ### §4b. The tools (`ToolResult.Content` is `[]content.Block`)
 
@@ -522,8 +600,8 @@ Errors → tool-result strings; secrets never logged; `crypto/rand` IDs
 | `WriteFile` | path, content | `containedPath` + `DeniedWritePaths`; `MkdirAll`; atomic tmp+`Rename` | Ask (`FileWriteRequest`) |
 | `EditFile` | path, old/new, replace_all | str-replace; 0→error, 2+ & !replace_all→ambiguous, else replace; diff preview | Ask (`FileWriteRequest`) |
 | `Bash` | command, workdir, timeout(≤120s) | `exec.CommandContext(ctx, "sh", "-c", command)`; combined output; 32 KiB cap; advisory `DeniedBashPrefixes` (see security note) | Ask (`BashRequest`) |
-| `Glob` | pattern, root | `containedPath`; **`**` via stdlib `WalkDir` + per-segment `path.Match`**; ≤500 results | AutoApprove |
-| `Grep` | pattern, path, recursive, ignore_case, context_lines, include_all | `rg` if present (binary, not a Go dep) else `WalkDir`+`regexp`; skip noise dirs; ≤200 matches | AutoApprove |
+| `Glob` | pattern, root | `containedPath`; **`**` via stdlib `WalkDir` + per-segment `path.Match`**; **`PathDenier` excludes `DeniedReadPaths` from results** (else auto-approved glob leaks `.env`/`id_rsa` names); ≤500 results | AutoApprove |
+| `Grep` | pattern, path, recursive, ignore_case, context_lines, include_all | `rg` if present (binary, not a Go dep) else `WalkDir`+`regexp`; skip noise dirs **and `DeniedReadPaths` (never open/match a denied file)**; ≤200 matches | AutoApprove |
 | `Fetch` | url, method(GET/POST), headers, body, timeout(≤60s) | `net/http` w/ explicit timeouts + `tls.Config{MinVersion: TLS1.2}`; 64 KiB cap | Ask (`FetchRequest`) |
 | `WebSearch` | query, results(≤10) | `SearchProvider` iface; DuckDuckGo HTML scrape via **`golang.org/x/net/html`** | Ask (`WebSearchRequest`) |
 | `AskUser` | question, choices | emits `UserInputRequested` via `EmitFromContext`; registers a gate, blocks on its reply (CallID-validated); answer validated against choices | AutoApprove |
@@ -562,10 +640,14 @@ can't express. The exception is explicit, not accidental:
 
 Each `New(ctx)` self-wires (matching today's `personalassistant.New(ctx)`):
 `os.Getwd()` → workspace root → build `PermissionPolicy` (default hard rules) →
-`tools.NewPermissionChecker(policy)` → build the `[]tool.InvokableTool` it wants →
-read API key from env → `auto.New(spec)` → seal `loop.Config{Client, Model, Tools}`
-→ `session.NewAgent(rootCtx, cfg)`. The wrapper satisfies `tui.Agent` plus the new
-`Approve`/`Deny`/`ProvideAnswer` trio (§5c).
+`pc := tools.NewPermissionChecker(policy)` → construct the tools it wants **with
+their narrow deps** (file tools get `root`+`pc` as the `PathDenier`; web tools get an
+`*http.Client`; `Subagent` gets a child-agent factory + `rootCtx`) → assemble
+`loop.ToolSet{Permission: pc, Registry: thoseTools, Middlewares: …}` → read API key
+from env → `auto.New(spec)` → seal `loop.Config{Client, Model, Tools: toolSet}` →
+`session.NewAgent(rootCtx, cfg)`. The wrapper satisfies `tui.Agent` plus the new
+`Approve`/`Deny`/`ProvideAnswer` trio (§5c). The manifest is the only place that
+knows the concrete tool set and wires each tool's least-privilege deps.
 
 - **`agents/personal-assistant`** (Kimi K2, text-only) → safe subset:
   `ReadFile, Glob, Grep, Fetch, WebSearch, AskUser, Todo`. No write/exec tools.
@@ -589,7 +671,7 @@ read API key from env → `auto.New(spec)` → seal `loop.Config{Client, Model, 
 ```go
 type PermissionRequested struct { CallID uuid.UUID; Request tool.PermissionRequest }
 type UserInputRequested  struct { CallID uuid.UUID; Question string; Choices []string }
-type ToolCallStarted     struct { CallID uuid.UUID; ToolName, ArgsJSON string }
+type ToolCallStarted     struct { CallID uuid.UUID; ToolName, Summary string } // Summary redacted/capped, never raw args
 type ToolCallCompleted   struct { CallID uuid.UUID; IsError bool }
 // each: isEvent()
 ```
@@ -599,12 +681,16 @@ only `content`). `ShellSession*` events are deferred with the tool.
 
 ### §5c. `session` + `tui.Agent` additions
 
-`AgentSession` gains `Approve(callID uuid.UUID, scope tool.ApprovalScope)`,
-`Deny(callID uuid.UUID)`, `ProvideUserInput(callID uuid.UUID, answer string)` —
-each sends the command to `loop.Commands` with a fresh `Header.ID` (same pattern as
-`Interrupt`/`Shutdown`). The TUI's consumer-defined `Agent` interface gains a
-matching `Approve`/`Deny`/`ProvideAnswer` trio; both agent wrappers delegate to the
-session.
+`AgentSession` gains `Approve(ctx, callID, scope) error`, `Deny(ctx, callID) error`,
+`ProvideUserInput(ctx, callID, answer) error` — each sends the command to
+`loop.Commands` with a fresh `Header.ID`, **selecting on `ctx.Done()` and the loop's
+`Done` channel** so a send never blocks forever if the actor has exited or is busy
+(`loop.Commands` is unbuffered). This matches the existing `Interrupt(ctx) (bool,
+error)` / `Shutdown(ctx) error` signatures (not the ctx-less form in the first
+draft). The TUI's consumer-defined `Agent` interface gains a matching
+`Approve(ctx,…) error` / `Deny(ctx,…) error` / `ProvideAnswer(ctx,…) error` trio;
+both agent wrappers delegate to the session, and the TUI calls them as bounded
+`tea.Cmd`s (like `interruptTurn`).
 
 ### §5d. TUI integration — contract only (rendering deferred)
 
@@ -612,11 +698,13 @@ session.
 
 - New events ride the same per-turn stream `readNext` already drains.
 - `PermissionRequested` → store; render an approval box (`Request.ToolName()` /
-  `Request.Description()` / keys from `AllowedScopes()` + always `[n]`); single
-  keypress `y/s/w` → `agent.Approve(callID, scope)`, `n` → `agent.Deny(callID)`;
-  cleared on any terminal event.
+  `Request.Description()` / keys from `AllowedScopes()` + always `[n]`); a single
+  keypress `y/s/w`/`n` dispatches a **bounded `tea.Cmd`** that calls
+  `agent.Approve(ctx, callID, scope)` / `agent.Deny(ctx, callID)` (so the Update loop
+  never blocks on the send); cleared on any terminal event.
 - `UserInputRequested` → assistant-style question; choices → key list + "other…";
-  free text → `agent.ProvideAnswer(callID, text)`.
+  the answer dispatches a bounded `tea.Cmd` calling `agent.ProvideAnswer(ctx, callID,
+  text)`.
 - `ToolCall{Started,Completed}` → optional tool-call cards; today's TUI ignores
   unknown event types, so this is additive.
 
@@ -635,16 +723,29 @@ The pixel-level work is a follow-up TUI-update doc, since that TUI is mid-flight
   final-component symlink fails to open. `FuzzContainedPath` over adversarial paths.
 - Each tool — happy/boundary/error/edge; `FuzzGlobMatch`; `EditFile` occurrence
   rules; `Bash` exit/timeout/truncation; `Fetch` method + truncation; `WebSearch`
-  via a fake `SearchProvider`; `AskUser` answer validation.
+  via a fake `SearchProvider`; `AskUser` answer validation. **`Glob`/`Grep` exclude
+  a `DeniedReadPaths` entry** (e.g. a `.env` in the workspace) from results/matches.
+- approval matching — generalized `Match` interpreted per tool: path glob (files),
+  command prefix (`Bash`), URL/host prefix (`Fetch`), ignored (`WebSearch`).
+- observability — `ToolCallStarted.Summary` is the **redacted** form: `WriteFile`
+  carries no content, `Fetch` no headers/body (assert no secret substring leaks).
+- least-privilege deps — a web tool's constructor takes no workspace root (compile-
+  level: it can't reach the filesystem); `ToolSet` is not passed to any tool.
 - `runner` — serial-then-parallel batching (fake `Sequential` tool), N→N+1
   session-grant visibility, `Grant` called only when `Scope != ScopeOnce`,
   middleware ordering, panic→error result, ctx-cancel terminates.
 - `runTurn` — `ToolUseChunk` fragment-accumulation by `Index`, tool round-trips,
   tool-result encoded as `ToolMessage{Blocks: result.Content}` (non-empty on the
   wire), `Terminate` completes with `TurnDone`, no-tool-call exit; fake `llm.LLM`.
-- control commands — **the per-gate channel does not drop the valid approval when a
-  stale/duplicate command precedes it**; `listen` matches by active `CallID`; a
-  command with no open gate or a wrong `CallID` is dropped.
+- gate plumbing — **synchronous registration**: an approval delivered immediately
+  after the request still lands (the ack ordering guarantees install-before-emit);
+  the per-gate channel does not drop the valid approval when a stale/duplicate
+  precedes it; **two concurrent `AskUser` gates** in one parallel batch each resolve
+  independently via `pendingGates`; `listen` drops a command with no/!matching gate.
+- session methods — `Approve/Deny/ProvideUserInput` return an error (don't block)
+  when `ctx` is cancelled or the loop has exited.
+- `PermissionRequest` types compile in `internal/tool` (sealed marker satisfied);
+  `loop` constructs `UnknownRequest` without importing `tools`.
 - manifests — coding registers 11 tools, PA registers the 7-tool subset,
   `AcceptsImages` false.
 - (identity-model tests live in the identity doc.)
