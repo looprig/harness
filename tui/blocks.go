@@ -154,11 +154,12 @@ func denyReason(clean string) (string, bool) {
 }
 
 // readAttachment opens clean with O_NOFOLLOW (rejecting a symlinked final
-// component), confirms it is a regular file via fd stat, enforces the size cap
-// at stat time and again after a bounded read, and returns the bytes.
+// component) and O_NONBLOCK (so a FIFO/named pipe does not block the open until
+// a writer connects), confirms it is a regular file via fd stat, enforces the
+// size cap at stat time and again after a bounded read, and returns the bytes.
 func readAttachment(clean string) ([]byte, error) {
 	// #nosec G304 -- user-selected local path, validated by denylist + classify + O_NOFOLLOW + fd stat
-	f, err := os.OpenFile(clean, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	f, err := os.OpenFile(clean, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, &AttachmentNotFoundError{Path: clean, Cause: err}
@@ -181,12 +182,25 @@ func readAttachment(clean string) ([]byte, error) {
 		return nil, &AttachmentTooLargeError{Path: clean, Size: fi.Size(), Max: maxAttachmentBytes}
 	}
 
-	data, err := io.ReadAll(io.LimitReader(f, maxAttachmentBytes+1))
+	data, overCap, err := readCapped(f, maxAttachmentBytes)
 	if err != nil {
 		return nil, &AttachmentReadError{Path: clean, Cause: err}
 	}
-	if int64(len(data)) > maxAttachmentBytes {
+	if overCap {
 		return nil, &AttachmentTooLargeError{Path: clean, Size: int64(len(data)), Max: maxAttachmentBytes}
 	}
 	return data, nil
+}
+
+// readCapped reads from r up to max bytes. It signals overCap when the source
+// holds more than max bytes (e.g. a file that grew after its stat-time size
+// check), so the caller can reject it. The returned data is read in full up to
+// max+1 bytes; at the boundary (exactly max bytes) overCap is false and data is
+// not truncated.
+func readCapped(r io.Reader, max int64) (data []byte, overCap bool, err error) {
+	data, err = io.ReadAll(io.LimitReader(r, max+1))
+	if err != nil {
+		return nil, false, err
+	}
+	return data, int64(len(data)) > max, nil
 }

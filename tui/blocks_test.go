@@ -6,7 +6,9 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 
 	"github.com/inventivepotter/urvi/internal/content"
 )
@@ -345,5 +347,107 @@ func TestBuildBlocksAttachmentOnlyNoLeadingText(t *testing.T) {
 	}
 	if len(got) != 1 {
 		t.Fatalf("len(blocks) = %d, want 1 (no leading empty text block)", len(got))
+	}
+}
+
+// TestBuildBlocksFifoDoesNotHang locks in finding I1: a FIFO @path must be
+// rejected as not-a-regular-file rather than blocking os.OpenFile until a
+// writer connects (which would freeze the synchronous Update loop). The
+// O_NONBLOCK flag makes the open return immediately; the regular-file check
+// then denies it. A regression that drops O_NONBLOCK would hang the open
+// forever, so the call runs in a goroutine guarded by a 5s deadline.
+func TestBuildBlocksFifoDoesNotHang(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	fifo := filepath.Join(dir, "p.txt") // accepted ext, but it's a FIFO
+	if err := syscall.Mkfifo(fifo, 0o600); err != nil {
+		t.Skipf("Mkfifo unsupported on this platform: %v", err)
+	}
+
+	type result struct {
+		blocks []content.Block
+		err    error
+	}
+	done := make(chan result, 1)
+	go func() {
+		blocks, err := buildBlocks("@"+fifo, true)
+		done <- result{blocks: blocks, err: err}
+	}()
+
+	select {
+	case got := <-done:
+		var denied *DeniedAttachmentError
+		if !errors.As(got.err, &denied) {
+			t.Fatalf("error = %v, want *DeniedAttachmentError (FIFO is not a regular file)", got.err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("buildBlocks hung on a FIFO @path: O_NONBLOCK regression")
+	}
+}
+
+func TestReadCapped(t *testing.T) {
+	t.Parallel()
+	const max int64 = 4
+	tests := []struct {
+		name        string
+		in          string
+		wantData    string
+		wantOverCap bool
+	}{
+		{name: "fewer than max", in: "ab", wantData: "ab", wantOverCap: false},
+		{name: "empty", in: "", wantData: "", wantOverCap: false},
+		{name: "exactly max reads fully", in: "abcd", wantData: "abcd", wantOverCap: false},
+		{name: "max plus one over cap", in: "abcde", wantData: "abcde", wantOverCap: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			data, overCap, err := readCapped(strings.NewReader(tt.in), max)
+			if err != nil {
+				t.Fatalf("readCapped() error = %v, want nil", err)
+			}
+			if overCap != tt.wantOverCap {
+				t.Errorf("overCap = %v, want %v", overCap, tt.wantOverCap)
+			}
+			if string(data) != tt.wantData {
+				t.Errorf("data = %q, want %q", string(data), tt.wantData)
+			}
+		})
+	}
+}
+
+func TestReadCappedReadError(t *testing.T) {
+	t.Parallel()
+	sentinel := errors.New("boom")
+	_, _, err := readCapped(errReader{err: sentinel}, 4)
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("readCapped() error = %v, want %v", err, sentinel)
+	}
+}
+
+// errReader fails every Read with err, exercising readCapped's error path.
+type errReader struct{ err error }
+
+func (e errReader) Read(_ []byte) (int, error) { return 0, e.err }
+
+// TestBuildBlocksExactlyMaxAccepted is a boundary check: a file of exactly
+// maxAttachmentBytes is accepted (overCap is false) and its TextBlock carries
+// every byte, proving readCapped does not truncate at the limit.
+func TestBuildBlocksExactlyMaxAccepted(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	body := bytes.Repeat([]byte("a"), int(maxAttachmentBytes))
+	p := writeFile(t, dir, "max.txt", body)
+	got, err := buildBlocks("@"+p, true)
+	if err != nil {
+		t.Fatalf("buildBlocks() error = %v, want nil (exactly max is accepted)", err)
+	}
+	tb, ok := got[0].(*content.TextBlock)
+	if !ok {
+		t.Fatalf("block[0] = %T, want *content.TextBlock", got[0])
+	}
+	want := "[max.txt]\n" + string(body)
+	if tb.Text != want {
+		t.Errorf("Text length = %d, want %d (no truncation)", len(tb.Text), len(want))
 	}
 }
