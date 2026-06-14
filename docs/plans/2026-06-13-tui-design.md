@@ -43,7 +43,7 @@ Dependency direction (low → high), no cycles, layering preserved:
 
 - `internal/registry` imports nothing from `agents/`, `tui/`, or `cmd/`. It is a
   generic container; its type parameter is supplied by the caller.
-- `tui` imports `internal/content`, `internal/agent/loop`, `internal/llm`, and the
+- `tui` imports `internal/content`, `internal/agent/loop/event`, `internal/llm`, and the
   charm libraries. It **defines** the `Agent` interface it consumes (Dependency
   Inversion); it does not import `agents/` or `internal/registry`.
 - `agents/personal-assistant` imports `internal/*` only — it is oblivious to `tui`
