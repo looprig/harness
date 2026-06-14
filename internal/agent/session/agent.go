@@ -6,6 +6,8 @@ import (
 	"sync"
 
 	"github.com/inventivepotter/urvi/internal/agent/loop"
+	"github.com/inventivepotter/urvi/internal/agent/loop/command"
+	"github.com/inventivepotter/urvi/internal/agent/loop/event"
 	"github.com/inventivepotter/urvi/internal/content"
 	"github.com/inventivepotter/urvi/internal/llm"
 	"github.com/inventivepotter/urvi/internal/uuid"
@@ -78,15 +80,15 @@ func NewAgent(ctx context.Context, cfg loop.Config) (*AgentSession, error) {
 }
 
 // Invoke sends input and blocks until a terminal event.
-// Cancelling ctx cancels the running turn; Invoke returns the TurnInterrupted event.
-func (s *AgentSession) Invoke(ctx context.Context, input []content.Block) (loop.Event, error) {
-	events := make(chan loop.Event, 64)
+// Cancelling ctx cancels the running turn; Invoke returns the event.TurnInterrupted event.
+func (s *AgentSession) Invoke(ctx context.Context, input []content.Block) (event.Event, error) {
+	events := make(chan event.Event, 64)
 	ack := make(chan error, 1)
 	abandoned := make(chan struct{})
 	defer close(abandoned) // ensures deliverAndClose always has an escape if Invoke exits early
 
 	select {
-	case s.loop.Commands <- loop.StartTurn{Ctx: ctx, Input: input, Events: events, Abandoned: abandoned, Ack: ack}:
+	case s.loop.Commands <- command.StartTurn{Ctx: ctx, Input: input, Events: events, Abandoned: abandoned, Ack: ack}:
 	case <-ctx.Done():
 		return nil, &SessionError{Kind: SessionContextDone, Cause: ctx.Err()}
 	case <-s.loop.Done:
@@ -104,7 +106,7 @@ func (s *AgentSession) Invoke(ctx context.Context, input []content.Block) (loop.
 				return nil, &SessionError{Kind: SessionEventChannelClosed}
 			}
 			switch ev.(type) {
-			case loop.TurnDone, loop.TurnFailed, loop.TurnInterrupted:
+			case event.TurnDone, event.TurnFailed, event.TurnInterrupted:
 				return ev, nil
 			}
 		case <-s.loop.Done:
@@ -116,19 +118,19 @@ func (s *AgentSession) Invoke(ctx context.Context, input []content.Block) (loop.
 	}
 }
 
-// Stream sends input and returns a StreamReader[loop.Event] that yields
+// Stream sends input and returns a StreamReader[event.Event] that yields
 // TurnStarted, TokenDelta×N, then one terminal event, then EOF while the caller
 // keeps reading. Calling sr.Close() abandons the event stream and cancels the turn.
 // Callers must either read until EOF or call Close.
-func (s *AgentSession) Stream(ctx context.Context, input []content.Block) (*llm.StreamReader[loop.Event], error) {
+func (s *AgentSession) Stream(ctx context.Context, input []content.Block) (*llm.StreamReader[event.Event], error) {
 	streamCtx, streamCancel := context.WithCancel(ctx)
 	abandoned := make(chan struct{})
 	var abandonOnce sync.Once
-	events := make(chan loop.Event, 64)
+	events := make(chan event.Event, 64)
 	ack := make(chan error, 1)
 
 	select {
-	case s.loop.Commands <- loop.StartTurn{
+	case s.loop.Commands <- command.StartTurn{
 		Ctx:       streamCtx,
 		Input:     input,
 		Events:    events,
@@ -152,7 +154,7 @@ func (s *AgentSession) Stream(ctx context.Context, input []content.Block) (*llm.
 	}
 
 	return llm.NewStreamReader(
-		func() (loop.Event, error) {
+		func() (event.Event, error) {
 			// The loop.Done case rescues a reader parked here if the loop is
 			// hard-killed mid-turn: on a DrainTimeout detach the actor never
 			// closes `events`, so without this escape a consumer would block
@@ -181,7 +183,7 @@ func (s *AgentSession) Stream(ctx context.Context, input []content.Block) (*llm.
 func (s *AgentSession) Interrupt(ctx context.Context) (bool, error) {
 	ack := make(chan bool, 1)
 	select {
-	case s.loop.Commands <- loop.Interrupt{Ack: ack}:
+	case s.loop.Commands <- command.Interrupt{Ack: ack}:
 	case <-s.loop.Done:
 		return false, &SessionError{Kind: SessionLoopExited}
 	case <-ctx.Done():
@@ -203,7 +205,7 @@ func (s *AgentSession) Interrupt(ctx context.Context) (bool, error) {
 func (s *AgentSession) Shutdown(ctx context.Context) error {
 	ack := make(chan error, 1)
 	select {
-	case s.loop.Commands <- loop.Shutdown{Ack: ack}:
+	case s.loop.Commands <- command.Shutdown{Ack: ack}:
 	case <-s.loop.Done:
 		return nil
 	case <-ctx.Done():

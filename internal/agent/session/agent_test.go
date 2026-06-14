@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"github.com/inventivepotter/urvi/internal/agent/loop"
+	"github.com/inventivepotter/urvi/internal/agent/loop/command"
+	"github.com/inventivepotter/urvi/internal/agent/loop/event"
 	"github.com/inventivepotter/urvi/internal/content"
 	"github.com/inventivepotter/urvi/internal/llm"
 )
@@ -51,10 +53,10 @@ func (s *stubLLM) Stream(ctx context.Context, req llm.Request) (*llm.StreamReade
 // and safe for concurrent calls, as the EventSink contract requires.
 type recordingSink struct {
 	mu   sync.Mutex
-	envs []loop.EventEnvelope
+	envs []event.EventEnvelope
 }
 
-func (r *recordingSink) OnEvent(_ context.Context, env loop.EventEnvelope) {
+func (r *recordingSink) OnEvent(_ context.Context, env event.EventEnvelope) {
 	r.mu.Lock()
 	r.envs = append(r.envs, env)
 	r.mu.Unlock()
@@ -65,7 +67,7 @@ func (r *recordingSink) sawTerminal() bool {
 	defer r.mu.Unlock()
 	for _, env := range r.envs {
 		switch env.Event.(type) {
-		case loop.TurnInterrupted:
+		case event.TurnInterrupted:
 			return true
 		}
 	}
@@ -76,9 +78,9 @@ func cfg(client llm.LLM) loop.Config {
 	return loop.Config{Client: client, Model: llm.ModelSpec{Model: "m"}, DrainTimeout: 100 * time.Millisecond}
 }
 
-func cfgWithSink(client llm.LLM, sink loop.EventSink) loop.Config {
+func cfgWithSink(client llm.LLM, sink event.EventSink) loop.Config {
 	c := cfg(client)
-	c.Sinks = []loop.EventSink{sink}
+	c.Sinks = []event.EventSink{sink}
 	return c
 }
 
@@ -119,8 +121,8 @@ func TestInvokeReturnsTurnDone(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Invoke: %v", err)
 	}
-	if _, ok := ev.(loop.TurnDone); !ok {
-		t.Fatalf("event = %T, want loop.TurnDone", ev)
+	if _, ok := ev.(event.TurnDone); !ok {
+		t.Fatalf("event = %T, want event.TurnDone", ev)
 	}
 }
 
@@ -137,8 +139,8 @@ func TestInvokeCtxCancelReturnsInterrupted(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Invoke returned Go error %v, want TurnInterrupted event", err)
 	}
-	if _, ok := ev.(loop.TurnInterrupted); !ok {
-		t.Fatalf("event = %T, want loop.TurnInterrupted", ev)
+	if _, ok := ev.(event.TurnInterrupted); !ok {
+		t.Fatalf("event = %T, want event.TurnInterrupted", ev)
 	}
 }
 
@@ -153,7 +155,7 @@ func TestStreamYieldsOrderedEvents(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Stream: %v", err)
 	}
-	var got []loop.Event
+	var got []event.Event
 	for {
 		ev, err := sr.Next()
 		if err == io.EOF {
@@ -167,10 +169,10 @@ func TestStreamYieldsOrderedEvents(t *testing.T) {
 	if len(got) < 3 {
 		t.Fatalf("got %d events, want >=3 (TurnStarted, deltas, terminal)", len(got))
 	}
-	if _, ok := got[0].(loop.TurnStarted); !ok {
+	if _, ok := got[0].(event.TurnStarted); !ok {
 		t.Errorf("first = %T, want TurnStarted", got[0])
 	}
-	if _, ok := got[len(got)-1].(loop.TurnDone); !ok {
+	if _, ok := got[len(got)-1].(event.TurnDone); !ok {
 		t.Errorf("last = %T, want TurnDone", got[len(got)-1])
 	}
 }
@@ -192,9 +194,9 @@ func TestConcurrentInvokeIsRejected(t *testing.T) {
 	time.Sleep(30 * time.Millisecond) // let the first turn occupy the loop
 
 	_, err = s.Invoke(context.Background(), nil)
-	var be *loop.TurnBusyError
+	var be *command.TurnBusyError
 	if !errors.As(err, &be) {
-		t.Fatalf("second Invoke err = %v, want *loop.TurnBusyError", err)
+		t.Fatalf("second Invoke err = %v, want *command.TurnBusyError", err)
 	}
 }
 
@@ -333,8 +335,8 @@ func TestStreamCloseCancelsTurn(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Invoke after Close: %v (session not released)", err)
 	}
-	if _, ok := ev.(loop.TurnInterrupted); !ok {
-		t.Fatalf("Invoke after Close returned %T, want loop.TurnInterrupted", ev)
+	if _, ok := ev.(event.TurnInterrupted); !ok {
+		t.Fatalf("Invoke after Close returned %T, want event.TurnInterrupted", ev)
 	}
 }
 
@@ -369,8 +371,8 @@ func TestStreamDrainReleasesSession(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Invoke after drain: %v", err)
 		}
-		if _, ok := ev.(loop.TurnDone); !ok {
-			t.Fatalf("event = %T, want loop.TurnDone", ev)
+		if _, ok := ev.(event.TurnDone); !ok {
+			t.Fatalf("event = %T, want event.TurnDone", ev)
 		}
 	})
 	t.Run("close early releases", func(t *testing.T) {
@@ -399,12 +401,12 @@ func TestStreamDrainReleasesSession(t *testing.T) {
 		for {
 			ev, err := s.Invoke(context.Background(), nil)
 			if err == nil {
-				if _, ok := ev.(loop.TurnDone); !ok {
-					t.Fatalf("event = %T, want loop.TurnDone", ev)
+				if _, ok := ev.(event.TurnDone); !ok {
+					t.Fatalf("event = %T, want event.TurnDone", ev)
 				}
 				break
 			}
-			var be *loop.TurnBusyError
+			var be *command.TurnBusyError
 			if !errors.As(err, &be) {
 				t.Fatalf("Invoke after early close = %v, want nil or TurnBusyError", err)
 			}
@@ -427,7 +429,7 @@ func TestInterruptDuringInvoke(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = s.Shutdown(context.Background()) })
 
-	evCh := make(chan loop.Event, 1)
+	evCh := make(chan event.Event, 1)
 	errCh := make(chan error, 1)
 	go func() {
 		ev, err := s.Invoke(context.Background(), nil)
@@ -449,8 +451,8 @@ func TestInterruptDuringInvoke(t *testing.T) {
 		if err := <-errCh; err != nil {
 			t.Fatalf("Invoke returned Go error %v, want TurnInterrupted event", err)
 		}
-		if _, ok := ev.(loop.TurnInterrupted); !ok {
-			t.Fatalf("Invoke event = %T, want loop.TurnInterrupted", ev)
+		if _, ok := ev.(event.TurnInterrupted); !ok {
+			t.Fatalf("Invoke event = %T, want event.TurnInterrupted", ev)
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("Invoke did not return after Interrupt")
@@ -539,9 +541,9 @@ func TestShutdownSurfacesLoopTerminatedError(t *testing.T) {
 		if !errors.As(err, &se) {
 			t.Fatalf("Shutdown err = %v (%T), want *SessionError", err, err)
 		}
-		var lte *loop.LoopTerminatedError
+		var lte *command.LoopTerminatedError
 		if !errors.As(err, &lte) {
-			t.Fatalf("Shutdown err = %v, want it to wrap *loop.LoopTerminatedError", err)
+			t.Fatalf("Shutdown err = %v, want it to wrap *command.LoopTerminatedError", err)
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("Shutdown never returned after root-ctx kill")
