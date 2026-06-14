@@ -8,7 +8,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/inventivepotter/urvi/internal/agent/loop"
+	"github.com/inventivepotter/urvi/internal/agent/loop/command"
+	"github.com/inventivepotter/urvi/internal/agent/loop/event"
 	"github.com/inventivepotter/urvi/internal/content"
 	"github.com/inventivepotter/urvi/internal/agent/session"
 )
@@ -73,9 +74,9 @@ func TestSendHappy(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Send() error = %v", err)
 	}
-	done, ok := ev.(loop.TurnDone)
+	done, ok := ev.(event.TurnDone)
 	if !ok {
-		t.Fatalf("event = %T, want loop.TurnDone", ev)
+		t.Fatalf("event = %T, want event.TurnDone", ev)
 	}
 	if got := textOf(done.Message); got != "hello" {
 		t.Errorf("message text = %q, want hello", got)
@@ -94,9 +95,9 @@ func TestSendProviderFailure(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Send() Go error = %v, want nil", err)
 	}
-	failed, ok := ev.(loop.TurnFailed)
+	failed, ok := ev.(event.TurnFailed)
 	if !ok {
-		t.Fatalf("event = %T, want loop.TurnFailed", ev)
+		t.Fatalf("event = %T, want event.TurnFailed", ev)
 	}
 	if !errors.Is(failed.Err, errFakeProvider) {
 		t.Errorf("TurnFailed.Err = %v, want errors.Is errFakeProvider", failed.Err)
@@ -147,11 +148,11 @@ func TestStreamOrderedEvents(t *testing.T) {
 			t.Fatalf("Next() error = %v", err)
 		}
 		switch ev.(type) {
-		case loop.TurnStarted:
+		case event.TurnStarted:
 			kinds = append(kinds, "started")
-		case loop.TokenDelta:
+		case event.TokenDelta:
 			kinds = append(kinds, "delta")
-		case loop.TurnDone:
+		case event.TurnDone:
 			kinds = append(kinds, "done")
 		default:
 			t.Fatalf("unexpected event %T", ev)
@@ -182,7 +183,7 @@ func TestStreamBlankInput(t *testing.T) {
 }
 
 // TestStreamCloseEventuallyReusable proves the contract: sr.Close() interrupts
-// asynchronously, so a subsequent Send may briefly see *loop.TurnBusyError and
+// asynchronously, so a subsequent Send may briefly see *command.TurnBusyError and
 // must be retried; the session is eventually reusable.
 func TestStreamCloseEventuallyReusable(t *testing.T) {
 	t.Parallel()
@@ -211,14 +212,14 @@ func TestStreamCloseEventuallyReusable(t *testing.T) {
 	for {
 		ev, err := a.Send(context.Background(), "again")
 		if err == nil {
-			if _, ok := ev.(loop.TurnDone); !ok {
-				t.Fatalf("Send event = %T, want loop.TurnDone", ev)
+			if _, ok := ev.(event.TurnDone); !ok {
+				t.Fatalf("Send event = %T, want event.TurnDone", ev)
 			}
 			return
 		}
-		var busy *loop.TurnBusyError
+		var busy *command.TurnBusyError
 		if !errors.As(err, &busy) {
-			t.Fatalf("Send err = %v, want nil or *loop.TurnBusyError", err)
+			t.Fatalf("Send err = %v, want nil or *command.TurnBusyError", err)
 		}
 		if time.Now().After(deadline) {
 			t.Fatal("session not reusable within deadline")
@@ -268,8 +269,8 @@ func TestCtxIndependenceFromSession(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Send() error = %v, want nil (session should outlive ctx)", err)
 	}
-	if _, ok := ev.(loop.TurnDone); !ok {
-		t.Fatalf("event = %T, want loop.TurnDone", ev)
+	if _, ok := ev.(event.TurnDone); !ok {
+		t.Fatalf("event = %T, want event.TurnDone", ev)
 	}
 }
 
@@ -294,7 +295,7 @@ func TestSendCtxCancelInterrupts(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	type result struct {
-		ev  loop.Event
+		ev  event.Event
 		err error
 	}
 	resCh := make(chan result, 1)
@@ -318,8 +319,8 @@ func TestSendCtxCancelInterrupts(t *testing.T) {
 		if res.err != nil {
 			t.Fatalf("Send() Go error = %v, want nil", res.err)
 		}
-		if _, ok := res.ev.(loop.TurnInterrupted); !ok {
-			t.Fatalf("event = %T, want loop.TurnInterrupted", res.ev)
+		if _, ok := res.ev.(event.TurnInterrupted); !ok {
+			t.Fatalf("event = %T, want event.TurnInterrupted", res.ev)
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("Send did not return after ctx cancel")

@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/inventivepotter/urvi/internal/agent/loop"
+	"github.com/inventivepotter/urvi/internal/agent/loop/event"
 	"github.com/inventivepotter/urvi/internal/content"
 	"github.com/inventivepotter/urvi/internal/llm"
 	"github.com/inventivepotter/urvi/internal/llm/auto"
@@ -90,14 +91,14 @@ func newWithClient(ctx context.Context, client llm.LLM, spec llm.ModelSpec) (*As
 }
 
 // Send delivers one user message and blocks until the turn reaches a terminal
-// event, returning it unchanged as one of the value types loop.TurnDone,
-// loop.TurnFailed, or loop.TurnInterrupted. The Go error return is nil for all
-// three terminal outcomes: a provider failure surfaces as a loop.TurnFailed
+// event, returning it unchanged as one of the value types event.TurnDone,
+// event.TurnFailed, or event.TurnInterrupted. The Go error return is nil for all
+// three terminal outcomes: a provider failure surfaces as a event.TurnFailed
 // whose Err carries the original provider/engine cause, not as a Go error. The
 // Go error is non-nil only when no turn completed (transport failures: the loop
 // exited, or ctx done), and the event is then nil. Cancel ctx to interrupt the
-// in-flight turn; Send then returns loop.TurnInterrupted with a nil error.
-func (a *Assistant) Send(ctx context.Context, text string) (loop.Event, error) {
+// in-flight turn; Send then returns event.TurnInterrupted with a nil error.
+func (a *Assistant) Send(ctx context.Context, text string) (event.Event, error) {
 	blocks, err := userBlocks(text)
 	if err != nil {
 		return nil, err
@@ -109,8 +110,8 @@ func (a *Assistant) Send(ctx context.Context, text string) (loop.Event, error) {
 // TurnStarted, TokenDelta×N, then one terminal event, then EOF. Callers must
 // read until EOF or call sr.Close(). sr.Close() abandons the stream and
 // interrupts the turn asynchronously, so an immediately following Send may
-// briefly observe *loop.TurnBusyError until the cancelled turn unwinds.
-func (a *Assistant) Stream(ctx context.Context, text string) (*llm.StreamReader[loop.Event], error) {
+// briefly observe *command.TurnBusyError until the cancelled turn unwinds.
+func (a *Assistant) Stream(ctx context.Context, text string) (*llm.StreamReader[event.Event], error) {
 	blocks, err := userBlocks(text)
 	if err != nil {
 		return nil, err
