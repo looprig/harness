@@ -33,34 +33,6 @@ func renderMD(md string, width int) string {
 	return styles.Dot + strings.TrimRight(out, "\n")
 }
 
-// wrapText hard-wraps s to width columns on word boundaries. A width <= 0 leaves
-// s unchanged. A single word longer than width is emitted on its own line rather
-// than being split, which guarantees termination.
-func wrapText(s string, width int) string {
-	if width <= 0 || s == "" {
-		return s
-	}
-
-	var b strings.Builder
-	lineLen := 0
-	for i, word := range strings.Fields(s) {
-		switch {
-		case i == 0:
-			b.WriteString(word)
-			lineLen = len(word)
-		case lineLen+1+len(word) > width:
-			b.WriteByte('\n')
-			b.WriteString(word)
-			lineLen = len(word)
-		default:
-			b.WriteByte(' ')
-			b.WriteString(word)
-			lineLen += 1 + len(word)
-		}
-	}
-	return b.String()
-}
-
 // renderMessages renders the whole transcript to a single string. It dispatches
 // on each message's DisplayRole and, within a row, on each block's concrete
 // type. Rows whose index is in queued get a trailing marker. A non-empty stream

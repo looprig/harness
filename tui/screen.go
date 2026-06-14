@@ -69,7 +69,7 @@ func (m Screen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width, m.height = msg.Width, msg.Height
 		m.ready = true
 		m.input.Resize(msg.Width)
-		m.history.Resize(msg.Width, m.historyHeight())
+		m.resizeHistory()
 		m.refreshHistory()
 		return m, nil
 	case tea.KeyMsg:
@@ -201,7 +201,12 @@ func (m Screen) View() string {
 	if !m.ready {
 		return ""
 	}
-	rows := []string{m.history.View(), RenderStatusLine(m.status)}
+	rows := []string{m.history.View()}
+	if status := RenderStatusLine(m.status); status != "" {
+		// Skip the Idle empty status: JoinVertical would otherwise count it as
+		// a blank row and the composite would exceed the height reservation.
+		rows = append(rows, status)
+	}
 	if m.slashComplete != nil {
 		rows = append(rows, m.slashComplete.View())
 	}
@@ -227,6 +232,7 @@ func (m *Screen) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if m.slashComplete != nil {
 			m.input.SetValue(m.slashComplete.Selected().Name)
 			m.slashComplete = nil
+			m.resizeHistory() // panel cleared: re-budget the viewport height
 			return *m, nil
 		}
 	case "up":
@@ -241,6 +247,11 @@ func (m *Screen) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 	case "enter":
 		return *m, m.handleEnter()
+	case "pgup", "pgdown", "ctrl+u", "ctrl+d":
+		// Scroll the transcript viewport instead of editing the input. This
+		// exercises the viewport's "stick to bottom only if at bottom" logic.
+		cmd := m.history.Update(msg)
+		return *m, cmd
 	}
 	return *m, m.forwardToInput(msg)
 }
@@ -278,6 +289,7 @@ func (m *Screen) handleEnter() tea.Cmd {
 		if ran {
 			m.input.Reset()
 			m.slashComplete = nil
+			m.resizeHistory() // panel cleared: re-budget the viewport height
 		}
 		return cmd
 	}
@@ -367,6 +379,7 @@ func (m *Screen) forwardToInput(msg tea.KeyMsg) tea.Cmd {
 	} else {
 		m.slashComplete = nil
 	}
+	m.resizeHistory() // panel toggled: re-budget the viewport height
 	return cmd
 }
 
@@ -438,8 +451,25 @@ func (m Screen) contentWidth() int {
 	return max(0, m.width)
 }
 
-// historyHeight is the viewport height: total height minus the status line and
-// input box, floored at zero.
+// panelHeight is the rendered height of the slash-complete panel, or 0 when the
+// panel is hidden (nil). It is subtracted from the viewport height so the panel
+// can never push the input box off-screen.
+func (m Screen) panelHeight() int {
+	if m.slashComplete == nil {
+		return 0
+	}
+	return lipgloss.Height(m.slashComplete.View())
+}
+
+// historyHeight is the viewport height: total height minus the status/input
+// reservation and the current slash-complete panel height, floored at zero.
 func (m Screen) historyHeight() int {
-	return max(0, m.height-reservedLines)
+	return max(0, m.height-reservedLines-m.panelHeight())
+}
+
+// resizeHistory re-sizes the history viewport to the current width and computed
+// height. Call it after any change that affects the height budget: the window
+// size, or any toggle of the slash-complete panel.
+func (m *Screen) resizeHistory() {
+	m.history.Resize(m.width, m.historyHeight())
 }

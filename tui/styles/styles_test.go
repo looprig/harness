@@ -3,20 +3,7 @@ package styles
 import (
 	"strings"
 	"testing"
-
-	"github.com/charmbracelet/lipgloss"
 )
-
-func TestDotWidth(t *testing.T) {
-	t.Parallel()
-
-	if got := DotWidth; got != lipgloss.Width(Dot) {
-		t.Errorf("DotWidth = %d, want %d", got, lipgloss.Width(Dot))
-	}
-	if DotWidth <= 0 {
-		t.Errorf("DotWidth = %d, want > 0", DotWidth)
-	}
-}
 
 func TestNewMarkdownRenderer(t *testing.T) {
 	t.Parallel()

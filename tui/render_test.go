@@ -41,52 +41,6 @@ func TestRenderMD(t *testing.T) {
 	}
 }
 
-func TestWrapText(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		name  string
-		s     string
-		width int
-	}{
-		{name: "empty", s: "", width: 10},
-		{name: "width zero unchanged", s: "a b c d e f g", width: 0},
-		{name: "negative width unchanged", s: "a b c d e f g", width: -1},
-		{name: "long line wraps", s: "the quick brown fox jumps over the lazy dog again", width: 10},
-		{name: "single short line", s: "short", width: 80},
-		{name: "over-long word terminates", s: "supercalifragilisticexpialidocious extra", width: 5},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-
-			got := wrapText(tt.s, tt.width)
-
-			if tt.s == "" {
-				if got != "" {
-					t.Errorf("wrapText(%q) = %q, want empty", tt.s, got)
-				}
-				return
-			}
-			if tt.width <= 0 {
-				if got != tt.s {
-					t.Errorf("wrapText(%q, %d) = %q, want unchanged", tt.s, tt.width, got)
-				}
-				return
-			}
-
-			// Every wrapped line must respect width unless it is a single
-			// over-long word that cannot be broken further.
-			for _, line := range strings.Split(got, "\n") {
-				if len(line) > tt.width && strings.Contains(line, " ") {
-					t.Errorf("wrapText line %q exceeds width %d and contains breakable space", line, tt.width)
-				}
-			}
-		})
-	}
-}
-
 func TestRenderMessages(t *testing.T) {
 	t.Parallel()
 

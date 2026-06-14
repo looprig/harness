@@ -11,9 +11,6 @@ import (
 // Dot is the leading marker rendered before assistant/markdown blocks.
 const Dot = "● "
 
-// DotWidth is the printed cell width of Dot (lipgloss.Width(Dot)).
-var DotWidth = lipgloss.Width(Dot)
-
 // Role styles (exported so package tui can use them).
 var (
 	UserStyle        = lipgloss.NewStyle().Bold(true)

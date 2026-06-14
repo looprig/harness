@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 
 	"github.com/inventivepotter/urvi/internal/agent/loop/event"
 	"github.com/inventivepotter/urvi/internal/content"
@@ -1123,6 +1124,95 @@ func TestHandleKeyTabNoPanelIsForwarded(t *testing.T) {
 	m, _ = updateScreen(t, m, tea.KeyMsg{Type: tea.KeyTab})
 	if m.slashComplete != nil {
 		t.Error("slashComplete should remain nil")
+	}
+}
+
+func TestHandleKeyScrollKeysRouteToHistory(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		key  tea.KeyMsg
+	}{
+		{name: "pgup", key: tea.KeyMsg{Type: tea.KeyPgUp}},
+		{name: "pgdown", key: tea.KeyMsg{Type: tea.KeyPgDown}},
+		{name: "ctrl+u", key: tea.KeyMsg{Type: tea.KeyCtrlU}},
+		{name: "ctrl+d", key: tea.KeyMsg{Type: tea.KeyCtrlD}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			agent := &fakeAgent{}
+			m := New(context.Background(), agent, fakeOpen(agent))
+			// Give the viewport real dimensions and content so scrolling is live.
+			m, _ = updateScreen(t, m, tea.WindowSizeMsg{Width: 40, Height: 20})
+			m.messages = make([]DisplayMessage, 0, 50)
+			for i := 0; i < 50; i++ {
+				m.messages = append(m.messages, DisplayMessage{
+					Role:   RoleSystem,
+					Blocks: []content.Block{&content.TextBlock{Text: "line of transcript content"}},
+				})
+			}
+			m.refreshHistory()
+			m.input.SetValue("draft")
+
+			m, cmd := updateScreen(t, m, tt.key)
+
+			// The scroll key must reach the viewport, not the textarea: the
+			// draft input is untouched.
+			if m.input.Value() != "draft" {
+				t.Errorf("input value = %q, want unchanged %q (scroll key leaked to textarea)", m.input.Value(), "draft")
+			}
+			_ = cmd // cmd may be nil or a viewport cmd; either is fine.
+		})
+	}
+}
+
+func TestViewNeverExceedsHeight(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		withPanel bool
+	}{
+		{name: "no panel", withPanel: false},
+		{name: "with slash panel", withPanel: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			agent := &fakeAgent{}
+			m := New(context.Background(), agent, fakeOpen(agent))
+			m, _ = updateScreen(t, m, tea.WindowSizeMsg{Width: 40, Height: 20})
+
+			// Fill the transcript so the viewport content is taller than the height.
+			m.messages = make([]DisplayMessage, 0, 50)
+			for i := 0; i < 50; i++ {
+				m.messages = append(m.messages, DisplayMessage{
+					Role:   RoleSystem,
+					Blocks: []content.Block{&content.TextBlock{Text: "line of transcript content"}},
+				})
+			}
+
+			if tt.withPanel {
+				// "/" matches ≥2 commands → a multi-row panel.
+				m.input.SetValue("/")
+				m.slashComplete = components.NewSlashComplete("/")
+				if m.slashComplete == nil {
+					t.Fatal("NewSlashComplete(/) = nil")
+				}
+				m.resizeHistory() // re-budget the viewport for the panel
+			}
+			m.refreshHistory()
+
+			if got := lipgloss.Height(m.View()); got > m.height {
+				t.Errorf("View() height = %d, want <= %d (overflow)", got, m.height)
+			}
+		})
 	}
 }
 
