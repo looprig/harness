@@ -46,6 +46,7 @@
 - `github.com/charmbracelet/bubbles` — textarea + viewport widgets for the TUI
 - `github.com/charmbracelet/lipgloss` — terminal styling/layout for the TUI
 - `github.com/charmbracelet/glamour` — markdown → ANSI rendering for the TUI transcript
+- `github.com/atotto/clipboard` — transitive (indirect) dep of `bubbles/textarea`, which imports it unconditionally for paste; approved as part of textarea, not chosen directly
 
 ## Secure Coding Patterns
 
