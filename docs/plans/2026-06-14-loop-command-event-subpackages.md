@@ -55,7 +55,7 @@ internal/agent/loop/
 ```
 loop/event   →  content, uuid, context        (context for EventSink.OnEvent)
 loop/command →  loop/event, content, context
-loop         →  loop/event, loop/command, llm, uuid
+loop         →  loop/event, loop/command, llm, content, uuid   (turn.go uses content directly)
 session      →  loop, loop/event, loop/command
 pa/agent     →  loop/event (return types), loop (Config)
 pa/agent_test→  loop/event, loop/command
@@ -97,18 +97,18 @@ are event payload errors, not command errors.
 
 | Test | Destination | Package |
 |---|---|---|
-| `TestValidateStartTurn` | `loop/command/start_turn_test.go` | `package command` (calls `Validate()` as exported method) |
-| Command error message tests (`TurnBusyError`, `InvalidCommandError`) | `loop/command/start_turn_test.go` | `package command` |
-| `LoopTerminatedError` message test | `loop/command/shutdown_test.go` | `package command` |
-| Event error message tests (`EmptyResponseError`, `TurnPanicError`) | `loop/event/errors_test.go` | `package event` |
+| `TestValidateStartTurn` | `loop/command/start_turn_test.go` | `package command_test` (black-box; `Validate()` is exported) |
+| Command error message tests (`TurnBusyError`, `InvalidCommandError`) | `loop/command/start_turn_test.go` | `package command_test` |
+| `LoopTerminatedError` message test | `loop/command/shutdown_test.go` | `package command_test` |
+| Event error message tests (`EmptyResponseError`, `TurnPanicError`) | `loop/event/errors_test.go` | `package event_test` |
 | `ConfigError` tests | `loop/errors_test.go` | `package loop` |
 | Actor tests | `loop/loop_test.go` | `package loop` (white-box, gains subpackage imports) |
 | Turn tests | `loop/turn_test.go` | `package loop` (white-box, gains loop/event import) |
 | Fake LLM helpers | `loop/fake_test.go` | `package loop` (unchanged) |
 
 White-box (`package loop`) is kept for actor and turn tests because they need access to
-loop internals. `Validate()` is now a method on `StartTurn` (exported), so command tests
-are `package command` but black-box is equally fine. Event tests use `package event`.
+loop internals. All command and event tests are black-box (`package command_test`,
+`package event_test`) — every tested symbol is exported, so white-box access adds nothing.
 
 ---
 
