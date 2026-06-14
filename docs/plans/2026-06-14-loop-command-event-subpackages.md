@@ -36,7 +36,7 @@ internal/agent/loop/
 │
 ├── command/
 │   ├── command.go     — Command interface
-│   ├── start_turn.go  — StartTurn, validateStartTurn, TurnBusyError/Reason,
+│   ├── start_turn.go  — StartTurn, (c StartTurn) Validate() error, TurnBusyError/Reason,
 │   │                    CommandName/Field, InvalidCommandError
 │   ├── interrupt.go   — Interrupt
 │   └── shutdown.go    — Shutdown, LoopTerminatedError
@@ -53,10 +53,11 @@ internal/agent/loop/
 ## Import graph
 
 ```
-loop/event   →  content, uuid
+loop/event   →  content, uuid, context        (context for EventSink.OnEvent)
 loop/command →  loop/event, content, context
 loop         →  loop/event, loop/command, llm, uuid
 session      →  loop, loop/event, loop/command
+pa/agent     →  loop/event (return types), loop (Config)
 pa/agent_test→  loop/event, loop/command
 ```
 
@@ -70,7 +71,7 @@ No cycles. `loop/event` is the base of the DAG.
 |---|---|
 | `Command` interface | `loop/command/command.go` |
 | `StartTurn` | `loop/command/start_turn.go` |
-| `validateStartTurn` (unexported) | `loop/command/start_turn.go` |
+| `(c StartTurn) Validate() error` (was `validateStartTurn`) | `loop/command/start_turn.go` — exported as method so `loop` can call `c.Validate()` cross-package |
 | `TurnBusyError`, `TurnBusyReason` | `loop/command/start_turn.go` |
 | `CommandName`, `CommandField`, `InvalidCommandError` | `loop/command/start_turn.go` |
 | `Interrupt` | `loop/command/interrupt.go` |
@@ -96,7 +97,7 @@ are event payload errors, not command errors.
 
 | Test | Destination | Package |
 |---|---|---|
-| `TestValidateStartTurn` | `loop/command/start_turn_test.go` | `package command` (white-box) |
+| `TestValidateStartTurn` | `loop/command/start_turn_test.go` | `package command` (calls `Validate()` as exported method) |
 | Command error message tests (`TurnBusyError`, `InvalidCommandError`) | `loop/command/start_turn_test.go` | `package command` |
 | `LoopTerminatedError` message test | `loop/command/shutdown_test.go` | `package command` |
 | Event error message tests (`EmptyResponseError`, `TurnPanicError`) | `loop/event/errors_test.go` | `package event` |
@@ -106,8 +107,8 @@ are event payload errors, not command errors.
 | Fake LLM helpers | `loop/fake_test.go` | `package loop` (unchanged) |
 
 White-box (`package loop`) is kept for actor and turn tests because they need access to
-loop internals. White-box (`package command`) is kept for `validateStartTurn` which is
-intentionally unexported. Event tests use `package event` for consistency.
+loop internals. `Validate()` is now a method on `StartTurn` (exported), so command tests
+are `package command` but black-box is equally fine. Event tests use `package event`.
 
 ---
 
@@ -115,8 +116,10 @@ intentionally unexported. Event tests use `package event` for consistency.
 
 | File | Change |
 |---|---|
-| `internal/agent/session/agent.go` | Add `loop/event`, `loop/command` imports; `loop.StartTurn` → `command.StartTurn`, `loop.TurnDone` → `event.TurnDone`, etc. |
-| `agents/personal-assistant/agent_test.go` | `loop.TurnDone` → `event.TurnDone`, `loop.TurnBusyError` → `command.TurnBusyError`, etc. |
-| `internal/agent/session/agent_test.go` | Same event/command import updates |
+| `internal/agent/session/agent.go` | Add `loop/event`, `loop/command`; `loop.StartTurn` → `command.StartTurn`, `loop.Interrupt` → `command.Interrupt`, `loop.Shutdown` → `command.Shutdown`, `loop.Event` → `event.Event`, `loop.TurnDone/TurnFailed/TurnInterrupted` → `event.*`, `loop.LoopTerminatedError` → `command.LoopTerminatedError` |
+| `internal/agent/session/agent_test.go` | `loop.TurnDone/TurnInterrupted` → `event.*`, `loop.TurnBusyError` → `command.TurnBusyError`, `loop.LoopTerminatedError` → `command.LoopTerminatedError` |
+| `agents/personal-assistant/agent.go` | Return types: `loop.Event` → `event.Event`, `*llm.StreamReader[loop.Event]` → `*llm.StreamReader[event.Event]`; add `loop/event` import; keep `loop` import for `loop.Config` |
+| `agents/personal-assistant/agent_test.go` | `loop.TurnDone/TurnFailed/TurnInterrupted` → `event.*`, `loop.TurnBusyError` → `command.TurnBusyError`; add `loop/event`, `loop/command` imports |
+| `docs/plans/2026-06-13-tui-design.md` | References to `loop.Event`, `loop.TurnDone`, `loop.TurnBusyError` in the `Agent` interface and `StreamBlocks` signature are doc-only; update qualifiers to `event.*` / `command.*` to stay accurate as a source of truth |
 
-No logic changes in any consumer — only import paths and type qualifiers change.
+No logic changes in any consumer — only import paths, type qualifiers, and doc references change.
