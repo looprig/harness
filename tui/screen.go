@@ -2,6 +2,7 @@ package tui
 
 import (
 	"context"
+	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -208,10 +209,194 @@ func (m Screen) View() string {
 	return lipgloss.JoinVertical(lipgloss.Left, rows...)
 }
 
-// handleKey routes a key press. Placeholder until the key-handling dispatch lands.
-func (m Screen) handleKey(_ tea.KeyMsg) (tea.Model, tea.Cmd) {
-	// TODO(next dispatch): key handling (Enter/Esc/Ctrl+C/slash-complete).
-	return m, nil
+// handleKey routes a key press to the input editor, slash-complete panel, or a
+// turn-control action. It mutates the addressable receiver and returns the value.
+// Ctrl+C quits from any state; Esc interrupts only while Running; Tab/Up/Down
+// drive the slash panel when visible; Enter submits, queues, or runs a slash
+// command; any other key forwards to the input editor and rebuilds the panel.
+func (m *Screen) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "ctrl+c":
+		return *m, tea.Sequence(closeAgent(m.agent), tea.Quit)
+	case "esc":
+		if m.status == StatusRunning {
+			return *m, m.interruptRunning()
+		}
+		return *m, nil
+	case "tab":
+		if m.slashComplete != nil {
+			m.input.SetValue(m.slashComplete.Selected().Name)
+			m.slashComplete = nil
+			return *m, nil
+		}
+	case "up":
+		if m.slashComplete != nil {
+			m.slashComplete.Up()
+			return *m, nil
+		}
+	case "down":
+		if m.slashComplete != nil {
+			m.slashComplete.Down()
+			return *m, nil
+		}
+	case "enter":
+		return *m, m.handleEnter()
+	}
+	return *m, m.forwardToInput(msg)
+}
+
+// interruptRunning begins an interrupt: it flips to Interrupting, drops the
+// pending queue, and removes exactly the queued-but-unsent rows from the
+// transcript (by DisplayIndex) before returning the bounded Interrupt command.
+func (m *Screen) interruptRunning() tea.Cmd {
+	m.status = StatusInterrupting
+
+	drop := make(map[int]bool, len(m.queue))
+	for _, q := range m.queue {
+		drop[q.DisplayIndex] = true
+	}
+	kept := make([]DisplayMessage, 0, len(m.messages))
+	for i, row := range m.messages {
+		if drop[i] {
+			continue
+		}
+		kept = append(kept, row)
+	}
+	m.messages = kept
+	m.queue = nil
+	m.refreshHistory()
+	return interruptTurn(m.appCtx, m.agent)
+}
+
+// handleEnter resolves an Enter press. A visible slash-complete selection or a
+// leading-slash input routes through dispatchSlash; only an actual run resets
+// the input (and hides the panel). Otherwise it is a plain submit/queue.
+func (m *Screen) handleEnter() tea.Cmd {
+	if m.slashComplete != nil {
+		name := m.slashComplete.Selected().Name
+		cmd, ran := m.dispatchSlash(name)
+		if ran {
+			m.input.Reset()
+			m.slashComplete = nil
+		}
+		return cmd
+	}
+
+	if strings.TrimSpace(m.input.Value()) == "" {
+		return nil
+	}
+
+	if strings.HasPrefix(m.input.Value(), "/") {
+		name := firstToken(m.input.Value())
+		if isSlashCommand(name) {
+			cmd, ran := m.dispatchSlash(name)
+			if ran {
+				m.input.Reset()
+			}
+			return cmd
+		}
+		// Unknown command: fall through to a plain-text submit.
+	}
+
+	return m.submit()
+}
+
+// dispatchSlash runs a known slash command, returning whether it actually ran.
+// A no-op (e.g. /clear while busy) returns ran=false so the caller keeps the
+// input and panel intact.
+func (m *Screen) dispatchSlash(name string) (cmd tea.Cmd, ran bool) {
+	switch name {
+	case "/help":
+		m.messages = append(m.messages, DisplayMessage{
+			Role:   RoleSystem,
+			Blocks: []content.Block{&content.TextBlock{Text: helpText()}},
+		})
+		m.refreshHistory()
+		return nil, true
+	case "/clear":
+		if m.status == StatusIdle {
+			m.status = StatusResetting
+			return reopenAgent(m.appCtx, m.openAgent), true
+		}
+		return nil, false
+	default:
+		return nil, false
+	}
+}
+
+// submit builds blocks from the input and either starts a turn (Idle), queues
+// it (Running), or no-ops (Interrupting/Resetting). A buildBlocks error and a
+// failed start both keep the input intact; only a successful start or queue
+// appends the RoleUser row and resets the input.
+func (m *Screen) submit() tea.Cmd {
+	blocks, err := buildBlocks(m.input.Value(), m.agent.AcceptsImages())
+	if err != nil {
+		m.appendError(err) // keep input intact; no turn
+		return nil
+	}
+
+	switch m.status {
+	case StatusIdle:
+		cmd, ok := m.startTurn(blocks)
+		if ok {
+			m.messages = append(m.messages, DisplayMessage{Role: RoleUser, Blocks: blocks})
+			m.input.Reset()
+		}
+		// On !ok startTurn already appended a RoleError and stayed Idle: keep input.
+		m.refreshHistory()
+		return cmd
+	case StatusRunning:
+		m.messages = append(m.messages, DisplayMessage{Role: RoleUser, Blocks: blocks})
+		m.queue = append(m.queue, queuedInput{Blocks: blocks, DisplayIndex: len(m.messages) - 1})
+		m.input.Reset()
+		m.refreshHistory()
+		return nil
+	default: // Interrupting / Resetting: no-op, keep input intact.
+		return nil
+	}
+}
+
+// forwardToInput sends msg to the input editor and rebuilds the slash-complete
+// panel from the new value: a leading-slash word (no whitespace) rebuilds it
+// from the prefix (nil if no command matches); anything else hides it.
+func (m *Screen) forwardToInput(msg tea.KeyMsg) tea.Cmd {
+	cmd := m.input.Update(msg)
+	v := m.input.Value()
+	if strings.HasPrefix(v, "/") && !strings.ContainsAny(v, " \t\n") {
+		m.slashComplete = components.NewSlashComplete(firstToken(v))
+	} else {
+		m.slashComplete = nil
+	}
+	return cmd
+}
+
+// helpText builds the /help listing from the canonical command table.
+func helpText() string {
+	var b strings.Builder
+	b.WriteString("commands:")
+	for _, c := range components.SlashCommands {
+		b.WriteString("\n  " + c.Name + " — " + c.Desc)
+	}
+	return b.String()
+}
+
+// isSlashCommand reports whether name is one of the canonical slash commands.
+func isSlashCommand(name string) bool {
+	for _, c := range components.SlashCommands {
+		if c.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+// firstToken returns the first whitespace-delimited token of s, or "" if none.
+func firstToken(s string) string {
+	fields := strings.Fields(s)
+	if len(fields) == 0 {
+		return ""
+	}
+	return fields[0]
 }
 
 // startTurn begins a turn from blocks. agent.StreamBlocks may fail before a reader

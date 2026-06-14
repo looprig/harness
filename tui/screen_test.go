@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"strings"
 	"testing"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -11,6 +12,7 @@ import (
 	"github.com/inventivepotter/urvi/internal/agent/loop/event"
 	"github.com/inventivepotter/urvi/internal/content"
 	"github.com/inventivepotter/urvi/internal/llm"
+	"github.com/inventivepotter/urvi/tui/components"
 )
 
 // fakeAgent is a scriptable Agent test double. It records calls and returns the
@@ -677,5 +679,477 @@ func TestUpdateSystemReady(t *testing.T) {
 	}
 	if firstTextBlock(t, row) != "session ready" {
 		t.Errorf("text = %q, want %q", firstTextBlock(t, row), "session ready")
+	}
+}
+
+func TestFirstToken(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{name: "single word", in: "/help", want: "/help"},
+		{name: "leading word with args", in: "/clear now", want: "/clear"},
+		{name: "leading whitespace", in: "  /help foo", want: "/help"},
+		{name: "empty", in: "", want: ""},
+		{name: "whitespace only", in: "   ", want: ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := firstToken(tt.in); got != tt.want {
+				t.Errorf("firstToken(%q) = %q, want %q", tt.in, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestHandleKeyTypingForwardsToInput(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name        string
+		value       string
+		wantSlash   bool // expect slashComplete non-nil after rebuild
+		description string
+	}{
+		{name: "plain text no panel", value: "hi", wantSlash: false},
+		{name: "single slash matches both", value: "/", wantSlash: true},
+		{name: "slash c matches clear", value: "/c", wantSlash: true},
+		{name: "no match", value: "/zz", wantSlash: false},
+		{name: "slash with space hides panel", value: "/clear ", wantSlash: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			agent := &fakeAgent{}
+			m := New(context.Background(), agent, fakeOpen(agent))
+			// SetValue then drive a no-op key so the default branch rebuilds the panel.
+			m.input.SetValue(tt.value)
+			m, _ = updateScreen(t, m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("")})
+
+			if m.input.Value() != tt.value {
+				t.Errorf("input value = %q, want %q", m.input.Value(), tt.value)
+			}
+			if (m.slashComplete != nil) != tt.wantSlash {
+				t.Errorf("slashComplete != nil = %v, want %v", m.slashComplete != nil, tt.wantSlash)
+			}
+		})
+	}
+}
+
+func TestHandleKeyEnterPlainSubmitIdle(t *testing.T) {
+	t.Parallel()
+
+	agent := &fakeAgent{streamReader: scriptedReader(event.TurnStarted{})}
+	m := New(context.Background(), agent, fakeOpen(agent))
+	m.input.SetValue("hello there")
+
+	m, cmd := updateScreen(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+
+	if cmd == nil {
+		t.Error("Enter submit cmd = nil, want non-nil (readNext)")
+	}
+	if m.status != StatusRunning {
+		t.Errorf("status = %d, want StatusRunning", m.status)
+	}
+	if m.input.Value() != "" {
+		t.Errorf("input = %q, want reset to empty", m.input.Value())
+	}
+	if len(m.messages) == 0 {
+		t.Fatal("expected a RoleUser row")
+	}
+	last := m.messages[len(m.messages)-1]
+	if last.Role != RoleUser {
+		t.Errorf("last role = %d, want RoleUser", last.Role)
+	}
+}
+
+func TestHandleKeyEnterQueueWhileRunning(t *testing.T) {
+	t.Parallel()
+
+	agent := &fakeAgent{}
+	m := New(context.Background(), agent, fakeOpen(agent))
+	m.status = StatusRunning
+	m.reader = scriptedReader()
+	// Pre-existing rows so the DisplayIndex is not trivially 0.
+	m.messages = []DisplayMessage{{Role: RoleUser}, {Role: RoleAssistant}}
+	m.input.SetValue("queued one")
+
+	m, cmd := updateScreen(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+
+	if cmd != nil {
+		t.Errorf("queue Enter cmd = non-nil, want nil")
+	}
+	if len(m.queue) != 1 {
+		t.Fatalf("queue len = %d, want 1", len(m.queue))
+	}
+	wantIdx := len(m.messages) - 1
+	if m.queue[0].DisplayIndex != wantIdx {
+		t.Errorf("queue[0].DisplayIndex = %d, want %d", m.queue[0].DisplayIndex, wantIdx)
+	}
+	if m.messages[wantIdx].Role != RoleUser {
+		t.Errorf("queued row role = %d, want RoleUser", m.messages[wantIdx].Role)
+	}
+	if m.input.Value() != "" {
+		t.Errorf("input = %q, want reset", m.input.Value())
+	}
+	if m.status != StatusRunning {
+		t.Errorf("status = %d, want StatusRunning", m.status)
+	}
+}
+
+func TestHandleKeyEnterBadAttachmentKeepsInput(t *testing.T) {
+	t.Parallel()
+
+	agent := &fakeAgent{}
+	m := New(context.Background(), agent, fakeOpen(agent))
+	m.input.SetValue("@nope.pem") // .pem is a denied extension → buildBlocks error
+
+	m, cmd := updateScreen(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+
+	if cmd != nil {
+		t.Errorf("cmd = non-nil, want nil (no turn started)")
+	}
+	if m.input.Value() != "@nope.pem" {
+		t.Errorf("input = %q, want intact %q", m.input.Value(), "@nope.pem")
+	}
+	if m.status != StatusIdle {
+		t.Errorf("status = %d, want StatusIdle", m.status)
+	}
+	if len(m.messages) == 0 || m.messages[len(m.messages)-1].Role != RoleError {
+		t.Error("expected a RoleError row")
+	}
+	if agent.closeCalled {
+		t.Error("agent should not be touched on a buildBlocks error")
+	}
+}
+
+func TestHandleKeyEnterEmptyIsNoop(t *testing.T) {
+	t.Parallel()
+
+	agent := &fakeAgent{}
+	m := New(context.Background(), agent, fakeOpen(agent))
+	m.input.SetValue("   ") // whitespace only
+
+	m, cmd := updateScreen(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+
+	if cmd != nil {
+		t.Errorf("cmd = non-nil, want nil")
+	}
+	if len(m.messages) != 0 {
+		t.Errorf("messages len = %d, want 0", len(m.messages))
+	}
+	if m.status != StatusIdle {
+		t.Errorf("status = %d, want StatusIdle", m.status)
+	}
+}
+
+func TestHandleKeyEnterHelp(t *testing.T) {
+	t.Parallel()
+
+	agent := &fakeAgent{}
+	m := New(context.Background(), agent, fakeOpen(agent))
+	m.input.SetValue("/help")
+
+	m, cmd := updateScreen(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+
+	if cmd != nil {
+		t.Errorf("/help cmd = non-nil, want nil")
+	}
+	if len(m.messages) != 1 {
+		t.Fatalf("messages len = %d, want 1", len(m.messages))
+	}
+	row := m.messages[0]
+	if row.Role != RoleSystem {
+		t.Errorf("role = %d, want RoleSystem", row.Role)
+	}
+	text := firstTextBlock(t, row)
+	for _, c := range components.SlashCommands {
+		if !strings.Contains(text, c.Name) {
+			t.Errorf("help text missing %q; got %q", c.Name, text)
+		}
+	}
+	if m.input.Value() != "" {
+		t.Errorf("input = %q, want reset after /help ran", m.input.Value())
+	}
+}
+
+func TestHandleKeyEnterClearWhileIdle(t *testing.T) {
+	t.Parallel()
+
+	agent := &fakeAgent{}
+	m := New(context.Background(), agent, fakeOpen(agent))
+	m.input.SetValue("/clear")
+
+	m, cmd := updateScreen(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+
+	if cmd == nil {
+		t.Error("/clear cmd = nil, want non-nil (reopen)")
+	}
+	if m.status != StatusResetting {
+		t.Errorf("status = %d, want StatusResetting", m.status)
+	}
+	if m.input.Value() != "" {
+		t.Errorf("input = %q, want reset after /clear ran", m.input.Value())
+	}
+}
+
+func TestHandleKeyEnterClearWhileRunningIsNoop(t *testing.T) {
+	t.Parallel()
+
+	agent := &fakeAgent{}
+	m := New(context.Background(), agent, fakeOpen(agent))
+	m.status = StatusRunning
+	m.reader = scriptedReader()
+	m.input.SetValue("/clear")
+
+	m, cmd := updateScreen(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+
+	if cmd != nil {
+		t.Errorf("/clear-while-running cmd = non-nil, want nil (no-op)")
+	}
+	if m.status != StatusRunning {
+		t.Errorf("status = %d, want StatusRunning (unchanged)", m.status)
+	}
+	if m.input.Value() != "/clear" {
+		t.Errorf("input = %q, want intact %q", m.input.Value(), "/clear")
+	}
+}
+
+func TestHandleKeyEnterUnknownSlashFallsToSubmit(t *testing.T) {
+	t.Parallel()
+
+	agent := &fakeAgent{streamReader: scriptedReader(event.TurnStarted{})}
+	m := New(context.Background(), agent, fakeOpen(agent))
+	// /unknown is not a known command, so it submits as plain text.
+	m.input.SetValue("/unknown stuff")
+
+	m, cmd := updateScreen(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+
+	if cmd == nil {
+		t.Error("unknown-slash cmd = nil, want non-nil (plain submit)")
+	}
+	if m.status != StatusRunning {
+		t.Errorf("status = %d, want StatusRunning", m.status)
+	}
+	last := m.messages[len(m.messages)-1]
+	if last.Role != RoleUser {
+		t.Errorf("last role = %d, want RoleUser", last.Role)
+	}
+}
+
+func TestHandleKeyEscWhileRunningClearsQueue(t *testing.T) {
+	t.Parallel()
+
+	agent := &fakeAgent{interruptCancelled: true}
+	m := New(context.Background(), agent, fakeOpen(agent))
+	m.status = StatusRunning
+	m.reader = scriptedReader()
+	// messages: [0]=user (active), [1]=system (interleaved), [2]=user (queued)
+	m.messages = []DisplayMessage{
+		{Role: RoleUser, Blocks: []content.Block{&content.TextBlock{Text: "active"}}},
+		{Role: RoleSystem, Blocks: []content.Block{&content.TextBlock{Text: "help"}}},
+		{Role: RoleUser, Blocks: []content.Block{&content.TextBlock{Text: "queued"}}},
+	}
+	m.queue = []queuedInput{{Blocks: []content.Block{&content.TextBlock{Text: "queued"}}, DisplayIndex: 2}}
+
+	m, cmd := updateScreen(t, m, tea.KeyMsg{Type: tea.KeyEsc})
+
+	if cmd == nil {
+		t.Error("Esc cmd = nil, want non-nil (interruptTurn)")
+	}
+	if m.status != StatusInterrupting {
+		t.Errorf("status = %d, want StatusInterrupting", m.status)
+	}
+	if len(m.queue) != 0 {
+		t.Errorf("queue len = %d, want 0", len(m.queue))
+	}
+	if len(m.messages) != 2 {
+		t.Fatalf("messages len = %d, want 2 (queued row removed)", len(m.messages))
+	}
+	// The remaining rows are the active user row and the interleaved system row.
+	if firstTextBlock(t, m.messages[0]) != "active" {
+		t.Errorf("messages[0] text = %q, want %q", firstTextBlock(t, m.messages[0]), "active")
+	}
+	if m.messages[1].Role != RoleSystem {
+		t.Errorf("messages[1] role = %d, want RoleSystem", m.messages[1].Role)
+	}
+}
+
+func TestHandleKeyEscWhileIdleIsNoop(t *testing.T) {
+	t.Parallel()
+
+	agent := &fakeAgent{}
+	m := New(context.Background(), agent, fakeOpen(agent))
+	m.status = StatusIdle
+
+	m, cmd := updateScreen(t, m, tea.KeyMsg{Type: tea.KeyEsc})
+
+	if cmd != nil {
+		t.Errorf("Esc-while-idle cmd = non-nil, want nil")
+	}
+	if m.status != StatusIdle {
+		t.Errorf("status = %d, want StatusIdle", m.status)
+	}
+}
+
+func TestHandleKeyCtrlC(t *testing.T) {
+	t.Parallel()
+
+	agent := &fakeAgent{}
+	m := New(context.Background(), agent, fakeOpen(agent))
+
+	_, cmd := updateScreen(t, m, tea.KeyMsg{Type: tea.KeyCtrlC})
+
+	if cmd == nil {
+		t.Fatal("Ctrl+C cmd = nil, want non-nil (close + quit sequence)")
+	}
+}
+
+func TestHandleKeySlashCompleteEnter(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name          string
+		status        Status
+		selected      string // command Name under cursor
+		wantRan       bool   // ran → input reset + panel hidden
+		wantStatus    Status
+		wantInputKept string // when !wantRan, the input should stay this
+	}{
+		{
+			name:       "help runs resets and hides panel",
+			status:     StatusIdle,
+			selected:   "/help",
+			wantRan:    true,
+			wantStatus: StatusIdle,
+		},
+		{
+			name:       "clear idle runs resets and hides panel",
+			status:     StatusIdle,
+			selected:   "/clear",
+			wantRan:    true,
+			wantStatus: StatusResetting,
+		},
+		{
+			name:          "clear while running is noop keeps panel and input",
+			status:        StatusRunning,
+			selected:      "/clear",
+			wantRan:       false,
+			wantStatus:    StatusRunning,
+			wantInputKept: "/cl",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			agent := &fakeAgent{}
+			m := New(context.Background(), agent, fakeOpen(agent))
+			m.status = tt.status
+			if tt.status == StatusRunning {
+				m.reader = scriptedReader()
+			}
+			// Build a panel whose Selected() is the wanted command.
+			m.input.SetValue("/cl")
+			m.slashComplete = components.NewSlashComplete(tt.selected)
+			if m.slashComplete == nil {
+				t.Fatalf("NewSlashComplete(%q) = nil", tt.selected)
+			}
+
+			m, _ = updateScreen(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+
+			if m.status != tt.wantStatus {
+				t.Errorf("status = %d, want %d", m.status, tt.wantStatus)
+			}
+			if tt.wantRan {
+				if m.input.Value() != "" {
+					t.Errorf("input = %q, want reset (ran)", m.input.Value())
+				}
+				if m.slashComplete != nil {
+					t.Error("slashComplete != nil, want hidden (ran)")
+				}
+			} else {
+				if m.input.Value() != tt.wantInputKept {
+					t.Errorf("input = %q, want kept %q (no-op)", m.input.Value(), tt.wantInputKept)
+				}
+				if m.slashComplete == nil {
+					t.Error("slashComplete = nil, want kept (no-op)")
+				}
+			}
+		})
+	}
+}
+
+func TestHandleKeyTab(t *testing.T) {
+	t.Parallel()
+
+	agent := &fakeAgent{}
+	m := New(context.Background(), agent, fakeOpen(agent))
+	m.input.SetValue("/h")
+	m.slashComplete = components.NewSlashComplete("/h")
+	if m.slashComplete == nil {
+		t.Fatal("NewSlashComplete(/h) = nil")
+	}
+	want := m.slashComplete.Selected().Name
+
+	m, cmd := updateScreen(t, m, tea.KeyMsg{Type: tea.KeyTab})
+
+	if cmd != nil {
+		t.Errorf("Tab cmd = non-nil, want nil")
+	}
+	if m.input.Value() != want {
+		t.Errorf("input = %q, want %q", m.input.Value(), want)
+	}
+	if m.slashComplete != nil {
+		t.Error("slashComplete != nil, want hidden after Tab")
+	}
+}
+
+func TestHandleKeyTabNoPanelIsForwarded(t *testing.T) {
+	t.Parallel()
+
+	agent := &fakeAgent{}
+	m := New(context.Background(), agent, fakeOpen(agent))
+	m.input.SetValue("hi")
+	// No slashComplete; Tab falls through to the input editor (default branch).
+	m, _ = updateScreen(t, m, tea.KeyMsg{Type: tea.KeyTab})
+	if m.slashComplete != nil {
+		t.Error("slashComplete should remain nil")
+	}
+}
+
+func TestHandleKeyUpDownMovesSelection(t *testing.T) {
+	t.Parallel()
+
+	agent := &fakeAgent{}
+	m := New(context.Background(), agent, fakeOpen(agent))
+	// Prefix "/" matches both /clear and /help (≥2 items).
+	m.slashComplete = components.NewSlashComplete("/")
+	if m.slashComplete == nil || len(components.SlashCommands) < 2 {
+		t.Fatal("need ≥2 matching commands for this test")
+	}
+	first := m.slashComplete.Selected().Name
+
+	m, cmd := updateScreen(t, m, tea.KeyMsg{Type: tea.KeyDown})
+	if cmd != nil {
+		t.Errorf("Down cmd = non-nil, want nil")
+	}
+	afterDown := m.slashComplete.Selected().Name
+	if afterDown == first {
+		t.Errorf("Down did not move selection from %q", first)
+	}
+
+	m, _ = updateScreen(t, m, tea.KeyMsg{Type: tea.KeyUp})
+	afterUp := m.slashComplete.Selected().Name
+	if afterUp != first {
+		t.Errorf("Up did not return to %q, got %q", first, afterUp)
 	}
 }
