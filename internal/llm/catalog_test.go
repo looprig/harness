@@ -24,4 +24,9 @@ func TestChutesKimiK2(t *testing.T) {
 	if err != nil || !needsKey {
 		t.Errorf("RequiresKey() = (%v, %v), want (true, nil)", needsKey, err)
 	}
+
+	// Kimi K2 is a text-only model: it must not advertise image support.
+	if m.AcceptsImages {
+		t.Errorf("AcceptsImages = true, want false (Kimi K2 is text-only)")
+	}
 }

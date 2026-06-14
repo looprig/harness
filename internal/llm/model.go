@@ -14,6 +14,10 @@ type Model struct {
 	Name        string
 	Temperature *float64
 	MaxTokens   *int
+
+	// AcceptsImages reports whether this model accepts image inputs. Zero value
+	// false means text-only. Carried verbatim onto the ModelSpec by Spec.
+	AcceptsImages bool
 }
 
 // Spec materializes a ModelSpec from this definition, injecting the secret API
@@ -22,13 +26,14 @@ type Model struct {
 // mutates *spec.Temperature cannot reach back into a shared Model.
 func (m Model) Spec(apiKey, system string) ModelSpec {
 	return ModelSpec{
-		Provider:    m.Provider,
-		BaseURL:     m.BaseURL,
-		APIKey:      apiKey,
-		Model:       m.Name,
-		System:      system,
-		Temperature: cloneFloat64Ptr(m.Temperature),
-		MaxTokens:   cloneIntPtr(m.MaxTokens),
+		Provider:      m.Provider,
+		BaseURL:       m.BaseURL,
+		APIKey:        apiKey,
+		Model:         m.Name,
+		System:        system,
+		AcceptsImages: m.AcceptsImages,
+		Temperature:   cloneFloat64Ptr(m.Temperature),
+		MaxTokens:     cloneIntPtr(m.MaxTokens),
 	}
 }
 

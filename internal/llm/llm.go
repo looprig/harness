@@ -45,6 +45,11 @@ type ModelSpec struct {
 	Model  string
 	System string
 
+	// AcceptsImages reports whether the model accepts image inputs. It is the
+	// single source of truth for modality gating (e.g. a TUI deciding whether
+	// to allow image attachments). Zero value false means text-only.
+	AcceptsImages bool
+
 	Temperature *float64
 	TopP        *float64
 	MaxTokens   *int

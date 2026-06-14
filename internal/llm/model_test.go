@@ -64,6 +64,43 @@ func TestModelSpec(t *testing.T) {
 	}
 }
 
+// TestModelSpecAcceptsImages verifies Spec carries the AcceptsImages modality
+// flag from the Model onto the returned ModelSpec, and that the zero value is
+// false (text-only by default).
+func TestModelSpecAcceptsImages(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name  string
+		model llm.Model
+		want  bool
+	}{
+		{
+			name:  "explicit true is carried onto spec",
+			model: llm.Model{AcceptsImages: true},
+			want:  true,
+		},
+		{
+			name:  "explicit false is carried onto spec",
+			model: llm.Model{AcceptsImages: false},
+			want:  false,
+		},
+		{
+			name:  "zero value defaults to false",
+			model: llm.Model{},
+			want:  false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got := tt.model.Spec("k", "s").AcceptsImages
+			if got != tt.want {
+				t.Errorf("Spec().AcceptsImages = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
 // TestModelSpecClonesPointers guards both cloneFloat64Ptr and cloneIntPtr:
 // mutating the returned spec's pointees must not reach a second spec or the Model.
 func TestModelSpecClonesPointers(t *testing.T) {
