@@ -57,6 +57,16 @@ Date: 2026-06-14 · Status: approved (brainstorm)
 > normalized `Hostname()`** (port-excluded, IDNA/punycode via `x/net/idna`) (§3c);
 > (6) **`Effect` (un)marshals as `"allow"/"ask"/"deny"`** in the user-editable file,
 > unknown → error (§3b).
+>
+> **Revision 2026-06-14 (review pass 5)** resolves a fifth review: (1) **sink path is
+> redacted** while the TUI stream stays full-fidelity — `PermissionRequested`/
+> `UserInputRequested` carry sensitive text only to the TUI, a `Redactable.SinkProjection`
+> strips it for sinks (§5b); (2) **Grep denied-path enforcement is two-layer** — `rg
+> --glob '!…'` exclusions *plus* an authoritative `ReadGuard.DeniedRead` output filter
+> (§4b); (3) **TUI prompt queue keyed by `CallID`** since concurrent `AskUser` gates
+> can coexist (§5d); (4) **malformed approvals fail open to `EffectAsk`, never
+> `AutoApprove`** (`Check` has no error return; bad file → empty stage + warn, bad
+> record → skipped) (§3c).
 
 ## Scope
 
@@ -662,6 +672,18 @@ on **every** call (so a `w` grant during one gate is visible to the next call's
 `Check` immediately); `hashcache` skips the JSON unmarshal when the file bytes are
 unchanged.
 
+**Malformed approvals — `Check` has no error return, so it fails open to `EffectAsk`,
+never to `AutoApprove`.** A read or parse failure of an approvals file makes the
+**Stage-5 persisted-approvals stage behave as empty** (the file contributes no
+grants); evaluation continues to Stage 6/7, landing at `EffectAsk` — the user is
+prompted (and can fix the file). A single malformed *record* in an otherwise-valid
+file is skipped (it grants nothing); valid records still apply. This is fail-secure
+in the right direction: a broken file can never *auto-approve*, but it also doesn't
+deny-everything and wedge the agent. The failure is surfaced once as a warning
+(log/sink) so the user knows the file is broken. (`hashcache.Load` returns
+`(ApprovalsFile, error)`; on error `Check` uses the zero value and warns — it never
+propagates the error into the effect.)
+
 ### §3d. New helper — `internal/hashcache/`
 
 ```go
@@ -694,7 +716,7 @@ in observability events — §2d); `crypto/rand` IDs (`internal/uuid`).
 | `EditFile` | path, old/new, replace_all | str-replace; 0→error, 2+ & !replace_all→ambiguous, else replace; diff preview | Ask (`FileWriteRequest`) |
 | `Bash` | command, workdir, timeout(≤120s) | `exec.CommandContext(ctx, "sh", "-c", command)`; combined output; 32 KiB cap; advisory `DeniedBashPrefixes` (see security note) | Ask (`BashRequest`) |
 | `Glob` | pattern, root | `containedPath`; **`**` via stdlib `WalkDir` + per-segment `path.Match`**; **`ReadGuard` excludes `DeniedReadPaths` from results** (else auto-approved glob leaks `.env`/`id_rsa` names); ≤500 results | AutoApprove |
-| `Grep` | pattern, path, recursive, ignore_case, context_lines, include_all | `rg` if present (binary, not a Go dep) — **arg-list exec, never a shell string: `exec.Command("rg", "--regexp", pattern, flags…, "--", path)`** so a `-`-leading pattern/path can't become a flag — else `WalkDir`+`regexp`; skip noise dirs **and `DeniedReadPaths` (never open/match a denied file)**; ≤200 matches | AutoApprove |
+| `Grep` | pattern, path, recursive, ignore_case, context_lines, include_all | `rg` if present (binary, not a Go dep) — **arg-list exec, never a shell string: `exec.Command("rg", "--regexp", pattern, flags…, "--", path)`** so a `-`-leading pattern/path can't become a flag — else `WalkDir`+`regexp`; skip noise dirs; **denied-path enforcement is two-layer** (see note); ≤200 matches | AutoApprove |
 | `Fetch` | url, method(GET/POST), headers, body, timeout(≤60s) | `net/http` w/ explicit timeouts + `tls.Config{MinVersion: TLS1.2}`; 64 KiB cap | Ask (`FetchRequest`) |
 | `WebSearch` | query, results(≤10) | `SearchProvider` iface; DuckDuckGo HTML scrape via **`golang.org/x/net/html`** | Ask (`WebSearchRequest`) |
 | `AskUser` | question, choices | emits `UserInputRequested` via `EmitFromContext`; registers a gate, blocks on its reply (CallID-validated); answer validated against choices | AutoApprove |
@@ -723,6 +745,16 @@ can't express. The exception is explicit, not accidental:
   **out of scope** here and is the prerequisite for ever auto-approving `Bash`
   broadly. Until then, `Bash` is gated by human approval.
 - This exception must be recorded in CLAUDE.md when `Bash` is implemented.
+
+**Grep denied-path enforcement (two-layer).** `rg` opens files itself during a
+recursive search, so it must not be trusted as the security boundary. (1) Translate
+`DeniedReadPaths` + noise dirs into `rg --glob '!<pattern>'` exclusions (gitignore-
+style, matching our `**/.env` form) so `rg` *skips* (never opens) them — best-effort,
+for performance and "not opened". (2) **Authoritatively**, filter every result path
+through `ReadGuard.DeniedRead` before emitting, so even a translation gap can never
+leak a denied file's path/content to the model. The stdlib `WalkDir`+`regexp`
+fallback applies `DeniedRead` directly during traversal. An integration test asserts
+a workspace `.env` is neither opened by `rg` (no `--glob` miss) nor present in output.
 
 ### §4c. Default-policy table
 
@@ -773,6 +805,31 @@ type ToolCallCompleted   struct { CallID uuid.UUID; IsError bool }
 `event` imports `internal/tool` for `PermissionRequest` — no cycle (`tool` imports
 only `content`). `ShellSession*` events are deferred with the tool.
 
+**Two audiences, not one — redacted sink projection.** Turn events serve two
+consumers: the per-turn `StartTurn.Events` **stream** (the TUI, which *must* see full
+fidelity — `Request.Description()` is what it renders) and the `EventSink` path
+(observability/audit logs). `PermissionRequested.Request.Description()` can hold a
+Bash command, a file-diff preview, or a URL; `UserInputRequested.Question` can hold
+user-sensitive text — neither belongs verbatim in a log (CLAUDE.md: *log events, not
+secrets*). So the **stream is full-fidelity; the sink path is redacted**. An event
+carrying sensitive payload implements an optional projector that the loop applies
+**only on the sink path** (the stream is untouched):
+
+```go
+// in internal/agent/loop/event/
+type Redactable interface { SinkProjection() Event } // loop calls this before enveloping for sinks
+```
+
+| Event | Stream (TUI) | Sink projection |
+|---|---|---|
+| `PermissionRequested` | full `Request` | `{CallID, ToolName}` only (drop `Description`) |
+| `UserInputRequested` | full `Question`/`Choices` | `{CallID, len(Choices)}` (drop `Question`) |
+| `ToolCallStarted` | redacted `Summary` (already safe) | unchanged |
+| `TokenDelta`/`TurnDone` | full content | model-output content; a sink may drop it by config (not a *secret*, but PII-bearing) |
+
+This is a loop sink-path concern; it composes with the identity-doc envelope (the
+loop projects the event, then wraps it in the `EventEnvelope`).
+
 ### §5c. `session` + `tui.Agent` additions
 
 `AgentSession` gains `Approve(ctx, callID, scope) error`, `Deny(ctx, callID) error`,
@@ -791,14 +848,21 @@ both agent wrappers delegate to the session, and the TUI calls them as bounded
 7.md's dropped `client/` view-models reland in `tui/`:
 
 - New events ride the same per-turn stream `readNext` already drains.
-- `PermissionRequested` → store; render an approval box (`Request.ToolName()` /
-  `Request.Description()` / keys from `AllowedScopes()` + always `[n]`); a single
-  keypress `y/s/w`/`n` dispatches a **bounded `tea.Cmd`** that calls
-  `agent.Approve(ctx, callID, scope)` / `agent.Deny(ctx, callID)` (so the Update loop
-  never blocks on the send); cleared on any terminal event.
-- `UserInputRequested` → assistant-style question; choices → key list + "other…";
-  the answer dispatches a bounded `tea.Cmd` calling `agent.ProvideAnswer(ctx, callID,
-  text)`.
+- **Prompts are a FIFO queue keyed by `CallID`, not a single slot.** Because
+  several `AskUser` gates can be open at once (parallel execution, §2c), the TUI
+  holds `pending []prompt` (each tagged with its `CallID`), renders the **head**, and
+  every answer/approval is dispatched **with that head's `CallID`**, then popped to
+  reveal the next. (Permission gates resolve sequentially so they don't pile up, but
+  routing by `CallID` makes the two uniform and collision-free.)
+- `PermissionRequested` → enqueue; the head renders an approval box
+  (`Request.ToolName()` / `Request.Description()` / keys from `AllowedScopes()` +
+  always `[n]`); a single keypress `y/s/w`/`n` dispatches a **bounded `tea.Cmd`**
+  calling `agent.Approve(ctx, callID, scope)` / `agent.Deny(ctx, callID)` for the head
+  `CallID` (Update loop never blocks on the send), then pops. The queue is cleared on
+  any terminal event.
+- `UserInputRequested` → enqueue; the head renders as an assistant-style question;
+  choices → key list + "other…"; the answer dispatches a bounded `tea.Cmd` calling
+  `agent.ProvideAnswer(ctx, callID, text)` for the head `CallID`, then pops.
 - `ToolCall{Started,Completed}` → optional tool-call cards; today's TUI ignores
   unknown event types, so this is additive.
 
@@ -856,7 +920,15 @@ The pixel-level work is a follow-up TUI-update doc, since that TUI is mid-flight
   child session created.
 - `Effect` JSON — round-trips `"allow"/"ask"/"deny"`; an unknown string errors.
 - `Grep` `rg` — a pattern like `-x`/`--foo` is passed as a value (`--regexp`/`--`),
-  not interpreted as a flag.
+  not interpreted as a flag; a workspace `.env` is excluded via `--glob` **and**
+  dropped by the `ReadGuard.DeniedRead` output filter (belt-and-suspenders).
+- sink redaction — `PermissionRequested`/`UserInputRequested` delivered to a fake
+  `EventSink` carry **no** `Description`/`Question` text; the same events on the
+  stream carry the full payload.
+- malformed approvals — a corrupt/unknown-`effect` approvals file yields `EffectAsk`
+  (never `AutoApprove`) and a warning; a bad record is skipped, valid ones still apply.
+- TUI prompt queue — two concurrent `UserInputRequested` (distinct `CallID`s) render
+  head-first and each answer dispatches with the correct `CallID`.
 - manifests — coding registers 11 tools, PA registers the 7-tool subset,
   `AcceptsImages` false.
 - **Integration tests** (`//go:build integration`, `*_integration_test.go`, run with
