@@ -307,7 +307,7 @@ func invokeReq(model string) llm.Request {
 			&content.UserMessage{
 				Message: content.Message{
 					Role:   content.RoleUser,
-					Blocks: []*content.Block{{Type: content.TypeText, Text: &content.TextBlock{Text: "hello"}}},
+					Blocks: []content.Block{&content.TextBlock{Text: "hello"}},
 				},
 			},
 		},

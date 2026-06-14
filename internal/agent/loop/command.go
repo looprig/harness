@@ -20,7 +20,7 @@ type Command interface{ isCommand() }
 // Events, Abandoned, and Ack are required and must be non-nil.
 type StartTurn struct {
 	Ctx       context.Context
-	Input     []*content.Block
+	Input     []content.Block
 	Events    chan<- Event
 	Abandoned <-chan struct{} // required; closed when caller no longer reads Events
 	Ack       chan<- error

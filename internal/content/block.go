@@ -1,6 +1,6 @@
 // Package content defines the unified content vocabulary shared across all
-// internal packages. It provides a discriminated-union Block type and all
-// concrete block subtypes.
+// internal packages. Block is a sealed interface; the concrete payload type is
+// the discriminator. Only this package can add variants (unexported marker).
 package content
 
 import "encoding/json"
@@ -17,18 +17,19 @@ const (
 	TypeToolResult BlockType = "tool_result"
 )
 
-// Block is a discriminated union: exactly one pointer field must be non-nil;
-// Type identifies which one. Callers must not set more than one payload field.
-type Block struct {
-	Type       BlockType
-	Text       *TextBlock
-	Image      *ImageBlock
-	Audio      *AudioBlock
-	Document   *DocumentBlock
-	Thinking   *ThinkingBlock
-	ToolUse    *ToolUseBlock
-	ToolResult *ToolResultBlock
-}
+// Block is the sealed interface over all content block payloads. The concrete
+// type is the discriminator; there is no Type field and no nil-able payload
+// pointers. BlockType is retained only as the wire tag for the JSON codec
+// (block_json.go, added in a later task), not as a field on any in-memory value.
+type Block interface{ isBlock() }
+
+func (*TextBlock) isBlock()       {}
+func (*ImageBlock) isBlock()      {}
+func (*AudioBlock) isBlock()      {}
+func (*DocumentBlock) isBlock()   {}
+func (*ThinkingBlock) isBlock()   {}
+func (*ToolUseBlock) isBlock()    {}
+func (*ToolResultBlock) isBlock() {}
 
 type TextBlock struct {
 	Text string
@@ -73,8 +74,10 @@ type ToolUseBlock struct {
 	Input json.RawMessage
 }
 
+// ToolResultBlock nests its own []Block, so it implements json.Marshaler /
+// json.Unmarshaler in block_json.go (a later task). Do not add a Type field.
 type ToolResultBlock struct {
 	ToolUseID string
-	Content   []*Block
+	Content   []Block
 	IsError   bool
 }

@@ -20,7 +20,7 @@ type fakeLLM struct {
 }
 
 func textChunk(s string) content.Chunk {
-	return content.Chunk{Type: content.ChunkTypeText, Text: &content.TextChunk{Text: s}}
+	return &content.TextChunk{Text: s}
 }
 
 func (f *fakeLLM) Invoke(ctx context.Context, req llm.Request) (*llm.Response, error) {
@@ -43,12 +43,12 @@ func (f *fakeLLM) Stream(ctx context.Context, req llm.Request) (*llm.StreamReade
 				select {} // deliberate hang; only safe under a bounded test
 			}
 			<-ctx.Done()
-			return content.Chunk{}, ctx.Err()
+			return nil, ctx.Err()
 		}
 		if f.nextErr != nil {
-			return content.Chunk{}, f.nextErr
+			return nil, f.nextErr
 		}
-		return content.Chunk{}, io.EOF
+		return nil, io.EOF
 	}
 	return llm.NewStreamReader(next, nil), nil
 }
@@ -74,7 +74,7 @@ func (r *recordingLLM) Stream(ctx context.Context, req llm.Request) (*llm.Stream
 			i++
 			return c, nil
 		}
-		return content.Chunk{}, io.EOF
+		return nil, io.EOF
 	}
 	return llm.NewStreamReader(next, nil), nil
 }

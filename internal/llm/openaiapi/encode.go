@@ -99,12 +99,12 @@ func encodeConversation(conv content.Conversation) ([]chatMessage, error) {
 	}
 }
 
-// textContent concatenates all TypeText blocks into a single string.
-func textContent(blocks []*content.Block) string {
+// textContent concatenates all text blocks into a single string.
+func textContent(blocks []content.Block) string {
 	var out string
 	for _, b := range blocks {
-		if b.Type == content.TypeText && b.Text != nil {
-			out += b.Text.Text
+		if t, ok := b.(*content.TextBlock); ok {
+			out += t.Text
 		}
 	}
 	return out
@@ -112,10 +112,10 @@ func textContent(blocks []*content.Block) string {
 
 // encodeContentParts returns a plain string when all blocks are text,
 // or a []chatContentPart slice when non-text blocks are present.
-func encodeContentParts(blocks []*content.Block) interface{} {
+func encodeContentParts(blocks []content.Block) interface{} {
 	allText := true
 	for _, b := range blocks {
-		if b.Type != content.TypeText {
+		if _, ok := b.(*content.TextBlock); !ok {
 			allText = false
 			break
 		}
@@ -126,21 +126,11 @@ func encodeContentParts(blocks []*content.Block) interface{} {
 
 	parts := make([]chatContentPart, 0, len(blocks))
 	for _, b := range blocks {
-		switch b.Type {
-		case content.TypeText:
-			if b.Text != nil {
-				parts = append(parts, chatContentPart{
-					Type: "text",
-					Text: b.Text.Text,
-				})
-			}
-		case content.TypeImage:
-			if b.Image != nil {
-				parts = append(parts, chatContentPart{
-					Type:     "image_url",
-					ImageURL: &imageURLPart{URL: imageURL(b.Image)},
-				})
-			}
+		switch b := b.(type) {
+		case *content.TextBlock:
+			parts = append(parts, chatContentPart{Type: "text", Text: b.Text})
+		case *content.ImageBlock:
+			parts = append(parts, chatContentPart{Type: "image_url", ImageURL: &imageURLPart{URL: imageURL(b)}})
 		}
 	}
 	return parts
@@ -163,23 +153,16 @@ func encodeAIMessage(m *content.AIMessage) (chatMessage, error) {
 	var calls []toolCall
 
 	for _, b := range m.Blocks {
-		switch b.Type {
-		case content.TypeText:
-			if b.Text != nil {
-				text += b.Text.Text
-			}
-		case content.TypeToolUse:
-			if b.ToolUse != nil {
-				calls = append(calls, toolCall{
-					ID:   b.ToolUse.ID,
-					Type: "function",
-					Function: toolCallFunction{
-						Name:      b.ToolUse.Name,
-						Arguments: b.ToolUse.Input,
-					},
-				})
-			}
-		case content.TypeThinking:
+		switch b := b.(type) {
+		case *content.TextBlock:
+			text += b.Text
+		case *content.ToolUseBlock:
+			calls = append(calls, toolCall{
+				ID:       b.ID,
+				Type:     "function",
+				Function: toolCallFunction{Name: b.Name, Arguments: b.Input},
+			})
+		case *content.ThinkingBlock:
 			// Deliberately ignored: thinking is not part of the OpenAI wire format.
 		}
 	}

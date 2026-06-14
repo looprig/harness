@@ -79,7 +79,7 @@ func NewAgent(ctx context.Context, cfg loop.Config) (*AgentSession, error) {
 
 // Invoke sends input and blocks until a terminal event.
 // Cancelling ctx cancels the running turn; Invoke returns the TurnInterrupted event.
-func (s *AgentSession) Invoke(ctx context.Context, input []*content.Block) (loop.Event, error) {
+func (s *AgentSession) Invoke(ctx context.Context, input []content.Block) (loop.Event, error) {
 	events := make(chan loop.Event, 64)
 	ack := make(chan error, 1)
 	abandoned := make(chan struct{})
@@ -120,7 +120,7 @@ func (s *AgentSession) Invoke(ctx context.Context, input []*content.Block) (loop
 // TurnStarted, TokenDelta×N, then one terminal event, then EOF while the caller
 // keeps reading. Calling sr.Close() abandons the event stream and cancels the turn.
 // Callers must either read until EOF or call Close.
-func (s *AgentSession) Stream(ctx context.Context, input []*content.Block) (*llm.StreamReader[loop.Event], error) {
+func (s *AgentSession) Stream(ctx context.Context, input []content.Block) (*llm.StreamReader[loop.Event], error) {
 	streamCtx, streamCancel := context.WithCancel(ctx)
 	abandoned := make(chan struct{})
 	var abandonOnce sync.Once

@@ -16,6 +16,23 @@ func TestDecodeResponse_CompileTimeCheck(t *testing.T) {
 	var _ func([]byte) (*llm.Response, error) = openaiapi.DecodeResponse
 }
 
+// blockType maps a concrete sealed block to its wire-tag BlockType, used to
+// assert decoded block ordering without a Type field on the value.
+func blockType(b content.Block) content.BlockType {
+	switch b.(type) {
+	case *content.TextBlock:
+		return content.TypeText
+	case *content.ThinkingBlock:
+		return content.TypeThinking
+	case *content.ToolUseBlock:
+		return content.TypeToolUse
+	case *content.ImageBlock:
+		return content.TypeImage
+	default:
+		return ""
+	}
+}
+
 func TestDecodeResponse(t *testing.T) {
 	t.Parallel()
 
@@ -39,8 +56,8 @@ func TestDecodeResponse(t *testing.T) {
 		wantOutputTokens int
 
 		// expected error fields
-		wantErr     bool
-		wantAPIErr  bool
+		wantErr       bool
+		wantAPIErr    bool
 		wantNoChoices bool
 	}{
 		{
@@ -154,10 +171,10 @@ func TestDecodeResponse(t *testing.T) {
 				"choices": [{"message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
 				"usage": null
 			}`),
-			wantModel:    "deepseek-chat",
+			wantModel:      "deepseek-chat",
 			wantBlockCount: 1,
-			wantText:     "ok",
-			wantUsageNil: true,
+			wantText:       "ok",
+			wantUsageNil:   true,
 		},
 		{
 			name: "multiple tool calls",
@@ -235,7 +252,7 @@ func TestDecodeResponse(t *testing.T) {
 				if i >= len(resp.Message.Blocks) {
 					break
 				}
-				if got := resp.Message.Blocks[i].Type; got != wantType {
+				if got := blockType(resp.Message.Blocks[i]); got != wantType {
 					t.Errorf("block[%d].Type: want %q, got %q", i, wantType, got)
 				}
 			}
@@ -243,7 +260,7 @@ func TestDecodeResponse(t *testing.T) {
 			if tc.wantThinking != "" {
 				var found bool
 				for _, b := range resp.Message.Blocks {
-					if b.Type == content.TypeThinking && b.Thinking != nil && b.Thinking.Thinking == tc.wantThinking {
+					if tb, ok := b.(*content.ThinkingBlock); ok && tb.Thinking == tc.wantThinking {
 						found = true
 						break
 					}
@@ -256,7 +273,7 @@ func TestDecodeResponse(t *testing.T) {
 			if tc.wantText != "" {
 				var found bool
 				for _, b := range resp.Message.Blocks {
-					if b.Type == content.TypeText && b.Text != nil && b.Text.Text == tc.wantText {
+					if tb, ok := b.(*content.TextBlock); ok && tb.Text == tc.wantText {
 						found = true
 						break
 					}
@@ -269,13 +286,12 @@ func TestDecodeResponse(t *testing.T) {
 			if tc.wantToolUseID != "" || tc.wantToolUseName != "" {
 				var found bool
 				for _, b := range resp.Message.Blocks {
-					if b.Type == content.TypeToolUse && b.ToolUse != nil &&
-						b.ToolUse.ID == tc.wantToolUseID &&
-						b.ToolUse.Name == tc.wantToolUseName {
+					tu, ok := b.(*content.ToolUseBlock)
+					if ok && tu.ID == tc.wantToolUseID && tu.Name == tc.wantToolUseName {
 						found = true
 						if string(tc.wantToolUseInput) != "" {
-							if string(b.ToolUse.Input) != string(tc.wantToolUseInput) {
-								t.Errorf("ToolUseBlock.Input: want %s, got %s", tc.wantToolUseInput, b.ToolUse.Input)
+							if string(tu.Input) != string(tc.wantToolUseInput) {
+								t.Errorf("ToolUseBlock.Input: want %s, got %s", tc.wantToolUseInput, tu.Input)
 							}
 						}
 						break

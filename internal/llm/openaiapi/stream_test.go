@@ -25,26 +25,26 @@ func TestNewStream_TextChunks(t *testing.T) {
 	t.Parallel()
 
 	cases := []struct {
-		name       string
-		body       string
-		wantTexts  []string
-		wantEOF    bool
+		name      string
+		body      string
+		wantTexts []string
+		wantEOF   bool
 	}{
 		{
-			name: "single text chunk then DONE",
-			body: "data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\ndata: [DONE]\n",
+			name:      "single text chunk then DONE",
+			body:      "data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\ndata: [DONE]\n",
 			wantTexts: []string{"hello"},
 			wantEOF:   true,
 		},
 		{
-			name: "multiple text chunks",
-			body: "data: {\"choices\":[{\"delta\":{\"content\":\"foo\"}}]}\ndata: {\"choices\":[{\"delta\":{\"content\":\"bar\"}}]}\ndata: [DONE]\n",
+			name:      "multiple text chunks",
+			body:      "data: {\"choices\":[{\"delta\":{\"content\":\"foo\"}}]}\ndata: {\"choices\":[{\"delta\":{\"content\":\"bar\"}}]}\ndata: [DONE]\n",
 			wantTexts: []string{"foo", "bar"},
 			wantEOF:   true,
 		},
 		{
-			name: "role-only delta skipped",
-			body: "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\ndata: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\ndata: [DONE]\n",
+			name:      "role-only delta skipped",
+			body:      "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\ndata: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\ndata: [DONE]\n",
 			wantTexts: []string{"hi"},
 			wantEOF:   true,
 		},
@@ -72,13 +72,11 @@ func TestNewStream_TextChunks(t *testing.T) {
 				if err != nil {
 					t.Fatalf("unexpected error: %v", err)
 				}
-				if chunk.Type != content.ChunkTypeText {
-					t.Fatalf("expected ChunkTypeText, got %q", chunk.Type)
+				tc, ok := chunk.(*content.TextChunk)
+				if !ok {
+					t.Fatalf("expected *content.TextChunk, got %T", chunk)
 				}
-				if chunk.Text == nil {
-					t.Fatal("Text field is nil on ChunkTypeText")
-				}
-				got = append(got, chunk.Text.Text)
+				got = append(got, tc.Text)
 			}
 
 			if len(got) != len(tc.wantTexts) {
@@ -106,19 +104,19 @@ func TestNewStream_ThinkingChunks(t *testing.T) {
 	cases := []struct {
 		name       string
 		body       string
-		wantTypes  []content.ChunkType
+		wantTypes  []string
 		wantValues []string
 	}{
 		{
-			name: "reasoning content yields ChunkTypeThinking",
-			body: "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"let me think\"}}]}\ndata: [DONE]\n",
-			wantTypes:  []content.ChunkType{content.ChunkTypeThinking},
+			name:       "reasoning content yields thinking chunk",
+			body:       "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"let me think\"}}]}\ndata: [DONE]\n",
+			wantTypes:  []string{"thinking"},
 			wantValues: []string{"let me think"},
 		},
 		{
-			name: "thinking then text in sequence",
-			body: "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"plan\"}}]}\ndata: {\"choices\":[{\"delta\":{\"content\":\"result\"}}]}\ndata: [DONE]\n",
-			wantTypes:  []content.ChunkType{content.ChunkTypeThinking, content.ChunkTypeText},
+			name:       "thinking then text in sequence",
+			body:       "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"plan\"}}]}\ndata: {\"choices\":[{\"delta\":{\"content\":\"result\"}}]}\ndata: [DONE]\n",
+			wantTypes:  []string{"thinking", "text"},
 			wantValues: []string{"plan", "result"},
 		},
 	}
@@ -130,7 +128,7 @@ func TestNewStream_ThinkingChunks(t *testing.T) {
 			stream := openaiapi.NewStream(io.NopCloser(strings.NewReader(tc.body)))
 			defer stream.Close()
 
-			var gotTypes []content.ChunkType
+			var gotTypes []string
 			var gotValues []string
 
 			for {
@@ -141,20 +139,15 @@ func TestNewStream_ThinkingChunks(t *testing.T) {
 				if err != nil {
 					t.Fatalf("unexpected error: %v", err)
 				}
-				gotTypes = append(gotTypes, chunk.Type)
-				switch chunk.Type {
-				case content.ChunkTypeThinking:
-					if chunk.Thinking == nil {
-						t.Fatal("Thinking field is nil on ChunkTypeThinking")
-					}
-					gotValues = append(gotValues, chunk.Thinking.Thinking)
-				case content.ChunkTypeText:
-					if chunk.Text == nil {
-						t.Fatal("Text field is nil on ChunkTypeText")
-					}
-					gotValues = append(gotValues, chunk.Text.Text)
+				switch c := chunk.(type) {
+				case *content.ThinkingChunk:
+					gotTypes = append(gotTypes, "thinking")
+					gotValues = append(gotValues, c.Thinking)
+				case *content.TextChunk:
+					gotTypes = append(gotTypes, "text")
+					gotValues = append(gotValues, c.Text)
 				default:
-					t.Fatalf("unexpected chunk type: %q", chunk.Type)
+					t.Fatalf("unexpected chunk type: %T", chunk)
 				}
 			}
 
@@ -203,9 +196,9 @@ func TestNewStream_MalformedJSON(t *testing.T) {
 	t.Parallel()
 
 	cases := []struct {
-		name      string
-		body      string
-		wantText  string
+		name     string
+		body     string
+		wantText string
 	}{
 		{
 			name:     "malformed line skipped, valid line yielded",
@@ -230,11 +223,12 @@ func TestNewStream_MalformedJSON(t *testing.T) {
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
-			if chunk.Type != content.ChunkTypeText {
-				t.Fatalf("expected ChunkTypeText, got %q", chunk.Type)
+			c, ok := chunk.(*content.TextChunk)
+			if !ok {
+				t.Fatalf("expected *content.TextChunk, got %T", chunk)
 			}
-			if chunk.Text == nil || chunk.Text.Text != tc.wantText {
-				t.Errorf("got text %q, want %q", chunk.Text.Text, tc.wantText)
+			if c.Text != tc.wantText {
+				t.Errorf("got text %q, want %q", c.Text, tc.wantText)
 			}
 		})
 	}
@@ -244,9 +238,9 @@ func TestNewStream_EmptyChoices(t *testing.T) {
 	t.Parallel()
 
 	cases := []struct {
-		name      string
-		body      string
-		wantText  string
+		name     string
+		body     string
+		wantText string
 	}{
 		{
 			name:     "empty choices skipped",
@@ -271,11 +265,12 @@ func TestNewStream_EmptyChoices(t *testing.T) {
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
-			if chunk.Type != content.ChunkTypeText {
-				t.Fatalf("expected ChunkTypeText, got %q", chunk.Type)
+			c, ok := chunk.(*content.TextChunk)
+			if !ok {
+				t.Fatalf("expected *content.TextChunk, got %T", chunk)
 			}
-			if chunk.Text == nil || chunk.Text.Text != tc.wantText {
-				t.Errorf("got text %q, want %q", chunk.Text.Text, tc.wantText)
+			if c.Text != tc.wantText {
+				t.Errorf("got text %q, want %q", c.Text, tc.wantText)
 			}
 		})
 	}

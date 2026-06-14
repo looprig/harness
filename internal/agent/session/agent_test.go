@@ -21,7 +21,7 @@ type stubLLM struct {
 }
 
 func textChunk(s string) content.Chunk {
-	return content.Chunk{Type: content.ChunkTypeText, Text: &content.TextChunk{Text: s}}
+	return &content.TextChunk{Text: s}
 }
 
 func (s *stubLLM) Invoke(ctx context.Context, req llm.Request) (*llm.Response, error) {
@@ -40,9 +40,9 @@ func (s *stubLLM) Stream(ctx context.Context, req llm.Request) (*llm.StreamReade
 				select {} // provider ignores cancellation; only safe under a bounded test
 			}
 			<-ctx.Done()
-			return content.Chunk{}, ctx.Err()
+			return nil, ctx.Err()
 		}
-		return content.Chunk{}, io.EOF
+		return nil, io.EOF
 	}
 	return llm.NewStreamReader(next, nil), nil
 }

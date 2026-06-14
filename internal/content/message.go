@@ -1,5 +1,7 @@
 package content
 
+import "encoding/json"
+
 // Role identifies the author of a message in a conversation thread.
 type Role string
 
@@ -15,7 +17,7 @@ const (
 // blocks are always accessible via the embedded field.
 type Message struct {
 	Role   Role
-	Blocks []*Block
+	Blocks []Block
 }
 
 // UserMessage is a turn authored by the human user.
@@ -48,3 +50,75 @@ func (*ToolMessage) isMessage()   {}
 // AgenticMessages is an ordered conversation thread. A nil or empty slice is a
 // valid zero value representing an empty thread.
 type AgenticMessages []Conversation
+
+// messageJSON is the wire form of Message. Blocks go through the slice codec so
+// nested blocks stay tagged.
+type messageJSON struct {
+	Role   Role            `json:"role"`
+	Blocks json.RawMessage `json:"blocks,omitempty"`
+}
+
+func (m Message) MarshalJSON() ([]byte, error) {
+	var blocks json.RawMessage
+	if len(m.Blocks) > 0 {
+		b, err := MarshalBlocks(m.Blocks)
+		if err != nil {
+			return nil, err
+		}
+		blocks = b
+	}
+	return json.Marshal(messageJSON{Role: m.Role, Blocks: blocks})
+}
+
+func (m *Message) UnmarshalJSON(data []byte) error {
+	var j messageJSON
+	if err := json.Unmarshal(data, &j); err != nil {
+		return err
+	}
+	m.Role = j.Role
+	if len(j.Blocks) > 0 {
+		blocks, err := UnmarshalBlocks(j.Blocks)
+		if err != nil {
+			return err
+		}
+		m.Blocks = blocks
+	}
+	return nil
+}
+
+// toolMessageJSON is the wire form of ToolMessage. ToolMessage defines its own
+// codec pair so the promoted Message methods do not silently drop ToolUseID.
+type toolMessageJSON struct {
+	Role      Role            `json:"role"`
+	Blocks    json.RawMessage `json:"blocks,omitempty"`
+	ToolUseID string          `json:"tool_use_id"`
+}
+
+func (m ToolMessage) MarshalJSON() ([]byte, error) {
+	var blocks json.RawMessage
+	if len(m.Blocks) > 0 {
+		b, err := MarshalBlocks(m.Blocks)
+		if err != nil {
+			return nil, err
+		}
+		blocks = b
+	}
+	return json.Marshal(toolMessageJSON{Role: m.Role, Blocks: blocks, ToolUseID: m.ToolUseID})
+}
+
+func (m *ToolMessage) UnmarshalJSON(data []byte) error {
+	var j toolMessageJSON
+	if err := json.Unmarshal(data, &j); err != nil {
+		return err
+	}
+	m.Role = j.Role
+	m.ToolUseID = j.ToolUseID
+	if len(j.Blocks) > 0 {
+		blocks, err := UnmarshalBlocks(j.Blocks)
+		if err != nil {
+			return err
+		}
+		m.Blocks = blocks
+	}
+	return nil
+}

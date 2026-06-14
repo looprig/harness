@@ -47,46 +47,46 @@ func contentStr(t *testing.T, msg map[string]json.RawMessage) string {
 	return s
 }
 
-func userMsg(blocks ...*content.Block) *content.UserMessage {
+func userMsg(blocks ...content.Block) *content.UserMessage {
 	return &content.UserMessage{Message: content.Message{Role: content.RoleUser, Blocks: blocks}}
 }
 
-func aiMsg(blocks ...*content.Block) *content.AIMessage {
+func aiMsg(blocks ...content.Block) *content.AIMessage {
 	return &content.AIMessage{Message: content.Message{Role: content.RoleAssistant, Blocks: blocks}}
 }
 
-func sysMsg(blocks ...*content.Block) *content.SystemMessage {
+func sysMsg(blocks ...content.Block) *content.SystemMessage {
 	return &content.SystemMessage{Message: content.Message{Role: content.RoleSystem, Blocks: blocks}}
 }
 
-func toolMsg(id string, blocks ...*content.Block) *content.ToolMessage {
+func toolMsg(id string, blocks ...content.Block) *content.ToolMessage {
 	return &content.ToolMessage{Message: content.Message{Role: content.RoleTool, Blocks: blocks}, ToolUseID: id}
 }
 
-func textBlock(s string) *content.Block {
-	return &content.Block{Type: content.TypeText, Text: &content.TextBlock{Text: s}}
+func textBlock(s string) content.Block {
+	return &content.TextBlock{Text: s}
 }
 
-func imageURLBlock(url string) *content.Block {
-	return &content.Block{Type: content.TypeImage, Image: &content.ImageBlock{
+func imageURLBlock(url string) content.Block {
+	return &content.ImageBlock{
 		MediaType: content.MediaTypeImageJPEG,
 		Source:    content.ImageSource{URL: url},
-	}}
+	}
 }
 
-func imageDataBlock(mediaType content.MediaType, data []byte) *content.Block {
-	return &content.Block{Type: content.TypeImage, Image: &content.ImageBlock{
+func imageDataBlock(mediaType content.MediaType, data []byte) content.Block {
+	return &content.ImageBlock{
 		MediaType: mediaType,
 		Source:    content.ImageSource{Data: data},
-	}}
+	}
 }
 
-func thinkingBlock(text string) *content.Block {
-	return &content.Block{Type: content.TypeThinking, Thinking: &content.ThinkingBlock{Thinking: text}}
+func thinkingBlock(text string) content.Block {
+	return &content.ThinkingBlock{Thinking: text}
 }
 
-func toolUseBlock(id, name string, input json.RawMessage) *content.Block {
-	return &content.Block{Type: content.TypeToolUse, ToolUse: &content.ToolUseBlock{ID: id, Name: name, Input: input}}
+func toolUseBlock(id, name string, input json.RawMessage) content.Block {
+	return &content.ToolUseBlock{ID: id, Name: name, Input: input}
 }
 
 // --- TestEncodeRequest_System ---
@@ -628,4 +628,3 @@ func TestEncodeRequest_ValidJSON(t *testing.T) {
 		})
 	}
 }
-

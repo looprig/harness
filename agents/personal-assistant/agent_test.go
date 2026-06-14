@@ -16,8 +16,8 @@ import (
 func textOf(m *content.AIMessage) string {
 	var b strings.Builder
 	for _, blk := range m.Blocks {
-		if blk.Type == content.TypeText && blk.Text != nil {
-			b.WriteString(blk.Text.Text)
+		if tb, ok := blk.(*content.TextBlock); ok {
+			b.WriteString(tb.Text)
 		}
 	}
 	return b.String()

@@ -19,7 +19,7 @@ import (
 // re-invoking with the same input.
 func runTurn(
 	ctx context.Context,
-	input []*content.Block,
+	input []content.Block,
 	turnIndex TurnIndex,
 	msgs content.AgenticMessages,
 	cfg Config,
@@ -55,30 +55,20 @@ func runTurn(
 			return msgs[:len(msgs)-1], TurnFailed{TurnIndex: turnIndex, Err: err}
 		}
 		emit(TokenDelta{TurnIndex: turnIndex, Chunk: chunk})
-		switch chunk.Type {
-		case content.ChunkTypeText:
-			if chunk.Text != nil {
-				textBuf.WriteString(chunk.Text.Text)
-			}
-		case content.ChunkTypeThinking:
-			if chunk.Thinking != nil {
-				thinkBuf.WriteString(chunk.Thinking.Thinking)
-			}
+		switch c := chunk.(type) {
+		case *content.TextChunk:
+			textBuf.WriteString(c.Text)
+		case *content.ThinkingChunk:
+			thinkBuf.WriteString(c.Thinking)
 		}
 	}
 
-	var blocks []*content.Block
+	var blocks []content.Block
 	if thinkBuf.Len() > 0 {
-		blocks = append(blocks, &content.Block{
-			Type:     content.TypeThinking,
-			Thinking: &content.ThinkingBlock{Thinking: thinkBuf.String()},
-		})
+		blocks = append(blocks, &content.ThinkingBlock{Thinking: thinkBuf.String()})
 	}
 	if textBuf.Len() > 0 {
-		blocks = append(blocks, &content.Block{
-			Type: content.TypeText,
-			Text: &content.TextBlock{Text: textBuf.String()},
-		})
+		blocks = append(blocks, &content.TextBlock{Text: textBuf.String()})
 	}
 	if len(blocks) == 0 {
 		// Provider sent a successful stream with no content — treat as a failure

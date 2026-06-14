@@ -17,7 +17,7 @@ func NewStream(body io.ReadCloser) *llm.StreamReader[content.Chunk] {
 		for {
 			line, err := sse.Next()
 			if err != nil {
-				return content.Chunk{}, err
+				return nil, err
 			}
 			var ev sseChunk
 			if err := json.Unmarshal([]byte(line), &ev); err != nil {
@@ -29,16 +29,10 @@ func NewStream(body io.ReadCloser) *llm.StreamReader[content.Chunk] {
 			delta := ev.Choices[0].Delta
 
 			if delta.ReasoningContent != "" {
-				return content.Chunk{
-					Type:     content.ChunkTypeThinking,
-					Thinking: &content.ThinkingChunk{Thinking: delta.ReasoningContent},
-				}, nil
+				return &content.ThinkingChunk{Thinking: delta.ReasoningContent}, nil
 			}
 			if delta.Content != "" {
-				return content.Chunk{
-					Type: content.ChunkTypeText,
-					Text: &content.TextChunk{Text: delta.Content},
-				}, nil
+				return &content.TextChunk{Text: delta.Content}, nil
 			}
 			// Empty delta (role-only or finish): keep reading.
 		}

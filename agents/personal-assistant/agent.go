@@ -130,12 +130,9 @@ func (a *Assistant) Close(ctx context.Context) error {
 
 // userBlocks wraps user text into a single text content block. It rejects blank
 // input before the session is touched.
-func userBlocks(text string) ([]*content.Block, error) {
+func userBlocks(text string) ([]content.Block, error) {
 	if strings.TrimSpace(text) == "" {
 		return nil, &EmptyInputError{}
 	}
-	return []*content.Block{{
-		Type: content.TypeText,
-		Text: &content.TextBlock{Text: text},
-	}}, nil
+	return []content.Block{&content.TextBlock{Text: text}}, nil
 }

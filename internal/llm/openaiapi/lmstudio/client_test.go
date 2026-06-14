@@ -30,7 +30,7 @@ func validRequest(model string) llm.Request {
 			&content.UserMessage{
 				Message: content.Message{
 					Role:   content.RoleUser,
-					Blocks: []*content.Block{{Type: content.TypeText, Text: &content.TextBlock{Text: "hello"}}},
+					Blocks: []content.Block{&content.TextBlock{Text: "hello"}},
 				},
 			},
 		},
@@ -242,14 +242,12 @@ func TestClient_Stream(t *testing.T) {
 				t.Fatalf("unexpected error from Next(): %v", err)
 			}
 			if tc.wantFirstChunk != "" {
-				if chunk.Type != content.ChunkTypeText {
-					t.Fatalf("expected ChunkTypeText, got %q", chunk.Type)
+				tc2, ok := chunk.(*content.TextChunk)
+				if !ok {
+					t.Fatalf("expected *content.TextChunk, got %T", chunk)
 				}
-				if chunk.Text == nil {
-					t.Fatal("Text field is nil on ChunkTypeText")
-				}
-				if chunk.Text.Text != tc.wantFirstChunk {
-					t.Errorf("chunk text: want %q, got %q", tc.wantFirstChunk, chunk.Text.Text)
+				if tc2.Text != tc.wantFirstChunk {
+					t.Errorf("chunk text: want %q, got %q", tc.wantFirstChunk, tc2.Text)
 				}
 			}
 		})
@@ -322,7 +320,7 @@ func TestClient_Validate(t *testing.T) {
 					&content.UserMessage{
 						Message: content.Message{
 							Role:   content.RoleUser,
-							Blocks: []*content.Block{{Type: content.TypeText, Text: &content.TextBlock{Text: "test"}}},
+							Blocks: []content.Block{&content.TextBlock{Text: "test"}},
 						},
 					},
 				},

@@ -45,31 +45,22 @@ func DecodeResponse(body []byte) (*llm.Response, error) {
 
 // buildBlocks constructs an ordered slice of content blocks from a decoded
 // chatMessage. Reasoning comes first, then text, then tool calls.
-func buildBlocks(msg chatMessage) []*content.Block {
-	var blocks []*content.Block
+func buildBlocks(msg chatMessage) []content.Block {
+	var blocks []content.Block
 
 	if msg.ReasoningContent != "" {
-		blocks = append(blocks, &content.Block{
-			Type:     content.TypeThinking,
-			Thinking: &content.ThinkingBlock{Thinking: msg.ReasoningContent},
-		})
+		blocks = append(blocks, &content.ThinkingBlock{Thinking: msg.ReasoningContent})
 	}
 
 	if s, ok := msg.Content.(string); ok && s != "" {
-		blocks = append(blocks, &content.Block{
-			Type: content.TypeText,
-			Text: &content.TextBlock{Text: s},
-		})
+		blocks = append(blocks, &content.TextBlock{Text: s})
 	}
 
 	for _, tc := range msg.ToolCalls {
-		blocks = append(blocks, &content.Block{
-			Type: content.TypeToolUse,
-			ToolUse: &content.ToolUseBlock{
-				ID:    tc.ID,
-				Name:  tc.Function.Name,
-				Input: tc.Function.Arguments,
-			},
+		blocks = append(blocks, &content.ToolUseBlock{
+			ID:    tc.ID,
+			Name:  tc.Function.Name,
+			Input: tc.Function.Arguments,
 		})
 	}
 

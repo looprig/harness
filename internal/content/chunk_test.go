@@ -6,105 +6,36 @@ import (
 	"github.com/inventivepotter/urvi/internal/content"
 )
 
-func TestChunkTypeConstants(t *testing.T) {
+// TestChunk_ConcretePayloads verifies the concrete Chunk variants carry their
+// delta text. The concrete type is the discriminator; there is no Type field.
+func TestChunk_ConcretePayloads(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		name     string
-		got      content.ChunkType
-		expected content.ChunkType
+		name      string
+		chunk     content.Chunk
+		wantText  string // expected text for a *TextChunk
+		wantThink string // expected thinking for a *ThinkingChunk
 	}{
 		{
-			name:     "text delta constant value",
-			got:      content.ChunkTypeText,
-			expected: "text_delta",
+			name:     "text chunk carries text payload",
+			chunk:    &content.TextChunk{Text: "hello"},
+			wantText: "hello",
 		},
 		{
-			name:     "thinking delta constant value",
-			got:      content.ChunkTypeThinking,
-			expected: "thinking_delta",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-			if tt.got != tt.expected {
-				t.Errorf("got %q, want %q", tt.got, tt.expected)
-			}
-		})
-	}
-}
-
-func TestChunkTypeConstants_Distinct(t *testing.T) {
-	t.Parallel()
-	if content.ChunkTypeText == content.ChunkTypeThinking {
-		t.Errorf("ChunkTypeText and ChunkTypeThinking must be distinct, both equal %q", content.ChunkTypeText)
-	}
-}
-
-func TestChunk(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		name             string
-		chunk            content.Chunk
-		wantType         content.ChunkType
-		wantTextNil      bool
-		wantThinkingNil  bool
-		wantTextContent  string
-		wantThinkContent string
-	}{
-		{
-			name:            "zero value has nil payload fields",
-			chunk:           content.Chunk{},
-			wantType:        "",
-			wantTextNil:     true,
-			wantThinkingNil: true,
+			name:      "thinking chunk carries thinking payload",
+			chunk:     &content.ThinkingChunk{Thinking: "reasoning"},
+			wantThink: "reasoning",
 		},
 		{
-			name: "text chunk carries text payload and nil thinking",
-			chunk: content.Chunk{
-				Type: content.ChunkTypeText,
-				Text: &content.TextChunk{Text: "hello"},
-			},
-			wantType:        content.ChunkTypeText,
-			wantTextNil:     false,
-			wantThinkingNil: true,
-			wantTextContent: "hello",
+			name:     "text chunk with empty string is a valid delta",
+			chunk:    &content.TextChunk{Text: ""},
+			wantText: "",
 		},
 		{
-			name: "thinking chunk carries thinking payload and nil text",
-			chunk: content.Chunk{
-				Type:     content.ChunkTypeThinking,
-				Thinking: &content.ThinkingChunk{Thinking: "reasoning"},
-			},
-			wantType:         content.ChunkTypeThinking,
-			wantTextNil:      true,
-			wantThinkingNil:  false,
-			wantThinkContent: "reasoning",
-		},
-		{
-			name: "text chunk with empty string is a valid delta",
-			chunk: content.Chunk{
-				Type: content.ChunkTypeText,
-				Text: &content.TextChunk{Text: ""},
-			},
-			wantType:        content.ChunkTypeText,
-			wantTextNil:     false,
-			wantThinkingNil: true,
-			wantTextContent: "",
-		},
-		{
-			name: "thinking chunk with empty string is a valid delta",
-			chunk: content.Chunk{
-				Type:     content.ChunkTypeThinking,
-				Thinking: &content.ThinkingChunk{Thinking: ""},
-			},
-			wantType:         content.ChunkTypeThinking,
-			wantTextNil:      true,
-			wantThinkingNil:  false,
-			wantThinkContent: "",
+			name:      "thinking chunk with empty string is a valid delta",
+			chunk:     &content.ThinkingChunk{Thinking: ""},
+			wantThink: "",
 		},
 	}
 
@@ -112,25 +43,26 @@ func TestChunk(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			if tt.chunk.Type != tt.wantType {
-				t.Errorf("Type: got %q, want %q", tt.chunk.Type, tt.wantType)
-			}
-
-			if (tt.chunk.Text == nil) != tt.wantTextNil {
-				t.Errorf("Text nil: got %v, want %v", tt.chunk.Text == nil, tt.wantTextNil)
-			}
-
-			if (tt.chunk.Thinking == nil) != tt.wantThinkingNil {
-				t.Errorf("Thinking nil: got %v, want %v", tt.chunk.Thinking == nil, tt.wantThinkingNil)
-			}
-
-			if !tt.wantTextNil && tt.chunk.Text.Text != tt.wantTextContent {
-				t.Errorf("TextChunk.Text: got %q, want %q", tt.chunk.Text.Text, tt.wantTextContent)
-			}
-
-			if !tt.wantThinkingNil && tt.chunk.Thinking.Thinking != tt.wantThinkContent {
-				t.Errorf("ThinkingChunk.Thinking: got %q, want %q", tt.chunk.Thinking.Thinking, tt.wantThinkContent)
+			switch c := tt.chunk.(type) {
+			case *content.TextChunk:
+				if c.Text != tt.wantText {
+					t.Errorf("TextChunk.Text = %q, want %q", c.Text, tt.wantText)
+				}
+			case *content.ThinkingChunk:
+				if c.Thinking != tt.wantThink {
+					t.Errorf("ThinkingChunk.Thinking = %q, want %q", c.Thinking, tt.wantThink)
+				}
+			default:
+				t.Fatalf("unexpected chunk type %T", c)
 			}
 		})
 	}
+}
+
+// TestChunk_InterfaceCompliance is a compile-time check that the concrete chunk
+// types satisfy the sealed Chunk interface.
+// Acceptable exception to the table-driven rule: purely compile-time, no runtime path to branch.
+func TestChunk_InterfaceCompliance(t *testing.T) {
+	var _ content.Chunk = (*content.TextChunk)(nil)
+	var _ content.Chunk = (*content.ThinkingChunk)(nil)
 }

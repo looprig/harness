@@ -78,146 +78,17 @@ func TestBlockTypeConstants(t *testing.T) {
 	}
 }
 
-// TestBlockDiscriminatedUnion verifies that Block is a discriminated union:
-// Type identifies which pointer field is set, and only one is non-nil per valid block.
-func TestBlockDiscriminatedUnion(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		name        string
-		block       content.Block
-		wantType    content.BlockType
-		wantNonNil  string // which field should be non-nil
-		wantAllNil  bool   // true when all payload fields are nil (zero-value block)
-	}{
-		{
-			name: "text block has Type and non-nil Text field",
-			block: content.Block{
-				Type: content.TypeText,
-				Text: &content.TextBlock{Text: "hello"},
-			},
-			wantType:   content.TypeText,
-			wantNonNil: "Text",
-		},
-		{
-			name: "image block has Type and non-nil Image field",
-			block: content.Block{
-				Type:  content.TypeImage,
-				Image: &content.ImageBlock{MediaType: content.MediaTypeImagePNG, Source: content.ImageSource{URL: "https://example.com/img.png"}},
-			},
-			wantType:   content.TypeImage,
-			wantNonNil: "Image",
-		},
-		{
-			name: "audio block has Type and non-nil Audio field",
-			block: content.Block{
-				Type:  content.TypeAudio,
-				Audio: &content.AudioBlock{MediaType: content.MediaTypeAudioMPEG, Data: []byte{0x01}},
-			},
-			wantType:   content.TypeAudio,
-			wantNonNil: "Audio",
-		},
-		{
-			name: "document block has Type and non-nil Document field",
-			block: content.Block{
-				Type:     content.TypeDocument,
-				Document: &content.DocumentBlock{MediaType: content.MediaTypeDocumentPDF, Name: "report.pdf", Data: []byte{0x25, 0x50, 0x44, 0x46}},
-			},
-			wantType:   content.TypeDocument,
-			wantNonNil: "Document",
-		},
-		{
-			name: "thinking block has Type and non-nil Thinking field",
-			block: content.Block{
-				Type:     content.TypeThinking,
-				Thinking: &content.ThinkingBlock{Thinking: "I think...", Signature: "sig123"},
-			},
-			wantType:   content.TypeThinking,
-			wantNonNil: "Thinking",
-		},
-		{
-			name: "tool_use block has Type and non-nil ToolUse field",
-			block: content.Block{
-				Type:    content.TypeToolUse,
-				ToolUse: &content.ToolUseBlock{ID: "tu_1", Name: "search", Input: json.RawMessage(`{"q":"go"}`)},
-			},
-			wantType:   content.TypeToolUse,
-			wantNonNil: "ToolUse",
-		},
-		{
-			name: "tool_result block has Type and non-nil ToolResult field",
-			block: content.Block{
-				Type:       content.TypeToolResult,
-				ToolResult: &content.ToolResultBlock{ToolUseID: "tu_1", IsError: false},
-			},
-			wantType:   content.TypeToolResult,
-			wantNonNil: "ToolResult",
-		},
-		{
-			name:       "zero-value Block has empty Type and all nil fields",
-			block:      content.Block{},
-			wantType:   "",
-			wantAllNil: true,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-
-			if tt.block.Type != tt.wantType {
-				t.Errorf("block.Type = %q, want %q", tt.block.Type, tt.wantType)
-			}
-
-			if tt.wantAllNil {
-				if tt.block.Text != nil {
-					t.Error("expected Text to be nil")
-				}
-				if tt.block.Image != nil {
-					t.Error("expected Image to be nil")
-				}
-				if tt.block.Audio != nil {
-					t.Error("expected Audio to be nil")
-				}
-				if tt.block.Document != nil {
-					t.Error("expected Document to be nil")
-				}
-				if tt.block.Thinking != nil {
-					t.Error("expected Thinking to be nil")
-				}
-				if tt.block.ToolUse != nil {
-					t.Error("expected ToolUse to be nil")
-				}
-				if tt.block.ToolResult != nil {
-					t.Error("expected ToolResult to be nil")
-				}
-				return
-			}
-
-			// Verify exactly one non-nil field matches wantNonNil.
-			nonNilCount := 0
-			fields := map[string]bool{
-				"Text":       tt.block.Text != nil,
-				"Image":      tt.block.Image != nil,
-				"Audio":      tt.block.Audio != nil,
-				"Document":   tt.block.Document != nil,
-				"Thinking":   tt.block.Thinking != nil,
-				"ToolUse":    tt.block.ToolUse != nil,
-				"ToolResult": tt.block.ToolResult != nil,
-			}
-			for _, nonNil := range fields {
-				if nonNil {
-					nonNilCount++
-				}
-			}
-			if nonNilCount != 1 {
-				t.Errorf("expected exactly 1 non-nil field, got %d", nonNilCount)
-			}
-			if !fields[tt.wantNonNil] {
-				t.Errorf("expected field %s to be non-nil, but it is nil", tt.wantNonNil)
-			}
-		})
-	}
+// TestBlock_InterfaceCompliance is a compile-time check that every concrete
+// payload type satisfies the sealed Block interface.
+// Acceptable exception to the table-driven rule: purely compile-time, no runtime path to branch.
+func TestBlock_InterfaceCompliance(t *testing.T) {
+	var _ content.Block = (*content.TextBlock)(nil)
+	var _ content.Block = (*content.ImageBlock)(nil)
+	var _ content.Block = (*content.AudioBlock)(nil)
+	var _ content.Block = (*content.DocumentBlock)(nil)
+	var _ content.Block = (*content.ThinkingBlock)(nil)
+	var _ content.Block = (*content.ToolUseBlock)(nil)
+	var _ content.Block = (*content.ToolResultBlock)(nil)
 }
 
 // TestTextBlock verifies TextBlock fields.
@@ -250,10 +121,10 @@ func TestImageSource(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		name      string
-		source    content.ImageSource
-		hasURL    bool
-		hasData   bool
+		name    string
+		source  content.ImageSource
+		hasURL  bool
+		hasData bool
 	}{
 		{
 			name:   "remote URL source",
@@ -465,7 +336,7 @@ func TestToolResultBlock(t *testing.T) {
 			name: "happy path with text content",
 			block: content.ToolResultBlock{
 				ToolUseID: "tu_001",
-				Content:   []*content.Block{{Type: content.TypeText, Text: &content.TextBlock{Text: "result"}}},
+				Content:   []content.Block{&content.TextBlock{Text: "result"}},
 				IsError:   false,
 			},
 			wantToolUseID: "tu_001",
@@ -487,9 +358,9 @@ func TestToolResultBlock(t *testing.T) {
 			name: "result with multiple content blocks",
 			block: content.ToolResultBlock{
 				ToolUseID: "tu_003",
-				Content: []*content.Block{
-					{Type: content.TypeText, Text: &content.TextBlock{Text: "part1"}},
-					{Type: content.TypeText, Text: &content.TextBlock{Text: "part2"}},
+				Content: []content.Block{
+					&content.TextBlock{Text: "part1"},
+					&content.TextBlock{Text: "part2"},
 				},
 				IsError: false,
 			},
@@ -499,7 +370,7 @@ func TestToolResultBlock(t *testing.T) {
 		},
 		{
 			name:          "empty content slice (not nil)",
-			block:         content.ToolResultBlock{ToolUseID: "tu_004", Content: []*content.Block{}, IsError: false},
+			block:         content.ToolResultBlock{ToolUseID: "tu_004", Content: []content.Block{}, IsError: false},
 			wantToolUseID: "tu_004",
 			wantIsError:   false,
 			wantContent:   0,
@@ -580,7 +451,6 @@ func TestAudioBlock(t *testing.T) {
 		})
 	}
 }
-
 
 // FuzzToolUseBlockInput exercises ToolUseBlock.Input with arbitrary provider-supplied bytes,
 // since Input is json.RawMessage that accepts any byte sequence from an external source.

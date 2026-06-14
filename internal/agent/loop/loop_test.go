@@ -50,7 +50,7 @@ func newLoop(t *testing.T, client llm.LLM, sinks ...EventSink) (*Loop, context.C
 }
 
 // startTurn sends a StartTurn and returns the events channel + abandoned closer.
-func startTurn(t *testing.T, l *Loop, ctx context.Context, input []*content.Block) (<-chan Event, func()) {
+func startTurn(t *testing.T, l *Loop, ctx context.Context, input []content.Block) (<-chan Event, func()) {
 	t.Helper()
 	ev := make(chan Event, 64)
 	ack := make(chan error, 1)
@@ -443,13 +443,13 @@ func TestFailedTurnRollsBackHistory(t *testing.T) {
 	l, _ := newLoop(t, rec)
 
 	// turn 1 fails (empty response) and must roll back the user message
-	ev1, _ := startTurn(t, l, context.Background(), []*content.Block{{Type: content.TypeText, Text: &content.TextBlock{Text: "first"}}})
+	ev1, _ := startTurn(t, l, context.Background(), []content.Block{&content.TextBlock{Text: "first"}})
 	if _, ok := drainToTerminal(t, ev1).(TurnFailed); !ok {
 		t.Fatal("turn 1 terminal != TurnFailed")
 	}
 	// turn 2: its request must NOT contain two consecutive user messages from turn 1
 	rec.chunks = []content.Chunk{textChunk("ok")}
-	ev2, _ := startTurn(t, l, context.Background(), []*content.Block{{Type: content.TypeText, Text: &content.TextBlock{Text: "second"}}})
+	ev2, _ := startTurn(t, l, context.Background(), []content.Block{&content.TextBlock{Text: "second"}})
 	drainToTerminal(t, ev2)
 	req := rec.lastReq()
 	if len(req.Messages) != 1 {

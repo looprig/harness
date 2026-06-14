@@ -16,7 +16,7 @@ func drainEmit(events *[]Event) func(Event) {
 func TestRunTurn(t *testing.T) {
 	t.Parallel()
 	cfg := Config{Model: llm.ModelSpec{Model: "m"}}
-	input := []*content.Block{{Type: content.TypeText, Text: &content.TextBlock{Text: "hi"}}}
+	input := []content.Block{&content.TextBlock{Text: "hi"}}
 
 	t.Run("success appends user+assistant and returns TurnDone", func(t *testing.T) {
 		t.Parallel()
@@ -34,9 +34,13 @@ func TestRunTurn(t *testing.T) {
 		if _, ok := msgs[0].(*content.UserMessage); !ok {
 			t.Errorf("msgs[0] = %T, want *UserMessage", msgs[0])
 		}
-		text := done.Message.Blocks[len(done.Message.Blocks)-1].Text.Text
-		if text != "hello" {
-			t.Errorf("assembled text = %q, want %q", text, "hello")
+		last := done.Message.Blocks[len(done.Message.Blocks)-1]
+		tb, ok := last.(*content.TextBlock)
+		if !ok {
+			t.Fatalf("last block = %T, want *content.TextBlock", last)
+		}
+		if tb.Text != "hello" {
+			t.Errorf("assembled text = %q, want %q", tb.Text, "hello")
 		}
 	})
 
