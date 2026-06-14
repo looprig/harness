@@ -47,6 +47,16 @@ Date: 2026-06-14 · Status: approved (brainstorm)
 > canonical semantics** — exact/`.suffix` host (no `example.com.evil`), https default,
 > workspace-relative canonical path globs (§3c); (6) **integration tests**
 > (`//go:build integration`) for filesystem tools + Fetch/WebSearch boundaries (§5e).
+>
+> **Revision 2026-06-14 (review pass 4)** resolves a fourth review: (1) a **`Grant`
+> failure never blocks execution** — the call was approved; persistence is best-effort
+> + warns (§2c); (2) **v1 tool results are text-only** — the runner flattens non-text
+> blocks to a visible placeholder, no silent loss (§2a); (3) **Grep `rg` arg-list
+> hardening** (`--regexp <pat> -- <path>`) against flag injection (§4b); (4) **Subagent
+> hard max-depth** (default 2, via `ctx`) ships now (§4b); (5) **Fetch host match uses
+> normalized `Hostname()`** (port-excluded, IDNA/punycode via `x/net/idna`) (§3c);
+> (6) **`Effect` (un)marshals as `"allow"/"ask"/"deny"`** in the user-editable file,
+> unknown → error (§3b).
 
 ## Scope
 
@@ -152,7 +162,7 @@ for {
     assemble AIMessage{Blocks: [thinking…, text, toolUse…]}; append to msgs
     if no tool_use blocks { emit TurnDone(msg); return }
     results := runner.RunBatch(ctx, toolUseBlocks, cfg.Tools, gateReg, emit)
-    for each result: append content.ToolMessage{ToolUseID, Blocks: result.Content} to msgs
+    for each result: append content.ToolMessage{ToolUseID, Blocks: flattenToText(result.Content)} to msgs
     if any result.Terminate { emit TurnDone(lastAIMessage); return }
 }
 ```
@@ -160,17 +170,19 @@ for {
 - `toolDefs` maps each registered tool's `Info(ctx)` → `llm.Tool{Name,
   Description, Schema}`. `ToolInfo.Schema` is `json.RawMessage` (1:1 with
   `llm.Tool.Schema`; no `map[string]any`).
-- **Tool-result message shape.** Each result is appended as
-  `content.ToolMessage{ToolUseID: <the tool_use id>, Blocks: result.Content}` —
-  the result's content blocks go *directly* in the `ToolMessage`, **not** wrapped
-  in a `content.ToolResultBlock`. The OpenAI-style encoder serialises a
-  `ToolMessage` via `textContent`, which extracts only `*content.TextBlock`
-  (`internal/llm/openaiapi/encode.go:90`,`:103`); a `ToolResultBlock` (a distinct
-  block type) would serialise to **empty** content. So tool results are effectively
-  text for the current providers. `result.Content` empty → the runner injects an
-  `"error: empty result"` text block. Image-in-tool-result and `IsError` on the
-  wire are deferred to a provider that supports them (and would teach the encoder
-  to flatten `ToolResultBlock` then).
+- **Tool-result message shape (v1 text-only).** Each result is appended as
+  `content.ToolMessage{ToolUseID: <the tool_use id>, Blocks: <flattened>}` — the
+  result's blocks go *directly* in the `ToolMessage`, **not** wrapped in a
+  `content.ToolResultBlock`. The OpenAI-style encoder serialises a `ToolMessage` via
+  `textContent`, which extracts only `*content.TextBlock`
+  (`internal/llm/openaiapi/encode.go:90`,`:103`); other block types serialise to
+  **empty**. So `ToolResult.Content` stays `[]content.Block` (future-proof), but for
+  v1 the runner **flattens it to text before appending** — `TextBlock`s pass through;
+  any non-text block becomes a visible `"[unsupported tool-result block: <type>]"`
+  text placeholder so nothing **silently** vanishes. `result.Content` empty → an
+  `"error: empty result"` text block. Image-in-tool-result and `IsError` on the wire
+  are deferred to a provider that supports them (which would carry the blocks through
+  instead of flattening). Tools should return `TextBlock`(s) in v1.
 - **Thinking blocks** are retained in the in-memory assistant message (for display
   and a future Anthropic-style signature-replay provider) — the runner does not
   strip them. But the current OpenAI-style encoder **deliberately drops** them on
@@ -318,7 +330,13 @@ unblocks via `<-ctx.Done()`).
    `<-reply` / `<-ctx.Done()`. (`CallID` is re-validated on receipt as cheap
    defence.) On approval with `Scope != ScopeOnce` the runner calls
    `gate.Grant(ctx, toolName, argsJSON, scope)` (§3b) using the `toolName`+`argsJSON`
-   it retained for *this* gate — so the command needs only `CallID`+`Scope`.
+   it retained for *this* gate — so the command needs only `CallID`+`Scope`. **A
+   `Grant` error never blocks execution**: the user already approved *this* call, and
+   `Grant` is best-effort persistence for *future* calls. On failure the runner
+   proceeds with the approved execution (effectively `ScopeOnce` for persistence) and
+   surfaces a non-fatal warning (log line / sink event) so the user knows the
+   session/workspace grant did not stick — it is neither a deny nor a tool-result
+   error.
 3. `AskUser` registers a `gateUserInput` gate the same way for `ProvideUserInput`.
    Because gates are keyed by `CallID` *and* matched by kind, several `AskUser` calls
    in one parallel batch each get their own entry and never collide, and a stray
@@ -464,6 +482,9 @@ finding-6 fix below.)
 
 ```go
 type Effect uint8 // EffectAutoApprove | EffectAsk | EffectDeny
+// Effect has custom MarshalJSON/UnmarshalJSON mapping to "allow"/"ask"/"deny" so the
+// user-editable approvals.json reads naturally (not opaque 0/1/2); an unknown string
+// unmarshals to an error (fail-secure — a malformed approval is not silently allowed).
 
 type ToolPolicy struct {
     Tool   string
@@ -513,7 +534,7 @@ narrow interface suffices" / least privilege):
 | `WriteFile`, `EditFile`, `Bash` | `root string` (resolve path/workdir under it) |
 | `Fetch`, `WebSearch` | `*http.Client` (timeouts + `MinVersion: TLS1.2`); **no filesystem access at all** |
 | `AskUser`, `Todo` | none (use `ctx` / in-memory state) |
-| `Subagent` | a child-agent `Factory` + the session root `context.Context` |
+| `Subagent` | a child-agent `Factory` + the session root `context.Context` (also carries the current spawn depth; see §4b) |
 
 The win is real least privilege: a web tool literally cannot reach the workspace
 root, and `Todo` cannot touch the registry. The cost — adding a *shared* dep touches
@@ -582,10 +603,14 @@ the threat model ever changes (e.g. a shared/multi-tenant workspace).
   per-segment `path.Match` matcher as `Glob` (`**` supported).
 - **Bash** matches a literal prefix of the trimmed command string (advisory; see the
   Bash security note — not a boundary).
-- **Fetch** matches on the parsed `url.Host`: **exact host equality**, or a leading-
-  dot suffix rule (`.example.com` matches `api.example.com`) — **never a substring or
-  string prefix**, so `example.com` does *not* match `example.com.evil.com`. The
-  scheme must be `https` unless the record explicitly encodes `http://`.
+- **Fetch** matches on the **normalized host** — `strings.ToLower(u.Hostname())`
+  (`Hostname()`, *not* `u.Host`, so the **port is excluded**), then IDNA-normalized to
+  ASCII/punycode (`golang.org/x/net/idna.Lookup.ToASCII`; same `x/net` module as the
+  approved `x/net/html` — a non-normalizable host is rejected) so a unicode homograph
+  can't slip past. Matching is **exact host equality** or a leading-dot suffix rule
+  (`.example.com` matches `api.example.com`) — **never substring/prefix**, so
+  `example.com` does *not* match `example.com.evil.com`. Scheme must be `https`
+  unless the record explicitly encodes `http://`.
 - **WebSearch** ignores `Match` (a grant is tool-level; the query is not a boundary).
 
 ```go
@@ -609,6 +634,11 @@ type ApprovalRecord struct {
 // An empty Match means "all calls of this tool" — for high-risk tools (Fetch) a
 // scoped Match should be required rather than a blanket grant.
 type ApprovalsFile struct { Version int `json:"version"`; Approvals []ApprovalRecord `json:"approvals"` }
+// On disk (effect is a string, not 0/1/2):
+//   { "version": 1, "approvals": [
+//       {"tool": "WriteFile", "match": "src/**", "effect": "allow"},
+//       {"tool": "Fetch",     "match": ".github.com", "effect": "allow"},
+//       {"tool": "Bash",      "match": "go test", "effect": "allow"} ] }
 
 type PermissionPolicy struct {
     WorkspaceRoot string
@@ -664,12 +694,12 @@ in observability events — §2d); `crypto/rand` IDs (`internal/uuid`).
 | `EditFile` | path, old/new, replace_all | str-replace; 0→error, 2+ & !replace_all→ambiguous, else replace; diff preview | Ask (`FileWriteRequest`) |
 | `Bash` | command, workdir, timeout(≤120s) | `exec.CommandContext(ctx, "sh", "-c", command)`; combined output; 32 KiB cap; advisory `DeniedBashPrefixes` (see security note) | Ask (`BashRequest`) |
 | `Glob` | pattern, root | `containedPath`; **`**` via stdlib `WalkDir` + per-segment `path.Match`**; **`ReadGuard` excludes `DeniedReadPaths` from results** (else auto-approved glob leaks `.env`/`id_rsa` names); ≤500 results | AutoApprove |
-| `Grep` | pattern, path, recursive, ignore_case, context_lines, include_all | `rg` if present (binary, not a Go dep) else `WalkDir`+`regexp`; skip noise dirs **and `DeniedReadPaths` (never open/match a denied file)**; ≤200 matches | AutoApprove |
+| `Grep` | pattern, path, recursive, ignore_case, context_lines, include_all | `rg` if present (binary, not a Go dep) — **arg-list exec, never a shell string: `exec.Command("rg", "--regexp", pattern, flags…, "--", path)`** so a `-`-leading pattern/path can't become a flag — else `WalkDir`+`regexp`; skip noise dirs **and `DeniedReadPaths` (never open/match a denied file)**; ≤200 matches | AutoApprove |
 | `Fetch` | url, method(GET/POST), headers, body, timeout(≤60s) | `net/http` w/ explicit timeouts + `tls.Config{MinVersion: TLS1.2}`; 64 KiB cap | Ask (`FetchRequest`) |
 | `WebSearch` | query, results(≤10) | `SearchProvider` iface; DuckDuckGo HTML scrape via **`golang.org/x/net/html`** | Ask (`WebSearchRequest`) |
 | `AskUser` | question, choices | emits `UserInputRequested` via `EmitFromContext`; registers a gate, blocks on its reply (CallID-validated); answer validated against choices | AutoApprove |
 | `Todo` | action(create/update/list), … | in-memory `sync.Mutex` map on the tool; `uuid` IDs; session-scoped | AutoApprove |
-| `Subagent` | skill, message | **synchronous** child `session.AgentSession` (`Invoke` to completion, returns final text); `Skill` selects a persona via `internal/registry` | AutoApprove |
+| `Subagent` | skill, message | **synchronous** child `session.AgentSession` (`Invoke` to completion, returns final text); `Skill` selects a persona via `internal/registry`; **hard max-depth (default 2) carried in `ctx` and incremented per spawn — exceeding returns a tool-result error** (prevents runaway recursion/resource exhaustion even though full depth/budget design is deferred) | AutoApprove |
 
 `Sequential` and `EffectChecker` are defined as extensibility seams but no built-in
 implements them yet (ShellSession, deferred, is their first user).
@@ -799,8 +829,9 @@ The pixel-level work is a follow-up TUI-update doc, since that TUI is mid-flight
   session-grant visibility, `Grant` called only when `Scope != ScopeOnce`,
   middleware ordering, panic→error result, ctx-cancel terminates.
 - `runTurn` — `ToolUseChunk` fragment-accumulation by `Index`, tool round-trips,
-  tool-result encoded as `ToolMessage{Blocks: result.Content}` (non-empty on the
-  wire), `Terminate` completes with `TurnDone`, no-tool-call exit; fake `llm.LLM`.
+  tool-result flattened to text in the `ToolMessage` (non-empty on the wire;
+  non-text → visible placeholder), `Terminate` completes with `TurnDone`, no-tool-call
+  exit; fake `llm.LLM`.
 - gate plumbing — **synchronous registration**: an approval delivered immediately
   after the request still lands (the ack ordering guarantees install-before-emit);
   the per-gate channel does not drop the valid approval when a stale/duplicate
@@ -814,8 +845,18 @@ The pixel-level work is a follow-up TUI-update doc, since that TUI is mid-flight
   an `AskUser` gate (and a provide does not satisfy a permission gate); registration
   and ack both unblock on `ctx` cancellation (no wedge if the actor exits).
 - `Match` semantics — `Fetch` host match rejects `example.com.evil.com` for an
-  `example.com` grant, accepts `.example.com` subdomains, requires `https`; file
-  globs match the workspace-relative canonical path, not `..`/absolute strings.
+  `example.com` grant, accepts `.example.com` subdomains, requires `https`, strips the
+  port (`host:443` matches `host`), and normalizes a unicode homograph to punycode;
+  file globs match the workspace-relative canonical path, not `..`/absolute strings.
+- `Grant` failure — a `ScopeWorkspace` grant whose file write fails still **executes**
+  the approved call and emits a warning (not a deny, not a tool-result error).
+- tool-result flattening — a tool returning a non-`TextBlock` yields a visible
+  `[unsupported …]` placeholder in the `ToolMessage`, never empty/silent.
+- `Subagent` depth — a spawn at `ctx` depth ≥ cap returns a tool-result error, no
+  child session created.
+- `Effect` JSON — round-trips `"allow"/"ask"/"deny"`; an unknown string errors.
+- `Grep` `rg` — a pattern like `-x`/`--foo` is passed as a value (`--regexp`/`--`),
+  not interpreted as a flag.
 - manifests — coding registers 11 tools, PA registers the 7-tool subset,
   `AcceptsImages` false.
 - **Integration tests** (`//go:build integration`, `*_integration_test.go`, run with
@@ -834,8 +875,8 @@ The pixel-level work is a follow-up TUI-update doc, since that TUI is mid-flight
 - **ShellSession** — persistent/async shell; needs a session-wide event path so
   `ShellSessionEnded` reaches the UI between turns. Its own follow-up. (`Sequential`
   + `EffectChecker` seams are in place so it lands with no runner change.)
-- **Subagent** beyond the synchronous stub — streaming child events, depth limits,
-  skill catalog.
+- **Subagent** beyond the synchronous stub — streaming child events, the full
+  depth/token-budget policy (a hard max-depth cap ships now, §4b), skill catalog.
 - WebSearch providers beyond DuckDuckGo.
 - Command dedup/idempotency **cache** (IDs are the substrate — identity doc).
 - Detailed TUI rendering of prompts/cards (contract here; rendering in a TUI-update
