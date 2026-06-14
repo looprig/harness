@@ -6,6 +6,7 @@ import (
 	"io"
 	"strings"
 
+	"github.com/inventivepotter/urvi/internal/agent/loop/event"
 	"github.com/inventivepotter/urvi/internal/content"
 	"github.com/inventivepotter/urvi/internal/llm"
 )
@@ -20,25 +21,25 @@ import (
 func runTurn(
 	ctx context.Context,
 	input []content.Block,
-	turnIndex TurnIndex,
+	turnIndex event.TurnIndex,
 	msgs content.AgenticMessages,
 	cfg Config,
 	client llm.LLM,
-	emit func(Event),
-) (content.AgenticMessages, Event) {
+	emit func(event.Event),
+) (content.AgenticMessages, event.Event) {
 	userMsg := &content.UserMessage{
 		Message: content.Message{Role: content.RoleUser, Blocks: input},
 	}
 	msgs = append(msgs, userMsg)
-	emit(TurnStarted{TurnIndex: turnIndex})
+	emit(event.TurnStarted{TurnIndex: turnIndex})
 
 	req := llm.Request{Model: cfg.Model, Messages: msgs}
 	sr, err := client.Stream(ctx, req)
 	if err != nil {
 		if ctx.Err() != nil {
-			return msgs[:len(msgs)-1], TurnInterrupted{TurnIndex: turnIndex}
+			return msgs[:len(msgs)-1], event.TurnInterrupted{TurnIndex: turnIndex}
 		}
-		return msgs[:len(msgs)-1], TurnFailed{TurnIndex: turnIndex, Err: err}
+		return msgs[:len(msgs)-1], event.TurnFailed{TurnIndex: turnIndex, Err: err}
 	}
 	defer sr.Close()
 
@@ -50,11 +51,11 @@ func runTurn(
 		}
 		if err != nil {
 			if ctx.Err() != nil {
-				return msgs[:len(msgs)-1], TurnInterrupted{TurnIndex: turnIndex}
+				return msgs[:len(msgs)-1], event.TurnInterrupted{TurnIndex: turnIndex}
 			}
-			return msgs[:len(msgs)-1], TurnFailed{TurnIndex: turnIndex, Err: err}
+			return msgs[:len(msgs)-1], event.TurnFailed{TurnIndex: turnIndex, Err: err}
 		}
-		emit(TokenDelta{TurnIndex: turnIndex, Chunk: chunk})
+		emit(event.TokenDelta{TurnIndex: turnIndex, Chunk: chunk})
 		switch c := chunk.(type) {
 		case *content.TextChunk:
 			textBuf.WriteString(c.Text)
@@ -74,10 +75,10 @@ func runTurn(
 		// Provider sent a successful stream with no content — treat as a failure
 		// and roll the user message back out, so callers are left with neither an
 		// empty assistant message nor a dangling user message in history.
-		return msgs[:len(msgs)-1], TurnFailed{TurnIndex: turnIndex, Err: &EmptyResponseError{}}
+		return msgs[:len(msgs)-1], event.TurnFailed{TurnIndex: turnIndex, Err: &event.EmptyResponseError{}}
 	}
 	aiMsg := &content.AIMessage{
 		Message: content.Message{Role: content.RoleAssistant, Blocks: blocks},
 	}
-	return append(msgs, aiMsg), TurnDone{TurnIndex: turnIndex, Message: aiMsg}
+	return append(msgs, aiMsg), event.TurnDone{TurnIndex: turnIndex, Message: aiMsg}
 }

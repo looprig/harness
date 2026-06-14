@@ -6,6 +6,8 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/inventivepotter/urvi/internal/agent/loop/command"
+	"github.com/inventivepotter/urvi/internal/agent/loop/event"
 	"github.com/inventivepotter/urvi/internal/content"
 	"github.com/inventivepotter/urvi/internal/uuid"
 )
@@ -21,7 +23,7 @@ import (
 // always read promptly: the actor sends acks synchronously, so a blocked ack
 // send would stall the actor.
 type Loop struct {
-	Commands chan<- Command
+	Commands chan<- command.Command
 	Done     <-chan struct{}
 }
 
@@ -43,7 +45,7 @@ func New(ctx context.Context, sessionID uuid.UUID, cfg Config) (*Loop, error) {
 		return nil, &ConfigError{Kind: ConfigInvalidModel, Cause: err}
 	}
 	cfg.DrainTimeout = resolveDrainTimeout(cfg.DrainTimeout)
-	commands := make(chan Command)
+	commands := make(chan command.Command)
 	done := make(chan struct{})
 	go listen(ctx, sessionID, cfg, commands, done)
 	return &Loop{Commands: commands, Done: done}, nil
@@ -58,38 +60,38 @@ const (
 )
 
 type loopState struct {
-	turnIndex     TurnIndex
+	turnIndex     event.TurnIndex
 	status        loopStatus
 	cancelTurn    context.CancelFunc
-	turnEvents    chan<- Event            // current turn's channel; actor closes it
-	turnAbandoned <-chan struct{}         // always non-nil; closed when caller stops reading
+	turnEvents    chan<- event.Event  // current turn's channel; actor closes it
+	turnAbandoned <-chan struct{}     // always non-nil; closed when caller stops reading
 	msgs          content.AgenticMessages // conversation history across turns
 	shutdownAcks  []chan<- error
 }
 
 type turnResult struct {
 	msgs     content.AgenticMessages
-	terminal Event // TurnDone, TurnFailed, or TurnInterrupted
+	terminal event.Event // TurnDone, TurnFailed, or TurnInterrupted
 }
 
-func listen(ctx context.Context, sessionID uuid.UUID, cfg Config, commands <-chan Command, done chan struct{}) {
+func listen(ctx context.Context, sessionID uuid.UUID, cfg Config, commands <-chan command.Command, done chan struct{}) {
 	defer close(done)
 
 	internal := make(chan turnResult, 1)
 	var state loopState
 
-	publish := func(ev Event) {
-		env := EventEnvelope{SessionID: sessionID, Event: ev} // sessionID is uuid.UUID
+	publish := func(ev event.Event) {
+		env := event.EventEnvelope{SessionID: sessionID, Event: ev} // sessionID is uuid.UUID
 		switch e := ev.(type) {
-		case TurnStarted:
+		case event.TurnStarted:
 			env.TurnIndex = e.TurnIndex
-		case TokenDelta:
+		case event.TokenDelta:
 			env.TurnIndex = e.TurnIndex
-		case TurnDone:
+		case event.TurnDone:
 			env.TurnIndex = e.TurnIndex
-		case TurnFailed:
+		case event.TurnFailed:
 			env.TurnIndex = e.TurnIndex
-		case TurnInterrupted:
+		case event.TurnInterrupted:
 			env.TurnIndex = e.TurnIndex
 		}
 		for _, sink := range cfg.Sinks {
@@ -104,7 +106,7 @@ func listen(ctx context.Context, sessionID uuid.UUID, cfg Config, commands <-cha
 		}
 	}
 
-	publish(SessionStarted{SessionID: sessionID})
+	publish(event.SessionStarted{SessionID: sessionID})
 
 	// deliverAndClose publishes the terminal event, sends it to the per-turn
 	// channel unless the caller abandoned the stream, and closes the channel.
@@ -121,7 +123,7 @@ func listen(ctx context.Context, sessionID uuid.UUID, cfg Config, commands <-cha
 	//     cancel always frees it. Without this case such a caller would wedge the
 	//     actor outside its select loop, where neither Shutdown nor root-ctx
 	//     cancel could reach it.
-	deliverAndClose := func(terminal Event) {
+	deliverAndClose := func(terminal event.Event) {
 		publish(terminal)
 		select {
 		case state.turnEvents <- terminal:
@@ -154,8 +156,8 @@ func listen(ctx context.Context, sessionID uuid.UUID, cfg Config, commands <-cha
 			}
 			switch c := cmd.(type) {
 
-			case StartTurn:
-				if err := validateStartTurn(c); err != nil {
+			case command.StartTurn:
+				if err := c.Validate(); err != nil {
 					slog.Warn("invalid StartTurn command", "error", err)
 					if c.Ack != nil {
 						c.Ack <- err
@@ -166,11 +168,11 @@ func listen(ctx context.Context, sessionID uuid.UUID, cfg Config, commands <-cha
 					continue
 				}
 				if state.status != loopIdle {
-					reason := TurnAlreadyRunning
+					reason := command.TurnAlreadyRunning
 					if state.status == loopShuttingDown {
-						reason = SessionShuttingDown
+						reason = command.SessionShuttingDown
 					}
-					c.Ack <- &TurnBusyError{Reason: reason}
+					c.Ack <- &command.TurnBusyError{Reason: reason}
 					close(c.Events)
 					continue
 				}
@@ -191,7 +193,7 @@ func listen(ctx context.Context, sessionID uuid.UUID, cfg Config, commands <-cha
 							// normal failure: history holds only completed pairs.
 							internal <- turnResult{
 								msgs:     preMsgs,
-								terminal: TurnFailed{TurnIndex: idx, Err: &TurnPanicError{Detail: fmt.Sprintf("%v", r)}},
+								terminal: event.TurnFailed{TurnIndex: idx, Err: &event.TurnPanicError{Detail: fmt.Sprintf("%v", r)}},
 							}
 						}
 					}()
@@ -200,7 +202,7 @@ func listen(ctx context.Context, sessionID uuid.UUID, cfg Config, commands <-cha
 					// turn (never the actor). Escapes on Abandoned (caller gone)
 					// and turnCtx.Done (interrupt/shutdown) keep emit from pinning
 					// the turn goroutine when the consumer stops reading.
-					emit := func(ev Event) {
+					emit := func(ev event.Event) {
 						publish(ev)
 						select {
 						case c.Events <- ev:
@@ -213,9 +215,9 @@ func listen(ctx context.Context, sessionID uuid.UUID, cfg Config, commands <-cha
 				}()
 				c.Ack <- nil
 
-			case Interrupt:
-				if c.Ack == nil {
-					slog.Warn("invalid interrupt command: Ack is required")
+			case command.Interrupt:
+				if err := c.Validate(); err != nil {
+					slog.Warn("invalid Interrupt command", "error", err)
 					continue
 				}
 				if state.cancelTurn != nil {
@@ -226,9 +228,9 @@ func listen(ctx context.Context, sessionID uuid.UUID, cfg Config, commands <-cha
 					c.Ack <- false
 				}
 
-			case Shutdown:
-				if c.Ack == nil {
-					slog.Warn("invalid shutdown command: Ack is required")
+			case command.Shutdown:
+				if err := c.Validate(); err != nil {
+					slog.Warn("invalid Shutdown command", "error", err)
 				} else {
 					state.shutdownAcks = append(state.shutdownAcks, c.Ack)
 				}
@@ -287,7 +289,7 @@ func listen(ctx context.Context, sessionID uuid.UUID, cfg Config, commands <-cha
 					state.turnAbandoned = nil
 				}
 			}
-			ackShutdowns(&LoopTerminatedError{Cause: ctx.Err()})
+			ackShutdowns(&command.LoopTerminatedError{Cause: ctx.Err()})
 			return
 		}
 	}
