@@ -42,6 +42,10 @@
 - `honnef.co/go/tools/cmd/staticcheck` — extended static analysis (dev/tool only)
 - `github.com/google/go-tdx-guest` — Intel TDX quote parsing and verification; required by internal/llm/tee for phala and chutes TEE attestation
 - `golang.org/x/crypto` — ChaCha20-Poly1305 AEAD; required by internal/llm/e2e for ML-KEM E2E envelope (stdlib has no chacha20poly1305)
+- `github.com/charmbracelet/bubbletea` — Elm-architecture TUI runtime; required by tui + cmd/cli (stdlib has no terminal raw-mode/TUI framework)
+- `github.com/charmbracelet/bubbles` — textarea + viewport widgets for the TUI
+- `github.com/charmbracelet/lipgloss` — terminal styling/layout for the TUI
+- `github.com/charmbracelet/glamour` — markdown → ANSI rendering for the TUI transcript
 
 ## Secure Coding Patterns
 
