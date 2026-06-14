@@ -15,6 +15,7 @@ func TestEventErrorMessages(t *testing.T) {
 	}{
 		{"empty response", &event.EmptyResponseError{}, "loop: empty response from provider"},
 		{"turn panic", &event.TurnPanicError{Detail: "x"}, "loop: panic in turn goroutine: x"},
+		{"turn panic empty detail", &event.TurnPanicError{Detail: ""}, "loop: panic in turn goroutine: "},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
