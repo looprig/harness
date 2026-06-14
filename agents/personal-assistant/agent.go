@@ -10,10 +10,10 @@ import (
 
 	"github.com/inventivepotter/urvi/internal/agent/loop"
 	"github.com/inventivepotter/urvi/internal/agent/loop/event"
+	"github.com/inventivepotter/urvi/internal/agent/session"
 	"github.com/inventivepotter/urvi/internal/content"
 	"github.com/inventivepotter/urvi/internal/llm"
 	"github.com/inventivepotter/urvi/internal/llm/auto"
-	"github.com/inventivepotter/urvi/internal/agent/session"
 )
 
 // model is the named model this assistant runs on. Swapping models is a one-line
@@ -37,8 +37,9 @@ const envAPIKey = "LLM_API_KEY" // #nosec G101 -- env var name, not a credential
 // Assistant is a persona-bearing wrapper over a session.AgentSession. The
 // caller owns it and must call Close to release the underlying actor goroutine.
 type Assistant struct {
-	session *session.AgentSession
-	cancel  context.CancelFunc // cancels the session's root context; called by Close
+	session       *session.AgentSession
+	cancel        context.CancelFunc // cancels the session's root context; called by Close
+	acceptsImages bool               // captured from spec at construction; reported by AcceptsImages
 }
 
 // New constructs an Assistant. The session runs under an assistant-owned root
@@ -87,7 +88,7 @@ func newWithClient(ctx context.Context, client llm.LLM, spec llm.ModelSpec) (*As
 		cancel()
 		return nil, err
 	}
-	return &Assistant{session: sess, cancel: cancel}, nil
+	return &Assistant{session: sess, cancel: cancel, acceptsImages: spec.AcceptsImages}, nil
 }
 
 // Send delivers one user message and blocks until the turn reaches a terminal
@@ -118,6 +119,21 @@ func (a *Assistant) Stream(ctx context.Context, text string) (*llm.StreamReader[
 	}
 	return a.session.Stream(ctx, blocks)
 }
+
+// StreamBlocks delivers a multimodal user message and returns the session's
+// event stream: TurnStarted, TokenDelta×N, one terminal event, then EOF.
+// Callers must read to EOF or call sr.Close().
+func (a *Assistant) StreamBlocks(ctx context.Context, blocks []content.Block) (*llm.StreamReader[event.Event], error) {
+	return a.session.Stream(ctx, blocks)
+}
+
+// Interrupt cancels the running turn. Returns true if a turn was cancelled.
+func (a *Assistant) Interrupt(ctx context.Context) (bool, error) {
+	return a.session.Interrupt(ctx)
+}
+
+// AcceptsImages reports whether the underlying model accepts image blocks.
+func (a *Assistant) AcceptsImages() bool { return a.acceptsImages }
 
 // Close gracefully shuts the session down and releases the session's root
 // context. It blocks until the actor exits (or ctx is done), then cancels the

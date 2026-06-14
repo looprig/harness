@@ -10,8 +10,9 @@ import (
 
 	"github.com/inventivepotter/urvi/internal/agent/loop/command"
 	"github.com/inventivepotter/urvi/internal/agent/loop/event"
-	"github.com/inventivepotter/urvi/internal/content"
 	"github.com/inventivepotter/urvi/internal/agent/session"
+	"github.com/inventivepotter/urvi/internal/content"
+	"github.com/inventivepotter/urvi/internal/llm"
 )
 
 func textOf(m *content.AIMessage) string {
@@ -324,5 +325,129 @@ func TestSendCtxCancelInterrupts(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("Send did not return after ctx cancel")
+	}
+}
+
+// TestStreamBlocksOrderedEvents proves StreamBlocks delivers a multimodal user
+// message and surfaces the session's event stream verbatim: TurnStarted, one
+// TokenDelta per chunk (concatenating to the full reply), one terminal
+// TurnDone, then io.EOF. It is the multimodal sibling of TestStreamOrderedEvents.
+func TestStreamBlocksOrderedEvents(t *testing.T) {
+	t.Parallel()
+	a, err := newWithClient(context.Background(), &fakeLLM{chunks: []content.Chunk{textChunk("he"), textChunk("llo")}}, testSpec())
+	if err != nil {
+		t.Fatalf("newWithClient: %v", err)
+	}
+	t.Cleanup(func() { _ = a.Close(context.Background()) })
+
+	sr, err := a.StreamBlocks(context.Background(), []content.Block{&content.TextBlock{Text: "hi"}})
+	if err != nil {
+		t.Fatalf("StreamBlocks() error = %v", err)
+	}
+	defer func() { _ = sr.Close() }()
+
+	var kinds []string
+	var delta strings.Builder
+	for {
+		ev, err := sr.Next()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			t.Fatalf("Next() error = %v", err)
+		}
+		switch e := ev.(type) {
+		case event.TurnStarted:
+			kinds = append(kinds, "started")
+		case event.TokenDelta:
+			kinds = append(kinds, "delta")
+			if tc, ok := e.Chunk.(*content.TextChunk); ok {
+				delta.WriteString(tc.Text)
+			}
+		case event.TurnDone:
+			kinds = append(kinds, "done")
+		default:
+			t.Fatalf("unexpected event %T", ev)
+		}
+	}
+	want := []string{"started", "delta", "delta", "done"}
+	if !equalStrings(kinds, want) {
+		t.Errorf("events = %v, want %v", kinds, want)
+	}
+	if got := delta.String(); got != "hello" {
+		t.Errorf("concatenated TokenDelta text = %q, want hello", got)
+	}
+}
+
+// TestInterruptInFlightTurn proves Interrupt cancels a turn that is genuinely
+// running. The fake holds Next open after its chunk, so the turn stays in flight
+// until we wait on `entered` and call Interrupt, which must report (true, nil).
+func TestInterruptInFlightTurn(t *testing.T) {
+	t.Parallel()
+	entered := make(chan struct{})
+	hold := make(chan struct{})
+	defer close(hold) // release the fake if the turn outlives the test
+	a, err := newWithClient(context.Background(), &fakeLLM{
+		chunks:  []content.Chunk{textChunk("partial")},
+		hold:    hold,
+		entered: entered,
+	}, testSpec())
+	if err != nil {
+		t.Fatalf("newWithClient: %v", err)
+	}
+	t.Cleanup(func() { _ = a.Close(context.Background()) })
+
+	sr, err := a.StreamBlocks(context.Background(), []content.Block{&content.TextBlock{Text: "hi"}})
+	if err != nil {
+		t.Fatalf("StreamBlocks() error = %v", err)
+	}
+	defer func() { _ = sr.Close() }()
+
+	// wait until the turn is genuinely running before interrupting — otherwise
+	// Interrupt could observe an idle session and report (false, nil).
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("turn did not start within deadline")
+	}
+
+	cancelled, err := a.Interrupt(context.Background())
+	if err != nil {
+		t.Fatalf("Interrupt() error = %v, want nil", err)
+	}
+	if !cancelled {
+		t.Fatal("Interrupt() = false, want true (turn was in flight)")
+	}
+}
+
+// TestAcceptsImages proves AcceptsImages reflects the constructed spec's
+// modality flag exactly, with no inversion or defaulting.
+func TestAcceptsImages(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+		want bool
+	}{
+		{name: "model accepts images", want: true},
+		{name: "model is text-only", want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			spec := llm.ModelSpec{
+				Provider:      llm.ProviderLMStudio,
+				Model:         "fake-model",
+				AcceptsImages: tt.want,
+			}
+			a, err := newWithClient(context.Background(), &fakeLLM{}, spec)
+			if err != nil {
+				t.Fatalf("newWithClient: %v", err)
+			}
+			t.Cleanup(func() { _ = a.Close(context.Background()) })
+
+			if got := a.AcceptsImages(); got != tt.want {
+				t.Errorf("AcceptsImages() = %v, want %v", got, tt.want)
+			}
+		})
 	}
 }
