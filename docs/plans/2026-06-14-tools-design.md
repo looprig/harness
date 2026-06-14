@@ -34,6 +34,19 @@ Date: 2026-06-14 · Status: approved (brainstorm)
 > runner-side `ToolSet` + **narrow per-tool deps** (least privilege; supersedes 7.md
 > Rule 2) (§3b, §4a, §4d); (8) `Glob`/`Grep` **exclude `DeniedReadPaths`** from
 > traversal/results (§4b).
+>
+> **Revision 2026-06-14 (review pass 3)** resolves a third review: (1) gate
+> registration send **and** ack are **ctx-aware** (`select … <-ctx.Done()`) so the
+> turn goroutine can't wedge on actor exit (§2c); (2) `pendingGates` stores a **gate
+> kind** — permission gates accept only approve/deny, `AskUser` only provide-input —
+> so a colliding-`CallID` wrong-kind command can't consume a gate (§2c); (3)
+> `PathDenier` → **`ReadGuard{DeniedRead, MaxReadBytes}`** so read tools can enforce
+> the byte cap under narrow deps (§3b); (4) **write-side symlink TOCTOU** documented
+> as out-of-threat-model (local single-user tool) with `O_EXCL\|O_NOFOLLOW` temp as
+> defence-in-depth; `openat`/dirfd noted as a future option (§3c, §4b); (5) **`Match`
+> canonical semantics** — exact/`.suffix` host (no `example.com.evil`), https default,
+> workspace-relative canonical path globs (§3c); (6) **integration tests**
+> (`//go:build integration`) for filesystem tools + Fetch/WebSearch boundaries (§5e).
 
 ## Scope
 
@@ -98,7 +111,7 @@ internal/tool/      internal/llm/  contracts: BaseTool, InvokableTool, ToolResul
     │                              ApprovalScope, Sequential, ToolMiddleware — imports content only
 internal/agent/loop/event/         + PermissionRequested(tool.PermissionRequest), UserInputRequested,
     ↑                                ToolCallStarted, ToolCallCompleted
-internal/agent/loop/               runner.go, deps.go (ToolSet, PermissionGate, PathDenier, Effect, ToolPolicy),
+internal/agent/loop/               runner.go, deps.go (ToolSet, PermissionGate, ReadGuard, Effect, ToolPolicy),
     ↑                ↑               EmitFromContext; command/ + Approve/Deny/Provide; turn.go agentic loop
 tools/            internal/hashcache/   11 impls, PermissionChecker, SearchProvider; hashcache backs approvals
     ↑
@@ -246,30 +259,49 @@ instead:
 - **Multiple gates can be open at once.** Permission *gates* are resolved
   sequentially, but `AskUser` is auto-approved and blocks for input *during parallel
   execution* — so two `AskUser` calls in one batch can be waiting simultaneously. A
-  single `pendingGate` would collide. `loopState` therefore holds
-  `pendingGates map[uuid.UUID]chan<- command.Command` (CallID → that gate's reply
-  channel), owned solely by `listen`.
-- **Registration is synchronous** (closes the install-before-emit race): the runner
-  creates `reply := make(chan command.Command, 1)`, sends
-  `{callID, reply, ack}` on the internal `gateReg` channel, and **blocks on `<-ack`**
-  until `listen` has installed it in `pendingGates`. Only then does it emit
-  `PermissionRequested`/`UserInputRequested` and block on `<-reply` / `<-ctx.Done()`.
-  Because the gate is provably installed before the request can reach the TUI, no
-  reply is ever dropped on a race.
-- `listen` routes each control command to the matching gate and delivers exactly
-  once on that gate's dedicated buffered(1) channel (runner is sole reader → never
-  blocks, never drops the match):
+  single `pendingGate` would collide. `loopState` holds
+  `pendingGates map[uuid.UUID]gate` (CallID → gate), owned solely by `listen`, where
+  a gate records both the reply channel **and the kind of command it accepts**:
 
 ```go
-case gateRegistration:                 // {callID, reply, ack} from the runner
-    state.pendingGates[reg.callID] = reg.reply
+type gateKind uint8
+const ( gatePermission gateKind = iota; gateUserInput )
+type gate struct { reply chan<- command.Command; kind gateKind }
+```
+
+- **Registration is synchronous and ctx-aware** (closes the install-before-emit
+  race without wedging on actor exit): the runner creates
+  `reply := make(chan command.Command, 1)` and registers, selecting on `ctx.Done()`
+  for both the send and the ack wait:
+
+```go
+select {
+case gateReg <- gateRegistration{callID, reply, kind, ack}:
+case <-ctx.Done(): return ctx.Err()            // actor gone / turn cancelled — no wedge
+}
+select {
+case <-ack:                                     // gate installed in pendingGates
+case <-ctx.Done(): return ctx.Err()
+}
+```
+  Only then does the runner emit `PermissionRequested`/`UserInputRequested` and block
+  on `<-reply` / `<-ctx.Done()`. The ack guarantees the gate is installed before the
+  request can reach the TUI, so no reply is dropped on a race.
+- `listen` routes a control command to the matching gate **only if the command kind
+  matches the gate kind**, delivering once on the gate's dedicated buffered(1)
+  channel (runner is sole reader → never blocks, never drops the match):
+
+```go
+case gateRegistration:                 // {callID, reply, kind, ack} from the runner
+    state.pendingGates[reg.callID] = gate{reg.reply, reg.kind}
     close(reg.ack)                      // unblock the runner: gate is installed
 
 case command.ApproveToolCall, command.DenyToolCall, command.ProvideUserInput:
-    if ch, ok := state.pendingGates[cmd.GateCallID()]; ok {
-        ch <- cmd                       // dedicated buffered(1) channel
+    g, ok := state.pendingGates[cmd.GateCallID()]
+    if ok && accepts(g.kind, cmd) {     // approve/deny ↔ gatePermission; provide ↔ gateUserInput
+        g.reply <- cmd
         delete(state.pendingGates, cmd.GateCallID())
-    }                                   // else: stale / wrong CallID / no such gate — drop (fail-safe)
+    }                                   // else: no gate / wrong CallID / wrong kind — drop (fail-safe)
 ```
 
 On turn end / cancellation `listen` clears `pendingGates` (any parked runner already
@@ -281,17 +313,16 @@ unblocks via `<-ctx.Done()`).
 1. `effect := cfg.Tools.Permission.Check(ctx, t, name, argsJSON)`.
 2. If `EffectAsk`: build the typed request
    (`t.(tool.PermissionPrompter).BuildRequest` or fallback `UnknownRequest`),
-   **register the gate synchronously** (send to `gateReg`, wait for `<-ack`), *then*
-   emit `event.PermissionRequested{CallID, Request}`, then block on `<-reply` /
-   `<-ctx.Done()`. (The ack guarantees the gate is in `pendingGates` before the TUI
-   can receive the request, so no approval is dropped on a race. `CallID` is
-   re-validated on receipt as cheap defence.) On approval with `Scope != ScopeOnce`
-   the runner calls `gate.Grant(ctx, toolName, argsJSON, scope)` (§3b) using the
-   `toolName`+`argsJSON` it retained for *this* gate — so the command needs only
-   `CallID`+`Scope`.
-3. `AskUser` registers a gate the same way for `ProvideUserInput`. Because gates are
-   keyed by `CallID` in `pendingGates`, several `AskUser` calls in one parallel batch
-   each get their own entry and never collide.
+   **register the gate synchronously** as `gatePermission` (ctx-aware send + ack, as
+   above), *then* emit `event.PermissionRequested{CallID, Request}`, then block on
+   `<-reply` / `<-ctx.Done()`. (`CallID` is re-validated on receipt as cheap
+   defence.) On approval with `Scope != ScopeOnce` the runner calls
+   `gate.Grant(ctx, toolName, argsJSON, scope)` (§3b) using the `toolName`+`argsJSON`
+   it retained for *this* gate — so the command needs only `CallID`+`Scope`.
+3. `AskUser` registers a `gateUserInput` gate the same way for `ProvideUserInput`.
+   Because gates are keyed by `CallID` *and* matched by kind, several `AskUser` calls
+   in one parallel batch each get their own entry and never collide, and a stray
+   approve/deny can never satisfy an `AskUser` gate (or vice versa).
 
 The `loopState` invariant is preserved: only `listen` touches `loop.Commands` and
 `loopState`; it *routes* the matching control command to the parked runner on that
@@ -458,9 +489,15 @@ type ToolSet struct {
     Middlewares []tool.ToolMiddleware
 }
 
-// PathDenier is the narrow read-deny check Glob/Grep/ReadFile use to filter
-// traversal + results; satisfied by *tools.PermissionChecker (its HardDeny config).
-type PathDenier interface { DeniedRead(absPath string) bool }
+// ReadGuard is the narrow read-side policy the read tools enforce themselves:
+// DeniedRead filters denied paths in Glob/Grep traversal+results; MaxReadBytes is
+// the per-file cap ReadFile/Grep apply via io.LimitReader. Satisfied by
+// *tools.PermissionChecker (exposing its HardDeny config). Carrying the cap here
+// fixes the orphaned HardDenyRules.MaxReadBytes under narrow deps.
+type ReadGuard interface {
+    DeniedRead(absPath string) bool
+    MaxReadBytes() int64
+}
 ```
 
 `loop.Config` gains `Tools ToolSet`. `EffectChecker` (returns `loop.Effect`) lives
@@ -472,7 +509,7 @@ narrow interface suffices" / least privilege):
 
 | Tool family | Constructor deps |
 |---|---|
-| `ReadFile`, `Glob`, `Grep` | `root string`, `PathDenier` (filter denied paths in traversal/results) |
+| `ReadFile`, `Glob`, `Grep` | `root string`, `ReadGuard` (filter denied paths in traversal/results; `ReadFile`/`Grep` enforce `MaxReadBytes`) |
 | `WriteFile`, `EditFile`, `Bash` | `root string` (resolve path/workdir under it) |
 | `Fetch`, `WebSearch` | `*http.Client` (timeouts + `MinVersion: TLS1.2`); **no filesystem access at all** |
 | `AskUser`, `Todo` | none (use `ctx` / in-memory state) |
@@ -523,7 +560,33 @@ path/workdir arg) therefore:
 
 This matches the attachment-read hardening already in the tree
 (`docs/plans/2026-06-13-tui-design.md`, *Block building*: `O_NOFOLLOW` + fd stat +
-`LimitReader`). `ReadFile` additionally caps the read via `LimitReader(MaxReadBytes)`.
+`LimitReader`). `ReadFile` additionally caps the read via
+`LimitReader(MaxReadBytes)` (from its `ReadGuard`).
+
+**Write-side threat model.** `WriteFile`'s `MkdirAll` + temp-write + `Rename` leaves
+a residual TOCTOU: a parent directory could be swapped to a symlink between the
+containment check and the write. This is **explicitly out of the threat model** —
+consistent with the TUI design's stance that this is a *local, single-user tool
+acting with the user's own privileges*, so a concurrent attacker with write access
+to the live workspace is already past the boundary. As cheap defence-in-depth the
+temp file is created with `O_CREATE|O_EXCL|O_WRONLY|O_NOFOLLOW` (no symlinked temp,
+no clobber). Full `openat`/dirfd confinement is platform-specific (would need
+`golang.org/x/sys`) and disproportionate here; it is noted as a hardening option if
+the threat model ever changes (e.g. a shared/multi-tenant workspace).
+
+**`Match` semantics (canonical, to avoid loose matching).**
+- **File globs** (`ReadFile`/`WriteFile`/`EditFile`/`Glob`/`Grep`) match against the
+  **workspace-relative, cleaned, symlink-resolved** path (the `containedPath`
+  output relativised to the root) — never a raw or absolute string — so a pattern is
+  stable and cannot be fooled by `..` or an absolute prefix. Matching uses the same
+  per-segment `path.Match` matcher as `Glob` (`**` supported).
+- **Bash** matches a literal prefix of the trimmed command string (advisory; see the
+  Bash security note — not a boundary).
+- **Fetch** matches on the parsed `url.Host`: **exact host equality**, or a leading-
+  dot suffix rule (`.example.com` matches `api.example.com`) — **never a substring or
+  string prefix**, so `example.com` does *not* match `example.com.evil.com`. The
+  scheme must be `https` unless the record explicitly encodes `http://`.
+- **WebSearch** ignores `Match` (a grant is tool-level; the query is not a boundary).
 
 ```go
 type EffectChecker interface { CheckEffect(argsJSON string) (effect loop.Effect, handled bool) }
@@ -597,10 +660,10 @@ in observability events — §2d); `crypto/rand` IDs (`internal/uuid`).
 | Tool | Args | Behaviour | Default |
 |---|---|---|---|
 | `ReadFile` | path, start/end line | `containedPath` + `DeniedReadPaths` + `MaxReadBytes`; line-numbered text; truncation notice | AutoApprove |
-| `WriteFile` | path, content | `containedPath` + `DeniedWritePaths`; `MkdirAll`; atomic tmp+`Rename` | Ask (`FileWriteRequest`) |
+| `WriteFile` | path, content | `containedPath` + `DeniedWritePaths`; `MkdirAll`; atomic write — temp via `O_CREATE\|O_EXCL\|O_WRONLY\|O_NOFOLLOW` then `Rename` (write-TOCTOU threat model in §3c) | Ask (`FileWriteRequest`) |
 | `EditFile` | path, old/new, replace_all | str-replace; 0→error, 2+ & !replace_all→ambiguous, else replace; diff preview | Ask (`FileWriteRequest`) |
 | `Bash` | command, workdir, timeout(≤120s) | `exec.CommandContext(ctx, "sh", "-c", command)`; combined output; 32 KiB cap; advisory `DeniedBashPrefixes` (see security note) | Ask (`BashRequest`) |
-| `Glob` | pattern, root | `containedPath`; **`**` via stdlib `WalkDir` + per-segment `path.Match`**; **`PathDenier` excludes `DeniedReadPaths` from results** (else auto-approved glob leaks `.env`/`id_rsa` names); ≤500 results | AutoApprove |
+| `Glob` | pattern, root | `containedPath`; **`**` via stdlib `WalkDir` + per-segment `path.Match`**; **`ReadGuard` excludes `DeniedReadPaths` from results** (else auto-approved glob leaks `.env`/`id_rsa` names); ≤500 results | AutoApprove |
 | `Grep` | pattern, path, recursive, ignore_case, context_lines, include_all | `rg` if present (binary, not a Go dep) else `WalkDir`+`regexp`; skip noise dirs **and `DeniedReadPaths` (never open/match a denied file)**; ≤200 matches | AutoApprove |
 | `Fetch` | url, method(GET/POST), headers, body, timeout(≤60s) | `net/http` w/ explicit timeouts + `tls.Config{MinVersion: TLS1.2}`; 64 KiB cap | Ask (`FetchRequest`) |
 | `WebSearch` | query, results(≤10) | `SearchProvider` iface; DuckDuckGo HTML scrape via **`golang.org/x/net/html`** | Ask (`WebSearchRequest`) |
@@ -641,7 +704,8 @@ can't express. The exception is explicit, not accidental:
 Each `New(ctx)` self-wires (matching today's `personalassistant.New(ctx)`):
 `os.Getwd()` → workspace root → build `PermissionPolicy` (default hard rules) →
 `pc := tools.NewPermissionChecker(policy)` → construct the tools it wants **with
-their narrow deps** (file tools get `root`+`pc` as the `PathDenier`; web tools get an
+their narrow deps** (read tools get `root`+`pc` as the `ReadGuard`; write/exec tools
+get `root`; web tools get an
 `*http.Client`; `Subagent` gets a child-agent factory + `rootCtx`) → assemble
 `loop.ToolSet{Permission: pc, Registry: thoseTools, Middlewares: …}` → read API key
 from env → `auto.New(spec)` → seal `loop.Config{Client, Model, Tools: toolSet}` →
@@ -746,8 +810,21 @@ The pixel-level work is a follow-up TUI-update doc, since that TUI is mid-flight
   when `ctx` is cancelled or the loop has exited.
 - `PermissionRequest` types compile in `internal/tool` (sealed marker satisfied);
   `loop` constructs `UnknownRequest` without importing `tools`.
+- gate-kind matching — an approve/deny with a colliding `CallID` does **not** satisfy
+  an `AskUser` gate (and a provide does not satisfy a permission gate); registration
+  and ack both unblock on `ctx` cancellation (no wedge if the actor exits).
+- `Match` semantics — `Fetch` host match rejects `example.com.evil.com` for an
+  `example.com` grant, accepts `.example.com` subdomains, requires `https`; file
+  globs match the workspace-relative canonical path, not `..`/absolute strings.
 - manifests — coding registers 11 tools, PA registers the 7-tool subset,
   `AcceptsImages` false.
+- **Integration tests** (`//go:build integration`, `*_integration_test.go`, run with
+  `-tags integration` — CLAUDE.md:115, process-boundary code): real-filesystem tests
+  for `ReadFile`/`WriteFile`/`EditFile`/`Glob`/`Grep` under a `t.TempDir()` workspace
+  (containment, symlink-escape rejection, `O_NOFOLLOW`/`O_EXCL` write, `MaxReadBytes`
+  cap, `DeniedReadPaths` exclusion, atomic rename); and `Fetch`/`WebSearch`
+  `SearchProvider` against a local `httptest.Server` (timeouts, TLS floor, truncation,
+  host-match enforcement).
 - (identity-model tests live in the identity doc.)
 
 ---
