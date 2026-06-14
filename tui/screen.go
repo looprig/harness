@@ -73,8 +73,124 @@ func (m Screen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case tea.KeyMsg:
 		return m.handleKey(msg)
+	case eventMsg:
+		return m, m.handleEvent(msg.ev)
+	case streamEOFMsg:
+		return m, m.finishTurnAdvanceQueue()
+	case streamErrMsg:
+		m.appendError(msg.err)
+		return m, m.finishTurnAdvanceQueue()
+	case interruptResultMsg:
+		return m, m.handleInterruptResult(msg)
+	case reopenResultMsg:
+		return m, m.handleReopenResult(msg)
+	case systemReadyMsg:
+		m.messages = append(m.messages, DisplayMessage{
+			Role:   RoleSystem,
+			Blocks: []content.Block{&content.TextBlock{Text: "session ready"}},
+		})
+		m.refreshHistory()
+		return m, nil
 	}
 	return m, nil
+}
+
+// handleEvent applies one turn-stream event to the model and returns the command
+// that pulls the next event (readNext). Unknown events are no-ops.
+func (m *Screen) handleEvent(ev event.Event) tea.Cmd {
+	switch ev := ev.(type) {
+	case event.TurnStarted:
+		// Already Running; nothing to display.
+	case event.TokenDelta:
+		if tc, ok := ev.Chunk.(*content.TextChunk); ok {
+			m.stream += tc.Text
+			m.refreshHistory()
+		}
+		// Any other chunk variant (e.g. *content.ThinkingChunk) is skipped.
+	case event.TurnDone:
+		var blocks []content.Block
+		if ev.Message != nil {
+			blocks = ev.Message.Blocks
+		}
+		m.messages = append(m.messages, DisplayMessage{Role: RoleAssistant, Blocks: blocks})
+		m.stream = ""
+		m.refreshHistory()
+	case event.TurnFailed:
+		m.appendError(ev.Err)
+		m.stream = ""
+		m.refreshHistory()
+	case event.TurnInterrupted:
+		if m.stream != "" {
+			m.messages = append(m.messages, DisplayMessage{
+				Role:   RoleAssistant,
+				Blocks: []content.Block{&content.TextBlock{Text: m.stream}},
+			})
+		}
+		m.messages = append(m.messages, DisplayMessage{Role: RoleInterrupted, Blocks: nil})
+		m.stream = ""
+		m.refreshHistory()
+	}
+	return readNext(m.reader)
+}
+
+// finishTurnAdvanceQueue closes the active reader, returns the model to Idle, and
+// peeks the queue: if a queued input starts successfully its head is removed and
+// the new turn's first readNext is returned; otherwise the head stays queued
+// (startTurn already showed a RoleError and stayed Idle) and nil is returned. It
+// is shared by the EOF and error stream arms.
+func (m *Screen) finishTurnAdvanceQueue() tea.Cmd {
+	if m.reader != nil {
+		_ = m.reader.Close() // best-effort; idempotent closer, nothing actionable at the UI
+	}
+	m.reader = nil
+	m.status = StatusIdle
+
+	if len(m.queue) > 0 {
+		head := m.queue[0]
+		cmd, ok := m.startTurn(head.Blocks)
+		if ok {
+			m.queue = m.queue[1:] // remove the head; its RoleUser row already exists
+		}
+		m.refreshHistory()
+		return cmd
+	}
+	m.refreshHistory()
+	return nil
+}
+
+// handleInterruptResult applies the outcome of an Interrupt call. On error the
+// turn may still be live, so the model returns to Running and surfaces a RoleError;
+// on success it stays Interrupting — the loop's TurnInterrupted terminal event (or
+// the in-flight stream's pending EOF when cancelled==false) returns it to Idle.
+func (m *Screen) handleInterruptResult(msg interruptResultMsg) tea.Cmd {
+	if msg.err != nil {
+		m.appendError(msg.err)
+		m.status = StatusRunning
+		m.refreshHistory()
+	}
+	return nil
+}
+
+// handleReopenResult applies a /clear reopen outcome (the model is Resetting). On
+// error the old agent is kept and the model returns to Idle with a RoleError. On
+// success the fresh agent is swapped in, all display state is cleared, the model
+// returns to Idle, and the old agent is closed best-effort via closeAgent.
+func (m *Screen) handleReopenResult(msg reopenResultMsg) tea.Cmd {
+	if msg.err != nil {
+		m.appendError(msg.err)
+		m.status = StatusIdle
+		m.refreshHistory()
+		return nil
+	}
+	old := m.agent
+	m.agent = msg.agent
+	m.messages = nil
+	m.stream = ""
+	m.queue = nil
+	m.history.Clear()
+	m.status = StatusIdle
+	m.refreshHistory()
+	return closeAgent(old)
 }
 
 // View renders an empty string until the first WindowSizeMsg (avoids a 0×0 first

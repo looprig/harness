@@ -214,3 +214,468 @@ func TestAppendError(t *testing.T) {
 		t.Errorf("text = %q, want %q", tb.Text, "kaboom")
 	}
 }
+
+// updateScreen drives m.Update with msg and returns the concrete Screen plus the
+// cmd, failing the test if the model is not a Screen.
+func updateScreen(t *testing.T, m Screen, msg tea.Msg) (Screen, tea.Cmd) {
+	t.Helper()
+	model, cmd := m.Update(msg)
+	got, ok := model.(Screen)
+	if !ok {
+		t.Fatalf("Update returned %T, want Screen", model)
+	}
+	return got, cmd
+}
+
+// firstTextBlock returns the text of the first *content.TextBlock in row, or "".
+func firstTextBlock(t *testing.T, row DisplayMessage) string {
+	t.Helper()
+	if len(row.Blocks) == 0 {
+		return ""
+	}
+	tb, ok := row.Blocks[0].(*content.TextBlock)
+	if !ok {
+		t.Fatalf("block[0] = %T, want *content.TextBlock", row.Blocks[0])
+	}
+	return tb.Text
+}
+
+func TestUpdateTokenDeltaAccumulates(t *testing.T) {
+	t.Parallel()
+
+	agent := &fakeAgent{}
+	m := New(context.Background(), agent, fakeOpen(agent))
+	m.reader = scriptedReader() // readNext targets must be non-nil
+	m.status = StatusRunning
+
+	m, cmd := updateScreen(t, m, eventMsg{ev: event.TokenDelta{Chunk: &content.TextChunk{Text: "ab"}}})
+	if cmd == nil {
+		t.Error("TokenDelta cmd = nil, want non-nil (readNext)")
+	}
+	m, _ = updateScreen(t, m, eventMsg{ev: event.TokenDelta{Chunk: &content.TextChunk{Text: "cd"}}})
+
+	if m.stream != "abcd" {
+		t.Errorf("stream = %q, want %q", m.stream, "abcd")
+	}
+}
+
+func TestUpdateThinkingChunkSkipped(t *testing.T) {
+	t.Parallel()
+
+	agent := &fakeAgent{}
+	m := New(context.Background(), agent, fakeOpen(agent))
+	m.reader = scriptedReader()
+	m.stream = "keep"
+
+	m, _ = updateScreen(t, m, eventMsg{ev: event.TokenDelta{Chunk: &content.ThinkingChunk{Thinking: "x"}}})
+
+	if m.stream != "keep" {
+		t.Errorf("stream = %q, want unchanged %q", m.stream, "keep")
+	}
+}
+
+func TestUpdateTurnDone(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		msg       *content.AIMessage
+		stream    string
+		wantText  string
+		wantNil   bool
+		wantBlock bool
+	}{
+		{
+			name:      "with message blocks",
+			msg:       &content.AIMessage{Message: content.Message{Blocks: []content.Block{&content.TextBlock{Text: "hi"}}}},
+			stream:    "partial",
+			wantText:  "hi",
+			wantBlock: true,
+		},
+		{
+			name:    "nil message appends empty assistant turn",
+			msg:     nil,
+			stream:  "partial",
+			wantNil: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			agent := &fakeAgent{}
+			m := New(context.Background(), agent, fakeOpen(agent))
+			m.reader = scriptedReader()
+			m.status = StatusRunning
+			m.stream = tt.stream
+
+			m, cmd := updateScreen(t, m, eventMsg{ev: event.TurnDone{Message: tt.msg}})
+			if cmd == nil {
+				t.Error("TurnDone cmd = nil, want non-nil (readNext for trailing EOF)")
+			}
+			if m.stream != "" {
+				t.Errorf("stream = %q, want cleared", m.stream)
+			}
+			if len(m.messages) == 0 {
+				t.Fatal("expected an assistant row")
+			}
+			last := m.messages[len(m.messages)-1]
+			if last.Role != RoleAssistant {
+				t.Errorf("role = %d, want RoleAssistant (%d)", last.Role, RoleAssistant)
+			}
+			if tt.wantNil && last.Blocks != nil {
+				t.Errorf("nil-message blocks = %v, want nil", last.Blocks)
+			}
+			if tt.wantBlock && firstTextBlock(t, last) != tt.wantText {
+				t.Errorf("text = %q, want %q", firstTextBlock(t, last), tt.wantText)
+			}
+		})
+	}
+}
+
+func TestUpdateTurnFailed(t *testing.T) {
+	t.Parallel()
+
+	agent := &fakeAgent{}
+	m := New(context.Background(), agent, fakeOpen(agent))
+	m.reader = scriptedReader()
+	m.status = StatusRunning
+	m.stream = "partial"
+
+	m, cmd := updateScreen(t, m, eventMsg{ev: event.TurnFailed{Err: errors.New("boom")}})
+	if cmd == nil {
+		t.Error("TurnFailed cmd = nil, want non-nil")
+	}
+	if m.stream != "" {
+		t.Errorf("stream = %q, want cleared", m.stream)
+	}
+	last := m.messages[len(m.messages)-1]
+	if last.Role != RoleError {
+		t.Errorf("role = %d, want RoleError", last.Role)
+	}
+	if firstTextBlock(t, last) != "boom" {
+		t.Errorf("text = %q, want %q", firstTextBlock(t, last), "boom")
+	}
+}
+
+func TestUpdateTurnInterrupted(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		stream    string
+		wantRoles []DisplayRole
+		wantText  string
+	}{
+		{
+			name:      "with partial flushes partial then tombstone",
+			stream:    "partial",
+			wantRoles: []DisplayRole{RoleAssistant, RoleInterrupted},
+			wantText:  "partial",
+		},
+		{
+			name:      "empty stream appends only tombstone",
+			stream:    "",
+			wantRoles: []DisplayRole{RoleInterrupted},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			agent := &fakeAgent{}
+			m := New(context.Background(), agent, fakeOpen(agent))
+			m.reader = scriptedReader()
+			m.status = StatusInterrupting
+			m.stream = tt.stream
+
+			m, cmd := updateScreen(t, m, eventMsg{ev: event.TurnInterrupted{}})
+			if cmd == nil {
+				t.Error("TurnInterrupted cmd = nil, want non-nil")
+			}
+			if m.stream != "" {
+				t.Errorf("stream = %q, want cleared", m.stream)
+			}
+			if len(m.messages) != len(tt.wantRoles) {
+				t.Fatalf("messages len = %d, want %d", len(m.messages), len(tt.wantRoles))
+			}
+			for i, role := range tt.wantRoles {
+				if m.messages[i].Role != role {
+					t.Errorf("messages[%d].Role = %d, want %d", i, m.messages[i].Role, role)
+				}
+			}
+			if tt.wantText != "" {
+				if got := firstTextBlock(t, m.messages[0]); got != tt.wantText {
+					t.Errorf("partial text = %q, want %q", got, tt.wantText)
+				}
+			}
+			// Tombstone carries nil Blocks.
+			tomb := m.messages[len(m.messages)-1]
+			if tomb.Blocks != nil {
+				t.Errorf("tombstone blocks = %v, want nil", tomb.Blocks)
+			}
+		})
+	}
+}
+
+func TestUpdateTurnStarted(t *testing.T) {
+	t.Parallel()
+
+	agent := &fakeAgent{}
+	m := New(context.Background(), agent, fakeOpen(agent))
+	m.reader = scriptedReader()
+	m.status = StatusRunning
+
+	m, cmd := updateScreen(t, m, eventMsg{ev: event.TurnStarted{}})
+	if cmd == nil {
+		t.Error("TurnStarted cmd = nil, want non-nil (readNext)")
+	}
+	if len(m.messages) != 0 {
+		t.Errorf("TurnStarted appended %d messages, want 0", len(m.messages))
+	}
+	if m.status != StatusRunning {
+		t.Errorf("status = %d, want StatusRunning", m.status)
+	}
+}
+
+func TestUpdateStreamEOFAdvancesQueue(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name        string
+		queue       []queuedInput
+		streamErr   error
+		wantStatus  Status
+		wantCmd     bool
+		wantQueue   int
+		wantErrLast bool
+	}{
+		{
+			name:       "empty queue goes idle",
+			queue:      nil,
+			wantStatus: StatusIdle,
+			wantCmd:    false,
+			wantQueue:  0,
+		},
+		{
+			name:       "non-empty queue starts next turn",
+			queue:      []queuedInput{{Blocks: []content.Block{&content.TextBlock{Text: "q"}}, DisplayIndex: 0}},
+			wantStatus: StatusRunning,
+			wantCmd:    true,
+			wantQueue:  0,
+		},
+		{
+			name:        "queued start failure keeps head, stays idle, error appended",
+			queue:       []queuedInput{{Blocks: []content.Block{&content.TextBlock{Text: "q"}}, DisplayIndex: 0}},
+			streamErr:   errors.New("busy"),
+			wantStatus:  StatusIdle,
+			wantCmd:     false,
+			wantQueue:   1,
+			wantErrLast: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			agent := &fakeAgent{streamReader: scriptedReader(event.TurnStarted{}), streamErr: tt.streamErr}
+			m := New(context.Background(), agent, fakeOpen(agent))
+			m.reader = scriptedReader()
+			m.status = StatusRunning
+			m.queue = tt.queue
+
+			m, cmd := updateScreen(t, m, streamEOFMsg{})
+
+			if m.status != tt.wantStatus {
+				t.Errorf("status = %d, want %d", m.status, tt.wantStatus)
+			}
+			if (cmd != nil) != tt.wantCmd {
+				t.Errorf("cmd != nil = %v, want %v", cmd != nil, tt.wantCmd)
+			}
+			if len(m.queue) != tt.wantQueue {
+				t.Errorf("queue len = %d, want %d", len(m.queue), tt.wantQueue)
+			}
+			if m.reader != nil && tt.wantStatus == StatusIdle {
+				t.Errorf("reader != nil after idle EOF, want nil")
+			}
+			if tt.wantErrLast {
+				last := m.messages[len(m.messages)-1]
+				if last.Role != RoleError {
+					t.Errorf("last role = %d, want RoleError", last.Role)
+				}
+			}
+		})
+	}
+}
+
+func TestUpdateStreamErr(t *testing.T) {
+	t.Parallel()
+
+	agent := &fakeAgent{}
+	m := New(context.Background(), agent, fakeOpen(agent))
+	m.reader = scriptedReader()
+	m.status = StatusRunning
+
+	m, cmd := updateScreen(t, m, streamErrMsg{err: errors.New("read fail")})
+	if cmd != nil {
+		t.Errorf("cmd = non-nil, want nil (empty queue)")
+	}
+	if m.status != StatusIdle {
+		t.Errorf("status = %d, want StatusIdle", m.status)
+	}
+	if m.reader != nil {
+		t.Error("reader != nil, want nil")
+	}
+	last := m.messages[len(m.messages)-1]
+	if last.Role != RoleError || firstTextBlock(t, last) != "read fail" {
+		t.Errorf("last = %+v, want RoleError 'read fail'", last)
+	}
+}
+
+func TestUpdateInterruptResult(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name        string
+		msg         interruptResultMsg
+		startStatus Status
+		wantStatus  Status
+		wantErrRow  bool
+	}{
+		{
+			name:        "error sets running and appends error",
+			msg:         interruptResultMsg{err: errors.New("x")},
+			startStatus: StatusInterrupting,
+			wantStatus:  StatusRunning,
+			wantErrRow:  true,
+		},
+		{
+			name:        "success stays interrupting",
+			msg:         interruptResultMsg{cancelled: true},
+			startStatus: StatusInterrupting,
+			wantStatus:  StatusInterrupting,
+		},
+		{
+			name:        "cancelled false stays interrupting (EOF returns to idle)",
+			msg:         interruptResultMsg{cancelled: false},
+			startStatus: StatusInterrupting,
+			wantStatus:  StatusInterrupting,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			agent := &fakeAgent{}
+			m := New(context.Background(), agent, fakeOpen(agent))
+			m.status = tt.startStatus
+
+			m, cmd := updateScreen(t, m, tt.msg)
+			if cmd != nil {
+				t.Errorf("cmd = non-nil, want nil")
+			}
+			if m.status != tt.wantStatus {
+				t.Errorf("status = %d, want %d", m.status, tt.wantStatus)
+			}
+			if tt.wantErrRow {
+				if len(m.messages) == 0 || m.messages[len(m.messages)-1].Role != RoleError {
+					t.Errorf("expected RoleError row")
+				}
+			} else if len(m.messages) != 0 {
+				t.Errorf("expected no messages, got %d", len(m.messages))
+			}
+		})
+	}
+}
+
+func TestUpdateReopenResult(t *testing.T) {
+	t.Parallel()
+
+	t.Run("error keeps old agent and goes idle", func(t *testing.T) {
+		t.Parallel()
+
+		old := &fakeAgent{}
+		m := New(context.Background(), old, fakeOpen(old))
+		m.status = StatusResetting
+
+		m, cmd := updateScreen(t, m, reopenResultMsg{err: errors.New("x")})
+		if cmd != nil {
+			t.Errorf("cmd = non-nil, want nil")
+		}
+		if m.Agent() != old {
+			t.Errorf("agent swapped on error, want unchanged")
+		}
+		if m.status != StatusIdle {
+			t.Errorf("status = %d, want StatusIdle", m.status)
+		}
+		if len(m.messages) == 0 || m.messages[len(m.messages)-1].Role != RoleError {
+			t.Errorf("expected RoleError row")
+		}
+	})
+
+	t.Run("success swaps agent clears state and closes old", func(t *testing.T) {
+		t.Parallel()
+
+		old := &fakeAgent{}
+		fresh := &fakeAgent{}
+		m := New(context.Background(), old, fakeOpen(old))
+		m.status = StatusResetting
+		m.messages = []DisplayMessage{{Role: RoleUser}}
+		m.stream = "x"
+		m.queue = []queuedInput{{DisplayIndex: 0}}
+
+		m, cmd := updateScreen(t, m, reopenResultMsg{agent: fresh})
+		if m.Agent() != fresh {
+			t.Errorf("agent = %p, want fresh %p", m.Agent(), fresh)
+		}
+		if len(m.messages) != 0 {
+			t.Errorf("messages len = %d, want 0", len(m.messages))
+		}
+		if m.stream != "" {
+			t.Errorf("stream = %q, want cleared", m.stream)
+		}
+		if len(m.queue) != 0 {
+			t.Errorf("queue len = %d, want 0", len(m.queue))
+		}
+		if m.status != StatusIdle {
+			t.Errorf("status = %d, want StatusIdle", m.status)
+		}
+		if cmd == nil {
+			t.Fatal("cmd = nil, want non-nil (closeAgent for old)")
+		}
+		// Executing the returned cmd must Close the OLD agent.
+		cmd()
+		if !old.closeCalled {
+			t.Error("old agent Close() not called")
+		}
+		if fresh.closeCalled {
+			t.Error("fresh agent Close() called, want not closed")
+		}
+	})
+}
+
+func TestUpdateSystemReady(t *testing.T) {
+	t.Parallel()
+
+	agent := &fakeAgent{}
+	m := New(context.Background(), agent, fakeOpen(agent))
+
+	m, cmd := updateScreen(t, m, systemReadyMsg{})
+	if cmd != nil {
+		t.Errorf("cmd = non-nil, want nil")
+	}
+	if len(m.messages) != 1 {
+		t.Fatalf("messages len = %d, want 1", len(m.messages))
+	}
+	row := m.messages[0]
+	if row.Role != RoleSystem {
+		t.Errorf("role = %d, want RoleSystem", row.Role)
+	}
+	if firstTextBlock(t, row) != "session ready" {
+		t.Errorf("text = %q, want %q", firstTextBlock(t, row), "session ready")
+	}
+}
