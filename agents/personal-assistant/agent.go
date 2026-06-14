@@ -12,7 +12,7 @@ import (
 	"github.com/inventivepotter/urvi/internal/content"
 	"github.com/inventivepotter/urvi/internal/llm"
 	"github.com/inventivepotter/urvi/internal/llm/auto"
-	"github.com/inventivepotter/urvi/internal/session"
+	"github.com/inventivepotter/urvi/internal/agent/session"
 )
 
 // model is the named model this assistant runs on. Swapping models is a one-line

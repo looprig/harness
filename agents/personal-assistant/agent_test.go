@@ -10,7 +10,7 @@ import (
 
 	"github.com/inventivepotter/urvi/internal/agent/loop"
 	"github.com/inventivepotter/urvi/internal/content"
-	"github.com/inventivepotter/urvi/internal/session"
+	"github.com/inventivepotter/urvi/internal/agent/session"
 )
 
 func textOf(m *content.AIMessage) string {
