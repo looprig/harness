@@ -18,12 +18,14 @@ the gateway catalog HTTP.
 | Decision | Choice |
 |---|---|
 | Feature scope | Full multimodal port: streaming, slash commands, file/image attach, input queue |
-| Agent integration | Extend `personalassistant.Assistant` additively (`StreamBlocks`, `Interrupt`); TUI depends on a narrow interface |
+| Agent integration | Extend `personalassistant.Assistant` additively (`StreamBlocks`, `Interrupt`, `Reset`); TUI depends on a narrow interface |
 | External deps | `bubbletea`, `bubbles`, `lipgloss`, `glamour` (approved this session; CLAUDE.md to be amended) |
 | Attachments | Inline `@path` tokens parsed from the input text |
+| Interrupt UX | Esc key only; no `/interrupt`, `/cancel`, or other user-visible command |
 | Entry point | `cmd/cli/main.go` (remove the empty `cmd/urvi` stub) |
 | Registry | Generic `internal/registry`; concrete agents registered at the composition root |
 | Display state | TUI-owned `DisplayMessage` history, independent of the loop's LLM context; no flag on `content.Block` |
+| Content types | `content.Block`/`content.Chunk` are sealed interfaces (prerequisite) — see `2026-06-14-content-sealed-interfaces.md` |
 | Auth | None |
 
 ---
@@ -34,7 +36,7 @@ the gateway catalog HTTP.
 cmd/cli/main.go        — entrypoint: parse agent-name arg, build registry, open agent, run TUI (wiring only)
 internal/registry      — generic name→constructor map; agent-agnostic, imports nothing domain-specific
 tui/                   — Bubbletea TUI; owns ALL display state in the Elm model; owns the Agent interface
-agents/personal-assistant — gains StreamBlocks + Interrupt (additive)
+agents/personal-assistant — gains StreamBlocks + Interrupt + Reset (additive)
 ```
 
 Dependency direction (low → high), no cycles, layering preserved:
@@ -92,13 +94,16 @@ Typed errors (CLAUDE.md: all package APIs return typed errors):
 ## Agent surface — personal-assistant changes (additive)
 
 Purely additive to the existing, committed wrapper. The text-only `Send`,
-`Stream`, and `Close` are untouched (open/closed).
+`Stream`, and `Close` are untouched (open/closed). `Assistant` keeps the
+constructed `llm.LLM` client and `llm.ModelSpec` so it can create a fresh
+`session.AgentSession` for `/clear` without re-reading environment variables or
+rebuilding provider transport.
 
 ```go
 // StreamBlocks delivers a multimodal user message and returns the session's
 // event stream: TurnStarted, TokenDelta×N, one terminal event, then EOF.
 // Callers must read to EOF or call sr.Close().
-func (a *Assistant) StreamBlocks(ctx context.Context, blocks []*content.Block) (*llm.StreamReader[loop.Event], error) {
+func (a *Assistant) StreamBlocks(ctx context.Context, blocks []content.Block) (*llm.StreamReader[event.Event], error) {
     return a.session.Stream(ctx, blocks) // reuse the loop session directly
 }
 
@@ -106,10 +111,18 @@ func (a *Assistant) StreamBlocks(ctx context.Context, blocks []*content.Block) (
 func (a *Assistant) Interrupt(ctx context.Context) (bool, error) {
     return a.session.Interrupt(ctx)
 }
+
+// Reset replaces the current idle session with a fresh session using the same
+// client and model spec. The TUI calls this only while StatusIdle. Construction
+// of the replacement happens before the old session is shut down; if construction
+// fails, the existing session remains active.
+func (a *Assistant) Reset(ctx context.Context) error {
+    // new session first, then close/swap old; implementation owns locking if needed
+}
 ```
 
 `*Assistant` then satisfies the `tui.Agent` interface structurally
-(`StreamBlocks`, `Interrupt`, `Close`). It never imports `tui`.
+(`StreamBlocks`, `Interrupt`, `Reset`, `Close`). It never imports `tui`.
 
 ---
 
@@ -121,8 +134,9 @@ func (a *Assistant) Interrupt(ctx context.Context) (bool, error) {
 // Agent is the narrow surface the TUI drives. *personalassistant.Assistant
 // satisfies it; the TUI never imports any agent package.
 type Agent interface {
-    StreamBlocks(ctx context.Context, blocks []*content.Block) (*llm.StreamReader[loop.Event], error)
+    StreamBlocks(ctx context.Context, blocks []content.Block) (*llm.StreamReader[event.Event], error)
     Interrupt(ctx context.Context) (bool, error)
+    Reset(ctx context.Context) error
     Close(ctx context.Context) error
 }
 ```
@@ -167,13 +181,13 @@ const (
 
 type DisplayMessage struct {
     Role   DisplayRole
-    Blocks []*content.Block
+    Blocks []content.Block
 }
 ```
 
-One uniform `[]*content.Block` field for every role — the renderer iterates
-blocks and dispatches on `block.Type`, no special-cased string fields. Per-role
-source:
+One uniform `[]content.Block` field for every role — the renderer iterates blocks
+and type-switches on each block's concrete type, no special-cased string fields.
+Per-role source:
 
 | Role | Blocks |
 |---|---|
@@ -199,8 +213,8 @@ type Screen struct {
     messages []DisplayMessage              // display history
     stream   string                        // live token accumulator (current turn)
     status   Status                        // StatusIdle | StatusRunning | StatusInterrupting
-    queue    [][]*content.Block            // inputs submitted while Running, FIFO
-    reader   *llm.StreamReader[loop.Event] // active turn's stream; nil when idle
+    queue    [][]content.Block             // inputs submitted while Running, FIFO
+    reader   *llm.StreamReader[event.Event] // active turn's stream; nil when idle
 
     history       components.ChatHistory
     input         components.InputBox
@@ -225,21 +239,26 @@ const (
 
 ### Streaming — tea.Cmd recursion (no drain goroutine)
 
-Each `loop.Event` becomes a `tea.Msg`; the model accumulates. This replaces the
+Each `event.Event` becomes a `tea.Msg`; the model accumulates. This replaces the
 old `Listen` goroutine + `notify` callback.
 
 Internal messages:
 
 ```go
-type eventMsg struct{ ev loop.Event }
+type eventMsg struct{ ev event.Event }
 type streamEOFMsg struct{}
 type streamErrMsg struct{ err error }
+type interruptResultMsg struct {
+    cancelled bool
+    err       error
+}
+type resetResultMsg struct{ err error }
 ```
 
 A single command pulls one event:
 
 ```go
-func readNext(r *llm.StreamReader[loop.Event]) tea.Cmd {
+func readNext(r *llm.StreamReader[event.Event]) tea.Cmd {
     return func() tea.Msg {
         ev, err := r.Next()
         switch {
@@ -251,6 +270,34 @@ func readNext(r *llm.StreamReader[loop.Event]) tea.Cmd {
 }
 ```
 
+Interrupt is also a `tea.Cmd` so `Screen.Update` never blocks on the session's
+interrupt ack. This is internal Bubbletea plumbing, not a user-visible command:
+the only user gesture for interrupt is Esc.
+
+```go
+func interruptTurn(ctx context.Context, agent Agent) tea.Cmd {
+    return func() tea.Msg {
+        interruptCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+        defer cancel()
+        cancelled, err := agent.Interrupt(interruptCtx)
+        return interruptResultMsg{cancelled: cancelled, err: err}
+    }
+}
+```
+
+Reset is also a `tea.Cmd` because it shuts down and replaces the underlying
+session. The TUI only starts this command while idle.
+
+```go
+func resetAgent(ctx context.Context, agent Agent) tea.Cmd {
+    return func() tea.Msg {
+        resetCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+        defer cancel()
+        return resetResultMsg{err: agent.Reset(resetCtx)}
+    }
+}
+```
+
 Flow:
 
 - **Submit (Idle):** build blocks from input, append `RoleUser` message,
@@ -258,12 +305,22 @@ Flow:
   `readNext(reader)`.
 - **`eventMsg`:**
   - `TurnStarted` → no-op (already Running); return `readNext`.
-  - `TokenDelta` → `stream += chunk text`; return `readNext`.
+  - `TokenDelta` → type-switch on `ev.Chunk` (a sealed `content.Chunk`): a
+    `*content.TextChunk` appends its `Text` to `stream`; any other variant (e.g.
+    `*content.ThinkingChunk`) is skipped — thinking rendering is out of scope. Return
+    `readNext`. (Because `Chunk` is an interface, there is no nil-deref risk from
+    reading a text field on a thinking delta.)
   - `TurnDone` → append `RoleAssistant` from `Message.Blocks`; clear `stream`;
     return `readNext` (to consume the trailing EOF).
   - `TurnFailed` → append `RoleError` from `Err`; clear `stream`; return `readNext`.
   - `TurnInterrupted` → if `stream != ""` flush it as a `RoleAssistant` partial;
     append `RoleInterrupted` tombstone; clear `stream`; return `readNext`.
+- **`interruptResultMsg`:** if `err != nil`, append `RoleError` and set `status =
+  Running` because the turn may still be active; otherwise stay `Interrupting` and
+  wait for the loop's `TurnInterrupted` terminal event.
+- **`resetResultMsg`:** if `err != nil`, append `RoleError`; otherwise clear
+  display history, render cache, stream, and queue. The replacement session is
+  now active behind the same `Agent` value.
 - **`streamEOFMsg`:** `reader.Close()`; `reader = nil`; `status = Idle`. **Pop the
   queue:** if non-empty, dequeue the next blocks, start a new turn (`status =
   Running`), return `readNext(newReader)`.
@@ -282,8 +339,8 @@ Submitting while `status != Idle`:
 - append its blocks to `queue`,
 - the renderer marks the last `len(queue)` user messages as "(queued)".
 
-`StatusInterrupting` submissions are dropped silently (a cancel is already in
-flight).
+`StatusInterrupting` submissions are no-ops: the input is left intact and nothing is
+queued until the interrupt resolves.
 
 ### Keys
 
@@ -291,9 +348,9 @@ flight).
 |---|---|---|
 | Enter | slashComplete visible | run `Selected()`; reset input; hide panel |
 | Enter | input empty | no-op |
-| Enter | starts with `/` | match slash command; `/clear`→wipe history+cache, `/help`→append help, `/quit`→`Close`+`tea.Quit`; no match → treat as plain text submit |
+| Enter | starts with `/` | match slash command; `/help`→append help; `/clear` while Idle→return `resetAgent(appCtx, agent)`; `/clear` while Running/Interrupting→no-op and keep input intact; no match → treat as plain text submit |
 | Enter | otherwise | build blocks from input; submit (or queue); reset input |
-| Esc | Running | `agent.Interrupt(appCtx)`; `status = Interrupting` |
+| Esc | Running | `status = Interrupting`; return `interruptTurn(appCtx, agent)` |
 | Ctrl+C | any | `agent.Close(appCtx)`; `tea.Quit` |
 | Tab | slashComplete visible | fill input with `Selected().Name`; hide panel |
 | ↑ / ↓ | slashComplete visible | move selection (wraps) |
@@ -312,7 +369,7 @@ flight).
 - `components/slashcomplete.go` — `SlashComplete`: filtered command list + wrapping
   cursor. `NewSlashComplete(prefix)` returns nil when no match (nil = hidden).
 - `components/render.go` — `renderMD` (glamour via `styles.MdStyle`, dot prefix,
-  cached), `renderMessages` (dispatch on `DisplayRole` + `block.Type`, append live
+  cached), `renderMessages` (dispatch on `DisplayRole` + each block's concrete type, append live
   `stream` entry, mark queued users), `wordWrap`/`wrapText`.
 - `styles/styles.go` — exported lipgloss styles + `Dot`/`DotWidth` + glamour
   `MdStyle` config.
@@ -327,19 +384,29 @@ type SlashCmd struct {
 var slashCmds = []SlashCmd{
     {"/clear", "clear the conversation"},
     {"/help",  "list commands"},
-    {"/quit",  "exit"},
 }
 ```
 
 The action for each is handled in `Screen.Update` (they touch TUI-local state:
-history clear, help append, quit) — there is no shared client to run them against.
+session reset + history clear, help append) — there is no shared client to run
+them against.
+There is deliberately no slash command for interrupt/cancel; Esc is the complete
+interrupt UX. There is deliberately no `/quit`; exit is Ctrl+C.
+
+Slash parsing is a TUI concern only. Commands that affect model/session state are
+translated into typed agent operations; the loop never parses `/...` strings.
+`/clear` is accepted only while `StatusIdle`. It creates a fresh underlying agent
+session via `Agent.Reset`, then clears display-only state. This is stronger than
+clearing the TUI transcript: the next prompt starts with an empty loop context. If
+the user types `/clear` while a turn is running or interrupting, the command is a
+no-op and the input stays intact.
 
 ### Block building — `@path` attachments
 
 `tui/blocks.go`:
 
 ```go
-func buildBlocks(input string) ([]*content.Block, error)
+func buildBlocks(input string) ([]content.Block, error)
 ```
 
 1. Split `input` on whitespace. Tokens of the form `@<path>` (len > 1) are
@@ -347,27 +414,40 @@ func buildBlocks(input string) ([]*content.Block, error)
 2. Leading block: one `TextBlock` with the prompt text (omitted if empty but
    attachments exist).
 3. For each `@path`, in order of appearance:
-   - `filepath.Clean(path)`; `os.Stat`; must be a **regular file**.
+   - `filepath.Clean(path)`.
+   - Reject denied attachment paths before opening the file.
+   - `os.Lstat`; symlinks are rejected; the path must be a **regular file**.
    - Enforce a size cap (**5 MB**) — refuse larger (`*AttachmentTooLargeError`).
    - Image ext (`.png`, `.jpg`, `.jpeg`, `.gif`, `.webp`, `.svg`) → read bytes →
-     `&content.Block{Type: TypeImage, Image: &ImageBlock{MediaType: <by ext>,
-     Source: ImageSource{Data: bytes}}}` (mapped to `content.MediaTypeImage*`).
-   - Plaintext ext (`.txt .md .go .py .js .ts .json .yaml .yml .toml .sh .env
-     .csv .html .xml .rs .java .c .cpp .h`) → read → `&content.Block{Type: TypeText,
-     Text: &TextBlock{Text: "[" + base + "]\n" + string(data)}}`.
+     `&content.ImageBlock{MediaType: <by ext>, Source: content.ImageSource{Data:
+     bytes}}` (media type mapped to `content.MediaTypeImage*`).
+   - Plaintext ext (`.txt .md .go .py .js .ts .json .yaml .yml .toml .sh
+     .csv .html .xml .rs .java .c .cpp .h`) → read →
+     `&content.TextBlock{Text: "[" + base + "]\n" + string(data)}`.
    - Otherwise → `*UnsupportedAttachmentError{Ext}`.
 4. Empty input with no attachments → `*EmptyInputError`.
 
+Denied attachments are never read, even if their extension would otherwise be
+supported. The deny check is based on the cleaned path's lower-cased path
+segments, basename, and extension:
+
+- Denied path segments: `.ssh`, `.aws`, `.gcloud`, `.gnupg`, `.kube`.
+- Denied basenames/patterns: `.env`, `.env.*`, `.npmrc`, `.netrc`, `.pypirc`,
+  `.dockercfg`, `id_rsa`, `id_dsa`, `id_ecdsa`, `id_ed25519`.
+- Denied extensions: `.env`, `.pem`, `.key`, `.p12`, `.pfx`, `.jks`,
+  `.keystore`.
+
 **Security:** this is a local single-user tool acting with the user's own
-privileges, so there is no path root to confine to; validation is `filepath.Clean`
-+ regular-file check + size cap. Attachment errors are surfaced as a `RoleError`
-line and the message is **not** sent — the input is left intact so the user can fix
-the path.
+privileges, so there is no path root to confine to; validation is
+`filepath.Clean` + denylist + symlink rejection + regular-file check + size cap.
+Attachment errors are surfaced as a `RoleError` line and the message is **not**
+sent — the input is left intact so the user can fix the path.
 
 ### Typed errors (tui package)
 
 - `EmptyInputError`
 - `UnsupportedAttachmentError{Ext string}`
+- `DeniedAttachmentError{Path string; Reason string}`
 - `AttachmentTooLargeError{Path string; Size, Max int64}`
 - `AttachmentNotFoundError{Path string}` (or wrap the `os` error with context)
 - `AttachmentReadError{Path string; Cause error}`
@@ -416,19 +496,22 @@ Table-driven, run with `-race`.
 
 - **blocks_test.go** — `buildBlocks`: happy text-only, single image, single
   plaintext, multiple mixed, unknown ext, missing file, directory (non-regular),
-  too-big, no tokens / empty, prompt-then-attachments ordering.
+  symlink, denied basename, denied path segment, denied extension, too-big, no
+  tokens / empty, prompt-then-attachments ordering.
 - **render_test.go** — `renderMD`, `renderMessages` (each role + queued marker +
   live stream), `wordWrap`/`wrapText` boundaries.
 - **slashcomplete_test.go** — prefix filtering, nil-on-no-match, cursor wrap.
 - **model_test.go** — `Screen.Update` transitions via a **fake `Agent`** returning a
   scripted `StreamReader`: submit-idle→Running, queue-while-Running, TokenDelta
   accumulation, TurnDone/TurnFailed/TurnInterrupted handling, EOF→pop queue,
-  Esc→Interrupting, Ctrl+C→quit. Drive `Update` directly with synthetic msgs (no
-  `teatest` dependency).
+  Esc→Interrupting, `/clear` idle→reset+clear, `/clear` running→no-op+keep input,
+  Ctrl+C→quit. Drive `Update` directly with synthetic msgs (no `teatest`
+  dependency).
 - **registry_test.go** — Register/Open happy path, duplicate name error, unknown
   name error, `Names()` sorted.
-- **personal-assistant** — extend existing tests: `StreamBlocks` and `Interrupt`
-  delegate to the session (fake-client based, matching the existing test style).
+- **personal-assistant** — extend existing tests: `StreamBlocks`, `Interrupt`, and
+  `Reset` delegate to / replace the session (fake-client based, matching the
+  existing test style).
 
 ---
 
