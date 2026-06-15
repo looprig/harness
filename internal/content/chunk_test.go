@@ -14,8 +14,9 @@ func TestChunk_ConcretePayloads(t *testing.T) {
 	tests := []struct {
 		name      string
 		chunk     content.Chunk
-		wantText  string // expected text for a *TextChunk
-		wantThink string // expected thinking for a *ThinkingChunk
+		wantText  string               // expected text for a *TextChunk
+		wantThink string               // expected thinking for a *ThinkingChunk
+		wantTool  content.ToolUseChunk // expected fields for a *ToolUseChunk
 	}{
 		{
 			name:     "text chunk carries text payload",
@@ -37,6 +38,16 @@ func TestChunk_ConcretePayloads(t *testing.T) {
 			chunk:     &content.ThinkingChunk{Thinking: ""},
 			wantThink: "",
 		},
+		{
+			name:     "tool-use chunk carries index/id/name/inputjson payload",
+			chunk:    &content.ToolUseChunk{Index: 1, ID: "call_1", Name: "read", InputJSON: `{"p":`},
+			wantTool: content.ToolUseChunk{Index: 1, ID: "call_1", Name: "read", InputJSON: `{"p":`},
+		},
+		{
+			name:     "tool-use chunk with empty id/name (non-first delta) carries only fragment",
+			chunk:    &content.ToolUseChunk{Index: 0, InputJSON: `"x"}`},
+			wantTool: content.ToolUseChunk{Index: 0, InputJSON: `"x"}`},
+		},
 	}
 
 	for _, tt := range tests {
@@ -52,6 +63,10 @@ func TestChunk_ConcretePayloads(t *testing.T) {
 				if c.Thinking != tt.wantThink {
 					t.Errorf("ThinkingChunk.Thinking = %q, want %q", c.Thinking, tt.wantThink)
 				}
+			case *content.ToolUseChunk:
+				if *c != tt.wantTool {
+					t.Errorf("ToolUseChunk = %+v, want %+v", *c, tt.wantTool)
+				}
 			default:
 				t.Fatalf("unexpected chunk type %T", c)
 			}
@@ -65,4 +80,5 @@ func TestChunk_ConcretePayloads(t *testing.T) {
 func TestChunk_InterfaceCompliance(t *testing.T) {
 	var _ content.Chunk = (*content.TextChunk)(nil)
 	var _ content.Chunk = (*content.ThinkingChunk)(nil)
+	var _ content.Chunk = (*content.ToolUseChunk)(nil)
 }
