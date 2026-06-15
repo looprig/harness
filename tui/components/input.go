@@ -55,10 +55,12 @@ func NewInputBox() InputBox {
 	// black background ("0"), which appears as a stray dark patch only as wide as the
 	// text. Clearing it makes the input plain, like the user-message rows.
 	//
-	// The default Cursor style (DefaultDarkStyles: block, blinking, static color "7")
-	// uses only literal colors — no lipgloss.LightDark/terminal probing — so it never
-	// triggers an OSC-11 background query (which the codebase deliberately avoids; see
-	// styles.NewMarkdownRenderer). It is therefore left at its safe static default.
+	// The default Cursor style is left untouched, and is safe to leave so: textarea's
+	// DefaultDarkStyles is built by resolving lipgloss's LightDark light/dark *closure*
+	// at construction with a literal dark choice, so the resulting style holds only
+	// static colors. No LightDark value survives into the live style, so rendering it
+	// never triggers a runtime OSC-11 background query (which the codebase deliberately
+	// avoids; see styles.NewMarkdownRenderer).
 	s := ta.Styles()
 	s.Focused.Prompt = styles.AccentBarStyle
 	s.Blurred.Prompt = styles.AccentBarStyle

@@ -227,6 +227,46 @@ func TestWindowSizeMsg(t *testing.T) {
 	}
 }
 
+// TestViewScrollbackFirstInvariant pins the scrollback-first guarantee at the
+// place it now lives: Screen.View() must return a tea.View that keeps the program
+// on the NORMAL screen (AltScreen == false) and never captures the mouse
+// (MouseMode == tea.MouseModeNone). Both are the v2 zero values, but asserting them
+// here — on the actual View() output — proves the intent is realized rather than
+// merely defaulted, and catches any future code that flips an alt-screen/mouse field.
+// Checked both before any WindowSizeMsg (the not-ready empty view) and after one
+// (the composed view), since either could in principle set those fields.
+func TestViewScrollbackFirstInvariant(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		resize *tea.WindowSizeMsg // nil = no WindowSizeMsg (view not yet ready)
+	}{
+		{name: "before window size (not ready)", resize: nil},
+		{name: "after window size (ready, composed)", resize: &tea.WindowSizeMsg{Width: 80, Height: 24}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			agent := &fakeAgent{}
+			m := New(context.Background(), agent, fakeOpen(agent))
+			if tt.resize != nil {
+				m, _ = updateScreen(t, m, *tt.resize)
+			}
+
+			v := m.View()
+			if v.AltScreen {
+				t.Error("View().AltScreen = true, want false (scrollback-first stays on the normal screen so tea.Println writes to native scrollback)")
+			}
+			if v.MouseMode != tea.MouseModeNone {
+				t.Errorf("View().MouseMode = %v, want tea.MouseModeNone (scrollback-first never captures the mouse)", v.MouseMode)
+			}
+		})
+	}
+}
+
 func TestAppendError(t *testing.T) {
 	t.Parallel()
 

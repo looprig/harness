@@ -66,34 +66,6 @@ const (
 	envLogLevel = "URVI_LOG_LEVEL"
 )
 
-// tuiOptions is the typed, testable description of the screen modes the CLI wires
-// up. Scrollback-first rendering requires the normal screen (no alt-screen) so
-// tea.Println can write to native terminal scrollback, and does not capture the
-// mouse.
-//
-// In Bubble Tea v2 alt-screen and mouse are no longer program options: they are
-// fields on the tea.View returned by the model's View() (AltScreen bool, MouseMode
-// MouseMode). The scrollback-first intent — both off — is expressed there, where
-// screen.View() returns a tea.NewView whose zero-value AltScreen (false) and
-// MouseMode (MouseModeNone) match these defaults. This type stays as the typed,
-// testable record of that intent.
-type tuiOptions struct{ AltScreen, Mouse bool }
-
-// defaultTUIOptions returns the scrollback-first defaults: normal screen, no mouse.
-func defaultTUIOptions() tuiOptions { return tuiOptions{AltScreen: false, Mouse: false} }
-
-// teaProgramOptions maps the typed tuiOptions onto Bubble Tea program options. In
-// v2 neither alt-screen nor mouse is a ProgramOption — both moved to tea.View — so
-// there are no program options to derive from the modes here; the alt/mouse intent
-// is applied in screen.View(). The function is retained so the composition root has
-// a single place to add real program options (e.g. WithOutput is appended by the
-// caller), and returns an empty slice for the scrollback-first defaults.
-func teaProgramOptions(o tuiOptions) []tea.ProgramOption {
-	_ = o // alt-screen/mouse are tea.View fields in v2, not program options
-	var opts []tea.ProgramOption
-	return opts
-}
-
 // openLogFile opens (creating as needed) the append-mode ~/.urvi/urvi.log file.
 func openLogFile() (*os.File, error) {
 	home, err := os.UserHomeDir()
@@ -150,7 +122,13 @@ func main() {
 	// then land in the log instead of corrupting live scrollback. Best-effort: on
 	// failure the TUI renders to the real stdout as usual. Restored right after Run so
 	// the teardown/error reporting below still reaches the terminal.
-	progOpts := teaProgramOptions(defaultTUIOptions())
+	//
+	// The only program option ever needed is the ttylog redirect (WithOutput). In v2,
+	// scrollback-first = no alt-screen / no mouse is NOT a program option: it is
+	// achieved by screen.View() leaving the returned tea.View's AltScreen false and
+	// MouseMode at MouseModeNone (the v2 zero values), so the program stays on the
+	// normal screen (tea.Println writes to native scrollback) and never grabs the mouse.
+	var progOpts []tea.ProgramOption
 	restoreStdio := func() error { return nil }
 	if logErr == nil {
 		if capture, cerr := ttylog.CaptureStdio(logFile); cerr == nil {
