@@ -27,6 +27,10 @@ type Loop struct {
 	Done     <-chan struct{}
 }
 
+// idGenerator mints a fresh UUID. It defaults to uuid.New; tests inject a
+// failing generator to exercise the crypto/rand failure branches.
+type idGenerator func() (uuid.UUID, error)
+
 const defaultDrainTimeout = 5 * time.Second
 
 // resolveDrainTimeout applies the default when the caller leaves DrainTimeout unset.
@@ -45,6 +49,9 @@ func New(ctx context.Context, sessionID uuid.UUID, cfg Config) (*Loop, error) {
 		return nil, &ConfigError{Kind: ConfigInvalidModel, Cause: err}
 	}
 	cfg.DrainTimeout = resolveDrainTimeout(cfg.DrainTimeout)
+	if cfg.idGen == nil {
+		cfg.idGen = uuid.New
+	}
 	commands := make(chan command.Command)
 	done := make(chan struct{})
 	go listen(ctx, sessionID, cfg, commands, done)
@@ -88,7 +95,7 @@ func listen(ctx context.Context, sessionID uuid.UUID, cfg Config, commands <-cha
 		// event is delivered separately), so log it and emit the envelope with a
 		// zero EventID rather than dropping the sink copy. CallID stays zero: no
 		// event in v1 pertains to a tool call.
-		eventID, err := uuid.New()
+		eventID, err := cfg.idGen()
 		if err != nil {
 			slog.Error("event id generation failed; emitting envelope with zero EventID", "error", err)
 		}
@@ -193,7 +200,7 @@ func listen(ctx context.Context, sessionID uuid.UUID, cfg Config, commands <-cha
 					close(c.Events)
 					continue
 				}
-				turnID, err := uuid.New()
+				turnID, err := cfg.idGen()
 				if err != nil {
 					// Cannot mint a TurnID; reject the turn at the gate (the turn
 					// never starts) rather than running an unidentifiable turn.

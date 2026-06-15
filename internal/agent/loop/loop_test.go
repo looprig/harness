@@ -190,30 +190,204 @@ func TestEnvelopeCorrelationStamped(t *testing.T) {
 		t.Fatal("no turn envelopes captured")
 	}
 
-	var turnID uuid.UUID
-	seenEventIDs := make(map[uuid.UUID]struct{})
-	for i, e := range turnEnvs {
-		if e.TurnID.IsZero() {
-			t.Errorf("envelope %d: TurnID is zero", i)
+	// Each correlation property is a named sub-assertion over the same captured
+	// turn envelopes; running them as a table keeps the single-turn flow intact
+	// while satisfying the table-driven convention.
+	checks := []struct {
+		name   string
+		assert func(t *testing.T, envs []event.EventEnvelope)
+	}{
+		{
+			name: "TurnID shared and non-zero",
+			assert: func(t *testing.T, envs []event.EventEnvelope) {
+				turnID := envs[0].TurnID
+				if turnID.IsZero() {
+					t.Fatal("envelope 0: TurnID is zero")
+				}
+				for i, e := range envs {
+					if e.TurnID != turnID {
+						t.Errorf("envelope %d: TurnID = %v, want shared %v", i, e.TurnID, turnID)
+					}
+				}
+			},
+		},
+		{
+			name: "EventID distinct and non-zero",
+			assert: func(t *testing.T, envs []event.EventEnvelope) {
+				seen := make(map[uuid.UUID]struct{})
+				for i, e := range envs {
+					if e.EventID.IsZero() {
+						t.Errorf("envelope %d: EventID is zero", i)
+					}
+					if _, dup := seen[e.EventID]; dup {
+						t.Errorf("envelope %d: EventID %v is duplicated", i, e.EventID)
+					}
+					seen[e.EventID] = struct{}{}
+				}
+			},
+		},
+		{
+			name: "CausationID equals StartTurn.Header.ID",
+			assert: func(t *testing.T, envs []event.EventEnvelope) {
+				for i, e := range envs {
+					if e.CausationID != cmdID {
+						t.Errorf("envelope %d: CausationID = %v, want StartTurn.ID %v", i, e.CausationID, cmdID)
+					}
+				}
+			},
+		},
+		{
+			name: "CallID zero (no tool call in v1)",
+			assert: func(t *testing.T, envs []event.EventEnvelope) {
+				for i, e := range envs {
+					if !e.CallID.IsZero() {
+						t.Errorf("envelope %d: CallID = %v, want zero (no tool call)", i, e.CallID)
+					}
+				}
+			},
+		},
+	}
+	for _, c := range checks {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			c.assert(t, turnEnvs)
+		})
+	}
+}
+
+// countedIDGen returns a real UUID for its first okCount calls, then fails every
+// subsequent call. It is safe for concurrent use (the actor and turn goroutines
+// both mint via publish). okCount = 0 fails immediately.
+type countedIDGen struct {
+	mu      sync.Mutex
+	calls   int
+	okCount int
+	err     error
+}
+
+func (g *countedIDGen) gen() (uuid.UUID, error) {
+	g.mu.Lock()
+	g.calls++
+	n := g.calls
+	g.mu.Unlock()
+	if n <= g.okCount {
+		return uuid.New()
+	}
+	return uuid.UUID{}, g.err
+}
+
+// newLoopWithIDGen starts a loop wired with a custom id generator, exercising
+// the crypto/rand failure branches that uuid.New cannot reach in tests.
+func newLoopWithIDGen(t *testing.T, client llm.LLM, gen idGenerator, sinks ...event.EventSink) *Loop {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	id, err := uuid.New()
+	if err != nil {
+		t.Fatalf("uuid.New: %v", err)
+	}
+	l, err := New(ctx, id, Config{
+		Client:       client,
+		Model:        llm.ModelSpec{Model: "m"},
+		Sinks:        sinks,
+		DrainTimeout: 200 * time.Millisecond,
+		idGen:        gen,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(cancel)
+	return l
+}
+
+// TestTurnIDGenerationFailure covers branch 1: when the id generator fails while
+// minting the per-turn TurnID, the turn is rejected at the gate with a typed
+// *IDGenerationError, its Events channel is closed, and the actor stays usable.
+func TestTurnIDGenerationFailure(t *testing.T) {
+	t.Parallel()
+	genErr := errors.New("rand source exhausted")
+	tests := []struct {
+		name    string
+		okCount int // succeeds for SessionStarted EventID (call #1); TurnID (call #2) fails
+	}{
+		{name: "turn id mint fails", okCount: 1},
+		{name: "all id mints fail", okCount: 0},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			gen := &countedIDGen{okCount: tt.okCount, err: genErr}
+			l := newLoopWithIDGen(t, &fakeLLM{chunks: []content.Chunk{textChunk("hi")}}, gen.gen)
+
+			ev := make(chan event.Event, 64)
+			ack := make(chan error, 1)
+			ab := make(chan struct{})
+			defer close(ab)
+			l.Commands <- command.StartTurn{Ctx: context.Background(), Input: nil, Events: ev, Abandoned: ab, Ack: ack}
+
+			err := <-ack
+			var ide *IDGenerationError
+			if !errors.As(err, &ide) {
+				t.Fatalf("ack = %v, want *IDGenerationError", err)
+			}
+			if !errors.Is(err, genErr) {
+				t.Fatalf("ack = %v, want it to wrap the generator error", err)
+			}
+			if _, ok := <-ev; ok {
+				t.Error("rejected turn's Events channel should be closed")
+			}
+		})
+	}
+}
+
+// TestEventIDGenerationFailureBestEffort covers branch 3: when EventID minting
+// fails after the TurnID is already minted, the turn still completes to a
+// terminal and the affected envelopes carry a zero EventID (best-effort sink
+// contract), rather than the turn aborting.
+func TestEventIDGenerationFailureBestEffort(t *testing.T) {
+	t.Parallel()
+	genErr := errors.New("rand source exhausted")
+	// okCount = 2: SessionStarted EventID (call #1) and TurnID (call #2) succeed;
+	// every per-event EventID mint after that fails.
+	gen := &countedIDGen{okCount: 2, err: genErr}
+	sink := &captureSink{}
+	l := newLoopWithIDGen(t, &fakeLLM{chunks: []content.Chunk{textChunk("hi")}}, gen.gen, sink)
+
+	ev := make(chan event.Event, 64)
+	ack := make(chan error, 1)
+	ab := make(chan struct{})
+	defer close(ab)
+	l.Commands <- command.StartTurn{Ctx: context.Background(), Input: nil, Events: ev, Abandoned: ab, Ack: ack}
+	if err := <-ack; err != nil {
+		t.Fatalf("StartTurn ack = %v, want nil (TurnID minted; only EventID fails)", err)
+	}
+	// Branch 3 must not abort the turn: a terminal still arrives.
+	if _, ok := drainToTerminal(t, ev).(event.TurnDone); !ok {
+		t.Fatal("turn did not complete despite EventID mint failure")
+	}
+
+	// At least one turn-level envelope must carry a zero EventID (the failed mints
+	// were emitted best-effort with a zero EventID rather than dropped).
+	var sawTurnEnv, sawZeroEventID bool
+	for _, e := range sink.events() {
+		if _, ok := e.Event.(event.SessionStarted); ok {
+			continue
 		}
-		if i == 0 {
-			turnID = e.TurnID
-		} else if e.TurnID != turnID {
-			t.Errorf("envelope %d: TurnID = %v, want shared %v", i, e.TurnID, turnID)
-		}
+		sawTurnEnv = true
 		if e.EventID.IsZero() {
-			t.Errorf("envelope %d: EventID is zero", i)
+			sawZeroEventID = true
 		}
-		if _, dup := seenEventIDs[e.EventID]; dup {
-			t.Errorf("envelope %d: EventID %v is duplicated", i, e.EventID)
+		// TurnID was minted before the failures, so it must remain non-zero.
+		if e.TurnID.IsZero() {
+			t.Error("turn envelope TurnID is zero; TurnID was minted successfully")
 		}
-		seenEventIDs[e.EventID] = struct{}{}
-		if e.CausationID != cmdID {
-			t.Errorf("envelope %d: CausationID = %v, want StartTurn.ID %v", i, e.CausationID, cmdID)
-		}
-		if !e.CallID.IsZero() {
-			t.Errorf("envelope %d: CallID = %v, want zero (no tool call)", i, e.CallID)
-		}
+	}
+	if !sawTurnEnv {
+		t.Fatal("no turn-level envelope captured")
+	}
+	if !sawZeroEventID {
+		t.Fatal("expected at least one envelope with a zero EventID after mint failure")
 	}
 }
 

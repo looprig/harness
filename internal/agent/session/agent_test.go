@@ -127,29 +127,166 @@ func TestNewAgent(t *testing.T) {
 	})
 }
 
-// TestInvokeStampsCommandHeaderID asserts the session stamps a fresh, non-zero
-// Header.ID on the StartTurn it sends. The loop copies the command's Header.ID
-// onto each turn envelope's CausationID, so observing a non-zero CausationID via
-// a sink proves the stamp happened end-to-end.
-func TestInvokeStampsCommandHeaderID(t *testing.T) {
-	t.Parallel()
-	sink := &recordingSink{}
-	s, err := NewAgent(context.Background(), cfgWithSink(&stubLLM{chunks: []content.Chunk{textChunk("hi")}}, sink))
+// capturingIDGen records every ID it mints so a test can assert the session
+// stamped a non-zero Header.ID onto the command it sent (even for commands —
+// Interrupt, Shutdown — whose ID has no observable runtime surface).
+type capturingIDGen struct {
+	mu  sync.Mutex
+	ids []uuid.UUID
+}
+
+func (g *capturingIDGen) gen() (uuid.UUID, error) {
+	id, err := uuid.New()
 	if err != nil {
-		t.Fatalf("NewAgent: %v", err)
+		return uuid.UUID{}, err
 	}
-	t.Cleanup(func() { _ = s.Shutdown(context.Background()) })
+	g.mu.Lock()
+	g.ids = append(g.ids, id)
+	g.mu.Unlock()
+	return id, nil
+}
 
-	if _, err := s.Invoke(context.Background(), nil); err != nil {
-		t.Fatalf("Invoke: %v", err)
+func (g *capturingIDGen) last() (uuid.UUID, bool) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if len(g.ids) == 0 {
+		return uuid.UUID{}, false
 	}
+	return g.ids[len(g.ids)-1], true
+}
 
-	cid, ok := sink.turnCausationID()
-	if !ok {
-		t.Fatal("no turn-level envelope captured")
+// TestStampsCommandHeaderID asserts every command-sending method stamps a
+// fresh, non-zero Header.ID on the command it sends. Each method mints the ID
+// through the session's idGenerator seam, so a non-zero captured value proves
+// the stamp. For Invoke and Stream the loop also copies the command's Header.ID
+// onto each turn envelope's CausationID, so the sink-observed CausationID must
+// equal the captured ID — an end-to-end check that the stamp reaches the loop.
+func TestStampsCommandHeaderID(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name        string
+		call        func(t *testing.T, s *AgentSession)
+		observeable bool // true when the stamped ID surfaces via sink CausationID
+	}{
+		{
+			name: "Invoke",
+			call: func(t *testing.T, s *AgentSession) {
+				if _, err := s.Invoke(context.Background(), nil); err != nil {
+					t.Fatalf("Invoke: %v", err)
+				}
+			},
+			observeable: true,
+		},
+		{
+			name: "Stream",
+			call: func(t *testing.T, s *AgentSession) {
+				sr, err := s.Stream(context.Background(), nil)
+				if err != nil {
+					t.Fatalf("Stream: %v", err)
+				}
+				for {
+					if _, err := sr.Next(); err == io.EOF {
+						break
+					} else if err != nil {
+						t.Fatalf("Next: %v", err)
+					}
+				}
+				_ = sr.Close()
+			},
+			observeable: true,
+		},
+		{
+			name: "Interrupt",
+			call: func(t *testing.T, s *AgentSession) {
+				if _, err := s.Interrupt(context.Background()); err != nil {
+					t.Fatalf("Interrupt: %v", err)
+				}
+			},
+		},
+		{
+			name: "Shutdown",
+			call: func(t *testing.T, s *AgentSession) {
+				if err := s.Shutdown(context.Background()); err != nil {
+					t.Fatalf("Shutdown: %v", err)
+				}
+			},
+		},
 	}
-	if cid.IsZero() {
-		t.Fatal("CausationID is zero: session did not stamp a non-zero Header.ID on StartTurn")
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			sink := &recordingSink{}
+			s, err := NewAgent(context.Background(), cfgWithSink(&stubLLM{chunks: []content.Chunk{textChunk("hi")}}, sink))
+			if err != nil {
+				t.Fatalf("NewAgent: %v", err)
+			}
+			gen := &capturingIDGen{}
+			s.newID = gen.gen
+			t.Cleanup(func() { _ = s.Shutdown(context.Background()) })
+
+			tt.call(t, s)
+
+			minted, ok := gen.last()
+			if !ok {
+				t.Fatal("session minted no command-Header ID")
+			}
+			if minted.IsZero() {
+				t.Fatal("session stamped a zero Header.ID on the command")
+			}
+			if tt.observeable {
+				cid, ok := sink.turnCausationID()
+				if !ok {
+					t.Fatal("no turn-level envelope captured")
+				}
+				if cid != minted {
+					t.Fatalf("envelope CausationID = %v, want stamped Header.ID %v", cid, minted)
+				}
+			}
+		})
+	}
+}
+
+// TestNewCommandIDGenerationFailure covers the crypto/rand failure branch: when
+// the session's idGenerator fails, every command-sending method must fail secure
+// with *SessionError{SessionIDGenerationFailed} and send no command (no
+// unidentifiable, zero-ID command ever leaves the session).
+func TestNewCommandIDGenerationFailure(t *testing.T) {
+	t.Parallel()
+	genErr := errors.New("rand source exhausted")
+	failingGen := func() (uuid.UUID, error) { return uuid.UUID{}, genErr }
+
+	tests := []struct {
+		name string
+		call func(s *AgentSession) error
+	}{
+		{name: "Invoke", call: func(s *AgentSession) error { _, err := s.Invoke(context.Background(), nil); return err }},
+		{name: "Stream", call: func(s *AgentSession) error { _, err := s.Stream(context.Background(), nil); return err }},
+		{name: "Interrupt", call: func(s *AgentSession) error { _, err := s.Interrupt(context.Background()); return err }},
+		{name: "Shutdown", call: func(s *AgentSession) error { return s.Shutdown(context.Background()) }},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			s, err := NewAgent(context.Background(), cfg(&stubLLM{chunks: []content.Chunk{textChunk("x")}}))
+			if err != nil {
+				t.Fatalf("NewAgent: %v", err)
+			}
+			// Restore a working generator before cleanup so the cleanup Shutdown can
+			// mint its own command ID and actually stop the actor (no leaked loop).
+			t.Cleanup(func() { s.newID = uuid.New; _ = s.Shutdown(context.Background()) })
+			s.newID = failingGen
+
+			err = tt.call(s)
+			var se *SessionError
+			if !errors.As(err, &se) || se.Kind != SessionIDGenerationFailed {
+				t.Fatalf("err = %v, want *SessionError{SessionIDGenerationFailed}", err)
+			}
+			if !errors.Is(err, genErr) {
+				t.Fatalf("err = %v, want it to wrap the generator error", err)
+			}
+		})
 	}
 }
 

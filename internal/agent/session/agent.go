@@ -50,20 +50,25 @@ func (e *SessionError) Error() string {
 }
 func (e *SessionError) Unwrap() error { return e.Cause }
 
-// newCommandID mints a fresh correlation ID for a command Header. Any
-// crypto/rand failure is mapped onto the session's typed error path rather than
-// swallowed, so callers never send an unidentifiable (zero-ID) command.
-func newCommandID() (uuid.UUID, error) {
-	id, err := uuid.New()
-	if err != nil {
-		return uuid.UUID{}, &SessionError{Kind: SessionIDGenerationFailed, Cause: err}
-	}
-	return id, nil
-}
+// idGenerator mints a fresh UUID. It defaults to uuid.New; tests inject a
+// failing generator to exercise the crypto/rand failure branch.
+type idGenerator func() (uuid.UUID, error)
 
 type AgentSession struct {
 	SessionID uuid.UUID
 	loop      *loop.Loop
+	newID     idGenerator // mints command-Header IDs; defaults to uuid.New
+}
+
+// newCommandID mints a fresh correlation ID for a command Header. Any
+// crypto/rand failure is mapped onto the session's typed error path rather than
+// swallowed, so callers never send an unidentifiable (zero-ID) command.
+func (s *AgentSession) newCommandID() (uuid.UUID, error) {
+	id, err := s.newID()
+	if err != nil {
+		return uuid.UUID{}, &SessionError{Kind: SessionIDGenerationFailed, Cause: err}
+	}
+	return id, nil
 }
 
 // NewAgent constructs an AgentSession and starts its actor goroutine.
@@ -87,13 +92,13 @@ func NewAgent(ctx context.Context, cfg loop.Config) (*AgentSession, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &AgentSession{SessionID: id, loop: l}, nil
+	return &AgentSession{SessionID: id, loop: l, newID: uuid.New}, nil
 }
 
 // Invoke sends input and blocks until a terminal event.
 // Cancelling ctx cancels the running turn; Invoke returns the event.TurnInterrupted event.
 func (s *AgentSession) Invoke(ctx context.Context, input []content.Block) (event.Event, error) {
-	id, err := newCommandID()
+	id, err := s.newCommandID()
 	if err != nil {
 		return nil, err
 	}
@@ -139,7 +144,7 @@ func (s *AgentSession) Invoke(ctx context.Context, input []content.Block) (event
 // keeps reading. Calling sr.Close() abandons the event stream and cancels the turn.
 // Callers must either read until EOF or call Close.
 func (s *AgentSession) Stream(ctx context.Context, input []content.Block) (*llm.StreamReader[event.Event], error) {
-	id, err := newCommandID()
+	id, err := s.newCommandID()
 	if err != nil {
 		return nil, err
 	}
@@ -203,7 +208,7 @@ func (s *AgentSession) Stream(ctx context.Context, input []content.Block) (*llm.
 // Interrupt cancels the running turn. Returns true if a turn was cancelled.
 // ctx allows the caller to time out the cancel attempt if the actor is slow.
 func (s *AgentSession) Interrupt(ctx context.Context) (bool, error) {
-	id, err := newCommandID()
+	id, err := s.newCommandID()
 	if err != nil {
 		return false, err
 	}
@@ -229,7 +234,7 @@ func (s *AgentSession) Interrupt(ctx context.Context) (bool, error) {
 // Shutdown cancels any running turn and blocks until the actor exits.
 // Calling Shutdown after the actor has exited is a no-op.
 func (s *AgentSession) Shutdown(ctx context.Context) error {
-	id, err := newCommandID()
+	id, err := s.newCommandID()
 	if err != nil {
 		return err
 	}

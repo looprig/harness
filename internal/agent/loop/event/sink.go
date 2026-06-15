@@ -15,11 +15,11 @@ import (
 // pertains to a specific tool call.
 type EventEnvelope struct {
 	SessionID   uuid.UUID
-	TurnID      uuid.UUID // NEW
+	TurnID      uuid.UUID
 	TurnIndex   TurnIndex
-	EventID     uuid.UUID // NEW
-	CausationID uuid.UUID // NEW
-	CallID      uuid.UUID // NEW — zero unless the event pertains to a tool call
+	EventID     uuid.UUID
+	CausationID uuid.UUID
+	CallID      uuid.UUID // zero unless the event pertains to a tool call
 	Event       Event
 }
 
