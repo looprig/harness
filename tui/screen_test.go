@@ -228,6 +228,54 @@ func TestWindowSizeMsg(t *testing.T) {
 	}
 }
 
+// TestWindowSizeMsgNoScrollbackPrint pins half of the resize-artifact root cause: a
+// WindowSizeMsg must ONLY update dimensions + repaint the View — it must NEVER return
+// a command (which, on the flush paths, would emit a tea.Println / insertAbove that
+// writes to native scrollback). A nil command guarantees a resize cannot itself print
+// to scrollback; combined with the width clamp (the other half — see
+// TestSurfaceViewNeverExceedsWidth), the resize cascade is eliminated. The case with
+// committed content present proves it stays a no-op even when there is history that a
+// stray flush could reprint.
+func TestWindowSizeMsgNoScrollbackPrint(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name        string
+		withCommits bool
+	}{
+		{name: "fresh screen", withCommits: false},
+		{name: "with committed history", withCommits: true},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			agent := &fakeAgent{}
+			m := New(context.Background(), agent, fakeOpen(agent), AgentBanner{})
+			m, _ = updateScreen(t, m, tea.WindowSizeMsg{Width: 80, Height: 24})
+			if tt.withCommits {
+				// Commit a couple of entries so a stray flush WOULD have something to print.
+				m.transcript = m.transcript.CommitSystem("first")
+				m.transcript = m.transcript.CommitSystem("second")
+				m, _ = updateScreen(t, m, systemReadyMsg{}) // drains the flush so committed are printed-once
+			}
+
+			// A resize (and several drag steps) must each return a nil command.
+			for _, size := range []tea.WindowSizeMsg{
+				{Width: 70, Height: 24}, {Width: 50, Height: 24}, {Width: 30, Height: 24}, {Width: 90, Height: 40},
+			} {
+				var cmd tea.Cmd
+				m, cmd = updateScreen(t, m, size)
+				if cmd != nil {
+					t.Errorf("WindowSizeMsg(%dx%d) returned a non-nil command; a resize must not flush/print to scrollback", size.Width, size.Height)
+				}
+			}
+		})
+	}
+}
+
 // TestViewScrollbackFirstInvariant pins the scrollback-first guarantee at the
 // place it now lives: Screen.View() must return a tea.View that keeps the program
 // on the NORMAL screen (AltScreen == false) and never captures the mouse

@@ -50,6 +50,17 @@ type surfaceInputs struct {
 // field by interaction mode), the slash-completion panel when visible, and one
 // status line. It allocates no transcript viewport. Empty regions are omitted so
 // the surface never emits stray blank rows.
+//
+// Every composed line is clamped to in.Width as the final step (clampSurfaceWidth).
+// This is a hard invariant for the bubbletea v2 inline renderer: it sizes its
+// managed region from the View's LOGICAL line count (strings.Count(view, "\n")+1)
+// and assumes each line occupies exactly one physical row. A line wider than the
+// terminal soft-wraps onto an extra physical row, so the renderer's relative-cursor
+// tracking under-counts the rows it drew; on the next frame (e.g. each step of a
+// resize drag) it repaints from the wrong row and strands the prior frame's lines
+// (the separator rule + input-box top border) into native scrollback — the resize
+// artifact cascade. Truncating (never wrapping) keeps the logical line count equal
+// to the physical row count, which is exactly what the renderer requires.
 func surfaceView(in surfaceInputs) string {
 	bottom := bottomBox(in)
 	slash := slashPanel(in.Interaction)
@@ -65,7 +76,26 @@ func surfaceView(in surfaceInputs) string {
 	rows = appendNonEmpty(rows, bottom)
 	rows = appendNonEmpty(rows, slash)
 	rows = appendNonEmpty(rows, status)
-	return strings.Join(rows, "\n")
+	return clampSurfaceWidth(strings.Join(rows, "\n"), in.Width)
+}
+
+// clampSurfaceWidth truncates every line of the composed active surface to width
+// display columns, the fail-safe that guarantees no active-surface line is ever
+// wider than the terminal (see surfaceView for why the bubbletea v2 inline renderer
+// requires this). It uses lipgloss MaxWidth, which is ANSI-aware: it counts display
+// columns and preserves the per-line SGR styling while cutting the overflow. A
+// non-positive width is a degenerate terminal (no managed region) — the surface is
+// dropped to the empty string rather than emitting unclamped lines.
+func clampSurfaceWidth(surface string, width int) string {
+	if width <= 0 {
+		return ""
+	}
+	clamp := lipgloss.NewStyle().MaxWidth(width)
+	lines := strings.Split(surface, "\n")
+	for i := range lines {
+		lines[i] = clamp.Render(lines[i])
+	}
+	return strings.Join(lines, "\n")
 }
 
 // bottomBox renders the bottom box for the current interaction mode: the prompt

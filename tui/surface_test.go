@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"strconv"
 	"strings"
 	"testing"
 
@@ -8,6 +9,7 @@ import (
 
 	"github.com/inventivepotter/urvi/internal/agent/loop/event"
 	"github.com/inventivepotter/urvi/internal/tool"
+	"github.com/inventivepotter/urvi/tui/styles"
 )
 
 // TestLiveTailCap covers the pure active-surface budget: the live tail gets the
@@ -159,5 +161,108 @@ func TestSurfaceCappedTail(t *testing.T) {
 	// Total composed height must not exceed the terminal height.
 	if h := lipgloss.Height(got); h > in.Height {
 		t.Errorf("surfaceView height = %d, exceeds terminal height %d:\n%s", h, in.Height, got)
+	}
+}
+
+// assertNoLineExceedsWidth fails if any line of surface is wider than width display
+// columns. This is the active-surface invariant the bubbletea v2 inline renderer
+// requires: a line wider than the terminal soft-wraps onto an extra physical row,
+// which desyncs the renderer's line-count tracking and strands the prior frame
+// (separator + box top) into native scrollback on each resize step.
+func assertNoLineExceedsWidth(t *testing.T, surface string, width int) {
+	t.Helper()
+	for i, line := range strings.Split(surface, "\n") {
+		if w := lipgloss.Width(line); w > width {
+			t.Errorf("line %d display-width %d exceeds terminal width %d: %q", i, w, width, stripANSI(line))
+		}
+	}
+}
+
+// TestSurfaceViewNeverExceedsWidth is the resize-artifact regression: no line of the
+// composed active surface may be wider than the terminal width, at any width and for
+// any region (live tail, separator, bottom box, slash panel, status). It drives a
+// rich live tail whose UNWRAPPED tool-card header (long tool summary) overflows pre-
+// fix, across shrinking widths AND a tiny width that pre-fix overflowed the input
+// box border. Pre-fix this cascade stranded the separator + input-box top border in
+// scrollback on every WindowSizeMsg; the clampSurfaceWidth fail-safe prevents it.
+func TestSurfaceViewNeverExceedsWidth(t *testing.T) {
+	t.Parallel()
+
+	longWord := strings.Repeat("x", 220) // unwrappable token wider than every case
+	// A live tail exercising the regression source: a tool card whose header summary
+	// is the unwrappable token (toolHeaderText is not width-wrapped at source).
+	calls := []ToolCallView{{
+		ToolName: "Bash",
+		Summary:  longWord,
+		Status:   ToolOK,
+		Result:   []string{longWord, "ok"},
+	}}
+	tail := renderLiveAssistant("reasoning\n"+longWord, "narration "+longWord, calls, true, 80, animState{})
+
+	// Widths cover an ample terminal, several shrinking steps (a resize drag), and a
+	// tiny width where the input-box border itself overflowed pre-fix.
+	for _, w := range []int{120, 80, 60, 40, 20, 10, 5, 3, 1} {
+		w := w
+		t.Run(strconv.Itoa(w), func(t *testing.T) {
+			t.Parallel()
+
+			im := newInteractionModel()
+			im.input.Resize(w)
+			im.input.SetValue(longWord) // a long composer value must not overflow either
+			in := surfaceInputs{
+				Interaction: im,
+				LiveTail:    tail,
+				Status:      StatusRunning,
+				StatusState: statusInputs{streaming: true},
+				Width:       w,
+				Height:      30,
+			}
+			assertNoLineExceedsWidth(t, surfaceView(in), w)
+		})
+	}
+}
+
+// TestClampSurfaceWidth covers the fail-safe directly: each line is truncated to the
+// width, a zero/negative width drops the surface, and styled (ANSI) lines are
+// measured by display columns (the escape bytes do not count toward the width).
+func TestClampSurfaceWidth(t *testing.T) {
+	t.Parallel()
+
+	styled := styles.StatusStyle.Render(strings.Repeat("─", 50)) // a wide, SGR-styled rule
+
+	tests := []struct {
+		name    string
+		surface string
+		width   int
+		// wantMax is the maximum display width any output line may have; -1 means the
+		// output must be exactly empty.
+		wantMax int
+	}{
+		{name: "wide plain line truncated", surface: strings.Repeat("a", 100), width: 40, wantMax: 40},
+		{name: "wide styled line truncated by display columns", surface: styled, width: 12, wantMax: 12},
+		{name: "multiple lines each clamped", surface: strings.Repeat("a", 80) + "\n" + strings.Repeat("b", 80), width: 30, wantMax: 30},
+		{name: "already-narrow line untouched", surface: "short", width: 40, wantMax: 5},
+		{name: "zero width drops surface", surface: "anything", width: 0, wantMax: -1},
+		{name: "negative width drops surface", surface: "anything", width: -5, wantMax: -1},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			got := clampSurfaceWidth(tt.surface, tt.width)
+			if tt.wantMax < 0 {
+				if got != "" {
+					t.Errorf("clampSurfaceWidth(width=%d) = %q, want empty", tt.width, got)
+				}
+				return
+			}
+			for i, line := range strings.Split(got, "\n") {
+				if w := lipgloss.Width(line); w > tt.wantMax {
+					t.Errorf("line %d display-width %d exceeds %d: %q", i, w, tt.wantMax, stripANSI(line))
+				}
+			}
+		})
 	}
 }
