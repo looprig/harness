@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -149,7 +150,7 @@ func TestFSEnvExcludedFromGlobGrepReadFile(t *testing.T) {
 			t.Fatalf("Grep InvokableRun() Go error = %v", err)
 		}
 		got := textOf(t, res)
-		assertNoSecret(t, "Grep secret-search output (backend rg="+boolStr(rgOnPath())+")", got)
+		assertNoSecret(t, "Grep secret-search output (backend rg="+strconv.FormatBool(rgOnPath())+")", got)
 		if strings.Contains(got, ".env") {
 			t.Errorf("Grep output referenced a .env path: %q", got)
 		}
@@ -192,14 +193,6 @@ func TestFSEnvExcludedFromGlobGrepReadFile(t *testing.T) {
 			t.Errorf("ReadFile(config/.env) = %q, want a \"read denied\" error", got2)
 		}
 	})
-}
-
-// boolStr renders a bool as "true"/"false" for a test label.
-func boolStr(b bool) string {
-	if b {
-		return "true"
-	}
-	return "false"
 }
 
 // TestFSContainmentSymlinkRejected proves every path tool refuses an in-workspace

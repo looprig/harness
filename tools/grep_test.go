@@ -356,10 +356,25 @@ func TestAsExitCode(t *testing.T) {
 	}
 }
 
-// TestDenyFilteredRel covers the extracted shared deny-filter helper (FIX 3): a
-// guard-denied path is reported denied; a permitted path yields the workspace-
-// relative slash form. The deny semantics here are the single source of truth for
-// Glob and both Grep backends.
+// TestDenyFilteredRel is the canonical, self-documenting unit test for the SINGLE
+// shared deny-filter (glob.go) used by Glob's walk and BOTH Grep backends
+// (collectRgLines + the WalkDir fallback). It covers all three of the helper's
+// outcomes:
+//   - a permitted path yields its workspace-relative slash form;
+//   - a guard-denied path (DeniedRead) is reported denied;
+//   - the security-critical ESCAPE branch: a symlink whose EvalSymlinks target
+//     resolves OUTSIDE the workspace root is reported denied (so it is excluded,
+//     never emitted with a "../"-climbing path that would leak the target);
+//   - and, to prove no over-rejection, an in-workspace symlink whose target stays
+//     INSIDE the root is NOT denied and yields the resolved in-workspace rel.
+//
+// Because this exercises the shared helper directly, it is the portable, rg-
+// independent coverage for the escape branch. That branch is what Grep's rg
+// backend (collectRgLines) relies on SOLELY to exclude an out-of-workspace path
+// rg emits; in the WalkDir fallback it is the first of two barriers (the second
+// being grepFile's O_NOFOLLOW). See TestGrepFallbackNoLeakThroughSymlink for the
+// fallback's end-to-end no-leak proof and fs_integration_test.go for the rg
+// backend's on-host coverage.
 func TestDenyFilteredRel(t *testing.T) {
 	t.Parallel()
 	root := t.TempDir()
@@ -373,6 +388,25 @@ func TestDenyFilteredRel(t *testing.T) {
 	}
 	mustWrite(t, filepath.Join(root, "ok", "app.go"), "x")
 	mustWrite(t, filepath.Join(root, ".env"), "SECRET=1")
+	mustWrite(t, filepath.Join(root, "inside-target.txt"), "y")
+
+	// A symlink INSIDE the workspace whose target is ALSO inside the workspace:
+	// must NOT be denied (no over-rejection); its resolved rel is the target's.
+	insideLink := filepath.Join(root, "inside-link")
+	if err := os.Symlink(filepath.Join(root, "inside-target.txt"), insideLink); err != nil {
+		t.Fatalf("symlink inside-link: %v", err)
+	}
+
+	// A symlink INSIDE the workspace whose target resolves OUTSIDE the root (a
+	// sibling temp dir): the escape branch must report it denied.
+	outside := t.TempDir()
+	if err := os.WriteFile(filepath.Join(outside, "secret.txt"), []byte("SECRET"), 0o600); err != nil {
+		t.Fatalf("write outside secret: %v", err)
+	}
+	escapeLink := filepath.Join(root, "escape-link")
+	if err := os.Symlink(filepath.Join(outside, "secret.txt"), escapeLink); err != nil {
+		t.Fatalf("symlink escape-link: %v", err)
+	}
 
 	okAbs := filepath.Join(resolvedRoot, "ok", "app.go")
 	envAbs := filepath.Join(resolvedRoot, ".env")
@@ -386,6 +420,8 @@ func TestDenyFilteredRel(t *testing.T) {
 	}{
 		{name: "permitted path yields slash rel", abs: okAbs, wantDenied: false, wantRel: "ok/app.go"},
 		{name: "denied path is excluded", abs: envAbs, wantDenied: true},
+		{name: "in-workspace symlink to in-workspace target is not denied", abs: insideLink, wantDenied: false, wantRel: "inside-target.txt"},
+		{name: "symlink resolving outside root is denied (escape branch)", abs: escapeLink, wantDenied: true},
 	}
 	for _, tt := range tests {
 		tt := tt
@@ -402,12 +438,25 @@ func TestDenyFilteredRel(t *testing.T) {
 	}
 }
 
-// TestGrepFallbackExcludesSymlinkEscapingWorkspace proves the WalkDir fallback's
-// shared deny-filter (denyFilteredRel) excludes a symlinked entry whose target
-// resolves OUTSIDE the workspace, rather than opening it or emitting a
-// "../"-climbing path. The outside file's content must never appear in matches.
-// Unit-level companion to fs_integration_test.go's symlink case (default run).
-func TestGrepFallbackExcludesSymlinkEscapingWorkspace(t *testing.T) {
+// TestGrepFallbackNoLeakThroughSymlink proves the WalkDir fallback never leaks an
+// out-of-workspace file's content through an in-workspace symlink, and never emits
+// a "../"-climbing path, while still matching legitimate in-workspace files.
+//
+// Honest scope note: this is a defence-in-depth, end-to-end assertion — it does
+// NOT isolate which mechanism does the work, because the fallback has two
+// independent barriers and either alone suffices:
+//  1. denyFilteredRel (grep.go runFallback) runs on each visited entry BEFORE the
+//     file is opened; a symlink whose target resolves outside the root hits the
+//     escape branch and is excluded — so the symlinked entry is dropped first.
+//  2. grepFile then opens with O_NOFOLLOW (grep.go), so even a symlinked final
+//     component that slipped past the filter is never read.
+//
+// The canonical, isolated proof that denyFilteredRel's escape branch actually
+// returns denied lives in TestDenyFilteredRel (rg-independent, portable). The rg
+// backend (collectRgLines, grep.go) — which has NO O_NOFOLLOW barrier and so
+// relies SOLELY on denyFilteredRel to rewrite/exclude rg's emitted absolute paths
+// — is exercised on rg-present hosts by fs_integration_test.go's symlink case.
+func TestGrepFallbackNoLeakThroughSymlink(t *testing.T) {
 	t.Parallel()
 
 	root := t.TempDir()
