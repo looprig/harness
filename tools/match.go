@@ -49,6 +49,9 @@ func MatchFileGlob(pattern, relPath string) bool {
 // path; anything else is a programming error or an attempted escape, and is
 // treated as no-match.
 func isUnsafeRelPath(relPath string) bool {
+	// path.IsAbs for slash paths IS HasPrefix(relPath, "/"); the explicit
+	// prefix clause is a belt-and-suspenders guard documenting that a
+	// leading-slash input is rejected regardless of path.IsAbs internals.
 	if path.IsAbs(relPath) || strings.HasPrefix(relPath, "/") {
 		return true
 	}
@@ -207,7 +210,10 @@ func parseFetchCall(callMethod, callURL string) (fetchTarget, bool) {
 // normalizeHost converts a hostname to its canonical ASCII (punycode) form via
 // idna.Lookup.ToASCII (the strict lookup profile). A non-normalizable host
 // (homograph with disallowed runes, invalid ACE label, etc.) returns ok=false
-// so the caller fails secure. An empty host is not normalizable.
+// so the caller fails secure. An empty host is not normalizable. A trailing-dot
+// FQDN (e.g. "example.com.") is intentionally treated as a DISTINCT host that
+// will NOT match "example.com" (fail-secure: the rooted form is not silently
+// equated with the relative form).
 func normalizeHost(host string) (string, bool) {
 	if host == "" {
 		return "", false
