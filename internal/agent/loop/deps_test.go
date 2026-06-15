@@ -198,7 +198,7 @@ var (
 		Registry:    []tool.InvokableTool(nil),
 		Middlewares: []tool.ToolMiddleware(nil),
 	}
-	_ = ToolPolicy{Tool: "x", Effect: EffectAsk, Match: []string{"*"}}
+	_                = ToolPolicy{Tool: "x", Effect: EffectAsk, Match: []string{"*"}}
 	_ ReadGuard      = readGuardStub{}
 	_ PermissionGate = permissionGateStub{}
 )
