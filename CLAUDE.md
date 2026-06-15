@@ -42,10 +42,10 @@
 - `honnef.co/go/tools/cmd/staticcheck` — extended static analysis (dev/tool only)
 - `github.com/google/go-tdx-guest` — Intel TDX quote parsing and verification; required by internal/llm/tee for phala and chutes TEE attestation
 - `golang.org/x/crypto` — ChaCha20-Poly1305 AEAD; required by internal/llm/e2e for ML-KEM E2E envelope (stdlib has no chacha20poly1305)
-- `github.com/charmbracelet/bubbletea` — Elm-architecture TUI runtime; required by tui + cmd/cli (stdlib has no terminal raw-mode/TUI framework)
-- `github.com/charmbracelet/bubbles` — textarea + viewport widgets for the TUI
-- `github.com/charmbracelet/lipgloss` — terminal styling/layout for the TUI
-- `github.com/charmbracelet/glamour` — markdown → ANSI rendering for the TUI transcript
+- `github.com/charmbracelet/bubbletea` — Elm-architecture TUI runtime; required by tui + cmd/cli (stdlib has no terminal raw-mode/TUI framework). **v2 approved (2026-06-15):** the TUI is migrating to Bubble Tea v2 (and co-versioned Bubbles/Lipgloss v2) for the Kitty keyboard protocol (true Shift+Enter newline) and other v2 features. Use v2 APIs throughout — v1.3.10 cannot distinguish Shift+Enter from Enter. **Migration landed (2026-06-15): the v2 import path is the `charm.land/...` vanity module, i.e. `charm.land/bubbletea/v2` (NOT `github.com/charmbracelet/...`).**
+- `github.com/charmbracelet/bubbles` — textarea + viewport widgets for the TUI. **v2 approved (2026-06-15)** (co-required by Bubble Tea v2). v2 import path: `charm.land/bubbles/v2` (subpackages `.../textarea`, `.../viewport`, `.../key`).
+- `github.com/charmbracelet/lipgloss` — terminal styling/layout for the TUI. **v2 approved (2026-06-15)** (co-required by Bubble Tea v2). v2 import path: `charm.land/lipgloss/v2`.
+- `github.com/charmbracelet/glamour` — markdown → ANSI rendering for the TUI transcript; pin a version compatible with Lipgloss v2. v2 import path: `charm.land/glamour/v2` (styles subpackage `charm.land/glamour/v2/styles`).
 - `github.com/atotto/clipboard` — transitive (indirect) dep of `bubbles/textarea`, which imports it unconditionally for paste; approved as part of textarea, not chosen directly
 - `golang.org/x/net/html` — HTML tokenizer; required by the `WebSearch` tool's DuckDuckGo HTML-scrape `SearchProvider` (stdlib has no HTML parser)
 - `golang.org/x/net/idna` — IDNA/punycode host normalization (same `golang.org/x/net` module as above); required by the `Fetch` tool's persisted-approval host matching to defeat unicode homographs (stdlib has no IDNA)
