@@ -20,6 +20,13 @@ var (
 	StatusStyle      = lipgloss.NewStyle().Faint(true)
 )
 
+// Tool-call styles: a tool card and its result preview render dim, subordinate to
+// the assistant narration they nest beneath.
+var (
+	ToolCallStyle   = lipgloss.NewStyle().Faint(true) // "└ ToolName  Summary  <glyph>" lines
+	ToolResultStyle = lipgloss.NewStyle().Faint(true) // indented result-preview lines
+)
+
 // NewMarkdownRenderer builds a glamour renderer for the given wrap width.
 // Returns an error if glamour fails to construct (caller decides fallback).
 func NewMarkdownRenderer(width int) (*glamour.TermRenderer, error) {
