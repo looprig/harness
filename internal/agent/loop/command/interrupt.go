@@ -9,6 +9,7 @@ const (
 // false if idle or the session is already shutting down.
 // Ack is required and must be non-nil.
 type Interrupt struct {
+	Header
 	Ack chan<- bool
 }
 

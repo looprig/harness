@@ -12,6 +12,7 @@ import (
 // or an *InvalidCommandError if a required field is nil.
 // Events, Abandoned, and Ack are required and must be non-nil.
 type StartTurn struct {
+	Header
 	Ctx       context.Context
 	Input     []content.Block
 	Events    chan<- event.Event

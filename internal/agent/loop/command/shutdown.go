@@ -10,6 +10,7 @@ const (
 // if the loop's root context was cancelled before cleanup completed.
 // Ack is required and must be non-nil.
 type Shutdown struct {
+	Header
 	Ack chan<- error
 }
 
