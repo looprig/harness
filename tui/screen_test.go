@@ -1901,18 +1901,18 @@ func TestViewNeverExceedsHeight(t *testing.T) {
 }
 
 // renderScreen renders the screen's current transcript exactly as refreshHistory
-// would, using the screen's own expandTools flag, so a test can assert on what the
+// would, using the screen's own expand flag, so a test can assert on what the
 // Ctrl+T toggle changes about the rendered output.
 func renderScreen(m Screen, width int) string {
 	queued := make(map[int]bool, len(m.queue))
 	for _, q := range m.queue {
 		queued[q.DisplayIndex] = true
 	}
-	return renderMessages(m.messages, m.live, queued, m.expandTools, width)
+	return renderMessages(m.messages, m.live, queued, m.expand, width)
 }
 
-// TestHandleKeyCtrlTTogglesExpand covers Task 4.1: ctrl+t flips expandTools and
-// re-renders, in any status, with no key conflict.
+// TestHandleKeyCtrlTTogglesExpand covers Task 12: ctrl+t flips the single expand
+// flag and re-renders, in any status, with no key conflict.
 func TestHandleKeyCtrlTTogglesExpand(t *testing.T) {
 	t.Parallel()
 
@@ -1936,31 +1936,31 @@ func TestHandleKeyCtrlTTogglesExpand(t *testing.T) {
 				m.reader = scriptedReader()
 			}
 
-			if m.expandTools {
-				t.Fatal("expandTools = true at construction, want false")
+			if m.expand {
+				t.Fatal("expand = true at construction, want false")
 			}
 			m, cmd := updateScreen(t, m, tea.KeyPressMsg{Code: 't', Mod: tea.ModCtrl})
 			if cmd != nil {
 				t.Errorf("ctrl+t cmd = non-nil, want nil (re-render only)")
 			}
-			if !m.expandTools {
-				t.Errorf("expandTools = false after first ctrl+t, want true")
+			if !m.expand {
+				t.Errorf("expand = false after first ctrl+t, want true")
 			}
 			// Status is unchanged — the toggle is status-agnostic.
 			if m.status != tt.status {
 				t.Errorf("status = %d, want unchanged %d", m.status, tt.status)
 			}
 			m, _ = updateScreen(t, m, tea.KeyPressMsg{Code: 't', Mod: tea.ModCtrl})
-			if m.expandTools {
-				t.Errorf("expandTools = true after second ctrl+t, want false (toggled back)")
+			if m.expand {
+				t.Errorf("expand = true after second ctrl+t, want false (toggled back)")
 			}
 		})
 	}
 }
 
-// TestHandleKeyCtrlTRerendersPreview covers Task 4.1's render effect: a transcript
-// with a long tool result renders folded (first K lines + marker) before the toggle
-// and fully (all lines, no marker) after.
+// TestHandleKeyCtrlTRerendersPreview covers Task 12's render effect on tools: a
+// transcript with a long tool result renders folded (first K lines + marker)
+// before the toggle and fully (all lines, no marker) after.
 func TestHandleKeyCtrlTRerendersPreview(t *testing.T) {
 	t.Parallel()
 
@@ -1980,7 +1980,7 @@ func TestHandleKeyCtrlTRerendersPreview(t *testing.T) {
 	if !strings.Contains(before, "line5") || strings.Contains(before, "line6") {
 		t.Errorf("collapsed render should show line5 and hide line6; got %q", before)
 	}
-	if !strings.Contains(before, "more lines (Ctrl+T)") {
+	if !strings.Contains(before, "more lines · ctrl+t") {
 		t.Errorf("collapsed render missing more-lines marker; got %q", before)
 	}
 
@@ -1990,8 +1990,38 @@ func TestHandleKeyCtrlTRerendersPreview(t *testing.T) {
 	if !strings.Contains(after, "line6") || !strings.Contains(after, "line9") {
 		t.Errorf("expanded render should show all lines incl line6 and line9; got %q", after)
 	}
-	if strings.Contains(after, "more lines (Ctrl+T)") {
+	if strings.Contains(after, "more lines · ctrl+t") {
 		t.Errorf("expanded render should drop the more-lines marker; got %q", after)
+	}
+}
+
+// TestHandleKeyCtrlTRerendersThinking covers Task 12: the SAME ctrl+t toggle also
+// drives the thinking block. Before the toggle (collapsed) an assistant row's
+// multi-line thinking renders as the compact summary line (no "│ " body); after
+// the toggle (expanded) the full "│ "-prefixed thinking body renders.
+func TestHandleKeyCtrlTRerendersThinking(t *testing.T) {
+	t.Parallel()
+
+	agent := &fakeAgent{}
+	m := New(context.Background(), agent, fakeOpen(agent))
+	m.messages = []DisplayMessage{{
+		Role: RoleAssistant,
+		Blocks: []content.Block{
+			&content.ThinkingBlock{Thinking: "first reason\nsecond reason"},
+			&content.TextBlock{Text: "the answer"},
+		},
+	}}
+
+	before := stripANSI(renderScreen(m, 80))
+	if !strings.Contains(before, "ctrl+t") || strings.Contains(before, "│ first reason") {
+		t.Errorf("collapsed render should show the thinking summary and hide the body; got %q", before)
+	}
+
+	m, _ = updateScreen(t, m, tea.KeyPressMsg{Code: 't', Mod: tea.ModCtrl})
+
+	after := stripANSI(renderScreen(m, 80))
+	if !strings.Contains(after, "│ first reason") || !strings.Contains(after, "│ second reason") {
+		t.Errorf("expanded render should show the full thinking body; got %q", after)
 	}
 }
 

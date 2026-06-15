@@ -53,7 +53,7 @@ type Screen struct {
 	history       components.ChatHistory
 	input         components.InputBox
 	slashComplete *components.SlashComplete // nil = hidden
-	expandTools   bool                      // Ctrl+T toggle; false = collapsed tool previews
+	expand        bool                      // Ctrl+T toggle; false = collapsed thinking + tool previews
 	width, height int
 	ready         bool
 }
@@ -426,9 +426,11 @@ func (m *Screen) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			return *m, nil
 		}
 	case "ctrl+t":
-		// Toggle tool-result preview expansion and re-render. Pure display state:
+		// Toggle thinking AND tool-result expansion and re-render. One flag drives
+		// both: collapsed = compact thinking summary + folded tool previews;
+		// expanded = full thinking body + full tool results. Pure display state:
 		// works in any status (it never touches the turn or the agent).
-		m.expandTools = !m.expandTools
+		m.expand = !m.expand
 		m.refreshHistory()
 		return *m, nil
 	case "enter":
@@ -629,7 +631,7 @@ func (m *Screen) refreshHistory() {
 	for _, q := range m.queue {
 		queued[q.DisplayIndex] = true
 	}
-	rendered := renderMessages(m.messages, m.live, queued, m.expandTools, m.contentWidth())
+	rendered := renderMessages(m.messages, m.live, queued, m.expand, m.contentWidth())
 	m.history.SetContent(rendered)
 }
 

@@ -18,12 +18,21 @@ const rowSep = "\n\n"
 const queuedMarker = " (queued)"
 
 // previewLineCap (K) is how many result-preview lines a collapsed tool card shows
-// before the "… N more lines (Ctrl+T)" marker. Expanding (Ctrl+T) shows all of the
+// before the "… N more lines · ctrl+t" marker. Expanding (ctrl+t) shows all of the
 // runner-capped preview, so this is purely a display fold, not a content cap.
 const previewLineCap = 6
 
 // noOutput is the placeholder shown for a completed tool call with no result lines.
 const noOutput = "(no output)"
+
+// hintSeparator joins the fields of a collapsed-fold hint (the thinking summary and
+// the tool-fold "more lines" marker). Kept in one place so both hints stay
+// consistent: " · " (a U+00B7 middle dot framed by single spaces).
+const hintSeparator = " · "
+
+// expandHint is the trailing fragment shared by both collapsed-fold hints; it names
+// the key that expands the fold. Lowercase to match the design appendix mockups.
+const expandHint = "ctrl+t"
 
 // cardConnector is the tree connector that prefixes each tool-call card line.
 const cardConnector = "└ "
@@ -122,7 +131,7 @@ func toolGlyph(s ToolStatus) string {
 // renderToolCalls renders a segment's tool-call children as indented cards, each a
 // header line ("└ ToolName  Summary  <glyph>") followed by its result preview. When
 // expandTools is false the preview is folded to the first previewLineCap lines plus
-// a "… N more lines (Ctrl+T)" marker; when true every (already runner-capped) line
+// a "… N more lines · ctrl+t" marker; when true every (already runner-capped) line
 // shows. An empty result renders "(no output)". An error card's result always shows
 // (subject to the same fold), never hidden. Lines are width-wrapped so a long card
 // never blows the viewport. Returns "" when there are no calls.
@@ -163,7 +172,7 @@ func toolHeaderText(name, summary, glyph string) string {
 // previewLines selects the result lines to display for a card. An empty result
 // yields the single "(no output)" placeholder. When collapsed and the result has
 // more than previewLineCap lines, it returns the first previewLineCap lines plus a
-// "… N more lines (Ctrl+T)" marker (N = the remainder). When expanded, every line
+// "… N more lines · ctrl+t" marker (N = the remainder). When expanded, every line
 // shows (the runner already capped the preview — no extra TUI cap).
 func previewLines(result []string, expandTools bool) []string {
 	if len(result) == 0 {
@@ -175,7 +184,7 @@ func previewLines(result []string, expandTools bool) []string {
 	remaining := len(result) - previewLineCap
 	shown := make([]string, 0, previewLineCap+1)
 	shown = append(shown, result[:previewLineCap]...)
-	shown = append(shown, "… "+strconv.Itoa(remaining)+" more lines (Ctrl+T)")
+	shown = append(shown, "… "+strconv.Itoa(remaining)+" more lines"+hintSeparator+expandHint)
 	return shown
 }
 
@@ -202,32 +211,34 @@ func indentWrap(s, indent string, width int) string {
 // segment is appended as a trailing in-progress assistant row carrying its
 // streamed text and its (possibly still-running) tool cards.
 //
-// expandTools controls whether tool-call previews render folded (first K lines +
-// a marker) or fully; it is threaded to every assistant row and to the live block.
-func renderMessages(msgs []DisplayMessage, live liveSegment, queued map[int]bool, expandTools bool, width int) string {
+// expand is the single ctrl+t flag: it controls whether an assistant row's thinking
+// block renders as a compact summary (collapsed) or its full body (expanded) AND
+// whether its tool-call previews render folded or fully. It is threaded to every
+// assistant row and to the live block so one toggle drives thinking and tools alike.
+func renderMessages(msgs []DisplayMessage, live liveSegment, queued map[int]bool, expand bool, width int) string {
 	rows := make([]string, 0, len(msgs)+1)
 	for i, m := range msgs {
-		row := renderRow(m, expandTools, width)
+		row := renderRow(m, expand, width)
 		if queued[i] {
 			row += queuedMarker
 		}
 		rows = append(rows, row)
 	}
 	if live.text != "" || live.thinking != "" || len(live.calls) > 0 {
-		rows = append(rows, renderAssistant(live.thinking, live.text, live.calls, expandTools, width))
+		rows = append(rows, renderAssistant(live.thinking, live.text, live.calls, expand, width))
 	}
 	return strings.Join(rows, rowSep)
 }
 
 // renderRow renders a single transcript message according to its role. The
-// RoleAssistant case nests the row's tool-call cards beneath its narration text;
-// expandTools is forwarded to that nesting.
-func renderRow(m DisplayMessage, expandTools bool, width int) string {
+// RoleAssistant case nests the row's thinking block and tool-call cards beneath its
+// narration text; the single expand flag is forwarded to both.
+func renderRow(m DisplayMessage, expand bool, width int) string {
 	switch m.Role {
 	case RoleUser:
 		return renderUser(renderInlineBlocks(m.Blocks), width)
 	case RoleAssistant:
-		return renderAssistant(thinkingText(m.Blocks), assistantText(m.Blocks), m.ToolCalls, expandTools, width)
+		return renderAssistant(thinkingText(m.Blocks), assistantText(m.Blocks), m.ToolCalls, expand, width)
 	case RoleSystem:
 		return styles.SystemStyle.Render(firstText(m.Blocks))
 	case RoleError:
@@ -242,11 +253,13 @@ func renderRow(m DisplayMessage, expandTools bool, width int) string {
 // renderAssistant renders an assistant segment in order: its reasoning (thinking)
 // block, its markdown narration, then its tool-call cards. A segment with empty
 // narration but non-empty cards renders a bare dot bullet (no empty markdown block)
-// before its cards, per design §3. Empty parts are omitted.
-func renderAssistant(thinking, text string, calls []ToolCallView, expandTools bool, width int) string {
+// before its cards, per design §3. Empty parts are omitted. The single expand flag
+// drives BOTH the thinking block (compact summary vs full body) and the tool-card
+// result folding, so ctrl+t toggles them together.
+func renderAssistant(thinking, text string, calls []ToolCallView, expand bool, width int) string {
 	var b strings.Builder
 
-	if t := renderThinking(thinking, width); t != "" {
+	if t := renderThinking(thinking, expand, width); t != "" {
 		b.WriteString(t)
 	}
 
@@ -265,7 +278,7 @@ func renderAssistant(thinking, text string, calls []ToolCallView, expandTools bo
 		if b.Len() > 0 {
 			b.WriteString("\n") // cards nest tight beneath the segment they belong to
 		}
-		b.WriteString(renderToolCalls(calls, expandTools, width))
+		b.WriteString(renderToolCalls(calls, expand, width))
 	}
 	return b.String()
 }
@@ -287,13 +300,22 @@ func renderUser(text string, width int) string {
 	return strings.Join(out, "\n")
 }
 
-// renderThinking renders the model's reasoning as a dim block: a faint "thinking"
-// header followed by "│ "-prefixed, width-wrapped lines. Empty/whitespace-only
-// reasoning renders nothing.
-func renderThinking(s string, width int) string {
+// renderThinking renders the model's reasoning under the unified ctrl+t expand
+// flag. When expanded it renders a dim block: a faint "thinking" header followed by
+// "│ "-prefixed, width-wrapped lines. When collapsed it renders a single compact
+// dim summary line ("thinking · N lines · ctrl+t", N = number of thinking content
+// lines, singularised to "1 line" for one line) instead of the full body.
+// Empty/whitespace-only reasoning renders nothing
+// in either mode.
+func renderThinking(s string, expand bool, width int) string {
 	s = strings.TrimSpace(s) // drop the model's leading/trailing blank reasoning lines
 	if s == "" {
 		return ""
+	}
+	if !expand {
+		n := strings.Count(s, "\n") + 1 // thinking content lines
+		summary := styles.ThinkingHeader + hintSeparator + pluralLines(n) + hintSeparator + expandHint
+		return styles.ThinkingStyle.Render(summary)
 	}
 	out := []string{styles.ThinkingStyle.Render(styles.ThinkingHeader)}
 	for _, raw := range strings.Split(s, "\n") {
@@ -302,6 +324,15 @@ func renderThinking(s string, width int) string {
 		}
 	}
 	return strings.Join(out, "\n")
+}
+
+// pluralLines renders a line count with grammatical agreement: "1 line" (singular)
+// for n == 1, "N lines" (plural) otherwise. Used by the collapsed thinking summary.
+func pluralLines(n int) string {
+	if n == 1 {
+		return "1 line"
+	}
+	return strconv.Itoa(n) + " lines"
 }
 
 // wrapToWidth word-wraps s to width columns and returns the resulting rows with

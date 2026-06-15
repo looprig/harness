@@ -272,7 +272,7 @@ func TestRenderToolCalls(t *testing.T) {
 			expandTools: false,
 			width:       80,
 			// K = 6 → lines 0..5 shown, lines 6..9 hidden, "4 more" marker.
-			want:   []string{"line0", "line5", "4 more lines", "Ctrl+T"},
+			want:   []string{"line0", "line5", "4 more lines", "ctrl+t"},
 			absent: []string{"line6", "line9"},
 		},
 		{
@@ -504,23 +504,49 @@ func TestRenderMessagesFullTranscriptNesting(t *testing.T) {
 	}
 }
 
-// TestRenderThinking covers the dim reasoning block: a "thinking" header followed by
-// "│ "-prefixed lines, one per source line; empty input renders nothing.
+// TestRenderThinking covers the dim reasoning block under the unified ctrl+t flag.
+// Expanded: a "thinking" header followed by "│ "-prefixed lines, one per source
+// line. Collapsed: a single compact summary line "thinking · N lines · ctrl+t"
+// (N = number of thinking content lines, singularised to "1 line"), with NO
+// "│ "-prefixed body. Empty or whitespace-only input renders nothing in either mode.
 func TestRenderThinking(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
 		name         string
 		in           string
+		expand       bool
 		wantContains []string
+		wantAbsent   []string
 		wantEmpty    bool
 	}{
-		{name: "empty renders nothing", in: "", wantEmpty: true},
-		{name: "whitespace renders nothing", in: "   \n  ", wantEmpty: true},
+		{name: "empty renders nothing collapsed", in: "", expand: false, wantEmpty: true},
+		{name: "empty renders nothing expanded", in: "", expand: true, wantEmpty: true},
+		{name: "whitespace renders nothing collapsed", in: "   \n  ", expand: false, wantEmpty: true},
+		{name: "whitespace renders nothing expanded", in: "   \n  ", expand: true, wantEmpty: true},
 		{
-			name:         "multi-line gets header and bar-prefixed lines",
+			name:         "expanded multi-line gets header and bar-prefixed lines",
 			in:           "line one\nline two",
+			expand:       true,
 			wantContains: []string{"thinking", "│ line one", "│ line two"},
+		},
+		{
+			// Collapsed two-line thinking → a compact summary mentioning "thinking",
+			// the line count (2), and "ctrl+t"; the "│ "-prefixed body is hidden.
+			name:         "collapsed multi-line is a compact summary line",
+			in:           "line one\nline two",
+			expand:       false,
+			wantContains: []string{"thinking", "2 lines", "ctrl+t"},
+			wantAbsent:   []string{"│ line one", "│ line two"},
+		},
+		{
+			// A single thinking line still renders a sensible summary (count = 1),
+			// singularised to "1 line" (not "1 lines").
+			name:         "collapsed single line summary",
+			in:           "only one line",
+			expand:       false,
+			wantContains: []string{"thinking", "1 line", "ctrl+t"},
+			wantAbsent:   []string{"│ only one line", "1 lines"},
 		},
 	}
 
@@ -528,19 +554,63 @@ func TestRenderThinking(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			got := stripANSI(renderThinking(tt.in, 80))
+			got := stripANSI(renderThinking(tt.in, tt.expand, 80))
 			if tt.wantEmpty {
 				if got != "" {
-					t.Errorf("renderThinking(%q) = %q, want empty", tt.in, got)
+					t.Errorf("renderThinking(%q, %v) = %q, want empty", tt.in, tt.expand, got)
 				}
 				return
 			}
 			for _, w := range tt.wantContains {
 				if !strings.Contains(got, w) {
-					t.Errorf("renderThinking(%q) = %q, want to contain %q", tt.in, got, w)
+					t.Errorf("renderThinking(%q, %v) = %q, want to contain %q", tt.in, tt.expand, got, w)
+				}
+			}
+			for _, a := range tt.wantAbsent {
+				if strings.Contains(got, a) {
+					t.Errorf("renderThinking(%q, %v) = %q, want to NOT contain %q", tt.in, tt.expand, got, a)
 				}
 			}
 		})
+	}
+}
+
+// TestRenderAssistantUnifiedExpand covers Task 12: ONE flag drives BOTH the
+// thinking block and the tool-result folding. Collapsed (expand=false): thinking
+// renders as the compact summary line (no "│ " body) AND the long tool result is
+// folded (first K lines + "more lines" marker). Expanded (expand=true): the full
+// "│ "-prefixed thinking body renders AND the tool result shows every line. The
+// SAME flag flips both — there is no separate thinking key.
+func TestRenderAssistantUnifiedExpand(t *testing.T) {
+	t.Parallel()
+
+	const thinking = "reason one\nreason two\nreason three"
+	calls := []ToolCallView{{ToolName: "ReadFile", Status: ToolOK, Result: makeLines(10)}}
+
+	collapsed := stripANSI(renderAssistant(thinking, "the answer", calls, false, 80))
+	expanded := stripANSI(renderAssistant(thinking, "the answer", calls, true, 80))
+
+	// Collapsed: thinking is the compact summary (count + ctrl+t), no "│ " body;
+	// the tool result is folded (first K lines, a more-marker, later lines hidden).
+	for _, w := range []string{"thinking", "3 lines", "ctrl+t", "line0", "line5", "more lines"} {
+		if !strings.Contains(collapsed, w) {
+			t.Errorf("collapsed renderAssistant missing %q in %q", w, collapsed)
+		}
+	}
+	for _, a := range []string{"│ reason one", "line6", "line9"} {
+		if strings.Contains(collapsed, a) {
+			t.Errorf("collapsed renderAssistant must NOT contain %q in %q", a, collapsed)
+		}
+	}
+
+	// Expanded: the full "│ "-prefixed thinking body AND every tool-result line.
+	for _, w := range []string{"│ reason one", "│ reason three", "line6", "line9"} {
+		if !strings.Contains(expanded, w) {
+			t.Errorf("expanded renderAssistant missing %q in %q", w, expanded)
+		}
+	}
+	if strings.Contains(expanded, "more lines") {
+		t.Errorf("expanded renderAssistant must NOT contain the more-marker in %q", expanded)
 	}
 }
 
@@ -561,8 +631,8 @@ func TestRenderUserAccentBar(t *testing.T) {
 }
 
 // TestRenderAssistantThinkingBlock covers an assistant row carrying a ThinkingBlock:
-// the reasoning renders as the thinking block (never as "[unsupported block]") and
-// the narration still renders.
+// when expanded the reasoning renders as the full thinking block (never as
+// "[unsupported block]") and the narration still renders.
 func TestRenderAssistantThinkingBlock(t *testing.T) {
 	t.Parallel()
 
@@ -573,7 +643,7 @@ func TestRenderAssistantThinkingBlock(t *testing.T) {
 			&content.TextBlock{Text: "the final answer"},
 		},
 	}
-	got := stripANSI(renderRow(row, false, 80))
+	got := stripANSI(renderRow(row, true, 80)) // expanded: assert the full thinking body renders
 
 	for _, w := range []string{"thinking", "my reasoning", "the final answer"} {
 		if !strings.Contains(got, w) {
@@ -586,12 +656,12 @@ func TestRenderAssistantThinkingBlock(t *testing.T) {
 }
 
 // TestRenderMessagesLiveThinking covers the in-progress live segment carrying both
-// streamed thinking and narration.
+// streamed thinking and narration; expanded so the full thinking body is asserted.
 func TestRenderMessagesLiveThinking(t *testing.T) {
 	t.Parallel()
 
 	live := liveSegment{thinking: "reasoning now", text: "answering"}
-	got := stripANSI(renderMessages(nil, live, nil, false, 80))
+	got := stripANSI(renderMessages(nil, live, nil, true, 80))
 
 	for _, w := range []string{"thinking", "reasoning now", "answering"} {
 		if !strings.Contains(got, w) {
