@@ -85,11 +85,23 @@ type prompt struct {
     // promptUserInput (built from event.UserInputRequested):
     Question string
     Choices  []string
-
-    // promptUserInput "other…" free-text sub-state:
-    freeText bool   // true once the user picked "other"; the input box captures the answer
+    freeText bool   // set at ENQUEUE when len(Choices)==0: the input box captures the answer
 }
 ```
+
+**AskUser answer contract (must match `tools/askuser.go validateAnswer`).** The TUI is
+constrained by the *existing* tool contract, which is the source of truth:
+`validateAnswer(answer, choices)` accepts — **with choices**: exactly one listed choice OR
+the literal string `"other"`; **with no choices**: any free text (including empty). So the
+TUI's two modes map 1:1 onto the contract:
+- **No choices (`freeText`)** → a free-text answer is valid → the input box captures it and
+  `ProvideAnswer(typed)` is sent. (The TUI requires non-empty for usability — a UI guard,
+  not a contract requirement; the tool would accept empty.)
+- **With choices** → the answer must be a listed choice or the literal `"other"`. Number
+  keys send the selected choice; `[o]` sends the **literal `"other"`** (the contract's
+  escape hatch — "none of these"). The TUI does **not** capture custom free text in this
+  case, because an unlisted typed string would fail `validateAnswer` and surface as a
+  tool-result error. (See §9 for the optional AskUser amendment that would lift this.)
 
 Construction happens in `handleEvent` (below). The `prompt` carries the **already-safe,
 full-fidelity** strings the stream delivered (`Description()` is what the user must read to
@@ -121,9 +133,15 @@ case event.UserInputRequested:
     m.pending = append(m.pending, prompt{
         CallID: ev.CallID, Kind: promptUserInput,
         Question: ev.Question, Choices: ev.Choices,
+        freeText: len(ev.Choices) == 0, // no choices → free-text mode (matches the tool contract)
     })
     m.refreshHistory()
+    m.resizeHistory() // a prompt opening changes the height budget (§3)
 ```
+
+(`PermissionRequested` likewise calls `m.resizeHistory()` after enqueue, and the
+terminal-event clear calls it after emptying `pending`, so the history viewport always
+reflects the current prompt's height — see §3.)
 
 **The queue is cleared on every terminal event.** `TurnDone`/`TurnFailed`/
 `TurnInterrupted` set `m.pending = nil` (alongside the existing `m.live = liveSegment{}`
@@ -178,18 +196,67 @@ new `styles.PromptStyle` (bordered/emphasised, distinct from the faint tool card
 └────────────────────────────────────────────────────┘
 ```
 
-- Choices render as a numbered key list (`[1]`…`[9]`); `[o] other…` is always offered (the
-  `AskUser` tool validates the answer ∈ choices + `"other"`, so "other" must be reachable).
-- With **no choices** (free-text question), render only `[o]`/an inline prompt and go
-  straight to the free-text sub-state.
-- In the **free-text sub-state** (`freeText == true`), render the question above the
-  re-enabled input box; `Enter` submits the typed text as the answer, `Esc` cancels back to
-  the choice list.
+- **With choices**: a numbered key list (`[1]`…`[9]`) plus `[o] other`. Selecting `[o]`
+  sends the literal `"other"` (the contract escape hatch — §1); there is no custom-text
+  capture in the choices case.
+- **No choices (`freeText == true`)**: render the question above the (re-enabled) input box;
+  the user types the answer and `Enter` submits it. No choice list, no `[o]`. This is the
+  only path that sends typed free text, and the tool accepts it (no-choices → any answer).
+- Only ≤9 choices get number keys; if a tool ever supplies >9 choices, the impl plan should
+  decide (paginate or letter-key) — `AskUser` callers today supply small lists.
 
 `renderMessages`/the screen's `View` composition: when `len(pending) > 0`, render
-`renderPrompt(m.pending[0], expandTools?, width)` in place of the idle input box. The
-status line (`StatusRunning`) can show `awaiting approval` / `awaiting input` so the state
-is unambiguous.
+`renderPrompt(m.pending[0], width)` in place of the idle input box. The status line
+(`StatusRunning`) can show `awaiting approval` / `awaiting input` so the state is
+unambiguous.
+
+### §3a — Layout & height budgeting (variable prompt height)
+
+The current layout reserves a FIXED 4 lines below the history viewport — `reservedLines =
+1 (status) + 3 (input box)` — and `historyHeight() = height − reservedLines −
+panelHeight()` (`tui/screen.go:16,624`; input box fixed at 3, `tui/components/input.go:8`).
+A bordered prompt with a wrapped `Description`/`Question` + a key-hint line is **taller than
+3 and variable**, so it cannot reuse the fixed `reservedLines` budget — without accounting,
+the prompt would overflow into / be clipped against the history viewport.
+
+The prompt is rendered **in place of** the input box (the input is hidden while a non-free-
+text prompt is active; in free-text mode the input box IS the prompt's entry field — see
+§4), so the budget swaps the input's 3 lines for the prompt's measured height. Mirror the
+existing `panelHeight()` pattern (`screen.go:615`, which already measures the slash-complete
+panel via `lipgloss.Height`):
+
+```go
+// promptHeight returns the rendered height of the active prompt box, or 0 when none.
+func (m Screen) promptHeight() int {
+    if len(m.pending) == 0 { return 0 }
+    return lipgloss.Height(renderPrompt(m.pending[0], m.width))
+}
+
+// historyHeight: status (1) is always reserved; the input region is EITHER the 3-line
+// input box (no prompt) OR the measured prompt box (prompt active). panelHeight unchanged.
+func (m Screen) historyHeight() int {
+    inputRegion := inputBoxLines // 3
+    if ph := m.promptHeight(); ph > 0 {
+        inputRegion = ph // prompt replaces the input box
+    }
+    return max(0, m.height-statusLines-inputRegion-m.panelHeight())
+}
+```
+
+- `resizeHistory()` is called whenever `pending` changes (enqueue in §2, pop in §4, clear in
+  §7) and on `WindowSizeMsg`, so the viewport always reflects the current prompt height.
+- **Cap the prompt height** so a pathologically long `Description`/`Question` cannot eat the
+  screen: the prompt box wraps to `width` and caps its body at `min(measured, height/2)` (or
+  a fixed max), truncating the body with a `… (truncated)` marker beyond the cap. The full
+  text remains in `Description`/`Question` (and, for a tool call, is what the human approves
+  — if it is genuinely huge that is itself a signal). A scrollable prompt body is out of
+  scope (§9).
+- Free-text mode: the prompt renders the question line(s) AND keeps the input box as its
+  entry field; `promptHeight()` then measures both, so the budget still holds.
+- Extract `statusLines = 1` and `inputBoxLines = 3` as named constants (replacing the lumped
+  `reservedLines = 4`) so the two regions are budgeted independently. Existing call sites
+  that used `reservedLines` (no prompt) compute the same `1 + 3 = 4` and stay behavior-
+  identical when no prompt is open.
 
 ---
 
@@ -214,20 +281,30 @@ if len(m.pending) > 0 && key != "ctrl+c" && key != "ctrl+t" {
 - `n` (and `esc`) → `denyCmd(headCallID)`, pop.
 - a key not offered by this prompt's `Scopes` → ignored (no-op, re-render).
 
-**`promptUserInput`:**
+**`promptUserInput` — with choices (`!freeText`):**
 - `1`…`9` → if the index is within `Choices`: `provideAnswerCmd(headCallID, Choices[i])`, pop.
-- `o` → enter free-text sub-state: set `pending[0].freeText = true`, re-enable + focus the
-  input box, re-render (do NOT pop yet).
-- in free-text sub-state: `enter` → `provideAnswerCmd(headCallID, inputText)` (reject empty
-  → stay), clear the input box, pop; `esc` → leave free-text back to the choice list (do
-  not pop / do not answer).
+- `o` → `provideAnswerCmd(headCallID, "other")` — the literal contract escape hatch (§1).
+  **No free-text capture here** (an unlisted typed string would fail the tool's
+  `validateAnswer` and surface as a tool-result error).
+- `esc` → interrupt the turn (`AskUser` has no "deny"; the gate releases via ctx-cancel →
+  `TurnInterrupted` → queue cleared, §7).
+- any other key → no-op.
 
-**Pop = reveal next.** Popping the head (`m.pending = m.pending[1:]`) re-renders; if another
-prompt remains, its box renders next. Answers are **fire-and-route** (no ack — see §5), so
-the pop is immediate/optimistic; the bounded command reports only transport failure.
+**`promptUserInput` — free-text (`freeText`, no choices):**
+- the input box is the prompt's entry field; printable keys type into it (route them to the
+  input box from `handlePromptKey`). `enter` → if the typed text is non-empty,
+  `provideAnswerCmd(headCallID, typed)`, clear the box, pop; an empty `enter` is ignored
+  (re-prompt). `esc` → interrupt the turn (as above). The tool accepts free text in the
+  no-choices case, so the typed answer is always valid.
 
-`Enter` while a non-free-text prompt is active does **not** submit the input box (the input
-box is hidden); normal `Enter`/queue behavior resumes once `pending` is empty.
+**Pop = reveal next.** Popping the head (`m.pending = m.pending[1:]`, then `resizeHistory()`
+since the height budget changed, §3a) re-renders; if another prompt remains its box renders
+next. Answers are **fire-and-route** (no ack — see §5), so the pop is immediate/optimistic;
+the bounded command reports only transport failure.
+
+While a *choices/permission* prompt is active the input box is hidden and `Enter` does not
+submit it; in *free-text* mode the input box IS the prompt entry. Normal `Enter`/queue
+behavior resumes once `pending` is empty.
 
 ---
 
@@ -313,11 +390,25 @@ The producing events already exist, so — like the tool-card work — this is u
   right `ToolName`/`Description`/`Scopes` (built via a fake `tool.PermissionRequest` whose
   `AllowedScopes()` varies — all-three vs once-only); `UserInputRequested` → `promptUserInput`
   with the choices. Two `UserInputRequested` (distinct `CallID`) → two pending, head first.
-- **Key dispatch:** `y`/`s`/`w` call `agent.Approve(headCallID, ScopeOnce/Session/Workspace)`;
-  a scope key NOT in `Scopes` is a no-op; `n`/`esc` → `agent.Deny(headCallID)`; the head pops
-  after each. A number key → `agent.ProvideAnswer(headCallID, Choices[i])`; `o` → free-text
-  mode (input box re-enabled, no pop), `enter` → `ProvideAnswer(headCallID, typed)`, empty
-  rejected, `esc` → back to choices.
+- **Key dispatch (permission):** `y`/`s`/`w` → `agent.Approve(headCallID, ScopeOnce/Session/
+  Workspace)`; a scope key NOT in `Scopes` is a no-op; `n`/`esc` → `agent.Deny(headCallID)`;
+  the head pops after each.
+- **Key dispatch (AskUser, with choices):** a number key → `agent.ProvideAnswer(headCallID,
+  Choices[i])`, pop; `o` → `agent.ProvideAnswer(headCallID, "other")` — assert it sends the
+  **literal `"other"`, not typed text**; `esc` → interrupts the turn (no `ProvideAnswer`).
+- **Key dispatch (AskUser, no choices / free-text):** the input box captures text; `enter`
+  → `agent.ProvideAnswer(headCallID, typed)`, pop; an empty `enter` is ignored (no call);
+  `esc` → interrupt.
+- **Contract conformance (the §2-finding regression):** assert that for a with-choices
+  prompt the TUI only ever sends a listed choice or the literal `"other"` — never arbitrary
+  typed text — so the answer always passes `tools/askuser.go validateAnswer`. (A test that
+  feeds the sent answer through the real `validateAnswer` with the prompt's choices and
+  asserts it returns "" is the tightest guard.)
+- **Height budgeting (§3a):** with a prompt active, `historyHeight()` shrinks by the
+  prompt's measured height (not the input's 3 lines); `resizeHistory` runs on enqueue / pop
+  / terminal-clear; a prompt taller than the cap is truncated and `historyHeight()` never
+  goes negative (floored at 0). Drive a `WindowSizeMsg` + a synthetic prompt and assert the
+  resulting viewport height.
 - **Modal routing:** with a prompt open, normal bindings (plain text, `enter`-submits-input,
   `up`/`down` history) are suppressed; `ctrl+c`/`ctrl+t` still act.
 - **Pop reveals next:** answer head → second prompt renders; `(+N more pending)` count is
@@ -348,17 +439,33 @@ box. This is the integration the tool-card doc could not exercise without this w
 - **Rich diff rendering inside the WriteFile/EditFile approval box** beyond the
   `Description()` the request already carries (the tool's `BuildRequest` decides what the
   prompt shows; richer previews are a tool-side change, not a TUI one).
+- **Custom free text *alongside* choices (OPTIONAL follow-up — a tool change).** With
+  choices present, `[o]` sends the literal `"other"`; the user cannot type a custom answer,
+  because `tools/askuser.go validateAnswer` rejects unlisted text. Supporting "pick a choice
+  OR type your own" requires a small, deliberate `AskUser` contract amendment — e.g.
+  `validateAnswer` accepting the typed text as the free-text "other" value, or an
+  `allow_other_text` arg. That is out of this tui-only doc (it changes a tool's validation
+  contract); call it out so the choice is conscious. Free text already works for a
+  no-choices question.
+- **A scrollable prompt body.** A prompt whose `Description`/`Question` exceeds the height
+  cap (§3a) is truncated with a marker, not scrolled.
 
 ---
 
 ## Suggested execution order (for the follow-up impl plan)
 
 1. `prompt` model + `Screen.pending` field (§1) — additive, no behavior.
-2. `handleEvent` enqueue cases + terminal-clear (§2) — synthetic-event tests.
+2. `handleEvent` enqueue cases (set `freeText` for no-choices) + terminal-clear (§2) —
+   synthetic-event tests.
 3. `tui/commands.go` `approve/deny/provideAnswer` bounded cmds + `promptResultMsg` (§5).
-4. `handlePromptKey` modal routing + free-text sub-state (§4).
-5. `renderPrompt` + `styles.PromptStyle` + `View` composition (§3).
-6. Manual smoke check against `agents/coding` (§8).
+4. `handlePromptKey` modal routing — permission (`y/s/w/n`), AskUser-with-choices (number /
+   literal `o` / `esc`-interrupt), AskUser-free-text (input box / `enter` / `esc`) (§4),
+   with the contract-conformance test.
+5. Layout split: `statusLines`/`inputBoxLines` consts + `promptHeight()` + `historyHeight()`
+   accounting + `resizeHistory()` on prompt open/close, with the height cap (§3a).
+6. `renderPrompt` (permission box + AskUser choices box + free-text box) + `styles.PromptStyle`
+   + `View` composition (§3).
+7. Manual smoke check against `agents/coding` (§8).
 
 Each step is one TDD task (failing test → minimal impl → `-race` → commit), keeping the
 existing `tui/` tests green throughout (the modal switch changes key routing only while a
