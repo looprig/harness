@@ -88,8 +88,10 @@ func (c *PermissionChecker) grantWorkspace(ctx context.Context, toolName, match 
 		return err
 	}
 
-	// Create + harden the store directories (0700).
-	if err := mkdirStoreDir(dir); err != nil {
+	// Create + harden the store directories: tighten EVERY store component under
+	// home to 0700 (not just the leaf), so a pre-existing loose ~/.urvi or
+	// ~/.urvi/workspaces cannot survive as a store-poisoning vector.
+	if err := mkdirStoreDir(home, dir); err != nil {
 		return err
 	}
 

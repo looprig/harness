@@ -450,9 +450,11 @@ func loadApprovalRecords(ctx context.Context, cache *hashcache.Cache[ApprovalsFi
 //     device, fifo, …) with NO group/world-writable bit (a non-owner could
 //     otherwise tamper with the policy that auto-approves tool calls).
 func readHardenedApprovalsFile(ctx context.Context, home, p string) ([]byte, bool) {
-	if err := assertNoSymlinkComponent(home, p); err != nil {
-		// A symlinked policy-path component → don't read through it; treat as empty.
-		slog.WarnContext(ctx, "tools: approvals path has a symlinked component; skipped (treated as empty)", "path", p, "err", err)
+	if err := assertHardenedStorePath(home, p); err != nil {
+		// A symlinked policy-path component OR a group/world-writable ancestor
+		// DIRECTORY → don't read through it; treat as empty (a non-owner could
+		// otherwise have planted the file via a loose ancestor dir).
+		slog.WarnContext(ctx, "tools: approvals path has a symlinked or world-writable component; skipped (treated as empty)", "path", p, "err", err)
 		return nil, false
 	}
 

@@ -139,6 +139,112 @@ func TestLoaderRejectsSymlinkedComponent(t *testing.T) {
 	}
 }
 
+// TestLoaderRejectsWorldWritableAncestorDir proves the loader rejects the store
+// (→ Ask, never AutoApprove) when ANY store DIRECTORY component under <home> is
+// group- or world-writable, even though the file itself is a valid 0600 regular
+// file. A pre-existing world-writable ~/.urvi/workspaces (the ancestor) lets a
+// non-owner plant an attacker-owned approvals.json that would otherwise pass
+// every file-level check — this is the store-poisoning vector being closed.
+func TestLoaderRejectsWorldWritableAncestorDir(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+		// looseRel is the store-relative dir (under <home>) to make world-writable
+		// AFTER a valid store is written; empty means "leave all dirs 0700".
+		looseRel string
+		mode     os.FileMode
+		want     loop.Effect
+	}{
+		{name: "control: all dirs 0700", looseRel: "", want: loop.EffectAutoApprove},
+		{name: "world-writable ~/.urvi rejected", looseRel: urviDirName, mode: 0o777, want: loop.EffectAsk},
+		{name: "world-writable ~/.urvi/workspaces rejected", looseRel: filepath.Join(urviDirName, workspacesDirName), mode: 0o777, want: loop.EffectAsk},
+		{name: "group-writable ~/.urvi rejected", looseRel: urviDirName, mode: 0o770, want: loop.EffectAsk},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			ws := newWS(t)
+			if err := os.WriteFile(filepath.Join(ws, "main.go"), []byte("package main"), 0o600); err != nil {
+				t.Fatalf("write main.go: %v", err)
+			}
+			home := t.TempDir()
+			hash, err := workspaceHash(ws)
+			if err != nil {
+				t.Fatalf("workspaceHash: %v", err)
+			}
+			wsFile := workspaceApprovalsPath(home, hash)
+			if err := os.MkdirAll(filepath.Dir(wsFile), 0o700); err != nil {
+				t.Fatalf("mkdir ws store: %v", err)
+			}
+			recs := writeApprovals(t, ApprovalRecord{Tool: "ReadFile", Match: "main.go", Effect: loop.EffectAutoApprove})
+			if err := os.WriteFile(wsFile, recs, 0o600); err != nil {
+				t.Fatalf("write ws approvals: %v", err)
+			}
+
+			// Loosen an ANCESTOR dir (the file stays a valid 0600 regular file).
+			if tt.looseRel != "" {
+				if err := os.Chmod(filepath.Join(home, tt.looseRel), tt.mode); err != nil {
+					t.Fatalf("chmod ancestor %q: %v", tt.looseRel, err)
+				}
+			}
+
+			pc := NewPermissionChecker(PermissionPolicy{WorkspaceRoot: ws, HardDeny: DefaultHardDeny()})
+			pc.SetHomeDir(func() (string, error) { return home, nil })
+			got := pc.Check(context.Background(), plainTool{name: "ReadFile"}, "ReadFile", `{"path":"main.go"}`)
+			if got != tt.want {
+				t.Errorf("Check() = %v, want %v (ancestor %q mode %o)", got, tt.want, tt.looseRel, tt.mode)
+			}
+		})
+	}
+}
+
+// TestLoaderRejectsLooseAncestorWarnsPathOnly proves rejecting the store for a
+// world-writable ANCESTOR dir emits a path-only WARN and never leaks the file
+// CONTENTS. Not parallel: swaps the global slog default.
+func TestLoaderRejectsLooseAncestorWarnsPathOnly(t *testing.T) {
+	ws := newWS(t)
+	if err := os.WriteFile(filepath.Join(ws, "main.go"), []byte("package main"), 0o600); err != nil {
+		t.Fatalf("write main.go: %v", err)
+	}
+	home := t.TempDir()
+	hash, err := workspaceHash(ws)
+	if err != nil {
+		t.Fatalf("workspaceHash: %v", err)
+	}
+	wsFile := workspaceApprovalsPath(home, hash)
+	if err := os.MkdirAll(filepath.Dir(wsFile), 0o700); err != nil {
+		t.Fatalf("mkdir ws store: %v", err)
+	}
+	const secretToken = "TOPSECRET_ANCESTOR_DO_NOT_LOG"
+	recs := writeApprovals(t, ApprovalRecord{Tool: "ReadFile", Match: secretToken, Effect: loop.EffectAutoApprove})
+	if err := os.WriteFile(wsFile, recs, 0o600); err != nil {
+		t.Fatalf("write ws approvals: %v", err)
+	}
+	// Loosen ~/.urvi/workspaces (an ancestor) to world-writable.
+	if err := os.Chmod(filepath.Join(home, urviDirName, workspacesDirName), 0o777); err != nil {
+		t.Fatalf("chmod ancestor: %v", err)
+	}
+
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	pc := NewPermissionChecker(PermissionPolicy{WorkspaceRoot: ws, HardDeny: DefaultHardDeny()})
+	pc.SetHomeDir(func() (string, error) { return home, nil })
+	if got := pc.Check(context.Background(), plainTool{name: "ReadFile"}, "ReadFile", `{"path":"main.go"}`); got != loop.EffectAsk {
+		t.Fatalf("Check() = %v, want EffectAsk (loose ancestor must reject store)", got)
+	}
+
+	logged := buf.String()
+	if !strings.Contains(logged, "approvals.json") {
+		t.Errorf("warning should name the file path; log was:\n%s", logged)
+	}
+	if strings.Contains(logged, secretToken) {
+		t.Errorf("warning leaked file CONTENTS (%q); log was:\n%s", secretToken, logged)
+	}
+}
+
 // TestLoaderRejectionWarns proves the loader emits a path-only WARN when it
 // rejects a hardening-violating file (here world-writable) and never leaks the
 // file CONTENTS. Not parallel: swaps the global slog default.

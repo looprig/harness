@@ -97,6 +97,25 @@ const (
 	groupWorldWritable os.FileMode = 0o022
 )
 
+// storeRelSegments validates that full is genuinely a descendant of base (the
+// resolved home, the trust anchor) and returns the path segments BELOW base, in
+// order from the shallowest store component down to the leaf. It is the single
+// source of truth for "which components are the store's own (and therefore ours
+// to walk/check/chmod), as opposed to home and above (outside our control)".
+// Both the read-side hardening walk and the write-side chmod walk consume this so
+// they stay consistent. A "." or a ".."-escaping rel means full is not under base
+// — a typed refusal (the store path must live under home).
+func storeRelSegments(base, full string) ([]string, error) {
+	rel, err := filepath.Rel(base, full)
+	if err != nil {
+		return nil, &PolicyStoreError{Path: full, Reason: "policy path is not relative to home", Err: err}
+	}
+	if rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
+		return nil, &PolicyStoreError{Path: full, Reason: "policy path is not under the home dir"}
+	}
+	return strings.Split(rel, string(os.PathSeparator)), nil
+}
+
 // assertNoSymlinkComponent walks every path component from base (inclusive,
 // exclusive of base's own ancestry) down to full and rejects if ANY component is
 // a symlink. It is the §3c "don't follow a symlinked ~/.urvi or workspaces/<hash>"
@@ -109,16 +128,12 @@ const (
 // It uses os.Lstat (which does NOT follow the final component) at each level so a
 // symlinked directory is detected rather than traversed.
 func assertNoSymlinkComponent(base, full string) error {
-	rel, err := filepath.Rel(base, full)
+	segs, err := storeRelSegments(base, full)
 	if err != nil {
-		return &PolicyStoreError{Path: full, Reason: "policy path is not relative to home", Err: err}
-	}
-	// A "." or a ".."-escaping rel means full is not genuinely under base — refuse.
-	if rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
-		return &PolicyStoreError{Path: full, Reason: "policy path is not under the home dir"}
+		return err
 	}
 	cur := base
-	for _, seg := range strings.Split(rel, string(os.PathSeparator)) {
+	for _, seg := range segs {
 		cur = filepath.Join(cur, seg)
 		fi, err := os.Lstat(cur)
 		if err != nil {
@@ -136,18 +151,75 @@ func assertNoSymlinkComponent(base, full string) error {
 	return nil
 }
 
-// mkdirStoreDir creates dir (and any missing parents up to home) at 0700 and
-// verifies the final mode is exactly owner-only — defending against a permissive
-// umask or a pre-existing too-open directory. base (the resolved home) is assumed
-// to exist; only the store sub-tree is created/verified.
-func mkdirStoreDir(dir string) error {
+// assertHardenedStorePath is the READ-side store-path hardening walk (§3c). In a
+// SINGLE os.Lstat pass over every component from home (exclusive) down to full it
+// rejects, fail-secure, if ANY component is:
+//   - a symlink (don't follow a symlinked ~/.urvi or workspaces/<hash>); or
+//   - a DIRECTORY that is group- or world-writable (mode & 0o022 != 0) — a
+//     non-owner could otherwise have planted/tampered with the approvals.json via
+//     the loose ancestor dir, bypassing the file's own 0600 check.
+//
+// Folding the perm check into the existing symlink walk avoids extra stats and
+// shrinks the TOCTOU surface (one Lstat decides both per component). It is scoped
+// strictly to components UNDER home: home itself (the trust anchor) and anything
+// above it are NEVER inspected. The final component is the approvals FILE; its own
+// regular-file + group/world-writable check is done separately on the open fd by
+// the caller, so the writable check here is applied only to non-final (directory)
+// components. A non-existent component is not a violation (an absent store is
+// normal — the caller handles the missing file); any OTHER Lstat error is.
+func assertHardenedStorePath(home, full string) error {
+	segs, err := storeRelSegments(home, full)
+	if err != nil {
+		return err
+	}
+	cur := home
+	for i, seg := range segs {
+		cur = filepath.Join(cur, seg)
+		fi, err := os.Lstat(cur)
+		if err != nil {
+			if os.IsNotExist(err) {
+				return nil // absent component (and below) — nothing to follow/check.
+			}
+			return &PolicyStoreError{Path: cur, Reason: "policy path component could not be stat-ed", Err: err}
+		}
+		if fi.Mode()&os.ModeSymlink != 0 {
+			return &PolicyStoreError{Path: cur, Reason: "policy path component is a symlink (refusing to follow)"}
+		}
+		// The final segment is the approvals FILE — its perms are checked on the
+		// open fd by the caller. Every non-final segment is a store DIRECTORY: a
+		// group/world-writable bit on it is a store-poisoning vector.
+		if i < len(segs)-1 && fi.Mode().Perm()&groupWorldWritable != 0 {
+			return &PolicyStoreError{Path: cur, Reason: "policy path directory component is group- or world-writable"}
+		}
+	}
+	return nil
+}
+
+// mkdirStoreDir creates dir (and any missing parents up to home) at 0700 and then
+// tightens EVERY store-owned component UNDER home to exactly 0700 — not just the
+// leaf. MkdirAll honours the umask (which may have stripped group/other bits) but
+// an EXISTING component keeps its old (possibly group/world-writable) mode, so a
+// pre-existing loose ~/.urvi or ~/.urvi/workspaces would otherwise survive and
+// let a non-owner plant a poisoned approvals.json. We therefore chmod each
+// component from the shallowest store dir DOWN to dir. base (the resolved home)
+// is the trust anchor: it (and anything above it) is NEVER chmod-ed. A chmod
+// failure on any component — e.g. EPERM because an ancestor is owned by another
+// user, the attack signal — is a typed error and Grant writes nothing.
+func mkdirStoreDir(home, dir string) error {
 	if err := os.MkdirAll(dir, storeDirPerm); err != nil {
 		return &PolicyStoreError{Path: dir, Reason: "could not create policy store directory", Err: err}
 	}
-	// MkdirAll honours the umask, which may have stripped group/other bits already,
-	// but an EXISTING dir keeps its old (possibly looser) mode; force 0700.
-	if err := os.Chmod(dir, storeDirPerm); err != nil {
-		return &PolicyStoreError{Path: dir, Reason: "could not set policy store directory mode", Err: err}
+	segs, err := storeRelSegments(home, dir)
+	if err != nil {
+		return err
+	}
+	// Walk each store-owned component from home DOWN to the leaf and force 0700.
+	cur := home
+	for _, seg := range segs {
+		cur = filepath.Join(cur, seg)
+		if err := os.Chmod(cur, storeDirPerm); err != nil {
+			return &PolicyStoreError{Path: cur, Reason: "could not set policy store directory mode", Err: err}
+		}
 	}
 	return nil
 }
