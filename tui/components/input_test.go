@@ -1,12 +1,22 @@
 package components
 
 import (
+	"regexp"
 	"strings"
 	"testing"
 
-	"github.com/charmbracelet/bubbles/key"
-	tea "github.com/charmbracelet/bubbletea"
+	"charm.land/bubbles/v2/key"
+	tea "charm.land/bubbletea/v2"
 )
+
+// ansiEscape matches ANSI CSI/SGR escape sequences (e.g. "\x1b[7;37m"). v2's focused
+// textarea inverts the first placeholder rune with the virtual cursor, splitting the
+// placeholder string with escape codes; stripping them lets appearance assertions
+// match the visible text rather than the styled bytes.
+var ansiEscape = regexp.MustCompile(`\x1b\[[0-9;]*m`)
+
+// stripANSI removes SGR escape sequences so a test can assert on visible glyphs.
+func stripANSI(s string) string { return ansiEscape.ReplaceAllString(s, "") }
 
 // TestInputBoxAppearance covers the auto-growing input: the bordered box, the "▌"
 // accent bar on the left (matching user rows), a dim placeholder, and no "> " prompt.
@@ -17,18 +27,22 @@ func TestInputBoxAppearance(t *testing.T) {
 	b := NewInputBox()
 	b.Resize(40)
 	v := b.View()
+	// Strip styling so substring checks match the visible glyphs: v2's focused
+	// textarea inverts the placeholder's first rune with the virtual cursor, which
+	// otherwise splits "Type a message…" with ANSI escapes.
+	plain := stripANSI(v)
 
 	// 1 content line + a top and bottom border row.
 	if lines := strings.Count(v, "\n") + 1; lines != minInputLines+2 {
 		t.Fatalf("View() has %d lines, want %d:\n%q", lines, minInputLines+2, v)
 	}
-	if strings.Contains(v, "> ") {
+	if strings.Contains(plain, "> ") {
 		t.Errorf("View() still shows the old \"> \" prompt:\n%q", v)
 	}
-	if !strings.Contains(v, "▌") {
+	if !strings.Contains(plain, "▌") {
 		t.Errorf("View() missing the \"▌\" accent bar:\n%q", v)
 	}
-	if !strings.Contains(v, "Type a message") {
+	if !strings.Contains(plain, "Type a message") {
 		t.Errorf("View() missing the placeholder text:\n%q", v)
 	}
 }
@@ -66,11 +80,11 @@ func TestInputBoxViewGrowsWithContent(t *testing.T) {
 	b.Resize(60)
 	b.SetValue("only one line")
 	// Drive an Update so the editor's height tracks the content.
-	b.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'!'}})
+	b.Update(tea.KeyPressMsg{Text: "!", Code: '!'})
 	short := strings.Count(b.View(), "\n") + 1
 
 	b.SetValue("line1\nline2\nline3\nline4")
-	b.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'!'}})
+	b.Update(tea.KeyPressMsg{Text: "!", Code: '!'})
 	tall := strings.Count(b.View(), "\n") + 1
 
 	if tall <= short {
@@ -83,7 +97,9 @@ func TestInputBoxViewGrowsWithContent(t *testing.T) {
 
 // TestInputBoxShiftEnterNewline asserts Shift+Enter (not Enter) is bound to insert a
 // newline, leaving Enter free for screen.go to use as submit. See the doc note on
-// input.go: on terminals lacking the enhanced keyboard protocol shift+enter == enter.
+// input.go: on terminals supporting the Kitty/enhanced keyboard protocol (which v2
+// requests basic disambiguation for by default), shift+enter is a distinct key; on
+// terminals lacking it, shift+enter arrives as plain enter.
 func TestInputBoxShiftEnterNewline(t *testing.T) {
 	t.Parallel()
 
@@ -95,9 +111,30 @@ func TestInputBoxShiftEnterNewline(t *testing.T) {
 	if contains(bound, "enter") {
 		t.Errorf("InsertNewline keys = %v, must NOT include %q (Enter is submit)", bound, "enter")
 	}
-	// Feeding a shift+enter key event grows the value by a newline.
-	msg := tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("\n")}
-	_ = key.Matches(msg, b.ta.KeyMap.InsertNewline)
+
+	// A shift+enter key event must match the InsertNewline binding (and NOT plain
+	// enter). In v2, Shift+Enter is a tea.KeyPressMsg{Code: KeyEnter, Mod: ModShift}
+	// whose String() is "shift+enter".
+	shiftEnter := tea.KeyPressMsg{Code: tea.KeyEnter, Mod: tea.ModShift}
+	if !key.Matches(shiftEnter, b.ta.KeyMap.InsertNewline) {
+		t.Errorf("shift+enter (%q) does not match InsertNewline binding", shiftEnter.String())
+	}
+	plainEnter := tea.KeyPressMsg{Code: tea.KeyEnter}
+	if key.Matches(plainEnter, b.ta.KeyMap.InsertNewline) {
+		t.Errorf("plain enter (%q) matches InsertNewline binding; Enter must stay free for submit", plainEnter.String())
+	}
+
+	// Feeding the shift+enter event to the editor inserts a literal newline: a
+	// single-line value becomes two logical lines.
+	b.SetValue("ab")
+	before := b.ta.LineCount()
+	b.Update(shiftEnter)
+	if after := b.ta.LineCount(); after != before+1 {
+		t.Errorf("LineCount after shift+enter = %d, want %d (newline inserted)", after, before+1)
+	}
+	if got := b.Value(); !strings.Contains(got, "\n") {
+		t.Errorf("Value() after shift+enter = %q, want it to contain a newline", got)
+	}
 }
 
 func contains(ss []string, want string) bool {

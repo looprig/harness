@@ -77,8 +77,9 @@ func TestScrollbackFlushPrintsEachEntryOnce(t *testing.T) {
 					t.Errorf("action[%d].EntryID = %d, want %d", i, actions[i].EntryID, tt.committed[i].ID)
 				}
 			}
-			// Re-flush the same entries → nothing reprinted (print-once).
-			s, again := s.Flush(tt.committed, tt.render)
+			// Re-flush the same entries → nothing reprinted (print-once). The
+			// returned model is discarded: this is the last flush in the test.
+			_, again := s.Flush(tt.committed, tt.render)
 			if len(again) != 0 {
 				t.Fatalf("second flush actions = %d, want 0 (print-once)", len(again))
 			}
@@ -99,7 +100,8 @@ func TestScrollbackFlushGrowingTail(t *testing.T) {
 	}
 
 	// Grow the committed slice by appending two new entries; only the tail flushes.
-	s, second := s.Flush([]entry{{ID: 1}, {ID: 2}, {ID: 3}, {ID: 4}}, render)
+	// The returned model is discarded: this is the last flush in the test.
+	_, second := s.Flush([]entry{{ID: 1}, {ID: 2}, {ID: 3}, {ID: 4}}, render)
 	if len(second) != 2 {
 		t.Fatalf("growing-tail flush actions = %d, want 2", len(second))
 	}

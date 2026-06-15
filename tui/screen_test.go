@@ -7,8 +7,8 @@ import (
 	"strings"
 	"testing"
 
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
+	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
 
 	"github.com/inventivepotter/urvi/internal/agent/loop/event"
 	"github.com/inventivepotter/urvi/internal/content"
@@ -207,7 +207,7 @@ func TestWindowSizeMsg(t *testing.T) {
 	m := New(context.Background(), agent, fakeOpen(agent))
 
 	// Before any WindowSizeMsg, the view is empty (not ready).
-	if v := m.View(); v != "" {
+	if v := m.View().Content; v != "" {
 		t.Errorf("View() before ready = %q, want empty", v)
 	}
 
@@ -222,7 +222,7 @@ func TestWindowSizeMsg(t *testing.T) {
 	if !got.ready {
 		t.Error("ready = false after WindowSizeMsg, want true")
 	}
-	if v := got.View(); v == "" {
+	if v := got.View().Content; v == "" {
 		t.Error("View() after ready = empty, want non-empty")
 	}
 }
@@ -294,7 +294,7 @@ func TestViewHeightIsConstant(t *testing.T) {
 		m, _ = updateScreen(t, m, tea.WindowSizeMsg{Width: w, Height: h})
 		m.status = st
 		m.refreshHistory()
-		if got := lipgloss.Height(m.View()); got != h {
+		if got := lipgloss.Height(m.View().Content); got != h {
 			t.Errorf("status %v: View height = %d, want exactly %d", st, got, h)
 		}
 	}
@@ -315,7 +315,7 @@ func TestViewNoLineExceedsWidth(t *testing.T) {
 	)
 	m.refreshHistory()
 
-	for i, ln := range strings.Split(m.View(), "\n") {
+	for i, ln := range strings.Split(m.View().Content, "\n") {
 		if got := lipgloss.Width(ln); got > w {
 			t.Errorf("View line %d width = %d, want <= %d: %q", i, got, w, ln)
 		}
@@ -832,7 +832,7 @@ func TestQueueIndicesSurviveSegmentCommits(t *testing.T) {
 	// Now the user queues an input mid-turn (Running): its RoleUser row appends
 	// at the current tail and queue[0].DisplayIndex records that tail index.
 	m.input.SetValue("queued question")
-	m, _ = updateScreen(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+	m, _ = updateScreen(t, m, tea.KeyPressMsg{Code: tea.KeyEnter})
 
 	if len(m.queue) != 1 {
 		t.Fatalf("queue len = %d, want 1", len(m.queue))
@@ -1376,7 +1376,7 @@ func TestHandleKeyTypingForwardsToInput(t *testing.T) {
 			m := New(context.Background(), agent, fakeOpen(agent))
 			// SetValue then drive a no-op key so the default branch rebuilds the panel.
 			m.input.SetValue(tt.value)
-			m, _ = updateScreen(t, m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("")})
+			m, _ = updateScreen(t, m, tea.KeyPressMsg{})
 
 			if m.input.Value() != tt.value {
 				t.Errorf("input value = %q, want %q", m.input.Value(), tt.value)
@@ -1395,7 +1395,7 @@ func TestHandleKeyEnterPlainSubmitIdle(t *testing.T) {
 	m := New(context.Background(), agent, fakeOpen(agent))
 	m.input.SetValue("hello there")
 
-	m, cmd := updateScreen(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+	m, cmd := updateScreen(t, m, tea.KeyPressMsg{Code: tea.KeyEnter})
 
 	if cmd == nil {
 		t.Error("Enter submit cmd = nil, want non-nil (readNext)")
@@ -1426,7 +1426,7 @@ func TestHandleKeyEnterQueueWhileRunning(t *testing.T) {
 	m.messages = []DisplayMessage{{Role: RoleUser}, {Role: RoleAssistant}}
 	m.input.SetValue("queued one")
 
-	m, cmd := updateScreen(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+	m, cmd := updateScreen(t, m, tea.KeyPressMsg{Code: tea.KeyEnter})
 
 	if cmd != nil {
 		t.Errorf("queue Enter cmd = non-nil, want nil")
@@ -1456,7 +1456,7 @@ func TestHandleKeyEnterBadAttachmentKeepsInput(t *testing.T) {
 	m := New(context.Background(), agent, fakeOpen(agent))
 	m.input.SetValue("@nope.pem") // .pem is a denied extension → buildBlocks error
 
-	m, cmd := updateScreen(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+	m, cmd := updateScreen(t, m, tea.KeyPressMsg{Code: tea.KeyEnter})
 
 	if cmd != nil {
 		t.Errorf("cmd = non-nil, want nil (no turn started)")
@@ -1482,7 +1482,7 @@ func TestHandleKeyEnterEmptyIsNoop(t *testing.T) {
 	m := New(context.Background(), agent, fakeOpen(agent))
 	m.input.SetValue("   ") // whitespace only
 
-	m, cmd := updateScreen(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+	m, cmd := updateScreen(t, m, tea.KeyPressMsg{Code: tea.KeyEnter})
 
 	if cmd != nil {
 		t.Errorf("cmd = non-nil, want nil")
@@ -1502,7 +1502,7 @@ func TestHandleKeyEnterHelp(t *testing.T) {
 	m := New(context.Background(), agent, fakeOpen(agent))
 	m.input.SetValue("/help")
 
-	m, cmd := updateScreen(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+	m, cmd := updateScreen(t, m, tea.KeyPressMsg{Code: tea.KeyEnter})
 
 	if cmd != nil {
 		t.Errorf("/help cmd = non-nil, want nil")
@@ -1532,7 +1532,7 @@ func TestHandleKeyEnterClearWhileIdle(t *testing.T) {
 	m := New(context.Background(), agent, fakeOpen(agent))
 	m.input.SetValue("/clear")
 
-	m, cmd := updateScreen(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+	m, cmd := updateScreen(t, m, tea.KeyPressMsg{Code: tea.KeyEnter})
 
 	if cmd == nil {
 		t.Error("/clear cmd = nil, want non-nil (reopen)")
@@ -1554,7 +1554,7 @@ func TestHandleKeyEnterClearWhileRunningIsNoop(t *testing.T) {
 	m.reader = scriptedReader()
 	m.input.SetValue("/clear")
 
-	m, cmd := updateScreen(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+	m, cmd := updateScreen(t, m, tea.KeyPressMsg{Code: tea.KeyEnter})
 
 	if cmd != nil {
 		t.Errorf("/clear-while-running cmd = non-nil, want nil (no-op)")
@@ -1575,7 +1575,7 @@ func TestHandleKeyEnterUnknownSlashFallsToSubmit(t *testing.T) {
 	// /unknown is not a known command, so it submits as plain text.
 	m.input.SetValue("/unknown stuff")
 
-	m, cmd := updateScreen(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+	m, cmd := updateScreen(t, m, tea.KeyPressMsg{Code: tea.KeyEnter})
 
 	if cmd == nil {
 		t.Error("unknown-slash cmd = nil, want non-nil (plain submit)")
@@ -1604,7 +1604,7 @@ func TestHandleKeyEscWhileRunningClearsQueue(t *testing.T) {
 	}
 	m.queue = []queuedInput{{Blocks: []content.Block{&content.TextBlock{Text: "queued"}}, DisplayIndex: 2}}
 
-	m, cmd := updateScreen(t, m, tea.KeyMsg{Type: tea.KeyEsc})
+	m, cmd := updateScreen(t, m, tea.KeyPressMsg{Code: tea.KeyEsc})
 
 	if cmd == nil {
 		t.Error("Esc cmd = nil, want non-nil (interruptTurn)")
@@ -1634,7 +1634,7 @@ func TestHandleKeyEscWhileIdleIsNoop(t *testing.T) {
 	m := New(context.Background(), agent, fakeOpen(agent))
 	m.status = StatusIdle
 
-	m, cmd := updateScreen(t, m, tea.KeyMsg{Type: tea.KeyEsc})
+	m, cmd := updateScreen(t, m, tea.KeyPressMsg{Code: tea.KeyEsc})
 
 	if cmd != nil {
 		t.Errorf("Esc-while-idle cmd = non-nil, want nil")
@@ -1650,7 +1650,7 @@ func TestHandleKeyCtrlC(t *testing.T) {
 	agent := &fakeAgent{}
 	m := New(context.Background(), agent, fakeOpen(agent))
 
-	_, cmd := updateScreen(t, m, tea.KeyMsg{Type: tea.KeyCtrlC})
+	_, cmd := updateScreen(t, m, tea.KeyPressMsg{Code: 'c', Mod: tea.ModCtrl})
 
 	if cmd == nil {
 		t.Fatal("Ctrl+C cmd = nil, want non-nil (close + quit sequence)")
@@ -1709,7 +1709,7 @@ func TestHandleKeySlashCompleteEnter(t *testing.T) {
 				t.Fatalf("NewSlashComplete(%q) = nil", tt.selected)
 			}
 
-			m, _ = updateScreen(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+			m, _ = updateScreen(t, m, tea.KeyPressMsg{Code: tea.KeyEnter})
 
 			if m.status != tt.wantStatus {
 				t.Errorf("status = %d, want %d", m.status, tt.wantStatus)
@@ -1745,7 +1745,7 @@ func TestHandleKeyTab(t *testing.T) {
 	}
 	want := m.slashComplete.Selected().Name
 
-	m, cmd := updateScreen(t, m, tea.KeyMsg{Type: tea.KeyTab})
+	m, cmd := updateScreen(t, m, tea.KeyPressMsg{Code: tea.KeyTab})
 
 	if cmd != nil {
 		t.Errorf("Tab cmd = non-nil, want nil")
@@ -1765,7 +1765,7 @@ func TestHandleKeyTabNoPanelIsForwarded(t *testing.T) {
 	m := New(context.Background(), agent, fakeOpen(agent))
 	m.input.SetValue("hi")
 	// No slashComplete; Tab falls through to the input editor (default branch).
-	m, _ = updateScreen(t, m, tea.KeyMsg{Type: tea.KeyTab})
+	m, _ = updateScreen(t, m, tea.KeyPressMsg{Code: tea.KeyTab})
 	if m.slashComplete != nil {
 		t.Error("slashComplete should remain nil")
 	}
@@ -1776,12 +1776,12 @@ func TestHandleKeyScrollKeysRouteToHistory(t *testing.T) {
 
 	tests := []struct {
 		name string
-		key  tea.KeyMsg
+		key  tea.KeyPressMsg
 	}{
-		{name: "pgup", key: tea.KeyMsg{Type: tea.KeyPgUp}},
-		{name: "pgdown", key: tea.KeyMsg{Type: tea.KeyPgDown}},
-		{name: "ctrl+u", key: tea.KeyMsg{Type: tea.KeyCtrlU}},
-		{name: "ctrl+d", key: tea.KeyMsg{Type: tea.KeyCtrlD}},
+		{name: "pgup", key: tea.KeyPressMsg{Code: tea.KeyPgUp}},
+		{name: "pgdown", key: tea.KeyPressMsg{Code: tea.KeyPgDown}},
+		{name: "ctrl+u", key: tea.KeyPressMsg{Code: 'u', Mod: tea.ModCtrl}},
+		{name: "ctrl+d", key: tea.KeyPressMsg{Code: 'd', Mod: tea.ModCtrl}},
 	}
 
 	for _, tt := range tests {
@@ -1853,7 +1853,7 @@ func TestViewNeverExceedsHeight(t *testing.T) {
 			}
 			m.refreshHistory()
 
-			if got := lipgloss.Height(m.View()); got > m.height {
+			if got := lipgloss.Height(m.View().Content); got > m.height {
 				t.Errorf("View() height = %d, want <= %d (overflow)", got, m.height)
 			}
 		})
@@ -1899,7 +1899,7 @@ func TestHandleKeyCtrlTTogglesExpand(t *testing.T) {
 			if m.expandTools {
 				t.Fatal("expandTools = true at construction, want false")
 			}
-			m, cmd := updateScreen(t, m, tea.KeyMsg{Type: tea.KeyCtrlT})
+			m, cmd := updateScreen(t, m, tea.KeyPressMsg{Code: 't', Mod: tea.ModCtrl})
 			if cmd != nil {
 				t.Errorf("ctrl+t cmd = non-nil, want nil (re-render only)")
 			}
@@ -1910,7 +1910,7 @@ func TestHandleKeyCtrlTTogglesExpand(t *testing.T) {
 			if m.status != tt.status {
 				t.Errorf("status = %d, want unchanged %d", m.status, tt.status)
 			}
-			m, _ = updateScreen(t, m, tea.KeyMsg{Type: tea.KeyCtrlT})
+			m, _ = updateScreen(t, m, tea.KeyPressMsg{Code: 't', Mod: tea.ModCtrl})
 			if m.expandTools {
 				t.Errorf("expandTools = true after second ctrl+t, want false (toggled back)")
 			}
@@ -1944,7 +1944,7 @@ func TestHandleKeyCtrlTRerendersPreview(t *testing.T) {
 		t.Errorf("collapsed render missing more-lines marker; got %q", before)
 	}
 
-	m, _ = updateScreen(t, m, tea.KeyMsg{Type: tea.KeyCtrlT})
+	m, _ = updateScreen(t, m, tea.KeyPressMsg{Code: 't', Mod: tea.ModCtrl})
 
 	after := renderScreen(m, 80)
 	if !strings.Contains(after, "line6") || !strings.Contains(after, "line9") {
@@ -1967,7 +1967,7 @@ func TestHandleKeyUpDownMovesSelection(t *testing.T) {
 	}
 	first := m.slashComplete.Selected().Name
 
-	m, cmd := updateScreen(t, m, tea.KeyMsg{Type: tea.KeyDown})
+	m, cmd := updateScreen(t, m, tea.KeyPressMsg{Code: tea.KeyDown})
 	if cmd != nil {
 		t.Errorf("Down cmd = non-nil, want nil")
 	}
@@ -1976,7 +1976,7 @@ func TestHandleKeyUpDownMovesSelection(t *testing.T) {
 		t.Errorf("Down did not move selection from %q", first)
 	}
 
-	m, _ = updateScreen(t, m, tea.KeyMsg{Type: tea.KeyUp})
+	m, _ = updateScreen(t, m, tea.KeyPressMsg{Code: tea.KeyUp})
 	afterUp := m.slashComplete.Selected().Name
 	if afterUp != first {
 		t.Errorf("Up did not return to %q, got %q", first, afterUp)
