@@ -35,9 +35,15 @@ func renderMD(md string, width int) string {
 
 // renderMessages renders the whole transcript to a single string. It dispatches
 // on each message's DisplayRole and, within a row, on each block's concrete
-// type. Rows whose index is in queued get a trailing marker. A non-empty stream
-// is appended as a trailing in-progress assistant row.
-func renderMessages(msgs []DisplayMessage, stream string, queued map[int]bool, width int) string {
+// type. Rows whose index is in queued get a trailing marker. A non-empty live
+// segment is appended as a trailing in-progress assistant row.
+//
+// The expandTools flag controls whether tool-call previews render collapsed or
+// fully; it is threaded for later phases and currently unused — live.calls is
+// always empty in this phase, so the live segment renders exactly its text, as
+// the old trailing stream did.
+func renderMessages(msgs []DisplayMessage, live liveSegment, queued map[int]bool, expandTools bool, width int) string {
+	_ = expandTools // reserved for tool-card rendering (Phase 3/4)
 	rows := make([]string, 0, len(msgs)+1)
 	for i, m := range msgs {
 		row := renderRow(m, width)
@@ -46,8 +52,8 @@ func renderMessages(msgs []DisplayMessage, stream string, queued map[int]bool, w
 		}
 		rows = append(rows, row)
 	}
-	if stream != "" {
-		rows = append(rows, renderMD(stream, width))
+	if live.text != "" {
+		rows = append(rows, renderMD(live.text, width))
 	}
 	return strings.Join(rows, rowSep)
 }

@@ -289,8 +289,8 @@ func TestUpdateTokenDeltaAccumulates(t *testing.T) {
 	}
 	m, _ = updateScreen(t, m, eventMsg{ev: event.TokenDelta{Chunk: &content.TextChunk{Text: "cd"}}})
 
-	if m.stream != "abcd" {
-		t.Errorf("stream = %q, want %q", m.stream, "abcd")
+	if m.live.text != "abcd" {
+		t.Errorf("live.text = %q, want %q", m.live.text, "abcd")
 	}
 }
 
@@ -300,12 +300,12 @@ func TestUpdateThinkingChunkSkipped(t *testing.T) {
 	agent := &fakeAgent{}
 	m := New(context.Background(), agent, fakeOpen(agent))
 	m.reader = scriptedReader()
-	m.stream = "keep"
+	m.live.text = "keep"
 
 	m, _ = updateScreen(t, m, eventMsg{ev: event.TokenDelta{Chunk: &content.ThinkingChunk{Thinking: "x"}}})
 
-	if m.stream != "keep" {
-		t.Errorf("stream = %q, want unchanged %q", m.stream, "keep")
+	if m.live.text != "keep" {
+		t.Errorf("live.text = %q, want unchanged %q", m.live.text, "keep")
 	}
 }
 
@@ -315,7 +315,7 @@ func TestUpdateTurnDone(t *testing.T) {
 	tests := []struct {
 		name      string
 		msg       *content.AIMessage
-		stream    string
+		live      string
 		wantText  string
 		wantNil   bool
 		wantBlock bool
@@ -323,14 +323,14 @@ func TestUpdateTurnDone(t *testing.T) {
 		{
 			name:      "with message blocks",
 			msg:       &content.AIMessage{Message: content.Message{Blocks: []content.Block{&content.TextBlock{Text: "hi"}}}},
-			stream:    "partial",
+			live:      "partial",
 			wantText:  "hi",
 			wantBlock: true,
 		},
 		{
 			name:    "nil message appends empty assistant turn",
 			msg:     nil,
-			stream:  "partial",
+			live:    "partial",
 			wantNil: true,
 		},
 	}
@@ -343,14 +343,14 @@ func TestUpdateTurnDone(t *testing.T) {
 			m := New(context.Background(), agent, fakeOpen(agent))
 			m.reader = scriptedReader()
 			m.status = StatusRunning
-			m.stream = tt.stream
+			m.live.text = tt.live
 
 			m, cmd := updateScreen(t, m, eventMsg{ev: event.TurnDone{Message: tt.msg}})
 			if cmd == nil {
 				t.Error("TurnDone cmd = nil, want non-nil (readNext for trailing EOF)")
 			}
-			if m.stream != "" {
-				t.Errorf("stream = %q, want cleared", m.stream)
+			if m.live.text != "" {
+				t.Errorf("live.text = %q, want cleared", m.live.text)
 			}
 			if len(m.messages) == 0 {
 				t.Fatal("expected an assistant row")
@@ -376,14 +376,14 @@ func TestUpdateTurnFailed(t *testing.T) {
 	m := New(context.Background(), agent, fakeOpen(agent))
 	m.reader = scriptedReader()
 	m.status = StatusRunning
-	m.stream = "partial"
+	m.live.text = "partial"
 
 	m, cmd := updateScreen(t, m, eventMsg{ev: event.TurnFailed{Err: errors.New("boom")}})
 	if cmd == nil {
 		t.Error("TurnFailed cmd = nil, want non-nil")
 	}
-	if m.stream != "" {
-		t.Errorf("stream = %q, want cleared", m.stream)
+	if m.live.text != "" {
+		t.Errorf("live.text = %q, want cleared", m.live.text)
 	}
 	last := m.messages[len(m.messages)-1]
 	if last.Role != RoleError {
@@ -399,19 +399,19 @@ func TestUpdateTurnInterrupted(t *testing.T) {
 
 	tests := []struct {
 		name      string
-		stream    string
+		live      string
 		wantRoles []DisplayRole
 		wantText  string
 	}{
 		{
 			name:      "with partial flushes partial then tombstone",
-			stream:    "partial",
+			live:      "partial",
 			wantRoles: []DisplayRole{RoleAssistant, RoleInterrupted},
 			wantText:  "partial",
 		},
 		{
 			name:      "empty stream appends only tombstone",
-			stream:    "",
+			live:      "",
 			wantRoles: []DisplayRole{RoleInterrupted},
 		},
 	}
@@ -424,14 +424,14 @@ func TestUpdateTurnInterrupted(t *testing.T) {
 			m := New(context.Background(), agent, fakeOpen(agent))
 			m.reader = scriptedReader()
 			m.status = StatusInterrupting
-			m.stream = tt.stream
+			m.live.text = tt.live
 
 			m, cmd := updateScreen(t, m, eventMsg{ev: event.TurnInterrupted{}})
 			if cmd == nil {
 				t.Error("TurnInterrupted cmd = nil, want non-nil")
 			}
-			if m.stream != "" {
-				t.Errorf("stream = %q, want cleared", m.stream)
+			if m.live.text != "" {
+				t.Errorf("live.text = %q, want cleared", m.live.text)
 			}
 			if len(m.messages) != len(tt.wantRoles) {
 				t.Fatalf("messages len = %d, want %d", len(m.messages), len(tt.wantRoles))
@@ -660,7 +660,7 @@ func TestUpdateReopenResult(t *testing.T) {
 		m := New(context.Background(), old, fakeOpen(old))
 		m.status = StatusResetting
 		m.messages = []DisplayMessage{{Role: RoleUser}}
-		m.stream = "x"
+		m.live.text = "x"
 		m.queue = []queuedInput{{DisplayIndex: 0}}
 
 		m, cmd := updateScreen(t, m, reopenResultMsg{agent: fresh})
@@ -670,8 +670,8 @@ func TestUpdateReopenResult(t *testing.T) {
 		if len(m.messages) != 0 {
 			t.Errorf("messages len = %d, want 0", len(m.messages))
 		}
-		if m.stream != "" {
-			t.Errorf("stream = %q, want cleared", m.stream)
+		if m.live.text != "" {
+			t.Errorf("live.text = %q, want cleared", m.live.text)
 		}
 		if len(m.queue) != 0 {
 			t.Errorf("queue len = %d, want 0", len(m.queue))

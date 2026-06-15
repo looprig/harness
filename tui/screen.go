@@ -17,8 +17,17 @@ import (
 // occupy below the history viewport.
 const reservedLines = 4
 
+// liveSegment is the in-progress assistant segment for the current turn: the
+// streamed narration text plus the tool calls reconstructed from the event
+// stream. It is committed to a DisplayMessage when the segment ends. calls stays
+// empty until the event-reconstruction state machine populates it (later phase).
+type liveSegment struct {
+	text  string
+	calls []ToolCallView
+}
+
 // Screen is the Elm model for the chat TUI. It owns all display state — the
-// transcript, the live token accumulator, the turn status, the input queue, and
+// transcript, the live segment accumulator, the turn status, the input queue, and
 // the active stream reader — and drives a single Agent. There is no separate
 // goroutine: streaming and interrupts are tea.Cmds whose results return as msgs.
 type Screen struct {
@@ -27,7 +36,7 @@ type Screen struct {
 	appCtx    context.Context // long-lived; cancelled on quit
 
 	messages []DisplayMessage               // display history
-	stream   string                         // live token accumulator (current turn)
+	live     liveSegment                    // in-progress segment (current turn)
 	status   Status                         // Idle | Running | Interrupting | Resetting
 	queue    []queuedInput                  // inputs submitted while Running, FIFO
 	reader   *llm.StreamReader[event.Event] // active turn's stream; nil when idle
@@ -35,6 +44,7 @@ type Screen struct {
 	history       components.ChatHistory
 	input         components.InputBox
 	slashComplete *components.SlashComplete // nil = hidden
+	expandTools   bool                      // Ctrl+T toggle; false = collapsed tool previews
 	width, height int
 	ready         bool
 }
@@ -104,7 +114,7 @@ func (m *Screen) handleEvent(ev event.Event) tea.Cmd {
 		// Already Running; nothing to display.
 	case event.TokenDelta:
 		if tc, ok := ev.Chunk.(*content.TextChunk); ok {
-			m.stream += tc.Text
+			m.live.text += tc.Text
 			m.refreshHistory()
 		}
 		// Any other chunk variant (e.g. *content.ThinkingChunk) is skipped.
@@ -114,21 +124,21 @@ func (m *Screen) handleEvent(ev event.Event) tea.Cmd {
 			blocks = ev.Message.Blocks
 		}
 		m.messages = append(m.messages, DisplayMessage{Role: RoleAssistant, Blocks: blocks})
-		m.stream = ""
+		m.live = liveSegment{}
 		m.refreshHistory()
 	case event.TurnFailed:
 		m.appendError(ev.Err)
-		m.stream = ""
+		m.live = liveSegment{}
 		m.refreshHistory()
 	case event.TurnInterrupted:
-		if m.stream != "" {
+		if m.live.text != "" || len(m.live.calls) > 0 {
 			m.messages = append(m.messages, DisplayMessage{
 				Role:   RoleAssistant,
-				Blocks: []content.Block{&content.TextBlock{Text: m.stream}},
+				Blocks: []content.Block{&content.TextBlock{Text: m.live.text}},
 			})
 		}
 		m.messages = append(m.messages, DisplayMessage{Role: RoleInterrupted, Blocks: nil})
-		m.stream = ""
+		m.live = liveSegment{}
 		m.refreshHistory()
 	}
 	return readNext(m.reader)
@@ -186,7 +196,7 @@ func (m *Screen) handleReopenResult(msg reopenResultMsg) tea.Cmd {
 	old := m.agent
 	m.agent = msg.agent
 	m.messages = nil
-	m.stream = ""
+	m.live = liveSegment{}
 	m.queue = nil
 	m.history.Clear()
 	m.status = StatusIdle
@@ -436,13 +446,14 @@ func (m *Screen) appendError(err error) {
 }
 
 // refreshHistory re-renders the transcript from current state and feeds it to the
-// history viewport. Call it after any change to messages, stream, queue, or width.
+// history viewport. Call it after any change to messages, the live segment, queue,
+// or width.
 func (m *Screen) refreshHistory() {
 	queued := make(map[int]bool, len(m.queue))
 	for _, q := range m.queue {
 		queued[q.DisplayIndex] = true
 	}
-	rendered := renderMessages(m.messages, m.stream, queued, m.contentWidth())
+	rendered := renderMessages(m.messages, m.live, queued, m.expandTools, m.contentWidth())
 	m.history.SetContent(rendered)
 }
 

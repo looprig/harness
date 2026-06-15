@@ -47,7 +47,7 @@ func TestRenderMessages(t *testing.T) {
 	tests := []struct {
 		name   string
 		msgs   []DisplayMessage
-		stream string
+		live   liveSegment
 		queued map[int]bool
 		want   []string // substrings that must all appear in the output
 	}{
@@ -117,18 +117,18 @@ func TestRenderMessages(t *testing.T) {
 			want:   []string{"do this later", "(queued)"},
 		},
 		{
-			name:   "live stream only",
-			msgs:   nil,
-			stream: "partial answer",
-			want:   []string{"partial answer"},
+			name: "live stream only",
+			msgs: nil,
+			live: liveSegment{text: "partial answer"},
+			want: []string{"partial answer"},
 		},
 		{
 			name: "stream appended after messages",
 			msgs: []DisplayMessage{
 				{Role: RoleUser, Blocks: []content.Block{&content.TextBlock{Text: "question"}}},
 			},
-			stream: "streaming reply",
-			want:   []string{"question", "streaming reply"},
+			live: liveSegment{text: "streaming reply"},
+			want: []string{"question", "streaming reply"},
 		},
 	}
 
@@ -136,7 +136,7 @@ func TestRenderMessages(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			got := renderMessages(tt.msgs, tt.stream, tt.queued, 80)
+			got := renderMessages(tt.msgs, tt.live, tt.queued, false, 80)
 			for _, w := range tt.want {
 				if !strings.Contains(got, w) {
 					t.Errorf("renderMessages() = %q, want to contain %q", got, w)
@@ -150,8 +150,8 @@ func TestRenderMessages(t *testing.T) {
 func TestRenderMessagesNoStream(t *testing.T) {
 	t.Parallel()
 
-	got := renderMessages(nil, "", nil, 80)
+	got := renderMessages(nil, liveSegment{}, nil, false, 80)
 	if strings.TrimSpace(got) != "" {
-		t.Errorf("renderMessages(nil, \"\", ...) = %q, want empty", got)
+		t.Errorf("renderMessages(nil, liveSegment{}, ...) = %q, want empty", got)
 	}
 }
