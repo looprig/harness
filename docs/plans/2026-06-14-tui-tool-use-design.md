@@ -17,6 +17,12 @@ Date: 2026-06-14 · Status: approved (brainstorm)
 > obligations the TUI depends on (`ResultPreview` cap/redaction; all `ToolCallStarted`
 > before any `ToolCallCompleted`) are now in **tools-design §5e** + the impl plan, not
 > only implied here.
+>
+> **Revision 2026-06-14 (review pass 3)** — pre-execution tool failures (unknown tool,
+> invalid args, permission denied, `WriteTarget` error) no longer vanish from the
+> transcript: the runner now guarantees a `ToolCallStarted`+`ToolCallCompleted` pair for
+> **every requested call** (tools-design §2d amended), so a failed call renders as a `✗`
+> card with its error *and* reaches the model as a retry-able tool-result.
 
 ## Scope
 
@@ -55,6 +61,12 @@ in-flight TUI (`docs/plans/2026-06-13-tui-design.md`, now implemented in `tui/`)
   IsError, …}` (tools design §5b).
 - So the TUI **reconstructs** the nesting from the ordered stream, correlating tool
   start↔completion by **`CallID`**. It never needs the provider `ToolUseBlock.ID`.
+- The runner **guarantees a `Started`+`Completed` pair for *every requested call***,
+  including ones that fail *before* execution — unknown tool, invalid args, permission
+  denied, `WriteTarget` error (tools design §2d). Those arrive as
+  `Completed{IsError:true, ResultPreview: the error}`, so a failed call renders as a
+  `✗` card with its error — it **never silently vanishes** from the transcript even
+  though it also reached the model as a retry-able tool-result error.
 
 ---
 
@@ -215,6 +227,10 @@ the event doesn't carry.
   `ToolCallStarted` finds `live.calls` all-terminal → commits the prior segment first,
   so each batch becomes its own (possibly bare-`●`) segment (§2). Without the runner's
   emit-all-starts-up-front guarantee this would race; with it, it's deterministic.
+- **Pre-execution failure** (unknown tool / invalid args / permission denied /
+  `WriteTarget` error) — the runner still emits `Started` + `Completed{IsError}` (tools
+  design §2d), so the card renders `✗` with the error preview; it does not vanish even
+  though it never executed.
 - **Interrupt mid-tool** — committed segment shows the running card as `ToolCancelled`;
   tombstone follows.
 - **Empty / truncated result** — `(no output)` / `… N more lines (Ctrl+T)` / the
@@ -242,6 +258,9 @@ the event doesn't carry.
   text appears once, not twice). And the fallback: an empty `live` + a non-nil
   `TurnDone.Message` → one segment from `Message.Blocks`; empty `live` + nil `Message` →
   no final segment.
+- **failure cards** — a `ToolCallStarted` followed by `ToolCallCompleted{IsError:true,
+  ResultPreview:"error: …"}` (no execution) renders a `✗` card with the error; the card
+  is present (not dropped) for unknown-tool / invalid-args / denied / WriteTarget-error.
 - **Ctrl+T** — toggles `expandTools` (collapsed first-K ⇄ all preview lines); works in
   any status.
 - **redaction** (in the tools impl) — a fake `EventSink` receives `ToolCallCompleted`

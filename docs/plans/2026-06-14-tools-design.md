@@ -134,6 +134,13 @@ Date: 2026-06-14 · Status: approved (brainstorm)
 > for the TUI's collapsed result preview; it is **stream-only**, dropped on the sink
 > path (output may hold secrets/PII). Driven by
 > `docs/plans/2026-06-14-tui-tool-use-design.md` (see §2d, §5b here).
+>
+> **Amendment 2026-06-14 (every-call observability)** — the runner now emits a
+> `ToolCallStarted`+`ToolCallCompleted` pair for **every requested tool call after
+> `CallID` assignment**, including pre-execution failures (unknown tool, invalid args,
+> permission denied, `WriteTarget` error) which get `Completed{IsError:true}` + a
+> tool-result error. So every failure is both model-visible (retry-able) and
+> TUI-visible (a card) — none silently vanish (§2d, §2b, §5e).
 
 ## Scope
 
@@ -364,16 +371,17 @@ fragment), and `runTurn` concatenates fragments per `Index` before
 `json.RawMessage(accumulated)` becomes the `ToolUseBlock.Input`.
 
 **Validate before appending — never poison history.** After folding the fragments,
-`runTurn` validates each assembled `ToolUseBlock` *before* appending the assistant
-message: `ID` and `Name` non-empty, and `json.Valid(Input)`. A malformed call (the
-provider truncated/garbled the argument fragments) must not produce an assistant
-message whose `ToolUseBlock.Input` is invalid JSON, because the **next** provider
-request would then re-encode unencodable history. On an invalid call the runner:
-(1) **sanitizes the stored `Input` to `{}`** so the message stays encodable; (2) does
-**not** execute that call; (3) appends a `ToolMessage` tool-result error for it
-(`"error: malformed tool call (invalid JSON arguments)"`) so the model can correct
-and retry on the next loop iteration. If the *entire* response is unparseable (no
-recoverable calls), the turn ends in a controlled `TurnFailed`
+`runTurn` checks each assembled call (`ID`/`Name` non-empty, `json.Valid(Input)`). A
+malformed call (the provider truncated/garbled the argument fragments) must not make
+the stored assistant message un-encodable, so **in the assistant message it appends to
+history, `runTurn` sanitizes an invalid `Input` to `{}`** (the next provider request
+re-encodes cleanly). The call itself (with its raw folded arguments) is still handed
+to `RunBatch`, which detects the invalid JSON and reports it the **same way as every
+other pre-execution failure** (§2d): a `ToolCallStarted` + `ToolCallCompleted{IsError,
+ResultPreview:"error: invalid tool arguments (not valid JSON)"}` pair and a tool-result
+error the model can retry from — so a malformed call is both model-visible *and*
+TUI-visible, not special-cased. If the *entire* response is unparseable (no
+recoverable calls at all), the turn ends in a controlled `TurnFailed`
 (`event.EmptyResponseError`-style) rather than a poisoned, half-encoded history.
 
 ### §2c. Permission / AskUser reply plumbing (actor-model remap)
@@ -532,29 +540,43 @@ keeps draining.
   outermost). Cross-cutting concerns (OTel spans, rate limiting, audit, caching,
   per-tool timeout) live here, not in the runner body.
 - `defer/recover` turns a panic into `"error: tool panicked: <detail>"`.
-- **All tool failures become tool-result strings** (invalid args, permission
-  denied, execution error, panic, unknown tool) — a tool *error* never aborts the
-  turn; the model sees it and can react. The turn *completes normally* (`TurnDone`)
+- **All tool failures become tool-result strings** (invalid/unparseable args,
+  permission denied, execution error, panic, unknown tool, `WriteTarget` error) — a
+  tool *error* never aborts the turn; the model sees the error **as that call's
+  tool-result and can retry** (e.g. re-issue the call with corrected arguments). The
+  turn *completes normally* (`TurnDone`)
   when the model emits no more tool calls (§2a). The
   things that *abort* a turn (no `TurnDone`; whole-turn rollback to `base`, §2a) are
   `ctx` cancellation / `Interrupt` (`TurnInterrupted`) and the runaway guard
   (`TurnFailed{ToolLimitError}`) — a tool-limit failure is **not** a normal
   tool-result path.
 
-**Observability events** (auto-approved tools execute silently otherwise):
-`event.ToolCallStarted{CallID, ToolName, Summary string}` before run,
-`event.ToolCallCompleted{CallID, IsError, ResultPreview string}` after — the runner
-fills `ResultPreview` from `flattenToText(result.Content)` **capped** (~2 KiB / 20
-lines, truncation marked), for the TUI's collapsed result preview
-(`docs/plans/2026-06-14-tui-tool-use-design.md`); it is **stream-only**, dropped on the
-sink path (see the redaction table) since tool output may hold secrets/PII. **The
-runner emits all `ToolCallStarted` for the approved batch *before* executing any call**
-(so within a batch every start precedes every completion) — this lets the TUI group a
-batch into one assistant segment race-free, and shows all pending cards at once. **`Summary` is a redacted, capped
-safe string — never raw `ArgsJSON`** (which can hold write-file contents, `Fetch`
-auth headers/cookies, a `Bash` command with an inline token, or PII; CLAUDE.md: *log
-security events, not secrets*). Tools supply it via an optional
-`tool.Auditable interface { AuditSummary(argsJSON string) string }`; a tool with no
+**Observability events — one `Started` + one `Completed` per *requested* call,
+whatever its fate.** The runner assigns a `CallID` to every tool call the model
+requested, resolves tools + permissions (gates may prompt), then emits
+`event.ToolCallStarted{CallID, ToolName, Summary}` for **every requested call**, then
+processes each and emits exactly one `event.ToolCallCompleted{CallID, IsError,
+ResultPreview}`. A call that fails **before execution** — unknown tool, invalid/
+unparseable args, permission denied, `WriteTarget` error — still gets
+`Completed{IsError:true, ResultPreview: the error string}` *and* contributes that
+error string as its model-visible tool-result; an executed call gets
+`Completed{IsError from result, ResultPreview}`. So **every requested call is both
+model-visible (a tool-result it can react to / retry) and transcript-visible (a
+card)** — a denied/invalid/unknown call **never silently vanishes** from the TUI
+timeline, which reconstructs cards solely from these events.
+
+The runner fills `ResultPreview` from `flattenToText(result.Content)` (or the error
+string) **capped** (~2 KiB / 20 lines, truncation marked), for the TUI's collapsed
+result preview (`docs/plans/2026-06-14-tui-tool-use-design.md`); it is **stream-only**,
+dropped on the sink path (see the redaction table) since tool output may hold
+secrets/PII. **All `ToolCallStarted` for a batch are emitted before any
+`ToolCallCompleted`** (so within a batch every start precedes every completion) — this
+lets the TUI group a batch into one assistant segment race-free and shows all pending
+cards at once. **`Summary` is a redacted, capped safe string — never raw `ArgsJSON`**
+(which can hold write-file contents, `Fetch` auth headers/cookies, a `Bash` command
+with an inline token, or PII; CLAUDE.md: *log security events, not secrets*). Tools
+supply it via an optional `tool.Auditable interface { AuditSummary(argsJSON string)
+string }` (it must tolerate invalid JSON — yield just the tool name); a tool with no
 `AuditSummary` yields just its name. Per-tool redaction: `WriteFile` →
 `"WriteFile <path> (<n> bytes)"` (no content); `Fetch` → `"<METHOD> <host>"` (no
 headers/body); `ReadFile`/`Grep`/`Glob` → path/pattern only. Both events carry
@@ -1130,6 +1152,13 @@ The pixel-level work is a follow-up TUI-update doc, since that TUI is mid-flight
   configured lines/bytes, with a truncation marker when the result exceeds it) and is
   **dropped on the sink path** (a fake `EventSink` receives no `ResultPreview`; the
   stream keeps it).
+- `runner` failure visibility — **every requested call emits exactly one
+  `ToolCallStarted` + one `ToolCallCompleted{IsError:true}` AND one tool-result error**,
+  for each of: **unknown tool**, **invalid/unparseable args**, **permission denied**,
+  and **`WriteTarget` error** (table-driven). Assert the failing call appears in the
+  captured event stream (a card the TUI can render) *and* its error reaches `msgs` as a
+  tool-result the model can retry from — i.e. a pre-execution failure never produces a
+  tool-result without its event pair, or vice versa.
 - `runTurn` — `ToolUseChunk` fragment-accumulation by `Index`, tool round-trips,
   tool-result flattened to text in the `ToolMessage` (non-empty on the wire;
   non-text → visible placeholder), no-tool-call exit emits `TurnDone`; fake `llm.LLM`.
