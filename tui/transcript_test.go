@@ -5,7 +5,22 @@ import (
 
 	"github.com/inventivepotter/urvi/internal/agent/loop/event"
 	"github.com/inventivepotter/urvi/internal/content"
+	"github.com/inventivepotter/urvi/internal/uuid"
 )
+
+// callID is defined in screen_test.go (same package): it builds a deterministic,
+// non-zero uuid.UUID from a single byte so tests can correlate
+// ToolCallStarted/ToolCallCompleted without crypto/rand.
+
+// toolStarted builds a real event.ToolCallStarted for the given call.
+func toolStarted(id uuid.UUID, name, summary string) event.Event {
+	return event.ToolCallStarted{CallID: id, ToolName: name, Summary: summary}
+}
+
+// toolCompleted builds a real event.ToolCallCompleted for the given call.
+func toolCompleted(id uuid.UUID, isErr bool, preview string) event.Event {
+	return event.ToolCallCompleted{CallID: id, IsError: isErr, ResultPreview: preview}
+}
 
 // textChunk builds a real *content.TextChunk TokenDelta event carrying t.
 func textChunk(s string) event.Event {
@@ -125,6 +140,70 @@ func TestTranscriptApplyEvent(t *testing.T) {
 			},
 		},
 		{
+			name: "TurnDone with an unresolved running call commits it (not dropped) preserving status, and resets live",
+			events: []event.Event{
+				event.TurnStarted{},
+				toolStarted(callID(1), "Bash", "sleep 9"),
+				event.TurnDone{},
+			},
+			want: func(t *testing.T, m transcriptModel) {
+				// The leftover running call must be flushed, not silently dropped.
+				if len(m.committed) != 1 {
+					t.Fatalf("committed = %d, want 1 (leftover call flushed, not dropped)", len(m.committed))
+				}
+				e := m.committed[0]
+				if e.Kind != kindTool {
+					t.Fatalf("committed[0].Kind = %v, want kindTool", e.Kind)
+				}
+				if e.ID == 0 {
+					t.Errorf("entry ID = 0, want nonzero stable ID")
+				}
+				if len(e.Calls) != 1 {
+					t.Fatalf("entry Calls = %d, want 1", len(e.Calls))
+				}
+				c := e.Calls[0]
+				if c.CallID != callID(1) {
+					t.Errorf("CallID = %v, want %v", c.CallID, callID(1))
+				}
+				// TurnDone is a normal completion: status preserved (NOT forced cancelled).
+				if c.Status != ToolRunning {
+					t.Errorf("Status = %v, want ToolRunning (TurnDone preserves status, does not cancel)", c.Status)
+				}
+				// live fully reset.
+				if !m.live.empty() || m.live.active {
+					t.Errorf("live not reset after TurnDone: %+v", m.live)
+				}
+				if len(m.live.Calls) != 0 {
+					t.Errorf("live.Calls = %d, want 0 after TurnDone", len(m.live.Calls))
+				}
+			},
+		},
+		{
+			name: "TurnDone after a completed call commits exactly one kindTool entry (no double-commit)",
+			events: []event.Event{
+				event.TurnStarted{},
+				toolStarted(callID(1), "Bash", "ls"),
+				toolCompleted(callID(1), false, "out"),
+				event.TurnDone{},
+			},
+			want: func(t *testing.T, m transcriptModel) {
+				// commit-once: completed call already committed and removed from live;
+				// TurnDone's flush must NOT re-commit it.
+				if len(m.committed) != 1 {
+					t.Fatalf("committed = %d, want exactly 1 (commit-once, no duplication)", len(m.committed))
+				}
+				if m.committed[0].Kind != kindTool {
+					t.Errorf("committed[0].Kind = %v, want kindTool", m.committed[0].Kind)
+				}
+				if m.committed[0].Calls[0].Status != ToolOK {
+					t.Errorf("Status = %v, want ToolOK", m.committed[0].Calls[0].Status)
+				}
+				if !m.live.empty() {
+					t.Errorf("live not reset after TurnDone: %+v", m.live)
+				}
+			},
+		},
+		{
 			name: "two turns produce distinct stable IDs",
 			events: []event.Event{
 				event.TurnStarted{},
@@ -213,3 +292,308 @@ func TestTranscriptLiveActive(t *testing.T) {
 		})
 	}
 }
+
+// TestTranscriptToolCalls covers the tool-call state machine: a started call adds
+// a running card to live.Calls; a completed call resolves into exactly ONE
+// committed kindTool entry at terminal state and leaves live.Calls without it.
+func TestTranscriptToolCalls(t *testing.T) {
+	tests := []struct {
+		name   string
+		events []event.Event
+		want   func(t *testing.T, m transcriptModel)
+	}{
+		{
+			name: "ToolCallStarted adds a running card to live.Calls",
+			events: []event.Event{
+				event.TurnStarted{},
+				toolStarted(callID(1), "Bash", "ls -la"),
+			},
+			want: func(t *testing.T, m transcriptModel) {
+				if len(m.live.Calls) != 1 {
+					t.Fatalf("live.Calls = %d, want 1", len(m.live.Calls))
+				}
+				c := m.live.Calls[0]
+				if c.CallID != callID(1) {
+					t.Errorf("CallID = %v, want %v", c.CallID, callID(1))
+				}
+				if c.ToolName != "Bash" {
+					t.Errorf("ToolName = %q, want %q", c.ToolName, "Bash")
+				}
+				if c.Summary != "ls -la" {
+					t.Errorf("Summary = %q, want %q", c.Summary, "ls -la")
+				}
+				if c.Status != ToolRunning {
+					t.Errorf("Status = %v, want ToolRunning", c.Status)
+				}
+				if len(m.committed) != 0 {
+					t.Errorf("committed = %d, want 0 (no terminal yet)", len(m.committed))
+				}
+			},
+		},
+		{
+			name: "ToolCallCompleted (ok) commits one kindTool entry and removes it from live",
+			events: []event.Event{
+				event.TurnStarted{},
+				toolStarted(callID(1), "Bash", "ls"),
+				toolCompleted(callID(1), false, "file1\nfile2"),
+			},
+			want: func(t *testing.T, m transcriptModel) {
+				if len(m.live.Calls) != 0 {
+					t.Fatalf("live.Calls = %d, want 0 (commit-once removes it)", len(m.live.Calls))
+				}
+				if len(m.committed) != 1 {
+					t.Fatalf("committed = %d, want exactly 1", len(m.committed))
+				}
+				e := m.committed[0]
+				if e.Kind != kindTool {
+					t.Errorf("Kind = %v, want kindTool", e.Kind)
+				}
+				if e.ID == 0 {
+					t.Errorf("entry ID = 0, want nonzero stable ID")
+				}
+				if len(e.Calls) != 1 {
+					t.Fatalf("entry Calls = %d, want 1", len(e.Calls))
+				}
+				c := e.Calls[0]
+				if c.Status != ToolOK {
+					t.Errorf("Status = %v, want ToolOK", c.Status)
+				}
+				if len(c.Result) != 2 || c.Result[0] != "file1" || c.Result[1] != "file2" {
+					t.Errorf("Result = %#v, want [file1 file2]", c.Result)
+				}
+			},
+		},
+		{
+			name: "ToolCallCompleted (error) commits one kindTool entry in ToolError",
+			events: []event.Event{
+				event.TurnStarted{},
+				toolStarted(callID(2), "Fetch", "GET /x"),
+				toolCompleted(callID(2), true, "boom"),
+			},
+			want: func(t *testing.T, m transcriptModel) {
+				if len(m.live.Calls) != 0 {
+					t.Fatalf("live.Calls = %d, want 0", len(m.live.Calls))
+				}
+				if len(m.committed) != 1 {
+					t.Fatalf("committed = %d, want 1", len(m.committed))
+				}
+				c := m.committed[0].Calls[0]
+				if c.Status != ToolError {
+					t.Errorf("Status = %v, want ToolError", c.Status)
+				}
+				if len(c.Result) != 1 || c.Result[0] != "boom" {
+					t.Errorf("Result = %#v, want [boom]", c.Result)
+				}
+			},
+		},
+		{
+			name: "two tool calls commit two distinct kindTool entries with distinct IDs",
+			events: []event.Event{
+				event.TurnStarted{},
+				toolStarted(callID(1), "Bash", "a"),
+				toolCompleted(callID(1), false, "out1"),
+				toolStarted(callID(2), "Bash", "b"),
+				toolCompleted(callID(2), false, "out2"),
+			},
+			want: func(t *testing.T, m transcriptModel) {
+				if len(m.committed) != 2 {
+					t.Fatalf("committed = %d, want 2", len(m.committed))
+				}
+				if m.committed[0].Kind != kindTool || m.committed[1].Kind != kindTool {
+					t.Errorf("kinds = %v,%v, want kindTool both", m.committed[0].Kind, m.committed[1].Kind)
+				}
+				if m.committed[0].ID == m.committed[1].ID {
+					t.Errorf("tool entry IDs not distinct: both %d", m.committed[0].ID)
+				}
+				if len(m.live.Calls) != 0 {
+					t.Errorf("live.Calls = %d, want 0", len(m.live.Calls))
+				}
+			},
+		},
+		{
+			name: "unknown completed CallID is a no-op (no commit, no panic)",
+			events: []event.Event{
+				event.TurnStarted{},
+				toolCompleted(callID(9), false, "orphan"),
+			},
+			want: func(t *testing.T, m transcriptModel) {
+				if len(m.committed) != 0 {
+					t.Errorf("committed = %d, want 0 (unknown CallID is a no-op)", len(m.committed))
+				}
+				if len(m.live.Calls) != 0 {
+					t.Errorf("live.Calls = %d, want 0", len(m.live.Calls))
+				}
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			var m transcriptModel
+			for _, ev := range tt.events {
+				m = m.ApplyEvent(ev)
+			}
+			tt.want(t, m)
+		})
+	}
+}
+
+// TestTranscriptOrdering locks the append-only scrollback ordering rule: prose
+// streamed BEFORE a tool call is committed as its own assistant entry ahead of the
+// tool card, and prose streamed AFTER lands in a later assistant entry — yielding
+// the natural reading order prose1 → tool card → prose2.
+func TestTranscriptOrdering(t *testing.T) {
+	t.Parallel()
+	var m transcriptModel
+	for _, ev := range []event.Event{
+		event.TurnStarted{},
+		textChunk("before tool"),
+		toolStarted(callID(1), "Bash", "run"),
+		toolCompleted(callID(1), false, "done"),
+		textChunk("after tool"),
+		event.TurnDone{},
+	} {
+		m = m.ApplyEvent(ev)
+	}
+	if len(m.committed) != 3 {
+		t.Fatalf("committed = %d, want 3 (prose1, tool, prose2)", len(m.committed))
+	}
+	// [0] assistant prose committed BEFORE the tool card.
+	if m.committed[0].Kind != kindAssistant {
+		t.Fatalf("committed[0].Kind = %v, want kindAssistant", m.committed[0].Kind)
+	}
+	if got := blockText(m.committed[0].Blocks[0]); got != "before tool" {
+		t.Errorf("committed[0] text = %q, want %q", got, "before tool")
+	}
+	// [1] the tool card, AFTER prose1.
+	if m.committed[1].Kind != kindTool {
+		t.Errorf("committed[1].Kind = %v, want kindTool", m.committed[1].Kind)
+	}
+	// [2] the trailing prose, AFTER the tool card.
+	if m.committed[2].Kind != kindAssistant {
+		t.Fatalf("committed[2].Kind = %v, want kindAssistant", m.committed[2].Kind)
+	}
+	if got := blockText(m.committed[2].Blocks[0]); got != "after tool" {
+		t.Errorf("committed[2] text = %q, want %q", got, "after tool")
+	}
+	// IDs strictly increasing in commit order.
+	if !(m.committed[0].ID < m.committed[1].ID && m.committed[1].ID < m.committed[2].ID) {
+		t.Errorf("IDs not strictly increasing: %d,%d,%d", m.committed[0].ID, m.committed[1].ID, m.committed[2].ID)
+	}
+}
+
+// TestTranscriptTerminals covers the TurnInterrupted and TurnFailed terminals:
+// remaining live prose/thinking is committed, any still-running call is cancelled
+// and committed, the appropriate tombstone/error entry is appended, and live is
+// reset.
+func TestTranscriptTerminals(t *testing.T) {
+	tests := []struct {
+		name   string
+		events []event.Event
+		want   func(t *testing.T, m transcriptModel)
+	}{
+		{
+			name: "TurnInterrupted commits prose, cancels running call, appends tombstone, resets live",
+			events: []event.Event{
+				event.TurnStarted{},
+				textChunk("partial answer"),
+				toolStarted(callID(1), "Bash", "sleep"),
+				event.TurnInterrupted{},
+			},
+			want: func(t *testing.T, m transcriptModel) {
+				// prose committed, cancelled tool committed, interrupted tombstone.
+				if len(m.committed) != 3 {
+					t.Fatalf("committed = %d, want 3 (prose, cancelled tool, tombstone)", len(m.committed))
+				}
+				if m.committed[0].Kind != kindAssistant {
+					t.Errorf("committed[0].Kind = %v, want kindAssistant", m.committed[0].Kind)
+				}
+				if m.committed[1].Kind != kindTool {
+					t.Errorf("committed[1].Kind = %v, want kindTool", m.committed[1].Kind)
+				}
+				if got := m.committed[1].Calls[0].Status; got != ToolCancelled {
+					t.Errorf("running call status = %v, want ToolCancelled", got)
+				}
+				if m.committed[2].Kind != kindInterrupted {
+					t.Errorf("committed[2].Kind = %v, want kindInterrupted", m.committed[2].Kind)
+				}
+				if !m.live.empty() || m.live.active {
+					t.Errorf("live not reset after interrupt: %+v", m.live)
+				}
+			},
+		},
+		{
+			name: "TurnInterrupted with no live content appends only the tombstone",
+			events: []event.Event{
+				event.TurnStarted{},
+				event.TurnInterrupted{},
+			},
+			want: func(t *testing.T, m transcriptModel) {
+				if len(m.committed) != 1 {
+					t.Fatalf("committed = %d, want 1 (tombstone only)", len(m.committed))
+				}
+				if m.committed[0].Kind != kindInterrupted {
+					t.Errorf("Kind = %v, want kindInterrupted", m.committed[0].Kind)
+				}
+			},
+		},
+		{
+			name: "TurnFailed commits prose then appends error entry carrying the message",
+			events: []event.Event{
+				event.TurnStarted{},
+				textChunk("partial"),
+				event.TurnFailed{Err: errBoom{}},
+			},
+			want: func(t *testing.T, m transcriptModel) {
+				if len(m.committed) != 2 {
+					t.Fatalf("committed = %d, want 2 (prose, error)", len(m.committed))
+				}
+				if m.committed[0].Kind != kindAssistant {
+					t.Errorf("committed[0].Kind = %v, want kindAssistant", m.committed[0].Kind)
+				}
+				if m.committed[1].Kind != kindError {
+					t.Fatalf("committed[1].Kind = %v, want kindError", m.committed[1].Kind)
+				}
+				if got := blockText(m.committed[1].Blocks[0]); got != "boom" {
+					t.Errorf("error text = %q, want %q", got, "boom")
+				}
+				if !m.live.empty() || m.live.active {
+					t.Errorf("live not reset after failure: %+v", m.live)
+				}
+			},
+		},
+		{
+			name: "TurnFailed with nil Err still appends an error entry and resets live",
+			events: []event.Event{
+				event.TurnStarted{},
+				event.TurnFailed{Err: nil},
+			},
+			want: func(t *testing.T, m transcriptModel) {
+				if len(m.committed) != 1 {
+					t.Fatalf("committed = %d, want 1 (error only)", len(m.committed))
+				}
+				if m.committed[0].Kind != kindError {
+					t.Errorf("Kind = %v, want kindError", m.committed[0].Kind)
+				}
+				if !m.live.empty() {
+					t.Errorf("live not reset after failure: %+v", m.live)
+				}
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			var m transcriptModel
+			for _, ev := range tt.events {
+				m = m.ApplyEvent(ev)
+			}
+			tt.want(t, m)
+		})
+	}
+}
+
+// errBoom is a typed test error whose message is "boom".
+type errBoom struct{}
+
+func (errBoom) Error() string { return "boom" }
