@@ -72,6 +72,8 @@ srv := &http.Server{
 
 **Shell commands** — Never pass user input to `exec.Command` as a shell string. Always pass args as separate parameters.
 
+> **Documented exception — the `Bash` tool (`tools/bash.go`).** `Bash` runs a single command via `sh -c <command>` — a deliberate violation of the rule above, because a coding agent genuinely needs shell features (pipes, globs, `&&`, redirects) an argv list can't express. The security boundary is the **permission gate**, not the argv shape: `Bash` defaults to **Ask**, so a human reads and approves each command before it runs. `DeniedBashPrefixes` is **advisory** defense-in-depth only (trivially bypassable — `/usr/bin/sudo`, `env sudo`, …) and must never be relied on as a boundary. The real hard boundary — OS-level sandboxing (seccomp/landlock/nsjail) — is **out of scope** and is the prerequisite for ever auto-approving `Bash` broadly; until then `Bash` must stay human-gated. The exec call carries a `// #nosec G204` with this rationale.
+
 **File paths** — Always call `filepath.Clean` and verify the result stays within the expected root before opening files from user-supplied paths.
 
 ## Build & Testing Requirements
