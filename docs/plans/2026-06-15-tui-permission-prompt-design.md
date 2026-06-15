@@ -85,6 +85,7 @@ type prompt struct {
     // promptUserInput (built from event.UserInputRequested):
     Question string
     Choices  []string
+    selected int    // highlighted choice index (cursor); ↑/↓ move it, Enter picks it
     freeText bool   // set at ENQUEUE when len(Choices)==0: the input box captures the answer
 }
 ```
@@ -159,8 +160,8 @@ happen (the runner mints a fresh `CallID` per call).
 
 A prompt is **modal**: while `len(m.pending) > 0`, the **head** (`m.pending[0]`) renders as
 a box occupying the input region (between the transcript viewport and the status line),
-and the normal input box is hidden/disabled — except the `promptUserInput` "other…"
-free-text sub-state, which re-enables the input box for typing (§4). This keeps the
+and the normal input box is hidden/disabled — except a `promptUserInput` **free-text** prompt
+(no choices), where the input box IS the prompt's entry field (§4). This keeps the
 transcript (and its in-progress tool cards from `tui-tool-use-design.md`) visible above
 while the decision is pending. Use the existing width-aware render helpers; styling via a
 new `styles.PromptStyle` (bordered/emphasised, distinct from the faint tool cards).
@@ -196,14 +197,18 @@ new `styles.PromptStyle` (bordered/emphasised, distinct from the faint tool card
 └────────────────────────────────────────────────────┘
 ```
 
-- **With choices**: a numbered key list (`[1]`…`[9]`) plus `[o] other`. Selecting `[o]`
-  sends the literal `"other"` (the contract escape hatch — §1); there is no custom-text
-  capture in the choices case.
+- **With choices**: a vertical, **cursor-navigable** list (the highlighted row is
+  `prompt.selected`) plus `[o] other`. `↑`/`↓` move the highlight and `Enter` picks it, so
+  **any number of choices is reachable** — `AskUser` imposes no length limit
+  (`tools/askuser.go`), so a `[1]`–`[9]`-only scheme would strand a 10th choice. `[1]`…`[9]`
+  remain as **accelerators** for the first nine rows. Selecting `[o]` sends the literal
+  `"other"` (the contract escape hatch — §1); no custom-text capture in the choices case.
+  If the list exceeds the prompt's height budget (§3a), the rendered window **scrolls with
+  the cursor** (a viewport over the choices only — not a transcript cursor, §9), so every
+  choice stays reachable.
 - **No choices (`freeText == true`)**: render the question above the (re-enabled) input box;
   the user types the answer and `Enter` submits it. No choice list, no `[o]`. This is the
   only path that sends typed free text, and the tool accepts it (no-choices → any answer).
-- Only ≤9 choices get number keys; if a tool ever supplies >9 choices, the impl plan should
-  decide (paginate or letter-key) — `AskUser` callers today supply small lists.
 
 `renderMessages`/the screen's `View` composition: when `len(pending) > 0`, render
 `renderPrompt(m.pending[0], width)` in place of the idle input box. The status line
@@ -282,7 +287,10 @@ if len(m.pending) > 0 && key != "ctrl+c" && key != "ctrl+t" {
 - a key not offered by this prompt's `Scopes` → ignored (no-op, re-render).
 
 **`promptUserInput` — with choices (`!freeText`):**
-- `1`…`9` → if the index is within `Choices`: `provideAnswerCmd(headCallID, Choices[i])`, pop.
+- `↑`/`↓` → move `prompt.selected` (clamp to `[0, len(Choices))`), re-render; no dispatch.
+- `enter` → `provideAnswerCmd(headCallID, Choices[selected])`, pop.
+- `1`…`9` → accelerator: if the index is within `Choices`, `provideAnswerCmd(headCallID,
+  Choices[i])`, pop. (Rows 10+ are reached via `↑`/`↓`+`enter`.)
 - `o` → `provideAnswerCmd(headCallID, "other")` — the literal contract escape hatch (§1).
   **No free-text capture here** (an unlisted typed string would fail the tool's
   `validateAnswer` and surface as a tool-result error).
@@ -387,9 +395,14 @@ The producing events already exist, so — like the tool-card work — this is u
 (no live loop), plus a **fake `tui.Agent`** recording the trio calls.
 
 - **Enqueue:** a synthetic `PermissionRequested` enqueues a `promptPermission` with the
-  right `ToolName`/`Description`/`Scopes` (built via a fake `tool.PermissionRequest` whose
-  `AllowedScopes()` varies — all-three vs once-only); `UserInputRequested` → `promptUserInput`
-  with the choices. Two `UserInputRequested` (distinct `CallID`) → two pending, head first.
+  right `ToolName`/`Description`/`Scopes`. **`tool.PermissionRequest` is a SEALED interface
+  (unexported `permissionRequest()` marker) — a `tui` fake CANNOT implement it.** Use the
+  concrete exported requests: `tool.BashRequest{Command: …}` (its `AllowedScopes()` is all
+  three: Once/Session/Workspace) for the all-scopes box, and `tool.UnknownRequest{Tool: …,
+  Summary: …}` (`AllowedScopes()` is `ScopeOnce` only) for the once-only box — construct the
+  event as `event.PermissionRequested{CallID: …, Request: tool.BashRequest{…}}`.
+  `UserInputRequested` → `promptUserInput` with the choices. Two `UserInputRequested`
+  (distinct `CallID`) → two pending, head first.
 - **Key dispatch (permission):** `y`/`s`/`w` → `agent.Approve(headCallID, ScopeOnce/Session/
   Workspace)`; a scope key NOT in `Scopes` is a no-op; `n`/`esc` → `agent.Deny(headCallID)`;
   the head pops after each.
@@ -401,9 +414,17 @@ The producing events already exist, so — like the tool-card work — this is u
   `esc` → interrupt.
 - **Contract conformance (the §2-finding regression):** assert that for a with-choices
   prompt the TUI only ever sends a listed choice or the literal `"other"` — never arbitrary
-  typed text — so the answer always passes `tools/askuser.go validateAnswer`. (A test that
-  feeds the sent answer through the real `validateAnswer` with the prompt's choices and
-  asserts it returns "" is the tightest guard.)
+  typed text. `validateAnswer` is **unexported** in package `tools`, so the `tui` test
+  asserts the PUBLIC invariant directly (the answer the fake `Agent` received is a member of
+  `Choices` or equals `"other"`); it does NOT call `validateAnswer` cross-package. The
+  end-to-end "AskUser actually accepts this" guard lives in a `tools` test (same package, so
+  `validateAnswer`/`InvokableRun` are reachable): drive `AskUser.InvokableRun` via its
+  `requestUserInput` seam returning a TUI-style answer (a listed choice, then `"other"`) and
+  assert a non-error tool-result.
+- **>9 choices reachable (the §4-finding regression):** a `UserInputRequested` with 12
+  choices → `↑`/`↓`+`enter` selects the 10th–12th (which have no number key); `[1]`…`[9]`
+  still accelerate the first nine; `selected` clamps at both ends; the rendered window
+  scrolls so a highlighted row past the height budget stays visible.
 - **Height budgeting (§3a):** with a prompt active, `historyHeight()` shrinks by the
   prompt's measured height (not the input's 3 lines); `resizeHistory` runs on enqueue / pop
   / terminal-clear; a prompt taller than the cap is truncated and `historyHeight()` never
@@ -430,8 +451,10 @@ box. This is the integration the tool-card doc could not exercise without this w
 
 ## §9 — Out of scope (this iteration)
 
-- **Per-prompt cursor / scrolling within a prompt**, mouse selection (keyboard-only, head-of-
-  queue is the focus — matches the `Ctrl+T`-global-toggle stance of the tool-card doc).
+- **A transcript / per-card cursor** (selecting past tool cards or scrollback messages to
+  act on them) and **mouse selection**. The AskUser *choice list* IS cursor-navigable
+  (§3/§4), but that highlight + its viewport live INSIDE the active prompt box only; there
+  is no cursor over the scrollback transcript. Only the head-of-queue prompt is interactive.
 - **A "remember for all tools" / batch-approve** affordance (each call is approved
   individually; that is the security posture — a human reads each `Description`).
 - **Editing/replaying** a denied call from the transcript (deny is terminal for that call;
