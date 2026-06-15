@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -150,7 +151,7 @@ func (td *Todo) InvokableRun(_ context.Context, argsJSON string) (*tool.ToolResu
 	case "":
 		return tool.TextResult("error: 'action' is required (one of: create, update, list)"), nil
 	default:
-		return tool.TextResult("error: unknown action " + quote(string(args.Action)) + " (want create, update, or list)"), nil
+		return tool.TextResult("error: unknown action " + strconv.Quote(string(args.Action)) + " (want create, update, or list)"), nil
 	}
 }
 
@@ -165,7 +166,7 @@ func (td *Todo) create(args todoArgs) (*tool.ToolResult, error) {
 		status = statusPending
 	}
 	if !validStatus(status) {
-		return tool.TextResult("error: invalid status " + quote(string(args.Status)) + " (want pending, in_progress, or done)"), nil
+		return tool.TextResult("error: invalid status " + strconv.Quote(string(args.Status)) + " (want pending, in_progress, or done)"), nil
 	}
 
 	u, err := uuid.New()
@@ -191,14 +192,14 @@ func (td *Todo) update(args todoArgs) (*tool.ToolResult, error) {
 		return tool.TextResult("error: 'id' is required for action=update"), nil
 	}
 	if args.Status != "" && !validStatus(args.Status) {
-		return tool.TextResult("error: invalid status " + quote(string(args.Status)) + " (want pending, in_progress, or done)"), nil
+		return tool.TextResult("error: invalid status " + strconv.Quote(string(args.Status)) + " (want pending, in_progress, or done)"), nil
 	}
 
 	td.mu.Lock()
 	defer td.mu.Unlock()
 	item, ok := td.items[id]
 	if !ok {
-		return tool.TextResult("error: no todo with id " + quote(id)), nil
+		return tool.TextResult("error: no todo with id " + strconv.Quote(id)), nil
 	}
 	if args.Title != "" {
 		item.Title = args.Title
@@ -242,10 +243,6 @@ func (td *Todo) list() (*tool.ToolResult, error) {
 	}
 	return tool.TextResult(sb.String()), nil
 }
-
-// quote wraps s in double quotes for an error message without pulling in fmt's
-// %q (which would also escape — fine, but quote keeps messages terse/predictable).
-func quote(s string) string { return "\"" + s + "\"" }
 
 // compile-time assertions: Todo is an InvokableTool and Auditable. It is
 // deliberately NOT a PermissionPrompter (AutoApprove) and NOT a WriteTarget.

@@ -111,9 +111,9 @@ func (a *AskUser) AuditSummary(argsJSON string) string {
 // the tool-result text. Every failure is a tool-result error STRING; it never
 // returns a Go error.
 func (a *AskUser) InvokableRun(ctx context.Context, argsJSON string) (*tool.ToolResult, error) {
-	args, err := parseAskUserArgs(argsJSON)
-	if err != nil {
-		return tool.TextResult("error: " + err.Error()), nil
+	args, errText := parseAskUserArgs(argsJSON)
+	if errText != "" {
+		return tool.TextResult(errText), nil
 	}
 
 	answer, err := a.requestUserInput(ctx, args.Question, args.Choices)
@@ -123,56 +123,46 @@ func (a *AskUser) InvokableRun(ctx context.Context, argsJSON string) (*tool.Tool
 		return tool.TextResult("error: could not get user input: " + err.Error()), nil
 	}
 
-	if err := validateAnswer(answer, args.Choices); err != nil {
-		return tool.TextResult("error: " + err.Error()), nil
+	if errText := validateAnswer(answer, args.Choices); errText != "" {
+		return tool.TextResult(errText), nil
 	}
 	return tool.TextResult(answer), nil
 }
 
-// parseAskUserArgs decodes + validates the args. A non-object document or an
-// empty question is a typed *askUserError.
-func parseAskUserArgs(argsJSON string) (askUserArgs, error) {
+// parseAskUserArgs decodes + validates the args. On a non-object document or an
+// empty question it returns a non-empty tool-result error string (the package
+// norm: see readfile.go/glob.go/todo.go, which build arg-validation failures
+// inline rather than via a typed error); otherwise the returned string is empty.
+func parseAskUserArgs(argsJSON string) (askUserArgs, string) {
 	var args askUserArgs
 	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
-		return askUserArgs{}, &askUserError{reason: "invalid arguments: not a JSON object", cause: err}
+		return askUserArgs{}, "error: invalid arguments: not a JSON object"
 	}
 	if strings.TrimSpace(args.Question) == "" {
-		return askUserArgs{}, &askUserError{reason: "a non-empty 'question' is required"}
+		return askUserArgs{}, "error: a non-empty 'question' is required"
 	}
-	return args, nil
+	return args, ""
 }
 
 // validateAnswer enforces the choice contract: when choices is non-empty the
 // answer must be EXACTLY one of the choices (case-sensitive) or the literal
 // "other" escape hatch; when choices is empty any free-text answer (including the
-// empty string) is accepted. An invalid answer is a typed *askUserError listing
-// the allowed values.
-func validateAnswer(answer string, choices []string) error {
+// empty string) is accepted. An invalid answer yields a non-empty tool-result
+// error string listing the allowed values; a valid answer yields the empty string.
+func validateAnswer(answer string, choices []string) string {
 	if len(choices) == 0 {
-		return nil // free-text mode: anything is accepted.
+		return "" // free-text mode: anything is accepted.
 	}
 	if answer == otherChoice {
-		return nil // escape hatch.
+		return "" // escape hatch.
 	}
 	for _, c := range choices {
 		if answer == c {
-			return nil
+			return ""
 		}
 	}
-	return &askUserError{reason: "answer must be one of: " + strings.Join(choices, ", ") + ", or \"" + otherChoice + "\""}
+	return "error: answer must be one of: " + strings.Join(choices, ", ") + ", or \"" + otherChoice + "\""
 }
-
-// askUserError is the typed failure for AskUser arg parsing/validation and answer
-// validation. It carries a non-secret reason; InvokableRun maps every failure to
-// a tool-result string.
-type askUserError struct {
-	reason string
-	cause  error
-}
-
-func (e *askUserError) Error() string { return e.reason }
-
-func (e *askUserError) Unwrap() error { return e.cause }
 
 // compile-time assertions: AskUser is an InvokableTool and Auditable. It is
 // deliberately NOT a PermissionPrompter (AutoApprove) and NOT a WriteTarget.
