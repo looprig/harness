@@ -5,8 +5,11 @@ package personalassistant
 
 import (
 	"context"
+	"crypto/tls"
+	"net/http"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/inventivepotter/urvi/internal/agent/loop"
 	"github.com/inventivepotter/urvi/internal/agent/loop/event"
@@ -14,6 +17,9 @@ import (
 	"github.com/inventivepotter/urvi/internal/content"
 	"github.com/inventivepotter/urvi/internal/llm"
 	"github.com/inventivepotter/urvi/internal/llm/auto"
+	"github.com/inventivepotter/urvi/internal/tool"
+	"github.com/inventivepotter/urvi/internal/uuid"
+	"github.com/inventivepotter/urvi/tools"
 )
 
 // model is the named model this assistant runs on. Swapping models is a one-line
@@ -82,13 +88,78 @@ func newWithClient(ctx context.Context, client llm.LLM, spec llm.ModelSpec) (*As
 	if err := ctx.Err(); err != nil {
 		return nil, &session.SessionError{Kind: session.SessionContextDone, Cause: err}
 	}
+	// The workspace root is the process working directory: file tools are confined
+	// to it and the PermissionChecker uses it for containment + path relativisation.
+	root, err := os.Getwd()
+	if err != nil {
+		return nil, &WorkspaceRootError{Cause: err}
+	}
+	toolSet, err := buildToolSet(root)
+	if err != nil {
+		return nil, err
+	}
 	rootCtx, cancel := context.WithCancel(context.Background())
-	sess, err := session.NewAgent(rootCtx, loop.Config{Client: client, Model: spec})
+	sess, err := session.NewAgent(rootCtx, loop.Config{Client: client, Model: spec, Tools: toolSet})
 	if err != nil {
 		cancel()
 		return nil, err
 	}
 	return &Assistant{session: sess, cancel: cancel, acceptsImages: spec.AcceptsImages}, nil
+}
+
+// autoApprovedTools is the personal assistant's hard-approve set: intrinsically
+// safe, side-effect-free tools that run within the workspace without prompting.
+// Fetch and WebSearch are deliberately ABSENT — they reach the network, so they
+// stay Ask (the user approves each call). The names match each tool's
+// Info().Name exactly; the PermissionChecker matches on them.
+var autoApprovedTools = []string{"ReadFile", "Glob", "Grep", "Todo", "AskUser"}
+
+// buildToolSet assembles the personal assistant's safe seven-tool subset and the
+// fail-secure PermissionChecker that gates them (design §4d). Each tool is wired
+// with only the dependencies it needs (least privilege): the read tools get the
+// workspace root plus the checker as their ReadGuard; the web tools get an HTTP
+// client with explicit timeouts and a TLS 1.2 floor; AskUser/Todo are self-
+// contained. The subset is read/search/fetch/ask/todo only — no write, exec, or
+// subagent tool is registered, so the assistant can never mutate the filesystem
+// or run a shell.
+func buildToolSet(root string) (loop.ToolSet, error) {
+	policy := tools.PermissionPolicy{
+		WorkspaceRoot: root,
+		HardDeny:      tools.DefaultHardDeny(),
+		HardApprove:   tools.HardApproveRules{Tools: autoApprovedTools},
+	}
+	pc := tools.NewPermissionChecker(policy)
+	client := newHTTPClient()
+
+	registry := []tool.InvokableTool{
+		tools.NewReadFile(root, pc),
+		tools.NewGlob(root, pc),
+		tools.NewGrep(root, pc),
+		tools.NewFetch(client),
+		tools.NewWebSearch(tools.NewDuckDuckGoProvider(client)),
+		tools.NewAskUser(),
+		tools.NewTodo(),
+	}
+	// Middlewares nil and the runaway-guard caps zero on purpose: loop.New applies
+	// its safe defaults for the caps; the manifest declares no middleware in v1.
+	return loop.ToolSet{Permission: pc, Registry: registry}, nil
+}
+
+// httpClientTimeout bounds every web request the Fetch/WebSearch tools make, so
+// a hung endpoint can never block a tool call indefinitely (CLAUDE.md: no
+// unbounded blocking).
+const httpClientTimeout = 30 * time.Second
+
+// newHTTPClient builds the single *http.Client shared by Fetch and the
+// DuckDuckGo provider. It sets an explicit overall timeout and pins the TLS floor
+// to 1.2 (never InsecureSkipVerify), per CLAUDE.md's TLS rules.
+func newHTTPClient() *http.Client {
+	return &http.Client{
+		Timeout: httpClientTimeout,
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12},
+		},
+	}
 }
 
 // Send delivers one user message and blocks until the turn reaches a terminal
@@ -134,6 +205,24 @@ func (a *Assistant) Interrupt(ctx context.Context) (bool, error) {
 
 // AcceptsImages reports whether the underlying model accepts image blocks.
 func (a *Assistant) AcceptsImages() bool { return a.acceptsImages }
+
+// Approve resolves a pending tool-call permission gate, granting it at scope. It
+// delegates verbatim to the session; the wrapper holds no gate state of its own.
+func (a *Assistant) Approve(ctx context.Context, callID uuid.UUID, scope tool.ApprovalScope) error {
+	return a.session.Approve(ctx, callID, scope)
+}
+
+// Deny resolves a pending tool-call permission gate by failing it closed
+// (fail-secure); nothing is persisted. It delegates to the session.
+func (a *Assistant) Deny(ctx context.Context, callID uuid.UUID) error {
+	return a.session.Deny(ctx, callID)
+}
+
+// ProvideAnswer supplies the user's reply to a pending AskUser request. It is the
+// TUI-facing name for the session's ProvideUserInput, to which it delegates.
+func (a *Assistant) ProvideAnswer(ctx context.Context, callID uuid.UUID, answer string) error {
+	return a.session.ProvideUserInput(ctx, callID, answer)
+}
 
 // Close gracefully shuts the session down and releases the session's root
 // context. It blocks until the actor exits (or ctx is done), then cancels the
