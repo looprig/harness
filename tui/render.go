@@ -11,12 +11,6 @@ import (
 	"github.com/inventivepotter/urvi/tui/styles"
 )
 
-// rowSep separates transcript rows in the rendered output.
-const rowSep = "\n\n"
-
-// queuedMarker is appended to a user row that is still queued for sending.
-const queuedMarker = " (queued)"
-
 // previewLineCap (K) is how many result-preview lines a collapsed tool card shows
 // before the "… N more lines · ctrl+t" marker. Expanding (ctrl+t) shows all of the
 // runner-capped preview, so this is purely a display fold, not a content cap.
@@ -203,63 +197,6 @@ func indentWrap(s, indent string, width int) string {
 		rows[i] = styles.ToolResultStyle.Render(indent + strings.TrimRight(rows[i], " "))
 	}
 	return strings.Join(rows, "\n")
-}
-
-// liveSegment is the legacy in-progress assistant segment used only by the
-// DisplayMessage-based renderMessages/renderRow path (and its tests). The live
-// scrollback-first path uses transcript.go's liveSeg + entryrender.go instead; this
-// type and renderMessages survive as the shared exercise of the render primitives
-// (renderUser/renderAssistant/renderToolCalls) and a potential future --fullscreen
-// transcript renderer. Screen no longer references either.
-type liveSegment struct {
-	text     string
-	thinking string
-	calls    []ToolCallView
-}
-
-// renderMessages renders the whole transcript to a single string. It dispatches
-// on each message's DisplayRole and, within a row, on each block's concrete
-// type. Rows whose index is in queued get a trailing marker. A non-empty live
-// segment is appended as a trailing in-progress assistant row carrying its
-// streamed text and its (possibly still-running) tool cards.
-//
-// expand is the single ctrl+t flag: it controls whether an assistant row's thinking
-// block renders as a compact summary (collapsed) or its full body (expanded) AND
-// whether its tool-call previews render folded or fully. It is threaded to every
-// assistant row and to the live block so one toggle drives thinking and tools alike.
-func renderMessages(msgs []DisplayMessage, live liveSegment, queued map[int]bool, expand bool, width int) string {
-	rows := make([]string, 0, len(msgs)+1)
-	for i, m := range msgs {
-		row := renderRow(m, expand, width)
-		if queued[i] {
-			row += queuedMarker
-		}
-		rows = append(rows, row)
-	}
-	if live.text != "" || live.thinking != "" || len(live.calls) > 0 {
-		rows = append(rows, renderAssistant(live.thinking, live.text, live.calls, expand, width))
-	}
-	return strings.Join(rows, rowSep)
-}
-
-// renderRow renders a single transcript message according to its role. The
-// RoleAssistant case nests the row's thinking block and tool-call cards beneath its
-// narration text; the single expand flag is forwarded to both.
-func renderRow(m DisplayMessage, expand bool, width int) string {
-	switch m.Role {
-	case RoleUser:
-		return renderUser(renderInlineBlocks(m.Blocks), width)
-	case RoleAssistant:
-		return renderAssistant(thinkingText(m.Blocks), assistantText(m.Blocks), m.ToolCalls, expand, width)
-	case RoleSystem:
-		return styles.SystemStyle.Render(firstText(m.Blocks))
-	case RoleError:
-		return styles.ErrorStyle.Render(firstText(m.Blocks))
-	case RoleInterrupted:
-		return styles.InterruptedStyle.Render(interruptedTombstone)
-	default:
-		return ""
-	}
 }
 
 // renderAssistant renders an assistant segment in order: its reasoning (thinking)

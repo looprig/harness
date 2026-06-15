@@ -79,7 +79,7 @@ type entry struct {
 // the event stream. It is committed to an entry when the turn ends. Calls stays
 // empty until the event-reconstruction state machine populates it (a later task).
 // active marks that a turn is in progress. It is the transcriptModel's own segment
-// type, distinct from screen.go's legacy liveSegment until Task 13 unifies them.
+// type — the single in-progress segment the scrollback-first path renders.
 type liveSeg struct {
 	Thinking string
 	Text     string

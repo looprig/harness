@@ -5,7 +5,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/inventivepotter/urvi/internal/content"
 	"github.com/inventivepotter/urvi/tui/styles"
 )
 
@@ -69,111 +68,6 @@ func TestRenderMDAlignsWithDot(t *testing.T) {
 	}
 	if !strings.Contains(first, "Hello there friend") {
 		t.Errorf("first line = %q, want the narration on the same line as the dot", first)
-	}
-}
-
-func TestRenderMessages(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		name   string
-		msgs   []DisplayMessage
-		live   liveSegment
-		queued map[int]bool
-		want   []string // substrings that must all appear in the output
-	}{
-		{
-			name: "user text",
-			msgs: []DisplayMessage{
-				{Role: RoleUser, Blocks: []content.Block{&content.TextBlock{Text: "hello from user"}}},
-			},
-			want: []string{"hello from user"},
-		},
-		{
-			name: "user image placeholder",
-			msgs: []DisplayMessage{
-				{Role: RoleUser, Blocks: []content.Block{
-					&content.ImageBlock{
-						MediaType: content.MediaTypeImagePNG,
-						Source:    content.ImageSource{Data: make([]byte, 12)},
-					},
-				}},
-			},
-			want: []string{"[image: image/png, 12 bytes]"},
-		},
-		{
-			name: "assistant markdown",
-			msgs: []DisplayMessage{
-				{Role: RoleAssistant, Blocks: []content.Block{&content.TextBlock{Text: "assistant reply text"}}},
-			},
-			want: []string{"assistant reply text"},
-		},
-		{
-			name: "assistant concatenates text blocks",
-			msgs: []DisplayMessage{
-				{Role: RoleAssistant, Blocks: []content.Block{
-					&content.TextBlock{Text: "alpha"},
-					&content.TextBlock{Text: "beta"},
-				}},
-			},
-			want: []string{"alpha", "beta"},
-		},
-		{
-			name: "system",
-			msgs: []DisplayMessage{
-				{Role: RoleSystem, Blocks: []content.Block{&content.TextBlock{Text: "system notice"}}},
-			},
-			want: []string{"system notice"},
-		},
-		{
-			name: "error",
-			msgs: []DisplayMessage{
-				{Role: RoleError, Blocks: []content.Block{&content.TextBlock{Text: "boom failure"}}},
-			},
-			want: []string{"boom failure"},
-		},
-		{
-			name: "interrupted nil blocks",
-			msgs: []DisplayMessage{
-				{Role: RoleInterrupted, Blocks: nil},
-			},
-			want: []string{"interrupted"},
-		},
-		{
-			name: "queued marker",
-			msgs: []DisplayMessage{
-				{Role: RoleUser, Blocks: []content.Block{&content.TextBlock{Text: "do this later"}}},
-			},
-			queued: map[int]bool{0: true},
-			want:   []string{"do this later", "(queued)"},
-		},
-		{
-			name: "live stream only",
-			msgs: nil,
-			live: liveSegment{text: "partial answer"},
-			want: []string{"partial answer"},
-		},
-		{
-			name: "stream appended after messages",
-			msgs: []DisplayMessage{
-				{Role: RoleUser, Blocks: []content.Block{&content.TextBlock{Text: "question"}}},
-			},
-			live: liveSegment{text: "streaming reply"},
-			want: []string{"question", "streaming reply"},
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-
-			got := stripANSI(renderMessages(tt.msgs, tt.live, tt.queued, false, 80))
-			for _, w := range tt.want {
-				if !strings.Contains(got, w) {
-					t.Errorf("renderMessages() = %q, want to contain %q", got, w)
-				}
-			}
-		})
 	}
 }
 
@@ -370,46 +264,37 @@ func TestRenderToolCallsWidthWrap(t *testing.T) {
 	}
 }
 
-// TestRenderRowAssistantNestsCards covers Task 3.3: an assistant row renders its
-// markdown text followed by its tool-call cards indented beneath; a row with empty
-// text but cards renders a bare dot bullet plus its cards (no empty markdown block).
-func TestRenderRowAssistantNestsCards(t *testing.T) {
+// TestRenderAssistantNestsCards covers an assistant segment rendering its markdown
+// text followed by its tool-call cards indented beneath; a segment with empty text
+// but cards renders a bare dot bullet plus its cards (no empty markdown block); and
+// a text-only segment carries no card connector. This exercises the live
+// renderAssistant primitive that the kindAssistant entry render (entryrender.go) drives.
+func TestRenderAssistantNestsCards(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		name   string
-		row    DisplayMessage
-		want   []string
-		absent []string
+		name     string
+		thinking string
+		text     string
+		calls    []ToolCallView
+		want     []string
+		absent   []string
 	}{
 		{
-			name: "text plus cards",
-			row: DisplayMessage{
-				Role:   RoleAssistant,
-				Blocks: []content.Block{&content.TextBlock{Text: "let me read the config"}},
-				ToolCalls: []ToolCallView{
-					{ToolName: "ReadFile", Summary: "config.yaml", Status: ToolOK, Result: []string{"port: 8080"}},
-				},
-			},
-			want: []string{"let me read the config", "ReadFile", "config.yaml", glyphOK, "port: 8080"},
+			name:  "text plus cards",
+			text:  "let me read the config",
+			calls: []ToolCallView{{ToolName: "ReadFile", Summary: "config.yaml", Status: ToolOK, Result: []string{"port: 8080"}}},
+			want:  []string{"let me read the config", "ReadFile", "config.yaml", glyphOK, "port: 8080"},
 		},
 		{
-			name: "empty text with cards renders bare bullet plus cards",
-			row: DisplayMessage{
-				Role:   RoleAssistant,
-				Blocks: nil, // bare segment whose only content is its tool cards
-				ToolCalls: []ToolCallView{
-					{ToolName: "Bash", Summary: "ls", Status: ToolOK, Result: []string{"a.go"}},
-				},
-			},
-			want: []string{strings.TrimSpace(styles.Dot), "Bash", "ls", glyphOK, "a.go"},
+			name:  "empty text with cards renders bare bullet plus cards",
+			text:  "", // bare segment whose only content is its tool cards
+			calls: []ToolCallView{{ToolName: "Bash", Summary: "ls", Status: ToolOK, Result: []string{"a.go"}}},
+			want:  []string{strings.TrimSpace(styles.Dot), "Bash", "ls", glyphOK, "a.go"},
 		},
 		{
-			name: "text without cards renders no card connector",
-			row: DisplayMessage{
-				Role:   RoleAssistant,
-				Blocks: []content.Block{&content.TextBlock{Text: "just text"}},
-			},
+			name:   "text without cards renders no card connector",
+			text:   "just text",
 			want:   []string{"just text"},
 			absent: []string{cardConnector},
 		},
@@ -419,89 +304,51 @@ func TestRenderRowAssistantNestsCards(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			got := stripANSI(renderRow(tt.row, false, 80))
+			got := stripANSI(renderAssistant(tt.thinking, tt.text, tt.calls, false, 80))
 			for _, w := range tt.want {
 				if !strings.Contains(got, w) {
-					t.Errorf("renderRow() = %q, want to contain %q", got, w)
+					t.Errorf("renderAssistant() = %q, want to contain %q", got, w)
 				}
 			}
 			for _, a := range tt.absent {
 				if strings.Contains(got, a) {
-					t.Errorf("renderRow() = %q, want to NOT contain %q", got, a)
+					t.Errorf("renderAssistant() = %q, want to NOT contain %q", got, a)
 				}
 			}
 		})
 	}
 }
 
-// TestRenderMessagesLiveCards covers Task 3.3: the live segment renders its text
-// then its tool cards as the trailing in-progress block; a running card shows the
-// running glyph.
-func TestRenderMessagesLiveCards(t *testing.T) {
+// TestRenderAssistantLiveCards covers the in-progress segment rendering its text
+// then its tool cards (a running card shows the running glyph), and a card-only
+// segment with empty text rendering the bare dot bullet plus its cards. This is the
+// same renderAssistant the live tail (screen.go's renderLiveTail) drives.
+func TestRenderAssistantLiveCards(t *testing.T) {
 	t.Parallel()
 
-	t.Run("live text plus running card", func(t *testing.T) {
+	t.Run("text plus running card", func(t *testing.T) {
 		t.Parallel()
 
-		live := liveSegment{
-			text:  "checking now",
-			calls: []ToolCallView{{ToolName: "Bash", Summary: "ls", Status: ToolRunning}},
-		}
-		got := stripANSI(renderMessages(nil, live, nil, false, 80))
+		calls := []ToolCallView{{ToolName: "Bash", Summary: "ls", Status: ToolRunning}}
+		got := stripANSI(renderAssistant("", "checking now", calls, false, 80))
 		for _, w := range []string{"checking now", "Bash", "ls", glyphRunning} {
 			if !strings.Contains(got, w) {
-				t.Errorf("renderMessages() = %q, want to contain %q", got, w)
+				t.Errorf("renderAssistant() = %q, want to contain %q", got, w)
 			}
 		}
 	})
 
-	t.Run("live cards with empty text render bare bullet", func(t *testing.T) {
+	t.Run("cards with empty text render bare bullet", func(t *testing.T) {
 		t.Parallel()
 
-		live := liveSegment{calls: []ToolCallView{{ToolName: "Bash", Status: ToolRunning}}}
-		got := stripANSI(renderMessages(nil, live, nil, false, 80))
+		calls := []ToolCallView{{ToolName: "Bash", Status: ToolRunning}}
+		got := stripANSI(renderAssistant("", "", calls, false, 80))
 		for _, w := range []string{strings.TrimSpace(styles.Dot), "Bash", glyphRunning} {
 			if !strings.Contains(got, w) {
-				t.Errorf("renderMessages() = %q, want to contain %q", got, w)
+				t.Errorf("renderAssistant() = %q, want to contain %q", got, w)
 			}
 		}
 	})
-}
-
-// TestRenderMessagesFullTranscriptNesting covers Task 3.3: a text→tool→text
-// transcript renders each segment's cards beneath the segment that triggered them.
-func TestRenderMessagesFullTranscriptNesting(t *testing.T) {
-	t.Parallel()
-
-	msgs := []DisplayMessage{
-		{Role: RoleUser, Blocks: []content.Block{&content.TextBlock{Text: "fix the port"}}},
-		{
-			Role:   RoleAssistant,
-			Blocks: []content.Block{&content.TextBlock{Text: "reading config"}},
-			ToolCalls: []ToolCallView{
-				{ToolName: "ReadFile", Summary: "config.yaml", Status: ToolOK, Result: []string{"port: 8080"}},
-			},
-		},
-		{
-			Role:   RoleAssistant,
-			Blocks: []content.Block{&content.TextBlock{Text: "now fixing"}},
-			ToolCalls: []ToolCallView{
-				{ToolName: "EditFile", Summary: "config.yaml", Status: ToolOK, Result: []string{"port: 9090"}},
-			},
-		},
-	}
-	got := stripANSI(renderMessages(msgs, liveSegment{}, nil, false, 80))
-
-	// Every segment's text and its own card appear, in transcript order.
-	for _, w := range []string{"fix the port", "reading config", "ReadFile", "port: 8080", "now fixing", "EditFile", "port: 9090"} {
-		if !strings.Contains(got, w) {
-			t.Errorf("transcript missing %q in %q", w, got)
-		}
-	}
-	// The first card precedes the second segment's narration (chronological nesting).
-	if i, j := strings.Index(got, "ReadFile"), strings.Index(got, "now fixing"); i < 0 || j < 0 || i > j {
-		t.Errorf("expected ReadFile card before 'now fixing' narration; got idx %d vs %d", i, j)
-	}
 }
 
 // TestRenderThinking covers the dim reasoning block under the unified ctrl+t flag.
@@ -614,68 +461,21 @@ func TestRenderAssistantUnifiedExpand(t *testing.T) {
 	}
 }
 
-// TestRenderUserAccentBar covers Task: a user row renders as left accent-bar lines
-// (the "▌" marker) carrying the text, replacing the old bold-only style.
-func TestRenderUserAccentBar(t *testing.T) {
-	t.Parallel()
-
-	row := DisplayMessage{Role: RoleUser, Blocks: []content.Block{&content.TextBlock{Text: "fix the port"}}}
-	got := stripANSI(renderRow(row, false, 80))
-
-	if !strings.Contains(got, "▌") {
-		t.Errorf("renderRow(user) = %q, want to contain the accent bar %q", got, "▌")
-	}
-	if !strings.Contains(got, "fix the port") {
-		t.Errorf("renderRow(user) = %q, want to contain the text", got)
-	}
-}
-
-// TestRenderAssistantThinkingBlock covers an assistant row carrying a ThinkingBlock:
+// TestRenderAssistantThinkingBlock covers an assistant segment carrying reasoning:
 // when expanded the reasoning renders as the full thinking block (never as
-// "[unsupported block]") and the narration still renders.
+// "[unsupported block]") and the narration still renders. It exercises renderAssistant
+// the way the kindAssistant entry render feeds it (thinkingText + assistantText).
 func TestRenderAssistantThinkingBlock(t *testing.T) {
 	t.Parallel()
 
-	row := DisplayMessage{
-		Role: RoleAssistant,
-		Blocks: []content.Block{
-			&content.ThinkingBlock{Thinking: "my reasoning"},
-			&content.TextBlock{Text: "the final answer"},
-		},
-	}
-	got := stripANSI(renderRow(row, true, 80)) // expanded: assert the full thinking body renders
+	got := stripANSI(renderAssistant("my reasoning", "the final answer", nil, true, 80)) // expanded
 
 	for _, w := range []string{"thinking", "my reasoning", "the final answer"} {
 		if !strings.Contains(got, w) {
-			t.Errorf("renderRow(assistant) = %q, want to contain %q", got, w)
+			t.Errorf("renderAssistant() = %q, want to contain %q", got, w)
 		}
 	}
 	if strings.Contains(got, "[unsupported block]") {
-		t.Errorf("renderRow(assistant) = %q, must not render ThinkingBlock as [unsupported block]", got)
-	}
-}
-
-// TestRenderMessagesLiveThinking covers the in-progress live segment carrying both
-// streamed thinking and narration; expanded so the full thinking body is asserted.
-func TestRenderMessagesLiveThinking(t *testing.T) {
-	t.Parallel()
-
-	live := liveSegment{thinking: "reasoning now", text: "answering"}
-	got := stripANSI(renderMessages(nil, live, nil, true, 80))
-
-	for _, w := range []string{"thinking", "reasoning now", "answering"} {
-		if !strings.Contains(got, w) {
-			t.Errorf("renderMessages(live thinking) = %q, want to contain %q", got, w)
-		}
-	}
-}
-
-// TestRenderMessagesNoStream verifies an empty stream is not appended as a row.
-func TestRenderMessagesNoStream(t *testing.T) {
-	t.Parallel()
-
-	got := renderMessages(nil, liveSegment{}, nil, false, 80)
-	if strings.TrimSpace(got) != "" {
-		t.Errorf("renderMessages(nil, liveSegment{}, ...) = %q, want empty", got)
+		t.Errorf("renderAssistant() = %q, must not render reasoning as [unsupported block]", got)
 	}
 }

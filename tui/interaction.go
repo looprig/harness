@@ -58,8 +58,9 @@ func newInteractionModel() interactionModel {
 // mutating index 0 of the result never writes through a slice the caller still
 // holds. interactionModel is driven by value, but a slice header copy shares its
 // backing array; the selection handlers mutate the head in place, so they must
-// clone it first to stay sound under that value-copy contract. The tail elements
-// are shared by design (they are not mutated). pending must be non-empty.
+// clone it first to stay sound under that value-copy contract. copy duplicates the
+// slice of prompt value structs into a fresh backing array, so every element —
+// head and tail — is an independent copy. pending must be non-empty.
 func cloneHead(pending []prompt) []prompt {
 	out := make([]prompt, len(pending))
 	copy(out, pending)
