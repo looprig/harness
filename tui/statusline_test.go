@@ -77,7 +77,7 @@ func TestStatusLabel(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		name  string
+		name   string
 		status Status
 		st     statusInputs
 		want   string
