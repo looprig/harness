@@ -38,3 +38,6 @@ func (u UUID) String() string {
 	return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x",
 		u[0:4], u[4:6], u[6:8], u[8:10], u[10:16])
 }
+
+// IsZero reports whether u is the zero UUID (absent / root).
+func (u UUID) IsZero() bool { return u == UUID{} }

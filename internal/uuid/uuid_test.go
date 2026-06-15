@@ -76,3 +76,23 @@ func TestNewUnique(t *testing.T) {
 		t.Error("two New() calls returned equal UUIDs")
 	}
 }
+
+func TestUUIDIsZero(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+		u    UUID
+		want bool
+	}{
+		{name: "zero value", u: UUID{}, want: true},
+		{name: "non-zero", u: UUID{1}, want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := tt.u.IsZero(); got != tt.want {
+				t.Errorf("IsZero() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
