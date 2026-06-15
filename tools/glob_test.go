@@ -167,6 +167,31 @@ func TestGlob(t *testing.T) {
 	}
 }
 
+// TestGlobWalkTimeout asserts the WalkDir walk honors a cancelled context: an
+// already-expired ctx aborts the traversal and the tool returns the timeout
+// tool-result rather than walking a (potentially huge) tree (FIX 1).
+func TestGlobWalkTimeout(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	mustWrite(t, filepath.Join(root, "a.go"), "x")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // expire before the walk begins.
+
+	g := NewGlob(root, newFakeReadGuard(1<<20))
+	res, err := g.InvokableRun(ctx, `{"pattern":"**"}`)
+	if err != nil {
+		t.Fatalf("InvokableRun returned a Go error %v; read tools return tool-result strings", err)
+	}
+	tb, ok := res.Content[0].(*content.TextBlock)
+	if !ok {
+		t.Fatalf("block type = %T, want *content.TextBlock", res.Content[0])
+	}
+	if !strings.Contains(tb.Text, "timed out") {
+		t.Errorf("output = %q, want it to report the timeout", tb.Text)
+	}
+}
+
 func TestGlobAuditSummary(t *testing.T) {
 	t.Parallel()
 	g := NewGlob(t.TempDir(), newFakeReadGuard(1<<20))

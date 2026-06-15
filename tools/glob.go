@@ -3,6 +3,7 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io/fs"
 	"path/filepath"
 	"sort"
@@ -80,7 +81,7 @@ func (g *Glob) AuditSummary(argsJSON string) string {
 // InvokableRun walks the (contained) search root, matches each workspace-relative
 // path against the pattern, EXCLUDES any path DeniedRead reports, caps results,
 // and returns a newline-separated list. Every failure is a tool-result string.
-func (g *Glob) InvokableRun(_ context.Context, argsJSON string) (*tool.ToolResult, error) {
+func (g *Glob) InvokableRun(ctx context.Context, argsJSON string) (*tool.ToolResult, error) {
 	var a globArgs
 	if err := json.Unmarshal([]byte(argsJSON), &a); err != nil {
 		return tool.TextResult("error: invalid arguments: not a JSON object"), nil
@@ -105,16 +106,26 @@ func (g *Glob) InvokableRun(_ context.Context, argsJSON string) (*tool.ToolResul
 		return tool.TextResult("error: workspace root could not be resolved"), nil
 	}
 
-	matches, truncated := g.walk(searchAbs, resolvedRoot, a.Pattern)
+	matches, truncated, expired := g.walk(ctx, searchAbs, resolvedRoot, a.Pattern)
+	if expired {
+		return tool.TextResult("error: glob timed out"), nil
+	}
 	return tool.TextResult(renderGlobResults(matches, truncated)), nil
 }
 
 // walk traverses searchAbs, returning the workspace-relative (slash) paths whose
-// relPath matches pattern and that DeniedRead does NOT exclude, sorted and capped
-// at maxGlobResults. truncated reports whether the cap was hit. A WalkDir error on
-// a single entry is skipped (best-effort listing), never fatal.
-func (g *Glob) walk(searchAbs, resolvedRoot, pattern string) (matches []string, truncated bool) {
-	_ = filepath.WalkDir(searchAbs, func(abs string, d fs.DirEntry, err error) error {
+// relPath matches pattern and that the shared deny-filter does NOT exclude, sorted
+// and capped at maxGlobResults. truncated reports whether the cap was hit; expired
+// reports that ctx was cancelled/expired mid-walk (the caller renders a timeout
+// instead of a partial listing). A WalkDir error on a single entry is skipped
+// (best-effort listing), never fatal.
+func (g *Glob) walk(ctx context.Context, searchAbs, resolvedRoot, pattern string) (matches []string, truncated, expired bool) {
+	walkErr := filepath.WalkDir(searchAbs, func(abs string, d fs.DirEntry, err error) error {
+		// Cheap cancellability: abort before touching this entry if ctx is done so a
+		// huge tree cannot block past cancellation.
+		if ctx.Err() != nil {
+			return errCtxCancelled
+		}
 		if err != nil {
 			// Unreadable entry (permissions, races): skip it, keep walking.
 			if d != nil && d.IsDir() {
@@ -125,21 +136,12 @@ func (g *Glob) walk(searchAbs, resolvedRoot, pattern string) (matches []string, 
 		if d.IsDir() {
 			return nil
 		}
-		// Authoritative denied-path exclusion: never leak a secret's name. abs is
-		// the symlink-unresolved WalkDir path; resolve it the same way containedPath
-		// would so DeniedRead's absolute-path contract holds.
-		denyAbs := abs
-		if resolved, rerr := filepath.EvalSymlinks(abs); rerr == nil {
-			denyAbs = resolved
-		}
-		if g.guard.DeniedRead(denyAbs) {
+		// Authoritative denied-path exclusion (shared helper): never leak a secret's
+		// name. A denied or non-relativisable path is excluded.
+		relSlash, denied := denyFilteredRel(g.guard, resolvedRoot, abs)
+		if denied {
 			return nil
 		}
-		rel, rerr := filepath.Rel(resolvedRoot, denyAbs)
-		if rerr != nil {
-			return nil
-		}
-		relSlash := filepath.ToSlash(rel)
 		if !matchGlob(pattern, relSlash) {
 			return nil
 		}
@@ -150,12 +152,15 @@ func (g *Glob) walk(searchAbs, resolvedRoot, pattern string) (matches []string, 
 		}
 		return nil
 	})
+	if errors.Is(walkErr, errCtxCancelled) {
+		return nil, false, true
+	}
 	if len(matches) > maxGlobResults {
 		matches = matches[:maxGlobResults]
 		truncated = true
 	}
 	sort.Strings(matches)
-	return matches, truncated
+	return matches, truncated, false
 }
 
 // errStopWalk is the shared sentinel that short-circuits a WalkDir traversal
@@ -167,6 +172,44 @@ var errStopWalk = stopWalkError{}
 type stopWalkError struct{}
 
 func (stopWalkError) Error() string { return "tools: walk result cap reached" }
+
+// errCtxCancelled is the shared sentinel a WalkDir callback returns to abort a
+// traversal when its context is cancelled or its deadline has expired (Glob and
+// Grep's fallback), so a huge tree cannot block past cancellation. Like
+// errStopWalk it is a leaf control-flow sentinel, never surfaced to a caller.
+var errCtxCancelled = ctxCancelledError{}
+
+// ctxCancelledError is the typed sentinel returned to abort WalkDir on context
+// cancellation/expiry.
+type ctxCancelledError struct{}
+
+func (ctxCancelledError) Error() string { return "tools: walk aborted; context cancelled" }
+
+// denyFilteredRel is the SINGLE source of truth for the security-critical
+// deny-filter applied to every path the read tools traverse or emit (Glob's walk,
+// Grep's rg-result path, and Grep's fallback walk). It resolves abs the way
+// DeniedRead's absolute-path contract expects (best-effort EvalSymlinks; an
+// unresolvable path falls back to abs unchanged — fail-secure: the authoritative
+// DeniedRead below still runs on it), applies the AUTHORITATIVE DeniedRead filter,
+// and returns the workspace-relative slash path for a permitted entry. denied=true
+// means the path MUST be excluded — either DeniedRead reported it, OR it could not
+// be made relative to the resolved root (a containment surprise is excluded, never
+// emitted). Centralising this guarantees the deny semantics cannot drift between
+// the three call sites.
+func denyFilteredRel(guard loop.ReadGuard, resolvedRoot, abs string) (relSlash string, denied bool) {
+	denyAbs := abs
+	if resolved, rerr := filepath.EvalSymlinks(abs); rerr == nil {
+		denyAbs = resolved
+	}
+	if guard.DeniedRead(denyAbs) {
+		return "", true
+	}
+	rel, rerr := filepath.Rel(resolvedRoot, denyAbs)
+	if rerr != nil {
+		return "", true
+	}
+	return filepath.ToSlash(rel), false
+}
 
 // renderGlobResults formats the sorted match list, appending a truncation notice
 // when the cap was hit. An empty list reports "no matches".

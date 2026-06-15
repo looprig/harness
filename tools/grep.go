@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"io/fs"
 	"os"
@@ -15,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/inventivepotter/urvi/internal/agent/loop"
 	"github.com/inventivepotter/urvi/internal/tool"
@@ -42,6 +44,13 @@ const maxGrepLineBytes = 64 * 1024
 // rgBinary is the ripgrep executable name resolved on PATH (a binary, not a Go
 // dependency).
 const rgBinary = "rg"
+
+// grepTimeout bounds a single Grep invocation (the rg subprocess exec AND the
+// in-process fallback walk). The CLAUDE.md "Context" rule forbids unbounded
+// external/blocking I/O: a pathological tree or a wedged rg process must not hang
+// the agent. 30s is generous for an interactive code search over a workspace yet
+// firmly bounded; on expiry the tool returns "error: grep timed out".
+const grepTimeout = 30 * time.Second
 
 // grepNoiseDirs are directory names skipped during the WalkDir fallback and
 // translated to `rg --glob '!<dir>'` exclusions (best-effort) — large, generated,
@@ -180,12 +189,22 @@ func (g *Grep) InvokableRun(ctx context.Context, argsJSON string) (*tool.ToolRes
 		includeAll:   a.IncludeAll,
 	}
 
+	// Bound the search (rg exec or fallback walk) so neither can block past
+	// grepTimeout (CLAUDE.md "Context": no unbounded external/blocking I/O). A
+	// caller deadline that is already tighter is honoured (WithTimeout never
+	// extends it).
+	ctx, cancel := context.WithTimeout(ctx, grepTimeout)
+	defer cancel()
+
 	var matches []string
-	var truncated bool
+	var truncated, expired bool
 	if g.useRg {
-		matches, truncated = g.runRg(ctx, a.Pattern, searchAbs, resolvedRoot, opts)
+		matches, truncated, expired = g.runRg(ctx, a.Pattern, searchAbs, resolvedRoot, opts)
 	} else {
-		matches, truncated = g.runFallback(searchAbs, resolvedRoot, re, opts)
+		matches, truncated, expired = g.runFallback(ctx, searchAbs, resolvedRoot, re, opts)
+	}
+	if expired {
+		return tool.TextResult("error: grep timed out"), nil
 	}
 	return tool.TextResult(renderGrepResults(matches, truncated)), nil
 }
@@ -259,10 +278,12 @@ type deniedGlobLister interface {
 }
 
 // runRg executes ripgrep with the injection-safe arg vector and AUTHORITATIVELY
-// filters every result path through DeniedRead before emitting (two-layer: the
-// --glob skip is best-effort; this filter is the boundary). rg's exit status 1
-// (no matches) is not an error.
-func (g *Grep) runRg(ctx context.Context, pattern, searchAbs, resolvedRoot string, opts grepOptions) (matches []string, truncated bool) {
+// filters every result path through the shared deny-filter before emitting
+// (two-layer: the --glob skip is best-effort; that filter is the boundary). rg's
+// exit status 1 (no matches) is not an error. The exec is bounded by ctx
+// (exec.CommandContext kills rg on deadline): expired=true reports a ctx
+// cancellation/timeout so the caller renders the timeout tool-result.
+func (g *Grep) runRg(ctx context.Context, pattern, searchAbs, resolvedRoot string, opts grepOptions) (matches []string, truncated, expired bool) {
 	args := buildRgArgs(pattern, searchAbs, opts, g.rgDenyGlobs())
 	// #nosec G204 -- fixed binary "rg"; pattern/path are passed as VALUES after
 	// --regexp / -- so they can never be interpreted as flags (no shell, arg list).
@@ -271,19 +292,24 @@ func (g *Grep) runRg(ctx context.Context, pattern, searchAbs, resolvedRoot strin
 	cmd.Stdout = &out
 	cmd.Stderr = io.Discard
 	if err := cmd.Run(); err != nil {
+		// A ctx timeout/cancel killed rg: surface it as a bounded-I/O timeout rather
+		// than a silent empty result.
+		if ctx.Err() != nil {
+			return nil, false, true
+		}
 		// rg exits 1 when there are simply no matches — not an execution failure.
-		var ee *exec.ExitError
-		if !asExitCode(err, &ee, 1) {
+		if code, ok := asExitCode(err); !ok || code != 1 {
 			// A genuine failure (binary vanished, killed): fall back to nothing.
-			return nil, false
+			return nil, false, false
 		}
 	}
-	return g.collectRgLines(&out, resolvedRoot)
+	matches, truncated = g.collectRgLines(&out, resolvedRoot)
+	return matches, truncated, false
 }
 
 // collectRgLines parses rg's "path:line:text" output, rewrites the absolute file
-// path to a workspace-relative one, applies the authoritative DeniedRead filter,
-// and caps the result.
+// path to a workspace-relative one via the shared authoritative deny-filter
+// (excluding any denied/non-relativisable path), and caps the result.
 func (g *Grep) collectRgLines(out *bytes.Buffer, resolvedRoot string) (matches []string, truncated bool) {
 	sc := bufio.NewScanner(out)
 	sc.Buffer(make([]byte, 0, 64*1024), maxGrepLineBytes)
@@ -293,19 +319,12 @@ func (g *Grep) collectRgLines(out *bytes.Buffer, resolvedRoot string) (matches [
 		if !ok {
 			continue
 		}
-		// Authoritative denied filter: resolve the path the way DeniedRead expects.
-		denyAbs := absFile
-		if resolved, rerr := filepath.EvalSymlinks(absFile); rerr == nil {
-			denyAbs = resolved
-		}
-		if g.guard.DeniedRead(denyAbs) {
+		// Authoritative denied filter (shared helper): a denied path is never emitted.
+		relSlash, denied := denyFilteredRel(g.guard, resolvedRoot, absFile)
+		if denied {
 			continue
 		}
-		rel, rerr := filepath.Rel(resolvedRoot, denyAbs)
-		if rerr != nil {
-			continue
-		}
-		matches = append(matches, filepath.ToSlash(rel)+rest)
+		matches = append(matches, relSlash+rest)
 		if len(matches) >= maxGrepMatches {
 			truncated = true
 			break
@@ -326,20 +345,30 @@ func splitRgLine(line string) (file, rest string, ok bool) {
 	return line[:i], line[i:], true
 }
 
-// asExitCode reports whether err is an *exec.ExitError with the given exit code.
-func asExitCode(err error, target **exec.ExitError, code int) bool {
-	if ee, ok := err.(*exec.ExitError); ok {
-		*target = ee
-		return ee.ExitCode() == code
+// asExitCode reports the process exit code of err when err is (or wraps) an
+// *exec.ExitError. ok=false for any non-exit error (including nil). It uses
+// errors.As for wrapped-error robustness, consistent with the rest of the package.
+func asExitCode(err error) (code int, ok bool) {
+	var ee *exec.ExitError
+	if errors.As(err, &ee) {
+		return ee.ExitCode(), true
 	}
-	return false
+	return 0, false
 }
 
-// runFallback walks searchAbs with the stdlib scanner, applying DeniedRead
-// DIRECTLY during traversal (so a denied file is never opened) and skipping noise
-// dirs, matching each line against re, and capping the result.
-func (g *Grep) runFallback(searchAbs, resolvedRoot string, re *regexp.Regexp, opts grepOptions) (matches []string, truncated bool) {
+// runFallback walks searchAbs with the stdlib scanner, applying the shared
+// authoritative deny-filter DIRECTLY during traversal (so a denied file is never
+// opened) and skipping noise dirs, matching each line against re, and capping the
+// result. The walk is cheaply cancellable: if ctx is done it aborts and reports
+// expired=true so the caller renders the timeout tool-result instead of a partial
+// scan.
+func (g *Grep) runFallback(ctx context.Context, searchAbs, resolvedRoot string, re *regexp.Regexp, opts grepOptions) (matches []string, truncated, expired bool) {
 	walkErr := filepath.WalkDir(searchAbs, func(abs string, d fs.DirEntry, err error) error {
+		// Cheap cancellability: abort before touching this entry if ctx is done so a
+		// huge tree cannot block past cancellation.
+		if ctx.Err() != nil {
+			return errCtxCancelled
+		}
 		if err != nil {
 			if d != nil && d.IsDir() {
 				return fs.SkipDir
@@ -355,18 +384,10 @@ func (g *Grep) runFallback(searchAbs, resolvedRoot string, re *regexp.Regexp, op
 			}
 			return nil
 		}
-		denyAbs := abs
-		if resolved, rerr := filepath.EvalSymlinks(abs); rerr == nil {
-			denyAbs = resolved
+		relSlash, denied := denyFilteredRel(g.guard, resolvedRoot, abs)
+		if denied {
+			return nil // never open a denied (or non-relativisable) file.
 		}
-		if g.guard.DeniedRead(denyAbs) {
-			return nil // never open a denied file.
-		}
-		rel, rerr := filepath.Rel(resolvedRoot, denyAbs)
-		if rerr != nil {
-			return nil
-		}
-		relSlash := filepath.ToSlash(rel)
 		fileMatches := g.grepFile(abs, relSlash, re)
 		for _, m := range fileMatches {
 			matches = append(matches, m)
@@ -377,11 +398,13 @@ func (g *Grep) runFallback(searchAbs, resolvedRoot string, re *regexp.Regexp, op
 		}
 		return nil
 	})
-	// errStopWalk (the only error this walk produces) already set truncated=true
-	// before aborting; a nil walkErr means the tree was fully scanned. Other walk
-	// errors are swallowed per-entry above, so walkErr is either nil or errStopWalk.
-	_ = walkErr
-	return matches, truncated
+	// A ctx cancellation aborts to errCtxCancelled -> report the timeout. errStopWalk
+	// already set truncated=true before aborting; a nil walkErr means the tree was
+	// fully scanned. Other walk errors are swallowed per-entry above.
+	if errors.Is(walkErr, errCtxCancelled) {
+		return nil, false, true
+	}
+	return matches, truncated, false
 }
 
 // grepFile opens relSlash's file with O_NOFOLLOW (a symlinked final component is
