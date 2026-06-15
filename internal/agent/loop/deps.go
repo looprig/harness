@@ -2,6 +2,8 @@ package loop
 
 import (
 	"context"
+	"encoding/json"
+	"strconv"
 
 	"github.com/inventivepotter/urvi/internal/tool"
 )
@@ -33,6 +35,73 @@ const (
 	// EffectDeny blocks the tool call.
 	EffectDeny
 )
+
+// The user-facing wire strings for Effect in approvals.json. They read naturally
+// (not opaque 0/1/2) so a human editing the file understands the policy.
+const (
+	effectStringAllow = "allow"
+	effectStringAsk   = "ask"
+	effectStringDeny  = "deny"
+)
+
+// InvalidEffectError is the typed failure for an Effect that cannot be mapped to
+// or from a wire string. It is fail-secure: callers (and json.Unmarshal) get an
+// error rather than a silently-defaulted effect, so a malformed approval is never
+// treated as auto-approve. Either Wire (bad/unknown input string or raw token)
+// or Value (out-of-range numeric Effect) is set depending on the direction.
+type InvalidEffectError struct {
+	Wire  string // the offending JSON token/string, when unmarshalling
+	Value Effect // the offending numeric Effect, when marshalling an unknown value
+}
+
+func (e *InvalidEffectError) Error() string {
+	if e.Wire != "" {
+		return "loop: invalid Effect: unknown approval value " + strconv.Quote(e.Wire) +
+			" (want \"allow\", \"ask\", or \"deny\")"
+	}
+	return "loop: invalid Effect: out-of-range value " + strconv.Itoa(int(e.Value))
+}
+
+// MarshalJSON encodes an Effect as its user-facing wire string. An out-of-range
+// Effect returns an *InvalidEffectError rather than emitting a bogus token.
+func (e Effect) MarshalJSON() ([]byte, error) {
+	var s string
+	switch e {
+	case EffectAutoApprove:
+		s = effectStringAllow
+	case EffectAsk:
+		s = effectStringAsk
+	case EffectDeny:
+		s = effectStringDeny
+	default:
+		return nil, &InvalidEffectError{Value: e}
+	}
+	return json.Marshal(s)
+}
+
+// UnmarshalJSON decodes a wire string into an Effect. Any non-string token, or a
+// string other than the three known values, yields an *InvalidEffectError
+// (fail-secure: an unrecognized approval is never decoded as auto-approve). The
+// receiver is left unchanged on error.
+func (e *Effect) UnmarshalJSON(b []byte) error {
+	var s string
+	if err := json.Unmarshal(b, &s); err != nil {
+		// Non-string JSON (number, bool, null, object, or malformed): record the
+		// raw token so the user can see what was rejected, never silently accept.
+		return &InvalidEffectError{Wire: string(b)}
+	}
+	switch s {
+	case effectStringAllow:
+		*e = EffectAutoApprove
+	case effectStringAsk:
+		*e = EffectAsk
+	case effectStringDeny:
+		*e = EffectDeny
+	default:
+		return &InvalidEffectError{Wire: s}
+	}
+	return nil
+}
 
 // ToolPolicy is a single user-editable approval rule. Match is tool-interpreted
 // (path glob for file tools, the EXACT command for Bash, or "METHOD scheme://host"

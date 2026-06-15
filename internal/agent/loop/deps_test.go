@@ -2,6 +2,8 @@ package loop
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"testing"
 	"time"
 
@@ -213,4 +215,126 @@ func (permissionGateStub) Check(context.Context, tool.InvokableTool, string, str
 }
 func (permissionGateStub) Grant(context.Context, string, string, tool.ApprovalScope) error {
 	return nil
+}
+
+// TestEffectMarshalJSON checks each defined Effect maps to its user-facing
+// string, and an out-of-range Effect fails to marshal (fail-secure: an unknown
+// numeric effect must never silently serialize to "allow").
+func TestEffectMarshalJSON(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name    string
+		in      Effect
+		want    string
+		wantErr bool
+	}{
+		{name: "ask -> ask", in: EffectAsk, want: `"ask"`},
+		{name: "auto-approve -> allow", in: EffectAutoApprove, want: `"allow"`},
+		{name: "deny -> deny", in: EffectDeny, want: `"deny"`},
+		{name: "out-of-range errors", in: Effect(99), wantErr: true},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got, err := json.Marshal(tt.in)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("Marshal(%d) error = %v, wantErr %v", tt.in, err, tt.wantErr)
+			}
+			if tt.wantErr {
+				var ie *InvalidEffectError
+				if !errors.As(err, &ie) {
+					t.Fatalf("Marshal error = %T (%v), want *InvalidEffectError", err, err)
+				}
+				return
+			}
+			if string(got) != tt.want {
+				t.Errorf("Marshal(%d) = %s, want %s", tt.in, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestEffectUnmarshalJSON checks the three valid strings decode, and every other
+// input (unknown string, number, bool, null, malformed) is rejected with a typed
+// *InvalidEffectError — fail-secure: a malformed approval is never silently
+// treated as auto-approve.
+func TestEffectUnmarshalJSON(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name          string
+		in            string
+		want          Effect
+		wantErr       bool
+		suppressTyped bool // true: the stdlib parser rejects before our method runs
+	}{
+		{name: "allow -> auto-approve", in: `"allow"`, want: EffectAutoApprove},
+		{name: "ask -> ask", in: `"ask"`, want: EffectAsk},
+		{name: "deny -> deny", in: `"deny"`, want: EffectDeny},
+		{name: "unknown string errors", in: `"yolo"`, wantErr: true},
+		{name: "empty string errors", in: `""`, wantErr: true},
+		{name: "uppercase ALLOW errors (exact match)", in: `"ALLOW"`, wantErr: true},
+		{name: "numeric errors", in: `5`, wantErr: true},
+		{name: "bool errors", in: `true`, wantErr: true},
+		{name: "null errors", in: `null`, wantErr: true},
+		{name: "object errors", in: `{}`, wantErr: true},
+		// Structurally malformed JSON (an unterminated string) fails in the stdlib
+		// parser BEFORE UnmarshalJSON is dispatched, so the error is a
+		// *json.SyntaxError, not our typed error. It is still fail-secure (an error,
+		// never auto-approve); we assert that weaker contract via suppressTyped.
+		{name: "malformed json errors (stdlib syntax)", in: `"allow`, wantErr: true, suppressTyped: true},
+	}
+	for _, tt := range tests {
+		tt := tt
+		// wantTypedErr defaults true for the cases that reach our UnmarshalJSON; the
+		// malformed-syntax case overrides it to false (the parser rejects it first).
+		typed := !tt.suppressTyped
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got := Effect(99) // poison (out-of-range): a successful decode must overwrite it
+			err := json.Unmarshal([]byte(tt.in), &got)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("Unmarshal(%s) error = %v, wantErr %v", tt.in, err, tt.wantErr)
+			}
+			if tt.wantErr {
+				// Fail-secure invariant for EVERY error case: never EffectAutoApprove.
+				if got == EffectAutoApprove {
+					t.Fatalf("Unmarshal(%s) errored but left value = EffectAutoApprove (fail-open!)", tt.in)
+				}
+				if typed {
+					var ie *InvalidEffectError
+					if !errors.As(err, &ie) {
+						t.Fatalf("Unmarshal(%s) error = %T (%v), want *InvalidEffectError", tt.in, err, err)
+					}
+				}
+				return
+			}
+			if got != tt.want {
+				t.Errorf("Unmarshal(%s) = %d, want %d", tt.in, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestEffectJSONRoundTrip marshals each valid effect and unmarshals it back to
+// the same value.
+func TestEffectJSONRoundTrip(t *testing.T) {
+	t.Parallel()
+	for _, e := range []Effect{EffectAsk, EffectAutoApprove, EffectDeny} {
+		e := e
+		t.Run(map[Effect]string{EffectAsk: "ask", EffectAutoApprove: "allow", EffectDeny: "deny"}[e], func(t *testing.T) {
+			t.Parallel()
+			b, err := json.Marshal(e)
+			if err != nil {
+				t.Fatalf("Marshal(%d): %v", e, err)
+			}
+			var got Effect
+			if err := json.Unmarshal(b, &got); err != nil {
+				t.Fatalf("Unmarshal(%s): %v", b, err)
+			}
+			if got != e {
+				t.Errorf("round-trip: got %d, want %d", got, e)
+			}
+		})
+	}
 }
