@@ -167,6 +167,13 @@ The print is a bounded `tea.Cmd` in `commands.go` that calls `tea.Println` once 
 (joining the pending entries' lines). `printed[displayID]` guarantees a resize, re-render, or
 duplicate event never reprints a committed entry.
 
+**Spacing.** Every transcript entry renders with **one trailing blank line**, so consecutive
+entries (user message, assistant segment, each tool card, prompt record) are separated by
+exactly one blank line in both scrollback and the live tail — messages breathe instead of
+crowding. The blank line is part of the entry's rendered output (counted in its
+`printAction.Lines`), so the print-once guarantee covers it too; within a single assistant
+segment, thinking → text → tool cards stay grouped.
+
 **Update flow** (replacing today's `handleEvent` + `commitLive`):
 
 1. `tea.Msg` → `transcript.ApplyEvent(ev)` mutates `live` or appends a committed entry on a
@@ -176,10 +183,10 @@ duplicate event never reprints a committed entry.
 4. `View` re-renders the active surface only.
 
 **Active surface (`surface.go` → `Screen.View`)** renders, top to bottom, only: the capped
-live tail (most recent N lines of live thinking/text/tool `⋯`); the active prompt control
-*or* the composer; slash completion (when visible); one status line. No `viewport`, no
-`historyHeight()` — the terminal owns history, so the active surface never needs an internal
-scroll region.
+live tail (most recent N lines of live thinking/text/tool `⋯`); a full-width **separator
+rule**; the **bottom box** (composer, prompt control, or answer field by mode); slash
+completion (when visible); one status line. No `viewport`, no `historyHeight()` — the
+terminal owns history, so the active surface never needs an internal scroll region.
 
 **Stable IDs fix a latent bug:** today's queued-input cleanup keys off `messages` slice
 indexes (`DisplayIndex`), which is brittle. Queued inputs now reference `displayID`, so
@@ -211,8 +218,11 @@ On every key routed to the editor, recompute and `ta.SetHeight(b.Height())`. Pas
 
 ```
 statusH      = 1
+sepH         = 1                              // the separator rule above the box
+boxBorderH   = 2                              // top + bottom border of the bottom box
 slashH       = slashComplete.Visible ? panelHeight : 0
-bottomH      = input.Height()            // or prompt height in prompt mode
+contentH     = input.Height()                 // or the prompt-control height in prompt mode
+bottomH      = sepH + boxBorderH + contentH
 liveTailCap  = max(0, termHeight − statusH − slashH − bottomH)
 ```
 
@@ -228,9 +238,21 @@ committed to scrollback at the next boundary, so nothing is lost.
 > terminals that do not support it (e.g. Apple Terminal), `Shift+Enter` is byte-identical to
 > `Enter` and submits. This is an accepted consequence of the binding choice.
 
-**Composer affordance:** drop the dark full-width `InputBoxStyle` box (styled for the
-fullscreen look) in favour of a lightweight `> ` prompt prefix that reads correctly inline in
-scrollback; `InputPlaceholderStyle` adapts.
+**Composer affordance — a bordered box below a separator.** The composer renders as a
+bordered box pinned to the bottom of the active surface, with an explicit full-width
+**separator rule** above it (chosen over a `> ` prefix and over a borderless bar). The
+bottom box is **always present**; its content switches by interaction mode — composer
+(compose), prompt control (permission/choice), or answer field (free-text) — so there is one
+consistent bottom affordance and never a second input box. The placeholder (`Type a
+message…`) shows when empty.
+
+**Committed transcript styling is unchanged.** User messages keep the `▌ ` accent bar
+(`styles.AccentBarPrompt` / `AccentBarStyle`) + bold `UserStyle`; assistant narration keeps
+the `● ` `Dot` prefix; thinking/tool cards keep `ThinkingStyle`/`ToolCallStyle`/
+`ToolResultStyle`. (The earlier `> `-prefix idea is dropped, and there is no `InputBoxStyle`
+— the current composer already uses the `▌ ` bar, which now moves inside the box only as the
+text region.) New styles needed: a `BoxStyle` border for the composer/answer box and an
+emphasised `PromptBoxStyle` border for prompt mode.
 
 **Draft handling** stays via `Value()`/`Reset()`/`SetValue()`; the same editor is reused as
 the AskUser free-text answer field with save/restore of the compose draft — there is never a
@@ -281,14 +303,19 @@ case event.UserInputRequested:
 **Scrollback / active-surface split** (the scrollback-first treatment): on enqueue → commit
 live prose/thinking, then commit a `promptRecord` entry carrying the *full* context to
 scrollback (the command / file path / URL, or the question + **all** choices) — copyable and
-permanent. The active surface shows only a compact control for the head prompt:
+permanent. The **bottom box** then becomes the prompt control (emphasised `PromptBoxStyle`
+border), replacing the composer; the compact control for the head prompt is:
 
 ```
-Approve Bash?  [y] once  [s] session  [w] workspace  [n] deny     (+2 more pending)
+┌─ Approve Bash? ──────────────────────────────────────────┐
+│ [y] once   [s] session   [w] workspace   [n] deny          │
+└──────────────────────────────────────────────────────────┘   (+2 more pending)
 ```
 ```
-Question: choice 3/12  "Use repo default"
-↑/↓ select · enter answer · 1–9 quick · o other · esc interrupt
+┌─ Question · choice 3/12 ─────────────────────────────────┐
+│ ▸ Use repo default                                         │
+│   ↑/↓ select · enter answer · 1–9 quick · o other · esc    │
+└──────────────────────────────────────────────────────────┘
 ```
 
 Scope hints are **derived from `Scopes`** (`[y]` iff `ScopeOnce`, `[s]` iff `ScopeSession`,
@@ -443,8 +470,8 @@ Each step is one TDD task (failing test → minimal impl → `-race` → commit)
    to scrollback exactly once at boundaries.
 5. Refactor `Screen.View()` to render only the active surface via `surface.go` (capped live
    tail + composer + slash + status); retire the `viewport` history in default mode.
-6. Add the auto-growing composer (`Shift+Enter` newline, `> ` prompt) and the active-surface
-   row budget.
+6. Add the auto-growing composer (`Shift+Enter` newline; bordered box + separator rule;
+   `▌`/`●` transcript styling unchanged) and the active-surface row budget.
 7. Add `interactionModel` + `prompt.go`: permission, AskUser choices, AskUser free-text with
    draft preservation; per-mode key routing; AskUser answer-contract tests.
 8. Add `commands.go` `approve`/`deny`/`provideAnswer` bounded cmds + `promptResultMsg`; map
@@ -453,3 +480,98 @@ Each step is one TDD task (failing test → minimal impl → `-race` → commit)
    thinking + tools.
 10. Run race tests, build with `CGO_ENABLED=0 go build -trimpath`, and perform the manual
     smoke checks.
+
+## Appendix — UX reference (approved screens)
+
+The visual contract. Above the `────` separator rule is native scrollback (scrollable,
+selectable, copyable); the rule + bottom box + status line are the active surface pinned to
+the bottom. User messages render `▌ <bold>`; assistant narration `● …`; thinking/tool cards
+dim/faint. The bottom box is always present; its content switches by mode.
+
+**Idle**
+
+```
+ ● Welcome to urvi. Ask me to build, edit, or run things.
+
+ ──────────────────────────────────────────────────────────
+ ┌──────────────────────────────────────────────────────────┐
+ │ Type a message…                                            │
+ └──────────────────────────────────────────────────────────┘
+ ready
+```
+
+**Composing (multi-line; box auto-grew via `Shift+Enter`)**
+
+```
+ ──────────────────────────────────────────────────────────
+ ┌──────────────────────────────────────────────────────────┐
+ │ Add a --version flag that prints the build version and     │
+ │ exits. Wire it before the Bubble Tea program starts.▮       │
+ └──────────────────────────────────────────────────────────┘
+ ready
+```
+
+**Streaming** (committed `▌` user msg in scrollback; live `●` turn in the tail above the
+separator; box stays for queued input):
+
+```
+ ▌ Add a --version flag that prints the build version and exits.
+
+ ● I'll add a --version flag to the CLI entrypoint. Let me read
+   the current flag setup first.
+   thinking · 4 lines · ctrl+t
+
+   └ ReadFile  cmd/cli/main.go  ✓   … 38 more lines · ctrl+t
+ ──────────────────────────────────────────────────────────
+ ┌──────────────────────────────────────────────────────────┐
+ │ Type a message…  (queues while the agent works)            │
+ └──────────────────────────────────────────────────────────┘
+ streaming…
+```
+
+**Permission prompt** (full diff committed to scrollback; bottom box = emphasised prompt
+control):
+
+```
+ ● I'll register the flag and short-circuit before the program starts.
+
+   Approve EditFile?
+   cmd/cli/main.go  ·  +7 −0
+     + version := flag.Bool("version", false, "print version and exit")
+     + if *version { fmt.Println(buildversion.Version()); os.Exit(0) }
+ ──────────────────────────────────────────────────────────
+ ┌─ Approve EditFile? ──────────────────────────────────────┐
+ │ [y] once   [s] session   [w] workspace   [n] deny          │
+ └──────────────────────────────────────────────────────────┘
+ awaiting approval
+```
+
+**AskUser free-text** (question committed to scrollback; the *same* box is reused as the
+answer field — the compose draft is saved and restored):
+
+```
+ ● What should the --version output look like? (e.g. "urvi 1.4.2")
+ ──────────────────────────────────────────────────────────
+ ┌─ answer ─────────────────────────────────────────────────┐
+ │ urvi v1.4.2 (commit abc1234)▮                              │
+ └──────────────────────────────────────────────────────────┘
+ awaiting input
+```
+
+**AskUser with >9 choices** (all choices committed to scrollback; bottom box shows the
+cursor + a window that scrolls with `selected`, so rows 10+ stay reachable):
+
+```
+ ● Which version string source should I use?
+     1. internal/version.Version()
+     …
+     12. ask me each build
+ ──────────────────────────────────────────────────────────
+ ┌─ Question · choice 10/12 ────────────────────────────────┐
+ │   9. latest git tag at runtime                             │
+ │ ▸ 10. CHANGELOG.md top entry                               │
+ │   11. date-based (YYYY.MM.DD)                              │
+ │   ↑/↓ select · enter answer · 1–9 quick · o other · esc    │
+ └──────────────────────────────────────────────────────────┘
+ awaiting input
+```
