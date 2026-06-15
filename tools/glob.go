@@ -158,15 +158,15 @@ func (g *Glob) walk(searchAbs, resolvedRoot, pattern string) (matches []string, 
 	return matches, truncated
 }
 
-// errStopWalk is the sentinel that short-circuits WalkDir once the result cap is
-// reached. It is a leaf control-flow sentinel (never surfaced to a caller), so a
-// bare errors.New is permitted per CLAUDE.md.
+// errStopWalk is the shared sentinel that short-circuits a WalkDir traversal
+// (Glob and Grep) once the result cap is reached. It is a leaf control-flow
+// sentinel, never surfaced to a caller.
 var errStopWalk = stopWalkError{}
 
 // stopWalkError is the typed sentinel returned to abort WalkDir at the cap.
 type stopWalkError struct{}
 
-func (stopWalkError) Error() string { return "glob: result cap reached" }
+func (stopWalkError) Error() string { return "tools: walk result cap reached" }
 
 // renderGlobResults formats the sorted match list, appending a truncation notice
 // when the cap was hit. An empty list reports "no matches".
