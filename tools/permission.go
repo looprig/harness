@@ -1,15 +1,19 @@
 package tools
 
 import (
+	"os"
 	"slices"
+	"sync"
 
 	"github.com/inventivepotter/urvi/internal/agent/loop"
+	"github.com/inventivepotter/urvi/internal/hashcache"
 )
 
-// permission.go defines the policy data structures and fail-secure default
-// hard-deny rules for the tools subsystem (design §3c). The PermissionChecker
-// implementation (the seven-stage Check and Grant) is added in a later task;
-// this file is the type + default surface those build on.
+// permission.go defines the policy data structures, fail-secure default
+// hard-deny rules, and the PermissionChecker type (its construction, the
+// home-dir seam, and the ReadGuard surface) for the tools subsystem (design
+// §3c). The seven-stage Check + per-tool extraction live in check.go; the
+// out-of-repo store path resolution lives in store.go.
 
 // EffectChecker decides the Effect for a tool call from its raw arguments,
 // independent of any persisted approval. It is consulted as an early evaluation
@@ -131,4 +135,108 @@ func DefaultHardDeny() HardDenyRules {
 		DeniedBashPrefixes: slices.Clone(defaultDeniedBashPrefixes),
 		MaxReadBytes:       defaultMaxReadBytes,
 	}
+}
+
+// homeDirFunc resolves the user's home directory. It is a seam: the default is
+// os.UserHomeDir, overridable in tests (and by Grant, which uses the SAME seam
+// to write the out-of-repo store). Returning an error makes the persisted stage
+// fail secure (treat both store files as absent — contribute no approvals).
+type homeDirFunc func() (string, error)
+
+// PermissionChecker is the seven-stage, fail-secure permission decision engine
+// (design §3c). It satisfies BOTH loop.PermissionGate (Check/Grant) and
+// loop.ReadGuard (DeniedRead/MaxReadBytes).
+//
+// Concurrency: a single mutex guards every mutable field. Check takes the lock
+// for its whole duration (it reads policy.Policies — mutated by a session-scope
+// Grant — and drives the two approval caches, which it must not race). The
+// hashcache instances are themselves concurrency-safe, but they are only ever
+// touched under mu here, which keeps the whole decision atomic w.r.t. a
+// concurrent session grant.
+type PermissionChecker struct {
+	mu      sync.Mutex
+	policy  PermissionPolicy
+	homeDir homeDirFunc
+
+	// Two caches memoize the JSON parse of the workspace and user approvals files
+	// keyed by content hash, so an unchanged file is not re-parsed on every Check.
+	wsCache   *hashcache.Cache[ApprovalsFile]
+	userCache *hashcache.Cache[ApprovalsFile]
+}
+
+// NewPermissionChecker builds a PermissionChecker for the given policy. The
+// home-dir seam defaults to os.UserHomeDir; tests (and the future Grant store
+// hardening) override it via SetHomeDir. Each approvals cache parses bytes into
+// an ApprovalsFile via parseApprovalsFile (strict, fail-secure).
+func NewPermissionChecker(policy PermissionPolicy) *PermissionChecker {
+	return &PermissionChecker{
+		policy:    policy,
+		homeDir:   os.UserHomeDir,
+		wsCache:   hashcache.New(parseApprovalsFile),
+		userCache: hashcache.New(parseApprovalsFile),
+	}
+}
+
+// SetHomeDir overrides the home-dir resolution seam. It is intended for tests
+// (and the composition root) to point the policy store at a controlled location;
+// production code uses the os.UserHomeDir default from NewPermissionChecker.
+func (c *PermissionChecker) SetHomeDir(fn homeDirFunc) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.homeDir = fn
+}
+
+// appendSessionPolicy appends an in-memory ToolPolicy under the lock. It is the
+// Stage-6 mutation point a ScopeSession Grant uses; exported behavior is via
+// Grant (added in a later task). Kept here so the lock that guards Check also
+// guards the slice mutation, making concurrent Check + grant -race clean.
+func (c *PermissionChecker) appendSessionPolicy(p loop.ToolPolicy) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.policy.Policies = append(c.policy.Policies, p)
+}
+
+// DeniedRead reports whether absPath matches any DeniedReadPaths glob via the
+// absolute hard-deny matcher (~/ expanded to the resolved home dir). It is the
+// ReadGuard hook the read tools call to filter denied paths during traversal and
+// before emitting results. It is fail-secure: an unresolvable home dir does not
+// disable the non-home globs (e.g. **/.env still matches), and any matcher error
+// is a no-match within a single glob but never a panic.
+func (c *PermissionChecker) DeniedRead(absPath string) bool {
+	c.mu.Lock()
+	denied := c.policy.HardDeny.DeniedReadPaths
+	homeFn := c.homeDir
+	c.mu.Unlock()
+
+	home := resolveHomeOrEmpty(homeFn)
+	for _, pat := range denied {
+		if matchHardDenyAbs(pat, absPath, home) {
+			return true
+		}
+	}
+	return false
+}
+
+// MaxReadBytes returns the per-file read cap from the policy's HardDenyRules. The
+// read tools apply it via io.LimitReader.
+func (c *PermissionChecker) MaxReadBytes() int64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.policy.HardDeny.MaxReadBytes
+}
+
+// resolveHomeOrEmpty resolves the home dir, returning "" on error. A "" home
+// makes the ~/ expansion in matchHardDenyAbs a no-op for home-relative globs
+// (those globs then cannot match — fail-secure for the read filter: a non-home
+// glob like **/.env is unaffected, a ~/ glob simply does not contribute a match
+// rather than matching something wrong).
+func resolveHomeOrEmpty(fn homeDirFunc) string {
+	if fn == nil {
+		return ""
+	}
+	home, err := fn()
+	if err != nil {
+		return ""
+	}
+	return home
 }
