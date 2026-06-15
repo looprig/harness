@@ -66,6 +66,27 @@ const (
 	envLogLevel = "URVI_LOG_LEVEL"
 )
 
+// tuiOptions is the typed, testable description of the Bubble Tea program modes
+// the CLI wires up. Scrollback-first rendering requires the normal screen (no
+// alt-screen) so tea.Println can write to native terminal scrollback, and does
+// not capture the mouse.
+type tuiOptions struct{ AltScreen, Mouse bool }
+
+// defaultTUIOptions returns the scrollback-first defaults: normal screen, no mouse.
+func defaultTUIOptions() tuiOptions { return tuiOptions{AltScreen: false, Mouse: false} }
+
+// teaProgramOptions maps the typed tuiOptions onto Bubble Tea program options.
+func teaProgramOptions(o tuiOptions) []tea.ProgramOption {
+	var opts []tea.ProgramOption
+	if o.AltScreen {
+		opts = append(opts, tea.WithAltScreen())
+	}
+	if o.Mouse {
+		opts = append(opts, tea.WithMouseCellMotion())
+	}
+	return opts
+}
+
 // openLogFile opens (creating as needed) the append-mode ~/.urvi/urvi.log file.
 func openLogFile() (*os.File, error) {
 	home, err := os.UserHomeDir()
@@ -119,10 +140,10 @@ func main() {
 	// Hand the TUI a dedicated handle to the real terminal, then point the process's
 	// stdout+stderr at the log file. Libraries that log to stdout or stderr — e.g. the
 	// TDX attestation verifier, which calls logger.Init(os.Stdout) at package init —
-	// then land in the log instead of corrupting the alt-screen. Best-effort: on
+	// then land in the log instead of corrupting live scrollback. Best-effort: on
 	// failure the TUI renders to the real stdout as usual. Restored right after Run so
 	// the teardown/error reporting below still reaches the terminal.
-	progOpts := []tea.ProgramOption{tea.WithAltScreen()}
+	progOpts := teaProgramOptions(defaultTUIOptions())
 	restoreStdio := func() error { return nil }
 	if logErr == nil {
 		if capture, cerr := ttylog.CaptureStdio(logFile); cerr == nil {

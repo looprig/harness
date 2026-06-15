@@ -31,6 +31,41 @@ func TestAgentName(t *testing.T) {
 	}
 }
 
+func TestDefaultTUIOptions(t *testing.T) {
+	t.Parallel()
+	got := defaultTUIOptions()
+	if got.AltScreen {
+		t.Errorf("AltScreen = true, want false (scrollback-first requires normal screen for tea.Println)")
+	}
+	if got.Mouse {
+		t.Errorf("Mouse = true, want false (no mouse capture in scrollback-first)")
+	}
+}
+
+func TestTeaProgramOptions(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+		in   tuiOptions
+		want int
+	}{
+		{name: "no modes appends nothing", in: tuiOptions{}, want: 0},
+		{name: "alt screen only appends one", in: tuiOptions{AltScreen: true}, want: 1},
+		{name: "mouse only appends one", in: tuiOptions{Mouse: true}, want: 1},
+		{name: "both modes append two", in: tuiOptions{AltScreen: true, Mouse: true}, want: 2},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			// tea.ProgramOption values are opaque func types and cannot be
+			// compared for equality, so assert the count of options returned.
+			if got := len(teaProgramOptions(tt.in)); got != tt.want {
+				t.Errorf("len(teaProgramOptions(%+v)) = %d, want %d", tt.in, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestBuildRegistry(t *testing.T) {
 	t.Parallel()
 	reg := buildRegistry()
