@@ -11,6 +11,8 @@ import (
 
 	"github.com/inventivepotter/urvi/internal/agent/loop/event"
 	"github.com/inventivepotter/urvi/internal/llm"
+	"github.com/inventivepotter/urvi/internal/tool"
+	"github.com/inventivepotter/urvi/internal/uuid"
 )
 
 // interruptTimeout bounds an Interrupt ack so Update never waits on a wedged session.
@@ -21,6 +23,12 @@ const reopenTimeout = 5 * time.Second
 
 // closeTimeout bounds a best-effort close so a hung session cannot wedge quit.
 const closeTimeout = 5 * time.Second
+
+// promptDispatchTimeout bounds an approve/deny/answer send so Update never blocks
+// on a wedged session resolving a permission or AskUser gate. It mirrors
+// interruptTimeout's shape: the dispatch is fire-and-route, so a lost or late send
+// is self-healing (the next terminal event clears the prompt queue regardless).
+const promptDispatchTimeout = 2 * time.Second
 
 // readNext pulls exactly one event from r and maps it to a tea.Msg: io.EOF →
 // streamEOFMsg, any other error → streamErrMsg, otherwise eventMsg. Re-dispatch
@@ -47,6 +55,43 @@ func interruptTurn(ctx context.Context, agent Agent) tea.Cmd {
 		defer cancel()
 		cancelled, err := agent.Interrupt(ictx)
 		return interruptResultMsg{cancelled: cancelled, err: err}
+	}
+}
+
+// promptResultMsg reports the outcome of a bounded prompt dispatch (approve,
+// deny, or provide-answer). Only the error matters at the UI: the optimistic-pop
+// design needs no ack, so a nil err is a silent success and a non-nil err lets
+// Update surface a faint failure line. It is a tea.Msg.
+type promptResultMsg struct{ err error }
+
+// approveCmd issues a bounded Approve for a pending permission gate and reports the
+// result, so Update never blocks on the session resolving the gate. callID
+// identifies the gate; scope is the chosen persistence breadth.
+func approveCmd(ctx context.Context, agent Agent, callID uuid.UUID, scope tool.ApprovalScope) tea.Cmd {
+	return func() tea.Msg {
+		c, cancel := context.WithTimeout(ctx, promptDispatchTimeout)
+		defer cancel()
+		return promptResultMsg{err: agent.Approve(c, callID, scope)}
+	}
+}
+
+// denyCmd issues a bounded Deny (fail-secure) for a pending permission gate and
+// reports the result, so Update never blocks on the session failing it closed.
+func denyCmd(ctx context.Context, agent Agent, callID uuid.UUID) tea.Cmd {
+	return func() tea.Msg {
+		c, cancel := context.WithTimeout(ctx, promptDispatchTimeout)
+		defer cancel()
+		return promptResultMsg{err: agent.Deny(c, callID)}
+	}
+}
+
+// provideAnswerCmd issues a bounded ProvideAnswer for a pending AskUser request and
+// reports the result, so Update never blocks on the session consuming the answer.
+func provideAnswerCmd(ctx context.Context, agent Agent, callID uuid.UUID, answer string) tea.Cmd {
+	return func() tea.Msg {
+		c, cancel := context.WithTimeout(ctx, promptDispatchTimeout)
+		defer cancel()
+		return promptResultMsg{err: agent.ProvideAnswer(c, callID, answer)}
 	}
 }
 

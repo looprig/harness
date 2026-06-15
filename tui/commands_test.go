@@ -4,10 +4,15 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
+
+	tea "charm.land/bubbletea/v2"
 
 	"github.com/inventivepotter/urvi/internal/agent/loop/event"
 	"github.com/inventivepotter/urvi/internal/content"
 	"github.com/inventivepotter/urvi/internal/llm"
+	"github.com/inventivepotter/urvi/internal/tool"
+	"github.com/inventivepotter/urvi/internal/uuid"
 )
 
 func TestReadNext(t *testing.T) {
@@ -239,5 +244,169 @@ func TestPrintToScrollback(t *testing.T) {
 				t.Errorf("printToScrollback nil = %v, want %v", cmd == nil, tt.wantNil)
 			}
 		})
+	}
+}
+
+// TestApproveCmd covers the bounded approve dispatch: every allowed scope is
+// forwarded verbatim with the call ID, and a configured error surfaces on the
+// result msg (non-fatal). errScope is a sentinel for the error path.
+func TestApproveCmd(t *testing.T) {
+	t.Parallel()
+
+	errApprove := errors.New("approve failed")
+
+	tests := []struct {
+		name       string
+		callID     uuid.UUID
+		scope      tool.ApprovalScope
+		approveErr error
+		wantErr    bool
+	}{
+		{name: "once succeeds", callID: callID(1), scope: tool.ScopeOnce},
+		{name: "session succeeds", callID: callID(2), scope: tool.ScopeSession},
+		{name: "workspace succeeds", callID: callID(3), scope: tool.ScopeWorkspace},
+		{name: "error surfaced", callID: callID(4), scope: tool.ScopeOnce, approveErr: errApprove, wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			agent := &fakeAgent{approveErr: tt.approveErr}
+			msg := approveCmd(context.Background(), agent, tt.callID, tt.scope)()
+
+			res, ok := msg.(promptResultMsg)
+			if !ok {
+				t.Fatalf("msg = %T, want promptResultMsg", msg)
+			}
+			if (res.err != nil) != tt.wantErr {
+				t.Errorf("err != nil = %v, want %v", res.err != nil, tt.wantErr)
+			}
+			if tt.wantErr && !errors.Is(res.err, errApprove) {
+				t.Errorf("err = %v, want %v", res.err, errApprove)
+			}
+			if agent.lastCallID != tt.callID {
+				t.Errorf("recorded callID = %v, want %v", agent.lastCallID, tt.callID)
+			}
+			if agent.lastScope != tt.scope {
+				t.Errorf("recorded scope = %v, want %v", agent.lastScope, tt.scope)
+			}
+		})
+	}
+}
+
+// TestDenyCmd covers the bounded deny dispatch: the call ID is forwarded and a
+// configured error surfaces on the result msg (non-fatal).
+func TestDenyCmd(t *testing.T) {
+	t.Parallel()
+
+	errDeny := errors.New("deny failed")
+
+	tests := []struct {
+		name    string
+		callID  uuid.UUID
+		denyErr error
+		wantErr bool
+	}{
+		{name: "deny succeeds", callID: callID(1)},
+		{name: "error surfaced", callID: callID(2), denyErr: errDeny, wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			agent := &fakeAgent{denyErr: tt.denyErr}
+			msg := denyCmd(context.Background(), agent, tt.callID)()
+
+			res, ok := msg.(promptResultMsg)
+			if !ok {
+				t.Fatalf("msg = %T, want promptResultMsg", msg)
+			}
+			if (res.err != nil) != tt.wantErr {
+				t.Errorf("err != nil = %v, want %v", res.err != nil, tt.wantErr)
+			}
+			if tt.wantErr && !errors.Is(res.err, errDeny) {
+				t.Errorf("err = %v, want %v", res.err, errDeny)
+			}
+			if agent.lastCallID != tt.callID {
+				t.Errorf("recorded callID = %v, want %v", agent.lastCallID, tt.callID)
+			}
+		})
+	}
+}
+
+// TestProvideAnswerCmd covers the bounded answer dispatch: the call ID and answer
+// are forwarded verbatim and a configured error surfaces on the result msg.
+func TestProvideAnswerCmd(t *testing.T) {
+	t.Parallel()
+
+	errAnswer := errors.New("answer failed")
+
+	tests := []struct {
+		name      string
+		callID    uuid.UUID
+		answer    string
+		answerErr error
+		wantErr   bool
+	}{
+		{name: "answer succeeds", callID: callID(1), answer: "yes, proceed"},
+		{name: "empty answer forwarded", callID: callID(2), answer: ""},
+		{name: "error surfaced", callID: callID(3), answer: "x", answerErr: errAnswer, wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			agent := &fakeAgent{answerErr: tt.answerErr}
+			msg := provideAnswerCmd(context.Background(), agent, tt.callID, tt.answer)()
+
+			res, ok := msg.(promptResultMsg)
+			if !ok {
+				t.Fatalf("msg = %T, want promptResultMsg", msg)
+			}
+			if (res.err != nil) != tt.wantErr {
+				t.Errorf("err != nil = %v, want %v", res.err != nil, tt.wantErr)
+			}
+			if tt.wantErr && !errors.Is(res.err, errAnswer) {
+				t.Errorf("err = %v, want %v", res.err, errAnswer)
+			}
+			if agent.lastCallID != tt.callID {
+				t.Errorf("recorded callID = %v, want %v", agent.lastCallID, tt.callID)
+			}
+			if agent.lastAnswer != tt.answer {
+				t.Errorf("recorded answer = %q, want %q", agent.lastAnswer, tt.answer)
+			}
+		})
+	}
+}
+
+// TestPromptDispatchBounded asserts the dispatch cmds honor a cancelled parent
+// context by returning promptly rather than blocking — the bounded-ctx guarantee
+// that keeps the Update loop from wedging on a stuck send. Each cmd still returns
+// a promptResultMsg (never panics).
+func TestPromptDispatchBounded(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // already-cancelled parent: the bounded child inherits cancellation
+
+	// Each goroutine gets its own agent: this test asserts only that the cmds
+	// return promptly, and a shared fake's recorder fields would race.
+	done := make(chan tea.Msg, 3)
+	go func() { done <- approveCmd(ctx, &fakeAgent{}, callID(1), tool.ScopeOnce)() }()
+	go func() { done <- denyCmd(ctx, &fakeAgent{}, callID(2))() }()
+	go func() { done <- provideAnswerCmd(ctx, &fakeAgent{}, callID(3), "a")() }()
+
+	for i := 0; i < 3; i++ {
+		select {
+		case msg := <-done:
+			if _, ok := msg.(promptResultMsg); !ok {
+				t.Errorf("msg = %T, want promptResultMsg", msg)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("dispatch cmd did not return promptly under a cancelled context")
+		}
 	}
 }
