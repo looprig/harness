@@ -128,6 +128,12 @@ Date: 2026-06-14 · Status: approved (brainstorm)
 > closed two consistency gaps: AskUser's gate registration is now a concrete
 > loop-provided `RequestUserInput(ctx,…)` helper (it never touches `gateReg` directly)
 > (§2e, §2c, §4b), and the §1 contracts list now includes `Auditable`/`WriteTarget`.
+>
+> **Amendment 2026-06-14 (TUI tool-use rendering)** — `event.ToolCallCompleted` gains
+> a capped `ResultPreview string` (runner fills it from `flattenToText(result.Content)`)
+> for the TUI's collapsed result preview; it is **stream-only**, dropped on the sink
+> path (output may hold secrets/PII). Driven by
+> `docs/plans/2026-06-14-tui-tool-use-design.md` (see §2d, §5b here).
 
 ## Scope
 
@@ -537,7 +543,11 @@ keeps draining.
 
 **Observability events** (auto-approved tools execute silently otherwise):
 `event.ToolCallStarted{CallID, ToolName, Summary string}` before run,
-`event.ToolCallCompleted{CallID, IsError}` after. **`Summary` is a redacted, capped
+`event.ToolCallCompleted{CallID, IsError, ResultPreview string}` after — the runner
+fills `ResultPreview` from `flattenToText(result.Content)` **capped** (~2 KiB / 20
+lines, truncation marked), for the TUI's collapsed result preview
+(`docs/plans/2026-06-14-tui-tool-use-design.md`); it is **stream-only**, dropped on the
+sink path (see the redaction table) since tool output may hold secrets/PII. **`Summary` is a redacted, capped
 safe string — never raw `ArgsJSON`** (which can hold write-file contents, `Fetch`
 auth headers/cookies, a `Bash` command with an inline token, or PII; CLAUDE.md: *log
 security events, not secrets*). Tools supply it via an optional
@@ -1005,7 +1015,7 @@ knows the concrete tool set and wires each tool's least-privilege deps.
 type PermissionRequested struct { CallID uuid.UUID; Request tool.PermissionRequest }
 type UserInputRequested  struct { CallID uuid.UUID; Question string; Choices []string }
 type ToolCallStarted     struct { CallID uuid.UUID; ToolName, Summary string } // Summary redacted/capped, never raw args
-type ToolCallCompleted   struct { CallID uuid.UUID; IsError bool }
+type ToolCallCompleted   struct { CallID uuid.UUID; IsError bool; ResultPreview string } // capped tool output; STREAM-only (redacted for sinks)
 // each: isEvent()
 ```
 
@@ -1032,6 +1042,7 @@ type Redactable interface { SinkProjection() Event } // loop calls this before e
 | `PermissionRequested` | full `Request` | `{CallID, ToolName}` only (drop `Description`) |
 | `UserInputRequested` | full `Question`/`Choices` | `{CallID, len(Choices)}` (drop `Question`) |
 | `ToolCallStarted` | redacted `Summary` (already safe) | unchanged |
+| `ToolCallCompleted` | full `ResultPreview` (capped tool output) | **`ResultPreview` dropped** — keep `CallID`/`IsError` (output may hold secrets/PII) |
 | `TokenDelta` (`TextChunk`/`ThinkingChunk`) | full text | model-output text; sink may drop by config (PII-bearing, not a secret) |
 | `TokenDelta` (`ToolUseChunk`) | full incl. `InputJSON` | **`InputJSON` dropped** — keep `Name`/`Index` only (the args are the secrets `ToolCallStarted.Summary` redacts) |
 | `TurnDone` | full `Message` | text/thinking as above; **every `ToolUseBlock.Input` redacted to `{}`** |
