@@ -249,13 +249,18 @@ func renderUser(text string, width int) string {
 	return strings.Join(out, "\n")
 }
 
+// thinkingRail is the left-rail margin ("│ ") that prefixes EVERY line of the
+// expanded thinking block — header included — so the block renders as one unbroken
+// vertical rail attaching the reasoning to the assistant turn it precedes.
+const thinkingRail = "│ "
+
 // renderThinking renders the model's reasoning under the unified ctrl+t expand
-// flag. When expanded it renders a dim block: a faint "thinking" header followed by
-// "│ "-prefixed, width-wrapped lines. When collapsed it renders a single compact
-// dim summary line ("thinking · N lines · ctrl+t", N = number of thinking content
-// lines, singularised to "1 line" for one line) instead of the full body.
-// Empty/whitespace-only reasoning renders nothing
-// in either mode.
+// flag. When expanded it renders a dim block whose every line carries the "│ " left
+// rail: a "│ thinking" header followed by "│ "-prefixed, width-wrapped reasoning
+// lines — an unbroken rail down the left margin. When collapsed it renders a single
+// compact dim summary line ("thinking · N lines · ctrl+t", N = number of thinking
+// content lines, singularised to "1 line" for one line) — a one-liner, so no rail.
+// Empty/whitespace-only reasoning renders nothing in either mode.
 func renderThinking(s string, expand bool, width int) string {
 	s = strings.TrimSpace(s) // drop the model's leading/trailing blank reasoning lines
 	if s == "" {
@@ -266,10 +271,10 @@ func renderThinking(s string, expand bool, width int) string {
 		summary := styles.ThinkingHeader + hintSeparator + pluralLines(n) + hintSeparator + expandHint
 		return styles.ThinkingStyle.Render(summary)
 	}
-	out := []string{styles.ThinkingStyle.Render(styles.ThinkingHeader)}
+	out := []string{styles.ThinkingStyle.Render(thinkingRail + styles.ThinkingHeader)}
 	for _, raw := range strings.Split(s, "\n") {
 		for _, line := range wrapToWidth(raw, width-barWidth) {
-			out = append(out, styles.ThinkingStyle.Render("│ "+line))
+			out = append(out, styles.ThinkingStyle.Render(thinkingRail+line))
 		}
 	}
 	return strings.Join(out, "\n")

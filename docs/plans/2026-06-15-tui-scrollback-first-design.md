@@ -376,8 +376,9 @@ on failure; it is never fatal (a gone gate is also covered by the terminal-event
 ## Thinking & status line
 
 **Thinking — renderer unchanged, lifecycle changed.** `render.go`'s `renderThinking` already
-produces a dim `thinking` header + `│ `-prefixed lines (`ThinkingStyle`, faint+italic), with
-tests. During a turn, `content.ThinkingChunk` accumulates into the live segment and shows in
+produces a dim block with a continuous `│ ` left rail on every line — a `│ thinking` header
+plus `│ `-prefixed reasoning lines (`ThinkingStyle`, faint, non-italic so the rail stays an
+unbroken vertical line), with tests. During a turn, `content.ThinkingChunk` accumulates into the live segment and shows in
 the capped live tail; at the boundary it commits to scrollback as part of the assistant entry
 (`content.ThinkingBlock`), above the answer text.
 
@@ -533,7 +534,7 @@ separator; box stays for queued input):
 
  ● I'll add a --version flag to the CLI entrypoint. Let me read
    the current flag setup first.
-   thinking
+   │ thinking
    │ The CLI builds the program in main; I should add the flag
    │ parse before tea.NewProgram and short-circuit on --version.
 

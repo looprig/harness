@@ -79,9 +79,11 @@ func SeparatorRule(width int) string {
 	return StatusStyle.Render(strings.Repeat(separatorRune, width))
 }
 
-// ThinkingStyle renders the model's reasoning block: faint and italic, subordinate
-// to the assistant narration it precedes.
-var ThinkingStyle = lipgloss.NewStyle().Faint(true).Italic(true)
+// ThinkingStyle renders the model's reasoning block: faint (never italic),
+// subordinate to the assistant narration it precedes. Italic is deliberately
+// omitted — it skewed the "│ " left rail and broke the column alignment; a
+// non-italic rail renders as a clean, unbroken vertical line.
+var ThinkingStyle = lipgloss.NewStyle().Faint(true)
 
 // NewMarkdownRenderer builds a glamour renderer for the given wrap width.
 //

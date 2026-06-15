@@ -352,10 +352,12 @@ func TestRenderAssistantLiveCards(t *testing.T) {
 }
 
 // TestRenderThinking covers the dim reasoning block under the unified ctrl+t flag.
-// Expanded: a "thinking" header followed by "│ "-prefixed lines, one per source
-// line. Collapsed: a single compact summary line "thinking · N lines · ctrl+t"
-// (N = number of thinking content lines, singularised to "1 line"), with NO
-// "│ "-prefixed body. Empty or whitespace-only input renders nothing in either mode.
+// Expanded: EVERY line carries the "│ " left rail — the header renders as
+// "│ thinking" and each body line as "│ <text>", producing an unbroken vertical
+// rail down the left margin. Collapsed: a single compact summary line
+// "thinking · N lines · ctrl+t" (N = number of thinking content lines, singularised
+// to "1 line"), with NO "│ "-prefixed body and NO rail (it is a one-liner). Empty or
+// whitespace-only input renders nothing in either mode.
 func TestRenderThinking(t *testing.T) {
 	t.Parallel()
 
@@ -372,10 +374,13 @@ func TestRenderThinking(t *testing.T) {
 		{name: "whitespace renders nothing collapsed", in: "   \n  ", expand: false, wantEmpty: true},
 		{name: "whitespace renders nothing expanded", in: "   \n  ", expand: true, wantEmpty: true},
 		{
-			name:         "expanded multi-line gets header and bar-prefixed lines",
+			// Expanded: the header carries the rail ("│ thinking", not bare "thinking")
+			// and every body line carries the rail too — an unbroken left rail.
+			name:         "expanded multi-line rails every line including header",
 			in:           "line one\nline two",
 			expand:       true,
-			wantContains: []string{"thinking", "│ line one", "│ line two"},
+			wantContains: []string{"│ thinking", "│ line one", "│ line two"},
+			wantAbsent:   []string{"\nthinking", "more lines"},
 		},
 		{
 			// Collapsed two-line thinking → a compact summary mentioning "thinking",
@@ -422,6 +427,29 @@ func TestRenderThinking(t *testing.T) {
 	}
 }
 
+// TestRenderThinkingExpandedRailOnEveryLine asserts the expanded thinking block is
+// an UNBROKEN left rail: every rendered line — the header AND each body line —
+// begins with the "│ " rail in the same column, so the block reads as a sub-block
+// attached to the assistant turn. No line (not even the header) is left bare.
+func TestRenderThinkingExpandedRailOnEveryLine(t *testing.T) {
+	t.Parallel()
+
+	const rail = "│ "
+	got := stripANSI(renderThinking("line one\nline two\nline three", true, 80))
+	lines := strings.Split(got, "\n")
+	if len(lines) < 4 { // header + three body lines
+		t.Fatalf("expanded thinking = %q, want at least 4 lines (header + body)", got)
+	}
+	if got, want := lines[0], rail+styles.ThinkingHeader; got != want {
+		t.Errorf("header line = %q, want %q (rail on the header, not bare)", got, want)
+	}
+	for i, ln := range lines {
+		if !strings.HasPrefix(ln, rail) {
+			t.Errorf("line %d = %q, want it to start with the rail %q (unbroken rail)", i, ln, rail)
+		}
+	}
+}
+
 // TestRenderAssistantUnifiedExpand covers Task 12: ONE flag drives BOTH the
 // thinking block and the tool-result folding. Collapsed (expand=false): thinking
 // renders as the compact summary line (no "│ " body) AND the long tool result is
@@ -450,8 +478,9 @@ func TestRenderAssistantUnifiedExpand(t *testing.T) {
 		}
 	}
 
-	// Expanded: the full "│ "-prefixed thinking body AND every tool-result line.
-	for _, w := range []string{"│ reason one", "│ reason three", "line6", "line9"} {
+	// Expanded: the full "│ "-prefixed thinking body — header included — AND every
+	// tool-result line.
+	for _, w := range []string{"│ thinking", "│ reason one", "│ reason three", "line6", "line9"} {
 		if !strings.Contains(expanded, w) {
 			t.Errorf("expanded renderAssistant missing %q in %q", w, expanded)
 		}
@@ -470,7 +499,7 @@ func TestRenderAssistantThinkingBlock(t *testing.T) {
 
 	got := stripANSI(renderAssistant("my reasoning", "the final answer", nil, true, 80)) // expanded
 
-	for _, w := range []string{"thinking", "my reasoning", "the final answer"} {
+	for _, w := range []string{"│ thinking", "│ my reasoning", "the final answer"} {
 		if !strings.Contains(got, w) {
 			t.Errorf("renderAssistant() = %q, want to contain %q", got, w)
 		}
