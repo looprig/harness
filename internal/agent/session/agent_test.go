@@ -13,6 +13,7 @@ import (
 	"github.com/inventivepotter/urvi/internal/agent/loop/event"
 	"github.com/inventivepotter/urvi/internal/content"
 	"github.com/inventivepotter/urvi/internal/llm"
+	"github.com/inventivepotter/urvi/internal/uuid"
 )
 
 // stubLLM is a controllable llm.LLM for session tests.
@@ -74,6 +75,22 @@ func (r *recordingSink) sawTerminal() bool {
 	return false
 }
 
+// turnCausationID returns the CausationID stamped on the first turn-level
+// envelope (skipping the session-level SessionStarted, which has none). The
+// loop sets envelope CausationID to the issuing StartTurn's Header.ID, so a
+// non-zero value here proves the session stamped a fresh Header.ID on the command.
+func (r *recordingSink) turnCausationID() (uuid.UUID, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, env := range r.envs {
+		if _, ok := env.Event.(event.SessionStarted); ok {
+			continue
+		}
+		return env.CausationID, true
+	}
+	return uuid.UUID{}, false
+}
+
 func cfg(client llm.LLM) loop.Config {
 	return loop.Config{Client: client, Model: llm.ModelSpec{Model: "m"}, DrainTimeout: 100 * time.Millisecond}
 }
@@ -108,6 +125,32 @@ func TestNewAgent(t *testing.T) {
 			t.Fatalf("err = %v, want *SessionError{SessionContextDone}", err)
 		}
 	})
+}
+
+// TestInvokeStampsCommandHeaderID asserts the session stamps a fresh, non-zero
+// Header.ID on the StartTurn it sends. The loop copies the command's Header.ID
+// onto each turn envelope's CausationID, so observing a non-zero CausationID via
+// a sink proves the stamp happened end-to-end.
+func TestInvokeStampsCommandHeaderID(t *testing.T) {
+	t.Parallel()
+	sink := &recordingSink{}
+	s, err := NewAgent(context.Background(), cfgWithSink(&stubLLM{chunks: []content.Chunk{textChunk("hi")}}, sink))
+	if err != nil {
+		t.Fatalf("NewAgent: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Shutdown(context.Background()) })
+
+	if _, err := s.Invoke(context.Background(), nil); err != nil {
+		t.Fatalf("Invoke: %v", err)
+	}
+
+	cid, ok := sink.turnCausationID()
+	if !ok {
+		t.Fatal("no turn-level envelope captured")
+	}
+	if cid.IsZero() {
+		t.Fatal("CausationID is zero: session did not stamp a non-zero Header.ID on StartTurn")
+	}
 }
 
 func TestInvokeReturnsTurnDone(t *testing.T) {

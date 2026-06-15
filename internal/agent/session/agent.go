@@ -50,6 +50,17 @@ func (e *SessionError) Error() string {
 }
 func (e *SessionError) Unwrap() error { return e.Cause }
 
+// newCommandID mints a fresh correlation ID for a command Header. Any
+// crypto/rand failure is mapped onto the session's typed error path rather than
+// swallowed, so callers never send an unidentifiable (zero-ID) command.
+func newCommandID() (uuid.UUID, error) {
+	id, err := uuid.New()
+	if err != nil {
+		return uuid.UUID{}, &SessionError{Kind: SessionIDGenerationFailed, Cause: err}
+	}
+	return id, nil
+}
+
 type AgentSession struct {
 	SessionID uuid.UUID
 	loop      *loop.Loop
@@ -82,13 +93,18 @@ func NewAgent(ctx context.Context, cfg loop.Config) (*AgentSession, error) {
 // Invoke sends input and blocks until a terminal event.
 // Cancelling ctx cancels the running turn; Invoke returns the event.TurnInterrupted event.
 func (s *AgentSession) Invoke(ctx context.Context, input []content.Block) (event.Event, error) {
+	id, err := newCommandID()
+	if err != nil {
+		return nil, err
+	}
 	events := make(chan event.Event, 64)
 	ack := make(chan error, 1)
 	abandoned := make(chan struct{})
 	defer close(abandoned) // ensures deliverAndClose always has an escape if Invoke exits early
 
 	select {
-	case s.loop.Commands <- command.StartTurn{Ctx: ctx, Input: input, Events: events, Abandoned: abandoned, Ack: ack}:
+	// User-initiated turn: CausationID is zero (root).
+	case s.loop.Commands <- command.StartTurn{Header: command.Header{ID: id}, Ctx: ctx, Input: input, Events: events, Abandoned: abandoned, Ack: ack}:
 	case <-ctx.Done():
 		return nil, &SessionError{Kind: SessionContextDone, Cause: ctx.Err()}
 	case <-s.loop.Done:
@@ -123,6 +139,10 @@ func (s *AgentSession) Invoke(ctx context.Context, input []content.Block) (event
 // keeps reading. Calling sr.Close() abandons the event stream and cancels the turn.
 // Callers must either read until EOF or call Close.
 func (s *AgentSession) Stream(ctx context.Context, input []content.Block) (*llm.StreamReader[event.Event], error) {
+	id, err := newCommandID()
+	if err != nil {
+		return nil, err
+	}
 	streamCtx, streamCancel := context.WithCancel(ctx)
 	abandoned := make(chan struct{})
 	var abandonOnce sync.Once
@@ -130,7 +150,9 @@ func (s *AgentSession) Stream(ctx context.Context, input []content.Block) (*llm.
 	ack := make(chan error, 1)
 
 	select {
+	// User-initiated turn: CausationID is zero (root).
 	case s.loop.Commands <- command.StartTurn{
+		Header:    command.Header{ID: id},
 		Ctx:       streamCtx,
 		Input:     input,
 		Events:    events,
@@ -181,9 +203,13 @@ func (s *AgentSession) Stream(ctx context.Context, input []content.Block) (*llm.
 // Interrupt cancels the running turn. Returns true if a turn was cancelled.
 // ctx allows the caller to time out the cancel attempt if the actor is slow.
 func (s *AgentSession) Interrupt(ctx context.Context) (bool, error) {
+	id, err := newCommandID()
+	if err != nil {
+		return false, err
+	}
 	ack := make(chan bool, 1)
 	select {
-	case s.loop.Commands <- command.Interrupt{Ack: ack}:
+	case s.loop.Commands <- command.Interrupt{Header: command.Header{ID: id}, Ack: ack}:
 	case <-s.loop.Done:
 		return false, &SessionError{Kind: SessionLoopExited}
 	case <-ctx.Done():
@@ -203,9 +229,13 @@ func (s *AgentSession) Interrupt(ctx context.Context) (bool, error) {
 // Shutdown cancels any running turn and blocks until the actor exits.
 // Calling Shutdown after the actor has exited is a no-op.
 func (s *AgentSession) Shutdown(ctx context.Context) error {
+	id, err := newCommandID()
+	if err != nil {
+		return err
+	}
 	ack := make(chan error, 1)
 	select {
-	case s.loop.Commands <- command.Shutdown{Ack: ack}:
+	case s.loop.Commands <- command.Shutdown{Header: command.Header{ID: id}, Ack: ack}:
 	case <-s.loop.Done:
 		return nil
 	case <-ctx.Done():
