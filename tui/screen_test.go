@@ -309,29 +309,508 @@ func TestUpdateThinkingChunkSkipped(t *testing.T) {
 	}
 }
 
+// TestUpdateTurnDone exercises the Task 2.4 rule: the live segment is
+// authoritative and ev.Message is a fallback only — never both — so a streamed
+// turn never duplicates its final text from the carried message (design §6).
+// callID returns a deterministic non-zero UUID for a test, distinguishing tool
+// calls by a single byte so CallID correlation can be asserted.
+func callID(b byte) uuid.UUID {
+	var u uuid.UUID
+	u[0] = b
+	return u
+}
+
+// runningScreen returns a fresh Screen wired for handleEvent: a non-nil reader
+// (readNext targets must be non-nil) and StatusRunning.
+func runningScreen(t *testing.T) Screen {
+	t.Helper()
+	agent := &fakeAgent{}
+	m := New(context.Background(), agent, fakeOpen(agent))
+	m.reader = scriptedReader()
+	m.status = StatusRunning
+	return m
+}
+
+// feed drives one synthetic event through Update and returns the new Screen.
+func feed(t *testing.T, m Screen, ev event.Event) Screen {
+	t.Helper()
+	m, _ = updateScreen(t, m, eventMsg{ev: ev})
+	return m
+}
+
+// assistantSegments returns the RoleAssistant rows of the transcript in order.
+func assistantSegments(msgs []DisplayMessage) []DisplayMessage {
+	var out []DisplayMessage
+	for _, msg := range msgs {
+		if msg.Role == RoleAssistant {
+			out = append(out, msg)
+		}
+	}
+	return out
+}
+
+// TestSplitLines covers the result-preview splitter.
+func TestSplitLines(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		in   string
+		want []string
+	}{
+		{name: "empty yields nil", in: "", want: nil},
+		{name: "single line", in: "one", want: []string{"one"}},
+		{name: "two lines", in: "a\nb", want: []string{"a", "b"}},
+		{name: "trailing newline keeps empty tail", in: "a\n", want: []string{"a", ""}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got := splitLines(tt.in)
+			if len(got) != len(tt.want) {
+				t.Fatalf("splitLines(%q) = %#v, want %#v", tt.in, got, tt.want)
+			}
+			for i := range tt.want {
+				if got[i] != tt.want[i] {
+					t.Errorf("splitLines(%q)[%d] = %q, want %q", tt.in, i, got[i], tt.want[i])
+				}
+			}
+		})
+	}
+}
+
+// TestCommitLive covers the commit helper directly: it carries both text and
+// calls, commits a calls-only (bare) segment, resets live, and no-ops when empty.
+func TestCommitLive(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name        string
+		live        liveSegment
+		wantSegment bool
+		wantText    string
+		wantCalls   int
+	}{
+		{
+			name:        "text and calls both survive",
+			live:        liveSegment{text: "narration", calls: []ToolCallView{{CallID: callID(1)}}},
+			wantSegment: true,
+			wantText:    "narration",
+			wantCalls:   1,
+		},
+		{
+			name:        "calls only commits bare segment with nil blocks",
+			live:        liveSegment{calls: []ToolCallView{{CallID: callID(2)}}},
+			wantSegment: true,
+			wantText:    "",
+			wantCalls:   1,
+		},
+		{
+			name:        "text only",
+			live:        liveSegment{text: "hi"},
+			wantSegment: true,
+			wantText:    "hi",
+			wantCalls:   0,
+		},
+		{
+			name:        "empty is no-op",
+			live:        liveSegment{},
+			wantSegment: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			agent := &fakeAgent{}
+			m := New(context.Background(), agent, fakeOpen(agent))
+			m.live = tt.live
+
+			m.commitLive()
+
+			if m.live.text != "" || len(m.live.calls) > 0 {
+				t.Errorf("live not reset: %+v", m.live)
+			}
+			if !tt.wantSegment {
+				if len(m.messages) != 0 {
+					t.Fatalf("expected no segment, got %d", len(m.messages))
+				}
+				return
+			}
+			if len(m.messages) != 1 {
+				t.Fatalf("messages len = %d, want 1", len(m.messages))
+			}
+			seg := m.messages[0]
+			if seg.Role != RoleAssistant {
+				t.Errorf("role = %d, want RoleAssistant", seg.Role)
+			}
+			if got := firstTextBlock(t, seg); got != tt.wantText {
+				t.Errorf("text = %q, want %q", got, tt.wantText)
+			}
+			if tt.wantText == "" && seg.Blocks != nil {
+				t.Errorf("bare segment Blocks = %v, want nil", seg.Blocks)
+			}
+			if len(seg.ToolCalls) != tt.wantCalls {
+				t.Errorf("ToolCalls len = %d, want %d", len(seg.ToolCalls), tt.wantCalls)
+			}
+		})
+	}
+}
+
+// TestTokenDeltaCommitsAfterTools covers Task 2.1: narration after a tool batch
+// commits the prior segment then starts fresh; plain text→text just accumulates.
+func TestTokenDeltaCommitsAfterTools(t *testing.T) {
+	t.Parallel()
+
+	t.Run("text then tools then text splits", func(t *testing.T) {
+		t.Parallel()
+
+		m := runningScreen(t)
+		m = feed(t, m, event.TokenDelta{Chunk: &content.TextChunk{Text: "before "}})
+		m = feed(t, m, event.ToolCallStarted{CallID: callID(1), ToolName: "ReadFile"})
+		m = feed(t, m, event.ToolCallCompleted{CallID: callID(1)})
+		// New narration after the (completed) batch must commit the first segment.
+		m = feed(t, m, event.TokenDelta{Chunk: &content.TextChunk{Text: "after"}})
+
+		if len(m.messages) != 1 {
+			t.Fatalf("committed segments = %d, want 1", len(m.messages))
+		}
+		first := m.messages[0]
+		if got := firstTextBlock(t, first); got != "before " {
+			t.Errorf("first segment text = %q, want %q", got, "before ")
+		}
+		if len(first.ToolCalls) != 1 {
+			t.Fatalf("first segment cards = %d, want 1", len(first.ToolCalls))
+		}
+		if m.live.text != "after" {
+			t.Errorf("live.text = %q, want %q", m.live.text, "after")
+		}
+		if len(m.live.calls) != 0 {
+			t.Errorf("live.calls len = %d, want 0 (fresh segment)", len(m.live.calls))
+		}
+	})
+
+	t.Run("plain text accumulates into one live", func(t *testing.T) {
+		t.Parallel()
+
+		m := runningScreen(t)
+		m = feed(t, m, event.TokenDelta{Chunk: &content.TextChunk{Text: "ab"}})
+		m = feed(t, m, event.TokenDelta{Chunk: &content.TextChunk{Text: "cd"}})
+
+		if len(m.messages) != 0 {
+			t.Errorf("committed segments = %d, want 0 (no calls present)", len(m.messages))
+		}
+		if m.live.text != "abcd" {
+			t.Errorf("live.text = %q, want %q", m.live.text, "abcd")
+		}
+	})
+}
+
+// TestToolCallStarted covers Task 2.2: parallel batches stay in one segment;
+// back-to-back terminal batches (no narration between) split.
+func TestToolCallStarted(t *testing.T) {
+	t.Parallel()
+
+	t.Run("parallel batch attaches to one segment", func(t *testing.T) {
+		t.Parallel()
+
+		m := runningScreen(t)
+		// Two starts before any completion: both still running → same segment.
+		m = feed(t, m, event.ToolCallStarted{CallID: callID(1), ToolName: "A"})
+		m = feed(t, m, event.ToolCallStarted{CallID: callID(2), ToolName: "B"})
+
+		if len(m.messages) != 0 {
+			t.Fatalf("committed segments = %d, want 0 (parallel batch not split)", len(m.messages))
+		}
+		if len(m.live.calls) != 2 {
+			t.Fatalf("live.calls len = %d, want 2", len(m.live.calls))
+		}
+	})
+
+	t.Run("back-to-back terminal batches split", func(t *testing.T) {
+		t.Parallel()
+
+		// text → tool(completed) → tool(no text between) → text → done = 3 segments.
+		m := runningScreen(t)
+		m = feed(t, m, event.TokenDelta{Chunk: &content.TextChunk{Text: "narr"}})
+		m = feed(t, m, event.ToolCallStarted{CallID: callID(1), ToolName: "A"})
+		m = feed(t, m, event.ToolCallCompleted{CallID: callID(1)})
+		// Second batch starts with the first all-terminal and NO narration → split.
+		m = feed(t, m, event.ToolCallStarted{CallID: callID(2), ToolName: "B"})
+		m = feed(t, m, event.ToolCallCompleted{CallID: callID(2)})
+		m = feed(t, m, event.TokenDelta{Chunk: &content.TextChunk{Text: "tail"}})
+		m = feed(t, m, event.TurnDone{})
+
+		segs := assistantSegments(m.messages)
+		if len(segs) != 3 {
+			t.Fatalf("assistant segments = %d, want 3", len(segs))
+		}
+		if got := firstTextBlock(t, segs[0]); got != "narr" || len(segs[0].ToolCalls) != 1 {
+			t.Errorf("seg0 = text %q cards %d, want %q / 1", got, len(segs[0].ToolCalls), "narr")
+		}
+		// seg1 is the bare back-to-back batch: no text, one card.
+		if firstTextBlock(t, segs[1]) != "" || len(segs[1].ToolCalls) != 1 {
+			t.Errorf("seg1 = text %q cards %d, want bare with 1 card", firstTextBlock(t, segs[1]), len(segs[1].ToolCalls))
+		}
+		if got := firstTextBlock(t, segs[2]); got != "tail" || len(segs[2].ToolCalls) != 0 {
+			t.Errorf("seg2 = text %q cards %d, want %q / 0", got, len(segs[2].ToolCalls), "tail")
+		}
+	})
+}
+
+// TestToolCallCompleted covers Task 2.3: status flip + result by CallID, the
+// committed-segment fallback, unknown-CallID no-op, and the failure card.
+func TestToolCallCompleted(t *testing.T) {
+	t.Parallel()
+
+	t.Run("success flips matching card to OK with result", func(t *testing.T) {
+		t.Parallel()
+
+		m := runningScreen(t)
+		m = feed(t, m, event.ToolCallStarted{CallID: callID(1), ToolName: "ReadFile"})
+		m = feed(t, m, event.ToolCallStarted{CallID: callID(2), ToolName: "Bash"})
+		m = feed(t, m, event.ToolCallCompleted{CallID: callID(2), ResultPreview: "out1\nout2"})
+
+		if len(m.live.calls) != 2 {
+			t.Fatalf("live.calls len = %d, want 2", len(m.live.calls))
+		}
+		if m.live.calls[0].Status != ToolRunning {
+			t.Errorf("card 0 status = %d, want ToolRunning (untouched)", m.live.calls[0].Status)
+		}
+		c := m.live.calls[1]
+		if c.Status != ToolOK {
+			t.Errorf("card 1 status = %d, want ToolOK", c.Status)
+		}
+		if len(c.Result) != 2 || c.Result[0] != "out1" || c.Result[1] != "out2" {
+			t.Errorf("card 1 Result = %#v, want [out1 out2]", c.Result)
+		}
+	})
+
+	t.Run("error flips card to ToolError", func(t *testing.T) {
+		t.Parallel()
+
+		m := runningScreen(t)
+		m = feed(t, m, event.ToolCallStarted{CallID: callID(1), ToolName: "Bash"})
+		m = feed(t, m, event.ToolCallCompleted{CallID: callID(1), IsError: true, ResultPreview: "boom"})
+
+		if m.live.calls[0].Status != ToolError {
+			t.Errorf("status = %d, want ToolError", m.live.calls[0].Status)
+		}
+		if len(m.live.calls[0].Result) != 1 || m.live.calls[0].Result[0] != "boom" {
+			t.Errorf("Result = %#v, want [boom]", m.live.calls[0].Result)
+		}
+	})
+
+	t.Run("unknown CallID is a no-op", func(t *testing.T) {
+		t.Parallel()
+
+		m := runningScreen(t)
+		m = feed(t, m, event.ToolCallStarted{CallID: callID(1), ToolName: "A"})
+		m = feed(t, m, event.ToolCallCompleted{CallID: callID(9), ResultPreview: "ignored"})
+
+		// The known card is untouched: still running, no result.
+		c := m.live.calls[0]
+		if c.Status != ToolRunning || c.Result != nil {
+			t.Errorf("card mutated by unknown CallID: status %d result %#v, want ToolRunning nil", c.Status, c.Result)
+		}
+	})
+
+	t.Run("completed updates committed-segment fallback", func(t *testing.T) {
+		t.Parallel()
+
+		// Commit a segment carrying a still-running card, then complete it.
+		m := runningScreen(t)
+		m = feed(t, m, event.ToolCallStarted{CallID: callID(1), ToolName: "A"})
+		m.commitLive() // simulate the card living in a committed segment
+		m = feed(t, m, event.ToolCallCompleted{CallID: callID(1), IsError: false, ResultPreview: "done"})
+
+		segs := assistantSegments(m.messages)
+		if len(segs) != 1 || len(segs[0].ToolCalls) != 1 {
+			t.Fatalf("want 1 committed segment with 1 card; got %d segs", len(segs))
+		}
+		c := segs[0].ToolCalls[0]
+		if c.Status != ToolOK || len(c.Result) != 1 || c.Result[0] != "done" {
+			t.Errorf("fallback card = %+v, want ToolOK [done]", c)
+		}
+	})
+
+	t.Run("pre-execution failure card", func(t *testing.T) {
+		t.Parallel()
+
+		// Started + Completed{IsError} with no execution → a ✗ card with the error
+		// (covers denied/invalid/unknown/WriteTarget — design §5).
+		m := runningScreen(t)
+		m = feed(t, m, event.ToolCallStarted{CallID: callID(1), ToolName: "WriteFile", Summary: "config.yaml"})
+		m = feed(t, m, event.ToolCallCompleted{CallID: callID(1), IsError: true, ResultPreview: "error: permission denied"})
+
+		c := m.live.calls[0]
+		if c.Status != ToolError {
+			t.Errorf("failure card status = %d, want ToolError", c.Status)
+		}
+		if len(c.Result) != 1 || c.Result[0] != "error: permission denied" {
+			t.Errorf("failure card Result = %#v, want [error: permission denied]", c.Result)
+		}
+	})
+}
+
+// TestTurnFailedCommitsLive covers Task 2.5: a TurnFailed after a tool batch
+// commits the segment (tool work visible) then appends the RoleError.
+func TestTurnFailedCommitsLive(t *testing.T) {
+	t.Parallel()
+
+	m := runningScreen(t)
+	m = feed(t, m, event.TokenDelta{Chunk: &content.TextChunk{Text: "working"}})
+	m = feed(t, m, event.ToolCallStarted{CallID: callID(1), ToolName: "Bash"})
+	m = feed(t, m, event.ToolCallCompleted{CallID: callID(1), ResultPreview: "ok"})
+	m = feed(t, m, event.TurnFailed{Err: errors.New("boom")})
+
+	if len(m.messages) != 2 {
+		t.Fatalf("messages len = %d, want 2 (assistant segment + error)", len(m.messages))
+	}
+	seg := m.messages[0]
+	if seg.Role != RoleAssistant || firstTextBlock(t, seg) != "working" || len(seg.ToolCalls) != 1 {
+		t.Errorf("seg = role %d text %q cards %d, want assistant 'working' 1 card", seg.Role, firstTextBlock(t, seg), len(seg.ToolCalls))
+	}
+	if m.messages[1].Role != RoleError || firstTextBlock(t, m.messages[1]) != "boom" {
+		t.Errorf("err row = role %d text %q, want RoleError 'boom'", m.messages[1].Role, firstTextBlock(t, m.messages[1]))
+	}
+	if m.live.text != "" || len(m.live.calls) != 0 {
+		t.Errorf("live not cleared: %+v", m.live)
+	}
+}
+
+// TestTurnInterruptedKeepsCards covers Task 2.5: interrupt mid-tool marks the
+// running card ToolCancelled and commits it (cards survive) before the tombstone.
+func TestTurnInterruptedKeepsCards(t *testing.T) {
+	t.Parallel()
+
+	agent := &fakeAgent{}
+	m := New(context.Background(), agent, fakeOpen(agent))
+	m.reader = scriptedReader()
+	m.status = StatusInterrupting
+	m = feed(t, m, event.TokenDelta{Chunk: &content.TextChunk{Text: "let me check"}})
+	m = feed(t, m, event.ToolCallStarted{CallID: callID(1), ToolName: "Bash"})
+	// Interrupt while the tool is still running.
+	m = feed(t, m, event.TurnInterrupted{})
+
+	if len(m.messages) != 2 {
+		t.Fatalf("messages len = %d, want 2 (segment + tombstone)", len(m.messages))
+	}
+	seg := m.messages[0]
+	if seg.Role != RoleAssistant {
+		t.Fatalf("messages[0] role = %d, want RoleAssistant", seg.Role)
+	}
+	if firstTextBlock(t, seg) != "let me check" {
+		t.Errorf("segment text = %q, want %q", firstTextBlock(t, seg), "let me check")
+	}
+	if len(seg.ToolCalls) != 1 {
+		t.Fatalf("segment cards = %d, want 1 (card survives interrupt)", len(seg.ToolCalls))
+	}
+	if seg.ToolCalls[0].Status != ToolCancelled {
+		t.Errorf("card status = %d, want ToolCancelled", seg.ToolCalls[0].Status)
+	}
+	if m.messages[1].Role != RoleInterrupted || m.messages[1].Blocks != nil {
+		t.Errorf("tombstone = role %d blocks %v, want RoleInterrupted nil", m.messages[1].Role, m.messages[1].Blocks)
+	}
+	if m.live.text != "" || len(m.live.calls) != 0 {
+		t.Errorf("live not cleared: %+v", m.live)
+	}
+}
+
+// TestQueueIndicesSurviveSegmentCommits covers Task 2.5's invariant: the extra
+// assistant-segment commits during a turn must not disturb queued RoleUser rows'
+// DisplayIndex mapping. A queued input's DisplayIndex must still point at its
+// RoleUser row after segments commit ahead of, and the turn ends behind, it.
+func TestQueueIndicesSurviveSegmentCommits(t *testing.T) {
+	t.Parallel()
+
+	agent := &fakeAgent{}
+	m := New(context.Background(), agent, fakeOpen(agent))
+	m.reader = scriptedReader()
+	m.status = StatusRunning
+
+	// The active user row (index 0) already exists for the running turn.
+	m.messages = []DisplayMessage{{Role: RoleUser, Blocks: []content.Block{&content.TextBlock{Text: "active"}}}}
+
+	// Stream the first segment of the turn (text + a completed tool batch),
+	// then a second segment of narration — two commits land at indices 1 and 2.
+	m = feed(t, m, event.TokenDelta{Chunk: &content.TextChunk{Text: "step 1"}})
+	m = feed(t, m, event.ToolCallStarted{CallID: callID(1), ToolName: "Bash"})
+	m = feed(t, m, event.ToolCallCompleted{CallID: callID(1), ResultPreview: "ok"})
+	m = feed(t, m, event.TokenDelta{Chunk: &content.TextChunk{Text: "step 2"}})
+
+	// Now the user queues an input mid-turn (Running): its RoleUser row appends
+	// at the current tail and queue[0].DisplayIndex records that tail index.
+	m.input.SetValue("queued question")
+	m, _ = updateScreen(t, m, tea.KeyMsg{Type: tea.KeyEnter})
+
+	if len(m.queue) != 1 {
+		t.Fatalf("queue len = %d, want 1", len(m.queue))
+	}
+	idx := m.queue[0].DisplayIndex
+	if idx < 0 || idx >= len(m.messages) {
+		t.Fatalf("queue DisplayIndex = %d, out of range len %d", idx, len(m.messages))
+	}
+	if m.messages[idx].Role != RoleUser {
+		t.Errorf("messages[%d].Role = %d, want RoleUser (queue index drifted)", idx, m.messages[idx].Role)
+	}
+	if got := firstTextBlock(t, m.messages[idx]); got != "queued question" {
+		t.Errorf("queued row text = %q, want %q", got, "queued question")
+	}
+
+	// Finish the turn with a final segment — another commit lands AHEAD of the
+	// queued row only if we appended out of order; since commits append at the
+	// tail, the queued row's index must still resolve to it.
+	m = feed(t, m, event.TurnDone{Message: nil})
+	if m.messages[idx].Role != RoleUser {
+		t.Errorf("after TurnDone messages[%d].Role = %d, want RoleUser", idx, m.messages[idx].Role)
+	}
+	if got := firstTextBlock(t, m.messages[idx]); got != "queued question" {
+		t.Errorf("after TurnDone queued row text = %q, want %q", got, "queued question")
+	}
+}
+
 func TestUpdateTurnDone(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		name      string
-		msg       *content.AIMessage
-		live      string
-		wantText  string
-		wantNil   bool
-		wantBlock bool
+		name        string
+		msg         *content.AIMessage
+		live        string
+		wantSegment bool   // expect a final RoleAssistant row
+		wantText    string // its first text-block text ("" → expect nil Blocks)
 	}{
 		{
-			name:      "with message blocks",
-			msg:       &content.AIMessage{Message: content.Message{Blocks: []content.Block{&content.TextBlock{Text: "hi"}}}},
-			live:      "partial",
-			wantText:  "hi",
-			wantBlock: true,
+			// live authoritative: the streamed text wins, ev.Message is ignored.
+			name:        "live wins over message",
+			msg:         &content.AIMessage{Message: content.Message{Blocks: []content.Block{&content.TextBlock{Text: "msg"}}}},
+			live:        "streamed",
+			wantSegment: true,
+			wantText:    "streamed",
 		},
 		{
-			name:    "nil message appends empty assistant turn",
-			msg:     nil,
-			live:    "partial",
-			wantNil: true,
+			// fallback: empty live + a non-nil message → one segment from Message.Blocks.
+			name:        "empty live falls back to message blocks",
+			msg:         &content.AIMessage{Message: content.Message{Blocks: []content.Block{&content.TextBlock{Text: "fallback"}}}},
+			live:        "",
+			wantSegment: true,
+			wantText:    "fallback",
+		},
+		{
+			// empty live + nil message → NO final segment.
+			name:        "empty live nil message no segment",
+			msg:         nil,
+			live:        "",
+			wantSegment: false,
+		},
+		{
+			// empty live + message with no blocks → NO final segment (nothing to show).
+			name:        "empty live empty message no segment",
+			msg:         &content.AIMessage{Message: content.Message{Blocks: nil}},
+			live:        "",
+			wantSegment: false,
 		},
 	}
 
@@ -352,21 +831,66 @@ func TestUpdateTurnDone(t *testing.T) {
 			if m.live.text != "" {
 				t.Errorf("live.text = %q, want cleared", m.live.text)
 			}
-			if len(m.messages) == 0 {
-				t.Fatal("expected an assistant row")
+			if !tt.wantSegment {
+				if len(m.messages) != 0 {
+					t.Fatalf("expected no final segment, got %d messages", len(m.messages))
+				}
+				return
 			}
-			last := m.messages[len(m.messages)-1]
+			if len(m.messages) != 1 {
+				t.Fatalf("messages len = %d, want exactly 1 (no duplication)", len(m.messages))
+			}
+			last := m.messages[0]
 			if last.Role != RoleAssistant {
 				t.Errorf("role = %d, want RoleAssistant (%d)", last.Role, RoleAssistant)
 			}
-			if tt.wantNil && last.Blocks != nil {
-				t.Errorf("nil-message blocks = %v, want nil", last.Blocks)
-			}
-			if tt.wantBlock && firstTextBlock(t, last) != tt.wantText {
-				t.Errorf("text = %q, want %q", firstTextBlock(t, last), tt.wantText)
+			if got := firstTextBlock(t, last); got != tt.wantText {
+				t.Errorf("text = %q, want %q", got, tt.wantText)
 			}
 		})
 	}
+}
+
+// TestUpdateTurnDoneNoDuplication is the §6 anchor case: a fully streamed turn
+// whose TurnDone.Message carries that SAME final text must produce exactly ONE
+// assistant segment, with the text appearing once.
+func TestUpdateTurnDoneNoDuplication(t *testing.T) {
+	t.Parallel()
+
+	const final = "the final answer"
+	agent := &fakeAgent{}
+	m := New(context.Background(), agent, fakeOpen(agent))
+	m.reader = scriptedReader()
+	m.status = StatusRunning
+
+	// Stream the final text, then TurnDone carries the same text in its Message.
+	m, _ = updateScreen(t, m, eventMsg{ev: event.TokenDelta{Chunk: &content.TextChunk{Text: final}}})
+	msg := &content.AIMessage{Message: content.Message{Blocks: []content.Block{&content.TextBlock{Text: final}}}}
+	m, _ = updateScreen(t, m, eventMsg{ev: event.TurnDone{Message: msg}})
+
+	if len(m.messages) != 1 {
+		t.Fatalf("messages len = %d, want exactly 1 segment (no duplication)", len(m.messages))
+	}
+	if got := firstTextBlock(t, m.messages[0]); got != final {
+		t.Errorf("final text = %q, want %q", got, final)
+	}
+	// The text appears exactly once across the whole transcript.
+	if n := strings.Count(renderAll(t, m), final); n != 1 {
+		t.Errorf("final text appears %d times in render, want 1", n)
+	}
+}
+
+// renderAll concatenates the first text block of every message into one string —
+// a cheap way to assert how many times a piece of text appears in the transcript
+// model (the render is flat this phase, so model text == rendered text).
+func renderAll(t *testing.T, m Screen) string {
+	t.Helper()
+	var b strings.Builder
+	for _, msg := range m.messages {
+		b.WriteString(firstTextBlock(t, msg))
+		b.WriteByte('\n')
+	}
+	return b.String()
 }
 
 func TestUpdateTurnFailed(t *testing.T) {

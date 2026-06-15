@@ -107,41 +107,182 @@ func (m Screen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 // handleEvent applies one turn-stream event to the model and returns the command
-// that pulls the next event (readNext). Unknown events are no-ops.
+// that pulls the next event (readNext). Unknown events are no-ops. It reconstructs
+// per-segment tool-call structure from the ordered event stream: an assistant text
+// segment is committed (with its tool-call children) when a new segment begins —
+// either when narration arrives after a tool batch (TokenDelta) or when a fresh,
+// narration-less batch starts (ToolCallStarted) — and at every terminal event.
 func (m *Screen) handleEvent(ev event.Event) tea.Cmd {
 	switch ev := ev.(type) {
 	case event.TurnStarted:
 		// Already Running; nothing to display.
 	case event.TokenDelta:
 		if tc, ok := ev.Chunk.(*content.TextChunk); ok {
+			// Narration following a completed tool batch begins a NEW segment:
+			// commit the prior segment (its text + cards) before accumulating.
+			if len(m.live.calls) > 0 {
+				m.commitLive()
+			}
 			m.live.text += tc.Text
 			m.refreshHistory()
 		}
 		// Any other chunk variant (e.g. *content.ThinkingChunk) is skipped.
+	case event.ToolCallStarted:
+		m.handleToolStarted(ev)
+	case event.ToolCallCompleted:
+		m.handleToolCompleted(ev)
 	case event.TurnDone:
-		var blocks []content.Block
-		if ev.Message != nil {
-			blocks = ev.Message.Blocks
-		}
-		m.messages = append(m.messages, DisplayMessage{Role: RoleAssistant, Blocks: blocks})
-		m.live = liveSegment{}
-		m.refreshHistory()
+		m.handleTurnDone(ev)
 	case event.TurnFailed:
+		if m.liveNonEmpty() {
+			m.commitLive() // keep completed tool work + partial text visible
+		}
 		m.appendError(ev.Err)
 		m.live = liveSegment{}
 		m.refreshHistory()
 	case event.TurnInterrupted:
-		if m.live.text != "" || len(m.live.calls) > 0 {
-			m.messages = append(m.messages, DisplayMessage{
-				Role:   RoleAssistant,
-				Blocks: []content.Block{&content.TextBlock{Text: m.live.text}},
-			})
-		}
-		m.messages = append(m.messages, DisplayMessage{Role: RoleInterrupted, Blocks: nil})
-		m.live = liveSegment{}
-		m.refreshHistory()
+		m.handleTurnInterrupted()
 	}
 	return readNext(m.reader)
+}
+
+// liveNonEmpty reports whether the live segment carries committable content —
+// either streamed narration text or any reconstructed tool call.
+func (m *Screen) liveNonEmpty() bool {
+	return m.live.text != "" || len(m.live.calls) > 0
+}
+
+// commitLive appends the live segment to the transcript as one RoleAssistant row
+// carrying BOTH its narration text and its tool-call children, then resets the
+// live segment. It is a no-op when the live segment is empty. A segment with no
+// text but with calls still commits (a bare assistant row whose only content is
+// its tool cards, per design §3): the empty TextBlock is omitted so the row's
+// Blocks are nil and only ToolCalls survive.
+func (m *Screen) commitLive() {
+	if !m.liveNonEmpty() {
+		return
+	}
+	var blocks []content.Block
+	if m.live.text != "" {
+		blocks = []content.Block{&content.TextBlock{Text: m.live.text}}
+	}
+	m.messages = append(m.messages, DisplayMessage{
+		Role:      RoleAssistant,
+		Blocks:    blocks,
+		ToolCalls: m.live.calls,
+	})
+	m.live = liveSegment{}
+}
+
+// handleToolStarted appends a new running tool card to the live segment. When the
+// existing cards are all terminal, the new card begins a fresh batch with no
+// narration between (design §5 back-to-back) — the prior segment is committed
+// first so each batch becomes its own (possibly bare) assistant row.
+func (m *Screen) handleToolStarted(ev event.ToolCallStarted) {
+	if len(m.live.calls) > 0 && m.allCallsTerminal() {
+		m.commitLive()
+	}
+	m.live.calls = append(m.live.calls, ToolCallView{
+		CallID:   ev.CallID,
+		ToolName: ev.ToolName,
+		Summary:  ev.Summary,
+		Status:   ToolRunning,
+	})
+	m.refreshHistory()
+}
+
+// allCallsTerminal reports whether every call in the live segment has reached a
+// terminal status (anything other than ToolRunning). An empty slice is vacuously
+// terminal, but callers guard on len(calls) > 0 before relying on it.
+func (m *Screen) allCallsTerminal() bool {
+	for i := range m.live.calls {
+		if m.live.calls[i].Status == ToolRunning {
+			return false
+		}
+	}
+	return true
+}
+
+// handleToolCompleted flips the matching tool card (by CallID) to its terminal
+// status and attaches the result preview. It searches the live segment first,
+// then falls back to the most recent committed RoleAssistant row (defensive: the
+// batch normally completes while its cards are still live). An unknown CallID is
+// a no-op — no panic.
+func (m *Screen) handleToolCompleted(ev event.ToolCallCompleted) {
+	status := ToolOK
+	if ev.IsError {
+		status = ToolError
+	}
+	result := splitLines(ev.ResultPreview)
+
+	for i := range m.live.calls {
+		if m.live.calls[i].CallID == ev.CallID {
+			m.live.calls[i].Status = status
+			m.live.calls[i].Result = result
+			m.refreshHistory()
+			return
+		}
+	}
+	// Fallback: scan the most recent committed RoleAssistant segment's children.
+	for mi := len(m.messages) - 1; mi >= 0; mi-- {
+		if m.messages[mi].Role != RoleAssistant {
+			continue
+		}
+		for ci := range m.messages[mi].ToolCalls {
+			if m.messages[mi].ToolCalls[ci].CallID == ev.CallID {
+				m.messages[mi].ToolCalls[ci].Status = status
+				m.messages[mi].ToolCalls[ci].Result = result
+				m.refreshHistory()
+				return
+			}
+		}
+		break // only the most recent assistant segment is a candidate
+	}
+	// Unknown CallID: no-op.
+}
+
+// handleTurnDone commits the final assistant segment. The live segment is
+// authoritative: if it carries content it is committed (its streamed text + any
+// cards). Otherwise — and ONLY otherwise — ev.Message is the fallback for a
+// non-streamed message. Never both, so the streamed final text is never
+// duplicated by the message copy (design §6). A nil Message with an empty live
+// produces no final segment.
+func (m *Screen) handleTurnDone(ev event.TurnDone) {
+	switch {
+	case m.liveNonEmpty():
+		m.commitLive()
+	case ev.Message != nil && len(ev.Message.Blocks) > 0:
+		m.messages = append(m.messages, DisplayMessage{Role: RoleAssistant, Blocks: ev.Message.Blocks})
+	}
+	m.live = liveSegment{}
+	m.refreshHistory()
+}
+
+// handleTurnInterrupted commits whatever tool work + partial text exists so it
+// stays visible, marking any still-running card as cancelled first, then appends
+// the RoleInterrupted tombstone. This fixes the prior flush that dropped the live
+// segment's tool cards on interrupt.
+func (m *Screen) handleTurnInterrupted() {
+	for i := range m.live.calls {
+		if m.live.calls[i].Status == ToolRunning {
+			m.live.calls[i].Status = ToolCancelled
+		}
+	}
+	m.commitLive()
+	m.messages = append(m.messages, DisplayMessage{Role: RoleInterrupted, Blocks: nil})
+	m.live = liveSegment{}
+	m.refreshHistory()
+}
+
+// splitLines splits a tool-result preview into display lines on "\n". An empty
+// preview yields nil (no result lines; the renderer shows "(no output)"); a
+// non-empty preview always yields at least one line. A trailing newline produces
+// a trailing empty line, preserved as-is (the runner caps/marks the preview).
+func splitLines(s string) []string {
+	if s == "" {
+		return nil
+	}
+	return strings.Split(s, "\n")
 }
 
 // finishTurnAdvanceQueue closes the active reader, returns the model to Idle, and
