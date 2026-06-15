@@ -181,6 +181,81 @@ func TestAskUserInvokableRun(t *testing.T) {
 	}
 }
 
+// TestAskUserAcceptsTUIChoiceOutputs is Guard B (Task 11): the end-to-end contract
+// lock for the tools side of the AskUser answer contract (design §2/§4 finding).
+// The TUI's choice-mode router (tui/interaction.go choiceKey) produces a uiAnswer
+// whose Text is ALWAYS a listed choice or the literal "other" — never arbitrary
+// typed text (locked on the producing side by tui/contract_test.go Guard A). This
+// guard pins the CONSUMING side: AskUser.InvokableRun, driven through the real
+// requestUserInput seam returning exactly those values, must yield a NON-error tool
+// result. The negative row (an unlisted typed answer the TUI can never emit in
+// choice mode) pins the contract BOUNDARY: it is the case that WOULD surface as a
+// tool-result error, which is exactly why the TUI must never produce it.
+//
+// This runs in package tools so the unexported requestUserInput seam + validateAnswer
+// path are reachable; the choice literal "other" mirrors tui.otherChoice / the
+// otherChoice const here (they are asserted equal by value, not import).
+func TestAskUserAcceptsTUIChoiceOutputs(t *testing.T) {
+	t.Parallel()
+
+	// The choices a with-choices AskUser was asked with; the TUI renders these and
+	// emits exactly one of them, or the literal "other", on submit.
+	choices := []string{"yes", "no", "maybe"}
+	const argsJSON = `{"question":"Pick one","choices":["yes","no","maybe"]}`
+
+	tests := []struct {
+		name string
+		// seamAnswer is what the TUI would hand back for a with-choices prompt: a
+		// listed choice, the literal "other", or (negative row) text it never emits.
+		seamAnswer  string
+		wantErrText bool // true → the tool-result text begins with "error:"
+	}{
+		{name: "first listed choice accepted", seamAnswer: "yes"},
+		{name: "middle listed choice accepted", seamAnswer: "no"},
+		{name: "last listed choice accepted", seamAnswer: "maybe"},
+		{name: "literal other escape hatch accepted", seamAnswer: otherChoice},
+		// Boundary: an unlisted answer is exactly what choice mode can NEVER produce;
+		// the tool rejects it, proving why the TUI invariant (Guard A) matters.
+		{name: "unlisted typed answer rejected (boundary)", seamAnswer: "totally unlisted", wantErrText: true},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			// Sanity: every non-error row must feed an answer the TUI choice router
+			// could actually emit (a listed choice or "other"); every error row must
+			// feed one it could not. This keeps the guard honest about what it pins.
+			isMember := tt.seamAnswer == otherChoice
+			for _, c := range choices {
+				if tt.seamAnswer == c {
+					isMember = true
+				}
+			}
+			if isMember == tt.wantErrText {
+				t.Fatalf("test row inconsistent: seamAnswer %q isMember=%v but wantErrText=%v", tt.seamAnswer, isMember, tt.wantErrText)
+			}
+
+			a := NewAskUser()
+			a.requestUserInput = func(_ context.Context, _ string, _ []string) (string, error) {
+				return tt.seamAnswer, nil
+			}
+			res, err := a.InvokableRun(context.Background(), argsJSON)
+			if err != nil {
+				t.Fatalf("InvokableRun() returned a Go error %v; failures must be tool-result strings", err)
+			}
+			got := textOf(t, res)
+			if gotErr := strings.HasPrefix(got, "error:"); gotErr != tt.wantErrText {
+				t.Fatalf("result = %q, error=%v, want error=%v", got, gotErr, tt.wantErrText)
+			}
+			if !tt.wantErrText && got != tt.seamAnswer {
+				t.Errorf("accepted result = %q, want the verbatim answer %q", got, tt.seamAnswer)
+			}
+		})
+	}
+}
+
 // TestAskUserSeamDefaultsToLoop asserts NewAskUser wires the seam to the real
 // loop.RequestUserInput by default — calling InvokableRun with NO loop ctx values
 // yields a tool-result error (the real helper's *GateContextError path), proving
