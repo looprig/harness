@@ -13,6 +13,7 @@ import (
 	"github.com/inventivepotter/urvi/internal/agent/loop/event"
 	"github.com/inventivepotter/urvi/internal/content"
 	"github.com/inventivepotter/urvi/internal/llm"
+	"github.com/inventivepotter/urvi/internal/tool"
 	"github.com/inventivepotter/urvi/internal/uuid"
 )
 
@@ -727,5 +728,282 @@ func TestShutdownSurfacesLoopTerminatedError(t *testing.T) {
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("Shutdown never returned after root-ctx kill")
+	}
+}
+
+// sessionWithFakeLoop builds an AgentSession wired to a fake loop whose Commands
+// channel the test reads from and whose Done channel the test controls. This is
+// the seam for the fire-and-route gate commands (Approve/Deny/ProvideUserInput),
+// which carry no Ack and so have no sink-observable effect through the real loop:
+// reading the unbuffered Commands channel directly captures the exact command the
+// session sent. cmds is unbuffered to mirror the real loop.Commands, so a send is
+// observable only when the test (or a closed Done) is ready.
+func sessionWithFakeLoop() (s *AgentSession, cmds chan command.Command, done chan struct{}) {
+	cmds = make(chan command.Command)
+	done = make(chan struct{})
+	s = &AgentSession{
+		SessionID: mustUUID(),
+		loop:      &loop.Loop{Commands: cmds, Done: done},
+		newID:     uuid.New,
+	}
+	return s, cmds, done
+}
+
+func mustUUID() uuid.UUID {
+	id, err := uuid.New()
+	if err != nil {
+		panic(err)
+	}
+	return id
+}
+
+// TestGateCommandsSendCorrectCommand asserts each gate-answer method sends the
+// correct command type to loop.Commands, stamped with a fresh non-zero Header.ID
+// and the right CallID/Scope/Answer, and returns nil. The fake loop's Commands
+// channel captures the exact command sent (these are fire-and-route — no Ack — so
+// this is the only observable effect).
+func TestGateCommandsSendCorrectCommand(t *testing.T) {
+	t.Parallel()
+	callID := mustUUID()
+	tests := []struct {
+		name   string
+		call   func(s *AgentSession) error
+		verify func(t *testing.T, cmd command.Command)
+	}{
+		{
+			name: "Approve",
+			call: func(s *AgentSession) error { return s.Approve(context.Background(), callID, tool.ScopeSession) },
+			verify: func(t *testing.T, cmd command.Command) {
+				c, ok := cmd.(command.ApproveToolCall)
+				if !ok {
+					t.Fatalf("sent %T, want command.ApproveToolCall", cmd)
+				}
+				if c.CallID != callID {
+					t.Errorf("CallID = %v, want %v", c.CallID, callID)
+				}
+				if c.Scope != tool.ScopeSession {
+					t.Errorf("Scope = %v, want %v", c.Scope, tool.ScopeSession)
+				}
+				if c.CommandHeader().ID.IsZero() {
+					t.Error("Header.ID is zero, want a fresh non-zero id")
+				}
+			},
+		},
+		{
+			name: "Deny",
+			call: func(s *AgentSession) error { return s.Deny(context.Background(), callID) },
+			verify: func(t *testing.T, cmd command.Command) {
+				c, ok := cmd.(command.DenyToolCall)
+				if !ok {
+					t.Fatalf("sent %T, want command.DenyToolCall", cmd)
+				}
+				if c.CallID != callID {
+					t.Errorf("CallID = %v, want %v", c.CallID, callID)
+				}
+				if c.CommandHeader().ID.IsZero() {
+					t.Error("Header.ID is zero, want a fresh non-zero id")
+				}
+			},
+		},
+		{
+			name: "ProvideUserInput",
+			call: func(s *AgentSession) error { return s.ProvideUserInput(context.Background(), callID, "the answer") },
+			verify: func(t *testing.T, cmd command.Command) {
+				c, ok := cmd.(command.ProvideUserInput)
+				if !ok {
+					t.Fatalf("sent %T, want command.ProvideUserInput", cmd)
+				}
+				if c.CallID != callID {
+					t.Errorf("CallID = %v, want %v", c.CallID, callID)
+				}
+				if c.Answer != "the answer" {
+					t.Errorf("Answer = %q, want %q", c.Answer, "the answer")
+				}
+				if c.CommandHeader().ID.IsZero() {
+					t.Error("Header.ID is zero, want a fresh non-zero id")
+				}
+			},
+		},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			s, cmds, _ := sessionWithFakeLoop()
+
+			errCh := make(chan error, 1)
+			go func() { errCh <- tt.call(s) }()
+
+			select {
+			case cmd := <-cmds:
+				tt.verify(t, cmd)
+			case <-time.After(2 * time.Second):
+				t.Fatal("method never sent a command")
+			}
+
+			select {
+			case err := <-errCh:
+				if err != nil {
+					t.Fatalf("method returned %v, want nil", err)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("method never returned after send")
+			}
+		})
+	}
+}
+
+// TestGateCommandsFreshHeaderIDPerCall asserts each method mints a distinct
+// Header.ID on every invocation (fresh per command, not reused).
+func TestGateCommandsFreshHeaderIDPerCall(t *testing.T) {
+	t.Parallel()
+	callID := mustUUID()
+	tests := []struct {
+		name string
+		call func(s *AgentSession) error
+	}{
+		{name: "Approve", call: func(s *AgentSession) error { return s.Approve(context.Background(), callID, tool.ScopeOnce) }},
+		{name: "Deny", call: func(s *AgentSession) error { return s.Deny(context.Background(), callID) }},
+		{name: "ProvideUserInput", call: func(s *AgentSession) error { return s.ProvideUserInput(context.Background(), callID, "x") }},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			s, cmds, _ := sessionWithFakeLoop()
+
+			ids := make([]uuid.UUID, 0, 2)
+			for i := 0; i < 2; i++ {
+				errCh := make(chan error, 1)
+				go func() { errCh <- tt.call(s) }()
+				select {
+				case cmd := <-cmds:
+					ids = append(ids, cmd.CommandHeader().ID)
+				case <-time.After(2 * time.Second):
+					t.Fatal("method never sent a command")
+				}
+				if err := <-errCh; err != nil {
+					t.Fatalf("method returned %v, want nil", err)
+				}
+			}
+			if ids[0] == ids[1] {
+				t.Fatalf("two calls reused Header.ID %v, want fresh ids", ids[0])
+			}
+		})
+	}
+}
+
+// TestGateCommandsCtxCancelled: a cancelled ctx makes each method return
+// *SessionError{SessionContextDone} without blocking and without sending a
+// command (the fake loop's Commands channel is never read).
+func TestGateCommandsCtxCancelled(t *testing.T) {
+	t.Parallel()
+	callID := mustUUID()
+	tests := []struct {
+		name string
+		call func(s *AgentSession, ctx context.Context) error
+	}{
+		{name: "Approve", call: func(s *AgentSession, ctx context.Context) error { return s.Approve(ctx, callID, tool.ScopeOnce) }},
+		{name: "Deny", call: func(s *AgentSession, ctx context.Context) error { return s.Deny(ctx, callID) }},
+		{name: "ProvideUserInput", call: func(s *AgentSession, ctx context.Context) error { return s.ProvideUserInput(ctx, callID, "x") }},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			s, _, _ := sessionWithFakeLoop() // Commands never read: a send would block
+
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel()
+
+			errCh := make(chan error, 1)
+			go func() { errCh <- tt.call(s, ctx) }()
+
+			select {
+			case err := <-errCh:
+				var se *SessionError
+				if !errors.As(err, &se) || se.Kind != SessionContextDone {
+					t.Fatalf("err = %v, want *SessionError{SessionContextDone}", err)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("method blocked on a cancelled ctx (no ctx.Done() escape)")
+			}
+		})
+	}
+}
+
+// TestGateCommandsLoopExited: after the loop's Done channel is closed, each method
+// returns *SessionError{SessionLoopExited} without blocking and without sending.
+func TestGateCommandsLoopExited(t *testing.T) {
+	t.Parallel()
+	callID := mustUUID()
+	tests := []struct {
+		name string
+		call func(s *AgentSession) error
+	}{
+		{name: "Approve", call: func(s *AgentSession) error { return s.Approve(context.Background(), callID, tool.ScopeOnce) }},
+		{name: "Deny", call: func(s *AgentSession) error { return s.Deny(context.Background(), callID) }},
+		{name: "ProvideUserInput", call: func(s *AgentSession) error { return s.ProvideUserInput(context.Background(), callID, "x") }},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			s, _, done := sessionWithFakeLoop() // Commands never read
+			close(done)                         // loop has exited
+
+			errCh := make(chan error, 1)
+			go func() { errCh <- tt.call(s) }()
+
+			select {
+			case err := <-errCh:
+				var se *SessionError
+				if !errors.As(err, &se) || se.Kind != SessionLoopExited {
+					t.Fatalf("err = %v, want *SessionError{SessionLoopExited}", err)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("method blocked after loop exited (no loop.Done escape)")
+			}
+		})
+	}
+}
+
+// TestGateCommandsIDGenerationFailure: when the idGenerator fails, each method
+// fails secure with *SessionError{SessionIDGenerationFailed} and sends no command.
+func TestGateCommandsIDGenerationFailure(t *testing.T) {
+	t.Parallel()
+	genErr := errors.New("rand source exhausted")
+	callID := mustUUID()
+	tests := []struct {
+		name string
+		call func(s *AgentSession) error
+	}{
+		{name: "Approve", call: func(s *AgentSession) error { return s.Approve(context.Background(), callID, tool.ScopeOnce) }},
+		{name: "Deny", call: func(s *AgentSession) error { return s.Deny(context.Background(), callID) }},
+		{name: "ProvideUserInput", call: func(s *AgentSession) error { return s.ProvideUserInput(context.Background(), callID, "x") }},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			s, _, _ := sessionWithFakeLoop() // Commands never read: a send would block
+			s.newID = func() (uuid.UUID, error) { return uuid.UUID{}, genErr }
+
+			errCh := make(chan error, 1)
+			go func() { errCh <- tt.call(s) }()
+
+			select {
+			case err := <-errCh:
+				var se *SessionError
+				if !errors.As(err, &se) || se.Kind != SessionIDGenerationFailed {
+					t.Fatalf("err = %v, want *SessionError{SessionIDGenerationFailed}", err)
+				}
+				if !errors.Is(err, genErr) {
+					t.Fatalf("err = %v, want it to wrap the generator error", err)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("method blocked on id-generation failure (should fail before send)")
+			}
+		})
 	}
 }

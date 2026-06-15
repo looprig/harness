@@ -10,6 +10,7 @@ import (
 	"github.com/inventivepotter/urvi/internal/agent/loop/event"
 	"github.com/inventivepotter/urvi/internal/content"
 	"github.com/inventivepotter/urvi/internal/llm"
+	"github.com/inventivepotter/urvi/internal/tool"
 	"github.com/inventivepotter/urvi/internal/uuid"
 )
 
@@ -258,6 +259,61 @@ func (s *AgentSession) Shutdown(ctx context.Context) error {
 		return nil
 	case <-s.loop.Done:
 		return nil
+	case <-ctx.Done():
+		return &SessionError{Kind: SessionContextDone, Cause: ctx.Err()}
+	}
+}
+
+// Approve approves the pending tool call identified by callID, granting it at the
+// given persistence scope. It is fire-and-route: the command carries no Ack, so
+// Approve returns as soon as the actor accepts it (the gate unblocking and the
+// subsequent ToolCallStarted event are the observable effect, not a reply). The
+// select covers ctx.Done() and the loop's Done channel so the unbuffered send can
+// never block forever if the actor is busy or has exited.
+func (s *AgentSession) Approve(ctx context.Context, callID uuid.UUID, scope tool.ApprovalScope) error {
+	id, err := s.newCommandID()
+	if err != nil {
+		return err
+	}
+	return s.routeCommand(ctx, command.ApproveToolCall{Header: command.Header{ID: id}, CallID: callID, Scope: scope})
+}
+
+// Deny denies the pending tool call identified by callID, failing it closed
+// (fail-secure). Like Approve it is fire-and-route with no Ack and no scope —
+// nothing is ever persisted on a deny. The select covers ctx.Done() and the
+// loop's Done channel so the unbuffered send can never block forever.
+func (s *AgentSession) Deny(ctx context.Context, callID uuid.UUID) error {
+	id, err := s.newCommandID()
+	if err != nil {
+		return err
+	}
+	return s.routeCommand(ctx, command.DenyToolCall{Header: command.Header{ID: id}, CallID: callID})
+}
+
+// ProvideUserInput supplies the user's answer to the pending AskUser request
+// identified by callID. Like the approve/deny pair it is fire-and-route with no
+// Ack: the actor routes it to the parked user-input gate, which delivers answer
+// to the waiting tool. The select covers ctx.Done() and the loop's Done channel
+// so the unbuffered send can never block forever.
+func (s *AgentSession) ProvideUserInput(ctx context.Context, callID uuid.UUID, answer string) error {
+	id, err := s.newCommandID()
+	if err != nil {
+		return err
+	}
+	return s.routeCommand(ctx, command.ProvideUserInput{Header: command.Header{ID: id}, CallID: callID, Answer: answer})
+}
+
+// routeCommand sends a fire-and-route gate command to the actor. These commands
+// carry no Ack, so routeCommand returns nil as soon as the send completes and
+// never waits for a reply. It selects on ctx.Done() and the loop's Done channel
+// alongside the unbuffered send so the call can never block forever when the
+// actor is busy (ctx times out) or has already exited (Done is closed).
+func (s *AgentSession) routeCommand(ctx context.Context, cmd command.Command) error {
+	select {
+	case s.loop.Commands <- cmd:
+		return nil
+	case <-s.loop.Done:
+		return &SessionError{Kind: SessionLoopExited}
 	case <-ctx.Done():
 		return &SessionError{Kind: SessionContextDone, Cause: ctx.Err()}
 	}
