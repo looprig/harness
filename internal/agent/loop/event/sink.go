@@ -8,10 +8,19 @@ import (
 
 // EventEnvelope tags an event with session and turn identity for observability.
 // TurnIndex is zero for session-level events such as SessionStarted.
+// TurnID, EventID, CausationID, and CallID are tracing-only correlation metadata
+// that live exclusively on the envelope (never on the bare event structs).
+// TurnID is zero for session-level events; CausationID is the active StartTurn's
+// Header.ID (zero when no turn is active); CallID is zero unless the event
+// pertains to a specific tool call.
 type EventEnvelope struct {
-	SessionID uuid.UUID
-	TurnIndex TurnIndex
-	Event     Event
+	SessionID   uuid.UUID
+	TurnID      uuid.UUID // NEW
+	TurnIndex   TurnIndex
+	EventID     uuid.UUID // NEW
+	CausationID uuid.UUID // NEW
+	CallID      uuid.UUID // NEW — zero unless the event pertains to a tool call
+	Event       Event
 }
 
 // EventSink receives best-effort copies of session events.
