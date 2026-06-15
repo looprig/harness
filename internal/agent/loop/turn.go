@@ -15,12 +15,6 @@ import (
 	"github.com/inventivepotter/urvi/internal/tool"
 )
 
-// emptyArgs is the canonical valid-JSON argument object a malformed tool-call's
-// Input is sanitized to BEFORE it is stored in history, so the stored assistant
-// message always re-encodes cleanly. The raw (invalid) Input is still handed to
-// RunBatch, which reports it as a pre-execution failure.
-var emptyArgs = json.RawMessage("{}")
-
 // runTurn drives the agentic loop for one user turn: it re-streams after each
 // tool batch until the model returns no tool calls (TurnDone), the runaway guard
 // fires (TurnFailed{ToolLimitError}), the provider errors (TurnFailed), or the
@@ -170,7 +164,11 @@ func streamOnce(
 	for _, c := range rawCalls {
 		stored := c
 		if !validToolCall(c) {
-			stored.Input = emptyArgs
+			// Sanitize a malformed Input to a fresh, valid-JSON "{}" so the stored
+			// assistant message re-encodes cleanly. A fresh allocation (not a shared
+			// var) keeps each history block's Input independently owned. The raw
+			// (invalid) Input is still handed to RunBatch, which reports the failure.
+			stored.Input = json.RawMessage("{}")
 		}
 		blocks = append(blocks, &stored)
 	}
