@@ -33,7 +33,7 @@ type prompt struct {
 	Scopes      []tool.ApprovalScope // promptPermission: scopes the request allows
 	Question    string               // promptUserInput: the AskUser question
 	Choices     []string             // promptUserInput: selectable choices (nil → free-text)
-	selected    int                  // promptUserInput: cursor over Choices (or Scopes for permission)
+	selected    int                  // promptUserInput: cursor over Choices
 	freeText    bool                 // promptUserInput: true when there are no Choices
 }
 
@@ -62,4 +62,37 @@ func promptFromUserInput(callID uuid.UUID, question string, choices []string) pr
 		Choices:  choices,
 		freeText: len(choices) == 0,
 	}
+}
+
+// offersScope reports whether the permission prompt allows approving at scope.
+// The modal router gates each scope key (y/s/w) on membership so a key for a
+// scope the request never offers (e.g. session on an UnknownRequest) is a no-op
+// rather than producing an approval the policy layer cannot honor.
+func (p *prompt) offersScope(scope tool.ApprovalScope) bool {
+	for _, s := range p.Scopes {
+		if s == scope {
+			return true
+		}
+	}
+	return false
+}
+
+// moveSelection shifts the choice cursor by delta and clamps it to the valid
+// range [0, len(Choices)-1]. An empty choice list pins the cursor at zero. It is
+// the up/down handler for choice mode; the value-copy router calls it on the head
+// of the RETURNED model's freshly-cloned slice (see interactionModel.choiceKey).
+func (p *prompt) moveSelection(delta int) {
+	n := len(p.Choices)
+	if n == 0 {
+		p.selected = 0
+		return
+	}
+	next := p.selected + delta
+	if next < 0 {
+		next = 0
+	}
+	if next > n-1 {
+		next = n - 1
+	}
+	p.selected = next
 }

@@ -6,8 +6,16 @@ import (
 	tea "charm.land/bubbletea/v2"
 
 	"github.com/inventivepotter/urvi/internal/agent/loop/event"
+	"github.com/inventivepotter/urvi/internal/tool"
 	"github.com/inventivepotter/urvi/tui/components"
 )
+
+// otherChoice is the literal escape-hatch answer the 'o' accelerator sends in
+// choice mode. It MUST equal tools.otherChoice (the AskUser validateAnswer
+// contract): with choices present, an answer is valid only if it is a listed
+// choice or this exact literal. It is duplicated here rather than imported because
+// package tools is a higher layer (the tui must not depend on it).
+const otherChoice = "other"
 
 // interactionMode is the bottom surface's current mode. Compose is the default
 // (editing the next message); the three prompt modes are entered when a prompt is
@@ -44,6 +52,18 @@ func newInteractionModel() interactionModel {
 		mode:  modeCompose,
 		input: components.NewInputBox(),
 	}
+}
+
+// cloneHead returns a copy of pending whose head element is a distinct value, so
+// mutating index 0 of the result never writes through a slice the caller still
+// holds. interactionModel is driven by value, but a slice header copy shares its
+// backing array; the selection handlers mutate the head in place, so they must
+// clone it first to stay sound under that value-copy contract. The tail elements
+// are shared by design (they are not mutated). pending must be non-empty.
+func cloneHead(pending []prompt) []prompt {
+	out := make([]prompt, len(pending))
+	copy(out, pending)
+	return out
 }
 
 // ActivePrompt returns the head (active) pending prompt, or nil when none pend.
@@ -129,6 +149,11 @@ func (m *interactionModel) syncModeToHead() {
 		m.mode = modePermissionPrompt
 	case p.freeText:
 		m.mode = modeAnswerPrompt
+		// The input box IS the answer field, so it must start empty: the compose
+		// draft was already saved to composeDraft at enqueue and is restored by
+		// restoreCompose when the queue drains. A back-to-back free-text prompt
+		// likewise opens on an empty field.
+		m.input.SetValue("")
 	default:
 		m.mode = modeChoicePrompt
 	}
@@ -142,33 +167,173 @@ func (m *interactionModel) restoreCompose() {
 	m.slash = nil
 }
 
+// noop is the consumed-key result: nothing for Screen to act on, re-render only.
+var noop = uiAction{Kind: uiNoop}
+
+// isEnter reports whether msg is a submit Enter — main Enter or keypad Enter,
+// both of which stringify to "enter" (KeyEnter and KeyKpEnter share that
+// keystroke). shift+enter stringifies to "shift+enter", so it is naturally
+// excluded here and forwards to the textarea's newline binding. Routing Enter
+// through this one helper keeps the decision identical across every mode
+// (compose + the three prompt modes) so a real key like keypad Enter cannot
+// submit in one mode yet be typed literally in another.
+func isEnter(msg tea.KeyPressMsg) bool { return msg.String() == "enter" }
+
 // Update advances the model on a key press and returns the new model plus a typed
-// uiAction. THIS TASK implements modeCompose only: printable keys edit the editor
-// (uiNoop), Enter submits non-empty prose (uiSubmit) or runs a known slash
-// (uiRunSlash). For the prompt modes it returns uiNoop — modal key routing is the
-// next task (Task 8).
+// uiAction. It dispatches on the current mode: compose edits/submits the next
+// message; the three prompt modes route the key to a per-mode handler that
+// produces the typed action (approve/deny/answer/interrupt). When a prompt-mode
+// handler resolves the head (approve/deny/answer) the head is popped optimistically
+// in the returned model — fire-and-route, no ack — revealing the next prompt or
+// returning to compose. esc precedence is encoded per mode: deny in permission
+// mode, interrupt (no pop) in choice/answer mode, existing behavior in compose.
 func (m interactionModel) Update(msg tea.KeyPressMsg) (interactionModel, uiAction) {
-	if m.mode != modeCompose {
-		return m, uiAction{Kind: uiNoop}
+	switch m.mode {
+	case modePermissionPrompt:
+		return m.permissionKey(msg)
+	case modeChoicePrompt:
+		return m.choiceKey(msg)
+	case modeAnswerPrompt:
+		return m.answerKey(msg)
+	default:
+		return m.composeKey(msg)
 	}
-	if msg.Code == tea.KeyEnter && msg.Mod == 0 {
+}
+
+// permissionKey routes a key in modePermissionPrompt (head is a promptPermission).
+// y/s/w approve at once/session/workspace but ONLY when the head offers that
+// scope (else a no-op); n or esc deny (fail-secure); any other key re-renders.
+// An approve/deny resolves the head, so it pops optimistically.
+func (m interactionModel) permissionKey(msg tea.KeyPressMsg) (interactionModel, uiAction) {
+	head := *m.ActivePrompt()
+	if msg.Code == tea.KeyEsc {
+		return m.pop(), uiAction{Kind: uiDeny, CallID: head.CallID}
+	}
+	switch msg.Code {
+	case 'y':
+		return m.approveAt(head, tool.ScopeOnce)
+	case 's':
+		return m.approveAt(head, tool.ScopeSession)
+	case 'w':
+		return m.approveAt(head, tool.ScopeWorkspace)
+	case 'n':
+		return m.pop(), uiAction{Kind: uiDeny, CallID: head.CallID}
+	}
+	return m, noop
+}
+
+// approveAt approves head at scope when the head offers it (pop + uiApprove),
+// otherwise it is a no-op (the key names a scope the request never granted).
+func (m interactionModel) approveAt(head prompt, scope tool.ApprovalScope) (interactionModel, uiAction) {
+	if !head.offersScope(scope) {
+		return m, noop
+	}
+	return m.pop(), uiAction{Kind: uiApprove, CallID: head.CallID, Scope: scope}
+}
+
+// choiceKey routes a key in modeChoicePrompt (head is a promptUserInput with
+// choices). up/down move the selection (no-op action, no pop); enter answers the
+// selected choice; 1–9 are accelerators for choices at that index; o answers the
+// literal "other" escape hatch; esc interrupts WITHOUT popping (the terminal event
+// clears). There is no free-text capture in choice mode — any other key re-renders.
+func (m interactionModel) choiceKey(msg tea.KeyPressMsg) (interactionModel, uiAction) {
+	head := *m.ActivePrompt()
+	if msg.Code == tea.KeyEsc {
+		return m, uiAction{Kind: uiInterrupt}
+	}
+	if isEnter(msg) {
+		return m.pop(), uiAction{Kind: uiAnswer, CallID: head.CallID, Text: head.Choices[head.selected]}
+	}
+	switch msg.Code {
+	case tea.KeyUp:
+		return m.selectBy(-1)
+	case tea.KeyDown:
+		return m.selectBy(1)
+	case 'o':
+		return m.pop(), uiAction{Kind: uiAnswer, CallID: head.CallID, Text: otherChoice}
+	}
+	if i := int(msg.Code - '1'); msg.Code >= '1' && msg.Code <= '9' && i < len(head.Choices) {
+		return m.pop(), uiAction{Kind: uiAnswer, CallID: head.CallID, Text: head.Choices[i]}
+	}
+	return m, noop
+}
+
+// selectBy moves the head choice cursor by delta and returns a no-op (selection
+// is local state, nothing for Screen to act on). Under the value-copy model the
+// returned model's pending slice shares its backing array with the caller, so the
+// head is cloned before mutating to avoid writing through the caller's slice.
+func (m interactionModel) selectBy(delta int) (interactionModel, uiAction) {
+	m.pending = cloneHead(m.pending)
+	m.pending[0].moveSelection(delta)
+	return m, noop
+}
+
+// answerKey routes a key in modeAnswerPrompt (head is a free-text promptUserInput;
+// the input box IS the answer field). enter submits the typed answer when
+// non-empty (pop + uiAnswer; the queue-drain restore puts the compose draft back);
+// an empty enter re-prompts (no-op); esc interrupts WITHOUT popping; every other
+// key (including shift+enter's newline via the textarea binding) forwards to the
+// editor.
+func (m interactionModel) answerKey(msg tea.KeyPressMsg) (interactionModel, uiAction) {
+	head := *m.ActivePrompt()
+	if msg.Code == tea.KeyEsc {
+		return m, uiAction{Kind: uiInterrupt}
+	}
+	if isEnter(msg) {
+		v := m.input.Value()
+		if strings.TrimSpace(v) == "" {
+			return m, noop
+		}
+		return m.pop(), uiAction{Kind: uiAnswer, CallID: head.CallID, Text: v}
+	}
+	_ = m.input.Update(msg)
+	return m, noop
+}
+
+// composeKey routes a key in modeCompose. When the slash panel is visible it owns
+// tab/up/down/enter (mirroring screen.go's handleKey/handleEnter): tab fills the
+// input with the highlighted command, up/down navigate the panel, and enter
+// dispatches the HIGHLIGHTED command. With no panel, a bare Enter submits/runs via
+// composeEnter; any other key edits the editor and rebuilds the panel.
+func (m interactionModel) composeKey(msg tea.KeyPressMsg) (interactionModel, uiAction) {
+	if m.slash != nil {
+		if isEnter(msg) {
+			name := m.slash.Selected().Name
+			m.input.Reset()
+			m.slash = nil
+			return m, uiAction{Kind: uiRunSlash, Slash: name}
+		}
+		switch msg.String() {
+		case "tab":
+			m.input.SetValue(m.slash.Selected().Name)
+			m.slash = nil
+			return m, noop
+		case "up":
+			m.slash.Up()
+			return m, noop
+		case "down":
+			m.slash.Down()
+			return m, noop
+		}
+	}
+	if isEnter(msg) {
 		return m.composeEnter()
 	}
 	m.forwardToInput(msg)
-	return m, uiAction{Kind: uiNoop}
+	return m, noop
 }
 
-// composeEnter resolves an Enter in compose mode by re-parsing the typed text. An
-// empty/whitespace draft is a no-op (input kept). A leading-slash known command
-// resets the input and returns uiRunSlash; an unknown slash falls through to a
-// plain submit. A plain submit resets the input and returns uiSubmit carrying the
-// composed text. This mirrors only screen.go's typed-text submit/slash path:
-// dispatching the highlighted slash-completion entry (m.slash.Selected) and the
-// Tab/Up/Down panel navigation are deferred to the modal-routing task (Task 8).
+// composeEnter resolves a bare Enter in compose mode WITH NO slash panel by
+// re-parsing the typed text. An empty/whitespace draft is a no-op (input kept). A
+// leading-slash known command resets the input and returns uiRunSlash; an unknown
+// slash falls through to a plain submit. A plain submit resets the input and
+// returns uiSubmit carrying the composed text. The panel-visible slash path
+// (dispatching the highlighted m.slash.Selected entry and Tab/Up/Down navigation)
+// lives in composeKey, mirroring screen.go's handleEnter/handleKey slash dispatch.
 func (m interactionModel) composeEnter() (interactionModel, uiAction) {
 	v := m.input.Value()
 	if strings.TrimSpace(v) == "" {
-		return m, uiAction{Kind: uiNoop}
+		return m, noop
 	}
 	if strings.HasPrefix(v, "/") {
 		name := firstToken(v)
