@@ -113,6 +113,12 @@ Date: 2026-06-14 · Status: approved (brainstorm)
 > optional interface** lets the runner group same-path writes without importing
 > `tools` (§3a, §2d); (3) §2d abort wording updated to include
 > `TurnFailed{ToolLimitError}` (§2d).
+>
+> **Revision 2026-06-14 (review pass 11)** resolves an eleventh review: (1)
+> **`MaxParallelToolCalls`** (default 8) added to `ToolSet` — a concrete concurrency
+> bound for the parallel batch, distinct from the total `MaxToolCallsPerTurn` (§3b,
+> §2d); (2) **`WriteTarget` error behavior** specified — `err != nil` → tool-result
+> error, not executed, not grouped (§3a, §2d).
 
 ## Scope
 
@@ -493,15 +499,19 @@ keeps draining.
 - **Permission is resolved sequentially across all calls first** — a session-scope
   grant on call *N* is visible to call *N+1*'s `Check`.
 - Execution then splits into a **serial batch** (tools where `Sequential()==true`)
-  that drains before a **semaphore-bounded parallel batch**. (No built-in
+  that drains before a **parallel batch bounded by a semaphore of width
+  `ToolSet.MaxParallelToolCalls`** (default 8, applied by `loop.New`). This is a
+  *concurrency* cap, distinct from `MaxToolCallsPerTurn` (a *total* cap) — without it,
+  a 100-call turn could run 100 `Bash`/`Fetch`/`Subagent` at once. (No built-in
   implements `Sequential` yet; it is the documented seam for ShellSession.)
 - **Same-path write serialization.** Two file-mutating calls
   (`WriteFile`/`EditFile`) targeting the **same resolved path** in one parallel batch
   would race (lost update / torn file). The runner discovers the path via the
   `tool.WriteTarget` optional interface (so it never imports/concrete-checks `tools`):
   calls sharing a `WriteTarget` key run sequentially (in call order), different keys
-  (and tools that don't implement it) still run in parallel. Without `ShellSession`,
-  this is the only intra-batch shared-state hazard.
+  (and tools that don't implement it) still run in parallel. A `WriteTarget` that
+  returns `err != nil` is handled like invalid args (tool-result error, not executed,
+  not grouped). Without `ShellSession`, this is the only intra-batch shared-state hazard.
 - The `tool.ToolMiddleware` chain wraps each `InvokableRun` (first listed =
   outermost). Cross-cutting concerns (OTel spans, rate limiting, audit, caching,
   per-tool timeout) live here, not in the runner body.
@@ -571,6 +581,8 @@ type Auditable         interface { AuditSummary(argsJSON string) string } // red
 // WriteTarget lets the runner group same-path mutations WITHOUT importing tools:
 // WriteFile/EditFile return their resolved write path as the key; the runner
 // serializes calls sharing a key (§2d). ok=false → not a write (no serialization).
+// err != nil (e.g. unparseable args) → the runner treats the call like invalid args:
+// tool-result error, not executed, not grouped (§2d).
 type WriteTarget       interface { WriteTarget(argsJSON string) (key string, ok bool, err error) }
 
 type ToolMiddleware func(ctx context.Context, t InvokableTool, argsJSON string, next ToolExecuteFunc) (*ToolResult, error)
@@ -641,6 +653,7 @@ type ToolSet struct {
     // Runaway guards (loop.New applies defaults when zero):
     MaxToolIterations   int // max LLM↔tool round-trips per turn (default 25)
     MaxToolCallsPerTurn int // max total tool executions per turn (default 100)
+    MaxParallelToolCalls int // semaphore width for the parallel batch (default 8)
 }
 
 // ReadGuard is the narrow read-side policy the read tools enforce themselves:
@@ -1136,7 +1149,11 @@ The pixel-level work is a follow-up TUI-update doc, since that TUI is mid-flight
 - unknown tool — a tool call naming a tool absent from the registry yields a
   tool-result error and the loop continues (no panic).
 - same-path writes — two `WriteFile`/`EditFile` to one path in a batch apply in call
-  order (no torn file); different paths still run concurrently.
+  order (no torn file); different paths still run concurrently; a `WriteTarget` error
+  → tool-result error, call not executed.
+- parallel bound — with `MaxParallelToolCalls=2`, a batch of N>2 slow tools never has
+  more than 2 running at once (assert peak concurrency); the cap is independent of
+  `MaxToolCallsPerTurn`.
 - Fetch match — a `GET https://api.host` grant does **not** approve a `POST` to the
   same host, an `http://` request, or `api.host.evil`.
 - policy-store hardening — `Grant` creates dirs `0700`/files `0600`, refuses to follow
