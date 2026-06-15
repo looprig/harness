@@ -49,6 +49,7 @@ func New(ctx context.Context, sessionID uuid.UUID, cfg Config) (*Loop, error) {
 		return nil, &ConfigError{Kind: ConfigInvalidModel, Cause: err}
 	}
 	cfg.DrainTimeout = resolveDrainTimeout(cfg.DrainTimeout)
+	cfg.Tools = resolveToolSetCaps(cfg.Tools)
 	if cfg.idGen == nil {
 		cfg.idGen = uuid.New
 	}

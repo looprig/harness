@@ -13,6 +13,12 @@ type Config struct {
 	Sinks        []event.EventSink // optional side-effect sinks for observability/journaling
 	DrainTimeout time.Duration     // optional — bounds the hard-kill wait for a cancelled turn to drain; New defaults it to 5s
 
+	// Tools is the runner's view of the tool subsystem (the consumer surface in
+	// deps.go). Its runaway-guard caps are defaulted by New when zero;
+	// Permission/Registry/Middlewares are left as the composition root set them
+	// (nil is valid).
+	Tools ToolSet
+
 	// idGen mints correlation IDs (TurnID, EventID). It is unexported, so the
 	// composition root cannot set it: New defaults it to uuid.New. It exists
 	// only as a test seam for exercising the crypto/rand failure branches.
