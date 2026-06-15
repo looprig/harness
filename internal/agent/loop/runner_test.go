@@ -43,8 +43,6 @@ type fakeRunTool struct {
 	auditFn    func(argsJSON string) string
 	promptFn   func(argsJSON string) (tool.PermissionRequest, error)
 	writeFn    func(argsJSON string) (string, bool, error)
-	hasPrompt  bool // documentation flag for readers; the wrapper carries the method
-	hasWrite   bool // documentation flag for readers; the wrapper carries the method
 
 	// observed state
 	mu        sync.Mutex
@@ -212,10 +210,11 @@ func call(t *testing.T, name, args string) content.ToolUseBlock {
 }
 
 // runBatchNoGate runs RunBatch with a gateReg channel that is never used (no
-// EffectAsk in the scenario) — a closed-on-cancel pattern is unnecessary.
+// EffectAsk in the scenario) — a closed-on-cancel pattern is unnecessary. It uses
+// the real uuid.New idGen seam (the production default).
 func runBatchNoGate(ctx context.Context, calls []content.ToolUseBlock, ts ToolSet, emit func(event.Event)) []result {
 	gateReg := make(chan gateRegistration)
-	return RunBatch(ctx, calls, ts, gateReg, emit)
+	return RunBatch(ctx, calls, ts, gateReg, uuid.New, emit)
 }
 
 // resultText returns the flattened text of a result.
@@ -353,7 +352,7 @@ func TestRunBatch_SequentialDrainsFirst(t *testing.T) {
 // Grant) auto-approves call 2 — call 2 must not be prompted.
 func TestRunBatch_SessionGrantVisibility(t *testing.T) {
 	t.Parallel()
-	tl := &fakeRunTool{name: "T", output: "ok", hasPrompt: true}
+	tl := &fakeRunTool{name: "T", output: "ok"}
 	pt := promptTool{fakeRunTool: tl}
 	tl.promptFn = func(argsJSON string) (tool.PermissionRequest, error) {
 		return tool.UnknownRequest{Tool: "T", Summary: "do"}, nil
@@ -380,7 +379,7 @@ func TestRunBatch_SessionGrantVisibility(t *testing.T) {
 	}()
 
 	calls := []content.ToolUseBlock{call(t, "T", `{"n":1}`), call(t, "T", `{"n":2}`)}
-	results := RunBatch(context.Background(), calls, ts, gateReg, emit)
+	results := RunBatch(context.Background(), calls, ts, gateReg, uuid.New, emit)
 
 	if len(results) != 2 || results[0].IsError || results[1].IsError {
 		t.Fatalf("results = %+v, want 2 successes", results)
@@ -427,7 +426,7 @@ func TestRunBatch_MaxParallelCap(t *testing.T) {
 // serially (no overlap); different keys overlap.
 func TestRunBatch_SameWriteTargetSerializes(t *testing.T) {
 	t.Parallel()
-	tl := &fakeRunTool{name: "W", output: "ok", delay: 25 * time.Millisecond, hasWrite: true}
+	tl := &fakeRunTool{name: "W", output: "ok", delay: 25 * time.Millisecond}
 	wt := writeKeyTool{fakeRunTool: tl}
 	tl.writeFn = func(argsJSON string) (string, bool, error) {
 		var a struct {
@@ -453,7 +452,7 @@ func TestRunBatch_SameWriteTargetSerializes(t *testing.T) {
 	}
 
 	// Different keys → they can overlap. Fresh tool to reset counters.
-	tl2 := &fakeRunTool{name: "W", output: "ok", delay: 25 * time.Millisecond, hasWrite: true}
+	tl2 := &fakeRunTool{name: "W", output: "ok", delay: 25 * time.Millisecond}
 	wt2 := writeKeyTool{fakeRunTool: tl2}
 	tl2.writeFn = tl.writeFn
 	ts2 := ToolSet{Permission: autoApproveGate{}, Registry: []tool.InvokableTool{wt2}, MaxParallelToolCalls: 8}
@@ -471,7 +470,7 @@ func TestRunBatch_SameWriteTargetSerializes(t *testing.T) {
 // failure (not executed, error result + event pair).
 func TestRunBatch_WriteTargetError(t *testing.T) {
 	t.Parallel()
-	tl := &fakeRunTool{name: "W", output: "ok", hasWrite: true}
+	tl := &fakeRunTool{name: "W", output: "ok"}
 	wt := writeKeyTool{fakeRunTool: tl}
 	tl.writeFn = func(argsJSON string) (string, bool, error) {
 		return "", false, errors.New("bad target")
@@ -580,7 +579,7 @@ func TestRunBatch_AllStartedBeforeAnyCompleted(t *testing.T) {
 		calls = append(calls, call(t, "P", `{}`))
 	}
 	calls = append(calls, call(t, unknown, `{}`)) // include a pre-exec failure
-	RunBatch(context.Background(), calls, ts, make(chan gateRegistration), emit)
+	RunBatch(context.Background(), calls, ts, make(chan gateRegistration), uuid.New, emit)
 
 	evs := getEvents()
 	lastStarted, firstCompleted, nStarted, nCompleted := startedCompletedOrder(evs)
@@ -632,7 +631,7 @@ func TestRunBatch_FailureVisibility(t *testing.T) {
 		{
 			name: "permission denied via gate Deny",
 			setup: func(t *testing.T) (ToolSet, content.ToolUseBlock, chan gateRegistration) {
-				tl := &fakeRunTool{name: "T", output: "ok", hasPrompt: true}
+				tl := &fakeRunTool{name: "T", output: "ok"}
 				pt := promptTool{fakeRunTool: tl}
 				tl.promptFn = func(string) (tool.PermissionRequest, error) {
 					return tool.UnknownRequest{Tool: "T", Summary: "x"}, nil
@@ -652,23 +651,24 @@ func TestRunBatch_FailureVisibility(t *testing.T) {
 		{
 			name: "WriteTarget error",
 			setup: func(t *testing.T) (ToolSet, content.ToolUseBlock, chan gateRegistration) {
-				tl := &fakeRunTool{name: "W", output: "ok", hasWrite: true}
+				tl := &fakeRunTool{name: "W", output: "ok"}
 				wt := writeKeyTool{fakeRunTool: tl}
-				tl.writeFn = func(string) (string, bool, error) { return "", false, errors.New("bad") }
+				tl.writeFn = func(string) (string, bool, error) { return "", false, errors.New("bad target") }
 				ts := ToolSet{Permission: autoApproveGate{}, Registry: []tool.InvokableTool{wt}, MaxParallelToolCalls: 2}
 				return ts, call(t, "W", `{}`), make(chan gateRegistration)
 			},
-			wantInErr: "error:",
+			// Assert the specific WriteTarget-failure message (prefix + cause), not
+			// just an "error:" substring, so a regression in the message is caught.
+			wantInErr: "invalid tool arguments: bad target",
 		},
 	}
 
 	for _, tt := range tests {
-		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			ts, c, gateReg := tt.setup(t)
 			emit, getEvents := collectEmit()
-			results := RunBatch(context.Background(), []content.ToolUseBlock{c}, ts, gateReg, emit)
+			results := RunBatch(context.Background(), []content.ToolUseBlock{c}, ts, gateReg, uuid.New, emit)
 
 			if len(results) != 1 {
 				t.Fatalf("len(results) = %d, want 1", len(results))
@@ -700,6 +700,113 @@ func TestRunBatch_FailureVisibility(t *testing.T) {
 	}
 }
 
+// TestRunBatch_IDGenFailure: a call whose CallID cannot be minted (idGen returns
+// an error) is a fail-secure pre-execution failure — it is NOT executed, NO gate
+// is opened for it, yet it still gets exactly one Started + one Completed{IsError}
+// + one error tool-result. Sibling calls with a working idGen still run and pair.
+func TestRunBatch_IDGenFailure(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		failMints map[int]bool // 0-based mint index that should error
+		nCalls    int
+		wantRuns  int32 // expected total tool runs across the batch
+	}{
+		{
+			name:      "first call id-gen fails, sibling runs",
+			failMints: map[int]bool{0: true},
+			nCalls:    2,
+			wantRuns:  1, // only the second (working) call executes
+		},
+		{
+			name:      "all id-gen fails, nothing runs",
+			failMints: map[int]bool{0: true, 1: true},
+			nCalls:    2,
+			wantRuns:  0,
+		},
+		{
+			name:      "middle call id-gen fails, siblings run",
+			failMints: map[int]bool{1: true},
+			nCalls:    3,
+			wantRuns:  2,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			tl := &fakeRunTool{name: "T", output: "ran"}
+			// A gate that records whether it is ever consulted: a failed-mint call
+			// must never reach Check (no gate opened for a call with no CallID).
+			gate := &fakePermissionGate{checkFn: func(name, args string) Effect { return EffectAutoApprove }}
+			ts := ToolSet{Permission: gate, Registry: []tool.InvokableTool{tl}, MaxParallelToolCalls: 4}
+
+			emit, getEvents := collectEmit()
+
+			var mintCalls int32
+			idGen := func() (uuid.UUID, error) {
+				i := int(atomic.AddInt32(&mintCalls, 1)) - 1
+				if tt.failMints[i] {
+					return uuid.UUID{}, errors.New("rand source exhausted")
+				}
+				return uuid.New()
+			}
+
+			var calls []content.ToolUseBlock
+			for i := 0; i < tt.nCalls; i++ {
+				calls = append(calls, call(t, "T", `{}`))
+			}
+			results := RunBatch(context.Background(), calls, ts, make(chan gateRegistration), idGen, emit)
+
+			if len(results) != tt.nCalls {
+				t.Fatalf("len(results) = %d, want %d", len(results), tt.nCalls)
+			}
+			// Each failed-mint call is an error result with the internal id message
+			// and pairs with its originating ToolUseBlock by index; working calls
+			// succeed. Results stay in call order regardless of mint outcome.
+			for i := range results {
+				if tt.failMints[i] {
+					if !results[i].IsError {
+						t.Errorf("results[%d].IsError = false, want true (id-gen failed)", i)
+					}
+					if !strings.Contains(resultText(results[i]), "could not generate call id") {
+						t.Errorf("results[%d] text = %q, want internal id-gen error", i, resultText(results[i]))
+					}
+				} else {
+					if results[i].IsError || !strings.Contains(resultText(results[i]), "ran") {
+						t.Errorf("results[%d] = %+v / %q, want success", i, results[i], resultText(results[i]))
+					}
+				}
+				if results[i].ToolUseID != calls[i].ID {
+					t.Errorf("results[%d].ToolUseID = %q, want %q (pairs by index)", i, results[i].ToolUseID, calls[i].ID)
+				}
+			}
+
+			if got := atomic.LoadInt32(&tl.totalRuns); got != tt.wantRuns {
+				t.Errorf("tool ran %d times, want %d (failed-mint calls must not execute)", got, tt.wantRuns)
+			}
+
+			// No gate (Check) consulted for a failed-mint call: Check is only reached
+			// by executable calls, so the consult count equals the number of working
+			// calls.
+			gate.mu.Lock()
+			nChecks := len(gate.checkCalls)
+			gate.mu.Unlock()
+			if want := tt.nCalls - len(tt.failMints); nChecks != want {
+				t.Errorf("Check consulted %d times, want %d (no gate for failed-mint call)", nChecks, want)
+			}
+
+			// Every requested call still gets exactly one Started + one Completed.
+			_, _, nStarted, nCompleted := startedCompletedOrder(getEvents())
+			if nStarted != tt.nCalls || nCompleted != tt.nCalls {
+				t.Errorf("events: %d started / %d completed, want %d/%d", nStarted, nCompleted, tt.nCalls, tt.nCalls)
+			}
+		})
+	}
+}
+
 // TestRunBatch_ResultPreviewCapped: an oversized result is truncated + marked; a
 // small one is not.
 func TestRunBatch_ResultPreviewCapped(t *testing.T) {
@@ -710,7 +817,7 @@ func TestRunBatch_ResultPreviewCapped(t *testing.T) {
 	ts := ToolSet{Permission: autoApproveGate{}, Registry: []tool.InvokableTool{tl, small}, MaxParallelToolCalls: 4}
 	emit, getEvents := collectEmit()
 	calls := []content.ToolUseBlock{call(t, "Big", `{}`), call(t, "Small", `{}`)}
-	RunBatch(context.Background(), calls, ts, make(chan gateRegistration), emit)
+	RunBatch(context.Background(), calls, ts, make(chan gateRegistration), uuid.New, emit)
 
 	var bigPreview, smallPreview string
 	for _, ev := range getEvents() {
@@ -744,7 +851,7 @@ func TestRunBatch_PreviewLineCap(t *testing.T) {
 	tl := &fakeRunTool{name: "Lines", output: sb.String()}
 	ts := ToolSet{Permission: autoApproveGate{}, Registry: []tool.InvokableTool{tl}, MaxParallelToolCalls: 4}
 	emit, getEvents := collectEmit()
-	RunBatch(context.Background(), []content.ToolUseBlock{call(t, "Lines", `{}`)}, ts, make(chan gateRegistration), emit)
+	RunBatch(context.Background(), []content.ToolUseBlock{call(t, "Lines", `{}`)}, ts, make(chan gateRegistration), uuid.New, emit)
 	var preview string
 	for _, ev := range getEvents() {
 		if c, ok := ev.(event.ToolCallCompleted); ok {
@@ -764,7 +871,7 @@ func TestRunBatch_PreviewLineCap(t *testing.T) {
 // it still executes (the user approved it); Grant error is only logged.
 func TestRunBatch_GrantErrorStillExecutes(t *testing.T) {
 	t.Parallel()
-	tl := &fakeRunTool{name: "T", output: "executed", hasPrompt: true}
+	tl := &fakeRunTool{name: "T", output: "executed"}
 	pt := promptTool{fakeRunTool: tl}
 	tl.promptFn = func(string) (tool.PermissionRequest, error) {
 		return tool.UnknownRequest{Tool: "T", Summary: "x"}, nil
@@ -781,7 +888,7 @@ func TestRunBatch_GrantErrorStillExecutes(t *testing.T) {
 		close(reg.ack)
 		reg.reply <- command.ApproveToolCall{CallID: reg.callID, Scope: tool.ScopeWorkspace}
 	}()
-	results := RunBatch(context.Background(), []content.ToolUseBlock{call(t, "T", `{}`)}, ts, gateReg, emit)
+	results := RunBatch(context.Background(), []content.ToolUseBlock{call(t, "T", `{}`)}, ts, gateReg, uuid.New, emit)
 	if results[0].IsError {
 		t.Errorf("result = %+v, want success despite Grant error", results[0])
 	}
@@ -796,7 +903,7 @@ func TestRunBatch_GrantErrorStillExecutes(t *testing.T) {
 // TestRunBatch_ScopeOnceNoGrant: approving with ScopeOnce must not call Grant.
 func TestRunBatch_ScopeOnceNoGrant(t *testing.T) {
 	t.Parallel()
-	tl := &fakeRunTool{name: "T", output: "ok", hasPrompt: true}
+	tl := &fakeRunTool{name: "T", output: "ok"}
 	pt := promptTool{fakeRunTool: tl}
 	tl.promptFn = func(string) (tool.PermissionRequest, error) {
 		return tool.UnknownRequest{Tool: "T", Summary: "x"}, nil
@@ -810,7 +917,7 @@ func TestRunBatch_ScopeOnceNoGrant(t *testing.T) {
 		close(reg.ack)
 		reg.reply <- command.ApproveToolCall{CallID: reg.callID, Scope: tool.ScopeOnce}
 	}()
-	results := RunBatch(context.Background(), []content.ToolUseBlock{call(t, "T", `{}`)}, ts, gateReg, emit)
+	results := RunBatch(context.Background(), []content.ToolUseBlock{call(t, "T", `{}`)}, ts, gateReg, uuid.New, emit)
 	if results[0].IsError {
 		t.Fatalf("result = %+v, want success", results[0])
 	}
@@ -848,7 +955,7 @@ func TestRunBatch_MiddlewareOutermostFirst(t *testing.T) {
 		MaxParallelToolCalls: 4,
 	}
 	emit, _ := collectEmit()
-	RunBatch(context.Background(), []content.ToolUseBlock{call(t, "T", `{}`)}, ts, make(chan gateRegistration), emit)
+	RunBatch(context.Background(), []content.ToolUseBlock{call(t, "T", `{}`)}, ts, make(chan gateRegistration), uuid.New, emit)
 	want := []string{"outer:before", "inner:before", "inner:after", "outer:after"}
 	mu.Lock()
 	defer mu.Unlock()
@@ -902,7 +1009,7 @@ func TestRunBatch_CtxInjectedPerCall(t *testing.T) {
 		close(reg.ack)
 		reg.reply <- command.ProvideUserInput{CallID: reg.callID, Answer: "green"}
 	}()
-	results := RunBatch(context.Background(), []content.ToolUseBlock{call(t, "Ask", `{}`)}, ts, gateReg, emit)
+	results := RunBatch(context.Background(), []content.ToolUseBlock{call(t, "Ask", `{}`)}, ts, gateReg, uuid.New, emit)
 	if results[0].IsError {
 		t.Fatalf("result = %+v, want success", results[0])
 	}
@@ -939,7 +1046,7 @@ func (c *ctxProbeTool) InvokableRun(ctx context.Context, argsJSON string) (*tool
 // without wedging.
 func TestRunBatch_CtxCancelDuringGate(t *testing.T) {
 	t.Parallel()
-	tl := &fakeRunTool{name: "T", output: "ok", hasPrompt: true}
+	tl := &fakeRunTool{name: "T", output: "ok"}
 	pt := promptTool{fakeRunTool: tl}
 	tl.promptFn = func(string) (tool.PermissionRequest, error) {
 		return tool.UnknownRequest{Tool: "T", Summary: "x"}, nil
@@ -961,7 +1068,7 @@ func TestRunBatch_CtxCancelDuringGate(t *testing.T) {
 	}()
 	done := make(chan []result, 1)
 	go func() {
-		done <- RunBatch(ctx, []content.ToolUseBlock{call(t, "T", `{}`)}, ts, gateReg, emit)
+		done <- RunBatch(ctx, []content.ToolUseBlock{call(t, "T", `{}`)}, ts, gateReg, uuid.New, emit)
 	}()
 	select {
 	case <-done:

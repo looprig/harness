@@ -27,12 +27,18 @@ import (
 // prefixes are named constants so they read consistently in the stream and in
 // tests.
 const (
+	errToolPrefix        = "error: " // the common prefix every tool-error string carries
 	errPrefixUnknownTool = "error: unknown tool: "
 	errInvalidArgs       = "error: invalid tool arguments (not valid JSON)"
 	errPermissionDenied  = "error: permission denied"
 	errPanicPrefix       = "error: tool panicked: "
 	errEmptyResult       = "error: empty result"
 	errWriteTargetPrefix = "error: invalid tool arguments: "
+	// errIDGenFailure is the fail-secure tool-result for a call whose CallID could
+	// not be minted (crypto/rand failure): the call is NOT executed and NO gate is
+	// opened (a missing CallID can't safely route a permission gate), but the model
+	// still sees a paired error result.
+	errIDGenFailure = "error: internal: could not generate call id"
 )
 
 // ResultPreview caps. ResultPreview is stream-only (the sink projection drops it)
@@ -79,22 +85,38 @@ type resolved struct {
 	sequential bool
 }
 
-// RunBatch executes a batch of tool calls. It assigns a CallID per call, resolves
-// tools + permissions sequentially (so a session grant on call N is visible to
-// call N+1's Check), emits ALL ToolCallStarted before executing any call, runs the
-// executable calls (serial batch drained first, then bounded-parallel with
-// same-WriteTarget serialization), and emits one ToolCallCompleted per call. The
-// returned []result is in call order.
+// RunBatch executes a batch of tool calls. It mints a CallID per call via idGen
+// (fail-secure: a call whose CallID cannot be minted is NOT executed and NO gate
+// is opened for it), resolves tools + permissions sequentially (so a session grant
+// on call N is visible to call N+1's Check), emits ALL ToolCallStarted before
+// executing any call, runs the executable calls (serial batch drained first, then
+// bounded-parallel with same-WriteTarget serialization), and emits one
+// ToolCallCompleted per call. The returned []result is in call order, each result
+// owning its slot by index.
+//
+// RunBatch SERIALIZES its own event emission: it wraps emit in an internal mutex
+// (safeEmit) and uses that for every Started and every (possibly concurrent)
+// Completed. The caller's emit therefore need NOT be concurrent-safe.
 func RunBatch(
 	ctx context.Context,
 	calls []content.ToolUseBlock,
 	ts ToolSet,
 	gateReg chan<- gateRegistration,
+	idGen func() (uuid.UUID, error),
 	emit func(event.Event),
 ) []result {
+	// safeEmit serializes all event emission so the caller's emit need not be
+	// concurrent-safe (the parallel executor calls Completed from many goroutines).
+	var emitMu sync.Mutex
+	safeEmit := func(ev event.Event) {
+		emitMu.Lock()
+		defer emitMu.Unlock()
+		emit(ev)
+	}
+
 	rs := make([]*resolved, len(calls))
 	for i, c := range calls {
-		rs[i] = newResolved(ctx, c, ts)
+		rs[i] = newResolved(ctx, c, ts, idGen)
 	}
 
 	// Sequential permission resolution, in call order, BEFORE any execution, so a
@@ -105,7 +127,7 @@ func RunBatch(
 		if r.failed || r.t == nil {
 			continue
 		}
-		if err := resolvePermission(ctx, r, ts, gateReg, emit); err != nil {
+		if err := resolvePermission(ctx, r, ts, gateReg, safeEmit); err != nil {
 			if ctx.Err() != nil {
 				return collectResults(rs)
 			}
@@ -118,53 +140,66 @@ func RunBatch(
 	// requested call (including pre-execution failures) gets a Started, and every
 	// Started precedes every Completed so the TUI groups the batch race-free.
 	for _, r := range rs {
-		emit(event.ToolCallStarted{CallID: r.callID, ToolName: r.block.Name, Summary: r.summary})
+		safeEmit(event.ToolCallStarted{CallID: r.callID, ToolName: r.block.Name, Summary: r.summary})
 	}
 
-	// Build the per-call results map (CallID → result), populated by executors and
-	// pre-execution failures alike. A mutex guards it across the parallel goroutines.
-	var mu sync.Mutex
-	out := make(map[uuid.UUID]result, len(rs))
+	// Each call owns final[i] by index: serial and parallel goroutines each write a
+	// DISTINCT index, so result storage needs no shared map and no mutex, and the
+	// outcome is already in call order. (A CallID-keyed map could drop/duplicate on
+	// a zero-key collision from a failed mint; indexing removes that hazard.)
+	final := make([]result, len(rs))
 
-	complete := func(r result) {
-		mu.Lock()
-		out[r.CallID] = r
-		mu.Unlock()
+	complete := func(i int, r result) {
+		final[i] = r
 		preview, isErr := previewOf(r)
-		emit(event.ToolCallCompleted{CallID: r.CallID, IsError: isErr, ResultPreview: preview})
+		safeEmit(event.ToolCallCompleted{CallID: r.CallID, IsError: isErr, ResultPreview: preview})
 	}
 
-	// Pre-execution failures complete immediately, in the Started order.
-	var executable []*resolved
-	for _, r := range rs {
+	// Pre-execution failures complete immediately, in the Started order. executable
+	// carries each call's own index so its executor writes the right slot.
+	var executable []indexedResolved
+	for i, r := range rs {
 		if r.failed {
-			complete(failureResult(r))
+			complete(i, failureResult(r))
 			continue
 		}
-		executable = append(executable, r)
+		executable = append(executable, indexedResolved{i: i, r: r})
 	}
 
-	execute(ctx, executable, ts, gateReg, emit, complete)
+	execute(ctx, executable, ts, gateReg, safeEmit, complete)
 
-	// Assemble results in call order from the map.
-	final := make([]result, len(rs))
-	for i, r := range rs {
-		mu.Lock()
-		final[i] = out[r.callID]
-		mu.Unlock()
-	}
 	return final
 }
 
-// newResolved builds the per-call working state: assigns a CallID, looks up the
-// tool, validates args JSON, queries WriteTarget, and computes the redacted
-// Summary. Pre-execution failures (unknown tool, invalid args, WriteTarget error)
-// are recorded here; permission is resolved later (sequentially).
-func newResolved(ctx context.Context, c content.ToolUseBlock, ts ToolSet) *resolved {
+// indexedResolved pairs an executable call with the result slot it owns, so each
+// executor (serial or parallel) writes a distinct final[i] with no shared state.
+type indexedResolved struct {
+	i int
+	r *resolved
+}
+
+// newResolved builds the per-call working state: mints a CallID via idGen, looks
+// up the tool, validates args JSON, queries WriteTarget, and computes the redacted
+// Summary. Pre-execution failures (id-gen failure, unknown tool, invalid args,
+// WriteTarget error) are recorded here; permission is resolved later (sequentially).
+//
+// An idGen error is fail-secure: the call is marked failed with errIDGenFailure
+// (so it is NOT executed and NO gate is opened — a missing CallID can't safely
+// route a gate) and the error is NOT swallowed (it is surfaced as a model-visible
+// tool-result and logged). The zero CallID it then carries is harmless: a failed
+// call neither opens a gate nor shares a result slot (results are indexed).
+func newResolved(ctx context.Context, c content.ToolUseBlock, ts ToolSet, idGen func() (uuid.UUID, error)) *resolved {
 	r := &resolved{block: c, argsstr: string(c.Input)}
-	if cid, err := uuid.New(); err == nil {
-		r.callID = cid
+
+	cid, err := idGen()
+	if err != nil {
+		slog.Error("loop: tool-call id generation failed; failing call fail-secure (not executed, no gate)",
+			"tool", c.Name, "error", err)
+		r.summary = c.Name // no CallID → Summary is just the requested name
+		r.fail(errIDGenFailure)
+		return r
 	}
+	r.callID = cid
 
 	r.t = lookupTool(ctx, ts.Registry, c.Name)
 	if r.t == nil {
@@ -339,28 +374,28 @@ func buildRequest(t tool.InvokableTool, name, summary, argsJSON string) tool.Per
 // execute runs the executable calls: the serial batch (Sequential()==true) drains
 // first, then the parallel batch runs bounded by a semaphore of width
 // MaxParallelToolCalls, with same-WriteTarget calls serialized in call order. Each
-// finished call is reported via complete. execute does not return until every
-// executable call has completed.
+// finished call is reported via complete(index, result) so it lands in its own
+// result slot. execute does not return until every executable call has completed.
 func execute(
 	ctx context.Context,
-	executable []*resolved,
+	executable []indexedResolved,
 	ts ToolSet,
 	gateReg chan<- gateRegistration,
 	emit func(event.Event),
-	complete func(result),
+	complete func(int, result),
 ) {
-	var serial, parallel []*resolved
-	for _, r := range executable {
-		if r.sequential {
-			serial = append(serial, r)
+	var serial, parallel []indexedResolved
+	for _, ir := range executable {
+		if ir.r.sequential {
+			serial = append(serial, ir)
 		} else {
-			parallel = append(parallel, r)
+			parallel = append(parallel, ir)
 		}
 	}
 
 	// Serial batch drains fully first (in call order).
-	for _, r := range serial {
-		complete(runOne(ctx, r, ts, gateReg, emit))
+	for _, ir := range serial {
+		complete(ir.i, runOne(ctx, ir.r, ts, gateReg, emit))
 	}
 
 	if len(parallel) == 0 {
@@ -370,10 +405,10 @@ func execute(
 	// Per-WriteTarget-key mutex so same-key calls serialize (in call order)
 	// even within the parallel batch.
 	keyLocks := make(map[string]*sync.Mutex)
-	for _, r := range parallel {
-		if r.hasWrite {
-			if _, ok := keyLocks[r.writeKey]; !ok {
-				keyLocks[r.writeKey] = &sync.Mutex{}
+	for _, ir := range parallel {
+		if ir.r.hasWrite {
+			if _, ok := keyLocks[ir.r.writeKey]; !ok {
+				keyLocks[ir.r.writeKey] = &sync.Mutex{}
 			}
 		}
 	}
@@ -381,20 +416,25 @@ func execute(
 	// Semaphore bounds peak concurrency to MaxParallelToolCalls.
 	sem := make(chan struct{}, resolveMaxParallelToolCalls(ts.MaxParallelToolCalls))
 	var wg sync.WaitGroup
-	for _, r := range parallel {
+	for _, ir := range parallel {
 		wg.Add(1)
-		go func(r *resolved) {
+		go func(ir indexedResolved) {
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
 
-			if r.hasWrite {
-				lk := keyLocks[r.writeKey]
+			if ir.r.hasWrite {
+				// Intentional: a same-key goroutine holds its semaphore slot while
+				// blocked on the key mutex. Correctness is preserved (concurrency is
+				// still capped and same-key calls still serialize); the only effect is
+				// a transient throughput nuance (a blocked slot could otherwise admit
+				// another call), not a bug.
+				lk := keyLocks[ir.r.writeKey]
 				lk.Lock()
 				defer lk.Unlock()
 			}
-			complete(runOne(ctx, r, ts, gateReg, emit))
-		}(r)
+			complete(ir.i, runOne(ctx, ir.r, ts, gateReg, emit))
+		}(ir)
 	}
 	wg.Wait()
 }
@@ -421,7 +461,7 @@ func runOne(
 	exec := chain(r.t, ts.Middlewares)
 	tr, err := exec(ctx2, r.argsstr)
 	if err != nil {
-		return errResult(r, "error: "+err.Error())
+		return errResult(r, errToolPrefix+err.Error())
 	}
 	if tr == nil || len(tr.Content) == 0 {
 		return errResult(r, errEmptyResult)
