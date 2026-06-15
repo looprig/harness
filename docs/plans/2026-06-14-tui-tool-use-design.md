@@ -9,6 +9,14 @@ Date: 2026-06-14 · Status: approved (brainstorm)
 > amended); (2) **`/verbose` removed in favour of a `Ctrl+T` key**, and expansion
 > redefined as "all lines of the runner-capped preview" (no fictional 100-line/"full"
 > view the ~20-line event can't supply) — the runner marks truncation.
+>
+> **Revision 2026-06-14 (review pass 2)** resolves a review: (1) **`TurnDone` is now
+> unambiguous** — `live` is authoritative, `ev.Message` is a fallback only when `live`
+> is empty; never both (no duplicated final text). Replaces the current
+> `tui/screen.go:111` handler; added a "no duplication" test (§2, §6); (2) the runner
+> obligations the TUI depends on (`ResultPreview` cap/redaction; all `ToolCallStarted`
+> before any `ToolCallCompleted`) are now in **tools-design §5e** + the impl plan, not
+> only implied here.
 
 ## Scope
 
@@ -104,7 +112,7 @@ No per-card `Expanded` field — the global `expandTools` covers v1 (YAGNI).
 | `TokenDelta` (`*content.TextChunk`) | If `live.calls` is non-empty (a batch ran and new narration is starting), **commit** `live` as `RoleAssistant{Blocks:[TextBlock(live.text)], ToolCalls:live.calls}` and reset `live`. Then `live.text += chunk.Text`. (Other chunk types still skipped.) |
 | `ToolCallStarted` | **If `live.calls` is non-empty and every existing call is terminal** (a batch finished and a new one starts with *no narration between* — `tool batch → tool batch`), **commit** `live` and reset first. Then append `ToolCallView{CallID, ToolName, Summary, Status:ToolRunning}` to `live.calls`. The text streamed so far is this batch's narration. |
 | `ToolCallCompleted` | Find the view by `CallID` in `live.calls` (fallback: most recent committed segment); set `Status` (`ToolOK`/`ToolError` from `IsError`) and `Result` from the capped preview. |
-| `TurnDone` | Commit `live` (final text; usually no calls); clear `live`. Guard nil `Message`. |
+| `TurnDone` | **`live` is authoritative** — commit `live` (its streamed `text` + any `calls`) as the final segment; **do not also append `ev.Message.Blocks`** (that would duplicate the streamed text). `ev.Message` is a **fallback only**: if `live` is empty (`text==""` and no `calls` — e.g. a non-streaming provider), commit `ev.Message.Blocks` instead (guard nil `Message`). Either way exactly **one** final assistant segment is produced. Clear `live`. **This replaces the current `tui/screen.go:111` handler** (which appends `ev.Message.Blocks` + clears `stream`). |
 | `TurnFailed` | Commit `live` if it has text or calls (keep completed tool work visible), then append `RoleError` (`ev.Err`). |
 | `TurnInterrupted` | Commit `live` (partial text + calls; any still-`ToolRunning` card → `ToolCancelled`), then the `RoleInterrupted` tombstone. |
 
@@ -229,6 +237,11 @@ the event doesn't carry.
   `ToolCallStarted` then two `ToolCallCompleted` by `CallID`); `Completed` updates the
   right card; interrupt mid-tool → `ToolCancelled` + tombstone; `TurnFailed` commits
   live + `RoleError`; queue indices survive segment commits.
+- **TurnDone (no duplication)** — streamed final text **plus** a `TurnDone` whose
+  `Message` carries that same text → **exactly one** final assistant segment (assert the
+  text appears once, not twice). And the fallback: an empty `live` + a non-nil
+  `TurnDone.Message` → one segment from `Message.Blocks`; empty `live` + nil `Message` →
+  no final segment.
 - **Ctrl+T** — toggles `expandTools` (collapsed first-K ⇄ all preview lines); works in
   any status.
 - **redaction** (in the tools impl) — a fake `EventSink` receives `ToolCallCompleted`

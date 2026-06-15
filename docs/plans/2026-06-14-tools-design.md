@@ -1123,6 +1123,13 @@ The pixel-level work is a follow-up TUI-update doc, since that TUI is mid-flight
 - `runner` — serial-then-parallel batching (fake `Sequential` tool), N→N+1
   session-grant visibility, `Grant` called only when `Scope != ScopeOnce`,
   middleware ordering, panic→error result, ctx-cancel terminates.
+- `runner` observability (the TUI tool-use design depends on these) — **all
+  `ToolCallStarted` for a batch are emitted before any `ToolCallCompleted`** (assert
+  ordering on the captured event sequence, incl. a batch larger than
+  `MaxParallelToolCalls`); `ToolCallCompleted.ResultPreview` is **capped** (≤ the
+  configured lines/bytes, with a truncation marker when the result exceeds it) and is
+  **dropped on the sink path** (a fake `EventSink` receives no `ResultPreview`; the
+  stream keeps it).
 - `runTurn` — `ToolUseChunk` fragment-accumulation by `Index`, tool round-trips,
   tool-result flattened to text in the `ToolMessage` (non-empty on the wire;
   non-text → visible placeholder), no-tool-call exit emits `TurnDone`; fake `llm.LLM`.
