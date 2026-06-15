@@ -164,6 +164,145 @@ func TestContainedPath(t *testing.T) {
 	}
 }
 
+// TestContainedPathRootResolutionError exercises step 1 of containedPath: a
+// workspace root that does not exist (and so cannot be EvalSymlinks-resolved)
+// must be rejected fail-secure with a *ContainmentError whose Reason pins the
+// root-resolution message and whose Unwrap() exposes the underlying os error.
+// This is the workspace-boundary guard for an unresolvable root and was
+// previously untested.
+func TestContainedPathRootResolutionError(t *testing.T) {
+	t.Parallel()
+	tmp := t.TempDir()
+	// A root that does not exist on disk: EvalSymlinks must fail.
+	root := filepath.Join(tmp, "does-not-exist")
+
+	got, err := containedPath(root, "a.go")
+	if err == nil {
+		t.Fatalf("containedPath(%q, ...) = %q, want error for non-existent root", root, got)
+	}
+	if got != "" {
+		t.Errorf("fail-secure violated: got non-empty path %q with error", got)
+	}
+
+	var ce *ContainmentError
+	if !errors.As(err, &ce) {
+		t.Fatalf("error is not *ContainmentError: %T %v", err, err)
+	}
+	if ce.Reason != "workspace root could not be resolved" {
+		t.Errorf("Reason = %q, want %q", ce.Reason, "workspace root could not be resolved")
+	}
+	if ce.Root != root {
+		t.Errorf("Root = %q, want %q", ce.Root, root)
+	}
+	// The underlying EvalSymlinks error must be wrapped and unwrappable.
+	if ce.Unwrap() == nil {
+		t.Fatal("Unwrap() = nil, want the underlying EvalSymlinks error")
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("errors.Is(err, os.ErrNotExist) = false, want true (wrapped cause)")
+	}
+}
+
+// TestContainedPathSingleLevelEscapeReason exercises the exact rel == ".."
+// branch of hasParentEscape: a single-level "../x" climb above the root must be
+// rejected, and the denial Reason must be the specific escape message. Pinning
+// the Reason here means a future refactor that swaps reason strings is caught.
+func TestContainedPathSingleLevelEscapeReason(t *testing.T) {
+	t.Parallel()
+	tmp := t.TempDir()
+	root := mkdir(t, tmp, "ws")
+	// secret.txt lives one level above the root; "../secret.txt" cleans to a
+	// single-level parent climb, driving rel == ".." exactly.
+	writeFile(t, filepath.Join(tmp, "secret.txt"), "x")
+
+	got, err := containedPath(root, "../secret.txt")
+	if err == nil {
+		t.Fatalf("containedPath(%q, %q) = %q, want escape error", root, "../secret.txt", got)
+	}
+	if got != "" {
+		t.Errorf("fail-secure violated: got non-empty path %q with error", got)
+	}
+
+	var ce *ContainmentError
+	if !errors.As(err, &ce) {
+		t.Fatalf("error is not *ContainmentError: %T %v", err, err)
+	}
+	if ce.Reason != "resolved path escapes the workspace root" {
+		t.Errorf("Reason = %q, want %q", ce.Reason, "resolved path escapes the workspace root")
+	}
+}
+
+// TestContainmentErrorErrorAndUnwrap covers ContainmentError.Error() and
+// Unwrap() directly (both at 0% coverage): the message must carry the root,
+// input and reason context, Unwrap() must return the wrapped cause when present
+// and nil when there is none, and Error() must render the cause only when set.
+func TestContainmentErrorErrorAndUnwrap(t *testing.T) {
+	t.Parallel()
+	cause := os.ErrNotExist
+	tests := []struct {
+		name        string
+		err         *ContainmentError
+		wantUnwrap  error
+		wantSubstrs []string
+		notSubstr   string // substring that must NOT appear (cause when none)
+	}{
+		{
+			name: "with cause",
+			err: &ContainmentError{
+				Root:     "/ws",
+				Input:    "../x",
+				Resolved: "/etc",
+				Reason:   "resolved path escapes the workspace root",
+				Err:      cause,
+			},
+			wantUnwrap: cause,
+			wantSubstrs: []string{
+				"path containment denied",
+				"resolved path escapes the workspace root",
+				`root="/ws"`,
+				`input="../x"`,
+				`resolved="/etc"`,
+				cause.Error(),
+			},
+		},
+		{
+			name: "without cause",
+			err: &ContainmentError{
+				Root:     "/ws",
+				Input:    "../x",
+				Resolved: "/etc",
+				Reason:   "resolved path escapes the workspace root",
+			},
+			wantUnwrap: nil,
+			wantSubstrs: []string{
+				"path containment denied",
+				"resolved path escapes the workspace root",
+				`root="/ws"`,
+				`input="../x"`,
+				`resolved="/etc"`,
+			},
+			notSubstr: cause.Error(),
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := tt.err.Unwrap(); got != tt.wantUnwrap {
+				t.Errorf("Unwrap() = %v, want %v", got, tt.wantUnwrap)
+			}
+			msg := tt.err.Error()
+			for _, want := range tt.wantSubstrs {
+				if !strings.Contains(msg, want) {
+					t.Errorf("Error() = %q, missing substring %q", msg, want)
+				}
+			}
+			if tt.notSubstr != "" && strings.Contains(msg, tt.notSubstr) {
+				t.Errorf("Error() = %q, must not contain %q", msg, tt.notSubstr)
+			}
+		})
+	}
+}
+
 // TestContainedPathAbsoluteAnchoredUnderRoot verifies the documented treatment
 // of absolute inputs: they are anchored under root (not honoured as absolute),
 // so an absolute path "outside" root becomes a contained would-be path rather

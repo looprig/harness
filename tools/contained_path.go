@@ -32,6 +32,16 @@ func (e *ContainmentError) Error() string {
 // Unwrap exposes the underlying cause for errors.Is / errors.As chaining.
 func (e *ContainmentError) Unwrap() error { return e.Err }
 
+// errNoExistingAncestor is the leaf cause returned by resolveExistingPrefix when
+// it walks all the way to the volume/filesystem root without finding any
+// existing ancestor. This is (near-)unreachable for an absolute joined path
+// anchored under a root that already resolved, but we fail secure rather than
+// loop forever. It carries no Root/Input context: containedPath wraps it into a
+// full *ContainmentError at the call site, exactly as it wraps every other
+// resolution failure, so EVERY *ContainmentError it returns has Root and Input
+// populated.
+var errNoExistingAncestor = errors.New("no existing ancestor found for path")
+
 // containedPath resolves a caller-supplied path against a workspace root and
 // returns the cleaned, symlink-resolved, ABSOLUTE path proven to be inside the
 // root — or a *ContainmentError. It implements §3c steps 1–4 of the tools
@@ -137,18 +147,21 @@ func hasParentEscape(rel string) bool {
 }
 
 // resolveExistingPrefix resolves symlinks for the longest existing prefix of
-// path and re-appends the non-existent remainder verbatim. If the full path
+// target and re-appends the non-existent remainder verbatim. If the full target
 // exists, it is fully EvalSymlinks-resolved. The returned path is absolute and
 // has all symlinks in its existing components resolved.
 //
-// It walks up from the full path to the root-most ancestor, stopping at the
+// It walks up from the full target to the root-most ancestor, stopping at the
 // first ancestor that exists (via Lstat). EvalSymlinks is then applied to that
 // existing ancestor, and the trailing components are joined back on. This is
 // fail-secure: if even the volume root does not resolve, the error propagates.
-func resolveExistingPrefix(path string) (string, error) {
+// On the (near-)unreachable volume-root fixed-point branch it returns the leaf
+// errNoExistingAncestor cause, which containedPath wraps with full Root/Input
+// context — this function deliberately adds no Root/Input itself.
+func resolveExistingPrefix(target string) (string, error) {
 	// Fast path: the whole target exists -> resolve it directly.
-	if _, err := os.Lstat(path); err == nil {
-		return filepath.EvalSymlinks(path)
+	if _, err := os.Lstat(target); err == nil {
+		return filepath.EvalSymlinks(target)
 	} else if !errors.Is(err, os.ErrNotExist) {
 		// A non-"not exist" Lstat error (e.g. ELOOP, EACCES on a component) is
 		// fail-secure: we cannot prove containment, so reject.
@@ -158,17 +171,15 @@ func resolveExistingPrefix(path string) (string, error) {
 	// Walk up collecting non-existent trailing components until we find an
 	// existing ancestor. The loop is bounded by the number of path separators.
 	var tail []string
-	cur := path
+	cur := target
 	for {
 		parent := filepath.Dir(cur)
 		if parent == cur {
 			// Reached the volume/filesystem root and nothing existed. This
 			// should be unreachable for an absolute joined path (root exists),
-			// but fail secure rather than loop forever.
-			return "", &ContainmentError{
-				Resolved: path,
-				Reason:   "no existing ancestor found for path",
-			}
+			// but fail secure rather than loop forever. Return the leaf cause;
+			// containedPath wraps it with Root/Input at the call site.
+			return "", errNoExistingAncestor
 		}
 		tail = append([]string{filepath.Base(cur)}, tail...)
 		_, err := os.Lstat(parent)
