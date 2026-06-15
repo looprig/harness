@@ -158,35 +158,35 @@ func indentWrap(s, indent string, width int) string {
 // renderMessages renders the whole transcript to a single string. It dispatches
 // on each message's DisplayRole and, within a row, on each block's concrete
 // type. Rows whose index is in queued get a trailing marker. A non-empty live
-// segment is appended as a trailing in-progress assistant row.
+// segment is appended as a trailing in-progress assistant row carrying its
+// streamed text and its (possibly still-running) tool cards.
 //
-// The expandTools flag controls whether tool-call previews render collapsed or
-// fully; it is threaded for later phases and currently unused — live.calls is
-// always empty in this phase, so the live segment renders exactly its text, as
-// the old trailing stream did.
+// expandTools controls whether tool-call previews render folded (first K lines +
+// a marker) or fully; it is threaded to every assistant row and to the live block.
 func renderMessages(msgs []DisplayMessage, live liveSegment, queued map[int]bool, expandTools bool, width int) string {
-	_ = expandTools // reserved for tool-card rendering (Phase 3/4)
 	rows := make([]string, 0, len(msgs)+1)
 	for i, m := range msgs {
-		row := renderRow(m, width)
+		row := renderRow(m, expandTools, width)
 		if queued[i] {
 			row += queuedMarker
 		}
 		rows = append(rows, row)
 	}
-	if live.text != "" {
-		rows = append(rows, renderMD(live.text, width))
+	if live.text != "" || len(live.calls) > 0 {
+		rows = append(rows, renderAssistant(live.text, live.calls, expandTools, width))
 	}
 	return strings.Join(rows, rowSep)
 }
 
-// renderRow renders a single transcript message according to its role.
-func renderRow(m DisplayMessage, width int) string {
+// renderRow renders a single transcript message according to its role. The
+// RoleAssistant case nests the row's tool-call cards beneath its narration text;
+// expandTools is forwarded to that nesting.
+func renderRow(m DisplayMessage, expandTools bool, width int) string {
 	switch m.Role {
 	case RoleUser:
 		return styles.UserStyle.Render(renderInlineBlocks(m.Blocks))
 	case RoleAssistant:
-		return renderMD(assistantText(m.Blocks), width)
+		return renderAssistant(assistantText(m.Blocks), m.ToolCalls, expandTools, width)
 	case RoleSystem:
 		return styles.SystemStyle.Render(firstText(m.Blocks))
 	case RoleError:
@@ -196,6 +196,20 @@ func renderRow(m DisplayMessage, width int) string {
 	default:
 		return ""
 	}
+}
+
+// renderAssistant renders an assistant segment: its markdown narration followed by
+// its tool-call cards. A segment with empty narration but non-empty cards renders a
+// bare dot bullet (no empty markdown block) before its cards, per design §3.
+func renderAssistant(text string, calls []ToolCallView, expandTools bool, width int) string {
+	body := renderMD(text, width)
+	if body == "" && len(calls) > 0 {
+		body = strings.TrimRight(styles.Dot, " ") // bare bullet for a card-only segment
+	}
+	if len(calls) == 0 {
+		return body
+	}
+	return body + "\n" + renderToolCalls(calls, expandTools, width)
 }
 
 // renderInlineBlocks renders each block to plain text and joins with newlines.

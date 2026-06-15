@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/inventivepotter/urvi/internal/content"
+	"github.com/inventivepotter/urvi/tui/styles"
 )
 
 func TestRenderMD(t *testing.T) {
@@ -336,6 +337,140 @@ func TestRenderToolCallsWidthWrap(t *testing.T) {
 	wideRows := strings.Count(wide, "\n")
 	if narrowRows <= wideRows {
 		t.Errorf("narrow render rows = %d, wide render rows = %d; want narrow to wrap into more rows", narrowRows, wideRows)
+	}
+}
+
+// TestRenderRowAssistantNestsCards covers Task 3.3: an assistant row renders its
+// markdown text followed by its tool-call cards indented beneath; a row with empty
+// text but cards renders a bare dot bullet plus its cards (no empty markdown block).
+func TestRenderRowAssistantNestsCards(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		row    DisplayMessage
+		want   []string
+		absent []string
+	}{
+		{
+			name: "text plus cards",
+			row: DisplayMessage{
+				Role:   RoleAssistant,
+				Blocks: []content.Block{&content.TextBlock{Text: "let me read the config"}},
+				ToolCalls: []ToolCallView{
+					{ToolName: "ReadFile", Summary: "config.yaml", Status: ToolOK, Result: []string{"port: 8080"}},
+				},
+			},
+			want: []string{"let me read the config", "ReadFile", "config.yaml", glyphOK, "port: 8080"},
+		},
+		{
+			name: "empty text with cards renders bare bullet plus cards",
+			row: DisplayMessage{
+				Role:   RoleAssistant,
+				Blocks: nil, // bare segment whose only content is its tool cards
+				ToolCalls: []ToolCallView{
+					{ToolName: "Bash", Summary: "ls", Status: ToolOK, Result: []string{"a.go"}},
+				},
+			},
+			want: []string{strings.TrimSpace(styles.Dot), "Bash", "ls", glyphOK, "a.go"},
+		},
+		{
+			name: "text without cards renders no card connector",
+			row: DisplayMessage{
+				Role:   RoleAssistant,
+				Blocks: []content.Block{&content.TextBlock{Text: "just text"}},
+			},
+			want:   []string{"just text"},
+			absent: []string{cardConnector},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			got := renderRow(tt.row, false, 80)
+			for _, w := range tt.want {
+				if !strings.Contains(got, w) {
+					t.Errorf("renderRow() = %q, want to contain %q", got, w)
+				}
+			}
+			for _, a := range tt.absent {
+				if strings.Contains(got, a) {
+					t.Errorf("renderRow() = %q, want to NOT contain %q", got, a)
+				}
+			}
+		})
+	}
+}
+
+// TestRenderMessagesLiveCards covers Task 3.3: the live segment renders its text
+// then its tool cards as the trailing in-progress block; a running card shows the
+// running glyph.
+func TestRenderMessagesLiveCards(t *testing.T) {
+	t.Parallel()
+
+	t.Run("live text plus running card", func(t *testing.T) {
+		t.Parallel()
+
+		live := liveSegment{
+			text:  "checking now",
+			calls: []ToolCallView{{ToolName: "Bash", Summary: "ls", Status: ToolRunning}},
+		}
+		got := renderMessages(nil, live, nil, false, 80)
+		for _, w := range []string{"checking now", "Bash", "ls", glyphRunning} {
+			if !strings.Contains(got, w) {
+				t.Errorf("renderMessages() = %q, want to contain %q", got, w)
+			}
+		}
+	})
+
+	t.Run("live cards with empty text render bare bullet", func(t *testing.T) {
+		t.Parallel()
+
+		live := liveSegment{calls: []ToolCallView{{ToolName: "Bash", Status: ToolRunning}}}
+		got := renderMessages(nil, live, nil, false, 80)
+		for _, w := range []string{strings.TrimSpace(styles.Dot), "Bash", glyphRunning} {
+			if !strings.Contains(got, w) {
+				t.Errorf("renderMessages() = %q, want to contain %q", got, w)
+			}
+		}
+	})
+}
+
+// TestRenderMessagesFullTranscriptNesting covers Task 3.3: a text→tool→text
+// transcript renders each segment's cards beneath the segment that triggered them.
+func TestRenderMessagesFullTranscriptNesting(t *testing.T) {
+	t.Parallel()
+
+	msgs := []DisplayMessage{
+		{Role: RoleUser, Blocks: []content.Block{&content.TextBlock{Text: "fix the port"}}},
+		{
+			Role:   RoleAssistant,
+			Blocks: []content.Block{&content.TextBlock{Text: "reading config"}},
+			ToolCalls: []ToolCallView{
+				{ToolName: "ReadFile", Summary: "config.yaml", Status: ToolOK, Result: []string{"port: 8080"}},
+			},
+		},
+		{
+			Role:   RoleAssistant,
+			Blocks: []content.Block{&content.TextBlock{Text: "now fixing"}},
+			ToolCalls: []ToolCallView{
+				{ToolName: "EditFile", Summary: "config.yaml", Status: ToolOK, Result: []string{"port: 9090"}},
+			},
+		},
+	}
+	got := renderMessages(msgs, liveSegment{}, nil, false, 80)
+
+	// Every segment's text and its own card appear, in transcript order.
+	for _, w := range []string{"fix the port", "reading config", "ReadFile", "port: 8080", "now fixing", "EditFile", "port: 9090"} {
+		if !strings.Contains(got, w) {
+			t.Errorf("transcript missing %q in %q", w, got)
+		}
+	}
+	// The first card precedes the second segment's narration (chronological nesting).
+	if i, j := strings.Index(got, "ReadFile"), strings.Index(got, "now fixing"); i < 0 || j < 0 || i > j {
+		t.Errorf("expected ReadFile card before 'now fixing' narration; got idx %d vs %d", i, j)
 	}
 }
 
