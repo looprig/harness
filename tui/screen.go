@@ -14,9 +14,15 @@ import (
 )
 
 // reservedLines is the vertical space the input box occupies below the history
-// viewport. The status line was removed, so only the 2-line input is reserved; the
-// history fills the rest so the composed frame is exactly the terminal height.
-const reservedLines = 2
+// viewport. The bordered composer box reserves 3 rows at its minimum height: 1
+// content line plus the top and bottom border rows. The history fills the rest so
+// the composed frame is exactly the terminal height.
+//
+// TRANSITIONAL: this is a fixed budget for the minimum-height box. It will be
+// replaced by a dynamic active-surface budget (separator + box border + grown
+// content + status) once the composer auto-growth and surrounding chrome are wired
+// into the height calculation in a later task.
+const reservedLines = 3
 
 // liveSegment is the in-progress assistant segment for the current turn: the
 // streamed reasoning (thinking) and narration text plus the tool calls

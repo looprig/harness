@@ -41,6 +41,11 @@ var (
 // AccentBarStyle colors the left accent bar on user rows and the input prompt.
 var AccentBarStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
 
+// BoxStyle is the border drawn around the composer (input) box. The auto-growing
+// editor renders inside it; callers subtract the style's horizontal frame from the
+// box width to size the inner textarea.
+var BoxStyle = lipgloss.NewStyle().Border(lipgloss.NormalBorder())
+
 // ThinkingStyle renders the model's reasoning block: faint and italic, subordinate
 // to the assistant narration it precedes.
 var ThinkingStyle = lipgloss.NewStyle().Faint(true).Italic(true)
