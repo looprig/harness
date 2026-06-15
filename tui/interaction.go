@@ -179,20 +179,25 @@ var noop = uiAction{Kind: uiNoop}
 // submit in one mode yet be typed literally in another.
 func isEnter(msg tea.KeyPressMsg) bool { return msg.String() == "enter" }
 
-// Update advances the model on a key press and returns the new model plus a typed
-// uiAction. It dispatches on the current mode: compose edits/submits the next
-// message; the three prompt modes route the key to a per-mode handler that
-// produces the typed action (approve/deny/answer/interrupt). When a prompt-mode
-// handler resolves the head (approve/deny/answer) the head is popped optimistically
-// in the returned model — fire-and-route, no ack — revealing the next prompt or
-// returning to compose. esc precedence is encoded per mode: deny in permission
-// mode, interrupt (no pop) in choice/answer mode, existing behavior in compose.
-func (m interactionModel) Update(msg tea.KeyPressMsg) (interactionModel, uiAction) {
+// Update advances the model on a key press and returns the new model, a typed
+// uiAction, and the editor's cursor-blink Cmd. It dispatches on the current mode:
+// compose edits/submits the next message; the three prompt modes route the key to a
+// per-mode handler that produces the typed action (approve/deny/answer/interrupt).
+// When a prompt-mode handler resolves the head (approve/deny/answer) the head is
+// popped optimistically in the returned model — fire-and-route, no ack — revealing
+// the next prompt or returning to compose. esc precedence is encoded per mode: deny
+// in permission mode, interrupt (no pop) in choice/answer mode, existing behavior in
+// compose. The third return is the textarea's blink Cmd from the editing modes
+// (compose + free-text answer); the prompt control modes return a nil Cmd. Screen
+// batches it so the cursor keeps blinking wherever the composer is the active field.
+func (m interactionModel) Update(msg tea.KeyPressMsg) (interactionModel, uiAction, tea.Cmd) {
 	switch m.mode {
 	case modePermissionPrompt:
-		return m.permissionKey(msg)
+		model, action := m.permissionKey(msg)
+		return model, action, nil
 	case modeChoicePrompt:
-		return m.choiceKey(msg)
+		model, action := m.choiceKey(msg)
+		return model, action, nil
 	case modeAnswerPrompt:
 		return m.answerKey(msg)
 	default:
@@ -273,54 +278,57 @@ func (m interactionModel) selectBy(delta int) (interactionModel, uiAction) {
 // non-empty (pop + uiAnswer; the queue-drain restore puts the compose draft back);
 // an empty enter re-prompts (no-op); esc interrupts WITHOUT popping; every other
 // key (including shift+enter's newline via the textarea binding) forwards to the
-// editor.
-func (m interactionModel) answerKey(msg tea.KeyPressMsg) (interactionModel, uiAction) {
+// editor and returns its blink Cmd so the answer field's cursor keeps blinking.
+func (m interactionModel) answerKey(msg tea.KeyPressMsg) (interactionModel, uiAction, tea.Cmd) {
 	head := *m.ActivePrompt()
 	if msg.Code == tea.KeyEsc {
-		return m, uiAction{Kind: uiInterrupt}
+		return m, uiAction{Kind: uiInterrupt}, nil
 	}
 	if isEnter(msg) {
 		v := m.input.Value()
 		if strings.TrimSpace(v) == "" {
-			return m, noop
+			return m, noop, nil
 		}
-		return m.pop(), uiAction{Kind: uiAnswer, CallID: head.CallID, Text: v}
+		return m.pop(), uiAction{Kind: uiAnswer, CallID: head.CallID, Text: v}, nil
 	}
-	_ = m.input.Update(msg)
-	return m, noop
+	cmd := m.input.Update(msg)
+	return m, noop, cmd
 }
 
 // composeKey routes a key in modeCompose. When the slash panel is visible it owns
 // tab/up/down/enter (mirroring screen.go's handleKey/handleEnter): tab fills the
 // input with the highlighted command, up/down navigate the panel, and enter
 // dispatches the HIGHLIGHTED command. With no panel, a bare Enter submits/runs via
-// composeEnter; any other key edits the editor and rebuilds the panel.
-func (m interactionModel) composeKey(msg tea.KeyPressMsg) (interactionModel, uiAction) {
+// composeEnter; any other key edits the editor and rebuilds the panel, returning the
+// editor's blink Cmd so the composer cursor keeps blinking. The panel-navigation and
+// submit/run keys are pure state changes — they return a nil Cmd.
+func (m interactionModel) composeKey(msg tea.KeyPressMsg) (interactionModel, uiAction, tea.Cmd) {
 	if m.slash != nil {
 		if isEnter(msg) {
 			name := m.slash.Selected().Name
 			m.input.Reset()
 			m.slash = nil
-			return m, uiAction{Kind: uiRunSlash, Slash: name}
+			return m, uiAction{Kind: uiRunSlash, Slash: name}, nil
 		}
 		switch msg.String() {
 		case "tab":
 			m.input.SetValue(m.slash.Selected().Name)
 			m.slash = nil
-			return m, noop
+			return m, noop, nil
 		case "up":
 			m.slash.Up()
-			return m, noop
+			return m, noop, nil
 		case "down":
 			m.slash.Down()
-			return m, noop
+			return m, noop, nil
 		}
 	}
 	if isEnter(msg) {
-		return m.composeEnter()
+		model, action := m.composeEnter()
+		return model, action, nil
 	}
-	m.forwardToInput(msg)
-	return m, noop
+	cmd := m.forwardToInput(msg)
+	return m, noop, cmd
 }
 
 // composeEnter resolves a bare Enter in compose mode WITH NO slash panel by
@@ -351,14 +359,46 @@ func (m interactionModel) composeEnter() (interactionModel, uiAction) {
 
 // forwardToInput sends the key to the editor and rebuilds the slash-completion
 // panel from the new value: a leading-slash word (no whitespace) rebuilds it from
-// the prefix (nil if nothing matches); anything else hides it. It mirrors
-// screen.go's forwardToInput so compose behavior is identical.
-func (m *interactionModel) forwardToInput(msg tea.KeyPressMsg) {
-	_ = m.input.Update(msg)
+// the prefix (nil if nothing matches); anything else hides it. It returns the
+// editor's Cmd (cursor blink) so the caller can keep the composer cursor alive. It
+// mirrors screen.go's forwardToInput so compose behavior is identical.
+func (m *interactionModel) forwardToInput(msg tea.KeyPressMsg) tea.Cmd {
+	cmd := m.input.Update(msg)
 	v := m.input.Value()
 	if strings.HasPrefix(v, "/") && !strings.ContainsAny(v, " \t\n") {
 		m.slash = components.NewSlashComplete(firstToken(v))
 	} else {
 		m.slash = nil
 	}
+	return cmd
+}
+
+// helpText builds the /help listing from the canonical command table. Screen
+// commits the result as a system entry when /help runs.
+func helpText() string {
+	var b strings.Builder
+	b.WriteString("commands:")
+	for _, c := range components.SlashCommands {
+		b.WriteString("\n  " + c.Name + " — " + c.Desc)
+	}
+	return b.String()
+}
+
+// isSlashCommand reports whether name is one of the canonical slash commands.
+func isSlashCommand(name string) bool {
+	for _, c := range components.SlashCommands {
+		if c.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+// firstToken returns the first whitespace-delimited token of s, or "" if none.
+func firstToken(s string) string {
+	fields := strings.Fields(s)
+	if len(fields) == 0 {
+		return ""
+	}
+	return fields[0]
 }

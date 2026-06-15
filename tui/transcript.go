@@ -1,9 +1,22 @@
 package tui
 
 import (
+	"strings"
+
 	"github.com/inventivepotter/urvi/internal/agent/loop/event"
 	"github.com/inventivepotter/urvi/internal/content"
 )
+
+// splitLines splits a tool-result preview into display lines on "\n". An empty
+// preview yields nil (no result lines; the renderer shows "(no output)"); a
+// non-empty preview always yields at least one line. A trailing newline produces a
+// trailing empty line, preserved as-is (the runner caps/marks the preview).
+func splitLines(s string) []string {
+	if s == "" {
+		return nil
+	}
+	return strings.Split(s, "\n")
+}
 
 // displayID is a stable, monotonically assigned identifier for a committed
 // transcript entry. It is allocated once when a live segment is committed and
@@ -24,6 +37,9 @@ const (
 	kindPromptRecord
 	kindError
 	kindInterrupted
+	// kindSystem is a session/notice line (e.g. the startup "session ready" row or
+	// the /help listing). It carries a single TextBlock and renders faint.
+	kindSystem
 )
 
 // promptContext is the FULL prompt payload a kindPromptRecord entry commits to
@@ -134,6 +150,39 @@ func (m transcriptModel) ApplyEvent(ev event.Event) transcriptModel {
 func (m transcriptModel) CommitUser(blocks []content.Block) transcriptModel {
 	m.nextID++
 	m.committed = append(m.committed, entry{ID: m.nextID, Kind: kindUser, Blocks: blocks})
+	return m
+}
+
+// CommitSystem appends a session/notice line (e.g. "session ready" or the /help
+// listing) as one kindSystem entry with a fresh stable ID and returns the next
+// model. It does NOT touch the live segment — a system notice is out-of-band from
+// the assistant's in-progress output.
+func (m transcriptModel) CommitSystem(text string) transcriptModel {
+	m.nextID++
+	m.committed = append(m.committed, entry{
+		ID:     m.nextID,
+		Kind:   kindSystem,
+		Blocks: []content.Block{&content.TextBlock{Text: text}},
+	})
+	return m
+}
+
+// CommitError appends a faint, non-fatal error line as one kindError entry with a
+// fresh stable ID and returns the next model. It is the out-of-band error path —
+// distinct from a turn failure's terminal kindError (turnFailed) — used by Screen
+// for submit/dispatch/reopen failures that must be surfaced without ending a turn.
+// A nil err commits an empty message (the entry still marks the failure).
+func (m transcriptModel) CommitError(err error) transcriptModel {
+	msg := ""
+	if err != nil {
+		msg = err.Error()
+	}
+	m.nextID++
+	m.committed = append(m.committed, entry{
+		ID:     m.nextID,
+		Kind:   kindError,
+		Blocks: []content.Block{&content.TextBlock{Text: msg}},
+	})
 	return m
 }
 

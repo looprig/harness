@@ -205,6 +205,18 @@ func indentWrap(s, indent string, width int) string {
 	return strings.Join(rows, "\n")
 }
 
+// liveSegment is the legacy in-progress assistant segment used only by the
+// DisplayMessage-based renderMessages/renderRow path (and its tests). The live
+// scrollback-first path uses transcript.go's liveSeg + entryrender.go instead; this
+// type and renderMessages survive as the shared exercise of the render primitives
+// (renderUser/renderAssistant/renderToolCalls) and a potential future --fullscreen
+// transcript renderer. Screen no longer references either.
+type liveSegment struct {
+	text     string
+	thinking string
+	calls    []ToolCallView
+}
+
 // renderMessages renders the whole transcript to a single string. It dispatches
 // on each message's DisplayRole and, within a row, on each block's concrete
 // type. Rows whose index is in queued get a trailing marker. A non-empty live

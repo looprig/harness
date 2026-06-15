@@ -90,10 +90,10 @@ func TestContractChoiceAnswerAlwaysAMember(t *testing.T) {
 
 			m := choiceModel(choices)
 			for i := 0; i < tt.preDowns; i++ {
-				m, _ = m.Update(tea.KeyPressMsg{Code: tea.KeyDown})
+				m, _, _ = m.Update(tea.KeyPressMsg{Code: tea.KeyDown})
 			}
 
-			_, action := m.Update(tt.key)
+			_, action, _ := m.Update(tt.key)
 
 			gotAnswer := action.Kind == uiAnswer
 			if gotAnswer != tt.wantEmitsAnswer {
@@ -142,9 +142,9 @@ func TestContractChoiceAnswerMemberUnderKeySequences(t *testing.T) {
 		// that only ever emits at a particular selected index is still exercised.
 		for _, k := range keys {
 			m := choiceModel(choices)
-			m, _ = m.Update(tea.KeyPressMsg{Code: tea.KeyDown}) // selected = 1
-			m, _ = m.Update(tea.KeyPressMsg{Code: tea.KeyDown}) // selected = 2
-			_, action := m.Update(k)
+			m, _, _ = m.Update(tea.KeyPressMsg{Code: tea.KeyDown}) // selected = 1
+			m, _, _ = m.Update(tea.KeyPressMsg{Code: tea.KeyDown}) // selected = 2
+			_, action, _ := m.Update(k)
 			if action.Kind == uiAnswer && !choiceMembers(action.Text, choices) {
 				t.Errorf("key %+v produced uiAnswer.Text %q, not a member of %v ∪ {%q}", k, action.Text, choices, otherChoice)
 			}
@@ -156,7 +156,7 @@ func TestContractChoiceAnswerMemberUnderKeySequences(t *testing.T) {
 		m := choiceModel(choices)
 		for _, k := range keys {
 			var action uiAction
-			m, action = m.Update(k)
+			m, action, _ = m.Update(k)
 			if action.Kind == uiAnswer && !choiceMembers(action.Text, choices) {
 				t.Fatalf("key %+v in sequence produced uiAnswer.Text %q, not a member of %v ∪ {%q}", k, action.Text, choices, otherChoice)
 			}

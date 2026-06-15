@@ -2,7 +2,6 @@ package tui
 
 import (
 	"github.com/inventivepotter/urvi/internal/agent/loop/event"
-	"github.com/inventivepotter/urvi/internal/content"
 )
 
 // eventMsg carries one event pulled from the active turn's stream.
@@ -27,13 +26,5 @@ type reopenResultMsg struct {
 	err   error
 }
 
-// systemReadyMsg triggers the initial RoleSystem "ready" row at startup.
+// systemReadyMsg triggers the initial system "session ready" entry at startup.
 type systemReadyMsg struct{}
-
-// queuedInput is a submission made while a turn was Running. DisplayIndex is the
-// index in messages of the RoleUser row shown for it, so the renderer can mark
-// exactly that row "(queued)" and an interrupt can remove exactly those rows.
-type queuedInput struct {
-	Blocks       []content.Block
-	DisplayIndex int
-}

@@ -29,6 +29,8 @@ func renderEntry(e entry, expand bool, width int) []string {
 		return renderPromptRecord(e.Prompt, width)
 	case kindError:
 		return splitNonEmpty(styles.ErrorStyle.Render(firstText(e.Blocks)))
+	case kindSystem:
+		return splitNonEmpty(styles.SystemStyle.Render(firstText(e.Blocks)))
 	case kindInterrupted:
 		return []string{styles.InterruptedStyle.Render(interruptedTombstone)}
 	default:

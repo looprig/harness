@@ -78,7 +78,7 @@ func TestInteractionComposeUpdate(t *testing.T) {
 			m := newInteractionModel()
 			m.input.SetValue(tt.seed)
 
-			m, action := m.Update(tt.key)
+			m, action, _ := m.Update(tt.key)
 
 			if action.Kind != tt.wantKind {
 				t.Errorf("action.Kind = %d, want %d", action.Kind, tt.wantKind)
@@ -287,7 +287,7 @@ func TestInteractionNonComposeUpdateIsNoop(t *testing.T) {
 		Request: tool.BashRequest{Command: "go build"},
 	})
 
-	m, action := m.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
+	m, action, _ := m.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
 	if action.Kind != uiNoop {
 		t.Errorf("non-compose Update Kind = %d, want uiNoop (%d)", action.Kind, uiNoop)
 	}
@@ -351,7 +351,7 @@ func TestInteractionPermissionRouting(t *testing.T) {
 			t.Parallel()
 
 			m := permissionModel(tt.req)
-			m, action := m.Update(tt.key)
+			m, action, _ := m.Update(tt.key)
 
 			if action.Kind != tt.wantKind {
 				t.Fatalf("action.Kind = %d, want %d", action.Kind, tt.wantKind)
@@ -435,7 +435,7 @@ func TestInteractionChoiceNavigation(t *testing.T) {
 			m := choiceModel(tt.choices)
 			for _, k := range tt.keys {
 				var action uiAction
-				m, action = m.Update(k)
+				m, action, _ = m.Update(k)
 				if action.Kind != uiNoop {
 					t.Fatalf("navigation Kind = %d, want uiNoop", action.Kind)
 				}
@@ -488,9 +488,9 @@ func TestInteractionChoiceSubmit(t *testing.T) {
 
 			m := choiceModel(tt.choices)
 			for i := 0; i < tt.preDowns; i++ {
-				m, _ = m.Update(tea.KeyPressMsg{Code: tea.KeyDown})
+				m, _, _ = m.Update(tea.KeyPressMsg{Code: tea.KeyDown})
 			}
-			m, action := m.Update(tt.key)
+			m, action, _ := m.Update(tt.key)
 
 			if action.Kind != tt.wantKind {
 				t.Fatalf("action.Kind = %d, want %d", action.Kind, tt.wantKind)
@@ -542,7 +542,7 @@ func TestInteractionAnswerMode(t *testing.T) {
 		t.Parallel()
 		m := newInteractionModel()
 		m = m.ApplyEvent(event.UserInputRequested{CallID: callID(3), Question: "name?", Choices: nil})
-		m, action := m.Update(runeKey('h'))
+		m, action, _ := m.Update(runeKey('h'))
 		if action.Kind != uiNoop {
 			t.Errorf("Kind = %d, want uiNoop", action.Kind)
 		}
@@ -556,9 +556,9 @@ func TestInteractionAnswerMode(t *testing.T) {
 		m := newInteractionModel()
 		m.input.SetValue("draft")
 		m = m.ApplyEvent(event.UserInputRequested{CallID: callID(3), Question: "name?", Choices: nil})
-		m, _ = m.Update(runeKey('h'))
-		m, _ = m.Update(runeKey('i'))
-		m, action := m.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
+		m, _, _ = m.Update(runeKey('h'))
+		m, _, _ = m.Update(runeKey('i'))
+		m, action, _ := m.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
 		if action.Kind != uiAnswer || action.Text != "hi" || action.CallID != callID(3) {
 			t.Fatalf("action = %+v, want uiAnswer 'hi' callID 3", action)
 		}
@@ -577,7 +577,7 @@ func TestInteractionAnswerMode(t *testing.T) {
 		t.Parallel()
 		m := newInteractionModel()
 		m = m.ApplyEvent(event.UserInputRequested{CallID: callID(3), Question: "name?", Choices: nil})
-		m, action := m.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
+		m, action, _ := m.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
 		if action.Kind != uiNoop {
 			t.Errorf("Kind = %d, want uiNoop (empty answer re-prompts)", action.Kind)
 		}
@@ -590,7 +590,7 @@ func TestInteractionAnswerMode(t *testing.T) {
 		t.Parallel()
 		m := newInteractionModel()
 		m = m.ApplyEvent(event.UserInputRequested{CallID: callID(3), Question: "name?", Choices: nil})
-		m, action := m.Update(tea.KeyPressMsg{Code: tea.KeyEsc})
+		m, action, _ := m.Update(tea.KeyPressMsg{Code: tea.KeyEsc})
 		if action.Kind != uiInterrupt {
 			t.Errorf("Kind = %d, want uiInterrupt", action.Kind)
 		}
@@ -642,10 +642,10 @@ func TestInteractionAnswerModeEnterVariants(t *testing.T) {
 			m = m.ApplyEvent(event.UserInputRequested{CallID: callID(3), Question: "name?", Choices: nil})
 			// Type a non-empty answer so a submit would fire (and so a shift+enter
 			// forward is distinguishable from an empty-enter no-op).
-			m, _ = m.Update(runeKey('h'))
-			m, _ = m.Update(runeKey('i'))
+			m, _, _ = m.Update(runeKey('h'))
+			m, _, _ = m.Update(runeKey('i'))
 
-			m, action := m.Update(tt.key)
+			m, action, _ := m.Update(tt.key)
 
 			if action.Kind != tt.wantKind {
 				t.Fatalf("action.Kind = %d, want %d", action.Kind, tt.wantKind)
@@ -677,8 +677,8 @@ func TestInteractionAnswerModeNextFieldEmpty(t *testing.T) {
 	m = m.ApplyEvent(event.UserInputRequested{CallID: callID(3), Question: "q1?", Choices: nil})
 	m = m.ApplyEvent(event.UserInputRequested{CallID: callID(4), Question: "q2?", Choices: nil})
 
-	m, _ = m.Update(runeKey('a'))
-	m, action := m.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
+	m, _, _ = m.Update(runeKey('a'))
+	m, action, _ := m.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
 	if action.Kind != uiAnswer || action.Text != "a" {
 		t.Fatalf("first answer = %+v, want uiAnswer 'a'", action)
 	}
@@ -701,16 +701,16 @@ func TestInteractionComposeSlashNavigation(t *testing.T) {
 		t.Parallel()
 		// Typing "/" matches all commands (/clear, /help); the panel is visible.
 		m := newInteractionModel()
-		m, _ = m.Update(runeKey('/'))
+		m, _, _ = m.Update(runeKey('/'))
 		if m.slash == nil {
 			t.Fatal("slash panel = nil after typing '/', want visible")
 		}
 		// Head highlight is /clear; down moves to /help.
-		m, navAction := m.Update(tea.KeyPressMsg{Code: tea.KeyDown})
+		m, navAction, _ := m.Update(tea.KeyPressMsg{Code: tea.KeyDown})
 		if navAction.Kind != uiNoop {
 			t.Errorf("down Kind = %d, want uiNoop", navAction.Kind)
 		}
-		m, action := m.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
+		m, action, _ := m.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
 		if action.Kind != uiRunSlash || action.Slash != "/help" {
 			t.Fatalf("action = %+v, want uiRunSlash '/help' (highlighted, not typed)", action)
 		}
@@ -722,10 +722,10 @@ func TestInteractionComposeSlashNavigation(t *testing.T) {
 	t.Run("up wraps and enter dispatches the highlighted command", func(t *testing.T) {
 		t.Parallel()
 		m := newInteractionModel()
-		m, _ = m.Update(runeKey('/'))
+		m, _, _ = m.Update(runeKey('/'))
 		// Up from /clear wraps to /help (the completer wraps).
-		m, _ = m.Update(tea.KeyPressMsg{Code: tea.KeyUp})
-		_, action := m.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
+		m, _, _ = m.Update(tea.KeyPressMsg{Code: tea.KeyUp})
+		_, action, _ := m.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
 		if action.Kind != uiRunSlash || action.Slash != "/help" {
 			t.Fatalf("action = %+v, want uiRunSlash '/help' (wrapped highlight)", action)
 		}
@@ -734,8 +734,8 @@ func TestInteractionComposeSlashNavigation(t *testing.T) {
 	t.Run("tab fills the input with the highlighted command", func(t *testing.T) {
 		t.Parallel()
 		m := newInteractionModel()
-		m, _ = m.Update(runeKey('/'))
-		m, action := m.Update(tea.KeyPressMsg{Code: tea.KeyTab})
+		m, _, _ = m.Update(runeKey('/'))
+		m, action, _ := m.Update(tea.KeyPressMsg{Code: tea.KeyTab})
 		if action.Kind != uiNoop {
 			t.Errorf("tab Kind = %d, want uiNoop", action.Kind)
 		}

@@ -14,6 +14,37 @@ import (
 // non-zero uuid.UUID from a single byte so tests can correlate
 // ToolCallStarted/ToolCallCompleted without crypto/rand.
 
+// TestSplitLines covers the tool-result preview splitter (transcript.go).
+func TestSplitLines(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		in   string
+		want []string
+	}{
+		{name: "empty yields nil", in: "", want: nil},
+		{name: "single line", in: "one", want: []string{"one"}},
+		{name: "two lines", in: "a\nb", want: []string{"a", "b"}},
+		{name: "trailing newline keeps empty tail", in: "a\n", want: []string{"a", ""}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got := splitLines(tt.in)
+			if len(got) != len(tt.want) {
+				t.Fatalf("splitLines(%q) = %#v, want %#v", tt.in, got, tt.want)
+			}
+			for i := range tt.want {
+				if got[i] != tt.want[i] {
+					t.Errorf("splitLines(%q)[%d] = %q, want %q", tt.in, i, got[i], tt.want[i])
+				}
+			}
+		})
+	}
+}
+
 // toolStarted builds a real event.ToolCallStarted for the given call.
 func toolStarted(id uuid.UUID, name, summary string) event.Event {
 	return event.ToolCallStarted{CallID: id, ToolName: name, Summary: summary}
