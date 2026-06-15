@@ -28,6 +28,19 @@ import (
 // defaultAgent is the agent opened when no agent name is given on the CLI.
 const defaultAgent = "coding"
 
+// agentDescriptions maps each registrable agent name to a one-line description shown
+// in the TUI startup banner. It lives at the composition root (not on the agent
+// packages) so the narrow tui.Agent interface need not expose a Description method —
+// the metadata is wired here alongside the registry registration. A name with no
+// entry falls back to an empty description (the banner then shows the bare name).
+var agentDescriptions = map[string]string{
+	"coding": "a careful software engineer that works through tools",
+}
+
+// agentDescription returns the banner description for name, or "" if none is
+// registered (the banner degrades to the bare name).
+func agentDescription(name string) string { return agentDescriptions[name] }
+
 // closeTimeout bounds the best-effort teardown Close of the current agent.
 const closeTimeout = 5 * time.Second
 
@@ -137,7 +150,7 @@ func main() {
 		}
 	}
 
-	screen := tui.New(ctx, agent, open)
+	screen := tui.New(ctx, agent, open, tui.AgentBanner{Name: name, Description: agentDescription(name)})
 	prog := tea.NewProgram(screen, progOpts...)
 
 	// SIGINT/SIGTERM (non-keyboard) cancels ctx → quit the TUI for a clean

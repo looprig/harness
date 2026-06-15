@@ -138,7 +138,7 @@ func feed(t *testing.T, m Screen, ev event.Event) Screen {
 // (readNext targets must be non-nil) and StatusRunning.
 func runningScreen(t *testing.T, agent Agent) Screen {
 	t.Helper()
-	m := New(context.Background(), agent, fakeOpen(agent))
+	m := New(context.Background(), agent, fakeOpen(agent), AgentBanner{})
 	m.reader = scriptedReader()
 	m.status = StatusRunning
 	return m
@@ -168,7 +168,7 @@ func TestNew(t *testing.T) {
 	t.Parallel()
 
 	agent := &fakeAgent{}
-	m := New(context.Background(), agent, fakeOpen(agent))
+	m := New(context.Background(), agent, fakeOpen(agent), AgentBanner{})
 
 	if m.status != StatusIdle {
 		t.Errorf("New status = %d, want StatusIdle (%d)", m.status, StatusIdle)
@@ -185,7 +185,7 @@ func TestInit(t *testing.T) {
 	t.Parallel()
 
 	agent := &fakeAgent{}
-	m := New(context.Background(), agent, fakeOpen(agent))
+	m := New(context.Background(), agent, fakeOpen(agent), AgentBanner{})
 
 	// Init focuses the composer (cursor blink) and queues the system-ready entry,
 	// so it must return a non-nil batched command.
@@ -199,14 +199,14 @@ func TestScreenIsTeaModel(t *testing.T) {
 	t.Parallel()
 
 	agent := &fakeAgent{}
-	var _ tea.Model = New(context.Background(), agent, fakeOpen(agent))
+	var _ tea.Model = New(context.Background(), agent, fakeOpen(agent), AgentBanner{})
 }
 
 func TestWindowSizeMsg(t *testing.T) {
 	t.Parallel()
 
 	agent := &fakeAgent{}
-	m := New(context.Background(), agent, fakeOpen(agent))
+	m := New(context.Background(), agent, fakeOpen(agent), AgentBanner{})
 
 	// Before any WindowSizeMsg, the view is empty (not ready).
 	if v := m.View().Content; v != "" {
@@ -250,7 +250,7 @@ func TestViewScrollbackFirstInvariant(t *testing.T) {
 			t.Parallel()
 
 			agent := &fakeAgent{}
-			m := New(context.Background(), agent, fakeOpen(agent))
+			m := New(context.Background(), agent, fakeOpen(agent), AgentBanner{})
 			if tt.resize != nil {
 				m, _ = updateScreen(t, m, *tt.resize)
 			}
@@ -274,7 +274,7 @@ func TestViewComposesSurfaceNoViewport(t *testing.T) {
 	t.Parallel()
 
 	agent := &fakeAgent{}
-	m := New(context.Background(), agent, fakeOpen(agent))
+	m := New(context.Background(), agent, fakeOpen(agent), AgentBanner{})
 	m, _ = updateScreen(t, m, tea.WindowSizeMsg{Width: 60, Height: 18})
 	m.transcript = m.transcript.CommitUser([]content.Block{&content.TextBlock{Text: "committed-history-line"}})
 
@@ -515,7 +515,7 @@ func TestSubmitStartsTurnIdle(t *testing.T) {
 	t.Parallel()
 
 	agent := &fakeAgent{streamReader: scriptedReader(event.TurnStarted{})}
-	m := New(context.Background(), agent, fakeOpen(agent))
+	m := New(context.Background(), agent, fakeOpen(agent), AgentBanner{})
 	m.interaction.input.SetValue("hello there")
 
 	m, cmd := updateScreen(t, m, tea.KeyPressMsg{Code: tea.KeyEnter})
@@ -578,7 +578,7 @@ func TestSubmitBadAttachmentCommitsError(t *testing.T) {
 	t.Parallel()
 
 	agent := &fakeAgent{}
-	m := New(context.Background(), agent, fakeOpen(agent))
+	m := New(context.Background(), agent, fakeOpen(agent), AgentBanner{})
 	m.interaction.input.SetValue("@nope.pem") // .pem is a denied extension → buildBlocks error
 
 	m, _ = updateScreen(t, m, tea.KeyPressMsg{Code: tea.KeyEnter})
@@ -587,8 +587,8 @@ func TestSubmitBadAttachmentCommitsError(t *testing.T) {
 		t.Errorf("status = %d, want StatusIdle (no turn)", m.status)
 	}
 	rec := lastCommitted(t, m)
-	if rec.Kind != kindError {
-		t.Errorf("committed kind = %d, want kindError", rec.Kind)
+	if rec.Kind != kindNotice || rec.Level != noticeError {
+		t.Errorf("committed = (kind %d, level %d), want (kindNotice, noticeError)", rec.Kind, rec.Level)
 	}
 	if agent.closeCalled {
 		t.Error("agent touched on a buildBlocks error, want untouched")
@@ -601,7 +601,7 @@ func TestSubmitEmptyIsNoop(t *testing.T) {
 	t.Parallel()
 
 	agent := &fakeAgent{}
-	m := New(context.Background(), agent, fakeOpen(agent))
+	m := New(context.Background(), agent, fakeOpen(agent), AgentBanner{})
 	m.interaction.input.SetValue("   ")
 
 	m, cmd := updateScreen(t, m, tea.KeyPressMsg{Code: tea.KeyEnter})
@@ -623,7 +623,7 @@ func TestRunSlashHelp(t *testing.T) {
 	t.Parallel()
 
 	agent := &fakeAgent{}
-	m := New(context.Background(), agent, fakeOpen(agent))
+	m := New(context.Background(), agent, fakeOpen(agent), AgentBanner{})
 	m.interaction.input.SetValue("/help")
 
 	m, cmd := updateScreen(t, m, tea.KeyPressMsg{Code: tea.KeyEnter})
@@ -631,8 +631,8 @@ func TestRunSlashHelp(t *testing.T) {
 		t.Error("/help cmd = nil, want non-nil (flush of the system entry)")
 	}
 	rec := lastCommitted(t, m)
-	if rec.Kind != kindSystem {
-		t.Fatalf("committed kind = %d, want kindSystem", rec.Kind)
+	if rec.Kind != kindNotice || rec.Level != noticeInfo {
+		t.Fatalf("committed = (kind %d, level %d), want (kindNotice, noticeInfo)", rec.Kind, rec.Level)
 	}
 	text := committedText(rec)
 	for _, c := range components.SlashCommands {
@@ -648,7 +648,7 @@ func TestRunSlashClearWhileIdle(t *testing.T) {
 	t.Parallel()
 
 	agent := &fakeAgent{}
-	m := New(context.Background(), agent, fakeOpen(agent))
+	m := New(context.Background(), agent, fakeOpen(agent), AgentBanner{})
 	m.interaction.input.SetValue("/clear")
 
 	m, cmd := updateScreen(t, m, tea.KeyPressMsg{Code: tea.KeyEnter})
@@ -704,7 +704,7 @@ func TestEscWhileIdleIsNoop(t *testing.T) {
 	t.Parallel()
 
 	agent := &fakeAgent{}
-	m := New(context.Background(), agent, fakeOpen(agent))
+	m := New(context.Background(), agent, fakeOpen(agent), AgentBanner{})
 
 	m, cmd := updateScreen(t, m, tea.KeyPressMsg{Code: tea.KeyEsc})
 	if cmd != nil {
@@ -768,7 +768,7 @@ func TestCtrlTTogglesExpandGlobally(t *testing.T) {
 			t.Parallel()
 
 			agent := &fakeAgent{}
-			m := New(context.Background(), agent, fakeOpen(agent))
+			m := New(context.Background(), agent, fakeOpen(agent), AgentBanner{})
 			m.status = tt.status
 			if tt.status != StatusIdle {
 				m.reader = scriptedReader()
@@ -882,7 +882,7 @@ func TestComposeBlinkCmdPlumbed(t *testing.T) {
 	t.Parallel()
 
 	agent := &fakeAgent{}
-	m := New(context.Background(), agent, fakeOpen(agent))
+	m := New(context.Background(), agent, fakeOpen(agent), AgentBanner{})
 
 	m, cmd := updateScreen(t, m, tea.KeyPressMsg{Text: "h", Code: 'h'})
 	if cmd == nil {
@@ -925,7 +925,7 @@ func TestStartTurn(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			m := New(context.Background(), tt.agent, fakeOpen(tt.agent))
+			m := New(context.Background(), tt.agent, fakeOpen(tt.agent), AgentBanner{})
 			cmd, ok := m.startTurn([]content.Block{&content.TextBlock{Text: "hi"}})
 
 			if (cmd != nil) != tt.wantCmd {
@@ -942,8 +942,8 @@ func TestStartTurn(t *testing.T) {
 			}
 			if tt.wantErr {
 				rec := lastCommitted(t, m)
-				if rec.Kind != kindError {
-					t.Errorf("committed kind = %d, want kindError", rec.Kind)
+				if rec.Kind != kindNotice || rec.Level != noticeError {
+					t.Errorf("committed = (kind %d, level %d), want (kindNotice, noticeError)", rec.Kind, rec.Level)
 				}
 			} else if len(m.transcript.committed) != 0 {
 				t.Errorf("committed = %d, want 0", len(m.transcript.committed))
@@ -1010,8 +1010,8 @@ func TestStreamEOFAdvancesQueue(t *testing.T) {
 			}
 			if tt.wantErr {
 				rec := lastCommitted(t, m)
-				if rec.Kind != kindError {
-					t.Errorf("last committed kind = %d, want kindError", rec.Kind)
+				if rec.Kind != kindNotice || rec.Level != noticeError {
+					t.Errorf("last committed = (kind %d, level %d), want (kindNotice, noticeError)", rec.Kind, rec.Level)
 				}
 			}
 		})
@@ -1035,8 +1035,8 @@ func TestStreamErrCommitsFailureAndAdvances(t *testing.T) {
 		t.Error("reader != nil, want nil")
 	}
 	rec := lastCommitted(t, m)
-	if rec.Kind != kindError || committedText(rec) != "read fail" {
-		t.Errorf("last committed = (kind %d, text %q), want (kindError, %q)", rec.Kind, committedText(rec), "read fail")
+	if rec.Kind != kindNotice || rec.Level != noticeError || committedText(rec) != "read fail" {
+		t.Errorf("last committed = (kind %d, level %d, text %q), want (kindNotice, noticeError, %q)", rec.Kind, rec.Level, committedText(rec), "read fail")
 	}
 }
 
@@ -1070,7 +1070,7 @@ func TestUpdateInterruptResult(t *testing.T) {
 			t.Parallel()
 
 			agent := &fakeAgent{}
-			m := New(context.Background(), agent, fakeOpen(agent))
+			m := New(context.Background(), agent, fakeOpen(agent), AgentBanner{})
 			m.status = tt.startStatus
 
 			m, _ = updateScreen(t, m, tt.msg)
@@ -1078,8 +1078,8 @@ func TestUpdateInterruptResult(t *testing.T) {
 				t.Errorf("status = %d, want %d", m.status, tt.wantStatus)
 			}
 			if tt.wantErr {
-				if rec := lastCommitted(t, m); rec.Kind != kindError {
-					t.Errorf("committed kind = %d, want kindError", rec.Kind)
+				if rec := lastCommitted(t, m); rec.Kind != kindNotice || rec.Level != noticeError {
+					t.Errorf("committed = (kind %d, level %d), want (kindNotice, noticeError)", rec.Kind, rec.Level)
 				}
 			} else if len(m.transcript.committed) != 0 {
 				t.Errorf("committed = %d, want 0", len(m.transcript.committed))
@@ -1095,7 +1095,7 @@ func TestUpdateReopenResult(t *testing.T) {
 		t.Parallel()
 
 		old := &fakeAgent{}
-		m := New(context.Background(), old, fakeOpen(old))
+		m := New(context.Background(), old, fakeOpen(old), AgentBanner{})
 		m.status = StatusResetting
 
 		m, _ = updateScreen(t, m, reopenResultMsg{err: errors.New("x")})
@@ -1105,8 +1105,8 @@ func TestUpdateReopenResult(t *testing.T) {
 		if m.status != StatusIdle {
 			t.Errorf("status = %d, want StatusIdle", m.status)
 		}
-		if rec := lastCommitted(t, m); rec.Kind != kindError {
-			t.Errorf("committed kind = %d, want kindError", rec.Kind)
+		if rec := lastCommitted(t, m); rec.Kind != kindNotice || rec.Level != noticeError {
+			t.Errorf("committed = (kind %d, level %d), want (kindNotice, noticeError)", rec.Kind, rec.Level)
 		}
 	})
 
@@ -1115,7 +1115,7 @@ func TestUpdateReopenResult(t *testing.T) {
 
 		old := &fakeAgent{}
 		fresh := &fakeAgent{}
-		m := New(context.Background(), old, fakeOpen(old))
+		m := New(context.Background(), old, fakeOpen(old), AgentBanner{})
 		m.status = StatusResetting
 		m.transcript = m.transcript.CommitUser([]content.Block{&content.TextBlock{Text: "x"}})
 		m.queue = [][]content.Block{{&content.TextBlock{Text: "q"}}}
@@ -1177,8 +1177,8 @@ func TestPromptResultMsgNonFatal(t *testing.T) {
 			t.Error("cmd = nil, want non-nil (flush of the error entry)")
 		}
 		rec := lastCommitted(t, m)
-		if rec.Kind != kindError || committedText(rec) != "dispatch failed" {
-			t.Errorf("committed = (kind %d, text %q), want (kindError, %q)", rec.Kind, committedText(rec), "dispatch failed")
+		if rec.Kind != kindNotice || rec.Level != noticeError || committedText(rec) != "dispatch failed" {
+			t.Errorf("committed = (kind %d, level %d, text %q), want (kindNotice, noticeError, %q)", rec.Kind, rec.Level, committedText(rec), "dispatch failed")
 		}
 		// The turn is NOT ended by a prompt-dispatch error.
 		if m.status != StatusRunning {
@@ -1187,19 +1187,57 @@ func TestPromptResultMsgNonFatal(t *testing.T) {
 	})
 }
 
-func TestUpdateSystemReady(t *testing.T) {
+// TestUpdateStartupBanner covers the startup-ready path: the systemReadyMsg commits
+// an INFO-level notice carrying the agent name + description (NOT the bland "session
+// ready"), threaded in at construction via AgentBanner. It also covers the
+// empty-description edge: the banner degrades to the bare name. A nil-flush cmd would
+// mean the entry never reaches scrollback, so a non-nil cmd is required.
+func TestUpdateStartupBanner(t *testing.T) {
 	t.Parallel()
 
-	agent := &fakeAgent{}
-	m := New(context.Background(), agent, fakeOpen(agent))
-
-	m, cmd := updateScreen(t, m, systemReadyMsg{})
-	if cmd == nil {
-		t.Error("systemReady cmd = nil, want non-nil (flush)")
+	tests := []struct {
+		name   string
+		banner AgentBanner
+		want   string
+	}{
+		{
+			name:   "name and description",
+			banner: AgentBanner{Name: "coding", Description: "a careful software engineer"},
+			want:   "coding — a careful software engineer",
+		},
+		{
+			name:   "empty description degrades to bare name",
+			banner: AgentBanner{Name: "coding"},
+			want:   "coding",
+		},
+		{
+			name:   "both empty falls back to a neutral marker",
+			banner: AgentBanner{},
+			want:   "session ready",
+		},
 	}
-	rec := lastCommitted(t, m)
-	if rec.Kind != kindSystem || committedText(rec) != "session ready" {
-		t.Errorf("committed = (kind %d, text %q), want (kindSystem, %q)", rec.Kind, committedText(rec), "session ready")
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			agent := &fakeAgent{}
+			m := New(context.Background(), agent, fakeOpen(agent), tt.banner)
+
+			m, cmd := updateScreen(t, m, systemReadyMsg{})
+			if cmd == nil {
+				t.Error("systemReady cmd = nil, want non-nil (flush)")
+			}
+			rec := lastCommitted(t, m)
+			if rec.Kind != kindNotice || rec.Level != noticeInfo {
+				t.Errorf("committed = (kind %d, level %d), want (kindNotice, noticeInfo)", rec.Kind, rec.Level)
+			}
+			if got := committedText(rec); got != tt.want {
+				t.Errorf("banner text = %q, want %q", got, tt.want)
+			}
+			if got := committedText(rec); strings.Contains(got, "session ready") && tt.want != "session ready" {
+				t.Errorf("banner text = %q, must not be the bland session-ready string", got)
+			}
+		})
 	}
 }
 
@@ -1210,7 +1248,7 @@ func TestFlushPrintsEachEntryOnce(t *testing.T) {
 	t.Parallel()
 
 	agent := &fakeAgent{}
-	m := New(context.Background(), agent, fakeOpen(agent))
+	m := New(context.Background(), agent, fakeOpen(agent), AgentBanner{})
 	m.transcript = m.transcript.CommitUser([]content.Block{&content.TextBlock{Text: "one"}})
 
 	first := m.flush()

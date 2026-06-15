@@ -571,7 +571,7 @@ func TestTranscriptTerminals(t *testing.T) {
 			},
 		},
 		{
-			name: "TurnFailed commits prose then appends error entry carrying the message",
+			name: "TurnFailed commits prose then appends an error-level notice carrying the message",
 			events: []event.Event{
 				event.TurnStarted{},
 				textChunk("partial"),
@@ -584,8 +584,8 @@ func TestTranscriptTerminals(t *testing.T) {
 				if m.committed[0].Kind != kindAssistant {
 					t.Errorf("committed[0].Kind = %v, want kindAssistant", m.committed[0].Kind)
 				}
-				if m.committed[1].Kind != kindError {
-					t.Fatalf("committed[1].Kind = %v, want kindError", m.committed[1].Kind)
+				if m.committed[1].Kind != kindNotice || m.committed[1].Level != noticeError {
+					t.Fatalf("committed[1] = (kind %v, level %d), want (kindNotice, noticeError)", m.committed[1].Kind, m.committed[1].Level)
 				}
 				if got := blockText(m.committed[1].Blocks[0]); got != "boom" {
 					t.Errorf("error text = %q, want %q", got, "boom")
@@ -596,7 +596,7 @@ func TestTranscriptTerminals(t *testing.T) {
 			},
 		},
 		{
-			name: "TurnFailed with nil Err still appends an error entry and resets live",
+			name: "TurnFailed with nil Err still appends an error-level notice and resets live",
 			events: []event.Event{
 				event.TurnStarted{},
 				event.TurnFailed{Err: nil},
@@ -605,8 +605,8 @@ func TestTranscriptTerminals(t *testing.T) {
 				if len(m.committed) != 1 {
 					t.Fatalf("committed = %d, want 1 (error only)", len(m.committed))
 				}
-				if m.committed[0].Kind != kindError {
-					t.Errorf("Kind = %v, want kindError", m.committed[0].Kind)
+				if m.committed[0].Kind != kindNotice || m.committed[0].Level != noticeError {
+					t.Errorf("committed[0] = (kind %v, level %d), want (kindNotice, noticeError)", m.committed[0].Kind, m.committed[0].Level)
 				}
 				if !m.live.empty() {
 					t.Errorf("live not reset after failure: %+v", m.live)

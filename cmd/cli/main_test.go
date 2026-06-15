@@ -31,6 +31,27 @@ func TestAgentName(t *testing.T) {
 	}
 }
 
+func TestAgentDescription(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name      string
+		agentName string
+		want      string
+	}{
+		{name: "known agent returns its description", agentName: "coding", want: "a careful software engineer that works through tools"},
+		{name: "unknown agent returns empty (banner shows bare name)", agentName: "nope", want: ""},
+		{name: "empty name returns empty", agentName: "", want: ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := agentDescription(tt.agentName); got != tt.want {
+				t.Errorf("agentDescription(%q) = %q, want %q", tt.agentName, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestBuildRegistry(t *testing.T) {
 	t.Parallel()
 	reg := buildRegistry()

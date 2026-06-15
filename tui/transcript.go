@@ -25,9 +25,9 @@ func splitLines(s string) []string {
 type displayID uint64
 
 // entryKind discriminates the source/kind of a committed transcript entry.
-// kindTool is one resolved tool call (terminal state); kindError carries a turn
-// failure message; kindInterrupted is the content-less tombstone for an
-// interrupted turn.
+// kindTool is one resolved tool call (terminal state); kindNotice carries a leveled
+// notification (info/warn/error) — including a turn-failure message at error level;
+// kindInterrupted is the content-less tombstone for an interrupted turn.
 type entryKind uint8
 
 const (
@@ -35,11 +35,25 @@ const (
 	kindAssistant
 	kindTool
 	kindPromptRecord
-	kindError
 	kindInterrupted
-	// kindSystem is a session/notice line (e.g. the startup "session ready" row or
-	// the /help listing). It carries a single TextBlock and renders faint.
-	kindSystem
+	// kindNotice is a leveled, out-of-band notification line (the startup banner, the
+	// /help listing, a non-fatal error, a turn failure). It carries a single TextBlock
+	// and a noticeLevel; renderEntry renders it with the shared "▌ " accent bar colored
+	// per level (see noticeLevel and styles.NoticeStyle).
+	kindNotice
+)
+
+// noticeLevel grades a kindNotice's severity, selecting its accent-bar color. The
+// three levels share the SAME "▌ " wrapper (the user-message accent bar) and differ
+// only in color: info is the neutral user-message gray, warn is yellow, error is red.
+// It is an explicit enum (not a bool/string) so the renderer and styles map levels to
+// colors exhaustively. The zero value is noticeInfo.
+type noticeLevel uint8
+
+const (
+	noticeInfo noticeLevel = iota
+	noticeWarn
+	noticeError
 )
 
 // promptContext is the FULL prompt payload a kindPromptRecord entry commits to
@@ -68,6 +82,10 @@ type entry struct {
 	Kind   entryKind
 	Blocks []content.Block
 	Calls  []ToolCallView
+	// Level grades a kindNotice entry's severity (info/warn/error), selecting its
+	// accent-bar color. It is meaningful ONLY for kindNotice; every other kind leaves
+	// it at the zero value (noticeInfo) and the renderer ignores it.
+	Level noticeLevel
 	// Prompt carries the FULL prompt context for a kindPromptRecord entry; it is
 	// nil for every other kind. Kept as a pointer so non-prompt entries pay no
 	// per-entry cost and a nil here is an unambiguous "not a prompt record".
@@ -153,37 +171,40 @@ func (m transcriptModel) CommitUser(blocks []content.Block) transcriptModel {
 	return m
 }
 
-// CommitSystem appends a session/notice line (e.g. "session ready" or the /help
-// listing) as one kindSystem entry with a fresh stable ID and returns the next
-// model. It does NOT touch the live segment — a system notice is out-of-band from
-// the assistant's in-progress output.
-func (m transcriptModel) CommitSystem(text string) transcriptModel {
+// CommitNotice appends a leveled, out-of-band notification as one kindNotice entry
+// carrying level + text with a fresh stable ID, and returns the next model. It is the
+// single notice-commit primitive — the startup banner and /help (info), and the
+// error paths (error) all route through it. It does NOT touch the live segment: a
+// notice is out-of-band from the assistant's in-progress output. An empty text still
+// commits one entry (the bar marks the event).
+func (m transcriptModel) CommitNotice(level noticeLevel, text string) transcriptModel {
 	m.nextID++
 	m.committed = append(m.committed, entry{
 		ID:     m.nextID,
-		Kind:   kindSystem,
+		Kind:   kindNotice,
+		Level:  level,
 		Blocks: []content.Block{&content.TextBlock{Text: text}},
 	})
 	return m
 }
 
-// CommitError appends a faint, non-fatal error line as one kindError entry with a
-// fresh stable ID and returns the next model. It is the out-of-band error path —
-// distinct from a turn failure's terminal kindError (turnFailed) — used by Screen
-// for submit/dispatch/reopen failures that must be surfaced without ending a turn.
-// A nil err commits an empty message (the entry still marks the failure).
+// CommitSystem appends an info-level notice (e.g. the /help listing). It is a thin
+// wrapper over CommitNotice(noticeInfo, …) — a system notice IS an info notice.
+func (m transcriptModel) CommitSystem(text string) transcriptModel {
+	return m.CommitNotice(noticeInfo, text)
+}
+
+// CommitError appends an error-level notice for a non-fatal failure. It is the
+// out-of-band error path — distinct from a turn failure's terminal notice
+// (turnFailed) — used by Screen for submit/dispatch/reopen failures that must be
+// surfaced without ending a turn. A nil err commits an empty message (the entry
+// still marks the failure). It is a thin wrapper over CommitNotice(noticeError, …).
 func (m transcriptModel) CommitError(err error) transcriptModel {
 	msg := ""
 	if err != nil {
 		msg = err.Error()
 	}
-	m.nextID++
-	m.committed = append(m.committed, entry{
-		ID:     m.nextID,
-		Kind:   kindError,
-		Blocks: []content.Block{&content.TextBlock{Text: msg}},
-	})
-	return m
+	return m.CommitNotice(noticeError, msg)
 }
 
 // permissionRequested is the permission-gate prompt-open boundary: it commits any
@@ -354,8 +375,9 @@ func (m *transcriptModel) turnInterrupted() {
 }
 
 // turnFailed is the failure terminal: it commits pending prose so partial work
-// stays visible, appends a kindError entry carrying the failure message (a nil Err
-// yields an empty message — the entry still marks the failure), and resets live.
+// stays visible, appends an error-level kindNotice carrying the failure message (a
+// nil Err yields an empty message — the entry still marks the failure), and resets
+// live. The error-notice commit reuses the same noticeError path as CommitError.
 func (m *transcriptModel) turnFailed(ev event.TurnFailed) {
 	m.commitProse()
 	msg := ""
@@ -365,7 +387,8 @@ func (m *transcriptModel) turnFailed(ev event.TurnFailed) {
 	m.nextID++
 	m.committed = append(m.committed, entry{
 		ID:     m.nextID,
-		Kind:   kindError,
+		Kind:   kindNotice,
+		Level:  noticeError,
 		Blocks: []content.Block{&content.TextBlock{Text: msg}},
 	})
 	m.live = liveSeg{}

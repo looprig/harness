@@ -27,11 +27,36 @@ const ThinkingHeader = "thinking"
 // Role styles (exported so package tui can use them).
 var (
 	UserStyle        = lipgloss.NewStyle().Bold(true)
-	SystemStyle      = lipgloss.NewStyle().Faint(true)
-	ErrorStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("9")) // red
 	InterruptedStyle = lipgloss.NewStyle().Faint(true).Italic(true)
 	StatusStyle      = lipgloss.NewStyle().Faint(true)
 )
+
+// Notice styles color a leveled notification's shared "▌ " accent bar (and text) by
+// severity. All three reuse the SAME accent-bar wrapper as user messages and differ
+// only in foreground color: info is the neutral user-message gray (color 8, matching
+// AccentBarStyle), warn is bright yellow (color 11), error is red (color 9). They are
+// selected per entry via NoticeStyle; callers must not branch on the level themselves.
+var (
+	NoticeInfoStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))  // neutral gray (user-message tone)
+	NoticeWarnStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("11")) // bright yellow
+	NoticeErrorStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("9"))  // red
+)
+
+// NoticeStyle maps a notice level (0=info, 1=warn, 2=error) to its style. An unknown
+// level falls back to the neutral info style (fail-safe: an unrecognised level must
+// never panic or pick an alarming color). The level argument is a plain uint8 so the
+// leaf styles package need not import package tui's noticeLevel type (it depends only
+// on charm libraries — see the package doc).
+func NoticeStyle(level uint8) lipgloss.Style {
+	switch level {
+	case 1:
+		return NoticeWarnStyle
+	case 2:
+		return NoticeErrorStyle
+	default:
+		return NoticeInfoStyle
+	}
+}
 
 // Tool-call styles: a tool card and its result preview render dim, subordinate to
 // the assistant narration they nest beneath.

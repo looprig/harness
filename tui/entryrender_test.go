@@ -242,16 +242,88 @@ func TestRenderEntryPermissionInteriorBlank(t *testing.T) {
 	}
 }
 
-// TestRenderEntryError locks the error-kind render: the failure message rendered
-// in the error style. An empty message still yields output (the entry marks the
-// failure even with no text).
-func TestRenderEntryError(t *testing.T) {
+// TestRenderEntryNotice locks the leveled-notice render: every level renders the
+// shared "▌ " accent bar plus its text, an empty-text notice still yields the bar
+// (the entry marks the event even with no text), and an unknown level falls back
+// to the info tone (fail-safe, never panics). Content is asserted after stripping
+// ANSI; the distinct per-level color is locked separately (see TestRenderEntryNoticeColors).
+func TestRenderEntryNotice(t *testing.T) {
 	t.Parallel()
-	e := entry{ID: 1, Kind: kindError, Blocks: []content.Block{&content.TextBlock{Text: "context deadline exceeded"}}}
-	out := stripANSI(strings.Join(renderEntry(e, false, 80), "\n"))
-	if !strings.Contains(out, "context deadline exceeded") {
-		t.Errorf("error render = %q, want the failure message", out)
+
+	tests := []struct {
+		name  string
+		level noticeLevel
+		text  string
+		want  string // expected visible substring (empty → only the bar is required)
+	}{
+		{name: "info happy path", level: noticeInfo, text: "coding — a careful engineer", want: "coding — a careful engineer"},
+		{name: "warn happy path", level: noticeWarn, text: "running low on context", want: "running low on context"},
+		{name: "error happy path", level: noticeError, text: "context deadline exceeded", want: "context deadline exceeded"},
+		{name: "empty info text still renders the bar", level: noticeInfo, text: "", want: ""},
+		{name: "unknown level falls back to info tone", level: noticeLevel(99), text: "mystery", want: "mystery"},
 	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			e := entry{ID: 1, Kind: kindNotice, Level: tt.level, Blocks: []content.Block{&content.TextBlock{Text: tt.text}}}
+			lines := renderEntry(e, false, 80)
+			if len(lines) == 0 {
+				t.Fatalf("renderEntry(notice level %d) returned no lines", tt.level)
+			}
+			out := stripANSI(strings.Join(lines, "\n"))
+			if !strings.Contains(out, styles.AccentBar) {
+				t.Errorf("notice render = %q, want the shared accent bar %q", out, styles.AccentBar)
+			}
+			if tt.want != "" && !strings.Contains(out, tt.want) {
+				t.Errorf("notice render = %q, want the text %q", out, tt.want)
+			}
+		})
+	}
+}
+
+// TestRenderEntryNoticeColors locks the DISTINCT per-level coloring: warn and error
+// each carry a color SGR sequence that info does not, and warn differs from error.
+// A strip-ANSI assertion cannot catch a wrong color, so this test deliberately does
+// NOT strip ANSI — it compares the raw, un-stripped renders (the Task-13a pattern).
+func TestRenderEntryNoticeColors(t *testing.T) {
+	t.Parallel()
+
+	render := func(level noticeLevel) string {
+		e := entry{ID: 1, Kind: kindNotice, Level: level, Blocks: []content.Block{&content.TextBlock{Text: "x"}}}
+		return strings.Join(renderEntry(e, false, 80), "\n") // NOT stripped — color is under test
+	}
+
+	info, warn, errd := render(noticeInfo), render(noticeWarn), render(noticeError)
+
+	// The warn (yellow) and error (red) renders must each carry the per-level color
+	// SGR the styles emit; that SGR must not match the info (neutral) render.
+	warnSGR := sgrPrefix(t, styles.NoticeStyle(uint8(noticeWarn)).Render("x"))
+	errSGR := sgrPrefix(t, styles.NoticeStyle(uint8(noticeError)).Render("x"))
+
+	if !strings.Contains(warn, warnSGR) {
+		t.Errorf("warn notice = %q, want the warn color SGR %q", warn, warnSGR)
+	}
+	if !strings.Contains(errd, errSGR) {
+		t.Errorf("error notice = %q, want the error color SGR %q", errd, errSGR)
+	}
+	if warnSGR == errSGR {
+		t.Errorf("warn and error notices share the SGR %q, want distinct per-level colors", warnSGR)
+	}
+	if strings.Contains(info, warnSGR) || strings.Contains(info, errSGR) {
+		t.Errorf("info notice = %q, must NOT carry the warn/error color SGR (info is neutral)", info)
+	}
+}
+
+// sgrPrefix extracts the leading SGR color sequence a styled string prepends to its
+// payload "x", failing if the style produced no leading escape to lock against.
+func sgrPrefix(t *testing.T, rendered string) string {
+	t.Helper()
+	prefix, _, ok := strings.Cut(rendered, "x")
+	if !ok || prefix == "" {
+		t.Fatalf("styled render %q produced no leading SGR prefix to lock against", rendered)
+	}
+	return prefix
 }
 
 // TestRenderEntryInterrupted locks the interrupted-kind render: the content-less

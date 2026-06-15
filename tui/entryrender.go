@@ -27,15 +27,34 @@ func renderEntry(e entry, expand bool, width int) []string {
 		return splitNonEmpty(renderToolCalls(e.Calls, expand, width))
 	case kindPromptRecord:
 		return renderPromptRecord(e.Prompt, width)
-	case kindError:
-		return splitNonEmpty(styles.ErrorStyle.Render(firstText(e.Blocks)))
-	case kindSystem:
-		return splitNonEmpty(styles.SystemStyle.Render(firstText(e.Blocks)))
+	case kindNotice:
+		return renderNotice(e.Level, firstText(e.Blocks), width)
 	case kindInterrupted:
 		return []string{styles.InterruptedStyle.Render(interruptedTombstone)}
 	default:
 		return nil
 	}
+}
+
+// renderNotice renders one leveled notice as "▌ "-bar lines colored per level (info
+// neutral, warn yellow, error red — see styles.NoticeStyle): every width-wrapped line
+// of text is prefixed with the level-colored accent bar, matching the user-message
+// bar layout. An empty text still yields a single bar line so the notice marks the
+// event. The bar and the text share the per-level style so the row reads as one
+// coherent colored unit.
+func renderNotice(level noticeLevel, text string, width int) []string {
+	style := styles.NoticeStyle(uint8(level))
+	bar := style.Render(styles.AccentBarPrompt)
+	var out []string
+	for _, raw := range strings.Split(text, "\n") {
+		for _, line := range wrapToWidth(raw, width-barWidth) {
+			out = append(out, bar+style.Render(line))
+		}
+	}
+	if len(out) == 0 {
+		out = append(out, bar)
+	}
+	return out
 }
 
 // renderPromptRecord renders the FULL prompt context committed to scrollback — the

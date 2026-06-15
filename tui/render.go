@@ -340,7 +340,7 @@ func thinkingText(blocks []content.Block) string {
 }
 
 // firstText returns the text of the first TextBlock, or "" if there is none.
-// Used by single-block roles (system, error).
+// Used by single-block roles (the leveled notice).
 func firstText(blocks []content.Block) string {
 	for _, blk := range blocks {
 		if tb, ok := blk.(*content.TextBlock); ok {

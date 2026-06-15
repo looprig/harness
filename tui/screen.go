@@ -2,6 +2,7 @@ package tui
 
 import (
 	"context"
+	"strings"
 
 	tea "charm.land/bubbletea/v2"
 
@@ -22,6 +23,7 @@ type Screen struct {
 	agent     Agent
 	openAgent OpenAgent       // builds a replacement agent on /clear
 	appCtx    context.Context // long-lived; cancelled on quit
+	banner    AgentBanner     // agent name + description, shown as the startup info notice
 
 	transcript  transcriptModel
 	scrollback  scrollbackModel
@@ -43,14 +45,44 @@ type Screen struct {
 	ready         bool
 }
 
-// New constructs an idle Screen driving agent, with open as the /clear thunk. The
-// expand flag starts TRUE so thinking + tool output render in full from the start —
-// see the field comment for why append-only scrollback forces expanded-by-default.
-func New(ctx context.Context, agent Agent, open OpenAgent) Screen {
+// AgentBanner is the agent metadata shown as the startup info notice — its Name and
+// Description, threaded in at construction from the composition root (cmd/cli) so the
+// Agent interface need not expose them. The zero value renders a name-less banner;
+// bannerText degrades gracefully when either field is empty.
+type AgentBanner struct {
+	Name        string
+	Description string
+}
+
+// bannerText renders the startup banner line from the agent metadata: "<Name> —
+// <Description>" when both are present, just the Name when the description is empty,
+// just the Description when the name is empty, and a neutral fallback when both are
+// empty (the notice still marks the session start). It degrades rather than emitting
+// a dangling separator.
+func (b AgentBanner) bannerText() string {
+	name, desc := strings.TrimSpace(b.Name), strings.TrimSpace(b.Description)
+	switch {
+	case name != "" && desc != "":
+		return name + " — " + desc
+	case name != "":
+		return name
+	case desc != "":
+		return desc
+	default:
+		return "session ready"
+	}
+}
+
+// New constructs an idle Screen driving agent, with open as the /clear thunk and
+// banner the agent name/description shown as the startup info notice. The expand flag
+// starts TRUE so thinking + tool output render in full from the start — see the field
+// comment for why append-only scrollback forces expanded-by-default.
+func New(ctx context.Context, agent Agent, open OpenAgent, banner AgentBanner) Screen {
 	return Screen{
 		agent:       agent,
 		openAgent:   open,
 		appCtx:      ctx,
+		banner:      banner,
 		status:      StatusIdle,
 		scrollback:  newScrollbackModel(0),
 		interaction: newInteractionModel(),
@@ -59,7 +91,7 @@ func New(ctx context.Context, agent Agent, open OpenAgent) Screen {
 }
 
 // Init focuses the composer (starting the cursor blink) and emits the initial
-// system "ready" entry.
+// startup-banner entry.
 func (m Screen) Init() tea.Cmd {
 	return tea.Batch(m.interaction.input.Focus(), func() tea.Msg { return systemReadyMsg{} })
 }
@@ -95,7 +127,7 @@ func (m Screen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case promptResultMsg:
 		return m, m.handlePromptResult(msg)
 	case systemReadyMsg:
-		m.transcript = m.transcript.CommitSystem("session ready")
+		m.transcript = m.transcript.CommitNotice(noticeInfo, m.banner.bannerText())
 		return m, m.flush()
 	}
 	return m, nil
