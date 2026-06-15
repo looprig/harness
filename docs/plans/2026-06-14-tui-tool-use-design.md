@@ -137,11 +137,12 @@ correctly split `text→tool→tool→text→done` *and* `text→tool→tool(no 
 only race-free if, within one batch, every `ToolCallStarted` precedes every
 `ToolCallCompleted`. With parallel goroutines each emitting their own start, a fast
 call could otherwise complete before a sibling's start and falsely trip "all
-terminal" mid-batch. So **the runner emits all `ToolCallStarted` for the approved
-batch *before* executing any call** (tools-design §2d). This also future-proofs serial
-(`Sequential`) tools and shows all pending cards at once. Given that, within a batch
-no prior call is ever terminal when a new start arrives, so "all terminal" fires only
-across batches.
+terminal" mid-batch. So **the runner emits all `ToolCallStarted` for the *requested*
+batch *before* executing any call** (tools-design §2d) — every requested call, including
+ones that will be denied / invalid / unknown (those get an immediate
+`Completed{IsError}`, not silence). This also future-proofs serial (`Sequential`) tools
+and shows all pending cards at once. Given that, within a batch no prior call is ever
+terminal when a new start arrives, so "all terminal" fires only across batches.
 
 **`ToolCallCompleted` correlation:** a batch fully completes before the next
 iteration streams (the loop re-streams only after `RunBatch` returns), so every
@@ -202,9 +203,10 @@ carry it today. This design **amends `2026-06-14-tools-design.md`** (kept consis
   — the runner (§2d) fills `ResultPreview` from `flattenToText(result.Content)`,
   **capped** (~2 KiB / 20 lines); when it caps it appends a truncation marker line
   (e.g. `… output truncated`). Full-fidelity on the TUI stream.
-- **§2d runner ordering** — the runner **emits all `ToolCallStarted` for the approved
-  batch before executing any call**, so within a batch every start precedes every
-  completion (makes the TUI's all-terminal segment-boundary rule race-free; §2).
+- **§2d runner ordering** — the runner **emits all `ToolCallStarted` for the *requested*
+  batch before executing any call** (every requested call, incl. denied/invalid/unknown),
+  so within a batch every start precedes every completion (makes the TUI's all-terminal
+  segment-boundary rule race-free; §2).
 - **§5b sink table** — `ToolCallCompleted` joins the `Redactable.SinkProjection`:
   the sink copy **drops `ResultPreview`** (keeps `CallID, IsError`). `ResultPreview` is
   tool *output* (file contents, Bash output, possible secrets/PII), so this extends the
