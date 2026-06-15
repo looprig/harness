@@ -14,11 +14,15 @@ import (
 )
 
 // editfile.go implements the EditFile tool: an exact-string-replace editor over a
-// workspace-contained file (design §4b). It reads the file (containment +
-// O_NOFOLLOW), replaces `old` with `new` under strict occurrence rules, writes
-// back atomically (the shared atomicWriteFile temp+Rename), and returns a diff
-// preview. Like WriteFile it defaults to Ask (PermissionPrompter →
-// tool.FileWriteRequest), is Auditable (no content), and is a WriteTarget.
+// workspace-contained file (design §4b). It proves containment (containedPath,
+// symlink-resolved) then reads and writes the LEXICAL joined path — the read is
+// O_RDONLY|O_NOFOLLOW so a final-component symlink is REJECTED (consistent with
+// ReadFile), and the atomic write targets the same lexical name so it REPLACES a
+// final-component symlink rather than following it. It replaces `old` with
+// `replacement` under strict occurrence rules, writes back atomically (the shared
+// atomicWriteFile temp+Rename), and returns a diff preview. Like WriteFile it
+// defaults to Ask (PermissionPrompter → tool.FileWriteRequest), is Auditable (no
+// content), and is a WriteTarget.
 //
 // Occurrence rules (the §4b contract):
 //   - 0 matches of `old`          → tool-result error ("not found")
@@ -147,12 +151,22 @@ func (e *EditFile) InvokableRun(_ context.Context, argsJSON string) (*tool.ToolR
 		return tool.TextResult("error: 'old' must be a non-empty substring to find"), nil
 	}
 
-	abs, err := containedPath(e.root, a.Path)
-	if err != nil {
+	// Stage 1: containment (symlink-aware). Proves the symlink-RESOLVED target is
+	// inside the workspace; an escape (including an in-workspace symlink pointing
+	// OUT) is rejected here. We discard the resolved path: the actual read/write
+	// below operate on the LEXICAL joined path (see below).
+	if _, err := containedPath(e.root, a.Path); err != nil {
 		return tool.TextResult("error: path is outside the workspace: " + a.Path), nil
 	}
 
-	original, err := e.readForEdit(abs)
+	// Stage 2: read and write the LEXICALLY-joined path (NOT the symlink-resolved
+	// form), mirroring ReadFile: the O_NOFOLLOW read below rejects a
+	// final-component symlink rather than following it, and the atomic write
+	// targets the same lexical name so it REPLACES a final-component symlink with
+	// a regular file rather than following it to clobber the symlink's target.
+	lexical := joinedUnderRoot(e.root, a.Path)
+
+	original, err := e.readForEdit(lexical)
 	if err != nil {
 		return tool.TextResult("error: " + err.Error()), nil
 	}
@@ -162,19 +176,26 @@ func (e *EditFile) InvokableRun(_ context.Context, argsJSON string) (*tool.ToolR
 		return tool.TextResult("error: " + errMsg), nil
 	}
 
-	if err := atomicWriteFile(abs, []byte(updated)); err != nil {
+	if err := atomicWriteFile(lexical, []byte(updated)); err != nil {
 		return tool.TextResult("error: " + err.Error()), nil
 	}
 	return tool.TextResult(diffPreview(a.Path, original, updated)), nil
 }
 
-// readForEdit opens abs O_RDONLY|O_NOFOLLOW (a symlinked final component fails to
-// open), confirms a regular file via the fd stat, and reads up to maxEditFileBytes.
-// Errors are typed writeFileError (non-secret reason, never contents).
-func (e *EditFile) readForEdit(abs string) (string, error) {
-	// #nosec G304 -- abs is the containedPath-resolved, workspace-confined path;
-	// O_NOFOLLOW + fd stat close the resolve→open TOCTOU window.
-	f, err := os.OpenFile(abs, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+// readForEdit opens path O_RDONLY|O_NOFOLLOW (a final-component symlink fails to
+// open with ELOOP), confirms a regular file via the fd stat, and reads up to
+// maxEditFileBytes. path is the LEXICAL joined path (joinedUnderRoot); the caller
+// has already proven the symlink-resolved form is contained. Errors are typed
+// writeFileError (non-secret reason, never contents).
+func (e *EditFile) readForEdit(path string) (string, error) {
+	// #nosec G304 -- path is joinedUnderRoot(root, input): the workspace root +
+	// the lexically-cleaned, contained input (containedPath already proved the
+	// symlink-resolved target is inside the workspace). O_NOFOLLOW rejects a
+	// FINAL-COMPONENT symlink (consistent with ReadFile); it does NOT by itself
+	// close the broader parent-dir resolve→open TOCTOU window, which §3c
+	// (write-side threat model) explicitly accepts as out of scope for this local
+	// single-user tool.
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return "", &writeFileError{reason: "file not found", cause: err}
@@ -205,9 +226,11 @@ func (e *EditFile) readForEdit(abs string) (string, error) {
 }
 
 // applyReplacement enforces the occurrence rules and returns the updated content.
-// On a rule violation it returns ("", errMsg) — a non-secret message naming the
-// match count, never the file body. On success it returns (updated, "").
-func applyReplacement(original, old, new string, replaceAll bool) (string, string) {
+// `replacement` is the new substring (the param is named replacement, not `new`,
+// to avoid shadowing the builtin). On a rule violation it returns ("", errMsg) —
+// a non-secret message naming the match count, never the file body. On success it
+// returns (updated, "").
+func applyReplacement(original, old, replacement string, replaceAll bool) (string, string) {
 	n := strings.Count(original, old)
 	switch {
 	case n == 0:
@@ -215,9 +238,9 @@ func applyReplacement(original, old, new string, replaceAll bool) (string, strin
 	case n >= 2 && !replaceAll:
 		return "", "ambiguous: 'old' matches " + strconv.Itoa(n) + " times; set replace_all to replace every occurrence"
 	case replaceAll:
-		return strings.ReplaceAll(original, old, new), ""
+		return strings.ReplaceAll(original, old, replacement), ""
 	default: // exactly 1 match
-		return strings.Replace(original, old, new, 1), ""
+		return strings.Replace(original, old, replacement, 1), ""
 	}
 }
 

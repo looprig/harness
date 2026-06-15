@@ -165,6 +165,60 @@ func TestWriteFileSymlinkNotFollowed(t *testing.T) {
 	}
 }
 
+// TestWriteFileInWorkspaceSymlinkReplaced asserts that writing to a path whose
+// final component is an EXISTING in-workspace symlink (pointing to another
+// in-workspace regular file) REPLACES the symlink with the new regular file
+// rather than following it to clobber the symlink's target. This is the
+// "don't silently follow a final-component symlink" alignment with ReadFile:
+// the atomic Rename targets the LEXICAL joined path, so it replaces the link
+// node itself.
+func TestWriteFileInWorkspaceSymlinkReplaced(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	const targetBody = "ORIGINAL TARGET BODY"
+	target := filepath.Join(root, "target.txt")
+	if err := os.WriteFile(target, []byte(targetBody), 0o600); err != nil {
+		t.Fatalf("seed target: %v", err)
+	}
+	link := filepath.Join(root, "link.txt")
+	if err := os.Symlink(target, link); err != nil {
+		t.Skipf("symlink unsupported: %v", err)
+	}
+
+	out := runWriteFile(t, root, map[string]any{"path": "link.txt", "content": "NEW"})
+	if strings.HasPrefix(out, "error:") {
+		t.Fatalf("write to in-workspace symlink path = %q, want success", out)
+	}
+
+	// The link path now holds the new content as a REGULAR file (the symlink was
+	// replaced, not followed).
+	fi, err := os.Lstat(link)
+	if err != nil {
+		t.Fatalf("lstat link: %v", err)
+	}
+	if fi.Mode()&os.ModeSymlink != 0 {
+		t.Fatalf("link.txt is still a symlink; the write followed it instead of replacing it")
+	}
+	if !fi.Mode().IsRegular() {
+		t.Fatalf("link.txt mode = %v, want a regular file", fi.Mode())
+	}
+	gotLink, err := os.ReadFile(link)
+	if err != nil {
+		t.Fatalf("read link: %v", err)
+	}
+	if string(gotLink) != "NEW" {
+		t.Fatalf("link.txt body = %q, want %q", gotLink, "NEW")
+	}
+	// The symlink's former target must be UNTOUCHED (the write did not follow it).
+	gotTarget, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatalf("read target: %v", err)
+	}
+	if string(gotTarget) != targetBody {
+		t.Fatalf("symlink target was clobbered: %q, want %q", gotTarget, targetBody)
+	}
+}
+
 func TestWriteFileWriteTarget(t *testing.T) {
 	t.Parallel()
 	root := t.TempDir()

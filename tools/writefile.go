@@ -13,21 +13,36 @@ import (
 	"github.com/inventivepotter/urvi/internal/tool"
 )
 
-// writefile.go implements the WriteFile tool: a workspace-contained,
-// symlink-rejecting atomic file writer (design §4b). WriteFile defaults to Ask
-// (it implements PermissionPrompter → tool.FileWriteRequest), is Auditable with
-// a content-free summary, and is a WriteTarget so the runner serializes
-// same-resolved-path writes. The denied-write hard-deny list is enforced by the
-// PermissionChecker BEFORE the tool runs (the tool takes only root); the tool
-// still runs containment itself for correct path resolution and defense in
-// depth.
+// writefile.go implements the WriteFile tool: a workspace-contained atomic file
+// writer (design §4b). WriteFile defaults to Ask (it implements
+// PermissionPrompter → tool.FileWriteRequest), is Auditable with a content-free
+// summary, and is a WriteTarget so the runner serializes same-resolved-path
+// writes. The denied-write hard-deny list is enforced by the PermissionChecker
+// BEFORE the tool runs (the tool takes only root); the tool still runs
+// containment itself for correct path resolution and defense in depth.
 //
-// Atomicity: parent dirs are created (MkdirAll), then the content is written to a
-// uniquely-named temp file in the SAME directory opened
-// O_CREATE|O_EXCL|O_WRONLY|O_NOFOLLOW (no symlink follow, no clobber), fsync'd,
-// closed, and os.Rename'd over the target (atomic within a directory). The temp
-// file is removed on any failure so no half-written litter is left behind. This
-// mirrors store.go's writeApprovalsFileAtomically hardening.
+// Path handling: containedPath proves the symlink-RESOLVED target is inside the
+// workspace (an escape — including an in-workspace symlink pointing out — is
+// rejected). The atomic write then targets the LEXICAL joined path, so a write to
+// a path whose final component is an existing in-workspace symlink REPLACES the
+// symlink with the new regular file rather than following it to clobber the
+// symlink's target (consistent with ReadFile/EditFile not silently following a
+// final-component symlink).
+//
+// Atomicity: parent dirs are created (MkdirAll on the lexical parent), then the
+// content is written to a uniquely-named temp file in the SAME directory opened
+// O_CREATE|O_EXCL|O_WRONLY|O_NOFOLLOW (refuses a pre-planted symlinked temp, no
+// clobber), fsync'd, closed, and os.Rename'd over the target (atomic within a
+// directory; rename replaces a final-component symlink rather than following it).
+// The temp file is removed on any failure so no half-written litter is left
+// behind. This mirrors store.go's writeApprovalsFileAtomically hardening.
+//
+// O_NOFOLLOW on the temp open rejects a pre-planted symlink AT THE TEMP NAME; it
+// does NOT close the broader parent-dir resolve→open TOCTOU window (a parent dir
+// swapped to a symlink between the containment check and the write). §3c
+// (write-side threat model) explicitly accepts that residual window as out of
+// scope for this local single-user tool acting with the user's own privileges;
+// the O_EXCL|O_NOFOLLOW temp is cheap defence-in-depth, not a complete TOCTOU fix.
 
 // writeFileToolName is the EXACT tool name classifyTool keys on for the write
 // class — it MUST equal "WriteFile" (check.go's toolWriteFile).
@@ -148,24 +163,33 @@ func (w *WriteFile) InvokableRun(_ context.Context, argsJSON string) (*tool.Tool
 	}
 
 	// Stage 1: containment (symlink-aware). An escape (including an in-workspace
-	// symlink pointing OUT) is rejected; echo only the requested path.
-	abs, err := containedPath(w.root, a.Path)
-	if err != nil {
+	// symlink pointing OUT) is rejected here; echo only the requested path. We
+	// discard the resolved path: the atomic write below targets the LEXICAL form.
+	if _, err := containedPath(w.root, a.Path); err != nil {
 		return tool.TextResult("error: path is outside the workspace: " + a.Path), nil
 	}
 
-	if err := atomicWriteFile(abs, []byte(a.Content)); err != nil {
+	// Stage 2: write the LEXICALLY-joined path (NOT the symlink-resolved form),
+	// mirroring ReadFile/EditFile. The atomic Rename targets this lexical name, so
+	// a final-component symlink is REPLACED by the new regular file rather than
+	// followed to clobber the symlink's target. Containment above already proved
+	// the resolved target is inside the workspace.
+	lexical := joinedUnderRoot(w.root, a.Path)
+	if err := atomicWriteFile(lexical, []byte(a.Content)); err != nil {
 		return tool.TextResult("error: " + err.Error()), nil
 	}
 	return tool.TextResult("wrote " + a.Path + " (" + strconv.Itoa(len(a.Content)) + " bytes)"), nil
 }
 
-// atomicWriteFile creates abs's parent directories then writes data to a temp
+// atomicWriteFile creates target's parent directories then writes data to a temp
 // file in the SAME directory (O_CREATE|O_EXCL|O_WRONLY|O_NOFOLLOW @0600) and
-// os.Rename's it over abs. The temp file is removed on any post-create failure.
-// All failures are typed writeFileError (non-secret reason, never contents).
-func atomicWriteFile(abs string, data []byte) error {
-	dir := filepath.Dir(abs)
+// os.Rename's it over target. target is the LEXICAL joined path (the caller has
+// proved its symlink-resolved form is contained); rename to a target that is a
+// final-component symlink REPLACES the symlink rather than following it. The temp
+// file is removed on any post-create failure. All failures are typed
+// writeFileError (non-secret reason, never contents).
+func atomicWriteFile(target string, data []byte) error {
+	dir := filepath.Dir(target)
 	if err := os.MkdirAll(dir, newDirPerm); err != nil {
 		return &writeFileError{reason: "could not create parent directories", cause: err}
 	}
@@ -175,9 +199,12 @@ func atomicWriteFile(abs string, data []byte) error {
 		return err
 	}
 
-	// #nosec G304 -- tmp = abs's containment-proven parent dir + a crypto/rand
-	// suffix; O_EXCL|O_NOFOLLOW refuse to follow or clobber a pre-planted
-	// symlink/file (the §3c write hardening). abs itself is containedPath-resolved.
+	// #nosec G304 -- tmp = target's containment-proven parent dir + a crypto/rand
+	// suffix. O_EXCL|O_NOFOLLOW refuse to clobber an existing name or to follow a
+	// pre-planted symlink AT THE TEMP NAME (cheap defence-in-depth). This does NOT
+	// close the broader parent-dir resolve→open TOCTOU window, which §3c
+	// (write-side threat model) explicitly accepts as out of scope for this local
+	// single-user tool. target's resolved form was proven contained by the caller.
 	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_EXCL|os.O_WRONLY|syscall.O_NOFOLLOW, newFilePerm)
 	if err != nil {
 		return &writeFileError{reason: "could not create temp file", cause: err}
@@ -186,7 +213,7 @@ func atomicWriteFile(abs string, data []byte) error {
 		_ = os.Remove(tmp)
 		return &writeFileError{reason: "could not write temp file", cause: err}
 	}
-	if err := os.Rename(tmp, abs); err != nil {
+	if err := os.Rename(tmp, target); err != nil {
 		_ = os.Remove(tmp)
 		return &writeFileError{reason: "could not rename temp file into place", cause: err}
 	}

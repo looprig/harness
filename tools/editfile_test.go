@@ -152,6 +152,38 @@ func TestEditFile(t *testing.T) {
 	}
 }
 
+// TestEditFileSymlinkFinalComponentRejected ensures EditFile, like ReadFile,
+// REFUSES to follow a final-component symlink (even one that points to an
+// in-workspace regular file): the open is on the LEXICAL joined path with
+// O_NOFOLLOW, so the symlink's target is never read and never modified.
+func TestEditFileSymlinkFinalComponentRejected(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	// target is a real in-workspace file; link.txt -> target (final-component
+	// symlink, both ends inside the workspace so containment passes).
+	const targetBody = "alpha\nbravo\ncharlie\n"
+	target := filepath.Join(root, "target.txt")
+	if err := os.WriteFile(target, []byte(targetBody), 0o600); err != nil {
+		t.Fatalf("seed target: %v", err)
+	}
+	if err := os.Symlink(target, filepath.Join(root, "link.txt")); err != nil {
+		t.Skipf("symlink unsupported: %v", err)
+	}
+
+	out := runEditFile(t, root, map[string]any{"path": "link.txt", "old": "bravo", "new": "BRAVO"})
+	if !strings.HasPrefix(out, "error:") {
+		t.Fatalf("edit via final-component symlink = %q, want an error", out)
+	}
+	// The symlink target must be untouched (the edit did not follow the link).
+	got, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatalf("read target: %v", err)
+	}
+	if string(got) != targetBody {
+		t.Fatalf("symlink target was modified: %q, want %q", got, targetBody)
+	}
+}
+
 // TestEditFileDiffPreview verifies the result carries a unified-ish diff header
 // and the changed lines.
 func TestEditFileDiffPreview(t *testing.T) {
