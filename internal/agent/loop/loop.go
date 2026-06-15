@@ -59,6 +59,33 @@ func New(ctx context.Context, sessionID uuid.UUID, cfg Config) (*Loop, error) {
 	return &Loop{Commands: commands, Done: done}, nil
 }
 
+// projectForSink derives the SINK-side form of an event from the (full-fidelity)
+// stream event. It returns the event to envelope for sinks and the CallID for the
+// envelope. SECURITY: any event carrying sensitive payload implements
+// event.Redactable; this replaces it with its redacted SinkProjection so tool
+// args, file content, URLs/headers, questions, choice strings, and result
+// previews NEVER reach a sink. Events without sensitive payload pass through. The
+// CallID is read from the ORIGINAL (full) event — projection may change the
+// concrete type — so the envelope self-identifies the tool call it pertains to.
+// The per-turn stream is never touched by this function.
+func projectForSink(ev event.Event) (event.Event, uuid.UUID) {
+	var callID uuid.UUID
+	switch e := ev.(type) {
+	case event.PermissionRequested:
+		callID = e.CallID
+	case event.UserInputRequested:
+		callID = e.CallID
+	case event.ToolCallStarted:
+		callID = e.CallID
+	case event.ToolCallCompleted:
+		callID = e.CallID
+	}
+	if r, ok := ev.(event.Redactable); ok {
+		return r.SinkProjection(), callID
+	}
+	return ev, callID
+}
+
 type loopStatus int
 
 const (
@@ -91,11 +118,16 @@ func listen(ctx context.Context, sessionID uuid.UUID, cfg Config, commands <-cha
 	var state loopState
 
 	publish := func(ev event.Event) {
+		// SECURITY: the sink path is redacted; the per-turn stream (handled
+		// separately by emit/deliverAndClose) keeps full fidelity. projectForSink
+		// replaces any event.Redactable with its SinkProjection so tool args, file
+		// content, URLs/headers, questions, and result previews never reach a sink,
+		// and extracts the CallID for the envelope from the ORIGINAL event.
+		sinkEv, callID := projectForSink(ev)
 		// EventID is fresh per emitted event. A crypto/rand failure here is a
 		// system-level fault; it must not abort turn execution (the bare per-turn
 		// event is delivered separately), so log it and emit the envelope with a
-		// zero EventID rather than dropping the sink copy. CallID stays zero: no
-		// event in v1 pertains to a tool call.
+		// zero EventID rather than dropping the sink copy.
 		eventID, err := cfg.idGen()
 		if err != nil {
 			slog.Error("event id generation failed; emitting envelope with zero EventID", "error", err)
@@ -105,8 +137,11 @@ func listen(ctx context.Context, sessionID uuid.UUID, cfg Config, commands <-cha
 			TurnID:      state.turnID,
 			EventID:     eventID,
 			CausationID: state.causationID,
-			Event:       ev,
+			CallID:      callID,
+			Event:       sinkEv,
 		}
+		// TurnIndex is read from the ORIGINAL event; projection preserves it but
+		// may change the concrete type (e.g. UserInputRequested → ...Sink).
 		switch e := ev.(type) {
 		case event.TurnStarted:
 			env.TurnIndex = e.TurnIndex

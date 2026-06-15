@@ -1,6 +1,15 @@
 package event
 
-import "github.com/inventivepotter/urvi/internal/content"
+import (
+	"encoding/json"
+
+	"github.com/inventivepotter/urvi/internal/content"
+)
+
+// redactedToolInput is the placeholder every ToolUseBlock.Input / ToolUseChunk
+// argument JSON is replaced with on the sink path. An empty JSON object is a
+// valid value that carries no argument bytes.
+var redactedToolInput = json.RawMessage(`{}`)
 
 // TurnStarted is the first event written to StartTurn.Events.
 type TurnStarted struct{ TurnIndex TurnIndex }
@@ -34,3 +43,55 @@ func (TokenDelta) isEvent()      {}
 func (TurnDone) isEvent()        {}
 func (TurnFailed) isEvent()      {}
 func (TurnInterrupted) isEvent() {}
+
+// SinkProjection redacts a tool-call delta before it reaches a sink. A
+// *content.ToolUseChunk carries partial argument JSON (InputJSON) — the same
+// secret ToolCallStarted.Summary redacts — so the projection keeps Index/ID/Name
+// and drops InputJSON. A TextChunk/ThinkingChunk TokenDelta is model output, not
+// a secret, so it is returned unchanged.
+func (e TokenDelta) SinkProjection() Event {
+	tu, ok := e.Chunk.(*content.ToolUseChunk)
+	if !ok {
+		return e
+	}
+	return TokenDelta{
+		TurnIndex: e.TurnIndex,
+		Chunk: &content.ToolUseChunk{
+			Index: tu.Index,
+			ID:    tu.ID,
+			Name:  tu.Name,
+			// InputJSON deliberately dropped: raw tool arguments never reach a sink.
+		},
+	}
+}
+
+// SinkProjection redacts a completed message before it reaches a sink. Every
+// ToolUseBlock.Input is replaced with `{}` so raw tool arguments (a WriteFile
+// body, a Bash command with an inline token, Fetch headers) never log. Text and
+// thinking blocks are model output and pass through unchanged. The projection is
+// a deep-enough copy that the original message — still referenced by the stream
+// and conversation history — is never mutated.
+func (e TurnDone) SinkProjection() Event {
+	if e.Message == nil {
+		return e
+	}
+	blocks := make([]content.Block, len(e.Message.Blocks))
+	for i, b := range e.Message.Blocks {
+		if tu, ok := b.(*content.ToolUseBlock); ok {
+			blocks[i] = &content.ToolUseBlock{
+				ID:    tu.ID,
+				Name:  tu.Name,
+				Input: redactedToolInput,
+			}
+			continue
+		}
+		blocks[i] = b
+	}
+	return TurnDone{
+		TurnIndex: e.TurnIndex,
+		Message: &content.AIMessage{Message: content.Message{
+			Role:   e.Message.Role,
+			Blocks: blocks,
+		}},
+	}
+}
