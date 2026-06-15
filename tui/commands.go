@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"strings"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -71,4 +72,27 @@ func closeAgent(agent Agent) tea.Cmd {
 		_ = agent.Close(ctx) // best-effort; Close is idempotent, nothing actionable at the UI
 		return nil
 	}
+}
+
+// printPayload flattens every action's Lines, in order, into a single string
+// joined by "\n". Each action's trailing "" line therefore yields the blank-line
+// separation between entries in scrollback. It is pure: the input actions and
+// their Lines are read-only, and a fresh slice is built (never appended into a
+// caller's backing array). No actions yields "".
+func printPayload(actions []printAction) string {
+	var all []string
+	for _, a := range actions {
+		all = append(all, a.Lines...)
+	}
+	return strings.Join(all, "\n")
+}
+
+// printToScrollback emits the assembled payload to the native terminal scrollback
+// via tea.Println. It returns nil (a no-op command) when there is nothing to print,
+// so the caller can dispatch it unconditionally.
+func printToScrollback(actions []printAction) tea.Cmd {
+	if len(actions) == 0 {
+		return nil
+	}
+	return tea.Println(printPayload(actions))
 }
