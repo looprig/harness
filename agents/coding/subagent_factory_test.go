@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/inventivepotter/urvi/internal/content"
 	"github.com/inventivepotter/urvi/internal/registry"
@@ -102,6 +103,70 @@ func TestFactoryChildTurnFailureSurfacesError(t *testing.T) {
 	}
 	if !errors.Is(ste.Cause, errFakeProvider) {
 		t.Errorf("SubagentTurnError.Cause = %v, want errors.Is errFakeProvider", ste.Cause)
+	}
+}
+
+// TestFactoryChildTurnInterruptSurfacesError proves a child whose turn is
+// interrupted (its Invoke ctx is cancelled while the turn is in flight) makes
+// Subsession.Invoke return a typed *SubagentInterruptedError with no Go error —
+// the Subagent tool turns this into a tool-result error string. This drives the
+// otherwise-unexercised TurnInterrupted branch of childSubsession.Invoke.
+//
+// The fake streams one chunk then holds Next open, so the child turn stays in
+// flight; we wait on `entered` (the fake's Stream genuinely running) before
+// cancelling, exercising cancel-while-running. A cancelled in-flight stream
+// surfaces in the loop as event.TurnInterrupted (turn.go streamFailure maps a
+// cancelled ctx to an interrupt), which the adapter projects to the typed error.
+func TestFactoryChildTurnInterruptSurfacesError(t *testing.T) {
+	t.Parallel()
+
+	entered := make(chan struct{})
+	hold := make(chan struct{})
+	defer close(hold) // belt-and-suspenders: release the fake if the turn outlives the test
+
+	f := newTestFactory(t, &fakeLLM{
+		chunks:  []content.Chunk{textChunk("partial")},
+		hold:    hold,
+		entered: entered,
+	})
+
+	sub, err := f.New(context.Background(), codingSkill)
+	if err != nil {
+		t.Fatalf("factory.New(coding) error = %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	type result struct {
+		text string
+		err  error
+	}
+	resCh := make(chan result, 1)
+	go func() {
+		text, err := sub.Invoke(ctx, "do the thing")
+		resCh <- result{text: text, err: err}
+	}()
+
+	// Wait until the child turn is genuinely running (fake's Stream entered)
+	// before cancelling — this is cancel-while-running, the path that yields a
+	// TurnInterrupted rather than a pre-start session error.
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("child turn did not start within deadline")
+	}
+	cancel()
+
+	select {
+	case res := <-resCh:
+		if res.text != "" {
+			t.Errorf("Invoke text = %q, want empty on interrupt", res.text)
+		}
+		var sie *SubagentInterruptedError
+		if !errors.As(res.err, &sie) {
+			t.Fatalf("err = %v, want *SubagentInterruptedError", res.err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Invoke did not return after ctx cancel")
 	}
 }
 

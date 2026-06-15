@@ -9,14 +9,6 @@ func (e *MissingEnvError) Error() string {
 	return "coding: required environment variable " + e.Var + " is not set"
 }
 
-// EmptyInputError is returned by Send and Stream when the user text is empty or
-// whitespace only.
-type EmptyInputError struct{}
-
-func (e *EmptyInputError) Error() string {
-	return "coding: input text is empty"
-}
-
 // WorkspaceRootError is returned during construction when the workspace root
 // (the process working directory) cannot be resolved, so the file tools cannot
 // be confined to a known root. Cause carries the underlying os.Getwd error.
