@@ -43,6 +43,12 @@ type Screen struct {
 	expand        bool
 	width, height int
 	ready         bool
+
+	// anim holds the LIVE-surface animation state (blink phase + spinner frame +
+	// ticking guard). It is advanced once per blinkTick while Running, threaded into
+	// renderLiveTail ONLY, and reset to its zero value when the turn ends. The committed
+	// scrollback path never consults it. See animState and the blinkMsg handler.
+	anim animState
 }
 
 // AgentBanner is the agent metadata shown as the startup info notice — its Name and
@@ -129,8 +135,26 @@ func (m Screen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case systemReadyMsg:
 		m.transcript = m.transcript.CommitNotice(noticeInfo, m.banner.bannerText())
 		return m, m.flush()
+	case blinkMsg:
+		return m, m.handleBlink()
 	}
 	return m, nil
+}
+
+// handleBlink advances the live-surface animation by one frame and, ONLY while the
+// turn is still Running, reschedules the next tick — so View re-renders the live tail
+// with the new blink/spinner phase. It is a PURE active-surface re-render: it never
+// calls flush/printToScrollback/readNext, so a tick can never write to scrollback.
+// At any non-Running status it stops the loop (returns nil — no reschedule) and resets
+// the animation state so the next live render is clean and a fresh turn starts a new
+// tick loop. Reset clears the ticking guard, letting the next Running turn start one.
+func (m *Screen) handleBlink() tea.Cmd {
+	if m.status != StatusRunning {
+		m.anim = m.anim.reset()
+		return nil
+	}
+	m.anim = m.anim.advance()
+	return blinkTick()
 }
 
 // handleEvent routes one turn-stream event through BOTH reducers — the transcript
@@ -233,8 +257,10 @@ func (m *Screen) handlePromptResult(msg promptResultMsg) tea.Cmd {
 
 // startTurn begins a turn from blocks. agent.StreamBlocks may fail before a reader
 // exists (TurnBusyError, loop exited, ctx done); on error it commits an error entry
-// and stays Idle — never Running without a reader, never readNext(nil). It returns
-// the readNext cmd and whether the turn actually started.
+// and stays Idle — never Running without a reader, never readNext(nil). On success it
+// transitions to Running and, via startBlink, kicks off the live-surface animation
+// tick (guarded so a queue-advance restart never spawns a parallel loop). It returns
+// the (batched) readNext + tick cmd and whether the turn actually started.
 func (m *Screen) startTurn(blocks []content.Block) (tea.Cmd, bool) {
 	r, err := m.agent.StreamBlocks(m.appCtx, blocks)
 	if err != nil {
@@ -243,7 +269,21 @@ func (m *Screen) startTurn(blocks []content.Block) (tea.Cmd, bool) {
 		return nil, false
 	}
 	m.reader, m.status = r, StatusRunning
-	return readNext(r), true
+	return tea.Batch(readNext(r), m.startBlink()), true
+}
+
+// startBlink starts the live-surface animation tick loop iff one is not already
+// running: it sets the ticking guard and returns the first blinkTick. If a tick is
+// already in flight (anim.ticking) — e.g. a queued submission restarts a turn before
+// the prior loop has observed Idle and reset — it returns nil so no second, parallel
+// loop is spawned. The single in-flight tick keeps ticking (it observes Running), so
+// the animation continues seamlessly across the queue-advance boundary.
+func (m *Screen) startBlink() tea.Cmd {
+	if m.anim.ticking {
+		return nil
+	}
+	m.anim.ticking = true
+	return blinkTick()
 }
 
 // View renders an empty string until the first WindowSizeMsg (avoids a 0×0 first
@@ -275,7 +315,7 @@ func (m Screen) renderLiveTail() string {
 	if live.empty() {
 		return ""
 	}
-	return renderAssistant(live.Thinking, live.Text, live.Calls, m.expand, m.width)
+	return renderLiveAssistant(live.Thinking, live.Text, live.Calls, m.expand, m.width, m.anim)
 }
 
 // statusInputs snapshots the live signals the status label is derived from: which

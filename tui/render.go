@@ -53,31 +53,40 @@ const (
 // line — still fit.
 const dotWidth = 2
 
-// renderMD renders markdown to ANSI and prefixes it with the assistant bullet so the
-// narration begins on the SAME line as the "●". glamour's "dark" style indents every
-// line by a 2-column document margin and brackets the block with blank lines; those
-// are stripped so the text aligns with the dot — first line "● text", continuation
+// renderMD renders markdown to ANSI behind the static committed bullet (styles.Dot).
+// It is the committed/scrollback path: a frozen assistant "●" never animates, so it
+// always uses the lit dot. The live tail uses renderMDDot with a blink-phased bullet.
+func renderMD(md string, width int) string {
+	return renderMDDot(md, width, styles.Dot)
+}
+
+// renderMDDot renders markdown to ANSI and prefixes it with dot so the narration
+// begins on the SAME line as the bullet. glamour's "dark" style indents every line by
+// a 2-column document margin and brackets the block with blank lines; those are
+// stripped so the text aligns with the dot — first line "<dot>text", continuation
 // lines indented to clear the bullet. On a glamour construction or render error it
 // falls back to the raw text behind the dot, so the UI always gets readable output.
-func renderMD(md string, width int) string {
+// dot MUST be dotWidth (2) columns wide so continuation-line alignment holds; callers
+// pass either the static styles.Dot (committed) or a blink-phased live bullet.
+func renderMDDot(md string, width int, dot string) string {
 	if strings.TrimSpace(md) == "" {
 		return ""
 	}
 
 	r, err := styles.NewMarkdownRenderer(max(0, width-dotWidth))
 	if err != nil {
-		return styles.Dot + md
+		return dot + md
 	}
 	out, err := r.Render(md)
 	if err != nil {
-		return styles.Dot + md
+		return dot + md
 	}
 
 	lines := dedentDocument(out)
 	indent := strings.Repeat(" ", dotWidth)
 	for i := range lines {
 		if i == 0 {
-			lines[i] = styles.Dot + lines[i]
+			lines[i] = dot + lines[i]
 		} else {
 			lines[i] = indent + lines[i]
 		}
@@ -130,21 +139,29 @@ func toolGlyph(s ToolStatus) string {
 // (subject to the same fold), never hidden. Lines are width-wrapped so a long card
 // never blows the viewport. Returns "" when there are no calls.
 func renderToolCalls(calls []ToolCallView, expandTools bool, width int) string {
+	return renderToolCallsGlyph(calls, expandTools, width, toolGlyph)
+}
+
+// renderToolCallsGlyph is the shared card renderer: it maps each call's status to a
+// glyph via glyph, the indirection that lets the LIVE path animate a running card's
+// glyph (spinnerGlyph) while the committed path keeps the static toolGlyph. Returns
+// "" when there are no calls.
+func renderToolCallsGlyph(calls []ToolCallView, expandTools bool, width int, glyph func(ToolStatus) string) string {
 	if len(calls) == 0 {
 		return ""
 	}
 	parts := make([]string, 0, len(calls))
 	for i := range calls {
-		parts = append(parts, renderToolCard(calls[i], expandTools, width))
+		parts = append(parts, renderToolCard(calls[i], expandTools, width, glyph))
 	}
 	return strings.Join(parts, "\n")
 }
 
 // renderToolCard renders one tool card: the styled header line then its styled,
-// indented result-preview lines.
-func renderToolCard(c ToolCallView, expandTools bool, width int) string {
+// indented result-preview lines. glyph maps the call's status to its header glyph.
+func renderToolCard(c ToolCallView, expandTools bool, width int, glyph func(ToolStatus) string) string {
 	header := cardIndent + styles.ToolCallStyle.Render(
-		cardConnector+toolHeaderText(c.ToolName, c.Summary, toolGlyph(c.Status)))
+		cardConnector+toolHeaderText(c.ToolName, c.Summary, glyph(c.Status)))
 
 	lines := make([]string, 0, previewLineCap+2)
 	lines = append(lines, header)
@@ -230,6 +247,52 @@ func renderAssistant(thinking, text string, calls []ToolCallView, expand bool, w
 		b.WriteString(renderToolCalls(calls, expand, width))
 	}
 	return b.String()
+}
+
+// renderLiveAssistant renders the in-progress (live) assistant segment with the
+// animation state threaded in: the leading bullet blinks (liveDot) and a still-running
+// tool card's glyph cycles through the spinner (spinnerGlyph), while resolved cards
+// keep their static ✓/✗. It mirrors renderAssistant's ordering (thinking → narration
+// → cards) but is the LIVE path ONLY — the committed renderAssistant stays static and
+// is never given an anim. Empty parts are omitted.
+func renderLiveAssistant(thinking, text string, calls []ToolCallView, expand bool, width int, a animState) string {
+	var b strings.Builder
+
+	if t := renderThinking(thinking, expand, width); t != "" {
+		b.WriteString(t)
+	}
+
+	body := renderMDDot(text, width, liveDot(a.blink))
+	if body == "" && len(calls) > 0 {
+		body = strings.TrimRight(liveDot(a.blink), " ") // bare blinking bullet for a card-only live segment
+	}
+	if body != "" {
+		if b.Len() > 0 {
+			b.WriteString("\n\n")
+		}
+		b.WriteString(body)
+	}
+
+	if len(calls) > 0 {
+		if b.Len() > 0 {
+			b.WriteString("\n")
+		}
+		b.WriteString(renderToolCallsGlyph(calls, expand, width, liveToolGlyph(a.frame)))
+	}
+	return b.String()
+}
+
+// liveToolGlyph returns a status→glyph resolver for the LIVE path: a running call
+// shows the animated spinner cell for frame; every other (resolved) status falls
+// through to the static toolGlyph. It closes over frame so renderToolCallsGlyph can
+// stay frame-agnostic.
+func liveToolGlyph(frame uint) func(ToolStatus) string {
+	return func(s ToolStatus) string {
+		if s == ToolRunning {
+			return spinnerGlyph(frame)
+		}
+		return toolGlyph(s)
+	}
 }
 
 // barWidth is the display columns a left-bar prefix ("▌ " / "│ ") consumes.

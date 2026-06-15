@@ -15,6 +15,20 @@ import (
 	"github.com/inventivepotter/urvi/internal/uuid"
 )
 
+// blinkInterval is the cadence of the live-surface animation tick: the streaming
+// assistant dot blinks and the running tool spinner steps once per interval. ~450ms
+// reads as a calm "working" pulse — fast enough to feel live, slow enough not to
+// strobe or churn the render loop.
+const blinkInterval = 450 * time.Millisecond
+
+// blinkTick schedules ONE live-surface animation tick after blinkInterval, delivering
+// a blinkMsg. It is a single-shot tick (tea.Tick semantics); the blinkMsg handler
+// reschedules it ONLY while the turn is still Running, so the loop self-terminates at
+// Idle with no orphaned timer. It never touches scrollback.
+func blinkTick() tea.Cmd {
+	return tea.Tick(blinkInterval, func(t time.Time) tea.Msg { return blinkMsg(t) })
+}
+
 // interruptTimeout bounds an Interrupt ack so Update never waits on a wedged session.
 const interruptTimeout = 2 * time.Second
 
