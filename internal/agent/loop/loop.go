@@ -128,7 +128,11 @@ type turnResult struct {
 	terminal event.Event // TurnDone, TurnFailed, or TurnInterrupted
 }
 
-func listen(ctx context.Context, sessionID uuid.UUID, cfg Config, commands <-chan command.Command, gateReg <-chan gateRegistration, done chan struct{}) {
+// listen takes gateReg as a bidirectional channel: the actor is its sole reader
+// (the select below), and the per-turn goroutine hands the SEND side to runTurn
+// → RunBatch so a parked tool can register a gate. (A receive-only handle could
+// not be narrowed to the send-only direction runTurn requires.)
+func listen(ctx context.Context, sessionID uuid.UUID, cfg Config, commands <-chan command.Command, gateReg chan gateRegistration, done chan struct{}) {
 	defer close(done)
 
 	internal := make(chan turnResult, 1)
@@ -325,7 +329,7 @@ func listen(ctx context.Context, sessionID uuid.UUID, cfg Config, commands <-cha
 						case <-turnCtx.Done():
 						}
 					}
-					updated, terminal := runTurn(turnCtx, c.Input, idx, preMsgs, cfg, cfg.Client, emit)
+					updated, terminal := runTurn(turnCtx, c.Input, idx, preMsgs, cfg, cfg.Client, gateReg, emit)
 					internal <- turnResult{msgs: updated, terminal: terminal}
 				}()
 				c.Ack <- nil
