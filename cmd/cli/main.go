@@ -16,6 +16,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 
+	"github.com/inventivepotter/urvi/agents/coding"
 	personalassistant "github.com/inventivepotter/urvi/agents/personal-assistant"
 	"github.com/inventivepotter/urvi/internal/registry"
 	"github.com/inventivepotter/urvi/tui"
@@ -40,12 +41,15 @@ func agentName(args []string) string {
 // buildRegistry returns the agent registry with the built-in agents registered.
 func buildRegistry() *registry.Registry[tui.Agent] {
 	reg := registry.New[tui.Agent]()
-	// Register returns an error only on duplicate names; with a single static
-	// registration that cannot happen, but handle it defensively. *Assistant
-	// satisfies tui.Agent, so personalassistant.New type-checks as
+	// Register returns an error only on duplicate names; with static, distinct
+	// registrations that cannot happen, but handle it defensively. *Assistant and
+	// *Coding satisfy tui.Agent, so each constructor type-checks as
 	// (tui.Agent, error).
 	_ = reg.Register(defaultAgent, func(c context.Context) (tui.Agent, error) {
 		return personalassistant.New(c)
+	})
+	_ = reg.Register("coding", func(c context.Context) (tui.Agent, error) {
+		return coding.New(c)
 	})
 	return reg
 }

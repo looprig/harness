@@ -18,6 +18,7 @@ func TestAgentName(t *testing.T) {
 		{name: "flag then positional", args: []string{"-v", "bar"}, want: "bar"},
 		{name: "only a flag returns default", args: []string{"-v"}, want: defaultAgent},
 		{name: "flag before default-able name", args: []string{"--debug", "personal-assistant"}, want: "personal-assistant"},
+		{name: "coding selects coding agent", args: []string{"coding"}, want: "coding"},
 		{name: "first positional wins", args: []string{"-x", "alpha", "beta"}, want: "alpha"},
 	}
 	for _, tt := range tests {
@@ -36,8 +37,13 @@ func TestBuildRegistry(t *testing.T) {
 	if reg == nil {
 		t.Fatal("buildRegistry() returned nil")
 	}
+	// Assert the built-in agents are registered by name. Names() is checked
+	// rather than Open() because opening an agent reads the environment and the
+	// working directory; the registry only promises the binding exists here.
 	names := reg.Names()
-	if !slices.Contains(names, defaultAgent) {
-		t.Errorf("buildRegistry().Names() = %v, want it to contain %q", names, defaultAgent)
+	for _, want := range []string{defaultAgent, "coding"} {
+		if !slices.Contains(names, want) {
+			t.Errorf("buildRegistry().Names() = %v, want it to contain %q", names, want)
+		}
 	}
 }
