@@ -212,6 +212,46 @@ func TestGlobCapabilities(t *testing.T) {
 	}
 }
 
+// TestGlobExcludesSymlinkEscapingWorkspace proves that a symlink ENTRY inside the
+// workspace whose target resolves OUTSIDE the root is excluded from Glob results
+// rather than emitted as a "../"-climbing path. WalkDir visits (but does not
+// descend into) such a symlink; denyFilteredRel must reject the resolved escape so
+// the outside target's location never leaks. This is the unit-level companion to
+// the symlink case in fs_integration_test.go (covered in the DEFAULT test run).
+func TestGlobExcludesSymlinkEscapingWorkspace(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	outside := t.TempDir()
+	// A file in the outside tree, reachable only by following the planted symlink.
+	if err := os.WriteFile(filepath.Join(outside, "secret.txt"), []byte("x"), 0o600); err != nil {
+		t.Fatalf("write outside file: %v", err)
+	}
+	// A legitimate in-workspace file (so the listing is non-empty).
+	if err := os.WriteFile(filepath.Join(root, "keep.txt"), []byte("y"), 0o600); err != nil {
+		t.Fatalf("write keep.txt: %v", err)
+	}
+	// Symlinks inside the workspace pointing OUT: one to the dir, one to the file.
+	if err := os.Symlink(outside, filepath.Join(root, "link-dir")); err != nil {
+		t.Fatalf("symlink link-dir: %v", err)
+	}
+	if err := os.Symlink(filepath.Join(outside, "secret.txt"), filepath.Join(root, "link-file")); err != nil {
+		t.Fatalf("symlink link-file: %v", err)
+	}
+
+	got := runGlob(t, root, newFakeReadGuard(1<<20), map[string]any{"pattern": "**"})
+
+	if strings.Contains(got, "..") {
+		t.Errorf("Glob emitted a workspace-escaping path; output:\n%s", got)
+	}
+	if strings.Contains(got, "secret.txt") {
+		t.Errorf("Glob listed the outside target through a symlink; output:\n%s", got)
+	}
+	if !strings.Contains(got, "keep.txt") {
+		t.Errorf("Glob did not list the legitimate in-workspace file; output:\n%s", got)
+	}
+}
+
 // mustWrite creates parent dirs and writes a file, failing the test on error.
 func mustWrite(t *testing.T, path, body string) {
 	t.Helper()

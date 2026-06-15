@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -398,6 +399,42 @@ func TestDenyFilteredRel(t *testing.T) {
 				t.Errorf("rel = %q, want %q", rel, tt.wantRel)
 			}
 		})
+	}
+}
+
+// TestGrepFallbackExcludesSymlinkEscapingWorkspace proves the WalkDir fallback's
+// shared deny-filter (denyFilteredRel) excludes a symlinked entry whose target
+// resolves OUTSIDE the workspace, rather than opening it or emitting a
+// "../"-climbing path. The outside file's content must never appear in matches.
+// Unit-level companion to fs_integration_test.go's symlink case (default run).
+func TestGrepFallbackExcludesSymlinkEscapingWorkspace(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	outside := t.TempDir()
+	if err := os.WriteFile(filepath.Join(outside, "secret.txt"), []byte("NEEDLE outside\n"), 0o600); err != nil {
+		t.Fatalf("write outside file: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "keep.txt"), []byte("NEEDLE inside\n"), 0o600); err != nil {
+		t.Fatalf("write keep.txt: %v", err)
+	}
+	if err := os.Symlink(filepath.Join(outside, "secret.txt"), filepath.Join(root, "link-file")); err != nil {
+		t.Fatalf("symlink link-file: %v", err)
+	}
+	if err := os.Symlink(outside, filepath.Join(root, "link-dir")); err != nil {
+		t.Fatalf("symlink link-dir: %v", err)
+	}
+
+	got := runGrep(t, root, newFakeReadGuard(1<<20), map[string]any{"pattern": "NEEDLE"})
+
+	if strings.Contains(got, "outside") {
+		t.Errorf("Grep matched content in the outside tree through a symlink; output:\n%s", got)
+	}
+	if strings.Contains(got, "..") {
+		t.Errorf("Grep emitted a workspace-escaping path; output:\n%s", got)
+	}
+	if !strings.Contains(got, "keep.txt") || !strings.Contains(got, "NEEDLE inside") {
+		t.Errorf("Grep did not match the legitimate in-workspace file; output:\n%s", got)
 	}
 }
 

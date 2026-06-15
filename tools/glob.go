@@ -192,10 +192,18 @@ func (ctxCancelledError) Error() string { return "tools: walk aborted; context c
 // unresolvable path falls back to abs unchanged — fail-secure: the authoritative
 // DeniedRead below still runs on it), applies the AUTHORITATIVE DeniedRead filter,
 // and returns the workspace-relative slash path for a permitted entry. denied=true
-// means the path MUST be excluded — either DeniedRead reported it, OR it could not
-// be made relative to the resolved root (a containment surprise is excluded, never
-// emitted). Centralising this guarantees the deny semantics cannot drift between
-// the three call sites.
+// means the path MUST be excluded — either DeniedRead reported it, OR the
+// symlink-resolved path ESCAPES the workspace root (a symlinked entry whose target
+// is outside, or any other containment surprise), OR it could not be made relative
+// to the resolved root. Centralising this guarantees the deny semantics cannot
+// drift between the three call sites.
+//
+// Containment is enforced on the RESOLVED (EvalSymlinks) path, mirroring
+// containedPath: WalkDir does not descend into a symlinked directory, but it still
+// VISITS a symlink entry, and an rg result path may itself be a symlink. Resolving
+// then rejecting a "../"-escaping rel ensures such an entry is excluded rather than
+// emitted with an out-of-workspace "../" path (which would leak the target's
+// location, and could match a "**" pattern).
 func denyFilteredRel(guard loop.ReadGuard, resolvedRoot, abs string) (relSlash string, denied bool) {
 	denyAbs := abs
 	if resolved, rerr := filepath.EvalSymlinks(abs); rerr == nil {
@@ -206,6 +214,11 @@ func denyFilteredRel(guard loop.ReadGuard, resolvedRoot, abs string) (relSlash s
 	}
 	rel, rerr := filepath.Rel(resolvedRoot, denyAbs)
 	if rerr != nil {
+		return "", true
+	}
+	// Reject a resolved path that climbs above the workspace root (e.g. an
+	// in-workspace symlink pointing OUT). Such an entry must never be emitted.
+	if hasParentEscape(rel) {
 		return "", true
 	}
 	return filepath.ToSlash(rel), false
