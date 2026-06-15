@@ -3,6 +3,7 @@ package loop
 import (
 	"context"
 	"encoding/json"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -167,7 +168,7 @@ func encodeSink(t *testing.T, ev event.Event) string {
 	case event.PermissionRequested:
 		return "perm tool=" + e.Request.ToolName() + " desc=" + e.Request.Description()
 	case event.UserInputRequestedSink:
-		return "uis count=" + itoa(e.ChoiceCount)
+		return "uis count=" + strconv.Itoa(e.ChoiceCount)
 	case event.UserInputRequested:
 		return "uir q=" + e.Question + " choices=" + strings.Join(e.Choices, ",")
 	case event.ToolCallStarted:
@@ -195,18 +196,6 @@ func encodeSink(t *testing.T, ev event.Event) string {
 	default:
 		return "unknown"
 	}
-}
-
-func itoa(n int) string {
-	if n == 0 {
-		return "0"
-	}
-	var buf []byte
-	for n > 0 {
-		buf = append([]byte{byte('0' + n%10)}, buf...)
-		n /= 10
-	}
-	return string(buf)
 }
 
 func boolStr(b bool) string {

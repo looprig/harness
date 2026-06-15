@@ -2,6 +2,8 @@ package event_test
 
 import (
 	"encoding/json"
+	"fmt"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -96,7 +98,7 @@ func encode(t *testing.T, ev event.Event) string {
 	case event.UserInputRequested:
 		return "callid=" + e.CallID.String() + " q=" + e.Question + " choices=" + strings.Join(e.Choices, ",")
 	case event.UserInputRequestedSink:
-		return "callid=" + e.CallID.String() + " count=" + itoa(e.ChoiceCount)
+		return "callid=" + e.CallID.String() + " count=" + strconv.Itoa(e.ChoiceCount)
 	case event.ToolCallStarted:
 		return "callid=" + e.CallID.String() + " tool=" + e.ToolName + " summary=" + e.Summary
 	case event.ToolCallCompleted:
@@ -114,25 +116,6 @@ func encode(t *testing.T, ev event.Event) string {
 		}
 		return string(b)
 	}
-}
-
-func itoa(n int) string {
-	if n == 0 {
-		return "0"
-	}
-	neg := n < 0
-	if neg {
-		n = -n
-	}
-	var buf []byte
-	for n > 0 {
-		buf = append([]byte{byte('0' + n%10)}, buf...)
-		n /= 10
-	}
-	if neg {
-		buf = append([]byte{'-'}, buf...)
-	}
-	return string(buf)
 }
 
 func boolStr(b bool) string {
@@ -363,7 +346,10 @@ func TestTurnDoneTextThinkingUnchanged(t *testing.T) {
 }
 
 // TestRedactableImplementations pins WHICH events implement Redactable. Events
-// without sensitive payload MUST NOT (the loop only projects those that do).
+// without sensitive payload MUST NOT (the loop only projects those that do). The
+// two lists must between them enumerate EVERY known event: the final check fails
+// if a new event lands in neither list, forcing its author to make a deliberate,
+// recorded sink-safety decision (CLAUDE.md: log events, not secrets).
 func TestRedactableImplementations(t *testing.T) {
 	t.Parallel()
 	shouldRedact := []event.Event{
@@ -378,18 +364,60 @@ func TestRedactableImplementations(t *testing.T) {
 			t.Errorf("%T must implement Redactable", e)
 		}
 	}
+	// shouldNotRedact enumerates the full set of events the loop forwards to sinks
+	// VERBATIM. Each is sink-safe BY CONSTRUCTION today:
+	//   - ToolCallStarted: Summary is pre-redacted at construction.
+	//   - UserInputRequestedSink: the already-redacted sink shape (no Q/choices).
+	//   - TurnStarted/SessionStarted/TurnInterrupted: carry only indices/IDs.
+	//   - TurnFailed: Err is a typed, secret-free cause this package constructs;
+	//     wrapping a provider/LLM error string into it later MUST redact (see the
+	//     SECURITY note on TurnFailed in turn.go).
 	shouldNotRedact := []event.Event{
 		event.ToolCallStarted{},
+		event.UserInputRequestedSink{},
 		event.TurnStarted{},
 		event.SessionStarted{},
 		event.TurnInterrupted{},
+		event.TurnFailed{},
 	}
 	for _, e := range shouldNotRedact {
 		if _, ok := e.(event.Redactable); ok {
 			t.Errorf("%T must NOT implement Redactable (no sensitive payload)", e)
 		}
 	}
+
+	// allKnownEvents is the complete sealed event set. A new event MUST be added
+	// to exactly one classification list above; this assertion fails if any known
+	// event is unclassified, so sink-safety is an enumerated, deliberate decision.
+	allKnownEvents := []event.Event{
+		event.PermissionRequested{Request: tool.UnknownRequest{}},
+		event.UserInputRequested{},
+		event.UserInputRequestedSink{},
+		event.ToolCallStarted{},
+		event.ToolCallCompleted{},
+		event.TokenDelta{},
+		event.TurnStarted{},
+		event.TurnDone{},
+		event.TurnFailed{},
+		event.TurnInterrupted{},
+		event.SessionStarted{},
+	}
+	classified := make(map[string]bool, len(shouldRedact)+len(shouldNotRedact))
+	for _, e := range shouldRedact {
+		classified[typeName(e)] = true
+	}
+	for _, e := range shouldNotRedact {
+		classified[typeName(e)] = true
+	}
+	for _, e := range allKnownEvents {
+		if !classified[typeName(e)] {
+			t.Errorf("%T is unclassified: add it to shouldRedact or shouldNotRedact in TestRedactableImplementations (and decide its sink-safety)", e)
+		}
+	}
 }
+
+// typeName returns the concrete type name of an event for set membership.
+func typeName(e event.Event) string { return fmt.Sprintf("%T", e) }
 
 // TestTurnDoneProjectionDoesNotMutateOriginal asserts the projection is a copy:
 // redacting ToolUseBlock.Input must not corrupt the in-memory message the stream
