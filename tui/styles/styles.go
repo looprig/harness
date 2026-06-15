@@ -4,6 +4,8 @@
 package styles
 
 import (
+	"strings"
+
 	"charm.land/glamour/v2"
 	glamourstyles "charm.land/glamour/v2/styles"
 	"charm.land/lipgloss/v2"
@@ -45,6 +47,37 @@ var AccentBarStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
 // editor renders inside it; callers subtract the style's horizontal frame from the
 // box width to size the inner textarea.
 var BoxStyle = lipgloss.NewStyle().Border(lipgloss.NormalBorder())
+
+// PromptBoxStyle is the emphasised border drawn around an active permission/AskUser
+// prompt control. It uses a rounded border (visually distinct from the composer's
+// square NormalBorder and from the faint, borderless tool cards) so a pending gate
+// reads as a foreground, action-required affordance rather than scrollback narration.
+var PromptBoxStyle = lipgloss.NewStyle().Border(lipgloss.RoundedBorder())
+
+// PromptHeaderStyle renders a prompt box's header label (e.g. "Approve Bash?"),
+// bold so the action reads at a glance above the body.
+var PromptHeaderStyle = lipgloss.NewStyle().Bold(true)
+
+// PromptHintStyle renders a prompt box's faint secondary hints — the key legend
+// ("↑/↓ select · …") and the "(+N more pending)" queue-depth note.
+var PromptHintStyle = lipgloss.NewStyle().Faint(true)
+
+// PromptCursorStyle renders the ▸ cursor marking the selected choice row, bold so
+// the selection stands out from the unselected rows.
+var PromptCursorStyle = lipgloss.NewStyle().Bold(true)
+
+// separatorRune is the horizontal-rule glyph for the active-surface separator.
+const separatorRune = "─"
+
+// SeparatorRule returns a faint full-width horizontal rule of width columns, the
+// divider drawn between the live tail (native scrollback above) and the bottom box.
+// A non-positive width yields the empty string.
+func SeparatorRule(width int) string {
+	if width <= 0 {
+		return ""
+	}
+	return StatusStyle.Render(strings.Repeat(separatorRune, width))
+}
 
 // ThinkingStyle renders the model's reasoning block: faint and italic, subordinate
 // to the assistant narration it precedes.

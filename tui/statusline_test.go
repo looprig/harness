@@ -67,3 +67,79 @@ func TestRenderStatusLine(t *testing.T) {
 		})
 	}
 }
+
+// TestStatusLabel covers the pure status-label derivation table (design §"Thinking
+// & status line"): the label is computed from the session Status plus the
+// interaction state (a prompt active, only-thinking-so-far, streaming text), with
+// the awaiting-approval / awaiting-input prompt labels taking precedence over the
+// underlying Running status.
+func TestStatusLabel(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name  string
+		status Status
+		st     statusInputs
+		want   string
+	}{
+		{name: "idle is empty", status: StatusIdle, st: statusInputs{}, want: ""},
+		{
+			name:   "streaming text",
+			status: StatusRunning,
+			st:     statusInputs{streaming: true},
+			want:   "streaming…",
+		},
+		{
+			name:   "only thinking so far",
+			status: StatusRunning,
+			st:     statusInputs{thinking: true},
+			want:   "thinking…",
+		},
+		{
+			name:   "permission prompt active",
+			status: StatusRunning,
+			st:     statusInputs{permissionActive: true, streaming: true},
+			want:   "awaiting approval",
+		},
+		{
+			name:   "askuser prompt active",
+			status: StatusRunning,
+			st:     statusInputs{userInputActive: true},
+			want:   "awaiting input",
+		},
+		{
+			name:   "interrupting",
+			status: StatusInterrupting,
+			st:     statusInputs{},
+			want:   "interrupting…",
+		},
+		{
+			name:   "clearing",
+			status: StatusResetting,
+			st:     statusInputs{},
+			want:   "clearing…",
+		},
+		{
+			name:   "running with no signal is empty",
+			status: StatusRunning,
+			st:     statusInputs{},
+			want:   "",
+		},
+		{
+			name:   "permission beats streaming",
+			status: StatusRunning,
+			st:     statusInputs{permissionActive: true, thinking: true, streaming: true},
+			want:   "awaiting approval",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			if got := statusLabel(tt.status, tt.st); got != tt.want {
+				t.Errorf("statusLabel(%v, %+v) = %q, want %q", tt.status, tt.st, got, tt.want)
+			}
+		})
+	}
+}

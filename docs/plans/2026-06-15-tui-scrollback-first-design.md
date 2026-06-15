@@ -322,6 +322,10 @@ Scope hints are **derived from `Scopes`** (`[y]` iff `ScopeOnce`, `[s]` iff `Sco
 `[w]` iff `ScopeWorkspace`); `[n]` always shows. `(+N more pending)` appears when the queue
 is deeper than one.
 
+> Implementation note: the mockups above draw the header embedded in the top border (`┌─
+> Approve Bash? ─┐`), but the implementation renders it as a bold first content row inside
+> the box (not border-embedded) — Lipgloss v2 exposes no border-title API.
+
 **Key routing by mode:**
 
 | Mode | Keys |
