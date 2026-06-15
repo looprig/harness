@@ -96,6 +96,15 @@ Date: 2026-06-14 · Status: approved (brainstorm)
 > "stays in history" claim is removed (§2a); (2) stale match descriptions in
 > `ToolPolicy`, the `ApprovalRecord` comment, and the test section updated to exact-Bash
 > + the Fetch `METHOD scheme://host` grammar (§3b, §3c, §5e).
+>
+> **Revision 2026-06-14 (review pass 9 + self-audit)** resolves a ninth review and a
+> self-audit: (1) **cap-order fix** — the runaway cap is applied *after* the
+> no-tool-calls→`TurnDone` path, so a final text-only answer on the limit iteration
+> still completes (it was wrongly failing) (§2a); (2) **`ToolLimitError` specified** —
+> lives in `event/errors.go` with `Iterations/MaxIterations/Calls/MaxCalls` (§2a);
+> (3) **unknown tool name** → tool-result error, never a panic (§2d); (4) **same-path
+> `WriteFile`/`EditFile` in one batch are serialized** by resolved path (§2d);
+> (5) stale "Fetch host match" test wording updated to the full grammar (§5e).
 
 ## Scope
 
@@ -200,12 +209,12 @@ for {
     stream := client.Stream(ctx, req)
     // accumulate: TextChunk/ThinkingChunk → emit TokenDelta (unchanged)
     //             ToolUseChunk           → fold by Index into []ToolUseBlock (validate, §2b)
-    if iters+1 > MaxToolIterations || calls+len(toolUseBlocks) > MaxToolCallsPerTurn {
-        msgs = msgs[:base]; emit TurnFailed(&ToolLimitError{…}); return   // roll back BEFORE appending
-    }
     assemble AIMessage{Blocks: [thinking…, text, toolUse…]}; append to msgs
-    if no tool_use blocks { emit TurnDone(msg); return }
+    if no tool_use blocks { emit TurnDone(msg); return }   // text-only completion ALWAYS wins, any iters
     iters++; calls += len(toolUseBlocks)
+    if iters > MaxToolIterations || calls > MaxToolCallsPerTurn {
+        msgs = msgs[:base]; emit TurnFailed(&ToolLimitError{…}); return   // whole-turn rollback (safe: not sent before truncation)
+    }
     results := runner.RunBatch(ctx, toolUseBlocks, cfg.Tools, gateReg, emit)
     for each result: append content.ToolMessage{ToolUseID, Blocks: flattenToText(result.Content)} to msgs
     if any result.Terminate { emit TurnDone(lastAIMessage); return }
@@ -215,12 +224,28 @@ for {
 
 **Runaway guard.** `MaxToolIterations` (LLM↔tool round-trips) and
 `MaxToolCallsPerTurn` (total executions) bound the loop so a stuck model can't run
-auto-approved tools forever. The cap is checked **before** the offending
-assistant-with-tool-calls message is appended, and on `ToolLimitError` the **whole
-turn is rolled back** to `base` — so history can never contain a `tool_use` block
-without its matching `ToolMessage` (an unpaired call would make the next provider
-request unencodable). Defaults (25 / 100) applied by `loop.New` when the `ToolSet`
-fields are zero.
+auto-approved tools forever. **Order matters:** the cap is applied *only after* the
+"no tool calls → `TurnDone`" path, so a final text-only answer that lands on the limit
+iteration still completes normally (it is not a tool-using iteration). The cap fires
+only when the model wants *another* tool batch; on `ToolLimitError` the **whole turn
+is rolled back** to `base` — so even though the tool-call assistant message was
+appended a moment earlier, it is truncated before any provider request is built, and
+history never contains a `tool_use` without its matching `ToolMessage`. Defaults
+(25 / 100) applied by `loop.New` when the `ToolSet` fields are zero.
+
+`ToolLimitError` is a typed loop error (CLAUDE.md: typed errors), living beside the
+existing `EmptyResponseError`/`TurnPanicError` in `internal/agent/loop/event/errors.go`:
+
+```go
+type ToolLimitError struct {
+    Iterations, MaxIterations int
+    Calls, MaxCalls           int
+}
+func (e *ToolLimitError) Error() string // "tool limit reached: N/M iterations, P/Q calls"
+```
+
+It is carried as `event.TurnFailed{Err: &ToolLimitError{…}}`, so a caller can
+`errors.As` it to distinguish a runaway stop from a provider/network failure.
 
 **Generalized rollback contract.** The single-stream `runTurn` rolled back just the
 user message (`msgs[:len(msgs)-1]`). The agentic loop appends many messages per turn,
@@ -452,11 +477,22 @@ keeps draining.
 
 `internal/agent/loop/runner.go`:
 
+- **Unknown tool name** — the runner resolves each call's `Name` against
+  `cfg.Tools.Registry`; a hallucinated/unknown name yields a `ToolMessage`
+  tool-result error (`"error: unknown tool: <name>"`), **never** a nil-deref or
+  panic, so the model can correct. (Duplicate names in a registry are a
+  construction-time error in the manifest, not a runtime concern.)
 - **Permission is resolved sequentially across all calls first** — a session-scope
   grant on call *N* is visible to call *N+1*'s `Check`.
 - Execution then splits into a **serial batch** (tools where `Sequential()==true`)
   that drains before a **semaphore-bounded parallel batch**. (No built-in
   implements `Sequential` yet; it is the documented seam for ShellSession.)
+- **Same-path write serialization.** Two file-mutating calls
+  (`WriteFile`/`EditFile`) targeting the **same resolved path** in one parallel batch
+  would race (lost update / torn file). The runner serializes calls by their resolved
+  write path — same-path mutations run sequentially (in call order), different paths
+  still run in parallel. (Read tools are not serialized.) Without `ShellSession`,
+  this is the only intra-batch shared-state hazard.
 - The `tool.ToolMiddleware` chain wraps each `InvokableRun` (first listed =
   outermost). Cross-cutting concerns (OTel spans, rate limiting, audit, caching,
   per-tool timeout) live here, not in the runner body.
@@ -1031,10 +1067,13 @@ The pixel-level work is a follow-up TUI-update doc, since that TUI is mid-flight
 - gate-kind matching — an approve/deny with a colliding `CallID` does **not** satisfy
   an `AskUser` gate (and a provide does not satisfy a permission gate); registration
   and ack both unblock on `ctx` cancellation (no wedge if the actor exits).
-- `Match` semantics — `Fetch` host match rejects `example.com.evil.com` for an
-  `example.com` grant, accepts `.example.com` subdomains, requires `https`, strips the
-  port (`host:443` matches `host`), and normalizes a unicode homograph to punycode;
-  file globs match the workspace-relative canonical path, not `..`/absolute strings.
+- `Match` semantics — `Fetch` `METHOD scheme://host[path]` matching: a
+  `GET https://example.com` grant rejects `example.com.evil.com`, a `POST`, and
+  `http://`; accepts `.example.com` subdomains; strips the port (`host:443` matches
+  `host`); normalizes a unicode homograph to punycode; an opt-in path-prefix only
+  matches when present. `Bash` match is exact-normalized (a suffix is rejected unless
+  `"prefix": true`). File globs match the workspace-relative canonical path, not
+  `..`/absolute strings.
 - `Grant` failure — a `ScopeWorkspace` grant whose file write fails still **executes**
   the approved call and emits a warning (not a deny, not a tool-result error).
 - tool-result flattening — a tool returning a non-`TextBlock` yields a visible
@@ -1067,6 +1106,14 @@ The pixel-level work is a follow-up TUI-update doc, since that TUI is mid-flight
   no unpaired `tool_use` block (assert the next encode succeeds).
 - whole-turn rollback — `TurnFailed`/`TurnInterrupted` mid-agentic-loop truncates all
   of the turn's appended messages (user + every assistant/tool pair), not just the last.
+- cap-order — a final **text-only** reply on the limit-th iteration completes with
+  `TurnDone` (not `TurnFailed`); the cap only fires when another tool batch is requested.
+- `ToolLimitError` — `errors.As`-able from `TurnFailed.Err`, distinct from a
+  provider/network failure; carries the iteration/call counts.
+- unknown tool — a tool call naming a tool absent from the registry yields a
+  tool-result error and the loop continues (no panic).
+- same-path writes — two `WriteFile`/`EditFile` to one path in a batch apply in call
+  order (no torn file); different paths still run concurrently.
 - Fetch match — a `GET https://api.host` grant does **not** approve a `POST` to the
   same host, an `http://` request, or `api.host.evil`.
 - policy-store hardening — `Grant` creates dirs `0700`/files `0600`, refuses to follow
