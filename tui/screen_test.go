@@ -13,8 +13,14 @@ import (
 	"github.com/inventivepotter/urvi/internal/agent/loop/event"
 	"github.com/inventivepotter/urvi/internal/content"
 	"github.com/inventivepotter/urvi/internal/llm"
+	"github.com/inventivepotter/urvi/internal/tool"
+	"github.com/inventivepotter/urvi/internal/uuid"
 	"github.com/inventivepotter/urvi/tui/components"
 )
+
+// compile-time assertion that the test double satisfies the (widened) Agent
+// interface; if a method is added or its signature drifts, this fails to build.
+var _ Agent = (*fakeAgent)(nil)
 
 // fakeAgent is a scriptable Agent test double. It records calls and returns the
 // configured reader/error/bool so Screen behavior can be exercised without a real
@@ -29,6 +35,15 @@ type fakeAgent struct {
 	closeCalled  bool
 	closeErr     error
 	acceptsImage bool
+
+	// gate-trio recorders: the configured error is returned, and the last call's
+	// arguments are captured so a test can assert the wrapper forwarded them.
+	approveErr error
+	denyErr    error
+	answerErr  error
+	lastCallID uuid.UUID
+	lastScope  tool.ApprovalScope
+	lastAnswer string
 }
 
 func (f *fakeAgent) StreamBlocks(_ context.Context, _ []content.Block) (*llm.StreamReader[event.Event], error) {
@@ -48,6 +63,23 @@ func (f *fakeAgent) Close(_ context.Context) error {
 }
 
 func (f *fakeAgent) AcceptsImages() bool { return f.acceptsImage }
+
+func (f *fakeAgent) Approve(_ context.Context, callID uuid.UUID, scope tool.ApprovalScope) error {
+	f.lastCallID = callID
+	f.lastScope = scope
+	return f.approveErr
+}
+
+func (f *fakeAgent) Deny(_ context.Context, callID uuid.UUID) error {
+	f.lastCallID = callID
+	return f.denyErr
+}
+
+func (f *fakeAgent) ProvideAnswer(_ context.Context, callID uuid.UUID, answer string) error {
+	f.lastCallID = callID
+	f.lastAnswer = answer
+	return f.answerErr
+}
 
 // scriptedReader builds a StreamReader that yields the given events in order,
 // then io.EOF on every subsequent call.
