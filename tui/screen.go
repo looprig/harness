@@ -291,13 +291,27 @@ func (m *Screen) startBlink() tea.Cmd {
 // (rendered from the live segment), the separator rule, the bottom box (composer /
 // prompt control / answer field by interaction mode), the slash panel when visible,
 // and one status line. Committed entries are NOT re-rendered here — they live in
-// native scrollback. tea.NewView leaves AltScreen false and MouseMode none (the v2
-// zero values), the scrollback-first configuration.
+// native scrollback. The View leaves AltScreen false and MouseMode none (the v2 zero
+// values), the scrollback-first configuration.
+//
+// KeyboardEnhancements.ReportAllKeysAsEscapeCodes is requested so the composer's
+// Shift+Enter binding works (see tui/components/input.go). v2's DEFAULT Kitty request
+// is just flag 1 ("disambiguate escape codes"), under which the Kitty spec keeps
+// Enter/Tab/Backspace as their legacy bytes — so a modified Enter (Shift+Enter) is NOT
+// reported distinctly and arrives as a plain Enter (submit). Flag 8 ("report all keys
+// as escape codes") is the one that makes the terminal report a modified Enter as
+// CSI 13;2u, which v2 decodes to KeyEnter+ModShift. This ONLY helps on terminals that
+// implement the Kitty keyboard protocol (kitty, Ghostty, WezTerm, foot, Alacritty,
+// recent iTerm2 with the option enabled). On terminals WITHOUT it (Apple Terminal,
+// many VS Code setups) Shift+Enter is indistinguishable from Enter no matter what we
+// request — those rely on the Ctrl+J fallback (input.go). The request is inert on
+// non-supporting terminals (they ignore the CSI), and it does NOT enable alt-screen,
+// mouse capture, or focus reporting, so the scrollback-first invariant is preserved.
 func (m Screen) View() tea.View {
 	if !m.ready {
 		return tea.NewView("")
 	}
-	return tea.NewView(surfaceView(surfaceInputs{
+	v := tea.NewView(surfaceView(surfaceInputs{
 		Interaction: m.interaction,
 		LiveTail:    m.renderLiveTail(),
 		Status:      m.status,
@@ -305,6 +319,8 @@ func (m Screen) View() tea.View {
 		Width:       m.width,
 		Height:      m.height,
 	}))
+	v.KeyboardEnhancements.ReportAllKeysAsEscapeCodes = true
+	return v
 }
 
 // renderLiveTail renders the in-progress assistant segment (streamed thinking,

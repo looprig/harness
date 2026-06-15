@@ -31,22 +31,32 @@ type InputBox struct {
 
 // NewInputBox returns a configured, focused prompt editor.
 //
-// Enter is left unbound on the textarea so screen.go can use it as submit; instead
-// Shift+Enter inserts a newline. NOTE: distinguishing shift+enter from enter requires
-// a terminal supporting the Kitty/enhanced keyboard protocol. Bubble Tea v2 requests
-// basic key disambiguation by default, so Shift+Enter is reported as a distinct key
-// (and inserts a newline) on supporting terminals. On terminals lacking the protocol,
-// shift+enter is delivered as plain enter and therefore submits — an accepted
-// limitation; such terminals simply cannot type a literal newline in the composer.
+// Enter is left unbound on the textarea so screen.go can use it as submit; newline
+// insertion is bound to TWO keys so it works regardless of terminal capability:
+//
+//   - Shift+Enter (PRIMARY, preferred) — only distinguishable from plain Enter on
+//     terminals that implement the Kitty keyboard protocol AND only when the program
+//     requests "report all keys as escape codes" (flag 8). screen.go's View() sets
+//     KeyboardEnhancements.ReportAllKeysAsEscapeCodes for exactly this reason; without
+//     it the Kitty spec keeps Enter as a legacy byte and Shift+Enter arrives as plain
+//     Enter (→ submit). Supported on kitty, Ghostty, WezTerm, foot, Alacritty, and
+//     recent iTerm2 (with the protocol option enabled).
+//   - Ctrl+J (UNIVERSAL FALLBACK) — the LF byte (0x0A), delivered by EVERY terminal
+//     with no protocol required; v2 decodes it as Code 'j' + ModCtrl (String()=="ctrl+j").
+//     This is the only way to type a literal newline on terminals that cannot deliver a
+//     distinct Shift+Enter (Apple Terminal, many VS Code setups). It is purely additive
+//     — Shift+Enter stays primary. Ctrl+J does not collide with any global binding in
+//     screen.go (which handles only ctrl+c, ctrl+t, and esc).
 func NewInputBox() InputBox {
 	ta := textarea.New()
 	ta.CharLimit = 0
 	ta.ShowLineNumbers = false
 	ta.Prompt = styles.AccentBarPrompt
 	ta.Placeholder = placeholder
-	// Rebind newline insertion to Shift+Enter, freeing Enter for submit in screen.go.
+	// Bind newline insertion to Shift+Enter (primary) OR Ctrl+J (universal fallback),
+	// freeing Enter for submit in screen.go. See the doc comment above for why both.
 	ta.KeyMap.InsertNewline = key.NewBinding(
-		key.WithKeys("shift+enter"),
+		key.WithKeys("shift+enter", "ctrl+j"),
 		key.WithHelp("shift+enter", "insert newline"),
 	)
 	// v2 restructures the per-state styles under a single Styles value accessed via

@@ -137,6 +137,47 @@ func TestInputBoxShiftEnterNewline(t *testing.T) {
 	}
 }
 
+// TestInputBoxCtrlJNewlineFallback asserts the universal newline fallback: Ctrl+J is
+// also bound to InsertNewline (alongside shift+enter), so terminals that cannot deliver
+// a distinct Shift+Enter (Apple Terminal, many VS Code setups — they lack the Kitty
+// keyboard protocol) still have a way to type a literal newline. Ctrl+J is the LF byte
+// (0x0A), which every terminal delivers without any protocol; v2 decodes it as
+// tea.KeyPressMsg{Code:'j', Mod: ModCtrl} whose String() == "ctrl+j". Shift+Enter stays
+// primary; Ctrl+J is purely additive.
+func TestInputBoxCtrlJNewlineFallback(t *testing.T) {
+	t.Parallel()
+
+	b := NewInputBox()
+	bound := b.ta.KeyMap.InsertNewline.Keys()
+	if !contains(bound, "ctrl+j") {
+		t.Errorf("InsertNewline keys = %v, want to include %q (universal newline fallback)", bound, "ctrl+j")
+	}
+	// shift+enter must remain bound — the fallback is additive, not a replacement.
+	if !contains(bound, "shift+enter") {
+		t.Errorf("InsertNewline keys = %v, want to STILL include %q (primary)", bound, "shift+enter")
+	}
+
+	// Ctrl+J is the LF byte; v2 represents it as Code 'j' + ModCtrl, String()=="ctrl+j".
+	ctrlJ := tea.KeyPressMsg{Code: 'j', Mod: tea.ModCtrl}
+	if got := ctrlJ.String(); got != "ctrl+j" {
+		t.Fatalf("ctrlJ.String() = %q, want %q (v2 key representation drifted)", got, "ctrl+j")
+	}
+	if !key.Matches(ctrlJ, b.ta.KeyMap.InsertNewline) {
+		t.Errorf("ctrl+j (%q) does not match InsertNewline binding", ctrlJ.String())
+	}
+
+	// Feeding ctrl+j to the editor inserts a literal newline.
+	b.SetValue("ab")
+	before := b.ta.LineCount()
+	b.Update(ctrlJ)
+	if after := b.ta.LineCount(); after != before+1 {
+		t.Errorf("LineCount after ctrl+j = %d, want %d (newline inserted)", after, before+1)
+	}
+	if got := b.Value(); !strings.Contains(got, "\n") {
+		t.Errorf("Value() after ctrl+j = %q, want it to contain a newline", got)
+	}
+}
+
 func contains(ss []string, want string) bool {
 	for _, s := range ss {
 		if s == want {

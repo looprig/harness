@@ -314,6 +314,35 @@ func TestViewScrollbackFirstInvariant(t *testing.T) {
 	}
 }
 
+// TestViewRequestsAllKeysAsEscapeCodes pins the keyboard-enhancement request needed
+// for Shift+Enter in the composer. v2's default Kitty flag is just "disambiguate
+// escape codes" (flag 1), under which the Kitty spec keeps Enter/Tab/Backspace as
+// their legacy bytes — so Shift+Enter arrives as a plain Enter and submits instead of
+// inserting a newline. Only ReportAllKeysAsEscapeCodes (flag 8) makes the terminal
+// report a MODIFIED Enter as a distinct escape code (CSI 13;2u → KeyEnter+ModShift).
+// View() must request it. The request is harmless on terminals that don't support the
+// Kitty protocol (they ignore it); the Ctrl+J fallback covers those. Enabling it must
+// NOT disturb the scrollback-first invariant (AltScreen off, mouse off).
+func TestViewRequestsAllKeysAsEscapeCodes(t *testing.T) {
+	t.Parallel()
+
+	agent := &fakeAgent{}
+	m := New(context.Background(), agent, fakeOpen(agent), AgentBanner{})
+	m, _ = updateScreen(t, m, tea.WindowSizeMsg{Width: 80, Height: 24})
+
+	v := m.View()
+	if !v.KeyboardEnhancements.ReportAllKeysAsEscapeCodes {
+		t.Error("View().KeyboardEnhancements.ReportAllKeysAsEscapeCodes = false, want true (required for Shift+Enter to be reported as a distinct key on Kitty-protocol terminals)")
+	}
+	// The enhancement must not flip the scrollback-first invariant.
+	if v.AltScreen {
+		t.Error("View().AltScreen = true, want false (keyboard enhancements must not enable alt-screen)")
+	}
+	if v.MouseMode != tea.MouseModeNone {
+		t.Errorf("View().MouseMode = %v, want tea.MouseModeNone (keyboard enhancements must not capture the mouse)", v.MouseMode)
+	}
+}
+
 // TestViewComposesSurfaceNoViewport asserts the View is the active surface (a
 // separator rule + a bottom box), never a transcript viewport, and that committed
 // entries are NOT re-rendered into the View (they live in native scrollback). A
