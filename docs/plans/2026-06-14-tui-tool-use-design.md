@@ -2,6 +2,14 @@
 
 Date: 2026-06-14 · Status: approved (brainstorm)
 
+> **Revision 2026-06-14 (review pass 1)** resolves a review: (1) **back-to-back tool
+> batches no longer collapse** — `ToolCallStarted` commits the live segment when its
+> existing calls are all terminal, and the runner now **emits all `ToolCallStarted` for
+> a batch before executing** (so the all-terminal rule is race-free; tools-design §2d
+> amended); (2) **`/verbose` removed in favour of a `Ctrl+T` key**, and expansion
+> redefined as "all lines of the runner-capped preview" (no fictional 100-line/"full"
+> view the ~20-line event can't supply) — the runner marks truncation.
+
 ## Scope
 
 Render an agentic turn's tool calls in the TUI transcript as **children of the
@@ -22,8 +30,8 @@ in-flight TUI (`docs/plans/2026-06-13-tui-design.md`, now implemented in `tui/`)
 | Nesting structure | **Per-segment, chronological** — each assistant text segment is a row; its tool calls nest beneath it in order |
 | Data model | Event-reconstruction: nested `ToolCallView` on the assistant `DisplayMessage`, built by a live-segment state machine from the event stream (not by delivering intermediate `AIMessage`s) |
 | Result display | **Collapsed preview** — capped lines + a global expand toggle |
-| Expand UX | **Global `/verbose` toggle** (v1); per-card cursor + Enter deferred (no transcript cursor exists yet) |
-| Result data | Amend `event.ToolCallCompleted` to carry a capped `ResultPreview`; redacted on the sink path |
+| Expand UX | **Global `Ctrl+T` toggle** — collapsed (first K lines) ⇄ all lines of the (runner-capped) preview; per-card cursor + Enter deferred |
+| Result data | Amend `event.ToolCallCompleted` to carry a capped `ResultPreview` (with a truncation marker when capped); redacted on the sink path |
 
 ---
 
@@ -80,7 +88,7 @@ type liveSegment struct {
 	calls []ToolCallView
 }
 // Screen.live        liveSegment // replaces Screen.stream
-// Screen.expandTools bool        // /verbose toggle; false = collapsed previews
+// Screen.expandTools bool        // Ctrl+T toggle; false = collapsed previews
 ```
 
 No per-card `Expanded` field — the global `expandTools` covers v1 (YAGNI).
@@ -94,16 +102,31 @@ No per-card `Expanded` field — the global `expandTools` covers v1 (YAGNI).
 | Event | Action |
 |---|---|
 | `TokenDelta` (`*content.TextChunk`) | If `live.calls` is non-empty (a batch ran and new narration is starting), **commit** `live` as `RoleAssistant{Blocks:[TextBlock(live.text)], ToolCalls:live.calls}` and reset `live`. Then `live.text += chunk.Text`. (Other chunk types still skipped.) |
-| `ToolCallStarted` | Append `ToolCallView{CallID, ToolName, Summary, Status:ToolRunning}` to `live.calls`. The text streamed so far is this batch's narration. |
+| `ToolCallStarted` | **If `live.calls` is non-empty and every existing call is terminal** (a batch finished and a new one starts with *no narration between* — `tool batch → tool batch`), **commit** `live` and reset first. Then append `ToolCallView{CallID, ToolName, Summary, Status:ToolRunning}` to `live.calls`. The text streamed so far is this batch's narration. |
 | `ToolCallCompleted` | Find the view by `CallID` in `live.calls` (fallback: most recent committed segment); set `Status` (`ToolOK`/`ToolError` from `IsError`) and `Result` from the capped preview. |
 | `TurnDone` | Commit `live` (final text; usually no calls); clear `live`. Guard nil `Message`. |
 | `TurnFailed` | Commit `live` if it has text or calls (keep completed tool work visible), then append `RoleError` (`ev.Err`). |
 | `TurnInterrupted` | Commit `live` (partial text + calls; any still-`ToolRunning` card → `ToolCancelled`), then the `RoleInterrupted` tombstone. |
 
-**Ordering guarantee:** a tool batch fully completes before the next iteration's text
-streams (the loop re-streams only after `RunBatch` returns), so every
-`ToolCallCompleted` lands while its view is still in `live.calls` — the `CallID` match
-is reliable. The fallback lookup in committed segments is defensive only.
+**Two boundary signals, both deterministic:** a new segment starts either when
+narration text arrives after a batch (the `TokenDelta` rule) **or** when a new batch
+starts with no narration (the `ToolCallStarted` all-terminal rule). Together they
+correctly split `text→tool→tool→text→done` *and* `text→tool→tool(no text)→text→done`.
+
+**Runner-ordering requirement (tools-design amendment):** the all-terminal rule is
+only race-free if, within one batch, every `ToolCallStarted` precedes every
+`ToolCallCompleted`. With parallel goroutines each emitting their own start, a fast
+call could otherwise complete before a sibling's start and falsely trip "all
+terminal" mid-batch. So **the runner emits all `ToolCallStarted` for the approved
+batch *before* executing any call** (tools-design §2d). This also future-proofs serial
+(`Sequential`) tools and shows all pending cards at once. Given that, within a batch
+no prior call is ever terminal when a new start arrives, so "all terminal" fires only
+across batches.
+
+**`ToolCallCompleted` correlation:** a batch fully completes before the next
+iteration streams (the loop re-streams only after `RunBatch` returns), so every
+`Completed` lands while its view is still in `live.calls` — the `CallID` match is
+reliable; the committed-segment fallback is defensive only.
 
 **Commit = append** to `messages`, so the existing queue/`DisplayIndex` bookkeeping
 (`tui/messages.go`, `tui/screen.go`) is unaffected: queued `RoleUser` rows keep their
@@ -123,7 +146,7 @@ markdown text, then each `ToolCallView` as an indented child:
   └ ReadFile  config.yaml                 ✓
     port: 8080
     host: 0.0.0.0
-    … 14 more lines  (/verbose for full)
+    … 14 more lines  (Ctrl+T)
 
 ● Now I'll fix the port.
   └ EditFile  config.yaml                 ✓
@@ -132,18 +155,20 @@ markdown text, then each `ToolCallView` as an indented child:
 - **Glyph by `Status`:** `ToolRunning`→`⋯`, `ToolOK`→`✓`, `ToolError`→`✗`,
   `ToolCancelled`→`⊘`. (A tick-driven spinner for running is an optional enhancement;
   v1 uses the static `⋯`.)
-- **Preview:** when `!expandTools`, show the first `K` lines (default 6) + `… N more
-  lines (/verbose for full)` if truncated; when `expandTools`, show all up to a hard
-  cap (100 lines) to protect the viewport. Error results always show (short +
-  important); empty result → `(no output)`.
+- **Preview:** the renderer's `Result` is the runner-capped preview (≤ `ResultPreview`
+  cap; the runner appends a truncation marker line if it capped). When `!expandTools`,
+  show the first `K` lines (default 6) + `… N more lines (Ctrl+T)` if there are more;
+  when `expandTools`, show **all lines of the preview** (no separate TUI line cap — the
+  runner already bounds it). The two caps are aligned: the TUI never promises more than
+  the event carries; output beyond the runner cap shows the runner's truncation marker.
+  Error results always show (short + important); empty result → `(no output)`.
 - **Layout:** cards indent 2, result lines 4; tree connector `└`/`├`; new
   `styles.ToolCallStyle` and `styles.ToolResultStyle` (dim). Width-aware wrap via the
   existing helpers. A segment with empty narration renders a bare `●` + its cards.
 
-**`/verbose` toggle:** add `{"/verbose", "show full tool output"}` to `slashCmds`
-(`tui/`); its dispatch flips `Screen.expandTools` and refreshes history. Reuses the
-existing slash infrastructure (`/clear`, `/help`); appears in `/help`. A dedicated
-key-binding is a trivial later add. (Per-card cursor + Enter-expand is deferred — it
+**`Ctrl+T` toggle:** a `tea.KeyMsg` for `ctrl+t` flips `Screen.expandTools` and
+refreshes history (`tui/screen.go` `handleKey`). No slash command (`/verbose` removed —
+not needed). Works in any status. (Per-card cursor + Enter-expand is deferred — it
 needs a transcript-selection cursor the TUI doesn't have yet.)
 
 ---
@@ -155,27 +180,37 @@ carry it today. This design **amends `2026-06-14-tools-design.md`** (kept consis
 
 - **§5b** `event.ToolCallCompleted{CallID uuid.UUID; IsError bool; ResultPreview string}`
   — the runner (§2d) fills `ResultPreview` from `flattenToText(result.Content)`,
-  **capped** (~2 KiB / 20 lines, with a truncation marker). Full-fidelity on the TUI
-  stream.
+  **capped** (~2 KiB / 20 lines); when it caps it appends a truncation marker line
+  (e.g. `… output truncated`). Full-fidelity on the TUI stream.
+- **§2d runner ordering** — the runner **emits all `ToolCallStarted` for the approved
+  batch before executing any call**, so within a batch every start precedes every
+  completion (makes the TUI's all-terminal segment-boundary rule race-free; §2).
 - **§5b sink table** — `ToolCallCompleted` joins the `Redactable.SinkProjection`:
   the sink copy **drops `ResultPreview`** (keeps `CallID, IsError`). `ResultPreview` is
   tool *output* (file contents, Bash output, possible secrets/PII), so this extends the
   rule from "tool *arguments* never reach a sink" to "tool *output* never reaches a
   sink." The TUI stream keeps the preview.
 
-The capping at the runner bounds both the event size and the TUI's `Result` slice; the
-TUI applies its own display cap (`K` lines / 100-line expanded max) on top.
+The single runner cap bounds the event size, the TUI's `Result` slice, and the
+expanded view — there is no separate, larger TUI cap, so `Ctrl+T` never promises lines
+the event doesn't carry.
 
 ---
 
 ## §5 — Edge cases
 
 - **Tool call with no narration** — `live.text` empty → render a bare `●` + the cards.
-- **Parallel batch** — multiple `ToolCallStarted` before any `Completed`; all attach as
-  children of the same segment; each `Completed` updates its card by `CallID`.
+- **Parallel batch** — multiple `ToolCallStarted` before any `Completed` (the runner
+  emits all starts up front, §4); all attach as children of the same segment; each
+  `Completed` updates its card by `CallID`.
+- **Back-to-back tool batches with no narration** (`tool→tool`) — the new batch's first
+  `ToolCallStarted` finds `live.calls` all-terminal → commits the prior segment first,
+  so each batch becomes its own (possibly bare-`●`) segment (§2). Without the runner's
+  emit-all-starts-up-front guarantee this would race; with it, it's deterministic.
 - **Interrupt mid-tool** — committed segment shows the running card as `ToolCancelled`;
   tombstone follows.
-- **Empty / truncated result** — `(no output)` / `… N more lines`.
+- **Empty / truncated result** — `(no output)` / `… N more lines (Ctrl+T)` / the
+  runner's `… output truncated` marker.
 - **`TurnFailed{ToolLimitError}`** — the loop rolls back its context (tools design §2a),
   but the TUI keeps its display: the committed segments + a `RoleError` show what ran
   before the cap. (Display ≠ model context, per the TUI design.)
@@ -188,11 +223,14 @@ TUI applies its own display cap (`K` lines / 100-line expanded max) on top.
   collapsed vs `expandTools`; truncation marker; empty/`(no output)`; bare-`●` segment;
   width wrap.
 - **state machine** (drive `handleEvent` with synthetic events) — `text→tool→text→done`
-  produces two committed assistant segments with the right children; parallel batch
-  (two `ToolCallStarted` then two `ToolCallCompleted` by `CallID`); `Completed` updates
-  the right card; interrupt mid-tool → `ToolCancelled` + tombstone; `TurnFailed` commits
+  produces two committed segments with the right children; **`text→tool→tool(no
+  text)→text→done` produces three segments** (the all-terminal rule splits the
+  back-to-back batches, not one collapsed segment); parallel batch (two
+  `ToolCallStarted` then two `ToolCallCompleted` by `CallID`); `Completed` updates the
+  right card; interrupt mid-tool → `ToolCancelled` + tombstone; `TurnFailed` commits
   live + `RoleError`; queue indices survive segment commits.
-- **/verbose** — toggles `expandTools`; `/help` lists it.
+- **Ctrl+T** — toggles `expandTools` (collapsed first-K ⇄ all preview lines); works in
+  any status.
 - **redaction** (in the tools impl) — a fake `EventSink` receives `ToolCallCompleted`
   with **no** `ResultPreview`; the stream keeps it; runner caps the preview.
 

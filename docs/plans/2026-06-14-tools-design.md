@@ -547,7 +547,10 @@ keeps draining.
 fills `ResultPreview` from `flattenToText(result.Content)` **capped** (~2 KiB / 20
 lines, truncation marked), for the TUI's collapsed result preview
 (`docs/plans/2026-06-14-tui-tool-use-design.md`); it is **stream-only**, dropped on the
-sink path (see the redaction table) since tool output may hold secrets/PII. **`Summary` is a redacted, capped
+sink path (see the redaction table) since tool output may hold secrets/PII. **The
+runner emits all `ToolCallStarted` for the approved batch *before* executing any call**
+(so within a batch every start precedes every completion) — this lets the TUI group a
+batch into one assistant segment race-free, and shows all pending cards at once. **`Summary` is a redacted, capped
 safe string — never raw `ArgsJSON`** (which can hold write-file contents, `Fetch`
 auth headers/cookies, a `Bash` command with an inline token, or PII; CLAUDE.md: *log
 security events, not secrets*). Tools supply it via an optional
