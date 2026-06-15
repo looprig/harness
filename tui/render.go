@@ -244,7 +244,7 @@ func renderRow(m DisplayMessage, expand bool, width int) string {
 	case RoleError:
 		return styles.ErrorStyle.Render(firstText(m.Blocks))
 	case RoleInterrupted:
-		return styles.InterruptedStyle.Render("└─ interrupted")
+		return styles.InterruptedStyle.Render(interruptedTombstone)
 	default:
 		return ""
 	}

@@ -1,10 +1,12 @@
 package tui
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/inventivepotter/urvi/internal/agent/loop/event"
 	"github.com/inventivepotter/urvi/internal/content"
+	"github.com/inventivepotter/urvi/internal/tool"
 	"github.com/inventivepotter/urvi/internal/uuid"
 )
 
@@ -597,3 +599,270 @@ func TestTranscriptTerminals(t *testing.T) {
 type errBoom struct{}
 
 func (errBoom) Error() string { return "boom" }
+
+// TestCommitUser locks the user-message commit: CommitUser appends exactly one
+// kindUser entry carrying the submitted blocks with a fresh, nonzero, stable ID;
+// a second CommitUser allocates a distinct ID; and empty blocks still commit one
+// user entry (the submit path validates emptiness upstream, not here).
+func TestCommitUser(t *testing.T) {
+	tests := []struct {
+		name   string
+		blocks [][]content.Block
+		want   func(t *testing.T, m transcriptModel)
+	}{
+		{
+			name:   "single user message commits one entry with a nonzero ID",
+			blocks: [][]content.Block{{&content.TextBlock{Text: "hello there"}}},
+			want: func(t *testing.T, m transcriptModel) {
+				if len(m.committed) != 1 {
+					t.Fatalf("committed = %d, want 1", len(m.committed))
+				}
+				e := m.committed[0]
+				if e.Kind != kindUser {
+					t.Errorf("Kind = %v, want kindUser", e.Kind)
+				}
+				if e.ID == 0 {
+					t.Errorf("entry ID = 0, want nonzero stable ID")
+				}
+				if len(e.Blocks) != 1 || blockText(e.Blocks[0]) != "hello there" {
+					t.Errorf("Blocks = %#v, want one TextBlock %q", e.Blocks, "hello there")
+				}
+			},
+		},
+		{
+			name: "two user messages get distinct stable IDs",
+			blocks: [][]content.Block{
+				{&content.TextBlock{Text: "first"}},
+				{&content.TextBlock{Text: "second"}},
+			},
+			want: func(t *testing.T, m transcriptModel) {
+				if len(m.committed) != 2 {
+					t.Fatalf("committed = %d, want 2", len(m.committed))
+				}
+				if m.committed[0].ID == m.committed[1].ID {
+					t.Errorf("user entry IDs not distinct: both %d", m.committed[0].ID)
+				}
+				if m.committed[0].ID == 0 || m.committed[1].ID == 0 {
+					t.Errorf("user entry IDs must be nonzero: %d, %d", m.committed[0].ID, m.committed[1].ID)
+				}
+			},
+		},
+		{
+			name:   "empty blocks still commit a single user entry",
+			blocks: [][]content.Block{{}},
+			want: func(t *testing.T, m transcriptModel) {
+				if len(m.committed) != 1 {
+					t.Fatalf("committed = %d, want 1", len(m.committed))
+				}
+				if m.committed[0].Kind != kindUser {
+					t.Errorf("Kind = %v, want kindUser", m.committed[0].Kind)
+				}
+				if m.committed[0].ID == 0 {
+					t.Errorf("entry ID = 0, want nonzero stable ID")
+				}
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			var m transcriptModel
+			for _, b := range tt.blocks {
+				m = m.CommitUser(b)
+			}
+			tt.want(t, m)
+		})
+	}
+}
+
+// TestCommitUserDoesNotDisturbLive locks that committing a user message neither
+// reads nor resets the in-progress live segment: a user message can be queued
+// mid-turn (Running) without truncating the streaming assistant output.
+func TestCommitUserDoesNotDisturbLive(t *testing.T) {
+	t.Parallel()
+	var m transcriptModel
+	m = m.ApplyEvent(event.TurnStarted{})
+	m = m.ApplyEvent(textChunk("streaming so far"))
+	m = m.CommitUser([]content.Block{&content.TextBlock{Text: "queued msg"}})
+	if m.live.Text != "streaming so far" {
+		t.Errorf("live.Text = %q, want preserved %q", m.live.Text, "streaming so far")
+	}
+	if !m.live.active {
+		t.Errorf("live.active = false, want true (CommitUser must not end the turn)")
+	}
+	if len(m.committed) != 1 || m.committed[0].Kind != kindUser {
+		t.Fatalf("committed = %#v, want one kindUser entry", m.committed)
+	}
+}
+
+// TestTranscriptPromptCommit covers the prompt-open boundary in ApplyEvent: a
+// PermissionRequested / UserInputRequested commits any pending live prose FIRST
+// (append-only ordering), then appends a single kindPromptRecord entry carrying
+// the FULL prompt context (permission: ToolName + Description; user input:
+// Question + ALL Choices). The live segment is NOT reset — the turn continues
+// while the gate is pending.
+func TestTranscriptPromptCommit(t *testing.T) {
+	tests := []struct {
+		name   string
+		events []event.Event
+		want   func(t *testing.T, m transcriptModel)
+	}{
+		{
+			name: "PermissionRequested commits pending prose then a promptRecord with tool+description",
+			events: []event.Event{
+				event.TurnStarted{},
+				textChunk("I'll run a command."),
+				event.PermissionRequested{
+					CallID:  callID(1),
+					Request: tool.BashRequest{Command: "rm -rf build"},
+				},
+			},
+			want: func(t *testing.T, m transcriptModel) {
+				if len(m.committed) != 2 {
+					t.Fatalf("committed = %d, want 2 (prose, promptRecord)", len(m.committed))
+				}
+				if m.committed[0].Kind != kindAssistant {
+					t.Errorf("committed[0].Kind = %v, want kindAssistant (prose committed first)", m.committed[0].Kind)
+				}
+				rec := m.committed[1]
+				if rec.Kind != kindPromptRecord {
+					t.Fatalf("committed[1].Kind = %v, want kindPromptRecord", rec.Kind)
+				}
+				if rec.ID == 0 {
+					t.Errorf("promptRecord ID = 0, want nonzero stable ID")
+				}
+				if rec.Prompt == nil {
+					t.Fatal("promptRecord Prompt context is nil")
+				}
+				if rec.Prompt.Kind != promptPermission {
+					t.Errorf("Prompt.Kind = %v, want promptPermission", rec.Prompt.Kind)
+				}
+				if rec.Prompt.ToolName != "Bash" {
+					t.Errorf("Prompt.ToolName = %q, want %q", rec.Prompt.ToolName, "Bash")
+				}
+				if rec.Prompt.Description != "rm -rf build" {
+					t.Errorf("Prompt.Description = %q, want %q", rec.Prompt.Description, "rm -rf build")
+				}
+				// the full context must survive into the rendered scrollback record.
+				out := strings.Join(renderEntry(rec, false, 80), "\n")
+				if !strings.Contains(stripANSI(out), "Bash") || !strings.Contains(stripANSI(out), "rm -rf build") {
+					t.Errorf("rendered promptRecord = %q, want it to contain ToolName + Description", stripANSI(out))
+				}
+				// live is NOT reset: the turn continues while the gate is pending.
+				if !m.live.active {
+					t.Errorf("live.active = false, want true (prompt does not end the turn)")
+				}
+			},
+		},
+		{
+			name: "PermissionRequested on UnknownRequest records the tool name and summary",
+			events: []event.Event{
+				event.TurnStarted{},
+				event.PermissionRequested{
+					CallID:  callID(2),
+					Request: tool.UnknownRequest{Tool: "Mystery", Summary: "do a thing"},
+				},
+			},
+			want: func(t *testing.T, m transcriptModel) {
+				if len(m.committed) != 1 {
+					t.Fatalf("committed = %d, want 1 (promptRecord only; no pending prose)", len(m.committed))
+				}
+				rec := m.committed[0]
+				if rec.Kind != kindPromptRecord || rec.Prompt == nil {
+					t.Fatalf("committed[0] = %+v, want a kindPromptRecord with Prompt context", rec)
+				}
+				if rec.Prompt.ToolName != "Mystery" || rec.Prompt.Description != "do a thing" {
+					t.Errorf("Prompt = {%q,%q}, want {Mystery, do a thing}", rec.Prompt.ToolName, rec.Prompt.Description)
+				}
+			},
+		},
+		{
+			name: "PermissionRequested with nil Request records empty context without panicking",
+			events: []event.Event{
+				event.TurnStarted{},
+				event.PermissionRequested{CallID: callID(3), Request: nil},
+			},
+			want: func(t *testing.T, m transcriptModel) {
+				if len(m.committed) != 1 {
+					t.Fatalf("committed = %d, want 1", len(m.committed))
+				}
+				rec := m.committed[0]
+				if rec.Kind != kindPromptRecord || rec.Prompt == nil {
+					t.Fatalf("committed[0] = %+v, want a kindPromptRecord with (empty) Prompt context", rec)
+				}
+				if rec.Prompt.ToolName != "" || rec.Prompt.Description != "" {
+					t.Errorf("Prompt = {%q,%q}, want both empty for nil Request", rec.Prompt.ToolName, rec.Prompt.Description)
+				}
+			},
+		},
+		{
+			name: "UserInputRequested commits prose then a promptRecord with question + all choices",
+			events: []event.Event{
+				event.TurnStarted{},
+				textChunk("Need a decision."),
+				event.UserInputRequested{
+					CallID:   callID(4),
+					Question: "Which source?",
+					Choices:  []string{"alpha", "beta", "gamma"},
+				},
+			},
+			want: func(t *testing.T, m transcriptModel) {
+				if len(m.committed) != 2 {
+					t.Fatalf("committed = %d, want 2 (prose, promptRecord)", len(m.committed))
+				}
+				if m.committed[0].Kind != kindAssistant {
+					t.Errorf("committed[0].Kind = %v, want kindAssistant", m.committed[0].Kind)
+				}
+				rec := m.committed[1]
+				if rec.Kind != kindPromptRecord || rec.Prompt == nil {
+					t.Fatalf("committed[1] = %+v, want a kindPromptRecord with Prompt context", rec)
+				}
+				if rec.Prompt.Kind != promptUserInput {
+					t.Errorf("Prompt.Kind = %v, want promptUserInput", rec.Prompt.Kind)
+				}
+				if rec.Prompt.Question != "Which source?" {
+					t.Errorf("Prompt.Question = %q, want %q", rec.Prompt.Question, "Which source?")
+				}
+				if len(rec.Prompt.Choices) != 3 {
+					t.Fatalf("Prompt.Choices = %d, want 3", len(rec.Prompt.Choices))
+				}
+				// every choice must survive into the rendered scrollback record.
+				out := stripANSI(strings.Join(renderEntry(rec, false, 80), "\n"))
+				for _, c := range []string{"Which source?", "alpha", "beta", "gamma"} {
+					if !strings.Contains(out, c) {
+						t.Errorf("rendered promptRecord = %q, want it to contain %q", out, c)
+					}
+				}
+			},
+		},
+		{
+			name: "UserInputRequested with no choices records a free-text question",
+			events: []event.Event{
+				event.TurnStarted{},
+				event.UserInputRequested{CallID: callID(5), Question: "free answer?", Choices: nil},
+			},
+			want: func(t *testing.T, m transcriptModel) {
+				if len(m.committed) != 1 {
+					t.Fatalf("committed = %d, want 1", len(m.committed))
+				}
+				rec := m.committed[0]
+				if rec.Kind != kindPromptRecord || rec.Prompt == nil {
+					t.Fatalf("committed[0] = %+v, want a kindPromptRecord", rec)
+				}
+				if rec.Prompt.Question != "free answer?" || len(rec.Prompt.Choices) != 0 {
+					t.Errorf("Prompt = {%q, %d choices}, want {free answer?, 0}", rec.Prompt.Question, len(rec.Prompt.Choices))
+				}
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			var m transcriptModel
+			for _, ev := range tt.events {
+				m = m.ApplyEvent(ev)
+			}
+			tt.want(t, m)
+		})
+	}
+}

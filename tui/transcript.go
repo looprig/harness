@@ -21,9 +21,26 @@ const (
 	kindUser entryKind = iota
 	kindAssistant
 	kindTool
+	kindPromptRecord
 	kindError
 	kindInterrupted
 )
+
+// promptContext is the FULL prompt payload a kindPromptRecord entry commits to
+// scrollback when a gate opens: the copyable command/diff (permission) or the
+// question + every choice (user input). It is the append-only SCROLLBACK record —
+// distinct from the interaction layer's compact bottom-box control (prompt in
+// prompt.go), which carries selection state and is redrawn every frame. Kind
+// reuses the prompt.go promptKind so the renderer dispatches the same way. A
+// permission record uses ToolName/Description; a user-input record uses
+// Question/Choices.
+type promptContext struct {
+	Kind        promptKind
+	ToolName    string   // promptPermission: approval header ("Approve <ToolName>?")
+	Description string   // promptPermission: copyable body (command / diff / url)
+	Question    string   // promptUserInput: the AskUser question
+	Choices     []string // promptUserInput: every offered choice, in order
+}
 
 // entry is one committed (finalized) row of the transcript. It stores the minimal
 // data needed to render the row later: its stable ID, its kind, and the content
@@ -35,6 +52,10 @@ type entry struct {
 	Kind   entryKind
 	Blocks []content.Block
 	Calls  []ToolCallView
+	// Prompt carries the FULL prompt context for a kindPromptRecord entry; it is
+	// nil for every other kind. Kept as a pointer so non-prompt entries pay no
+	// per-entry cost and a nil here is an unambiguous "not a prompt record".
+	Prompt *promptContext
 }
 
 // liveSeg is the in-progress assistant segment for the current turn: the streamed
@@ -72,9 +93,13 @@ type transcriptModel struct {
 // model. TurnStarted begins/keeps a live assistant segment; TokenDelta routes
 // *content.TextChunk → live.Text and *content.ThinkingChunk → live.Thinking;
 // TurnDone commits a non-empty live segment. ToolCallStarted/ToolCallCompleted
-// drive the per-call card state machine, and TurnInterrupted/TurnFailed are the
-// terminals. It returns ONLY the next transcriptModel — no uiAction; prompt
-// clearing on terminals is the interactionModel's job, not the transcript's.
+// drive the per-call card state machine. PermissionRequested/UserInputRequested
+// are prompt-open boundaries: each commits any pending prose, then commits the
+// FULL prompt context as a kindPromptRecord entry (the live segment is NOT reset —
+// the turn continues while the gate is pending). TurnInterrupted/TurnFailed are
+// the terminals. It returns ONLY the next transcriptModel — no uiAction; prompt
+// clearing on terminals and active-surface control are the interactionModel's job,
+// not the transcript's.
 func (m transcriptModel) ApplyEvent(ev event.Event) transcriptModel {
 	switch ev := ev.(type) {
 	case event.TurnStarted:
@@ -85,6 +110,10 @@ func (m transcriptModel) ApplyEvent(ev event.Event) transcriptModel {
 		m.toolStarted(ev)
 	case event.ToolCallCompleted:
 		m.toolCompleted(ev)
+	case event.PermissionRequested:
+		m.permissionRequested(ev)
+	case event.UserInputRequested:
+		m.userInputRequested(ev)
 	case event.TurnDone:
 		m.commitLive()
 	case event.TurnInterrupted:
@@ -93,6 +122,56 @@ func (m transcriptModel) ApplyEvent(ev event.Event) transcriptModel {
 		m.turnFailed(ev)
 	}
 	return m
+}
+
+// CommitUser appends the user's submitted message as one kindUser entry with a
+// fresh stable ID and returns the next model. Blocks are the same []content.Block
+// the submit path builds (buildBlocks) and queues — text plus any @attachments.
+// It does NOT touch the live segment: a message submitted mid-turn (queued while
+// Running) must land in scrollback without truncating the in-progress assistant
+// output. An empty Blocks slice still commits one entry — emptiness is rejected
+// upstream at the input boundary, not here.
+func (m transcriptModel) CommitUser(blocks []content.Block) transcriptModel {
+	m.nextID++
+	m.committed = append(m.committed, entry{ID: m.nextID, Kind: kindUser, Blocks: blocks})
+	return m
+}
+
+// permissionRequested is the permission-gate prompt-open boundary: it commits any
+// pending live prose FIRST (so the narration that precedes the gate lands ahead of
+// the prompt record in append-only order), then commits the FULL permission
+// context (ToolName + Description, read off the sealed request) as a
+// kindPromptRecord entry. A nil Request yields an empty-context record rather than
+// a panic (fail-visible). live is intentionally NOT reset — the turn continues
+// while the gate is pending.
+func (m *transcriptModel) permissionRequested(ev event.PermissionRequested) {
+	m.commitProse()
+	ctx := promptContext{Kind: promptPermission}
+	if ev.Request != nil {
+		ctx.ToolName = ev.Request.ToolName()
+		ctx.Description = ev.Request.Description()
+	}
+	m.commitPrompt(ctx)
+}
+
+// userInputRequested is the AskUser prompt-open boundary: it commits any pending
+// live prose FIRST, then commits the FULL user-input context (Question + ALL
+// Choices) as a kindPromptRecord entry. Choices are copied so a later mutation of
+// the event's slice cannot reach the committed record. live is NOT reset.
+func (m *transcriptModel) userInputRequested(ev event.UserInputRequested) {
+	m.commitProse()
+	ctx := promptContext{Kind: promptUserInput, Question: ev.Question}
+	if len(ev.Choices) > 0 {
+		ctx.Choices = append([]string(nil), ev.Choices...)
+	}
+	m.commitPrompt(ctx)
+}
+
+// commitPrompt appends one kindPromptRecord entry carrying ctx with a fresh stable
+// ID. It is the shared tail of the two prompt-open boundaries.
+func (m *transcriptModel) commitPrompt(ctx promptContext) {
+	m.nextID++
+	m.committed = append(m.committed, entry{ID: m.nextID, Kind: kindPromptRecord, Prompt: &ctx})
 }
 
 // applyChunk routes one streamed chunk into the live segment: text accumulates
