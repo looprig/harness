@@ -77,6 +77,16 @@ Date: 2026-06-14 · Status: approved (brainstorm)
 > `"prefix": true` opt-in (no `go test` → `go test; curl…`) (§3c); (4) **assembled
 > tool calls are validated** (ID/Name/valid-JSON) before append — invalid → `Input`
 > sanitized to `{}` + tool-result error, never poisoned history (§2b).
+>
+> **Revision 2026-06-14 (review pass 7)** resolves a seventh review: (1) **runaway
+> guard** — `MaxToolIterations`/`MaxToolCallsPerTurn` bound the agentic loop, exceed →
+> controlled `TurnFailed{ToolLimitError}` (§2a, §3b); (2) test-section precedence
+> corrected to **deny-beats-allow** (§5e); (3) **Fetch persisted match = method +
+> scheme + host** (+ opt-in path-prefix), so a GET grant can't approve later POSTs
+> (§3c); (4) **policy-store fs hardening** — `0700`/`0600`, `O_EXCL\|O_NOFOLLOW` temp,
+> reject symlinked policy-path components, reject group/world-writable files (§3c);
+> (5) clarified `Cache[T any]` is the permitted type-parameter idiom (not banned
+> `any`) and is required by the layering; concrete alternative noted (§3d).
 
 ## Scope
 
@@ -174,18 +184,30 @@ calling tools:
 
 ```
 append user message to msgs; emit TurnStarted
+iters, calls := 0, 0
 for {
     req := llm.Request{Model: cfg.Model, Messages: msgs, Tools: toolDefs(cfg.Tools.Registry)}
     stream := client.Stream(ctx, req)
     // accumulate: TextChunk/ThinkingChunk → emit TokenDelta (unchanged)
-    //             ToolUseChunk           → fold by Index into []ToolUseBlock
+    //             ToolUseChunk           → fold by Index into []ToolUseBlock (validate, §2b)
     assemble AIMessage{Blocks: [thinking…, text, toolUse…]}; append to msgs
     if no tool_use blocks { emit TurnDone(msg); return }
+    iters++; calls += len(toolUseBlocks)
+    if iters > MaxToolIterations || calls > MaxToolCallsPerTurn {
+        emit TurnFailed(&ToolLimitError{Iterations: iters, Calls: calls}); return   // controlled stop
+    }
     results := runner.RunBatch(ctx, toolUseBlocks, cfg.Tools, gateReg, emit)
     for each result: append content.ToolMessage{ToolUseID, Blocks: flattenToText(result.Content)} to msgs
     if any result.Terminate { emit TurnDone(lastAIMessage); return }
 }
 ```
+
+**Runaway guard.** `MaxToolIterations` (LLM↔tool round-trips) and
+`MaxToolCallsPerTurn` (total executions) bound the loop so a stuck model can't run
+auto-approved tools forever. Exceeding either ends the turn with a controlled
+`event.TurnFailed{Err: &ToolLimitError{…}}` (a typed loop error) — the assistant/tool
+exchange so far stays in history (it completed cleanly); the turn just stops looping.
+Defaults (25 / 100) are applied by `loop.New` when the `ToolSet` fields are zero.
 
 - `toolDefs` maps each registered tool's `Info(ctx)` → `llm.Tool{Name,
   Description, Schema}`. `ToolInfo.Schema` is `json.RawMessage` (1:1 with
@@ -542,6 +564,9 @@ type ToolSet struct {
     Permission  PermissionGate
     Registry    []tool.InvokableTool // runner looks up by Info().Name, builds toolDefs
     Middlewares []tool.ToolMiddleware
+    // Runaway guards (loop.New applies defaults when zero):
+    MaxToolIterations   int // max LLM↔tool round-trips per turn (default 25)
+    MaxToolCallsPerTurn int // max total tool executions per turn (default 100)
 }
 
 // ReadGuard is the narrow read-side policy the read tools enforce themselves:
@@ -608,6 +633,15 @@ records are not first-match-wins across allow/deny: **a matching `deny` always w
 over a matching `allow`** (scan all records from both files; any `deny` → deny), so a
 user-level `~/.urvi/approvals.json` deny can't be undercut by a workspace allow.
 
+**Policy-store filesystem hardening.** The store is security-sensitive, so `Grant`
+and the loader treat it strictly: directories (`~/.urvi`, `~/.urvi/workspaces/<hash>`)
+are created `0700`, approval files `0600`; the temp file is opened
+`O_CREATE|O_EXCL|O_WRONLY|O_NOFOLLOW` at `0600` before the atomic `Rename`; and a
+**symlinked path component anywhere in the policy path is rejected** (don't follow a
+symlinked `~/.urvi` or `workspaces/<hash>`). The loader rejects a file that is not a
+regular file or is group/world-writable. (This is the store's *own* hardening, distinct
+from the workspace `containedPath` rules.)
+
 **Containment must resolve symlinks**, not just `Clean`+prefix — a path *inside*
 the workspace can be a symlink to `/etc`, `~/.ssh`, or another repo. `containedPath`
 (used by `ReadFile`, `WriteFile`, `EditFile`, `Glob`, `Grep`, and any tool with a
@@ -649,14 +683,20 @@ the threat model ever changes (e.g. a shared/multi-tenant workspace).
   grant approves *only* that command, not arbitrary suffixes. A prefix grant is the
   hand-edited `"prefix": true` opt-in only. (Still gated behind hard-deny prefixes;
   see the Bash security note.)
-- **Fetch** matches on the **normalized host** — `strings.ToLower(u.Hostname())`
-  (`Hostname()`, *not* `u.Host`, so the **port is excluded**), then IDNA-normalized to
-  ASCII/punycode (`golang.org/x/net/idna.Lookup.ToASCII`; same `x/net` module as the
-  approved `x/net/html` — a non-normalizable host is rejected) so a unicode homograph
-  can't slip past. Matching is **exact host equality** or a leading-dot suffix rule
-  (`.example.com` matches `api.example.com`) — **never substring/prefix**, so
-  `example.com` does *not* match `example.com.evil.com`. Scheme must be `https`
-  unless the record explicitly encodes `http://`.
+- **Fetch** match grammar is **`<METHOD> <scheme>://<host>[<path-prefix>]`** — host
+  alone is too coarse for a method/body-capable tool (a benign `GET` grant must not
+  auto-approve later `POST`s to the same host). All three dimensions are matched:
+  - **method** — exact (`GET`/`POST`); a grant records the approved method.
+  - **scheme** — exact; defaults to `https` (an `http://` grant is explicit).
+  - **host** — `strings.ToLower(u.Hostname())` (`Hostname()`, *not* `u.Host`, so the
+    **port is excluded**), IDNA-normalized to punycode
+    (`golang.org/x/net/idna.Lookup.ToASCII`; non-normalizable host rejected); **exact
+    equality or a leading-dot suffix** (`.example.com` matches `api.example.com`),
+    **never substring/prefix**, so `example.com` ≠ `example.com.evil.com`.
+  - **path-prefix** — matched **only if present** in the record (explicit opt-in);
+    absent = any path on that scheme+host+method.
+  e.g. `"GET https://.github.com"` approves GETs to any `*.github.com` over https, but
+  not a POST and not `http://`.
 - **WebSearch** ignores `Match` (a grant is tool-level; the query is not a boundary).
 
 ```go
@@ -690,7 +730,7 @@ type ApprovalsFile struct { Version int `json:"version"`; Approvals []ApprovalRe
 // On disk (effect is a string; Bash match is the exact normalized command):
 //   { "version": 1, "approvals": [
 //       {"tool": "WriteFile", "match": "src/**",      "effect": "allow"},
-//       {"tool": "Fetch",     "match": ".github.com", "effect": "allow"},
+//       {"tool": "Fetch",     "match": "GET https://.github.com", "effect": "allow"},
 //       {"tool": "Bash",      "match": "go test ./...", "effect": "allow"} ] }
 
 type PermissionPolicy struct {
@@ -738,6 +778,18 @@ func (c *Cache[T]) Load(content []byte) (T, error) // sha256(content)-keyed; re-
 
 Pure stdlib (`crypto/sha256`, `sync`); concurrency-safe. `PermissionChecker` holds
 two instances (workspace + user approvals files).
+
+**On `Cache[T any]` and the no-`any` rule.** `[T any]` here is a *type-parameter
+constraint* (the unconstrained-type-parameter idiom), **not** the banned dynamic
+`any`/`interface{}` value flowing through business logic — which is what CLAUDE.md
+prohibits. It matches existing precedent in the tree (`llm.StreamReader[T any]`,
+`registry.Registry[T any]`) and the ruling already made in the TUI design doc. The
+generic also *required* by the layering: a concrete `ApprovalsCache` here would force
+`internal/hashcache` to import `ApprovalsFile` from `tools/` — an import cycle
+(`tools/` → `internal/hashcache`). If you prefer maximum simplicity over reuse, the
+alternative is a concrete unexported `approvalsCache` living *in* `tools/` (no
+separate package); this design keeps the generic `internal/hashcache` as a domain-free
+reusable utility, per the approved "build hashcache" decision.
 
 ---
 
@@ -918,8 +970,10 @@ The pixel-level work is a follow-up TUI-update doc, since that TUI is mid-flight
 - `PermissionChecker` — **fail-secure ordering**: a `HardDeny`-matching path/command
   is denied even when a tool's `EffectChecker`, a `HardApprove "*"`, or a persisted
   approval would auto-approve it. Plus containment escape, hard-deny globs,
-  persisted-approval precedence (ws over user), and `Grant` (ScopeSession appends
-  in-memory; ScopeWorkspace writes the file and the next `Check` sees it).
+  **deny-beats-allow precedence** (any matching `deny` from *either* the workspace or
+  user file wins; otherwise any matching `allow` grants), and `Grant` (ScopeSession
+  appends in-memory; ScopeWorkspace writes the out-of-repo file and the next `Check`
+  sees it).
 - `containedPath` — **symlink escape**: a symlink inside the workspace pointing to
   `/etc`/`~/.ssh`/another repo is rejected; `..` escape rejected; `O_NOFOLLOW`
   final-component symlink fails to open. `FuzzContainedPath` over adversarial paths.
@@ -982,6 +1036,13 @@ The pixel-level work is a follow-up TUI-update doc, since that TUI is mid-flight
   `go test ./...; echo x`; a `"prefix": true` record does.
 - malformed tool call — folded `Input` of invalid JSON → stored as `{}` + a
   tool-result error for that call; history re-encodes cleanly on the next request.
+- runaway guard — a model that emits a tool call every round hits
+  `MaxToolIterations`/`MaxToolCallsPerTurn` and ends in `TurnFailed{ToolLimitError}`
+  (not an infinite loop); the prior exchange remains in history.
+- Fetch match — a `GET https://api.host` grant does **not** approve a `POST` to the
+  same host, an `http://` request, or `api.host.evil`.
+- policy-store hardening — `Grant` creates dirs `0700`/files `0600`, refuses to follow
+  a symlinked `~/.urvi`, and the loader rejects a world-writable approvals file.
 - manifests — coding registers 11 tools, PA registers the 7-tool subset,
   `AcceptsImages` false.
 - **Integration tests** (`//go:build integration`, `*_integration_test.go`, run with
