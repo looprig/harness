@@ -25,6 +25,14 @@ import (
 type Loop struct {
 	Commands chan<- command.Command
 	Done     <-chan struct{}
+
+	// gateReg is the actor's gate-registration seam. A parked runner (or
+	// RequestUserInput on its behalf) sends a gateRegistration here and waits for
+	// the ack; listen installs the gate in loopState.pendingGates before closing
+	// the ack (install-before-emit). It is unexported: only in-package callers (the
+	// runner via the turn-launch ctx injection, and tests) register gates. The
+	// actor is the sole reader.
+	gateReg chan<- gateRegistration
 }
 
 // idGenerator mints a fresh UUID. It defaults to uuid.New; tests inject a
@@ -55,8 +63,11 @@ func New(ctx context.Context, sessionID uuid.UUID, cfg Config) (*Loop, error) {
 	}
 	commands := make(chan command.Command)
 	done := make(chan struct{})
-	go listen(ctx, sessionID, cfg, commands, done)
-	return &Loop{Commands: commands, Done: done}, nil
+	// gateReg is unbuffered: registration is synchronous (the runner blocks on the
+	// ack), and the actor is the sole reader, selecting on it alongside commands.
+	gateReg := make(chan gateRegistration)
+	go listen(ctx, sessionID, cfg, commands, gateReg, done)
+	return &Loop{Commands: commands, Done: done, gateReg: gateReg}, nil
 }
 
 // projectForSink derives the SINK-side form of an event from the (full-fidelity)
@@ -104,6 +115,12 @@ type loopState struct {
 	turnAbandoned <-chan struct{}         // always non-nil; closed when caller stops reading
 	msgs          content.AgenticMessages // conversation history across turns
 	shutdownAcks  []chan<- error
+
+	// pendingGates maps a tool call's CallID to the gate a parked runner is blocked
+	// on. Owned SOLELY by listen/the actor — a turn goroutine never touches it. A
+	// control command (Approve/Deny/ProvideUserInput) is routed to the matching
+	// gate by CallID AND kind, then the entry is deleted. Cleared on turn end.
+	pendingGates map[uuid.UUID]gate
 }
 
 type turnResult struct {
@@ -111,11 +128,11 @@ type turnResult struct {
 	terminal event.Event // TurnDone, TurnFailed, or TurnInterrupted
 }
 
-func listen(ctx context.Context, sessionID uuid.UUID, cfg Config, commands <-chan command.Command, done chan struct{}) {
+func listen(ctx context.Context, sessionID uuid.UUID, cfg Config, commands <-chan command.Command, gateReg <-chan gateRegistration, done chan struct{}) {
 	defer close(done)
 
 	internal := make(chan turnResult, 1)
-	var state loopState
+	state := loopState{pendingGates: make(map[uuid.UUID]gate)}
 
 	publish := func(ev event.Event) {
 		// SECURITY: the sink path is redacted; the per-turn stream (handled
@@ -206,6 +223,33 @@ func listen(ctx context.Context, sessionID uuid.UUID, cfg Config, commands <-cha
 			ack <- err
 		}
 		state.shutdownAcks = nil
+	}
+
+	// routeControl delivers a control command (Approve/Deny/ProvideUserInput) to
+	// the parked runner blocked on its CallID, but ONLY if a gate is open for that
+	// CallID AND the gate kind accepts this command kind. On a match it delivers
+	// once (the gate's reply channel is buffered(1) and the runner is its sole
+	// reader, so the send never blocks the actor) and deletes the gate so a
+	// duplicate cannot deliver twice. Any miss — no gate (wrong/unknown CallID,
+	// stale or duplicate command) or a kind mismatch — is silently DROPPED
+	// (fail-safe): the actor never blocks and never panics.
+	routeControl := func(cmd command.Command, callID uuid.UUID) {
+		g, ok := state.pendingGates[callID]
+		if !ok || !accepts(g.kind, cmd) {
+			return
+		}
+		g.reply <- cmd
+		delete(state.pendingGates, callID)
+	}
+
+	// clearGates drops every open gate at turn end / cancellation. A parked runner
+	// is already unblocking via <-ctx.Done() (the turn ctx is cancelled), so the
+	// reply channels are simply abandoned; the actor must not hold stale entries
+	// that a late control command for a finished turn could match.
+	clearGates := func() {
+		if len(state.pendingGates) > 0 {
+			state.pendingGates = make(map[uuid.UUID]gate)
+		}
 	}
 
 	for {
@@ -318,8 +362,28 @@ func listen(ctx context.Context, sessionID uuid.UUID, cfg Config, commands <-cha
 					ackShutdowns(nil)
 					return
 				}
-				// Turn goroutine is winding down; wait for internal below.
+			// Turn goroutine is winding down; wait for internal below.
+
+			// Control commands are fire-and-route: no Validate, no Ack. routeControl
+			// delivers to the parked runner blocked on this CallID iff a gate is open
+			// AND its kind accepts this command; any miss (unknown/stale CallID, kind
+			// mismatch, duplicate after delivery) is silently dropped (fail-safe).
+			case command.ApproveToolCall:
+				routeControl(c, c.GateCallID())
+
+			case command.DenyToolCall:
+				routeControl(c, c.GateCallID())
+
+			case command.ProvideUserInput:
+				routeControl(c, c.GateCallID())
 			}
+
+		case reg := <-gateReg:
+			// Install-before-emit: record the gate under its CallID, then close ack
+			// so the parked runner may emit its request event knowing a routed reply
+			// can no longer be dropped on a race. Only the actor touches pendingGates.
+			state.pendingGates[reg.callID] = gate{reply: reg.reply, kind: reg.kind}
+			close(reg.ack)
 
 		case result := <-internal:
 			state.msgs = result.msgs
@@ -333,6 +397,10 @@ func listen(ctx context.Context, sessionID uuid.UUID, cfg Config, commands <-cha
 			deliverAndClose(result.terminal)
 			state.turnID = uuid.UUID{}
 			state.causationID = uuid.UUID{}
+			// A finished turn must not leave stale gates: the parked runners have
+			// already unblocked via the cancelled turn ctx, and a late control
+			// command for this dead turn must not match a leftover gate.
+			clearGates()
 			if shuttingDown {
 				ackShutdowns(nil)
 				return
@@ -364,6 +432,10 @@ func listen(ctx context.Context, sessionID uuid.UUID, cfg Config, commands <-cha
 					state.turnAbandoned = nil
 				}
 			}
+			// Defensive: the loop is exiting, but drop any gates so no detached path
+			// could ever match a stale entry. Parked runners already unblock via the
+			// cancelled turn ctx.
+			clearGates()
 			ackShutdowns(&command.LoopTerminatedError{Cause: ctx.Err()})
 			return
 		}
