@@ -236,14 +236,16 @@ func renderAssistant(thinking, text string, calls []ToolCallView, expand bool, w
 const barWidth = 2
 
 // renderUser renders a user message as left accent-bar lines: every width-wrapped
-// line of text is prefixed with the styled "▌ " bar, left-aligned in the assistant
+// line of text is prefixed with the gray "▌ " bar (AccentBarStyle), and the text
+// itself is rendered bold (UserStyle) so the user's words stand out from assistant
+// narration. The bold is applied per wrapped line, left-aligned in the assistant
 // column.
 func renderUser(text string, width int) string {
 	bar := styles.AccentBarStyle.Render(styles.AccentBarPrompt)
 	var out []string
 	for _, raw := range strings.Split(text, "\n") {
 		for _, line := range wrapToWidth(raw, width-barWidth) {
-			out = append(out, bar+line)
+			out = append(out, bar+styles.UserStyle.Render(line))
 		}
 	}
 	return strings.Join(out, "\n")
