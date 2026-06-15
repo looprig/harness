@@ -1,10 +1,10 @@
 package components
 
 import (
-	"github.com/charmbracelet/bubbles/key"
-	"github.com/charmbracelet/bubbles/textarea"
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
+	"charm.land/bubbles/v2/key"
+	"charm.land/bubbles/v2/textarea"
+	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
 
 	"github.com/inventivepotter/urvi/tui/styles"
 )
@@ -33,7 +33,9 @@ type InputBox struct {
 //
 // Enter is left unbound on the textarea so screen.go can use it as submit; instead
 // Shift+Enter inserts a newline. NOTE: distinguishing shift+enter from enter requires
-// the terminal's enhanced (Kitty) keyboard protocol. On terminals lacking it,
+// a terminal supporting the Kitty/enhanced keyboard protocol. Bubble Tea v2 requests
+// basic key disambiguation by default, so Shift+Enter is reported as a distinct key
+// (and inserts a newline) on supporting terminals. On terminals lacking the protocol,
 // shift+enter is delivered as plain enter and therefore submits — an accepted
 // limitation; such terminals simply cannot type a literal newline in the composer.
 func NewInputBox() InputBox {
@@ -41,18 +43,27 @@ func NewInputBox() InputBox {
 	ta.CharLimit = 0
 	ta.ShowLineNumbers = false
 	ta.Prompt = styles.AccentBarPrompt
-	ta.FocusedStyle.Prompt = styles.AccentBarStyle
-	ta.BlurredStyle.Prompt = styles.AccentBarStyle
 	ta.Placeholder = placeholder
 	// Rebind newline insertion to Shift+Enter, freeing Enter for submit in screen.go.
 	ta.KeyMap.InsertNewline = key.NewBinding(
 		key.WithKeys("shift+enter"),
 		key.WithHelp("shift+enter", "insert newline"),
 	)
-	// The bubbles textarea highlights the focused line with a black background
-	// (DefaultStyles: CursorLine bg "0"), which appears as a stray dark patch only
-	// as wide as the text. Clear it so the input is plain like the user-message rows.
-	ta.FocusedStyle.CursorLine = lipgloss.NewStyle()
+	// v2 restructures the per-state styles under a single Styles value accessed via
+	// Styles()/SetStyles. Color the focused and blurred prompts with the shared accent
+	// bar, and clear the focused CursorLine: the default DefaultDarkStyles gives it a
+	// black background ("0"), which appears as a stray dark patch only as wide as the
+	// text. Clearing it makes the input plain, like the user-message rows.
+	//
+	// The default Cursor style (DefaultDarkStyles: block, blinking, static color "7")
+	// uses only literal colors — no lipgloss.LightDark/terminal probing — so it never
+	// triggers an OSC-11 background query (which the codebase deliberately avoids; see
+	// styles.NewMarkdownRenderer). It is therefore left at its safe static default.
+	s := ta.Styles()
+	s.Focused.Prompt = styles.AccentBarStyle
+	s.Blurred.Prompt = styles.AccentBarStyle
+	s.Focused.CursorLine = lipgloss.NewStyle()
+	ta.SetStyles(s)
 	ta.SetHeight(minInputLines)
 	ta.Focus()
 	return InputBox{ta: ta}

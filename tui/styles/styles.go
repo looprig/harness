@@ -4,9 +4,9 @@
 package styles
 
 import (
-	"github.com/charmbracelet/glamour"
-	glamourstyles "github.com/charmbracelet/glamour/styles"
-	"github.com/charmbracelet/lipgloss"
+	"charm.land/glamour/v2"
+	glamourstyles "charm.land/glamour/v2/styles"
+	"charm.land/lipgloss/v2"
 )
 
 // Dot is the leading marker rendered before assistant/markdown blocks.

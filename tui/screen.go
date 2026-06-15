@@ -4,8 +4,8 @@ import (
 	"context"
 	"strings"
 
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
+	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
 
 	"github.com/inventivepotter/urvi/internal/agent/loop/event"
 	"github.com/inventivepotter/urvi/internal/content"
@@ -91,7 +91,7 @@ func (m Screen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.resizeHistory()
 		m.refreshHistory()
 		return m, nil
-	case tea.KeyMsg:
+	case tea.KeyPressMsg:
 		return m.handleKey(msg)
 	case eventMsg:
 		return m, m.handleEvent(msg.ev)
@@ -371,9 +371,9 @@ func (m *Screen) handleReopenResult(msg reopenResultMsg) tea.Cmd {
 // renders leaves stale rows that bubbletea does not clear (the "multiplying" /
 // doubled-input artifact). The turn status is intentionally not shown here — thinking
 // streams inline as its own block.
-func (m Screen) View() string {
+func (m Screen) View() tea.View {
 	if !m.ready {
-		return ""
+		return tea.NewView("")
 	}
 	hh := m.historyHeight()
 	history := lipgloss.NewStyle().
@@ -387,7 +387,11 @@ func (m Screen) View() string {
 		rows = append(rows, m.slashComplete.View())
 	}
 	rows = append(rows, m.input.View())
-	return lipgloss.JoinVertical(lipgloss.Left, rows...)
+	// tea.NewView yields a View with AltScreen=false and MouseMode=MouseModeNone
+	// (their zero values), which is exactly the scrollback-first configuration: the
+	// program stays on the normal screen so tea.Println writes to native scrollback,
+	// and the mouse is never captured.
+	return tea.NewView(lipgloss.JoinVertical(lipgloss.Left, rows...))
 }
 
 // handleKey routes a key press to the input editor, slash-complete panel, or a
@@ -395,7 +399,7 @@ func (m Screen) View() string {
 // Ctrl+C quits from any state; Esc interrupts only while Running; Tab/Up/Down
 // drive the slash panel when visible; Enter submits, queues, or runs a slash
 // command; any other key forwards to the input editor and rebuilds the panel.
-func (m *Screen) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+func (m *Screen) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "ctrl+c":
 		return *m, tea.Sequence(closeAgent(m.agent), tea.Quit)
@@ -553,7 +557,7 @@ func (m *Screen) submit() tea.Cmd {
 // forwardToInput sends msg to the input editor and rebuilds the slash-complete
 // panel from the new value: a leading-slash word (no whitespace) rebuilds it
 // from the prefix (nil if no command matches); anything else hides it.
-func (m *Screen) forwardToInput(msg tea.KeyMsg) tea.Cmd {
+func (m *Screen) forwardToInput(msg tea.KeyPressMsg) tea.Cmd {
 	cmd := m.input.Update(msg)
 	v := m.input.Value()
 	if strings.HasPrefix(v, "/") && !strings.ContainsAny(v, " \t\n") {

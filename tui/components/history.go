@@ -1,8 +1,8 @@
 package components
 
 import (
-	"github.com/charmbracelet/bubbles/viewport"
-	tea "github.com/charmbracelet/bubbletea"
+	"charm.land/bubbles/v2/viewport"
+	tea "charm.land/bubbletea/v2"
 )
 
 // ChatHistory is a scrolling viewport over pre-rendered transcript text. It sticks
@@ -18,7 +18,10 @@ type ChatHistory struct {
 
 // NewChatHistory returns a viewport sized to the given dimensions.
 func NewChatHistory(width, height int) ChatHistory {
-	return ChatHistory{vp: viewport.New(width, height)}
+	vp := viewport.New()
+	vp.SetWidth(width)
+	vp.SetHeight(height)
+	return ChatHistory{vp: vp}
 }
 
 // SetContent replaces the rendered transcript. If the view was at the bottom
@@ -34,8 +37,8 @@ func (h *ChatHistory) SetContent(s string) {
 
 // Resize sets the viewport dimensions.
 func (h *ChatHistory) Resize(width, height int) {
-	h.vp.Width = width
-	h.vp.Height = height
+	h.vp.SetWidth(width)
+	h.vp.SetHeight(height)
 }
 
 // Clear empties the content and returns to the top.
