@@ -144,6 +144,79 @@ func TestSingleTurn(t *testing.T) {
 	}
 }
 
+// TestEnvelopeCorrelationStamped drives one full turn and asserts that the
+// sink-side envelopes carry correlation identity: every envelope for the turn
+// shares the same non-zero TurnID, each EventID is distinct and non-zero, and
+// CausationID equals the issuing StartTurn's Header.ID. The bare per-turn events
+// are unchanged; only the envelope gains these fields.
+func TestEnvelopeCorrelationStamped(t *testing.T) {
+	t.Parallel()
+	sink := &captureSink{}
+	l, _ := newLoop(t, &fakeLLM{chunks: []content.Chunk{textChunk("hi")}}, sink)
+
+	cmdID, err := uuid.New()
+	if err != nil {
+		t.Fatalf("uuid.New: %v", err)
+	}
+	ev := make(chan event.Event, 64)
+	ack := make(chan error, 1)
+	ab := make(chan struct{})
+	defer close(ab)
+	l.Commands <- command.StartTurn{
+		Header:    command.Header{ID: cmdID},
+		Ctx:       context.Background(),
+		Input:     nil,
+		Events:    ev,
+		Abandoned: ab,
+		Ack:       ack,
+	}
+	if err := <-ack; err != nil {
+		t.Fatalf("StartTurn ack = %v, want nil", err)
+	}
+	if _, ok := drainToTerminal(t, ev).(event.TurnDone); !ok {
+		t.Fatal("terminal != TurnDone")
+	}
+
+	// Collect only the turn's envelopes (skip the session-level SessionStarted,
+	// which has no active turn so carries zero TurnID/CausationID).
+	var turnEnvs []event.EventEnvelope
+	for _, e := range sink.events() {
+		if _, ok := e.Event.(event.SessionStarted); ok {
+			continue
+		}
+		turnEnvs = append(turnEnvs, e)
+	}
+	if len(turnEnvs) == 0 {
+		t.Fatal("no turn envelopes captured")
+	}
+
+	var turnID uuid.UUID
+	seenEventIDs := make(map[uuid.UUID]struct{})
+	for i, e := range turnEnvs {
+		if e.TurnID.IsZero() {
+			t.Errorf("envelope %d: TurnID is zero", i)
+		}
+		if i == 0 {
+			turnID = e.TurnID
+		} else if e.TurnID != turnID {
+			t.Errorf("envelope %d: TurnID = %v, want shared %v", i, e.TurnID, turnID)
+		}
+		if e.EventID.IsZero() {
+			t.Errorf("envelope %d: EventID is zero", i)
+		}
+		if _, dup := seenEventIDs[e.EventID]; dup {
+			t.Errorf("envelope %d: EventID %v is duplicated", i, e.EventID)
+		}
+		seenEventIDs[e.EventID] = struct{}{}
+		if e.CausationID != cmdID {
+			t.Errorf("envelope %d: CausationID = %v, want StartTurn.ID %v", i, e.CausationID, cmdID)
+		}
+		if !e.CallID.IsZero() {
+			t.Errorf("envelope %d: CallID = %v, want zero (no tool call)", i, e.CallID)
+		}
+	}
+}
+
 func TestStartWhileRunning(t *testing.T) {
 	t.Parallel()
 	// provider blocks until ctx cancel, so the first turn stays running

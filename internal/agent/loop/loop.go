@@ -61,10 +61,12 @@ const (
 
 type loopState struct {
 	turnIndex     event.TurnIndex
+	turnID        uuid.UUID // entity id for the active turn; zero when idle
+	causationID   uuid.UUID // active StartTurn.Header.ID; zero when idle
 	status        loopStatus
 	cancelTurn    context.CancelFunc
-	turnEvents    chan<- event.Event  // current turn's channel; actor closes it
-	turnAbandoned <-chan struct{}     // always non-nil; closed when caller stops reading
+	turnEvents    chan<- event.Event      // current turn's channel; actor closes it
+	turnAbandoned <-chan struct{}         // always non-nil; closed when caller stops reading
 	msgs          content.AgenticMessages // conversation history across turns
 	shutdownAcks  []chan<- error
 }
@@ -81,7 +83,22 @@ func listen(ctx context.Context, sessionID uuid.UUID, cfg Config, commands <-cha
 	var state loopState
 
 	publish := func(ev event.Event) {
-		env := event.EventEnvelope{SessionID: sessionID, Event: ev} // sessionID is uuid.UUID
+		// EventID is fresh per emitted event. A crypto/rand failure here is a
+		// system-level fault; it must not abort turn execution (the bare per-turn
+		// event is delivered separately), so log it and emit the envelope with a
+		// zero EventID rather than dropping the sink copy. CallID stays zero: no
+		// event in v1 pertains to a tool call.
+		eventID, err := uuid.New()
+		if err != nil {
+			slog.Error("event id generation failed; emitting envelope with zero EventID", "error", err)
+		}
+		env := event.EventEnvelope{
+			SessionID:   sessionID, // sessionID is uuid.UUID
+			TurnID:      state.turnID,
+			EventID:     eventID,
+			CausationID: state.causationID,
+			Event:       ev,
+		}
 		switch e := ev.(type) {
 		case event.TurnStarted:
 			env.TurnIndex = e.TurnIndex
@@ -176,7 +193,18 @@ func listen(ctx context.Context, sessionID uuid.UUID, cfg Config, commands <-cha
 					close(c.Events)
 					continue
 				}
+				turnID, err := uuid.New()
+				if err != nil {
+					// Cannot mint a TurnID; reject the turn at the gate (the turn
+					// never starts) rather than running an unidentifiable turn.
+					slog.Error("turn id generation failed; rejecting StartTurn", "error", err)
+					c.Ack <- &IDGenerationError{Cause: err}
+					close(c.Events)
+					continue
+				}
 				state.turnIndex++
+				state.turnID = turnID
+				state.causationID = c.CommandHeader().ID
 				state.status = loopRunning
 				state.turnEvents = c.Events
 				state.turnAbandoned = c.Abandoned
@@ -257,7 +285,11 @@ func listen(ctx context.Context, sessionID uuid.UUID, cfg Config, commands <-cha
 			if !shuttingDown {
 				state.status = loopIdle
 			}
+			// deliverAndClose publishes the terminal envelope, which must still
+			// carry this turn's correlation IDs, so clear them only afterward.
 			deliverAndClose(result.terminal)
+			state.turnID = uuid.UUID{}
+			state.causationID = uuid.UUID{}
 			if shuttingDown {
 				ackShutdowns(nil)
 				return
