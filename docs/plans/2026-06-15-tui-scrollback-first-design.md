@@ -382,13 +382,22 @@ the capped live tail; at the boundary it commits to scrollback as part of the as
 (`content.ThinkingBlock`), above the answer text.
 
 **Expand/collapse — a single toggle.** `ctrl+t` toggles one `expand` state controlling
-**both** thinking and tool output. Default **collapsed** (thinking → compact dim summary
-line; tool result → folded preview at `previewLineCap`); `ctrl+t` expands both to full.
-`ctrl+r` is not used.
+**both** thinking and tool output. Default **expanded** (thinking → full `│ `-prefixed body;
+tool result → full runner-capped preview); `ctrl+t` collapses both (thinking → compact dim
+summary line; tool result → folded preview at `previewLineCap`), and toggles back. `ctrl+r`
+is not used.
+
+**Why default expanded (revised):** scrollback is **append-only** — an entry prints once and
+can never be retroactively re-rendered, so a toggle cannot expand thinking/tool output that
+has already been committed to native history. Defaulting to *collapsed* would therefore
+permanently truncate that history with no way to recover it. The transcript instead shows
+**full** thinking + tool output by default; `ctrl+t` *reduces* verbosity for the live tail
+and **future** commits only. (Real-world testing confirmed collapsed-by-default is wrong for
+scrollback-first for exactly this reason.)
 
 **Append-only consequence (stated plainly):** the toggle affects the live tail and **future**
 commits only — it cannot retroactively collapse or expand text already printed to scrollback.
-This is the accepted cost of scrollback-first.
+This is the accepted cost of scrollback-first, and the reason the default is expanded.
 
 **Status line — finally shown.** `statusline.go`'s `RenderStatusLine` exists but `View` never
 calls it. `surface.go` renders it as the single bottom line of the active surface, with the
@@ -442,7 +451,8 @@ existing `tui/` tests. Grouped by helper:
   status-label derivation; never negative.
 - **`cmd/cli`** — program options **do not** include `tea.WithAltScreen()` or any mouse
   option.
-- **`ctrl+t`** — toggles both thinking and tool expansion; changes live/future rendering only.
+- **`ctrl+t`** — a fresh Screen renders thinking + tool output EXPANDED by default; the first
+  `ctrl+t` collapses both, the second expands again; changes live/future rendering only.
 
 **Manual smoke** (the integration unit tests cannot cover):
 
@@ -523,9 +533,13 @@ separator; box stays for queued input):
 
  ● I'll add a --version flag to the CLI entrypoint. Let me read
    the current flag setup first.
-   thinking · 4 lines · ctrl+t
+   thinking
+   │ The CLI builds the program in main; I should add the flag
+   │ parse before tea.NewProgram and short-circuit on --version.
 
-   └ ReadFile  cmd/cli/main.go  ✓   … 38 more lines · ctrl+t
+   └ ReadFile  cmd/cli/main.go  ✓
+     package main
+     …                           (full result; ctrl+t collapses to a fold)
  ──────────────────────────────────────────────────────────
  ┌──────────────────────────────────────────────────────────┐
  │ Type a message…  (queues while the agent works)            │

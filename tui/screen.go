@@ -31,12 +31,21 @@ type Screen struct {
 	queue  [][]content.Block              // submissions made while Running, FIFO
 	reader *llm.StreamReader[event.Event] // active turn's stream; nil when idle
 
-	expand        bool // Ctrl+T toggle; false = collapsed thinking + tool previews
+	// expand drives the unified ctrl+t fold for thinking + tool output. It defaults
+	// to TRUE (expanded — full thinking body + full tool result) because native
+	// scrollback is append-only: an entry prints once and can never be retroactively
+	// re-rendered, so a toggle cannot expand text already committed to history. To
+	// avoid permanently truncating that history, the transcript shows FULL content by
+	// default; ctrl+t flips it to collapsed, which only reduces verbosity for the live
+	// tail + future commits (expanded→collapsed and back).
+	expand        bool
 	width, height int
 	ready         bool
 }
 
-// New constructs an idle Screen driving agent, with open as the /clear thunk.
+// New constructs an idle Screen driving agent, with open as the /clear thunk. The
+// expand flag starts TRUE so thinking + tool output render in full from the start —
+// see the field comment for why append-only scrollback forces expanded-by-default.
 func New(ctx context.Context, agent Agent, open OpenAgent) Screen {
 	return Screen{
 		agent:       agent,
@@ -45,6 +54,7 @@ func New(ctx context.Context, agent Agent, open OpenAgent) Screen {
 		status:      StatusIdle,
 		scrollback:  newScrollbackModel(0),
 		interaction: newInteractionModel(),
+		expand:      true,
 	}
 }
 
@@ -268,7 +278,7 @@ func (m *Screen) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	case "ctrl+c":
 		return *m, tea.Sequence(closeAgent(m.agent), tea.Quit)
 	case "ctrl+t":
-		m.expand = !m.expand // pure display state; works in any status / prompt mode
+		m.expand = !m.expand // pure display state; default expanded, so this collapses first
 		return *m, nil
 	case "esc":
 		// With no prompt active, Esc keeps its legacy meaning — interrupt a running

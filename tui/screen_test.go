@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -746,7 +747,9 @@ func TestCtrlCQuits(t *testing.T) {
 
 // TestCtrlTTogglesExpandGlobally covers the GLOBAL ctrl+t: it flips the expand flag
 // (re-render only, nil cmd) in any status AND even with a prompt active, never
-// touching the turn or the prompt queue.
+// touching the turn or the prompt queue. The default is EXPANDED (append-only
+// scrollback can't retroactively expand printed output), so the FIRST ctrl+t
+// collapses and the SECOND expands again.
 func TestCtrlTTogglesExpandGlobally(t *testing.T) {
 	t.Parallel()
 
@@ -775,12 +778,18 @@ func TestCtrlTTogglesExpandGlobally(t *testing.T) {
 			}
 			wantPending := m.interaction.PendingCount()
 
+			// A fresh Screen defaults to expanded.
+			if !m.expand {
+				t.Fatalf("fresh Screen expand = false, want true (default expanded)")
+			}
+
+			// First ctrl+t collapses.
 			m, cmd := updateScreen(t, m, tea.KeyPressMsg{Code: 't', Mod: tea.ModCtrl})
 			if cmd != nil {
 				t.Errorf("ctrl+t cmd = non-nil, want nil (re-render only)")
 			}
-			if !m.expand {
-				t.Errorf("expand = false after ctrl+t, want true")
+			if m.expand {
+				t.Errorf("expand = true after first ctrl+t, want false (collapsed)")
 			}
 			if m.status != tt.status {
 				t.Errorf("status = %d, want unchanged %d", m.status, tt.status)
@@ -788,12 +797,81 @@ func TestCtrlTTogglesExpandGlobally(t *testing.T) {
 			if m.interaction.PendingCount() != wantPending {
 				t.Errorf("PendingCount changed by ctrl+t: %d, want %d", m.interaction.PendingCount(), wantPending)
 			}
-			// Second toggle flips back.
+			// Second toggle expands again.
 			m, _ = updateScreen(t, m, tea.KeyPressMsg{Code: 't', Mod: tea.ModCtrl})
-			if m.expand {
-				t.Errorf("expand = true after second ctrl+t, want false")
+			if !m.expand {
+				t.Errorf("expand = false after second ctrl+t, want true (expanded)")
 			}
 		})
+	}
+}
+
+// TestCtrlTFlipsLiveTailRendering pins that ctrl+t actually changes what the live
+// tail renders, not just a bool. A fresh Screen renders thinking + tool output
+// EXPANDED by default (full "│ " thinking body + full tool result, no collapse
+// hints); the first ctrl+t collapses both (compact "thinking · N lines" summary +
+// "… N more lines" tool fold); the second restores the full rendering.
+func TestCtrlTFlipsLiveTailRendering(t *testing.T) {
+	t.Parallel()
+
+	agent := &fakeAgent{}
+	m := runningScreen(t, agent)
+	m, _ = updateScreen(t, m, tea.WindowSizeMsg{Width: 80, Height: 40})
+
+	// A live segment with multi-line thinking AND a completed tool card whose result
+	// exceeds previewLineCap, so both folds are observable.
+	resultLines := make([]string, 0, previewLineCap+3)
+	for i := 0; i < previewLineCap+3; i++ {
+		resultLines = append(resultLines, "result-line-"+strconv.Itoa(i))
+	}
+	m.transcript.live = liveSeg{
+		Thinking: "first reasoning line\nsecond reasoning line\nthird reasoning line",
+		Text:     "the narration",
+		Calls: []ToolCallView{{
+			ToolName: "Bash",
+			Summary:  "ls",
+			Status:   ToolOK,
+			Result:   resultLines,
+		}},
+		active: true,
+	}
+
+	expandedHas := "first reasoning line" // full thinking body line (expanded only)
+	expandedTail := "result-line-" + strconv.Itoa(previewLineCap+2)
+	collapsedHints := []string{"more lines", "thinking" + hintSeparator}
+
+	// Default: expanded — full thinking body + full tool result, NO collapse hints.
+	def := stripANSI(m.renderLiveTail())
+	if !strings.Contains(def, expandedHas) {
+		t.Errorf("default live tail missing full thinking body %q; got %q", expandedHas, def)
+	}
+	if !strings.Contains(def, expandedTail) {
+		t.Errorf("default live tail missing tail tool result %q; got %q", expandedTail, def)
+	}
+	if strings.Contains(def, "more lines") {
+		t.Errorf("default live tail shows the collapsed tool fold; want full result; got %q", def)
+	}
+
+	// First ctrl+t: collapsed — compact thinking summary + folded tool result.
+	m, _ = updateScreen(t, m, tea.KeyPressMsg{Code: 't', Mod: tea.ModCtrl})
+	col := stripANSI(m.renderLiveTail())
+	for _, h := range collapsedHints {
+		if !strings.Contains(col, h) {
+			t.Errorf("collapsed live tail missing %q; got %q", h, col)
+		}
+	}
+	if strings.Contains(col, expandedTail) {
+		t.Errorf("collapsed live tail still shows tail tool result %q; want folded; got %q", expandedTail, col)
+	}
+
+	// Second ctrl+t: expanded again.
+	m, _ = updateScreen(t, m, tea.KeyPressMsg{Code: 't', Mod: tea.ModCtrl})
+	exp := stripANSI(m.renderLiveTail())
+	if !strings.Contains(exp, expandedHas) || !strings.Contains(exp, expandedTail) {
+		t.Errorf("re-expanded live tail missing full content; got %q", exp)
+	}
+	if strings.Contains(exp, "more lines") {
+		t.Errorf("re-expanded live tail still shows collapsed fold; got %q", exp)
 	}
 }
 
