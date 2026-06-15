@@ -1,0 +1,134 @@
+package tools
+
+import (
+	"slices"
+
+	"github.com/inventivepotter/urvi/internal/agent/loop"
+)
+
+// permission.go defines the policy data structures and fail-secure default
+// hard-deny rules for the tools subsystem (design §3c). The PermissionChecker
+// implementation (the seven-stage Check and Grant) is added in a later task;
+// this file is the type + default surface those build on.
+
+// EffectChecker decides the Effect for a tool call from its raw arguments,
+// independent of any persisted approval. It is consulted as an early evaluation
+// stage (e.g. a tool that is intrinsically read-only can auto-approve itself).
+// handled=false means "this checker has no opinion" — evaluation continues to
+// the next stage; handled=true pins the returned Effect.
+type EffectChecker interface {
+	CheckEffect(argsJSON string) (effect loop.Effect, handled bool)
+}
+
+// HardApproveRules names tools that are auto-approved unconditionally (after
+// containment + hard-deny). These are intrinsically safe, side-effect-free tools
+// (e.g. a within-workspace search) that never need a prompt.
+type HardApproveRules struct {
+	// Tools is the set of tool names that hard-approve. An empty slice approves
+	// nothing.
+	Tools []string
+}
+
+// HardDenyRules are the non-negotiable denials evaluated before any approval
+// stage (containment aside). They are fail-secure: a call matching any entry is
+// denied regardless of persisted approvals, session policies, or an
+// EffectChecker. Path entries are globs matched by MatchFileGlob; Bash entries
+// are normalized command prefixes.
+type HardDenyRules struct {
+	// DeniedReadPaths globs that ReadFile/Glob/Grep may never read (secrets).
+	DeniedReadPaths []string
+	// DeniedWritePaths globs that WriteFile/EditFile may never write. By
+	// construction this is a superset of DeniedReadPaths plus write-only entries
+	// (VCS/build integrity files and the .urvi policy store).
+	DeniedWritePaths []string
+	// DeniedBashPrefixes normalized command prefixes Bash may never run.
+	DeniedBashPrefixes []string
+	// MaxReadBytes is the per-file read cap (bytes) the ReadGuard enforces.
+	MaxReadBytes int64
+}
+
+// ApprovalRecord is one persisted approval (the on-disk approvals.json shape).
+// Match is tool-interpreted: a path glob (file tools), the EXACT normalized
+// command (Bash), or the "METHOD scheme://host[path]" grammar (Fetch). An empty
+// Match means "all calls of this tool". Prefix is the Bash-only, hand-edited,
+// risky opt-in to prefix (rather than exact) command matching.
+type ApprovalRecord struct {
+	Tool   string      `json:"tool"`
+	Match  string      `json:"match,omitempty"`
+	Prefix bool        `json:"prefix,omitempty"`
+	Effect loop.Effect `json:"effect"`
+}
+
+// ApprovalsFile is the on-disk approvals document. Version pins the schema so a
+// future format change is detectable; Approvals is the ordered rule list.
+type ApprovalsFile struct {
+	Version   int              `json:"version"`
+	Approvals []ApprovalRecord `json:"approvals"`
+}
+
+// PermissionPolicy is the immutable-at-construction configuration the
+// PermissionChecker evaluates against. WorkspaceRoot is the resolved root for
+// containment + path relativisation; Policies holds session-scope ToolPolicy
+// grants (extended in place by a ScopeSession Grant).
+type PermissionPolicy struct {
+	WorkspaceRoot string
+	HardApprove   HardApproveRules
+	HardDeny      HardDenyRules
+	Policies      []loop.ToolPolicy
+}
+
+// defaultMaxReadBytes is the per-file read cap default: 1 MiB. A larger file is
+// truncated by the ReadGuard rather than streamed unbounded into the model.
+const defaultMaxReadBytes int64 = 1 << 20
+
+// The default secret-path globs that may never be READ by a file tool. These are
+// also (a subset of) the write-deny set: you may never write what you may not
+// read.
+var defaultDeniedReadPaths = []string{
+	"~/.ssh/**",  // private keys + known_hosts + config
+	"**/.env",    // dotenv secrets anywhere in the tree
+	"**/*.pem",   // PEM-encoded keys/certs anywhere
+	"**/id_rsa",  // bare SSH private key anywhere
+	"~/.urvi/**", // the urvi policy/config store (approvals, identity)
+}
+
+// The write-only additions on top of the read-deny set. These protect VCS and
+// build-integrity files and — security-critically — the .urvi policy store, so
+// the tool system can NEVER mutate its own approvals via WriteFile/EditFile.
+// "**/.urvi/**" covers any in-repo .urvi directory; "~/.urvi/**" the user store.
+// Only PermissionChecker.Grant may ever write the policy store.
+var defaultDeniedWriteOnlyPaths = []string{
+	"**/.git/config", // git remote/hook config (RCE-via-hook surface)
+	"**/go.sum",      // module checksum integrity
+	"**/.urvi/**",    // in-repo policy store: deny-write (defense in depth)
+	"~/.urvi/**",     // user policy store: deny-write (only Grant writes it)
+}
+
+// The default dangerous Bash command prefixes that may never run.
+var defaultDeniedBashPrefixes = []string{
+	"rm -rf /",    // catastrophic recursive delete from root
+	"sudo",        // privilege escalation
+	"curl | bash", // pipe-to-shell remote execution
+	"dd if=",      // raw device/disk overwrite
+}
+
+// DefaultHardDeny returns the fail-secure default HardDenyRules from design §3c.
+// The write-deny set is the read-deny set PLUS the write-only additions (so it
+// is always a superset), guaranteeing the .urvi policy store and every secret
+// glob are deny-write. MaxReadBytes defaults to 1 MiB.
+//
+// Each call returns fresh slices (no shared backing array) so a caller may
+// append workspace-specific entries without mutating the package defaults.
+func DefaultHardDeny() HardDenyRules {
+	read := slices.Clone(defaultDeniedReadPaths)
+	// Write set = read set + write-only additions, in a fresh slice.
+	write := make([]string, 0, len(read)+len(defaultDeniedWriteOnlyPaths))
+	write = append(write, read...)
+	write = append(write, defaultDeniedWriteOnlyPaths...)
+	return HardDenyRules{
+		DeniedReadPaths:    read,
+		DeniedWritePaths:   write,
+		DeniedBashPrefixes: slices.Clone(defaultDeniedBashPrefixes),
+		MaxReadBytes:       defaultMaxReadBytes,
+	}
+}
