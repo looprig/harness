@@ -157,10 +157,23 @@ func encodeAIMessage(m *content.AIMessage) (chatMessage, error) {
 		case *content.TextBlock:
 			text += b.Text
 		case *content.ToolUseBlock:
+			// OpenAI wire format: function.arguments MUST be a JSON-encoded
+			// STRING (e.g. "{\"p\":1}"), never a raw object. b.Input holds the
+			// raw JSON object, so quote it; empty input becomes "{}". Emitting a
+			// bare object here makes strict servers (vLLM/chutes) reject the
+			// follow-up request with a 400.
+			raw := string(b.Input)
+			if raw == "" {
+				raw = "{}"
+			}
+			quoted, err := json.Marshal(raw)
+			if err != nil {
+				return chatMessage{}, fmt.Errorf("openaiapi: encode tool arguments for %q: %w", b.Name, err)
+			}
 			calls = append(calls, toolCall{
 				ID:       b.ID,
 				Type:     "function",
-				Function: toolCallFunction{Name: b.Name, Arguments: b.Input},
+				Function: toolCallFunction{Name: b.Name, Arguments: json.RawMessage(quoted)},
 			})
 		case *content.ThinkingBlock:
 			// Deliberately ignored: thinking is not part of the OpenAI wire format.

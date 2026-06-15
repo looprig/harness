@@ -45,7 +45,11 @@ type toolCall struct {
 }
 
 type toolCallFunction struct {
-	Name      string          `json:"name"`
+	Name string `json:"name"`
+	// Arguments is json.RawMessage to tolerate both wire shapes on DECODE
+	// (some servers send a JSON string, others a bare object). On ENCODE it
+	// MUST be a JSON-encoded string — see encodeAIMessage, which quotes the
+	// raw object before assigning it here. Do not assign a bare object.
 	Arguments json.RawMessage `json:"arguments"`
 }
 
