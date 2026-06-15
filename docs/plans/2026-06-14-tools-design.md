@@ -105,6 +105,14 @@ Date: 2026-06-14 · Status: approved (brainstorm)
 > (3) **unknown tool name** → tool-result error, never a panic (§2d); (4) **same-path
 > `WriteFile`/`EditFile` in one batch are serialized** by resolved path (§2d);
 > (5) stale "Fetch host match" test wording updated to the full grammar (§5e).
+>
+> **Revision 2026-06-14 (review pass 10)** resolves a tenth review: (1) **sink
+> projection extended to `TokenDelta`/`TurnDone`** — `ToolUseChunk.InputJSON` and
+> `ToolUseBlock.Input` (raw tool args) dropped/redacted for sinks, closing the leak
+> created when `ToolUseChunk` started riding `TokenDelta` (§5b); (2) **`tool.WriteTarget`
+> optional interface** lets the runner group same-path writes without importing
+> `tools` (§3a, §2d); (3) §2d abort wording updated to include
+> `TurnFailed{ToolLimitError}` (§2d).
 
 ## Scope
 
@@ -489,20 +497,23 @@ keeps draining.
   implements `Sequential` yet; it is the documented seam for ShellSession.)
 - **Same-path write serialization.** Two file-mutating calls
   (`WriteFile`/`EditFile`) targeting the **same resolved path** in one parallel batch
-  would race (lost update / torn file). The runner serializes calls by their resolved
-  write path — same-path mutations run sequentially (in call order), different paths
-  still run in parallel. (Read tools are not serialized.) Without `ShellSession`,
+  would race (lost update / torn file). The runner discovers the path via the
+  `tool.WriteTarget` optional interface (so it never imports/concrete-checks `tools`):
+  calls sharing a `WriteTarget` key run sequentially (in call order), different keys
+  (and tools that don't implement it) still run in parallel. Without `ShellSession`,
   this is the only intra-batch shared-state hazard.
 - The `tool.ToolMiddleware` chain wraps each `InvokableRun` (first listed =
   outermost). Cross-cutting concerns (OTel spans, rate limiting, audit, caching,
   per-tool timeout) live here, not in the runner body.
 - `defer/recover` turns a panic into `"error: tool panicked: <detail>"`.
 - **All tool failures become tool-result strings** (invalid args, permission
-  denied, execution error, panic) — a tool *error* never aborts the turn; the model
-  sees it and can react. The turn *completes normally* (`TurnDone`) when the model
-  emits no more tool calls or a result sets `Terminate` (§2a). The only things that
-  *abort* a turn (no `TurnDone`; `TurnInterrupted`) are `ctx` cancellation and
-  `Interrupt`.
+  denied, execution error, panic, unknown tool) — a tool *error* never aborts the
+  turn; the model sees it and can react. The turn *completes normally* (`TurnDone`)
+  when the model emits no more tool calls or a result sets `Terminate` (§2a). The
+  things that *abort* a turn (no `TurnDone`; whole-turn rollback to `base`, §2a) are
+  `ctx` cancellation / `Interrupt` (`TurnInterrupted`) and the runaway guard
+  (`TurnFailed{ToolLimitError}`) — a tool-limit failure is **not** a normal
+  tool-result path.
 
 **Observability events** (auto-approved tools execute silently otherwise):
 `event.ToolCallStarted{CallID, ToolName, Summary string}` before run,
@@ -557,6 +568,10 @@ func TextResult(s string) *ToolResult // one TextBlock, Terminate false
 type Sequential        interface { Sequential() bool }
 type PermissionPrompter interface { BuildRequest(argsJSON string) (PermissionRequest, error) }
 type Auditable         interface { AuditSummary(argsJSON string) string } // redacted, capped; for ToolCallStarted
+// WriteTarget lets the runner group same-path mutations WITHOUT importing tools:
+// WriteFile/EditFile return their resolved write path as the key; the runner
+// serializes calls sharing a key (§2d). ok=false → not a write (no serialization).
+type WriteTarget       interface { WriteTarget(argsJSON string) (key string, ok bool, err error) }
 
 type ToolMiddleware func(ctx context.Context, t InvokableTool, argsJSON string, next ToolExecuteFunc) (*ToolResult, error)
 type ToolExecuteFunc func(ctx context.Context, argsJSON string) (*ToolResult, error)
@@ -981,10 +996,17 @@ type Redactable interface { SinkProjection() Event } // loop calls this before e
 | `PermissionRequested` | full `Request` | `{CallID, ToolName}` only (drop `Description`) |
 | `UserInputRequested` | full `Question`/`Choices` | `{CallID, len(Choices)}` (drop `Question`) |
 | `ToolCallStarted` | redacted `Summary` (already safe) | unchanged |
-| `TokenDelta`/`TurnDone` | full content | model-output content; a sink may drop it by config (not a *secret*, but PII-bearing) |
+| `TokenDelta` (`TextChunk`/`ThinkingChunk`) | full text | model-output text; sink may drop by config (PII-bearing, not a secret) |
+| `TokenDelta` (`ToolUseChunk`) | full incl. `InputJSON` | **`InputJSON` dropped** — keep `Name`/`Index` only (the args are the secrets `ToolCallStarted.Summary` redacts) |
+| `TurnDone` | full `Message` | text/thinking as above; **every `ToolUseBlock.Input` redacted to `{}`** |
 
-This is a loop sink-path concern; it composes with the identity-doc envelope (the
-loop projects the event, then wraps it in the `EventEnvelope`).
+**Tool arguments never reach a sink in any event.** Because `ToolUseChunk` rides
+`TokenDelta` (§2b) and a `TurnDone.Message` can carry `ToolUseBlock`s, both must be
+projected — otherwise raw `WriteFile` content / `Fetch` headers/body / a `Bash` command
+with an inline token would be logged, defeating the `ToolCallStarted.Summary`
+redaction. The stream (TUI) still gets full fidelity. This is a loop sink-path concern;
+it composes with the identity-doc envelope (the loop projects the event, then wraps it
+in the `EventEnvelope`).
 
 ### §5c. `session` + `tui.Agent` additions
 
@@ -1085,8 +1107,9 @@ The pixel-level work is a follow-up TUI-update doc, since that TUI is mid-flight
   not interpreted as a flag; a workspace `.env` is excluded via `--glob` **and**
   dropped by the `ReadGuard.DeniedRead` output filter (belt-and-suspenders).
 - sink redaction — `PermissionRequested`/`UserInputRequested` delivered to a fake
-  `EventSink` carry **no** `Description`/`Question` text; the same events on the
-  stream carry the full payload.
+  `EventSink` carry **no** `Description`/`Question` text; a `TokenDelta{ToolUseChunk}`
+  and a `TurnDone` with tool-use blocks carry **no** raw args/`Input` to the sink; the
+  same events on the stream carry the full payload.
 - malformed approvals — a corrupt/unknown-`effect` approvals file yields `EffectAsk`
   (never `AutoApprove`) and a warning; a bad record is skipped, valid ones still apply.
 - TUI prompt queue — two concurrent `UserInputRequested` (distinct `CallID`s) render
