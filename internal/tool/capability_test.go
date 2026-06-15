@@ -17,9 +17,7 @@ func (capableTool) InvokableRun(ctx context.Context, argsJSON string) (*ToolResu
 func (capableTool) Sequential() bool                    { return true }
 func (capableTool) AuditSummary(argsJSON string) string { return "summary" }
 func (capableTool) BuildRequest(argsJSON string) (PermissionRequest, error) {
-	// Returns nil here; concrete PermissionRequest types land in Task 1.3.
-	// PermissionPrompter only depends on the PermissionRequest interface.
-	return nil, nil
+	return UnknownRequest{Tool: "capable", Summary: "does a thing"}, nil
 }
 func (capableTool) WriteTarget(argsJSON string) (string, bool, error) {
 	return "/tmp/x", true, nil
