@@ -124,7 +124,10 @@ Date: 2026-06-14 · Status: approved (brainstorm)
 > `Terminate` the loop emitted `TurnDone(lastAIMessage)`, but that is the
 > tool-*requesting* assistant message, not the terminal tool output — an unclear
 > contract no v1 tool needs. Turns now complete only via the model emitting no more
-> tool calls (§2a, §3a; deferred in Out of scope).
+> tool calls (§2a, §3a; deferred in Out of scope). **Full re-read self-audit** also
+> closed two consistency gaps: AskUser's gate registration is now a concrete
+> loop-provided `RequestUserInput(ctx,…)` helper (it never touches `gateReg` directly)
+> (§2e, §2c, §4b), and the §1 contracts list now includes `Auditable`/`WriteTarget`.
 
 ## Scope
 
@@ -186,7 +189,8 @@ internal/content/                  Block (+ ToolUseBlock, ToolResultBlock), Chun
 internal/tool/      internal/llm/  contracts: BaseTool, InvokableTool, ToolResult, ToolInfo,
     ↑                              PermissionRequest (sealed) + ALL its concrete types
     │                              (FileWriteRequest…UnknownRequest), PermissionPrompter,
-    │                              ApprovalScope, Sequential, ToolMiddleware — imports content only
+    │                              ApprovalScope, Sequential, Auditable, WriteTarget,
+    │                              ToolMiddleware — imports content only
 internal/agent/loop/event/         + PermissionRequested(tool.PermissionRequest), UserInputRequested,
     ↑                                ToolCallStarted, ToolCallCompleted
 internal/agent/loop/               runner.go, deps.go (ToolSet, PermissionGate, ReadGuard, Effect, ToolPolicy),
@@ -459,10 +463,11 @@ unblocks via `<-ctx.Done()`).
    surfaces a non-fatal warning (log line / sink event) so the user knows the
    session/workspace grant did not stick — it is neither a deny nor a tool-result
    error.
-3. `AskUser` registers a `gateUserInput` gate the same way for `ProvideUserInput`.
-   Because gates are keyed by `CallID` *and* matched by kind, several `AskUser` calls
-   in one parallel batch each get their own entry and never collide, and a stray
-   approve/deny can never satisfy an `AskUser` gate (or vice versa).
+3. `AskUser` does not register a gate itself — it calls `loop.RequestUserInput(ctx,…)`
+   (§2e), which registers a `gateUserInput` gate the same ctx-aware way and blocks for
+   `ProvideUserInput`. Because gates are keyed by `CallID` *and* matched by kind,
+   several `AskUser` calls in one parallel batch each get their own entry and never
+   collide, and a stray approve/deny can never satisfy an `AskUser` gate (or vice versa).
 
 The `loopState` invariant is preserved: only `listen` touches `loop.Commands` and
 `loopState`; it *routes* the matching control command to the parked runner on that
@@ -551,12 +556,23 @@ helper in `loop` (not `internal/tool`, which must stay `event`-free):
 ```go
 // in internal/agent/loop/
 func EmitFromContext(ctx context.Context) (func(event.Event), bool)
+
+// RequestUserInput is the loop-provided helper AskUser calls — it encapsulates the
+// gate plumbing so a tool in tools/ never touches gateReg directly. It registers a
+// gateUserInput gate (ctx-aware, §2c), emits UserInputRequested{CallID,…}, blocks for
+// the matching ProvideUserInput (or ctx cancel), and returns the raw answer. AskUser
+// then validates the answer against its choices.
+func RequestUserInput(ctx context.Context, question string, choices []string) (answer string, err error)
 ```
 
-`AskUser` uses it to emit `UserInputRequested`. There is **no session-wide `Events`
-field** anywhere (7.md's had one); per-turn emit comes from `ctx`, and the session
-root `ctx` is passed at construction only to tools that need it (`Subagent`). With
-ShellSession deferred, no tool emits events that outlive a turn.
+The runner injects the emit func, the `CallID`, and the gate-registration handle into
+`ctx`; `EmitFromContext`/`RequestUserInput` read them back (both live in `loop`, which
+`tools/` already imports — `internal/tool` stays `event`-free). Permission gates are
+registered by the runner *internally* (it holds `gateReg`); `RequestUserInput` is the
+only path a *tool* opens a gate. There is **no session-wide `Events` field** anywhere
+(7.md's had one); per-turn emit comes from `ctx`, and the session root `ctx` is passed
+at construction only to tools that need it (`Subagent`). With ShellSession deferred, no
+tool emits events that outlive a turn.
 
 ---
 
@@ -910,7 +926,7 @@ in observability events — §2d); `crypto/rand` IDs (`internal/uuid`).
 | `Grep` | pattern, path, recursive, ignore_case, context_lines, include_all | `rg` if present (binary, not a Go dep) — **arg-list exec, never a shell string: `exec.Command("rg", "--regexp", pattern, flags…, "--", path)`** so a `-`-leading pattern/path can't become a flag — else `WalkDir`+`regexp`; skip noise dirs; **denied-path enforcement is two-layer** (see note); ≤200 matches | AutoApprove |
 | `Fetch` | url, method(GET/POST), headers, body, timeout(≤60s) | `net/http` w/ explicit timeouts + `tls.Config{MinVersion: TLS1.2}`; 64 KiB cap | Ask (`FetchRequest`) |
 | `WebSearch` | query, results(≤10) | `SearchProvider` iface; DuckDuckGo HTML scrape via **`golang.org/x/net/html`** | Ask (`WebSearchRequest`) |
-| `AskUser` | question, choices | emits `UserInputRequested` via `EmitFromContext`; registers a gate, blocks on its reply (CallID-validated); answer validated against choices | AutoApprove |
+| `AskUser` | question, choices | calls `loop.RequestUserInput(ctx,…)` (emits `UserInputRequested`, registers a `gateUserInput` gate, blocks on its reply, CallID-validated); answer validated against choices | AutoApprove |
 | `Todo` | action(create/update/list), … | in-memory `sync.Mutex` map on the tool; `uuid` IDs; session-scoped | AutoApprove |
 | `Subagent` | skill, message | **synchronous** child `session.AgentSession` (`Invoke` to completion, returns final text); `Skill` selects a persona via `internal/registry`; **hard max-depth (default 2) carried in `ctx` and incremented per spawn — exceeding returns a tool-result error** (prevents runaway recursion/resource exhaustion even though full depth/budget design is deferred) | AutoApprove |
 
