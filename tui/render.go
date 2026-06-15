@@ -44,15 +44,24 @@ const (
 	glyphCancelled = "⊘"
 )
 
-// renderMD renders markdown to ANSI for the given wrap width. On a glamour
-// construction or render error it falls back to the raw text prefixed with the
-// dot marker, so the UI always gets readable output and never an error.
+// dotWidth is the display width of the assistant bullet prefix ("● "), which also
+// matches glamour's "dark" document left margin. Narration wraps to this much less
+// than the content width so continuation lines — indented to align under the first
+// line — still fit.
+const dotWidth = 2
+
+// renderMD renders markdown to ANSI and prefixes it with the assistant bullet so the
+// narration begins on the SAME line as the "●". glamour's "dark" style indents every
+// line by a 2-column document margin and brackets the block with blank lines; those
+// are stripped so the text aligns with the dot — first line "● text", continuation
+// lines indented to clear the bullet. On a glamour construction or render error it
+// falls back to the raw text behind the dot, so the UI always gets readable output.
 func renderMD(md string, width int) string {
-	if md == "" {
+	if strings.TrimSpace(md) == "" {
 		return ""
 	}
 
-	r, err := styles.NewMarkdownRenderer(width)
+	r, err := styles.NewMarkdownRenderer(max(0, width-dotWidth))
 	if err != nil {
 		return styles.Dot + md
 	}
@@ -60,7 +69,39 @@ func renderMD(md string, width int) string {
 	if err != nil {
 		return styles.Dot + md
 	}
-	return styles.Dot + strings.TrimRight(out, "\n")
+
+	lines := dedentDocument(out)
+	indent := strings.Repeat(" ", dotWidth)
+	for i := range lines {
+		if i == 0 {
+			lines[i] = styles.Dot + lines[i]
+		} else {
+			lines[i] = indent + lines[i]
+		}
+	}
+	return strings.Join(lines, "\n")
+}
+
+// dedentDocument strips glamour's document framing from rendered output: the
+// dotWidth-column left margin on every line and the surrounding blank lines. It
+// returns at least one line.
+func dedentDocument(s string) []string {
+	margin := strings.Repeat(" ", dotWidth)
+	raw := strings.Split(s, "\n")
+	out := make([]string, 0, len(raw))
+	for _, ln := range raw {
+		out = append(out, strings.TrimPrefix(strings.TrimRight(ln, " "), margin))
+	}
+	for len(out) > 0 && out[0] == "" {
+		out = out[1:]
+	}
+	for len(out) > 0 && out[len(out)-1] == "" {
+		out = out[:len(out)-1]
+	}
+	if len(out) == 0 {
+		return []string{""}
+	}
+	return out
 }
 
 // toolGlyph maps a tool-call status to its single-rune display glyph (design §3).
@@ -172,8 +213,8 @@ func renderMessages(msgs []DisplayMessage, live liveSegment, queued map[int]bool
 		}
 		rows = append(rows, row)
 	}
-	if live.text != "" || len(live.calls) > 0 {
-		rows = append(rows, renderAssistant(live.text, live.calls, expandTools, width))
+	if live.text != "" || live.thinking != "" || len(live.calls) > 0 {
+		rows = append(rows, renderAssistant(live.thinking, live.text, live.calls, expandTools, width))
 	}
 	return strings.Join(rows, rowSep)
 }
@@ -184,9 +225,9 @@ func renderMessages(msgs []DisplayMessage, live liveSegment, queued map[int]bool
 func renderRow(m DisplayMessage, expandTools bool, width int) string {
 	switch m.Role {
 	case RoleUser:
-		return styles.UserStyle.Render(renderInlineBlocks(m.Blocks))
+		return renderUser(renderInlineBlocks(m.Blocks), width)
 	case RoleAssistant:
-		return renderAssistant(assistantText(m.Blocks), m.ToolCalls, expandTools, width)
+		return renderAssistant(thinkingText(m.Blocks), assistantText(m.Blocks), m.ToolCalls, expandTools, width)
 	case RoleSystem:
 		return styles.SystemStyle.Render(firstText(m.Blocks))
 	case RoleError:
@@ -198,18 +239,83 @@ func renderRow(m DisplayMessage, expandTools bool, width int) string {
 	}
 }
 
-// renderAssistant renders an assistant segment: its markdown narration followed by
-// its tool-call cards. A segment with empty narration but non-empty cards renders a
-// bare dot bullet (no empty markdown block) before its cards, per design §3.
-func renderAssistant(text string, calls []ToolCallView, expandTools bool, width int) string {
+// renderAssistant renders an assistant segment in order: its reasoning (thinking)
+// block, its markdown narration, then its tool-call cards. A segment with empty
+// narration but non-empty cards renders a bare dot bullet (no empty markdown block)
+// before its cards, per design §3. Empty parts are omitted.
+func renderAssistant(thinking, text string, calls []ToolCallView, expandTools bool, width int) string {
+	var b strings.Builder
+
+	if t := renderThinking(thinking, width); t != "" {
+		b.WriteString(t)
+	}
+
 	body := renderMD(text, width)
 	if body == "" && len(calls) > 0 {
 		body = strings.TrimRight(styles.Dot, " ") // bare bullet for a card-only segment
 	}
-	if len(calls) == 0 {
-		return body
+	if body != "" {
+		if b.Len() > 0 {
+			b.WriteString("\n\n") // one blank line between the thinking block and the AI message
+		}
+		b.WriteString(body)
 	}
-	return body + "\n" + renderToolCalls(calls, expandTools, width)
+
+	if len(calls) > 0 {
+		if b.Len() > 0 {
+			b.WriteString("\n") // cards nest tight beneath the segment they belong to
+		}
+		b.WriteString(renderToolCalls(calls, expandTools, width))
+	}
+	return b.String()
+}
+
+// barWidth is the display columns a left-bar prefix ("▌ " / "│ ") consumes.
+const barWidth = 2
+
+// renderUser renders a user message as left accent-bar lines: every width-wrapped
+// line of text is prefixed with the styled "▌ " bar, left-aligned in the assistant
+// column.
+func renderUser(text string, width int) string {
+	bar := styles.AccentBarStyle.Render(styles.AccentBarPrompt)
+	var out []string
+	for _, raw := range strings.Split(text, "\n") {
+		for _, line := range wrapToWidth(raw, width-barWidth) {
+			out = append(out, bar+line)
+		}
+	}
+	return strings.Join(out, "\n")
+}
+
+// renderThinking renders the model's reasoning as a dim block: a faint "thinking"
+// header followed by "│ "-prefixed, width-wrapped lines. Empty/whitespace-only
+// reasoning renders nothing.
+func renderThinking(s string, width int) string {
+	s = strings.TrimSpace(s) // drop the model's leading/trailing blank reasoning lines
+	if s == "" {
+		return ""
+	}
+	out := []string{styles.ThinkingStyle.Render(styles.ThinkingHeader)}
+	for _, raw := range strings.Split(s, "\n") {
+		for _, line := range wrapToWidth(raw, width-barWidth) {
+			out = append(out, styles.ThinkingStyle.Render("│ "+line))
+		}
+	}
+	return strings.Join(out, "\n")
+}
+
+// wrapToWidth word-wraps s to width columns and returns the resulting rows with
+// trailing wrap padding trimmed. A non-positive width skips wrapping (single row).
+func wrapToWidth(s string, width int) []string {
+	if width <= 0 {
+		return []string{s}
+	}
+	wrapped := lipgloss.NewStyle().Width(width).Render(s)
+	rows := strings.Split(wrapped, "\n")
+	for i := range rows {
+		rows[i] = strings.TrimRight(rows[i], " ")
+	}
+	return rows
 }
 
 // renderInlineBlocks renders each block to plain text and joins with newlines.
@@ -222,14 +328,30 @@ func renderInlineBlocks(blocks []content.Block) string {
 	return strings.Join(parts, "\n")
 }
 
-// assistantText concatenates the text of every TextBlock and renders any other
-// block as its placeholder, joined with newlines, for markdown rendering.
+// assistantText concatenates the narration of an assistant segment for markdown
+// rendering: every block except ThinkingBlock (rendered separately as the dim
+// thinking block by renderThinking, so it must not be markdown-rendered here too).
 func assistantText(blocks []content.Block) string {
 	parts := make([]string, 0, len(blocks))
 	for _, blk := range blocks {
+		if _, ok := blk.(*content.ThinkingBlock); ok {
+			continue
+		}
 		parts = append(parts, renderBlock(blk))
 	}
 	return strings.Join(parts, "\n")
+}
+
+// thinkingText concatenates the reasoning of every ThinkingBlock in blocks, the
+// source for an assistant row's dim thinking block.
+func thinkingText(blocks []content.Block) string {
+	var b strings.Builder
+	for _, blk := range blocks {
+		if tb, ok := blk.(*content.ThinkingBlock); ok {
+			b.WriteString(tb.Thinking)
+		}
+	}
+	return b.String()
 }
 
 // firstText returns the text of the first TextBlock, or "" if there is none.
@@ -249,6 +371,8 @@ func renderBlock(blk content.Block) string {
 	switch b := blk.(type) {
 	case *content.TextBlock:
 		return b.Text
+	case *content.ThinkingBlock:
+		return b.Thinking
 	case *content.ImageBlock:
 		return fmt.Sprintf("[image: %s, %d bytes]", string(b.MediaType), len(b.Source.Data))
 	default:

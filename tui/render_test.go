@@ -1,12 +1,23 @@
 package tui
 
 import (
+	"regexp"
 	"strings"
 	"testing"
 
 	"github.com/inventivepotter/urvi/internal/content"
 	"github.com/inventivepotter/urvi/tui/styles"
 )
+
+// ansiSGR matches ANSI SGR (color/style) escape sequences. The markdown renderer
+// emits per-word color spans, so substring assertions on narration text must strip
+// styling first — they verify rendered TEXT, not the incidental color codes (which
+// depend on the runtime color profile and would otherwise split words like
+// "reading config" across two escapes).
+var ansiSGR = regexp.MustCompile("\x1b\\[[0-9;]*m")
+
+// stripANSI removes SGR escape sequences so content assertions match the visible text.
+func stripANSI(s string) string { return ansiSGR.ReplaceAllString(s, "") }
 
 func TestRenderMD(t *testing.T) {
 	t.Parallel()
@@ -28,7 +39,7 @@ func TestRenderMD(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			got := renderMD(tt.md, tt.width)
+			got := stripANSI(renderMD(tt.md, tt.width))
 			if tt.wantWord == "" {
 				if strings.TrimSpace(got) != "" {
 					t.Errorf("renderMD(%q) = %q, want empty/whitespace", tt.md, got)
@@ -39,6 +50,25 @@ func TestRenderMD(t *testing.T) {
 				t.Errorf("renderMD(%q) = %q, want to contain %q", tt.md, got, tt.wantWord)
 			}
 		})
+	}
+}
+
+// TestRenderMDAlignsWithDot covers aligning the AI message with its bullet: the
+// narration starts on the SAME line as the "●" dot, not the dot alone with the text
+// indented on the next line.
+func TestRenderMDAlignsWithDot(t *testing.T) {
+	t.Parallel()
+
+	got := stripANSI(renderMD("Hello there friend", 60))
+	first := got
+	if i := strings.IndexByte(got, '\n'); i >= 0 {
+		first = got[:i]
+	}
+	if !strings.HasPrefix(first, styles.Dot) {
+		t.Errorf("first line = %q, want it to start with the dot %q", first, styles.Dot)
+	}
+	if !strings.Contains(first, "Hello there friend") {
+		t.Errorf("first line = %q, want the narration on the same line as the dot", first)
 	}
 }
 
@@ -137,7 +167,7 @@ func TestRenderMessages(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			got := renderMessages(tt.msgs, tt.live, tt.queued, false, 80)
+			got := stripANSI(renderMessages(tt.msgs, tt.live, tt.queued, false, 80))
 			for _, w := range tt.want {
 				if !strings.Contains(got, w) {
 					t.Errorf("renderMessages() = %q, want to contain %q", got, w)
@@ -389,7 +419,7 @@ func TestRenderRowAssistantNestsCards(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			got := renderRow(tt.row, false, 80)
+			got := stripANSI(renderRow(tt.row, false, 80))
 			for _, w := range tt.want {
 				if !strings.Contains(got, w) {
 					t.Errorf("renderRow() = %q, want to contain %q", got, w)
@@ -417,7 +447,7 @@ func TestRenderMessagesLiveCards(t *testing.T) {
 			text:  "checking now",
 			calls: []ToolCallView{{ToolName: "Bash", Summary: "ls", Status: ToolRunning}},
 		}
-		got := renderMessages(nil, live, nil, false, 80)
+		got := stripANSI(renderMessages(nil, live, nil, false, 80))
 		for _, w := range []string{"checking now", "Bash", "ls", glyphRunning} {
 			if !strings.Contains(got, w) {
 				t.Errorf("renderMessages() = %q, want to contain %q", got, w)
@@ -429,7 +459,7 @@ func TestRenderMessagesLiveCards(t *testing.T) {
 		t.Parallel()
 
 		live := liveSegment{calls: []ToolCallView{{ToolName: "Bash", Status: ToolRunning}}}
-		got := renderMessages(nil, live, nil, false, 80)
+		got := stripANSI(renderMessages(nil, live, nil, false, 80))
 		for _, w := range []string{strings.TrimSpace(styles.Dot), "Bash", glyphRunning} {
 			if !strings.Contains(got, w) {
 				t.Errorf("renderMessages() = %q, want to contain %q", got, w)
@@ -460,7 +490,7 @@ func TestRenderMessagesFullTranscriptNesting(t *testing.T) {
 			},
 		},
 	}
-	got := renderMessages(msgs, liveSegment{}, nil, false, 80)
+	got := stripANSI(renderMessages(msgs, liveSegment{}, nil, false, 80))
 
 	// Every segment's text and its own card appear, in transcript order.
 	for _, w := range []string{"fix the port", "reading config", "ReadFile", "port: 8080", "now fixing", "EditFile", "port: 9090"} {
@@ -471,6 +501,102 @@ func TestRenderMessagesFullTranscriptNesting(t *testing.T) {
 	// The first card precedes the second segment's narration (chronological nesting).
 	if i, j := strings.Index(got, "ReadFile"), strings.Index(got, "now fixing"); i < 0 || j < 0 || i > j {
 		t.Errorf("expected ReadFile card before 'now fixing' narration; got idx %d vs %d", i, j)
+	}
+}
+
+// TestRenderThinking covers the dim reasoning block: a "thinking" header followed by
+// "│ "-prefixed lines, one per source line; empty input renders nothing.
+func TestRenderThinking(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name         string
+		in           string
+		wantContains []string
+		wantEmpty    bool
+	}{
+		{name: "empty renders nothing", in: "", wantEmpty: true},
+		{name: "whitespace renders nothing", in: "   \n  ", wantEmpty: true},
+		{
+			name:         "multi-line gets header and bar-prefixed lines",
+			in:           "line one\nline two",
+			wantContains: []string{"thinking", "│ line one", "│ line two"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			got := stripANSI(renderThinking(tt.in, 80))
+			if tt.wantEmpty {
+				if got != "" {
+					t.Errorf("renderThinking(%q) = %q, want empty", tt.in, got)
+				}
+				return
+			}
+			for _, w := range tt.wantContains {
+				if !strings.Contains(got, w) {
+					t.Errorf("renderThinking(%q) = %q, want to contain %q", tt.in, got, w)
+				}
+			}
+		})
+	}
+}
+
+// TestRenderUserAccentBar covers Task: a user row renders as left accent-bar lines
+// (the "▌" marker) carrying the text, replacing the old bold-only style.
+func TestRenderUserAccentBar(t *testing.T) {
+	t.Parallel()
+
+	row := DisplayMessage{Role: RoleUser, Blocks: []content.Block{&content.TextBlock{Text: "fix the port"}}}
+	got := stripANSI(renderRow(row, false, 80))
+
+	if !strings.Contains(got, "▌") {
+		t.Errorf("renderRow(user) = %q, want to contain the accent bar %q", got, "▌")
+	}
+	if !strings.Contains(got, "fix the port") {
+		t.Errorf("renderRow(user) = %q, want to contain the text", got)
+	}
+}
+
+// TestRenderAssistantThinkingBlock covers an assistant row carrying a ThinkingBlock:
+// the reasoning renders as the thinking block (never as "[unsupported block]") and
+// the narration still renders.
+func TestRenderAssistantThinkingBlock(t *testing.T) {
+	t.Parallel()
+
+	row := DisplayMessage{
+		Role: RoleAssistant,
+		Blocks: []content.Block{
+			&content.ThinkingBlock{Thinking: "my reasoning"},
+			&content.TextBlock{Text: "the final answer"},
+		},
+	}
+	got := stripANSI(renderRow(row, false, 80))
+
+	for _, w := range []string{"thinking", "my reasoning", "the final answer"} {
+		if !strings.Contains(got, w) {
+			t.Errorf("renderRow(assistant) = %q, want to contain %q", got, w)
+		}
+	}
+	if strings.Contains(got, "[unsupported block]") {
+		t.Errorf("renderRow(assistant) = %q, must not render ThinkingBlock as [unsupported block]", got)
+	}
+}
+
+// TestRenderMessagesLiveThinking covers the in-progress live segment carrying both
+// streamed thinking and narration.
+func TestRenderMessagesLiveThinking(t *testing.T) {
+	t.Parallel()
+
+	live := liveSegment{thinking: "reasoning now", text: "answering"}
+	got := stripANSI(renderMessages(nil, live, nil, false, 80))
+
+	for _, w := range []string{"thinking", "reasoning now", "answering"} {
+		if !strings.Contains(got, w) {
+			t.Errorf("renderMessages(live thinking) = %q, want to contain %q", got, w)
+		}
 	}
 }
 

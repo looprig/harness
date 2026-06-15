@@ -275,6 +275,53 @@ func firstTextBlock(t *testing.T, row DisplayMessage) string {
 	return tb.Text
 }
 
+// TestViewNoLineExceedsWidth guards against a rendered line wider than the
+// terminal: such a line wraps visually (which lipgloss.Height cannot see), pushing
+// the real frame past the terminal height and stacking stale chrome (the
+// "multiplying" artifact). Every composed line must fit the width.
+// TestViewHeightIsConstant covers the anti-stacking invariant: the composed View is
+// always exactly the terminal height regardless of turn status. If the frame height
+// fluctuates (e.g. a status line that appears only while running), shrinking frames
+// leave stale chrome that bubbletea does not clear — the "multiplying"/doubled-input
+// artifact.
+func TestViewHeightIsConstant(t *testing.T) {
+	t.Parallel()
+
+	const w, h = 60, 18
+	for _, st := range []Status{StatusIdle, StatusRunning, StatusInterrupting, StatusResetting} {
+		agent := &fakeAgent{}
+		m := New(context.Background(), agent, fakeOpen(agent))
+		m, _ = updateScreen(t, m, tea.WindowSizeMsg{Width: w, Height: h})
+		m.status = st
+		m.refreshHistory()
+		if got := lipgloss.Height(m.View()); got != h {
+			t.Errorf("status %v: View height = %d, want exactly %d", st, got, h)
+		}
+	}
+}
+
+func TestViewNoLineExceedsWidth(t *testing.T) {
+	t.Parallel()
+
+	const w, h = 40, 20
+	agent := &fakeAgent{}
+	m := New(context.Background(), agent, fakeOpen(agent))
+	m, _ = updateScreen(t, m, tea.WindowSizeMsg{Width: w, Height: h})
+
+	long := strings.Repeat("supercalifragilistic ", 20)
+	m.messages = append(m.messages,
+		DisplayMessage{Role: RoleUser, Blocks: []content.Block{&content.TextBlock{Text: long}}},
+		DisplayMessage{Role: RoleAssistant, Blocks: []content.Block{&content.TextBlock{Text: long}}},
+	)
+	m.refreshHistory()
+
+	for i, ln := range strings.Split(m.View(), "\n") {
+		if got := lipgloss.Width(ln); got > w {
+			t.Errorf("View line %d width = %d, want <= %d: %q", i, got, w, ln)
+		}
+	}
+}
+
 func TestUpdateTokenDeltaAccumulates(t *testing.T) {
 	t.Parallel()
 
@@ -294,18 +341,59 @@ func TestUpdateTokenDeltaAccumulates(t *testing.T) {
 	}
 }
 
-func TestUpdateThinkingChunkSkipped(t *testing.T) {
+// TestUpdateThinkingChunkAccumulates covers the redesign: ThinkingChunk TokenDeltas
+// accumulate into the live segment's thinking buffer (they used to be discarded) and
+// leave the narration text untouched.
+func TestUpdateThinkingChunkAccumulates(t *testing.T) {
 	t.Parallel()
 
 	agent := &fakeAgent{}
 	m := New(context.Background(), agent, fakeOpen(agent))
 	m.reader = scriptedReader()
+	m.status = StatusRunning
 	m.live.text = "keep"
 
-	m, _ = updateScreen(t, m, eventMsg{ev: event.TokenDelta{Chunk: &content.ThinkingChunk{Thinking: "x"}}})
+	m, _ = updateScreen(t, m, eventMsg{ev: event.TokenDelta{Chunk: &content.ThinkingChunk{Thinking: "rea"}}})
+	m, _ = updateScreen(t, m, eventMsg{ev: event.TokenDelta{Chunk: &content.ThinkingChunk{Thinking: "soning"}}})
 
+	if m.live.thinking != "reasoning" {
+		t.Errorf("live.thinking = %q, want %q", m.live.thinking, "reasoning")
+	}
 	if m.live.text != "keep" {
 		t.Errorf("live.text = %q, want unchanged %q", m.live.text, "keep")
+	}
+}
+
+// TestThinkingCommittedAsBlock covers committing a streamed thinking+text segment:
+// the committed assistant row carries a ThinkingBlock (the reasoning) and a TextBlock
+// (the narration), so both the streamed and final-message paths render thinking the
+// same way.
+func TestThinkingCommittedAsBlock(t *testing.T) {
+	t.Parallel()
+
+	m := runningScreen(t)
+	m = feed(t, m, event.TokenDelta{Chunk: &content.ThinkingChunk{Thinking: "because reasons"}})
+	m = feed(t, m, event.TokenDelta{Chunk: &content.TextChunk{Text: "the answer"}})
+	m = feed(t, m, event.TurnDone{})
+
+	if len(m.messages) == 0 {
+		t.Fatal("no committed messages after TurnDone")
+	}
+	last := m.messages[len(m.messages)-1]
+	var thinking, text string
+	for _, b := range last.Blocks {
+		switch bb := b.(type) {
+		case *content.ThinkingBlock:
+			thinking = bb.Thinking
+		case *content.TextBlock:
+			text = bb.Text
+		}
+	}
+	if thinking != "because reasons" {
+		t.Errorf("committed ThinkingBlock = %q, want %q (blocks=%+v)", thinking, "because reasons", last.Blocks)
+	}
+	if text != "the answer" {
+		t.Errorf("committed TextBlock = %q, want %q (blocks=%+v)", text, "the answer", last.Blocks)
 	}
 }
 

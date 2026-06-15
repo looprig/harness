@@ -13,17 +13,20 @@ import (
 	"github.com/inventivepotter/urvi/tui/components"
 )
 
-// reservedLines is the vertical space the status line (1) plus the input box (3)
-// occupy below the history viewport.
-const reservedLines = 4
+// reservedLines is the vertical space the input box occupies below the history
+// viewport. The status line was removed, so only the 2-line input is reserved; the
+// history fills the rest so the composed frame is exactly the terminal height.
+const reservedLines = 2
 
 // liveSegment is the in-progress assistant segment for the current turn: the
-// streamed narration text plus the tool calls reconstructed from the event
-// stream. It is committed to a DisplayMessage when the segment ends. calls stays
-// empty until the event-reconstruction state machine populates it (later phase).
+// streamed reasoning (thinking) and narration text plus the tool calls
+// reconstructed from the event stream. It is committed to a DisplayMessage when the
+// segment ends. calls stays empty until the event-reconstruction state machine
+// populates it.
 type liveSegment struct {
-	text  string
-	calls []ToolCallView
+	text     string
+	thinking string
+	calls    []ToolCallView
 }
 
 // Screen is the Elm model for the chat TUI. It owns all display state — the
@@ -117,16 +120,22 @@ func (m *Screen) handleEvent(ev event.Event) tea.Cmd {
 	case event.TurnStarted:
 		// Already Running; nothing to display.
 	case event.TokenDelta:
-		if tc, ok := ev.Chunk.(*content.TextChunk); ok {
+		switch chunk := ev.Chunk.(type) {
+		case *content.TextChunk:
 			// Narration following a completed tool batch begins a NEW segment:
 			// commit the prior segment (its text + cards) before accumulating.
 			if len(m.live.calls) > 0 {
 				m.commitLive()
 			}
-			m.live.text += tc.Text
+			m.live.text += chunk.Text
+			m.refreshHistory()
+		case *content.ThinkingChunk:
+			// Reasoning streams into the live segment and renders as the dim
+			// thinking block above the narration.
+			m.live.thinking += chunk.Thinking
 			m.refreshHistory()
 		}
-		// Any other chunk variant (e.g. *content.ThinkingChunk) is skipped.
+		// Any other chunk variant is skipped.
 	case event.ToolCallStarted:
 		m.handleToolStarted(ev)
 	case event.ToolCallCompleted:
@@ -147,24 +156,28 @@ func (m *Screen) handleEvent(ev event.Event) tea.Cmd {
 }
 
 // liveNonEmpty reports whether the live segment carries committable content —
-// either streamed narration text or any reconstructed tool call.
+// streamed reasoning, streamed narration text, or any reconstructed tool call.
 func (m *Screen) liveNonEmpty() bool {
-	return m.live.text != "" || len(m.live.calls) > 0
+	return m.live.text != "" || m.live.thinking != "" || len(m.live.calls) > 0
 }
 
 // commitLive appends the live segment to the transcript as one RoleAssistant row
-// carrying BOTH its narration text and its tool-call children, then resets the
-// live segment. It is a no-op when the live segment is empty. A segment with no
-// text but with calls still commits (a bare assistant row whose only content is
-// its tool cards, per design §3): the empty TextBlock is omitted so the row's
-// Blocks are nil and only ToolCalls survive.
+// carrying its reasoning, its narration text, and its tool-call children, then
+// resets the live segment. It is a no-op when the live segment is empty. Reasoning
+// is stored as a leading ThinkingBlock so the streamed and final-message paths
+// render thinking identically. A segment with no text/thinking but with calls still
+// commits (a bare assistant row whose only content is its tool cards, per design
+// §3): empty blocks are omitted so only the present content survives.
 func (m *Screen) commitLive() {
 	if !m.liveNonEmpty() {
 		return
 	}
 	var blocks []content.Block
+	if m.live.thinking != "" {
+		blocks = append(blocks, &content.ThinkingBlock{Thinking: m.live.thinking})
+	}
 	if m.live.text != "" {
-		blocks = []content.Block{&content.TextBlock{Text: m.live.text}}
+		blocks = append(blocks, &content.TextBlock{Text: m.live.text})
 	}
 	m.messages = append(m.messages, DisplayMessage{
 		Role:      RoleAssistant,
@@ -346,18 +359,24 @@ func (m *Screen) handleReopenResult(msg reopenResultMsg) tea.Cmd {
 }
 
 // View renders an empty string until the first WindowSizeMsg (avoids a 0×0 first
-// frame), then vertically joins history, status line, an optional slash-complete
-// panel, and the input box.
+// frame), then vertically joins the history, an optional slash-complete panel, and
+// the input box. The history is pinned to an exact line count so the composed frame
+// is ALWAYS exactly the terminal height: a frame whose height fluctuates between
+// renders leaves stale rows that bubbletea does not clear (the "multiplying" /
+// doubled-input artifact). The turn status is intentionally not shown here — thinking
+// streams inline as its own block.
 func (m Screen) View() string {
 	if !m.ready {
 		return ""
 	}
-	rows := []string{m.history.View()}
-	if status := RenderStatusLine(m.status); status != "" {
-		// Skip the Idle empty status: JoinVertical would otherwise count it as
-		// a blank row and the composite would exceed the height reservation.
-		rows = append(rows, status)
-	}
+	hh := m.historyHeight()
+	history := lipgloss.NewStyle().
+		Width(m.width).
+		Height(hh).
+		MaxHeight(hh).
+		Render(m.history.View())
+
+	rows := []string{history}
 	if m.slashComplete != nil {
 		rows = append(rows, m.slashComplete.View())
 	}

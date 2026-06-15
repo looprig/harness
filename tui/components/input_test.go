@@ -1,6 +1,33 @@
 package components
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
+
+// TestInputBoxAppearance covers the 2-line input: exactly two rows (so stale frames
+// can't bleed through), the "▌" accent bar on the left (matching user rows), a dim
+// placeholder, and no "> " prompt.
+func TestInputBoxAppearance(t *testing.T) {
+	t.Parallel()
+
+	b := NewInputBox()
+	b.Resize(40)
+	v := b.View()
+
+	if lines := strings.Count(v, "\n") + 1; lines != 2 {
+		t.Fatalf("View() has %d lines, want exactly 2:\n%q", lines, v)
+	}
+	if strings.Contains(v, "> ") {
+		t.Errorf("View() still shows the old \"> \" prompt:\n%q", v)
+	}
+	if !strings.Contains(v, "▌") {
+		t.Errorf("View() missing the \"▌\" accent bar:\n%q", v)
+	}
+	if !strings.Contains(v, "Type a message") {
+		t.Errorf("View() missing the placeholder text:\n%q", v)
+	}
+}
 
 func TestInputBoxValueResetSetValue(t *testing.T) {
 	t.Parallel()

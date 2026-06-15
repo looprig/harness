@@ -3,13 +3,21 @@ package components
 import (
 	"github.com/charmbracelet/bubbles/textarea"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
+
+	"github.com/inventivepotter/urvi/tui/styles"
 )
 
-// inputHeight is the fixed visible height of the prompt editor, in lines.
-const inputHeight = 3
+// inputHeight is the fixed visible height of the prompt editor, in lines. View
+// clamps the rendered box to exactly this many rows.
+const inputHeight = 2
 
-// InputBox wraps a bubbles textarea: fixed 3-line height, no char limit, no line
-// numbers — the user's prompt editor.
+// placeholder is the dim hint shown while the editor is empty.
+const placeholder = "Type a message…"
+
+// InputBox wraps a bubbles textarea: a fixed 2-line editor with the shared "▌"
+// accent bar as its prompt (matching user-message rows), shown whether or not the
+// user is typing. No char limit, no line numbers, no "> " prompt.
 type InputBox struct {
 	ta textarea.Model
 }
@@ -19,7 +27,14 @@ func NewInputBox() InputBox {
 	ta := textarea.New()
 	ta.CharLimit = 0
 	ta.ShowLineNumbers = false
-	ta.Prompt = "> "
+	ta.Prompt = styles.AccentBarPrompt
+	ta.FocusedStyle.Prompt = styles.AccentBarStyle
+	ta.BlurredStyle.Prompt = styles.AccentBarStyle
+	ta.Placeholder = placeholder
+	// The bubbles textarea highlights the focused line with a black background
+	// (DefaultStyles: CursorLine bg "0"), which appears as a stray dark patch only
+	// as wide as the text. Clear it so the input is plain like the user-message rows.
+	ta.FocusedStyle.CursorLine = lipgloss.NewStyle()
 	ta.SetHeight(inputHeight)
 	ta.Focus()
 	return InputBox{ta: ta}
@@ -57,7 +72,9 @@ func (b *InputBox) Update(msg tea.Msg) tea.Cmd {
 	return cmd
 }
 
-// View renders the editor.
+// View renders the editor clamped to exactly inputHeight rows. Forcing the height
+// keeps the input from ever contributing more rows than the layout reserved — a
+// taller frame would overflow the terminal and stack stale chrome.
 func (b *InputBox) View() string {
-	return b.ta.View()
+	return lipgloss.NewStyle().Height(inputHeight).MaxHeight(inputHeight).Render(b.ta.View())
 }
