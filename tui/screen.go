@@ -396,6 +396,12 @@ func (m *Screen) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.slashComplete.Down()
 			return *m, nil
 		}
+	case "ctrl+t":
+		// Toggle tool-result preview expansion and re-render. Pure display state:
+		// works in any status (it never touches the turn or the agent).
+		m.expandTools = !m.expandTools
+		m.refreshHistory()
+		return *m, nil
 	case "enter":
 		return *m, m.handleEnter()
 	case "pgup", "pgdown", "ctrl+u", "ctrl+d":
