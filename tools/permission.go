@@ -68,6 +68,12 @@ type ApprovalRecord struct {
 type ApprovalsFile struct {
 	Version   int              `json:"version"`
 	Approvals []ApprovalRecord `json:"approvals"`
+
+	// SkippedRecords is the count of individually-malformed records that
+	// parseApprovalsFile dropped while keeping the valid ones (fail-secure). It is
+	// IN-MEMORY ONLY (json:"-") — never serialized — and is used solely to emit a
+	// single aggregate operability warning. It never holds record contents.
+	SkippedRecords int `json:"-"`
 }
 
 // PermissionPolicy is the immutable-at-construction configuration the
@@ -153,6 +159,23 @@ type homeDirFunc func() (string, error)
 // hashcache instances are themselves concurrency-safe, but they are only ever
 // touched under mu here, which keeps the whole decision atomic w.r.t. a
 // concurrent session grant.
+//
+// I/O under the lock — an ACCEPTED trade-off: the lock is intentionally held
+// across Stage 5's os.ReadFile of the two approvals files. This serializes
+// concurrent Check calls across that disk I/O — notably under the runner's
+// parallel tool batch (MaxParallelToolCalls, default 8), where up to that many
+// Check calls can be in flight at once. It is accepted because the atomicity it
+// buys (a Check never observes a half-applied concurrent session grant, and the
+// two-file deny-beats-allow reduction is computed against a single consistent
+// policy snapshot) outweighs the cost: the approvals files are small and the
+// hashcache returns memoized parses for unchanged content, so the held I/O is a
+// cheap, cache-fast read in the common case, and this is an interactive agent,
+// not a high-QPS service. If lock contention ever does matter, the noted future
+// option is a lock-free snapshot refactor — snapshot the policy fields under the
+// lock, release it, then do the file I/O + matching outside the lock — exactly
+// as DeniedRead already does for its read-filter check. Until then the locking
+// stays as-is; the security core (the decision + the single-mutex structure) is
+// verified and must not regress.
 type PermissionChecker struct {
 	mu      sync.Mutex
 	policy  PermissionPolicy
@@ -202,6 +225,12 @@ func (c *PermissionChecker) appendSessionPolicy(p loop.ToolPolicy) {
 // before emitting results. It is fail-secure: an unresolvable home dir does not
 // disable the non-home globs (e.g. **/.env still matches), and any matcher error
 // is a no-match within a single glob but never a panic.
+//
+// CONTRACT: callers MUST pass a containedPath-resolved ABSOLUTE path (the
+// cleaned, symlink-resolved, workspace-contained output — mirroring the input
+// MatchFileGlob requires). matchHardDenyAbs strips a single leading "/" to align
+// the glob segments, so a relative or unresolved path would silently mis-match;
+// the Phase-6 read tools must honour this so their traversal filter is sound.
 func (c *PermissionChecker) DeniedRead(absPath string) bool {
 	c.mu.Lock()
 	denied := c.policy.HardDeny.DeniedReadPaths

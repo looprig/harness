@@ -512,6 +512,55 @@ func TestCheckMalformedApprovalsWarns(t *testing.T) {
 	}
 }
 
+// TestCheckSkippedRecordsWarn proves that when ≥1 individual record is malformed
+// and dropped (while valid records still apply), a SINGLE aggregate WARN is
+// emitted carrying the dropped COUNT and the file PATH but NOT the record
+// CONTENTS (which could carry sensitive match patterns/secrets). Like the
+// malformed-file test it is intentionally NOT parallel — it swaps the global
+// slog default to capture output.
+func TestCheckSkippedRecordsWarn(t *testing.T) {
+	ws := newWS(t)
+	if err := os.WriteFile(filepath.Join(ws, "main.go"), []byte("package main"), 0o600); err != nil {
+		t.Fatalf("write main.go: %v", err)
+	}
+	// A distinctive secret embedded in a record's match field. The record's effect
+	// is unknown ("frobnicate") so parseApprovalsFile DROPS it (counted as
+	// skipped); a sibling valid allow record keeps the stage live.
+	const secretToken = "TOPSECRET_MATCH_DO_NOT_LOG"
+	skipped := []byte(`{"version":1,"approvals":[` +
+		`{"tool":"ReadFile","match":"` + secretToken + `","effect":"frobnicate"},` +
+		`{"tool":"ReadFile","match":"main.go","effect":"allow"}]}`)
+
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	pc := NewPermissionChecker(PermissionPolicy{WorkspaceRoot: ws, HardDeny: DefaultHardDeny()})
+	_, homeFn := fakeHome(t, ws, skipped, nil)
+	pc.SetHomeDir(homeFn)
+
+	// The valid allow record must still apply (skip is fail-secure, not fatal).
+	got := pc.Check(context.Background(), plainTool{name: "ReadFile"}, "ReadFile", `{"path":"main.go"}`)
+	if got != loop.EffectAutoApprove {
+		t.Fatalf("Check() = %v, want EffectAutoApprove (valid record applies despite skip)", got)
+	}
+
+	logged := buf.String()
+	if !strings.Contains(logged, "skipped malformed approval records") {
+		t.Errorf("expected the aggregate skipped-records warning; log was:\n%s", logged)
+	}
+	if !strings.Contains(logged, "count=1") {
+		t.Errorf("warning should report the dropped count (count=1); log was:\n%s", logged)
+	}
+	if !strings.Contains(logged, "approvals.json") {
+		t.Errorf("warning should name the file path; log was:\n%s", logged)
+	}
+	if strings.Contains(logged, secretToken) {
+		t.Errorf("warning leaked record CONTENTS (%q); log was:\n%s", secretToken, logged)
+	}
+}
+
 // TestCheckInRepoApprovalsIgnored proves an in-repo <ws>/.urvi/approvals.json has
 // NO effect — only ~/.urvi/workspaces/<hash>/ is read.
 func TestCheckInRepoApprovalsIgnored(t *testing.T) {

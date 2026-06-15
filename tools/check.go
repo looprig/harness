@@ -169,6 +169,13 @@ func (c *PermissionChecker) Check(ctx context.Context, t tool.InvokableTool, too
 }
 
 // boundaryOutcome is the result of the Stage-1/2 safety evaluation.
+//
+// The loop.Effect returned ALONGSIDE a boundaryOutcome is meaningful ONLY when
+// the outcome is boundaryDenied (it carries the EffectDeny to return). For
+// boundaryCleared and boundaryAskOnly the paired Effect is a DON'T-CARE: Check
+// ignores it (a cleared call proceeds to the approval stages; an askOnly call
+// returns loop.EffectAsk regardless). The helpers below conventionally return
+// loop.EffectAsk in those cases, but only the outcome is load-bearing.
 type boundaryOutcome uint8
 
 const (
@@ -198,6 +205,8 @@ func (c *PermissionChecker) stageContainmentAndHardDeny(toolName string, class t
 	case classBash:
 		return c.checkBashBoundary(argsJSON)
 	case classNetwork:
+		// No filesystem boundary → cleared. The Effect is a don't-care here (only
+		// boundaryDenied carries a meaningful Effect); cleared proceeds to Stage 3+.
 		return loop.EffectAsk, boundaryCleared
 	default: // classUnknown
 		return c.checkUnknownBoundary(argsJSON)
@@ -276,6 +285,7 @@ func (c *PermissionChecker) checkBashBoundary(argsJSON string) (loop.Effect, bou
 	if matchDeniedBashPrefix(cmd, c.policy.HardDeny.DeniedBashPrefixes) {
 		return loop.EffectDeny, boundaryDenied
 	}
+	// Cleared: the paired Effect is a don't-care (ignored unless boundaryDenied).
 	return loop.EffectAsk, boundaryCleared
 }
 
@@ -320,6 +330,7 @@ func (c *PermissionChecker) containAndHardDeny(rawPath string, deniedGlobs []str
 			return loop.EffectDeny, boundaryDenied // Stage 2.
 		}
 	}
+	// Cleared: the paired Effect is a don't-care (ignored unless boundaryDenied).
 	return loop.EffectAsk, boundaryCleared
 }
 
@@ -395,6 +406,10 @@ func (c *PermissionChecker) loadUserApprovals(ctx context.Context, home string) 
 // absent store is normal). Any other read error or a parse error yields no
 // records plus a single warning naming the PATH only (never the contents — those
 // could carry sensitive match patterns). This is the fail-open-to-Ask behaviour.
+//
+// If the file parsed but ≥1 individual record was malformed and dropped (the
+// valid records still apply), a SINGLE aggregate warning is emitted with the
+// dropped COUNT and the file PATH — never the record contents/secrets.
 func loadApprovalRecords(ctx context.Context, cache *hashcache.Cache[ApprovalsFile], p string) []ApprovalRecord {
 	b, err := os.ReadFile(p) // #nosec G304 -- p is composed from the trusted home dir + fixed store names, not user input.
 	if err != nil {
@@ -409,6 +424,11 @@ func loadApprovalRecords(ctx context.Context, cache *hashcache.Cache[ApprovalsFi
 		// Malformed file → behave as empty + warn (path only, never contents).
 		slog.WarnContext(ctx, "tools: malformed approvals file; skipped (treated as empty)", "path", p, "err", err)
 		return nil
+	}
+	if af.SkippedRecords > 0 {
+		// Aggregate operability signal: how many records were dropped and from
+		// where. NEVER the record contents (which could carry sensitive patterns).
+		slog.WarnContext(ctx, "tools: skipped malformed approval records", "count", af.SkippedRecords, "path", p)
 	}
 	return af.Approvals
 }
@@ -720,12 +740,14 @@ func parseApprovalsFile(b []byte) (ApprovalsFile, error) {
 		var rec ApprovalRecord
 		if err := json.Unmarshal(rawRec, &rec); err != nil {
 			// A single bad record (e.g. unknown effect via Effect.UnmarshalJSON, or
-			// a non-string effect) is SKIPPED, not fatal. The caller's loader logs
-			// the file as malformed only on a whole-file error; here we silently
-			// drop the bad record so valid records still apply. We deliberately do
-			// not warn per-record (the file path is logged at most once on a
-			// whole-file failure) — but a wholly-bad file yields zero records, which
-			// lands the stage at Ask.
+			// a non-string effect) is SKIPPED, not fatal. We drop the bad record so
+			// valid records still apply, and only TALLY it here — we deliberately do
+			// not warn per-record (which would risk logging record contents). The
+			// loader (loadApprovalRecords) emits a single AGGREGATE count+path warn
+			// when out.SkippedRecords > 0; a whole-file syntax error is warned
+			// separately. A wholly-bad file yields zero records, landing Stage 5 at
+			// Ask.
+			out.SkippedRecords++
 			continue
 		}
 		out.Approvals = append(out.Approvals, rec)
