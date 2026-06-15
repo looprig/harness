@@ -22,6 +22,29 @@ import (
 // flood the model context. A larger match set is truncated with a notice.
 const maxGlobResults = 500
 
+// globNoiseDirs are directory names Glob prunes at the directory level (it does
+// not descend into them) by DEFAULT, so `**/*` over a workspace never floods the
+// model with VCS internals or large generated trees that are never useful to a
+// coding agent (a real provider context-window overflow motivated this). `.git`
+// is the must-have — its hundreds of objects/refs are pure noise; the rest are
+// well-known heavy/generated trees (dependencies, build output, editor metadata).
+// Pruning is bypassed when the search ROOT is itself one of these dirs (the user
+// explicitly targeted it), mirroring grep's grepNoiseDirs behaviour. The set is
+// kept intentionally parallel to grep's grepNoiseDirs (same purpose, two callers);
+// duplicating this short, stable list keeps each read tool self-contained.
+var globNoiseDirs = map[string]bool{
+	".git":         true, // VCS internals: objects/refs/logs — never useful to an agent.
+	".hg":          true, // Mercurial internals.
+	".svn":         true, // Subversion internals.
+	"node_modules": true, // JS dependencies — huge, generated.
+	"vendor":       true, // vendored deps (Go and others).
+	"dist":         true, // build/distribution output.
+	"build":        true, // build output.
+	"target":       true, // Rust/Java (cargo/maven) build output.
+	".next":        true, // Next.js build cache.
+	"__pycache__":  true, // Python bytecode cache.
+}
+
 // globToolName is the EXACT tool name classifyTool keys on for the read class.
 const globToolName = toolGlob
 
@@ -134,6 +157,12 @@ func (g *Glob) walk(ctx context.Context, searchAbs, resolvedRoot, pattern string
 			return nil
 		}
 		if d.IsDir() {
+			// Prune noise/VCS dirs at the directory level (don't descend) so a broad
+			// pattern cannot flood the model context. The search root itself is never
+			// pruned, so an explicit `root: ".git"` is still honoured.
+			if abs != searchAbs && globNoiseDirs[d.Name()] {
+				return fs.SkipDir
+			}
 			return nil
 		}
 		// Authoritative denied-path exclusion (shared helper): never leak a secret's

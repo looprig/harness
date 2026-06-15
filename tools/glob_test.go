@@ -118,6 +118,66 @@ func TestGlob(t *testing.T) {
 			wantContain: []string{"error"},
 		},
 		{
+			name: "git and noise dirs are pruned by default",
+			setup: func(t *testing.T, root string) {
+				// VCS internals and heavy generated trees that must never reach the model.
+				mustWrite(t, filepath.Join(root, ".git", "objects", "ab", "cdef"), "x")
+				mustWrite(t, filepath.Join(root, ".git", "HEAD"), "ref: x")
+				mustWrite(t, filepath.Join(root, "node_modules", "left-pad", "index.js"), "x")
+				mustWrite(t, filepath.Join(root, "vendor", "dep", "v.go"), "x")
+				// A real source file that SHOULD be listed.
+				mustWrite(t, filepath.Join(root, "main.go"), "x")
+			},
+			args:        func(root string) map[string]any { return map[string]any{"pattern": "**"} },
+			guard:       func(root string) *fakeReadGuard { return newFakeReadGuard(1 << 20) },
+			wantContain: []string{"main.go"},
+			wantAbsent:  []string{".git", "node_modules", "vendor"},
+		},
+		{
+			name: "explicit noise-dir root is still searched",
+			setup: func(t *testing.T, root string) {
+				mustWrite(t, filepath.Join(root, ".git", "HEAD"), "ref: x")
+				mustWrite(t, filepath.Join(root, ".git", "config"), "x")
+			},
+			args:        func(root string) map[string]any { return map[string]any{"pattern": "**", "root": ".git"} },
+			guard:       func(root string) *fakeReadGuard { return newFakeReadGuard(1 << 20) },
+			wantContain: []string{".git/HEAD", ".git/config"},
+		},
+		{
+			name: "exactly the cap is not truncated",
+			setup: func(t *testing.T, root string) {
+				for i := 0; i < maxGlobResults; i++ {
+					mustWrite(t, filepath.Join(root, fmt.Sprintf("f%04d.go", i)), "x")
+				}
+			},
+			args:        func(root string) map[string]any { return map[string]any{"pattern": "*.go"} },
+			guard:       func(root string) *fakeReadGuard { return newFakeReadGuard(1 << 20) },
+			wantContain: []string{"f0000.go"},
+			wantAbsent:  []string{"truncat", "more matches"},
+		},
+		{
+			name: "one over the cap is truncated with a refine notice",
+			setup: func(t *testing.T, root string) {
+				for i := 0; i < maxGlobResults+1; i++ {
+					mustWrite(t, filepath.Join(root, fmt.Sprintf("f%04d.go", i)), "x")
+				}
+			},
+			args:        func(root string) map[string]any { return map[string]any{"pattern": "*.go"} },
+			guard:       func(root string) *fakeReadGuard { return newFakeReadGuard(1 << 20) },
+			wantContain: []string{"truncat", "refine"},
+		},
+		{
+			name: "empty dir reports no matches",
+			setup: func(t *testing.T, root string) {
+				if err := os.MkdirAll(filepath.Join(root, "empty"), 0o700); err != nil {
+					t.Fatalf("mkdir: %v", err)
+				}
+			},
+			args:        func(root string) map[string]any { return map[string]any{"pattern": "**/*.go"} },
+			guard:       func(root string) *fakeReadGuard { return newFakeReadGuard(1 << 20) },
+			wantContain: []string{"no matches"},
+		},
+		{
 			name: "over the cap is truncated with a notice",
 			setup: func(t *testing.T, root string) {
 				for i := 0; i < maxGlobResults+25; i++ {
