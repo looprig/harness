@@ -22,7 +22,7 @@ type ChatRequest struct {
 
 type chatMessage struct {
 	Role             string      `json:"role"`
-	Content          interface{} `json:"content"` // string or []chatContentPart; interface{} required at JSON serialization boundary
+	Content          interface{} `json:"content"`                     // string or []chatContentPart; interface{} required at JSON serialization boundary
 	ReasoningContent string      `json:"reasoning_content,omitempty"` // DeepSeek / o-series
 	ToolCalls        []toolCall  `json:"tool_calls,omitempty"`
 	ToolCallID       string      `json:"tool_call_id,omitempty"`
@@ -89,8 +89,20 @@ type sseChoice struct {
 }
 
 type sseMessageDelta struct {
-	Role             string     `json:"role"`
-	Content          string     `json:"content"`
-	ReasoningContent string     `json:"reasoning_content"` // DeepSeek / o-series
-	ToolCalls        []toolCall `json:"tool_calls"`
+	Role             string             `json:"role"`
+	Content          string             `json:"content"`
+	ReasoningContent string             `json:"reasoning_content"` // DeepSeek / o-series
+	ToolCalls        []sseToolCallDelta `json:"tool_calls"`
+}
+
+// sseToolCallDelta is one streaming tool-call delta entry. Unlike the
+// non-streaming toolCall, it carries a per-call Index and delivers
+// Function.Arguments as string fragments that the runner concatenates by Index.
+type sseToolCallDelta struct {
+	Index    int    `json:"index"`
+	ID       string `json:"id"` // first delta only
+	Function struct {
+		Name      string `json:"name"`      // first delta only
+		Arguments string `json:"arguments"` // FRAGMENT — concatenate across deltas
+	} `json:"function"`
 }
