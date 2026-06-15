@@ -119,6 +119,12 @@ Date: 2026-06-14 · Status: approved (brainstorm)
 > bound for the parallel batch, distinct from the total `MaxToolCallsPerTurn` (§3b,
 > §2d); (2) **`WriteTarget` error behavior** specified — `err != nil` → tool-result
 > error, not executed, not grouped (§3a, §2d).
+>
+> **Revision 2026-06-14 (review pass 12)** removes `ToolResult.Terminate` from v1: on
+> `Terminate` the loop emitted `TurnDone(lastAIMessage)`, but that is the
+> tool-*requesting* assistant message, not the terminal tool output — an unclear
+> contract no v1 tool needs. Turns now complete only via the model emitting no more
+> tool calls (§2a, §3a; deferred in Out of scope).
 
 ## Scope
 
@@ -231,7 +237,7 @@ for {
     }
     results := runner.RunBatch(ctx, toolUseBlocks, cfg.Tools, gateReg, emit)
     for each result: append content.ToolMessage{ToolUseID, Blocks: flattenToText(result.Content)} to msgs
-    if any result.Terminate { emit TurnDone(lastAIMessage); return }
+    // loop: next iteration lets the model react to the tool results
 }
 // on ctx-cancel / interrupt anywhere above: msgs = msgs[:base]; emit TurnInterrupted; return
 ```
@@ -297,11 +303,10 @@ interrupted/failed exchange even though the model's context drops it — the exi
   abnormal exit truncates `msgs[:base]`; only a `TurnDone` path keeps the (well-formed,
   fully paired) exchange. See the *Generalized rollback contract* note above.
 - **Turn completion vs. abort.** The agentic loop completes *normally* (emits
-  `TurnDone`) on either of two paths: the model returns no tool calls, or a tool
-  result sets `Terminate`. The things that *abort* a turn — no `TurnDone`, whole-turn
-  rollback — are `ctx` cancellation / `Interrupt` (`TurnInterrupted`) and the runaway
-  guard (`TurnFailed{ToolLimitError}`). (See §2d; "tool failures never terminate"
-  means a tool *error* never aborts, not that `Terminate` can't complete.)
+  `TurnDone`) on exactly one path: the model returns no tool calls. The things that
+  *abort* a turn — no `TurnDone`, whole-turn rollback — are `ctx` cancellation /
+  `Interrupt` (`TurnInterrupted`) and the runaway guard (`TurnFailed{ToolLimitError}`).
+  (There is no tool-driven `Terminate` in v1 — see Out of scope.)
 
 ### §2b. Streaming tool calls — `content.ToolUseChunk`
 
@@ -519,7 +524,7 @@ keeps draining.
 - **All tool failures become tool-result strings** (invalid args, permission
   denied, execution error, panic, unknown tool) — a tool *error* never aborts the
   turn; the model sees it and can react. The turn *completes normally* (`TurnDone`)
-  when the model emits no more tool calls or a result sets `Terminate` (§2a). The
+  when the model emits no more tool calls (§2a). The
   things that *abort* a turn (no `TurnDone`; whole-turn rollback to `base`, §2a) are
   `ctx` cancellation / `Interrupt` (`TurnInterrupted`) and the runaway guard
   (`TurnFailed{ToolLimitError}`) — a tool-limit failure is **not** a normal
@@ -569,10 +574,12 @@ type BaseTool      interface { Info(ctx context.Context) (*ToolInfo, error) } //
 type InvokableTool interface { BaseTool; InvokableRun(ctx context.Context, argsJSON string) (*ToolResult, error) }
 
 type ToolResult struct {
-    Content   []content.Block // ≥1 block; runner injects "error: empty result" if nil
-    Terminate bool
+    Content []content.Block // ≥1 block; runner injects "error: empty result" if nil
 }
-func TextResult(s string) *ToolResult // one TextBlock, Terminate false
+func TextResult(s string) *ToolResult // one TextBlock
+// No Terminate field in v1 — see Out of scope. A tool ending the turn needs a defined
+// terminal-message contract that no v1 tool requires; turns end only via the model
+// emitting no more tool calls (TurnDone) or an abort (TurnInterrupted / ToolLimitError).
 
 // Optional capability interfaces (added, never folded into BaseTool — Rule 1):
 type Sequential        interface { Sequential() bool }
@@ -1088,8 +1095,7 @@ The pixel-level work is a follow-up TUI-update doc, since that TUI is mid-flight
   middleware ordering, panic→error result, ctx-cancel terminates.
 - `runTurn` — `ToolUseChunk` fragment-accumulation by `Index`, tool round-trips,
   tool-result flattened to text in the `ToolMessage` (non-empty on the wire;
-  non-text → visible placeholder), `Terminate` completes with `TurnDone`, no-tool-call
-  exit; fake `llm.LLM`.
+  non-text → visible placeholder), no-tool-call exit emits `TurnDone`; fake `llm.LLM`.
 - gate plumbing — **synchronous registration**: an approval delivered immediately
   after the request still lands (the ack ordering guarantees install-before-emit);
   the per-gate channel does not drop the valid approval when a stale/duplicate
@@ -1179,6 +1185,11 @@ The pixel-level work is a follow-up TUI-update doc, since that TUI is mid-flight
 - **Subagent** beyond the synchronous stub — streaming child events, the full
   depth/token-budget policy (a hard max-depth cap ships now, §4b), skill catalog.
 - WebSearch providers beyond DuckDuckGo.
+- **`ToolResult.Terminate`** — a tool ending the turn needs a defined terminal-message
+  contract (the terminating tool result would have to be converted into the final
+  `AIMessage` carried by `TurnDone`, since the last assistant message is the
+  tool-*requesting* one). No v1 tool needs it; deferred rather than shipped with an
+  ambiguous contract.
 - Command dedup/idempotency **cache** (IDs are the substrate — identity doc).
 - Detailed TUI rendering of prompts/cards (contract here; rendering in a TUI-update
   doc).
