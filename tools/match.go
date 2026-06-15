@@ -255,6 +255,25 @@ func cleanPathPrefix(p string) string {
 	return cleaned
 }
 
+// fetchMatchString derives the canonical Fetch record Match "<METHOD>
+// <scheme>://<host>" from a live call's method + URL, reusing parseFetchCall so
+// the derivation and the matcher share the SAME normalization (lower-cased
+// idna-punycode host, port excluded, upper-cased method, lower-cased scheme). It
+// records NO path-prefix — a grant approves the whole scheme+host+method, the
+// conservative breadth the design specifies (a path-scoped grant is a hand-edited
+// opt-in). ok=false on any unparseable/non-normalizable input (Grant then fails
+// secure). The produced string round-trips: MatchFetch(out, method, url) is true.
+func fetchMatchString(callMethod, callURL string) (string, bool) {
+	call, ok := parseFetchCall(callMethod, callURL)
+	if !ok {
+		return "", false
+	}
+	if call.method == "" {
+		return "", false
+	}
+	return call.method + " " + call.scheme + "://" + call.host, true
+}
+
 // pathMatches reports whether callPath satisfies a record path-prefix. An empty
 // recordPref means the record opted out of path matching → any path matches.
 // Otherwise matching is SEGMENT-AWARE: callPath must equal recordPref or have it

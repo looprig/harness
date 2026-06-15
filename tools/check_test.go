@@ -719,11 +719,13 @@ func TestReadGuard(t *testing.T) {
 }
 
 // TestReadGuardInterfaces is a compile-time assertion that *PermissionChecker
-// satisfies loop.ReadGuard. (The full loop.PermissionGate assertion lands with
-// Grant in the next task; Check is exercised directly throughout this file.)
+// satisfies loop.ReadGuard AND loop.PermissionGate (the latter now that Grant
+// exists; the package-level assertion lives in grant.go, re-stated here so the
+// gate contract is exercised alongside the ReadGuard one).
 func TestReadGuardInterfaces(t *testing.T) {
 	t.Parallel()
 	var _ loop.ReadGuard = (*PermissionChecker)(nil)
+	var _ loop.PermissionGate = (*PermissionChecker)(nil)
 }
 
 // TestMatchHardDenyAbs unit-tests the absolute hard-deny matcher directly,

@@ -3,11 +3,13 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"log/slog"
 	"os"
 	"path"
 	"path/filepath"
 	"strings"
+	"syscall"
 
 	"github.com/inventivepotter/urvi/internal/agent/loop"
 	"github.com/inventivepotter/urvi/internal/hashcache"
@@ -392,32 +394,34 @@ func (c *PermissionChecker) loadWorkspaceApprovals(ctx context.Context, home str
 		slog.WarnContext(ctx, "tools: workspace root unresolvable; workspace approvals skipped", "err", err)
 		return nil
 	}
-	return loadApprovalRecords(ctx, c.wsCache, workspaceApprovalsPath(home, hash))
+	return loadApprovalRecords(ctx, c.wsCache, home, workspaceApprovalsPath(home, hash))
 }
 
 // loadUserApprovals reads + parses the user-global approvals file with the same
 // fail-open semantics as loadWorkspaceApprovals.
 func (c *PermissionChecker) loadUserApprovals(ctx context.Context, home string) []ApprovalRecord {
-	return loadApprovalRecords(ctx, c.userCache, userApprovalsPath(home))
+	return loadApprovalRecords(ctx, c.userCache, home, userApprovalsPath(home))
 }
 
-// loadApprovalRecords reads the file at p, feeds the bytes to the content-keyed
-// cache, and returns its records. A non-existent file is empty (no warning — an
-// absent store is normal). Any other read error or a parse error yields no
-// records plus a single warning naming the PATH only (never the contents — those
-// could carry sensitive match patterns). This is the fail-open-to-Ask behaviour.
+// loadApprovalRecords reads the file at p (HOME-anchored, with its components
+// symlink-checked and the file itself hardened-checked), feeds the bytes to the
+// content-keyed cache, and returns its records. A non-existent file is empty (no
+// warning — an absent store is normal). Any other read error, a hardening
+// violation, or a parse error yields no records plus a single warning naming the
+// PATH only (never the contents — those could carry sensitive match patterns).
+// This is the fail-open-to-Ask behaviour.
+//
+// home is the resolved home dir (the trust anchor); the path from home down to p
+// is checked for symlinked components, and p itself is checked for being a regular
+// file with no group/world-writable bit — see openHardenedApprovalsFile.
 //
 // If the file parsed but ≥1 individual record was malformed and dropped (the
 // valid records still apply), a SINGLE aggregate warning is emitted with the
 // dropped COUNT and the file PATH — never the record contents/secrets.
-func loadApprovalRecords(ctx context.Context, cache *hashcache.Cache[ApprovalsFile], p string) []ApprovalRecord {
-	b, err := os.ReadFile(p) // #nosec G304 -- p is composed from the trusted home dir + fixed store names, not user input.
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil // Absent store: normal, not an error.
-		}
-		slog.WarnContext(ctx, "tools: could not read approvals file; skipped", "path", p, "err", err)
-		return nil
+func loadApprovalRecords(ctx context.Context, cache *hashcache.Cache[ApprovalsFile], home, p string) []ApprovalRecord {
+	b, ok := readHardenedApprovalsFile(ctx, home, p)
+	if !ok {
+		return nil // absent (normal) or a rejected/unreadable file (already warned).
 	}
 	af, err := cache.Load(b)
 	if err != nil {
@@ -429,6 +433,92 @@ func loadApprovalRecords(ctx context.Context, cache *hashcache.Cache[ApprovalsFi
 		// Aggregate operability signal: how many records were dropped and from
 		// where. NEVER the record contents (which could carry sensitive patterns).
 		slog.WarnContext(ctx, "tools: skipped malformed approval records", "count", af.SkippedRecords, "path", p)
+	}
+	return af.Approvals
+}
+
+// readHardenedApprovalsFile reads p with the §3c READ-side store hardening,
+// returning (bytes, true) only when every check passes. It returns (nil, false)
+// for an absent file (the normal case — NO warning) and for any rejected or
+// unreadable file (a single path-only warning, never contents). The checks, in
+// order (all fail-secure → treat-as-empty):
+//  1. no symlinked path component from home down to p (don't read through a
+//     symlinked ~/.urvi or workspaces/<hash>);
+//  2. open with O_RDONLY|O_NOFOLLOW so a SYMLINKED FILE p fails to open (rather
+//     than following it) — closing the resolve→open TOCTOU window;
+//  3. fstat the OPEN fd (not the path) and require a REGULAR file (reject a dir,
+//     device, fifo, …) with NO group/world-writable bit (a non-owner could
+//     otherwise tamper with the policy that auto-approves tool calls).
+func readHardenedApprovalsFile(ctx context.Context, home, p string) ([]byte, bool) {
+	if err := assertNoSymlinkComponent(home, p); err != nil {
+		// A symlinked policy-path component → don't read through it; treat as empty.
+		slog.WarnContext(ctx, "tools: approvals path has a symlinked component; skipped (treated as empty)", "path", p, "err", err)
+		return nil, false
+	}
+
+	// O_NOFOLLOW makes a symlink AT p fail to open (ELOOP) rather than be followed.
+	f, err := os.OpenFile(p, os.O_RDONLY|syscall.O_NOFOLLOW, 0) // #nosec G304 -- p = trusted home + fixed store names + a sha256 hash; not user input.
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, false // Absent store: normal, not an error, no warning.
+		}
+		slog.WarnContext(ctx, "tools: could not open approvals file; skipped (treated as empty)", "path", p, "err", err)
+		return nil, false
+	}
+	defer func() { _ = f.Close() }()
+
+	fi, err := f.Stat()
+	if err != nil {
+		slog.WarnContext(ctx, "tools: could not stat approvals file; skipped (treated as empty)", "path", p, "err", err)
+		return nil, false
+	}
+	if !fi.Mode().IsRegular() {
+		slog.WarnContext(ctx, "tools: approvals path is not a regular file; skipped (treated as empty)", "path", p)
+		return nil, false
+	}
+	if fi.Mode().Perm()&groupWorldWritable != 0 {
+		slog.WarnContext(ctx, "tools: approvals file is group- or world-writable; skipped (treated as empty)", "path", p)
+		return nil, false
+	}
+
+	b, err := io.ReadAll(io.LimitReader(f, maxApprovalsFileBytes))
+	if err != nil {
+		slog.WarnContext(ctx, "tools: could not read approvals file; skipped (treated as empty)", "path", p, "err", err)
+		return nil, false
+	}
+	return b, true
+}
+
+// maxApprovalsFileBytes caps the approvals file read so a pathological store file
+// cannot exhaust memory. The store holds a small, human-edited rule list; 1 MiB is
+// far beyond any legitimate size.
+const maxApprovalsFileBytes int64 = 1 << 20
+
+// loadApprovalRecordsForGrant reads the EXISTING valid records at p for Grant's
+// load→append→write cycle, reusing the parseApprovalsFile parser directly (NOT the
+// Check hashcache, which is for the read path). A missing, unreadable, or malformed
+// file yields no records so a grant always succeeds (it then writes a clean,
+// hardened file). The caller has ALREADY asserted no symlinked component and owns
+// the dir; this open is O_NOFOLLOW so a symlinked file p is not followed either.
+func loadApprovalRecordsForGrant(ctx context.Context, p string) []ApprovalRecord {
+	f, err := os.OpenFile(p, os.O_RDONLY|syscall.O_NOFOLLOW, 0) // #nosec G304 -- p = trusted home + fixed store names + a sha256 hash; not user input.
+	if err != nil {
+		if !os.IsNotExist(err) {
+			slog.WarnContext(ctx, "tools: could not open existing approvals for grant; starting fresh", "path", p, "err", err)
+		}
+		return nil
+	}
+	defer func() { _ = f.Close() }()
+
+	b, err := io.ReadAll(io.LimitReader(f, maxApprovalsFileBytes))
+	if err != nil {
+		slog.WarnContext(ctx, "tools: could not read existing approvals for grant; starting fresh", "path", p, "err", err)
+		return nil
+	}
+	af, err := parseApprovalsFile(b)
+	if err != nil {
+		slog.WarnContext(ctx, "tools: existing approvals malformed; starting fresh", "path", p, "err", err)
+		return nil
 	}
 	return af.Approvals
 }
