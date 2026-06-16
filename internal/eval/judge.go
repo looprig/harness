@@ -17,6 +17,11 @@ type Completer interface {
 // Judge is a GEval-style Metric: it asks a model (via Completer) to score how
 // well ActualOutput satisfies Criteria on a 0..1 scale. It is unit-testable with
 // a fake Completer and integration-tested with a real model.
+//
+// Judge scores against the free-form Criteria using only the case's Input and
+// ActualOutput; it deliberately does NOT consult ExpectedOutput. Reference-string
+// checking is the Contains metric's job — pair the two when a case has both a
+// gold substring and a qualitative rubric.
 type Judge struct {
 	Criteria  string
 	Threshold float64
