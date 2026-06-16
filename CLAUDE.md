@@ -50,6 +50,20 @@
 - `golang.org/x/net/html` — HTML tokenizer; required by the `WebSearch` tool's DuckDuckGo HTML-scrape `SearchProvider` (stdlib has no HTML parser)
 - `golang.org/x/net/idna` — IDNA/punycode host normalization (same `golang.org/x/net` module as above); required by the `Fetch` tool's persisted-approval host matching to defeat unicode homographs (stdlib has no IDNA)
 
+### Vendored patches (forked dependencies)
+
+When a sanctioned dependency has a confirmed upstream bug we cannot wait on, we
+vendor a **minimally patched** copy under `third_party/<module-path>/` and wire
+it in via a `replace <module> => ./third_party/<module-path>` directive in
+`go.mod`. The copy is byte-for-byte the pinned upstream version except for the
+documented patch; each fork carries a `PATCH.md` recording the upstream version,
+the exact change, why, and how to re-sync. A local `replace => ./dir` is not
+checksum-verified by `go mod verify` (expected); `govulncheck` still scans the
+local code. **Re-evaluate every fork on dependency bumps — drop it if upstream
+fixes the bug.**
+
+- `github.com/charmbracelet/ultraviolet` (transitive dep of `charm.land/bubbletea/v2`) — vendored as `./third_party/github.com/charmbracelet/ultraviolet`, pinned to `v0.0.0-20260525132238-948f4557a654`. **One-line patch** in `(*TerminalRenderer).Render` (`terminal_renderer.go`): the post-resize `curbuf` sync loop `for i := curHeight - 1; i < newHeight` → `for i := 0; i < newHeight`, so **all** rows (not just the grown tail) are synced from the new frame after a dimension change. **Why:** upstream left `curbuf` holding stale content from the previous, different-width frame (old narrow row survives on width growth; nothing synced at all on height shrink), so the next diff partial-redrew the bordered composer box's `┌…┐` / `└…┘` borders at an absolute column offset (`CSI <col> C`) and desynced the relative cursor-up count — a Bubble Tea **v2 inline-renderer resize scrollback leak** that stranded the prior separator + box-top rows in native scrollback on every resize step. Locked by `tui/resize_scrollback_leak_test.go`; full detail in `third_party/github.com/charmbracelet/ultraviolet/PATCH.md`. **Must be re-synced (or dropped) when bubbletea / ultraviolet updates.**
+
 ## Secure Coding Patterns
 
 **Randomness** — Use `crypto/rand` for anything security-sensitive (tokens, nonces, IDs). Never use `math/rand` for secrets.
