@@ -23,13 +23,21 @@ func LoadCases(dir string) ([]TestCase, error) {
 	if err != nil {
 		return nil, &LoadError{Path: dir, Cause: err}
 	}
+	// Confine all per-file reads to dir: entries are read through the root by
+	// base name, so a traversal or symlink that escapes dir is rejected rather
+	// than followed (defends G304 / CWE-22).
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		return nil, &LoadError{Path: dir, Cause: err}
+	}
+	defer root.Close()
 	var cases []TestCase
 	for _, e := range entries {
 		if e.IsDir() || filepath.Ext(e.Name()) != ".json" {
 			continue
 		}
 		path := filepath.Join(dir, e.Name())
-		data, err := os.ReadFile(path)
+		data, err := root.ReadFile(e.Name())
 		if err != nil {
 			return nil, &LoadError{Path: path, Cause: err}
 		}

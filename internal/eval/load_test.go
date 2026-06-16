@@ -44,6 +44,24 @@ func TestLoadCases(t *testing.T) {
 			t.Fatalf("error = %v, want *LoadError", err)
 		}
 	})
+	t.Run("symlink escaping the dir is not followed", func(t *testing.T) {
+		t.Parallel()
+		outside := t.TempDir()
+		secret := filepath.Join(outside, "secret.json")
+		mustWrite(t, secret, `{"name":"leaked","input":"secret"}`)
+
+		dir := t.TempDir()
+		// A *.json entry that symlinks to a file outside dir must be rejected
+		// by os.Root containment, not silently read.
+		if err := os.Symlink(secret, filepath.Join(dir, "escape.json")); err != nil {
+			t.Skipf("symlink unsupported on this platform: %v", err)
+		}
+		_, err := LoadCases(dir)
+		var le *LoadError
+		if !errors.As(err, &le) {
+			t.Fatalf("error = %v, want *LoadError for escaping symlink", err)
+		}
+	})
 }
 
 func mustWrite(t *testing.T, path, content string) {
