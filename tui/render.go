@@ -139,29 +139,45 @@ func toolGlyph(s ToolStatus) string {
 // (subject to the same fold), never hidden. Lines are width-wrapped so a long card
 // never blows the viewport. Returns "" when there are no calls.
 func renderToolCalls(calls []ToolCallView, expandTools bool, width int) string {
-	return renderToolCallsGlyph(calls, expandTools, width, toolGlyph)
+	// Committed/scrollback path: full cards, static glyphs, never header-only (a
+	// stray running card committed at a terminal still shows its body).
+	return renderToolCallsGlyph(calls, expandTools, width, toolGlyph, false)
 }
 
 // renderToolCallsGlyph is the shared card renderer: it maps each call's status to a
 // glyph via glyph, the indirection that lets the LIVE path animate a running card's
-// glyph (spinnerGlyph) while the committed path keeps the static toolGlyph. Returns
-// "" when there are no calls.
-func renderToolCallsGlyph(calls []ToolCallView, expandTools bool, width int, glyph func(ToolStatus) string) string {
+// glyph (spinnerGlyph) while the committed path keeps the static toolGlyph. When
+// liveRunning is true (the LIVE tail only), a still-RUNNING card renders header-only
+// — see renderToolCard. Returns "" when there are no calls.
+func renderToolCallsGlyph(calls []ToolCallView, expandTools bool, width int, glyph func(ToolStatus) string, liveRunning bool) string {
 	if len(calls) == 0 {
 		return ""
 	}
 	parts := make([]string, 0, len(calls))
 	for i := range calls {
-		parts = append(parts, renderToolCard(calls[i], expandTools, width, glyph))
+		parts = append(parts, renderToolCard(calls[i], expandTools, width, glyph, liveRunning))
 	}
 	return strings.Join(parts, "\n")
 }
 
 // renderToolCard renders one tool card: the styled header line then its styled,
 // indented result-preview lines. glyph maps the call's status to its header glyph.
-func renderToolCard(c ToolCallView, expandTools bool, width int, glyph func(ToolStatus) string) string {
+//
+// liveRunning collapses a still-RUNNING card to its header line ALONE (no result
+// body) — the live→committed handoff fix (design Option B). A running card has no
+// result yet, so its body is only the "(no output)" placeholder; dropping it in the
+// LIVE tail means the compact one-line running indicator is replaced by the full
+// committed card (which inserts above via tea.Println) without a multi-line live-tail
+// shrink, so the running→completed transition reads as a clean continuation rather
+// than a split. It applies ONLY to ToolRunning cards on the live path; resolved cards
+// (live or committed) and the committed path always render their full body.
+func renderToolCard(c ToolCallView, expandTools bool, width int, glyph func(ToolStatus) string, liveRunning bool) string {
 	header := cardIndent + styles.ToolCallStyle.Render(
 		cardConnector+toolHeaderText(c.ToolName, c.Summary, glyph(c.Status)))
+
+	if liveRunning && c.Status == ToolRunning {
+		return header // compact one-line running indicator; body appears once, on commit
+	}
 
 	lines := make([]string, 0, previewLineCap+2)
 	lines = append(lines, header)
@@ -277,7 +293,10 @@ func renderLiveAssistant(thinking, text string, calls []ToolCallView, expand boo
 		if b.Len() > 0 {
 			b.WriteString("\n")
 		}
-		b.WriteString(renderToolCallsGlyph(calls, expand, width, liveToolGlyph(a.frame)))
+		// liveRunning=true: a still-running card renders header-only in the live tail
+		// so the live→committed handoff is a one-line→full-card continuation, not a
+		// multi-line live shrink (see renderToolCard).
+		b.WriteString(renderToolCallsGlyph(calls, expand, width, liveToolGlyph(a.frame), true))
 	}
 	return b.String()
 }

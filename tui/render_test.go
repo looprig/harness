@@ -351,6 +351,70 @@ func TestRenderAssistantLiveCards(t *testing.T) {
 	})
 }
 
+// TestRenderLiveRunningCardIsHeaderOnly locks the live→committed handoff fix
+// (Option B): a still-RUNNING tool card in the LIVE tail renders as a SINGLE compact
+// header line (spinner + tool name + summary) with NO result body — not the
+// "(no output)" placeholder a committed/resolved card carries. This minimises the
+// live-tail height that must be removed when the card commits to scrollback, so the
+// running→completed handoff composes cleanly (the committed full card replaces a
+// one-line live indicator, not a multi-line live card). Resolved cards co-resident in
+// the live tail (a batch sibling that finished but hasn't committed yet) keep their
+// full body, and the committed scrollback path is unchanged (full card always).
+func TestRenderLiveRunningCardIsHeaderOnly(t *testing.T) {
+	t.Parallel()
+
+	a := animState{}
+
+	t.Run("running card is one header line, no body", func(t *testing.T) {
+		t.Parallel()
+
+		calls := []ToolCallView{{ToolName: "Fetch", Summary: "GET weather.com", Status: ToolRunning}}
+		got := stripANSI(renderLiveAssistant("", "", calls, true, 80, a))
+		// The bare bullet (●/◦) is its own line; the running card is exactly one more.
+		lines := strings.Split(got, "\n")
+		if len(lines) != 2 {
+			t.Fatalf("live running card: got %d lines %q, want 2 (bullet + one-line card)", len(lines), lines)
+		}
+		card := lines[1]
+		for _, w := range []string{"Fetch", "GET weather.com"} {
+			if !strings.Contains(card, w) {
+				t.Errorf("live running card = %q, want to contain %q", card, w)
+			}
+		}
+		if strings.Contains(got, noOutput) {
+			t.Errorf("live running card must NOT show the %q body placeholder; got %q", noOutput, got)
+		}
+	})
+
+	t.Run("resolved card in live tail keeps its body", func(t *testing.T) {
+		t.Parallel()
+
+		// A finished batch sibling that has not yet committed must still show its
+		// result in the live tail (it is NOT a running card).
+		calls := []ToolCallView{{
+			ToolName: "Bash", Summary: "ls", Status: ToolOK, Result: []string{"file-a", "file-b"},
+		}}
+		got := stripANSI(renderLiveAssistant("", "", calls, true, 80, a))
+		for _, w := range []string{"Bash", "ls", "file-a", "file-b"} {
+			if !strings.Contains(got, w) {
+				t.Errorf("resolved live card = %q, want to contain %q", got, w)
+			}
+		}
+	})
+
+	t.Run("committed running card (defensive) keeps full body", func(t *testing.T) {
+		t.Parallel()
+
+		// The committed/scrollback path renders the full card regardless of status;
+		// a (stray) running card committed at a terminal still shows its body.
+		calls := []ToolCallView{{ToolName: "Fetch", Summary: "GET x", Status: ToolRunning}}
+		got := stripANSI(renderToolCalls(calls, true, 80))
+		if !strings.Contains(got, noOutput) {
+			t.Errorf("committed running card should still show %q body; got %q", noOutput, got)
+		}
+	})
+}
+
 // TestRenderThinking covers the dim reasoning block under the unified ctrl+t flag.
 // Expanded: EVERY line carries the "│ " left rail — the header renders as
 // "│ thinking" and each body line as "│ <text>", producing an unbroken vertical
