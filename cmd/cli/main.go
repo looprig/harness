@@ -42,6 +42,21 @@ var agentDescriptions = map[string]string{
 // registered (the banner degrades to the bare name).
 func agentDescription(name string) string { return agentDescriptions[name] }
 
+// agentDisplayNames maps an agent's registry name to its user-facing display
+// name (shown in the banner). Unmapped agents fall back to the registry name.
+var agentDisplayNames = map[string]string{
+	"coding": "Togo",
+}
+
+// agentDisplayName returns the banner display name for name, falling back to
+// name itself when there is no override.
+func agentDisplayName(name string) string {
+	if d, ok := agentDisplayNames[name]; ok {
+		return d
+	}
+	return name
+}
+
 // closeTimeout bounds the best-effort teardown Close of the current agent.
 const closeTimeout = 5 * time.Second
 
@@ -151,7 +166,7 @@ func main() {
 		}
 	}
 
-	screen := tui.New(ctx, agent, open, tui.AgentBanner{Name: name, Description: agentDescription(name)})
+	screen := tui.New(ctx, agent, open, tui.AgentBanner{Name: agentDisplayName(name), Description: agentDescription(name)})
 	prog := tea.NewProgram(screen, progOpts...)
 
 	// SIGINT/SIGTERM (non-keyboard) cancels ctx → quit the TUI for a clean

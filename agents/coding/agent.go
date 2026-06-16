@@ -1,5 +1,5 @@
 // Package coding is the full-tool coding agent built on the session engine. It
-// wraps a session.AgentSession with a coding persona and a named model, wiring
+// wraps a session.AgentSession with the Togo coding persona and a named model, wiring
 // ALL eleven tools (read/search, write/edit/exec, web, ask/todo, and a
 // recursion-safe Subagent) each with only the dependencies it needs. It exposes
 // the tui.Agent surface plus the Approve/Deny/ProvideAnswer gate trio.

@@ -52,6 +52,27 @@ func TestAgentDescription(t *testing.T) {
 	}
 }
 
+func TestAgentDisplayName(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name      string
+		agentName string
+		want      string
+	}{
+		{name: "coding agent displays as Togo", agentName: "coding", want: "Togo"},
+		{name: "unmapped agent falls back to its name", agentName: "personal-assistant", want: "personal-assistant"},
+		{name: "empty name falls back to empty", agentName: "", want: ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := agentDisplayName(tt.agentName); got != tt.want {
+				t.Errorf("agentDisplayName(%q) = %q, want %q", tt.agentName, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestBuildRegistry(t *testing.T) {
 	t.Parallel()
 	reg := buildRegistry()
