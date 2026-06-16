@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/inventivepotter/urvi/agents/coding/prompts"
 	"github.com/inventivepotter/urvi/internal/agent/loop"
 	"github.com/inventivepotter/urvi/internal/agent/loop/event"
 	"github.com/inventivepotter/urvi/internal/agent/session"
@@ -29,18 +30,6 @@ import (
 // one-line change here. Read-only after init: do not reassign or mutate it — the
 // parallel fake-client tests read it concurrently.
 var model = llm.ChutesKimiK2()
-
-// codingPersonaPrompt is the coding agent's entire identity in v1. It tells the
-// model it is a capable software engineer that works through tools, plans before
-// acting, and is careful with anything that mutates the workspace or runs a shell.
-const codingPersonaPrompt = `You are a capable, careful software engineer. You ` +
-	`work in a real codebase through tools: read and search files before you act, ` +
-	`make focused edits, and run commands only when needed. Before any change that ` +
-	`writes a file or runs a shell command, briefly explain your plan so the user ` +
-	`can follow and approve it. Prefer the smallest change that solves the problem, ` +
-	`keep edits surgical, and never guess a file's contents — read it first. Run ` +
-	`tests or build commands to verify your work when you can. Keep responses ` +
-	`concise and concrete, and say plainly when you are unsure rather than guessing.`
 
 // envAPIKey is the only value read from the environment. The value is the NAME
 // of an env var, not a secret; the #nosec annotation documents that gosec's
@@ -77,7 +66,7 @@ func New(ctx context.Context) (*Coding, error) {
 	}
 	// Pass the key verbatim — never normalize credential material. The TrimSpace
 	// above is a presence check, not a sanitizer.
-	spec := model.Spec(apiKey, codingPersonaPrompt)
+	spec := model.Spec(apiKey, prompts.SystemPrompt)
 	client, err := auto.New(spec) // validates spec + dispatches on provider
 	if err != nil {
 		return nil, err

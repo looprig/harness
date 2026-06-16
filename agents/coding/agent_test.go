@@ -6,6 +6,7 @@ import (
 	"sort"
 	"testing"
 
+	"github.com/inventivepotter/urvi/agents/coding/prompts"
 	"github.com/inventivepotter/urvi/internal/agent/session"
 	"github.com/inventivepotter/urvi/internal/llm"
 	"github.com/inventivepotter/urvi/internal/tool"
@@ -171,7 +172,7 @@ func TestAcceptsImages(t *testing.T) {
 // text-only: a Coding agent built from the real spec reports AcceptsImages false.
 func TestProductionAcceptsImagesFalse(t *testing.T) {
 	t.Parallel()
-	spec := model.Spec("unused-key", codingPersonaPrompt)
+	spec := model.Spec("unused-key", prompts.SystemPrompt)
 	c, err := newWithClient(context.Background(), &fakeLLM{}, spec)
 	if err != nil {
 		t.Fatalf("newWithClient: %v", err)
