@@ -34,7 +34,8 @@ const defaultAgent = "coding"
 // the metadata is wired here alongside the registry registration. A name with no
 // entry falls back to an empty description (the banner then shows the bare name).
 var agentDescriptions = map[string]string{
-	"coding": "a careful software engineer that works through tools",
+	"coding":             "a careful software engineer that works through tools",
+	"personal-assistant": "a helpful, concise personal assistant",
 }
 
 // agentDescription returns the banner description for name, or "" if none is
@@ -62,10 +63,10 @@ func buildRegistry() *registry.Registry[tui.Agent] {
 	// *Coding satisfy tui.Agent, so each constructor type-checks as
 	// (tui.Agent, error).
 	_ = reg.Register(defaultAgent, func(c context.Context) (tui.Agent, error) {
-		return personalassistant.New(c)
-	})
-	_ = reg.Register("coding", func(c context.Context) (tui.Agent, error) {
 		return coding.New(c)
+	})
+	_ = reg.Register("personal-assistant", func(c context.Context) (tui.Agent, error) {
+		return personalassistant.New(c)
 	})
 	return reg
 }
