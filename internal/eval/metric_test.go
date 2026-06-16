@@ -18,6 +18,8 @@ func TestContainsMeasure(t *testing.T) {
 		{name: "missing expected", actual: "the answer is five", expected: "4", wantValue: 0, wantPassed: false},
 		{name: "case-insensitive", actual: "HELLO World", expected: "hello", wantValue: 1, wantPassed: true},
 		{name: "empty expected is vacuous", actual: "anything", expected: "", wantValue: 1, wantPassed: true},
+		{name: "empty actual and empty expected is vacuous", actual: "", expected: "", wantValue: 1, wantPassed: true},
+		{name: "empty actual with expectation fails", actual: "", expected: "x", wantValue: 0, wantPassed: false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

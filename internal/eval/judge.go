@@ -23,8 +23,12 @@ type Judge struct {
 	Model     Completer
 }
 
+// judgeMetricName is the single source of truth for this metric's label, used by
+// both Name and the Score it returns so the two can never drift.
+const judgeMetricName = "judge"
+
 // Name identifies the metric in Scores and errors.
-func (Judge) Name() string { return "judge" }
+func (Judge) Name() string { return judgeMetricName }
 
 // Measure asks the judge model to score tc.ActualOutput against Criteria.
 func (j Judge) Measure(ctx context.Context, tc TestCase) (Score, error) {
@@ -37,7 +41,7 @@ func (j Judge) Measure(ctx context.Context, tc TestCase) (Score, error) {
 		return Score{}, err
 	}
 	return Score{
-		Metric:    "judge",
+		Metric:    judgeMetricName,
 		Value:     value,
 		Threshold: j.Threshold,
 		Passed:    value >= j.Threshold,
@@ -63,8 +67,9 @@ func judgePrompt(criteria, input, output string) string {
 }
 
 var (
-	errNoScoreLine = errors.New("judge response has no SCORE line")
-	errScoreRange  = errors.New("judge score is outside [0,1]")
+	errNoScoreLine    = errors.New("judge response has no SCORE line")
+	errScoreRange     = errors.New("judge score is outside [0,1]")
+	errDuplicateScore = errors.New("judge response has more than one SCORE line")
 )
 
 // parseJudge extracts the 0..1 score and reason from "SCORE: 0.8\nREASON: ...".
@@ -78,6 +83,9 @@ func parseJudge(raw string) (float64, string, error) {
 		upper := strings.ToUpper(line)
 		switch {
 		case strings.HasPrefix(upper, "SCORE:"):
+			if gotScore {
+				return 0, "", &JudgeParseError{Raw: raw, Cause: errDuplicateScore}
+			}
 			v, err := strconv.ParseFloat(strings.TrimSpace(line[len("SCORE:"):]), 64)
 			if err != nil {
 				return 0, "", &JudgeParseError{Raw: raw, Cause: err}
