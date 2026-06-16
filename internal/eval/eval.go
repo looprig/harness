@@ -48,3 +48,41 @@ type Metric interface {
 type Runner interface {
 	Run(ctx context.Context, input string) (string, error)
 }
+
+// RunCases returns a copy of cases with ActualOutput filled by r. The first
+// Runner error aborts and is returned wrapped in a RunError. The input slice is
+// never mutated.
+func RunCases(ctx context.Context, r Runner, cases []TestCase) ([]TestCase, error) {
+	out := make([]TestCase, len(cases))
+	copy(out, cases)
+	for i := range out {
+		got, err := r.Run(ctx, out[i].Input)
+		if err != nil {
+			return nil, &RunError{Case: out[i].Name, Cause: err}
+		}
+		out[i].ActualOutput = got
+	}
+	return out, nil
+}
+
+// Evaluate scores every case against every metric. A metric error aborts and is
+// returned wrapped in a MeasureError. A Result's Passed is the AND of its metric
+// Passed flags (vacuously true with no metrics).
+func Evaluate(ctx context.Context, cases []TestCase, metrics []Metric) ([]Result, error) {
+	results := make([]Result, 0, len(cases))
+	for _, tc := range cases {
+		r := Result{Case: tc, Passed: true}
+		for _, m := range metrics {
+			s, err := m.Measure(ctx, tc)
+			if err != nil {
+				return nil, &MeasureError{Metric: m.Name(), Case: tc.Name, Cause: err}
+			}
+			r.Scores = append(r.Scores, s)
+			if !s.Passed {
+				r.Passed = false
+			}
+		}
+		results = append(results, r)
+	}
+	return results, nil
+}
