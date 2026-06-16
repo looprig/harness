@@ -178,6 +178,162 @@ func TestInputBoxCtrlJNewlineFallback(t *testing.T) {
 	}
 }
 
+// visibleContentRows returns the editor's content rows (those carrying the "▌" accent
+// bar) from a rendered View, with ANSI stripped and the box border trimmed off. The
+// "▌ " prompt is dropped and surrounding box-padding whitespace is trimmed so each
+// element is the bare visible text of one editor row (empty string for a blank row).
+func visibleContentRows(view string) []string {
+	var rows []string
+	for _, line := range strings.Split(stripANSI(view), "\n") {
+		if !strings.Contains(line, "▌") {
+			continue // border row, not editor content
+		}
+		// Drop the box's vertical border runes and the accent-bar prompt, then trim the
+		// box padding, leaving just the row's visible text.
+		text := strings.ReplaceAll(line, "│", "")
+		text = strings.TrimSpace(text)
+		text = strings.TrimPrefix(text, "▌")
+		rows = append(rows, strings.TrimSpace(text))
+	}
+	return rows
+}
+
+// typeInto drives the editor through the real keystroke path: each rune as a key press,
+// and a literal newline (\n) as Ctrl+J (the universal InsertNewline binding). This is
+// the path a user takes in the terminal — and the one that surfaced the scroll bug,
+// where the composer hid the first line(s) and showed a phantom trailing blank because
+// the textarea's viewport stayed scrolled to the cursor instead of resetting to the top
+// once the content fit. SetValue alone never reproduced it.
+func typeInto(b *InputBox, s string) {
+	for _, r := range s {
+		if r == '\n' {
+			b.Update(tea.KeyPressMsg{Code: 'j', Mod: tea.ModCtrl})
+			continue
+		}
+		b.Update(tea.KeyPressMsg{Text: string(r), Code: r})
+	}
+}
+
+// TestInputBoxMultiLineTopAligned is the regression test for the composer scroll bug:
+// multi-line content must render top-aligned with EVERY line visible and NO phantom
+// trailing blank row, until the content exceeds maxInputLines (then it scrolls to keep
+// the cursor visible). It drives input through the real keystroke path (typeInto), which
+// is what reproduced the bug; SetValue alone always rendered correctly.
+func TestInputBoxMultiLineTopAligned(t *testing.T) {
+	tests := []struct {
+		name     string
+		value    string
+		wantRows []string // exact visible content rows, top to bottom
+		wantHt   int      // expected Height() (visible content rows); 0 = don't assert
+		mustShow []string // substrings that must appear somewhere in the view
+		mustHide []string // substrings that must NOT appear in the view
+	}{
+		{
+			name:     "two lines: both shown, no hidden first line, no phantom blank",
+			value:    "AAA\nBBB",
+			wantRows: []string{"AAA", "BBB"},
+			wantHt:   2,
+			mustShow: []string{"AAA", "BBB"},
+		},
+		{
+			name:     "three lines: all shown top-aligned, no phantom blank",
+			value:    "AAA\nBBB\nCCC",
+			wantRows: []string{"AAA", "BBB", "CCC"},
+			wantHt:   3,
+			mustShow: []string{"AAA", "BBB", "CCC"},
+		},
+		{
+			name:     "single line: one row, no phantom blank",
+			value:    "AAA",
+			wantRows: []string{"AAA"},
+			wantHt:   1,
+			mustShow: []string{"AAA"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			b := NewInputBox()
+			b.Resize(60)
+			typeInto(&b, tt.value)
+
+			rows := visibleContentRows(b.View())
+			if len(rows) != len(tt.wantRows) {
+				t.Fatalf("visible content rows = %d %q, want %d %q\nview:\n%s",
+					len(rows), rows, len(tt.wantRows), tt.wantRows, stripANSI(b.View()))
+			}
+			for i := range tt.wantRows {
+				if rows[i] != tt.wantRows[i] {
+					t.Errorf("content row %d = %q, want %q\nview:\n%s",
+						i, rows[i], tt.wantRows[i], stripANSI(b.View()))
+				}
+			}
+			if tt.wantHt != 0 {
+				if got := b.Height(); got != tt.wantHt {
+					t.Errorf("Height() = %d, want %d", got, tt.wantHt)
+				}
+			}
+			plain := stripANSI(b.View())
+			for _, s := range tt.mustShow {
+				if !strings.Contains(plain, s) {
+					t.Errorf("View() missing %q\nview:\n%s", s, plain)
+				}
+			}
+			for _, s := range tt.mustHide {
+				if strings.Contains(plain, s) {
+					t.Errorf("View() unexpectedly contains %q\nview:\n%s", s, plain)
+				}
+			}
+		})
+	}
+}
+
+// TestInputBoxScrollsPastMax verifies the grow-then-scroll behavior past the cap: with
+// more logical lines than maxInputLines the box height caps at maxInputLines, NO content
+// is dropped (every typed line is in Value()), and the view scrolls so the LAST lines —
+// where the cursor sits — stay visible while the earliest lines scroll off the top.
+func TestInputBoxScrollsPastMax(t *testing.T) {
+	t.Parallel()
+
+	const total = maxInputLines + 2 // 12 logical lines
+	var sb strings.Builder
+	for i := 0; i < total; i++ {
+		if i > 0 {
+			sb.WriteByte('\n')
+		}
+		sb.WriteString("L")
+		sb.WriteByte(byte('A' + i)) // L A, L B, ... distinct per line
+	}
+	want := sb.String()
+
+	b := NewInputBox()
+	b.Resize(60)
+	typeInto(&b, want)
+
+	// No content lost despite exceeding the visible cap.
+	if got := b.Value(); got != want {
+		t.Fatalf("Value() = %q, want %q (content dropped past the cap?)", got, want)
+	}
+	// Height caps at maxInputLines.
+	if got := b.Height(); got != maxInputLines {
+		t.Errorf("Height() = %d, want %d (cap)", got, maxInputLines)
+	}
+	// Exactly maxInputLines visible rows, and the LAST line (cursor) is among them while
+	// the FIRST line has scrolled off.
+	rows := visibleContentRows(b.View())
+	if len(rows) != maxInputLines {
+		t.Fatalf("visible rows = %d, want %d\nview:\n%s", len(rows), maxInputLines, stripANSI(b.View()))
+	}
+	plain := stripANSI(b.View())
+	lastLine := "L" + string(rune('A'+total-1)) // last typed line
+	if !strings.Contains(plain, lastLine) {
+		t.Errorf("View() missing last line %q (cursor must stay visible)\nview:\n%s", lastLine, plain)
+	}
+	if strings.Contains(plain, "LA") {
+		t.Errorf("View() still shows first line %q; it should have scrolled off the top\nview:\n%s", "LA", plain)
+	}
+}
+
 func contains(ss []string, want string) bool {
 	for _, s := range ss {
 		if s == want {

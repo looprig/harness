@@ -18,6 +18,15 @@ const (
 	maxInputLines = 10
 )
 
+// contentHeightCeiling is the textarea's own MaxHeight. It is set far above
+// maxInputLines on purpose: MaxHeight in the bubbles textarea is BOTH the visible-row
+// cap AND an input gate — once the logical line count reaches MaxHeight the textarea
+// refuses to insert further newlines (textarea.atContentLimit), silently dropping
+// content. We must never drop the user's text, so the textarea's MaxHeight is parked
+// high and the VISIBLE cap (maxInputLines) is enforced separately via SetHeight on the
+// viewport window. The value just needs to exceed any realistic composer input.
+const contentHeightCeiling = 10000
+
 // placeholder is the dim hint shown while the editor is empty.
 const placeholder = "Type a message…"
 
@@ -76,15 +85,44 @@ func NewInputBox() InputBox {
 	s.Blurred.Prompt = styles.AccentBarStyle
 	s.Focused.CursorLine = lipgloss.NewStyle()
 	ta.SetStyles(s)
-	ta.SetHeight(minInputLines)
+	// DynamicHeight makes the textarea recompute its height from the VISUAL (soft-wrap
+	// aware) line count on every mutation, and — crucially — clamp its internal viewport
+	// scroll offset back to the top when the content fits. Without it, the viewport stays
+	// scrolled to wherever the cursor was as the user typed each new line: SetHeight only
+	// ever scrolls DOWN to reveal the cursor, never back UP to collapse the slack above
+	// it, so the box hid the first line(s) and showed a phantom trailing blank. MaxHeight
+	// is parked at contentHeightCeiling (NOT maxInputLines) because MaxHeight doubles as
+	// an input gate that drops newlines once reached; the visible [1, maxInputLines] cap
+	// is applied separately in capHeight via SetHeight.
+	ta.DynamicHeight = true
+	ta.MinHeight = minInputLines
+	ta.MaxHeight = contentHeightCeiling
 	ta.Focus()
-	return InputBox{ta: ta}
+	b := InputBox{ta: ta}
+	b.capHeight()
+	return b
 }
 
-// Height is the editor's content height in lines: the textarea's logical line count
-// clamped to [minInputLines, maxInputLines]. It excludes the border frame.
+// Height is the editor's visible content height in rows: the textarea's current row
+// count clamped to [minInputLines, maxInputLines]. It excludes the border frame.
+//
+// It reads ta.Height() rather than ta.LineCount() so it tracks VISUAL rows (a single
+// long logical line that soft-wraps occupies several rows), matching what View()
+// actually renders. DynamicHeight keeps ta.Height() equal to the total visual line
+// count (capped at contentHeightCeiling, far above maxInputLines), so once capHeight
+// has applied the visible cap this returns that capped value, and before capping it
+// returns the true content height — both already within [min, max] after clamp.
 func (b InputBox) Height() int {
-	return clamp(b.ta.LineCount(), minInputLines, maxInputLines)
+	return clamp(b.ta.Height(), minInputLines, maxInputLines)
+}
+
+// capHeight pins the visible viewport window to [minInputLines, maxInputLines]. The
+// textarea's DynamicHeight grows ta.Height() to the full visual line count on each
+// mutation (and resets its scroll to the top while the content fits); this caps the
+// visible window so the box grows only up to maxInputLines, after which the textarea
+// scrolls internally to keep the cursor in view. Call after every mutation.
+func (b *InputBox) capHeight() {
+	b.ta.SetHeight(b.Height())
 }
 
 // Value returns the current text.
@@ -95,13 +133,13 @@ func (b *InputBox) Value() string {
 // Reset clears the text.
 func (b *InputBox) Reset() {
 	b.ta.Reset()
-	b.ta.SetHeight(b.Height())
+	b.capHeight()
 }
 
 // SetValue replaces the text.
 func (b *InputBox) SetValue(s string) {
 	b.ta.SetValue(s)
-	b.ta.SetHeight(b.Height())
+	b.capHeight()
 }
 
 // Resize sets the box width; the inner textarea is the box width minus the border's
@@ -124,7 +162,7 @@ func (b *InputBox) Focus() tea.Cmd {
 func (b *InputBox) Update(msg tea.Msg) tea.Cmd {
 	var cmd tea.Cmd
 	b.ta, cmd = b.ta.Update(msg)
-	b.ta.SetHeight(b.Height())
+	b.capHeight()
 	return cmd
 }
 
