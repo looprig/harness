@@ -275,6 +275,42 @@ func TestInteractionClearOnTerminal(t *testing.T) {
 	}
 }
 
+// TestInteractionTerminalPreservesComposeWhenNoPrompt covers the input-loss fix:
+// when a turn ends and NO prompt was active, the user's in-progress compose text
+// must be preserved, not clobbered by restoring the empty saved draft.
+func TestInteractionTerminalPreservesComposeWhenNoPrompt(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		term event.Event
+	}{
+		{name: "turn done", term: event.TurnDone{}},
+		{name: "turn failed", term: event.TurnFailed{}},
+		{name: "turn interrupted", term: event.TurnInterrupted{}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			m := newInteractionModel()
+			// The user is typing their next message while the AI streams; no
+			// permission/AskUser prompt is active.
+			m.input.SetValue("half-typed next message")
+
+			m = m.ApplyEvent(tt.term) // the AI turn ends
+
+			if got := m.input.Value(); got != "half-typed next message" {
+				t.Errorf("compose input wiped on %s: got %q, want preserved", tt.name, got)
+			}
+			if m.PendingCount() != 0 {
+				t.Errorf("PendingCount = %d, want 0", m.PendingCount())
+			}
+		})
+	}
+}
+
 // TestInteractionNonComposeUpdateIsNoop covers the deferral to Task 8: while a
 // prompt is active (non-compose mode), Update returns noop for now (modal routing
 // is the next task) and never submits.

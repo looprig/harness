@@ -130,7 +130,14 @@ func (m interactionModel) pop() interactionModel {
 // saved draft. It is the terminal-event path: when the turn ends, any unresolved
 // prompts are abandoned and the user is returned to their composer exactly as they
 // left it. Value receiver returning a new model, matching pop's Elm-style contract.
+//
+// When no prompt was active it is a no-op. Terminal events fire on every turn end,
+// and restoring the (empty) saved draft would clobber text the user typed into the
+// composer while the turn was streaming. Only an actually-preempted compose is restored.
 func (m interactionModel) ClearPrompts() interactionModel {
+	if len(m.pending) == 0 {
+		return m
+	}
 	m.pending = nil
 	m.restoreCompose()
 	return m
