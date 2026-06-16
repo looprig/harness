@@ -4,6 +4,8 @@ import (
 	"strconv"
 	"strings"
 
+	"charm.land/lipgloss/v2"
+
 	"github.com/inventivepotter/urvi/tui/styles"
 )
 
@@ -44,24 +46,37 @@ func renderEntry(e entry, expand bool, width int) []string {
 // coherent colored unit.
 func renderNotice(level noticeLevel, text string, width int) []string {
 	style := styles.NoticeStyle(uint8(level))
+	out := barWrap(style, strings.Split(text, "\n"), width)
+	if len(out) == 0 {
+		out = append(out, style.Render(styles.AccentBarPrompt))
+	}
+	return out
+}
+
+// barWrap renders each raw line as a "▌ "-bar-prefixed, width-wrapped row in style:
+// the accent bar and the wrapped text share one style so the rows read as a single
+// coherent colored unit (the leveled-notice / info-notification layout). Every wrapped
+// row keeps the bar, and the wrap budget reserves barWidth columns for it. It is the
+// shared bar-rendering primitive reused by renderNotice and the scrollback prompt
+// record so neither duplicates the bar layout.
+func barWrap(style lipgloss.Style, rawLines []string, width int) []string {
 	bar := style.Render(styles.AccentBarPrompt)
 	var out []string
-	for _, raw := range strings.Split(text, "\n") {
+	for _, raw := range rawLines {
 		for _, line := range wrapToWidth(raw, width-barWidth) {
 			out = append(out, bar+style.Render(line))
 		}
-	}
-	if len(out) == 0 {
-		out = append(out, bar)
 	}
 	return out
 }
 
 // renderPromptRecord renders the FULL prompt context committed to scrollback — the
-// copyable record, NOT the compact bottom-box control (prompt.go renders that). A
-// permission record renders an "Approve <ToolName>?" header then its wrapped
-// Description (the command / diff / url); a user-input record renders the Question
-// then every choice (renderPromptChoices). A nil context renders nothing (fail-safe).
+// copyable record, NOT the compact bottom-box control (prompt.go renders that). It is
+// rendered as one info notification: every line carries the neutral "▌ " info bar
+// (styles.NoticeInfoStyle), matching the leveled-notice family. A permission record
+// renders an "Approve <ToolName>?" header then its wrapped Description (the command /
+// diff / url); a user-input record renders the Question then every choice. A nil
+// context renders nothing (fail-safe).
 func renderPromptRecord(p *promptContext, width int) []string {
 	if p == nil {
 		return nil
@@ -72,18 +87,19 @@ func renderPromptRecord(p *promptContext, width int) []string {
 	return renderPermissionRecord(*p, width)
 }
 
-// renderPermissionRecord renders a permission gate's scrollback record: a bold
-// "Approve <ToolName>?" header followed by the width-wrapped, copyable Description
-// lines. The Description (Bash command, file diff, fetch url) is shown in full so
-// scrollback retains exactly what was approved/denied — INTERIOR blank lines are
-// preserved (a multi-line command or diff can carry meaningful gaps); only a single
-// leading/trailing empty line is trimmed so the record reads tight against the header.
+// renderPermissionRecord renders a permission gate's scrollback record as one info
+// notification: a "▌ "-barred, bold "Approve <ToolName>?" header followed by the
+// "▌ "-barred, width-wrapped, copyable Description lines — every line carries the
+// neutral info bar (styles.NoticeInfoStyle) so the block reads as one information
+// notice (unifying it with the leveled-notice family). The Description (Bash command,
+// file diff, fetch url) is shown in full so scrollback retains exactly what was
+// approved/denied — INTERIOR blank lines are preserved (a multi-line command or diff
+// can carry meaningful gaps); only a single leading/trailing empty line is trimmed so
+// the record reads tight against the header.
 func renderPermissionRecord(p promptContext, width int) []string {
-	out := []string{styles.PromptHeaderStyle.Render("Approve " + p.ToolName + "?")}
-	for _, raw := range trimEdgeBlanks(strings.Split(p.Description, "\n")) {
-		out = append(out, wrapToWidth(raw, width)...)
-	}
-	return out
+	out := barWrap(styles.PromptRecordHeaderStyle, []string{"Approve " + p.ToolName + "?"}, width)
+	body := trimEdgeBlanks(strings.Split(p.Description, "\n"))
+	return append(out, barWrap(styles.NoticeInfoStyle, body, width)...)
 }
 
 // trimEdgeBlanks drops a single leading and a single trailing empty line from rows,
@@ -100,32 +116,29 @@ func trimEdgeBlanks(rows []string) []string {
 	return rows
 }
 
-// renderUserInputRecord renders an AskUser request's scrollback record: the
-// width-wrapped Question followed by every offered choice as a numbered line
-// (renderPromptChoices). A free-text request (no choices) records just the question.
+// renderUserInputRecord renders an AskUser request's scrollback record as one info
+// notification: the "▌ "-barred Question followed by every offered choice as a
+// "▌ "-barred numbered line (promptChoiceLines). Every line carries the neutral info
+// bar (styles.NoticeInfoStyle) so the request reads as one information notice. A
+// free-text request (no choices) records just the question.
 func renderUserInputRecord(p promptContext, width int) []string {
-	out := make([]string, 0, len(p.Choices)+2)
-	out = append(out, wrapToWidth(p.Question, width)...)
-	out = append(out, renderPromptChoices(p.Choices, width)...)
-	return out
+	lines := append([]string{p.Question}, promptChoiceLines(p.Choices)...)
+	return barWrap(styles.NoticeInfoStyle, lines, width)
 }
 
 // choiceIndent is the 2-space lead applied to every recorded-choice line so a
 // wrapped "N. text" choice's continuation rows align under the "N. " number.
 const choiceIndent = "  "
 
-// renderPromptChoices renders each choice as a "  N. text" numbered line (1-based),
-// width-wrapped under the number indent so a long choice never blows the width.
-// Choices render at NORMAL weight via wrapToWidth (which applies no style) — they
-// are user-facing record lines, NOT subordinate tool output, so they must not pick
-// up the faint styles.ToolResultStyle that indentWrap unconditionally applies.
-// Returns nil for an empty choice list (a free-text question records no choices).
-func renderPromptChoices(choices []string, width int) []string {
+// promptChoiceLines builds each choice as a "  N. text" numbered raw line (1-based),
+// the choiceIndent leading every line so a barWrap-wrapped continuation row aligns
+// under the number. Width-wrapping and the info bar are applied by barWrap (which the
+// caller runs these through) — this only lays out the numbered text. Returns nil for
+// an empty choice list (a free-text question records no choices).
+func promptChoiceLines(choices []string) []string {
 	out := make([]string, 0, len(choices))
 	for i, c := range choices {
-		for _, row := range wrapToWidth(strconv.Itoa(i+1)+". "+c, width-len(choiceIndent)) {
-			out = append(out, choiceIndent+row)
-		}
+		out = append(out, choiceIndent+strconv.Itoa(i+1)+". "+c)
 	}
 	return out
 }

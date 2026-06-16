@@ -83,6 +83,13 @@ var PromptBoxStyle = lipgloss.NewStyle().Border(lipgloss.RoundedBorder())
 // bold so the action reads at a glance above the body.
 var PromptHeaderStyle = lipgloss.NewStyle().Bold(true)
 
+// PromptRecordHeaderStyle renders the SCROLLBACK prompt-record's header label
+// ("Approve <ToolName>?") in the neutral info-notification color (matching
+// NoticeInfoStyle) but BOLD, so the scrollback record reads as one "▌ "-barred info
+// notice while the header still stands out for scannability. It is distinct from
+// PromptHeaderStyle, which styles the active bottom-box control's header (not barred).
+var PromptRecordHeaderStyle = NoticeInfoStyle.Bold(true)
+
 // PromptHintStyle renders a prompt box's faint secondary hints — the key legend
 // ("↑/↓ select · …") and the "(+N more pending)" queue-depth note.
 var PromptHintStyle = lipgloss.NewStyle().Faint(true)

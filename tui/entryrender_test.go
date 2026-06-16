@@ -226,6 +226,101 @@ func TestRenderEntryPromptRecord(t *testing.T) {
 	}
 }
 
+// TestRenderEntryPromptRecordInfoBar locks that the SCROLLBACK promptRecord renders
+// in the info-notification style — every line (permission header + body; AskUser
+// question + every choice) carries the "▌ " accent bar in the neutral NoticeInfoStyle,
+// reading as one information notice (unifying it with the leveled-notice family). The
+// bar-styling assertion is NON-stripped: it matches the exact info-bar fragment that
+// styles.NoticeInfoStyle.Render(AccentBarPrompt) produces, so it would fail if the
+// promptRecord were emitted plain (the old bare/bold-only-header rendering, no bar).
+// A long line is forced to wrap and EACH wrapped line must keep the bar.
+func TestRenderEntryPromptRecordInfoBar(t *testing.T) {
+	t.Parallel()
+
+	// The neutral info-color code the bar carries on every line. The body bar's SGR is
+	// exactly this color; the bold header bar is this color plus the bold attribute —
+	// both are the neutral info color, so we lock the color code (a strip-ANSI check
+	// could not catch a wrong/absent bar color). infoColorCode is the bare SGR color
+	// number (e.g. "90") NoticeInfoStyle emits, trimmed of the CSI frame.
+	infoColorCode := strings.TrimSuffix(strings.TrimPrefix(sgrPrefix(t, styles.NoticeInfoStyle.Render("x")), "\x1b["), "m")
+
+	tests := []struct {
+		name       string
+		ctx        promptContext
+		width      int
+		wantSubs   []string // stripped content substrings that must survive
+		minBarHits int      // minimum number of barred lines the output must carry
+	}{
+		{
+			name: "permission header and body each carry the info bar",
+			ctx: promptContext{
+				Kind:        promptPermission,
+				ToolName:    "Bash",
+				Description: "date",
+			},
+			width:      80,
+			wantSubs:   []string{"Approve Bash?", "date"},
+			minBarHits: 2, // header line + body line
+		},
+		{
+			name: "AskUser question and every choice each carry the info bar",
+			ctx: promptContext{
+				Kind:     promptUserInput,
+				Question: "Which version source?",
+				Choices:  []string{"version.Version()", "git tag", "CHANGELOG top"},
+			},
+			width:      80,
+			wantSubs:   []string{"Which version source?", "1. version.Version()", "2. git tag", "3. CHANGELOG top"},
+			minBarHits: 4, // question + three choices
+		},
+		{
+			name: "long permission description wraps and each wrapped line keeps the bar",
+			ctx: promptContext{
+				Kind:        promptPermission,
+				ToolName:    "Bash",
+				Description: "alpha bravo charlie delta echo foxtrot golf hotel india juliet",
+			},
+			width:      16, // forces the description to wrap across several rows
+			wantSubs:   []string{"Approve Bash?", "alpha"},
+			minBarHits: 3, // header + at least two wrapped body rows
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			ctx := tt.ctx
+			e := entry{ID: 1, Kind: kindPromptRecord, Prompt: &ctx}
+			lines := renderEntry(e, false, tt.width)
+			raw := strings.Join(lines, "\n") // NOT stripped — the info-bar styling is under test
+
+			barred := 0
+			for i, line := range lines {
+				// NON-stripped: the line's leading SGR must carry the neutral info color
+				// (the bar's color) — proving it is NOT the old plain/bold-only header.
+				lead, _, _ := strings.Cut(line, styles.AccentBar)
+				if !strings.Contains(lead, infoColorCode) {
+					t.Errorf("promptRecord line %d = %q, want the info-color code %q in the SGR before the bar", i, line, infoColorCode)
+				}
+				// And the visible line must begin with the "▌ " accent bar.
+				if !strings.HasPrefix(stripANSI(line), styles.AccentBarPrompt) {
+					t.Errorf("promptRecord line %d (stripped) = %q, want it to start with %q", i, stripANSI(line), styles.AccentBarPrompt)
+				}
+				barred++
+			}
+			if barred < tt.minBarHits {
+				t.Errorf("promptRecord render = %q, carried %d barred lines, want >= %d", raw, barred, tt.minBarHits)
+			}
+			stripped := stripANSI(raw)
+			for _, sub := range tt.wantSubs {
+				if !strings.Contains(stripped, sub) {
+					t.Errorf("promptRecord render = %q, want content substring %q", stripped, sub)
+				}
+			}
+		})
+	}
+}
+
 // TestRenderEntryChoicesNotFaint locks the styling of recorded user-input choices:
 // they render at NORMAL weight, NOT the faint styles.ToolResultStyle reserved for
 // subordinate tool output. The faint SGR sequence ToolResultStyle emits is computed
@@ -276,24 +371,26 @@ func TestRenderEntryPermissionInteriorBlank(t *testing.T) {
 	}
 	e := entry{ID: 1, Kind: kindPromptRecord, Prompt: &ctx}
 	lines := renderEntry(e, false, 80)
-	stripped := make([]string, len(lines))
+	// Strip ANSI but keep the literal "▌ " bar glyph; trim it off each line to inspect
+	// the body content, since every line now carries the info bar.
+	body := make([]string, len(lines))
 	for i, l := range lines {
-		stripped[i] = stripANSI(l)
+		body[i] = strings.TrimPrefix(stripANSI(l), styles.AccentBarPrompt)
 	}
-	joined := strings.Join(stripped, "\n")
+	joined := strings.Join(body, "\n")
 
 	if !strings.Contains(joined, "line one\n\nline two") {
 		t.Errorf("permission record = %q, want the interior blank line preserved between the two body lines", joined)
 	}
 	// Header then body with no leading blank: header is line 0, body starts at line 1.
-	if len(stripped) < 1 || !strings.Contains(stripped[0], "Approve Bash?") {
-		t.Fatalf("permission record lines = %q, want the Approve header first", stripped)
+	if len(body) < 1 || !strings.Contains(body[0], "Approve Bash?") {
+		t.Fatalf("permission record lines = %q, want the Approve header first", body)
 	}
-	if len(stripped) > 1 && stripped[1] == "" {
-		t.Errorf("permission record = %q, leading blank line should have been trimmed", stripped)
+	if len(body) > 1 && body[1] == "" {
+		t.Errorf("permission record = %q, leading blank line should have been trimmed", body)
 	}
-	if stripped[len(stripped)-1] == "" {
-		t.Errorf("permission record = %q, trailing blank line should have been trimmed", stripped)
+	if body[len(body)-1] == "" {
+		t.Errorf("permission record = %q, trailing blank line should have been trimmed", body)
 	}
 }
 
