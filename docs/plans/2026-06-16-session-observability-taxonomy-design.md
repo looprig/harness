@@ -105,10 +105,22 @@ The loop already feeds two audiences from `listen()` (`loop.go:141-188`):
   (`loop.go:147`; observability must never see secrets — CLAUDE.md "log security
   events, not secrets").
 
-Both copies share one minted set of metadata (`EventID`, `CreatedAt`, `TurnID`,
-`CausationID`, `ToolCallID`). Refactor the `emit`/`publish`/`deliverAndClose`
-closures in `listen()` to mint metadata **once**, then build the full envelope for
-`turnEvents` and the redacted envelope for sinks.
+Both copies share one set of metadata (`EventID`, `CreatedAt`, `TurnID`,
+`CausationID`, `ToolCallID`). **`CreatedAt` and `EventID` are captured by the
+producer at the moment the event is constructed — its birth time — not at publish
+or delivery.** Today `publish` mints `EventID` (`loop.go:152`) on the sink step,
+which is too late and would make a `CreatedAt` added there a *delivery* time. The
+clock/id seam is read where the event is *created*: for streaming events the
+producer builds and emits on the same line (`runner.go:143`
+`safeEmit(event.ToolCallStarted{...})`), so capture happens at construction; for
+the **terminal** event — the one case where construction and delivery differ —
+capture `CreatedAt`/`EventID` in `runTurn` when it is **finalised**, and have the
+actor **reuse** those values when it delivers via `deliverAndClose` (it must never
+re-read the clock at delivery). The loop then attaches the contextual fields it
+owns (`SessionID`/`TurnID`/`TurnIndex`/`CausationID`, frozen by value at turn start
+so reads from the turn goroutine are race-free), builds the full envelope for
+`turnEvents`, and hands the **same** metadata with the event's `SinkProjection` to
+sinks. `publish` only redacts and forwards — it never mints.
 
 **Cost-reducer:** keep the loop's internal `emit func(event.Event)` signature
 unchanged — enveloping happens *inside* the closure. So every event **producer**
@@ -206,9 +218,13 @@ type Sink interface {
   single serialization point, so the journal is one correctly **interleaved,
   ordered** command+event stream.
 - **No `CommandEnvelope` wrapper.** A command **embeds** its metadata (`Header`:
-  `ID`/`CausationID`/`CreatedAt`), so it needs no external wrapper — unlike a bare
-  event, whose metadata is minted late by the loop and therefore lives in
-  `EventEnvelope`. This asymmetry is principled.
+  `ID`/`CausationID`/`CreatedAt`) because the **sender** authors it at construction.
+  An event keeps its metadata in `EventEnvelope` (the bare event struct stays
+  metadata-free) because one event needs **two projections** — full for the
+  per-turn caller, redacted for sinks — that must **share** identical metadata. Both
+  are stamped **at creation** (the producer captures `CreatedAt`/`EventID` when it
+  builds the event — see A3), never at delivery; the embed-vs-wrap difference
+  reflects *who authors the metadata* (sender vs loop), not *when*.
 
 ### Command redaction
 
