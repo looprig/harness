@@ -59,8 +59,8 @@ func sysMsg(blocks ...content.Block) *content.SystemMessage {
 	return &content.SystemMessage{Message: content.Message{Role: content.RoleSystem, Blocks: blocks}}
 }
 
-func toolMsg(id string, blocks ...content.Block) *content.ToolMessage {
-	return &content.ToolMessage{Message: content.Message{Role: content.RoleTool, Blocks: blocks}, ToolUseID: id}
+func toolMsg(id string, blocks ...content.Block) *content.ToolResultMessage {
+	return &content.ToolResultMessage{Message: content.Message{Role: content.RoleTool, Blocks: blocks}, ToolUseID: id}
 }
 
 func textBlock(s string) content.Block {

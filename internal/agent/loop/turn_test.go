@@ -118,7 +118,7 @@ func (e *echoTool) runCount() int {
 	return e.runs
 }
 
-// countToolUseInHistory counts tool_use blocks (in AIMessages) and ToolMessages.
+// countToolUseInHistory counts tool_use blocks (in AIMessages) and ToolResultMessages.
 // A well-formed turn has equal counts; rollback to base leaves both at zero.
 func countToolUseInHistory(msgs content.AgenticMessages) (toolUse, toolMsg int) {
 	for _, m := range msgs {
@@ -129,7 +129,7 @@ func countToolUseInHistory(msgs content.AgenticMessages) (toolUse, toolMsg int) 
 					toolUse++
 				}
 			}
-		case *content.ToolMessage:
+		case *content.ToolResultMessage:
 			toolMsg++
 		}
 	}
@@ -192,9 +192,9 @@ func TestRunTurnAgentic(t *testing.T) {
 		if _, ok := ai1.Blocks[len(ai1.Blocks)-1].(*content.ToolUseBlock); !ok {
 			t.Errorf("msgs[1] last block = %T, want *ToolUseBlock", ai1.Blocks[len(ai1.Blocks)-1])
 		}
-		tm, ok := msgs[2].(*content.ToolMessage)
+		tm, ok := msgs[2].(*content.ToolResultMessage)
 		if !ok {
-			t.Fatalf("msgs[2] = %T, want *ToolMessage", msgs[2])
+			t.Fatalf("msgs[2] = %T, want *ToolResultMessage", msgs[2])
 		}
 		if tm.ToolUseID != "id-1" {
 			t.Errorf("tool message ToolUseID = %q, want %q", tm.ToolUseID, "id-1")
@@ -308,9 +308,9 @@ func TestRunTurnAgentic(t *testing.T) {
 			t.Errorf("stored tool_use Input is not valid JSON: %q", string(tub.Input))
 		}
 		// A tool-result error reached the model.
-		tm, ok := msgs[2].(*content.ToolMessage)
+		tm, ok := msgs[2].(*content.ToolResultMessage)
 		if !ok {
-			t.Fatalf("msgs[2] = %T, want *ToolMessage", msgs[2])
+			t.Fatalf("msgs[2] = %T, want *ToolResultMessage", msgs[2])
 		}
 		if got := flattenToText(tm.Blocks); got == "" {
 			t.Errorf("tool message must carry a non-empty error result, got %q", got)

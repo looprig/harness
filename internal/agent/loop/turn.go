@@ -23,7 +23,7 @@ import (
 //
 // Whole-turn rollback: base := len(msgs) is snapshotted at turn start; any
 // abnormal exit truncates msgs[:base], discarding the ENTIRE turn's exchange so
-// history never holds a tool_use without its matching ToolMessage (which a strict
+// history never holds a tool_use without its matching ToolResultMessage (which a strict
 // provider would reject on the next request). Only a TurnDone path keeps the
 // turn — and only well-formed, fully paired exchanges reach a TurnDone.
 func runTurn(
@@ -194,13 +194,13 @@ func validToolCall(b content.ToolUseBlock) bool {
 	return b.ID != "" && b.Name != "" && json.Valid(b.Input)
 }
 
-// toolResultMessage wraps one tool result into a ToolMessage carrying the
+// toolResultMessage wraps one tool result into a ToolResultMessage carrying the
 // flattened result text (flattenToText is REUSED from runner.go: TextBlocks pass
 // through; non-text → "[unsupported …]" placeholder; empty → "error: empty
 // result") and the originating tool_use id, so the model pairs result↔call.
-func toolResultMessage(r result) *content.ToolMessage {
+func toolResultMessage(r result) *content.ToolResultMessage {
 	text := flattenToText(r.Content)
-	return &content.ToolMessage{
+	return &content.ToolResultMessage{
 		Message:   content.Message{Role: content.RoleTool, Blocks: []content.Block{&content.TextBlock{Text: text}}},
 		ToolUseID: r.ToolUseID,
 	}
