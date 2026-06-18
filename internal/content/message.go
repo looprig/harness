@@ -29,9 +29,9 @@ type AIMessage struct{ Message }
 // SystemMessage carries a system prompt that shapes model behavior.
 type SystemMessage struct{ Message }
 
-// ToolMessage carries the result of a tool invocation back to the model.
+// ToolResultMessage carries the result of a tool invocation back to the model.
 // ToolUseID ties this result to the specific ToolUseBlock that requested it.
-type ToolMessage struct {
+type ToolResultMessage struct {
 	Message
 	ToolUseID string
 }
@@ -42,10 +42,10 @@ type ToolMessage struct {
 // keeping the discriminated union closed.
 type Conversation interface{ isMessage() }
 
-func (*UserMessage) isMessage()   {}
-func (*AIMessage) isMessage()     {}
-func (*SystemMessage) isMessage() {}
-func (*ToolMessage) isMessage()   {}
+func (*UserMessage) isMessage()       {}
+func (*AIMessage) isMessage()         {}
+func (*SystemMessage) isMessage()     {}
+func (*ToolResultMessage) isMessage() {}
 
 // AgenticMessages is an ordered conversation thread. A nil or empty slice is a
 // valid zero value representing an empty thread.
@@ -86,15 +86,16 @@ func (m *Message) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
-// toolMessageJSON is the wire form of ToolMessage. ToolMessage defines its own
-// codec pair so the promoted Message methods do not silently drop ToolUseID.
-type toolMessageJSON struct {
+// toolResultMessageJSON is the wire form of ToolResultMessage. ToolResultMessage
+// defines its own codec pair so the promoted Message methods do not silently drop
+// ToolUseID.
+type toolResultMessageJSON struct {
 	Role      Role            `json:"role"`
 	Blocks    json.RawMessage `json:"blocks,omitempty"`
 	ToolUseID string          `json:"tool_use_id"`
 }
 
-func (m ToolMessage) MarshalJSON() ([]byte, error) {
+func (m ToolResultMessage) MarshalJSON() ([]byte, error) {
 	var blocks json.RawMessage
 	if len(m.Blocks) > 0 {
 		b, err := MarshalBlocks(m.Blocks)
@@ -103,11 +104,11 @@ func (m ToolMessage) MarshalJSON() ([]byte, error) {
 		}
 		blocks = b
 	}
-	return json.Marshal(toolMessageJSON{Role: m.Role, Blocks: blocks, ToolUseID: m.ToolUseID})
+	return json.Marshal(toolResultMessageJSON{Role: m.Role, Blocks: blocks, ToolUseID: m.ToolUseID})
 }
 
-func (m *ToolMessage) UnmarshalJSON(data []byte) error {
-	var j toolMessageJSON
+func (m *ToolResultMessage) UnmarshalJSON(data []byte) error {
+	var j toolResultMessageJSON
 	if err := json.Unmarshal(data, &j); err != nil {
 		return err
 	}
