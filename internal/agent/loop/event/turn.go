@@ -4,44 +4,111 @@ import (
 	"encoding/json"
 
 	"github.com/inventivepotter/urvi/internal/content"
+	"github.com/inventivepotter/urvi/internal/uuid"
 )
 
-// TurnStarted is the first event written to StartTurn.Events.
-type TurnStarted struct{ TurnIndex TurnIndex }
+// TurnStarted is emitted when runLoop commits a turn's initial UserMessage. It is
+// the first enduring turn event. Header.CausationID == InputID (the submit command
+// id). Message is the exact UserMessage committed as the first message of the turn.
+type TurnStarted struct {
+	enduring
+	loopScoped
+	Header
+	TurnIndex TurnIndex
+	InputID   uuid.UUID
+	Message   *content.UserMessage
+}
 
-// TokenDelta is emitted for each streaming chunk from the LLM.
+// StepDone is the enduring event emitted when runLoop commits a completed step's
+// finalized group: the step's single AIMessage followed by its ToolResultMessages.
+// It is emitted at the same actor-owned point the messages are appended to
+// loopState.msgs, so it is never a lie.
+type StepDone struct {
+	enduring
+	loopScoped
+	Header
+	Messages content.AgenticMessages
+}
+
+// TurnFoldedInto is emitted when queued input folds into a mandatory
+// tool-continuation request. Header.CausationID == InputID; Header.TriggeredByLoopID
+// is set for a SubagentResult hand-back. Message is the folded user message.
+type TurnFoldedInto struct {
+	enduring
+	loopScoped
+	Header
+	TurnIndex TurnIndex
+	InputID   uuid.UUID
+	Message   *content.UserMessage
+}
+
+// InputCancelled is emitted when a queued input leaves the loop queue without
+// committing — client retract, or a return after an abnormal turn end.
+// Header.CausationID == InputID; Header.TurnID is the active turn that caused a
+// return, or zero for a pure client retract outside a turn. Message is the
+// returned/retracted user message.
+type InputCancelled struct {
+	enduring
+	loopScoped
+	Header
+	TurnIndex TurnIndex
+	InputID   uuid.UUID
+	Reason    CancelReason
+	Message   *content.UserMessage
+}
+
+// TokenDelta is emitted for each streaming chunk from the LLM. It is the only
+// Ephemeral event.
 type TokenDelta struct {
+	ephemeral
+	loopScoped
+	Header
 	TurnIndex TurnIndex
 	Chunk     content.Chunk
 }
 
-// TurnDone is the terminal success event. Message is the complete AI response.
+// TurnDone is the terminal success event for a turn.
 type TurnDone struct {
+	terminal
+	loopScoped
+	Header
 	TurnIndex TurnIndex
-	Message   *content.AIMessage
+	// Message is the complete AI response. It is retained for the current sink
+	// projection; the loop-machine refactor removes it in a later phase once the
+	// step group is the authoritative payload.
+	Message *content.AIMessage
 }
 
-// TurnFailed is the terminal event for non-cancellation LLM/provider errors.
-// On failure the user message is rolled back from history. Err carries the
-// typed cause; callers may errors.As it to inspect and retry.
+// TurnFailed is the terminal event for non-cancellation LLM/provider errors. Err
+// carries the typed cause; callers may errors.As it to inspect and retry.
 //
 // SECURITY: TurnFailed is intentionally NOT Redactable, so Err is forwarded to
 // sinks UN-redacted — an audit log legitimately needs the failure cause. This is
 // safe ONLY while every cause is a typed, secret-free error constructed in this
-// package (EmptyResponseError, TurnPanicError). A future change that wraps a
-// provider/LLM error string into TurnFailed.Err MUST redact it (or make
-// TurnFailed implement Redactable), because such strings can carry request
+// package (EmptyResponseError, ToolLimitError, TurnPanicError). A future change
+// that wraps a provider/LLM error string into TurnFailed.Err MUST redact it (or
+// make TurnFailed implement Redactable), because such strings can carry request
 // bodies, headers, or tokens.
 type TurnFailed struct {
+	terminal
+	loopScoped
+	Header
 	TurnIndex TurnIndex
 	Err       error
 }
 
 // TurnInterrupted is the terminal event when the turn context is cancelled.
-// The user message for the cancelled turn is rolled back from history.
-type TurnInterrupted struct{ TurnIndex TurnIndex }
+type TurnInterrupted struct {
+	terminal
+	loopScoped
+	Header
+	TurnIndex TurnIndex
+}
 
 func (TurnStarted) isEvent()     {}
+func (StepDone) isEvent()        {}
+func (TurnFoldedInto) isEvent()  {}
+func (InputCancelled) isEvent()  {}
 func (TokenDelta) isEvent()      {}
 func (TurnDone) isEvent()        {}
 func (TurnFailed) isEvent()      {}
@@ -51,13 +118,16 @@ func (TurnInterrupted) isEvent() {}
 // *content.ToolUseChunk carries partial argument JSON (InputJSON) — the same
 // secret ToolCallStarted.Summary redacts — so the projection keeps Index/ID/Name
 // and drops InputJSON. A TextChunk/ThinkingChunk TokenDelta is model output, not
-// a secret, so it is returned unchanged.
+// a secret, so it is returned unchanged. The Header is carried through unchanged.
+// TODO(Open Items B): journal/redaction follow-on re-homes redaction as a
+// subscriber; new content-bearing events get no projection here by design.
 func (e TokenDelta) SinkProjection() Event {
 	tu, ok := e.Chunk.(*content.ToolUseChunk)
 	if !ok {
 		return e
 	}
 	return TokenDelta{
+		Header:    e.Header,
 		TurnIndex: e.TurnIndex,
 		Chunk: &content.ToolUseChunk{
 			Index: tu.Index,
@@ -73,7 +143,10 @@ func (e TokenDelta) SinkProjection() Event {
 // body, a Bash command with an inline token, Fetch headers) never log. Text and
 // thinking blocks are model output and pass through unchanged. The projection is
 // a deep-enough copy that the original message — still referenced by the stream
-// and conversation history — is never mutated.
+// and conversation history — is never mutated. The Header is carried through
+// unchanged.
+// TODO(Open Items B): journal/redaction follow-on re-homes redaction as a
+// subscriber; new content-bearing events get no projection here by design.
 func (e TurnDone) SinkProjection() Event {
 	if e.Message == nil {
 		return e
@@ -94,6 +167,7 @@ func (e TurnDone) SinkProjection() Event {
 		blocks[i] = b
 	}
 	return TurnDone{
+		Header:    e.Header,
 		TurnIndex: e.TurnIndex,
 		Message: &content.AIMessage{Message: content.Message{
 			Role:   e.Message.Role,

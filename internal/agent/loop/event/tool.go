@@ -25,6 +25,9 @@ type Redactable interface {
 // a file-diff preview, or a URL — so the stream gets the full Request. The SINK
 // must never see that text; SinkProjection drops it (see below).
 type PermissionRequested struct {
+	enduring
+	loopScoped
+	Header
 	CallID  uuid.UUID
 	Request tool.PermissionRequest
 }
@@ -33,6 +36,9 @@ type PermissionRequested struct {
 // STREAM gets the full Question and Choices for rendering; the SINK gets only the
 // CallID and the count of choices (the question and choice text may be sensitive).
 type UserInputRequested struct {
+	enduring
+	loopScoped
+	Header
 	CallID   uuid.UUID
 	Question string
 	Choices  []string
@@ -45,6 +51,9 @@ type UserInputRequested struct {
 // the absence of Question/Choices fields is enforced by the compiler, not by a
 // nulled field that could be repopulated by mistake.
 type UserInputRequestedSink struct {
+	enduring
+	loopScoped
+	Header
 	CallID      uuid.UUID
 	ChoiceCount int
 }
@@ -53,6 +62,9 @@ type UserInputRequestedSink struct {
 // already redacted/capped at construction (never raw args), so it is safe for
 // both audiences — this event does NOT implement Redactable.
 type ToolCallStarted struct {
+	enduring
+	loopScoped
+	Header
 	CallID   uuid.UUID
 	ToolName string
 	Summary  string
@@ -62,6 +74,9 @@ type ToolCallStarted struct {
 // tool output for the TUI and is STREAM-ONLY: tool output may hold secrets/PII,
 // so SinkProjection drops it, keeping only CallID and IsError.
 type ToolCallCompleted struct {
+	enduring
+	loopScoped
+	Header
 	CallID        uuid.UUID
 	IsError       bool
 	ResultPreview string
@@ -76,13 +91,15 @@ func (ToolCallCompleted) isEvent()      {}
 // SinkProjection drops Request.Description() — the load-bearing secret — keeping
 // only the CallID and the tool name. The projected Request is an UnknownRequest
 // carrying just the tool name (its Description() returns the empty Summary), so
-// no descriptive text can reach a sink even through the interface.
+// no descriptive text can reach a sink even through the interface. The Header is
+// carried through unchanged.
 func (e PermissionRequested) SinkProjection() Event {
 	toolName := ""
 	if e.Request != nil {
 		toolName = e.Request.ToolName()
 	}
 	return PermissionRequested{
+		Header:  e.Header,
 		CallID:  e.CallID,
 		Request: tool.UnknownRequest{Tool: toolName},
 	}
@@ -90,17 +107,21 @@ func (e PermissionRequested) SinkProjection() Event {
 
 // SinkProjection drops the Question text and every Choice string, keeping the
 // CallID and the choice count as the non-sensitive UserInputRequestedSink shape.
+// The Header is carried through unchanged.
 func (e UserInputRequested) SinkProjection() Event {
 	return UserInputRequestedSink{
+		Header:      e.Header,
 		CallID:      e.CallID,
 		ChoiceCount: len(e.Choices),
 	}
 }
 
 // SinkProjection drops ResultPreview (tool output may hold secrets/PII), keeping
-// the CallID and the IsError flag for audit.
+// the CallID and the IsError flag for audit. The Header is carried through
+// unchanged.
 func (e ToolCallCompleted) SinkProjection() Event {
 	return ToolCallCompleted{
+		Header:  e.Header,
 		CallID:  e.CallID,
 		IsError: e.IsError,
 	}
