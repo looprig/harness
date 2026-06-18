@@ -187,7 +187,7 @@ func listen(ctx context.Context, sessionID uuid.UUID, cfg Config, commands <-cha
 		}
 	}
 
-	publish(event.SessionStarted{SessionID: sessionID})
+	publish(event.SessionStarted{Header: event.Header{SessionID: sessionID}})
 
 	// deliverAndClose publishes the terminal event, sends it to the per-turn
 	// channel unless the caller abandoned the stream, and closes the channel.
