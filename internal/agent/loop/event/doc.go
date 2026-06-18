@@ -10,9 +10,11 @@
 package event
 
 // Sealed-union interface-satisfaction assertions. Each concrete event must
-// satisfy Event (isEvent + Class + Scope + EndsTurn + EventHeader). Embedding two
-// lifecycle mixins or two scope mixins makes the selectors ambiguous and the type
-// stops satisfying Event, so these assertions also enforce "exactly one of each".
+// satisfy Event (isEvent + Class + Scope + EndsTurn + EventHeader). The intended
+// "exactly one lifecycle mixin and exactly one scope mixin" is enforced from both
+// sides: embedding two of a kind makes the promoted selector ambiguous (won't
+// compile), and embedding zero leaves the method missing (won't satisfy Event) —
+// so any count other than one fails these assertions.
 var (
 	// Session-scoped events.
 	_ Event = SessionStarted{}

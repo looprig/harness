@@ -37,7 +37,6 @@ func TestEventClass(t *testing.T) {
 		{"ToolCallCompleted enduring", event.ToolCallCompleted{}, event.Enduring},
 	}
 	for _, tt := range tests {
-		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			if got := tt.ev.Class(); got != tt.want {
@@ -75,7 +74,6 @@ func TestEventEndsTurn(t *testing.T) {
 		{"ToolCallCompleted does not end turn", event.ToolCallCompleted{}, false},
 	}
 	for _, tt := range tests {
-		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			if got := tt.ev.EndsTurn(); got != tt.want {
@@ -113,7 +111,6 @@ func TestEventScope(t *testing.T) {
 		{"ToolCallCompleted loop-scoped", event.ToolCallCompleted{}, event.ScopeLoop},
 	}
 	for _, tt := range tests {
-		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			if got := tt.ev.Scope(); got != tt.want {
@@ -167,7 +164,6 @@ func TestEventHeaderRoundTrip(t *testing.T) {
 		},
 	}
 	for _, tt := range tests {
-		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			ev := event.StepDone{Header: tt.hdr}
@@ -258,6 +254,22 @@ func TestNewEventFields(t *testing.T) {
 		}
 		if ev.Reason != event.CancelTurnInterrupted {
 			t.Errorf("Reason = %v, want %v", ev.Reason, event.CancelTurnInterrupted)
+		}
+	})
+
+	t.Run("InputCancelled carries CancelTurnFailed reason", func(t *testing.T) {
+		t.Parallel()
+		ev := event.InputCancelled{
+			Header:  event.Header{CausationID: inputID},
+			InputID: inputID,
+			Reason:  event.CancelTurnFailed,
+			Message: userMsg,
+		}
+		if ev.Reason != event.CancelTurnFailed {
+			t.Errorf("Reason = %v, want %v", ev.Reason, event.CancelTurnFailed)
+		}
+		if ev.Message != userMsg {
+			t.Errorf("Message = %v, want %v", ev.Message, userMsg)
 		}
 	})
 
