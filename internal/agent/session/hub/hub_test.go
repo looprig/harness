@@ -396,7 +396,7 @@ func TestStopSession(t *testing.T) {
 	case <-time.After(50 * time.Millisecond):
 	}
 
-	h.stopSession(context.Background())
+	h.StopSession(context.Background())
 
 	// The blocked WaitIdle wakes with ErrSessionStopped.
 	if err := <-waitErr; !errors.Is(err, ErrSessionStopped) {
@@ -423,7 +423,7 @@ func TestStopSession(t *testing.T) {
 	// No derived SessionIdle follows.
 	expectNoMore(t, sub)
 	// Idempotent stop.
-	h.stopSession(context.Background())
+	h.StopSession(context.Background())
 }
 
 // expectNoMore asserts no further event arrives briefly (channel stays open).
@@ -451,12 +451,12 @@ func TestExpectTurnCancelExpectTurn(t *testing.T) {
 		t.Fatalf("SubscribeEvents = %v", err)
 	}
 
-	h.expectTurn(context.Background(), subagent)
+	h.ExpectTurn(context.Background(), subagent)
 	if _, ok := recv(t, sub).(event.SessionActive); !ok {
 		t.Fatalf("expectTurn while idle did not derive SessionActive")
 	}
 
-	h.cancelExpectTurn(context.Background(), subagent)
+	h.CancelExpectTurn(context.Background(), subagent)
 	if _, ok := recv(t, sub).(event.SessionIdle); !ok {
 		t.Fatalf("cancelExpectTurn emptying active did not derive SessionIdle")
 	}
@@ -478,7 +478,7 @@ func TestHandbackReleaseNoEdge(t *testing.T) {
 	}
 
 	// Spawn: expectTurn takes {wake, subagent}; session goes Active.
-	h.expectTurn(context.Background(), subagent)
+	h.ExpectTurn(context.Background(), subagent)
 	if _, ok := recv(t, sub).(event.SessionActive); !ok {
 		t.Fatalf("expectTurn did not derive SessionActive")
 	}
@@ -608,7 +608,7 @@ func TestTurnFoldedAndInputCancelledReleaseWake(t *testing.T) {
 	}
 
 	// Only a wake token outstanding -> Active.
-	h.expectTurn(context.Background(), subagent)
+	h.ExpectTurn(context.Background(), subagent)
 	if _, ok := recv(t, sub).(event.SessionActive); !ok {
 		t.Fatalf("expectTurn did not derive SessionActive")
 	}

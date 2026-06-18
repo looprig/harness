@@ -22,8 +22,9 @@ import (
 
 // Hub is the session's event fan-in. It is owned by AgentSession; loops see only
 // its PublishEvent method (the narrow eventPublisher), and consumers see only
-// SubscribeEvents. expectTurn/cancelExpectTurn/stopSession are session-internal
-// (the session calls them; loops must not).
+// SubscribeEvents. ExpectTurn/CancelExpectTurn/StopSession are session-owned (the
+// session calls them; loops depend on the eventPublisher interface, which excludes
+// them).
 type Hub struct {
 	sessionID uuid.UUID
 
@@ -185,11 +186,12 @@ func (h *Hub) deliver(subs []*EventSubscription, ev event.Event) {
 	}
 }
 
-// expectTurn takes a {wake, subagentLoopID} token at subagent spawn so a finished
+// ExpectTurn takes a {wake, subagentLoopID} token at subagent spawn so a finished
 // subagent's in-flight hand-back cannot empty active and fire a false SessionIdle.
-// It derives SessionActive if the session was idle. Session-internal: loops never
-// call it.
-func (h *Hub) expectTurn(_ context.Context, subagentLoopID uuid.UUID) {
+// It derives SessionActive if the session was idle. It is exported for the session
+// (its sole caller); loops depend only on the narrow eventPublisher interface,
+// which excludes it, so a loop can never reach it.
+func (h *Hub) ExpectTurn(_ context.Context, subagentLoopID uuid.UUID) {
 	h.mu.Lock()
 	post := h.state.applyActivity(h.sessionID,
 		func() { h.state.add(activityKey{kind: kindWake, id: subagentLoopID}) },
@@ -201,10 +203,10 @@ func (h *Hub) expectTurn(_ context.Context, subagentLoopID uuid.UUID) {
 	}
 }
 
-// cancelExpectTurn releases a {wake, subagentLoopID} token when its hand-back is
+// CancelExpectTurn releases a {wake, subagentLoopID} token when its hand-back is
 // rejected or explicitly discarded. It derives SessionIdle if this emptied active.
-// Session-internal.
-func (h *Hub) cancelExpectTurn(_ context.Context, subagentLoopID uuid.UUID) {
+// Exported for the session only (see ExpectTurn).
+func (h *Hub) CancelExpectTurn(_ context.Context, subagentLoopID uuid.UUID) {
 	h.mu.Lock()
 	post := h.state.applyActivity(h.sessionID,
 		func() { h.state.remove(activityKey{kind: kindWake, id: subagentLoopID}) },
@@ -216,12 +218,12 @@ func (h *Hub) cancelExpectTurn(_ context.Context, subagentLoopID uuid.UUID) {
 	}
 }
 
-// stopSession is the session-owned teardown transition. It is idempotent: if
+// StopSession is the session-owned teardown transition. It is idempotent: if
 // already SessionStopped it returns without effect. Otherwise it clears active,
 // forces phase=SessionStopped (bypassing applyActivity so no SessionIdle is
 // derived), wakes every WaitIdle waiter with ErrSessionStopped, and delivers a
-// SessionStopped event. Session-internal.
-func (h *Hub) stopSession(_ context.Context) {
+// SessionStopped event. Exported for the session only (see ExpectTurn).
+func (h *Hub) StopSession(_ context.Context) {
 	h.mu.Lock()
 	if h.state.phase == SessionStopped {
 		h.mu.Unlock()
@@ -239,7 +241,7 @@ func (h *Hub) stopSession(_ context.Context) {
 // WaitIdle blocks until the session is quiescent (active empty), ctx is done, or
 // the session stops. It returns nil on idle, ctx.Err() on cancellation, and
 // ErrSessionStopped if the session is or becomes stopped. With no session
-// goroutine, waiters are woken by applyActivity (Active->Idle) and stopSession.
+// goroutine, waiters are woken by applyActivity (Active->Idle) and StopSession.
 func (h *Hub) WaitIdle(ctx context.Context) error {
 	h.mu.Lock()
 	switch {

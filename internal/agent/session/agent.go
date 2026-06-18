@@ -8,6 +8,7 @@ import (
 	"github.com/inventivepotter/urvi/internal/agent/loop"
 	"github.com/inventivepotter/urvi/internal/agent/loop/command"
 	"github.com/inventivepotter/urvi/internal/agent/loop/event"
+	"github.com/inventivepotter/urvi/internal/agent/session/hub"
 	"github.com/inventivepotter/urvi/internal/content"
 	"github.com/inventivepotter/urvi/internal/llm"
 	"github.com/inventivepotter/urvi/internal/tool"
@@ -65,6 +66,13 @@ type AgentSession struct {
 	// SessionID is shared by every loop participating in this session.
 	SessionID uuid.UUID
 
+	// hub is the session-level event fan-in. Loops publish through it (via the
+	// session's PublishEvent, which delegates here); consumers subscribe via
+	// SubscribeEvents. The hub also owns the federated-quiescence model that
+	// WaitIdle reads. It is constructed in NewAgent before any loop, so a loop
+	// never publishes into a nil hub.
+	hub *hub.Hub
+
 	// sessionCtx is the shared lifetime root for the session; every loop gets a
 	// loopCtx derived from it. sessionCancel is the final backstop, cancelled by
 	// the construction context (today) or future explicit teardown.
@@ -100,12 +108,55 @@ type loopHandle struct {
 	cancel context.CancelFunc
 }
 
-// PublishEvent is the session's eventPublisher implementation passed to
-// loop.New. Phase 3 is a no-op STUB: the loop stores the publisher but does not
-// yet call it (event-publication wiring, the real session fan-in / hub, is
-// Phase 4). The method exists so *AgentSession satisfies loop's eventPublisher
-// interface and the loop.New(..., s, ...) wiring stays stable.
-func (s *AgentSession) PublishEvent(_ context.Context, _ event.Event) error { return nil }
+// eventSubscriber is the consumer-facing half of the session fan-in: a TUI/CLI (or
+// later a durable journal) attaches here to receive filtered events. It is defined
+// where it is consumed (the session), per Dependency Inversion. *AgentSession
+// satisfies it by delegating to the hub.
+type eventSubscriber interface {
+	SubscribeEvents(event.EventFilter) (*hub.EventSubscription, error)
+}
+
+// Compile-time proof that *AgentSession is the consumer-facing eventSubscriber.
+// Its publisher half (PublishEvent) is asserted by loop.New accepting s as its
+// eventPublisher at the NewLoop call site.
+var _ eventSubscriber = (*AgentSession)(nil)
+
+// PublishEvent is the session's eventPublisher implementation passed to loop.New.
+// It delegates to the hub, which fans the event out to matching subscribers and
+// applies any quiescence transition the event implies. The loop depends only on
+// the narrow eventPublisher interface; it never sees the hub, its subscriber set,
+// or its shutdown state (Interface Segregation / least privilege).
+func (s *AgentSession) PublishEvent(ctx context.Context, ev event.Event) error {
+	return s.hub.PublishEvent(ctx, ev)
+}
+
+// SubscribeEvents attaches a consumer to the session fan-in with the given filter.
+// The returned subscription's Events() channel yields the filtered stream; the
+// caller must Close it when done. It delegates to the hub.
+func (s *AgentSession) SubscribeEvents(filter event.EventFilter) (*hub.EventSubscription, error) {
+	return s.hub.SubscribeEvents(filter)
+}
+
+// WaitIdle blocks until the session is quiescent, ctx is done, or the session has
+// stopped (hub.ErrSessionStopped). It is the headless caller's "is the whole
+// interaction at rest?" primitive; it delegates to the hub's quiescence model.
+func (s *AgentSession) WaitIdle(ctx context.Context) error {
+	return s.hub.WaitIdle(ctx)
+}
+
+// expectTurn takes a hand-back wake token for a subagent loop at spawn so its
+// in-flight result cannot empty the quiescence set and fire a false idle. It is
+// session-internal — loops never call it; only the session's (future) subagent
+// orchestration does. Inert in Phase 4 (no async subagents yet).
+func (s *AgentSession) expectTurn(ctx context.Context, subagentLoopID uuid.UUID) {
+	s.hub.ExpectTurn(ctx, subagentLoopID)
+}
+
+// cancelExpectTurn releases a subagent's wake token when its hand-back is rejected
+// or discarded. Session-internal; inert in Phase 4.
+func (s *AgentSession) cancelExpectTurn(ctx context.Context, subagentLoopID uuid.UUID) {
+	s.hub.CancelExpectTurn(ctx, subagentLoopID)
+}
 
 // NewLoop creates another loop inside this session. The new loop shares
 // SessionID but receives its own loop id and loop goroutine. parent is the
@@ -156,12 +207,16 @@ func (s *AgentSession) newCommandID() (uuid.UUID, error) {
 	return id, nil
 }
 
-// NewAgent constructs an AgentSession and starts its actor goroutine.
-// The actor publishes SessionStarted to sinks before entering its command loop.
-// Because Commands is an unbuffered channel, the first call to Invoke, Stream,
-// Interrupt, or Shutdown is guaranteed to observe SessionStarted in sinks — the
-// unbuffered send cannot complete until the actor is in its select loop, which
-// is entered only after SessionStarted is published.
+// NewAgent constructs an AgentSession and starts its primary loop's actor
+// goroutine. It owns the session fan-in hub and emits the session-scoped
+// SessionStarted through it.
+//
+// Two distinct consumer paths carry SessionStarted, by design, to two distinct
+// audiences: the loop's actor publishes a SessionStarted to its observability
+// SINKS (cfg.Sinks) on startup, while the session here publishes the session-scoped
+// SessionStarted through the HUB to its SUBSCRIBERS (TUI/CLI fan-in). These never
+// double-deliver to the same consumer — sinks and subscribers are separate sets —
+// so the two emissions are complementary, not redundant.
 func NewAgent(ctx context.Context, cfg loop.Config) (*AgentSession, error) {
 	select {
 	case <-ctx.Done():
@@ -177,10 +232,19 @@ func NewAgent(ctx context.Context, cfg loop.Config) (*AgentSession, error) {
 	sessionCtx, sessionCancel := context.WithCancel(ctx)
 	s := &AgentSession{
 		SessionID:     id,
+		hub:           hub.New(id),
 		sessionCtx:    sessionCtx,
 		sessionCancel: sessionCancel,
 		loops:         make(map[uuid.UUID]*loopHandle),
 		newID:         uuid.New,
+	}
+
+	// The hub is built before any loop, so a loop publishing through the session's
+	// PublishEvent never sees a nil hub. With no subscribers yet, this delivers to
+	// nobody (a no-op), but it is the session's authoritative session-scoped start.
+	if err := s.hub.PublishEvent(sessionCtx, event.SessionStarted{Header: event.Header{SessionID: id}}); err != nil {
+		sessionCancel()
+		return nil, &SessionError{Kind: SessionContextDone, Cause: err}
 	}
 
 	primaryLoopID, err := s.NewLoop(loop.Provenance{}, cfg)
@@ -340,9 +404,25 @@ func (s *AgentSession) Interrupt(ctx context.Context) (bool, error) {
 	}
 }
 
-// Shutdown cancels any running turn and blocks until the actor exits.
-// Calling Shutdown after the actor has exited is a no-op.
+// Shutdown drives the session to its stopped phase and blocks until the loop
+// actor exits. The order is deliberate:
+//
+//  1. hub.StopSession FIRST — flip the session phase to SessionStopped, wake every
+//     WaitIdle waiter with ErrSessionStopped, and deliver SessionStopped to
+//     subscribers. Doing this before the loop teardown means a headless WaitIdle
+//     unblocks immediately and any shutdown-induced loop terminals that arrive
+//     later are published but no longer mutate quiescence (post-stop publishes
+//     never derive SessionIdle).
+//  2. THEN snapshot the loops and send command.Shutdown to each, keeping the
+//     Phase-3 Done/ctx send escapes so the unbuffered send can never wedge.
+//  3. THEN sessionCancel as the final backstop so every loopCtx derived from
+//     sessionCtx is released.
+//
+// Calling Shutdown after the actor has exited is a no-op (StopSession is
+// idempotent; the loop's Done short-circuits the rest).
 func (s *AgentSession) Shutdown(ctx context.Context) error {
+	s.hub.StopSession(ctx)
+
 	l, ok := s.loopFor(s.primaryLoopID)
 	if !ok {
 		// No primary loop to stop; still cancel the session lifetime backstop so
