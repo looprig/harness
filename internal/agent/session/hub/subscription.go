@@ -32,6 +32,15 @@ func (e *SubscriptionLossError) Error() string {
 
 func (e *SubscriptionLossError) Unwrap() error { return e.Cause }
 
+// sendResult reports the outcome of a non-blocking egress send.
+type sendResult uint8
+
+const (
+	sendDelivered sendResult = iota // the event entered the egress buffer
+	sendFull                        // the buffer was full (overflow policy applies)
+	sendClosed                      // the subscription was already torn down (skip it)
+)
+
 // EventSubscription is a consumer's handle to the session fan-in. It owns exactly
 // one bounded egress channel. Events closes when the subscriber Closes it or when
 // the hub fails it for loss. Err returns nil for an intentional Close and the
@@ -44,17 +53,16 @@ type EventSubscription struct {
 	filter event.EventFilter
 
 	// events is the single bounded egress channel. The hub is the sole sender
-	// (non-blocking); the subscriber is the sole receiver.
+	// (non-blocking, via trySend); the subscriber is the sole receiver.
 	events chan event.Event
 
-	// once guards the single close of events so neither a double Close nor a
-	// Close racing a fail can panic on a closed channel.
-	once sync.Once
-
-	// errMu guards err. err is written exactly once (inside once.Do) and read by
-	// Err from the subscriber goroutine, so it needs its own guard.
-	errMu sync.Mutex
-	err   error
+	// mu serializes a hub-side send against teardown so a non-blocking send can
+	// never race the close of events (which would panic). It also guards closed
+	// and err. It is a per-subscription lock, taken outside the hub lock, so it
+	// never serializes unrelated subscribers.
+	mu     sync.Mutex
+	closed bool
+	err    error
 }
 
 // newSubscription builds a subscription with its bounded egress channel and the
@@ -81,9 +89,28 @@ func (s *EventSubscription) Close() error {
 // Err returns nil for an intentional Close and the typed SubscriptionLossError for
 // a hub-forced loss. It returns nil while the subscription is still live.
 func (s *EventSubscription) Err() error {
-	s.errMu.Lock()
-	defer s.errMu.Unlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	return s.err
+}
+
+// trySend performs the hub's non-blocking egress send under the per-subscription
+// lock, so it can never race teardown. If the subscription is already torn down it
+// returns sendClosed (the hub skips it); if the buffer is full it returns sendFull
+// (the hub applies the overflow policy); otherwise the event is buffered and it
+// returns sendDelivered. Only the hub calls this.
+func (s *EventSubscription) trySend(ev event.Event) sendResult {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return sendClosed
+	}
+	select {
+	case s.events <- ev:
+		return sendDelivered
+	default:
+		return sendFull
+	}
 }
 
 // fail is the hub-forced termination path: it records the typed loss error and
@@ -92,13 +119,16 @@ func (s *EventSubscription) Err() error {
 func (s *EventSubscription) fail(err error) { s.terminate(err) }
 
 // terminate closes the egress channel exactly once and records the first terminal
-// cause (nil for Close, the loss error for fail). sync.Once makes the close
-// panic-free under any interleaving of Close and fail.
+// cause (nil for Close, the loss error for fail). The per-subscription lock makes
+// the close mutually exclusive with trySend, so no send can ever fire on a closed
+// channel.
 func (s *EventSubscription) terminate(cause error) {
-	s.once.Do(func() {
-		s.errMu.Lock()
-		s.err = cause
-		s.errMu.Unlock()
-		close(s.events)
-	})
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return // first terminal wins; idempotent
+	}
+	s.closed = true
+	s.err = cause
+	close(s.events)
 }
