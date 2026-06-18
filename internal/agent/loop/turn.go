@@ -6,8 +6,6 @@ import (
 	"errors"
 	"io"
 	"log/slog"
-	"sort"
-	"strings"
 
 	"github.com/inventivepotter/urvi/internal/agent/loop/event"
 	"github.com/inventivepotter/urvi/internal/content"
@@ -94,11 +92,12 @@ func runTurn(
 	}
 }
 
-// streamOnce streams one LLM response, emitting a TokenDelta per chunk and
-// accumulating text/thinking into buffers and tool-call deltas (folded by Index)
-// into ToolUseBlocks. It returns the assembled AIMessage and the tool-call blocks
-// to execute. ok=false means a terminal event was produced (provider error,
-// empty response, or interrupt) and the assembled message must be discarded.
+// streamOnce streams one LLM response, driving each chunk through a
+// chunkProcessor (emit a TokenDelta THEN fold into the blockState's text/
+// thinking/tool-use accumulators) and materializing the assembled AIMessage and
+// the tool-call blocks to execute via blockState after EOF. ok=false means a
+// terminal event was produced (provider error, empty response, or interrupt) and
+// the assembled message must be discarded.
 //
 // Each assembled tool-call block is validated (ID & Name non-empty, valid JSON
 // Input). An invalid block is sanitized to emptyArgs IN THE STORED MESSAGE so
@@ -122,8 +121,10 @@ func streamOnce(
 		}
 	}()
 
-	var textBuf, thinkBuf strings.Builder
-	acc := newToolAccumulator()
+	// blockState folds streamed chunks into thinking/text/tool-use accumulators;
+	// the chunkProcessor owns the per-chunk "emit TokenDelta THEN accumulate" order.
+	state := blockState{}
+	proc := newChunkProcessor(emit, chunkState{blocks: &state})
 	for {
 		chunk, err := sr.Next()
 		if errors.Is(err, io.EOF) {
@@ -132,49 +133,85 @@ func streamOnce(
 		if err != nil {
 			return nil, nil, streamFailure(ctx, turnIndex, err), false
 		}
-		emit(event.TokenDelta{TurnIndex: turnIndex, Chunk: chunk})
-		switch c := chunk.(type) {
-		case *content.TextChunk:
-			textBuf.WriteString(c.Text)
-		case *content.ThinkingChunk:
-			thinkBuf.WriteString(c.Thinking)
-		case *content.ToolUseChunk:
-			acc.add(c)
-		}
+		proc.process(chunk, turnIndex)
 	}
 
-	rawCalls := acc.blocks()
+	// Materialize the single assistant message (thinking?, text?, then tool_use
+	// blocks in ascending Index order) and the raw executable tool-use view. The
+	// AIMessage's tool-use blocks are a DISTINCT allocation from rawCalls, so
+	// sanitizing the stored message below never mutates the raw executable Input.
+	aiMsg := state.AIMessage()
+	rawCalls := state.ToolUses()
 
 	// A successful stream with no content at all (no text, no thinking, no tool
 	// calls) is a failure — the same controlled TurnFailed as the single-stream
-	// loop, rather than appending an empty assistant message.
-	if textBuf.Len() == 0 && thinkBuf.Len() == 0 && len(rawCalls) == 0 {
+	// loop, rather than appending an empty assistant message. Emptiness is decided
+	// on the materialized block text (an empty-string-only chunk leaves a zero-
+	// length block that does not count as content), matching prior behavior.
+	if isEmptyAssistantMessage(aiMsg, rawCalls) {
 		return nil, nil, event.TurnFailed{TurnIndex: turnIndex, Err: &event.EmptyResponseError{}}, false
 	}
 
-	// Build the assistant message's blocks: thinking?, text?, then tool_use blocks
-	// with invalid Input sanitized to {}. The raw calls are returned for execution.
-	var blocks []content.Block
-	if thinkBuf.Len() > 0 {
-		blocks = append(blocks, &content.ThinkingBlock{Thinking: thinkBuf.String()})
-	}
-	if textBuf.Len() > 0 {
-		blocks = append(blocks, &content.TextBlock{Text: textBuf.String()})
-	}
-	for _, c := range rawCalls {
-		stored := c
-		if !validToolCall(c) {
-			// Sanitize a malformed Input to a fresh, valid-JSON "{}" so the stored
-			// assistant message re-encodes cleanly. A fresh allocation (not a shared
-			// var) keeps each history block's Input independently owned. The raw
-			// (invalid) Input is still handed to RunBatch, which reports the failure.
-			stored.Input = json.RawMessage("{}")
-		}
-		blocks = append(blocks, &stored)
-	}
-
-	aiMsg := &content.AIMessage{Message: content.Message{Role: content.RoleAssistant, Blocks: blocks}}
+	// Sanitize the stored assistant message: drop zero-length text/thinking blocks
+	// (prior behavior only included them when non-empty) and rewrite any malformed
+	// tool-use Input to a fresh, valid-JSON "{}" so the stored message re-encodes
+	// cleanly. The raw (possibly invalid) Input is still returned for execution, so
+	// RunBatch reports the failure as a model-visible tool-result error.
+	aiMsg.Blocks = sanitizeAssistantBlocks(aiMsg.Blocks)
 	return aiMsg, rawCalls, nil, true
+}
+
+// isEmptyAssistantMessage reports whether a materialized assistant message
+// carries no usable content: no non-empty text, no non-empty thinking, and no
+// tool calls. This is the EmptyResponseError trigger and matches the prior
+// builder-length check (a zero-length block does not count as content).
+func isEmptyAssistantMessage(aiMsg *content.AIMessage, rawCalls []content.ToolUseBlock) bool {
+	if len(rawCalls) > 0 {
+		return false
+	}
+	for _, b := range aiMsg.Blocks {
+		switch v := b.(type) {
+		case *content.TextBlock:
+			if v.Text != "" {
+				return false
+			}
+		case *content.ThinkingBlock:
+			if v.Thinking != "" {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// sanitizeAssistantBlocks returns the storable form of the materialized blocks:
+// zero-length text/thinking blocks are dropped (prior behavior only stored them
+// when non-empty), and a tool-use block with invalid Input is rewritten to a
+// fresh, valid-JSON "{}" so the stored history re-encodes cleanly. A fresh block
+// allocation keeps each history block's Input independently owned.
+func sanitizeAssistantBlocks(blocks []content.Block) []content.Block {
+	out := make([]content.Block, 0, len(blocks))
+	for _, b := range blocks {
+		switch v := b.(type) {
+		case *content.TextBlock:
+			if v.Text != "" {
+				out = append(out, v)
+			}
+		case *content.ThinkingBlock:
+			if v.Thinking != "" {
+				out = append(out, v)
+			}
+		case *content.ToolUseBlock:
+			stored := *v
+			if !validToolCall(stored) {
+				stored.Input = json.RawMessage("{}")
+			}
+			out = append(out, &stored)
+		default:
+			out = append(out, b)
+		}
+	}
+	return out
 }
 
 // streamFailure maps a stream/provider error to the right terminal event: a
@@ -229,67 +266,4 @@ func toolDefs(ctx context.Context, registry []tool.InvokableTool) []llm.Tool {
 		})
 	}
 	return defs
-}
-
-// toolAccumulator folds streaming ToolUseChunk deltas into complete
-// ToolUseBlocks. It is keyed by the provider-supplied Index (which is
-// attacker/provider-influenced), so it uses a map rather than slice indexing: a
-// negative or huge Index can NEVER panic or allocate an unbounded slice. The
-// first delta for an Index carries ID/Name; later deltas carry InputJSON
-// fragments to concatenate. blocks() emits the assembled blocks in ASCENDING
-// Index order (the deterministic response order).
-type toolAccumulator struct {
-	parts map[int]*toolPart
-	order []int // Index values in first-seen order; sorted ascending by blocks()
-}
-
-type toolPart struct {
-	id    string
-	name  string
-	input strings.Builder
-}
-
-func newToolAccumulator() *toolAccumulator {
-	return &toolAccumulator{parts: make(map[int]*toolPart)}
-}
-
-// add folds one delta into the accumulator, bounds-safe on any Index value.
-func (a *toolAccumulator) add(c *content.ToolUseChunk) {
-	p, ok := a.parts[c.Index]
-	if !ok {
-		p = &toolPart{}
-		a.parts[c.Index] = p
-		a.order = append(a.order, c.Index)
-	}
-	// ID/Name arrive on the first delta for an Index; never overwrite a set value
-	// with a later empty fragment.
-	if c.ID != "" {
-		p.id = c.ID
-	}
-	if c.Name != "" {
-		p.name = c.Name
-	}
-	p.input.WriteString(c.InputJSON)
-}
-
-// blocks returns the assembled ToolUseBlocks in ascending Index order. The raw
-// concatenated Input is used verbatim (validation/sanitization happens in the
-// caller, which needs both the raw and sanitized forms).
-func (a *toolAccumulator) blocks() []content.ToolUseBlock {
-	if len(a.order) == 0 {
-		return nil
-	}
-	idx := make([]int, len(a.order))
-	copy(idx, a.order)
-	sort.Ints(idx)
-	out := make([]content.ToolUseBlock, 0, len(idx))
-	for _, i := range idx {
-		p := a.parts[i]
-		out = append(out, content.ToolUseBlock{
-			ID:    p.id,
-			Name:  p.name,
-			Input: json.RawMessage(p.input.String()),
-		})
-	}
-	return out
 }
