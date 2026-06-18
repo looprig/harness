@@ -52,7 +52,7 @@ func TestSubscriptionLossErrorError(t *testing.T) {
 // closed after Close.
 func TestEventSubscriptionClose(t *testing.T) {
 	t.Parallel()
-	sub := newSubscription(event.EventFilter{})
+	sub := newSubscription(event.EventFilter{}, nil)
 
 	if err := sub.Err(); err != nil {
 		t.Fatalf("Err() before close = %v, want nil", err)
@@ -99,7 +99,7 @@ func TestEventSubscriptionForceLoss(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			sub := newSubscription(event.EventFilter{})
+			sub := newSubscription(event.EventFilter{}, nil)
 			lossErr := &SubscriptionLossError{DroppedClass: tt.wantClass}
 			sub.fail(lossErr)
 			tt.afterFunc(sub)
@@ -125,7 +125,7 @@ func TestEventSubscriptionForceLoss(t *testing.T) {
 func TestEventSubscriptionFailThenCloseSafe(t *testing.T) {
 	t.Parallel()
 	// Intentional Close first, then a (losing) fail: the nil cause stands.
-	sub := newSubscription(event.EventFilter{})
+	sub := newSubscription(event.EventFilter{}, nil)
 	if err := sub.Close(); err != nil {
 		t.Fatalf("Close() = %v", err)
 	}
@@ -141,7 +141,7 @@ func TestEventSubscriptionFilter(t *testing.T) {
 	t.Parallel()
 	loopID := mustID(t)
 	want := event.EventFilter{Ephemeral: event.LoopScope{Loops: map[uuid.UUID]struct{}{loopID: {}}}}
-	sub := newSubscription(want)
+	sub := newSubscription(want, nil)
 	if !sub.filter.Ephemeral.Matches(loopID) {
 		t.Errorf("subscription filter did not retain the configured ephemeral scope")
 	}

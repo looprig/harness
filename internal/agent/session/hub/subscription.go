@@ -63,14 +63,24 @@ type EventSubscription struct {
 	mu     sync.Mutex
 	closed bool
 	err    error
+
+	// onClose detaches this subscription from the hub's subscriber set on the
+	// first terminal (Close or fail), so a closed subscription does not linger in
+	// the set forever. It is a callback (not a hub back-reference) to keep the
+	// subscription decoupled from the concrete hub. Invoked exactly once, outside
+	// the per-subscription lock to avoid a lock-order inversion with the hub lock.
+	onClose func(*EventSubscription)
 }
 
-// newSubscription builds a subscription with its bounded egress channel and the
-// subscriber's filter. The hub calls this under its write lock when registering.
-func newSubscription(filter event.EventFilter) *EventSubscription {
+// newSubscription builds a subscription with its bounded egress channel, the
+// subscriber's filter, and the detach callback. The hub calls this under its
+// write lock when registering. onClose may be nil in unit tests that exercise the
+// subscription in isolation.
+func newSubscription(filter event.EventFilter, onClose func(*EventSubscription)) *EventSubscription {
 	return &EventSubscription{
-		filter: filter,
-		events: make(chan event.Event, defaultEgressBuffer),
+		filter:  filter,
+		events:  make(chan event.Event, defaultEgressBuffer),
+		onClose: onClose,
 	}
 }
 
@@ -121,14 +131,20 @@ func (s *EventSubscription) fail(err error) { s.terminate(err) }
 // terminate closes the egress channel exactly once and records the first terminal
 // cause (nil for Close, the loss error for fail). The per-subscription lock makes
 // the close mutually exclusive with trySend, so no send can ever fire on a closed
-// channel.
+// channel. The onClose detach runs AFTER releasing the per-subscription lock, so
+// it can take the hub lock without a lock-order inversion against trySend/deliver.
 func (s *EventSubscription) terminate(cause error) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if s.closed {
+		s.mu.Unlock()
 		return // first terminal wins; idempotent
 	}
 	s.closed = true
 	s.err = cause
 	close(s.events)
+	s.mu.Unlock()
+
+	if s.onClose != nil {
+		s.onClose(s)
+	}
 }

@@ -537,6 +537,43 @@ func TestWaitIdleAlreadyIdle(t *testing.T) {
 	}
 }
 
+// TestCloseDetachesFromHub proves Close (and a forced loss) removes the
+// subscription from the hub's fan-out set, so it does not linger and a subsequent
+// publish does not even attempt delivery to it.
+func TestCloseDetachesFromHub(t *testing.T) {
+	t.Parallel()
+	session := mustID(t)
+	loopA := mustID(t)
+	h := New(session)
+	sub, err := h.SubscribeEvents(allFilter())
+	if err != nil {
+		t.Fatalf("SubscribeEvents = %v", err)
+	}
+
+	h.mu.RLock()
+	before := len(h.subs)
+	h.mu.RUnlock()
+	if before != 1 {
+		t.Fatalf("subscriber count after Subscribe = %d, want 1", before)
+	}
+
+	if err := sub.Close(); err != nil {
+		t.Fatalf("Close() = %v", err)
+	}
+	// onClose detaches synchronously.
+	h.mu.RLock()
+	after := len(h.subs)
+	h.mu.RUnlock()
+	if after != 0 {
+		t.Fatalf("subscriber count after Close = %d, want 0 (detached)", after)
+	}
+
+	// A publish after detach is a clean no-op delivery (and never panics).
+	if err := h.PublishEvent(context.Background(), event.StepDone{Header: event.Header{SessionID: session, LoopID: loopA}}); err != nil {
+		t.Fatalf("PublishEvent after detach = %v", err)
+	}
+}
+
 // TestConcurrentCloseDuringDelivery proves a subscriber Closing concurrently with
 // a publish flood never panics (no send on a closed channel) and never blocks the
 // publisher. The race detector + the closed-channel-send guard are what this

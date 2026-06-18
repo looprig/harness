@@ -51,16 +51,17 @@ func New(sessionID uuid.UUID) *Hub {
 // its handle. The subscriber reads ev from sub.Events(); it must Close the
 // subscription when done.
 func (h *Hub) SubscribeEvents(filter event.EventFilter) (*EventSubscription, error) {
-	sub := newSubscription(filter)
+	sub := newSubscription(filter, h.unsubscribe)
 	h.mu.Lock()
 	h.subs[sub] = struct{}{}
 	h.mu.Unlock()
 	return sub, nil
 }
 
-// unsubscribe removes a subscription from the set under the write lock. It is
-// called by the session when a consumer detaches; the subscription's own Close
-// closes its channel, this drops it from fan-out.
+// unsubscribe removes a subscription from the set under the write lock. It is the
+// subscription's onClose callback, fired on the first terminal (Close or fail), so
+// a torn-down subscription does not linger in the fan-out set. Idempotent: a
+// second delete of an absent key is a no-op.
 func (h *Hub) unsubscribe(sub *EventSubscription) {
 	h.mu.Lock()
 	delete(h.subs, sub)
