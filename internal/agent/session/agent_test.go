@@ -289,6 +289,137 @@ func TestLoopFor(t *testing.T) {
 	}
 }
 
+// TestRoutingMethodsLoopNotFound covers the SessionLoopNotFound branch shared by
+// every routing method: when loopFor(primaryLoopID) misses (the registry has no
+// entry for the primary id), the method must fail secure with
+// *SessionError{SessionLoopNotFound} and send no command. The miss is forced by
+// deleting the primary registry entry under loopsMu after construction, so the
+// id stays set but resolves to nothing — the exact state the branch guards.
+func TestRoutingMethodsLoopNotFound(t *testing.T) {
+	t.Parallel()
+	callID := mustUUID()
+	tests := []struct {
+		name string
+		call func(s *AgentSession) error
+	}{
+		{name: "Invoke", call: func(s *AgentSession) error { _, err := s.Invoke(context.Background(), nil); return err }},
+		{name: "Stream", call: func(s *AgentSession) error { _, err := s.Stream(context.Background(), nil); return err }},
+		{name: "Interrupt", call: func(s *AgentSession) error { _, err := s.Interrupt(context.Background()); return err }},
+		// Approve/Deny/ProvideUserInput route through routeCommand, which performs
+		// the same loopFor(primaryLoopID) lookup behind the gate-answer methods.
+		{name: "Approve", call: func(s *AgentSession) error { return s.Approve(context.Background(), callID, tool.ScopeOnce) }},
+		{name: "Deny", call: func(s *AgentSession) error { return s.Deny(context.Background(), callID) }},
+		{name: "ProvideUserInput", call: func(s *AgentSession) error { return s.ProvideUserInput(context.Background(), callID, "x") }},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			s, cmds, _ := sessionWithFakeLoop() // Commands never read: a send would block forever
+
+			// Force loopFor(primaryLoopID) to miss by deleting the primary entry
+			// while leaving primaryLoopID set. The routing method must short-circuit
+			// before ever touching the (unread) Commands channel.
+			s.loopsMu.Lock()
+			delete(s.loops, s.primaryLoopID)
+			s.loopsMu.Unlock()
+
+			errCh := make(chan error, 1)
+			go func() { errCh <- tt.call(s) }()
+
+			select {
+			case err := <-errCh:
+				var se *SessionError
+				if !errors.As(err, &se) || se.Kind != SessionLoopNotFound {
+					t.Fatalf("err = %v, want *SessionError{SessionLoopNotFound}", err)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("method blocked on a missing loop (no SessionLoopNotFound short-circuit)")
+			}
+
+			// No command may have been sent: the fake loop's Commands channel is
+			// unbuffered and never read, so any send would have blocked the goroutine
+			// above (which instead returned an error). A non-blocking receive must miss.
+			select {
+			case cmd := <-cmds:
+				t.Fatalf("method sent %T on a missing-loop path, want no command", cmd)
+			default:
+			}
+		})
+	}
+}
+
+// TestNewLoopReturnsLoopNewError covers NewLoop's loop.New error path: when
+// loop.New fails its own Config validation, NewLoop must (a) return that error
+// unwrapped (a *loop.ConfigError, NOT a *SessionError — the id generation
+// already succeeded), (b) leave the registry unmutated (no handle stored), and
+// (c) cancel the derived loopCtx so the session leaks no context.
+//
+// The cheapest loop.New validation failure is a nil Client, which short-circuits
+// to *loop.ConfigError{ConfigMissingClient} synchronously, before any goroutine
+// or LLM is involved. Cancellation of the derived loopCtx is asserted
+// structurally: NewLoop derives loopCtx from s.sessionCtx and, on the loop.New
+// error, sessionCtx must still be live (NewLoop must cancel only the child, never
+// the session). The child loopCtx is local to NewLoop and cannot be captured
+// without changing production code, so the cancel-observation here is
+// structural-only (the cancel() call sits on the asserted error path); the
+// positive guard is that sessionCtx itself was NOT cancelled.
+func TestNewLoopReturnsLoopNewError(t *testing.T) {
+	t.Parallel()
+	sessionCtx, sessionCancel := context.WithCancel(context.Background())
+	t.Cleanup(sessionCancel)
+	primaryLoopID := mustUUID()
+	s := &AgentSession{
+		SessionID:     mustUUID(),
+		sessionCtx:    sessionCtx,
+		sessionCancel: sessionCancel,
+		loops:         map[uuid.UUID]*loopHandle{primaryLoopID: {}},
+		primaryLoopID: primaryLoopID,
+		newID:         uuid.New, // id mint succeeds; only loop.New must fail
+	}
+
+	s.loopsMu.RLock()
+	before := len(s.loops)
+	s.loopsMu.RUnlock()
+
+	// loop.New rejects a nil Client with *ConfigError{ConfigMissingClient} before
+	// starting any goroutine — the cheapest validation failure to inject.
+	badCfg := loop.Config{Model: llm.ModelSpec{Model: "m"}}
+	loopID, err := s.NewLoop(loop.Provenance{}, badCfg)
+
+	// (a) the loop.New error is returned, unwrapped, not remapped to *SessionError.
+	if err == nil {
+		t.Fatal("NewLoop returned nil error, want loop.New's ConfigError")
+	}
+	if !loopID.IsZero() {
+		t.Errorf("NewLoop returned loop id %v on error, want zero", loopID)
+	}
+	var ce *loop.ConfigError
+	if !errors.As(err, &ce) || ce.Kind != loop.ConfigMissingClient {
+		t.Fatalf("err = %v, want *loop.ConfigError{ConfigMissingClient}", err)
+	}
+	var se *SessionError
+	if errors.As(err, &se) {
+		t.Fatalf("err = %v, want the raw loop.New error, not a *SessionError", err)
+	}
+
+	// (b) the registry must be unchanged: no handle stored for the failed loop.
+	s.loopsMu.RLock()
+	after := len(s.loops)
+	s.loopsMu.RUnlock()
+	if after != before {
+		t.Fatalf("registry size changed from %d to %d on loop.New failure, want unchanged", before, after)
+	}
+
+	// (c) structural cancel guard: NewLoop must cancel ONLY the derived loopCtx,
+	// never the session backstop. sessionCtx must still be live after the error.
+	select {
+	case <-sessionCtx.Done():
+		t.Fatal("NewLoop cancelled sessionCtx on the loop.New error path, want only the derived loopCtx cancelled")
+	default:
+	}
+}
+
 // capturingIDGen records every ID it mints so a test can assert the session
 // stamped a non-zero Header.ID onto the command it sent (even for commands —
 // Interrupt, Shutdown — whose ID has no observable runtime surface).
