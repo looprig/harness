@@ -131,3 +131,160 @@ func TestToolUsesEmpty(t *testing.T) {
 		})
 	}
 }
+
+func TestText(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		chunks []*content.TextChunk
+		want   *content.TextBlock
+	}{
+		{
+			name:   "empty yields nil block",
+			chunks: nil,
+			want:   nil,
+		},
+		{
+			name:   "single chunk",
+			chunks: []*content.TextChunk{{Text: "hello"}},
+			want:   &content.TextBlock{Text: "hello"},
+		},
+		{
+			name: "multiple chunks fold into one block",
+			chunks: []*content.TextChunk{
+				{Text: "hel"},
+				{Text: "lo "},
+				{Text: "world"},
+			},
+			want: &content.TextBlock{Text: "hello world"},
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			var acc streamaccumulator.Text
+			for _, c := range tt.chunks {
+				acc.Add(c)
+			}
+			got := acc.Block()
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("Block() = %#v, want %#v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestTextEmpty(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		chunks    []*content.TextChunk
+		wantEmpty bool
+	}{
+		{name: "empty before any add", chunks: nil, wantEmpty: true},
+		{name: "not empty after add", chunks: []*content.TextChunk{{Text: "x"}}, wantEmpty: false},
+		{
+			name:      "not empty after empty-string add",
+			chunks:    []*content.TextChunk{{Text: ""}},
+			wantEmpty: false,
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			var acc streamaccumulator.Text
+			for _, c := range tt.chunks {
+				acc.Add(c)
+			}
+			if got := acc.Empty(); got != tt.wantEmpty {
+				t.Errorf("Empty() = %v, want %v", got, tt.wantEmpty)
+			}
+		})
+	}
+}
+
+func TestThinking(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		chunks []*content.ThinkingChunk
+		want   *content.ThinkingBlock
+	}{
+		{
+			name:   "empty yields nil block",
+			chunks: nil,
+			want:   nil,
+		},
+		{
+			name:   "single chunk, signature stays empty",
+			chunks: []*content.ThinkingChunk{{Thinking: "reasoning"}},
+			want:   &content.ThinkingBlock{Thinking: "reasoning", Signature: ""},
+		},
+		{
+			name: "multiple chunks fold into one block with empty signature",
+			chunks: []*content.ThinkingChunk{
+				{Thinking: "step "},
+				{Thinking: "one "},
+				{Thinking: "two"},
+			},
+			want: &content.ThinkingBlock{Thinking: "step one two", Signature: ""},
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			var acc streamaccumulator.Thinking
+			for _, c := range tt.chunks {
+				acc.Add(c)
+			}
+			got := acc.Block()
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("Block() = %#v, want %#v", got, tt.want)
+			}
+			if got != nil && got.Signature != "" {
+				t.Errorf("Block().Signature = %q, want empty (conscious omission)", got.Signature)
+			}
+		})
+	}
+}
+
+func TestThinkingEmpty(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		chunks    []*content.ThinkingChunk
+		wantEmpty bool
+	}{
+		{name: "empty before any add", chunks: nil, wantEmpty: true},
+		{name: "not empty after add", chunks: []*content.ThinkingChunk{{Thinking: "x"}}, wantEmpty: false},
+		{
+			name:      "not empty after empty-string add",
+			chunks:    []*content.ThinkingChunk{{Thinking: ""}},
+			wantEmpty: false,
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			var acc streamaccumulator.Thinking
+			for _, c := range tt.chunks {
+				acc.Add(c)
+			}
+			if got := acc.Empty(); got != tt.wantEmpty {
+				t.Errorf("Empty() = %v, want %v", got, tt.wantEmpty)
+			}
+		})
+	}
+}

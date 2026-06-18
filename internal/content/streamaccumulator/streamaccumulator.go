@@ -21,6 +21,60 @@ import (
 	"github.com/inventivepotter/urvi/internal/content"
 )
 
+// Thinking folds streamed ThinkingChunk deltas into a single ThinkingBlock.
+// The zero value is ready to use.
+type Thinking struct {
+	builder  strings.Builder
+	received bool
+}
+
+// Add appends one thinking delta to the accumulator.
+func (a *Thinking) Add(chunk *content.ThinkingChunk) {
+	a.received = true
+	a.builder.WriteString(chunk.Thinking)
+}
+
+// Block returns the accumulated ThinkingBlock, or nil if no chunk was received.
+//
+// Signature is intentionally left empty. ThinkingChunk carries no signature, and
+// the extended-thinking signature is attached to the finalized block by the
+// provider decode path, not reconstructed from streamed deltas. This is a
+// conscious omission (streaming does not populate it today either); a future
+// provider that streams signatures would thread one through here.
+func (a Thinking) Block() *content.ThinkingBlock {
+	if !a.received {
+		return nil
+	}
+	return &content.ThinkingBlock{Thinking: a.builder.String()}
+}
+
+// Empty reports whether no chunk has been added yet.
+func (a Thinking) Empty() bool { return !a.received }
+
+// Text folds streamed TextChunk deltas into a single TextBlock.
+// The zero value is ready to use.
+type Text struct {
+	builder  strings.Builder
+	received bool
+}
+
+// Add appends one text delta to the accumulator.
+func (a *Text) Add(chunk *content.TextChunk) {
+	a.received = true
+	a.builder.WriteString(chunk.Text)
+}
+
+// Block returns the accumulated TextBlock, or nil if no chunk was received.
+func (a Text) Block() *content.TextBlock {
+	if !a.received {
+		return nil
+	}
+	return &content.TextBlock{Text: a.builder.String()}
+}
+
+// Empty reports whether no chunk has been added yet.
+func (a Text) Empty() bool { return !a.received }
+
 // ToolUses folds streaming ToolUseChunk deltas into complete ToolUseBlocks. It is
 // keyed by the provider-supplied Index (which is provider/attacker-influenced),
 // so it uses a map rather than slice indexing: a negative or huge Index can NEVER
