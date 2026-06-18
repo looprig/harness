@@ -126,6 +126,167 @@ func TestNewAgent(t *testing.T) {
 			t.Fatalf("err = %v, want *SessionError{SessionContextDone}", err)
 		}
 	})
+	t.Run("exactly one loop indexed by primaryLoopID", func(t *testing.T) {
+		t.Parallel()
+		s, err := NewAgent(context.Background(), cfg(&stubLLM{chunks: []content.Chunk{textChunk("x")}}))
+		if err != nil {
+			t.Fatalf("NewAgent: %v", err)
+		}
+		t.Cleanup(func() { _ = s.Shutdown(context.Background()) })
+
+		s.loopsMu.RLock()
+		n := len(s.loops)
+		h, ok := s.loops[s.primaryLoopID]
+		s.loopsMu.RUnlock()
+
+		if n != 1 {
+			t.Fatalf("len(loops) = %d, want 1", n)
+		}
+		if !ok {
+			t.Fatal("loops has no entry for primaryLoopID")
+		}
+		if s.primaryLoopID.IsZero() {
+			t.Error("primaryLoopID is zero")
+		}
+		if h.loop == nil {
+			t.Error("primary loopHandle.loop is nil")
+		}
+		// The primary loop has no parent (zero provenance).
+		if h.parent != (loop.Provenance{}) {
+			t.Errorf("primary loopHandle.parent = %+v, want zero Provenance", h.parent)
+		}
+		if h.cancel == nil {
+			t.Error("primary loopHandle.cancel is nil")
+		}
+	})
+}
+
+// TestNewLoop covers NewLoop: it mints a fresh loop id via the session's idGen,
+// derives the loopCtx from sessionCtx, and stores a loopHandle with the given
+// parent provenance and a non-nil cancel.
+func TestNewLoop(t *testing.T) {
+	t.Parallel()
+	parentLoop := mustUUID()
+	parentTurn := mustUUID()
+	tests := []struct {
+		name   string
+		parent loop.Provenance
+	}{
+		{name: "zero parent (primary-style)", parent: loop.Provenance{}},
+		{name: "non-zero parent (subagent-style)", parent: loop.Provenance{LoopID: parentLoop, TurnID: parentTurn}},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			s, err := NewAgent(context.Background(), cfg(&stubLLM{chunks: []content.Chunk{textChunk("x")}}))
+			if err != nil {
+				t.Fatalf("NewAgent: %v", err)
+			}
+			t.Cleanup(func() { _ = s.Shutdown(context.Background()) })
+
+			// Record which ids the session mints from here on, so we can assert the
+			// returned loop id came from idGen.
+			gen := &capturingIDGen{}
+			s.newID = gen.gen
+
+			loopID, err := s.NewLoop(tt.parent, cfg(&stubLLM{chunks: []content.Chunk{textChunk("y")}}))
+			if err != nil {
+				t.Fatalf("NewLoop: %v", err)
+			}
+			if loopID.IsZero() {
+				t.Fatal("NewLoop returned a zero loop id")
+			}
+			minted, ok := gen.last()
+			if !ok || minted != loopID {
+				t.Fatalf("returned loop id %v was not the freshly minted id %v", loopID, minted)
+			}
+			if loopID == s.primaryLoopID {
+				t.Fatal("NewLoop reused the primary loop id, want a distinct id")
+			}
+
+			s.loopsMu.RLock()
+			h, ok := s.loops[loopID]
+			s.loopsMu.RUnlock()
+			if !ok {
+				t.Fatal("NewLoop did not store the loop in the registry")
+			}
+			if h.loop == nil {
+				t.Error("stored loopHandle.loop is nil")
+			}
+			if h.parent != tt.parent {
+				t.Errorf("stored loopHandle.parent = %+v, want %+v", h.parent, tt.parent)
+			}
+			if h.cancel == nil {
+				t.Fatal("stored loopHandle.cancel is nil")
+			}
+
+			// The loopCtx must be derived from sessionCtx: cancelling sessionCtx
+			// (via sessionCancel) must hard-kill the new loop, closing its Done.
+			s.sessionCancel()
+			select {
+			case <-h.loop.Done:
+			case <-time.After(2 * time.Second):
+				t.Fatal("new loop's Done did not close after sessionCancel; loopCtx not derived from sessionCtx")
+			}
+		})
+	}
+}
+
+// TestNewLoopIDGenerationFailure: when idGen fails, NewLoop returns
+// *SessionError{SessionLoopIDGenerationFailed} wrapping the generator error and
+// registers no loop.
+func TestNewLoopIDGenerationFailure(t *testing.T) {
+	t.Parallel()
+	genErr := errors.New("rand source exhausted")
+	s, err := NewAgent(context.Background(), cfg(&stubLLM{chunks: []content.Chunk{textChunk("x")}}))
+	if err != nil {
+		t.Fatalf("NewAgent: %v", err)
+	}
+	t.Cleanup(func() { s.newID = uuid.New; _ = s.Shutdown(context.Background()) })
+
+	s.loopsMu.RLock()
+	before := len(s.loops)
+	s.loopsMu.RUnlock()
+
+	s.newID = func() (uuid.UUID, error) { return uuid.UUID{}, genErr }
+
+	_, err = s.NewLoop(loop.Provenance{}, cfg(&stubLLM{}))
+	var se *SessionError
+	if !errors.As(err, &se) || se.Kind != SessionLoopIDGenerationFailed {
+		t.Fatalf("err = %v, want *SessionError{SessionLoopIDGenerationFailed}", err)
+	}
+	if !errors.Is(err, genErr) {
+		t.Fatalf("err = %v, want it to wrap the generator error", err)
+	}
+
+	s.loopsMu.RLock()
+	after := len(s.loops)
+	s.loopsMu.RUnlock()
+	if after != before {
+		t.Fatalf("registry grew from %d to %d on idGen failure, want no new loop", before, after)
+	}
+}
+
+// TestLoopFor: loopFor(primaryLoopID) resolves the primary loop; a random id
+// misses.
+func TestLoopFor(t *testing.T) {
+	t.Parallel()
+	s, err := NewAgent(context.Background(), cfg(&stubLLM{chunks: []content.Chunk{textChunk("x")}}))
+	if err != nil {
+		t.Fatalf("NewAgent: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Shutdown(context.Background()) })
+
+	if l, ok := s.loopFor(s.primaryLoopID); !ok || l == nil {
+		t.Fatalf("loopFor(primaryLoopID) = (%v, %v), want (non-nil, true)", l, ok)
+	}
+	if l, ok := s.loopFor(mustUUID()); ok || l != nil {
+		t.Fatalf("loopFor(random) = (%v, %v), want (nil, false)", l, ok)
+	}
+	if l, ok := s.loopFor(uuid.UUID{}); ok || l != nil {
+		t.Fatalf("loopFor(zero) = (%v, %v), want (nil, false)", l, ok)
+	}
 }
 
 // capturingIDGen records every ID it mints so a test can assert the session
@@ -741,10 +902,17 @@ func TestShutdownSurfacesLoopTerminatedError(t *testing.T) {
 func sessionWithFakeLoop() (s *AgentSession, cmds chan command.Command, done chan struct{}) {
 	cmds = make(chan command.Command)
 	done = make(chan struct{})
+	sessionCtx, sessionCancel := context.WithCancel(context.Background())
+	primaryLoopID := mustUUID()
 	s = &AgentSession{
-		SessionID: mustUUID(),
-		loop:      &loop.Loop{Commands: cmds, Done: done},
-		newID:     uuid.New,
+		SessionID:     mustUUID(),
+		sessionCtx:    sessionCtx,
+		sessionCancel: sessionCancel,
+		loops: map[uuid.UUID]*loopHandle{
+			primaryLoopID: {loop: &loop.Loop{Commands: cmds, Done: done}},
+		},
+		primaryLoopID: primaryLoopID,
+		newID:         uuid.New,
 	}
 	return s, cmds, done
 }

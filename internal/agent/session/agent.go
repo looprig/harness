@@ -17,10 +17,12 @@ import (
 type SessionErrorKind string
 
 const (
-	SessionIDGenerationFailed SessionErrorKind = "id_generation_failed"
-	SessionLoopExited         SessionErrorKind = "loop_exited"
-	SessionEventChannelClosed SessionErrorKind = "event_channel_closed"
-	SessionContextDone        SessionErrorKind = "context_done"
+	SessionIDGenerationFailed     SessionErrorKind = "id_generation_failed"
+	SessionLoopIDGenerationFailed SessionErrorKind = "loop_id_generation_failed"
+	SessionLoopExited             SessionErrorKind = "loop_exited"
+	SessionLoopNotFound           SessionErrorKind = "loop_not_found"
+	SessionEventChannelClosed     SessionErrorKind = "event_channel_closed"
+	SessionContextDone            SessionErrorKind = "context_done"
 )
 
 // SessionError is returned when a session method cannot complete.
@@ -35,8 +37,12 @@ func (e *SessionError) Error() string {
 	switch e.Kind {
 	case SessionIDGenerationFailed:
 		msg = "session: id generation failed"
+	case SessionLoopIDGenerationFailed:
+		msg = "session: loop id generation failed"
 	case SessionLoopExited:
 		msg = "session: loop exited"
+	case SessionLoopNotFound:
+		msg = "session: loop not found"
 	case SessionEventChannelClosed:
 		msg = "session: event channel closed without terminal event"
 	case SessionContextDone:
@@ -56,9 +62,87 @@ func (e *SessionError) Unwrap() error { return e.Cause }
 type idGenerator func() (uuid.UUID, error)
 
 type AgentSession struct {
+	// SessionID is shared by every loop participating in this session.
 	SessionID uuid.UUID
-	loop      *loop.Loop
-	newID     idGenerator // mints command-Header IDs; defaults to uuid.New
+
+	// sessionCtx is the shared lifetime root for the session; every loop gets a
+	// loopCtx derived from it. sessionCancel is the final backstop, cancelled by
+	// the construction context (today) or future explicit teardown.
+	sessionCtx    context.Context
+	sessionCancel context.CancelFunc
+
+	// loopsMu protects loops and primaryLoopID. There is no session goroutine, so
+	// session methods serialize registry access with a normal RWMutex.
+	loopsMu sync.RWMutex
+
+	// loops are the loop handles in this session, keyed by loop id. Each entry
+	// pairs the loop handle with the provenance of whatever spawned it (zero for
+	// the primary loop). Today this map holds one entry; multi-agent
+	// orchestration adds subagent loops with a non-zero parent.
+	loops map[uuid.UUID]*loopHandle
+
+	// primaryLoopID is the default target for Invoke/Stream/Interrupt/Shutdown
+	// and the gate-answer methods.
+	primaryLoopID uuid.UUID
+
+	// newID mints command-Header IDs and loop ids. It defaults to uuid.New; kept
+	// as a field only so tests can inject failure and prove the session never
+	// sends zero-id commands and never registers a zero-id loop.
+	newID idGenerator
+}
+
+// loopHandle is the session's registry entry: the loop's channel handle, the
+// provenance of the turn/step that spawned it (zero for the primary loop), and
+// the cancel for this loop's loopCtx (a session-owned backstop).
+type loopHandle struct {
+	loop   *loop.Loop
+	parent loop.Provenance
+	cancel context.CancelFunc
+}
+
+// PublishEvent is the session's eventPublisher implementation passed to
+// loop.New. Phase 3 is a no-op STUB: the loop stores the publisher but does not
+// yet call it (event-publication wiring, the real session fan-in / hub, is
+// Phase 4). The method exists so *AgentSession satisfies loop's eventPublisher
+// interface and the loop.New(..., s, ...) wiring stays stable.
+func (s *AgentSession) PublishEvent(_ context.Context, _ event.Event) error { return nil }
+
+// NewLoop creates another loop inside this session. The new loop shares
+// SessionID but receives its own loop id and loop goroutine. parent is the
+// provenance of the spawning turn/step (zero for the primary loop); the session
+// records it in the registry and passes it to loop.New. The session stores the
+// loop handle and returns only the loop id, because callers route through
+// session methods rather than writing to a loop command channel directly.
+func (s *AgentSession) NewLoop(parent loop.Provenance, cfg loop.Config) (uuid.UUID, error) {
+	loopID, err := s.newID()
+	if err != nil {
+		return uuid.UUID{}, &SessionError{Kind: SessionLoopIDGenerationFailed, Cause: err}
+	}
+
+	loopCtx, cancel := context.WithCancel(s.sessionCtx)
+	l, err := loop.New(loopCtx, s.SessionID, loopID, parent, s, cfg)
+	if err != nil {
+		cancel()
+		return uuid.UUID{}, err
+	}
+
+	s.loopsMu.Lock()
+	defer s.loopsMu.Unlock()
+	s.loops[loopID] = &loopHandle{loop: l, parent: parent, cancel: cancel}
+	return loopID, nil
+}
+
+// loopFor returns the loop's channel handle for command routing. The registry
+// stores *loopHandle; this derefs to the handle's loop. The parent provenance is
+// read only by future tree walks, which read s.loops directly.
+func (s *AgentSession) loopFor(loopID uuid.UUID) (*loop.Loop, bool) {
+	s.loopsMu.RLock()
+	defer s.loopsMu.RUnlock()
+	h, ok := s.loops[loopID]
+	if !ok {
+		return nil, false
+	}
+	return h.loop, true
 }
 
 // newCommandID mints a fresh correlation ID for a command Header. Any
@@ -89,16 +173,32 @@ func NewAgent(ctx context.Context, cfg loop.Config) (*AgentSession, error) {
 	if err != nil {
 		return nil, &SessionError{Kind: SessionIDGenerationFailed, Cause: err}
 	}
-	l, err := loop.New(ctx, id, cfg)
+
+	sessionCtx, sessionCancel := context.WithCancel(ctx)
+	s := &AgentSession{
+		SessionID:     id,
+		sessionCtx:    sessionCtx,
+		sessionCancel: sessionCancel,
+		loops:         make(map[uuid.UUID]*loopHandle),
+		newID:         uuid.New,
+	}
+
+	primaryLoopID, err := s.NewLoop(loop.Provenance{}, cfg)
 	if err != nil {
+		sessionCancel()
 		return nil, err
 	}
-	return &AgentSession{SessionID: id, loop: l, newID: uuid.New}, nil
+	s.primaryLoopID = primaryLoopID
+	return s, nil
 }
 
 // Invoke sends input and blocks until a terminal event.
 // Cancelling ctx cancels the running turn; Invoke returns the event.TurnInterrupted event.
 func (s *AgentSession) Invoke(ctx context.Context, input []content.Block) (event.Event, error) {
+	l, ok := s.loopFor(s.primaryLoopID)
+	if !ok {
+		return nil, &SessionError{Kind: SessionLoopNotFound}
+	}
 	id, err := s.newCommandID()
 	if err != nil {
 		return nil, err
@@ -110,10 +210,10 @@ func (s *AgentSession) Invoke(ctx context.Context, input []content.Block) (event
 
 	select {
 	// User-initiated turn: CausationID is zero (root).
-	case s.loop.Commands <- command.StartTurn{Header: command.Header{ID: id}, Ctx: ctx, Input: input, Events: events, Abandoned: abandoned, Ack: ack}:
+	case l.Commands <- command.StartTurn{Header: command.Header{ID: id}, Ctx: ctx, Input: input, Events: events, Abandoned: abandoned, Ack: ack}:
 	case <-ctx.Done():
 		return nil, &SessionError{Kind: SessionContextDone, Cause: ctx.Err()}
-	case <-s.loop.Done:
+	case <-l.Done:
 		return nil, &SessionError{Kind: SessionLoopExited}
 	}
 
@@ -131,7 +231,7 @@ func (s *AgentSession) Invoke(ctx context.Context, input []content.Block) (event
 			case event.TurnDone, event.TurnFailed, event.TurnInterrupted:
 				return ev, nil
 			}
-		case <-s.loop.Done:
+		case <-l.Done:
 			// Hard loop kill: on a DrainTimeout detach the actor never closes
 			// `events`, so without this escape Invoke would block forever. The
 			// loop is gone, so no terminal can arrive.
@@ -145,6 +245,10 @@ func (s *AgentSession) Invoke(ctx context.Context, input []content.Block) (event
 // keeps reading. Calling sr.Close() abandons the event stream and cancels the turn.
 // Callers must either read until EOF or call Close.
 func (s *AgentSession) Stream(ctx context.Context, input []content.Block) (*llm.StreamReader[event.Event], error) {
+	l, ok := s.loopFor(s.primaryLoopID)
+	if !ok {
+		return nil, &SessionError{Kind: SessionLoopNotFound}
+	}
 	id, err := s.newCommandID()
 	if err != nil {
 		return nil, err
@@ -157,7 +261,7 @@ func (s *AgentSession) Stream(ctx context.Context, input []content.Block) (*llm.
 
 	select {
 	// User-initiated turn: CausationID is zero (root).
-	case s.loop.Commands <- command.StartTurn{
+	case l.Commands <- command.StartTurn{
 		Header:    command.Header{ID: id},
 		Ctx:       streamCtx,
 		Input:     input,
@@ -169,7 +273,7 @@ func (s *AgentSession) Stream(ctx context.Context, input []content.Block) (*llm.
 		streamCancel()
 		abandonOnce.Do(func() { close(abandoned) })
 		return nil, &SessionError{Kind: SessionContextDone, Cause: ctx.Err()}
-	case <-s.loop.Done:
+	case <-l.Done:
 		streamCancel()
 		abandonOnce.Do(func() { close(abandoned) })
 		return nil, &SessionError{Kind: SessionLoopExited}
@@ -194,7 +298,7 @@ func (s *AgentSession) Stream(ctx context.Context, input []content.Block) (*llm.
 					return nil, io.EOF
 				}
 				return ev, nil
-			case <-s.loop.Done:
+			case <-l.Done:
 				return nil, io.EOF
 			}
 		},
@@ -209,14 +313,18 @@ func (s *AgentSession) Stream(ctx context.Context, input []content.Block) (*llm.
 // Interrupt cancels the running turn. Returns true if a turn was cancelled.
 // ctx allows the caller to time out the cancel attempt if the actor is slow.
 func (s *AgentSession) Interrupt(ctx context.Context) (bool, error) {
+	l, ok := s.loopFor(s.primaryLoopID)
+	if !ok {
+		return false, &SessionError{Kind: SessionLoopNotFound}
+	}
 	id, err := s.newCommandID()
 	if err != nil {
 		return false, err
 	}
 	ack := make(chan bool, 1)
 	select {
-	case s.loop.Commands <- command.Interrupt{Header: command.Header{ID: id}, Ack: ack}:
-	case <-s.loop.Done:
+	case l.Commands <- command.Interrupt{Header: command.Header{ID: id}, Ack: ack}:
+	case <-l.Done:
 		return false, &SessionError{Kind: SessionLoopExited}
 	case <-ctx.Done():
 		return false, &SessionError{Kind: SessionContextDone, Cause: ctx.Err()}
@@ -225,7 +333,7 @@ func (s *AgentSession) Interrupt(ctx context.Context) (bool, error) {
 	select {
 	case cancelled := <-ack:
 		return cancelled, nil
-	case <-s.loop.Done:
+	case <-l.Done:
 		return false, &SessionError{Kind: SessionLoopExited}
 	case <-ctx.Done():
 		return false, &SessionError{Kind: SessionContextDone, Cause: ctx.Err()}
@@ -235,14 +343,23 @@ func (s *AgentSession) Interrupt(ctx context.Context) (bool, error) {
 // Shutdown cancels any running turn and blocks until the actor exits.
 // Calling Shutdown after the actor has exited is a no-op.
 func (s *AgentSession) Shutdown(ctx context.Context) error {
+	l, ok := s.loopFor(s.primaryLoopID)
+	if !ok {
+		// No primary loop to stop; still cancel the session lifetime backstop so
+		// any loopCtx derived from sessionCtx is released.
+		s.sessionCancel()
+		return nil
+	}
 	id, err := s.newCommandID()
 	if err != nil {
 		return err
 	}
 	ack := make(chan error, 1)
 	select {
-	case s.loop.Commands <- command.Shutdown{Header: command.Header{ID: id}, Ack: ack}:
-	case <-s.loop.Done:
+	case l.Commands <- command.Shutdown{Header: command.Header{ID: id}, Ack: ack}:
+	case <-l.Done:
+		// Loop already exited; cancel the session lifetime backstop and return.
+		s.sessionCancel()
 		return nil
 	case <-ctx.Done():
 		return &SessionError{Kind: SessionContextDone, Cause: ctx.Err()}
@@ -250,6 +367,9 @@ func (s *AgentSession) Shutdown(ctx context.Context) error {
 
 	select {
 	case err := <-ack:
+		// The actor has stopped; cancel the session lifetime backstop as the
+		// final step so every loopCtx derived from sessionCtx is released.
+		s.sessionCancel()
 		// err is non-nil when the loop's root context was cancelled before
 		// the actor finished cleanup. Wrap it so callers always receive a
 		// typed *SessionError rather than a raw context error.
@@ -257,7 +377,8 @@ func (s *AgentSession) Shutdown(ctx context.Context) error {
 			return &SessionError{Kind: SessionContextDone, Cause: err}
 		}
 		return nil
-	case <-s.loop.Done:
+	case <-l.Done:
+		s.sessionCancel()
 		return nil
 	case <-ctx.Done():
 		return &SessionError{Kind: SessionContextDone, Cause: ctx.Err()}
@@ -309,10 +430,14 @@ func (s *AgentSession) ProvideUserInput(ctx context.Context, callID uuid.UUID, a
 // alongside the unbuffered send so the call can never block forever when the
 // actor is busy (ctx times out) or has already exited (Done is closed).
 func (s *AgentSession) routeCommand(ctx context.Context, cmd command.Command) error {
+	l, ok := s.loopFor(s.primaryLoopID)
+	if !ok {
+		return &SessionError{Kind: SessionLoopNotFound}
+	}
 	select {
-	case s.loop.Commands <- cmd:
+	case l.Commands <- cmd:
 		return nil
-	case <-s.loop.Done:
+	case <-l.Done:
 		return &SessionError{Kind: SessionLoopExited}
 	case <-ctx.Done():
 		return &SessionError{Kind: SessionContextDone, Cause: ctx.Err()}
