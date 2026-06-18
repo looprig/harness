@@ -35,15 +35,26 @@ type panicSink struct{}
 
 func (panicSink) OnEvent(context.Context, event.EventEnvelope) { panic("boom in sink") }
 
+// noopPublisher is a no-op eventPublisher for loop tests. Phase 3 stores the
+// publisher in loopState but never calls it (publication wiring is Phase 4), so
+// a no-op is sufficient to satisfy the New signature.
+type noopPublisher struct{}
+
+func (noopPublisher) PublishEvent(context.Context, event.Event) error { return nil }
+
 // newLoop starts a loop with a 200ms DrainTimeout and returns it plus the root cancel.
 func newLoop(t *testing.T, client llm.LLM, sinks ...event.EventSink) (*Loop, context.CancelFunc) {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
-	id, err := uuid.New()
+	sessionID, err := uuid.New()
 	if err != nil {
 		t.Fatalf("uuid.New: %v", err)
 	}
-	l, err := New(ctx, id, Config{Client: client, Model: llm.ModelSpec{Model: "m"}, Sinks: sinks, DrainTimeout: 200 * time.Millisecond})
+	loopID, err := uuid.New()
+	if err != nil {
+		t.Fatalf("uuid.New: %v", err)
+	}
+	l, err := New(ctx, sessionID, loopID, Provenance{}, noopPublisher{}, Config{Client: client, Model: llm.ModelSpec{Model: "m"}, Sinks: sinks, DrainTimeout: 200 * time.Millisecond})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -104,11 +115,12 @@ func TestResolveDrainTimeout(t *testing.T) {
 func TestNew_Validation(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
-	id, _ := uuid.New()
+	sessionID, _ := uuid.New()
+	loopID, _ := uuid.New()
 
 	t.Run("missing client", func(t *testing.T) {
 		t.Parallel()
-		_, err := New(ctx, id, Config{Model: llm.ModelSpec{Model: "m"}})
+		_, err := New(ctx, sessionID, loopID, Provenance{}, noopPublisher{}, Config{Model: llm.ModelSpec{Model: "m"}})
 		var ce *ConfigError
 		if !errors.As(err, &ce) || ce.Kind != ConfigMissingClient {
 			t.Fatalf("err = %v, want *ConfigError{ConfigMissingClient}", err)
@@ -117,7 +129,7 @@ func TestNew_Validation(t *testing.T) {
 	t.Run("invalid model unwraps to ValidationError", func(t *testing.T) {
 		t.Parallel()
 		bad := llm.ModelSpec{Model: "m", ThinkingBudget: 1, Temperature: func() *float64 { f := 0.5; return &f }()}
-		_, err := New(ctx, id, Config{Client: &fakeLLM{}, Model: bad})
+		_, err := New(ctx, sessionID, loopID, Provenance{}, noopPublisher{}, Config{Client: &fakeLLM{}, Model: bad})
 		var ce *ConfigError
 		if !errors.As(err, &ce) || ce.Kind != ConfigInvalidModel {
 			t.Fatalf("err = %v, want *ConfigError{ConfigInvalidModel}", err)
@@ -127,6 +139,78 @@ func TestNew_Validation(t *testing.T) {
 			t.Fatalf("err does not unwrap to *llm.ValidationError")
 		}
 	})
+	t.Run("nil publisher", func(t *testing.T) {
+		t.Parallel()
+		_, err := New(ctx, sessionID, loopID, Provenance{}, nil, Config{Client: &fakeLLM{}, Model: llm.ModelSpec{Model: "m"}})
+		var ce *ConfigError
+		if !errors.As(err, &ce) || ce.Kind != ConfigMissingPublisher {
+			t.Fatalf("err = %v, want *ConfigError{ConfigMissingPublisher}", err)
+		}
+	})
+}
+
+// TestNewLoopState asserts the constructor carries the loop identity (sessionID,
+// loopID, parent provenance) and the event publisher onto loopState, and always
+// initializes pendingGates so the actor never panics on a nil map.
+func TestNewLoopState(t *testing.T) {
+	t.Parallel()
+	sessionID, _ := uuid.New()
+	loopID, _ := uuid.New()
+	parentLoop, _ := uuid.New()
+	parentTurn, _ := uuid.New()
+	parentStep, _ := uuid.New()
+
+	tests := []struct {
+		name      string
+		sessionID uuid.UUID
+		loopID    uuid.UUID
+		parent    Provenance
+		events    eventPublisher
+	}{
+		{
+			name:      "primary loop (zero parent)",
+			sessionID: sessionID,
+			loopID:    loopID,
+			parent:    Provenance{},
+			events:    noopPublisher{},
+		},
+		{
+			name:      "subagent loop (non-zero parent)",
+			sessionID: sessionID,
+			loopID:    loopID,
+			parent:    Provenance{LoopID: parentLoop, TurnID: parentTurn, StepID: parentStep},
+			events:    noopPublisher{},
+		},
+		{
+			name:      "zero session and loop ids",
+			sessionID: uuid.UUID{},
+			loopID:    uuid.UUID{},
+			parent:    Provenance{},
+			events:    noopPublisher{},
+		},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			st := newLoopState(tt.sessionID, tt.loopID, tt.parent, tt.events)
+			if st.sessionID != tt.sessionID {
+				t.Errorf("sessionID = %v, want %v", st.sessionID, tt.sessionID)
+			}
+			if st.id != tt.loopID {
+				t.Errorf("id = %v, want %v", st.id, tt.loopID)
+			}
+			if st.parent != tt.parent {
+				t.Errorf("parent = %+v, want %+v", st.parent, tt.parent)
+			}
+			if st.events != tt.events {
+				t.Errorf("events publisher not stored")
+			}
+			if st.pendingGates == nil {
+				t.Error("pendingGates is nil, want an initialized map")
+			}
+		})
+	}
 }
 
 func TestSingleTurn(t *testing.T) {
@@ -282,11 +366,15 @@ func (g *countedIDGen) gen() (uuid.UUID, error) {
 func newLoopWithIDGen(t *testing.T, client llm.LLM, gen idGenerator, sinks ...event.EventSink) *Loop {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
-	id, err := uuid.New()
+	sessionID, err := uuid.New()
 	if err != nil {
 		t.Fatalf("uuid.New: %v", err)
 	}
-	l, err := New(ctx, id, Config{
+	loopID, err := uuid.New()
+	if err != nil {
+		t.Fatalf("uuid.New: %v", err)
+	}
+	l, err := New(ctx, sessionID, loopID, Provenance{}, noopPublisher{}, Config{
 		Client:       client,
 		Model:        llm.ModelSpec{Model: "m"},
 		Sinks:        sinks,
@@ -607,8 +695,9 @@ func TestLeakedReaderDoesNotWedgeActor(t *testing.T) {
 	t.Parallel()
 	sink := &captureSink{}
 	ctx, cancel := context.WithCancel(context.Background())
-	id, _ := uuid.New()
-	l, err := New(ctx, id, Config{
+	sessionID, _ := uuid.New()
+	loopID, _ := uuid.New()
+	l, err := New(ctx, sessionID, loopID, Provenance{}, noopPublisher{}, Config{
 		Client:       &fakeLLM{chunks: []content.Chunk{textChunk("a")}},
 		Model:        llm.ModelSpec{Model: "m"},
 		Sinks:        []event.EventSink{sink},
@@ -662,8 +751,9 @@ func hasTerminal(evs []event.EventEnvelope) bool {
 func TestCtxIgnoringProviderDoesNotPinActor(t *testing.T) {
 	t.Parallel()
 	ctx, cancel := context.WithCancel(context.Background())
-	id, _ := uuid.New()
-	l, err := New(ctx, id, Config{
+	sessionID, _ := uuid.New()
+	loopID, _ := uuid.New()
+	l, err := New(ctx, sessionID, loopID, Provenance{}, noopPublisher{}, Config{
 		Client:       &fakeLLM{blockUntilCancel: true, ignoreCtx: true},
 		Model:        llm.ModelSpec{Model: "m"},
 		DrainTimeout: 100 * time.Millisecond,

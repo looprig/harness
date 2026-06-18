@@ -3,8 +3,9 @@ package loop
 type ConfigErrorKind string
 
 const (
-	ConfigMissingClient ConfigErrorKind = "missing_client"
-	ConfigInvalidModel  ConfigErrorKind = "invalid_model"
+	ConfigMissingClient    ConfigErrorKind = "missing_client"
+	ConfigInvalidModel     ConfigErrorKind = "invalid_model"
+	ConfigMissingPublisher ConfigErrorKind = "missing_publisher"
 )
 
 // ConfigError is returned by New when the supplied Config is invalid.
@@ -19,6 +20,8 @@ func (e *ConfigError) Error() string {
 		return "loop: config error: Config.Client is required"
 	case ConfigInvalidModel:
 		return "loop: config error: Config.Model invalid"
+	case ConfigMissingPublisher:
+		return "loop: config error: event publisher is required"
 	default:
 		return "loop: config error"
 	}

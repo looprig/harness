@@ -39,6 +39,26 @@ type Loop struct {
 // failing generator to exercise the crypto/rand failure branches.
 type idGenerator func() (uuid.UUID, error)
 
+// eventPublisher is the loop's narrow consumer of the session-level event
+// fan-in. The loop depends on this small interface (Dependency Inversion /
+// Interface Segregation) rather than on the concrete session type, so only the
+// session owns buffering, shutdown, close, and sequence policy. A parent or
+// primary loop must not forward child-loop events; identity is metadata, not
+// the transport path.
+type eventPublisher interface {
+	PublishEvent(context.Context, event.Event) error
+}
+
+// Provenance identifies the parent turn/step that spawned a loop. The zero value
+// means "no parent" (the primary loop). It is the (LoopID, TurnID, StepID) tuple
+// the loop stamps onto the Parent* fields of every event it emits. It lives in
+// the loop package because both loopState and AgentSession's registry use it.
+type Provenance struct {
+	LoopID uuid.UUID // parent loop; zero for the primary loop
+	TurnID uuid.UUID // the parent turn that spawned this loop
+	StepID uuid.UUID // the parent step (optional finer grain)
+}
+
 const defaultDrainTimeout = 5 * time.Second
 
 // resolveDrainTimeout applies the default when the caller leaves DrainTimeout unset.
@@ -49,12 +69,21 @@ func resolveDrainTimeout(d time.Duration) time.Duration {
 	return d
 }
 
-func New(ctx context.Context, sessionID uuid.UUID, cfg Config) (*Loop, error) {
+// New constructs a loop and starts its actor goroutine. loopCtx is the loop's
+// lifetime (derived by the session from its sessionCtx); it is NOT a turn
+// lifetime. sessionID is shared by every loop in the session; loopID is unique
+// to this loop. parent is the provenance of the turn/step that spawned this loop
+// (zero for the primary loop). events is the session-level event publisher the
+// loop depends on (Dependency Inversion); it must be non-nil.
+func New(loopCtx context.Context, sessionID, loopID uuid.UUID, parent Provenance, events eventPublisher, cfg Config) (*Loop, error) {
 	if cfg.Client == nil {
 		return nil, &ConfigError{Kind: ConfigMissingClient}
 	}
 	if err := cfg.Model.Validate(); err != nil {
 		return nil, &ConfigError{Kind: ConfigInvalidModel, Cause: err}
+	}
+	if events == nil {
+		return nil, &ConfigError{Kind: ConfigMissingPublisher}
 	}
 	cfg.DrainTimeout = resolveDrainTimeout(cfg.DrainTimeout)
 	cfg.Tools = resolveToolSetCaps(cfg.Tools)
@@ -66,7 +95,8 @@ func New(ctx context.Context, sessionID uuid.UUID, cfg Config) (*Loop, error) {
 	// gateReg is unbuffered: registration is synchronous (the runner blocks on the
 	// ack), and the actor is the sole reader, selecting on it alongside commands.
 	gateReg := make(chan gateRegistration)
-	go listen(ctx, sessionID, cfg, commands, gateReg, done)
+	state := newLoopState(sessionID, loopID, parent, events)
+	go listen(loopCtx, cfg, commands, gateReg, done, state)
 	return &Loop{Commands: commands, Done: done, gateReg: gateReg}, nil
 }
 
@@ -106,6 +136,24 @@ const (
 )
 
 type loopState struct {
+	// id is this loop's id. In multi-agent sessions each subagent loop gets its
+	// own loop id.
+	id uuid.UUID
+
+	// sessionID is shared by every loop participating in the same session.
+	sessionID uuid.UUID
+
+	// parent is the provenance of whatever spawned this loop (zero for the
+	// primary loop). The loop knows its PARENT so it can later stamp Parent* on
+	// the events it emits; it never tracks its CHILDREN. The session owns the
+	// loop registry and turn tree (SRP).
+	parent Provenance
+
+	// events is the session-level event publisher (Dependency Inversion). Stored
+	// at construction; Phase 3 does not yet call it — event publication wiring is
+	// Phase 4. The existing per-turn channel + cfg.Sinks paths are unchanged.
+	events eventPublisher
+
 	turnIndex     event.TurnIndex
 	turnID        uuid.UUID // entity id for the active turn; zero when idle
 	causationID   uuid.UUID // active StartTurn.Header.ID; zero when idle
@@ -123,6 +171,19 @@ type loopState struct {
 	pendingGates map[uuid.UUID]gate
 }
 
+// newLoopState builds the actor-owned loop state with its identity (sessionID,
+// loopID, parent provenance) and the session event publisher. pendingGates is
+// initialized so the actor can route gate commands without a nil-map panic.
+func newLoopState(sessionID, loopID uuid.UUID, parent Provenance, events eventPublisher) loopState {
+	return loopState{
+		id:           loopID,
+		sessionID:    sessionID,
+		parent:       parent,
+		events:       events,
+		pendingGates: make(map[uuid.UUID]gate),
+	}
+}
+
 type turnResult struct {
 	msgs     content.AgenticMessages
 	terminal event.Event // TurnDone, TurnFailed, or TurnInterrupted
@@ -132,11 +193,10 @@ type turnResult struct {
 // (the select below), and the per-turn goroutine hands the SEND side to runTurn
 // → RunBatch so a parked tool can register a gate. (A receive-only handle could
 // not be narrowed to the send-only direction runTurn requires.)
-func listen(ctx context.Context, sessionID uuid.UUID, cfg Config, commands <-chan command.Command, gateReg chan gateRegistration, done chan struct{}) {
+func listen(ctx context.Context, cfg Config, commands <-chan command.Command, gateReg chan gateRegistration, done chan struct{}, state loopState) {
 	defer close(done)
 
 	internal := make(chan turnResult, 1)
-	state := loopState{pendingGates: make(map[uuid.UUID]gate)}
 
 	publish := func(ev event.Event) {
 		// SECURITY: the sink path is redacted; the per-turn stream (handled
@@ -154,7 +214,7 @@ func listen(ctx context.Context, sessionID uuid.UUID, cfg Config, commands <-cha
 			slog.Error("event id generation failed; emitting envelope with zero EventID", "error", err)
 		}
 		env := event.EventEnvelope{
-			SessionID:   sessionID, // sessionID is uuid.UUID
+			SessionID:   state.sessionID,
 			TurnID:      state.turnID,
 			EventID:     eventID,
 			CausationID: state.causationID,
@@ -187,7 +247,7 @@ func listen(ctx context.Context, sessionID uuid.UUID, cfg Config, commands <-cha
 		}
 	}
 
-	publish(event.SessionStarted{Header: event.Header{SessionID: sessionID}})
+	publish(event.SessionStarted{Header: event.Header{SessionID: state.sessionID}})
 
 	// deliverAndClose publishes the terminal event, sends it to the per-turn
 	// channel unless the caller abandoned the stream, and closes the channel.
