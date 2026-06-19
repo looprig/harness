@@ -84,6 +84,22 @@ func startTurn(t *testing.T, l *Loop, _ context.Context, input []content.Block) 
 	return ev, closeAb
 }
 
+// sendCmd sends cmd to the loop with the same Done escape every production sender
+// (AgentSession.Shutdown / routeCommand) uses: once the actor has shut down it
+// stops reading Commands, so a raw unbuffered send to a stopped actor wedges
+// forever. Tests that send a command which MAY race the actor's exit (a second
+// Shutdown after the first) must use this escape; a raw send is correct only when
+// the actor is guaranteed to still be reading. It reports whether the send landed.
+func sendCmd(t *testing.T, l *Loop, cmd command.Command) bool {
+	t.Helper()
+	select {
+	case l.Commands <- cmd:
+		return true
+	case <-l.Done:
+		return false
+	}
+}
+
 // drainToTerminal reads until a terminal event, returns it.
 func drainToTerminal(t *testing.T, ev <-chan event.Event) event.Event {
 	t.Helper()
@@ -574,17 +590,26 @@ func TestShutdownWhileShuttingDown(t *testing.T) {
 	ev, _ := startTurn(t, l, context.Background(), nil)
 	ack1 := make(chan error, 1)
 	ack2 := make(chan error, 1)
-	// two Shutdowns during one running turn; both acks must receive nil
+	// First Shutdown during the running turn: the actor is guaranteed to be reading
+	// Commands, so a raw send is safe and the ack always receives nil.
 	l.Commands <- command.Shutdown{Ack: ack1}
-	l.Commands <- command.Shutdown{Ack: ack2}
+	// Second Shutdown RACES the actor's exit: once the turn terminal arrives and the
+	// actor sees it is shutting down, it acks the shutdowns it has and returns,
+	// stopping its Commands read. A raw blocking send here would wedge forever if the
+	// actor exits first (the pre-existing flake). Escape on Done exactly as the
+	// production senders do; if the send lands the actor is still draining and ack2
+	// receives nil, otherwise the actor already exited (and ack1 covered the stop).
+	landed := sendCmd(t, l, command.Shutdown{Ack: ack2})
 	if _, ok := drainToTerminal(t, ev).(event.TurnInterrupted); !ok {
 		t.Fatal("terminal != TurnInterrupted")
 	}
 	if err := <-ack1; err != nil {
 		t.Fatalf("Shutdown ack1 = %v, want nil", err)
 	}
-	if err := <-ack2; err != nil {
-		t.Fatalf("Shutdown ack2 = %v, want nil", err)
+	if landed {
+		if err := <-ack2; err != nil {
+			t.Fatalf("Shutdown ack2 = %v, want nil", err)
+		}
 	}
 	<-l.Done
 }
