@@ -97,6 +97,39 @@ func TestSpinnerGlyph(t *testing.T) {
 	}
 }
 
+// TestWorkingWord covers the live working-word selection for an empty-text tool step
+// (design §3 rule 4): the list is non-empty, frame 0 returns the first word, and the
+// counter wraps modulo the word count so any (unbounded) live frame is in range and
+// never panics. It mirrors TestSpinnerGlyph — the word is a purely live affordance.
+func TestWorkingWord(t *testing.T) {
+	t.Parallel()
+
+	if len(workingWords) == 0 {
+		t.Fatal("workingWords is empty; an empty-text tool step needs at least one live word")
+	}
+
+	n := uint(len(workingWords))
+	tests := []struct {
+		name  string
+		frame uint
+		want  string
+	}{
+		{name: "frame 0", frame: 0, want: workingWords[0]},
+		{name: "last frame", frame: n - 1, want: workingWords[n-1]},
+		{name: "wraps at count", frame: n, want: workingWords[0]},
+		{name: "wraps far past count", frame: n*4 + 1, want: workingWords[1]},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := workingWord(tt.frame); got != tt.want {
+				t.Errorf("workingWord(%d) = %q, want %q", tt.frame, got, tt.want)
+			}
+		})
+	}
+}
+
 // TestLiveDot covers the blink phase of the live assistant bullet: lit when blink is
 // off, dimmed when on, and both 2 columns wide so narration alignment is unchanged.
 func TestLiveDot(t *testing.T) {

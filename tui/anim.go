@@ -42,6 +42,19 @@ func spinnerGlyph(frame uint) string {
 	return spinnerFrames[frame%uint(len(spinnerFrames))]
 }
 
+// workingWords are the live "doing work" synonyms shown beside the dot for an
+// empty-text tool step (design §3 rule 4). They are a purely LIVE affordance —
+// the committed headline is always the static "Done" — so the word may rotate
+// while the step runs; it need not survive into scrollback.
+var workingWords = []string{"Working", "Crunching", "Churning", "Toiling", "Cooking", "Whirring"}
+
+// workingWord returns the live working-word for frame, wrapping modulo the word
+// count (the live frame counter grows unbounded over a long step), mirroring
+// spinnerGlyph. It is used ONLY for a live empty-text tool step.
+func workingWord(frame uint) string {
+	return workingWords[frame%uint(len(workingWords))]
+}
+
 // liveDotLit / liveDotDim are the two glyphs the live (streaming) assistant bullet
 // alternates between on each blink tick: the normal lit "● " and a dimmed hollow
 // "◦ ". Both keep the dotWidth (2 columns) so narration alignment is unchanged.
