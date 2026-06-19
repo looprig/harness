@@ -29,6 +29,8 @@ func TestEventClass(t *testing.T) {
 		{"StepDone enduring", event.StepDone{}, event.Enduring},
 		{"TurnFoldedInto enduring", event.TurnFoldedInto{}, event.Enduring},
 		{"InputCancelled enduring", event.InputCancelled{}, event.Enduring},
+		{"InputQueued ephemeral", event.InputQueued{}, event.Ephemeral},
+		{"TurnRejected enduring", event.TurnRejected{}, event.Enduring},
 		{"TurnDone terminal is enduring", event.TurnDone{}, event.Enduring},
 		{"TurnFailed terminal is enduring", event.TurnFailed{}, event.Enduring},
 		{"TurnInterrupted terminal is enduring", event.TurnInterrupted{}, event.Enduring},
@@ -290,6 +292,46 @@ func TestNewEventFields(t *testing.T) {
 		ev := event.StepDone{}
 		if ev.Messages != nil {
 			t.Errorf("Messages = %v, want nil", ev.Messages)
+		}
+	})
+
+	t.Run("InputQueued carries InputID and CausationID", func(t *testing.T) {
+		t.Parallel()
+		ev := event.InputQueued{
+			Header:  event.Header{CausationID: inputID},
+			InputID: inputID,
+		}
+		if ev.InputID != inputID {
+			t.Errorf("InputID = %v, want %v", ev.InputID, inputID)
+		}
+		if ev.EventHeader().CausationID != inputID {
+			t.Errorf("CausationID = %v, want %v (must equal InputID)", ev.EventHeader().CausationID, inputID)
+		}
+	})
+
+	t.Run("TurnRejected carries InputID and Reason", func(t *testing.T) {
+		t.Parallel()
+		ev := event.TurnRejected{
+			Header:  event.Header{CausationID: inputID},
+			InputID: inputID,
+			Reason:  event.RejectQueueFull,
+		}
+		if ev.InputID != inputID {
+			t.Errorf("InputID = %v, want %v", ev.InputID, inputID)
+		}
+		if ev.Reason != event.RejectQueueFull {
+			t.Errorf("Reason = %v, want %v", ev.Reason, event.RejectQueueFull)
+		}
+		if ev.EventHeader().CausationID != inputID {
+			t.Errorf("CausationID = %v, want %v (must equal InputID)", ev.EventHeader().CausationID, inputID)
+		}
+	})
+
+	t.Run("TurnRejected zero Reason is RejectBusy boundary", func(t *testing.T) {
+		t.Parallel()
+		ev := event.TurnRejected{}
+		if ev.Reason != event.RejectBusy {
+			t.Errorf("zero Reason = %v, want %v (RejectBusy)", ev.Reason, event.RejectBusy)
 		}
 	})
 }

@@ -378,6 +378,9 @@ func TestRedactableImplementations(t *testing.T) {
 	//     defers their redaction to the journal/redaction follow-on
 	//     (TODO(Open Items B)); they MUST NOT implement Redactable here, so a new
 	//     projection is not silently added before the follow-on owns it.
+	//   - InputQueued/TurnRejected carry only an InputID (and TurnRejected a typed
+	//     RejectReason enum) — no message content or secret payload — so they are
+	//     sink-safe verbatim.
 	shouldNotRedact := []event.Event{
 		event.ToolCallStarted{},
 		event.UserInputRequestedSink{},
@@ -392,6 +395,8 @@ func TestRedactableImplementations(t *testing.T) {
 		event.StepDone{},
 		event.TurnFoldedInto{},
 		event.InputCancelled{},
+		event.InputQueued{},
+		event.TurnRejected{},
 	}
 	for _, e := range shouldNotRedact {
 		if _, ok := e.(event.Redactable); ok {
@@ -413,6 +418,8 @@ func TestRedactableImplementations(t *testing.T) {
 		event.StepDone{},
 		event.TurnFoldedInto{},
 		event.InputCancelled{},
+		event.InputQueued{},
+		event.TurnRejected{},
 		event.TurnDone{},
 		event.TurnFailed{},
 		event.TurnInterrupted{},

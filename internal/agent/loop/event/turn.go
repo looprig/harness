@@ -66,6 +66,52 @@ type InputCancelled struct {
 	Message   *content.UserMessage
 }
 
+// RejectReason explains why a UserInput submit was refused (carried by TurnRejected).
+// It mirrors the loop's command-side reason set (the command package owns the
+// point-to-point copy; this is the event-stream copy, since event must not import
+// command).
+type RejectReason uint8
+
+const (
+	// RejectBusy: the loop is running and the submit is not queueable
+	// (StartOnly / a non-queueable internal turn).
+	RejectBusy RejectReason = iota
+	// RejectQueueFull: the loop's inbox is at capacity.
+	RejectQueueFull
+	// RejectShuttingDown: the loop is shutting down and accepts no new input.
+	RejectShuttingDown
+	// RejectInternal: a transient internal failure (e.g. id generation); the loop is
+	// healthy and the caller MAY retry.
+	RejectInternal
+)
+
+// InputQueued is the Ephemeral Reply event for a UserInput accepted into the loop
+// inbox but not yet assigned to a turn (it later resolves to TurnStarted,
+// TurnFoldedInto, or InputCancelled). Header.CausationID == InputID (the submit
+// command id). Ephemeral: it self-heals — the authoritative resolution event still
+// follows if this is dropped.
+type InputQueued struct {
+	ephemeral
+	loopScoped
+	Header
+	InputID uuid.UUID
+}
+
+// TurnRejected is the Enduring Reply event for a UserInput the loop refused
+// (queue-full, shutting-down, busy/non-queueable, or a transient internal failure).
+// Enduring: a rejected user message must never silently vanish. Header.CausationID ==
+// InputID. It carries an InputID it did not have as a point-to-point reply.
+type TurnRejected struct {
+	enduring
+	loopScoped
+	Header
+	InputID uuid.UUID
+	Reason  RejectReason
+}
+
+func (InputQueued) isEvent()  {}
+func (TurnRejected) isEvent() {}
+
 // TokenDelta is emitted for each streaming chunk from the LLM. TokenDelta and
 // the ToolCallStarted/ToolCallCompleted events (in tool.go) are the Ephemeral
 // events.
