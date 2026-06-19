@@ -311,6 +311,120 @@ func TestInteractionTerminalPreservesComposeWhenNoPrompt(t *testing.T) {
 	}
 }
 
+// TestInteractionClearPromptsForLoop covers per-loop terminal-event clearing
+// (design §7): a terminal event (TurnDone/TurnFailed/TurnInterrupted) must clear
+// ONLY the pending prompts produced by the FINISHING loop, leaving a sibling
+// loop's pending gate untouched. The previous behavior dropped EVERY pending
+// prompt regardless of producing loop, abandoning a sibling loop's gate.
+func TestInteractionClearPromptsForLoop(t *testing.T) {
+	t.Parallel()
+
+	loopA := loopID(1)
+	loopB := loopID(2)
+	loopC := loopID(3) // an unrelated loop with no pending prompt
+
+	tests := []struct {
+		name string
+		term event.Event // terminal event carrying its producing loop
+	}{
+		{name: "turn done", term: event.TurnDone{Header: event.Header{LoopID: loopA}}},
+		{name: "turn failed", term: event.TurnFailed{Header: event.Header{LoopID: loopA}}},
+		{name: "turn interrupted", term: event.TurnInterrupted{Header: event.Header{LoopID: loopA}}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			m := newInteractionModel()
+			// Loop A's gate is the active head; loop B's gate waits behind it.
+			m = m.ApplyEvent(event.PermissionRequested{
+				Header:  event.Header{LoopID: loopA},
+				CallID:  callID(1),
+				Request: tool.BashRequest{Command: "go test"},
+			})
+			m = m.ApplyEvent(event.UserInputRequested{
+				Header:   event.Header{LoopID: loopB},
+				CallID:   callID(2),
+				Question: "pick",
+				Choices:  []string{"x"},
+			})
+			if m.PendingCount() != 2 {
+				t.Fatalf("setup PendingCount = %d, want 2", m.PendingCount())
+			}
+
+			// Loop A finishes: only A's prompt is cleared, B's survives.
+			m = m.ApplyEvent(tt.term)
+			if m.PendingCount() != 1 {
+				t.Fatalf("PendingCount = %d, want 1 (only loop A cleared)", m.PendingCount())
+			}
+			head := m.ActivePrompt()
+			if head == nil || head.CallID != callID(2) || head.LoopID != loopB {
+				t.Fatalf("surviving head = %+v, want loop B's gate (CallID %v, LoopID %v)", head, callID(2), loopB)
+			}
+			// The active head was loop A's permission prompt; with B (a choice
+			// prompt) now at the head, the mode must re-sync to choice mode — not
+			// wrongly fall back to compose.
+			if m.mode != modeChoicePrompt {
+				t.Errorf("mode = %d, want modeChoicePrompt (%d) re-synced to surviving head", m.mode, modeChoicePrompt)
+			}
+
+			// A terminal event for an unrelated loop C (no pending prompt) is a
+			// no-op: both surviving prompts remain. (Use the same lifecycle type.)
+			before := m.PendingCount()
+			switch tt.term.(type) {
+			case event.TurnDone:
+				m = m.ApplyEvent(event.TurnDone{Header: event.Header{LoopID: loopC}})
+			case event.TurnFailed:
+				m = m.ApplyEvent(event.TurnFailed{Header: event.Header{LoopID: loopC}})
+			case event.TurnInterrupted:
+				m = m.ApplyEvent(event.TurnInterrupted{Header: event.Header{LoopID: loopC}})
+			}
+			if m.PendingCount() != before {
+				t.Errorf("PendingCount after unrelated loop C terminal = %d, want %d (no-op)", m.PendingCount(), before)
+			}
+		})
+	}
+}
+
+// TestInteractionClearPromptsForLoopDrainsAndRestores covers the all-cleared
+// path: when every pending prompt belongs to the finishing loop, clearing them
+// drains the queue and restores compose mode plus the saved draft (design §7).
+func TestInteractionClearPromptsForLoopDrainsAndRestores(t *testing.T) {
+	t.Parallel()
+
+	loopA := loopID(1)
+
+	m := newInteractionModel()
+	// The user had a draft before two of loop A's gates preempted them.
+	m.input.SetValue("my draft")
+	m = m.ApplyEvent(event.PermissionRequested{
+		Header:  event.Header{LoopID: loopA},
+		CallID:  callID(1),
+		Request: tool.BashRequest{Command: "go test"},
+	})
+	m = m.ApplyEvent(event.PermissionRequested{
+		Header:  event.Header{LoopID: loopA},
+		CallID:  callID(2),
+		Request: tool.BashRequest{Command: "go build"},
+	})
+	if m.PendingCount() != 2 {
+		t.Fatalf("setup PendingCount = %d, want 2", m.PendingCount())
+	}
+
+	// Loop A finishes: both of its gates clear, the queue drains.
+	m = m.ApplyEvent(event.TurnDone{Header: event.Header{LoopID: loopA}})
+	if m.PendingCount() != 0 {
+		t.Fatalf("PendingCount = %d, want 0 (all of loop A cleared)", m.PendingCount())
+	}
+	if m.mode != modeCompose {
+		t.Errorf("mode = %d, want modeCompose (%d)", m.mode, modeCompose)
+	}
+	if m.input.Value() != "my draft" {
+		t.Errorf("restored draft = %q, want %q", m.input.Value(), "my draft")
+	}
+}
+
 // TestInteractionNonComposeUpdateIsNoop covers the deferral to Task 8: while a
 // prompt is active (non-compose mode), Update returns noop for now (modal routing
 // is the next task) and never submits.

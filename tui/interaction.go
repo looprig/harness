@@ -7,6 +7,7 @@ import (
 
 	"github.com/inventivepotter/urvi/internal/agent/loop/event"
 	"github.com/inventivepotter/urvi/internal/tool"
+	"github.com/inventivepotter/urvi/internal/uuid"
 	"github.com/inventivepotter/urvi/tui/components"
 )
 
@@ -82,19 +83,31 @@ func (m interactionModel) PendingCount() int { return len(m.pending) }
 
 // ApplyEvent folds one turn-stream event into the interaction surface. A
 // PermissionRequested/UserInputRequested enqueues a prompt (append-once by
-// CallID) and reveals the head; the terminal events clear every pending prompt
-// and restore compose. All other events are no-ops here (the transcript owns
-// them). It returns the updated model by value.
+// CallID), stamped with its producing loop's id (ev.EventHeader().LoopID), and
+// reveals the head; the terminal events clear only the FINISHING loop's pending
+// prompts (ClearPromptsForLoop) and, if that drains the queue, restore compose —
+// a sibling loop's pending gate is left intact (design §7). All other events are
+// no-ops here (the transcript owns them). It returns the updated model by value.
 func (m interactionModel) ApplyEvent(ev event.Event) interactionModel {
 	switch ev := ev.(type) {
 	case event.PermissionRequested:
-		m.enqueue(promptFromPermission(ev.CallID, ev.Request))
+		m.enqueueForLoop(promptFromPermission(ev.CallID, ev.Request), ev.EventHeader().LoopID)
 	case event.UserInputRequested:
-		m.enqueue(promptFromUserInput(ev.CallID, ev.Question, ev.Choices))
+		m.enqueueForLoop(promptFromUserInput(ev.CallID, ev.Question, ev.Choices), ev.EventHeader().LoopID)
 	case event.TurnDone, event.TurnFailed, event.TurnInterrupted:
-		m = m.ClearPrompts()
+		m = m.ClearPromptsForLoop(ev.EventHeader().LoopID)
 	}
 	return m
+}
+
+// enqueueForLoop stamps p with its producing loop's id and enqueues it. The
+// LoopID scopes terminal-event clearing per loop (ClearPromptsForLoop, design
+// §7); it is set here at the single enqueue site rather than threaded through the
+// prompt constructors, so prompt construction stays purely about the gate's
+// view-model and the producer-identity concern lives at the event boundary.
+func (m *interactionModel) enqueueForLoop(p prompt, loopID uuid.UUID) {
+	p.LoopID = loopID
+	m.enqueue(p)
 }
 
 // enqueue appends p unless a prompt with the same CallID is already pending
@@ -140,6 +153,45 @@ func (m interactionModel) ClearPrompts() interactionModel {
 	}
 	m.pending = nil
 	m.restoreCompose()
+	return m
+}
+
+// ClearPromptsForLoop drops only the pending prompts produced by loopID and
+// reveals what remains. It is the per-turn terminal-event path (design §7): when
+// one loop's turn ends (TurnDone/TurnFailed/TurnInterrupted), only THAT loop's
+// unresolved gates are abandoned — a sibling loop's pending prompt survives,
+// where the blanket ClearPrompts would have wrongly dropped it. Value receiver
+// returning a new model, matching ClearPrompts/pop's Elm-style contract.
+//
+// It is a no-op (returns m unchanged) when nothing pends or when no pending
+// prompt belongs to loopID — terminal events fire on every turn end, and an
+// unrelated loop's end must not restore the (possibly empty) saved draft over
+// text the user typed into the composer while the turn streamed.
+//
+// When some prompts match, it builds a FRESH slice of the survivors (LoopID !=
+// loopID) — never an in-place filter, since the value-copy model shares pending's
+// backing array with the caller (see cloneHead). If the queue then drains it
+// restores compose; otherwise it re-syncs the mode to the new head, which may
+// have changed when the prior active head was one of the cleared prompts.
+func (m interactionModel) ClearPromptsForLoop(loopID uuid.UUID) interactionModel {
+	if len(m.pending) == 0 {
+		return m
+	}
+	kept := make([]prompt, 0, len(m.pending))
+	for _, p := range m.pending {
+		if p.LoopID != loopID {
+			kept = append(kept, p)
+		}
+	}
+	if len(kept) == len(m.pending) {
+		return m // nothing belonged to loopID — no compose clobber
+	}
+	m.pending = kept
+	if len(m.pending) == 0 {
+		m.restoreCompose()
+	} else {
+		m.syncModeToHead()
+	}
 	return m
 }
 

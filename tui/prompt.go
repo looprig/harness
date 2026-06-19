@@ -30,7 +30,13 @@ const (
 // prompt uses ToolName/Description/Scopes; a user-input prompt uses
 // Question/Choices/selected/freeText.
 type prompt struct {
-	CallID      uuid.UUID
+	CallID uuid.UUID
+	// LoopID is the producing loop's id, stamped from the enqueuing event's
+	// Header (zero for a single/primary loop). It scopes terminal-event clearing
+	// per loop (design §7): a TurnDone/TurnFailed/TurnInterrupted clears only the
+	// prompts whose LoopID matches the finishing loop, so one loop ending never
+	// abandons a sibling loop's pending gate.
+	LoopID      uuid.UUID
 	Kind        promptKind
 	ToolName    string               // promptPermission: approval-prompt header
 	Description string               // promptPermission: approval-prompt body (redacted)
