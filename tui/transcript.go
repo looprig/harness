@@ -480,8 +480,9 @@ func (m *transcriptModel) commitStepAssistant(ai *content.AIMessage) {
 // Summary and capped preview already shown live); when there is none it falls back to
 // the stored block's tool name and the matching ToolResultMessage text (correlated by
 // ToolUseID). The fallback shows no summary (the redacted summary is not carried in
-// the stored message) and OK status (the stored ToolResultMessage does not preserve an
-// error flag — error display rides the live card's preview path).
+// the stored message); its ✓/✗ status comes from ToolResultMessage.IsError, which the
+// stored message now preserves (an error result commits a ✗ card even on the fallback
+// path, no longer relying on the live card's preview).
 func (m *transcriptModel) stepToolCard(use content.ToolUseBlock, results map[string]*content.ToolResultMessage, idx int) ToolCallView {
 	if idx < len(m.live.Calls) {
 		live := m.live.Calls[idx]
@@ -495,6 +496,9 @@ func (m *transcriptModel) stepToolCard(use content.ToolUseBlock, results map[str
 	card := ToolCallView{ToolName: use.Name, Status: ToolOK}
 	if r, ok := results[use.ID]; ok {
 		card.Result = splitLines(toolResultText(r))
+		if r.IsError {
+			card.Status = ToolError
+		}
 	}
 	return card
 }

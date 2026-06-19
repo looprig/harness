@@ -96,6 +96,14 @@ func toolResult(toolUseID, text string) *content.ToolResultMessage {
 	}
 }
 
+// toolResultErr builds a *content.ToolResultMessage answering toolUseID with an
+// error result (IsError=true), used to exercise the stepToolCard fallback status.
+func toolResultErr(toolUseID, text string) *content.ToolResultMessage {
+	r := toolResult(toolUseID, text)
+	r.IsError = true
+	return r
+}
+
 // stepDone builds an event.StepDone carrying the given finalized group.
 func stepDone(msgs ...content.Conversation) event.Event {
 	return event.StepDone{Messages: content.AgenticMessages(msgs)}
@@ -482,6 +490,57 @@ func TestTranscriptToolCalls(t *testing.T) {
 				}
 				if !m.live.empty() {
 					t.Errorf("live not reset after StepDone: %+v", m.live)
+				}
+			},
+		},
+		{
+			name: "StepDone fallback (no live card) reads ToolResultMessage.IsError → ToolError",
+			events: []event.Event{
+				event.TurnStarted{},
+				// No toolStarted/toolCompleted: live.Calls is empty, so stepToolCard
+				// takes the fallback branch keyed on the stored ToolResultMessage.
+				stepDone(
+					aiMessage("", "", toolUse("tu-err", "Bash", `{}`)),
+					toolResultErr("tu-err", "tool error: boom"),
+				),
+			},
+			want: func(t *testing.T, m transcriptModel) {
+				// bare assistant (card-only) + one tool entry committed via fallback.
+				if len(m.committed) != 2 {
+					t.Fatalf("committed = %d, want 2 (bare assistant, tool)", len(m.committed))
+				}
+				if m.committed[1].Kind != kindTool {
+					t.Errorf("committed[1].Kind = %v, want kindTool", m.committed[1].Kind)
+				}
+				if len(m.committed[1].Calls) != 1 {
+					t.Fatalf("committed[1].Calls = %d, want 1", len(m.committed[1].Calls))
+				}
+				if got := m.committed[1].Calls[0].Status; got != ToolError {
+					t.Errorf("fallback card Status = %v, want ToolError (from IsError)", got)
+				}
+			},
+		},
+		{
+			name: "StepDone fallback (no live card) with IsError false → ToolOK",
+			events: []event.Event{
+				event.TurnStarted{},
+				stepDone(
+					aiMessage("", "", toolUse("tu-ok", "Bash", `{}`)),
+					toolResult("tu-ok", "all good"),
+				),
+			},
+			want: func(t *testing.T, m transcriptModel) {
+				if len(m.committed) != 2 {
+					t.Fatalf("committed = %d, want 2 (bare assistant, tool)", len(m.committed))
+				}
+				if m.committed[1].Kind != kindTool {
+					t.Errorf("committed[1].Kind = %v, want kindTool", m.committed[1].Kind)
+				}
+				if len(m.committed[1].Calls) != 1 {
+					t.Fatalf("committed[1].Calls = %d, want 1", len(m.committed[1].Calls))
+				}
+				if got := m.committed[1].Calls[0].Status; got != ToolOK {
+					t.Errorf("fallback card Status = %v, want ToolOK", got)
 				}
 			},
 		},
