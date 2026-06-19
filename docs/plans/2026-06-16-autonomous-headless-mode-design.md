@@ -2,7 +2,7 @@
 
 **Date:** 2026-06-16
 **Status:** Approved design, pending implementation plan
-**Depends on:** [Design A — Session Observability & Taxonomy Foundation](2026-06-16-session-observability-taxonomy-design.md) (`ControlEvent`/`TerminalEvent` markers, envelope delivery, unified `Sink`).
+**Depends on:** ⚠️ **stale** — the former [Design A — Session Observability & Taxonomy Foundation] has been superseded by [Cleanup — Remove Event Sink, Redaction & EventEnvelope Scaffolding](2026-06-19-remove-sink-redaction-envelope.md). The concepts this doc leans on (`ControlEvent`/`TerminalEvent` markers, envelope delivery, unified `Sink`, `NotificationEvent`) were either dropped ("add when needed"), built differently on main (`Class`×`Scope`+`Reply`+`EndsTurn`, `Header`-carried identity, hub `Subscription`), or deleted (the sink path). **This design needs its own reconciliation against main before implementation.**
 
 ## Motivation
 
