@@ -29,6 +29,11 @@ var (
 	UserStyle        = lipgloss.NewStyle().Bold(true)
 	InterruptedStyle = lipgloss.NewStyle().Faint(true).Italic(true)
 	StatusStyle      = lipgloss.NewStyle().Faint(true)
+	// QueuedStyle renders the transient queued-input affordance — the pending,
+	// not-yet-running echo of a submitted user message shown below the live tail. It
+	// is FAINT (not bold like UserStyle) so a queued line reads as a quieter "this is
+	// waiting" hint, distinct from the bold committed user row it later promotes to.
+	QueuedStyle = lipgloss.NewStyle().Faint(true)
 )
 
 // HeadlineStyle renders the bold headline word shown beside the assistant dot for an

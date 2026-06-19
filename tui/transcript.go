@@ -5,6 +5,7 @@ import (
 
 	"github.com/inventivepotter/urvi/internal/agent/loop/event"
 	"github.com/inventivepotter/urvi/internal/content"
+	"github.com/inventivepotter/urvi/internal/uuid"
 )
 
 // splitLines splits a tool-result preview into display lines on "\n". An empty
@@ -189,18 +190,40 @@ func (s liveSeg) empty() bool {
 	return s.Thinking == "" && s.Text == "" && len(s.Calls) == 0
 }
 
+// queuedInput is a transient affordance for one submitted-but-not-yet-committed
+// user message: its submit correlation id, the blocks the TUI remembers from the
+// submit (InputQueued carries no Message, so the affordance text comes from here),
+// and a shown flag the loop's InputQueued event flips on. It is NOT a committed
+// transcript entry — it is a pending hint rendered below the live tail until the
+// authoritative TurnStarted/TurnFoldedInto commits the real user row (or
+// InputCancelled/TurnRejected drops it).
+type queuedInput struct {
+	inputID uuid.UUID
+	blocks  []content.Block
+	shown   bool
+}
+
 // transcriptModel is the pure, side-effect-free reducer over a turn's event
 // stream. committed holds finalized entries in display order; live is the
-// in-progress segment for the current turn; nextID is the next stable ID to
+// in-progress segment for the current turn; queued holds the pending
+// queued-input affordances (ordered by submit); nextID is the next stable ID to
 // allocate. It is applied by value: ApplyEvent returns the next model.
 type transcriptModel struct {
 	committed []entry
 	live      liveSeg
+	queued    []queuedInput
 	nextID    displayID
 }
 
 // ApplyEvent folds one turn-stream event into the model and returns the next
-// model. TurnStarted begins/keeps a live assistant segment; TokenDelta routes
+// model. TurnStarted begins/keeps a live assistant segment AND — for GENUINE user
+// input only (Header.TriggeredByLoopID == 0; a subagent hand-back carries a
+// non-zero one and commits NO user row) — commits the authoritative user row from
+// its Message and drops the matching queued affordance. TurnFoldedInto does the
+// same user-row commit for a folded tool-continuation input. InputQueued reveals
+// the queued affordance for its InputID; InputCancelled drops it (no row);
+// TurnRejected drops it and commits an error notice (a rejected message must not
+// silently vanish). TokenDelta routes
 // *content.TextChunk → live.Text and *content.ThinkingChunk → live.Thinking as a
 // PROVISIONAL live render; ToolCallStarted/ToolCallCompleted drive the live tool
 // cards (in the live tail only — they are not committed to scrollback here).
@@ -227,6 +250,15 @@ func (m transcriptModel) ApplyEvent(ev event.Event) transcriptModel {
 	switch ev := ev.(type) {
 	case event.TurnStarted:
 		m.live.active = true
+		m.startTurnUser(ev.TriggeredByLoopID, ev.InputID, ev.Message)
+	case event.TurnFoldedInto:
+		m.startTurnUser(ev.TriggeredByLoopID, ev.InputID, ev.Message)
+	case event.InputQueued:
+		m.markQueued(ev.InputID)
+	case event.InputCancelled:
+		m.dropQueued(ev.InputID)
+	case event.TurnRejected:
+		m.rejectInput(ev.InputID, ev.Reason)
 	case event.TokenDelta:
 		m.applyChunk(ev.Chunk)
 	case event.ToolCallStarted:
@@ -260,6 +292,120 @@ func (m transcriptModel) CommitUser(blocks []content.Block) transcriptModel {
 	m.nextID++
 	m.committed = append(m.committed, entry{ID: m.nextID, Kind: kindUser, Blocks: blocks})
 	return m
+}
+
+// RecordSubmit registers a fire-and-forget submit by its correlation id so the
+// queued affordance can show the remembered blocks once the loop's InputQueued
+// event arrives. It is called by the Screen on a successful submitResultMsg. If an
+// entry for inputID already exists (the InputQueued event raced ahead of the
+// submit result), this FILLS its blocks rather than appending a duplicate — so a
+// shown-but-blockless placeholder gets its text. Otherwise it appends a fresh
+// queuedInput (shown=false) at the submit-order tail. It returns the next model.
+//
+// Value-copy contract: a fresh queued slice is built (never an in-place mutation
+// of a shared backing array) so the by-value reducer never aliases a prior model's
+// queue — mirroring the interaction model's cloneHead rationale.
+func (m transcriptModel) RecordSubmit(inputID uuid.UUID, blocks []content.Block) transcriptModel {
+	next := append([]queuedInput(nil), m.queued...)
+	for i := range next {
+		if next[i].inputID == inputID {
+			next[i].blocks = blocks
+			m.queued = next
+			return m
+		}
+	}
+	m.queued = append(next, queuedInput{inputID: inputID, blocks: blocks})
+	return m
+}
+
+// QueuedInputs returns, in submit order, the blocks of every queued affordance
+// that is ready to render (shown by an InputQueued event AND carrying remembered
+// blocks). A still-blockless placeholder (InputQueued arrived before RecordSubmit
+// filled the blocks) is skipped until its blocks land. The returned slice is a
+// fresh copy, so a caller cannot reach the model's internal queue.
+func (m transcriptModel) QueuedInputs() [][]content.Block {
+	var out [][]content.Block
+	for _, q := range m.queued {
+		if q.shown && q.blocks != nil {
+			out = append(out, q.blocks)
+		}
+	}
+	return out
+}
+
+// startTurnUser commits the authoritative user row for a turn-start event
+// (TurnStarted/TurnFoldedInto) and drops the matching queued affordance. It
+// commits a kindUser row ONLY for GENUINE user input — triggeredBy must be the
+// zero loop id (a SubagentResult hand-back also produces these events but carries
+// a non-zero TriggeredByLoopID and must NOT add a user row) — and only when a
+// Message is present. The row is committed from the event's authoritative blocks,
+// never from remembered submit state, which sidesteps the submit↔event arrival
+// race. The queued affordance for this InputID is always dropped (the real row, if
+// any, supersedes it).
+func (m *transcriptModel) startTurnUser(triggeredBy, inputID uuid.UUID, msg *content.UserMessage) {
+	if triggeredBy.IsZero() && msg != nil {
+		*m = m.CommitUser(msg.Blocks)
+	}
+	m.dropQueued(inputID)
+}
+
+// markQueued reveals the queued affordance for inputID (InputQueued boundary). If
+// no entry exists yet (InputQueued raced ahead of RecordSubmit) it creates a
+// shown-but-blockless placeholder so the affordance appears the instant the
+// remembered blocks land via RecordSubmit; until then QueuedInputs skips it. It
+// rebuilds the slice rather than mutating a shared backing array (value-copy
+// contract).
+func (m *transcriptModel) markQueued(inputID uuid.UUID) {
+	next := append([]queuedInput(nil), m.queued...)
+	for i := range next {
+		if next[i].inputID == inputID {
+			next[i].shown = true
+			m.queued = next
+			return
+		}
+	}
+	m.queued = append(next, queuedInput{inputID: inputID, shown: true})
+}
+
+// dropQueued removes the queued affordance for inputID, if present. It rebuilds the
+// slice (value-copy contract) so the reducer never mutates a prior model's queue.
+// An unknown inputID is a no-op.
+func (m *transcriptModel) dropQueued(inputID uuid.UUID) {
+	if len(m.queued) == 0 {
+		return
+	}
+	next := make([]queuedInput, 0, len(m.queued))
+	for _, q := range m.queued {
+		if q.inputID != inputID {
+			next = append(next, q)
+		}
+	}
+	m.queued = next
+}
+
+// rejectInput is the TurnRejected boundary: a submitted message the loop refused
+// must not silently vanish. It drops the queued affordance for inputID and commits
+// an error-level notice naming the reason, so the user sees the rejection.
+func (m *transcriptModel) rejectInput(inputID uuid.UUID, reason event.RejectReason) {
+	m.dropQueued(inputID)
+	*m = m.CommitNotice(noticeError, "input rejected: "+rejectReasonText(reason))
+}
+
+// rejectReasonText maps a RejectReason to a short user-facing phrase. An unknown
+// value degrades to a neutral "refused" rather than printing a raw enum number.
+func rejectReasonText(reason event.RejectReason) string {
+	switch reason {
+	case event.RejectBusy:
+		return "loop busy"
+	case event.RejectQueueFull:
+		return "queue full"
+	case event.RejectShuttingDown:
+		return "shutting down"
+	case event.RejectInternal:
+		return "internal error"
+	default:
+		return "refused"
+	}
 }
 
 // CommitNotice appends a leveled, out-of-band notification as one kindNotice entry

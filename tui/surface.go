@@ -40,6 +40,7 @@ func liveTailCap(term, statusH, slashH, contentH int) int {
 type surfaceInputs struct {
 	Interaction   interactionModel
 	LiveTail      string // pre-rendered live thinking/text/tool ⋯ lines
+	Queued        string // pre-rendered dim queued-input affordance lines (below the live tail)
 	Status        Status
 	StatusState   statusInputs
 	Width, Height int
@@ -67,16 +68,33 @@ func surfaceView(in surfaceInputs) string {
 	status := renderStatusLine(in.Status, in.StatusState)
 
 	contentH := bottomContentHeight(in)
-	capacity := liveTailCap(in.Height, statusH, lipgloss.Height(slash), contentH)
+	// The queued affordance and slash panel are first-class reserved rows: they sit
+	// between the live tail and the separator (queued) or below the bottom box
+	// (slash), so the tail gets only the rows left after BOTH are reserved — keeping
+	// the logical line count equal to the physical row count the v2 inline renderer
+	// requires (see clampSurfaceWidth).
+	reserved := lipgloss.Height(slash) + queuedHeight(in.Queued)
+	capacity := liveTailCap(in.Height, statusH, reserved, contentH)
 	tail := cappedTail(in.LiveTail, capacity)
 
-	rows := make([]string, 0, 5)
+	rows := make([]string, 0, 6)
 	rows = appendNonEmpty(rows, tail)
+	rows = appendNonEmpty(rows, in.Queued)
 	rows = append(rows, styles.SeparatorRule(in.Width))
 	rows = appendNonEmpty(rows, bottom)
 	rows = appendNonEmpty(rows, slash)
 	rows = appendNonEmpty(rows, status)
 	return clampSurfaceWidth(strings.Join(rows, "\n"), in.Width)
+}
+
+// queuedHeight is the row count of the pre-rendered queued affordance (0 when
+// empty), reserved out of the live-tail budget so the tail never overlaps the
+// affordance. An empty affordance reserves nothing.
+func queuedHeight(queued string) int {
+	if queued == "" {
+		return 0
+	}
+	return lipgloss.Height(queued)
 }
 
 // clampSurfaceWidth truncates every line of the composed active surface to width

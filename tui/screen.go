@@ -22,9 +22,12 @@ import (
 // startup and read continuously by subNext, is the sole event source — it spans
 // every turn and loop and never EOFs per turn. Submissions are fire-and-forget
 // (submitCmd → agent.Submit); the LOOP owns queueing, so Screen keeps no queue.
-// The optimistic CommitUser at submit time still lands the user row in scrollback
-// immediately; the loop's TurnStarted/TurnDone/TurnFailed/TurnInterrupted terminals
-// on the subscription drive the turn status (for the PRIMARY loop only).
+// User rows are EVENT-DRIVEN: the authoritative user row commits from the loop's
+// TurnStarted/TurnFoldedInto Message (genuine input only — TriggeredByLoopID == 0),
+// never optimistically at submit; a successful submit only records the queued
+// affordance (RecordSubmit), shown once InputQueued arrives. The loop's
+// TurnStarted/TurnDone/TurnFailed/TurnInterrupted terminals on the subscription
+// drive the turn status (for the PRIMARY loop only).
 type Screen struct {
 	agent     Agent
 	openAgent OpenAgent       // builds a replacement agent on /clear
@@ -249,17 +252,20 @@ func (m *Screen) handleSubClosed(msg subClosedMsg) tea.Cmd {
 	return m.flush()
 }
 
-// handleSubmitResult surfaces a fire-and-forget Submit outcome. A nil err is a
-// silent success (the loop accepted the input; its events arrive on the
-// subscription). A non-nil err commits a faint, NON-FATAL error entry: the
-// optimistic user row already printed at submit time and stays as a record; the
-// error only notes the send failed. It never panics and never hangs.
+// handleSubmitResult surfaces a fire-and-forget Submit outcome. On success it
+// records the submit (RecordSubmit) under the loop-assigned InputID so the queued
+// affordance can show the remembered blocks once the loop's InputQueued event
+// arrives; the authoritative user row is committed later from the loop's
+// TurnStarted/TurnFoldedInto Message, NOT here. A non-nil err commits a faint,
+// NON-FATAL error entry noting the send failed (no user row was ever committed, so
+// nothing is left dangling). It never panics and never hangs.
 func (m *Screen) handleSubmitResult(msg submitResultMsg) tea.Cmd {
-	if msg.err == nil {
-		return nil
+	if msg.err != nil {
+		m.transcript = m.transcript.CommitError(msg.err)
+		return m.flush()
 	}
-	m.transcript = m.transcript.CommitError(msg.err)
-	return m.flush()
+	m.transcript = m.transcript.RecordSubmit(msg.inputID, msg.blocks)
+	return nil
 }
 
 // flush renders every newly committed transcript entry to scrollback exactly once
@@ -373,6 +379,7 @@ func (m Screen) View() tea.View {
 	v := tea.NewView(surfaceView(surfaceInputs{
 		Interaction: m.interaction,
 		LiveTail:    m.renderLiveTail(),
+		Queued:      m.renderQueued(),
 		Status:      m.status,
 		StatusState: m.statusInputs(),
 		Width:       m.width,
@@ -391,6 +398,14 @@ func (m Screen) renderLiveTail() string {
 		return ""
 	}
 	return renderLiveAssistant(live.Thinking, live.Text, live.Calls, m.expand, m.width, m.anim)
+}
+
+// renderQueued renders the transcript's pending queued-input affordances (the
+// submitted-but-not-yet-running user messages) to their dim display lines, shown
+// below the live tail. It is empty when nothing is queued, so the surface omits the
+// region entirely.
+func (m Screen) renderQueued() string {
+	return renderQueued(m.transcript.QueuedInputs(), m.width)
 }
 
 // statusInputs snapshots the live signals the status label is derived from: which
@@ -476,21 +491,20 @@ func (m *Screen) mapAction(a uiAction) tea.Cmd {
 
 // submit builds blocks from the composed text and sends them fire-and-forget. The
 // LOOP owns queueing now (a submission while Running is queued by the loop, not by
-// Screen), so there is no status branching and no Screen-side queue: every accepted
-// submission optimistically commits a user entry to scrollback (so it lands in
-// native history immediately) and fires submitCmd. A buildBlocks error commits a
-// faint error entry and sends nothing. The optimistic CommitUser is kept for now —
-// moving user rows to event-driven (the loop's TurnStarted Message) is the next
-// sub-task. submitCmd's submitResultMsg notes any send failure without removing the
-// optimistic row.
+// Screen), so there is no status branching and no Screen-side queue. It does NOT
+// commit a user row optimistically: the authoritative user row is committed from
+// the loop's TurnStarted/TurnFoldedInto Message (event-driven), so submit only
+// fires submitCmd. A buildBlocks error commits a faint error entry and sends
+// nothing. submitCmd's submitResultMsg carries the InputID + blocks so a successful
+// send records the submit (so the queued affordance can show on the later
+// InputQueued); a send failure surfaces a faint error notice.
 func (m *Screen) submit(text string) tea.Cmd {
 	blocks, err := buildBlocks(text, m.agent.AcceptsImages())
 	if err != nil {
 		m.transcript = m.transcript.CommitError(err)
 		return m.flush()
 	}
-	m.transcript = m.transcript.CommitUser(blocks)
-	return tea.Batch(m.flush(), submitCmd(m.appCtx, m.agent, blocks))
+	return submitCmd(m.appCtx, m.agent, blocks)
 }
 
 // runSlash executes a known slash command. /help commits the listing to scrollback;

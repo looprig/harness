@@ -4,6 +4,8 @@ import (
 	"time"
 
 	"github.com/inventivepotter/urvi/internal/agent/loop/event"
+	"github.com/inventivepotter/urvi/internal/content"
+	"github.com/inventivepotter/urvi/internal/uuid"
 )
 
 // eventMsg carries one event pulled from the session-lifetime subscription.
@@ -24,11 +26,18 @@ type subscribedMsg struct {
 // continuous reader's only terminal — there is no per-turn EOF anymore.
 type subClosedMsg struct{ err error }
 
-// submitResultMsg reports the outcome of a fire-and-forget Submit. Only the error
-// matters at the UI: the optimistic CommitUser row already landed in scrollback, so
-// a nil err is a silent success and a non-nil err lets Update note that the send
-// failed without removing the record. It is a tea.Msg.
-type submitResultMsg struct{ err error }
+// submitResultMsg reports the outcome of a fire-and-forget Submit. On success it
+// carries the loop-assigned inputID and the submitted blocks so Update can record
+// the submit (RecordSubmit) — the queued affordance shows once the loop's
+// InputQueued event arrives, and the authoritative user row is committed later from
+// the TurnStarted/TurnFoldedInto Message (NOT optimistically at submit). A non-nil
+// err is a non-fatal send failure Update surfaces as a faint error notice. It is a
+// tea.Msg.
+type submitResultMsg struct {
+	inputID uuid.UUID
+	blocks  []content.Block
+	err     error
+}
 
 // interruptResultMsg carries the outcome of an Interrupt call.
 type interruptResultMsg struct {

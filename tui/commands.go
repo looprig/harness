@@ -78,16 +78,19 @@ func subNext(sub EventStream) tea.Cmd {
 }
 
 // submitCmd sends blocks fire-and-forget via Submit under the app context and
-// reports the outcome. The loop owns queueing, so there is no per-turn reader to
+// reports the outcome, capturing the loop-assigned InputID and echoing back the
+// submitted blocks. The loop owns queueing, so there is no per-turn reader to
 // install and no status branching here: Submit returns immediately once the input
 // is enqueued, and the loop publishes the turn-lifecycle + content events back on
-// the subscription. Only the error matters at the UI (the InputID is unused for
-// now); a non-nil err lets Update note the send failed without removing the
-// optimistic user row.
+// the subscription. On success the (InputID, blocks) let handleSubmitResult record
+// the submit so the queued affordance can show once the loop's InputQueued event
+// arrives; the authoritative user row is committed later from the
+// TurnStarted/TurnFoldedInto Message, never optimistically at submit. A non-nil err
+// lets Update surface a faint, non-fatal send failure.
 func submitCmd(ctx context.Context, agent Agent, blocks []content.Block) tea.Cmd {
 	return func() tea.Msg {
-		_, err := agent.Submit(ctx, blocks)
-		return submitResultMsg{err: err}
+		id, err := agent.Submit(ctx, blocks)
+		return submitResultMsg{inputID: id, blocks: blocks, err: err}
 	}
 }
 

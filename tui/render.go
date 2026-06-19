@@ -349,6 +349,40 @@ func renderUser(text string, width int) string {
 	return strings.Join(out, "\n")
 }
 
+// renderQueued renders the pending queued-input affordances as compact, DIM
+// user-style lines — the transient "this is queued, not yet running" hint shown
+// below the live tail until the loop's TurnStarted/TurnFoldedInto promotes each to
+// a committed user row (or InputCancelled/TurnRejected drops it). Each queued
+// message's first line of text is prefixed with the gray "▌ " accent bar and
+// rendered faint (QueuedStyle), so it reads as a quieter echo of the bold
+// committed user row. Empty queued yields "" so the surface omits the region. It is
+// deliberately a one-line-per-message preview, not a full word-wrap: this is a
+// throwaway affordance, never committed scrollback.
+func renderQueued(messages [][]content.Block, width int) string {
+	if len(messages) == 0 {
+		return ""
+	}
+	bar := styles.AccentBarStyle.Render(styles.AccentBarPrompt)
+	var out []string
+	for _, blocks := range messages {
+		text := firstLine(renderInlineBlocks(blocks))
+		for _, line := range wrapToWidth(text, width-barWidth) {
+			out = append(out, bar+styles.QueuedStyle.Render(line))
+		}
+	}
+	return strings.Join(out, "\n")
+}
+
+// firstLine returns the first "\n"-delimited line of s (s itself when single-line).
+// The queued affordance previews only the first line of a multi-line submission —
+// it is a compact pending hint, not the full committed row.
+func firstLine(s string) string {
+	if i := strings.IndexByte(s, '\n'); i >= 0 {
+		return s[:i]
+	}
+	return s
+}
+
 // thinkingRail is the left-rail margin ("│ ") that prefixes EVERY line of the
 // expanded thinking block — header included — so the block renders as one unbroken
 // vertical rail attaching the reasoning to the assistant turn it precedes.

@@ -695,10 +695,11 @@ func TestTerminalEventClearsPromptQueue(t *testing.T) {
 	}
 }
 
-// TestSubmitFireAndForgetIdle covers uiSubmit at Idle: a user entry is optimistically
-// committed and flushed to scrollback, Submit is fired fire-and-forget (NOT
-// StreamBlocks), and the status stays Idle — it flips to Running only when the loop's
-// TurnStarted arrives on the subscription. The composer resets.
+// TestSubmitFireAndForgetIdle covers uiSubmit at Idle: NO user row is committed at
+// submit (the optimistic commit is gone — the row is event-driven now), Submit is
+// fired fire-and-forget (NOT StreamBlocks), and the status stays Idle — it flips to
+// Running only when the loop's TurnStarted arrives on the subscription. The composer
+// resets.
 func TestSubmitFireAndForgetIdle(t *testing.T) {
 	t.Parallel()
 
@@ -709,22 +710,20 @@ func TestSubmitFireAndForgetIdle(t *testing.T) {
 	m, cmd := updateScreen(t, m, tea.KeyPressMsg{Code: tea.KeyEnter})
 
 	if cmd == nil {
-		t.Fatal("submit cmd = nil, want non-nil (flush + submitCmd)")
+		t.Fatal("submit cmd = nil, want non-nil (submitCmd)")
 	}
 	if m.status != StatusIdle {
 		t.Errorf("status = %d, want StatusIdle (status follows TurnStarted, not submit)", m.status)
 	}
-	rec := lastCommitted(t, m)
-	if rec.Kind != kindUser || committedText(rec) != "hello there" {
-		t.Errorf("committed entry = (kind %d, text %q), want (kindUser, %q)", rec.Kind, committedText(rec), "hello there")
-	}
-	if !m.scrollback.printed[rec.ID] {
-		t.Error("user entry not flushed to scrollback")
+	// No optimistic user row: the authoritative row comes from the loop's TurnStarted
+	// Message, not from submit.
+	if len(m.transcript.committed) != 0 {
+		t.Errorf("committed = %d, want 0 (no optimistic user row; it is event-driven)", len(m.transcript.committed))
 	}
 	if m.interaction.input.Value() != "" {
 		t.Errorf("composer = %q, want reset", m.interaction.input.Value())
 	}
-	// Executing the batched cmd must reach Submit (fire-and-forget), NOT StreamBlocks.
+	// Executing the cmd must reach Submit (fire-and-forget), NOT StreamBlocks.
 	drainCmd(t, cmd)
 	if !agent.submitCalled {
 		t.Error("Submit not called; the fire-and-forget path must call agent.Submit")
@@ -737,9 +736,9 @@ func TestSubmitFireAndForgetIdle(t *testing.T) {
 	}
 }
 
-// TestSubmitFireAndForgetWhileRunning covers uiSubmit at Running: the user entry is
-// optimistically committed (lands in scrollback) and Submit is fired — the LOOP owns
-// queueing now, so Screen keeps no queue and the status stays Running. The composer
+// TestSubmitFireAndForgetWhileRunning covers uiSubmit at Running: NO user row is
+// committed at submit (event-driven now) and Submit is fired — the LOOP owns
+// queueing, so Screen keeps no queue and the status stays Running. The composer
 // resets.
 func TestSubmitFireAndForgetWhileRunning(t *testing.T) {
 	t.Parallel()
@@ -751,11 +750,10 @@ func TestSubmitFireAndForgetWhileRunning(t *testing.T) {
 	m, cmd := updateScreen(t, m, tea.KeyPressMsg{Code: tea.KeyEnter})
 
 	if cmd == nil {
-		t.Error("submit cmd = nil, want non-nil (flush + submitCmd)")
+		t.Error("submit cmd = nil, want non-nil (submitCmd)")
 	}
-	rec := lastCommitted(t, m)
-	if rec.Kind != kindUser || committedText(rec) != "second one" {
-		t.Errorf("committed = (kind %d, text %q), want (kindUser, %q)", rec.Kind, committedText(rec), "second one")
+	if len(m.transcript.committed) != 0 {
+		t.Errorf("committed = %d, want 0 (no optimistic user row; it is event-driven)", len(m.transcript.committed))
 	}
 	if m.status != StatusRunning {
 		t.Errorf("status = %d, want StatusRunning (unchanged; the loop queues)", m.status)
@@ -1090,8 +1088,9 @@ func TestComposeBlinkCmdPlumbed(t *testing.T) {
 }
 
 // TestSubmitResultMsg covers the fire-and-forget Submit outcome arm: a nil err is a
-// silent success (no commit, no cmd); a non-nil err commits a faint, non-fatal error
-// entry (the optimistic user row stays) and does NOT change the turn status.
+// success that records the submit (no committed entry, no cmd — the queued affordance
+// only surfaces later on InputQueued); a non-nil err commits a faint, non-fatal error
+// entry (no user row was ever committed) and does NOT change the turn status.
 func TestSubmitResultMsg(t *testing.T) {
 	t.Parallel()
 
@@ -1499,6 +1498,143 @@ func TestUpdateStartupBanner(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestSubmitUserRowFromEventNotSubmit is the Screen-level proof of the event-driven
+// user row: after a submit there is NO kindUser row (the optimistic commit is gone);
+// feeding the loop's TurnStarted (genuine input, Message present) commits exactly one
+// kindUser row equal to the event's Message blocks, and flushes it to scrollback.
+func TestSubmitUserRowFromEventNotSubmit(t *testing.T) {
+	t.Parallel()
+
+	agent := &fakeAgent{}
+	m := runningScreen(t, agent)
+	m.interaction.input.SetValue("from the event")
+
+	// Submit: fires submitCmd, commits NO row.
+	m, cmd := updateScreen(t, m, tea.KeyPressMsg{Code: tea.KeyEnter})
+	drainCmd(t, cmd)
+	if got := len(m.transcript.committed); got != 0 {
+		t.Fatalf("committed after submit = %d, want 0 (no optimistic user row)", got)
+	}
+
+	// The loop's TurnStarted carries the authoritative user message (genuine input:
+	// the fakeAgent's primary loop id is zero, so TriggeredByLoopID == 0).
+	m = feed(t, m, event.TurnStarted{InputID: fixedFakeSubmitID, Message: userMsg("from the event")})
+
+	rec := lastCommitted(t, m)
+	if rec.Kind != kindUser || committedText(rec) != "from the event" {
+		t.Fatalf("committed = (kind %d, text %q), want (kindUser, %q)", rec.Kind, committedText(rec), "from the event")
+	}
+	if got := userRowCount(m); got != 1 {
+		t.Errorf("kindUser rows = %d, want exactly 1 (one TurnStarted -> one row)", got)
+	}
+	if !m.scrollback.printed[rec.ID] {
+		t.Error("event-committed user row not flushed to scrollback")
+	}
+}
+
+// TestSubagentHandbackCommitsNoUserRow is the Screen-level proof that a SubagentResult
+// hand-back (TurnStarted/TurnFoldedInto with a non-zero TriggeredByLoopID) commits NO
+// user row — only genuine user input (TriggeredByLoopID == 0) gets a row.
+func TestSubagentHandbackCommitsNoUserRow(t *testing.T) {
+	t.Parallel()
+
+	subagent := callID(0xBB)
+
+	tests := []struct {
+		name string
+		ev   event.Event
+	}{
+		{name: "TurnStarted hand-back", ev: event.TurnStarted{Header: event.Header{TriggeredByLoopID: subagent}, InputID: callID(1), Message: userMsg("handback")}},
+		{name: "TurnFoldedInto hand-back", ev: event.TurnFoldedInto{Header: event.Header{TriggeredByLoopID: subagent}, InputID: callID(1), Message: userMsg("handback")}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			agent := &fakeAgent{}
+			m := runningScreen(t, agent)
+			m = feed(t, m, tt.ev)
+			if got := userRowCount(m); got != 0 {
+				t.Errorf("kindUser rows = %d, want 0 (a subagent hand-back commits no user row)", got)
+			}
+		})
+	}
+}
+
+// TestSubmitQueuedAffordancePromotes is the Screen-level lifecycle: a successful
+// submitResultMsg records the submit, the loop's InputQueued reveals the dim
+// affordance in the View, and the loop's TurnStarted promotes it to a committed user
+// row (the affordance gone from the View, the row in scrollback).
+func TestSubmitQueuedAffordancePromotes(t *testing.T) {
+	t.Parallel()
+
+	agent := &fakeAgent{}
+	m := runningScreen(t, agent)
+	m, _ = updateScreen(t, m, tea.WindowSizeMsg{Width: 60, Height: 24})
+
+	id := callID(0x42)
+	// A successful submit result records the submit (no row, no affordance yet).
+	m, _ = updateScreen(t, m, submitResultMsg{inputID: id, blocks: userBlocks("pending msg")})
+	if strings.Contains(stripANSI(m.View().Content), "pending msg") {
+		t.Fatal("affordance shown before InputQueued; it must wait for the event")
+	}
+
+	// InputQueued reveals the affordance below the live tail (above the separator).
+	m = feed(t, m, event.InputQueued{InputID: id})
+	view := stripANSI(m.View().Content)
+	if !strings.Contains(view, "pending msg") {
+		t.Fatalf("queued affordance missing from View after InputQueued; got %q", view)
+	}
+
+	// TurnStarted promotes to a committed row and clears the affordance.
+	m = feed(t, m, event.TurnStarted{InputID: id, Message: userMsg("pending msg")})
+	if got := userRowCount(m); got != 1 {
+		t.Errorf("kindUser rows = %d, want 1 (promoted once)", got)
+	}
+	if strings.Contains(stripANSI(m.View().Content), "pending msg") {
+		t.Error("queued affordance still in View after TurnStarted; it must be cleared (the row is in scrollback)")
+	}
+}
+
+// TestTurnRejectedSurfacesNotice is the Screen-level proof that a rejected submit is
+// not silent: after recording a submit and revealing the affordance, a TurnRejected
+// drops the affordance and commits an error notice mentioning the reason.
+func TestTurnRejectedSurfacesNotice(t *testing.T) {
+	t.Parallel()
+
+	agent := &fakeAgent{}
+	m := runningScreen(t, agent)
+	m, _ = updateScreen(t, m, tea.WindowSizeMsg{Width: 60, Height: 24})
+
+	id := callID(0x66)
+	m, _ = updateScreen(t, m, submitResultMsg{inputID: id, blocks: userBlocks("rejected msg")})
+	m = feed(t, m, event.InputQueued{InputID: id})
+
+	m = feed(t, m, event.TurnRejected{InputID: id, Reason: event.RejectQueueFull})
+
+	rec := lastCommitted(t, m)
+	if rec.Kind != kindNotice || rec.Level != noticeError {
+		t.Fatalf("committed = (kind %d, level %d), want (kindNotice, noticeError)", rec.Kind, rec.Level)
+	}
+	if got := committedText(rec); !strings.Contains(got, "queue full") {
+		t.Errorf("rejection notice = %q, want it to mention the reason %q", got, "queue full")
+	}
+	if got := userRowCount(m); got != 0 {
+		t.Errorf("kindUser rows = %d, want 0 (a rejected message surfaces as a notice, not a row)", got)
+	}
+}
+
+// userRowCount counts the committed kindUser rows in m's transcript.
+func userRowCount(m Screen) int {
+	n := 0
+	for _, e := range m.transcript.committed {
+		if e.Kind == kindUser {
+			n++
+		}
+	}
+	return n
 }
 
 // TestFlushPrintsEachEntryOnce covers the print-once invariant at the Screen level:

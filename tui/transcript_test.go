@@ -1278,3 +1278,232 @@ func TestCommitStepAssistantDoneHeadline(t *testing.T) {
 		})
 	}
 }
+
+// userMsg builds a *content.UserMessage carrying one TextBlock, the authoritative
+// payload a TurnStarted/TurnFoldedInto event carries for the committed user row.
+func userMsg(text string) *content.UserMessage {
+	return &content.UserMessage{Message: content.Message{
+		Role:   content.RoleUser,
+		Blocks: []content.Block{&content.TextBlock{Text: text}},
+	}}
+}
+
+// userBlocks builds the []content.Block a submit produces, the blocks RecordSubmit
+// remembers for the queued affordance.
+func userBlocks(text string) []content.Block {
+	return []content.Block{&content.TextBlock{Text: text}}
+}
+
+// kindUserCount counts the committed kindUser rows in m.
+func kindUserCount(m transcriptModel) int {
+	n := 0
+	for _, e := range m.committed {
+		if e.Kind == kindUser {
+			n++
+		}
+	}
+	return n
+}
+
+// queuedTexts returns the first-text-block text of each ready queued affordance, in
+// order, for assertions.
+func queuedTexts(m transcriptModel) []string {
+	var out []string
+	for _, blocks := range m.QueuedInputs() {
+		out = append(out, blockText(blocks[0]))
+	}
+	return out
+}
+
+// TestTranscriptUserRowFromTurnEvent locks the event-driven user row: a TurnStarted /
+// TurnFoldedInto with TriggeredByLoopID == 0 and a Message commits exactly ONE
+// kindUser row equal to the Message blocks; a SUBAGENT hand-back (TriggeredByLoopID
+// != 0) commits NO user row; a nil Message commits no row either.
+func TestTranscriptUserRowFromTurnEvent(t *testing.T) {
+	primary := callID(0)     // genuine user input: the zero (untriggered) loop id
+	subagent := callID(0xBB) // a non-zero TriggeredByLoopID => subagent hand-back
+
+	tests := []struct {
+		name     string
+		event    event.Event
+		wantRows int
+		wantText string // checked only when wantRows == 1
+	}{
+		{
+			name:     "TurnStarted genuine user input commits one row",
+			event:    event.TurnStarted{Header: event.Header{TriggeredByLoopID: primary}, InputID: callID(1), Message: userMsg("hello")},
+			wantRows: 1,
+			wantText: "hello",
+		},
+		{
+			name:     "TurnFoldedInto genuine user input commits one row",
+			event:    event.TurnFoldedInto{Header: event.Header{TriggeredByLoopID: primary}, InputID: callID(1), Message: userMsg("folded")},
+			wantRows: 1,
+			wantText: "folded",
+		},
+		{
+			name:     "TurnStarted subagent hand-back commits no row",
+			event:    event.TurnStarted{Header: event.Header{TriggeredByLoopID: subagent}, InputID: callID(1), Message: userMsg("handback")},
+			wantRows: 0,
+		},
+		{
+			name:     "TurnFoldedInto subagent hand-back commits no row",
+			event:    event.TurnFoldedInto{Header: event.Header{TriggeredByLoopID: subagent}, InputID: callID(1), Message: userMsg("handback")},
+			wantRows: 0,
+		},
+		{
+			name:     "TurnStarted nil message commits no row",
+			event:    event.TurnStarted{Header: event.Header{TriggeredByLoopID: primary}, InputID: callID(1)},
+			wantRows: 0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			var m transcriptModel
+			m = m.ApplyEvent(tt.event)
+			if got := kindUserCount(m); got != tt.wantRows {
+				t.Fatalf("kindUser rows = %d, want %d", got, tt.wantRows)
+			}
+			if tt.wantRows == 1 {
+				e := m.committed[len(m.committed)-1]
+				if got := blockText(e.Blocks[0]); got != tt.wantText {
+					t.Errorf("committed user row text = %q, want %q", got, tt.wantText)
+				}
+			}
+		})
+	}
+}
+
+// TestTranscriptQueuedAffordance locks the full queued-input lifecycle: RecordSubmit
+// then InputQueued shows the affordance; a later TurnStarted promotes it to exactly
+// one committed user row (from the event Message) and clears the affordance. It also
+// covers the race where InputQueued arrives BEFORE RecordSubmit — the affordance
+// stays hidden (blockless) until the blocks land, then shows.
+func TestTranscriptQueuedAffordance(t *testing.T) {
+	id := callID(0x42)
+
+	t.Run("RecordSubmit then InputQueued then TurnStarted", func(t *testing.T) {
+		t.Parallel()
+		var m transcriptModel
+		m = m.RecordSubmit(id, userBlocks("queued one"))
+		// Not shown until InputQueued.
+		if got := queuedTexts(m); len(got) != 0 {
+			t.Fatalf("queued before InputQueued = %v, want none (not shown yet)", got)
+		}
+		m = m.ApplyEvent(event.InputQueued{InputID: id})
+		if got := queuedTexts(m); len(got) != 1 || got[0] != "queued one" {
+			t.Fatalf("queued after InputQueued = %v, want [queued one]", got)
+		}
+		// TurnStarted promotes to one committed row and clears the affordance.
+		m = m.ApplyEvent(event.TurnStarted{InputID: id, Message: userMsg("queued one")})
+		if got := kindUserCount(m); got != 1 {
+			t.Errorf("kindUser rows = %d, want exactly 1 (promoted once)", got)
+		}
+		if got := queuedTexts(m); len(got) != 0 {
+			t.Errorf("queued after TurnStarted = %v, want none (affordance cleared)", got)
+		}
+	})
+
+	t.Run("InputQueued races ahead of RecordSubmit", func(t *testing.T) {
+		t.Parallel()
+		var m transcriptModel
+		// InputQueued arrives first: a shown-but-blockless placeholder; render skips it.
+		m = m.ApplyEvent(event.InputQueued{InputID: id})
+		if got := queuedTexts(m); len(got) != 0 {
+			t.Fatalf("queued with no blocks yet = %v, want none (blockless placeholder skipped)", got)
+		}
+		// RecordSubmit fills the blocks: now it shows.
+		m = m.RecordSubmit(id, userBlocks("late blocks"))
+		if got := queuedTexts(m); len(got) != 1 || got[0] != "late blocks" {
+			t.Errorf("queued after late RecordSubmit = %v, want [late blocks]", got)
+		}
+	})
+}
+
+// TestTranscriptInputCancelled locks that InputCancelled drops the queued affordance
+// and commits NO row — a retracted/returned input simply disappears from the pending
+// area.
+func TestTranscriptInputCancelled(t *testing.T) {
+	t.Parallel()
+	id := callID(0x55)
+
+	var m transcriptModel
+	m = m.RecordSubmit(id, userBlocks("cancel me"))
+	m = m.ApplyEvent(event.InputQueued{InputID: id})
+	if got := queuedTexts(m); len(got) != 1 {
+		t.Fatalf("setup: queued = %v, want one", got)
+	}
+	m = m.ApplyEvent(event.InputCancelled{InputID: id, Reason: event.CancelClientRetracted, Message: userMsg("cancel me")})
+	if got := queuedTexts(m); len(got) != 0 {
+		t.Errorf("queued after InputCancelled = %v, want none (affordance dropped)", got)
+	}
+	if got := kindUserCount(m); got != 0 {
+		t.Errorf("kindUser rows = %d, want 0 (cancelled input commits no row)", got)
+	}
+}
+
+// TestTranscriptTurnRejected locks that TurnRejected drops the affordance AND commits
+// an error notice naming the reason — a rejected message must not silently vanish.
+func TestTranscriptTurnRejected(t *testing.T) {
+	id := callID(0x66)
+
+	tests := []struct {
+		name   string
+		reason event.RejectReason
+		want   string
+	}{
+		{name: "busy", reason: event.RejectBusy, want: "loop busy"},
+		{name: "queue full", reason: event.RejectQueueFull, want: "queue full"},
+		{name: "shutting down", reason: event.RejectShuttingDown, want: "shutting down"},
+		{name: "internal", reason: event.RejectInternal, want: "internal error"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			var m transcriptModel
+			m = m.RecordSubmit(id, userBlocks("rejected"))
+			m = m.ApplyEvent(event.InputQueued{InputID: id})
+			m = m.ApplyEvent(event.TurnRejected{InputID: id, Reason: tt.reason})
+
+			if got := queuedTexts(m); len(got) != 0 {
+				t.Errorf("queued after TurnRejected = %v, want none (affordance dropped)", got)
+			}
+			if got := kindUserCount(m); got != 0 {
+				t.Errorf("kindUser rows = %d, want 0 (a rejected message is surfaced as a notice, not a user row)", got)
+			}
+			rec := m.committed[len(m.committed)-1]
+			if rec.Kind != kindNotice || rec.Level != noticeError {
+				t.Fatalf("last committed = (kind %d, level %d), want (kindNotice, noticeError)", rec.Kind, rec.Level)
+			}
+			text := blockText(rec.Blocks[0])
+			if !strings.Contains(text, tt.want) {
+				t.Errorf("rejection notice = %q, want it to mention %q", text, tt.want)
+			}
+		})
+	}
+}
+
+// TestTranscriptRecordSubmitValueCopy locks the value-copy contract on the queued
+// slice: RecordSubmit returns a new model whose queue mutation does not alias the
+// prior model's backing array — a parent transcriptModel value kept around stays
+// unchanged after a child records another submit.
+func TestTranscriptRecordSubmitValueCopy(t *testing.T) {
+	t.Parallel()
+
+	base := transcriptModel{}.RecordSubmit(callID(1), userBlocks("first"))
+	base = base.ApplyEvent(event.InputQueued{InputID: callID(1)})
+
+	// Branch a child off base, recording a second submit. base must not gain it.
+	child := base.RecordSubmit(callID(2), userBlocks("second"))
+	child = child.ApplyEvent(event.InputQueued{InputID: callID(2)})
+
+	if got := queuedTexts(base); len(got) != 1 || got[0] != "first" {
+		t.Errorf("base queued = %v, want [first] (child must not mutate base's backing array)", got)
+	}
+	if got := queuedTexts(child); len(got) != 2 {
+		t.Errorf("child queued = %v, want two entries", got)
+	}
+}
