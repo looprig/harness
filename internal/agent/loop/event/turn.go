@@ -19,10 +19,19 @@ type TurnStarted struct {
 	Message   *content.UserMessage
 }
 
-// StepDone is the enduring event emitted when runLoop commits a completed step's
-// finalized group: the step's single AIMessage followed by its ToolResultMessages.
-// It is emitted at the same actor-owned point the messages are appended to
-// loopState.msgs, so it is never a lie.
+// StepDone is the enduring event emitted when a completed step's finalized group
+// is committed: the step's single AIMessage followed by its ToolResultMessages.
+// It is emitted at step completion (the actor-owned commit point once the commit
+// handshake lands), so it is never a lie.
+//
+// SECURITY: StepDone carries message content (an AIMessage whose ToolUseBlocks
+// hold raw tool arguments, and ToolResultMessages holding tool output). The
+// loop-machine spec DELIBERATELY does NOT add a Redactable projection here — the
+// "Redaction deferred and risk accepted" decision routes this (and the other
+// content-bearing events TurnStarted/TurnFoldedInto/InputCancelled) to existing
+// best-effort sinks unredacted, with re-homing owned by the journal/redaction
+// follow-on (TODO(Open Items B)). Do NOT make StepDone implement Redactable in
+// this phase; TestRedactableImplementations enforces that.
 type StepDone struct {
 	enduring
 	loopScoped

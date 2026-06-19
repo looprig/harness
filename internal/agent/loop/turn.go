@@ -94,8 +94,10 @@ func runTurn(
 		toolUses := st.blocks.ToolUses()
 
 		// Text-only completion ALWAYS wins, regardless of iteration count: the runaway
-		// cap is only checked when the model wants ANOTHER tool batch.
+		// cap is only checked when the model wants ANOTHER tool batch. Emit the step's
+		// StepDone (its group is just the AIMessage) before the turn terminal.
 		if len(toolUses) == 0 {
+			emit(stepDoneEvent(st))
 			return msgs, event.TurnDone{TurnIndex: turnIndex, Message: aiMsg}
 		}
 
@@ -124,9 +126,33 @@ func runTurn(
 			return rollback(), event.TurnInterrupted{TurnIndex: turnIndex}
 		}
 		for _, r := range results {
-			msgs = append(msgs, toolResultMessage(r))
+			trm := toolResultMessage(r)
+			st.msgs = append(st.msgs, trm)
+			msgs = append(msgs, trm)
 		}
+		// The step is now COMPLETE (AIMessage finalized AND its tool results
+		// appended): emit its StepDone carrying the full group.
+		emit(stepDoneEvent(st))
 		// Loop: the next stream lets the model react to the tool results.
+	}
+}
+
+// stepDoneEvent builds the Enduring StepDone for one COMPLETED step: its Header is
+// stamped from the step's identity (SessionID/LoopID/TurnID/StepID), and Messages
+// is the finalized step group (the single AIMessage followed by its
+// ToolResultMessages). The Messages slice is a fresh copy so a consumer cannot
+// mutate the turn's live history through the event.
+func stepDoneEvent(st stepState) event.StepDone {
+	group := make(content.AgenticMessages, len(st.msgs))
+	copy(group, st.msgs)
+	return event.StepDone{
+		Header: event.Header{
+			SessionID: st.sessionID,
+			LoopID:    st.loopID,
+			TurnID:    st.turnID,
+			StepID:    st.id,
+		},
+		Messages: group,
 	}
 }
 

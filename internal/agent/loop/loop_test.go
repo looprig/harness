@@ -688,9 +688,10 @@ func TestTurnFailedProviderErrorTyped(t *testing.T) {
 // TestLeakedReaderDoesNotWedgeActor guards review fix #1: deliverAndClose's
 // ctx.Done() escape. The caller leaks the stream (never reads Events past the
 // buffer, never closes Abandoned). Events is buffered to EXACTLY the count of
-// non-terminal events (TurnStarted + 1 TokenDelta) so the turn goroutine
-// completes and the actor enters deliverAndClose, where the terminal send
-// blocks on the full unread buffer. Only the ctx.Done() escape can free it.
+// non-terminal events (TurnStarted + 1 TokenDelta + 1 StepDone for the single
+// no-tool step) so the turn goroutine completes and the actor enters
+// deliverAndClose, where the terminal send blocks on the full unread buffer. Only
+// the ctx.Done() escape can free it.
 func TestLeakedReaderDoesNotWedgeActor(t *testing.T) {
 	t.Parallel()
 	sink := &captureSink{}
@@ -707,7 +708,7 @@ func TestLeakedReaderDoesNotWedgeActor(t *testing.T) {
 		t.Fatalf("New: %v", err)
 	}
 
-	ev := make(chan event.Event, 2) // exactly TurnStarted + 1 TokenDelta; terminal cannot fit
+	ev := make(chan event.Event, 3) // exactly TurnStarted + 1 TokenDelta + 1 StepDone; terminal cannot fit
 	ack := make(chan error, 1)
 	ab := make(chan struct{}) // never closed -> leaked reader
 	l.Commands <- command.StartTurn{Ctx: context.Background(), Input: nil, Events: ev, Abandoned: ab, Ack: ack}

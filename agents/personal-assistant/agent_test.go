@@ -153,13 +153,17 @@ func TestStreamOrderedEvents(t *testing.T) {
 			kinds = append(kinds, "started")
 		case event.TokenDelta:
 			kinds = append(kinds, "delta")
+		case event.StepDone:
+			kinds = append(kinds, "stepdone")
 		case event.TurnDone:
 			kinds = append(kinds, "done")
 		default:
 			t.Fatalf("unexpected event %T", ev)
 		}
 	}
-	want := []string{"started", "delta", "delta", "done"}
+	// The single no-tool step emits its enduring StepDone after its deltas and
+	// before the turn terminal.
+	want := []string{"started", "delta", "delta", "stepdone", "done"}
 	if !equalStrings(kinds, want) {
 		t.Errorf("events = %v, want %v", kinds, want)
 	}
@@ -364,13 +368,17 @@ func TestStreamBlocksOrderedEvents(t *testing.T) {
 			if tc, ok := e.Chunk.(*content.TextChunk); ok {
 				delta.WriteString(tc.Text)
 			}
+		case event.StepDone:
+			kinds = append(kinds, "stepdone")
 		case event.TurnDone:
 			kinds = append(kinds, "done")
 		default:
 			t.Fatalf("unexpected event %T", ev)
 		}
 	}
-	want := []string{"started", "delta", "delta", "done"}
+	// The single no-tool step emits its enduring StepDone after its deltas and
+	// before the turn terminal.
+	want := []string{"started", "delta", "delta", "stepdone", "done"}
 	if !equalStrings(kinds, want) {
 		t.Errorf("events = %v, want %v", kinds, want)
 	}

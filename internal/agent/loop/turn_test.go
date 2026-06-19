@@ -20,7 +20,7 @@ func drainEmit(events *[]event.Event) func(event.Event) {
 }
 
 // testIdentity mints a fresh (session, loop, turn) identity for a runTurn call so
-// emitted step events carry non-zero, consistent ids. It panics on the
+// emitted StepDone Headers carry non-zero, consistent ids. It panics on the
 // near-impossible crypto/rand failure (acceptable in a test helper).
 func testIdentity() turnIdentity {
 	must := func() uuid.UUID {
@@ -31,6 +31,17 @@ func testIdentity() turnIdentity {
 		return id
 	}
 	return turnIdentity{sessionID: must(), loopID: must(), turnID: must()}
+}
+
+// stepDones returns the StepDone events from an emitted-event slice, in order.
+func stepDones(emitted []event.Event) []event.StepDone {
+	var out []event.StepDone
+	for _, e := range emitted {
+		if sd, ok := e.(event.StepDone); ok {
+			out = append(out, sd)
+		}
+	}
+	return out
 }
 
 // ---------------------------------------------------------------------------
@@ -183,7 +194,8 @@ func TestRunTurnAgentic(t *testing.T) {
 			{textChunk("all done")},                      // iter2: text-only → TurnDone
 		}}
 		var emitted []event.Event
-		msgs, terminal := runTurn(context.Background(), input, 1, testIdentity(), nil, cfg, client, noGateReg(), drainEmit(&emitted))
+		id := testIdentity()
+		msgs, terminal := runTurn(context.Background(), input, 1, id, nil, cfg, client, noGateReg(), drainEmit(&emitted))
 
 		done, ok := terminal.(event.TurnDone)
 		if !ok {
@@ -191,6 +203,52 @@ func TestRunTurnAgentic(t *testing.T) {
 		}
 		if echo.runCount() != 1 {
 			t.Errorf("echo ran %d times, want 1", echo.runCount())
+		}
+
+		// A multi-step (tool-using) turn emits one StepDone per completed step, then
+		// the single turn terminal. Step 0 is the tool step (its group is the
+		// AIMessage + its ToolResultMessage); step 1 is the final text step (group is
+		// just the AIMessage).
+		sds := stepDones(emitted)
+		if len(sds) != 2 {
+			t.Fatalf("StepDone count = %d, want 2 (one per completed step)", len(sds))
+		}
+		// Every StepDone is stamped from the turn identity, with distinct, non-zero
+		// StepIDs.
+		seenStepIDs := map[uuid.UUID]struct{}{}
+		for i, sd := range sds {
+			if sd.SessionID != id.sessionID || sd.LoopID != id.loopID || sd.TurnID != id.turnID {
+				t.Errorf("StepDone[%d] Header ids = (s=%v l=%v t=%v), want (s=%v l=%v t=%v)",
+					i, sd.SessionID, sd.LoopID, sd.TurnID, id.sessionID, id.loopID, id.turnID)
+			}
+			if sd.StepID.IsZero() {
+				t.Errorf("StepDone[%d] StepID is zero", i)
+			}
+			if _, dup := seenStepIDs[sd.StepID]; dup {
+				t.Errorf("StepDone[%d] StepID %v duplicated", i, sd.StepID)
+			}
+			seenStepIDs[sd.StepID] = struct{}{}
+		}
+		// Step 0's group: the tool-use AIMessage followed by its ToolResultMessage.
+		if len(sds[0].Messages) != 2 {
+			t.Fatalf("StepDone[0].Messages len = %d, want 2 (AIMessage + ToolResultMessage)", len(sds[0].Messages))
+		}
+		if _, ok := sds[0].Messages[0].(*content.AIMessage); !ok {
+			t.Errorf("StepDone[0].Messages[0] = %T, want *AIMessage", sds[0].Messages[0])
+		}
+		trm, ok := sds[0].Messages[1].(*content.ToolResultMessage)
+		if !ok {
+			t.Fatalf("StepDone[0].Messages[1] = %T, want *ToolResultMessage", sds[0].Messages[1])
+		}
+		if trm.ToolUseID != "id-1" {
+			t.Errorf("StepDone[0] tool result ToolUseID = %q, want %q", trm.ToolUseID, "id-1")
+		}
+		// Step 1's group: just the final text AIMessage.
+		if len(sds[1].Messages) != 1 {
+			t.Fatalf("StepDone[1].Messages len = %d, want 1 (final AIMessage only)", len(sds[1].Messages))
+		}
+		if sds[1].Messages[0] != done.Message {
+			t.Errorf("StepDone[1].Messages[0] must be the final assistant message (== TurnDone.Message)")
 		}
 		// history: user, assistant(tool_use), tool message, assistant(text)
 		if len(msgs) != 4 {
@@ -279,6 +337,14 @@ func TestRunTurnAgentic(t *testing.T) {
 		tu, tmCount := countToolUseInHistory(msgs)
 		if tu != 0 || tmCount != 0 {
 			t.Errorf("after rollback: %d tool_use, %d tool messages, want 0/0", tu, tmCount)
+		}
+		// The cap fires on the 4th iteration (maxIters=3): iterations 1-3 are
+		// COMPLETED tool steps that each emit a StepDone before the cap check on the
+		// uncompleted 4th. (Phase 7 emits StepDone directly via emit, so they fire
+		// even though the whole-turn rollback discards them from msgs; the per-step
+		// commit that makes the two atomic is Phase 8.)
+		if got := len(stepDones(emitted)); got != 3 {
+			t.Errorf("StepDone count = %d, want 3 (the 3 completed tool steps before the cap)", got)
 		}
 	})
 
@@ -426,6 +492,11 @@ func TestRunTurnAgentic(t *testing.T) {
 		if tu != 0 || tmCount != 0 {
 			t.Errorf("after interrupt rollback: %d tool_use, %d tool messages, want 0/0", tu, tmCount)
 		}
+		// Step 0 (the tool step) COMPLETED before iter2's stream was interrupted, so
+		// exactly one StepDone was emitted; the interrupted step 1 emits none.
+		if got := len(stepDones(emitted)); got != 1 {
+			t.Errorf("StepDone count = %d, want 1 (only the completed step 0)", got)
+		}
 	})
 
 	t.Run("toolDefs maps registry → req.Tools (the client receives the tool defs)", func(t *testing.T) {
@@ -498,7 +569,8 @@ func TestRunTurn(t *testing.T) {
 		t.Parallel()
 		client := &fakeLLM{chunks: []content.Chunk{textChunk("hel"), textChunk("lo")}}
 		var emitted []event.Event
-		msgs, terminal := runTurn(context.Background(), input, 1, testIdentity(), nil, cfg, client, noGateReg(), drainEmit(&emitted))
+		id := testIdentity()
+		msgs, terminal := runTurn(context.Background(), input, 1, id, nil, cfg, client, noGateReg(), drainEmit(&emitted))
 
 		done, ok := terminal.(event.TurnDone)
 		if !ok {
@@ -517,6 +589,37 @@ func TestRunTurn(t *testing.T) {
 		}
 		if tb.Text != "hello" {
 			t.Errorf("assembled text = %q, want %q", tb.Text, "hello")
+		}
+		// A single-step, no-tool turn emits exactly one StepDone (its Messages is
+		// just the AIMessage), stamped from the turn identity, then the terminal.
+		sds := stepDones(emitted)
+		if len(sds) != 1 {
+			t.Fatalf("StepDone count = %d, want 1 (single no-tool step)", len(sds))
+		}
+		if len(sds[0].Messages) != 1 {
+			t.Fatalf("StepDone.Messages len = %d, want 1 (AIMessage only)", len(sds[0].Messages))
+		}
+		if sds[0].Messages[0] != done.Message {
+			t.Errorf("StepDone.Messages[0] must be the assistant message (== TurnDone.Message)")
+		}
+		if sds[0].SessionID != id.sessionID || sds[0].LoopID != id.loopID || sds[0].TurnID != id.turnID || sds[0].StepID.IsZero() {
+			t.Errorf("StepDone Header ids not stamped from identity: %+v", sds[0].Header)
+		}
+		// StepDone is emitted AFTER the step's TokenDeltas and BEFORE the terminal.
+		var sawDelta, sawStepDone bool
+		for _, e := range emitted {
+			switch e.(type) {
+			case event.TokenDelta:
+				sawDelta = true
+				if sawStepDone {
+					t.Error("TokenDelta emitted after StepDone for the same step")
+				}
+			case event.StepDone:
+				sawStepDone = true
+				if !sawDelta {
+					t.Error("StepDone emitted before any TokenDelta")
+				}
+			}
 		}
 	})
 
@@ -538,6 +641,10 @@ func TestRunTurn(t *testing.T) {
 		if len(msgs) != 0 {
 			t.Errorf("history len = %d, want 0 (user rolled back)", len(msgs))
 		}
+		// The step never finalized an AIMessage, so no StepDone is emitted.
+		if got := len(stepDones(emitted)); got != 0 {
+			t.Errorf("StepDone count = %d, want 0 (step never completed)", got)
+		}
 	})
 
 	t.Run("empty response rolls back and returns EmptyResponseError", func(t *testing.T) {
@@ -556,6 +663,10 @@ func TestRunTurn(t *testing.T) {
 		}
 		if len(msgs) != 0 {
 			t.Errorf("history len = %d, want 0 (user rolled back)", len(msgs))
+		}
+		// An empty response is not a completed step → no StepDone.
+		if got := len(stepDones(emitted)); got != 0 {
+			t.Errorf("StepDone count = %d, want 0 (empty response is not a completed step)", got)
 		}
 	})
 
