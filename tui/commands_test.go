@@ -80,6 +80,15 @@ func TestSubNextClosed(t *testing.T) {
 	}
 }
 
+// TestSubNextNilIsNoop guards the /clear re-subscribe window: a re-arm built from a
+// transiently-nil m.sub must be a no-op (nil msg), never a nil-deref panic.
+func TestSubNextNilIsNoop(t *testing.T) {
+	t.Parallel()
+	if msg := subNext(nil)(); msg != nil {
+		t.Fatalf("subNext(nil)() = %v, want nil (no-op, no panic)", msg)
+	}
+}
+
 // TestSubscribeCmd covers the startup subscribe: it forwards the single-loop
 // DefaultEventFilter (built from PrimaryLoopID) and reports the outcome. On success
 // the stream is carried on the msg; on error the err is carried and the stream is nil.

@@ -62,6 +62,13 @@ func subscribeCmd(agent Agent) tea.Cmd {
 // the subscription is whole-session.
 func subNext(sub EventStream) tea.Cmd {
 	return func() tea.Msg {
+		// Defensive: during the /clear re-subscribe window m.sub is briefly nil
+		// (closed, awaiting the new subscribedMsg). A re-arm constructed from that
+		// transient nil must be a no-op, not a nil-deref panic — the fresh
+		// subscription's reader is started by handleSubscribed.
+		if sub == nil {
+			return nil
+		}
 		ev, ok := <-sub.Events()
 		if !ok {
 			return subClosedMsg{err: sub.Err()}

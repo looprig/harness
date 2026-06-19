@@ -182,7 +182,14 @@ func (m *Screen) handleEvent(ev event.Event) tea.Cmd {
 	m.transcript = m.transcript.ApplyEvent(ev)
 	m.interaction = m.interaction.ApplyEvent(ev)
 	statusCmd := m.applyTurnStatus(ev)
-	return tea.Batch(subNext(m.sub), statusCmd, m.flush())
+	// Re-arm only while a live subscription is installed: during the /clear window
+	// m.sub is transiently nil, and the fresh subscription's reader is (re)started
+	// by handleSubscribed, not here. subNext is also nil-guarded as a backstop.
+	var rearm tea.Cmd
+	if m.sub != nil {
+		rearm = subNext(m.sub)
+	}
+	return tea.Batch(rearm, statusCmd, m.flush())
 }
 
 // applyTurnStatus derives the turn status from a turn-lifecycle event for the
