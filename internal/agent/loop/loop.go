@@ -293,7 +293,30 @@ func listen(ctx context.Context, cfg Config, commands <-chan command.Command, ga
 	// is the only goroutine touching inbox/draining when it runs.
 	drains := make(chan drainRequest)
 
+	// publishHub sends a FULL-FIDELITY loop event to the session-level event fan-in.
+	// Producer identity is stamped here from loopState/the active turn (the actor IS
+	// the loop producer — this is the loop stamping its own identity, not the hub
+	// inferring it), so the hub's EventFilter (per-loop LoopID) and its applyActivity
+	// quiescence transitions (TurnStarted/LoopIdle/TurnFoldedInto/InputCancelled) see
+	// the ids they need. The hub is non-blocking and class-aware (Ephemeral drop /
+	// Enduring fail-close), so this NEVER blocks the actor. SessionStarted is NOT sent
+	// here: the loop's startup SessionStarted is sink-only; the session owns the
+	// session-scoped SessionStarted it delivers to the hub's subscribers. PublishEvent
+	// returns nil even with no subscribers (the headless case), so a non-nil error is
+	// a genuine fault; log it and continue (event publication must not abort the loop).
+	publishHub := func(ev event.Event) {
+		if _, ok := ev.(event.SessionStarted); ok {
+			return
+		}
+		if err := state.events.PublishEvent(ctx, stampLoopHeader(ev, state.sessionID, state.id, state.turnID)); err != nil {
+			slog.Error("loop event publish to session fan-in failed", "error", err)
+		}
+	}
+
 	publish := func(ev event.Event) {
+		// Full-fidelity loop events go to the session fan-in FIRST (header-stamped,
+		// non-blocking), then the redacted envelope goes to sinks below.
+		publishHub(ev)
 		// SECURITY: the sink path is redacted; the per-turn stream (handled
 		// separately by emit/deliverAndClose) keeps full fidelity. projectForSink
 		// replaces any event.Redactable with its SinkProjection so tool args, file
@@ -403,6 +426,20 @@ func listen(ctx context.Context, cfg Config, commands <-chan command.Command, ga
 		abandoned := make(chan struct{})
 		close(abandoned)
 		state.turnAbandoned = abandoned
+	}
+
+	// emitLoopIdle announces the loop's running->idle transition: an Enduring,
+	// non-terminal LoopIdle carrying only the loop's identity (SessionID + LoopID;
+	// TurnID is zero — it is loop-scoped, not turn-scoped). The session quiescence
+	// model removes this loop's {loop, LoopID} activity key on it, so a primary-only
+	// synchronous session reaches SessionIdle exactly when the primary loop parks. It
+	// goes to the hub (quiescence) and to sinks (observability), never to the per-turn
+	// stream (the turn is already over and its stream closed). It is emitted ONLY on a
+	// genuine running->idle transition: never between chained turns (running->running),
+	// and shutdown-induced idling does not emit it because the actor returns before
+	// reaching the emit point (or has already flipped to SessionStopped at the session).
+	emitLoopIdle := func() {
+		publish(event.LoopIdle{Header: event.Header{SessionID: state.sessionID, LoopID: state.id}})
 	}
 
 	ackShutdowns := func(err error) {
@@ -896,6 +933,13 @@ func listen(ctx context.Context, cfg Config, commands <-chan command.Command, ga
 			//   - abnormal terminal (TurnFailed/TurnInterrupted): return EVERY queued
 			//     entry via InputCancelled and auto-start nothing — the client decides
 			//     whether to resend.
+			//
+			// chained tracks whether the actor immediately started a new turn from the
+			// queue (running -> running). When it did, the loop did NOT go idle, so it
+			// must NOT emit LoopIdle between the chained turns (quiescence would briefly
+			// and wrongly see the loop idle). LoopIdle is emitted ONLY when the loop
+			// actually parks idle (no chained turn).
+			chained := false
 			if _, normal := result.terminal.(event.TurnDone); normal {
 				if next, ok := popFront(); ok {
 					// Inbox-exit invariant: next is now REMOVED from the inbox, so it
@@ -912,10 +956,19 @@ func listen(ctx context.Context, cfg Config, commands <-chan command.Command, ga
 						slog.Error("turn id generation failed starting queued input; returning it", "error", err)
 						returnEntry(next, event.CancelTurnFailed, endedTurnID)
 						returnQueuedInbox(event.CancelTurnFailed, endedTurnID)
+					} else {
+						chained = true // running -> running; no LoopIdle between turns
 					}
 				}
 			} else {
 				returnQueuedInbox(cancelReasonFor(result.terminal), endedTurnID)
+			}
+			// Running -> idle transition: the loop parked with no active turn. Announce
+			// LoopIdle (Enduring, non-terminal) AFTER the terminal so the session
+			// quiescence model removes this loop's {loop, LoopID} activity key. A chained
+			// turn stayed running (chained == true), so it emits no LoopIdle.
+			if !chained {
+				emitLoopIdle()
 			}
 
 		case <-ctx.Done():

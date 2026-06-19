@@ -283,11 +283,13 @@ func TestEnvelopeCorrelationStamped(t *testing.T) {
 		t.Fatal("terminal != TurnDone")
 	}
 
-	// Collect only the turn's envelopes (skip the session-level SessionStarted,
-	// which has no active turn so carries zero TurnID/CausationID).
+	// Collect only the turn's envelopes. Skip the session-level SessionStarted and the
+	// loop-scoped LoopIdle (the running->idle announcement): both have no active turn,
+	// so they carry zero TurnID/CausationID by design and are not turn envelopes.
 	var turnEnvs []event.EventEnvelope
 	for _, e := range sink.events() {
-		if _, ok := e.Event.(event.SessionStarted); ok {
+		switch e.Event.(type) {
+		case event.SessionStarted, event.LoopIdle:
 			continue
 		}
 		turnEnvs = append(turnEnvs, e)
@@ -484,7 +486,10 @@ func TestEventIDGenerationFailureBestEffort(t *testing.T) {
 	// were emitted best-effort with a zero EventID rather than dropped).
 	var sawTurnEnv, sawZeroEventID bool
 	for _, e := range sink.events() {
-		if _, ok := e.Event.(event.SessionStarted); ok {
+		// SessionStarted and the loop-scoped LoopIdle are not turn envelopes (no active
+		// turn -> zero TurnID by design); skip both.
+		switch e.Event.(type) {
+		case event.SessionStarted, event.LoopIdle:
 			continue
 		}
 		sawTurnEnv = true

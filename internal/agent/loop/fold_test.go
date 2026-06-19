@@ -36,6 +36,26 @@ func newFoldLoop(t *testing.T, client llm.LLM, ts ToolSet) (*Loop, *captureSink)
 	return l, sink
 }
 
+// waitForRequests polls the scripted client until it has recorded at least n
+// requests, or fails. The continuation request after a fold is issued asynchronously
+// (after the fold commits), so a test must wait for it rather than read once.
+func waitForRequests(t *testing.T, client *scriptedLLM, n int) []llm.Request {
+	t.Helper()
+	deadline := time.After(2 * time.Second)
+	for {
+		reqs := client.requests()
+		if len(reqs) >= n {
+			return reqs
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("recorded %d requests, want >= %d (initial + continuation)", len(reqs), n)
+			return nil
+		case <-time.After(2 * time.Millisecond):
+		}
+	}
+}
+
 // TestFoldAtToolContinuation proves the core fold behavior: input queued behind a
 // running tool-using turn folds at the tool-continuation boundary. After the tool
 // step commits, runTurn drains the inbox and emits event.TurnFoldedInto for the
@@ -97,10 +117,10 @@ func TestFoldAtToolContinuation(t *testing.T) {
 	// The continuation request (step 1) carries the folded UserMessage AFTER the tool
 	// result and BEFORE the next assistant message. History at that point is:
 	//   user(turn1), AI(tool_use id-1), tool(id-1), user(folded)
-	reqs := client.requests()
-	if len(reqs) < 2 {
-		t.Fatalf("recorded %d requests, want >= 2 (initial + continuation)", len(reqs))
-	}
+	// The continuation request is issued AFTER the fold commits (TurnFoldedInto is
+	// emitted at the commit point, before runTurn loops to the next runStep), so wait
+	// for the second request to be recorded rather than reading once.
+	reqs := waitForRequests(t, client, 2)
 	cont := reqs[1].Messages
 	wantKinds := []string{"user", "ai", "tool", "user"}
 	if len(cont) != len(wantKinds) {
