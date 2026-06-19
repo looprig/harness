@@ -13,72 +13,128 @@ import (
 	"github.com/inventivepotter/urvi/internal/uuid"
 )
 
-// cancelQueuedInput sends a CancelQueuedInput for inputID and returns the result.
-func cancelQueuedInput(t *testing.T, l *Loop, inputID uuid.UUID) command.CancelResult {
+// cancelQueuedInput sends a fire-and-forget CancelQueuedInput for inputID. The
+// retract carries no Ack: its outcome is the published event.InputCancelled
+// {CancelClientRetracted} (keyed by InputID) when the input was still queued, and
+// nothing at all when it had already started/folded or was never queued (the
+// issuer infers "already committed" from the prior TurnStarted/TurnFoldedInto it
+// already saw for that InputID).
+func cancelQueuedInput(t *testing.T, l *Loop, inputID uuid.UUID) {
 	t.Helper()
-	ack := make(chan command.CancelResult, 1)
-	l.Commands <- command.CancelQueuedInput{Header: command.Header{ID: mustID(t)}, InputID: inputID, Ack: ack}
-	select {
-	case r := <-ack:
-		return r
-	case <-time.After(2 * time.Second):
-		t.Fatal("CancelQueuedInput result not received")
-		return nil
-	}
+	l.Commands <- command.CancelQueuedInput{Header: command.Header{ID: mustID(t)}, InputID: inputID}
 }
 
-// TestCancelWhileQueuedReturnsCancelled: a CancelQueuedInput for a still-queued
-// submit returns Cancelled and emits event.InputCancelled{CancelClientRetracted}
-// carrying the InputID and original Message; the entry is removed from the inbox
-// (a second cancel finds it already gone -> AlreadyCommitted).
-func TestCancelWhileQueuedReturnsCancelled(t *testing.T) {
+// hasInputCancelled reports whether evs contains an event.InputCancelled for
+// inputID with the given reason (and a non-nil echoed Message).
+func hasInputCancelled(evs []event.EventEnvelope, inputID uuid.UUID, reason event.CancelReason) bool {
+	for _, e := range evs {
+		if ic, ok := e.Event.(event.InputCancelled); ok &&
+			ic.InputID == inputID && ic.Reason == reason && ic.Message != nil {
+			return true
+		}
+	}
+	return false
+}
+
+// TestCancelWhileQueuedPublishesInputCancelled: a CancelQueuedInput for a
+// still-queued submit publishes event.InputCancelled{CancelClientRetracted}
+// carrying the InputID and original Message, and removes the entry from the inbox
+// (a second retract finds it gone and is a pure no-op — no second InputCancelled).
+func TestCancelWhileQueuedPublishesInputCancelled(t *testing.T) {
 	t.Parallel()
 	sink := &captureSink{}
 	l, _ := newLoop(t, &fakeLLM{blockUntilCancel: true}, sink)
 	ev1, _ := startTurn(t, l, context.Background(), nil) // occupy the loop
-	_ = ev1
+	go func() {
+		for range ev1 {
+		}
+	}()
 
-	// Queue an input.
+	// Queue an input behind the running turn.
 	queuedID := mustID(t)
 	l.Commands <- command.UserInput{Header: command.Header{ID: queuedID}, Mode: command.AllowFold, Blocks: textBlocks("retract me")}
 	if _, ok := awaitReply(t, sink, queuedID).(event.InputQueued); !ok {
 		t.Fatal("submit not queued")
 	}
 
-	// Cancel it while still queued.
-	r := cancelQueuedInput(t, l, queuedID)
-	if _, ok := r.(command.Cancelled); !ok {
-		t.Fatalf("cancel result = %T, want Cancelled", r)
-	}
-
-	// event.InputCancelled{CancelClientRetracted} must be emitted with the InputID.
+	// Retract it while still queued: the observable outcome is the published
+	// event.InputCancelled{CancelClientRetracted} for that InputID.
+	cancelQueuedInput(t, l, queuedID)
 	blockUntilSink(t, sink, func(evs []event.EventEnvelope) bool {
-		for _, e := range evs {
-			if ic, ok := e.Event.(event.InputCancelled); ok {
-				return ic.InputID == queuedID && ic.Reason == event.CancelClientRetracted && ic.Message != nil
-			}
-		}
-		return false
+		return hasInputCancelled(evs, queuedID, event.CancelClientRetracted)
 	})
 
-	// A second cancel finds it gone: AlreadyCommitted (it left the queue).
-	r2 := cancelQueuedInput(t, l, queuedID)
-	if _, ok := r2.(command.AlreadyCommitted); !ok {
-		t.Fatalf("second cancel result = %T, want AlreadyCommitted", r2)
+	// The entry left the inbox: a second retract is a no-op. Wait long enough that a
+	// (buggy) duplicate emit would have landed, then assert exactly one
+	// InputCancelled for queuedID ever appeared.
+	cancelQueuedInput(t, l, queuedID)
+	if !waitNoExtraInputCancelled(t, sink, queuedID, event.CancelClientRetracted, 1) {
+		t.Fatal("second retract published an extra InputCancelled for an already-removed input")
 	}
 }
 
-// TestCancelUnknownInputAlreadyCommitted: a CancelQueuedInput for an InputID not in
-// the inbox (never queued, or already started/committed) returns AlreadyCommitted.
-func TestCancelUnknownInputAlreadyCommitted(t *testing.T) {
+// TestCancelUnknownInputIsNoop: a CancelQueuedInput for an InputID not in the inbox
+// (never queued, or already started/committed) is a pure no-op — NO
+// event.InputCancelled is published for it. A real submit is queued first and its
+// InputQueued observed, proving the loop is alive and processing commands so the
+// absence of an InputCancelled for the unknown id is meaningful, not just latency.
+func TestCancelUnknownInputIsNoop(t *testing.T) {
 	t.Parallel()
-	l, _ := newLoop(t, &fakeLLM{blockUntilCancel: true})
+	sink := &captureSink{}
+	l, _ := newLoop(t, &fakeLLM{blockUntilCancel: true}, sink)
 	ev1, _ := startTurn(t, l, context.Background(), nil)
-	_ = ev1
+	go func() {
+		for range ev1 {
+		}
+	}()
 
-	r := cancelQueuedInput(t, l, mustID(t)) // never queued
-	if _, ok := r.(command.AlreadyCommitted); !ok {
-		t.Fatalf("cancel result = %T, want AlreadyCommitted", r)
+	// Prove the loop is alive: queue a real input and observe its InputQueued.
+	queuedID := mustID(t)
+	l.Commands <- command.UserInput{Header: command.Header{ID: queuedID}, Mode: command.AllowFold, Blocks: textBlocks("alive")}
+	if _, ok := awaitReply(t, sink, queuedID).(event.InputQueued); !ok {
+		t.Fatal("submit not queued")
+	}
+
+	// Retract an InputID that was NEVER queued: no-op.
+	unknownID := mustID(t)
+	cancelQueuedInput(t, l, unknownID)
+
+	// Round-trip a SECOND retract for the real queued id to flush the command
+	// channel past the unknown retract: once its InputCancelled lands we know the
+	// unknown retract was fully processed, so any InputCancelled for unknownID would
+	// already be in the sink.
+	cancelQueuedInput(t, l, queuedID)
+	blockUntilSink(t, sink, func(evs []event.EventEnvelope) bool {
+		return hasInputCancelled(evs, queuedID, event.CancelClientRetracted)
+	})
+	for _, e := range sink.events() {
+		if ic, ok := e.Event.(event.InputCancelled); ok && ic.InputID == unknownID {
+			t.Fatalf("unknown-input retract published InputCancelled %+v, want no-op", ic)
+		}
+	}
+}
+
+// waitNoExtraInputCancelled waits a short settling window and reports whether the
+// count of event.InputCancelled for (inputID, reason) stays at want. It returns
+// true if the count never exceeds want during the window.
+func waitNoExtraInputCancelled(t *testing.T, sink *captureSink, inputID uuid.UUID, reason event.CancelReason, want int) bool {
+	t.Helper()
+	deadline := time.After(200 * time.Millisecond)
+	for {
+		n := 0
+		for _, e := range sink.events() {
+			if ic, ok := e.Event.(event.InputCancelled); ok && ic.InputID == inputID && ic.Reason == reason {
+				n++
+			}
+		}
+		if n > want {
+			return false
+		}
+		select {
+		case <-deadline:
+			return true
+		case <-time.After(2 * time.Millisecond):
+		}
 	}
 }
 

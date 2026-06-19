@@ -8,15 +8,18 @@ import "github.com/inventivepotter/urvi/internal/uuid"
 // actor is the sole owner of the queue), so there is no session-side TOCTOU.
 //
 // Route selects the target loop; InputID names the queued submit to remove (it is
-// the submit command's Header.ID, returned in InputQueued.InputID). Ack is
-// required and must be buffered(1): the loop replies a CancelResult exactly once
-// via tryAck — Cancelled if the input was still queued and removed,
-// AlreadyCommitted if it had already started or folded.
+// the submit command's Header.ID, returned in InputQueued.InputID).
+//
+// It is fire-and-forget — there is no Ack. Its outcome is observable as events,
+// not a point-to-point reply: when the input was still queued the loop publishes
+// the Enduring event.InputCancelled{CancelClientRetracted} keyed by InputID. When
+// it had already started or folded into a turn — or was never queued — the retract
+// is a pure no-op: the issuer infers "already committed / unknown" from the
+// event.TurnStarted / event.TurnFoldedInto it already saw for that InputID.
 type CancelQueuedInput struct {
 	Header
 	Route   Route
 	InputID uuid.UUID
-	Ack     chan<- CancelResult
 }
 
 func (CancelQueuedInput) isCommand() {}

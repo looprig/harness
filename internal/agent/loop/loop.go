@@ -17,12 +17,13 @@ import (
 // never close Commands; stop the actor with Shutdown. (Closing it would exit the
 // actor through the `!ok` path, skipping terminal delivery and shutdown acks.)
 // Done is closed when the actor has fully exited.
-// Direct callers must honor the command contracts, including a buffered(1) Ack on
-// every submit (UserInput/SubagentResult) and CancelQueuedInput, and a paired
-// Events/Abandoned pair when supplying a per-turn stream.
-// Reply channels (the Ack on each command) must be buffered (capacity >= 1): the
-// actor replies through tryAck (a non-blocking send), so an unbuffered or unread
-// Ack drops the reply rather than stalling the actor.
+// Direct callers must honor the command contracts. The submit commands
+// (UserInput/SubagentResult) and CancelQueuedInput are fire-and-forget: their
+// outcomes are PUBLISHED as typed events onto the session fan-in, not replied on a
+// per-command channel. Only the control commands carry a reply channel — Interrupt
+// (Ack chan bool) and Shutdown (Ack chan error) — and each must be non-nil and
+// buffered(1) so the actor's direct send never stalls. A per-turn submit must also
+// supply a paired Events/Abandoned pair.
 type Loop struct {
 	Commands chan<- command.Command
 	Done     <-chan struct{}
@@ -907,11 +908,14 @@ func runLoop(cfg loopConfig, state loopState) {
 		}
 	}
 
-	// cancelQueued resolves a CancelQueuedInput against the actor-owned inbox. If
-	// the InputID is still queued it is removed and resolved via returnEntry
-	// (event.InputCancelled{CancelClientRetracted}, Header.TurnID zero — a pure
-	// retract outside a turn), replying Cancelled. If not found it has already
-	// started or folded, so the actor replies AlreadyCommitted with the active turn id.
+	// cancelQueued resolves a fire-and-forget CancelQueuedInput against the
+	// actor-owned inbox. If the InputID is still queued it is removed and resolved
+	// via returnEntry — the Enduring event.InputCancelled{CancelClientRetracted}
+	// (Header.TurnID zero — a pure retract outside a turn) IS the observable
+	// outcome. If not found, the input has already started or folded (or was never
+	// queued), so the retract is a no-op: the issuer infers "already committed /
+	// unknown" from the event.TurnStarted / event.TurnFoldedInto it already saw for
+	// that InputID. There is no reply channel.
 	cancelQueued := func(c command.CancelQueuedInput) {
 		for i, qi := range state.inbox {
 			if qi.inputID != c.InputID {
@@ -921,10 +925,10 @@ func runLoop(cfg loopConfig, state loopState) {
 			// Removed from the inbox by a retract: resolve it via returnEntry (the one
 			// return-emit point). TurnID is zero — a pure retract outside any turn.
 			returnEntry(qi, event.CancelClientRetracted, uuid.UUID{})
-			tryAck[command.CancelResult](c.Ack, command.Cancelled{})
 			return
 		}
-		tryAck[command.CancelResult](c.Ack, command.AlreadyCommitted{TurnID: state.turnID})
+		// Not queued: already started/folded or never queued. No-op — the outcome is
+		// observable via the prior TurnStarted/TurnFoldedInto for this InputID.
 	}
 
 	// resolveQueueAfterTurn resolves still-queued input once a NON-shutdown turn has
@@ -1038,8 +1042,9 @@ func runLoop(cfg loopConfig, state loopState) {
 
 			case command.CancelQueuedInput:
 				// Retract a still-queued submit. Resolved by the actor against its own
-				// inbox: Cancelled (+ InputCancelled) if still queued, else
-				// AlreadyCommitted. No Validate/no fire-and-route — it carries an Ack.
+				// inbox: if still queued it emits event.InputCancelled{CancelClientRetracted}
+				// and removes it; otherwise it is a no-op (already started/folded or never
+				// queued). Fire-and-forget — no reply channel.
 				cancelQueued(c)
 
 			case command.Interrupt:

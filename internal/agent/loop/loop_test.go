@@ -32,6 +32,16 @@ func (s *captureSink) events() []event.EventEnvelope {
 	return append([]event.EventEnvelope(nil), s.got...)
 }
 
+// mustID returns a fresh UUID or fails the test.
+func mustID(t *testing.T) uuid.UUID {
+	t.Helper()
+	u, err := uuid.New()
+	if err != nil {
+		t.Fatalf("uuid.New: %v", err)
+	}
+	return u
+}
+
 // panicSink panics on every OnEvent; the actor must recover and keep running.
 type panicSink struct{}
 

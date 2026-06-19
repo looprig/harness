@@ -16,7 +16,6 @@ func TestCancelQueuedInputSatisfiesCommand(t *testing.T) {
 	headerID := newID(t)
 	loopID := newID(t)
 	inputID := newID(t)
-	ack := make(chan command.CancelResult, 1)
 
 	tests := []struct {
 		name        string
@@ -27,14 +26,14 @@ func TestCancelQueuedInputSatisfiesCommand(t *testing.T) {
 	}{
 		{
 			name:        "fully addressed",
-			cmd:         command.CancelQueuedInput{Header: command.Header{ID: headerID}, Route: command.Route{LoopID: loopID}, InputID: inputID, Ack: ack},
+			cmd:         command.CancelQueuedInput{Header: command.Header{ID: headerID}, Route: command.Route{LoopID: loopID}, InputID: inputID},
 			wantHeader:  headerID,
 			wantLoopID:  loopID,
 			wantInputID: inputID,
 		},
 		{
 			name:        "zero header and route is boundary",
-			cmd:         command.CancelQueuedInput{InputID: inputID, Ack: ack},
+			cmd:         command.CancelQueuedInput{InputID: inputID},
 			wantHeader:  uuid.UUID{},
 			wantLoopID:  uuid.UUID{},
 			wantInputID: inputID,
