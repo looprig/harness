@@ -28,8 +28,11 @@ func (e *ConfigError) Error() string {
 }
 func (e *ConfigError) Unwrap() error { return e.Cause }
 
-// IDGenerationError is sent on StartTurn.Ack when the actor cannot mint a
-// TurnID from crypto/rand while accepting the turn. The turn is not started.
+// IDGenerationError is the typed cause logged when the actor cannot mint a TurnID
+// from crypto/rand while starting a turn from an accepted submit. The turn is not
+// started; the submit is rejected with a TurnRejected disposition. It remains a
+// distinct typed error so the failure is greppable/testable, even though it is no
+// longer carried on a reply channel (Disposition has no id-error variant).
 type IDGenerationError struct{ Cause error }
 
 func (e *IDGenerationError) Error() string {

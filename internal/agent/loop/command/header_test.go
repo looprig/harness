@@ -35,7 +35,9 @@ func TestHeaderPromotedOnCommands(t *testing.T) {
 			name string
 			cmd  Command
 		}{
-			{name: "StartTurn", cmd: StartTurn{Header: hc.header}},
+			{name: "UserInput", cmd: UserInput{Header: hc.header}},
+			{name: "SubagentResult", cmd: SubagentResult{Header: hc.header}},
+			{name: "CancelQueuedInput", cmd: CancelQueuedInput{Header: hc.header}},
 			{name: "Interrupt", cmd: Interrupt{Header: hc.header}},
 			{name: "Shutdown", cmd: Shutdown{Header: hc.header}},
 		}
