@@ -91,7 +91,9 @@ func (m *Message) UnmarshalJSON(data []byte) error {
 
 // toolResultMessageJSON is the wire form of ToolResultMessage. ToolResultMessage
 // defines its own codec pair so the promoted Message methods do not silently drop
-// ToolUseID.
+// ToolUseID. IsError uses omitempty, so a false value is omitted on the wire and an
+// absent field decodes back to false — a lossless round-trip for both values,
+// matching the sibling ToolResultBlock codec (block_json.go).
 type toolResultMessageJSON struct {
 	Role      Role            `json:"role"`
 	Blocks    json.RawMessage `json:"blocks,omitempty"`

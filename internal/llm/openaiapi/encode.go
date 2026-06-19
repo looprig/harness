@@ -92,9 +92,12 @@ func encodeConversation(conv content.Conversation) ([]chatMessage, error) {
 		// structured error flag (unlike Anthropic's tool_result block), so
 		// ToolResultMessage.IsError is intentionally NOT placed on the request —
 		// emitting a non-standard is_error here would be a schema violation. The model
-		// learns a tool errored via the result's text content, which the loop
-		// error-prefixes. The message-level IsError exists for the internal wire form
-		// and the display layer, not for this provider's request.
+		// learns a tool errored via the result's text content, which for engine-level
+		// failures (Go error, panic, empty result, pre-exec failure) the loop
+		// error-prefixes; a tool's self-reported ToolResultBlock error passes through
+		// verbatim, so there the message-level IsError is the only structured signal.
+		// IsError exists for the internal wire form and the display layer, not for
+		// this provider's request.
 		return []chatMessage{{
 			Role:       "tool",
 			Content:    textContent(m.Blocks),
