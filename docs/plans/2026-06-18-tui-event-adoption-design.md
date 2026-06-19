@@ -63,24 +63,38 @@ The loop-machine merge already landed the **core** of this spec; the rest is wha
 - **Tool cards live→committed.** Live cards resolve in place; `StepDone` reuses the
   resolved card and falls back to the stored block (`tui/transcript.go:400-447`) — option
   (c), §3.3.
-- **Session fan-in.** `AgentSession.SubscribeEvents(EventFilter)` + per-loop scoping
-  (`session/agent.go`, `tui/agent.go`); `EventFilter{Ephemeral, Enduring LoopScope}` is the
-  real shape (§1).
+- **Session fan-in + the full transport switch (§1).** `AgentSession.SubscribeEvents(EventFilter)`
+  + per-loop scoping (`session/agent.go`, `tui/agent.go`); `EventFilter{Ephemeral, Enduring
+  LoopScope}` is the real shape. The TUI now holds **one session-lifetime subscription**
+  (`subscribeCmd` once at `Init`, the continuous `subNext` reader) — the per-turn
+  `StreamBlocks` reader and `Screen.queue` are gone (`tui/screen.go`, `tui/commands.go`).
+- **`IsError` end-to-end (§3.3).** `content.ToolResultMessage` carries `IsError`; the loop
+  threads it (`turn.go`) and the committed tool-card fallback reads it (`stepToolCard`), so
+  ✓/✗ is authoritative from the `StepDone` group on both the reuse and fallback paths.
+- **Tool events Ephemeral (Amendment 1).** `ToolCallStarted`/`ToolCallCompleted` embed
+  `ephemeral` (`event/tool.go`); a subagent's tool chatter is muted under the default
+  `{Ephemeral: primary-only}` filter alongside its tokens, surfacing only via `StepDone`.
+- **Working-word / `● Done` (§3 rule 4).** An empty-text tool step renders a live
+  working-word headline that commits to a bold `● Done` (`tui/anim.go`, `tui/render.go`,
+  `commitStepAssistant`'s `doneHeadline`).
+- **Replies are events (Amendment 2).** The loop publishes `event.InputQueued` (Ephemeral) /
+  `event.TurnRejected` (Enduring) and a `Reply` marker interface replaces
+  `command.Disposition`/`CancelResult`; submit/cancel are fire-and-forget; `SubagentResult`
+  is never rejected (`loop.go`, `session/agent.go`, `command/`).
+- **Input lifecycle from events (§6).** The TUI submits fire-and-forget (`agent.Submit`);
+  user rows commit from `TurnStarted`/`TurnFoldedInto` `Message` (primary loop only); a
+  queued affordance shows on `InputQueued`; `InputCancelled`/`TurnRejected` drop it
+  (`tui/transcript.go`, `tui/screen.go`).
+- **Per-loop gate-prompt clearing (§7).** A terminal event clears only the finishing loop's
+  pending prompts (`tui/interaction.go` `ClearPromptsForLoop`).
 
-*Still pending (this spec's remaining work):*
+*Still pending (out of scope for this spec):*
 
-- **TUI still owns the input queue** — `Screen.queue [][]content.Block`, self-drained
-  (`tui/screen.go:197-465`). §6 removes it.
-- **Replies are still acks** — the loop uses `command.Disposition` on an `Ack` channel
-  (`loop/ack.go`); no `event.InputQueued`/`TurnRejected`/`Reply`. Amendment 2.
-- **Tool events still Enduring** — `ToolCallStarted`/`ToolCallCompleted` embed `enduring`;
-  `event/turn.go` asserts "TokenDelta is the only Ephemeral event." Amendment 1.
-- **Card-only step is still a bare bullet** — `commitStepAssistant` renders a bare `●`,
-  not the working-word / `● Done` of §3 rule 4 (`tui/transcript.go`).
-- **`TurnDone` still carries `Message`** (`event/turn.go:88`) — removed in a later loop
+- **`TurnDone` still carries `Message`** (`event/turn.go`) — removed in a later loop
   phase; harmless, the TUI ignores it.
-- **Global prompt clearing** — any terminal event triggers `ClearPrompts`
-  (`tui/interaction.go`); §7 scopes it per loop.
+- **Per-turn channels for `Invoke`/`Stream`** — redundant with the fan-in but retained for
+  the programmatic single-shot APIs; collapsing them onto the subscription is a tracked
+  follow-on (not a behavioural dependency of this spec).
 
 ## Changes
 
