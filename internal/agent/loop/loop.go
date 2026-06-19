@@ -578,55 +578,72 @@ func listen(ctx context.Context, cfg Config, commands <-chan command.Command, ga
 		}
 	}
 
+	// returnEntry resolves ONE removed-from-inbox entry as returned: it emits the
+	// single event.InputCancelled{reason} that a client observes for qi. It is the
+	// ONE place a return is emitted, so the "every removal is resolved exactly once"
+	// invariant has a single owner. turnID is the turn whose end caused the return
+	// (zero for a pure retract outside a turn); it lands on Header.TurnID.
+	returnEntry := func(qi queuedInput, reason event.CancelReason, turnID uuid.UUID) {
+		publish(event.InputCancelled{
+			Header: event.Header{
+				SessionID:         state.sessionID,
+				LoopID:            state.id,
+				TurnID:            turnID,
+				CausationID:       qi.inputID,
+				TriggeredByLoopID: qi.triggeredBy,
+			},
+			InputID: qi.inputID,
+			Reason:  reason,
+			Message: qi.msg,
+		})
+	}
+
+	// returnQueuedInbox returns every still-queued inbox entry via returnEntry after
+	// an abnormal terminal (TurnFailed/TurnInterrupted). The actor does NOT auto-start
+	// a new turn from a returned entry — the client decides whether to resend.
+	// endedTurnID is the turn that ended (the cause of the return).
+	returnQueuedInbox := func(reason event.CancelReason, endedTurnID uuid.UUID) {
+		for _, qi := range state.inbox {
+			returnEntry(qi, reason, endedTurnID)
+		}
+		state.inbox = nil
+	}
+
+	// popFront removes and returns the first queued entry, the single place the
+	// inbox-front splice lives. The bool is false when the inbox is empty.
+	//
+	// Inbox-exit invariant: every entry that popFront (or any other path) REMOVES
+	// from state.inbox MUST be resolved exactly once — either it reaches a successful
+	// startTurn (it becomes a turn) or it reaches returnEntry (it is returned via
+	// event.InputCancelled). A removed entry that reaches neither is silently
+	// stranded; do not add a removal path that can skip both.
+	popFront := func() (queuedInput, bool) {
+		if len(state.inbox) == 0 {
+			return queuedInput{}, false
+		}
+		qi := state.inbox[0]
+		state.inbox = state.inbox[1:]
+		return qi, true
+	}
+
 	// cancelQueued resolves a CancelQueuedInput against the actor-owned inbox. If
-	// the InputID is still queued it is removed and event.InputCancelled
-	// {CancelClientRetracted} is emitted (Header.TurnID zero — a pure retract
-	// outside a turn), replying Cancelled. If not found it has already started or
-	// folded, so the actor replies AlreadyCommitted with the active turn id.
+	// the InputID is still queued it is removed and resolved via returnEntry
+	// (event.InputCancelled{CancelClientRetracted}, Header.TurnID zero — a pure
+	// retract outside a turn), replying Cancelled. If not found it has already
+	// started or folded, so the actor replies AlreadyCommitted with the active turn id.
 	cancelQueued := func(c command.CancelQueuedInput) {
 		for i, qi := range state.inbox {
 			if qi.inputID != c.InputID {
 				continue
 			}
 			state.inbox = append(state.inbox[:i], state.inbox[i+1:]...)
-			publish(event.InputCancelled{
-				Header: event.Header{
-					SessionID:         state.sessionID,
-					LoopID:            state.id,
-					CausationID:       qi.inputID,
-					TriggeredByLoopID: qi.triggeredBy,
-				},
-				InputID: qi.inputID,
-				Reason:  event.CancelClientRetracted,
-				Message: qi.msg,
-			})
+			// Removed from the inbox by a retract: resolve it via returnEntry (the one
+			// return-emit point). TurnID is zero — a pure retract outside any turn.
+			returnEntry(qi, event.CancelClientRetracted, uuid.UUID{})
 			tryAck[command.CancelResult](c.Ack, command.Cancelled{})
 			return
 		}
 		tryAck[command.CancelResult](c.Ack, command.AlreadyCommitted{TurnID: state.turnID})
-	}
-
-	// returnQueuedInbox returns every still-queued inbox entry via
-	// event.InputCancelled{reason} after an abnormal terminal (TurnFailed/
-	// TurnInterrupted). The actor does NOT auto-start a new turn from a returned
-	// entry — the client decides whether to resend. Header.TurnID is the turn that
-	// ended (the cause of the return).
-	returnQueuedInbox := func(reason event.CancelReason, endedTurnID uuid.UUID) {
-		for _, qi := range state.inbox {
-			publish(event.InputCancelled{
-				Header: event.Header{
-					SessionID:         state.sessionID,
-					LoopID:            state.id,
-					TurnID:            endedTurnID,
-					CausationID:       qi.inputID,
-					TriggeredByLoopID: qi.triggeredBy,
-				},
-				InputID: qi.inputID,
-				Reason:  reason,
-				Message: qi.msg,
-			})
-		}
-		state.inbox = nil
 	}
 
 	for {
@@ -768,16 +785,20 @@ func listen(ctx context.Context, cfg Config, commands <-chan command.Command, ga
 			//     entry via InputCancelled and auto-start nothing — the client decides
 			//     whether to resend.
 			if _, normal := result.terminal.(event.TurnDone); normal {
-				if len(state.inbox) > 0 {
-					next := state.inbox[0]
-					state.inbox = state.inbox[1:]
+				if next, ok := popFront(); ok {
+					// Inbox-exit invariant: next is now REMOVED from the inbox, so it
+					// MUST reach either startTurn-success or returnEntry below — never
+					// neither (that would silently strand it).
+					//
 					// A later turn started from the queue is fan-in-only (nil stream):
 					// the original submit's per-turn stream, if any, belonged to a
 					// StartOnly caller, which is never queued.
 					if _, err := startTurn(next, nil, nil); err != nil {
-						// Could not mint a TurnID for the queued entry: return it
-						// (and any remaining) rather than dropping it silently.
+						// Could not mint a TurnID for the popped entry: resolve THAT
+						// entry as returned (returnQueuedInbox would not — next is no
+						// longer in the inbox), then return any remaining entries too.
 						slog.Error("turn id generation failed starting queued input; returning it", "error", err)
+						returnEntry(next, event.CancelTurnFailed, endedTurnID)
 						returnQueuedInbox(event.CancelTurnFailed, endedTurnID)
 					}
 				}
