@@ -100,8 +100,9 @@ type turnConfig struct {
 	drainPending func(context.Context) ([]queuedInput, error)
 
 	// emit publishes this loop's events (TurnStarted is actor-emitted; runTurn emits
-	// TokenDeltas, tool lifecycle events, and the turn terminal). StepDone is NOT
-	// emitted here — it is emitted by the actor at the commit point.
+	// the Ephemeral TokenDeltas and tool-lifecycle events plus the Enduring turn
+	// terminal). StepDone is NOT emitted here — it is emitted by the actor at the
+	// commit point.
 	emit func(event.Event)
 
 	// afterDrain is a test-only seam (nil in production) invoked by foldPending after

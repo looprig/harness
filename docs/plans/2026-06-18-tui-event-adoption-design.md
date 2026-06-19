@@ -450,8 +450,10 @@ input emit `InputQueued`/`TurnRejected` (effectively just the primary loop; suba
   while live (provisional), and commits to a **`● Done`** headline at `StepDone`; the
   per-card ✓/✗ reflects each tool's outcome.
 - The TUI subscribes once per session; multiple turns reuse the one subscription.
-- With `{Ephemeral: primary-only}`, a subagent's `TokenDelta` never renders, but its
-  `StepDone`/tool/gate events do, attributed by `LoopID`.
+- With `{Ephemeral: primary-only}`, a subagent's `TokenDelta` **and** its tool-lifecycle
+  events (`ToolCallStarted`/`ToolCallCompleted`, now Ephemeral per amendment 1) never
+  render, but its Enduring `StepDone`/gate events do, attributed by `LoopID` — so the
+  subagent's tools surface at `StepDone` granularity, not as a live per-call view.
 - **Input lifecycle (events, no ack):** `event.InputQueued` (Ephemeral) shows the message
   as queued keyed by `InputID`; a following `event.TurnStarted`/`TurnFoldedInto` with the
   same `CausationID`/`InputID` promotes it to a committed user row **exactly once** (at

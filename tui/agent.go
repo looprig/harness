@@ -52,16 +52,19 @@ type Agent interface {
 }
 
 // DefaultEventFilter is the single-loop TUI's declared interest for a session
-// subscription: live Ephemeral tokens (TokenDelta) from the PRIMARY loop only, and
-// Enduring events (StepDone, gates, tool lifecycle, terminals) from EVERY loop.
-// This is the spec's example filter — a TUI streams the primary loop's tokens live
-// while still seeing the finalized output of any subagent loop (those appear
-// collapsed-but-present, attributed by Header.LoopID). Session-scoped events
-// (SessionStarted/Active/Idle/Stopped) bypass the loop filter and always deliver.
+// subscription: live Ephemeral events (TokenDelta + tool lifecycle, i.e.
+// ToolCallStarted/Completed) from the PRIMARY loop only, and Enduring events
+// (StepDone, gates, terminals) from EVERY loop. This is the spec's example filter —
+// a TUI streams the primary loop's live progress (tokens AND tool spinners) while
+// still seeing the finalized output of any subagent loop at StepDone granularity
+// (those appear collapsed-but-present, attributed by Header.LoopID). Session-scoped
+// events (SessionStarted/Active/Idle/Stopped) bypass the loop filter and always
+// deliver.
 //
-// primaryLoopID names the loop whose live token firehose the TUI wants; a
-// subagent's tokens, excluded by the Ephemeral scope, never even enter the
-// subscriber's egress buffer.
+// primaryLoopID names the loop whose live firehose the TUI wants; a subagent's
+// tokens AND its tool-lifecycle chatter, excluded by the Ephemeral scope, never even
+// enter the subscriber's egress buffer — by design amendment 1 the subagent's tools
+// surface only via its Enduring StepDone, not a live per-call view.
 func DefaultEventFilter(primaryLoopID uuid.UUID) event.EventFilter {
 	return event.EventFilter{
 		Ephemeral: event.LoopScope{Loops: map[uuid.UUID]struct{}{primaryLoopID: {}}},
