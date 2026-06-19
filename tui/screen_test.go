@@ -50,12 +50,14 @@ type fakeAgent struct {
 	closeErr     error
 	acceptsImage bool
 
-	// subscribe recorder: the configured stream/error is returned, and the last
-	// filter is captured so a test can assert the wrapper forwarded it.
-	subStream  event.Subscription
-	subErr     error
-	subFilter  event.EventFilter
-	subscribed bool
+	// subscribe recorder: the configured stream/error is returned, the last filter
+	// is captured so a test can assert the wrapper forwarded it, and subscribeCount
+	// counts Subscribe calls so a test can assert the TUI subscribes exactly ONCE per
+	// session (one session-lifetime subscription, never re-subscribed per turn).
+	subStream      event.Subscription
+	subErr         error
+	subFilter      event.EventFilter
+	subscribeCount int
 
 	// gate-trio recorders: the configured error is returned, and the last call's
 	// arguments are captured so a test can assert the wrapper forwarded them.
@@ -110,7 +112,7 @@ func (f *fakeAgent) Close(_ context.Context) error {
 func (f *fakeAgent) AcceptsImages() bool { return f.acceptsImage }
 
 func (f *fakeAgent) Subscribe(filter event.EventFilter) (EventStream, error) {
-	f.subscribed = true
+	f.subscribeCount++
 	f.subFilter = filter
 	if f.subErr != nil {
 		return nil, f.subErr
@@ -1288,6 +1290,50 @@ func TestSubagentTurnEventsDoNotFlipStatus(t *testing.T) {
 	}
 }
 
+// TestSubscribesOncePerSession locks the one-session-lifetime-subscription invariant:
+// the TUI subscribes EXACTLY ONCE (subscribeCmd, batched into Init) and never
+// re-subscribes per turn. The continuous reader re-arms via subNext after each event,
+// so feeding many turns' worth of lifecycle events must NOT trigger another Subscribe.
+// It is count-based (fakeAgent.subscribeCount) and drives multiple turns so a stray
+// per-turn re-subscribe would push the count above 1.
+func TestSubscribesOncePerSession(t *testing.T) {
+	t.Parallel()
+
+	primary := callID(0xAA)
+	sub := newFakeSubscription()
+	agent := &fakeAgent{primaryLoopID: primary, subStream: sub}
+	m := New(context.Background(), agent, fakeOpen(agent), AgentBanner{})
+
+	// Init batches subscribeCmd; the runtime would resolve it to a subscribedMsg.
+	// Run the batched command's leaves and deliver the resulting subscribedMsg so the
+	// session-lifetime subscription is installed exactly as the runtime would.
+	if cmd := m.Init(); cmd == nil {
+		t.Fatal("Init() = nil, want non-nil (subscribeCmd batched)")
+	}
+	// subscribeCmd is the only command that performs the Subscribe; invoke it the way
+	// the runtime would and feed its message back into Update.
+	m, _ = updateScreen(t, m, subscribeCmd(agent)())
+	if agent.subscribeCount != 1 {
+		t.Fatalf("after Init subscribe = %d, want 1 (one session-lifetime subscription)", agent.subscribeCount)
+	}
+	if m.sub == nil {
+		t.Fatal("subscription not installed after subscribedMsg")
+	}
+
+	// Feed several turns' worth of events through Update. Each turn: TurnStarted ->
+	// StepDone -> TurnDone for the primary loop. The continuous reader re-arms via
+	// subNext on every event; none of this may re-subscribe.
+	for turn := 0; turn < 4; turn++ {
+		m = feed(t, m, event.TurnStarted{Header: event.Header{LoopID: primary}})
+		m = feed(t, m, event.StepDone{Header: event.Header{LoopID: primary}})
+		m = feed(t, m, event.TurnDone{Header: event.Header{LoopID: primary}})
+	}
+
+	if agent.subscribeCount != 1 {
+		t.Errorf("subscribe count after %d turns = %d, want exactly 1 (the continuous reader re-arms via subNext, it never re-subscribes per turn)", 4, agent.subscribeCount)
+	}
+}
+
 func TestUpdateInterruptResult(t *testing.T) {
 	t.Parallel()
 
@@ -1399,11 +1445,11 @@ func TestUpdateReopenResult(t *testing.T) {
 		if fresh.closeCalled {
 			t.Error("fresh agent Close() called, want not closed")
 		}
-		if !fresh.subscribed {
-			t.Error("fresh agent Subscribe() not called; /clear must re-subscribe to the new agent")
+		if fresh.subscribeCount != 1 {
+			t.Errorf("fresh agent Subscribe() count = %d, want 1; /clear must re-subscribe exactly once to the new agent", fresh.subscribeCount)
 		}
-		if old.subscribed {
-			t.Error("old agent Subscribe() called by the re-subscribe; it must target the fresh agent")
+		if old.subscribeCount != 0 {
+			t.Errorf("old agent Subscribe() count = %d, want 0; the re-subscribe must target the fresh agent", old.subscribeCount)
 		}
 	})
 }

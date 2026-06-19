@@ -65,6 +65,33 @@ func TestDefaultEventFilter(t *testing.T) {
 	}
 }
 
+// TestDefaultEventFilterShape locks the literal STRUCT shape returned by
+// DefaultEventFilter (distinct from TestDefaultEventFilter, which asserts the
+// resulting delivery decisions through ShouldDeliver): Ephemeral scopes to the
+// primary loop ONLY (not All, exactly one member — the primary id), and Enduring is
+// All (every loop). It inspects the returned struct directly so a regression that,
+// say, flips Ephemeral.All on or widens the Ephemeral.Loops set is caught at the
+// source, not only through behavior.
+func TestDefaultEventFilterShape(t *testing.T) {
+	t.Parallel()
+
+	primary := loopID(1)
+	filter := DefaultEventFilter(primary)
+
+	if filter.Ephemeral.All {
+		t.Error("Ephemeral.All = true, want false (Ephemeral must be primary-only, not every loop)")
+	}
+	if len(filter.Ephemeral.Loops) != 1 {
+		t.Errorf("Ephemeral.Loops size = %d, want 1 (only the primary loop)", len(filter.Ephemeral.Loops))
+	}
+	if _, ok := filter.Ephemeral.Loops[primary]; !ok {
+		t.Errorf("Ephemeral.Loops missing the primary loop %v", primary)
+	}
+	if !filter.Enduring.All {
+		t.Error("Enduring.All = false, want true (Enduring must deliver from every loop)")
+	}
+}
+
 // loopID builds a deterministic non-zero loop uuid from one byte (callID is defined
 // in screen_test.go with the same shape; this name documents the loop-id intent).
 func loopID(b byte) uuid.UUID {

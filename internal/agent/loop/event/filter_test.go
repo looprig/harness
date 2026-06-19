@@ -156,6 +156,50 @@ func TestShouldDeliver(t *testing.T) {
 			ev:     event.TurnStarted{Header: event.Header{SessionID: session, LoopID: subagent}},
 			want:   true,
 		},
+		// Amendment-1 delivery lock. ToolCallStarted/Completed are EPHEMERAL (see
+		// tool.go), so the TUI filter's primary-only Ephemeral scope mutes a
+		// SUBAGENT's tool chatter alongside its tokens — its tools surface only via
+		// its Enduring StepDone, never a live per-call view. The PRIMARY loop's tool
+		// lifecycle still streams (Ephemeral, primary matches). The interactive GATES
+		// (PermissionRequested/UserInputRequested) are ENDURING, so the All enduring
+		// scope delivers them from EVERY loop — gates are never muted (fail-secure:
+		// the user must always be able to answer a subagent's gate).
+		{
+			name:   "ephemeral ToolCallStarted from subagent is muted (primary-only Ephemeral)",
+			filter: tuiFilter,
+			ev:     event.ToolCallStarted{Header: event.Header{SessionID: session, LoopID: subagent}},
+			want:   false,
+		},
+		{
+			name:   "ephemeral ToolCallCompleted from subagent is muted (primary-only Ephemeral)",
+			filter: tuiFilter,
+			ev:     event.ToolCallCompleted{Header: event.Header{SessionID: session, LoopID: subagent}},
+			want:   false,
+		},
+		{
+			name:   "ephemeral ToolCallStarted from primary delivers (live tool spinner)",
+			filter: tuiFilter,
+			ev:     event.ToolCallStarted{Header: event.Header{SessionID: session, LoopID: primary}},
+			want:   true,
+		},
+		{
+			name:   "ephemeral ToolCallCompleted from primary delivers (tool result)",
+			filter: tuiFilter,
+			ev:     event.ToolCallCompleted{Header: event.Header{SessionID: session, LoopID: primary}},
+			want:   true,
+		},
+		{
+			name:   "enduring PermissionRequested gate from subagent delivers (All enduring; gates never muted)",
+			filter: tuiFilter,
+			ev:     event.PermissionRequested{Header: event.Header{SessionID: session, LoopID: subagent}},
+			want:   true,
+		},
+		{
+			name:   "enduring UserInputRequested gate from subagent delivers (All enduring; gates never muted)",
+			filter: tuiFilter,
+			ev:     event.UserInputRequested{Header: event.Header{SessionID: session, LoopID: subagent}},
+			want:   true,
+		},
 		{
 			name:   "terminal TurnDone (enduring class) matched by enduring scope",
 			filter: tuiFilter,
