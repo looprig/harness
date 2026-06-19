@@ -2,6 +2,7 @@ package loop
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -187,6 +188,69 @@ func TestSubagentResultToFullInboxQueues(t *testing.T) {
 	}
 	if q.InputID != srID || q.TriggeredByLoopID != fromLoop {
 		t.Errorf("InputQueued InputID/TriggeredByLoopID = %v/%v, want %v/%v", q.InputID, q.TriggeredByLoopID, srID, fromLoop)
+	}
+}
+
+// TestSubagentResultIDGenerationFailureCancels: a SubagentResult delivered to an
+// IDLE loop whose TurnID id-gen fails is NEVER rejected — it surfaces as
+// event.InputCancelled{CancelTurnFailed} (NOT event.TurnRejected), because a
+// SubagentResult's {wake} quiescence token releases only via an Enduring event
+// carrying TriggeredByLoopID (InputCancelled does; TurnRejected does NOT). This is
+// the SubagentResult half of the idle id-gen-failure branch (loop.go decideSubmit's
+// bypassReject path); the plain-UserInput half is covered by
+// TestTurnIDGenerationFailure. The cancellation must carry CausationID == the
+// SubagentResult command id (== InputID) and TriggeredByLoopID == FromLoopID.
+func TestSubagentResultIDGenerationFailureCancels(t *testing.T) {
+	t.Parallel()
+	genErr := errors.New("rand source exhausted")
+	tests := []struct {
+		name    string
+		okCount int // SessionStarted EventID (call #1) ok; TurnID (call #2) fails
+	}{
+		{name: "turn id mint fails", okCount: 1},
+		{name: "all id mints fail", okCount: 0},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			sink := &captureSink{}
+			gen := &countedIDGen{okCount: tt.okCount, err: genErr}
+			l := newLoopWithIDGen(t, &fakeLLM{chunks: []content.Chunk{textChunk("hi")}}, gen.gen, sink)
+
+			inputID := mustID(t)
+			fromLoop := mustID(t)
+			l.Commands <- command.SubagentResult{
+				Header:     command.Header{ID: inputID},
+				FromLoopID: fromLoop,
+				Blocks:     textBlocks("subagent output"),
+			}
+
+			// A never-rejected SubagentResult that cannot mint its TurnID resolves as
+			// InputCancelled{CancelTurnFailed} (the {wake} release rides this Enduring event),
+			// recognised on the fan-in via ReplyTo() == its command id.
+			ev := awaitReply(t, sink, inputID)
+			ic, ok := ev.(event.InputCancelled)
+			if !ok {
+				t.Fatalf("outcome = %T, want event.InputCancelled (SubagentResult is never rejected)", ev)
+			}
+			if ic.Reason != event.CancelTurnFailed {
+				t.Errorf("InputCancelled.Reason = %d, want CancelTurnFailed", ic.Reason)
+			}
+			if ic.InputID != inputID || ic.CausationID != inputID {
+				t.Errorf("InputCancelled InputID/CausationID = %v/%v, want %v", ic.InputID, ic.CausationID, inputID)
+			}
+			if ic.TriggeredByLoopID != fromLoop {
+				t.Errorf("InputCancelled.TriggeredByLoopID = %v, want %v (releases the subagent's {wake} token)", ic.TriggeredByLoopID, fromLoop)
+			}
+
+			// It must NOT be rejected: a TurnRejected would not carry/release the {wake} token.
+			for _, e := range sink.events() {
+				if rej, ok := e.Event.(event.TurnRejected); ok && rej.InputID == inputID {
+					t.Fatalf("SubagentResult was rejected (%+v); a SubagentResult is never rejected", rej)
+				}
+			}
+		})
 	}
 }
 
