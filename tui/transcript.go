@@ -160,6 +160,12 @@ type entry struct {
 	// nil for every other kind. Kept as a pointer so non-prompt entries pay no
 	// per-entry cost and a nil here is an unambiguous "not a prompt record".
 	Prompt *promptContext
+	// doneHeadline marks a kindAssistant entry that is the committed form of an
+	// empty-text tool step (design §3 rule 4): it carries no prose blocks and renders
+	// a bold "● Done" headline above its separately-committed tool cards. Set ONLY by
+	// commitStepAssistant on the clean StepDone path; the interrupt/failure partial
+	// path never sets it (an interrupted step is not "done").
+	doneHeadline bool
 }
 
 // liveSeg is the in-progress assistant segment for the current turn: the streamed
@@ -471,8 +477,16 @@ func (m *transcriptModel) commitStepAssistant(ai *content.AIMessage) {
 	if len(blocks) == 0 && len(toolUsesOf(ai)) == 0 {
 		return // nothing to show for this assistant message
 	}
+	// An empty-text tool step (no prose blocks, but tool uses present) commits a
+	// doneHeadline entry so the renderer shows a bold "● Done" headline above the
+	// step's separately-committed tool cards (design §3 rule 4), not a bare bullet.
 	m.nextID++
-	m.committed = append(m.committed, entry{ID: m.nextID, Kind: kindAssistant, Blocks: blocks})
+	m.committed = append(m.committed, entry{
+		ID:           m.nextID,
+		Kind:         kindAssistant,
+		Blocks:       blocks,
+		doneHeadline: len(blocks) == 0 && len(toolUsesOf(ai)) > 0,
+	})
 }
 
 // stepToolCard builds the committed ToolCallView for the index-th tool-use block of a

@@ -24,7 +24,7 @@ func renderEntry(e entry, expand bool, width int) []string {
 	case kindUser:
 		return splitNonEmpty(renderUser(renderInlineBlocks(e.Blocks), width))
 	case kindAssistant:
-		return splitNonEmpty(renderAssistant(thinkingText(e.Blocks), assistantText(e.Blocks), e.Calls, expand, width))
+		return splitNonEmpty(renderAssistant(thinkingText(e.Blocks), assistantText(e.Blocks), e.Calls, e.doneHeadline, expand, width))
 	case kindTool:
 		return splitNonEmpty(renderToolCalls(e.Calls, expand, width))
 	case kindPromptRecord:

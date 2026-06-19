@@ -1201,3 +1201,80 @@ func TestTranscriptPromptCommit(t *testing.T) {
 		})
 	}
 }
+
+// TestCommitStepAssistantDoneHeadline covers the doneHeadline signal on a committed
+// assistant entry (design §3 rule 4): a StepDone whose AIMessage has tool-use blocks
+// but NO prose/thinking commits a kindAssistant entry marked doneHeadline (it renders
+// the static "● Done"); any prose/thinking clears it (the prose IS the headline); and
+// the interrupt/failure partial path NEVER sets it (an interrupted step is not "done").
+func TestCommitStepAssistantDoneHeadline(t *testing.T) {
+	tests := []struct {
+		name   string
+		events []event.Event
+		want   bool // doneHeadline on committed[0] (always a kindAssistant in these rows)
+	}{
+		{
+			name: "empty-text tool step → doneHeadline",
+			events: []event.Event{
+				event.TurnStarted{},
+				stepDone(aiMessage("", "", toolUse("tu-1", "Bash", `{}`)), toolResult("tu-1", "out")),
+			},
+			want: true,
+		},
+		{
+			name: "tool step WITH narration → no doneHeadline (prose is the headline)",
+			events: []event.Event{
+				event.TurnStarted{},
+				stepDone(aiMessage("", "reading config", toolUse("tu-1", "Bash", `{}`)), toolResult("tu-1", "out")),
+			},
+			want: false,
+		},
+		{
+			name: "tool step WITH thinking → no doneHeadline",
+			events: []event.Event{
+				event.TurnStarted{},
+				stepDone(aiMessage("plan it", "", toolUse("tu-1", "Bash", `{}`)), toolResult("tu-1", "out")),
+			},
+			want: false,
+		},
+		{
+			name: "interrupted partial prose → no doneHeadline (not done)",
+			events: []event.Event{
+				event.TurnStarted{},
+				textChunk("partial answer"),
+				toolStarted(callID(1), "Bash", "sleep"),
+				event.TurnInterrupted{},
+			},
+			want: false,
+		},
+		{
+			name: "failed partial prose → no doneHeadline (not done)",
+			events: []event.Event{
+				event.TurnStarted{},
+				textChunk("partial"),
+				event.TurnFailed{Err: errBoom{}},
+			},
+			want: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			var m transcriptModel
+			for _, ev := range tt.events {
+				m = m.ApplyEvent(ev)
+			}
+			if len(m.committed) == 0 {
+				t.Fatalf("committed = 0 entries, want at least 1")
+			}
+			e := m.committed[0]
+			if e.Kind != kindAssistant {
+				t.Fatalf("committed[0].Kind = %v, want kindAssistant", e.Kind)
+			}
+			if e.doneHeadline != tt.want {
+				t.Errorf("committed[0].doneHeadline = %v, want %v", e.doneHeadline, tt.want)
+			}
+		})
+	}
+}

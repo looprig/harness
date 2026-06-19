@@ -53,6 +53,11 @@ const (
 // line — still fit.
 const dotWidth = 2
 
+// doneHeadlineText is the committed headline word beside the dot for an empty-text tool
+// step (design §3 rule 4): a static "Done", since the per-tool ✓/✗ outcome lives on
+// each separately-committed card. The LIVE counterpart is a rotating workingWord.
+const doneHeadlineText = "Done"
+
 // renderMD renders markdown to ANSI behind the static committed bullet (styles.Dot).
 // It is the committed/scrollback path: a frozen assistant "●" never animates, so it
 // always uses the lit dot. The live tail uses renderMDDot with a blink-phased bullet.
@@ -233,12 +238,15 @@ func indentWrap(s, indent string, width int) string {
 }
 
 // renderAssistant renders an assistant segment in order: its reasoning (thinking)
-// block, its markdown narration, then its tool-call cards. A segment with empty
-// narration but non-empty cards renders a bare dot bullet (no empty markdown block)
-// before its cards, per design §3. Empty parts are omitted. The single expand flag
-// drives BOTH the thinking block (compact summary vs full body) and the tool-card
-// result folding, so ctrl+t toggles them together.
-func renderAssistant(thinking, text string, calls []ToolCallView, expand bool, width int) string {
+// block, its markdown narration, then its tool-call cards. When the segment has empty
+// narration and done is set — the committed empty-text tool step (design §3 rule 4) —
+// it renders a bold "● Done" headline beside the dot, the static committed counterpart
+// of the live working-word; the per-tool ✓/✗ outcome lives on each separately-committed
+// card. With empty narration and done unset it falls back to a bare dot bullet (a
+// defensive card-only case). Empty parts are omitted. The single expand flag drives BOTH
+// the thinking block (compact summary vs full body) and the tool-card result folding, so
+// ctrl+t toggles them together.
+func renderAssistant(thinking, text string, calls []ToolCallView, done bool, expand bool, width int) string {
 	var b strings.Builder
 
 	if t := renderThinking(thinking, expand, width); t != "" {
@@ -246,8 +254,13 @@ func renderAssistant(thinking, text string, calls []ToolCallView, expand bool, w
 	}
 
 	body := renderMD(text, width)
-	if body == "" && len(calls) > 0 {
-		body = strings.TrimRight(styles.Dot, " ") // bare bullet for a card-only segment
+	if body == "" {
+		switch {
+		case done:
+			body = strings.TrimRight(styles.Dot, " ") + " " + styles.HeadlineStyle.Render(doneHeadlineText) // "● Done"
+		case len(calls) > 0:
+			body = strings.TrimRight(styles.Dot, " ") // bare bullet for a card-only segment (defensive)
+		}
 	}
 	if body != "" {
 		if b.Len() > 0 {
@@ -280,7 +293,10 @@ func renderLiveAssistant(thinking, text string, calls []ToolCallView, expand boo
 
 	body := renderMDDot(text, width, liveDot(a.blink))
 	if body == "" && len(calls) > 0 {
-		body = strings.TrimRight(liveDot(a.blink), " ") // bare blinking bullet for a card-only live segment
+		// Live empty-text tool step (design §3 rule 4): a rotating working-word beside
+		// the blinking dot — the provisional, pre-StepDone counterpart of the committed
+		// static "Done" (renderAssistant). The word may rotate while the step runs.
+		body = strings.TrimRight(liveDot(a.blink), " ") + " " + styles.HeadlineStyle.Render(workingWord(a.frame))
 	}
 	if body != "" {
 		if b.Len() > 0 {

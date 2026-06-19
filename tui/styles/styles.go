@@ -31,6 +31,12 @@ var (
 	StatusStyle      = lipgloss.NewStyle().Faint(true)
 )
 
+// HeadlineStyle renders the bold headline word shown beside the assistant dot for an
+// empty-text tool step (the live "working" synonym and the committed "Done") — design
+// §3 rule 4. Bold so the headline stands out beside the bullet, matching the bold
+// emphasis the user message and prompt headers use.
+var HeadlineStyle = lipgloss.NewStyle().Bold(true)
+
 // Notice styles color a leveled notification's shared "▌ " accent bar (and text) by
 // severity. All three reuse the SAME accent-bar wrapper as user messages and differ
 // only in foreground color: info is the neutral user-message gray (color 8, matching

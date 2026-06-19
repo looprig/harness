@@ -304,7 +304,7 @@ func TestRenderAssistantNestsCards(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			got := stripANSI(renderAssistant(tt.thinking, tt.text, tt.calls, false, 80))
+			got := stripANSI(renderAssistant(tt.thinking, tt.text, tt.calls, false, false, 80))
 			for _, w := range tt.want {
 				if !strings.Contains(got, w) {
 					t.Errorf("renderAssistant() = %q, want to contain %q", got, w)
@@ -330,7 +330,7 @@ func TestRenderAssistantLiveCards(t *testing.T) {
 		t.Parallel()
 
 		calls := []ToolCallView{{ToolName: "Bash", Summary: "ls", Status: ToolRunning}}
-		got := stripANSI(renderAssistant("", "checking now", calls, false, 80))
+		got := stripANSI(renderAssistant("", "checking now", calls, false, false, 80))
 		for _, w := range []string{"checking now", "Bash", "ls", glyphRunning} {
 			if !strings.Contains(got, w) {
 				t.Errorf("renderAssistant() = %q, want to contain %q", got, w)
@@ -342,7 +342,7 @@ func TestRenderAssistantLiveCards(t *testing.T) {
 		t.Parallel()
 
 		calls := []ToolCallView{{ToolName: "Bash", Status: ToolRunning}}
-		got := stripANSI(renderAssistant("", "", calls, false, 80))
+		got := stripANSI(renderAssistant("", "", calls, false, false, 80))
 		for _, w := range []string{strings.TrimSpace(styles.Dot), "Bash", glyphRunning} {
 			if !strings.Contains(got, w) {
 				t.Errorf("renderAssistant() = %q, want to contain %q", got, w)
@@ -526,8 +526,8 @@ func TestRenderAssistantUnifiedExpand(t *testing.T) {
 	const thinking = "reason one\nreason two\nreason three"
 	calls := []ToolCallView{{ToolName: "ReadFile", Status: ToolOK, Result: makeLines(10)}}
 
-	collapsed := stripANSI(renderAssistant(thinking, "the answer", calls, false, 80))
-	expanded := stripANSI(renderAssistant(thinking, "the answer", calls, true, 80))
+	collapsed := stripANSI(renderAssistant(thinking, "the answer", calls, false, false, 80))
+	expanded := stripANSI(renderAssistant(thinking, "the answer", calls, false, true, 80))
 
 	// Collapsed: thinking is the compact summary (count + ctrl+t), no "│ " body;
 	// the tool result is folded (first K lines, a more-marker, later lines hidden).
@@ -561,7 +561,7 @@ func TestRenderAssistantUnifiedExpand(t *testing.T) {
 func TestRenderAssistantThinkingBlock(t *testing.T) {
 	t.Parallel()
 
-	got := stripANSI(renderAssistant("my reasoning", "the final answer", nil, true, 80)) // expanded
+	got := stripANSI(renderAssistant("my reasoning", "the final answer", nil, false, true, 80)) // expanded
 
 	for _, w := range []string{"│ thinking", "│ my reasoning", "the final answer"} {
 		if !strings.Contains(got, w) {
@@ -570,5 +570,94 @@ func TestRenderAssistantThinkingBlock(t *testing.T) {
 	}
 	if strings.Contains(got, "[unsupported block]") {
 		t.Errorf("renderAssistant() = %q, must not render reasoning as [unsupported block]", got)
+	}
+}
+
+// TestRenderAssistantDoneHeadline covers the committed empty-text tool step (design §3
+// rule 4): a card-only assistant segment marked done renders a bold "● Done" headline
+// beside the dot — NOT a bare lone "●". The per-tool ✓/✗ outcome lives on each
+// separately-committed card, so the headline is the static word "Done". When done is
+// false the empty-body path keeps the defensive bare-bullet fallback.
+func TestRenderAssistantDoneHeadline(t *testing.T) {
+	t.Parallel()
+
+	// Each row has empty narration; calls drive the defensive bare-bullet fallback
+	// (the committed card-only step's cards are separate kindTool entries, so the
+	// committed entry's own Calls are empty — done is the signal, not the calls).
+	tests := []struct {
+		name     string
+		done     bool
+		calls    []ToolCallView
+		wantWord bool // expect the "Done" word in the output
+	}{
+		{name: "done renders the headline word", done: true, calls: nil, wantWord: true},
+		{
+			name:     "not done with calls keeps the bare bullet",
+			done:     false,
+			calls:    []ToolCallView{{ToolName: "Bash", Status: ToolOK, Result: []string{"a.go"}}},
+			wantWord: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			got := stripANSI(renderAssistant("", "", tt.calls, tt.done, false, 80))
+			dot := strings.TrimSpace(styles.Dot)
+			if !strings.Contains(got, dot) {
+				t.Errorf("renderAssistant() = %q, want the dot glyph %q", got, dot)
+			}
+			if tt.wantWord && !strings.Contains(got, doneHeadlineText) {
+				t.Errorf("renderAssistant() = %q, want the %q headline beside the dot", got, doneHeadlineText)
+			}
+			if !tt.wantWord && strings.Contains(got, doneHeadlineText) {
+				t.Errorf("renderAssistant() = %q, must not show %q when not done", got, doneHeadlineText)
+			}
+		})
+	}
+}
+
+// TestRenderEntryDoneHeadline covers the committed-entry threading: a kindAssistant
+// entry with empty blocks and doneHeadline set renders the bold "● Done" headline (and
+// never a bare lone "●"). This pins the entryrender → renderAssistant signal wiring.
+func TestRenderEntryDoneHeadline(t *testing.T) {
+	t.Parallel()
+
+	e := entry{Kind: kindAssistant, doneHeadline: true}
+	got := stripANSI(strings.Join(renderEntry(e, false, 80), "\n"))
+	if !strings.Contains(got, doneHeadlineText) {
+		t.Errorf("renderEntry(doneHeadline) = %q, want the %q headline", got, doneHeadlineText)
+	}
+	if strings.TrimSpace(got) == strings.TrimSpace(styles.Dot) {
+		t.Errorf("renderEntry(doneHeadline) = %q, want a headline, not a bare lone dot", got)
+	}
+}
+
+// TestRenderLiveAssistantWorkingWord covers the LIVE empty-text tool step (design §3
+// rule 4): a card-only live segment renders a working-word from workingWords beside the
+// blinking dot — a live "doing work" affordance — rather than a bare bullet. The
+// committed form (TestRenderAssistantDoneHeadline) is the static "Done"; this is the
+// provisional, pre-StepDone surface.
+func TestRenderLiveAssistantWorkingWord(t *testing.T) {
+	t.Parallel()
+
+	calls := []ToolCallView{{ToolName: "Bash", Status: ToolRunning}}
+	for _, frame := range []uint{0, 1, 5} {
+		got := stripANSI(renderLiveAssistant("", "", calls, false, 80, animState{frame: frame}))
+		headline := got
+		if i := strings.IndexByte(got, '\n'); i >= 0 {
+			headline = got[:i] // the headline is the first line; cards follow below
+		}
+		found := false
+		for _, w := range workingWords {
+			if strings.Contains(headline, w) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("frame %d: live headline = %q, want one of the working words %v", frame, headline, workingWords)
+		}
 	}
 }
