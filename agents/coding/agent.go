@@ -40,7 +40,7 @@ const envAPIKey = "LLM_API_KEY" // #nosec G101 -- env var name, not a credential
 // Coding is a persona-bearing wrapper over a session.AgentSession. The caller
 // owns it and must call Close to release the underlying actor goroutine.
 type Coding struct {
-	session       *session.AgentSession
+	session       *session.Sesssion
 	cancel        context.CancelFunc // cancels the session's root context; called by Close
 	acceptsImages bool               // captured from spec at construction; reported by AcceptsImages
 }

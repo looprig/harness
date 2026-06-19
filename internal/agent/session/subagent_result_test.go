@@ -20,13 +20,13 @@ import (
 // deliverSubagentResult (now fire-and-forget) without a full loop: the test reads the
 // routed command to confirm it landed, and drives any quiescence transitions by
 // publishing events directly through the session.
-func sessionWithHubAndFakeLoop() (s *AgentSession, cmds chan command.Command, done chan struct{}) {
+func sessionWithHubAndFakeLoop() (s *Sesssion, cmds chan command.Command, done chan struct{}) {
 	cmds = make(chan command.Command)
 	done = make(chan struct{})
 	sessionCtx, sessionCancel := context.WithCancel(context.Background())
 	id := mustUUID()
 	primaryLoopID := mustUUID()
-	s = &AgentSession{
+	s = &Sesssion{
 		SessionID:     id,
 		hub:           hub.New(id),
 		sessionCtx:    sessionCtx,

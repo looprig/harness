@@ -300,16 +300,16 @@ func TestRoutingMethodsLoopNotFound(t *testing.T) {
 	callID := mustUUID()
 	tests := []struct {
 		name string
-		call func(s *AgentSession) error
+		call func(s *Sesssion) error
 	}{
-		{name: "Invoke", call: func(s *AgentSession) error { _, err := s.Invoke(context.Background(), nil); return err }},
-		{name: "Stream", call: func(s *AgentSession) error { _, err := s.Stream(context.Background(), nil); return err }},
-		{name: "Interrupt", call: func(s *AgentSession) error { _, err := s.Interrupt(context.Background()); return err }},
+		{name: "Invoke", call: func(s *Sesssion) error { _, err := s.Invoke(context.Background(), nil); return err }},
+		{name: "Stream", call: func(s *Sesssion) error { _, err := s.Stream(context.Background(), nil); return err }},
+		{name: "Interrupt", call: func(s *Sesssion) error { _, err := s.Interrupt(context.Background()); return err }},
 		// Approve/Deny/ProvideUserInput route through routeCommand, which performs
 		// the same loopFor(primaryLoopID) lookup behind the gate-answer methods.
-		{name: "Approve", call: func(s *AgentSession) error { return s.Approve(context.Background(), callID, tool.ScopeOnce) }},
-		{name: "Deny", call: func(s *AgentSession) error { return s.Deny(context.Background(), callID) }},
-		{name: "ProvideUserInput", call: func(s *AgentSession) error { return s.ProvideUserInput(context.Background(), callID, "x") }},
+		{name: "Approve", call: func(s *Sesssion) error { return s.Approve(context.Background(), callID, tool.ScopeOnce) }},
+		{name: "Deny", call: func(s *Sesssion) error { return s.Deny(context.Background(), callID) }},
+		{name: "ProvideUserInput", call: func(s *Sesssion) error { return s.ProvideUserInput(context.Background(), callID, "x") }},
 	}
 	for _, tt := range tests {
 		tt := tt
@@ -369,7 +369,7 @@ func TestNewLoopReturnsLoopNewError(t *testing.T) {
 	sessionCtx, sessionCancel := context.WithCancel(context.Background())
 	t.Cleanup(sessionCancel)
 	primaryLoopID := mustUUID()
-	s := &AgentSession{
+	s := &Sesssion{
 		SessionID:     mustUUID(),
 		sessionCtx:    sessionCtx,
 		sessionCancel: sessionCancel,
@@ -470,12 +470,12 @@ func TestStampsCommandHeaderID(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
 		name        string
-		call        func(t *testing.T, s *AgentSession)
+		call        func(t *testing.T, s *Sesssion)
 		observeable bool // true when the stamped ID surfaces via sink CausationID
 	}{
 		{
 			name: "Invoke",
-			call: func(t *testing.T, s *AgentSession) {
+			call: func(t *testing.T, s *Sesssion) {
 				if _, err := s.Invoke(context.Background(), nil); err != nil {
 					t.Fatalf("Invoke: %v", err)
 				}
@@ -484,7 +484,7 @@ func TestStampsCommandHeaderID(t *testing.T) {
 		},
 		{
 			name: "Stream",
-			call: func(t *testing.T, s *AgentSession) {
+			call: func(t *testing.T, s *Sesssion) {
 				sr, err := s.Stream(context.Background(), nil)
 				if err != nil {
 					t.Fatalf("Stream: %v", err)
@@ -502,7 +502,7 @@ func TestStampsCommandHeaderID(t *testing.T) {
 		},
 		{
 			name: "Interrupt",
-			call: func(t *testing.T, s *AgentSession) {
+			call: func(t *testing.T, s *Sesssion) {
 				if _, err := s.Interrupt(context.Background()); err != nil {
 					t.Fatalf("Interrupt: %v", err)
 				}
@@ -510,7 +510,7 @@ func TestStampsCommandHeaderID(t *testing.T) {
 		},
 		{
 			name: "Shutdown",
-			call: func(t *testing.T, s *AgentSession) {
+			call: func(t *testing.T, s *Sesssion) {
 				if err := s.Shutdown(context.Background()); err != nil {
 					t.Fatalf("Shutdown: %v", err)
 				}
@@ -570,12 +570,12 @@ func TestNewCommandIDGenerationFailure(t *testing.T) {
 
 	tests := []struct {
 		name string
-		call func(s *AgentSession) error
+		call func(s *Sesssion) error
 	}{
-		{name: "Invoke", call: func(s *AgentSession) error { _, err := s.Invoke(context.Background(), nil); return err }},
-		{name: "Stream", call: func(s *AgentSession) error { _, err := s.Stream(context.Background(), nil); return err }},
-		{name: "Interrupt", call: func(s *AgentSession) error { _, err := s.Interrupt(context.Background()); return err }},
-		{name: "Shutdown", call: func(s *AgentSession) error { return s.Shutdown(context.Background()) }},
+		{name: "Invoke", call: func(s *Sesssion) error { _, err := s.Invoke(context.Background(), nil); return err }},
+		{name: "Stream", call: func(s *Sesssion) error { _, err := s.Stream(context.Background(), nil); return err }},
+		{name: "Interrupt", call: func(s *Sesssion) error { _, err := s.Interrupt(context.Background()); return err }},
+		{name: "Shutdown", call: func(s *Sesssion) error { return s.Shutdown(context.Background()) }},
 	}
 	for _, tt := range tests {
 		tt := tt
@@ -1078,12 +1078,12 @@ func TestShutdownSurfacesLoopTerminatedError(t *testing.T) {
 // reading the unbuffered Commands channel directly captures the exact command the
 // session sent. cmds is unbuffered to mirror the real loop.Commands, so a send is
 // observable only when the test (or a closed Done) is ready.
-func sessionWithFakeLoop() (s *AgentSession, cmds chan command.Command, done chan struct{}) {
+func sessionWithFakeLoop() (s *Sesssion, cmds chan command.Command, done chan struct{}) {
 	cmds = make(chan command.Command)
 	done = make(chan struct{})
 	sessionCtx, sessionCancel := context.WithCancel(context.Background())
 	primaryLoopID := mustUUID()
-	s = &AgentSession{
+	s = &Sesssion{
 		SessionID:     mustUUID(),
 		sessionCtx:    sessionCtx,
 		sessionCancel: sessionCancel,
@@ -1114,12 +1114,12 @@ func TestGateCommandsSendCorrectCommand(t *testing.T) {
 	callID := mustUUID()
 	tests := []struct {
 		name   string
-		call   func(s *AgentSession) error
+		call   func(s *Sesssion) error
 		verify func(t *testing.T, cmd command.Command)
 	}{
 		{
 			name: "Approve",
-			call: func(s *AgentSession) error { return s.Approve(context.Background(), callID, tool.ScopeSession) },
+			call: func(s *Sesssion) error { return s.Approve(context.Background(), callID, tool.ScopeSession) },
 			verify: func(t *testing.T, cmd command.Command) {
 				c, ok := cmd.(command.ApproveToolCall)
 				if !ok {
@@ -1138,7 +1138,7 @@ func TestGateCommandsSendCorrectCommand(t *testing.T) {
 		},
 		{
 			name: "Deny",
-			call: func(s *AgentSession) error { return s.Deny(context.Background(), callID) },
+			call: func(s *Sesssion) error { return s.Deny(context.Background(), callID) },
 			verify: func(t *testing.T, cmd command.Command) {
 				c, ok := cmd.(command.DenyToolCall)
 				if !ok {
@@ -1154,7 +1154,7 @@ func TestGateCommandsSendCorrectCommand(t *testing.T) {
 		},
 		{
 			name: "ProvideUserInput",
-			call: func(s *AgentSession) error { return s.ProvideUserInput(context.Background(), callID, "the answer") },
+			call: func(s *Sesssion) error { return s.ProvideUserInput(context.Background(), callID, "the answer") },
 			verify: func(t *testing.T, cmd command.Command) {
 				c, ok := cmd.(command.ProvideUserInput)
 				if !ok {
@@ -1207,11 +1207,11 @@ func TestGateCommandsFreshHeaderIDPerCall(t *testing.T) {
 	callID := mustUUID()
 	tests := []struct {
 		name string
-		call func(s *AgentSession) error
+		call func(s *Sesssion) error
 	}{
-		{name: "Approve", call: func(s *AgentSession) error { return s.Approve(context.Background(), callID, tool.ScopeOnce) }},
-		{name: "Deny", call: func(s *AgentSession) error { return s.Deny(context.Background(), callID) }},
-		{name: "ProvideUserInput", call: func(s *AgentSession) error { return s.ProvideUserInput(context.Background(), callID, "x") }},
+		{name: "Approve", call: func(s *Sesssion) error { return s.Approve(context.Background(), callID, tool.ScopeOnce) }},
+		{name: "Deny", call: func(s *Sesssion) error { return s.Deny(context.Background(), callID) }},
+		{name: "ProvideUserInput", call: func(s *Sesssion) error { return s.ProvideUserInput(context.Background(), callID, "x") }},
 	}
 	for _, tt := range tests {
 		tt := tt
@@ -1248,11 +1248,11 @@ func TestGateCommandsCtxCancelled(t *testing.T) {
 	callID := mustUUID()
 	tests := []struct {
 		name string
-		call func(s *AgentSession, ctx context.Context) error
+		call func(s *Sesssion, ctx context.Context) error
 	}{
-		{name: "Approve", call: func(s *AgentSession, ctx context.Context) error { return s.Approve(ctx, callID, tool.ScopeOnce) }},
-		{name: "Deny", call: func(s *AgentSession, ctx context.Context) error { return s.Deny(ctx, callID) }},
-		{name: "ProvideUserInput", call: func(s *AgentSession, ctx context.Context) error { return s.ProvideUserInput(ctx, callID, "x") }},
+		{name: "Approve", call: func(s *Sesssion, ctx context.Context) error { return s.Approve(ctx, callID, tool.ScopeOnce) }},
+		{name: "Deny", call: func(s *Sesssion, ctx context.Context) error { return s.Deny(ctx, callID) }},
+		{name: "ProvideUserInput", call: func(s *Sesssion, ctx context.Context) error { return s.ProvideUserInput(ctx, callID, "x") }},
 	}
 	for _, tt := range tests {
 		tt := tt
@@ -1286,11 +1286,11 @@ func TestGateCommandsLoopExited(t *testing.T) {
 	callID := mustUUID()
 	tests := []struct {
 		name string
-		call func(s *AgentSession) error
+		call func(s *Sesssion) error
 	}{
-		{name: "Approve", call: func(s *AgentSession) error { return s.Approve(context.Background(), callID, tool.ScopeOnce) }},
-		{name: "Deny", call: func(s *AgentSession) error { return s.Deny(context.Background(), callID) }},
-		{name: "ProvideUserInput", call: func(s *AgentSession) error { return s.ProvideUserInput(context.Background(), callID, "x") }},
+		{name: "Approve", call: func(s *Sesssion) error { return s.Approve(context.Background(), callID, tool.ScopeOnce) }},
+		{name: "Deny", call: func(s *Sesssion) error { return s.Deny(context.Background(), callID) }},
+		{name: "ProvideUserInput", call: func(s *Sesssion) error { return s.ProvideUserInput(context.Background(), callID, "x") }},
 	}
 	for _, tt := range tests {
 		tt := tt
@@ -1323,11 +1323,11 @@ func TestGateCommandsIDGenerationFailure(t *testing.T) {
 	callID := mustUUID()
 	tests := []struct {
 		name string
-		call func(s *AgentSession) error
+		call func(s *Sesssion) error
 	}{
-		{name: "Approve", call: func(s *AgentSession) error { return s.Approve(context.Background(), callID, tool.ScopeOnce) }},
-		{name: "Deny", call: func(s *AgentSession) error { return s.Deny(context.Background(), callID) }},
-		{name: "ProvideUserInput", call: func(s *AgentSession) error { return s.ProvideUserInput(context.Background(), callID, "x") }},
+		{name: "Approve", call: func(s *Sesssion) error { return s.Approve(context.Background(), callID, tool.ScopeOnce) }},
+		{name: "Deny", call: func(s *Sesssion) error { return s.Deny(context.Background(), callID) }},
+		{name: "ProvideUserInput", call: func(s *Sesssion) error { return s.ProvideUserInput(context.Background(), callID, "x") }},
 	}
 	for _, tt := range tests {
 		tt := tt

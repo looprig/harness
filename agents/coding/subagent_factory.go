@@ -115,7 +115,7 @@ func (f *codingFactory) New(ctx context.Context, skill string) (tools.Subsession
 // assistant text. It owns the child's lifetime and tears it down after Invoke so
 // a spawn never leaks the child actor goroutine.
 type childSubsession struct {
-	session *session.AgentSession
+	session *session.Sesssion
 	cancel  context.CancelFunc // cancels the child root; called after Invoke
 }
 
