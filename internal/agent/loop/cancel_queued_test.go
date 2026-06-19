@@ -136,18 +136,32 @@ func TestAbnormalTerminalReturnsQueuedInput(t *testing.T) {
 		bt := newBlockingTool()
 		tools := agenticToolSet([]tool.InvokableTool{bt}, 25, 100)
 		// Scripted client: turn 1 step 0 calls the blocking tool, holding the turn
-		// running; on release the next stream returns an empty response, which fails
-		// the turn (EmptyResponseError -> TurnFailed).
+		// running; on release the next stream (step 1) returns an empty response, which
+		// fails the turn (EmptyResponseError -> TurnFailed). The input is queued at the
+		// START of the empty step 1 — AFTER step 0's tool-continuation drain, so it is
+		// NOT folded — so the failure returns it via InputCancelled{CancelTurnFailed}.
+		queuedID := mustID(t)
+		var l *Loop
 		client := &scriptedLLM{scripts: [][]content.Chunk{
-			{toolUseChunk(0, "id-1", "Block", `{}`)}, // hold the turn running
-			{}, // empty -> EmptyResponseError -> TurnFailed
+			{toolUseChunk(0, "id-1", "Block", `{}`)}, // step 0: hold the turn running
+			{}, // step 1: empty -> EmptyResponseError -> TurnFailed
 		}}
 		ctx, cancel := context.WithCancel(context.Background())
 		t.Cleanup(cancel)
 		sessionID, _ := uuid.New()
 		loopID, _ := uuid.New()
 		sink := &captureSink{}
-		l, err := New(ctx, sessionID, loopID, Provenance{}, noopPublisher{},
+		client.onStreamN = map[int]func(){
+			1: func() {
+				ack := make(chan command.Disposition, 1)
+				l.Commands <- command.UserInput{Header: command.Header{ID: queuedID}, Mode: command.AllowFold, Blocks: textBlocks("queued"), Ack: ack}
+				if _, ok := (<-ack).(command.InputQueued); !ok {
+					t.Errorf("submit at step 1 not queued")
+				}
+			},
+		}
+		var err error
+		l, err = New(ctx, sessionID, loopID, Provenance{}, noopPublisher{},
 			Config{Client: client, Model: llm.ModelSpec{Model: "m"}, Tools: tools, Sinks: []event.EventSink{sink}, DrainTimeout: 500 * time.Millisecond})
 		if err != nil {
 			t.Fatalf("New: %v", err)
@@ -160,14 +174,7 @@ func TestAbnormalTerminalReturnsQueuedInput(t *testing.T) {
 		}()
 		<-bt.started
 
-		queuedID := mustID(t)
-		ack := make(chan command.Disposition, 1)
-		l.Commands <- command.UserInput{Header: command.Header{ID: queuedID}, Mode: command.AllowFold, Blocks: textBlocks("queued"), Ack: ack}
-		if _, ok := (<-ack).(command.InputQueued); !ok {
-			t.Fatal("submit not queued")
-		}
-
-		close(bt.release) // tool returns; next stream is empty -> TurnFailed
+		close(bt.release) // tool returns; step 0 drains (inbox empty), then step 1 queues + fails
 
 		blockUntilSink(t, sink, func(evs []event.EventEnvelope) bool {
 			for _, e := range evs {

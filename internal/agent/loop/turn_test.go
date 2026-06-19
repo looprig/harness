@@ -27,6 +27,14 @@ type turnRecorder struct {
 	committed content.AgenticMessages // groups appended by commit, in order
 	commits   []turnCommit
 	commitErr error // when non-nil, commit returns it without committing
+
+	// drainBatches is the queue of foldedMsg batches drainPending returns, one per
+	// drain call (a nil/empty default means "no pending input" — the common case for
+	// the multi-step tool tests that do not exercise folding). drainCalls counts the
+	// drainPending invocations, and drainErr (when set) makes drainPending return it.
+	drainBatches [][]foldedMsg
+	drainCalls   int
+	drainErr     error
 }
 
 func (r *turnRecorder) emit(ev event.Event) {
@@ -47,6 +55,23 @@ func (r *turnRecorder) commit(ctx context.Context, tc turnCommit) error {
 	// stream, AFTER appending. Record that ordering here.
 	r.stream = append(r.stream, tc.Event)
 	return nil
+}
+
+// drainPending mirrors the actor's tool-continuation drain: it returns the next
+// queued batch (nil/empty when there is no pending input) and records the call. The
+// fixture's default has no batches, so the multi-step tool tests fold nothing.
+func (r *turnRecorder) drainPending(ctx context.Context) ([]foldedMsg, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.drainErr != nil {
+		return nil, r.drainErr
+	}
+	i := r.drainCalls
+	r.drainCalls++
+	if i < len(r.drainBatches) {
+		return r.drainBatches[i], nil
+	}
+	return nil, nil
 }
 
 func (r *turnRecorder) events() []event.Event {
@@ -103,14 +128,15 @@ func newTurnFixture(input []content.Block, base content.AgenticMessages, ts Tool
 	user := &content.UserMessage{Message: content.Message{Role: content.RoleUser, Blocks: input}}
 	st := newTurnState(id.sessionID, id.loopID, id.turnID, 1, uuid.UUID{}, user)
 	cfg := turnConfig{
-		base:    cloneMessages(base),
-		model:   llm.ModelSpec{Model: "m"},
-		tools:   ts,
-		client:  client,
-		gateReg: gateReg,
-		idGen:   uuid.New,
-		commit:  rec.commit,
-		emit:    rec.emit,
+		base:         cloneMessages(base),
+		model:        llm.ModelSpec{Model: "m"},
+		tools:        ts,
+		client:       client,
+		gateReg:      gateReg,
+		idGen:        uuid.New,
+		commit:       rec.commit,
+		drainPending: rec.drainPending,
+		emit:         rec.emit,
 	}
 	return cfg, st, rec
 }

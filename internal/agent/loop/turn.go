@@ -85,6 +85,20 @@ type turnConfig struct {
 	// wedging it.
 	commit func(context.Context, turnCommit) error
 
+	// drainPending is the tool-continuation handshake back to the actor. After a
+	// COMPLETED tool-using step commits (tool results appended), and BEFORE the
+	// mandatory next LLM request, runTurn calls it to pull every accepted inbox
+	// entry. The actor (the inbox's sole owner) pops + clears the inbox in order,
+	// moves the popped entries into an actor-owned draining buffer (so an abnormal
+	// terminal still returns them — they are no longer in the inbox), and replies the
+	// foldedMsgs. runTurn appends each message to turnState.msgs and commits a
+	// TurnFoldedInto for it via cfg.commit; the actor removes the entry from the
+	// draining buffer at that commit point. It MUST be ctx-cancellable (select on the
+	// reply AND turnCtx.Done) so an Interrupt/Shutdown during the handshake frees
+	// runTurn. runTurn never calls it after a no-tool final answer (a final answer is
+	// not a tool-continuation boundary).
+	drainPending func(context.Context) ([]foldedMsg, error)
+
 	// emit publishes this loop's events (TurnStarted is actor-emitted; runTurn emits
 	// TokenDeltas, tool lifecycle events, and the turn terminal). StepDone is NOT
 	// emitted here — it is emitted by the actor at the commit point.
@@ -96,6 +110,18 @@ type turnConfig struct {
 type turnCommit struct {
 	Messages content.AgenticMessages
 	Event    event.Event
+}
+
+// foldedMsg is one drained inbox entry handed back to runTurn at a tool-continuation
+// boundary. It carries the message to fold AND the provenance runTurn needs to stamp
+// the TurnFoldedInto event: inputID (-> Header.CausationID + InputID) and triggeredBy
+// (-> Header.TriggeredByLoopID, set for a SubagentResult hand-back, zero for a plain
+// UserInput). triggeredBy is what releases the parent's {wake} quiescence token on the
+// publish path, so it MUST survive the drain handshake.
+type foldedMsg struct {
+	inputID     uuid.UUID
+	triggeredBy uuid.UUID
+	msg         *content.UserMessage
 }
 
 // cloneMessages returns a copy of msgs with its OWN backing array (a fresh slice
@@ -225,8 +251,60 @@ func runTurn(ctx context.Context, cfg turnConfig, ts turnState) event.Event {
 			// already committed stay in loopState.msgs.
 			return event.TurnInterrupted{TurnIndex: ts.index}
 		}
-		// Loop: the next stream lets the model react to the tool results.
+
+		// Tool-continuation boundary: another LLM request is already required to send
+		// the tool results, so this is the ONLY point where queued input may fold. Pull
+		// every accepted inbox entry (ctx-cancellable), append each to the staged turn
+		// AFTER the tool results, and commit a TurnFoldedInto for it. A no-tool final
+		// answer (handled above) never reaches here, so folding cannot extend a turn
+		// past the model's final answer.
+		if ferr := foldPending(ctx, cfg, &ts); ferr != nil {
+			// The drain or a fold commit was cancelled (Interrupt/Shutdown) before it
+			// completed: treat as interrupt. Committed steps + any already-committed
+			// folds stay in loopState.msgs; the actor returns the rest of the inbox and
+			// the draining buffer via InputCancelled.
+			return event.TurnInterrupted{TurnIndex: ts.index}
+		}
+		// Loop: the next stream lets the model react to the tool results (and any
+		// folded user messages).
 	}
+}
+
+// foldPending drains the actor's inbox at a tool-continuation boundary and folds the
+// returned messages into the staged turn. For each drained entry it appends the
+// message to ts.msgs (after the just-committed tool results) and commits a
+// TurnFoldedInto for it through the ctx-cancellable cfg.commit handshake (the actor
+// appends it to loopState.msgs, emits TurnFoldedInto, and clears it from the draining
+// buffer at the same point). A cancellation (drain or commit) returns an error so
+// runTurn stops; nothing is folded twice and the actor still owns returning the
+// not-yet-committed entries.
+func foldPending(ctx context.Context, cfg turnConfig, ts *turnState) error {
+	batch, err := cfg.drainPending(ctx)
+	if err != nil {
+		return err
+	}
+	for _, fm := range batch {
+		ts.msgs = append(ts.msgs, fm.msg)
+		fold := turnCommit{
+			Messages: content.AgenticMessages{fm.msg},
+			Event: event.TurnFoldedInto{
+				Header: event.Header{
+					SessionID:         ts.sessionID,
+					LoopID:            ts.loopID,
+					TurnID:            ts.id,
+					CausationID:       fm.inputID,
+					TriggeredByLoopID: fm.triggeredBy,
+				},
+				TurnIndex: ts.index,
+				InputID:   fm.inputID,
+				Message:   fm.msg,
+			},
+		}
+		if cerr := cfg.commit(ctx, fold); cerr != nil {
+			return cerr
+		}
+	}
+	return nil
 }
 
 // requestMessages builds the LLM request message slice from the committed base

@@ -9,7 +9,6 @@ import (
 	"github.com/inventivepotter/urvi/internal/agent/loop/event"
 	"github.com/inventivepotter/urvi/internal/content"
 	"github.com/inventivepotter/urvi/internal/llm"
-	"github.com/inventivepotter/urvi/internal/tool"
 	"github.com/inventivepotter/urvi/internal/uuid"
 )
 
@@ -222,17 +221,17 @@ func TestShuttingDownRejected(t *testing.T) {
 
 // TestNormalCompletionPopsInbox: a turn that completes normally with a non-empty
 // inbox makes the actor pop the FIRST queued entry and start a later turn from it.
-// The first turn is parked in a blocking tool (so it is running while we queue),
-// then released so it completes (TurnDone); the queued input then drives a second
-// TurnStarted carrying its InputID.
+// Turn 1 is a single no-tool text step; the input is queued at the START of that step
+// (after any drain, so it is NOT folded — folding happens only at a tool-continuation
+// boundary), so on the normal terminal the actor pops it and starts turn 2, which
+// drives a second TurnStarted carrying its InputID.
 func TestNormalCompletionPopsInbox(t *testing.T) {
 	t.Parallel()
-	bt := newBlockingTool()
-	ts := agenticToolSet([]tool.InvokableTool{bt}, 25, 100)
+	ts := agenticToolSet(nil, 25, 100)
+	queuedID := mustID(t)
 	client := &scriptedLLM{scripts: [][]content.Chunk{
-		{toolUseChunk(0, "id-1", "Block", `{}`)}, // turn 1 step 0: blocking tool
-		{textChunk("done turn 1")},               // turn 1 step 1: text -> TurnDone
-		{textChunk("done turn 2")},               // turn 2 (from queued input) -> TurnDone
+		{textChunk("done turn 1")}, // turn 1: single text step -> TurnDone (no fold)
+		{textChunk("done turn 2")}, // turn 2 (from queued input) -> TurnDone
 	}}
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
@@ -245,26 +244,30 @@ func TestNormalCompletionPopsInbox(t *testing.T) {
 		t.Fatalf("New: %v", err)
 	}
 
-	// Turn 1 starts (StartOnly), parks in the blocking tool.
+	// Queue a UserInput at the START of turn 1's only (no-tool) step. The turn is
+	// running, so it is accepted into the inbox; the no-tool step performs no drain, so
+	// it is not folded and waits for the on-idle pop.
+	client.mu.Lock()
+	client.onStreamN = map[int]func(){
+		0: func() {
+			ack := make(chan command.Disposition, 1)
+			l.Commands <- command.UserInput{Header: command.Header{ID: queuedID}, Mode: command.AllowFold, Ack: ack}
+			if _, ok := (<-ack).(command.InputQueued); !ok {
+				t.Errorf("queued submit during final step not InputQueued")
+			}
+		},
+	}
+	client.mu.Unlock()
+
+	// Turn 1 starts (StartOnly).
 	ev1, _ := startTurn(t, l, context.Background(), textBlocks("turn1"))
 	go func() { // drain turn 1's per-turn stream so emit never blocks
 		for range ev1 {
 		}
 	}()
-	<-bt.started // turn 1 is now running, parked in the tool
 
-	// Queue a UserInput while running; it must be accepted.
-	queuedID := mustID(t)
-	d := submitUserInput(t, l, queuedID, command.AllowFold)
-	if _, ok := d.(command.InputQueued); !ok {
-		t.Fatalf("queued submit disposition = %T, want InputQueued", d)
-	}
-
-	// Release the tool: turn 1 completes normally (TurnDone), then the actor pops
-	// the queued entry and starts turn 2 from it.
-	close(bt.release)
-
-	// A second event.TurnStarted must appear carrying the queued InputID.
+	// Turn 1 completes normally (TurnDone); the actor pops the queued entry and starts
+	// turn 2 from it. A second event.TurnStarted must appear carrying the queued InputID.
 	blockUntilSink(t, sink, func(evs []event.EventEnvelope) bool {
 		for _, e := range evs {
 			if ts, ok := e.Event.(event.TurnStarted); ok && ts.InputID == queuedID {

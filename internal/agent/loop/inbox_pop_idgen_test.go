@@ -11,7 +11,6 @@ import (
 	"github.com/inventivepotter/urvi/internal/agent/loop/event"
 	"github.com/inventivepotter/urvi/internal/content"
 	"github.com/inventivepotter/urvi/internal/llm"
-	"github.com/inventivepotter/urvi/internal/tool"
 	"github.com/inventivepotter/urvi/internal/uuid"
 )
 
@@ -51,19 +50,20 @@ func (g *flagIDGen) fail() {
 // fails to mint the TurnID, the popped entry must NOT be silently dropped: it must
 // be resolved with event.InputCancelled{CancelTurnFailed}.
 //
-// Setup: turn 1 parks in a blocking tool while we queue an entry. We then flip the
-// id-gen to fail and release the tool; turn 1 completes normally (TurnDone — its
-// terminal EventIDs mint zero best-effort), and the on-idle pop's TurnID mint
-// fails. The popped entry must surface as InputCancelled{CancelTurnFailed}.
+// Setup: turn 1 is a single no-tool text step so the queued entry is never folded
+// (folding happens only at a tool-continuation boundary). We queue the entry at the
+// START of that final step — after any drain, so it stays in the inbox to be popped
+// on idle — and flip the id-gen to fail in the same hook. Turn 1 completes normally
+// (TurnDone — its terminal EventIDs mint zero best-effort), and the on-idle pop's
+// TurnID mint fails. The popped entry must surface as InputCancelled{CancelTurnFailed}.
 func TestInboxPopIDGenFailureReturnsEntry(t *testing.T) {
 	t.Parallel()
 	gen := &flagIDGen{err: errIDGenForTest}
-	bt := newBlockingTool()
-	ts := agenticToolSet([]tool.InvokableTool{bt}, 25, 100)
+	ts := agenticToolSet(nil, 25, 100)
+	queuedID := mustID(t)
 	client := &scriptedLLM{scripts: [][]content.Chunk{
-		{toolUseChunk(0, "id-1", "Block", `{}`)}, // turn 1 step 0: blocking tool
-		{textChunk("done turn 1")},               // turn 1 step 1: text -> TurnDone
-		{textChunk("done turn 2")},               // turn 2 (should never start)
+		{textChunk("done turn 1")}, // turn 1: single text step -> TurnDone (no fold)
+		{textChunk("done turn 2")}, // turn 2 (should never start)
 	}}
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
@@ -82,25 +82,28 @@ func TestInboxPopIDGenFailureReturnsEntry(t *testing.T) {
 		t.Fatalf("New: %v", err)
 	}
 
-	// Turn 1 starts (StartOnly), parks in the blocking tool.
+	// Queue the entry at the START of turn 1's only (no-tool) step, then flip the
+	// id-gen to fail. The submit lands in the inbox (the turn is running) and, because
+	// the step requests no tools, no drain consumes it: it waits for the on-idle pop.
+	client.mu.Lock()
+	client.onStreamN = map[int]func(){
+		0: func() {
+			ack := make(chan command.Disposition, 1)
+			l.Commands <- command.UserInput{Header: command.Header{ID: queuedID}, Mode: command.AllowFold, Ack: ack}
+			if _, ok := (<-ack).(command.InputQueued); !ok {
+				t.Errorf("queued submit during final step not InputQueued")
+			}
+			gen.fail()
+		},
+	}
+	client.mu.Unlock()
+
+	// Turn 1 starts (StartOnly).
 	ev1, _ := startTurn(t, l, context.Background(), textBlocks("turn1"))
 	go func() { // drain turn 1's per-turn stream so emit never blocks
 		for range ev1 {
 		}
 	}()
-	<-bt.started // turn 1 is now running, parked in the tool
-
-	// Queue a UserInput while running; it must be accepted into the inbox.
-	queuedID := mustID(t)
-	d := submitUserInput(t, l, queuedID, command.AllowFold)
-	if _, ok := d.(command.InputQueued); !ok {
-		t.Fatalf("queued submit disposition = %T, want InputQueued", d)
-	}
-
-	// Force the id-gen to fail, then release the tool. Turn 1 completes normally
-	// (TurnDone); the on-idle pop's TurnID mint for the queued entry then fails.
-	gen.fail()
-	close(bt.release)
 
 	// The popped entry must NOT be stranded: it must surface as
 	// InputCancelled{CancelTurnFailed}. (Before the fix it is silently dropped.)

@@ -196,6 +196,16 @@ type loopState struct {
 	// abnormal-terminal return.
 	inbox []queuedInput
 
+	// draining holds inbox entries the actor popped for a tool-continuation drain but
+	// whose TurnFoldedInto has not yet been committed. The drain handshake moves
+	// entries here (out of inbox) at the drain point and replies them to runTurn;
+	// runTurn then commits a TurnFoldedInto per entry, and the commit point removes
+	// the matching entry from draining (it is now resolved). If the turn ends
+	// abnormally between the drain and a fold commit, these entries are no longer in
+	// inbox, so the abnormal-terminal path returns them from draining too (every
+	// removed entry is resolved exactly once). Actor-owned, like inbox.
+	draining []queuedInput
+
 	shutdownAcks []chan<- error
 
 	// pendingGates maps a tool call's CallID to the gate a parked runner is blocked
@@ -249,6 +259,18 @@ type commitRequest struct {
 	ack    chan<- struct{}
 }
 
+// drainRequest is the tool-continuation drain handshake from the turn goroutine to
+// the actor. The actor (the inbox's sole owner) pops + clears the inbox in order,
+// moves the popped entries into loopState.draining (so an abnormal terminal still
+// returns them), converts each to a foldedMsg, and sends them on reply. reply is
+// buffered(1): the actor never blocks sending it, and a runTurn that escapes on
+// turnCtx.Done (an Interrupt during the handshake) leaves the reply in the buffer
+// harmlessly — the moved entries are resolved by returnQueuedInbox via the draining
+// buffer on the resulting abnormal terminal, so nothing is stranded.
+type drainRequest struct {
+	reply chan<- []foldedMsg
+}
+
 // listen takes gateReg as a bidirectional channel: the actor is its sole reader
 // (the select below), and the per-turn goroutine hands the SEND side to runTurn
 // → RunBatch so a parked tool can register a gate. (A receive-only handle could
@@ -264,6 +286,12 @@ func listen(ctx context.Context, cfg Config, commands <-chan command.Command, ga
 	// ack), which serializes the per-turn stream so a step's TokenDeltas (emitted by
 	// runTurn) all precede that step's StepDone (emitted here by the actor).
 	commits := make(chan commitRequest)
+	// drains is the tool-continuation drain handshake channel. The turn goroutine
+	// sends one drainRequest per tool-continuation boundary; the actor (the sole
+	// reader, in its select) pops + clears the inbox into loopState.draining and
+	// replies the foldedMsgs. Unbuffered: the handshake is synchronous, so the actor
+	// is the only goroutine touching inbox/draining when it runs.
+	drains := make(chan drainRequest)
 
 	publish := func(ev event.Event) {
 		// SECURITY: the sink path is redacted; the per-turn stream (handled
@@ -480,6 +508,28 @@ func listen(ctx context.Context, cfg Config, commands <-chan command.Command, ga
 			}
 		}
 
+		// drainPending is the tool-continuation drain handshake. It is ctx-cancellable
+		// exactly like commit: it selects on the buffered(1) reply AND cctx.Done, so an
+		// Interrupt/Shutdown during the drain frees the parked runTurn instead of
+		// wedging it. The reply is buffered, so the actor's send never blocks even if
+		// runTurn has already escaped on cctx.Done (the moved-out inbox entries are then
+		// resolved from loopState.draining by the abnormal-terminal return path).
+		drainPending := func(cctx context.Context) ([]foldedMsg, error) {
+			reply := make(chan []foldedMsg, 1)
+			req := drainRequest{reply: reply}
+			select {
+			case drains <- req:
+			case <-cctx.Done():
+				return nil, &CommitError{Reason: CommitTurnCancelled, Cause: cctx.Err()}
+			}
+			select {
+			case batch := <-reply:
+				return batch, nil
+			case <-cctx.Done():
+				return nil, &CommitError{Reason: CommitTurnCancelled, Cause: cctx.Err()}
+			}
+		}
+
 		// emit is the turn goroutine's per-turn emit. It is nil-safe: a fan-in-only
 		// turn (nil events) publishes to sinks/fan-in only and never sends on a nil
 		// channel. The escapes (abandoned, turnCtx.Done) keep emit from pinning the
@@ -497,14 +547,15 @@ func listen(ctx context.Context, cfg Config, commands <-chan command.Command, ga
 		}
 
 		turnCfg := turnConfig{
-			base:    base,
-			model:   cfg.Model,
-			tools:   cfg.Tools,
-			client:  cfg.Client,
-			gateReg: gateReg,
-			idGen:   cfg.idGen,
-			commit:  commit,
-			emit:    emit,
+			base:         base,
+			model:        cfg.Model,
+			tools:        cfg.Tools,
+			client:       cfg.Client,
+			gateReg:      gateReg,
+			idGen:        cfg.idGen,
+			commit:       commit,
+			drainPending: drainPending,
+			emit:         emit,
 		}
 
 		go func() {
@@ -602,11 +653,21 @@ func listen(ctx context.Context, cfg Config, commands <-chan command.Command, ga
 		})
 	}
 
-	// returnQueuedInbox returns every still-queued inbox entry via returnEntry after
-	// an abnormal terminal (TurnFailed/TurnInterrupted). The actor does NOT auto-start
-	// a new turn from a returned entry — the client decides whether to resend.
-	// endedTurnID is the turn that ended (the cause of the return).
+	// returnQueuedInbox returns every still-unresolved queued entry via returnEntry
+	// after an abnormal terminal (TurnFailed/TurnInterrupted). It covers BOTH the inbox
+	// (entries never drained) AND the draining buffer (entries popped for a fold whose
+	// TurnFoldedInto never committed because the turn ended first) — without the
+	// draining sweep those popped entries would be silently stranded (no
+	// TurnFoldedInto, no InputCancelled). The actor does NOT auto-start a new turn from
+	// a returned entry — the client decides whether to resend. endedTurnID is the turn
+	// that ended (the cause of the return). The draining entries are returned BEFORE
+	// the inbox entries, preserving their original receive order (drained entries were
+	// queued earliest).
 	returnQueuedInbox := func(reason event.CancelReason, endedTurnID uuid.UUID) {
+		for _, qi := range state.draining {
+			returnEntry(qi, reason, endedTurnID)
+		}
+		state.draining = nil
 		for _, qi := range state.inbox {
 			returnEntry(qi, reason, endedTurnID)
 		}
@@ -628,6 +689,38 @@ func listen(ctx context.Context, cfg Config, commands <-chan command.Command, ga
 		qi := state.inbox[0]
 		state.inbox = state.inbox[1:]
 		return qi, true
+	}
+
+	// drainInbox is the tool-continuation drain: it pops + clears the ENTIRE inbox in
+	// order, MOVES the popped entries into state.draining (so they are still resolved
+	// if the turn ends abnormally before their TurnFoldedInto commits), and returns one
+	// foldedMsg per entry for runTurn to fold. It is the single place the inbox→draining
+	// move lives. Each moved entry leaves draining only via the commit point (its
+	// TurnFoldedInto resolves it) or via returnQueuedInbox (an abnormal terminal), so the
+	// inbox-exit invariant — every removed entry is resolved exactly once — still holds.
+	drainInbox := func() []foldedMsg {
+		if len(state.inbox) == 0 {
+			return nil
+		}
+		batch := make([]foldedMsg, 0, len(state.inbox))
+		for _, qi := range state.inbox {
+			batch = append(batch, foldedMsg{inputID: qi.inputID, triggeredBy: qi.triggeredBy, msg: qi.msg})
+		}
+		state.draining = append(state.draining, state.inbox...)
+		state.inbox = nil
+		return batch
+	}
+
+	// removeDraining drops the entry with inputID from state.draining at its
+	// TurnFoldedInto commit point (it is now resolved by that event). It is a no-op if
+	// the id is absent (defensive — a fold is committed exactly once).
+	removeDraining := func(inputID uuid.UUID) {
+		for i, qi := range state.draining {
+			if qi.inputID == inputID {
+				state.draining = append(state.draining[:i], state.draining[i+1:]...)
+				return
+			}
+		}
 	}
 
 	// cancelQueued resolves a CancelQueuedInput against the actor-owned inbox. If
@@ -742,17 +835,32 @@ func listen(ctx context.Context, cfg Config, commands <-chan command.Command, ga
 			state.pendingGates[reg.callID] = gate{reply: reg.reply, kind: reg.kind}
 			close(reg.ack)
 
+		case req := <-drains:
+			// Tool-continuation drain: pop + clear the inbox into draining and reply the
+			// foldedMsgs. The actor is the sole owner of inbox/draining, and the turn
+			// goroutine is parked in cfg.drainPending while this runs, so there is no
+			// concurrent access. The reply is buffered(1); the send never blocks. The
+			// drained entries are now in draining and are resolved either by their
+			// TurnFoldedInto commit (below) or by returnQueuedInbox on an abnormal
+			// terminal — never silently lost.
+			req.reply <- drainInbox()
+
 		case req := <-commits:
 			// Loop-owned incremental commit: the actor is the SOLE mutator of
 			// loopState.msgs. It appends the completed step group AND emits the
-			// Enduring StepDone at the SAME point, so StepDone is never a lie (it
-			// always reflects already-committed history). The turn goroutine is parked
-			// in cfg.commit while this runs, so emitTurn here cannot race the turn
-			// goroutine's TokenDelta emits — a step's TokenDeltas all precede its
-			// StepDone on the per-turn stream. Ack last so the runner only resumes
-			// (and emits the NEXT step's deltas) after this StepDone is on the stream.
+			// Enduring StepDone (or TurnFoldedInto, for a fold) at the SAME point, so
+			// the event is never a lie (it always reflects already-committed history).
+			// The turn goroutine is parked in cfg.commit while this runs, so emitTurn
+			// here cannot race the turn goroutine's TokenDelta emits. Ack last so the
+			// runner only resumes after the event is on the stream.
 			state.msgs = append(state.msgs, req.commit.Messages...)
 			emitTurn(req.commit.Event)
+			// A folded user message is now committed: resolve its draining entry (its
+			// TurnFoldedInto was just emitted), so the abnormal-terminal return path
+			// does not also return it. StepDone commits carry no inbox entry.
+			if fi, ok := req.commit.Event.(event.TurnFoldedInto); ok {
+				removeDraining(fi.InputID)
+			}
 			req.ack <- struct{}{}
 
 		case result := <-internal:
