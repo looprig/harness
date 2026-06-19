@@ -326,15 +326,20 @@ func newLoopState(sessionID uuid.UUID, loopID uuid.UUID, parent Provenance) loop
 // runLoop is the loop goroutine started by New. It is the only goroutine that
 // mutates loopState, installs or clears activeTurn, closes activeTurn.events,
 // commits or discards turn messages, emits TurnStarted/StepDone/TurnFoldedInto
-// at the same points it mutates loopState.msgs, and resolves pending gates.
-func runLoop(ctx context.Context, cfg loopConfig)
+// at the same points it mutates loopState.msgs, and resolves pending gates. The
+// loop lifetime context is cfg.loopCtx (each turn ctx derives from it); state is
+// passed as the second argument because it is what runLoop evolves, distinct from
+// the immutable cfg.
+func runLoop(cfg loopConfig, state loopState)
 ```
 
-The public `Loop` remains a handle over channels. `runLoop` can keep
-`loopConfig` and `loopState` as locals; no wrapper type is required unless the
-loop goroutine later needs receiver methods. `loopConfig` holds dependencies and
-construction-time wiring, while `loopState` holds identity, status, and
-accumulated messages.
+The public `Loop` remains a handle over channels. `runLoop` keeps `loopConfig`
+and `loopState` as locals; no wrapper type is required unless the loop goroutine
+later needs receiver methods. `loopConfig` holds dependencies and
+construction-time wiring (including `loopCtx` and the internal/commits/drains
+handshake channels), while `loopState` holds identity, status, and accumulated
+messages. The session event publisher lives in `loopConfig.events`, NOT in
+`loopState`: it is a dependency, and parking it in state would be an SRP smudge.
 
 `New(ctx, sessionID, loopID, parent, events, cfg)` owns the loop-side split: it
 validates `cfg`, validates the session event publisher, creates the loop
@@ -611,12 +616,13 @@ If that `AIMessage` contains tool-use blocks, executing those tools produces zer
 or more `ToolResultMessage`s. Those tool result messages belong to the same
 step, after the assistant message.
 
+Phase 10 (Open Items A) collapsed the placeholder `step{state stepState}`
+wrapper: it was a one-field struct with no methods and no runtime role, so
+`runStep` takes `stepState` directly. `stepState` owns the step's messages and
+block state.
+
 ```go
 type StepIndex uint64
-
-type step struct {
-    state stepState
-}
 
 type stepConfig struct {
     req    llm.Request
@@ -629,13 +635,9 @@ type stepResult struct {
     terminal event.Event // nil on success; non-nil when runTurn should stop
 }
 
-func newStep(state stepState) step {
-    return step{state: state}
-}
-
 // runStep owns one LLM request/response cycle. Config/dependencies stay at this
-// boundary; step owns one step's messages and block state.
-func runStep(ctx context.Context, cfg stepConfig, s step) stepResult
+// boundary; stepState owns one step's messages and block state.
+func runStep(ctx context.Context, cfg stepConfig, st stepState) stepResult
 
 type stepState struct {
     // sessionID is copied from turnState.
@@ -685,15 +687,12 @@ same `msgs`.
 
 The block layer owns assistant block accumulation for one step.
 
+Phase 10 (Open Items A) collapsed the placeholder `block{state blockState}`
+wrapper for the same reason as `step`: a one-field struct with no methods.
+`blockState` carries the materialization methods (`AIMessage`/`ToolUses`)
+directly, so callers use it without a wrapper.
+
 ```go
-type block struct {
-    state blockState
-}
-
-func newBlock(state blockState) block {
-    return block{state: state}
-}
-
 type blockState struct {
     // msgs is the assistant block state for one AIMessage:
     // thinking, text, and tool-use blocks accumulated from chunks.
@@ -2404,10 +2403,15 @@ listed here so it is not lost. Check items off as they are resolved.
   across packages — a readability/maintenance trap. Pick a distinct name for the
   disposition variant (e.g. `Started`). (See *Routing*, *Event API*.)
 
-- [ ] **Validate the thin wrapper types against real code.** `block` (`block{state}`)
-  and `chunkProcessor` may add little over their state structs; confirm they earn
-  their place once `runStep`/`runTurn` are written, and collapse them if not. (See
-  *Block*, *Chunk*.)
+- [x] **Validate the thin wrapper types against real code.** Resolved in Phase 10.
+  `block` (`block{state blockState}`) and `step` (`step{state stepState}`) were
+  one-field structs with no methods and no runtime role beyond holding their state —
+  every caller reached straight through to the inner state — so both were
+  **collapsed** (YAGNI): `runStep` takes `stepState` directly and `feedBlock` builds
+  `&blockState{}`. `chunkProcessor` is **kept**: it owns the per-chunk "emit
+  TokenDelta THEN accumulate" ordering (a real behavior, not just state), so it earns
+  its place. `turn` is **kept**: it is the real runtime type (events/abandoned/cancel/
+  pendingGates), inlined in the actor-owned loopState. (See *Block*, *Chunk*, *Step*.)
 
 - [ ] **Keep restated lists in sync (single-source drift).** The session-scoped
   event set, the Enduring set, and the quiescence transition rules are each
@@ -2415,9 +2419,12 @@ listed here so it is not lost. Check items off as they are resolved.
   Implementation Order). A change to one must be propagated to all; consider
   generating the invariant/testing lists from one canonical table.
 
-- [ ] **Add `SessionInterruptCanceled` to the `SessionError` kind set.** Introduced
-  by the non-blocking `Interrupt` send; ensure it joins `SessionLoopNotFound` /
-  `SessionLoopIDGenerationFailed` in the concrete kind enumeration. (See *Routing*.)
+- [x] **Add `SessionInterruptCanceled` to the `SessionError` kind set.** Reviewed in
+  Phase 10. The implemented `Interrupt`'s ctx-done escape already returns the existing
+  `SessionContextDone` kind (shared with every other session command send), and no
+  code references `SessionInterruptCanceled`. Rather than add a second kind for the
+  same failure mode, the error set is left as-is; `SessionInterruptCanceled` was a
+  spec-example name, not a distinct implemented failure. (See *Routing*.)
 
 ### B. Owned by follow-on specs (tracked, not lost)
 
