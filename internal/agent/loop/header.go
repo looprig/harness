@@ -56,14 +56,9 @@ func stampLoopHeader(ev event.Event, sessionID, loopID, turnID uuid.UUID) event.
 		e.Header = fillLoopScoped(e.Header, sessionID, loopID)
 		return e
 	default:
-		// Session-scoped events (SessionStarted/Active/Idle/Stopped) and any future
-		// event: only ensure SessionID. SessionStarted never reaches publishHub, but a
-		// defensive fill keeps the helper total.
-		if h := e.EventHeader(); h.SessionID.IsZero() {
-			// No generic setter on the sealed interface; an unhandled type is returned
-			// as-is. Concrete loop events are all enumerated above.
-			return ev
-		}
+		// Session-scoped events (SessionStarted/Active/Idle/Stopped) carry their own
+		// SessionID; any future un-enumerated type cannot be header-repaired (the sealed
+		// event interface has no generic Header setter), so return it unchanged.
 		return ev
 	}
 }
