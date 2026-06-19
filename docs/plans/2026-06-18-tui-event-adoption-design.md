@@ -134,7 +134,8 @@ Rendering one `AIMessage` (its blocks: `ThinkingBlock` / `TextBlock` / `ToolUseB
    `thinking · N lines · ctrl+t` collapsed). Unchanged (`renderThinking`).
 2. **Text present** → dot bullet, markdown: `● <text>` (`renderMD`). Unchanged.
 3. **Tool-use blocks present** → render each as an indented child card under the entry,
-   in block order (this is **built** — `stepDone`/`stepToolCard`, `tui/transcript.go`).
+   in block order (largely **built** — `stepDone`/`stepToolCard`, `tui/transcript.go`; the
+   fallback status is a known code gap, below).
    One card per `AIMessage` `ToolUseBlock`. The header is `ToolName` (`ToolUseBlock.Name`)
    + a redacted one-line args summary sourced by **reusing the resolved live card**: at
    `StepDone` the i-th `ToolUseBlock` is matched to the i-th in-flight live card (guarded
@@ -145,9 +146,10 @@ Rendering one `AIMessage` (its blocks: `ThinkingBlock` / `TextBlock` / `ToolUseB
    card streamed (a dropped `ToolCallStarted`, or a subagent-loop step the TUI only sees
    finalized): commit `ToolName` + the result, **no summary line** — body from the
    `StepDone` group's `ToolResultMessage` (correlated `ToolUseBlock.ID ==
-   ToolResultMessage.ToolUseID`), ✓/✗ from `ToolResultMessage.IsError`. So the essentials
-   (name, result, status) are always from the Enduring group; only the cosmetic summary
-   depends on the live card. **Live source:** `ToolCallStarted`/`Completed` (§4).
+   ToolResultMessage.ToolUseID`), ✓/✗ from `ToolResultMessage.IsError` (**code gap:** the
+   built `stepToolCard` fallback currently hardcodes `✓` and ignores `IsError` — a one-line
+   fix). So the essentials (name, result, status) are always from the Enduring group; only
+   the cosmetic summary depends on the live card. **Live source:** `ToolCallStarted`/`Completed` (§4).
 4. **Text empty but tool-use present** → instead of a bare `●`, render a **bold
    headline** beside the dot, with the tool cards as its children. The headline depends
    on phase:
@@ -179,8 +181,9 @@ The lone exception is the cosmetic one-line **summary**, reused from the resolve
 `ToolCallStarted` (and dropped to name + result on the dropped/subagent fallback — §3.3).
 A long-running tool still shows a spinner while it runs, and the frozen entry shows the
 authoritative name + result; the curated summary stands in for the raw args, which are
-never dumped. A dropped live signal costs only the transient
-spinner; the committed card self-heals at `StepDone`. Note the committed body is the
+never dumped. A dropped live signal costs the transient spinner **and** the committed
+card's one-line summary — the card self-heals to name + result at `StepDone` (only the
+cosmetic summary is lost). Note the committed body is the
 **full** `ToolResultMessage` content where the live body was the runner's **capped**
 `ResultPreview`, so `ctrl+t` expand on a committed card can reveal more than the live one
 did; the collapsed K-line fold still applies.
@@ -422,9 +425,8 @@ input emit `InputQueued`/`TurnRejected` (effectively just the primary loop; suba
   until then.
 - Deep subagent transcript nesting/styling is a follow-on; v1 targets a single primary
   loop inline + compact attributed subagent lines.
-- Native-scrollback flushing of committed entries moves from "flush on commit of
-  accumulated text" to "flush on `StepDone` commit"; verify no double-flush across the
-  provisional → committed swap.
+- Native-scrollback flushing of committed entries now happens on `StepDone` commit
+  (landed); the remaining check is no double-flush across the provisional → committed swap.
 - The working-word list is small and fixed; localization/configurability is out of
   scope.
 
