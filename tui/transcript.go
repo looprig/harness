@@ -293,12 +293,13 @@ func (m transcriptModel) ApplyEvent(ev event.Event) transcriptModel {
 }
 
 // CommitUser appends the user's submitted message as one kindUser entry with a
-// fresh stable ID and returns the next model. Blocks are the same []content.Block
-// the submit path builds (buildBlocks) and queues — text plus any @attachments.
-// It does NOT touch the live segment: a message submitted mid-turn (queued while
-// Running) must land in scrollback without truncating the in-progress assistant
-// output. An empty Blocks slice still commits one entry — emptiness is rejected
-// upstream at the input boundary, not here.
+// fresh stable ID and returns the next model. Its authoritative caller is
+// startTurnUser, which passes the loop's event Message.Blocks (the stored user
+// message) — NOT the submit-built blocks, which now only feed the queued affordance.
+// It does NOT touch the live segment: a message folded mid-turn must land in
+// scrollback without truncating the in-progress assistant output. An empty Blocks
+// slice still commits one entry — emptiness is rejected upstream at the input
+// boundary, not here.
 func (m transcriptModel) CommitUser(blocks []content.Block) transcriptModel {
 	m.nextID++
 	m.committed = append(m.committed, entry{ID: m.nextID, Kind: kindUser, Blocks: blocks})
@@ -307,7 +308,10 @@ func (m transcriptModel) CommitUser(blocks []content.Block) transcriptModel {
 
 // RecordSubmit registers a fire-and-forget submit by its correlation id so the
 // queued affordance can show the remembered blocks once the loop's InputQueued
-// event arrives. It is called by the Screen on a successful submitResultMsg. If an
+// event arrives. The remembered blocks are DISPLAY-ONLY and assumed immutable after
+// submit (the committed row comes from the event's authoritative Message, not these);
+// callers must not mutate the slice they pass. It is called by the Screen on a
+// successful submitResultMsg. If an
 // entry for inputID already exists (the InputQueued event raced ahead of the
 // submit result), this FILLS its blocks rather than appending a duplicate — so a
 // shown-but-blockless placeholder gets its text. Otherwise it appends a fresh

@@ -19,14 +19,15 @@ const (
 )
 
 // liveTailCap is the number of rows the live tail may occupy: the terminal height
-// less the status line, the slash panel (slashH, 0 when hidden) and the bottom box
+// less the status line, the rows reserved below the tail (reservedH = the slash
+// panel + the queued-input affordance, 0 when both hidden) and the bottom box
 // (sep + box border + contentH). contentH is the composer height in compose/answer
 // mode or the prompt-control height in prompt mode. The result is floored at 0 and
 // is never negative — when the chrome alone fills the terminal the tail vanishes
 // (its rows are already committed to scrollback at the next boundary).
-func liveTailCap(term, statusH, slashH, contentH int) int {
+func liveTailCap(term, statusH, reservedH, contentH int) int {
 	bottomH := sepH + boxBorderH + contentH
-	capacity := term - statusH - slashH - bottomH
+	capacity := term - statusH - reservedH - bottomH
 	if capacity < 0 {
 		return 0
 	}
