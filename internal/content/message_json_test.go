@@ -58,6 +58,31 @@ func TestToolResultMessageJSONPreservesToolUseID(t *testing.T) {
 			},
 			wantContains: []string{`"role":"tool"`, `"tool_use_id":"tu_outer"`},
 		},
+		{
+			name: "error result preserves IsError true on the wire",
+			in: content.ToolResultMessage{
+				Message: content.Message{
+					Role:   content.RoleTool,
+					Blocks: []content.Block{&content.TextBlock{Text: "tool error: boom"}},
+				},
+				ToolUseID: "tu_err",
+				IsError:   true,
+			},
+			// omitempty omits false; true is emitted as "is_error":true.
+			wantContains: []string{`"role":"tool"`, `"tool_use_id":"tu_err"`, `"is_error":true`},
+		},
+		{
+			name: "success result omits IsError on the wire (false)",
+			in: content.ToolResultMessage{
+				Message: content.Message{
+					Role:   content.RoleTool,
+					Blocks: []content.Block{&content.TextBlock{Text: "ok"}},
+				},
+				ToolUseID: "tu_ok",
+				IsError:   false,
+			},
+			wantContains: []string{`"role":"tool"`, `"tool_use_id":"tu_ok"`},
+		},
 	}
 
 	for _, tt := range tests {
@@ -79,6 +104,9 @@ func TestToolResultMessageJSONPreservesToolUseID(t *testing.T) {
 			}
 			if got.ToolUseID != tt.in.ToolUseID {
 				t.Errorf("ToolUseID = %q, want %q (dropped by promoted method?)", got.ToolUseID, tt.in.ToolUseID)
+			}
+			if got.IsError != tt.in.IsError {
+				t.Errorf("IsError = %v, want %v (dropped by codec?)", got.IsError, tt.in.IsError)
 			}
 			if !reflect.DeepEqual(got, tt.in) {
 				t.Errorf("round trip = %#v, want %#v", got, tt.in)

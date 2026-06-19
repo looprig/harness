@@ -31,9 +31,12 @@ type SystemMessage struct{ Message }
 
 // ToolResultMessage carries the result of a tool invocation back to the model.
 // ToolUseID ties this result to the specific ToolUseBlock that requested it.
+// IsError is true when the tool reported an error result; it is the message-level
+// error signal the loop carries from the result and the display layer reads.
 type ToolResultMessage struct {
 	Message
 	ToolUseID string
+	IsError   bool
 }
 
 // Conversation is a sealed interface: only message types defined in this
@@ -93,6 +96,7 @@ type toolResultMessageJSON struct {
 	Role      Role            `json:"role"`
 	Blocks    json.RawMessage `json:"blocks,omitempty"`
 	ToolUseID string          `json:"tool_use_id"`
+	IsError   bool            `json:"is_error,omitempty"`
 }
 
 func (m ToolResultMessage) MarshalJSON() ([]byte, error) {
@@ -104,7 +108,7 @@ func (m ToolResultMessage) MarshalJSON() ([]byte, error) {
 		}
 		blocks = b
 	}
-	return json.Marshal(toolResultMessageJSON{Role: m.Role, Blocks: blocks, ToolUseID: m.ToolUseID})
+	return json.Marshal(toolResultMessageJSON{Role: m.Role, Blocks: blocks, ToolUseID: m.ToolUseID, IsError: m.IsError})
 }
 
 func (m *ToolResultMessage) UnmarshalJSON(data []byte) error {
@@ -114,6 +118,7 @@ func (m *ToolResultMessage) UnmarshalJSON(data []byte) error {
 	}
 	m.Role = j.Role
 	m.ToolUseID = j.ToolUseID
+	m.IsError = j.IsError
 	if len(j.Blocks) > 0 {
 		blocks, err := UnmarshalBlocks(j.Blocks)
 		if err != nil {
