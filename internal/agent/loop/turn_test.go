@@ -15,8 +15,67 @@ import (
 	"github.com/inventivepotter/urvi/internal/uuid"
 )
 
+// turnRecorder stands in for the actor during runTurn unit tests. It records the
+// ordered per-turn stream the way the actor would observe it: cfg.emit events and
+// the StepDone delivered through cfg.commit BOTH funnel into `stream` in call
+// order, and each commit's Messages are appended to `committed` (the loopState.msgs
+// the actor owns). commit is synchronous and never cancelled, mirroring a healthy
+// actor; the cancellation path is exercised separately (commitErr / actor tests).
+type turnRecorder struct {
+	mu        sync.Mutex
+	stream    []event.Event           // emit() events + commit StepDone, in order
+	committed content.AgenticMessages // groups appended by commit, in order
+	commits   []turnCommit
+	commitErr error // when non-nil, commit returns it without committing
+}
+
+func (r *turnRecorder) emit(ev event.Event) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.stream = append(r.stream, ev)
+}
+
+func (r *turnRecorder) commit(ctx context.Context, tc turnCommit) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.commitErr != nil {
+		return r.commitErr
+	}
+	r.commits = append(r.commits, tc)
+	r.committed = append(r.committed, tc.Messages...)
+	// The actor emits the StepDone at the commit point, onto the same per-turn
+	// stream, AFTER appending. Record that ordering here.
+	r.stream = append(r.stream, tc.Event)
+	return nil
+}
+
+func (r *turnRecorder) events() []event.Event {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]event.Event(nil), r.stream...)
+}
+
+func (r *turnRecorder) committedMsgs() content.AgenticMessages {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append(content.AgenticMessages(nil), r.committed...)
+}
+
+// drainEmit appends every emitted event to events; a simple recording emit used
+// by step-level tests that do not need the full turnRecorder.
 func drainEmit(events *[]event.Event) func(event.Event) {
 	return func(ev event.Event) { *events = append(*events, ev) }
+}
+
+// stepDones returns the StepDone events from an emitted-event slice, in order.
+func stepDones(emitted []event.Event) []event.StepDone {
+	var out []event.StepDone
+	for _, e := range emitted {
+		if sd, ok := e.(event.StepDone); ok {
+			out = append(out, sd)
+		}
+	}
+	return out
 }
 
 // testIdentity mints a fresh (session, loop, turn) identity for a runTurn call so
@@ -33,14 +92,39 @@ func testIdentity() turnIdentity {
 	return turnIdentity{sessionID: must(), loopID: must(), turnID: must()}
 }
 
-// stepDones returns the StepDone events from an emitted-event slice, in order.
-func stepDones(emitted []event.Event) []event.StepDone {
-	var out []event.StepDone
-	for _, e := range emitted {
-		if sd, ok := e.(event.StepDone); ok {
-			out = append(out, sd)
-		}
+// newTurnFixture builds a turnConfig wired to a fresh turnRecorder plus a turnState
+// seeded with the input as the initial UserMessage. base is the pre-turn committed
+// history clone (the actor commits the initial UserMessage separately; in these
+// unit tests the committed view is base + recorder.committed). The committed
+// loop history a strict provider would see is committedHistory(base, rec).
+func newTurnFixture(input []content.Block, base content.AgenticMessages, ts ToolSet, client llm.LLM, gateReg chan<- gateRegistration) (turnConfig, turnState, *turnRecorder) {
+	rec := &turnRecorder{}
+	id := testIdentity()
+	user := &content.UserMessage{Message: content.Message{Role: content.RoleUser, Blocks: input}}
+	st := newTurnState(id.sessionID, id.loopID, id.turnID, 1, uuid.UUID{}, user)
+	cfg := turnConfig{
+		base:    cloneMessages(base),
+		model:   llm.ModelSpec{Model: "m"},
+		tools:   ts,
+		client:  client,
+		gateReg: gateReg,
+		idGen:   uuid.New,
+		commit:  rec.commit,
+		emit:    rec.emit,
 	}
+	return cfg, st, rec
+}
+
+// committedHistory reconstructs the loop history visible after a turn: the initial
+// UserMessage (which the actor commits up front) plus every committed step group.
+// In these unit tests base already EXCLUDES the initial UserMessage, so the
+// committed view is base + initial user + recorder groups. The fixture seeds the
+// user message into turnState; the actor would have appended it to loopState.msgs
+// at TurnStarted. We model that by prefixing it here.
+func committedHistory(base content.AgenticMessages, user *content.UserMessage, rec *turnRecorder) content.AgenticMessages {
+	out := append(content.AgenticMessages(nil), base...)
+	out = append(out, user)
+	out = append(out, rec.committedMsgs()...)
 	return out
 }
 
@@ -54,7 +138,7 @@ func stepDones(emitted []event.Event) []event.StepDone {
 // calls arrive than there are scripts, the last script is repeated (so an
 // "always calls tools" model is a single tool-call script repeated forever).
 // onStreamN, if set for an index, runs at the START of that Stream() call (used
-// to cancel ctx mid-loop). It records every request for toolDefs assertions.
+// to cancel ctx mid-loop). It records every request for toolDefs/base assertions.
 type scriptedLLM struct {
 	mu        sync.Mutex
 	scripts   [][]content.Chunk
@@ -144,7 +228,8 @@ func (e *echoTool) runCount() int {
 }
 
 // countToolUseInHistory counts tool_use blocks (in AIMessages) and ToolResultMessages.
-// A well-formed turn has equal counts; rollback to base leaves both at zero.
+// A well-formed committed history has equal counts; a discarded in-flight step
+// leaves no unpaired tool_use.
 func countToolUseInHistory(msgs content.AgenticMessages) (toolUse, toolMsg int) {
 	for _, m := range msgs {
 		switch v := m.(type) {
@@ -171,15 +256,12 @@ func agenticToolSet(reg []tool.InvokableTool, maxIters, maxCalls int) ToolSet {
 	})
 }
 
-// agenticCfg builds a turn Config wired like loop.New does: idGen defaulted to
-// the real uuid.New (RunBatch mints a CallID per call via this seam).
-func agenticCfg(ts ToolSet) Config {
-	return Config{Model: llm.ModelSpec{Model: "m"}, Tools: ts, idGen: uuid.New}
-}
-
 // noGateReg returns a gateReg channel that is never read (no EffectAsk in
 // auto-approve scenarios).
 func noGateReg() chan gateRegistration { return make(chan gateRegistration) }
+
+// initialUser pulls the initial UserMessage out of a turnState (always msgs[0]).
+func initialUser(ts turnState) *content.UserMessage { return ts.msgs[0].(*content.UserMessage) }
 
 func TestRunTurnAgentic(t *testing.T) {
 	t.Parallel()
@@ -188,14 +270,13 @@ func TestRunTurnAgentic(t *testing.T) {
 	t.Run("one tool round-trip then text-only completes with TurnDone", func(t *testing.T) {
 		t.Parallel()
 		echo := &echoTool{name: "Echo", output: "tool ran"}
-		cfg := agenticCfg(agenticToolSet([]tool.InvokableTool{echo}, 25, 100))
+		ts := agenticToolSet([]tool.InvokableTool{echo}, 25, 100)
 		client := &scriptedLLM{scripts: [][]content.Chunk{
 			{toolUseChunk(0, "id-1", "Echo", `{"x":1}`)}, // iter1: one tool call
 			{textChunk("all done")},                      // iter2: text-only → TurnDone
 		}}
-		var emitted []event.Event
-		id := testIdentity()
-		msgs, terminal := runTurn(context.Background(), input, 1, id, nil, cfg, client, noGateReg(), drainEmit(&emitted))
+		cfg, st, rec := newTurnFixture(input, nil, ts, client, noGateReg())
+		terminal := runTurn(context.Background(), cfg, st)
 
 		done, ok := terminal.(event.TurnDone)
 		if !ok {
@@ -205,16 +286,14 @@ func TestRunTurnAgentic(t *testing.T) {
 			t.Errorf("echo ran %d times, want 1", echo.runCount())
 		}
 
-		// A multi-step (tool-using) turn emits one StepDone per completed step, then
-		// the single turn terminal. Step 0 is the tool step (its group is the
-		// AIMessage + its ToolResultMessage); step 1 is the final text step (group is
-		// just the AIMessage).
-		sds := stepDones(emitted)
+		// A multi-step (tool-using) turn commits one step per completed step, each
+		// emitting a StepDone. Step 0 is the tool step (group = AIMessage + its
+		// ToolResultMessage); step 1 is the final text step (group = just the AIMessage).
+		sds := stepDones(rec.events())
 		if len(sds) != 2 {
 			t.Fatalf("StepDone count = %d, want 2 (one per completed step)", len(sds))
 		}
-		// Every StepDone is stamped from the turn identity, with distinct, non-zero
-		// StepIDs.
+		id := turnIdentity{sessionID: st.sessionID, loopID: st.loopID, turnID: st.id}
 		seenStepIDs := map[uuid.UUID]struct{}{}
 		for i, sd := range sds {
 			if sd.SessionID != id.sessionID || sd.LoopID != id.loopID || sd.TurnID != id.turnID {
@@ -229,7 +308,6 @@ func TestRunTurnAgentic(t *testing.T) {
 			}
 			seenStepIDs[sd.StepID] = struct{}{}
 		}
-		// Step 0's group: the tool-use AIMessage followed by its ToolResultMessage.
 		if len(sds[0].Messages) != 2 {
 			t.Fatalf("StepDone[0].Messages len = %d, want 2 (AIMessage + ToolResultMessage)", len(sds[0].Messages))
 		}
@@ -243,16 +321,17 @@ func TestRunTurnAgentic(t *testing.T) {
 		if trm.ToolUseID != "id-1" {
 			t.Errorf("StepDone[0] tool result ToolUseID = %q, want %q", trm.ToolUseID, "id-1")
 		}
-		// Step 1's group: just the final text AIMessage.
 		if len(sds[1].Messages) != 1 {
 			t.Fatalf("StepDone[1].Messages len = %d, want 1 (final AIMessage only)", len(sds[1].Messages))
 		}
 		if sds[1].Messages[0] != done.Message {
 			t.Errorf("StepDone[1].Messages[0] must be the final assistant message (== TurnDone.Message)")
 		}
-		// history: user, assistant(tool_use), tool message, assistant(text)
+
+		// committed history: user, assistant(tool_use), tool message, assistant(text).
+		msgs := committedHistory(cfg.base, initialUser(st), rec)
 		if len(msgs) != 4 {
-			t.Fatalf("history len = %d, want 4 (user, assistant tool_use, tool, assistant text)", len(msgs))
+			t.Fatalf("committed history len = %d, want 4 (user, assistant tool_use, tool, assistant text)", len(msgs))
 		}
 		if _, ok := msgs[0].(*content.UserMessage); !ok {
 			t.Errorf("msgs[0] = %T, want *UserMessage", msgs[0])
@@ -284,39 +363,31 @@ func TestRunTurnAgentic(t *testing.T) {
 		if tu != tmCount {
 			t.Errorf("unpaired tool_use: %d tool_use vs %d tool messages", tu, tmCount)
 		}
-	})
 
-	t.Run("text-only on the LIMIT iteration completes with TurnDone (cap does not fire)", func(t *testing.T) {
-		t.Parallel()
-		echo := &echoTool{name: "Echo", output: "ran"}
-		// maxIters=1: iter1 streams a tool call (iters becomes 1, == cap, OK),
-		// iter2 streams text-only → TurnDone (the cap is only checked when ANOTHER
-		// tool batch is requested, which never happens here).
-		cfg := agenticCfg(agenticToolSet([]tool.InvokableTool{echo}, 1, 100))
-		client := &scriptedLLM{scripts: [][]content.Chunk{
-			{toolUseChunk(0, "id-1", "Echo", `{}`)},
-			{textChunk("final answer")},
-		}}
-		var emitted []event.Event
-		_, terminal := runTurn(context.Background(), input, 1, testIdentity(), nil, cfg, client, noGateReg(), drainEmit(&emitted))
-		if _, ok := terminal.(event.TurnDone); !ok {
-			t.Fatalf("terminal = %T, want TurnDone (text-only on the limit iteration must win)", terminal)
+		// The continuation request must be built from base + staged turn msgs — never
+		// duplicating the committed groups. Request 2 (the tool continuation) carries:
+		// user, assistant(tool_use), tool message = 3 messages (base is empty here).
+		reqs := client.requests()
+		if len(reqs) != 2 {
+			t.Fatalf("recorded %d requests, want 2", len(reqs))
+		}
+		if len(reqs[1].Messages) != 3 {
+			t.Errorf("continuation request had %d messages, want 3 (user, assistant tool_use, tool)", len(reqs[1].Messages))
 		}
 	})
 
-	t.Run("model always calls tools → TurnFailed{ToolLimitError}, whole-turn rollback to base", func(t *testing.T) {
+	t.Run("model always calls tools → TurnFailed{ToolLimitError}; committed steps survive, in-flight discarded", func(t *testing.T) {
 		t.Parallel()
 		echo := &echoTool{name: "Echo", output: "ran"}
-		cfg := agenticCfg(agenticToolSet([]tool.InvokableTool{echo}, 3, 100))
+		ts := agenticToolSet([]tool.InvokableTool{echo}, 3, 100)
 		// A single tool-call script repeated forever → never a text-only iteration.
 		client := &scriptedLLM{scripts: [][]content.Chunk{
 			{toolUseChunk(0, "id-x", "Echo", `{}`)},
 		}}
 		// Pre-existing history so base != 0.
 		pre := content.AgenticMessages{&content.UserMessage{Message: content.Message{Role: content.RoleUser, Blocks: []content.Block{&content.TextBlock{Text: "earlier"}}}}}
-		base := len(pre)
-		var emitted []event.Event
-		msgs, terminal := runTurn(context.Background(), input, 1, testIdentity(), pre, cfg, client, noGateReg(), drainEmit(&emitted))
+		cfg, st, rec := newTurnFixture(input, pre, ts, client, noGateReg())
+		terminal := runTurn(context.Background(), cfg, st)
 
 		failed, ok := terminal.(event.TurnFailed)
 		if !ok {
@@ -326,47 +397,53 @@ func TestRunTurnAgentic(t *testing.T) {
 		if !errors.As(failed.Err, &tle) {
 			t.Fatalf("TurnFailed.Err = %T, want *ToolLimitError via errors.As", failed.Err)
 		}
-		if len(msgs) != base {
-			t.Fatalf("history len = %d, want %d (whole-turn rollback to base)", len(msgs), base)
-		}
-		// The pre-existing message must survive; the whole new turn must be gone.
-		if msgs[0] != pre[0] {
-			t.Errorf("rollback must preserve pre-turn history exactly")
-		}
-		// No unpaired tool_use survives — the rolled-back history encodes cleanly.
-		tu, tmCount := countToolUseInHistory(msgs)
-		if tu != 0 || tmCount != 0 {
-			t.Errorf("after rollback: %d tool_use, %d tool messages, want 0/0", tu, tmCount)
-		}
-		// The cap fires on the 4th iteration (maxIters=3): iterations 1-3 are
-		// COMPLETED tool steps that each emit a StepDone before the cap check on the
-		// uncompleted 4th. (Phase 7 emits StepDone directly via emit, so they fire
-		// even though the whole-turn rollback discards them from msgs; the per-step
-		// commit that makes the two atomic is Phase 8.)
-		if got := len(stepDones(emitted)); got != 3 {
+		// Step-granularity rollback (Phase 8): the cap fires on the UNCOMPLETED 4th
+		// iteration (maxIters=3). Iterations 1-3 are COMPLETED tool steps that each
+		// committed (StepDone + group) and STAY in committed history; only the
+		// in-flight 4th step is discarded. Committed history therefore holds:
+		// earlier(pre), user, then 3 × (assistant tool_use + tool message) = 1+1+6.
+		if got := len(stepDones(rec.events())); got != 3 {
 			t.Errorf("StepDone count = %d, want 3 (the 3 completed tool steps before the cap)", got)
+		}
+		if len(rec.commits) != 3 {
+			t.Errorf("commit count = %d, want 3 (3 completed steps committed)", len(rec.commits))
+		}
+		msgs := committedHistory(cfg.base, initialUser(st), rec)
+		if len(msgs) != 1+1+6 {
+			t.Fatalf("committed history len = %d, want 8 (pre, user, 3×(tool_use+tool))", len(msgs))
+		}
+		if msgs[0] != pre[0] {
+			t.Errorf("committed history must preserve pre-turn history exactly")
+		}
+		// Each committed tool_use is paired with its tool result — the in-flight 4th
+		// tool_use was never committed, so no unpaired tool_use survives.
+		tu, tmCount := countToolUseInHistory(msgs)
+		if tu != tmCount {
+			t.Errorf("unpaired tool_use after step-granularity rollback: %d tool_use vs %d tool messages", tu, tmCount)
+		}
+		if tu != 3 {
+			t.Errorf("committed tool_use count = %d, want 3 (the completed steps)", tu)
 		}
 	})
 
 	t.Run("malformed tool args → {} in stored assistant message + tool-result error; turn continues", func(t *testing.T) {
 		t.Parallel()
 		echo := &echoTool{name: "Echo", output: "ran"}
-		cfg := agenticCfg(agenticToolSet([]tool.InvokableTool{echo}, 25, 100))
+		ts := agenticToolSet([]tool.InvokableTool{echo}, 25, 100)
 		client := &scriptedLLM{scripts: [][]content.Chunk{
 			{toolUseChunk(0, "id-bad", "Echo", `{not valid json`)}, // malformed args
 			{textChunk("recovered")},                               // model reacts → TurnDone
 		}}
-		var emitted []event.Event
-		msgs, terminal := runTurn(context.Background(), input, 1, testIdentity(), nil, cfg, client, noGateReg(), drainEmit(&emitted))
+		cfg, st, rec := newTurnFixture(input, nil, ts, client, noGateReg())
+		terminal := runTurn(context.Background(), cfg, st)
 
 		if _, ok := terminal.(event.TurnDone); !ok {
 			t.Fatalf("terminal = %T, want TurnDone (turn recovers from malformed args)", terminal)
 		}
-		// The tool never runs (invalid args is a pre-exec failure in RunBatch).
 		if echo.runCount() != 0 {
 			t.Errorf("echo ran %d times, want 0 (invalid args)", echo.runCount())
 		}
-		// Stored assistant message sanitizes the bad Input to {}.
+		msgs := committedHistory(cfg.base, initialUser(st), rec)
 		ai1, ok := msgs[1].(*content.AIMessage)
 		if !ok {
 			t.Fatalf("msgs[1] = %T, want *AIMessage", msgs[1])
@@ -383,11 +460,9 @@ func TestRunTurnAgentic(t *testing.T) {
 		if string(tub.Input) != "{}" {
 			t.Errorf("stored tool_use Input = %q, want %q (sanitized)", string(tub.Input), "{}")
 		}
-		// The whole stored history must re-encode cleanly (no invalid JSON).
 		if !json.Valid(tub.Input) {
 			t.Errorf("stored tool_use Input is not valid JSON: %q", string(tub.Input))
 		}
-		// A tool-result error reached the model.
 		tm, ok := msgs[2].(*content.ToolResultMessage)
 		if !ok {
 			t.Fatalf("msgs[2] = %T, want *ToolResultMessage", msgs[2])
@@ -395,9 +470,8 @@ func TestRunTurnAgentic(t *testing.T) {
 		if got := flattenToText(tm.Blocks); got == "" {
 			t.Errorf("tool message must carry a non-empty error result, got %q", got)
 		}
-		// Exactly one Started + one Completed{IsError} for the malformed call.
 		var nStarted, nCompletedErr int
-		for _, ev := range emitted {
+		for _, ev := range rec.events() {
 			switch e := ev.(type) {
 			case event.ToolCallStarted:
 				nStarted++
@@ -416,25 +490,24 @@ func TestRunTurnAgentic(t *testing.T) {
 		t.Parallel()
 		echoA := &echoTool{name: "A", output: "ra"}
 		echoB := &echoTool{name: "B", output: "rb"}
-		cfg := agenticCfg(agenticToolSet([]tool.InvokableTool{echoA, echoB}, 25, 100))
+		ts := agenticToolSet([]tool.InvokableTool{echoA, echoB}, 25, 100)
 		client := &scriptedLLM{scripts: [][]content.Chunk{
 			{
-				// Index 1 first (out of order); fragments split across deltas.
 				toolUseChunk(1, "id-b", "B", `{"k"`),
 				toolUseChunk(0, "id-a", "A", `{"k"`),
 				toolUseChunk(1, "", "", `:2}`),
 				toolUseChunk(0, "", "", `:1}`),
-				// A pathological negative and huge Index must not panic.
 				toolUseChunk(-5, "id-neg", "A", `{}`),
 				toolUseChunk(1<<30, "id-huge", "B", `{}`),
 			},
 			{textChunk("done")},
 		}}
-		var emitted []event.Event
-		msgs, terminal := runTurn(context.Background(), input, 1, testIdentity(), nil, cfg, client, noGateReg(), drainEmit(&emitted))
+		cfg, st, rec := newTurnFixture(input, nil, ts, client, noGateReg())
+		terminal := runTurn(context.Background(), cfg, st)
 		if _, ok := terminal.(event.TurnDone); !ok {
 			t.Fatalf("terminal = %T, want TurnDone", terminal)
 		}
+		msgs := committedHistory(cfg.base, initialUser(st), rec)
 		ai1 := msgs[1].(*content.AIMessage)
 		var blocks []*content.ToolUseBlock
 		for _, b := range ai1.Blocks {
@@ -445,14 +518,12 @@ func TestRunTurnAgentic(t *testing.T) {
 		if len(blocks) != 4 {
 			t.Fatalf("folded %d tool_use blocks, want 4 (indices -5,0,1,2^30)", len(blocks))
 		}
-		// Emitted in ASCENDING Index order: -5, 0, 1, 1<<30 → ids neg, a, b, huge.
 		wantIDs := []string{"id-neg", "id-a", "id-b", "id-huge"}
 		for i, b := range blocks {
 			if b.ID != wantIDs[i] {
 				t.Errorf("block[%d].ID = %q, want %q (ascending Index order)", i, b.ID, wantIDs[i])
 			}
 		}
-		// Fragments concatenated per Index.
 		for _, b := range blocks {
 			if b.ID == "id-a" && string(b.Input) != `{"k":1}` {
 				t.Errorf("index 0 folded Input = %q, want %q", string(b.Input), `{"k":1}`)
@@ -463,13 +534,13 @@ func TestRunTurnAgentic(t *testing.T) {
 		}
 	})
 
-	t.Run("interrupt mid-loop → whole-turn rollback + TurnInterrupted", func(t *testing.T) {
+	t.Run("interrupt mid-loop → completed step survives, in-flight discarded, TurnInterrupted", func(t *testing.T) {
 		t.Parallel()
 		echo := &echoTool{name: "Echo", output: "ran"}
-		cfg := agenticCfg(agenticToolSet([]tool.InvokableTool{echo}, 25, 100))
+		ts := agenticToolSet([]tool.InvokableTool{echo}, 25, 100)
 		ctx, cancel := context.WithCancel(context.Background())
-		// iter1 streams a tool call and runs it; iter2's Stream() cancels ctx
-		// before producing any chunk → interrupt between iterations.
+		// iter1 streams a tool call and runs it (step 0 completes + commits); iter2's
+		// Stream() cancels ctx before producing any chunk → interrupt between steps.
 		client := &scriptedLLM{
 			scripts: [][]content.Chunk{
 				{toolUseChunk(0, "id-1", "Echo", `{}`)},
@@ -478,24 +549,29 @@ func TestRunTurnAgentic(t *testing.T) {
 			onStreamN: map[int]func(){1: cancel},
 		}
 		pre := content.AgenticMessages{&content.UserMessage{Message: content.Message{Role: content.RoleUser, Blocks: []content.Block{&content.TextBlock{Text: "earlier"}}}}}
-		base := len(pre)
-		var emitted []event.Event
-		msgs, terminal := runTurn(ctx, input, 1, testIdentity(), pre, cfg, client, noGateReg(), drainEmit(&emitted))
+		cfg, st, rec := newTurnFixture(input, pre, ts, client, noGateReg())
+		terminal := runTurn(ctx, cfg, st)
 
 		if _, ok := terminal.(event.TurnInterrupted); !ok {
 			t.Fatalf("terminal = %T, want TurnInterrupted", terminal)
 		}
-		if len(msgs) != base {
-			t.Errorf("history len = %d, want %d (whole-turn rollback)", len(msgs), base)
+		// Step 0 (the tool step) COMPLETED + committed before iter2's stream was
+		// interrupted, so exactly one StepDone was emitted and committed; the
+		// interrupted step 1 emits/commits none and is discarded.
+		if got := len(stepDones(rec.events())); got != 1 {
+			t.Errorf("StepDone count = %d, want 1 (only the completed step 0)", got)
+		}
+		if len(rec.commits) != 1 {
+			t.Errorf("commit count = %d, want 1 (only the completed step 0)", len(rec.commits))
+		}
+		// Committed history: earlier(pre), user, assistant(tool_use), tool message.
+		msgs := committedHistory(cfg.base, initialUser(st), rec)
+		if len(msgs) != 4 {
+			t.Fatalf("committed history len = %d, want 4 (pre, user, tool_use, tool)", len(msgs))
 		}
 		tu, tmCount := countToolUseInHistory(msgs)
-		if tu != 0 || tmCount != 0 {
-			t.Errorf("after interrupt rollback: %d tool_use, %d tool messages, want 0/0", tu, tmCount)
-		}
-		// Step 0 (the tool step) COMPLETED before iter2's stream was interrupted, so
-		// exactly one StepDone was emitted; the interrupted step 1 emits none.
-		if got := len(stepDones(emitted)); got != 1 {
-			t.Errorf("StepDone count = %d, want 1 (only the completed step 0)", got)
+		if tu != tmCount || tu != 1 {
+			t.Errorf("committed pairs: %d tool_use vs %d tool messages, want 1/1", tu, tmCount)
 		}
 	})
 
@@ -503,10 +579,10 @@ func TestRunTurnAgentic(t *testing.T) {
 		t.Parallel()
 		echoA := &echoTool{name: "A", output: "ra"}
 		echoB := &echoTool{name: "B", output: "rb"}
-		cfg := agenticCfg(agenticToolSet([]tool.InvokableTool{echoA, echoB}, 25, 100))
+		ts := agenticToolSet([]tool.InvokableTool{echoA, echoB}, 25, 100)
 		client := &scriptedLLM{scripts: [][]content.Chunk{{textChunk("hi")}}}
-		var emitted []event.Event
-		runTurn(context.Background(), input, 1, testIdentity(), nil, cfg, client, noGateReg(), drainEmit(&emitted))
+		cfg, st, _ := newTurnFixture(input, nil, ts, client, noGateReg())
+		runTurn(context.Background(), cfg, st)
 
 		reqs := client.requests()
 		if len(reqs) == 0 {
@@ -531,16 +607,52 @@ func TestRunTurnAgentic(t *testing.T) {
 		}
 	})
 
+	t.Run("request base = turnConfig.base + staged turn msgs (committed pre-history is used, not duplicated)", func(t *testing.T) {
+		t.Parallel()
+		echo := &echoTool{name: "Echo", output: "ran"}
+		ts := agenticToolSet([]tool.InvokableTool{echo}, 25, 100)
+		client := &scriptedLLM{scripts: [][]content.Chunk{
+			{toolUseChunk(0, "id-1", "Echo", `{}`)},
+			{textChunk("done")},
+		}}
+		pre := content.AgenticMessages{
+			&content.UserMessage{Message: content.Message{Role: content.RoleUser, Blocks: []content.Block{&content.TextBlock{Text: "older user"}}}},
+			&content.AIMessage{Message: content.Message{Role: content.RoleAssistant, Blocks: []content.Block{&content.TextBlock{Text: "older reply"}}}},
+		}
+		cfg, st, _ := newTurnFixture(input, pre, ts, client, noGateReg())
+		runTurn(context.Background(), cfg, st)
+
+		reqs := client.requests()
+		if len(reqs) != 2 {
+			t.Fatalf("recorded %d requests, want 2", len(reqs))
+		}
+		// Request 0 (first step): base (2) + initial user (1) = 3 messages.
+		if len(reqs[0].Messages) != 3 {
+			t.Errorf("request 0 had %d messages, want 3 (base 2 + user)", len(reqs[0].Messages))
+		}
+		// Request 1 (continuation): base (2) + user + assistant(tool_use) + tool = 5.
+		if len(reqs[1].Messages) != 5 {
+			t.Errorf("request 1 had %d messages, want 5 (base 2 + user + tool_use + tool)", len(reqs[1].Messages))
+		}
+		// The first two messages of every request are the committed pre-history,
+		// exactly once (not duplicated).
+		if reqs[0].Messages[0] != pre[0] || reqs[0].Messages[1] != pre[1] {
+			t.Errorf("request 0 did not start with the base pre-history")
+		}
+		if reqs[1].Messages[0] != pre[0] || reqs[1].Messages[1] != pre[1] {
+			t.Errorf("request 1 did not start with the base pre-history")
+		}
+	})
+
 	t.Run("call-cap fires when a batch exceeds MaxToolCallsPerTurn", func(t *testing.T) {
 		t.Parallel()
 		echo := &echoTool{name: "Echo", output: "ran"}
-		// maxCalls=1, but iter1 requests 2 calls → calls=2 > 1 → cap fires.
-		cfg := agenticCfg(agenticToolSet([]tool.InvokableTool{echo}, 25, 1))
+		ts := agenticToolSet([]tool.InvokableTool{echo}, 25, 1)
 		client := &scriptedLLM{scripts: [][]content.Chunk{
 			{toolUseChunk(0, "id-1", "Echo", `{}`), toolUseChunk(1, "id-2", "Echo", `{}`)},
 		}}
-		var emitted []event.Event
-		msgs, terminal := runTurn(context.Background(), input, 1, testIdentity(), nil, cfg, client, noGateReg(), drainEmit(&emitted))
+		cfg, st, rec := newTurnFixture(input, nil, ts, client, noGateReg())
+		terminal := runTurn(context.Background(), cfg, st)
 		failed, ok := terminal.(event.TurnFailed)
 		if !ok {
 			t.Fatalf("terminal = %T, want TurnFailed", terminal)
@@ -549,10 +661,10 @@ func TestRunTurnAgentic(t *testing.T) {
 		if !errors.As(failed.Err, &tle) {
 			t.Fatalf("TurnFailed.Err = %T, want *ToolLimitError", failed.Err)
 		}
-		if len(msgs) != 0 {
-			t.Errorf("history len = %d, want 0 (rollback to base)", len(msgs))
+		// The cap fires on the FIRST (uncompleted) step, so nothing is committed.
+		if len(rec.commits) != 0 {
+			t.Errorf("commit count = %d, want 0 (cap fires on the first uncompleted step)", len(rec.commits))
 		}
-		// Cap fires before RunBatch executes the batch.
 		if echo.runCount() != 0 {
 			t.Errorf("echo ran %d times, want 0 (cap fires before execution)", echo.runCount())
 		}
@@ -561,23 +673,22 @@ func TestRunTurnAgentic(t *testing.T) {
 
 func TestRunTurn(t *testing.T) {
 	t.Parallel()
-	// idGen is wired the same way loop.New does it: runTurn mints a StepID per step.
-	cfg := Config{Model: llm.ModelSpec{Model: "m"}, idGen: uuid.New}
 	input := []content.Block{&content.TextBlock{Text: "hi"}}
+	emptyTS := func() ToolSet { return resolveToolSetCaps(ToolSet{Permission: autoApproveGate{}}) }
 
-	t.Run("success appends user+assistant and returns TurnDone", func(t *testing.T) {
+	t.Run("success commits one step group and returns TurnDone", func(t *testing.T) {
 		t.Parallel()
 		client := &fakeLLM{chunks: []content.Chunk{textChunk("hel"), textChunk("lo")}}
-		var emitted []event.Event
-		id := testIdentity()
-		msgs, terminal := runTurn(context.Background(), input, 1, id, nil, cfg, client, noGateReg(), drainEmit(&emitted))
+		cfg, st, rec := newTurnFixture(input, nil, emptyTS(), client, noGateReg())
+		terminal := runTurn(context.Background(), cfg, st)
 
 		done, ok := terminal.(event.TurnDone)
 		if !ok {
 			t.Fatalf("terminal = %T, want TurnDone", terminal)
 		}
+		msgs := committedHistory(cfg.base, initialUser(st), rec)
 		if len(msgs) != 2 {
-			t.Fatalf("history len = %d, want 2 (user, assistant)", len(msgs))
+			t.Fatalf("committed history len = %d, want 2 (user, assistant)", len(msgs))
 		}
 		if _, ok := msgs[0].(*content.UserMessage); !ok {
 			t.Errorf("msgs[0] = %T, want *UserMessage", msgs[0])
@@ -590,9 +701,9 @@ func TestRunTurn(t *testing.T) {
 		if tb.Text != "hello" {
 			t.Errorf("assembled text = %q, want %q", tb.Text, "hello")
 		}
-		// A single-step, no-tool turn emits exactly one StepDone (its Messages is
-		// just the AIMessage), stamped from the turn identity, then the terminal.
-		sds := stepDones(emitted)
+		// A single-step, no-tool turn commits exactly one step (Messages is just the
+		// AIMessage) and emits its StepDone, stamped from the turn identity.
+		sds := stepDones(rec.events())
 		if len(sds) != 1 {
 			t.Fatalf("StepDone count = %d, want 1 (single no-tool step)", len(sds))
 		}
@@ -602,12 +713,14 @@ func TestRunTurn(t *testing.T) {
 		if sds[0].Messages[0] != done.Message {
 			t.Errorf("StepDone.Messages[0] must be the assistant message (== TurnDone.Message)")
 		}
-		if sds[0].SessionID != id.sessionID || sds[0].LoopID != id.loopID || sds[0].TurnID != id.turnID || sds[0].StepID.IsZero() {
+		if sds[0].SessionID != st.sessionID || sds[0].LoopID != st.loopID || sds[0].TurnID != st.id || sds[0].StepID.IsZero() {
 			t.Errorf("StepDone Header ids not stamped from identity: %+v", sds[0].Header)
 		}
-		// StepDone is emitted AFTER the step's TokenDeltas and BEFORE the terminal.
+		// Ordering: StepDone is recorded AFTER the step's TokenDeltas (the recorder
+		// funnels emit + commit into one ordered stream, like the actor's per-turn
+		// stream) and there is no StepDone before any TokenDelta.
 		var sawDelta, sawStepDone bool
-		for _, e := range emitted {
+		for _, e := range rec.events() {
 			switch e.(type) {
 			case event.TokenDelta:
 				sawDelta = true
@@ -623,12 +736,12 @@ func TestRunTurn(t *testing.T) {
 		}
 	})
 
-	t.Run("stream error rolls back user message, TurnFailed carries typed cause", func(t *testing.T) {
+	t.Run("stream error discards the in-flight step (no commit), TurnFailed carries typed cause", func(t *testing.T) {
 		t.Parallel()
 		boom := &llm.ValidationError{Field: "x", Reason: "boom"}
 		client := &fakeLLM{streamErr: boom}
-		var emitted []event.Event
-		msgs, terminal := runTurn(context.Background(), input, 1, testIdentity(), nil, cfg, client, noGateReg(), drainEmit(&emitted))
+		cfg, st, rec := newTurnFixture(input, nil, emptyTS(), client, noGateReg())
+		terminal := runTurn(context.Background(), cfg, st)
 
 		failed, ok := terminal.(event.TurnFailed)
 		if !ok {
@@ -638,20 +751,20 @@ func TestRunTurn(t *testing.T) {
 		if !errors.As(failed.Err, &ve) {
 			t.Fatalf("TurnFailed.Err = %T, want *llm.ValidationError via errors.As", failed.Err)
 		}
-		if len(msgs) != 0 {
-			t.Errorf("history len = %d, want 0 (user rolled back)", len(msgs))
+		// The step never finalized an AIMessage, so nothing was committed.
+		if len(rec.commits) != 0 {
+			t.Errorf("commit count = %d, want 0 (in-flight step discarded)", len(rec.commits))
 		}
-		// The step never finalized an AIMessage, so no StepDone is emitted.
-		if got := len(stepDones(emitted)); got != 0 {
+		if got := len(stepDones(rec.events())); got != 0 {
 			t.Errorf("StepDone count = %d, want 0 (step never completed)", got)
 		}
 	})
 
-	t.Run("empty response rolls back and returns EmptyResponseError", func(t *testing.T) {
+	t.Run("empty response discards the in-flight step and returns EmptyResponseError", func(t *testing.T) {
 		t.Parallel()
 		client := &fakeLLM{chunks: nil}
-		var emitted []event.Event
-		msgs, terminal := runTurn(context.Background(), input, 1, testIdentity(), nil, cfg, client, noGateReg(), drainEmit(&emitted))
+		cfg, st, rec := newTurnFixture(input, nil, emptyTS(), client, noGateReg())
+		terminal := runTurn(context.Background(), cfg, st)
 
 		failed, ok := terminal.(event.TurnFailed)
 		if !ok {
@@ -661,26 +774,20 @@ func TestRunTurn(t *testing.T) {
 		if !errors.As(failed.Err, &ere) {
 			t.Fatalf("TurnFailed.Err = %T, want *EmptyResponseError", failed.Err)
 		}
-		if len(msgs) != 0 {
-			t.Errorf("history len = %d, want 0 (user rolled back)", len(msgs))
+		if len(rec.commits) != 0 {
+			t.Errorf("commit count = %d, want 0 (empty response is not a completed step)", len(rec.commits))
 		}
-		// An empty response is not a completed step → no StepDone.
-		if got := len(stepDones(emitted)); got != 0 {
+		if got := len(stepDones(rec.events())); got != 0 {
 			t.Errorf("StepDone count = %d, want 0 (empty response is not a completed step)", got)
 		}
 	})
 
-	t.Run("empty-string-only chunks roll back and return EmptyResponseError (zero-length blocks, not zero blocks)", func(t *testing.T) {
+	t.Run("empty-string-only chunks discard the in-flight step and return EmptyResponseError", func(t *testing.T) {
 		t.Parallel()
-		// Unlike the chunks:nil case above (zero blocks), this stream emits real
-		// chunks whose text is empty. streamaccumulator.Text.received flips true on
-		// the first Add, but the loop decides emptiness on the materialized block
-		// TEXT (isEmptyAssistantMessage), so a zero-LENGTH text block must still be
-		// EmptyResponseError with no assistant message stored.
 		chunks := []content.Chunk{textChunk(""), textChunk("")}
 		client := &fakeLLM{chunks: chunks}
-		var emitted []event.Event
-		msgs, terminal := runTurn(context.Background(), input, 1, testIdentity(), nil, cfg, client, noGateReg(), drainEmit(&emitted))
+		cfg, st, rec := newTurnFixture(input, nil, emptyTS(), client, noGateReg())
+		terminal := runTurn(context.Background(), cfg, st)
 
 		failed, ok := terminal.(event.TurnFailed)
 		if !ok {
@@ -690,12 +797,11 @@ func TestRunTurn(t *testing.T) {
 		if !errors.As(failed.Err, &ere) {
 			t.Fatalf("TurnFailed.Err = %T, want *EmptyResponseError", failed.Err)
 		}
-		if len(msgs) != 0 {
-			t.Errorf("history len = %d, want 0 (no assistant message stored; rolled back to base)", len(msgs))
+		if len(rec.commits) != 0 {
+			t.Errorf("commit count = %d, want 0 (no assistant message stored)", len(rec.commits))
 		}
-		// A TokenDelta is still emitted per chunk even though the materialized text is empty.
 		var deltas int
-		for _, e := range emitted {
+		for _, e := range rec.events() {
 			if _, ok := e.(event.TokenDelta); ok {
 				deltas++
 			}
@@ -705,28 +811,28 @@ func TestRunTurn(t *testing.T) {
 		}
 	})
 
-	t.Run("cancelled context rolls back and returns TurnInterrupted", func(t *testing.T) {
+	t.Run("cancelled context discards the in-flight step and returns TurnInterrupted", func(t *testing.T) {
 		t.Parallel()
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
 		client := &fakeLLM{streamErr: context.Canceled}
-		var emitted []event.Event
-		msgs, terminal := runTurn(ctx, input, 1, testIdentity(), nil, cfg, client, noGateReg(), drainEmit(&emitted))
+		cfg, st, rec := newTurnFixture(input, nil, emptyTS(), client, noGateReg())
+		terminal := runTurn(ctx, cfg, st)
 
 		if _, ok := terminal.(event.TurnInterrupted); !ok {
 			t.Fatalf("terminal = %T, want TurnInterrupted", terminal)
 		}
-		if len(msgs) != 0 {
-			t.Errorf("history len = %d, want 0 (user rolled back)", len(msgs))
+		if len(rec.commits) != 0 {
+			t.Errorf("commit count = %d, want 0 (in-flight step discarded)", len(rec.commits))
 		}
 	})
 
-	t.Run("mid-stream Next error rolls back with typed cause", func(t *testing.T) {
+	t.Run("mid-stream Next error discards the in-flight step with typed cause", func(t *testing.T) {
 		t.Parallel()
 		boom := &llm.ValidationError{Field: "y", Reason: "midstream"}
 		client := &fakeLLM{chunks: []content.Chunk{textChunk("partial")}, nextErr: boom}
-		var emitted []event.Event
-		msgs, terminal := runTurn(context.Background(), input, 1, testIdentity(), nil, cfg, client, noGateReg(), drainEmit(&emitted))
+		cfg, st, rec := newTurnFixture(input, nil, emptyTS(), client, noGateReg())
+		terminal := runTurn(context.Background(), cfg, st)
 
 		failed, ok := terminal.(event.TurnFailed)
 		if !ok {
@@ -736,30 +842,25 @@ func TestRunTurn(t *testing.T) {
 		if !errors.As(failed.Err, &ve) {
 			t.Fatalf("TurnFailed.Err = %T, want *llm.ValidationError", failed.Err)
 		}
-		if len(msgs) != 0 {
-			t.Errorf("history len = %d, want 0 (user rolled back)", len(msgs))
+		if len(rec.commits) != 0 {
+			t.Errorf("commit count = %d, want 0 (in-flight step discarded)", len(rec.commits))
 		}
 	})
 
-	t.Run("emits TurnStarted then TokenDelta per chunk", func(t *testing.T) {
+	t.Run("a cancelled commit handshake aborts the turn (TurnInterrupted), keeping prior commits", func(t *testing.T) {
 		t.Parallel()
-		client := &fakeLLM{chunks: []content.Chunk{textChunk("a"), textChunk("b")}}
-		var emitted []event.Event
-		runTurn(context.Background(), input, 1, testIdentity(), nil, cfg, client, noGateReg(), drainEmit(&emitted))
-		if len(emitted) < 1 {
-			t.Fatal("no events emitted")
+		// The recorder rejects the commit with a CommitError, modelling an
+		// Interrupt/Shutdown that cancels the handshake. runTurn must surface
+		// TurnInterrupted instead of wedging or finalizing a TurnDone.
+		client := &fakeLLM{chunks: []content.Chunk{textChunk("answer")}}
+		cfg, st, rec := newTurnFixture(input, nil, emptyTS(), client, noGateReg())
+		rec.commitErr = &CommitError{Reason: CommitTurnCancelled, Cause: context.Canceled}
+		terminal := runTurn(context.Background(), cfg, st)
+		if _, ok := terminal.(event.TurnInterrupted); !ok {
+			t.Fatalf("terminal = %T, want TurnInterrupted (commit cancelled)", terminal)
 		}
-		if _, ok := emitted[0].(event.TurnStarted); !ok {
-			t.Errorf("first event = %T, want TurnStarted", emitted[0])
-		}
-		var deltas int
-		for _, e := range emitted {
-			if _, ok := e.(event.TokenDelta); ok {
-				deltas++
-			}
-		}
-		if deltas != 2 {
-			t.Errorf("TokenDelta count = %d, want 2", deltas)
+		if len(rec.commits) != 0 {
+			t.Errorf("commit count = %d, want 0 (the commit was rejected)", len(rec.commits))
 		}
 	})
 }

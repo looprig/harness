@@ -159,6 +159,7 @@ type loopState struct {
 	causationID   uuid.UUID // active StartTurn.Header.ID; zero when idle
 	status        loopStatus
 	cancelTurn    context.CancelFunc
+	turnDone      <-chan struct{}         // active turnCtx.Done(); nil when idle. emitTurn escapes on it so an Interrupt frees the actor's commit-point StepDone emission (and thus the parked runTurn).
 	turnEvents    chan<- event.Event      // current turn's channel; actor closes it
 	turnAbandoned <-chan struct{}         // always non-nil; closed when caller stops reading
 	msgs          content.AgenticMessages // conversation history across turns
@@ -184,9 +185,23 @@ func newLoopState(sessionID, loopID uuid.UUID, parent Provenance, events eventPu
 	}
 }
 
+// turnResult is the turn goroutine's hand-back to the actor. The conversation is
+// committed INCREMENTALLY through the per-step commit handshake (commitRequest), so
+// turnResult no longer carries the whole-turn message slice: it carries only the
+// turn terminal for the actor to deliver. A failed/interrupted turn discards only
+// the in-flight incomplete step; committed steps already live in loopState.msgs.
 type turnResult struct {
-	msgs     content.AgenticMessages
 	terminal event.Event // TurnDone, TurnFailed, or TurnInterrupted
+}
+
+// commitRequest is one per-step commit handshake from the turn goroutine to the
+// actor: the finalized step group to append to loopState.msgs and the Enduring
+// StepDone event to emit at the same actor-owned point. ack is buffered(1); the
+// actor closes it after committing+emitting so the parked runTurn unblocks. The
+// turn goroutine selects on ack AND turnCtx.Done so an Interrupt/Shutdown frees it.
+type commitRequest struct {
+	commit turnCommit
+	ack    chan<- struct{}
 }
 
 // listen takes gateReg as a bidirectional channel: the actor is its sole reader
@@ -197,6 +212,13 @@ func listen(ctx context.Context, cfg Config, commands <-chan command.Command, ga
 	defer close(done)
 
 	internal := make(chan turnResult, 1)
+	// commits is the per-step commit handshake channel. The turn goroutine sends a
+	// commitRequest per completed step; the actor (the sole reader, in its select)
+	// appends the group to loopState.msgs and emits the StepDone at the same point,
+	// then acks. Unbuffered: the handshake is synchronous (runTurn blocks on the
+	// ack), which serializes the per-turn stream so a step's TokenDeltas (emitted by
+	// runTurn) all precede that step's StepDone (emitted here by the actor).
+	commits := make(chan commitRequest)
 
 	publish := func(ev event.Event) {
 		// SECURITY: the sink path is redacted; the per-turn stream (handled
@@ -249,6 +271,28 @@ func listen(ctx context.Context, cfg Config, commands <-chan command.Command, ga
 
 	publish(event.SessionStarted{Header: event.Header{SessionID: state.sessionID}})
 
+	// emitTurn is the ACTOR-side per-turn emit, used at the commit point to emit the
+	// initial TurnStarted and each step's StepDone. It mirrors the turn goroutine's
+	// emit closure (publish to sinks, then send to the per-turn channel) so both
+	// reach the same per-turn stream. The blocking commit handshake guarantees the
+	// turn goroutine is parked in cfg.commit while the actor calls this, so there are
+	// never two concurrent writers to state.turnEvents — a step's TokenDeltas (from
+	// the turn goroutine) all precede that step's StepDone (from here). The three
+	// escapes (turnAbandoned / ctx.Done / nil channel) keep the actor from wedging if
+	// the caller stopped reading or the loop is dying.
+	emitTurn := func(ev event.Event) {
+		publish(ev)
+		if state.turnEvents == nil {
+			return
+		}
+		select {
+		case state.turnEvents <- ev:
+		case <-state.turnAbandoned:
+		case <-ctx.Done():
+		case <-state.turnDone: // active turn cancelled (Interrupt/Shutdown): stop blocking on a stalled consumer so the commit point can ack and free runTurn
+		}
+	}
+
 	// deliverAndClose publishes the terminal event, sends it to the per-turn
 	// channel unless the caller abandoned the stream, and closes the channel.
 	// Always called by the actor, never by the turn goroutine, and only after the
@@ -274,6 +318,7 @@ func listen(ctx context.Context, cfg Config, commands <-chan command.Command, ga
 		close(state.turnEvents)
 		state.turnEvents = nil
 		state.turnAbandoned = nil
+		state.turnDone = nil
 	}
 
 	forceAbandon := func() {
@@ -361,39 +406,102 @@ func listen(ctx context.Context, cfg Config, commands <-chan command.Command, ga
 				state.turnAbandoned = c.Abandoned
 				turnCtx, cancel := context.WithCancel(c.Ctx)
 				state.cancelTurn = cancel
-				idx, preMsgs := state.turnIndex, state.msgs
-				// Identity stamped onto each step's StepDone. loopState.id is this
-				// loop's id; turnID was just minted above for this turn.
-				identity := turnIdentity{sessionID: state.sessionID, loopID: state.id, turnID: state.turnID}
+				state.turnDone = turnCtx.Done()
+				idx := state.turnIndex
+
+				// base is a defensive CLONE of the pre-turn history with its OWN backing
+				// array, taken BEFORE the initial UserMessage is committed. runTurn reads
+				// base concurrently while the actor keeps appending committed step groups
+				// to loopState.msgs, so the two must never share storage. The LLM request
+				// for each step is base + turnState.msgs.
+				base := cloneMessages(state.msgs)
+
+				// Loop-owned incremental commit: the actor commits the initial
+				// UserMessage into loopState.msgs and emits TurnStarted (carrying the
+				// Message and CausationID = the triggering StartTurn's id) at the SAME
+				// point, BEFORE runTurn starts. (InputID stays zero — UserInput/InputID
+				// semantics are a later phase.)
+				userMsg := &content.UserMessage{
+					Message: content.Message{Role: content.RoleUser, Blocks: c.Input},
+				}
+				state.msgs = append(state.msgs, userMsg)
+				emitTurn(event.TurnStarted{
+					Header: event.Header{
+						SessionID:   state.sessionID,
+						LoopID:      state.id,
+						TurnID:      state.turnID,
+						CausationID: state.causationID,
+					},
+					TurnIndex: idx,
+					Message:   userMsg,
+				})
+
+				// turnState seeds msgs with exactly the initial UserMessage; runTurn
+				// appends completed step groups and builds each request from base + msgs.
+				ts := newTurnState(state.sessionID, state.id, state.turnID, idx, state.causationID, userMsg)
+
+				// commit is the ctx-cancellable per-step handshake to the actor. It sends
+				// a commitRequest and blocks on the actor's ack, escaping on the turn
+				// context (runTurn passes turnCtx as cctx) so an Interrupt/Shutdown that
+				// cancels turnCtx frees runTurn instead of wedging it — both on the send
+				// (actor not yet selecting on commits, e.g. in the shutdown drain) and on
+				// the ack wait (actor parked emitting StepDone to a stalled consumer).
+				commit := func(cctx context.Context, tc turnCommit) error {
+					ack := make(chan struct{}, 1)
+					req := commitRequest{commit: tc, ack: ack}
+					select {
+					case commits <- req:
+					case <-cctx.Done():
+						return &CommitError{Reason: CommitTurnCancelled, Cause: cctx.Err()}
+					}
+					select {
+					case <-ack:
+						return nil
+					case <-cctx.Done():
+						return &CommitError{Reason: CommitTurnCancelled, Cause: cctx.Err()}
+					}
+				}
+
+				// emit is the turn goroutine's per-turn emit (TokenDeltas, tool lifecycle,
+				// the turn terminal). StepDone is NOT emitted here — it is emitted by the
+				// actor at the commit point. Escapes on Abandoned (caller gone) and
+				// turnCtx.Done (interrupt/shutdown) keep emit from pinning the turn
+				// goroutine when the consumer stops reading.
+				emit := func(ev event.Event) {
+					publish(ev)
+					select {
+					case c.Events <- ev:
+					case <-c.Abandoned:
+					case <-turnCtx.Done():
+					}
+				}
+
+				turnCfg := turnConfig{
+					base:    base,
+					model:   cfg.Model,
+					tools:   cfg.Tools,
+					client:  cfg.Client,
+					gateReg: gateReg,
+					idGen:   cfg.idGen,
+					commit:  commit,
+					emit:    emit,
+				}
+
 				go func() {
 					defer cancel()
 					defer func() {
 						if r := recover(); r != nil {
 							slog.Error("turn goroutine panicked", "panic", r)
-							// preMsgs excludes the user message (runTurn appends it
-							// internally), so a panic rolls back exactly like a
-							// normal failure: history holds only completed pairs.
+							// Committed steps already live in loopState.msgs (the actor
+							// committed them incrementally); a panic discards only the
+							// in-flight step, so the terminal carries no message slice.
 							internal <- turnResult{
-								msgs:     preMsgs,
 								terminal: event.TurnFailed{TurnIndex: idx, Err: &event.TurnPanicError{Detail: fmt.Sprintf("%v", r)}},
 							}
 						}
 					}()
-					// Non-terminal events apply backpressure rather than drop:
-					// a slow Stream consumer slows token production for its own
-					// turn (never the actor). Escapes on Abandoned (caller gone)
-					// and turnCtx.Done (interrupt/shutdown) keep emit from pinning
-					// the turn goroutine when the consumer stops reading.
-					emit := func(ev event.Event) {
-						publish(ev)
-						select {
-						case c.Events <- ev:
-						case <-c.Abandoned:
-						case <-turnCtx.Done():
-						}
-					}
-					updated, terminal := runTurn(turnCtx, c.Input, idx, identity, preMsgs, cfg, cfg.Client, gateReg, emit)
-					internal <- turnResult{msgs: updated, terminal: terminal}
+					terminal := runTurn(turnCtx, turnCfg, ts)
+					internal <- turnResult{terminal: terminal}
 				}()
 				c.Ack <- nil
 
@@ -452,8 +560,23 @@ func listen(ctx context.Context, cfg Config, commands <-chan command.Command, ga
 			state.pendingGates[reg.callID] = gate{reply: reg.reply, kind: reg.kind}
 			close(reg.ack)
 
+		case req := <-commits:
+			// Loop-owned incremental commit: the actor is the SOLE mutator of
+			// loopState.msgs. It appends the completed step group AND emits the
+			// Enduring StepDone at the SAME point, so StepDone is never a lie (it
+			// always reflects already-committed history). The turn goroutine is parked
+			// in cfg.commit while this runs, so emitTurn here cannot race the turn
+			// goroutine's TokenDelta emits — a step's TokenDeltas all precede its
+			// StepDone on the per-turn stream. Ack last so the runner only resumes
+			// (and emits the NEXT step's deltas) after this StepDone is on the stream.
+			state.msgs = append(state.msgs, req.commit.Messages...)
+			emitTurn(req.commit.Event)
+			req.ack <- struct{}{}
+
 		case result := <-internal:
-			state.msgs = result.msgs
+			// loopState.msgs is committed incrementally via the commit handshake, not
+			// from the turn result. A failed/interrupted turn discards only the
+			// in-flight incomplete step (which never committed); committed steps stay.
 			state.cancelTurn = nil
 			shuttingDown := state.status == loopShuttingDown
 			if !shuttingDown {
@@ -497,6 +620,7 @@ func listen(ctx context.Context, cfg Config, commands <-chan command.Command, ga
 						"timeout", cfg.DrainTimeout)
 					state.turnEvents = nil
 					state.turnAbandoned = nil
+					state.turnDone = nil
 				}
 			}
 			// Defensive: the loop is exiting, but drop any gates so no detached path

@@ -12,8 +12,120 @@ import (
 	"github.com/inventivepotter/urvi/internal/uuid"
 )
 
+// turnStatus is the lifecycle of one turn, mirroring loopStatus/stepStatus style.
+// A turn is turnRunning from start until it reaches a terminal; the terminal then
+// records which way it ended.
+type turnStatus int
+
+const (
+	// turnRunning is the initial state: the turn is executing steps.
+	turnRunning turnStatus = iota
+	// turnSucceeded marks a turn that reached TurnDone (a final no-tool answer).
+	turnSucceeded
+	// turnAborted marks a turn that reached TurnFailed/TurnInterrupted; only the
+	// in-flight incomplete step is discarded — completed steps stay committed.
+	turnAborted
+)
+
+// turnState is the staged turn conversation owned by the turn goroutine. msgs
+// starts with the single initial UserMessage and accumulates completed
+// stepState.msgs groups; the LLM request for each step is built from
+// turnConfig.base + turnState.msgs (never live loopState.msgs). The turn goroutine
+// is the SOLE writer of turnState; the actor never touches it.
+type turnState struct {
+	// sessionID is copied from loopState so turn/step records correlate without
+	// reaching back into loopState.
+	sessionID uuid.UUID
+	// loopID is copied from loopState (the parent loop).
+	loopID uuid.UUID
+	// id is this turn's id, minted by the actor before the turn runs.
+	id uuid.UUID
+	// index is the loop-local turn index.
+	index event.TurnIndex
+	// causationID is the submit command id (today command.StartTurn.Header.ID)
+	// that initiated this turn.
+	causationID uuid.UUID
+
+	// msgs is the staged turn conversation: the initial UserMessage followed by
+	// completed step message groups. It is the running view used to build the next
+	// LLM request; committed history (loopState.msgs) grows group-by-group via
+	// turnConfig.commit. It is NOT the LLM request base — that is turnConfig.base.
+	msgs content.AgenticMessages
+
+	toolIterations int
+	toolCalls      int
+	status         turnStatus
+}
+
+// newTurnState builds a fresh turnState with its identity (copied from the loop)
+// and seeds msgs with EXACTLY the one initial UserMessage. The actor commits that
+// same UserMessage into loopState.msgs and emits TurnStarted before runTurn runs.
+func newTurnState(
+	sessionID, loopID, turnID uuid.UUID,
+	index event.TurnIndex,
+	causationID uuid.UUID,
+	user *content.UserMessage,
+) turnState {
+	return turnState{
+		sessionID:   sessionID,
+		loopID:      loopID,
+		id:          turnID,
+		index:       index,
+		causationID: causationID,
+		msgs:        content.AgenticMessages{user},
+		status:      turnRunning,
+	}
+}
+
+// turnConfig carries the dependencies of one turn: the request base, model/tools/
+// client, the gate registry, the id generator, and the two actor handshakes
+// (commit + emit). Dependencies stay at this boundary; turnState owns one turn's
+// staged messages and counters.
+type turnConfig struct {
+	// base is a defensive CLONE of the pre-turn loopState.msgs with its OWN backing
+	// array. The LLM request for each step is base + turnState.msgs. base MUST NOT
+	// alias loopState.msgs: the actor keeps appending committed step groups to
+	// loopState.msgs while runTurn reads base concurrently.
+	base content.AgenticMessages
+
+	model   llm.ModelSpec
+	tools   ToolSet
+	client  llm.LLM
+	gateReg chan<- gateRegistration
+	idGen   idGenerator
+
+	// commit is the durability/event handshake back to the actor. runTurn prepares a
+	// complete step group, but the actor is the only goroutine that mutates
+	// loopState.msgs; it appends commit.Messages and emits commit.Event (the
+	// StepDone) at the SAME actor-owned point, then acks. commit MUST be
+	// ctx-cancellable so Interrupt/Shutdown frees a parked runTurn instead of
+	// wedging it.
+	commit func(context.Context, turnCommit) error
+
+	// emit publishes this loop's events (TurnStarted is actor-emitted; runTurn emits
+	// TokenDeltas, tool lifecycle events, and the turn terminal). StepDone is NOT
+	// emitted here — it is emitted by the actor at the commit point.
+	emit func(event.Event)
+}
+
+// turnCommit is one commit request: the finalized step group to append to
+// loopState.msgs and the Enduring event (StepDone) to emit at the same actor point.
+type turnCommit struct {
+	Messages content.AgenticMessages
+	Event    event.Event
+}
+
+// cloneMessages returns a copy of msgs with its OWN backing array (a fresh slice
+// of the same element pointers). Appends to the source never reach the clone. A
+// nil/empty source yields an empty (non-shared) slice.
+func cloneMessages(msgs content.AgenticMessages) content.AgenticMessages {
+	out := make(content.AgenticMessages, len(msgs))
+	copy(out, msgs)
+	return out
+}
+
 // turnIdentity is the (session, loop, turn) identity a turn stamps onto the steps
-// it runs and the StepDone events it emits. runLoop threads it in from
+// it runs and the StepDone events the actor emits. runLoop threads it in from
 // loopState/turnState; runTurn copies it into each step's stepState.
 type turnIdentity struct {
 	sessionID uuid.UUID
@@ -21,56 +133,45 @@ type turnIdentity struct {
 	turnID    uuid.UUID
 }
 
-// runTurn drives the agentic loop for one user turn: it runs one step (one LLM
+// runTurn drives the agentic loop for one user turn. It runs one step (one LLM
 // request/response cycle → exactly one AIMessage) per iteration, executes that
-// step's tool batch (appending the ToolResultMessages to the same step), emits an
-// Enduring StepDone per completed step, and re-streams after each tool batch until
-// the model returns no tool calls (TurnDone), the runaway guard fires
-// (TurnFailed{ToolLimitError}), the provider errors (TurnFailed), or the turn is
-// cancelled (TurnInterrupted). It returns updated history and the terminal event.
+// step's tool batch (appending the ToolResultMessages to the same step), and
+// re-streams after each tool batch until the model returns no tool calls
+// (TurnDone), the runaway guard fires (TurnFailed{ToolLimitError}), the provider
+// errors (TurnFailed), or the turn is cancelled (TurnInterrupted). It returns the
+// terminal event for the actor to deliver.
 //
-// Whole-turn rollback: base := len(msgs) is snapshotted at turn start; any
-// abnormal exit truncates msgs[:base], discarding the ENTIRE turn's exchange so
-// history never holds a tool_use without its matching ToolResultMessage (which a
-// strict provider would reject on the next request). Only a TurnDone path keeps the
-// turn — and only well-formed, fully paired exchanges reach a TurnDone.
+// Incremental, loop-owned commit (Phase 8): the actor commits the initial
+// UserMessage and emits TurnStarted BEFORE runTurn starts. As each step completes,
+// runTurn appends it to turnState.msgs and calls cfg.commit; the ACTOR appends that
+// group to loopState.msgs and emits the Enduring StepDone at the same point (so
+// StepDone is never a lie). cfg.commit is ctx-cancellable: an Interrupt/Shutdown
+// during the handshake frees runTurn.
 //
-// StepDone is emitted directly via emit (the per-turn + sink path); it is Enduring
-// and NON-terminal. A turn that completes N steps emits N StepDone events, each
-// carrying that step's finalized group (AIMessage + its ToolResultMessages),
-// interleaved after the step's TokenDeltas, then the single turn terminal.
-func runTurn(
-	ctx context.Context,
-	input []content.Block,
-	turnIndex event.TurnIndex,
-	identity turnIdentity,
-	msgs content.AgenticMessages,
-	cfg Config,
-	client llm.LLM,
-	gateReg chan<- gateRegistration,
-	emit func(event.Event),
-) (content.AgenticMessages, event.Event) {
-	base := len(msgs)
-	rollback := func() content.AgenticMessages { return msgs[:base] }
+// Step-granularity rollback: a TurnFailed/TurnInterrupted discards ONLY the
+// in-flight incomplete step (which never committed and never emitted StepDone);
+// steps already committed stay in loopState.msgs (the actor never un-commits). A
+// terminal means "the turn stopped here," not "the turn never happened."
+//
+// The LLM request for each step is built from cfg.base + ts.msgs — never live
+// loopState.msgs — so the already-committed parts are not duplicated.
+func runTurn(ctx context.Context, cfg turnConfig, ts turnState) event.Event {
+	identity := turnIdentity{sessionID: ts.sessionID, loopID: ts.loopID, turnID: ts.id}
+	defs := toolDefs(ctx, cfg.tools.Registry)
 
-	userMsg := &content.UserMessage{
-		Message: content.Message{Role: content.RoleUser, Blocks: input},
-	}
-	msgs = append(msgs, userMsg)
-	emit(event.TurnStarted{TurnIndex: turnIndex})
-
-	defs := toolDefs(ctx, cfg.Tools.Registry)
-
-	var iters, calls int
 	for stepIdx := StepIndex(0); ; stepIdx++ {
-		req := llm.Request{Model: cfg.Model, Messages: msgs, Tools: defs}
+		// Request base is the committed history clone + this turn's staged messages.
+		req := llm.Request{
+			Model:    cfg.model,
+			Messages: requestMessages(cfg.base, ts.msgs),
+			Tools:    defs,
+		}
 
 		// Mint this step's id BEFORE streaming so StepDone can be stamped from the
 		// step's identity. Best-effort, mirroring the EventID mint in publish: a
 		// crypto/rand failure here is a system-level fault that must not abort an
 		// already-accepted turn, so log it and stamp a zero StepID rather than
-		// dropping the step. (The turn's identity-critical TurnID was already minted
-		// at the gate; only that aborts.)
+		// dropping the step.
 		stepID, err := cfg.idGen()
 		if err != nil {
 			slog.Error("step id generation failed; stamping StepDone with zero StepID", "error", err)
@@ -78,63 +179,98 @@ func runTurn(
 		st := newStepState(identity.sessionID, identity.loopID, identity.turnID, stepID, stepIdx)
 
 		// runStep owns the LLM cycle: stream → exactly one AIMessage into st.msgs[0].
-		// turnIndex is passed for the legacy TurnIndex on the emitted TokenDelta /
-		// terminal events; the step's own index lives in st.index.
-		res := runStep(ctx, stepConfig{req: req, client: client, emit: emit}, turnIndex, newStep(st))
+		res := runStep(ctx, stepConfig{req: req, client: cfg.client, emit: cfg.emit}, ts.index, newStep(st))
 		if res.terminal != nil {
-			// The LLM cycle produced a terminal (provider error / empty response /
-			// interrupt): whole-turn rollback.
-			return rollback(), res.terminal
+			// The in-flight step never completed: discard it (it was never added to
+			// ts.msgs and never committed) and return the terminal. Committed steps
+			// stay in loopState.msgs.
+			ts.status = turnAborted
+			return res.terminal
 		}
 		st = res.state
 		aiMsg := st.msgs[0].(*content.AIMessage)
-		msgs = append(msgs, aiMsg)
 
 		// Raw executable tool-use view (unsanitized Input) for this step.
 		toolUses := st.blocks.ToolUses()
 
 		// Text-only completion ALWAYS wins, regardless of iteration count: the runaway
-		// cap is only checked when the model wants ANOTHER tool batch. Emit the step's
-		// StepDone (its group is just the AIMessage) before the turn terminal.
+		// cap is only checked when the model wants ANOTHER tool batch. The step's group
+		// is just the AIMessage. Commit it (actor appends + emits StepDone), then end.
 		if len(toolUses) == 0 {
-			emit(stepDoneEvent(st))
-			return msgs, event.TurnDone{TurnIndex: turnIndex, Message: aiMsg}
+			ts.msgs = append(ts.msgs, aiMsg)
+			if cerr := commitStep(ctx, cfg, st); cerr != nil {
+				// The commit handshake was cancelled (Interrupt/Shutdown) before the
+				// actor committed/emitted this final step: treat as interrupt.
+				ts.status = turnAborted
+				return event.TurnInterrupted{TurnIndex: ts.index}
+			}
+			ts.status = turnSucceeded
+			return event.TurnDone{TurnIndex: ts.index, Message: aiMsg}
 		}
 
-		iters++
-		calls += len(toolUses)
-		if iters > cfg.Tools.MaxToolIterations || calls > cfg.Tools.MaxToolCallsPerTurn {
-			// The tool-call assistant message was just appended, but rollback truncates
-			// to base BEFORE any further provider request is built — so no unpaired
-			// tool_use ever survives into history, and no StepDone is emitted for an
-			// uncompleted step.
-			return rollback(), event.TurnFailed{
-				TurnIndex: turnIndex,
+		ts.toolIterations++
+		ts.toolCalls += len(toolUses)
+		if ts.toolIterations > cfg.tools.MaxToolIterations || ts.toolCalls > cfg.tools.MaxToolCallsPerTurn {
+			// The runaway cap fires on this UNCOMPLETED tool step: it is never appended
+			// to ts.msgs and never committed, so no unpaired tool_use survives into
+			// loopState.msgs and no StepDone is emitted for it.
+			ts.status = turnAborted
+			return event.TurnFailed{
+				TurnIndex: ts.index,
 				Err: &event.ToolLimitError{
-					Iterations:    iters,
-					MaxIterations: cfg.Tools.MaxToolIterations,
-					Calls:         calls,
-					MaxCalls:      cfg.Tools.MaxToolCallsPerTurn,
+					Iterations:    ts.toolIterations,
+					MaxIterations: cfg.tools.MaxToolIterations,
+					Calls:         ts.toolCalls,
+					MaxCalls:      cfg.tools.MaxToolCallsPerTurn,
 				},
 			}
 		}
 
-		results := RunBatch(ctx, toolUses, cfg.Tools, gateReg, cfg.idGen, emit)
+		results := RunBatch(ctx, toolUses, cfg.tools, cfg.gateReg, cfg.idGen, cfg.emit)
 		if ctx.Err() != nil {
-			// A cancelled batch's results are discarded; whole-turn rollback. The step
-			// never completes, so no StepDone is emitted for it.
-			return rollback(), event.TurnInterrupted{TurnIndex: turnIndex}
+			// A cancelled batch's results are discarded; the step never completes, so
+			// it is not appended/committed and emits no StepDone.
+			ts.status = turnAborted
+			return event.TurnInterrupted{TurnIndex: ts.index}
 		}
 		for _, r := range results {
 			trm := toolResultMessage(r)
 			st.msgs = append(st.msgs, trm)
-			msgs = append(msgs, trm)
 		}
-		// The step is now COMPLETE (AIMessage finalized AND its tool results
-		// appended): emit its StepDone carrying the full group.
-		emit(stepDoneEvent(st))
+		// The step is now COMPLETE (AIMessage finalized AND its tool results appended).
+		// Append the whole group to the staged turn and commit it (actor appends to
+		// loopState.msgs + emits StepDone at the same point).
+		ts.msgs = append(ts.msgs, st.msgs...)
+		if cerr := commitStep(ctx, cfg, st); cerr != nil {
+			// The commit handshake was cancelled (Interrupt/Shutdown) before the actor
+			// committed/emitted this completed step: treat as interrupt. Prior steps
+			// already committed stay in loopState.msgs.
+			ts.status = turnAborted
+			return event.TurnInterrupted{TurnIndex: ts.index}
+		}
 		// Loop: the next stream lets the model react to the tool results.
 	}
+}
+
+// requestMessages builds the LLM request message slice from the committed base
+// clone followed by the turn's staged messages. The result is a fresh slice so the
+// request never aliases either input's backing array.
+func requestMessages(base, staged content.AgenticMessages) content.AgenticMessages {
+	out := make(content.AgenticMessages, 0, len(base)+len(staged))
+	out = append(out, base...)
+	out = append(out, staged...)
+	return out
+}
+
+// commitStep sends one completed step's group + its StepDone to the actor through
+// the ctx-cancellable cfg.commit handshake. The actor appends the group to
+// loopState.msgs and emits the StepDone at the same point. On a cancellation error
+// the turn goroutine stops; committed steps stay committed.
+func commitStep(ctx context.Context, cfg turnConfig, st stepState) error {
+	return cfg.commit(ctx, turnCommit{
+		Messages: cloneMessages(st.msgs),
+		Event:    stepDoneEvent(st),
+	})
 }
 
 // stepDoneEvent builds the Enduring StepDone for one COMPLETED step: its Header is
@@ -143,8 +279,7 @@ func runTurn(
 // ToolResultMessages). The Messages slice is a fresh copy so a consumer cannot
 // mutate the turn's live history through the event.
 func stepDoneEvent(st stepState) event.StepDone {
-	group := make(content.AgenticMessages, len(st.msgs))
-	copy(group, st.msgs)
+	group := cloneMessages(st.msgs)
 	return event.StepDone{
 		Header: event.Header{
 			SessionID: st.sessionID,
@@ -219,8 +354,8 @@ func sanitizeAssistantBlocks(blocks []content.Block) []content.Block {
 }
 
 // streamFailure maps a stream/provider error to the right terminal event: a
-// cancelled ctx is an interrupt (whole-turn rollback, no error surfaced); any
-// other error is a TurnFailed carrying the typed cause.
+// cancelled ctx is an interrupt (no error surfaced); any other error is a
+// TurnFailed carrying the typed cause.
 func streamFailure(ctx context.Context, turnIndex event.TurnIndex, err error) event.Event {
 	if ctx.Err() != nil {
 		return event.TurnInterrupted{TurnIndex: turnIndex}

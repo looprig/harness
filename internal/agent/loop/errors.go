@@ -39,3 +39,31 @@ func (e *IDGenerationError) Error() string {
 	return "loop: turn id generation failed: " + e.Cause.Error()
 }
 func (e *IDGenerationError) Unwrap() error { return e.Cause }
+
+// CommitCancelReason distinguishes why a per-step commit handshake did not reach
+// the actor's commit point.
+type CommitCancelReason string
+
+const (
+	// CommitTurnCancelled means the turn context was cancelled (Interrupt/Shutdown)
+	// before the actor committed the step. runTurn returns a TurnInterrupted and the
+	// in-flight step is discarded; committed steps stay committed.
+	CommitTurnCancelled CommitCancelReason = "turn cancelled"
+)
+
+// CommitError is returned by turnConfig.commit when the ctx-cancellable commit
+// handshake cannot deliver a completed step to the actor. The turn goroutine uses
+// it (errors.As) to stop and surface the right terminal without wedging; the
+// already-committed steps remain in loopState.msgs.
+type CommitError struct {
+	Reason CommitCancelReason
+	Cause  error
+}
+
+func (e *CommitError) Error() string {
+	if e.Cause != nil {
+		return "loop: commit handshake: " + string(e.Reason) + ": " + e.Cause.Error()
+	}
+	return "loop: commit handshake: " + string(e.Reason)
+}
+func (e *CommitError) Unwrap() error { return e.Cause }

@@ -11,6 +11,7 @@ import (
 	"github.com/inventivepotter/urvi/internal/agent/loop/event"
 	"github.com/inventivepotter/urvi/internal/content"
 	"github.com/inventivepotter/urvi/internal/llm"
+	"github.com/inventivepotter/urvi/internal/tool"
 	"github.com/inventivepotter/urvi/internal/uuid"
 )
 
@@ -776,23 +777,116 @@ func TestCtxIgnoringProviderDoesNotPinActor(t *testing.T) {
 	}
 }
 
-// REGRESSION GUARD (review fix #3): failed turn rolls back; next turn sees no doubled user message.
-func TestFailedTurnRollsBackHistory(t *testing.T) {
+// TestStepGranularityRollback replaces the old whole-turn-rollback guard. With
+// loop-owned incremental commit, a TurnFailed/TurnInterrupted discards ONLY the
+// in-flight incomplete step; the initial UserMessage (committed at TurnStarted) and
+// every completed step (committed with its StepDone) STAY in loopState.msgs. A
+// terminal means "the turn stopped here," not "the turn never happened."
+func TestStepGranularityRollback(t *testing.T) {
 	t.Parallel()
-	rec := &recordingLLM{} // empty chunks -> EmptyResponseError on first turn
-	l, _ := newLoop(t, rec)
 
-	// turn 1 fails (empty response) and must roll back the user message
-	ev1, _ := startTurn(t, l, context.Background(), []content.Block{&content.TextBlock{Text: "first"}})
-	if _, ok := drainToTerminal(t, ev1).(event.TurnFailed); !ok {
-		t.Fatal("turn 1 terminal != TurnFailed")
-	}
-	// turn 2: its request must NOT contain two consecutive user messages from turn 1
-	rec.chunks = []content.Chunk{textChunk("ok")}
-	ev2, _ := startTurn(t, l, context.Background(), []content.Block{&content.TextBlock{Text: "second"}})
-	drainToTerminal(t, ev2)
-	req := rec.lastReq()
-	if len(req.Messages) != 1 {
-		t.Fatalf("turn 2 request had %d messages, want 1 (rolled-back history)", len(req.Messages))
-	}
+	t.Run("fail at step 0 keeps the committed initial UserMessage (no whole-turn rollback)", func(t *testing.T) {
+		t.Parallel()
+		rec := &recordingLLM{} // empty chunks -> EmptyResponseError on the first step
+		l, _ := newLoop(t, rec)
+
+		// turn 1 fails on an empty response: step 0 never completes, so its (absent)
+		// AIMessage is discarded — but the initial UserMessage was committed at
+		// TurnStarted and stays.
+		ev1, _ := startTurn(t, l, context.Background(), []content.Block{&content.TextBlock{Text: "first"}})
+		if _, ok := drainToTerminal(t, ev1).(event.TurnFailed); !ok {
+			t.Fatal("turn 1 terminal != TurnFailed")
+		}
+		// turn 2's request must contain turn 1's committed user message THEN turn 2's
+		// user message = 2 messages. The committed history grows; it is not rolled back.
+		rec.chunks = []content.Chunk{textChunk("ok")}
+		ev2, _ := startTurn(t, l, context.Background(), []content.Block{&content.TextBlock{Text: "second"}})
+		drainToTerminal(t, ev2)
+		req := rec.lastReq()
+		if len(req.Messages) != 2 {
+			t.Fatalf("turn 2 request had %d messages, want 2 (committed user msg from turn 1 + turn 2 user msg)", len(req.Messages))
+		}
+		// Both are user messages (no assistant reply was ever committed for turn 1).
+		for i, m := range req.Messages {
+			if _, ok := m.(*content.UserMessage); !ok {
+				t.Errorf("req.Messages[%d] = %T, want *UserMessage", i, m)
+			}
+		}
+	})
+
+	t.Run("fail mid-turn keeps completed steps committed, discards only the in-flight step (no unpaired tool_use)", func(t *testing.T) {
+		t.Parallel()
+		echo := &echoTool{name: "Echo", output: "ran"}
+		// maxIters=2: steps 0 and 1 are completed tool steps (committed); the cap fires
+		// on the uncompleted 3rd tool step, which is discarded.
+		ts := agenticToolSet([]tool.InvokableTool{echo}, 2, 100)
+		client := &scriptedLLM{scripts: [][]content.Chunk{
+			{toolUseChunk(0, "id-1", "Echo", `{}`)}, // step 0 (committed)
+			{toolUseChunk(0, "id-2", "Echo", `{}`)}, // step 1 (committed)
+			{toolUseChunk(0, "id-3", "Echo", `{}`)}, // step 2 (uncompleted; cap fires)
+		}}
+		ctx, cancel := context.WithCancel(context.Background())
+		t.Cleanup(cancel)
+		sessionID, _ := uuid.New()
+		loopID, _ := uuid.New()
+		l, err := New(ctx, sessionID, loopID, Provenance{}, noopPublisher{},
+			Config{Client: client, Model: llm.ModelSpec{Model: "m"}, Tools: ts, DrainTimeout: 200 * time.Millisecond})
+		if err != nil {
+			t.Fatalf("New: %v", err)
+		}
+
+		ev, _ := startTurn(t, l, context.Background(), []content.Block{&content.TextBlock{Text: "go"}})
+		// Collect the per-turn stream: count StepDones and assert the terminal.
+		var sds int
+		var terminal event.Event
+		for e := range ev {
+			switch e.(type) {
+			case event.StepDone:
+				sds++
+			case event.TurnDone, event.TurnFailed, event.TurnInterrupted:
+				terminal = e
+			}
+			if terminal != nil {
+				break
+			}
+		}
+		if _, ok := terminal.(event.TurnFailed); !ok {
+			t.Fatalf("terminal = %T, want TurnFailed", terminal)
+		}
+		if sds != 2 {
+			t.Errorf("StepDone count = %d, want 2 (steps 0 and 1 committed before the cap)", sds)
+		}
+
+		// A follow-up turn's request reveals the committed history: user + step0(tool_use,
+		// tool) + step1(tool_use, tool) + the new user message = 6 messages, with NO
+		// unpaired tool_use (the in-flight step 2 tool_use was discarded).
+		next := &scriptedLLM{scripts: [][]content.Chunk{{textChunk("done")}}}
+		// Swap the client isn't possible on a running loop; instead inspect the
+		// committed history via the in-flight client's recorded requests: the last
+		// request the failed turn issued (the uncompleted step 2) was built from the
+		// committed step0+step1 groups + the initial user message.
+		_ = next
+		reqs := client.requests()
+		last := reqs[len(reqs)-1]
+		// Last request = user + step0(tool_use + tool) + step1(tool_use + tool) = 5.
+		if len(last.Messages) != 5 {
+			t.Fatalf("final request had %d messages, want 5 (user + 2 committed tool steps)", len(last.Messages))
+		}
+		var tu, tm int
+		for _, m := range last.Messages {
+			switch v := m.(type) {
+			case *content.AIMessage:
+				for _, b := range v.Blocks {
+					if _, ok := b.(*content.ToolUseBlock); ok {
+						tu++
+					}
+				}
+			case *content.ToolResultMessage:
+				tm++
+			}
+		}
+		if tu != tm || tu != 2 {
+			t.Errorf("committed pairs in final request: %d tool_use vs %d tool messages, want 2/2", tu, tm)
+		}
+	})
 }
