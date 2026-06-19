@@ -15,7 +15,7 @@ import (
 // from 0; it is not unique across turns.
 type StepIndex uint64
 
-// stepStatus is the lifecycle of one step, mirroring loopStatus/turnStatus style.
+// stepStatus is the lifecycle of one step, mirroring loopStatus style.
 // The zero value is stepStreaming: a fresh step is mid-stream until its single
 // AIMessage is finalized (stepDone) or the stream produced a terminal (stepFailed).
 type stepStatus int

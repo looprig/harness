@@ -52,9 +52,11 @@ const (
 )
 
 // CommitError is returned by turnConfig.commit when the ctx-cancellable commit
-// handshake cannot deliver a completed step to the actor. The turn goroutine uses
-// it (errors.As) to stop and surface the right terminal without wedging; the
-// already-committed steps remain in loopState.msgs.
+// handshake cannot deliver a completed step to the actor. The turn goroutine stops
+// and surfaces a terminal without wedging; the already-committed steps remain in
+// loopState.msgs. Callers MAY errors.As to distinguish cancel reasons; today the
+// only reason is CommitTurnCancelled and callers treat any commit error as an
+// interrupt. Reason is reserved for a later phase (e.g. Shutdown-vs-Interrupt).
 type CommitError struct {
 	Reason CommitCancelReason
 	Cause  error

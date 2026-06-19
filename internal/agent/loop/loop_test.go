@@ -861,12 +861,6 @@ func TestStepGranularityRollback(t *testing.T) {
 		// A follow-up turn's request reveals the committed history: user + step0(tool_use,
 		// tool) + step1(tool_use, tool) + the new user message = 6 messages, with NO
 		// unpaired tool_use (the in-flight step 2 tool_use was discarded).
-		next := &scriptedLLM{scripts: [][]content.Chunk{{textChunk("done")}}}
-		// Swap the client isn't possible on a running loop; instead inspect the
-		// committed history via the in-flight client's recorded requests: the last
-		// request the failed turn issued (the uncompleted step 2) was built from the
-		// committed step0+step1 groups + the initial user message.
-		_ = next
 		reqs := client.requests()
 		last := reqs[len(reqs)-1]
 		// Last request = user + step0(tool_use + tool) + step1(tool_use + tool) = 5.

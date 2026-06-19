@@ -76,9 +76,6 @@ func TestNewTurnState(t *testing.T) {
 			if _, ok := ts.msgs[0].(*content.UserMessage); !ok {
 				t.Errorf("msgs[0] = %T, want *content.UserMessage", ts.msgs[0])
 			}
-			if ts.status != turnRunning {
-				t.Errorf("status = %v, want turnRunning", ts.status)
-			}
 			if ts.toolIterations != 0 || ts.toolCalls != 0 {
 				t.Errorf("counters = (%d,%d), want (0,0)", ts.toolIterations, ts.toolCalls)
 			}

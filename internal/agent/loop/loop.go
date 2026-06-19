@@ -159,7 +159,7 @@ type loopState struct {
 	causationID   uuid.UUID // active StartTurn.Header.ID; zero when idle
 	status        loopStatus
 	cancelTurn    context.CancelFunc
-	turnDone      <-chan struct{}         // active turnCtx.Done(); nil when idle. emitTurn escapes on it so an Interrupt frees the actor's commit-point StepDone emission (and thus the parked runTurn).
+	turnDone      <-chan struct{}         // active turnCtx.Done(); nil when idle. It is closed when the turn ctx is cancelled (Interrupt/Shutdown processed on an earlier loop iteration, or root-ctx). emitTurn escapes on it so a turn cancelled BEFORE the actor parked here can still ack and free the parked runTurn. While the actor is parked in emitTurn it cannot process a new Interrupt — turnAbandoned / ctx.Done() are the escapes for that case.
 	turnEvents    chan<- event.Event      // current turn's channel; actor closes it
 	turnAbandoned <-chan struct{}         // always non-nil; closed when caller stops reading
 	msgs          content.AgenticMessages // conversation history across turns
@@ -289,7 +289,7 @@ func listen(ctx context.Context, cfg Config, commands <-chan command.Command, ga
 		case state.turnEvents <- ev:
 		case <-state.turnAbandoned:
 		case <-ctx.Done():
-		case <-state.turnDone: // active turn cancelled (Interrupt/Shutdown): stop blocking on a stalled consumer so the commit point can ack and free runTurn
+		case <-state.turnDone: // turn ctx already cancelled (Interrupt/Shutdown handled before the actor parked here, or root-ctx): stop blocking on a stalled consumer so the commit point can ack and free runTurn. A NEW Interrupt arriving while parked here cannot be processed — turnAbandoned / ctx.Done() cover that.
 		}
 	}
 

@@ -12,21 +12,6 @@ import (
 	"github.com/inventivepotter/urvi/internal/uuid"
 )
 
-// turnStatus is the lifecycle of one turn, mirroring loopStatus/stepStatus style.
-// A turn is turnRunning from start until it reaches a terminal; the terminal then
-// records which way it ended.
-type turnStatus int
-
-const (
-	// turnRunning is the initial state: the turn is executing steps.
-	turnRunning turnStatus = iota
-	// turnSucceeded marks a turn that reached TurnDone (a final no-tool answer).
-	turnSucceeded
-	// turnAborted marks a turn that reached TurnFailed/TurnInterrupted; only the
-	// in-flight incomplete step is discarded — completed steps stay committed.
-	turnAborted
-)
-
 // turnState is the staged turn conversation owned by the turn goroutine. msgs
 // starts with the single initial UserMessage and accumulates completed
 // stepState.msgs groups; the LLM request for each step is built from
@@ -54,7 +39,6 @@ type turnState struct {
 
 	toolIterations int
 	toolCalls      int
-	status         turnStatus
 }
 
 // newTurnState builds a fresh turnState with its identity (copied from the loop)
@@ -73,7 +57,6 @@ func newTurnState(
 		index:       index,
 		causationID: causationID,
 		msgs:        content.AgenticMessages{user},
-		status:      turnRunning,
 	}
 }
 
@@ -184,7 +167,6 @@ func runTurn(ctx context.Context, cfg turnConfig, ts turnState) event.Event {
 			// The in-flight step never completed: discard it (it was never added to
 			// ts.msgs and never committed) and return the terminal. Committed steps
 			// stay in loopState.msgs.
-			ts.status = turnAborted
 			return res.terminal
 		}
 		st = res.state
@@ -201,10 +183,8 @@ func runTurn(ctx context.Context, cfg turnConfig, ts turnState) event.Event {
 			if cerr := commitStep(ctx, cfg, st); cerr != nil {
 				// The commit handshake was cancelled (Interrupt/Shutdown) before the
 				// actor committed/emitted this final step: treat as interrupt.
-				ts.status = turnAborted
 				return event.TurnInterrupted{TurnIndex: ts.index}
 			}
-			ts.status = turnSucceeded
 			return event.TurnDone{TurnIndex: ts.index, Message: aiMsg}
 		}
 
@@ -214,7 +194,6 @@ func runTurn(ctx context.Context, cfg turnConfig, ts turnState) event.Event {
 			// The runaway cap fires on this UNCOMPLETED tool step: it is never appended
 			// to ts.msgs and never committed, so no unpaired tool_use survives into
 			// loopState.msgs and no StepDone is emitted for it.
-			ts.status = turnAborted
 			return event.TurnFailed{
 				TurnIndex: ts.index,
 				Err: &event.ToolLimitError{
@@ -230,7 +209,6 @@ func runTurn(ctx context.Context, cfg turnConfig, ts turnState) event.Event {
 		if ctx.Err() != nil {
 			// A cancelled batch's results are discarded; the step never completes, so
 			// it is not appended/committed and emits no StepDone.
-			ts.status = turnAborted
 			return event.TurnInterrupted{TurnIndex: ts.index}
 		}
 		for _, r := range results {
@@ -245,7 +223,6 @@ func runTurn(ctx context.Context, cfg turnConfig, ts turnState) event.Event {
 			// The commit handshake was cancelled (Interrupt/Shutdown) before the actor
 			// committed/emitted this completed step: treat as interrupt. Prior steps
 			// already committed stay in loopState.msgs.
-			ts.status = turnAborted
 			return event.TurnInterrupted{TurnIndex: ts.index}
 		}
 		// Loop: the next stream lets the model react to the tool results.
@@ -267,6 +244,12 @@ func requestMessages(base, staged content.AgenticMessages) content.AgenticMessag
 // loopState.msgs and emits the StepDone at the same point. On a cancellation error
 // the turn goroutine stops; committed steps stay committed.
 func commitStep(ctx context.Context, cfg turnConfig, st stepState) error {
+	// The step group is cloned TWICE on purpose: Messages (appended to
+	// loopState.msgs as committed history) and the StepDone payload inside
+	// stepDoneEvent (the consumer-held event). These two clones are DELIBERATELY
+	// independent — the committed-history slice and the consumer-held event payload
+	// must not alias each other or st.msgs. Do NOT merge into one shared slice
+	// (would reintroduce aliasing).
 	return cfg.commit(ctx, turnCommit{
 		Messages: cloneMessages(st.msgs),
 		Event:    stepDoneEvent(st),
