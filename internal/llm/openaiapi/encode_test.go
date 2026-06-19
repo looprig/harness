@@ -350,6 +350,75 @@ func TestEncodeRequest_Messages(t *testing.T) {
 	}
 }
 
+// --- TestEncodeRequest_ToolResultErrorReachesModel ---
+
+// TestEncodeRequest_ToolResultErrorReachesModel locks the IsError reconciliation:
+// the OpenAI Chat Completions tool message has NO structured error flag, so
+// ToolResultMessage.IsError is intentionally NOT emitted on the request. The model
+// learns a tool errored only through the result's text content (the loop
+// error-prefixes it). The encoded tool message must carry role=tool, the
+// tool_call_id, and the error text as content — and must NOT carry an is_error field.
+func TestEncodeRequest_ToolResultErrorReachesModel(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name        string
+		msg         *content.ToolResultMessage
+		wantContent string
+	}{
+		{
+			name:        "error result: IsError true, error text reaches model",
+			msg:         func() *content.ToolResultMessage { m := toolMsg("call-err", textBlock("tool error: boom")); m.IsError = true; return m }(),
+			wantContent: "tool error: boom",
+		},
+		{
+			name:        "success result: IsError false, result text reaches model",
+			msg:         toolMsg("call-ok", textBlock("ok")),
+			wantContent: "ok",
+		},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			req := llm.Request{
+				Model:    llm.ModelSpec{Model: "m"},
+				Messages: content.AgenticMessages{tc.msg},
+			}
+			got, err := openaiapi.EncodeRequest(req, false)
+			if err != nil {
+				t.Fatalf("EncodeRequest error: %v", err)
+			}
+
+			raw := mustDecode(t, got)
+			msgs := messagesFromRaw(t, raw)
+			if len(msgs) != 1 {
+				t.Fatalf("expected exactly 1 message, got %d", len(msgs))
+			}
+			if r := roleOf(t, msgs[0]); r != "tool" {
+				t.Errorf("role = %q, want \"tool\"", r)
+			}
+			var id string
+			if err := json.Unmarshal(msgs[0]["tool_call_id"], &id); err != nil {
+				t.Fatalf("unmarshal tool_call_id: %v", err)
+			}
+			if id != tc.msg.ToolUseID {
+				t.Errorf("tool_call_id = %q, want %q", id, tc.msg.ToolUseID)
+			}
+			if s := contentStr(t, msgs[0]); s != tc.wantContent {
+				t.Errorf("content = %q, want %q (error text must reach the model)", s, tc.wantContent)
+			}
+			// The OpenAI schema has no is_error field on a tool message: it must NOT
+			// be emitted, regardless of ToolResultMessage.IsError.
+			if _, ok := msgs[0]["is_error"]; ok {
+				t.Error("tool message carries a non-standard is_error field; OpenAI Chat Completions has no such field")
+			}
+		})
+	}
+}
+
 // --- TestEncodeRequest_Tools ---
 
 func TestEncodeRequest_Tools(t *testing.T) {

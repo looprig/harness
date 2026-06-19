@@ -88,6 +88,13 @@ func encodeConversation(conv content.Conversation) ([]chatMessage, error) {
 		return []chatMessage{msg}, nil
 
 	case *content.ToolResultMessage:
+		// IsError reconciliation: the OpenAI Chat Completions tool message has no
+		// structured error flag (unlike Anthropic's tool_result block), so
+		// ToolResultMessage.IsError is intentionally NOT placed on the request —
+		// emitting a non-standard is_error here would be a schema violation. The model
+		// learns a tool errored via the result's text content, which the loop
+		// error-prefixes. The message-level IsError exists for the internal wire form
+		// and the display layer, not for this provider's request.
 		return []chatMessage{{
 			Role:       "tool",
 			Content:    textContent(m.Blocks),
