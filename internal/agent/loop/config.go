@@ -23,4 +23,13 @@ type Config struct {
 	// composition root cannot set it: New defaults it to uuid.New. It exists
 	// only as a test seam for exercising the crypto/rand failure branches.
 	idGen idGenerator
+
+	// afterDrain is a test-only synchronization seam invoked by foldPending in the
+	// turn goroutine AFTER cfg.drainPending has moved the inbox into the actor's
+	// draining buffer but BEFORE the first TurnFoldedInto commit. It is unexported,
+	// so the composition root cannot set it; New never assigns it, so it is nil in
+	// production and foldPending's nil check skips it entirely. It exists only so a
+	// test can cancel the loop deterministically in the post-drain/pre-commit window
+	// to exercise the draining-buffer abnormal-return sweep.
+	afterDrain func()
 }

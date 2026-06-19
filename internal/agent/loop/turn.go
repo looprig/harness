@@ -103,6 +103,11 @@ type turnConfig struct {
 	// TokenDeltas, tool lifecycle events, and the turn terminal). StepDone is NOT
 	// emitted here — it is emitted by the actor at the commit point.
 	emit func(event.Event)
+
+	// afterDrain is a test-only seam (nil in production) invoked by foldPending after
+	// drainPending returns the batch but before the first TurnFoldedInto commit. See
+	// Config.afterDrain for the rationale.
+	afterDrain func()
 }
 
 // turnCommit is one commit request: the finalized step group to append to
@@ -282,6 +287,12 @@ func foldPending(ctx context.Context, cfg turnConfig, ts *turnState) error {
 	batch, err := cfg.drainPending(ctx)
 	if err != nil {
 		return err
+	}
+	// Test-only seam (nil in production): the inbox has been moved into the actor's
+	// draining buffer but no TurnFoldedInto has committed yet. A test cancels the loop
+	// here to exercise the draining-buffer abnormal-return sweep.
+	if cfg.afterDrain != nil {
+		cfg.afterDrain()
 	}
 	for _, fm := range batch {
 		ts.msgs = append(ts.msgs, fm.msg)

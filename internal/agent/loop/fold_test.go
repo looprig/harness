@@ -2,6 +2,7 @@ package loop
 
 import (
 	"context"
+	"sync"
 	"testing"
 	"time"
 
@@ -34,6 +35,33 @@ func newFoldLoop(t *testing.T, client llm.LLM, ts ToolSet) (*Loop, *captureSink)
 		t.Fatalf("New: %v", err)
 	}
 	return l, sink
+}
+
+// newFoldLoopWithAfterDrain builds a fold loop exactly like newFoldLoop but installs
+// the test-only afterDrain seam and returns the loop's root cancel. foldPending invokes
+// afterDrain (in the turn goroutine) AFTER the inbox has been moved into the actor's
+// draining buffer and BEFORE the first TurnFoldedInto commit. A test uses it to cancel
+// the loop in the post-drain/pre-commit window deterministically. The seam is
+// unexported and never set in production.
+func newFoldLoopWithAfterDrain(t *testing.T, client llm.LLM, ts ToolSet, afterDrain func()) (*Loop, *captureSink, context.CancelFunc) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	sessionID, err := uuid.New()
+	if err != nil {
+		t.Fatalf("uuid.New: %v", err)
+	}
+	loopID, err := uuid.New()
+	if err != nil {
+		t.Fatalf("uuid.New: %v", err)
+	}
+	sink := &captureSink{}
+	l, err := New(ctx, sessionID, loopID, Provenance{}, noopPublisher{},
+		Config{Client: client, Model: llm.ModelSpec{Model: "m"}, Tools: ts, Sinks: []event.EventSink{sink}, DrainTimeout: 500 * time.Millisecond, afterDrain: afterDrain})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	return l, sink, cancel
 }
 
 // waitForRequests polls the scripted client until it has recorded at least n
@@ -363,4 +391,152 @@ func TestInterruptDuringDrainFreesTurn(t *testing.T) {
 		t.Fatal("Shutdown did not complete; actor wedged after drain interrupt")
 	}
 	<-l.Done
+}
+
+// TestDrainingSweepReturnsEntryOnInterrupt is the DETERMINISTIC complement to
+// TestInterruptDuringDrainFreesTurn. It pins the draining-buffer abnormal-return
+// sweep in returnQueuedInbox (loop.go) — the path that returns an entry the actor
+// already moved from inbox into draining (for a fold) but whose TurnFoldedInto never
+// committed because the turn ended abnormally first.
+//
+// Determinism comes from the afterDrain seam combined with a ROOT-ctx cancel.
+// foldPending invokes afterDrain AFTER drainPending has moved the queued entry into the
+// actor's draining buffer and BEFORE the first TurnFoldedInto commit. The hook cancels
+// the loop's root ctx (which cancels the turn ctx, a child) and returns. Two strands
+// then resolve without a race:
+//   - The actor, parked in its main select, sees ctx.Done() ready (commits is NOT ready
+//     yet — the turn goroutine has not sent), so it deterministically takes the
+//     hard-kill arm and LEAVES the select; it stops reading the commits channel.
+//   - The turn goroutine returns from the hook and calls cfg.commit for the fold. Since
+//     the actor no longer reads commits, the unbuffered `commits <-` send blocks and the
+//     commit's select deterministically takes <-cctx.Done() (turn ctx cancelled). So the
+//     fold NEVER commits: foldPending returns an error and runTurn returns
+//     TurnInterrupted.
+//
+// Both happen-before edges hold because cancel() and the commits-send run sequentially
+// in the turn goroutine (cancel first), and the actor cannot observe a commits-send that
+// has not happened yet. The entry is therefore in draining (not inbox, not folded) when
+// the hard-kill arm calls returnQueuedInbox, so ONLY the draining sweep can return it.
+//
+// Using a real Interrupt COMMAND here would NOT be deterministic: after the actor acks
+// the Interrupt it loops back to its select still reading commits, so the fold's
+// `commits <-` send and the commit's <-cctx.Done() are BOTH ready and Go picks at random
+// — the entry would fold ~half the time. The root-ctx cancel avoids that because the
+// actor LEAVES the select. (TestInterruptDuringDrainFreesTurn exercises that race
+// non-deterministically; this test is the deterministic complement.)
+//
+// Why onStreamN can't express this: onStreamN fires at the START of a Stream() call —
+// i.e. at the start of the NEXT step, which only runs AFTER the folds already committed.
+// By then the entry has left draining via its TurnFoldedInto, so the draining sweep is
+// never the path under test.
+//
+// Asserts: exactly ONE event.InputCancelled{InputID==queued, Reason==CancelTurnInterrupted}
+// for the drained entry, NO TurnFoldedInto for it, and the turn ends TurnInterrupted.
+// The single InputCancelled IS the draining sweep: the entry was moved out of inbox by
+// drainInbox, so no other path can return it — exactly-once proves draining is empty
+// afterward (a stranded entry would yield zero returns; a double-return would yield two).
+// Removing the `for _, qi := range state.draining` loop from returnQueuedInbox makes this
+// FAIL (the entry is stranded: no TurnFoldedInto, no InputCancelled), proving it is
+// load-bearing.
+func TestDrainingSweepReturnsEntryOnInterrupt(t *testing.T) {
+	t.Parallel()
+	bt := newBlockingTool()
+	ts := agenticToolSet([]tool.InvokableTool{bt}, 25, 100)
+	client := &scriptedLLM{scripts: [][]content.Chunk{
+		{toolUseChunk(0, "id-1", "Block", `{}`)}, // step 0: tool, then the drain happens
+		{textChunk("never reached: interrupted in the fold window")},
+	}}
+
+	// The afterDrain seam cancels the loop in the post-drain/pre-commit window. It must
+	// run EXACTLY once (one drain boundary with a non-empty batch).
+	var rootCancel context.CancelFunc
+	cancelled := make(chan struct{})
+	var afterDrainOnce sync.Once
+	afterDrain := func() {
+		afterDrainOnce.Do(func() {
+			rootCancel()
+			close(cancelled)
+		})
+	}
+	l, sink, rc := newFoldLoopWithAfterDrain(t, client, ts, afterDrain)
+	rootCancel = rc
+
+	ev1, _ := startTurn(t, l, context.Background(), textBlocks("turn1"))
+	// Drain the per-turn stream so the actor's per-turn emits never block. The terminal
+	// is asserted via the SINK below, not here: on the hard-kill path deliverAndClose
+	// runs after forceAbandon, so it may take the abandoned branch and NOT deliver the
+	// terminal on the per-turn channel — but it ALWAYS publishes it to sinks.
+	go func() {
+		for range ev1 {
+		}
+	}()
+	<-bt.started // step 0's tool is blocked; queue an input before the drain runs
+
+	// Queue exactly one input so the drain moves exactly one entry into draining.
+	queuedID := mustID(t)
+	d := submitUserInputBlocks(t, l, queuedID, command.AllowFold, textBlocks("queued"))
+	if _, ok := d.(command.InputQueued); !ok {
+		t.Fatalf("queued submit disposition = %T, want InputQueued", d)
+	}
+
+	// Release the tool: step 0 commits, runTurn drains (moving the entry into draining),
+	// then foldPending invokes afterDrain, which cancels the loop before the fold
+	// commits. The cancelled commit makes runTurn return TurnInterrupted.
+	close(bt.release)
+	<-cancelled // the cancel has landed in the post-drain/pre-commit window
+
+	// The turn must terminate as TurnInterrupted (the cancelled fold commit), observed via
+	// the sink (always published, even on the hard-kill abandoned-delivery path).
+	blockUntilSink(t, sink, func(evs []event.EventEnvelope) bool {
+		for _, e := range evs {
+			if _, ok := e.Event.(event.TurnInterrupted); ok {
+				return true
+			}
+		}
+		return false
+	})
+	for _, e := range sink.events() {
+		switch e.Event.(type) {
+		case event.TurnDone, event.TurnFailed:
+			t.Fatalf("turn terminal = %T, want event.TurnInterrupted", e.Event)
+		}
+	}
+
+	// The entry must come back via EXACTLY ONE InputCancelled{CancelTurnInterrupted}
+	// from the draining sweep, and NO TurnFoldedInto must be emitted for it.
+	blockUntilSink(t, sink, func(evs []event.EventEnvelope) bool {
+		for _, e := range evs {
+			if ic, ok := e.Event.(event.InputCancelled); ok && ic.InputID == queuedID {
+				return ic.Reason == event.CancelTurnInterrupted && ic.Message != nil
+			}
+		}
+		return false
+	})
+	var cancels, folds int
+	for _, e := range sink.events() {
+		switch ev := e.Event.(type) {
+		case event.InputCancelled:
+			if ev.InputID == queuedID {
+				cancels++
+			}
+		case event.TurnFoldedInto:
+			if ev.InputID == queuedID {
+				folds++
+			}
+		}
+	}
+	if cancels != 1 {
+		t.Fatalf("InputCancelled for the drained entry = %d, want exactly 1 (the draining sweep)", cancels)
+	}
+	if folds != 0 {
+		t.Fatalf("TurnFoldedInto for the drained entry = %d, want 0 (it was interrupted before the fold committed)", folds)
+	}
+
+	// The root-ctx cancel drives the actor through its hard-kill arm to exit; Loop.Done
+	// closing proves the actor returned cleanly (draining swept, nothing left pinned).
+	select {
+	case <-l.Done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Loop.Done did not close after the draining-sweep cancel; actor wedged")
+	}
 }

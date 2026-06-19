@@ -602,6 +602,7 @@ func listen(ctx context.Context, cfg Config, commands <-chan command.Command, ga
 			commit:       commit,
 			drainPending: drainPending,
 			emit:         emit,
+			afterDrain:   cfg.afterDrain,
 		}
 
 		go func() {
