@@ -140,7 +140,7 @@ func TestToolRunningToCompletedHandoff(t *testing.T) {
 	//    before the step boundary), and the one COMMITTED card snapped in by StepDone.
 	//    The committed card must appear (the ✓ glyph reaches scrollback), and the
 	//    running-card body placeholder ("(no output)") must never have been committed.
-	if got := strings.Count(full, "└ Fetch  GET weather.com"); got != 3 {
+	if got := strings.Count(full, "└ Fetch(GET weather.com)"); got != 3 {
 		t.Errorf("Fetch card header appeared %d times, want 3 (live running indicator, live resolved, committed)\n%q",
 			got, full)
 	}

@@ -505,17 +505,17 @@ func TestTranscriptToolCalls(t *testing.T) {
 				),
 			},
 			want: func(t *testing.T, m transcriptModel) {
-				// bare assistant (card-only) + one tool entry committed via fallback.
-				if len(m.committed) != 2 {
-					t.Fatalf("committed = %d, want 2 (bare assistant, tool)", len(m.committed))
+				// single empty-text tool → the one card is promoted to the bullet (no umbrella).
+				if len(m.committed) != 1 {
+					t.Fatalf("committed = %d, want 1 (promoted card)", len(m.committed))
 				}
-				if m.committed[1].Kind != kindTool {
-					t.Errorf("committed[1].Kind = %v, want kindTool", m.committed[1].Kind)
+				if m.committed[0].Kind != kindTool || !m.committed[0].promoted {
+					t.Errorf("committed[0] = %+v, want a promoted kindTool", m.committed[0])
 				}
-				if len(m.committed[1].Calls) != 1 {
-					t.Fatalf("committed[1].Calls = %d, want 1", len(m.committed[1].Calls))
+				if len(m.committed[0].Calls) != 1 {
+					t.Fatalf("committed[0].Calls = %d, want 1", len(m.committed[0].Calls))
 				}
-				if got := m.committed[1].Calls[0].Status; got != ToolError {
+				if got := m.committed[0].Calls[0].Status; got != ToolError {
 					t.Errorf("fallback card Status = %v, want ToolError (from IsError)", got)
 				}
 			},
@@ -530,16 +530,16 @@ func TestTranscriptToolCalls(t *testing.T) {
 				),
 			},
 			want: func(t *testing.T, m transcriptModel) {
-				if len(m.committed) != 2 {
-					t.Fatalf("committed = %d, want 2 (bare assistant, tool)", len(m.committed))
+				if len(m.committed) != 1 {
+					t.Fatalf("committed = %d, want 1 (promoted card)", len(m.committed))
 				}
-				if m.committed[1].Kind != kindTool {
-					t.Errorf("committed[1].Kind = %v, want kindTool", m.committed[1].Kind)
+				if m.committed[0].Kind != kindTool || !m.committed[0].promoted {
+					t.Errorf("committed[0] = %+v, want a promoted kindTool", m.committed[0])
 				}
-				if len(m.committed[1].Calls) != 1 {
-					t.Fatalf("committed[1].Calls = %d, want 1", len(m.committed[1].Calls))
+				if len(m.committed[0].Calls) != 1 {
+					t.Fatalf("committed[0].Calls = %d, want 1", len(m.committed[0].Calls))
 				}
-				if got := m.committed[1].Calls[0].Status; got != ToolOK {
+				if got := m.committed[0].Calls[0].Status; got != ToolOK {
 					t.Errorf("fallback card Status = %v, want ToolOK", got)
 				}
 			},
@@ -843,7 +843,7 @@ func TestTranscriptStepDoneSelfHeal(t *testing.T) {
 			},
 		},
 		{
-			name: "tool-use-only step (no narration) commits a bare assistant entry then the tool entry",
+			name: "tool-use-only step (single tool, no narration) promotes the one card to the bullet",
 			events: []event.Event{
 				event.TurnStarted{},
 				stepDone(
@@ -852,17 +852,14 @@ func TestTranscriptStepDoneSelfHeal(t *testing.T) {
 				),
 			},
 			want: func(t *testing.T, m transcriptModel) {
-				if len(m.committed) != 2 {
-					t.Fatalf("committed = %d, want 2 (bare assistant, tool)", len(m.committed))
+				if len(m.committed) != 1 {
+					t.Fatalf("committed = %d, want 1 (promoted card, no umbrella)", len(m.committed))
 				}
-				if m.committed[0].Kind != kindAssistant {
-					t.Errorf("committed[0].Kind = %v, want kindAssistant (bare bullet)", m.committed[0].Kind)
+				if m.committed[0].Kind != kindTool || !m.committed[0].promoted {
+					t.Errorf("committed[0] = %+v, want a promoted kindTool", m.committed[0])
 				}
-				if m.committed[1].Kind != kindTool {
-					t.Errorf("committed[1].Kind = %v, want kindTool", m.committed[1].Kind)
-				}
-				if m.committed[1].Calls[0].ToolName != "ReadFile" {
-					t.Errorf("tool name = %q, want ReadFile", m.committed[1].Calls[0].ToolName)
+				if m.committed[0].Calls[0].ToolName != "ReadFile" {
+					t.Errorf("tool name = %q, want ReadFile", m.committed[0].Calls[0].ToolName)
 				}
 			},
 		},
@@ -1030,22 +1027,23 @@ func TestCommitUserDoesNotDisturbLive(t *testing.T) {
 	}
 }
 
-// TestTranscriptPromptCommit covers the prompt-open boundary in ApplyEvent: a
-// PermissionRequested / UserInputRequested commits any pending live prose FIRST
-// (append-only ordering), then appends a single kindPromptRecord entry carrying
-// the FULL prompt context (permission: ToolName + Description; user input:
-// Question + ALL Choices). The live segment is NOT reset — the turn continues
-// while the gate is pending.
-func TestTranscriptPromptCommit(t *testing.T) {
+// TestTranscriptGatePrompts covers the gate-open boundaries in ApplyEvent after the
+// §7 rework: a PermissionRequested commits NOTHING (the gate surfaces as a live
+// awaiting-approval card composed by Screen, never a committed record), and a
+// UserInputRequested commits ONLY its AskUser record. Neither commits the provisional
+// live prose — it stays in the live segment to be committed exactly once by the step's
+// StepDone (the duplicate-thinking fix). The live segment is NOT reset by either gate.
+func TestTranscriptGatePrompts(t *testing.T) {
 	tests := []struct {
 		name   string
 		events []event.Event
 		want   func(t *testing.T, m transcriptModel)
 	}{
 		{
-			name: "PermissionRequested commits pending prose then a promptRecord with tool+description",
+			name: "PermissionRequested commits nothing and leaves provisional prose live",
 			events: []event.Event{
 				event.TurnStarted{},
+				thinkingChunk("planning the command"),
 				textChunk("I'll run a command."),
 				event.PermissionRequested{
 					CallID:  callID(1),
@@ -1053,85 +1051,22 @@ func TestTranscriptPromptCommit(t *testing.T) {
 				},
 			},
 			want: func(t *testing.T, m transcriptModel) {
-				if len(m.committed) != 2 {
-					t.Fatalf("committed = %d, want 2 (prose, promptRecord)", len(m.committed))
+				if len(m.committed) != 0 {
+					t.Fatalf("committed = %d, want 0 (the gate must not commit)", len(m.committed))
 				}
-				if m.committed[0].Kind != kindAssistant {
-					t.Errorf("committed[0].Kind = %v, want kindAssistant (prose committed first)", m.committed[0].Kind)
+				if m.live.Thinking != "planning the command" {
+					t.Errorf("live.Thinking = %q, want the provisional thinking preserved (uncommitted)", m.live.Thinking)
 				}
-				rec := m.committed[1]
-				if rec.Kind != kindPromptRecord {
-					t.Fatalf("committed[1].Kind = %v, want kindPromptRecord", rec.Kind)
+				if m.live.Text != "I'll run a command." {
+					t.Errorf("live.Text = %q, want the provisional prose preserved (uncommitted)", m.live.Text)
 				}
-				if rec.ID == 0 {
-					t.Errorf("promptRecord ID = 0, want nonzero stable ID")
-				}
-				if rec.Prompt == nil {
-					t.Fatal("promptRecord Prompt context is nil")
-				}
-				if rec.Prompt.Kind != promptPermission {
-					t.Errorf("Prompt.Kind = %v, want promptPermission", rec.Prompt.Kind)
-				}
-				if rec.Prompt.ToolName != "Bash" {
-					t.Errorf("Prompt.ToolName = %q, want %q", rec.Prompt.ToolName, "Bash")
-				}
-				if rec.Prompt.Description != "rm -rf build" {
-					t.Errorf("Prompt.Description = %q, want %q", rec.Prompt.Description, "rm -rf build")
-				}
-				// the full context must survive into the rendered scrollback record.
-				out := strings.Join(renderEntry(rec, false, 80), "\n")
-				if !strings.Contains(stripANSI(out), "Bash") || !strings.Contains(stripANSI(out), "rm -rf build") {
-					t.Errorf("rendered promptRecord = %q, want it to contain ToolName + Description", stripANSI(out))
-				}
-				// live is NOT reset: the turn continues while the gate is pending.
 				if !m.live.active {
-					t.Errorf("live.active = false, want true (prompt does not end the turn)")
+					t.Errorf("live.active = false, want true (the gate does not end the turn)")
 				}
 			},
 		},
 		{
-			name: "PermissionRequested on UnknownRequest records the tool name and summary",
-			events: []event.Event{
-				event.TurnStarted{},
-				event.PermissionRequested{
-					CallID:  callID(2),
-					Request: tool.UnknownRequest{Tool: "Mystery", Summary: "do a thing"},
-				},
-			},
-			want: func(t *testing.T, m transcriptModel) {
-				if len(m.committed) != 1 {
-					t.Fatalf("committed = %d, want 1 (promptRecord only; no pending prose)", len(m.committed))
-				}
-				rec := m.committed[0]
-				if rec.Kind != kindPromptRecord || rec.Prompt == nil {
-					t.Fatalf("committed[0] = %+v, want a kindPromptRecord with Prompt context", rec)
-				}
-				if rec.Prompt.ToolName != "Mystery" || rec.Prompt.Description != "do a thing" {
-					t.Errorf("Prompt = {%q,%q}, want {Mystery, do a thing}", rec.Prompt.ToolName, rec.Prompt.Description)
-				}
-			},
-		},
-		{
-			name: "PermissionRequested with nil Request records empty context without panicking",
-			events: []event.Event{
-				event.TurnStarted{},
-				event.PermissionRequested{CallID: callID(3), Request: nil},
-			},
-			want: func(t *testing.T, m transcriptModel) {
-				if len(m.committed) != 1 {
-					t.Fatalf("committed = %d, want 1", len(m.committed))
-				}
-				rec := m.committed[0]
-				if rec.Kind != kindPromptRecord || rec.Prompt == nil {
-					t.Fatalf("committed[0] = %+v, want a kindPromptRecord with (empty) Prompt context", rec)
-				}
-				if rec.Prompt.ToolName != "" || rec.Prompt.Description != "" {
-					t.Errorf("Prompt = {%q,%q}, want both empty for nil Request", rec.Prompt.ToolName, rec.Prompt.Description)
-				}
-			},
-		},
-		{
-			name: "UserInputRequested commits prose then a promptRecord with question + all choices",
+			name: "UserInputRequested commits ONLY the record; provisional prose stays live",
 			events: []event.Event{
 				event.TurnStarted{},
 				textChunk("Need a decision."),
@@ -1142,18 +1077,15 @@ func TestTranscriptPromptCommit(t *testing.T) {
 				},
 			},
 			want: func(t *testing.T, m transcriptModel) {
-				if len(m.committed) != 2 {
-					t.Fatalf("committed = %d, want 2 (prose, promptRecord)", len(m.committed))
+				if len(m.committed) != 1 {
+					t.Fatalf("committed = %d, want 1 (the AskUser record only — no prose commit)", len(m.committed))
 				}
-				if m.committed[0].Kind != kindAssistant {
-					t.Errorf("committed[0].Kind = %v, want kindAssistant", m.committed[0].Kind)
+				if m.live.Text != "Need a decision." {
+					t.Errorf("live.Text = %q, want the provisional prose preserved (uncommitted)", m.live.Text)
 				}
-				rec := m.committed[1]
+				rec := m.committed[0]
 				if rec.Kind != kindPromptRecord || rec.Prompt == nil {
-					t.Fatalf("committed[1] = %+v, want a kindPromptRecord with Prompt context", rec)
-				}
-				if rec.Prompt.Kind != promptUserInput {
-					t.Errorf("Prompt.Kind = %v, want promptUserInput", rec.Prompt.Kind)
+					t.Fatalf("committed[0] = %+v, want a kindPromptRecord with Prompt context", rec)
 				}
 				if rec.Prompt.Question != "Which source?" {
 					t.Errorf("Prompt.Question = %q, want %q", rec.Prompt.Question, "Which source?")
@@ -1165,8 +1097,11 @@ func TestTranscriptPromptCommit(t *testing.T) {
 				out := stripANSI(strings.Join(renderEntry(rec, false, 80), "\n"))
 				for _, c := range []string{"Which source?", "alpha", "beta", "gamma"} {
 					if !strings.Contains(out, c) {
-						t.Errorf("rendered promptRecord = %q, want it to contain %q", out, c)
+						t.Errorf("rendered AskUser record = %q, want it to contain %q", out, c)
 					}
+				}
+				if !m.live.active {
+					t.Errorf("live.active = false, want true (the gate does not end the turn)")
 				}
 			},
 		},
@@ -1202,59 +1137,89 @@ func TestTranscriptPromptCommit(t *testing.T) {
 	}
 }
 
-// TestCommitStepAssistantDoneHeadline covers the doneHeadline signal on a committed
-// assistant entry (design §3 rule 4): a StepDone whose AIMessage has tool-use blocks
-// but NO prose/thinking commits a kindAssistant entry marked doneHeadline (it renders
-// the static "● Done"); any prose/thinking clears it (the prose IS the headline); and
-// the interrupt/failure partial path NEVER sets it (an interrupted step is not "done").
-func TestCommitStepAssistantDoneHeadline(t *testing.T) {
+// TestStepDoneHeadlineAndPromotion covers how an empty-text tool step commits: a
+// SINGLE-tool step promotes its one card to the assistant bullet (a promoted kindTool
+// entry, no umbrella) — with a thinking-only kindAssistant entry above it when the step
+// reasoned; a MULTI-tool step commits a "● Multiple actions" umbrella (kindAssistant
+// headline) then its plain cards; and a step WITH narration commits a narration bullet
+// and leaves its cards un-promoted.
+func TestStepDoneHeadlineAndPromotion(t *testing.T) {
 	tests := []struct {
 		name   string
 		events []event.Event
-		want   bool // doneHeadline on committed[0] (always a kindAssistant in these rows)
+		check  func(t *testing.T, m transcriptModel)
 	}{
 		{
-			name: "empty-text tool step → doneHeadline",
+			name: "single empty-text tool → one promoted card, no umbrella entry",
 			events: []event.Event{
 				event.TurnStarted{},
 				stepDone(aiMessage("", "", toolUse("tu-1", "Bash", `{}`)), toolResult("tu-1", "out")),
 			},
-			want: true,
-		},
-		{
-			name: "tool step WITH narration → no doneHeadline (prose is the headline)",
-			events: []event.Event{
-				event.TurnStarted{},
-				stepDone(aiMessage("", "reading config", toolUse("tu-1", "Bash", `{}`)), toolResult("tu-1", "out")),
+			check: func(t *testing.T, m transcriptModel) {
+				if len(m.committed) != 1 {
+					t.Fatalf("committed = %d, want 1 (just the promoted card)", len(m.committed))
+				}
+				if e := m.committed[0]; e.Kind != kindTool || !e.promoted {
+					t.Errorf("committed[0] = {kind %v, promoted %v}, want {kindTool, true}", e.Kind, e.promoted)
+				}
 			},
-			want: false,
 		},
 		{
-			name: "tool step WITH thinking → no doneHeadline",
+			name: "single empty-text tool WITH thinking → thinking entry then promoted card",
 			events: []event.Event{
 				event.TurnStarted{},
 				stepDone(aiMessage("plan it", "", toolUse("tu-1", "Bash", `{}`)), toolResult("tu-1", "out")),
 			},
-			want: false,
+			check: func(t *testing.T, m transcriptModel) {
+				if len(m.committed) != 2 {
+					t.Fatalf("committed = %d, want 2 (thinking entry, promoted card)", len(m.committed))
+				}
+				if e := m.committed[0]; e.Kind != kindAssistant || e.headline != "" || thinkingText(e.Blocks) == "" {
+					t.Errorf("committed[0] = %+v, want a thinking-only kindAssistant (no headline)", e)
+				}
+				if e := m.committed[1]; e.Kind != kindTool || !e.promoted {
+					t.Errorf("committed[1] = %+v, want the promoted kindTool card", e)
+				}
+			},
 		},
 		{
-			name: "interrupted partial prose → no doneHeadline (not done)",
+			name: "multi empty-text tools → Multiple actions umbrella then plain cards",
 			events: []event.Event{
 				event.TurnStarted{},
-				textChunk("partial answer"),
-				toolStarted(callID(1), "Bash", "sleep"),
-				event.TurnInterrupted{},
+				stepDone(aiMessage("", "", toolUse("tu-1", "Bash", `{}`), toolUse("tu-2", "Fetch", `{}`)),
+					toolResult("tu-1", "a"), toolResult("tu-2", "b")),
 			},
-			want: false,
+			check: func(t *testing.T, m transcriptModel) {
+				if len(m.committed) != 3 {
+					t.Fatalf("committed = %d, want 3 (umbrella + 2 cards)", len(m.committed))
+				}
+				if e := m.committed[0]; e.Kind != kindAssistant || e.headline != multipleActionsHeadline {
+					t.Errorf("committed[0] = %+v, want kindAssistant headline %q", e, multipleActionsHeadline)
+				}
+				for i := 1; i <= 2; i++ {
+					if e := m.committed[i]; e.Kind != kindTool || e.promoted {
+						t.Errorf("committed[%d] = %+v, want a plain (non-promoted) kindTool card", i, e)
+					}
+				}
+			},
 		},
 		{
-			name: "failed partial prose → no doneHeadline (not done)",
+			name: "text + tool → narration bullet, card not promoted",
 			events: []event.Event{
 				event.TurnStarted{},
-				textChunk("partial"),
-				event.TurnFailed{Err: errBoom{}},
+				stepDone(aiMessage("", "reading config", toolUse("tu-1", "Bash", `{}`)), toolResult("tu-1", "out")),
 			},
-			want: false,
+			check: func(t *testing.T, m transcriptModel) {
+				if len(m.committed) != 2 {
+					t.Fatalf("committed = %d, want 2 (narration, card)", len(m.committed))
+				}
+				if e := m.committed[0]; e.Kind != kindAssistant || e.headline != "" || textOnly(e.Blocks) == "" {
+					t.Errorf("committed[0] = %+v, want a narration kindAssistant (no headline)", e)
+				}
+				if e := m.committed[1]; e.Kind != kindTool || e.promoted {
+					t.Errorf("committed[1] = %+v, want a plain (non-promoted) kindTool card", e)
+				}
+			},
 		},
 	}
 
@@ -1265,16 +1230,7 @@ func TestCommitStepAssistantDoneHeadline(t *testing.T) {
 			for _, ev := range tt.events {
 				m = m.ApplyEvent(ev)
 			}
-			if len(m.committed) == 0 {
-				t.Fatalf("committed = 0 entries, want at least 1")
-			}
-			e := m.committed[0]
-			if e.Kind != kindAssistant {
-				t.Fatalf("committed[0].Kind = %v, want kindAssistant", e.Kind)
-			}
-			if e.doneHeadline != tt.want {
-				t.Errorf("committed[0].doneHeadline = %v, want %v", e.doneHeadline, tt.want)
-			}
+			tt.check(t, m)
 		})
 	}
 }
@@ -1557,5 +1513,67 @@ func TestTranscriptRecordSubmitValueCopy(t *testing.T) {
 	}
 	if got := queuedTexts(child); len(got) != 2 {
 		t.Errorf("child queued = %v, want two entries", got)
+	}
+}
+
+// TestGateDecisionFlow covers the permission verb end-to-end in the transcript: a
+// PermissionRequested remembers the gate (committing nothing), ResolveGate records the
+// keypress decision, and the step's StepDone bakes it onto the committed card so it
+// reads "Approved …" / "Denied …". The step's thinking commits exactly once (the gate
+// never commits prose — the duplicate-thinking fix), and the card uses the Tool(args)
+// form.
+func TestGateDecisionFlow(t *testing.T) {
+	tests := []struct {
+		name     string
+		decision gateDecision
+		wantVerb string
+	}{
+		{name: "approved", decision: gateApproved, wantVerb: "Approved"},
+		{name: "denied", decision: gateDenied, wantVerb: "Denied"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			var m transcriptModel
+			m = m.ApplyEvent(event.TurnStarted{})
+			m = m.ApplyEvent(thinkingChunk("let me run it"))
+			m = m.ApplyEvent(event.PermissionRequested{CallID: callID(1), Request: tool.BashRequest{Command: "date"}})
+			// The gate commits nothing; the thinking stays live (uncommitted).
+			if len(m.committed) != 0 {
+				t.Fatalf("committed after gate = %d, want 0", len(m.committed))
+			}
+			// Screen records the keypress decision, then the loop runs the tool.
+			m = m.ResolveGate(callID(1), tt.decision)
+			m = m.ApplyEvent(toolStarted(callID(1), "Bash", "date"))
+			m = m.ApplyEvent(toolCompleted(callID(1), tt.decision == gateDenied, "out"))
+			m = m.ApplyEvent(stepDone(aiMessage("let me run it", "", toolUse("tu-1", "Bash", `{}`)), toolResult("tu-1", "out")))
+
+			// committed: a thinking-only entry then the promoted card carrying the decision.
+			if len(m.committed) != 2 {
+				t.Fatalf("committed = %d, want 2 (thinking, promoted card)", len(m.committed))
+			}
+			thinkCount := 0
+			for _, e := range m.committed {
+				if e.Kind == kindAssistant && thinkingText(e.Blocks) != "" {
+					thinkCount++
+				}
+			}
+			if thinkCount != 1 {
+				t.Errorf("committed thinking entries = %d, want exactly 1 (no gate duplicate)", thinkCount)
+			}
+			card := m.committed[1]
+			if card.Kind != kindTool || !card.promoted {
+				t.Fatalf("committed[1] = %+v, want the promoted card", card)
+			}
+			if got := card.Calls[0].Decision; got != tt.decision {
+				t.Errorf("card Decision = %v, want %v", got, tt.decision)
+			}
+			got := stripANSI(strings.Join(renderEntry(card, false, 80), "\n"))
+			for _, w := range []string{tt.wantVerb, "Bash(date)"} {
+				if !strings.Contains(got, w) {
+					t.Errorf("rendered card = %q, want %q", got, w)
+				}
+			}
+		})
 	}
 }

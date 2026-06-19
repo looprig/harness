@@ -157,10 +157,10 @@ func TestRenderEntryTool(t *testing.T) {
 	}
 }
 
-// TestRenderEntryPromptRecord locks the promptRecord render: the FULL prompt
-// context (permission: an "Approve <ToolName>?" header + the wrapped Description;
-// user input: the Question + every numbered choice). It is the SCROLLBACK record —
-// it must NOT render the compact bottom-box control (no [y]/[s]/[n] key legend).
+// TestRenderEntryPromptRecord locks the promptRecord render: the FULL AskUser context
+// (the Question + every numbered choice). It is the SCROLLBACK record — it must NOT
+// render the compact bottom-box control (no ↑/↓ key legend). Permission gates no
+// longer commit a record (they surface as a live awaiting-approval card, design §7).
 func TestRenderEntryPromptRecord(t *testing.T) {
 	tests := []struct {
 		name      string
@@ -169,19 +169,8 @@ func TestRenderEntryPromptRecord(t *testing.T) {
 		absentSub []string // substrings the compact control would have but the record must NOT
 	}{
 		{
-			name: "permission renders Approve header and full description",
-			ctx: promptContext{
-				Kind:        promptPermission,
-				ToolName:    "EditFile",
-				Description: "cmd/cli/main.go  ·  +7 −0",
-			},
-			wantSubs:  []string{"Approve EditFile?", "cmd/cli/main.go", "+7 −0"},
-			absentSub: []string{"[y] once", "[n] deny"},
-		},
-		{
 			name: "user input renders the question and all numbered choices",
 			ctx: promptContext{
-				Kind:     promptUserInput,
 				Question: "Which version source?",
 				Choices:  []string{"version.Version()", "git tag", "CHANGELOG top"},
 			},
@@ -191,19 +180,10 @@ func TestRenderEntryPromptRecord(t *testing.T) {
 		{
 			name: "free-text user input renders only the question (no choices)",
 			ctx: promptContext{
-				Kind:     promptUserInput,
 				Question: "What should the output look like?",
 			},
 			wantSubs:  []string{"What should the output look like?"},
 			absentSub: []string{"1.", "↑/↓ select"},
-		},
-		{
-			name: "empty permission context renders the bare Approve header without panicking",
-			ctx: promptContext{
-				Kind: promptPermission,
-			},
-			wantSubs:  []string{"Approve"},
-			absentSub: []string{"[y] once"},
 		},
 	}
 	for _, tt := range tests {
@@ -252,20 +232,8 @@ func TestRenderEntryPromptRecordInfoBar(t *testing.T) {
 		minBarHits int      // minimum number of barred lines the output must carry
 	}{
 		{
-			name: "permission header and body each carry the info bar",
-			ctx: promptContext{
-				Kind:        promptPermission,
-				ToolName:    "Bash",
-				Description: "date",
-			},
-			width:      80,
-			wantSubs:   []string{"Approve Bash?", "date"},
-			minBarHits: 2, // header line + body line
-		},
-		{
 			name: "AskUser question and every choice each carry the info bar",
 			ctx: promptContext{
-				Kind:     promptUserInput,
 				Question: "Which version source?",
 				Choices:  []string{"version.Version()", "git tag", "CHANGELOG top"},
 			},
@@ -274,15 +242,13 @@ func TestRenderEntryPromptRecordInfoBar(t *testing.T) {
 			minBarHits: 4, // question + three choices
 		},
 		{
-			name: "long permission description wraps and each wrapped line keeps the bar",
+			name: "long AskUser question wraps and each wrapped line keeps the bar",
 			ctx: promptContext{
-				Kind:        promptPermission,
-				ToolName:    "Bash",
-				Description: "alpha bravo charlie delta echo foxtrot golf hotel india juliet",
+				Question: "alpha bravo charlie delta echo foxtrot golf hotel india juliet",
 			},
-			width:      16, // forces the description to wrap across several rows
-			wantSubs:   []string{"Approve Bash?", "alpha"},
-			minBarHits: 3, // header + at least two wrapped body rows
+			width:      16, // forces the question to wrap across several rows
+			wantSubs:   []string{"alpha"},
+			minBarHits: 3, // at least three wrapped rows
 		},
 	}
 
@@ -339,7 +305,6 @@ func TestRenderEntryChoicesNotFaint(t *testing.T) {
 	}
 
 	ctx := promptContext{
-		Kind:     promptUserInput,
 		Question: "Which version source?",
 		Choices:  []string{"version.Version()", "git tag"},
 	}
@@ -355,42 +320,6 @@ func TestRenderEntryChoicesNotFaint(t *testing.T) {
 		if !strings.Contains(stripped, want) {
 			t.Errorf("recorded choices render = %q, want plain numbered line %q", stripped, want)
 		}
-	}
-}
-
-// TestRenderEntryPermissionInteriorBlank locks blank-line preservation in the FULL
-// permission record: a multi-line Description with an INTERIOR blank line keeps that
-// blank (a multi-line command/diff can carry meaningful gaps), while a single
-// leading/trailing blank is trimmed so the body reads tight against the header.
-func TestRenderEntryPermissionInteriorBlank(t *testing.T) {
-	t.Parallel()
-	ctx := promptContext{
-		Kind:        promptPermission,
-		ToolName:    "Bash",
-		Description: "\nline one\n\nline two\n", // leading + trailing trimmed; interior blank kept
-	}
-	e := entry{ID: 1, Kind: kindPromptRecord, Prompt: &ctx}
-	lines := renderEntry(e, false, 80)
-	// Strip ANSI but keep the literal "▌ " bar glyph; trim it off each line to inspect
-	// the body content, since every line now carries the info bar.
-	body := make([]string, len(lines))
-	for i, l := range lines {
-		body[i] = strings.TrimPrefix(stripANSI(l), styles.AccentBarPrompt)
-	}
-	joined := strings.Join(body, "\n")
-
-	if !strings.Contains(joined, "line one\n\nline two") {
-		t.Errorf("permission record = %q, want the interior blank line preserved between the two body lines", joined)
-	}
-	// Header then body with no leading blank: header is line 0, body starts at line 1.
-	if len(body) < 1 || !strings.Contains(body[0], "Approve Bash?") {
-		t.Fatalf("permission record lines = %q, want the Approve header first", body)
-	}
-	if len(body) > 1 && body[1] == "" {
-		t.Errorf("permission record = %q, leading blank line should have been trimmed", body)
-	}
-	if body[len(body)-1] == "" {
-		t.Errorf("permission record = %q, trailing blank line should have been trimmed", body)
 	}
 }
 

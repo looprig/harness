@@ -24,8 +24,11 @@ func renderEntry(e entry, expand bool, width int) []string {
 	case kindUser:
 		return splitNonEmpty(renderUser(renderInlineBlocks(e.Blocks), width))
 	case kindAssistant:
-		return splitNonEmpty(renderAssistant(thinkingText(e.Blocks), assistantText(e.Blocks), e.Calls, e.doneHeadline, expand, width))
+		return splitNonEmpty(renderAssistant(thinkingText(e.Blocks), assistantText(e.Blocks), e.headline, expand, width))
 	case kindTool:
+		if e.promoted && len(e.Calls) == 1 {
+			return splitNonEmpty(renderPromotedTool(e.Calls[0], expand, width))
+		}
 		return splitNonEmpty(renderToolCalls(e.Calls, expand, width))
 	case kindPromptRecord:
 		return renderPromptRecord(e.Prompt, width)
@@ -70,50 +73,17 @@ func barWrap(style lipgloss.Style, rawLines []string, width int) []string {
 	return out
 }
 
-// renderPromptRecord renders the FULL prompt context committed to scrollback — the
-// copyable record, NOT the compact bottom-box control (prompt.go renders that). It is
-// rendered as one info notification: every line carries the neutral "▌ " info bar
-// (styles.NoticeInfoStyle), matching the leveled-notice family. A permission record
-// renders an "Approve <ToolName>?" header then its wrapped Description (the command /
-// diff / url); a user-input record renders the Question then every choice. A nil
-// context renders nothing (fail-safe).
+// renderPromptRecord renders the FULL AskUser context committed to scrollback — the
+// question + every numbered choice, NOT the compact bottom-box control (prompt.go
+// renders that). It is rendered as one info notification: every line carries the
+// neutral "▌ " info bar (styles.NoticeInfoStyle), matching the leveled-notice family.
+// A nil context renders nothing (fail-safe). Permission gates never reach here — they
+// surface as the "Approved …"/"Denied …" verb on their committed tool card, not a record.
 func renderPromptRecord(p *promptContext, width int) []string {
 	if p == nil {
 		return nil
 	}
-	if p.Kind == promptUserInput {
-		return renderUserInputRecord(*p, width)
-	}
-	return renderPermissionRecord(*p, width)
-}
-
-// renderPermissionRecord renders a permission gate's scrollback record as one info
-// notification: a "▌ "-barred, bold "Approve <ToolName>?" header followed by the
-// "▌ "-barred, width-wrapped, copyable Description lines — every line carries the
-// neutral info bar (styles.NoticeInfoStyle) so the block reads as one information
-// notice (unifying it with the leveled-notice family). The Description (Bash command,
-// file diff, fetch url) is shown in full so scrollback retains exactly what was
-// approved/denied — INTERIOR blank lines are preserved (a multi-line command or diff
-// can carry meaningful gaps); only a single leading/trailing empty line is trimmed so
-// the record reads tight against the header.
-func renderPermissionRecord(p promptContext, width int) []string {
-	out := barWrap(styles.PromptRecordHeaderStyle, []string{"Approve " + p.ToolName + "?"}, width)
-	body := trimEdgeBlanks(strings.Split(p.Description, "\n"))
-	return append(out, barWrap(styles.NoticeInfoStyle, body, width)...)
-}
-
-// trimEdgeBlanks drops a single leading and a single trailing empty line from rows,
-// preserving every interior blank line. It is how the permission record keeps a
-// multi-line Description's meaningful interior gaps while not opening or closing the
-// body on a stray blank. A slice that is all-blank collapses to empty.
-func trimEdgeBlanks(rows []string) []string {
-	if len(rows) > 0 && rows[0] == "" {
-		rows = rows[1:]
-	}
-	if len(rows) > 0 && rows[len(rows)-1] == "" {
-		rows = rows[:len(rows)-1]
-	}
-	return rows
+	return renderUserInputRecord(*p, width)
 }
 
 // renderUserInputRecord renders an AskUser request's scrollback record as one info

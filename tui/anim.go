@@ -43,9 +43,9 @@ func spinnerGlyph(frame uint) string {
 }
 
 // workingWords are the live "doing work" synonyms shown beside the dot for an
-// empty-text tool step (design §3 rule 4). They are a purely LIVE affordance —
-// the committed headline is always the static "Done" — so the word may rotate
-// while the step runs; it need not survive into scrollback.
+// empty-text tool step. They are a purely LIVE affordance — the committed form is the
+// promoted tool card ("● <verb >Tool(args)") or the "● Multiple actions" umbrella — so
+// the word may rotate while the step runs; it need not survive into scrollback.
 var workingWords = []string{"Working", "Crunching", "Churning", "Toiling", "Cooking", "Whirring"}
 
 // workingWord returns the live working-word for frame, wrapping modulo the word

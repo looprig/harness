@@ -186,7 +186,7 @@ func TestRenderLiveAssistantBlink(t *testing.T) {
 		t.Fatalf("live assistant identical across blink phases (%q); the live dot must blink", stripANSI(lit))
 	}
 	// The lit live phase matches the static committed render (same lit dot).
-	committed := renderAssistant("", text, nil, false, false, 80)
+	committed := renderAssistant("", text, "", false, 80)
 	if stripANSI(lit) != stripANSI(committed) {
 		t.Errorf("lit live render %q != committed render %q; lit phase must equal the static dot",
 			stripANSI(lit), stripANSI(committed))

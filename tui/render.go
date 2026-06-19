@@ -53,10 +53,13 @@ const (
 // line — still fit.
 const dotWidth = 2
 
-// doneHeadlineText is the committed headline word beside the dot for an empty-text tool
-// step (design §3 rule 4): a static "Done", since the per-tool ✓/✗ outcome lives on
-// each separately-committed card. The LIVE counterpart is a rotating workingWord.
-const doneHeadlineText = "Done"
+// multipleActionsHeadline is the committed bullet headline for an empty-text step that
+// ran MORE THAN ONE tool call: a single "● Multiple actions" umbrella, with each call
+// committed below it as its own card (carrying the per-tool name, args, ✓/✗ and any
+// Approved/Denied verb). A single-tool empty-text step has no umbrella — its one card
+// is promoted to the bullet directly (renderPromotedTool). The LIVE counterpart of an
+// empty-text step is a rotating workingWord.
+const multipleActionsHeadline = "Multiple actions"
 
 // renderMD renders markdown to ANSI behind the static committed bullet (styles.Dot).
 // It is the committed/scrollback path: a frozen assistant "●" never animates, so it
@@ -178,7 +181,7 @@ func renderToolCallsGlyph(calls []ToolCallView, expandTools bool, width int, gly
 // (live or committed) and the committed path always render their full body.
 func renderToolCard(c ToolCallView, expandTools bool, width int, glyph func(ToolStatus) string, liveRunning bool) string {
 	header := cardIndent + styles.ToolCallStyle.Render(
-		cardConnector+toolHeaderText(c.ToolName, c.Summary, glyph(c.Status)))
+		cardConnector+toolHeaderText(c, glyph(c.Status)))
 
 	if liveRunning && c.Status == ToolRunning {
 		return header // compact one-line running indicator; body appears once, on commit
@@ -192,13 +195,33 @@ func renderToolCard(c ToolCallView, expandTools bool, width int, glyph func(Tool
 	return strings.Join(lines, "\n")
 }
 
-// toolHeaderText assembles the "ToolName  Summary  glyph" body of a card header,
-// omitting the summary gap when there is no summary.
-func toolHeaderText(name, summary, glyph string) string {
-	if summary == "" {
-		return name + "  " + glyph
+// toolHeaderText assembles a card header's body: "<verb >ToolName(Summary)  glyph",
+// where verb is the permission decision ("Approved "/"Denied ") for a call that
+// prompted (empty for an ungated/pre-approved call) and the args summary is shown in
+// parens. The parens and the summary gap are omitted when there is no summary.
+func toolHeaderText(c ToolCallView, glyph string) string {
+	head := c.ToolName
+	if c.Summary != "" {
+		head = c.ToolName + "(" + c.Summary + ")"
 	}
-	return name + "  " + summary + "  " + glyph
+	if v := decisionVerb(c.Decision); v != "" {
+		head = v + " " + head
+	}
+	return head + "  " + glyph
+}
+
+// decisionVerb maps a permission decision to its card-header verb. A call that never
+// prompted (gateNone) — ungated or pre-approved by an existing grant — gets no verb;
+// a still-pending gate likewise shows none (it resolves before the card commits).
+func decisionVerb(d gateDecision) string {
+	switch d {
+	case gateApproved:
+		return "Approved"
+	case gateDenied:
+		return "Denied"
+	default:
+		return ""
+	}
 }
 
 // previewLines selects the result lines to display for a card. An empty result
@@ -237,16 +260,16 @@ func indentWrap(s, indent string, width int) string {
 	return strings.Join(rows, "\n")
 }
 
-// renderAssistant renders an assistant segment in order: its reasoning (thinking)
-// block, its markdown narration, then its tool-call cards. When the segment has empty
-// narration and done is set — the committed empty-text tool step (design §3 rule 4) —
-// it renders a bold "● Done" headline beside the dot, the static committed counterpart
-// of the live working-word; the per-tool ✓/✗ outcome lives on each separately-committed
-// card. With empty narration and done unset it falls back to a bare dot bullet (a
-// defensive card-only case). Empty parts are omitted. The single expand flag drives BOTH
-// the thinking block (compact summary vs full body) and the tool-card result folding, so
-// ctrl+t toggles them together.
-func renderAssistant(thinking, text string, calls []ToolCallView, done bool, expand bool, width int) string {
+// renderAssistant renders a committed assistant segment in order: its reasoning
+// (thinking) block, then its markdown narration OR a bold bullet headline. When the
+// narration is non-empty it renders "● <text>"; when it is empty and headline is set —
+// the empty-text MULTI-tool step's "● Multiple actions" umbrella — it renders
+// "● <headline>". When both are empty it renders the thinking rail alone with no
+// bullet (a thinking-only message, or a single-tool empty-text step whose one card is
+// promoted to the bullet separately by renderPromotedTool). Committed tool cards are
+// their OWN kindTool entries, so this never renders cards inline. expand drives the
+// thinking block's compact/full fold.
+func renderAssistant(thinking, text, headline string, expand bool, width int) string {
 	var b strings.Builder
 
 	if t := renderThinking(thinking, expand, width); t != "" {
@@ -254,13 +277,8 @@ func renderAssistant(thinking, text string, calls []ToolCallView, done bool, exp
 	}
 
 	body := renderMD(text, width)
-	if body == "" {
-		switch {
-		case done:
-			body = strings.TrimRight(styles.Dot, " ") + " " + styles.HeadlineStyle.Render(doneHeadlineText) // "● Done"
-		case len(calls) > 0:
-			body = strings.TrimRight(styles.Dot, " ") // bare bullet for a card-only segment (defensive)
-		}
+	if body == "" && headline != "" {
+		body = strings.TrimRight(styles.Dot, " ") + " " + styles.HeadlineStyle.Render(headline) // "● <headline>"
 	}
 	if body != "" {
 		if b.Len() > 0 {
@@ -268,14 +286,24 @@ func renderAssistant(thinking, text string, calls []ToolCallView, done bool, exp
 		}
 		b.WriteString(body)
 	}
-
-	if len(calls) > 0 {
-		if b.Len() > 0 {
-			b.WriteString("\n") // cards nest tight beneath the segment they belong to
-		}
-		b.WriteString(renderToolCalls(calls, expand, width))
-	}
 	return b.String()
+}
+
+// renderPromotedTool renders a single tool card promoted to the assistant bullet — the
+// committed form of an empty-text step that ran exactly ONE tool call. Instead of a
+// "Multiple actions" umbrella plus a child card, the one call IS the headline:
+// "● <verb >ToolName(args)  glyph" beside the lit dot, with its result preview indented
+// below (same fold as a normal card). It is the committed counterpart of the live
+// working-word for the single-tool case.
+func renderPromotedTool(c ToolCallView, expand bool, width int) string {
+	header := strings.TrimRight(styles.Dot, " ") + " " +
+		styles.HeadlineStyle.Render(toolHeaderText(c, toolGlyph(c.Status)))
+	lines := make([]string, 0, previewLineCap+2)
+	lines = append(lines, header)
+	for _, rl := range previewLines(c.Result, expand) {
+		lines = append(lines, indentWrap(rl, resultIndent, width))
+	}
+	return strings.Join(lines, "\n")
 }
 
 // renderLiveAssistant renders the in-progress (live) assistant segment with the
@@ -293,9 +321,9 @@ func renderLiveAssistant(thinking, text string, calls []ToolCallView, expand boo
 
 	body := renderMDDot(text, width, liveDot(a.blink))
 	if body == "" && len(calls) > 0 {
-		// Live empty-text tool step (design §3 rule 4): a rotating working-word beside
-		// the blinking dot — the provisional, pre-StepDone counterpart of the committed
-		// static "Done" (renderAssistant). The word may rotate while the step runs.
+		// Live empty-text tool step: a rotating working-word beside the blinking dot —
+		// the provisional, pre-StepDone counterpart of the committed promoted-tool /
+		// "Multiple actions" headline. The word may rotate while the step runs.
 		body = strings.TrimRight(liveDot(a.blink), " ") + " " + styles.HeadlineStyle.Render(workingWord(a.frame))
 	}
 	if body != "" {
@@ -382,6 +410,7 @@ func firstLine(s string) string {
 	}
 	return s
 }
+
 
 // thinkingRail is the left-rail margin ("│ ") that prefixes EVERY line of the
 // expanded thinking block — header included — so the block renders as one unbroken

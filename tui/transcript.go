@@ -127,20 +127,15 @@ const (
 	noticeError
 )
 
-// promptContext is the FULL prompt payload a kindPromptRecord entry commits to
-// scrollback when a gate opens: the copyable command/diff (permission) or the
-// question + every choice (user input). It is the append-only SCROLLBACK record —
-// distinct from the interaction layer's compact bottom-box control (prompt in
-// prompt.go), which carries selection state and is redrawn every frame. Kind
-// reuses the prompt.go promptKind so the renderer dispatches the same way. A
-// permission record uses ToolName/Description; a user-input record uses
-// Question/Choices.
+// promptContext is the FULL AskUser payload a kindPromptRecord entry commits to
+// scrollback when a user-input gate opens: the question + every choice. It is the
+// append-only SCROLLBACK record — distinct from the interaction layer's compact
+// bottom-box control (prompt in prompt.go), which carries selection state and is
+// redrawn every frame. Permission gates do NOT use this: they surface as the
+// "Approved …"/"Denied …" verb on their committed tool card, never as a record.
 type promptContext struct {
-	Kind        promptKind
-	ToolName    string   // promptPermission: approval header ("Approve <ToolName>?")
-	Description string   // promptPermission: copyable body (command / diff / url)
-	Question    string   // promptUserInput: the AskUser question
-	Choices     []string // promptUserInput: every offered choice, in order
+	Question string   // the AskUser question
+	Choices  []string // every offered choice, in order
 }
 
 // entry is one committed (finalized) row of the transcript. It stores the minimal
@@ -161,12 +156,17 @@ type entry struct {
 	// nil for every other kind. Kept as a pointer so non-prompt entries pay no
 	// per-entry cost and a nil here is an unambiguous "not a prompt record".
 	Prompt *promptContext
-	// doneHeadline marks a kindAssistant entry that is the committed form of an
-	// empty-text tool step (design §3 rule 4): it carries no prose blocks and renders
-	// a bold "● Done" headline above its separately-committed tool cards. Set ONLY by
-	// commitStepAssistant on the clean StepDone path; the interrupt/failure partial
-	// path never sets it (an interrupted step is not "done").
-	doneHeadline bool
+	// headline is the bold bullet text of a kindAssistant entry that has NO narration
+	// (empty TextBlock) — currently "Multiple actions", the umbrella for an empty-text
+	// step that ran more than one tool call. Empty for every other assistant entry
+	// (narration entries render their text; a single-tool empty-text step promotes its
+	// one card to the bullet instead — see promoted). Renders as "● <headline>".
+	headline string
+	// promoted marks a kindTool entry whose single card is rendered AS the assistant
+	// bullet ("● <verb >ToolName(args)" + result) rather than an indented "└ …" card —
+	// the committed form of an empty-text step that ran exactly one tool call. Set ONLY
+	// by stepDone for that case; every other kindTool entry renders as a normal card.
+	promoted bool
 }
 
 // liveSeg is the in-progress assistant segment for the current turn: the streamed
@@ -180,6 +180,12 @@ type liveSeg struct {
 	Text     string
 	Calls    []ToolCallView
 	active   bool
+	// gateDecisions records, by gate CallID, how each PERMISSION gate of the current
+	// step was resolved: gatePending on PermissionRequested, then gateApproved/
+	// gateDenied once Screen calls ResolveGate from the user's keypress. toolStarted
+	// bakes the decision into its live card, so the committed card reads "Approved …" /
+	// "Denied …". It is reset (to nil) at each StepDone with the rest of the segment.
+	gateDecisions map[uuid.UUID]gateDecision
 }
 
 // empty reports whether the live segment carries no committable content — no
@@ -249,9 +255,13 @@ type transcriptModel struct {
 //
 // TurnDone is a lifecycle terminal: every completed step already committed via its
 // StepDone, so it only flushes any leftover provisional live (defensive) and resets.
-// PermissionRequested/UserInputRequested are prompt-open boundaries: each commits any
-// pending prose, then commits the FULL prompt context as a kindPromptRecord entry
-// (the live segment is NOT reset — the turn continues while the gate is pending).
+// PermissionRequested only REMEMBERS the gate (by CallID) so the call's committed card
+// can read "Approved …" / "Denied …" once Screen reports the keypress via ResolveGate;
+// it commits nothing (the permission shows on the tool card, not a separate record).
+// UserInputRequested (AskUser is not a tool) commits ONLY the prompt record. Neither
+// commits pending prose — the provisional live prose stays live and commits exactly
+// once via StepDone (no duplicate) — and neither resets the live segment, so the turn
+// continues while the gate is pending.
 // TurnInterrupted/TurnFailed are the abnormal terminals: the in-flight INCOMPLETE step
 // never emitted a StepDone, so its provisional live is committed (partial work stays
 // visible) before the tombstone/error. It returns ONLY the next transcriptModel — no
@@ -463,30 +473,54 @@ func (m transcriptModel) CommitError(err error) transcriptModel {
 	return m.CommitNotice(noticeError, msg)
 }
 
-// permissionRequested is the permission-gate prompt-open boundary: it commits any
-// pending live prose FIRST (so the narration that precedes the gate lands ahead of
-// the prompt record in append-only order), then commits the FULL permission
-// context (ToolName + Description, read off the sealed request) as a
-// kindPromptRecord entry. A nil Request yields an empty-context record rather than
-// a panic (fail-visible). live is intentionally NOT reset — the turn continues
-// while the gate is pending.
+// permissionRequested is the permission-gate boundary: it REMEMBERS the gate by its
+// CallID (decision gatePending) so the call's committed card can read "Approved …" /
+// "Denied …" once Screen reports the user's keypress via ResolveGate. It commits
+// NOTHING — the permission shows on the tool card itself (the verb + the ✓/✗ glyph),
+// not as a separate record — and it does NOT commit pending live prose (the
+// provisional narration stays live and commits once at StepDone). live is NOT reset:
+// the turn continues while the gate is pending. The map is cloned on write so the
+// value-copy reducer never aliases a prior model's gate map.
 func (m *transcriptModel) permissionRequested(ev event.PermissionRequested) {
-	m.commitProse()
-	ctx := promptContext{Kind: promptPermission}
-	if ev.Request != nil {
-		ctx.ToolName = ev.Request.ToolName()
-		ctx.Description = ev.Request.Description()
-	}
-	m.commitPrompt(ctx)
+	g := cloneGates(m.live.gateDecisions)
+	g[ev.CallID] = gatePending
+	m.live.gateDecisions = g
 }
 
-// userInputRequested is the AskUser prompt-open boundary: it commits any pending
-// live prose FIRST, then commits the FULL user-input context (Question + ALL
-// Choices) as a kindPromptRecord entry. Choices are copied so a later mutation of
-// the event's slice cannot reach the committed record. live is NOT reset.
+// ResolveGate records the user's decision for a pending permission gate (callID),
+// the source the loop never emits as an event — Screen calls it from the approve/deny
+// keypress. An unknown callID (no matching pending gate) is a no-op. The map is cloned
+// on write (value-copy contract). It returns the next model.
+func (m transcriptModel) ResolveGate(callID uuid.UUID, decision gateDecision) transcriptModel {
+	if _, ok := m.live.gateDecisions[callID]; !ok {
+		return m
+	}
+	g := cloneGates(m.live.gateDecisions)
+	g[callID] = decision
+	m.live.gateDecisions = g
+	return m
+}
+
+// cloneGates returns a fresh copy of a gate-decision map (nil-safe), so a by-value
+// reducer mutation never writes through a map a prior model still holds — the map
+// analogue of the slice value-copy contract used elsewhere in this model.
+func cloneGates(g map[uuid.UUID]gateDecision) map[uuid.UUID]gateDecision {
+	next := make(map[uuid.UUID]gateDecision, len(g)+1)
+	for k, v := range g {
+		next[k] = v
+	}
+	return next
+}
+
+// userInputRequested is the AskUser prompt-open boundary: it commits the FULL
+// user-input context (Question + ALL Choices) as a kindPromptRecord entry. Choices
+// are copied so a later mutation of the event's slice cannot reach the committed
+// record. It does NOT commit pending live prose: the provisional narration stays in
+// the live segment and is committed exactly once by the step's StepDone (committing it
+// here would duplicate it in append-only scrollback). live is NOT reset — the turn
+// continues while the gate is pending.
 func (m *transcriptModel) userInputRequested(ev event.UserInputRequested) {
-	m.commitProse()
-	ctx := promptContext{Kind: promptUserInput, Question: ev.Question}
+	ctx := promptContext{Question: ev.Question}
 	if len(ev.Choices) > 0 {
 		ctx.Choices = append([]string(nil), ev.Choices...)
 	}
@@ -494,7 +528,8 @@ func (m *transcriptModel) userInputRequested(ev event.UserInputRequested) {
 }
 
 // commitPrompt appends one kindPromptRecord entry carrying ctx with a fresh stable
-// ID. It is the shared tail of the two prompt-open boundaries.
+// ID. It is the AskUser prompt-open boundary's commit (permission gates surface as the
+// verb on their tool card, not as a committed record).
 func (m *transcriptModel) commitPrompt(ctx promptContext) {
 	m.nextID++
 	m.committed = append(m.committed, entry{ID: m.nextID, Kind: kindPromptRecord, Prompt: &ctx})
@@ -533,7 +568,7 @@ func (m *transcriptModel) commitLive() {
 // reset the whole live segment afterward.
 func (m *transcriptModel) flushCalls(transform func(ToolCallView) ToolCallView) {
 	for i := range m.live.Calls {
-		m.commitCall(transform(m.live.Calls[i]))
+		m.commitCall(transform(m.live.Calls[i]), false)
 	}
 }
 
@@ -574,6 +609,11 @@ func (m *transcriptModel) toolStarted(ev event.ToolCallStarted) {
 		ToolName: ev.ToolName,
 		Summary:  ev.Summary,
 		Status:   ToolRunning,
+		// Bake in the permission decision (if this call prompted): permission resolves
+		// BEFORE ToolCallStarted, so the gate is already gateApproved/gateDenied here
+		// (gateNone for an ungated/pre-approved call). The card carries it through to
+		// the committed entry, so it reads "Approved …" / "Denied …".
+		Decision: m.live.gateDecisions[ev.CallID],
 	})
 }
 
@@ -601,21 +641,28 @@ func (m *transcriptModel) toolCompleted(ev event.ToolCallCompleted) {
 }
 
 // stepDone is the StepDone commit point: it SNAPS the transcript to the loop's
-// finalized step group. It commits the step's AIMessage prose (thinking + narration)
-// as one kindAssistant entry, then each of the AIMessage's ToolUseBlocks as its own
-// kindTool entry — preferring the matching resolved LIVE card (its redacted Summary +
-// capped preview) and falling back to the stored block + ToolResultMessage when no
-// live card streamed (e.g. a dropped ToolCallStarted, or a subagent-loop step the TUI
-// only sees finalized). Committing prose first then tools mirrors the AIMessage block
-// order; a multi-step turn therefore renders as separate per-step groups, never
-// merged. After committing, the provisional live segment is reset (active preserved):
-// the dropped/partial TokenDeltas of this step vanish — the self-heal.
+// finalized step group. It builds each tool-use block's card (reusing the resolved
+// LIVE card — with its redacted Summary, capped preview, and permission Decision — or
+// falling back to the stored block + ToolResultMessage when no live card streamed),
+// commits the step's AIMessage prose / headline as one kindAssistant entry, then
+// commits each card as its own kindTool entry. An empty-text step that ran exactly ONE
+// tool promotes that single card to the assistant bullet (promoted=true, no umbrella
+// entry); an empty-text step with MORE than one tool gets a "Multiple actions"
+// umbrella headline above its cards. A multi-step turn renders as separate per-step
+// groups, never merged. After committing, the provisional live segment is reset
+// (active preserved): the dropped/partial TokenDeltas of this step vanish — the
+// self-heal — and the step's gate decisions are cleared.
 func (m *transcriptModel) stepDone(ev event.StepDone) {
 	ai, results := splitStepGroup(ev.Messages)
-	m.commitStepAssistant(ai)
 	uses := toolUsesOf(ai)
+	cards := make([]ToolCallView, len(uses))
 	for i := range uses {
-		m.commitCall(m.stepToolCard(uses[i], results, i))
+		cards[i] = m.stepToolCard(uses[i], results, i)
+	}
+	m.commitStepAssistant(ai, len(cards))
+	promotedSingle := ai != nil && textOnly(ai.Blocks) == "" && len(cards) == 1
+	for i := range cards {
+		m.commitCall(cards[i], promotedSingle)
 	}
 	// SNAP: drop the provisional live for this step; active stays so the turn's next
 	// step (or its terminal) is still seen as in-progress.
@@ -623,12 +670,15 @@ func (m *transcriptModel) stepDone(ev event.StepDone) {
 	m.live = liveSeg{active: active}
 }
 
-// commitStepAssistant commits the AIMessage's prose (leading ThinkingBlock, then
-// TextBlock) as one kindAssistant entry. A nil AIMessage commits nothing. A
-// tool-use-only message (no thinking, no text) still commits one kindAssistant entry,
-// flagged doneHeadline, so the renderer shows a bold "● Done" headline ahead of the
-// step's tool cards (design §3 rule 4); a fully empty message commits nothing.
-func (m *transcriptModel) commitStepAssistant(ai *content.AIMessage) {
+// commitStepAssistant commits the AIMessage's prose / headline as one kindAssistant
+// entry. A nil AIMessage commits nothing. It commits the thinking rail (if any) and
+// the narration (if any); when there is NO narration it sets a bullet headline only
+// for an empty-text step that ran MORE than one tool ("Multiple actions") — a
+// single-tool empty-text step commits no umbrella here (its one card is promoted to
+// the bullet by stepDone). So a thinking-only message renders just the rail, a
+// single-tool empty-text step with no thinking commits nothing here at all, and a
+// multi-tool empty-text step gets the "● Multiple actions" umbrella.
+func (m *transcriptModel) commitStepAssistant(ai *content.AIMessage, cardCount int) {
 	if ai == nil {
 		return
 	}
@@ -636,21 +686,23 @@ func (m *transcriptModel) commitStepAssistant(ai *content.AIMessage) {
 	if th := thinkingText(ai.Blocks); th != "" {
 		blocks = append(blocks, &content.ThinkingBlock{Thinking: th})
 	}
-	if tx := textOnly(ai.Blocks); tx != "" {
-		blocks = append(blocks, &content.TextBlock{Text: tx})
+	text := textOnly(ai.Blocks)
+	if text != "" {
+		blocks = append(blocks, &content.TextBlock{Text: text})
 	}
-	if len(blocks) == 0 && len(toolUsesOf(ai)) == 0 {
-		return // nothing to show for this assistant message
+	headline := ""
+	if text == "" && cardCount > 1 {
+		headline = multipleActionsHeadline
 	}
-	// An empty-text tool step (no prose blocks, but tool uses present) commits a
-	// doneHeadline entry so the renderer shows a bold "● Done" headline above the
-	// step's separately-committed tool cards (design §3 rule 4), not a bare bullet.
+	if len(blocks) == 0 && headline == "" {
+		return // nothing to show here (a single-tool empty-text step, or a fully empty message)
+	}
 	m.nextID++
 	m.committed = append(m.committed, entry{
-		ID:           m.nextID,
-		Kind:         kindAssistant,
-		Blocks:       blocks,
-		doneHeadline: len(blocks) == 0 && len(toolUsesOf(ai)) > 0,
+		ID:       m.nextID,
+		Kind:     kindAssistant,
+		Blocks:   blocks,
+		headline: headline,
 	})
 }
 
@@ -683,14 +735,17 @@ func (m *transcriptModel) stepToolCard(use content.ToolUseBlock, results map[str
 }
 
 // commitCall appends one resolved tool call as its own kindTool entry with a fresh
-// stable ID. The single-element Calls slice carries the terminal ToolCallView so
-// the renderer can reuse the existing tool-card rendering.
-func (m *transcriptModel) commitCall(call ToolCallView) {
+// stable ID. The single-element Calls slice carries the terminal ToolCallView so the
+// renderer can reuse the existing tool-card rendering. promoted marks the lone card of
+// an empty-text single-tool step: it renders AS the assistant bullet ("● <verb >
+// ToolName(args)" + result) instead of an indented "└ …" card (renderPromotedTool).
+func (m *transcriptModel) commitCall(call ToolCallView, promoted bool) {
 	m.nextID++
 	m.committed = append(m.committed, entry{
-		ID:    m.nextID,
-		Kind:  kindTool,
-		Calls: []ToolCallView{call},
+		ID:       m.nextID,
+		Kind:     kindTool,
+		Calls:    []ToolCallView{call},
+		promoted: promoted,
 	})
 }
 

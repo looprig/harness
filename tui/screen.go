@@ -480,8 +480,13 @@ func (m *Screen) mapAction(a uiAction) tea.Cmd {
 	case uiRunSlash:
 		return m.runSlash(a.Slash)
 	case uiApprove:
+		// Record the decision so the call's committed card reads "Approved …". The loop
+		// emits no decision event, so the keypress is the only source (the gate was
+		// remembered by the transcript on PermissionRequested).
+		m.transcript = m.transcript.ResolveGate(a.CallID, gateApproved)
 		return approveCmd(m.appCtx, m.agent, a.CallID, a.Scope)
 	case uiDeny:
+		m.transcript = m.transcript.ResolveGate(a.CallID, gateDenied)
 		return denyCmd(m.appCtx, m.agent, a.CallID)
 	case uiAnswer:
 		return provideAnswerCmd(m.appCtx, m.agent, a.CallID, a.Text)

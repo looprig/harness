@@ -513,11 +513,13 @@ func TestEventRoutesToBothReducers(t *testing.T) {
 	}
 }
 
-// TestPermissionRequestedEnqueuesAndCommits covers the freeze fix's first half: a
-// PermissionRequested both ENQUEUES a prompt in the interaction model (so the
-// bottom box becomes the permission control) AND commits a promptRecord to the
-// transcript that flushes to scrollback. The stream keeps draining.
-func TestPermissionRequestedEnqueuesAndCommits(t *testing.T) {
+// TestPermissionRequestedEnqueuesAndTracksGate covers the gate-open path: a
+// PermissionRequested ENQUEUES a prompt in the interaction model (so the bottom box
+// becomes the permission control) and REMEMBERS the gate in the transcript (so the
+// call's committed card can read "Approved …"/"Denied …"), but commits NOTHING —
+// committing at the gate would duplicate the step's prose/card in append-only
+// scrollback. The stream keeps draining.
+func TestPermissionRequestedEnqueuesAndTracksGate(t *testing.T) {
 	t.Parallel()
 
 	agent := &fakeAgent{}
@@ -533,17 +535,12 @@ func TestPermissionRequestedEnqueuesAndCommits(t *testing.T) {
 	if m.interaction.mode != modePermissionPrompt {
 		t.Errorf("interaction mode = %d, want modePermissionPrompt", m.interaction.mode)
 	}
-	// Transcript: a kindPromptRecord committed with the request payload.
-	rec := lastCommitted(t, m)
-	if rec.Kind != kindPromptRecord || rec.Prompt == nil {
-		t.Fatalf("last committed = %+v, want a kindPromptRecord with a Prompt context", rec)
+	// Transcript: the gate commits NOTHING but is remembered (gatePending) by CallID.
+	if len(m.transcript.committed) != 0 {
+		t.Fatalf("committed = %d entries, want 0 (the gate must not commit)", len(m.transcript.committed))
 	}
-	if rec.Prompt.ToolName != "Bash" {
-		t.Errorf("prompt record ToolName = %q, want %q", rec.Prompt.ToolName, "Bash")
-	}
-	// The record flushed to scrollback exactly once (print-once map records its ID).
-	if !m.scrollback.printed[rec.ID] {
-		t.Error("prompt record not flushed to scrollback")
+	if got := m.transcript.live.gateDecisions[callID(1)]; got != gatePending {
+		t.Errorf("gateDecisions[callID(1)] = %v, want gatePending", got)
 	}
 	// The stream keeps draining (the gate, not the stream, blocks the loop).
 	if cmd == nil {
