@@ -2,6 +2,7 @@ package loop
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"sync"
 	"testing"
@@ -889,4 +890,324 @@ func TestStepGranularityRollback(t *testing.T) {
 			t.Errorf("committed pairs in final request: %d tool_use vs %d tool messages, want 2/2", tu, tm)
 		}
 	})
+}
+
+
+// TestActorCommitsInitialUserMessageAndTurnStarted asserts the loop-owned commit
+// of the initial UserMessage: the actor emits TurnStarted carrying the exact
+// UserMessage and CausationID = the triggering StartTurn's id, BEFORE runTurn
+// produces any step, and commits that UserMessage into loopState.msgs (proven by
+// the first request the provider receives carrying exactly that user message).
+func TestActorCommitsInitialUserMessageAndTurnStarted(t *testing.T) {
+	t.Parallel()
+	rec := &recordingLLM{chunks: []content.Chunk{textChunk("hi")}}
+	l, _ := newLoop(t, rec)
+
+	cmdID, err := uuid.New()
+	if err != nil {
+		t.Fatalf("uuid.New: %v", err)
+	}
+	ev := make(chan event.Event, 64)
+	ack := make(chan error, 1)
+	ab := make(chan struct{})
+	defer close(ab)
+	input := []content.Block{&content.TextBlock{Text: "hello there"}}
+	l.Commands <- command.StartTurn{
+		Header:    command.Header{ID: cmdID},
+		Ctx:       context.Background(),
+		Input:     input,
+		Events:    ev,
+		Abandoned: ab,
+		Ack:       ack,
+	}
+	if err := <-ack; err != nil {
+		t.Fatalf("StartTurn ack = %v, want nil", err)
+	}
+
+	// The first per-turn event is TurnStarted, carrying the initial UserMessage and
+	// CausationID == the StartTurn id. It is emitted by the actor at the commit point
+	// BEFORE any TokenDelta/StepDone.
+	first := <-ev
+	started, ok := first.(event.TurnStarted)
+	if !ok {
+		t.Fatalf("first event = %T, want TurnStarted", first)
+	}
+	if started.CausationID != cmdID {
+		t.Errorf("TurnStarted.CausationID = %v, want %v (the StartTurn id)", started.CausationID, cmdID)
+	}
+	if started.Message == nil {
+		t.Fatal("TurnStarted.Message is nil, want the committed initial UserMessage")
+	}
+	if started.Message.Role != content.RoleUser {
+		t.Errorf("TurnStarted.Message.Role = %q, want %q", started.Message.Role, content.RoleUser)
+	}
+	if got := flattenToText(started.Message.Blocks); got != "hello there" {
+		t.Errorf("TurnStarted.Message text = %q, want %q", got, "hello there")
+	}
+	// InputID stays zero in this phase (UserInput/InputID semantics are a later phase).
+	if !started.InputID.IsZero() {
+		t.Errorf("TurnStarted.InputID = %v, want zero (this phase)", started.InputID)
+	}
+	if _, ok := drainToTerminal(t, ev).(event.TurnDone); !ok {
+		t.Fatal("terminal != TurnDone")
+	}
+
+	// The committed UserMessage drove the very first provider request.
+	reqs := rec.reqs
+	if len(reqs) == 0 {
+		t.Fatal("no provider request recorded")
+	}
+	if len(reqs[0].Messages) != 1 {
+		t.Fatalf("first request had %d messages, want 1 (the committed initial UserMessage)", len(reqs[0].Messages))
+	}
+	if _, ok := reqs[0].Messages[0].(*content.UserMessage); !ok {
+		t.Errorf("first request msg = %T, want *UserMessage", reqs[0].Messages[0])
+	}
+}
+
+// TestActorPerTurnStreamOrdering asserts the actor-owned serialization invariant:
+// across the full actor path, every step's TokenDeltas precede that step's
+// StepDone (emitted by the actor at the commit point while runTurn is parked in
+// the handshake), and the single terminal is last. The blocking commit handshake
+// guarantees there are no concurrent writers to the per-turn stream.
+func TestActorPerTurnStreamOrdering(t *testing.T) {
+	t.Parallel()
+	echo := &echoTool{name: "Echo", output: "ran"}
+	ts := agenticToolSet([]tool.InvokableTool{echo}, 25, 100)
+	client := &scriptedLLM{scripts: [][]content.Chunk{
+		{textChunk("step0a"), textChunk("step0b"), toolUseChunk(0, "id-1", "Echo", `{}`)}, // step 0: 2 deltas + tool
+		{textChunk("final")}, // step 1: text-only → TurnDone
+	}}
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	sessionID, _ := uuid.New()
+	loopID, _ := uuid.New()
+	l, err := New(ctx, sessionID, loopID, Provenance{}, noopPublisher{},
+		Config{Client: client, Model: llm.ModelSpec{Model: "m"}, Tools: ts, DrainTimeout: 200 * time.Millisecond})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	ev, _ := startTurn(t, l, context.Background(), []content.Block{&content.TextBlock{Text: "go"}})
+
+	var kinds []string
+	for e := range ev {
+		switch e.(type) {
+		case event.TurnStarted:
+			kinds = append(kinds, "started")
+		case event.TokenDelta:
+			kinds = append(kinds, "delta")
+		case event.StepDone:
+			kinds = append(kinds, "stepdone")
+		case event.TurnDone:
+			kinds = append(kinds, "done")
+		}
+		if len(kinds) > 0 && kinds[len(kinds)-1] == "done" {
+			break
+		}
+	}
+	// started, then step 0's deltas all precede step 0's stepdone, then step 1's
+	// delta precedes step 1's stepdone, then the terminal last. Step 0 streams THREE
+	// chunks (two text + one tool-use), each emitting a TokenDelta; step 1 streams one
+	// text chunk. (Tool lifecycle events for the auto-approved Echo call also appear
+	// within step 0 but are not in this projection; we assert only the
+	// started/delta/stepdone/done ordering.)
+	want := []string{"started", "delta", "delta", "delta", "stepdone", "delta", "stepdone", "done"}
+	if !equalStringSlices(kinds, want) {
+		t.Errorf("event order = %v, want %v", kinds, want)
+	}
+}
+
+func equalStringSlices(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// TestActorToolTurnOrderedHistory asserts that a tool-using turn produces, in
+// loopState.msgs (observed via the provider's final request), one UserMessage,
+// multiple AIMessages, and matching ToolResultMessages in order.
+func TestActorToolTurnOrderedHistory(t *testing.T) {
+	t.Parallel()
+	echo := &echoTool{name: "Echo", output: "ran"}
+	ts := agenticToolSet([]tool.InvokableTool{echo}, 25, 100)
+	client := &scriptedLLM{scripts: [][]content.Chunk{
+		{toolUseChunk(0, "id-1", "Echo", `{}`)}, // step 0: tool
+		{toolUseChunk(0, "id-2", "Echo", `{}`)}, // step 1: tool
+		{textChunk("done")},                     // step 2: text → TurnDone
+	}}
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	sessionID, _ := uuid.New()
+	loopID, _ := uuid.New()
+	l, err := New(ctx, sessionID, loopID, Provenance{}, noopPublisher{},
+		Config{Client: client, Model: llm.ModelSpec{Model: "m"}, Tools: ts, DrainTimeout: 200 * time.Millisecond})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	ev, _ := startTurn(t, l, context.Background(), []content.Block{&content.TextBlock{Text: "go"}})
+	if _, ok := drainToTerminal(t, ev).(event.TurnDone); !ok {
+		t.Fatal("terminal != TurnDone")
+	}
+
+	// The final (3rd) request reflects committed history: user, AI(tool_use), tool,
+	// AI(tool_use), tool — in that order.
+	reqs := client.requests()
+	if len(reqs) != 3 {
+		t.Fatalf("recorded %d requests, want 3", len(reqs))
+	}
+	final := reqs[2].Messages
+	wantKinds := []string{"user", "ai", "tool", "ai", "tool"}
+	if len(final) != len(wantKinds) {
+		t.Fatalf("final request had %d messages, want %d", len(final), len(wantKinds))
+	}
+	for i, m := range final {
+		var kind string
+		switch m.(type) {
+		case *content.UserMessage:
+			kind = "user"
+		case *content.AIMessage:
+			kind = "ai"
+		case *content.ToolResultMessage:
+			kind = "tool"
+		default:
+			kind = "?"
+		}
+		if kind != wantKinds[i] {
+			t.Errorf("final history[%d] = %s, want %s", i, kind, wantKinds[i])
+		}
+	}
+	// Tool results pair with their calls in order.
+	if tm, ok := final[2].(*content.ToolResultMessage); !ok || tm.ToolUseID != "id-1" {
+		t.Errorf("final history[2] tool result ToolUseID mismatch")
+	}
+	if tm, ok := final[4].(*content.ToolResultMessage); !ok || tm.ToolUseID != "id-2" {
+		t.Errorf("final history[4] tool result ToolUseID mismatch")
+	}
+}
+
+// blockingTool blocks in InvokableRun until released, signalling started first. It
+// lets a test park the turn goroutine deterministically inside a tool batch (and,
+// by extension, drive the actor into the commit/interrupt path).
+type blockingTool struct {
+	started  chan struct{}
+	release  chan struct{}
+	onceStop sync.Once
+}
+
+func newBlockingTool() *blockingTool {
+	return &blockingTool{started: make(chan struct{}), release: make(chan struct{})}
+}
+
+func (b *blockingTool) Info(ctx context.Context) (*tool.ToolInfo, error) {
+	return &tool.ToolInfo{Name: "Block", Desc: "blocks", Schema: json.RawMessage(`{"type":"object"}`)}, nil
+}
+
+func (b *blockingTool) InvokableRun(ctx context.Context, argsJSON string) (*tool.ToolResult, error) {
+	b.onceStop.Do(func() { close(b.started) })
+	select {
+	case <-b.release:
+		return tool.TextResult("released"), nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+// TestCommitParkDoesNotWedgeOnRootCancel proves the ctx-cancellable commit
+// handshake never wedges the loop: a per-turn consumer that stops reading parks the
+// actor blocked in the commit-point StepDone emission while runTurn waits for the
+// ack; a root-ctx cancel (the universal escape) must free both so Loop.Done closes.
+func TestCommitParkDoesNotWedgeOnRootCancel(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithCancel(context.Background())
+	sessionID, _ := uuid.New()
+	loopID, _ := uuid.New()
+	// A single no-tool step: runTurn emits one TokenDelta, then commits step 0; the
+	// actor emits StepDone at the commit point.
+	l, err := New(ctx, sessionID, loopID, Provenance{}, noopPublisher{}, Config{
+		Client:       &fakeLLM{chunks: []content.Chunk{textChunk("a")}},
+		Model:        llm.ModelSpec{Model: "m"},
+		DrainTimeout: 100 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	// Events buffered to EXACTLY TurnStarted + 1 TokenDelta; the StepDone send from
+	// the actor's commit point blocks on the full, unread buffer, parking the actor
+	// (and runTurn waiting for the ack). Only the emitTurn ctx.Done() escape frees it.
+	ev := make(chan event.Event, 2)
+	ack := make(chan error, 1)
+	ab := make(chan struct{}) // never closed -> leaked reader
+	l.Commands <- command.StartTurn{Ctx: context.Background(), Input: nil, Events: ev, Abandoned: ab, Ack: ack}
+	if err := <-ack; err != nil {
+		t.Fatalf("ack = %v", err)
+	}
+	// Give the turn time to fill the buffer and park the actor in the commit point.
+	deadline := time.After(2 * time.Second)
+	for len(ev) < 2 {
+		select {
+		case <-deadline:
+			t.Fatal("buffer never filled; actor did not reach the commit point")
+		case <-time.After(2 * time.Millisecond):
+		}
+	}
+	cancel() // root-ctx cancel: the universal escape for the parked commit point
+	select {
+	case <-l.Done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("actor wedged at the commit point: Loop.Done never closed after root-ctx cancel")
+	}
+}
+
+// TestInterruptDuringToolBatchFreesTurn proves an Interrupt delivered while the
+// turn goroutine is parked deep in a tool batch (just before the next commit/LLM
+// request) frees the turn: the actor processes Interrupt, cancels turnCtx, the
+// blocked tool returns ctx.Err(), and runTurn returns TurnInterrupted without
+// wedging the loop.
+func TestInterruptDuringToolBatchFreesTurn(t *testing.T) {
+	t.Parallel()
+	bt := newBlockingTool()
+	ts := agenticToolSet([]tool.InvokableTool{bt}, 25, 100)
+	client := &scriptedLLM{scripts: [][]content.Chunk{
+		{toolUseChunk(0, "id-1", "Block", `{}`)},
+	}}
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	sessionID, _ := uuid.New()
+	loopID, _ := uuid.New()
+	l, err := New(ctx, sessionID, loopID, Provenance{}, noopPublisher{},
+		Config{Client: client, Model: llm.ModelSpec{Model: "m"}, Tools: ts, DrainTimeout: 200 * time.Millisecond})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	ev, _ := startTurn(t, l, context.Background(), []content.Block{&content.TextBlock{Text: "go"}})
+	// Drain the per-turn stream in the background so emit never blocks the turn.
+	terminalCh := make(chan event.Event, 1)
+	go func() {
+		for e := range ev {
+			if e.EndsTurn() {
+				terminalCh <- e
+				return
+			}
+		}
+	}()
+	<-bt.started // the tool is now blocked; the turn goroutine is parked in the batch
+	iack := make(chan bool, 1)
+	l.Commands <- command.Interrupt{Ack: iack}
+	if !<-iack {
+		t.Fatal("Interrupt ack = false, want true (turn running)")
+	}
+	select {
+	case term := <-terminalCh:
+		if _, ok := term.(event.TurnInterrupted); !ok {
+			t.Fatalf("terminal = %T, want TurnInterrupted", term)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("turn did not terminate after Interrupt")
+	}
 }
