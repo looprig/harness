@@ -84,7 +84,13 @@ command layer and propagates into the turn's events. No new turn-start logic:
   `queuedInput` → `decideSubmit`. The only difference is an **origin marker** on
   `queuedInput` (`OriginHuman` / `OriginAgent`) set from which command arrived; all
   queue/start/fold logic stays single-sourced.
-- The resulting turn events carry that origin (or it is recoverable from the sub-loop's
+- **Same Reply-event family — no new event types.** Because both funnel into `decideSubmit`,
+  an `AgentInput` produces the *exact* same `Reply` events as a `UserInput` — `InputQueued`,
+  `TurnStarted`, `TurnFoldedInto`, `InputCancelled`, `TurnRejected` — correlated by
+  `Header.CausationID`, uniform with the way `SubagentResult` already emits its lifecycle
+  events. The subagent's input lifecycle is therefore fully observable on the one event
+  stream exactly like user input; the only difference is the carried provenance.
+- The reply/turn events carry that origin (or it is recoverable from the sub-loop's
   `Provenance`, which names the parent). An audit subscriber sees "agent-originated turn on
   loop X spawned by Y", never a fake "user said…".
 - Entry points: human → `Submit(blocks)` → `UserInput` → primary loop. Subagent →
@@ -154,9 +160,11 @@ no teardown and no change to §1–§7. Not required for this cut, not a blocker
 
 - `drainToFinalText` unit tests: clean / failed / interrupted, and the subscribe-before-
   submit ordering (no missed opening event).
-- `decideSubmit`: `UserInput` and `AgentInput` both start/queue a turn via the shared path;
-  the `queuedInput` origin marker is set correctly; quiescence `-race` stays green after
-  dropping `StartOnly`/`Events`/`Abandoned`.
+- `decideSubmit`: `UserInput` and `AgentInput` both start/queue a turn via the shared path
+  and emit the **same** `Reply` events (`InputQueued`/`TurnStarted`/`TurnFoldedInto`/
+  `InputCancelled`/`TurnRejected`, correlated by `CausationID`), differing only in the
+  carried origin; the `queuedInput` origin marker is set correctly; quiescence `-race`
+  stays green after dropping `StartOnly`/`Events`/`Abandoned`.
 - Subagent integration: a subagent runs as an in-session loop; its `StepDone`/gate events
   appear on the parent session's subscription attributed by `LoopID`; its token/tool events
   are muted under the default filter; it returns the final text (or the typed error).
