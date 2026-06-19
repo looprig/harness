@@ -60,23 +60,23 @@ func (e *SessionError) Unwrap() error { return e.Cause }
 
 // TurnRejectedError is returned by Invoke/Stream when the loop refuses to start a
 // turn for a StartOnly submit. Invoke/Stream are the programmatic single-shot
-// (start-or-reject) callers, so a non-Started disposition is surfaced as this
-// typed error. Reason carries the loop's RejectReason (Busy/QueueFull/
-// ShuttingDown/Internal) so callers can errors.As and branch (e.g. retry-on-busy,
-// or retry a transient RejectInternal).
+// (start-or-reject) callers, so a published event.TurnRejected on the per-turn
+// stream is surfaced as this typed error. Reason carries the event RejectReason
+// (Busy/QueueFull/ShuttingDown/Internal) so callers can errors.As and branch (e.g.
+// retry-on-busy, or retry a transient RejectInternal).
 type TurnRejectedError struct {
-	Reason command.RejectReason
+	Reason event.RejectReason
 }
 
 func (e *TurnRejectedError) Error() string {
 	switch e.Reason {
-	case command.RejectBusy:
+	case event.RejectBusy:
 		return "session: turn rejected: loop busy"
-	case command.RejectQueueFull:
+	case event.RejectQueueFull:
 		return "session: turn rejected: queue full"
-	case command.RejectShuttingDown:
+	case event.RejectShuttingDown:
 		return "session: turn rejected: loop shutting down"
-	case command.RejectInternal:
+	case event.RejectInternal:
 		// Transient internal failure (e.g. id generation); the loop is healthy and
 		// the caller MAY retry. Distinct from RejectShuttingDown.
 		return "session: turn rejected: transient internal failure"
@@ -196,63 +196,52 @@ func (s *AgentSession) expectTurn(ctx context.Context, subagentLoopID uuid.UUID)
 	s.hub.ExpectTurn(ctx, subagentLoopID)
 }
 
-// cancelExpectTurn releases a subagent's wake token when its hand-back is rejected or
-// discarded. Session-internal (loops never call it). It is the ONLY hand-back wake
-// release that is NOT on the publish path: a TurnRejected SubagentResult produces no
-// event (nothing happened in the session), so deliverSubagentResult releases the token
-// here after reading the Disposition. The event-path releases
-// (TurnStarted/TurnFoldedInto/InputCancelled carrying TriggeredByLoopID) happen
-// automatically in the hub now that loop events are published.
+// cancelExpectTurn releases a subagent's wake token off the publish path. It is
+// session-internal (loops never call it) and is NO LONGER on the SubagentResult
+// hand-back path: a SubagentResult is never rejected, so its {wake} token always
+// releases on the publish path via the resulting TurnStarted/TurnFoldedInto/
+// InputCancelled carrying TriggeredByLoopID. cancelExpectTurn remains for the future
+// async-spawn DISCARD path (a child spawned but abandoned before it ever hands back,
+// so no event ever carries its TriggeredByLoopID). Today it has no production caller;
+// it is exercised by the session+hub quiescence tests.
 func (s *AgentSession) cancelExpectTurn(ctx context.Context, subagentLoopID uuid.UUID) {
 	s.hub.CancelExpectTurn(ctx, subagentLoopID)
 }
 
-// deliverSubagentResult is the session-owned SubagentResult hand-back round trip. It
-// routes a finished subagent's output (blocks) to its parent loop as a
-// command.SubagentResult, reads the loop's Disposition through a buffered(1) Ack, and
-// returns it. The parent loop decides start/queue/reject on its own state (race-free);
-// the session does NOT decide. On a TurnRejected disposition the session releases the
-// subagent's {wake, fromLoopID} quiescence token via cancelExpectTurn — the rejected
-// hand-back produced no event, so this is the one release off the publish path; a
-// Started/InputQueued outcome instead releases on the publish path when the resulting
-// TurnStarted/TurnFoldedInto/InputCancelled carries TriggeredByLoopID == fromLoopID.
+// deliverSubagentResult is the session-owned SubagentResult hand-back: it routes a
+// finished subagent's output (blocks) to its parent loop as a command.SubagentResult
+// and returns only a transport error (the loop is gone, or ctx is done). It is
+// FIRE-AND-FORGET: a SubagentResult is NEVER rejected, so there is no outcome to wait
+// for off the publish path. The parent loop always starts (idle) or queues
+// (running/shutting-down) the hand-back, and its quiescence {wake, fromLoopID} token
+// is ALWAYS released on the publish path by the resulting Enduring event — a
+// TurnStarted/TurnFoldedInto carrying TriggeredByLoopID == fromLoopID, or an
+// InputCancelled (also carrying it) if the loop ends before the hand-back commits (the
+// shutdown terminal's returnQueuedInbox, or an idle-time id-gen failure to start). The
+// session no longer reads a disposition and no longer releases the token off the
+// publish path.
 //
 // parentLoopID selects the parent loop's command channel; fromLoopID is the producing
 // subagent (stamped as SubagentResult.FromLoopID -> TriggeredByLoopID on the events the
 // hand-back causes). The submit carries no per-turn stream — the parent's events flow
-// to the session fan-in. ctx governs the send + ack wait only (the loop derives the
-// turn ctx from its own loopCtx).
-func (s *AgentSession) deliverSubagentResult(ctx context.Context, parentLoopID, fromLoopID uuid.UUID, blocks []content.Block) (command.Disposition, error) {
+// to the session fan-in. ctx governs the send only (the loop derives the turn ctx from
+// its own loopCtx).
+func (s *AgentSession) deliverSubagentResult(ctx context.Context, parentLoopID, fromLoopID uuid.UUID, blocks []content.Block) error {
 	l, ok := s.loopFor(parentLoopID)
 	if !ok {
-		return nil, &SessionError{Kind: SessionLoopNotFound}
+		return &SessionError{Kind: SessionLoopNotFound}
 	}
 	id, err := s.newCommandID()
 	if err != nil {
-		return nil, err
+		return err
 	}
-	ack := make(chan command.Disposition, 1) // buffered(1): the loop replies via tryAck
 	select {
-	case l.Commands <- command.SubagentResult{Header: command.Header{ID: id}, FromLoopID: fromLoopID, Blocks: blocks, Ack: ack}:
+	case l.Commands <- command.SubagentResult{Header: command.Header{ID: id}, FromLoopID: fromLoopID, Blocks: blocks}:
+		return nil
 	case <-l.Done:
-		return nil, &SessionError{Kind: SessionLoopExited}
+		return &SessionError{Kind: SessionLoopExited}
 	case <-ctx.Done():
-		return nil, &SessionError{Kind: SessionContextDone, Cause: ctx.Err()}
-	}
-
-	select {
-	case d := <-ack:
-		// A rejected hand-back produced no event, so its {wake} token will never be
-		// released on the publish path. Release it here (the only off-publish-path
-		// release) so a rejected SubagentResult cannot leak the token.
-		if _, rejected := d.(command.TurnRejected); rejected {
-			s.cancelExpectTurn(ctx, fromLoopID)
-		}
-		return d, nil
-	case <-l.Done:
-		return nil, &SessionError{Kind: SessionLoopExited}
-	case <-ctx.Done():
-		return nil, &SessionError{Kind: SessionContextDone, Cause: ctx.Err()}
+		return &SessionError{Kind: SessionContextDone, Cause: ctx.Err()}
 	}
 }
 
@@ -371,25 +360,34 @@ func (s *AgentSession) Invoke(ctx context.Context, input []content.Block) (event
 		return nil, err
 	}
 	events := make(chan event.Event, 64)
-	ack := make(chan command.Disposition, 1)
 	abandoned := make(chan struct{})
 	defer close(abandoned) // ensures deliverAndClose always has an escape if Invoke exits early
 
 	select {
 	// User-initiated turn: CausationID is zero (root).
-	case l.Commands <- command.UserInput{Header: command.Header{ID: id}, Mode: command.StartOnly, Blocks: input, Events: events, Abandoned: abandoned, Ack: ack}:
+	case l.Commands <- command.UserInput{Header: command.Header{ID: id}, Mode: command.StartOnly, Blocks: input, Events: events, Abandoned: abandoned}:
 	case <-ctx.Done():
 		return nil, &SessionError{Kind: SessionContextDone, Cause: ctx.Err()}
 	case <-l.Done:
 		return nil, &SessionError{Kind: SessionLoopExited}
 	}
 
+	// The start-or-reject outcome is the FIRST event on the per-turn stream: the loop
+	// delivers event.TurnRejected (then closes the stream) on a refusal, or
+	// event.TurnStarted on success. Read it before draining to the terminal.
 	select {
-	case d := <-ack:
-		if rej, ok := d.(command.TurnRejected); ok {
+	case first, ok := <-events:
+		if !ok {
+			// Stream closed with no event: a rejection whose on-stream send lost the
+			// non-blocking race (defensive — the loop sends before closing). The fan-in
+			// still carries the authoritative TurnRejected; surface a generic rejection.
+			return nil, &SessionError{Kind: SessionEventChannelClosed}
+		}
+		if rej, ok := first.(event.TurnRejected); ok {
 			return nil, &TurnRejectedError{Reason: rej.Reason}
 		}
-		// Started: a turn exists; proceed to drain its events.
+		// event.TurnStarted (or any non-reject first event): a turn exists; fall through
+		// and keep draining for the terminal. The first event itself is not a terminal.
 	case <-l.Done:
 		return nil, &SessionError{Kind: SessionLoopExited}
 	}
@@ -461,7 +459,6 @@ func (s *AgentSession) Stream(ctx context.Context, input []content.Block) (*llm.
 	abandoned := make(chan struct{})
 	var abandonOnce sync.Once
 	events := make(chan event.Event, 64)
-	ack := make(chan command.Disposition, 1)
 
 	select {
 	// User-initiated turn: CausationID is zero (root).
@@ -471,7 +468,6 @@ func (s *AgentSession) Stream(ctx context.Context, input []content.Block) (*llm.
 		Blocks:    input,
 		Events:    events,
 		Abandoned: abandoned,
-		Ack:       ack,
 	}:
 	case <-ctx.Done():
 		abandonOnce.Do(func() { close(abandoned) })
@@ -481,20 +477,37 @@ func (s *AgentSession) Stream(ctx context.Context, input []content.Block) (*llm.
 		return nil, &SessionError{Kind: SessionLoopExited}
 	}
 
+	// The start-or-reject outcome is the FIRST event on the per-turn stream: the loop
+	// delivers event.TurnRejected (then closes the stream) on a refusal, or
+	// event.TurnStarted on success. Peek it here so the rejection is surfaced as a typed
+	// error rather than a reader, exactly as before.
+	var first event.Event
 	select {
-	case d := <-ack:
-		if rej, ok := d.(command.TurnRejected); ok {
+	case ev, ok := <-events:
+		if !ok {
+			abandonOnce.Do(func() { close(abandoned) })
+			return nil, &SessionError{Kind: SessionEventChannelClosed}
+		}
+		if rej, ok := ev.(event.TurnRejected); ok {
 			abandonOnce.Do(func() { close(abandoned) })
 			return nil, &TurnRejectedError{Reason: rej.Reason}
 		}
-		// Started: a turn exists; return the per-turn reader.
+		first = ev // event.TurnStarted (the success outcome); re-yielded below.
 	case <-l.Done:
 		abandonOnce.Do(func() { close(abandoned) })
 		return nil, &SessionError{Kind: SessionLoopExited}
 	}
 
+	// firstSent re-yields the peeked first event (the TurnStarted) on the reader's first
+	// Next so the consumer observes the full stream (TurnStarted, deltas, …, terminal);
+	// thereafter the reader pulls directly from `events`.
+	firstSent := false
 	return llm.NewStreamReader(
 		func() (event.Event, error) {
+			if !firstSent {
+				firstSent = true
+				return first, nil
+			}
 			// The loop.Done case rescues a reader parked here if the loop is
 			// hard-killed mid-turn: on a DrainTimeout detach the actor never
 			// closes `events`, so without this escape a consumer would block

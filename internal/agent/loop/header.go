@@ -55,6 +55,17 @@ func stampLoopHeader(ev event.Event, sessionID, loopID, turnID uuid.UUID) event.
 	case event.InputCancelled:
 		e.Header = fillLoopScoped(e.Header, sessionID, loopID)
 		return e
+	case event.InputQueued:
+		// Loop-scoped reply event: no turn exists yet (the input is only queued), so
+		// fill SessionID/LoopID and PRESERVE the producer-set CausationID == InputID.
+		e.Header = fillLoopScoped(e.Header, sessionID, loopID)
+		return e
+	case event.TurnRejected:
+		// Loop-scoped reply event: nothing started, so there is no turn — fill only
+		// SessionID/LoopID and PRESERVE CausationID == InputID (and TriggeredByLoopID
+		// for a rejected SubagentResult, were that ever possible).
+		e.Header = fillLoopScoped(e.Header, sessionID, loopID)
+		return e
 	default:
 		// Session-scoped events (SessionStarted/Active/Idle/Stopped) carry their own
 		// SessionID; any future un-enumerated type cannot be header-repaired (the sealed

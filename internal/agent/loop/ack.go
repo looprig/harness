@@ -1,8 +1,10 @@
 package loop
 
 // tryAck is the loop's single non-blocking reply helper for every
-// loop-originated reply channel: command.Disposition (UserInput/SubagentResult),
-// command.CancelResult (CancelQueuedInput), and command.Command (gate.reply).
+// loop-originated reply channel: command.CancelResult (CancelQueuedInput) and
+// command.Command (gate.reply). The submit outcome (UserInput/SubagentResult) is no
+// longer a point-to-point reply — it is PUBLISHED as a typed event.Reply onto the
+// session fan-in — so tryAck no longer carries a command.Disposition.
 //
 // Session-created reply channels are buffered with capacity 1, so the send
 // succeeds on the normal path. The select/default exists ONLY to protect the

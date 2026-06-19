@@ -687,7 +687,7 @@ func TestConcurrentInvokeIsRejected(t *testing.T) {
 
 	_, err = s.Invoke(context.Background(), nil)
 	var rej *TurnRejectedError
-	if !errors.As(err, &rej) || rej.Reason != command.RejectBusy {
+	if !errors.As(err, &rej) || rej.Reason != event.RejectBusy {
 		t.Fatalf("second Invoke err = %v, want *TurnRejectedError{RejectBusy}", err)
 	}
 }
@@ -716,7 +716,7 @@ func TestStreamBusyRejected(t *testing.T) {
 		t.Fatal("Stream returned a reader while the loop was busy, want nil + TurnRejectedError")
 	}
 	var rej *TurnRejectedError
-	if !errors.As(err, &rej) || rej.Reason != command.RejectBusy {
+	if !errors.As(err, &rej) || rej.Reason != event.RejectBusy {
 		t.Fatalf("Stream while busy err = %v, want *TurnRejectedError{RejectBusy}", err)
 	}
 }

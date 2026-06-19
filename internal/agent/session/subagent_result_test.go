@@ -17,8 +17,9 @@ import (
 // sessionWithHubAndFakeLoop builds an AgentSession with a REAL hub (so quiescence
 // transitions run) and a fake parent loop whose Commands channel the test reads and
 // whose Done channel the test controls. The fake loop lets a test drive
-// deliverSubagentResult without a full loop's reject machinery: the test reads the
-// routed command and replies whatever Disposition it wants on the command's Ack.
+// deliverSubagentResult (now fire-and-forget) without a full loop: the test reads the
+// routed command to confirm it landed, and drives any quiescence transitions by
+// publishing events directly through the session.
 func sessionWithHubAndFakeLoop() (s *AgentSession, cmds chan command.Command, done chan struct{}) {
 	cmds = make(chan command.Command)
 	done = make(chan struct{})
@@ -115,15 +116,22 @@ func TestSubagentHandBackWakeReleaseViaTurnStarted(t *testing.T) {
 	}
 }
 
-// TestSubagentResultRejectReleasesWakeToken drives the off-publish-path release: a
-// SubagentResult that the parent loop rejects produces no event, so its {wake} token
-// would leak — deliverSubagentResult must release it via cancelExpectTurn after
-// reading the TurnRejected disposition. With the token the only outstanding work,
-// that release empties active and derives SessionIdle.
-func TestSubagentResultRejectReleasesWakeToken(t *testing.T) {
+// TestSubagentResultNeverRejectedReleasesWakeViaInputCancelled replaces the old
+// reject-release test: a SubagentResult can no longer be rejected, so its {wake} token
+// can no longer leak via an off-publish reconciliation. This drives the END-TO-END
+// event path on a REAL loop: a SubagentResult delivered while the loop is BUSY queues
+// (never rejected, even with a full inbox); interrupting the running turn ends it and
+// makes returnQueuedInbox emit event.InputCancelled carrying TriggeredByLoopID ==
+// fromLoopID, which releases the {wake} token ON THE PUBLISH PATH (NOT cancelExpectTurn).
+// Quiescence then reaches SessionIdle and WaitIdle returns.
+func TestSubagentResultNeverRejectedReleasesWakeViaInputCancelled(t *testing.T) {
 	t.Parallel()
-	s, cmds, done := sessionWithHubAndFakeLoop()
-	defer close(done)
+	// blockUntilCancel keeps the turn running so the SubagentResult queues behind it.
+	s, err := NewAgent(context.Background(), cfg(&stubLLM{blockUntilCancel: true}))
+	if err != nil {
+		t.Fatalf("NewAgent: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Shutdown(context.Background()) })
 
 	sub, err := s.SubscribeEvents(allFilter())
 	if err != nil {
@@ -133,35 +141,82 @@ func TestSubagentResultRejectReleasesWakeToken(t *testing.T) {
 
 	subagentLoopID := mustUUID()
 
-	// Spawn-time guard: SessionActive on the Idle->Active edge.
-	s.expectTurn(context.Background(), subagentLoopID)
-	if !drainFor[event.SessionActive](t, sub) {
-		t.Fatal("expectTurn did not derive SessionActive")
+	// Occupy the loop with a running turn (Invoke blocks on the provider).
+	invokeStarted := make(chan struct{})
+	go func() { close(invokeStarted); _, _ = s.Invoke(context.Background(), textBlocks("occupy")) }()
+	<-invokeStarted
+	// Wait until the loop is actually running (TurnStarted observed on the fan-in).
+	if !drainFor[event.TurnStarted](t, sub) {
+		t.Fatal("occupying turn never started")
 	}
 
-	// Parent loop replies TurnRejected to the routed SubagentResult. Run the fake
-	// loop's reply in a goroutine so deliverSubagentResult's send + ack-wait proceed.
-	routed := make(chan command.SubagentResult, 1)
-	go func() {
-		c := <-cmds
-		sr, ok := c.(command.SubagentResult)
-		if !ok {
-			return
-		}
-		routed <- sr
-		sr.Ack <- command.TurnRejected{Reason: command.RejectShuttingDown}
-	}()
+	// Spawn-time guard: take the {wake, subagentLoopID} token. The session is already
+	// Active (a turn runs), so this just adds the token; WaitIdle must block on it.
+	s.expectTurn(context.Background(), subagentLoopID)
 
-	d, err := s.deliverSubagentResult(context.Background(), s.primaryLoopID, subagentLoopID, textBlocks("subagent output"))
-	if err != nil {
+	// Deliver the SubagentResult: the loop is busy, so it QUEUES (never rejected). Its
+	// {wake} token is NOT released yet — it rides the eventual resolution event.
+	if err := s.deliverSubagentResult(context.Background(), s.primaryLoopID, subagentLoopID, textBlocks("subagent output")); err != nil {
 		t.Fatalf("deliverSubagentResult: %v", err)
 	}
-	if _, ok := d.(command.TurnRejected); !ok {
-		t.Fatalf("disposition = %T, want command.TurnRejected", d)
+
+	// Interrupt the running turn: it ends TurnInterrupted, and returnQueuedInbox emits
+	// InputCancelled for the queued SubagentResult, carrying TriggeredByLoopID ==
+	// subagentLoopID — the publish-path release of the {wake} token.
+	if _, err := s.Interrupt(context.Background()); err != nil {
+		t.Fatalf("Interrupt: %v", err)
 	}
 
-	// The routed command carried FromLoopID == subagentLoopID (so the loop would have
-	// stamped TriggeredByLoopID on any event it produced).
+	// Observe the InputCancelled that releases the token (the wake release rides THIS
+	// event, not cancelExpectTurn), then SessionIdle once active empties.
+	sawRelease := false
+	deadline := time.After(2 * time.Second)
+	for !sawRelease {
+		select {
+		case ev, ok := <-sub.Events():
+			if !ok {
+				t.Fatal("subscription closed before the InputCancelled wake-release")
+			}
+			if ic, ok := ev.(event.InputCancelled); ok && ic.TriggeredByLoopID == subagentLoopID {
+				sawRelease = true
+			}
+		case <-deadline:
+			t.Fatal("no InputCancelled carrying the subagent loop id (wake token leaked off the event path)")
+		}
+	}
+
+	// With the {wake} token released by the event and the loop idle, quiescence reaches
+	// SessionIdle and WaitIdle returns.
+	if err := s.WaitIdle(context.Background()); err != nil {
+		t.Fatalf("WaitIdle after event-path wake-release = %v, want nil", err)
+	}
+}
+
+// TestSubagentResultQueuedDoesNotReleaseOffPublishPath proves the {wake} token is NOT
+// released off the publish path: after a SubagentResult queues (fire-and-forget, no
+// disposition), the token is still held — WaitIdle blocks — until the resulting event
+// (here a simulated TurnStarted carrying TriggeredByLoopID) releases it on the publish
+// path. This is the inverse guarantee to the InputCancelled release above.
+func TestSubagentResultQueuedDoesNotReleaseOffPublishPath(t *testing.T) {
+	t.Parallel()
+	s, cmds, done := sessionWithHubAndFakeLoop()
+	defer close(done)
+
+	subagentLoopID := mustUUID()
+	s.expectTurn(context.Background(), subagentLoopID)
+
+	// Fake parent loop: just receive the routed SubagentResult (fire-and-forget; no
+	// reply). Confirm it carried FromLoopID == subagentLoopID.
+	routed := make(chan command.SubagentResult, 1)
+	go func() {
+		if sr, ok := (<-cmds).(command.SubagentResult); ok {
+			routed <- sr
+		}
+	}()
+
+	if err := s.deliverSubagentResult(context.Background(), s.primaryLoopID, subagentLoopID, textBlocks("output")); err != nil {
+		t.Fatalf("deliverSubagentResult: %v", err)
+	}
 	select {
 	case sr := <-routed:
 		if sr.FromLoopID != subagentLoopID {
@@ -171,54 +226,13 @@ func TestSubagentResultRejectReleasesWakeToken(t *testing.T) {
 		t.Fatal("SubagentResult was not routed to the parent loop")
 	}
 
-	// The rejected hand-back produced no event; deliverSubagentResult released the
-	// {wake} token via cancelExpectTurn, emptying active -> SessionIdle.
-	if !drainFor[event.SessionIdle](t, sub) {
-		t.Fatal("TurnRejected hand-back did not release the wake token (no SessionIdle)")
-	}
-	if err := s.WaitIdle(context.Background()); err != nil {
-		t.Fatalf("WaitIdle after reject-release = %v, want nil", err)
-	}
-}
-
-// TestSubagentResultStartedQueuedDoesNotReleaseOffPublishPath proves the inverse: a
-// non-rejected disposition (Started/InputQueued) does NOT release the {wake} token off
-// the publish path — that release rides the resulting event (TurnStarted/
-// TurnFoldedInto/InputCancelled) instead. So after a Started disposition the token is
-// still held and WaitIdle still blocks.
-func TestSubagentResultStartedQueuedDoesNotReleaseOffPublishPath(t *testing.T) {
-	t.Parallel()
-	s, cmds, done := sessionWithHubAndFakeLoop()
-	defer close(done)
-
-	subagentLoopID := mustUUID()
-	s.expectTurn(context.Background(), subagentLoopID)
-
-	// Parent loop replies Started (a turn was created).
-	go func() {
-		c := <-cmds
-		sr, ok := c.(command.SubagentResult)
-		if !ok {
-			return
-		}
-		sr.Ack <- command.Started{TurnID: mustUUID(), InputID: sr.CommandHeader().ID}
-	}()
-
-	d, err := s.deliverSubagentResult(context.Background(), s.primaryLoopID, subagentLoopID, textBlocks("output"))
-	if err != nil {
-		t.Fatalf("deliverSubagentResult: %v", err)
-	}
-	if _, ok := d.(command.Started); !ok {
-		t.Fatalf("disposition = %T, want command.Started", d)
-	}
-
-	// A Started disposition must NOT release the token off the publish path: the token
-	// is still held, so WaitIdle blocks. (In production the resulting TurnStarted
-	// carrying TriggeredByLoopID releases it on the publish path.)
+	// The hand-back released nothing off the publish path: the token is still held, so
+	// WaitIdle blocks. (In production the resulting TurnStarted/TurnFoldedInto/
+	// InputCancelled carrying TriggeredByLoopID releases it on the publish path.)
 	blockCtx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
 	if err := s.WaitIdle(blockCtx); !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("WaitIdle after Started hand-back = %v, want DeadlineExceeded (token still held)", err)
+		t.Fatalf("WaitIdle after queued hand-back = %v, want DeadlineExceeded (token still held)", err)
 	}
 
 	// Releasing it on the publish path (the hand-back's TurnStarted) then idles it.

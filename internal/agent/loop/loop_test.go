@@ -65,21 +65,35 @@ func newLoop(t *testing.T, client llm.LLM, sinks ...event.EventSink) (*Loop, con
 }
 
 // startTurn sends a StartOnly UserInput and returns the events channel + abandoned
-// closer. It asserts the loop replied a Started disposition (the start-or-reject
-// path). The ctx parameter is retained for source compatibility with callers but is
-// unused: submit commands carry no context, and the turn ctx derives from loopCtx.
+// closer. It asserts the loop STARTED the turn by reading the first event off the
+// per-turn stream and requiring it to be event.TurnStarted (the start-or-reject path
+// now delivers its outcome on the stream — TurnStarted on success, TurnRejected on a
+// refusal — instead of a command.Disposition reply). The peeked TurnStarted is NOT
+// re-injected, mirroring production Stream's re-yield only at the session boundary;
+// loop tests that need the TurnStarted from the stream read it before calling this or
+// observe it via a sink. The ctx parameter is retained for source compatibility with
+// callers but is unused: submit commands carry no context, and the turn ctx derives
+// from loopCtx.
 func startTurn(t *testing.T, l *Loop, _ context.Context, input []content.Block) (<-chan event.Event, func()) {
 	t.Helper()
 	ev := make(chan event.Event, 64)
-	ack := make(chan command.Disposition, 1)
 	ab := make(chan struct{})
 	var once sync.Once
 	closeAb := func() { once.Do(func() { close(ab) }) }
-	l.Commands <- command.UserInput{Mode: command.StartOnly, Blocks: input, Events: ev, Abandoned: ab, Ack: ack}
-	d := <-ack
-	if _, ok := d.(command.Started); !ok {
+	l.Commands <- command.UserInput{Mode: command.StartOnly, Blocks: input, Events: ev, Abandoned: ab}
+	select {
+	case first, ok := <-ev:
+		if !ok {
+			closeAb()
+			t.Fatal("UserInput(StartOnly) per-turn stream closed without TurnStarted (rejected)")
+		}
+		if _, ok := first.(event.TurnStarted); !ok {
+			closeAb()
+			t.Fatalf("UserInput(StartOnly) first event = %T, want event.TurnStarted", first)
+		}
+	case <-time.After(2 * time.Second):
 		closeAb()
-		t.Fatalf("UserInput(StartOnly) disposition = %T, want command.Started", d)
+		t.Fatal("UserInput(StartOnly): no event on per-turn stream within deadline")
 	}
 	return ev, closeAb
 }
@@ -260,7 +274,6 @@ func TestEnvelopeCorrelationStamped(t *testing.T) {
 		t.Fatalf("uuid.New: %v", err)
 	}
 	ev := make(chan event.Event, 64)
-	ack := make(chan command.Disposition, 1)
 	ab := make(chan struct{})
 	defer close(ab)
 	l.Commands <- command.UserInput{
@@ -269,10 +282,12 @@ func TestEnvelopeCorrelationStamped(t *testing.T) {
 		Blocks:    nil,
 		Events:    ev,
 		Abandoned: ab,
-		Ack:       ack,
 	}
-	if _, ok := (<-ack).(command.Started); !ok {
-		t.Fatal("UserInput disposition != Started")
+	// The start-or-reject outcome is the first per-turn event: TurnStarted on success.
+	if first, ok := <-ev; !ok {
+		t.Fatal("per-turn stream closed without TurnStarted (rejected)")
+	} else if _, ok := first.(event.TurnStarted); !ok {
+		t.Fatalf("first per-turn event = %T, want event.TurnStarted", first)
 	}
 	if _, ok := drainToTerminal(t, ev).(event.TurnDone); !ok {
 		t.Fatal("terminal != TurnDone")
@@ -431,20 +446,24 @@ func TestTurnIDGenerationFailure(t *testing.T) {
 			l := newLoopWithIDGen(t, &fakeLLM{chunks: []content.Chunk{textChunk("hi")}}, gen.gen)
 
 			ev := make(chan event.Event, 64)
-			ack := make(chan command.Disposition, 1)
 			ab := make(chan struct{})
 			defer close(ab)
-			l.Commands <- command.UserInput{Mode: command.StartOnly, Blocks: nil, Events: ev, Abandoned: ab, Ack: ack}
+			l.Commands <- command.UserInput{Mode: command.StartOnly, Blocks: nil, Events: ev, Abandoned: ab}
 
-			d := <-ack
-			rej, ok := d.(command.TurnRejected)
+			// The id-gen failure is surfaced on the per-turn stream as TurnRejected{Internal},
+			// then the stream is closed.
+			first, ok := <-ev
 			if !ok {
-				t.Fatalf("disposition = %T, want command.TurnRejected (id-gen failure)", d)
+				t.Fatal("per-turn stream closed without a TurnRejected event")
 			}
-			if rej.Reason != command.RejectInternal {
+			rej, ok := first.(event.TurnRejected)
+			if !ok {
+				t.Fatalf("first per-turn event = %T, want event.TurnRejected (id-gen failure)", first)
+			}
+			if rej.Reason != event.RejectInternal {
 				t.Fatalf("reject reason = %d, want RejectInternal (transient id-gen failure, not ShuttingDown)", rej.Reason)
 			}
-			if _, ok := <-ev; ok {
+			if _, open := <-ev; open {
 				t.Error("rejected turn's Events channel should be closed")
 			}
 		})
@@ -465,12 +484,13 @@ func TestEventIDGenerationFailureBestEffort(t *testing.T) {
 	l := newLoopWithIDGen(t, &fakeLLM{chunks: []content.Chunk{textChunk("hi")}}, gen.gen, sink)
 
 	ev := make(chan event.Event, 64)
-	ack := make(chan command.Disposition, 1)
 	ab := make(chan struct{})
 	defer close(ab)
-	l.Commands <- command.UserInput{Mode: command.StartOnly, Blocks: nil, Events: ev, Abandoned: ab, Ack: ack}
-	if _, ok := (<-ack).(command.Started); !ok {
-		t.Fatal("disposition != Started (TurnID minted; only EventID fails)")
+	l.Commands <- command.UserInput{Mode: command.StartOnly, Blocks: nil, Events: ev, Abandoned: ab}
+	if first, ok := <-ev; !ok {
+		t.Fatal("per-turn stream closed without TurnStarted (TurnID minted; only EventID fails)")
+	} else if _, ok := first.(event.TurnStarted); !ok {
+		t.Fatalf("first per-turn event = %T, want event.TurnStarted", first)
 	}
 	// Branch 3 must not abort the turn: a terminal still arrives.
 	if _, ok := drainToTerminal(t, ev).(event.TurnDone); !ok {
@@ -511,18 +531,21 @@ func TestStartWhileRunning(t *testing.T) {
 	ev1, ab1 := startTurn(t, l, context.Background(), nil)
 	defer ab1()
 
-	// second StartOnly submit must be rejected with TurnRejected{RejectBusy}
+	// second StartOnly submit must be rejected with TurnRejected{RejectBusy} on its
+	// per-turn stream, which is then closed.
 	ev2 := make(chan event.Event, 1)
-	ack2 := make(chan command.Disposition, 1)
 	ab2 := make(chan struct{})
 	defer close(ab2)
-	l.Commands <- command.UserInput{Mode: command.StartOnly, Blocks: nil, Events: ev2, Abandoned: ab2, Ack: ack2}
-	d := <-ack2
-	rej, ok := d.(command.TurnRejected)
-	if !ok || rej.Reason != command.RejectBusy {
-		t.Fatalf("disposition = %+v, want command.TurnRejected{RejectBusy}", d)
+	l.Commands <- command.UserInput{Mode: command.StartOnly, Blocks: nil, Events: ev2, Abandoned: ab2}
+	first, ok := <-ev2
+	if !ok {
+		t.Fatal("rejected turn's per-turn stream closed without a TurnRejected event")
 	}
-	if _, ok := <-ev2; ok {
+	rej, ok := first.(event.TurnRejected)
+	if !ok || rej.Reason != event.RejectBusy {
+		t.Fatalf("per-turn outcome = %+v, want event.TurnRejected{RejectBusy}", first)
+	}
+	if _, open := <-ev2; open {
 		t.Error("rejected turn's Events channel should be closed")
 	}
 	_ = ev1
@@ -666,18 +689,17 @@ func TestEventSinkPanicRecovered(t *testing.T) {
 // TestFanInOnlyUserInputStartsTurn proves a fan-in-only AllowFold UserInput (nil
 // Events/Abandoned) starts a turn and runs it to completion through sinks/fan-in
 // only: emit and deliverAndClose are nil-safe (no send-on-nil, no close-nil). The
-// Started disposition and the sink-observed TurnDone are the only evidence the turn
+// published TurnStarted and the sink-observed TurnDone are the only evidence the turn
 // ran, since there is no per-turn stream.
 func TestFanInOnlyUserInputStartsTurn(t *testing.T) {
 	t.Parallel()
 	sink := &captureSink{}
 	l, _ := newLoop(t, &fakeLLM{chunks: []content.Chunk{textChunk("hi")}}, sink)
 
-	ack := make(chan command.Disposition, 1)
-	l.Commands <- command.UserInput{Mode: command.AllowFold, Blocks: nil, Ack: ack} // nil Events/Abandoned
-	d := <-ack
-	if _, ok := d.(command.Started); !ok {
-		t.Fatalf("disposition = %T, want command.Started", d)
+	id := mustID(t)
+	l.Commands <- command.UserInput{Header: command.Header{ID: id}, Mode: command.AllowFold, Blocks: nil} // nil Events/Abandoned
+	if _, ok := awaitReply(t, sink, id).(event.TurnStarted); !ok {
+		t.Fatal("fan-in-only AllowFold submit did not publish TurnStarted")
 	}
 	// The turn runs to a TurnDone observed on sinks only (no per-turn channel).
 	deadline := time.After(2 * time.Second)
@@ -692,9 +714,9 @@ func TestFanInOnlyUserInputStartsTurn(t *testing.T) {
 		}
 	}
 	// Actor is usable afterward.
-	ack2 := make(chan command.Disposition, 1)
-	l.Commands <- command.UserInput{Mode: command.AllowFold, Blocks: nil, Ack: ack2}
-	if _, ok := (<-ack2).(command.Started); !ok {
+	id2 := mustID(t)
+	l.Commands <- command.UserInput{Header: command.Header{ID: id2}, Mode: command.AllowFold, Blocks: nil}
+	if _, ok := awaitReply(t, sink, id2).(event.TurnStarted); !ok {
 		t.Fatal("actor not usable after a fan-in-only turn")
 	}
 }
@@ -765,12 +787,11 @@ func TestLeakedReaderDoesNotWedgeActor(t *testing.T) {
 	}
 
 	ev := make(chan event.Event, 3) // exactly TurnStarted + 1 TokenDelta + 1 StepDone; terminal cannot fit
-	ack := make(chan command.Disposition, 1)
-	ab := make(chan struct{}) // never closed -> leaked reader
-	l.Commands <- command.UserInput{Mode: command.StartOnly, Blocks: nil, Events: ev, Abandoned: ab, Ack: ack}
-	if _, ok := (<-ack).(command.Started); !ok {
-		t.Fatalf("disposition != Started")
-	}
+	ab := make(chan struct{})       // never closed -> leaked reader
+	// Leaked reader: never read from ev (so the buffer fills) and never close ab. The
+	// turn's TurnStarted is the first event on ev; we do NOT consume it (consuming
+	// would free a buffer slot and let the terminal fit, defeating the test).
+	l.Commands <- command.UserInput{Mode: command.StartOnly, Blocks: nil, Events: ev, Abandoned: ab}
 
 	// Wait until the actor has published the terminal (it does so inside
 	// deliverAndClose, immediately before blocking on the full Events buffer).
@@ -819,11 +840,10 @@ func TestCtxIgnoringProviderDoesNotPinActor(t *testing.T) {
 		t.Fatalf("New: %v", err)
 	}
 	ev := make(chan event.Event, 64)
-	ack := make(chan command.Disposition, 1)
 	ab := make(chan struct{})
 	defer close(ab)
-	l.Commands <- command.UserInput{Mode: command.StartOnly, Blocks: nil, Events: ev, Abandoned: ab, Ack: ack}
-	<-ack
+	l.Commands <- command.UserInput{Mode: command.StartOnly, Blocks: nil, Events: ev, Abandoned: ab}
+	<-ev // wait for TurnStarted (the turn is running) before cancelling
 	cancel()
 	select {
 	case <-l.Done:
@@ -956,7 +976,6 @@ func TestActorCommitsInitialUserMessageAndTurnStarted(t *testing.T) {
 		t.Fatalf("uuid.New: %v", err)
 	}
 	ev := make(chan event.Event, 64)
-	ack := make(chan command.Disposition, 1)
 	ab := make(chan struct{})
 	defer close(ab)
 	input := []content.Block{&content.TextBlock{Text: "hello there"}}
@@ -966,14 +985,6 @@ func TestActorCommitsInitialUserMessageAndTurnStarted(t *testing.T) {
 		Blocks:    input,
 		Events:    ev,
 		Abandoned: ab,
-		Ack:       ack,
-	}
-	started2, ok := (<-ack).(command.Started)
-	if !ok {
-		t.Fatal("UserInput disposition != Started")
-	}
-	if started2.InputID != cmdID {
-		t.Errorf("Started.InputID = %v, want the submit id %v", started2.InputID, cmdID)
 	}
 
 	// The first per-turn event is TurnStarted, carrying the initial UserMessage and
@@ -1040,7 +1051,13 @@ func TestActorPerTurnStreamOrdering(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	ev, _ := startTurn(t, l, context.Background(), []content.Block{&content.TextBlock{Text: "go"}})
+	// Raw StartOnly submit (not the startTurn helper) so the leading TurnStarted stays
+	// on the stream to be asserted: the start-or-reject outcome IS the first per-turn
+	// event now, and this test verifies the full started/delta/stepdone/done ordering.
+	ev := make(chan event.Event, 64)
+	ab := make(chan struct{})
+	defer close(ab)
+	l.Commands <- command.UserInput{Mode: command.StartOnly, Blocks: []content.Block{&content.TextBlock{Text: "go"}}, Events: ev, Abandoned: ab}
 
 	var kinds []string
 	for e := range ev {
@@ -1194,12 +1211,10 @@ func TestCommitParkDoesNotWedgeOnRootCancel(t *testing.T) {
 	// the actor's commit point blocks on the full, unread buffer, parking the actor
 	// (and runTurn waiting for the ack). Only the emitTurn ctx.Done() escape frees it.
 	ev := make(chan event.Event, 2)
-	ack := make(chan command.Disposition, 1)
 	ab := make(chan struct{}) // never closed -> leaked reader
-	l.Commands <- command.UserInput{Mode: command.StartOnly, Blocks: nil, Events: ev, Abandoned: ab, Ack: ack}
-	if _, ok := (<-ack).(command.Started); !ok {
-		t.Fatal("disposition != Started")
-	}
+	// Leaked reader: never read from ev (TurnStarted fills slot 1, the TokenDelta fills
+	// slot 2; the StepDone then blocks the actor). Reading would defeat the test.
+	l.Commands <- command.UserInput{Mode: command.StartOnly, Blocks: nil, Events: ev, Abandoned: ab}
 	// Give the turn time to fill the buffer and park the actor in the commit point.
 	deadline := time.After(2 * time.Second)
 	for len(ev) < 2 {

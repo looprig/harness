@@ -88,9 +88,8 @@ func TestInboxPopIDGenFailureReturnsEntry(t *testing.T) {
 	client.mu.Lock()
 	client.onStreamN = map[int]func(){
 		0: func() {
-			ack := make(chan command.Disposition, 1)
-			l.Commands <- command.UserInput{Header: command.Header{ID: queuedID}, Mode: command.AllowFold, Ack: ack}
-			if _, ok := (<-ack).(command.InputQueued); !ok {
+			l.Commands <- command.UserInput{Header: command.Header{ID: queuedID}, Mode: command.AllowFold}
+			if _, ok := awaitReply(t, sink, queuedID).(event.InputQueued); !ok {
 				t.Errorf("queued submit during final step not InputQueued")
 			}
 			gen.fail()

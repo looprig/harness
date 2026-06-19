@@ -28,7 +28,6 @@ func TestSubmitCommandsSatisfyCommand(t *testing.T) {
 	headerID := newID(t)
 	fromLoop := newID(t)
 	ev := make(chan event.Event, 1)
-	ack := make(chan command.Disposition, 1)
 	ab := make(chan struct{})
 	blocks := []content.Block{&content.TextBlock{Text: "hi"}}
 
@@ -39,27 +38,27 @@ func TestSubmitCommandsSatisfyCommand(t *testing.T) {
 	}{
 		{
 			name:       "UserInput AllowFold fan-in only (nil stream)",
-			cmd:        command.UserInput{Header: command.Header{ID: headerID}, Blocks: blocks, Mode: command.AllowFold, Ack: ack},
+			cmd:        command.UserInput{Header: command.Header{ID: headerID}, Blocks: blocks, Mode: command.AllowFold},
 			wantHeader: headerID,
 		},
 		{
 			name:       "UserInput StartOnly with per-turn stream",
-			cmd:        command.UserInput{Header: command.Header{ID: headerID}, Blocks: blocks, Mode: command.StartOnly, Events: ev, Abandoned: ab, Ack: ack},
+			cmd:        command.UserInput{Header: command.Header{ID: headerID}, Blocks: blocks, Mode: command.StartOnly, Events: ev, Abandoned: ab},
 			wantHeader: headerID,
 		},
 		{
 			name:       "UserInput zero header is boundary",
-			cmd:        command.UserInput{Ack: ack},
+			cmd:        command.UserInput{},
 			wantHeader: uuid.UUID{},
 		},
 		{
 			name:       "SubagentResult carries FromLoopID",
-			cmd:        command.SubagentResult{Header: command.Header{ID: headerID}, FromLoopID: fromLoop, Blocks: blocks, Ack: ack},
+			cmd:        command.SubagentResult{Header: command.Header{ID: headerID}, FromLoopID: fromLoop, Blocks: blocks},
 			wantHeader: headerID,
 		},
 		{
 			name:       "SubagentResult zero header is boundary",
-			cmd:        command.SubagentResult{Ack: ack},
+			cmd:        command.SubagentResult{},
 			wantHeader: uuid.UUID{},
 		},
 	}

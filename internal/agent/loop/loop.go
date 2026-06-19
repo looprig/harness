@@ -710,65 +710,15 @@ func runLoop(cfg loopConfig, state loopState) {
 		return &content.UserMessage{Message: content.Message{Role: content.RoleUser, Blocks: blocks}}
 	}
 
-	// decideSubmit resolves a UserInput/SubagentResult against the actor's OWN live
-	// state (race-free), replying its Disposition through ack via tryAck. queueable
-	// is false for a StartOnly UserInput (and, later, non-queueable internal turns):
-	// such a submit must start or be rejected. events/abandoned are the optional
-	// per-turn stream (nil for a fan-in-only submit). On an id-gen failure while
-	// starting, the rejected turn's Events channel is closed and TurnRejected{Busy}
-	// is mapped to a TurnRejected so the caller always unblocks. A crypto/rand
-	// failure means the actor cannot mint the TurnID — a transient system fault — so
-	// the loop declines the work (fail-secure): it closes the per-turn stream, logs
-	// the typed IDGenerationError, and replies TurnRejected{RejectInternal} (a
-	// transient internal failure; the loop is healthy and the caller MAY retry —
-	// distinct from RejectShuttingDown, which says the loop is going away).
-	decideSubmit := func(qi queuedInput, queueable bool, events chan<- event.Event, abandoned <-chan struct{}, ack chan<- command.Disposition) {
-		switch {
-		case state.status == loopShuttingDown:
-			tryAck[command.Disposition](ack, command.TurnRejected{Reason: command.RejectShuttingDown})
-			if events != nil {
-				close(events)
-			}
-		case len(state.inbox) >= inboxCap:
-			tryAck[command.Disposition](ack, command.TurnRejected{Reason: command.RejectQueueFull})
-			if events != nil {
-				close(events)
-			}
-		case state.status == loopRunning && !queueable:
-			tryAck[command.Disposition](ack, command.TurnRejected{Reason: command.RejectBusy})
-			if events != nil {
-				close(events)
-			}
-		case state.status == loopRunning:
-			// Queueable + busy: accept into the inbox (ordered). A queued submit has
-			// no per-turn stream of its own — it resolves on the fan-in — so an
-			// events channel supplied here (only StartOnly sets one, and StartOnly is
-			// not queueable) cannot reach this branch; nothing to close.
-			state.inbox = append(state.inbox, qi)
-			tryAck[command.Disposition](ack, command.InputQueued{InputID: qi.inputID})
-		default: // idle
-			turnID, err := startTurn(qi, events, abandoned)
-			if err != nil {
-				// Fail-secure: cannot mint a TurnID. Decline the work, close the
-				// per-turn stream, and reply a rejection so the caller unblocks. The
-				// loop is healthy (only id-gen failed), so this is RejectInternal — a
-				// transient failure the caller MAY retry, NOT RejectShuttingDown.
-				slog.Error("turn id generation failed; rejecting submit", "error", err)
-				tryAck[command.Disposition](ack, command.TurnRejected{Reason: command.RejectInternal})
-				if events != nil {
-					close(events)
-				}
-				return
-			}
-			tryAck[command.Disposition](ack, command.Started{TurnID: turnID, InputID: qi.inputID})
-		}
-	}
-
 	// returnEntry resolves ONE removed-from-inbox entry as returned: it emits the
 	// single event.InputCancelled{reason} that a client observes for qi. It is the
 	// ONE place a return is emitted, so the "every removal is resolved exactly once"
 	// invariant has a single owner. turnID is the turn whose end caused the return
-	// (zero for a pure retract outside a turn); it lands on Header.TurnID.
+	// (zero for a pure retract outside a turn); it lands on Header.TurnID. decideSubmit
+	// also uses it for the SubagentResult idle id-gen-failure path: a SubagentResult is
+	// never rejected, so a failure to start it surfaces as InputCancelled (which
+	// releases its {wake} token on the publish path) rather than TurnRejected (which
+	// does not).
 	returnEntry := func(qi queuedInput, reason event.CancelReason, turnID uuid.UUID) {
 		publish(event.InputCancelled{
 			Header: event.Header{
@@ -782,6 +732,109 @@ func runLoop(cfg loopConfig, state loopState) {
 			Reason:  reason,
 			Message: qi.msg,
 		})
+	}
+
+	// rejectSubmit resolves a refused submit through the EVENT path (the typed
+	// replacement for the old command.Disposition reply). It publishes the Enduring
+	// event.TurnRejected to the session fan-in (header-stamped by stampLoopHeader,
+	// CausationID == InputID), so any issuer recognises its answer via
+	// ReplyTo() == its command id. For a StartOnly submit (the per-turn stream is
+	// non-nil) it ALSO delivers the same TurnRejected on `events` BEFORE closing the
+	// channel, so Invoke/Stream observe the reason as the stream's first (and only)
+	// event. The on-stream send is non-blocking with the same escapes the turn's
+	// emit uses (abandoned / root-ctx) — there is no turn ctx yet, so no turnDone
+	// escape is needed (and `abandoned` is the caller's own channel, closed if the
+	// caller already gave up). A fan-in-only submit (events == nil) has no stream to
+	// feed or close: the published TurnRejected is the whole answer.
+	rejectSubmit := func(qi queuedInput, reason event.RejectReason, events chan<- event.Event, abandoned <-chan struct{}) {
+		rejected := event.TurnRejected{
+			Header: event.Header{
+				CausationID:       qi.inputID,
+				TriggeredByLoopID: qi.triggeredBy,
+			},
+			InputID: qi.inputID,
+			Reason:  reason,
+		}
+		publish(rejected)
+		if events == nil {
+			return
+		}
+		// Deliver the reason on the per-turn stream as its first event so a StartOnly
+		// caller (Invoke/Stream) sees it, then close so the caller unblocks. The full-
+		// fidelity stamped event is the one published above; the stream carries the
+		// unstamped local copy, which is sufficient for the caller to read Reason.
+		select {
+		case events <- rejected:
+		case <-abandoned:
+		case <-ctx.Done():
+		}
+		close(events)
+	}
+
+	// decideSubmit resolves a UserInput/SubagentResult against the actor's OWN live
+	// state (race-free), PUBLISHING the typed outcome event rather than replying a
+	// command.Disposition. queueable is false for a StartOnly UserInput (Invoke/Stream):
+	// such a submit must start or be rejected. bypassReject is true for a
+	// SubagentResult: it can NEVER be rejected (not by cap, busy, or shutdown) — it
+	// must always start (idle) or queue (running/shutting-down), so its quiescence
+	// {wake} token is ALWAYS released by a resulting Enduring event (TurnStarted /
+	// TurnFoldedInto, or InputCancelled if the loop ends before it commits — the
+	// shutdown terminal's returnQueuedInbox emits it carrying TriggeredByLoopID),
+	// never off the publish path. events/abandoned are the optional per-turn stream
+	// (nil for a fan-in-only submit). A crypto/rand failure means the actor cannot
+	// mint the TurnID — a transient system fault — so the loop declines the work
+	// (fail-secure): it publishes event.TurnRejected{RejectInternal} and closes the
+	// per-turn stream (the loop is healthy and the caller MAY retry — distinct from
+	// RejectShuttingDown, which says the loop is going away).
+	decideSubmit := func(qi queuedInput, queueable, bypassReject bool, events chan<- event.Event, abandoned <-chan struct{}) {
+		switch {
+		case state.status == loopShuttingDown && !bypassReject:
+			rejectSubmit(qi, event.RejectShuttingDown, events, abandoned)
+		case len(state.inbox) >= inboxCap && !bypassReject:
+			rejectSubmit(qi, event.RejectQueueFull, events, abandoned)
+		case state.status == loopRunning && !queueable && !bypassReject:
+			rejectSubmit(qi, event.RejectBusy, events, abandoned)
+		case state.status == loopRunning || (state.status == loopShuttingDown && bypassReject):
+			// Queueable + busy (or a never-rejected SubagentResult while shutting down):
+			// accept into the inbox (ordered) and publish InputQueued (Ephemeral). A
+			// queued submit has no per-turn stream of its own — it resolves on the
+			// fan-in — so an events channel supplied here (only StartOnly sets one, and
+			// StartOnly is not queueable) cannot reach this branch; nothing to close. A
+			// SubagentResult queued during shutdown is later returned via InputCancelled
+			// by the shutdown terminal's returnQueuedInbox (releasing its {wake} token).
+			state.inbox = append(state.inbox, qi)
+			publish(event.InputQueued{
+				Header: event.Header{
+					CausationID:       qi.inputID,
+					TriggeredByLoopID: qi.triggeredBy,
+				},
+				InputID: qi.inputID,
+			})
+		default: // idle: start a turn from the submit.
+			if _, err := startTurn(qi, events, abandoned); err != nil {
+				slog.Error("turn id generation failed; declining submit", "error", err)
+				if bypassReject {
+					// A SubagentResult is NEVER rejected — even an idle-time id-gen
+					// failure must release its {wake} quiescence token on the PUBLISH
+					// path (it produces no off-publish release anymore). TurnRejected does
+					// NOT release {wake}; InputCancelled (carrying TriggeredByLoopID) does,
+					// so an internal failure to start a SubagentResult is surfaced as an
+					// InputCancelled (the input never committed) rather than a reject. The
+					// per-turn stream is always nil for a SubagentResult, so there is no
+					// stream to close.
+					returnEntry(qi, event.CancelTurnFailed, uuid.UUID{})
+					return
+				}
+				// Fail-secure for a UserInput: cannot mint a TurnID. Publish a rejection
+				// so any issuer unblocks, and close the per-turn stream. The loop is
+				// healthy (only id-gen failed), so this is RejectInternal — a transient
+				// failure the caller MAY retry, NOT RejectShuttingDown.
+				rejectSubmit(qi, event.RejectInternal, events, abandoned)
+				return
+			}
+			// startTurn already emitted event.TurnStarted (the Started outcome); there is
+			// no separate Started event to publish here.
+		}
 	}
 
 	// returnQueuedInbox returns every still-unresolved queued entry via returnEntry
@@ -961,22 +1014,27 @@ func runLoop(cfg loopConfig, state loopState) {
 
 			case command.UserInput:
 				// Interactive (AllowFold) input may queue behind a running turn;
-				// StartOnly (Invoke/Stream) must start or be rejected. The actor
-				// decides on its own live state — race-free — and replies a
-				// Disposition through the buffered(1) Ack via tryAck.
+				// StartOnly (Invoke/Stream) must start or be rejected. The actor decides
+				// on its own live state — race-free — and PUBLISHES the typed outcome
+				// event (TurnStarted / InputQueued / TurnRejected); a StartOnly caller
+				// also observes that outcome on its per-turn stream. A UserInput may be
+				// rejected, so bypassReject is false.
 				qi := queuedInput{inputID: c.CommandHeader().ID, msg: userMessageFromBlocks(c.Blocks)}
-				decideSubmit(qi, c.Mode == command.AllowFold, c.Events, c.Abandoned, c.Ack)
+				decideSubmit(qi, c.Mode == command.AllowFold, false, c.Events, c.Abandoned)
 
 			case command.SubagentResult:
-				// A hand-back from a finished subagent loop. Same decision path as an
-				// AllowFold UserInput (always queueable, no per-turn stream); triggeredBy
-				// is the producing subagent loop id, stamped on the resulting events.
+				// A hand-back from a finished subagent loop. Always queueable, no per-turn
+				// stream; triggeredBy is the producing subagent loop id, stamped on the
+				// resulting events. bypassReject is true: a SubagentResult is NEVER
+				// rejected — it always starts (idle) or queues (running/shutting-down), so
+				// its quiescence {wake} token is always released by a resulting Enduring
+				// event, never off the publish path.
 				qi := queuedInput{
 					inputID:     c.CommandHeader().ID,
 					triggeredBy: c.FromLoopID,
 					msg:         userMessageFromBlocks(c.Blocks),
 				}
-				decideSubmit(qi, true, nil, nil, c.Ack)
+				decideSubmit(qi, true, true, nil, nil)
 
 			case command.CancelQueuedInput:
 				// Retract a still-queued submit. Resolved by the actor against its own

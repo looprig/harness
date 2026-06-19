@@ -40,9 +40,8 @@ func TestCancelWhileQueuedReturnsCancelled(t *testing.T) {
 
 	// Queue an input.
 	queuedID := mustID(t)
-	ack := make(chan command.Disposition, 1)
-	l.Commands <- command.UserInput{Header: command.Header{ID: queuedID}, Mode: command.AllowFold, Blocks: textBlocks("retract me"), Ack: ack}
-	if _, ok := (<-ack).(command.InputQueued); !ok {
+	l.Commands <- command.UserInput{Header: command.Header{ID: queuedID}, Mode: command.AllowFold, Blocks: textBlocks("retract me")}
+	if _, ok := awaitReply(t, sink, queuedID).(event.InputQueued); !ok {
 		t.Fatal("submit not queued")
 	}
 
@@ -101,9 +100,8 @@ func TestAbnormalTerminalReturnsQueuedInput(t *testing.T) {
 
 		// Queue an input while the turn runs.
 		queuedID := mustID(t)
-		ack := make(chan command.Disposition, 1)
-		l.Commands <- command.UserInput{Header: command.Header{ID: queuedID}, Mode: command.AllowFold, Blocks: textBlocks("queued"), Ack: ack}
-		if _, ok := (<-ack).(command.InputQueued); !ok {
+		l.Commands <- command.UserInput{Header: command.Header{ID: queuedID}, Mode: command.AllowFold, Blocks: textBlocks("queued")}
+		if _, ok := awaitReply(t, sink, queuedID).(event.InputQueued); !ok {
 			t.Fatal("submit not queued")
 		}
 
@@ -153,9 +151,8 @@ func TestAbnormalTerminalReturnsQueuedInput(t *testing.T) {
 		sink := &captureSink{}
 		client.onStreamN = map[int]func(){
 			1: func() {
-				ack := make(chan command.Disposition, 1)
-				l.Commands <- command.UserInput{Header: command.Header{ID: queuedID}, Mode: command.AllowFold, Blocks: textBlocks("queued"), Ack: ack}
-				if _, ok := (<-ack).(command.InputQueued); !ok {
+				l.Commands <- command.UserInput{Header: command.Header{ID: queuedID}, Mode: command.AllowFold, Blocks: textBlocks("queued")}
+				if _, ok := awaitReply(t, sink, queuedID).(event.InputQueued); !ok {
 					t.Errorf("submit at step 1 not queued")
 				}
 			},

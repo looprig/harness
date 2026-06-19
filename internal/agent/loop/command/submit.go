@@ -22,39 +22,42 @@ const (
 	StartOnly
 )
 
-// UserInput is interactive input. The loop decides its disposition; the caller
-// never assumes a turn was created. Submit commands DO NOT carry a context (no
-// Ctx field): a queued input can start much later, fold, be cancelled, or be
-// returned, so the loop derives the turn context from its own loopCtx only when a
-// turn actually starts.
+// UserInput is interactive input. The loop decides its outcome; the caller never
+// assumes a turn was created. Submit commands DO NOT carry a context (no Ctx
+// field): a queued input can start much later, fold, be cancelled, or be returned,
+// so the loop derives the turn context from its own loopCtx only when a turn
+// actually starts.
+//
+// The loop announces the outcome by PUBLISHING a typed Reply event onto the normal
+// session fan-in (event.TurnStarted / event.InputQueued / event.TurnRejected, each
+// carrying CausationID == this command's id), NOT a point-to-point reply.
 //
 // Events/Abandoned are the OPTIONAL per-turn stream: StartOnly callers
-// (Invoke/Stream) set them to receive the per-turn StreamReader; a fan-in-only
-// submit leaves them nil and observes results on the session event fan-in.
-// Ack is required and must be a buffered(1) channel: the loop replies its
-// Disposition through it exactly once via tryAck (a non-blocking send), so a
-// missing/unbuffered Ack would force the loop to drop the reply rather than wedge.
+// (Invoke/Stream) set them to observe the outcome (and, on success, the turn's
+// events) on a dedicated channel — the loop delivers the same outcome event there
+// before the terminal; a fan-in-only submit leaves them nil and observes results on
+// the session event fan-in.
 type UserInput struct {
 	Header
 	Blocks    []content.Block
 	Mode      InputMode
 	Events    chan<- event.Event
 	Abandoned <-chan struct{}
-	Ack       chan<- Disposition
 }
 
 // SubagentResult delivers a finished subagent's output to its parent loop (the
 // hand-back). It shares UserInput's submit semantics but is always AllowFold and
 // carries no per-turn stream — the parent loop's events go to the session fan-in.
 // FromLoopID is the producing subagent loop: the loop stamps it as
-// TriggeredByLoopID on any start/fold/return event the submit causes, which
-// releases the parent's quiescence wake token on the publish path. A TurnRejected
-// reply is instead reconciled by the session via cancelExpectTurn.
+// TriggeredByLoopID on any start/queue/fold/return event the submit causes, which
+// releases the parent's quiescence wake token on the publish path. A SubagentResult
+// is NEVER rejected, so its wake token is ALWAYS released by a published Enduring
+// event (TurnStarted/TurnFoldedInto, or InputCancelled if the loop ends before it
+// commits) — there is no off-publish-path reconciliation anymore.
 type SubagentResult struct {
 	Header
 	FromLoopID uuid.UUID
 	Blocks     []content.Block
-	Ack        chan<- Disposition
 }
 
 func (UserInput) isCommand()      {}

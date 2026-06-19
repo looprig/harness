@@ -111,9 +111,9 @@ func TestFoldAtToolContinuation(t *testing.T) {
 
 	// Queue an input while the tool step is in flight.
 	foldedID := mustID(t)
-	d := submitUserInputBlocks(t, l, foldedID, command.AllowFold, textBlocks("folded text"))
-	if _, ok := d.(command.InputQueued); !ok {
-		t.Fatalf("queued submit disposition = %T, want InputQueued", d)
+	d := submitUserInputBlocks(t, l, sink, foldedID, command.AllowFold, textBlocks("folded text"))
+	if _, ok := d.(event.InputQueued); !ok {
+		t.Fatalf("queued submit outcome = %T, want event.InputQueued", d)
 	}
 
 	// Release the tool: step 0 commits, then runTurn drains the inbox and folds the
@@ -204,14 +204,12 @@ func TestSubagentResultFoldStampsTriggeredBy(t *testing.T) {
 	// folds at the tool-continuation boundary.
 	fromLoopID := mustID(t)
 	resultID := mustID(t)
-	ack := make(chan command.Disposition, 1)
 	l.Commands <- command.SubagentResult{
 		Header:     command.Header{ID: resultID},
 		FromLoopID: fromLoopID,
 		Blocks:     textBlocks("subagent says hi"),
-		Ack:        ack,
 	}
-	if _, ok := (<-ack).(command.InputQueued); !ok {
+	if _, ok := awaitReply(t, sink, resultID).(event.InputQueued); !ok {
 		t.Fatal("SubagentResult not queued")
 	}
 
@@ -236,18 +234,12 @@ func TestSubagentResultFoldStampsTriggeredBy(t *testing.T) {
 }
 
 // submitUserInputBlocks is submitUserInput with explicit blocks, so a fold test can
-// assert the folded message's content lands in the continuation request.
-func submitUserInputBlocks(t *testing.T, l *Loop, id uuid.UUID, mode command.InputMode, blocks []content.Block) command.Disposition {
+// assert the folded message's content lands in the continuation request. It observes
+// the published outcome event (InputQueued/TurnStarted/TurnRejected) via the sink.
+func submitUserInputBlocks(t *testing.T, l *Loop, sink *captureSink, id uuid.UUID, mode command.InputMode, blocks []content.Block) event.Event {
 	t.Helper()
-	ack := make(chan command.Disposition, 1)
-	l.Commands <- command.UserInput{Header: command.Header{ID: id}, Mode: mode, Blocks: blocks, Ack: ack}
-	select {
-	case d := <-ack:
-		return d
-	case <-time.After(2 * time.Second):
-		t.Fatal("UserInput disposition not received")
-		return nil
-	}
+	l.Commands <- command.UserInput{Header: command.Header{ID: id}, Mode: mode, Blocks: blocks}
+	return awaitReply(t, sink, id)
 }
 
 // TestNoToolFinalAnswerDoesNotFold proves a no-tool final answer does NOT drain the
@@ -273,10 +265,10 @@ func TestNoToolFinalAnswerDoesNotFold(t *testing.T) {
 	client.mu.Lock()
 	client.onStreamN = map[int]func(){
 		0: func() {
-			ack := make(chan command.Disposition, 1)
-			// AllowFold submit while the turn is running -> InputQueued.
-			l.Commands <- command.UserInput{Header: command.Header{ID: queuedID}, Mode: command.AllowFold, Blocks: textBlocks("later"), Ack: ack}
-			if _, ok := (<-ack).(command.InputQueued); !ok {
+			// AllowFold submit while the turn is running -> InputQueued (observed on
+			// the sink fan-in).
+			l.Commands <- command.UserInput{Header: command.Header{ID: queuedID}, Mode: command.AllowFold, Blocks: textBlocks("later")}
+			if _, ok := awaitReply(t, sink, queuedID).(event.InputQueued); !ok {
 				t.Errorf("queued submit during final step not InputQueued")
 			}
 		},
@@ -339,9 +331,9 @@ func TestInterruptDuringDrainFreesTurn(t *testing.T) {
 	// Queue an input so the drain has something to pull (so runTurn enters the
 	// handshake meaningfully).
 	queuedID := mustID(t)
-	d := submitUserInputBlocks(t, l, queuedID, command.AllowFold, textBlocks("queued"))
-	if _, ok := d.(command.InputQueued); !ok {
-		t.Fatalf("queued submit disposition = %T, want InputQueued", d)
+	d := submitUserInputBlocks(t, l, sink, queuedID, command.AllowFold, textBlocks("queued"))
+	if _, ok := d.(event.InputQueued); !ok {
+		t.Fatalf("queued submit outcome = %T, want event.InputQueued", d)
 	}
 
 	// Interrupt and release the tool concurrently: the turn ctx is cancelled around
@@ -474,9 +466,9 @@ func TestDrainingSweepReturnsEntryOnInterrupt(t *testing.T) {
 
 	// Queue exactly one input so the drain moves exactly one entry into draining.
 	queuedID := mustID(t)
-	d := submitUserInputBlocks(t, l, queuedID, command.AllowFold, textBlocks("queued"))
-	if _, ok := d.(command.InputQueued); !ok {
-		t.Fatalf("queued submit disposition = %T, want InputQueued", d)
+	d := submitUserInputBlocks(t, l, sink, queuedID, command.AllowFold, textBlocks("queued"))
+	if _, ok := d.(event.InputQueued); !ok {
+		t.Fatalf("queued submit outcome = %T, want event.InputQueued", d)
 	}
 
 	// Release the tool: step 0 commits, runTurn drains (moving the entry into draining),
