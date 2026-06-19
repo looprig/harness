@@ -93,11 +93,28 @@ func TestToolRunningToCompletedHandoff(t *testing.T) {
 	}
 	preComplete := out.String()
 
+	// ToolCallCompleted resolves the live card IN PLACE (it stays in the live tail,
+	// now with a ✓ and its result body). Under the StepDone-group model the card is not
+	// committed yet — committing is the step boundary's job.
 	deliver(event.ToolCallCompleted{
 		CallID: callID(1),
 		ResultPreview: "HTTP 200 OK\nContent-Type: text/html\nServer: nginx\n" +
 			"Date: today\nX-Cache: HIT\nbody body body",
 	})
+
+	// The step boundary: StepDone snaps the finalized group into scrollback —
+	// committing the resolved Fetch card (reusing its redacted live Summary/preview by
+	// position) and the assistant narration. This is the live→committed handoff point.
+	deliver(event.StepDone{Messages: content.AgenticMessages{
+		&content.AIMessage{Message: content.Message{Role: content.RoleAssistant, Blocks: []content.Block{
+			&content.TextBlock{Text: "Let me fetch the weather."},
+			&content.ToolUseBlock{ID: "tu-1", Name: "Fetch", Input: []byte(`{}`)},
+		}}},
+		&content.ToolResultMessage{
+			Message:   content.Message{Role: content.RoleTool, Blocks: []content.Block{&content.TextBlock{Text: "HTTP 200 OK\nbody body body"}}},
+			ToolUseID: "tu-1",
+		},
+	}})
 
 	prog.Quit()
 	in.Close()
@@ -118,12 +135,14 @@ func TestToolRunningToCompletedHandoff(t *testing.T) {
 			noOutput, preComplete)
 	}
 
-	// 3. The completed card committed to scrollback exactly once (no duplicate/split),
-	//    and only the RESOLVED (✓) card — never a running glyph — reaches scrollback.
-	if got := strings.Count(full, "└ Fetch  GET weather.com"); got != 2 {
-		// Two header occurrences total: the live running indicator + the one committed
-		// card. A third would be a duplicate/split.
-		t.Errorf("Fetch card header appeared %d times in the full stream, want 2 (one live, one committed)\n%q",
+	// 3. The resolved (✓) card reaches scrollback on commit. Under the StepDone-group
+	//    model the card header paints three times across the run: the live RUNNING
+	//    indicator, the live RESOLVED card (ToolCallCompleted resolves it in place
+	//    before the step boundary), and the one COMMITTED card snapped in by StepDone.
+	//    The committed card must appear (the ✓ glyph reaches scrollback), and the
+	//    running-card body placeholder ("(no output)") must never have been committed.
+	if got := strings.Count(full, "└ Fetch  GET weather.com"); got != 3 {
+		t.Errorf("Fetch card header appeared %d times, want 3 (live running indicator, live resolved, committed)\n%q",
 			got, full)
 	}
 	if !strings.Contains(full, glyphOK) {
