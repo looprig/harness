@@ -112,6 +112,9 @@ type TurnRejected struct {
 func (InputQueued) isEvent()  {}
 func (TurnRejected) isEvent() {}
 
+func (InputQueued) isReply()  {}
+func (TurnRejected) isReply() {}
+
 // TokenDelta is emitted for each streaming chunk from the LLM. TokenDelta and
 // the ToolCallStarted/ToolCallCompleted events (in tool.go) are the Ephemeral
 // events.
@@ -169,6 +172,13 @@ func (TokenDelta) isEvent()      {}
 func (TurnDone) isEvent()        {}
 func (TurnFailed) isEvent()      {}
 func (TurnInterrupted) isEvent() {}
+
+// isReply marks the command-outcome events. Together with InputQueued/TurnRejected
+// (declared above) these are exactly the five Reply events: a command issuer
+// recognises its answer via ReplyTo() == its command id.
+func (TurnStarted) isReply()    {}
+func (TurnFoldedInto) isReply() {}
+func (InputCancelled) isReply() {}
 
 // SinkProjection redacts a tool-call delta before it reaches a sink. A
 // *content.ToolUseChunk carries partial argument JSON (InputJSON) — the same

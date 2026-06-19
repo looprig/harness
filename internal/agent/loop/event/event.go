@@ -24,6 +24,20 @@ type Event interface {
 	EventHeader() Header
 }
 
+// Reply is an event that is the direct outcome of a command, delivered on the normal
+// fan-in (classed Ephemeral/Enduring like any other event — NOT a point-to-point
+// channel). It is the typed replacement for the command.Disposition reply: an issuer
+// recognises "the answer to my command" via ReplyTo() == its command id.
+type Reply interface {
+	Event
+	isReply()           // seals the set
+	ReplyTo() uuid.UUID // == Header.CausationID: the command this answers
+}
+
+// ReplyTo returns the id of the command this event answers (its CausationID). It is
+// promoted onto every Reply event via the embedded Header.
+func (h Header) ReplyTo() uuid.UUID { return h.CausationID }
+
 // Class is the delivery class of an event. It is semantic — "is this event
 // reconstructable from a later authoritative event?" — not a transport flag,
 // which is why it belongs on the event rather than on the transport.
