@@ -7,10 +7,10 @@
 group (`AIMessage` + its `ToolResultMessage`s), the queued-input lifecycle
 (`command.UserInput` and the `TurnStarted`/`TurnFoldedInto`/`InputCancelled` events),
 producer-identity `Header` fields, and the publish/subscribe fan-in with `EventFilter`.
-This spec **amends** that doc in three owned ways — see the *Loop/event amendment* sections
-below — without editing it: it reclassifies the `ToolCall*` events as Ephemeral, replaces
-the `command.UserInput` `Disposition` reply with `Reply` events, and has `StepDone` carry
-per-tool-use display summaries. All apply when this work lands.
+This spec **amends** that doc in two owned ways — see the *Loop/event amendment* sections
+below — without editing it: it reclassifies the `ToolCall*` events as Ephemeral, and
+replaces the `command.UserInput` `Disposition` reply with `Reply` events. Both apply when
+this work lands.
 
 > **Revision 2026-06-18 (loop-machine alignment).** Pins down what the original
 > draft deferred ("nesting/styling is a follow-on") and folds in these decisions:
@@ -26,9 +26,6 @@ per-tool-use display summaries. All apply when this work lands.
 > (4) **command replies become `Reply` events** — the `Disposition`/ack channel is
 > dropped; the TUI submits fire-and-forget and reads outcomes (`InputQueued` Ephemeral,
 > `TurnRejected` Enduring) from the one event stream (second amendment).
-> (5) **`StepDone` carries per-tool-use display summaries** (third amendment) — so the
-> committed tool card's redacted args summary is self-contained from the Enduring group,
-> not reused from a droppable live event.
 
 ## Motivation
 
@@ -39,37 +36,51 @@ events carry producer identity (`LoopID`); the session exposes a publish/subscri
 fan-in with `EventFilter` instead of a per-turn stream; and the loop — not the TUI —
 owns the queue of pending user input.
 
-The current TUI predates all of that. It is the *source of truth* for assistant
-text — it accumulates chunks itself and commits its own accumulation — and it owns a
-FIFO of user submissions it drains to start turns. To consume the new model
-correctly (and to make multi-loop attribution possible at all), the TUI must stop
-owning both assistant content and input queueing, and become a **projection of the
-loop's Enduring events**: user rows from `TurnStarted`/`TurnFoldedInto`, assistant
-rows from `StepDone`. This spec is the display-layer counterpart to the loop-machine
-spec; it is kept separate because it lands after the engine changes and has its own
-risk surface (rendering, scrollback, prompt routing).
+The current TUI predates all of that. The `StepDone`-committed transcript and the session
+fan-in have since **landed** (see Current state), but the TUI still owns a FIFO of user
+submissions it drains to start turns, still reads command replies as acks, and still treats
+tool events as Enduring live signals. To finish becoming a **projection of the loop's
+Enduring events** — user rows from `TurnStarted`/`TurnFoldedInto`, assistant rows from
+`StepDone` — it must shed input queueing and the remaining ownership. This spec is the
+display-layer counterpart to the loop-machine spec; it is kept separate because it lands
+after the engine changes and has its own risk surface (rendering, scrollback, prompt
+routing).
 
-## Current state (verified)
+## Current state (verified against `main`)
 
-- **Per-turn subscription.** `session.Stream` returns a `StreamReader[event.Event]`
-  for one `StartTurn`; the TUI opens one per user message (`session/agent.go`).
-- **TUI owns assistant text.** `transcriptModel.applyChunk` folds chunks with `+=`
-  and `commitLive`/`commitProse` commit *that accumulation* as assistant entries
-  (`tui/transcript.go`). It does not fold tool-use chunks — tool cards are driven by
-  the loop's `ToolCallStarted`/`ToolCallCompleted`.
-- **TUI owns the input queue.** `Screen.queue [][]content.Block` (`tui/screen.go:33`)
-  holds submissions made while a turn is `Running`, FIFO; the TUI commits the user row
-  itself and drains the queue to start the next turn (`tui/screen.go`). The loop never
-  sees the queue.
-- **`TurnDone.Message` is unused for the transcript** — the committed entry is the
-  TUI's own accumulated text, so displayed text can differ from the loop's stored
-  `AIMessage`.
-- **Single-session reducer.** One `live` segment and a flat committed list with no
-  loop/session field (`tui/transcript.go`); `Screen` folds every event into the one
-  reducer (`tui/screen.go`).
-- **Global prompt clearing.** Any terminal event triggers `ClearPrompts`
-  (`tui/interaction.go`), which would drop a sibling loop's pending gate prompt once
-  per-loop streams are merged.
+The loop-machine merge already landed the **core** of this spec; the rest is what remains.
+
+*Landed:*
+
+- **StepDone-committed transcript.** `stepDone` snaps the transcript to the loop's
+  finalized `StepDone.Messages` — one per-step group, multi-step turns never merged
+  (`tui/transcript.go`). The "displayed != stored" problem is fixed: committed text is the
+  loop's stored `AIMessage`, not the TUI's accumulation.
+- **Provisional live + self-heal.** Chunks accumulate into a live segment; `StepDone`
+  resets it, so dropped `TokenDelta`s vanish at the step boundary (`tui/transcript.go`).
+- **Interrupt/partial commit.** A turn that ends with no `StepDone` for its in-flight step
+  commits the provisional partial (`tui/transcript.go`).
+- **Tool cards live→committed.** Live cards resolve in place; `StepDone` reuses the
+  resolved card and falls back to the stored block (`tui/transcript.go:400-447`) — option
+  (c), §3.3.
+- **Session fan-in.** `AgentSession.SubscribeEvents(EventFilter)` + per-loop scoping
+  (`session/agent.go`, `tui/agent.go`); `EventFilter{Ephemeral, Enduring LoopScope}` is the
+  real shape (§1).
+
+*Still pending (this spec's remaining work):*
+
+- **TUI still owns the input queue** — `Screen.queue [][]content.Block`, self-drained
+  (`tui/screen.go:197-465`). §6 removes it.
+- **Replies are still acks** — the loop uses `command.Disposition` on an `Ack` channel
+  (`loop/ack.go`); no `event.InputQueued`/`TurnRejected`/`Reply`. Amendment 2.
+- **Tool events still Enduring** — `ToolCallStarted`/`ToolCallCompleted` embed `enduring`;
+  `event/turn.go` asserts "TokenDelta is the only Ephemeral event." Amendment 1.
+- **Card-only step is still a bare bullet** — `commitStepAssistant` renders a bare `●`,
+  not the working-word / `● Done` of §3 rule 4 (`tui/transcript.go`).
+- **`TurnDone` still carries `Message`** (`event/turn.go:88`) — removed in a later loop
+  phase; harmless, the TUI ignores it.
+- **Global prompt clearing** — any terminal event triggers `ClearPrompts`
+  (`tui/interaction.go`); §7 scopes it per loop.
 
 ## Changes
 
@@ -122,18 +133,21 @@ Rendering one `AIMessage` (its blocks: `ThinkingBlock` / `TextBlock` / `ToolUseB
 1. **Thinking present** → the existing dim thinking style (`│ ` rail expanded;
    `thinking · N lines · ctrl+t` collapsed). Unchanged (`renderThinking`).
 2. **Text present** → dot bullet, markdown: `● <text>` (`renderMD`). Unchanged.
-3. **Tool-use blocks present** → render each as an indented child card under the
-   entry, in block order, as today. **The committed card is fully self-contained from the
-   Enduring `StepDone` group:** one card per `AIMessage` `ToolUseBlock`, correlated to the
-   group's `ToolResultMessage`s by `ToolUseBlock.ID == ToolResultMessage.ToolUseID`. The
-   header is `ToolName` (`ToolUseBlock.Name`) + the redacted args **summary the group
-   carries** (per-tool-use, keyed by `ToolUseID` — see the third amendment). The summary
-   can't be the raw `ToolUseBlock.Input` (a `WriteFile`/`EditFile` arg *is* the whole file
-   body) and the TUI can't recompute the runner's per-tool one-liner, so the loop ships it
-   in `StepDone`. The body is the `ToolResultMessage` content (replacing
-   `ToolCallCompleted.ResultPreview` on the committed path), and the ✓/✗ comes from
-   `ToolResultMessage.IsError`. Nothing on the committed card depends on a droppable event.
-   **Live source:** `ToolCallStarted`/`Completed` (§4).
+3. **Tool-use blocks present** → render each as an indented child card under the entry,
+   in block order (this is **built** — `stepDone`/`stepToolCard`, `tui/transcript.go`).
+   One card per `AIMessage` `ToolUseBlock`. The header is `ToolName` (`ToolUseBlock.Name`)
+   + a redacted one-line args summary sourced by **reusing the resolved live card**: at
+   `StepDone` the i-th `ToolUseBlock` is matched to the i-th in-flight live card (guarded
+   by tool name), and that card's already-redacted `ToolCallStarted.Summary` + capped
+   preview commit. The TUI can't recompute the summary itself (it's the tool's per-tool
+   `tool.Auditable.AuditSummary`, owned by the runner) and the raw `ToolUseBlock.Input` is
+   unsuitable to show (a `WriteFile` arg *is* the whole file). **Fallback** when no live
+   card streamed (a dropped `ToolCallStarted`, or a subagent-loop step the TUI only sees
+   finalized): commit `ToolName` + the result, **no summary line** — body from the
+   `StepDone` group's `ToolResultMessage` (correlated `ToolUseBlock.ID ==
+   ToolResultMessage.ToolUseID`), ✓/✗ from `ToolResultMessage.IsError`. So the essentials
+   (name, result, status) are always from the Enduring group; only the cosmetic summary
+   depends on the live card. **Live source:** `ToolCallStarted`/`Completed` (§4).
 4. **Text empty but tool-use present** → instead of a bare `●`, render a **bold
    headline** beside the dot, with the tool cards as its children. The headline depends
    on phase:
@@ -160,12 +174,12 @@ are the **live** running/done signal on the provisional tail only — spinner gl
 on completion, the runner's capped `ResultPreview` (full-fidelity on the TUI stream;
 redaction is the sink projection's concern, not the display's). The **committed** card
 I/O comes from the finalized `AIMessage`'s `ToolUseBlock`s and the following
-`ToolResultMessage`s in the same Enduring `StepDone` group — including the redacted args
-**summary** the group now carries (per-tool-use; third amendment) — **not** from the live
-preview. So the entire committed card (name, summary, result, ✓/✗) is Enduring. A
-long-running tool still shows a spinner while it runs, and the frozen entry shows the
-authoritative summary + results (the curated one-liner stands in for the raw args, which
-are never dumped — §3.3). A dropped live signal costs only the transient
+`ToolResultMessage`s in the same Enduring `StepDone` group — **not** from the live preview.
+The lone exception is the cosmetic one-line **summary**, reused from the resolved live
+`ToolCallStarted` (and dropped to name + result on the dropped/subagent fallback — §3.3).
+A long-running tool still shows a spinner while it runs, and the frozen entry shows the
+authoritative name + result; the curated summary stands in for the raw args, which are
+never dumped. A dropped live signal costs only the transient
 spinner; the committed card self-heals at `StepDone`. Note the committed body is the
 **full** `ToolResultMessage` content where the live body was the runner's **capped**
 `ResultPreview`, so `ctrl+t` expand on a committed card can reveal more than the live one
@@ -246,8 +260,10 @@ reconstructable later?"* — deltas Ephemeral, state transitions Enduring. Both 
 events are **fully reconstructable from the Enduring `StepDone` group**: name/args from
 the `AIMessage`'s `ToolUseBlock`s, `IsError` and result body from the
 `ToolResultMessage`s, correlation by `ToolUseBlock.ID ↔ ToolResultMessage.ToolUseID`.
-(The redacted display `Summary` is also reconstructable — the third amendment carries it
-in `StepDone` — so nothing the tool events show is lost on a drop.)
+(The one thing NOT reconstructable from `StepDone` is the runner's redacted display
+`Summary`; the committed card reuses it from the live event and degrades to name + result
+on a drop — cosmetic only, §3.3. Everything semantic — name, args, result, status — is in
+the group.)
 They are non-blocking, within-step **live progress** — the same category as
 `TokenDelta` — so by the doc's own test they are Ephemeral; a dropped one self-heals at
 the step boundary.
@@ -356,42 +372,6 @@ input emit `InputQueued`/`TurnRejected` (effectively just the primary loop; suba
 `CausationID` still let any subscriber pick out its own command's outcome, and Ephemeral
 `InputQueued` is dropped under the primary-only filter anyway.
 
-## Loop/event amendment — `StepDone` carries per-tool-use display summaries (owned here)
-
-A third owned change, so the **committed** tool card is fully self-contained from the
-Enduring group — including the redacted args summary. That one-liner is the runner's
-per-tool `tool.Auditable.AuditSummary(args)` (e.g. `WriteFile  config.yaml`, not the file
-body); the TUI can't recompute it (it's owned by the runner, unreachable from the display
-layer), and the raw `ToolUseBlock.Input` is unsuitable to dump directly (a
-`WriteFile`/`EditFile` arg *is* the whole file). Today it rides only on the Ephemeral
-`ToolCallStarted`. So:
-
-- **`StepDone` carries a per-tool-use redacted `Summary`** — one per `ToolUseBlock` in the
-  step's `AIMessage`, keyed by `ToolUseID`, filled by the runner's `AuditSummary` at
-  execution (the same value it puts on `ToolCallStarted.Summary`; computed once, emitted on
-  both). Shape: a side slice on the event, e.g.
-  `StepDone.ToolSummaries []ToolUseSummary{ ToolUseID string; Summary string }`,
-  **alongside** `Messages`.
-
-**Layering.** The `Summary` is display/audit metadata, so it lives on the `StepDone`
-*event* (a delivery/display vehicle), **not** inside `content.ToolUseBlock` (semantic model
-content sent back to the provider). This preserves "content is what the model sees" — the
-redacted one-liner never enters model content.
-
-**Consequences:**
-- The committed card's summary is **always present and correlated** within the group (by
-  `ToolUseID`) — no reuse of a droppable event, no name-only fallback, no cross-correlation
-  to the live `ToolCallStarted`. This **removes** the `ToolUseID`-on-tool-events dependency
-  the previous §3.3 draft needed.
-- Tool lifecycle events (`ToolCallStarted`/`Completed`) become *purely* live decoration
-  with **zero** committed-side dependency.
-- Amendment 1 is airtight: with the summary in `StepDone`, the Ephemeral tool events are
-  now **fully** reconstructable from the Enduring group — nothing they show is lost on a
-  drop.
-- Sink-safe: the carried `Summary` is the already-redacted form (the runner's safe
-  one-liner), so it adds no new raw-args exposure to `StepDone` beyond the tool *output* it
-  already carries.
-
 ## What this resolves
 
 - **Displayed != stored (assistant):** committed transcript is `StepDone.Messages`.
@@ -422,12 +402,13 @@ redacted one-liner never enters model content.
   The separate, unstarted `docs/plans/2026-06-18-id-normalization-design.md` will later
   rename these (`CausationID` to `Cause.CommandID`, gate `CallID` to `GateID`, `InputID`
   to `Cause.CommandID`). When those renames land they are **purely cosmetic for this
-  spec** — there is no behavioural dependency on them. In particular, with the third
-  amendment the committed tool card correlates `ToolUseBlock` / `ToolResultMessage` / group
-  `Summary` entirely by the content-level `ToolUseID` (which already exists), so it does
-  **not** need `ToolUseID` added to the live tool events. (The id-normalization doc also
-  still shows `CancelQueuedInput` keeping a `CancelResult` ack — superseded by amendment
-  2's "no ack.")
+  spec** — there is no behavioural dependency on them. In particular the committed tool
+  card needs no id bridge to the live events: it reuses the live card **by position**
+  (i-th block ↔ i-th live card, guarded by tool name) and correlates the fallback result
+  by the content-level `ToolUseID` (`ToolUseBlock.ID == ToolResultMessage.ToolUseID`, which
+  already exists). So it does **not** need `ToolUseID` added to the live tool events. (The
+  id-normalization doc also still shows `CancelQueuedInput` keeping a `CancelResult` ack —
+  superseded by amendment 2's "no ack.")
 - **Deferred: splitting `StepDone`** into a request event (`StepResponded{AIMessage}`
   at stream EOF) + a result event (`StepResolved{ToolResultMessages}` after tools).
   With `ToolCall*` now Ephemeral (amendment above), a subscriber watching a subagent
@@ -457,10 +438,11 @@ redacted one-liner never enters model content.
   collapse.
 - The committed tool card's body equals its `ToolResultMessage` (✓/✗ from
   `ToolResultMessage.IsError`), correlated by `ToolUseBlock.ID ==
-  ToolResultMessage.ToolUseID`; its header summary is the **`StepDone` group's
-  per-tool-use `Summary`** (always present, keyed by `ToolUseID`, no live dependency, no
-  fallback) — a `WriteFile`-style tool shows its summary (path), never the raw file-body
-  args; the live card body comes from `ToolCallCompleted`.
+  ToolResultMessage.ToolUseID`; its header summary is **reused from the resolved live card**
+  (matched by position + tool name) and **falls back to `ToolName` + result, no summary**
+  when no live card streamed (dropped/subagent). A `WriteFile`-style tool shows its summary
+  (path) when live, never the raw file-body args; the live card body comes from
+  `ToolCallCompleted`.
 - An empty-text + tool-use step renders a bold **working-word** headline + child cards
   while live (provisional), and commits to a **`● Done`** headline at `StepDone`; the
   per-card ✓/✗ reflects each tool's outcome.
