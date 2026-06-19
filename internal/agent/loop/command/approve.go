@@ -12,6 +12,10 @@ import (
 // are the observable effect, not a reply on this command).
 type ApproveToolCall struct {
 	Header
+	// Route addresses the loop (and, for full routing, the turn/step/tool call).
+	// The loop's gate routing still matches by CallID for now; Route is carried
+	// alongside so routing can migrate to Route-keyed without breaking callers.
+	Route  Route
 	CallID uuid.UUID
 	Scope  tool.ApprovalScope
 }

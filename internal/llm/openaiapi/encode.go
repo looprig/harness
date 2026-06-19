@@ -87,7 +87,7 @@ func encodeConversation(conv content.Conversation) ([]chatMessage, error) {
 		}
 		return []chatMessage{msg}, nil
 
-	case *content.ToolMessage:
+	case *content.ToolResultMessage:
 		return []chatMessage{{
 			Role:       "tool",
 			Content:    textContent(m.Blocks),

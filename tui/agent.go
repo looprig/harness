@@ -10,6 +10,14 @@ import (
 	"github.com/inventivepotter/urvi/internal/uuid"
 )
 
+// EventStream is the narrow consumer-facing handle the TUI reads whole-session
+// events from. It is event.Subscription — the read+teardown contract the session
+// hub's *EventSubscription satisfies structurally — so the TUI depends on the
+// interface, not the concrete hub type. Events yields the filtered fan-in stream;
+// it closes on Close or on a hub-forced loss, after which Err reports the typed
+// cause (nil for an intentional Close).
+type EventStream = event.Subscription
+
 // Agent is the narrow surface the TUI drives. *personalassistant.Assistant
 // satisfies it structurally; the TUI never imports any agent package.
 type Agent interface {
@@ -19,6 +27,16 @@ type Agent interface {
 	// AcceptsImages reports whether the model accepts image blocks, so buildBlocks
 	// can reject image @path tokens at the boundary instead of failing mid-turn.
 	AcceptsImages() bool
+
+	// Subscribe attaches a whole-session event consumer to the agent's session
+	// fan-in with the given filter and returns its EventStream. It is the seam the
+	// TUI uses to observe events across the entire session (every loop), distinct
+	// from the per-turn StreamBlocks reader: the per-turn reader closes when one
+	// turn ends, whereas a session subscription spans turns and loops. The caller
+	// must Close the returned stream when done. Use DefaultEventFilter for the
+	// single-loop TUI default. The full transport switch from the per-turn reader
+	// to this subscription is owned by the separate TUI-adoption spec.
+	Subscribe(filter event.EventFilter) (EventStream, error)
 
 	// Approve resolves a pending tool-call permission gate, granting it at the
 	// chosen persistence scope. callID identifies the gate (carried on the
@@ -31,6 +49,24 @@ type Agent interface {
 	// identified by callID. It is the TUI-facing name for the session's
 	// ProvideUserInput; the wrapper delegates to it.
 	ProvideAnswer(ctx context.Context, callID uuid.UUID, answer string) error
+}
+
+// DefaultEventFilter is the single-loop TUI's declared interest for a session
+// subscription: live Ephemeral tokens (TokenDelta) from the PRIMARY loop only, and
+// Enduring events (StepDone, gates, tool lifecycle, terminals) from EVERY loop.
+// This is the spec's example filter — a TUI streams the primary loop's tokens live
+// while still seeing the finalized output of any subagent loop (those appear
+// collapsed-but-present, attributed by Header.LoopID). Session-scoped events
+// (SessionStarted/Active/Idle/Stopped) bypass the loop filter and always deliver.
+//
+// primaryLoopID names the loop whose live token firehose the TUI wants; a
+// subagent's tokens, excluded by the Ephemeral scope, never even enter the
+// subscriber's egress buffer.
+func DefaultEventFilter(primaryLoopID uuid.UUID) event.EventFilter {
+	return event.EventFilter{
+		Ephemeral: event.LoopScope{Loops: map[uuid.UUID]struct{}{primaryLoopID: {}}},
+		Enduring:  event.LoopScope{All: true},
+	}
 }
 
 // OpenAgent constructs a fresh Agent. The composition root binds it to

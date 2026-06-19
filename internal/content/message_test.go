@@ -12,7 +12,7 @@ func TestConversation_InterfaceCompliance(t *testing.T) {
 	var _ content.Conversation = (*content.UserMessage)(nil)
 	var _ content.Conversation = (*content.AIMessage)(nil)
 	var _ content.Conversation = (*content.SystemMessage)(nil)
-	var _ content.Conversation = (*content.ToolMessage)(nil)
+	var _ content.Conversation = (*content.ToolResultMessage)(nil)
 }
 
 func TestRole_Constants(t *testing.T) {
@@ -120,19 +120,19 @@ type sysMsgAccessor struct{ m *content.SystemMessage }
 func (a *sysMsgAccessor) GetRole() content.Role      { return a.m.Role }
 func (a *sysMsgAccessor) GetBlocks() []content.Block { return a.m.Blocks }
 
-func TestToolMessage_Fields(t *testing.T) {
+func TestToolResultMessage_Fields(t *testing.T) {
 	block := content.Block(&content.ToolResultBlock{ToolUseID: "tu_1"})
 
 	tests := []struct {
 		name          string
-		msg           *content.ToolMessage
+		msg           *content.ToolResultMessage
 		wantRole      content.Role
 		wantToolUseID string
 		wantBlockLen  int
 	}{
 		{
-			name: "ToolMessage has embedded Message and ToolUseID",
-			msg: &content.ToolMessage{
+			name: "ToolResultMessage has embedded Message and ToolUseID",
+			msg: &content.ToolResultMessage{
 				Message:   content.Message{Role: content.RoleTool, Blocks: []content.Block{block}},
 				ToolUseID: "tu_1",
 			},
@@ -141,8 +141,8 @@ func TestToolMessage_Fields(t *testing.T) {
 			wantBlockLen:  1,
 		},
 		{
-			name: "ToolMessage with no blocks",
-			msg: &content.ToolMessage{
+			name: "ToolResultMessage with no blocks",
+			msg: &content.ToolResultMessage{
 				Message:   content.Message{Role: content.RoleTool},
 				ToolUseID: "tu_2",
 			},
@@ -152,7 +152,7 @@ func TestToolMessage_Fields(t *testing.T) {
 		},
 		{
 			name: "empty ToolUseID",
-			msg: &content.ToolMessage{
+			msg: &content.ToolResultMessage{
 				Message:   content.Message{Role: content.RoleTool},
 				ToolUseID: "",
 			},
@@ -202,7 +202,7 @@ func TestAgenticMessages_MixedTypes(t *testing.T) {
 				&content.SystemMessage{Message: content.Message{Role: content.RoleSystem, Blocks: []content.Block{textBlock}}},
 				&content.UserMessage{Message: content.Message{Role: content.RoleUser, Blocks: []content.Block{textBlock}}},
 				&content.AIMessage{Message: content.Message{Role: content.RoleAssistant, Blocks: []content.Block{textBlock}}},
-				&content.ToolMessage{Message: content.Message{Role: content.RoleTool, Blocks: []content.Block{toolBlock}}, ToolUseID: "tu_1"},
+				&content.ToolResultMessage{Message: content.Message{Role: content.RoleTool, Blocks: []content.Block{toolBlock}}, ToolUseID: "tu_1"},
 			},
 			wantLen: 4,
 		},

@@ -18,6 +18,76 @@ func splitLines(s string) []string {
 	return strings.Split(s, "\n")
 }
 
+// splitStepGroup splits a StepDone.Messages group into its single AIMessage and a
+// ToolUseID→ToolResultMessage index of the tool results that follow it. The step
+// shape is one AIMessage followed by zero or more ToolResultMessages (loop-machine
+// design §Step); a missing AIMessage yields nil so the caller commits no assistant
+// entry. UserMessages (a folded tool-continuation input) and any other message types
+// are ignored — the transcript commits those from their own TurnStarted/TurnFoldedInto
+// events, not from a StepDone group.
+func splitStepGroup(msgs content.AgenticMessages) (*content.AIMessage, map[string]*content.ToolResultMessage) {
+	var ai *content.AIMessage
+	results := make(map[string]*content.ToolResultMessage)
+	for _, msg := range msgs {
+		switch v := msg.(type) {
+		case *content.AIMessage:
+			if ai == nil {
+				ai = v
+			}
+		case *content.ToolResultMessage:
+			results[v.ToolUseID] = v
+		}
+	}
+	return ai, results
+}
+
+// toolUsesOf returns the AIMessage's tool-use blocks in block order — the executable
+// children of the assistant message. A nil message yields nil.
+func toolUsesOf(ai *content.AIMessage) []content.ToolUseBlock {
+	if ai == nil {
+		return nil
+	}
+	var out []content.ToolUseBlock
+	for _, b := range ai.Blocks {
+		if tu, ok := b.(*content.ToolUseBlock); ok {
+			out = append(out, *tu)
+		}
+	}
+	return out
+}
+
+// textOnly concatenates ONLY the narration (TextBlocks) of an assistant message,
+// joined by "\n". Thinking blocks (rendered separately as the dim reasoning block)
+// and tool-use blocks (rendered as their own tool cards) are excluded, so the
+// committed assistant entry's Blocks carry exactly the markdown narration. An
+// all-thinking/all-tool message yields "" (no narration entry).
+func textOnly(blocks []content.Block) string {
+	var parts []string
+	for _, b := range blocks {
+		if tb, ok := b.(*content.TextBlock); ok {
+			parts = append(parts, tb.Text)
+		}
+	}
+	return strings.Join(parts, "\n")
+}
+
+// toolResultText flattens a ToolResultMessage's TextBlocks into one display string.
+// The loop builds a ToolResultMessage carrying a single flattened TextBlock, so this
+// concatenates every TextBlock; non-text blocks are skipped (they have no display
+// form here — the live card's redacted preview is the display path for those).
+func toolResultText(r *content.ToolResultMessage) string {
+	if r == nil {
+		return ""
+	}
+	var b strings.Builder
+	for _, blk := range r.Blocks {
+		if tb, ok := blk.(*content.TextBlock); ok {
+			b.WriteString(tb.Text)
+		}
+	}
+	return b.String()
+}
+
 // displayID is a stable, monotonically assigned identifier for a committed
 // transcript entry. It is allocated once when a live segment is committed and
 // never reused, so a renderer can key on it across re-renders. The zero value is
@@ -125,15 +195,28 @@ type transcriptModel struct {
 
 // ApplyEvent folds one turn-stream event into the model and returns the next
 // model. TurnStarted begins/keeps a live assistant segment; TokenDelta routes
-// *content.TextChunk → live.Text and *content.ThinkingChunk → live.Thinking;
-// TurnDone commits a non-empty live segment. ToolCallStarted/ToolCallCompleted
-// drive the per-call card state machine. PermissionRequested/UserInputRequested
-// are prompt-open boundaries: each commits any pending prose, then commits the
-// FULL prompt context as a kindPromptRecord entry (the live segment is NOT reset —
-// the turn continues while the gate is pending). TurnInterrupted/TurnFailed are
-// the terminals. It returns ONLY the next transcriptModel — no uiAction; prompt
-// clearing on terminals and active-surface control are the interactionModel's job,
-// not the transcript's.
+// *content.TextChunk → live.Text and *content.ThinkingChunk → live.Thinking as a
+// PROVISIONAL live render; ToolCallStarted/ToolCallCompleted drive the live tool
+// cards (in the live tail only — they are not committed to scrollback here).
+//
+// StepDone is the authoritative commit point and the self-heal anchor: it SNAPS the
+// transcript to the loop's finalized StepDone.Messages (the step's AIMessage + its
+// ToolResultMessages), committing that group as separate entries and discarding the
+// provisional live segment — so a dropped/partial TokenDelta never survives past the
+// step boundary, and the displayed transcript equals the committed transcript by
+// construction. A multi-step turn therefore renders as multiple separate assistant +
+// tool entries, never one merged entry.
+//
+// TurnDone is a lifecycle terminal: every completed step already committed via its
+// StepDone, so it only flushes any leftover provisional live (defensive) and resets.
+// PermissionRequested/UserInputRequested are prompt-open boundaries: each commits any
+// pending prose, then commits the FULL prompt context as a kindPromptRecord entry
+// (the live segment is NOT reset — the turn continues while the gate is pending).
+// TurnInterrupted/TurnFailed are the abnormal terminals: the in-flight INCOMPLETE step
+// never emitted a StepDone, so its provisional live is committed (partial work stays
+// visible) before the tombstone/error. It returns ONLY the next transcriptModel — no
+// uiAction; prompt clearing on terminals and active-surface control are the
+// interactionModel's job, not the transcript's.
 func (m transcriptModel) ApplyEvent(ev event.Event) transcriptModel {
 	switch ev := ev.(type) {
 	case event.TurnStarted:
@@ -144,6 +227,8 @@ func (m transcriptModel) ApplyEvent(ev event.Event) transcriptModel {
 		m.toolStarted(ev)
 	case event.ToolCallCompleted:
 		m.toolCompleted(ev)
+	case event.StepDone:
+		m.stepDone(ev)
 	case event.PermissionRequested:
 		m.permissionRequested(ev)
 	case event.UserInputRequested:
@@ -256,13 +341,13 @@ func (m *transcriptModel) applyChunk(c content.Chunk) {
 	}
 }
 
-// commitLive is the TurnDone path: it commits any pending live prose/thinking as
-// one kindAssistant entry (see commitProse), then commits any leftover live.Calls
-// in their CURRENT status (TurnDone is a normal completion, NOT a cancellation —
-// see flushCalls with the identity transform), and finally resets live. In a
-// well-formed stream every call resolves via toolCompleted before TurnDone, so
-// live.Calls is empty here; flushing rather than dropping guarantees a stray
-// unresolved call is never silently lost from the transcript.
+// commitLive is the TurnDone lifecycle path. In a well-formed stream every step
+// already committed via its StepDone (which resets the live segment), so live is
+// empty here and this is a pure reset. It is DEFENSIVE: should a turn somehow end with
+// uncommitted provisional live (no StepDone for an in-flight step), it flushes that
+// prose as one kindAssistant entry and any leftover live.Calls in their CURRENT status
+// (TurnDone is a normal completion, NOT a cancellation — flushCalls with the identity
+// transform), so a stray segment is never silently lost. It finally resets live.
 func (m *transcriptModel) commitLive() {
 	m.commitProse()
 	m.flushCalls(func(c ToolCallView) ToolCallView { return c })
@@ -285,9 +370,11 @@ func (m *transcriptModel) flushCalls(transform func(ToolCallView) ToolCallView) 
 // as one kindAssistant entry (leading ThinkingBlock, then TextBlock; empty blocks
 // omitted), allocates its stable ID, and clears ONLY the prose fields — live.Calls
 // and active are left intact so a running batch survives the prose commit. It is a
-// no-op when there is no pending prose. Committing prose before a tool card (on
-// tool start/complete and on the terminals) is what preserves append-only reading
-// order: prose1 → tool card → prose2.
+// no-op when there is no pending prose. It is the PROVISIONAL-prose path used at the
+// prompt-open boundaries and the abnormal terminals (TurnInterrupted/TurnFailed) to
+// flush an in-flight step's narration before its tombstone/error; the normal,
+// finalized prose path is stepDone → commitStepAssistant (which renders the AIMessage,
+// not the accumulated provisional text).
 func (m *transcriptModel) commitProse() {
 	if m.live.Thinking == "" && m.live.Text == "" {
 		return
@@ -304,12 +391,13 @@ func (m *transcriptModel) commitProse() {
 	m.live.Thinking, m.live.Text = "", ""
 }
 
-// toolStarted records a freshly started tool call. Any pending live prose/thinking
-// is committed FIRST so the assistant narration that precedes the call lands ahead
-// of the tool card in append-only scrollback order; then a running ToolCallView is
-// appended to live.Calls to await its completion.
+// toolStarted records a freshly started tool call as a running card in live.Calls.
+// The card lives in the live tail (the in-progress assistant segment) and is NOT
+// committed to scrollback here: a step's tool cards are committed as a group when its
+// StepDone snaps the finalized step in (or, defensively, when a turn ends with an
+// incomplete in-flight step). It carries the event's redacted Summary so the live and
+// committed cards show the same one-line, secret-free header.
 func (m *transcriptModel) toolStarted(ev event.ToolCallStarted) {
-	m.commitProse()
 	m.live.Calls = append(m.live.Calls, ToolCallView{
 		CallID:   ev.CallID,
 		ToolName: ev.ToolName,
@@ -318,31 +406,97 @@ func (m *transcriptModel) toolStarted(ev event.ToolCallStarted) {
 	})
 }
 
-// toolCompleted resolves the matching live call (by CallID) into exactly one
-// committed kindTool entry at terminal state, then removes it from live.Calls
-// (commit-once: never both live and committed, never double-committed). Pending
-// prose is committed first so any narration interleaved before this completion
-// keeps its order. An unknown CallID is a no-op — no panic, no commit.
+// toolCompleted resolves the matching live call (by CallID) IN PLACE — setting its
+// terminal status and its capped, redacted ResultPreview — so the live tail shows the
+// completed card. It does NOT commit the card or remove it from live.Calls: the card
+// is committed only at the step boundary (StepDone) or, defensively, at the turn
+// terminal. Keeping the resolved live card lets StepDone reuse its redacted
+// Summary/preview when it commits the finalized group (the stored ToolResultMessage
+// carries the raw, uncapped result; the resolved live card carries the display-safe
+// one). An unknown CallID is a no-op — no panic.
 func (m *transcriptModel) toolCompleted(ev event.ToolCallCompleted) {
-	idx := -1
 	for i := range m.live.Calls {
-		if m.live.Calls[i].CallID == ev.CallID {
-			idx = i
-			break
+		if m.live.Calls[i].CallID != ev.CallID {
+			continue
+		}
+		m.live.Calls[i].Status = ToolOK
+		if ev.IsError {
+			m.live.Calls[i].Status = ToolError
+		}
+		m.live.Calls[i].Result = splitLines(ev.ResultPreview)
+		return
+	}
+	// unknown CallID: no-op
+}
+
+// stepDone is the StepDone commit point: it SNAPS the transcript to the loop's
+// finalized step group. It commits the step's AIMessage prose (thinking + narration)
+// as one kindAssistant entry, then each of the AIMessage's ToolUseBlocks as its own
+// kindTool entry — preferring the matching resolved LIVE card (its redacted Summary +
+// capped preview) and falling back to the stored block + ToolResultMessage when no
+// live card streamed (e.g. a dropped ToolCallStarted, or a subagent-loop step the TUI
+// only sees finalized). Committing prose first then tools mirrors the AIMessage block
+// order; a multi-step turn therefore renders as separate per-step groups, never
+// merged. After committing, the provisional live segment is reset (active preserved):
+// the dropped/partial TokenDeltas of this step vanish — the self-heal.
+func (m *transcriptModel) stepDone(ev event.StepDone) {
+	ai, results := splitStepGroup(ev.Messages)
+	m.commitStepAssistant(ai)
+	uses := toolUsesOf(ai)
+	for i := range uses {
+		m.commitCall(m.stepToolCard(uses[i], results, i))
+	}
+	// SNAP: drop the provisional live for this step; active stays so the turn's next
+	// step (or its terminal) is still seen as in-progress.
+	active := m.live.active
+	m.live = liveSeg{active: active}
+}
+
+// commitStepAssistant commits the AIMessage's prose (leading ThinkingBlock, then
+// TextBlock) as one kindAssistant entry. A nil AIMessage commits nothing. A
+// tool-use-only message (no thinking, no text) still commits one bare kindAssistant
+// entry so the step's assistant bullet renders ahead of its tool cards (the renderer
+// shows a bare bullet for a card-only segment); a fully empty message commits nothing.
+func (m *transcriptModel) commitStepAssistant(ai *content.AIMessage) {
+	if ai == nil {
+		return
+	}
+	var blocks []content.Block
+	if th := thinkingText(ai.Blocks); th != "" {
+		blocks = append(blocks, &content.ThinkingBlock{Thinking: th})
+	}
+	if tx := textOnly(ai.Blocks); tx != "" {
+		blocks = append(blocks, &content.TextBlock{Text: tx})
+	}
+	if len(blocks) == 0 && len(toolUsesOf(ai)) == 0 {
+		return // nothing to show for this assistant message
+	}
+	m.nextID++
+	m.committed = append(m.committed, entry{ID: m.nextID, Kind: kindAssistant, Blocks: blocks})
+}
+
+// stepToolCard builds the committed ToolCallView for the index-th tool-use block of a
+// step. It prefers the resolved live card at the same position (carrying the redacted
+// Summary and capped preview already shown live); when there is none it falls back to
+// the stored block's tool name and the matching ToolResultMessage text (correlated by
+// ToolUseID). The fallback shows no summary (the redacted summary is not carried in
+// the stored message) and OK status (the stored ToolResultMessage does not preserve an
+// error flag — error display rides the live card's preview path).
+func (m *transcriptModel) stepToolCard(use content.ToolUseBlock, results map[string]*content.ToolResultMessage, idx int) ToolCallView {
+	if idx < len(m.live.Calls) {
+		live := m.live.Calls[idx]
+		if live.ToolName == use.Name {
+			if live.Status == ToolRunning {
+				live.Status = ToolOK // the step finalized: a still-"running" live card resolves OK
+			}
+			return live
 		}
 	}
-	if idx == -1 {
-		return // unknown CallID: no-op
+	card := ToolCallView{ToolName: use.Name, Status: ToolOK}
+	if r, ok := results[use.ID]; ok {
+		card.Result = splitLines(toolResultText(r))
 	}
-	m.commitProse()
-	call := m.live.Calls[idx]
-	call.Status = ToolOK
-	if ev.IsError {
-		call.Status = ToolError
-	}
-	call.Result = splitLines(ev.ResultPreview)
-	m.commitCall(call)
-	m.live.Calls = append(m.live.Calls[:idx], m.live.Calls[idx+1:]...)
+	return card
 }
 
 // commitCall appends one resolved tool call as its own kindTool entry with a fresh

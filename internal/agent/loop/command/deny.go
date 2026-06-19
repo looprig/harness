@@ -8,6 +8,10 @@ import "github.com/inventivepotter/urvi/internal/uuid"
 // (fail-secure). Denial carries no scope — nothing is ever persisted on a deny.
 type DenyToolCall struct {
 	Header
+	// Route addresses the loop (and, for full routing, the turn/step/tool call).
+	// The loop's gate routing still matches by CallID for now; Route is carried
+	// alongside so routing can migrate to Route-keyed without breaking callers.
+	Route  Route
 	CallID uuid.UUID
 }
 

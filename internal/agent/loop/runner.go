@@ -53,7 +53,7 @@ const (
 // result is the package-private outcome of one tool call. Results are returned in
 // the SAME ORDER as the requested calls (the model pairs tool_use↔tool_result by
 // position/ID), and each carries its originating ToolUseBlock.ID so runTurn can
-// build the paired ToolMessage.
+// build the paired ToolResultMessage.
 type result struct {
 	CallID    uuid.UUID
 	ToolUseID string
@@ -330,7 +330,7 @@ func askPermission(
 	}
 }
 
-// applyDecision applies an Approve/Deny reply to r. listen already matched by
+// applyDecision applies an Approve/Deny reply to r. runLoop already matched by
 // CallID + kind; the CallID is re-validated as cheap defence in depth. A non-once
 // approval persists via Grant — a Grant error NEVER fails the call (the user
 // approved THIS call; Grant is best-effort persistence for future calls).
@@ -533,7 +533,7 @@ func previewOf(r result) (string, bool) {
 }
 
 // flattenToText renders a block slice to text for the ResultPreview AND for the
-// ToolMessage runTurn builds (runTurn REUSES this). Text/TextBlock content passes
+// ToolResultMessage runTurn builds (runTurn REUSES this). Text/TextBlock content passes
 // through (concatenated); any non-text block becomes a visible
 // "[unsupported <type>]" placeholder — NEVER empty/silent, so a tool-result is
 // always non-empty on the wire.

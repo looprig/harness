@@ -256,7 +256,7 @@ func (m *Screen) handlePromptResult(msg promptResultMsg) tea.Cmd {
 }
 
 // startTurn begins a turn from blocks. agent.StreamBlocks may fail before a reader
-// exists (TurnBusyError, loop exited, ctx done); on error it commits an error entry
+// exists (TurnRejectedError, loop exited, ctx done); on error it commits an error entry
 // and stays Idle — never Running without a reader, never readNext(nil). On success it
 // transitions to Running and, via startBlink, kicks off the live-surface animation
 // tick (guarded so a queue-advance restart never spawns a parallel loop). It returns

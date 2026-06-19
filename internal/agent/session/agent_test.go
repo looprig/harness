@@ -78,7 +78,7 @@ func (r *recordingSink) sawTerminal() bool {
 
 // turnCausationID returns the CausationID stamped on the first turn-level
 // envelope (skipping the session-level SessionStarted, which has none). The
-// loop sets envelope CausationID to the issuing StartTurn's Header.ID, so a
+// loop sets envelope CausationID to the issuing UserInput's Header.ID, so a
 // non-zero value here proves the session stamped a fresh Header.ID on the command.
 func (r *recordingSink) turnCausationID() (uuid.UUID, bool) {
 	r.mu.Lock()
@@ -126,6 +126,298 @@ func TestNewAgent(t *testing.T) {
 			t.Fatalf("err = %v, want *SessionError{SessionContextDone}", err)
 		}
 	})
+	t.Run("exactly one loop indexed by primaryLoopID", func(t *testing.T) {
+		t.Parallel()
+		s, err := NewAgent(context.Background(), cfg(&stubLLM{chunks: []content.Chunk{textChunk("x")}}))
+		if err != nil {
+			t.Fatalf("NewAgent: %v", err)
+		}
+		t.Cleanup(func() { _ = s.Shutdown(context.Background()) })
+
+		s.loopsMu.RLock()
+		n := len(s.loops)
+		h, ok := s.loops[s.primaryLoopID]
+		s.loopsMu.RUnlock()
+
+		if n != 1 {
+			t.Fatalf("len(loops) = %d, want 1", n)
+		}
+		if !ok {
+			t.Fatal("loops has no entry for primaryLoopID")
+		}
+		if s.primaryLoopID.IsZero() {
+			t.Error("primaryLoopID is zero")
+		}
+		if h.loop == nil {
+			t.Error("primary loopHandle.loop is nil")
+		}
+		// The primary loop has no parent (zero provenance).
+		if h.parent != (loop.Provenance{}) {
+			t.Errorf("primary loopHandle.parent = %+v, want zero Provenance", h.parent)
+		}
+		if h.cancel == nil {
+			t.Error("primary loopHandle.cancel is nil")
+		}
+	})
+}
+
+// TestNewLoop covers NewLoop: it mints a fresh loop id via the session's idGen,
+// derives the loopCtx from sessionCtx, and stores a loopHandle with the given
+// parent provenance and a non-nil cancel.
+func TestNewLoop(t *testing.T) {
+	t.Parallel()
+	parentLoop := mustUUID()
+	parentTurn := mustUUID()
+	tests := []struct {
+		name   string
+		parent loop.Provenance
+	}{
+		{name: "zero parent (primary-style)", parent: loop.Provenance{}},
+		{name: "non-zero parent (subagent-style)", parent: loop.Provenance{LoopID: parentLoop, TurnID: parentTurn}},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			s, err := NewAgent(context.Background(), cfg(&stubLLM{chunks: []content.Chunk{textChunk("x")}}))
+			if err != nil {
+				t.Fatalf("NewAgent: %v", err)
+			}
+			t.Cleanup(func() { _ = s.Shutdown(context.Background()) })
+
+			// Record which ids the session mints from here on, so we can assert the
+			// returned loop id came from idGen.
+			gen := &capturingIDGen{}
+			s.newID = gen.gen
+
+			loopID, err := s.NewLoop(tt.parent, cfg(&stubLLM{chunks: []content.Chunk{textChunk("y")}}))
+			if err != nil {
+				t.Fatalf("NewLoop: %v", err)
+			}
+			if loopID.IsZero() {
+				t.Fatal("NewLoop returned a zero loop id")
+			}
+			minted, ok := gen.last()
+			if !ok || minted != loopID {
+				t.Fatalf("returned loop id %v was not the freshly minted id %v", loopID, minted)
+			}
+			if loopID == s.primaryLoopID {
+				t.Fatal("NewLoop reused the primary loop id, want a distinct id")
+			}
+
+			s.loopsMu.RLock()
+			h, ok := s.loops[loopID]
+			s.loopsMu.RUnlock()
+			if !ok {
+				t.Fatal("NewLoop did not store the loop in the registry")
+			}
+			if h.loop == nil {
+				t.Error("stored loopHandle.loop is nil")
+			}
+			if h.parent != tt.parent {
+				t.Errorf("stored loopHandle.parent = %+v, want %+v", h.parent, tt.parent)
+			}
+			if h.cancel == nil {
+				t.Fatal("stored loopHandle.cancel is nil")
+			}
+
+			// The loopCtx must be derived from sessionCtx: cancelling sessionCtx
+			// (via sessionCancel) must hard-kill the new loop, closing its Done.
+			s.sessionCancel()
+			select {
+			case <-h.loop.Done:
+			case <-time.After(2 * time.Second):
+				t.Fatal("new loop's Done did not close after sessionCancel; loopCtx not derived from sessionCtx")
+			}
+		})
+	}
+}
+
+// TestNewLoopIDGenerationFailure: when idGen fails, NewLoop returns
+// *SessionError{SessionLoopIDGenerationFailed} wrapping the generator error and
+// registers no loop.
+func TestNewLoopIDGenerationFailure(t *testing.T) {
+	t.Parallel()
+	genErr := errors.New("rand source exhausted")
+	s, err := NewAgent(context.Background(), cfg(&stubLLM{chunks: []content.Chunk{textChunk("x")}}))
+	if err != nil {
+		t.Fatalf("NewAgent: %v", err)
+	}
+	t.Cleanup(func() { s.newID = uuid.New; _ = s.Shutdown(context.Background()) })
+
+	s.loopsMu.RLock()
+	before := len(s.loops)
+	s.loopsMu.RUnlock()
+
+	s.newID = func() (uuid.UUID, error) { return uuid.UUID{}, genErr }
+
+	_, err = s.NewLoop(loop.Provenance{}, cfg(&stubLLM{}))
+	var se *SessionError
+	if !errors.As(err, &se) || se.Kind != SessionLoopIDGenerationFailed {
+		t.Fatalf("err = %v, want *SessionError{SessionLoopIDGenerationFailed}", err)
+	}
+	if !errors.Is(err, genErr) {
+		t.Fatalf("err = %v, want it to wrap the generator error", err)
+	}
+
+	s.loopsMu.RLock()
+	after := len(s.loops)
+	s.loopsMu.RUnlock()
+	if after != before {
+		t.Fatalf("registry grew from %d to %d on idGen failure, want no new loop", before, after)
+	}
+}
+
+// TestLoopFor: loopFor(primaryLoopID) resolves the primary loop; a random id
+// misses.
+func TestLoopFor(t *testing.T) {
+	t.Parallel()
+	s, err := NewAgent(context.Background(), cfg(&stubLLM{chunks: []content.Chunk{textChunk("x")}}))
+	if err != nil {
+		t.Fatalf("NewAgent: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Shutdown(context.Background()) })
+
+	if l, ok := s.loopFor(s.primaryLoopID); !ok || l == nil {
+		t.Fatalf("loopFor(primaryLoopID) = (%v, %v), want (non-nil, true)", l, ok)
+	}
+	if l, ok := s.loopFor(mustUUID()); ok || l != nil {
+		t.Fatalf("loopFor(random) = (%v, %v), want (nil, false)", l, ok)
+	}
+	if l, ok := s.loopFor(uuid.UUID{}); ok || l != nil {
+		t.Fatalf("loopFor(zero) = (%v, %v), want (nil, false)", l, ok)
+	}
+}
+
+// TestRoutingMethodsLoopNotFound covers the SessionLoopNotFound branch shared by
+// every routing method: when loopFor(primaryLoopID) misses (the registry has no
+// entry for the primary id), the method must fail secure with
+// *SessionError{SessionLoopNotFound} and send no command. The miss is forced by
+// deleting the primary registry entry under loopsMu after construction, so the
+// id stays set but resolves to nothing — the exact state the branch guards.
+func TestRoutingMethodsLoopNotFound(t *testing.T) {
+	t.Parallel()
+	callID := mustUUID()
+	tests := []struct {
+		name string
+		call func(s *AgentSession) error
+	}{
+		{name: "Invoke", call: func(s *AgentSession) error { _, err := s.Invoke(context.Background(), nil); return err }},
+		{name: "Stream", call: func(s *AgentSession) error { _, err := s.Stream(context.Background(), nil); return err }},
+		{name: "Interrupt", call: func(s *AgentSession) error { _, err := s.Interrupt(context.Background()); return err }},
+		// Approve/Deny/ProvideUserInput route through routeCommand, which performs
+		// the same loopFor(primaryLoopID) lookup behind the gate-answer methods.
+		{name: "Approve", call: func(s *AgentSession) error { return s.Approve(context.Background(), callID, tool.ScopeOnce) }},
+		{name: "Deny", call: func(s *AgentSession) error { return s.Deny(context.Background(), callID) }},
+		{name: "ProvideUserInput", call: func(s *AgentSession) error { return s.ProvideUserInput(context.Background(), callID, "x") }},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			s, cmds, _ := sessionWithFakeLoop() // Commands never read: a send would block forever
+
+			// Force loopFor(primaryLoopID) to miss by deleting the primary entry
+			// while leaving primaryLoopID set. The routing method must short-circuit
+			// before ever touching the (unread) Commands channel.
+			s.loopsMu.Lock()
+			delete(s.loops, s.primaryLoopID)
+			s.loopsMu.Unlock()
+
+			errCh := make(chan error, 1)
+			go func() { errCh <- tt.call(s) }()
+
+			select {
+			case err := <-errCh:
+				var se *SessionError
+				if !errors.As(err, &se) || se.Kind != SessionLoopNotFound {
+					t.Fatalf("err = %v, want *SessionError{SessionLoopNotFound}", err)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("method blocked on a missing loop (no SessionLoopNotFound short-circuit)")
+			}
+
+			// No command may have been sent: the fake loop's Commands channel is
+			// unbuffered and never read, so any send would have blocked the goroutine
+			// above (which instead returned an error). A non-blocking receive must miss.
+			select {
+			case cmd := <-cmds:
+				t.Fatalf("method sent %T on a missing-loop path, want no command", cmd)
+			default:
+			}
+		})
+	}
+}
+
+// TestNewLoopReturnsLoopNewError covers NewLoop's loop.New error path: when
+// loop.New fails its own Config validation, NewLoop must (a) return that error
+// unwrapped (a *loop.ConfigError, NOT a *SessionError — the id generation
+// already succeeded), (b) leave the registry unmutated (no handle stored), and
+// (c) cancel the derived loopCtx so the session leaks no context.
+//
+// The cheapest loop.New validation failure is a nil Client, which short-circuits
+// to *loop.ConfigError{ConfigMissingClient} synchronously, before any goroutine
+// or LLM is involved. Cancellation of the derived loopCtx is asserted
+// structurally: NewLoop derives loopCtx from s.sessionCtx and, on the loop.New
+// error, sessionCtx must still be live (NewLoop must cancel only the child, never
+// the session). The child loopCtx is local to NewLoop and cannot be captured
+// without changing production code, so the cancel-observation here is
+// structural-only (the cancel() call sits on the asserted error path); the
+// positive guard is that sessionCtx itself was NOT cancelled.
+func TestNewLoopReturnsLoopNewError(t *testing.T) {
+	t.Parallel()
+	sessionCtx, sessionCancel := context.WithCancel(context.Background())
+	t.Cleanup(sessionCancel)
+	primaryLoopID := mustUUID()
+	s := &AgentSession{
+		SessionID:     mustUUID(),
+		sessionCtx:    sessionCtx,
+		sessionCancel: sessionCancel,
+		loops:         map[uuid.UUID]*loopHandle{primaryLoopID: {}},
+		primaryLoopID: primaryLoopID,
+		newID:         uuid.New, // id mint succeeds; only loop.New must fail
+	}
+
+	s.loopsMu.RLock()
+	before := len(s.loops)
+	s.loopsMu.RUnlock()
+
+	// loop.New rejects a nil Client with *ConfigError{ConfigMissingClient} before
+	// starting any goroutine — the cheapest validation failure to inject.
+	badCfg := loop.Config{Model: llm.ModelSpec{Model: "m"}}
+	loopID, err := s.NewLoop(loop.Provenance{}, badCfg)
+
+	// (a) the loop.New error is returned, unwrapped, not remapped to *SessionError.
+	if err == nil {
+		t.Fatal("NewLoop returned nil error, want loop.New's ConfigError")
+	}
+	if !loopID.IsZero() {
+		t.Errorf("NewLoop returned loop id %v on error, want zero", loopID)
+	}
+	var ce *loop.ConfigError
+	if !errors.As(err, &ce) || ce.Kind != loop.ConfigMissingClient {
+		t.Fatalf("err = %v, want *loop.ConfigError{ConfigMissingClient}", err)
+	}
+	var se *SessionError
+	if errors.As(err, &se) {
+		t.Fatalf("err = %v, want the raw loop.New error, not a *SessionError", err)
+	}
+
+	// (b) the registry must be unchanged: no handle stored for the failed loop.
+	s.loopsMu.RLock()
+	after := len(s.loops)
+	s.loopsMu.RUnlock()
+	if after != before {
+		t.Fatalf("registry size changed from %d to %d on loop.New failure, want unchanged", before, after)
+	}
+
+	// (c) structural cancel guard: NewLoop must cancel ONLY the derived loopCtx,
+	// never the session backstop. sessionCtx must still be live after the error.
+	select {
+	case <-sessionCtx.Done():
+		t.Fatal("NewLoop cancelled sessionCtx on the loop.New error path, want only the derived loopCtx cancelled")
+	default:
+	}
 }
 
 // capturingIDGen records every ID it mints so a test can assert the session
@@ -154,6 +446,18 @@ func (g *capturingIDGen) last() (uuid.UUID, bool) {
 		return uuid.UUID{}, false
 	}
 	return g.ids[len(g.ids)-1], true
+}
+
+// first returns the earliest minted id — the turn-initiating command's id (the
+// UserInput for Invoke/Stream). A later Stream.Close mints a second id for its
+// best-effort Interrupt, so the observable turn CausationID is the FIRST mint.
+func (g *capturingIDGen) first() (uuid.UUID, bool) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if len(g.ids) == 0 {
+		return uuid.UUID{}, false
+	}
+	return g.ids[0], true
 }
 
 // TestStampsCommandHeaderID asserts every command-sending method stamps a
@@ -236,12 +540,19 @@ func TestStampsCommandHeaderID(t *testing.T) {
 				t.Fatal("session stamped a zero Header.ID on the command")
 			}
 			if tt.observeable {
+				// The turn-initiating command (the UserInput) is the FIRST mint; a
+				// Stream.Close fires a best-effort Interrupt that mints a later id, so
+				// compare the observable CausationID against the first.
+				turnID, ok := gen.first()
+				if !ok {
+					t.Fatal("session minted no command-Header ID")
+				}
 				cid, ok := sink.turnCausationID()
 				if !ok {
 					t.Fatal("no turn-level envelope captured")
 				}
-				if cid != minted {
-					t.Fatalf("envelope CausationID = %v, want stamped Header.ID %v", cid, minted)
+				if cid != turnID {
+					t.Fatalf("envelope CausationID = %v, want stamped Header.ID %v", cid, turnID)
 				}
 			}
 		})
@@ -375,9 +686,38 @@ func TestConcurrentInvokeIsRejected(t *testing.T) {
 	time.Sleep(30 * time.Millisecond) // let the first turn occupy the loop
 
 	_, err = s.Invoke(context.Background(), nil)
-	var be *command.TurnBusyError
-	if !errors.As(err, &be) {
-		t.Fatalf("second Invoke err = %v, want *command.TurnBusyError", err)
+	var rej *TurnRejectedError
+	if !errors.As(err, &rej) || rej.Reason != command.RejectBusy {
+		t.Fatalf("second Invoke err = %v, want *TurnRejectedError{RejectBusy}", err)
+	}
+}
+
+// TestStreamBusyRejected asserts Stream is also start-or-reject: a second Stream
+// while a turn occupies the loop returns *TurnRejectedError{RejectBusy} (the
+// TurnRejected disposition mapped to a typed error), never a reader.
+func TestStreamBusyRejected(t *testing.T) {
+	t.Parallel()
+	s, err := NewAgent(context.Background(), cfg(&stubLLM{blockUntilCancel: true}))
+	if err != nil {
+		t.Fatalf("NewAgent: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Shutdown(context.Background()) })
+
+	ctx1, cancel1 := context.WithCancel(context.Background())
+	defer cancel1()
+	started := make(chan struct{})
+	go func() { close(started); _, _ = s.Invoke(ctx1, nil) }()
+	<-started
+	time.Sleep(30 * time.Millisecond) // let the first turn occupy the loop
+
+	sr, err := s.Stream(context.Background(), nil)
+	if sr != nil {
+		_ = sr.Close()
+		t.Fatal("Stream returned a reader while the loop was busy, want nil + TurnRejectedError")
+	}
+	var rej *TurnRejectedError
+	if !errors.As(err, &rej) || rej.Reason != command.RejectBusy {
+		t.Fatalf("Stream while busy err = %v, want *TurnRejectedError{RejectBusy}", err)
 	}
 }
 
@@ -507,7 +847,7 @@ func TestStreamCloseCancelsTurn(t *testing.T) {
 	}
 
 	// session must be usable again: a subsequent Invoke is accepted by the loop
-	// (not rejected with TurnBusyError). Because the loop's client blocks until
+	// (not rejected with TurnRejectedError). Because the loop's client blocks until
 	// ctx cancel, drive the new turn with a short-timeout ctx; acceptance + a
 	// TurnInterrupted terminal proves the session was released by Close.
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
@@ -587,9 +927,9 @@ func TestStreamDrainReleasesSession(t *testing.T) {
 				}
 				break
 			}
-			var be *command.TurnBusyError
-			if !errors.As(err, &be) {
-				t.Fatalf("Invoke after early close = %v, want nil or TurnBusyError", err)
+			var rej *TurnRejectedError
+			if !errors.As(err, &rej) {
+				t.Fatalf("Invoke after early close = %v, want nil or *TurnRejectedError", err)
 			}
 			select {
 			case <-deadline:
@@ -741,10 +1081,17 @@ func TestShutdownSurfacesLoopTerminatedError(t *testing.T) {
 func sessionWithFakeLoop() (s *AgentSession, cmds chan command.Command, done chan struct{}) {
 	cmds = make(chan command.Command)
 	done = make(chan struct{})
+	sessionCtx, sessionCancel := context.WithCancel(context.Background())
+	primaryLoopID := mustUUID()
 	s = &AgentSession{
-		SessionID: mustUUID(),
-		loop:      &loop.Loop{Commands: cmds, Done: done},
-		newID:     uuid.New,
+		SessionID:     mustUUID(),
+		sessionCtx:    sessionCtx,
+		sessionCancel: sessionCancel,
+		loops: map[uuid.UUID]*loopHandle{
+			primaryLoopID: {loop: &loop.Loop{Commands: cmds, Done: done}},
+		},
+		primaryLoopID: primaryLoopID,
+		newID:         uuid.New,
 	}
 	return s, cmds, done
 }

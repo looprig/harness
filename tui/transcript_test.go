@@ -65,6 +65,42 @@ func thinkingChunk(s string) event.Event {
 	return event.TokenDelta{Chunk: &content.ThinkingChunk{Thinking: s}}
 }
 
+// aiMessage builds an *content.AIMessage from leading thinking, narration text, and
+// any tool-use blocks (each by id+name), in that block order. Empty thinking/text
+// are omitted so the blocks mirror the materialized AIMessage shape.
+func aiMessage(thinking, text string, tools ...content.ToolUseBlock) *content.AIMessage {
+	var blocks []content.Block
+	if thinking != "" {
+		blocks = append(blocks, &content.ThinkingBlock{Thinking: thinking})
+	}
+	if text != "" {
+		blocks = append(blocks, &content.TextBlock{Text: text})
+	}
+	for i := range tools {
+		tb := tools[i]
+		blocks = append(blocks, &tb)
+	}
+	return &content.AIMessage{Message: content.Message{Role: content.RoleAssistant, Blocks: blocks}}
+}
+
+// toolUse builds a ToolUseBlock with the given provider id, name, and raw input.
+func toolUse(id, name, input string) content.ToolUseBlock {
+	return content.ToolUseBlock{ID: id, Name: name, Input: []byte(input)}
+}
+
+// toolResult builds a *content.ToolResultMessage answering toolUseID with text.
+func toolResult(toolUseID, text string) *content.ToolResultMessage {
+	return &content.ToolResultMessage{
+		Message:   content.Message{Role: content.RoleTool, Blocks: []content.Block{&content.TextBlock{Text: text}}},
+		ToolUseID: toolUseID,
+	}
+}
+
+// stepDone builds an event.StepDone carrying the given finalized group.
+func stepDone(msgs ...content.Conversation) event.Event {
+	return event.StepDone{Messages: content.AgenticMessages(msgs)}
+}
+
 // blockText returns the Text of b if it is a *content.TextBlock, else "".
 func blockText(b content.Block) string {
 	if tb, ok := b.(*content.TextBlock); ok {
@@ -220,10 +256,10 @@ func TestTranscriptApplyEvent(t *testing.T) {
 				event.TurnDone{},
 			},
 			want: func(t *testing.T, m transcriptModel) {
-				// commit-once: completed call already committed and removed from live;
-				// TurnDone's flush must NOT re-commit it.
+				// Defensive commitLive path (no StepDone for this step): the resolved
+				// live card is flushed exactly once by TurnDone — never duplicated.
 				if len(m.committed) != 1 {
-					t.Fatalf("committed = %d, want exactly 1 (commit-once, no duplication)", len(m.committed))
+					t.Fatalf("committed = %d, want exactly 1 (flushed once, no duplication)", len(m.committed))
 				}
 				if m.committed[0].Kind != kindTool {
 					t.Errorf("committed[0].Kind = %v, want kindTool", m.committed[0].Kind)
@@ -364,30 +400,22 @@ func TestTranscriptToolCalls(t *testing.T) {
 			},
 		},
 		{
-			name: "ToolCallCompleted (ok) commits one kindTool entry and removes it from live",
+			name: "ToolCallCompleted (ok) resolves the live card IN PLACE (no commit until StepDone)",
 			events: []event.Event{
 				event.TurnStarted{},
 				toolStarted(callID(1), "Bash", "ls"),
 				toolCompleted(callID(1), false, "file1\nfile2"),
 			},
 			want: func(t *testing.T, m transcriptModel) {
-				if len(m.live.Calls) != 0 {
-					t.Fatalf("live.Calls = %d, want 0 (commit-once removes it)", len(m.live.Calls))
+				// The card stays in the live tail, resolved; nothing is committed yet —
+				// committing is the step boundary's job (StepDone), not the event's.
+				if len(m.committed) != 0 {
+					t.Fatalf("committed = %d, want 0 (no StepDone/terminal yet)", len(m.committed))
 				}
-				if len(m.committed) != 1 {
-					t.Fatalf("committed = %d, want exactly 1", len(m.committed))
+				if len(m.live.Calls) != 1 {
+					t.Fatalf("live.Calls = %d, want 1 (resolved in place, not removed)", len(m.live.Calls))
 				}
-				e := m.committed[0]
-				if e.Kind != kindTool {
-					t.Errorf("Kind = %v, want kindTool", e.Kind)
-				}
-				if e.ID == 0 {
-					t.Errorf("entry ID = 0, want nonzero stable ID")
-				}
-				if len(e.Calls) != 1 {
-					t.Fatalf("entry Calls = %d, want 1", len(e.Calls))
-				}
-				c := e.Calls[0]
+				c := m.live.Calls[0]
 				if c.Status != ToolOK {
 					t.Errorf("Status = %v, want ToolOK", c.Status)
 				}
@@ -397,20 +425,20 @@ func TestTranscriptToolCalls(t *testing.T) {
 			},
 		},
 		{
-			name: "ToolCallCompleted (error) commits one kindTool entry in ToolError",
+			name: "ToolCallCompleted (error) resolves the live card to ToolError in place",
 			events: []event.Event{
 				event.TurnStarted{},
 				toolStarted(callID(2), "Fetch", "GET /x"),
 				toolCompleted(callID(2), true, "boom"),
 			},
 			want: func(t *testing.T, m transcriptModel) {
-				if len(m.live.Calls) != 0 {
-					t.Fatalf("live.Calls = %d, want 0", len(m.live.Calls))
+				if len(m.committed) != 0 {
+					t.Fatalf("committed = %d, want 0 (no StepDone/terminal yet)", len(m.committed))
 				}
-				if len(m.committed) != 1 {
-					t.Fatalf("committed = %d, want 1", len(m.committed))
+				if len(m.live.Calls) != 1 {
+					t.Fatalf("live.Calls = %d, want 1", len(m.live.Calls))
 				}
-				c := m.committed[0].Calls[0]
+				c := m.live.Calls[0]
 				if c.Status != ToolError {
 					t.Errorf("Status = %v, want ToolError", c.Status)
 				}
@@ -420,26 +448,40 @@ func TestTranscriptToolCalls(t *testing.T) {
 			},
 		},
 		{
-			name: "two tool calls commit two distinct kindTool entries with distinct IDs",
+			name: "StepDone commits the resolved live cards' redacted Summary/preview by position",
 			events: []event.Event{
 				event.TurnStarted{},
 				toolStarted(callID(1), "Bash", "a"),
 				toolCompleted(callID(1), false, "out1"),
 				toolStarted(callID(2), "Bash", "b"),
 				toolCompleted(callID(2), false, "out2"),
+				// The finalized step group: two tool-use blocks, in the same order.
+				stepDone(
+					aiMessage("", "", toolUse("tu-1", "Bash", `{}`), toolUse("tu-2", "Bash", `{}`)),
+					toolResult("tu-1", "out1"),
+					toolResult("tu-2", "out2"),
+				),
 			},
 			want: func(t *testing.T, m transcriptModel) {
-				if len(m.committed) != 2 {
-					t.Fatalf("committed = %d, want 2", len(m.committed))
+				// bare assistant (card-only) + two tool entries.
+				if len(m.committed) != 3 {
+					t.Fatalf("committed = %d, want 3 (bare assistant, tool, tool)", len(m.committed))
 				}
-				if m.committed[0].Kind != kindTool || m.committed[1].Kind != kindTool {
-					t.Errorf("kinds = %v,%v, want kindTool both", m.committed[0].Kind, m.committed[1].Kind)
+				if m.committed[1].Kind != kindTool || m.committed[2].Kind != kindTool {
+					t.Errorf("kinds = %v,%v, want kindTool both", m.committed[1].Kind, m.committed[2].Kind)
 				}
-				if m.committed[0].ID == m.committed[1].ID {
-					t.Errorf("tool entry IDs not distinct: both %d", m.committed[0].ID)
+				if m.committed[1].ID == m.committed[2].ID {
+					t.Errorf("tool entry IDs not distinct: both %d", m.committed[1].ID)
 				}
-				if len(m.live.Calls) != 0 {
-					t.Errorf("live.Calls = %d, want 0", len(m.live.Calls))
+				// The committed cards reuse the LIVE cards' redacted Summary by position.
+				if got := m.committed[1].Calls[0].Summary; got != "a" {
+					t.Errorf("tool[0] Summary = %q, want the redacted live summary %q", got, "a")
+				}
+				if got := m.committed[2].Calls[0].Summary; got != "b" {
+					t.Errorf("tool[1] Summary = %q, want the redacted live summary %q", got, "b")
+				}
+				if !m.live.empty() {
+					t.Errorf("live not reset after StepDone: %+v", m.live)
 				}
 			},
 		},
@@ -471,19 +513,28 @@ func TestTranscriptToolCalls(t *testing.T) {
 	}
 }
 
-// TestTranscriptOrdering locks the append-only scrollback ordering rule: prose
-// streamed BEFORE a tool call is committed as its own assistant entry ahead of the
-// tool card, and prose streamed AFTER lands in a later assistant entry — yielding
-// the natural reading order prose1 → tool card → prose2.
+// TestTranscriptOrdering locks the per-step append-only ordering rule under the
+// StepDone-group model: within a step the AIMessage prose commits as its own
+// assistant entry AHEAD of that step's tool card, and a SECOND step's prose lands in a
+// later assistant entry — yielding the natural reading order prose1 → tool card →
+// prose2 across two StepDone groups (the OLD single-turn interleave maps onto two
+// steps now).
 func TestTranscriptOrdering(t *testing.T) {
 	t.Parallel()
 	var m transcriptModel
 	for _, ev := range []event.Event{
 		event.TurnStarted{},
+		// Step 1: prose then a tool use, finalized.
 		textChunk("before tool"),
 		toolStarted(callID(1), "Bash", "run"),
 		toolCompleted(callID(1), false, "done"),
+		stepDone(
+			aiMessage("", "before tool", toolUse("tu-1", "Bash", `{}`)),
+			toolResult("tu-1", "done"),
+		),
+		// Step 2: the trailing prose, finalized.
 		textChunk("after tool"),
+		stepDone(aiMessage("", "after tool")),
 		event.TurnDone{},
 	} {
 		m = m.ApplyEvent(ev)
@@ -491,7 +542,7 @@ func TestTranscriptOrdering(t *testing.T) {
 	if len(m.committed) != 3 {
 		t.Fatalf("committed = %d, want 3 (prose1, tool, prose2)", len(m.committed))
 	}
-	// [0] assistant prose committed BEFORE the tool card.
+	// [0] step-1 assistant prose committed BEFORE the tool card.
 	if m.committed[0].Kind != kindAssistant {
 		t.Fatalf("committed[0].Kind = %v, want kindAssistant", m.committed[0].Kind)
 	}
@@ -502,7 +553,7 @@ func TestTranscriptOrdering(t *testing.T) {
 	if m.committed[1].Kind != kindTool {
 		t.Errorf("committed[1].Kind = %v, want kindTool", m.committed[1].Kind)
 	}
-	// [2] the trailing prose, AFTER the tool card.
+	// [2] step-2 prose, AFTER the tool card.
 	if m.committed[2].Kind != kindAssistant {
 		t.Fatalf("committed[2].Kind = %v, want kindAssistant", m.committed[2].Kind)
 	}
@@ -623,6 +674,200 @@ func TestTranscriptTerminals(t *testing.T) {
 			}
 			tt.want(t, m)
 		})
+	}
+}
+
+// TestTranscriptStepDoneSelfHeal locks the StepDone-group rendering + self-heal
+// contract (Phase 11.2): provisional live prose accumulated from TokenDeltas is
+// REPLACED by the finalized StepDone.Messages on commit (a dropped/partial delta
+// does not survive past StepDone), the committed entries are built from the stored
+// AIMessage (+ its ToolResultMessages), and the live segment is reset to empty.
+func TestTranscriptStepDoneSelfHeal(t *testing.T) {
+	tests := []struct {
+		name   string
+		events []event.Event
+		want   func(t *testing.T, m transcriptModel)
+	}{
+		{
+			name: "no-tool step: provisional text replaced by finalized AIMessage prose",
+			events: []event.Event{
+				event.TurnStarted{},
+				// Provisional/partial deltas: a torn stream that dropped the tail.
+				thinkingChunk("because rea"),
+				textChunk("the ans"),
+				// The authoritative finalized group: full thinking + full text.
+				stepDone(aiMessage("because reasons", "the answer")),
+			},
+			want: func(t *testing.T, m transcriptModel) {
+				if len(m.committed) != 1 {
+					t.Fatalf("committed = %d, want exactly 1 (the finalized AIMessage)", len(m.committed))
+				}
+				e := m.committed[0]
+				if e.Kind != kindAssistant {
+					t.Fatalf("committed[0].Kind = %v, want kindAssistant", e.Kind)
+				}
+				if e.ID == 0 {
+					t.Errorf("entry ID = 0, want nonzero stable ID")
+				}
+				// SNAP: the finalized message, NOT the partial provisional text.
+				if got := thinkingText(e.Blocks); got != "because reasons" {
+					t.Errorf("committed thinking = %q, want finalized %q (self-heal)", got, "because reasons")
+				}
+				if got := assistantText(e.Blocks); got != "the answer" {
+					t.Errorf("committed text = %q, want finalized %q (self-heal)", got, "the answer")
+				}
+				// the provisional live segment is gone: dropped deltas do not survive.
+				if !m.live.empty() {
+					t.Errorf("live not reset after StepDone: %+v", m.live)
+				}
+			},
+		},
+		{
+			name: "provisional text that OVER-ran the finalized message is discarded on snap",
+			events: []event.Event{
+				event.TurnStarted{},
+				// A stale/duplicated provisional render: longer than the truth.
+				textChunk("the answer is forty-two and then some garbage"),
+				stepDone(aiMessage("", "the answer is forty-two")),
+			},
+			want: func(t *testing.T, m transcriptModel) {
+				if len(m.committed) != 1 {
+					t.Fatalf("committed = %d, want 1", len(m.committed))
+				}
+				if got := assistantText(m.committed[0].Blocks); got != "the answer is forty-two" {
+					t.Errorf("committed text = %q, want the finalized %q (provisional discarded)", got, "the answer is forty-two")
+				}
+			},
+		},
+		{
+			name: "tool-using step: AIMessage prose entry then a separate tool entry carrying the result",
+			events: []event.Event{
+				event.TurnStarted{},
+				textChunk("let me check"),
+				stepDone(
+					aiMessage("", "let me check", toolUse("tu-1", "Grep", `{"q":"x"}`)),
+					toolResult("tu-1", "match\nanother"),
+				),
+			},
+			want: func(t *testing.T, m transcriptModel) {
+				// SEPARATE entries: the assistant prose, then the tool card. NOT merged.
+				if len(m.committed) != 2 {
+					t.Fatalf("committed = %d, want 2 (assistant prose, tool)", len(m.committed))
+				}
+				if m.committed[0].Kind != kindAssistant {
+					t.Errorf("committed[0].Kind = %v, want kindAssistant", m.committed[0].Kind)
+				}
+				if got := assistantText(m.committed[0].Blocks); got != "let me check" {
+					t.Errorf("assistant text = %q, want %q", got, "let me check")
+				}
+				tool := m.committed[1]
+				if tool.Kind != kindTool {
+					t.Fatalf("committed[1].Kind = %v, want kindTool", tool.Kind)
+				}
+				if len(tool.Calls) != 1 {
+					t.Fatalf("tool entry Calls = %d, want 1", len(tool.Calls))
+				}
+				c := tool.Calls[0]
+				if c.ToolName != "Grep" {
+					t.Errorf("tool name = %q, want %q", c.ToolName, "Grep")
+				}
+				if len(c.Result) != 2 || c.Result[0] != "match" || c.Result[1] != "another" {
+					t.Errorf("tool result = %#v, want [match another] (from the stored ToolResultMessage)", c.Result)
+				}
+				// IDs strictly increasing in commit order.
+				if !(m.committed[0].ID < m.committed[1].ID) {
+					t.Errorf("IDs not increasing: %d, %d", m.committed[0].ID, m.committed[1].ID)
+				}
+				if !m.live.empty() {
+					t.Errorf("live not reset after StepDone: %+v", m.live)
+				}
+			},
+		},
+		{
+			name: "tool-use-only step (no narration) commits a bare assistant entry then the tool entry",
+			events: []event.Event{
+				event.TurnStarted{},
+				stepDone(
+					aiMessage("", "", toolUse("tu-9", "ReadFile", `{"path":"a"}`)),
+					toolResult("tu-9", "contents"),
+				),
+			},
+			want: func(t *testing.T, m transcriptModel) {
+				if len(m.committed) != 2 {
+					t.Fatalf("committed = %d, want 2 (bare assistant, tool)", len(m.committed))
+				}
+				if m.committed[0].Kind != kindAssistant {
+					t.Errorf("committed[0].Kind = %v, want kindAssistant (bare bullet)", m.committed[0].Kind)
+				}
+				if m.committed[1].Kind != kindTool {
+					t.Errorf("committed[1].Kind = %v, want kindTool", m.committed[1].Kind)
+				}
+				if m.committed[1].Calls[0].ToolName != "ReadFile" {
+					t.Errorf("tool name = %q, want ReadFile", m.committed[1].Calls[0].ToolName)
+				}
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			var m transcriptModel
+			for _, ev := range tt.events {
+				m = m.ApplyEvent(ev)
+			}
+			tt.want(t, m)
+		})
+	}
+}
+
+// TestTranscriptMultiStepSeparateEntries locks that a multi-step (tool-using) turn
+// renders as MULTIPLE separate assistant + tool entries, in order — never collapsed
+// into one merged entry. Two StepDone groups (a tool step then a final no-tool
+// answer) followed by the lifecycle TurnDone must yield: assistant, tool, assistant.
+func TestTranscriptMultiStepSeparateEntries(t *testing.T) {
+	t.Parallel()
+	var m transcriptModel
+	for _, ev := range []event.Event{
+		event.TurnStarted{},
+		// Step 1: assistant asks for a tool; its result comes back.
+		textChunk("checking"),
+		stepDone(
+			aiMessage("", "checking", toolUse("tu-1", "Bash", `{"cmd":"ls"}`)),
+			toolResult("tu-1", "file1\nfile2"),
+		),
+		// Step 2: the final no-tool answer.
+		textChunk("all done"),
+		stepDone(aiMessage("", "all done")),
+		// Lifecycle terminal: no new content (every step already committed via StepDone).
+		event.TurnDone{},
+	} {
+		m = m.ApplyEvent(ev)
+	}
+
+	if len(m.committed) != 3 {
+		t.Fatalf("committed = %d, want 3 (step1 assistant, step1 tool, step2 assistant) — NOT merged", len(m.committed))
+	}
+	wantKinds := []entryKind{kindAssistant, kindTool, kindAssistant}
+	for i, want := range wantKinds {
+		if m.committed[i].Kind != want {
+			t.Errorf("committed[%d].Kind = %v, want %v", i, m.committed[i].Kind, want)
+		}
+	}
+	if got := assistantText(m.committed[0].Blocks); got != "checking" {
+		t.Errorf("step1 assistant text = %q, want %q", got, "checking")
+	}
+	if c := m.committed[1].Calls[0]; c.ToolName != "Bash" {
+		t.Errorf("step1 tool name = %q, want Bash", c.ToolName)
+	}
+	if got := assistantText(m.committed[2].Blocks); got != "all done" {
+		t.Errorf("step2 assistant text = %q, want %q", got, "all done")
+	}
+	// IDs strictly increasing in commit order across both steps.
+	if !(m.committed[0].ID < m.committed[1].ID && m.committed[1].ID < m.committed[2].ID) {
+		t.Errorf("IDs not strictly increasing: %d,%d,%d", m.committed[0].ID, m.committed[1].ID, m.committed[2].ID)
+	}
+	if !m.live.empty() || m.live.active {
+		t.Errorf("live not reset after the turn: %+v", m.live)
 	}
 }
 

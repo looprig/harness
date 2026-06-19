@@ -182,7 +182,7 @@ func (a *Assistant) Send(ctx context.Context, text string) (event.Event, error) 
 // TurnStarted, TokenDelta×N, then one terminal event, then EOF. Callers must
 // read until EOF or call sr.Close(). sr.Close() abandons the stream and
 // interrupts the turn asynchronously, so an immediately following Send may
-// briefly observe *command.TurnBusyError until the cancelled turn unwinds.
+// briefly observe *session.TurnRejectedError until the cancelled turn unwinds.
 func (a *Assistant) Stream(ctx context.Context, text string) (*llm.StreamReader[event.Event], error) {
 	blocks, err := userBlocks(text)
 	if err != nil {
@@ -197,6 +197,22 @@ func (a *Assistant) Stream(ctx context.Context, text string) (*llm.StreamReader[
 func (a *Assistant) StreamBlocks(ctx context.Context, blocks []content.Block) (*llm.StreamReader[event.Event], error) {
 	return a.session.Stream(ctx, blocks)
 }
+
+// Subscribe attaches a whole-session event consumer to the session fan-in with
+// filter and returns its event.Subscription (the session hub's *EventSubscription,
+// which satisfies the interface). It is the seam a TUI/CLI uses to observe events
+// across the whole session — every loop, spanning turns — distinct from the
+// per-turn StreamBlocks reader that closes when one turn ends. The caller Closes
+// the returned subscription when done. PrimaryLoopID is exposed so the caller can
+// build the single-loop default filter (primary-only live tokens, all-loop
+// finalized output).
+func (a *Assistant) Subscribe(filter event.EventFilter) (event.Subscription, error) {
+	return a.session.SubscribeEvents(filter)
+}
+
+// PrimaryLoopID returns the session's primary loop id, so a subscriber can build
+// its EventFilter (primary-only Ephemeral + all-loop Enduring).
+func (a *Assistant) PrimaryLoopID() uuid.UUID { return a.session.PrimaryLoopID() }
 
 // Interrupt cancels the running turn. Returns true if a turn was cancelled.
 func (a *Assistant) Interrupt(ctx context.Context) (bool, error) {

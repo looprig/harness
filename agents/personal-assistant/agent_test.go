@@ -8,7 +8,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/inventivepotter/urvi/internal/agent/loop/command"
 	"github.com/inventivepotter/urvi/internal/agent/loop/event"
 	"github.com/inventivepotter/urvi/internal/agent/session"
 	"github.com/inventivepotter/urvi/internal/content"
@@ -153,13 +152,17 @@ func TestStreamOrderedEvents(t *testing.T) {
 			kinds = append(kinds, "started")
 		case event.TokenDelta:
 			kinds = append(kinds, "delta")
+		case event.StepDone:
+			kinds = append(kinds, "stepdone")
 		case event.TurnDone:
 			kinds = append(kinds, "done")
 		default:
 			t.Fatalf("unexpected event %T", ev)
 		}
 	}
-	want := []string{"started", "delta", "delta", "done"}
+	// The single no-tool step emits its enduring StepDone after its deltas and
+	// before the turn terminal.
+	want := []string{"started", "delta", "delta", "stepdone", "done"}
 	if !equalStrings(kinds, want) {
 		t.Errorf("events = %v, want %v", kinds, want)
 	}
@@ -184,8 +187,8 @@ func TestStreamBlankInput(t *testing.T) {
 }
 
 // TestStreamCloseEventuallyReusable proves the contract: sr.Close() interrupts
-// asynchronously, so a subsequent Send may briefly see *command.TurnBusyError and
-// must be retried; the session is eventually reusable.
+// asynchronously, so a subsequent Send may briefly see *session.TurnRejectedError
+// and must be retried; the session is eventually reusable.
 func TestStreamCloseEventuallyReusable(t *testing.T) {
 	t.Parallel()
 	hold := make(chan struct{})
@@ -218,9 +221,9 @@ func TestStreamCloseEventuallyReusable(t *testing.T) {
 			}
 			return
 		}
-		var busy *command.TurnBusyError
-		if !errors.As(err, &busy) {
-			t.Fatalf("Send err = %v, want nil or *command.TurnBusyError", err)
+		var rej *session.TurnRejectedError
+		if !errors.As(err, &rej) {
+			t.Fatalf("Send err = %v, want nil or *session.TurnRejectedError", err)
 		}
 		if time.Now().After(deadline) {
 			t.Fatal("session not reusable within deadline")
@@ -364,13 +367,17 @@ func TestStreamBlocksOrderedEvents(t *testing.T) {
 			if tc, ok := e.Chunk.(*content.TextChunk); ok {
 				delta.WriteString(tc.Text)
 			}
+		case event.StepDone:
+			kinds = append(kinds, "stepdone")
 		case event.TurnDone:
 			kinds = append(kinds, "done")
 		default:
 			t.Fatalf("unexpected event %T", ev)
 		}
 	}
-	want := []string{"started", "delta", "delta", "done"}
+	// The single no-tool step emits its enduring StepDone after its deltas and
+	// before the turn terminal.
+	want := []string{"started", "delta", "delta", "stepdone", "done"}
 	if !equalStrings(kinds, want) {
 		t.Errorf("events = %v, want %v", kinds, want)
 	}

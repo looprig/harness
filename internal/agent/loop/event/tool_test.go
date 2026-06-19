@@ -372,6 +372,12 @@ func TestRedactableImplementations(t *testing.T) {
 	//   - TurnFailed: Err is a typed, secret-free cause this package constructs;
 	//     wrapping a provider/LLM error string into it later MUST redact (see the
 	//     SECURITY note on TurnFailed in turn.go).
+	//   - LoopIdle/SessionActive/SessionIdle/SessionStopped: carry only Header ids.
+	//   - StepDone/TurnFoldedInto/InputCancelled carry user/assistant message
+	//     content. The loop-machine spec ACCEPTS that leakage risk for now and
+	//     defers their redaction to the journal/redaction follow-on
+	//     (TODO(Open Items B)); they MUST NOT implement Redactable here, so a new
+	//     projection is not silently added before the follow-on owns it.
 	shouldNotRedact := []event.Event{
 		event.ToolCallStarted{},
 		event.UserInputRequestedSink{},
@@ -379,6 +385,13 @@ func TestRedactableImplementations(t *testing.T) {
 		event.SessionStarted{},
 		event.TurnInterrupted{},
 		event.TurnFailed{},
+		event.LoopIdle{},
+		event.SessionActive{},
+		event.SessionIdle{},
+		event.SessionStopped{},
+		event.StepDone{},
+		event.TurnFoldedInto{},
+		event.InputCancelled{},
 	}
 	for _, e := range shouldNotRedact {
 		if _, ok := e.(event.Redactable); ok {
@@ -397,10 +410,17 @@ func TestRedactableImplementations(t *testing.T) {
 		event.ToolCallCompleted{},
 		event.TokenDelta{},
 		event.TurnStarted{},
+		event.StepDone{},
+		event.TurnFoldedInto{},
+		event.InputCancelled{},
 		event.TurnDone{},
 		event.TurnFailed{},
 		event.TurnInterrupted{},
 		event.SessionStarted{},
+		event.SessionActive{},
+		event.SessionIdle{},
+		event.SessionStopped{},
+		event.LoopIdle{},
 	}
 	classified := make(map[string]bool, len(shouldRedact)+len(shouldNotRedact))
 	for _, e := range shouldRedact {

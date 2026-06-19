@@ -169,13 +169,17 @@ func TestNewAppliesToolSetDefaults(t *testing.T) {
 	t.Parallel()
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
-	id, err := uuid.New()
+	sessionID, err := uuid.New()
+	if err != nil {
+		t.Fatalf("uuid.New: %v", err)
+	}
+	loopID, err := uuid.New()
 	if err != nil {
 		t.Fatalf("uuid.New: %v", err)
 	}
 	// Config carries a fully zero-value ToolSet: nil Permission/Registry/
 	// Middlewares and zero caps. New must accept it and the loop must run.
-	l, err := New(ctx, id, Config{
+	l, err := New(ctx, sessionID, loopID, Provenance{}, noopPublisher{}, Config{
 		Client:       &fakeLLM{chunks: []content.Chunk{textChunk("hi")}},
 		Model:        llm.ModelSpec{Model: "m"},
 		DrainTimeout: 200 * time.Millisecond,

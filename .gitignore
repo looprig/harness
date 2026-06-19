@@ -10,9 +10,6 @@
 *.test
 *.out
 
-# NOTE: vendor/ is intentionally committed (vendored dependency tree) so all
-# third-party source is in-repo, auditable in review diffs, and builds offline.
-
 # Environment & secrets
 .env
 .env.*
@@ -30,3 +27,10 @@
 
 # Claude Code project settings
 .claude/
+
+# Vendored dependency tree — committed in full and built offline (-mod=vendor).
+# The global ignores above (*.pem, *.key, .env.*, *.test, *.out, ...) otherwise
+# silently drop vendored files (e.g. go-tdx-guest's embedded trusted_root.pem),
+# yielding a tree that fails `go build`/`go test` from a clean checkout. This
+# negation must stay LAST so it re-includes everything under vendor/.
+!/vendor/**

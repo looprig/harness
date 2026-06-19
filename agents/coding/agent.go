@@ -190,6 +190,20 @@ func (c *Coding) StreamBlocks(ctx context.Context, blocks []content.Block) (*llm
 	return c.session.Stream(ctx, blocks)
 }
 
+// Subscribe attaches a whole-session event consumer to the session fan-in with
+// filter and returns its event.Subscription (the session hub's *EventSubscription,
+// which satisfies the interface). It is the seam a TUI/CLI uses to observe events
+// across the whole session — every loop (including subagent loops), spanning turns
+// — distinct from the per-turn StreamBlocks reader that closes when one turn ends.
+// The caller Closes the returned subscription when done.
+func (c *Coding) Subscribe(filter event.EventFilter) (event.Subscription, error) {
+	return c.session.SubscribeEvents(filter)
+}
+
+// PrimaryLoopID returns the session's primary loop id, so a subscriber can build
+// its EventFilter (primary-only Ephemeral + all-loop Enduring).
+func (c *Coding) PrimaryLoopID() uuid.UUID { return c.session.PrimaryLoopID() }
+
 // Interrupt cancels the running turn. Returns true if a turn was cancelled.
 func (c *Coding) Interrupt(ctx context.Context) (bool, error) {
 	return c.session.Interrupt(ctx)

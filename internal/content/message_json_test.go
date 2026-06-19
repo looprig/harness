@@ -3,42 +3,48 @@ package content_test
 import (
 	"encoding/json"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/inventivepotter/urvi/internal/content"
 )
 
-// TestToolMessageJSONPreservesToolUseID is the key regression: ToolMessage must
-// NOT inherit Message's promoted MarshalJSON/UnmarshalJSON, which would silently
-// drop ToolUseID. Marshal then unmarshal a ToolMessage and assert ToolUseID
-// survives along with the blocks.
-func TestToolMessageJSONPreservesToolUseID(t *testing.T) {
+// TestToolResultMessageJSONPreservesToolUseID is the key regression:
+// ToolResultMessage must NOT inherit Message's promoted MarshalJSON/UnmarshalJSON,
+// which would silently drop ToolUseID. Marshal then unmarshal a ToolResultMessage
+// and assert ToolUseID survives along with the blocks. It also pins the wire form:
+// the rename is Go-type-only, so the JSON must still carry "role":"tool" and the
+// "tool_use_id" field byte-for-byte.
+func TestToolResultMessageJSONPreservesToolUseID(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		name string
-		in   content.ToolMessage
+		name         string
+		in           content.ToolResultMessage
+		wantContains []string
 	}{
 		{
 			name: "tool message with id and content block",
-			in: content.ToolMessage{
+			in: content.ToolResultMessage{
 				Message: content.Message{
 					Role:   content.RoleTool,
 					Blocks: []content.Block{&content.TextBlock{Text: "result"}},
 				},
 				ToolUseID: "tu_42",
 			},
+			wantContains: []string{`"role":"tool"`, `"tool_use_id":"tu_42"`},
 		},
 		{
 			name: "tool message with id and no blocks",
-			in: content.ToolMessage{
+			in: content.ToolResultMessage{
 				Message:   content.Message{Role: content.RoleTool},
 				ToolUseID: "tu_7",
 			},
+			wantContains: []string{`"role":"tool"`, `"tool_use_id":"tu_7"`},
 		},
 		{
 			name: "tool message with nested tool_result block",
-			in: content.ToolMessage{
+			in: content.ToolResultMessage{
 				Message: content.Message{
 					Role: content.RoleTool,
 					Blocks: []content.Block{
@@ -50,6 +56,7 @@ func TestToolMessageJSONPreservesToolUseID(t *testing.T) {
 				},
 				ToolUseID: "tu_outer",
 			},
+			wantContains: []string{`"role":"tool"`, `"tool_use_id":"tu_outer"`},
 		},
 	}
 
@@ -59,11 +66,16 @@ func TestToolMessageJSONPreservesToolUseID(t *testing.T) {
 
 			data, err := json.Marshal(tt.in)
 			if err != nil {
-				t.Fatalf("json.Marshal(ToolMessage) error = %v", err)
+				t.Fatalf("json.Marshal(ToolResultMessage) error = %v", err)
 			}
-			var got content.ToolMessage
+			for _, want := range tt.wantContains {
+				if !strings.Contains(string(data), want) {
+					t.Errorf("marshalled JSON = %s, want it to contain %s", data, want)
+				}
+			}
+			var got content.ToolResultMessage
 			if err := json.Unmarshal(data, &got); err != nil {
-				t.Fatalf("json.Unmarshal(ToolMessage) error = %v", err)
+				t.Fatalf("json.Unmarshal(ToolResultMessage) error = %v", err)
 			}
 			if got.ToolUseID != tt.in.ToolUseID {
 				t.Errorf("ToolUseID = %q, want %q (dropped by promoted method?)", got.ToolUseID, tt.in.ToolUseID)
