@@ -970,7 +970,7 @@ func TestComposeBlinkCmdPlumbed(t *testing.T) {
 	}
 }
 
-func TestStartTurn(t *testing.T) {
+func TestSubmitTurn(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {

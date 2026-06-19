@@ -182,7 +182,7 @@ func (a *Assistant) Send(ctx context.Context, text string) (event.Event, error) 
 // TurnStarted, TokenDelta×N, then one terminal event, then EOF. Callers must
 // read until EOF or call sr.Close(). sr.Close() abandons the stream and
 // interrupts the turn asynchronously, so an immediately following Send may
-// briefly observe *command.TurnBusyError until the cancelled turn unwinds.
+// briefly observe *session.TurnRejectedError until the cancelled turn unwinds.
 func (a *Assistant) Stream(ctx context.Context, text string) (*llm.StreamReader[event.Event], error) {
 	blocks, err := userBlocks(text)
 	if err != nil {

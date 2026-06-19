@@ -58,6 +58,28 @@ func (e *SessionError) Error() string {
 }
 func (e *SessionError) Unwrap() error { return e.Cause }
 
+// TurnRejectedError is returned by Invoke/Stream when the loop refuses to start a
+// turn for a StartOnly submit. Invoke/Stream are the programmatic single-shot
+// (start-or-reject) callers, so a non-Started disposition is surfaced as this
+// typed error. Reason carries the loop's RejectReason (Busy/QueueFull/
+// ShuttingDown) so callers can errors.As and branch (e.g. retry-on-busy).
+type TurnRejectedError struct {
+	Reason command.RejectReason
+}
+
+func (e *TurnRejectedError) Error() string {
+	switch e.Reason {
+	case command.RejectBusy:
+		return "session: turn rejected: loop busy"
+	case command.RejectQueueFull:
+		return "session: turn rejected: queue full"
+	case command.RejectShuttingDown:
+		return "session: turn rejected: loop shutting down"
+	default:
+		return "session: turn rejected"
+	}
+}
+
 // idGenerator mints a fresh UUID. It defaults to uuid.New; tests inject a
 // failing generator to exercise the crypto/rand failure branch.
 type idGenerator func() (uuid.UUID, error)
@@ -256,8 +278,13 @@ func NewAgent(ctx context.Context, cfg loop.Config) (*AgentSession, error) {
 	return s, nil
 }
 
-// Invoke sends input and blocks until a terminal event.
-// Cancelling ctx cancels the running turn; Invoke returns the event.TurnInterrupted event.
+// Invoke sends input as a StartOnly UserInput and blocks until a terminal event.
+// It is the programmatic single-shot caller (start-or-reject): a Started
+// disposition proceeds; a TurnRejected disposition returns a typed
+// *TurnRejectedError. The submit carries no context (the loop derives the turn
+// ctx from its loopCtx), so cancelling ctx no longer cancels the turn through the
+// command — instead the session translates the boundary cancel into an Interrupt
+// and returns the resulting event.TurnInterrupted.
 func (s *AgentSession) Invoke(ctx context.Context, input []content.Block) (event.Event, error) {
 	l, ok := s.loopFor(s.primaryLoopID)
 	if !ok {
@@ -268,23 +295,32 @@ func (s *AgentSession) Invoke(ctx context.Context, input []content.Block) (event
 		return nil, err
 	}
 	events := make(chan event.Event, 64)
-	ack := make(chan error, 1)
+	ack := make(chan command.Disposition, 1)
 	abandoned := make(chan struct{})
 	defer close(abandoned) // ensures deliverAndClose always has an escape if Invoke exits early
 
 	select {
 	// User-initiated turn: CausationID is zero (root).
-	case l.Commands <- command.StartTurn{Header: command.Header{ID: id}, Ctx: ctx, Input: input, Events: events, Abandoned: abandoned, Ack: ack}:
+	case l.Commands <- command.UserInput{Header: command.Header{ID: id}, Mode: command.StartOnly, Blocks: input, Events: events, Abandoned: abandoned, Ack: ack}:
 	case <-ctx.Done():
 		return nil, &SessionError{Kind: SessionContextDone, Cause: ctx.Err()}
 	case <-l.Done:
 		return nil, &SessionError{Kind: SessionLoopExited}
 	}
 
-	if err := <-ack; err != nil {
-		return nil, err
+	select {
+	case d := <-ack:
+		if rej, ok := d.(command.TurnRejected); ok {
+			return nil, &TurnRejectedError{Reason: rej.Reason}
+		}
+		// Started: a turn exists; proceed to drain its events.
+	case <-l.Done:
+		return nil, &SessionError{Kind: SessionLoopExited}
 	}
 
+	// interrupted guards a single best-effort Interrupt: once ctx is done we cancel
+	// the turn and keep draining for the resulting terminal.
+	interrupted := false
 	for {
 		select {
 		case ev, ok := <-events:
@@ -295,6 +331,13 @@ func (s *AgentSession) Invoke(ctx context.Context, input []content.Block) (event
 			case event.TurnDone, event.TurnFailed, event.TurnInterrupted:
 				return ev, nil
 			}
+		case <-ctx.Done():
+			// Boundary cancel: submits carry no ctx, so translate it into an
+			// Interrupt and keep draining for the TurnInterrupted terminal.
+			if !interrupted {
+				interrupted = true
+				s.interruptLoop(l)
+			}
 		case <-l.Done:
 			// Hard loop kill: on a DrainTimeout detach the actor never closes
 			// `events`, so without this escape Invoke would block forever. The
@@ -304,9 +347,31 @@ func (s *AgentSession) Invoke(ctx context.Context, input []content.Block) (event
 	}
 }
 
-// Stream sends input and returns a StreamReader[event.Event] that yields
-// TurnStarted, TokenDelta×N, then one terminal event, then EOF while the caller
-// keeps reading. Calling sr.Close() abandons the event stream and cancels the turn.
+// interruptLoop sends a best-effort Interrupt to the loop to cancel its active
+// turn, escaping on the loop's Done so a stopped loop never wedges the send. It is
+// used to translate an Invoke/Stream boundary-ctx cancel (the submit carries no
+// ctx) into a turn cancellation. The ack is buffered(1) and unread here: the
+// caller observes the cancellation through the resulting TurnInterrupted terminal,
+// not this command's reply. An id-gen failure is swallowed (best-effort): the worst
+// case is the turn runs to its natural terminal instead of being interrupted.
+func (s *AgentSession) interruptLoop(l *loop.Loop) {
+	id, err := s.newID()
+	if err != nil {
+		return
+	}
+	ack := make(chan bool, 1)
+	select {
+	case l.Commands <- command.Interrupt{Header: command.Header{ID: id}, Ack: ack}:
+	case <-l.Done:
+	}
+}
+
+// Stream sends input as a StartOnly UserInput and returns a
+// StreamReader[event.Event] that yields TurnStarted, TokenDelta×N, then one
+// terminal event, then EOF while the caller keeps reading. A Started disposition
+// returns the reader; a TurnRejected disposition returns a typed
+// *TurnRejectedError. Calling sr.Close() abandons the event stream AND interrupts
+// the turn (the submit carries no ctx, so Close translates into an Interrupt).
 // Callers must either read until EOF or call Close.
 func (s *AgentSession) Stream(ctx context.Context, input []content.Block) (*llm.StreamReader[event.Event], error) {
 	l, ok := s.loopFor(s.primaryLoopID)
@@ -317,36 +382,39 @@ func (s *AgentSession) Stream(ctx context.Context, input []content.Block) (*llm.
 	if err != nil {
 		return nil, err
 	}
-	streamCtx, streamCancel := context.WithCancel(ctx)
 	abandoned := make(chan struct{})
 	var abandonOnce sync.Once
 	events := make(chan event.Event, 64)
-	ack := make(chan error, 1)
+	ack := make(chan command.Disposition, 1)
 
 	select {
 	// User-initiated turn: CausationID is zero (root).
-	case l.Commands <- command.StartTurn{
+	case l.Commands <- command.UserInput{
 		Header:    command.Header{ID: id},
-		Ctx:       streamCtx,
-		Input:     input,
+		Mode:      command.StartOnly,
+		Blocks:    input,
 		Events:    events,
 		Abandoned: abandoned,
 		Ack:       ack,
 	}:
 	case <-ctx.Done():
-		streamCancel()
 		abandonOnce.Do(func() { close(abandoned) })
 		return nil, &SessionError{Kind: SessionContextDone, Cause: ctx.Err()}
 	case <-l.Done:
-		streamCancel()
 		abandonOnce.Do(func() { close(abandoned) })
 		return nil, &SessionError{Kind: SessionLoopExited}
 	}
 
-	if err := <-ack; err != nil {
-		streamCancel()
+	select {
+	case d := <-ack:
+		if rej, ok := d.(command.TurnRejected); ok {
+			abandonOnce.Do(func() { close(abandoned) })
+			return nil, &TurnRejectedError{Reason: rej.Reason}
+		}
+		// Started: a turn exists; return the per-turn reader.
+	case <-l.Done:
 		abandonOnce.Do(func() { close(abandoned) })
-		return nil, err
+		return nil, &SessionError{Kind: SessionLoopExited}
 	}
 
 	return llm.NewStreamReader(
@@ -367,8 +435,11 @@ func (s *AgentSession) Stream(ctx context.Context, input []content.Block) (*llm.
 			}
 		},
 		func() error {
-			streamCancel()
+			// Close abandons the stream (so the actor's terminal delivery never
+			// blocks on this reader) and interrupts the turn (the submit carried no
+			// ctx). The Interrupt is best-effort and escapes on l.Done.
 			abandonOnce.Do(func() { close(abandoned) })
+			s.interruptLoop(l)
 			return nil
 		},
 	), nil

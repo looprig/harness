@@ -373,11 +373,11 @@ func TestStartBlinkGuard(t *testing.T) {
 	})
 }
 
-// TestStartTurnStartsTicking covers the integration point: a turn that actually
+// TestTurnStartTicking covers the integration point: a turn that actually
 // starts transitions to Running and kicks off the animation tick (ticking set, and a
 // non-nil cmd batching readNext + the tick). A failed start stays Idle and never
 // starts ticking.
-func TestStartTurnStartsTicking(t *testing.T) {
+func TestTurnStartTicking(t *testing.T) {
 	t.Parallel()
 
 	t.Run("successful start ticks", func(t *testing.T) {

@@ -8,7 +8,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/inventivepotter/urvi/internal/agent/loop/command"
 	"github.com/inventivepotter/urvi/internal/agent/loop/event"
 	"github.com/inventivepotter/urvi/internal/agent/session"
 	"github.com/inventivepotter/urvi/internal/content"
@@ -188,8 +187,8 @@ func TestStreamBlankInput(t *testing.T) {
 }
 
 // TestStreamCloseEventuallyReusable proves the contract: sr.Close() interrupts
-// asynchronously, so a subsequent Send may briefly see *command.TurnBusyError and
-// must be retried; the session is eventually reusable.
+// asynchronously, so a subsequent Send may briefly see *session.TurnRejectedError
+// and must be retried; the session is eventually reusable.
 func TestStreamCloseEventuallyReusable(t *testing.T) {
 	t.Parallel()
 	hold := make(chan struct{})
@@ -222,9 +221,9 @@ func TestStreamCloseEventuallyReusable(t *testing.T) {
 			}
 			return
 		}
-		var busy *command.TurnBusyError
-		if !errors.As(err, &busy) {
-			t.Fatalf("Send err = %v, want nil or *command.TurnBusyError", err)
+		var rej *session.TurnRejectedError
+		if !errors.As(err, &rej) {
+			t.Fatalf("Send err = %v, want nil or *session.TurnRejectedError", err)
 		}
 		if time.Now().After(deadline) {
 			t.Fatal("session not reusable within deadline")

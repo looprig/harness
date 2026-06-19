@@ -27,8 +27,8 @@ type turnState struct {
 	id uuid.UUID
 	// index is the loop-local turn index.
 	index event.TurnIndex
-	// causationID is the submit command id (today command.StartTurn.Header.ID)
-	// that initiated this turn.
+	// causationID is the submit command id (command.UserInput/SubagentResult
+	// Header.ID) that initiated this turn.
 	causationID uuid.UUID
 
 	// msgs is the staged turn conversation: the initial UserMessage followed by

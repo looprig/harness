@@ -78,7 +78,7 @@ func (r *recordingSink) sawTerminal() bool {
 
 // turnCausationID returns the CausationID stamped on the first turn-level
 // envelope (skipping the session-level SessionStarted, which has none). The
-// loop sets envelope CausationID to the issuing StartTurn's Header.ID, so a
+// loop sets envelope CausationID to the issuing UserInput's Header.ID, so a
 // non-zero value here proves the session stamped a fresh Header.ID on the command.
 func (r *recordingSink) turnCausationID() (uuid.UUID, bool) {
 	r.mu.Lock()
@@ -448,6 +448,18 @@ func (g *capturingIDGen) last() (uuid.UUID, bool) {
 	return g.ids[len(g.ids)-1], true
 }
 
+// first returns the earliest minted id — the turn-initiating command's id (the
+// UserInput for Invoke/Stream). A later Stream.Close mints a second id for its
+// best-effort Interrupt, so the observable turn CausationID is the FIRST mint.
+func (g *capturingIDGen) first() (uuid.UUID, bool) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if len(g.ids) == 0 {
+		return uuid.UUID{}, false
+	}
+	return g.ids[0], true
+}
+
 // TestStampsCommandHeaderID asserts every command-sending method stamps a
 // fresh, non-zero Header.ID on the command it sends. Each method mints the ID
 // through the session's idGenerator seam, so a non-zero captured value proves
@@ -528,12 +540,19 @@ func TestStampsCommandHeaderID(t *testing.T) {
 				t.Fatal("session stamped a zero Header.ID on the command")
 			}
 			if tt.observeable {
+				// The turn-initiating command (the UserInput) is the FIRST mint; a
+				// Stream.Close fires a best-effort Interrupt that mints a later id, so
+				// compare the observable CausationID against the first.
+				turnID, ok := gen.first()
+				if !ok {
+					t.Fatal("session minted no command-Header ID")
+				}
 				cid, ok := sink.turnCausationID()
 				if !ok {
 					t.Fatal("no turn-level envelope captured")
 				}
-				if cid != minted {
-					t.Fatalf("envelope CausationID = %v, want stamped Header.ID %v", cid, minted)
+				if cid != turnID {
+					t.Fatalf("envelope CausationID = %v, want stamped Header.ID %v", cid, turnID)
 				}
 			}
 		})
@@ -667,9 +686,38 @@ func TestConcurrentInvokeIsRejected(t *testing.T) {
 	time.Sleep(30 * time.Millisecond) // let the first turn occupy the loop
 
 	_, err = s.Invoke(context.Background(), nil)
-	var be *command.TurnBusyError
-	if !errors.As(err, &be) {
-		t.Fatalf("second Invoke err = %v, want *command.TurnBusyError", err)
+	var rej *TurnRejectedError
+	if !errors.As(err, &rej) || rej.Reason != command.RejectBusy {
+		t.Fatalf("second Invoke err = %v, want *TurnRejectedError{RejectBusy}", err)
+	}
+}
+
+// TestStreamBusyRejected asserts Stream is also start-or-reject: a second Stream
+// while a turn occupies the loop returns *TurnRejectedError{RejectBusy} (the
+// TurnRejected disposition mapped to a typed error), never a reader.
+func TestStreamBusyRejected(t *testing.T) {
+	t.Parallel()
+	s, err := NewAgent(context.Background(), cfg(&stubLLM{blockUntilCancel: true}))
+	if err != nil {
+		t.Fatalf("NewAgent: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Shutdown(context.Background()) })
+
+	ctx1, cancel1 := context.WithCancel(context.Background())
+	defer cancel1()
+	started := make(chan struct{})
+	go func() { close(started); _, _ = s.Invoke(ctx1, nil) }()
+	<-started
+	time.Sleep(30 * time.Millisecond) // let the first turn occupy the loop
+
+	sr, err := s.Stream(context.Background(), nil)
+	if sr != nil {
+		_ = sr.Close()
+		t.Fatal("Stream returned a reader while the loop was busy, want nil + TurnRejectedError")
+	}
+	var rej *TurnRejectedError
+	if !errors.As(err, &rej) || rej.Reason != command.RejectBusy {
+		t.Fatalf("Stream while busy err = %v, want *TurnRejectedError{RejectBusy}", err)
 	}
 }
 
@@ -799,7 +847,7 @@ func TestStreamCloseCancelsTurn(t *testing.T) {
 	}
 
 	// session must be usable again: a subsequent Invoke is accepted by the loop
-	// (not rejected with TurnBusyError). Because the loop's client blocks until
+	// (not rejected with TurnRejectedError). Because the loop's client blocks until
 	// ctx cancel, drive the new turn with a short-timeout ctx; acceptance + a
 	// TurnInterrupted terminal proves the session was released by Close.
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
@@ -879,9 +927,9 @@ func TestStreamDrainReleasesSession(t *testing.T) {
 				}
 				break
 			}
-			var be *command.TurnBusyError
-			if !errors.As(err, &be) {
-				t.Fatalf("Invoke after early close = %v, want nil or TurnBusyError", err)
+			var rej *TurnRejectedError
+			if !errors.As(err, &rej) {
+				t.Fatalf("Invoke after early close = %v, want nil or *TurnRejectedError", err)
 			}
 			select {
 			case <-deadline:

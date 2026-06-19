@@ -237,7 +237,7 @@ func TestSingleTurn(t *testing.T) {
 // TestEnvelopeCorrelationStamped drives one full turn and asserts that the
 // sink-side envelopes carry correlation identity: every envelope for the turn
 // shares the same non-zero TurnID, each EventID is distinct and non-zero, and
-// CausationID equals the issuing StartTurn's Header.ID. The bare per-turn events
+// CausationID equals the issuing UserInput's Header.ID. The bare per-turn events
 // are unchanged; only the envelope gains these fields.
 func TestEnvelopeCorrelationStamped(t *testing.T) {
 	t.Parallel()
@@ -317,11 +317,11 @@ func TestEnvelopeCorrelationStamped(t *testing.T) {
 			},
 		},
 		{
-			name: "CausationID equals StartTurn.Header.ID",
+			name: "CausationID equals UserInput.Header.ID",
 			assert: func(t *testing.T, envs []event.EventEnvelope) {
 				for i, e := range envs {
 					if e.CausationID != cmdID {
-						t.Errorf("envelope %d: CausationID = %v, want StartTurn.ID %v", i, e.CausationID, cmdID)
+						t.Errorf("envelope %d: CausationID = %v, want UserInput.ID %v", i, e.CausationID, cmdID)
 					}
 				}
 			},
@@ -912,7 +912,7 @@ func TestStepGranularityRollback(t *testing.T) {
 
 // TestActorCommitsInitialUserMessageAndTurnStarted asserts the loop-owned commit
 // of the initial UserMessage: the actor emits TurnStarted carrying the exact
-// UserMessage and CausationID = the triggering StartTurn's id, BEFORE runTurn
+// UserMessage and CausationID = the triggering UserInput's id, BEFORE runTurn
 // produces any step, and commits that UserMessage into loopState.msgs (proven by
 // the first request the provider receives carrying exactly that user message).
 func TestActorCommitsInitialUserMessageAndTurnStarted(t *testing.T) {
@@ -954,7 +954,7 @@ func TestActorCommitsInitialUserMessageAndTurnStarted(t *testing.T) {
 		t.Fatalf("first event = %T, want TurnStarted", first)
 	}
 	if started.CausationID != cmdID {
-		t.Errorf("TurnStarted.CausationID = %v, want %v (the StartTurn id)", started.CausationID, cmdID)
+		t.Errorf("TurnStarted.CausationID = %v, want %v (the UserInput id)", started.CausationID, cmdID)
 	}
 	if started.Message == nil {
 		t.Fatal("TurnStarted.Message is nil, want the committed initial UserMessage")

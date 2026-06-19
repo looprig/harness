@@ -84,6 +84,34 @@ func TestSubmitToIdleStartsTurn(t *testing.T) {
 	})
 }
 
+// TestSubagentResultToIdleStartsTurn: a SubagentResult to an idle loop is handled
+// like an AllowFold UserInput (it starts a turn) and stamps the producing
+// subagent's loop id as TriggeredByLoopID on the resulting event.TurnStarted.
+func TestSubagentResultToIdleStartsTurn(t *testing.T) {
+	t.Parallel()
+	sink := &captureSink{}
+	l, _ := newLoop(t, &fakeLLM{chunks: []content.Chunk{textChunk("hi")}}, sink)
+
+	inputID := mustID(t)
+	fromLoop := mustID(t)
+	ack := make(chan command.Disposition, 1)
+	l.Commands <- command.SubagentResult{Header: command.Header{ID: inputID}, FromLoopID: fromLoop, Blocks: textBlocks("subagent output"), Ack: ack}
+	d := <-ack
+
+	started, ok := d.(command.Started)
+	if !ok || started.InputID != inputID {
+		t.Fatalf("disposition = %+v, want Started{InputID:%v}", d, inputID)
+	}
+	blockUntilSink(t, sink, func(evs []event.EventEnvelope) bool {
+		for _, e := range evs {
+			if ts, ok := e.Event.(event.TurnStarted); ok && ts.InputID == inputID {
+				return ts.TriggeredByLoopID == fromLoop
+			}
+		}
+		return false
+	})
+}
+
 // TestSubmitToRunningQueueableQueues: an AllowFold UserInput to a running loop
 // returns InputQueued{InputID} (no TurnID) and is held in the inbox in order.
 func TestSubmitToRunningQueueableQueues(t *testing.T) {
