@@ -544,6 +544,41 @@ func TestRunTurn(t *testing.T) {
 		}
 	})
 
+	t.Run("empty-string-only chunks roll back and return EmptyResponseError (zero-length blocks, not zero blocks)", func(t *testing.T) {
+		t.Parallel()
+		// Unlike the chunks:nil case above (zero blocks), this stream emits real
+		// chunks whose text is empty. streamaccumulator.Text.received flips true on
+		// the first Add, but the loop decides emptiness on the materialized block
+		// TEXT (isEmptyAssistantMessage), so a zero-LENGTH text block must still be
+		// EmptyResponseError with no assistant message stored.
+		chunks := []content.Chunk{textChunk(""), textChunk("")}
+		client := &fakeLLM{chunks: chunks}
+		var emitted []event.Event
+		msgs, terminal := runTurn(context.Background(), input, 1, nil, cfg, client, noGateReg(), drainEmit(&emitted))
+
+		failed, ok := terminal.(event.TurnFailed)
+		if !ok {
+			t.Fatalf("terminal = %T, want TurnFailed", terminal)
+		}
+		var ere *event.EmptyResponseError
+		if !errors.As(failed.Err, &ere) {
+			t.Fatalf("TurnFailed.Err = %T, want *EmptyResponseError", failed.Err)
+		}
+		if len(msgs) != 0 {
+			t.Errorf("history len = %d, want 0 (no assistant message stored; rolled back to base)", len(msgs))
+		}
+		// A TokenDelta is still emitted per chunk even though the materialized text is empty.
+		var deltas int
+		for _, e := range emitted {
+			if _, ok := e.(event.TokenDelta); ok {
+				deltas++
+			}
+		}
+		if deltas != len(chunks) {
+			t.Errorf("TokenDelta count = %d, want %d (one per chunk)", deltas, len(chunks))
+		}
+	})
+
 	t.Run("cancelled context rolls back and returns TurnInterrupted", func(t *testing.T) {
 		t.Parallel()
 		ctx, cancel := context.WithCancel(context.Background())

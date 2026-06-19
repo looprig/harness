@@ -5,9 +5,13 @@ import (
 	"github.com/inventivepotter/urvi/internal/content/streamaccumulator"
 )
 
-// block owns assistant block accumulation for one step. It wraps the blockState
-// that folds streamed chunks into the thinking/text/tool-use accumulators and
-// materializes a single AIMessage.
+// block is the runtime-hierarchy wrapper for one step's assistant-block
+// accumulation, parallel to step/turn. It wraps the blockState that folds
+// streamed chunks into the thinking/text/tool-use accumulators and materializes
+// a single AIMessage. It currently holds only blockState; whether these thin
+// wrappers earn their keep is validated in the Phase 10 loopConfig/loopState
+// reshape (see Open Items A in docs/plans/loop-machine-design.md). Do not delete
+// in isolation — keep block/step/turn symmetric.
 type block struct {
 	state blockState
 }
@@ -47,7 +51,8 @@ func (b *blockState) AIMessage() *content.AIMessage {
 		blocks = append(blocks, tb)
 	}
 	for _, tu := range b.msgs.toolUses.Blocks() {
-		tu := tu
+		// Go 1.22+ scopes tu per iteration, so &tu is a distinct pointer for each
+		// block (no per-iteration copy needed for correctness).
 		blocks = append(blocks, &tu)
 	}
 	return &content.AIMessage{Message: content.Message{Role: content.RoleAssistant, Blocks: blocks}}
