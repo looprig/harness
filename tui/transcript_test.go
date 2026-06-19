@@ -1376,6 +1376,58 @@ func TestTranscriptUserRowFromTurnEvent(t *testing.T) {
 	}
 }
 
+// TestTranscriptUserRowRequiresPrimaryLoop locks the loop-scoping half of the
+// user-row decision: a TurnStarted / TurnFoldedInto whose Header.LoopID is NOT the
+// model's primaryLoopID commits NO kindUser row — even with TriggeredByLoopID == 0
+// and a non-nil Message. This is the subagent-own-turn case: a subagent's INITIAL
+// task arrives at its loop as a command.UserInput, so its emitted TurnStarted has
+// TriggeredByLoopID == 0 and LoopID == <the subagent loop>; the DefaultEventFilter
+// delivers it (Enduring from All loops), so it reaches ApplyEvent — but it must NOT
+// become a human user row (§5/§6: subagent loops' own turns surface only via
+// StepDone). A turn whose LoopID == primaryLoopID still commits the row.
+func TestTranscriptUserRowRequiresPrimaryLoop(t *testing.T) {
+	primary := callID(0xA1) // the model's primary loop id
+	subLoop := callID(0xC2) // a different (subagent) loop id
+
+	tests := []struct {
+		name     string
+		event    event.Event
+		wantRows int
+	}{
+		{
+			name:     "TurnStarted on the PRIMARY loop commits a row",
+			event:    event.TurnStarted{Header: event.Header{LoopID: primary}, InputID: callID(1), Message: userMsg("genuine")},
+			wantRows: 1,
+		},
+		{
+			name:     "TurnFoldedInto on the PRIMARY loop commits a row",
+			event:    event.TurnFoldedInto{Header: event.Header{LoopID: primary}, InputID: callID(1), Message: userMsg("folded")},
+			wantRows: 1,
+		},
+		{
+			name:     "TurnStarted on a SUBAGENT loop commits no row (its own initial task)",
+			event:    event.TurnStarted{Header: event.Header{LoopID: subLoop}, InputID: callID(1), Message: userMsg("subagent task")},
+			wantRows: 0,
+		},
+		{
+			name:     "TurnFoldedInto on a SUBAGENT loop commits no row",
+			event:    event.TurnFoldedInto{Header: event.Header{LoopID: subLoop}, InputID: callID(1), Message: userMsg("subagent fold")},
+			wantRows: 0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			m := transcriptModel{primaryLoopID: primary}
+			m = m.ApplyEvent(tt.event)
+			if got := kindUserCount(m); got != tt.wantRows {
+				t.Fatalf("kindUser rows = %d, want %d", got, tt.wantRows)
+			}
+		})
+	}
+}
+
 // TestTranscriptQueuedAffordance locks the full queued-input lifecycle: RecordSubmit
 // then InputQueued shows the affordance; a later TurnStarted promotes it to exactly
 // one committed user row (from the event Message) and clears the affordance. It also

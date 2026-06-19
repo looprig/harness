@@ -213,6 +213,17 @@ type transcriptModel struct {
 	live      liveSeg
 	queued    []queuedInput
 	nextID    displayID
+	// primaryLoopID is the loop whose GENUINE user turns become committed kindUser
+	// rows. A turn-start event commits a user row only when its Header.LoopID equals
+	// this id (in addition to TriggeredByLoopID being zero and a Message present): a
+	// SUBAGENT loop's own initial task also arrives as an untriggered TurnStarted
+	// (TriggeredByLoopID == 0) carrying a Message, and the DefaultEventFilter delivers
+	// it (Enduring from every loop), so without this scoping it would bogusly commit as
+	// a human user row. A subagent loop's own turns surface ONLY collapsed via StepDone,
+	// attributed by LoopID (§5/§6) — never as a human user row. It is wired from
+	// Agent.PrimaryLoopID() at construction (see screen.go New / handleReopenResult);
+	// the zero value matches a zero-LoopID primary turn (the single-loop default).
+	primaryLoopID uuid.UUID
 }
 
 // ApplyEvent folds one turn-stream event into the model and returns the next
@@ -250,9 +261,9 @@ func (m transcriptModel) ApplyEvent(ev event.Event) transcriptModel {
 	switch ev := ev.(type) {
 	case event.TurnStarted:
 		m.live.active = true
-		m.startTurnUser(ev.TriggeredByLoopID, ev.InputID, ev.Message)
+		m.startTurnUser(ev.LoopID, ev.TriggeredByLoopID, ev.InputID, ev.Message)
 	case event.TurnFoldedInto:
-		m.startTurnUser(ev.TriggeredByLoopID, ev.InputID, ev.Message)
+		m.startTurnUser(ev.LoopID, ev.TriggeredByLoopID, ev.InputID, ev.Message)
 	case event.InputQueued:
 		m.markQueued(ev.InputID)
 	case event.InputCancelled:
@@ -335,15 +346,19 @@ func (m transcriptModel) QueuedInputs() [][]content.Block {
 
 // startTurnUser commits the authoritative user row for a turn-start event
 // (TurnStarted/TurnFoldedInto) and drops the matching queued affordance. It
-// commits a kindUser row ONLY for GENUINE user input — triggeredBy must be the
-// zero loop id (a SubagentResult hand-back also produces these events but carries
-// a non-zero TriggeredByLoopID and must NOT add a user row) — and only when a
-// Message is present. The row is committed from the event's authoritative blocks,
-// never from remembered submit state, which sidesteps the submit↔event arrival
-// race. The queued affordance for this InputID is always dropped (the real row, if
-// any, supersedes it).
-func (m *transcriptModel) startTurnUser(triggeredBy, inputID uuid.UUID, msg *content.UserMessage) {
-	if triggeredBy.IsZero() && msg != nil {
+// commits a kindUser row ONLY for a GENUINE PRIMARY-loop user turn — ALL THREE must
+// hold: loopID == m.primaryLoopID (a SUBAGENT loop's OWN initial task also arrives
+// as an untriggered TurnStarted carrying a Message — TriggeredByLoopID == 0,
+// LoopID == the subagent loop — and the DefaultEventFilter delivers it from every
+// loop, so without this scoping it would bogusly commit as a human user row);
+// triggeredBy is the zero loop id (a SubagentResult hand-back FOLDS into the PRIMARY
+// loop, so LoopID == primary but TriggeredByLoopID != 0 — that is a hand-back, not a
+// human turn); and a Message is present. The row is committed from the event's
+// authoritative blocks, never from remembered submit state, which sidesteps the
+// submit↔event arrival race. The queued affordance for this InputID is always
+// dropped (the real row, if any, supersedes it).
+func (m *transcriptModel) startTurnUser(loopID, triggeredBy, inputID uuid.UUID, msg *content.UserMessage) {
+	if loopID == m.primaryLoopID && triggeredBy.IsZero() && msg != nil {
 		*m = m.CommitUser(msg.Blocks)
 	}
 	m.dropQueued(inputID)

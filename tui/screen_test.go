@@ -1507,7 +1507,8 @@ func TestUpdateStartupBanner(t *testing.T) {
 func TestSubmitUserRowFromEventNotSubmit(t *testing.T) {
 	t.Parallel()
 
-	agent := &fakeAgent{}
+	primary := callID(0xAA)
+	agent := &fakeAgent{primaryLoopID: primary}
 	m := runningScreen(t, agent)
 	m.interaction.input.SetValue("from the event")
 
@@ -1519,8 +1520,9 @@ func TestSubmitUserRowFromEventNotSubmit(t *testing.T) {
 	}
 
 	// The loop's TurnStarted carries the authoritative user message (genuine input:
-	// the fakeAgent's primary loop id is zero, so TriggeredByLoopID == 0).
-	m = feed(t, m, event.TurnStarted{InputID: fixedFakeSubmitID, Message: userMsg("from the event")})
+	// TriggeredByLoopID == 0 AND Header.LoopID == the agent's primary loop id, which
+	// New threaded into the transcript).
+	m = feed(t, m, event.TurnStarted{Header: event.Header{LoopID: primary}, InputID: fixedFakeSubmitID, Message: userMsg("from the event")})
 
 	rec := lastCommitted(t, m)
 	if rec.Kind != kindUser || committedText(rec) != "from the event" {
@@ -1558,6 +1560,41 @@ func TestSubagentHandbackCommitsNoUserRow(t *testing.T) {
 			m = feed(t, m, tt.ev)
 			if got := userRowCount(m); got != 0 {
 				t.Errorf("kindUser rows = %d, want 0 (a subagent hand-back commits no user row)", got)
+			}
+		})
+	}
+}
+
+// TestSubagentOwnTurnCommitsNoUserRow is the Screen-level proof of the loop-scoping
+// fix: a SUBAGENT loop's OWN initial task arrives as an untriggered TurnStarted /
+// TurnFoldedInto (TriggeredByLoopID == 0) carrying a Message, but with
+// Header.LoopID == the subagent loop (NOT the primary). The DefaultEventFilter
+// delivers it (Enduring from every loop), so it reaches ApplyEvent — but it must NOT
+// commit a human user row (it surfaces only via the collapsed StepDone, §5/§6). New
+// threaded the agent's primary loop id into the transcript, so a non-matching LoopID
+// is rejected even though TriggeredByLoopID is zero.
+func TestSubagentOwnTurnCommitsNoUserRow(t *testing.T) {
+	t.Parallel()
+
+	primary := callID(0xAA)
+	subLoop := callID(0xCC) // a different (subagent) loop id
+
+	tests := []struct {
+		name string
+		ev   event.Event
+	}{
+		{name: "subagent TurnStarted (own initial task)", ev: event.TurnStarted{Header: event.Header{LoopID: subLoop}, InputID: callID(1), Message: userMsg("subagent task")}},
+		{name: "subagent TurnFoldedInto", ev: event.TurnFoldedInto{Header: event.Header{LoopID: subLoop}, InputID: callID(1), Message: userMsg("subagent fold")}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			agent := &fakeAgent{primaryLoopID: primary}
+			m := runningScreen(t, agent)
+			m = feed(t, m, tt.ev)
+			if got := userRowCount(m); got != 0 {
+				t.Errorf("kindUser rows = %d, want 0 (a subagent's own turn must not commit a user row)", got)
 			}
 		})
 	}

@@ -98,6 +98,7 @@ func New(ctx context.Context, agent Agent, open OpenAgent, banner AgentBanner) S
 		appCtx:      ctx,
 		banner:      banner,
 		status:      StatusIdle,
+		transcript:  transcriptModel{primaryLoopID: agent.PrimaryLoopID()},
 		scrollback:  newScrollbackModel(0),
 		interaction: newInteractionModel(),
 		expand:      true,
@@ -317,7 +318,9 @@ func (m *Screen) handleReopenResult(msg reopenResultMsg) tea.Cmd {
 	m.sub = nil
 	old := m.agent
 	m.agent = msg.agent
-	m.transcript = transcriptModel{}
+	// Read the NEW agent's primary loop id (the swap above happened first) so the
+	// fresh transcript scopes its committed user rows to the replacement loop.
+	m.transcript = transcriptModel{primaryLoopID: m.agent.PrimaryLoopID()}
 	m.scrollback = newScrollbackModel(m.width)
 	m.interaction = m.interaction.ClearPrompts()
 	m.status = StatusIdle
