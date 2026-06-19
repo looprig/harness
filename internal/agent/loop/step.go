@@ -32,20 +32,6 @@ const (
 	stepFailed
 )
 
-// step is the runtime-hierarchy wrapper for one LLM request/response cycle,
-// parallel to block/turn. It currently holds only stepState; whether these thin
-// wrappers earn their keep is validated in the Phase 10 loopConfig/loopState
-// reshape (see Open Items A in docs/plans/loop-machine-design.md). Do not delete
-// in isolation — keep block/step/turn symmetric.
-type step struct {
-	state stepState
-}
-
-// newStep constructs a step from an initial stepState.
-func newStep(state stepState) step {
-	return step{state: state}
-}
-
 // stepConfig carries the dependencies of one LLM request/response cycle: the
 // request to stream, the client to stream it through, and the event sink for live
 // TokenDeltas. Config/dependencies stay at this boundary; stepState owns one
@@ -70,6 +56,11 @@ type stepResult struct {
 // zero or more ToolResultMessages), the block accumulator for the in-progress
 // assistant blocks, and its lifecycle status. The zero blockState is ready to
 // use.
+//
+// Phase 10 (Open Items A) collapsed the thin `step{state stepState}` wrapper:
+// like block, it was a one-field struct with no methods and no runtime role, so
+// runStep now takes stepState directly (YAGNI). The turn runtime state stays the
+// real one, owned by the actor.
 type stepState struct {
 	// sessionID is copied from the turn's identity (shared across the session).
 	sessionID uuid.UUID
@@ -125,8 +116,7 @@ func newStepState(sessionID, loopID, turnID, stepID uuid.UUID, index StepIndex) 
 // re-encodes cleanly; the raw executable view (state.blocks.ToolUses) keeps the
 // RAW folded Input so RunBatch detects the invalid JSON and reports it as a
 // pre-execution, model-visible tool-result error.
-func runStep(ctx context.Context, cfg stepConfig, turnIndex event.TurnIndex, s step) stepResult {
-	st := s.state
+func runStep(ctx context.Context, cfg stepConfig, turnIndex event.TurnIndex, st stepState) stepResult {
 
 	sr, err := cfg.client.Stream(ctx, cfg.req)
 	if err != nil {

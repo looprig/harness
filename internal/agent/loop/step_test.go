@@ -22,11 +22,11 @@ func mustUUID(t *testing.T) uuid.UUID {
 	return id
 }
 
-// newTestStep builds a step over a fresh stepState with the given identity ids
-// and index, the way runTurn does before each LLM cycle.
-func newTestStep(t *testing.T, index StepIndex) step {
+// newTestStep builds a fresh stepState with the given identity ids and index,
+// the way runTurn does before each LLM cycle.
+func newTestStep(t *testing.T, index StepIndex) stepState {
 	t.Helper()
-	return newStep(newStepState(mustUUID(t), mustUUID(t), mustUUID(t), mustUUID(t), index))
+	return newStepState(mustUUID(t), mustUUID(t), mustUUID(t), mustUUID(t), index)
 }
 
 func TestNewStepState(t *testing.T) {

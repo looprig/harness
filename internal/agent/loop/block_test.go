@@ -11,8 +11,7 @@ import (
 // chunk's concrete type the same way the chunk layer does. It returns the
 // blockState so a test can materialize the AIMessage / ToolUses.
 func feedBlock(chunks []content.Chunk) *blockState {
-	b := newBlock(blockState{})
-	st := &b.state
+	st := &blockState{}
 	for _, c := range chunks {
 		switch v := c.(type) {
 		case *content.TextChunk:

@@ -5,24 +5,16 @@ import (
 	"github.com/inventivepotter/urvi/internal/content/streamaccumulator"
 )
 
-// block is the runtime-hierarchy wrapper for one step's assistant-block
-// accumulation, parallel to step/turn. It wraps the blockState that folds
-// streamed chunks into the thinking/text/tool-use accumulators and materializes
-// a single AIMessage. It currently holds only blockState; whether these thin
-// wrappers earn their keep is validated in the Phase 10 loopConfig/loopState
-// reshape (see Open Items A in docs/plans/loop-machine-design.md). Do not delete
-// in isolation — keep block/step/turn symmetric.
-type block struct {
-	state blockState
-}
-
-// newBlock constructs a block from an initial blockState.
-func newBlock(state blockState) block {
-	return block{state: state}
-}
-
 // blockState is the assistant block state for one AIMessage: thinking, text, and
 // tool-use blocks accumulated from chunks. The zero value is ready to use.
+//
+// Phase 10 (Open Items A) validated the thin `block{state blockState}` wrapper
+// against real code and COLLAPSED it: it was a one-field struct with no methods
+// and no runtime role beyond holding its state — every caller reached straight
+// through to blockState. blockState carries the materialization methods
+// (AIMessage/ToolUses) directly, so the wrapper added no value (YAGNI). The step
+// wrapper was collapsed for the same reason; the turn runtime state is the real
+// one and is owned by the actor.
 type blockState struct {
 	msgs blockMessages
 }

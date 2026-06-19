@@ -193,7 +193,7 @@ func runTurn(ctx context.Context, cfg turnConfig, ts turnState) event.Event {
 		st := newStepState(identity.sessionID, identity.loopID, identity.turnID, stepID, stepIdx)
 
 		// runStep owns the LLM cycle: stream → exactly one AIMessage into st.msgs[0].
-		res := runStep(ctx, stepConfig{req: req, client: cfg.client, emit: cfg.emit}, ts.index, newStep(st))
+		res := runStep(ctx, stepConfig{req: req, client: cfg.client, emit: cfg.emit}, ts.index, st)
 		if res.terminal != nil {
 			// The in-flight step never completed: discard it (it was never added to
 			// ts.msgs and never committed) and return the terminal. Committed steps
