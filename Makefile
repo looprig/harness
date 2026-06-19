@@ -1,5 +1,12 @@
 .PHONY: build run test lint vuln verify secure fuzz
 
+# Build from the vendored dependency tree: offline, reproducible, and auditable
+# (every dependency's source lives in vendor/ and shows up in review diffs). Go
+# auto-selects -mod=vendor when vendor/ is present; we export it explicitly so a
+# stray global GOFLAGS (e.g. -mod=mod) can't silently switch the build off the
+# vendored tree. Do NOT use -mod=readonly here — it ignores vendor/ entirely.
+export GOFLAGS := -mod=vendor
+
 build:
 	CGO_ENABLED=0 go build -trimpath -o bin/urvi ./cmd/cli
 

@@ -9,7 +9,9 @@
 # Go build artifacts
 *.test
 *.out
-/vendor/
+
+# NOTE: vendor/ is intentionally committed (vendored dependency tree) so all
+# third-party source is in-repo, auditable in review diffs, and builds offline.
 
 # Environment & secrets
 .env
