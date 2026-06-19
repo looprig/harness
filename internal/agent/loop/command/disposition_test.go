@@ -74,6 +74,16 @@ func TestDispositionVariants(t *testing.T) {
 			},
 		},
 		{
+			name: "TurnRejected RejectInternal",
+			d:    command.TurnRejected{Reason: command.RejectInternal},
+			assert: func(t *testing.T, d command.Disposition) {
+				r, _ := d.(command.TurnRejected)
+				if r.Reason != command.RejectInternal {
+					t.Errorf("reason = %d, want RejectInternal", r.Reason)
+				}
+			},
+		},
+		{
 			name: "Started zero ids is boundary",
 			d:    command.Started{},
 			assert: func(t *testing.T, d command.Disposition) {
@@ -104,6 +114,7 @@ func TestRejectReasonValues(t *testing.T) {
 		{name: "RejectBusy is zero", r: command.RejectBusy, want: 0},
 		{name: "RejectQueueFull is one", r: command.RejectQueueFull, want: 1},
 		{name: "RejectShuttingDown is two", r: command.RejectShuttingDown, want: 2},
+		{name: "RejectInternal is three", r: command.RejectInternal, want: 3},
 	}
 	for _, tt := range tests {
 		tt := tt

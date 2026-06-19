@@ -396,8 +396,10 @@ func newLoopWithIDGen(t *testing.T, client llm.LLM, gen idGenerator, sinks ...ev
 
 // TestTurnIDGenerationFailure covers branch 1: when the id generator fails while
 // minting the per-turn TurnID for a StartOnly submit, the turn does not start, the
-// actor replies TurnRejected (fail-secure: it cannot mint a TurnID, so it declines
-// the work), the Events channel is closed, and the actor stays usable.
+// actor replies TurnRejected{RejectInternal} (fail-secure: it cannot mint a TurnID,
+// so it declines the work — but the loop is healthy and the caller MAY retry, so
+// the reason is the transient RejectInternal, NOT RejectShuttingDown), the Events
+// channel is closed, and the actor stays usable.
 func TestTurnIDGenerationFailure(t *testing.T) {
 	t.Parallel()
 	genErr := errors.New("rand source exhausted")
@@ -422,8 +424,12 @@ func TestTurnIDGenerationFailure(t *testing.T) {
 			l.Commands <- command.UserInput{Mode: command.StartOnly, Blocks: nil, Events: ev, Abandoned: ab, Ack: ack}
 
 			d := <-ack
-			if _, ok := d.(command.TurnRejected); !ok {
+			rej, ok := d.(command.TurnRejected)
+			if !ok {
 				t.Fatalf("disposition = %T, want command.TurnRejected (id-gen failure)", d)
+			}
+			if rej.Reason != command.RejectInternal {
+				t.Fatalf("reject reason = %d, want RejectInternal (transient id-gen failure, not ShuttingDown)", rej.Reason)
 			}
 			if _, ok := <-ev; ok {
 				t.Error("rejected turn's Events channel should be closed")

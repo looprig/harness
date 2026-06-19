@@ -62,7 +62,8 @@ func (e *SessionError) Unwrap() error { return e.Cause }
 // turn for a StartOnly submit. Invoke/Stream are the programmatic single-shot
 // (start-or-reject) callers, so a non-Started disposition is surfaced as this
 // typed error. Reason carries the loop's RejectReason (Busy/QueueFull/
-// ShuttingDown) so callers can errors.As and branch (e.g. retry-on-busy).
+// ShuttingDown/Internal) so callers can errors.As and branch (e.g. retry-on-busy,
+// or retry a transient RejectInternal).
 type TurnRejectedError struct {
 	Reason command.RejectReason
 }
@@ -75,6 +76,10 @@ func (e *TurnRejectedError) Error() string {
 		return "session: turn rejected: queue full"
 	case command.RejectShuttingDown:
 		return "session: turn rejected: loop shutting down"
+	case command.RejectInternal:
+		// Transient internal failure (e.g. id generation); the loop is healthy and
+		// the caller MAY retry. Distinct from RejectShuttingDown.
+		return "session: turn rejected: transient internal failure"
 	default:
 		return "session: turn rejected"
 	}

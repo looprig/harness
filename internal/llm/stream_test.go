@@ -74,6 +74,72 @@ func TestStreamReader_Next(t *testing.T) {
 	}
 }
 
+// TestStreamReader_CloseIdempotent asserts Close runs the wrapped closer at most
+// once across repeated calls, and every call returns the first call's result.
+func TestStreamReader_CloseIdempotent(t *testing.T) {
+	t.Parallel()
+
+	errClose := errors.New("close failed")
+
+	cases := []struct {
+		name     string
+		closer   func(calls *int) func() error
+		calls    int // number of Close() invocations
+		wantRuns int // how many times the wrapped closer must run
+		wantErr  error
+	}{
+		{
+			name:     "double close on nil closer runs nothing, returns nil",
+			closer:   nil,
+			calls:    2,
+			wantRuns: 0,
+			wantErr:  nil,
+		},
+		{
+			name: "double close runs closer once, returns nil twice",
+			closer: func(calls *int) func() error {
+				return func() error { *calls++; return nil }
+			},
+			calls:    2,
+			wantRuns: 1,
+			wantErr:  nil,
+		},
+		{
+			name: "triple close runs error-closer once, returns same err each call",
+			closer: func(calls *int) func() error {
+				return func() error { *calls++; return errClose }
+			},
+			calls:    3,
+			wantRuns: 1,
+			wantErr:  errClose,
+		},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			runs := 0
+			var closer func() error
+			if tc.closer != nil {
+				closer = tc.closer(&runs)
+			}
+			next := func() (string, error) { return "", io.EOF }
+			r := llm.NewStreamReader(next, closer)
+
+			for i := 0; i < tc.calls; i++ {
+				if err := r.Close(); !errors.Is(err, tc.wantErr) {
+					t.Errorf("Close() call %d error = %v, want %v", i, err, tc.wantErr)
+				}
+			}
+			if runs != tc.wantRuns {
+				t.Errorf("closer ran %d times, want %d", runs, tc.wantRuns)
+			}
+		})
+	}
+}
+
 func TestStreamReader_Close(t *testing.T) {
 	t.Parallel()
 

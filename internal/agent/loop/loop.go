@@ -138,7 +138,9 @@ const (
 
 // inboxCap bounds loopState.inbox. A submit that arrives while the queue is full
 // is rejected with TurnRejected{RejectQueueFull} (a length check, never a blocking
-// send), so the actor never blocks on a queue push.
+// send), so the actor never blocks on a queue push. WHY a bound at all: it caps the
+// memory held by accepted-but-unresolved submits so a producer that floods the loop
+// cannot grow the inbox without limit. 64 is a generous default, not a tuned value.
 const inboxCap = 64
 
 // queuedInput is an accepted-but-unresolved submit sitting in loopState.inbox.
@@ -533,11 +535,11 @@ func listen(ctx context.Context, cfg Config, commands <-chan command.Command, ga
 	// per-turn stream (nil for a fan-in-only submit). On an id-gen failure while
 	// starting, the rejected turn's Events channel is closed and TurnRejected{Busy}
 	// is mapped to a TurnRejected so the caller always unblocks. A crypto/rand
-	// failure means the actor cannot mint the TurnID — a serious system fault — so
+	// failure means the actor cannot mint the TurnID — a transient system fault — so
 	// the loop declines the work (fail-secure): it closes the per-turn stream, logs
-	// the typed IDGenerationError, and replies TurnRejected{RejectShuttingDown} (the
-	// "loop declines, do not retry by queueing" reason; there is no id-error
-	// Disposition variant in this phase).
+	// the typed IDGenerationError, and replies TurnRejected{RejectInternal} (a
+	// transient internal failure; the loop is healthy and the caller MAY retry —
+	// distinct from RejectShuttingDown, which says the loop is going away).
 	decideSubmit := func(qi queuedInput, queueable bool, events chan<- event.Event, abandoned <-chan struct{}, ack chan<- command.Disposition) {
 		switch {
 		case state.status == loopShuttingDown:
@@ -566,9 +568,11 @@ func listen(ctx context.Context, cfg Config, commands <-chan command.Command, ga
 			turnID, err := startTurn(qi, events, abandoned)
 			if err != nil {
 				// Fail-secure: cannot mint a TurnID. Decline the work, close the
-				// per-turn stream, and reply a rejection so the caller unblocks.
+				// per-turn stream, and reply a rejection so the caller unblocks. The
+				// loop is healthy (only id-gen failed), so this is RejectInternal — a
+				// transient failure the caller MAY retry, NOT RejectShuttingDown.
 				slog.Error("turn id generation failed; rejecting submit", "error", err)
-				tryAck[command.Disposition](ack, command.TurnRejected{Reason: command.RejectShuttingDown})
+				tryAck[command.Disposition](ack, command.TurnRejected{Reason: command.RejectInternal})
 				if events != nil {
 					close(events)
 				}

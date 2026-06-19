@@ -52,6 +52,10 @@ const (
 	RejectQueueFull
 	// RejectShuttingDown: the loop is shutting down and accepts no new input.
 	RejectShuttingDown
+	// RejectInternal: a transient internal failure, e.g. id generation; the submit
+	// was not accepted but the loop is healthy. Distinct from RejectShuttingDown
+	// (the loop is NOT going away) — the caller MAY retry.
+	RejectInternal
 )
 
 // CancelResult is the loop's answer to a CancelQueuedInput. It is a sealed
@@ -60,11 +64,16 @@ const (
 // un-commit what is in the transcript).
 type CancelResult interface{ isCancelResult() }
 
-// Cancelled reports the queued input was found still queued and removed.
+// Cancelled reports the queued input was found still queued and removed. It carries
+// no InputID echo: the caller already holds the InputID it passed to
+// CancelQueuedInput, so the empty marker suffices.
 type Cancelled struct{}
 
 // AlreadyCommitted reports the queued input had already started or folded into a
-// turn (identified by TurnID) and so could not be retracted.
+// turn (identified by TurnID) and so could not be retracted. It is ALSO the answer
+// for an unknown / never-queued InputID: there is nothing to retract, so TurnID is
+// simply the currently-active turn (zero if idle), not necessarily related to the
+// cancelled id.
 type AlreadyCommitted struct {
 	TurnID uuid.UUID
 }
