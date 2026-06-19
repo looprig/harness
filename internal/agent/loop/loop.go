@@ -362,6 +362,9 @@ func listen(ctx context.Context, cfg Config, commands <-chan command.Command, ga
 				turnCtx, cancel := context.WithCancel(c.Ctx)
 				state.cancelTurn = cancel
 				idx, preMsgs := state.turnIndex, state.msgs
+				// Identity stamped onto each step's StepDone. loopState.id is this
+				// loop's id; turnID was just minted above for this turn.
+				identity := turnIdentity{sessionID: state.sessionID, loopID: state.id, turnID: state.turnID}
 				go func() {
 					defer cancel()
 					defer func() {
@@ -389,7 +392,7 @@ func listen(ctx context.Context, cfg Config, commands <-chan command.Command, ga
 						case <-turnCtx.Done():
 						}
 					}
-					updated, terminal := runTurn(turnCtx, c.Input, idx, preMsgs, cfg, cfg.Client, gateReg, emit)
+					updated, terminal := runTurn(turnCtx, c.Input, idx, identity, preMsgs, cfg, cfg.Client, gateReg, emit)
 					internal <- turnResult{msgs: updated, terminal: terminal}
 				}()
 				c.Ack <- nil

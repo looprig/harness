@@ -19,6 +19,20 @@ func drainEmit(events *[]event.Event) func(event.Event) {
 	return func(ev event.Event) { *events = append(*events, ev) }
 }
 
+// testIdentity mints a fresh (session, loop, turn) identity for a runTurn call so
+// emitted step events carry non-zero, consistent ids. It panics on the
+// near-impossible crypto/rand failure (acceptable in a test helper).
+func testIdentity() turnIdentity {
+	must := func() uuid.UUID {
+		id, err := uuid.New()
+		if err != nil {
+			panic(err)
+		}
+		return id
+	}
+	return turnIdentity{sessionID: must(), loopID: must(), turnID: must()}
+}
+
 // ---------------------------------------------------------------------------
 // Multi-stream fake LLM: returns a DIFFERENT scripted stream per Stream() call
 // (one per agentic iteration), records every request it received, and can be told
@@ -169,7 +183,7 @@ func TestRunTurnAgentic(t *testing.T) {
 			{textChunk("all done")},                      // iter2: text-only → TurnDone
 		}}
 		var emitted []event.Event
-		msgs, terminal := runTurn(context.Background(), input, 1, nil, cfg, client, noGateReg(), drainEmit(&emitted))
+		msgs, terminal := runTurn(context.Background(), input, 1, testIdentity(), nil, cfg, client, noGateReg(), drainEmit(&emitted))
 
 		done, ok := terminal.(event.TurnDone)
 		if !ok {
@@ -226,7 +240,7 @@ func TestRunTurnAgentic(t *testing.T) {
 			{textChunk("final answer")},
 		}}
 		var emitted []event.Event
-		_, terminal := runTurn(context.Background(), input, 1, nil, cfg, client, noGateReg(), drainEmit(&emitted))
+		_, terminal := runTurn(context.Background(), input, 1, testIdentity(), nil, cfg, client, noGateReg(), drainEmit(&emitted))
 		if _, ok := terminal.(event.TurnDone); !ok {
 			t.Fatalf("terminal = %T, want TurnDone (text-only on the limit iteration must win)", terminal)
 		}
@@ -244,7 +258,7 @@ func TestRunTurnAgentic(t *testing.T) {
 		pre := content.AgenticMessages{&content.UserMessage{Message: content.Message{Role: content.RoleUser, Blocks: []content.Block{&content.TextBlock{Text: "earlier"}}}}}
 		base := len(pre)
 		var emitted []event.Event
-		msgs, terminal := runTurn(context.Background(), input, 1, pre, cfg, client, noGateReg(), drainEmit(&emitted))
+		msgs, terminal := runTurn(context.Background(), input, 1, testIdentity(), pre, cfg, client, noGateReg(), drainEmit(&emitted))
 
 		failed, ok := terminal.(event.TurnFailed)
 		if !ok {
@@ -277,7 +291,7 @@ func TestRunTurnAgentic(t *testing.T) {
 			{textChunk("recovered")},                               // model reacts → TurnDone
 		}}
 		var emitted []event.Event
-		msgs, terminal := runTurn(context.Background(), input, 1, nil, cfg, client, noGateReg(), drainEmit(&emitted))
+		msgs, terminal := runTurn(context.Background(), input, 1, testIdentity(), nil, cfg, client, noGateReg(), drainEmit(&emitted))
 
 		if _, ok := terminal.(event.TurnDone); !ok {
 			t.Fatalf("terminal = %T, want TurnDone (turn recovers from malformed args)", terminal)
@@ -351,7 +365,7 @@ func TestRunTurnAgentic(t *testing.T) {
 			{textChunk("done")},
 		}}
 		var emitted []event.Event
-		msgs, terminal := runTurn(context.Background(), input, 1, nil, cfg, client, noGateReg(), drainEmit(&emitted))
+		msgs, terminal := runTurn(context.Background(), input, 1, testIdentity(), nil, cfg, client, noGateReg(), drainEmit(&emitted))
 		if _, ok := terminal.(event.TurnDone); !ok {
 			t.Fatalf("terminal = %T, want TurnDone", terminal)
 		}
@@ -400,7 +414,7 @@ func TestRunTurnAgentic(t *testing.T) {
 		pre := content.AgenticMessages{&content.UserMessage{Message: content.Message{Role: content.RoleUser, Blocks: []content.Block{&content.TextBlock{Text: "earlier"}}}}}
 		base := len(pre)
 		var emitted []event.Event
-		msgs, terminal := runTurn(ctx, input, 1, pre, cfg, client, noGateReg(), drainEmit(&emitted))
+		msgs, terminal := runTurn(ctx, input, 1, testIdentity(), pre, cfg, client, noGateReg(), drainEmit(&emitted))
 
 		if _, ok := terminal.(event.TurnInterrupted); !ok {
 			t.Fatalf("terminal = %T, want TurnInterrupted", terminal)
@@ -421,7 +435,7 @@ func TestRunTurnAgentic(t *testing.T) {
 		cfg := agenticCfg(agenticToolSet([]tool.InvokableTool{echoA, echoB}, 25, 100))
 		client := &scriptedLLM{scripts: [][]content.Chunk{{textChunk("hi")}}}
 		var emitted []event.Event
-		runTurn(context.Background(), input, 1, nil, cfg, client, noGateReg(), drainEmit(&emitted))
+		runTurn(context.Background(), input, 1, testIdentity(), nil, cfg, client, noGateReg(), drainEmit(&emitted))
 
 		reqs := client.requests()
 		if len(reqs) == 0 {
@@ -455,7 +469,7 @@ func TestRunTurnAgentic(t *testing.T) {
 			{toolUseChunk(0, "id-1", "Echo", `{}`), toolUseChunk(1, "id-2", "Echo", `{}`)},
 		}}
 		var emitted []event.Event
-		msgs, terminal := runTurn(context.Background(), input, 1, nil, cfg, client, noGateReg(), drainEmit(&emitted))
+		msgs, terminal := runTurn(context.Background(), input, 1, testIdentity(), nil, cfg, client, noGateReg(), drainEmit(&emitted))
 		failed, ok := terminal.(event.TurnFailed)
 		if !ok {
 			t.Fatalf("terminal = %T, want TurnFailed", terminal)
@@ -476,14 +490,15 @@ func TestRunTurnAgentic(t *testing.T) {
 
 func TestRunTurn(t *testing.T) {
 	t.Parallel()
-	cfg := Config{Model: llm.ModelSpec{Model: "m"}}
+	// idGen is wired the same way loop.New does it: runTurn mints a StepID per step.
+	cfg := Config{Model: llm.ModelSpec{Model: "m"}, idGen: uuid.New}
 	input := []content.Block{&content.TextBlock{Text: "hi"}}
 
 	t.Run("success appends user+assistant and returns TurnDone", func(t *testing.T) {
 		t.Parallel()
 		client := &fakeLLM{chunks: []content.Chunk{textChunk("hel"), textChunk("lo")}}
 		var emitted []event.Event
-		msgs, terminal := runTurn(context.Background(), input, 1, nil, cfg, client, noGateReg(), drainEmit(&emitted))
+		msgs, terminal := runTurn(context.Background(), input, 1, testIdentity(), nil, cfg, client, noGateReg(), drainEmit(&emitted))
 
 		done, ok := terminal.(event.TurnDone)
 		if !ok {
@@ -510,7 +525,7 @@ func TestRunTurn(t *testing.T) {
 		boom := &llm.ValidationError{Field: "x", Reason: "boom"}
 		client := &fakeLLM{streamErr: boom}
 		var emitted []event.Event
-		msgs, terminal := runTurn(context.Background(), input, 1, nil, cfg, client, noGateReg(), drainEmit(&emitted))
+		msgs, terminal := runTurn(context.Background(), input, 1, testIdentity(), nil, cfg, client, noGateReg(), drainEmit(&emitted))
 
 		failed, ok := terminal.(event.TurnFailed)
 		if !ok {
@@ -529,7 +544,7 @@ func TestRunTurn(t *testing.T) {
 		t.Parallel()
 		client := &fakeLLM{chunks: nil}
 		var emitted []event.Event
-		msgs, terminal := runTurn(context.Background(), input, 1, nil, cfg, client, noGateReg(), drainEmit(&emitted))
+		msgs, terminal := runTurn(context.Background(), input, 1, testIdentity(), nil, cfg, client, noGateReg(), drainEmit(&emitted))
 
 		failed, ok := terminal.(event.TurnFailed)
 		if !ok {
@@ -554,7 +569,7 @@ func TestRunTurn(t *testing.T) {
 		chunks := []content.Chunk{textChunk(""), textChunk("")}
 		client := &fakeLLM{chunks: chunks}
 		var emitted []event.Event
-		msgs, terminal := runTurn(context.Background(), input, 1, nil, cfg, client, noGateReg(), drainEmit(&emitted))
+		msgs, terminal := runTurn(context.Background(), input, 1, testIdentity(), nil, cfg, client, noGateReg(), drainEmit(&emitted))
 
 		failed, ok := terminal.(event.TurnFailed)
 		if !ok {
@@ -585,7 +600,7 @@ func TestRunTurn(t *testing.T) {
 		cancel()
 		client := &fakeLLM{streamErr: context.Canceled}
 		var emitted []event.Event
-		msgs, terminal := runTurn(ctx, input, 1, nil, cfg, client, noGateReg(), drainEmit(&emitted))
+		msgs, terminal := runTurn(ctx, input, 1, testIdentity(), nil, cfg, client, noGateReg(), drainEmit(&emitted))
 
 		if _, ok := terminal.(event.TurnInterrupted); !ok {
 			t.Fatalf("terminal = %T, want TurnInterrupted", terminal)
@@ -600,7 +615,7 @@ func TestRunTurn(t *testing.T) {
 		boom := &llm.ValidationError{Field: "y", Reason: "midstream"}
 		client := &fakeLLM{chunks: []content.Chunk{textChunk("partial")}, nextErr: boom}
 		var emitted []event.Event
-		msgs, terminal := runTurn(context.Background(), input, 1, nil, cfg, client, noGateReg(), drainEmit(&emitted))
+		msgs, terminal := runTurn(context.Background(), input, 1, testIdentity(), nil, cfg, client, noGateReg(), drainEmit(&emitted))
 
 		failed, ok := terminal.(event.TurnFailed)
 		if !ok {
@@ -619,7 +634,7 @@ func TestRunTurn(t *testing.T) {
 		t.Parallel()
 		client := &fakeLLM{chunks: []content.Chunk{textChunk("a"), textChunk("b")}}
 		var emitted []event.Event
-		runTurn(context.Background(), input, 1, nil, cfg, client, noGateReg(), drainEmit(&emitted))
+		runTurn(context.Background(), input, 1, testIdentity(), nil, cfg, client, noGateReg(), drainEmit(&emitted))
 		if len(emitted) < 1 {
 			t.Fatal("no events emitted")
 		}

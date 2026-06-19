@@ -169,7 +169,7 @@ func TestBlockStateToolUsesIndependentOfAIMessage(t *testing.T) {
 	if len(raw) != 1 {
 		t.Fatalf("ToolUses() len = %d, want 1", len(raw))
 	}
-	// Find the stored tool-use block and mutate its Input as streamOnce would.
+	// Find the stored tool-use block and mutate its Input as runStep would.
 	var stored *content.ToolUseBlock
 	for _, b := range msg.Blocks {
 		if x, ok := b.(*content.ToolUseBlock); ok {
