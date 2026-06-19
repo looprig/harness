@@ -1,7 +1,7 @@
 # In-Session Subagents + Unified Submit Surface
 
 **Date:** 2026-06-19
-**Status:** Draft — one OPEN question (sub-loop lifecycle, §8)
+**Status:** Draft — no blocking open questions (loop lifecycle resolved, §8)
 **Depends on:** `docs/plans/loop-machine-design.md` (multi-loop sessions, federated
 quiescence, the publish/subscribe hub, `NewLoop`, producer-identity `Header`s) and
 `docs/plans/2026-06-18-tui-event-adoption-design.md` (the TUI is already a projection of
@@ -135,19 +135,20 @@ any wake token. The sub-loop's own `{kindLoop, subLoopID}` activity is also in t
 set. (The `expectTurn`/`SubagentResult` wake-token path remains for the *async* hand-back
 pattern, which this synchronous cut does not use.)
 
-## 8. OPEN QUESTION — sub-loop lifecycle
+## 8. Loop lifecycle — loops are never deleted (intentional)
 
-**Is a subagent loop one-shot or persistent?**
+There is **no loop teardown** in the session, by design. A subagent call therefore:
+spawn the loop (`NewLoop`) → run the task (`AgentInput` turn) → the result drains back to
+**whoever called the tool** (the parent turn's tool execution receives the final text and
+continues) → the loop then **sits idle** in the session's loop registry, retained with its
+history. Nothing deletes it. So there is no "one-shot vs persistent (teardown)" fork — the
+loop always persists idle.
 
-- **One-shot (recommended for this cut):** spawn → run the task → tear the loop down. The
-  simplest, fully covered by §2–§7. Persistence becomes a clean follow-on layer.
-- **Persistent ("agent teams"):** spawn → run → the loop stays **idle with its history**,
-  and a follow-up Subagent call routes back to the *same* loop. This needs loop identity /
-  addressing (how a follow-up names the existing loop), idle-loop retention + teardown
-  policy, and history reuse — a larger surface.
-
-Recommendation: **one-shot first**, persistence as a follow-on. Everything in §1–§7 stands
-either way; persistence only adds loop addressing + retention on top.
+This cut **spawns a fresh loop per subagent invocation** (each call gets a new idle loop).
+Because idle loops are retained, **routing a follow-up subagent call back to the same loop
+("agent teams" — reuse an existing idle loop by identity, replaying its history)** is a
+purely **additive follow-on**: it needs loop addressing/identity at the tool boundary, but
+no teardown and no change to §1–§7. Not required for this cut, not a blocker.
 
 ## Testing
 
