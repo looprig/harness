@@ -164,6 +164,16 @@ func (s *AgentSession) SubscribeEvents(filter event.EventFilter) (*hub.EventSubs
 	return s.hub.SubscribeEvents(filter)
 }
 
+// PrimaryLoopID returns the session's primary loop id — the default target for
+// Invoke/Stream and the loop whose live Ephemeral tokens a single-loop TUI streams.
+// A whole-session subscriber builds its EventFilter from it (primary-only Ephemeral
+// + all-loop Enduring). It is read-only identity, safe to call concurrently.
+func (s *AgentSession) PrimaryLoopID() uuid.UUID {
+	s.loopsMu.RLock()
+	defer s.loopsMu.RUnlock()
+	return s.primaryLoopID
+}
+
 // WaitIdle blocks until the session is quiescent, ctx is done, or the session has
 // stopped (hub.ErrSessionStopped). It is the headless caller's "is the whole
 // interaction at rest?" primitive; it delegates to the hub's quiescence model.

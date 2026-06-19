@@ -9,6 +9,7 @@ import (
 	"github.com/inventivepotter/urvi/internal/agent/loop/event"
 	"github.com/inventivepotter/urvi/internal/agent/session/hub"
 	"github.com/inventivepotter/urvi/internal/content"
+	"github.com/inventivepotter/urvi/internal/uuid"
 )
 
 // allFilter delivers every event from every loop in both classes.
@@ -55,6 +56,56 @@ func TestHubWiringDeliversSessionEvents(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatalf("subscriber did not receive the session event")
+	}
+}
+
+// TestSubscribeSeamDefaultFilterDeliversSessionEvent proves the whole-session
+// subscribe seam (11.1): a subscription opened with the single-loop TUI default
+// filter (primary-only Ephemeral, all-loop Enduring) is usable and delivers a
+// session-scoped event (SessionIdle) — which bypasses the loop filter — and that the
+// concrete *hub.EventSubscription satisfies the consumer-facing event.Subscription
+// contract the TUI depends on.
+func TestSubscribeSeamDefaultFilterDeliversSessionEvent(t *testing.T) {
+	t.Parallel()
+	s, err := NewAgent(context.Background(), cfg(&stubLLM{chunks: []content.Chunk{textChunk("x")}}))
+	if err != nil {
+		t.Fatalf("NewAgent: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Shutdown(context.Background()) })
+
+	// The single-loop default: live tokens from the primary loop only, finalized
+	// events from every loop. Session-scoped events ignore both scopes.
+	filter := event.EventFilter{
+		Ephemeral: event.LoopScope{Loops: map[uuid.UUID]struct{}{s.PrimaryLoopID(): {}}},
+		Enduring:  event.LoopScope{All: true},
+	}
+
+	// The seam returns a concrete *hub.EventSubscription; it must satisfy the
+	// consumer-facing event.Subscription the TUI's EventStream aliases.
+	var sub event.Subscription
+	sub, err = s.SubscribeEvents(filter)
+	if err != nil {
+		t.Fatalf("SubscribeEvents: %v", err)
+	}
+	t.Cleanup(func() { _ = sub.Close() })
+
+	// A session-scoped event must arrive through the default filter.
+	if err := s.PublishEvent(context.Background(), event.SessionIdle{Header: event.Header{SessionID: s.SessionID}}); err != nil {
+		t.Fatalf("PublishEvent: %v", err)
+	}
+	select {
+	case ev, ok := <-sub.Events():
+		if !ok {
+			t.Fatalf("subscription closed unexpectedly")
+		}
+		if _, isIdle := ev.(event.SessionIdle); !isIdle {
+			t.Fatalf("got %T, want event.SessionIdle", ev)
+		}
+	case <-time.After(time.Second):
+		t.Fatalf("subscriber did not receive the session-scoped event through the default filter")
+	}
+	if err := sub.Err(); err != nil {
+		t.Errorf("sub.Err() = %v, want nil (live subscription)", err)
 	}
 }
 

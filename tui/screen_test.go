@@ -36,6 +36,13 @@ type fakeAgent struct {
 	closeErr     error
 	acceptsImage bool
 
+	// subscribe recorder: the configured stream/error is returned, and the last
+	// filter is captured so a test can assert the wrapper forwarded it.
+	subStream    event.Subscription
+	subErr       error
+	subFilter    event.EventFilter
+	subscribed   bool
+
 	// gate-trio recorders: the configured error is returned, and the last call's
 	// arguments are captured so a test can assert the wrapper forwarded them.
 	approveErr    error
@@ -66,6 +73,15 @@ func (f *fakeAgent) Close(_ context.Context) error {
 }
 
 func (f *fakeAgent) AcceptsImages() bool { return f.acceptsImage }
+
+func (f *fakeAgent) Subscribe(filter event.EventFilter) (EventStream, error) {
+	f.subscribed = true
+	f.subFilter = filter
+	if f.subErr != nil {
+		return nil, f.subErr
+	}
+	return f.subStream, nil
+}
 
 func (f *fakeAgent) Approve(_ context.Context, callID uuid.UUID, scope tool.ApprovalScope) error {
 	f.approveCalled = true

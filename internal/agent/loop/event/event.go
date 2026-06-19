@@ -93,6 +93,24 @@ type Header struct {
 // per-type boilerplate.
 func (h Header) EventHeader() Header { return h }
 
+// Subscription is the consumer-facing handle to a session event fan-in: the
+// read+teardown contract a TUI/CLI (or a future journal) depends on, independent
+// of the concrete subscription implementation. It lives here in the (leaf) event
+// package — the one package every event producer and consumer already imports — so
+// neither side has to depend on the concrete hub type to name the contract
+// (Dependency Inversion). The session hub's *EventSubscription satisfies it
+// structurally.
+//
+// Events yields the filtered fan-in stream and closes on Close or on a hub-forced
+// loss; Close is the consumer's intentional, idempotent teardown; Err reports the
+// typed termination cause (nil for an intentional Close, the loss error for a
+// hub-forced drop).
+type Subscription interface {
+	Events() <-chan Event
+	Close() error
+	Err() error
+}
+
 // ephemeral is the lifecycle mixin for a streaming delta: droppable, never
 // turn-terminal.
 type ephemeral struct{}
