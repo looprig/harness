@@ -32,7 +32,7 @@ const (
 type prompt struct {
 	CallID uuid.UUID
 	// LoopID is the producing loop's id, stamped from the enqueuing event's
-	// Header (zero for a single/primary loop). It scopes terminal-event clearing
+	// Header (zero when that event carries no LoopID). It scopes terminal-event clearing
 	// per loop (design §7): a TurnDone/TurnFailed/TurnInterrupted clears only the
 	// prompts whose LoopID matches the finishing loop, so one loop ending never
 	// abandons a sibling loop's pending gate.
