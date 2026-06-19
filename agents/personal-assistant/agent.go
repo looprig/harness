@@ -198,6 +198,17 @@ func (a *Assistant) StreamBlocks(ctx context.Context, blocks []content.Block) (*
 	return a.session.Stream(ctx, blocks)
 }
 
+// Submit delivers a multimodal user message FIRE-AND-FORGET as a queueable
+// (AllowFold) UserInput and returns the InputID — the CausationID the resulting
+// Reply events (InputQueued / TurnStarted / TurnFoldedInto / TurnRejected /
+// InputCancelled) carry on the session fan-in. The Go error is non-nil only when
+// the command could not be handed to the loop (loop gone, or ctx done); the turn
+// outcome is observed on the Subscribe stream, never returned. It delegates to the
+// session; the wrapper holds no submit state of its own.
+func (a *Assistant) Submit(ctx context.Context, blocks []content.Block) (uuid.UUID, error) {
+	return a.session.Submit(ctx, blocks)
+}
+
 // Subscribe attaches a whole-session event consumer to the session fan-in with
 // filter and returns its event.Subscription (the session hub's *EventSubscription,
 // which satisfies the interface). It is the seam a TUI/CLI uses to observe events

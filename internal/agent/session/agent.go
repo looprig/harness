@@ -534,6 +534,45 @@ func (s *AgentSession) Stream(ctx context.Context, input []content.Block) (*llm.
 	), nil
 }
 
+// Submit sends input as an AllowFold (queueable) UserInput to the primary loop,
+// FIRE-AND-FORGET: it returns the InputID (the submit command's id, == the
+// CausationID on the resulting Reply events) and a transport error only if the
+// command could not be handed to the loop. The outcome — InputQueued /
+// TurnStarted / TurnFoldedInto / TurnRejected / InputCancelled — is observed on
+// the event fan-in (each Reply carries CausationID == this returned id), NOT
+// returned here.
+//
+// AllowFold is the interactive queueable mode: a submit while a turn is running
+// QUEUES rather than rejecting; a submit while idle starts a turn. Submit attaches
+// no per-turn stream (Events/Abandoned nil) — unlike Invoke/Stream, it never reads
+// a reply, so it returns the instant the command is accepted by the loop.
+//
+// The send carries the same escapes as Invoke/Stream: ctx.Done() →
+// SessionContextDone, the loop's Done → SessionLoopExited, and a missing primary
+// loop → SessionLoopNotFound. On any of those the returned id is the zero UUID,
+// because nothing was sent and there is no correlation to hand back.
+func (s *AgentSession) Submit(ctx context.Context, input []content.Block) (uuid.UUID, error) {
+	l, ok := s.loopFor(s.primaryLoopID)
+	if !ok {
+		return uuid.UUID{}, &SessionError{Kind: SessionLoopNotFound}
+	}
+	id, err := s.newCommandID()
+	if err != nil {
+		return uuid.UUID{}, err
+	}
+	select {
+	// User-initiated queueable turn: CausationID is zero (root); Events/Abandoned
+	// nil because the outcome is observed on the session fan-in, not a per-turn
+	// stream.
+	case l.Commands <- command.UserInput{Header: command.Header{ID: id}, Mode: command.AllowFold, Blocks: input}:
+		return id, nil
+	case <-ctx.Done():
+		return uuid.UUID{}, &SessionError{Kind: SessionContextDone, Cause: ctx.Err()}
+	case <-l.Done:
+		return uuid.UUID{}, &SessionError{Kind: SessionLoopExited}
+	}
+}
+
 // Interrupt cancels the running turn. Returns true if a turn was cancelled.
 // ctx allows the caller to time out the cancel attempt if the actor is slow.
 func (s *AgentSession) Interrupt(ctx context.Context) (bool, error) {

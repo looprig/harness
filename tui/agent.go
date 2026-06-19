@@ -22,6 +22,12 @@ type EventStream = event.Subscription
 // satisfies it structurally; the TUI never imports any agent package.
 type Agent interface {
 	StreamBlocks(ctx context.Context, blocks []content.Block) (*llm.StreamReader[event.Event], error)
+	// Submit sends input fire-and-forget as a queueable UserInput; the returned
+	// InputID correlates the Reply events (CausationID) that report the outcome.
+	Submit(ctx context.Context, blocks []content.Block) (uuid.UUID, error)
+	// PrimaryLoopID is the loop whose live Ephemeral stream the TUI watches; used to
+	// build the DefaultEventFilter for the session subscription.
+	PrimaryLoopID() uuid.UUID
 	Interrupt(ctx context.Context) (bool, error)
 	Close(ctx context.Context) error
 	// AcceptsImages reports whether the model accepts image blocks, so buildBlocks

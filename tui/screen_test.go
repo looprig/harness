@@ -29,6 +29,19 @@ type fakeAgent struct {
 	streamReader *llm.StreamReader[event.Event]
 	streamErr    error
 
+	// submit recorder: a configured id/error is returned, and the last call's
+	// blocks are captured so a test can assert the wrapper forwarded them. When
+	// submitID is zero it defaults to a fixed deterministic id so callers always get
+	// a usable correlation id.
+	submitID         uuid.UUID
+	submitErr        error
+	submitCalled     bool
+	lastSubmitBlocks []content.Block
+
+	// primaryLoopID is returned by PrimaryLoopID; zero is a valid fixed id for the
+	// single-loop default filter.
+	primaryLoopID uuid.UUID
+
 	interruptCancelled bool
 	interruptErr       error
 
@@ -38,10 +51,10 @@ type fakeAgent struct {
 
 	// subscribe recorder: the configured stream/error is returned, and the last
 	// filter is captured so a test can assert the wrapper forwarded it.
-	subStream    event.Subscription
-	subErr       error
-	subFilter    event.EventFilter
-	subscribed   bool
+	subStream  event.Subscription
+	subErr     error
+	subFilter  event.EventFilter
+	subscribed bool
 
 	// gate-trio recorders: the configured error is returned, and the last call's
 	// arguments are captured so a test can assert the wrapper forwarded them.
@@ -62,6 +75,24 @@ func (f *fakeAgent) StreamBlocks(_ context.Context, _ []content.Block) (*llm.Str
 	}
 	return f.streamReader, nil
 }
+
+// fixedFakeSubmitID is the deterministic InputID a fakeAgent returns when no
+// submitID is configured, so a test always gets a non-zero correlation id.
+var fixedFakeSubmitID = uuid.UUID{0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00}
+
+func (f *fakeAgent) Submit(_ context.Context, blocks []content.Block) (uuid.UUID, error) {
+	f.submitCalled = true
+	f.lastSubmitBlocks = blocks
+	if f.submitErr != nil {
+		return uuid.UUID{}, f.submitErr
+	}
+	if f.submitID.IsZero() {
+		return fixedFakeSubmitID, nil
+	}
+	return f.submitID, nil
+}
+
+func (f *fakeAgent) PrimaryLoopID() uuid.UUID { return f.primaryLoopID }
 
 func (f *fakeAgent) Interrupt(_ context.Context) (bool, error) {
 	return f.interruptCancelled, f.interruptErr
