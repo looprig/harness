@@ -344,9 +344,9 @@ func NewAgent(ctx context.Context, cfg loop.Config) (*AgentSession, error) {
 }
 
 // Invoke sends input as a StartOnly UserInput and blocks until a terminal event.
-// It is the programmatic single-shot caller (start-or-reject): a Started
-// disposition proceeds; a TurnRejected disposition returns a typed
-// *TurnRejectedError. The submit carries no context (the loop derives the turn
+// It is the programmatic single-shot caller (start-or-reject), reading the outcome
+// from the per-turn stream's first event: an event.TurnStarted proceeds; an
+// event.TurnRejected returns a typed *TurnRejectedError. The submit carries no context (the loop derives the turn
 // ctx from its loopCtx), so cancelling ctx no longer cancels the turn through the
 // command — instead the session translates the boundary cancel into an Interrupt
 // and returns the resulting event.TurnInterrupted.
@@ -442,9 +442,9 @@ func (s *AgentSession) interruptLoop(l *loop.Loop) {
 
 // Stream sends input as a StartOnly UserInput and returns a
 // StreamReader[event.Event] that yields TurnStarted, TokenDelta×N, then one
-// terminal event, then EOF while the caller keeps reading. A Started disposition
-// returns the reader; a TurnRejected disposition returns a typed
-// *TurnRejectedError. Calling sr.Close() abandons the event stream AND interrupts
+// terminal event, then EOF while the caller keeps reading. It reads the per-turn
+// stream's first event: an event.TurnStarted returns the reader (re-yielding that
+// first event); an event.TurnRejected returns a typed *TurnRejectedError. Calling sr.Close() abandons the event stream AND interrupts
 // the turn (the submit carries no ctx, so Close translates into an Interrupt).
 // Callers must either read until EOF or call Close.
 func (s *AgentSession) Stream(ctx context.Context, input []content.Block) (*llm.StreamReader[event.Event], error) {

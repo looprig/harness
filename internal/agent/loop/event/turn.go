@@ -67,9 +67,9 @@ type InputCancelled struct {
 }
 
 // RejectReason explains why a UserInput submit was refused (carried by TurnRejected).
-// It mirrors the loop's command-side reason set (the command package owns the
-// point-to-point copy; this is the event-stream copy, since event must not import
-// command).
+// It is the single source of truth for submit-rejection reasons — the loop publishes
+// it on the event stream; there is no command-side copy (the former
+// command.Disposition reply, with its command.RejectReason, was removed).
 type RejectReason uint8
 
 const (

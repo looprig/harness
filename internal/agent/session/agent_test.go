@@ -694,7 +694,7 @@ func TestConcurrentInvokeIsRejected(t *testing.T) {
 
 // TestStreamBusyRejected asserts Stream is also start-or-reject: a second Stream
 // while a turn occupies the loop returns *TurnRejectedError{RejectBusy} (the
-// TurnRejected disposition mapped to a typed error), never a reader.
+// published event.TurnRejected mapped to a typed error), never a reader.
 func TestStreamBusyRejected(t *testing.T) {
 	t.Parallel()
 	s, err := NewAgent(context.Background(), cfg(&stubLLM{blockUntilCancel: true}))
