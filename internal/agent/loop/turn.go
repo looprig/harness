@@ -91,13 +91,13 @@ type turnConfig struct {
 	// entry. The actor (the inbox's sole owner) pops + clears the inbox in order,
 	// moves the popped entries into an actor-owned draining buffer (so an abnormal
 	// terminal still returns them — they are no longer in the inbox), and replies the
-	// foldedMsgs. runTurn appends each message to turnState.msgs and commits a
+	// queuedInputs. runTurn appends each message to turnState.msgs and commits a
 	// TurnFoldedInto for it via cfg.commit; the actor removes the entry from the
 	// draining buffer at that commit point. It MUST be ctx-cancellable (select on the
 	// reply AND turnCtx.Done) so an Interrupt/Shutdown during the handshake frees
 	// runTurn. runTurn never calls it after a no-tool final answer (a final answer is
 	// not a tool-continuation boundary).
-	drainPending func(context.Context) ([]foldedMsg, error)
+	drainPending func(context.Context) ([]queuedInput, error)
 
 	// emit publishes this loop's events (TurnStarted is actor-emitted; runTurn emits
 	// TokenDeltas, tool lifecycle events, and the turn terminal). StepDone is NOT
@@ -115,18 +115,6 @@ type turnConfig struct {
 type turnCommit struct {
 	Messages content.AgenticMessages
 	Event    event.Event
-}
-
-// foldedMsg is one drained inbox entry handed back to runTurn at a tool-continuation
-// boundary. It carries the message to fold AND the provenance runTurn needs to stamp
-// the TurnFoldedInto event: inputID (-> Header.CausationID + InputID) and triggeredBy
-// (-> Header.TriggeredByLoopID, set for a SubagentResult hand-back, zero for a plain
-// UserInput). triggeredBy is what releases the parent's {wake} quiescence token on the
-// publish path, so it MUST survive the drain handshake.
-type foldedMsg struct {
-	inputID     uuid.UUID
-	triggeredBy uuid.UUID
-	msg         *content.UserMessage
 }
 
 // cloneMessages returns a copy of msgs with its OWN backing array (a fresh slice
@@ -294,21 +282,21 @@ func foldPending(ctx context.Context, cfg turnConfig, ts *turnState) error {
 	if cfg.afterDrain != nil {
 		cfg.afterDrain()
 	}
-	for _, fm := range batch {
-		ts.msgs = append(ts.msgs, fm.msg)
+	for _, qi := range batch {
+		ts.msgs = append(ts.msgs, qi.msg)
 		fold := turnCommit{
-			Messages: content.AgenticMessages{fm.msg},
+			Messages: content.AgenticMessages{qi.msg},
 			Event: event.TurnFoldedInto{
 				Header: event.Header{
 					SessionID:         ts.sessionID,
 					LoopID:            ts.loopID,
 					TurnID:            ts.id,
-					CausationID:       fm.inputID,
-					TriggeredByLoopID: fm.triggeredBy,
+					CausationID:       qi.inputID,
+					TriggeredByLoopID: qi.triggeredBy,
 				},
 				TurnIndex: ts.index,
-				InputID:   fm.inputID,
-				Message:   fm.msg,
+				InputID:   qi.inputID,
+				Message:   qi.msg,
 			},
 		}
 		if cerr := cfg.commit(ctx, fold); cerr != nil {

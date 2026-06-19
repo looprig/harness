@@ -143,26 +143,23 @@ const (
 // cannot grow the inbox without limit. 64 is a generous default, not a tuned value.
 const inboxCap = 64
 
-// queuedInput is an accepted-but-unresolved submit sitting in loopState.inbox.
-// inputID is the submit command's Header.ID (so CancelQueuedInput can remove it by
-// id while it is still queued). triggeredBy is the producing subagent loop id for a
-// SubagentResult (zero for a UserInput); the events caused by this queued input
-// (TurnStarted/TurnFoldedInto/InputCancelled) stamp it as Header.TriggeredByLoopID,
-// which releases the parent's quiescence wake token. triggeredBy is stored now and
-// USED for quiescence in a later phase.
+// queuedInput is an accepted-but-unresolved submit sitting in loopState.inbox,
+// and is also the entry handed back to runTurn at a tool-continuation drain (the
+// drain hands the actor-owned entries straight to runTurn — same provenance, no
+// projection). inputID is the submit command's Header.ID (so CancelQueuedInput can
+// remove it by id while it is still queued). triggeredBy is the producing subagent
+// loop id for a SubagentResult (zero for a UserInput); the events caused by this
+// queued input (TurnStarted/TurnFoldedInto/InputCancelled) stamp it as
+// Header.TriggeredByLoopID, which releases the parent's quiescence wake token.
+// triggeredBy is stored now and USED for quiescence in a later phase.
+//
+// Phase 10 unified the former drain-handback type `foldedMsg` into this one: the
+// two were field-identical and the drain converted between them with a struct
+// cast, so the second type and its `fold()` projection were dead weight (YAGNI).
 type queuedInput struct {
 	inputID     uuid.UUID
 	triggeredBy uuid.UUID
 	msg         *content.UserMessage
-}
-
-// fold projects a queued entry into the foldedMsg handed back to runTurn at a
-// tool-continuation drain. queuedInput and foldedMsg share the same provenance layout
-// (inputID + triggeredBy + msg), so this is a direct conversion; the named method
-// keeps the field-layout coupling documented in one place. If either struct's fields
-// diverge, replace the conversion with an explicit field mapping here.
-func (qi queuedInput) fold() foldedMsg {
-	return foldedMsg(qi)
 }
 
 type loopState struct {
@@ -271,13 +268,13 @@ type commitRequest struct {
 // drainRequest is the tool-continuation drain handshake from the turn goroutine to
 // the actor. The actor (the inbox's sole owner) pops + clears the inbox in order,
 // moves the popped entries into loopState.draining (so an abnormal terminal still
-// returns them), converts each to a foldedMsg, and sends them on reply. reply is
+// returns them), and sends those entries on reply. reply is
 // buffered(1): the actor never blocks sending it, and a runTurn that escapes on
 // turnCtx.Done (an Interrupt during the handshake) leaves the reply in the buffer
 // harmlessly — the moved entries are resolved by returnQueuedInbox via the draining
 // buffer on the resulting abnormal terminal, so nothing is stranded.
 type drainRequest struct {
-	reply chan<- []foldedMsg
+	reply chan<- []queuedInput
 }
 
 // listen takes gateReg as a bidirectional channel: the actor is its sole reader
@@ -560,8 +557,8 @@ func listen(ctx context.Context, cfg Config, commands <-chan command.Command, ga
 		// wedging it. The reply is buffered, so the actor's send never blocks even if
 		// runTurn has already escaped on cctx.Done (the moved-out inbox entries are then
 		// resolved from loopState.draining by the abnormal-terminal return path).
-		drainPending := func(cctx context.Context) ([]foldedMsg, error) {
-			reply := make(chan []foldedMsg, 1)
+		drainPending := func(cctx context.Context) ([]queuedInput, error) {
+			reply := make(chan []queuedInput, 1)
 			req := drainRequest{reply: reply}
 			select {
 			case drains <- req:
@@ -740,19 +737,19 @@ func listen(ctx context.Context, cfg Config, commands <-chan command.Command, ga
 
 	// drainInbox is the tool-continuation drain: it pops + clears the ENTIRE inbox in
 	// order, MOVES the popped entries into state.draining (so they are still resolved
-	// if the turn ends abnormally before their TurnFoldedInto commits), and returns one
-	// foldedMsg per entry for runTurn to fold. It is the single place the inbox→draining
+	// if the turn ends abnormally before their TurnFoldedInto commits), and returns the
+	// popped entries for runTurn to fold. It is the single place the inbox→draining
 	// move lives. Each moved entry leaves draining only via the commit point (its
 	// TurnFoldedInto resolves it) or via returnQueuedInbox (an abnormal terminal), so the
 	// inbox-exit invariant — every removed entry is resolved exactly once — still holds.
-	drainInbox := func() []foldedMsg {
+	drainInbox := func() []queuedInput {
 		if len(state.inbox) == 0 {
 			return nil
 		}
-		batch := make([]foldedMsg, 0, len(state.inbox))
-		for _, qi := range state.inbox {
-			batch = append(batch, qi.fold())
-		}
+		// The reply gets its OWN backing array (state.inbox is about to be cleared and
+		// later reused): copy out before moving the entries into draining.
+		batch := make([]queuedInput, len(state.inbox))
+		copy(batch, state.inbox)
 		state.draining = append(state.draining, state.inbox...)
 		state.inbox = nil
 		return batch

@@ -28,11 +28,11 @@ type turnRecorder struct {
 	commits   []turnCommit
 	commitErr error // when non-nil, commit returns it without committing
 
-	// drainBatches is the queue of foldedMsg batches drainPending returns, one per
+	// drainBatches is the queue of queuedInput batches drainPending returns, one per
 	// drain call (a nil/empty default means "no pending input" — the common case for
 	// the multi-step tool tests that do not exercise folding). drainCalls counts the
 	// drainPending invocations, and drainErr (when set) makes drainPending return it.
-	drainBatches [][]foldedMsg
+	drainBatches [][]queuedInput
 	drainCalls   int
 	drainErr     error
 }
@@ -60,7 +60,7 @@ func (r *turnRecorder) commit(ctx context.Context, tc turnCommit) error {
 // drainPending mirrors the actor's tool-continuation drain: it returns the next
 // queued batch (nil/empty when there is no pending input) and records the call. The
 // fixture's default has no batches, so the multi-step tool tests fold nothing.
-func (r *turnRecorder) drainPending(ctx context.Context) ([]foldedMsg, error) {
+func (r *turnRecorder) drainPending(ctx context.Context) ([]queuedInput, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.drainErr != nil {
