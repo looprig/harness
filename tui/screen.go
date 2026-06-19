@@ -184,7 +184,11 @@ func (m *Screen) handleEvent(ev event.Event) tea.Cmd {
 	statusCmd := m.applyTurnStatus(ev)
 	// Re-arm only while a live subscription is installed: during the /clear window
 	// m.sub is transiently nil, and the fresh subscription's reader is (re)started
-	// by handleSubscribed, not here. subNext is also nil-guarded as a backstop.
+	// by handleSubscribed, not here. subNext is also nil-guarded as a backstop. A
+	// stale buffered event from the OLD sub that lands just after re-subscribe is
+	// harmless: this re-arms a second reader on the new channel, but channel receive
+	// is single-consumer, so no event is duplicated and the spare reader dies on its
+	// next receive/close.
 	var rearm tea.Cmd
 	if m.sub != nil {
 		rearm = subNext(m.sub)
