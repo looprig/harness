@@ -9,8 +9,9 @@ import (
 )
 
 // TestEventClass asserts every concrete event reports the Class its lifecycle
-// mixin dictates: TokenDelta is the sole Ephemeral event; every other event is
-// Enduring (terminal events fold in Class()==Enduring by construction).
+// mixin dictates: TokenDelta and the ToolCall* events (ToolCallStarted/
+// ToolCallCompleted) are Ephemeral; every other loop event is Enduring (terminal
+// events fold in Class()==Enduring by construction).
 func TestEventClass(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
@@ -33,8 +34,8 @@ func TestEventClass(t *testing.T) {
 		{"TurnInterrupted terminal is enduring", event.TurnInterrupted{}, event.Enduring},
 		{"PermissionRequested enduring", event.PermissionRequested{}, event.Enduring},
 		{"UserInputRequested enduring", event.UserInputRequested{}, event.Enduring},
-		{"ToolCallStarted enduring", event.ToolCallStarted{}, event.Enduring},
-		{"ToolCallCompleted enduring", event.ToolCallCompleted{}, event.Enduring},
+		{"ToolCallStarted ephemeral", event.ToolCallStarted{}, event.Ephemeral},
+		{"ToolCallCompleted ephemeral", event.ToolCallCompleted{}, event.Ephemeral},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

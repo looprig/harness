@@ -8,8 +8,8 @@ import "github.com/inventivepotter/urvi/internal/uuid"
 // A subagent's token firehose excluded by Ephemeral never even enters that
 // subscriber's egress buffer.
 type EventFilter struct {
-	Ephemeral LoopScope // TokenDelta delivery
-	Enduring  LoopScope // loop-produced StepDone, gates, tool lifecycle, terminals
+	Ephemeral LoopScope // TokenDelta + tool lifecycle (ToolCallStarted/Completed) delivery
+	Enduring  LoopScope // loop-produced StepDone, gates, terminals
 }
 
 // LoopScope selects which loops a class of events is delivered from. All is a

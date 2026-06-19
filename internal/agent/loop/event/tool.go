@@ -62,7 +62,7 @@ type UserInputRequestedSink struct {
 // already redacted/capped at construction (never raw args), so it is safe for
 // both audiences — this event does NOT implement Redactable.
 type ToolCallStarted struct {
-	enduring
+	ephemeral
 	loopScoped
 	Header
 	CallID   uuid.UUID
@@ -74,7 +74,7 @@ type ToolCallStarted struct {
 // tool output for the TUI and is STREAM-ONLY: tool output may hold secrets/PII,
 // so SinkProjection drops it, keeping only CallID and IsError.
 type ToolCallCompleted struct {
-	enduring
+	ephemeral
 	loopScoped
 	Header
 	CallID        uuid.UUID

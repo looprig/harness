@@ -66,8 +66,9 @@ type InputCancelled struct {
 	Message   *content.UserMessage
 }
 
-// TokenDelta is emitted for each streaming chunk from the LLM. It is the only
-// Ephemeral event.
+// TokenDelta is emitted for each streaming chunk from the LLM. TokenDelta and
+// the ToolCallStarted/ToolCallCompleted events (in tool.go) are the Ephemeral
+// events.
 type TokenDelta struct {
 	ephemeral
 	loopScoped
