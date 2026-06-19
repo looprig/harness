@@ -460,9 +460,9 @@ func (m *transcriptModel) stepDone(ev event.StepDone) {
 
 // commitStepAssistant commits the AIMessage's prose (leading ThinkingBlock, then
 // TextBlock) as one kindAssistant entry. A nil AIMessage commits nothing. A
-// tool-use-only message (no thinking, no text) still commits one bare kindAssistant
-// entry so the step's assistant bullet renders ahead of its tool cards (the renderer
-// shows a bare bullet for a card-only segment); a fully empty message commits nothing.
+// tool-use-only message (no thinking, no text) still commits one kindAssistant entry,
+// flagged doneHeadline, so the renderer shows a bold "● Done" headline ahead of the
+// step's tool cards (design §3 rule 4); a fully empty message commits nothing.
 func (m *transcriptModel) commitStepAssistant(ai *content.AIMessage) {
 	if ai == nil {
 		return
