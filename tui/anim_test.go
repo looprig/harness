@@ -5,6 +5,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/inventivepotter/urvi/internal/agent/loop/event"
 	"github.com/inventivepotter/urvi/internal/content"
 	"github.com/inventivepotter/urvi/tui/styles"
 )
@@ -406,49 +407,48 @@ func TestStartBlinkGuard(t *testing.T) {
 	})
 }
 
-// TestTurnStartTicking covers the integration point: a turn that actually
-// starts transitions to Running and kicks off the animation tick (ticking set, and a
-// non-nil cmd batching readNext + the tick). A failed start stays Idle and never
-// starts ticking.
+// TestTurnStartTicking covers the integration point now driven by the subscription:
+// the PRIMARY loop's TurnStarted event transitions to Running and kicks off the
+// animation tick (ticking set, and a non-nil cmd batching subNext + the tick). A
+// SUBAGENT loop's TurnStarted must NOT start the primary turn nor its tick.
 func TestTurnStartTicking(t *testing.T) {
 	t.Parallel()
 
-	t.Run("successful start ticks", func(t *testing.T) {
+	primary := callID(0xAA)
+	subagent := callID(0xBB)
+
+	t.Run("primary TurnStarted ticks", func(t *testing.T) {
 		t.Parallel()
 
-		agent := &fakeAgent{streamReader: scriptedReader()}
+		agent := &fakeAgent{primaryLoopID: primary}
 		m := New(context.Background(), agent, fakeOpen(agent), AgentBanner{})
+		m.sub = newFakeSubscription()
 
-		cmd, ok := m.startTurn([]content.Block{&content.TextBlock{Text: "hi"}})
-		if !ok {
-			t.Fatal("startTurn ok = false, want true")
-		}
+		m, cmd := updateScreen(t, m, eventMsg{ev: event.TurnStarted{Header: event.Header{LoopID: primary}}})
 		if m.status != StatusRunning {
-			t.Errorf("startTurn status = %d, want StatusRunning", m.status)
+			t.Errorf("status = %d, want StatusRunning", m.status)
 		}
 		if !m.anim.ticking {
-			t.Error("startTurn did not start the animation tick (ticking false)")
+			t.Error("primary TurnStarted did not start the animation tick (ticking false)")
 		}
 		if cmd == nil {
-			t.Error("startTurn cmd = nil, want batched readNext + tick")
+			t.Error("event cmd = nil, want batched subNext + tick")
 		}
 	})
 
-	t.Run("failed start does not tick", func(t *testing.T) {
+	t.Run("subagent TurnStarted does not tick", func(t *testing.T) {
 		t.Parallel()
 
-		agent := &fakeAgent{streamErr: errStub{}}
+		agent := &fakeAgent{primaryLoopID: primary}
 		m := New(context.Background(), agent, fakeOpen(agent), AgentBanner{})
+		m.sub = newFakeSubscription()
 
-		_, ok := m.startTurn([]content.Block{&content.TextBlock{Text: "hi"}})
-		if ok {
-			t.Fatal("startTurn ok = true on stream error, want false")
-		}
+		m, _ = updateScreen(t, m, eventMsg{ev: event.TurnStarted{Header: event.Header{LoopID: subagent}}})
 		if m.status != StatusIdle {
-			t.Errorf("failed startTurn status = %d, want StatusIdle", m.status)
+			t.Errorf("status = %d, want StatusIdle (subagent turn must not flip primary)", m.status)
 		}
 		if m.anim.ticking {
-			t.Error("failed startTurn started the animation tick; it must not")
+			t.Error("subagent TurnStarted started the primary animation tick; it must not")
 		}
 	})
 }
@@ -481,8 +481,3 @@ func TestBlinkDoesNotFlushScrollback(t *testing.T) {
 			printedBefore, len(got.scrollback.printed))
 	}
 }
-
-// errStub is a typed stub error for the failed-start table row.
-type errStub struct{}
-
-func (errStub) Error() string { return "stub stream error" }

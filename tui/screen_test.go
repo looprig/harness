@@ -3,7 +3,6 @@ package tui
 import (
 	"context"
 	"errors"
-	"io"
 	"strconv"
 	"strings"
 	"testing"
@@ -11,6 +10,7 @@ import (
 	tea "charm.land/bubbletea/v2"
 
 	"github.com/inventivepotter/urvi/internal/agent/loop/event"
+	"github.com/inventivepotter/urvi/internal/agent/session/hub"
 	"github.com/inventivepotter/urvi/internal/content"
 	"github.com/inventivepotter/urvi/internal/llm"
 	"github.com/inventivepotter/urvi/internal/tool"
@@ -26,8 +26,9 @@ var _ Agent = (*fakeAgent)(nil)
 // configured reader/error/bool so Screen behavior can be exercised without a real
 // session.
 type fakeAgent struct {
-	streamReader *llm.StreamReader[event.Event]
-	streamErr    error
+	streamReader       *llm.StreamReader[event.Event]
+	streamErr          error
+	streamBlocksCalled bool
 
 	// submit recorder: a configured id/error is returned, and the last call's
 	// blocks are captured so a test can assert the wrapper forwarded them. When
@@ -69,7 +70,10 @@ type fakeAgent struct {
 	lastAnswer    string
 }
 
+// streamBlocksCalled records whether the (now-unused-by-Screen) per-turn reader API
+// was invoked, so a test can assert the event transport switched to Subscribe.
 func (f *fakeAgent) StreamBlocks(_ context.Context, _ []content.Block) (*llm.StreamReader[event.Event], error) {
+	f.streamBlocksCalled = true
 	if f.streamErr != nil {
 		return nil, f.streamErr
 	}
@@ -134,20 +138,50 @@ func (f *fakeAgent) ProvideAnswer(_ context.Context, callID uuid.UUID, answer st
 	return f.answerErr
 }
 
-// scriptedReader builds a StreamReader that yields the given events in order,
-// then io.EOF on every subsequent call.
-func scriptedReader(evs ...event.Event) *llm.StreamReader[event.Event] {
-	i := 0
-	next := func() (event.Event, error) {
-		if i >= len(evs) {
-			return nil, io.EOF
-		}
-		ev := evs[i]
-		i++
-		return ev, nil
-	}
-	return llm.NewStreamReader(next, nil)
+// fakeSubscription is a test-controlled event.Subscription: a buffered channel a
+// test pushes events onto (push) plus an idempotent Close and a configurable Err.
+// It models the session-lifetime stream the Screen reads via subNext. The channel
+// is buffered so push never blocks the test goroutine; closeErr is what Err reports
+// after a hub-forced loss (nil mimics an intentional Close).
+type fakeSubscription struct {
+	ch       chan event.Event
+	closeErr error
+	closed   bool
 }
+
+// newFakeSubscription builds a fakeSubscription with a generously buffered channel
+// so a test can stage several events without a reader draining them.
+func newFakeSubscription() *fakeSubscription {
+	return &fakeSubscription{ch: make(chan event.Event, 64)}
+}
+
+func (s *fakeSubscription) Events() <-chan event.Event { return s.ch }
+
+// Close is the consumer's idempotent teardown: it closes the channel once so a
+// subsequent subNext receives !ok. It records no error (Err stays whatever was set).
+func (s *fakeSubscription) Close() error {
+	if !s.closed {
+		s.closed = true
+		close(s.ch)
+	}
+	return nil
+}
+
+func (s *fakeSubscription) Err() error { return s.closeErr }
+
+// push stages an event on the subscription channel (non-blocking — the buffer is
+// large enough for the tests). It panics if the channel is full so a test bug
+// surfaces loudly rather than hanging.
+func (s *fakeSubscription) push(ev event.Event) {
+	select {
+	case s.ch <- ev:
+	default:
+		panic("fakeSubscription buffer full")
+	}
+}
+
+// compile-time assertion that fakeSubscription satisfies the consumer contract.
+var _ event.Subscription = (*fakeSubscription)(nil)
 
 // fakeOpen returns an OpenAgent thunk that yields the given agent.
 func fakeOpen(a Agent) OpenAgent {
@@ -160,6 +194,33 @@ func callID(b byte) uuid.UUID {
 	var u uuid.UUID
 	u[0] = b
 	return u
+}
+
+// drainCmd executes cmd, recursively running any BatchMsg/sequenceMsg leaves it
+// produces so the underlying I/O closures (e.g. submitCmd's agent.Submit call) all
+// run. A nil cmd is a no-op. It is the test-side analogue of the Bubble Tea runtime
+// fanning out a batched command.
+func drainCmd(t *testing.T, cmd tea.Cmd) {
+	t.Helper()
+	if cmd == nil {
+		return
+	}
+	switch msg := cmd().(type) {
+	case tea.BatchMsg:
+		for _, c := range msg {
+			drainCmd(t, c)
+		}
+	}
+}
+
+// firstBlockText returns the first text-block text in blocks, or "".
+func firstBlockText(blocks []content.Block) string {
+	for _, b := range blocks {
+		if tb, ok := b.(*content.TextBlock); ok {
+			return tb.Text
+		}
+	}
+	return ""
 }
 
 // updateScreen drives m.Update with msg and returns the concrete Screen plus the
@@ -181,12 +242,14 @@ func feed(t *testing.T, m Screen, ev event.Event) Screen {
 	return m
 }
 
-// runningScreen returns a fresh Screen wired for a live turn: a non-nil reader
-// (readNext targets must be non-nil) and StatusRunning.
+// runningScreen returns a fresh Screen wired for a live turn: a non-nil session
+// subscription (subNext targets must be non-nil) and StatusRunning. The returned
+// fakeSubscription lets a test stage further events; most tests feed via the feed
+// helper (a direct eventMsg) and only check the re-arm cmd is non-nil.
 func runningScreen(t *testing.T, agent Agent) Screen {
 	t.Helper()
 	m := New(context.Background(), agent, fakeOpen(agent), AgentBanner{})
-	m.reader = scriptedReader()
+	m.sub = newFakeSubscription()
 	m.status = StatusRunning
 	return m
 }
@@ -428,10 +491,10 @@ func TestViewRendersLiveTail(t *testing.T) {
 	}
 }
 
-// TestEventRoutesToBothReducers is the core router invariant: a single stream event
-// reaches BOTH the transcript reducer (which accumulates the live segment) AND the
-// interaction reducer, and readNext keeps draining (a non-nil cmd is returned so the
-// next event is pulled even though the loop may be gated).
+// TestEventRoutesToBothReducers is the core router invariant: a single subscription
+// event reaches BOTH the transcript reducer (which accumulates the live segment) AND
+// the interaction reducer, and subNext keeps reading (a non-nil cmd is returned so
+// the next event is pulled even though the loop may be gated).
 func TestEventRoutesToBothReducers(t *testing.T) {
 	t.Parallel()
 
@@ -444,7 +507,7 @@ func TestEventRoutesToBothReducers(t *testing.T) {
 		t.Errorf("transcript live.Text = %q, want %q (event not routed to transcript)", m.transcript.live.Text, "hello")
 	}
 	if cmd == nil {
-		t.Error("event cmd = nil, want non-nil (readNext keeps draining the stream)")
+		t.Error("event cmd = nil, want non-nil (subNext keeps reading the subscription)")
 	}
 }
 
@@ -482,7 +545,7 @@ func TestPermissionRequestedEnqueuesAndCommits(t *testing.T) {
 	}
 	// The stream keeps draining (the gate, not the stream, blocks the loop).
 	if cmd == nil {
-		t.Error("PermissionRequested cmd = nil, want non-nil (readNext keeps draining)")
+		t.Error("PermissionRequested cmd = nil, want non-nil (subNext keeps reading)")
 	}
 }
 
@@ -632,26 +695,24 @@ func TestTerminalEventClearsPromptQueue(t *testing.T) {
 	}
 }
 
-// TestSubmitStartsTurnIdle covers uiSubmit at Idle: a user entry is committed and
-// flushed to scrollback, the turn starts (StatusRunning), and the agent's reader is
-// installed.
-func TestSubmitStartsTurnIdle(t *testing.T) {
+// TestSubmitFireAndForgetIdle covers uiSubmit at Idle: a user entry is optimistically
+// committed and flushed to scrollback, Submit is fired fire-and-forget (NOT
+// StreamBlocks), and the status stays Idle — it flips to Running only when the loop's
+// TurnStarted arrives on the subscription. The composer resets.
+func TestSubmitFireAndForgetIdle(t *testing.T) {
 	t.Parallel()
 
-	agent := &fakeAgent{streamReader: scriptedReader(event.TurnStarted{})}
+	agent := &fakeAgent{}
 	m := New(context.Background(), agent, fakeOpen(agent), AgentBanner{})
 	m.interaction.input.SetValue("hello there")
 
 	m, cmd := updateScreen(t, m, tea.KeyPressMsg{Code: tea.KeyEnter})
 
 	if cmd == nil {
-		t.Fatal("submit cmd = nil, want non-nil (flush + readNext)")
+		t.Fatal("submit cmd = nil, want non-nil (flush + submitCmd)")
 	}
-	if m.status != StatusRunning {
-		t.Errorf("status = %d, want StatusRunning", m.status)
-	}
-	if m.reader == nil {
-		t.Error("reader = nil after a successful start")
+	if m.status != StatusIdle {
+		t.Errorf("status = %d, want StatusIdle (status follows TurnStarted, not submit)", m.status)
 	}
 	rec := lastCommitted(t, m)
 	if rec.Kind != kindUser || committedText(rec) != "hello there" {
@@ -663,35 +724,48 @@ func TestSubmitStartsTurnIdle(t *testing.T) {
 	if m.interaction.input.Value() != "" {
 		t.Errorf("composer = %q, want reset", m.interaction.input.Value())
 	}
+	// Executing the batched cmd must reach Submit (fire-and-forget), NOT StreamBlocks.
+	drainCmd(t, cmd)
+	if !agent.submitCalled {
+		t.Error("Submit not called; the fire-and-forget path must call agent.Submit")
+	}
+	if agent.streamBlocksCalled {
+		t.Error("StreamBlocks called; the event transport switched off the per-turn reader")
+	}
+	if got := firstBlockText(agent.lastSubmitBlocks); got != "hello there" {
+		t.Errorf("Submit blocks text = %q, want %q", got, "hello there")
+	}
 }
 
-// TestSubmitQueuesWhileRunning covers uiSubmit at Running: the user entry is
-// committed (lands in scrollback) and the blocks are queued; no new turn starts and
-// the composer resets.
-func TestSubmitQueuesWhileRunning(t *testing.T) {
+// TestSubmitFireAndForgetWhileRunning covers uiSubmit at Running: the user entry is
+// optimistically committed (lands in scrollback) and Submit is fired — the LOOP owns
+// queueing now, so Screen keeps no queue and the status stays Running. The composer
+// resets.
+func TestSubmitFireAndForgetWhileRunning(t *testing.T) {
 	t.Parallel()
 
 	agent := &fakeAgent{}
 	m := runningScreen(t, agent)
-	m.interaction.input.SetValue("queued one")
+	m.interaction.input.SetValue("second one")
 
 	m, cmd := updateScreen(t, m, tea.KeyPressMsg{Code: tea.KeyEnter})
 
 	if cmd == nil {
-		t.Error("queue submit cmd = nil, want non-nil (flush of the committed user entry)")
-	}
-	if len(m.queue) != 1 {
-		t.Fatalf("queue len = %d, want 1", len(m.queue))
+		t.Error("submit cmd = nil, want non-nil (flush + submitCmd)")
 	}
 	rec := lastCommitted(t, m)
-	if rec.Kind != kindUser || committedText(rec) != "queued one" {
-		t.Errorf("committed = (kind %d, text %q), want (kindUser, %q)", rec.Kind, committedText(rec), "queued one")
+	if rec.Kind != kindUser || committedText(rec) != "second one" {
+		t.Errorf("committed = (kind %d, text %q), want (kindUser, %q)", rec.Kind, committedText(rec), "second one")
 	}
 	if m.status != StatusRunning {
-		t.Errorf("status = %d, want StatusRunning (unchanged)", m.status)
+		t.Errorf("status = %d, want StatusRunning (unchanged; the loop queues)", m.status)
 	}
 	if m.interaction.input.Value() != "" {
 		t.Errorf("composer = %q, want reset", m.interaction.input.Value())
+	}
+	drainCmd(t, cmd)
+	if !agent.submitCalled {
+		t.Error("Submit not called while Running; the loop owns queueing now")
 	}
 }
 
@@ -803,13 +877,14 @@ func TestRunSlashClearWhileRunningIsNoop(t *testing.T) {
 }
 
 // TestEscWhileRunningInterrupts covers the no-prompt Esc precedence: Esc with no
-// active prompt interrupts a running turn and clears the queue.
+// active prompt interrupts a running turn (flips to Interrupting + dispatches the
+// bounded Interrupt). The loop owns queueing now, so there is no Screen-side queue
+// to clear.
 func TestEscWhileRunningInterrupts(t *testing.T) {
 	t.Parallel()
 
 	agent := &fakeAgent{interruptCancelled: true}
 	m := runningScreen(t, agent)
-	m.queue = [][]content.Block{{&content.TextBlock{Text: "queued"}}}
 
 	m, cmd := updateScreen(t, m, tea.KeyPressMsg{Code: tea.KeyEsc})
 	if cmd == nil {
@@ -817,9 +892,6 @@ func TestEscWhileRunningInterrupts(t *testing.T) {
 	}
 	if m.status != StatusInterrupting {
 		t.Errorf("status = %d, want StatusInterrupting", m.status)
-	}
-	if len(m.queue) != 0 {
-		t.Errorf("queue len = %d, want 0 (cleared on interrupt)", len(m.queue))
 	}
 }
 
@@ -895,7 +967,7 @@ func TestCtrlTTogglesExpandGlobally(t *testing.T) {
 			m := New(context.Background(), agent, fakeOpen(agent), AgentBanner{})
 			m.status = tt.status
 			if tt.status != StatusIdle {
-				m.reader = scriptedReader()
+				m.sub = newFakeSubscription()
 			}
 			if tt.withPrompt {
 				m = feed(t, m, event.PermissionRequested{CallID: callID(1), Request: tool.BashRequest{Command: "x"}})
@@ -1017,31 +1089,110 @@ func TestComposeBlinkCmdPlumbed(t *testing.T) {
 	}
 }
 
-func TestSubmitTurn(t *testing.T) {
+// TestSubmitResultMsg covers the fire-and-forget Submit outcome arm: a nil err is a
+// silent success (no commit, no cmd); a non-nil err commits a faint, non-fatal error
+// entry (the optimistic user row stays) and does NOT change the turn status.
+func TestSubmitResultMsg(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
 		name       string
-		agent      *fakeAgent
+		err        error
 		wantCmd    bool
-		wantOK     bool
-		wantStatus Status
-		wantReader bool
 		wantErr    bool
+		wantStatus Status
 	}{
+		{name: "nil err is silent", err: nil, wantCmd: false, wantStatus: StatusRunning},
+		{name: "err commits a faint error entry", err: errors.New("send failed"), wantCmd: true, wantErr: true, wantStatus: StatusRunning},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			agent := &fakeAgent{}
+			m := runningScreen(t, agent)
+
+			m, cmd := updateScreen(t, m, submitResultMsg{err: tt.err})
+			if (cmd != nil) != tt.wantCmd {
+				t.Errorf("cmd != nil = %v, want %v", cmd != nil, tt.wantCmd)
+			}
+			if m.status != tt.wantStatus {
+				t.Errorf("status = %d, want %d (a send failure is non-fatal)", m.status, tt.wantStatus)
+			}
+			if tt.wantErr {
+				rec := lastCommitted(t, m)
+				if rec.Kind != kindNotice || rec.Level != noticeError || committedText(rec) != "send failed" {
+					t.Errorf("committed = (kind %d, level %d, text %q), want (kindNotice, noticeError, %q)", rec.Kind, rec.Level, committedText(rec), "send failed")
+				}
+			} else if len(m.transcript.committed) != 0 {
+				t.Errorf("committed = %d, want 0 (silent success)", len(m.transcript.committed))
+			}
+		})
+	}
+}
+
+// TestSubscribedMsg covers the subscription install arm: on success the stream is
+// stored and the continuous reader is armed (a non-nil cmd); on error a fatal error
+// entry is committed (the TUI cannot observe the session without a subscription).
+func TestSubscribedMsg(t *testing.T) {
+	t.Parallel()
+
+	t.Run("success installs sub and arms reader", func(t *testing.T) {
+		t.Parallel()
+		agent := &fakeAgent{}
+		m := New(context.Background(), agent, fakeOpen(agent), AgentBanner{})
+		sub := newFakeSubscription()
+
+		m, cmd := updateScreen(t, m, subscribedMsg{sub: sub})
+		if m.sub != sub {
+			t.Errorf("sub = %p, want %p (stream not installed)", m.sub, sub)
+		}
+		if cmd == nil {
+			t.Error("cmd = nil, want non-nil (subNext arms the continuous reader)")
+		}
+		if len(m.transcript.committed) != 0 {
+			t.Errorf("committed = %d, want 0 (success commits nothing)", len(m.transcript.committed))
+		}
+	})
+
+	t.Run("error commits a fatal entry", func(t *testing.T) {
+		t.Parallel()
+		agent := &fakeAgent{}
+		m := New(context.Background(), agent, fakeOpen(agent), AgentBanner{})
+
+		m, cmd := updateScreen(t, m, subscribedMsg{err: errors.New("no hub")})
+		if m.sub != nil {
+			t.Error("sub installed on error, want nil")
+		}
+		if cmd == nil {
+			t.Error("cmd = nil, want non-nil (flush of the error entry)")
+		}
+		rec := lastCommitted(t, m)
+		if rec.Kind != kindNotice || rec.Level != noticeError || committedText(rec) != "no hub" {
+			t.Errorf("committed = (kind %d, level %d, text %q), want (kindNotice, noticeError, %q)", rec.Kind, rec.Level, committedText(rec), "no hub")
+		}
+	})
+}
+
+// TestSubClosedMsg covers the continuous reader's terminal: a nil err (intentional
+// Close — a /clear swap or quit teardown) is silent (no commit, no cmd); a hub-forced
+// loss surfaces an error entry so the user learns the live stream was dropped.
+func TestSubClosedMsg(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		err     error
+		wantCmd bool
+		wantErr bool
+	}{
+		{name: "intentional close is silent", err: nil, wantCmd: false},
 		{
-			name:       "success returns cmd and running",
-			agent:      &fakeAgent{streamReader: scriptedReader(event.TurnStarted{})},
-			wantCmd:    true,
-			wantOK:     true,
-			wantStatus: StatusRunning,
-			wantReader: true,
-		},
-		{
-			name:       "failure commits error and stays idle",
-			agent:      &fakeAgent{streamErr: errors.New("boom")},
-			wantStatus: StatusIdle,
-			wantErr:    true,
+			name:    "hub-forced loss surfaces an error",
+			err:     &hub.SubscriptionLossError{DroppedClass: event.Enduring},
+			wantCmd: true,
+			wantErr: true,
 		},
 	}
 
@@ -1049,20 +1200,12 @@ func TestSubmitTurn(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			m := New(context.Background(), tt.agent, fakeOpen(tt.agent), AgentBanner{})
-			cmd, ok := m.startTurn([]content.Block{&content.TextBlock{Text: "hi"}})
+			agent := &fakeAgent{}
+			m := runningScreen(t, agent)
 
+			m, cmd := updateScreen(t, m, subClosedMsg{err: tt.err})
 			if (cmd != nil) != tt.wantCmd {
-				t.Errorf("startTurn cmd != nil = %v, want %v", cmd != nil, tt.wantCmd)
-			}
-			if ok != tt.wantOK {
-				t.Errorf("startTurn ok = %v, want %v", ok, tt.wantOK)
-			}
-			if m.status != tt.wantStatus {
-				t.Errorf("status = %d, want %d", m.status, tt.wantStatus)
-			}
-			if (m.reader != nil) != tt.wantReader {
-				t.Errorf("reader != nil = %v, want %v", m.reader != nil, tt.wantReader)
+				t.Errorf("cmd != nil = %v, want %v", cmd != nil, tt.wantCmd)
 			}
 			if tt.wantErr {
 				rec := lastCommitted(t, m)
@@ -1070,97 +1213,79 @@ func TestSubmitTurn(t *testing.T) {
 					t.Errorf("committed = (kind %d, level %d), want (kindNotice, noticeError)", rec.Kind, rec.Level)
 				}
 			} else if len(m.transcript.committed) != 0 {
-				t.Errorf("committed = %d, want 0", len(m.transcript.committed))
+				t.Errorf("committed = %d, want 0 (silent close)", len(m.transcript.committed))
 			}
 		})
 	}
 }
 
-// TestStreamEOFAdvancesQueue covers the queue advance on EOF: an empty queue goes
-// Idle; a non-empty queue starts the next turn (its user entry already printed at
-// submit time); a failed restart keeps the head queued and stays Idle with an error.
-func TestStreamEOFAdvancesQueue(t *testing.T) {
+// TestPrimaryTurnEventsDriveStatus covers the status derivation from turn-lifecycle
+// events for the PRIMARY loop: a primary TurnStarted goes Running (and arms the blink
+// tick); each primary terminal returns to Idle. The blink-arming cmd is non-nil on
+// TurnStarted (subNext + startBlink batched).
+func TestPrimaryTurnEventsDriveStatus(t *testing.T) {
 	t.Parallel()
 
+	primary := callID(0xAA)
+
 	tests := []struct {
-		name       string
-		queue      [][]content.Block
-		streamErr  error
-		wantStatus Status
-		wantCmd    bool
-		wantQueue  int
-		wantErr    bool
+		name        string
+		ev          event.Event
+		startStatus Status
+		wantStatus  Status
 	}{
-		{name: "empty queue goes idle", wantStatus: StatusIdle, wantQueue: 0},
-		{
-			name:       "non-empty queue starts next turn",
-			queue:      [][]content.Block{{&content.TextBlock{Text: "q"}}},
-			wantStatus: StatusRunning,
-			wantCmd:    true,
-			wantQueue:  0,
-		},
-		{
-			name:       "restart failure keeps head and goes idle with error",
-			queue:      [][]content.Block{{&content.TextBlock{Text: "q"}}},
-			streamErr:  errors.New("busy"),
-			wantStatus: StatusIdle,
-			wantCmd:    true, // a flush of the committed error entry
-			wantQueue:  1,
-			wantErr:    true,
-		},
+		{name: "TurnStarted goes running", ev: event.TurnStarted{Header: event.Header{LoopID: primary}}, startStatus: StatusIdle, wantStatus: StatusRunning},
+		{name: "TurnDone goes idle", ev: event.TurnDone{Header: event.Header{LoopID: primary}}, startStatus: StatusRunning, wantStatus: StatusIdle},
+		{name: "TurnFailed goes idle", ev: event.TurnFailed{Header: event.Header{LoopID: primary}, Err: errors.New("x")}, startStatus: StatusRunning, wantStatus: StatusIdle},
+		{name: "TurnInterrupted from interrupting goes idle", ev: event.TurnInterrupted{Header: event.Header{LoopID: primary}}, startStatus: StatusInterrupting, wantStatus: StatusIdle},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			agent := &fakeAgent{streamReader: scriptedReader(event.TurnStarted{}), streamErr: tt.streamErr}
+			agent := &fakeAgent{primaryLoopID: primary}
 			m := runningScreen(t, agent)
-			m.queue = tt.queue
+			m.status = tt.startStatus
 
-			m, cmd := updateScreen(t, m, streamEOFMsg{})
-
+			m = feed(t, m, tt.ev)
 			if m.status != tt.wantStatus {
 				t.Errorf("status = %d, want %d", m.status, tt.wantStatus)
-			}
-			if (cmd != nil) != tt.wantCmd {
-				t.Errorf("cmd != nil = %v, want %v", cmd != nil, tt.wantCmd)
-			}
-			if len(m.queue) != tt.wantQueue {
-				t.Errorf("queue len = %d, want %d", len(m.queue), tt.wantQueue)
-			}
-			if m.reader != nil && tt.wantStatus == StatusIdle {
-				t.Error("reader != nil after idle EOF, want nil")
-			}
-			if tt.wantErr {
-				rec := lastCommitted(t, m)
-				if rec.Kind != kindNotice || rec.Level != noticeError {
-					t.Errorf("last committed = (kind %d, level %d), want (kindNotice, noticeError)", rec.Kind, rec.Level)
-				}
 			}
 		})
 	}
 }
 
-// TestStreamErrCommitsFailureAndAdvances covers a non-EOF stream read error: it
-// commits a terminal failure (via the transcript's TurnFailed path), goes Idle, and
-// closes the reader.
-func TestStreamErrCommitsFailureAndAdvances(t *testing.T) {
+// TestSubagentTurnEventsDoNotFlipStatus pins the primary-loop guard: a turn event
+// from a SUBAGENT loop (a different Header.LoopID) must NOT change the primary turn
+// status — the subagent's output surfaces via Enduring StepDone, not by hijacking the
+// primary status line.
+func TestSubagentTurnEventsDoNotFlipStatus(t *testing.T) {
 	t.Parallel()
 
-	agent := &fakeAgent{}
-	m := runningScreen(t, agent)
+	primary := callID(0xAA)
+	subagent := callID(0xBB)
 
-	m, _ = updateScreen(t, m, streamErrMsg{err: errors.New("read fail")})
-	if m.status != StatusIdle {
-		t.Errorf("status = %d, want StatusIdle", m.status)
+	tests := []struct {
+		name string
+		ev   event.Event
+	}{
+		{name: "subagent TurnStarted", ev: event.TurnStarted{Header: event.Header{LoopID: subagent}}},
+		{name: "subagent TurnDone", ev: event.TurnDone{Header: event.Header{LoopID: subagent}}},
+		{name: "subagent TurnInterrupted", ev: event.TurnInterrupted{Header: event.Header{LoopID: subagent}}},
 	}
-	if m.reader != nil {
-		t.Error("reader != nil, want nil")
-	}
-	rec := lastCommitted(t, m)
-	if rec.Kind != kindNotice || rec.Level != noticeError || committedText(rec) != "read fail" {
-		t.Errorf("last committed = (kind %d, level %d, text %q), want (kindNotice, noticeError, %q)", rec.Kind, rec.Level, committedText(rec), "read fail")
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			agent := &fakeAgent{primaryLoopID: primary}
+			m := runningScreen(t, agent) // StatusRunning
+			m = feed(t, m, tt.ev)
+			if m.status != StatusRunning {
+				t.Errorf("status = %d, want StatusRunning (a subagent turn event must not flip primary status)", m.status)
+			}
+		})
 	}
 }
 
@@ -1234,7 +1359,7 @@ func TestUpdateReopenResult(t *testing.T) {
 		}
 	})
 
-	t.Run("success swaps agent resets state and closes old", func(t *testing.T) {
+	t.Run("success swaps agent resets state closes old and re-subscribes", func(t *testing.T) {
 		t.Parallel()
 
 		old := &fakeAgent{}
@@ -1242,7 +1367,8 @@ func TestUpdateReopenResult(t *testing.T) {
 		m := New(context.Background(), old, fakeOpen(old), AgentBanner{})
 		m.status = StatusResetting
 		m.transcript = m.transcript.CommitUser([]content.Block{&content.TextBlock{Text: "x"}})
-		m.queue = [][]content.Block{{&content.TextBlock{Text: "q"}}}
+		oldSub := newFakeSubscription()
+		m.sub = oldSub
 
 		m, cmd := updateScreen(t, m, reopenResultMsg{agent: fresh})
 		if m.Agent() != fresh {
@@ -1251,8 +1377,11 @@ func TestUpdateReopenResult(t *testing.T) {
 		if len(m.transcript.committed) != 0 {
 			t.Errorf("committed = %d, want 0 (reset)", len(m.transcript.committed))
 		}
-		if len(m.queue) != 0 {
-			t.Errorf("queue len = %d, want 0", len(m.queue))
+		if m.sub != nil {
+			t.Errorf("sub = %p, want nil (old sub dropped; the re-subscribe installs the new one)", m.sub)
+		}
+		if !oldSub.closed {
+			t.Error("old subscription not closed on /clear swap")
 		}
 		if m.interaction.PendingCount() != 0 {
 			t.Errorf("PendingCount = %d, want 0 (prompts cleared)", m.interaction.PendingCount())
@@ -1261,14 +1390,21 @@ func TestUpdateReopenResult(t *testing.T) {
 			t.Errorf("status = %d, want StatusIdle", m.status)
 		}
 		if cmd == nil {
-			t.Fatal("cmd = nil, want non-nil (closeAgent for old)")
+			t.Fatal("cmd = nil, want non-nil (closeAgent + re-subscribe)")
 		}
-		cmd()
+		// Draining the batch must close the OLD agent and re-subscribe against the FRESH one.
+		drainCmd(t, cmd)
 		if !old.closeCalled {
 			t.Error("old agent Close() not called")
 		}
 		if fresh.closeCalled {
 			t.Error("fresh agent Close() called, want not closed")
+		}
+		if !fresh.subscribed {
+			t.Error("fresh agent Subscribe() not called; /clear must re-subscribe to the new agent")
+		}
+		if old.subscribed {
+			t.Error("old agent Subscribe() called by the re-subscribe; it must target the fresh agent")
 		}
 	})
 }

@@ -10,20 +10,22 @@ import (
 
 	"github.com/inventivepotter/urvi/internal/agent/loop/event"
 	"github.com/inventivepotter/urvi/internal/content"
-	"github.com/inventivepotter/urvi/internal/llm"
 	"github.com/inventivepotter/urvi/internal/tool"
 	"github.com/inventivepotter/urvi/internal/uuid"
 )
 
-func TestReadNext(t *testing.T) {
+// TestSubNext covers the continuous reader: each staged event is delivered as an
+// eventMsg in FIFO order, and a closed channel yields a subClosedMsg carrying the
+// subscription's typed termination cause.
+func TestSubNext(t *testing.T) {
 	t.Parallel()
 
-	started := event.TurnStarted{}
-	done := event.TurnDone{Message: &content.AIMessage{}}
-	r := scriptedReader(started, done)
+	sub := newFakeSubscription()
+	sub.push(event.TurnStarted{})
+	sub.push(event.TurnDone{Message: &content.AIMessage{}})
 
-	// First call yields the TurnStarted event.
-	msg := readNext(r)()
+	// First receive yields the TurnStarted event.
+	msg := subNext(sub)()
 	ev, ok := msg.(eventMsg)
 	if !ok {
 		t.Fatalf("first msg = %T, want eventMsg", msg)
@@ -32,8 +34,8 @@ func TestReadNext(t *testing.T) {
 		t.Errorf("first event = %T, want event.TurnStarted", ev.ev)
 	}
 
-	// Second call yields the TurnDone event.
-	msg = readNext(r)()
+	// Second receive yields the TurnDone event.
+	msg = subNext(sub)()
 	ev, ok = msg.(eventMsg)
 	if !ok {
 		t.Fatalf("second msg = %T, want eventMsg", msg)
@@ -41,32 +43,126 @@ func TestReadNext(t *testing.T) {
 	if _, ok := ev.ev.(event.TurnDone); !ok {
 		t.Errorf("second event = %T, want event.TurnDone", ev.ev)
 	}
-
-	// Third call yields EOF.
-	msg = readNext(r)()
-	if _, ok := msg.(streamEOFMsg); !ok {
-		t.Fatalf("third msg = %T, want streamEOFMsg", msg)
-	}
 }
 
-// errStreamReader is a StreamReader whose Next returns a non-EOF error.
-func errStreamReader(err error) *llm.StreamReader[event.Event] {
-	return llm.NewStreamReader(func() (event.Event, error) { return nil, err }, nil)
-}
-
-func TestReadNextError(t *testing.T) {
+// TestSubNextClosed covers the reader's terminal: a closed channel yields a
+// subClosedMsg carrying Err() — nil for an intentional Close, the typed loss error
+// for a hub-forced drop.
+func TestSubNextClosed(t *testing.T) {
 	t.Parallel()
 
-	wantErr := errors.New("stream broke")
-	r := errStreamReader(wantErr)
-
-	msg := readNext(r)()
-	em, ok := msg.(streamErrMsg)
-	if !ok {
-		t.Fatalf("msg = %T, want streamErrMsg", msg)
+	tests := []struct {
+		name     string
+		closeErr error
+		wantErr  bool
+	}{
+		{name: "intentional close yields nil err", closeErr: nil},
+		{name: "loss yields the typed err", closeErr: errors.New("lost"), wantErr: true},
 	}
-	if !errors.Is(em.err, wantErr) {
-		t.Errorf("err = %v, want %v", em.err, wantErr)
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			sub := newFakeSubscription()
+			sub.closeErr = tt.closeErr
+			_ = sub.Close()
+
+			msg := subNext(sub)()
+			cm, ok := msg.(subClosedMsg)
+			if !ok {
+				t.Fatalf("msg = %T, want subClosedMsg", msg)
+			}
+			if (cm.err != nil) != tt.wantErr {
+				t.Errorf("err != nil = %v, want %v", cm.err != nil, tt.wantErr)
+			}
+		})
+	}
+}
+
+// TestSubscribeCmd covers the startup subscribe: it forwards the single-loop
+// DefaultEventFilter (built from PrimaryLoopID) and reports the outcome. On success
+// the stream is carried on the msg; on error the err is carried and the stream is nil.
+func TestSubscribeCmd(t *testing.T) {
+	t.Parallel()
+
+	t.Run("success carries the stream and the default filter", func(t *testing.T) {
+		t.Parallel()
+		primary := callID(0x5A)
+		sub := newFakeSubscription()
+		agent := &fakeAgent{primaryLoopID: primary, subStream: sub}
+
+		msg := subscribeCmd(agent)()
+		res, ok := msg.(subscribedMsg)
+		if !ok {
+			t.Fatalf("msg = %T, want subscribedMsg", msg)
+		}
+		if res.err != nil {
+			t.Errorf("err = %v, want nil", res.err)
+		}
+		if res.sub != sub {
+			t.Errorf("sub = %p, want %p", res.sub, sub)
+		}
+		// The forwarded filter is the single-loop default for the primary loop.
+		if _, ok := agent.subFilter.Ephemeral.Loops[primary]; !ok {
+			t.Errorf("subscribe filter Ephemeral did not scope to the primary loop %v", primary)
+		}
+		if !agent.subFilter.Enduring.All {
+			t.Error("subscribe filter Enduring.All = false, want true (every loop's enduring events)")
+		}
+	})
+
+	t.Run("error carries the err and a nil stream", func(t *testing.T) {
+		t.Parallel()
+		agent := &fakeAgent{subErr: errors.New("no hub")}
+
+		msg := subscribeCmd(agent)()
+		res, ok := msg.(subscribedMsg)
+		if !ok {
+			t.Fatalf("msg = %T, want subscribedMsg", msg)
+		}
+		if res.err == nil {
+			t.Error("err = nil, want non-nil")
+		}
+		if res.sub != nil {
+			t.Errorf("sub = %p, want nil on error", res.sub)
+		}
+	})
+}
+
+// TestSubmitCmd covers the fire-and-forget submit: blocks are forwarded to Submit
+// and the result msg carries only the error (a nil err is a silent success).
+func TestSubmitCmd(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		submitErr error
+		wantErr   bool
+	}{
+		{name: "success is silent", submitErr: nil},
+		{name: "error surfaced", submitErr: errors.New("send failed"), wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			agent := &fakeAgent{submitErr: tt.submitErr}
+			blocks := []content.Block{&content.TextBlock{Text: "hi"}}
+			msg := submitCmd(context.Background(), agent, blocks)()
+
+			res, ok := msg.(submitResultMsg)
+			if !ok {
+				t.Fatalf("msg = %T, want submitResultMsg", msg)
+			}
+			if (res.err != nil) != tt.wantErr {
+				t.Errorf("err != nil = %v, want %v", res.err != nil, tt.wantErr)
+			}
+			if !agent.submitCalled {
+				t.Error("Submit not called")
+			}
+		})
 	}
 }
 

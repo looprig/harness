@@ -2,15 +2,12 @@ package tui
 
 import (
 	"context"
-	"errors"
-	"io"
 	"strings"
 	"time"
 
 	tea "charm.land/bubbletea/v2"
 
-	"github.com/inventivepotter/urvi/internal/agent/loop/event"
-	"github.com/inventivepotter/urvi/internal/llm"
+	"github.com/inventivepotter/urvi/internal/content"
 	"github.com/inventivepotter/urvi/internal/tool"
 	"github.com/inventivepotter/urvi/internal/uuid"
 )
@@ -44,20 +41,46 @@ const closeTimeout = 5 * time.Second
 // is self-healing (the next terminal event clears the prompt queue regardless).
 const promptDispatchTimeout = 2 * time.Second
 
-// readNext pulls exactly one event from r and maps it to a tea.Msg: io.EOF →
-// streamEOFMsg, any other error → streamErrMsg, otherwise eventMsg. Re-dispatch
-// it after each event to drive the stream forward without a drain goroutine.
-func readNext(r *llm.StreamReader[event.Event]) tea.Cmd {
+// subscribeCmd attaches the session-lifetime event subscription with the
+// single-loop DefaultEventFilter and reports the outcome. It is the ONE event
+// source for the whole session — established once at startup (batched into Init)
+// and re-established after a /clear swaps the agent. Unlike the old per-turn
+// reader, the returned stream spans every turn and loop; it closes only on Close,
+// hub-forced loss, or hub teardown, never per turn.
+func subscribeCmd(agent Agent) tea.Cmd {
 	return func() tea.Msg {
-		ev, err := r.Next()
-		switch {
-		case errors.Is(err, io.EOF):
-			return streamEOFMsg{}
-		case err != nil:
-			return streamErrMsg{err: err}
-		default:
-			return eventMsg{ev: ev}
+		sub, err := agent.Subscribe(DefaultEventFilter(agent.PrimaryLoopID()))
+		return subscribedMsg{sub: sub, err: err}
+	}
+}
+
+// subNext receives exactly one event from the session subscription and maps it to
+// a tea.Msg: a closed channel → subClosedMsg carrying the typed termination cause
+// (nil for an intentional Close, a *hub.SubscriptionLossError for a hub-forced
+// loss), otherwise eventMsg. Re-dispatch it after each event to drive the
+// continuous reader forward without a drain goroutine. It NEVER EOFs per turn —
+// the subscription is whole-session.
+func subNext(sub EventStream) tea.Cmd {
+	return func() tea.Msg {
+		ev, ok := <-sub.Events()
+		if !ok {
+			return subClosedMsg{err: sub.Err()}
 		}
+		return eventMsg{ev: ev}
+	}
+}
+
+// submitCmd sends blocks fire-and-forget via Submit under the app context and
+// reports the outcome. The loop owns queueing, so there is no per-turn reader to
+// install and no status branching here: Submit returns immediately once the input
+// is enqueued, and the loop publishes the turn-lifecycle + content events back on
+// the subscription. Only the error matters at the UI (the InputID is unused for
+// now); a non-nil err lets Update note the send failed without removing the
+// optimistic user row.
+func submitCmd(ctx context.Context, agent Agent, blocks []content.Block) tea.Cmd {
+	return func() tea.Msg {
+		_, err := agent.Submit(ctx, blocks)
+		return submitResultMsg{err: err}
 	}
 }
 

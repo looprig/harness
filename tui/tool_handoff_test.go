@@ -2,7 +2,6 @@ package tui
 
 import (
 	"context"
-	"io"
 	"strings"
 	"testing"
 	"time"
@@ -11,7 +10,6 @@ import (
 
 	"github.com/inventivepotter/urvi/internal/agent/loop/event"
 	"github.com/inventivepotter/urvi/internal/content"
-	"github.com/inventivepotter/urvi/internal/llm"
 )
 
 // runningGlyphs is the spinner cell set (anim.spinnerFrames) — its presence in the
@@ -38,12 +36,13 @@ func TestToolRunningToCompletedHandoff(t *testing.T) {
 	out := &syncBuf{}
 	in := newBlockingReader()
 
-	// Reader BLOCKS forever so the turn stays Running while events are hand-delivered
-	// as eventMsg (so readNext never EOFs the turn or competes for ordering).
-	block := make(chan struct{})
-	defer close(block)
-	agent := &fakeAgent{streamReader: llm.NewStreamReader(
-		func() (event.Event, error) { <-block; return nil, io.EOF }, nil)}
+	// The agent's subscription is a fakeSubscription whose channel stays open and
+	// empty: the Screen's continuous subNext reader parks on it harmlessly while
+	// events are hand-delivered as eventMsg (so the test controls ordering and the
+	// subscription reader never competes). Closing it at teardown releases the reader.
+	sub := newFakeSubscription()
+	defer func() { _ = sub.Close() }()
+	agent := &fakeAgent{subStream: sub}
 	screen := New(context.Background(), agent, fakeOpen(agent), AgentBanner{Name: "test"})
 
 	prog := tea.NewProgram(

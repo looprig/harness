@@ -7,8 +7,6 @@ import (
 	tea "charm.land/bubbletea/v2"
 
 	"github.com/inventivepotter/urvi/internal/agent/loop/event"
-	"github.com/inventivepotter/urvi/internal/content"
-	"github.com/inventivepotter/urvi/internal/llm"
 )
 
 // Screen is the Elm model for the chat TUI. In scrollback-first mode it is a thin
@@ -16,9 +14,17 @@ import (
 // stream and tracks committed entries + the live segment; scrollback prints each
 // committed entry to native terminal scrollback exactly once; interaction owns the
 // bottom surface (composer, slash panel, and the FIFO of pending permission/AskUser
-// prompts). Screen holds only the agent wiring, the turn status, the active stream
-// reader, the queued-while-running submissions, the terminal dimensions, and the
-// ctrl+t expand flag. There is no transcript viewport — the terminal owns history.
+// prompts). Screen holds only the agent wiring, the turn status, the ONE
+// session-lifetime event subscription, the terminal dimensions, and the ctrl+t
+// expand flag. There is no transcript viewport — the terminal owns history.
+//
+// Event transport: a SINGLE whole-session subscription (sub), established once at
+// startup and read continuously by subNext, is the sole event source — it spans
+// every turn and loop and never EOFs per turn. Submissions are fire-and-forget
+// (submitCmd → agent.Submit); the LOOP owns queueing, so Screen keeps no queue.
+// The optimistic CommitUser at submit time still lands the user row in scrollback
+// immediately; the loop's TurnStarted/TurnDone/TurnFailed/TurnInterrupted terminals
+// on the subscription drive the turn status (for the PRIMARY loop only).
 type Screen struct {
 	agent     Agent
 	openAgent OpenAgent       // builds a replacement agent on /clear
@@ -29,9 +35,8 @@ type Screen struct {
 	scrollback  scrollbackModel
 	interaction interactionModel
 
-	status Status                         // Idle | Running | Interrupting | Resetting
-	queue  [][]content.Block              // submissions made while Running, FIFO
-	reader *llm.StreamReader[event.Event] // active turn's stream; nil when idle
+	status Status      // Idle | Running | Interrupting | Resetting
+	sub    EventStream // the session-lifetime event subscription; nil until subscribed
 
 	// expand drives the unified ctrl+t fold for thinking + tool output. It defaults
 	// to TRUE (expanded — full thinking body + full tool result) because native
@@ -96,10 +101,16 @@ func New(ctx context.Context, agent Agent, open OpenAgent, banner AgentBanner) S
 	}
 }
 
-// Init focuses the composer (starting the cursor blink) and emits the initial
-// startup-banner entry.
+// Init focuses the composer (starting the cursor blink), emits the initial
+// startup-banner entry, AND attaches the session-lifetime event subscription. The
+// subscription is the single event source for the whole session; subscribeCmd's
+// subscribedMsg installs it and starts the continuous reader.
 func (m Screen) Init() tea.Cmd {
-	return tea.Batch(m.interaction.input.Focus(), func() tea.Msg { return systemReadyMsg{} })
+	return tea.Batch(
+		m.interaction.input.Focus(),
+		func() tea.Msg { return systemReadyMsg{} },
+		subscribeCmd(m.agent),
+	)
 }
 
 // Agent returns the live agent. cmd/cli uses this for a bounded backstop Close
@@ -121,11 +132,12 @@ func (m Screen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.handleKey(msg)
 	case eventMsg:
 		return m, m.handleEvent(msg.ev)
-	case streamEOFMsg:
-		return m, m.finishTurnAdvanceQueue()
-	case streamErrMsg:
-		m.transcript = m.transcript.ApplyEvent(event.TurnFailed{Err: msg.err})
-		return m, m.finishTurnAdvanceQueue()
+	case subscribedMsg:
+		return m, m.handleSubscribed(msg)
+	case subClosedMsg:
+		return m, m.handleSubClosed(msg)
+	case submitResultMsg:
+		return m, m.handleSubmitResult(msg)
 	case interruptResultMsg:
 		return m, m.handleInterruptResult(msg)
 	case reopenResultMsg:
@@ -144,7 +156,7 @@ func (m Screen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 // handleBlink advances the live-surface animation by one frame and, ONLY while the
 // turn is still Running, reschedules the next tick — so View re-renders the live tail
 // with the new blink/spinner phase. It is a PURE active-surface re-render: it never
-// calls flush/printToScrollback/readNext, so a tick can never write to scrollback.
+// calls flush/printToScrollback/subNext, so a tick can never write to scrollback.
 // At any non-Running status it stops the loop (returns nil — no reschedule) and resets
 // the animation state so the next live render is clean and a fresh turn starts a new
 // tick loop. Reset clears the ticking guard, letting the next Running turn start one.
@@ -157,19 +169,86 @@ func (m *Screen) handleBlink() tea.Cmd {
 	return blinkTick()
 }
 
-// handleEvent routes one turn-stream event through BOTH reducers — the transcript
+// handleEvent routes one subscription event through BOTH reducers — the transcript
 // (which reconstructs the live segment and commits user/tool/prompt/terminal
-// entries) and the interaction model (which enqueues prompts and clears the queue
-// on terminal events) — flushes any newly committed entries to scrollback, and keeps
-// draining the stream. The status LABEL is derived per-frame in View from the live
-// signals + active prompt, so there is no status field to refresh here. Draining
-// continues unconditionally: the loop is blocked on the permission GATE, not the
-// stream, so the user's keypress (approve/deny/answer) is what releases it. A prompt
-// event dispatches nothing here; the trio call happens later when the user resolves it.
+// entries) and the interaction model (which enqueues prompts and clears its queue
+// on terminal events) — derives the turn STATUS from the primary loop's
+// turn-lifecycle events, flushes any newly committed entries to scrollback, and
+// re-arms the continuous reader. Reading continues unconditionally: the loop is
+// blocked on the permission GATE, not the stream, so the user's keypress
+// (approve/deny/answer) is what releases it. A prompt event dispatches nothing
+// here; the trio call happens later when the user resolves it.
 func (m *Screen) handleEvent(ev event.Event) tea.Cmd {
 	m.transcript = m.transcript.ApplyEvent(ev)
 	m.interaction = m.interaction.ApplyEvent(ev)
-	return tea.Batch(readNext(m.reader), m.flush())
+	statusCmd := m.applyTurnStatus(ev)
+	return tea.Batch(subNext(m.sub), statusCmd, m.flush())
+}
+
+// applyTurnStatus derives the turn status from a turn-lifecycle event for the
+// PRIMARY loop ONLY (events carry Header.LoopID; a subagent loop's turn events must
+// NOT flip the primary status — its output surfaces via Enduring StepDone, rendered
+// collapsed-but-present). On the primary loop's TurnStarted it goes Running and
+// starts the live-surface blink; on any of its terminals (TurnDone/TurnFailed/
+// TurnInterrupted) it returns to Idle. Interrupting/Resetting are owned by their own
+// handlers and are NOT set here — but a TurnInterrupted terminal does land Idle from
+// Interrupting, completing the interrupt. Non-turn events and subagent turn events
+// return nil and leave the status untouched.
+func (m *Screen) applyTurnStatus(ev event.Event) tea.Cmd {
+	if ev.EventHeader().LoopID != m.agent.PrimaryLoopID() {
+		return nil
+	}
+	switch ev.(type) {
+	case event.TurnStarted:
+		m.status = StatusRunning
+		return m.startBlink()
+	case event.TurnDone, event.TurnFailed, event.TurnInterrupted:
+		m.status = StatusIdle
+		return nil
+	default:
+		return nil
+	}
+}
+
+// handleSubscribed installs the session-lifetime subscription and starts the
+// continuous reader. On a non-nil err the TUI cannot observe the session at all —
+// it commits a fatal error entry (the user sees the failure rather than a silently
+// dead surface). On success it stores the stream and kicks off subNext, the single
+// reader that drives every subsequent event.
+func (m *Screen) handleSubscribed(msg subscribedMsg) tea.Cmd {
+	if msg.err != nil {
+		m.transcript = m.transcript.CommitError(msg.err)
+		return m.flush()
+	}
+	m.sub = msg.sub
+	return subNext(m.sub)
+}
+
+// handleSubClosed reacts to the continuous reader observing a closed channel. A nil
+// err is an intentional Close (a /clear swap or quit teardown) — nothing to surface.
+// A non-nil err is a hub-forced loss (egress overflow); it commits an error entry so
+// the user learns the live stream was dropped rather than silently stalling. Either
+// way the reader is not re-armed (the channel is closed); a /clear re-subscribe is
+// the path back to a live stream.
+func (m *Screen) handleSubClosed(msg subClosedMsg) tea.Cmd {
+	if msg.err == nil {
+		return nil
+	}
+	m.transcript = m.transcript.CommitError(msg.err)
+	return m.flush()
+}
+
+// handleSubmitResult surfaces a fire-and-forget Submit outcome. A nil err is a
+// silent success (the loop accepted the input; its events arrive on the
+// subscription). A non-nil err commits a faint, NON-FATAL error entry: the
+// optimistic user row already printed at submit time and stays as a record; the
+// error only notes the send failed. It never panics and never hangs.
+func (m *Screen) handleSubmitResult(msg submitResultMsg) tea.Cmd {
+	if msg.err == nil {
+		return nil
+	}
+	m.transcript = m.transcript.CommitError(msg.err)
+	return m.flush()
 }
 
 // flush renders every newly committed transcript entry to scrollback exactly once
@@ -183,34 +262,10 @@ func (m *Screen) flush() tea.Cmd {
 	return printToScrollback(actions)
 }
 
-// finishTurnAdvanceQueue closes the active reader, returns the model to Idle, and
-// starts the next queued submission if one is waiting (its user entry was already
-// committed to scrollback at submit time). It is shared by the EOF and error arms.
-func (m *Screen) finishTurnAdvanceQueue() tea.Cmd {
-	if m.reader != nil {
-		_ = m.reader.Close() // best-effort; idempotent closer, nothing actionable at the UI
-	}
-	m.reader = nil
-	m.status = StatusIdle
-
-	var start tea.Cmd
-	if len(m.queue) > 0 {
-		head := m.queue[0]
-		cmd, ok := m.startTurn(head) // may commit a kindError entry on failure
-		if ok {
-			m.queue = m.queue[1:]
-		}
-		start = cmd
-	}
-	// Flush AFTER the restart attempt so any terminal entry committed above (the
-	// turn's own error/tombstone) AND any restart-failure error entry both print.
-	return tea.Batch(m.flush(), start)
-}
-
 // handleInterruptResult applies the outcome of an Interrupt call. On error the turn
 // may still be live, so the model returns to Running and commits a faint error
-// entry; on success it stays Interrupting — the loop's TurnInterrupted terminal (or
-// the in-flight stream's pending EOF) returns it to Idle.
+// entry; on success it stays Interrupting — the loop's TurnInterrupted terminal on
+// the subscription (applyTurnStatus, primary loop) returns it to Idle.
 func (m *Screen) handleInterruptResult(msg interruptResultMsg) tea.Cmd {
 	if msg.err != nil {
 		m.transcript = m.transcript.CommitError(msg.err)
@@ -223,23 +278,33 @@ func (m *Screen) handleInterruptResult(msg interruptResultMsg) tea.Cmd {
 // handleReopenResult applies a /clear reopen outcome (the model is Resetting). On
 // error the old agent is kept and the model returns to Idle with an error entry. On
 // success the fresh agent is swapped in, all display state is reset, the model
-// returns to Idle, and the old agent is closed best-effort. Already-printed
+// returns to Idle, the OLD subscription is closed and a NEW one is established
+// against the fresh agent, and the old agent is closed best-effort. Already-printed
 // scrollback stays in the terminal (native history is append-only); the print-once
 // engine is reset so a fresh session starts a clean transcript model.
+//
+// Ordering matters: the agent is swapped to msg.agent BEFORE subscribeCmd is built
+// so the re-subscribe reads the NEW agent (subscribeCmd reads m.agent). The old
+// subscription is closed best-effort first so the old agent's hub does not leak it;
+// m.sub is cleared so a late subClosedMsg from the old stream (nil err — an
+// intentional Close) is a harmless no-op.
 func (m *Screen) handleReopenResult(msg reopenResultMsg) tea.Cmd {
 	if msg.err != nil {
 		m.transcript = m.transcript.CommitError(msg.err)
 		m.status = StatusIdle
 		return m.flush()
 	}
+	if m.sub != nil {
+		_ = m.sub.Close() // best-effort; idempotent, nothing actionable at the UI
+	}
+	m.sub = nil
 	old := m.agent
 	m.agent = msg.agent
 	m.transcript = transcriptModel{}
 	m.scrollback = newScrollbackModel(m.width)
 	m.interaction = m.interaction.ClearPrompts()
-	m.queue = nil
 	m.status = StatusIdle
-	return closeAgent(old)
+	return tea.Batch(closeAgent(old), subscribeCmd(m.agent))
 }
 
 // handlePromptResult surfaces a bounded prompt-dispatch outcome. A nil err is a
@@ -255,29 +320,12 @@ func (m *Screen) handlePromptResult(msg promptResultMsg) tea.Cmd {
 	return m.flush()
 }
 
-// startTurn begins a turn from blocks. agent.StreamBlocks may fail before a reader
-// exists (TurnRejectedError, loop exited, ctx done); on error it commits an error entry
-// and stays Idle — never Running without a reader, never readNext(nil). On success it
-// transitions to Running and, via startBlink, kicks off the live-surface animation
-// tick (guarded so a queue-advance restart never spawns a parallel loop). It returns
-// the (batched) readNext + tick cmd and whether the turn actually started.
-func (m *Screen) startTurn(blocks []content.Block) (tea.Cmd, bool) {
-	r, err := m.agent.StreamBlocks(m.appCtx, blocks)
-	if err != nil {
-		m.transcript = m.transcript.CommitError(err)
-		m.status, m.reader = StatusIdle, nil
-		return nil, false
-	}
-	m.reader, m.status = r, StatusRunning
-	return tea.Batch(readNext(r), m.startBlink()), true
-}
-
 // startBlink starts the live-surface animation tick loop iff one is not already
 // running: it sets the ticking guard and returns the first blinkTick. If a tick is
-// already in flight (anim.ticking) — e.g. a queued submission restarts a turn before
-// the prior loop has observed Idle and reset — it returns nil so no second, parallel
+// already in flight (anim.ticking) — e.g. a fresh TurnStarted arrives before the
+// prior loop has observed Idle and reset — it returns nil so no second, parallel
 // loop is spawned. The single in-flight tick keeps ticking (it observes Running), so
-// the animation continues seamlessly across the queue-advance boundary.
+// the animation continues seamlessly across back-to-back turns.
 func (m *Screen) startBlink() tea.Cmd {
 	if m.anim.ticking {
 		return nil
@@ -364,6 +412,14 @@ func (m Screen) activePrompt() *prompt {
 func (m *Screen) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "ctrl+c":
+		// Close the session subscription best-effort so it does not leak past quit.
+		// Close is a synchronous, idempotent in-process teardown (it just closes the
+		// egress channel under a lock), so it is safe to call inline here; the agent
+		// close is the bounded async cmd that may block.
+		if m.sub != nil {
+			_ = m.sub.Close()
+			m.sub = nil
+		}
 		return *m, tea.Sequence(closeAgent(m.agent), tea.Quit)
 	case "ctrl+t":
 		m.expand = !m.expand // pure display state; default expanded, so this collapses first
@@ -407,30 +463,23 @@ func (m *Screen) mapAction(a uiAction) tea.Cmd {
 	}
 }
 
-// submit builds blocks from the composed text and either starts a turn (Idle),
-// queues it (Running), or no-ops (Interrupting/Resetting). On any status that
-// accepts the message the user entry is committed to scrollback first (so it lands
-// in native history immediately, even when queued mid-turn). A buildBlocks error or
-// a failed start commits a faint error entry and starts no turn.
+// submit builds blocks from the composed text and sends them fire-and-forget. The
+// LOOP owns queueing now (a submission while Running is queued by the loop, not by
+// Screen), so there is no status branching and no Screen-side queue: every accepted
+// submission optimistically commits a user entry to scrollback (so it lands in
+// native history immediately) and fires submitCmd. A buildBlocks error commits a
+// faint error entry and sends nothing. The optimistic CommitUser is kept for now —
+// moving user rows to event-driven (the loop's TurnStarted Message) is the next
+// sub-task. submitCmd's submitResultMsg notes any send failure without removing the
+// optimistic row.
 func (m *Screen) submit(text string) tea.Cmd {
 	blocks, err := buildBlocks(text, m.agent.AcceptsImages())
 	if err != nil {
 		m.transcript = m.transcript.CommitError(err)
 		return m.flush()
 	}
-
-	switch m.status {
-	case StatusIdle:
-		m.transcript = m.transcript.CommitUser(blocks)
-		cmd, _ := m.startTurn(blocks)
-		return tea.Batch(m.flush(), cmd)
-	case StatusRunning:
-		m.transcript = m.transcript.CommitUser(blocks)
-		m.queue = append(m.queue, blocks)
-		return m.flush()
-	default: // Interrupting / Resetting: no-op, drop the submission.
-		return nil
-	}
+	m.transcript = m.transcript.CommitUser(blocks)
+	return tea.Batch(m.flush(), submitCmd(m.appCtx, m.agent, blocks))
 }
 
 // runSlash executes a known slash command. /help commits the listing to scrollback;
@@ -452,16 +501,16 @@ func (m *Screen) runSlash(name string) tea.Cmd {
 	}
 }
 
-// interruptRunning begins an interrupt only while Running: it flips to Interrupting,
-// drops the pending queue (those submissions are abandoned; their user entries
-// already printed to scrollback), and returns the bounded Interrupt command. From
-// any other status it is a no-op. It is the home for both the Esc-in-compose path
-// and the uiInterrupt action raised from a choice/answer prompt.
+// interruptRunning begins an interrupt only while Running: it flips to Interrupting
+// and returns the bounded Interrupt command. The loop owns queueing, so there is no
+// Screen-side queue to drop — the loop returns any queued inputs as InputCancelled
+// events on the subscription (harmless to the transcript today). From any other
+// status it is a no-op. It is the home for both the Esc-in-compose path and the
+// uiInterrupt action raised from a choice/answer prompt.
 func (m *Screen) interruptRunning() tea.Cmd {
 	if m.status != StatusRunning {
 		return nil
 	}
 	m.status = StatusInterrupting
-	m.queue = nil
 	return interruptTurn(m.appCtx, m.agent)
 }
