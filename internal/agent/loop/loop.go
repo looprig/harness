@@ -29,11 +29,65 @@ type Loop struct {
 
 	// gateReg is the actor's gate-registration seam. A parked runner (or
 	// RequestUserInput on its behalf) sends a gateRegistration here and waits for
-	// the ack; listen installs the gate in loopState.pendingGates before closing
+	// the ack; runLoop installs the gate in loopState.pendingGates before closing
 	// the ack (install-before-emit). It is unexported: only in-package callers (the
 	// runner via the turn-launch ctx injection, and tests) register gates. The
 	// actor is the sole reader.
 	gateReg chan<- gateRegistration
+}
+
+// loopConfig holds the loop goroutine's DEPENDENCIES and construction-time wiring
+// (Single Responsibility: deps, not mutable state). New builds it once and hands
+// it to runLoop; runLoop never mutates it. loopState (separate) holds the loop's
+// identity, status, and accumulated messages — the only thing runLoop mutates.
+//
+// The split is deliberate: a dependency parked in state (the Phase-3 interim
+// `loopState.events`) was an SRP smudge — config is wiring set at construction,
+// state is what the actor evolves. events lives here now.
+type loopConfig struct {
+	// loopCtx is the loop's lifetime context (derived by the session from its
+	// sessionCtx). It is NOT a turn lifetime: runLoop derives each turn ctx from it
+	// via context.WithCancel(loopCtx). Submit commands carry no context.
+	loopCtx context.Context
+
+	// cfg is the caller-supplied loop configuration (client, model, tools, sinks,
+	// drain timeout, and the test-only id-gen/after-drain seams), defaulted by New.
+	cfg Config
+
+	// commands is the actor's inbound command channel (the send side is the public
+	// Loop.Commands). Closing it is a contract violation; stop via Shutdown.
+	commands <-chan command.Command
+
+	// gateReg is the gate-registration channel. The actor is its sole reader; the
+	// per-turn goroutine hands the SEND side to runTurn so a parked tool can register
+	// a gate. Bidirectional here because a receive-only handle could not be narrowed
+	// to the send-only direction runTurn requires.
+	gateReg chan gateRegistration
+
+	// internal is the turn goroutine's terminal hand-back (turnResult). Buffered(1)
+	// so a finished turn never blocks delivering its terminal to the actor.
+	internal chan turnResult
+
+	// commits is the per-step commit handshake channel: the turn goroutine sends a
+	// commitRequest per completed step; the actor appends the group to loopState.msgs
+	// and emits the StepDone at the same point, then acks. Unbuffered (synchronous).
+	commits chan commitRequest
+
+	// drains is the tool-continuation drain handshake channel: one drainRequest per
+	// tool-continuation boundary; the actor pops + clears the inbox into
+	// loopState.draining and replies the queued inputs. Unbuffered (synchronous).
+	drains chan drainRequest
+
+	// done is closed by runLoop when the actor has fully exited (the public
+	// Loop.Done is its receive side).
+	done chan struct{}
+
+	// events publishes FULL-FIDELITY loop events to the session-level event fan-in.
+	// The loop depends on the narrow publisher interface (Dependency Inversion /
+	// Interface Segregation) instead of a raw channel, so only AgentSession owns
+	// buffering, shutdown, close, and sequence policy. A parent or primary loop must
+	// not forward child-loop events; identity is metadata, not the transport path.
+	events eventPublisher
 }
 
 // idGenerator mints a fresh UUID. It defaults to uuid.New; tests inject a
@@ -96,8 +150,24 @@ func New(loopCtx context.Context, sessionID, loopID uuid.UUID, parent Provenance
 	// gateReg is unbuffered: registration is synchronous (the runner blocks on the
 	// ack), and the actor is the sole reader, selecting on it alongside commands.
 	gateReg := make(chan gateRegistration)
-	state := newLoopState(sessionID, loopID, parent, events)
-	go listen(loopCtx, cfg, commands, gateReg, done, state)
+	// The loop-goroutine handshake channels are construction-time wiring shared
+	// between the actor and the per-turn goroutine, so they live in loopConfig:
+	//   - internal: turn terminal hand-back, buffered(1) so a finished turn never blocks.
+	//   - commits/drains: per-step commit and tool-continuation drain handshakes;
+	//     unbuffered because each is a synchronous request/reply the actor serializes.
+	lc := loopConfig{
+		loopCtx:  loopCtx,
+		cfg:      cfg,
+		commands: commands,
+		gateReg:  gateReg,
+		internal: make(chan turnResult, 1),
+		commits:  make(chan commitRequest),
+		drains:   make(chan drainRequest),
+		done:     done,
+		events:   events,
+	}
+	state := newLoopState(sessionID, loopID, parent)
+	go runLoop(lc, state)
 	return &Loop{Commands: commands, Done: done, gateReg: gateReg}, nil
 }
 
@@ -174,12 +244,11 @@ type loopState struct {
 	// primary loop). The loop knows its PARENT so it can later stamp Parent* on
 	// the events it emits; it never tracks its CHILDREN. The session owns the
 	// loop registry and turn tree (SRP).
+	//
+	// The session event publisher is NOT here: it is a dependency, so it lives in
+	// loopConfig.events. loopState holds only identity, status, and accumulated
+	// state — the things the actor mutates.
 	parent Provenance
-
-	// events is the session-level event publisher (Dependency Inversion). Stored
-	// at construction; Phase 3 does not yet call it — event publication wiring is
-	// Phase 4. The existing per-turn channel + cfg.Sinks paths are unchanged.
-	events eventPublisher
 
 	turnIndex     event.TurnIndex
 	turnID        uuid.UUID // entity id for the active turn; zero when idle
@@ -193,7 +262,7 @@ type loopState struct {
 
 	// inbox is the actor-owned pending-input queue for accepted
 	// UserInput/SubagentResult that could not start immediately (a turn was
-	// running). Only the actor (listen) appends/removes/clears it — no locks. On
+	// running). Only the actor (runLoop) appends/removes/clears it — no locks. On
 	// going idle the actor pops the first entry to start the next turn; on an
 	// abnormal terminal it returns the remaining entries via InputCancelled and
 	// starts nothing. Bounded by inboxCap (a full inbox rejects with QueueFull).
@@ -215,21 +284,21 @@ type loopState struct {
 	shutdownAcks []chan<- error
 
 	// pendingGates maps a tool call's CallID to the gate a parked runner is blocked
-	// on. Owned SOLELY by listen/the actor — a turn goroutine never touches it. A
+	// on. Owned SOLELY by runLoop/the actor — a turn goroutine never touches it. A
 	// control command (Approve/Deny/ProvideUserInput) is routed to the matching
 	// gate by CallID AND kind, then the entry is deleted. Cleared on turn end.
 	pendingGates map[uuid.UUID]gate
 }
 
 // newLoopState builds the actor-owned loop state with its identity (sessionID,
-// loopID, parent provenance) and the session event publisher. pendingGates is
-// initialized so the actor can route gate commands without a nil-map panic.
-func newLoopState(sessionID, loopID uuid.UUID, parent Provenance, events eventPublisher) loopState {
+// loopID, parent provenance). The session event publisher is a dependency, not
+// state, so it lives in loopConfig — not here. pendingGates is initialized so the
+// actor can route gate commands without a nil-map panic.
+func newLoopState(sessionID, loopID uuid.UUID, parent Provenance) loopState {
 	return loopState{
 		id:           loopID,
 		sessionID:    sessionID,
 		parent:       parent,
-		events:       events,
 		pendingGates: make(map[uuid.UUID]gate),
 	}
 }
@@ -277,27 +346,33 @@ type drainRequest struct {
 	reply chan<- []queuedInput
 }
 
-// listen takes gateReg as a bidirectional channel: the actor is its sole reader
-// (the select below), and the per-turn goroutine hands the SEND side to runTurn
-// → RunBatch so a parked tool can register a gate. (A receive-only handle could
-// not be narrowed to the send-only direction runTurn requires.)
-func listen(ctx context.Context, cfg Config, commands <-chan command.Command, gateReg chan gateRegistration, done chan struct{}, state loopState) {
-	defer close(done)
+// runLoop is the loop goroutine started by New. It is the only goroutine that
+// mutates loopState, installs or clears the active turn, closes the per-turn
+// stream, commits or discards turn messages, emits TurnStarted/StepDone/
+// TurnFoldedInto at the same points it mutates loopState.msgs, and resolves
+// pending gates.
+//
+// cfg (loopConfig) holds the dependencies and construction-time wiring; state
+// (loopState) holds the identity, status, and accumulated messages runLoop
+// evolves. Both are kept as locals here. The handshake channels (internal/
+// commits/drains) and the gate-registration channel live in cfg because they are
+// construction-time wiring shared with the per-turn goroutine; cfg.gateReg is
+// bidirectional because the per-turn goroutine hands its SEND side to runTurn so a
+// parked tool can register a gate (a receive-only handle could not be narrowed to
+// the send-only direction runTurn requires).
+func runLoop(cfg loopConfig, state loopState) {
+	defer close(cfg.done)
 
-	internal := make(chan turnResult, 1)
-	// commits is the per-step commit handshake channel. The turn goroutine sends a
-	// commitRequest per completed step; the actor (the sole reader, in its select)
-	// appends the group to loopState.msgs and emits the StepDone at the same point,
-	// then acks. Unbuffered: the handshake is synchronous (runTurn blocks on the
-	// ack), which serializes the per-turn stream so a step's TokenDeltas (emitted by
-	// runTurn) all precede that step's StepDone (emitted here by the actor).
-	commits := make(chan commitRequest)
-	// drains is the tool-continuation drain handshake channel. The turn goroutine
-	// sends one drainRequest per tool-continuation boundary; the actor (the sole
-	// reader, in its select) pops + clears the inbox into loopState.draining and
-	// replies the foldedMsgs. Unbuffered: the handshake is synchronous, so the actor
-	// is the only goroutine touching inbox/draining when it runs.
-	drains := make(chan drainRequest)
+	// Locals alias the config's wiring so the actor body reads against the same
+	// names the per-turn handshakes use. ctx is the loop lifetime (cfg.loopCtx);
+	// each turn ctx derives from it. Config (the caller's loop config) is cfg.cfg.
+	ctx := cfg.loopCtx
+	config := cfg.cfg
+	commands := cfg.commands
+	gateReg := cfg.gateReg
+	internal := cfg.internal
+	commits := cfg.commits
+	drains := cfg.drains
 
 	// publishHub sends a FULL-FIDELITY loop event to the session-level event fan-in.
 	// Producer identity is stamped here from loopState/the active turn (the actor IS
@@ -314,7 +389,7 @@ func listen(ctx context.Context, cfg Config, commands <-chan command.Command, ga
 		if _, ok := ev.(event.SessionStarted); ok {
 			return
 		}
-		if err := state.events.PublishEvent(ctx, stampLoopHeader(ev, state.sessionID, state.id, state.turnID)); err != nil {
+		if err := cfg.events.PublishEvent(ctx, stampLoopHeader(ev, state.sessionID, state.id, state.turnID)); err != nil {
 			slog.Error("loop event publish to session fan-in failed", "error", err)
 		}
 	}
@@ -333,7 +408,7 @@ func listen(ctx context.Context, cfg Config, commands <-chan command.Command, ga
 		// system-level fault; it must not abort turn execution (the bare per-turn
 		// event is delivered separately), so log it and emit the envelope with a
 		// zero EventID rather than dropping the sink copy.
-		eventID, err := cfg.idGen()
+		eventID, err := config.idGen()
 		if err != nil {
 			slog.Error("event id generation failed; emitting envelope with zero EventID", "error", err)
 		}
@@ -359,7 +434,7 @@ func listen(ctx context.Context, cfg Config, commands <-chan command.Command, ga
 		case event.TurnInterrupted:
 			env.TurnIndex = e.TurnIndex
 		}
-		for _, sink := range cfg.Sinks {
+		for _, sink := range config.Sinks {
 			func() {
 				defer func() {
 					if r := recover(); r != nil {
@@ -482,33 +557,25 @@ func listen(ctx context.Context, cfg Config, commands <-chan command.Command, ga
 		}
 	}
 
-	// startTurn begins a turn FROM an accepted submit (qi). It is the single
-	// commit-then-start path shared by an idle submit and the on-idle inbox pop. It
-	// mints the TurnID, installs the active-turn fields (events/abandoned may be nil
-	// for a fan-in-only turn), commits qi.msg into loopState.msgs and emits
-	// event.TurnStarted{InputID, Message, CausationID=inputID} at the same
-	// actor-owned point, then launches runTurn. It returns the new TurnID; on an
-	// id-gen failure it returns a non-nil error and starts nothing (the caller
-	// decides how to surface it). The actor is the sole caller, so it always runs
-	// with state.status idle.
-	startTurn := func(qi queuedInput, events chan<- event.Event, abandoned <-chan struct{}) (uuid.UUID, error) {
-		turnID, err := cfg.idGen()
-		if err != nil {
-			return uuid.UUID{}, &IDGenerationError{Cause: err}
-		}
+	// installActiveTurn installs the active-turn fields on loopState and derives the
+	// turn ctx from the loop ctx (submit commands carry no context, so a turn's
+	// lifetime is bounded by the loop's, not by any caller's API-call ctx). It then
+	// commits the initial UserMessage into loopState.msgs and emits
+	// event.TurnStarted at the SAME actor-owned point (TriggeredByLoopID carries
+	// qi.triggeredBy: set for a SubagentResult, zero for a UserInput). It returns the
+	// derived turn ctx and the defensive base clone the per-turn goroutine reads.
+	// This is the COMMIT-AND-ANNOUNCE half of starting a turn (distinct from
+	// assembling the per-turn turnConfig).
+	installActiveTurn := func(turnID uuid.UUID, qi queuedInput, events chan<- event.Event, abandoned <-chan struct{}) (context.Context, content.AgenticMessages) {
 		state.turnIndex++
 		state.turnID = turnID
 		state.causationID = qi.inputID
 		state.status = loopRunning
 		state.turnEvents = events
 		state.turnAbandoned = abandoned
-		// The turn ctx derives from the loop ctx (listen's ctx is loopCtx): submit
-		// commands carry no context, so a turn's lifetime is bounded by the loop's,
-		// not by any caller's API-call ctx.
 		turnCtx, cancel := context.WithCancel(ctx)
 		state.cancelTurn = cancel
 		state.turnDone = turnCtx.Done()
-		idx := state.turnIndex
 
 		// base is a defensive CLONE of pre-turn history with its OWN backing array,
 		// taken BEFORE the initial UserMessage is committed (runTurn reads it
@@ -517,8 +584,7 @@ func listen(ctx context.Context, cfg Config, commands <-chan command.Command, ga
 
 		// Loop-owned incremental commit: commit the initial UserMessage and emit
 		// TurnStarted (Message + CausationID = inputID + InputID = inputID) at the
-		// SAME actor-owned point, BEFORE runTurn starts. TriggeredByLoopID carries
-		// qi.triggeredBy (set for a SubagentResult, zero for a UserInput).
+		// SAME actor-owned point, BEFORE runTurn starts.
 		state.msgs = append(state.msgs, qi.msg)
 		emitTurn(event.TurnStarted{
 			Header: event.Header{
@@ -528,13 +594,28 @@ func listen(ctx context.Context, cfg Config, commands <-chan command.Command, ga
 				CausationID:       state.causationID,
 				TriggeredByLoopID: qi.triggeredBy,
 			},
-			TurnIndex: idx,
+			TurnIndex: state.turnIndex,
 			InputID:   qi.inputID,
 			Message:   qi.msg,
 		})
+		return turnCtx, base
+	}
 
-		ts := newTurnState(state.sessionID, state.id, state.turnID, idx, state.causationID, qi.msg)
-
+	// buildTurnConfig assembles the per-turn turnConfig: the static deps (base/model/
+	// tools/client/gateReg/idGen) plus the three ctx-cancellable handshake closures
+	// the turn goroutine calls back through. This is the WIRING half of starting a
+	// turn (distinct from committing + announcing it).
+	//
+	//   - commit: per-step commit handshake. Selects on the buffered(1) ack AND
+	//     turnCtx.Done so an Interrupt/Shutdown during the handshake frees runTurn.
+	//   - drainPending: tool-continuation drain handshake, ctx-cancellable exactly
+	//     like commit. The reply is buffered(1), so the actor's send never blocks even
+	//     if runTurn already escaped on turnCtx.Done (the moved-out inbox entries are
+	//     then resolved from loopState.draining by the abnormal-terminal return path).
+	//   - emit: the turn goroutine's per-turn emit, nil-safe for a fan-in-only turn.
+	//     The escapes (abandoned, turnCtx.Done) keep it from pinning the turn goroutine
+	//     when the consumer stops reading.
+	buildTurnConfig := func(turnCtx context.Context, base content.AgenticMessages, events chan<- event.Event, abandoned <-chan struct{}) turnConfig {
 		commit := func(cctx context.Context, tc turnCommit) error {
 			ack := make(chan struct{}, 1)
 			req := commitRequest{commit: tc, ack: ack}
@@ -550,13 +631,6 @@ func listen(ctx context.Context, cfg Config, commands <-chan command.Command, ga
 				return &CommitError{Reason: CommitTurnCancelled, Cause: cctx.Err()}
 			}
 		}
-
-		// drainPending is the tool-continuation drain handshake. It is ctx-cancellable
-		// exactly like commit: it selects on the buffered(1) reply AND cctx.Done, so an
-		// Interrupt/Shutdown during the drain frees the parked runTurn instead of
-		// wedging it. The reply is buffered, so the actor's send never blocks even if
-		// runTurn has already escaped on cctx.Done (the moved-out inbox entries are then
-		// resolved from loopState.draining by the abnormal-terminal return path).
 		drainPending := func(cctx context.Context) ([]queuedInput, error) {
 			reply := make(chan []queuedInput, 1)
 			req := drainRequest{reply: reply}
@@ -572,11 +646,6 @@ func listen(ctx context.Context, cfg Config, commands <-chan command.Command, ga
 				return nil, &CommitError{Reason: CommitTurnCancelled, Cause: cctx.Err()}
 			}
 		}
-
-		// emit is the turn goroutine's per-turn emit. It is nil-safe: a fan-in-only
-		// turn (nil events) publishes to sinks/fan-in only and never sends on a nil
-		// channel. The escapes (abandoned, turnCtx.Done) keep emit from pinning the
-		// turn goroutine when the consumer stops reading.
 		emit := func(ev event.Event) {
 			publish(ev)
 			if events == nil {
@@ -588,19 +657,37 @@ func listen(ctx context.Context, cfg Config, commands <-chan command.Command, ga
 			case <-turnCtx.Done():
 			}
 		}
-
-		turnCfg := turnConfig{
+		return turnConfig{
 			base:         base,
-			model:        cfg.Model,
-			tools:        cfg.Tools,
-			client:       cfg.Client,
+			model:        config.Model,
+			tools:        config.Tools,
+			client:       config.Client,
 			gateReg:      gateReg,
-			idGen:        cfg.idGen,
+			idGen:        config.idGen,
 			commit:       commit,
 			drainPending: drainPending,
 			emit:         emit,
-			afterDrain:   cfg.afterDrain,
+			afterDrain:   config.afterDrain,
 		}
+	}
+
+	// startTurn begins a turn FROM an accepted submit (qi). It is the single
+	// commit-then-start path shared by an idle submit and the on-idle inbox pop. It
+	// mints the TurnID, installs+commits+announces the turn (installActiveTurn),
+	// assembles the per-turn config (buildTurnConfig), then launches runTurn. It
+	// returns the new TurnID; on an id-gen failure it returns a non-nil error and
+	// starts nothing (the caller decides how to surface it). The actor is the sole
+	// caller, so it always runs with state.status idle.
+	startTurn := func(qi queuedInput, events chan<- event.Event, abandoned <-chan struct{}) (uuid.UUID, error) {
+		turnID, err := config.idGen()
+		if err != nil {
+			return uuid.UUID{}, &IDGenerationError{Cause: err}
+		}
+		turnCtx, base := installActiveTurn(turnID, qi, events, abandoned)
+		idx := state.turnIndex
+		ts := newTurnState(state.sessionID, state.id, turnID, idx, state.causationID, qi.msg)
+		turnCfg := buildTurnConfig(turnCtx, base, events, abandoned)
+		cancel := state.cancelTurn
 
 		go func() {
 			defer cancel()
@@ -787,6 +874,83 @@ func listen(ctx context.Context, cfg Config, commands <-chan command.Command, ga
 		tryAck[command.CancelResult](c.Ack, command.AlreadyCommitted{TurnID: state.turnID})
 	}
 
+	// resolveQueueAfterTurn resolves still-queued input once a NON-shutdown turn has
+	// ended, and reports whether the actor immediately chained into a new turn
+	// (running -> running). On a normal terminal (TurnDone) it pops the FIRST queued
+	// entry and starts a later turn (no input stranded); the rest stay queued. On an
+	// abnormal terminal (TurnFailed/TurnInterrupted) it returns EVERY queued entry via
+	// InputCancelled and auto-starts nothing — the client decides whether to resend.
+	// endedTurnID is the turn that ended (the cause of any return). chained==true means
+	// the loop stayed running, so the caller must NOT emit LoopIdle between the turns.
+	resolveQueueAfterTurn := func(result turnResult, endedTurnID uuid.UUID) (chained bool) {
+		if _, normal := result.terminal.(event.TurnDone); !normal {
+			returnQueuedInbox(cancelReasonFor(result.terminal), endedTurnID)
+			return false
+		}
+		next, ok := popFront()
+		if !ok {
+			return false
+		}
+		// Inbox-exit invariant: next is now REMOVED from the inbox, so it MUST reach
+		// either startTurn-success or returnEntry — never neither (that would silently
+		// strand it). A later turn started from the queue is fan-in-only (nil stream):
+		// the original submit's per-turn stream, if any, belonged to a StartOnly caller,
+		// which is never queued.
+		if _, err := startTurn(next, nil, nil); err != nil {
+			// Could not mint a TurnID for the popped entry: resolve THAT entry as
+			// returned (returnQueuedInbox would not — next is no longer in the inbox),
+			// then return any remaining entries too.
+			slog.Error("turn id generation failed starting queued input; returning it", "error", err)
+			returnEntry(next, event.CancelTurnFailed, endedTurnID)
+			returnQueuedInbox(event.CancelTurnFailed, endedTurnID)
+			return false
+		}
+		return true // running -> running; no LoopIdle between turns
+	}
+
+	// handleTurnResult is the actor's response to a turn goroutine's terminal
+	// hand-back (the `case result := <-internal` select arm, extracted so the select
+	// reads as a dispatch). It runs the three distinct concerns in order — (1) flip
+	// status idle and DELIVER the terminal (clearing the turn's correlation ids after,
+	// since the terminal envelope still needs them); (2) drop stale gates; (3) resolve
+	// the queue and announce idle — and returns true when the loop must EXIT (a
+	// shutdown-induced terminal: ack the shutdown waiters and stop). loopState.msgs is
+	// committed incrementally via the commit handshake, not from the turn result: a
+	// failed/interrupted turn discards only the in-flight incomplete step (which never
+	// committed); committed steps stay.
+	handleTurnResult := func(result turnResult) (exit bool) {
+		state.cancelTurn = nil
+		shuttingDown := state.status == loopShuttingDown
+		if !shuttingDown {
+			state.status = loopIdle
+		}
+		endedTurnID := state.turnID
+		// deliverAndClose publishes the terminal envelope, which must still carry this
+		// turn's correlation IDs, so clear them only afterward.
+		deliverAndClose(result.terminal)
+		state.turnID = uuid.UUID{}
+		state.causationID = uuid.UUID{}
+		// A finished turn must not leave stale gates: the parked runners have already
+		// unblocked via the cancelled turn ctx, and a late control command for this dead
+		// turn must not match a leftover gate.
+		clearGates()
+		if shuttingDown {
+			// Shutting down: return any still-queued input (it will never start) and
+			// stop. Reason follows the terminal: a TurnDone shutdown still returns queued
+			// input as interrupted (the loop is going away).
+			returnQueuedInbox(cancelReasonFor(result.terminal), endedTurnID)
+			ackShutdowns(nil)
+			return true
+		}
+		// Running -> idle transition: announce LoopIdle (Enduring, non-terminal) AFTER
+		// the terminal so the session quiescence model removes this loop's {loop, LoopID}
+		// activity key. A chained turn stayed running, so it emits no LoopIdle.
+		if !resolveQueueAfterTurn(result, endedTurnID) {
+			emitLoopIdle()
+		}
+		return false
+	}
+
 	for {
 		select {
 		case cmd, ok := <-commands:
@@ -881,7 +1045,7 @@ func listen(ctx context.Context, cfg Config, commands <-chan command.Command, ga
 
 		case req := <-drains:
 			// Tool-continuation drain: pop + clear the inbox into draining and reply the
-			// foldedMsgs. The actor is the sole owner of inbox/draining, and the turn
+			// queued inputs. The actor is the sole owner of inbox/draining, and the turn
 			// goroutine is parked in cfg.drainPending while this runs, so there is no
 			// concurrent access. The reply is buffered(1); the send never blocks. The
 			// drained entries are now in draining and are resolved either by their
@@ -908,74 +1072,8 @@ func listen(ctx context.Context, cfg Config, commands <-chan command.Command, ga
 			req.ack <- struct{}{}
 
 		case result := <-internal:
-			// loopState.msgs is committed incrementally via the commit handshake, not
-			// from the turn result. A failed/interrupted turn discards only the
-			// in-flight incomplete step (which never committed); committed steps stay.
-			state.cancelTurn = nil
-			shuttingDown := state.status == loopShuttingDown
-			if !shuttingDown {
-				state.status = loopIdle
-			}
-			endedTurnID := state.turnID
-			// deliverAndClose publishes the terminal envelope, which must still
-			// carry this turn's correlation IDs, so clear them only afterward.
-			deliverAndClose(result.terminal)
-			state.turnID = uuid.UUID{}
-			state.causationID = uuid.UUID{}
-			// A finished turn must not leave stale gates: the parked runners have
-			// already unblocked via the cancelled turn ctx, and a late control
-			// command for this dead turn must not match a leftover gate.
-			clearGates()
-			if shuttingDown {
-				// Shutting down: return any still-queued input (it will never start)
-				// and stop. Reason follows the terminal: a TurnDone shutdown still
-				// returns queued input as interrupted (the loop is going away).
-				returnQueuedInbox(cancelReasonFor(result.terminal), endedTurnID)
-				ackShutdowns(nil)
+			if handleTurnResult(result) {
 				return
-			}
-			// Resolve any queued input now that the turn ended:
-			//   - normal terminal (TurnDone): start a later turn from the FIRST queued
-			//     entry (no input stranded); the rest stay queued for subsequent turns.
-			//   - abnormal terminal (TurnFailed/TurnInterrupted): return EVERY queued
-			//     entry via InputCancelled and auto-start nothing — the client decides
-			//     whether to resend.
-			//
-			// chained tracks whether the actor immediately started a new turn from the
-			// queue (running -> running). When it did, the loop did NOT go idle, so it
-			// must NOT emit LoopIdle between the chained turns (quiescence would briefly
-			// and wrongly see the loop idle). LoopIdle is emitted ONLY when the loop
-			// actually parks idle (no chained turn).
-			chained := false
-			if _, normal := result.terminal.(event.TurnDone); normal {
-				if next, ok := popFront(); ok {
-					// Inbox-exit invariant: next is now REMOVED from the inbox, so it
-					// MUST reach either startTurn-success or returnEntry below — never
-					// neither (that would silently strand it).
-					//
-					// A later turn started from the queue is fan-in-only (nil stream):
-					// the original submit's per-turn stream, if any, belonged to a
-					// StartOnly caller, which is never queued.
-					if _, err := startTurn(next, nil, nil); err != nil {
-						// Could not mint a TurnID for the popped entry: resolve THAT
-						// entry as returned (returnQueuedInbox would not — next is no
-						// longer in the inbox), then return any remaining entries too.
-						slog.Error("turn id generation failed starting queued input; returning it", "error", err)
-						returnEntry(next, event.CancelTurnFailed, endedTurnID)
-						returnQueuedInbox(event.CancelTurnFailed, endedTurnID)
-					} else {
-						chained = true // running -> running; no LoopIdle between turns
-					}
-				}
-			} else {
-				returnQueuedInbox(cancelReasonFor(result.terminal), endedTurnID)
-			}
-			// Running -> idle transition: the loop parked with no active turn. Announce
-			// LoopIdle (Enduring, non-terminal) AFTER the terminal so the session
-			// quiescence model removes this loop's {loop, LoopID} activity key. A chained
-			// turn stayed running (chained == true), so it emits no LoopIdle.
-			if !chained {
-				emitLoopIdle()
 			}
 
 		case <-ctx.Done():
@@ -997,9 +1095,9 @@ func listen(ctx context.Context, cfg Config, commands <-chan command.Command, ga
 				select {
 				case result := <-internal:
 					deliverAndClose(result.terminal)
-				case <-time.After(cfg.DrainTimeout):
+				case <-time.After(config.DrainTimeout):
 					slog.Error("turn goroutine did not drain after ctx cancel; detaching",
-						"timeout", cfg.DrainTimeout)
+						"timeout", config.DrainTimeout)
 					state.turnEvents = nil
 					state.turnAbandoned = nil
 					state.turnDone = nil

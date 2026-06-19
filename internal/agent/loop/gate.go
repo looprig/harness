@@ -8,7 +8,7 @@ import (
 	"github.com/inventivepotter/urvi/internal/uuid"
 )
 
-// gateKind distinguishes the two kinds of parked-runner gate so listen can refuse
+// gateKind distinguishes the two kinds of parked-runner gate so runLoop can refuse
 // to satisfy a user-input gate with an approval (or vice versa). Routing matches
 // on CallID AND kind: a stray approve/deny can never answer an AskUser gate.
 type gateKind uint8
@@ -24,7 +24,7 @@ const (
 
 // gate is the actor-owned record of an open gate: the dedicated reply channel for
 // the parked runner and the kind of command it will accept. Stored in
-// loopState.pendingGates, keyed by CallID, and touched ONLY by listen/the actor.
+// loopState.pendingGates, keyed by CallID, and touched ONLY by runLoop/the actor.
 type gate struct {
 	reply chan<- command.Command
 	kind  gateKind
@@ -43,7 +43,7 @@ type gateRegistration struct {
 
 // accepts reports whether a control command may satisfy a gate of the given kind.
 // gatePermission ↔ ApproveToolCall/DenyToolCall; gateUserInput ↔ ProvideUserInput.
-// Any other pairing is rejected (fail-safe): listen drops a mismatched command
+// Any other pairing is rejected (fail-safe): runLoop drops a mismatched command
 // rather than delivering it to the wrong parked runner.
 func accepts(kind gateKind, cmd command.Command) bool {
 	switch cmd.(type) {
@@ -173,7 +173,7 @@ func RequestUserInput(ctx context.Context, question string, choices []string) (s
 
 	select {
 	case cmd := <-reply:
-		// listen already matched by CallID + kind; re-validate the CallID as cheap
+		// runLoop already matched by CallID + kind; re-validate the CallID as cheap
 		// defence in depth, and narrow to the concrete command for the answer.
 		pui, ok := cmd.(command.ProvideUserInput)
 		if !ok || pui.GateCallID() != callID {
@@ -186,7 +186,7 @@ func RequestUserInput(ctx context.Context, question string, choices []string) (s
 }
 
 // GateReplyMismatchError is returned if the command delivered on a gateUserInput
-// reply channel is not a ProvideUserInput for the expected CallID. listen routes
+// reply channel is not a ProvideUserInput for the expected CallID. runLoop routes
 // by CallID + kind, so this is a defence-in-depth guard that should never fire in
 // normal operation.
 type GateReplyMismatchError struct{ CallID uuid.UUID }

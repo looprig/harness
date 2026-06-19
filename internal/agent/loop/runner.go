@@ -330,7 +330,7 @@ func askPermission(
 	}
 }
 
-// applyDecision applies an Approve/Deny reply to r. listen already matched by
+// applyDecision applies an Approve/Deny reply to r. runLoop already matched by
 // CallID + kind; the CallID is re-validated as cheap defence in depth. A non-once
 // approval persists via Grant — a Grant error NEVER fails the call (the user
 // approved THIS call; Grant is best-effort persistence for future calls).

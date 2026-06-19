@@ -37,9 +37,9 @@ type panicSink struct{}
 
 func (panicSink) OnEvent(context.Context, event.EventEnvelope) { panic("boom in sink") }
 
-// noopPublisher is a no-op eventPublisher for loop tests. Phase 3 stores the
-// publisher in loopState but never calls it (publication wiring is Phase 4), so
-// a no-op is sufficient to satisfy the New signature.
+// noopPublisher is a no-op eventPublisher for loop tests that do not assert on
+// the session fan-in. New stores it in loopConfig.events; PublishEvent simply
+// drops the event, which is sufficient to satisfy the New signature.
 type noopPublisher struct{}
 
 func (noopPublisher) PublishEvent(context.Context, event.Event) error { return nil }
@@ -187,35 +187,33 @@ func TestNewLoopState(t *testing.T) {
 		sessionID uuid.UUID
 		loopID    uuid.UUID
 		parent    Provenance
-		events    eventPublisher
 	}{
 		{
 			name:      "primary loop (zero parent)",
 			sessionID: sessionID,
 			loopID:    loopID,
 			parent:    Provenance{},
-			events:    noopPublisher{},
 		},
 		{
 			name:      "subagent loop (non-zero parent)",
 			sessionID: sessionID,
 			loopID:    loopID,
 			parent:    Provenance{LoopID: parentLoop, TurnID: parentTurn, StepID: parentStep},
-			events:    noopPublisher{},
 		},
 		{
 			name:      "zero session and loop ids",
 			sessionID: uuid.UUID{},
 			loopID:    uuid.UUID{},
 			parent:    Provenance{},
-			events:    noopPublisher{},
 		},
 	}
 	for _, tt := range tests {
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			st := newLoopState(tt.sessionID, tt.loopID, tt.parent, tt.events)
+			// The session event publisher is a dependency (loopConfig.events), no longer
+			// loopState — newLoopState carries identity only.
+			st := newLoopState(tt.sessionID, tt.loopID, tt.parent)
 			if st.sessionID != tt.sessionID {
 				t.Errorf("sessionID = %v, want %v", st.sessionID, tt.sessionID)
 			}
@@ -224,9 +222,6 @@ func TestNewLoopState(t *testing.T) {
 			}
 			if st.parent != tt.parent {
 				t.Errorf("parent = %+v, want %+v", st.parent, tt.parent)
-			}
-			if st.events != tt.events {
-				t.Errorf("events publisher not stored")
 			}
 			if st.pendingGates == nil {
 				t.Error("pendingGates is nil, want an initialized map")

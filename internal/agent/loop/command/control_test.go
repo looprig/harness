@@ -8,7 +8,7 @@ import (
 	"github.com/inventivepotter/urvi/internal/uuid"
 )
 
-// gateRouter is the narrow accessor listen uses to route a control command to
+// gateRouter is the narrow accessor runLoop uses to route a control command to
 // the gate waiting on its CallID. Every control command must satisfy it.
 type gateRouter interface {
 	command.Command
@@ -93,7 +93,7 @@ func TestControlCommandsSatisfyContracts(t *testing.T) {
 }
 
 // TestApproveScopeRoundTrips asserts ApproveToolCall preserves the granted scope
-// (the only field listen consults beyond the CallID), across every scope value.
+// (the only field runLoop consults beyond the CallID), across every scope value.
 func TestApproveScopeRoundTrips(t *testing.T) {
 	t.Parallel()
 	scopes := []struct {
