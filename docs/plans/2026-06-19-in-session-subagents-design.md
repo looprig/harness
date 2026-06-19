@@ -1,7 +1,8 @@
 # In-Session Subagents + Unified Submit Surface
 
 **Date:** 2026-06-19
-**Status:** Draft — no blocking open questions (loop lifecycle resolved, §8)
+**Status:** Draft — no blocking open questions (loop lifecycle §8; sub-loop interrupt §6;
+async-cancel ownership deferred to the cross-turn handle model, §7)
 **Depends on:** `docs/plans/loop-machine-design.md` (multi-loop sessions, federated
 quiescence, the publish/subscribe hub, `NewLoop`, producer-identity `Header`s) and
 `docs/plans/2026-06-18-tui-event-adoption-design.md` (the TUI is already a projection of
@@ -66,8 +67,9 @@ parent linkage and `cfg loop.Config` for the skill's model/tools/prompt):
 4. `drainToFinalText(sub, inputID)` — drain that loop's events to its terminal → final text.
 
 The tool depends on a **narrow injected interface** (`NewLoop` + loop-targeted submit +
-`SubscribeEvents`), not the whole `AgentSession` — mirroring today's injected `factory`
-(Dependency Inversion). `factory.New` (child session) → that capability (in-session loop).
+`SubscribeEvents` + loop-targeted `Interrupt`, see §6), not the whole `AgentSession` —
+mirroring today's injected `factory` (Dependency Inversion). `factory.New` (child session) →
+that capability (in-session loop).
 
 ### 3. `command.AgentInput` — audit-honest input provenance
 
@@ -110,36 +112,79 @@ does the correlation/drain), reused by the Subagent tool and any future whole-se
 caller:
 
 ```
-drainToFinalText(sub Subscription, inputID uuid.UUID) (string, error)
+drainToFinalText(ctx context.Context, sub Subscription, inputID uuid.UUID, interrupt func()) (string, error)
 ```
 It reads `sub.Events()`, keeping events correlated to `inputID`/its turn, captures the
 loop's latest `StepDone` final assistant text, and stops at the loop's terminal. The
 subscribe-**before**-submit ordering (so the opening `TurnStarted` cannot be missed) is the
 caller's responsibility and the one subtlety the helper documents.
 
+`ctx` is the calling turn's context and `interrupt` is the loop-targeted `Interrupt` bound
+to the sub-loop (§6). On `ctx.Done()` (the caller went away — HTTP close / CLI Esc) the
+helper calls `interrupt()` **once** and keeps draining to the sub-loop's `TurnInterrupted`
+terminal, then returns the §5 interrupted error. This is exactly `session.Invoke`'s existing
+boundary-cancel → `interruptLoop` translation: submits carry no ctx, so cancelling `ctx`
+cannot reach the sub-loop's turn — only an explicit `Interrupt` can. Without it the sub-loop
+would orphan and run to completion (§8 never reaps it).
+
 ### 5. Failure contract
 
 Mapped in `drainToFinalText` and surfaced by the Subagent tool:
 - `TurnDone` → final assistant text, nil error.
 - `TurnFailed` → typed error wrapping `TurnFailed.Err`.
-- `TurnInterrupted` (ctx-cancel — the caller went away: HTTP request closed / CLI Esc) →
-  typed "interrupted" error, no partial.
+- `TurnInterrupted` (the caller went away: HTTP request closed / CLI Esc) → typed
+  "interrupted" error, no partial. The sub-loop is stopped by the loop-targeted `Interrupt`
+  the helper drives on `ctx.Done()` (§4, §6), not by ctx propagation.
 
-### 6. Loop-targeted submit
+### 6. Loop-targeted submit and interrupt
 
-`Submit` is primary-only today. A subagent submits to its sub-loop, so submit must address
-a specific loop: either `Submit(ctx, loopID, blocks)` (uniform — the TUI passes the primary
-id) or a sibling `SubmitTo(loopID, …)`. The `AgentInput` submit is the loop-targeted form;
-public `Submit` may stay primary-only with sub-loop submission internal to the injected
-capability. (Decide at plan time — implementation detail, not a design fork.)
+Both halves of driving a sub-loop must address a specific loop, because the sub-loop's turn
+ctx derives from `sessionCtx`, not from the parent tool call — so the parent's ctx can
+neither submit to nor cancel the sub-loop implicitly.
 
-### 7. Quiescence
+**Submit.** `Submit` is primary-only today. A subagent submits to its sub-loop, so submit
+must address a specific loop: either `Submit(ctx, loopID, blocks)` (uniform — the TUI passes
+the primary id) or a sibling `SubmitTo(loopID, …)`. The `AgentInput` submit is the
+loop-targeted form; public `Submit` may stay primary-only with sub-loop submission internal
+to the injected capability. (Decide at plan time — implementation detail, not a design fork.)
+
+**Interrupt.** Symmetric with submit: a loop-targeted `Interrupt(loopID)` so a parent can
+stop its subagent (the §4 drain calls it on caller cancel; the §8 "agent teams" follow-on
+reuses the same lever). It needs **no new command** — `command.Interrupt` already cancels
+whatever loop it is routed to (the loop actor's dispatch fires `state.cancelTurn()`), and
+`session.interruptLoop(l)` already sends it to a *given* loop; today's `session.Interrupt`
+just hardcodes the primary id. Loop-targeted `Interrupt` resolves `loopID → loop →
+interruptLoop` and joins the injected capability (§2). It is `Interrupt`, **not** shutdown:
+the sub-loop's turn cancels, the loop goes idle, and it stays retained (§8).
+
+**Granularity.** A loop has exactly one active turn (the actor serializes turns), so
+"interrupt loop X" already means "interrupt its active turn" — there is no separate
+turn-addressed path. A step has no independent cancel (it lives and dies with the turn ctx),
+so step-level interrupt has no coherent target. An optional `TargetTurnID` guard on
+`Interrupt` (no-op if the active turn ≠ target, defending against a stale interrupt landing
+on a *successor* turn) is unnecessary for this synchronous cut — the sub-loop runs exactly
+one turn per tool call — and is a follow-on for the agent-teams reuse case (§8).
+
+### 7. Quiescence and async-cancel ownership
 
 Unchanged. A synchronous Subagent tool keeps the **parent** loop active (its turn is blocked
 on the tool) for the whole subagent run, so the session cannot go idle prematurely without
 any wake token. The sub-loop's own `{kindLoop, subLoopID}` activity is also in the active
 set. (The `expectTurn`/`SubagentResult` wake-token path remains for the *async* hand-back
 pattern, which this synchronous cut does not use.)
+
+**Who cancels an async subagent (deferred).** The `expectTurn`/`{wake, subLoopID}` token and
+the `SubagentResult` hand-back own *liveness accounting* and *result delivery* for an async
+subagent (loop-machine §"Federated quiescence", §"Subagent hand-back") — but **not**
+cancellation. Cancel/interrupt of an in-flight async child is the deferred **cross-turn
+handle model** (`wait`/`send`/`interrupt`), explicitly out of scope in loop-machine
+(`loop-machine-design.md` lines 1757-1759; Open Items B). Interrupting the parent's turn does
+**not** cascade to an async child (the child is on `sessionCtx`, not the parent's `turnCtx`),
+and the **only async reaper today is session shutdown** (`sessionCancel` → `sessionCtx` →
+every `loopCtx`). For *this* synchronous cut the owner is unambiguous: the blocked tool call
+(§4). The loop-targeted `Interrupt` primitive (§6) is **shared** — the sync tool calls it
+now; the future async handle/supervisor will call the same lever — so building it now is
+forward-compatible, not throwaway.
 
 ## 8. Loop lifecycle — loops are never deleted (intentional)
 
@@ -156,10 +201,23 @@ Because idle loops are retained, **routing a follow-up subagent call back to the
 purely **additive follow-on**: it needs loop addressing/identity at the tool boundary, but
 no teardown and no change to §1–§7. Not required for this cut, not a blocker.
 
+**No resource bound in this cut (intentional).** This cut **drops the recursion-depth cap**
+that today's `tools/subagent.go` enforces (the `maxSubagentDepth` / `subagentDepthKey`
+ctx-key machinery). That cap worked only because the old child ran under the parent tool
+call's ctx; with the in-session model the sub-loop's turn ctx derives from `sessionCtx`, not
+the parent tool call, so the ctx-key no longer propagates to the child's own tool calls and
+depth cannot be carried that way. Depth is therefore **intentionally unenforced here**.
+Combined with never-delete retention, neither **depth** nor **breadth** (a runaway agent
+spawning many idle-retained loops) is bounded in this cut. A per-session loop cap — and, if
+depth limiting returns, re-deriving depth by walking the loop `Provenance` parent chain at
+`NewLoop` time rather than via ctx — is a follow-on, not a blocker.
+
 ## Testing
 
 - `drainToFinalText` unit tests: clean / failed / interrupted, and the subscribe-before-
-  submit ordering (no missed opening event).
+  submit ordering (no missed opening event). The interrupted case asserts the helper calls
+  the loop-targeted `interrupt` **once** on `ctx.Done()` and still drains to the
+  `TurnInterrupted` terminal (no orphaned sub-loop).
 - `decideSubmit`: `UserInput` and `AgentInput` both start/queue a turn via the shared path
   and emit the **same** `Reply` events (`InputQueued`/`TurnStarted`/`TurnFoldedInto`/
   `InputCancelled`/`TurnRejected`, correlated by `CausationID`), differing only in the
@@ -175,7 +233,13 @@ no teardown and no change to §1–§7. Not required for this cut, not a blocker
 
 ## Out of scope / sequencing
 
-- **Persistent agent teams** (§8) — follow-on layer.
+- **Persistent agent teams** (§8) — follow-on layer, incl. the optional `Interrupt`
+  `TargetTurnID` guard for reusing an idle loop across turns (§6).
 - **Async `SubagentResult` fold-back orchestration** — the wake-token machinery stays for it,
   but this cut's Subagent tool is synchronous (block + drain), not fold-back.
+- **Async subagent cancel/interrupt ownership** — the cross-turn handle model
+  (`wait`/`send`/`interrupt`), deferred by loop-machine (§7); this cut's loop-targeted
+  `Interrupt` is the shared primitive it will reuse.
+- **Resource bounds** — depth and breadth caps for subagent spawning (§8); this cut enforces
+  neither.
 - Removing the now-redundant per-turn channels is part of §1 (deleting `Stream`/`Invoke`).
