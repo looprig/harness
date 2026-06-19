@@ -173,16 +173,77 @@ func (s *AgentSession) WaitIdle(ctx context.Context) error {
 
 // expectTurn takes a hand-back wake token for a subagent loop at spawn so its
 // in-flight result cannot empty the quiescence set and fire a false idle. It is
-// session-internal — loops never call it; only the session's (future) subagent
-// orchestration does. Inert in Phase 4 (no async subagents yet).
+// session-internal — loops never call it (they hold only the narrow eventPublisher);
+// only the session's subagent orchestration does.
+//
+// TODO(Open Items A): async subagent spawn must call expectTurn(subagentLoopID)
+// before the child can complete its first turn, so the {wake} token guards the
+// quiescence set across the hand-back. That async-spawn orchestration is deferred;
+// when it lands, NewLoop's async-spawn path is where this call wires in. Today no loop
+// spawns an async subagent, so this method has no production caller yet — it is
+// exercised by the round-trip and the session+hub quiescence tests.
 func (s *AgentSession) expectTurn(ctx context.Context, subagentLoopID uuid.UUID) {
 	s.hub.ExpectTurn(ctx, subagentLoopID)
 }
 
-// cancelExpectTurn releases a subagent's wake token when its hand-back is rejected
-// or discarded. Session-internal; inert in Phase 4.
+// cancelExpectTurn releases a subagent's wake token when its hand-back is rejected or
+// discarded. Session-internal (loops never call it). It is the ONLY hand-back wake
+// release that is NOT on the publish path: a TurnRejected SubagentResult produces no
+// event (nothing happened in the session), so deliverSubagentResult releases the token
+// here after reading the Disposition. The event-path releases
+// (TurnStarted/TurnFoldedInto/InputCancelled carrying TriggeredByLoopID) happen
+// automatically in the hub now that loop events are published.
 func (s *AgentSession) cancelExpectTurn(ctx context.Context, subagentLoopID uuid.UUID) {
 	s.hub.CancelExpectTurn(ctx, subagentLoopID)
+}
+
+// deliverSubagentResult is the session-owned SubagentResult hand-back round trip. It
+// routes a finished subagent's output (blocks) to its parent loop as a
+// command.SubagentResult, reads the loop's Disposition through a buffered(1) Ack, and
+// returns it. The parent loop decides start/queue/reject on its own state (race-free);
+// the session does NOT decide. On a TurnRejected disposition the session releases the
+// subagent's {wake, fromLoopID} quiescence token via cancelExpectTurn — the rejected
+// hand-back produced no event, so this is the one release off the publish path; a
+// Started/InputQueued outcome instead releases on the publish path when the resulting
+// TurnStarted/TurnFoldedInto/InputCancelled carries TriggeredByLoopID == fromLoopID.
+//
+// parentLoopID selects the parent loop's command channel; fromLoopID is the producing
+// subagent (stamped as SubagentResult.FromLoopID -> TriggeredByLoopID on the events the
+// hand-back causes). The submit carries no per-turn stream — the parent's events flow
+// to the session fan-in. ctx governs the send + ack wait only (the loop derives the
+// turn ctx from its own loopCtx).
+func (s *AgentSession) deliverSubagentResult(ctx context.Context, parentLoopID, fromLoopID uuid.UUID, blocks []content.Block) (command.Disposition, error) {
+	l, ok := s.loopFor(parentLoopID)
+	if !ok {
+		return nil, &SessionError{Kind: SessionLoopNotFound}
+	}
+	id, err := s.newCommandID()
+	if err != nil {
+		return nil, err
+	}
+	ack := make(chan command.Disposition, 1) // buffered(1): the loop replies via tryAck
+	select {
+	case l.Commands <- command.SubagentResult{Header: command.Header{ID: id}, FromLoopID: fromLoopID, Blocks: blocks, Ack: ack}:
+	case <-l.Done:
+		return nil, &SessionError{Kind: SessionLoopExited}
+	case <-ctx.Done():
+		return nil, &SessionError{Kind: SessionContextDone, Cause: ctx.Err()}
+	}
+
+	select {
+	case d := <-ack:
+		// A rejected hand-back produced no event, so its {wake} token will never be
+		// released on the publish path. Release it here (the only off-publish-path
+		// release) so a rejected SubagentResult cannot leak the token.
+		if _, rejected := d.(command.TurnRejected); rejected {
+			s.cancelExpectTurn(ctx, fromLoopID)
+		}
+		return d, nil
+	case <-l.Done:
+		return nil, &SessionError{Kind: SessionLoopExited}
+	case <-ctx.Done():
+		return nil, &SessionError{Kind: SessionContextDone, Cause: ctx.Err()}
+	}
 }
 
 // NewLoop creates another loop inside this session. The new loop shares

@@ -156,6 +156,15 @@ type queuedInput struct {
 	msg         *content.UserMessage
 }
 
+// fold projects a queued entry into the foldedMsg handed back to runTurn at a
+// tool-continuation drain. queuedInput and foldedMsg share the same provenance layout
+// (inputID + triggeredBy + msg), so this is a direct conversion; the named method
+// keeps the field-layout coupling documented in one place. If either struct's fields
+// diverge, replace the conversion with an explicit field mapping here.
+func (qi queuedInput) fold() foldedMsg {
+	return foldedMsg(qi)
+}
+
 type loopState struct {
 	// id is this loop's id. In multi-agent sessions each subagent loop gets its
 	// own loop id.
@@ -741,7 +750,7 @@ func listen(ctx context.Context, cfg Config, commands <-chan command.Command, ga
 		}
 		batch := make([]foldedMsg, 0, len(state.inbox))
 		for _, qi := range state.inbox {
-			batch = append(batch, foldedMsg{inputID: qi.inputID, triggeredBy: qi.triggeredBy, msg: qi.msg})
+			batch = append(batch, qi.fold())
 		}
 		state.draining = append(state.draining, state.inbox...)
 		state.inbox = nil
