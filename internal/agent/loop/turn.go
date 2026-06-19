@@ -433,12 +433,15 @@ func validToolCall(b content.ToolUseBlock) bool {
 // toolResultMessage wraps one tool result into a ToolResultMessage carrying the
 // flattened result text (flattenToText is REUSED from runner.go: TextBlocks pass
 // through; non-text → "[unsupported …]" placeholder; empty → "error: empty
-// result") and the originating tool_use id, so the model pairs result↔call.
+// result"), the originating tool_use id (so the model pairs result↔call), and the
+// result's error flag (so the message-level IsError survives into committed history
+// instead of being dropped).
 func toolResultMessage(r result) *content.ToolResultMessage {
 	text := flattenToText(r.Content)
 	return &content.ToolResultMessage{
 		Message:   content.Message{Role: content.RoleTool, Blocks: []content.Block{&content.TextBlock{Text: text}}},
 		ToolUseID: r.ToolUseID,
+		IsError:   r.IsError,
 	}
 }
 

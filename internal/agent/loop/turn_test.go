@@ -289,6 +289,56 @@ func noGateReg() chan gateRegistration { return make(chan gateRegistration) }
 // initialUser pulls the initial UserMessage out of a turnState (always msgs[0]).
 func initialUser(ts turnState) *content.UserMessage { return ts.msgs[0].(*content.UserMessage) }
 
+// TestToolResultMessage verifies the staged ToolResultMessage carries the result's
+// IsError flag (instead of dropping it) along with the flattened text and tool_use
+// id, so the message-level error signal survives into committed history.
+func TestToolResultMessage(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name        string
+		in          result
+		wantText    string
+		wantIsError bool
+	}{
+		{
+			name:        "error result carries IsError true",
+			in:          result{ToolUseID: "tu-err", Content: []content.Block{&content.TextBlock{Text: "tool error: boom"}}, IsError: true},
+			wantText:    "tool error: boom",
+			wantIsError: true,
+		},
+		{
+			name:        "success result carries IsError false",
+			in:          result{ToolUseID: "tu-ok", Content: []content.Block{&content.TextBlock{Text: "ran"}}, IsError: false},
+			wantText:    "ran",
+			wantIsError: false,
+		},
+		{
+			name:        "empty content still pairs by id, IsError preserved",
+			in:          result{ToolUseID: "tu-empty", Content: nil, IsError: true},
+			wantText:    flattenToText(nil),
+			wantIsError: true,
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got := toolResultMessage(tt.in)
+			if got.ToolUseID != tt.in.ToolUseID {
+				t.Errorf("ToolUseID = %q, want %q", got.ToolUseID, tt.in.ToolUseID)
+			}
+			if got.IsError != tt.wantIsError {
+				t.Errorf("IsError = %v, want %v (dropped?)", got.IsError, tt.wantIsError)
+			}
+			if text := flattenToText(got.Blocks); text != tt.wantText {
+				t.Errorf("text = %q, want %q", text, tt.wantText)
+			}
+		})
+	}
+}
+
 func TestRunTurnAgentic(t *testing.T) {
 	t.Parallel()
 	input := []content.Block{&content.TextBlock{Text: "hi"}}
