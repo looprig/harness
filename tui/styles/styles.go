@@ -99,35 +99,27 @@ var (
 // echo) a mid gray (#737373).
 var AccentBarStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#737373"))
 
-// Composer (input) panel palette: a borderless, ▌-edged subtle dark-gray panel.
-// InputPanelBg is the panel fill (xterm 237); InputAccent matches the AccentBarStyle
-// gray so the left edge reads as the same accent used on user rows.
-var (
-	InputPanelBg = lipgloss.Color("237")
-	InputAccent  = lipgloss.Color("#737373")
-)
+// InputAccent colors the composer's left ▌ edge — the same mid gray as the
+// AccentBarStyle bar on user rows, so the input reads as the same accent.
+var InputAccent = lipgloss.Color("#737373")
 
 // composerBorder draws ONLY a left ▌ edge (no top/right/bottom), so the accent runs
-// the full panel height — including the 1-row top/bottom padding — rather than a
-// floating glyph on the text row alone.
+// down the left of the (auto-growing) editor.
 var composerBorder = lipgloss.Border{Left: AccentBar}
 
-// BoxStyle frames the composer (input) box as a borderless dark-gray panel: a
-// left-only ▌ accent border over an InputPanelBg fill, with one padding row above and
-// below the editor. It deliberately replaces the former full NormalBorder: a
-// full-width rule/border is the loudest thing the bubbletea v2 inline renderer strands
-// into scrollback when a resize desyncs its relative cursor (see surfaceView), so the
-// box paints no full-width horizontal glyphs — a stranded row is only a faint tinted
-// bar. The auto-growing editor renders inside it (tinted to match in components.input);
-// callers subtract the style's horizontal frame (left edge + left padding = 2 cols,
-// unchanged from the old border) from the box width to size the inner textarea.
+// BoxStyle frames the composer (input) box as the lowest-footprint affordance: a
+// left-only ▌ accent edge + one space of left padding, and NOTHING else — no border
+// box, no background fill, no top/bottom padding. This is deliberate: the bubbletea v2
+// inline renderer strands the composer's rows into scrollback when a resize desyncs
+// its relative cursor, and the loudness of that artifact scales with how much each row
+// paints. A single, full-width-tinted or bordered row strands as a bar/box; a bare
+// "▌ text" row strands as a faint one-glyph fragment. So the box paints no full-width
+// glyphs and occupies the fewest rows possible (just the editor's content lines). The
+// editor renders to the right of the edge; callers subtract the horizontal frame (edge
+// + left padding = 2 cols) from the box width to size the inner textarea.
 var BoxStyle = lipgloss.NewStyle().
 	Border(composerBorder, false, false, false, true).
 	BorderForeground(InputAccent).
-	BorderBackground(InputPanelBg).
-	Background(InputPanelBg).
-	PaddingTop(1).
-	PaddingBottom(1).
 	PaddingLeft(1)
 
 // PromptBoxStyle is the emphasised border drawn around an active permission/AskUser

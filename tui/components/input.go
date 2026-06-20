@@ -72,15 +72,11 @@ func NewInputBox() InputBox {
 		key.WithHelp("shift+enter", "insert newline"),
 	)
 	// v2 restructures the per-state styles under a single Styles value accessed via
-	// Styles()/SetStyles. Tint the editor cells with the composer panel fill
-	// (styles.InputPanelBg) so the whole box — the textarea content AND the box's
-	// border/padding frame — reads as one continuous dark-gray panel; without this the
-	// content cells keep their default (terminal) background and show through as an
-	// untinted gap inside the tinted frame. Background is set on Base (inherited by the
-	// computed CursorLine/EndOfBuffer/line-number styles), and explicitly on Text and
-	// Placeholder, which are applied directly rather than inheriting Base. The focused
-	// CursorLine is set to a plain panel-tinted style: the default DefaultDarkStyles
-	// gives it a black background ("0"), a stray dark patch as wide as the text.
+	// Styles()/SetStyles. The composer paints NO background (lowest resize-stranding
+	// footprint — see styles.BoxStyle), so the only style fix is clearing the focused
+	// CursorLine: the default DefaultDarkStyles gives it a black background ("0"), a
+	// stray dark patch as wide as the text. An empty style leaves the editor plain, like
+	// the user-message rows.
 	//
 	// The default Cursor style is left untouched, and is safe to leave so: textarea's
 	// DefaultDarkStyles is built by resolving lipgloss's LightDark light/dark *closure*
@@ -89,13 +85,7 @@ func NewInputBox() InputBox {
 	// never triggers a runtime OSC-11 background query (which the codebase deliberately
 	// avoids; see styles.NewMarkdownRenderer).
 	s := ta.Styles()
-	for _, st := range []*textarea.StyleState{&s.Focused, &s.Blurred} {
-		st.Base = st.Base.Background(styles.InputPanelBg)
-		st.Text = st.Text.Background(styles.InputPanelBg)
-		st.Placeholder = st.Placeholder.Background(styles.InputPanelBg)
-		st.EndOfBuffer = st.EndOfBuffer.Background(styles.InputPanelBg)
-		st.CursorLine = lipgloss.NewStyle().Background(styles.InputPanelBg)
-	}
+	s.Focused.CursorLine = lipgloss.NewStyle()
 	ta.SetStyles(s)
 	// DynamicHeight makes the textarea recompute its height from the VISUAL (soft-wrap
 	// aware) line count on every mutation, and — crucially — clamp its internal viewport

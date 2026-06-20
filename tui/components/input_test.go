@@ -18,9 +18,10 @@ var ansiEscape = regexp.MustCompile(`\x1b\[[0-9;]*m`)
 // stripANSI removes SGR escape sequences so a test can assert on visible glyphs.
 func stripANSI(s string) string { return ansiEscape.ReplaceAllString(s, "") }
 
-// TestInputBoxAppearance covers the auto-growing input: the bordered box, the "▌"
-// accent bar on the left (matching user rows), a dim placeholder, and no "> " prompt.
-// The empty box is the minimum content height (1 line) plus the border's two rows.
+// TestInputBoxAppearance covers the auto-growing input: the borderless ▌-edged editor
+// (the "▌" accent bar on the left, matching user rows), a dim placeholder, and no
+// "> " prompt. The box paints no border or padding rows, so the empty box is exactly
+// the minimum content height (1 line).
 func TestInputBoxAppearance(t *testing.T) {
 	t.Parallel()
 
@@ -32,9 +33,9 @@ func TestInputBoxAppearance(t *testing.T) {
 	// otherwise splits "Type a message…" with ANSI escapes.
 	plain := stripANSI(v)
 
-	// 1 content line + a top and bottom border row.
-	if lines := strings.Count(v, "\n") + 1; lines != minInputLines+2 {
-		t.Fatalf("View() has %d lines, want %d:\n%q", lines, minInputLines+2, v)
+	// Just the content line — no border/padding rows.
+	if lines := strings.Count(v, "\n") + 1; lines != minInputLines {
+		t.Fatalf("View() has %d lines, want %d:\n%q", lines, minInputLines, v)
 	}
 	if strings.Contains(plain, "> ") {
 		t.Errorf("View() still shows the old \"> \" prompt:\n%q", v)
@@ -183,23 +184,16 @@ func TestInputBoxCtrlJNewlineFallback(t *testing.T) {
 // "▌ " prompt is dropped and surrounding box-padding whitespace is trimmed so each
 // element is the bare visible text of one editor row (empty string for a blank row).
 func visibleContentRows(view string) []string {
-	// The composer is a borderless ▌-edged panel (styles.BoxStyle): the ▌ left edge
-	// runs down EVERY row, including a blank padding row above and below the editor
-	// (PaddingTop/Bottom 1). Every box row therefore carries a ▌; the content rows are
-	// the ones between the two padding rows.
-	var framed []string
-	for _, line := range strings.Split(stripANSI(view), "\n") {
-		if strings.Contains(line, "▌") {
-			framed = append(framed, line)
-		}
-	}
-	// Drop the top + bottom padding rows; what remains is the editor content (a phantom
-	// trailing blank row, if the bug being guarded against reappears, survives here).
-	if len(framed) >= 2 {
-		framed = framed[1 : len(framed)-1]
-	}
+	// The composer is a borderless ▌-edged editor (styles.BoxStyle): no box, no padding
+	// rows — the ▌ left edge runs down each editor content line. Every line carries a ▌,
+	// so each is a content row; strip the ▌ edge and the surrounding space to get the
+	// row's text (a phantom trailing blank, if the bug being guarded against reappears,
+	// survives as an empty row).
 	var rows []string
-	for _, line := range framed {
+	for _, line := range strings.Split(stripANSI(view), "\n") {
+		if !strings.Contains(line, "▌") {
+			continue
+		}
 		text := strings.TrimSpace(line)
 		text = strings.TrimPrefix(text, "▌")
 		rows = append(rows, strings.TrimSpace(text))
