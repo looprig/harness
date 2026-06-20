@@ -519,10 +519,12 @@ func (m *Screen) mapAction(a uiAction) tea.Cmd {
 func (m *Screen) submit(text string) tea.Cmd {
 	blocks, err := buildBlocks(text, m.agent.AcceptsImages())
 	if err != nil {
-		// composeEnter already cleared the editor, so restore the text — a bad @path
-		// (or other build error) must not swallow the user's whole message; they can
-		// fix it and resubmit. The error is surfaced as a faint notice above.
-		m.interaction.input.SetValue(text)
+		// A build error (e.g. an unsupported image on a text-only model) commits the
+		// message as a plain user row FIRST, then the error beneath it — the message is
+		// preserved in scrollback rather than lost or stuffed back into the editor, and
+		// composeEnter already left the input box empty. The message was NOT sent to the
+		// model (the build failed); it is displayed so the user sees what they asked.
+		m.transcript = m.transcript.CommitUserText(text)
 		m.transcript = m.transcript.CommitError(err)
 		return m.flush()
 	}

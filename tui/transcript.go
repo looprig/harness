@@ -316,6 +316,14 @@ func (m transcriptModel) CommitUser(blocks []content.Block) transcriptModel {
 	return m
 }
 
+// CommitUserText commits a plain-text user row (no attachments). It is for the
+// submit-FAILED path: when buildBlocks rejects a message (e.g. an image on a text-only
+// model) the message is shown in scrollback as the user's row — even though it was
+// never sent to the model — so the user sees what they asked alongside the error.
+func (m transcriptModel) CommitUserText(text string) transcriptModel {
+	return m.CommitUser([]content.Block{&content.TextBlock{Text: text}})
+}
+
 // RecordSubmit registers a fire-and-forget submit by its correlation id so the
 // queued affordance can show the remembered blocks once the loop's InputQueued
 // event arrives. The remembered blocks are DISPLAY-ONLY and assumed immutable after
