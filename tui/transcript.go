@@ -163,7 +163,7 @@ type entry struct {
 	// one card to the bullet instead — see promoted). Renders as "● <headline>".
 	headline string
 	// promoted marks a kindTool entry whose single card is rendered AS the assistant
-	// bullet ("● <verb >ToolName(args)" + result) rather than an indented "└ …" card —
+	// bullet ("● <verb >ToolName(args)" + result) rather than an indented "⎿ …" card —
 	// the committed form of an empty-text step that ran exactly one tool call. Set ONLY
 	// by stepDone for that case; every other kindTool entry renders as a normal card.
 	promoted bool
@@ -738,7 +738,7 @@ func (m *transcriptModel) stepToolCard(use content.ToolUseBlock, results map[str
 // stable ID. The single-element Calls slice carries the terminal ToolCallView so the
 // renderer can reuse the existing tool-card rendering. promoted marks the lone card of
 // an empty-text single-tool step: it renders AS the assistant bullet ("● <verb >
-// ToolName(args)" + result) instead of an indented "└ …" card (renderPromotedTool).
+// ToolName(args)" + result) instead of an indented "⎿ …" card (renderPromotedTool).
 func (m *transcriptModel) commitCall(call ToolCallView, promoted bool) {
 	m.nextID++
 	m.committed = append(m.committed, entry{

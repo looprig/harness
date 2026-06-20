@@ -622,7 +622,7 @@ func TestRenderAssistantHeadline(t *testing.T) {
 
 // TestRenderEntryPromotedTool covers a single-tool empty-text step's promoted card: a
 // kindTool entry with promoted set renders AS the assistant bullet
-// ("● <verb >ToolName(args)" + result), never an indented "└ …" card.
+// ("● <verb >ToolName(args)" + result), never an indented "⎿ …" card.
 func TestRenderEntryPromotedTool(t *testing.T) {
 	t.Parallel()
 
@@ -638,7 +638,7 @@ func TestRenderEntryPromotedTool(t *testing.T) {
 		}
 	}
 	if strings.Contains(got, cardConnector) {
-		t.Errorf("renderEntry(promoted) = %q, must NOT use the └ card connector", got)
+		t.Errorf("renderEntry(promoted) = %q, must NOT use the ⎿ card connector", got)
 	}
 }
 

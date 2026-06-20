@@ -28,8 +28,9 @@ const hintSeparator = " · "
 // the key that expands the fold. Lowercase to match the design appendix mockups.
 const expandHint = "ctrl+t"
 
-// cardConnector is the tree connector that prefixes each tool-call card line.
-const cardConnector = "└ "
+// cardConnector is the tree connector that prefixes each tool-call card line. It is
+// dotWidth (2) columns — the "⎿" glyph plus a space — so a card's body aligns under it.
+const cardConnector = "⎿ "
 
 // cardIndent / resultIndent are the leading indents for a card line and for its
 // result-preview lines (design §3: cards indent 2, result lines 4).
@@ -140,7 +141,7 @@ func toolGlyph(s ToolStatus) string {
 }
 
 // renderToolCalls renders a segment's tool-call children as indented cards, each a
-// header line ("└ ToolName  Summary  <glyph>") followed by its result preview. When
+// header line ("⎿ ToolName(Summary)  <glyph>") followed by its result preview. When
 // expandTools is false the preview is folded to the first previewLineCap lines plus
 // a "… N more lines · ctrl+t" marker; when true every (already runner-capped) line
 // shows. An empty result renders "(no output)". An error card's result always shows
