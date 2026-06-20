@@ -62,11 +62,12 @@ const dotWidth = 2
 // empty-text step is a rotating workingWord.
 const multipleActionsHeadline = "Multiple actions"
 
-// renderMD renders markdown to ANSI behind the static committed bullet (styles.Dot).
-// It is the committed/scrollback path: a frozen assistant "●" never animates, so it
-// always uses the lit dot. The live tail uses renderMDDot with a blink-phased bullet.
+// renderMD renders markdown to ANSI behind the static committed bullet (styles.LitDot,
+// the DotColor-foregrounded "●"). It is the committed/scrollback path: a frozen
+// assistant "●" never animates, so it always uses the lit dot. The live tail uses
+// renderMDDot with a blink-phased bullet.
 func renderMD(md string, width int) string {
-	return renderMDDot(md, width, styles.Dot)
+	return renderMDDot(md, width, styles.LitDot)
 }
 
 // renderMDDot renders markdown to ANSI and prefixes it with dot so the narration
@@ -279,7 +280,7 @@ func renderAssistant(thinking, text, headline string, expand bool, width int) st
 
 	body := renderMD(text, width)
 	if body == "" && headline != "" {
-		body = strings.TrimRight(styles.Dot, " ") + " " + styles.HeadlineStyle.Render(headline) // "● <headline>"
+		body = strings.TrimRight(styles.LitDot, " ") + " " + styles.HeadlineStyle.Render(headline) // "● <headline>"
 	}
 	if body != "" {
 		if b.Len() > 0 {
@@ -297,7 +298,7 @@ func renderAssistant(thinking, text, headline string, expand bool, width int) st
 // below (same fold as a normal card). It is the committed counterpart of the live
 // working-word for the single-tool case.
 func renderPromotedTool(c ToolCallView, expand bool, width int) string {
-	header := strings.TrimRight(styles.Dot, " ") + " " +
+	header := strings.TrimRight(styles.LitDot, " ") + " " +
 		styles.HeadlineStyle.Render(toolHeaderText(c, toolGlyph(c.Status)))
 	lines := make([]string, 0, previewLineCap+2)
 	lines = append(lines, header)

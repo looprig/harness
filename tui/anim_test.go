@@ -153,8 +153,10 @@ func TestLiveDot(t *testing.T) {
 			if got != tt.want {
 				t.Errorf("liveDot(%v) = %q, want %q", tt.blink, got, tt.want)
 			}
-			if len([]rune(got)) != dotWidth {
-				t.Errorf("liveDot(%v) width = %d runes, want %d (alignment)", tt.blink, len([]rune(got)), dotWidth)
+			// Display width (ANSI color is zero-width) must stay dotWidth for alignment;
+			// count runes AFTER stripping the lit dot's color codes.
+			if w := len([]rune(stripANSI(got))); w != dotWidth {
+				t.Errorf("liveDot(%v) width = %d visible runes, want %d (alignment)", tt.blink, w, dotWidth)
 			}
 		})
 	}

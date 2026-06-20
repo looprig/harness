@@ -11,8 +11,19 @@ import (
 	"charm.land/lipgloss/v2"
 )
 
-// Dot is the leading marker rendered before assistant/markdown blocks.
+// Dot is the leading marker rendered before assistant/markdown blocks — the PLAIN
+// layout form (the bullet glyph + a trailing space, dotWidth columns). The rendered
+// bullet is COLORED via LitDot; Dot itself stays uncolored so it doubles as the
+// width/layout reference (and the ANSI-stripped substring tests match against).
 const Dot = "● "
+
+// DotColor is the assistant bullet's foreground color.
+var DotColor = lipgloss.Color("#D4F84D")
+
+// LitDot is the COLORED leading marker actually rendered before an assistant bullet:
+// the DotColor-foregrounded glyph plus a plain trailing space. Its display width equals
+// Dot's (the color is zero-width ANSI), so narration alignment is unchanged.
+var LitDot = lipgloss.NewStyle().Foreground(DotColor).Render("●") + " "
 
 // AccentBar is the left bar marker shared by user-message rows and the input
 // prompt. AccentBarPrompt is the bar plus its trailing space, used as the prompt.
@@ -44,9 +55,9 @@ var HeadlineStyle = lipgloss.NewStyle().Bold(true)
 
 // Notice styles color a leveled notification's shared "▌ " accent bar (and text) by
 // severity. All three reuse the SAME accent-bar wrapper as user messages and differ
-// only in foreground color: info is the neutral user-message gray (color 8, matching
-// AccentBarStyle), warn is bright yellow (color 11), error is red (color 9). They are
-// selected per entry via NoticeStyle; callers must not branch on the level themselves.
+// only in foreground color: info is a neutral gray (color 8), warn is bright yellow
+// (color 11), error is red (color 9). They are selected per entry via NoticeStyle;
+// callers must not branch on the level themselves.
 var (
 	NoticeInfoStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))  // neutral gray (user-message tone)
 	NoticeWarnStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("11")) // bright yellow
@@ -76,8 +87,9 @@ var (
 	ToolResultStyle = lipgloss.NewStyle().Faint(true) // indented result-preview lines
 )
 
-// AccentBarStyle colors the left accent bar on user rows and the input prompt.
-var AccentBarStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
+// AccentBarStyle colors the left accent bar ("▌") on user rows (and the queued-input
+// echo) a mid gray (#737373).
+var AccentBarStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#737373"))
 
 // BoxStyle is the border drawn around the composer (input) box. The auto-growing
 // editor renders inside it; callers subtract the style's horizontal frame from the
