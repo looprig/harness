@@ -56,10 +56,12 @@ func workingWord(frame uint) string {
 }
 
 // liveDotLit / liveDotDim are the two glyphs the live (streaming) assistant bullet
-// alternates between on each blink tick: the normal lit colored "● " (styles.LitDot,
-// the same DotColor-foregrounded bullet the committed path renders) and a dimmed hollow
-// "◦ ". Both keep the dotWidth (2 columns) so narration alignment is unchanged.
-const liveDotDim = "◦ "
+// alternates between on each blink tick: the normal lit colored "⬤ " (styles.LitDot,
+// the same DotColor-foregrounded bullet the committed path renders) and the same-size
+// hollow "◯ " for the off phase, so the blink reads as the dot emptying rather than
+// shrinking. Both are display-width-1 glyphs (+ a space), keeping the dotWidth (2
+// columns) so narration alignment is unchanged.
+const liveDotDim = "◯ "
 
 var liveDotLit = styles.LitDot
 
