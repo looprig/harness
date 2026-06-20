@@ -12,12 +12,10 @@ import (
 )
 
 // Dot is the leading marker rendered before assistant/markdown blocks — the PLAIN
-// layout form (the bullet glyph "⬤" plus a trailing space, dotWidth columns). The
-// rendered bullet is COLORED via LitDot; Dot itself stays uncolored so it doubles as
-// the width/layout reference (and the ANSI-stripped substring tests match against).
-// "⬤" (U+2B24 BLACK LARGE CIRCLE) is a non-emoji, display-width-1 glyph, so it reads
-// larger than a plain "●" without widening the marker.
-const Dot = "⬤ "
+// layout form (the bullet glyph + a trailing space, dotWidth columns). The rendered
+// bullet is COLORED via LitDot; Dot itself stays uncolored so it doubles as the
+// width/layout reference (and the ANSI-stripped substring tests match against).
+const Dot = "● "
 
 // DotColor is the assistant bullet's foreground color.
 var DotColor = lipgloss.Color("#D4F84D")
@@ -25,7 +23,7 @@ var DotColor = lipgloss.Color("#D4F84D")
 // LitDot is the COLORED leading marker actually rendered before an assistant bullet:
 // the DotColor-foregrounded glyph plus a plain trailing space. Its display width equals
 // Dot's (the color is zero-width ANSI), so narration alignment is unchanged.
-var LitDot = lipgloss.NewStyle().Foreground(DotColor).Render("⬤") + " "
+var LitDot = lipgloss.NewStyle().Foreground(DotColor).Render("●") + " "
 
 // AccentBar is the left bar marker shared by user-message rows and the input
 // prompt. AccentBarPrompt is the bar plus its trailing space, used as the prompt.
