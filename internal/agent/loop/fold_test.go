@@ -14,9 +14,10 @@ import (
 	"github.com/inventivepotter/urvi/internal/uuid"
 )
 
-// newFoldLoop builds a loop with the given scripted client + blocking tool, a sink
-// to observe events, and a generous DrainTimeout. It returns the loop and the sink.
-func newFoldLoop(t *testing.T, client llm.LLM, ts ToolSet) (*Loop, *captureSink) {
+// newFoldLoop builds a loop with the given scripted client + blocking tool, a
+// recordingPublisher to observe the full-fidelity events the production hub sees,
+// and a generous DrainTimeout. It returns the loop and the recorder.
+func newFoldLoop(t *testing.T, client llm.LLM, ts ToolSet) (*Loop, *recordingPublisher) {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
@@ -28,13 +29,13 @@ func newFoldLoop(t *testing.T, client llm.LLM, ts ToolSet) (*Loop, *captureSink)
 	if err != nil {
 		t.Fatalf("uuid.New: %v", err)
 	}
-	sink := &captureSink{}
-	l, err := New(ctx, sessionID, loopID, Provenance{}, noopPublisher{},
-		Config{Client: client, Model: llm.ModelSpec{Model: "m"}, Tools: ts, Sinks: []event.EventSink{sink}, DrainTimeout: 500 * time.Millisecond})
+	rec := &recordingPublisher{}
+	l, err := New(ctx, sessionID, loopID, Provenance{}, rec,
+		Config{Client: client, Model: llm.ModelSpec{Model: "m"}, Tools: ts, DrainTimeout: 500 * time.Millisecond})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	return l, sink
+	return l, rec
 }
 
 // newFoldLoopWithAfterDrain builds a fold loop exactly like newFoldLoop but installs
@@ -43,7 +44,7 @@ func newFoldLoop(t *testing.T, client llm.LLM, ts ToolSet) (*Loop, *captureSink)
 // draining buffer and BEFORE the first TurnFoldedInto commit. A test uses it to cancel
 // the loop in the post-drain/pre-commit window deterministically. The seam is
 // unexported and never set in production.
-func newFoldLoopWithAfterDrain(t *testing.T, client llm.LLM, ts ToolSet, afterDrain func()) (*Loop, *captureSink, context.CancelFunc) {
+func newFoldLoopWithAfterDrain(t *testing.T, client llm.LLM, ts ToolSet, afterDrain func()) (*Loop, *recordingPublisher, context.CancelFunc) {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
@@ -55,13 +56,13 @@ func newFoldLoopWithAfterDrain(t *testing.T, client llm.LLM, ts ToolSet, afterDr
 	if err != nil {
 		t.Fatalf("uuid.New: %v", err)
 	}
-	sink := &captureSink{}
-	l, err := New(ctx, sessionID, loopID, Provenance{}, noopPublisher{},
-		Config{Client: client, Model: llm.ModelSpec{Model: "m"}, Tools: ts, Sinks: []event.EventSink{sink}, DrainTimeout: 500 * time.Millisecond, afterDrain: afterDrain})
+	rec := &recordingPublisher{}
+	l, err := New(ctx, sessionID, loopID, Provenance{}, rec,
+		Config{Client: client, Model: llm.ModelSpec{Model: "m"}, Tools: ts, DrainTimeout: 500 * time.Millisecond, afterDrain: afterDrain})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	return l, sink, cancel
+	return l, rec, cancel
 }
 
 // waitForRequests polls the scripted client until it has recorded at least n
@@ -99,7 +100,7 @@ func TestFoldAtToolContinuation(t *testing.T) {
 		{toolUseChunk(0, "id-1", "Block", `{}`)}, // step 0: blocking tool (turn parks here)
 		{textChunk("final")},                      // step 1: text -> TurnDone (after the fold)
 	}}
-	l, sink := newFoldLoop(t, client, ts)
+	l, rec := newFoldLoop(t, client, ts)
 
 	// Turn 1 starts and parks in the blocking tool.
 	ev1, _ := startTurn(t, l, context.Background(), textBlocks("turn1"))
@@ -111,7 +112,7 @@ func TestFoldAtToolContinuation(t *testing.T) {
 
 	// Queue an input while the tool step is in flight.
 	foldedID := mustID(t)
-	d := submitUserInputBlocks(t, l, sink, foldedID, command.AllowFold, textBlocks("folded text"))
+	d := submitUserInputBlocks(t, l, rec, foldedID, command.AllowFold, textBlocks("folded text"))
 	if _, ok := d.(event.InputQueued); !ok {
 		t.Fatalf("queued submit outcome = %T, want event.InputQueued", d)
 	}
@@ -122,9 +123,9 @@ func TestFoldAtToolContinuation(t *testing.T) {
 
 	// event.TurnFoldedInto must be emitted for the queued input, with CausationID ==
 	// InputID and a zero TriggeredByLoopID (a UserInput, not a hand-back).
-	blockUntilSink(t, sink, func(evs []event.EventEnvelope) bool {
+	blockUntilEvents(t, rec, func(evs []event.Event) bool {
 		for _, e := range evs {
-			if fi, ok := e.Event.(event.TurnFoldedInto); ok {
+			if fi, ok := e.(event.TurnFoldedInto); ok {
 				return fi.InputID == foldedID &&
 					fi.CausationID == foldedID &&
 					fi.TriggeredByLoopID.IsZero() &&
@@ -136,8 +137,8 @@ func TestFoldAtToolContinuation(t *testing.T) {
 
 	// The folded input did NOT start a new turn: there is exactly ONE TurnStarted and
 	// it is NOT for foldedID.
-	for _, e := range sink.events() {
-		if tsv, ok := e.Event.(event.TurnStarted); ok && tsv.InputID == foldedID {
+	for _, e := range rec.events() {
+		if tsv, ok := e.(event.TurnStarted); ok && tsv.InputID == foldedID {
 			t.Fatal("folded input started a new turn, want it folded into the running turn")
 		}
 	}
@@ -191,7 +192,7 @@ func TestSubagentResultFoldStampsTriggeredBy(t *testing.T) {
 		{toolUseChunk(0, "id-1", "Block", `{}`)}, // step 0: blocking tool
 		{textChunk("final")},                      // step 1: text -> TurnDone
 	}}
-	l, sink := newFoldLoop(t, client, ts)
+	l, rec := newFoldLoop(t, client, ts)
 
 	ev1, _ := startTurn(t, l, context.Background(), textBlocks("turn1"))
 	go func() {
@@ -209,7 +210,7 @@ func TestSubagentResultFoldStampsTriggeredBy(t *testing.T) {
 		FromLoopID: fromLoopID,
 		Blocks:     textBlocks("subagent says hi"),
 	}
-	if _, ok := awaitReply(t, sink, resultID).(event.InputQueued); !ok {
+	if _, ok := awaitReply(t, rec, resultID).(event.InputQueued); !ok {
 		t.Fatal("SubagentResult not queued")
 	}
 
@@ -217,9 +218,9 @@ func TestSubagentResultFoldStampsTriggeredBy(t *testing.T) {
 
 	// TurnFoldedInto must carry TriggeredByLoopID == fromLoopID and CausationID ==
 	// resultID (the submit command id).
-	blockUntilSink(t, sink, func(evs []event.EventEnvelope) bool {
+	blockUntilEvents(t, rec, func(evs []event.Event) bool {
 		for _, e := range evs {
-			if fi, ok := e.Event.(event.TurnFoldedInto); ok && fi.InputID == resultID {
+			if fi, ok := e.(event.TurnFoldedInto); ok && fi.InputID == resultID {
 				if fi.TriggeredByLoopID != fromLoopID {
 					t.Errorf("TurnFoldedInto.TriggeredByLoopID = %v, want %v (FromLoopID)", fi.TriggeredByLoopID, fromLoopID)
 				}
@@ -235,11 +236,11 @@ func TestSubagentResultFoldStampsTriggeredBy(t *testing.T) {
 
 // submitUserInputBlocks is submitUserInput with explicit blocks, so a fold test can
 // assert the folded message's content lands in the continuation request. It observes
-// the published outcome event (InputQueued/TurnStarted/TurnRejected) via the sink.
-func submitUserInputBlocks(t *testing.T, l *Loop, sink *captureSink, id uuid.UUID, mode command.InputMode, blocks []content.Block) event.Event {
+// the published outcome event (InputQueued/TurnStarted/TurnRejected) via the recorder.
+func submitUserInputBlocks(t *testing.T, l *Loop, rec *recordingPublisher, id uuid.UUID, mode command.InputMode, blocks []content.Block) event.Event {
 	t.Helper()
 	l.Commands <- command.UserInput{Header: command.Header{ID: id}, Mode: mode, Blocks: blocks}
-	return awaitReply(t, sink, id)
+	return awaitReply(t, rec, id)
 }
 
 // TestNoToolFinalAnswerDoesNotFold proves a no-tool final answer does NOT drain the
@@ -251,7 +252,7 @@ func submitUserInputBlocks(t *testing.T, l *Loop, sink *captureSink, id uuid.UUI
 func TestNoToolFinalAnswerDoesNotFold(t *testing.T) {
 	t.Parallel()
 	queuedID := mustID(t)
-	l, sink := (*Loop)(nil), (*captureSink)(nil)
+	l, rec := (*Loop)(nil), (*recordingPublisher)(nil)
 	client := &scriptedLLM{
 		scripts: [][]content.Chunk{
 			{textChunk("only step, final answer")}, // turn 1: text-only -> TurnDone
@@ -259,16 +260,16 @@ func TestNoToolFinalAnswerDoesNotFold(t *testing.T) {
 		},
 	}
 	ts := agenticToolSet(nil, 25, 100)
-	l, sink = newFoldLoop(t, client, ts)
+	l, rec = newFoldLoop(t, client, ts)
 	// Queue the input at the START of turn 1's only (text-only) step, before it
 	// completes. A no-tool step performs NO drain, so this must start a later turn.
 	client.mu.Lock()
 	client.onStreamN = map[int]func(){
 		0: func() {
 			// AllowFold submit while the turn is running -> InputQueued (observed on
-			// the sink fan-in).
+			// the recorder fan-in).
 			l.Commands <- command.UserInput{Header: command.Header{ID: queuedID}, Mode: command.AllowFold, Blocks: textBlocks("later")}
-			if _, ok := awaitReply(t, sink, queuedID).(event.InputQueued); !ok {
+			if _, ok := awaitReply(t, rec, queuedID).(event.InputQueued); !ok {
 				t.Errorf("queued submit during final step not InputQueued")
 			}
 		},
@@ -283,13 +284,13 @@ func TestNoToolFinalAnswerDoesNotFold(t *testing.T) {
 
 	// The queued input must NOT fold (no TurnFoldedInto for it) and must instead
 	// start a LATER turn (a TurnStarted carrying its InputID).
-	blockUntilSink(t, sink, func(evs []event.EventEnvelope) bool {
+	blockUntilEvents(t, rec, func(evs []event.Event) bool {
 		var started2 bool
 		for _, e := range evs {
-			if fi, ok := e.Event.(event.TurnFoldedInto); ok && fi.InputID == queuedID {
+			if fi, ok := e.(event.TurnFoldedInto); ok && fi.InputID == queuedID {
 				t.Errorf("queued input folded into a no-tool final answer turn, want it to start a later turn")
 			}
-			if tsv, ok := e.Event.(event.TurnStarted); ok && tsv.InputID == queuedID {
+			if tsv, ok := e.(event.TurnStarted); ok && tsv.InputID == queuedID {
 				started2 = true
 			}
 		}
@@ -314,7 +315,7 @@ func TestInterruptDuringDrainFreesTurn(t *testing.T) {
 		{toolUseChunk(0, "id-1", "Block", `{}`)}, // step 0: tool, then a drain happens
 		{textChunk("never reached if interrupted")},
 	}}
-	l, sink := newFoldLoop(t, client, ts)
+	l, rec := newFoldLoop(t, client, ts)
 
 	ev1, _ := startTurn(t, l, context.Background(), textBlocks("turn1"))
 	terminalCh := make(chan event.Event, 1)
@@ -331,7 +332,7 @@ func TestInterruptDuringDrainFreesTurn(t *testing.T) {
 	// Queue an input so the drain has something to pull (so runTurn enters the
 	// handshake meaningfully).
 	queuedID := mustID(t)
-	d := submitUserInputBlocks(t, l, sink, queuedID, command.AllowFold, textBlocks("queued"))
+	d := submitUserInputBlocks(t, l, rec, queuedID, command.AllowFold, textBlocks("queued"))
 	if _, ok := d.(event.InputQueued); !ok {
 		t.Fatalf("queued submit outcome = %T, want event.InputQueued", d)
 	}
@@ -355,9 +356,9 @@ func TestInterruptDuringDrainFreesTurn(t *testing.T) {
 
 	// Strand-safety: the queued entry must reach exactly ONE terminal outcome —
 	// TurnFoldedInto (rode along) or InputCancelled (returned) — never neither.
-	blockUntilSink(t, sink, func(evs []event.EventEnvelope) bool {
+	blockUntilEvents(t, rec, func(evs []event.Event) bool {
 		for _, e := range evs {
-			switch ev := e.Event.(type) {
+			switch ev := e.(type) {
 			case event.TurnFoldedInto:
 				if ev.InputID == queuedID {
 					return true
@@ -450,14 +451,14 @@ func TestDrainingSweepReturnsEntryOnInterrupt(t *testing.T) {
 			close(cancelled)
 		})
 	}
-	l, sink, rc := newFoldLoopWithAfterDrain(t, client, ts, afterDrain)
+	l, rec, rc := newFoldLoopWithAfterDrain(t, client, ts, afterDrain)
 	rootCancel = rc
 
 	ev1, _ := startTurn(t, l, context.Background(), textBlocks("turn1"))
 	// Drain the per-turn stream so the actor's per-turn emits never block. The terminal
-	// is asserted via the SINK below, not here: on the hard-kill path deliverAndClose
+	// is asserted via the RECORDER below, not here: on the hard-kill path deliverAndClose
 	// runs after forceAbandon, so it may take the abandoned branch and NOT deliver the
-	// terminal on the per-turn channel — but it ALWAYS publishes it to sinks.
+	// terminal on the per-turn channel — but it ALWAYS publishes it to the fan-in.
 	go func() {
 		for range ev1 {
 		}
@@ -466,7 +467,7 @@ func TestDrainingSweepReturnsEntryOnInterrupt(t *testing.T) {
 
 	// Queue exactly one input so the drain moves exactly one entry into draining.
 	queuedID := mustID(t)
-	d := submitUserInputBlocks(t, l, sink, queuedID, command.AllowFold, textBlocks("queued"))
+	d := submitUserInputBlocks(t, l, rec, queuedID, command.AllowFold, textBlocks("queued"))
 	if _, ok := d.(event.InputQueued); !ok {
 		t.Fatalf("queued submit outcome = %T, want event.InputQueued", d)
 	}
@@ -478,35 +479,35 @@ func TestDrainingSweepReturnsEntryOnInterrupt(t *testing.T) {
 	<-cancelled // the cancel has landed in the post-drain/pre-commit window
 
 	// The turn must terminate as TurnInterrupted (the cancelled fold commit), observed via
-	// the sink (always published, even on the hard-kill abandoned-delivery path).
-	blockUntilSink(t, sink, func(evs []event.EventEnvelope) bool {
+	// the recorder (always published, even on the hard-kill abandoned-delivery path).
+	blockUntilEvents(t, rec, func(evs []event.Event) bool {
 		for _, e := range evs {
-			if _, ok := e.Event.(event.TurnInterrupted); ok {
+			if _, ok := e.(event.TurnInterrupted); ok {
 				return true
 			}
 		}
 		return false
 	})
-	for _, e := range sink.events() {
-		switch e.Event.(type) {
+	for _, e := range rec.events() {
+		switch e.(type) {
 		case event.TurnDone, event.TurnFailed:
-			t.Fatalf("turn terminal = %T, want event.TurnInterrupted", e.Event)
+			t.Fatalf("turn terminal = %T, want event.TurnInterrupted", e)
 		}
 	}
 
 	// The entry must come back via EXACTLY ONE InputCancelled{CancelTurnInterrupted}
 	// from the draining sweep, and NO TurnFoldedInto must be emitted for it.
-	blockUntilSink(t, sink, func(evs []event.EventEnvelope) bool {
+	blockUntilEvents(t, rec, func(evs []event.Event) bool {
 		for _, e := range evs {
-			if ic, ok := e.Event.(event.InputCancelled); ok && ic.InputID == queuedID {
+			if ic, ok := e.(event.InputCancelled); ok && ic.InputID == queuedID {
 				return ic.Reason == event.CancelTurnInterrupted && ic.Message != nil
 			}
 		}
 		return false
 	})
 	var cancels, folds int
-	for _, e := range sink.events() {
-		switch ev := e.Event.(type) {
+	for _, e := range rec.events() {
+		switch ev := e.(type) {
 		case event.InputCancelled:
 			if ev.InputID == queuedID {
 				cancels++

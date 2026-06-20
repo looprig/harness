@@ -51,8 +51,8 @@ type loopConfig struct {
 	// via context.WithCancel(loopCtx). Submit commands carry no context.
 	loopCtx context.Context
 
-	// cfg is the caller-supplied loop configuration (client, model, tools, sinks,
-	// drain timeout, and the test-only id-gen/after-drain seams), defaulted by New.
+	// cfg is the caller-supplied loop configuration (client, model, tools, drain
+	// timeout, and the test-only id-gen/after-drain seams), defaulted by New.
 	cfg Config
 
 	// commands is the actor's inbound command channel (the send side is the public
@@ -91,8 +91,9 @@ type loopConfig struct {
 	events eventPublisher
 }
 
-// idGenerator mints a fresh UUID. It defaults to uuid.New; tests inject a
-// failing generator to exercise the crypto/rand failure branches.
+// idGenerator mints a fresh UUID for the loop's correlation IDs — the per-turn
+// TurnID, each StepID, and each tool-call CallID. It defaults to uuid.New; tests
+// inject a failing generator to exercise the crypto/rand failure branches.
 type idGenerator func() (uuid.UUID, error)
 
 // eventPublisher is the loop's narrow consumer of the session-level event
@@ -170,33 +171,6 @@ func New(loopCtx context.Context, sessionID, loopID uuid.UUID, parent Provenance
 	state := newLoopState(sessionID, loopID, parent)
 	go runLoop(lc, state)
 	return &Loop{Commands: commands, Done: done, gateReg: gateReg}, nil
-}
-
-// projectForSink derives the SINK-side form of an event from the (full-fidelity)
-// stream event. It returns the event to envelope for sinks and the CallID for the
-// envelope. SECURITY: any event carrying sensitive payload implements
-// event.Redactable; this replaces it with its redacted SinkProjection so tool
-// args, file content, URLs/headers, questions, choice strings, and result
-// previews NEVER reach a sink. Events without sensitive payload pass through. The
-// CallID is read from the ORIGINAL (full) event — projection may change the
-// concrete type — so the envelope self-identifies the tool call it pertains to.
-// The per-turn stream is never touched by this function.
-func projectForSink(ev event.Event) (event.Event, uuid.UUID) {
-	var callID uuid.UUID
-	switch e := ev.(type) {
-	case event.PermissionRequested:
-		callID = e.CallID
-	case event.UserInputRequested:
-		callID = e.CallID
-	case event.ToolCallStarted:
-		callID = e.CallID
-	case event.ToolCallCompleted:
-		callID = e.CallID
-	}
-	if r, ok := ev.(event.Redactable); ok {
-		return r.SinkProjection(), callID
-	}
-	return ev, callID
 }
 
 type loopStatus int
@@ -375,84 +349,28 @@ func runLoop(cfg loopConfig, state loopState) {
 	commits := cfg.commits
 	drains := cfg.drains
 
-	// publishHub sends a FULL-FIDELITY loop event to the session-level event fan-in.
+	// publish sends a FULL-FIDELITY loop event to the session-level event fan-in.
 	// Producer identity is stamped here from loopState/the active turn (the actor IS
-	// the loop producer — this is the loop stamping its own identity, not the hub
-	// inferring it), so the hub's EventFilter (per-loop LoopID) and its applyActivity
-	// quiescence transitions (TurnStarted/LoopIdle/TurnFoldedInto/InputCancelled) see
-	// the ids they need. The hub is non-blocking and class-aware (Ephemeral drop /
-	// Enduring fail-close), so this NEVER blocks the actor. SessionStarted is NOT sent
-	// here: the loop's startup SessionStarted is sink-only; the session owns the
-	// session-scoped SessionStarted it delivers to the hub's subscribers. PublishEvent
-	// returns nil even with no subscribers (the headless case), so a non-nil error is
-	// a genuine fault; log it and continue (event publication must not abort the loop).
-	publishHub := func(ev event.Event) {
-		if _, ok := ev.(event.SessionStarted); ok {
-			return
-		}
+	// the loop producer — this is the loop stamping its own identity, not the fan-in
+	// inferring it), so the fan-in's EventFilter (per-loop LoopID) and its
+	// applyActivity quiescence transitions (TurnStarted/LoopIdle/TurnFoldedInto/
+	// InputCancelled) see the ids they need. The fan-in is non-blocking and
+	// class-aware (Ephemeral drop / Enduring fail-close), so this NEVER blocks the
+	// actor. The session owns the session-scoped SessionStarted it delivers to the
+	// fan-in's subscribers; the loop never emits one. PublishEvent returns nil even
+	// with no subscribers (the headless case), so a non-nil error is a genuine
+	// fault; log it and continue (event publication must not abort the loop). The
+	// per-turn stream is handled separately by emitTurn/deliverAndClose.
+	publish := func(ev event.Event) {
 		if err := cfg.events.PublishEvent(ctx, stampLoopHeader(ev, state.sessionID, state.id, state.turnID)); err != nil {
 			slog.Error("loop event publish to session fan-in failed", "error", err)
 		}
 	}
 
-	publish := func(ev event.Event) {
-		// Full-fidelity loop events go to the session fan-in FIRST (header-stamped,
-		// non-blocking), then the redacted envelope goes to sinks below.
-		publishHub(ev)
-		// SECURITY: the sink path is redacted; the per-turn stream (handled
-		// separately by emit/deliverAndClose) keeps full fidelity. projectForSink
-		// replaces any event.Redactable with its SinkProjection so tool args, file
-		// content, URLs/headers, questions, and result previews never reach a sink,
-		// and extracts the CallID for the envelope from the ORIGINAL event.
-		sinkEv, callID := projectForSink(ev)
-		// EventID is fresh per emitted event. A crypto/rand failure here is a
-		// system-level fault; it must not abort turn execution (the bare per-turn
-		// event is delivered separately), so log it and emit the envelope with a
-		// zero EventID rather than dropping the sink copy.
-		eventID, err := config.idGen()
-		if err != nil {
-			slog.Error("event id generation failed; emitting envelope with zero EventID", "error", err)
-		}
-		env := event.EventEnvelope{
-			SessionID:   state.sessionID,
-			TurnID:      state.turnID,
-			EventID:     eventID,
-			CausationID: state.causationID,
-			CallID:      callID,
-			Event:       sinkEv,
-		}
-		// TurnIndex is read from the ORIGINAL event; projection preserves it but
-		// may change the concrete type (e.g. UserInputRequested → ...Sink).
-		switch e := ev.(type) {
-		case event.TurnStarted:
-			env.TurnIndex = e.TurnIndex
-		case event.TokenDelta:
-			env.TurnIndex = e.TurnIndex
-		case event.TurnDone:
-			env.TurnIndex = e.TurnIndex
-		case event.TurnFailed:
-			env.TurnIndex = e.TurnIndex
-		case event.TurnInterrupted:
-			env.TurnIndex = e.TurnIndex
-		}
-		for _, sink := range config.Sinks {
-			func() {
-				defer func() {
-					if r := recover(); r != nil {
-						slog.Warn("event sink panicked", "panic", r)
-					}
-				}()
-				sink.OnEvent(ctx, env)
-			}()
-		}
-	}
-
-	publish(event.SessionStarted{Header: event.Header{SessionID: state.sessionID}})
-
 	// emitTurn is the ACTOR-side per-turn emit, used at the commit point to emit the
 	// initial TurnStarted and each step's StepDone. It mirrors the turn goroutine's
-	// emit closure (publish to sinks, then send to the per-turn channel) so both
-	// reach the same per-turn stream. The blocking commit handshake guarantees the
+	// emit closure (publish to the session fan-in, then send to the per-turn channel)
+	// so both reach the same per-turn stream. The blocking commit handshake guarantees the
 	// turn goroutine is parked in cfg.commit while the actor calls this, so there are
 	// never two concurrent writers to state.turnEvents — a step's TokenDeltas (from
 	// the turn goroutine) all precede that step's StepDone (from here). The three
@@ -489,13 +407,13 @@ func runLoop(cfg loopConfig, state loopState) {
 	deliverAndClose := func(terminal event.Event) {
 		publish(terminal)
 		// A fan-in-only turn (nil turnEvents) has no per-turn stream to deliver to
-		// or close: publish to sinks/fan-in is the whole delivery. Sending on a nil
-		// channel would block forever and close(nil) would panic, so skip both.
+		// or close: the publish to the session fan-in is the whole delivery. Sending
+		// on a nil channel would block forever and close(nil) would panic, so skip both.
 		if state.turnEvents != nil {
 			select {
 			case state.turnEvents <- terminal:
-			case <-state.turnAbandoned: // caller abandoned; terminal already in sinks
-			case <-ctx.Done(): // hard loop kill; terminal already in sinks
+			case <-state.turnAbandoned: // caller abandoned; terminal already on the fan-in
+			case <-ctx.Done(): // hard loop kill; terminal already on the fan-in
 			}
 			close(state.turnEvents)
 		}
@@ -515,8 +433,8 @@ func runLoop(cfg loopConfig, state loopState) {
 	// TurnID is zero — it is loop-scoped, not turn-scoped). The session quiescence
 	// model removes this loop's {loop, LoopID} activity key on it, so a primary-only
 	// synchronous session reaches SessionIdle exactly when the primary loop parks. It
-	// goes to the hub (quiescence) and to sinks (observability), never to the per-turn
-	// stream (the turn is already over and its stream closed). It is emitted ONLY on a
+	// goes to the session fan-in (for quiescence), never to the per-turn stream (the
+	// turn is already over and its stream closed). It is emitted ONLY on a
 	// genuine running->idle transition: never between chained turns (running->running),
 	// and shutdown-induced idling does not emit it because the actor returns before
 	// reaching the emit point (or has already flipped to SessionStopped at the session).

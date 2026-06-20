@@ -12,7 +12,7 @@ func (EmptyResponseError) Error() string { return "loop: empty response from pro
 // guard fires: the model requested another tool batch after either the
 // per-turn iteration cap (LLM<->tool round-trips) or the total-call cap was
 // exceeded. It is typed and secret-free (it carries only the counts), so it is
-// safe to forward to sinks UN-redacted via TurnFailed — it never embeds raw
+// safe to surface un-redacted in TurnFailed.Err — it never embeds raw
 // messages or tool arguments. Callers may errors.As it to distinguish a runaway
 // stop from a provider/network failure.
 type ToolLimitError struct {

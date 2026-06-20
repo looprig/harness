@@ -16,22 +16,6 @@ import (
 	"github.com/inventivepotter/urvi/internal/uuid"
 )
 
-type captureSink struct {
-	mu  sync.Mutex
-	got []event.EventEnvelope
-}
-
-func (s *captureSink) OnEvent(_ context.Context, e event.EventEnvelope) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.got = append(s.got, e)
-}
-func (s *captureSink) events() []event.EventEnvelope {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return append([]event.EventEnvelope(nil), s.got...)
-}
-
 // mustID returns a fresh UUID or fails the test.
 func mustID(t *testing.T) uuid.UUID {
 	t.Helper()
@@ -42,11 +26,6 @@ func mustID(t *testing.T) uuid.UUID {
 	return u
 }
 
-// panicSink panics on every OnEvent; the actor must recover and keep running.
-type panicSink struct{}
-
-func (panicSink) OnEvent(context.Context, event.EventEnvelope) { panic("boom in sink") }
-
 // noopPublisher is a no-op eventPublisher for loop tests that do not assert on
 // the session fan-in. New stores it in loopConfig.events; PublishEvent simply
 // drops the event, which is sufficient to satisfy the New signature.
@@ -54,8 +33,69 @@ type noopPublisher struct{}
 
 func (noopPublisher) PublishEvent(context.Context, event.Event) error { return nil }
 
+// recordingPublisher is an eventPublisher that records every published full-
+// fidelity event.Event (no envelope, no redaction — exactly what the production
+// hub sees). It receives events from the actor goroutine, so it is guarded by a
+// mutex. events() returns a copy so a reader never aliases the live slice the
+// actor is appending to.
+type recordingPublisher struct {
+	mu  sync.Mutex
+	got []event.Event
+}
+
+func (r *recordingPublisher) PublishEvent(_ context.Context, ev event.Event) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.got = append(r.got, ev)
+	return nil
+}
+
+func (r *recordingPublisher) events() []event.Event {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]event.Event(nil), r.got...)
+}
+
+// blockUntilEvents polls the recording publisher's events until pred is
+// satisfied, or fails after ~2s.
+func blockUntilEvents(t *testing.T, rec *recordingPublisher, pred func([]event.Event) bool) {
+	t.Helper()
+	deadline := time.After(2 * time.Second)
+	for {
+		if pred(rec.events()) {
+			return
+		}
+		select {
+		case <-deadline:
+			t.Fatal("recorded-events condition not met within deadline")
+		case <-time.After(2 * time.Millisecond):
+		}
+	}
+}
+
+// newLoopRec is like newLoop but injects a recordingPublisher (instead of
+// noopPublisher{}) as the event publisher and returns it, so a test can observe
+// the full-fidelity events the production hub would see. It uses a 200ms
+// DrainTimeout; the root cancel is registered with t.Cleanup and also returned
+// for callers that cancel explicitly.
+func newLoopRec(t *testing.T, client llm.LLM) (*Loop, *recordingPublisher, context.CancelFunc) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	rec := &recordingPublisher{}
+	l, err := New(ctx, mustID(t), mustID(t), Provenance{}, rec, Config{
+		Client:       client,
+		Model:        llm.ModelSpec{Model: "m"},
+		DrainTimeout: 200 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(cancel)
+	return l, rec, cancel
+}
+
 // newLoop starts a loop with a 200ms DrainTimeout and returns it plus the root cancel.
-func newLoop(t *testing.T, client llm.LLM, sinks ...event.EventSink) (*Loop, context.CancelFunc) {
+func newLoop(t *testing.T, client llm.LLM) (*Loop, context.CancelFunc) {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	sessionID, err := uuid.New()
@@ -66,7 +106,7 @@ func newLoop(t *testing.T, client llm.LLM, sinks ...event.EventSink) (*Loop, con
 	if err != nil {
 		t.Fatalf("uuid.New: %v", err)
 	}
-	l, err := New(ctx, sessionID, loopID, Provenance{}, noopPublisher{}, Config{Client: client, Model: llm.ModelSpec{Model: "m"}, Sinks: sinks, DrainTimeout: 200 * time.Millisecond})
+	l, err := New(ctx, sessionID, loopID, Provenance{}, noopPublisher{}, Config{Client: client, Model: llm.ModelSpec{Model: "m"}, DrainTimeout: 200 * time.Millisecond})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -81,7 +121,7 @@ func newLoop(t *testing.T, client llm.LLM, sinks ...event.EventSink) (*Loop, con
 // refusal — instead of a command.Disposition reply). The peeked TurnStarted is NOT
 // re-injected, mirroring production Stream's re-yield only at the session boundary;
 // loop tests that need the TurnStarted from the stream read it before calling this or
-// observe it via a sink. The ctx parameter is retained for source compatibility with
+// observe it via a recordingPublisher. The ctx parameter is retained for source compatibility with
 // callers but is unused: submit commands carry no context, and the turn ctx derives
 // from loopCtx.
 func startTurn(t *testing.T, l *Loop, _ context.Context, input []content.Block) (<-chan event.Event, func()) {
@@ -135,6 +175,30 @@ func drainToTerminal(t *testing.T, ev <-chan event.Event) event.Event {
 	}
 	t.Fatal("events channel closed without terminal")
 	return nil
+}
+
+// TestRecordingPublisherObservesTurnStarted proves the recordingPublisher
+// observes a real loop event: a turn started via the fakeLLM client publishes an
+// event.TurnStarted onto the event publisher (the production fan-in path), which
+// the recorder captures. This is the migration target for tests that previously
+// observed loop events through a sink.
+func TestRecordingPublisherObservesTurnStarted(t *testing.T) {
+	t.Parallel()
+	l, rec, _ := newLoopRec(t, &fakeLLM{chunks: []content.Chunk{textChunk("hi")}})
+	ev, _ := startTurn(t, l, context.Background(), nil)
+	t.Cleanup(func() {
+		for range ev { // drain so the actor's emit/publish path never wedges
+		}
+	})
+
+	blockUntilEvents(t, rec, func(evs []event.Event) bool {
+		for _, e := range evs {
+			if _, ok := e.(event.TurnStarted); ok {
+				return true
+			}
+		}
+		return false
+	})
 }
 
 func TestResolveDrainTimeout(t *testing.T) {
@@ -269,15 +333,16 @@ func TestSingleTurn(t *testing.T) {
 	}
 }
 
-// TestEnvelopeCorrelationStamped drives one full turn and asserts that the
-// sink-side envelopes carry correlation identity: every envelope for the turn
-// shares the same non-zero TurnID, each EventID is distinct and non-zero, and
-// CausationID equals the issuing UserInput's Header.ID. The bare per-turn events
-// are unchanged; only the envelope gains these fields.
-func TestEnvelopeCorrelationStamped(t *testing.T) {
+// TestTurnEventCorrelationStamped drives one full turn and asserts that the
+// full-fidelity events the session fan-in sees carry correlation identity in their
+// own Header: every turn event shares the same non-zero TurnID, the Reply event
+// (TurnStarted) carries CausationID == the issuing UserInput's Header.ID, and no
+// event carries a tool-call id (ToolCallID is zero — there is no tool call in this
+// turn). These are the producer-stamped Header fields the recordingPublisher
+// observes via cfg.events.PublishEvent (the production hub path).
+func TestTurnEventCorrelationStamped(t *testing.T) {
 	t.Parallel()
-	sink := &captureSink{}
-	l, _ := newLoop(t, &fakeLLM{chunks: []content.Chunk{textChunk("hi")}}, sink)
+	l, rec, _ := newLoopRec(t, &fakeLLM{chunks: []content.Chunk{textChunk("hi")}})
 
 	cmdID, err := uuid.New()
 	if err != nil {
@@ -303,73 +368,72 @@ func TestEnvelopeCorrelationStamped(t *testing.T) {
 		t.Fatal("terminal != TurnDone")
 	}
 
-	// Collect only the turn's envelopes. Skip the session-level SessionStarted and the
-	// loop-scoped LoopIdle (the running->idle announcement): both have no active turn,
-	// so they carry zero TurnID/CausationID by design and are not turn envelopes.
-	var turnEnvs []event.EventEnvelope
-	for _, e := range sink.events() {
-		switch e.Event.(type) {
-		case event.SessionStarted, event.LoopIdle:
+	// Collect only the turn's events. Skip the loop-scoped LoopIdle (the
+	// running->idle announcement): it has no active turn, so it carries a zero
+	// TurnID by design and is not a turn event. The loop never emits SessionStarted
+	// (the session owns it), so there is nothing to skip there.
+	var turnEvents []event.Event
+	for _, e := range rec.events() {
+		if _, ok := e.(event.LoopIdle); ok {
 			continue
 		}
-		turnEnvs = append(turnEnvs, e)
+		turnEvents = append(turnEvents, e)
 	}
-	if len(turnEnvs) == 0 {
-		t.Fatal("no turn envelopes captured")
+	if len(turnEvents) == 0 {
+		t.Fatal("no turn events captured")
 	}
 
 	// Each correlation property is a named sub-assertion over the same captured
-	// turn envelopes; running them as a table keeps the single-turn flow intact
+	// turn events; running them as a table keeps the single-turn flow intact
 	// while satisfying the table-driven convention.
 	checks := []struct {
 		name   string
-		assert func(t *testing.T, envs []event.EventEnvelope)
+		assert func(t *testing.T, evs []event.Event)
 	}{
 		{
 			name: "TurnID shared and non-zero",
-			assert: func(t *testing.T, envs []event.EventEnvelope) {
-				turnID := envs[0].TurnID
+			assert: func(t *testing.T, evs []event.Event) {
+				turnID := evs[0].EventHeader().TurnID
 				if turnID.IsZero() {
-					t.Fatal("envelope 0: TurnID is zero")
+					t.Fatal("event 0: TurnID is zero")
 				}
-				for i, e := range envs {
-					if e.TurnID != turnID {
-						t.Errorf("envelope %d: TurnID = %v, want shared %v", i, e.TurnID, turnID)
+				for i, e := range evs {
+					if e.EventHeader().TurnID != turnID {
+						t.Errorf("event %d (%T): TurnID = %v, want shared %v", i, e, e.EventHeader().TurnID, turnID)
 					}
 				}
 			},
 		},
 		{
-			name: "EventID distinct and non-zero",
-			assert: func(t *testing.T, envs []event.EventEnvelope) {
-				seen := make(map[uuid.UUID]struct{})
-				for i, e := range envs {
-					if e.EventID.IsZero() {
-						t.Errorf("envelope %d: EventID is zero", i)
+			// CausationID is a Reply-event property (ReplyTo() == CausationID). Of this
+			// turn's events only the Reply (TurnStarted) carries it; the other turn
+			// events (TokenDelta/StepDone/TurnDone) leave it zero on their own Header.
+			// At least one Reply must be present and every Reply must point back to the
+			// issuing UserInput.
+			name: "Reply CausationID equals UserInput.Header.ID",
+			assert: func(t *testing.T, evs []event.Event) {
+				var sawReply bool
+				for i, e := range evs {
+					r, ok := e.(event.Reply)
+					if !ok {
+						continue
 					}
-					if _, dup := seen[e.EventID]; dup {
-						t.Errorf("envelope %d: EventID %v is duplicated", i, e.EventID)
+					sawReply = true
+					if r.ReplyTo() != cmdID {
+						t.Errorf("event %d (%T): ReplyTo/CausationID = %v, want UserInput.ID %v", i, e, r.ReplyTo(), cmdID)
 					}
-					seen[e.EventID] = struct{}{}
+				}
+				if !sawReply {
+					t.Fatal("no Reply event captured; expected at least TurnStarted")
 				}
 			},
 		},
 		{
-			name: "CausationID equals UserInput.Header.ID",
-			assert: func(t *testing.T, envs []event.EventEnvelope) {
-				for i, e := range envs {
-					if e.CausationID != cmdID {
-						t.Errorf("envelope %d: CausationID = %v, want UserInput.ID %v", i, e.CausationID, cmdID)
-					}
-				}
-			},
-		},
-		{
-			name: "CallID zero (no tool call in v1)",
-			assert: func(t *testing.T, envs []event.EventEnvelope) {
-				for i, e := range envs {
-					if !e.CallID.IsZero() {
-						t.Errorf("envelope %d: CallID = %v, want zero (no tool call)", i, e.CallID)
+			name: "ToolCallID zero (no tool call in v1)",
+			assert: func(t *testing.T, evs []event.Event) {
+				for i, e := range evs {
+					if !e.EventHeader().ToolCallID.IsZero() {
+						t.Errorf("event %d (%T): ToolCallID = %v, want zero (no tool call)", i, e, e.EventHeader().ToolCallID)
 					}
 				}
 			},
@@ -379,14 +443,14 @@ func TestEnvelopeCorrelationStamped(t *testing.T) {
 		c := c
 		t.Run(c.name, func(t *testing.T) {
 			t.Parallel()
-			c.assert(t, turnEnvs)
+			c.assert(t, turnEvents)
 		})
 	}
 }
 
 // countedIDGen returns a real UUID for its first okCount calls, then fails every
-// subsequent call. It is safe for concurrent use (the actor and turn goroutines
-// both mint via publish). okCount = 0 fails immediately.
+// subsequent call. It is safe for concurrent use (the actor mints the TurnID and
+// the turn goroutine mints step/tool-call ids). okCount = 0 fails immediately.
 type countedIDGen struct {
 	mu      sync.Mutex
 	calls   int
@@ -407,7 +471,7 @@ func (g *countedIDGen) gen() (uuid.UUID, error) {
 
 // newLoopWithIDGen starts a loop wired with a custom id generator, exercising
 // the crypto/rand failure branches that uuid.New cannot reach in tests.
-func newLoopWithIDGen(t *testing.T, client llm.LLM, gen idGenerator, sinks ...event.EventSink) *Loop {
+func newLoopWithIDGen(t *testing.T, client llm.LLM, gen idGenerator) *Loop {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	sessionID, err := uuid.New()
@@ -421,7 +485,6 @@ func newLoopWithIDGen(t *testing.T, client llm.LLM, gen idGenerator, sinks ...ev
 	l, err := New(ctx, sessionID, loopID, Provenance{}, noopPublisher{}, Config{
 		Client:       client,
 		Model:        llm.ModelSpec{Model: "m"},
-		Sinks:        sinks,
 		DrainTimeout: 200 * time.Millisecond,
 		idGen:        gen,
 	})
@@ -443,10 +506,9 @@ func TestTurnIDGenerationFailure(t *testing.T) {
 	genErr := errors.New("rand source exhausted")
 	tests := []struct {
 		name    string
-		okCount int // succeeds for SessionStarted EventID (call #1); TurnID (call #2) fails
+		okCount int // TurnID is the first id minted for the submit; okCount 0 fails it
 	}{
-		{name: "turn id mint fails", okCount: 1},
-		{name: "all id mints fail", okCount: 0},
+		{name: "turn id mint fails", okCount: 0},
 	}
 	for _, tt := range tests {
 		tt := tt
@@ -477,60 +539,6 @@ func TestTurnIDGenerationFailure(t *testing.T) {
 				t.Error("rejected turn's Events channel should be closed")
 			}
 		})
-	}
-}
-
-// TestEventIDGenerationFailureBestEffort covers branch 3: when EventID minting
-// fails after the TurnID is already minted, the turn still completes to a
-// terminal and the affected envelopes carry a zero EventID (best-effort sink
-// contract), rather than the turn aborting.
-func TestEventIDGenerationFailureBestEffort(t *testing.T) {
-	t.Parallel()
-	genErr := errors.New("rand source exhausted")
-	// okCount = 2: SessionStarted EventID (call #1) and TurnID (call #2) succeed;
-	// every per-event EventID mint after that fails.
-	gen := &countedIDGen{okCount: 2, err: genErr}
-	sink := &captureSink{}
-	l := newLoopWithIDGen(t, &fakeLLM{chunks: []content.Chunk{textChunk("hi")}}, gen.gen, sink)
-
-	ev := make(chan event.Event, 64)
-	ab := make(chan struct{})
-	defer close(ab)
-	l.Commands <- command.UserInput{Mode: command.StartOnly, Blocks: nil, Events: ev, Abandoned: ab}
-	if first, ok := <-ev; !ok {
-		t.Fatal("per-turn stream closed without TurnStarted (TurnID minted; only EventID fails)")
-	} else if _, ok := first.(event.TurnStarted); !ok {
-		t.Fatalf("first per-turn event = %T, want event.TurnStarted", first)
-	}
-	// Branch 3 must not abort the turn: a terminal still arrives.
-	if _, ok := drainToTerminal(t, ev).(event.TurnDone); !ok {
-		t.Fatal("turn did not complete despite EventID mint failure")
-	}
-
-	// At least one turn-level envelope must carry a zero EventID (the failed mints
-	// were emitted best-effort with a zero EventID rather than dropped).
-	var sawTurnEnv, sawZeroEventID bool
-	for _, e := range sink.events() {
-		// SessionStarted and the loop-scoped LoopIdle are not turn envelopes (no active
-		// turn -> zero TurnID by design); skip both.
-		switch e.Event.(type) {
-		case event.SessionStarted, event.LoopIdle:
-			continue
-		}
-		sawTurnEnv = true
-		if e.EventID.IsZero() {
-			sawZeroEventID = true
-		}
-		// TurnID was minted before the failures, so it must remain non-zero.
-		if e.TurnID.IsZero() {
-			t.Error("turn envelope TurnID is zero; TurnID was minted successfully")
-		}
-	}
-	if !sawTurnEnv {
-		t.Fatal("no turn-level envelope captured")
-	}
-	if !sawZeroEventID {
-		t.Fatal("expected at least one envelope with a zero EventID after mint failure")
 	}
 }
 
@@ -662,71 +670,48 @@ func TestTurnPanic(t *testing.T) {
 	}
 }
 
-func TestStartupSinkEvent(t *testing.T) {
-	t.Parallel()
-	sink := &captureSink{}
-	l, _ := newLoop(t, &fakeLLM{chunks: []content.Chunk{textChunk("x")}}, sink)
-	// unbuffered Commands guarantees SessionStarted was published before this send returns
-	ack := make(chan error, 1)
-	l.Commands <- command.Shutdown{Ack: ack}
-	<-ack
-	<-l.Done
-	got := sink.events()
-	if len(got) == 0 {
-		t.Fatal("no sink events")
-	}
-	if _, ok := got[0].Event.(event.SessionStarted); !ok {
-		t.Fatalf("first sink event = %T, want SessionStarted", got[0].Event)
-	}
-}
-
-func TestEventSinkPanicRecovered(t *testing.T) {
-	t.Parallel()
-	// a sink whose OnEvent always panics must not break the turn or the actor
-	l, _ := newLoop(t, &fakeLLM{chunks: []content.Chunk{textChunk("ok")}}, panicSink{})
-	ev, _ := startTurn(t, l, context.Background(), nil)
-	if _, ok := drainToTerminal(t, ev).(event.TurnDone); !ok {
-		t.Fatal("turn did not complete despite sink panic")
-	}
-	ack := make(chan error, 1)
-	l.Commands <- command.Shutdown{Ack: ack}
-	if err := <-ack; err != nil {
-		t.Fatalf("Shutdown ack = %v, want nil", err)
-	}
-	<-l.Done
-}
-
-// TestFanInOnlyUserInputStartsTurn proves a fan-in-only AllowFold UserInput (nil
-// Events/Abandoned) starts a turn and runs it to completion through sinks/fan-in
-// only: emit and deliverAndClose are nil-safe (no send-on-nil, no close-nil). The
-// published TurnStarted and the sink-observed TurnDone are the only evidence the turn
-// ran, since there is no per-turn stream.
-func TestFanInOnlyUserInputStartsTurn(t *testing.T) {
-	t.Parallel()
-	sink := &captureSink{}
-	l, _ := newLoop(t, &fakeLLM{chunks: []content.Chunk{textChunk("hi")}}, sink)
-
-	id := mustID(t)
-	l.Commands <- command.UserInput{Header: command.Header{ID: id}, Mode: command.AllowFold, Blocks: nil} // nil Events/Abandoned
-	if _, ok := awaitReply(t, sink, id).(event.TurnStarted); !ok {
-		t.Fatal("fan-in-only AllowFold submit did not publish TurnStarted")
-	}
-	// The turn runs to a TurnDone observed on sinks only (no per-turn channel).
+// awaitReply polls the recorded full-fidelity events for the published
+// event.Reply whose ReplyTo() == inputID (the submit's outcome: TurnStarted,
+// InputQueued, or TurnRejected) and returns it, failing if none lands within the
+// deadline.
+func awaitReply(t *testing.T, rec *recordingPublisher, inputID uuid.UUID) event.Event {
+	t.Helper()
 	deadline := time.After(2 * time.Second)
 	for {
-		if hasTerminal(sink.events()) {
-			break
+		for _, e := range rec.events() {
+			if r, ok := e.(event.Reply); ok && r.ReplyTo() == inputID {
+				return e
+			}
 		}
 		select {
 		case <-deadline:
-			t.Fatal("fan-in-only turn produced no terminal on sinks")
+			t.Fatalf("no Reply for input %v within deadline", inputID)
+			return nil
 		case <-time.After(2 * time.Millisecond):
 		}
 	}
+}
+
+// TestFanInOnlyUserInputStartsTurn proves a fan-in-only AllowFold UserInput (nil
+// Events/Abandoned) starts a turn and runs it to completion through the fan-in
+// only: emit and deliverAndClose are nil-safe (no send-on-nil, no close-nil). The
+// published TurnStarted and the fan-in-observed TurnDone are the only evidence the
+// turn ran, since there is no per-turn stream.
+func TestFanInOnlyUserInputStartsTurn(t *testing.T) {
+	t.Parallel()
+	l, rec, _ := newLoopRec(t, &fakeLLM{chunks: []content.Chunk{textChunk("hi")}})
+
+	id := mustID(t)
+	l.Commands <- command.UserInput{Header: command.Header{ID: id}, Mode: command.AllowFold, Blocks: nil} // nil Events/Abandoned
+	if _, ok := awaitReply(t, rec, id).(event.TurnStarted); !ok {
+		t.Fatal("fan-in-only AllowFold submit did not publish TurnStarted")
+	}
+	// The turn runs to a TurnDone observed on the fan-in only (no per-turn channel).
+	blockUntilEvents(t, rec, hasTerminal)
 	// Actor is usable afterward.
 	id2 := mustID(t)
 	l.Commands <- command.UserInput{Header: command.Header{ID: id2}, Mode: command.AllowFold, Blocks: nil}
-	if _, ok := awaitReply(t, sink, id2).(event.TurnStarted); !ok {
+	if _, ok := awaitReply(t, rec, id2).(event.TurnStarted); !ok {
 		t.Fatal("actor not usable after a fan-in-only turn")
 	}
 }
@@ -782,14 +767,13 @@ func TestTurnFailedProviderErrorTyped(t *testing.T) {
 // the ctx.Done() escape can free it.
 func TestLeakedReaderDoesNotWedgeActor(t *testing.T) {
 	t.Parallel()
-	sink := &captureSink{}
+	rec := &recordingPublisher{}
 	ctx, cancel := context.WithCancel(context.Background())
 	sessionID, _ := uuid.New()
 	loopID, _ := uuid.New()
-	l, err := New(ctx, sessionID, loopID, Provenance{}, noopPublisher{}, Config{
+	l, err := New(ctx, sessionID, loopID, Provenance{}, rec, Config{
 		Client:       &fakeLLM{chunks: []content.Chunk{textChunk("a")}},
 		Model:        llm.ModelSpec{Model: "m"},
-		Sinks:        []event.EventSink{sink},
 		DrainTimeout: 100 * time.Millisecond,
 	})
 	if err != nil {
@@ -805,17 +789,7 @@ func TestLeakedReaderDoesNotWedgeActor(t *testing.T) {
 
 	// Wait until the actor has published the terminal (it does so inside
 	// deliverAndClose, immediately before blocking on the full Events buffer).
-	deadline := time.After(2 * time.Second)
-	for {
-		if hasTerminal(sink.events()) {
-			break
-		}
-		select {
-		case <-deadline:
-			t.Fatal("actor never reached deliverAndClose (no terminal published)")
-		case <-time.After(2 * time.Millisecond):
-		}
-	}
+	blockUntilEvents(t, rec, hasTerminal)
 
 	cancel() // only the deliverAndClose ctx.Done() escape can free the parked actor
 	select {
@@ -825,10 +799,9 @@ func TestLeakedReaderDoesNotWedgeActor(t *testing.T) {
 	}
 }
 
-func hasTerminal(evs []event.EventEnvelope) bool {
-	for _, e := range evs {
-		switch e.Event.(type) {
-		case event.TurnDone, event.TurnFailed, event.TurnInterrupted:
+func hasTerminal(evs []event.Event) bool {
+	for _, ev := range evs {
+		if ev.EndsTurn() {
 			return true
 		}
 	}

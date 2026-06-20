@@ -298,12 +298,11 @@ func (s *Sesssion) newCommandID() (uuid.UUID, error) {
 // goroutine. It owns the session fan-in hub and emits the session-scoped
 // SessionStarted through it.
 //
-// Two distinct consumer paths carry SessionStarted, by design, to two distinct
-// audiences: the loop's actor publishes a SessionStarted to its observability
-// SINKS (cfg.Sinks) on startup, while the session here publishes the session-scoped
-// SessionStarted through the HUB to its SUBSCRIBERS (TUI/CLI fan-in). These never
-// double-deliver to the same consumer — sinks and subscribers are separate sets —
-// so the two emissions are complementary, not redundant.
+// This SessionStarted (the s.hub.PublishEvent below) is the SOLE SessionStarted:
+// the session publishes it through the HUB to its SUBSCRIBERS (TUI/CLI fan-in),
+// and the loop never emits one. It is published before any subscriber attaches,
+// so a subscriber that connects later does not observe it; reliable delivery of
+// the session start to late subscribers is a separate future follow-on.
 func NewAgent(ctx context.Context, cfg loop.Config) (*Sesssion, error) {
 	select {
 	case <-ctx.Done():

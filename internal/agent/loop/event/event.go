@@ -11,11 +11,6 @@ import "github.com/inventivepotter/urvi/internal/uuid"
 // mixins or two scope mixins makes the selectors ambiguous and the type stops
 // satisfying Event, so the "exactly one of each" rule is enforced by the
 // compiler.
-//
-// SECURITY: any new event carrying sensitive payload (tool args, file content,
-// URLs/headers, user text, raw provider/LLM error strings) MUST implement
-// Redactable (see tool.go), because the loop's sink path forwards every
-// non-Redactable event to observability sinks VERBATIM. If in doubt, redact.
 type Event interface {
 	isEvent()
 	Class() Class
@@ -94,9 +89,8 @@ type Header struct {
 	// ToolCallID is set on gate/tool lifecycle events when CallID is available.
 	ToolCallID uuid.UUID
 
-	// Event identity and parent grouping are present on the type, but detailed
-	// wiring and EventEnvelope replacement are sequenced after the
-	// journal/redaction follow-on.
+	// Event identity and parent grouping. Header carries this identity directly;
+	// detailed wiring is sequenced after the journal follow-on.
 	ID           uuid.UUID
 	ParentLoopID uuid.UUID
 	ParentTurnID uuid.UUID

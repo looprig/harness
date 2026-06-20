@@ -26,9 +26,9 @@ func cancelQueuedInput(t *testing.T, l *Loop, inputID uuid.UUID) {
 
 // hasInputCancelled reports whether evs contains an event.InputCancelled for
 // inputID with the given reason (and a non-nil echoed Message).
-func hasInputCancelled(evs []event.EventEnvelope, inputID uuid.UUID, reason event.CancelReason) bool {
+func hasInputCancelled(evs []event.Event, inputID uuid.UUID, reason event.CancelReason) bool {
 	for _, e := range evs {
-		if ic, ok := e.Event.(event.InputCancelled); ok &&
+		if ic, ok := e.(event.InputCancelled); ok &&
 			ic.InputID == inputID && ic.Reason == reason && ic.Message != nil {
 			return true
 		}
@@ -42,8 +42,7 @@ func hasInputCancelled(evs []event.EventEnvelope, inputID uuid.UUID, reason even
 // (a second retract finds it gone and is a pure no-op — no second InputCancelled).
 func TestCancelWhileQueuedPublishesInputCancelled(t *testing.T) {
 	t.Parallel()
-	sink := &captureSink{}
-	l, _ := newLoop(t, &fakeLLM{blockUntilCancel: true}, sink)
+	l, rec, _ := newLoopRec(t, &fakeLLM{blockUntilCancel: true})
 	ev1, _ := startTurn(t, l, context.Background(), nil) // occupy the loop
 	go func() {
 		for range ev1 {
@@ -53,14 +52,14 @@ func TestCancelWhileQueuedPublishesInputCancelled(t *testing.T) {
 	// Queue an input behind the running turn.
 	queuedID := mustID(t)
 	l.Commands <- command.UserInput{Header: command.Header{ID: queuedID}, Mode: command.AllowFold, Blocks: textBlocks("retract me")}
-	if _, ok := awaitReply(t, sink, queuedID).(event.InputQueued); !ok {
+	if _, ok := awaitReply(t, rec, queuedID).(event.InputQueued); !ok {
 		t.Fatal("submit not queued")
 	}
 
 	// Retract it while still queued: the observable outcome is the published
 	// event.InputCancelled{CancelClientRetracted} for that InputID.
 	cancelQueuedInput(t, l, queuedID)
-	blockUntilSink(t, sink, func(evs []event.EventEnvelope) bool {
+	blockUntilEvents(t, rec, func(evs []event.Event) bool {
 		return hasInputCancelled(evs, queuedID, event.CancelClientRetracted)
 	})
 
@@ -68,7 +67,7 @@ func TestCancelWhileQueuedPublishesInputCancelled(t *testing.T) {
 	// (buggy) duplicate emit would have landed, then assert exactly one
 	// InputCancelled for queuedID ever appeared.
 	cancelQueuedInput(t, l, queuedID)
-	if !waitNoExtraInputCancelled(t, sink, queuedID, event.CancelClientRetracted, 1) {
+	if !waitNoExtraInputCancelled(t, rec, queuedID, event.CancelClientRetracted, 1) {
 		t.Fatal("second retract published an extra InputCancelled for an already-removed input")
 	}
 }
@@ -80,8 +79,7 @@ func TestCancelWhileQueuedPublishesInputCancelled(t *testing.T) {
 // absence of an InputCancelled for the unknown id is meaningful, not just latency.
 func TestCancelUnknownInputIsNoop(t *testing.T) {
 	t.Parallel()
-	sink := &captureSink{}
-	l, _ := newLoop(t, &fakeLLM{blockUntilCancel: true}, sink)
+	l, rec, _ := newLoopRec(t, &fakeLLM{blockUntilCancel: true})
 	ev1, _ := startTurn(t, l, context.Background(), nil)
 	go func() {
 		for range ev1 {
@@ -91,7 +89,7 @@ func TestCancelUnknownInputIsNoop(t *testing.T) {
 	// Prove the loop is alive: queue a real input and observe its InputQueued.
 	queuedID := mustID(t)
 	l.Commands <- command.UserInput{Header: command.Header{ID: queuedID}, Mode: command.AllowFold, Blocks: textBlocks("alive")}
-	if _, ok := awaitReply(t, sink, queuedID).(event.InputQueued); !ok {
+	if _, ok := awaitReply(t, rec, queuedID).(event.InputQueued); !ok {
 		t.Fatal("submit not queued")
 	}
 
@@ -102,13 +100,13 @@ func TestCancelUnknownInputIsNoop(t *testing.T) {
 	// Round-trip a SECOND retract for the real queued id to flush the command
 	// channel past the unknown retract: once its InputCancelled lands we know the
 	// unknown retract was fully processed, so any InputCancelled for unknownID would
-	// already be in the sink.
+	// already be recorded.
 	cancelQueuedInput(t, l, queuedID)
-	blockUntilSink(t, sink, func(evs []event.EventEnvelope) bool {
+	blockUntilEvents(t, rec, func(evs []event.Event) bool {
 		return hasInputCancelled(evs, queuedID, event.CancelClientRetracted)
 	})
-	for _, e := range sink.events() {
-		if ic, ok := e.Event.(event.InputCancelled); ok && ic.InputID == unknownID {
+	for _, e := range rec.events() {
+		if ic, ok := e.(event.InputCancelled); ok && ic.InputID == unknownID {
 			t.Fatalf("unknown-input retract published InputCancelled %+v, want no-op", ic)
 		}
 	}
@@ -117,13 +115,13 @@ func TestCancelUnknownInputIsNoop(t *testing.T) {
 // waitNoExtraInputCancelled waits a short settling window and reports whether the
 // count of event.InputCancelled for (inputID, reason) stays at want. It returns
 // true if the count never exceeds want during the window.
-func waitNoExtraInputCancelled(t *testing.T, sink *captureSink, inputID uuid.UUID, reason event.CancelReason, want int) bool {
+func waitNoExtraInputCancelled(t *testing.T, rec *recordingPublisher, inputID uuid.UUID, reason event.CancelReason, want int) bool {
 	t.Helper()
 	deadline := time.After(200 * time.Millisecond)
 	for {
 		n := 0
-		for _, e := range sink.events() {
-			if ic, ok := e.Event.(event.InputCancelled); ok && ic.InputID == inputID && ic.Reason == reason {
+		for _, e := range rec.events() {
+			if ic, ok := e.(event.InputCancelled); ok && ic.InputID == inputID && ic.Reason == reason {
 				n++
 			}
 		}
@@ -146,8 +144,7 @@ func TestAbnormalTerminalReturnsQueuedInput(t *testing.T) {
 
 	t.Run("interrupt returns queued input as CancelTurnInterrupted", func(t *testing.T) {
 		t.Parallel()
-		sink := &captureSink{}
-		l, _ := newLoop(t, &fakeLLM{blockUntilCancel: true}, sink)
+		l, rec, _ := newLoopRec(t, &fakeLLM{blockUntilCancel: true})
 		ev1, _ := startTurn(t, l, context.Background(), nil)
 		go func() {
 			for range ev1 {
@@ -157,7 +154,7 @@ func TestAbnormalTerminalReturnsQueuedInput(t *testing.T) {
 		// Queue an input while the turn runs.
 		queuedID := mustID(t)
 		l.Commands <- command.UserInput{Header: command.Header{ID: queuedID}, Mode: command.AllowFold, Blocks: textBlocks("queued")}
-		if _, ok := awaitReply(t, sink, queuedID).(event.InputQueued); !ok {
+		if _, ok := awaitReply(t, rec, queuedID).(event.InputQueued); !ok {
 			t.Fatal("submit not queued")
 		}
 
@@ -167,9 +164,9 @@ func TestAbnormalTerminalReturnsQueuedInput(t *testing.T) {
 		l.Commands <- command.Interrupt{Ack: iack}
 		<-iack
 
-		blockUntilSink(t, sink, func(evs []event.EventEnvelope) bool {
+		blockUntilEvents(t, rec, func(evs []event.Event) bool {
 			for _, e := range evs {
-				if ic, ok := e.Event.(event.InputCancelled); ok {
+				if ic, ok := e.(event.InputCancelled); ok {
 					return ic.InputID == queuedID && ic.Reason == event.CancelTurnInterrupted && ic.Message != nil
 				}
 			}
@@ -178,8 +175,8 @@ func TestAbnormalTerminalReturnsQueuedInput(t *testing.T) {
 
 		// No new turn was started from the returned entry: there is exactly ONE
 		// TurnStarted (the original turn), never a second one for queuedID.
-		for _, e := range sink.events() {
-			if ts, ok := e.Event.(event.TurnStarted); ok && ts.InputID == queuedID {
+		for _, e := range rec.events() {
+			if ts, ok := e.(event.TurnStarted); ok && ts.InputID == queuedID {
 				t.Fatal("returned input was auto-started, want no new turn")
 			}
 		}
@@ -204,18 +201,18 @@ func TestAbnormalTerminalReturnsQueuedInput(t *testing.T) {
 		t.Cleanup(cancel)
 		sessionID, _ := uuid.New()
 		loopID, _ := uuid.New()
-		sink := &captureSink{}
+		rec := &recordingPublisher{}
 		client.onStreamN = map[int]func(){
 			1: func() {
 				l.Commands <- command.UserInput{Header: command.Header{ID: queuedID}, Mode: command.AllowFold, Blocks: textBlocks("queued")}
-				if _, ok := awaitReply(t, sink, queuedID).(event.InputQueued); !ok {
+				if _, ok := awaitReply(t, rec, queuedID).(event.InputQueued); !ok {
 					t.Errorf("submit at step 1 not queued")
 				}
 			},
 		}
 		var err error
-		l, err = New(ctx, sessionID, loopID, Provenance{}, noopPublisher{},
-			Config{Client: client, Model: llm.ModelSpec{Model: "m"}, Tools: tools, Sinks: []event.EventSink{sink}, DrainTimeout: 500 * time.Millisecond})
+		l, err = New(ctx, sessionID, loopID, Provenance{}, rec,
+			Config{Client: client, Model: llm.ModelSpec{Model: "m"}, Tools: tools, DrainTimeout: 500 * time.Millisecond})
 		if err != nil {
 			t.Fatalf("New: %v", err)
 		}
@@ -229,16 +226,16 @@ func TestAbnormalTerminalReturnsQueuedInput(t *testing.T) {
 
 		close(bt.release) // tool returns; step 0 drains (inbox empty), then step 1 queues + fails
 
-		blockUntilSink(t, sink, func(evs []event.EventEnvelope) bool {
+		blockUntilEvents(t, rec, func(evs []event.Event) bool {
 			for _, e := range evs {
-				if ic, ok := e.Event.(event.InputCancelled); ok {
+				if ic, ok := e.(event.InputCancelled); ok {
 					return ic.InputID == queuedID && ic.Reason == event.CancelTurnFailed
 				}
 			}
 			return false
 		})
-		for _, e := range sink.events() {
-			if ts, ok := e.Event.(event.TurnStarted); ok && ts.InputID == queuedID {
+		for _, e := range rec.events() {
+			if ts, ok := e.(event.TurnStarted); ok && ts.InputID == queuedID {
 				t.Fatal("returned input was auto-started after failure, want no new turn")
 			}
 		}

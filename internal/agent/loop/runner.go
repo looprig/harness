@@ -41,9 +41,9 @@ const (
 	errIDGenFailure = "error: internal: could not generate call id"
 )
 
-// ResultPreview caps. ResultPreview is stream-only (the sink projection drops it)
-// but it may still hold a slice of tool output, so it is capped by BOTH a byte
-// budget and a line budget, with a visible truncation marker when exceeded.
+// ResultPreview caps. ResultPreview may hold a slice of tool output, so it is
+// capped by BOTH a byte budget and a line budget, with a visible truncation
+// marker when exceeded.
 const (
 	previewMaxBytes  = 2 * 1024 // ~2 KiB
 	previewMaxLines  = 20

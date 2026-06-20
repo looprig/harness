@@ -51,55 +51,108 @@ func (s *stubLLM) Stream(ctx context.Context, req llm.Request) (*llm.StreamReade
 	return llm.NewStreamReader(next, nil), nil
 }
 
-// recordingSink captures every event envelope for assertions. It is non-blocking
-// and safe for concurrent calls, as the EventSink contract requires.
-type recordingSink struct {
-	mu   sync.Mutex
-	envs []event.EventEnvelope
+// recordingSub drains a hub Subscription — the same consumer API the TUI/CLI use
+// — into a mutex-guarded slice so a test can assert on the full-fidelity events
+// the session fan-in delivered. A goroutine owns the receive; record() and the
+// accessors are safe for concurrent use. The drain loop exits when Events() is
+// closed (the subscription's Close, a hub-forced loss, or session teardown).
+type recordingSub struct {
+	mu     sync.Mutex
+	events []event.Event
 }
 
-func (r *recordingSink) OnEvent(_ context.Context, env event.EventEnvelope) {
+// observe subscribes to s for the loop(s) under test and starts draining. The
+// filter mirrors the real single-loop consumer (tui.DefaultEventFilter): live
+// Ephemeral events from the primary loop, and Enduring events (StepDone, gates,
+// terminals — including TurnStarted/TurnInterrupted) from every loop. The
+// returned Subscription must be Closed by the caller (t.Cleanup). The
+// subscription is created AFTER NewAgent, so it never sees the construction-time
+// SessionStarted (the hub has no replay) — tests must not assert on it.
+func observe(t *testing.T, s *Sesssion) (*recordingSub, event.Subscription) {
+	t.Helper()
+	sub, err := s.SubscribeEvents(event.EventFilter{
+		Ephemeral: event.LoopScope{Loops: map[uuid.UUID]struct{}{s.primaryLoopID: {}}},
+		Enduring:  event.LoopScope{All: true},
+	})
+	if err != nil {
+		t.Fatalf("SubscribeEvents: %v", err)
+	}
+	rec := &recordingSub{}
+	go func() {
+		for ev := range sub.Events() {
+			rec.record(ev)
+		}
+	}()
+	return rec, sub
+}
+
+func (r *recordingSub) record(ev event.Event) {
 	r.mu.Lock()
-	r.envs = append(r.envs, env)
+	r.events = append(r.events, ev)
 	r.mu.Unlock()
 }
 
-func (r *recordingSink) sawTerminal() bool {
+func (r *recordingSub) sawTerminal() bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	for _, env := range r.envs {
-		switch env.Event.(type) {
-		case event.TurnInterrupted:
+	for _, ev := range r.events {
+		if _, ok := ev.(event.TurnInterrupted); ok {
 			return true
 		}
 	}
 	return false
 }
 
-// turnCausationID returns the CausationID stamped on the first turn-level
-// envelope (skipping the session-level SessionStarted, which has none). The
-// loop sets envelope CausationID to the issuing UserInput's Header.ID, so a
-// non-zero value here proves the session stamped a fresh Header.ID on the command.
-func (r *recordingSink) turnCausationID() (uuid.UUID, bool) {
+// turnCausationID returns the CausationID stamped on the first turn-level event
+// (a loop-scoped event; session-scoped events carry none). The loop stamps a
+// turn event's CausationID with the issuing UserInput's Header.ID, so a non-zero
+// value here proves the session stamped a fresh Header.ID on the command.
+func (r *recordingSub) turnCausationID() (uuid.UUID, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	for _, env := range r.envs {
-		if _, ok := env.Event.(event.SessionStarted); ok {
+	for _, ev := range r.events {
+		if ev.Scope() == event.ScopeSession {
 			continue
 		}
-		return env.CausationID, true
+		return ev.EventHeader().CausationID, true
 	}
 	return uuid.UUID{}, false
 }
 
-func cfg(client llm.LLM) loop.Config {
-	return loop.Config{Client: client, Model: llm.ModelSpec{Model: "m"}, DrainTimeout: 100 * time.Millisecond}
+// waitTurnCausationID polls turnCausationID until a turn-level event has been
+// drained or the deadline elapses. The drain runs in a goroutine, so an event
+// published by the time a call returns may not yet be in the slice; this bridges
+// that gap deterministically without sleeping a fixed duration.
+func (r *recordingSub) waitTurnCausationID(d time.Duration) (uuid.UUID, bool) {
+	deadline := time.Now().Add(d)
+	for {
+		if cid, ok := r.turnCausationID(); ok {
+			return cid, true
+		}
+		if time.Now().After(deadline) {
+			return uuid.UUID{}, false
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
 }
 
-func cfgWithSink(client llm.LLM, sink event.EventSink) loop.Config {
-	c := cfg(client)
-	c.Sinks = []event.EventSink{sink}
-	return c
+// waitTerminal polls sawTerminal until a TurnInterrupted has been drained or the
+// deadline elapses.
+func (r *recordingSub) waitTerminal(d time.Duration) bool {
+	deadline := time.Now().Add(d)
+	for {
+		if r.sawTerminal() {
+			return true
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+func cfg(client llm.LLM) loop.Config {
+	return loop.Config{Client: client, Model: llm.ModelSpec{Model: "m"}, DrainTimeout: 100 * time.Millisecond}
 }
 
 func TestNewAgent(t *testing.T) {
@@ -464,14 +517,15 @@ func (g *capturingIDGen) first() (uuid.UUID, bool) {
 // fresh, non-zero Header.ID on the command it sends. Each method mints the ID
 // through the session's idGenerator seam, so a non-zero captured value proves
 // the stamp. For Invoke and Stream the loop also copies the command's Header.ID
-// onto each turn envelope's CausationID, so the sink-observed CausationID must
-// equal the captured ID — an end-to-end check that the stamp reaches the loop.
+// onto each turn event's CausationID, so the CausationID observed through a hub
+// Subscription must equal the captured ID — an end-to-end check that the stamp
+// reaches the loop.
 func TestStampsCommandHeaderID(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
 		name        string
 		call        func(t *testing.T, s *Sesssion)
-		observeable bool // true when the stamped ID surfaces via sink CausationID
+		observeable bool // true when the stamped ID surfaces via a turn event's CausationID
 	}{
 		{
 			name: "Invoke",
@@ -521,11 +575,14 @@ func TestStampsCommandHeaderID(t *testing.T) {
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			sink := &recordingSink{}
-			s, err := NewAgent(context.Background(), cfgWithSink(&stubLLM{chunks: []content.Chunk{textChunk("hi")}}, sink))
+			s, err := NewAgent(context.Background(), cfg(&stubLLM{chunks: []content.Chunk{textChunk("hi")}}))
 			if err != nil {
 				t.Fatalf("NewAgent: %v", err)
 			}
+			// Subscribe BEFORE the call so the turn events it triggers are observed
+			// (the hub has no replay; a late subscriber would miss them).
+			rec, sub := observe(t, s)
+			t.Cleanup(func() { _ = sub.Close() })
 			gen := &capturingIDGen{}
 			s.newID = gen.gen
 			t.Cleanup(func() { _ = s.Shutdown(context.Background()) })
@@ -547,12 +604,12 @@ func TestStampsCommandHeaderID(t *testing.T) {
 				if !ok {
 					t.Fatal("session minted no command-Header ID")
 				}
-				cid, ok := sink.turnCausationID()
+				cid, ok := rec.waitTurnCausationID(2 * time.Second)
 				if !ok {
-					t.Fatal("no turn-level envelope captured")
+					t.Fatal("no turn-level event observed via the subscription")
 				}
 				if cid != turnID {
-					t.Fatalf("envelope CausationID = %v, want stamped Header.ID %v", cid, turnID)
+					t.Fatalf("event CausationID = %v, want stamped Header.ID %v", cid, turnID)
 				}
 			}
 		})
@@ -813,15 +870,17 @@ func TestInvokeUnblocksOnLoopDeath(t *testing.T) {
 
 // TestStreamCloseCancelsTurn: closing the stream reader abandons the event
 // stream and cancels the running turn; the session is usable again afterward,
-// and a sink observes the TurnInterrupted terminal event.
+// and a hub Subscription observes the TurnInterrupted terminal event.
 func TestStreamCloseCancelsTurn(t *testing.T) {
 	t.Parallel()
-	sink := &recordingSink{}
-	s, err := NewAgent(context.Background(), cfgWithSink(&stubLLM{blockUntilCancel: true}, sink))
+	s, err := NewAgent(context.Background(), cfg(&stubLLM{blockUntilCancel: true}))
 	if err != nil {
 		t.Fatalf("NewAgent: %v", err)
 	}
 	t.Cleanup(func() { _ = s.Shutdown(context.Background()) })
+	// Subscribe BEFORE the turn so the terminal it triggers on Close is observed.
+	rec, sub := observe(t, s)
+	t.Cleanup(func() { _ = sub.Close() })
 
 	sr, err := s.Stream(context.Background(), nil)
 	if err != nil {
@@ -836,14 +895,11 @@ func TestStreamCloseCancelsTurn(t *testing.T) {
 		t.Fatalf("Close: %v", err)
 	}
 
-	// give the actor a moment to process the abandon + cancel and publish the
-	// interrupted terminal to the sink.
-	deadline := time.Now().Add(time.Second)
-	for time.Now().Before(deadline) && !sink.sawTerminal() {
-		time.Sleep(5 * time.Millisecond)
-	}
-	if !sink.sawTerminal() {
-		t.Error("sink did not observe TurnInterrupted after Close")
+	// the actor processes the abandon + cancel and publishes the interrupted
+	// terminal to the hub; the recorder's drain goroutine records it. Poll until
+	// observed (or the deadline elapses).
+	if !rec.waitTerminal(time.Second) {
+		t.Error("subscription did not observe TurnInterrupted after Close")
 	}
 
 	// session must be usable again: a subsequent Invoke is accepted by the loop

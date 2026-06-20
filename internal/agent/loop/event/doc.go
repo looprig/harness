@@ -38,18 +38,6 @@ var (
 	// Gate/tool lifecycle events.
 	_ Event = PermissionRequested{}
 	_ Event = UserInputRequested{}
-	_ Event = UserInputRequestedSink{}
 	_ Event = ToolCallStarted{}
 	_ Event = ToolCallCompleted{}
-)
-
-// Redactable-satisfaction assertions for the events that carry sensitive payload.
-// These pin which events provide a SinkProjection; the runtime test
-// TestRedactableImplementations enforces the complementary "must NOT redact" set.
-var (
-	_ Redactable = PermissionRequested{}
-	_ Redactable = UserInputRequested{}
-	_ Redactable = ToolCallCompleted{}
-	_ Redactable = TokenDelta{}
-	_ Redactable = TurnDone{}
 )

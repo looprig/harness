@@ -69,12 +69,11 @@ func TestInboxPopIDGenFailureReturnsEntry(t *testing.T) {
 	t.Cleanup(cancel)
 	sessionID, _ := uuid.New()
 	loopID, _ := uuid.New()
-	sink := &captureSink{}
-	l, err := New(ctx, sessionID, loopID, Provenance{}, noopPublisher{}, Config{
+	rec := &recordingPublisher{}
+	l, err := New(ctx, sessionID, loopID, Provenance{}, rec, Config{
 		Client:       client,
 		Model:        llm.ModelSpec{Model: "m"},
 		Tools:        ts,
-		Sinks:        []event.EventSink{sink},
 		DrainTimeout: 500 * time.Millisecond,
 		idGen:        gen.gen,
 	})
@@ -89,7 +88,7 @@ func TestInboxPopIDGenFailureReturnsEntry(t *testing.T) {
 	client.onStreamN = map[int]func(){
 		0: func() {
 			l.Commands <- command.UserInput{Header: command.Header{ID: queuedID}, Mode: command.AllowFold}
-			if _, ok := awaitReply(t, sink, queuedID).(event.InputQueued); !ok {
+			if _, ok := awaitReply(t, rec, queuedID).(event.InputQueued); !ok {
 				t.Errorf("queued submit during final step not InputQueued")
 			}
 			gen.fail()
@@ -106,9 +105,9 @@ func TestInboxPopIDGenFailureReturnsEntry(t *testing.T) {
 
 	// The popped entry must NOT be stranded: it must surface as
 	// InputCancelled{CancelTurnFailed}. (Before the fix it is silently dropped.)
-	blockUntilSink(t, sink, func(evs []event.EventEnvelope) bool {
+	blockUntilEvents(t, rec, func(evs []event.Event) bool {
 		for _, e := range evs {
-			if ic, ok := e.Event.(event.InputCancelled); ok &&
+			if ic, ok := e.(event.InputCancelled); ok &&
 				ic.InputID == queuedID && ic.Reason == event.CancelTurnFailed {
 				return true
 			}
@@ -117,8 +116,8 @@ func TestInboxPopIDGenFailureReturnsEntry(t *testing.T) {
 	})
 
 	// And no second turn ever started from the popped entry.
-	for _, e := range sink.events() {
-		if ts, ok := e.Event.(event.TurnStarted); ok && ts.InputID == queuedID {
+	for _, e := range rec.events() {
+		if ts, ok := e.(event.TurnStarted); ok && ts.InputID == queuedID {
 			t.Fatal("popped entry was auto-started despite id-gen failure, want InputCancelled")
 		}
 	}

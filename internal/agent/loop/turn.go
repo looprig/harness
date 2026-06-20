@@ -171,10 +171,9 @@ func runTurn(ctx context.Context, cfg turnConfig, ts turnState) event.Event {
 		}
 
 		// Mint this step's id BEFORE streaming so StepDone can be stamped from the
-		// step's identity. Best-effort, mirroring the EventID mint in publish: a
-		// crypto/rand failure here is a system-level fault that must not abort an
-		// already-accepted turn, so log it and stamp a zero StepID rather than
-		// dropping the step.
+		// step's identity. Best-effort: a crypto/rand failure here is a system-level
+		// fault that must not abort an already-accepted turn, so log it and stamp a
+		// zero StepID rather than dropping the step.
 		stepID, err := cfg.idGen()
 		if err != nil {
 			slog.Error("step id generation failed; stamping StepDone with zero StepID", "error", err)

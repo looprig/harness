@@ -13,61 +13,19 @@ import (
 	"github.com/inventivepotter/urvi/internal/uuid"
 )
 
-// awaitReply polls the captured sink for the published event.Reply whose
-// CausationID == inputID (the submit's outcome: TurnStarted, InputQueued, or
-// TurnRejected) and returns it. The loop now PUBLISHES the submit outcome onto the
-// session fan-in instead of replying a command.Disposition, so a test observes the
-// outcome here rather than on a reply channel. It fails if no matching reply lands
-// within the deadline.
-func awaitReply(t *testing.T, sink *captureSink, inputID uuid.UUID) event.Event {
-	t.Helper()
-	deadline := time.After(2 * time.Second)
-	for {
-		for _, e := range sink.events() {
-			r, ok := e.Event.(event.Reply)
-			if !ok || r.ReplyTo() != inputID {
-				continue
-			}
-			return e.Event
-		}
-		select {
-		case <-deadline:
-			t.Fatalf("no Reply for input %v within deadline", inputID)
-			return nil
-		case <-time.After(2 * time.Millisecond):
-		}
-	}
-}
-
 // submitUserInput sends an AllowFold/StartOnly UserInput (fan-in only) with the
 // given id and returns the published outcome event (TurnStarted/InputQueued/
-// TurnRejected) observed via the sink. It is the interactive submit path (no
-// per-turn stream).
-func submitUserInput(t *testing.T, l *Loop, sink *captureSink, id uuid.UUID, mode command.InputMode) event.Event {
+// TurnRejected) observed via the recording publisher. It is the interactive submit
+// path (no per-turn stream).
+func submitUserInput(t *testing.T, l *Loop, rec *recordingPublisher, id uuid.UUID, mode command.InputMode) event.Event {
 	t.Helper()
 	l.Commands <- command.UserInput{Header: command.Header{ID: id}, Mode: mode}
-	return awaitReply(t, sink, id)
+	return awaitReply(t, rec, id)
 }
 
 // textBlocks wraps a string in a one-element block slice.
 func textBlocks(s string) []content.Block {
 	return []content.Block{&content.TextBlock{Text: s}}
-}
-
-// blockUntilSink waits until pred sees the captured sink events, or fails.
-func blockUntilSink(t *testing.T, sink *captureSink, pred func([]event.EventEnvelope) bool) {
-	t.Helper()
-	deadline := time.After(2 * time.Second)
-	for {
-		if pred(sink.events()) {
-			return
-		}
-		select {
-		case <-deadline:
-			t.Fatal("sink condition not met within deadline")
-		case <-time.After(2 * time.Millisecond):
-		}
-	}
 }
 
 // TestSubmitToIdleStartsTurn: an AllowFold UserInput to an idle loop publishes
@@ -76,13 +34,12 @@ func blockUntilSink(t *testing.T, sink *captureSink, pred func([]event.EventEnve
 // outcome.
 func TestSubmitToIdleStartsTurn(t *testing.T) {
 	t.Parallel()
-	sink := &captureSink{}
-	l, _ := newLoop(t, &fakeLLM{chunks: []content.Chunk{textChunk("hi")}}, sink)
+	l, rec, _ := newLoopRec(t, &fakeLLM{chunks: []content.Chunk{textChunk("hi")}})
 
 	inputID := mustID(t)
 	l.Commands <- command.UserInput{Header: command.Header{ID: inputID}, Mode: command.AllowFold, Blocks: textBlocks("hello")}
 
-	ev := awaitReply(t, sink, inputID)
+	ev := awaitReply(t, rec, inputID)
 	started, ok := ev.(event.TurnStarted)
 	if !ok {
 		t.Fatalf("outcome = %T, want event.TurnStarted", ev)
@@ -103,14 +60,13 @@ func TestSubmitToIdleStartsTurn(t *testing.T) {
 // event.TurnStarted.
 func TestSubagentResultToIdleStartsTurn(t *testing.T) {
 	t.Parallel()
-	sink := &captureSink{}
-	l, _ := newLoop(t, &fakeLLM{chunks: []content.Chunk{textChunk("hi")}}, sink)
+	l, rec, _ := newLoopRec(t, &fakeLLM{chunks: []content.Chunk{textChunk("hi")}})
 
 	inputID := mustID(t)
 	fromLoop := mustID(t)
 	l.Commands <- command.SubagentResult{Header: command.Header{ID: inputID}, FromLoopID: fromLoop, Blocks: textBlocks("subagent output")}
 
-	ev := awaitReply(t, sink, inputID)
+	ev := awaitReply(t, rec, inputID)
 	started, ok := ev.(event.TurnStarted)
 	if !ok || started.InputID != inputID {
 		t.Fatalf("outcome = %+v, want event.TurnStarted{InputID:%v}", ev, inputID)
@@ -125,16 +81,15 @@ func TestSubagentResultToIdleStartsTurn(t *testing.T) {
 // held in the inbox in order.
 func TestSubmitToRunningQueueableQueues(t *testing.T) {
 	t.Parallel()
-	sink := &captureSink{}
 	// blockUntilCancel keeps the first turn running so the second submit queues.
-	l, _ := newLoop(t, &fakeLLM{blockUntilCancel: true}, sink)
+	l, rec, _ := newLoopRec(t, &fakeLLM{blockUntilCancel: true})
 	ev1, _ := startTurn(t, l, context.Background(), nil) // StartOnly: occupies the loop
 	_ = ev1
 
 	idA := mustID(t)
 	idB := mustID(t)
-	qA := submitUserInput(t, l, sink, idA, command.AllowFold)
-	qB := submitUserInput(t, l, sink, idB, command.AllowFold)
+	qA := submitUserInput(t, l, rec, idA, command.AllowFold)
+	qB := submitUserInput(t, l, rec, idB, command.AllowFold)
 
 	for _, tc := range []struct {
 		name string
@@ -164,15 +119,14 @@ func TestSubmitToRunningQueueableQueues(t *testing.T) {
 // event.
 func TestSubagentResultToFullInboxQueues(t *testing.T) {
 	t.Parallel()
-	sink := &captureSink{}
-	l, _ := newLoop(t, &fakeLLM{blockUntilCancel: true}, sink)
+	l, rec, _ := newLoopRec(t, &fakeLLM{blockUntilCancel: true})
 	ev1, _ := startTurn(t, l, context.Background(), nil) // occupy the loop
 	_ = ev1
 
 	// Fill the inbox to capacity with AllowFold UserInputs.
 	for i := 0; i < inboxCap; i++ {
 		id := mustID(t)
-		if _, ok := submitUserInput(t, l, sink, id, command.AllowFold).(event.InputQueued); !ok {
+		if _, ok := submitUserInput(t, l, rec, id, command.AllowFold).(event.InputQueued); !ok {
 			t.Fatalf("submit %d: want event.InputQueued", i)
 		}
 	}
@@ -181,7 +135,7 @@ func TestSubagentResultToFullInboxQueues(t *testing.T) {
 	fromLoop := mustID(t)
 	srID := mustID(t)
 	l.Commands <- command.SubagentResult{Header: command.Header{ID: srID}, FromLoopID: fromLoop, Blocks: textBlocks("subagent output")}
-	ev := awaitReply(t, sink, srID)
+	ev := awaitReply(t, rec, srID)
 	q, ok := ev.(event.InputQueued)
 	if !ok {
 		t.Fatalf("SubagentResult to full inbox outcome = %T, want event.InputQueued (never rejected)", ev)
@@ -205,18 +159,27 @@ func TestSubagentResultIDGenerationFailureCancels(t *testing.T) {
 	genErr := errors.New("rand source exhausted")
 	tests := []struct {
 		name    string
-		okCount int // SessionStarted EventID (call #1) ok; TurnID (call #2) fails
+		okCount int // TurnID is the first id minted for the submit; okCount 0 fails it
 	}{
-		{name: "turn id mint fails", okCount: 1},
-		{name: "all id mints fail", okCount: 0},
+		{name: "turn id mint fails", okCount: 0},
 	}
 	for _, tt := range tests {
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			sink := &captureSink{}
+			rec := &recordingPublisher{}
 			gen := &countedIDGen{okCount: tt.okCount, err: genErr}
-			l := newLoopWithIDGen(t, &fakeLLM{chunks: []content.Chunk{textChunk("hi")}}, gen.gen, sink)
+			ctx, cancel := context.WithCancel(context.Background())
+			t.Cleanup(cancel)
+			l, err := New(ctx, mustID(t), mustID(t), Provenance{}, rec, Config{
+				Client:       &fakeLLM{chunks: []content.Chunk{textChunk("hi")}},
+				Model:        llm.ModelSpec{Model: "m"},
+				DrainTimeout: 200 * time.Millisecond,
+				idGen:        gen.gen,
+			})
+			if err != nil {
+				t.Fatalf("New: %v", err)
+			}
 
 			inputID := mustID(t)
 			fromLoop := mustID(t)
@@ -229,7 +192,7 @@ func TestSubagentResultIDGenerationFailureCancels(t *testing.T) {
 			// A never-rejected SubagentResult that cannot mint its TurnID resolves as
 			// InputCancelled{CancelTurnFailed} (the {wake} release rides this Enduring event),
 			// recognised on the fan-in via ReplyTo() == its command id.
-			ev := awaitReply(t, sink, inputID)
+			ev := awaitReply(t, rec, inputID)
 			ic, ok := ev.(event.InputCancelled)
 			if !ok {
 				t.Fatalf("outcome = %T, want event.InputCancelled (SubagentResult is never rejected)", ev)
@@ -245,8 +208,8 @@ func TestSubagentResultIDGenerationFailureCancels(t *testing.T) {
 			}
 
 			// It must NOT be rejected: a TurnRejected would not carry/release the {wake} token.
-			for _, e := range sink.events() {
-				if rej, ok := e.Event.(event.TurnRejected); ok && rej.InputID == inputID {
+			for _, e := range rec.events() {
+				if rej, ok := e.(event.TurnRejected); ok && rej.InputID == inputID {
 					t.Fatalf("SubagentResult was rejected (%+v); a SubagentResult is never rejected", rej)
 				}
 			}
@@ -259,8 +222,7 @@ func TestSubagentResultIDGenerationFailureCancels(t *testing.T) {
 // same reason is delivered on the caller's per-turn stream, which is then closed.
 func TestStartOnlyBusyRejected(t *testing.T) {
 	t.Parallel()
-	sink := &captureSink{}
-	l, _ := newLoop(t, &fakeLLM{blockUntilCancel: true}, sink)
+	l, rec, _ := newLoopRec(t, &fakeLLM{blockUntilCancel: true})
 	ev1, _ := startTurn(t, l, context.Background(), nil)
 	_ = ev1
 
@@ -284,7 +246,7 @@ func TestStartOnlyBusyRejected(t *testing.T) {
 	}
 
 	// And the published fan-in event mirrors it (CausationID == InputID).
-	pub, ok := awaitReply(t, sink, id).(event.TurnRejected)
+	pub, ok := awaitReply(t, rec, id).(event.TurnRejected)
 	if !ok || pub.Reason != event.RejectBusy || pub.InputID != id {
 		t.Fatalf("published outcome = %+v, want event.TurnRejected{RejectBusy, InputID:%v}", pub, id)
 	}
@@ -295,21 +257,20 @@ func TestStartOnlyBusyRejected(t *testing.T) {
 // blocks).
 func TestInboxFullRejected(t *testing.T) {
 	t.Parallel()
-	sink := &captureSink{}
-	l, _ := newLoop(t, &fakeLLM{blockUntilCancel: true}, sink)
+	l, rec, _ := newLoopRec(t, &fakeLLM{blockUntilCancel: true})
 	ev1, _ := startTurn(t, l, context.Background(), nil) // occupy the loop
 	_ = ev1
 
 	// Fill the inbox to capacity.
 	for i := 0; i < inboxCap; i++ {
 		id := mustID(t)
-		if _, ok := submitUserInput(t, l, sink, id, command.AllowFold).(event.InputQueued); !ok {
+		if _, ok := submitUserInput(t, l, rec, id, command.AllowFold).(event.InputQueued); !ok {
 			t.Fatalf("submit %d: want event.InputQueued", i)
 		}
 	}
 	// One more: the queue is full.
 	id := mustID(t)
-	ev := submitUserInput(t, l, sink, id, command.AllowFold)
+	ev := submitUserInput(t, l, rec, id, command.AllowFold)
 	rej, ok := ev.(event.TurnRejected)
 	if !ok || rej.Reason != event.RejectQueueFull {
 		t.Fatalf("outcome = %+v, want event.TurnRejected{RejectQueueFull}", ev)
@@ -320,8 +281,7 @@ func TestInboxFullRejected(t *testing.T) {
 // rejected with event.TurnRejected{RejectShuttingDown}.
 func TestShuttingDownRejected(t *testing.T) {
 	t.Parallel()
-	sink := &captureSink{}
-	l, _ := newLoop(t, &fakeLLM{blockUntilCancel: true}, sink)
+	l, rec, _ := newLoopRec(t, &fakeLLM{blockUntilCancel: true})
 	ev1, _ := startTurn(t, l, context.Background(), nil)
 	_ = ev1
 
@@ -342,7 +302,7 @@ func TestShuttingDownRejected(t *testing.T) {
 			<-sack
 			return
 		}
-		if rej, ok := awaitReplyOrNil(sink, id).(event.TurnRejected); ok && rej.Reason == event.RejectShuttingDown {
+		if rej, ok := awaitReplyOrNil(rec, id).(event.TurnRejected); ok && rej.Reason == event.RejectShuttingDown {
 			<-sack
 			return
 		}
@@ -355,13 +315,12 @@ func TestShuttingDownRejected(t *testing.T) {
 }
 
 // awaitReplyOrNil returns the published Reply for inputID if one is already in the
-// sink, else nil (non-blocking single sweep). TestShuttingDownRejected uses it to
-// poll without failing on a not-yet-rejected submit.
-func awaitReplyOrNil(sink *captureSink, inputID uuid.UUID) event.Event {
-	for _, e := range sink.events() {
-		r, ok := e.Event.(event.Reply)
-		if ok && r.ReplyTo() == inputID {
-			return e.Event
+// recording publisher, else nil (non-blocking single sweep). TestShuttingDownRejected
+// uses it to poll without failing on a not-yet-rejected submit.
+func awaitReplyOrNil(rec *recordingPublisher, inputID uuid.UUID) event.Event {
+	for _, e := range rec.events() {
+		if r, ok := e.(event.Reply); ok && r.ReplyTo() == inputID {
+			return e
 		}
 	}
 	return nil
@@ -385,9 +344,9 @@ func TestNormalCompletionPopsInbox(t *testing.T) {
 	t.Cleanup(cancel)
 	sessionID, _ := uuid.New()
 	loopID, _ := uuid.New()
-	sink := &captureSink{}
-	l, err := New(ctx, sessionID, loopID, Provenance{}, noopPublisher{},
-		Config{Client: client, Model: llm.ModelSpec{Model: "m"}, Tools: ts, Sinks: []event.EventSink{sink}, DrainTimeout: 500 * time.Millisecond})
+	rec := &recordingPublisher{}
+	l, err := New(ctx, sessionID, loopID, Provenance{}, rec,
+		Config{Client: client, Model: llm.ModelSpec{Model: "m"}, Tools: ts, DrainTimeout: 500 * time.Millisecond})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -412,9 +371,9 @@ func TestNormalCompletionPopsInbox(t *testing.T) {
 
 	// Turn 1 completes normally (TurnDone); the actor pops the queued entry and starts
 	// turn 2 from it. A second event.TurnStarted must appear carrying the queued InputID.
-	blockUntilSink(t, sink, func(evs []event.EventEnvelope) bool {
+	blockUntilEvents(t, rec, func(evs []event.Event) bool {
 		for _, e := range evs {
-			if ts, ok := e.Event.(event.TurnStarted); ok && ts.InputID == queuedID {
+			if ts, ok := e.(event.TurnStarted); ok && ts.InputID == queuedID {
 				return true
 			}
 		}
