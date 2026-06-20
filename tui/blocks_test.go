@@ -45,6 +45,42 @@ func TestBuildBlocksTextOnly(t *testing.T) {
 	}
 }
 
+// TestSplitInputPreservesFormatting locks the fix for multi-line input being
+// flattened: splitInput must keep the prompt's newlines (and in-line spacing) verbatim
+// while still pulling out @path attachments, instead of reflowing everything through
+// Fields/Join.
+func TestSplitInputPreservesFormatting(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		input      string
+		wantPrompt string
+		wantAttach []string
+	}{
+		{name: "single line unchanged", input: "hello world", wantPrompt: "hello world"},
+		{name: "newlines preserved", input: "line one\nline two", wantPrompt: "line one\nline two"},
+		{name: "indentation preserved", input: "func f() {\n\treturn 1\n}", wantPrompt: "func f() {\n\treturn 1\n}"},
+		{name: "blank line preserved", input: "a\n\nb", wantPrompt: "a\n\nb"},
+		{name: "outer whitespace trimmed", input: "  hi there  ", wantPrompt: "hi there"},
+		{name: "attachment extracted, newlines kept", input: "@a.txt explain\nthis code", wantPrompt: "explain\nthis code", wantAttach: []string{"a.txt"}},
+		{name: "only attachment", input: "@a.txt", wantPrompt: "", wantAttach: []string{"a.txt"}},
+		{name: "empty", input: "", wantPrompt: ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			prompt, attach := splitInput(tt.input)
+			if prompt != tt.wantPrompt {
+				t.Errorf("splitInput(%q) prompt = %q, want %q", tt.input, prompt, tt.wantPrompt)
+			}
+			if strings.Join(attach, "\x00") != strings.Join(tt.wantAttach, "\x00") {
+				t.Errorf("splitInput(%q) attachments = %v, want %v", tt.input, attach, tt.wantAttach)
+			}
+		})
+	}
+}
+
 func TestBuildBlocksEmptyInput(t *testing.T) {
 	t.Parallel()
 	tests := []struct {

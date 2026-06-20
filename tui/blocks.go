@@ -78,18 +78,34 @@ func buildBlocks(input string, allowImages bool) ([]content.Block, error) {
 	return blocks, nil
 }
 
-// splitInput tokenizes on whitespace, separating @path attachments from the
-// remaining words, which rejoin single-spaced into the prompt text.
+// splitInput separates @path attachments from the prompt text. An attachment is a
+// whitespace-delimited token starting with '@' (len > 1). The REST of the text is kept
+// VERBATIM — preserving the user's newlines and in-line spacing — rather than reflowed
+// through Fields/Join (which collapsed every run of whitespace, including newlines, to a
+// single space and silently flattened multi-line input). With no attachments the input
+// is returned unchanged but for outer trimming; with attachments the @tokens are removed
+// line-by-line so the surrounding newlines still survive.
 func splitInput(input string) (prompt string, attachments []string) {
-	var words []string
 	for _, tok := range strings.Fields(input) {
 		if len(tok) > 1 && tok[0] == '@' {
 			attachments = append(attachments, tok[1:])
-			continue
 		}
-		words = append(words, tok)
 	}
-	return strings.Join(words, " "), attachments
+	if len(attachments) == 0 {
+		return strings.TrimSpace(input), nil
+	}
+	var lines []string
+	for _, line := range strings.Split(input, "\n") {
+		var kept []string
+		for _, tok := range strings.Fields(line) {
+			if len(tok) > 1 && tok[0] == '@' {
+				continue // already collected above
+			}
+			kept = append(kept, tok)
+		}
+		lines = append(lines, strings.Join(kept, " "))
+	}
+	return strings.TrimSpace(strings.Join(lines, "\n")), attachments
 }
 
 // buildAttachment classifies path, then (only for an accepted classification)
