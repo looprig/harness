@@ -54,9 +54,15 @@ type Screen struct {
 
 	// anim holds the LIVE-surface animation state (blink phase + spinner frame +
 	// ticking guard). It is advanced once per blinkTick while Running, threaded into
-	// renderLiveTail ONLY, and reset to its zero value when the turn ends. The committed
-	// scrollback path never consults it. See animState and the blinkMsg handler.
+	// renderLiveTail AND the status dot (its blink phase pulses the waiting/thinking
+	// dot), and reset to its zero value when the turn ends. The committed scrollback
+	// path never consults it. See animState and the blinkMsg handler.
 	anim animState
+
+	// tip is the rotating educational hint shown faint below the status line. It is
+	// seeded at construction and refreshed (nextTip) on every turn terminal, so a fresh
+	// hint shows after each turn.
+	tip string
 }
 
 // AgentBanner is the agent metadata shown as the startup info notice — its Name and
@@ -102,6 +108,7 @@ func New(ctx context.Context, agent Agent, open OpenAgent, banner AgentBanner) S
 		scrollback:  newScrollbackModel(0),
 		interaction: newInteractionModel(),
 		expand:      true,
+		tip:         nextTip(""),
 	}
 }
 
@@ -219,6 +226,7 @@ func (m *Screen) applyTurnStatus(ev event.Event) tea.Cmd {
 		return m.startBlink()
 	case event.TurnDone, event.TurnFailed, event.TurnInterrupted:
 		m.status = StatusIdle
+		m.tip = nextTip(m.tip) // rotate the hint after each completed turn
 		return nil
 	default:
 		return nil
@@ -385,6 +393,8 @@ func (m Screen) View() tea.View {
 		Queued:      m.renderQueued(),
 		Status:      m.status,
 		StatusState: m.statusInputs(),
+		Blink:       m.anim.blink,
+		Tip:         m.tip,
 		Width:       m.width,
 		Height:      m.height,
 	}))

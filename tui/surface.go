@@ -11,8 +11,9 @@ import (
 // history, so there is no transcript viewport — only a capped live tail, a
 // separator rule, the bottom box, an optional slash panel, and one status line.
 const (
-	statusH    = 1 // the single status line at the very bottom
+	statusH    = 1 // the single status line
 	statusPadH = 1 // a blank line between the bottom box and the status line
+	tipH       = 1 // the rotating Tips line at the very bottom, below the status line
 	boxBorderH = 2 // the bottom box's top + bottom frame rows (a prompt box's border; the minimal composer has none, so this over-reserves harmlessly in compose mode)
 )
 
@@ -42,6 +43,8 @@ type surfaceInputs struct {
 	Queued        string // pre-rendered dim queued-input affordance lines (below the live tail)
 	Status        Status
 	StatusState   statusInputs
+	Blink         bool   // live-surface blink phase, pulses the status dot while waiting/thinking
+	Tip           string // the rotating hint shown faint on the Tips line at the very bottom
 	Width, Height int
 }
 
@@ -66,7 +69,8 @@ type surfaceInputs struct {
 func surfaceView(in surfaceInputs) string {
 	bottom := bottomBox(in)
 	slash := slashPanel(in.Interaction)
-	status := renderStatusLine(in.Status, in.StatusState)
+	status := renderStatusLine(in.Status, in.StatusState, in.Blink)
+	tip := renderTip(in.Tip)
 
 	contentH := bottomContentHeight(in)
 	// The queued affordance and slash panel are first-class reserved rows: they sit
@@ -75,9 +79,9 @@ func surfaceView(in surfaceInputs) string {
 	// the logical line count equal to the physical row count the v2 inline renderer
 	// requires (see clampSurfaceWidth).
 	reserved := lipgloss.Height(slash) + queuedHeight(in.Queued)
-	// statusPadH (the blank line above the status row) is reserved alongside statusH so
-	// the tail budget accounts for it.
-	capacity := liveTailCap(in.Height, statusH+statusPadH, reserved, contentH)
+	// statusPadH (the blank above the status row) and tipH (the Tips line below it) are
+	// reserved alongside statusH so the tail budget accounts for the whole bottom chrome.
+	capacity := liveTailCap(in.Height, statusH+statusPadH+tipH, reserved, contentH)
 
 	// The live tail carries a trailing blank line, mirroring the one
 	// scrollbackModel.Flush appends after every committed entry — so the gap below the
@@ -97,12 +101,14 @@ func surfaceView(in surfaceInputs) string {
 	rows = appendNonEmpty(rows, bottom)
 	rows = appendNonEmpty(rows, slash)
 	// A blank line of padding (statusPadH) separates the bottom box from the status
-	// row, which is always present (statusLabel never returns ""): it reads "▸ idle" at
+	// row, which is always present (statusLabel never returns ""): it reads "○ idle" at
 	// rest and the live label during a turn. Keeping the row whatever the state holds
 	// the composer's vertical position stable across the turn (both rows are budgeted).
+	// The rotating Tips line (tipH), when present, sits on the very bottom below it.
 	if status != "" {
 		rows = append(rows, "", status)
 	}
+	rows = appendNonEmpty(rows, tip)
 	return clampSurfaceWidth(strings.Join(rows, "\n"), in.Width)
 }
 

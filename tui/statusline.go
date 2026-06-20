@@ -6,6 +6,7 @@ import "github.com/inventivepotter/urvi/tui/styles"
 // derived from the session Status plus the live interaction signals.
 const (
 	labelIdle         = "idle"
+	labelWaiting      = "waiting…"
 	labelStreaming    = "streaming…"
 	labelThinking     = "thinking…"
 	labelApproval     = "awaiting approval"
@@ -28,10 +29,10 @@ type statusInputs struct {
 // statusLabel derives the active-surface status label (design §"Thinking & status
 // line"). A pending prompt takes precedence over the streaming/thinking signals (its
 // awaiting-* label is clearer); interrupting/clearing come straight from the session
-// status; an idle session reads "idle". A Running turn with no live signal yet — the
-// request is in flight but nothing has streamed back — reads "thinking…" (the same as
-// when only thinking chunks have arrived), so the gap between submitting and the first
-// token is never blank. statusLabel never returns "".
+// status; an idle session reads "idle". A Running turn progresses through the live
+// signals: "waiting…" the moment it starts (request in flight, no token back yet) →
+// "thinking…" once thinking chunks arrive → "streaming…" once narration text streams.
+// statusLabel never returns "".
 func statusLabel(status Status, in statusInputs) string {
 	switch status {
 	case StatusInterrupting:
@@ -48,10 +49,11 @@ func statusLabel(status Status, in statusInputs) string {
 		return labelInput
 	case in.streaming:
 		return labelStreaming
-	default:
-		// Thinking chunks present, OR a freshly-started turn still waiting for the
-		// model's first token — both read as "thinking…".
+	case in.thinking:
 		return labelThinking
+	default:
+		// Running, but nothing has streamed back yet — the request is in flight.
+		return labelWaiting
 	}
 }
 
@@ -61,20 +63,57 @@ func statusLabel(status Status, in statusInputs) string {
 // — refines it via renderStatusLine. The empty label renders to "", every other
 // label through the faint StatusStyle. Retained for callers holding only the status.
 func RenderStatusLine(s Status) string {
-	return renderStatusLine(s, statusInputs{thinking: s == StatusRunning})
+	return renderStatusLine(s, statusInputs{thinking: s == StatusRunning}, false)
 }
 
-// statusIcon is the small play glyph prefixing the status line.
-const statusIcon = "▸"
+// Status-line dot glyphs: a hollow ring at rest, a filled dot while a turn is live.
+const (
+	dotHollow = "○"
+	dotFilled = "●"
+)
+
+// renderTip renders the rotating educational hint as a faint "Tips: …" line below the
+// status row, or "" when there is no tip (so the surface omits the row).
+func renderTip(tip string) string {
+	if tip == "" {
+		return ""
+	}
+	return styles.StatusStyle.Render("Tips: " + tip)
+}
 
 // renderStatusLine styles the derived label through the faint StatusStyle, prefixed by
-// the small play icon. statusLabel always returns a non-empty label (idle reads
-// "idle"), so the status row is always present below the composer; the empty-label
-// guard is a defensive no-op.
-func renderStatusLine(status Status, in statusInputs) string {
+// the status dot (see statusDot). blink is the live-surface blink phase, used to pulse
+// the dot while waiting/thinking. statusLabel always returns a non-empty label (idle
+// reads "idle"), so the status row is always present below the composer; the
+// empty-label guard is a defensive no-op.
+func renderStatusLine(status Status, in statusInputs, blink bool) string {
 	label := statusLabel(status, in)
 	if label == "" {
 		return ""
 	}
-	return styles.StatusStyle.Render(statusIcon + " " + label)
+	return statusDot(status, in, blink) + " " + styles.StatusStyle.Render(label)
+}
+
+// statusDot renders the leading status dot for the current state:
+//   - idle: a faint hollow ring (○) — the resting cue.
+//   - actively working (Running, not blocked on a prompt) with text streaming: a solid
+//     lit (lime) dot.
+//   - actively working but still waiting/thinking (no narration yet): a filled dot that
+//     pulses lime ↔ white on the blink phase, a gentle "the model is cogitating" beat.
+//   - otherwise (awaiting a prompt, interrupting, clearing): a faint filled dot.
+func statusDot(status Status, in statusInputs, blink bool) string {
+	if status == StatusIdle {
+		return styles.StatusStyle.Render(dotHollow)
+	}
+	working := status == StatusRunning && !in.permissionActive && !in.userInputActive
+	switch {
+	case !working:
+		return styles.StatusStyle.Render(dotFilled)
+	case in.streaming:
+		return styles.StatusWorkingStyle.Render(dotFilled)
+	case blink:
+		return styles.StatusWorkingStyle.Render(dotFilled) // lit (lime)
+	default:
+		return styles.StatusWorkingAltStyle.Render(dotFilled) // blink alternate (white)
+	}
 }

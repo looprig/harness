@@ -48,6 +48,13 @@ var (
 	UserStyle        = lipgloss.NewStyle().Bold(true)
 	InterruptedStyle = lipgloss.NewStyle().Faint(true).Italic(true)
 	StatusStyle      = lipgloss.NewStyle().Faint(true)
+	// StatusWorkingStyle / StatusWorkingAltStyle are the two phases of the status-line
+	// icon while the model is actively working: lit (the assistant lime) and its blink
+	// alternate (white). Waiting/thinking alternate between them on the blink tick for a
+	// gentle pulse; streaming holds the lit lime. At rest / when blocked the icon falls
+	// back to the faint StatusStyle.
+	StatusWorkingStyle    = lipgloss.NewStyle().Foreground(DotColor)
+	StatusWorkingAltStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("15"))
 	// QueuedStyle renders the transient queued-input affordance — the pending,
 	// not-yet-running echo of a submitted user message shown below the live tail. It
 	// is FAINT (not bold like UserStyle) so a queued line reads as a quieter "this is
