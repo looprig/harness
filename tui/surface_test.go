@@ -14,7 +14,7 @@ import (
 
 // TestLiveTailCap covers the pure active-surface budget: the live tail gets the
 // terminal height minus the status line, the slash panel (when visible), and the
-// bottom box (separator + box border + content). It is floored at 0 and never
+// bottom box (box frame + content; no separator row). It is floored at 0 and never
 // negative.
 func TestLiveTailCap(t *testing.T) {
 	t.Parallel()
@@ -24,12 +24,12 @@ func TestLiveTailCap(t *testing.T) {
 		term, statusH, slashH, contentH int
 		want                            int
 	}{
-		{name: "ample room", term: 40, statusH: 1, slashH: 0, contentH: 1, want: 35},
-		// bottomH = sep(1) + border(2) + content(1) = 4; 40 - 1 - 0 - 4 = 35
-		{name: "with slash panel", term: 40, statusH: 1, slashH: 3, contentH: 1, want: 32},
-		{name: "grown composer shrinks tail", term: 40, statusH: 1, slashH: 0, contentH: 10, want: 26},
-		{name: "exact fit floors at zero", term: 5, statusH: 1, slashH: 0, contentH: 1, want: 0},
-		// bottomH = 4; 5 - 1 - 0 - 4 = 0
+		{name: "ample room", term: 40, statusH: 1, slashH: 0, contentH: 1, want: 36},
+		// bottomH = box frame(2) + content(1) = 3; 40 - 1 - 0 - 3 = 36 (no separator row)
+		{name: "with slash panel", term: 40, statusH: 1, slashH: 3, contentH: 1, want: 33},
+		{name: "grown composer shrinks tail", term: 40, statusH: 1, slashH: 0, contentH: 10, want: 27},
+		{name: "exact fit floors at zero", term: 4, statusH: 1, slashH: 0, contentH: 1, want: 0},
+		// bottomH = 3; 4 - 1 - 0 - 3 = 0
 		{name: "overflow floored at zero never negative", term: 3, statusH: 1, slashH: 0, contentH: 1, want: 0},
 		{name: "tiny terminal floored at zero", term: 0, statusH: 1, slashH: 0, contentH: 1, want: 0},
 	}
@@ -51,8 +51,8 @@ func TestLiveTailCap(t *testing.T) {
 }
 
 // TestSurfaceViewCompose covers the composed active surface in compose mode: the
-// capped live tail, then the separator rule, then the composer box, then the status
-// line — top to bottom, no transcript viewport.
+// capped live tail, then the borderless composer panel (no separator rule), then the
+// status line — top to bottom, no transcript viewport.
 func TestSurfaceViewCompose(t *testing.T) {
 	t.Parallel()
 
@@ -74,16 +74,17 @@ func TestSurfaceViewCompose(t *testing.T) {
 			t.Errorf("surfaceView missing %q in:\n%s", sub, got)
 		}
 	}
-	// A separator rule (run of horizontal-rule chars) must appear above the box.
-	if !strings.Contains(got, strings.Repeat("─", 10)) {
-		t.Errorf("surfaceView missing a separator rule in:\n%s", got)
+	// The A2 composer is a borderless panel: there is NO separator rule above it.
+	if strings.Contains(got, strings.Repeat("─", 10)) {
+		t.Errorf("surfaceView should emit no separator rule now, got:\n%s", got)
 	}
-	// Order: live tail above the separator, status line at the very bottom.
+	// Order: live tail on top, the composer (its placeholder) in the middle, the status
+	// line at the very bottom — composer sits directly below the tail, no separator.
 	tailIdx := strings.Index(got, "live narration")
-	sepIdx := strings.Index(got, strings.Repeat("─", 10))
+	composerIdx := strings.Index(got, "Type a message…")
 	statusIdx := strings.LastIndex(got, "streaming…")
-	if !(tailIdx < sepIdx && sepIdx < statusIdx) {
-		t.Errorf("surfaceView order wrong: tail=%d sep=%d status=%d\n%s", tailIdx, sepIdx, statusIdx, got)
+	if !(tailIdx < composerIdx && composerIdx < statusIdx) {
+		t.Errorf("surfaceView order wrong: tail=%d composer=%d status=%d\n%s", tailIdx, composerIdx, statusIdx, got)
 	}
 }
 

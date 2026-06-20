@@ -183,15 +183,24 @@ func TestInputBoxCtrlJNewlineFallback(t *testing.T) {
 // "▌ " prompt is dropped and surrounding box-padding whitespace is trimmed so each
 // element is the bare visible text of one editor row (empty string for a blank row).
 func visibleContentRows(view string) []string {
-	var rows []string
+	// The composer is a borderless ▌-edged panel (styles.BoxStyle): the ▌ left edge
+	// runs down EVERY row, including a blank padding row above and below the editor
+	// (PaddingTop/Bottom 1). Every box row therefore carries a ▌; the content rows are
+	// the ones between the two padding rows.
+	var framed []string
 	for _, line := range strings.Split(stripANSI(view), "\n") {
-		if !strings.Contains(line, "▌") {
-			continue // border row, not editor content
+		if strings.Contains(line, "▌") {
+			framed = append(framed, line)
 		}
-		// Drop the box's vertical border runes and the accent-bar prompt, then trim the
-		// box padding, leaving just the row's visible text.
-		text := strings.ReplaceAll(line, "│", "")
-		text = strings.TrimSpace(text)
+	}
+	// Drop the top + bottom padding rows; what remains is the editor content (a phantom
+	// trailing blank row, if the bug being guarded against reappears, survives here).
+	if len(framed) >= 2 {
+		framed = framed[1 : len(framed)-1]
+	}
+	var rows []string
+	for _, line := range framed {
+		text := strings.TrimSpace(line)
 		text = strings.TrimPrefix(text, "▌")
 		rows = append(rows, strings.TrimSpace(text))
 	}

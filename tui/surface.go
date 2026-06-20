@@ -4,8 +4,6 @@ import (
 	"strings"
 
 	"charm.land/lipgloss/v2"
-
-	"github.com/inventivepotter/urvi/tui/styles"
 )
 
 // Active-surface row budget (design §"Input box · Active-surface budgeting"). The
@@ -14,19 +12,18 @@ import (
 // separator rule, the bottom box, an optional slash panel, and one status line.
 const (
 	statusH    = 1 // the single status line at the very bottom
-	sepH       = 1 // the separator rule above the bottom box
-	boxBorderH = 2 // a bottom box's top + bottom border rows
+	boxBorderH = 2 // the bottom box's top + bottom frame rows: a prompt box's border, or the borderless composer panel's top/bottom padding
 )
 
 // liveTailCap is the number of rows the live tail may occupy: the terminal height
 // less the status line, the rows reserved below the tail (reservedH = the slash
 // panel + the queued-input affordance, 0 when both hidden) and the bottom box
-// (sep + box border + contentH). contentH is the composer height in compose/answer
-// mode or the prompt-control height in prompt mode. The result is floored at 0 and
-// is never negative — when the chrome alone fills the terminal the tail vanishes
-// (its rows are already committed to scrollback at the next boundary).
+// (box frame + contentH). contentH is the composer height in compose/answer mode or
+// the prompt-control height in prompt mode. The result is floored at 0 and is never
+// negative — when the chrome alone fills the terminal the tail vanishes (its rows are
+// already committed to scrollback at the next boundary).
 func liveTailCap(term, statusH, reservedH, contentH int) int {
-	bottomH := sepH + boxBorderH + contentH
+	bottomH := boxBorderH + contentH
 	capacity := term - statusH - reservedH - bottomH
 	if capacity < 0 {
 		return 0
@@ -48,9 +45,11 @@ type surfaceInputs struct {
 }
 
 // surfaceView composes the active surface top to bottom: the capped live tail, the
-// full-width separator rule, the bottom box (composer, prompt control, or answer
-// field by interaction mode), the slash-completion panel when visible, and one
-// status line. It allocates no transcript viewport. Empty regions are omitted so
+// bottom box (composer, prompt control, or answer field by interaction mode), the
+// slash-completion panel when visible, and one status line. The composer is a
+// borderless, ▌-edged dark-gray panel — there is no separator rule above it (a
+// full-width rule was the most visible artifact stranded into scrollback on a resize
+// desync; see styles.BoxStyle). It allocates no transcript viewport. Empty regions are omitted so
 // the surface never emits stray blank rows.
 //
 // Every composed line is clamped to in.Width as the final step (clampSurfaceWidth).
@@ -70,7 +69,7 @@ func surfaceView(in surfaceInputs) string {
 
 	contentH := bottomContentHeight(in)
 	// The queued affordance and slash panel are first-class reserved rows: they sit
-	// between the live tail and the separator (queued) or below the bottom box
+	// between the live tail and the bottom box (queued) or below the bottom box
 	// (slash), so the tail gets only the rows left after BOTH are reserved — keeping
 	// the logical line count equal to the physical row count the v2 inline renderer
 	// requires (see clampSurfaceWidth).
@@ -78,10 +77,9 @@ func surfaceView(in surfaceInputs) string {
 	capacity := liveTailCap(in.Height, statusH, reserved, contentH)
 	tail := cappedTail(in.LiveTail, capacity)
 
-	rows := make([]string, 0, 6)
+	rows := make([]string, 0, 5)
 	rows = appendNonEmpty(rows, tail)
 	rows = appendNonEmpty(rows, in.Queued)
-	rows = append(rows, styles.SeparatorRule(in.Width))
 	rows = appendNonEmpty(rows, bottom)
 	rows = appendNonEmpty(rows, slash)
 	rows = appendNonEmpty(rows, status)

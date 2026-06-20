@@ -455,10 +455,10 @@ func TestViewRequestsAllKeysAsEscapeCodes(t *testing.T) {
 	}
 }
 
-// TestViewComposesSurfaceNoViewport asserts the View is the active surface (a
-// separator rule + a bottom box), never a transcript viewport, and that committed
-// entries are NOT re-rendered into the View (they live in native scrollback). A
-// committed user line's text must not appear in the View.
+// TestViewComposesSurfaceNoViewport asserts the View is the active surface (the
+// borderless composer panel + status line), never a transcript viewport, and that
+// committed entries are NOT re-rendered into the View (they live in native
+// scrollback). A committed user line's text must not appear in the View.
 func TestViewComposesSurfaceNoViewport(t *testing.T) {
 	t.Parallel()
 
@@ -468,8 +468,8 @@ func TestViewComposesSurfaceNoViewport(t *testing.T) {
 	m.transcript = m.transcript.CommitUser([]content.Block{&content.TextBlock{Text: "committed-history-line"}})
 
 	view := stripANSI(m.View().Content)
-	if !strings.Contains(view, "─") {
-		t.Errorf("View() missing the separator rule; got %q", view)
+	if !strings.Contains(view, "Type a message…") {
+		t.Errorf("View() missing the composer surface; got %q", view)
 	}
 	if strings.Contains(view, "committed-history-line") {
 		t.Errorf("View() re-rendered a committed entry; it belongs in native scrollback, got %q", view)
@@ -477,7 +477,7 @@ func TestViewComposesSurfaceNoViewport(t *testing.T) {
 }
 
 // TestViewRendersLiveTail asserts the in-progress (live) assistant segment renders
-// in the View's capped live tail above the separator — it is NOT yet committed, so
+// in the View's capped live tail above the composer panel — it is NOT yet committed, so
 // it cannot be in scrollback.
 func TestViewRendersLiveTail(t *testing.T) {
 	t.Parallel()
@@ -1661,7 +1661,7 @@ func TestSubmitQueuedAffordancePromotes(t *testing.T) {
 		t.Fatal("affordance shown before InputQueued; it must wait for the event")
 	}
 
-	// InputQueued reveals the affordance below the live tail (above the separator).
+	// InputQueued reveals the affordance below the live tail (above the composer panel).
 	m = feed(t, m, event.InputQueued{InputID: id})
 	view := stripANSI(m.View().Content)
 	if !strings.Contains(view, "pending msg") {

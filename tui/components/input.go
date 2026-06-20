@@ -60,7 +60,10 @@ func NewInputBox() InputBox {
 	ta := textarea.New()
 	ta.CharLimit = 0
 	ta.ShowLineNumbers = false
-	ta.Prompt = styles.AccentBarPrompt
+	// No per-line prompt: the ▌ accent is now the composer panel's left border (drawn
+	// by styles.BoxStyle over every row, including the top/bottom padding), so a
+	// textarea prompt would double it. The leading gap is the box's PaddingLeft.
+	ta.Prompt = ""
 	ta.Placeholder = placeholder
 	// Bind newline insertion to Shift+Enter (primary) OR Ctrl+J (universal fallback),
 	// freeing Enter for submit in screen.go. See the doc comment above for why both.
@@ -69,10 +72,15 @@ func NewInputBox() InputBox {
 		key.WithHelp("shift+enter", "insert newline"),
 	)
 	// v2 restructures the per-state styles under a single Styles value accessed via
-	// Styles()/SetStyles. Color the focused and blurred prompts with the shared accent
-	// bar, and clear the focused CursorLine: the default DefaultDarkStyles gives it a
-	// black background ("0"), which appears as a stray dark patch only as wide as the
-	// text. Clearing it makes the input plain, like the user-message rows.
+	// Styles()/SetStyles. Tint the editor cells with the composer panel fill
+	// (styles.InputPanelBg) so the whole box — the textarea content AND the box's
+	// border/padding frame — reads as one continuous dark-gray panel; without this the
+	// content cells keep their default (terminal) background and show through as an
+	// untinted gap inside the tinted frame. Background is set on Base (inherited by the
+	// computed CursorLine/EndOfBuffer/line-number styles), and explicitly on Text and
+	// Placeholder, which are applied directly rather than inheriting Base. The focused
+	// CursorLine is set to a plain panel-tinted style: the default DefaultDarkStyles
+	// gives it a black background ("0"), a stray dark patch as wide as the text.
 	//
 	// The default Cursor style is left untouched, and is safe to leave so: textarea's
 	// DefaultDarkStyles is built by resolving lipgloss's LightDark light/dark *closure*
@@ -81,9 +89,13 @@ func NewInputBox() InputBox {
 	// never triggers a runtime OSC-11 background query (which the codebase deliberately
 	// avoids; see styles.NewMarkdownRenderer).
 	s := ta.Styles()
-	s.Focused.Prompt = styles.AccentBarStyle
-	s.Blurred.Prompt = styles.AccentBarStyle
-	s.Focused.CursorLine = lipgloss.NewStyle()
+	for _, st := range []*textarea.StyleState{&s.Focused, &s.Blurred} {
+		st.Base = st.Base.Background(styles.InputPanelBg)
+		st.Text = st.Text.Background(styles.InputPanelBg)
+		st.Placeholder = st.Placeholder.Background(styles.InputPanelBg)
+		st.EndOfBuffer = st.EndOfBuffer.Background(styles.InputPanelBg)
+		st.CursorLine = lipgloss.NewStyle().Background(styles.InputPanelBg)
+	}
 	ta.SetStyles(s)
 	// DynamicHeight makes the textarea recompute its height from the VISUAL (soft-wrap
 	// aware) line count on every mutation, and — crucially — clamp its internal viewport
