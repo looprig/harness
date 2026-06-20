@@ -61,8 +61,9 @@ func RenderStatusLine(s Status) string {
 	return renderStatusLine(s, statusInputs{thinking: s == StatusRunning})
 }
 
-// renderStatusLine styles the derived label, returning "" for the empty label so
-// the surface omits the status row entirely when idle.
+// renderStatusLine styles the derived label, returning "" for the empty (idle) label.
+// surfaceView keeps the bottom row regardless — rendering an empty label as a blank
+// breathing-room line below the composer — so the composer's position stays stable.
 func renderStatusLine(status Status, in statusInputs) string {
 	label := statusLabel(status, in)
 	if label == "" {

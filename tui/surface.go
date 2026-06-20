@@ -93,7 +93,17 @@ func surfaceView(in surfaceInputs) string {
 	rows = appendNonEmpty(rows, in.Queued)
 	rows = appendNonEmpty(rows, bottom)
 	rows = appendNonEmpty(rows, slash)
-	rows = appendNonEmpty(rows, status)
+	// The bottom status row is ALWAYS present: the status label while a turn is live
+	// (streaming/thinking) or a prompt is pending, otherwise a single blank line. The
+	// blank gives the resting (idle) composer a line of breathing room below it, and
+	// keeping the row whether or not the label is empty holds the composer's vertical
+	// position stable across a turn — the row never appears/disappears (statusH already
+	// reserves it in the budget).
+	if status != "" {
+		rows = append(rows, status)
+	} else {
+		rows = append(rows, "")
+	}
 	return clampSurfaceWidth(strings.Join(rows, "\n"), in.Width)
 }
 
