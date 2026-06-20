@@ -12,7 +12,8 @@ import (
 // separator rule, the bottom box, an optional slash panel, and one status line.
 const (
 	statusH    = 1 // the single status line at the very bottom
-	boxBorderH = 2 // the bottom box's top + bottom frame rows: a prompt box's border, or the borderless composer panel's top/bottom padding
+	statusPadH = 1 // a blank line between the bottom box and the status line
+	boxBorderH = 2 // the bottom box's top + bottom frame rows (a prompt box's border; the minimal composer has none, so this over-reserves harmlessly in compose mode)
 )
 
 // liveTailCap is the number of rows the live tail may occupy: the terminal height
@@ -74,7 +75,9 @@ func surfaceView(in surfaceInputs) string {
 	// the logical line count equal to the physical row count the v2 inline renderer
 	// requires (see clampSurfaceWidth).
 	reserved := lipgloss.Height(slash) + queuedHeight(in.Queued)
-	capacity := liveTailCap(in.Height, statusH, reserved, contentH)
+	// statusPadH (the blank line above the status row) is reserved alongside statusH so
+	// the tail budget accounts for it.
+	capacity := liveTailCap(in.Height, statusH+statusPadH, reserved, contentH)
 
 	// The live tail carries a trailing blank line, mirroring the one
 	// scrollbackModel.Flush appends after every committed entry — so the gap below the
@@ -93,11 +96,13 @@ func surfaceView(in surfaceInputs) string {
 	rows = appendNonEmpty(rows, in.Queued)
 	rows = appendNonEmpty(rows, bottom)
 	rows = appendNonEmpty(rows, slash)
-	// The status row is always present (statusLabel never returns ""): it reads "idle"
-	// at rest and the live label during a turn. That single faint line below the
-	// composer is its breathing room, and because the row is always there the composer's
-	// vertical position stays stable across the turn (statusH reserves it in the budget).
-	rows = appendNonEmpty(rows, status)
+	// A blank line of padding (statusPadH) separates the bottom box from the status
+	// row, which is always present (statusLabel never returns ""): it reads "▸ idle" at
+	// rest and the live label during a turn. Keeping the row whatever the state holds
+	// the composer's vertical position stable across the turn (both rows are budgeted).
+	if status != "" {
+		rows = append(rows, "", status)
+	}
 	return clampSurfaceWidth(strings.Join(rows, "\n"), in.Width)
 }
 

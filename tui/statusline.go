@@ -64,13 +64,17 @@ func RenderStatusLine(s Status) string {
 	return renderStatusLine(s, statusInputs{thinking: s == StatusRunning})
 }
 
-// renderStatusLine styles the derived label through the faint StatusStyle. statusLabel
-// always returns a non-empty label (idle reads "idle"), so the status row is always
-// present below the composer; the empty-label guard is a defensive no-op.
+// statusIcon is the small play glyph prefixing the status line.
+const statusIcon = "▸"
+
+// renderStatusLine styles the derived label through the faint StatusStyle, prefixed by
+// the small play icon. statusLabel always returns a non-empty label (idle reads
+// "idle"), so the status row is always present below the composer; the empty-label
+// guard is a defensive no-op.
 func renderStatusLine(status Status, in statusInputs) string {
 	label := statusLabel(status, in)
 	if label == "" {
 		return ""
 	}
-	return styles.StatusStyle.Render(label)
+	return styles.StatusStyle.Render(statusIcon + " " + label)
 }
