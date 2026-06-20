@@ -5,6 +5,7 @@ import "github.com/inventivepotter/urvi/tui/styles"
 // Status labels — the legible one-line descriptions of the turn-lifecycle state,
 // derived from the session Status plus the live interaction signals.
 const (
+	labelIdle         = "idle"
 	labelStreaming    = "streaming…"
 	labelThinking     = "thinking…"
 	labelApproval     = "awaiting approval"
@@ -25,10 +26,12 @@ type statusInputs struct {
 }
 
 // statusLabel derives the active-surface status label (design §"Thinking & status
-// line"). A pending prompt takes precedence over the streaming/thinking signals
-// (its awaiting-* label is clearer); interrupting/clearing come straight from the
-// session status; an idle session (or Running with no live signal) is empty — the
-// composer prompt is the cue.
+// line"). A pending prompt takes precedence over the streaming/thinking signals (its
+// awaiting-* label is clearer); interrupting/clearing come straight from the session
+// status; an idle session reads "idle". A Running turn with no live signal yet — the
+// request is in flight but nothing has streamed back — reads "thinking…" (the same as
+// when only thinking chunks have arrived), so the gap between submitting and the first
+// token is never blank. statusLabel never returns "".
 func statusLabel(status Status, in statusInputs) string {
 	switch status {
 	case StatusInterrupting:
@@ -36,7 +39,7 @@ func statusLabel(status Status, in statusInputs) string {
 	case StatusResetting:
 		return labelClearing
 	case StatusIdle:
-		return ""
+		return labelIdle
 	}
 	switch {
 	case in.permissionActive:
@@ -45,10 +48,10 @@ func statusLabel(status Status, in statusInputs) string {
 		return labelInput
 	case in.streaming:
 		return labelStreaming
-	case in.thinking:
-		return labelThinking
 	default:
-		return ""
+		// Thinking chunks present, OR a freshly-started turn still waiting for the
+		// model's first token — both read as "thinking…".
+		return labelThinking
 	}
 }
 
@@ -61,9 +64,9 @@ func RenderStatusLine(s Status) string {
 	return renderStatusLine(s, statusInputs{thinking: s == StatusRunning})
 }
 
-// renderStatusLine styles the derived label, returning "" for the empty (idle) label.
-// surfaceView keeps the bottom row regardless — rendering an empty label as a blank
-// breathing-room line below the composer — so the composer's position stays stable.
+// renderStatusLine styles the derived label through the faint StatusStyle. statusLabel
+// always returns a non-empty label (idle reads "idle"), so the status row is always
+// present below the composer; the empty-label guard is a defensive no-op.
 func renderStatusLine(status Status, in statusInputs) string {
 	label := statusLabel(status, in)
 	if label == "" {

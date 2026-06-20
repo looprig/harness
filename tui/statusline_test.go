@@ -39,7 +39,7 @@ func TestRenderStatusLine(t *testing.T) {
 		wantEmpty  bool
 		wantSubstr string
 	}{
-		{name: "idle is empty", status: StatusIdle, wantEmpty: true},
+		{name: "idle reads idle", status: StatusIdle, wantSubstr: "idle"},
 		{name: "running contains thinking", status: StatusRunning, wantSubstr: "thinking"},
 		{name: "interrupting contains interrupting", status: StatusInterrupting, wantSubstr: "interrupting"},
 		{name: "resetting contains clearing", status: StatusResetting, wantSubstr: "clearing"},
@@ -82,7 +82,7 @@ func TestStatusLabel(t *testing.T) {
 		st     statusInputs
 		want   string
 	}{
-		{name: "idle is empty", status: StatusIdle, st: statusInputs{}, want: ""},
+		{name: "idle reads idle", status: StatusIdle, st: statusInputs{}, want: "idle"},
 		{
 			name:   "streaming text",
 			status: StatusRunning,
@@ -120,10 +120,10 @@ func TestStatusLabel(t *testing.T) {
 			want:   "clearing…",
 		},
 		{
-			name:   "running with no signal is empty",
+			name:   "running with no signal reads thinking (request in flight)",
 			status: StatusRunning,
 			st:     statusInputs{},
-			want:   "",
+			want:   "thinking…",
 		},
 		{
 			name:   "permission beats streaming",
