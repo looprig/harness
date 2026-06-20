@@ -59,8 +59,8 @@ func TestBuildBlocksExtensionlessFile(t *testing.T) {
 		wantErr  bool
 		wantText string
 	}{
-		{name: "Makefile is plaintext", filename: "Makefile", data: []byte("build:\n\tgo build ./...\n"), wantText: "[Makefile]\nbuild:\n\tgo build ./...\n"},
-		{name: "Dockerfile is plaintext", filename: "Dockerfile", data: []byte("FROM scratch\n"), wantText: "[Dockerfile]\nFROM scratch\n"},
+		{name: "Makefile is plaintext", filename: "Makefile", data: []byte("build:\n\tgo build ./...\n"), wantText: "`Makefile`\n```\nbuild:\n\tgo build ./...\n```"},
+		{name: "Dockerfile is plaintext", filename: "Dockerfile", data: []byte("FROM scratch\n"), wantText: "`Dockerfile`\n```\nFROM scratch\n```"},
 		{name: "binary extensionless is rejected", filename: "blob", data: []byte{0x00, 0xff, 0xfe, 0x80}, wantErr: true},
 	}
 	for _, tt := range tests {
@@ -234,8 +234,8 @@ func TestBuildBlocksPlaintext(t *testing.T) {
 	if !ok {
 		t.Fatalf("block[0] = %T, want *content.TextBlock", got[0])
 	}
-	if tb.Text != "[a.txt]\nabc" {
-		t.Errorf("Text = %q, want %q", tb.Text, "[a.txt]\nabc")
+	if want := "`a.txt`\n```txt\nabc\n```"; tb.Text != want {
+		t.Errorf("Text = %q, want %q", tb.Text, want)
 	}
 }
 
@@ -253,8 +253,8 @@ func TestBuildBlocksSVGIsPlaintext(t *testing.T) {
 	if !ok {
 		t.Fatalf("block[0] = %T, want *content.TextBlock", got[0])
 	}
-	if tb.Text != "[a.svg]\n<svg/>" {
-		t.Errorf("Text = %q, want %q", tb.Text, "[a.svg]\n<svg/>")
+	if want := "`a.svg`\n```svg\n<svg/>\n```"; tb.Text != want {
+		t.Errorf("Text = %q, want %q", tb.Text, want)
 	}
 }
 
@@ -381,8 +381,8 @@ func TestBuildBlocksPromptThenAttachmentOrdering(t *testing.T) {
 		t.Fatalf("block[0] = %#v, want *TextBlock{Text:%q}", got[0], "see now")
 	}
 	att, ok := got[1].(*content.TextBlock)
-	if !ok || att.Text != "[a.txt]\nx" {
-		t.Fatalf("block[1] = %#v, want *TextBlock{Text:%q}", got[1], "[a.txt]\nx")
+	if want := "`a.txt`\n```txt\nx\n```"; !ok || att.Text != want {
+		t.Fatalf("block[1] = %#v, want *TextBlock{Text:%q}", got[1], want)
 	}
 }
 
@@ -405,7 +405,7 @@ func TestBuildBlocksMultipleMixed(t *testing.T) {
 		t.Fatalf("block[0] = %#v, want *TextBlock{Text:%q}", got[0], "look and")
 	}
 	noteB, ok := got[1].(*content.TextBlock)
-	if !ok || noteB.Text != "[note.txt]\nhi" {
+	if !ok || noteB.Text != "`note.txt`\n```txt\nhi\n```" {
 		t.Fatalf("block[1] = %#v, want note TextBlock", got[1])
 	}
 	picB, ok := got[2].(*content.ImageBlock)
@@ -526,7 +526,7 @@ func TestBuildBlocksExactlyMaxAccepted(t *testing.T) {
 	if !ok {
 		t.Fatalf("block[0] = %T, want *content.TextBlock", got[0])
 	}
-	want := "[max.txt]\n" + string(body)
+	want := formatAttachment("max.txt", ".txt", string(body))
 	if tb.Text != want {
 		t.Errorf("Text length = %d, want %d (no truncation)", len(tb.Text), len(want))
 	}

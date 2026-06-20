@@ -141,7 +141,7 @@ func buildAttachment(path string, allowImages bool) (content.Block, error) {
 		if ext == "" && !utf8.Valid(data) {
 			return nil, &BinaryAttachmentError{Path: clean}
 		}
-		return &content.TextBlock{Text: "[" + filepath.Base(clean) + "]\n" + string(data)}, nil
+		return &content.TextBlock{Text: formatAttachment(filepath.Base(clean), ext, string(data))}, nil
 	default:
 		return nil, &UnsupportedAttachmentError{Ext: ext}
 	}
@@ -150,6 +150,20 @@ func buildAttachment(path string, allowImages bool) (content.Block, error) {
 func isPlaintextExt(ext string) bool {
 	_, ok := plaintextExts[ext]
 	return ok
+}
+
+// formatAttachment formats an attached file's content for the message as markdown: a
+// markdown file (.md/.markdown) is inlined as-is so it renders as markdown; any other
+// text file is wrapped in a fenced code block (language inferred from the extension) so
+// it renders as a syntax-aware code block. A "`name`" header labels it either way. The
+// block text is BOTH what the model receives and what the committed user row renders
+// (see renderUser), so the fences read well in both.
+func formatAttachment(name, ext, body string) string {
+	body = strings.TrimRight(body, "\n")
+	if ext == ".md" || ext == ".markdown" {
+		return "`" + name + "`\n\n" + body
+	}
+	return "`" + name + "`\n```" + strings.TrimPrefix(ext, ".") + "\n" + body + "\n```"
 }
 
 // denyReason reports whether clean matches the secret/credential denylist,

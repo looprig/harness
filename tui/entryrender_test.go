@@ -30,56 +30,43 @@ func TestRenderEntryUser(t *testing.T) {
 	}
 }
 
-// TestRenderEntryUserBold locks that a kindUser entry renders its message TEXT in
-// bold (styles.UserStyle) while keeping the gray "▌ " accent bar — and that the
-// bold is applied to EACH wrapped line of a multi-line user message. The bold
-// assertion is NON-stripped: it matches the exact bold-SGR-wrapped text fragment
-// that styles.UserStyle.Render produces, so it would fail if the text were emitted
-// plain (the bug this guards). The bar assertion confirms the bar is untouched.
-func TestRenderEntryUserBold(t *testing.T) {
+// TestRenderEntryUserMarkdown locks that a kindUser entry renders its message TEXT as
+// MARKDOWN (via glamour, like assistant narration) behind the gray "▌ " accent bar —
+// no longer force-bolded. It asserts on the ANSI-STRIPPED output that the text content
+// (and markdown features like lists and fenced code) survive rendering, that the bar is
+// present, and that the text is NOT wrapped in the old bold UserStyle.
+func TestRenderEntryUserMarkdown(t *testing.T) {
 	t.Parallel()
 	bar := styles.AccentBarStyle.Render(styles.AccentBarPrompt)
 	tests := []struct {
-		name      string
-		text      string
-		width     int
-		wantBolds []string // exact bold-styled fragments expected in the raw output
+		name     string
+		text     string
+		width    int
+		wantText []string // ANSI-stripped substrings expected in the rendered output
 	}{
-		{
-			name:      "single line",
-			text:      "ship it",
-			width:     80,
-			wantBolds: []string{styles.UserStyle.Render("ship it")},
-		},
-		{
-			name:      "explicit newline keeps bold on each line",
-			text:      "line one\nline two",
-			width:     80,
-			wantBolds: []string{styles.UserStyle.Render("line one"), styles.UserStyle.Render("line two")},
-		},
-		{
-			name:  "width wrap keeps bold on each wrapped line",
-			text:  "alpha bravo charlie delta",
-			width: 8, // forces wrapping into multiple rows
-			wantBolds: []string{
-				styles.UserStyle.Render("alpha"),
-				styles.UserStyle.Render("bravo"),
-			},
-		},
+		{name: "single line", text: "ship it", width: 80, wantText: []string{"ship it"}},
+		{name: "explicit newline", text: "line one\nline two", width: 80, wantText: []string{"line one", "line two"}},
+		{name: "markdown list renders", text: "- alpha\n- bravo", width: 80, wantText: []string{"alpha", "bravo"}},
+		{name: "fenced code renders", text: "```go\nx := 1\n```", width: 80, wantText: []string{"x := 1"}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			e := entry{ID: 1, Kind: kindUser, Blocks: []content.Block{&content.TextBlock{Text: tt.text}}}
 			raw := strings.Join(renderEntry(e, false, tt.width), "\n")
-			for _, want := range tt.wantBolds {
-				if !strings.Contains(raw, want) {
-					t.Errorf("user render = %q, want it to contain bold fragment %q", raw, want)
+			plain := stripANSI(raw)
+			for _, want := range tt.wantText {
+				if !strings.Contains(plain, want) {
+					t.Errorf("user render (plain) = %q, want substring %q", plain, want)
 				}
 			}
-			// The gray bar must still be present and unchanged.
+			// The gray bar must still be present.
 			if !strings.Contains(raw, bar) {
 				t.Errorf("user render = %q, want it to contain the styled accent bar %q", raw, bar)
+			}
+			// The text must no longer be wrapped in the old bold UserStyle.
+			if strings.Contains(raw, styles.UserStyle.Render(tt.text)) {
+				t.Errorf("user render still force-bolds the text; markdown render expected")
 			}
 		})
 	}

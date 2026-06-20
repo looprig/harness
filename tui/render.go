@@ -363,20 +363,47 @@ func liveToolGlyph(frame uint) func(ToolStatus) string {
 // barWidth is the display columns a left-bar prefix ("▌ " / "│ ") consumes.
 const barWidth = 2
 
-// renderUser renders a user message as left accent-bar lines: every width-wrapped
-// line of text is prefixed with the gray "▌ " bar (AccentBarStyle), and the text
-// itself is rendered bold (UserStyle) so the user's words stand out from assistant
-// narration. The bold is applied per wrapped line, left-aligned in the assistant
-// column.
+// renderUser renders a committed user message as MARKDOWN behind the gray "▌ " rail:
+// the text goes through the same glamour renderer as assistant narration (so a fenced
+// file attachment shows as a code block, and lists/headings/inline-code/links render),
+// then every output line is prefixed with the bar so the message reads as the user's
+// with its left-accent identity. This is display-only — the literal text is what was
+// sent to the model. On a glamour construction/render error it falls back to the raw,
+// width-wrapped text behind the bar (bad markdown shows as-is).
 func renderUser(text string, width int) string {
-	bar := styles.AccentBarStyle.Render(styles.AccentBarPrompt)
-	var out []string
-	for _, raw := range strings.Split(text, "\n") {
-		for _, line := range wrapToWidth(raw, width-barWidth) {
-			out = append(out, bar+styles.UserStyle.Render(line))
-		}
+	return renderMDRail(text, width, styles.AccentBarStyle.Render(styles.AccentBarPrompt))
+}
+
+// renderMDRail renders md to ANSI (glamour) and prefixes EVERY line with bar — a left
+// rail down the whole block. It dedents glamour's document margin first so the content
+// sits flush behind the bar (bar is barWidth == dotWidth columns), and falls back to
+// the raw, width-wrapped text behind the bar on any glamour error.
+func renderMDRail(md string, width int, bar string) string {
+	if strings.TrimSpace(md) == "" {
+		return ""
 	}
-	return strings.Join(out, "\n")
+	raw := func() string {
+		var out []string
+		for _, para := range strings.Split(md, "\n") {
+			for _, line := range wrapToWidth(para, width-barWidth) {
+				out = append(out, bar+line)
+			}
+		}
+		return strings.Join(out, "\n")
+	}
+	r, err := styles.NewMarkdownRenderer(max(0, width-barWidth))
+	if err != nil {
+		return raw()
+	}
+	out, err := r.Render(md)
+	if err != nil {
+		return raw()
+	}
+	lines := dedentDocument(out)
+	for i := range lines {
+		lines[i] = bar + lines[i]
+	}
+	return strings.Join(lines, "\n")
 }
 
 // renderQueued renders the pending queued-input affordances as compact, DIM
