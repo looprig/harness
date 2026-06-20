@@ -43,7 +43,8 @@ type interactionModel struct {
 	mode         interactionMode
 	pending      []prompt // FIFO; pending[0] is the active prompt
 	input        components.InputBox
-	slash        *components.SlashComplete // nil = hidden
+	slash        *components.SlashComplete // slash-command panel; nil = hidden
+	files        *components.FileComplete  // @path completion panel; nil = hidden
 	composeDraft string                    // editor text saved when a prompt preempts compose
 }
 
@@ -220,11 +221,11 @@ func (m *interactionModel) syncModeToHead() {
 }
 
 // restoreCompose returns to compose mode and refills the editor with the saved
-// draft, clearing any stale slash panel.
+// draft, clearing any stale completion panel.
 func (m *interactionModel) restoreCompose() {
 	m.mode = modeCompose
 	m.input.SetValue(m.composeDraft)
-	m.slash = nil
+	m.slash, m.files = nil, nil
 }
 
 // noop is the consumed-key result: nothing for Screen to act on, re-render only.
@@ -383,12 +384,47 @@ func (m interactionModel) composeKey(msg tea.KeyPressMsg) (interactionModel, uiA
 			return m, noop, nil
 		}
 	}
+	// The @path panel owns tab/enter (complete the highlighted entry) and up/down
+	// (navigate). Tab and Enter both COMPLETE here (they never submit while the panel is
+	// open); completing a directory keeps the panel open one level in (completeAtPath).
+	if m.files != nil {
+		switch {
+		case isEnter(msg), msg.String() == "tab":
+			m.completeAtPath(m.files.Selected())
+			return m, noop, nil
+		case msg.String() == "up":
+			m.files.Up()
+			return m, noop, nil
+		case msg.String() == "down":
+			m.files.Down()
+			return m, noop, nil
+		}
+	}
 	if isEnter(msg) {
 		model, action := m.composeEnter()
 		return model, action, nil
 	}
 	cmd := m.forwardToInput(msg)
 	return m, noop, cmd
+}
+
+// completeAtPath replaces the @path partial being typed at the end of the editor with
+// the selected entry: "<text before>@<path>", appending "/" for a directory. After
+// completing a directory the panel re-lists that directory's contents (drill in); after
+// a file it hides. SetValue keeps the editor cursor at the end, ready to keep typing.
+func (m *interactionModel) completeAtPath(sel components.FileItem) {
+	v := m.input.Value()
+	before := strings.TrimSuffix(v, lastField(v)) // text before the trailing @token
+	path := sel.Path
+	if sel.IsDir {
+		path += "/"
+	}
+	m.input.SetValue(before + "@" + path)
+	if sel.IsDir {
+		m.files = components.NewFileComplete(listFiles(path))
+	} else {
+		m.files = nil
+	}
 }
 
 // composeEnter resolves a bare Enter in compose mode WITH NO slash panel by
@@ -413,7 +449,7 @@ func (m interactionModel) composeEnter() (interactionModel, uiAction) {
 		// Unknown command: fall through to a plain-text submit.
 	}
 	m.input.Reset()
-	m.slash = nil
+	m.slash, m.files = nil, nil
 	return m, uiAction{Kind: uiSubmit, Text: v}
 }
 
@@ -425,10 +461,17 @@ func (m interactionModel) composeEnter() (interactionModel, uiAction) {
 func (m *interactionModel) forwardToInput(msg tea.KeyPressMsg) tea.Cmd {
 	cmd := m.input.Update(msg)
 	v := m.input.Value()
-	if strings.HasPrefix(v, "/") && !strings.ContainsAny(v, " \t\n") {
+	// A leading-slash word opens the command panel; otherwise an @path being typed at
+	// the end of the editor opens the file panel. They are mutually exclusive, and any
+	// other text hides both.
+	m.slash, m.files = nil, nil
+	switch {
+	case strings.HasPrefix(v, "/") && !strings.ContainsAny(v, " \t\n"):
 		m.slash = components.NewSlashComplete(firstToken(v))
-	} else {
-		m.slash = nil
+	default:
+		if partial, ok := activeAtToken(v); ok {
+			m.files = components.NewFileComplete(listFiles(partial))
+		}
 	}
 	return cmd
 }

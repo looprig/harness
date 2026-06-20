@@ -213,12 +213,18 @@ func promptControlBudget(term int) int {
 	return budget
 }
 
-// slashPanel renders the slash-completion panel when visible, else "".
+// slashPanel renders the active completion panel below the composer — the slash-command
+// panel or the @path file panel (mutually exclusive) — else "". Both share this one
+// reserved slot in the surface budget.
 func slashPanel(m interactionModel) string {
-	if m.slash == nil {
+	switch {
+	case m.slash != nil:
+		return m.slash.View()
+	case m.files != nil:
+		return m.files.View()
+	default:
 		return ""
 	}
-	return m.slash.View()
 }
 
 // cappedTail returns the last capacity lines of the (pre-rendered) live tail,
