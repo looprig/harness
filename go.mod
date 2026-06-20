@@ -94,5 +94,3 @@ require (
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 	honnef.co/go/tools v0.7.0 // indirect
 )
-
-replace github.com/charmbracelet/ultraviolet => ./third_party/github.com/charmbracelet/ultraviolet

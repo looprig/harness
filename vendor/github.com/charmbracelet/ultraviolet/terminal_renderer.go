@@ -1235,26 +1235,8 @@ func (s *TerminalRenderer) Render(newbuf *RenderBuffer) {
 	if curWidth != newWidth || curHeight != newHeight {
 		// Resize the old buffer to match the new buffer.
 		s.curbuf.Resize(newWidth, newHeight)
-		// VENDOR PATCH (urvi): sync ALL rows from newbuf into curbuf after a
-		// dimension change, not just the grown tail (curHeight-1..newHeight).
-		//
-		// Upstream only synced the newly-added rows, leaving the rest of curbuf
-		// holding STALE content from the previous (different-width) frame: on a
-		// width GROWTH the old narrow row survives in columns 0..oldWidth-1, and
-		// on a height SHRINK (curHeight > newHeight) the loop ran zero times and
-		// synced nothing at all. The NEXT (non-clear) Render then diffs the new
-		// frame against that stale curbuf and partial-redraws full-width lines —
-		// e.g. the composer box's ┌…┐ / └…┘ borders — at an absolute column
-		// offset (CSI <col> C), while the terminating relative cursor-up count
-		// desyncs. In inline mode that strands the prior, narrower border rows in
-		// native scrollback on every resize step (cumulative across a drag).
-		//
-		// A clearUpdate/transformLine full redraw at this point has already put
-		// the correct frame on screen, so making curbuf a faithful copy of
-		// newbuf for every row keeps the renderer's model in sync and lets the
-		// next diff be correct. See third_party/.../PATCH.md; re-evaluate when
-		// ultraviolet updates.
-		for i := 0; i < newHeight; i++ {
+		// Sync new lines to old lines
+		for i := curHeight - 1; i < newHeight; i++ {
 			copy(s.curbuf.Line(i), newbuf.Line(i))
 		}
 	}
