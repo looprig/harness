@@ -75,10 +75,21 @@ func surfaceView(in surfaceInputs) string {
 	// requires (see clampSurfaceWidth).
 	reserved := lipgloss.Height(slash) + queuedHeight(in.Queued)
 	capacity := liveTailCap(in.Height, statusH, reserved, contentH)
-	tail := cappedTail(in.LiveTail, capacity)
 
-	rows := make([]string, 0, 5)
-	rows = appendNonEmpty(rows, tail)
+	// The live tail carries a trailing blank line, mirroring the one
+	// scrollbackModel.Flush appends after every committed entry — so the gap below the
+	// streaming assistant already matches its committed look, and the layout does not
+	// jump by a row when the turn commits. The spacer is reserved out of the tail
+	// capacity (capacity-1) so the surface row budget is unchanged.
+	tail := ""
+	if in.LiveTail != "" {
+		tail = cappedTail(in.LiveTail, capacity-1)
+	}
+
+	rows := make([]string, 0, 6)
+	if tail != "" {
+		rows = append(rows, tail, "") // tail + trailing blank (matches a committed entry's spacing)
+	}
 	rows = appendNonEmpty(rows, in.Queued)
 	rows = appendNonEmpty(rows, bottom)
 	rows = appendNonEmpty(rows, slash)
