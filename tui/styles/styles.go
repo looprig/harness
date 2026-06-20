@@ -20,6 +20,16 @@ const Dot = "● "
 // DotColor is the assistant bullet's foreground color.
 var DotColor = lipgloss.Color("#D4F84D")
 
+// Markdown palette overrides applied by NewMarkdownRenderer over glamour's
+// DarkStyleConfig. MarkdownHeadingColor replaces glamour's heading blue (ANSI 256
+// "39") and MarkdownInlineCodeColor replaces glamour's inline `code` red (ANSI 256
+// "203"), both with the same softer brand blue. They are hex strings (not
+// lipgloss.Color) because glamour's StylePrimitive.Color is a *string.
+var (
+	MarkdownHeadingColor    = "#A2D2FF"
+	MarkdownInlineCodeColor = "#A2D2FF"
+)
+
 // LitDot is the COLORED leading marker actually rendered before an assistant bullet:
 // the DotColor-foregrounded glyph plus a plain trailing space. Its display width equals
 // Dot's (the color is zero-width ANSI), so narration alignment is unchanged.
@@ -145,11 +155,38 @@ var ThinkingStyle = lipgloss.NewStyle().Faint(true)
 //
 // The document's left margin is zeroed so narration aligns flush under the "●"
 // bullet that package tui prepends (otherwise glamour indents every line by 2).
+//
+// The Nexus palette is applied to glamour's defaults: markdown headings (glamour's
+// blue) and inline `code` spans (glamour's red) are recolored to MarkdownHeadingColor
+// and MarkdownInlineCodeColor. The inline `code` span additionally drops glamour's
+// dark background fill and its U+00A0 prefix/suffix (which padded each span with a
+// leading/trailing space), so a `code` span renders as bare colored text. The H2–H6
+// heading prefixes (glamour's literal "## ", "### ", … markers) are cleared so a
+// heading renders as clean styled text rather than echoing its markdown hashes; H1
+// keeps its colored background bar (it never carried a "#" marker). cfg is a value
+// copy of DarkStyleConfig, so reassigning its fields never mutates the shared
+// package-level config (the same copy-then-override pattern as the document margin).
+//
 // Returns an error if glamour fails to construct (caller decides fallback).
 func NewMarkdownRenderer(width int) (*glamour.TermRenderer, error) {
 	cfg := glamourstyles.DarkStyleConfig
 	noMargin := uint(0)
 	cfg.Document.Margin = &noMargin
+
+	heading := MarkdownHeadingColor
+	cfg.Heading.Color = &heading
+	cfg.H2.Prefix = "" // drop glamour's literal "## " heading marker
+	cfg.H3.Prefix = "" // drop "### "
+	cfg.H4.Prefix = "" // drop "#### "
+	cfg.H5.Prefix = "" // drop "##### "
+	cfg.H6.Prefix = "" // drop "###### "
+
+	code := MarkdownInlineCodeColor
+	cfg.Code.Color = &code
+	cfg.Code.BackgroundColor = nil // no background fill
+	cfg.Code.Prefix = ""           // no leading U+00A0 padding space
+	cfg.Code.Suffix = ""           // no trailing U+00A0 padding space
+
 	return glamour.NewTermRenderer(
 		glamour.WithStyles(cfg),
 		glamour.WithWordWrap(width),

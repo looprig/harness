@@ -34,9 +34,12 @@ func newScrollbackModel(width int) scrollbackModel {
 // Flush renders every committed entry not yet printed, in order, and returns the
 // next model plus the new print actions. Each entry's rendered lines are terminated
 // with exactly one trailing blank line so consecutive entries are separated by a
-// single blank line in scrollback (§Spacing). Already-printed entries are skipped
-// (print-once). Flush is a pure reducer: it copies the printed map so neither the
-// input model nor the input committed slice is mutated.
+// single blank line in scrollback (§Spacing) — EXCEPT where the next entry attaches
+// tightly to this one (attachesTight): a tool card belongs to the assistant/tool
+// step group above it, so the assistant bullet and its "⎿ …" cards render with no
+// intervening blank line, reading as one message (matching the live tail). Already-
+// printed entries are skipped (print-once). Flush is a pure reducer: it copies the
+// printed map so neither the input model nor the input committed slice is mutated.
 func (s scrollbackModel) Flush(committed []entry, render func(entry) []string) (scrollbackModel, []printAction) {
 	printed := make(map[displayID]bool, len(s.printed))
 	for id := range s.printed {
@@ -45,13 +48,32 @@ func (s scrollbackModel) Flush(committed []entry, render func(entry) []string) (
 	next := scrollbackModel{printed: printed, width: s.width}
 
 	var actions []printAction
-	for _, e := range committed {
+	for i, e := range committed {
 		if printed[e.ID] {
 			continue
 		}
-		lines := append(render(e), "")
+		lines := render(e)
+		if !attachesTight(committed, i) {
+			lines = append(lines, "")
+		}
 		actions = append(actions, printAction{EntryID: e.ID, Lines: lines})
 		printed[e.ID] = true
 	}
 	return next, actions
+}
+
+// attachesTight reports whether the entry following committed[i] renders flush
+// against it with NO separating blank line — i.e. the next entry is a tool card
+// (kindTool) that belongs to the same assistant/tool step group as committed[i].
+// A promoted tool card renders AS its own assistant bullet, so it STARTS a new group
+// and is never tight; every non-promoted tool card commits directly beneath its
+// step's assistant narration / "Multiple actions" umbrella (or a sibling card), so
+// it attaches tightly. Returns false at the tail (no following entry).
+func attachesTight(committed []entry, i int) bool {
+	j := i + 1
+	if j >= len(committed) {
+		return false
+	}
+	next := committed[j]
+	return next.Kind == kindTool && !next.promoted
 }

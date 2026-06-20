@@ -87,6 +87,76 @@ func TestScrollbackFlushPrintsEachEntryOnce(t *testing.T) {
 	}
 }
 
+// TestScrollbackFlushTightAttach verifies the step-group spacing exception: a
+// non-promoted tool card attaches FLUSH (no trailing blank line) to the entry above
+// it, so an assistant bullet and its "⎿ …" cards read as one message. The trailing
+// blank line falls only on the LAST entry of a group (the one whose successor starts
+// a new group), so groups stay separated by a single blank line. A promoted tool
+// card renders as its own bullet, so it starts a new group and keeps its blank line.
+func TestScrollbackFlushTightAttach(t *testing.T) {
+	t.Parallel()
+
+	oneLine := func(e entry) []string { return []string{"line-" + e.ID.String()} }
+
+	tests := []struct {
+		name      string
+		committed []entry
+		// wantBlank is the expected per-entry trailing-blank state, in committed order:
+		// true = the entry's Lines end with a "" separator, false = it attaches tight.
+		wantBlank []bool
+	}{
+		{
+			name:      "assistant then one tool card → assistant tight, card blank",
+			committed: []entry{{ID: 1, Kind: kindAssistant}, {ID: 2, Kind: kindTool}},
+			wantBlank: []bool{false, true},
+		},
+		{
+			name: "assistant then multiple cards → group tight, only last card blank",
+			committed: []entry{
+				{ID: 1, Kind: kindAssistant}, {ID: 2, Kind: kindTool},
+				{ID: 3, Kind: kindTool}, {ID: 4, Kind: kindTool},
+			},
+			wantBlank: []bool{false, false, false, true},
+		},
+		{
+			name: "promoted card starts a new group → preceding user keeps its blank",
+			committed: []entry{
+				{ID: 1, Kind: kindUser},
+				{ID: 2, Kind: kindTool, promoted: true},
+			},
+			wantBlank: []bool{true, true},
+		},
+		{
+			name: "assistant then a non-tool entry → both keep their blank",
+			committed: []entry{
+				{ID: 1, Kind: kindAssistant},
+				{ID: 2, Kind: kindNotice},
+			},
+			wantBlank: []bool{true, true},
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			s := newScrollbackModel(80)
+			_, actions := s.Flush(tt.committed, oneLine)
+			if len(actions) != len(tt.wantBlank) {
+				t.Fatalf("actions = %d, want %d", len(actions), len(tt.wantBlank))
+			}
+			for i, want := range tt.wantBlank {
+				got := actions[i].Lines
+				gotBlank := len(got) > 0 && got[len(got)-1] == ""
+				if gotBlank != want {
+					t.Errorf("entry %d (id %d) trailing-blank = %v, want %v (Lines %q)",
+						i, tt.committed[i].ID, gotBlank, want, got)
+				}
+			}
+		})
+	}
+}
+
 // TestScrollbackFlushGrowingTail verifies that when committed grows, only the new
 // tail entries are flushed — previously printed entries are skipped.
 func TestScrollbackFlushGrowingTail(t *testing.T) {
