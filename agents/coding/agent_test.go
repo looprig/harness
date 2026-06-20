@@ -190,7 +190,7 @@ func TestProductionAcceptsImagesFalse(t *testing.T) {
 // The proof is deterministic by construction. We Close the agent FIRST: Close
 // calls session.Shutdown, which blocks until the actor goroutine has exited and
 // loop.Done is closed, so nothing reads loop.Commands any longer. We then invoke
-// each wrapper with a LIVE (non-cancelled) ctx. Inside session.routeCommand the
+// each wrapper with a LIVE (non-cancelled) ctx. Inside session.routeGate the
 // select has the unbuffered send to loop.Commands (blocks forever — no reader),
 // <-loop.Done (closed — READY), and <-ctx.Done() (live — never ready). Only the
 // Done case can fire, so every call returns *session.SessionError{SessionLoopExited}
@@ -205,19 +205,19 @@ func TestGateTrioDelegatesToSession(t *testing.T) {
 		{
 			name: "Approve",
 			invoke: func(ctx context.Context, c *Coding) error {
-				return c.Approve(ctx, mustUUID(t), tool.ScopeSession)
+				return c.Approve(ctx, c.PrimaryLoopID(), mustUUID(t), tool.ScopeSession)
 			},
 		},
 		{
 			name: "Deny",
 			invoke: func(ctx context.Context, c *Coding) error {
-				return c.Deny(ctx, mustUUID(t))
+				return c.Deny(ctx, c.PrimaryLoopID(), mustUUID(t))
 			},
 		},
 		{
 			name: "ProvideAnswer",
 			invoke: func(ctx context.Context, c *Coding) error {
-				return c.ProvideAnswer(ctx, mustUUID(t), "the answer")
+				return c.ProvideAnswer(ctx, c.PrimaryLoopID(), mustUUID(t), "the answer")
 			},
 		},
 	}

@@ -41,7 +41,7 @@ import (
 const codingSkill = "coding"
 
 // childModelSpec is the narrow value a persona constructor yields: enough to build
-// a child session.NewAgent. It carries the materialized spec (model + system
+// a child session.New. It carries the materialized spec (model + system
 // prompt) and nothing else — the remaining deps (client, root, pc) belong to the
 // factory, not the persona.
 type childModelSpec struct {
@@ -102,7 +102,7 @@ func (f *codingFactory) New(ctx context.Context, skill string) (tools.Subsession
 	childRoot, cancel := context.WithCancel(f.rootCtx)
 
 	toolSet := buildToolSet(f.root, f.httpCl, childRoot, f)
-	child, err := session.NewAgent(childRoot, loop.Config{Client: f.client, Model: persona.spec, Tools: toolSet})
+	child, err := session.New(childRoot, loop.Config{Client: f.client, Model: persona.spec, Tools: toolSet})
 	if err != nil {
 		cancel()
 		return nil, err
@@ -110,12 +110,12 @@ func (f *codingFactory) New(ctx context.Context, skill string) (tools.Subsession
 	return &childSubsession{session: child, cancel: cancel}, nil
 }
 
-// childSubsession adapts a child session.AgentSession to the tools.Subsession
+// childSubsession adapts a child session.Session to the tools.Subsession
 // contract: run the child to completion on one message and return its final
 // assistant text. It owns the child's lifetime and tears it down after Invoke so
 // a spawn never leaks the child actor goroutine.
 type childSubsession struct {
-	session *session.Sesssion
+	session *session.Session
 	cancel  context.CancelFunc // cancels the child root; called after Invoke
 }
 

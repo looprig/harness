@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/inventivepotter/urvi/internal/agent/loop/event"
+	"github.com/inventivepotter/urvi/internal/agent/loop/identity"
 	"github.com/inventivepotter/urvi/internal/uuid"
 )
 
@@ -111,49 +112,49 @@ func TestShouldDeliver(t *testing.T) {
 		{
 			name:   "session-scoped SessionStarted always delivers despite empty filter",
 			filter: emptyFilter,
-			ev:     event.SessionStarted{Header: event.Header{SessionID: session}},
+			ev:     event.SessionStarted{Header: event.Header{Coordinates: identity.Coordinates{SessionID: session}}},
 			want:   true,
 		},
 		{
 			name:   "session-scoped SessionIdle always delivers despite empty filter",
 			filter: emptyFilter,
-			ev:     event.SessionIdle{Header: event.Header{SessionID: session}},
+			ev:     event.SessionIdle{Header: event.Header{Coordinates: identity.Coordinates{SessionID: session}}},
 			want:   true,
 		},
 		{
 			name:   "session-scoped SessionStopped always delivers",
 			filter: emptyFilter,
-			ev:     event.SessionStopped{Header: event.Header{SessionID: session}},
+			ev:     event.SessionStopped{Header: event.Header{Coordinates: identity.Coordinates{SessionID: session}}},
 			want:   true,
 		},
 		{
 			name:   "ephemeral TokenDelta from primary matches ephemeral scope",
 			filter: tuiFilter,
-			ev:     event.TokenDelta{Header: event.Header{SessionID: session, LoopID: primary}},
+			ev:     event.TokenDelta{Header: event.Header{Coordinates: identity.Coordinates{SessionID: session, LoopID: primary}}},
 			want:   true,
 		},
 		{
 			name:   "ephemeral TokenDelta from subagent does not match ephemeral scope",
 			filter: tuiFilter,
-			ev:     event.TokenDelta{Header: event.Header{SessionID: session, LoopID: subagent}},
+			ev:     event.TokenDelta{Header: event.Header{Coordinates: identity.Coordinates{SessionID: session, LoopID: subagent}}},
 			want:   false,
 		},
 		{
 			name:   "enduring LoopIdle from subagent matches All enduring scope",
 			filter: tuiFilter,
-			ev:     event.LoopIdle{Header: event.Header{SessionID: session, LoopID: subagent}},
+			ev:     event.LoopIdle{Header: event.Header{Coordinates: identity.Coordinates{SessionID: session, LoopID: subagent}}},
 			want:   true,
 		},
 		{
 			name:   "enduring StepDone from primary matches All enduring scope",
 			filter: tuiFilter,
-			ev:     event.StepDone{Header: event.Header{SessionID: session, LoopID: primary}},
+			ev:     event.StepDone{Header: event.Header{Coordinates: identity.Coordinates{SessionID: session, LoopID: primary}}},
 			want:   true,
 		},
 		{
 			name:   "enduring TurnStarted from subagent matches All enduring scope",
 			filter: tuiFilter,
-			ev:     event.TurnStarted{Header: event.Header{SessionID: session, LoopID: subagent}},
+			ev:     event.TurnStarted{Header: event.Header{Coordinates: identity.Coordinates{SessionID: session, LoopID: subagent}}},
 			want:   true,
 		},
 		// Amendment-1 delivery lock. ToolCallStarted/Completed are EPHEMERAL (see
@@ -167,43 +168,43 @@ func TestShouldDeliver(t *testing.T) {
 		{
 			name:   "ephemeral ToolCallStarted from subagent is muted (primary-only Ephemeral)",
 			filter: tuiFilter,
-			ev:     event.ToolCallStarted{Header: event.Header{SessionID: session, LoopID: subagent}},
+			ev:     event.ToolCallStarted{Header: event.Header{Coordinates: identity.Coordinates{SessionID: session, LoopID: subagent}}},
 			want:   false,
 		},
 		{
 			name:   "ephemeral ToolCallCompleted from subagent is muted (primary-only Ephemeral)",
 			filter: tuiFilter,
-			ev:     event.ToolCallCompleted{Header: event.Header{SessionID: session, LoopID: subagent}},
+			ev:     event.ToolCallCompleted{Header: event.Header{Coordinates: identity.Coordinates{SessionID: session, LoopID: subagent}}},
 			want:   false,
 		},
 		{
 			name:   "ephemeral ToolCallStarted from primary delivers (live tool spinner)",
 			filter: tuiFilter,
-			ev:     event.ToolCallStarted{Header: event.Header{SessionID: session, LoopID: primary}},
+			ev:     event.ToolCallStarted{Header: event.Header{Coordinates: identity.Coordinates{SessionID: session, LoopID: primary}}},
 			want:   true,
 		},
 		{
 			name:   "ephemeral ToolCallCompleted from primary delivers (tool result)",
 			filter: tuiFilter,
-			ev:     event.ToolCallCompleted{Header: event.Header{SessionID: session, LoopID: primary}},
+			ev:     event.ToolCallCompleted{Header: event.Header{Coordinates: identity.Coordinates{SessionID: session, LoopID: primary}}},
 			want:   true,
 		},
 		{
 			name:   "enduring PermissionRequested gate from subagent delivers (All enduring; gates never muted)",
 			filter: tuiFilter,
-			ev:     event.PermissionRequested{Header: event.Header{SessionID: session, LoopID: subagent}},
+			ev:     event.PermissionRequested{Header: event.Header{Coordinates: identity.Coordinates{SessionID: session, LoopID: subagent}}},
 			want:   true,
 		},
 		{
 			name:   "enduring UserInputRequested gate from subagent delivers (All enduring; gates never muted)",
 			filter: tuiFilter,
-			ev:     event.UserInputRequested{Header: event.Header{SessionID: session, LoopID: subagent}},
+			ev:     event.UserInputRequested{Header: event.Header{Coordinates: identity.Coordinates{SessionID: session, LoopID: subagent}}},
 			want:   true,
 		},
 		{
 			name:   "terminal TurnDone (enduring class) matched by enduring scope",
 			filter: tuiFilter,
-			ev:     event.TurnDone{Header: event.Header{SessionID: session, LoopID: subagent}},
+			ev:     event.TurnDone{Header: event.Header{Coordinates: identity.Coordinates{SessionID: session, LoopID: subagent}}},
 			want:   true,
 		},
 		{
@@ -212,7 +213,7 @@ func TestShouldDeliver(t *testing.T) {
 				Ephemeral: event.LoopScope{All: true},
 				Enduring:  event.LoopScope{Loops: map[uuid.UUID]struct{}{primary: {}}},
 			},
-			ev:   event.LoopIdle{Header: event.Header{SessionID: session, LoopID: subagent}},
+			ev:   event.LoopIdle{Header: event.Header{Coordinates: identity.Coordinates{SessionID: session, LoopID: subagent}}},
 			want: false,
 		},
 		{
@@ -222,7 +223,7 @@ func TestShouldDeliver(t *testing.T) {
 				Enduring:  event.LoopScope{All: true},
 			},
 			// subagent token: enduring is All, but ephemeral excludes subagent.
-			ev:   event.TokenDelta{Header: event.Header{SessionID: session, LoopID: subagent}},
+			ev:   event.TokenDelta{Header: event.Header{Coordinates: identity.Coordinates{SessionID: session, LoopID: subagent}}},
 			want: false,
 		},
 	}

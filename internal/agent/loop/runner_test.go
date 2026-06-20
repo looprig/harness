@@ -291,7 +291,7 @@ func TestRunBatch_ResultOrderMatchesCalls(t *testing.T) {
 	if len(results) != 2 {
 		t.Fatalf("len(results) = %d, want 2", len(results))
 	}
-	if results[0].CallID == (uuid.UUID{}) || results[0].ToolUseID != calls[0].ID {
+	if results[0].ToolExecutionID == (uuid.UUID{}) || results[0].ToolUseID != calls[0].ID {
 		t.Errorf("results[0].ToolUseID = %q, want %q", results[0].ToolUseID, calls[0].ID)
 	}
 	if results[1].ToolUseID != calls[1].ID {
@@ -299,6 +299,49 @@ func TestRunBatch_ResultOrderMatchesCalls(t *testing.T) {
 	}
 	if !strings.Contains(resultText(results[0]), "rb") || !strings.Contains(resultText(results[1]), "ra") {
 		t.Errorf("results out of order: %q, %q", resultText(results[0]), resultText(results[1]))
+	}
+}
+
+// TestRunBatch_ToolExecutionIDBindsToProviderToolUseID locks the two-id tool model:
+// RunBatch mints one internal ToolExecutionID per call (unique, non-zero, ours) and
+// binds it 1:1 to the model's provider ToolUseID (the ToolUseBlock.ID). The result
+// pairs back to the model ONLY by the provider ToolUseID — a ToolResultMessage built
+// from a result carries that provider id, never our internal ToolExecutionID.
+func TestRunBatch_ToolExecutionIDBindsToProviderToolUseID(t *testing.T) {
+	t.Parallel()
+	a := &fakeRunTool{name: "A", output: "ra"}
+	b := &fakeRunTool{name: "B", output: "rb"}
+	c := &fakeRunTool{name: "C", output: "rc"}
+	ts := ToolSet{Permission: autoApproveGate{}, Registry: []tool.InvokableTool{a, b, c}, MaxParallelToolCalls: 4}
+	emit, _ := collectEmit()
+	calls := []content.ToolUseBlock{call(t, "A", `{}`), call(t, "B", `{}`), call(t, "C", `{}`)}
+	results := runBatchNoGate(context.Background(), calls, ts, emit)
+	if len(results) != len(calls) {
+		t.Fatalf("len(results) = %d, want %d", len(results), len(calls))
+	}
+	seenExec := make(map[uuid.UUID]bool)
+	seenUse := make(map[string]bool)
+	for i, r := range results {
+		// Our minted handle: present, and unique across the batch (1:1, never reused).
+		if r.ToolExecutionID.IsZero() {
+			t.Errorf("results[%d]: ToolExecutionID is zero (must be minted)", i)
+		}
+		if seenExec[r.ToolExecutionID] {
+			t.Errorf("results[%d]: ToolExecutionID %v reused — not 1:1", i, r.ToolExecutionID)
+		}
+		seenExec[r.ToolExecutionID] = true
+		// Bound 1:1 to the model's provider ToolUseID for THIS call (call order).
+		if r.ToolUseID != calls[i].ID {
+			t.Errorf("results[%d]: ToolUseID = %q, want %q (provider id for this call)", i, r.ToolUseID, calls[i].ID)
+		}
+		if seenUse[r.ToolUseID] {
+			t.Errorf("results[%d]: ToolUseID %q reused — not 1:1", i, r.ToolUseID)
+		}
+		seenUse[r.ToolUseID] = true
+		// The result pairs back to the model by the provider ToolUseID only.
+		if got := toolResultMessage(r).ToolUseID; got != calls[i].ID {
+			t.Errorf("results[%d]: ToolResultMessage.ToolUseID = %q, want provider id %q", i, got, calls[i].ID)
+		}
 	}
 }
 
@@ -375,7 +418,7 @@ func TestRunBatch_SessionGrantVisibility(t *testing.T) {
 	go func() {
 		reg := <-gateReg
 		close(reg.ack)
-		reg.reply <- command.ApproveToolCall{CallID: reg.callID, Scope: tool.ScopeSession}
+		reg.reply <- command.ApproveToolCall{GateRoute: command.GateRoute{ToolExecutionID: reg.callID}, Scope: tool.ScopeSession}
 	}()
 
 	calls := []content.ToolUseBlock{call(t, "T", `{"n":1}`), call(t, "T", `{"n":2}`)}
@@ -642,7 +685,7 @@ func TestRunBatch_FailureVisibility(t *testing.T) {
 				go func() {
 					reg := <-gateReg
 					close(reg.ack)
-					reg.reply <- command.DenyToolCall{CallID: reg.callID}
+					reg.reply <- command.DenyToolCall{GateRoute: command.GateRoute{ToolExecutionID: reg.callID}}
 				}()
 				return ts, call(t, "T", `{}`), gateReg
 			},
@@ -700,7 +743,7 @@ func TestRunBatch_FailureVisibility(t *testing.T) {
 	}
 }
 
-// TestRunBatch_IDGenFailure: a call whose CallID cannot be minted (idGen returns
+// TestRunBatch_IDGenFailure: a call whose ToolExecutionID cannot be minted (idGen returns
 // an error) is a fail-secure pre-execution failure — it is NOT executed, NO gate
 // is opened for it, yet it still gets exactly one Started + one Completed{IsError}
 // + one error tool-result. Sibling calls with a working idGen still run and pair.
@@ -739,7 +782,7 @@ func TestRunBatch_IDGenFailure(t *testing.T) {
 
 			tl := &fakeRunTool{name: "T", output: "ran"}
 			// A gate that records whether it is ever consulted: a failed-mint call
-			// must never reach Check (no gate opened for a call with no CallID).
+			// must never reach Check (no gate opened for a call with no ToolExecutionID).
 			gate := &fakePermissionGate{checkFn: func(name, args string) Effect { return EffectAutoApprove }}
 			ts := ToolSet{Permission: gate, Registry: []tool.InvokableTool{tl}, MaxParallelToolCalls: 4}
 
@@ -886,7 +929,7 @@ func TestRunBatch_GrantErrorStillExecutes(t *testing.T) {
 	go func() {
 		reg := <-gateReg
 		close(reg.ack)
-		reg.reply <- command.ApproveToolCall{CallID: reg.callID, Scope: tool.ScopeWorkspace}
+		reg.reply <- command.ApproveToolCall{GateRoute: command.GateRoute{ToolExecutionID: reg.callID}, Scope: tool.ScopeWorkspace}
 	}()
 	results := RunBatch(context.Background(), []content.ToolUseBlock{call(t, "T", `{}`)}, ts, gateReg, uuid.New, emit)
 	if results[0].IsError {
@@ -915,7 +958,7 @@ func TestRunBatch_ScopeOnceNoGrant(t *testing.T) {
 	go func() {
 		reg := <-gateReg
 		close(reg.ack)
-		reg.reply <- command.ApproveToolCall{CallID: reg.callID, Scope: tool.ScopeOnce}
+		reg.reply <- command.ApproveToolCall{GateRoute: command.GateRoute{ToolExecutionID: reg.callID}, Scope: tool.ScopeOnce}
 	}()
 	results := RunBatch(context.Background(), []content.ToolUseBlock{call(t, "T", `{}`)}, ts, gateReg, uuid.New, emit)
 	if results[0].IsError {
@@ -995,7 +1038,7 @@ func TestRunBatch_ToolErrorBecomesResult(t *testing.T) {
 	}
 }
 
-// TestRunBatch_CtxInjectedPerCall: the per-call ctx must carry CallID + emit +
+// TestRunBatch_CtxInjectedPerCall: the per-call ctx must carry ToolExecutionID + emit +
 // gateReg so an event-emitting / input-requesting tool works. We use a tool that
 // calls RequestUserInput.
 func TestRunBatch_CtxInjectedPerCall(t *testing.T) {
@@ -1007,7 +1050,7 @@ func TestRunBatch_CtxInjectedPerCall(t *testing.T) {
 	go func() {
 		reg := <-gateReg
 		close(reg.ack)
-		reg.reply <- command.ProvideUserInput{CallID: reg.callID, Answer: "green"}
+		reg.reply <- command.ProvideUserInput{GateRoute: command.GateRoute{ToolExecutionID: reg.callID}, Answer: "green"}
 	}()
 	results := RunBatch(context.Background(), []content.ToolUseBlock{call(t, "Ask", `{}`)}, ts, gateReg, uuid.New, emit)
 	if results[0].IsError {
@@ -1027,7 +1070,7 @@ func TestRunBatch_CtxInjectedPerCall(t *testing.T) {
 	}
 }
 
-// ctxProbeTool calls RequestUserInput to prove the runner injected emit/CallID/
+// ctxProbeTool calls RequestUserInput to prove the runner injected emit/ToolExecutionID/
 // gateReg into the per-call ctx.
 type ctxProbeTool struct{ name string }
 

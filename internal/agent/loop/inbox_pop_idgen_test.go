@@ -87,7 +87,7 @@ func TestInboxPopIDGenFailureReturnsEntry(t *testing.T) {
 	client.mu.Lock()
 	client.onStreamN = map[int]func(){
 		0: func() {
-			l.Commands <- command.UserInput{Header: command.Header{ID: queuedID}, Mode: command.AllowFold}
+			l.Commands <- command.UserInput{Header: command.Header{CommandID: queuedID}, Mode: command.AllowFold}
 			if _, ok := awaitReply(t, rec, queuedID).(event.InputQueued); !ok {
 				t.Errorf("queued submit during final step not InputQueued")
 			}
@@ -108,7 +108,7 @@ func TestInboxPopIDGenFailureReturnsEntry(t *testing.T) {
 	blockUntilEvents(t, rec, func(evs []event.Event) bool {
 		for _, e := range evs {
 			if ic, ok := e.(event.InputCancelled); ok &&
-				ic.InputID == queuedID && ic.Reason == event.CancelTurnFailed {
+				ic.Cause.CommandID == queuedID && ic.Reason == event.CancelTurnFailed {
 				return true
 			}
 		}
@@ -117,7 +117,7 @@ func TestInboxPopIDGenFailureReturnsEntry(t *testing.T) {
 
 	// And no second turn ever started from the popped entry.
 	for _, e := range rec.events() {
-		if ts, ok := e.(event.TurnStarted); ok && ts.InputID == queuedID {
+		if ts, ok := e.(event.TurnStarted); ok && ts.Cause.CommandID == queuedID {
 			t.Fatal("popped entry was auto-started despite id-gen failure, want InputCancelled")
 		}
 	}

@@ -8,6 +8,7 @@ import (
 
 	"github.com/inventivepotter/urvi/internal/agent/loop/command"
 	"github.com/inventivepotter/urvi/internal/agent/loop/event"
+	"github.com/inventivepotter/urvi/internal/agent/loop/identity"
 	"github.com/inventivepotter/urvi/internal/content"
 	"github.com/inventivepotter/urvi/internal/llm"
 	"github.com/inventivepotter/urvi/internal/uuid"
@@ -19,7 +20,7 @@ import (
 // path (no per-turn stream).
 func submitUserInput(t *testing.T, l *Loop, rec *recordingPublisher, id uuid.UUID, mode command.InputMode) event.Event {
 	t.Helper()
-	l.Commands <- command.UserInput{Header: command.Header{ID: id}, Mode: mode}
+	l.Commands <- command.UserInput{Header: command.Header{CommandID: id}, Mode: mode}
 	return awaitReply(t, rec, id)
 }
 
@@ -30,22 +31,22 @@ func textBlocks(s string) []content.Block {
 
 // TestSubmitToIdleStartsTurn: an AllowFold UserInput to an idle loop publishes
 // event.TurnStarted (the Started outcome) carrying InputID, Message, and
-// CausationID == InputID. There is no separate Started reply: the TurnStarted IS the
+// Cause.CommandID == InputID. There is no separate Started reply: the TurnStarted IS the
 // outcome.
 func TestSubmitToIdleStartsTurn(t *testing.T) {
 	t.Parallel()
 	l, rec, _ := newLoopRec(t, &fakeLLM{chunks: []content.Chunk{textChunk("hi")}})
 
 	inputID := mustID(t)
-	l.Commands <- command.UserInput{Header: command.Header{ID: inputID}, Mode: command.AllowFold, Blocks: textBlocks("hello")}
+	l.Commands <- command.UserInput{Header: command.Header{CommandID: inputID}, Mode: command.AllowFold, Blocks: textBlocks("hello")}
 
 	ev := awaitReply(t, rec, inputID)
 	started, ok := ev.(event.TurnStarted)
 	if !ok {
 		t.Fatalf("outcome = %T, want event.TurnStarted", ev)
 	}
-	if started.InputID != inputID || started.CausationID != inputID {
-		t.Errorf("TurnStarted InputID/CausationID = %v/%v, want %v", started.InputID, started.CausationID, inputID)
+	if started.Cause.CommandID != inputID {
+		t.Errorf("TurnStarted Cause.CommandID = %v, want %v", started.Cause.CommandID, inputID)
 	}
 	if started.TurnID.IsZero() {
 		t.Error("TurnStarted.TurnID is zero, want a minted turn id")
@@ -56,28 +57,38 @@ func TestSubmitToIdleStartsTurn(t *testing.T) {
 }
 
 // TestSubagentResultToIdleStartsTurn: a SubagentResult to an idle loop starts a turn
-// and stamps the producing subagent's loop id as TriggeredByLoopID on the published
-// event.TurnStarted.
+// and stamps the producing CHILD subagent's loop id (Cause.LoopID) as Cause.LoopID on
+// the published event.TurnStarted — NOT the PARENT loop id carried by the embedded
+// Coordinates (the delivery target). This is the end-to-end proof that the wake token
+// rides the CHILD, which is the behavior the old FromLoopID provided.
 func TestSubagentResultToIdleStartsTurn(t *testing.T) {
 	t.Parallel()
 	l, rec, _ := newLoopRec(t, &fakeLLM{chunks: []content.Chunk{textChunk("hi")}})
 
 	inputID := mustID(t)
-	fromLoop := mustID(t)
-	l.Commands <- command.SubagentResult{Header: command.Header{ID: inputID}, FromLoopID: fromLoop, Blocks: textBlocks("subagent output")}
+	childLoop := mustID(t)  // the producing subagent (wake token)
+	parentLoop := mustID(t) // the delivery target — must NOT appear as Cause.LoopID
+	l.Commands <- command.SubagentResult{
+		Coordinates: identity.Coordinates{LoopID: parentLoop},
+		Header:      command.Header{CommandID: inputID, Cause: identity.Cause{Coordinates: identity.Coordinates{LoopID: childLoop}}},
+		Blocks:      textBlocks("subagent output"),
+	}
 
 	ev := awaitReply(t, rec, inputID)
 	started, ok := ev.(event.TurnStarted)
-	if !ok || started.InputID != inputID {
-		t.Fatalf("outcome = %+v, want event.TurnStarted{InputID:%v}", ev, inputID)
+	if !ok || started.Cause.CommandID != inputID {
+		t.Fatalf("outcome = %+v, want event.TurnStarted{Cause.CommandID:%v}", ev, inputID)
 	}
-	if started.TriggeredByLoopID != fromLoop {
-		t.Errorf("TurnStarted.TriggeredByLoopID = %v, want %v", started.TriggeredByLoopID, fromLoop)
+	if started.Cause.LoopID != childLoop {
+		t.Errorf("TurnStarted.Cause.LoopID = %v, want %v (the CHILD = wake token)", started.Cause.LoopID, childLoop)
+	}
+	if started.Cause.LoopID == parentLoop {
+		t.Errorf("TurnStarted.Cause.LoopID = %v leaked the PARENT delivery target, want the CHILD", started.Cause.LoopID)
 	}
 }
 
 // TestSubmitToRunningQueueableQueues: an AllowFold UserInput to a running loop
-// publishes event.InputQueued{InputID} (CausationID == InputID, no TurnID) and is
+// publishes event.InputQueued{InputID} (Cause.CommandID == InputID, no TurnID) and is
 // held in the inbox in order.
 func TestSubmitToRunningQueueableQueues(t *testing.T) {
 	t.Parallel()
@@ -103,8 +114,8 @@ func TestSubmitToRunningQueueableQueues(t *testing.T) {
 		if !ok {
 			t.Fatalf("%s: outcome = %T, want event.InputQueued", tc.name, tc.ev)
 		}
-		if q.InputID != tc.want || q.CausationID != tc.want {
-			t.Errorf("%s: InputQueued InputID/CausationID = %v/%v, want %v", tc.name, q.InputID, q.CausationID, tc.want)
+		if q.Cause.CommandID != tc.want {
+			t.Errorf("%s: InputQueued Cause.CommandID = %v, want %v", tc.name, q.Cause.CommandID, tc.want)
 		}
 		if !q.TurnID.IsZero() {
 			t.Errorf("%s: InputQueued.TurnID = %v, want zero (no turn yet)", tc.name, q.TurnID)
@@ -132,16 +143,20 @@ func TestSubagentResultToFullInboxQueues(t *testing.T) {
 	}
 
 	// A SubagentResult to the full inbox must still QUEUE (never reject).
-	fromLoop := mustID(t)
+	childLoop := mustID(t)
 	srID := mustID(t)
-	l.Commands <- command.SubagentResult{Header: command.Header{ID: srID}, FromLoopID: fromLoop, Blocks: textBlocks("subagent output")}
+	l.Commands <- command.SubagentResult{
+		Coordinates: identity.Coordinates{LoopID: mustID(t)}, // PARENT delivery target
+		Header:      command.Header{CommandID: srID, Cause: identity.Cause{Coordinates: identity.Coordinates{LoopID: childLoop}}},
+		Blocks:      textBlocks("subagent output"),
+	}
 	ev := awaitReply(t, rec, srID)
 	q, ok := ev.(event.InputQueued)
 	if !ok {
 		t.Fatalf("SubagentResult to full inbox outcome = %T, want event.InputQueued (never rejected)", ev)
 	}
-	if q.InputID != srID || q.TriggeredByLoopID != fromLoop {
-		t.Errorf("InputQueued InputID/TriggeredByLoopID = %v/%v, want %v/%v", q.InputID, q.TriggeredByLoopID, srID, fromLoop)
+	if q.Cause.CommandID != srID || q.Cause.LoopID != childLoop {
+		t.Errorf("InputQueued InputID/Cause.LoopID = %v/%v, want %v/%v", q.Cause.CommandID, q.Cause.LoopID, srID, childLoop)
 	}
 }
 
@@ -149,11 +164,12 @@ func TestSubagentResultToFullInboxQueues(t *testing.T) {
 // IDLE loop whose TurnID id-gen fails is NEVER rejected — it surfaces as
 // event.InputCancelled{CancelTurnFailed} (NOT event.TurnRejected), because a
 // SubagentResult's {wake} quiescence token releases only via an Enduring event
-// carrying TriggeredByLoopID (InputCancelled does; TurnRejected does NOT). This is
+// carrying Cause.LoopID (InputCancelled does; TurnRejected does NOT). This is
 // the SubagentResult half of the idle id-gen-failure branch (loop.go decideSubmit's
 // bypassReject path); the plain-UserInput half is covered by
-// TestTurnIDGenerationFailure. The cancellation must carry CausationID == the
-// SubagentResult command id (== InputID) and TriggeredByLoopID == FromLoopID.
+// TestTurnIDGenerationFailure. The cancellation must carry Cause.CommandID == the
+// SubagentResult command id (== InputID) and Cause.LoopID == the CHILD loop
+// (Header.Cause.LoopID).
 func TestSubagentResultIDGenerationFailureCancels(t *testing.T) {
 	t.Parallel()
 	genErr := errors.New("rand source exhausted")
@@ -182,11 +198,11 @@ func TestSubagentResultIDGenerationFailureCancels(t *testing.T) {
 			}
 
 			inputID := mustID(t)
-			fromLoop := mustID(t)
+			childLoop := mustID(t)
 			l.Commands <- command.SubagentResult{
-				Header:     command.Header{ID: inputID},
-				FromLoopID: fromLoop,
-				Blocks:     textBlocks("subagent output"),
+				Coordinates: identity.Coordinates{LoopID: mustID(t)}, // PARENT delivery target
+				Header:      command.Header{CommandID: inputID, Cause: identity.Cause{Coordinates: identity.Coordinates{LoopID: childLoop}}},
+				Blocks:      textBlocks("subagent output"),
 			}
 
 			// A never-rejected SubagentResult that cannot mint its TurnID resolves as
@@ -200,16 +216,16 @@ func TestSubagentResultIDGenerationFailureCancels(t *testing.T) {
 			if ic.Reason != event.CancelTurnFailed {
 				t.Errorf("InputCancelled.Reason = %d, want CancelTurnFailed", ic.Reason)
 			}
-			if ic.InputID != inputID || ic.CausationID != inputID {
-				t.Errorf("InputCancelled InputID/CausationID = %v/%v, want %v", ic.InputID, ic.CausationID, inputID)
+			if ic.Cause.CommandID != inputID {
+				t.Errorf("InputCancelled Cause.CommandID = %v, want %v", ic.Cause.CommandID, inputID)
 			}
-			if ic.TriggeredByLoopID != fromLoop {
-				t.Errorf("InputCancelled.TriggeredByLoopID = %v, want %v (releases the subagent's {wake} token)", ic.TriggeredByLoopID, fromLoop)
+			if ic.Cause.LoopID != childLoop {
+				t.Errorf("InputCancelled.Cause.LoopID = %v, want %v (the CHILD releases the {wake} token)", ic.Cause.LoopID, childLoop)
 			}
 
 			// It must NOT be rejected: a TurnRejected would not carry/release the {wake} token.
 			for _, e := range rec.events() {
-				if rej, ok := e.(event.TurnRejected); ok && rej.InputID == inputID {
+				if rej, ok := e.(event.TurnRejected); ok && rej.Cause.CommandID == inputID {
 					t.Fatalf("SubagentResult was rejected (%+v); a SubagentResult is never rejected", rej)
 				}
 			}
@@ -230,7 +246,7 @@ func TestStartOnlyBusyRejected(t *testing.T) {
 	ev := make(chan event.Event, 1)
 	ab := make(chan struct{})
 	defer close(ab)
-	l.Commands <- command.UserInput{Header: command.Header{ID: id}, Mode: command.StartOnly, Events: ev, Abandoned: ab}
+	l.Commands <- command.UserInput{Header: command.Header{CommandID: id}, Mode: command.StartOnly, Events: ev, Abandoned: ab}
 
 	// The per-turn stream carries the reason as its first event, then closes.
 	first, ok := <-ev
@@ -245,10 +261,10 @@ func TestStartOnlyBusyRejected(t *testing.T) {
 		t.Error("rejected turn's per-turn stream should be closed after the reason")
 	}
 
-	// And the published fan-in event mirrors it (CausationID == InputID).
+	// And the published fan-in event mirrors it (Cause.CommandID == InputID).
 	pub, ok := awaitReply(t, rec, id).(event.TurnRejected)
-	if !ok || pub.Reason != event.RejectBusy || pub.InputID != id {
-		t.Fatalf("published outcome = %+v, want event.TurnRejected{RejectBusy, InputID:%v}", pub, id)
+	if !ok || pub.Reason != event.RejectBusy || pub.Cause.CommandID != id {
+		t.Fatalf("published outcome = %+v, want event.TurnRejected{RejectBusy, Cause.CommandID:%v}", pub, id)
 	}
 }
 
@@ -295,7 +311,7 @@ func TestShuttingDownRejected(t *testing.T) {
 	for {
 		id := mustID(t)
 		select {
-		case l.Commands <- command.UserInput{Header: command.Header{ID: id}, Mode: command.AllowFold}:
+		case l.Commands <- command.UserInput{Header: command.Header{CommandID: id}, Mode: command.AllowFold}:
 		case <-l.Done:
 			// Loop exited before we observed the rejection — acceptable: a stopped
 			// loop also refuses input. End the test.
@@ -357,7 +373,7 @@ func TestNormalCompletionPopsInbox(t *testing.T) {
 	client.mu.Lock()
 	client.onStreamN = map[int]func(){
 		0: func() {
-			l.Commands <- command.UserInput{Header: command.Header{ID: queuedID}, Mode: command.AllowFold}
+			l.Commands <- command.UserInput{Header: command.Header{CommandID: queuedID}, Mode: command.AllowFold}
 		},
 	}
 	client.mu.Unlock()
@@ -373,7 +389,7 @@ func TestNormalCompletionPopsInbox(t *testing.T) {
 	// turn 2 from it. A second event.TurnStarted must appear carrying the queued InputID.
 	blockUntilEvents(t, rec, func(evs []event.Event) bool {
 		for _, e := range evs {
-			if ts, ok := e.(event.TurnStarted); ok && ts.InputID == queuedID {
+			if ts, ok := e.(event.TurnStarted); ok && ts.Cause.CommandID == queuedID {
 				return true
 			}
 		}

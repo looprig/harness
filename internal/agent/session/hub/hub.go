@@ -17,10 +17,11 @@ import (
 	"sync"
 
 	"github.com/inventivepotter/urvi/internal/agent/loop/event"
+	"github.com/inventivepotter/urvi/internal/agent/loop/identity"
 	"github.com/inventivepotter/urvi/internal/uuid"
 )
 
-// Hub is the session's event fan-in. It is owned by AgentSession; loops see only
+// Hub is the session's event fan-in. It is owned by Session; loops see only
 // its PublishEvent method (the narrow eventPublisher), and consumers see only
 // SubscribeEvents. ExpectTurn/CancelExpectTurn/StopSession are session-owned (the
 // session calls them; loops depend on the eventPublisher interface, which excludes
@@ -121,10 +122,10 @@ func (h *Hub) snapshotSubsLocked() []*EventSubscription {
 
 // activeMutation returns the sessionState mutation an event implies and whether it
 // mutates at all. The mutating events:
-//   - TurnStarted: add {loop, LoopID}; if TriggeredByLoopID != 0, also remove its
+//   - TurnStarted: add {loop, LoopID}; if Cause.LoopID != 0, also remove its
 //     {wake} (the hand-back release; the loop key is added in the same step).
 //   - LoopIdle: remove {loop, LoopID}.
-//   - TurnFoldedInto / InputCancelled with TriggeredByLoopID != 0: remove {wake}.
+//   - TurnFoldedInto / InputCancelled with Cause.LoopID != 0: remove {wake}.
 //
 // Every other event is non-mutating (token firehose, StepDone, tool/gate, the
 // session events themselves, and terminals).
@@ -132,7 +133,7 @@ func activeMutation(ev event.Event) (func(*sessionState), bool) {
 	switch e := ev.(type) {
 	case event.TurnStarted:
 		loopID := e.LoopID
-		wake := e.TriggeredByLoopID
+		wake := e.Cause.LoopID
 		return func(s *sessionState) {
 			if !wake.IsZero() {
 				s.remove(activityKey{kind: kindWake, id: wake})
@@ -145,16 +146,16 @@ func activeMutation(ev event.Event) (func(*sessionState), bool) {
 			s.remove(activityKey{kind: kindLoop, id: loopID})
 		}, true
 	case event.TurnFoldedInto:
-		if e.TriggeredByLoopID.IsZero() {
+		if e.Cause.LoopID.IsZero() {
 			return nil, false
 		}
-		wake := e.TriggeredByLoopID
+		wake := e.Cause.LoopID
 		return func(s *sessionState) { s.remove(activityKey{kind: kindWake, id: wake}) }, true
 	case event.InputCancelled:
-		if e.TriggeredByLoopID.IsZero() {
+		if e.Cause.LoopID.IsZero() {
 			return nil, false
 		}
-		wake := e.TriggeredByLoopID
+		wake := e.Cause.LoopID
 		return func(s *sessionState) { s.remove(activityKey{kind: kindWake, id: wake}) }, true
 	default:
 		return nil, false
@@ -236,7 +237,7 @@ func (h *Hub) StopSession(_ context.Context) {
 	subs := h.snapshotSubsLocked()
 	h.mu.Unlock()
 
-	h.deliver(subs, event.SessionStopped{Header: event.Header{SessionID: h.sessionID}})
+	h.deliver(subs, event.SessionStopped{Header: event.Header{Coordinates: identity.Coordinates{SessionID: h.sessionID}}})
 }
 
 // WaitIdle blocks until the session is quiescent (active empty), ctx is done, or

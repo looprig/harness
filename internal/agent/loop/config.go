@@ -18,7 +18,7 @@ type Config struct {
 	Tools ToolSet
 
 	// idGen mints the loop's correlation IDs: the per-turn TurnID, each StepID,
-	// and each tool-call CallID. It is unexported, so the composition root cannot
+	// and each tool-call ToolExecutionID. It is unexported, so the composition root cannot
 	// set it: New defaults it to uuid.New. It exists only as a test seam for
 	// exercising the crypto/rand failure branches.
 	idGen idGenerator

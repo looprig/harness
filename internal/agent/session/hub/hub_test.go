@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/inventivepotter/urvi/internal/agent/loop/event"
+	"github.com/inventivepotter/urvi/internal/agent/loop/identity"
 	"github.com/inventivepotter/urvi/internal/uuid"
 )
 
@@ -56,7 +57,7 @@ func TestPublishNoSubscribers(t *testing.T) {
 	h := New(session)
 
 	// TurnStarted with no subscribers: no error, no block, phase becomes Active.
-	if err := h.PublishEvent(context.Background(), event.TurnStarted{Header: event.Header{SessionID: session, LoopID: loopA}}); err != nil {
+	if err := h.PublishEvent(context.Background(), event.TurnStarted{Header: event.Header{Coordinates: identity.Coordinates{SessionID: session, LoopID: loopA}}}); err != nil {
 		t.Fatalf("PublishEvent(TurnStarted) = %v, want nil", err)
 	}
 
@@ -72,7 +73,7 @@ func TestPublishNoSubscribers(t *testing.T) {
 	case <-time.After(50 * time.Millisecond):
 	}
 
-	if err := h.PublishEvent(context.Background(), event.LoopIdle{Header: event.Header{SessionID: session, LoopID: loopA}}); err != nil {
+	if err := h.PublishEvent(context.Background(), event.LoopIdle{Header: event.Header{Coordinates: identity.Coordinates{SessionID: session, LoopID: loopA}}}); err != nil {
 		t.Fatalf("PublishEvent(LoopIdle) = %v, want nil", err)
 	}
 	if err := <-idleErr; err != nil {
@@ -103,7 +104,7 @@ func TestPublishFilteredDelivery(t *testing.T) {
 	}
 
 	// A StepDone from the subagent: 'all' gets it, 'onlyPrimary' does not.
-	if err := h.PublishEvent(context.Background(), event.StepDone{Header: event.Header{SessionID: session, LoopID: subagent}}); err != nil {
+	if err := h.PublishEvent(context.Background(), event.StepDone{Header: event.Header{Coordinates: identity.Coordinates{SessionID: session, LoopID: subagent}}}); err != nil {
 		t.Fatalf("PublishEvent = %v", err)
 	}
 	if got := recv(t, all); got.EventHeader().LoopID != subagent {
@@ -112,7 +113,7 @@ func TestPublishFilteredDelivery(t *testing.T) {
 	expectNone(t, onlyPrimary)
 
 	// A StepDone from the primary: both get it.
-	if err := h.PublishEvent(context.Background(), event.StepDone{Header: event.Header{SessionID: session, LoopID: primary}}); err != nil {
+	if err := h.PublishEvent(context.Background(), event.StepDone{Header: event.Header{Coordinates: identity.Coordinates{SessionID: session, LoopID: primary}}}); err != nil {
 		t.Fatalf("PublishEvent = %v", err)
 	}
 	if got := recv(t, onlyPrimary); got.EventHeader().LoopID != primary {
@@ -132,7 +133,7 @@ func TestPublishOrderingWithDerivedPosts(t *testing.T) {
 		t.Fatalf("SubscribeEvents = %v", err)
 	}
 
-	if err := h.PublishEvent(context.Background(), event.TurnStarted{Header: event.Header{SessionID: session, LoopID: loopA}}); err != nil {
+	if err := h.PublishEvent(context.Background(), event.TurnStarted{Header: event.Header{Coordinates: identity.Coordinates{SessionID: session, LoopID: loopA}}}); err != nil {
 		t.Fatalf("PublishEvent(TurnStarted) = %v", err)
 	}
 	if _, ok := recv(t, sub).(event.TurnStarted); !ok {
@@ -142,7 +143,7 @@ func TestPublishOrderingWithDerivedPosts(t *testing.T) {
 		t.Fatalf("second event not derived SessionActive")
 	}
 
-	if err := h.PublishEvent(context.Background(), event.LoopIdle{Header: event.Header{SessionID: session, LoopID: loopA}}); err != nil {
+	if err := h.PublishEvent(context.Background(), event.LoopIdle{Header: event.Header{Coordinates: identity.Coordinates{SessionID: session, LoopID: loopA}}}); err != nil {
 		t.Fatalf("PublishEvent(LoopIdle) = %v", err)
 	}
 	if _, ok := recv(t, sub).(event.LoopIdle); !ok {
@@ -176,7 +177,7 @@ func TestEphemeralOverflowDrops(t *testing.T) {
 	go func() {
 		defer close(done)
 		for i := 0; i < defaultEgressBuffer*3; i++ {
-			_ = h.PublishEvent(context.Background(), event.TokenDelta{Header: event.Header{SessionID: session, LoopID: loopA}})
+			_ = h.PublishEvent(context.Background(), event.TokenDelta{Header: event.Header{Coordinates: identity.Coordinates{SessionID: session, LoopID: loopA}}})
 		}
 	}()
 	select {
@@ -224,7 +225,7 @@ func TestEnduringOverflowFailsSubscription(t *testing.T) {
 	// Fill slow's buffer entirely with Enduring events (it never reads), then one
 	// more to overflow and fail it.
 	for i := 0; i < defaultEgressBuffer+1; i++ {
-		if err := h.PublishEvent(context.Background(), event.StepDone{Header: event.Header{SessionID: session, LoopID: loopA}}); err != nil {
+		if err := h.PublishEvent(context.Background(), event.StepDone{Header: event.Header{Coordinates: identity.Coordinates{SessionID: session, LoopID: loopA}}}); err != nil {
 			t.Fatalf("PublishEvent = %v", err)
 		}
 	}
@@ -291,7 +292,7 @@ func TestDeliveryOutsideLock(t *testing.T) {
 
 	// Saturate slow's egress buffer with Ephemeral events (dropped past cap).
 	for i := 0; i < defaultEgressBuffer*2; i++ {
-		_ = h.PublishEvent(context.Background(), event.TokenDelta{Header: event.Header{SessionID: session, LoopID: loopA}})
+		_ = h.PublishEvent(context.Background(), event.TokenDelta{Header: event.Header{Coordinates: identity.Coordinates{SessionID: session, LoopID: loopA}}})
 	}
 
 	// Now a second SubscribeEvents and a PublishEvent must complete promptly: if
@@ -306,7 +307,7 @@ func TestDeliveryOutsideLock(t *testing.T) {
 	pubDone := make(chan struct{})
 	go func() {
 		defer close(pubDone)
-		_ = h.PublishEvent(context.Background(), event.TokenDelta{Header: event.Header{SessionID: session, LoopID: loopA}})
+		_ = h.PublishEvent(context.Background(), event.TokenDelta{Header: event.Header{Coordinates: identity.Coordinates{SessionID: session, LoopID: loopA}}})
 	}()
 	for _, c := range []chan struct{}{subDone, pubDone} {
 		select {
@@ -342,7 +343,7 @@ func TestDeliveryOutsideLockConcurrentOps(t *testing.T) {
 			case <-stop:
 				return
 			default:
-				_ = h.PublishEvent(context.Background(), event.TokenDelta{Header: event.Header{SessionID: session, LoopID: loopA}})
+				_ = h.PublishEvent(context.Background(), event.TokenDelta{Header: event.Header{Coordinates: identity.Coordinates{SessionID: session, LoopID: loopA}}})
 			}
 		}
 	}()
@@ -379,7 +380,7 @@ func TestStopSession(t *testing.T) {
 	}
 
 	// Make the session Active so a WaitIdle blocks.
-	if err := h.PublishEvent(context.Background(), event.TurnStarted{Header: event.Header{SessionID: session, LoopID: loopA}}); err != nil {
+	if err := h.PublishEvent(context.Background(), event.TurnStarted{Header: event.Header{Coordinates: identity.Coordinates{SessionID: session, LoopID: loopA}}}); err != nil {
 		t.Fatalf("PublishEvent = %v", err)
 	}
 	_ = recv(t, sub) // TurnStarted
@@ -413,7 +414,7 @@ func TestStopSession(t *testing.T) {
 
 	// A post-stop publish delivers (filtered) but does not mutate phase nor derive
 	// SessionIdle: deliver a LoopIdle (which would normally remove a {loop} key).
-	if err := h.PublishEvent(context.Background(), event.LoopIdle{Header: event.Header{SessionID: session, LoopID: loopA}}); err != nil {
+	if err := h.PublishEvent(context.Background(), event.LoopIdle{Header: event.Header{Coordinates: identity.Coordinates{SessionID: session, LoopID: loopA}}}); err != nil {
 		t.Fatalf("post-stop PublishEvent = %v", err)
 	}
 	got := recv(t, sub)
@@ -462,7 +463,7 @@ func TestExpectTurnCancelExpectTurn(t *testing.T) {
 	}
 }
 
-// TestHandbackReleaseNoEdge proves a TurnStarted carrying TriggeredByLoopID
+// TestHandbackReleaseNoEdge proves a TurnStarted carrying Cause.LoopID
 // removes the {wake} and adds the {loop} key in one step, crossing no emptiness
 // edge: while a wake token is outstanding, the parent's TurnStarted does not
 // re-fire SessionActive.
@@ -486,7 +487,8 @@ func TestHandbackReleaseNoEdge(t *testing.T) {
 	// Hand-back TurnStarted on the parent: removes {wake, subagent}, adds
 	// {loop, parent} in the same step. No edge -> only the TurnStarted is delivered.
 	if err := h.PublishEvent(context.Background(), event.TurnStarted{Header: event.Header{
-		SessionID: session, LoopID: parent, TriggeredByLoopID: subagent,
+		Coordinates: identity.Coordinates{SessionID: session, LoopID: parent},
+		Cause:       identity.Cause{Coordinates: identity.Coordinates{LoopID: subagent}},
 	}}); err != nil {
 		t.Fatalf("PublishEvent = %v", err)
 	}
@@ -496,7 +498,7 @@ func TestHandbackReleaseNoEdge(t *testing.T) {
 	expectNoMore(t, sub) // no derived SessionActive/SessionIdle
 
 	// Parent goes idle: {loop, parent} removed -> empties -> SessionIdle.
-	if err := h.PublishEvent(context.Background(), event.LoopIdle{Header: event.Header{SessionID: session, LoopID: parent}}); err != nil {
+	if err := h.PublishEvent(context.Background(), event.LoopIdle{Header: event.Header{Coordinates: identity.Coordinates{SessionID: session, LoopID: parent}}}); err != nil {
 		t.Fatalf("PublishEvent = %v", err)
 	}
 	if _, ok := recv(t, sub).(event.LoopIdle); !ok {
@@ -520,7 +522,7 @@ func TestWaitIdleAlreadyIdle(t *testing.T) {
 	}
 
 	// Make Active, then prove ctx cancellation unblocks a waiter.
-	if err := h.PublishEvent(context.Background(), event.TurnStarted{Header: event.Header{SessionID: session, LoopID: loopA}}); err != nil {
+	if err := h.PublishEvent(context.Background(), event.TurnStarted{Header: event.Header{Coordinates: identity.Coordinates{SessionID: session, LoopID: loopA}}}); err != nil {
 		t.Fatalf("PublishEvent = %v", err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -569,7 +571,7 @@ func TestCloseDetachesFromHub(t *testing.T) {
 	}
 
 	// A publish after detach is a clean no-op delivery (and never panics).
-	if err := h.PublishEvent(context.Background(), event.StepDone{Header: event.Header{SessionID: session, LoopID: loopA}}); err != nil {
+	if err := h.PublishEvent(context.Background(), event.StepDone{Header: event.Header{Coordinates: identity.Coordinates{SessionID: session, LoopID: loopA}}}); err != nil {
 		t.Fatalf("PublishEvent after detach = %v", err)
 	}
 }
@@ -610,8 +612,8 @@ func TestConcurrentCloseDuringDelivery(t *testing.T) {
 			case <-stop:
 				return
 			default:
-				_ = h.PublishEvent(context.Background(), event.StepDone{Header: event.Header{SessionID: session, LoopID: loopA}})
-				_ = h.PublishEvent(context.Background(), event.TokenDelta{Header: event.Header{SessionID: session, LoopID: loopA}})
+				_ = h.PublishEvent(context.Background(), event.StepDone{Header: event.Header{Coordinates: identity.Coordinates{SessionID: session, LoopID: loopA}}})
+				_ = h.PublishEvent(context.Background(), event.TokenDelta{Header: event.Header{Coordinates: identity.Coordinates{SessionID: session, LoopID: loopA}}})
 			}
 		}
 	}()
@@ -631,7 +633,7 @@ func TestConcurrentCloseDuringDelivery(t *testing.T) {
 }
 
 // TestTurnFoldedAndInputCancelledReleaseWake covers the other two wake-release
-// publish paths: TurnFoldedInto and InputCancelled carrying TriggeredByLoopID
+// publish paths: TurnFoldedInto and InputCancelled carrying Cause.LoopID
 // remove {wake, s}. With the parent already busy, folding empties nothing; an
 // InputCancelled when the wake is the only entry empties active and fires Idle.
 func TestTurnFoldedAndInputCancelledReleaseWake(t *testing.T) {
@@ -650,10 +652,11 @@ func TestTurnFoldedAndInputCancelledReleaseWake(t *testing.T) {
 		t.Fatalf("expectTurn did not derive SessionActive")
 	}
 
-	// InputCancelled carrying TriggeredByLoopID removes {wake, subagent}; that was
+	// InputCancelled carrying Cause.LoopID removes {wake, subagent}; that was
 	// the only entry -> SessionIdle.
 	if err := h.PublishEvent(context.Background(), event.InputCancelled{Header: event.Header{
-		SessionID: session, LoopID: subagent, TriggeredByLoopID: subagent,
+		Coordinates: identity.Coordinates{SessionID: session, LoopID: subagent},
+		Cause:       identity.Cause{Coordinates: identity.Coordinates{LoopID: subagent}},
 	}}); err != nil {
 		t.Fatalf("PublishEvent = %v", err)
 	}

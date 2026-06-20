@@ -120,11 +120,11 @@ func TestRenderEntryTool(t *testing.T) {
 		ID:   1,
 		Kind: kindTool,
 		Calls: []ToolCallView{{
-			CallID:   callID(1),
-			ToolName: "Bash",
-			Summary:  "ls -la",
-			Status:   ToolOK,
-			Result:   result,
+			ToolExecutionID: callID(1),
+			ToolName:        "Bash",
+			Summary:         "ls -la",
+			Status:          ToolOK,
+			Result:          result,
 		}},
 	}
 	collapsed := stripANSI(strings.Join(renderEntry(e, false, 80), "\n"))

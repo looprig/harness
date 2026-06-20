@@ -34,9 +34,9 @@ const (
 	errPanicPrefix       = "error: tool panicked: "
 	errEmptyResult       = "error: empty result"
 	errWriteTargetPrefix = "error: invalid tool arguments: "
-	// errIDGenFailure is the fail-secure tool-result for a call whose CallID could
+	// errIDGenFailure is the fail-secure tool-result for a call whose ToolExecutionID could
 	// not be minted (crypto/rand failure): the call is NOT executed and NO gate is
-	// opened (a missing CallID can't safely route a permission gate), but the model
+	// opened (a missing ToolExecutionID can't safely route a permission gate), but the model
 	// still sees a paired error result.
 	errIDGenFailure = "error: internal: could not generate call id"
 )
@@ -55,10 +55,10 @@ const (
 // position/ID), and each carries its originating ToolUseBlock.ID so runTurn can
 // build the paired ToolResultMessage.
 type result struct {
-	CallID    uuid.UUID
-	ToolUseID string
-	Content   []content.Block
-	IsError   bool
+	ToolExecutionID uuid.UUID
+	ToolUseID       string
+	Content         []content.Block
+	IsError         bool
 }
 
 // resolved is the runner's per-call working state, threaded from resolution
@@ -85,8 +85,8 @@ type resolved struct {
 	sequential bool
 }
 
-// RunBatch executes a batch of tool calls. It mints a CallID per call via idGen
-// (fail-secure: a call whose CallID cannot be minted is NOT executed and NO gate
+// RunBatch executes a batch of tool calls. It mints a ToolExecutionID per call via idGen
+// (fail-secure: a call whose ToolExecutionID cannot be minted is NOT executed and NO gate
 // is opened for it), resolves tools + permissions sequentially (so a session grant
 // on call N is visible to call N+1's Check), emits ALL ToolCallStarted before
 // executing any call, runs the executable calls (serial batch drained first, then
@@ -140,19 +140,19 @@ func RunBatch(
 	// requested call (including pre-execution failures) gets a Started, and every
 	// Started precedes every Completed so the TUI groups the batch race-free.
 	for _, r := range rs {
-		safeEmit(event.ToolCallStarted{CallID: r.callID, ToolName: r.block.Name, Summary: r.summary})
+		safeEmit(event.ToolCallStarted{ToolExecutionID: r.callID, ToolName: r.block.Name, Summary: r.summary})
 	}
 
 	// Each call owns final[i] by index: serial and parallel goroutines each write a
 	// DISTINCT index, so result storage needs no shared map and no mutex, and the
-	// outcome is already in call order. (A CallID-keyed map could drop/duplicate on
+	// outcome is already in call order. (A ToolExecutionID-keyed map could drop/duplicate on
 	// a zero-key collision from a failed mint; indexing removes that hazard.)
 	final := make([]result, len(rs))
 
 	complete := func(i int, r result) {
 		final[i] = r
 		preview, isErr := previewOf(r)
-		safeEmit(event.ToolCallCompleted{CallID: r.CallID, IsError: isErr, ResultPreview: preview})
+		safeEmit(event.ToolCallCompleted{ToolExecutionID: r.ToolExecutionID, IsError: isErr, ResultPreview: preview})
 	}
 
 	// Pre-execution failures complete immediately, in the Started order. executable
@@ -178,15 +178,15 @@ type indexedResolved struct {
 	r *resolved
 }
 
-// newResolved builds the per-call working state: mints a CallID via idGen, looks
+// newResolved builds the per-call working state: mints a ToolExecutionID via idGen, looks
 // up the tool, validates args JSON, queries WriteTarget, and computes the redacted
 // Summary. Pre-execution failures (id-gen failure, unknown tool, invalid args,
 // WriteTarget error) are recorded here; permission is resolved later (sequentially).
 //
 // An idGen error is fail-secure: the call is marked failed with errIDGenFailure
-// (so it is NOT executed and NO gate is opened — a missing CallID can't safely
+// (so it is NOT executed and NO gate is opened — a missing ToolExecutionID can't safely
 // route a gate) and the error is NOT swallowed (it is surfaced as a model-visible
-// tool-result and logged). The zero CallID it then carries is harmless: a failed
+// tool-result and logged). The zero ToolExecutionID it then carries is harmless: a failed
 // call neither opens a gate nor shares a result slot (results are indexed).
 func newResolved(ctx context.Context, c content.ToolUseBlock, ts ToolSet, idGen func() (uuid.UUID, error)) *resolved {
 	r := &resolved{block: c, argsstr: string(c.Input)}
@@ -195,7 +195,7 @@ func newResolved(ctx context.Context, c content.ToolUseBlock, ts ToolSet, idGen 
 	if err != nil {
 		slog.Error("loop: tool-call id generation failed; failing call fail-secure (not executed, no gate)",
 			"tool", c.Name, "error", err)
-		r.summary = c.Name // no CallID → Summary is just the requested name
+		r.summary = c.Name // no ToolExecutionID → Summary is just the requested name
 		r.fail(errIDGenFailure)
 		return r
 	}
@@ -263,7 +263,7 @@ func summaryOf(t tool.InvokableTool, name, argsJSON string) string {
 
 // resolvePermission resolves the permission Effect for one (resolvable) call. On
 // EffectAsk it opens a gatePermission gate (ctx-aware register → ack → emit →
-// block), validates the reply's CallID, persists a non-ScopeOnce grant
+// block), validates the reply's ToolExecutionID, persists a non-ScopeOnce grant
 // (best-effort — a Grant error never fails the call), and marks r.failed on deny.
 // A returned non-nil error is either ctx.Err() (batch torn down) or a gate
 // interruption; in both cases r is left in a safe state (failed or to-be-discarded).
@@ -320,7 +320,7 @@ func askPermission(
 
 	// Install-before-emit: only now is the gate guaranteed installed, so the
 	// matching Approve/Deny cannot be dropped on a race.
-	emit(event.PermissionRequested{CallID: r.callID, Request: req})
+	emit(event.PermissionRequested{ToolExecutionID: r.callID, Request: req})
 
 	select {
 	case cmd := <-reply:
@@ -331,14 +331,14 @@ func askPermission(
 }
 
 // applyDecision applies an Approve/Deny reply to r. runLoop already matched by
-// CallID + kind; the CallID is re-validated as cheap defence in depth. A non-once
+// ToolExecutionID + kind; the ToolExecutionID is re-validated as cheap defence in depth. A non-once
 // approval persists via Grant — a Grant error NEVER fails the call (the user
 // approved THIS call; Grant is best-effort persistence for future calls).
 func applyDecision(ctx context.Context, r *resolved, ts ToolSet, cmd command.Command) error {
 	switch c := cmd.(type) {
 	case command.ApproveToolCall:
-		if c.GateCallID() != r.callID {
-			// Defence in depth: a mismatched CallID is fail-secure → deny.
+		if c.GateToolExecutionID() != r.callID {
+			// Defence in depth: a mismatched ToolExecutionID is fail-secure → deny.
 			r.fail(errPermissionDenied)
 			return nil
 		}
@@ -439,7 +439,7 @@ func execute(
 	wg.Wait()
 }
 
-// runOne executes a single resolved call: builds the per-call ctx (CallID + emit +
+// runOne executes a single resolved call: builds the per-call ctx (ToolExecutionID + emit +
 // gateReg injected so the tool can emit / request user input), wraps InvokableRun
 // in the middleware chain (first listed = outermost), recovers a panic into an
 // error result, and normalizes the outcome to a result. It never aborts the batch.
@@ -467,10 +467,10 @@ func runOne(
 		return errResult(r, errEmptyResult)
 	}
 	return result{
-		CallID:    r.callID,
-		ToolUseID: r.block.ID,
-		Content:   tr.Content,
-		IsError:   isErrorResult(tr),
+		ToolExecutionID: r.callID,
+		ToolUseID:       r.block.ID,
+		Content:         tr.Content,
+		IsError:         isErrorResult(tr),
 	}
 }
 
@@ -508,10 +508,10 @@ func failureResult(r *resolved) result {
 // errResult builds an error tool-result carrying the given message.
 func errResult(r *resolved, msg string) result {
 	return result{
-		CallID:    r.callID,
-		ToolUseID: r.block.ID,
-		Content:   []content.Block{&content.TextBlock{Text: msg}},
-		IsError:   true,
+		ToolExecutionID: r.callID,
+		ToolUseID:       r.block.ID,
+		Content:         []content.Block{&content.TextBlock{Text: msg}},
+		IsError:         true,
 	}
 }
 
@@ -522,7 +522,7 @@ func errResult(r *resolved, msg string) result {
 func collectResults(rs []*resolved) []result {
 	out := make([]result, len(rs))
 	for i, r := range rs {
-		out[i] = result{CallID: r.callID, ToolUseID: r.block.ID}
+		out[i] = result{ToolExecutionID: r.callID, ToolUseID: r.block.ID}
 	}
 	return out
 }

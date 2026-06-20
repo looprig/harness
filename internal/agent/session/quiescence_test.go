@@ -43,9 +43,9 @@ func drainSub(t *testing.T, sub interface{ Events() <-chan event.Event }, want f
 // primary (synchronous) loop, quiescence is exactly the primary loop going idle.
 func TestEndToEndQuiescence(t *testing.T) {
 	t.Parallel()
-	s, err := NewAgent(context.Background(), cfg(&stubLLM{chunks: []content.Chunk{textChunk("hi")}}))
+	s, err := New(context.Background(), cfg(&stubLLM{chunks: []content.Chunk{textChunk("hi")}}))
 	if err != nil {
-		t.Fatalf("NewAgent: %v", err)
+		t.Fatalf("New: %v", err)
 	}
 	t.Cleanup(func() { _ = s.Shutdown(context.Background()) })
 
@@ -229,9 +229,9 @@ func (c *chainStubLLM) Stream(ctx context.Context, _ llm.Request) (*llm.StreamRe
 func TestChainedTurnsEmitNoLoopIdleBetween(t *testing.T) {
 	t.Parallel()
 	client := &chainStubLLM{text: "ok", onCall: map[int]func(){}}
-	s, err := NewAgent(context.Background(), cfg(client))
+	s, err := New(context.Background(), cfg(client))
 	if err != nil {
-		t.Fatalf("NewAgent: %v", err)
+		t.Fatalf("New: %v", err)
 	}
 	t.Cleanup(func() { _ = s.Shutdown(context.Background()) })
 
@@ -252,7 +252,7 @@ func TestChainedTurnsEmitNoLoopIdleBetween(t *testing.T) {
 		// (appended to the inbox) before turn 1's terminal — no ack needed now that the
 		// outcome (InputQueued) is published to the fan-in rather than replied.
 		select {
-		case l.Commands <- command.UserInput{Header: command.Header{ID: queuedID}, Mode: command.AllowFold, Blocks: textBlocks("turn2")}:
+		case l.Commands <- command.UserInput{Header: command.Header{CommandID: queuedID}, Mode: command.AllowFold, Blocks: textBlocks("turn2")}:
 		case <-l.Done:
 		}
 	}

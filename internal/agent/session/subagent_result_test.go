@@ -9,24 +9,25 @@ import (
 	"github.com/inventivepotter/urvi/internal/agent/loop"
 	"github.com/inventivepotter/urvi/internal/agent/loop/command"
 	"github.com/inventivepotter/urvi/internal/agent/loop/event"
+	"github.com/inventivepotter/urvi/internal/agent/loop/identity"
 	"github.com/inventivepotter/urvi/internal/agent/session/hub"
 	"github.com/inventivepotter/urvi/internal/content"
 	"github.com/inventivepotter/urvi/internal/uuid"
 )
 
-// sessionWithHubAndFakeLoop builds an AgentSession with a REAL hub (so quiescence
+// sessionWithHubAndFakeLoop builds a Session with a REAL hub (so quiescence
 // transitions run) and a fake parent loop whose Commands channel the test reads and
 // whose Done channel the test controls. The fake loop lets a test drive
 // deliverSubagentResult (now fire-and-forget) without a full loop: the test reads the
 // routed command to confirm it landed, and drives any quiescence transitions by
 // publishing events directly through the session.
-func sessionWithHubAndFakeLoop() (s *Sesssion, cmds chan command.Command, done chan struct{}) {
+func sessionWithHubAndFakeLoop() (s *Session, cmds chan command.Command, done chan struct{}) {
 	cmds = make(chan command.Command)
 	done = make(chan struct{})
 	sessionCtx, sessionCancel := context.WithCancel(context.Background())
 	id := mustUUID()
 	primaryLoopID := mustUUID()
-	s = &Sesssion{
+	s = &Session{
 		SessionID:     id,
 		hub:           hub.New(id),
 		sessionCtx:    sessionCtx,
@@ -43,14 +44,14 @@ func sessionWithHubAndFakeLoop() (s *Sesssion, cmds chan command.Command, done c
 // TestSubagentHandBackWakeReleaseViaTurnStarted drives the synchronous-spawn
 // quiescence accounting through the session + hub directly: a {wake} token taken at
 // (would-be) spawn keeps the session Active even while the parent loop is idle; the
-// simulated hand-back TurnStarted carrying TriggeredByLoopID releases the token, and
+// simulated hand-back TurnStarted carrying Cause.LoopID releases the token, and
 // because the same event adds the parent's {loop} key, active never dips to empty
 // across the handoff — SessionIdle fires only after the parent itself goes idle.
 func TestSubagentHandBackWakeReleaseViaTurnStarted(t *testing.T) {
 	t.Parallel()
-	s, err := NewAgent(context.Background(), cfg(&stubLLM{chunks: []content.Chunk{textChunk("x")}}))
+	s, err := New(context.Background(), cfg(&stubLLM{chunks: []content.Chunk{textChunk("x")}}))
 	if err != nil {
-		t.Fatalf("NewAgent: %v", err)
+		t.Fatalf("New: %v", err)
 	}
 	t.Cleanup(func() { _ = s.Shutdown(context.Background()) })
 
@@ -78,19 +79,22 @@ func TestSubagentHandBackWakeReleaseViaTurnStarted(t *testing.T) {
 	}
 
 	// Simulate the hand-back landing in the parent and starting a turn: publish a
-	// TurnStarted carrying TriggeredByLoopID == subagentLoopID. The hub removes
+	// TurnStarted carrying Cause.LoopID == subagentLoopID. The hub removes
 	// {wake, subagentLoopID} and adds {loop, parentLoopID} in the same step, so active
 	// stays non-empty (no false SessionIdle).
 	tid := mustUUID()
 	if err := s.PublishEvent(context.Background(), event.TurnStarted{
 		Header: event.Header{
-			SessionID:         s.SessionID,
-			LoopID:            parentLoopID,
-			TurnID:            tid,
-			CausationID:       mustUUID(),
-			TriggeredByLoopID: subagentLoopID,
+			Coordinates: identity.Coordinates{
+				SessionID: s.SessionID,
+				LoopID:    parentLoopID,
+				TurnID:    tid,
+			},
+			Cause: identity.Cause{
+				CommandID:   mustUUID(),
+				Coordinates: identity.Coordinates{LoopID: subagentLoopID},
+			},
 		},
-		InputID: mustUUID(),
 	}); err != nil {
 		t.Fatalf("PublishEvent(TurnStarted): %v", err)
 	}
@@ -104,7 +108,7 @@ func TestSubagentHandBackWakeReleaseViaTurnStarted(t *testing.T) {
 
 	// The parent goes idle: now active empties and SessionIdle fires.
 	if err := s.PublishEvent(context.Background(), event.LoopIdle{
-		Header: event.Header{SessionID: s.SessionID, LoopID: parentLoopID},
+		Header: event.Header{Coordinates: identity.Coordinates{SessionID: s.SessionID, LoopID: parentLoopID}},
 	}); err != nil {
 		t.Fatalf("PublishEvent(LoopIdle): %v", err)
 	}
@@ -121,15 +125,15 @@ func TestSubagentHandBackWakeReleaseViaTurnStarted(t *testing.T) {
 // can no longer leak via an off-publish reconciliation. This drives the END-TO-END
 // event path on a REAL loop: a SubagentResult delivered while the loop is BUSY queues
 // (never rejected, even with a full inbox); interrupting the running turn ends it and
-// makes returnQueuedInbox emit event.InputCancelled carrying TriggeredByLoopID ==
+// makes returnQueuedInbox emit event.InputCancelled carrying Cause.LoopID ==
 // fromLoopID, which releases the {wake} token ON THE PUBLISH PATH (NOT cancelExpectTurn).
 // Quiescence then reaches SessionIdle and WaitIdle returns.
 func TestSubagentResultNeverRejectedReleasesWakeViaInputCancelled(t *testing.T) {
 	t.Parallel()
 	// blockUntilCancel keeps the turn running so the SubagentResult queues behind it.
-	s, err := NewAgent(context.Background(), cfg(&stubLLM{blockUntilCancel: true}))
+	s, err := New(context.Background(), cfg(&stubLLM{blockUntilCancel: true}))
 	if err != nil {
-		t.Fatalf("NewAgent: %v", err)
+		t.Fatalf("New: %v", err)
 	}
 	t.Cleanup(func() { _ = s.Shutdown(context.Background()) })
 
@@ -161,7 +165,7 @@ func TestSubagentResultNeverRejectedReleasesWakeViaInputCancelled(t *testing.T) 
 	}
 
 	// Interrupt the running turn: it ends TurnInterrupted, and returnQueuedInbox emits
-	// InputCancelled for the queued SubagentResult, carrying TriggeredByLoopID ==
+	// InputCancelled for the queued SubagentResult, carrying Cause.LoopID ==
 	// subagentLoopID — the publish-path release of the {wake} token.
 	if _, err := s.Interrupt(context.Background()); err != nil {
 		t.Fatalf("Interrupt: %v", err)
@@ -177,7 +181,7 @@ func TestSubagentResultNeverRejectedReleasesWakeViaInputCancelled(t *testing.T) 
 			if !ok {
 				t.Fatal("subscription closed before the InputCancelled wake-release")
 			}
-			if ic, ok := ev.(event.InputCancelled); ok && ic.TriggeredByLoopID == subagentLoopID {
+			if ic, ok := ev.(event.InputCancelled); ok && ic.Cause.LoopID == subagentLoopID {
 				sawRelease = true
 			}
 		case <-deadline:
@@ -195,7 +199,7 @@ func TestSubagentResultNeverRejectedReleasesWakeViaInputCancelled(t *testing.T) 
 // TestSubagentResultQueuedDoesNotReleaseOffPublishPath proves the {wake} token is NOT
 // released off the publish path: after a SubagentResult queues (fire-and-forget, no
 // disposition), the token is still held — WaitIdle blocks — until the resulting event
-// (here a simulated TurnStarted carrying TriggeredByLoopID) releases it on the publish
+// (here a simulated TurnStarted carrying Cause.LoopID) releases it on the publish
 // path. This is the inverse guarantee to the InputCancelled release above.
 func TestSubagentResultQueuedDoesNotReleaseOffPublishPath(t *testing.T) {
 	t.Parallel()
@@ -206,7 +210,8 @@ func TestSubagentResultQueuedDoesNotReleaseOffPublishPath(t *testing.T) {
 	s.expectTurn(context.Background(), subagentLoopID)
 
 	// Fake parent loop: just receive the routed SubagentResult (fire-and-forget; no
-	// reply). Confirm it carried FromLoopID == subagentLoopID.
+	// reply). Confirm it carried the CHILD via Cause.LoopID == subagentLoopID and the
+	// PARENT delivery target via the embedded Coordinates.LoopID == primaryLoopID.
 	routed := make(chan command.SubagentResult, 1)
 	go func() {
 		if sr, ok := (<-cmds).(command.SubagentResult); ok {
@@ -219,8 +224,11 @@ func TestSubagentResultQueuedDoesNotReleaseOffPublishPath(t *testing.T) {
 	}
 	select {
 	case sr := <-routed:
-		if sr.FromLoopID != subagentLoopID {
-			t.Errorf("routed SubagentResult.FromLoopID = %v, want %v", sr.FromLoopID, subagentLoopID)
+		if sr.Cause.LoopID != subagentLoopID {
+			t.Errorf("routed SubagentResult.Cause.LoopID = %v, want %v (the CHILD)", sr.Cause.LoopID, subagentLoopID)
+		}
+		if sr.LoopID != s.primaryLoopID {
+			t.Errorf("routed SubagentResult.LoopID = %v, want %v (the PARENT delivery target)", sr.LoopID, s.primaryLoopID)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("SubagentResult was not routed to the parent loop")
@@ -228,7 +236,7 @@ func TestSubagentResultQueuedDoesNotReleaseOffPublishPath(t *testing.T) {
 
 	// The hand-back released nothing off the publish path: the token is still held, so
 	// WaitIdle blocks. (In production the resulting TurnStarted/TurnFoldedInto/
-	// InputCancelled carrying TriggeredByLoopID releases it on the publish path.)
+	// InputCancelled carrying Cause.LoopID releases it on the publish path.)
 	blockCtx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
 	if err := s.WaitIdle(blockCtx); !errors.Is(err, context.DeadlineExceeded) {
@@ -238,16 +246,18 @@ func TestSubagentResultQueuedDoesNotReleaseOffPublishPath(t *testing.T) {
 	// Releasing it on the publish path (the hand-back's TurnStarted) then idles it.
 	if err := s.PublishEvent(context.Background(), event.TurnStarted{
 		Header: event.Header{
-			SessionID:         s.SessionID,
-			LoopID:            s.primaryLoopID,
-			TurnID:            mustUUID(),
-			TriggeredByLoopID: subagentLoopID,
+			Coordinates: identity.Coordinates{
+				SessionID: s.SessionID,
+				LoopID:    s.primaryLoopID,
+				TurnID:    mustUUID(),
+			},
+			Cause: identity.Cause{Coordinates: identity.Coordinates{LoopID: subagentLoopID}},
 		},
 	}); err != nil {
 		t.Fatalf("PublishEvent(TurnStarted): %v", err)
 	}
 	if err := s.PublishEvent(context.Background(), event.LoopIdle{
-		Header: event.Header{SessionID: s.SessionID, LoopID: s.primaryLoopID},
+		Header: event.Header{Coordinates: identity.Coordinates{SessionID: s.SessionID, LoopID: s.primaryLoopID}},
 	}); err != nil {
 		t.Fatalf("PublishEvent(LoopIdle): %v", err)
 	}

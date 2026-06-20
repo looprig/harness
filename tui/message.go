@@ -31,12 +31,12 @@ const (
 
 // ToolCallView is one tool call rendered as a child of its assistant segment. It
 // is reconstructed from the turn event stream (ToolCallStarted / ToolCallCompleted),
-// correlated by CallID.
+// correlated by ToolExecutionID.
 type ToolCallView struct {
-	CallID   uuid.UUID
-	ToolName string       // ToolCallStarted.ToolName
-	Summary  string       // ToolCallStarted.Summary (already redacted, one line)
-	Status   ToolStatus   // lifecycle state
-	Result   []string     // capped preview lines from ToolCallCompleted; nil while running
-	Decision gateDecision // the user's permission decision, if this call prompted (else gateNone)
+	ToolExecutionID uuid.UUID
+	ToolName        string       // ToolCallStarted.ToolName
+	Summary         string       // ToolCallStarted.Summary (already redacted, one line)
+	Status          ToolStatus   // lifecycle state
+	Result          []string     // capped preview lines from ToolCallCompleted; nil while running
+	Decision        gateDecision // the user's permission decision, if this call prompted (else gateNone)
 }

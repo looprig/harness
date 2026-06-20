@@ -2,19 +2,17 @@ package event
 
 import (
 	"github.com/inventivepotter/urvi/internal/content"
-	"github.com/inventivepotter/urvi/internal/uuid"
 )
 
 // TurnStarted is emitted when runLoop commits a turn's initial UserMessage. It is
-// the first enduring turn event. Header.CausationID == InputID (the submit command
-// id). Message is the exact UserMessage committed as the first message of the turn.
+// the first enduring turn event. Header.Cause.CommandID is the submit command id.
+// Message is the exact UserMessage committed as the first message of the turn.
 type TurnStarted struct {
 	enduring
 	loopScoped
 	Header
-	TurnIndex TurnIndex
-	InputID   uuid.UUID
-	Message   *content.UserMessage
+	TurnIndex TurnIndex            `json:"turn_index,omitzero"`
+	Message   *content.UserMessage `json:"message,omitzero"`
 }
 
 // StepDone is the enduring event emitted when a completed step's finalized group
@@ -25,34 +23,33 @@ type StepDone struct {
 	enduring
 	loopScoped
 	Header
-	Messages content.AgenticMessages
+	Messages content.AgenticMessages `json:"messages,omitempty"`
 }
 
 // TurnFoldedInto is emitted when queued input folds into a mandatory
-// tool-continuation request. Header.CausationID == InputID; Header.TriggeredByLoopID
-// is set for a SubagentResult hand-back. Message is the folded user message.
+// tool-continuation request. Header.Cause.CommandID is the submit command id;
+// Header.Cause.LoopID is set for a SubagentResult hand-back. Message is the folded
+// user message.
 type TurnFoldedInto struct {
 	enduring
 	loopScoped
 	Header
-	TurnIndex TurnIndex
-	InputID   uuid.UUID
-	Message   *content.UserMessage
+	TurnIndex TurnIndex            `json:"turn_index,omitzero"`
+	Message   *content.UserMessage `json:"message,omitzero"`
 }
 
 // InputCancelled is emitted when a queued input leaves the loop queue without
 // committing — client retract, or a return after an abnormal turn end.
-// Header.CausationID == InputID; Header.TurnID is the active turn that caused a
-// return, or zero for a pure client retract outside a turn. Message is the
-// returned/retracted user message.
+// Header.Cause.CommandID is the submit command id; Header.TurnID is the active turn
+// that caused a return, or zero for a pure client retract outside a turn. Message is
+// the returned/retracted user message.
 type InputCancelled struct {
 	enduring
 	loopScoped
 	Header
-	TurnIndex TurnIndex
-	InputID   uuid.UUID
-	Reason    CancelReason
-	Message   *content.UserMessage
+	TurnIndex TurnIndex            `json:"turn_index,omitzero"`
+	Reason    CancelReason         `json:"reason,omitzero"`
+	Message   *content.UserMessage `json:"message,omitzero"`
 }
 
 // RejectReason explains why a UserInput submit was refused (carried by TurnRejected).
@@ -76,26 +73,24 @@ const (
 
 // InputQueued is the Ephemeral Reply event for a UserInput accepted into the loop
 // inbox but not yet assigned to a turn (it later resolves to TurnStarted,
-// TurnFoldedInto, or InputCancelled). Header.CausationID == InputID (the submit
-// command id). Ephemeral: it self-heals — the authoritative resolution event still
-// follows if this is dropped.
+// TurnFoldedInto, or InputCancelled). Header.Cause.CommandID is the submit command
+// id. Ephemeral: it self-heals — the authoritative resolution event still follows
+// if this is dropped.
 type InputQueued struct {
 	ephemeral
 	loopScoped
 	Header
-	InputID uuid.UUID
 }
 
 // TurnRejected is the Enduring Reply event for a UserInput the loop refused
 // (queue-full, shutting-down, busy/non-queueable, or a transient internal failure).
-// Enduring: a rejected user message must never silently vanish. Header.CausationID ==
-// InputID. It carries an InputID it did not have as a point-to-point reply.
+// Enduring: a rejected user message must never silently vanish.
+// Header.Cause.CommandID is the submit command id.
 type TurnRejected struct {
 	enduring
 	loopScoped
 	Header
-	InputID uuid.UUID
-	Reason  RejectReason
+	Reason RejectReason `json:"reason,omitzero"`
 }
 
 func (InputQueued) isEvent()  {}
@@ -111,8 +106,11 @@ type TokenDelta struct {
 	ephemeral
 	loopScoped
 	Header
-	TurnIndex TurnIndex
-	Chunk     content.Chunk
+	TurnIndex TurnIndex `json:"turn_index,omitzero"`
+	// Chunk is content.Chunk, a sealed interface that is never serialized (chunks
+	// have no wire codec — see content.Chunk); TokenDelta is an Ephemeral streaming
+	// delta that never reaches the journal, so the field is tagged json:"-".
+	Chunk content.Chunk `json:"-"`
 }
 
 // TurnDone is the terminal success event for a turn.
@@ -120,9 +118,9 @@ type TurnDone struct {
 	terminal
 	loopScoped
 	Header
-	TurnIndex TurnIndex
+	TurnIndex TurnIndex `json:"turn_index,omitzero"`
 	// Message is the complete AI response.
-	Message *content.AIMessage
+	Message *content.AIMessage `json:"message,omitzero"`
 }
 
 // TurnFailed is the terminal event for non-cancellation LLM/provider errors. Err
@@ -131,8 +129,12 @@ type TurnFailed struct {
 	terminal
 	loopScoped
 	Header
-	TurnIndex TurnIndex
-	Err       error
+	TurnIndex TurnIndex `json:"turn_index,omitzero"`
+	// Err is the typed cause; an error value cannot round-trip through
+	// encoding/json (no codec, no stable shape), so it is tagged json:"-" to keep
+	// the journal output clean rather than emitting garbage. Callers read it
+	// in-memory via errors.As; a journal records the failure via the event itself.
+	Err error `json:"-"`
 }
 
 // TurnInterrupted is the terminal event when the turn context is cancelled.
@@ -140,7 +142,7 @@ type TurnInterrupted struct {
 	terminal
 	loopScoped
 	Header
-	TurnIndex TurnIndex
+	TurnIndex TurnIndex `json:"turn_index,omitzero"`
 }
 
 func (TurnStarted) isEvent()     {}

@@ -24,13 +24,13 @@ const (
 )
 
 // prompt is the interaction layer's view-model for one pending request, keyed by
-// the gate's CallID. It carries everything the renderer needs and the selection
+// the gate's ToolExecutionID. It carries everything the renderer needs and the selection
 // state the modal key router (Task 8) mutates — but holds NO agent reference: the
 // interactionModel only PRODUCES a uiAction; Screen drives the agent. A permission
 // prompt uses ToolName/Description/Scopes; a user-input prompt uses
 // Question/Choices/selected/freeText.
 type prompt struct {
-	CallID uuid.UUID
+	ToolExecutionID uuid.UUID
 	// LoopID is the producing loop's id, stamped from the enqueuing event's
 	// Header (zero when that event carries no LoopID). It scopes terminal-event clearing
 	// per loop (design §7): a TurnDone/TurnFailed/TurnInterrupted clears only the
@@ -53,11 +53,11 @@ type prompt struct {
 // projects uniformly. freeText is false: a permission gate is never free-text.
 func promptFromPermission(callID uuid.UUID, req tool.PermissionRequest) prompt {
 	return prompt{
-		CallID:      callID,
-		Kind:        promptPermission,
-		ToolName:    req.ToolName(),
-		Description: req.Description(),
-		Scopes:      req.AllowedScopes(),
+		ToolExecutionID: callID,
+		Kind:            promptPermission,
+		ToolName:        req.ToolName(),
+		Description:     req.Description(),
+		Scopes:          req.AllowedScopes(),
 	}
 }
 
@@ -66,11 +66,11 @@ func promptFromPermission(callID uuid.UUID, req tool.PermissionRequest) prompt {
 // user types an answer rather than picking one.
 func promptFromUserInput(callID uuid.UUID, question string, choices []string) prompt {
 	return prompt{
-		CallID:   callID,
-		Kind:     promptUserInput,
-		Question: question,
-		Choices:  choices,
-		freeText: len(choices) == 0,
+		ToolExecutionID: callID,
+		Kind:            promptUserInput,
+		Question:        question,
+		Choices:         choices,
+		freeText:        len(choices) == 0,
 	}
 }
 

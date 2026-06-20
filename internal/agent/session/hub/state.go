@@ -4,6 +4,7 @@ import (
 	"errors"
 
 	"github.com/inventivepotter/urvi/internal/agent/loop/event"
+	"github.com/inventivepotter/urvi/internal/agent/loop/identity"
 	"github.com/inventivepotter/urvi/internal/uuid"
 )
 
@@ -88,10 +89,10 @@ func (s *sessionState) applyActivity(sessionID uuid.UUID, mutate func(), signalI
 	case !wasEmpty && isEmpty: // Active -> Idle
 		s.phase = SessionIdle
 		signalIdle()
-		return event.SessionIdle{Header: event.Header{SessionID: sessionID}}
+		return event.SessionIdle{Header: event.Header{Coordinates: identity.Coordinates{SessionID: sessionID}}}
 	case wasEmpty && !isEmpty: // Idle -> Active
 		s.phase = SessionActive
-		return event.SessionActive{Header: event.Header{SessionID: sessionID}}
+		return event.SessionActive{Header: event.Header{Coordinates: identity.Coordinates{SessionID: sessionID}}}
 	default:
 		return nil // no edge crossed
 	}

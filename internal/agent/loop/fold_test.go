@@ -8,6 +8,7 @@ import (
 
 	"github.com/inventivepotter/urvi/internal/agent/loop/command"
 	"github.com/inventivepotter/urvi/internal/agent/loop/event"
+	"github.com/inventivepotter/urvi/internal/agent/loop/identity"
 	"github.com/inventivepotter/urvi/internal/content"
 	"github.com/inventivepotter/urvi/internal/llm"
 	"github.com/inventivepotter/urvi/internal/tool"
@@ -88,7 +89,7 @@ func waitForRequests(t *testing.T, client *scriptedLLM, n int) []llm.Request {
 // TestFoldAtToolContinuation proves the core fold behavior: input queued behind a
 // running tool-using turn folds at the tool-continuation boundary. After the tool
 // step commits, runTurn drains the inbox and emits event.TurnFoldedInto for the
-// queued message (CausationID == InputID, no TriggeredByLoopID for a UserInput),
+// queued message (Cause.CommandID == InputID, no Cause.LoopID for a UserInput),
 // the folded message appears in the next LLM request AFTER the tool result and
 // BEFORE the next assistant message, and NO second TurnStarted is emitted (the
 // input rode along; it did not start a new turn).
@@ -98,7 +99,7 @@ func TestFoldAtToolContinuation(t *testing.T) {
 	ts := agenticToolSet([]tool.InvokableTool{bt}, 25, 100)
 	client := &scriptedLLM{scripts: [][]content.Chunk{
 		{toolUseChunk(0, "id-1", "Block", `{}`)}, // step 0: blocking tool (turn parks here)
-		{textChunk("final")},                      // step 1: text -> TurnDone (after the fold)
+		{textChunk("final")},                     // step 1: text -> TurnDone (after the fold)
 	}}
 	l, rec := newFoldLoop(t, client, ts)
 
@@ -121,14 +122,13 @@ func TestFoldAtToolContinuation(t *testing.T) {
 	// queued input into the mandatory continuation request.
 	close(bt.release)
 
-	// event.TurnFoldedInto must be emitted for the queued input, with CausationID ==
-	// InputID and a zero TriggeredByLoopID (a UserInput, not a hand-back).
+	// event.TurnFoldedInto must be emitted for the queued input, with Cause.CommandID ==
+	// InputID and a zero Cause.LoopID (a UserInput, not a hand-back).
 	blockUntilEvents(t, rec, func(evs []event.Event) bool {
 		for _, e := range evs {
 			if fi, ok := e.(event.TurnFoldedInto); ok {
-				return fi.InputID == foldedID &&
-					fi.CausationID == foldedID &&
-					fi.TriggeredByLoopID.IsZero() &&
+				return fi.Cause.CommandID == foldedID &&
+					fi.Cause.LoopID.IsZero() &&
 					fi.Message != nil
 			}
 		}
@@ -138,7 +138,7 @@ func TestFoldAtToolContinuation(t *testing.T) {
 	// The folded input did NOT start a new turn: there is exactly ONE TurnStarted and
 	// it is NOT for foldedID.
 	for _, e := range rec.events() {
-		if tsv, ok := e.(event.TurnStarted); ok && tsv.InputID == foldedID {
+		if tsv, ok := e.(event.TurnStarted); ok && tsv.Cause.CommandID == foldedID {
 			t.Fatal("folded input started a new turn, want it folded into the running turn")
 		}
 	}
@@ -180,17 +180,18 @@ func TestFoldAtToolContinuation(t *testing.T) {
 }
 
 // TestSubagentResultFoldStampsTriggeredBy proves a SubagentResult hand-back that
-// folds at a tool-continuation boundary stamps TurnFoldedInto.TriggeredByLoopID with
-// the producing subagent's loop id (FromLoopID). That id is what releases the parent's
-// {wake, subagentLoopID} quiescence token on the publish path, so it MUST survive the
-// drain handshake onto the folded event.
+// folds at a tool-continuation boundary stamps TurnFoldedInto.Cause.LoopID with
+// the producing CHILD subagent's loop id (Header.Cause.LoopID) — NOT the PARENT
+// delivery target carried by the embedded Coordinates. That CHILD id is what releases
+// the parent's {wake, childLoopID} quiescence token on the publish path, so it MUST
+// survive the drain handshake onto the folded event.
 func TestSubagentResultFoldStampsTriggeredBy(t *testing.T) {
 	t.Parallel()
 	bt := newBlockingTool()
 	ts := agenticToolSet([]tool.InvokableTool{bt}, 25, 100)
 	client := &scriptedLLM{scripts: [][]content.Chunk{
 		{toolUseChunk(0, "id-1", "Block", `{}`)}, // step 0: blocking tool
-		{textChunk("final")},                      // step 1: text -> TurnDone
+		{textChunk("final")},                     // step 1: text -> TurnDone
 	}}
 	l, rec := newFoldLoop(t, client, ts)
 
@@ -203,12 +204,12 @@ func TestSubagentResultFoldStampsTriggeredBy(t *testing.T) {
 
 	// Hand back a SubagentResult while the tool step is in flight: it queues, then
 	// folds at the tool-continuation boundary.
-	fromLoopID := mustID(t)
+	childLoopID := mustID(t)
 	resultID := mustID(t)
 	l.Commands <- command.SubagentResult{
-		Header:     command.Header{ID: resultID},
-		FromLoopID: fromLoopID,
-		Blocks:     textBlocks("subagent says hi"),
+		Coordinates: identity.Coordinates{LoopID: mustID(t)}, // PARENT delivery target
+		Header:      command.Header{CommandID: resultID, Cause: identity.Cause{Coordinates: identity.Coordinates{LoopID: childLoopID}}},
+		Blocks:      textBlocks("subagent says hi"),
 	}
 	if _, ok := awaitReply(t, rec, resultID).(event.InputQueued); !ok {
 		t.Fatal("SubagentResult not queued")
@@ -216,16 +217,16 @@ func TestSubagentResultFoldStampsTriggeredBy(t *testing.T) {
 
 	close(bt.release)
 
-	// TurnFoldedInto must carry TriggeredByLoopID == fromLoopID and CausationID ==
+	// TurnFoldedInto must carry Cause.LoopID == fromLoopID and Cause.CommandID ==
 	// resultID (the submit command id).
 	blockUntilEvents(t, rec, func(evs []event.Event) bool {
 		for _, e := range evs {
-			if fi, ok := e.(event.TurnFoldedInto); ok && fi.InputID == resultID {
-				if fi.TriggeredByLoopID != fromLoopID {
-					t.Errorf("TurnFoldedInto.TriggeredByLoopID = %v, want %v (FromLoopID)", fi.TriggeredByLoopID, fromLoopID)
+			if fi, ok := e.(event.TurnFoldedInto); ok && fi.Cause.CommandID == resultID {
+				if fi.Cause.LoopID != childLoopID {
+					t.Errorf("TurnFoldedInto.Cause.LoopID = %v, want %v (the CHILD)", fi.Cause.LoopID, childLoopID)
 				}
-				if fi.CausationID != resultID {
-					t.Errorf("TurnFoldedInto.CausationID = %v, want %v (submit id)", fi.CausationID, resultID)
+				if fi.Cause.CommandID != resultID {
+					t.Errorf("TurnFoldedInto.Cause.CommandID = %v, want %v (submit id)", fi.Cause.CommandID, resultID)
 				}
 				return true
 			}
@@ -239,7 +240,7 @@ func TestSubagentResultFoldStampsTriggeredBy(t *testing.T) {
 // the published outcome event (InputQueued/TurnStarted/TurnRejected) via the recorder.
 func submitUserInputBlocks(t *testing.T, l *Loop, rec *recordingPublisher, id uuid.UUID, mode command.InputMode, blocks []content.Block) event.Event {
 	t.Helper()
-	l.Commands <- command.UserInput{Header: command.Header{ID: id}, Mode: mode, Blocks: blocks}
+	l.Commands <- command.UserInput{Header: command.Header{CommandID: id}, Mode: mode, Blocks: blocks}
 	return awaitReply(t, rec, id)
 }
 
@@ -256,7 +257,7 @@ func TestNoToolFinalAnswerDoesNotFold(t *testing.T) {
 	client := &scriptedLLM{
 		scripts: [][]content.Chunk{
 			{textChunk("only step, final answer")}, // turn 1: text-only -> TurnDone
-			{textChunk("turn 2 answer")},            // turn 2 (from the queued input)
+			{textChunk("turn 2 answer")},           // turn 2 (from the queued input)
 		},
 	}
 	ts := agenticToolSet(nil, 25, 100)
@@ -268,7 +269,7 @@ func TestNoToolFinalAnswerDoesNotFold(t *testing.T) {
 		0: func() {
 			// AllowFold submit while the turn is running -> InputQueued (observed on
 			// the recorder fan-in).
-			l.Commands <- command.UserInput{Header: command.Header{ID: queuedID}, Mode: command.AllowFold, Blocks: textBlocks("later")}
+			l.Commands <- command.UserInput{Header: command.Header{CommandID: queuedID}, Mode: command.AllowFold, Blocks: textBlocks("later")}
 			if _, ok := awaitReply(t, rec, queuedID).(event.InputQueued); !ok {
 				t.Errorf("queued submit during final step not InputQueued")
 			}
@@ -287,10 +288,10 @@ func TestNoToolFinalAnswerDoesNotFold(t *testing.T) {
 	blockUntilEvents(t, rec, func(evs []event.Event) bool {
 		var started2 bool
 		for _, e := range evs {
-			if fi, ok := e.(event.TurnFoldedInto); ok && fi.InputID == queuedID {
+			if fi, ok := e.(event.TurnFoldedInto); ok && fi.Cause.CommandID == queuedID {
 				t.Errorf("queued input folded into a no-tool final answer turn, want it to start a later turn")
 			}
-			if tsv, ok := e.(event.TurnStarted); ok && tsv.InputID == queuedID {
+			if tsv, ok := e.(event.TurnStarted); ok && tsv.Cause.CommandID == queuedID {
 				started2 = true
 			}
 		}
@@ -360,11 +361,11 @@ func TestInterruptDuringDrainFreesTurn(t *testing.T) {
 		for _, e := range evs {
 			switch ev := e.(type) {
 			case event.TurnFoldedInto:
-				if ev.InputID == queuedID {
+				if ev.Cause.CommandID == queuedID {
 					return true
 				}
 			case event.InputCancelled:
-				if ev.InputID == queuedID {
+				if ev.Cause.CommandID == queuedID {
 					return true
 				}
 			}
@@ -499,7 +500,7 @@ func TestDrainingSweepReturnsEntryOnInterrupt(t *testing.T) {
 	// from the draining sweep, and NO TurnFoldedInto must be emitted for it.
 	blockUntilEvents(t, rec, func(evs []event.Event) bool {
 		for _, e := range evs {
-			if ic, ok := e.(event.InputCancelled); ok && ic.InputID == queuedID {
+			if ic, ok := e.(event.InputCancelled); ok && ic.Cause.CommandID == queuedID {
 				return ic.Reason == event.CancelTurnInterrupted && ic.Message != nil
 			}
 		}
@@ -509,11 +510,11 @@ func TestDrainingSweepReturnsEntryOnInterrupt(t *testing.T) {
 	for _, e := range rec.events() {
 		switch ev := e.(type) {
 		case event.InputCancelled:
-			if ev.InputID == queuedID {
+			if ev.Cause.CommandID == queuedID {
 				cancels++
 			}
 		case event.TurnFoldedInto:
-			if ev.InputID == queuedID {
+			if ev.Cause.CommandID == queuedID {
 				folds++
 			}
 		}

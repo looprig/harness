@@ -21,7 +21,7 @@ func newCallID(t *testing.T) uuid.UUID {
 	return u
 }
 
-// turnCtx builds a fully-injected per-call ctx (emit + CallID + gateReg) as the
+// turnCtx builds a fully-injected per-call ctx (emit + ToolExecutionID + gateReg) as the
 // runner would. It returns the ctx, the gateReg channel a fake actor reads, and a
 // slice-collecting emit recorder.
 func injectedCtx(t *testing.T, callID uuid.UUID, gateReg chan<- gateRegistration, emit func(event.Event)) context.Context {
@@ -56,7 +56,7 @@ func TestRequestUserInput_DeliversAnswer(t *testing.T) {
 			t.Errorf("reg.kind = %v, want gateUserInput", reg.kind)
 		}
 		close(reg.ack)
-		reg.reply <- command.ProvideUserInput{CallID: callID, Answer: "blue"}
+		reg.reply <- command.ProvideUserInput{GateRoute: command.GateRoute{ToolExecutionID: callID}, Answer: "blue"}
 	}()
 
 	done := make(chan struct{})
@@ -91,8 +91,8 @@ func TestRequestUserInput_DeliversAnswer(t *testing.T) {
 	if !ok {
 		t.Fatalf("emitted[0] = %T, want event.UserInputRequested", emitted[0])
 	}
-	if uir.CallID != callID || uir.Question != "favorite color?" || len(uir.Choices) != 2 {
-		t.Fatalf("UserInputRequested = %+v, want CallID/Question/2 choices", uir)
+	if uir.ToolExecutionID != callID || uir.Question != "favorite color?" || len(uir.Choices) != 2 {
+		t.Fatalf("UserInputRequested = %+v, want ToolExecutionID/Question/2 choices", uir)
 	}
 }
 
@@ -132,7 +132,7 @@ func TestRequestUserInput_EmitsAfterAck(t *testing.T) {
 		t.Fatal("no emit after ack")
 	}
 	// Reply so the goroutine returns (no leak).
-	reg.reply <- command.ProvideUserInput{CallID: callID, Answer: "x"}
+	reg.reply <- command.ProvideUserInput{GateRoute: command.GateRoute{ToolExecutionID: callID}, Answer: "x"}
 	<-done
 }
 
@@ -234,7 +234,7 @@ func TestRequestUserInput_CancelWhileBlockedOnReply(t *testing.T) {
 	}
 }
 
-// TestRequestUserInput_MissingCtxValues: each of emit/CallID/gateReg missing from
+// TestRequestUserInput_MissingCtxValues: each of emit/ToolExecutionID/gateReg missing from
 // ctx yields a typed GateContextError (fail-secure), without touching gateReg.
 func TestRequestUserInput_MissingCtxValues(t *testing.T) {
 	t.Parallel()

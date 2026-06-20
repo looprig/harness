@@ -44,20 +44,20 @@ func TestToolCallViewRoundTrips(t *testing.T) {
 		{
 			name: "running call, nil result",
 			calls: []ToolCallView{
-				{CallID: id, ToolName: "Bash", Summary: "ls -la", Status: ToolRunning, Result: nil},
+				{ToolExecutionID: id, ToolName: "Bash", Summary: "ls -la", Status: ToolRunning, Result: nil},
 			},
 		},
 		{
 			name: "completed ok with preview lines",
 			calls: []ToolCallView{
-				{CallID: id, ToolName: "Read", Summary: "read file", Status: ToolOK, Result: []string{"line1", "line2"}},
+				{ToolExecutionID: id, ToolName: "Read", Summary: "read file", Status: ToolOK, Result: []string{"line1", "line2"}},
 			},
 		},
 		{
 			name: "error and cancelled calls",
 			calls: []ToolCallView{
-				{CallID: id, ToolName: "Write", Summary: "write file", Status: ToolError, Result: []string{"permission denied"}},
-				{CallID: uuid.UUID{0xAA}, ToolName: "Fetch", Summary: "fetch url", Status: ToolCancelled, Result: nil},
+				{ToolExecutionID: id, ToolName: "Write", Summary: "write file", Status: ToolError, Result: []string{"permission denied"}},
+				{ToolExecutionID: uuid.UUID{0xAA}, ToolName: "Fetch", Summary: "fetch url", Status: ToolCancelled, Result: nil},
 			},
 		},
 	}

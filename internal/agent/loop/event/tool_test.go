@@ -19,7 +19,7 @@ func newID(t *testing.T) uuid.UUID {
 }
 
 // TestToolEventsSatisfyEvent asserts each new tool event satisfies the sealed
-// Event interface and round-trips its CallID where specified.
+// Event interface and round-trips its ToolExecutionID where specified.
 func TestToolEventsSatisfyEvent(t *testing.T) {
 	t.Parallel()
 	callID := newID(t)
@@ -31,33 +31,33 @@ func TestToolEventsSatisfyEvent(t *testing.T) {
 	}{
 		{
 			name:       "PermissionRequested",
-			ev:         event.PermissionRequested{CallID: callID, Request: tool.BashRequest{Command: "rm -rf /"}},
+			ev:         event.PermissionRequested{ToolExecutionID: callID, Request: tool.BashRequest{Command: "rm -rf /"}},
 			wantCallID: callID,
-			getCallID:  func(e event.Event) uuid.UUID { return e.(event.PermissionRequested).CallID },
+			getCallID:  func(e event.Event) uuid.UUID { return e.(event.PermissionRequested).ToolExecutionID },
 		},
 		{
 			name:       "UserInputRequested",
-			ev:         event.UserInputRequested{CallID: callID, Question: "proceed?", Choices: []string{"yes", "no"}},
+			ev:         event.UserInputRequested{ToolExecutionID: callID, Question: "proceed?", Choices: []string{"yes", "no"}},
 			wantCallID: callID,
-			getCallID:  func(e event.Event) uuid.UUID { return e.(event.UserInputRequested).CallID },
+			getCallID:  func(e event.Event) uuid.UUID { return e.(event.UserInputRequested).ToolExecutionID },
 		},
 		{
 			name:       "ToolCallStarted",
-			ev:         event.ToolCallStarted{CallID: callID, ToolName: "Bash", Summary: "run a command"},
+			ev:         event.ToolCallStarted{ToolExecutionID: callID, ToolName: "Bash", Summary: "run a command"},
 			wantCallID: callID,
-			getCallID:  func(e event.Event) uuid.UUID { return e.(event.ToolCallStarted).CallID },
+			getCallID:  func(e event.Event) uuid.UUID { return e.(event.ToolCallStarted).ToolExecutionID },
 		},
 		{
 			name:       "ToolCallCompleted",
-			ev:         event.ToolCallCompleted{CallID: callID, IsError: true, ResultPreview: "boom"},
+			ev:         event.ToolCallCompleted{ToolExecutionID: callID, IsError: true, ResultPreview: "boom"},
 			wantCallID: callID,
-			getCallID:  func(e event.Event) uuid.UUID { return e.(event.ToolCallCompleted).CallID },
+			getCallID:  func(e event.Event) uuid.UUID { return e.(event.ToolCallCompleted).ToolExecutionID },
 		},
 		{
-			name:       "PermissionRequested zero CallID is boundary",
+			name:       "PermissionRequested zero ToolExecutionID is boundary",
 			ev:         event.PermissionRequested{Request: tool.UnknownRequest{Tool: "X"}},
 			wantCallID: uuid.UUID{},
-			getCallID:  func(e event.Event) uuid.UUID { return e.(event.PermissionRequested).CallID },
+			getCallID:  func(e event.Event) uuid.UUID { return e.(event.PermissionRequested).ToolExecutionID },
 		},
 	}
 	for _, tt := range tests {
@@ -65,7 +65,7 @@ func TestToolEventsSatisfyEvent(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			if got := tt.getCallID(tt.ev); got != tt.wantCallID {
-				t.Errorf("CallID = %v, want %v", got, tt.wantCallID)
+				t.Errorf("ToolExecutionID = %v, want %v", got, tt.wantCallID)
 			}
 		})
 	}

@@ -8,6 +8,7 @@ import (
 
 	"github.com/inventivepotter/urvi/internal/agent/loop/command"
 	"github.com/inventivepotter/urvi/internal/agent/loop/event"
+	"github.com/inventivepotter/urvi/internal/agent/loop/identity"
 	"github.com/inventivepotter/urvi/internal/content"
 	"github.com/inventivepotter/urvi/internal/uuid"
 )
@@ -85,14 +86,14 @@ type loopConfig struct {
 
 	// events publishes FULL-FIDELITY loop events to the session-level event fan-in.
 	// The loop depends on the narrow publisher interface (Dependency Inversion /
-	// Interface Segregation) instead of a raw channel, so only AgentSession owns
+	// Interface Segregation) instead of a raw channel, so only Session owns
 	// buffering, shutdown, close, and sequence policy. A parent or primary loop must
 	// not forward child-loop events; identity is metadata, not the transport path.
 	events eventPublisher
 }
 
 // idGenerator mints a fresh UUID for the loop's correlation IDs — the per-turn
-// TurnID, each StepID, and each tool-call CallID. It defaults to uuid.New; tests
+// TurnID, each StepID, and each tool-call ToolExecutionID. It defaults to uuid.New; tests
 // inject a failing generator to exercise the crypto/rand failure branches.
 type idGenerator func() (uuid.UUID, error)
 
@@ -108,8 +109,9 @@ type eventPublisher interface {
 
 // Provenance identifies the parent turn/step that spawned a loop. The zero value
 // means "no parent" (the primary loop). It is the (LoopID, TurnID, StepID) tuple
-// the loop stamps onto the Parent* fields of every event it emits. It lives in
-// the loop package because both loopState and AgentSession's registry use it.
+// recorded on the loop's registry entry (loopState.parent); event-level lineage
+// stamping is deferred — the event Header carries no parent/origin fields yet. It
+// lives in the loop package because both loopState and Session's registry use it.
 type Provenance struct {
 	LoopID uuid.UUID // parent loop; zero for the primary loop
 	TurnID uuid.UUID // the parent turn that spawned this loop
@@ -195,7 +197,7 @@ const inboxCap = 64
 // remove it by id while it is still queued). triggeredBy is the producing subagent
 // loop id for a SubagentResult (zero for a UserInput); the events caused by this
 // queued input (TurnStarted/TurnFoldedInto/InputCancelled) stamp it as
-// Header.TriggeredByLoopID, which releases the parent's quiescence wake token.
+// Header.Cause.LoopID, which releases the parent's quiescence wake token.
 // triggeredBy is stored now and USED for quiescence in a later phase.
 //
 // Phase 10 unified the former drain-handback type `foldedMsg` into this one: the
@@ -204,7 +206,13 @@ const inboxCap = 64
 type queuedInput struct {
 	inputID     uuid.UUID
 	triggeredBy uuid.UUID
-	msg         *content.UserMessage
+	// agency is a COPY of the originating submit command's Header.Agency. It is
+	// carried alongside inputID/triggeredBy so the submit-resolution events
+	// (TurnStarted/TurnFoldedInto/InputCancelled) can stamp Cause.Agency without
+	// chasing the command — AgencyUser surfaces "a human started/folded/cancelled
+	// this", AgencyMachine (the zero default) otherwise.
+	agency identity.Agency
+	msg    *content.UserMessage
 }
 
 type loopState struct {
@@ -258,10 +266,10 @@ type loopState struct {
 
 	shutdownAcks []chan<- error
 
-	// pendingGates maps a tool call's CallID to the gate a parked runner is blocked
+	// pendingGates maps a tool call's ToolExecutionID to the gate a parked runner is blocked
 	// on. Owned SOLELY by runLoop/the actor — a turn goroutine never touches it. A
 	// control command (Approve/Deny/ProvideUserInput) is routed to the matching
-	// gate by CallID AND kind, then the entry is deleted. Cleared on turn end.
+	// gate by ToolExecutionID AND kind, then the entry is deleted. Cleared on turn end.
 	pendingGates map[uuid.UUID]gate
 }
 
@@ -439,7 +447,7 @@ func runLoop(cfg loopConfig, state loopState) {
 	// and shutdown-induced idling does not emit it because the actor returns before
 	// reaching the emit point (or has already flipped to SessionStopped at the session).
 	emitLoopIdle := func() {
-		publish(event.LoopIdle{Header: event.Header{SessionID: state.sessionID, LoopID: state.id}})
+		publish(event.LoopIdle{Header: event.Header{Coordinates: identity.Coordinates{SessionID: state.sessionID, LoopID: state.id}}})
 	}
 
 	ackShutdowns := func(err error) {
@@ -450,11 +458,11 @@ func runLoop(cfg loopConfig, state loopState) {
 	}
 
 	// routeControl delivers a control command (Approve/Deny/ProvideUserInput) to
-	// the parked runner blocked on its CallID, but ONLY if a gate is open for that
-	// CallID AND the gate kind accepts this command kind. On a match it delivers
+	// the parked runner blocked on its ToolExecutionID, but ONLY if a gate is open for that
+	// ToolExecutionID AND the gate kind accepts this command kind. On a match it delivers
 	// once (the gate's reply channel is buffered(1) and the runner is its sole
 	// reader, so the send never blocks the actor) and deletes the gate so a
-	// duplicate cannot deliver twice. Any miss — no gate (wrong/unknown CallID,
+	// duplicate cannot deliver twice. Any miss — no gate (wrong/unknown ToolExecutionID,
 	// stale or duplicate command) or a kind mismatch — is silently DROPPED
 	// (fail-safe): the actor never blocks and never panics.
 	routeControl := func(cmd command.Command, callID uuid.UUID) {
@@ -480,7 +488,7 @@ func runLoop(cfg loopConfig, state loopState) {
 	// turn ctx from the loop ctx (submit commands carry no context, so a turn's
 	// lifetime is bounded by the loop's, not by any caller's API-call ctx). It then
 	// commits the initial UserMessage into loopState.msgs and emits
-	// event.TurnStarted at the SAME actor-owned point (TriggeredByLoopID carries
+	// event.TurnStarted at the SAME actor-owned point (Cause.LoopID carries
 	// qi.triggeredBy: set for a SubagentResult, zero for a UserInput). It returns the
 	// derived turn ctx and the defensive base clone the per-turn goroutine reads.
 	// This is the COMMIT-AND-ANNOUNCE half of starting a turn (distinct from
@@ -502,19 +510,23 @@ func runLoop(cfg loopConfig, state loopState) {
 		base := cloneMessages(state.msgs)
 
 		// Loop-owned incremental commit: commit the initial UserMessage and emit
-		// TurnStarted (Message + CausationID = inputID + InputID = inputID) at the
+		// TurnStarted (Message + Cause.CommandID = inputID + InputID = inputID) at the
 		// SAME actor-owned point, BEFORE runTurn starts.
 		state.msgs = append(state.msgs, qi.msg)
 		emitTurn(event.TurnStarted{
 			Header: event.Header{
-				SessionID:         state.sessionID,
-				LoopID:            state.id,
-				TurnID:            state.turnID,
-				CausationID:       state.causationID,
-				TriggeredByLoopID: qi.triggeredBy,
+				Coordinates: identity.Coordinates{
+					SessionID: state.sessionID,
+					LoopID:    state.id,
+					TurnID:    state.turnID,
+				},
+				Cause: identity.Cause{
+					CommandID:   state.causationID,
+					Coordinates: identity.Coordinates{LoopID: qi.triggeredBy},
+					Agency:      qi.agency,
+				},
 			},
 			TurnIndex: state.turnIndex,
-			InputID:   qi.inputID,
 			Message:   qi.msg,
 		})
 		return turnCtx, base
@@ -641,13 +653,17 @@ func runLoop(cfg loopConfig, state loopState) {
 	returnEntry := func(qi queuedInput, reason event.CancelReason, turnID uuid.UUID) {
 		publish(event.InputCancelled{
 			Header: event.Header{
-				SessionID:         state.sessionID,
-				LoopID:            state.id,
-				TurnID:            turnID,
-				CausationID:       qi.inputID,
-				TriggeredByLoopID: qi.triggeredBy,
+				Coordinates: identity.Coordinates{
+					SessionID: state.sessionID,
+					LoopID:    state.id,
+					TurnID:    turnID,
+				},
+				Cause: identity.Cause{
+					CommandID:   qi.inputID,
+					Coordinates: identity.Coordinates{LoopID: qi.triggeredBy},
+					Agency:      qi.agency,
+				},
 			},
-			InputID: qi.inputID,
 			Reason:  reason,
 			Message: qi.msg,
 		})
@@ -656,7 +672,7 @@ func runLoop(cfg loopConfig, state loopState) {
 	// rejectSubmit resolves a refused submit through the EVENT path (the typed
 	// replacement for the old command.Disposition reply). It publishes the Enduring
 	// event.TurnRejected to the session fan-in (header-stamped by stampLoopHeader,
-	// CausationID == InputID), so any issuer recognises its answer via
+	// Cause.CommandID == InputID), so any issuer recognises its answer via
 	// ReplyTo() == its command id. For a StartOnly submit (the per-turn stream is
 	// non-nil) it ALSO delivers the same TurnRejected on `events` BEFORE closing the
 	// channel, so Invoke/Stream observe the reason as the stream's first (and only)
@@ -668,11 +684,12 @@ func runLoop(cfg loopConfig, state loopState) {
 	rejectSubmit := func(qi queuedInput, reason event.RejectReason, events chan<- event.Event, abandoned <-chan struct{}) {
 		rejected := event.TurnRejected{
 			Header: event.Header{
-				CausationID:       qi.inputID,
-				TriggeredByLoopID: qi.triggeredBy,
+				Cause: identity.Cause{
+					CommandID:   qi.inputID,
+					Coordinates: identity.Coordinates{LoopID: qi.triggeredBy},
+				},
 			},
-			InputID: qi.inputID,
-			Reason:  reason,
+			Reason: reason,
 		}
 		publish(rejected)
 		if events == nil {
@@ -698,7 +715,7 @@ func runLoop(cfg loopConfig, state loopState) {
 	// must always start (idle) or queue (running/shutting-down), so its quiescence
 	// {wake} token is ALWAYS released by a resulting Enduring event (TurnStarted /
 	// TurnFoldedInto, or InputCancelled if the loop ends before it commits — the
-	// shutdown terminal's returnQueuedInbox emits it carrying TriggeredByLoopID),
+	// shutdown terminal's returnQueuedInbox emits it carrying Cause.LoopID),
 	// never off the publish path. events/abandoned are the optional per-turn stream
 	// (nil for a fan-in-only submit). A crypto/rand failure means the actor cannot
 	// mint the TurnID — a transient system fault — so the loop declines the work
@@ -724,10 +741,11 @@ func runLoop(cfg loopConfig, state loopState) {
 			state.inbox = append(state.inbox, qi)
 			publish(event.InputQueued{
 				Header: event.Header{
-					CausationID:       qi.inputID,
-					TriggeredByLoopID: qi.triggeredBy,
+					Cause: identity.Cause{
+						CommandID:   qi.inputID,
+						Coordinates: identity.Coordinates{LoopID: qi.triggeredBy},
+					},
 				},
-				InputID: qi.inputID,
 			})
 		default: // idle: start a turn from the submit.
 			if _, err := startTurn(qi, events, abandoned); err != nil {
@@ -736,7 +754,7 @@ func runLoop(cfg loopConfig, state loopState) {
 					// A SubagentResult is NEVER rejected — even an idle-time id-gen
 					// failure must release its {wake} quiescence token on the PUBLISH
 					// path (it produces no off-publish release anymore). TurnRejected does
-					// NOT release {wake}; InputCancelled (carrying TriggeredByLoopID) does,
+					// NOT release {wake}; InputCancelled (carrying Cause.LoopID) does,
 					// so an internal failure to start a SubagentResult is surfaced as an
 					// InputCancelled (the input never committed) rather than a reject. The
 					// per-turn stream is always nil for a SubagentResult, so there is no
@@ -836,7 +854,7 @@ func runLoop(cfg loopConfig, state loopState) {
 	// that InputID. There is no reply channel.
 	cancelQueued := func(c command.CancelQueuedInput) {
 		for i, qi := range state.inbox {
-			if qi.inputID != c.InputID {
+			if qi.inputID != c.TargetCommandID {
 				continue
 			}
 			state.inbox = append(state.inbox[:i], state.inbox[i+1:]...)
@@ -941,19 +959,22 @@ func runLoop(cfg loopConfig, state loopState) {
 				// event (TurnStarted / InputQueued / TurnRejected); a StartOnly caller
 				// also observes that outcome on its per-turn stream. A UserInput may be
 				// rejected, so bypassReject is false.
-				qi := queuedInput{inputID: c.CommandHeader().ID, msg: userMessageFromBlocks(c.Blocks)}
+				qi := queuedInput{inputID: c.CommandHeader().CommandID, agency: c.CommandHeader().Agency, msg: userMessageFromBlocks(c.Blocks)}
 				decideSubmit(qi, c.Mode == command.AllowFold, false, c.Events, c.Abandoned)
 
 			case command.SubagentResult:
 				// A hand-back from a finished subagent loop. Always queueable, no per-turn
-				// stream; triggeredBy is the producing subagent loop id, stamped on the
-				// resulting events. bypassReject is true: a SubagentResult is NEVER
-				// rejected — it always starts (idle) or queues (running/shutting-down), so
-				// its quiescence {wake} token is always released by a resulting Enduring
-				// event, never off the publish path.
+				// stream; triggeredBy is the producing CHILD loop id (Cause.LoopID),
+				// stamped on the resulting events — the command's embedded Coordinates.LoopID
+				// is the PARENT (this loop, the delivery target), NOT the wake token.
+				// bypassReject is true: a SubagentResult is NEVER rejected — it always
+				// starts (idle) or queues (running/shutting-down), so its quiescence {wake}
+				// token is always released by a resulting Enduring event, never off the
+				// publish path.
 				qi := queuedInput{
-					inputID:     c.CommandHeader().ID,
-					triggeredBy: c.FromLoopID,
+					inputID:     c.CommandHeader().CommandID,
+					triggeredBy: c.Cause.LoopID,           // the CHILD loop (wake token)
+					agency:      c.CommandHeader().Agency, // a hand-back is machine; copy verbatim
 					msg:         userMessageFromBlocks(c.Blocks),
 				}
 				decideSubmit(qi, true, true, nil, nil)
@@ -1004,21 +1025,21 @@ func runLoop(cfg loopConfig, state loopState) {
 			// Turn goroutine is winding down; wait for internal below.
 
 			// Control commands are fire-and-route: no Validate, no Ack. routeControl
-			// delivers to the parked runner blocked on this CallID iff a gate is open
-			// AND its kind accepts this command; any miss (unknown/stale CallID, kind
+			// delivers to the parked runner blocked on this ToolExecutionID iff a gate is open
+			// AND its kind accepts this command; any miss (unknown/stale ToolExecutionID, kind
 			// mismatch, duplicate after delivery) is silently dropped (fail-safe).
 			case command.ApproveToolCall:
-				routeControl(c, c.GateCallID())
+				routeControl(c, c.GateToolExecutionID())
 
 			case command.DenyToolCall:
-				routeControl(c, c.GateCallID())
+				routeControl(c, c.GateToolExecutionID())
 
 			case command.ProvideUserInput:
-				routeControl(c, c.GateCallID())
+				routeControl(c, c.GateToolExecutionID())
 			}
 
 		case reg := <-gateReg:
-			// Install-before-emit: record the gate under its CallID, then close ack
+			// Install-before-emit: record the gate under its ToolExecutionID, then close ack
 			// so the parked runner may emit its request event knowing a routed reply
 			// can no longer be dropped on a race. Only the actor touches pendingGates.
 			state.pendingGates[reg.callID] = gate{reply: reg.reply, kind: reg.kind}
@@ -1048,7 +1069,7 @@ func runLoop(cfg loopConfig, state loopState) {
 			// TurnFoldedInto was just emitted), so the abnormal-terminal return path
 			// does not also return it. StepDone commits carry no inbox entry.
 			if fi, ok := req.commit.Event.(event.TurnFoldedInto); ok {
-				removeDraining(fi.InputID)
+				removeDraining(fi.Cause.CommandID)
 			}
 			req.ack <- struct{}{}
 

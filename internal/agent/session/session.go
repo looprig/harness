@@ -8,6 +8,7 @@ import (
 	"github.com/inventivepotter/urvi/internal/agent/loop"
 	"github.com/inventivepotter/urvi/internal/agent/loop/command"
 	"github.com/inventivepotter/urvi/internal/agent/loop/event"
+	"github.com/inventivepotter/urvi/internal/agent/loop/identity"
 	"github.com/inventivepotter/urvi/internal/agent/session/hub"
 	"github.com/inventivepotter/urvi/internal/content"
 	"github.com/inventivepotter/urvi/internal/llm"
@@ -89,14 +90,14 @@ func (e *TurnRejectedError) Error() string {
 // failing generator to exercise the crypto/rand failure branch.
 type idGenerator func() (uuid.UUID, error)
 
-type Sesssion struct {
+type Session struct {
 	// SessionID is shared by every loop participating in this session.
 	SessionID uuid.UUID
 
 	// hub is the session-level event fan-in. Loops publish through it (via the
 	// session's PublishEvent, which delegates here); consumers subscribe via
 	// SubscribeEvents. The hub also owns the federated-quiescence model that
-	// WaitIdle reads. It is constructed in NewAgent before any loop, so a loop
+	// WaitIdle reads. It is constructed in New before any loop, so a loop
 	// never publishes into a nil hub.
 	hub *hub.Hub
 
@@ -137,30 +138,30 @@ type loopHandle struct {
 
 // eventSubscriber is the consumer-facing half of the session fan-in: a TUI/CLI (or
 // later a durable journal) attaches here to receive filtered events. It is defined
-// where it is consumed (the session), per Dependency Inversion. *AgentSession
+// where it is consumed (the session), per Dependency Inversion. *Session
 // satisfies it by delegating to the hub.
 type eventSubscriber interface {
 	SubscribeEvents(event.EventFilter) (*hub.EventSubscription, error)
 }
 
-// Compile-time proof that *AgentSession is the consumer-facing eventSubscriber.
+// Compile-time proof that *Session is the consumer-facing eventSubscriber.
 // Its publisher half (PublishEvent) is asserted by loop.New accepting s as its
 // eventPublisher at the NewLoop call site.
-var _ eventSubscriber = (*Sesssion)(nil)
+var _ eventSubscriber = (*Session)(nil)
 
 // PublishEvent is the session's eventPublisher implementation passed to loop.New.
 // It delegates to the hub, which fans the event out to matching subscribers and
 // applies any quiescence transition the event implies. The loop depends only on
 // the narrow eventPublisher interface; it never sees the hub, its subscriber set,
 // or its shutdown state (Interface Segregation / least privilege).
-func (s *Sesssion) PublishEvent(ctx context.Context, ev event.Event) error {
+func (s *Session) PublishEvent(ctx context.Context, ev event.Event) error {
 	return s.hub.PublishEvent(ctx, ev)
 }
 
 // SubscribeEvents attaches a consumer to the session fan-in with the given filter.
 // The returned subscription's Events() channel yields the filtered stream; the
 // caller must Close it when done. It delegates to the hub.
-func (s *Sesssion) SubscribeEvents(filter event.EventFilter) (*hub.EventSubscription, error) {
+func (s *Session) SubscribeEvents(filter event.EventFilter) (*hub.EventSubscription, error) {
 	return s.hub.SubscribeEvents(filter)
 }
 
@@ -168,7 +169,7 @@ func (s *Sesssion) SubscribeEvents(filter event.EventFilter) (*hub.EventSubscrip
 // Invoke/Stream and the loop whose live Ephemeral tokens a single-loop TUI streams.
 // A whole-session subscriber builds its EventFilter from it (primary-only Ephemeral
 // + all-loop Enduring). It is read-only identity, safe to call concurrently.
-func (s *Sesssion) PrimaryLoopID() uuid.UUID {
+func (s *Session) PrimaryLoopID() uuid.UUID {
 	s.loopsMu.RLock()
 	defer s.loopsMu.RUnlock()
 	return s.primaryLoopID
@@ -177,7 +178,7 @@ func (s *Sesssion) PrimaryLoopID() uuid.UUID {
 // WaitIdle blocks until the session is quiescent, ctx is done, or the session has
 // stopped (hub.ErrSessionStopped). It is the headless caller's "is the whole
 // interaction at rest?" primitive; it delegates to the hub's quiescence model.
-func (s *Sesssion) WaitIdle(ctx context.Context) error {
+func (s *Session) WaitIdle(ctx context.Context) error {
 	return s.hub.WaitIdle(ctx)
 }
 
@@ -192,7 +193,7 @@ func (s *Sesssion) WaitIdle(ctx context.Context) error {
 // when it lands, NewLoop's async-spawn path is where this call wires in. Today no loop
 // spawns an async subagent, so this method has no production caller yet — it is
 // exercised by the round-trip and the session+hub quiescence tests.
-func (s *Sesssion) expectTurn(ctx context.Context, subagentLoopID uuid.UUID) {
+func (s *Session) expectTurn(ctx context.Context, subagentLoopID uuid.UUID) {
 	s.hub.ExpectTurn(ctx, subagentLoopID)
 }
 
@@ -200,11 +201,11 @@ func (s *Sesssion) expectTurn(ctx context.Context, subagentLoopID uuid.UUID) {
 // session-internal (loops never call it) and is NO LONGER on the SubagentResult
 // hand-back path: a SubagentResult is never rejected, so its {wake} token always
 // releases on the publish path via the resulting TurnStarted/TurnFoldedInto/
-// InputCancelled carrying TriggeredByLoopID. cancelExpectTurn remains for the future
+// InputCancelled carrying Cause.LoopID. cancelExpectTurn remains for the future
 // async-spawn DISCARD path (a child spawned but abandoned before it ever hands back,
-// so no event ever carries its TriggeredByLoopID). Today it has no production caller;
+// so no event ever carries its Cause.LoopID). Today it has no production caller;
 // it is exercised by the session+hub quiescence tests.
-func (s *Sesssion) cancelExpectTurn(ctx context.Context, subagentLoopID uuid.UUID) {
+func (s *Session) cancelExpectTurn(ctx context.Context, subagentLoopID uuid.UUID) {
 	s.hub.CancelExpectTurn(ctx, subagentLoopID)
 }
 
@@ -215,18 +216,19 @@ func (s *Sesssion) cancelExpectTurn(ctx context.Context, subagentLoopID uuid.UUI
 // for off the publish path. The parent loop always starts (idle) or queues
 // (running/shutting-down) the hand-back, and its quiescence {wake, fromLoopID} token
 // is ALWAYS released on the publish path by the resulting Enduring event — a
-// TurnStarted/TurnFoldedInto carrying TriggeredByLoopID == fromLoopID, or an
+// TurnStarted/TurnFoldedInto carrying Cause.LoopID == fromLoopID, or an
 // InputCancelled (also carrying it) if the loop ends before the hand-back commits (the
 // shutdown terminal's returnQueuedInbox, or an idle-time id-gen failure to start). The
 // session no longer reads a disposition and no longer releases the token off the
 // publish path.
 //
-// parentLoopID selects the parent loop's command channel; fromLoopID is the producing
-// subagent (stamped as SubagentResult.FromLoopID -> TriggeredByLoopID on the events the
-// hand-back causes). The submit carries no per-turn stream — the parent's events flow
+// parentLoopID selects the parent loop's command channel — it rides as the command's
+// embedded Coordinates.LoopID (the delivery target). fromLoopID is the producing
+// subagent (the CHILD); it rides as Header.Cause.LoopID and is stamped onto the events
+// the hand-back causes. The submit carries no per-turn stream — the parent's events flow
 // to the session fan-in. ctx governs the send only (the loop derives the turn ctx from
 // its own loopCtx).
-func (s *Sesssion) deliverSubagentResult(ctx context.Context, parentLoopID, fromLoopID uuid.UUID, blocks []content.Block) error {
+func (s *Session) deliverSubagentResult(ctx context.Context, parentLoopID, fromLoopID uuid.UUID, blocks []content.Block) error {
 	l, ok := s.loopFor(parentLoopID)
 	if !ok {
 		return &SessionError{Kind: SessionLoopNotFound}
@@ -236,7 +238,14 @@ func (s *Sesssion) deliverSubagentResult(ctx context.Context, parentLoopID, from
 		return err
 	}
 	select {
-	case l.Commands <- command.SubagentResult{Header: command.Header{ID: id}, FromLoopID: fromLoopID, Blocks: blocks}:
+	case l.Commands <- command.SubagentResult{
+		Coordinates: identity.Coordinates{LoopID: parentLoopID}, // delivery target (PARENT)
+		Header: command.Header{
+			CommandID: id,
+			Cause:     identity.Cause{Coordinates: identity.Coordinates{LoopID: fromLoopID}}, // CHILD (wake token)
+		},
+		Blocks: blocks,
+	}: // Agency left default AgencyMachine — a hand-back is machine-originated
 		return nil
 	case <-l.Done:
 		return &SessionError{Kind: SessionLoopExited}
@@ -251,7 +260,7 @@ func (s *Sesssion) deliverSubagentResult(ctx context.Context, parentLoopID, from
 // records it in the registry and passes it to loop.New. The session stores the
 // loop handle and returns only the loop id, because callers route through
 // session methods rather than writing to a loop command channel directly.
-func (s *Sesssion) NewLoop(parent loop.Provenance, cfg loop.Config) (uuid.UUID, error) {
+func (s *Session) NewLoop(parent loop.Provenance, cfg loop.Config) (uuid.UUID, error) {
 	loopID, err := s.newID()
 	if err != nil {
 		return uuid.UUID{}, &SessionError{Kind: SessionLoopIDGenerationFailed, Cause: err}
@@ -273,7 +282,7 @@ func (s *Sesssion) NewLoop(parent loop.Provenance, cfg loop.Config) (uuid.UUID, 
 // loopFor returns the loop's channel handle for command routing. The registry
 // stores *loopHandle; this derefs to the handle's loop. The parent provenance is
 // read only by future tree walks, which read s.loops directly.
-func (s *Sesssion) loopFor(loopID uuid.UUID) (*loop.Loop, bool) {
+func (s *Session) loopFor(loopID uuid.UUID) (*loop.Loop, bool) {
 	s.loopsMu.RLock()
 	defer s.loopsMu.RUnlock()
 	h, ok := s.loops[loopID]
@@ -286,7 +295,7 @@ func (s *Sesssion) loopFor(loopID uuid.UUID) (*loop.Loop, bool) {
 // newCommandID mints a fresh correlation ID for a command Header. Any
 // crypto/rand failure is mapped onto the session's typed error path rather than
 // swallowed, so callers never send an unidentifiable (zero-ID) command.
-func (s *Sesssion) newCommandID() (uuid.UUID, error) {
+func (s *Session) newCommandID() (uuid.UUID, error) {
 	id, err := s.newID()
 	if err != nil {
 		return uuid.UUID{}, &SessionError{Kind: SessionIDGenerationFailed, Cause: err}
@@ -294,7 +303,7 @@ func (s *Sesssion) newCommandID() (uuid.UUID, error) {
 	return id, nil
 }
 
-// NewAgent constructs an AgentSession and starts its primary loop's actor
+// New constructs a Session and starts its primary loop's actor
 // goroutine. It owns the session fan-in hub and emits the session-scoped
 // SessionStarted through it.
 //
@@ -303,7 +312,7 @@ func (s *Sesssion) newCommandID() (uuid.UUID, error) {
 // and the loop never emits one. It is published before any subscriber attaches,
 // so a subscriber that connects later does not observe it; reliable delivery of
 // the session start to late subscribers is a separate future follow-on.
-func NewAgent(ctx context.Context, cfg loop.Config) (*Sesssion, error) {
+func New(ctx context.Context, cfg loop.Config) (*Session, error) {
 	select {
 	case <-ctx.Done():
 		return nil, &SessionError{Kind: SessionContextDone, Cause: ctx.Err()}
@@ -316,7 +325,7 @@ func NewAgent(ctx context.Context, cfg loop.Config) (*Sesssion, error) {
 	}
 
 	sessionCtx, sessionCancel := context.WithCancel(ctx)
-	s := &Sesssion{
+	s := &Session{
 		SessionID:     id,
 		hub:           hub.New(id),
 		sessionCtx:    sessionCtx,
@@ -328,7 +337,7 @@ func NewAgent(ctx context.Context, cfg loop.Config) (*Sesssion, error) {
 	// The hub is built before any loop, so a loop publishing through the session's
 	// PublishEvent never sees a nil hub. With no subscribers yet, this delivers to
 	// nobody (a no-op), but it is the session's authoritative session-scoped start.
-	if err := s.hub.PublishEvent(sessionCtx, event.SessionStarted{Header: event.Header{SessionID: id}}); err != nil {
+	if err := s.hub.PublishEvent(sessionCtx, event.SessionStarted{Header: event.Header{Coordinates: identity.Coordinates{SessionID: id}}}); err != nil {
 		sessionCancel()
 		return nil, &SessionError{Kind: SessionContextDone, Cause: err}
 	}
@@ -349,7 +358,7 @@ func NewAgent(ctx context.Context, cfg loop.Config) (*Sesssion, error) {
 // ctx from its loopCtx), so cancelling ctx no longer cancels the turn through the
 // command — instead the session translates the boundary cancel into an Interrupt
 // and returns the resulting event.TurnInterrupted.
-func (s *Sesssion) Invoke(ctx context.Context, input []content.Block) (event.Event, error) {
+func (s *Session) Invoke(ctx context.Context, input []content.Block) (event.Event, error) {
 	l, ok := s.loopFor(s.primaryLoopID)
 	if !ok {
 		return nil, &SessionError{Kind: SessionLoopNotFound}
@@ -363,8 +372,8 @@ func (s *Sesssion) Invoke(ctx context.Context, input []content.Block) (event.Eve
 	defer close(abandoned) // ensures deliverAndClose always has an escape if Invoke exits early
 
 	select {
-	// User-initiated turn: CausationID is zero (root).
-	case l.Commands <- command.UserInput{Header: command.Header{ID: id}, Mode: command.StartOnly, Blocks: input, Events: events, Abandoned: abandoned}:
+	// User-initiated turn: Cause.CommandID is zero (root).
+	case l.Commands <- command.UserInput{Header: command.Header{CommandID: id}, Mode: command.StartOnly, Blocks: input, Events: events, Abandoned: abandoned}:
 	case <-ctx.Done():
 		return nil, &SessionError{Kind: SessionContextDone, Cause: ctx.Err()}
 	case <-l.Done:
@@ -427,14 +436,14 @@ func (s *Sesssion) Invoke(ctx context.Context, input []content.Block) (event.Eve
 // caller observes the cancellation through the resulting TurnInterrupted terminal,
 // not this command's reply. An id-gen failure is swallowed (best-effort): the worst
 // case is the turn runs to its natural terminal instead of being interrupted.
-func (s *Sesssion) interruptLoop(l *loop.Loop) {
+func (s *Session) interruptLoop(l *loop.Loop) {
 	id, err := s.newID()
 	if err != nil {
 		return
 	}
 	ack := make(chan bool, 1)
 	select {
-	case l.Commands <- command.Interrupt{Header: command.Header{ID: id}, Ack: ack}:
+	case l.Commands <- command.Interrupt{Header: command.Header{CommandID: id}, Ack: ack}:
 	case <-l.Done:
 	}
 }
@@ -446,7 +455,7 @@ func (s *Sesssion) interruptLoop(l *loop.Loop) {
 // first event); an event.TurnRejected returns a typed *TurnRejectedError. Calling sr.Close() abandons the event stream AND interrupts
 // the turn (the submit carries no ctx, so Close translates into an Interrupt).
 // Callers must either read until EOF or call Close.
-func (s *Sesssion) Stream(ctx context.Context, input []content.Block) (*llm.StreamReader[event.Event], error) {
+func (s *Session) Stream(ctx context.Context, input []content.Block) (*llm.StreamReader[event.Event], error) {
 	l, ok := s.loopFor(s.primaryLoopID)
 	if !ok {
 		return nil, &SessionError{Kind: SessionLoopNotFound}
@@ -460,9 +469,9 @@ func (s *Sesssion) Stream(ctx context.Context, input []content.Block) (*llm.Stre
 	events := make(chan event.Event, 64)
 
 	select {
-	// User-initiated turn: CausationID is zero (root).
+	// User-initiated turn: Cause.CommandID is zero (root).
 	case l.Commands <- command.UserInput{
-		Header:    command.Header{ID: id},
+		Header:    command.Header{CommandID: id},
 		Mode:      command.StartOnly,
 		Blocks:    input,
 		Events:    events,
@@ -533,12 +542,16 @@ func (s *Sesssion) Stream(ctx context.Context, input []content.Block) (*llm.Stre
 	), nil
 }
 
+// Submit is the HUMAN-ONLY submit entry point: it stamps Agency=AgencyUser (a
+// person authored this input). Programmatic/machine callers use Invoke/Stream
+// (StartOnly), which stay Agency=AgencyMachine.
+//
 // Submit sends input as an AllowFold (queueable) UserInput to the primary loop,
 // FIRE-AND-FORGET: it returns the InputID (the submit command's id, == the
-// CausationID on the resulting Reply events) and a transport error only if the
+// Cause.CommandID on the resulting Reply events) and a transport error only if the
 // command could not be handed to the loop. The outcome — InputQueued /
 // TurnStarted / TurnFoldedInto / TurnRejected / InputCancelled — is observed on
-// the event fan-in (each Reply carries CausationID == this returned id), NOT
+// the event fan-in (each Reply carries Cause.CommandID == this returned id), NOT
 // returned here.
 //
 // AllowFold is the interactive queueable mode: a submit while a turn is running
@@ -550,7 +563,7 @@ func (s *Sesssion) Stream(ctx context.Context, input []content.Block) (*llm.Stre
 // SessionContextDone, the loop's Done → SessionLoopExited, and a missing primary
 // loop → SessionLoopNotFound. On any of those the returned id is the zero UUID,
 // because nothing was sent and there is no correlation to hand back.
-func (s *Sesssion) Submit(ctx context.Context, input []content.Block) (uuid.UUID, error) {
+func (s *Session) Submit(ctx context.Context, input []content.Block) (uuid.UUID, error) {
 	l, ok := s.loopFor(s.primaryLoopID)
 	if !ok {
 		return uuid.UUID{}, &SessionError{Kind: SessionLoopNotFound}
@@ -560,10 +573,12 @@ func (s *Sesssion) Submit(ctx context.Context, input []content.Block) (uuid.UUID
 		return uuid.UUID{}, err
 	}
 	select {
-	// User-initiated queueable turn: CausationID is zero (root); Events/Abandoned
+	// User-initiated queueable turn: Cause.CommandID is zero (root); Events/Abandoned
 	// nil because the outcome is observed on the session fan-in, not a per-turn
-	// stream.
-	case l.Commands <- command.UserInput{Header: command.Header{ID: id}, Mode: command.AllowFold, Blocks: input}:
+	// stream. Submit is the interactive (AllowFold) submit — the human-typed input
+	// path — so it stamps Agency=AgencyUser (a human authored this). The programmatic
+	// submit path is the SEPARATE StartOnly Invoke/Stream methods, which stay machine.
+	case l.Commands <- command.UserInput{Header: command.Header{CommandID: id, Agency: identity.AgencyUser}, Mode: command.AllowFold, Blocks: input}:
 		return id, nil
 	case <-ctx.Done():
 		return uuid.UUID{}, &SessionError{Kind: SessionContextDone, Cause: ctx.Err()}
@@ -574,7 +589,7 @@ func (s *Sesssion) Submit(ctx context.Context, input []content.Block) (uuid.UUID
 
 // Interrupt cancels the running turn. Returns true if a turn was cancelled.
 // ctx allows the caller to time out the cancel attempt if the actor is slow.
-func (s *Sesssion) Interrupt(ctx context.Context) (bool, error) {
+func (s *Session) Interrupt(ctx context.Context) (bool, error) {
 	l, ok := s.loopFor(s.primaryLoopID)
 	if !ok {
 		return false, &SessionError{Kind: SessionLoopNotFound}
@@ -585,7 +600,11 @@ func (s *Sesssion) Interrupt(ctx context.Context) (bool, error) {
 	}
 	ack := make(chan bool, 1)
 	select {
-	case l.Commands <- command.Interrupt{Header: command.Header{ID: id}, Ack: ack}:
+	// A manual Interrupt is a human-origination point (the human pressed interrupt),
+	// so it stamps Agency=AgencyUser. The programmatic boundary-cancel translation
+	// (interruptLoop, fired by an Invoke/Stream ctx cancel) is a SEPARATE method and
+	// stays machine — we never falsely attribute that machine action to a user.
+	case l.Commands <- command.Interrupt{Header: command.Header{CommandID: id, Agency: identity.AgencyUser}, Ack: ack}:
 	case <-l.Done:
 		return false, &SessionError{Kind: SessionLoopExited}
 	case <-ctx.Done():
@@ -618,7 +637,7 @@ func (s *Sesssion) Interrupt(ctx context.Context) (bool, error) {
 //
 // Calling Shutdown after the actor has exited is a no-op (StopSession is
 // idempotent; the loop's Done short-circuits the rest).
-func (s *Sesssion) Shutdown(ctx context.Context) error {
+func (s *Session) Shutdown(ctx context.Context) error {
 	s.hub.StopSession(ctx)
 
 	l, ok := s.loopFor(s.primaryLoopID)
@@ -634,7 +653,7 @@ func (s *Sesssion) Shutdown(ctx context.Context) error {
 	}
 	ack := make(chan error, 1)
 	select {
-	case l.Commands <- command.Shutdown{Header: command.Header{ID: id}, Ack: ack}:
+	case l.Commands <- command.Shutdown{Header: command.Header{CommandID: id}, Ack: ack}:
 	case <-l.Done:
 		// Loop already exited; cancel the session lifetime backstop and return.
 		s.sessionCancel()
@@ -663,55 +682,96 @@ func (s *Sesssion) Shutdown(ctx context.Context) error {
 	}
 }
 
-// Approve approves the pending tool call identified by callID, granting it at the
-// given persistence scope. It is fire-and-route: the command carries no Ack, so
-// Approve returns as soon as the actor accepts it (the gate unblocking and the
-// subsequent ToolCallStarted event are the observable effect, not a reply). The
-// select covers ctx.Done() and the loop's Done channel so the unbuffered send can
-// never block forever if the actor is busy or has exited.
-func (s *Sesssion) Approve(ctx context.Context, callID uuid.UUID, scope tool.ApprovalScope) error {
+// Approve approves the pending tool call identified by toolExecutionID, granting
+// it at the given persistence scope. The reply is dispatched to loopID — the loop
+// that opened the gate — so a subagent loop's gate is never answered by routing to
+// the primary (the latent multi-loop misroute). loopID is resolved against the
+// registry; a zero loopID falls back to the primary loop (single-loop default),
+// and an unknown non-zero loopID fails secure with SessionLoopNotFound. It is
+// fire-and-route: the command carries no Ack, so Approve returns as soon as the
+// actor accepts it (the gate unblocking and the subsequent ToolCallStarted event
+// are the observable effect, not a reply). The select covers ctx.Done() and the
+// loop's Done channel so the unbuffered send can never block forever.
+func (s *Session) Approve(ctx context.Context, loopID, toolExecutionID uuid.UUID, scope tool.ApprovalScope) error {
+	l, route, err := s.resolveGate(loopID, toolExecutionID)
+	if err != nil {
+		return err
+	}
 	id, err := s.newCommandID()
 	if err != nil {
 		return err
 	}
-	return s.routeCommand(ctx, command.ApproveToolCall{Header: command.Header{ID: id}, CallID: callID, Scope: scope})
+	// A human approve is a user-origination point (the gate replies): stamp AgencyUser.
+	return s.routeGate(ctx, l, command.ApproveToolCall{Header: command.Header{CommandID: id, Agency: identity.AgencyUser}, GateRoute: route, Scope: scope})
 }
 
-// Deny denies the pending tool call identified by callID, failing it closed
-// (fail-secure). Like Approve it is fire-and-route with no Ack and no scope —
-// nothing is ever persisted on a deny. The select covers ctx.Done() and the
-// loop's Done channel so the unbuffered send can never block forever.
-func (s *Sesssion) Deny(ctx context.Context, callID uuid.UUID) error {
+// Deny denies the pending tool call identified by toolExecutionID, failing it
+// closed (fail-secure). Like Approve it dispatches to loopID (the loop that opened
+// the gate) and is fire-and-route with no Ack and no scope — nothing is ever
+// persisted on a deny. A zero loopID falls back to the primary loop; an unknown
+// non-zero loopID fails secure with SessionLoopNotFound.
+func (s *Session) Deny(ctx context.Context, loopID, toolExecutionID uuid.UUID) error {
+	l, route, err := s.resolveGate(loopID, toolExecutionID)
+	if err != nil {
+		return err
+	}
 	id, err := s.newCommandID()
 	if err != nil {
 		return err
 	}
-	return s.routeCommand(ctx, command.DenyToolCall{Header: command.Header{ID: id}, CallID: callID})
+	// A human deny is a user-origination point (the gate replies): stamp AgencyUser.
+	return s.routeGate(ctx, l, command.DenyToolCall{Header: command.Header{CommandID: id, Agency: identity.AgencyUser}, GateRoute: route})
 }
 
 // ProvideUserInput supplies the user's answer to the pending AskUser request
-// identified by callID. Like the approve/deny pair it is fire-and-route with no
-// Ack: the actor routes it to the parked user-input gate, which delivers answer
-// to the waiting tool. The select covers ctx.Done() and the loop's Done channel
-// so the unbuffered send can never block forever.
-func (s *Sesssion) ProvideUserInput(ctx context.Context, callID uuid.UUID, answer string) error {
+// identified by toolExecutionID. Like the approve/deny pair it dispatches to
+// loopID (the loop that opened the gate) and is fire-and-route with no Ack: the
+// actor routes it to the parked user-input gate, which delivers answer to the
+// waiting tool. A zero loopID falls back to the primary loop; an unknown non-zero
+// loopID fails secure with SessionLoopNotFound.
+func (s *Session) ProvideUserInput(ctx context.Context, loopID, toolExecutionID uuid.UUID, answer string) error {
+	l, route, err := s.resolveGate(loopID, toolExecutionID)
+	if err != nil {
+		return err
+	}
 	id, err := s.newCommandID()
 	if err != nil {
 		return err
 	}
-	return s.routeCommand(ctx, command.ProvideUserInput{Header: command.Header{ID: id}, CallID: callID, Answer: answer})
+	// A human answer is a user-origination point (the gate replies): stamp AgencyUser.
+	return s.routeGate(ctx, l, command.ProvideUserInput{Header: command.Header{CommandID: id, Agency: identity.AgencyUser}, GateRoute: route, Answer: answer})
 }
 
-// routeCommand sends a fire-and-route gate command to the actor. These commands
-// carry no Ack, so routeCommand returns nil as soon as the send completes and
-// never waits for a reply. It selects on ctx.Done() and the loop's Done channel
-// alongside the unbuffered send so the call can never block forever when the
-// actor is busy (ctx times out) or has already exited (Done is closed).
-func (s *Sesssion) routeCommand(ctx context.Context, cmd command.Command) error {
-	l, ok := s.loopFor(s.primaryLoopID)
-	if !ok {
-		return &SessionError{Kind: SessionLoopNotFound}
+// resolveGate selects the target loop for a gate reply and builds the command's
+// GateRoute. A zero loopID is "unspecified at this granularity": it falls back to
+// the primary loop (the single-loop default). A non-zero loopID is looked up in
+// the registry as-is; an unknown one fails secure with SessionLoopNotFound rather
+// than silently falling through to the primary loop — an unroutable approval must
+// never approve a tool call on a loop the caller did not address. The returned
+// GateRoute carries the RESOLVED loop id (the loop actually dispatched to) and the
+// match key (ToolExecutionID), so the route is concrete and self-describing.
+func (s *Session) resolveGate(loopID, toolExecutionID uuid.UUID) (*loop.Loop, command.GateRoute, error) {
+	targetLoopID := loopID
+	if targetLoopID.IsZero() {
+		targetLoopID = s.PrimaryLoopID()
 	}
+	l, ok := s.loopFor(targetLoopID)
+	if !ok {
+		return nil, command.GateRoute{}, &SessionError{Kind: SessionLoopNotFound}
+	}
+	route := command.GateRoute{
+		Coordinates:     identity.Coordinates{SessionID: s.SessionID, LoopID: targetLoopID},
+		ToolExecutionID: toolExecutionID,
+	}
+	return l, route, nil
+}
+
+// routeGate sends a fire-and-route gate command to the resolved target loop. These
+// commands carry no Ack, so routeGate returns nil as soon as the send completes
+// and never waits for a reply. It selects on ctx.Done() and the loop's Done
+// channel alongside the unbuffered send so the call can never block forever when
+// the actor is busy (ctx times out) or has already exited (Done is closed).
+func (s *Session) routeGate(ctx context.Context, l *loop.Loop, cmd command.Command) error {
 	select {
 	case l.Commands <- cmd:
 		return nil

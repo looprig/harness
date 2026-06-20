@@ -362,15 +362,16 @@ func TestApproveCmd(t *testing.T) {
 
 	tests := []struct {
 		name       string
+		loopID     uuid.UUID
 		callID     uuid.UUID
 		scope      tool.ApprovalScope
 		approveErr error
 		wantErr    bool
 	}{
-		{name: "once succeeds", callID: callID(1), scope: tool.ScopeOnce},
-		{name: "session succeeds", callID: callID(2), scope: tool.ScopeSession},
-		{name: "workspace succeeds", callID: callID(3), scope: tool.ScopeWorkspace},
-		{name: "error surfaced", callID: callID(4), scope: tool.ScopeOnce, approveErr: errApprove, wantErr: true},
+		{name: "once succeeds", loopID: callID(10), callID: callID(1), scope: tool.ScopeOnce},
+		{name: "session succeeds", loopID: callID(20), callID: callID(2), scope: tool.ScopeSession},
+		{name: "workspace succeeds", loopID: callID(30), callID: callID(3), scope: tool.ScopeWorkspace},
+		{name: "error surfaced", loopID: callID(40), callID: callID(4), scope: tool.ScopeOnce, approveErr: errApprove, wantErr: true},
 	}
 
 	for _, tt := range tests {
@@ -378,7 +379,7 @@ func TestApproveCmd(t *testing.T) {
 			t.Parallel()
 
 			agent := &fakeAgent{approveErr: tt.approveErr}
-			msg := approveCmd(context.Background(), agent, tt.callID, tt.scope)()
+			msg := approveCmd(context.Background(), agent, tt.loopID, tt.callID, tt.scope)()
 
 			res, ok := msg.(promptResultMsg)
 			if !ok {
@@ -389,6 +390,9 @@ func TestApproveCmd(t *testing.T) {
 			}
 			if tt.wantErr && !errors.Is(res.err, errApprove) {
 				t.Errorf("err = %v, want %v", res.err, errApprove)
+			}
+			if agent.lastLoopID != tt.loopID {
+				t.Errorf("recorded loopID = %v, want %v", agent.lastLoopID, tt.loopID)
 			}
 			if agent.lastCallID != tt.callID {
 				t.Errorf("recorded callID = %v, want %v", agent.lastCallID, tt.callID)
@@ -409,12 +413,13 @@ func TestDenyCmd(t *testing.T) {
 
 	tests := []struct {
 		name    string
+		loopID  uuid.UUID
 		callID  uuid.UUID
 		denyErr error
 		wantErr bool
 	}{
-		{name: "deny succeeds", callID: callID(1)},
-		{name: "error surfaced", callID: callID(2), denyErr: errDeny, wantErr: true},
+		{name: "deny succeeds", loopID: callID(10), callID: callID(1)},
+		{name: "error surfaced", loopID: callID(20), callID: callID(2), denyErr: errDeny, wantErr: true},
 	}
 
 	for _, tt := range tests {
@@ -422,7 +427,7 @@ func TestDenyCmd(t *testing.T) {
 			t.Parallel()
 
 			agent := &fakeAgent{denyErr: tt.denyErr}
-			msg := denyCmd(context.Background(), agent, tt.callID)()
+			msg := denyCmd(context.Background(), agent, tt.loopID, tt.callID)()
 
 			res, ok := msg.(promptResultMsg)
 			if !ok {
@@ -433,6 +438,9 @@ func TestDenyCmd(t *testing.T) {
 			}
 			if tt.wantErr && !errors.Is(res.err, errDeny) {
 				t.Errorf("err = %v, want %v", res.err, errDeny)
+			}
+			if agent.lastLoopID != tt.loopID {
+				t.Errorf("recorded loopID = %v, want %v", agent.lastLoopID, tt.loopID)
 			}
 			if agent.lastCallID != tt.callID {
 				t.Errorf("recorded callID = %v, want %v", agent.lastCallID, tt.callID)
@@ -450,14 +458,15 @@ func TestProvideAnswerCmd(t *testing.T) {
 
 	tests := []struct {
 		name      string
+		loopID    uuid.UUID
 		callID    uuid.UUID
 		answer    string
 		answerErr error
 		wantErr   bool
 	}{
-		{name: "answer succeeds", callID: callID(1), answer: "yes, proceed"},
-		{name: "empty answer forwarded", callID: callID(2), answer: ""},
-		{name: "error surfaced", callID: callID(3), answer: "x", answerErr: errAnswer, wantErr: true},
+		{name: "answer succeeds", loopID: callID(10), callID: callID(1), answer: "yes, proceed"},
+		{name: "empty answer forwarded", loopID: callID(20), callID: callID(2), answer: ""},
+		{name: "error surfaced", loopID: callID(30), callID: callID(3), answer: "x", answerErr: errAnswer, wantErr: true},
 	}
 
 	for _, tt := range tests {
@@ -465,7 +474,7 @@ func TestProvideAnswerCmd(t *testing.T) {
 			t.Parallel()
 
 			agent := &fakeAgent{answerErr: tt.answerErr}
-			msg := provideAnswerCmd(context.Background(), agent, tt.callID, tt.answer)()
+			msg := provideAnswerCmd(context.Background(), agent, tt.loopID, tt.callID, tt.answer)()
 
 			res, ok := msg.(promptResultMsg)
 			if !ok {
@@ -476,6 +485,9 @@ func TestProvideAnswerCmd(t *testing.T) {
 			}
 			if tt.wantErr && !errors.Is(res.err, errAnswer) {
 				t.Errorf("err = %v, want %v", res.err, errAnswer)
+			}
+			if agent.lastLoopID != tt.loopID {
+				t.Errorf("recorded loopID = %v, want %v", agent.lastLoopID, tt.loopID)
 			}
 			if agent.lastCallID != tt.callID {
 				t.Errorf("recorded callID = %v, want %v", agent.lastCallID, tt.callID)
@@ -500,9 +512,9 @@ func TestPromptDispatchBounded(t *testing.T) {
 	// Each goroutine gets its own agent: this test asserts only that the cmds
 	// return promptly, and a shared fake's recorder fields would race.
 	done := make(chan tea.Msg, 3)
-	go func() { done <- approveCmd(ctx, &fakeAgent{}, callID(1), tool.ScopeOnce)() }()
-	go func() { done <- denyCmd(ctx, &fakeAgent{}, callID(2))() }()
-	go func() { done <- provideAnswerCmd(ctx, &fakeAgent{}, callID(3), "a")() }()
+	go func() { done <- approveCmd(ctx, &fakeAgent{}, callID(10), callID(1), tool.ScopeOnce)() }()
+	go func() { done <- denyCmd(ctx, &fakeAgent{}, callID(20), callID(2))() }()
+	go func() { done <- provideAnswerCmd(ctx, &fakeAgent{}, callID(30), callID(3), "a")() }()
 
 	for i := 0; i < 3; i++ {
 		select {

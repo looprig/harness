@@ -146,10 +146,10 @@ func TestStreamReader_Close(t *testing.T) {
 	errClose := errors.New("close failed")
 
 	cases := []struct {
-		name      string
-		closer    func() error
+		name       string
+		closer     func() error
 		wantCalled bool
-		wantErr   error
+		wantErr    error
 	}{
 		{
 			name:       "nil closer returns nil and is a no-op",
@@ -211,11 +211,11 @@ func TestStreamReader_ErrorPropagates(t *testing.T) {
 	sentinel := errors.New("stream error")
 
 	cases := []struct {
-		name        string
-		items       []string
-		errOnCall   int
-		wantItems   []string
-		wantErr     error
+		name      string
+		items     []string
+		errOnCall int
+		wantItems []string
+		wantErr   error
 	}{
 		{
 			name:      "error on first call returns no items",

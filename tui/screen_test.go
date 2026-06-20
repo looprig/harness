@@ -10,6 +10,7 @@ import (
 	tea "charm.land/bubbletea/v2"
 
 	"github.com/inventivepotter/urvi/internal/agent/loop/event"
+	"github.com/inventivepotter/urvi/internal/agent/loop/identity"
 	"github.com/inventivepotter/urvi/internal/agent/session/hub"
 	"github.com/inventivepotter/urvi/internal/content"
 	"github.com/inventivepotter/urvi/internal/llm"
@@ -67,6 +68,7 @@ type fakeAgent struct {
 	approveCalled bool
 	denyCalled    bool
 	answerCalled  bool
+	lastLoopID    uuid.UUID
 	lastCallID    uuid.UUID
 	lastScope     tool.ApprovalScope
 	lastAnswer    string
@@ -120,21 +122,24 @@ func (f *fakeAgent) Subscribe(filter event.EventFilter) (EventStream, error) {
 	return f.subStream, nil
 }
 
-func (f *fakeAgent) Approve(_ context.Context, callID uuid.UUID, scope tool.ApprovalScope) error {
+func (f *fakeAgent) Approve(_ context.Context, loopID, callID uuid.UUID, scope tool.ApprovalScope) error {
 	f.approveCalled = true
+	f.lastLoopID = loopID
 	f.lastCallID = callID
 	f.lastScope = scope
 	return f.approveErr
 }
 
-func (f *fakeAgent) Deny(_ context.Context, callID uuid.UUID) error {
+func (f *fakeAgent) Deny(_ context.Context, loopID, callID uuid.UUID) error {
 	f.denyCalled = true
+	f.lastLoopID = loopID
 	f.lastCallID = callID
 	return f.denyErr
 }
 
-func (f *fakeAgent) ProvideAnswer(_ context.Context, callID uuid.UUID, answer string) error {
+func (f *fakeAgent) ProvideAnswer(_ context.Context, loopID, callID uuid.UUID, answer string) error {
 	f.answerCalled = true
+	f.lastLoopID = loopID
 	f.lastCallID = callID
 	f.lastAnswer = answer
 	return f.answerErr
@@ -191,7 +196,7 @@ func fakeOpen(a Agent) OpenAgent {
 }
 
 // callID returns a deterministic non-zero UUID for a test, distinguishing gates by
-// a single byte so CallID correlation can be asserted.
+// a single byte so ToolExecutionID correlation can be asserted.
 func callID(b byte) uuid.UUID {
 	var u uuid.UUID
 	u[0] = b
@@ -526,7 +531,7 @@ func TestPermissionRequestedEnqueuesAndTracksGate(t *testing.T) {
 	m := runningScreen(t, agent)
 
 	req := tool.BashRequest{Command: "rm -rf /tmp/x"}
-	m, cmd := updateScreen(t, m, eventMsg{ev: event.PermissionRequested{CallID: callID(1), Request: req}})
+	m, cmd := updateScreen(t, m, eventMsg{ev: event.PermissionRequested{ToolExecutionID: callID(1), Request: req}})
 
 	// Interaction: one pending prompt, mode switched to permission.
 	if m.interaction.PendingCount() != 1 {
@@ -535,7 +540,7 @@ func TestPermissionRequestedEnqueuesAndTracksGate(t *testing.T) {
 	if m.interaction.mode != modePermissionPrompt {
 		t.Errorf("interaction mode = %d, want modePermissionPrompt", m.interaction.mode)
 	}
-	// Transcript: the gate commits NOTHING but is remembered (gatePending) by CallID.
+	// Transcript: the gate commits NOTHING but is remembered (gatePending) by ToolExecutionID.
 	if len(m.transcript.committed) != 0 {
 		t.Fatalf("committed = %d entries, want 0 (the gate must not commit)", len(m.transcript.committed))
 	}
@@ -573,7 +578,15 @@ func TestPermissionKeyDispatchesTrio(t *testing.T) {
 
 			agent := &fakeAgent{}
 			m := runningScreen(t, agent)
-			m = feed(t, m, event.PermissionRequested{CallID: callID(7), Request: tool.BashRequest{Command: "ls"}})
+			// The request carries a producing loop id on its Header; the prompt is
+			// stamped with it and the gate reply must be dispatched to THAT loop, so a
+			// subagent loop's gate is never answered by routing to the primary.
+			gateLoop := callID(9)
+			m = feed(t, m, event.PermissionRequested{
+				Header:          event.Header{Coordinates: identity.Coordinates{LoopID: gateLoop}},
+				ToolExecutionID: callID(7),
+				Request:         tool.BashRequest{Command: "ls"},
+			})
 
 			m, cmd := updateScreen(t, m, tt.key)
 			if cmd == nil {
@@ -597,7 +610,10 @@ func TestPermissionKeyDispatchesTrio(t *testing.T) {
 				t.Error("Deny not called")
 			}
 			if agent.lastCallID != callID(7) {
-				t.Errorf("dispatched CallID = %v, want %v", agent.lastCallID, callID(7))
+				t.Errorf("dispatched ToolExecutionID = %v, want %v", agent.lastCallID, callID(7))
+			}
+			if agent.lastLoopID != gateLoop {
+				t.Errorf("dispatched LoopID = %v, want producing loop %v", agent.lastLoopID, gateLoop)
 			}
 		})
 	}
@@ -611,8 +627,14 @@ func TestAnswerKeyDispatchesProvideAnswer(t *testing.T) {
 
 	agent := &fakeAgent{}
 	m := runningScreen(t, agent)
-	// A free-text AskUser (no choices) enters answer mode.
-	m = feed(t, m, event.UserInputRequested{CallID: callID(3), Question: "name?"})
+	// A free-text AskUser (no choices) enters answer mode. The request carries a
+	// producing loop id, which the answer must be dispatched back to.
+	gateLoop := callID(9)
+	m = feed(t, m, event.UserInputRequested{
+		Header:          event.Header{Coordinates: identity.Coordinates{LoopID: gateLoop}},
+		ToolExecutionID: callID(3),
+		Question:        "name?",
+	})
 	if m.interaction.mode != modeAnswerPrompt {
 		t.Fatalf("mode = %d, want modeAnswerPrompt", m.interaction.mode)
 	}
@@ -633,6 +655,9 @@ func TestAnswerKeyDispatchesProvideAnswer(t *testing.T) {
 		t.Errorf("ProvideAnswer call = (called %v, answer %q, id %v), want (true, %q, %v)",
 			agent.answerCalled, agent.lastAnswer, agent.lastCallID, "neo", callID(3))
 	}
+	if agent.lastLoopID != gateLoop {
+		t.Errorf("dispatched LoopID = %v, want producing loop %v", agent.lastLoopID, gateLoop)
+	}
 }
 
 // TestChoiceEscInterrupts covers the Esc precedence in choice mode: Esc interrupts
@@ -643,7 +668,7 @@ func TestChoiceEscInterrupts(t *testing.T) {
 
 	agent := &fakeAgent{}
 	m := runningScreen(t, agent)
-	m = feed(t, m, event.UserInputRequested{CallID: callID(4), Question: "pick", Choices: []string{"a", "b"}})
+	m = feed(t, m, event.UserInputRequested{ToolExecutionID: callID(4), Question: "pick", Choices: []string{"a", "b"}})
 	if m.interaction.mode != modeChoicePrompt {
 		t.Fatalf("mode = %d, want modeChoicePrompt", m.interaction.mode)
 	}
@@ -678,7 +703,7 @@ func TestTerminalEventClearsPromptQueue(t *testing.T) {
 
 			agent := &fakeAgent{}
 			m := runningScreen(t, agent)
-			m = feed(t, m, event.PermissionRequested{CallID: callID(1), Request: tool.BashRequest{Command: "x"}})
+			m = feed(t, m, event.PermissionRequested{ToolExecutionID: callID(1), Request: tool.BashRequest{Command: "x"}})
 			if m.interaction.PendingCount() != 1 {
 				t.Fatalf("setup: PendingCount = %d, want 1", m.interaction.PendingCount())
 			}
@@ -928,7 +953,7 @@ func TestCtrlCQuits(t *testing.T) {
 			agent := &fakeAgent{}
 			m := runningScreen(t, agent)
 			if tt.withPrompt {
-				m = feed(t, m, event.PermissionRequested{CallID: callID(1), Request: tool.BashRequest{Command: "x"}})
+				m = feed(t, m, event.PermissionRequested{ToolExecutionID: callID(1), Request: tool.BashRequest{Command: "x"}})
 			}
 			_, cmd := updateScreen(t, m, tea.KeyPressMsg{Code: 'c', Mod: tea.ModCtrl})
 			if cmd == nil {
@@ -967,7 +992,7 @@ func TestCtrlTTogglesExpandGlobally(t *testing.T) {
 				m.sub = newFakeSubscription()
 			}
 			if tt.withPrompt {
-				m = feed(t, m, event.PermissionRequested{CallID: callID(1), Request: tool.BashRequest{Command: "x"}})
+				m = feed(t, m, event.PermissionRequested{ToolExecutionID: callID(1), Request: tool.BashRequest{Command: "x"}})
 			}
 			wantPending := m.interaction.PendingCount()
 
@@ -1232,10 +1257,10 @@ func TestPrimaryTurnEventsDriveStatus(t *testing.T) {
 		startStatus Status
 		wantStatus  Status
 	}{
-		{name: "TurnStarted goes running", ev: event.TurnStarted{Header: event.Header{LoopID: primary}}, startStatus: StatusIdle, wantStatus: StatusRunning},
-		{name: "TurnDone goes idle", ev: event.TurnDone{Header: event.Header{LoopID: primary}}, startStatus: StatusRunning, wantStatus: StatusIdle},
-		{name: "TurnFailed goes idle", ev: event.TurnFailed{Header: event.Header{LoopID: primary}, Err: errors.New("x")}, startStatus: StatusRunning, wantStatus: StatusIdle},
-		{name: "TurnInterrupted from interrupting goes idle", ev: event.TurnInterrupted{Header: event.Header{LoopID: primary}}, startStatus: StatusInterrupting, wantStatus: StatusIdle},
+		{name: "TurnStarted goes running", ev: event.TurnStarted{Header: event.Header{Coordinates: identity.Coordinates{LoopID: primary}}}, startStatus: StatusIdle, wantStatus: StatusRunning},
+		{name: "TurnDone goes idle", ev: event.TurnDone{Header: event.Header{Coordinates: identity.Coordinates{LoopID: primary}}}, startStatus: StatusRunning, wantStatus: StatusIdle},
+		{name: "TurnFailed goes idle", ev: event.TurnFailed{Header: event.Header{Coordinates: identity.Coordinates{LoopID: primary}}, Err: errors.New("x")}, startStatus: StatusRunning, wantStatus: StatusIdle},
+		{name: "TurnInterrupted from interrupting goes idle", ev: event.TurnInterrupted{Header: event.Header{Coordinates: identity.Coordinates{LoopID: primary}}}, startStatus: StatusInterrupting, wantStatus: StatusIdle},
 	}
 
 	for _, tt := range tests {
@@ -1268,9 +1293,9 @@ func TestSubagentTurnEventsDoNotFlipStatus(t *testing.T) {
 		name string
 		ev   event.Event
 	}{
-		{name: "subagent TurnStarted", ev: event.TurnStarted{Header: event.Header{LoopID: subagent}}},
-		{name: "subagent TurnDone", ev: event.TurnDone{Header: event.Header{LoopID: subagent}}},
-		{name: "subagent TurnInterrupted", ev: event.TurnInterrupted{Header: event.Header{LoopID: subagent}}},
+		{name: "subagent TurnStarted", ev: event.TurnStarted{Header: event.Header{Coordinates: identity.Coordinates{LoopID: subagent}}}},
+		{name: "subagent TurnDone", ev: event.TurnDone{Header: event.Header{Coordinates: identity.Coordinates{LoopID: subagent}}}},
+		{name: "subagent TurnInterrupted", ev: event.TurnInterrupted{Header: event.Header{Coordinates: identity.Coordinates{LoopID: subagent}}}},
 	}
 
 	for _, tt := range tests {
@@ -1321,9 +1346,9 @@ func TestSubscribesOncePerSession(t *testing.T) {
 	// StepDone -> TurnDone for the primary loop. The continuous reader re-arms via
 	// subNext on every event; none of this may re-subscribe.
 	for turn := 0; turn < 4; turn++ {
-		m = feed(t, m, event.TurnStarted{Header: event.Header{LoopID: primary}})
-		m = feed(t, m, event.StepDone{Header: event.Header{LoopID: primary}})
-		m = feed(t, m, event.TurnDone{Header: event.Header{LoopID: primary}})
+		m = feed(t, m, event.TurnStarted{Header: event.Header{Coordinates: identity.Coordinates{LoopID: primary}}})
+		m = feed(t, m, event.StepDone{Header: event.Header{Coordinates: identity.Coordinates{LoopID: primary}}})
+		m = feed(t, m, event.TurnDone{Header: event.Header{Coordinates: identity.Coordinates{LoopID: primary}}})
 	}
 
 	if agent.subscribeCount != 1 {
@@ -1563,9 +1588,9 @@ func TestSubmitUserRowFromEventNotSubmit(t *testing.T) {
 	}
 
 	// The loop's TurnStarted carries the authoritative user message (genuine input:
-	// TriggeredByLoopID == 0 AND Header.LoopID == the agent's primary loop id, which
+	// Cause.LoopID == 0 AND Header.LoopID == the agent's primary loop id, which
 	// New threaded into the transcript).
-	m = feed(t, m, event.TurnStarted{Header: event.Header{LoopID: primary}, InputID: fixedFakeSubmitID, Message: userMsg("from the event")})
+	m = feed(t, m, event.TurnStarted{Header: event.Header{Coordinates: identity.Coordinates{LoopID: primary}, Cause: identity.Cause{CommandID: fixedFakeSubmitID}}, Message: userMsg("from the event")})
 
 	rec := lastCommitted(t, m)
 	if rec.Kind != kindUser || committedText(rec) != "from the event" {
@@ -1580,8 +1605,8 @@ func TestSubmitUserRowFromEventNotSubmit(t *testing.T) {
 }
 
 // TestSubagentHandbackCommitsNoUserRow is the Screen-level proof that a SubagentResult
-// hand-back (TurnStarted/TurnFoldedInto with a non-zero TriggeredByLoopID) commits NO
-// user row — only genuine user input (TriggeredByLoopID == 0) gets a row.
+// hand-back (TurnStarted/TurnFoldedInto with a non-zero Cause.LoopID) commits NO
+// user row — only genuine user input (Cause.LoopID == 0) gets a row.
 func TestSubagentHandbackCommitsNoUserRow(t *testing.T) {
 	t.Parallel()
 
@@ -1591,8 +1616,8 @@ func TestSubagentHandbackCommitsNoUserRow(t *testing.T) {
 		name string
 		ev   event.Event
 	}{
-		{name: "TurnStarted hand-back", ev: event.TurnStarted{Header: event.Header{TriggeredByLoopID: subagent}, InputID: callID(1), Message: userMsg("handback")}},
-		{name: "TurnFoldedInto hand-back", ev: event.TurnFoldedInto{Header: event.Header{TriggeredByLoopID: subagent}, InputID: callID(1), Message: userMsg("handback")}},
+		{name: "TurnStarted hand-back", ev: event.TurnStarted{Header: event.Header{Cause: identity.Cause{CommandID: callID(1), Coordinates: identity.Coordinates{LoopID: subagent}}}, Message: userMsg("handback")}},
+		{name: "TurnFoldedInto hand-back", ev: event.TurnFoldedInto{Header: event.Header{Cause: identity.Cause{CommandID: callID(1), Coordinates: identity.Coordinates{LoopID: subagent}}}, Message: userMsg("handback")}},
 	}
 
 	for _, tt := range tests {
@@ -1610,12 +1635,12 @@ func TestSubagentHandbackCommitsNoUserRow(t *testing.T) {
 
 // TestSubagentOwnTurnCommitsNoUserRow is the Screen-level proof of the loop-scoping
 // fix: a SUBAGENT loop's OWN initial task arrives as an untriggered TurnStarted /
-// TurnFoldedInto (TriggeredByLoopID == 0) carrying a Message, but with
+// TurnFoldedInto (Cause.LoopID == 0) carrying a Message, but with
 // Header.LoopID == the subagent loop (NOT the primary). The DefaultEventFilter
 // delivers it (Enduring from every loop), so it reaches ApplyEvent — but it must NOT
 // commit a human user row (it surfaces only via the collapsed StepDone, §5/§6). New
 // threaded the agent's primary loop id into the transcript, so a non-matching LoopID
-// is rejected even though TriggeredByLoopID is zero.
+// is rejected even though Cause.LoopID is zero.
 func TestSubagentOwnTurnCommitsNoUserRow(t *testing.T) {
 	t.Parallel()
 
@@ -1626,8 +1651,8 @@ func TestSubagentOwnTurnCommitsNoUserRow(t *testing.T) {
 		name string
 		ev   event.Event
 	}{
-		{name: "subagent TurnStarted (own initial task)", ev: event.TurnStarted{Header: event.Header{LoopID: subLoop}, InputID: callID(1), Message: userMsg("subagent task")}},
-		{name: "subagent TurnFoldedInto", ev: event.TurnFoldedInto{Header: event.Header{LoopID: subLoop}, InputID: callID(1), Message: userMsg("subagent fold")}},
+		{name: "subagent TurnStarted (own initial task)", ev: event.TurnStarted{Header: event.Header{Coordinates: identity.Coordinates{LoopID: subLoop}, Cause: identity.Cause{CommandID: callID(1)}}, Message: userMsg("subagent task")}},
+		{name: "subagent TurnFoldedInto", ev: event.TurnFoldedInto{Header: event.Header{Coordinates: identity.Coordinates{LoopID: subLoop}, Cause: identity.Cause{CommandID: callID(1)}}, Message: userMsg("subagent fold")}},
 	}
 
 	for _, tt := range tests {
@@ -1662,14 +1687,14 @@ func TestSubmitQueuedAffordancePromotes(t *testing.T) {
 	}
 
 	// InputQueued reveals the affordance below the live tail (above the composer panel).
-	m = feed(t, m, event.InputQueued{InputID: id})
+	m = feed(t, m, event.InputQueued{Header: event.Header{Cause: identity.Cause{CommandID: id}}})
 	view := stripANSI(m.View().Content)
 	if !strings.Contains(view, "pending msg") {
 		t.Fatalf("queued affordance missing from View after InputQueued; got %q", view)
 	}
 
 	// TurnStarted promotes to a committed row and clears the affordance.
-	m = feed(t, m, event.TurnStarted{InputID: id, Message: userMsg("pending msg")})
+	m = feed(t, m, event.TurnStarted{Header: event.Header{Cause: identity.Cause{CommandID: id}}, Message: userMsg("pending msg")})
 	if got := userRowCount(m); got != 1 {
 		t.Errorf("kindUser rows = %d, want 1 (promoted once)", got)
 	}
@@ -1690,9 +1715,9 @@ func TestTurnRejectedSurfacesNotice(t *testing.T) {
 
 	id := callID(0x66)
 	m, _ = updateScreen(t, m, submitResultMsg{inputID: id, blocks: userBlocks("rejected msg")})
-	m = feed(t, m, event.InputQueued{InputID: id})
+	m = feed(t, m, event.InputQueued{Header: event.Header{Cause: identity.Cause{CommandID: id}}})
 
-	m = feed(t, m, event.TurnRejected{InputID: id, Reason: event.RejectQueueFull})
+	m = feed(t, m, event.TurnRejected{Header: event.Header{Cause: identity.Cause{CommandID: id}}, Reason: event.RejectQueueFull})
 
 	rec := lastCommitted(t, m)
 	if rec.Kind != kindNotice || rec.Level != noticeError {

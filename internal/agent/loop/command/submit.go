@@ -2,8 +2,8 @@ package command
 
 import (
 	"github.com/inventivepotter/urvi/internal/agent/loop/event"
+	"github.com/inventivepotter/urvi/internal/agent/loop/identity"
 	"github.com/inventivepotter/urvi/internal/content"
-	"github.com/inventivepotter/urvi/internal/uuid"
 )
 
 // InputMode lets the caller say whether queueing behind a running turn is
@@ -30,7 +30,7 @@ const (
 //
 // The loop announces the outcome by PUBLISHING a typed Reply event onto the normal
 // session fan-in (event.TurnStarted / event.InputQueued / event.TurnRejected, each
-// carrying CausationID == this command's id), NOT a point-to-point reply.
+// carrying Cause.CommandID == this command's id), NOT a point-to-point reply.
 //
 // Events/Abandoned are the OPTIONAL per-turn stream: StartOnly callers
 // (Invoke/Stream) set them to observe the outcome (and, on success, the turn's
@@ -39,25 +39,39 @@ const (
 // the session event fan-in.
 type UserInput struct {
 	Header
-	Blocks    []content.Block
-	Mode      InputMode
-	Events    chan<- event.Event
-	Abandoned <-chan struct{}
+	Blocks []content.Block `json:"blocks,omitempty"`
+	Mode   InputMode       `json:"mode,omitzero"`
+	// Events/Abandoned are live channels for the optional per-turn stream; channels
+	// have no JSON representation, so they are tagged json:"-" (journal-prep is for
+	// the durable command shape, not the in-memory stream wiring).
+	Events    chan<- event.Event `json:"-"`
+	Abandoned <-chan struct{}    `json:"-"`
 }
 
 // SubagentResult delivers a finished subagent's output to its parent loop (the
 // hand-back). It shares UserInput's submit semantics but is always AllowFold and
 // carries no per-turn stream — the parent loop's events go to the session fan-in.
-// FromLoopID is the producing subagent loop: the loop stamps it as
-// TriggeredByLoopID on any start/queue/fold/return event the submit causes, which
-// releases the parent's quiescence wake token on the publish path. A SubagentResult
-// is NEVER rejected, so its wake token is ALWAYS released by a published Enduring
-// event (TurnStarted/TurnFoldedInto, or InputCancelled if the loop ends before it
-// commits) — there is no off-publish-path reconciliation anymore.
+//
+// It carries TWO loop ids with distinct jobs:
+//
+//   - The embedded identity.Coordinates addresses the PARENT loop — the delivery
+//     target. The session dispatches the command to loops[Coordinates.LoopID].
+//   - Header.Cause.LoopID is the CHILD loop that produced the result. When the
+//     parent folds the result into a turn, the loop stamps this Cause.LoopID onto
+//     any start/queue/fold/return event the submit causes, which releases the
+//     parent's quiescence wake token on the publish path.
+//
+// Header.Agency stays AgencyMachine (the zero default): a hand-back is
+// machine-originated, never user.
+//
+// A SubagentResult is NEVER rejected, so its wake token is ALWAYS released by a
+// published Enduring event (TurnStarted/TurnFoldedInto, or InputCancelled if the
+// loop ends before it commits) — there is no off-publish-path reconciliation
+// anymore.
 type SubagentResult struct {
-	Header
-	FromLoopID uuid.UUID
-	Blocks     []content.Block
+	Header                               // command.Header; Cause.LoopID = CHILD loop; Agency = AgencyMachine
+	identity.Coordinates                 // addresses the PARENT loop (delivery target)
+	Blocks               []content.Block `json:"blocks,omitempty"`
 }
 
 func (UserInput) isCommand()      {}

@@ -164,7 +164,7 @@ func TestContractChoiceAnswerMemberUnderKeySequences(t *testing.T) {
 			// there a printable key is composer text, never a choice answer. Re-enter
 			// a fresh choice prompt so the remaining keys keep exercising choice mode.
 			if m.mode == modeCompose {
-				m = m.ApplyEvent(event.UserInputRequested{CallID: callID(99), Question: "again", Choices: choices})
+				m = m.ApplyEvent(event.UserInputRequested{ToolExecutionID: callID(99), Question: "again", Choices: choices})
 			}
 		}
 	})

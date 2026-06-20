@@ -8,6 +8,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/inventivepotter/urvi/internal/agent/loop/command"
 	"github.com/inventivepotter/urvi/internal/agent/loop/event"
 	"github.com/inventivepotter/urvi/internal/content"
 	"github.com/inventivepotter/urvi/internal/llm"
@@ -253,6 +254,28 @@ func (e *echoTool) runCount() int {
 	return e.runs
 }
 
+// askUserTool is a registered fake tool that calls RequestUserInput inside its run
+// (the way the real AskUser tool does), so a runTurn-level test exercises the
+// UserInputRequested gate end-to-end. The runner injects emit/callID/gateReg into
+// the tool's ctx, so RequestUserInput finds everything it needs there.
+type askUserTool struct {
+	name     string
+	question string
+	choices  []string
+}
+
+func (a *askUserTool) Info(ctx context.Context) (*tool.ToolInfo, error) {
+	return &tool.ToolInfo{Name: a.name, Desc: "asks", Schema: json.RawMessage(`{"type":"object"}`)}, nil
+}
+
+func (a *askUserTool) InvokableRun(ctx context.Context, argsJSON string) (*tool.ToolResult, error) {
+	ans, err := RequestUserInput(ctx, a.question, a.choices)
+	if err != nil {
+		return nil, err
+	}
+	return tool.TextResult(ans), nil
+}
+
 // countToolUseInHistory counts tool_use blocks (in AIMessages) and ToolResultMessages.
 // A well-formed committed history has equal counts; a discarded in-flight step
 // leaves no unpaired tool_use.
@@ -449,6 +472,169 @@ func TestRunTurnAgentic(t *testing.T) {
 		}
 		if len(reqs[1].Messages) != 3 {
 			t.Errorf("continuation request had %d messages, want 3 (user, assistant tool_use, tool)", len(reqs[1].Messages))
+		}
+	})
+
+	t.Run("tool-step ToolCallStarted/Completed carry the step's StepID (== that step's StepDone)", func(t *testing.T) {
+		t.Parallel()
+		echo := &echoTool{name: "Echo", output: "tool ran"}
+		ts := agenticToolSet([]tool.InvokableTool{echo}, 25, 100)
+		client := &scriptedLLM{scripts: [][]content.Chunk{
+			{toolUseChunk(0, "id-1", "Echo", `{"x":1}`)}, // iter1: one tool call → step 0
+			{textChunk("all done")},                      // iter2: text-only → TurnDone (step 1)
+		}}
+		cfg, st, rec := newTurnFixture(input, nil, ts, client, noGateReg())
+		if _, ok := runTurn(context.Background(), cfg, st).(event.TurnDone); !ok {
+			t.Fatalf("terminal not TurnDone")
+		}
+
+		// Step 0 is the tool step; its StepDone carries the step's StepID. The
+		// ToolCallStarted/Completed for that step's batch must carry the SAME StepID
+		// (non-zero), satisfying the ToolExecutionID-requires-StepID invariant.
+		sds := stepDones(rec.events())
+		if len(sds) != 2 {
+			t.Fatalf("StepDone count = %d, want 2", len(sds))
+		}
+		toolStepID := sds[0].StepID
+		if toolStepID.IsZero() {
+			t.Fatal("tool step's StepDone StepID is zero")
+		}
+
+		var started, completed int
+		for _, ev := range rec.events() {
+			switch e := ev.(type) {
+			case event.ToolCallStarted:
+				started++
+				if e.StepID != toolStepID {
+					t.Errorf("ToolCallStarted StepID = %v, want %v (the tool step's StepID)", e.StepID, toolStepID)
+				}
+				if e.StepID.IsZero() {
+					t.Error("ToolCallStarted StepID is zero")
+				}
+			case event.ToolCallCompleted:
+				completed++
+				if e.StepID != toolStepID {
+					t.Errorf("ToolCallCompleted StepID = %v, want %v (the tool step's StepID)", e.StepID, toolStepID)
+				}
+			}
+		}
+		if started != 1 || completed != 1 {
+			t.Errorf("events: %d started / %d completed, want 1/1", started, completed)
+		}
+	})
+
+	t.Run("gate PermissionRequested carries the tool step's StepID", func(t *testing.T) {
+		t.Parallel()
+		tl := &fakeRunTool{name: "T", output: "ok"}
+		pt := promptTool{fakeRunTool: tl}
+		tl.promptFn = func(string) (tool.PermissionRequest, error) {
+			return tool.UnknownRequest{Tool: "T", Summary: "do"}, nil
+		}
+		gate := &fakePermissionGate{checkFn: func(string, string) Effect { return EffectAsk }}
+		ts := resolveToolSetCaps(ToolSet{
+			Permission:           gate,
+			Registry:             []tool.InvokableTool{pt},
+			MaxToolIterations:    25,
+			MaxToolCallsPerTurn:  100,
+			MaxParallelToolCalls: 4,
+		})
+		client := &scriptedLLM{scripts: [][]content.Chunk{
+			{toolUseChunk(0, "id-1", "T", `{}`)}, // iter1: one gated tool call → step 0
+			{textChunk("done")},                  // iter2: text-only → TurnDone
+		}}
+
+		gateReg := make(chan gateRegistration)
+		// Fake actor: install the gate (close ack), then approve the call.
+		go func() {
+			reg := <-gateReg
+			close(reg.ack)
+			reg.reply <- command.ApproveToolCall{GateRoute: command.GateRoute{ToolExecutionID: reg.callID}, Scope: tool.ScopeOnce}
+		}()
+
+		cfg, st, rec := newTurnFixture(input, nil, ts, client, gateReg)
+		if _, ok := runTurn(context.Background(), cfg, st).(event.TurnDone); !ok {
+			t.Fatalf("terminal not TurnDone")
+		}
+
+		sds := stepDones(rec.events())
+		if len(sds) != 2 {
+			t.Fatalf("StepDone count = %d, want 2", len(sds))
+		}
+		toolStepID := sds[0].StepID
+		if toolStepID.IsZero() {
+			t.Fatal("tool step's StepDone StepID is zero")
+		}
+
+		var nPerm int
+		for _, ev := range rec.events() {
+			if pr, ok := ev.(event.PermissionRequested); ok {
+				nPerm++
+				if pr.StepID != toolStepID {
+					t.Errorf("PermissionRequested StepID = %v, want %v (the tool step's StepID)", pr.StepID, toolStepID)
+				}
+			}
+		}
+		if nPerm != 1 {
+			t.Errorf("PermissionRequested count = %d, want 1", nPerm)
+		}
+	})
+
+	t.Run("gate UserInputRequested carries the tool step's StepID", func(t *testing.T) {
+		t.Parallel()
+		// askTool calls RequestUserInput inside its run; the runner injects emit +
+		// callID + gateReg into the tool's ctx, so this exercises the real AskUser path
+		// end-to-end (the same path RequestUserInput tests cover at the unit level).
+		ask := &askUserTool{name: "Ask", question: "favorite color?", choices: []string{"red", "blue"}}
+		ts := resolveToolSetCaps(ToolSet{
+			Permission:           autoApproveGate{},
+			Registry:             []tool.InvokableTool{ask},
+			MaxToolIterations:    25,
+			MaxToolCallsPerTurn:  100,
+			MaxParallelToolCalls: 4,
+		})
+		client := &scriptedLLM{scripts: [][]content.Chunk{
+			{toolUseChunk(0, "id-1", "Ask", `{}`)}, // iter1: one user-input tool call → step 0
+			{textChunk("done")},                    // iter2: text-only → TurnDone
+		}}
+
+		gateReg := make(chan gateRegistration)
+		// Fake actor: install the user-input gate (close ack), then provide the answer.
+		go func() {
+			reg := <-gateReg
+			close(reg.ack)
+			reg.reply <- command.ProvideUserInput{GateRoute: command.GateRoute{ToolExecutionID: reg.callID}, Answer: "blue"}
+		}()
+
+		cfg, st, rec := newTurnFixture(input, nil, ts, client, gateReg)
+		if _, ok := runTurn(context.Background(), cfg, st).(event.TurnDone); !ok {
+			t.Fatalf("terminal not TurnDone")
+		}
+
+		sds := stepDones(rec.events())
+		if len(sds) != 2 {
+			t.Fatalf("StepDone count = %d, want 2", len(sds))
+		}
+		toolStepID := sds[0].StepID
+		if toolStepID.IsZero() {
+			t.Fatal("tool step's StepDone StepID is zero")
+		}
+
+		var nReq int
+		for _, ev := range rec.events() {
+			uir, ok := ev.(event.UserInputRequested)
+			if !ok {
+				continue
+			}
+			nReq++
+			if uir.StepID != toolStepID {
+				t.Errorf("UserInputRequested StepID = %v, want %v (the tool step's StepID)", uir.StepID, toolStepID)
+			}
+			if uir.StepID.IsZero() {
+				t.Error("UserInputRequested StepID is zero")
+			}
+		}
+		if nReq != 1 {
+			t.Errorf("UserInputRequested count = %d, want 1", nReq)
 		}
 	})
 

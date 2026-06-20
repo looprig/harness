@@ -20,11 +20,11 @@ const (
 	uiSubmit
 	// uiRunSlash carries a known slash command name in Slash for Screen to dispatch.
 	uiRunSlash
-	// uiApprove resolves a permission gate (CallID) at Scope. (Produced in Task 8.)
+	// uiApprove resolves a permission gate (ToolExecutionID) at Scope. (Produced in Task 8.)
 	uiApprove
-	// uiDeny resolves a permission gate (CallID) fail-secure. (Produced in Task 8.)
+	// uiDeny resolves a permission gate (ToolExecutionID) fail-secure. (Produced in Task 8.)
 	uiDeny
-	// uiAnswer supplies the AskUser reply Text for the gate CallID. (Task 8.)
+	// uiAnswer supplies the AskUser reply Text for the gate ToolExecutionID. (Task 8.)
 	uiAnswer
 	// uiInterrupt requests a turn interrupt. (Produced in Task 8.)
 	uiInterrupt
@@ -36,9 +36,14 @@ const (
 // tasks PRODUCE approve/deny/answer/interrupt without changing this contract;
 // this task only ever produces uiSubmit / uiRunSlash / uiNoop.
 type uiAction struct {
-	Kind   uiActionKind
-	Text   string             // uiSubmit / uiAnswer payload
-	CallID uuid.UUID          // uiApprove / uiDeny / uiAnswer target gate
-	Scope  tool.ApprovalScope // uiApprove persistence breadth
-	Slash  string             // uiRunSlash command name (e.g. "/help")
+	Kind uiActionKind
+	Text string // uiSubmit / uiAnswer payload
+	// LoopID is the gate-opening loop's id, carried for uiApprove/uiDeny/uiAnswer so
+	// Screen dispatches the gate reply to the loop that produced the prompt (stamped
+	// on the pending prompt from its request event's Header.LoopID), not
+	// unconditionally to the primary loop. Zero for non-gate actions.
+	LoopID          uuid.UUID
+	ToolExecutionID uuid.UUID          // uiApprove / uiDeny / uiAnswer target gate
+	Scope           tool.ApprovalScope // uiApprove persistence breadth
+	Slash           string             // uiRunSlash command name (e.g. "/help")
 }

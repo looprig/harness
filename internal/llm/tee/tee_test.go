@@ -21,10 +21,10 @@ func TestExtractNRASToken(t *testing.T) {
 	}
 
 	cases := []struct {
-		name     string
-		body     []byte
-		want     string
-		wantErr  bool
+		name      string
+		body      []byte
+		want      string
+		wantErr   bool
 		errReason Reason
 	}{
 		{
@@ -38,45 +38,45 @@ func TestExtractNRASToken(t *testing.T) {
 			want: "eyJhbGciOiJFUzM4NCJ9.eyJzdWIiOiJ0ZXN0In0.c2lnbmF0dXJl",
 		},
 		{
-			name:     "empty body",
-			body:     []byte{},
-			wantErr:  true,
+			name:      "empty body",
+			body:      []byte{},
+			wantErr:   true,
 			errReason: ReasonNvidiaVerdictInvalid,
 		},
 		{
-			name:     "whitespace only",
-			body:     []byte("   \n\t"),
-			wantErr:  true,
+			name:      "whitespace only",
+			body:      []byte("   \n\t"),
+			wantErr:   true,
 			errReason: ReasonNvidiaVerdictInvalid,
 		},
 		{
-			name:     "invalid bare string not valid JSON",
-			body:     []byte(`not-a-json-string`),
-			wantErr:  true,
+			name:      "invalid bare string not valid JSON",
+			body:      []byte(`not-a-json-string`),
+			wantErr:   true,
 			errReason: ReasonNvidiaVerdictInvalid,
 		},
 		{
-			name:     "unexpected leading byte (object)",
-			body:     []byte(`{"token":"x"}`),
-			wantErr:  true,
+			name:      "unexpected leading byte (object)",
+			body:      []byte(`{"token":"x"}`),
+			wantErr:   true,
 			errReason: ReasonNvidiaVerdictInvalid,
 		},
 		{
-			name:     "empty EAT array",
-			body:     []byte(`[]`),
-			wantErr:  true,
+			name:      "empty EAT array",
+			body:      []byte(`[]`),
+			wantErr:   true,
 			errReason: ReasonNvidiaVerdictInvalid,
 		},
 		{
-			name:     "EAT array overall token has no JWT element",
-			body:     []byte(`[["JWT"]]`),
-			wantErr:  true,
+			name:      "EAT array overall token has no JWT element",
+			body:      []byte(`[["JWT"]]`),
+			wantErr:   true,
 			errReason: ReasonNvidiaVerdictInvalid,
 		},
 		{
-			name:     "outer EAT array is not valid JSON",
-			body:     []byte(`[not json`),
-			wantErr:  true,
+			name:      "outer EAT array is not valid JSON",
+			body:      []byte(`[not json`),
+			wantErr:   true,
 			errReason: ReasonNvidiaVerdictInvalid,
 		},
 	}

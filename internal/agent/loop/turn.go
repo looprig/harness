@@ -6,6 +6,7 @@ import (
 	"log/slog"
 
 	"github.com/inventivepotter/urvi/internal/agent/loop/event"
+	"github.com/inventivepotter/urvi/internal/agent/loop/identity"
 	"github.com/inventivepotter/urvi/internal/content"
 	"github.com/inventivepotter/urvi/internal/llm"
 	"github.com/inventivepotter/urvi/internal/tool"
@@ -224,7 +225,13 @@ func runTurn(ctx context.Context, cfg turnConfig, ts turnState) event.Event {
 			}
 		}
 
-		results := RunBatch(ctx, toolUses, cfg.tools, cfg.gateReg, cfg.idGen, cfg.emit)
+		// Wrap the per-turn emit so every tool/gate event RunBatch (and the gates it
+		// opens) emits carries this step's StepID. stampStepID touches ONLY the four
+		// tool/gate events; stampLoopHeader later fills the remaining zero header fields
+		// without disturbing the StepID set here. This is the seam where the active
+		// step's id is known (st.id), keeping the runner ignorant of step identity.
+		stepEmit := stepStampingEmit(cfg.emit, st.id)
+		results := RunBatch(ctx, toolUses, cfg.tools, cfg.gateReg, cfg.idGen, stepEmit)
 		if ctx.Err() != nil {
 			// A cancelled batch's results are discarded; the step never completes, so
 			// it is not appended/committed and emits no StepDone.
@@ -288,14 +295,18 @@ func foldPending(ctx context.Context, cfg turnConfig, ts *turnState) error {
 			Messages: content.AgenticMessages{qi.msg},
 			Event: event.TurnFoldedInto{
 				Header: event.Header{
-					SessionID:         ts.sessionID,
-					LoopID:            ts.loopID,
-					TurnID:            ts.id,
-					CausationID:       qi.inputID,
-					TriggeredByLoopID: qi.triggeredBy,
+					Coordinates: identity.Coordinates{
+						SessionID: ts.sessionID,
+						LoopID:    ts.loopID,
+						TurnID:    ts.id,
+					},
+					Cause: identity.Cause{
+						CommandID:   qi.inputID,
+						Coordinates: identity.Coordinates{LoopID: qi.triggeredBy},
+						Agency:      qi.agency,
+					},
 				},
 				TurnIndex: ts.index,
-				InputID:   qi.inputID,
 				Message:   qi.msg,
 			},
 		}
@@ -342,10 +353,12 @@ func stepDoneEvent(st stepState) event.StepDone {
 	group := cloneMessages(st.msgs)
 	return event.StepDone{
 		Header: event.Header{
-			SessionID: st.sessionID,
-			LoopID:    st.loopID,
-			TurnID:    st.turnID,
-			StepID:    st.id,
+			Coordinates: identity.Coordinates{
+				SessionID: st.sessionID,
+				LoopID:    st.loopID,
+				TurnID:    st.turnID,
+				StepID:    st.id,
+			},
 		},
 		Messages: group,
 	}

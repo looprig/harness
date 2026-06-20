@@ -6,6 +6,7 @@ import (
 	tea "charm.land/bubbletea/v2"
 
 	"github.com/inventivepotter/urvi/internal/agent/loop/event"
+	"github.com/inventivepotter/urvi/internal/agent/loop/identity"
 	"github.com/inventivepotter/urvi/internal/tool"
 )
 
@@ -105,8 +106,8 @@ func TestInteractionEnqueuePermission(t *testing.T) {
 	m := newInteractionModel()
 	id := callID(1)
 	m = m.ApplyEvent(event.PermissionRequested{
-		CallID:  id,
-		Request: tool.BashRequest{Command: "go build"},
+		ToolExecutionID: id,
+		Request:         tool.BashRequest{Command: "go build"},
 	})
 
 	if m.PendingCount() != 1 {
@@ -119,8 +120,8 @@ func TestInteractionEnqueuePermission(t *testing.T) {
 	if p == nil {
 		t.Fatal("ActivePrompt = nil, want the head permission prompt")
 	}
-	if p.CallID != id {
-		t.Errorf("active CallID = %v, want %v", p.CallID, id)
+	if p.ToolExecutionID != id {
+		t.Errorf("active ToolExecutionID = %v, want %v", p.ToolExecutionID, id)
 	}
 	if p.Kind != promptPermission || p.ToolName != "Bash" || p.Description != "go build" {
 		t.Errorf("active prompt = %+v, want Bash/go build permission", *p)
@@ -164,9 +165,9 @@ func TestInteractionEnqueueUserInput(t *testing.T) {
 			m := newInteractionModel()
 			id := callID(2)
 			m = m.ApplyEvent(event.UserInputRequested{
-				CallID:   id,
-				Question: "proceed?",
-				Choices:  tt.choices,
+				ToolExecutionID: id,
+				Question:        "proceed?",
+				Choices:         tt.choices,
 			})
 
 			if m.PendingCount() != 1 {
@@ -191,7 +192,7 @@ func TestInteractionEnqueueUserInput(t *testing.T) {
 
 // TestInteractionEnqueueFIFOAndAppendOnce covers the queue mechanics: two
 // distinct CallIDs leave two pending with the head (index 0) active first; a
-// duplicate CallID (already pending) is ignored (append-once).
+// duplicate ToolExecutionID (already pending) is ignored (append-once).
 func TestInteractionEnqueueFIFOAndAppendOnce(t *testing.T) {
 	t.Parallel()
 
@@ -199,18 +200,18 @@ func TestInteractionEnqueueFIFOAndAppendOnce(t *testing.T) {
 	first := callID(10)
 	second := callID(20)
 
-	m = m.ApplyEvent(event.UserInputRequested{CallID: first, Question: "Q1", Choices: []string{"x"}})
-	m = m.ApplyEvent(event.UserInputRequested{CallID: second, Question: "Q2", Choices: []string{"y"}})
+	m = m.ApplyEvent(event.UserInputRequested{ToolExecutionID: first, Question: "Q1", Choices: []string{"x"}})
+	m = m.ApplyEvent(event.UserInputRequested{ToolExecutionID: second, Question: "Q2", Choices: []string{"y"}})
 
 	if m.PendingCount() != 2 {
 		t.Fatalf("PendingCount = %d, want 2 (distinct CallIDs)", m.PendingCount())
 	}
-	if head := m.ActivePrompt(); head == nil || head.CallID != first {
-		t.Fatalf("head CallID = %v, want %v (FIFO)", head, first)
+	if head := m.ActivePrompt(); head == nil || head.ToolExecutionID != first {
+		t.Fatalf("head ToolExecutionID = %v, want %v (FIFO)", head, first)
 	}
 
-	// A duplicate of an already-pending CallID is ignored (append-once).
-	m = m.ApplyEvent(event.UserInputRequested{CallID: first, Question: "DUP", Choices: []string{"z"}})
+	// A duplicate of an already-pending ToolExecutionID is ignored (append-once).
+	m = m.ApplyEvent(event.UserInputRequested{ToolExecutionID: first, Question: "DUP", Choices: []string{"z"}})
 	if m.PendingCount() != 2 {
 		t.Fatalf("PendingCount after dup = %d, want 2 (append-once)", m.PendingCount())
 	}
@@ -218,8 +219,8 @@ func TestInteractionEnqueueFIFOAndAppendOnce(t *testing.T) {
 		t.Errorf("head Question = %v, want Q1 (dup did not overwrite)", head)
 	}
 
-	// A duplicate permission CallID is likewise ignored.
-	m = m.ApplyEvent(event.PermissionRequested{CallID: second, Request: tool.BashRequest{Command: "rm"}})
+	// A duplicate permission ToolExecutionID is likewise ignored.
+	m = m.ApplyEvent(event.PermissionRequested{ToolExecutionID: second, Request: tool.BashRequest{Command: "rm"}})
 	if m.PendingCount() != 2 {
 		t.Errorf("PendingCount after dup permission = %d, want 2", m.PendingCount())
 	}
@@ -250,8 +251,8 @@ func TestInteractionClearOnTerminal(t *testing.T) {
 			m.composeDraft = "my draft"
 
 			m = m.ApplyEvent(event.PermissionRequested{
-				CallID:  callID(1),
-				Request: tool.BashRequest{Command: "go test"},
+				ToolExecutionID: callID(1),
+				Request:         tool.BashRequest{Command: "go test"},
 			})
 			if m.mode != modePermissionPrompt || m.PendingCount() != 1 {
 				t.Fatalf("pre-terminal state wrong: mode %d pending %d", m.mode, m.PendingCount())
@@ -327,9 +328,9 @@ func TestInteractionClearPromptsForLoop(t *testing.T) {
 		name string
 		term event.Event // terminal event carrying its producing loop
 	}{
-		{name: "turn done", term: event.TurnDone{Header: event.Header{LoopID: loopA}}},
-		{name: "turn failed", term: event.TurnFailed{Header: event.Header{LoopID: loopA}}},
-		{name: "turn interrupted", term: event.TurnInterrupted{Header: event.Header{LoopID: loopA}}},
+		{name: "turn done", term: event.TurnDone{Header: event.Header{Coordinates: identity.Coordinates{LoopID: loopA}}}},
+		{name: "turn failed", term: event.TurnFailed{Header: event.Header{Coordinates: identity.Coordinates{LoopID: loopA}}}},
+		{name: "turn interrupted", term: event.TurnInterrupted{Header: event.Header{Coordinates: identity.Coordinates{LoopID: loopA}}}},
 	}
 
 	for _, tt := range tests {
@@ -339,15 +340,15 @@ func TestInteractionClearPromptsForLoop(t *testing.T) {
 			m := newInteractionModel()
 			// Loop A's gate is the active head; loop B's gate waits behind it.
 			m = m.ApplyEvent(event.PermissionRequested{
-				Header:  event.Header{LoopID: loopA},
-				CallID:  callID(1),
-				Request: tool.BashRequest{Command: "go test"},
+				Header:          event.Header{Coordinates: identity.Coordinates{LoopID: loopA}},
+				ToolExecutionID: callID(1),
+				Request:         tool.BashRequest{Command: "go test"},
 			})
 			m = m.ApplyEvent(event.UserInputRequested{
-				Header:   event.Header{LoopID: loopB},
-				CallID:   callID(2),
-				Question: "pick",
-				Choices:  []string{"x"},
+				Header:          event.Header{Coordinates: identity.Coordinates{LoopID: loopB}},
+				ToolExecutionID: callID(2),
+				Question:        "pick",
+				Choices:         []string{"x"},
 			})
 			if m.PendingCount() != 2 {
 				t.Fatalf("setup PendingCount = %d, want 2", m.PendingCount())
@@ -359,8 +360,8 @@ func TestInteractionClearPromptsForLoop(t *testing.T) {
 				t.Fatalf("PendingCount = %d, want 1 (only loop A cleared)", m.PendingCount())
 			}
 			head := m.ActivePrompt()
-			if head == nil || head.CallID != callID(2) || head.LoopID != loopB {
-				t.Fatalf("surviving head = %+v, want loop B's gate (CallID %v, LoopID %v)", head, callID(2), loopB)
+			if head == nil || head.ToolExecutionID != callID(2) || head.LoopID != loopB {
+				t.Fatalf("surviving head = %+v, want loop B's gate (ToolExecutionID %v, LoopID %v)", head, callID(2), loopB)
 			}
 			// The active head was loop A's permission prompt; with B (a choice
 			// prompt) now at the head, the mode must re-sync to choice mode — not
@@ -374,11 +375,11 @@ func TestInteractionClearPromptsForLoop(t *testing.T) {
 			before := m.PendingCount()
 			switch tt.term.(type) {
 			case event.TurnDone:
-				m = m.ApplyEvent(event.TurnDone{Header: event.Header{LoopID: loopC}})
+				m = m.ApplyEvent(event.TurnDone{Header: event.Header{Coordinates: identity.Coordinates{LoopID: loopC}}})
 			case event.TurnFailed:
-				m = m.ApplyEvent(event.TurnFailed{Header: event.Header{LoopID: loopC}})
+				m = m.ApplyEvent(event.TurnFailed{Header: event.Header{Coordinates: identity.Coordinates{LoopID: loopC}}})
 			case event.TurnInterrupted:
-				m = m.ApplyEvent(event.TurnInterrupted{Header: event.Header{LoopID: loopC}})
+				m = m.ApplyEvent(event.TurnInterrupted{Header: event.Header{Coordinates: identity.Coordinates{LoopID: loopC}}})
 			}
 			if m.PendingCount() != before {
 				t.Errorf("PendingCount after unrelated loop C terminal = %d, want %d (no-op)", m.PendingCount(), before)
@@ -399,21 +400,21 @@ func TestInteractionClearPromptsForLoopDrainsAndRestores(t *testing.T) {
 	// The user had a draft before two of loop A's gates preempted them.
 	m.input.SetValue("my draft")
 	m = m.ApplyEvent(event.PermissionRequested{
-		Header:  event.Header{LoopID: loopA},
-		CallID:  callID(1),
-		Request: tool.BashRequest{Command: "go test"},
+		Header:          event.Header{Coordinates: identity.Coordinates{LoopID: loopA}},
+		ToolExecutionID: callID(1),
+		Request:         tool.BashRequest{Command: "go test"},
 	})
 	m = m.ApplyEvent(event.PermissionRequested{
-		Header:  event.Header{LoopID: loopA},
-		CallID:  callID(2),
-		Request: tool.BashRequest{Command: "go build"},
+		Header:          event.Header{Coordinates: identity.Coordinates{LoopID: loopA}},
+		ToolExecutionID: callID(2),
+		Request:         tool.BashRequest{Command: "go build"},
 	})
 	if m.PendingCount() != 2 {
 		t.Fatalf("setup PendingCount = %d, want 2", m.PendingCount())
 	}
 
 	// Loop A finishes: both of its gates clear, the queue drains.
-	m = m.ApplyEvent(event.TurnDone{Header: event.Header{LoopID: loopA}})
+	m = m.ApplyEvent(event.TurnDone{Header: event.Header{Coordinates: identity.Coordinates{LoopID: loopA}}})
 	if m.PendingCount() != 0 {
 		t.Fatalf("PendingCount = %d, want 0 (all of loop A cleared)", m.PendingCount())
 	}
@@ -433,8 +434,8 @@ func TestInteractionNonComposeUpdateIsNoop(t *testing.T) {
 
 	m := newInteractionModel()
 	m = m.ApplyEvent(event.PermissionRequested{
-		CallID:  callID(1),
-		Request: tool.BashRequest{Command: "go build"},
+		ToolExecutionID: callID(1),
+		Request:         tool.BashRequest{Command: "go build"},
 	})
 
 	m, action, _ := m.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
@@ -458,14 +459,14 @@ func runeKey(r rune) tea.KeyPressMsg {
 // gate (callID 1) built from req.
 func permissionModel(req tool.PermissionRequest) interactionModel {
 	m := newInteractionModel()
-	return m.ApplyEvent(event.PermissionRequested{CallID: callID(1), Request: req})
+	return m.ApplyEvent(event.PermissionRequested{ToolExecutionID: callID(1), Request: req})
 }
 
 // choiceModel returns an interaction model in choice mode for one gate (callID 2)
 // with the given choices.
 func choiceModel(choices []string) interactionModel {
 	m := newInteractionModel()
-	return m.ApplyEvent(event.UserInputRequested{CallID: callID(2), Question: "pick", Choices: choices})
+	return m.ApplyEvent(event.UserInputRequested{ToolExecutionID: callID(2), Question: "pick", Choices: choices})
 }
 
 // TestInteractionPermissionRouting covers modePermissionPrompt key routing: the
@@ -507,15 +508,15 @@ func TestInteractionPermissionRouting(t *testing.T) {
 				t.Fatalf("action.Kind = %d, want %d", action.Kind, tt.wantKind)
 			}
 			if tt.wantKind == uiApprove {
-				if action.CallID != callID(1) {
-					t.Errorf("approve CallID = %v, want %v", action.CallID, callID(1))
+				if action.ToolExecutionID != callID(1) {
+					t.Errorf("approve ToolExecutionID = %v, want %v", action.ToolExecutionID, callID(1))
 				}
 				if action.Scope != tt.wantScope {
 					t.Errorf("approve Scope = %d, want %d", action.Scope, tt.wantScope)
 				}
 			}
-			if tt.wantKind == uiDeny && action.CallID != callID(1) {
-				t.Errorf("deny CallID = %v, want %v", action.CallID, callID(1))
+			if tt.wantKind == uiDeny && action.ToolExecutionID != callID(1) {
+				t.Errorf("deny ToolExecutionID = %v, want %v", action.ToolExecutionID, callID(1))
 			}
 			wantPending := 1
 			if tt.wantPop {
@@ -649,8 +650,8 @@ func TestInteractionChoiceSubmit(t *testing.T) {
 				if action.Text != tt.wantText {
 					t.Errorf("answer Text = %q, want %q", action.Text, tt.wantText)
 				}
-				if action.CallID != callID(2) {
-					t.Errorf("answer CallID = %v, want %v", action.CallID, callID(2))
+				if action.ToolExecutionID != callID(2) {
+					t.Errorf("answer ToolExecutionID = %v, want %v", action.ToolExecutionID, callID(2))
 				}
 			}
 			wantPending := 1
@@ -676,7 +677,7 @@ func TestInteractionAnswerMode(t *testing.T) {
 		t.Parallel()
 		m := newInteractionModel()
 		m.input.SetValue("my draft")
-		m = m.ApplyEvent(event.UserInputRequested{CallID: callID(3), Question: "name?", Choices: nil})
+		m = m.ApplyEvent(event.UserInputRequested{ToolExecutionID: callID(3), Question: "name?", Choices: nil})
 		if m.mode != modeAnswerPrompt {
 			t.Fatalf("mode = %d, want modeAnswerPrompt", m.mode)
 		}
@@ -691,7 +692,7 @@ func TestInteractionAnswerMode(t *testing.T) {
 	t.Run("printable key edits the answer box", func(t *testing.T) {
 		t.Parallel()
 		m := newInteractionModel()
-		m = m.ApplyEvent(event.UserInputRequested{CallID: callID(3), Question: "name?", Choices: nil})
+		m = m.ApplyEvent(event.UserInputRequested{ToolExecutionID: callID(3), Question: "name?", Choices: nil})
 		m, action, _ := m.Update(runeKey('h'))
 		if action.Kind != uiNoop {
 			t.Errorf("Kind = %d, want uiNoop", action.Kind)
@@ -705,11 +706,11 @@ func TestInteractionAnswerMode(t *testing.T) {
 		t.Parallel()
 		m := newInteractionModel()
 		m.input.SetValue("draft")
-		m = m.ApplyEvent(event.UserInputRequested{CallID: callID(3), Question: "name?", Choices: nil})
+		m = m.ApplyEvent(event.UserInputRequested{ToolExecutionID: callID(3), Question: "name?", Choices: nil})
 		m, _, _ = m.Update(runeKey('h'))
 		m, _, _ = m.Update(runeKey('i'))
 		m, action, _ := m.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
-		if action.Kind != uiAnswer || action.Text != "hi" || action.CallID != callID(3) {
+		if action.Kind != uiAnswer || action.Text != "hi" || action.ToolExecutionID != callID(3) {
 			t.Fatalf("action = %+v, want uiAnswer 'hi' callID 3", action)
 		}
 		if m.PendingCount() != 0 {
@@ -726,7 +727,7 @@ func TestInteractionAnswerMode(t *testing.T) {
 	t.Run("empty enter re-prompts (no-op)", func(t *testing.T) {
 		t.Parallel()
 		m := newInteractionModel()
-		m = m.ApplyEvent(event.UserInputRequested{CallID: callID(3), Question: "name?", Choices: nil})
+		m = m.ApplyEvent(event.UserInputRequested{ToolExecutionID: callID(3), Question: "name?", Choices: nil})
 		m, action, _ := m.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
 		if action.Kind != uiNoop {
 			t.Errorf("Kind = %d, want uiNoop (empty answer re-prompts)", action.Kind)
@@ -739,7 +740,7 @@ func TestInteractionAnswerMode(t *testing.T) {
 	t.Run("esc interrupts without popping", func(t *testing.T) {
 		t.Parallel()
 		m := newInteractionModel()
-		m = m.ApplyEvent(event.UserInputRequested{CallID: callID(3), Question: "name?", Choices: nil})
+		m = m.ApplyEvent(event.UserInputRequested{ToolExecutionID: callID(3), Question: "name?", Choices: nil})
 		m, action, _ := m.Update(tea.KeyPressMsg{Code: tea.KeyEsc})
 		if action.Kind != uiInterrupt {
 			t.Errorf("Kind = %d, want uiInterrupt", action.Kind)
@@ -789,7 +790,7 @@ func TestInteractionAnswerModeEnterVariants(t *testing.T) {
 			t.Parallel()
 
 			m := newInteractionModel()
-			m = m.ApplyEvent(event.UserInputRequested{CallID: callID(3), Question: "name?", Choices: nil})
+			m = m.ApplyEvent(event.UserInputRequested{ToolExecutionID: callID(3), Question: "name?", Choices: nil})
 			// Type a non-empty answer so a submit would fire (and so a shift+enter
 			// forward is distinguishable from an empty-enter no-op).
 			m, _, _ = m.Update(runeKey('h'))
@@ -801,7 +802,7 @@ func TestInteractionAnswerModeEnterVariants(t *testing.T) {
 				t.Fatalf("action.Kind = %d, want %d", action.Kind, tt.wantKind)
 			}
 			if tt.wantSubmit {
-				if action.Text != "hi" || action.CallID != callID(3) {
+				if action.Text != "hi" || action.ToolExecutionID != callID(3) {
 					t.Errorf("submit action = %+v, want uiAnswer 'hi' callID 3", action)
 				}
 				if m.PendingCount() != 0 {
@@ -824,8 +825,8 @@ func TestInteractionAnswerModeNextFieldEmpty(t *testing.T) {
 
 	m := newInteractionModel()
 	m.input.SetValue("draft")
-	m = m.ApplyEvent(event.UserInputRequested{CallID: callID(3), Question: "q1?", Choices: nil})
-	m = m.ApplyEvent(event.UserInputRequested{CallID: callID(4), Question: "q2?", Choices: nil})
+	m = m.ApplyEvent(event.UserInputRequested{ToolExecutionID: callID(3), Question: "q1?", Choices: nil})
+	m = m.ApplyEvent(event.UserInputRequested{ToolExecutionID: callID(4), Question: "q2?", Choices: nil})
 
 	m, _, _ = m.Update(runeKey('a'))
 	m, action, _ := m.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
@@ -909,14 +910,14 @@ func TestInteractionPopRevealsNextThenCompose(t *testing.T) {
 	m.input.SetValue("saved")
 	first := callID(1)
 	second := callID(2)
-	m = m.ApplyEvent(event.PermissionRequested{CallID: first, Request: tool.BashRequest{Command: "a"}})
-	m = m.ApplyEvent(event.PermissionRequested{CallID: second, Request: tool.UnknownRequest{Tool: "T", Summary: "s"}})
+	m = m.ApplyEvent(event.PermissionRequested{ToolExecutionID: first, Request: tool.BashRequest{Command: "a"}})
+	m = m.ApplyEvent(event.PermissionRequested{ToolExecutionID: second, Request: tool.UnknownRequest{Tool: "T", Summary: "s"}})
 
 	m = m.pop()
 	if m.PendingCount() != 1 {
 		t.Fatalf("PendingCount after pop = %d, want 1", m.PendingCount())
 	}
-	if head := m.ActivePrompt(); head == nil || head.CallID != second {
+	if head := m.ActivePrompt(); head == nil || head.ToolExecutionID != second {
 		t.Fatalf("head after pop = %v, want second %v", head, second)
 	}
 

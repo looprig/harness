@@ -66,9 +66,9 @@ type recordingSub struct {
 // Ephemeral events from the primary loop, and Enduring events (StepDone, gates,
 // terminals — including TurnStarted/TurnInterrupted) from every loop. The
 // returned Subscription must be Closed by the caller (t.Cleanup). The
-// subscription is created AFTER NewAgent, so it never sees the construction-time
+// subscription is created AFTER New, so it never sees the construction-time
 // SessionStarted (the hub has no replay) — tests must not assert on it.
-func observe(t *testing.T, s *Sesssion) (*recordingSub, event.Subscription) {
+func observe(t *testing.T, s *Session) (*recordingSub, event.Subscription) {
 	t.Helper()
 	sub, err := s.SubscribeEvents(event.EventFilter{
 		Ephemeral: event.LoopScope{Loops: map[uuid.UUID]struct{}{s.primaryLoopID: {}}},
@@ -103,9 +103,9 @@ func (r *recordingSub) sawTerminal() bool {
 	return false
 }
 
-// turnCausationID returns the CausationID stamped on the first turn-level event
+// turnCausationID returns the Cause.CommandID stamped on the first turn-level event
 // (a loop-scoped event; session-scoped events carry none). The loop stamps a
-// turn event's CausationID with the issuing UserInput's Header.ID, so a non-zero
+// turn event's Cause.CommandID with the issuing UserInput's Header.ID, so a non-zero
 // value here proves the session stamped a fresh Header.ID on the command.
 func (r *recordingSub) turnCausationID() (uuid.UUID, bool) {
 	r.mu.Lock()
@@ -114,7 +114,7 @@ func (r *recordingSub) turnCausationID() (uuid.UUID, bool) {
 		if ev.Scope() == event.ScopeSession {
 			continue
 		}
-		return ev.EventHeader().CausationID, true
+		return ev.EventHeader().Cause.CommandID, true
 	}
 	return uuid.UUID{}, false
 }
@@ -155,13 +155,13 @@ func cfg(client llm.LLM) loop.Config {
 	return loop.Config{Client: client, Model: llm.ModelSpec{Model: "m"}, DrainTimeout: 100 * time.Millisecond}
 }
 
-func TestNewAgent(t *testing.T) {
+func TestNew(t *testing.T) {
 	t.Parallel()
 	t.Run("non-zero SessionID", func(t *testing.T) {
 		t.Parallel()
-		s, err := NewAgent(context.Background(), cfg(&stubLLM{chunks: []content.Chunk{textChunk("x")}}))
+		s, err := New(context.Background(), cfg(&stubLLM{chunks: []content.Chunk{textChunk("x")}}))
 		if err != nil {
-			t.Fatalf("NewAgent: %v", err)
+			t.Fatalf("New: %v", err)
 		}
 		t.Cleanup(func() { _ = s.Shutdown(context.Background()) })
 		var zero [16]byte
@@ -173,7 +173,7 @@ func TestNewAgent(t *testing.T) {
 		t.Parallel()
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
-		_, err := NewAgent(ctx, cfg(&stubLLM{}))
+		_, err := New(ctx, cfg(&stubLLM{}))
 		var se *SessionError
 		if !errors.As(err, &se) || se.Kind != SessionContextDone {
 			t.Fatalf("err = %v, want *SessionError{SessionContextDone}", err)
@@ -181,9 +181,9 @@ func TestNewAgent(t *testing.T) {
 	})
 	t.Run("exactly one loop indexed by primaryLoopID", func(t *testing.T) {
 		t.Parallel()
-		s, err := NewAgent(context.Background(), cfg(&stubLLM{chunks: []content.Chunk{textChunk("x")}}))
+		s, err := New(context.Background(), cfg(&stubLLM{chunks: []content.Chunk{textChunk("x")}}))
 		if err != nil {
-			t.Fatalf("NewAgent: %v", err)
+			t.Fatalf("New: %v", err)
 		}
 		t.Cleanup(func() { _ = s.Shutdown(context.Background()) })
 
@@ -232,9 +232,9 @@ func TestNewLoop(t *testing.T) {
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			s, err := NewAgent(context.Background(), cfg(&stubLLM{chunks: []content.Chunk{textChunk("x")}}))
+			s, err := New(context.Background(), cfg(&stubLLM{chunks: []content.Chunk{textChunk("x")}}))
 			if err != nil {
-				t.Fatalf("NewAgent: %v", err)
+				t.Fatalf("New: %v", err)
 			}
 			t.Cleanup(func() { _ = s.Shutdown(context.Background()) })
 
@@ -292,9 +292,9 @@ func TestNewLoop(t *testing.T) {
 func TestNewLoopIDGenerationFailure(t *testing.T) {
 	t.Parallel()
 	genErr := errors.New("rand source exhausted")
-	s, err := NewAgent(context.Background(), cfg(&stubLLM{chunks: []content.Chunk{textChunk("x")}}))
+	s, err := New(context.Background(), cfg(&stubLLM{chunks: []content.Chunk{textChunk("x")}}))
 	if err != nil {
-		t.Fatalf("NewAgent: %v", err)
+		t.Fatalf("New: %v", err)
 	}
 	t.Cleanup(func() { s.newID = uuid.New; _ = s.Shutdown(context.Background()) })
 
@@ -325,9 +325,9 @@ func TestNewLoopIDGenerationFailure(t *testing.T) {
 // misses.
 func TestLoopFor(t *testing.T) {
 	t.Parallel()
-	s, err := NewAgent(context.Background(), cfg(&stubLLM{chunks: []content.Chunk{textChunk("x")}}))
+	s, err := New(context.Background(), cfg(&stubLLM{chunks: []content.Chunk{textChunk("x")}}))
 	if err != nil {
-		t.Fatalf("NewAgent: %v", err)
+		t.Fatalf("New: %v", err)
 	}
 	t.Cleanup(func() { _ = s.Shutdown(context.Background()) })
 
@@ -353,16 +353,18 @@ func TestRoutingMethodsLoopNotFound(t *testing.T) {
 	callID := mustUUID()
 	tests := []struct {
 		name string
-		call func(s *Sesssion) error
+		call func(s *Session) error
 	}{
-		{name: "Invoke", call: func(s *Sesssion) error { _, err := s.Invoke(context.Background(), nil); return err }},
-		{name: "Stream", call: func(s *Sesssion) error { _, err := s.Stream(context.Background(), nil); return err }},
-		{name: "Interrupt", call: func(s *Sesssion) error { _, err := s.Interrupt(context.Background()); return err }},
-		// Approve/Deny/ProvideUserInput route through routeCommand, which performs
-		// the same loopFor(primaryLoopID) lookup behind the gate-answer methods.
-		{name: "Approve", call: func(s *Sesssion) error { return s.Approve(context.Background(), callID, tool.ScopeOnce) }},
-		{name: "Deny", call: func(s *Sesssion) error { return s.Deny(context.Background(), callID) }},
-		{name: "ProvideUserInput", call: func(s *Sesssion) error { return s.ProvideUserInput(context.Background(), callID, "x") }},
+		{name: "Invoke", call: func(s *Session) error { _, err := s.Invoke(context.Background(), nil); return err }},
+		{name: "Stream", call: func(s *Session) error { _, err := s.Stream(context.Background(), nil); return err }},
+		{name: "Interrupt", call: func(s *Session) error { _, err := s.Interrupt(context.Background()); return err }},
+		// Approve/Deny/ProvideUserInput resolve the target loop by id (the primary
+		// here), which misses once the primary entry is deleted below.
+		{name: "Approve", call: func(s *Session) error {
+			return s.Approve(context.Background(), s.primaryLoopID, callID, tool.ScopeOnce)
+		}},
+		{name: "Deny", call: func(s *Session) error { return s.Deny(context.Background(), s.primaryLoopID, callID) }},
+		{name: "ProvideUserInput", call: func(s *Session) error { return s.ProvideUserInput(context.Background(), s.primaryLoopID, callID, "x") }},
 	}
 	for _, tt := range tests {
 		tt := tt
@@ -422,7 +424,7 @@ func TestNewLoopReturnsLoopNewError(t *testing.T) {
 	sessionCtx, sessionCancel := context.WithCancel(context.Background())
 	t.Cleanup(sessionCancel)
 	primaryLoopID := mustUUID()
-	s := &Sesssion{
+	s := &Session{
 		SessionID:     mustUUID(),
 		sessionCtx:    sessionCtx,
 		sessionCancel: sessionCancel,
@@ -503,7 +505,7 @@ func (g *capturingIDGen) last() (uuid.UUID, bool) {
 
 // first returns the earliest minted id — the turn-initiating command's id (the
 // UserInput for Invoke/Stream). A later Stream.Close mints a second id for its
-// best-effort Interrupt, so the observable turn CausationID is the FIRST mint.
+// best-effort Interrupt, so the observable turn Cause.CommandID is the FIRST mint.
 func (g *capturingIDGen) first() (uuid.UUID, bool) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -517,19 +519,19 @@ func (g *capturingIDGen) first() (uuid.UUID, bool) {
 // fresh, non-zero Header.ID on the command it sends. Each method mints the ID
 // through the session's idGenerator seam, so a non-zero captured value proves
 // the stamp. For Invoke and Stream the loop also copies the command's Header.ID
-// onto each turn event's CausationID, so the CausationID observed through a hub
+// onto each turn event's Cause.CommandID, so the Cause.CommandID observed through a hub
 // Subscription must equal the captured ID — an end-to-end check that the stamp
 // reaches the loop.
 func TestStampsCommandHeaderID(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
 		name        string
-		call        func(t *testing.T, s *Sesssion)
-		observeable bool // true when the stamped ID surfaces via a turn event's CausationID
+		call        func(t *testing.T, s *Session)
+		observeable bool // true when the stamped ID surfaces via a turn event's Cause.CommandID
 	}{
 		{
 			name: "Invoke",
-			call: func(t *testing.T, s *Sesssion) {
+			call: func(t *testing.T, s *Session) {
 				if _, err := s.Invoke(context.Background(), nil); err != nil {
 					t.Fatalf("Invoke: %v", err)
 				}
@@ -538,7 +540,7 @@ func TestStampsCommandHeaderID(t *testing.T) {
 		},
 		{
 			name: "Stream",
-			call: func(t *testing.T, s *Sesssion) {
+			call: func(t *testing.T, s *Session) {
 				sr, err := s.Stream(context.Background(), nil)
 				if err != nil {
 					t.Fatalf("Stream: %v", err)
@@ -556,7 +558,7 @@ func TestStampsCommandHeaderID(t *testing.T) {
 		},
 		{
 			name: "Interrupt",
-			call: func(t *testing.T, s *Sesssion) {
+			call: func(t *testing.T, s *Session) {
 				if _, err := s.Interrupt(context.Background()); err != nil {
 					t.Fatalf("Interrupt: %v", err)
 				}
@@ -564,7 +566,7 @@ func TestStampsCommandHeaderID(t *testing.T) {
 		},
 		{
 			name: "Shutdown",
-			call: func(t *testing.T, s *Sesssion) {
+			call: func(t *testing.T, s *Session) {
 				if err := s.Shutdown(context.Background()); err != nil {
 					t.Fatalf("Shutdown: %v", err)
 				}
@@ -575,9 +577,9 @@ func TestStampsCommandHeaderID(t *testing.T) {
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			s, err := NewAgent(context.Background(), cfg(&stubLLM{chunks: []content.Chunk{textChunk("hi")}}))
+			s, err := New(context.Background(), cfg(&stubLLM{chunks: []content.Chunk{textChunk("hi")}}))
 			if err != nil {
-				t.Fatalf("NewAgent: %v", err)
+				t.Fatalf("New: %v", err)
 			}
 			// Subscribe BEFORE the call so the turn events it triggers are observed
 			// (the hub has no replay; a late subscriber would miss them).
@@ -599,7 +601,7 @@ func TestStampsCommandHeaderID(t *testing.T) {
 			if tt.observeable {
 				// The turn-initiating command (the UserInput) is the FIRST mint; a
 				// Stream.Close fires a best-effort Interrupt that mints a later id, so
-				// compare the observable CausationID against the first.
+				// compare the observable Cause.CommandID against the first.
 				turnID, ok := gen.first()
 				if !ok {
 					t.Fatal("session minted no command-Header ID")
@@ -609,7 +611,7 @@ func TestStampsCommandHeaderID(t *testing.T) {
 					t.Fatal("no turn-level event observed via the subscription")
 				}
 				if cid != turnID {
-					t.Fatalf("event CausationID = %v, want stamped Header.ID %v", cid, turnID)
+					t.Fatalf("event Cause.CommandID = %v, want stamped Header.ID %v", cid, turnID)
 				}
 			}
 		})
@@ -627,20 +629,20 @@ func TestNewCommandIDGenerationFailure(t *testing.T) {
 
 	tests := []struct {
 		name string
-		call func(s *Sesssion) error
+		call func(s *Session) error
 	}{
-		{name: "Invoke", call: func(s *Sesssion) error { _, err := s.Invoke(context.Background(), nil); return err }},
-		{name: "Stream", call: func(s *Sesssion) error { _, err := s.Stream(context.Background(), nil); return err }},
-		{name: "Interrupt", call: func(s *Sesssion) error { _, err := s.Interrupt(context.Background()); return err }},
-		{name: "Shutdown", call: func(s *Sesssion) error { return s.Shutdown(context.Background()) }},
+		{name: "Invoke", call: func(s *Session) error { _, err := s.Invoke(context.Background(), nil); return err }},
+		{name: "Stream", call: func(s *Session) error { _, err := s.Stream(context.Background(), nil); return err }},
+		{name: "Interrupt", call: func(s *Session) error { _, err := s.Interrupt(context.Background()); return err }},
+		{name: "Shutdown", call: func(s *Session) error { return s.Shutdown(context.Background()) }},
 	}
 	for _, tt := range tests {
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			s, err := NewAgent(context.Background(), cfg(&stubLLM{chunks: []content.Chunk{textChunk("x")}}))
+			s, err := New(context.Background(), cfg(&stubLLM{chunks: []content.Chunk{textChunk("x")}}))
 			if err != nil {
-				t.Fatalf("NewAgent: %v", err)
+				t.Fatalf("New: %v", err)
 			}
 			// Restore a working generator before cleanup so the cleanup Shutdown can
 			// mint its own command ID and actually stop the actor (no leaked loop).
@@ -661,9 +663,9 @@ func TestNewCommandIDGenerationFailure(t *testing.T) {
 
 func TestInvokeReturnsTurnDone(t *testing.T) {
 	t.Parallel()
-	s, err := NewAgent(context.Background(), cfg(&stubLLM{chunks: []content.Chunk{textChunk("hello")}}))
+	s, err := New(context.Background(), cfg(&stubLLM{chunks: []content.Chunk{textChunk("hello")}}))
 	if err != nil {
-		t.Fatalf("NewAgent: %v", err)
+		t.Fatalf("New: %v", err)
 	}
 	t.Cleanup(func() { _ = s.Shutdown(context.Background()) })
 	ev, err := s.Invoke(context.Background(), nil)
@@ -677,9 +679,9 @@ func TestInvokeReturnsTurnDone(t *testing.T) {
 
 func TestInvokeCtxCancelReturnsInterrupted(t *testing.T) {
 	t.Parallel()
-	s, err := NewAgent(context.Background(), cfg(&stubLLM{blockUntilCancel: true}))
+	s, err := New(context.Background(), cfg(&stubLLM{blockUntilCancel: true}))
 	if err != nil {
-		t.Fatalf("NewAgent: %v", err)
+		t.Fatalf("New: %v", err)
 	}
 	t.Cleanup(func() { _ = s.Shutdown(context.Background()) })
 	ctx, cancel := context.WithCancel(context.Background())
@@ -695,9 +697,9 @@ func TestInvokeCtxCancelReturnsInterrupted(t *testing.T) {
 
 func TestStreamYieldsOrderedEvents(t *testing.T) {
 	t.Parallel()
-	s, err := NewAgent(context.Background(), cfg(&stubLLM{chunks: []content.Chunk{textChunk("a"), textChunk("b")}}))
+	s, err := New(context.Background(), cfg(&stubLLM{chunks: []content.Chunk{textChunk("a"), textChunk("b")}}))
 	if err != nil {
-		t.Fatalf("NewAgent: %v", err)
+		t.Fatalf("New: %v", err)
 	}
 	t.Cleanup(func() { _ = s.Shutdown(context.Background()) })
 	sr, err := s.Stream(context.Background(), nil)
@@ -728,9 +730,9 @@ func TestStreamYieldsOrderedEvents(t *testing.T) {
 
 func TestConcurrentInvokeIsRejected(t *testing.T) {
 	t.Parallel()
-	s, err := NewAgent(context.Background(), cfg(&stubLLM{blockUntilCancel: true}))
+	s, err := New(context.Background(), cfg(&stubLLM{blockUntilCancel: true}))
 	if err != nil {
-		t.Fatalf("NewAgent: %v", err)
+		t.Fatalf("New: %v", err)
 	}
 	t.Cleanup(func() { _ = s.Shutdown(context.Background()) })
 
@@ -754,9 +756,9 @@ func TestConcurrentInvokeIsRejected(t *testing.T) {
 // published event.TurnRejected mapped to a typed error), never a reader.
 func TestStreamBusyRejected(t *testing.T) {
 	t.Parallel()
-	s, err := NewAgent(context.Background(), cfg(&stubLLM{blockUntilCancel: true}))
+	s, err := New(context.Background(), cfg(&stubLLM{blockUntilCancel: true}))
 	if err != nil {
-		t.Fatalf("NewAgent: %v", err)
+		t.Fatalf("New: %v", err)
 	}
 	t.Cleanup(func() { _ = s.Shutdown(context.Background()) })
 
@@ -780,9 +782,9 @@ func TestStreamBusyRejected(t *testing.T) {
 
 func TestShutdownThenMethodsExit(t *testing.T) {
 	t.Parallel()
-	s, err := NewAgent(context.Background(), cfg(&stubLLM{chunks: []content.Chunk{textChunk("x")}}))
+	s, err := New(context.Background(), cfg(&stubLLM{chunks: []content.Chunk{textChunk("x")}}))
 	if err != nil {
-		t.Fatalf("NewAgent: %v", err)
+		t.Fatalf("New: %v", err)
 	}
 	if err := s.Shutdown(context.Background()); err != nil {
 		t.Fatalf("Shutdown: %v", err)
@@ -804,9 +806,9 @@ func TestShutdownThenMethodsExit(t *testing.T) {
 func TestStreamReaderUnblocksOnLoopDeath(t *testing.T) {
 	t.Parallel()
 	ctx, cancel := context.WithCancel(context.Background())
-	s, err := NewAgent(ctx, cfg(&stubLLM{blockUntilCancel: true}))
+	s, err := New(ctx, cfg(&stubLLM{blockUntilCancel: true}))
 	if err != nil {
-		t.Fatalf("NewAgent: %v", err)
+		t.Fatalf("New: %v", err)
 	}
 	sr, err := s.Stream(context.Background(), nil)
 	if err != nil {
@@ -844,9 +846,9 @@ func TestStreamReaderUnblocksOnLoopDeath(t *testing.T) {
 func TestInvokeUnblocksOnLoopDeath(t *testing.T) {
 	t.Parallel()
 	ctx, cancel := context.WithCancel(context.Background())
-	s, err := NewAgent(ctx, cfg(&stubLLM{blockUntilCancel: true, ignoreCtx: true}))
+	s, err := New(ctx, cfg(&stubLLM{blockUntilCancel: true, ignoreCtx: true}))
 	if err != nil {
-		t.Fatalf("NewAgent: %v", err)
+		t.Fatalf("New: %v", err)
 	}
 	errCh := make(chan error, 1)
 	go func() {
@@ -873,9 +875,9 @@ func TestInvokeUnblocksOnLoopDeath(t *testing.T) {
 // and a hub Subscription observes the TurnInterrupted terminal event.
 func TestStreamCloseCancelsTurn(t *testing.T) {
 	t.Parallel()
-	s, err := NewAgent(context.Background(), cfg(&stubLLM{blockUntilCancel: true}))
+	s, err := New(context.Background(), cfg(&stubLLM{blockUntilCancel: true}))
 	if err != nil {
-		t.Fatalf("NewAgent: %v", err)
+		t.Fatalf("New: %v", err)
 	}
 	t.Cleanup(func() { _ = s.Shutdown(context.Background()) })
 	// Subscribe BEFORE the turn so the terminal it triggers on Close is observed.
@@ -923,9 +925,9 @@ func TestStreamDrainReleasesSession(t *testing.T) {
 	t.Parallel()
 	t.Run("drain to EOF releases", func(t *testing.T) {
 		t.Parallel()
-		s, err := NewAgent(context.Background(), cfg(&stubLLM{chunks: []content.Chunk{textChunk("a")}}))
+		s, err := New(context.Background(), cfg(&stubLLM{chunks: []content.Chunk{textChunk("a")}}))
 		if err != nil {
-			t.Fatalf("NewAgent: %v", err)
+			t.Fatalf("New: %v", err)
 		}
 		t.Cleanup(func() { _ = s.Shutdown(context.Background()) })
 
@@ -954,9 +956,9 @@ func TestStreamDrainReleasesSession(t *testing.T) {
 	})
 	t.Run("close early releases", func(t *testing.T) {
 		t.Parallel()
-		s, err := NewAgent(context.Background(), cfg(&stubLLM{chunks: []content.Chunk{textChunk("a")}}))
+		s, err := New(context.Background(), cfg(&stubLLM{chunks: []content.Chunk{textChunk("a")}}))
 		if err != nil {
-			t.Fatalf("NewAgent: %v", err)
+			t.Fatalf("New: %v", err)
 		}
 		t.Cleanup(func() { _ = s.Shutdown(context.Background()) })
 
@@ -1000,9 +1002,9 @@ func TestStreamDrainReleasesSession(t *testing.T) {
 // and the Invoke returns a TurnInterrupted event.
 func TestInterruptDuringInvoke(t *testing.T) {
 	t.Parallel()
-	s, err := NewAgent(context.Background(), cfg(&stubLLM{blockUntilCancel: true}))
+	s, err := New(context.Background(), cfg(&stubLLM{blockUntilCancel: true}))
 	if err != nil {
-		t.Fatalf("NewAgent: %v", err)
+		t.Fatalf("New: %v", err)
 	}
 	t.Cleanup(func() { _ = s.Shutdown(context.Background()) })
 
@@ -1040,9 +1042,9 @@ func TestInterruptDuringInvoke(t *testing.T) {
 // (false, *SessionError{SessionContextDone}) before any command is sent.
 func TestInterruptCtxCancelledBeforeSend(t *testing.T) {
 	t.Parallel()
-	s, err := NewAgent(context.Background(), cfg(&stubLLM{blockUntilCancel: true}))
+	s, err := New(context.Background(), cfg(&stubLLM{blockUntilCancel: true}))
 	if err != nil {
-		t.Fatalf("NewAgent: %v", err)
+		t.Fatalf("New: %v", err)
 	}
 	t.Cleanup(func() { _ = s.Shutdown(context.Background()) })
 
@@ -1067,9 +1069,9 @@ func TestInterruptCtxCancelledBeforeSend(t *testing.T) {
 // *SessionError{SessionContextDone} before any command is sent.
 func TestShutdownCtxCancelledBeforeSend(t *testing.T) {
 	t.Parallel()
-	s, err := NewAgent(context.Background(), cfg(&stubLLM{blockUntilCancel: true}))
+	s, err := New(context.Background(), cfg(&stubLLM{blockUntilCancel: true}))
 	if err != nil {
-		t.Fatalf("NewAgent: %v", err)
+		t.Fatalf("New: %v", err)
 	}
 	t.Cleanup(func() { _ = s.Shutdown(context.Background()) })
 
@@ -1089,7 +1091,7 @@ func TestShutdownCtxCancelledBeforeSend(t *testing.T) {
 // TestShutdownSurfacesLoopTerminatedError covers the spec-table case "Shutdown
 // loop root ctx cancelled during shutdown → ack receives *LoopTerminatedError;
 // session wraps to *SessionError". This IS deterministic through the session API:
-// AgentSession.Shutdown parks in its final select before the kill, and the actor
+// Session.Shutdown parks in its final select before the kill, and the actor
 // sends the LoopTerminatedError ack BEFORE closing Done, so the parked select
 // wakes on the ack case while Done is still open — ack wins, not a race. (A
 // ctx-ignoring provider is required so the turn never completes on cancelTurn,
@@ -1097,9 +1099,9 @@ func TestShutdownCtxCancelledBeforeSend(t *testing.T) {
 func TestShutdownSurfacesLoopTerminatedError(t *testing.T) {
 	t.Parallel()
 	ctx, cancel := context.WithCancel(context.Background())
-	s, err := NewAgent(ctx, cfg(&stubLLM{blockUntilCancel: true, ignoreCtx: true}))
+	s, err := New(ctx, cfg(&stubLLM{blockUntilCancel: true, ignoreCtx: true}))
 	if err != nil {
-		t.Fatalf("NewAgent: %v", err)
+		t.Fatalf("New: %v", err)
 	}
 	// Occupy the loop with a turn that never completes (provider ignores ctx).
 	go func() { _, _ = s.Invoke(context.Background(), nil) }()
@@ -1127,19 +1129,19 @@ func TestShutdownSurfacesLoopTerminatedError(t *testing.T) {
 	}
 }
 
-// sessionWithFakeLoop builds an AgentSession wired to a fake loop whose Commands
+// sessionWithFakeLoop builds a Session wired to a fake loop whose Commands
 // channel the test reads from and whose Done channel the test controls. This is
 // the seam for the fire-and-route gate commands (Approve/Deny/ProvideUserInput),
 // which carry no Ack and so have no sink-observable effect through the real loop:
 // reading the unbuffered Commands channel directly captures the exact command the
 // session sent. cmds is unbuffered to mirror the real loop.Commands, so a send is
 // observable only when the test (or a closed Done) is ready.
-func sessionWithFakeLoop() (s *Sesssion, cmds chan command.Command, done chan struct{}) {
+func sessionWithFakeLoop() (s *Session, cmds chan command.Command, done chan struct{}) {
 	cmds = make(chan command.Command)
 	done = make(chan struct{})
 	sessionCtx, sessionCancel := context.WithCancel(context.Background())
 	primaryLoopID := mustUUID()
-	s = &Sesssion{
+	s = &Session{
 		SessionID:     mustUUID(),
 		sessionCtx:    sessionCtx,
 		sessionCancel: sessionCancel,
@@ -1162,7 +1164,7 @@ func mustUUID() uuid.UUID {
 
 // TestGateCommandsSendCorrectCommand asserts each gate-answer method sends the
 // correct command type to loop.Commands, stamped with a fresh non-zero Header.ID
-// and the right CallID/Scope/Answer, and returns nil. The fake loop's Commands
+// and the right ToolExecutionID/Scope/Answer, and returns nil. The fake loop's Commands
 // channel captures the exact command sent (these are fire-and-route — no Ack — so
 // this is the only observable effect).
 func TestGateCommandsSendCorrectCommand(t *testing.T) {
@@ -1170,59 +1172,63 @@ func TestGateCommandsSendCorrectCommand(t *testing.T) {
 	callID := mustUUID()
 	tests := []struct {
 		name   string
-		call   func(s *Sesssion) error
+		call   func(s *Session) error
 		verify func(t *testing.T, cmd command.Command)
 	}{
 		{
 			name: "Approve",
-			call: func(s *Sesssion) error { return s.Approve(context.Background(), callID, tool.ScopeSession) },
+			call: func(s *Session) error {
+				return s.Approve(context.Background(), s.primaryLoopID, callID, tool.ScopeSession)
+			},
 			verify: func(t *testing.T, cmd command.Command) {
 				c, ok := cmd.(command.ApproveToolCall)
 				if !ok {
 					t.Fatalf("sent %T, want command.ApproveToolCall", cmd)
 				}
-				if c.CallID != callID {
-					t.Errorf("CallID = %v, want %v", c.CallID, callID)
+				if c.ToolExecutionID != callID {
+					t.Errorf("ToolExecutionID = %v, want %v", c.ToolExecutionID, callID)
 				}
 				if c.Scope != tool.ScopeSession {
 					t.Errorf("Scope = %v, want %v", c.Scope, tool.ScopeSession)
 				}
-				if c.CommandHeader().ID.IsZero() {
+				if c.CommandHeader().CommandID.IsZero() {
 					t.Error("Header.ID is zero, want a fresh non-zero id")
 				}
 			},
 		},
 		{
 			name: "Deny",
-			call: func(s *Sesssion) error { return s.Deny(context.Background(), callID) },
+			call: func(s *Session) error { return s.Deny(context.Background(), s.primaryLoopID, callID) },
 			verify: func(t *testing.T, cmd command.Command) {
 				c, ok := cmd.(command.DenyToolCall)
 				if !ok {
 					t.Fatalf("sent %T, want command.DenyToolCall", cmd)
 				}
-				if c.CallID != callID {
-					t.Errorf("CallID = %v, want %v", c.CallID, callID)
+				if c.ToolExecutionID != callID {
+					t.Errorf("ToolExecutionID = %v, want %v", c.ToolExecutionID, callID)
 				}
-				if c.CommandHeader().ID.IsZero() {
+				if c.CommandHeader().CommandID.IsZero() {
 					t.Error("Header.ID is zero, want a fresh non-zero id")
 				}
 			},
 		},
 		{
 			name: "ProvideUserInput",
-			call: func(s *Sesssion) error { return s.ProvideUserInput(context.Background(), callID, "the answer") },
+			call: func(s *Session) error {
+				return s.ProvideUserInput(context.Background(), s.primaryLoopID, callID, "the answer")
+			},
 			verify: func(t *testing.T, cmd command.Command) {
 				c, ok := cmd.(command.ProvideUserInput)
 				if !ok {
 					t.Fatalf("sent %T, want command.ProvideUserInput", cmd)
 				}
-				if c.CallID != callID {
-					t.Errorf("CallID = %v, want %v", c.CallID, callID)
+				if c.ToolExecutionID != callID {
+					t.Errorf("ToolExecutionID = %v, want %v", c.ToolExecutionID, callID)
 				}
 				if c.Answer != "the answer" {
 					t.Errorf("Answer = %q, want %q", c.Answer, "the answer")
 				}
-				if c.CommandHeader().ID.IsZero() {
+				if c.CommandHeader().CommandID.IsZero() {
 					t.Error("Header.ID is zero, want a fresh non-zero id")
 				}
 			},
@@ -1263,11 +1269,13 @@ func TestGateCommandsFreshHeaderIDPerCall(t *testing.T) {
 	callID := mustUUID()
 	tests := []struct {
 		name string
-		call func(s *Sesssion) error
+		call func(s *Session) error
 	}{
-		{name: "Approve", call: func(s *Sesssion) error { return s.Approve(context.Background(), callID, tool.ScopeOnce) }},
-		{name: "Deny", call: func(s *Sesssion) error { return s.Deny(context.Background(), callID) }},
-		{name: "ProvideUserInput", call: func(s *Sesssion) error { return s.ProvideUserInput(context.Background(), callID, "x") }},
+		{name: "Approve", call: func(s *Session) error {
+			return s.Approve(context.Background(), s.primaryLoopID, callID, tool.ScopeOnce)
+		}},
+		{name: "Deny", call: func(s *Session) error { return s.Deny(context.Background(), s.primaryLoopID, callID) }},
+		{name: "ProvideUserInput", call: func(s *Session) error { return s.ProvideUserInput(context.Background(), s.primaryLoopID, callID, "x") }},
 	}
 	for _, tt := range tests {
 		tt := tt
@@ -1281,7 +1289,7 @@ func TestGateCommandsFreshHeaderIDPerCall(t *testing.T) {
 				go func() { errCh <- tt.call(s) }()
 				select {
 				case cmd := <-cmds:
-					ids = append(ids, cmd.CommandHeader().ID)
+					ids = append(ids, cmd.CommandHeader().CommandID)
 				case <-time.After(2 * time.Second):
 					t.Fatal("method never sent a command")
 				}
@@ -1304,11 +1312,15 @@ func TestGateCommandsCtxCancelled(t *testing.T) {
 	callID := mustUUID()
 	tests := []struct {
 		name string
-		call func(s *Sesssion, ctx context.Context) error
+		call func(s *Session, ctx context.Context) error
 	}{
-		{name: "Approve", call: func(s *Sesssion, ctx context.Context) error { return s.Approve(ctx, callID, tool.ScopeOnce) }},
-		{name: "Deny", call: func(s *Sesssion, ctx context.Context) error { return s.Deny(ctx, callID) }},
-		{name: "ProvideUserInput", call: func(s *Sesssion, ctx context.Context) error { return s.ProvideUserInput(ctx, callID, "x") }},
+		{name: "Approve", call: func(s *Session, ctx context.Context) error {
+			return s.Approve(ctx, s.primaryLoopID, callID, tool.ScopeOnce)
+		}},
+		{name: "Deny", call: func(s *Session, ctx context.Context) error { return s.Deny(ctx, s.primaryLoopID, callID) }},
+		{name: "ProvideUserInput", call: func(s *Session, ctx context.Context) error {
+			return s.ProvideUserInput(ctx, s.primaryLoopID, callID, "x")
+		}},
 	}
 	for _, tt := range tests {
 		tt := tt
@@ -1342,11 +1354,13 @@ func TestGateCommandsLoopExited(t *testing.T) {
 	callID := mustUUID()
 	tests := []struct {
 		name string
-		call func(s *Sesssion) error
+		call func(s *Session) error
 	}{
-		{name: "Approve", call: func(s *Sesssion) error { return s.Approve(context.Background(), callID, tool.ScopeOnce) }},
-		{name: "Deny", call: func(s *Sesssion) error { return s.Deny(context.Background(), callID) }},
-		{name: "ProvideUserInput", call: func(s *Sesssion) error { return s.ProvideUserInput(context.Background(), callID, "x") }},
+		{name: "Approve", call: func(s *Session) error {
+			return s.Approve(context.Background(), s.primaryLoopID, callID, tool.ScopeOnce)
+		}},
+		{name: "Deny", call: func(s *Session) error { return s.Deny(context.Background(), s.primaryLoopID, callID) }},
+		{name: "ProvideUserInput", call: func(s *Session) error { return s.ProvideUserInput(context.Background(), s.primaryLoopID, callID, "x") }},
 	}
 	for _, tt := range tests {
 		tt := tt
@@ -1379,11 +1393,13 @@ func TestGateCommandsIDGenerationFailure(t *testing.T) {
 	callID := mustUUID()
 	tests := []struct {
 		name string
-		call func(s *Sesssion) error
+		call func(s *Session) error
 	}{
-		{name: "Approve", call: func(s *Sesssion) error { return s.Approve(context.Background(), callID, tool.ScopeOnce) }},
-		{name: "Deny", call: func(s *Sesssion) error { return s.Deny(context.Background(), callID) }},
-		{name: "ProvideUserInput", call: func(s *Sesssion) error { return s.ProvideUserInput(context.Background(), callID, "x") }},
+		{name: "Approve", call: func(s *Session) error {
+			return s.Approve(context.Background(), s.primaryLoopID, callID, tool.ScopeOnce)
+		}},
+		{name: "Deny", call: func(s *Session) error { return s.Deny(context.Background(), s.primaryLoopID, callID) }},
+		{name: "ProvideUserInput", call: func(s *Session) error { return s.ProvideUserInput(context.Background(), s.primaryLoopID, callID, "x") }},
 	}
 	for _, tt := range tests {
 		tt := tt
@@ -1408,5 +1424,258 @@ func TestGateCommandsIDGenerationFailure(t *testing.T) {
 				t.Fatal("method blocked on id-generation failure (should fail before send)")
 			}
 		})
+	}
+}
+
+// sessionWithTwoFakeLoops builds a Session wired to TWO fake loops (A and B), each
+// keyed by its own loop id in the registry. A is the primary loop. The test reads
+// each loop's unbuffered Commands channel directly to observe exactly which loop a
+// gate reply was dispatched to — the seam for the multi-loop routing guarantee.
+func sessionWithTwoFakeLoops() (s *Session, loopA, loopB uuid.UUID, cmdsA, cmdsB chan command.Command) {
+	cmdsA = make(chan command.Command)
+	cmdsB = make(chan command.Command)
+	doneA := make(chan struct{})
+	doneB := make(chan struct{})
+	sessionCtx, sessionCancel := context.WithCancel(context.Background())
+	loopA = mustUUID()
+	loopB = mustUUID()
+	s = &Session{
+		SessionID:     mustUUID(),
+		sessionCtx:    sessionCtx,
+		sessionCancel: sessionCancel,
+		loops: map[uuid.UUID]*loopHandle{
+			loopA: {loop: &loop.Loop{Commands: cmdsA, Done: doneA}},
+			loopB: {loop: &loop.Loop{Commands: cmdsB, Done: doneB}},
+		},
+		primaryLoopID: loopA,
+		newID:         uuid.New,
+	}
+	return s, loopA, loopB, cmdsA, cmdsB
+}
+
+// TestGateReplyRoutesToTargetLoopNeverSibling is the point of Task 13: a gate reply
+// addressed to loop A is dispatched to loop A's command channel and NEVER reaches
+// loop B. The session dispatches by GateRoute.LoopID; the command carries both
+// Coordinates.LoopID (the dispatch target) and ToolExecutionID (the uuid match
+// key). Matching is by ToolExecutionID — a uuid, never the provider's ToolUseID
+// (a string), which is structurally impossible to confuse here because the field
+// is typed uuid.UUID.
+func TestGateReplyRoutesToTargetLoopNeverSibling(t *testing.T) {
+	t.Parallel()
+	callID := mustUUID()
+	tests := []struct {
+		name   string
+		call   func(s *Session, loopID uuid.UUID) error
+		verify func(t *testing.T, cmd command.Command, wantLoop uuid.UUID)
+	}{
+		{
+			name: "Approve",
+			call: func(s *Session, loopID uuid.UUID) error {
+				return s.Approve(context.Background(), loopID, callID, tool.ScopeSession)
+			},
+			verify: func(t *testing.T, cmd command.Command, wantLoop uuid.UUID) {
+				c, ok := cmd.(command.ApproveToolCall)
+				if !ok {
+					t.Fatalf("sent %T, want command.ApproveToolCall", cmd)
+				}
+				if c.GateRoute.LoopID != wantLoop {
+					t.Errorf("GateRoute.LoopID = %v, want %v", c.GateRoute.LoopID, wantLoop)
+				}
+				if c.GateRoute.ToolExecutionID != callID {
+					t.Errorf("GateRoute.ToolExecutionID = %v, want %v", c.GateRoute.ToolExecutionID, callID)
+				}
+				if c.Scope != tool.ScopeSession {
+					t.Errorf("Scope = %v, want %v", c.Scope, tool.ScopeSession)
+				}
+			},
+		},
+		{
+			name: "Deny",
+			call: func(s *Session, loopID uuid.UUID) error {
+				return s.Deny(context.Background(), loopID, callID)
+			},
+			verify: func(t *testing.T, cmd command.Command, wantLoop uuid.UUID) {
+				c, ok := cmd.(command.DenyToolCall)
+				if !ok {
+					t.Fatalf("sent %T, want command.DenyToolCall", cmd)
+				}
+				if c.GateRoute.LoopID != wantLoop {
+					t.Errorf("GateRoute.LoopID = %v, want %v", c.GateRoute.LoopID, wantLoop)
+				}
+				if c.GateRoute.ToolExecutionID != callID {
+					t.Errorf("GateRoute.ToolExecutionID = %v, want %v", c.GateRoute.ToolExecutionID, callID)
+				}
+			},
+		},
+		{
+			name: "ProvideUserInput",
+			call: func(s *Session, loopID uuid.UUID) error {
+				return s.ProvideUserInput(context.Background(), loopID, callID, "the answer")
+			},
+			verify: func(t *testing.T, cmd command.Command, wantLoop uuid.UUID) {
+				c, ok := cmd.(command.ProvideUserInput)
+				if !ok {
+					t.Fatalf("sent %T, want command.ProvideUserInput", cmd)
+				}
+				if c.GateRoute.LoopID != wantLoop {
+					t.Errorf("GateRoute.LoopID = %v, want %v", c.GateRoute.LoopID, wantLoop)
+				}
+				if c.GateRoute.ToolExecutionID != callID {
+					t.Errorf("GateRoute.ToolExecutionID = %v, want %v", c.GateRoute.ToolExecutionID, callID)
+				}
+				if c.Answer != "the answer" {
+					t.Errorf("Answer = %q, want %q", c.Answer, "the answer")
+				}
+			},
+		},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			s, loopA, _, cmdsA, cmdsB := sessionWithTwoFakeLoops()
+
+			errCh := make(chan error, 1)
+			// Address the reply to the NON-primary loop B... actually address loop A
+			// (the primary) here and assert B never sees it; the sibling-isolation
+			// guarantee is symmetric. We target A explicitly to prove dispatch keys
+			// on the supplied loop id, not on "primary by default".
+			go func() { errCh <- tt.call(s, loopA) }()
+
+			// The reply must arrive on loop A's channel. Loop B's channel is read
+			// non-blockingly throughout to prove a stray dispatch never lands there.
+			select {
+			case cmd := <-cmdsA:
+				tt.verify(t, cmd, loopA)
+			case cmd := <-cmdsB:
+				t.Fatalf("gate reply for loop A was delivered to sibling loop B: %T", cmd)
+			case <-time.After(2 * time.Second):
+				t.Fatal("gate reply never reached the target loop")
+			}
+
+			if err := <-errCh; err != nil {
+				t.Fatalf("method returned %v, want nil", err)
+			}
+
+			// Loop B must never receive anything.
+			select {
+			case cmd := <-cmdsB:
+				t.Fatalf("sibling loop B received a stray command: %T", cmd)
+			default:
+			}
+		})
+	}
+}
+
+// TestGateReplyToNonPrimaryLoop proves dispatch follows the supplied loop id even
+// when it is NOT the primary: a reply addressed to loop B reaches B (not the
+// primary A). This is the latent multi-loop bug Task 13 fixes — today every gate
+// reply routes to the primary loop regardless of which loop opened the gate.
+func TestGateReplyToNonPrimaryLoop(t *testing.T) {
+	t.Parallel()
+	callID := mustUUID()
+	s, _, loopB, cmdsA, cmdsB := sessionWithTwoFakeLoops()
+
+	errCh := make(chan error, 1)
+	go func() { errCh <- s.Approve(context.Background(), loopB, callID, tool.ScopeOnce) }()
+
+	select {
+	case cmd := <-cmdsB:
+		c, ok := cmd.(command.ApproveToolCall)
+		if !ok {
+			t.Fatalf("sent %T, want command.ApproveToolCall", cmd)
+		}
+		if c.GateRoute.LoopID != loopB {
+			t.Errorf("GateRoute.LoopID = %v, want %v (loop B)", c.GateRoute.LoopID, loopB)
+		}
+	case cmd := <-cmdsA:
+		t.Fatalf("gate reply for loop B was misrouted to the primary loop A: %T", cmd)
+	case <-time.After(2 * time.Second):
+		t.Fatal("gate reply never reached loop B")
+	}
+	if err := <-errCh; err != nil {
+		t.Fatalf("Approve returned %v, want nil", err)
+	}
+}
+
+// TestGateReplyUnknownLoopFailsSecure: a gate reply addressed to a loop id that is
+// NOT in the registry must fail secure with *SessionError{SessionLoopNotFound} and
+// send no command — an unroutable approval must never silently fall through to the
+// primary loop (which would approve a tool call the user meant for a dead/unknown
+// loop).
+func TestGateReplyUnknownLoopFailsSecure(t *testing.T) {
+	t.Parallel()
+	callID := mustUUID()
+	unknown := mustUUID()
+	tests := []struct {
+		name string
+		call func(s *Session) error
+	}{
+		{name: "Approve", call: func(s *Session) error { return s.Approve(context.Background(), unknown, callID, tool.ScopeOnce) }},
+		{name: "Deny", call: func(s *Session) error { return s.Deny(context.Background(), unknown, callID) }},
+		{name: "ProvideUserInput", call: func(s *Session) error { return s.ProvideUserInput(context.Background(), unknown, callID, "x") }},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			s, _, _, cmdsA, cmdsB := sessionWithTwoFakeLoops() // neither channel is read
+
+			errCh := make(chan error, 1)
+			go func() { errCh <- tt.call(s) }()
+
+			select {
+			case err := <-errCh:
+				var se *SessionError
+				if !errors.As(err, &se) || se.Kind != SessionLoopNotFound {
+					t.Fatalf("err = %v, want *SessionError{SessionLoopNotFound}", err)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("method blocked on an unknown loop id (no fail-secure short-circuit)")
+			}
+
+			// No command may have been sent to ANY loop.
+			select {
+			case cmd := <-cmdsA:
+				t.Fatalf("unknown-loop reply leaked a command to loop A: %T", cmd)
+			case cmd := <-cmdsB:
+				t.Fatalf("unknown-loop reply leaked a command to loop B: %T", cmd)
+			default:
+			}
+		})
+	}
+}
+
+// TestGateReplyZeroLoopFallsBackToPrimary: a gate reply with a ZERO loop id (an
+// "unspecified at this granularity" route — e.g. a single-loop caller that does
+// not stamp a LoopID) falls back to the primary loop, preserving today's
+// single-loop behavior. A zero route is unspecified, not a hard misroute, so it is
+// safe to default to the only loop a single-loop session has.
+func TestGateReplyZeroLoopFallsBackToPrimary(t *testing.T) {
+	t.Parallel()
+	callID := mustUUID()
+	s, loopA, _, cmdsA, cmdsB := sessionWithTwoFakeLoops()
+
+	errCh := make(chan error, 1)
+	go func() { errCh <- s.Approve(context.Background(), uuid.UUID{}, callID, tool.ScopeOnce) }()
+
+	select {
+	case cmd := <-cmdsA: // primary loop
+		c, ok := cmd.(command.ApproveToolCall)
+		if !ok {
+			t.Fatalf("sent %T, want command.ApproveToolCall", cmd)
+		}
+		// The stamped LoopID is the resolved primary loop, not zero: the route is
+		// concretized to the loop the session actually dispatched to.
+		if c.GateRoute.LoopID != loopA {
+			t.Errorf("GateRoute.LoopID = %v, want primary %v", c.GateRoute.LoopID, loopA)
+		}
+	case cmd := <-cmdsB:
+		t.Fatalf("zero-loop reply went to sibling loop B instead of the primary: %T", cmd)
+	case <-time.After(2 * time.Second):
+		t.Fatal("zero-loop reply never reached the primary loop")
+	}
+	if err := <-errCh; err != nil {
+		t.Fatalf("Approve returned %v, want nil", err)
 	}
 }

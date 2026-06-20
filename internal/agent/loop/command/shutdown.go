@@ -11,7 +11,7 @@ const (
 // Ack is required and must be non-nil.
 type Shutdown struct {
 	Header
-	Ack chan<- error
+	Ack chan<- error `json:"-"` // live reply channel; no JSON representation
 }
 
 func (Shutdown) isCommand() {}

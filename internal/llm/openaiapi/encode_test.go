@@ -367,8 +367,12 @@ func TestEncodeRequest_ToolResultErrorReachesModel(t *testing.T) {
 		wantContent string
 	}{
 		{
-			name:        "error result: IsError true, error text reaches model",
-			msg:         func() *content.ToolResultMessage { m := toolMsg("call-err", textBlock("tool error: boom")); m.IsError = true; return m }(),
+			name: "error result: IsError true, error text reaches model",
+			msg: func() *content.ToolResultMessage {
+				m := toolMsg("call-err", textBlock("tool error: boom"))
+				m.IsError = true
+				return m
+			}(),
 			wantContent: "tool error: boom",
 		},
 		{

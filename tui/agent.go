@@ -23,7 +23,7 @@ type EventStream = event.Subscription
 type Agent interface {
 	StreamBlocks(ctx context.Context, blocks []content.Block) (*llm.StreamReader[event.Event], error)
 	// Submit sends input fire-and-forget as a queueable UserInput; the returned
-	// InputID correlates the Reply events (CausationID) that report the outcome.
+	// InputID correlates the Reply events (Cause.CommandID) that report the outcome.
 	Submit(ctx context.Context, blocks []content.Block) (uuid.UUID, error)
 	// PrimaryLoopID is the loop whose live Ephemeral stream the TUI watches; used to
 	// build the DefaultEventFilter for the session subscription.
@@ -45,16 +45,20 @@ type Agent interface {
 	Subscribe(filter event.EventFilter) (EventStream, error)
 
 	// Approve resolves a pending tool-call permission gate, granting it at the
-	// chosen persistence scope. callID identifies the gate (carried on the
-	// PermissionRequested event). The agent wrapper delegates to its session.
-	Approve(ctx context.Context, callID uuid.UUID, scope tool.ApprovalScope) error
+	// chosen persistence scope. loopID is the loop that opened the gate (the
+	// PermissionRequested event's Header.LoopID) so the reply is dispatched to the
+	// right loop in a multi-loop session; callID identifies the gate. The agent
+	// wrapper delegates to its session.
+	Approve(ctx context.Context, loopID, callID uuid.UUID, scope tool.ApprovalScope) error
 	// Deny resolves a pending tool-call permission gate by failing it closed
-	// (fail-secure); nothing is persisted. The wrapper delegates to its session.
-	Deny(ctx context.Context, callID uuid.UUID) error
+	// (fail-secure); nothing is persisted. loopID names the gate-opening loop so the
+	// reply reaches the right loop. The wrapper delegates to its session.
+	Deny(ctx context.Context, loopID, callID uuid.UUID) error
 	// ProvideAnswer supplies the user's reply to a pending AskUser request
-	// identified by callID. It is the TUI-facing name for the session's
-	// ProvideUserInput; the wrapper delegates to it.
-	ProvideAnswer(ctx context.Context, callID uuid.UUID, answer string) error
+	// identified by callID. loopID names the gate-opening loop so the answer reaches
+	// the right loop. It is the TUI-facing name for the session's ProvideUserInput;
+	// the wrapper delegates to it.
+	ProvideAnswer(ctx context.Context, loopID, callID uuid.UUID, answer string) error
 }
 
 // DefaultEventFilter is the single-loop TUI's declared interest for a session

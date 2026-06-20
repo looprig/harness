@@ -48,8 +48,8 @@ func TestSSEReader_Next(t *testing.T) {
 		wantErr  error
 	}{
 		{
-			name: "happy path two data lines then DONE",
-			body: "data: {\"a\":1}\n\ndata: {\"b\":2}\n\ndata: [DONE]\n\n",
+			name:     "happy path two data lines then DONE",
+			body:     "data: {\"a\":1}\n\ndata: {\"b\":2}\n\ndata: [DONE]\n\n",
 			wantData: []string{`{"a":1}`, `{"b":2}`},
 			wantErr:  io.EOF,
 		},

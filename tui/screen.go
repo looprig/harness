@@ -23,7 +23,7 @@ import (
 // every turn and loop and never EOFs per turn. Submissions are fire-and-forget
 // (submitCmd → agent.Submit); the LOOP owns queueing, so Screen keeps no queue.
 // User rows are EVENT-DRIVEN: the authoritative user row commits from the loop's
-// TurnStarted/TurnFoldedInto Message (genuine input only — TriggeredByLoopID == 0),
+// TurnStarted/TurnFoldedInto Message (genuine input only — Cause.LoopID == 0),
 // never optimistically at submit; a successful submit only records the queued
 // affordance (RecordSubmit), shown once InputQueued arrives. The loop's
 // TurnStarted/TurnDone/TurnFailed/TurnInterrupted terminals on the subscription
@@ -493,13 +493,13 @@ func (m *Screen) mapAction(a uiAction) tea.Cmd {
 		// Record the decision so the call's committed card reads "Approved …". The loop
 		// emits no decision event, so the keypress is the only source (the gate was
 		// remembered by the transcript on PermissionRequested).
-		m.transcript = m.transcript.ResolveGate(a.CallID, gateApproved)
-		return approveCmd(m.appCtx, m.agent, a.CallID, a.Scope)
+		m.transcript = m.transcript.ResolveGate(a.ToolExecutionID, gateApproved)
+		return approveCmd(m.appCtx, m.agent, a.LoopID, a.ToolExecutionID, a.Scope)
 	case uiDeny:
-		m.transcript = m.transcript.ResolveGate(a.CallID, gateDenied)
-		return denyCmd(m.appCtx, m.agent, a.CallID)
+		m.transcript = m.transcript.ResolveGate(a.ToolExecutionID, gateDenied)
+		return denyCmd(m.appCtx, m.agent, a.LoopID, a.ToolExecutionID)
 	case uiAnswer:
-		return provideAnswerCmd(m.appCtx, m.agent, a.CallID, a.Text)
+		return provideAnswerCmd(m.appCtx, m.agent, a.LoopID, a.ToolExecutionID, a.Text)
 	case uiInterrupt:
 		return m.interruptRunning()
 	default: // uiNoop

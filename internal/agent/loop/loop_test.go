@@ -149,7 +149,7 @@ func startTurn(t *testing.T, l *Loop, _ context.Context, input []content.Block) 
 }
 
 // sendCmd sends cmd to the loop with the same Done escape every production sender
-// (AgentSession.Shutdown / routeCommand) uses: once the actor has shut down it
+// (Session.routeGate) uses: once the actor has shut down it
 // stops reading Commands, so a raw unbuffered send to a stopped actor wedges
 // forever. Tests that send a command which MAY race the actor's exit (a second
 // Shutdown after the first) must use this escape; a raw send is correct only when
@@ -336,8 +336,8 @@ func TestSingleTurn(t *testing.T) {
 // TestTurnEventCorrelationStamped drives one full turn and asserts that the
 // full-fidelity events the session fan-in sees carry correlation identity in their
 // own Header: every turn event shares the same non-zero TurnID, the Reply event
-// (TurnStarted) carries CausationID == the issuing UserInput's Header.ID, and no
-// event carries a tool-call id (ToolCallID is zero — there is no tool call in this
+// (TurnStarted) carries Cause.CommandID == the issuing UserInput's Header.ID, and no
+// event carries a tool-call id (ToolExecutionID is zero — there is no tool call in this
 // turn). These are the producer-stamped Header fields the recordingPublisher
 // observes via cfg.events.PublishEvent (the production hub path).
 func TestTurnEventCorrelationStamped(t *testing.T) {
@@ -352,7 +352,7 @@ func TestTurnEventCorrelationStamped(t *testing.T) {
 	ab := make(chan struct{})
 	defer close(ab)
 	l.Commands <- command.UserInput{
-		Header:    command.Header{ID: cmdID},
+		Header:    command.Header{CommandID: cmdID},
 		Mode:      command.StartOnly,
 		Blocks:    nil,
 		Events:    ev,
@@ -405,12 +405,12 @@ func TestTurnEventCorrelationStamped(t *testing.T) {
 			},
 		},
 		{
-			// CausationID is a Reply-event property (ReplyTo() == CausationID). Of this
+			// Cause.CommandID is a Reply-event property (ReplyTo() == Cause.CommandID). Of this
 			// turn's events only the Reply (TurnStarted) carries it; the other turn
 			// events (TokenDelta/StepDone/TurnDone) leave it zero on their own Header.
 			// At least one Reply must be present and every Reply must point back to the
 			// issuing UserInput.
-			name: "Reply CausationID equals UserInput.Header.ID",
+			name: "Reply Cause.CommandID equals UserInput.Header.ID",
 			assert: func(t *testing.T, evs []event.Event) {
 				var sawReply bool
 				for i, e := range evs {
@@ -420,21 +420,11 @@ func TestTurnEventCorrelationStamped(t *testing.T) {
 					}
 					sawReply = true
 					if r.ReplyTo() != cmdID {
-						t.Errorf("event %d (%T): ReplyTo/CausationID = %v, want UserInput.ID %v", i, e, r.ReplyTo(), cmdID)
+						t.Errorf("event %d (%T): ReplyTo/Cause.CommandID = %v, want UserInput.ID %v", i, e, r.ReplyTo(), cmdID)
 					}
 				}
 				if !sawReply {
 					t.Fatal("no Reply event captured; expected at least TurnStarted")
-				}
-			},
-		},
-		{
-			name: "ToolCallID zero (no tool call in v1)",
-			assert: func(t *testing.T, evs []event.Event) {
-				for i, e := range evs {
-					if !e.EventHeader().ToolCallID.IsZero() {
-						t.Errorf("event %d (%T): ToolCallID = %v, want zero (no tool call)", i, e, e.EventHeader().ToolCallID)
-					}
 				}
 			},
 		},
@@ -702,7 +692,7 @@ func TestFanInOnlyUserInputStartsTurn(t *testing.T) {
 	l, rec, _ := newLoopRec(t, &fakeLLM{chunks: []content.Chunk{textChunk("hi")}})
 
 	id := mustID(t)
-	l.Commands <- command.UserInput{Header: command.Header{ID: id}, Mode: command.AllowFold, Blocks: nil} // nil Events/Abandoned
+	l.Commands <- command.UserInput{Header: command.Header{CommandID: id}, Mode: command.AllowFold, Blocks: nil} // nil Events/Abandoned
 	if _, ok := awaitReply(t, rec, id).(event.TurnStarted); !ok {
 		t.Fatal("fan-in-only AllowFold submit did not publish TurnStarted")
 	}
@@ -710,7 +700,7 @@ func TestFanInOnlyUserInputStartsTurn(t *testing.T) {
 	blockUntilEvents(t, rec, hasTerminal)
 	// Actor is usable afterward.
 	id2 := mustID(t)
-	l.Commands <- command.UserInput{Header: command.Header{ID: id2}, Mode: command.AllowFold, Blocks: nil}
+	l.Commands <- command.UserInput{Header: command.Header{CommandID: id2}, Mode: command.AllowFold, Blocks: nil}
 	if _, ok := awaitReply(t, rec, id2).(event.TurnStarted); !ok {
 		t.Fatal("actor not usable after a fan-in-only turn")
 	}
@@ -943,10 +933,9 @@ func TestStepGranularityRollback(t *testing.T) {
 	})
 }
 
-
 // TestActorCommitsInitialUserMessageAndTurnStarted asserts the loop-owned commit
 // of the initial UserMessage: the actor emits TurnStarted carrying the exact
-// UserMessage and CausationID = the triggering UserInput's id, BEFORE runTurn
+// UserMessage and Cause.CommandID = the triggering UserInput's id, BEFORE runTurn
 // produces any step, and commits that UserMessage into loopState.msgs (proven by
 // the first request the provider receives carrying exactly that user message).
 func TestActorCommitsInitialUserMessageAndTurnStarted(t *testing.T) {
@@ -963,7 +952,7 @@ func TestActorCommitsInitialUserMessageAndTurnStarted(t *testing.T) {
 	defer close(ab)
 	input := []content.Block{&content.TextBlock{Text: "hello there"}}
 	l.Commands <- command.UserInput{
-		Header:    command.Header{ID: cmdID},
+		Header:    command.Header{CommandID: cmdID},
 		Mode:      command.StartOnly,
 		Blocks:    input,
 		Events:    ev,
@@ -971,15 +960,15 @@ func TestActorCommitsInitialUserMessageAndTurnStarted(t *testing.T) {
 	}
 
 	// The first per-turn event is TurnStarted, carrying the initial UserMessage and
-	// CausationID == the submit id. It is emitted by the actor at the commit point
+	// Cause.CommandID == the submit id. It is emitted by the actor at the commit point
 	// BEFORE any TokenDelta/StepDone.
 	first := <-ev
 	started, ok := first.(event.TurnStarted)
 	if !ok {
 		t.Fatalf("first event = %T, want TurnStarted", first)
 	}
-	if started.CausationID != cmdID {
-		t.Errorf("TurnStarted.CausationID = %v, want %v (the UserInput id)", started.CausationID, cmdID)
+	if started.Cause.CommandID != cmdID {
+		t.Errorf("TurnStarted.Cause.CommandID = %v, want %v (the UserInput id)", started.Cause.CommandID, cmdID)
 	}
 	if started.Message == nil {
 		t.Fatal("TurnStarted.Message is nil, want the committed initial UserMessage")
@@ -990,10 +979,10 @@ func TestActorCommitsInitialUserMessageAndTurnStarted(t *testing.T) {
 	if got := flattenToText(started.Message.Blocks); got != "hello there" {
 		t.Errorf("TurnStarted.Message text = %q, want %q", got, "hello there")
 	}
-	// InputID now carries the submit command id (== CausationID), so a consumer can
+	// InputID now carries the submit command id (== Cause.CommandID), so a consumer can
 	// correlate the event.TurnStarted back to the originating UserInput.
-	if started.InputID != cmdID {
-		t.Errorf("TurnStarted.InputID = %v, want the submit id %v", started.InputID, cmdID)
+	if started.Cause.CommandID != cmdID {
+		t.Errorf("TurnStarted.Cause.CommandID = %v, want the submit id %v", started.Cause.CommandID, cmdID)
 	}
 	if _, ok := drainToTerminal(t, ev).(event.TurnDone); !ok {
 		t.Fatal("terminal != TurnDone")

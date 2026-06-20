@@ -112,33 +112,36 @@ func interruptTurn(ctx context.Context, agent Agent) tea.Cmd {
 type promptResultMsg struct{ err error }
 
 // approveCmd issues a bounded Approve for a pending permission gate and reports the
-// result, so Update never blocks on the session resolving the gate. callID
-// identifies the gate; scope is the chosen persistence breadth.
-func approveCmd(ctx context.Context, agent Agent, callID uuid.UUID, scope tool.ApprovalScope) tea.Cmd {
+// result, so Update never blocks on the session resolving the gate. loopID is the
+// gate-opening loop (so the reply is dispatched there); callID identifies the gate;
+// scope is the chosen persistence breadth.
+func approveCmd(ctx context.Context, agent Agent, loopID, callID uuid.UUID, scope tool.ApprovalScope) tea.Cmd {
 	return func() tea.Msg {
 		c, cancel := context.WithTimeout(ctx, promptDispatchTimeout)
 		defer cancel()
-		return promptResultMsg{err: agent.Approve(c, callID, scope)}
+		return promptResultMsg{err: agent.Approve(c, loopID, callID, scope)}
 	}
 }
 
 // denyCmd issues a bounded Deny (fail-secure) for a pending permission gate and
 // reports the result, so Update never blocks on the session failing it closed.
-func denyCmd(ctx context.Context, agent Agent, callID uuid.UUID) tea.Cmd {
+// loopID is the gate-opening loop so the reply is dispatched there.
+func denyCmd(ctx context.Context, agent Agent, loopID, callID uuid.UUID) tea.Cmd {
 	return func() tea.Msg {
 		c, cancel := context.WithTimeout(ctx, promptDispatchTimeout)
 		defer cancel()
-		return promptResultMsg{err: agent.Deny(c, callID)}
+		return promptResultMsg{err: agent.Deny(c, loopID, callID)}
 	}
 }
 
 // provideAnswerCmd issues a bounded ProvideAnswer for a pending AskUser request and
 // reports the result, so Update never blocks on the session consuming the answer.
-func provideAnswerCmd(ctx context.Context, agent Agent, callID uuid.UUID, answer string) tea.Cmd {
+// loopID is the gate-opening loop so the answer is dispatched there.
+func provideAnswerCmd(ctx context.Context, agent Agent, loopID, callID uuid.UUID, answer string) tea.Cmd {
 	return func() tea.Msg {
 		c, cancel := context.WithTimeout(ctx, promptDispatchTimeout)
 		defer cancel()
-		return promptResultMsg{err: agent.ProvideAnswer(c, callID, answer)}
+		return promptResultMsg{err: agent.ProvideAnswer(c, loopID, callID, answer)}
 	}
 }
 

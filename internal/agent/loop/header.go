@@ -8,11 +8,11 @@ import (
 // stampLoopHeader returns ev with its producer-identity Header completed from the
 // loop's identity for the session fan-in. It fills ONLY zero header fields (so an
 // event that already carries finer identity — TurnStarted/StepDone/TurnFoldedInto/
-// InputCancelled stamp SessionID/LoopID/TurnID/StepID/CausationID/TriggeredByLoopID at
-// their producers — is preserved exactly). Header-less events (TokenDelta, the turn
-// terminals, and gate/tool lifecycle events) get SessionID + LoopID + TurnID from the
-// loop and active turn here. ToolCallID is filled from the event's own CallID for gate/
-// tool events so a consumer can correlate without an envelope.
+// InputCancelled stamp SessionID/LoopID/TurnID/StepID and Cause at their producers —
+// is preserved exactly). Header-less events (TokenDelta, the turn terminals, and gate/
+// tool lifecycle events) get SessionID + LoopID + TurnID from the loop and active turn
+// here. Gate/tool events carry their tool id on their own body (e.ToolExecutionID), not the
+// header, so they need no extra header field.
 //
 // This is the LOOP stamping its own producer identity (the actor is the loop's
 // authoritative producer), NOT the hub inferring it — the fan-in never repairs
@@ -32,16 +32,16 @@ func stampLoopHeader(ev event.Event, sessionID, loopID, turnID uuid.UUID) event.
 		e.Header = fillTurnScoped(e.Header, sessionID, loopID, turnID)
 		return e
 	case event.PermissionRequested:
-		e.Header = fillToolScoped(e.Header, sessionID, loopID, turnID, e.CallID)
+		e.Header = fillTurnScoped(e.Header, sessionID, loopID, turnID)
 		return e
 	case event.UserInputRequested:
-		e.Header = fillToolScoped(e.Header, sessionID, loopID, turnID, e.CallID)
+		e.Header = fillTurnScoped(e.Header, sessionID, loopID, turnID)
 		return e
 	case event.ToolCallStarted:
-		e.Header = fillToolScoped(e.Header, sessionID, loopID, turnID, e.CallID)
+		e.Header = fillTurnScoped(e.Header, sessionID, loopID, turnID)
 		return e
 	case event.ToolCallCompleted:
-		e.Header = fillToolScoped(e.Header, sessionID, loopID, turnID, e.CallID)
+		e.Header = fillTurnScoped(e.Header, sessionID, loopID, turnID)
 		return e
 	case event.TurnStarted:
 		e.Header = fillLoopScoped(e.Header, sessionID, loopID)
@@ -57,13 +57,13 @@ func stampLoopHeader(ev event.Event, sessionID, loopID, turnID uuid.UUID) event.
 		return e
 	case event.InputQueued:
 		// Loop-scoped reply event: no turn exists yet (the input is only queued), so
-		// fill SessionID/LoopID and PRESERVE the producer-set CausationID == InputID.
+		// fill SessionID/LoopID and PRESERVE the producer-set Cause.CommandID == InputID.
 		e.Header = fillLoopScoped(e.Header, sessionID, loopID)
 		return e
 	case event.TurnRejected:
 		// Loop-scoped reply event: nothing started, so there is no turn — fill only
-		// SessionID/LoopID and PRESERVE CausationID == InputID (and TriggeredByLoopID
-		// for a rejected SubagentResult, were that ever possible).
+		// SessionID/LoopID and PRESERVE Cause.CommandID == InputID (and Cause.LoopID for
+		// a rejected SubagentResult, were that ever possible).
 		e.Header = fillLoopScoped(e.Header, sessionID, loopID)
 		return e
 	default:
@@ -75,7 +75,7 @@ func stampLoopHeader(ev event.Event, sessionID, loopID, turnID uuid.UUID) event.
 }
 
 // fillLoopScoped ensures SessionID + LoopID are present without disturbing the
-// already-stamped TurnID/StepID/CausationID/TriggeredByLoopID a producer set.
+// already-stamped TurnID/StepID/Cause a producer set.
 func fillLoopScoped(h event.Header, sessionID, loopID uuid.UUID) event.Header {
 	if h.SessionID.IsZero() {
 		h.SessionID = sessionID
@@ -86,22 +86,53 @@ func fillLoopScoped(h event.Header, sessionID, loopID uuid.UUID) event.Header {
 	return h
 }
 
+// stampStepID returns ev with Coordinates.StepID set to stepID for the four
+// tool/gate events ONLY (PermissionRequested/UserInputRequested/ToolCallStarted/
+// ToolCallCompleted). Those events are emitted by the runner with a header that
+// stampLoopHeader later completes from the loop/turn identity; stampLoopHeader's
+// fillTurnScoped fills only ZERO fields, so it never repairs StepID. Stamping it
+// here at emit time — where the active step's id is known — is what lets the
+// "ToolExecutionID requires StepID" invariant hold for these events.
+//
+// It stamps ONLY the four tool/gate events: any other event (TokenDelta, the turn
+// terminals, the submit-resolution events, …) is returned unchanged, so an event
+// that must keep StepID zero is never touched. StepID is set unconditionally on the
+// four (the runner emits them with a zero header), which is correct: the step is the
+// authoritative producer of its own tool/gate events.
+func stampStepID(ev event.Event, stepID uuid.UUID) event.Event {
+	switch e := ev.(type) {
+	case event.PermissionRequested:
+		e.StepID = stepID
+		return e
+	case event.UserInputRequested:
+		e.StepID = stepID
+		return e
+	case event.ToolCallStarted:
+		e.StepID = stepID
+		return e
+	case event.ToolCallCompleted:
+		e.StepID = stepID
+		return e
+	default:
+		return ev
+	}
+}
+
+// stepStampingEmit wraps an emit sink so every event it carries is first passed
+// through stampStepID(_, stepID): the four tool/gate events get this step's StepID,
+// every other event passes through untouched. runTurn builds it per step (around
+// RunBatch) so the runner — which has no step identity — emits StepID-stamped
+// tool/gate events without ever depending on the step.
+func stepStampingEmit(emit func(event.Event), stepID uuid.UUID) func(event.Event) {
+	return func(ev event.Event) { emit(stampStepID(ev, stepID)) }
+}
+
 // fillTurnScoped fills SessionID + LoopID + TurnID for a header-less turn-scoped
 // event (TokenDelta, terminals). Only zero fields are filled.
 func fillTurnScoped(h event.Header, sessionID, loopID, turnID uuid.UUID) event.Header {
 	h = fillLoopScoped(h, sessionID, loopID)
 	if h.TurnID.IsZero() {
 		h.TurnID = turnID
-	}
-	return h
-}
-
-// fillToolScoped fills SessionID + LoopID + TurnID + ToolCallID for a gate/tool
-// lifecycle event from the loop identity and the event's own CallID.
-func fillToolScoped(h event.Header, sessionID, loopID, turnID, callID uuid.UUID) event.Header {
-	h = fillTurnScoped(h, sessionID, loopID, turnID)
-	if h.ToolCallID.IsZero() {
-		h.ToolCallID = callID
 	}
 	return h
 }

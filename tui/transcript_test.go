@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/inventivepotter/urvi/internal/agent/loop/event"
+	"github.com/inventivepotter/urvi/internal/agent/loop/identity"
 	"github.com/inventivepotter/urvi/internal/content"
 	"github.com/inventivepotter/urvi/internal/tool"
 	"github.com/inventivepotter/urvi/internal/uuid"
@@ -47,12 +48,12 @@ func TestSplitLines(t *testing.T) {
 
 // toolStarted builds a real event.ToolCallStarted for the given call.
 func toolStarted(id uuid.UUID, name, summary string) event.Event {
-	return event.ToolCallStarted{CallID: id, ToolName: name, Summary: summary}
+	return event.ToolCallStarted{ToolExecutionID: id, ToolName: name, Summary: summary}
 }
 
 // toolCompleted builds a real event.ToolCallCompleted for the given call.
 func toolCompleted(id uuid.UUID, isErr bool, preview string) event.Event {
-	return event.ToolCallCompleted{CallID: id, IsError: isErr, ResultPreview: preview}
+	return event.ToolCallCompleted{ToolExecutionID: id, IsError: isErr, ResultPreview: preview}
 }
 
 // textChunk builds a real *content.TextChunk TokenDelta event carrying t.
@@ -239,8 +240,8 @@ func TestTranscriptApplyEvent(t *testing.T) {
 					t.Fatalf("entry Calls = %d, want 1", len(e.Calls))
 				}
 				c := e.Calls[0]
-				if c.CallID != callID(1) {
-					t.Errorf("CallID = %v, want %v", c.CallID, callID(1))
+				if c.ToolExecutionID != callID(1) {
+					t.Errorf("ToolExecutionID = %v, want %v", c.ToolExecutionID, callID(1))
 				}
 				// TurnDone is a normal completion: status preserved (NOT forced cancelled).
 				if c.Status != ToolRunning {
@@ -390,8 +391,8 @@ func TestTranscriptToolCalls(t *testing.T) {
 					t.Fatalf("live.Calls = %d, want 1", len(m.live.Calls))
 				}
 				c := m.live.Calls[0]
-				if c.CallID != callID(1) {
-					t.Errorf("CallID = %v, want %v", c.CallID, callID(1))
+				if c.ToolExecutionID != callID(1) {
+					t.Errorf("ToolExecutionID = %v, want %v", c.ToolExecutionID, callID(1))
 				}
 				if c.ToolName != "Bash" {
 					t.Errorf("ToolName = %q, want %q", c.ToolName, "Bash")
@@ -545,14 +546,14 @@ func TestTranscriptToolCalls(t *testing.T) {
 			},
 		},
 		{
-			name: "unknown completed CallID is a no-op (no commit, no panic)",
+			name: "unknown completed ToolExecutionID is a no-op (no commit, no panic)",
 			events: []event.Event{
 				event.TurnStarted{},
 				toolCompleted(callID(9), false, "orphan"),
 			},
 			want: func(t *testing.T, m transcriptModel) {
 				if len(m.committed) != 0 {
-					t.Errorf("committed = %d, want 0 (unknown CallID is a no-op)", len(m.committed))
+					t.Errorf("committed = %d, want 0 (unknown ToolExecutionID is a no-op)", len(m.committed))
 				}
 				if len(m.live.Calls) != 0 {
 					t.Errorf("live.Calls = %d, want 0", len(m.live.Calls))
@@ -1046,8 +1047,8 @@ func TestTranscriptGatePrompts(t *testing.T) {
 				thinkingChunk("planning the command"),
 				textChunk("I'll run a command."),
 				event.PermissionRequested{
-					CallID:  callID(1),
-					Request: tool.BashRequest{Command: "rm -rf build"},
+					ToolExecutionID: callID(1),
+					Request:         tool.BashRequest{Command: "rm -rf build"},
 				},
 			},
 			want: func(t *testing.T, m transcriptModel) {
@@ -1071,9 +1072,9 @@ func TestTranscriptGatePrompts(t *testing.T) {
 				event.TurnStarted{},
 				textChunk("Need a decision."),
 				event.UserInputRequested{
-					CallID:   callID(4),
-					Question: "Which source?",
-					Choices:  []string{"alpha", "beta", "gamma"},
+					ToolExecutionID: callID(4),
+					Question:        "Which source?",
+					Choices:         []string{"alpha", "beta", "gamma"},
 				},
 			},
 			want: func(t *testing.T, m transcriptModel) {
@@ -1109,7 +1110,7 @@ func TestTranscriptGatePrompts(t *testing.T) {
 			name: "UserInputRequested with no choices records a free-text question",
 			events: []event.Event{
 				event.TurnStarted{},
-				event.UserInputRequested{CallID: callID(5), Question: "free answer?", Choices: nil},
+				event.UserInputRequested{ToolExecutionID: callID(5), Question: "free answer?", Choices: nil},
 			},
 			want: func(t *testing.T, m transcriptModel) {
 				if len(m.committed) != 1 {
@@ -1272,12 +1273,12 @@ func queuedTexts(m transcriptModel) []string {
 }
 
 // TestTranscriptUserRowFromTurnEvent locks the event-driven user row: a TurnStarted /
-// TurnFoldedInto with TriggeredByLoopID == 0 and a Message commits exactly ONE
-// kindUser row equal to the Message blocks; a SUBAGENT hand-back (TriggeredByLoopID
+// TurnFoldedInto with Cause.LoopID == 0 and a Message commits exactly ONE
+// kindUser row equal to the Message blocks; a SUBAGENT hand-back (Cause.LoopID
 // != 0) commits NO user row; a nil Message commits no row either.
 func TestTranscriptUserRowFromTurnEvent(t *testing.T) {
 	primary := callID(0)     // genuine user input: the zero (untriggered) loop id
-	subagent := callID(0xBB) // a non-zero TriggeredByLoopID => subagent hand-back
+	subagent := callID(0xBB) // a non-zero Cause.LoopID => subagent hand-back
 
 	tests := []struct {
 		name     string
@@ -1287,29 +1288,29 @@ func TestTranscriptUserRowFromTurnEvent(t *testing.T) {
 	}{
 		{
 			name:     "TurnStarted genuine user input commits one row",
-			event:    event.TurnStarted{Header: event.Header{TriggeredByLoopID: primary}, InputID: callID(1), Message: userMsg("hello")},
+			event:    event.TurnStarted{Header: event.Header{Cause: identity.Cause{CommandID: callID(1), Coordinates: identity.Coordinates{LoopID: primary}}}, Message: userMsg("hello")},
 			wantRows: 1,
 			wantText: "hello",
 		},
 		{
 			name:     "TurnFoldedInto genuine user input commits one row",
-			event:    event.TurnFoldedInto{Header: event.Header{TriggeredByLoopID: primary}, InputID: callID(1), Message: userMsg("folded")},
+			event:    event.TurnFoldedInto{Header: event.Header{Cause: identity.Cause{CommandID: callID(1), Coordinates: identity.Coordinates{LoopID: primary}}}, Message: userMsg("folded")},
 			wantRows: 1,
 			wantText: "folded",
 		},
 		{
 			name:     "TurnStarted subagent hand-back commits no row",
-			event:    event.TurnStarted{Header: event.Header{TriggeredByLoopID: subagent}, InputID: callID(1), Message: userMsg("handback")},
+			event:    event.TurnStarted{Header: event.Header{Cause: identity.Cause{CommandID: callID(1), Coordinates: identity.Coordinates{LoopID: subagent}}}, Message: userMsg("handback")},
 			wantRows: 0,
 		},
 		{
 			name:     "TurnFoldedInto subagent hand-back commits no row",
-			event:    event.TurnFoldedInto{Header: event.Header{TriggeredByLoopID: subagent}, InputID: callID(1), Message: userMsg("handback")},
+			event:    event.TurnFoldedInto{Header: event.Header{Cause: identity.Cause{CommandID: callID(1), Coordinates: identity.Coordinates{LoopID: subagent}}}, Message: userMsg("handback")},
 			wantRows: 0,
 		},
 		{
 			name:     "TurnStarted nil message commits no row",
-			event:    event.TurnStarted{Header: event.Header{TriggeredByLoopID: primary}, InputID: callID(1)},
+			event:    event.TurnStarted{Header: event.Header{Cause: identity.Cause{CommandID: callID(1), Coordinates: identity.Coordinates{LoopID: primary}}}},
 			wantRows: 0,
 		},
 	}
@@ -1334,10 +1335,10 @@ func TestTranscriptUserRowFromTurnEvent(t *testing.T) {
 
 // TestTranscriptUserRowRequiresPrimaryLoop locks the loop-scoping half of the
 // user-row decision: a TurnStarted / TurnFoldedInto whose Header.LoopID is NOT the
-// model's primaryLoopID commits NO kindUser row — even with TriggeredByLoopID == 0
+// model's primaryLoopID commits NO kindUser row — even with Cause.LoopID == 0
 // and a non-nil Message. This is the subagent-own-turn case: a subagent's INITIAL
 // task arrives at its loop as a command.UserInput, so its emitted TurnStarted has
-// TriggeredByLoopID == 0 and LoopID == <the subagent loop>; the DefaultEventFilter
+// Cause.LoopID == 0 and LoopID == <the subagent loop>; the DefaultEventFilter
 // delivers it (Enduring from All loops), so it reaches ApplyEvent — but it must NOT
 // become a human user row (§5/§6: subagent loops' own turns surface only via
 // StepDone). A turn whose LoopID == primaryLoopID still commits the row.
@@ -1352,22 +1353,22 @@ func TestTranscriptUserRowRequiresPrimaryLoop(t *testing.T) {
 	}{
 		{
 			name:     "TurnStarted on the PRIMARY loop commits a row",
-			event:    event.TurnStarted{Header: event.Header{LoopID: primary}, InputID: callID(1), Message: userMsg("genuine")},
+			event:    event.TurnStarted{Header: event.Header{Coordinates: identity.Coordinates{LoopID: primary}, Cause: identity.Cause{CommandID: callID(1)}}, Message: userMsg("genuine")},
 			wantRows: 1,
 		},
 		{
 			name:     "TurnFoldedInto on the PRIMARY loop commits a row",
-			event:    event.TurnFoldedInto{Header: event.Header{LoopID: primary}, InputID: callID(1), Message: userMsg("folded")},
+			event:    event.TurnFoldedInto{Header: event.Header{Coordinates: identity.Coordinates{LoopID: primary}, Cause: identity.Cause{CommandID: callID(1)}}, Message: userMsg("folded")},
 			wantRows: 1,
 		},
 		{
 			name:     "TurnStarted on a SUBAGENT loop commits no row (its own initial task)",
-			event:    event.TurnStarted{Header: event.Header{LoopID: subLoop}, InputID: callID(1), Message: userMsg("subagent task")},
+			event:    event.TurnStarted{Header: event.Header{Coordinates: identity.Coordinates{LoopID: subLoop}, Cause: identity.Cause{CommandID: callID(1)}}, Message: userMsg("subagent task")},
 			wantRows: 0,
 		},
 		{
 			name:     "TurnFoldedInto on a SUBAGENT loop commits no row",
-			event:    event.TurnFoldedInto{Header: event.Header{LoopID: subLoop}, InputID: callID(1), Message: userMsg("subagent fold")},
+			event:    event.TurnFoldedInto{Header: event.Header{Coordinates: identity.Coordinates{LoopID: subLoop}, Cause: identity.Cause{CommandID: callID(1)}}, Message: userMsg("subagent fold")},
 			wantRows: 0,
 		},
 	}
@@ -1400,12 +1401,12 @@ func TestTranscriptQueuedAffordance(t *testing.T) {
 		if got := queuedTexts(m); len(got) != 0 {
 			t.Fatalf("queued before InputQueued = %v, want none (not shown yet)", got)
 		}
-		m = m.ApplyEvent(event.InputQueued{InputID: id})
+		m = m.ApplyEvent(event.InputQueued{Header: event.Header{Cause: identity.Cause{CommandID: id}}})
 		if got := queuedTexts(m); len(got) != 1 || got[0] != "queued one" {
 			t.Fatalf("queued after InputQueued = %v, want [queued one]", got)
 		}
 		// TurnStarted promotes to one committed row and clears the affordance.
-		m = m.ApplyEvent(event.TurnStarted{InputID: id, Message: userMsg("queued one")})
+		m = m.ApplyEvent(event.TurnStarted{Header: event.Header{Cause: identity.Cause{CommandID: id}}, Message: userMsg("queued one")})
 		if got := kindUserCount(m); got != 1 {
 			t.Errorf("kindUser rows = %d, want exactly 1 (promoted once)", got)
 		}
@@ -1418,7 +1419,7 @@ func TestTranscriptQueuedAffordance(t *testing.T) {
 		t.Parallel()
 		var m transcriptModel
 		// InputQueued arrives first: a shown-but-blockless placeholder; render skips it.
-		m = m.ApplyEvent(event.InputQueued{InputID: id})
+		m = m.ApplyEvent(event.InputQueued{Header: event.Header{Cause: identity.Cause{CommandID: id}}})
 		if got := queuedTexts(m); len(got) != 0 {
 			t.Fatalf("queued with no blocks yet = %v, want none (blockless placeholder skipped)", got)
 		}
@@ -1439,11 +1440,11 @@ func TestTranscriptInputCancelled(t *testing.T) {
 
 	var m transcriptModel
 	m = m.RecordSubmit(id, userBlocks("cancel me"))
-	m = m.ApplyEvent(event.InputQueued{InputID: id})
+	m = m.ApplyEvent(event.InputQueued{Header: event.Header{Cause: identity.Cause{CommandID: id}}})
 	if got := queuedTexts(m); len(got) != 1 {
 		t.Fatalf("setup: queued = %v, want one", got)
 	}
-	m = m.ApplyEvent(event.InputCancelled{InputID: id, Reason: event.CancelClientRetracted, Message: userMsg("cancel me")})
+	m = m.ApplyEvent(event.InputCancelled{Header: event.Header{Cause: identity.Cause{CommandID: id}}, Reason: event.CancelClientRetracted, Message: userMsg("cancel me")})
 	if got := queuedTexts(m); len(got) != 0 {
 		t.Errorf("queued after InputCancelled = %v, want none (affordance dropped)", got)
 	}
@@ -1473,8 +1474,8 @@ func TestTranscriptTurnRejected(t *testing.T) {
 			t.Parallel()
 			var m transcriptModel
 			m = m.RecordSubmit(id, userBlocks("rejected"))
-			m = m.ApplyEvent(event.InputQueued{InputID: id})
-			m = m.ApplyEvent(event.TurnRejected{InputID: id, Reason: tt.reason})
+			m = m.ApplyEvent(event.InputQueued{Header: event.Header{Cause: identity.Cause{CommandID: id}}})
+			m = m.ApplyEvent(event.TurnRejected{Header: event.Header{Cause: identity.Cause{CommandID: id}}, Reason: tt.reason})
 
 			if got := queuedTexts(m); len(got) != 0 {
 				t.Errorf("queued after TurnRejected = %v, want none (affordance dropped)", got)
@@ -1502,11 +1503,11 @@ func TestTranscriptRecordSubmitValueCopy(t *testing.T) {
 	t.Parallel()
 
 	base := transcriptModel{}.RecordSubmit(callID(1), userBlocks("first"))
-	base = base.ApplyEvent(event.InputQueued{InputID: callID(1)})
+	base = base.ApplyEvent(event.InputQueued{Header: event.Header{Cause: identity.Cause{CommandID: callID(1)}}})
 
 	// Branch a child off base, recording a second submit. base must not gain it.
 	child := base.RecordSubmit(callID(2), userBlocks("second"))
-	child = child.ApplyEvent(event.InputQueued{InputID: callID(2)})
+	child = child.ApplyEvent(event.InputQueued{Header: event.Header{Cause: identity.Cause{CommandID: callID(2)}}})
 
 	if got := queuedTexts(base); len(got) != 1 || got[0] != "first" {
 		t.Errorf("base queued = %v, want [first] (child must not mutate base's backing array)", got)
@@ -1537,7 +1538,7 @@ func TestGateDecisionFlow(t *testing.T) {
 			var m transcriptModel
 			m = m.ApplyEvent(event.TurnStarted{})
 			m = m.ApplyEvent(thinkingChunk("let me run it"))
-			m = m.ApplyEvent(event.PermissionRequested{CallID: callID(1), Request: tool.BashRequest{Command: "date"}})
+			m = m.ApplyEvent(event.PermissionRequested{ToolExecutionID: callID(1), Request: tool.BashRequest{Command: "date"}})
 			// The gate commits nothing; the thinking stays live (uncommitted).
 			if len(m.committed) != 0 {
 				t.Fatalf("committed after gate = %d, want 0", len(m.committed))

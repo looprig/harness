@@ -35,7 +35,7 @@ const (
 )
 
 // interactionModel owns the bottom interaction surface: the compose editor, the
-// slash-completion panel, the FIFO queue of pending prompts (keyed by CallID), and
+// slash-completion panel, the FIFO queue of pending prompts (keyed by ToolExecutionID), and
 // the saved compose draft restored when the queue drains. It is a value type
 // driven Elm-style: Update/ApplyEvent return a new interactionModel. It holds NO
 // agent reference — it only PRODUCES a typed uiAction for Screen to act on.
@@ -84,7 +84,7 @@ func (m interactionModel) PendingCount() int { return len(m.pending) }
 
 // ApplyEvent folds one turn-stream event into the interaction surface. A
 // PermissionRequested/UserInputRequested enqueues a prompt (append-once by
-// CallID), stamped with its producing loop's id (ev.EventHeader().LoopID), and
+// ToolExecutionID), stamped with its producing loop's id (ev.EventHeader().LoopID), and
 // reveals the head; the terminal events clear only the FINISHING loop's pending
 // prompts (ClearPromptsForLoop) and, if that drains the queue, restore compose —
 // a sibling loop's pending gate is left intact (design §7). All other events are
@@ -92,9 +92,9 @@ func (m interactionModel) PendingCount() int { return len(m.pending) }
 func (m interactionModel) ApplyEvent(ev event.Event) interactionModel {
 	switch ev := ev.(type) {
 	case event.PermissionRequested:
-		m.enqueueForLoop(promptFromPermission(ev.CallID, ev.Request), ev.EventHeader().LoopID)
+		m.enqueueForLoop(promptFromPermission(ev.ToolExecutionID, ev.Request), ev.EventHeader().LoopID)
 	case event.UserInputRequested:
-		m.enqueueForLoop(promptFromUserInput(ev.CallID, ev.Question, ev.Choices), ev.EventHeader().LoopID)
+		m.enqueueForLoop(promptFromUserInput(ev.ToolExecutionID, ev.Question, ev.Choices), ev.EventHeader().LoopID)
 	case event.TurnDone, event.TurnFailed, event.TurnInterrupted:
 		m = m.ClearPromptsForLoop(ev.EventHeader().LoopID)
 	}
@@ -111,13 +111,13 @@ func (m *interactionModel) enqueueForLoop(p prompt, loopID uuid.UUID) {
 	m.enqueue(p)
 }
 
-// enqueue appends p unless a prompt with the same CallID is already pending
+// enqueue appends p unless a prompt with the same ToolExecutionID is already pending
 // (append-once: a duplicate gate event must not double-queue). The first prompt to
 // land saves the current compose draft and switches the mode to the head's mode;
 // subsequent appends leave the active head and mode untouched.
 func (m *interactionModel) enqueue(p prompt) {
 	for i := range m.pending {
-		if m.pending[i].CallID == p.CallID {
+		if m.pending[i].ToolExecutionID == p.ToolExecutionID {
 			return // already pending — ignore the duplicate
 		}
 	}
@@ -273,7 +273,7 @@ func (m interactionModel) Update(msg tea.KeyPressMsg) (interactionModel, uiActio
 func (m interactionModel) permissionKey(msg tea.KeyPressMsg) (interactionModel, uiAction) {
 	head := *m.ActivePrompt()
 	if msg.Code == tea.KeyEsc {
-		return m.pop(), uiAction{Kind: uiDeny, CallID: head.CallID}
+		return m.pop(), uiAction{Kind: uiDeny, LoopID: head.LoopID, ToolExecutionID: head.ToolExecutionID}
 	}
 	switch msg.Code {
 	case 'y':
@@ -283,7 +283,7 @@ func (m interactionModel) permissionKey(msg tea.KeyPressMsg) (interactionModel, 
 	case 'w':
 		return m.approveAt(head, tool.ScopeWorkspace)
 	case 'n':
-		return m.pop(), uiAction{Kind: uiDeny, CallID: head.CallID}
+		return m.pop(), uiAction{Kind: uiDeny, LoopID: head.LoopID, ToolExecutionID: head.ToolExecutionID}
 	}
 	return m, noop
 }
@@ -294,7 +294,7 @@ func (m interactionModel) approveAt(head prompt, scope tool.ApprovalScope) (inte
 	if !head.offersScope(scope) {
 		return m, noop
 	}
-	return m.pop(), uiAction{Kind: uiApprove, CallID: head.CallID, Scope: scope}
+	return m.pop(), uiAction{Kind: uiApprove, LoopID: head.LoopID, ToolExecutionID: head.ToolExecutionID, Scope: scope}
 }
 
 // choiceKey routes a key in modeChoicePrompt (head is a promptUserInput with
@@ -308,7 +308,7 @@ func (m interactionModel) choiceKey(msg tea.KeyPressMsg) (interactionModel, uiAc
 		return m, uiAction{Kind: uiInterrupt}
 	}
 	if isEnter(msg) {
-		return m.pop(), uiAction{Kind: uiAnswer, CallID: head.CallID, Text: head.Choices[head.selected]}
+		return m.pop(), uiAction{Kind: uiAnswer, LoopID: head.LoopID, ToolExecutionID: head.ToolExecutionID, Text: head.Choices[head.selected]}
 	}
 	switch msg.Code {
 	case tea.KeyUp:
@@ -316,10 +316,10 @@ func (m interactionModel) choiceKey(msg tea.KeyPressMsg) (interactionModel, uiAc
 	case tea.KeyDown:
 		return m.selectBy(1)
 	case 'o':
-		return m.pop(), uiAction{Kind: uiAnswer, CallID: head.CallID, Text: otherChoice}
+		return m.pop(), uiAction{Kind: uiAnswer, LoopID: head.LoopID, ToolExecutionID: head.ToolExecutionID, Text: otherChoice}
 	}
 	if i := int(msg.Code - '1'); msg.Code >= '1' && msg.Code <= '9' && i < len(head.Choices) {
-		return m.pop(), uiAction{Kind: uiAnswer, CallID: head.CallID, Text: head.Choices[i]}
+		return m.pop(), uiAction{Kind: uiAnswer, LoopID: head.LoopID, ToolExecutionID: head.ToolExecutionID, Text: head.Choices[i]}
 	}
 	return m, noop
 }
@@ -350,7 +350,7 @@ func (m interactionModel) answerKey(msg tea.KeyPressMsg) (interactionModel, uiAc
 		if strings.TrimSpace(v) == "" {
 			return m, noop, nil
 		}
-		return m.pop(), uiAction{Kind: uiAnswer, CallID: head.CallID, Text: v}, nil
+		return m.pop(), uiAction{Kind: uiAnswer, LoopID: head.LoopID, ToolExecutionID: head.ToolExecutionID, Text: v}, nil
 	}
 	cmd := m.input.Update(msg)
 	return m, noop, cmd

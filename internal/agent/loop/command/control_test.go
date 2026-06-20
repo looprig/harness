@@ -9,16 +9,16 @@ import (
 )
 
 // gateRouter is the narrow accessor runLoop uses to route a control command to
-// the gate waiting on its CallID. Every control command must satisfy it.
+// the gate waiting on its ToolExecutionID. Every control command must satisfy it.
 type gateRouter interface {
 	command.Command
-	GateCallID() uuid.UUID
+	GateToolExecutionID() uuid.UUID
 }
 
 // TestControlCommandsSatisfyContracts asserts the three control commands satisfy
-// Command (sealed), expose the shared GateCallID() accessor returning the set
-// CallID, and round-trip their embedded Header.ID. Table-driven across happy,
-// boundary (zero CallID/Header), and per-type cases.
+// Command (sealed), expose the shared GateToolExecutionID() accessor returning the set
+// ToolExecutionID, and round-trip their embedded Header.ID. Table-driven across happy,
+// boundary (zero ToolExecutionID/Header), and per-type cases.
 func TestControlCommandsSatisfyContracts(t *testing.T) {
 	t.Parallel()
 
@@ -42,37 +42,37 @@ func TestControlCommandsSatisfyContracts(t *testing.T) {
 	}{
 		{
 			name:       "ApproveToolCall set fields",
-			cmd:        command.ApproveToolCall{Header: command.Header{ID: headerID}, CallID: callID, Scope: tool.ScopeSession},
+			cmd:        command.ApproveToolCall{Header: command.Header{CommandID: headerID}, GateRoute: command.GateRoute{ToolExecutionID: callID}, Scope: tool.ScopeSession},
 			wantHeader: headerID,
 			wantCallID: callID,
 		},
 		{
 			name:       "DenyToolCall set fields",
-			cmd:        command.DenyToolCall{Header: command.Header{ID: headerID}, CallID: callID},
+			cmd:        command.DenyToolCall{Header: command.Header{CommandID: headerID}, GateRoute: command.GateRoute{ToolExecutionID: callID}},
 			wantHeader: headerID,
 			wantCallID: callID,
 		},
 		{
 			name:       "ProvideUserInput set fields",
-			cmd:        command.ProvideUserInput{Header: command.Header{ID: headerID}, CallID: callID, Answer: "yes"},
+			cmd:        command.ProvideUserInput{Header: command.Header{CommandID: headerID}, GateRoute: command.GateRoute{ToolExecutionID: callID}, Answer: "yes"},
 			wantHeader: headerID,
 			wantCallID: callID,
 		},
 		{
-			name:       "ApproveToolCall zero CallID is boundary",
-			cmd:        command.ApproveToolCall{Header: command.Header{ID: headerID}},
+			name:       "ApproveToolCall zero ToolExecutionID is boundary",
+			cmd:        command.ApproveToolCall{Header: command.Header{CommandID: headerID}},
 			wantHeader: headerID,
 			wantCallID: uuid.UUID{},
 		},
 		{
 			name:       "DenyToolCall zero header is boundary",
-			cmd:        command.DenyToolCall{CallID: callID},
+			cmd:        command.DenyToolCall{GateRoute: command.GateRoute{ToolExecutionID: callID}},
 			wantHeader: uuid.UUID{},
 			wantCallID: callID,
 		},
 		{
 			name:       "ProvideUserInput empty answer is boundary",
-			cmd:        command.ProvideUserInput{Header: command.Header{ID: headerID}, CallID: callID, Answer: ""},
+			cmd:        command.ProvideUserInput{Header: command.Header{CommandID: headerID}, GateRoute: command.GateRoute{ToolExecutionID: callID}, Answer: ""},
 			wantHeader: headerID,
 			wantCallID: callID,
 		},
@@ -82,18 +82,18 @@ func TestControlCommandsSatisfyContracts(t *testing.T) {
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			if got := tt.cmd.GateCallID(); got != tt.wantCallID {
-				t.Errorf("GateCallID() = %v, want %v", got, tt.wantCallID)
+			if got := tt.cmd.GateToolExecutionID(); got != tt.wantCallID {
+				t.Errorf("GateToolExecutionID() = %v, want %v", got, tt.wantCallID)
 			}
-			if got := tt.cmd.CommandHeader().ID; got != tt.wantHeader {
-				t.Errorf("CommandHeader().ID = %v, want %v", got, tt.wantHeader)
+			if got := tt.cmd.CommandHeader().CommandID; got != tt.wantHeader {
+				t.Errorf("CommandHeader().CommandID = %v, want %v", got, tt.wantHeader)
 			}
 		})
 	}
 }
 
 // TestApproveScopeRoundTrips asserts ApproveToolCall preserves the granted scope
-// (the only field runLoop consults beyond the CallID), across every scope value.
+// (the only field runLoop consults beyond the ToolExecutionID), across every scope value.
 func TestApproveScopeRoundTrips(t *testing.T) {
 	t.Parallel()
 	scopes := []struct {

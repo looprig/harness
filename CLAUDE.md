@@ -80,6 +80,8 @@ srv := &http.Server{
 
 **Build** — Always build with `CGO_ENABLED=0 go build -trimpath`. Never ship a binary without `-trimpath` (leaks local paths).
 
+**Format** — All Go code must be `gofmt`-clean. Run `make fmt` to format the whole module in place; `make fmt-check` fails if anything is unformatted and is wired into `make lint` (so `make secure` enforces it). Scope is `go list -f '{{.Dir}}' ./...`, which excludes `vendor/` and the nested `.worktrees/` modules — never reformat vendored or worktree files.
+
 **Tests** — Always run with `-race`: `go test -race ./...`. A test that passes without `-race` but not with it is not passing.
 
 **Table-driven tests (mandatory).** Every test function uses a `[]struct{ name string; ... }` table. Each table must cover:
@@ -119,7 +121,7 @@ func TestFoo(t *testing.T) {
 
 **Fuzzing** — For any function that parses external input, write a fuzz target: `go test -fuzz=FuzzXxx ./pkg -fuzztime=30s`.
 
-**Security checks** — Run `make secure` before every commit. It runs `lint` (vet + staticcheck + gosec) and `vuln` (go mod verify + govulncheck).
+**Security checks** — Run `make secure` before every commit. It runs `lint` (gofmt check + vet + staticcheck + gosec) and `vuln` (go mod verify + govulncheck).
 
 ## Code Rules
 

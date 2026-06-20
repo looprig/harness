@@ -16,7 +16,7 @@ import (
 //
 // LEAST PRIVILEGE: AskUser takes NO dependencies (no filesystem, no network). It
 // reaches the user solely through loop.RequestUserInput, which reads the per-call
-// emit/CallID/gateReg the runner injected into ctx (gate.go). The tool never
+// emit/ToolExecutionID/gateReg the runner injected into ctx (gate.go). The tool never
 // touches the gate plumbing directly.
 //
 // AUTO-APPROVE: AskUser is AutoApprove — it deliberately does NOT implement
@@ -30,7 +30,7 @@ import (
 // error STRING. InvokableRun never returns a Go error (CLAUDE.md: tool failures →
 // tool-result strings).
 //
-// TEST SEAM (documented): loop.RequestUserInput reads emit/CallID/gateReg from ctx
+// TEST SEAM (documented): loop.RequestUserInput reads emit/ToolExecutionID/gateReg from ctx
 // via unexported injectors in package loop, which package tools cannot call. So
 // AskUser holds an indirect requestUserInput func field defaulting to
 // loop.RequestUserInput in NewAskUser; a unit test overrides it to exercise the

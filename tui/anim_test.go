@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/inventivepotter/urvi/internal/agent/loop/event"
+	"github.com/inventivepotter/urvi/internal/agent/loop/identity"
 	"github.com/inventivepotter/urvi/internal/content"
 	"github.com/inventivepotter/urvi/tui/styles"
 )
@@ -426,7 +427,7 @@ func TestTurnStartTicking(t *testing.T) {
 		m := New(context.Background(), agent, fakeOpen(agent), AgentBanner{})
 		m.sub = newFakeSubscription()
 
-		m, cmd := updateScreen(t, m, eventMsg{ev: event.TurnStarted{Header: event.Header{LoopID: primary}}})
+		m, cmd := updateScreen(t, m, eventMsg{ev: event.TurnStarted{Header: event.Header{Coordinates: identity.Coordinates{LoopID: primary}}}})
 		if m.status != StatusRunning {
 			t.Errorf("status = %d, want StatusRunning", m.status)
 		}
@@ -445,7 +446,7 @@ func TestTurnStartTicking(t *testing.T) {
 		m := New(context.Background(), agent, fakeOpen(agent), AgentBanner{})
 		m.sub = newFakeSubscription()
 
-		m, _ = updateScreen(t, m, eventMsg{ev: event.TurnStarted{Header: event.Header{LoopID: subagent}}})
+		m, _ = updateScreen(t, m, eventMsg{ev: event.TurnStarted{Header: event.Header{Coordinates: identity.Coordinates{LoopID: subagent}}}})
 		if m.status != StatusIdle {
 			t.Errorf("status = %d, want StatusIdle (subagent turn must not flip primary)", m.status)
 		}

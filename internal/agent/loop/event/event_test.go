@@ -4,13 +4,14 @@ import (
 	"testing"
 
 	"github.com/inventivepotter/urvi/internal/agent/loop/event"
+	"github.com/inventivepotter/urvi/internal/agent/loop/identity"
 	"github.com/inventivepotter/urvi/internal/uuid"
 )
 
 // TestReplyImplementations pins WHICH events are Reply (the direct, typed outcome
 // of a command, recognised by ReplyTo() == the issuer's command id). Exactly the
 // five submit-resolution events implement it; ReplyTo() must return the embedded
-// Header.CausationID verbatim. Any other event MUST NOT be a Reply, so the set
+// Header.Cause.CommandID verbatim. Any other event MUST NOT be a Reply, so the set
 // stays sealed to the command-outcome events.
 func TestReplyImplementations(t *testing.T) {
 	t.Parallel()
@@ -21,11 +22,11 @@ func TestReplyImplementations(t *testing.T) {
 		name string
 		ev   event.Event
 	}{
-		{"TurnStarted", event.TurnStarted{Header: event.Header{CausationID: causationID}}},
-		{"InputQueued", event.InputQueued{Header: event.Header{CausationID: causationID}}},
-		{"TurnRejected", event.TurnRejected{Header: event.Header{CausationID: causationID}}},
-		{"TurnFoldedInto", event.TurnFoldedInto{Header: event.Header{CausationID: causationID}}},
-		{"InputCancelled", event.InputCancelled{Header: event.Header{CausationID: causationID}}},
+		{"TurnStarted", event.TurnStarted{Header: event.Header{Cause: identity.Cause{CommandID: causationID}}}},
+		{"InputQueued", event.InputQueued{Header: event.Header{Cause: identity.Cause{CommandID: causationID}}}},
+		{"TurnRejected", event.TurnRejected{Header: event.Header{Cause: identity.Cause{CommandID: causationID}}}},
+		{"TurnFoldedInto", event.TurnFoldedInto{Header: event.Header{Cause: identity.Cause{CommandID: causationID}}}},
+		{"InputCancelled", event.InputCancelled{Header: event.Header{Cause: identity.Cause{CommandID: causationID}}}},
 	}
 	for _, tt := range isReply {
 		tt := tt
@@ -36,7 +37,7 @@ func TestReplyImplementations(t *testing.T) {
 				t.Fatalf("%T must implement event.Reply", tt.ev)
 			}
 			if got := r.ReplyTo(); got != causationID {
-				t.Errorf("ReplyTo() = %v, want %v (the Header.CausationID)", got, causationID)
+				t.Errorf("ReplyTo() = %v, want %v (the Header.Cause.CommandID)", got, causationID)
 			}
 		})
 	}
@@ -65,7 +66,7 @@ func TestReplyImplementations(t *testing.T) {
 	}
 }
 
-// TestReplyToZeroCausation asserts ReplyTo() faithfully returns a zero CausationID
+// TestReplyToZeroCausation asserts ReplyTo() faithfully returns a zero Cause.CommandID
 // (the boundary value) rather than synthesizing an id.
 func TestReplyToZeroCausation(t *testing.T) {
 	t.Parallel()

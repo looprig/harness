@@ -95,7 +95,7 @@ func TestSurfaceViewPermissionPrompt(t *testing.T) {
 	t.Parallel()
 
 	im := newInteractionModel()
-	im = im.ApplyEvent(event.PermissionRequested{CallID: callID(1), Request: tool.BashRequest{Command: "go test"}})
+	im = im.ApplyEvent(event.PermissionRequested{ToolExecutionID: callID(1), Request: tool.BashRequest{Command: "go test"}})
 	in := surfaceInputs{
 		Interaction: im,
 		LiveTail:    "",
@@ -120,7 +120,7 @@ func TestSurfaceViewChoicePrompt(t *testing.T) {
 	t.Parallel()
 
 	im := newInteractionModel()
-	im = im.ApplyEvent(event.UserInputRequested{CallID: callID(2), Question: "Pick one", Choices: []string{"alpha", "beta"}})
+	im = im.ApplyEvent(event.UserInputRequested{ToolExecutionID: callID(2), Question: "Pick one", Choices: []string{"alpha", "beta"}})
 	in := surfaceInputs{
 		Interaction: im,
 		Status:      StatusRunning,

@@ -5,23 +5,21 @@ import (
 	"github.com/inventivepotter/urvi/internal/uuid"
 )
 
-// ApproveToolCall approves a pending tool call identified by CallID, granting it
+// ApproveToolCall approves a pending tool call identified by ToolExecutionID, granting it
 // at the requested persistence Scope. It is a fire-and-route control command: the
-// actor routes it by GateCallID to the permission gate blocked on that call, so
+// actor routes it by GateToolExecutionID to the permission gate blocked on that call, so
 // there is no Ack (the gate's unblocking and the subsequent ToolCallStarted event
 // are the observable effect, not a reply on this command).
 type ApproveToolCall struct {
 	Header
-	// Route addresses the loop (and, for full routing, the turn/step/tool call).
-	// The loop's gate routing still matches by CallID for now; Route is carried
-	// alongside so routing can migrate to Route-keyed without breaking callers.
-	Route  Route
-	CallID uuid.UUID
-	Scope  tool.ApprovalScope
+	// GateRoute locates the loop (the session dispatches by LoopID) and names the
+	// pending gate (ToolExecutionID), which the actor matches against.
+	GateRoute
+	Scope tool.ApprovalScope `json:"scope,omitzero"`
 }
 
 func (ApproveToolCall) isCommand() {}
 
-// GateCallID returns the tool-call id this command targets, so the actor can
+// GateToolExecutionID returns the tool-call id this command targets, so the actor can
 // route it to the matching pending gate.
-func (c ApproveToolCall) GateCallID() uuid.UUID { return c.CallID }
+func (c ApproveToolCall) GateToolExecutionID() uuid.UUID { return c.GateRoute.ToolExecutionID }

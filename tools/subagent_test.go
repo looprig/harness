@@ -11,7 +11,7 @@ import (
 
 // subagent_test.go exercises the Subagent tool against FAKE SubagentFactory /
 // Subsession implementations (DIP: the tool never touches the real
-// session.AgentSession). The fakes record what they were called with so the
+// session.Session). The fakes record what they were called with so the
 // tests can assert the security-critical invariants:
 //
 //   - the depth cap is enforced BEFORE a child is created (fail-secure), and

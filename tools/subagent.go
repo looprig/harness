@@ -22,9 +22,9 @@ import (
 // DIP / LEAST PRIVILEGE. The tool depends on TWO narrow interfaces it defines
 // itself — SubagentFactory (build a child by skill) and Subsession (run one child
 // to completion and read its final text) — NOT on the concrete
-// session.AgentSession. The manifest wires a concrete SubagentFactory that adapts
+// session.Session. The manifest wires a concrete SubagentFactory that adapts
 // the real session: it uses internal/registry to map a skill name to a persona /
-// loop.Config, constructs a session.NewAgent, drives session.Invoke to a terminal
+// loop.Config, constructs a session.New, drives session.Invoke to a terminal
 // event, and projects the terminal TurnDone.Message text into the string this
 // tool's Subsession.Invoke returns. Keeping the tool behind these interfaces makes
 // it unit-testable with fakes and keeps tools/ → session a one-way (acyclic)
@@ -90,7 +90,7 @@ func subagentDepth(ctx context.Context) int {
 
 // Subsession is the narrow interface the tool needs from a child agent: run the
 // child to completion on message and return its final assistant text. The
-// concrete implementation (wired by the manifest) adapts session.AgentSession —
+// concrete implementation (wired by the manifest) adapts session.Session —
 // whose Invoke returns a terminal event.Event — by extracting the text blocks of
 // the terminal event.TurnDone.Message. A failed/interrupted turn is surfaced as a
 // non-nil error.
@@ -100,7 +100,7 @@ type Subsession interface {
 
 // SubagentFactory builds a child Subsession for the named skill. The concrete
 // implementation (wired by the manifest) resolves skill → persona via
-// internal/registry and constructs a session.NewAgent. An unknown skill (or any
+// internal/registry and constructs a session.New. An unknown skill (or any
 // construction failure) is returned as an error, which the tool turns into a
 // tool-result error string.
 type SubagentFactory interface {
@@ -138,7 +138,7 @@ type Subagent struct {
 
 // NewSubagent constructs a Subagent from a SubagentFactory and the session-root
 // context (design §4a — the manifest's rootCtx, already in hand when it builds
-// tools before session.NewAgent).
+// tools before session.New).
 func NewSubagent(factory SubagentFactory, rootCtx context.Context) *Subagent {
 	return &Subagent{factory: factory, rootCtx: rootCtx}
 }

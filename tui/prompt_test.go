@@ -46,8 +46,8 @@ func TestPromptFromPermission(t *testing.T) {
 			id := callID(7)
 			p := promptFromPermission(id, tt.req)
 
-			if p.CallID != id {
-				t.Errorf("CallID = %v, want %v", p.CallID, id)
+			if p.ToolExecutionID != id {
+				t.Errorf("ToolExecutionID = %v, want %v", p.ToolExecutionID, id)
 			}
 			if p.Kind != promptPermission {
 				t.Errorf("Kind = %d, want promptPermission (%d)", p.Kind, promptPermission)
@@ -107,8 +107,8 @@ func TestPromptFromUserInput(t *testing.T) {
 			id := callID(3)
 			p := promptFromUserInput(id, tt.question, tt.choices)
 
-			if p.CallID != id {
-				t.Errorf("CallID = %v, want %v", p.CallID, id)
+			if p.ToolExecutionID != id {
+				t.Errorf("ToolExecutionID = %v, want %v", p.ToolExecutionID, id)
 			}
 			if p.Kind != promptUserInput {
 				t.Errorf("Kind = %d, want promptUserInput (%d)", p.Kind, promptUserInput)

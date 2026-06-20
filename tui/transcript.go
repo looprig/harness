@@ -180,7 +180,7 @@ type liveSeg struct {
 	Text     string
 	Calls    []ToolCallView
 	active   bool
-	// gateDecisions records, by gate CallID, how each PERMISSION gate of the current
+	// gateDecisions records, by gate ToolExecutionID, how each PERMISSION gate of the current
 	// step was resolved: gatePending on PermissionRequested, then gateApproved/
 	// gateDenied once Screen calls ResolveGate from the user's keypress. toolStarted
 	// bakes the decision into its live card, so the committed card reads "Approved …" /
@@ -221,9 +221,9 @@ type transcriptModel struct {
 	nextID    displayID
 	// primaryLoopID is the loop whose GENUINE user turns become committed kindUser
 	// rows. A turn-start event commits a user row only when its Header.LoopID equals
-	// this id (in addition to TriggeredByLoopID being zero and a Message present): a
+	// this id (in addition to Cause.LoopID being zero and a Message present): a
 	// SUBAGENT loop's own initial task also arrives as an untriggered TurnStarted
-	// (TriggeredByLoopID == 0) carrying a Message, and the DefaultEventFilter delivers
+	// (Cause.LoopID == 0) carrying a Message, and the DefaultEventFilter delivers
 	// it (Enduring from every loop), so without this scoping it would bogusly commit as
 	// a human user row. A subagent loop's own turns surface ONLY collapsed via StepDone,
 	// attributed by LoopID (§5/§6) — never as a human user row. It is wired from
@@ -234,7 +234,7 @@ type transcriptModel struct {
 
 // ApplyEvent folds one turn-stream event into the model and returns the next
 // model. TurnStarted begins/keeps a live assistant segment AND — for GENUINE user
-// input only (Header.TriggeredByLoopID == 0; a subagent hand-back carries a
+// input only (Header.Cause.LoopID == 0; a subagent hand-back carries a
 // non-zero one and commits NO user row) — commits the authoritative user row from
 // its Message and drops the matching queued affordance. TurnFoldedInto does the
 // same user-row commit for a folded tool-continuation input. InputQueued reveals
@@ -255,7 +255,7 @@ type transcriptModel struct {
 //
 // TurnDone is a lifecycle terminal: every completed step already committed via its
 // StepDone, so it only flushes any leftover provisional live (defensive) and resets.
-// PermissionRequested only REMEMBERS the gate (by CallID) so the call's committed card
+// PermissionRequested only REMEMBERS the gate (by ToolExecutionID) so the call's committed card
 // can read "Approved …" / "Denied …" once Screen reports the keypress via ResolveGate;
 // it commits nothing (the permission shows on the tool card, not a separate record).
 // UserInputRequested (AskUser is not a tool) commits ONLY the prompt record. Neither
@@ -271,15 +271,15 @@ func (m transcriptModel) ApplyEvent(ev event.Event) transcriptModel {
 	switch ev := ev.(type) {
 	case event.TurnStarted:
 		m.live.active = true
-		m.startTurnUser(ev.LoopID, ev.TriggeredByLoopID, ev.InputID, ev.Message)
+		m.startTurnUser(ev.LoopID, ev.Cause.LoopID, ev.Cause.CommandID, ev.Message)
 	case event.TurnFoldedInto:
-		m.startTurnUser(ev.LoopID, ev.TriggeredByLoopID, ev.InputID, ev.Message)
+		m.startTurnUser(ev.LoopID, ev.Cause.LoopID, ev.Cause.CommandID, ev.Message)
 	case event.InputQueued:
-		m.markQueued(ev.InputID)
+		m.markQueued(ev.Cause.CommandID)
 	case event.InputCancelled:
-		m.dropQueued(ev.InputID)
+		m.dropQueued(ev.Cause.CommandID)
 	case event.TurnRejected:
-		m.rejectInput(ev.InputID, ev.Reason)
+		m.rejectInput(ev.Cause.CommandID, ev.Reason)
 	case event.TokenDelta:
 		m.applyChunk(ev.Chunk)
 	case event.ToolCallStarted:
@@ -370,11 +370,11 @@ func (m transcriptModel) QueuedInputs() [][]content.Block {
 // (TurnStarted/TurnFoldedInto) and drops the matching queued affordance. It
 // commits a kindUser row ONLY for a GENUINE PRIMARY-loop user turn — ALL THREE must
 // hold: loopID == m.primaryLoopID (a SUBAGENT loop's OWN initial task also arrives
-// as an untriggered TurnStarted carrying a Message — TriggeredByLoopID == 0,
+// as an untriggered TurnStarted carrying a Message — Cause.LoopID == 0,
 // LoopID == the subagent loop — and the DefaultEventFilter delivers it from every
 // loop, so without this scoping it would bogusly commit as a human user row);
 // triggeredBy is the zero loop id (a SubagentResult hand-back FOLDS into the PRIMARY
-// loop, so LoopID == primary but TriggeredByLoopID != 0 — that is a hand-back, not a
+// loop, so LoopID == primary but Cause.LoopID != 0 — that is a hand-back, not a
 // human turn); and a Message is present. The row is committed from the event's
 // authoritative blocks, never from remembered submit state, which sidesteps the
 // submit↔event arrival race. The queued affordance for this InputID is always
@@ -482,7 +482,7 @@ func (m transcriptModel) CommitError(err error) transcriptModel {
 }
 
 // permissionRequested is the permission-gate boundary: it REMEMBERS the gate by its
-// CallID (decision gatePending) so the call's committed card can read "Approved …" /
+// ToolExecutionID (decision gatePending) so the call's committed card can read "Approved …" /
 // "Denied …" once Screen reports the user's keypress via ResolveGate. It commits
 // NOTHING — the permission shows on the tool card itself (the verb + the ✓/✗ glyph),
 // not as a separate record — and it does NOT commit pending live prose (the
@@ -491,7 +491,7 @@ func (m transcriptModel) CommitError(err error) transcriptModel {
 // value-copy reducer never aliases a prior model's gate map.
 func (m *transcriptModel) permissionRequested(ev event.PermissionRequested) {
 	g := cloneGates(m.live.gateDecisions)
-	g[ev.CallID] = gatePending
+	g[ev.ToolExecutionID] = gatePending
 	m.live.gateDecisions = g
 }
 
@@ -613,29 +613,29 @@ func (m *transcriptModel) commitProse() {
 // committed cards show the same one-line, secret-free header.
 func (m *transcriptModel) toolStarted(ev event.ToolCallStarted) {
 	m.live.Calls = append(m.live.Calls, ToolCallView{
-		CallID:   ev.CallID,
-		ToolName: ev.ToolName,
-		Summary:  ev.Summary,
-		Status:   ToolRunning,
+		ToolExecutionID: ev.ToolExecutionID,
+		ToolName:        ev.ToolName,
+		Summary:         ev.Summary,
+		Status:          ToolRunning,
 		// Bake in the permission decision (if this call prompted): permission resolves
 		// BEFORE ToolCallStarted, so the gate is already gateApproved/gateDenied here
 		// (gateNone for an ungated/pre-approved call). The card carries it through to
 		// the committed entry, so it reads "Approved …" / "Denied …".
-		Decision: m.live.gateDecisions[ev.CallID],
+		Decision: m.live.gateDecisions[ev.ToolExecutionID],
 	})
 }
 
-// toolCompleted resolves the matching live call (by CallID) IN PLACE — setting its
+// toolCompleted resolves the matching live call (by ToolExecutionID) IN PLACE — setting its
 // terminal status and its capped, redacted ResultPreview — so the live tail shows the
 // completed card. It does NOT commit the card or remove it from live.Calls: the card
 // is committed only at the step boundary (StepDone) or, defensively, at the turn
 // terminal. Keeping the resolved live card lets StepDone reuse its redacted
 // Summary/preview when it commits the finalized group (the stored ToolResultMessage
 // carries the raw, uncapped result; the resolved live card carries the display-safe
-// one). An unknown CallID is a no-op — no panic.
+// one). An unknown ToolExecutionID is a no-op — no panic.
 func (m *transcriptModel) toolCompleted(ev event.ToolCallCompleted) {
 	for i := range m.live.Calls {
-		if m.live.Calls[i].CallID != ev.CallID {
+		if m.live.Calls[i].ToolExecutionID != ev.ToolExecutionID {
 			continue
 		}
 		m.live.Calls[i].Status = ToolOK
@@ -645,7 +645,7 @@ func (m *transcriptModel) toolCompleted(ev event.ToolCallCompleted) {
 		m.live.Calls[i].Result = splitLines(ev.ResultPreview)
 		return
 	}
-	// unknown CallID: no-op
+	// unknown ToolExecutionID: no-op
 }
 
 // stepDone is the StepDone commit point: it SNAPS the transcript to the loop's

@@ -10,7 +10,7 @@ const (
 // Ack is required and must be non-nil.
 type Interrupt struct {
 	Header
-	Ack chan<- bool
+	Ack chan<- bool `json:"-"` // live reply channel; no JSON representation
 }
 
 func (Interrupt) isCommand() {}

@@ -83,7 +83,7 @@ func TestToolRunningToCompletedHandoff(t *testing.T) {
 
 	deliver(event.TurnStarted{})
 	deliver(event.TokenDelta{Chunk: &content.TextChunk{Text: "Let me fetch the weather.\n"}})
-	deliver(event.ToolCallStarted{CallID: callID(1), ToolName: "Fetch", Summary: "GET weather.com"})
+	deliver(event.ToolCallStarted{ToolExecutionID: callID(1), ToolName: "Fetch", Summary: "GET weather.com"})
 
 	// Drive blink ticks so the running card visibly paints (as it does live).
 	for i := 0; i < 3; i++ {
@@ -96,7 +96,7 @@ func TestToolRunningToCompletedHandoff(t *testing.T) {
 	// now with a ✓ and its result body). Under the StepDone-group model the card is not
 	// committed yet — committing is the step boundary's job.
 	deliver(event.ToolCallCompleted{
-		CallID: callID(1),
+		ToolExecutionID: callID(1),
 		ResultPreview: "HTTP 200 OK\nContent-Type: text/html\nServer: nginx\n" +
 			"Date: today\nX-Cache: HIT\nbody body body",
 	})

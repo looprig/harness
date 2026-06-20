@@ -1,5 +1,5 @@
 // Package coding is the full-tool coding agent built on the session engine. It
-// wraps a session.AgentSession with the Togo coding persona and a named model, wiring
+// wraps a session.Session with the Togo coding persona and a named model, wiring
 // ALL eleven tools (read/search, write/edit/exec, web, ask/todo, and a
 // recursion-safe Subagent) each with only the dependencies it needs. It exposes
 // the tui.Agent surface plus the Approve/Deny/ProvideAnswer gate trio.
@@ -37,10 +37,10 @@ var model = llm.ChutesKimiK2()
 // is a false positive here.
 const envAPIKey = "LLM_API_KEY" // #nosec G101 -- env var name, not a credential
 
-// Coding is a persona-bearing wrapper over a session.AgentSession. The caller
+// Coding is a persona-bearing wrapper over a session.Session. The caller
 // owns it and must call Close to release the underlying actor goroutine.
 type Coding struct {
-	session       *session.Sesssion
+	session       *session.Session
 	cancel        context.CancelFunc // cancels the session's root context; called by Close
 	acceptsImages bool               // captured from spec at construction; reported by AcceptsImages
 }
@@ -108,7 +108,7 @@ func newWithClient(ctx context.Context, client llm.LLM, spec llm.ModelSpec) (*Co
 	}
 
 	toolSet := buildToolSet(root, httpCl, rootCtx, factory)
-	sess, err := session.NewAgent(rootCtx, loop.Config{Client: client, Model: spec, Tools: toolSet})
+	sess, err := session.New(rootCtx, loop.Config{Client: client, Model: spec, Tools: toolSet})
 	if err != nil {
 		cancel()
 		return nil, err
@@ -191,7 +191,7 @@ func (c *Coding) StreamBlocks(ctx context.Context, blocks []content.Block) (*llm
 }
 
 // Submit delivers a multimodal user message FIRE-AND-FORGET as a queueable
-// (AllowFold) UserInput and returns the InputID — the CausationID the resulting
+// (AllowFold) UserInput and returns the InputID — the Cause.CommandID the resulting
 // Reply events (InputQueued / TurnStarted / TurnFoldedInto / TurnRejected /
 // InputCancelled) carry on the session fan-in. The Go error is non-nil only when
 // the command could not be handed to the loop (loop gone, or ctx done); the turn
@@ -226,20 +226,25 @@ func (c *Coding) AcceptsImages() bool { return c.acceptsImages }
 
 // Approve resolves a pending tool-call permission gate, granting it at scope. It
 // delegates verbatim to the session; the wrapper holds no gate state of its own.
-func (c *Coding) Approve(ctx context.Context, callID uuid.UUID, scope tool.ApprovalScope) error {
-	return c.session.Approve(ctx, callID, scope)
+// loopID is the loop that opened the gate, so the reply reaches the right loop in a
+// multi-loop session (the session falls back to its primary loop for a zero id).
+func (c *Coding) Approve(ctx context.Context, loopID, callID uuid.UUID, scope tool.ApprovalScope) error {
+	return c.session.Approve(ctx, loopID, callID, scope)
 }
 
 // Deny resolves a pending tool-call permission gate by failing it closed
-// (fail-secure); nothing is persisted. It delegates to the session.
-func (c *Coding) Deny(ctx context.Context, callID uuid.UUID) error {
-	return c.session.Deny(ctx, callID)
+// (fail-secure); nothing is persisted. It delegates to the session. loopID names
+// the gate-opening loop so the reply is dispatched there, not unconditionally to
+// the primary loop.
+func (c *Coding) Deny(ctx context.Context, loopID, callID uuid.UUID) error {
+	return c.session.Deny(ctx, loopID, callID)
 }
 
 // ProvideAnswer supplies the user's reply to a pending AskUser request. It is the
 // TUI-facing name for the session's ProvideUserInput, to which it delegates.
-func (c *Coding) ProvideAnswer(ctx context.Context, callID uuid.UUID, answer string) error {
-	return c.session.ProvideUserInput(ctx, callID, answer)
+// loopID names the gate-opening loop so the answer reaches the right loop.
+func (c *Coding) ProvideAnswer(ctx context.Context, loopID, callID uuid.UUID, answer string) error {
+	return c.session.ProvideUserInput(ctx, loopID, callID, answer)
 }
 
 // Close gracefully shuts the session down and releases the session's root

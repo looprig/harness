@@ -1,6 +1,9 @@
 package event
 
-import "github.com/inventivepotter/urvi/internal/uuid"
+import (
+	"github.com/inventivepotter/urvi/internal/agent/loop/identity"
+	"github.com/inventivepotter/urvi/internal/uuid"
+)
 
 // Event is the sealed root of every loop event. Every concrete event embeds a
 // Header, exactly one lifecycle mixin (ephemeral, enduring, or terminal), and
@@ -26,12 +29,12 @@ type Event interface {
 type Reply interface {
 	Event
 	isReply()           // seals the set
-	ReplyTo() uuid.UUID // == Header.CausationID: the command this answers
+	ReplyTo() uuid.UUID // == Header.Cause.CommandID: the command this answers
 }
 
-// ReplyTo returns the id of the command this event answers (its CausationID). It is
-// promoted onto every Reply event via the embedded Header.
-func (h Header) ReplyTo() uuid.UUID { return h.CausationID }
+// ReplyTo returns the id of the command this event answers (its Cause.CommandID).
+// It is promoted onto every Reply event via the embedded Header.
+func (h Header) ReplyTo() uuid.UUID { return h.Cause.CommandID }
 
 // Class is the delivery class of an event. It is semantic — "is this event
 // reconstructable from a later authoritative event?" — not a transport flag,
@@ -65,36 +68,24 @@ const (
 // for loop events, the session for session events) fills it in; fan-in, filter,
 // and journal consumers read it without a transport-only envelope.
 type Header struct {
-	// SessionID is set on every event.
-	SessionID uuid.UUID
+	// Coordinates is the producer's location in the hierarchy: SessionID on every
+	// event; LoopID for loop-scoped events; TurnID for turn events; StepID for
+	// step/tool scoped events. Session-scoped events leave LoopID/TurnID/StepID zero.
+	identity.Coordinates
 
-	// Producer identity. For session-scoped events, LoopID/TurnID/StepID are zero.
-	// For loop-scoped events, LoopID is set. TurnID is set for turn events; StepID
-	// is set for step/tool scoped events.
-	LoopID uuid.UUID
-	TurnID uuid.UUID
-	StepID uuid.UUID
+	// EventID identifies this event. Header carries this identity directly; detailed
+	// wiring is sequenced after the journal follow-on.
+	EventID uuid.UUID `json:"event_id,omitzero"`
 
-	// TriggeredByLoopID is set on a turn/input event caused by a SubagentResult
-	// (= the producing subagent's loop id); zero otherwise. The publish path
-	// releases {wake, TriggeredByLoopID} when it sees TurnStarted/TurnFoldedInto/
-	// InputCancelled carrying it (see quiescence).
-	TriggeredByLoopID uuid.UUID
-
-	// CausationID is set when an event is directly caused by a command. For
-	// UserInput/SubagentResult resolution events (TurnStarted, TurnFoldedInto,
-	// InputCancelled), it is the submit command id and equals InputID.
-	CausationID uuid.UUID
-
-	// ToolCallID is set on gate/tool lifecycle events when CallID is available.
-	ToolCallID uuid.UUID
-
-	// Event identity and parent grouping. Header carries this identity directly;
-	// detailed wiring is sequenced after the journal follow-on.
-	ID           uuid.UUID
-	ParentLoopID uuid.UUID
-	ParentTurnID uuid.UUID
-	ParentStepID uuid.UUID
+	// Cause is the direct cause of this event. For UserInput/SubagentResult
+	// resolution events (TurnStarted, TurnFoldedInto, InputCancelled, InputQueued,
+	// TurnRejected), Cause.CommandID is the submit command id. For an event caused by
+	// a SubagentResult, Cause.LoopID is the producing subagent's loop id (its
+	// quiescence wake token). Cause.Agency surfaces who caused it, but ONLY the turn-
+	// resolution events stamp it — TurnStarted, TurnFoldedInto, and InputCancelled
+	// (per design §444-446); InputQueued and TurnRejected carry Cause.CommandID but
+	// NOT Cause.Agency.
+	Cause identity.Cause `json:"cause,omitzero"`
 }
 
 // EventHeader returns the embedded Header so every event satisfies Event without

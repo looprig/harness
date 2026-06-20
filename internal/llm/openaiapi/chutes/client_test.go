@@ -546,9 +546,9 @@ func TestClientStream_FullRoundTrip(t *testing.T) {
 	}
 
 	tests := []struct {
-		name    string
-		chunks  []string
-		want    string
+		name   string
+		chunks []string
+		want   string
 	}{
 		{
 			name: "happy path: three content chunks",

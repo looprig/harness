@@ -440,7 +440,6 @@ func firstLine(s string) string {
 	return s
 }
 
-
 // thinkingRail is the left-rail margin ("│ ") that prefixes EVERY line of the
 // expanded thinking block — header included — so the block renders as one unbroken
 // vertical rail attaching the reasoning to the assistant turn it precedes.

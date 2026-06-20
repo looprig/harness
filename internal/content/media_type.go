@@ -27,11 +27,11 @@ const (
 
 // Document MIME types.
 const (
-	MediaTypeDocumentPDF      MediaType = "application/pdf"  // .pdf
-	MediaTypeDocumentText     MediaType = "text/plain"        // .txt
-	MediaTypeDocumentHTML     MediaType = "text/html"         // .html
-	MediaTypeDocumentCSV      MediaType = "text/csv"          // .csv
-	MediaTypeDocumentMarkdown MediaType = "text/markdown"     // .md
+	MediaTypeDocumentPDF      MediaType = "application/pdf" // .pdf
+	MediaTypeDocumentText     MediaType = "text/plain"      // .txt
+	MediaTypeDocumentHTML     MediaType = "text/html"       // .html
+	MediaTypeDocumentCSV      MediaType = "text/csv"        // .csv
+	MediaTypeDocumentMarkdown MediaType = "text/markdown"   // .md
 	// Office open XML formats — the modern .docx/.xlsx wire types.
 	MediaTypeDocumentDOCX MediaType = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 	MediaTypeDocumentXLSX MediaType = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"

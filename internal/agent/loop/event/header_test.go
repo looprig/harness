@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/inventivepotter/urvi/internal/agent/loop/event"
+	"github.com/inventivepotter/urvi/internal/agent/loop/identity"
 	"github.com/inventivepotter/urvi/internal/content"
 	"github.com/inventivepotter/urvi/internal/uuid"
 )
@@ -144,17 +145,20 @@ func TestEventHeaderRoundTrip(t *testing.T) {
 		{
 			name: "full header",
 			hdr: event.Header{
-				SessionID:         id(t),
-				LoopID:            id(t),
-				TurnID:            id(t),
-				StepID:            id(t),
-				TriggeredByLoopID: id(t),
-				CausationID:       id(t),
-				ToolCallID:        id(t),
-				ID:                id(t),
-				ParentLoopID:      id(t),
-				ParentTurnID:      id(t),
-				ParentStepID:      id(t),
+				Coordinates: identity.Coordinates{
+					SessionID: id(t),
+					LoopID:    id(t),
+					TurnID:    id(t),
+					StepID:    id(t),
+				},
+				EventID: id(t),
+				Cause: identity.Cause{
+					CommandID:       id(t),
+					EventID:         id(t),
+					ToolExecutionID: id(t),
+					Coordinates:     identity.Coordinates{LoopID: id(t)},
+					Agency:          identity.AgencyUser,
+				},
 			},
 		},
 		{
@@ -163,7 +167,7 @@ func TestEventHeaderRoundTrip(t *testing.T) {
 		},
 		{
 			name: "session-scoped header only SessionID set",
-			hdr:  event.Header{SessionID: id(t)},
+			hdr:  event.Header{Coordinates: identity.Coordinates{SessionID: id(t)}},
 		},
 	}
 	for _, tt := range tests {
@@ -197,36 +201,34 @@ func TestNewEventFields(t *testing.T) {
 	t.Run("TurnStarted carries InputID and Message", func(t *testing.T) {
 		t.Parallel()
 		ev := event.TurnStarted{
-			Header:    event.Header{CausationID: inputID},
+			Header:    event.Header{Cause: identity.Cause{CommandID: inputID}},
 			TurnIndex: 1,
-			InputID:   inputID,
 			Message:   userMsg,
 		}
-		if ev.InputID != inputID {
-			t.Errorf("InputID = %v, want %v", ev.InputID, inputID)
+		if ev.Cause.CommandID != inputID {
+			t.Errorf("InputID = %v, want %v", ev.Cause.CommandID, inputID)
 		}
-		if ev.EventHeader().CausationID != inputID {
-			t.Errorf("CausationID = %v, want %v (must equal InputID)", ev.EventHeader().CausationID, inputID)
+		if ev.EventHeader().Cause.CommandID != inputID {
+			t.Errorf("Cause.CommandID = %v, want %v (must equal InputID)", ev.EventHeader().Cause.CommandID, inputID)
 		}
 		if ev.Message != userMsg {
 			t.Errorf("Message = %v, want %v", ev.Message, userMsg)
 		}
 	})
 
-	t.Run("TurnFoldedInto carries TriggeredByLoopID for a hand-back", func(t *testing.T) {
+	t.Run("TurnFoldedInto carries Cause.LoopID for a hand-back", func(t *testing.T) {
 		t.Parallel()
 		fromLoop, err := uuid.New()
 		if err != nil {
 			t.Fatalf("uuid.New: %v", err)
 		}
 		ev := event.TurnFoldedInto{
-			Header:    event.Header{CausationID: inputID, TriggeredByLoopID: fromLoop},
+			Header:    event.Header{Cause: identity.Cause{CommandID: inputID, Coordinates: identity.Coordinates{LoopID: fromLoop}}},
 			TurnIndex: 2,
-			InputID:   inputID,
 			Message:   userMsg,
 		}
-		if ev.EventHeader().TriggeredByLoopID != fromLoop {
-			t.Errorf("TriggeredByLoopID = %v, want %v", ev.EventHeader().TriggeredByLoopID, fromLoop)
+		if ev.EventHeader().Cause.LoopID != fromLoop {
+			t.Errorf("Cause.LoopID = %v, want %v", ev.EventHeader().Cause.LoopID, fromLoop)
 		}
 		if ev.Message != userMsg {
 			t.Errorf("Message = %v, want %v", ev.Message, userMsg)
@@ -236,8 +238,7 @@ func TestNewEventFields(t *testing.T) {
 	t.Run("InputCancelled carries Reason and Message", func(t *testing.T) {
 		t.Parallel()
 		ev := event.InputCancelled{
-			Header:  event.Header{CausationID: inputID},
-			InputID: inputID,
+			Header:  event.Header{Cause: identity.Cause{CommandID: inputID}},
 			Reason:  event.CancelClientRetracted,
 			Message: userMsg,
 		}
@@ -263,8 +264,7 @@ func TestNewEventFields(t *testing.T) {
 	t.Run("InputCancelled carries CancelTurnFailed reason", func(t *testing.T) {
 		t.Parallel()
 		ev := event.InputCancelled{
-			Header:  event.Header{CausationID: inputID},
-			InputID: inputID,
+			Header:  event.Header{Cause: identity.Cause{CommandID: inputID}},
 			Reason:  event.CancelTurnFailed,
 			Message: userMsg,
 		}
@@ -295,35 +295,33 @@ func TestNewEventFields(t *testing.T) {
 		}
 	})
 
-	t.Run("InputQueued carries InputID and CausationID", func(t *testing.T) {
+	t.Run("InputQueued carries InputID and Cause.CommandID", func(t *testing.T) {
 		t.Parallel()
 		ev := event.InputQueued{
-			Header:  event.Header{CausationID: inputID},
-			InputID: inputID,
+			Header: event.Header{Cause: identity.Cause{CommandID: inputID}},
 		}
-		if ev.InputID != inputID {
-			t.Errorf("InputID = %v, want %v", ev.InputID, inputID)
+		if ev.Cause.CommandID != inputID {
+			t.Errorf("InputID = %v, want %v", ev.Cause.CommandID, inputID)
 		}
-		if ev.EventHeader().CausationID != inputID {
-			t.Errorf("CausationID = %v, want %v (must equal InputID)", ev.EventHeader().CausationID, inputID)
+		if ev.EventHeader().Cause.CommandID != inputID {
+			t.Errorf("Cause.CommandID = %v, want %v (must equal InputID)", ev.EventHeader().Cause.CommandID, inputID)
 		}
 	})
 
 	t.Run("TurnRejected carries InputID and Reason", func(t *testing.T) {
 		t.Parallel()
 		ev := event.TurnRejected{
-			Header:  event.Header{CausationID: inputID},
-			InputID: inputID,
-			Reason:  event.RejectQueueFull,
+			Header: event.Header{Cause: identity.Cause{CommandID: inputID}},
+			Reason: event.RejectQueueFull,
 		}
-		if ev.InputID != inputID {
-			t.Errorf("InputID = %v, want %v", ev.InputID, inputID)
+		if ev.Cause.CommandID != inputID {
+			t.Errorf("InputID = %v, want %v", ev.Cause.CommandID, inputID)
 		}
 		if ev.Reason != event.RejectQueueFull {
 			t.Errorf("Reason = %v, want %v", ev.Reason, event.RejectQueueFull)
 		}
-		if ev.EventHeader().CausationID != inputID {
-			t.Errorf("CausationID = %v, want %v (must equal InputID)", ev.EventHeader().CausationID, inputID)
+		if ev.EventHeader().Cause.CommandID != inputID {
+			t.Errorf("Cause.CommandID = %v, want %v (must equal InputID)", ev.EventHeader().Cause.CommandID, inputID)
 		}
 	})
 

@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/inventivepotter/urvi/internal/agent/loop/event"
+	"github.com/inventivepotter/urvi/internal/agent/loop/identity"
 	"github.com/inventivepotter/urvi/internal/agent/session/hub"
 	"github.com/inventivepotter/urvi/internal/content"
 	"github.com/inventivepotter/urvi/internal/uuid"
@@ -23,15 +24,15 @@ func allFilter() event.EventFilter {
 // TestSessionStartedDeliveredToLateSubscriber proves the session emits the
 // session-scoped SessionStarted through the hub at construction. Because the hub
 // has no buffering for pre-subscription events, a subscriber that attaches after
-// NewAgent will not receive that initial SessionStarted — but a fresh
+// New will not receive that initial SessionStarted — but a fresh
 // SessionStarted from a subsequent publish (or, here, the session's own start
 // being session-scoped) confirms wiring. We assert wiring by publishing a
 // session-scoped event after subscribing and seeing it arrive.
 func TestHubWiringDeliversSessionEvents(t *testing.T) {
 	t.Parallel()
-	s, err := NewAgent(context.Background(), cfg(&stubLLM{chunks: []content.Chunk{textChunk("x")}}))
+	s, err := New(context.Background(), cfg(&stubLLM{chunks: []content.Chunk{textChunk("x")}}))
 	if err != nil {
-		t.Fatalf("NewAgent: %v", err)
+		t.Fatalf("New: %v", err)
 	}
 	t.Cleanup(func() { _ = s.Shutdown(context.Background()) })
 
@@ -43,7 +44,7 @@ func TestHubWiringDeliversSessionEvents(t *testing.T) {
 
 	// Publish a session-scoped event through the session's PublishEvent; the
 	// subscriber must receive it (proving PublishEvent -> hub -> subscriber wiring).
-	if err := s.PublishEvent(context.Background(), event.SessionStarted{Header: event.Header{SessionID: s.SessionID}}); err != nil {
+	if err := s.PublishEvent(context.Background(), event.SessionStarted{Header: event.Header{Coordinates: identity.Coordinates{SessionID: s.SessionID}}}); err != nil {
 		t.Fatalf("PublishEvent: %v", err)
 	}
 	select {
@@ -67,9 +68,9 @@ func TestHubWiringDeliversSessionEvents(t *testing.T) {
 // contract the TUI depends on.
 func TestSubscribeSeamDefaultFilterDeliversSessionEvent(t *testing.T) {
 	t.Parallel()
-	s, err := NewAgent(context.Background(), cfg(&stubLLM{chunks: []content.Chunk{textChunk("x")}}))
+	s, err := New(context.Background(), cfg(&stubLLM{chunks: []content.Chunk{textChunk("x")}}))
 	if err != nil {
-		t.Fatalf("NewAgent: %v", err)
+		t.Fatalf("New: %v", err)
 	}
 	t.Cleanup(func() { _ = s.Shutdown(context.Background()) })
 
@@ -90,7 +91,7 @@ func TestSubscribeSeamDefaultFilterDeliversSessionEvent(t *testing.T) {
 	t.Cleanup(func() { _ = sub.Close() })
 
 	// A session-scoped event must arrive through the default filter.
-	if err := s.PublishEvent(context.Background(), event.SessionIdle{Header: event.Header{SessionID: s.SessionID}}); err != nil {
+	if err := s.PublishEvent(context.Background(), event.SessionIdle{Header: event.Header{Coordinates: identity.Coordinates{SessionID: s.SessionID}}}); err != nil {
 		t.Fatalf("PublishEvent: %v", err)
 	}
 	select {
@@ -113,9 +114,9 @@ func TestSubscribeSeamDefaultFilterDeliversSessionEvent(t *testing.T) {
 // so WaitIdle returns nil immediately.
 func TestWaitIdleFreshSession(t *testing.T) {
 	t.Parallel()
-	s, err := NewAgent(context.Background(), cfg(&stubLLM{chunks: []content.Chunk{textChunk("x")}}))
+	s, err := New(context.Background(), cfg(&stubLLM{chunks: []content.Chunk{textChunk("x")}}))
 	if err != nil {
-		t.Fatalf("NewAgent: %v", err)
+		t.Fatalf("New: %v", err)
 	}
 	t.Cleanup(func() { _ = s.Shutdown(context.Background()) })
 
@@ -132,9 +133,9 @@ func TestWaitIdleFreshSession(t *testing.T) {
 // not flip the phase back to idle/active (WaitIdle keeps returning ErrSessionStopped).
 func TestShutdownStopsSessionAndWaitIdle(t *testing.T) {
 	t.Parallel()
-	s, err := NewAgent(context.Background(), cfg(&stubLLM{chunks: []content.Chunk{textChunk("x")}}))
+	s, err := New(context.Background(), cfg(&stubLLM{chunks: []content.Chunk{textChunk("x")}}))
 	if err != nil {
-		t.Fatalf("NewAgent: %v", err)
+		t.Fatalf("New: %v", err)
 	}
 
 	sub, err := s.SubscribeEvents(allFilter())
@@ -170,7 +171,7 @@ func TestShutdownStopsSessionAndWaitIdle(t *testing.T) {
 	}
 
 	// A late loop event published after stop is delivered but does not flip phase.
-	if err := s.PublishEvent(context.Background(), event.LoopIdle{Header: event.Header{SessionID: s.SessionID}}); err != nil {
+	if err := s.PublishEvent(context.Background(), event.LoopIdle{Header: event.Header{Coordinates: identity.Coordinates{SessionID: s.SessionID}}}); err != nil {
 		t.Fatalf("post-stop PublishEvent = %v", err)
 	}
 	if err := s.WaitIdle(context.Background()); !errors.Is(err, hub.ErrSessionStopped) {
@@ -183,9 +184,9 @@ func TestShutdownStopsSessionAndWaitIdle(t *testing.T) {
 // inert in production (no async subagents yet) but the wiring is exercised here.
 func TestExpectCancelExpectTurnSessionWiring(t *testing.T) {
 	t.Parallel()
-	s, err := NewAgent(context.Background(), cfg(&stubLLM{chunks: []content.Chunk{textChunk("x")}}))
+	s, err := New(context.Background(), cfg(&stubLLM{chunks: []content.Chunk{textChunk("x")}}))
 	if err != nil {
-		t.Fatalf("NewAgent: %v", err)
+		t.Fatalf("New: %v", err)
 	}
 	t.Cleanup(func() { _ = s.Shutdown(context.Background()) })
 

@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/inventivepotter/urvi/internal/agent/loop/event"
+	"github.com/inventivepotter/urvi/internal/agent/loop/identity"
 	"github.com/inventivepotter/urvi/internal/uuid"
 )
 
@@ -26,32 +27,32 @@ func TestDefaultEventFilter(t *testing.T) {
 	}{
 		{
 			name: "primary loop TokenDelta delivers (live tokens from the watched loop)",
-			ev:   event.TokenDelta{Header: event.Header{LoopID: primary}},
+			ev:   event.TokenDelta{Header: event.Header{Coordinates: identity.Coordinates{LoopID: primary}}},
 			want: true,
 		},
 		{
 			name: "subagent TokenDelta is filtered out (its firehose never enters egress)",
-			ev:   event.TokenDelta{Header: event.Header{LoopID: subagent}},
+			ev:   event.TokenDelta{Header: event.Header{Coordinates: identity.Coordinates{LoopID: subagent}}},
 			want: false,
 		},
 		{
 			name: "primary loop StepDone delivers (finalized group)",
-			ev:   event.StepDone{Header: event.Header{LoopID: primary}},
+			ev:   event.StepDone{Header: event.Header{Coordinates: identity.Coordinates{LoopID: primary}}},
 			want: true,
 		},
 		{
 			name: "subagent StepDone delivers (all-loop Enduring: collapsed-but-present)",
-			ev:   event.StepDone{Header: event.Header{LoopID: subagent}},
+			ev:   event.StepDone{Header: event.Header{Coordinates: identity.Coordinates{LoopID: subagent}}},
 			want: true,
 		},
 		{
 			name: "subagent TurnDone terminal delivers (all-loop Enduring)",
-			ev:   event.TurnDone{Header: event.Header{LoopID: subagent}},
+			ev:   event.TurnDone{Header: event.Header{Coordinates: identity.Coordinates{LoopID: subagent}}},
 			want: true,
 		},
 		{
 			name: "session-scoped SessionIdle always delivers (bypasses the loop filter)",
-			ev:   event.SessionIdle{Header: event.Header{SessionID: loopID(9)}},
+			ev:   event.SessionIdle{Header: event.Header{Coordinates: identity.Coordinates{SessionID: loopID(9)}}},
 			want: true,
 		},
 	}

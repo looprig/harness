@@ -123,10 +123,10 @@ func TestSubmitFireAndForget(t *testing.T) {
 			if ui.Mode != tt.wantMode {
 				t.Errorf("Mode = %v, want %v (AllowFold = queueable)", ui.Mode, tt.wantMode)
 			}
-			// The returned InputID is the command's Header.ID — the CausationID the
+			// The returned InputID is the command's Header.ID — the Cause.CommandID the
 			// Reply events will carry. They must be identical.
-			if ui.Header.ID != res.id {
-				t.Errorf("UserInput.Header.ID = %v, want returned InputID %v", ui.Header.ID, res.id)
+			if ui.Header.CommandID != res.id {
+				t.Errorf("UserInput.Header.ID = %v, want returned InputID %v", ui.Header.CommandID, res.id)
 			}
 			// Fire-and-forget: no per-turn stream is attached.
 			if ui.Events != nil {

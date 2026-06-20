@@ -1,5 +1,5 @@
 // Package personalassistant is a conversational personal-assistant agent built
-// on the session engine. It wraps a session.AgentSession with a fixed persona
+// on the session engine. It wraps a session.Session with a fixed persona
 // and a named model, exposing a small text-in / event-out surface.
 package personalassistant
 
@@ -40,10 +40,10 @@ const personaPrompt = `You are a helpful, concise personal assistant. Answer ` +
 // is a false positive here.
 const envAPIKey = "LLM_API_KEY" // #nosec G101 -- env var name, not a credential
 
-// Assistant is a persona-bearing wrapper over a session.AgentSession. The
+// Assistant is a persona-bearing wrapper over a session.Session. The
 // caller owns it and must call Close to release the underlying actor goroutine.
 type Assistant struct {
-	session       *session.Sesssion
+	session       *session.Session
 	cancel        context.CancelFunc // cancels the session's root context; called by Close
 	acceptsImages bool               // captured from spec at construction; reported by AcceptsImages
 }
@@ -99,7 +99,7 @@ func newWithClient(ctx context.Context, client llm.LLM, spec llm.ModelSpec) (*As
 		return nil, err
 	}
 	rootCtx, cancel := context.WithCancel(context.Background())
-	sess, err := session.NewAgent(rootCtx, loop.Config{Client: client, Model: spec, Tools: toolSet})
+	sess, err := session.New(rootCtx, loop.Config{Client: client, Model: spec, Tools: toolSet})
 	if err != nil {
 		cancel()
 		return nil, err
@@ -199,7 +199,7 @@ func (a *Assistant) StreamBlocks(ctx context.Context, blocks []content.Block) (*
 }
 
 // Submit delivers a multimodal user message FIRE-AND-FORGET as a queueable
-// (AllowFold) UserInput and returns the InputID — the CausationID the resulting
+// (AllowFold) UserInput and returns the InputID — the Cause.CommandID the resulting
 // Reply events (InputQueued / TurnStarted / TurnFoldedInto / TurnRejected /
 // InputCancelled) carry on the session fan-in. The Go error is non-nil only when
 // the command could not be handed to the loop (loop gone, or ctx done); the turn
@@ -235,20 +235,25 @@ func (a *Assistant) AcceptsImages() bool { return a.acceptsImages }
 
 // Approve resolves a pending tool-call permission gate, granting it at scope. It
 // delegates verbatim to the session; the wrapper holds no gate state of its own.
-func (a *Assistant) Approve(ctx context.Context, callID uuid.UUID, scope tool.ApprovalScope) error {
-	return a.session.Approve(ctx, callID, scope)
+// loopID is the loop that opened the gate, so the reply reaches the right loop in a
+// multi-loop session (the session falls back to its primary loop for a zero id).
+func (a *Assistant) Approve(ctx context.Context, loopID, callID uuid.UUID, scope tool.ApprovalScope) error {
+	return a.session.Approve(ctx, loopID, callID, scope)
 }
 
 // Deny resolves a pending tool-call permission gate by failing it closed
-// (fail-secure); nothing is persisted. It delegates to the session.
-func (a *Assistant) Deny(ctx context.Context, callID uuid.UUID) error {
-	return a.session.Deny(ctx, callID)
+// (fail-secure); nothing is persisted. It delegates to the session. loopID names
+// the gate-opening loop so the reply is dispatched there, not unconditionally to
+// the primary loop.
+func (a *Assistant) Deny(ctx context.Context, loopID, callID uuid.UUID) error {
+	return a.session.Deny(ctx, loopID, callID)
 }
 
 // ProvideAnswer supplies the user's reply to a pending AskUser request. It is the
 // TUI-facing name for the session's ProvideUserInput, to which it delegates.
-func (a *Assistant) ProvideAnswer(ctx context.Context, callID uuid.UUID, answer string) error {
-	return a.session.ProvideUserInput(ctx, callID, answer)
+// loopID names the gate-opening loop so the answer reaches the right loop.
+func (a *Assistant) ProvideAnswer(ctx context.Context, loopID, callID uuid.UUID, answer string) error {
+	return a.session.ProvideUserInput(ctx, loopID, callID, answer)
 }
 
 // Close gracefully shuts the session down and releases the session's root

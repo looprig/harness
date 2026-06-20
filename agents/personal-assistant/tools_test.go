@@ -68,13 +68,13 @@ func toolNames(t *testing.T, reg []tool.InvokableTool) []string {
 // The proof is deterministic by construction. We Close the assistant FIRST: Close
 // calls session.Shutdown, which blocks until the actor goroutine has exited and
 // loop.Done is closed, so nothing reads loop.Commands any longer. We then invoke
-// each wrapper with a LIVE (non-cancelled) ctx. Inside session.routeCommand the
+// each wrapper with a LIVE (non-cancelled) ctx. Inside session.routeGate the
 // select has the unbuffered send to loop.Commands (blocks forever — no reader),
 // <-loop.Done (closed — READY), and <-ctx.Done() (live — never ready). Only the
 // Done case can fire, so every call returns *session.SessionError{SessionLoopExited}
 // every time — no race between a winning send and a cancelled ctx.
 //
-// Observing that exact typed error proves the call reached session.routeCommand:
+// Observing that exact typed error proves the call reached session.routeGate:
 // a local short-circuit in the wrapper could not synthesize a *session.SessionError.
 func TestGateTrioDelegatesToSession(t *testing.T) {
 	t.Parallel()
@@ -86,19 +86,19 @@ func TestGateTrioDelegatesToSession(t *testing.T) {
 		{
 			name: "Approve",
 			invoke: func(ctx context.Context, a *Assistant) error {
-				return a.Approve(ctx, mustUUID(t), tool.ScopeSession)
+				return a.Approve(ctx, a.PrimaryLoopID(), mustUUID(t), tool.ScopeSession)
 			},
 		},
 		{
 			name: "Deny",
 			invoke: func(ctx context.Context, a *Assistant) error {
-				return a.Deny(ctx, mustUUID(t))
+				return a.Deny(ctx, a.PrimaryLoopID(), mustUUID(t))
 			},
 		},
 		{
 			name: "ProvideAnswer",
 			invoke: func(ctx context.Context, a *Assistant) error {
-				return a.ProvideAnswer(ctx, mustUUID(t), "the answer")
+				return a.ProvideAnswer(ctx, a.PrimaryLoopID(), mustUUID(t), "the answer")
 			},
 		},
 	}
