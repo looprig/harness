@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+	"unicode/utf8"
 
 	"github.com/inventivepotter/urvi/internal/content"
 )
@@ -128,10 +129,17 @@ func buildAttachment(path string, allowImages bool) (content.Block, error) {
 			return nil, err
 		}
 		return &content.ImageBlock{MediaType: mediaType, Source: content.ImageSource{Data: data}}, nil
-	case isPlaintextExt(ext):
+	case isPlaintextExt(ext) || ext == "":
 		data, err := readAttachment(clean)
 		if err != nil {
 			return nil, err
+		}
+		// Extensionless files (Makefile, Dockerfile, LICENSE, .env-less configs, …) are
+		// commonly plaintext. Accept them as text ONLY when the content is valid UTF-8,
+		// so attaching a binary without an extension is rejected cleanly rather than
+		// injecting garbage. Known plaintext extensions are trusted without the check.
+		if ext == "" && !utf8.Valid(data) {
+			return nil, &BinaryAttachmentError{Path: clean}
 		}
 		return &content.TextBlock{Text: "[" + filepath.Base(clean) + "]\n" + string(data)}, nil
 	default:

@@ -19,6 +19,13 @@ func (e UnsupportedAttachmentError) Error() string {
 	return fmt.Sprintf("tui: unsupported attachment extension %q (expected image or plaintext)", e.Ext)
 }
 
+// BinaryAttachmentError — an extensionless @path whose content is not UTF-8 text.
+type BinaryAttachmentError struct{ Path string }
+
+func (e BinaryAttachmentError) Error() string {
+	return fmt.Sprintf("tui: attachment %q is not UTF-8 text (binary file)", e.Path)
+}
+
 // ImageUnsupportedError — image @path while the active model is text-only.
 type ImageUnsupportedError struct{ Ext string }
 

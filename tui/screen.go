@@ -519,6 +519,10 @@ func (m *Screen) mapAction(a uiAction) tea.Cmd {
 func (m *Screen) submit(text string) tea.Cmd {
 	blocks, err := buildBlocks(text, m.agent.AcceptsImages())
 	if err != nil {
+		// composeEnter already cleared the editor, so restore the text — a bad @path
+		// (or other build error) must not swallow the user's whole message; they can
+		// fix it and resubmit. The error is surfaced as a faint notice above.
+		m.interaction.input.SetValue(text)
 		m.transcript = m.transcript.CommitError(err)
 		return m.flush()
 	}

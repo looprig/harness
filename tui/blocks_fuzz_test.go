@@ -68,6 +68,7 @@ func isKnownBuildError(err error) bool {
 	var (
 		empty       *EmptyInputError
 		unsupported *UnsupportedAttachmentError
+		binary      *BinaryAttachmentError
 		imageUnsup  *ImageUnsupportedError
 		denied      *DeniedAttachmentError
 		tooLarge    *AttachmentTooLargeError
@@ -77,6 +78,7 @@ func isKnownBuildError(err error) bool {
 	switch {
 	case errors.As(err, &empty),
 		errors.As(err, &unsupported),
+		errors.As(err, &binary),
 		errors.As(err, &imageUnsup),
 		errors.As(err, &denied),
 		errors.As(err, &tooLarge),

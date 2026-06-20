@@ -45,6 +45,50 @@ func TestBuildBlocksTextOnly(t *testing.T) {
 	}
 }
 
+// TestBuildBlocksExtensionlessFile covers attaching a file with no extension (Makefile,
+// Dockerfile, LICENSE, …): UTF-8 text is accepted as a plaintext block, binary content
+// is rejected with a BinaryAttachmentError rather than the misleading "unsupported
+// extension" message.
+func TestBuildBlocksExtensionlessFile(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		filename string
+		data     []byte
+		wantErr  bool
+		wantText string
+	}{
+		{name: "Makefile is plaintext", filename: "Makefile", data: []byte("build:\n\tgo build ./...\n"), wantText: "[Makefile]\nbuild:\n\tgo build ./...\n"},
+		{name: "Dockerfile is plaintext", filename: "Dockerfile", data: []byte("FROM scratch\n"), wantText: "[Dockerfile]\nFROM scratch\n"},
+		{name: "binary extensionless is rejected", filename: "blob", data: []byte{0x00, 0xff, 0xfe, 0x80}, wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			p := writeFile(t, t.TempDir(), tt.filename, tt.data)
+			got, err := buildBlocks("@"+p, true)
+			if tt.wantErr {
+				var binErr *BinaryAttachmentError
+				if !errors.As(err, &binErr) {
+					t.Fatalf("buildBlocks(@%s) error = %v, want *BinaryAttachmentError", tt.filename, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("buildBlocks(@%s) error = %v, want nil", tt.filename, err)
+			}
+			tb, ok := got[0].(*content.TextBlock)
+			if !ok {
+				t.Fatalf("block[0] = %T, want *content.TextBlock", got[0])
+			}
+			if tb.Text != tt.wantText {
+				t.Errorf("Text = %q, want %q", tb.Text, tt.wantText)
+			}
+		})
+	}
+}
+
 // TestSplitInputPreservesFormatting locks the fix for multi-line input being
 // flattened: splitInput must keep the prompt's newlines (and in-line spacing) verbatim
 // while still pulling out @path attachments, instead of reflowing everything through
