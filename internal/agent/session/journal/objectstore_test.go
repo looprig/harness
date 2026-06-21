@@ -2,12 +2,149 @@ package journal
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"strings"
 	"testing"
+
+	"github.com/nats-io/nats.go"
 )
+
+// fakePutter is a test double for objectPutter. It records the (name, data) of the
+// single PutBytes call and returns errPut so the offload path can be driven down both
+// its success (errPut == nil) and fail-closed (errPut != nil) arms without a live
+// object store. called proves we attempted the upload (so the fail-closed assertion is
+// that we tried then failed, not that we skipped the put).
+type fakePutter struct {
+	errPut  error
+	called  bool
+	gotName string
+	gotData []byte
+}
+
+func (f *fakePutter) PutBytes(name string, data []byte, _ ...nats.ObjectOpt) (*nats.ObjectInfo, error) {
+	f.called = true
+	f.gotName = name
+	f.gotData = data
+	if f.errPut != nil {
+		return nil, f.errPut
+	}
+	return &nats.ObjectInfo{}, nil
+}
+
+// TestBuildOffloadMessage covers the offload path's two outcomes against a fake
+// objectPutter: a successful, content-addressed upload that yields a pointer message,
+// and an upload failure that fails closed with a typed *RecordTooLargeError (NO pointer
+// built or appendable). This is the only coverage of the PutBytes failure arm — the
+// whole reason the narrow objectPutter interface and RecordTooLargeError exist.
+func TestBuildOffloadMessage(t *testing.T) {
+	t.Parallel()
+
+	errPutFailed := errors.New("object store unavailable")
+
+	tests := []struct {
+		name    string
+		putErr  error // nil ⇒ success row; non-nil ⇒ fail-closed row
+		payload []byte
+		wantErr bool
+	}{
+		{
+			name:    "success uploads content-addressed and builds pointer",
+			payload: bytes.Repeat([]byte{0xab}, inlineThreshold+1),
+		},
+		{
+			name:    "put failure fails closed with RecordTooLargeError",
+			putErr:  errPutFailed,
+			payload: bytes.Repeat([]byte{0xcd}, inlineThreshold+1),
+			wantErr: true,
+		},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			putter := &fakePutter{errPut: tt.putErr}
+			rec := foreignRecord{subject: "urvi.test.subject", id: "test-msg-id"}
+
+			msg, err := buildOffloadMessage(context.Background(), putter, rec, tt.payload)
+
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("buildOffloadMessage() err = %v, wantErr %v", err, tt.wantErr)
+			}
+
+			// Both arms must attempt the upload before deciding — upload-before-append.
+			if !putter.called {
+				t.Fatalf("PutBytes was not called; offload never attempted the upload")
+			}
+
+			if tt.wantErr {
+				// Fail-closed: nil message, typed *RecordTooLargeError unwrapping to cause.
+				if msg != nil {
+					t.Errorf("buildOffloadMessage() msg = %v, want nil on failure", msg)
+				}
+				var tooLarge *RecordTooLargeError
+				if !errors.As(err, &tooLarge) {
+					t.Fatalf("error %v is not *RecordTooLargeError", err)
+				}
+				if !errors.Is(err, tt.putErr) {
+					t.Errorf("error %v does not unwrap to put sentinel %v", err, tt.putErr)
+				}
+				if tooLarge.Unwrap() != tt.putErr {
+					t.Errorf("RecordTooLargeError.Unwrap() = %v, want %v", tooLarge.Unwrap(), tt.putErr)
+				}
+				if tooLarge.Subject != rec.Subject() {
+					t.Errorf("RecordTooLargeError.Subject = %q, want %q", tooLarge.Subject, rec.Subject())
+				}
+				if tooLarge.MsgID != rec.IdempotencyID() {
+					t.Errorf("RecordTooLargeError.MsgID = %q, want %q", tooLarge.MsgID, rec.IdempotencyID())
+				}
+				if tooLarge.Length != len(tt.payload) {
+					t.Errorf("RecordTooLargeError.Length = %d, want %d", tooLarge.Length, len(tt.payload))
+				}
+				return
+			}
+
+			// Success: the upload is content-addressed (name == hex(sha256(payload))) and
+			// carries the exact payload bytes.
+			wantID := objectID(tt.payload)
+			if putter.gotName != wantID {
+				t.Errorf("PutBytes name = %q, want content address %q", putter.gotName, wantID)
+			}
+			sum := sha256.Sum256(tt.payload)
+			if putter.gotName != hex.EncodeToString(sum[:]) {
+				t.Errorf("PutBytes name = %q, want hex(sha256(payload))", putter.gotName)
+			}
+			if !bytes.Equal(putter.gotData, tt.payload) {
+				t.Errorf("PutBytes data (%d bytes) != payload (%d bytes)", len(putter.gotData), len(tt.payload))
+			}
+
+			// Success: the returned pointer message has the content-id header and a body
+			// that decodes to a pointer matching the upload.
+			if msg == nil {
+				t.Fatalf("buildOffloadMessage() msg = nil, want a pointer message")
+			}
+			if got := msg.Header.Get(objectIDHeader); got != wantID {
+				t.Errorf("%s header = %q, want %q", objectIDHeader, got, wantID)
+			}
+			if got := msg.Header.Get(nats.MsgIdHdr); got != rec.IdempotencyID() {
+				t.Errorf("%s header = %q, want %q", nats.MsgIdHdr, got, rec.IdempotencyID())
+			}
+			if msg.Subject != rec.Subject() {
+				t.Errorf("msg.Subject = %q, want %q", msg.Subject, rec.Subject())
+			}
+			ptr, decErr := unmarshalPointer(msg.Data)
+			if decErr != nil {
+				t.Fatalf("unmarshalPointer(msg.Data): %v", decErr)
+			}
+			want := pointerRecord{ObjectID: wantID, Length: uint64(len(tt.payload)), CodecVersion: pointerCodecVersion}
+			if ptr != want {
+				t.Errorf("pointer = %#v, want %#v", ptr, want)
+			}
+		})
+	}
+}
 
 // TestObjectID asserts the content-addressed id is the lowercase hex sha256 of the
 // payload, so identical bytes always map to the same object name (idempotent put) and
