@@ -8,15 +8,19 @@ package coding
 import (
 	"context"
 	"crypto/tls"
+	"errors"
+	"io"
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/inventivepotter/urvi/agents/coding/prompts"
 	"github.com/inventivepotter/urvi/internal/agent/loop"
 	"github.com/inventivepotter/urvi/internal/agent/loop/event"
 	"github.com/inventivepotter/urvi/internal/agent/session"
+	"github.com/inventivepotter/urvi/internal/agent/session/journal"
 	"github.com/inventivepotter/urvi/internal/content"
 	"github.com/inventivepotter/urvi/internal/llm"
 	"github.com/inventivepotter/urvi/internal/llm/auto"
@@ -43,6 +47,23 @@ type Coding struct {
 	session       *session.Session
 	cancel        context.CancelFunc // cancels the session's root context; called by Close
 	acceptsImages bool               // captured from spec at construction; reported by AcceptsImages
+
+	// teardown is the composition-root persistence teardown the persisted constructors
+	// install: it releases the single-writer lease (so a successor can re-acquire without
+	// waiting out the TTL) and stops the GC ticker. It is nil for a non-persisted (headless
+	// / fake-only) agent, so Close is unchanged in that mode. Run AFTER session.Shutdown so
+	// the journal has finished its last append before the lease is relinquished. Idempotent
+	// (guarded by teardownOnce) so Close can safely be called more than once.
+	teardown     func(context.Context) error
+	teardownOnce sync.Once
+
+	// replayer is the journal-backed read side a RESTORED session's ReplayBacklog drains
+	// for the TUI's cold-restore repaint. It is nil for a NEW session (new sessions have no
+	// backlog to repaint → ReplayBacklog returns nil). restoredSessionID/restoredPrimaryLoopID
+	// scope the cold replay to the primary loop's session view.
+	replayer              journal.EventReplayer
+	restoredSessionID     uuid.UUID
+	restoredPrimaryLoopID uuid.UUID
 }
 
 // New constructs a Coding agent. The session runs under an agent-owned root
@@ -54,24 +75,37 @@ type Coding struct {
 // and none is set, then builds the provider client via auto.New and starts the
 // session actor. The caller owns the Coding agent and must call Close to release it.
 func New(ctx context.Context) (*Coding, error) {
+	client, spec, err := buildClient()
+	if err != nil {
+		return nil, err
+	}
+	return newWithClient(ctx, client, spec)
+}
+
+// buildClient is the credential/provider boundary shared by New and NewPersistent: it
+// reads LLM_API_KEY (the only env-sourced value), refuses an unclassified provider (fail
+// secure), fails loud (typed *MissingEnvError) if the provider requires a key and none is
+// set, then builds + validates the provider client via auto.New. It is the single place
+// the API key is read and passed verbatim (never normalized — the TrimSpace is a presence
+// check, not a sanitizer), so the #nosec rationale on envAPIKey lives in one spot.
+func buildClient() (llm.LLM, llm.ModelSpec, error) {
 	needsKey, err := model.Provider.RequiresKey()
 	if err != nil {
-		return nil, err // unclassified provider — fail secure
+		return nil, llm.ModelSpec{}, err // unclassified provider — fail secure
 	}
 	apiKey := os.Getenv(envAPIKey)
 	if needsKey && strings.TrimSpace(apiKey) == "" {
 		// env is a boundary: treat whitespace-only as missing so the failure is
 		// loud at startup, not deferred to provider call time.
-		return nil, &MissingEnvError{Var: envAPIKey}
+		return nil, llm.ModelSpec{}, &MissingEnvError{Var: envAPIKey}
 	}
-	// Pass the key verbatim — never normalize credential material. The TrimSpace
-	// above is a presence check, not a sanitizer.
+	// Pass the key verbatim — never normalize credential material.
 	spec := model.Spec(apiKey, prompts.SystemPrompt)
 	client, err := auto.New(spec) // validates spec + dispatches on provider
 	if err != nil {
-		return nil, err
+		return nil, llm.ModelSpec{}, err
 	}
-	return newWithClient(ctx, client, spec)
+	return client, spec, nil
 }
 
 // newWithClient is the construction seam shared by New and tests; tests inject a
@@ -80,14 +114,48 @@ func New(ctx context.Context) (*Coding, error) {
 // the caller's ctx — so a request-scoped or timeout ctx passed to New cannot
 // later tear the session down. ctx bounds only this construction call.
 func newWithClient(ctx context.Context, client llm.LLM, spec llm.ModelSpec) (*Coding, error) {
+	build, err := newLoopBuild(ctx, client, spec)
+	if err != nil {
+		return nil, err
+	}
+	// Headless / no-persistence: a bare session.New (nop appenders). The spawner is
+	// late-bound after the session exists (see codingSpawner doc).
+	sess, err := session.New(build.rootCtx, build.cfg)
+	if err != nil {
+		build.cancel()
+		return nil, err
+	}
+	build.spawner.session = sess
+	return &Coding{session: sess, cancel: build.cancel, acceptsImages: spec.AcceptsImages}, nil
+}
+
+// loopBuild is the shared construction artifact both the headless (newWithClient) and
+// persisted (newPersistentWithClient) constructors produce before calling session.New /
+// session.Restore: the agent-owned root context (+ its cancel), the late-bindable
+// spawner, and the loop.Config. Extracting it keeps the workspace-root + http-client +
+// tool-set + spawner-cycle wiring in ONE place so the two construction paths cannot drift.
+type loopBuild struct {
+	rootCtx context.Context
+	cancel  context.CancelFunc
+	spawner *codingSpawner
+	cfg     loop.Config
+}
+
+// newLoopBuild assembles the shared loopBuild: it validates ctx (fail-fast if already
+// cancelled), resolves the workspace root, builds the agent-owned root context, the HTTP
+// client, the spawner (empty session, late-bound by the caller after the session exists),
+// and the tool set, then returns the loop.Config. On any failure it returns a typed error
+// and leaks nothing (the root context is only created after the fail-fast checks pass, and
+// the caller owns cancelling it once it has a Coding).
+func newLoopBuild(ctx context.Context, client llm.LLM, spec llm.ModelSpec) (loopBuild, error) {
 	if err := ctx.Err(); err != nil {
-		return nil, &session.SessionError{Kind: session.SessionContextDone, Cause: err}
+		return loopBuild{}, &session.SessionError{Kind: session.SessionContextDone, Cause: err}
 	}
 	// The workspace root is the process working directory: file tools are confined
 	// to it and the PermissionChecker uses it for containment + path relativisation.
 	root, err := os.Getwd()
 	if err != nil {
-		return nil, &WorkspaceRootError{Cause: err}
+		return loopBuild{}, &WorkspaceRootError{Cause: err}
 	}
 
 	// The session's root context — independent of the caller's ctx — owns the
@@ -96,20 +164,18 @@ func newWithClient(ctx context.Context, client llm.LLM, spec llm.ModelSpec) (*Co
 
 	httpCl := newHTTPClient()
 
-	// Resolve the spawner↔session cycle by late-binding: the Subagent tool needs
-	// the spawner, and the spawner needs the live session, but the tools must be
-	// built BEFORE session.New (it takes the ToolSet). So build the spawner empty,
-	// wire it into the tool set, construct the session, then set spawner.session
-	// once — synchronously, before any turn runs (see codingSpawner doc).
+	// Resolve the spawner↔session cycle by late-binding: the Subagent tool needs the
+	// spawner, and the spawner needs the live session, but the tools must be built BEFORE
+	// session.New (it takes the ToolSet). So build the spawner empty here; the caller wires
+	// spawner.session once — synchronously, after session construction, before any turn.
 	spawner := &codingSpawner{root: root, httpCl: httpCl, client: client, spec: spec}
 	toolSet := buildToolSet(root, httpCl, spawner)
-	sess, err := session.New(rootCtx, loop.Config{Client: client, Model: spec, Tools: toolSet})
-	if err != nil {
-		cancel()
-		return nil, err
-	}
-	spawner.session = sess // late-bind: tools were built before the session existed
-	return &Coding{session: sess, cancel: cancel, acceptsImages: spec.AcceptsImages}, nil
+	return loopBuild{
+		rootCtx: rootCtx,
+		cancel:  cancel,
+		spawner: spawner,
+		cfg:     loop.Config{Client: client, Model: spec, Tools: toolSet},
+	}, nil
 }
 
 // autoApprovedTools is the coding agent's hard-approve set (design §4c): the six
@@ -204,16 +270,44 @@ func (c *Coding) Subscribe(filter event.EventFilter) (event.Subscription, error)
 // its EventFilter (primary-only Ephemeral + all-loop Enduring).
 func (c *Coding) PrimaryLoopID() uuid.UUID { return c.session.PrimaryLoopID() }
 
+// SessionID returns the underlying session's id — the composition root reads it to print
+// the session being resumed and to key the catalog/lease. It is read-only identity.
+func (c *Coding) SessionID() uuid.UUID { return c.session.SessionID }
+
 // ReplayBacklog returns the RESTORED session's historical Enduring events for the
-// TUI's cold-restore repaint. A freshly-constructed session (New) is NOT a restore:
-// it has no backlog to repaint, so this returns nil and the TUI skips the repaint —
-// the new-session behavior is unchanged. Wiring a journal-backed EventReplayer here
-// for an actually-restored session (the cursor drain → materialized slice, scoped to
-// the primary loop's Enduring view) lands at the composition root in Phase 10.3, where
-// the new-vs-restore decision is made; until then a live session has no durable backlog
-// to replay. ctx bounds the read.
-func (c *Coding) ReplayBacklog(_ context.Context) ([]event.Event, error) {
-	return nil, nil
+// TUI's cold-restore repaint, in session order. A freshly-constructed session (New) is
+// NOT a restore: it has no replayer wired (c.replayer is nil), so this returns nil and
+// the TUI skips the repaint — the new-session behavior is unchanged. A RESTORED session
+// opens the primary loop's Enduring view (session subject + that loop's event subject),
+// drains the EventCursor to io.EOF into a materialized slice, and surfaces the journal's
+// typed fail-secure errors (a missing/corrupt offload object) unchanged — the TUI shows a
+// non-fatal restore-error notice; the live stream is unaffected. ctx bounds the read.
+func (c *Coding) ReplayBacklog(ctx context.Context) ([]event.Event, error) {
+	if c.replayer == nil {
+		return nil, nil // not a restore (new session) — nothing to repaint
+	}
+	cursor, err := c.replayer.Open(ctx, journal.ReplayRequest{
+		SessionID: c.restoredSessionID,
+		LoopID:    c.restoredPrimaryLoopID,
+		From:      journal.Beginning(),
+		Follow:    false, // cold restore: io.EOF at the backlog end
+	})
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = cursor.Close() }()
+
+	var out []event.Event
+	for {
+		ev, _, err := cursor.Next(ctx)
+		if errors.Is(err, io.EOF) {
+			return out, nil
+		}
+		if err != nil {
+			return nil, err // typed fail-secure error (object missing/corrupt) — surfaced unchanged
+		}
+		out = append(out, ev)
+	}
 }
 
 // Interrupt cancels the running turn. Returns true if a turn was cancelled.
@@ -253,8 +347,22 @@ func (c *Coding) ProvideAnswer(ctx context.Context, loopID, callID uuid.UUID, an
 // root as a backstop so the actor goroutine cannot leak even if Shutdown timed
 // out on ctx. Cancelling the root also tears down every in-session subagent loop
 // (they run under the same session root). Safe to call more than once.
+//
+// For a PERSISTED agent it then runs the composition-root teardown ONCE (releasing the
+// single-writer lease so a successor can re-acquire without waiting out the TTL, and
+// stopping the GC ticker) — AFTER session.Shutdown so the journal has finished its last
+// append before ownership is relinquished. The teardown runs even when Shutdown returns
+// an error (a faulted session still must release its lease). A teardown error is joined
+// onto the Shutdown error so neither is lost.
 func (c *Coding) Close(ctx context.Context) error {
 	err := c.session.Shutdown(ctx)
 	c.cancel()
+	if c.teardown != nil {
+		c.teardownOnce.Do(func() {
+			if terr := c.teardown(ctx); terr != nil {
+				err = errors.Join(err, terr)
+			}
+		})
+	}
 	return err
 }
