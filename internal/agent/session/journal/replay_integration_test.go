@@ -361,6 +361,95 @@ func TestEventReplayerFailSecureCorruptObject(t *testing.T) {
 	}
 }
 
+// TestEventReplayerCallerDeadlineMidDrainNoSilentEOF is the data-loss regression for the
+// Task 5.3 review finding: a cold drain whose CALLER context deadline expires mid-backlog
+// must NOT return io.EOF (a silent truncation that a Phase-8 restore would persist as a
+// complete-but-short history). It must fail closed with a typed *ReplayReadError while
+// undelivered backlog remains (delivered < lastSeq and no NumPending==0 yet seen).
+//
+// Construction: append a sizable backlog (200 events), open with a generous context (so
+// Open's StreamInfo succeeds and the tip is captured), then drain with a caller context
+// carrying a deadline short enough to fire partway through the drain. The cursor's
+// per-fetch child context is derived from this caller context, so once the caller
+// deadline expires every subsequent Fetch returns context.DeadlineExceeded — which the
+// UNFIXED code mistakes for the benign caught-up signal and turns into io.EOF.
+func TestEventReplayerCallerDeadlineMidDrainNoSilentEOF(t *testing.T) {
+	sid := seedUUID(0x40)
+	lid := seedUUID(0x41)
+
+	_, js := newEmbeddedJS(t)
+	j, err := journal.NewSessionJournal(js, sid)
+	if err != nil {
+		t.Fatalf("NewSessionJournal: %v", err)
+	}
+	setupCtx, setupCancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer setupCancel()
+
+	const backlog = 200
+	for i := 0; i < backlog; i++ {
+		// Each event needs a unique, non-zero EventID: the journal dedups on a msg-id derived
+		// from it (a repeated id trips the single-writer fence), and a zero id fails event
+		// validation on decode. Encode i+1 across the trailing bytes.
+		var eid uuid.UUID
+		n := i + 1
+		eid[13] = 0xEE
+		eid[14] = byte(n >> 8)
+		eid[15] = byte(n)
+		ev := event.LoopIdle{Header: event.Header{
+			Coordinates: identity.Coordinates{SessionID: sid, LoopID: lid},
+			EventID:     eid,
+		}}
+		appendEvent(t, j, setupCtx, ev)
+	}
+
+	r := journal.NewEventReplayer(js, mustObjectStore(t, js, sid))
+
+	// Open with a generous context so StreamInfo succeeds and lastSeq (the tip) is captured.
+	cur, err := r.Open(setupCtx, journal.ReplayRequest{SessionID: sid, LoopID: lid, From: journal.Beginning()})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := cur.Close(); err != nil {
+			t.Errorf("Close: %v", err)
+		}
+	})
+
+	// Drain with a caller context whose deadline expires mid-drain. A few milliseconds is
+	// long enough to deliver the first records (a local embedded store is fast) but fires
+	// well before the 200th, so the drain is interrupted with backlog still pending.
+	drainCtx, drainCancel := context.WithTimeout(context.Background(), 8*time.Millisecond)
+	defer drainCancel()
+
+	var delivered int
+	for {
+		_, _, err := cur.Next(drainCtx)
+		if err == nil {
+			delivered++
+			continue
+		}
+		// The contract: while the caller deadline killed the drain mid-backlog, Next must
+		// surface a typed *ReplayReadError (fail closed), NEVER io.EOF (silent truncation).
+		if errors.Is(err, io.EOF) {
+			t.Fatalf("Next returned io.EOF after delivering %d/%d events with caller deadline "+
+				"expired mid-drain — SILENT TRUNCATION (lost %d events)", delivered, backlog, backlog-delivered)
+		}
+		var readErr *journal.ReplayReadError
+		if !errors.As(err, &readErr) {
+			t.Fatalf("Next error = %v (%T), want *ReplayReadError", err, err)
+		}
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Errorf("ReplayReadError should unwrap to context.DeadlineExceeded, got %v", err)
+		}
+		// Backlog was interrupted, not drained: we must have stopped short of the full set.
+		if delivered >= backlog {
+			t.Fatalf("delivered all %d events before the deadline could interrupt the drain; "+
+				"tighten the drain deadline so the mid-drain case is actually exercised", backlog)
+		}
+		return
+	}
+}
+
 // mustObjectStore binds the per-session object store bucket or fails the test.
 func mustObjectStore(t *testing.T, js nats.JetStreamContext, sid uuid.UUID) nats.ObjectStore {
 	t.Helper()

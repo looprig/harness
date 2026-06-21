@@ -21,12 +21,24 @@ import (
 // deletes it eagerly; this is the backstop.
 const replayInactiveThreshold = 5 * time.Minute
 
-// replayFetchTimeout bounds a single backlog Fetch round-trip when the caller's context
-// carries no deadline of its own. A cold backlog read of a local embedded stream returns
-// promptly, and the consumer's NumPending==0 signal normally ends the drain WITHOUT a
-// fetch reaching this timeout; it is only the backstop for the rare empty-fetch-yet-tip-
-// says-pending edge, so it is kept short to avoid a slow EOF.
+// replayFetchTimeout bounds EVERY single backlog Fetch round-trip: each fetch derives a
+// child context from the caller's with this timeout, so no individual pull blocks longer
+// than this even when the caller passed a long (or no) deadline. A cold backlog read of a
+// local embedded stream returns promptly, and the consumer's NumPending==0 signal normally
+// ends the drain WITHOUT any fetch reaching this timeout. If a fetch DOES time out while
+// the Open-time tip still reports records pending, that is NOT treated as caught-up — it
+// is a read anomaly that fails closed as a *ReplayReadError (see Next's empty-fetch
+// branch), because EOFing there would silently truncate a restore. Kept short so the
+// fail-closed path is reached promptly rather than after a long stall.
 const replayFetchTimeout = 2 * time.Second
+
+// errEmptyFetchBacklogRemaining is the leaf cause wrapped in a *ReplayReadError when a
+// bounded backlog fetch came back empty even though the Open-time tip says records remain
+// (delivered < lastSeq) and no server-authoritative NumPending==0 has been seen — and the
+// CALLER context is still live (so this is the internal replayFetchTimeout backstop, not
+// the caller's own deadline). It is a read anomaly on a healthy local store: failing
+// closed here is mandatory, because returning io.EOF would silently truncate a restore.
+var errEmptyFetchBacklogRemaining = errors.New("journal: bounded backlog fetch returned no message while the Open-time tip reports records still pending (no NumPending==0 observed)")
 
 // StartPos is the closed value type naming where a replay begins: the stream beginning
 // (every record) or a specific stream sequence (the dormant-snapshot hook). It is a
@@ -363,13 +375,22 @@ func (c *streamCursor) Next(ctx context.Context) (event.Event, uint64, error) {
 		return nil, 0, err
 	}
 	if msg == nil {
-		// Empty fetch though the tip said there should be more — the matching records
-		// before the boundary are exhausted (the remaining records are on filtered-out
-		// subjects). Caught up: EOF.
-		c.mu.Lock()
-		c.caughtUp = true
-		c.mu.Unlock()
-		return nil, 0, io.EOF
+		// Empty fetch while the tip said backlog remains (delivered < lastSeq) and no
+		// NumPending==0 has ever been seen — so we are provably NOT caught up. EOF here
+		// would silently truncate a restore. Fail closed instead.
+		//
+		// The empty fetch has two indistinguishable-at-the-Fetch-layer causes; we
+		// disambiguate by inspecting the CALLER context first:
+		//   1. the caller's own ctx deadline/cancellation expired mid-drain — surface it
+		//      so the caller learns its budget ran out (the backlog is NOT drained);
+		//   2. only the internal replayFetchTimeout backstop fired while the caller ctx is
+		//      still live — a read anomaly on a healthy local store (the tip says there is
+		//      more, yet a bounded fetch came back empty). Either way: a *ReplayReadError,
+		//      never io.EOF.
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, 0, &ReplayReadError{Stream: c.stream, Cause: ctxErr}
+		}
+		return nil, 0, &ReplayReadError{Stream: c.stream, Cause: errEmptyFetchBacklogRemaining}
 	}
 
 	seq, pending, err := messageMeta(msg, c.stream)
@@ -393,22 +414,27 @@ func (c *streamCursor) Next(ctx context.Context) (event.Event, uint64, error) {
 	return ev, seq, nil
 }
 
-// fetchOne pulls a single backlog message, bounding the wait by the caller's context or
-// replayFetchTimeout. A benign empty fetch (ErrTimeout / nats.ErrTimeout) returns
-// (nil, nil) — the caught-up signal — while any other fetch failure fails closed as a
-// *ReplayReadError.
+// fetchOne pulls a single backlog message, ALWAYS bounding the wait by the internal
+// replayFetchTimeout backstop derived from the caller's context (so no single fetch
+// blocks unboundedly even when the caller passed a long or no deadline). An empty fetch
+// (a timeout, or a zero-length batch) returns (nil, nil) — the "no message this round"
+// signal that Next disambiguates against the tip and the caller context; any OTHER fetch
+// failure fails closed as a *ReplayReadError.
+//
+// Returning (nil, nil) is deliberately NOT a "caught up" verdict: the timeout has two
+// indistinguishable causes here (the caller's own deadline expiring, or the internal
+// backstop firing on a slow store), and only Next — which knows delivered vs. lastSeq and
+// can read the caller ctx's Err() — is positioned to decide whether an empty fetch means
+// drained (EOF) or a read anomaly (error). fetchOne stays a dumb single-pull primitive.
 func (c *streamCursor) fetchOne(ctx context.Context, sub *nats.Subscription) (*nats.Msg, error) {
-	fetchCtx := ctx
-	var cancel context.CancelFunc
-	if _, hasDeadline := ctx.Deadline(); !hasDeadline {
-		fetchCtx, cancel = context.WithTimeout(ctx, replayFetchTimeout)
-		defer cancel()
-	}
+	fetchCtx, cancel := context.WithTimeout(ctx, replayFetchTimeout)
+	defer cancel()
 
 	msgs, err := sub.Fetch(1, nats.Context(fetchCtx))
 	if err != nil {
-		// An empty backlog manifests as a timeout: no message arrived within the window.
-		// That is the caught-up signal, not a failure — return (nil, nil).
+		// A timeout (either the backstop or the caller deadline propagated through fetchCtx)
+		// means no message arrived this round. Report it as an empty fetch (nil, nil) and let
+		// Next decide; any non-timeout failure fails closed.
 		if errors.Is(err, nats.ErrTimeout) || errors.Is(err, context.DeadlineExceeded) {
 			return nil, nil
 		}
