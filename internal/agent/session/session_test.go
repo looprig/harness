@@ -505,7 +505,11 @@ func TestNewLoopReturnsLoopNewError(t *testing.T) {
 		loops:         map[uuid.UUID]*loopHandle{primaryLoopID: {}},
 		primaryLoopID: primaryLoopID,
 		newID:         uuid.New, // id mint succeeds; only loop.New must fail
+		now:           time.Now,
 	}
+	// NewLoop stamps the LoopStarted header via the Factory before loop.New, so a
+	// manually-built Session must wire one (New does this; this test bypasses New).
+	s.factory = event.NewFactory(func() (uuid.UUID, error) { return s.newID() }, func() time.Time { return s.now() })
 
 	s.loopsMu.RLock()
 	before := len(s.loops)

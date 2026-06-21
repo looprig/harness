@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"sync"
+	"time"
 
 	"github.com/inventivepotter/urvi/internal/agent/loop"
 	"github.com/inventivepotter/urvi/internal/agent/loop/command"
@@ -134,6 +135,19 @@ type Session struct {
 	// as a field only so tests can inject failure and prove the session never
 	// sends zero-id commands and never registers a zero-id loop.
 	newID idGenerator
+
+	// now is the clock the session's event Factory mints CreatedAt from. It
+	// defaults to time.Now; kept as a field so tests can pin it deterministically
+	// (mirrors newID).
+	now event.Clock
+
+	// factory mints the EventID + CreatedAt stamped onto the session-scoped Enduring
+	// events the session itself produces — SessionStarted (in New) and the loop-tree
+	// record LoopStarted (in NewLoop). It is built in New from closures over the live
+	// newID + now fields, so a test that swaps either after construction pins the
+	// stamp too. The LOOP owns minting for its own loop events (loopConfig.eventFactory);
+	// this Factory is only for the session's own creation sites.
+	factory *event.Factory
 }
 
 // loopHandle is the session's registry entry: the loop's channel handle, the
@@ -287,10 +301,20 @@ func (s *Session) NewLoop(parent loop.Provenance, cfg loop.Config) (uuid.UUID, e
 		return uuid.UUID{}, &SessionError{Kind: SessionLoopIDGenerationFailed, Cause: err}
 	}
 
-	// Mint the LoopStarted EventID BEFORE building or registering the loop, so an
-	// id-gen failure fails NewLoop cleanly (typed error) before any loop exists —
-	// we never leave a registered loop behind a returned error.
-	eventID, err := s.newID()
+	// Stamp the LoopStarted header (minting its EventID + CreatedAt via the Factory)
+	// BEFORE building or registering the loop, so a crypto/rand failure fails NewLoop
+	// cleanly (typed error) before any loop exists — we never leave a registered loop
+	// behind a returned error. This is the 2nd mint of NewLoop (the loop id was the
+	// 1st), so an id-gen failure here is SessionIDGenerationFailed (the loop id was
+	// already minted). Coordinates/Cause are the loop-tree record the Factory
+	// preserves; only EventID + CreatedAt are added.
+	startedHeader, err := s.factory.Stamp(event.Header{
+		Coordinates: identity.Coordinates{SessionID: s.SessionID, LoopID: loopID},
+		Cause: identity.Cause{
+			Coordinates: identity.Coordinates{LoopID: parent.LoopID, TurnID: parent.TurnID, StepID: parent.StepID},
+			Agency:      identity.AgencyMachine,
+		},
+	})
 	if err != nil {
 		return uuid.UUID{}, &SessionError{Kind: SessionIDGenerationFailed, Cause: err}
 	}
@@ -326,17 +350,10 @@ func (s *Session) NewLoop(parent loop.Provenance, cfg loop.Config) (uuid.UUID, e
 	// InputCancelled), so it never perturbs session quiescence. Header.Coordinates is
 	// the NEW loop (SessionID+LoopID; Turn/Step zero); Header.Cause is the spawning
 	// loop/turn/step (zero for the primary = root), machine-originated. There is no
-	// ctx param, so it publishes on the session lifetime (s.sessionCtx).
-	ev := event.LoopStarted{
-		Header: event.Header{
-			Coordinates: identity.Coordinates{SessionID: s.SessionID, LoopID: loopID},
-			EventID:     eventID,
-			Cause: identity.Cause{
-				Coordinates: identity.Coordinates{LoopID: parent.LoopID, TurnID: parent.TurnID, StepID: parent.StepID},
-				Agency:      identity.AgencyMachine,
-			},
-		},
-	}
+	// ctx param, so it publishes on the session lifetime (s.sessionCtx). The header
+	// (Coordinates/Cause + minted EventID/CreatedAt) was stamped above before the loop
+	// was built.
+	ev := event.LoopStarted{Header: startedHeader}
 	if err := s.PublishEvent(s.sessionCtx, ev); err != nil {
 		// Mirror New's cleanup-on-publish-failure: the loop is already registered and
 		// its loopCtx cancel is live, so a bare return would leak a cancel-orphaned
@@ -405,12 +422,27 @@ func New(ctx context.Context, cfg loop.Config) (*Session, error) {
 		sessionCancel: sessionCancel,
 		loops:         make(map[uuid.UUID]*loopHandle),
 		newID:         uuid.New,
+		now:           time.Now,
+	}
+	// The Factory mints from closures over the LIVE newID + now fields, so a test
+	// that swaps either after construction pins the stamp too (the same seam the
+	// session's command-id minting uses).
+	s.factory = event.NewFactory(func() (uuid.UUID, error) { return s.newID() }, func() time.Time { return s.now() })
+
+	// SessionStarted is an Enduring, session-scoped event: stamp it with a minted
+	// EventID + CreatedAt so the journal sees a stable idempotency key and creation
+	// time. A crypto/rand failure aborts construction (fail-secure) rather than
+	// publishing a zero-EventID SessionStarted.
+	startedHeader, err := s.factory.Stamp(event.Header{Coordinates: identity.Coordinates{SessionID: id}})
+	if err != nil {
+		sessionCancel()
+		return nil, &SessionError{Kind: SessionIDGenerationFailed, Cause: err}
 	}
 
 	// The hub is built before any loop, so a loop publishing through the session's
 	// PublishEvent never sees a nil hub. With no subscribers yet, this delivers to
 	// nobody (a no-op), but it is the session's authoritative session-scoped start.
-	if err := s.hub.PublishEvent(sessionCtx, event.SessionStarted{Header: event.Header{Coordinates: identity.Coordinates{SessionID: id}}}); err != nil {
+	if err := s.hub.PublishEvent(sessionCtx, event.SessionStarted{Header: startedHeader}); err != nil {
 		sessionCancel()
 		return nil, &SessionError{Kind: SessionContextDone, Cause: err}
 	}
