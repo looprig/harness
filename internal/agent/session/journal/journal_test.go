@@ -1,6 +1,7 @@
 package journal
 
 import (
+	"context"
 	"errors"
 	"reflect"
 	"testing"
@@ -9,22 +10,39 @@ import (
 	"github.com/inventivepotter/urvi/internal/agent/loop/command"
 	"github.com/inventivepotter/urvi/internal/agent/loop/event"
 	"github.com/inventivepotter/urvi/internal/agent/loop/identity"
+	"github.com/inventivepotter/urvi/internal/uuid"
 	"github.com/nats-io/nats.go"
 )
 
+// stubLease is a white-box Lease double for the nil-jetstream guard test: the guard
+// returns before the lease is ever used, so a trivial stub suffices and proves a
+// non-nil lease does not paper over a nil js.
+type stubLease struct {
+	epoch     uint64
+	sessionID uuid.UUID
+}
+
+func (s stubLease) Epoch() uint64                 { return s.epoch }
+func (s stubLease) SessionID() uuid.UUID          { return s.sessionID }
+func (stubLease) Valid() bool                     { return true }
+func (stubLease) Lost() <-chan struct{}           { return nil }
+func (stubLease) Release(_ context.Context) error { return nil }
+
 // TestNewSessionJournalNilJetStream asserts the constructor fails closed when handed
-// a nil JetStream context: it returns a *StreamSetupError unwrapping to the
-// errNilJetStream sentinel rather than dereferencing nil at the first management call.
+// a nil JetStream context — even with a valid lease — returning a *StreamSetupError
+// unwrapping to errNilJetStream rather than dereferencing nil at the first management
+// call. (The nil-lease guard, which runs after this one, is covered against a live
+// server in the integration suite where a real js is available.)
 func TestNewSessionJournalNilJetStream(t *testing.T) {
 	t.Parallel()
 	sid := fixedUUID(0x01)
 
-	got, err := NewSessionJournal(nil, sid)
+	got, err := NewSessionJournal(nil, sid, stubLease{epoch: 1, sessionID: sid})
 	if err == nil {
-		t.Fatalf("NewSessionJournal(nil, sid) err = nil, want error")
+		t.Fatalf("NewSessionJournal(nil, sid, lease) err = nil, want error")
 	}
 	if got != nil {
-		t.Errorf("NewSessionJournal(nil, sid) journal = %v, want nil", got)
+		t.Errorf("NewSessionJournal(nil, sid, lease) journal = %v, want nil", got)
 	}
 	var setupErr *StreamSetupError
 	if !errors.As(err, &setupErr) {

@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"reflect"
+	"sync"
 	"testing"
 	"time"
 
@@ -55,8 +56,9 @@ type appendCase struct {
 }
 
 // TestSessionJournalAppend exercises the happy path of the single-writer
-// serializer against a real embedded JetStream server: a fence, several events,
-// and a command are appended in order, and each is asserted to land at a strictly
+// serializer against a real embedded JetStream server: the journal's opening
+// LeaseFence lands first (seq 1, carrying the lease's epoch), then several events and
+// a command are appended in order, and each is asserted to land at a strictly
 // monotonic sequence on the expected subject with the expected Nats-Msg-Id, and to
 // decode back deep-equal to what was written.
 func TestSessionJournalAppend(t *testing.T) {
@@ -64,8 +66,6 @@ func TestSessionJournalAppend(t *testing.T) {
 	lid := seedUUID(0x11)
 	tid := seedUUID(0x12)
 	stepID := seedUUID(0x13)
-
-	fence := journal.LeaseFence{Epoch: 1}
 
 	sessionStarted := event.SessionStarted{
 		Header: event.Header{
@@ -97,14 +97,6 @@ func TestSessionJournalAppend(t *testing.T) {
 	}
 
 	cases := []appendCase{
-		{
-			name:        "fence epoch 1",
-			rec:         journal.NewFenceRecord(sid, fence),
-			kind:        kindFence,
-			wantSubject: journal.FenceSubject(sid),
-			wantMsgID:   "1",
-			wantFence:   fence,
-		},
 		{
 			name:        "session started",
 			rec:         journal.NewEventRecord(sessionStarted),
@@ -140,13 +132,31 @@ func TestSessionJournalAppend(t *testing.T) {
 	}
 
 	_, js := newEmbeddedJS(t)
-	j, err := journal.NewSessionJournal(js, sid)
+	lease := mustAcquireLease(t, js, sid)
+	j, err := journal.NewSessionJournal(js, sid, lease)
 	if err != nil {
 		t.Fatalf("NewSessionJournal: %v", err)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
+
+	// The journal's FIRST append is its opening LeaseFence at seq 1, carrying the
+	// lease's epoch on the session's fence subject. Assert it before the user records.
+	fenceRaw, err := js.GetMsg(journal.StreamName(sid), 1)
+	if err != nil {
+		t.Fatalf("GetMsg(opening fence seq 1): %v", err)
+	}
+	if fenceRaw.Subject != journal.FenceSubject(sid) {
+		t.Errorf("opening fence subject = %q, want %q", fenceRaw.Subject, journal.FenceSubject(sid))
+	}
+	gotFence, err := journal.UnmarshalLeaseFence(fenceRaw.Data)
+	if err != nil {
+		t.Fatalf("UnmarshalLeaseFence(opening fence): %v", err)
+	}
+	if gotFence.Epoch != lease.Epoch() {
+		t.Errorf("opening fence epoch = %d, want lease epoch %d", gotFence.Epoch, lease.Epoch())
+	}
 
 	var lastSeq uint64
 	for i, tc := range cases {
@@ -155,8 +165,9 @@ func TestSessionJournalAppend(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Append(%s): %v", tc.name, err)
 			}
-			// Sequences are strictly monotonic, 1-based and gap-free.
-			wantSeq := uint64(i + 1)
+			// User records follow the opening LeaseFence (seq 1): strictly monotonic,
+			// gap-free, starting at seq 2.
+			wantSeq := uint64(i + 2)
 			if seq != wantSeq {
 				t.Fatalf("Append(%s) seq = %d, want %d (strictly monotonic)", tc.name, seq, wantSeq)
 			}
@@ -188,8 +199,34 @@ func TestSessionJournalAppend(t *testing.T) {
 	if info.State.LastSeq != lastSeq {
 		t.Errorf("StreamInfo LastSeq = %d, want %d (last returned seq)", info.State.LastSeq, lastSeq)
 	}
-	if info.State.Msgs != uint64(len(cases)) {
-		t.Errorf("StreamInfo Msgs = %d, want %d", info.State.Msgs, len(cases))
+	// The opening LeaseFence plus every user record.
+	if want := uint64(len(cases) + 1); info.State.Msgs != want {
+		t.Errorf("StreamInfo Msgs = %d, want %d (opening LeaseFence + %d records)", info.State.Msgs, want, len(cases))
+	}
+}
+
+// TestNewSessionJournalRejectsNilLease asserts the constructor fails closed when
+// handed a nil lease against a LIVE server: the lease is a required dependency (DIP),
+// so a nil one returns a *StreamSetupError unwrapping to a nil-lease cause before any
+// stream is taken over. (The nil-jetstream guard, which runs first, is covered in the
+// white-box suite.)
+func TestNewSessionJournalRejectsNilLease(t *testing.T) {
+	sid := seedUUID(0x58)
+	_, js := newEmbeddedJS(t)
+
+	j, err := journal.NewSessionJournal(js, sid, nil)
+	if err == nil {
+		t.Fatalf("NewSessionJournal(js, sid, nil) err = nil, want error")
+	}
+	if j != nil {
+		t.Errorf("NewSessionJournal(js, sid, nil) journal = %v, want nil", j)
+	}
+	var setupErr *journal.StreamSetupError
+	if !errors.As(err, &setupErr) {
+		t.Fatalf("error %v is not *StreamSetupError", err)
+	}
+	if setupErr.Stream != journal.StreamName(sid) {
+		t.Errorf("StreamSetupError.Stream = %q, want %q", setupErr.Stream, journal.StreamName(sid))
 	}
 }
 
@@ -236,7 +273,10 @@ func TestNewSessionJournalRejectsMismatchedStream(t *testing.T) {
 				t.Fatalf("pre-create stream: %v", err)
 			}
 
-			j, err := journal.NewSessionJournal(js, sid)
+			// A valid lease is supplied, but construction fails at stream-verify before
+			// the lease is ever used (the opening fence is never written onto a divergent
+			// stream).
+			j, err := journal.NewSessionJournal(js, sid, mustAcquireLease(t, js, sid))
 			if err == nil {
 				t.Fatalf("NewSessionJournal bound a divergent stream (j=%v); want a verify error", j)
 			}
@@ -257,108 +297,191 @@ func TestNewSessionJournalRejectsMismatchedStream(t *testing.T) {
 	}
 }
 
-// TestSessionJournalStreamLevelFenceRejectsStaleWriter proves the single-writer
-// fence is at STREAM level, not subject level. Two journals A and B bind the SAME
-// session stream and both initialize expectedSeq from the (fresh) LastSeq of 0. A
-// appends a record, advancing the stream tip to 1. B — now holding a stale
-// expectedSeq of 0 — appends to a DIFFERENT loop subject than A wrote and must still
-// be fenced: the rejection is the stream's expected-last-sequence check (wrong last
-// sequence), not anything subject-scoped. B's expectedSeq must NOT advance on the
-// rejection, so a second B append fails identically; the stream tip stays at A's one
-// record (the stale writer never interleaves a durable record).
-func TestSessionJournalStreamLevelFenceRejectsStaleWriter(t *testing.T) {
+// TestSessionJournalLeaseHandoverFencesStaleWriter is the Task 6.2 handover boundary
+// proof. Owner A acquires a lease (epoch N), constructs a journal — whose FIRST append
+// is its LeaseFence{N} (seq 1) — and appends a loop event (seq 2). A's TTL is then
+// expired (injected clock), so a second Acquire yields epoch N+1; owner B constructs a
+// journal whose FIRST append is LeaseFence{N+1}, which ADVANCES the stream (seq 3)
+// before B does any loop work. The handover is now complete and:
+//
+//   - B's opening LeaseFence really is its first append and is acked (its journal
+//     constructed) before B appends a loop record.
+//   - A is stale: its lease is lost (B took a higher epoch), so A's Append fails fast
+//     with a typed JournalLeaseLostError — and the HARD backstop holds regardless: a
+//     publish on A's stale tip, even to a DIFFERENT loop subject than anyone wrote,
+//     fails the stream's expected-last-sequence fence (the 4.4 stream-level assertion).
+//   - B proceeds normally, appending after its fence.
+func TestSessionJournalLeaseHandoverFencesStaleWriter(t *testing.T) {
 	sid := seedUUID(0x50)
 	loopA := seedUUID(0x51)
 	loopB := seedUUID(0x52)
+	loopC := seedUUID(0x55) // a third, never-written subject: proves the fence is stream-level
 
 	_, js := newEmbeddedJS(t)
 
-	// A and B are two serializers over the SAME session stream; both read the fresh
-	// tip (LastSeq 0) at construction, so both believe the next append fences on 0.
-	a, err := journal.NewSessionJournal(js, sid)
+	// An injected clock so A's TTL expiry (and thus B's takeover at N+1) is
+	// deterministic — no wall-clock waiting.
+	var (
+		mu  sync.Mutex
+		clk = time.Date(2026, 6, 21, 0, 0, 0, 0, time.UTC)
+	)
+	now := func() time.Time {
+		mu.Lock()
+		defer mu.Unlock()
+		return clk
+	}
+	advance := func(d time.Duration) {
+		mu.Lock()
+		defer mu.Unlock()
+		clk = clk.Add(d)
+	}
+	lm, err := journal.NewLeaseManager(js, journal.WithLeaseTTL(200*time.Millisecond), journal.WithLeaseClock(now))
+	if err != nil {
+		t.Fatalf("NewLeaseManager: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	// --- Owner A: acquire (epoch N), construct (opening LeaseFence{N} at seq 1), append.
+	leaseA, err := lm.Acquire(ctx, sid)
+	if err != nil {
+		t.Fatalf("Acquire(A): %v", err)
+	}
+	epochN := leaseA.Epoch()
+	a, err := journal.NewSessionJournal(js, sid, leaseA)
 	if err != nil {
 		t.Fatalf("NewSessionJournal(A): %v", err)
 	}
-	b, err := journal.NewSessionJournal(js, sid)
-	if err != nil {
-		t.Fatalf("NewSessionJournal(B): %v", err)
-	}
+	assertOpeningFence(t, js, sid, 1, epochN)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	// A appends a loop event on loopA's subject; the stream tip advances to seq 1.
-	aEvent := event.LoopStarted{
-		Header: event.Header{
-			Coordinates: identity.Coordinates{SessionID: sid, LoopID: loopA},
-			EventID:     seedUUID(0x53),
-		},
-	}
+	aEvent := event.LoopStarted{Header: event.Header{
+		Coordinates: identity.Coordinates{SessionID: sid, LoopID: loopA}, EventID: seedUUID(0x53)}}
 	seqA, err := a.Append(ctx, journal.NewEventRecord(aEvent))
 	if err != nil {
 		t.Fatalf("A.Append: %v", err)
 	}
-	if seqA != 1 {
-		t.Fatalf("A.Append seq = %d, want 1", seqA)
+	if seqA != 2 {
+		t.Fatalf("A.Append seq = %d, want 2 (after A's opening LeaseFence at seq 1)", seqA)
 	}
 
-	// B writes to a DIFFERENT loop subject (loopB.event), so a subject-level fence
-	// would NOT catch it — only the stream-level expected-last-sequence does. B still
-	// holds expectedSeq 0 (the pre-A tip), so the publish must be rejected.
-	bEvent := event.LoopStarted{
-		Header: event.Header{
-			Coordinates: identity.Coordinates{SessionID: sid, LoopID: loopB},
-			EventID:     seedUUID(0x54),
-		},
+	// --- Expire A's TTL so B can take over at a higher epoch.
+	advance(time.Second) // >> the 200ms lease TTL
+	leaseB, err := lm.Acquire(ctx, sid)
+	if err != nil {
+		t.Fatalf("Acquire(B) after A expiry: %v", err)
 	}
-	assertFenced := func(t *testing.T, label string) {
-		t.Helper()
-		seq, err := b.Append(ctx, journal.NewEventRecord(bEvent))
-		if err == nil {
-			t.Fatalf("B.Append (%s) seq = %d, want a fence rejection", label, seq)
-		}
-		if seq != 0 {
-			t.Errorf("B.Append (%s) returned seq %d alongside error, want 0", label, seq)
-		}
-		var appendErr *journal.AppendError
-		if !errors.As(err, &appendErr) {
-			t.Fatalf("B.Append (%s) error %v is not *AppendError", label, err)
-		}
-		// The append carried B's stale expected sequence (0), the pre-A tip.
-		if appendErr.Expected != 0 {
-			t.Errorf("AppendError.Expected = %d, want 0 (B's stale tip)", appendErr.Expected)
-		}
-		if appendErr.Subject != journal.LoopEventSubject(sid, loopB) {
-			t.Errorf("AppendError.Subject = %q, want %q (B's own subject)", appendErr.Subject, journal.LoopEventSubject(sid, loopB))
-		}
-		// The cause is the stream's wrong-last-sequence fence — a JetStream APIError
-		// with the wrong-last-sequence code — NOT a timeout/transport error.
-		var apiErr *nats.APIError
-		if !errors.As(err, &apiErr) {
-			t.Fatalf("B.Append (%s) cause %v is not *nats.APIError (the wrong-last-seq fence)", label, err)
-		}
-		if apiErr.ErrorCode != nats.JSErrCodeStreamWrongLastSequence {
-			t.Errorf("APIError.ErrorCode = %d, want %d (wrong last sequence)", apiErr.ErrorCode, nats.JSErrCodeStreamWrongLastSequence)
-		}
+	if leaseB.Epoch() <= epochN {
+		t.Fatalf("B epoch = %d, want > A epoch %d (monotonic handover)", leaseB.Epoch(), epochN)
+	}
+	t.Cleanup(func() {
+		rctx, rcancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer rcancel()
+		_ = leaseB.Release(rctx)
+	})
+
+	// --- Owner B: construct. Its FIRST append is LeaseFence{N+1}, advancing the stream
+	// to seq 3 — BEFORE B does any loop work. A successful construction is precisely the
+	// "fence acked before loop start" guarantee: NewSessionJournal does not return until
+	// the opening fence lands.
+	b, err := journal.NewSessionJournal(js, sid, leaseB)
+	if err != nil {
+		t.Fatalf("NewSessionJournal(B): %v", err)
+	}
+	assertOpeningFence(t, js, sid, 3, leaseB.Epoch())
+
+	// --- A is now stale. B took a higher epoch, so A's heartbeat renewal CAS-fails and
+	// marks A's lease lost. The heartbeat ticks on real time (independent of the injected
+	// clock), so wait (bounded) for A's loss to be observed before asserting the refusal.
+	select {
+	case <-leaseA.Lost():
+	case <-time.After(5 * time.Second):
+		t.Fatalf("A's lease never observed lost after B's takeover")
 	}
 
-	// First B append is fenced (stream advanced past B's expectedSeq).
-	assertFenced(t, "first")
-	// B's expectedSeq must NOT have advanced on the rejection: a second append fences
-	// identically. A stale writer that silently re-synced its tip would slip a record
-	// in here; the fence must keep rejecting until B is explicitly reconstructed.
-	assertFenced(t, "second")
+	// A's Append now fails fast with the typed lease-lost refusal (the journal never
+	// re-fetches/advances its expectedSeq).
+	staleEvent := event.LoopStarted{Header: event.Header{
+		Coordinates: identity.Coordinates{SessionID: sid, LoopID: loopB}, EventID: seedUUID(0x54)}}
+	seq, err := a.Append(ctx, journal.NewEventRecord(staleEvent))
+	if err == nil {
+		t.Fatalf("stale A.Append seq = %d, want a lease-lost refusal", seq)
+	}
+	if seq != 0 {
+		t.Errorf("stale A.Append returned seq %d alongside error, want 0", seq)
+	}
+	var lostErr *journal.JournalLeaseLostError
+	if !errors.As(err, &lostErr) {
+		t.Fatalf("stale A.Append error %v is not *JournalLeaseLostError", err)
+	}
+	var leaseLost *journal.LeaseLostError
+	if !errors.As(err, &leaseLost) {
+		t.Errorf("stale A.Append error %v does not unwrap to *LeaseLostError", err)
+	}
 
-	// The stream tip is still A's single record: B never wrote a durable record.
+	// --- The HARD backstop (Task 4.4 stream-level fence): even bypassing the journal's
+	// fast-path lease guard, a publish on A's stale tip (seq 2) — to loopC, a subject
+	// NOBODY has written, so a subject-level fence could not catch it — is rejected by
+	// the stream's expected-last-sequence check, because B's LeaseFence advanced the tip
+	// to 3. This is the guarantee that backs the lease loss: a stale journal physically
+	// cannot extend the stream once a higher-epoch owner has fenced.
+	staleTip := uint64(2) // A's expectedSeq before the handover
+	foreign := &nats.Msg{
+		Subject: journal.LoopEventSubject(sid, loopC),
+		Header:  nats.Header{nats.MsgIdHdr: []string{seedUUID(0x56).String()}},
+		Data:    []byte("stale-A-on-an-unwritten-subject"),
+	}
+	_, perr := js.PublishMsg(foreign, nats.Context(ctx), nats.ExpectLastSequence(staleTip))
+	if perr == nil {
+		t.Fatalf("publish on A's stale tip succeeded; the stream fence must reject it")
+	}
+	var apiErr *nats.APIError
+	if !errors.As(perr, &apiErr) {
+		t.Fatalf("stale publish error %v is not *nats.APIError (the wrong-last-seq fence)", perr)
+	}
+	if apiErr.ErrorCode != nats.JSErrCodeStreamWrongLastSequence {
+		t.Errorf("APIError.ErrorCode = %d, want %d (wrong last sequence)", apiErr.ErrorCode, nats.JSErrCodeStreamWrongLastSequence)
+	}
+
+	// --- B proceeds normally: an append after its opening fence lands at seq 4.
+	bEvent := event.LoopStarted{Header: event.Header{
+		Coordinates: identity.Coordinates{SessionID: sid, LoopID: loopB}, EventID: seedUUID(0x57)}}
+	seqB, err := b.Append(ctx, journal.NewEventRecord(bEvent))
+	if err != nil {
+		t.Fatalf("B.Append: %v", err)
+	}
+	if seqB != 4 {
+		t.Errorf("B.Append seq = %d, want 4 (after B's opening LeaseFence at seq 3)", seqB)
+	}
+
+	// The durable log holds exactly: A's fence (1), A's event (2), B's fence (3), B's
+	// event (4). The stale A publish never landed.
 	info, err := js.StreamInfo(journal.StreamName(sid))
 	if err != nil {
 		t.Fatalf("StreamInfo: %v", err)
 	}
-	if info.State.LastSeq != 1 {
-		t.Errorf("StreamInfo LastSeq = %d, want 1 (only A's record; B was fenced)", info.State.LastSeq)
+	if info.State.LastSeq != 4 || info.State.Msgs != 4 {
+		t.Errorf("stream state LastSeq=%d Msgs=%d, want 4/4 (A.fence, A.evt, B.fence, B.evt)", info.State.LastSeq, info.State.Msgs)
 	}
-	if info.State.Msgs != 1 {
-		t.Errorf("StreamInfo Msgs = %d, want 1 (B's appends never landed)", info.State.Msgs)
+}
+
+// assertOpeningFence reads the record at seq and asserts it is a LeaseFence on the
+// session's fence subject carrying wantEpoch — the journal's ownership handshake.
+func assertOpeningFence(t *testing.T, js nats.JetStreamContext, sid uuid.UUID, seq, wantEpoch uint64) {
+	t.Helper()
+	raw, err := js.GetMsg(journal.StreamName(sid), seq)
+	if err != nil {
+		t.Fatalf("GetMsg(opening fence seq %d): %v", seq, err)
+	}
+	if raw.Subject != journal.FenceSubject(sid) {
+		t.Errorf("opening fence (seq %d) subject = %q, want %q", seq, raw.Subject, journal.FenceSubject(sid))
+	}
+	fence, err := journal.UnmarshalLeaseFence(raw.Data)
+	if err != nil {
+		t.Fatalf("UnmarshalLeaseFence(seq %d): %v", seq, err)
+	}
+	if fence.Epoch != wantEpoch {
+		t.Errorf("opening fence (seq %d) epoch = %d, want %d", seq, fence.Epoch, wantEpoch)
 	}
 }
 

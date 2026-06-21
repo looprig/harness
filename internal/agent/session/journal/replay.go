@@ -295,14 +295,40 @@ func (r *streamReplayer) Open(ctx context.Context, req ReplayRequest) (EventCurs
 		return nil, &ReplaySetupError{Stream: stream, Reason: "pull subscribe", Cause: err}
 	}
 
+	// The raw stream tip (lastSeq) counts EVERY record — including the command and
+	// LeaseFence records on non-event subjects this consumer filters out. So lastSeq
+	// alone cannot tell "backlog drained" from "the tip is a non-event record we will
+	// never deliver": a session whose only record is the opening LeaseFence has
+	// lastSeq>=1 yet ZERO matching events. The consumer's NumPending is the
+	// filter-aware count of matching records pending right now; capture it so an
+	// empty-for-this-filter backlog EOFs cleanly instead of tripping the
+	// "tip-says-pending but fetch-came-back-empty" anomaly guard.
+	matchPending, err := consumerNumPending(sub)
+	if err != nil {
+		return nil, &ReplaySetupError{Stream: stream, Reason: "consumer info", Cause: err}
+	}
+
 	return &streamCursor{
-		stream:    stream,
-		objects:   r.objects,
-		sub:       sub,
-		lastSeq:   lastSeq,
-		fromSeq:   req.From.fromSeq,
-		delivered: 0,
+		stream:       stream,
+		objects:      r.objects,
+		sub:          sub,
+		lastSeq:      lastSeq,
+		fromSeq:      req.From.fromSeq,
+		delivered:    0,
+		emptyBacklog: matchPending == 0,
 	}, nil
+}
+
+// consumerNumPending reads the just-created consumer's count of matching records still
+// pending delivery — the filter-aware backlog size (events only; cmd/fence subjects are
+// excluded by the consumer's filter). It fails closed with the underlying error so Open
+// can surface a setup failure rather than guessing the backlog is empty.
+func consumerNumPending(sub *nats.Subscription) (uint64, error) {
+	ci, err := sub.ConsumerInfo()
+	if err != nil {
+		return 0, err
+	}
+	return ci.NumPending, nil
 }
 
 // eventSubjectFilters builds the consumer's subject filter set: always the session-event
@@ -347,6 +373,11 @@ type streamCursor struct {
 	// delivered is the highest stream sequence handed to the caller so far. Once it
 	// reaches lastSeq the cold backlog is fully drained.
 	delivered uint64
+	// emptyBacklog is true when the consumer reported NumPending==0 at Open: no record
+	// matches this cursor's event filter, so the first Next EOFs immediately without a
+	// fetch. This is the filter-aware emptiness signal that the raw stream tip (lastSeq)
+	// cannot give — the tip counts cmd/fence records the consumer never delivers.
+	emptyBacklog bool
 }
 
 // Next fetches and decodes the next backlog event. It returns io.EOF when the cold
@@ -362,9 +393,11 @@ func (c *streamCursor) Next(ctx context.Context) (event.Event, uint64, error) {
 		return nil, 0, io.EOF
 	}
 	sub := c.sub
-	// Empty stream, started past the tip, or already delivered the tip record: nothing
-	// left to deliver in cold mode.
-	if c.lastSeq == 0 || c.delivered >= c.lastSeq || c.fromSeq > c.lastSeq {
+	// Empty stream, no record matching this filter (consumer NumPending==0 at Open —
+	// e.g. the only record is the opening LeaseFence on a non-event subject), started
+	// past the tip, or already delivered the tip record: nothing left to deliver in cold
+	// mode.
+	if c.lastSeq == 0 || c.emptyBacklog || c.delivered >= c.lastSeq || c.fromSeq > c.lastSeq {
 		c.mu.Unlock()
 		return nil, 0, io.EOF
 	}

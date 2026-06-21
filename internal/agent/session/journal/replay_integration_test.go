@@ -78,7 +78,7 @@ func TestEventReplayerColdBacklogInOrder(t *testing.T) {
 	stepID := seedUUID(0xA3)
 
 	_, js := newEmbeddedJS(t)
-	j, err := journal.NewSessionJournal(js, sid)
+	j, err := journal.NewSessionJournal(js, sid, mustAcquireLease(t, js, sid))
 	if err != nil {
 		t.Fatalf("NewSessionJournal: %v", err)
 	}
@@ -181,7 +181,7 @@ func TestEventReplayerLoopFiltering(t *testing.T) {
 	loopB := seedUUID(0xD2)
 
 	_, js := newEmbeddedJS(t)
-	j, err := journal.NewSessionJournal(js, sid)
+	j, err := journal.NewSessionJournal(js, sid, mustAcquireLease(t, js, sid))
 	if err != nil {
 		t.Fatalf("NewSessionJournal: %v", err)
 	}
@@ -232,7 +232,7 @@ func TestEventReplayerFromSeq(t *testing.T) {
 	lid := seedUUID(0xF1)
 
 	_, js := newEmbeddedJS(t)
-	j, err := journal.NewSessionJournal(js, sid)
+	j, err := journal.NewSessionJournal(js, sid, mustAcquireLease(t, js, sid))
 	if err != nil {
 		t.Fatalf("NewSessionJournal: %v", err)
 	}
@@ -246,9 +246,10 @@ func TestEventReplayerFromSeq(t *testing.T) {
 	idle := event.LoopIdle{Header: event.Header{
 		Coordinates: identity.Coordinates{SessionID: sid, LoopID: lid}, EventID: seedUUID(0x03)}}
 
-	appendEvent(t, j, ctx, sess)            // seq 1
-	loopSeq := appendEvent(t, j, ctx, loop) // seq 2
-	appendEvent(t, j, ctx, idle)            // seq 3
+	// seq 1 is the journal's opening LeaseFence; the events follow at seq 2, 3, 4.
+	appendEvent(t, j, ctx, sess)            // seq 2
+	loopSeq := appendEvent(t, j, ctx, loop) // seq 3
+	appendEvent(t, j, ctx, idle)            // seq 4
 
 	r := journal.NewEventReplayer(js, mustObjectStore(t, js, sid))
 	got, seqs := drainAll(t, r, journal.ReplayRequest{SessionID: sid, LoopID: lid, From: journal.FromSeq(loopSeq)})
@@ -267,7 +268,7 @@ func TestEventReplayerEmptyStreamEOF(t *testing.T) {
 	lid := seedUUID(0x11)
 
 	_, js := newEmbeddedJS(t)
-	if _, err := journal.NewSessionJournal(js, sid); err != nil {
+	if _, err := journal.NewSessionJournal(js, sid, mustAcquireLease(t, js, sid)); err != nil {
 		t.Fatalf("NewSessionJournal: %v", err)
 	}
 	r := journal.NewEventReplayer(js, mustObjectStore(t, js, sid))
@@ -285,7 +286,7 @@ func TestEventReplayerFailSecureMissingObject(t *testing.T) {
 	lid := seedUUID(0x21)
 
 	_, js := newEmbeddedJS(t)
-	j, err := journal.NewSessionJournal(js, sid)
+	j, err := journal.NewSessionJournal(js, sid, mustAcquireLease(t, js, sid))
 	if err != nil {
 		t.Fatalf("NewSessionJournal: %v", err)
 	}
@@ -326,7 +327,7 @@ func TestEventReplayerFailSecureCorruptObject(t *testing.T) {
 	lid := seedUUID(0x31)
 
 	_, js := newEmbeddedJS(t)
-	j, err := journal.NewSessionJournal(js, sid)
+	j, err := journal.NewSessionJournal(js, sid, mustAcquireLease(t, js, sid))
 	if err != nil {
 		t.Fatalf("NewSessionJournal: %v", err)
 	}
@@ -378,7 +379,7 @@ func TestEventReplayerCallerDeadlineMidDrainNoSilentEOF(t *testing.T) {
 	lid := seedUUID(0x41)
 
 	_, js := newEmbeddedJS(t)
-	j, err := journal.NewSessionJournal(js, sid)
+	j, err := journal.NewSessionJournal(js, sid, mustAcquireLease(t, js, sid))
 	if err != nil {
 		t.Fatalf("NewSessionJournal: %v", err)
 	}

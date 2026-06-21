@@ -56,7 +56,7 @@ func TestSessionJournalResolvesAmbiguousAck(t *testing.T) {
 			lid := seedUUID(0x61)
 			_, js := newEmbeddedJS(t)
 
-			j, err := journal.NewSessionJournal(js, sid)
+			j, err := journal.NewSessionJournal(js, sid, mustAcquireLease(t, js, sid))
 			if err != nil {
 				t.Fatalf("NewSessionJournal: %v", err)
 			}
@@ -64,7 +64,8 @@ func TestSessionJournalResolvesAmbiguousAck(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 			defer cancel()
 
-			// The record under test lands at seq 1 (expectedSeq 0 → N+1 == 1).
+			// The opening LeaseFence already occupies seq 1, so the record under test
+			// lands at seq 2 (expectedSeq 1 → N+1 == 2).
 			rec := journal.NewEventRecord(event.LoopStarted{
 				Header: event.Header{
 					Coordinates: identity.Coordinates{SessionID: sid, LoopID: lid},
@@ -100,7 +101,7 @@ func TestSessionJournalResolvesAmbiguousAck(t *testing.T) {
 						}
 						return nil, nats.ErrTimeout
 					case 2: // retry: server reports a dedup hit (Duplicate ack)
-						return &nats.PubAck{Sequence: 1, Duplicate: true}, nil
+						return &nats.PubAck{Sequence: 2, Duplicate: true}, nil
 					default: // the follow-up append uses the real fenced seam
 						return real(ctx, msg)
 					}
@@ -155,13 +156,14 @@ func TestSessionJournalResolvesAmbiguousAck(t *testing.T) {
 				journal.SwapPublish(j, func(ctx context.Context, msg *nats.Msg) (*nats.PubAck, error) {
 					calls++
 					if calls == 1 {
-						// Land a foreign record at seq 1 with expected-last-seq 0.
-						if _, perr := js.PublishMsg(foreign, nats.Context(ctx), nats.ExpectLastSequence(0)); perr != nil {
+						// Land a foreign record at seq 2 with expected-last-seq 1 (the tip is
+						// the opening LeaseFence at seq 1).
+						if _, perr := js.PublishMsg(foreign, nats.Context(ctx), nats.ExpectLastSequence(1)); perr != nil {
 							t.Fatalf("seam foreign store (call 1): %v", perr)
 						}
 						return nil, nats.ErrTimeout
 					}
-					// Retry under expected-last-seq 0: tip is now 1 (foreign) → conflict.
+					// Retry under expected-last-seq 1: tip is now 2 (foreign) → conflict.
 					return real(ctx, msg)
 				})
 			}
@@ -179,8 +181,8 @@ func TestSessionJournalResolvesAmbiguousAck(t *testing.T) {
 				if !errors.As(err, &fve) {
 					t.Fatalf("Append error %v is not *FenceViolationError", err)
 				}
-				if fve.Sequence != 1 {
-					t.Errorf("FenceViolationError.Sequence = %d, want 1 (the contested N+1)", fve.Sequence)
+				if fve.Sequence != 2 {
+					t.Errorf("FenceViolationError.Sequence = %d, want 2 (the contested N+1)", fve.Sequence)
 				}
 				if fve.WantMsgID != wantMsgID {
 					t.Errorf("FenceViolationError.WantMsgID = %q, want %q (our record)", fve.WantMsgID, wantMsgID)
@@ -197,28 +199,28 @@ func TestSessionJournalResolvesAmbiguousAck(t *testing.T) {
 			}
 
 			// Branches (a)/(b)/(c) all resolve to: the record committed exactly once at
-			// seq 1, and the journal advanced to it.
+			// seq 2 (after the opening LeaseFence at seq 1), and the journal advanced to it.
 			if err != nil {
 				t.Fatalf("Append: %v", err)
 			}
-			if seq != 1 {
-				t.Fatalf("Append seq = %d, want 1", seq)
+			if seq != 2 {
+				t.Fatalf("Append seq = %d, want 2", seq)
 			}
 
 			info, err := js.StreamInfo(journal.StreamName(sid))
 			if err != nil {
 				t.Fatalf("StreamInfo: %v", err)
 			}
-			if info.State.LastSeq != 1 {
-				t.Errorf("StreamInfo LastSeq = %d, want 1 (record committed once)", info.State.LastSeq)
+			if info.State.LastSeq != 2 {
+				t.Errorf("StreamInfo LastSeq = %d, want 2 (LeaseFence + record committed once)", info.State.LastSeq)
 			}
-			if info.State.Msgs != 1 {
-				t.Errorf("StreamInfo Msgs = %d, want 1 (no duplicate stored under the dedup window)", info.State.Msgs)
+			if info.State.Msgs != 2 {
+				t.Errorf("StreamInfo Msgs = %d, want 2 (LeaseFence + record; no duplicate under the dedup window)", info.State.Msgs)
 			}
 
-			raw, err := js.GetMsg(journal.StreamName(sid), 1)
+			raw, err := js.GetMsg(journal.StreamName(sid), 2)
 			if err != nil {
-				t.Fatalf("GetMsg(1): %v", err)
+				t.Fatalf("GetMsg(2): %v", err)
 			}
 			if raw.Subject != wantSubject {
 				t.Errorf("stored subject = %q, want %q", raw.Subject, wantSubject)
@@ -227,8 +229,8 @@ func TestSessionJournalResolvesAmbiguousAck(t *testing.T) {
 				t.Errorf("stored Nats-Msg-Id = %q, want %q", got, wantMsgID)
 			}
 
-			// The journal advanced exactly to seq 1: the next append fences on 1 and
-			// lands at 2 (no double-advance, no stuck fence).
+			// The journal advanced exactly to seq 2: the next append fences on 2 and
+			// lands at 3 (no double-advance, no stuck fence).
 			next := journal.NewEventRecord(event.LoopIdle{
 				Header: event.Header{
 					Coordinates: identity.Coordinates{SessionID: sid, LoopID: lid},
@@ -239,8 +241,8 @@ func TestSessionJournalResolvesAmbiguousAck(t *testing.T) {
 			if err != nil {
 				t.Fatalf("follow-up Append: %v", err)
 			}
-			if nseq != 2 {
-				t.Errorf("follow-up Append seq = %d, want 2 (journal advanced to 1)", nseq)
+			if nseq != 3 {
+				t.Errorf("follow-up Append seq = %d, want 3 (journal advanced to 2)", nseq)
 			}
 		})
 	}
@@ -254,7 +256,7 @@ func TestSessionJournalAmbiguousTwiceIsUnresolved(t *testing.T) {
 	lid := seedUUID(0x71)
 	_, js := newEmbeddedJS(t)
 
-	j, err := journal.NewSessionJournal(js, sid)
+	j, err := journal.NewSessionJournal(js, sid, mustAcquireLease(t, js, sid))
 	if err != nil {
 		t.Fatalf("NewSessionJournal: %v", err)
 	}
@@ -294,13 +296,14 @@ func TestSessionJournalAmbiguousTwiceIsUnresolved(t *testing.T) {
 		t.Errorf("publish seam called %d times, want 2 (original + one bounded retry)", calls)
 	}
 
-	// expectedSeq unadvanced: a follow-up append (now with the real seam) lands at 1.
+	// expectedSeq unadvanced: a follow-up append (now with the real seam) lands at 2
+	// (the tip is the opening LeaseFence at seq 1; the unresolved attempt did not advance).
 	journal.SwapPublish(j, real)
 	nseq, err := j.Append(ctx, rec)
 	if err != nil {
 		t.Fatalf("follow-up Append after unresolved: %v", err)
 	}
-	if nseq != 1 {
-		t.Errorf("follow-up Append seq = %d, want 1 (expectedSeq was not advanced)", nseq)
+	if nseq != 2 {
+		t.Errorf("follow-up Append seq = %d, want 2 (expectedSeq was not advanced past the LeaseFence)", nseq)
 	}
 }

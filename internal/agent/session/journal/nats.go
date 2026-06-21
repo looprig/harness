@@ -168,6 +168,47 @@ func (e *StreamSetupError) Error() string {
 }
 func (e *StreamSetupError) Unwrap() error { return e.Cause }
 
+// JournalNotReadyError reports an Append attempted before the journal's opening
+// LeaseFence was acknowledged. NewSessionJournal writes the LeaseFence as the
+// journal's first append and only marks the journal ready once it lands; an Append
+// before that (which can only happen if a caller drove the concrete writer directly)
+// fails closed with this typed error rather than racing the fence. It carries the
+// session so a caller can correlate the failure.
+type JournalNotReadyError struct {
+	SessionID uuid.UUID
+}
+
+func (e *JournalNotReadyError) Error() string {
+	return "journal: session " + e.SessionID.String() + " not ready (opening LeaseFence not yet acknowledged)"
+}
+
+// JournalLeaseLostError reports an Append refused because the journal's ownership
+// lease was lost — released by the holder or overtaken by a higher epoch. Once the
+// lease is gone the journal fails every append fast and never re-fetches or advances
+// its expected sequence: a new owner (higher epoch) has written, or will write, its
+// own LeaseFence to advance the stream, so this stale journal's expected-sequence
+// fence would reject the append at the stream anyway. Failing here is the fast-path
+// guard; the stream fence is the hard backstop. It carries the session and the lost
+// lease's epoch and unwraps to a *LeaseLostError for errors.As.
+type JournalLeaseLostError struct {
+	SessionID uuid.UUID
+	Epoch     uint64
+}
+
+func (e *JournalLeaseLostError) Error() string {
+	return "journal: session " + e.SessionID.String() +
+		" append refused: lease at epoch " + strconv.FormatUint(e.Epoch, 10) + " lost"
+}
+
+func (e *JournalLeaseLostError) Unwrap() error {
+	return &LeaseLostError{SessionID: e.SessionID, Epoch: e.Epoch}
+}
+
+// errNilLease is the leaf cause when NewSessionJournal is handed a nil Lease. The
+// lease is a required dependency (DIP): the composition root acquires it and passes
+// it in. A sentinel is permitted (no context fields).
+var errNilLease = errors.New("journal: nil lease")
+
 // Option configures a SessionJournal at construction. Options are applied in order
 // over a defaults struct, so a later option overrides an earlier one.
 type Option func(*journalOptions)
@@ -191,20 +232,32 @@ func WithAppendTimeout(d time.Duration) Option {
 }
 
 // NewSessionJournal binds (creating if absent) the per-session JetStream stream for
-// sessionID and returns a single-writer SessionJournal over it. The stream is the
-// keep-everything log for one session: Limits retention, no age/byte discard, one
-// replica. Construction is idempotent — a second process binding the same session's
-// existing stream succeeds and initializes its expected-sequence fence from the
-// stream's current tip (LastSeq), so it appends after the last durable record
-// rather than re-fencing from zero.
+// sessionID and returns a single-writer SessionJournal over it, taking ownership of
+// the stream by writing the lease's epoch as the journal's FIRST append — a
+// LeaseFence on the session's fence subject, fenced like any other append. The stream
+// is the keep-everything log for one session: Limits retention, no age/byte discard,
+// one replica. Construction is idempotent at the stream level — a second process
+// binding the same session's existing stream succeeds and initializes its
+// expected-sequence fence from the stream's current tip (LastSeq) — but ownership is
+// NOT: the opening LeaseFence advances the stream, so a stale prior owner's next
+// append fails the expected-sequence fence. The journal refuses every Append until
+// that LeaseFence is acknowledged.
+//
+// lease is a required dependency (DIP): the composition root (or a test) acquires it
+// from a LeaseManager and passes it in; the journal never acquires a lease itself. It
+// stamps lease.Epoch() into the LeaseFence and refuses to append once the lease is
+// lost (a higher-epoch owner has taken over).
 //
 // js is a bound JetStream context; the journal never starts a server (that is the
 // composition root's job, Phase 10). All management I/O carries a deadline. It
 // returns the narrow SessionJournal interface so callers depend on Append alone,
 // not the concrete writer.
-func NewSessionJournal(js nats.JetStreamContext, sessionID uuid.UUID, opts ...Option) (SessionJournal, error) {
+func NewSessionJournal(js nats.JetStreamContext, sessionID uuid.UUID, lease Lease, opts ...Option) (SessionJournal, error) {
 	if js == nil {
 		return nil, &StreamSetupError{Stream: StreamName(sessionID), Phase: PhaseAdd, Cause: errNilJetStream}
+	}
+	if lease == nil {
+		return nil, &StreamSetupError{Stream: StreamName(sessionID), Phase: PhaseAdd, Cause: errNilLease}
 	}
 	o := journalOptions{appendTimeout: defaultAppendTimeout}
 	for _, opt := range opts {
@@ -239,12 +292,22 @@ func NewSessionJournal(js nats.JetStreamContext, sessionID uuid.UUID, opts ...Op
 	j := &streamJournal{
 		js:            js,
 		stream:        name,
+		sessionID:     sessionID,
+		lease:         lease,
 		objects:       objects,
 		appendTimeout: o.appendTimeout,
 		expectedSeq:   info.State.LastSeq,
 	}
 	// Default publish seam: the real fenced PublishMsg. Tests swap it via SwapPublish.
 	j.publish = j.defaultPublish
+
+	// Take ownership: the FIRST append is the LeaseFence, fenced on the current tip. If
+	// a stale prior owner (or a higher-epoch successor) advanced the stream, this fails
+	// the expected-sequence fence and construction fails closed — a stale owner cannot
+	// even open a journal. Only once this lands is the journal ready to accept Appends.
+	if err := j.writeOpeningFence(ctx); err != nil {
+		return nil, err
+	}
 	return j, nil
 }
 

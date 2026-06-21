@@ -3,9 +3,12 @@
 package journal_test
 
 import (
+	"context"
 	"testing"
 	"time"
 
+	"github.com/inventivepotter/urvi/internal/agent/session/journal"
+	"github.com/inventivepotter/urvi/internal/uuid"
 	"github.com/nats-io/nats-server/v2/server"
 	"github.com/nats-io/nats.go"
 )
@@ -44,4 +47,30 @@ func TestEmbeddedServerSmoke(t *testing.T) {
 	if _, err := js.AddStream(&nats.StreamConfig{Name: "S", Subjects: []string{"s.>"}}); err != nil {
 		t.Fatalf("AddStream: %v", err)
 	}
+}
+
+// mustAcquireLease provisions a LeaseManager over js and acquires a lease for sid,
+// failing the test on error. It is the integration-test seam that satisfies
+// NewSessionJournal's required Lease dependency: tests acquire ownership here and
+// pass the lease in, exactly as the composition root will. The lease is released on
+// cleanup. The default (production) lease TTL applies; tests that need to drive expiry
+// deterministically build their own manager with an injected clock.
+func mustAcquireLease(t *testing.T, js nats.JetStreamContext, sid uuid.UUID) journal.Lease {
+	t.Helper()
+	lm, err := journal.NewLeaseManager(js)
+	if err != nil {
+		t.Fatalf("NewLeaseManager: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	lease, err := lm.Acquire(ctx, sid)
+	if err != nil {
+		t.Fatalf("Acquire lease for %v: %v", sid, err)
+	}
+	t.Cleanup(func() {
+		rctx, rcancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer rcancel()
+		_ = lease.Release(rctx)
+	})
+	return lease
 }

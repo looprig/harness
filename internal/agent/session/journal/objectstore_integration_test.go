@@ -59,7 +59,7 @@ func largeStepDone(sid, lid uuid.UUID, eid byte, blockChars int) event.StepDone 
 func TestSessionJournalInlineSmallRecord(t *testing.T) {
 	sid := seedUUID(0x60)
 	_, js := newEmbeddedJS(t)
-	j, err := journal.NewSessionJournal(js, sid)
+	j, err := journal.NewSessionJournal(js, sid, mustAcquireLease(t, js, sid))
 	if err != nil {
 		t.Fatalf("NewSessionJournal: %v", err)
 	}
@@ -72,12 +72,13 @@ func TestSessionJournalInlineSmallRecord(t *testing.T) {
 		t.Fatalf("MarshalEvent: %v", err)
 	}
 
+	// The journal's opening LeaseFence is seq 1; the first user append lands at seq 2.
 	seq, err := j.Append(ctx, journal.NewEventRecord(ev))
 	if err != nil {
 		t.Fatalf("Append: %v", err)
 	}
-	if seq != 1 {
-		t.Fatalf("Append seq = %d, want 1", seq)
+	if seq != 2 {
+		t.Fatalf("Append seq = %d, want 2 (after opening LeaseFence at seq 1)", seq)
 	}
 
 	raw, err := js.GetMsg(journal.StreamName(sid), seq)
@@ -120,7 +121,7 @@ func TestSessionJournalOffloadsLargeRecord(t *testing.T) {
 	const blockChars = 700 * 1024 // > 512 KiB inline threshold once marshaled.
 
 	_, js := newEmbeddedJS(t)
-	j, err := journal.NewSessionJournal(js, sid)
+	j, err := journal.NewSessionJournal(js, sid, mustAcquireLease(t, js, sid))
 	if err != nil {
 		t.Fatalf("NewSessionJournal: %v", err)
 	}
@@ -138,12 +139,13 @@ func TestSessionJournalOffloadsLargeRecord(t *testing.T) {
 	sum := sha256.Sum256(payload)
 	wantObjID := hex.EncodeToString(sum[:])
 
+	// The opening LeaseFence is seq 1; the first user append (the large record) is seq 2.
 	seq, err := j.Append(ctx, journal.NewEventRecord(ev))
 	if err != nil {
 		t.Fatalf("Append (large): %v", err)
 	}
-	if seq != 1 {
-		t.Fatalf("Append (large) seq = %d, want 1", seq)
+	if seq != 2 {
+		t.Fatalf("Append (large) seq = %d, want 2 (after opening LeaseFence at seq 1)", seq)
 	}
 
 	// Upload-before-append proof: the object is present in the bucket NOW (Append has
@@ -184,24 +186,25 @@ func TestSessionJournalOffloadsLargeRecord(t *testing.T) {
 		t.Errorf("pointer %s = %q, want record id %q", nats.MsgIdHdr, got, ev.EventID.String())
 	}
 
-	// A follow-up append still fences correctly: it lands at seq 2 (the fence advanced
-	// to 1 from the offloaded append, exactly as the inline path advances).
+	// A follow-up append still fences correctly: it lands at seq 3 (the fence advanced
+	// to 2 from the offloaded append, exactly as the inline path advances).
 	follow := smallTextEvent(sid, 0x65)
 	seq2, err := j.Append(ctx, journal.NewEventRecord(follow))
 	if err != nil {
 		t.Fatalf("Append (follow-up): %v", err)
 	}
-	if seq2 != 2 {
-		t.Errorf("follow-up Append seq = %d, want 2 (fence advanced past the offloaded record)", seq2)
+	if seq2 != 3 {
+		t.Errorf("follow-up Append seq = %d, want 3 (fence advanced past the offloaded record)", seq2)
 	}
 
-	// Stream tip reflects exactly two durable records (both appends landed).
+	// Stream tip reflects three durable records: the opening LeaseFence plus the two
+	// appends.
 	info, err := js.StreamInfo(journal.StreamName(sid))
 	if err != nil {
 		t.Fatalf("StreamInfo: %v", err)
 	}
-	if info.State.LastSeq != 2 || info.State.Msgs != 2 {
-		t.Errorf("stream state LastSeq=%d Msgs=%d, want 2/2", info.State.LastSeq, info.State.Msgs)
+	if info.State.LastSeq != 3 || info.State.Msgs != 3 {
+		t.Errorf("stream state LastSeq=%d Msgs=%d, want 3/3 (LeaseFence + 2 appends)", info.State.LastSeq, info.State.Msgs)
 	}
 }
 
@@ -213,7 +216,7 @@ func TestOffloadObjectIDIsContentAddressed(t *testing.T) {
 	const blockChars = 700 * 1024
 
 	_, js := newEmbeddedJS(t)
-	if _, err := journal.NewSessionJournal(js, sid); err != nil {
+	if _, err := journal.NewSessionJournal(js, sid, mustAcquireLease(t, js, sid)); err != nil {
 		t.Fatalf("NewSessionJournal: %v", err)
 	}
 	store, err := js.ObjectStore(journal.SessionObjectBucket(sid))

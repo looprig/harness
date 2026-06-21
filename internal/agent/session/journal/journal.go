@@ -9,6 +9,7 @@ import (
 
 	"github.com/inventivepotter/urvi/internal/agent/loop/command"
 	"github.com/inventivepotter/urvi/internal/agent/loop/event"
+	"github.com/inventivepotter/urvi/internal/uuid"
 	"github.com/nats-io/nats.go"
 )
 
@@ -50,8 +51,15 @@ type publishFunc func(ctx context.Context, msg *nats.Msg) (*nats.PubAck, error)
 // publish ack so the next publish fences on the exact prior sequence. A foreign
 // goroutine cannot race the sequence: mu guards the whole publish-and-advance.
 type streamJournal struct {
-	js     nats.JetStreamContext
-	stream string // the bound stream name (StreamName(sessionID))
+	js        nats.JetStreamContext
+	stream    string    // the bound stream name (StreamName(sessionID))
+	sessionID uuid.UUID // the session this journal owns (for fence record + error context)
+
+	// lease is the single-writer ownership token (DIP: injected, never acquired here).
+	// Its Epoch is stamped into the opening LeaseFence; Append refuses once the lease
+	// is lost (a higher-epoch owner took over). The journal depends only on the narrow
+	// ownershipToken view — never Release — so it cannot tamper with the lifecycle.
+	lease ownershipToken
 
 	// objects is the per-session object store an over-threshold record's marshaled
 	// bytes are offloaded to (content-addressed) before its pointer is appended. It is
@@ -70,10 +78,14 @@ type streamJournal struct {
 	// is serialized with the advance.
 	publish publishFunc
 
-	// mu serializes Append and guards expectedSeq. The serializer is single-writer
-	// by contract; the mutex makes that safe even if a caller fans Append across
-	// goroutines.
+	// mu serializes Append and guards expectedSeq and ready. The serializer is
+	// single-writer by contract; the mutex makes that safe even if a caller fans
+	// Append across goroutines.
 	mu sync.Mutex
+	// ready is set true only after the opening LeaseFence has been acknowledged (the
+	// journal has taken ownership of the stream tip). Append refuses with a typed
+	// JournalNotReadyError until then so no record ever precedes the ownership fence.
+	ready bool
 	// expectedSeq is the stream sequence the next publish must fence on: the last
 	// successfully published sequence (0 for a fresh stream). Publishing with
 	// Nats-Expected-Last-Sequence == expectedSeq rejects any write that does not
@@ -94,19 +106,70 @@ func (j *streamJournal) defaultPublish(ctx context.Context, msg *nats.Msg) (*nat
 	)
 }
 
+// writeOpeningFence is the journal's ownership handshake: it appends a
+// LeaseFence{Epoch: lease.Epoch()} on the session's fence subject as the journal's
+// very first record, fenced on the current tip like any append. It runs once at
+// construction, bypassing the ready gate (it is what SETS ready) but otherwise using
+// the identical serialized publish path — so a stale prior owner (or a higher-epoch
+// successor) that advanced the stream causes the expected-sequence fence to reject
+// this fence and construction to fail closed. On success the journal is marked ready.
+func (j *streamJournal) writeOpeningFence(ctx context.Context) error {
+	fence := NewFenceRecord(j.sessionID, LeaseFence{Epoch: j.lease.Epoch()})
+
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if _, err := j.appendLocked(ctx, fence); err != nil {
+		return err
+	}
+	j.ready = true
+	return nil
+}
+
 // Append marshals rec via its payload codec, publishes it to rec.Subject() with the
 // record's IdempotencyID() as the Nats-Msg-Id and expectedSeq as the
 // stream-level Nats-Expected-Last-Sequence fence, then advances expectedSeq to the
-// assigned sequence on success. The whole operation holds mu so the publish and the
+// assigned sequence on success. It first guards two ownership invariants under mu:
+// the journal must be ready (its opening LeaseFence acknowledged) and its lease must
+// still be held. Once the lease is lost it refuses every append fast and never
+// re-fetches or advances expectedSeq — the stream fence is the hard backstop, this is
+// the fast-path guard. The whole operation holds mu so the guard, publish, and
 // expectedSeq advance are one atomic step; the publish carries its own deadline.
 func (j *streamJournal) Append(ctx context.Context, rec JournalRecord) (uint64, error) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+
+	if !j.ready {
+		return 0, &JournalNotReadyError{SessionID: j.sessionID}
+	}
+	if !j.leaseHeld() {
+		return 0, &JournalLeaseLostError{SessionID: j.sessionID, Epoch: j.lease.Epoch()}
+	}
+	return j.appendLocked(ctx, rec)
+}
+
+// leaseHeld reports whether the ownership lease is still held: both the validity flag
+// and the loss channel must say so. It is the fast-path ownership guard; the stream's
+// expected-sequence fence is the hard backstop that catches a loss this guard races.
+func (j *streamJournal) leaseHeld() bool {
+	if !j.lease.Valid() {
+		return false
+	}
+	select {
+	case <-j.lease.Lost():
+		return false
+	default:
+		return true
+	}
+}
+
+// appendLocked is the serialized publish core, factored out so both the public Append
+// (after its ready/lease guard) and the construction-time writeOpeningFence share one
+// code path. The caller MUST hold mu.
+func (j *streamJournal) appendLocked(ctx context.Context, rec JournalRecord) (uint64, error) {
 	payload, err := marshalRecord(rec)
 	if err != nil {
 		return 0, err
 	}
-
-	j.mu.Lock()
-	defer j.mu.Unlock()
 
 	// Per-append deadline independent of the session context: a derived child of
 	// ctx so the caller can still cancel earlier, but capped so one stuck publish

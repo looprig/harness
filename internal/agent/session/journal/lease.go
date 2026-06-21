@@ -491,11 +491,20 @@ func isKVCASConflict(err error) bool {
 	return errors.As(err, &apiErr) && apiErr.ErrorCode == nats.JSErrCodeStreamWrongLastSequence
 }
 
+// LeaseEncodeError wraps a failure to marshal a leaseRecord to JSON. A leaseRecord is
+// a uint64 + string + time, so this is effectively unreachable, but the codec returns
+// a typed error rather than dropping the json.Marshal error to satisfy the
+// errors-are-typed contract.
+type LeaseEncodeError struct{ Cause error }
+
+func (e *LeaseEncodeError) Error() string { return "journal: encode lease record: " + e.Cause.Error() }
+func (e *LeaseEncodeError) Unwrap() error { return e.Cause }
+
 // encodeLeaseRecord marshals a leaseRecord to its JSON value.
 func encodeLeaseRecord(rec leaseRecord) ([]byte, error) {
 	data, err := json.Marshal(rec)
 	if err != nil {
-		return nil, &LeaseReadError{SessionID: uuid.UUID{}, Cause: err}
+		return nil, &LeaseEncodeError{Cause: err}
 	}
 	return data, nil
 }
