@@ -92,17 +92,6 @@ func (r *recordingSub) record(ev event.Event) {
 	r.mu.Unlock()
 }
 
-func (r *recordingSub) sawTerminal() bool {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	for _, ev := range r.events {
-		if _, ok := ev.(event.TurnInterrupted); ok {
-			return true
-		}
-	}
-	return false
-}
-
 // turnCausationID returns the Cause.CommandID stamped on the first turn-level event
 // (a loop-scoped event; session-scoped events carry none). The loop stamps a
 // turn event's Cause.CommandID with the issuing UserInput's Header.ID, so a non-zero
@@ -131,21 +120,6 @@ func (r *recordingSub) waitTurnCausationID(d time.Duration) (uuid.UUID, bool) {
 		}
 		if time.Now().After(deadline) {
 			return uuid.UUID{}, false
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-}
-
-// waitTerminal polls sawTerminal until a TurnInterrupted has been drained or the
-// deadline elapses.
-func (r *recordingSub) waitTerminal(d time.Duration) bool {
-	deadline := time.Now().Add(d)
-	for {
-		if r.sawTerminal() {
-			return true
-		}
-		if time.Now().After(deadline) {
-			return false
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
@@ -356,7 +330,6 @@ func TestRoutingMethodsLoopNotFound(t *testing.T) {
 		call func(s *Session) error
 	}{
 		{name: "Invoke", call: func(s *Session) error { _, err := s.Invoke(context.Background(), nil); return err }},
-		{name: "Stream", call: func(s *Session) error { _, err := s.Stream(context.Background(), nil); return err }},
 		{name: "Interrupt", call: func(s *Session) error { _, err := s.Interrupt(context.Background()); return err }},
 		// Approve/Deny/ProvideUserInput resolve the target loop by id (the primary
 		// here), which misses once the primary entry is deleted below.
@@ -504,8 +477,7 @@ func (g *capturingIDGen) last() (uuid.UUID, bool) {
 }
 
 // first returns the earliest minted id — the turn-initiating command's id (the
-// UserInput for Invoke/Stream). A later Stream.Close mints a second id for its
-// best-effort Interrupt, so the observable turn Cause.CommandID is the FIRST mint.
+// UserInput for Invoke), which is the id the observable turn Cause.CommandID carries.
 func (g *capturingIDGen) first() (uuid.UUID, bool) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -518,7 +490,7 @@ func (g *capturingIDGen) first() (uuid.UUID, bool) {
 // TestStampsCommandHeaderID asserts every command-sending method stamps a
 // fresh, non-zero Header.ID on the command it sends. Each method mints the ID
 // through the session's idGenerator seam, so a non-zero captured value proves
-// the stamp. For Invoke and Stream the loop also copies the command's Header.ID
+// the stamp. For Invoke the loop also copies the command's Header.ID
 // onto each turn event's Cause.CommandID, so the Cause.CommandID observed through a hub
 // Subscription must equal the captured ID — an end-to-end check that the stamp
 // reaches the loop.
@@ -535,24 +507,6 @@ func TestStampsCommandHeaderID(t *testing.T) {
 				if _, err := s.Invoke(context.Background(), nil); err != nil {
 					t.Fatalf("Invoke: %v", err)
 				}
-			},
-			observeable: true,
-		},
-		{
-			name: "Stream",
-			call: func(t *testing.T, s *Session) {
-				sr, err := s.Stream(context.Background(), nil)
-				if err != nil {
-					t.Fatalf("Stream: %v", err)
-				}
-				for {
-					if _, err := sr.Next(); err == io.EOF {
-						break
-					} else if err != nil {
-						t.Fatalf("Next: %v", err)
-					}
-				}
-				_ = sr.Close()
 			},
 			observeable: true,
 		},
@@ -599,8 +553,7 @@ func TestStampsCommandHeaderID(t *testing.T) {
 				t.Fatal("session stamped a zero Header.ID on the command")
 			}
 			if tt.observeable {
-				// The turn-initiating command (the UserInput) is the FIRST mint; a
-				// Stream.Close fires a best-effort Interrupt that mints a later id, so
+				// The turn-initiating command (the UserInput) is the FIRST mint, so
 				// compare the observable Cause.CommandID against the first.
 				turnID, ok := gen.first()
 				if !ok {
@@ -632,7 +585,6 @@ func TestNewCommandIDGenerationFailure(t *testing.T) {
 		call func(s *Session) error
 	}{
 		{name: "Invoke", call: func(s *Session) error { _, err := s.Invoke(context.Background(), nil); return err }},
-		{name: "Stream", call: func(s *Session) error { _, err := s.Stream(context.Background(), nil); return err }},
 		{name: "Interrupt", call: func(s *Session) error { _, err := s.Interrupt(context.Background()); return err }},
 		{name: "Shutdown", call: func(s *Session) error { return s.Shutdown(context.Background()) }},
 	}
@@ -695,39 +647,6 @@ func TestInvokeCtxCancelReturnsInterrupted(t *testing.T) {
 	}
 }
 
-func TestStreamYieldsOrderedEvents(t *testing.T) {
-	t.Parallel()
-	s, err := New(context.Background(), cfg(&stubLLM{chunks: []content.Chunk{textChunk("a"), textChunk("b")}}))
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
-	t.Cleanup(func() { _ = s.Shutdown(context.Background()) })
-	sr, err := s.Stream(context.Background(), nil)
-	if err != nil {
-		t.Fatalf("Stream: %v", err)
-	}
-	var got []event.Event
-	for {
-		ev, err := sr.Next()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			t.Fatalf("Next: %v", err)
-		}
-		got = append(got, ev)
-	}
-	if len(got) < 3 {
-		t.Fatalf("got %d events, want >=3 (TurnStarted, deltas, terminal)", len(got))
-	}
-	if _, ok := got[0].(event.TurnStarted); !ok {
-		t.Errorf("first = %T, want TurnStarted", got[0])
-	}
-	if _, ok := got[len(got)-1].(event.TurnDone); !ok {
-		t.Errorf("last = %T, want TurnDone", got[len(got)-1])
-	}
-}
-
 func TestConcurrentInvokeIsRejected(t *testing.T) {
 	t.Parallel()
 	s, err := New(context.Background(), cfg(&stubLLM{blockUntilCancel: true}))
@@ -751,35 +670,6 @@ func TestConcurrentInvokeIsRejected(t *testing.T) {
 	}
 }
 
-// TestStreamBusyRejected asserts Stream is also start-or-reject: a second Stream
-// while a turn occupies the loop returns *TurnRejectedError{RejectBusy} (the
-// published event.TurnRejected mapped to a typed error), never a reader.
-func TestStreamBusyRejected(t *testing.T) {
-	t.Parallel()
-	s, err := New(context.Background(), cfg(&stubLLM{blockUntilCancel: true}))
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
-	t.Cleanup(func() { _ = s.Shutdown(context.Background()) })
-
-	ctx1, cancel1 := context.WithCancel(context.Background())
-	defer cancel1()
-	started := make(chan struct{})
-	go func() { close(started); _, _ = s.Invoke(ctx1, nil) }()
-	<-started
-	time.Sleep(30 * time.Millisecond) // let the first turn occupy the loop
-
-	sr, err := s.Stream(context.Background(), nil)
-	if sr != nil {
-		_ = sr.Close()
-		t.Fatal("Stream returned a reader while the loop was busy, want nil + TurnRejectedError")
-	}
-	var rej *TurnRejectedError
-	if !errors.As(err, &rej) || rej.Reason != event.RejectBusy {
-		t.Fatalf("Stream while busy err = %v, want *TurnRejectedError{RejectBusy}", err)
-	}
-}
-
 func TestShutdownThenMethodsExit(t *testing.T) {
 	t.Parallel()
 	s, err := New(context.Background(), cfg(&stubLLM{chunks: []content.Chunk{textChunk("x")}}))
@@ -798,44 +688,6 @@ func TestShutdownThenMethodsExit(t *testing.T) {
 	var se *SessionError
 	if !errors.As(err, &se) || se.Kind != SessionLoopExited {
 		t.Fatalf("Invoke after shutdown err = %v, want *SessionError{SessionLoopExited}", err)
-	}
-}
-
-// REGRESSION GUARD (review fix #4): a Stream reader parked in Next() unblocks
-// when the loop is hard-killed (root ctx cancelled), instead of hanging forever.
-func TestStreamReaderUnblocksOnLoopDeath(t *testing.T) {
-	t.Parallel()
-	ctx, cancel := context.WithCancel(context.Background())
-	s, err := New(ctx, cfg(&stubLLM{blockUntilCancel: true}))
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
-	sr, err := s.Stream(context.Background(), nil)
-	if err != nil {
-		t.Fatalf("Stream: %v", err)
-	}
-	// drain the initial TurnStarted so we're parked waiting for more
-	_, _ = sr.Next()
-
-	cancel() // hard-kill the loop via its root ctx
-
-	done := make(chan error, 1)
-	go func() {
-		for {
-			_, err := sr.Next()
-			if err != nil {
-				done <- err
-				return
-			}
-		}
-	}()
-	select {
-	case err := <-done:
-		if err != io.EOF {
-			t.Fatalf("Next after loop death = %v, want io.EOF", err)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("Stream reader hung after loop death (fix #4 missing)")
 	}
 }
 
@@ -868,134 +720,6 @@ func TestInvokeUnblocksOnLoopDeath(t *testing.T) {
 	case <-time.After(3 * time.Second):
 		t.Fatal("Invoke hung after loop death (missing loop.Done escape)")
 	}
-}
-
-// TestStreamCloseCancelsTurn: closing the stream reader abandons the event
-// stream and cancels the running turn; the session is usable again afterward,
-// and a hub Subscription observes the TurnInterrupted terminal event.
-func TestStreamCloseCancelsTurn(t *testing.T) {
-	t.Parallel()
-	s, err := New(context.Background(), cfg(&stubLLM{blockUntilCancel: true}))
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
-	t.Cleanup(func() { _ = s.Shutdown(context.Background()) })
-	// Subscribe BEFORE the turn so the terminal it triggers on Close is observed.
-	rec, sub := observe(t, s)
-	t.Cleanup(func() { _ = sub.Close() })
-
-	sr, err := s.Stream(context.Background(), nil)
-	if err != nil {
-		t.Fatalf("Stream: %v", err)
-	}
-	// drain TurnStarted so the turn is actively running and parked in the provider
-	if _, err := sr.Next(); err != nil {
-		t.Fatalf("first Next: %v", err)
-	}
-
-	if err := sr.Close(); err != nil {
-		t.Fatalf("Close: %v", err)
-	}
-
-	// the actor processes the abandon + cancel and publishes the interrupted
-	// terminal to the hub; the recorder's drain goroutine records it. Poll until
-	// observed (or the deadline elapses).
-	if !rec.waitTerminal(time.Second) {
-		t.Error("subscription did not observe TurnInterrupted after Close")
-	}
-
-	// session must be usable again: a subsequent Invoke is accepted by the loop
-	// (not rejected with TurnRejectedError). Because the loop's client blocks until
-	// ctx cancel, drive the new turn with a short-timeout ctx; acceptance + a
-	// TurnInterrupted terminal proves the session was released by Close.
-	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
-	defer cancel()
-	ev, err := s.Invoke(ctx, nil)
-	if err != nil {
-		t.Fatalf("Invoke after Close: %v (session not released)", err)
-	}
-	if _, ok := ev.(event.TurnInterrupted); !ok {
-		t.Fatalf("Invoke after Close returned %T, want event.TurnInterrupted", ev)
-	}
-}
-
-// TestStreamDrainReleasesSession: reading a stream until EOF releases the
-// session so a later Invoke succeeds; closing early also releases it.
-func TestStreamDrainReleasesSession(t *testing.T) {
-	t.Parallel()
-	t.Run("drain to EOF releases", func(t *testing.T) {
-		t.Parallel()
-		s, err := New(context.Background(), cfg(&stubLLM{chunks: []content.Chunk{textChunk("a")}}))
-		if err != nil {
-			t.Fatalf("New: %v", err)
-		}
-		t.Cleanup(func() { _ = s.Shutdown(context.Background()) })
-
-		sr, err := s.Stream(context.Background(), nil)
-		if err != nil {
-			t.Fatalf("Stream: %v", err)
-		}
-		for {
-			_, err := sr.Next()
-			if err == io.EOF {
-				break
-			}
-			if err != nil {
-				t.Fatalf("Next: %v", err)
-			}
-		}
-		_ = sr.Close()
-
-		ev, err := s.Invoke(context.Background(), nil)
-		if err != nil {
-			t.Fatalf("Invoke after drain: %v", err)
-		}
-		if _, ok := ev.(event.TurnDone); !ok {
-			t.Fatalf("event = %T, want event.TurnDone", ev)
-		}
-	})
-	t.Run("close early releases", func(t *testing.T) {
-		t.Parallel()
-		s, err := New(context.Background(), cfg(&stubLLM{chunks: []content.Chunk{textChunk("a")}}))
-		if err != nil {
-			t.Fatalf("New: %v", err)
-		}
-		t.Cleanup(func() { _ = s.Shutdown(context.Background()) })
-
-		sr, err := s.Stream(context.Background(), nil)
-		if err != nil {
-			t.Fatalf("Stream: %v", err)
-		}
-		// read just the first event then close without draining
-		if _, err := sr.Next(); err != nil {
-			t.Fatalf("first Next: %v", err)
-		}
-		if err := sr.Close(); err != nil {
-			t.Fatalf("Close: %v", err)
-		}
-
-		// Close() only signals; the actor may still be draining the cancelled turn.
-		// Poll the re-invoke until the session is released (or fail on deadline).
-		deadline := time.After(2 * time.Second)
-		for {
-			ev, err := s.Invoke(context.Background(), nil)
-			if err == nil {
-				if _, ok := ev.(event.TurnDone); !ok {
-					t.Fatalf("event = %T, want event.TurnDone", ev)
-				}
-				break
-			}
-			var rej *TurnRejectedError
-			if !errors.As(err, &rej) {
-				t.Fatalf("Invoke after early close = %v, want nil or *TurnRejectedError", err)
-			}
-			select {
-			case <-deadline:
-				t.Fatal("session never released after early Close")
-			case <-time.After(5 * time.Millisecond):
-			}
-		}
-	})
 }
 
 // TestInterruptDuringInvoke: while Invoke blocks, Interrupt returns (true, nil)

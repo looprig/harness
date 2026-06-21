@@ -82,15 +82,6 @@ func TestSessionStampsAgency(t *testing.T) {
 			wantAgency: identity.AgencyMachine,
 		},
 		{
-			name: "Stream (programmatic single-shot) -> AgencyMachine",
-			call: func(s *Session) {
-				if sr, err := s.Stream(context.Background(), blocks); err == nil {
-					_ = sr.Close()
-				}
-			},
-			wantAgency: identity.AgencyMachine,
-		},
-		{
 			name: "SubagentResult hand-back -> AgencyMachine",
 			call: func(s *Session) {
 				_ = s.deliverSubagentResult(context.Background(), s.primaryLoopID, mustUUID(), blocks)
