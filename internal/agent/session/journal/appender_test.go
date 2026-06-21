@@ -101,6 +101,74 @@ func TestJournalEventAppenderPropagatesError(t *testing.T) {
 	}
 }
 
+// recordingCatalog records each event the appender hands it after a successful append.
+// It satisfies the catalogUpdater seam and, per that contract, never returns an error.
+type recordingCatalog struct{ events []event.Event }
+
+func (c *recordingCatalog) UpdateOnEvent(_ context.Context, ev event.Event) error {
+	c.events = append(c.events, ev)
+	return nil
+}
+
+// TestJournalEventAppenderCatalogHook proves the appender notifies the injected catalog
+// AFTER a successful append, with the same event — and that the nop default (no catalog
+// injected) leaves the append path unchanged.
+func TestJournalEventAppenderCatalogHook(t *testing.T) {
+	t.Parallel()
+	sid := fixedUUID(0x61)
+	ev := event.SessionStarted{Header: event.Header{Coordinates: identity.Coordinates{SessionID: sid}, EventID: fixedUUID(0x62)}}
+
+	t.Run("catalog notified post-success", func(t *testing.T) {
+		t.Parallel()
+		j := &recordingJournal{}
+		cat := &recordingCatalog{}
+		app := NewJournalEventAppender(j, WithCatalog(cat))
+		if err := app.AppendEvent(context.Background(), ev); err != nil {
+			t.Fatalf("AppendEvent = %v, want nil", err)
+		}
+		if len(j.records) != 1 {
+			t.Fatalf("appended %d records, want 1", len(j.records))
+		}
+		if len(cat.events) != 1 {
+			t.Fatalf("catalog saw %d events, want 1", len(cat.events))
+		}
+		if cat.events[0] != ev {
+			t.Errorf("catalog event = %v, want the appended event", cat.events[0])
+		}
+	})
+
+	t.Run("nil catalog ignored (nop default keeps behavior)", func(t *testing.T) {
+		t.Parallel()
+		j := &recordingJournal{}
+		app := NewJournalEventAppender(j, WithCatalog(nil))
+		if err := app.AppendEvent(context.Background(), ev); err != nil {
+			t.Fatalf("AppendEvent = %v, want nil", err)
+		}
+		if len(j.records) != 1 {
+			t.Errorf("appended %d records, want 1", len(j.records))
+		}
+	})
+}
+
+// TestJournalEventAppenderCatalogSkippedOnFailure proves a failed durable append does
+// NOT touch the catalog (the event did not land, so it must not be indexed).
+func TestJournalEventAppenderCatalogSkippedOnFailure(t *testing.T) {
+	t.Parallel()
+	sid := fixedUUID(0x71)
+	wantErr := errors.New("stream rejected the write")
+	j := &recordingJournal{err: wantErr}
+	cat := &recordingCatalog{}
+	app := NewJournalEventAppender(j, WithCatalog(cat))
+
+	ev := event.SessionStarted{Header: event.Header{Coordinates: identity.Coordinates{SessionID: sid}, EventID: fixedUUID(0x72)}}
+	if err := app.AppendEvent(context.Background(), ev); !errors.Is(err, wantErr) {
+		t.Fatalf("AppendEvent error = %v, want %v", err, wantErr)
+	}
+	if len(cat.events) != 0 {
+		t.Errorf("catalog saw %d events on append failure, want 0", len(cat.events))
+	}
+}
+
 // TestJournalCommandAppenderRoutes proves the command façade wraps a command in a
 // CommandRecord targeting the given session+loop (the intent-log subject) and carries
 // the command's CommandID as the idempotency id, then calls the underlying Append.
