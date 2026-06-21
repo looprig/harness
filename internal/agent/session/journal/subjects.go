@@ -102,6 +102,16 @@ func LoopCommandSubject(sessionID, loopID uuid.UUID) string {
 	return loopSubjectPrefix(sessionID, loopID) + "." + leafCommand
 }
 
+// allLoopsEventSubject returns the wildcard subject matching every loop's event
+// subject in a session: "urvi.session.<sid>.loop.*.event". The '*' wildcards exactly
+// the loop-id token, so it captures all loops' events and ONLY events (never .cmd).
+// It is built from the same constant leaves as the concrete builders so the filter
+// cannot drift from what the writer emits. It is the EventReplayer's all-loops filter
+// (ReplayRequest.LoopID == zero).
+func allLoopsEventSubject(sessionID uuid.UUID) string {
+	return subjectRoot + "." + sessionID.String() + "." + leafLoop + ".*." + leafEvent
+}
+
 // FenceSubject returns the subject carrying a session's internal LeaseFence
 // records: "urvi.session.<sid>.fence".
 func FenceSubject(sessionID uuid.UUID) string {

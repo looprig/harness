@@ -1,0 +1,512 @@
+package journal
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
+	"io"
+	"strconv"
+	"sync"
+	"time"
+
+	"github.com/inventivepotter/urvi/internal/agent/loop/event"
+	"github.com/inventivepotter/urvi/internal/uuid"
+	"github.com/nats-io/nats.go"
+)
+
+// replayInactiveThreshold is the ephemeral replay consumer's self-cleanup window: if the
+// cursor is abandoned without Close (a panicked caller), the server tears the consumer
+// down after this idle span so a leaked consumer cannot accumulate on the stream. Close
+// deletes it eagerly; this is the backstop.
+const replayInactiveThreshold = 5 * time.Minute
+
+// replayFetchTimeout bounds a single backlog Fetch round-trip when the caller's context
+// carries no deadline of its own. A cold backlog read of a local embedded stream returns
+// promptly, and the consumer's NumPending==0 signal normally ends the drain WITHOUT a
+// fetch reaching this timeout; it is only the backstop for the rare empty-fetch-yet-tip-
+// says-pending edge, so it is kept short to avoid a slow EOF.
+const replayFetchTimeout = 2 * time.Second
+
+// StartPos is the closed value type naming where a replay begins: the stream beginning
+// (every record) or a specific stream sequence (the dormant-snapshot hook). It is a
+// value, not an interface, so a caller cannot smuggle a third start mode past the
+// switch; the two constructors Beginning and FromSeq are the only ways to build one.
+type StartPos struct {
+	// fromSeq is 0 for Beginning and the (1-based) inclusive start sequence for FromSeq.
+	// JetStream stream sequences are 1-based, so 0 unambiguously means "from the start".
+	fromSeq uint64
+}
+
+// Beginning starts a replay at the stream's first record (DeliverAll).
+func Beginning() StartPos { return StartPos{fromSeq: 0} }
+
+// FromSeq starts a replay at stream sequence seq, inclusive — the dormant-snapshot hook
+// (Phase 8 resumes after a snapshot's last applied sequence). A seq of 0 is equivalent
+// to Beginning (there is no sequence 0 in a JetStream stream).
+func FromSeq(seq uint64) StartPos { return StartPos{fromSeq: seq} }
+
+// ReplayRequest selects which of a session's Enduring events to replay and how. The
+// subject filter is derived from SessionID + LoopID: always the session-event subject,
+// plus the loop-event subject for LoopID (a single loop) or all loops' event subjects
+// (LoopID zero). Command and fence subjects are NEVER included — the replayer decodes
+// only events.
+type ReplayRequest struct {
+	// SessionID is the session whose stream is replayed (required; a zero id yields a
+	// setup error rather than a wildcard over every session).
+	SessionID uuid.UUID
+	// LoopID, when non-zero, narrows the loop-event filter to that single loop; zero
+	// replays the session event subject plus every loop's event subject.
+	LoopID uuid.UUID
+	// From is where the backlog read begins: Beginning or FromSeq(n).
+	From StartPos
+	// Follow keeps the cursor live after the backlog drains (tailing new appends). Only
+	// the cold path (Follow:false) is implemented in Task 5.3; Follow:true returns a
+	// typed *FollowUnsupportedError from Open. See the package note on Open.
+	Follow bool
+}
+
+// EventReplayer is the journal's read side: it opens an ordered cursor over a session's
+// Enduring events. It is the narrow counterpart to SessionJournal (the write side) — a
+// caller that only reads history depends on Open alone, not on stream-management or the
+// object store. The concrete *streamReplayer satisfies it; NewEventReplayer is the
+// composition-time constructor.
+type EventReplayer interface {
+	// Open binds a consumer over the session stream filtered to the request's event
+	// subjects and returns a cursor positioned at req.From. The embedded server is NOT
+	// started here (that is the composition root's job); js must already be bound.
+	Open(ctx context.Context, req ReplayRequest) (EventCursor, error)
+}
+
+// EventCursor yields a session's Enduring events in stream-sequence order. Next returns
+// the next decoded event with its stream sequence, io.EOF once the backlog is drained
+// (cold mode), or a typed error on a malformed/missing/corrupt record. Close releases
+// the underlying consumer; it is idempotent and safe to call after an error.
+type EventCursor interface {
+	// Next returns the next event and its stream sequence, or io.EOF when the cold
+	// backlog is exhausted. A decode/object error fails secure: the cursor surfaces the
+	// typed error rather than skipping or zero-valuing the record.
+	Next(ctx context.Context) (event.Event, uint64, error)
+	// Close tears down the consumer. Idempotent: a second call is a no-op.
+	Close() error
+}
+
+// objectFetcher is the narrow object-store surface the replayer's rehydration path
+// depends on (Interface Segregation, mirroring the write-side objectPutter): fetch bytes
+// by content-addressed name. The vendored nats.ObjectStore satisfies it; the replayer
+// never depends on the full store interface.
+type objectFetcher interface {
+	GetBytes(name string, opts ...nats.GetObjectOpt) ([]byte, error)
+}
+
+// ReplaySetupError reports a failure to bind the replay consumer in Open (a missing
+// SessionID, a stream-info read failure, or a PullSubscribe failure). It carries the
+// stream name and unwraps to the underlying NATS error so a caller can errors.As both
+// this and the cause. It is the read-side analogue of StreamSetupError.
+type ReplaySetupError struct {
+	Stream string
+	Reason string
+	Cause  error
+}
+
+func (e *ReplaySetupError) Error() string {
+	if e.Cause == nil {
+		return "journal: replay setup for " + strconv.Quote(e.Stream) + ": " + e.Reason
+	}
+	return "journal: replay setup for " + strconv.Quote(e.Stream) + ": " + e.Reason + ": " + e.Cause.Error()
+}
+func (e *ReplaySetupError) Unwrap() error { return e.Cause }
+
+// ReplayReadError reports a failure to read the next backlog message from the consumer
+// (a Fetch failure that is not a benign timeout, or a message whose JetStream metadata
+// cannot be read). It fails closed: the cursor surfaces it rather than guessing the
+// stream position. It carries the stream name and unwraps to the underlying cause.
+type ReplayReadError struct {
+	Stream string
+	Cause  error
+}
+
+func (e *ReplayReadError) Error() string {
+	return "journal: replay read on " + strconv.Quote(e.Stream) + ": " + e.Cause.Error()
+}
+func (e *ReplayReadError) Unwrap() error { return e.Cause }
+
+// ReplayDecodeError wraps a failure to decode a replayed record's body into an event:
+// an undecodable offload pointer, or an UnmarshalEvent failure on the (inline or
+// rehydrated) bytes. It carries the offending record's stream sequence and unwraps to
+// the underlying codec error (a *PointerDecodeError, an *event.EventDecodeError, etc.).
+type ReplayDecodeError struct {
+	Sequence uint64
+	Cause    error
+}
+
+func (e *ReplayDecodeError) Error() string {
+	return "journal: replay decode at seq " + strconv.FormatUint(e.Sequence, 10) + ": " + e.Cause.Error()
+}
+func (e *ReplayDecodeError) Unwrap() error { return e.Cause }
+
+// ObjectCodecVersionError reports an offload pointer whose CodecVersion is not the one
+// this build understands (pointerCodecVersion). It fails closed at the untrusted restore
+// boundary rather than misdecoding an object written by a future/unknown codec. Phase-8
+// restore maps it (like the missing/corrupt errors) onto a RestoreErrored. It carries
+// the record's stream sequence, the pointer's object id, and the version mismatch.
+type ObjectCodecVersionError struct {
+	Sequence uint64
+	ObjectID string
+	Got      uint32
+	Want     uint32
+}
+
+func (e *ObjectCodecVersionError) Error() string {
+	return "journal: offload pointer at seq " + strconv.FormatUint(e.Sequence, 10) +
+		" (object " + strconv.Quote(e.ObjectID) + ") codec version " + strconv.FormatUint(uint64(e.Got), 10) +
+		", want " + strconv.FormatUint(uint64(e.Want), 10)
+}
+
+// ObjectMissingError reports an offload pointer whose backing object is absent from the
+// per-session bucket: a dangling pointer (the object was deleted or never landed). It
+// fails secure — the cursor surfaces it rather than yielding a zero-valued event — so
+// Phase-8 restore maps it onto a RestoreErrored rather than silently losing history. It
+// carries the record's stream sequence and the missing object id.
+type ObjectMissingError struct {
+	Sequence uint64
+	ObjectID string
+	Cause    error
+}
+
+func (e *ObjectMissingError) Error() string {
+	return "journal: offloaded object " + strconv.Quote(e.ObjectID) +
+		" referenced at seq " + strconv.FormatUint(e.Sequence, 10) + " is missing: " + e.Cause.Error()
+}
+func (e *ObjectMissingError) Unwrap() error { return e.Cause }
+
+// ObjectCorruptError reports an offloaded object whose fetched bytes do not hash to the
+// content-addressed id the pointer named: sha256(bytes) != pointer.ObjectID, so the
+// object has been corrupted or substituted. It fails secure — the cursor surfaces it
+// rather than decoding tampered bytes — so Phase-8 restore maps it onto a RestoreErrored.
+// It carries the record's stream sequence, the expected object id (the pointer's), and
+// the actual hash of the fetched bytes.
+type ObjectCorruptError struct {
+	Sequence uint64
+	ObjectID string // the id the pointer named (the expected sha256)
+	GotHash  string // sha256 of the bytes actually fetched
+}
+
+func (e *ObjectCorruptError) Error() string {
+	return "journal: offloaded object referenced at seq " + strconv.FormatUint(e.Sequence, 10) +
+		" is corrupt: fetched bytes hash " + strconv.Quote(e.GotHash) +
+		", pointer names " + strconv.Quote(e.ObjectID)
+}
+
+// FollowUnsupportedError is returned by Open when ReplayRequest.Follow is true. The live
+// tailing path is deferred (Task 5.3 implements only the cold Follow:false backlog read);
+// failing closed with a typed error is preferable to silently behaving as a cold cursor
+// that EOFs at the current tip. The composition root (Phase 10 TUI) will revisit this.
+type FollowUnsupportedError struct {
+	Stream string
+}
+
+func (e *FollowUnsupportedError) Error() string {
+	return "journal: live follow (Follow:true) is not yet implemented for " + strconv.Quote(e.Stream)
+}
+
+// streamReplayer is the concrete EventReplayer over one JetStream context and one
+// session's object store. It holds no per-replay state: every Open builds an independent
+// consumer + cursor, so concurrent replays of the same (or different) sessions do not
+// interfere. js is the bound context (never started here); objects is the per-session
+// bucket offloaded records rehydrate from.
+type streamReplayer struct {
+	js      nats.JetStreamContext
+	objects objectFetcher
+}
+
+// NewEventReplayer wires a read-side replayer over a bound JetStream context and the
+// session's object store, mirroring how NewSessionJournal is wired at the composition
+// root (the embedded server is started elsewhere). It returns the narrow EventReplayer
+// interface so callers depend on Open alone, not the concrete reader. objects is the
+// per-session bucket (SessionObjectBucket) the write side offloaded over-threshold
+// records to; the replayer rehydrates from it.
+func NewEventReplayer(js nats.JetStreamContext, objects nats.ObjectStore) EventReplayer {
+	return &streamReplayer{js: js, objects: objects}
+}
+
+// Open binds an ephemeral pull consumer over the session stream filtered to the request's
+// event subjects (session-event plus the selected loop-event subject(s) — never cmd/
+// fence) and returns a cursor positioned at req.From. The snapshot of the stream tip
+// (LastSeq) is captured here so the cold cursor knows when the backlog is drained: Next
+// returns io.EOF once it has delivered the record at that sequence (or immediately for an
+// empty/no-matching stream).
+//
+// A single consumer with a multi-subject FilterSubjects delivers messages in STREAM-
+// SEQUENCE order regardless of how many subjects it filters — it walks the stream's
+// monotonic sequence emitting only matching records. Because the journal is a single
+// fenced writer producing a gap-free monotonic sequence, walking this one consumer is
+// exactly walking session order across the session-event and loop-event subjects.
+func (r *streamReplayer) Open(ctx context.Context, req ReplayRequest) (EventCursor, error) {
+	if req.SessionID.IsZero() {
+		return nil, &ReplaySetupError{Stream: "", Reason: "zero session id"}
+	}
+	stream := StreamName(req.SessionID)
+	if req.Follow {
+		// Cold-only in Task 5.3: fail closed rather than behave as a cold cursor.
+		return nil, &FollowUnsupportedError{Stream: stream}
+	}
+
+	// Snapshot the tip BEFORE subscribing so the cold cursor's caught-up boundary is the
+	// durable length at Open time (later appends are out of scope for a cold replay).
+	info, err := r.js.StreamInfo(stream, nats.Context(ctx))
+	if err != nil {
+		return nil, &ReplaySetupError{Stream: stream, Reason: "stream info", Cause: err}
+	}
+	lastSeq := info.State.LastSeq
+
+	filters := eventSubjectFilters(req.SessionID, req.LoopID)
+
+	// Build the start-policy + multi-subject-filter sub options. An ephemeral pull
+	// consumer (no durable name) with AckNone — this is a read-only replay, acks would
+	// only add round-trips — and an inactivity threshold so an abandoned cursor self-
+	// cleans. ConsumerFilterSubjects requires BindStream + an empty subject.
+	opts := []nats.SubOpt{
+		nats.BindStream(stream),
+		nats.ConsumerFilterSubjects(filters...),
+		nats.AckNone(),
+		nats.InactiveThreshold(replayInactiveThreshold),
+	}
+	if req.From.fromSeq > 0 {
+		opts = append(opts, nats.StartSequence(req.From.fromSeq))
+	} else {
+		opts = append(opts, nats.DeliverAll())
+	}
+
+	sub, err := r.js.PullSubscribe("", "", opts...)
+	if err != nil {
+		return nil, &ReplaySetupError{Stream: stream, Reason: "pull subscribe", Cause: err}
+	}
+
+	return &streamCursor{
+		stream:    stream,
+		objects:   r.objects,
+		sub:       sub,
+		lastSeq:   lastSeq,
+		fromSeq:   req.From.fromSeq,
+		delivered: 0,
+	}, nil
+}
+
+// eventSubjectFilters builds the consumer's subject filter set: always the session-event
+// subject, plus the loop-event subject for a specific loopID, or the all-loops wildcard
+// (...loop.*.event) when loopID is zero. Command and fence subjects are deliberately
+// excluded — the replayer decodes events only. The subjects are built via the subject
+// builders (never hand-rolled), so the filter cannot drift from what the writer emits.
+func eventSubjectFilters(sessionID, loopID uuid.UUID) []string {
+	session := SessionEventSubject(sessionID)
+	if loopID.IsZero() {
+		// All loops' event subjects: ...loop.*.event. Built from the loop-event subject of
+		// a sentinel loop id then wildcarding the loop token — but to avoid hand-rolling,
+		// derive the all-loops form from the constant leaves directly.
+		return []string{session, allLoopsEventSubject(sessionID)}
+	}
+	return []string{session, LoopEventSubject(sessionID, loopID)}
+}
+
+// streamCursor is the concrete EventCursor over one ephemeral pull consumer. It fetches
+// one backlog message per Next, decodes inline-or-offloaded bodies, and reports io.EOF
+// once it has delivered the record at the tip snapshot (lastSeq). It is not safe for
+// concurrent Next calls — a cursor is a single-reader handle — but mu guards Close
+// against a racing Next so teardown is safe.
+type streamCursor struct {
+	stream  string
+	objects objectFetcher
+
+	mu       sync.Mutex
+	sub      *nats.Subscription
+	closed   bool
+	caughtUp bool
+
+	// lastSeq is the stream tip captured at Open. It bounds the cold replay to the
+	// durable length at Open time: a record appended AFTER Open (beyond lastSeq) is not
+	// delivered, so a slow drain cannot tail an ever-growing stream. The primary drain-
+	// done signal is caughtUp (set when a delivered message reports NumPending==0); this
+	// is the secondary guard.
+	lastSeq uint64
+	// fromSeq is the inclusive start sequence (0 for Beginning); used only to detect an
+	// empty-backlog open (start past the tip) so Next EOFs immediately.
+	fromSeq uint64
+	// delivered is the highest stream sequence handed to the caller so far. Once it
+	// reaches lastSeq the cold backlog is fully drained.
+	delivered uint64
+}
+
+// Next fetches and decodes the next backlog event. It returns io.EOF when the cold
+// backlog is exhausted. The primary drain-done signal is the consumer's NumPending: once
+// a delivered message reports zero remaining matching records, the next Next returns EOF
+// without a fetch. The Open-time tip (lastSeq) is the secondary bound — a record appended
+// after Open (beyond lastSeq) is never delivered. Decode/object failures fail secure as
+// typed errors; they do NOT advance the cursor past the offending record.
+func (c *streamCursor) Next(ctx context.Context) (event.Event, uint64, error) {
+	c.mu.Lock()
+	if c.closed || c.caughtUp {
+		c.mu.Unlock()
+		return nil, 0, io.EOF
+	}
+	sub := c.sub
+	// Empty stream, started past the tip, or already delivered the tip record: nothing
+	// left to deliver in cold mode.
+	if c.lastSeq == 0 || c.delivered >= c.lastSeq || c.fromSeq > c.lastSeq {
+		c.mu.Unlock()
+		return nil, 0, io.EOF
+	}
+	c.mu.Unlock()
+
+	msg, err := c.fetchOne(ctx, sub)
+	if err != nil {
+		return nil, 0, err
+	}
+	if msg == nil {
+		// Empty fetch though the tip said there should be more — the matching records
+		// before the boundary are exhausted (the remaining records are on filtered-out
+		// subjects). Caught up: EOF.
+		c.mu.Lock()
+		c.caughtUp = true
+		c.mu.Unlock()
+		return nil, 0, io.EOF
+	}
+
+	seq, pending, err := messageMeta(msg, c.stream)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	ev, err := c.decode(ctx, msg, seq)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	c.mu.Lock()
+	c.delivered = seq
+	// NumPending counts the matching records still queued AFTER this one; zero means this
+	// was the last matching record, so the next Next can EOF without a (slow) empty fetch.
+	if pending == 0 {
+		c.caughtUp = true
+	}
+	c.mu.Unlock()
+	return ev, seq, nil
+}
+
+// fetchOne pulls a single backlog message, bounding the wait by the caller's context or
+// replayFetchTimeout. A benign empty fetch (ErrTimeout / nats.ErrTimeout) returns
+// (nil, nil) — the caught-up signal — while any other fetch failure fails closed as a
+// *ReplayReadError.
+func (c *streamCursor) fetchOne(ctx context.Context, sub *nats.Subscription) (*nats.Msg, error) {
+	fetchCtx := ctx
+	var cancel context.CancelFunc
+	if _, hasDeadline := ctx.Deadline(); !hasDeadline {
+		fetchCtx, cancel = context.WithTimeout(ctx, replayFetchTimeout)
+		defer cancel()
+	}
+
+	msgs, err := sub.Fetch(1, nats.Context(fetchCtx))
+	if err != nil {
+		// An empty backlog manifests as a timeout: no message arrived within the window.
+		// That is the caught-up signal, not a failure — return (nil, nil).
+		if errors.Is(err, nats.ErrTimeout) || errors.Is(err, context.DeadlineExceeded) {
+			return nil, nil
+		}
+		return nil, &ReplayReadError{Stream: c.stream, Cause: err}
+	}
+	if len(msgs) == 0 {
+		return nil, nil
+	}
+	return msgs[0], nil
+}
+
+// decode turns a delivered backlog message into an event. An inline record (no
+// objectIDHeader) decodes its body directly via UnmarshalEvent. An offloaded record
+// parses its pointer body, gates the codec version, fetches the object, RE-VERIFIES the
+// fetched bytes hash to the pointer's id, then decodes the rehydrated bytes. Every
+// failure is a typed fail-secure error carrying the record's stream sequence.
+func (c *streamCursor) decode(ctx context.Context, msg *nats.Msg, seq uint64) (event.Event, error) {
+	if msg.Header.Get(objectIDHeader) == "" {
+		// Inline: the body is the marshaled event verbatim.
+		ev, err := event.UnmarshalEvent(msg.Data)
+		if err != nil {
+			return nil, &ReplayDecodeError{Sequence: seq, Cause: err}
+		}
+		return ev, nil
+	}
+	return c.rehydrate(ctx, msg, seq)
+}
+
+// rehydrate resolves an offloaded record: parse the pointer body, gate its CodecVersion
+// against pointerCodecVersion (fail closed on an unknown/future version), fetch the named
+// object, re-hash the fetched bytes against the pointer's content-addressed id (fail
+// secure on a mismatch), then decode the verified bytes. A missing object →
+// *ObjectMissingError; a hash mismatch → *ObjectCorruptError; a version mismatch →
+// *ObjectCodecVersionError; an undecodable pointer or a decode failure on the verified
+// bytes → *ReplayDecodeError. The header object id is advisory; the BODY pointer is
+// authoritative (it is what reconcileTip compares on the write side).
+func (c *streamCursor) rehydrate(ctx context.Context, msg *nats.Msg, seq uint64) (event.Event, error) {
+	ptr, err := unmarshalPointer(msg.Data)
+	if err != nil {
+		return nil, &ReplayDecodeError{Sequence: seq, Cause: err}
+	}
+	if ptr.CodecVersion != pointerCodecVersion {
+		return nil, &ObjectCodecVersionError{
+			Sequence: seq, ObjectID: ptr.ObjectID, Got: ptr.CodecVersion, Want: pointerCodecVersion,
+		}
+	}
+
+	// The object fetch carries the caller's context (bounded I/O): nats.Context satisfies
+	// GetObjectOpt, so the fetch is cancelled/deadlined with Next's ctx.
+	bytes, err := c.objects.GetBytes(ptr.ObjectID, nats.Context(ctx))
+	if err != nil {
+		if errors.Is(err, nats.ErrObjectNotFound) {
+			return nil, &ObjectMissingError{Sequence: seq, ObjectID: ptr.ObjectID, Cause: err}
+		}
+		return nil, &ReplayReadError{Stream: c.stream, Cause: err}
+	}
+
+	// Semantic integrity check: the fetched bytes must hash to the id the pointer named.
+	sum := sha256.Sum256(bytes)
+	gotHash := hex.EncodeToString(sum[:])
+	if gotHash != ptr.ObjectID {
+		return nil, &ObjectCorruptError{Sequence: seq, ObjectID: ptr.ObjectID, GotHash: gotHash}
+	}
+
+	ev, err := event.UnmarshalEvent(bytes)
+	if err != nil {
+		return nil, &ReplayDecodeError{Sequence: seq, Cause: err}
+	}
+	return ev, nil
+}
+
+// Close tears down the consumer. It is idempotent: a second call is a no-op. Unsubscribe
+// deletes the ephemeral consumer eagerly (the InactiveThreshold is only the abandoned-
+// cursor backstop). A nil subscription (defensive) closes cleanly.
+func (c *streamCursor) Close() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed {
+		return nil
+	}
+	c.closed = true
+	if c.sub == nil {
+		return nil
+	}
+	if err := c.sub.Unsubscribe(); err != nil {
+		return &ReplayReadError{Stream: c.stream, Cause: err}
+	}
+	return nil
+}
+
+// messageMeta reads a delivered message's stream sequence and the consumer's NumPending
+// (matching records still queued after this one) from its JetStream metadata. A message
+// without parseable metadata fails closed as a *ReplayReadError rather than being yielded
+// with a guessed sequence.
+func messageMeta(msg *nats.Msg, stream string) (seq, pending uint64, err error) {
+	meta, err := msg.Metadata()
+	if err != nil {
+		return 0, 0, &ReplayReadError{Stream: stream, Cause: err}
+	}
+	return meta.Sequence.Stream, meta.NumPending, nil
+}
