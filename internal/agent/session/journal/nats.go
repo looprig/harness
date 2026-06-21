@@ -16,6 +16,15 @@ import (
 // this deadline.
 const streamSetupTimeout = 10 * time.Second
 
+// dedupWindow is the JetStream message-deduplication window: the span over which the
+// server remembers a Nats-Msg-Id and silently drops a republish of the same id. The
+// journal sets it explicitly (rather than inheriting the server default) because the
+// keep-everything contract depends on it: it backs Task 4.5's ambiguous-ack retry,
+// where an Append whose ack was lost is re-published under the same IdempotencyID and
+// must dedup against the record the server already committed. A window too short would
+// turn a benign retry into a duplicate durable record.
+const dedupWindow = 2 * time.Minute
+
 // MarshalRecordError wraps a failure to encode a record's payload before publish.
 // It names the destination subject so a caller can correlate the failure to the
 // record without re-inspecting the payload, and unwraps to the underlying codec
@@ -185,8 +194,15 @@ func streamConfig(sessionID uuid.UUID) *nats.StreamConfig {
 		MaxAge:            0,
 		MaxMsgsPerSubject: -1,
 		Replicas:          1,
+		// Explicit dedup window (do not inherit the server default): backs 4.5's
+		// ambiguous-ack retry, where a lost-ack republish under the same Nats-Msg-Id
+		// must dedup against the already-committed record.
+		Duplicates: dedupWindow,
 		// TODO(Phase 5): size policy — MaxMsgSize / server max_payload / object-store
 		// offload for oversized records is deferred; defaults stand for now.
+		// TODO(Phase 10): set the embedded server's SyncInterval (power-loss durability
+		// knob, design round 5) at composition root — it is a server/FileStore option set
+		// when the embedded server is created in cmd/cli, not a StreamConfig field.
 	}
 }
 
