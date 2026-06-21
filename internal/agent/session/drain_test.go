@@ -42,11 +42,18 @@ func (f *fakeSubscription) Err() error                 { return f.err }
 
 // turnStarted builds a TurnStarted whose Cause.CommandID is cmd and whose
 // Coordinates.TurnID is turn — the opening resolution event drainToFinalText
-// correlates on in phase 1.
+// correlates on in phase 1. LoopID is left zero (matched by the also-zero LoopID
+// on the zero-loop phase-2 helpers); use turnStartedOnLoop to pin a LoopID.
 func turnStarted(cmd, turn uuid.UUID) event.TurnStarted {
+	return turnStartedOnLoop(cmd, turn, uuid.UUID{})
+}
+
+// turnStartedOnLoop is turnStarted with an explicit Coordinates.LoopID, so phase 2
+// can be driven with matching/mismatching loop ids for the fail-secure cross-check.
+func turnStartedOnLoop(cmd, turn, loop uuid.UUID) event.TurnStarted {
 	return event.TurnStarted{
 		Header: event.Header{
-			Coordinates: identity.Coordinates{TurnID: turn},
+			Coordinates: identity.Coordinates{LoopID: loop, TurnID: turn},
 			Cause:       identity.Cause{CommandID: cmd},
 		},
 	}
@@ -71,6 +78,15 @@ func aiMessage(text string) *content.AIMessage {
 func turnDone(turn uuid.UUID, msg *content.AIMessage) event.TurnDone {
 	return event.TurnDone{
 		Header:  event.Header{Coordinates: identity.Coordinates{TurnID: turn}},
+		Message: msg,
+	}
+}
+
+// turnDoneOnLoop is turnDone with an explicit Coordinates.LoopID, for exercising
+// the phase-2 LoopID cross-check (right TurnID on a wrong loop must be ignored).
+func turnDoneOnLoop(turn, loop uuid.UUID, msg *content.AIMessage) event.TurnDone {
+	return event.TurnDone{
+		Header:  event.Header{Coordinates: identity.Coordinates{LoopID: loop, TurnID: turn}},
 		Message: msg,
 	}
 }
@@ -107,6 +123,8 @@ func TestDrainToFinalText(t *testing.T) {
 	turn := drainUUID(0x02)
 	otherCmd := drainUUID(0x03)
 	otherTurn := drainUUID(0x04)
+	loop := drainUUID(0x05)
+	otherLoop := drainUUID(0x06)
 
 	tests := []struct {
 		name string
@@ -118,13 +136,12 @@ func TestDrainToFinalText(t *testing.T) {
 		// subErr is set on the fake before draining (the hub-forced loss cause).
 		subErr error
 
-		wantText        string
-		wantErr         bool
-		wantFailed      bool // *drainFailedError wrapping errProvider
-		wantInterrupted bool // *drainInterruptedError
-		wantRejected    bool // *drainRejectedError
-		wantLost        bool // *drainLostError
-		wantInterrupts  int32
+		wantText         string
+		wantErr          bool
+		wantFailed       bool // *drainFailedError wrapping errProvider
+		wantTurnRejected bool // *TurnRejectedError (the package's existing typed reject)
+		wantLost         bool // *drainLostError
+		wantInterrupts   int32
 	}{
 		{
 			name:     "clean TurnDone returns its message text",
@@ -143,10 +160,10 @@ func TestDrainToFinalText(t *testing.T) {
 			wantFailed: true,
 		},
 		{
-			name:         "TurnRejected before any turn yields a typed rejected error",
-			script:       []event.Event{turnRejected(cmd, event.RejectBusy)},
-			wantErr:      true,
-			wantRejected: true,
+			name:             "TurnRejected before any turn yields a typed TurnRejectedError",
+			script:           []event.Event{turnRejected(cmd, event.RejectBusy)},
+			wantErr:          true,
+			wantTurnRejected: true,
 		},
 		{
 			name:       "subscription loss before terminal wraps Err()",
@@ -172,6 +189,18 @@ func TestDrainToFinalText(t *testing.T) {
 				stepDone(turn, "partial"),
 				turnDone(otherTurn, aiMessage("OTHER final")),
 				turnDone(turn, aiMessage("final")),
+			},
+			wantText: "final",
+		},
+		{
+			// Fail-secure LoopID cross-check: a phase-2 TurnDone carrying the right
+			// TurnID but a WRONG LoopID must be ignored; only the matching-loop
+			// terminal resolves.
+			name: "phase-2 event with right TurnID but wrong LoopID is ignored",
+			script: []event.Event{
+				turnStartedOnLoop(cmd, turn, loop),
+				turnDoneOnLoop(turn, otherLoop, aiMessage("WRONG loop final")),
+				turnDoneOnLoop(turn, loop, aiMessage("final")),
 			},
 			wantText: "final",
 		},
@@ -215,16 +244,10 @@ func TestDrainToFinalText(t *testing.T) {
 					t.Errorf("err = %v, want it to wrap errProvider", err)
 				}
 			}
-			if tt.wantInterrupted {
-				var ie *drainInterruptedError
-				if !errors.As(err, &ie) {
-					t.Fatalf("err = %v, want *drainInterruptedError", err)
-				}
-			}
-			if tt.wantRejected {
-				var re *drainRejectedError
+			if tt.wantTurnRejected {
+				var re *TurnRejectedError
 				if !errors.As(err, &re) {
-					t.Fatalf("err = %v, want *drainRejectedError", err)
+					t.Fatalf("err = %v, want *TurnRejectedError", err)
 				}
 				if re.Reason != event.RejectBusy {
 					t.Errorf("rejected reason = %v, want RejectBusy", re.Reason)

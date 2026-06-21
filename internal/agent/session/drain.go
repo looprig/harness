@@ -33,17 +33,10 @@ type drainInterruptedError struct{}
 
 func (e *drainInterruptedError) Error() string { return "drain: turn interrupted" }
 
-// drainRejectedError is returned when the submit was refused (TurnRejected
-// arrived with the submit's Cause.CommandID) before any turn could start. Reason
-// carries the loop's RejectReason so callers can branch (fail-secure: a fresh
-// sub-loop with a single submitter should not reject, but we surface it typed).
-type drainRejectedError struct {
-	Reason event.RejectReason
-}
-
-func (e *drainRejectedError) Error() string {
-	return "drain: submit rejected: " + rejectReasonString(e.Reason)
-}
+// A submit refused before any turn starts (TurnRejected for the submit's
+// Cause.CommandID) surfaces as the package's existing *TurnRejectedError: its
+// Reason and event.TurnRejected.Reason are the same type (event.RejectReason),
+// so there is no second rejected-error type or duplicated reason→string switch.
 
 // drainLostError is returned when sub.Events() closes before a terminal arrives:
 // the hub force-closed the subscription (Cause set to sub.Err()) or the sub-loop
@@ -60,32 +53,20 @@ func (e *drainLostError) Error() string {
 }
 func (e *drainLostError) Unwrap() error { return e.Cause }
 
-// rejectReasonString renders a RejectReason for the rejected error message.
-func rejectReasonString(r event.RejectReason) string {
-	switch r {
-	case event.RejectBusy:
-		return "loop busy"
-	case event.RejectQueueFull:
-		return "queue full"
-	case event.RejectShuttingDown:
-		return "loop shutting down"
-	case event.RejectInternal:
-		return "transient internal failure"
-	default:
-		return "unknown"
-	}
-}
-
 // drainToFinalText drains a (sub-)loop's events from a caller-owned subscription
 // to the terminal for the submit identified by commandID, and returns the final
 // assistant text (or a typed error per the §5 failure contract).
 //
 // Correlation is two-phase: phase 1 scans for the opening event.TurnStarted whose
-// Header.Cause.CommandID == commandID and captures its TurnID; phase 2 matches
-// StepDone/terminal events by that TurnID (they do not carry Cause.CommandID).
-// Events for other commands/turns interleaved on the stream are ignored. A
-// TurnRejected for commandID in phase 1 means the submit was refused and no turn
-// will ever start, so it short-circuits to a typed rejected error.
+// Header.Cause.CommandID == commandID and captures its TurnID and LoopID; phase 2
+// matches StepDone/terminal events by BOTH that TurnID and LoopID (they do not
+// carry Cause.CommandID). The LoopID check is fail-secure defense-in-depth: the
+// subscription is scoped to one sub-loop so every event should already carry that
+// loop's id, and a phase-2 event from a different loop is thereby provably ignored
+// rather than merely "can't happen". Events for other commands/turns interleaved
+// on the stream are ignored. A TurnRejected for commandID in phase 1 means the
+// submit was refused and no turn will ever start, so it short-circuits to the
+// package's typed *TurnRejectedError.
 //
 // The final text is taken from the TurnDone.Message terminal, falling back to the
 // latest StepDone's assistant text when Message is nil/empty.
@@ -103,6 +84,7 @@ func rejectReasonString(r event.RejectReason) string {
 func drainToFinalText(ctx context.Context, sub event.Subscription, commandID uuid.UUID, interrupt func()) (string, error) {
 	var (
 		turnID    uuid.UUID // captured from the opening TurnStarted (phase-1 -> phase-2 edge)
+		loopID    uuid.UUID // captured alongside turnID; phase-2 cross-checks it (fail-secure)
 		haveTurn  bool
 		lastStep  string // latest StepDone assistant text for the matched turn (fallback)
 		fired     bool   // guards the single fail-safe interrupt() on ctx.Done()
@@ -118,7 +100,7 @@ func drainToFinalText(ctx context.Context, sub event.Subscription, commandID uui
 			if !ok {
 				return "", &drainLostError{Cause: sub.Err()}
 			}
-			if text, done, err := handleEvent(ev, commandID, &turnID, &haveTurn, &lastStep); done {
+			if text, done, err := handleEvent(ev, commandID, &turnID, &loopID, &haveTurn, &lastStep); done {
 				return text, err
 			}
 			continue
@@ -129,7 +111,7 @@ func drainToFinalText(ctx context.Context, sub event.Subscription, commandID uui
 			if !ok {
 				return "", &drainLostError{Cause: sub.Err()}
 			}
-			if text, done, err := handleEvent(ev, commandID, &turnID, &haveTurn, &lastStep); done {
+			if text, done, err := handleEvent(ev, commandID, &turnID, &loopID, &haveTurn, &lastStep); done {
 				return text, err
 			}
 		case <-ctx.Done():
@@ -148,11 +130,12 @@ func drainToFinalText(ctx context.Context, sub event.Subscription, commandID uui
 // handleEvent applies one event to the two-phase correlation state. It returns
 // done=true with the result (text+err) only on the matched turn's terminal (or a
 // phase-1 rejection); otherwise done=false and the caller keeps draining. turnID,
-// haveTurn, and lastStep are updated in place across calls.
+// loopID, haveTurn, and lastStep are updated in place across calls.
 func handleEvent(
 	ev event.Event,
 	commandID uuid.UUID,
 	turnID *uuid.UUID,
+	loopID *uuid.UUID,
 	haveTurn *bool,
 	lastStep *string,
 ) (text string, done bool, err error) {
@@ -162,26 +145,29 @@ func handleEvent(
 		case event.TurnStarted:
 			if e.Cause.CommandID == commandID {
 				*turnID = e.Coordinates.TurnID
+				*loopID = e.Coordinates.LoopID
 				*haveTurn = true
 			}
 		case event.TurnRejected:
 			if e.Cause.CommandID == commandID {
-				return "", true, &drainRejectedError{Reason: e.Reason}
+				return "", true, &TurnRejectedError{Reason: e.Reason}
 			}
 		}
 		return "", false, nil
 	}
 
-	// Phase 2: match StepDone/terminal events by the captured TurnID.
+	// Phase 2: match StepDone/terminal events by the captured TurnID AND LoopID.
+	// LoopID is the fail-secure cross-check (the sub is scoped to one loop, so a
+	// phase-2 event from a different loop is provably ignored, not "can't happen").
 	switch e := ev.(type) {
 	case event.StepDone:
-		if e.Coordinates.TurnID == *turnID {
+		if e.Coordinates.TurnID == *turnID && e.Coordinates.LoopID == *loopID {
 			if t := stepDoneText(e.Messages); t != "" {
 				*lastStep = t
 			}
 		}
 	case event.TurnDone:
-		if e.Coordinates.TurnID == *turnID {
+		if e.Coordinates.TurnID == *turnID && e.Coordinates.LoopID == *loopID {
 			final := aiText(e.Message)
 			if final == "" {
 				final = *lastStep
@@ -189,11 +175,11 @@ func handleEvent(
 			return final, true, nil
 		}
 	case event.TurnFailed:
-		if e.Coordinates.TurnID == *turnID {
+		if e.Coordinates.TurnID == *turnID && e.Coordinates.LoopID == *loopID {
 			return "", true, &drainFailedError{Cause: e.Err}
 		}
 	case event.TurnInterrupted:
-		if e.Coordinates.TurnID == *turnID {
+		if e.Coordinates.TurnID == *turnID && e.Coordinates.LoopID == *loopID {
 			return "", true, &drainInterruptedError{}
 		}
 	}
@@ -233,6 +219,5 @@ func stepDoneText(msgs content.AgenticMessages) string {
 var (
 	_ error = (*drainFailedError)(nil)
 	_ error = (*drainInterruptedError)(nil)
-	_ error = (*drainRejectedError)(nil)
 	_ error = (*drainLostError)(nil)
 )
