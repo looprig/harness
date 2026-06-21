@@ -600,65 +600,104 @@ func (s *Session) Interrupt(ctx context.Context) (bool, error) {
 	}
 }
 
-// Shutdown drives the session to its stopped phase and blocks until the loop
-// actor exits. The order is deliberate:
+// shutdownTarget pairs a loop with the Ack channel of the command.Shutdown the
+// session sent it, so the ack-wait phase can drain each loop's reply in turn. It
+// is Shutdown-internal: the send phase records one per loop actually reached, and
+// the wait phase reads them back.
+type shutdownTarget struct {
+	loop *loop.Loop
+	ack  chan error
+}
+
+// Shutdown drives the WHOLE session to its stopped phase and blocks until every
+// loop's actor exits. Sub-loops are retained (each runs its own goroutine and
+// loopCtx), so Shutdown must reach EVERY loop, not just the primary. The order is
+// deliberate:
 //
-//  1. hub.StopSession FIRST — flip the session phase to SessionStopped, wake every
+//  1. Latch closing AND snapshot the loops in ONE loopsMu critical section. This
+//     is the atomicity NewLoop's registration check pairs with (it re-tests
+//     closing under the same lock): a loop is either already in this snapshot or
+//     refused by NewLoop — never registered after the snapshot is taken.
+//  2. THEN hub.StopSession — flip the session phase to SessionStopped, wake every
 //     WaitIdle waiter with ErrSessionStopped, and deliver SessionStopped to
-//     subscribers. Doing this before the loop teardown means a headless WaitIdle
-//     unblocks immediately and any shutdown-induced loop terminals that arrive
-//     later are published but no longer mutate quiescence (post-stop publishes
+//     subscribers. After the snapshot, before the sends, so shutdown-induced loop
+//     terminals are published but no longer mutate quiescence (post-stop publishes
 //     never derive SessionIdle).
-//  2. THEN snapshot the loops and send command.Shutdown to each, keeping the
-//     Phase-3 Done/ctx send escapes so the unbuffered send can never wedge.
-//  3. THEN sessionCancel as the final backstop so every loopCtx derived from
-//     sessionCtx is released.
+//  3. defer sessionCancel as the FINAL backstop on ALL paths (graceful waits, an
+//     id-gen-skipped loop, or a ctx timeout) — it releases every loopCtx derived
+//     from sessionCtx. It is deferred (not called before the graceful waits) so it
+//     never hard-cancels loops mid-shutdown; it runs last, on every return.
+//  4. Send command.Shutdown to EVERY loop in the snapshot, recording each reached
+//     loop's (loop, ack) pair. Per loop: mint a CommandID; on id-gen failure SKIP
+//     that loop's graceful shutdown (the deferred sessionCancel hard-cancels it)
+//     rather than aborting the whole Shutdown. The send keeps Done/ctx escapes so
+//     an unbuffered send can never wedge; a loop already exited (Done) is skipped.
+//  5. Wait for every recorded ack, aggregating the first non-nil error (a loop's
+//     root ctx cancelled before cleanup finished), bounded by ctx and each loop's
+//     Done.
 //
-// Calling Shutdown after the actor has exited is a no-op (StopSession is
-// idempotent; the loop's Done short-circuits the rest).
+// Calling Shutdown twice is safe: StopSession is idempotent, closing already true
+// is fine, and loops that already exited hit the <-Done cases.
 func (s *Session) Shutdown(ctx context.Context) error {
+	// (1) Latch closing and snapshot the loops atomically under loopsMu — the same
+	// lock NewLoop's registration check re-tests closing under, so no loop can be
+	// registered after this snapshot is taken.
+	s.loopsMu.Lock()
+	s.closing = true
+	handles := make([]*loopHandle, 0, len(s.loops))
+	for _, h := range s.loops {
+		handles = append(handles, h)
+	}
+	s.loopsMu.Unlock()
+
+	// (2) Flip the session phase to stopped after the snapshot, before the sends.
 	s.hub.StopSession(ctx)
 
-	l, ok := s.loopFor(s.primaryLoopID)
-	if !ok {
-		// No primary loop to stop; still cancel the session lifetime backstop so
-		// any loopCtx derived from sessionCtx is released.
-		s.sessionCancel()
-		return nil
-	}
-	id, err := s.newCommandID()
-	if err != nil {
-		return err
-	}
-	ack := make(chan error, 1)
-	select {
-	case l.Commands <- command.Shutdown{Header: command.Header{CommandID: id}, Ack: ack}:
-	case <-l.Done:
-		// Loop already exited; cancel the session lifetime backstop and return.
-		s.sessionCancel()
-		return nil
-	case <-ctx.Done():
-		return &SessionError{Kind: SessionContextDone, Cause: ctx.Err()}
+	// (3) Final backstop on every path: released last, after the graceful waits or
+	// on a ctx timeout. Deferred so it never hard-cancels loops mid-shutdown.
+	defer s.sessionCancel()
+
+	// (4) Send a graceful Shutdown to every loop in the snapshot.
+	targets := make([]shutdownTarget, 0, len(handles))
+	for _, h := range handles {
+		id, err := s.newCommandID()
+		if err != nil {
+			// id-gen failure for ONE loop must not abort the whole Shutdown: skip
+			// its graceful shutdown; the deferred sessionCancel hard-cancels it.
+			continue
+		}
+		ack := make(chan error, 1)
+		select {
+		case h.loop.Commands <- command.Shutdown{Header: command.Header{CommandID: id}, Ack: ack}:
+			targets = append(targets, shutdownTarget{loop: h.loop, ack: ack})
+		case <-h.loop.Done:
+			// Loop already exited; nothing to wait for.
+		case <-ctx.Done():
+			return &SessionError{Kind: SessionContextDone, Cause: ctx.Err()}
+		}
 	}
 
-	select {
-	case err := <-ack:
-		// The actor has stopped; cancel the session lifetime backstop as the
-		// final step so every loopCtx derived from sessionCtx is released.
-		s.sessionCancel()
-		// err is non-nil when the loop's root context was cancelled before
-		// the actor finished cleanup. Wrap it so callers always receive a
-		// typed *SessionError rather than a raw context error.
-		if err != nil {
-			return &SessionError{Kind: SessionContextDone, Cause: err}
+	// (5) Wait for each reached loop's ack, aggregating the first non-nil error.
+	var firstErr error
+	for _, t := range targets {
+		select {
+		case e := <-t.ack:
+			// e is non-nil when that loop's root ctx was cancelled before the actor
+			// finished cleanup. Keep the first such error to report.
+			if e != nil && firstErr == nil {
+				firstErr = e
+			}
+		case <-t.loop.Done:
+			// Actor exited without (or before we read) an ack; nothing to wait for.
+		case <-ctx.Done():
+			return &SessionError{Kind: SessionContextDone, Cause: ctx.Err()}
 		}
-		return nil
-	case <-l.Done:
-		s.sessionCancel()
-		return nil
-	case <-ctx.Done():
-		return &SessionError{Kind: SessionContextDone, Cause: ctx.Err()}
 	}
+
+	if firstErr != nil {
+		return &SessionError{Kind: SessionContextDone, Cause: firstErr}
+	}
+	return nil
 }
 
 // Approve approves the pending tool call identified by toolExecutionID, granting

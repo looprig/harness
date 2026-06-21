@@ -11,6 +11,7 @@ import (
 	"github.com/inventivepotter/urvi/internal/agent/loop"
 	"github.com/inventivepotter/urvi/internal/agent/loop/command"
 	"github.com/inventivepotter/urvi/internal/agent/loop/event"
+	"github.com/inventivepotter/urvi/internal/agent/session/hub"
 	"github.com/inventivepotter/urvi/internal/content"
 	"github.com/inventivepotter/urvi/internal/llm"
 	"github.com/inventivepotter/urvi/internal/tool"
@@ -670,6 +671,12 @@ func TestStampsCommandHeaderID(t *testing.T) {
 // the session's idGenerator fails, every command-sending method must fail secure
 // with *SessionError{SessionIDGenerationFailed} and send no command (no
 // unidentifiable, zero-ID command ever leaves the session).
+//
+// Shutdown is deliberately NOT in this table: per Task 7 / design §9, an id-gen
+// failure for one loop must NOT abort the whole Shutdown — Shutdown's job is to
+// tear down EVERY loop, so it skips that loop's graceful command and falls back to
+// the deferred sessionCancel backstop, returning nil. That distinct contract is
+// covered by TestShutdownIDGenFailureStillTearsDownAllLoops.
 func TestNewCommandIDGenerationFailure(t *testing.T) {
 	t.Parallel()
 	genErr := errors.New("rand source exhausted")
@@ -681,7 +688,6 @@ func TestNewCommandIDGenerationFailure(t *testing.T) {
 	}{
 		{name: "Invoke", call: func(s *Session) error { _, err := s.Invoke(context.Background(), nil); return err }},
 		{name: "Interrupt", call: func(s *Session) error { _, err := s.Interrupt(context.Background()); return err }},
-		{name: "Shutdown", call: func(s *Session) error { return s.Shutdown(context.Background()) }},
 	}
 	for _, tt := range tests {
 		tt := tt
@@ -705,6 +711,50 @@ func TestNewCommandIDGenerationFailure(t *testing.T) {
 				t.Fatalf("err = %v, want it to wrap the generator error", err)
 			}
 		})
+	}
+}
+
+// TestShutdownIDGenFailureStillTearsDownAllLoops covers Shutdown's distinct
+// id-gen-failure contract (Task 7 / design §9): a crypto/rand failure must NOT
+// abort the whole Shutdown. Shutdown skips the graceful command.Shutdown for the
+// loops it cannot mint an id for and falls back to the deferred sessionCancel
+// backstop, which hard-cancels every loopCtx — so EVERY loop's actor still exits
+// (Done closes) and Shutdown returns nil. A leaked, still-running loop on a
+// shutdown is the failure this guards against.
+func TestShutdownIDGenFailureStillTearsDownAllLoops(t *testing.T) {
+	t.Parallel()
+	s, err := New(context.Background(), cfg(&stubLLM{chunks: []content.Chunk{textChunk("x")}}))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	subID, err := s.NewLoop(loop.Provenance{}, cfg(&stubLLM{chunks: []content.Chunk{textChunk("y")}}))
+	if err != nil {
+		t.Fatalf("NewLoop: %v", err)
+	}
+
+	s.loopsMu.RLock()
+	primaryDone := s.loops[s.primaryLoopID].loop.Done
+	subDone := s.loops[subID].loop.Done
+	s.loopsMu.RUnlock()
+
+	// Fail every command-id mint during Shutdown.
+	s.newID = func() (uuid.UUID, error) { return uuid.UUID{}, errors.New("rand source exhausted") }
+
+	if err := s.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown with failing id-gen = %v, want nil (backstop tears loops down)", err)
+	}
+
+	// Despite the id-gen failure, the sessionCancel backstop must hard-cancel every
+	// loopCtx, so both actors exit.
+	select {
+	case <-primaryDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("primary loop Done not closed after Shutdown with failing id-gen (backstop did not fire)")
+	}
+	select {
+	case <-subDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("sub-loop Done not closed after Shutdown with failing id-gen (backstop did not fire)")
 	}
 }
 
@@ -1496,5 +1546,152 @@ func TestGateReplyZeroLoopFallsBackToPrimary(t *testing.T) {
 	}
 	if err := <-errCh; err != nil {
 		t.Fatalf("Approve returned %v, want nil", err)
+	}
+}
+
+// twoFakeLoopHandles exposes both fake loops' command AND done channels so a test
+// can observe the per-loop Shutdown send and drive each actor's exit. Unlike
+// sessionWithTwoFakeLoops it returns the done channels so the test owns the
+// actor-exit signal. cmds are unbuffered to mirror the real loop.Commands.
+func sessionWithTwoFakeLoopsAndDone() (s *Session, cmdsA, cmdsB chan command.Command, doneA, doneB chan struct{}) {
+	cmdsA = make(chan command.Command)
+	cmdsB = make(chan command.Command)
+	doneA = make(chan struct{})
+	doneB = make(chan struct{})
+	sessionCtx, sessionCancel := context.WithCancel(context.Background())
+	loopA := mustUUID()
+	loopB := mustUUID()
+	s = &Session{
+		SessionID:     mustUUID(),
+		hub:           hub.New(mustUUID()),
+		sessionCtx:    sessionCtx,
+		sessionCancel: sessionCancel,
+		loops: map[uuid.UUID]*loopHandle{
+			loopA: {loop: &loop.Loop{Commands: cmdsA, Done: doneA}, cancel: func() {}},
+			loopB: {loop: &loop.Loop{Commands: cmdsB, Done: doneB}, cancel: func() {}},
+		},
+		primaryLoopID: loopA,
+		newID:         uuid.New,
+	}
+	return s, cmdsA, cmdsB, doneA, doneB
+}
+
+// TestShutdownReachesEveryLoop is the point of Task 7: Shutdown must send a
+// graceful command.Shutdown to EVERY registered loop (the primary AND every
+// sub-loop), not just the primary. With two fake loops whose Done never closes on
+// their own, the only way both actors learn to stop is the per-loop Shutdown
+// command — the current primary-only Shutdown sends it to loop A alone and never
+// reaches loop B, so the "sub-loop B received a Shutdown" requirement is the red.
+//
+// The fake loops never close Done themselves, so the test acts as both actors:
+// it receives the Shutdown on each command channel and replies nil on each Ack,
+// exactly as a real actor would, letting Shutdown complete and return nil.
+func TestShutdownReachesEveryLoop(t *testing.T) {
+	t.Parallel()
+	s, cmdsA, cmdsB, _, _ := sessionWithTwoFakeLoopsAndDone()
+
+	errCh := make(chan error, 1)
+	go func() { errCh <- s.Shutdown(context.Background()) }()
+
+	// Both loops MUST be reached. The sends may arrive in either order, so accept
+	// whichever channel is ready first across two iterations, then require both
+	// were a real command.Shutdown carrying a fresh id and a non-nil Ack.
+	var ackA, ackB chan<- error
+	for i := 0; i < 2; i++ {
+		select {
+		case cmd := <-cmdsA:
+			sd, ok := cmd.(command.Shutdown)
+			if !ok {
+				t.Fatalf("loop A received %T, want command.Shutdown", cmd)
+			}
+			if sd.Ack == nil || sd.Header.CommandID.IsZero() {
+				t.Fatalf("loop A Shutdown malformed: ack=%v id=%v", sd.Ack, sd.Header.CommandID)
+			}
+			ackA = sd.Ack
+		case cmd := <-cmdsB:
+			sd, ok := cmd.(command.Shutdown)
+			if !ok {
+				t.Fatalf("loop B received %T, want command.Shutdown", cmd)
+			}
+			if sd.Ack == nil || sd.Header.CommandID.IsZero() {
+				t.Fatalf("loop B Shutdown malformed: ack=%v id=%v", sd.Ack, sd.Header.CommandID)
+			}
+			ackB = sd.Ack
+		case <-time.After(2 * time.Second):
+			t.Fatal("a loop never received its Shutdown command (Shutdown did not reach every loop)")
+		}
+	}
+	if ackA == nil {
+		t.Fatal("primary loop A never received a Shutdown command")
+	}
+	if ackB == nil {
+		t.Fatal("sub-loop B never received a Shutdown command (current primary-only Shutdown leaves it running)")
+	}
+
+	// Both actors ack a clean exit.
+	ackA <- nil
+	ackB <- nil
+
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("Shutdown returned %v, want nil after both loops acked clean", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Shutdown never returned after both loops acked")
+	}
+}
+
+// TestShutdownClosesAllRealLoopsAndLatchesClosing drives a real two-loop session
+// to shutdown and asserts the whole-session teardown contract:
+//
+//	(a) BOTH the primary loop's AND the sub-loop's actor exit (Done closes) — every
+//	    loop is reached, none is left running.
+//	(b) WaitIdle returns hub.ErrSessionStopped — the session phase is stopped.
+//	(c) a NewLoop after Shutdown fails secure with *SessionError{SessionClosing} —
+//	    Shutdown latched the closing flag so no loop can register post-shutdown.
+func TestShutdownClosesAllRealLoopsAndLatchesClosing(t *testing.T) {
+	t.Parallel()
+	s, err := New(context.Background(), cfg(&stubLLM{chunks: []content.Chunk{textChunk("x")}}))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	subID, err := s.NewLoop(loop.Provenance{}, cfg(&stubLLM{chunks: []content.Chunk{textChunk("y")}}))
+	if err != nil {
+		t.Fatalf("NewLoop: %v", err)
+	}
+
+	// Capture both actors' Done channels before shutdown.
+	s.loopsMu.RLock()
+	primaryDone := s.loops[s.primaryLoopID].loop.Done
+	subDone := s.loops[subID].loop.Done
+	s.loopsMu.RUnlock()
+
+	if err := s.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+
+	// (a) both actors have exited.
+	select {
+	case <-primaryDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("primary loop Done not closed after Shutdown")
+	}
+	select {
+	case <-subDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("sub-loop Done not closed after Shutdown (Shutdown did not reach it)")
+	}
+
+	// (b) the session is stopped.
+	if err := s.WaitIdle(context.Background()); !errors.Is(err, hub.ErrSessionStopped) {
+		t.Fatalf("WaitIdle after Shutdown = %v, want hub.ErrSessionStopped", err)
+	}
+
+	// (c) no loop can register once closing is latched.
+	_, err = s.NewLoop(loop.Provenance{}, cfg(&stubLLM{chunks: []content.Chunk{textChunk("z")}}))
+	var se *SessionError
+	if !errors.As(err, &se) || se.Kind != SessionClosing {
+		t.Fatalf("NewLoop after Shutdown = %v, want *SessionError{SessionClosing}", err)
 	}
 }
