@@ -216,6 +216,29 @@ func TestTurnFailedErrNotMarshalled(t *testing.T) {
 	}
 }
 
+// TestRestoreErroredErrNotMarshalled proves RestoreErrored.Err is tagged json:"-"
+// (mirroring TurnFailed.Err): the typed restore-failure cause cannot round-trip
+// through encoding/json, so it must never appear in the journal as garbage. The
+// event still marshals (here, only the embedded Header fields).
+func TestRestoreErroredErrNotMarshalled(t *testing.T) {
+	t.Parallel()
+	ev := RestoreErrored{
+		Header: Header{EventID: seededUUID(0x66)},
+		Err:    errSentinel{},
+	}
+	data, err := json.Marshal(ev)
+	if err != nil {
+		t.Fatalf("json.Marshal(RestoreErrored) error = %v", err)
+	}
+	keys := topLevelKeys(t, data)
+	if hasKey(keys, "err") || hasKey(keys, "Err") {
+		t.Errorf("RestoreErrored journal output must not carry the error field; got %s", data)
+	}
+	if !hasKey(keys, "event_id") {
+		t.Errorf("RestoreErrored journal output missing event_id; got %s", data)
+	}
+}
+
 // errSentinel is a tiny error used only to populate TurnFailed.Err.
 type errSentinel struct{}
 

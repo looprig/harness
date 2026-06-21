@@ -181,6 +181,41 @@ type SessionStopped struct {
 	Header
 }
 
+// RestoreStarted marks the beginning of a session restore from the durable
+// journal. Like SessionStarted it is session-scoped and Enduring (an
+// authoritative session-lifecycle transition, never a turn-ender); Header.SessionID
+// is set, LoopID/TurnID/StepID are zero.
+type RestoreStarted struct {
+	enduring
+	sessionScoped
+	Header
+}
+
+// RestoreDone marks a successful end of a session restore from the durable
+// journal — the session is reconstructed and ready to resume. It is session-scoped
+// and Enduring; Header.SessionID is set, LoopID/TurnID/StepID are zero.
+type RestoreDone struct {
+	enduring
+	sessionScoped
+	Header
+}
+
+// RestoreErrored marks a failed session restore from the durable journal. Err
+// carries the typed cause; like TurnFailed.Err an error value cannot round-trip
+// through encoding/json, so it is tagged json:"-" — callers read it in-memory via
+// errors.As, and the durable codec's projection lands in a later phase. It is
+// session-scoped and Enduring; Header.SessionID is set, LoopID/TurnID/StepID are
+// zero.
+type RestoreErrored struct {
+	enduring
+	sessionScoped
+	Header
+	// Err is the typed cause of the restore failure; tagged json:"-" because an
+	// error value has no stable codec (mirrors TurnFailed.Err). Callers inspect it
+	// in-memory via errors.As; a journal records the failure via the event itself.
+	Err error `json:"-"`
+}
+
 // LoopIdle is emitted when a loop parks with no active turn. Header.SessionID and
 // Header.LoopID are set; TurnID/StepID are zero. It drives session quiescence.
 type LoopIdle struct {
@@ -203,5 +238,8 @@ func (SessionStarted) isEvent() {}
 func (SessionActive) isEvent()  {}
 func (SessionIdle) isEvent()    {}
 func (SessionStopped) isEvent() {}
+func (RestoreStarted) isEvent() {}
+func (RestoreDone) isEvent()    {}
+func (RestoreErrored) isEvent() {}
 func (LoopIdle) isEvent()       {}
 func (LoopStarted) isEvent()    {}

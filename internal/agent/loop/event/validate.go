@@ -157,6 +157,13 @@ func classify(ev Event) (name string, profile idProfile, ok bool) {
 		return "SessionIdle", sessionProfile(), true
 	case SessionStopped:
 		return "SessionStopped", sessionProfile(), true
+	case RestoreStarted:
+		// Session-scoped, same shape as SessionStarted: only SessionID set.
+		return "RestoreStarted", sessionProfile(), true
+	case RestoreDone:
+		return "RestoreDone", sessionProfile(), true
+	case RestoreErrored:
+		return "RestoreErrored", sessionProfile(), true
 	case LoopIdle:
 		return "LoopIdle", loopProfile(), true
 	case LoopStarted:

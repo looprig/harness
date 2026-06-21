@@ -44,6 +44,9 @@ func TestValidateEventValid(t *testing.T) {
 		{"SessionActive", event.SessionActive{Header: sessionH}},
 		{"SessionIdle", event.SessionIdle{Header: sessionH}},
 		{"SessionStopped", event.SessionStopped{Header: sessionH}},
+		{"RestoreStarted", event.RestoreStarted{Header: sessionH}},
+		{"RestoreDone", event.RestoreDone{Header: sessionH}},
+		{"RestoreErrored", event.RestoreErrored{Header: sessionH}},
 		{"LoopIdle", event.LoopIdle{Header: loopH}},
 		// LoopStarted: NEW loop in Header.Coordinates (SessionID+LoopID, Turn/Step zero);
 		// the spawning loop/turn/step rides in Header.Cause and is unconstrained by the
