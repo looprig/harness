@@ -219,6 +219,15 @@ func NewSessionJournal(js nats.JetStreamContext, sessionID uuid.UUID, opts ...Op
 		return nil, err
 	}
 
+	// Bind (creating if absent) the per-session object store the offload path uploads
+	// over-threshold records to. Idempotent, mirroring ensureStream: a rebind binds the
+	// existing bucket. Done alongside the stream so the journal is ready to offload from
+	// the first Append.
+	objects, err := ensureObjectStore(js, sessionID)
+	if err != nil {
+		return nil, err
+	}
+
 	// Initialize the fence from the stream's current tip. A fresh stream reports
 	// LastSeq 0 (so the first publish fences on 0 and lands at seq 1); an existing
 	// stream reports its last durable sequence, so a rebind appends after it.
@@ -230,6 +239,7 @@ func NewSessionJournal(js nats.JetStreamContext, sessionID uuid.UUID, opts ...Op
 	j := &streamJournal{
 		js:            js,
 		stream:        name,
+		objects:       objects,
 		appendTimeout: o.appendTimeout,
 		expectedSeq:   info.State.LastSeq,
 	}
@@ -329,8 +339,12 @@ func streamConfig(sessionID uuid.UUID) *nats.StreamConfig {
 		// ambiguous-ack retry, where a lost-ack republish under the same Nats-Msg-Id
 		// must dedup against the already-committed record.
 		Duplicates: dedupWindow,
-		// TODO(Phase 5): size policy — MaxMsgSize / server max_payload / object-store
-		// offload for oversized records is deferred; defaults stand for now.
+		// Inline ceiling (Task 5.1): the hard per-message size cap enforced by the
+		// stream as defense-in-depth. The journal already offloads any record over
+		// inlineThreshold (512 KiB) to the object store, so a correctly-built inline
+		// message or pointer always fits well under this; a stray oversized inline
+		// publish is rejected by the server rather than silently truncated/accepted.
+		MaxMsgSize: streamInlineCeiling,
 		// TODO(Phase 10): set the embedded server's SyncInterval (power-loss durability
 		// knob, design round 5) at composition root — it is a server/FileStore option set
 		// when the embedded server is created in cmd/cli, not a StreamConfig field.

@@ -53,6 +53,12 @@ type streamJournal struct {
 	js     nats.JetStreamContext
 	stream string // the bound stream name (StreamName(sessionID))
 
+	// objects is the per-session object store an over-threshold record's marshaled
+	// bytes are offloaded to (content-addressed) before its pointer is appended. It is
+	// bound once at construction (ensureObjectStore) and used only inside the serialized
+	// publish path, so the upload-before-append ordering holds under mu.
+	objects nats.ObjectStore
+
 	// appendTimeout is the per-append publish deadline (defaultAppendTimeout unless
 	// overridden via WithAppendTimeout).
 	appendTimeout time.Duration
@@ -108,10 +114,18 @@ func (j *streamJournal) Append(ctx context.Context, rec JournalRecord) (uint64, 
 	pubCtx, cancel := context.WithTimeout(ctx, j.appendTimeout)
 	defer cancel()
 
-	msg := &nats.Msg{
-		Subject: rec.Subject(),
-		Header:  nats.Header{nats.MsgIdHdr: []string{rec.IdempotencyID()}},
-		Data:    payload,
+	// Build the message to publish. A record at or below inlineThreshold is published
+	// inline exactly as before. An over-threshold record is content-addressed and its
+	// marshaled bytes are offloaded to the object store BEFORE the pointer is appended
+	// (upload-before-append: no dangling reference), and the published message becomes
+	// the small pointer carrying the SAME Subject and SAME Nats-Msg-Id — so the fence,
+	// dedup, and ambiguous-ack reconciliation below are byte-identical to the inline
+	// path; only the body the server stores differs. The upload runs under mu (this
+	// whole method holds it), preserving the single-writer ordering. The pointer body
+	// (not the original payload) is what later reconcileTip compares against the tip.
+	msg, payload, err := j.buildMessage(pubCtx, rec, payload)
+	if err != nil {
+		return 0, err
 	}
 
 	// expected is the tip the publish (and any resolve retry) fences on. Capture it
@@ -149,6 +163,35 @@ func (j *streamJournal) Append(ctx context.Context, rec JournalRecord) (uint64, 
 	// Any other publish error (e.g. a non-fence API error, a transport failure that
 	// is not classed ambiguous) is a definite failure: fail closed, unadvanced.
 	return 0, &AppendError{Subject: rec.Subject(), MsgID: rec.IdempotencyID(), Expected: expected, Cause: err}
+}
+
+// buildMessage decides inline-vs-offload for a marshaled record and returns the message
+// to publish together with the bytes that will actually be STORED in the stream (so the
+// caller's ambiguous-ack reconcileTip compares the tip against the right body). Called
+// only under mu, so the over-threshold upload is serialized with the publish that
+// references it.
+//
+//   - payload <= inlineThreshold: the message body is payload itself (the unchanged
+//     inline path); the stored bytes are payload.
+//   - payload > inlineThreshold: the marshaled bytes are uploaded to the object store
+//     under their content-addressed id BEFORE returning, and the message body becomes
+//     the small pointer record (same Subject, same Nats-Msg-Id); the stored bytes are
+//     that pointer body. A failed upload returns *RecordTooLargeError — the record is
+//     never silently inlined.
+func (j *streamJournal) buildMessage(ctx context.Context, rec JournalRecord, payload []byte) (*nats.Msg, []byte, error) {
+	if len(payload) <= inlineThreshold {
+		msg := &nats.Msg{
+			Subject: rec.Subject(),
+			Header:  nats.Header{nats.MsgIdHdr: []string{rec.IdempotencyID()}},
+			Data:    payload,
+		}
+		return msg, payload, nil
+	}
+	msg, err := buildOffloadMessage(ctx, j.objects, rec, payload)
+	if err != nil {
+		return nil, nil, err
+	}
+	return msg, msg.Data, nil
 }
 
 // resolveAmbiguous resolves a lost-ack append whose original outcome is unknown. It
