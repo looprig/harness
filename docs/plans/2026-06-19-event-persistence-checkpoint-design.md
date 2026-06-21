@@ -13,6 +13,59 @@ session/loop lifecycle events (`SessionStarted`/`SessionActive`/`SessionIdle`/
 as a projection of Enduring events via `ApplyEvent`; restore reuses that exact
 projection.
 
+> **Reconciliation with landed code (2026-06-21).** Validated against `main`
+> (`fc93ee4`); the loop-machine event model has **landed as real code**, so this
+> layer is buildable now — no upstream design dependency remains. Deltas from the
+> original draft:
+>
+> - **Confirmed as-designed:** `StepDone` (Enduring, loop-scoped, carries
+>   `Messages content.AgenticMessages`); `TurnStarted`/`TurnFoldedInto` carry the
+>   `UserMessage`; the commit arm appends `msgs` **then** publishes the event at one
+>   actor-owned point (`loop.go` — "never a lie"); the hub
+>   (`internal/agent/session/hub`) exposes `SubscribeEvents(EventFilter{Ephemeral,
+>   Enduring LoopScope})` and already enforces Ephemeral-drop / Enduring-fail-loud
+>   (`SubscriptionLossError`, 256-buffer); `ToolCall*` + `InputQueued` are
+>   Ephemeral and `TurnRejected` Enduring (TUI-adoption amendments are in code);
+>   the TUI reduces via `transcript.ApplyEvent` + `interaction.ApplyEvent` with
+>   per-loop `ClearPromptsForLoop`.
+> - **`LoopSpawned` caveat resolved:** `LoopStarted` (Enduring, loop-scoped) is
+>   published by `Session.NewLoop`, spawning provenance in
+>   `Header.Cause.Coordinates` (zero = primary/root). Session structure folds from
+>   it; no new event needed.
+> - **Terminology map** (doc → code): `AgentSession`→`Session`; `Header.ID`→
+>   `Header.EventID` (the idempotency key → `Nats-Msg-Id`); `Header.ParentLoopID`→
+>   `Header.Cause.Coordinates.LoopID`; `CausationID`→`Cause.CommandID`/`Cause.EventID`;
+>   submit `InputID`→`CommandID`. Subjects key off `Header.Coordinates`.
+> - **Integration is a publish-path decorator, not a reroute** (supersedes *One
+>   delivery path per class* below). The hub is already the live bus with the
+>   right policy, so the durable layer is a `journalingPublisher` implementing the
+>   loop's narrow `eventPublisher` (`PublishEvent`) and wrapping `*hub.Hub`: for
+>   Enduring, **Append to JetStream then forward to the hub**; for Ephemeral,
+>   **forward only**. The loop is unchanged (DIP); live delivery stays in-memory
+>   via the hub; JetStream is the durable tap + restore source.
+> - **Append-failure = crash-consistency (fail-secure).** `msgs` commits before
+>   publish, so a JetStream `Append` error can't un-commit; treat it as a crash at
+>   that instant — surface loudly and stop/degrade the session. The append-only
+>   log stays a consistent prefix; restore lands at the last durable step (the
+>   crash-seam covers the rest). **Never** forward-on-Append-error (that yields an
+>   unrestorable session).
+> - **An event-level JSON codec must be built** (supersedes "reuses the existing
+>   codec"). Only `content.Block` and `Message` have tagged-union codecs today;
+>   whole events don't round-trip. Build a sealed `MarshalEvent`/`UnmarshalEvent`
+>   (type discriminator + payload) over the 20 event types atop the block/message
+>   codecs, with its own fuzz target. `json:"-"` fields don't serialize: on
+>   persisted (Enduring) events that's only `PermissionRequested.Request` and
+>   `TurnFailed.Err` — acceptable (gate neutralized by the crash-seam; error is
+>   display-only), but stated.
+> - **Restore needs a dedicated constructor.** `session.New` mints a fresh id,
+>   publishes `SessionStarted`, and spawns an empty primary loop — wrong for
+>   resume. Add a `Restore(ctx, cfg, sessionID, replayer)` path that folds the
+>   journal to rebuild loops + `msgs` + tree, appends the crash-seam
+>   `TurnInterrupted` for any open turn, and comes up idle without a new
+>   `SessionStarted`. Live handoff: subscribe to the fresh hub first, replay the
+>   JetStream backlog, then drain buffered live events **deduped by
+>   `Header.EventID`**.
+
 ## Motivation
 
 Today there is **zero persistence**: a loop's committed conversation
@@ -105,6 +158,12 @@ Inversion).
   not payload — unaffected by the future at-rest encryption.)
 
 ### One delivery path per class (no dedup seam)
+
+> **Superseded by the 2026-06-21 reconciliation.** Now that the hub exists as the
+> live bus, the durable layer is a *publish-path decorator* (Append-then-forward),
+> so live Enduring delivery stays in-memory via the hub and JetStream is the
+> durable tap; the backlog→live seam is deduped by `Header.EventID` at restore.
+> The original framing below is retained for rationale.
 
 Even **live** Enduring events round-trip through JetStream before a local client
 sees them: `PublishEvent(Enduring)` does `journal.Append` only; a subscriber
@@ -358,10 +417,15 @@ it is a **long-lived compatibility surface**: old sessions are restored by new
 code, so the format must evolve forward/backward-compatibly. JSON does this with
 additive fields + an explicit `schemaVersion` tag.
 
-- **Reuses the existing codec.** `content.Block`/messages are already a
-  sealed-interface JSON codec (the one `FuzzUnmarshalBlock` guards). `Event` is
-  likewise a sealed interface, so events use the *same* tagged-union pattern
-  (type tag + payload) — one codec style, one fuzz boundary.
+- **Must build an event-level codec, atop existing ones.** `content.Block` and
+  `Message` already have sealed-interface JSON codecs (the ones `FuzzUnmarshalBlock`
+  guards), but **whole events do not round-trip through `encoding/json` today**
+  (verified 2026-06-21). `Event` is a sealed interface, so build a
+  `MarshalEvent`/`UnmarshalEvent` tagged union (type tag + payload) over the 20
+  event types, delegating block/message payloads to the existing codecs — one
+  codec style, a new `FuzzDecodeEvent` boundary. `json:"-"` fields are not
+  serialized: on persisted (Enduring) events only `PermissionRequested.Request`
+  and `TurnFailed.Err` (both acceptable to drop on restore — see reconciliation).
 - **Debuggable.** The stream/FileStore can be inspected (`nats stream view`) and
   the events read directly — valuable during restore bring-up.
 - **Stdlib**, per `CLAUDE.md`.
@@ -402,14 +466,15 @@ code, fuzz the untrusted boundary.
 
 ## Sequencing
 
-Depends on the loop-machine spec shipping its event model (classes, `StepDone`,
-the hub, `EventFilter`) — the same upstream dependency as the TUI-adoption spec.
-**Possible upstream amendment:** if session structure can't be fully inferred
-from subjects + `Header.ParentLoopID`, add a `LoopSpawned` structural Enduring
-event (see *Session structural state*). Order: loop-machine event model
-(+ any structural event) → this persistence layer (durable hub + NATS
-appender/replayer + restore + catalog) → TUI consumes restore. Orthogonal to and
-composes with the TUI-event-adoption work.
+The loop-machine event model (classes, `StepDone`, the hub, `EventFilter`,
+`LoopStarted`) has **landed on `main` as of `fc93ee4`** — so there is no upstream
+design dependency left and this layer is buildable now. The `LoopSpawned`
+amendment is moot: `LoopStarted` + `Header.Cause.Coordinates` already make
+session structure foldable. Build order within this layer: event codec
+(`MarshalEvent`/`UnmarshalEvent` + fuzz) → `EventAppender`/`EventReplayer` (NATS)
+→ `journalingPublisher` decorator + composition wiring → `Restore` constructor →
+catalog (KV) → TUI replay-repaint. Orthogonal to and composes with the
+TUI-event-adoption work.
 
 ## Open questions / risks
 
