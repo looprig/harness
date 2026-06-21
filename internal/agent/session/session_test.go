@@ -11,6 +11,7 @@ import (
 	"github.com/inventivepotter/urvi/internal/agent/loop"
 	"github.com/inventivepotter/urvi/internal/agent/loop/command"
 	"github.com/inventivepotter/urvi/internal/agent/loop/event"
+	"github.com/inventivepotter/urvi/internal/agent/loop/identity"
 	"github.com/inventivepotter/urvi/internal/agent/session/hub"
 	"github.com/inventivepotter/urvi/internal/content"
 	"github.com/inventivepotter/urvi/internal/llm"
@@ -412,11 +413,17 @@ func TestLoopFor(t *testing.T) {
 }
 
 // TestRoutingMethodsLoopNotFound covers the SessionLoopNotFound branch shared by
-// every routing method: when loopFor(primaryLoopID) misses (the registry has no
-// entry for the primary id), the method must fail secure with
+// the SINGLE-TARGET routing methods: when loopFor misses (the registry has no
+// entry for the addressed id), the method must fail secure with
 // *SessionError{SessionLoopNotFound} and send no command. The miss is forced by
 // deleting the primary registry entry under loopsMu after construction, so the
 // id stays set but resolves to nothing — the exact state the branch guards.
+//
+// Interrupt is deliberately NOT in this table. Task 8 made it distributed: it
+// iterates ALL loops rather than resolving one by id, so an empty registry is the
+// no-op case (returns (false, nil)), NOT a SessionLoopNotFound error — there is no
+// longer a single-target miss to guard. Its every-loop fan-out is covered by
+// TestInterruptReachesEveryLoop.
 func TestRoutingMethodsLoopNotFound(t *testing.T) {
 	t.Parallel()
 	callID := mustUUID()
@@ -425,7 +432,6 @@ func TestRoutingMethodsLoopNotFound(t *testing.T) {
 		call func(s *Session) error
 	}{
 		{name: "Invoke", call: func(s *Session) error { _, err := s.Invoke(context.Background(), nil); return err }},
-		{name: "Interrupt", call: func(s *Session) error { _, err := s.Interrupt(context.Background()); return err }},
 		// Approve/Deny/ProvideUserInput resolve the target loop by id (the primary
 		// here), which misses once the primary entry is deleted below.
 		{name: "Approve", call: func(s *Session) error {
@@ -667,16 +673,22 @@ func TestStampsCommandHeaderID(t *testing.T) {
 	}
 }
 
-// TestNewCommandIDGenerationFailure covers the crypto/rand failure branch: when
-// the session's idGenerator fails, every command-sending method must fail secure
-// with *SessionError{SessionIDGenerationFailed} and send no command (no
-// unidentifiable, zero-ID command ever leaves the session).
+// TestNewCommandIDGenerationFailure covers the crypto/rand failure branch for the
+// SINGLE-TARGET command methods: when the session's idGenerator fails, the method
+// must fail secure with *SessionError{SessionIDGenerationFailed} and send no
+// command (no unidentifiable, zero-ID command ever leaves the session).
 //
 // Shutdown is deliberately NOT in this table: per Task 7 / design §9, an id-gen
 // failure for one loop must NOT abort the whole Shutdown — Shutdown's job is to
 // tear down EVERY loop, so it skips that loop's graceful command and falls back to
 // the deferred sessionCancel backstop, returning nil. That distinct contract is
 // covered by TestShutdownIDGenFailureStillTearsDownAllLoops.
+//
+// Interrupt is also NOT in this table for the same reason (Task 8): it is the
+// distributed human "stop everything" and skips a loop it cannot mint an id for
+// (best-effort, consistent with Shutdown) rather than aborting the whole Interrupt,
+// so an id-gen failure yields (false, nil), not SessionIDGenerationFailed. Its
+// fan-out is covered by TestInterruptReachesEveryLoop.
 func TestNewCommandIDGenerationFailure(t *testing.T) {
 	t.Parallel()
 	genErr := errors.New("rand source exhausted")
@@ -687,7 +699,6 @@ func TestNewCommandIDGenerationFailure(t *testing.T) {
 		call func(s *Session) error
 	}{
 		{name: "Invoke", call: func(s *Session) error { _, err := s.Invoke(context.Background(), nil); return err }},
-		{name: "Interrupt", call: func(s *Session) error { _, err := s.Interrupt(context.Background()); return err }},
 	}
 	for _, tt := range tests {
 		tt := tt
@@ -1639,6 +1650,110 @@ func TestShutdownReachesEveryLoop(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("Shutdown never returned after both loops acked")
+	}
+}
+
+// TestInterruptReachesEveryLoop is the point of Task 8: Interrupt is the human
+// "stop everything" — it must send a command.Interrupt to EVERY registered loop
+// (the primary AND every sub-loop), not just the primary. With two fake loops
+// whose Done never closes on their own, the only way both actors learn to cancel
+// is the per-loop Interrupt command — the prior primary-only Interrupt reaches
+// loop A alone and never touches loop B, so the "sub-loop B received an Interrupt"
+// requirement is the red.
+//
+// Every Interrupt must carry Agency=AgencyUser (a human pressed interrupt). The
+// fake loops never close Done themselves, so the test acts as both actors: it
+// receives the Interrupt on each command channel and replies on each Ack with the
+// table's per-loop value, then asserts Interrupt aggregates to true iff any loop
+// reported it cancelled a turn (idle loops ack false and must not break the fan-in
+// or panic).
+func TestInterruptReachesEveryLoop(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name    string
+		ackA    bool
+		ackB    bool
+		wantAny bool
+	}{
+		{name: "both cancelled a turn", ackA: true, ackB: true, wantAny: true},
+		{name: "primary cancelled, sub idle", ackA: true, ackB: false, wantAny: true},
+		{name: "sub cancelled, primary idle", ackA: false, ackB: true, wantAny: true},
+		{name: "both idle ack false", ackA: false, ackB: false, wantAny: false},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			s, cmdsA, cmdsB, _, _ := sessionWithTwoFakeLoopsAndDone()
+
+			resCh := make(chan bool, 1)
+			errCh := make(chan error, 1)
+			go func() {
+				any, err := s.Interrupt(context.Background())
+				errCh <- err
+				resCh <- any
+			}()
+
+			// Both loops MUST be reached. The sends may arrive in either order, so
+			// accept whichever channel is ready first across two iterations, then
+			// require both were a real command.Interrupt carrying a fresh id, a
+			// non-nil Ack, and Agency=AgencyUser. Each loop's Ack is replied with the
+			// table's per-loop value, exactly as a real actor would.
+			var ackA, ackB chan<- bool
+			for i := 0; i < 2; i++ {
+				select {
+				case cmd := <-cmdsA:
+					ic, ok := cmd.(command.Interrupt)
+					if !ok {
+						t.Fatalf("loop A received %T, want command.Interrupt", cmd)
+					}
+					if ic.Ack == nil || ic.Header.CommandID.IsZero() {
+						t.Fatalf("loop A Interrupt malformed: ack=%v id=%v", ic.Ack, ic.Header.CommandID)
+					}
+					if ic.Header.Agency != identity.AgencyUser {
+						t.Fatalf("loop A Interrupt Agency = %v, want AgencyUser", ic.Header.Agency)
+					}
+					ackA = ic.Ack
+				case cmd := <-cmdsB:
+					ic, ok := cmd.(command.Interrupt)
+					if !ok {
+						t.Fatalf("loop B received %T, want command.Interrupt", cmd)
+					}
+					if ic.Ack == nil || ic.Header.CommandID.IsZero() {
+						t.Fatalf("loop B Interrupt malformed: ack=%v id=%v", ic.Ack, ic.Header.CommandID)
+					}
+					if ic.Header.Agency != identity.AgencyUser {
+						t.Fatalf("loop B Interrupt Agency = %v, want AgencyUser", ic.Header.Agency)
+					}
+					ackB = ic.Ack
+				case <-time.After(2 * time.Second):
+					t.Fatal("a loop never received its Interrupt command (Interrupt did not reach every loop)")
+				}
+			}
+			if ackA == nil {
+				t.Fatal("primary loop A never received an Interrupt command")
+			}
+			if ackB == nil {
+				t.Fatal("sub-loop B never received an Interrupt command (prior primary-only Interrupt leaves it running)")
+			}
+
+			// Both actors ack their table value.
+			ackA <- tt.ackA
+			ackB <- tt.ackB
+
+			select {
+			case err := <-errCh:
+				if err != nil {
+					t.Fatalf("Interrupt returned %v, want nil", err)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("Interrupt never returned after both loops acked")
+			}
+			any := <-resCh
+			if any != tt.wantAny {
+				t.Fatalf("Interrupt returned %v, want %v (ackA=%v ackB=%v)", any, tt.wantAny, tt.ackA, tt.ackB)
+			}
+		})
 	}
 }
 

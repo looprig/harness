@@ -566,38 +566,83 @@ func (s *Session) Submit(ctx context.Context, input []content.Block) (uuid.UUID,
 	}
 }
 
-// Interrupt cancels the running turn. Returns true if a turn was cancelled.
-// ctx allows the caller to time out the cancel attempt if the actor is slow.
+// interruptTarget pairs a loop with the Ack channel of the command.Interrupt the
+// session sent it, so the ack-wait phase can drain each loop's reply in turn. It
+// is Interrupt-internal: the send phase records one per loop actually reached, and
+// the wait phase reads them back. The Ack is chan bool (cancelled?), distinct from
+// shutdownTarget's chan error (graceful-exit error).
+type interruptTarget struct {
+	loop *loop.Loop
+	ack  chan bool
+}
+
+// Interrupt is the human "stop everything": it cancels the running turn of EVERY
+// loop in the session — the primary AND every sub-loop — not just the primary.
+// Sub-loops each run their own actor and turn, so a single human interrupt must
+// fan out to all of them. Idle loops (or loops already shutting down) ack false
+// and are harmless; Interrupt returns true iff ANY loop reported it cancelled a
+// running turn. ctx bounds the whole fan-out so a slow actor cannot wedge it.
+//
+// Unlike Shutdown, Interrupt does NOT latch closing and does NOT tear loops down:
+// it only cancels in-flight turns. A loop created concurrently with an Interrupt
+// is simply not in the snapshot and so is not interrupted — acceptable, because a
+// brand-new loop has no turn to cancel.
+//
+// The structure mirrors Shutdown's: snapshot the loops under loopsMu, send one
+// Interrupt per loop recording each reached loop's (loop, ack), then wait every
+// recorded ack and aggregate. Per-loop id-gen failure SKIPS that loop (best-effort,
+// consistent with Shutdown — one loop's failure never aborts the whole Interrupt).
 func (s *Session) Interrupt(ctx context.Context) (bool, error) {
-	l, ok := s.loopFor(s.primaryLoopID)
-	if !ok {
-		return false, &SessionError{Kind: SessionLoopNotFound}
+	// Snapshot the loops under loopsMu (no closing latch — Interrupt does not tear
+	// loops down). The snapshot is the set we fan the Interrupt out to.
+	s.loopsMu.RLock()
+	handles := make([]*loopHandle, 0, len(s.loops))
+	for _, h := range s.loops {
+		handles = append(handles, h)
 	}
-	id, err := s.newCommandID()
-	if err != nil {
-		return false, err
-	}
-	ack := make(chan bool, 1)
-	select {
-	// A manual Interrupt is a human-origination point (the human pressed interrupt),
-	// so it stamps Agency=AgencyUser. The programmatic boundary-cancel translation
-	// (interruptLoop, fired by an Invoke ctx cancel) is a SEPARATE method and
-	// stays machine — we never falsely attribute that machine action to a user.
-	case l.Commands <- command.Interrupt{Header: command.Header{CommandID: id, Agency: identity.AgencyUser}, Ack: ack}:
-	case <-l.Done:
-		return false, &SessionError{Kind: SessionLoopExited}
-	case <-ctx.Done():
-		return false, &SessionError{Kind: SessionContextDone, Cause: ctx.Err()}
+	s.loopsMu.RUnlock()
+
+	// Send an Interrupt to every loop in the snapshot, recording each reached loop's
+	// (loop, ack) pair.
+	targets := make([]interruptTarget, 0, len(handles))
+	for _, h := range handles {
+		id, err := s.newCommandID()
+		if err != nil {
+			// id-gen failure for ONE loop must not abort the whole Interrupt: skip its
+			// interrupt rather than failing the human's "stop everything". The worst
+			// case is that loop's turn runs to its natural terminal.
+			continue
+		}
+		ack := make(chan bool, 1)
+		select {
+		// A manual Interrupt is a human-origination point (the human pressed interrupt),
+		// so it stamps Agency=AgencyUser. The programmatic boundary-cancel translation
+		// (interruptLoop, fired by an Invoke ctx cancel) is a SEPARATE method and
+		// stays machine — we never falsely attribute that machine action to a user.
+		case h.loop.Commands <- command.Interrupt{Header: command.Header{CommandID: id, Agency: identity.AgencyUser}, Ack: ack}:
+			targets = append(targets, interruptTarget{loop: h.loop, ack: ack})
+		case <-h.loop.Done:
+			// Loop already exited; nothing to cancel.
+		case <-ctx.Done():
+			return false, &SessionError{Kind: SessionContextDone, Cause: ctx.Err()}
+		}
 	}
 
-	select {
-	case cancelled := <-ack:
-		return cancelled, nil
-	case <-l.Done:
-		return false, &SessionError{Kind: SessionLoopExited}
-	case <-ctx.Done():
-		return false, &SessionError{Kind: SessionContextDone, Cause: ctx.Err()}
+	// Wait for each reached loop's ack, aggregating: Interrupt returns true iff ANY
+	// loop reported it cancelled a running turn.
+	var any bool
+	for _, t := range targets {
+		select {
+		case cancelled := <-t.ack:
+			any = any || cancelled
+		case <-t.loop.Done:
+			// Actor exited without (or before we read) an ack; nothing was cancelled
+			// by us — leave any unchanged.
+		case <-ctx.Done():
+			return false, &SessionError{Kind: SessionContextDone, Cause: ctx.Err()}
+		}
 	}
+	return any, nil
 }
 
 // shutdownTarget pairs a loop with the Ack channel of the command.Shutdown the
