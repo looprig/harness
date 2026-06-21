@@ -240,6 +240,11 @@ func leaseKey(sessionID uuid.UUID) string { return sessionID.String() }
 // On success it starts a heartbeat goroutine renewing ExpiresAt and returns a live
 // Lease. The epoch is monotonic across acquisitions because each takeover writes
 // prev+1; only one holder wins a race because CAS (Create / Update(rev)) is atomic.
+//
+// Note: ctx does NOT cancel the underlying KV round-trip. The legacy JetStream KV
+// API (Get/Create/Update) takes no context; each call is bounded only by the
+// JetStream client's default request timeout (~5s), which ctx cannot shorten. ctx
+// is accepted for signature uniformity and future use, not for I/O cancellation.
 func (m *LeaseManager) Acquire(ctx context.Context, sessionID uuid.UUID) (Lease, error) {
 	key := leaseKey(sessionID)
 	holder, err := uuid.New()
@@ -386,6 +391,9 @@ func (l *kvLease) Lost() <-chan struct{} { return l.lost }
 // for prev+1). Deleting the entry instead would reset the next acquirer to epoch 1 and
 // break monotonicity. The update fails silently if a higher epoch already replaced us
 // — that successor already owns the session.
+//
+// Note: as with Acquire, ctx does NOT bound the KV round-trip (legacy KV API has no
+// context; bounded by the ~5s JetStream client default).
 func (l *kvLease) Release(ctx context.Context) error {
 	l.stopOnce.Do(func() { close(l.stop) })
 	l.wg.Wait()
