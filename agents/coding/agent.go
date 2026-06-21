@@ -204,6 +204,18 @@ func (c *Coding) Subscribe(filter event.EventFilter) (event.Subscription, error)
 // its EventFilter (primary-only Ephemeral + all-loop Enduring).
 func (c *Coding) PrimaryLoopID() uuid.UUID { return c.session.PrimaryLoopID() }
 
+// ReplayBacklog returns the RESTORED session's historical Enduring events for the
+// TUI's cold-restore repaint. A freshly-constructed session (New) is NOT a restore:
+// it has no backlog to repaint, so this returns nil and the TUI skips the repaint —
+// the new-session behavior is unchanged. Wiring a journal-backed EventReplayer here
+// for an actually-restored session (the cursor drain → materialized slice, scoped to
+// the primary loop's Enduring view) lands at the composition root in Phase 10.3, where
+// the new-vs-restore decision is made; until then a live session has no durable backlog
+// to replay. ctx bounds the read.
+func (c *Coding) ReplayBacklog(_ context.Context) ([]event.Event, error) {
+	return nil, nil
+}
+
 // Interrupt cancels the running turn. Returns true if a turn was cancelled.
 func (c *Coding) Interrupt(ctx context.Context) (bool, error) {
 	return c.session.Interrupt(ctx)

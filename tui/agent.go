@@ -39,6 +39,19 @@ type Agent interface {
 	// when done. Use DefaultEventFilter for the single-loop TUI default.
 	Subscribe(filter event.EventFilter) (EventStream, error)
 
+	// ReplayBacklog returns the RESTORED session's historical Enduring events for a
+	// cold-restore repaint, in session order. It is the backlog seam the TUI folds
+	// off the update loop (restoreBacklogCmd) to rebuild the committed transcript +
+	// pending gates BEFORE attaching the live Subscribe stream. The slice is
+	// materialized (the data layer is sub-second for realistic sizes) so the consumer
+	// drains it without owning a cursor's lifetime. A NEW (non-restored) session
+	// returns nil/empty — the TUI then skips the repaint and behaves exactly as a
+	// fresh session. A read failure returns a typed error the fold surfaces as a
+	// non-fatal restore-error notice (history could not repaint; the live stream is
+	// unaffected). The events are Enduring-only and from the primary loop's session
+	// view — never the live 256-cap hub buffer. ctx bounds the read.
+	ReplayBacklog(ctx context.Context) ([]event.Event, error)
+
 	// Approve resolves a pending tool-call permission gate, granting it at the
 	// chosen persistence scope. loopID is the loop that opened the gate (the
 	// PermissionRequested event's Header.LoopID) so the reply is dispatched to the

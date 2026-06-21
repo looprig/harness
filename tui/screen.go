@@ -113,13 +113,20 @@ func New(ctx context.Context, agent Agent, open OpenAgent, banner AgentBanner) S
 }
 
 // Init focuses the composer (starting the cursor blink), emits the initial
-// startup-banner entry, AND attaches the session-lifetime event subscription. The
-// subscription is the single event source for the whole session; subscribeCmd's
-// subscribedMsg installs it and starts the continuous reader.
+// startup-banner entry, schedules the cold-restore repaint, AND attaches the
+// session-lifetime event subscription. The subscription is the single LIVE event
+// source for the whole session; subscribeCmd's subscribedMsg installs it and starts
+// the continuous reader. restoreBacklogCmd folds a RESTORED session's historical
+// Enduring backlog OFF the update loop and repaints it once (restoredMsg) before any
+// live event drives the transcript — a new session's empty backlog makes it a no-op.
+// Both run as independent background commands: for a cold restore the loop comes up
+// idle, so no live event arrives until a user Submit, and there is no backlog/live
+// overlap to dedup (the live-attach overlap case is deferred).
 func (m Screen) Init() tea.Cmd {
 	return tea.Batch(
 		m.interaction.input.Focus(),
 		func() tea.Msg { return systemReadyMsg{} },
+		restoreBacklogCmd(m.appCtx, m.agent, m.agent.PrimaryLoopID()),
 		subscribeCmd(m.agent),
 	)
 }
