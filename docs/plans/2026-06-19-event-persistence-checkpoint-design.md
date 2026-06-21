@@ -171,12 +171,26 @@ durable, auditable handover boundary.
 append carries its **own deadline, independent of the long-lived session context** (a
 stalled publish must not stall the session forever). On timeout the ack is *ambiguous*. Do
 **not** "look up by id" — JetStream has no header index; resolve with a **sequence-based**
-algorithm. With expected sequence `N`: **retry the same record** (same `Nats-Msg-Id`,
-`Nats-Expected-Last-Sequence: N`). If the retry **succeeds**, the original never landed —
-done. If it **conflicts** (something is already at `N+1`), **direct-get sequence `N+1`** and
-verify its stored `Nats-Msg-Id` / payload hash: if it is our record, the original landed →
-advance expected := `N+1`; if it is **not** ours, the single-writer invariant is broken →
-raise `SessionPersistenceFault`. Never blindly re-append past an ambiguous ack.
+algorithm. Dedup is id-based and returns a *duplicate* ack, so "success" does **not** mean
+the original never landed. With expected sequence `N`, **retry the same record** (same
+`Nats-Msg-Id`, `Nats-Expected-Last-Sequence: N`) and branch on the actual response:
+- **success, `PubAck.Duplicate=true`** → the original landed (dedup hit); verify seq `N+1`
+  / stored hash and advance expected := `N+1`;
+- **success, `Duplicate=false`** → the retry landed; advance := `N+1`;
+- **expected-sequence conflict** → direct-get `N+1`, compare `Nats-Msg-Id` + payload hash:
+  ours → advance; not ours → `SessionPersistenceFault`.
+
+Never blindly re-append past an ambiguous ack.
+
+**Durability guarantee (power loss).** The embedded FileStore acks a write before its
+periodic fsync (JetStream's default `SyncInterval` is ~2 min), so an ack is durable against
+**process exit** (clean quit, panic, `kill`) but **not** a kernel/power loss — up to one
+sync interval of acked events can be lost. **v1's stated guarantee: survives process exit;
+bounded OS-crash/power-loss window**, with events in that window degrading to
+crash-consistency (restore lands at the last fsynced step). Set the journal stream's
+`SyncInterval` conservatively (≤ a few seconds, or `SyncAlways` if benchmarks permit) to
+shrink the window — a durability/throughput knob stated explicitly, not left at the 2-min
+default.
 
 **Hub tap algorithm** (Enduring events; precise ordering & failure):
 1. Serialize all hub persistence through the one serializer.
@@ -215,10 +229,11 @@ bodies to a JetStream Object Store** with **content-addressed ids** (object-id =
 of the body, so re-upload is idempotent and dedups), and store the reference in the event:
 `{object-id, length, codec-version}`. **Upload the object before appending the referencing
 event** (no dangling reference). The event append can still fail *after* a successful
-upload, so an object can be **orphaned**: a **GC pass** deletes any object whose hash is
-unreferenced by any event **and** older than a grace period (so a just-uploaded,
-about-to-be-referenced object is never reaped); content-addressing makes this safe and
-idempotent. On restore, a missing or hash-mismatched object is **fail-secure**: corrupt →
+upload, so an object can be **orphaned**: a **GC pass — run only while holding the session
+lease** (so it never races an active writer) — deletes any object whose hash is
+unreferenced by any event **and** older than a grace period that **exceeds the maximum
+upload→append retry interval** (so a just-uploaded, about-to-be-referenced object is never
+reaped); content-addressing makes this safe and idempotent. On restore, a missing or hash-mismatched object is **fail-secure**: corrupt →
 `RestoreErrored`, do not come up. Raise `max_payload` + `MaxMsgSize` to a sane inline
 ceiling; the object store covers the rest.
 
@@ -327,20 +342,22 @@ Steps:
    `{agentKind, modelID, systemPromptRev, toolPolicyRev}`. Compare to the current config;
    on mismatch **reject or require explicit user confirmation** (re-seeding silently from
    today's config would change the resumed conversation).
-2. **Acquire the single-writer lease + fence** (above) before any append.
-3. **Fold the primary loop's `…loop.<lid>.event` subject** (`Open{From:Beginning,
+2. **Acquire the lease + write `LeaseFence{epoch}`** (above) — the new owner's first
+   append; gate everything below on its ack.
+3. **Append `RestoreStarted`** — the **first restore mutation**, opening the audit bracket
+   *before* `TurnInterrupted` so the bracket actually covers the mutation.
+4. **Fold the primary loop's `…loop.<lid>.event` subject** (read-only, `Open{From:Beginning,
    Follow:false}`): `TurnStarted`/`TurnFoldedInto` → user message; `StepDone` → step group
-   → `loopState.msgs`; **rebuild `turnIndex`** from the count of `TurnStarted` so turn
-   numbering continues; re-seed `SystemMessage` from config.
-4. **Crash seam.** For any turn left open (no terminal event), append a `TurnInterrupted`
-   before resuming. Precise visible result of an interrupted turn: the **committed user
-   message** (from its `TurnStarted`) **plus an interruption marker**, and **no partial
-   assistant step** (the in-flight step had no `StepDone`).
-5. **Bracket with `Restore*`.** Append `RestoreStarted`, then `RestoreDone` (success) or
-   `RestoreErrored{Err}` (failure → session does not come up). These persist back; repeated
-   restores leave an audit trail (folded as no-ops for `msgs`); the catalog bumps
-   `LastActiveAt` off `RestoreDone`.
-6. Bring the primary loop up **idle**, ready for input.
+   → `loopState.msgs`; **rebuild `turnIndex`** from the count of `TurnStarted`; re-seed
+   `SystemMessage` from config.
+5. **Crash seam.** For any turn left open (no terminal event), append a `TurnInterrupted`.
+   Precise visible result of an interrupted turn: the **committed user message** (from its
+   `TurnStarted`) **plus an interruption marker**, and **no partial assistant step** (the
+   in-flight step had no `StepDone`).
+6. **Close the bracket:** `RestoreDone` (success) or `RestoreErrored{Err}` (failure →
+   session does not come up). These persist back; repeated restores leave an audit trail
+   (no-ops for the `msgs` fold); the catalog bumps `LastActiveAt` off `RestoreDone`.
+7. Bring the primary loop up **idle**, ready for input.
 
 **Queued inputs** accepted-but-unstarted exist only as Ephemeral `InputQueued` (not
 durable): **not auto-resumed** (they never became a turn); they remain in the command log
@@ -376,10 +393,14 @@ display/restore is the future multi-loop feature; v1 does not reconstruct subloo
 per session — `{SessionID, Title, CreatedAt, LastActiveAt, Status, AgentKind, LoopCount,
 ConfigFingerprint}`. It is a **derived, rebuildable cache**, *not* a source of truth: lost
 or stale, it is rebuilt by scanning streams. The CLI picker reads the KV bucket only
-(**zero event replay**); a session is restored only on selection. A `catalog` subscriber
-keeps it current off the Enduring lifecycle events (`SessionStarted` upserts; first
-`TurnStarted` sets `Title`; `RestoreDone`/`TurnStarted`/`StepDone` bump `LastActiveAt`;
-`SessionStopped` flips `Status`).
+(**zero event replay**); a session is restored only on selection. The KV catalog is updated
+**inline by the journal serializer after a successful append** of a catalog-relevant record
+(`SessionStarted` upserts; first `TurnStarted` sets `Title`;
+`RestoreDone`/`TurnStarted`/`StepDone` bump `LastActiveAt`; `SessionStopped` flips
+`Status`) — a best-effort secondary write, since the catalog is derived. **No per-stream
+consumer:** one stream per session would make a "catalog subscriber" an idle JetStream
+consumer per session just for indexing; instead, **startup repair** rebuilds/reconciles the
+catalog from stream metadata when it is missing or stale.
 
 Physically the FileStore lays a stream down as ~a directory per session under `StoreDir`,
 plus the KV buckets.
@@ -432,8 +453,9 @@ Per `CLAUDE.md`: table-driven, `-race`, integration-tagged, fuzz the untrusted b
   **stream-level fencing + `LeaseFence` handover** — a new owner's first append is
   `LeaseFence{epoch}`, loops don't start until it acks, and an old-owner append after
   handover fails the fence on *any* subject; **ambiguous-ack** — a timed-out append is
-  resolved by `EventID` lookup (stored → advance; absent → retry/fault) before the next
-  append; object-store offload + restore, missing/corrupt-object → `RestoreErrored`, and
+  resolved by retry-with-same-`Nats-Msg-Id` (branch on `PubAck.Duplicate` vs expected-seq
+  conflict + direct-get `N+1` verify), not an id lookup; object-store offload + restore,
+  missing/corrupt-object → `RestoreErrored`, and
   **orphan-GC** reaps an object orphaned by a failed event append after the grace period
   (never a referenced one); dedup window; the two consumption modes; lazy listing reads
   only the KV bucket; `Restore*` bracketing with `SessionID`/`LoopID` unchanged; commands
