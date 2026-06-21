@@ -72,18 +72,34 @@ func (e *AppendError) Error() string {
 }
 func (e *AppendError) Unwrap() error { return e.Cause }
 
-// StreamSetupError wraps a failure to create, bind, or read the per-session stream
-// in NewSessionJournal. It carries the stream name and a short phase tag (the
+// setupPhase names the stream-management call in NewSessionJournal that failed. It
+// is a closed typed enum (not a free-form string) so callers can switch on the phase
+// and a typo cannot silently mislabel a failure.
+type setupPhase string
+
+const (
+	// PhaseAdd is the AddStream create/already-in-use call in ensureStream.
+	PhaseAdd setupPhase = "add"
+	// PhaseInfo is the StreamInfo tip read that initializes the fence.
+	PhaseInfo setupPhase = "info"
+	// PhaseVerify is the existing-stream config verification in ensureStream: an
+	// already-provisioned stream whose config diverges from the durability contract
+	// fails here rather than being bound as-is.
+	PhaseVerify setupPhase = "verify"
+)
+
+// StreamSetupError wraps a failure to create, bind, verify, or read the per-session
+// stream in NewSessionJournal. It carries the stream name and a typed phase tag (the
 // management call that failed) and unwraps to the underlying NATS error so a caller
 // can errors.As both this and the wrapped cause.
 type StreamSetupError struct {
 	Stream string
-	Phase  string // "add", "info"
+	Phase  setupPhase
 	Cause  error
 }
 
 func (e *StreamSetupError) Error() string {
-	return "journal: stream setup (" + e.Phase + ") for " + strconv.Quote(e.Stream) + ": " + e.Cause.Error()
+	return "journal: stream setup (" + string(e.Phase) + ") for " + strconv.Quote(e.Stream) + ": " + e.Cause.Error()
 }
 func (e *StreamSetupError) Unwrap() error { return e.Cause }
 
@@ -123,7 +139,7 @@ func WithAppendTimeout(d time.Duration) Option {
 // not the concrete writer.
 func NewSessionJournal(js nats.JetStreamContext, sessionID uuid.UUID, opts ...Option) (SessionJournal, error) {
 	if js == nil {
-		return nil, &StreamSetupError{Stream: StreamName(sessionID), Phase: "add", Cause: errNilJetStream}
+		return nil, &StreamSetupError{Stream: StreamName(sessionID), Phase: PhaseAdd, Cause: errNilJetStream}
 	}
 	o := journalOptions{appendTimeout: defaultAppendTimeout}
 	for _, opt := range opts {
@@ -143,7 +159,7 @@ func NewSessionJournal(js nats.JetStreamContext, sessionID uuid.UUID, opts ...Op
 	// stream reports its last durable sequence, so a rebind appends after it.
 	info, err := js.StreamInfo(name, nats.Context(ctx))
 	if err != nil {
-		return nil, &StreamSetupError{Stream: name, Phase: "info", Cause: err}
+		return nil, &StreamSetupError{Stream: name, Phase: PhaseInfo, Cause: err}
 	}
 
 	return &streamJournal{
@@ -175,7 +191,7 @@ func ensureStream(ctx context.Context, js nats.JetStreamContext, sessionID uuid.
 		// follow-on StreamInfo read in NewSessionJournal confirms it is reachable.
 		return nil
 	}
-	return &StreamSetupError{Stream: name, Phase: "add", Cause: err}
+	return &StreamSetupError{Stream: name, Phase: PhaseAdd, Cause: err}
 }
 
 // streamConfig is the per-session stream's configuration: the keep-everything log.
