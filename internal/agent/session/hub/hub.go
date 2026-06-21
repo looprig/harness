@@ -15,6 +15,7 @@ package hub
 import (
 	"context"
 	"sync"
+	"time"
 
 	"github.com/inventivepotter/urvi/internal/agent/loop/event"
 	"github.com/inventivepotter/urvi/internal/agent/loop/identity"
@@ -35,17 +36,38 @@ type Hub struct {
 	subs    map[*EventSubscription]struct{}
 	state   sessionState
 	waiters map[chan error]struct{}
+
+	// The durable-tap trio (Dependency Inversion: all three are interfaces/seams
+	// injected via Option; the bare New installs nop/real-clock defaults so existing
+	// callers and headless mode are unchanged). They are immutable after construction
+	// and read without the lock — appender.AppendEvent is the durable write the hub
+	// runs OUTSIDE mu (no I/O under the lock); factory mints headers for synthesized
+	// session events; reporter is the fail-secure escalation seam.
+	appender eventAppender
+	factory  *event.Factory
+	reporter FaultReporter
 }
 
 // New builds an idle hub for sessionID. The returned hub has no subscribers and a
-// zero-value (idle, empty) sessionState.
-func New(sessionID uuid.UUID) *Hub {
-	return &Hub{
+// zero-value (idle, empty) sessionState. Without options it installs the durable-tap
+// defaults: a nop appender (persists nothing, never fails — headless/no-persistence
+// mode), a real-clock/real-uuid event Factory, and a nop fault reporter. The
+// composition root (Phase 10) injects the real trio via WithAppender/WithFactory/
+// WithFaultReporter.
+func New(sessionID uuid.UUID, opts ...Option) *Hub {
+	h := &Hub{
 		sessionID: sessionID,
 		subs:      make(map[*EventSubscription]struct{}),
 		state:     newSessionState(),
 		waiters:   make(map[chan error]struct{}),
+		appender:  nopEventAppender{},
+		factory:   event.NewFactory(uuid.New, time.Now),
+		reporter:  nopFaultReporter{},
 	}
+	for _, opt := range opts {
+		opt(h)
+	}
+	return h
 }
 
 // SubscribeEvents registers a new subscription with the given filter and returns
