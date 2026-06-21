@@ -156,6 +156,9 @@ func setHeader(t *testing.T, ev event.Event, hdr event.Header) event.Event {
 	case event.StepDone:
 		e.Header = hdr
 		return e
+	case event.TurnFoldedInto:
+		e.Header = hdr
+		return e
 	case event.TurnDone:
 		e.Header = hdr
 		return e
@@ -316,6 +319,65 @@ func buildCrashedRun(t *testing.T, js nats.JetStreamContext, fp event.ConfigFing
 			aiMessage("calling tool"),
 		},
 		committedTurn: 2,
+	}
+}
+
+// buildComplexShapesRun produces a durable stream that exercises the structurally-
+// interesting commit shapes the simpler builders omit, all inside ONE cleanly-closed
+// turn (so the restore tail is the plain RestoreStarted -> RestoreDone, no interrupt):
+//
+//   - a multi-message StepDone group: an AIMessage carrying a tool-use reply FOLLOWED
+//     by two ToolResultMessages (the exact shape foldPrimaryLoop's unit test asserts),
+//     committed as a single StepDone.Messages slice, then
+//   - a TurnFoldedInto user message landing MID-TURN (after that step), then
+//   - a second single-AIMessage StepDone, then the TurnDone terminal.
+//
+// It direct-publishes through the journal-backed hub (deterministic, no goroutine
+// race), so the fold sees exactly these committed bytes. The committedMsgs it reports
+// is the independently-built slice the restored Snapshot must deep-equal — proving the
+// journaled BYTES of a multi-message StepDone group and a TurnFoldedInto rehydrate into
+// the identical AgenticMessages, not merely that the pure fold is correct.
+func buildComplexShapesRun(t *testing.T, js nats.JetStreamContext, fp event.ConfigFingerprint) persistedStream {
+	t.Helper()
+	h, sessionID, primaryLoopID, lease, es := newOriginalHub(t, js, fp)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	turn1 := mustSessionID(t)
+	step1 := mustSessionID(t)
+	step2 := mustSessionID(t)
+
+	// TurnFoldedInto is turn-scoped (SessionID+LoopID+TurnID, no StepID); StepDone is
+	// step-scoped (adds StepID). Stamp each with the coordinates the replay validates.
+	turnCoord := identity.Coordinates{SessionID: sessionID, LoopID: primaryLoopID, TurnID: turn1}
+	stepCoord := func(stepID uuid.UUID) identity.Coordinates {
+		return identity.Coordinates{SessionID: sessionID, LoopID: primaryLoopID, TurnID: turn1, StepID: stepID}
+	}
+
+	// One turn: user -> (AI tool-use + two tool results) -> folded user -> AI -> TurnDone.
+	es.stamp(t, ctx, h, event.TurnStarted{Header: event.Header{Coordinates: turnCoord}, TurnIndex: 1, Message: foldUserMsg("use a tool")})
+	es.stamp(t, ctx, h, event.StepDone{Header: event.Header{Coordinates: stepCoord(step1)}, Messages: content.AgenticMessages{
+		aiMessage("calling tool"),
+		foldToolResult("t1", "result a"),
+		foldToolResult("t2", "result b"),
+	}})
+	es.stamp(t, ctx, h, event.TurnFoldedInto{Header: event.Header{Coordinates: turnCoord}, TurnIndex: 1, Message: foldUserMsg("folded follow-up")})
+	es.stamp(t, ctx, h, event.StepDone{Header: event.Header{Coordinates: stepCoord(step2)}, Messages: content.AgenticMessages{aiMessage("final answer")}})
+	es.stamp(t, ctx, h, event.TurnDone{Header: event.Header{Coordinates: turnCoord}, TurnIndex: 1, Message: aiMessage("final answer")})
+
+	return persistedStream{
+		sessionID:     sessionID,
+		primaryLoopID: primaryLoopID,
+		lease:         lease,
+		committedMsgs: content.AgenticMessages{
+			foldUserMsg("use a tool"),
+			aiMessage("calling tool"),
+			foldToolResult("t1", "result a"),
+			foldToolResult("t2", "result b"),
+			foldUserMsg("folded follow-up"),
+			aiMessage("final answer"),
+		},
+		committedTurn: 1,
 	}
 }
 
@@ -569,5 +631,52 @@ func TestRestoreCrashMidTurn(t *testing.T) {
 	submitAndDrain(t, s, []content.Block{&content.TextBlock{Text: "carry on"}})
 	if _, idx2 := restoredSnapshot(t, s); idx2 != orig.committedTurn+1 {
 		t.Errorf("post-crash-restore turnIndex = %d, want %d", idx2, orig.committedTurn+1)
+	}
+}
+
+// TestRestoreComplexShapesRoundTrip is the end-to-end round-trip of the structurally-
+// interesting commit shapes the other round-trips omit: a multi-message StepDone group
+// (an AIMessage carrying a tool-use reply FOLLOWED by two ToolResultMessages) and a
+// TurnFoldedInto user message landing MID-TURN. It direct-publishes them through the
+// REAL journal, then Restore rehydrates via the EventReplayer -> fold -> loop seed, and
+// the restored loop's actor-served Snapshot is asserted to deep-equal the independently-
+// built expected AgenticMessages (and turnIndex). This proves the journaled BYTES of a
+// multi-message StepDone group and a TurnFoldedInto fold into the IDENTICAL slice — not
+// merely that the pure foldPrimaryLoop is correct.
+func TestRestoreComplexShapesRoundTrip(t *testing.T) {
+	js := newEmbeddedJS(t)
+	fp := FingerprintFrom(restoreCfg(&stubLLM{}, "model-x", "be helpful"))
+
+	orig := buildComplexShapesRun(t, js, fp)
+	handOver(t, orig.lease)
+
+	objStore := mustObjectStore(t, js, orig.sessionID)
+
+	s, err := Restore(context.Background(), restoreCfg(&stubLLM{chunks: []content.Chunk{textChunk("after restore")}}, "model-x", "be helpful"),
+		orig.sessionID, js, objStore, mustLeaseManager(t, js))
+	if err != nil {
+		t.Fatalf("Restore (complex shapes): %v", err)
+	}
+	t.Cleanup(func() { _ = s.Shutdown(context.Background()) })
+
+	// The folded history deep-equals the independently-built slice: the multi-message
+	// StepDone group (AI + two tool results) and the mid-turn TurnFoldedInto user message
+	// rehydrate into the exact AgenticMessages, in order — byte-for-byte.
+	msgs, idx := restoredSnapshot(t, s)
+	if !reflect.DeepEqual(msgs, orig.committedMsgs) {
+		t.Errorf("restored (complex shapes) msgs =\n  %#v\nwant\n  %#v", msgs, orig.committedMsgs)
+	}
+	if idx != orig.committedTurn {
+		t.Errorf("restored (complex shapes) turnIndex = %d, want %d", idx, orig.committedTurn)
+	}
+
+	// The turn closed cleanly (TurnDone), so no interrupt: tail is RestoreStarted -> RestoreDone.
+	assertTail(t, restoreEventTail(t, js, orig.sessionID, orig.primaryLoopID),
+		[]event.Event{event.RestoreStarted{}, event.RestoreDone{}})
+
+	// Comes up idle: a new Submit numbers from the restored index.
+	submitAndDrain(t, s, []content.Block{&content.TextBlock{Text: "keep going"}})
+	if _, idx2 := restoredSnapshot(t, s); idx2 != orig.committedTurn+1 {
+		t.Errorf("post-restore turnIndex = %d, want %d", idx2, orig.committedTurn+1)
 	}
 }

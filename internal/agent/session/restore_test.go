@@ -5,7 +5,9 @@ import (
 	"testing"
 
 	"github.com/inventivepotter/urvi/internal/agent/loop/event"
+	"github.com/inventivepotter/urvi/internal/agent/loop/identity"
 	"github.com/inventivepotter/urvi/internal/content"
+	"github.com/inventivepotter/urvi/internal/uuid"
 )
 
 // foldUserMsg builds a *content.UserMessage carrying a single text block, the
@@ -265,6 +267,92 @@ func TestFoldPrimaryLoop(t *testing.T) {
 			}
 			if got.OpenTurn != tt.wantOpenTurn {
 				t.Errorf("foldPrimaryLoop() openTurn = %v, want %v", got.OpenTurn, tt.wantOpenTurn)
+			}
+		})
+	}
+}
+
+// turnStartedWithID builds a TurnStarted carrying a specific TurnID + TurnIndex, so
+// openTurnCoords' return can be matched against the exact open turn.
+func turnStartedWithID(turnID uuid.UUID, idx event.TurnIndex, user string) event.TurnStarted {
+	return event.TurnStarted{
+		Header:    event.Header{Coordinates: identity.Coordinates{TurnID: turnID}},
+		TurnIndex: idx,
+		Message:   foldUserMsg(user),
+	}
+}
+
+// TestOpenTurnCoordsCoupledToOpenTurnInvariant locks the invariant openTurnCoords
+// relies on: whenever foldPrimaryLoop reports OpenTurn (a TurnStarted with no later
+// terminal), a trailing TurnStarted exists, so openTurnCoords returns that turn's
+// (TurnID, TurnIndex) — never its zero fall-through. The two stay coupled: the restore
+// constructor calls openTurnCoords ONLY under folded.OpenTurn, so the zero return is
+// unreachable in production, and this test fails if a future change ever lets an
+// OpenTurn fold yield a zero coordinate (a half-open turn that could not be closed).
+func TestOpenTurnCoordsCoupledToOpenTurnInvariant(t *testing.T) {
+	t.Parallel()
+
+	open := uuid.UUID{0x07}
+	prior := uuid.UUID{0x06}
+
+	tests := []struct {
+		name        string
+		events      []event.Event
+		wantTurnID  uuid.UUID
+		wantTurnIdx event.TurnIndex
+	}{
+		{
+			name: "open turn after a clean turn: coords are the LAST (open) TurnStarted",
+			events: []event.Event{
+				turnStartedWithID(prior, 1, "done turn"),
+				foldStepGroup(aiMessage("answered")),
+				event.TurnDone{Message: aiMessage("answered")},
+				turnStartedWithID(open, 2, "reopened"),
+			},
+			wantTurnID:  open,
+			wantTurnIdx: 2,
+		},
+		{
+			name: "open turn with completed steps and a mid-turn fold: coords are that turn",
+			events: []event.Event{
+				turnStartedWithID(open, 1, "start work"),
+				foldStepGroup(aiMessage("calling tool"), foldToolResult("t1", "out")),
+				event.TurnFoldedInto{Message: foldUserMsg("folded follow-up")},
+				foldStepGroup(aiMessage("more")),
+				// no terminal: crashed mid-turn.
+			},
+			wantTurnID:  open,
+			wantTurnIdx: 1,
+		},
+		{
+			name: "bare open turn (no steps): coords are that turn",
+			events: []event.Event{
+				turnStartedWithID(open, 3, "only user committed"),
+			},
+			wantTurnID:  open,
+			wantTurnIdx: 3,
+		},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			// Precondition: these sequences are exactly the ones openTurnCoords is called
+			// on — the fold reports an open turn.
+			if folded := foldPrimaryLoop(tt.events); !folded.OpenTurn {
+				t.Fatalf("test setup: fold did not report OpenTurn for %q", tt.name)
+			}
+
+			gotID, gotIdx := openTurnCoords(tt.events)
+			if gotID == (uuid.UUID{}) {
+				t.Fatalf("openTurnCoords returned the ZERO TurnID on an OpenTurn fold (the dead fall-through fired)")
+			}
+			if gotID != tt.wantTurnID {
+				t.Errorf("openTurnCoords TurnID = %v, want %v", gotID, tt.wantTurnID)
+			}
+			if gotIdx != tt.wantTurnIdx {
+				t.Errorf("openTurnCoords TurnIndex = %d, want %d", gotIdx, tt.wantTurnIdx)
 			}
 		})
 	}
