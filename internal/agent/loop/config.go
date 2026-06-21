@@ -3,6 +3,7 @@ package loop
 import (
 	"time"
 
+	"github.com/inventivepotter/urvi/internal/agent/loop/event"
 	"github.com/inventivepotter/urvi/internal/llm"
 )
 
@@ -22,6 +23,19 @@ type Config struct {
 	// set it: New defaults it to uuid.New. It exists only as a test seam for
 	// exercising the crypto/rand failure branches.
 	idGen idGenerator
+
+	// now is the clock the loop's event Factory mints CreatedAt from. It is
+	// unexported, so the composition root cannot set it: New defaults it to
+	// time.Now. It exists only as a test seam so a test can pin CreatedAt
+	// deterministically (mirrors idGen).
+	now event.Clock
+
+	// eventFactory mints the EventID + CreatedAt stamped onto every ENDURING loop
+	// event at the single publish chokepoint (Ephemeral events are never persisted
+	// and so are never stamped). It is unexported, so the composition root cannot
+	// set it: New defaults it to a Factory built from idGen + now. It exists as a
+	// test seam so a test can inject a deterministic (or failing) factory.
+	eventFactory *event.Factory
 
 	// afterDrain is a test-only synchronization seam invoked by foldPending in the
 	// turn goroutine AFTER cfg.drainPending has moved the inbox into the actor's

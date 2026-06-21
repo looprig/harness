@@ -76,6 +76,10 @@ func TestInboxPopIDGenFailureReturnsEntry(t *testing.T) {
 		Tools:        ts,
 		DrainTimeout: 500 * time.Millisecond,
 		idGen:        gen.gen,
+		// The injected gen fails the CORRELATION-id mint (the branch under test); give
+		// the loop a working EventID factory so the Enduring InputCancelled it publishes
+		// in response is still stamped and observable on the fan-in.
+		eventFactory: workingFactory(),
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)

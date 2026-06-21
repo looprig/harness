@@ -74,6 +74,56 @@ func stampLoopHeader(ev event.Event, sessionID, loopID, turnID uuid.UUID) event.
 	}
 }
 
+// withLoopHeader returns ev with its embedded Header REPLACED by h. It is the
+// write-back counterpart to stampLoopHeader: the publish chokepoint reads an
+// event's Header (already coordinate-stamped), mints its persistence identity
+// (EventID + CreatedAt) via the Factory, then writes the completed Header back
+// through here. It enumerates ONLY the ENDURING loop-event types — the only events
+// the chokepoint stamps; an Ephemeral or session-scoped event never reaches this
+// path, so the default returns ev unchanged (the sealed event interface has no
+// generic Header setter). The switch must list every Enduring loop event the loop
+// publishes; a missing case would silently drop the minted identity (default arm),
+// so a new Enduring loop event MUST be added here.
+func withLoopHeader(ev event.Event, h event.Header) event.Event {
+	switch e := ev.(type) {
+	case event.TurnStarted:
+		e.Header = h
+		return e
+	case event.StepDone:
+		e.Header = h
+		return e
+	case event.TurnFoldedInto:
+		e.Header = h
+		return e
+	case event.InputCancelled:
+		e.Header = h
+		return e
+	case event.TurnRejected:
+		e.Header = h
+		return e
+	case event.LoopIdle:
+		e.Header = h
+		return e
+	case event.TurnDone:
+		e.Header = h
+		return e
+	case event.TurnFailed:
+		e.Header = h
+		return e
+	case event.TurnInterrupted:
+		e.Header = h
+		return e
+	case event.PermissionRequested:
+		e.Header = h
+		return e
+	case event.UserInputRequested:
+		e.Header = h
+		return e
+	default:
+		return ev
+	}
+}
+
 // fillLoopScoped ensures SessionID + LoopID are present without disturbing the
 // already-stamped TurnID/StepID/Cause a producer set.
 func fillLoopScoped(h event.Header, sessionID, loopID uuid.UUID) event.Header {

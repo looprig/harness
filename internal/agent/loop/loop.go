@@ -89,6 +89,12 @@ type loopConfig struct {
 	// buffering, shutdown, close, and sequence policy. A parent or primary loop must
 	// not forward child-loop events; identity is metadata, not the transport path.
 	events eventPublisher
+
+	// eventFactory mints the EventID + CreatedAt stamped onto every ENDURING loop
+	// event at the publish chokepoint. Ephemeral events are never persisted, so they
+	// are never stamped (this also avoids a per-token crypto/rand call). It is a
+	// dependency wired at construction (its peer is events), defaulted by New.
+	eventFactory *event.Factory
 }
 
 // idGenerator mints a fresh UUID for the loop's correlation IDs — the per-turn
@@ -148,6 +154,19 @@ func New(loopCtx context.Context, sessionID, loopID uuid.UUID, parent Provenance
 	if cfg.idGen == nil {
 		cfg.idGen = uuid.New
 	}
+	if cfg.now == nil {
+		cfg.now = time.Now
+	}
+	// The loop mints its own Enduring-event EventID + CreatedAt from the SAME id
+	// generator that mints its correlation ids (idGen) and its clock (now), so a
+	// test that pins those pins the stamp too. Default it here unless a test
+	// injected one — a parked dependency, wired at construction (loopConfig.events
+	// is its peer).
+	if cfg.eventFactory == nil {
+		// idGenerator and event.IDGen are the same underlying func type but distinct
+		// named types, so the conversion is explicit.
+		cfg.eventFactory = event.NewFactory(event.IDGen(cfg.idGen), cfg.now)
+	}
 	commands := make(chan command.Command)
 	done := make(chan struct{})
 	// gateReg is unbuffered: registration is synchronous (the runner blocks on the
@@ -159,15 +178,16 @@ func New(loopCtx context.Context, sessionID, loopID uuid.UUID, parent Provenance
 	//   - commits/drains: per-step commit and tool-continuation drain handshakes;
 	//     unbuffered because each is a synchronous request/reply the actor serializes.
 	lc := loopConfig{
-		loopCtx:  loopCtx,
-		cfg:      cfg,
-		commands: commands,
-		gateReg:  gateReg,
-		internal: make(chan turnResult, 1),
-		commits:  make(chan commitRequest),
-		drains:   make(chan drainRequest),
-		done:     done,
-		events:   events,
+		loopCtx:      loopCtx,
+		cfg:          cfg,
+		commands:     commands,
+		gateReg:      gateReg,
+		internal:     make(chan turnResult, 1),
+		commits:      make(chan commitRequest),
+		drains:       make(chan drainRequest),
+		done:         done,
+		events:       events,
+		eventFactory: cfg.eventFactory,
 	}
 	state := newLoopState(sessionID, loopID, parent)
 	go runLoop(lc, state)
@@ -364,8 +384,28 @@ func runLoop(cfg loopConfig, state loopState) {
 	// with no subscribers (the headless case), so a non-nil error is a genuine
 	// fault; log it and continue (event publication must not abort the loop). Every
 	// loop event reaches consumers through this single fan-in path.
+	//
+	// This is also the single point that mints the persistence identity (EventID +
+	// CreatedAt) for every ENDURING event: stampLoopHeader fills the producer
+	// COORDINATES, then the Factory stamps EventID + CreatedAt for the Enduring class
+	// only — Ephemeral events (TokenDelta/ToolCall*/InputQueued) are never persisted,
+	// so they are published unstamped (which also avoids per-token crypto/rand). On a
+	// mint failure we FAIL SECURE: log loudly and SKIP publishing that Enduring event
+	// rather than fan out a zero-EventID one (a journal would key on a zero
+	// idempotency key) or silently pretend it published.
 	publish := func(ev event.Event) {
-		if err := cfg.events.PublishEvent(ctx, stampLoopHeader(ev, state.sessionID, state.id, state.turnID)); err != nil {
+		stamped := stampLoopHeader(ev, state.sessionID, state.id, state.turnID)
+		if stamped.Class() == event.Enduring {
+			h, err := cfg.eventFactory.Stamp(stamped.EventHeader())
+			if err != nil {
+				// TODO(Phase 7): escalate to SessionPersistenceFault.
+				slog.Error("event id mint failed; dropping Enduring loop event (fail-secure)",
+					"event", fmt.Sprintf("%T", stamped), "error", err)
+				return
+			}
+			stamped = withLoopHeader(stamped, h)
+		}
+		if err := cfg.events.PublishEvent(ctx, stamped); err != nil {
 			slog.Error("loop event publish to session fan-in failed", "error", err)
 		}
 	}
