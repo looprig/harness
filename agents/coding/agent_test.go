@@ -7,11 +7,11 @@ import (
 	"testing"
 
 	"github.com/inventivepotter/urvi/agents/coding/prompts"
+	"github.com/inventivepotter/urvi/internal/agent/loop"
 	"github.com/inventivepotter/urvi/internal/agent/session"
 	"github.com/inventivepotter/urvi/internal/llm"
 	"github.com/inventivepotter/urvi/internal/tool"
 	"github.com/inventivepotter/urvi/internal/uuid"
-	"github.com/inventivepotter/urvi/tools"
 	"github.com/inventivepotter/urvi/tui"
 )
 
@@ -47,12 +47,12 @@ func toolNames(t *testing.T, reg []tool.InvokableTool) []string {
 	return names
 }
 
-// fakeFactory is a no-op tools.SubagentFactory for buildToolSet wiring tests that
-// only inspect the tool set's shape. It never builds a child.
-type fakeFactory struct{}
+// fakeSpawner is a no-op tools.Spawner for buildToolSet wiring tests that only
+// inspect the tool set's shape. It never runs a sub-loop.
+type fakeSpawner struct{}
 
-func (fakeFactory) New(ctx context.Context, skill string) (tools.Subsession, error) {
-	return nil, errors.New("fakeFactory.New not used")
+func (fakeSpawner) Spawn(ctx context.Context, parent loop.Provenance, message string) (string, error) {
+	return "", errors.New("fakeSpawner.Spawn not used")
 }
 
 // TestBuildToolSetRegistersAllEleven proves the coding manifest wires EXACTLY the
@@ -62,7 +62,7 @@ func (fakeFactory) New(ctx context.Context, skill string) (tools.Subsession, err
 func TestBuildToolSetRegistersAllEleven(t *testing.T) {
 	t.Parallel()
 
-	ts := buildToolSet("/tmp/workspace-root", newHTTPClient(), context.Background(), fakeFactory{})
+	ts := buildToolSet("/tmp/workspace-root", newHTTPClient(), fakeSpawner{})
 	if ts.Permission == nil {
 		t.Fatal("buildToolSet() ToolSet.Permission = nil, want non-nil PermissionChecker")
 	}

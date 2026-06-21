@@ -91,28 +91,24 @@ func newWithClient(ctx context.Context, client llm.LLM, spec llm.ModelSpec) (*Co
 	}
 
 	// The session's root context — independent of the caller's ctx — owns the
-	// actor's lifetime AND is the base lifetime handed to the Subagent factory for
-	// the children it spawns. Built before the tool set because the Subagent tool
-	// needs it (design §4a).
+	// actor's lifetime (and, transitively, every sub-loop the session spawns).
 	rootCtx, cancel := context.WithCancel(context.Background())
 
 	httpCl := newHTTPClient()
-	// The factory holds the deps to build child sessions lazily (per spawn); it
-	// must be constructed before buildToolSet because the Subagent tool references
-	// it. Children reuse the same factory, so the depth cap (carried in ctx by the
-	// Subagent tool) bounds the recursion.
-	factory, err := newCodingFactory(root, client, httpCl, rootCtx, spec)
-	if err != nil {
-		cancel()
-		return nil, err
-	}
 
-	toolSet := buildToolSet(root, httpCl, rootCtx, factory)
+	// Resolve the spawner↔session cycle by late-binding: the Subagent tool needs
+	// the spawner, and the spawner needs the live session, but the tools must be
+	// built BEFORE session.New (it takes the ToolSet). So build the spawner empty,
+	// wire it into the tool set, construct the session, then set spawner.session
+	// once — synchronously, before any turn runs (see codingSpawner doc).
+	spawner := &codingSpawner{root: root, httpCl: httpCl, client: client, spec: spec}
+	toolSet := buildToolSet(root, httpCl, spawner)
 	sess, err := session.New(rootCtx, loop.Config{Client: client, Model: spec, Tools: toolSet})
 	if err != nil {
 		cancel()
 		return nil, err
 	}
+	spawner.session = sess // late-bind: tools were built before the session existed
 	return &Coding{session: sess, cancel: cancel, acceptsImages: spec.AcceptsImages}, nil
 }
 
@@ -125,22 +121,23 @@ func newWithClient(ctx context.Context, client llm.LLM, spec llm.ModelSpec) (*Co
 var autoApprovedTools = []string{"ReadFile", "Glob", "Grep", "Todo", "AskUser", "Subagent"}
 
 // buildToolSet assembles ALL eleven tools and the fail-secure PermissionChecker
-// that gates them (design §4d). It is shared by the parent session and every
-// child the Subagent factory spawns, so a child gets the same full tool set —
-// including a Subagent tool wired with the SAME factory, which lets a child spawn
-// a depth-capped grandchild (the depth lives in ctx and is enforced by the
-// Subagent tool, not here).
+// that gates them (design §4d). It is called for the parent session and AGAIN, by
+// codingSpawner.Spawn, for every in-session sub-loop, so a sub-loop gets the same
+// full tool set — including a Subagent tool wired with the SAME spawner, which
+// lets a sub-loop spawn a grandchild (recursion; unbounded — the depth cap was
+// dropped, design §8).
 //
 // Least privilege: each tool gets only the deps it needs — the read/search tools
 // get the workspace root plus the checker as their ReadGuard; the write/exec
 // tools get only the root; the web tools get an HTTP client with explicit
 // timeouts and a TLS 1.2 floor and never touch the filesystem; AskUser/Todo are
-// self-contained; Subagent gets the narrow factory plus the session root.
+// self-contained; Subagent gets only the narrow spawner.
 //
-// A FRESH PermissionChecker is built per call so the parent and each child have
-// independent session-scope approval state (a child's grant never leaks into the
-// parent's policy, and vice versa).
-func buildToolSet(root string, httpCl *http.Client, rootCtx context.Context, factory tools.SubagentFactory) loop.ToolSet {
+// A FRESH PermissionChecker is built per call so the parent and each sub-loop have
+// independent session-scope approval state (a sub-loop's grant never leaks into
+// the parent's policy, and vice versa) — this is the per-loop approval isolation
+// guarantee, so it must stay per-call.
+func buildToolSet(root string, httpCl *http.Client, spawner tools.Spawner) loop.ToolSet {
 	policy := tools.PermissionPolicy{
 		WorkspaceRoot: root,
 		HardDeny:      tools.DefaultHardDeny(),
@@ -159,7 +156,7 @@ func buildToolSet(root string, httpCl *http.Client, rootCtx context.Context, fac
 		tools.NewWebSearch(tools.NewDuckDuckGoProvider(httpCl)),
 		tools.NewAskUser(),
 		tools.NewTodo(),
-		tools.NewSubagent(factory, rootCtx),
+		tools.NewSubagent(spawner),
 	}
 	// Middlewares nil and the runaway-guard caps zero on purpose: loop.New applies
 	// its safe defaults for the caps; the manifest declares no middleware in v1.
@@ -242,8 +239,8 @@ func (c *Coding) ProvideAnswer(ctx context.Context, loopID, callID uuid.UUID, an
 // Close gracefully shuts the session down and releases the session's root
 // context. It blocks until the actor exits (or ctx is done), then cancels the
 // root as a backstop so the actor goroutine cannot leak even if Shutdown timed
-// out on ctx. Cancelling the root also tears down any in-flight child Subagent
-// session (children derive their root from it). Safe to call more than once.
+// out on ctx. Cancelling the root also tears down every in-session subagent loop
+// (they run under the same session root). Safe to call more than once.
 func (c *Coding) Close(ctx context.Context) error {
 	err := c.session.Shutdown(ctx)
 	c.cancel()

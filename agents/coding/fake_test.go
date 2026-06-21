@@ -10,9 +10,6 @@ import (
 	"github.com/inventivepotter/urvi/internal/llm"
 )
 
-// errFakeProvider is a sentinel the provider-failure test asserts on via errors.Is.
-var errFakeProvider = errors.New("fake provider failure")
-
 // fakeLLM is a controllable llm.LLM for tests. The loop only ever calls Stream,
 // so Invoke is a stub.
 type fakeLLM struct {
