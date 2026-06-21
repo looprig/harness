@@ -54,6 +54,18 @@ func WithCommandAppender(a commandAppender) Option {
 	}
 }
 
+// WithAllowConfigMismatch is the restore-only opt-in to resume a session whose
+// persisted config fingerprint no longer matches the live config (a different model,
+// system prompt, or tool policy). Restore is fail-secure by DEFAULT — a mismatch
+// rejects with *ConfigMismatchError so a conversation never silently resumes under
+// behavior it never ran with — so this option exists for an operator who knowingly
+// accepts the drift. New ignores it (only Restore checks fingerprints).
+func WithAllowConfigMismatch() Option {
+	return func(s *Session) {
+		s.allowConfigMismatch = true
+	}
+}
+
 // stampNow returns the session clock's current time, defaulting to the wall clock if
 // the clock seam is unset (a struct-literal test session). The session stamps this onto
 // every dispatched command's Header.CreatedAt at the dispatch boundary, so a journaled

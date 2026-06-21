@@ -169,6 +169,12 @@ type Session struct {
 	// hub's required durable tap, an append failure here is logged-and-swallowed — the
 	// dispatch always proceeds (a lost command record must never block the user).
 	cmdAppender commandAppender
+
+	// allowConfigMismatch is the restore-only opt-in (set by WithAllowConfigMismatch)
+	// to resume a session whose persisted config fingerprint no longer matches the live
+	// config. It is read ONLY by Restore (before the session comes up); New never
+	// consults it. Default false = fail-secure (a mismatch rejects the restore).
+	allowConfigMismatch bool
 }
 
 // loopHandle is the session's registry entry: the loop's channel handle, the

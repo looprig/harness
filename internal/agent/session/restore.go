@@ -2,8 +2,108 @@ package session
 
 import (
 	"github.com/inventivepotter/urvi/internal/agent/loop/event"
+	"github.com/inventivepotter/urvi/internal/agent/loop/identity"
 	"github.com/inventivepotter/urvi/internal/content"
+	"github.com/inventivepotter/urvi/internal/uuid"
 )
+
+// ConfigMismatchError is the fail-secure rejection a restore returns when the live
+// config's fingerprint does not match the one the session was started under
+// (persisted on its SessionStarted). Restoring a session against a materially changed
+// config (a different model, system prompt, or tool policy) would silently resume a
+// conversation under behavior it never ran with, so the restore refuses by default. An
+// operator who knowingly wants to proceed passes WithAllowConfigMismatch. Persisted is
+// the fingerprint from the journal; Live is the fingerprint of the config Restore was
+// called with.
+type ConfigMismatchError struct {
+	Persisted event.ConfigFingerprint
+	Live      event.ConfigFingerprint
+}
+
+func (e *ConfigMismatchError) Error() string {
+	return "session: restore config mismatch: persisted model=" + e.Persisted.ModelID +
+		" != live model=" + e.Live.ModelID +
+		" (system/tool digests may also differ); pass WithAllowConfigMismatch to override"
+}
+
+// RestoreDiscoveryErrorKind classifies a failure to extract a required fact from the
+// replayed durable stream during restore (the persisted config fingerprint, or the
+// primary loop's original id). A stream missing either cannot be restored.
+type RestoreDiscoveryErrorKind string
+
+const (
+	// RestoreNoSessionStarted means the replayed stream carried no SessionStarted, so
+	// there is no persisted config fingerprint to check against.
+	RestoreNoSessionStarted RestoreDiscoveryErrorKind = "no_session_started"
+	// RestoreNoPrimaryLoop means the replayed stream carried no root LoopStarted (one
+	// whose Cause.Coordinates is zero), so the primary loop's id cannot be recovered.
+	RestoreNoPrimaryLoop RestoreDiscoveryErrorKind = "no_primary_loop"
+)
+
+// RestoreDiscoveryError reports that a required fact could not be extracted from the
+// replayed stream. It fails the restore closed (RestoreErrored + no come-up) rather
+// than guessing a missing id or fingerprint.
+type RestoreDiscoveryError struct {
+	Kind      RestoreDiscoveryErrorKind
+	SessionID uuid.UUID
+}
+
+func (e *RestoreDiscoveryError) Error() string {
+	switch e.Kind {
+	case RestoreNoSessionStarted:
+		return "session: restore: no SessionStarted in stream for " + e.SessionID.String()
+	case RestoreNoPrimaryLoop:
+		return "session: restore: no root LoopStarted in stream for " + e.SessionID.String()
+	default:
+		return "session: restore: discovery failed for " + e.SessionID.String()
+	}
+}
+
+// checkFingerprint is the restore config-fingerprint decision: it returns nil when the
+// persisted and live fingerprints are Equal, a typed *ConfigMismatchError when they
+// differ, and — when allowMismatch is set — nil even on a difference (the operator's
+// explicit opt-in to resume under a changed config). It is fail-secure by default: a
+// mismatch blocks unless overridden.
+func checkFingerprint(persisted, live event.ConfigFingerprint, allowMismatch bool) error {
+	if persisted.Equal(live) {
+		return nil
+	}
+	if allowMismatch {
+		return nil
+	}
+	return &ConfigMismatchError{Persisted: persisted, Live: live}
+}
+
+// firstConfigFingerprint extracts the persisted config fingerprint from the FIRST
+// SessionStarted in the replayed event slice (stream-sequence order). A stream with no
+// SessionStarted fails closed with a typed *RestoreDiscoveryError — there is nothing to
+// check the live config against, so the restore must not proceed.
+func firstConfigFingerprint(events []event.Event) (event.ConfigFingerprint, error) {
+	for _, ev := range events {
+		if ss, ok := ev.(event.SessionStarted); ok {
+			return ss.Config, nil
+		}
+	}
+	return event.ConfigFingerprint{}, &RestoreDiscoveryError{Kind: RestoreNoSessionStarted}
+}
+
+// findPrimaryLoopID locates the session's primary (root) loop id: the LoopID of the
+// LoopStarted whose Cause.Coordinates is zero (a root loop has no spawning
+// loop/turn/step). The session's identity must stay stable across restore, so the
+// recovered loop comes up under THIS id. A stream with no root LoopStarted fails closed
+// with a typed *RestoreDiscoveryError.
+func findPrimaryLoopID(events []event.Event) (uuid.UUID, error) {
+	for _, ev := range events {
+		ls, ok := ev.(event.LoopStarted)
+		if !ok {
+			continue
+		}
+		if ls.Cause.Coordinates == (identity.Coordinates{}) {
+			return ls.LoopID, nil
+		}
+	}
+	return uuid.UUID{}, &RestoreDiscoveryError{Kind: RestoreNoPrimaryLoop}
+}
 
 // foldResult is the reconstruction of one loop's committed conversation from its
 // ordered Enduring event sequence. It is what the Restore constructor (Task 8.3)
