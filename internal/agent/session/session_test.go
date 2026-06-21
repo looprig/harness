@@ -838,55 +838,76 @@ func TestInterruptDuringRunningTurn(t *testing.T) {
 
 // TestInterruptCtxCancelledBeforeSend: a cancelled ctx makes Interrupt return
 // (false, *SessionError{SessionContextDone}) before any command is sent.
+//
+// Determinism comes from a FAKE loop whose unbuffered Commands channel NOTHING
+// receives from and whose Done is never closed: the per-loop send select in
+// Interrupt has only its ctx.Done() arm ready (the Commands send blocks forever
+// with no reader; Done blocks because it is open), so a pre-cancelled ctx wins
+// every time. A REAL running loop would keep reading Commands, leaving both the
+// send and ctx.Done() ready and letting Go's select pick at random — the source
+// of the prior flake. No time.Sleep is needed (or correct) here.
 func TestInterruptCtxCancelledBeforeSend(t *testing.T) {
 	t.Parallel()
-	s, err := New(context.Background(), cfg(&stubLLM{blockUntilCancel: true}))
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
-	t.Cleanup(func() { _ = s.Shutdown(context.Background()) })
-
-	// occupy the loop so the unbuffered Commands send would block, forcing the
-	// ctx.Done() branch to win deterministically.
-	if _, err := s.Submit(context.Background(), nil); err != nil {
-		t.Fatalf("Submit: %v", err)
-	}
-	time.Sleep(30 * time.Millisecond)
+	s, _, _ := sessionWithFakeLoop() // Commands never read + Done never closed: the send blocks
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	cancelled, err := s.Interrupt(ctx)
-	if cancelled {
-		t.Error("Interrupt returned true, want false")
-	}
-	var se *SessionError
-	if !errors.As(err, &se) || se.Kind != SessionContextDone {
-		t.Fatalf("err = %v, want *SessionError{SessionContextDone}", err)
+
+	resCh := make(chan struct {
+		cancelled bool
+		err       error
+	}, 1)
+	go func() {
+		cancelled, err := s.Interrupt(ctx)
+		resCh <- struct {
+			cancelled bool
+			err       error
+		}{cancelled, err}
+	}()
+
+	select {
+	case res := <-resCh:
+		if res.cancelled {
+			t.Error("Interrupt returned true, want false")
+		}
+		var se *SessionError
+		if !errors.As(res.err, &se) || se.Kind != SessionContextDone {
+			t.Fatalf("err = %v, want *SessionError{SessionContextDone}", res.err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Interrupt blocked on a cancelled ctx (no ctx.Done() escape in the send select)")
 	}
 }
 
 // TestShutdownCtxCancelledBeforeSend: a cancelled ctx makes Shutdown return
 // *SessionError{SessionContextDone} before any command is sent.
+//
+// As with Interrupt, determinism comes from a FAKE loop whose unbuffered Commands
+// channel NOTHING receives from and whose Done is never closed: Shutdown's
+// per-loop send select has only its ctx.Done() arm ready, so a pre-cancelled ctx
+// wins on the very first per-loop send. Shutdown first latches closing, snapshots
+// the loops, and calls hub.StopSession before the sends — all harmless here; the
+// send still blocks and the cancelled ctx still wins. sessionWithTwoFakeLoopsAndDone
+// (not sessionWithFakeLoop) is used because Shutdown dereferences s.hub, which that
+// helper populates. No time.Sleep is needed (or correct) here.
 func TestShutdownCtxCancelledBeforeSend(t *testing.T) {
 	t.Parallel()
-	s, err := New(context.Background(), cfg(&stubLLM{blockUntilCancel: true}))
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
-	t.Cleanup(func() { _ = s.Shutdown(context.Background()) })
-
-	// occupy the loop so the Commands send blocks, forcing the ctx.Done() branch.
-	if _, err := s.Submit(context.Background(), nil); err != nil {
-		t.Fatalf("Submit: %v", err)
-	}
-	time.Sleep(30 * time.Millisecond)
+	s, _, _, _, _ := sessionWithTwoFakeLoopsAndDone() // Commands never read + Done never closed
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	err = s.Shutdown(ctx)
-	var se *SessionError
-	if !errors.As(err, &se) || se.Kind != SessionContextDone {
-		t.Fatalf("err = %v, want *SessionError{SessionContextDone}", err)
+
+	errCh := make(chan error, 1)
+	go func() { errCh <- s.Shutdown(ctx) }()
+
+	select {
+	case err := <-errCh:
+		var se *SessionError
+		if !errors.As(err, &se) || se.Kind != SessionContextDone {
+			t.Fatalf("err = %v, want *SessionError{SessionContextDone}", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Shutdown blocked on a cancelled ctx (no ctx.Done() escape in the send select)")
 	}
 }
 
