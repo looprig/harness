@@ -543,7 +543,26 @@ func (s *Session) interruptLoop(l *loop.Loop) {
 // loop → SessionLoopNotFound. On any of those the returned id is the zero UUID,
 // because nothing was sent and there is no correlation to hand back.
 func (s *Session) Submit(ctx context.Context, input []content.Block) (uuid.UUID, error) {
-	l, ok := s.loopFor(s.primaryLoopID)
+	// Submit IS the primary-loop, human-authored (AgencyUser) case of submitToLoop:
+	// the interactive (AllowFold) submit targets the primary loop and stamps user
+	// agency. The loop-targeted core (a sub-loop, machine agency) is the subagent path.
+	return s.submitToLoop(ctx, s.primaryLoopID, input, identity.AgencyUser)
+}
+
+// submitToLoop submits a UserInput to a SPECIFIC loop with the given Agency,
+// returning the minted CommandID (correlate Reply events via Cause.CommandID).
+// It is the loop-targeted core of Submit: public Submit is the primary-loop,
+// AgencyUser case; the subagent path targets a sub-loop with AgencyMachine.
+//
+// Like Submit it is FIRE-AND-FORGET (Events/Abandoned nil): the outcome —
+// InputQueued / TurnStarted / TurnFoldedInto / TurnRejected / InputCancelled — is
+// observed on the event fan-in (each Reply carries Cause.CommandID == the returned
+// id), not returned here. The send carries the same escapes: ctx.Done() →
+// SessionContextDone, the loop's Done → SessionLoopExited, and an unknown loop id →
+// SessionLoopNotFound. On any of those the returned id is the zero UUID, because
+// nothing was sent and there is no correlation to hand back.
+func (s *Session) submitToLoop(ctx context.Context, loopID uuid.UUID, blocks []content.Block, agency identity.Agency) (uuid.UUID, error) {
+	l, ok := s.loopFor(loopID)
 	if !ok {
 		return uuid.UUID{}, &SessionError{Kind: SessionLoopNotFound}
 	}
@@ -552,12 +571,12 @@ func (s *Session) Submit(ctx context.Context, input []content.Block) (uuid.UUID,
 		return uuid.UUID{}, err
 	}
 	select {
-	// User-initiated queueable turn: Cause.CommandID is zero (root); Events/Abandoned
+	// Queueable (AllowFold) turn: Cause.CommandID is zero (root); Events/Abandoned
 	// nil because the outcome is observed on the session fan-in, not a per-turn
-	// stream. Submit is the interactive (AllowFold) submit — the human-typed input
-	// path — so it stamps Agency=AgencyUser (a human authored this). The programmatic
-	// submit path is the SEPARATE StartOnly Invoke method, which stays machine.
-	case l.Commands <- command.UserInput{Header: command.Header{CommandID: id, Agency: identity.AgencyUser}, Mode: command.AllowFold, Blocks: input}:
+	// stream. Agency is caller-chosen — AgencyUser for the interactive human Submit,
+	// AgencyMachine for the subagent task submit — so a machine path never claims user
+	// agency.
+	case l.Commands <- command.UserInput{Header: command.Header{CommandID: id, Agency: agency}, Mode: command.AllowFold, Blocks: blocks}:
 		return id, nil
 	case <-ctx.Done():
 		return uuid.UUID{}, &SessionError{Kind: SessionContextDone, Cause: ctx.Err()}
