@@ -192,6 +192,14 @@ func (f *Factory) NewHeader() Header { return Header{EventID: f.newID(), Created
 **Step 4:** Run → PASS.
 **Step 5:** Commit: `git commit -am "feat(event): Factory mints EventID + CreatedAt at creation"`
 
+> **Revision (controller, after 1.2 landed):** the Factory must return errors to match
+> session's `idGenerator func() (uuid.UUID, error)` and propagate `crypto/rand` failure (no
+> swallowing). So change `factory.go`: `type IDGen func() (uuid.UUID, error)`;
+> `NewHeader() (Header, error)`; add `Stamp(h Header) (Header, error)` (sets EventID+CreatedAt
+> on a copy, preserving Coordinates/Cause; `NewHeader` == `Stamp(Header{})`). Mint **only for
+> Enduring events** (Ephemeral are never persisted → skip, avoids per-token rand). Adjust
+> `factory_test.go` to the error-returning signature.
+
 ### Task 1.3: Mint at every Enduring creation site
 
 **Files (read then modify):**
