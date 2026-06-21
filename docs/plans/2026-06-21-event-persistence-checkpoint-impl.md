@@ -27,6 +27,18 @@ bare `errors.New`/`fmt.Errorf` from package APIs); strict typing (no `any` past
 serialization boundaries); interface-first; commit messages **short subject, no co-author
 trailer**.
 
+**Repo facts (discovered in Task 0.1):**
+- The module is **vendored** (`vendor/`). After any dependency change run `go mod vendor`;
+  builds/tests use the vendored tree (`-mod=vendor`). Most of Task 0.1's diff is vendored
+  NATS source — expected.
+- `go mod tidy` prunes deps with no importer, and a custom build tag (`integration`) does
+  **not** anchor a dep for `tidy`. So a **temporary anchor** `internal/agent/session/journal/deps.go`
+  blank-imports both NATS packages. Remove the `nats.go` blank-import when Phase 4's journal
+  production code imports it for real; remove the `nats-server/v2/server` blank-import (and
+  delete the file) when Phase 10 wires the embedded server in `cmd/cli`. **The `journal`
+  package must NOT permanently import `nats-server/v2/server`** — the embedded server is a
+  composition-root (cmd/cli) concern; journal takes a `nats.JetStreamContext`.
+
 **Scope reminder (v1):** local CLI only; **primary loop restore only**; cloud backend,
 multi-loop/subagent restore, at-rest encryption, and snapshots are **out of scope** (seams
 only). Do not implement them.
