@@ -231,7 +231,17 @@ func runTurn(ctx context.Context, cfg turnConfig, ts turnState) event.Event {
 		// without disturbing the StepID set here. This is the seam where the active
 		// step's id is known (st.id), keeping the runner ignorant of step identity.
 		stepEmit := stepStampingEmit(cfg.emit, st.id)
-		results := RunBatch(ctx, toolUses, cfg.tools, cfg.gateReg, cfg.idGen, stepEmit)
+		// Inject the running step's coordinates so every tool in the batch can read
+		// its OWN provenance via ProvenanceFrom(ctx) — the Subagent tool passes this
+		// as the `parent` when spawning a sub-loop. This is the one seam where all
+		// three ids are unambiguously the running step's (st.id is this step's id),
+		// so we wrap once at the batch boundary rather than per-tool in the runner.
+		batchCtx := WithProvenance(ctx, Provenance{
+			LoopID: identity.loopID,
+			TurnID: identity.turnID,
+			StepID: st.id,
+		})
+		results := RunBatch(batchCtx, toolUses, cfg.tools, cfg.gateReg, cfg.idGen, stepEmit)
 		if ctx.Err() != nil {
 			// A cancelled batch's results are discarded; the step never completes, so
 			// it is not appended/committed and emits no StepDone.

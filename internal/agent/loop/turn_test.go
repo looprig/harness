@@ -276,6 +276,39 @@ func (a *askUserTool) InvokableRun(ctx context.Context, argsJSON string) (*tool.
 	return tool.TextResult(ans), nil
 }
 
+// provenanceTool is a registered fake tool that records the Provenance the runner
+// injected into its ctx (via ProvenanceFrom), so a runTurn-level test can assert a
+// tool learns its own loop/turn/step coordinates — exactly what the Subagent tool
+// needs to spawn a sub-loop under the running step.
+type provenanceTool struct {
+	name string
+
+	mu     sync.Mutex
+	seen   Provenance
+	seenOK bool
+	runs   int
+}
+
+func (p *provenanceTool) Info(ctx context.Context) (*tool.ToolInfo, error) {
+	return &tool.ToolInfo{Name: p.name, Desc: "records provenance", Schema: json.RawMessage(`{"type":"object"}`)}, nil
+}
+
+func (p *provenanceTool) InvokableRun(ctx context.Context, argsJSON string) (*tool.ToolResult, error) {
+	prov, ok := ProvenanceFrom(ctx)
+	p.mu.Lock()
+	p.seen = prov
+	p.seenOK = ok
+	p.runs++
+	p.mu.Unlock()
+	return tool.TextResult("ok"), nil
+}
+
+func (p *provenanceTool) recorded() (Provenance, bool, int) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.seen, p.seenOK, p.runs
+}
+
 // countToolUseInHistory counts tool_use blocks (in AIMessages) and ToolResultMessages.
 // A well-formed committed history has equal counts; a discarded in-flight step
 // leaves no unpaired tool_use.
@@ -929,6 +962,70 @@ func TestRunTurnAgentic(t *testing.T) {
 		}
 		if echo.runCount() != 0 {
 			t.Errorf("echo ran %d times, want 0 (cap fires before execution)", echo.runCount())
+		}
+	})
+}
+
+// TestRunTurnInjectsProvenance verifies that a tool executed inside a turn sees its
+// OWN loop/turn/step coordinates via ProvenanceFrom(ctx): the loop must inject the
+// running step's {LoopID, TurnID, StepID} into the ctx it hands tools so the Subagent
+// tool can pass them as the `parent` Provenance when spawning a sub-loop.
+func TestRunTurnInjectsProvenance(t *testing.T) {
+	t.Parallel()
+	input := []content.Block{&content.TextBlock{Text: "hi"}}
+
+	t.Run("tool sees the running step's loop/turn/step Provenance", func(t *testing.T) {
+		t.Parallel()
+		pt := &provenanceTool{name: "Prov"}
+		ts := agenticToolSet([]tool.InvokableTool{pt}, 25, 100)
+		client := &scriptedLLM{scripts: [][]content.Chunk{
+			{toolUseChunk(0, "id-1", "Prov", `{}`)}, // iter1: one tool call → step 0
+			{textChunk("done")},                     // iter2: text-only → TurnDone
+		}}
+		cfg, st, rec := newTurnFixture(input, nil, ts, client, noGateReg())
+		if _, ok := runTurn(context.Background(), cfg, st).(event.TurnDone); !ok {
+			t.Fatalf("terminal not TurnDone")
+		}
+
+		prov, ok, runs := pt.recorded()
+		if runs != 1 {
+			t.Fatalf("tool ran %d times, want 1", runs)
+		}
+		if !ok {
+			t.Fatal("ProvenanceFrom returned ok=false; the loop did not inject Provenance into the tool ctx")
+		}
+		// The tool ran in step 0 (the tool step). Its StepDone carries that step's
+		// StepID; the injected Provenance must match the running step exactly.
+		sds := stepDones(rec.events())
+		if len(sds) == 0 {
+			t.Fatal("no StepDone recorded")
+		}
+		wantStepID := sds[0].StepID
+		if wantStepID.IsZero() {
+			t.Fatal("tool step's StepID is zero")
+		}
+		if prov.LoopID != st.loopID {
+			t.Errorf("Provenance.LoopID = %v, want %v (the running loop)", prov.LoopID, st.loopID)
+		}
+		if prov.TurnID != st.id {
+			t.Errorf("Provenance.TurnID = %v, want %v (the running turn)", prov.TurnID, st.id)
+		}
+		if prov.StepID != wantStepID {
+			t.Errorf("Provenance.StepID = %v, want %v (the running step)", prov.StepID, wantStepID)
+		}
+		if prov.StepID.IsZero() {
+			t.Error("Provenance.StepID is zero (expected the running step's non-zero StepID)")
+		}
+	})
+
+	t.Run("absent injection → ProvenanceFrom returns (zero, false), no panic", func(t *testing.T) {
+		t.Parallel()
+		prov, ok := ProvenanceFrom(context.Background())
+		if ok {
+			t.Error("ProvenanceFrom(plain ctx) returned ok=true, want false")
+		}
+		if prov != (Provenance{}) {
+			t.Errorf("ProvenanceFrom(plain ctx) = %+v, want zero Provenance", prov)
 		}
 	})
 }
