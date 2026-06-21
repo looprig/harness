@@ -92,6 +92,7 @@ func TestClassifyExhaustive(t *testing.T) {
 		{"SessionIdle", SessionIdle{}},
 		{"SessionStopped", SessionStopped{}},
 		{"LoopIdle", LoopIdle{}},
+		{"LoopStarted", LoopStarted{}},
 		{"TokenDelta", TokenDelta{}},
 		{"TurnStarted", TurnStarted{}},
 		{"StepDone", StepDone{}},

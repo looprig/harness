@@ -159,6 +159,11 @@ func classify(ev Event) (name string, profile idProfile, ok bool) {
 		return "SessionStopped", sessionProfile(), true
 	case LoopIdle:
 		return "LoopIdle", loopProfile(), true
+	case LoopStarted:
+		// Loop-scoped: NEW loop in Header.Coordinates (SessionID+LoopID set, Turn/Step
+		// zero). The spawning loop/turn/step rides in Header.Cause, which the validator
+		// never constrains — same shape as LoopIdle.
+		return "LoopStarted", loopProfile(), true
 	case TokenDelta:
 		return "TokenDelta", stepProfile(), true
 	case TurnStarted:

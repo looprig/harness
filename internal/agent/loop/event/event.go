@@ -183,8 +183,19 @@ type LoopIdle struct {
 	Header
 }
 
+// LoopStarted is published by Session.NewLoop when a loop is registered. Header.Coordinates
+// is the NEW loop (SessionID+LoopID set; TurnID/StepID zero). Header.Cause.Coordinates is the
+// spawning loop/turn/step (zero for the primary = root); Cause.Agency = AgencyMachine. It is
+// the durable loop-tree record for subscribers active at creation time.
+type LoopStarted struct {
+	enduring
+	loopScoped
+	Header
+}
+
 func (SessionStarted) isEvent() {}
 func (SessionActive) isEvent()  {}
 func (SessionIdle) isEvent()    {}
 func (SessionStopped) isEvent() {}
 func (LoopIdle) isEvent()       {}
+func (LoopStarted) isEvent()    {}

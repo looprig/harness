@@ -22,8 +22,9 @@ var (
 	_ Event = SessionIdle{}
 	_ Event = SessionStopped{}
 
-	// Loop-scoped event.
+	// Loop-scoped events.
 	_ Event = LoopIdle{}
+	_ Event = LoopStarted{}
 
 	// Turn/step-scoped events.
 	_ Event = TokenDelta{}

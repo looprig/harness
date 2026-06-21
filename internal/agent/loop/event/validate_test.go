@@ -45,6 +45,17 @@ func TestValidateEventValid(t *testing.T) {
 		{"SessionIdle", event.SessionIdle{Header: sessionH}},
 		{"SessionStopped", event.SessionStopped{Header: sessionH}},
 		{"LoopIdle", event.LoopIdle{Header: loopH}},
+		// LoopStarted: NEW loop in Header.Coordinates (SessionID+LoopID, Turn/Step zero);
+		// the spawning loop/turn/step rides in Header.Cause and is unconstrained by the
+		// profile (the validator never checks Cause).
+		{"LoopStarted", event.LoopStarted{Header: event.Header{
+			Coordinates: identity.Coordinates{SessionID: sess, LoopID: loop},
+			EventID:     evID,
+			Cause: identity.Cause{
+				Coordinates: identity.Coordinates{LoopID: loop, TurnID: turn, StepID: step},
+				Agency:      identity.AgencyMachine,
+			},
+		}}},
 		{"InputQueued", event.InputQueued{Header: loopH}},
 		{"TurnRejected", event.TurnRejected{Header: loopH}},
 		{"TurnStarted", event.TurnStarted{Header: turnH}},
@@ -122,6 +133,27 @@ func TestValidateEventInvalid(t *testing.T) {
 			wantField: event.FieldLoopID,
 			wantRule:  event.RuleRequired,
 			wantEvent: "LoopIdle",
+		},
+		{
+			name:      "LoopStarted missing EventID",
+			ev:        event.LoopStarted{Header: event.Header{Coordinates: identity.Coordinates{SessionID: sess, LoopID: loop}}},
+			wantField: event.FieldEventID,
+			wantRule:  event.RuleRequired,
+			wantEvent: "LoopStarted",
+		},
+		{
+			name:      "LoopStarted missing LoopID",
+			ev:        event.LoopStarted{Header: event.Header{Coordinates: identity.Coordinates{SessionID: sess}, EventID: evID}},
+			wantField: event.FieldLoopID,
+			wantRule:  event.RuleRequired,
+			wantEvent: "LoopStarted",
+		},
+		{
+			name:      "LoopStarted with non-zero TurnID must be zero",
+			ev:        event.LoopStarted{Header: event.Header{Coordinates: identity.Coordinates{SessionID: sess, LoopID: loop, TurnID: turn}, EventID: evID}},
+			wantField: event.FieldTurnID,
+			wantRule:  event.RuleMustBeZero,
+			wantEvent: "LoopStarted",
 		},
 		{
 			name:      "turn event with non-zero StepID must be zero",
