@@ -84,6 +84,21 @@ func WithEventAppender(a eventAppender) Option {
 	}
 }
 
+// WithLeaseRelease installs the single-writer-lease release hook the session calls ONCE
+// at the end of Shutdown (after the loops have drained, so the journal's last append is
+// durable before ownership is relinquished). The composition root passes lease.Release
+// for a NEW session; Restore installs it from the lease it acquired, so both paths free
+// ownership on a clean exit and a successor can re-acquire without waiting out the TTL. A
+// nil hook is ignored (headless mode stays a no-op). It takes a context so the release I/O
+// is bounded by Shutdown's ctx.
+func WithLeaseRelease(release func(context.Context) error) Option {
+	return func(s *Session) {
+		if release != nil {
+			s.leaseRelease = release
+		}
+	}
+}
+
 // WithAllowConfigMismatch is the restore-only opt-in to resume a session whose
 // persisted config fingerprint no longer matches the live config (a different model,
 // system prompt, or tool policy). Restore is fail-secure by DEFAULT — a mismatch

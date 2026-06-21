@@ -77,6 +77,46 @@ func TestWithSessionID(t *testing.T) {
 	}
 }
 
+// TestWithLeaseRelease proves the lease-release-on-teardown seam: a session built with a
+// release hook calls it EXACTLY ONCE at the end of Shutdown (so a clean exit relinquishes
+// single-writer ownership and a successor can re-acquire without waiting out the TTL). A
+// second Shutdown does not call it again (idempotent). A session built WITHOUT the option
+// never references a releaser (the default is nil — a no-op), so headless mode is
+// unchanged.
+func TestWithLeaseRelease(t *testing.T) {
+	t.Parallel()
+
+	var calls int
+	var mu sync.Mutex
+	release := func(context.Context) error {
+		mu.Lock()
+		defer mu.Unlock()
+		calls++
+		return nil
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s, err := New(ctx, cfg(&stubLLM{}), WithLeaseRelease(release))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	if err := s.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+	// A second Shutdown must not double-release (StopSession is idempotent; the releaser
+	// must be too).
+	_ = s.Shutdown(context.Background())
+
+	mu.Lock()
+	got := calls
+	mu.Unlock()
+	if got != 1 {
+		t.Errorf("lease release called %d times, want exactly 1", got)
+	}
+}
+
 // TestWithEventAppender proves the hub's required durable tap is injectable at the
 // session boundary: a new session built WithEventAppender(rec) appends its Enduring
 // session-scoped events (SessionStarted, LoopStarted) through rec BEFORE fan-out. The

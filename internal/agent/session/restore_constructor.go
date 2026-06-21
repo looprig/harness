@@ -233,8 +233,14 @@ func restoreSession(
 	// (8) Build the Session, reusing sessionID + the primary loop id (identity stable).
 	// It mirrors newSession's wiring EXCEPT: no SessionStarted is published (the start
 	// was recorded on the original run), and the primary loop is SEEDED via NewRestored
-	// rather than spawned empty.
-	s, err := buildRestoredSession(ctx, cfg, sessionID, primaryLoopID, folded, j, factory, newID, now, opts...)
+	// rather than spawned empty. The lease Restore acquired is handed to the session as its
+	// release-on-Shutdown hook (the Phase-10 composition wiring): the journal holds the
+	// lease for the live lifetime, and a clean Shutdown releases it so a successor can
+	// re-acquire without waiting out the TTL. We append WithLeaseRelease AFTER the caller's
+	// opts so the restore owns the lease lifecycle (a caller cannot accidentally override
+	// the releaser with a stale one).
+	leaseOpts := append(append([]Option(nil), opts...), WithLeaseRelease(lease.Release))
+	s, err := buildRestoredSession(ctx, cfg, sessionID, primaryLoopID, folded, j, factory, newID, now, leaseOpts...)
 	if err != nil {
 		return recordErrored(err)
 	}

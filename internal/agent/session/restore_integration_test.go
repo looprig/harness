@@ -558,6 +558,40 @@ func TestRestoreRoundTrip(t *testing.T) {
 	}
 }
 
+// TestRestoreReleasesLeaseOnShutdown proves the Phase-10 lease-release-on-teardown wiring
+// for a RESTORED session: Restore holds the single-writer lease for the session lifetime,
+// and a clean Shutdown releases it so a SECOND Restore can re-acquire single-writer
+// ownership without waiting out the TTL. Without the release, the second Restore would
+// fail *LeaseHeldError until the lease expired.
+func TestRestoreReleasesLeaseOnShutdown(t *testing.T) {
+	js := newEmbeddedJS(t)
+	fp := FingerprintFrom(restoreCfg(&stubLLM{}, "model-x", "be helpful"))
+
+	orig := buildOriginalRun(t, js, fp, restoreCfg(&stubLLM{chunks: []content.Chunk{textChunk("reply")}}, "model-x", "be helpful"), 1)
+	handOver(t, orig.lease)
+
+	objStore := mustObjectStore(t, js, orig.sessionID)
+
+	// First restore acquires + holds the lease.
+	s1, err := Restore(context.Background(), restoreCfg(&stubLLM{}, "model-x", "be helpful"),
+		orig.sessionID, js, objStore, mustLeaseManager(t, js))
+	if err != nil {
+		t.Fatalf("Restore #1: %v", err)
+	}
+	// Clean Shutdown must release the lease.
+	if err := s1.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown #1: %v", err)
+	}
+
+	// Second restore re-acquires immediately (no TTL wait) — proving the lease was released.
+	s2, err := Restore(context.Background(), restoreCfg(&stubLLM{}, "model-x", "be helpful"),
+		orig.sessionID, js, objStore, mustLeaseManager(t, js))
+	if err != nil {
+		t.Fatalf("Restore #2 (lease not released on Shutdown #1?): %v", err)
+	}
+	t.Cleanup(func() { _ = s2.Shutdown(context.Background()) })
+}
+
 // TestRestoreConfigMismatch proves the fail-secure config check: a mismatch rejects with
 // *ConfigMismatchError, the session does not come up, and a RestoreErrored is recorded —
 // unless WithAllowConfigMismatch.

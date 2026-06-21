@@ -191,6 +191,16 @@ type Session struct {
 	// appender installed — headless/no-persistence mode is unchanged. Restore builds its
 	// own appender from the journal it constructs, so it does not read this.
 	injectedEventAppender eventAppender
+
+	// leaseRelease is the single-writer-lease release hook the composition root installs
+	// via WithLeaseRelease (New) or that Restore installs from the lease it acquires. It is
+	// called ONCE at the END of Shutdown (releaseOnce) — after the loops have drained, so
+	// the journal's last append precedes the release — so a clean exit relinquishes
+	// ownership and a successor can re-acquire without waiting out the TTL. Nil (headless /
+	// no-persistence) is a no-op. The session owns this seam (DIP): it never holds the
+	// concrete lease, only the narrow release closure.
+	leaseRelease func(context.Context) error
+	releaseOnce  sync.Once
 }
 
 // eventAppender is the session's narrow view of the hub's REQUIRED durable event tap:
@@ -911,6 +921,23 @@ func (s *Session) Interrupt(ctx context.Context) (bool, error) {
 	return any, nil
 }
 
+// releaseLease invokes the lease-release hook EXACTLY ONCE (releaseOnce) on the bounded
+// ctx, swallowing the error (the bucket TTL is the backstop and Shutdown's own error is
+// the caller-facing one). It is nil-safe: a headless session (no WithLeaseRelease, no
+// Restore-installed releaser) has no hook and this is a no-op. Idempotent so a second
+// Shutdown never double-releases.
+func (s *Session) releaseLease(ctx context.Context) {
+	s.releaseOnce.Do(func() {
+		if s.leaseRelease == nil {
+			return
+		}
+		if err := s.leaseRelease(ctx); err != nil {
+			slog.WarnContext(ctx, "session: lease release on shutdown failed (TTL is the backstop)",
+				"session", s.SessionID, "err", err)
+		}
+	})
+}
+
 // shutdownTarget pairs a loop with the Ack channel of the command.Shutdown the
 // session sent it, so the ack-wait phase can drain each loop's reply in turn. It
 // is Shutdown-internal: the send phase records one per loop actually reached, and
@@ -967,6 +994,12 @@ func (s *Session) Shutdown(ctx context.Context) error {
 	// (3) Final backstop on every path: released last, after the graceful waits or
 	// on a ctx timeout. Deferred so it never hard-cancels loops mid-shutdown.
 	defer s.sessionCancel()
+
+	// Release the single-writer lease on every Shutdown return path, ONCE — deferred
+	// AFTER sessionCancel so it runs BEFORE it (LIFO): the graceful waits have completed
+	// (the journal's last append is durable) before ownership is relinquished, and the
+	// release happens before the root context is cancelled. Nil in headless mode (no-op).
+	defer s.releaseLease(ctx)
 
 	// (4) Send a graceful Shutdown to every loop in the snapshot.
 	targets := make([]shutdownTarget, 0, len(snapshot))
