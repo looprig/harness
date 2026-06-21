@@ -119,9 +119,11 @@ event.Cause.CommandID`; order against events by the shared JetStream sequence.
 `CommandRecord = {CommandID, CreatedAt, SessionID, TargetLoopID, Agency, Command}`. Transient
 fields (ack channels) are not serialized.
 
-**Asymmetric fail-secure.** Event append is strict (it is the restore source of truth);
-command append is audit-only — losing one cannot corrupt restore — so it surfaces loudly
-but **proceeds** with dispatch. Never block the user's action on the audit write.
+**Asymmetric fail-secure.** Events and commands go through the **same `SessionJournal`**
+(one serializer, one expected-sequence fence) — only the failure *policy* differs: event
+append is strict (it is the restore source of truth → `SessionPersistenceFault`); command
+append is audit-only — losing one cannot corrupt restore — so it surfaces loudly but
+**proceeds** with dispatch. Never block the user's action on the audit write.
 
 ## Timestamps, identity, ordering
 
@@ -148,6 +150,24 @@ process *is* the serializer, but the hard fence is the stream-level expected-seq
 stale serializer's append fails because the sequence has advanced. Lease alone is not a
 fence.
 
+**Lease handover (the durable boundary).** The expected-sequence fence is *reactive* — it
+rejects a stale writer only once another writer has advanced the stream, so at lease
+transfer the old owner could still append before the new owner writes anything. Close the
+window with a **`LeaseFence{epoch}`** record (epoch = the lease's monotonic fencing token):
+the new owner's **first** serialized append is the `LeaseFence`, and it **does not start or
+restore any loop until that append is acknowledged**. After lease loss the old owner
+**never refreshes its expected sequence** and stops appending. The `LeaseFence` advances the
+stream, so any in-flight old-owner append then fails the expected-sequence check — a
+durable, auditable handover boundary.
+
+**Bounded append & ambiguous acks.** The serializer is the correctness boundary, so each
+append carries its **own deadline, independent of the long-lived session context** (a
+stalled publish must not stall the session forever). On timeout the ack is *ambiguous* (the
+record may or may not have been stored): before any further append, **resolve** by looking
+the `EventID`/`CommandID` up in the stream (dedup window / last sequence) — if stored,
+advance expected := its sequence; if absent, retry within the dedup window; if unresolved,
+raise `SessionPersistenceFault`. Never blindly re-append past an ambiguous ack.
+
 **Hub tap algorithm** (Enduring events; precise ordering & failure):
 1. Serialize all hub persistence through the one serializer.
 2. For an incoming Enduring event: **append it before applying it** to hub state.
@@ -162,7 +182,8 @@ fence.
 
 This lives in the hub — not the loop — because the loop deliberately swallows publish
 errors (`loop.go:367`); fail-secure must be enforced where the append happens. Inject into
-the hub: the serializer (`EventAppender`), the event factory, and the fault reporter.
+the hub: the `SessionJournal` (the one serializer), the event factory, and the fault
+reporter.
 
 **Idempotency.** `Nats-Msg-Id = EventID` (events) / `CommandID` (commands) gives
 **at-least-once with a ~2-min dedup window** for fast retries — **not exactly-once**.
@@ -180,26 +201,35 @@ record is effectively unbounded.
 
 Policy: define a **journal record size limit independent of block limits**. Inline records
 stay under a conservative threshold (well below `max_payload`). Above it, **offload block
-bodies to a JetStream Object Store** and store a **reference** in the event:
-`{object-id, content-hash (sha256), length, codec-version}`. **Upload the object before
-appending the referencing event** (no dangling reference). On restore, a missing or
-hash-mismatched object is **fail-secure**: treat as corrupt → `RestoreErrored`, do not come
-up. Raise `max_payload` + `MaxMsgSize` to a sane inline ceiling; the object store covers
-the rest.
+bodies to a JetStream Object Store** with **content-addressed ids** (object-id = `sha256`
+of the body, so re-upload is idempotent and dedups), and store the reference in the event:
+`{object-id, length, codec-version}`. **Upload the object before appending the referencing
+event** (no dangling reference). The event append can still fail *after* a successful
+upload, so an object can be **orphaned**: a **GC pass** deletes any object whose hash is
+unreferenced by any event **and** older than a grace period (so a just-uploaded,
+about-to-be-referenced object is never reaped); content-addressing makes this safe and
+idempotent. On restore, a missing or hash-mismatched object is **fail-secure**: corrupt →
+`RestoreErrored`, do not come up. Raise `max_payload` + `MaxMsgSize` to a sane inline
+ceiling; the object store covers the rest.
 
 ## Interfaces (DIP boundary)
 
 ```go
-// Write side — events. Used by the hub's journal serializer; idempotent by Header.EventID;
-// fenced by stream-level expected-sequence (returns the acknowledged sequence).
-type EventAppender interface {
-    Append(ctx context.Context, ev event.Event) (seq uint64, err error)
+// SessionJournal is the single serialized writer for a session's stream — the one place
+// that owns the stream-level expected-sequence fence and the per-append deadline. Events,
+// commands, and LeaseFence ALL go through it, so concurrent appends never race the
+// expected sequence. Idempotent by the record's id (EventID / CommandID / epoch).
+type SessionJournal interface {
+    Append(ctx context.Context, rec JournalRecord) (seq uint64, err error)
 }
 
-// Write side — commands (intent log), at the Session boundary; idempotent by CommandID.
-type CommandAppender interface {
-    Append(ctx context.Context, rec CommandRecord) error
-}
+// JournalRecord is the sealed sum the serializer writes.
+type JournalRecord interface{ isJournalRecord() } // event | command | LeaseFence{epoch}
+
+// EventAppender / CommandAppender are thin typed façades over the one SessionJournal —
+// they own no serializer or sequence of their own.
+type EventAppender   interface{ Append(ctx context.Context, ev event.Event) (uint64, error) }
+type CommandAppender interface{ Append(ctx context.Context, rec CommandRecord) (uint64, error) }
 
 // Read side — backlog (and optionally live) for restore / TUI repaint.
 type EventReplayer interface {
@@ -386,15 +416,23 @@ Per `CLAUDE.md`: table-driven, `-race`, integration-tagged, fuzz the untrusted b
   fingerprint mismatch is rejected/confirmed.
 - **Integration (`//go:build integration`):** append N events → tear down → new server, same
   `StoreDir` → primary-loop restore reconstructs `msgs` byte-for-byte and the transcript;
-  **stream-level fencing** rejects a stale second writer (lease lost) appending to *any*
-  subject; object-store offload + restore, and missing/corrupt-object → `RestoreErrored`;
-  dedup window; the two consumption modes; lazy listing reads only the KV bucket;
-  `Restore*` bracketing with `SessionID`/`LoopID` unchanged; commands correlate to outcomes
-  by `CommandID`.
+  **stream-level fencing + `LeaseFence` handover** — a new owner's first append is
+  `LeaseFence{epoch}`, loops don't start until it acks, and an old-owner append after
+  handover fails the fence on *any* subject; **ambiguous-ack** — a timed-out append is
+  resolved by `EventID` lookup (stored → advance; absent → retry/fault) before the next
+  append; object-store offload + restore, missing/corrupt-object → `RestoreErrored`, and
+  **orphan-GC** reaps an object orphaned by a failed event append after the grace period
+  (never a referenced one); dedup window; the two consumption modes; lazy listing reads
+  only the KV bucket; `Restore*` bracketing with `SessionID`/`LoopID` unchanged; commands
+  correlate to outcomes by `CommandID`.
 - **Fuzz:** `FuzzDecodeEvent` + `FuzzDecodeCommand` over the on-disk codecs.
 - **No UI hang:** a 10 000-event backlog folds in a background `tea.Cmd` and renders once.
-- **Headline property:** stream a session → `kill` → restore → `msgs` identical **and**
-  transcript identical.
+- **Headline property (scoped correctly):** for a **quiescent** history (cleanly ended),
+  restore → `msgs` and transcript **exactly identical**. For a **mid-step kill** the
+  pre-crash *live* screen held Ephemeral token deltas + a partial step, so compare the
+  restored transcript to the **durable Enduring projection** (committed user message +
+  interruption marker, no partial assistant step, no ephemeral) — *not* to the pre-crash
+  live view.
 - `go test -race ./...`; integration with `-tags integration`.
 
 ## Build order
@@ -404,11 +442,13 @@ Per `CLAUDE.md`: table-driven, `-race`, integration-tagged, fuzz the untrusted b
 2. **Codecs** — `MarshalEvent`/`UnmarshalEvent` (Enduring-only, rejects Ephemeral) +
    sealed `tool.PermissionRequest` codec + `MarshalCommand`/`UnmarshalCommand` +
    `FuzzDecodeEvent`/`FuzzDecodeCommand`.
-3. **NATS impl** — `EventAppender` (stream-fenced, returns acked seq) / `CommandAppender` /
-   `EventReplayer`; record-size limit + Object-Store offload; KV lease.
-4. **Hub durable tap** — the per-session serializer + append-before-apply algorithm +
-   `SessionPersistenceFault` + injected factory/fault-reporter; Session-boundary command
-   append; composition wiring.
+3. **NATS impl** — `SessionJournal` (single serializer: stream-fenced, bounded per-append
+   deadline, ambiguous-ack resolution, returns acked seq) with `EventAppender`/
+   `CommandAppender` façades + `EventReplayer`; record-size limit + content-addressed
+   Object-Store offload + orphan-GC; KV lease + `LeaseFence{epoch}` handover.
+4. **Hub durable tap** — append-before-apply algorithm + `SessionPersistenceFault` +
+   injected `SessionJournal`/factory/fault-reporter; Session-boundary command append;
+   composition wiring.
 5. **`Restore` constructor** — primary loop only: config-fingerprint check, fold `msgs` +
    `turnIndex`, crash-seam, `Restore*` events, lease+fence.
 6. **Catalog (KV)** + lazy listing → **TUI replay-repaint** (background fold, mode (a)).
