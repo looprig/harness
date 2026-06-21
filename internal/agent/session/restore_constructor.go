@@ -89,9 +89,11 @@ func (e *RestoreError) Unwrap() error { return e.Cause }
 //
 // On ANY failure in steps 2–7 (a config mismatch, a discovery/replay/decode/object
 // failure, or an append failure) Restore durably records a RestoreErrored and returns a
-// typed error; the session does NOT come up (fail-secure / no silent drift). The lease
-// is the caller's to release on the returned session's teardown; on a failed restore the
-// lease is released here before returning.
+// typed error; the session does NOT come up (fail-secure / no silent drift). On a FAILED
+// restore the acquired lease is released here before returning (so a successor can
+// re-acquire). On SUCCESS the journal HOLDS the lease for the live session's lifetime;
+// releasing it at session teardown is the Phase-10 composition root's wiring (mirroring
+// how the lease is composition-root-owned in the durable-tap path), out of scope here.
 func Restore(
 	ctx context.Context,
 	cfg loop.Config,
