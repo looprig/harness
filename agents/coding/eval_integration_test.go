@@ -24,9 +24,8 @@ var errTurnInterrupted = errors.New("turn interrupted")
 
 // togoRunner adapts the live Togo agent to eval.Runner: it runs one turn for the
 // input prompt over the session subscription transport and projects the terminal
-// TurnDone.Message to text (reusing agents/coding/subagent_factory.go's
-// aiMessageText projection — this test is in package coding, so the unexported
-// helper is in scope).
+// TurnDone.Message to text (reusing the aiMessageText projection from text_test.go
+// — this test is in package coding, so the unexported helper is in scope).
 type togoRunner struct{ agent *Coding }
 
 // Run subscribes to the session fan-in, submits a single turn fire-and-forget, and

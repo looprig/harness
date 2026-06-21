@@ -75,7 +75,10 @@ func (e *drainLostError) Unwrap() error { return e.Cause }
 // bound to the sub-loop. Submits carry no ctx, so cancelling ctx cannot reach the
 // sub-loop's turn — only an explicit Interrupt can. On ctx.Done() the helper
 // therefore calls interrupt() EXACTLY ONCE (fail-safe) and keeps draining to the
-// sub-loop's TurnInterrupted terminal so the loop can never orphan.
+// sub-loop's TurnInterrupted terminal so the loop does not orphan on ctx-cancel.
+// This fail-safe relies on the sub-loop honouring the interrupt by producing a
+// terminal (or the subscription closing); a pathologically wedged provider that
+// ignores its turn ctx after the interrupt is a known, pre-existing liveness corner.
 //
 // CALLER RESPONSIBILITY: subscribe BEFORE submitting. The hub has no replay, so a
 // subscription created after the submit could miss the opening TurnStarted and the
