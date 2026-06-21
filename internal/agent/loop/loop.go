@@ -163,6 +163,11 @@ func New(loopCtx context.Context, sessionID, loopID uuid.UUID, parent Provenance
 	// injected one — a parked dependency, wired at construction (loopConfig.events
 	// is its peer).
 	if cfg.eventFactory == nil {
+		// Unlike the session (whose Factory closes over the LIVE s.newID/s.now fields,
+		// so a post-construction swap is honored), the loop intentionally FREEZES its
+		// id-gen + clock into the Factory here at construction: cfg.idGen/cfg.now are
+		// captured by value, so a later mutation of cfg is NOT honored. A test pins the
+		// stamp by injecting idGen/now (or a whole eventFactory) BEFORE loop.New.
 		// idGenerator and event.IDGen are the same underlying func type but distinct
 		// named types, so the conversion is explicit.
 		cfg.eventFactory = event.NewFactory(event.IDGen(cfg.idGen), cfg.now)

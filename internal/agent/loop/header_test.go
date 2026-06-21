@@ -2,11 +2,97 @@ package loop
 
 import (
 	"testing"
+	"time"
 
 	"github.com/inventivepotter/urvi/internal/agent/loop/event"
 	"github.com/inventivepotter/urvi/internal/agent/loop/identity"
 	"github.com/inventivepotter/urvi/internal/uuid"
 )
+
+// TestWithLoopHeaderStampsEveryEnduringType is the EXHAUSTIVE guard on
+// withLoopHeader: it runs ONE instance of each of the 11 Enduring loop-scoped
+// event types through withLoopHeader(ev, h) with a known non-zero h and asserts
+// the write-back actually took — EventID + CreatedAt (the minted persistence
+// identity) AND the Coordinates/Cause carried by h all land on the returned
+// event's header. A type that falls through withLoopHeader's default arm returns
+// ev UNCHANGED (its EventID stays zero), so it fails here. This closes the silent
+// zero-EventID-Enduring-event surface: a new Enduring loop event that someone
+// forgets to add to withLoopHeader's switch is caught the moment it is added to
+// this table (and a type dropped from the switch fails immediately). The list
+// MUST equal loop.go's set of Enduring loop events the publish chokepoint stamps.
+func TestWithLoopHeaderStampsEveryEnduringType(t *testing.T) {
+	t.Parallel()
+
+	// A fully-populated, non-zero Header so a missed write-back is unmistakable: a
+	// type that falls through returns ev with its ZERO header, failing every assert.
+	h := event.Header{
+		Coordinates: identity.Coordinates{
+			SessionID: uuid.UUID{0x11},
+			LoopID:    uuid.UUID{0x22},
+			TurnID:    uuid.UUID{0x33},
+			StepID:    uuid.UUID{0x44},
+		},
+		EventID:   uuid.UUID{0x55},
+		CreatedAt: time.Date(2026, 6, 21, 8, 0, 0, 0, time.UTC),
+		Cause: identity.Cause{
+			Coordinates: identity.Coordinates{LoopID: uuid.UUID{0x66}},
+			CommandID:   uuid.UUID{0x77},
+			Agency:      identity.AgencyUser,
+		},
+	}
+
+	// in is one instance of each Enduring loop-scoped event type. These are exactly
+	// the 11 cases withLoopHeader enumerates (the only events the publish chokepoint
+	// stamps); Ephemeral and session-scoped events never reach withLoopHeader.
+	tests := []struct {
+		name string
+		in   event.Event
+	}{
+		{name: "TurnStarted", in: event.TurnStarted{}},
+		{name: "StepDone", in: event.StepDone{}},
+		{name: "TurnFoldedInto", in: event.TurnFoldedInto{}},
+		{name: "InputCancelled", in: event.InputCancelled{}},
+		{name: "TurnRejected", in: event.TurnRejected{}},
+		{name: "LoopIdle", in: event.LoopIdle{}},
+		{name: "TurnDone", in: event.TurnDone{}},
+		{name: "TurnFailed", in: event.TurnFailed{}},
+		{name: "TurnInterrupted", in: event.TurnInterrupted{}},
+		{name: "PermissionRequested", in: event.PermissionRequested{}},
+		{name: "UserInputRequested", in: event.UserInputRequested{}},
+	}
+
+	// Guard the count so adding a 12th Enduring loop event without extending this
+	// table is itself a failure (the test must enumerate every type).
+	const wantEnduringLoopTypes = 11
+	if len(tests) != wantEnduringLoopTypes {
+		t.Fatalf("table has %d types, want %d Enduring loop-scoped event types", len(tests), wantEnduringLoopTypes)
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got := withLoopHeader(tt.in, h)
+			gh := got.EventHeader()
+			// The minted persistence identity must be written back. A type that fell
+			// through the default arm keeps its zero header, so EventID stays zero here.
+			if gh.EventID != h.EventID {
+				t.Errorf("EventID = %v, want %v (write-back missing — type fell through default arm?)", gh.EventID, h.EventID)
+			}
+			if !gh.CreatedAt.Equal(h.CreatedAt) {
+				t.Errorf("CreatedAt = %v, want %v (write-back missing)", gh.CreatedAt, h.CreatedAt)
+			}
+			// withLoopHeader REPLACES the whole header with h, so the Coordinates and
+			// Cause h carries must be preserved on the returned event too.
+			if gh.Coordinates != h.Coordinates {
+				t.Errorf("Coordinates = %+v, want %+v (header write-back lost coordinates)", gh.Coordinates, h.Coordinates)
+			}
+			if gh.Cause != h.Cause {
+				t.Errorf("Cause = %+v, want %+v (header write-back lost cause)", gh.Cause, h.Cause)
+			}
+		})
+	}
+}
 
 // TestStampLoopHeaderReplyEvents proves stampLoopHeader stamps the loop-scoped
 // reply events InputQueued and TurnRejected: it fills the zero SessionID/LoopID
