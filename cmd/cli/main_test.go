@@ -17,7 +17,7 @@ func TestAgentName(t *testing.T) {
 		{name: "single positional arg", args: []string{"foo"}, want: "foo"},
 		{name: "flag then positional", args: []string{"-v", "bar"}, want: "bar"},
 		{name: "only a flag returns default", args: []string{"-v"}, want: defaultAgent},
-		{name: "flag before default-able name", args: []string{"--debug", "personal-assistant"}, want: "personal-assistant"},
+		{name: "flag before positional name", args: []string{"--debug", "coding"}, want: "coding"},
 		{name: "coding selects coding agent", args: []string{"coding"}, want: "coding"},
 		{name: "first positional wins", args: []string{"-x", "alpha", "beta"}, want: "alpha"},
 	}
@@ -60,7 +60,7 @@ func TestAgentDisplayName(t *testing.T) {
 		want      string
 	}{
 		{name: "coding agent displays as Togo", agentName: "coding", want: "Togo"},
-		{name: "unmapped agent falls back to its name", agentName: "personal-assistant", want: "personal-assistant"},
+		{name: "unmapped agent falls back to its name", agentName: "other", want: "other"},
 		{name: "empty name falls back to empty", agentName: "", want: ""},
 	}
 	for _, tt := range tests {

@@ -18,8 +18,8 @@ import (
 // cause (nil for an intentional Close).
 type EventStream = event.Subscription
 
-// Agent is the narrow surface the TUI drives. *personalassistant.Assistant
-// satisfies it structurally; the TUI never imports any agent package.
+// Agent is the narrow surface the TUI drives. *coding.Coding satisfies it
+// structurally; the TUI never imports any agent package.
 type Agent interface {
 	StreamBlocks(ctx context.Context, blocks []content.Block) (*llm.StreamReader[event.Event], error)
 	// Submit sends input fire-and-forget as a queueable UserInput; the returned

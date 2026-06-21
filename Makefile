@@ -15,8 +15,8 @@ build:
 	CGO_ENABLED=0 go build -trimpath -o bin/urvi ./cmd/cli
 
 # Run the TUI directly. Loads .env (if present) so LLM_API_KEY and friends are
-# exported for the process. Select an agent with AGENT=<name> (default: coding;
-# "personal-assistant" is also available). e.g. make run AGENT=personal-assistant
+# exported for the process. Select an agent with AGENT=<name> (default: coding).
+# e.g. make run AGENT=coding
 run:
 	set -a; [ -f .env ] && . ./.env; set +a; go run ./cmd/cli $(AGENT)
 

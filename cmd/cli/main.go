@@ -18,7 +18,6 @@ import (
 	tea "charm.land/bubbletea/v2"
 
 	"github.com/inventivepotter/urvi/agents/coding"
-	personalassistant "github.com/inventivepotter/urvi/agents/personal-assistant"
 	"github.com/inventivepotter/urvi/internal/logging"
 	"github.com/inventivepotter/urvi/internal/registry"
 	"github.com/inventivepotter/urvi/internal/ttylog"
@@ -34,8 +33,7 @@ const defaultAgent = "coding"
 // the metadata is wired here alongside the registry registration. A name with no
 // entry falls back to an empty description (the banner then shows the bare name).
 var agentDescriptions = map[string]string{
-	"coding":             "a careful software engineer that works through tools",
-	"personal-assistant": "a helpful, concise personal assistant",
+	"coding": "a careful software engineer that works through tools",
 }
 
 // agentDescription returns the banner description for name, or "" if none is
@@ -73,15 +71,11 @@ func agentName(args []string) string {
 // buildRegistry returns the agent registry with the built-in agents registered.
 func buildRegistry() *registry.Registry[tui.Agent] {
 	reg := registry.New[tui.Agent]()
-	// Register returns an error only on duplicate names; with static, distinct
-	// registrations that cannot happen, but handle it defensively. *Assistant and
-	// *Coding satisfy tui.Agent, so each constructor type-checks as
-	// (tui.Agent, error).
+	// Register returns an error only on duplicate names; with a single static
+	// registration that cannot happen, but handle it defensively. *Coding
+	// satisfies tui.Agent, so the constructor type-checks as (tui.Agent, error).
 	_ = reg.Register(defaultAgent, func(c context.Context) (tui.Agent, error) {
 		return coding.New(c)
-	})
-	_ = reg.Register("personal-assistant", func(c context.Context) (tui.Agent, error) {
-		return personalassistant.New(c)
 	})
 	return reg
 }
