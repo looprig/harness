@@ -264,6 +264,14 @@ func (s *Session) NewLoop(parent loop.Provenance, cfg loop.Config) (uuid.UUID, e
 		return uuid.UUID{}, &SessionError{Kind: SessionLoopIDGenerationFailed, Cause: err}
 	}
 
+	// Mint the LoopStarted EventID BEFORE building or registering the loop, so an
+	// id-gen failure fails NewLoop cleanly (typed error) before any loop exists —
+	// we never leave a registered loop behind a returned error.
+	eventID, err := s.newID()
+	if err != nil {
+		return uuid.UUID{}, &SessionError{Kind: SessionIDGenerationFailed, Cause: err}
+	}
+
 	loopCtx, cancel := context.WithCancel(s.sessionCtx)
 	l, err := loop.New(loopCtx, s.SessionID, loopID, parent, s, cfg)
 	if err != nil {
@@ -272,8 +280,30 @@ func (s *Session) NewLoop(parent loop.Provenance, cfg loop.Config) (uuid.UUID, e
 	}
 
 	s.loopsMu.Lock()
-	defer s.loopsMu.Unlock()
 	s.loops[loopID] = &loopHandle{loop: l, parent: parent, cancel: cancel}
+	s.loopsMu.Unlock()
+
+	// Announce the loop tree to subscribers active now. Published AFTER releasing
+	// loopsMu — never under the registry lock — because a hub publish fans out and
+	// must not hold the registry lock. LoopStarted is a pure announcement: it is not
+	// one of the active-mutating events (TurnStarted/LoopIdle/TurnFoldedInto/
+	// InputCancelled), so it never perturbs session quiescence. Header.Coordinates is
+	// the NEW loop (SessionID+LoopID; Turn/Step zero); Header.Cause is the spawning
+	// loop/turn/step (zero for the primary = root), machine-originated. There is no
+	// ctx param, so it publishes on the session lifetime (s.sessionCtx).
+	ev := event.LoopStarted{
+		Header: event.Header{
+			Coordinates: identity.Coordinates{SessionID: s.SessionID, LoopID: loopID},
+			EventID:     eventID,
+			Cause: identity.Cause{
+				Coordinates: identity.Coordinates{LoopID: parent.LoopID, TurnID: parent.TurnID, StepID: parent.StepID},
+				Agency:      identity.AgencyMachine,
+			},
+		},
+	}
+	if err := s.PublishEvent(s.sessionCtx, ev); err != nil {
+		return uuid.UUID{}, err
+	}
 	return loopID, nil
 }
 

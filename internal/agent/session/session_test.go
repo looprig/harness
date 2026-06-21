@@ -213,7 +213,8 @@ func TestNewLoop(t *testing.T) {
 			t.Cleanup(func() { _ = s.Shutdown(context.Background()) })
 
 			// Record which ids the session mints from here on, so we can assert the
-			// returned loop id came from idGen.
+			// returned loop id came from idGen. NewLoop mints the loop id FIRST, then
+			// the LoopStarted EventID — so the loop id is the first captured id.
 			gen := &capturingIDGen{}
 			s.newID = gen.gen
 
@@ -224,9 +225,9 @@ func TestNewLoop(t *testing.T) {
 			if loopID.IsZero() {
 				t.Fatal("NewLoop returned a zero loop id")
 			}
-			minted, ok := gen.last()
+			minted, ok := gen.first()
 			if !ok || minted != loopID {
-				t.Fatalf("returned loop id %v was not the freshly minted id %v", loopID, minted)
+				t.Fatalf("returned loop id %v was not the first freshly minted id %v", loopID, minted)
 			}
 			if loopID == s.primaryLoopID {
 				t.Fatal("NewLoop reused the primary loop id, want a distinct id")
@@ -260,38 +261,63 @@ func TestNewLoop(t *testing.T) {
 	}
 }
 
-// TestNewLoopIDGenerationFailure: when idGen fails, NewLoop returns
-// *SessionError{SessionLoopIDGenerationFailed} wrapping the generator error and
-// registers no loop.
+// TestNewLoopIDGenerationFailure: when idGen fails, NewLoop returns a typed
+// *SessionError wrapping the generator error and registers no loop. NewLoop mints
+// two ids — the loop id (1st) then the LoopStarted EventID (2nd). A failure on the
+// 1st call is SessionLoopIDGenerationFailed (no loop id); a failure on the 2nd is
+// SessionIDGenerationFailed (loop id minted, but the announcement id failed). Both
+// must fail BEFORE any loop is built or registered, so the registry never grows.
 func TestNewLoopIDGenerationFailure(t *testing.T) {
 	t.Parallel()
 	genErr := errors.New("rand source exhausted")
-	s, err := New(context.Background(), cfg(&stubLLM{chunks: []content.Chunk{textChunk("x")}}))
-	if err != nil {
-		t.Fatalf("New: %v", err)
+	tests := []struct {
+		name      string
+		failOnNth int // 1 = loop id mint fails; 2 = EventID mint fails
+		wantKind  SessionErrorKind
+	}{
+		{name: "loop id mint fails", failOnNth: 1, wantKind: SessionLoopIDGenerationFailed},
+		{name: "event id mint fails", failOnNth: 2, wantKind: SessionIDGenerationFailed},
 	}
-	t.Cleanup(func() { s.newID = uuid.New; _ = s.Shutdown(context.Background()) })
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			s, err := New(context.Background(), cfg(&stubLLM{chunks: []content.Chunk{textChunk("x")}}))
+			if err != nil {
+				t.Fatalf("New: %v", err)
+			}
+			t.Cleanup(func() { s.newID = uuid.New; _ = s.Shutdown(context.Background()) })
 
-	s.loopsMu.RLock()
-	before := len(s.loops)
-	s.loopsMu.RUnlock()
+			s.loopsMu.RLock()
+			before := len(s.loops)
+			s.loopsMu.RUnlock()
 
-	s.newID = func() (uuid.UUID, error) { return uuid.UUID{}, genErr }
+			// Fail the Nth idGen call; earlier calls return real ids.
+			var n int
+			s.newID = func() (uuid.UUID, error) {
+				n++
+				if n == tt.failOnNth {
+					return uuid.UUID{}, genErr
+				}
+				return uuid.New()
+			}
 
-	_, err = s.NewLoop(loop.Provenance{}, cfg(&stubLLM{}))
-	var se *SessionError
-	if !errors.As(err, &se) || se.Kind != SessionLoopIDGenerationFailed {
-		t.Fatalf("err = %v, want *SessionError{SessionLoopIDGenerationFailed}", err)
-	}
-	if !errors.Is(err, genErr) {
-		t.Fatalf("err = %v, want it to wrap the generator error", err)
-	}
+			_, err = s.NewLoop(loop.Provenance{}, cfg(&stubLLM{}))
+			var se *SessionError
+			if !errors.As(err, &se) || se.Kind != tt.wantKind {
+				t.Fatalf("err = %v, want *SessionError{%v}", err, tt.wantKind)
+			}
+			if !errors.Is(err, genErr) {
+				t.Fatalf("err = %v, want it to wrap the generator error", err)
+			}
 
-	s.loopsMu.RLock()
-	after := len(s.loops)
-	s.loopsMu.RUnlock()
-	if after != before {
-		t.Fatalf("registry grew from %d to %d on idGen failure, want no new loop", before, after)
+			s.loopsMu.RLock()
+			after := len(s.loops)
+			s.loopsMu.RUnlock()
+			if after != before {
+				t.Fatalf("registry grew from %d to %d on idGen failure, want no new loop", before, after)
+			}
+		})
 	}
 }
 

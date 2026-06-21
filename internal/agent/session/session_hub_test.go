@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/inventivepotter/urvi/internal/agent/loop"
 	"github.com/inventivepotter/urvi/internal/agent/loop/event"
 	"github.com/inventivepotter/urvi/internal/agent/loop/identity"
 	"github.com/inventivepotter/urvi/internal/agent/session/hub"
@@ -239,5 +240,101 @@ func drainFor[T event.Event](t *testing.T, sub *hub.EventSubscription) bool {
 		case <-deadline:
 			return false
 		}
+	}
+}
+
+// firstMatching reads from the subscription until an event of type T arrives or a
+// timeout elapses, returning the matched event and true (zero value, false on
+// miss). Unlike drainFor it hands back the concrete event so a test can inspect
+// its Header/Cause.
+func firstMatching[T event.Event](t *testing.T, sub *hub.EventSubscription) (T, bool) {
+	t.Helper()
+	var zero T
+	deadline := time.After(time.Second)
+	for {
+		select {
+		case ev, ok := <-sub.Events():
+			if !ok {
+				return zero, false
+			}
+			if got, match := ev.(T); match {
+				return got, true
+			}
+		case <-deadline:
+			return zero, false
+		}
+	}
+}
+
+// TestLoopStartedPublishedOnNewLoop proves Session.NewLoop publishes exactly one
+// Enduring LoopStarted to a subscriber active at creation time, carrying the NEW
+// loop in Header.Coordinates and the spawning provenance in Header.Cause
+// (Agency=AgencyMachine). It also proves there is no replay: a subscriber that
+// attaches AFTER NewLoop never sees that LoopStarted.
+func TestLoopStartedPublishedOnNewLoop(t *testing.T) {
+	t.Parallel()
+	s, err := New(context.Background(), cfg(&stubLLM{chunks: []content.Chunk{textChunk("x")}}))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Shutdown(context.Background()) })
+
+	// Subscribe to all Enduring events BEFORE creating the second loop, so this
+	// subscriber is active at creation time and must receive the LoopStarted.
+	sub, err := s.SubscribeEvents(allFilter())
+	if err != nil {
+		t.Fatalf("SubscribeEvents: %v", err)
+	}
+	t.Cleanup(func() { _ = sub.Close() })
+
+	parent := loop.Provenance{LoopID: mustUUID(), TurnID: mustUUID(), StepID: mustUUID()}
+	loopID, err := s.NewLoop(parent, cfg(&stubLLM{chunks: []content.Chunk{textChunk("y")}}))
+	if err != nil {
+		t.Fatalf("NewLoop: %v", err)
+	}
+
+	ev, ok := firstMatching[event.LoopStarted](t, sub)
+	if !ok {
+		t.Fatal("subscriber active at NewLoop did not receive a LoopStarted")
+	}
+	// Header.Coordinates is the NEW loop: SessionID+LoopID set, Turn/Step zero.
+	if ev.SessionID != s.SessionID {
+		t.Errorf("LoopStarted SessionID = %v, want %v", ev.SessionID, s.SessionID)
+	}
+	if ev.LoopID != loopID {
+		t.Errorf("LoopStarted LoopID = %v, want returned loop id %v", ev.LoopID, loopID)
+	}
+	if !ev.TurnID.IsZero() || !ev.StepID.IsZero() {
+		t.Errorf("LoopStarted Coordinates Turn/Step = %v/%v, want both zero", ev.TurnID, ev.StepID)
+	}
+	if ev.EventID.IsZero() {
+		t.Error("LoopStarted EventID is zero, want a freshly minted id")
+	}
+	// Header.Cause is the spawning loop/turn/step, machine-originated.
+	if ev.Cause.LoopID != parent.LoopID {
+		t.Errorf("LoopStarted Cause.LoopID = %v, want parent %v", ev.Cause.LoopID, parent.LoopID)
+	}
+	if ev.Cause.TurnID != parent.TurnID {
+		t.Errorf("LoopStarted Cause.TurnID = %v, want parent %v", ev.Cause.TurnID, parent.TurnID)
+	}
+	if ev.Cause.StepID != parent.StepID {
+		t.Errorf("LoopStarted Cause.StepID = %v, want parent %v", ev.Cause.StepID, parent.StepID)
+	}
+	if ev.Cause.Agency != identity.AgencyMachine {
+		t.Errorf("LoopStarted Cause.Agency = %v, want AgencyMachine", ev.Cause.Agency)
+	}
+	// It is Enduring (durable loop-tree record).
+	if ev.Class() != event.Enduring {
+		t.Errorf("LoopStarted Class = %v, want Enduring", ev.Class())
+	}
+
+	// No replay: a subscriber attaching AFTER NewLoop must not see that LoopStarted.
+	late, err := s.SubscribeEvents(allFilter())
+	if err != nil {
+		t.Fatalf("late SubscribeEvents: %v", err)
+	}
+	t.Cleanup(func() { _ = late.Close() })
+	if _, ok := firstMatching[event.LoopStarted](t, late); ok {
+		t.Fatal("late subscriber received a replayed LoopStarted, want none (no replay)")
 	}
 }
