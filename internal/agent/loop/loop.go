@@ -35,6 +35,12 @@ type Loop struct {
 	// runner via the turn-launch ctx injection, and tests) register gates. The
 	// actor is the sole reader.
 	gateReg chan<- gateRegistration
+
+	// snapshots is the committed-state query seam: Snapshot sends a snapshotRequest
+	// here and the actor (the sole owner of loopState.msgs/turnIndex) replies a
+	// defensive clone. It is the restore-verification + dormant-snapshot read primitive
+	// (see Snapshot). The actor is the sole reader, selecting on it alongside commands.
+	snapshots chan<- snapshotRequest
 }
 
 // loopConfig holds the loop goroutine's DEPENDENCIES and construction-time wiring
@@ -64,6 +70,12 @@ type loopConfig struct {
 	// a gate. Bidirectional here because a receive-only handle could not be narrowed
 	// to the send-only direction runTurn requires.
 	gateReg chan gateRegistration
+
+	// snapshots is the committed-state query channel. The actor is its sole reader,
+	// selecting on it alongside commands; a caller (Snapshot) sends a request and the
+	// actor replies a defensive clone of loopState.msgs + turnIndex. Bidirectional here
+	// because the public Loop.snapshots is its send side.
+	snapshots chan snapshotRequest
 
 	// internal is the turn goroutine's terminal hand-back (turnResult). Buffered(1)
 	// so a finished turn never blocks delivering its terminal to the actor.
@@ -139,7 +151,21 @@ func resolveDrainTimeout(d time.Duration) time.Duration {
 // to this loop. parent is the provenance of the turn/step that spawned this loop
 // (zero for the primary loop). events is the session-level event publisher the
 // loop depends on (Dependency Inversion); it must be non-nil.
+//
+// New spawns an EMPTY loop (no committed history, turnIndex 0). The restore path
+// (NewRestored) seeds pre-built committed state instead; both funnel through
+// newLoopWithSeed, which is identical save for that seed.
 func New(loopCtx context.Context, sessionID, loopID uuid.UUID, parent Provenance, events eventPublisher, cfg Config) (*Loop, error) {
+	return newLoopWithSeed(loopCtx, sessionID, loopID, parent, events, cfg, nil)
+}
+
+// newLoopWithSeed is the construction core shared by New (seed nil → an empty loop)
+// and NewRestored (seed non-nil → a loop pre-seeded with committed msgs + turnIndex,
+// coming up idle). It runs the identical config validation/defaulting and actor
+// goroutine for both; the ONLY difference is whether loopState starts empty or seeded.
+// Keeping it one function means the spawn path and the restore path can never drift in
+// validation, defaulting, or wiring.
+func newLoopWithSeed(loopCtx context.Context, sessionID, loopID uuid.UUID, parent Provenance, events eventPublisher, cfg Config, seed *RestoredState) (*Loop, error) {
 	if cfg.Client == nil {
 		return nil, &ConfigError{Kind: ConfigMissingClient}
 	}
@@ -177,6 +203,9 @@ func New(loopCtx context.Context, sessionID, loopID uuid.UUID, parent Provenance
 	// gateReg is unbuffered: registration is synchronous (the runner blocks on the
 	// ack), and the actor is the sole reader, selecting on it alongside commands.
 	gateReg := make(chan gateRegistration)
+	// snapshots is unbuffered: the actor is the sole reader and replies on the request's
+	// buffered(1) reply channel, so the actor never blocks serving a snapshot.
+	snapshots := make(chan snapshotRequest)
 	// The loop-goroutine handshake channels are construction-time wiring shared
 	// between the actor and the per-turn goroutine, so they live in loopConfig:
 	//   - internal: turn terminal hand-back, buffered(1) so a finished turn never blocks.
@@ -187,6 +216,7 @@ func New(loopCtx context.Context, sessionID, loopID uuid.UUID, parent Provenance
 		cfg:          cfg,
 		commands:     commands,
 		gateReg:      gateReg,
+		snapshots:    snapshots,
 		internal:     make(chan turnResult, 1),
 		commits:      make(chan commitRequest),
 		drains:       make(chan drainRequest),
@@ -195,8 +225,17 @@ func New(loopCtx context.Context, sessionID, loopID uuid.UUID, parent Provenance
 		eventFactory: cfg.eventFactory,
 	}
 	state := newLoopState(sessionID, loopID, parent)
+	if seed != nil {
+		// Restore seed: come up with the folded committed history and turn count. The
+		// status stays loopIdle (newLoopState's zero default), so the resumed loop
+		// accepts the next submit immediately and numbers its next turn from turnIndex.
+		// The system prompt is NOT in msgs — it rides cfg.Model.System, sent every turn
+		// — so seeding msgs alone reproduces loopState exactly as it was committed.
+		state.msgs = cloneMessages(seed.Msgs)
+		state.turnIndex = seed.TurnIndex
+	}
 	go runLoop(lc, state)
-	return &Loop{Commands: commands, Done: done, gateReg: gateReg}, nil
+	return &Loop{Commands: commands, Done: done, gateReg: gateReg, snapshots: snapshots}, nil
 }
 
 type loopStatus int
@@ -373,6 +412,7 @@ func runLoop(cfg loopConfig, state loopState) {
 	config := cfg.cfg
 	commands := cfg.commands
 	gateReg := cfg.gateReg
+	snapshots := cfg.snapshots
 	internal := cfg.internal
 	commits := cfg.commits
 	drains := cfg.drains
@@ -977,6 +1017,13 @@ func runLoop(cfg loopConfig, state loopState) {
 			// can no longer be dropped on a race. Only the actor touches pendingGates.
 			state.pendingGates[reg.callID] = gate{reply: reg.reply, kind: reg.kind}
 			close(reg.ack)
+
+		case req := <-snapshots:
+			// Committed-state query: the actor is the SOLE owner of loopState.msgs +
+			// turnIndex, so a consistent read is served from here. Reply a DEFENSIVE clone
+			// (its own backing array) so the caller can never alias or race the live slice
+			// the actor keeps appending to. reply is buffered(1); the send never blocks.
+			req.reply <- loopSnapshot{msgs: cloneMessages(state.msgs), turnIndex: state.turnIndex}
 
 		case req := <-drains:
 			// Tool-continuation drain: pop + clear the inbox into draining and reply the
