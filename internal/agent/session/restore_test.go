@@ -39,16 +39,18 @@ func TestFoldPrimaryLoop(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		name        string
-		events      []event.Event
-		wantMsgs    content.AgenticMessages
-		wantTurnIdx event.TurnIndex
+		name         string
+		events       []event.Event
+		wantMsgs     content.AgenticMessages
+		wantTurnIdx  event.TurnIndex
+		wantOpenTurn bool
 	}{
 		{
-			name:        "empty sequence yields empty msgs",
-			events:      nil,
-			wantMsgs:    content.AgenticMessages{},
-			wantTurnIdx: 0,
+			name:         "empty sequence yields empty msgs",
+			events:       nil,
+			wantMsgs:     content.AgenticMessages{},
+			wantTurnIdx:  0,
+			wantOpenTurn: false,
 		},
 		{
 			name: "single turn: user + one step group + TurnDone",
@@ -61,7 +63,8 @@ func TestFoldPrimaryLoop(t *testing.T) {
 				foldUserMsg("hello"),
 				aiMessage("hi there"),
 			},
-			wantTurnIdx: 1,
+			wantTurnIdx:  1,
+			wantOpenTurn: false,
 		},
 		{
 			name: "single turn with tool step: user + (AI + tool results) + final AI + TurnDone",
@@ -78,7 +81,8 @@ func TestFoldPrimaryLoop(t *testing.T) {
 				foldToolResult("t2", "result b"),
 				aiMessage("done"),
 			},
-			wantTurnIdx: 1,
+			wantTurnIdx:  1,
+			wantOpenTurn: false,
 		},
 		{
 			name: "multi-turn: two complete turns in order",
@@ -96,7 +100,8 @@ func TestFoldPrimaryLoop(t *testing.T) {
 				foldUserMsg("second"),
 				aiMessage("answer two"),
 			},
-			wantTurnIdx: 2,
+			wantTurnIdx:  2,
+			wantOpenTurn: false,
 		},
 		{
 			name: "TurnFoldedInto lands the folded user message at the fold point",
@@ -114,7 +119,8 @@ func TestFoldPrimaryLoop(t *testing.T) {
 				foldUserMsg("folded follow-up"),
 				aiMessage("final answer"),
 			},
-			wantTurnIdx: 1,
+			wantTurnIdx:  1,
+			wantOpenTurn: false,
 		},
 		{
 			name: "TurnFailed terminal is a no-op for msgs (committed steps stay)",
@@ -127,7 +133,8 @@ func TestFoldPrimaryLoop(t *testing.T) {
 				foldUserMsg("try"),
 				aiMessage("partial committed step"),
 			},
-			wantTurnIdx: 1,
+			wantTurnIdx:  1,
+			wantOpenTurn: false,
 		},
 		{
 			name: "TurnInterrupted terminal is a no-op for msgs",
@@ -140,7 +147,8 @@ func TestFoldPrimaryLoop(t *testing.T) {
 				foldUserMsg("try"),
 				aiMessage("committed before interrupt"),
 			},
-			wantTurnIdx: 1,
+			wantTurnIdx:  1,
+			wantOpenTurn: false,
 		},
 		{
 			name: "lifecycle events do not contribute to msgs",
@@ -160,7 +168,8 @@ func TestFoldPrimaryLoop(t *testing.T) {
 				foldUserMsg("hello"),
 				aiMessage("hi"),
 			},
-			wantTurnIdx: 1,
+			wantTurnIdx:  1,
+			wantOpenTurn: false,
 		},
 		{
 			name: "InputCancelled does not contribute to msgs",
@@ -174,7 +183,73 @@ func TestFoldPrimaryLoop(t *testing.T) {
 				foldUserMsg("hello"),
 				aiMessage("hi"),
 			},
-			wantTurnIdx: 1,
+			wantTurnIdx:  1,
+			wantOpenTurn: false,
+		},
+		// --- Task 8.2: open-turn (crash-seam) detection + interrupted-turn contract ---
+		{
+			name: "open turn: TurnStarted + completed steps, NO terminal -> open, no partial",
+			events: []event.Event{
+				event.TurnStarted{Message: foldUserMsg("first")},
+				foldStepGroup(aiMessage("answer one")),
+				event.TurnDone{Message: aiMessage("answer one")},
+				event.TurnStarted{Message: foldUserMsg("crashed mid-turn")},
+				foldStepGroup(aiMessage("calling tool"), foldToolResult("t1", "tool out")),
+				// no terminal: the loop crashed after committing this step but before
+				// finishing the in-flight (uncommitted, no StepDone) next step.
+			},
+			wantMsgs: content.AgenticMessages{
+				foldUserMsg("first"),
+				aiMessage("answer one"),
+				foldUserMsg("crashed mid-turn"),
+				aiMessage("calling tool"),
+				foldToolResult("t1", "tool out"),
+				// NO partial assistant step — the in-flight step never emitted StepDone.
+			},
+			wantTurnIdx:  2,
+			wantOpenTurn: true,
+		},
+		{
+			name: "open turn: TurnStarted with zero StepDones -> open, msgs = just the user message",
+			events: []event.Event{
+				event.TurnStarted{Message: foldUserMsg("only the user message committed")},
+				// crash before the first step committed.
+			},
+			wantMsgs: content.AgenticMessages{
+				foldUserMsg("only the user message committed"),
+			},
+			wantTurnIdx:  1,
+			wantOpenTurn: true,
+		},
+		{
+			name: "cleanly-ended history (…TurnDone) is not open",
+			events: []event.Event{
+				event.TurnStarted{Message: foldUserMsg("hello")},
+				foldStepGroup(aiMessage("hi")),
+				event.TurnDone{Message: aiMessage("hi")},
+			},
+			wantMsgs: content.AgenticMessages{
+				foldUserMsg("hello"),
+				aiMessage("hi"),
+			},
+			wantTurnIdx:  1,
+			wantOpenTurn: false,
+		},
+		{
+			name: "open turn after a clean turn then a bare TurnStarted -> open",
+			events: []event.Event{
+				event.TurnStarted{Message: foldUserMsg("done turn")},
+				foldStepGroup(aiMessage("answered")),
+				event.TurnInterrupted{},
+				event.TurnStarted{Message: foldUserMsg("reopened")},
+			},
+			wantMsgs: content.AgenticMessages{
+				foldUserMsg("done turn"),
+				aiMessage("answered"),
+				foldUserMsg("reopened"),
+			},
+			wantTurnIdx:  2,
+			wantOpenTurn: true,
 		},
 	}
 
@@ -187,6 +262,9 @@ func TestFoldPrimaryLoop(t *testing.T) {
 			}
 			if got.TurnIndex != tt.wantTurnIdx {
 				t.Errorf("foldPrimaryLoop() turnIndex = %d, want %d", got.TurnIndex, tt.wantTurnIdx)
+			}
+			if got.OpenTurn != tt.wantOpenTurn {
+				t.Errorf("foldPrimaryLoop() openTurn = %v, want %v", got.OpenTurn, tt.wantOpenTurn)
 			}
 		})
 	}
