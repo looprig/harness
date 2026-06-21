@@ -403,32 +403,43 @@ timeout but actually stored). Resolver must: retry same `Nats-Msg-Id`+`expected 
 
 ---
 
-## Phase 5 — Record size + Object-Store offload + orphan-GC (spec: Record size)
+## Phase 5 — Record size, whole-record object-store offload (write), and the read-side EventReplayer
 
-### Task 5.1: Server/stream size config + record-size guard
+> **Re-plan (controller):** (1) v1 offloads the **WHOLE over-threshold record** (not
+> block-level — simpler/safer; see design *Record size*). (2) **orphan-GC moved to Phase 6**
+> (it requires the session lease). (3) the **`EventReplayer` (read side)** was only implicit
+> in the original plan's interfaces — made explicit here as Task 5.3, since restore (Phase 8)
+> and the TUI (Phase 10) consume it, and the offload read-path (rehydration + fail-secure)
+> lives in it.
 
-**Files:** `…/nats.go` (set `max_payload` + stream `MaxMsgSize` to the inline ceiling; reject
-oversized inline records with a typed `RecordTooLargeError` unless offloaded).
-TDD (integration): a record above the inline threshold but not offloaded → typed error.
-Commit: `git commit -m "feat(journal): inline record-size ceiling + RecordTooLargeError"`
+### Task 5.1+5.2: record-size threshold + whole-record content-addressed offload (write/append)
 
-### Task 5.2: Content-addressed object offload (upload-before-event)
+**Files:** `internal/agent/session/journal/objectstore.go`, `journal.go`/`nats.go`.
+On `Append`, after marshaling the record: if `len(payload) > inlineThreshold` (a named const,
+comfortably under NATS `max_payload`), **upload the marshaled bytes to a JetStream Object
+Store, content-addressed (object-id = `sha256(payload)`), BEFORE appending**; then append a
+small **pointer record** `{ObjectID, Length, CodecVersion}` to the stream in place of the
+inline payload (a distinct wire kind the codec/replayer recognizes — keep the subject/Msg-Id
+fence semantics identical). Set the stream `MaxMsgSize` to a sane inline ceiling; an
+over-threshold record that can't be offloaded → typed `RecordTooLargeError`.
+**Integration test:** a `StepDone` with large block bodies is offloaded — the stream message
+is the small pointer, the object holds the bytes, upload-before-append is proven, and a
+follow-up append still fences (seq advances by exactly 1). Commit
+`feat(journal): whole-record content-addressed object-store offload`.
 
-**Files:** `…/objectstore.go` (sha256 object id; `Put` idempotent; reference
-`{ObjectID, Length, CodecVersion}` embedded into the record).
-**Step 1 (test, integration):** a `StepDone` whose block bodies exceed the threshold → bodies
-uploaded to the JetStream Object Store **before** the event append; the stored event carries
-references; restore re-hydrates byte-for-byte.
-**Steps 2–5:** TDD. Commit: `git commit -m "feat(journal): content-addressed object offload for oversized records"`
+### Task 5.3: `EventReplayer` (read side) + offload rehydration + fail-secure
 
-### Task 5.3: Missing/corrupt object → fail-secure; orphan-GC under lease
-
-**Step 1 (tests, integration):** (a) delete/corrupt an object → restore returns
-`RestoreErrored` (does not come up); (b) an object uploaded then orphaned (event append
-fails) is reaped by GC **only under the lease** and **only past the grace period**; a
-referenced object is never reaped.
-**Steps 2–5:** implement `GC(ctx)` (lease-guarded; grace > max retry interval). Commit:
-`git commit -m "feat(journal): fail-secure on missing/corrupt object; lease-guarded orphan-GC"`
+**Files:** `internal/agent/session/journal/replay.go` (+ integration test).
+Implement `EventReplayer.Open(ctx, ReplayRequest) (EventCursor, error)`: open a consumer /
+ordered fetch over the request's scope — **event subjects only** (`…session` + a loop's
+`…loop.<lid>.event`; exclude `.cmd`/`.fence` via `IsEventSubject`) — in **sequence order**;
+`Next` decodes each record to `event.Event`. For a **pointer record**: fetch the object,
+**verify `sha256` == object-id**, then decode — a **missing or hash-mismatched object is
+fail-secure** (typed `ObjectMissingError` / `ObjectCorruptError`; Phase 8 restore maps these
+to `RestoreErrored`). Support `From: Beginning | FromSeq(n)`, `Follow:false` (cold restore —
+`io.EOF` at backlog end). **Integration test:** append inline + offloaded events → replay
+reconstructs them in-order byte-for-byte; a deleted/corrupted object → the typed fail-secure
+error. Commit `feat(journal): EventReplayer with object rehydration + fail-secure`.
 
 ---
 
@@ -451,6 +462,18 @@ appends if a later fence with a higher epoch is observed; old owner stops refres
 stale owner A append now fails the fence **on any subject**; B does not start loop work until
 the `LeaseFence` ack.
 **Steps 2–5:** TDD. Commit: `git commit -m "feat(journal): LeaseFence handover boundary (first append, gates loop start)"`
+
+### Task 6.3: orphan-GC under the session lease (moved from Phase 5)
+
+**Files:** `internal/agent/session/journal/gc.go` (+ integration test). A `GC(ctx)` pass — run
+**only while holding the session lease** (so it never races an active writer) — deletes any
+Object-Store object whose `sha256` is **unreferenced by any pointer record in the stream**
+AND **older than a grace period that exceeds the max upload→append retry interval** (so a
+just-uploaded, about-to-be-referenced object is never reaped). Content-addressing makes it
+idempotent. **Integration test:** an object uploaded then orphaned (append failed) is reaped
+after the grace period under the lease; a referenced object is never reaped; GC invoked
+without holding the lease is refused/no-op. Commit
+`feat(journal): lease-guarded orphan-GC for offload objects`.
 
 ---
 

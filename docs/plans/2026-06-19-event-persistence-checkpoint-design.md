@@ -182,6 +182,18 @@ the original never landed. With expected sequence `N`, **retry the same record**
 
 Never blindly re-append past an ambiguous ack.
 
+> **Validated against the embedded server (Phase 4.5).** The single-node embedded server
+> (`Replicas:1`) evaluates the **expected-last-sequence fence *before* dedup** (vendored
+> `nats-server` non-clustered write path). So a *fenced* retry of an already-stored
+> `Nats-Msg-Id` returns **wrong-last-sequence, not `Duplicate=true`** — the **live "original
+> landed" path in production is the *expected-sequence-conflict → direct-get-`N+1`-verify*
+> branch**, not the `Duplicate=true` branch. The `Duplicate=true` branch is **kept** (it is
+> safe — it re-verifies the tip's id+payload before advancing) for the no-fence/fresh-tip
+> edge and for a future clustered deployment, where dedup is checked *before* the seq fence
+> (opposite order). Implementation: a single bounded retry; not-ours/missing-`N+1` →
+> `FenceViolationError` (the journal-layer error the hub maps to `SessionPersistenceFault`
+> in Phase 7).
+
 **Durability guarantee (power loss).** The embedded FileStore acks a write before its
 periodic fsync (JetStream's default `SyncInterval` is ~2 min), so an ack is durable against
 **process exit** (clean quit, panic, `kill`) but **not** a kernel/power loss — up to one
@@ -224,11 +236,13 @@ MiB per block** with up to 10 000 blocks per slice (`block_json.go:8`), so a `St
 record is effectively unbounded.
 
 Policy: define a **journal record size limit independent of block limits**. Inline records
-stay under a conservative threshold (well below `max_payload`). Above it, **offload block
-bodies to a JetStream Object Store** with **content-addressed ids** (object-id = `sha256`
-of the body, so re-upload is idempotent and dedups), and store the reference in the event:
-`{object-id, length, codec-version}`. **Upload the object before appending the referencing
-event** (no dangling reference). The event append can still fail *after* a successful
+stay under a conservative threshold (well below `max_payload`). Above it — **v1: offload the
+*whole* over-threshold record** (block-level externalization, keeping small metadata
+in-stream, is a future optimization) — put the record's marshaled bytes in a JetStream
+Object Store with a **content-addressed id** (object-id = `sha256` of the bytes, so re-upload
+is idempotent and dedups) and append a small **pointer record** to the stream in its place:
+`{object-id, length, codec-version}`. **Upload the object before appending the pointer
+record** (no dangling reference). The event append can still fail *after* a successful
 upload, so an object can be **orphaned**: a **GC pass — run only while holding the session
 lease** (so it never races an active writer) — deletes any object whose hash is
 unreferenced by any event **and** older than a grace period that **exceeds the maximum
@@ -305,7 +319,13 @@ restored by new code), evolving via additive fields + a `schemaVersion` tag. Bui
   delegating `UserInput` blocks to the existing block codec.
 - A sealed **`tool.PermissionRequest` codec** — `PermissionRequested.Request` is persisted
   **in full** (header-only would panic on replay: `interaction.ApplyEvent` →
-  `promptFromPermission` dereferences it, `prompt.go:54`).
+  `promptFromPermission` dereferences it, `prompt.go:54`). The sealed union must include
+  **every** request case, incl. the SWE swarm's **`tool.SkillLoadRequest`**
+  (`docs/plans/2026-06-21-swe-swarm-roles-design.md` §7a/§16): serialize only its **safe
+  metadata — relative path, agent name, size, SHA-256 — and never the skill body**. Because
+  workspace skill loads are `ScopeOnce` (every load re-prompts), the contents themselves
+  need no config-fingerprint hash. Add a `SkillLoadRequest` round-trip + restore test
+  (metadata/hash survive, body absent); `FuzzDecodeEvent` covers it.
 - `TurnFailed.Err` → a `{kind, message}` projection, reconstructed as a leaf
   `RestoredError` (a typed `error` can't round-trip).
 
