@@ -13,7 +13,6 @@ import (
 	"github.com/inventivepotter/urvi/internal/agent/loop/identity"
 	"github.com/inventivepotter/urvi/internal/agent/session/hub"
 	"github.com/inventivepotter/urvi/internal/content"
-	"github.com/inventivepotter/urvi/internal/llm"
 	"github.com/inventivepotter/urvi/internal/tool"
 	"github.com/inventivepotter/urvi/internal/uuid"
 	"github.com/inventivepotter/urvi/tui/components"
@@ -27,10 +26,6 @@ var _ Agent = (*fakeAgent)(nil)
 // configured reader/error/bool so Screen behavior can be exercised without a real
 // session.
 type fakeAgent struct {
-	streamReader       *llm.StreamReader[event.Event]
-	streamErr          error
-	streamBlocksCalled bool
-
 	// submit recorder: a configured id/error is returned, and the last call's
 	// blocks are captured so a test can assert the wrapper forwarded them. When
 	// submitID is zero it defaults to a fixed deterministic id so callers always get
@@ -72,16 +67,6 @@ type fakeAgent struct {
 	lastCallID    uuid.UUID
 	lastScope     tool.ApprovalScope
 	lastAnswer    string
-}
-
-// streamBlocksCalled records whether the (now-unused-by-Screen) per-turn reader API
-// was invoked, so a test can assert the event transport switched to Subscribe.
-func (f *fakeAgent) StreamBlocks(_ context.Context, _ []content.Block) (*llm.StreamReader[event.Event], error) {
-	f.streamBlocksCalled = true
-	if f.streamErr != nil {
-		return nil, f.streamErr
-	}
-	return f.streamReader, nil
 }
 
 // fixedFakeSubmitID is the deterministic InputID a fakeAgent returns when no
@@ -721,9 +706,8 @@ func TestTerminalEventClearsPromptQueue(t *testing.T) {
 
 // TestSubmitFireAndForgetIdle covers uiSubmit at Idle: NO user row is committed at
 // submit (the optimistic commit is gone — the row is event-driven now), Submit is
-// fired fire-and-forget (NOT StreamBlocks), and the status stays Idle — it flips to
-// Running only when the loop's TurnStarted arrives on the subscription. The composer
-// resets.
+// fired fire-and-forget, and the status stays Idle — it flips to Running only when
+// the loop's TurnStarted arrives on the subscription. The composer resets.
 func TestSubmitFireAndForgetIdle(t *testing.T) {
 	t.Parallel()
 
@@ -747,13 +731,10 @@ func TestSubmitFireAndForgetIdle(t *testing.T) {
 	if m.interaction.input.Value() != "" {
 		t.Errorf("composer = %q, want reset", m.interaction.input.Value())
 	}
-	// Executing the cmd must reach Submit (fire-and-forget), NOT StreamBlocks.
+	// Executing the cmd must reach Submit (fire-and-forget).
 	drainCmd(t, cmd)
 	if !agent.submitCalled {
 		t.Error("Submit not called; the fire-and-forget path must call agent.Submit")
-	}
-	if agent.streamBlocksCalled {
-		t.Error("StreamBlocks called; the event transport switched off the per-turn reader")
 	}
 	if got := firstBlockText(agent.lastSubmitBlocks); got != "hello there" {
 		t.Errorf("Submit blocks text = %q, want %q", got, "hello there")

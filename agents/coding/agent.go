@@ -183,13 +183,6 @@ func newHTTPClient() *http.Client {
 	}
 }
 
-// StreamBlocks delivers a multimodal user message and returns the session's
-// event stream: TurnStarted, TokenDelta×N, one terminal event, then EOF.
-// Callers must read to EOF or call sr.Close().
-func (c *Coding) StreamBlocks(ctx context.Context, blocks []content.Block) (*llm.StreamReader[event.Event], error) {
-	return c.session.Stream(ctx, blocks)
-}
-
 // Submit delivers a multimodal user message FIRE-AND-FORGET as a queueable
 // (AllowFold) UserInput and returns the InputID — the Cause.CommandID the resulting
 // Reply events (InputQueued / TurnStarted / TurnFoldedInto / TurnRejected /
@@ -204,8 +197,7 @@ func (c *Coding) Submit(ctx context.Context, blocks []content.Block) (uuid.UUID,
 // Subscribe attaches a whole-session event consumer to the session fan-in with
 // filter and returns its event.Subscription (the session hub's *EventSubscription,
 // which satisfies the interface). It is the seam a TUI/CLI uses to observe events
-// across the whole session — every loop (including subagent loops), spanning turns
-// — distinct from the per-turn StreamBlocks reader that closes when one turn ends.
+// across the whole session — every loop (including subagent loops), spanning turns.
 // The caller Closes the returned subscription when done.
 func (c *Coding) Subscribe(filter event.EventFilter) (event.Subscription, error) {
 	return c.session.SubscribeEvents(filter)

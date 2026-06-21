@@ -5,7 +5,6 @@ package coding
 import (
 	"context"
 	"errors"
-	"io"
 	"os"
 	"strings"
 	"testing"
@@ -16,35 +15,66 @@ import (
 	"github.com/inventivepotter/urvi/internal/eval"
 	"github.com/inventivepotter/urvi/internal/llm"
 	"github.com/inventivepotter/urvi/internal/llm/auto"
+	"github.com/inventivepotter/urvi/internal/uuid"
 )
 
-// togoRunner adapts the live Togo agent to eval.Runner: it streams one turn for
-// the input prompt and projects the terminal TurnDone.Message to text (reusing
-// agents/coding/subagent_factory.go's aiMessageText projection — this test is in
-// package coding, so the unexported helper is in scope).
+// errTurnInterrupted is the eval-harness sentinel for a turn whose context was
+// cancelled (event.TurnInterrupted carries no typed cause to forward).
+var errTurnInterrupted = errors.New("turn interrupted")
+
+// togoRunner adapts the live Togo agent to eval.Runner: it runs one turn for the
+// input prompt over the session subscription transport and projects the terminal
+// TurnDone.Message to text (reusing agents/coding/subagent_factory.go's
+// aiMessageText projection — this test is in package coding, so the unexported
+// helper is in scope).
 type togoRunner struct{ agent *Coding }
 
-// Run streams a single turn for input and returns the terminal assistant text.
-// It drains the StreamReader by calling Next until io.EOF (the end-of-stream
-// sentinel documented in internal/llm/stream.go), capturing the last TurnDone.
+// Run subscribes to the session fan-in, submits a single turn fire-and-forget, and
+// drains the subscription to that turn's terminal, returning the terminal assistant
+// text. It subscribes BEFORE submitting so no event is missed, correlates by the
+// submit command id (TurnStarted.Cause.CommandID == id) to capture the turn id, then
+// returns the latest TurnDone.Message for that turn; TurnFailed/TurnInterrupted map
+// to an error. Enduring/all-loop scope is enough — every terminal is Enduring — and
+// avoids importing the tui package for its DefaultEventFilter.
 func (r togoRunner) Run(ctx context.Context, input string) (string, error) {
-	sr, err := r.agent.StreamBlocks(ctx, []content.Block{&content.TextBlock{Text: input}})
+	sub, err := r.agent.Subscribe(event.EventFilter{Enduring: event.LoopScope{All: true}})
 	if err != nil {
 		return "", err
 	}
-	defer func() { _ = sr.Close() }()
+	defer func() { _ = sub.Close() }()
 
-	var out string
+	id, err := r.agent.Submit(ctx, []content.Block{&content.TextBlock{Text: input}})
+	if err != nil {
+		return "", err
+	}
+
+	var turnID uuid.UUID // captured from this submit's TurnStarted; zero until then
 	for {
-		ev, err := sr.Next()
-		if errors.Is(err, io.EOF) {
-			return out, nil
-		}
-		if err != nil {
-			return "", err
-		}
-		if done, ok := ev.(event.TurnDone); ok {
-			out = aiMessageText(done.Message) // reuse the package-internal projection
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		case ev, ok := <-sub.Events():
+			if !ok {
+				return "", sub.Err() // hub-forced loss (or nil on intentional close)
+			}
+			switch e := ev.(type) {
+			case event.TurnStarted:
+				if e.Cause.CommandID == id {
+					turnID = e.TurnID
+				}
+			case event.TurnDone:
+				if !turnID.IsZero() && e.TurnID == turnID {
+					return aiMessageText(e.Message), nil
+				}
+			case event.TurnFailed:
+				if !turnID.IsZero() && e.TurnID == turnID {
+					return "", e.Err
+				}
+			case event.TurnInterrupted:
+				if !turnID.IsZero() && e.TurnID == turnID {
+					return "", errTurnInterrupted
+				}
+			}
 		}
 	}
 }

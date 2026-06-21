@@ -5,7 +5,6 @@ import (
 
 	"github.com/inventivepotter/urvi/internal/agent/loop/event"
 	"github.com/inventivepotter/urvi/internal/content"
-	"github.com/inventivepotter/urvi/internal/llm"
 	"github.com/inventivepotter/urvi/internal/tool"
 	"github.com/inventivepotter/urvi/internal/uuid"
 )
@@ -21,7 +20,6 @@ type EventStream = event.Subscription
 // Agent is the narrow surface the TUI drives. *coding.Coding satisfies it
 // structurally; the TUI never imports any agent package.
 type Agent interface {
-	StreamBlocks(ctx context.Context, blocks []content.Block) (*llm.StreamReader[event.Event], error)
 	// Submit sends input fire-and-forget as a queueable UserInput; the returned
 	// InputID correlates the Reply events (Cause.CommandID) that report the outcome.
 	Submit(ctx context.Context, blocks []content.Block) (uuid.UUID, error)
@@ -36,12 +34,9 @@ type Agent interface {
 
 	// Subscribe attaches a whole-session event consumer to the agent's session
 	// fan-in with the given filter and returns its EventStream. It is the seam the
-	// TUI uses to observe events across the entire session (every loop), distinct
-	// from the per-turn StreamBlocks reader: the per-turn reader closes when one
-	// turn ends, whereas a session subscription spans turns and loops. The caller
-	// must Close the returned stream when done. Use DefaultEventFilter for the
-	// single-loop TUI default. The full transport switch from the per-turn reader
-	// to this subscription is owned by the separate TUI-adoption spec.
+	// TUI uses to observe events across the entire session (every loop): a session
+	// subscription spans turns and loops. The caller must Close the returned stream
+	// when done. Use DefaultEventFilter for the single-loop TUI default.
 	Subscribe(filter event.EventFilter) (EventStream, error)
 
 	// Approve resolves a pending tool-call permission gate, granting it at the
