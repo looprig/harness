@@ -54,6 +54,36 @@ func WithCommandAppender(a commandAppender) Option {
 	}
 }
 
+// WithSessionID injects an externally-minted sessionID for New to adopt instead of
+// minting its own. It resolves the journal chicken-and-egg: the durable journal needs
+// the sessionID (to bind the per-session stream and write the opening LeaseFence)
+// BEFORE the session exists, so the composition root mints the id first, builds the
+// journal/lease/appenders from it, then hands the SAME id to New here. A zero id is
+// ignored (New mints one) so a wiring slip can never produce a zero-id session. Restore
+// takes the sessionID positionally and ignores this option.
+func WithSessionID(id uuid.UUID) Option {
+	return func(s *Session) {
+		if !id.IsZero() {
+			s.injectedSessionID = id
+		}
+	}
+}
+
+// WithEventAppender injects the hub's REQUIRED durable event tap (the composition
+// root's adapter over SessionJournal — journal.JournalEventAppender). New forwards it
+// into the hub (hub.WithAppender) so every Enduring event is durably appended before
+// fan-out (fail-secure: an append failure faults the session). A nil appender is ignored
+// (the hub's nop default stays installed) so a caller can never null out the tap and
+// silently persist nothing. This is the event-side counterpart to WithCommandAppender
+// (the audit-only intent log).
+func WithEventAppender(a eventAppender) Option {
+	return func(s *Session) {
+		if a != nil {
+			s.injectedEventAppender = a
+		}
+	}
+}
+
 // WithAllowConfigMismatch is the restore-only opt-in to resume a session whose
 // persisted config fingerprint no longer matches the live config (a different model,
 // system prompt, or tool policy). Restore is fail-secure by DEFAULT — a mismatch

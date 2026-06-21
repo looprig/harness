@@ -175,6 +175,34 @@ type Session struct {
 	// config. It is read ONLY by Restore (before the session comes up); New never
 	// consults it. Default false = fail-secure (a mismatch rejects the restore).
 	allowConfigMismatch bool
+
+	// injectedSessionID is the externally-minted sessionID the composition root supplies
+	// via WithSessionID, read ONLY by newSession to resolve the journal chicken-and-egg:
+	// the journal needs the sid before session construction, so the composition root mints
+	// it first, builds the journal/lease/appenders from it, then passes it in here. Zero
+	// (the default, no option) means New mints its own. It is never consulted by Restore
+	// (which already takes the sessionID as a positional argument).
+	injectedSessionID uuid.UUID
+
+	// injectedEventAppender is the hub's REQUIRED durable tap the composition root supplies
+	// via WithEventAppender, read ONLY by newSession when it builds the hub: the journal's
+	// JournalEventAppender wired as hub.WithAppender so every Enduring event is appended
+	// before fan-out (fail-secure). Nil (the default, no option) leaves the hub's nop
+	// appender installed — headless/no-persistence mode is unchanged. Restore builds its
+	// own appender from the journal it constructs, so it does not read this.
+	injectedEventAppender eventAppender
+}
+
+// eventAppender is the session's narrow view of the hub's REQUIRED durable event tap:
+// append one Enduring event to the durable journal, returning a typed error if it did
+// not commit. The session holds it only to FORWARD it into the hub at construction
+// (hub.WithAppender); the session never calls AppendEvent itself (the hub owns the
+// durable tap). It mirrors the hub's own unexported eventAppender method-set, so the
+// concrete journal.JournalEventAppender satisfies both structurally and the session
+// never imports the journal's appender type. Defined here (where it is consumed) per
+// Dependency Inversion, exactly like commandAppender.
+type eventAppender interface {
+	AppendEvent(ctx context.Context, ev event.Event) error
 }
 
 // loopHandle is the session's registry entry: the loop's channel handle, the
@@ -507,9 +535,28 @@ func newSession(ctx context.Context, cfg loop.Config, newID idGenerator, now eve
 	default:
 	}
 
-	id, err := newID()
-	if err != nil {
-		return nil, &SessionError{Kind: SessionIDGenerationFailed, Cause: err}
+	// Resolve the composition-root options on a probe BEFORE minting the session id, so
+	// WithSessionID can be consulted to adopt an externally-minted id (the journal
+	// chicken-and-egg) instead of minting one here. The same opts are re-applied to the
+	// real session below so the other injections (WithCommandAppender/WithEventAppender)
+	// take effect on it. A probe (not the real session) is used because the id and the
+	// hub must be built from the resolved values, before the struct is finalized.
+	probe := &Session{}
+	for _, opt := range opts {
+		opt(probe)
+	}
+
+	// SessionID: adopt the externally-minted id when WithSessionID supplied a non-zero
+	// one (so the composition root's journal and this session share the same id); else
+	// mint one. The id-gen path is preserved for the no-injection case so a crypto/rand
+	// failure still fails New closed.
+	id := probe.injectedSessionID
+	if id.IsZero() {
+		minted, err := newID()
+		if err != nil {
+			return nil, &SessionError{Kind: SessionIDGenerationFailed, Cause: err}
+		}
+		id = minted
 	}
 
 	sessionCtx, sessionCancel := context.WithCancel(ctx)
@@ -524,9 +571,10 @@ func newSession(ctx context.Context, cfg loop.Config, newID idGenerator, now eve
 		// The composition root (Phase 10) overrides it via WithCommandAppender below.
 		cmdAppender: nopCommandAppender{},
 	}
-	// Apply optional dependency injections (e.g. WithCommandAppender) before any
-	// command can be dispatched, so an injected appender is in effect from the first
-	// dispatch. A nil appender option is ignored (the nop default stays installed).
+	// Apply optional dependency injections (e.g. WithCommandAppender, WithEventAppender)
+	// before any command can be dispatched or the hub is built, so an injected appender is
+	// in effect from the first dispatch/publish. A nil appender option is ignored (the nop
+	// default stays installed). WithSessionID is a no-op here (already consumed above).
 	for _, opt := range opts {
 		opt(s)
 	}
@@ -539,10 +587,17 @@ func newSession(ctx context.Context, cfg loop.Config, newID idGenerator, now eve
 	// FaultReporter (fail-secure: on a required-durable-append failure the hub calls
 	// s.ReportFault). The hub shares the session's Factory so a hub-synthesized
 	// session event (SessionActive/Idle/Stopped) is stamped from the same pinned
-	// newID/now seam as the session's own events. The durable appender is left at the
-	// hub's nop default here; the composition root (Phase 10) injects the real one
-	// wrapping the SessionJournal — wiring an actual journal into New is out of scope.
-	s.hub = hub.New(id, hub.WithFactory(s.factory), hub.WithFaultReporter(s))
+	// newID/now seam as the session's own events. The durable event tap is the injected
+	// appender (WithEventAppender) when the composition root supplied one — wrapping the
+	// SessionJournal so every Enduring event is appended before fan-out — else the hub's
+	// nop default (headless/no-persistence). A nil appender is passed through to
+	// hub.WithAppender, which ignores it (the nop default stays), so the no-injection
+	// path is unchanged.
+	hubOpts := []hub.Option{hub.WithFactory(s.factory), hub.WithFaultReporter(s)}
+	if s.injectedEventAppender != nil {
+		hubOpts = append(hubOpts, hub.WithAppender(s.injectedEventAppender))
+	}
+	s.hub = hub.New(id, hubOpts...)
 
 	// SessionStarted is an Enduring, session-scoped event: stamp it with a minted
 	// EventID + CreatedAt so the journal sees a stable idempotency key and creation
