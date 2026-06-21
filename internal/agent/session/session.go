@@ -521,6 +521,26 @@ func (s *Session) interruptLoop(l *loop.Loop) {
 	}
 }
 
+// interruptLoopID interrupts a SPECIFIC loop's active turn by id (machine-originated,
+// fire-and-forget). It resolves loopID then delegates to interruptLoop. Returns
+// SessionLoopNotFound if no such loop is registered. It is the per-loop lever the
+// subagent drain uses as a fail-safe (drainToFinalText, later task), and the
+// loop-targeted counterpart to the distributed Session.Interrupt.
+//
+// There is deliberately no ctx parameter: interruptLoop is best-effort and already
+// escapes on the loop's Done, and the drain calls this on its own ctx.Done(), so a
+// ctx here would arrive already-cancelled and useless. Like interruptLoop the send
+// stays Agency=AgencyMachine (the zero value) — a programmatic per-loop interrupt is
+// a machine action, never falsely attributed to a human.
+func (s *Session) interruptLoopID(loopID uuid.UUID) error {
+	l, ok := s.loopFor(loopID)
+	if !ok {
+		return &SessionError{Kind: SessionLoopNotFound}
+	}
+	s.interruptLoop(l)
+	return nil
+}
+
 // Submit is the HUMAN-ONLY submit entry point: it stamps Agency=AgencyUser (a
 // person authored this input). Programmatic/machine callers use Invoke
 // (StartOnly), which stays Agency=AgencyMachine.

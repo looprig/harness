@@ -1757,6 +1757,73 @@ func TestInterruptReachesEveryLoop(t *testing.T) {
 	}
 }
 
+// TestInterruptLoopIDTargetsRightLoop is the point of Task 10: interruptLoopID is
+// the per-loop, machine-originated interrupt the subagent drain uses as a fail-safe.
+// It must resolve the addressed loop id and send a command.Interrupt to THAT loop —
+// the SUB-loop B here, never the primary A — carrying Agency=AgencyMachine (a
+// programmatic action, not a human pressing interrupt). With two fake loops, the
+// only way to prove correct routing is that B's command channel receives the
+// Interrupt while A's does not, and that the Header.Agency is the machine zero value.
+func TestInterruptLoopIDTargetsRightLoop(t *testing.T) {
+	t.Parallel()
+	s, _, subLoopID, cmdsA, cmdsB := sessionWithTwoFakeLoops()
+
+	errCh := make(chan error, 1)
+	go func() { errCh <- s.interruptLoopID(subLoopID) }()
+
+	select {
+	case cmd := <-cmdsB:
+		ic, ok := cmd.(command.Interrupt)
+		if !ok {
+			t.Fatalf("sub-loop B received %T, want command.Interrupt", cmd)
+		}
+		if ic.Header.CommandID.IsZero() {
+			t.Fatalf("Interrupt CommandID is zero, want a fresh id")
+		}
+		if ic.Header.Agency != identity.AgencyMachine {
+			t.Errorf("interruptLoopID Header.Agency = %v, want AgencyMachine (programmatic per-loop interrupt)", ic.Header.Agency)
+		}
+	case cmd := <-cmdsA:
+		t.Fatalf("primary loop A received %T, but interruptLoopID(subLoopID) must target the SUB-loop, never the primary", cmd)
+	case <-time.After(2 * time.Second):
+		t.Fatal("interruptLoopID never sent an Interrupt to the addressed sub-loop")
+	}
+
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("interruptLoopID returned %v, want nil", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("interruptLoopID never returned after the Interrupt was delivered")
+	}
+}
+
+// TestInterruptLoopIDUnknownID covers the fail-secure miss: interruptLoopID against
+// an id with no registry entry must return *SessionError{SessionLoopNotFound} and
+// send no command (the registered loops' channels stay empty).
+func TestInterruptLoopIDUnknownID(t *testing.T) {
+	t.Parallel()
+	s, _, _, cmdsA, cmdsB := sessionWithTwoFakeLoops()
+
+	err := s.interruptLoopID(mustUUID()) // an id no loop is registered under
+	var se *SessionError
+	if !errors.As(err, &se) || se.Kind != SessionLoopNotFound {
+		t.Fatalf("interruptLoopID(unknown) err = %v, want *SessionError{SessionLoopNotFound}", err)
+	}
+
+	// No command may have been sent to either registered loop: the channels are
+	// unbuffered and never read, so a send would have blocked. A non-blocking
+	// receive must miss on both.
+	select {
+	case cmd := <-cmdsA:
+		t.Fatalf("interruptLoopID(unknown) sent %T to loop A, want no command", cmd)
+	case cmd := <-cmdsB:
+		t.Fatalf("interruptLoopID(unknown) sent %T to loop B, want no command", cmd)
+	default:
+	}
+}
+
 // TestShutdownClosesAllRealLoopsAndLatchesClosing drives a real two-loop session
 // to shutdown and asserts the whole-session teardown contract:
 //
