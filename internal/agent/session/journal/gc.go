@@ -117,7 +117,10 @@ func (e *GCDeleteError) Unwrap() error { return e.Cause }
 // window), and how many orphans were reaped. The counts let a caller log/observe a
 // pass without re-deriving them.
 type GCResult struct {
-	// Scanned is the number of objects the bucket held at the start of the pass.
+	// Scanned is the raw length of the object list the bucket returned at the start of
+	// the pass. It is the unfiltered list length: any nil entry the store returns is
+	// counted here but skipped by reap, so Scanned may exceed Referenced+WithinGrace+
+	// Deleted.
 	Scanned int
 	// Referenced is the number of objects still referenced by an in-stream pointer.
 	Referenced int
@@ -203,8 +206,8 @@ const gcScanTimeout = 30 * time.Second
 const gcFetchTimeout = 2 * time.Second
 
 // GC runs one orphan-GC pass under the held lease. It (1) refuses unless the lease is
-// valid — GC deletes, so it must be the single writer; (2) scans the session stream's
-// EVENT subjects for pointer records and builds the set of referenced object ids; (3)
+// valid — GC deletes, so it must be the single writer; (2) scans EVERY subject of the
+// session stream for pointer records and builds the set of referenced object ids; (3)
 // lists the per-session object bucket and deletes each object that is BOTH unreferenced
 // AND older than the grace window (now - ModTime > gcGraceWindow). It returns a summary
 // of the pass. Every failure is a typed fail-closed error; on a scan/list failure it
@@ -290,24 +293,31 @@ func (g *ObjectGC) listObjects(ctx context.Context) ([]*nats.ObjectInfo, error) 
 	return objs, nil
 }
 
-// collectReferenced scans the session stream's EVENT subjects (pointers only ever
-// appear on event subjects) and builds the set of object ids referenced by an in-stream
-// pointer record — read from each message's Urvi-Object-Id header (no body decode, no
-// object fetch: GC must NOT rehydrate, or a deliberately-orphaned object would make the
-// scan fail). It binds its own ephemeral AckNone pull consumer over the same subject
-// filter the replayer uses, walks the backlog to the Open-time tip, and returns the id
-// set. It fails closed with a *GCScanError on any non-benign failure: an incomplete
-// referenced set could orphan a live object.
+// collectReferenced scans the WHOLE session stream (every subject) and builds the set of
+// object ids referenced by an in-stream pointer record — read from each message's
+// Urvi-Object-Id header (no body decode, no object fetch: GC must NOT rehydrate, or a
+// deliberately-orphaned object would make the scan fail). The scan scope is tied to the
+// writer's OFFLOAD scope: the writer offloads any over-threshold record by size
+// regardless of record kind (buildMessage), so a pointer can land on a .cmd subject (a
+// large UserInput/SubagentResult) just as on an .event one — GC must therefore scan every
+// subject a pointer can land on (events AND commands), not events alone, or it would
+// classify a still-referenced object as an orphan and reap it. Fence records carry no
+// Urvi-Object-Id header and are harmlessly scanned. It binds its own ephemeral AckNone
+// pull consumer over the all-subjects wildcard, walks the backlog to the Open-time tip,
+// and returns the id set. It fails closed with a *GCScanError on any non-benign failure:
+// an incomplete referenced set could orphan a live object.
 func (g *ObjectGC) collectReferenced(ctx context.Context) (map[string]struct{}, error) {
 	stream := StreamName(g.sessionID)
 
 	scanCtx, cancel := context.WithTimeout(ctx, gcScanTimeout)
 	defer cancel()
 
-	filters := eventSubjectFilters(g.sessionID, uuid.UUID{}) // all loops' events + session events.
+	// Single '>' wildcard over the whole session: events, commands, AND fences. The scan
+	// scope must cover every subject the writer can offload a pointer onto (see doc above).
+	filter := allSessionSubjects(g.sessionID)
 	sub, err := g.js.PullSubscribe("", "",
 		nats.BindStream(stream),
-		nats.ConsumerFilterSubjects(filters...),
+		nats.ConsumerFilterSubjects(filter),
 		nats.AckNone(),
 		nats.DeliverAll(),
 		nats.InactiveThreshold(replayInactiveThreshold),

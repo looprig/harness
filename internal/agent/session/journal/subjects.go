@@ -118,6 +118,18 @@ func FenceSubject(sessionID uuid.UUID) string {
 	return subjectRoot + "." + sessionID.String() + "." + leafFence
 }
 
+// allSessionSubjects returns the single '>' wildcard matching EVERY subject in a
+// session's stream: "urvi.session.<sid>.>". Unlike allLoopsEventSubject (events only),
+// this captures session events, loop events, loop commands AND fences — every subject a
+// pointer record can land on. It is orphan-GC's reference-scan filter: the writer
+// offloads any over-threshold record by size regardless of kind (buildMessage), so an
+// offload pointer can appear on a .cmd subject just as on an .event one, and GC must see
+// them all to know the full referenced set. It is built from the constant root + session
+// id so the filter cannot drift from what the writer emits.
+func allSessionSubjects(sessionID uuid.UUID) string {
+	return subjectRoot + "." + sessionID.String() + ".>"
+}
+
 // loopSubjectPrefix returns "urvi.session.<sid>.loop.<lid>", the shared head of
 // every loop-scoped subject.
 func loopSubjectPrefix(sessionID, loopID uuid.UUID) string {
