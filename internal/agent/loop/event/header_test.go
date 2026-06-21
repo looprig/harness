@@ -1,7 +1,9 @@
 package event_test
 
 import (
+	"encoding/json"
 	"testing"
+	"time"
 
 	"github.com/inventivepotter/urvi/internal/agent/loop/event"
 	"github.com/inventivepotter/urvi/internal/agent/loop/identity"
@@ -25,6 +27,9 @@ func TestEventClass(t *testing.T) {
 		{"SessionActive enduring", event.SessionActive{}, event.Enduring},
 		{"SessionIdle enduring", event.SessionIdle{}, event.Enduring},
 		{"SessionStopped enduring", event.SessionStopped{}, event.Enduring},
+		{"RestoreStarted enduring", event.RestoreStarted{}, event.Enduring},
+		{"RestoreDone enduring", event.RestoreDone{}, event.Enduring},
+		{"RestoreErrored enduring", event.RestoreErrored{}, event.Enduring},
 		{"LoopIdle enduring", event.LoopIdle{}, event.Enduring},
 		{"TurnStarted enduring", event.TurnStarted{}, event.Enduring},
 		{"StepDone enduring", event.StepDone{}, event.Enduring},
@@ -72,6 +77,9 @@ func TestEventEndsTurn(t *testing.T) {
 		{"SessionActive does not end turn", event.SessionActive{}, false},
 		{"SessionIdle does not end turn", event.SessionIdle{}, false},
 		{"SessionStopped does not end turn", event.SessionStopped{}, false},
+		{"RestoreStarted does not end turn", event.RestoreStarted{}, false},
+		{"RestoreDone does not end turn", event.RestoreDone{}, false},
+		{"RestoreErrored does not end turn", event.RestoreErrored{}, false},
 		{"PermissionRequested does not end turn", event.PermissionRequested{}, false},
 		{"UserInputRequested does not end turn", event.UserInputRequested{}, false},
 		{"ToolCallStarted does not end turn", event.ToolCallStarted{}, false},
@@ -100,6 +108,9 @@ func TestEventScope(t *testing.T) {
 		{"SessionActive session-scoped", event.SessionActive{}, event.ScopeSession},
 		{"SessionIdle session-scoped", event.SessionIdle{}, event.ScopeSession},
 		{"SessionStopped session-scoped", event.SessionStopped{}, event.ScopeSession},
+		{"RestoreStarted session-scoped", event.RestoreStarted{}, event.ScopeSession},
+		{"RestoreDone session-scoped", event.RestoreDone{}, event.ScopeSession},
+		{"RestoreErrored session-scoped", event.RestoreErrored{}, event.ScopeSession},
 		{"LoopIdle loop-scoped", event.LoopIdle{}, event.ScopeLoop},
 		{"TokenDelta loop-scoped", event.TokenDelta{}, event.ScopeLoop},
 		{"TurnStarted loop-scoped", event.TurnStarted{}, event.ScopeLoop},
@@ -176,6 +187,42 @@ func TestEventHeaderRoundTrip(t *testing.T) {
 			ev := event.StepDone{Header: tt.hdr}
 			if got := ev.EventHeader(); got != tt.hdr {
 				t.Errorf("EventHeader() = %+v, want %+v", got, tt.hdr)
+			}
+		})
+	}
+}
+
+// TestHeaderCreatedAt asserts Header.CreatedAt survives a JSON round-trip and is
+// surfaced verbatim by EventHeader() — the creation timestamp every Enduring
+// event must carry into the journal.
+func TestHeaderCreatedAt(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+		ts   time.Time
+	}{
+		{name: "non-zero UTC timestamp", ts: time.Date(2026, 6, 21, 15, 0, 0, 0, time.UTC)},
+		{name: "zero time is boundary", ts: time.Time{}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			hdr := event.Header{CreatedAt: tt.ts}
+
+			data, err := json.Marshal(hdr)
+			if err != nil {
+				t.Fatalf("json.Marshal(Header) err = %v", err)
+			}
+			var got event.Header
+			if err := json.Unmarshal(data, &got); err != nil {
+				t.Fatalf("json.Unmarshal(Header) err = %v", err)
+			}
+			if !got.CreatedAt.Equal(tt.ts) {
+				t.Errorf("round-trip CreatedAt = %v, want %v", got.CreatedAt, tt.ts)
+			}
+			ev := event.StepDone{Header: hdr}
+			if !ev.EventHeader().CreatedAt.Equal(tt.ts) {
+				t.Errorf("EventHeader().CreatedAt = %v, want %v", ev.EventHeader().CreatedAt, tt.ts)
 			}
 		})
 	}

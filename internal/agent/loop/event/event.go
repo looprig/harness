@@ -1,6 +1,8 @@
 package event
 
 import (
+	"time"
+
 	"github.com/inventivepotter/urvi/internal/agent/loop/identity"
 	"github.com/inventivepotter/urvi/internal/uuid"
 )
@@ -77,6 +79,10 @@ type Header struct {
 	// wiring is sequenced after the journal follow-on.
 	EventID uuid.UUID `json:"event_id,omitzero"`
 
+	// CreatedAt is when this event was created (minted at creation, not delivery).
+	// It is the journal's creation timestamp for every Enduring event.
+	CreatedAt time.Time `json:"created_at,omitzero"`
+
 	// Cause is the direct cause of this event. For UserInput/SubagentResult
 	// resolution events (TurnStarted, TurnFoldedInto, InputCancelled, InputQueued,
 	// TurnRejected), Cause.CommandID is the submit command id. For an event caused by
@@ -147,11 +153,15 @@ func (loopScoped) Scope() Scope { return ScopeLoop }
 type TurnIndex int
 
 // SessionStarted is published when the session's primary loop actor starts.
-// Header.SessionID is set; LoopID/TurnID/StepID are zero.
+// Header.SessionID is set; LoopID/TurnID/StepID are zero. Config is the fingerprint
+// of the agent configuration the session started under (model/system-prompt/tool
+// policy), stamped at construction so a durable journal can detect a config change
+// on restore.
 type SessionStarted struct {
 	enduring
 	sessionScoped
 	Header
+	Config ConfigFingerprint `json:"config,omitzero"`
 }
 
 // SessionActive marks the Idle -> Active edge of the session quiescence model.
@@ -173,6 +183,41 @@ type SessionStopped struct {
 	enduring
 	sessionScoped
 	Header
+}
+
+// RestoreStarted marks the beginning of a session restore from the durable
+// journal. Like SessionStarted it is session-scoped and Enduring (an
+// authoritative session-lifecycle transition, never a turn-ender); Header.SessionID
+// is set, LoopID/TurnID/StepID are zero.
+type RestoreStarted struct {
+	enduring
+	sessionScoped
+	Header
+}
+
+// RestoreDone marks a successful end of a session restore from the durable
+// journal — the session is reconstructed and ready to resume. It is session-scoped
+// and Enduring; Header.SessionID is set, LoopID/TurnID/StepID are zero.
+type RestoreDone struct {
+	enduring
+	sessionScoped
+	Header
+}
+
+// RestoreErrored marks a failed session restore from the durable journal. Err
+// carries the typed cause; like TurnFailed.Err an error value cannot round-trip
+// through encoding/json, so it is tagged json:"-" — callers read it in-memory via
+// errors.As, and the durable codec's projection lands in a later phase. It is
+// session-scoped and Enduring; Header.SessionID is set, LoopID/TurnID/StepID are
+// zero.
+type RestoreErrored struct {
+	enduring
+	sessionScoped
+	Header
+	// Err is the typed cause of the restore failure; tagged json:"-" because an
+	// error value has no stable codec (mirrors TurnFailed.Err). Callers inspect it
+	// in-memory via errors.As; a journal records the failure via the event itself.
+	Err error `json:"-"`
 }
 
 // LoopIdle is emitted when a loop parks with no active turn. Header.SessionID and
@@ -197,5 +242,8 @@ func (SessionStarted) isEvent() {}
 func (SessionActive) isEvent()  {}
 func (SessionIdle) isEvent()    {}
 func (SessionStopped) isEvent() {}
+func (RestoreStarted) isEvent() {}
+func (RestoreDone) isEvent()    {}
+func (RestoreErrored) isEvent() {}
 func (LoopIdle) isEvent()       {}
 func (LoopStarted) isEvent()    {}

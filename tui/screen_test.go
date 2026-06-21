@@ -67,6 +67,13 @@ type fakeAgent struct {
 	lastCallID    uuid.UUID
 	lastScope     tool.ApprovalScope
 	lastAnswer    string
+
+	// replay-backlog recorder: backlog is returned verbatim (a restored session's
+	// historical Enduring events for repaint; nil for a NEW session), replayErr is the
+	// configured failure, and replayCalled records that the restore seam was exercised.
+	backlog      []event.Event
+	replayErr    error
+	replayCalled bool
 }
 
 // fixedFakeSubmitID is the deterministic InputID a fakeAgent returns when no
@@ -128,6 +135,14 @@ func (f *fakeAgent) ProvideAnswer(_ context.Context, loopID, callID uuid.UUID, a
 	f.lastCallID = callID
 	f.lastAnswer = answer
 	return f.answerErr
+}
+
+func (f *fakeAgent) ReplayBacklog(_ context.Context) ([]event.Event, error) {
+	f.replayCalled = true
+	if f.replayErr != nil {
+		return nil, f.replayErr
+	}
+	return f.backlog, nil
 }
 
 // fakeSubscription is a test-controlled event.Subscription: a buffered channel a

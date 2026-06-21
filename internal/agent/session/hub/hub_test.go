@@ -3,6 +3,7 @@ package hub
 import (
 	"context"
 	"errors"
+	"reflect"
 	"testing"
 	"time"
 
@@ -462,6 +463,101 @@ func TestExpectTurnCancelExpectTurn(t *testing.T) {
 		t.Fatalf("cancelExpectTurn emptying active did not derive SessionIdle")
 	}
 }
+
+// TestExpectTurnCancelExpectTurnDerivedAppendFailure proves the wake-token operations
+// are fail-secure when the derived session event's durable append fails: nothing is
+// delivered to subscribers, a *SessionPersistenceFault naming the derived event is
+// raised, and no blocked WaitIdle waiter is woken with a false nil. Two cases:
+//   - ExpectTurn while idle derives SessionActive; its append fails.
+//   - CancelExpectTurn emptying active derives SessionIdle; its append fails (the prior
+//     ExpectTurn that took the wake token uses a passing appender path).
+func TestExpectTurnCancelExpectTurnDerivedAppendFailure(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name    string
+		op      string // "expectTurn" or "cancelExpectTurn"
+		wantEv  event.Event
+		blockWI bool // register a blocked WaitIdle that must NOT wake with nil
+	}{
+		{name: "expectTurn idle->active append fails", op: "expectTurn", wantEv: event.SessionActive{}, blockWI: false},
+		{name: "cancelExpectTurn active->idle append fails", op: "cancelExpectTurn", wantEv: event.SessionIdle{}, blockWI: true},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			session := mustID(t)
+			subagent := mustID(t)
+			// Fail ONLY the derived event for this case; any earlier append (the
+			// wake-take SessionActive in the cancel case) succeeds.
+			app := failOnType(tt.wantEv)
+			rep := &recordingReporter{}
+			h := New(session, WithAppender(app), WithFactory(testFactory()), WithFaultReporter(rep))
+			sub, err := h.SubscribeEvents(allFilter())
+			if err != nil {
+				t.Fatalf("SubscribeEvents = %v", err)
+			}
+
+			var waitErr chan error
+			if tt.op == "cancelExpectTurn" {
+				// Take the wake token (idle->active) with a passing append, drain the
+				// delivered SessionActive, then block a WaitIdle before the failing cancel.
+				h.ExpectTurn(context.Background(), subagent)
+				if _, ok := recv(t, sub).(event.SessionActive); !ok {
+					t.Fatalf("setup expectTurn did not derive SessionActive")
+				}
+				ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+				defer cancel()
+				waitErr = make(chan error, 1)
+				go func() { waitErr <- h.WaitIdle(ctx) }()
+				select {
+				case err := <-waitErr:
+					t.Fatalf("WaitIdle returned %v before cancel; should be blocked (Active)", err)
+				case <-time.After(50 * time.Millisecond):
+				}
+				h.CancelExpectTurn(context.Background(), subagent)
+			} else {
+				h.ExpectTurn(context.Background(), subagent)
+			}
+
+			// Nothing delivered for the failed derived event.
+			expectNone(t, sub)
+
+			// The derived event was NOT recorded as appended (its append failed).
+			for _, ev := range app.events() {
+				if eventTypeName(ev) == eventTypeName(tt.wantEv) {
+					t.Errorf("a %T was recorded as appended; its append was supposed to fail", tt.wantEv)
+				}
+			}
+
+			// Exactly one fault, naming the derived event.
+			faults := rep.reported()
+			if len(faults) != 1 {
+				t.Fatalf("reported %d faults, want 1", len(faults))
+			}
+			if eventTypeName(faults[0].Event) != eventTypeName(tt.wantEv) {
+				t.Errorf("fault.Event = %T, want %T (the derived event whose append failed)", faults[0].Event, tt.wantEv)
+			}
+			if !errors.Is(faults[0].Cause, errAppend) {
+				t.Errorf("fault.Cause = %v, want errAppend", faults[0].Cause)
+			}
+
+			// A blocked WaitIdle was NOT woken with a false nil by the failed SessionIdle
+			// append: it must still be blocked (the hub's nop reporter does not release
+			// it, and signalIdleIfEdge ran after — never before — the failed append).
+			if tt.blockWI {
+				select {
+				case err := <-waitErr:
+					t.Fatalf("WaitIdle was woken with %v after a failed SessionIdle append; must stay blocked (no false idle)", err)
+				case <-time.After(50 * time.Millisecond):
+				}
+			}
+		})
+	}
+}
+
+// eventTypeName returns the %T name of an event for type-equality assertions in tables.
+func eventTypeName(ev event.Event) string { return reflect.TypeOf(ev).String() }
 
 // TestHandbackReleaseNoEdge proves a TurnStarted carrying Cause.LoopID
 // removes the {wake} and adds the {loop} key in one step, crossing no emptiness

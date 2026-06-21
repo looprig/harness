@@ -21,6 +21,9 @@ var (
 	_ Event = SessionActive{}
 	_ Event = SessionIdle{}
 	_ Event = SessionStopped{}
+	_ Event = RestoreStarted{}
+	_ Event = RestoreDone{}
+	_ Event = RestoreErrored{}
 
 	// Loop-scoped events.
 	_ Event = LoopIdle{}

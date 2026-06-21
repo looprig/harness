@@ -3,6 +3,7 @@ package command
 import (
 	"encoding/json"
 	"testing"
+	"time"
 
 	"github.com/inventivepotter/urvi/internal/agent/loop/identity"
 	"github.com/inventivepotter/urvi/internal/uuid"
@@ -72,6 +73,51 @@ func TestHeaderPromotedOnCommands(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+// TestCommandHeaderCreatedAt asserts the journal-stamped creation timestamp
+// round-trips through the wire codec and is dropped (omitzero) when zero, mirroring
+// event.Header.CreatedAt. The session stamps CreatedAt at the dispatch boundary so a
+// restored intent-log command carries its creation time.
+func TestCommandHeaderCreatedAt(t *testing.T) {
+	t.Parallel()
+	ts := time.Date(2026, 6, 21, 12, 0, 0, 0, time.UTC)
+	cmd := fixedUUID(0x01)
+	tests := []struct {
+		name string
+		in   Header
+		want string
+	}{
+		{name: "zero created_at omitted", in: Header{CommandID: cmd}, want: `{"command_id":"01010101-0101-0101-0101-010101010101"}`},
+		{
+			name: "created_at serialized when set",
+			in:   Header{CommandID: cmd, CreatedAt: ts},
+			want: `{"command_id":"01010101-0101-0101-0101-010101010101","created_at":"2026-06-21T12:00:00Z"}`,
+		},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			data, err := json.Marshal(tt.in)
+			if err != nil {
+				t.Fatalf("json.Marshal err = %v", err)
+			}
+			if string(data) != tt.want {
+				t.Errorf("json.Marshal = %s, want %s", data, tt.want)
+			}
+			var got Header
+			if err := json.Unmarshal(data, &got); err != nil {
+				t.Fatalf("json.Unmarshal err = %v", err)
+			}
+			if !got.CreatedAt.Equal(tt.in.CreatedAt) {
+				t.Errorf("round-trip CreatedAt = %v, want %v", got.CreatedAt, tt.in.CreatedAt)
+			}
+			if got.CommandID != tt.in.CommandID {
+				t.Errorf("round-trip CommandID = %v, want %v", got.CommandID, tt.in.CommandID)
+			}
+		})
 	}
 }
 

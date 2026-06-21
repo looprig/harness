@@ -7,7 +7,9 @@ package main
 import (
 	"context"
 	"errors"
+	"flag"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -19,8 +21,10 @@ import (
 
 	"github.com/inventivepotter/urvi/agents/coding"
 	"github.com/inventivepotter/urvi/internal/logging"
+	"github.com/inventivepotter/urvi/internal/persistence"
 	"github.com/inventivepotter/urvi/internal/registry"
 	"github.com/inventivepotter/urvi/internal/ttylog"
+	"github.com/inventivepotter/urvi/internal/uuid"
 	"github.com/inventivepotter/urvi/tui"
 )
 
@@ -58,6 +62,76 @@ func agentDisplayName(name string) string {
 // closeTimeout bounds the best-effort teardown Close of the current agent.
 const closeTimeout = 5 * time.Second
 
+// listTimeout bounds the --list catalog read.
+const listTimeout = 10 * time.Second
+
+// startPersistence builds the embedded engine on the default StoreDir and the per-process
+// Persistence context (lease manager + catalog) over it. On any failure it returns a typed
+// error and no engine (so the caller fails loud). The engine and Persistence are owned by
+// main for the whole process; the caller closes the engine at exit.
+func startPersistence() (*persistence.Engine, *coding.Persistence, error) {
+	opts, err := persistence.DefaultEngineOptions()
+	if err != nil {
+		return nil, nil, err
+	}
+	engine, err := persistence.Open(opts)
+	if err != nil {
+		return nil, nil, err
+	}
+	p, err := coding.NewPersistence(engine.JetStream())
+	if err != nil {
+		_ = engine.Close()
+		return nil, nil, err
+	}
+	return engine, p, nil
+}
+
+// listSessions prints the replay-free session catalog (id, status, last-active, title) to
+// w, newest-active first. It is the --list path: it reads the KV index only (no replay, no
+// stream consumer). An empty catalog prints a friendly note rather than nothing.
+func listSessions(ctx context.Context, p *coding.Persistence, w io.Writer) error {
+	lctx, cancel := context.WithTimeout(ctx, listTimeout)
+	defer cancel()
+	metas, err := p.ListSessions(lctx)
+	if err != nil {
+		return err
+	}
+	if len(metas) == 0 {
+		fmt.Fprintln(w, "no sessions yet")
+		return nil
+	}
+	for _, m := range metas {
+		title := m.Title
+		if title == "" {
+			title = "(untitled)"
+		}
+		fmt.Fprintf(w, "%s  %-7s  %s  %s\n",
+			m.SessionID, m.Status, m.LastActiveAt.Format(time.RFC3339), title)
+	}
+	return nil
+}
+
+// openThunk builds the tui.OpenAgent thunk. For the coding agent it returns a closure that
+// opens a PERSISTED session: the FIRST call honors resume (a non-zero id restores that
+// session); every later call (a /clear reopen) starts a fresh new session, so /clear never
+// re-restores the same id. For any other agent it falls back to the registry (unpersisted),
+// preserving the unknown-agent error path. The first-call latch is guarded so a reopen is
+// deterministically a new session.
+func openThunk(name string, reg *registry.Registry[tui.Agent], p *coding.Persistence, resume uuid.UUID) tui.OpenAgent {
+	if name != defaultAgent {
+		return func(c context.Context) (tui.Agent, error) { return reg.Open(c, name) }
+	}
+	var opened bool
+	return func(c context.Context) (tui.Agent, error) {
+		sel := coding.SessionSelector{}
+		if !opened {
+			sel.Resume = resume // only the first open resumes; /clear reopens start fresh
+		}
+		opened = true
+		return coding.NewPersistent(c, p, sel)
+	}
+}
+
 // agentName returns the first non-flag CLI arg, or defaultAgent if none.
 func agentName(args []string) string {
 	for _, a := range args {
@@ -66,6 +140,80 @@ func agentName(args []string) string {
 		}
 	}
 	return defaultAgent
+}
+
+// cliFlags is the parsed CLI invocation: which agent to open, whether to list sessions
+// and exit (--list), and which session to resume (--resume <uuid>; zero = new session).
+type cliFlags struct {
+	agent  string
+	list   bool
+	resume uuid.UUID
+}
+
+// FlagParseError reports a malformed CLI invocation (an unknown flag, a non-UUID
+// --resume value, or the mutually-exclusive --list + --resume combination). It is a
+// typed boundary error: untrusted CLI input is validated here, before any wiring runs.
+type FlagParseError struct {
+	Reason string
+	Cause  error
+}
+
+func (e *FlagParseError) Error() string {
+	if e.Cause != nil {
+		return "cli: " + e.Reason + ": " + e.Cause.Error()
+	}
+	return "cli: " + e.Reason
+}
+func (e *FlagParseError) Unwrap() error { return e.Cause }
+
+// parseFlags parses args (os.Args[1:]) into a cliFlags, validating every value at this
+// boundary: --resume must be a canonical UUID (parsed via uuid.UnmarshalText, fail-closed),
+// and --list and --resume are mutually exclusive (a list-and-resume request is ambiguous).
+// The agent name is the first positional arg after the flags, defaulting to defaultAgent.
+// It uses an isolated FlagSet (ContinueOnError, discarded output) so a bad flag returns a
+// typed error rather than calling os.Exit — making it unit-testable and keeping main the
+// single exit point.
+func parseFlags(args []string) (cliFlags, error) {
+	fs := flag.NewFlagSet("urvi", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	var (
+		list   = fs.Bool("list", false, "list resumable sessions and exit")
+		resume = fs.String("resume", "", "resume the session with this id")
+	)
+	if err := fs.Parse(args); err != nil {
+		return cliFlags{}, &FlagParseError{Reason: "invalid flags", Cause: err}
+	}
+
+	out := cliFlags{agent: defaultAgent, list: *list}
+	if name := fs.Arg(0); name != "" {
+		out.agent = name
+	}
+
+	// Detect whether --resume was explicitly given (vs left at its empty default): an
+	// explicit --resume with an empty/whitespace value is a malformed invocation, rejected
+	// at the boundary rather than silently treated as "no resume".
+	var resumeGiven bool
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "resume" {
+			resumeGiven = true
+		}
+	})
+	if resumeGiven {
+		v := strings.TrimSpace(*resume)
+		if v == "" {
+			return cliFlags{}, &FlagParseError{Reason: "--resume requires a session id"}
+		}
+		var id uuid.UUID
+		if err := id.UnmarshalText([]byte(v)); err != nil {
+			return cliFlags{}, &FlagParseError{Reason: "invalid --resume session id", Cause: err}
+		}
+		out.resume = id
+	}
+
+	if out.list && !out.resume.IsZero() {
+		return cliFlags{}, &FlagParseError{Reason: "--list and --resume are mutually exclusive"}
+	}
+	return out, nil
 }
 
 // buildRegistry returns the agent registry with the built-in agents registered.
@@ -107,7 +255,12 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	name := agentName(os.Args[1:])
+	flags, ferr := parseFlags(os.Args[1:])
+	if ferr != nil {
+		fmt.Fprintln(os.Stderr, ferr)
+		os.Exit(2)
+	}
+	name := flags.agent
 
 	// Open the shared log file and build the injected structured logger up front so
 	// startup and early failures are captured. slog and the later stderr redirect
@@ -124,8 +277,41 @@ func main() {
 
 	reg := buildRegistry()
 
-	// open is the OpenAgent thunk: the TUI uses it to (re)open the agent on /clear.
-	open := func(c context.Context) (tui.Agent, error) { return reg.Open(c, name) }
+	// Start the embedded JetStream engine (in-process, no TCP) over the persistent
+	// StoreDir under the user data dir. This is what turns persistence on in the real CLI:
+	// the session journal writes through this engine's JetStreamContext. The engine
+	// outlives every agent (a /clear reopens a fresh session against the same engine) and
+	// is shut down cleanly at process exit. A failure to start fails loud (persistence is
+	// the point) — but only the coding agent is journaled; other agents run unpersisted.
+	engine, persist, perr := startPersistence()
+	if perr != nil {
+		logger.Error("start persistence engine failed", "err", perr.Error())
+		fmt.Fprintln(os.Stderr, "persistence:", perr)
+		os.Exit(1)
+	}
+	defer func() {
+		if engine != nil {
+			if cerr := engine.Close(); cerr != nil {
+				logger.Warn("embedded engine close error", "err", cerr.Error())
+			}
+		}
+	}()
+
+	// --list: print the replay-free session catalog and exit (no TUI, no replay). It reads
+	// only the KV index, so it is cheap even with many sessions.
+	if flags.list {
+		if err := listSessions(ctx, persist, os.Stdout); err != nil {
+			logger.Error("list sessions failed", "err", err.Error())
+			fmt.Fprintln(os.Stderr, "list:", err)
+			os.Exit(1)
+		}
+		return
+	}
+
+	// open is the OpenAgent thunk: the initial open honors --resume (resume that session),
+	// and every /clear reopen starts a FRESH persisted session. Only the coding agent is
+	// journaled; any other agent falls back to the registry (unpersisted).
+	open := openThunk(name, reg, persist, flags.resume)
 
 	agent, err := open(ctx)
 	if err != nil {

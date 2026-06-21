@@ -35,6 +35,12 @@ type Loop struct {
 	// runner via the turn-launch ctx injection, and tests) register gates. The
 	// actor is the sole reader.
 	gateReg chan<- gateRegistration
+
+	// snapshots is the committed-state query seam: Snapshot sends a snapshotRequest
+	// here and the actor (the sole owner of loopState.msgs/turnIndex) replies a
+	// defensive clone. It is the restore-verification + dormant-snapshot read primitive
+	// (see Snapshot). The actor is the sole reader, selecting on it alongside commands.
+	snapshots chan<- snapshotRequest
 }
 
 // loopConfig holds the loop goroutine's DEPENDENCIES and construction-time wiring
@@ -65,6 +71,12 @@ type loopConfig struct {
 	// to the send-only direction runTurn requires.
 	gateReg chan gateRegistration
 
+	// snapshots is the committed-state query channel. The actor is its sole reader,
+	// selecting on it alongside commands; a caller (Snapshot) sends a request and the
+	// actor replies a defensive clone of loopState.msgs + turnIndex. Bidirectional here
+	// because the public Loop.snapshots is its send side.
+	snapshots chan snapshotRequest
+
 	// internal is the turn goroutine's terminal hand-back (turnResult). Buffered(1)
 	// so a finished turn never blocks delivering its terminal to the actor.
 	internal chan turnResult
@@ -89,6 +101,12 @@ type loopConfig struct {
 	// buffering, shutdown, close, and sequence policy. A parent or primary loop must
 	// not forward child-loop events; identity is metadata, not the transport path.
 	events eventPublisher
+
+	// eventFactory mints the EventID + CreatedAt stamped onto every ENDURING loop
+	// event at the publish chokepoint. Ephemeral events are never persisted, so they
+	// are never stamped (this also avoids a per-token crypto/rand call). It is a
+	// dependency wired at construction (its peer is events), defaulted by New.
+	eventFactory *event.Factory
 }
 
 // idGenerator mints a fresh UUID for the loop's correlation IDs — the per-turn
@@ -133,7 +151,21 @@ func resolveDrainTimeout(d time.Duration) time.Duration {
 // to this loop. parent is the provenance of the turn/step that spawned this loop
 // (zero for the primary loop). events is the session-level event publisher the
 // loop depends on (Dependency Inversion); it must be non-nil.
+//
+// New spawns an EMPTY loop (no committed history, turnIndex 0). The restore path
+// (NewRestored) seeds pre-built committed state instead; both funnel through
+// newLoopWithSeed, which is identical save for that seed.
 func New(loopCtx context.Context, sessionID, loopID uuid.UUID, parent Provenance, events eventPublisher, cfg Config) (*Loop, error) {
+	return newLoopWithSeed(loopCtx, sessionID, loopID, parent, events, cfg, nil)
+}
+
+// newLoopWithSeed is the construction core shared by New (seed nil → an empty loop)
+// and NewRestored (seed non-nil → a loop pre-seeded with committed msgs + turnIndex,
+// coming up idle). It runs the identical config validation/defaulting and actor
+// goroutine for both; the ONLY difference is whether loopState starts empty or seeded.
+// Keeping it one function means the spawn path and the restore path can never drift in
+// validation, defaulting, or wiring.
+func newLoopWithSeed(loopCtx context.Context, sessionID, loopID uuid.UUID, parent Provenance, events eventPublisher, cfg Config, seed *RestoredState) (*Loop, error) {
 	if cfg.Client == nil {
 		return nil, &ConfigError{Kind: ConfigMissingClient}
 	}
@@ -148,30 +180,62 @@ func New(loopCtx context.Context, sessionID, loopID uuid.UUID, parent Provenance
 	if cfg.idGen == nil {
 		cfg.idGen = uuid.New
 	}
+	if cfg.now == nil {
+		cfg.now = time.Now
+	}
+	// The loop mints its own Enduring-event EventID + CreatedAt from the SAME id
+	// generator that mints its correlation ids (idGen) and its clock (now), so a
+	// test that pins those pins the stamp too. Default it here unless a test
+	// injected one — a parked dependency, wired at construction (loopConfig.events
+	// is its peer).
+	if cfg.eventFactory == nil {
+		// Unlike the session (whose Factory closes over the LIVE s.newID/s.now fields,
+		// so a post-construction swap is honored), the loop intentionally FREEZES its
+		// id-gen + clock into the Factory here at construction: cfg.idGen/cfg.now are
+		// captured by value, so a later mutation of cfg is NOT honored. A test pins the
+		// stamp by injecting idGen/now (or a whole eventFactory) BEFORE loop.New.
+		// idGenerator and event.IDGen are the same underlying func type but distinct
+		// named types, so the conversion is explicit.
+		cfg.eventFactory = event.NewFactory(event.IDGen(cfg.idGen), cfg.now)
+	}
 	commands := make(chan command.Command)
 	done := make(chan struct{})
 	// gateReg is unbuffered: registration is synchronous (the runner blocks on the
 	// ack), and the actor is the sole reader, selecting on it alongside commands.
 	gateReg := make(chan gateRegistration)
+	// snapshots is unbuffered: the actor is the sole reader and replies on the request's
+	// buffered(1) reply channel, so the actor never blocks serving a snapshot.
+	snapshots := make(chan snapshotRequest)
 	// The loop-goroutine handshake channels are construction-time wiring shared
 	// between the actor and the per-turn goroutine, so they live in loopConfig:
 	//   - internal: turn terminal hand-back, buffered(1) so a finished turn never blocks.
 	//   - commits/drains: per-step commit and tool-continuation drain handshakes;
 	//     unbuffered because each is a synchronous request/reply the actor serializes.
 	lc := loopConfig{
-		loopCtx:  loopCtx,
-		cfg:      cfg,
-		commands: commands,
-		gateReg:  gateReg,
-		internal: make(chan turnResult, 1),
-		commits:  make(chan commitRequest),
-		drains:   make(chan drainRequest),
-		done:     done,
-		events:   events,
+		loopCtx:      loopCtx,
+		cfg:          cfg,
+		commands:     commands,
+		gateReg:      gateReg,
+		snapshots:    snapshots,
+		internal:     make(chan turnResult, 1),
+		commits:      make(chan commitRequest),
+		drains:       make(chan drainRequest),
+		done:         done,
+		events:       events,
+		eventFactory: cfg.eventFactory,
 	}
 	state := newLoopState(sessionID, loopID, parent)
+	if seed != nil {
+		// Restore seed: come up with the folded committed history and turn count. The
+		// status stays loopIdle (newLoopState's zero default), so the resumed loop
+		// accepts the next submit immediately and numbers its next turn from turnIndex.
+		// The system prompt is NOT in msgs — it rides cfg.Model.System, sent every turn
+		// — so seeding msgs alone reproduces loopState exactly as it was committed.
+		state.msgs = cloneMessages(seed.Msgs)
+		state.turnIndex = seed.TurnIndex
+	}
 	go runLoop(lc, state)
-	return &Loop{Commands: commands, Done: done, gateReg: gateReg}, nil
+	return &Loop{Commands: commands, Done: done, gateReg: gateReg, snapshots: snapshots}, nil
 }
 
 type loopStatus int
@@ -348,6 +412,7 @@ func runLoop(cfg loopConfig, state loopState) {
 	config := cfg.cfg
 	commands := cfg.commands
 	gateReg := cfg.gateReg
+	snapshots := cfg.snapshots
 	internal := cfg.internal
 	commits := cfg.commits
 	drains := cfg.drains
@@ -364,8 +429,31 @@ func runLoop(cfg loopConfig, state loopState) {
 	// with no subscribers (the headless case), so a non-nil error is a genuine
 	// fault; log it and continue (event publication must not abort the loop). Every
 	// loop event reaches consumers through this single fan-in path.
+	//
+	// This is also the single point that mints the persistence identity (EventID +
+	// CreatedAt) for every ENDURING event: stampLoopHeader fills the producer
+	// COORDINATES, then the Factory stamps EventID + CreatedAt for the Enduring class
+	// only — Ephemeral events (TokenDelta/ToolCall*/InputQueued) are never persisted,
+	// so they are published unstamped (which also avoids per-token crypto/rand). On a
+	// mint failure we FAIL SECURE: log loudly and SKIP publishing that Enduring event
+	// rather than fan out a zero-EventID one (a journal would key on a zero
+	// idempotency key) or silently pretend it published.
 	publish := func(ev event.Event) {
-		if err := cfg.events.PublishEvent(ctx, stampLoopHeader(ev, state.sessionID, state.id, state.turnID)); err != nil {
+		stamped := stampLoopHeader(ev, state.sessionID, state.id, state.turnID)
+		if stamped.Class() == event.Enduring {
+			h, err := cfg.eventFactory.Stamp(stamped.EventHeader())
+			if err != nil {
+				// A crypto/rand mint failure is catastrophic and astronomically rare; drop
+				// this Enduring event fail-secure (never publish a zero-EventID record). The
+				// hub raises SessionPersistenceFault for durable-append failures; a loop-side
+				// fault for this mint edge is a deferred refinement, not a Phase-7 gap.
+				slog.Error("event id mint failed; dropping Enduring loop event (fail-secure)",
+					"event", fmt.Sprintf("%T", stamped), "error", err)
+				return
+			}
+			stamped = withLoopHeader(stamped, h)
+		}
+		if err := cfg.events.PublishEvent(ctx, stamped); err != nil {
 			slog.Error("loop event publish to session fan-in failed", "error", err)
 		}
 	}
@@ -932,6 +1020,13 @@ func runLoop(cfg loopConfig, state loopState) {
 			// can no longer be dropped on a race. Only the actor touches pendingGates.
 			state.pendingGates[reg.callID] = gate{reply: reg.reply, kind: reg.kind}
 			close(reg.ack)
+
+		case req := <-snapshots:
+			// Committed-state query: the actor is the SOLE owner of loopState.msgs +
+			// turnIndex, so a consistent read is served from here. Reply a DEFENSIVE clone
+			// (its own backing array) so the caller can never alias or race the live slice
+			// the actor keeps appending to. reply is buffered(1); the send never blocks.
+			req.reply <- loopSnapshot{msgs: cloneMessages(state.msgs), turnIndex: state.turnIndex}
 
 		case req := <-drains:
 			// Tool-continuation drain: pop + clear the inbox into draining and reply the

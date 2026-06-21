@@ -49,6 +49,8 @@
 - `github.com/atotto/clipboard` — transitive (indirect) dep of `bubbles/textarea`, which imports it unconditionally for paste; approved as part of textarea, not chosen directly
 - `golang.org/x/net/html` — HTML tokenizer; required by the `WebSearch` tool's DuckDuckGo HTML-scrape `SearchProvider` (stdlib has no HTML parser)
 - `golang.org/x/net/idna` — IDNA/punycode host normalization (same `golang.org/x/net` module as above); required by the `Fetch` tool's persisted-approval host matching to defeat unicode homographs (stdlib has no IDNA)
+- `github.com/nats-io/nats.go` — JetStream client (pub/sub, JetStream ctx, KV, object store, durable consumers); required by internal/agent/session/journal for session persistence.
+- `github.com/nats-io/nats-server/v2` — embedded in-process JetStream server (no TCP) for the CLI's local durable journal; the client alone persists nothing.
 
 ## Secure Coding Patterns
 

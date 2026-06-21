@@ -187,7 +187,7 @@ func TestInterruptLoopStaysMachine(t *testing.T) {
 	s, cmds, _ := sessionWithFakeLoop()
 	cmd := captureCommand(t, s, cmds, func(s *Session) {
 		l, _ := s.loopFor(s.primaryLoopID)
-		s.interruptLoop(l)
+		s.interruptLoop(s.primaryLoopID, l)
 	})
 	ic, ok := cmd.(command.Interrupt)
 	if !ok {

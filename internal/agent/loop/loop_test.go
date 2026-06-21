@@ -464,6 +464,10 @@ func newLoopWithIDGen(t *testing.T, client llm.LLM, gen idGenerator) (*Loop, *re
 		Model:        llm.ModelSpec{Model: "m"},
 		DrainTimeout: 200 * time.Millisecond,
 		idGen:        gen,
+		// The injected gen fails the CORRELATION-id mint (the branch under test); give
+		// the loop a working EventID factory so the Enduring outcome event it publishes
+		// in response (TurnRejected/InputCancelled) is still stamped and observable.
+		eventFactory: workingFactory(),
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
