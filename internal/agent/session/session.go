@@ -283,10 +283,10 @@ func (s *Session) NewLoop(parent loop.Provenance, cfg loop.Config) (uuid.UUID, e
 	s.loops[loopID] = &loopHandle{loop: l, parent: parent, cancel: cancel}
 	s.loopsMu.Unlock()
 
-	// Announce the loop tree to subscribers active now. Published AFTER releasing
-	// loopsMu — never under the registry lock — because a hub publish fans out and
-	// must not hold the registry lock. LoopStarted is a pure announcement: it is not
-	// one of the active-mutating events (TurnStarted/LoopIdle/TurnFoldedInto/
+	// Announce the new loop to subscribers active at creation time. Published AFTER
+	// releasing loopsMu — never under the registry lock — because a hub publish fans
+	// out and must not hold the registry lock. LoopStarted is a pure announcement: it
+	// is not one of the active-mutating events (TurnStarted/LoopIdle/TurnFoldedInto/
 	// InputCancelled), so it never perturbs session quiescence. Header.Coordinates is
 	// the NEW loop (SessionID+LoopID; Turn/Step zero); Header.Cause is the spawning
 	// loop/turn/step (zero for the primary = root), machine-originated. There is no
@@ -302,7 +302,16 @@ func (s *Session) NewLoop(parent loop.Provenance, cfg loop.Config) (uuid.UUID, e
 		},
 	}
 	if err := s.PublishEvent(s.sessionCtx, ev); err != nil {
-		return uuid.UUID{}, err
+		// Mirror New's cleanup-on-publish-failure: the loop is already registered and
+		// its loopCtx cancel is live, so a bare return would leak a cancel-orphaned
+		// loop. Unregister it, run its cancel, then surface the typed error. (hub
+		// PublishEvent returns nil today, so this path is presently unreachable — but
+		// it is correct-and-safe rather than dead-and-unsafe if that ever changes.)
+		s.loopsMu.Lock()
+		delete(s.loops, loopID)
+		s.loopsMu.Unlock()
+		cancel()
+		return uuid.UUID{}, &SessionError{Kind: SessionContextDone, Cause: err}
 	}
 	return loopID, nil
 }

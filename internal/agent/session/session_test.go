@@ -225,6 +225,8 @@ func TestNewLoop(t *testing.T) {
 			if loopID.IsZero() {
 				t.Fatal("NewLoop returned a zero loop id")
 			}
+			// NewLoop mints twice (loop id, then the LoopStarted EventID); the
+			// FIRST mint is the loop id, so first() here means the loop id.
 			minted, ok := gen.first()
 			if !ok || minted != loopID {
 				t.Fatalf("returned loop id %v was not the first freshly minted id %v", loopID, minted)
@@ -502,8 +504,9 @@ func (g *capturingIDGen) last() (uuid.UUID, bool) {
 	return g.ids[len(g.ids)-1], true
 }
 
-// first returns the earliest minted id — the turn-initiating command's id (the
-// UserInput for Invoke), which is the id the observable turn Cause.CommandID carries.
+// first returns the earliest minted id. What that id means is call-site specific
+// (e.g. the turn-initiating UserInput's id for Invoke, or NewLoop's loop id, the
+// first of its two mints); each call site documents which id it expects.
 func (g *capturingIDGen) first() (uuid.UUID, bool) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
