@@ -457,7 +457,9 @@ func newSession(ctx context.Context, cfg loop.Config, newID idGenerator, now eve
 	// The hub is built before any loop, so a loop publishing through the session's
 	// PublishEvent never sees a nil hub. With no subscribers yet, this delivers to
 	// nobody (a no-op), but it is the session's authoritative session-scoped start.
-	if err := s.hub.PublishEvent(sessionCtx, event.SessionStarted{Header: startedHeader}); err != nil {
+	// Config is the fingerprint of the agent configuration this session started
+	// under, stamped here so a durable journal can detect a config change on restore.
+	if err := s.hub.PublishEvent(sessionCtx, event.SessionStarted{Header: startedHeader, Config: FingerprintFrom(cfg)}); err != nil {
 		sessionCancel()
 		return nil, &SessionError{Kind: SessionContextDone, Cause: err}
 	}

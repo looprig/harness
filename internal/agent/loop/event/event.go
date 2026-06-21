@@ -153,11 +153,15 @@ func (loopScoped) Scope() Scope { return ScopeLoop }
 type TurnIndex int
 
 // SessionStarted is published when the session's primary loop actor starts.
-// Header.SessionID is set; LoopID/TurnID/StepID are zero.
+// Header.SessionID is set; LoopID/TurnID/StepID are zero. Config is the fingerprint
+// of the agent configuration the session started under (model/system-prompt/tool
+// policy), stamped at construction so a durable journal can detect a config change
+// on restore.
 type SessionStarted struct {
 	enduring
 	sessionScoped
 	Header
+	Config ConfigFingerprint `json:"config,omitzero"`
 }
 
 // SessionActive marks the Idle -> Active edge of the session quiescence model.
