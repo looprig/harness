@@ -323,6 +323,72 @@ func TestNewLoopIDGenerationFailure(t *testing.T) {
 	}
 }
 
+// TestNewLoopClosingRejects: once the session is closing (the flag Shutdown
+// sets in the next task, set here directly under loopsMu as a white-box seam),
+// NewLoop must fail secure — return *SessionError{SessionClosing}, register no
+// loop, and publish no LoopStarted. The not-closing positive case proves the
+// guard does not reject a healthy session.
+func TestNewLoopClosingRejects(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name     string
+		closing  bool
+		wantErr  bool
+		wantKind SessionErrorKind
+	}{
+		{name: "closing rejects", closing: true, wantErr: true, wantKind: SessionClosing},
+		{name: "not closing succeeds", closing: false, wantErr: false},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			s, err := New(context.Background(), cfg(&stubLLM{chunks: []content.Chunk{textChunk("x")}}))
+			if err != nil {
+				t.Fatalf("New: %v", err)
+			}
+			t.Cleanup(func() { _ = s.Shutdown(context.Background()) })
+
+			s.loopsMu.Lock()
+			s.closing = tt.closing
+			before := len(s.loops)
+			s.loopsMu.Unlock()
+
+			loopID, err := s.NewLoop(loop.Provenance{}, cfg(&stubLLM{chunks: []content.Chunk{textChunk("y")}}))
+
+			var se *SessionError
+			if tt.wantErr {
+				if !errors.As(err, &se) || se.Kind != tt.wantKind {
+					t.Fatalf("err = %v, want *SessionError{%v}", err, tt.wantKind)
+				}
+				if !loopID.IsZero() {
+					t.Fatalf("NewLoop returned loop id %v on closing, want zero", loopID)
+				}
+			} else {
+				if err != nil {
+					t.Fatalf("NewLoop: %v", err)
+				}
+				if loopID.IsZero() {
+					t.Fatal("NewLoop returned a zero loop id on a healthy session")
+				}
+			}
+
+			s.loopsMu.RLock()
+			after := len(s.loops)
+			s.loopsMu.RUnlock()
+			if tt.wantErr {
+				if after != before {
+					t.Fatalf("registry grew from %d to %d while closing, want no new loop", before, after)
+				}
+			} else {
+				if after != before+1 {
+					t.Fatalf("registry = %d, want %d (one new loop) on a healthy session", after, before+1)
+				}
+			}
+		})
+	}
+}
+
 // TestLoopFor: loopFor(primaryLoopID) resolves the primary loop; a random id
 // misses.
 func TestLoopFor(t *testing.T) {

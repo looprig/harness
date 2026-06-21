@@ -23,6 +23,7 @@ const (
 	SessionLoopNotFound           SessionErrorKind = "loop_not_found"
 	SessionEventChannelClosed     SessionErrorKind = "event_channel_closed"
 	SessionContextDone            SessionErrorKind = "context_done"
+	SessionClosing                SessionErrorKind = "session_closing"
 )
 
 // SessionError is returned when a session method cannot complete.
@@ -47,6 +48,8 @@ func (e *SessionError) Error() string {
 		msg = "session: event channel closed without terminal event"
 	case SessionContextDone:
 		msg = "session: context done"
+	case SessionClosing:
+		msg = "session: closing"
 	default:
 		msg = "session: error"
 	}
@@ -118,6 +121,14 @@ type Session struct {
 	// primaryLoopID is the default target for Invoke/Interrupt/Shutdown
 	// and the gate-answer methods.
 	primaryLoopID uuid.UUID
+
+	// closing is the fail-secure latch: once set, NewLoop refuses to create or
+	// register any further loop. It is guarded by loopsMu — set by Shutdown
+	// (which flips it and snapshots the loops under the same lock), read by
+	// NewLoop's registration critical section. Because both the set and the
+	// authoritative NewLoop check happen under loopsMu, a loop can never be
+	// registered after Shutdown's snapshot has been taken.
+	closing bool
 
 	// newID mints command-Header IDs and loop ids. It defaults to uuid.New; kept
 	// as a field only so tests can inject failure and prove the session never
@@ -259,6 +270,18 @@ func (s *Session) deliverSubagentResult(ctx context.Context, parentLoopID, fromL
 // loop handle and returns only the loop id, because callers route through
 // session methods rather than writing to a loop command channel directly.
 func (s *Session) NewLoop(parent loop.Provenance, cfg loop.Config) (uuid.UUID, error) {
+	// Cheap early-out: if the session is already closing, refuse before minting or
+	// building anything. This is an optimization only — the authoritative,
+	// race-free check is the one inside the registration critical section below
+	// (taken under the same loopsMu Shutdown uses to set closing + snapshot the
+	// loops), which closes the window between this read and registration.
+	s.loopsMu.RLock()
+	closing := s.closing
+	s.loopsMu.RUnlock()
+	if closing {
+		return uuid.UUID{}, &SessionError{Kind: SessionClosing}
+	}
+
 	loopID, err := s.newID()
 	if err != nil {
 		return uuid.UUID{}, &SessionError{Kind: SessionLoopIDGenerationFailed, Cause: err}
@@ -280,6 +303,19 @@ func (s *Session) NewLoop(parent loop.Provenance, cfg loop.Config) (uuid.UUID, e
 	}
 
 	s.loopsMu.Lock()
+	// Authoritative fail-secure check: re-test closing under the SAME lock
+	// acquire that registers the loop. Shutdown sets closing and snapshots the
+	// loops under this lock, so checking-then-registering atomically here
+	// guarantees a loop is never registered after Shutdown's snapshot — it either
+	// makes it into the snapshot (registered before closing) or is refused here
+	// (closing seen). On refusal: register nothing, release the lock, tear down
+	// the already-built loop with cancel(), and return before the publish so no
+	// LoopStarted is ever emitted.
+	if s.closing {
+		s.loopsMu.Unlock()
+		cancel()
+		return uuid.UUID{}, &SessionError{Kind: SessionClosing}
+	}
 	s.loops[loopID] = &loopHandle{loop: l, parent: parent, cancel: cancel}
 	s.loopsMu.Unlock()
 
