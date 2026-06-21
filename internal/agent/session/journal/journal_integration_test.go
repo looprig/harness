@@ -257,6 +257,111 @@ func TestNewSessionJournalRejectsMismatchedStream(t *testing.T) {
 	}
 }
 
+// TestSessionJournalStreamLevelFenceRejectsStaleWriter proves the single-writer
+// fence is at STREAM level, not subject level. Two journals A and B bind the SAME
+// session stream and both initialize expectedSeq from the (fresh) LastSeq of 0. A
+// appends a record, advancing the stream tip to 1. B — now holding a stale
+// expectedSeq of 0 — appends to a DIFFERENT loop subject than A wrote and must still
+// be fenced: the rejection is the stream's expected-last-sequence check (wrong last
+// sequence), not anything subject-scoped. B's expectedSeq must NOT advance on the
+// rejection, so a second B append fails identically; the stream tip stays at A's one
+// record (the stale writer never interleaves a durable record).
+func TestSessionJournalStreamLevelFenceRejectsStaleWriter(t *testing.T) {
+	sid := seedUUID(0x50)
+	loopA := seedUUID(0x51)
+	loopB := seedUUID(0x52)
+
+	_, js := newEmbeddedJS(t)
+
+	// A and B are two serializers over the SAME session stream; both read the fresh
+	// tip (LastSeq 0) at construction, so both believe the next append fences on 0.
+	a, err := journal.NewSessionJournal(js, sid)
+	if err != nil {
+		t.Fatalf("NewSessionJournal(A): %v", err)
+	}
+	b, err := journal.NewSessionJournal(js, sid)
+	if err != nil {
+		t.Fatalf("NewSessionJournal(B): %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// A appends a loop event on loopA's subject; the stream tip advances to seq 1.
+	aEvent := event.LoopStarted{
+		Header: event.Header{
+			Coordinates: identity.Coordinates{SessionID: sid, LoopID: loopA},
+			EventID:     seedUUID(0x53),
+		},
+	}
+	seqA, err := a.Append(ctx, journal.NewEventRecord(aEvent))
+	if err != nil {
+		t.Fatalf("A.Append: %v", err)
+	}
+	if seqA != 1 {
+		t.Fatalf("A.Append seq = %d, want 1", seqA)
+	}
+
+	// B writes to a DIFFERENT loop subject (loopB.event), so a subject-level fence
+	// would NOT catch it — only the stream-level expected-last-sequence does. B still
+	// holds expectedSeq 0 (the pre-A tip), so the publish must be rejected.
+	bEvent := event.LoopStarted{
+		Header: event.Header{
+			Coordinates: identity.Coordinates{SessionID: sid, LoopID: loopB},
+			EventID:     seedUUID(0x54),
+		},
+	}
+	assertFenced := func(t *testing.T, label string) {
+		t.Helper()
+		seq, err := b.Append(ctx, journal.NewEventRecord(bEvent))
+		if err == nil {
+			t.Fatalf("B.Append (%s) seq = %d, want a fence rejection", label, seq)
+		}
+		if seq != 0 {
+			t.Errorf("B.Append (%s) returned seq %d alongside error, want 0", label, seq)
+		}
+		var appendErr *journal.AppendError
+		if !errors.As(err, &appendErr) {
+			t.Fatalf("B.Append (%s) error %v is not *AppendError", label, err)
+		}
+		// The append carried B's stale expected sequence (0), the pre-A tip.
+		if appendErr.Expected != 0 {
+			t.Errorf("AppendError.Expected = %d, want 0 (B's stale tip)", appendErr.Expected)
+		}
+		if appendErr.Subject != journal.LoopEventSubject(sid, loopB) {
+			t.Errorf("AppendError.Subject = %q, want %q (B's own subject)", appendErr.Subject, journal.LoopEventSubject(sid, loopB))
+		}
+		// The cause is the stream's wrong-last-sequence fence — a JetStream APIError
+		// with the wrong-last-sequence code — NOT a timeout/transport error.
+		var apiErr *nats.APIError
+		if !errors.As(err, &apiErr) {
+			t.Fatalf("B.Append (%s) cause %v is not *nats.APIError (the wrong-last-seq fence)", label, err)
+		}
+		if apiErr.ErrorCode != nats.JSErrCodeStreamWrongLastSequence {
+			t.Errorf("APIError.ErrorCode = %d, want %d (wrong last sequence)", apiErr.ErrorCode, nats.JSErrCodeStreamWrongLastSequence)
+		}
+	}
+
+	// First B append is fenced (stream advanced past B's expectedSeq).
+	assertFenced(t, "first")
+	// B's expectedSeq must NOT have advanced on the rejection: a second append fences
+	// identically. A stale writer that silently re-synced its tip would slip a record
+	// in here; the fence must keep rejecting until B is explicitly reconstructed.
+	assertFenced(t, "second")
+
+	// The stream tip is still A's single record: B never wrote a durable record.
+	info, err := js.StreamInfo(journal.StreamName(sid))
+	if err != nil {
+		t.Fatalf("StreamInfo: %v", err)
+	}
+	if info.State.LastSeq != 1 {
+		t.Errorf("StreamInfo LastSeq = %d, want 1 (only A's record; B was fenced)", info.State.LastSeq)
+	}
+	if info.State.Msgs != 1 {
+		t.Errorf("StreamInfo Msgs = %d, want 1 (B's appends never landed)", info.State.Msgs)
+	}
+}
+
 // assertRoundTrip decodes data via the codec named by tc.kind and asserts the
 // decoded value is deep-equal to the value tc carried into the append.
 func assertRoundTrip(t *testing.T, tc appendCase, data []byte) {
