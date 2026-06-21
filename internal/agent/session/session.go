@@ -26,6 +26,7 @@ const (
 	SessionEventChannelClosed     SessionErrorKind = "event_channel_closed"
 	SessionContextDone            SessionErrorKind = "context_done"
 	SessionClosing                SessionErrorKind = "session_closing"
+	SessionFaulted                SessionErrorKind = "session_faulted"
 )
 
 // SessionError is returned when a session method cannot complete.
@@ -52,6 +53,8 @@ func (e *SessionError) Error() string {
 		msg = "session: context done"
 	case SessionClosing:
 		msg = "session: closing"
+	case SessionFaulted:
+		msg = "session: faulted (durable persistence failure)"
 	default:
 		msg = "session: error"
 	}
@@ -131,6 +134,16 @@ type Session struct {
 	// registered after Shutdown's snapshot has been taken.
 	closing bool
 
+	// faulted is the persistence fail-secure latch: set by ReportFault when the hub
+	// raises a SessionPersistenceFault (a required durable append failed). Once set,
+	// every new Submit/NewLoop is refused with SessionFaulted, so no further work is
+	// admitted to a session whose durable log is no longer trustworthy. faultErr is
+	// the fault that latched it (chained as the refusal's Cause). Both are guarded by
+	// loopsMu — the same lock that gates closing and the NewLoop registration check —
+	// so a fault and a NewLoop can never interleave incorrectly.
+	faulted  bool
+	faultErr error
+
 	// newID mints command-Header IDs and loop ids. It defaults to uuid.New; kept
 	// as a field only so tests can inject failure and prove the session never
 	// sends zero-id commands and never registers a zero-id loop.
@@ -171,6 +184,45 @@ type eventSubscriber interface {
 // Its publisher half (PublishEvent) is asserted by loop.New accepting s as its
 // eventPublisher at the NewLoop call site.
 var _ eventSubscriber = (*Session)(nil)
+
+// Compile-time proof that *Session is the hub's FaultReporter: on a required durable
+// append failure the hub calls ReportFault, and the session fails secure.
+var _ hub.FaultReporter = (*Session)(nil)
+
+// ReportFault is the session's fail-secure response to a hub persistence fault (a
+// required durable append failed): it latches the faulted state (so every new
+// Submit/NewLoop is refused) and wakes every blocked WaitIdle waiter with the fault.
+// It is the hub's FaultReporter — the hub calls it inline (outside the hub lock) when
+// AppendEvent fails the durable tap. It is idempotent: the FIRST fault latches and
+// records the cause; a later fault still wakes any new waiters but keeps the first
+// recorded cause (the root failure). The session is NOT torn down here — restore /
+// operator action owns recovery; this only stops admitting new work and unblocks
+// callers stuck waiting on a session that can no longer reach idle durably.
+func (s *Session) ReportFault(_ context.Context, fault *hub.SessionPersistenceFault) {
+	s.loopsMu.Lock()
+	if !s.faulted {
+		s.faulted = true
+		s.faultErr = fault
+	}
+	s.loopsMu.Unlock()
+
+	// Wake blocked WaitIdle waiters with the fault (outside loopsMu — FailWaiters
+	// takes the hub lock; loopsMu and the hub lock are never held together).
+	s.hub.FailWaiters(fault)
+}
+
+// faultIfFaulted returns a typed SessionFaulted error (chaining the latched fault) if
+// the session has faulted, else nil. It is the fail-secure gate every new-work entry
+// point (Submit/submitToLoop/NewLoop) checks before admitting work. Read under
+// loopsMu — the same lock ReportFault latches under.
+func (s *Session) faultIfFaulted() error {
+	s.loopsMu.RLock()
+	defer s.loopsMu.RUnlock()
+	if s.faulted {
+		return &SessionError{Kind: SessionFaulted, Cause: s.faultErr}
+	}
+	return nil
+}
 
 // PublishEvent is the session's eventPublisher implementation passed to loop.New.
 // It delegates to the hub, which fans the event out to matching subscribers and
@@ -284,14 +336,19 @@ func (s *Session) deliverSubagentResult(ctx context.Context, parentLoopID, fromL
 // loop handle and returns only the loop id, because callers route through
 // session methods rather than writing to a loop command channel directly.
 func (s *Session) NewLoop(parent loop.Provenance, cfg loop.Config) (uuid.UUID, error) {
-	// Cheap early-out: if the session is already closing, refuse before minting or
-	// building anything. This is an optimization only — the authoritative,
+	// Cheap early-out: if the session is already closing OR faulted, refuse before
+	// minting or building anything. This is an optimization only — the authoritative,
 	// race-free check is the one inside the registration critical section below
-	// (taken under the same loopsMu Shutdown uses to set closing + snapshot the
-	// loops), which closes the window between this read and registration.
+	// (taken under the same loopsMu Shutdown/ReportFault use to set closing/faulted +
+	// snapshot the loops), which closes the window between this read and registration.
 	s.loopsMu.RLock()
 	closing := s.closing
+	faulted := s.faulted
+	faultErr := s.faultErr
 	s.loopsMu.RUnlock()
+	if faulted {
+		return uuid.UUID{}, &SessionError{Kind: SessionFaulted, Cause: faultErr}
+	}
 	if closing {
 		return uuid.UUID{}, &SessionError{Kind: SessionClosing}
 	}
@@ -327,14 +384,20 @@ func (s *Session) NewLoop(parent loop.Provenance, cfg loop.Config) (uuid.UUID, e
 	}
 
 	s.loopsMu.Lock()
-	// Authoritative fail-secure check: re-test closing under the SAME lock
-	// acquire that registers the loop. Shutdown sets closing and snapshots the
-	// loops under this lock, so checking-then-registering atomically here
-	// guarantees a loop is never registered after Shutdown's snapshot — it either
-	// makes it into the snapshot (registered before closing) or is refused here
-	// (closing seen). On refusal: register nothing, release the lock, tear down
+	// Authoritative fail-secure check: re-test faulted AND closing under the SAME
+	// lock acquire that registers the loop. Shutdown sets closing and ReportFault
+	// sets faulted under this lock, so checking-then-registering atomically here
+	// guarantees a loop is never registered after a fault or after Shutdown's
+	// snapshot — it either makes it into the snapshot (registered before the latch)
+	// or is refused here. On refusal: register nothing, release the lock, tear down
 	// the already-built loop with cancel(), and return before the publish so no
-	// LoopStarted is ever emitted.
+	// LoopStarted is ever emitted. Faulted is checked first (the stronger condition).
+	if s.faulted {
+		fe := s.faultErr
+		s.loopsMu.Unlock()
+		cancel()
+		return uuid.UUID{}, &SessionError{Kind: SessionFaulted, Cause: fe}
+	}
 	if s.closing {
 		s.loopsMu.Unlock()
 		cancel()
@@ -432,7 +495,6 @@ func newSession(ctx context.Context, cfg loop.Config, newID idGenerator, now eve
 	sessionCtx, sessionCancel := context.WithCancel(ctx)
 	s := &Session{
 		SessionID:     id,
-		hub:           hub.New(id),
 		sessionCtx:    sessionCtx,
 		sessionCancel: sessionCancel,
 		loops:         make(map[uuid.UUID]*loopHandle),
@@ -443,6 +505,15 @@ func newSession(ctx context.Context, cfg loop.Config, newID idGenerator, now eve
 	// that swaps either after construction pins the stamp too (the same seam the
 	// session's command-id minting uses).
 	s.factory = event.NewFactory(func() (uuid.UUID, error) { return s.newID() }, func() time.Time { return s.now() })
+
+	// The hub is built AFTER s so the session can wire itself as the hub's
+	// FaultReporter (fail-secure: on a required-durable-append failure the hub calls
+	// s.ReportFault). The hub shares the session's Factory so a hub-synthesized
+	// session event (SessionActive/Idle/Stopped) is stamped from the same pinned
+	// newID/now seam as the session's own events. The durable appender is left at the
+	// hub's nop default here; the composition root (Phase 10) injects the real one
+	// wrapping the SessionJournal — wiring an actual journal into New is out of scope.
+	s.hub = hub.New(id, hub.WithFactory(s.factory), hub.WithFaultReporter(s))
 
 	// SessionStarted is an Enduring, session-scoped event: stamp it with a minted
 	// EventID + CreatedAt so the journal sees a stable idempotency key and creation
@@ -552,6 +623,11 @@ func (s *Session) Submit(ctx context.Context, input []content.Block) (uuid.UUID,
 // SessionLoopNotFound. On any of those the returned id is the zero UUID, because
 // nothing was sent and there is no correlation to hand back.
 func (s *Session) submitToLoop(ctx context.Context, loopID uuid.UUID, blocks []content.Block, agency identity.Agency) (uuid.UUID, error) {
+	// Fail-secure: a faulted session (a required durable append failed) admits no new
+	// work. Checked before any loop lookup or id mint so nothing is sent.
+	if err := s.faultIfFaulted(); err != nil {
+		return uuid.UUID{}, err
+	}
 	l, ok := s.loopFor(loopID)
 	if !ok {
 		return uuid.UUID{}, &SessionError{Kind: SessionLoopNotFound}
