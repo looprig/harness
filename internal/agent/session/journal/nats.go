@@ -74,6 +74,69 @@ func (e *AppendError) Error() string {
 }
 func (e *AppendError) Unwrap() error { return e.Cause }
 
+// FenceViolationError reports that the single-writer invariant is broken: after an
+// ambiguous append (a lost ack) the serializer resolved the tip at sequence N+1 and
+// found a record that is NOT the one it was publishing — a foreign Nats-Msg-Id at the
+// sequence we were fencing on. This is unrecoverable at the journal layer: another
+// writer advanced the stream, so the durable log can no longer be extended safely from
+// here. It carries the contested sequence, the id we expected (ours), and the id we
+// found (the intruder's) so a caller can audit exactly which record collided.
+//
+// TODO(Phase 7): the hub maps this to a SessionPersistenceFault (reject new commands /
+// NewLoop, wake WaitIdle waiters). The journal layer must not reference hub types; it
+// surfaces this typed error and lets the composition root translate it.
+type FenceViolationError struct {
+	Subject   string
+	Sequence  uint64 // the contested stream sequence (the expected N+1)
+	WantMsgID string // our record's Nats-Msg-Id (the one we were publishing)
+	GotMsgID  string // the Nats-Msg-Id actually stored at Sequence (the intruder's)
+}
+
+func (e *FenceViolationError) Error() string {
+	return "journal: fence violation at seq " + strconv.FormatUint(e.Sequence, 10) +
+		" on " + strconv.Quote(e.Subject) +
+		": stored msg-id " + strconv.Quote(e.GotMsgID) +
+		" is not ours " + strconv.Quote(e.WantMsgID) + " (single-writer invariant broken)"
+}
+
+// AmbiguousAckError reports an append whose ack was lost and could NOT be resolved
+// within the bounded retry: the publish timed out, the retry to resolve it also timed
+// out (or otherwise stayed ambiguous), so the serializer cannot tell whether the
+// record landed. The fence stays unadvanced, so the next Append re-fences on the same
+// tip; the caller decides whether to fail the session or retry later. It carries the
+// subject, the record's Nats-Msg-Id, the expected sequence the publish fenced on, and
+// the underlying ambiguous cause (a deadline / timeout / no-response).
+type AmbiguousAckError struct {
+	Subject  string
+	MsgID    string
+	Expected uint64
+	Cause    error
+}
+
+func (e *AmbiguousAckError) Error() string {
+	return "journal: ambiguous ack (unresolved) for " + strconv.Quote(e.Subject) +
+		" (msg-id " + strconv.Quote(e.MsgID) +
+		", expected-seq " + strconv.FormatUint(e.Expected, 10) + "): " + e.Cause.Error()
+}
+func (e *AmbiguousAckError) Unwrap() error { return e.Cause }
+
+// ResolveReadError reports that the ambiguous-ack resolver could not read the tip
+// record (GetMsg at the contested sequence failed for a reason other than
+// not-found): without that read it cannot decide commit-vs-conflict, so it fails
+// closed rather than guessing. It carries the sequence it tried to read and the
+// underlying read error.
+type ResolveReadError struct {
+	Subject  string
+	Sequence uint64
+	Cause    error
+}
+
+func (e *ResolveReadError) Error() string {
+	return "journal: resolve read of seq " + strconv.FormatUint(e.Sequence, 10) +
+		" on " + strconv.Quote(e.Subject) + ": " + e.Cause.Error()
+}
+func (e *ResolveReadError) Unwrap() error { return e.Cause }
+
 // setupPhase names the stream-management call in NewSessionJournal that failed. It
 // is a closed typed enum (not a free-form string) so callers can switch on the phase
 // and a typo cannot silently mislabel a failure.
@@ -164,12 +227,15 @@ func NewSessionJournal(js nats.JetStreamContext, sessionID uuid.UUID, opts ...Op
 		return nil, &StreamSetupError{Stream: name, Phase: PhaseInfo, Cause: err}
 	}
 
-	return &streamJournal{
+	j := &streamJournal{
 		js:            js,
 		stream:        name,
 		appendTimeout: o.appendTimeout,
 		expectedSeq:   info.State.LastSeq,
-	}, nil
+	}
+	// Default publish seam: the real fenced PublishMsg. Tests swap it via SwapPublish.
+	j.publish = j.defaultPublish
+	return j, nil
 }
 
 // errNilJetStream is the leaf cause when NewSessionJournal is handed a nil
