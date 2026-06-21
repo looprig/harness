@@ -3,7 +3,61 @@ package main
 import (
 	"slices"
 	"testing"
+
+	"github.com/inventivepotter/urvi/internal/uuid"
 )
+
+// TestParseFlags covers the CLI flag parser: --list, --resume <uuid>, and the positional
+// agent name, plus boundary validation (an invalid resume id fails at the boundary, not
+// deep in the wiring; --list and --resume are mutually exclusive).
+func TestParseFlags(t *testing.T) {
+	t.Parallel()
+
+	validID, err := uuid.New()
+	if err != nil {
+		t.Fatalf("uuid.New: %v", err)
+	}
+	tests := []struct {
+		name       string
+		args       []string
+		wantAgent  string
+		wantList   bool
+		wantResume uuid.UUID
+		wantErr    bool
+	}{
+		{name: "no flags → default agent, new session", args: nil, wantAgent: defaultAgent},
+		{name: "positional agent name", args: []string{"coding"}, wantAgent: "coding"},
+		{name: "list flag", args: []string{"-list"}, wantAgent: defaultAgent, wantList: true},
+		{name: "list flag double dash", args: []string{"--list"}, wantAgent: defaultAgent, wantList: true},
+		{name: "resume a session", args: []string{"-resume", validID.String()}, wantAgent: defaultAgent, wantResume: validID},
+		{name: "resume then agent name", args: []string{"-resume", validID.String(), "coding"}, wantAgent: "coding", wantResume: validID},
+		{name: "invalid resume id rejected", args: []string{"-resume", "not-a-uuid"}, wantErr: true},
+		{name: "empty resume id rejected", args: []string{"-resume", ""}, wantErr: true},
+		{name: "list and resume are mutually exclusive", args: []string{"-list", "-resume", validID.String()}, wantErr: true},
+		{name: "unknown flag rejected", args: []string{"-nope"}, wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got, err := parseFlags(tt.args)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("parseFlags(%v) err = %v, wantErr %v", tt.args, err, tt.wantErr)
+			}
+			if tt.wantErr {
+				return
+			}
+			if got.agent != tt.wantAgent {
+				t.Errorf("agent = %q, want %q", got.agent, tt.wantAgent)
+			}
+			if got.list != tt.wantList {
+				t.Errorf("list = %v, want %v", got.list, tt.wantList)
+			}
+			if got.resume != tt.wantResume {
+				t.Errorf("resume = %v, want %v", got.resume, tt.wantResume)
+			}
+		})
+	}
+}
 
 func TestAgentName(t *testing.T) {
 	t.Parallel()
