@@ -161,6 +161,14 @@ type Session struct {
 	// stamp too. The LOOP owns minting for its own loop events (loopConfig.eventFactory);
 	// this Factory is only for the session's own creation sites.
 	factory *event.Factory
+
+	// cmdAppender is the AUDIT-ONLY intent-log seam: every command the session
+	// dispatches to a loop is appended here BEFORE the send (appendCommand). It defaults
+	// to the nop appender (no-persistence/headless mode); the composition root (Phase 10)
+	// injects the real journal.JournalCommandAppender via WithCommandAppender. Unlike the
+	// hub's required durable tap, an append failure here is logged-and-swallowed — the
+	// dispatch always proceeds (a lost command record must never block the user).
+	cmdAppender commandAppender
 }
 
 // loopHandle is the session's registry entry: the loop's channel handle, the
@@ -312,15 +320,20 @@ func (s *Session) deliverSubagentResult(ctx context.Context, parentLoopID, fromL
 	if err != nil {
 		return err
 	}
-	select {
-	case l.Commands <- command.SubagentResult{
+	cmd := command.SubagentResult{
 		Coordinates: identity.Coordinates{LoopID: parentLoopID}, // delivery target (PARENT)
 		Header: command.Header{
 			CommandID: id,
 			Cause:     identity.Cause{Coordinates: identity.Coordinates{LoopID: fromLoopID}}, // CHILD (wake token)
+			CreatedAt: s.stampNow(),
 		},
 		Blocks: blocks,
-	}: // Agency left default AgencyMachine — a hand-back is machine-originated
+	} // Agency left default AgencyMachine — a hand-back is machine-originated
+	// Intent log (audit-only): append BEFORE dispatch; an append failure is logged and
+	// the hand-back proceeds. Targets the PARENT loop (the command's delivery target).
+	s.appendCommand(ctx, parentLoopID, cmd)
+	select {
+	case l.Commands <- cmd:
 		return nil
 	case <-l.Done:
 		return &SessionError{Kind: SessionLoopExited}
@@ -465,13 +478,14 @@ func (s *Session) newCommandID() (uuid.UUID, error) {
 // and the loop never emits one. It is published before any subscriber attaches,
 // so a subscriber that connects later does not observe it; reliable delivery of
 // the session start to late subscribers is a separate future follow-on.
-func New(ctx context.Context, cfg loop.Config) (*Session, error) {
+func New(ctx context.Context, cfg loop.Config, opts ...Option) (*Session, error) {
 	// Production seams: crypto/rand id-gen + the wall clock. newSession is the
 	// unexported core that lets a same-package test inject a failing newID (or a
 	// pinned now) that is IN EFFECT during the construction-time SessionStarted
 	// stamp — the only way to exercise New's mint-error failure branch — mirroring
-	// how the loop injects idGen/now via Config before loop.New.
-	return newSession(ctx, cfg, uuid.New, time.Now)
+	// how the loop injects idGen/now via Config before loop.New. opts are the optional
+	// dependency injections (e.g. WithCommandAppender) the composition root supplies.
+	return newSession(ctx, cfg, uuid.New, time.Now, opts...)
 }
 
 // newSession is the construction core of New with the id-gen and clock seams made
@@ -480,7 +494,7 @@ func New(ctx context.Context, cfg loop.Config) (*Session, error) {
 // mint-error branch (no zero-EventID SessionStarted is ever published; New returns
 // nil + a typed *SessionError). newID also mints the session id itself, so a
 // generator that fails on its FIRST call aborts before any event is stamped.
-func newSession(ctx context.Context, cfg loop.Config, newID idGenerator, now event.Clock) (*Session, error) {
+func newSession(ctx context.Context, cfg loop.Config, newID idGenerator, now event.Clock, opts ...Option) (*Session, error) {
 	select {
 	case <-ctx.Done():
 		return nil, &SessionError{Kind: SessionContextDone, Cause: ctx.Err()}
@@ -500,6 +514,15 @@ func newSession(ctx context.Context, cfg loop.Config, newID idGenerator, now eve
 		loops:         make(map[uuid.UUID]*loopHandle),
 		newID:         newID,
 		now:           now,
+		// Audit-only intent-log appender: nop by default (no-persistence/headless mode).
+		// The composition root (Phase 10) overrides it via WithCommandAppender below.
+		cmdAppender: nopCommandAppender{},
+	}
+	// Apply optional dependency injections (e.g. WithCommandAppender) before any
+	// command can be dispatched, so an injected appender is in effect from the first
+	// dispatch. A nil appender option is ignored (the nop default stays installed).
+	for _, opt := range opts {
+		opt(s)
 	}
 	// The Factory mints from closures over the LIVE newID + now fields, so a test
 	// that swaps either after construction pins the stamp too (the same seam the
@@ -551,14 +574,22 @@ func newSession(ctx context.Context, cfg loop.Config, newID idGenerator, now eve
 // caller observes the cancellation through the resulting TurnInterrupted terminal,
 // not this command's reply. An id-gen failure is swallowed (best-effort): the worst
 // case is the turn runs to its natural terminal instead of being interrupted.
-func (s *Session) interruptLoop(l *loop.Loop) {
+//
+// loopID is the dispatch target, passed in for the intent-log append (the Interrupt
+// itself carries no addressing); it is appended audit-only before the send on the
+// session lifetime ctx (interruptLoop has no ctx of its own — it is best-effort).
+func (s *Session) interruptLoop(loopID uuid.UUID, l *loop.Loop) {
 	id, err := s.newID()
 	if err != nil {
 		return
 	}
 	ack := make(chan bool, 1)
+	cmd := command.Interrupt{Header: command.Header{CommandID: id, CreatedAt: s.stampNow()}, Ack: ack}
+	// Intent log (audit-only): append before dispatch; failure is logged and the
+	// best-effort interrupt proceeds.
+	s.appendCommand(s.sessionCtx, loopID, cmd)
 	select {
-	case l.Commands <- command.Interrupt{Header: command.Header{CommandID: id}, Ack: ack}:
+	case l.Commands <- cmd:
 	case <-l.Done:
 	}
 }
@@ -579,7 +610,7 @@ func (s *Session) interruptLoopID(loopID uuid.UUID) error {
 	if !ok {
 		return &SessionError{Kind: SessionLoopNotFound}
 	}
-	s.interruptLoop(l)
+	s.interruptLoop(loopID, l)
 	return nil
 }
 
@@ -636,12 +667,16 @@ func (s *Session) submitToLoop(ctx context.Context, loopID uuid.UUID, blocks []c
 	if err != nil {
 		return uuid.UUID{}, err
 	}
-	select {
 	// Queueable submit: Cause.CommandID is zero (root); the outcome is observed on the
 	// session fan-in. Agency is caller-chosen — AgencyUser for the interactive human
 	// Submit, AgencyMachine for the subagent task submit — so a machine path never
 	// claims user agency.
-	case l.Commands <- command.UserInput{Header: command.Header{CommandID: id, Agency: agency}, Blocks: blocks}:
+	cmd := command.UserInput{Header: command.Header{CommandID: id, Agency: agency, CreatedAt: s.stampNow()}, Blocks: blocks}
+	// Intent log (audit-only): append BEFORE dispatch; an append failure is logged and
+	// the submit proceeds (a lost record must never block the user's input).
+	s.appendCommand(ctx, loopID, cmd)
+	select {
+	case l.Commands <- cmd:
 		return id, nil
 	case <-ctx.Done():
 		return uuid.UUID{}, &SessionError{Kind: SessionContextDone, Cause: ctx.Err()}
@@ -722,6 +757,15 @@ func (s *Session) RunSubagent(ctx context.Context, parent loop.Provenance, cfg l
 	})
 }
 
+// loopSnapshot pairs a loop id with its handle, captured under loopsMu by the
+// Interrupt/Shutdown fan-outs. The loop id is carried alongside the handle (the map
+// key is otherwise lost on snapshot) so the per-loop intent-log append can target the
+// right loop's command subject — Interrupt/Shutdown carry no addressing of their own.
+type loopSnapshot struct {
+	loopID uuid.UUID
+	handle *loopHandle
+}
+
 // interruptTarget pairs a loop with the Ack channel of the command.Interrupt the
 // session sent it, so the ack-wait phase can drain each loop's reply in turn. It
 // is Interrupt-internal: the send phase records one per loop actually reached, and
@@ -750,18 +794,19 @@ type interruptTarget struct {
 // consistent with Shutdown — one loop's failure never aborts the whole Interrupt).
 func (s *Session) Interrupt(ctx context.Context) (bool, error) {
 	// Snapshot the loops under loopsMu (no closing latch — Interrupt does not tear
-	// loops down). The snapshot is the set we fan the Interrupt out to.
+	// loops down). The snapshot is the set we fan the Interrupt out to; it carries the
+	// loop id so the per-loop intent-log append can target each loop's command subject.
 	s.loopsMu.RLock()
-	handles := make([]*loopHandle, 0, len(s.loops))
-	for _, h := range s.loops {
-		handles = append(handles, h)
+	snapshot := make([]loopSnapshot, 0, len(s.loops))
+	for lid, h := range s.loops {
+		snapshot = append(snapshot, loopSnapshot{loopID: lid, handle: h})
 	}
 	s.loopsMu.RUnlock()
 
 	// Send an Interrupt to every loop in the snapshot, recording each reached loop's
 	// (loop, ack) pair.
-	targets := make([]interruptTarget, 0, len(handles))
-	for _, h := range handles {
+	targets := make([]interruptTarget, 0, len(snapshot))
+	for _, ls := range snapshot {
 		id, err := s.newCommandID()
 		if err != nil {
 			// id-gen failure for ONE loop must not abort the whole Interrupt: skip its
@@ -769,15 +814,19 @@ func (s *Session) Interrupt(ctx context.Context) (bool, error) {
 			// case is that loop's turn runs to its natural terminal.
 			continue
 		}
-		ack := make(chan bool, 1)
-		select {
 		// A manual Interrupt is a human-origination point (the human pressed interrupt),
 		// so it stamps Agency=AgencyUser. The programmatic per-loop interrupt
 		// (interruptLoop, the subagent drain's ctx-cancel fail-safe) is a SEPARATE method
 		// and stays machine — we never falsely attribute that machine action to a user.
-		case h.loop.Commands <- command.Interrupt{Header: command.Header{CommandID: id, Agency: identity.AgencyUser}, Ack: ack}:
-			targets = append(targets, interruptTarget{loop: h.loop, ack: ack})
-		case <-h.loop.Done:
+		ack := make(chan bool, 1)
+		cmd := command.Interrupt{Header: command.Header{CommandID: id, Agency: identity.AgencyUser, CreatedAt: s.stampNow()}, Ack: ack}
+		// Intent log (audit-only): one record per loop (the command is per-loop), appended
+		// BEFORE this loop's send; an append failure is logged and the fan-out proceeds.
+		s.appendCommand(ctx, ls.loopID, cmd)
+		select {
+		case ls.handle.loop.Commands <- cmd:
+			targets = append(targets, interruptTarget{loop: ls.handle.loop, ack: ack})
+		case <-ls.handle.loop.Done:
 			// Loop already exited; nothing to cancel.
 		case <-ctx.Done():
 			return false, &SessionError{Kind: SessionContextDone, Cause: ctx.Err()}
@@ -845,9 +894,9 @@ func (s *Session) Shutdown(ctx context.Context) error {
 	// registered after this snapshot is taken.
 	s.loopsMu.Lock()
 	s.closing = true
-	handles := make([]*loopHandle, 0, len(s.loops))
-	for _, h := range s.loops {
-		handles = append(handles, h)
+	snapshot := make([]loopSnapshot, 0, len(s.loops))
+	for lid, h := range s.loops {
+		snapshot = append(snapshot, loopSnapshot{loopID: lid, handle: h})
 	}
 	s.loopsMu.Unlock()
 
@@ -859,8 +908,8 @@ func (s *Session) Shutdown(ctx context.Context) error {
 	defer s.sessionCancel()
 
 	// (4) Send a graceful Shutdown to every loop in the snapshot.
-	targets := make([]shutdownTarget, 0, len(handles))
-	for _, h := range handles {
+	targets := make([]shutdownTarget, 0, len(snapshot))
+	for _, ls := range snapshot {
 		id, err := s.newCommandID()
 		if err != nil {
 			// id-gen failure for ONE loop must not abort the whole Shutdown: skip
@@ -868,10 +917,14 @@ func (s *Session) Shutdown(ctx context.Context) error {
 			continue
 		}
 		ack := make(chan error, 1)
+		cmd := command.Shutdown{Header: command.Header{CommandID: id, CreatedAt: s.stampNow()}, Ack: ack}
+		// Intent log (audit-only): one record per loop (the command is per-loop), appended
+		// BEFORE this loop's send; an append failure is logged and the fan-out proceeds.
+		s.appendCommand(ctx, ls.loopID, cmd)
 		select {
-		case h.loop.Commands <- command.Shutdown{Header: command.Header{CommandID: id}, Ack: ack}:
-			targets = append(targets, shutdownTarget{loop: h.loop, ack: ack})
-		case <-h.loop.Done:
+		case ls.handle.loop.Commands <- cmd:
+			targets = append(targets, shutdownTarget{loop: ls.handle.loop, ack: ack})
+		case <-ls.handle.loop.Done:
 			// Loop already exited; nothing to wait for.
 		case <-ctx.Done():
 			return &SessionError{Kind: SessionContextDone, Cause: ctx.Err()}
@@ -921,7 +974,7 @@ func (s *Session) Approve(ctx context.Context, loopID, toolExecutionID uuid.UUID
 		return err
 	}
 	// A human approve is a user-origination point (the gate replies): stamp AgencyUser.
-	return s.routeGate(ctx, l, command.ApproveToolCall{Header: command.Header{CommandID: id, Agency: identity.AgencyUser}, GateRoute: route, Scope: scope})
+	return s.routeGate(ctx, route.LoopID, l, command.ApproveToolCall{Header: command.Header{CommandID: id, Agency: identity.AgencyUser, CreatedAt: s.stampNow()}, GateRoute: route, Scope: scope})
 }
 
 // Deny denies the pending tool call identified by toolExecutionID, failing it
@@ -939,7 +992,7 @@ func (s *Session) Deny(ctx context.Context, loopID, toolExecutionID uuid.UUID) e
 		return err
 	}
 	// A human deny is a user-origination point (the gate replies): stamp AgencyUser.
-	return s.routeGate(ctx, l, command.DenyToolCall{Header: command.Header{CommandID: id, Agency: identity.AgencyUser}, GateRoute: route})
+	return s.routeGate(ctx, route.LoopID, l, command.DenyToolCall{Header: command.Header{CommandID: id, Agency: identity.AgencyUser, CreatedAt: s.stampNow()}, GateRoute: route})
 }
 
 // ProvideUserInput supplies the user's answer to the pending AskUser request
@@ -958,7 +1011,7 @@ func (s *Session) ProvideUserInput(ctx context.Context, loopID, toolExecutionID 
 		return err
 	}
 	// A human answer is a user-origination point (the gate replies): stamp AgencyUser.
-	return s.routeGate(ctx, l, command.ProvideUserInput{Header: command.Header{CommandID: id, Agency: identity.AgencyUser}, GateRoute: route, Answer: answer})
+	return s.routeGate(ctx, route.LoopID, l, command.ProvideUserInput{Header: command.Header{CommandID: id, Agency: identity.AgencyUser, CreatedAt: s.stampNow()}, GateRoute: route, Answer: answer})
 }
 
 // resolveGate selects the target loop for a gate reply and builds the command's
@@ -990,7 +1043,12 @@ func (s *Session) resolveGate(loopID, toolExecutionID uuid.UUID) (*loop.Loop, co
 // and never waits for a reply. It selects on ctx.Done() and the loop's Done
 // channel alongside the unbuffered send so the call can never block forever when
 // the actor is busy (ctx times out) or has already exited (Done is closed).
-func (s *Session) routeGate(ctx context.Context, l *loop.Loop, cmd command.Command) error {
+//
+// loopID is the resolved dispatch target (route.LoopID), passed in for the intent-log
+// append — appended audit-only BEFORE the send; an append failure is logged and the
+// gate reply proceeds (a lost record must never block a human's approval/denial).
+func (s *Session) routeGate(ctx context.Context, loopID uuid.UUID, l *loop.Loop, cmd command.Command) error {
+	s.appendCommand(ctx, loopID, cmd)
 	select {
 	case l.Commands <- cmd:
 		return nil

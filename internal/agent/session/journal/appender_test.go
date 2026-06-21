@@ -5,6 +5,7 @@ import (
 	"errors"
 	"testing"
 
+	"github.com/inventivepotter/urvi/internal/agent/loop/command"
 	"github.com/inventivepotter/urvi/internal/agent/loop/event"
 	"github.com/inventivepotter/urvi/internal/agent/loop/identity"
 )
@@ -97,6 +98,89 @@ func TestJournalEventAppenderPropagatesError(t *testing.T) {
 	err := app.AppendEvent(context.Background(), event.SessionStopped{Header: event.Header{Coordinates: identity.Coordinates{SessionID: sid}, EventID: fixedUUID(0x32)}})
 	if !errors.Is(err, wantErr) {
 		t.Fatalf("AppendEvent error = %v, want %v", err, wantErr)
+	}
+}
+
+// TestJournalCommandAppenderRoutes proves the command façade wraps a command in a
+// CommandRecord targeting the given session+loop (the intent-log subject) and carries
+// the command's CommandID as the idempotency id, then calls the underlying Append.
+func TestJournalCommandAppenderRoutes(t *testing.T) {
+	t.Parallel()
+	sid := fixedUUID(0x41)
+	lid := fixedUUID(0x42)
+	cmdID := fixedUUID(0x43)
+
+	tests := []struct {
+		name string
+		cmd  command.Command
+	}{
+		{name: "UserInput routes to the loop cmd subject", cmd: command.UserInput{Header: command.Header{CommandID: cmdID}}},
+		{name: "Interrupt routes to the loop cmd subject", cmd: command.Interrupt{Header: command.Header{CommandID: cmdID}}},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			j := &recordingJournal{}
+			app := NewJournalCommandAppender(j)
+
+			rec := NewCommandRecord(sid, lid, tt.cmd)
+			if err := app.AppendCommand(context.Background(), rec); err != nil {
+				t.Fatalf("AppendCommand = %v, want nil", err)
+			}
+			if len(j.records) != 1 {
+				t.Fatalf("appended %d records, want 1", len(j.records))
+			}
+			got := j.records[0]
+			if got.Subject() != LoopCommandSubject(sid, lid) {
+				t.Errorf("record subject = %q, want %q", got.Subject(), LoopCommandSubject(sid, lid))
+			}
+			if got.IdempotencyID() != cmdID.String() {
+				t.Errorf("record idempotency id = %q, want %q", got.IdempotencyID(), cmdID.String())
+			}
+			cr, ok := got.(CommandRecord)
+			if !ok {
+				t.Fatalf("record type = %T, want CommandRecord", got)
+			}
+			if cr.Command().CommandHeader().CommandID != cmdID {
+				t.Errorf("wrapped command id = %v, want %v", cr.Command().CommandHeader().CommandID, cmdID)
+			}
+		})
+	}
+}
+
+// TestJournalCommandAppenderPropagatesError proves an Append failure is surfaced
+// unchanged to the caller (the session logs+proceeds; the façade itself never swallows).
+func TestJournalCommandAppenderPropagatesError(t *testing.T) {
+	t.Parallel()
+	sid := fixedUUID(0x51)
+	lid := fixedUUID(0x52)
+	wantErr := errors.New("stream rejected the command")
+	j := &recordingJournal{err: wantErr}
+	app := NewJournalCommandAppender(j)
+
+	rec := NewCommandRecord(sid, lid, command.UserInput{Header: command.Header{CommandID: fixedUUID(0x53)}})
+	err := app.AppendCommand(context.Background(), rec)
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("AppendCommand error = %v, want %v", err, wantErr)
+	}
+}
+
+// TestJournalCommandAppenderNilJournal proves the checked constructor's nil guard
+// mirrors the event appender's: a nil SessionJournal fails loud at the composition
+// root rather than nil-deref at the first append.
+func TestJournalCommandAppenderNilJournal(t *testing.T) {
+	t.Parallel()
+	app, err := NewJournalCommandAppenderChecked(nil)
+	if err == nil {
+		t.Fatalf("NewJournalCommandAppenderChecked(nil) err = nil, want error")
+	}
+	if app != nil {
+		t.Errorf("NewJournalCommandAppenderChecked(nil) appender = %v, want nil", app)
+	}
+	var nje *NilJournalError
+	if !errors.As(err, &nje) {
+		t.Fatalf("error %v is not *NilJournalError", err)
 	}
 }
 

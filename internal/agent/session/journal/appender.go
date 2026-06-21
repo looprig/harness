@@ -57,3 +57,51 @@ func (a *JournalEventAppender) AppendEvent(ctx context.Context, ev event.Event) 
 	_, err := a.journal.Append(ctx, NewEventRecord(ev))
 	return err
 }
+
+// JournalCommandAppender adapts a SessionJournal to the narrow "append one command"
+// seam the session depends on for the intent log. The session holds an unexported
+// commandAppender interface (AppendCommand(ctx, CommandRecord) error); this type
+// satisfies it structurally, so the composition root (Phase 10) wires it in without
+// the session importing journal internals beyond the CommandRecord constructor
+// (Dependency Inversion). It carries no state beyond the journal — one method, one
+// responsibility: append a CommandRecord (which the SESSION built with the dispatch
+// target loopID, since a command — Interrupt/Shutdown especially — does not carry its
+// own routing) and return the underlying typed error.
+//
+// Unlike the event appender, the SESSION treats this seam as AUDIT-ONLY: a non-nil
+// error is logged and the dispatch proceeds (losing a command record must never block
+// the user's action). This façade itself never swallows — it returns the journal's
+// error unchanged so the session owns the log-and-proceed decision.
+type JournalCommandAppender struct {
+	journal SessionJournal
+}
+
+// NewJournalCommandAppender wraps journal as a command appender. Like the event
+// appender's unchecked form, it does NOT guard against a nil journal — use
+// NewJournalCommandAppenderChecked at the composition root where a wiring bug must
+// fail loud.
+func NewJournalCommandAppender(journal SessionJournal) *JournalCommandAppender {
+	return &JournalCommandAppender{journal: journal}
+}
+
+// NewJournalCommandAppenderChecked is the fail-loud constructor for the composition
+// root: it returns a typed *NilJournalError if journal is nil rather than deferring the
+// failure to a nil-deref at the first append.
+func NewJournalCommandAppenderChecked(journal SessionJournal) (*JournalCommandAppender, error) {
+	if journal == nil {
+		return nil, &NilJournalError{}
+	}
+	return &JournalCommandAppender{journal: journal}, nil
+}
+
+// AppendCommand appends one intent-log command record: it calls the journal's Append
+// with the session-built CommandRecord and returns the underlying typed error
+// unchanged (the session logs+proceeds — audit-only — never faulting the session on a
+// command-append failure). The CommandRecord routes to the target loop's command
+// (intent-log) subject and uses the command's CommandID as the Nats-Msg-Id
+// (idempotency). The returned sequence is discarded — the session needs only the
+// success/failure signal.
+func (a *JournalCommandAppender) AppendCommand(ctx context.Context, rec CommandRecord) error {
+	_, err := a.journal.Append(ctx, rec)
+	return err
+}
