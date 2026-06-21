@@ -14,10 +14,9 @@ import (
 
 // captureCommand runs call (which sends exactly one command to the fake loop) in a
 // goroutine and returns the command read off the fake loop's Commands channel. The
-// call may park afterward (e.g. Invoke/Stream block on the per-turn reply that the
-// fake loop never sends) — the test only needs the command shape, so the parked
-// goroutine is harmless and reaped at test exit. A send that never arrives fails the
-// test rather than hanging.
+// test only needs the command shape, so any goroutine still parked after the send is
+// harmless and reaped at test exit. A send that never arrives fails the test rather
+// than hanging.
 func captureCommand(t *testing.T, s *Session, cmds chan command.Command, call func(s *Session)) command.Command {
 	t.Helper()
 	go call(s)
@@ -33,10 +32,10 @@ func captureCommand(t *testing.T, s *Session, cmds chan command.Command, call fu
 // TestSessionStampsAgency asserts each command-sending session method stamps the
 // correct Header.Agency on the command it sends: AgencyUser at the discrete
 // human-origination points (the interactive Submit, the gate replies, the manual
-// Interrupt), and the AgencyMachine zero default everywhere else (the programmatic
-// Invoke/Stream submit and the SubagentResult hand-back). Agency is determined by
-// WHICH session method was called — each already encodes a distinct origination
-// semantics — so a machine path cannot accidentally claim user agency.
+// Interrupt), and the AgencyMachine zero default everywhere else (the SubagentResult
+// hand-back). Agency is determined by WHICH session method was called — each already
+// encodes a distinct origination semantics — so a machine path cannot accidentally
+// claim user agency.
 //
 // The fake-loop seam captures the exact command sent on the unbuffered Commands
 // channel — the only observable effect of these fire-and-route / fire-and-forget
@@ -75,11 +74,6 @@ func TestSessionStampsAgency(t *testing.T) {
 			name:       "Interrupt (manual) -> AgencyUser",
 			call:       func(s *Session) { _, _ = s.Interrupt(context.Background()) },
 			wantAgency: identity.AgencyUser,
-		},
-		{
-			name:       "Invoke (programmatic single-shot) -> AgencyMachine",
-			call:       func(s *Session) { _, _ = s.Invoke(context.Background(), blocks) },
-			wantAgency: identity.AgencyMachine,
 		},
 		{
 			name: "SubagentResult hand-back -> AgencyMachine",
@@ -128,8 +122,8 @@ func waitTurnStartedAgency(r *recordingSub, d time.Duration) (identity.Agency, b
 // TestSubmitAgencyReachesTurnStarted is the end-to-end proof against a REAL loop that
 // the agency a session method stamps on its submit command surfaces on the resulting
 // event.TurnStarted's Cause.Agency. A user Submit yields Cause.Agency==AgencyUser ("a
-// human started this turn"); a programmatic Invoke yields AgencyMachine. This closes
-// the loop on the design contract: TurnStarted.Cause.Agency equals its submit
+// human started this turn"); the machine submitToLoop path yields AgencyMachine. This
+// closes the loop on the design contract: TurnStarted.Cause.Agency equals its submit
 // command's Header.Agency, for both the user and the machine case.
 func TestSubmitAgencyReachesTurnStarted(t *testing.T) {
 	t.Parallel()
@@ -148,10 +142,10 @@ func TestSubmitAgencyReachesTurnStarted(t *testing.T) {
 			wantAgency: identity.AgencyUser,
 		},
 		{
-			name: "Invoke -> TurnStarted.Cause.Agency AgencyMachine",
+			name: "machine submitToLoop -> TurnStarted.Cause.Agency AgencyMachine",
 			call: func(t *testing.T, s *Session) {
-				if _, err := s.Invoke(context.Background(), nil); err != nil {
-					t.Fatalf("Invoke: %v", err)
+				if _, err := s.submitToLoop(context.Background(), s.primaryLoopID, nil, identity.AgencyMachine); err != nil {
+					t.Fatalf("submitToLoop: %v", err)
 				}
 			},
 			wantAgency: identity.AgencyMachine,
@@ -182,11 +176,11 @@ func TestSubmitAgencyReachesTurnStarted(t *testing.T) {
 	}
 }
 
-// TestInterruptLoopStaysMachine guards the boundary-cancel translation: the internal
-// interruptLoop (fired when an Invoke/Stream caller's ctx is cancelled, translating
-// the boundary cancel into a turn interrupt) is a MACHINE action — it must NOT inherit
+// TestInterruptLoopStaysMachine guards the per-loop interrupt's attribution: the
+// internal interruptLoop (the subagent drain's ctx-cancel fail-safe, translating a
+// boundary cancel into a turn interrupt) is a MACHINE action — it must NOT inherit
 // the human-stamped AgencyUser of the public Interrupt. Only a human pressing
-// interrupt (Session.Interrupt) is AgencyUser; the programmatic boundary cancel is
+// interrupt (Session.Interrupt) is AgencyUser; the programmatic per-loop interrupt is
 // machine, so we never falsely attribute it to a user (fail-secure attribution).
 func TestInterruptLoopStaysMachine(t *testing.T) {
 	t.Parallel()

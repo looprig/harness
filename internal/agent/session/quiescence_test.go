@@ -36,11 +36,13 @@ func drainSub(t *testing.T, sub interface{ Events() <-chan event.Event }, want f
 	}
 }
 
-// TestEndToEndQuiescence proves the live hub wiring closes the loop: after Invoke
-// completes, WaitIdle returns (the loop emitted LoopIdle -> active empties ->
+// TestEndToEndQuiescence proves the live hub wiring closes the loop: after a Submit
+// turn completes, WaitIdle returns (the loop emitted LoopIdle -> active empties ->
 // SessionIdle), and a subscriber sees the ordered live stream
-// SessionActive -> TurnStarted -> ... -> LoopIdle -> SessionIdle. For the single
-// primary (synchronous) loop, quiescence is exactly the primary loop going idle.
+// SessionActive -> TurnStarted -> ... -> TurnDone -> LoopIdle -> SessionIdle. For the
+// single primary (synchronous) loop, quiescence is exactly the primary loop going
+// idle. Submit is fire-and-forget, so the turn's completion (and its TurnDone
+// terminal) is observed on the fan-in, not returned.
 func TestEndToEndQuiescence(t *testing.T) {
 	t.Parallel()
 	s, err := New(context.Background(), cfg(&stubLLM{chunks: []content.Chunk{textChunk("hi")}}))
@@ -55,8 +57,8 @@ func TestEndToEndQuiescence(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = sub.Close() })
 
-	// Collect the live stream concurrently so a slow Invoke drain never blocks the
-	// loop's publish (the egress is bounded but we drain it promptly).
+	// Collect the live stream concurrently so a slow consumer never blocks the loop's
+	// publish (the egress is bounded but we drain it promptly).
 	var (
 		mu   sync.Mutex
 		seen []event.Event
@@ -83,20 +85,19 @@ func TestEndToEndQuiescence(t *testing.T) {
 		}
 	}()
 
-	term, err := s.Invoke(context.Background(), textBlocks("go"))
-	if err != nil {
-		t.Fatalf("Invoke: %v", err)
-	}
-	if _, ok := term.(event.TurnDone); !ok {
-		t.Fatalf("Invoke terminal = %T, want event.TurnDone", term)
+	// Submit is fire-and-forget: it starts the turn and returns once the loop accepts
+	// the command. The turn runs to its TurnDone terminal asynchronously, observed on
+	// the fan-in (the ordering checks below assert TurnDone is present).
+	if _, err := s.Submit(context.Background(), textBlocks("go")); err != nil {
+		t.Fatalf("Submit: %v", err)
 	}
 
-	// After Invoke returns, the loop goes idle (LoopIdle) and the session reaches
+	// After the turn completes, the loop goes idle (LoopIdle) and the session reaches
 	// SessionIdle; WaitIdle must return nil.
 	waitCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	if err := s.WaitIdle(waitCtx); err != nil {
-		t.Fatalf("WaitIdle after Invoke = %v, want nil", err)
+		t.Fatalf("WaitIdle after Submit = %v, want nil", err)
 	}
 
 	<-done
@@ -257,9 +258,9 @@ func TestChainedTurnsEmitNoLoopIdleBetween(t *testing.T) {
 		}
 	}
 
-	// Invoke turn 1 (StartOnly). It completes, then the actor chains into turn 2.
-	if _, err := s.Invoke(context.Background(), textBlocks("turn1")); err != nil {
-		t.Fatalf("Invoke: %v", err)
+	// Submit turn 1 (fire-and-forget). It completes, then the actor chains into turn 2.
+	if _, err := s.Submit(context.Background(), textBlocks("turn1")); err != nil {
+		t.Fatalf("Submit: %v", err)
 	}
 
 	// Collect until SessionIdle (the whole chain is at rest).

@@ -145,10 +145,11 @@ func TestSubagentResultNeverRejectedReleasesWakeViaInputCancelled(t *testing.T) 
 
 	subagentLoopID := mustUUID()
 
-	// Occupy the loop with a running turn (Invoke blocks on the provider).
-	invokeStarted := make(chan struct{})
-	go func() { close(invokeStarted); _, _ = s.Invoke(context.Background(), textBlocks("occupy")) }()
-	<-invokeStarted
+	// Occupy the loop with a running turn (Submit is fire-and-forget; the provider
+	// blocks so the turn stays running).
+	if _, err := s.Submit(context.Background(), textBlocks("occupy")); err != nil {
+		t.Fatalf("Submit: %v", err)
+	}
 	// Wait until the loop is actually running (TurnStarted observed on the fan-in).
 	if !drainFor[event.TurnStarted](t, sub) {
 		t.Fatal("occupying turn never started")

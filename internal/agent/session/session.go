@@ -61,10 +61,10 @@ func (e *SessionError) Error() string {
 }
 func (e *SessionError) Unwrap() error { return e.Cause }
 
-// TurnRejectedError is returned by Invoke when the loop refuses to start a
-// turn for a StartOnly submit. Invoke is the programmatic single-shot
-// (start-or-reject) callers, so a published event.TurnRejected on the per-turn
-// stream is surfaced as this typed error. Reason carries the event RejectReason
+// TurnRejectedError is returned by drainToFinalText when the loop refuses to start
+// a turn for a subagent submit — a phase-1 event.TurnRejected for the submit's
+// Cause.CommandID means no turn will ever start, so the drain surfaces it as this
+// typed error. Reason carries the event RejectReason
 // (Busy/QueueFull/ShuttingDown/Internal) so callers can errors.As and branch (e.g.
 // retry-on-busy, or retry a transient RejectInternal).
 type TurnRejectedError struct {
@@ -119,8 +119,8 @@ type Session struct {
 	// orchestration adds subagent loops with a non-zero parent.
 	loops map[uuid.UUID]*loopHandle
 
-	// primaryLoopID is the default target for Invoke/Interrupt/Shutdown
-	// and the gate-answer methods.
+	// primaryLoopID is the default target for Submit and the gate-answer methods
+	// (and the loop Interrupt/Shutdown fan out across, starting from).
 	primaryLoopID uuid.UUID
 
 	// closing is the fail-secure latch: once set, NewLoop refuses to create or
@@ -176,7 +176,7 @@ func (s *Session) SubscribeEvents(filter event.EventFilter) (*hub.EventSubscript
 }
 
 // PrimaryLoopID returns the session's primary loop id — the default target for
-// Invoke and the loop whose live Ephemeral tokens a single-loop TUI streams.
+// Submit and the loop whose live Ephemeral tokens a single-loop TUI streams.
 // A whole-session subscriber builds its EventFilter from it (primary-only Ephemeral
 // + all-loop Enduring). It is read-only identity, safe to call concurrently.
 func (s *Session) PrimaryLoopID() uuid.UUID {
@@ -425,88 +425,10 @@ func New(ctx context.Context, cfg loop.Config) (*Session, error) {
 	return s, nil
 }
 
-// Invoke sends input as a StartOnly UserInput and blocks until a terminal event.
-// It is the programmatic single-shot caller (start-or-reject), reading the outcome
-// from the per-turn stream's first event: an event.TurnStarted proceeds; an
-// event.TurnRejected returns a typed *TurnRejectedError. The submit carries no context (the loop derives the turn
-// ctx from its loopCtx), so cancelling ctx no longer cancels the turn through the
-// command — instead the session translates the boundary cancel into an Interrupt
-// and returns the resulting event.TurnInterrupted.
-func (s *Session) Invoke(ctx context.Context, input []content.Block) (event.Event, error) {
-	l, ok := s.loopFor(s.primaryLoopID)
-	if !ok {
-		return nil, &SessionError{Kind: SessionLoopNotFound}
-	}
-	id, err := s.newCommandID()
-	if err != nil {
-		return nil, err
-	}
-	events := make(chan event.Event, 64)
-	abandoned := make(chan struct{})
-	defer close(abandoned) // ensures deliverAndClose always has an escape if Invoke exits early
-
-	select {
-	// User-initiated turn: Cause.CommandID is zero (root).
-	case l.Commands <- command.UserInput{Header: command.Header{CommandID: id}, Mode: command.StartOnly, Blocks: input, Events: events, Abandoned: abandoned}:
-	case <-ctx.Done():
-		return nil, &SessionError{Kind: SessionContextDone, Cause: ctx.Err()}
-	case <-l.Done:
-		return nil, &SessionError{Kind: SessionLoopExited}
-	}
-
-	// The start-or-reject outcome is the FIRST event on the per-turn stream: the loop
-	// delivers event.TurnRejected (then closes the stream) on a refusal, or
-	// event.TurnStarted on success. Read it before draining to the terminal.
-	select {
-	case first, ok := <-events:
-		if !ok {
-			// Stream closed with no event: a rejection whose on-stream send lost the
-			// non-blocking race (defensive — the loop sends before closing). The fan-in
-			// still carries the authoritative TurnRejected; surface a generic rejection.
-			return nil, &SessionError{Kind: SessionEventChannelClosed}
-		}
-		if rej, ok := first.(event.TurnRejected); ok {
-			return nil, &TurnRejectedError{Reason: rej.Reason}
-		}
-		// event.TurnStarted (or any non-reject first event): a turn exists; fall through
-		// and keep draining for the terminal. The first event itself is not a terminal.
-	case <-l.Done:
-		return nil, &SessionError{Kind: SessionLoopExited}
-	}
-
-	// interrupted guards a single best-effort Interrupt: once ctx is done we cancel
-	// the turn and keep draining for the resulting terminal.
-	interrupted := false
-	for {
-		select {
-		case ev, ok := <-events:
-			if !ok {
-				return nil, &SessionError{Kind: SessionEventChannelClosed}
-			}
-			switch ev.(type) {
-			case event.TurnDone, event.TurnFailed, event.TurnInterrupted:
-				return ev, nil
-			}
-		case <-ctx.Done():
-			// Boundary cancel: submits carry no ctx, so translate it into an
-			// Interrupt and keep draining for the TurnInterrupted terminal.
-			if !interrupted {
-				interrupted = true
-				s.interruptLoop(l)
-			}
-		case <-l.Done:
-			// Hard loop kill: on a DrainTimeout detach the actor never closes
-			// `events`, so without this escape Invoke would block forever. The
-			// loop is gone, so no terminal can arrive.
-			return nil, &SessionError{Kind: SessionLoopExited}
-		}
-	}
-}
-
 // interruptLoop sends a best-effort Interrupt to the loop to cancel its active
 // turn, escaping on the loop's Done so a stopped loop never wedges the send. It is
-// used to translate an Invoke boundary-ctx cancel (the submit carries no
-// ctx) into a turn cancellation. The ack is buffered(1) and unread here: the
+// the loop-targeted cancel primitive interruptLoopID delegates to (the subagent
+// drain's ctx-cancel fail-safe). The ack is buffered(1) and unread here: the
 // caller observes the cancellation through the resulting TurnInterrupted terminal,
 // not this command's reply. An id-gen failure is swallowed (best-effort): the worst
 // case is the turn runs to its natural terminal instead of being interrupted.
@@ -543,8 +465,8 @@ func (s *Session) interruptLoopID(loopID uuid.UUID) error {
 }
 
 // Submit is the HUMAN-ONLY submit entry point: it stamps Agency=AgencyUser (a
-// person authored this input). Programmatic/machine callers use Invoke
-// (StartOnly), which stays Agency=AgencyMachine.
+// person authored this input). Programmatic/machine callers go through
+// submitToLoop with Agency=AgencyMachine (the subagent path).
 //
 // Submit sends input as an AllowFold (queueable) UserInput to the primary loop,
 // FIRE-AND-FORGET: it returns the InputID (the submit command's id, == the
@@ -556,10 +478,10 @@ func (s *Session) interruptLoopID(loopID uuid.UUID) error {
 //
 // AllowFold is the interactive queueable mode: a submit while a turn is running
 // QUEUES rather than rejecting; a submit while idle starts a turn. Submit attaches
-// no per-turn stream (Events/Abandoned nil) — unlike Invoke, it never reads
-// a reply, so it returns the instant the command is accepted by the loop.
+// no per-turn stream — it never reads a reply, so it returns the instant the
+// command is accepted by the loop.
 //
-// The send carries the same escapes as Invoke: ctx.Done() →
+// The send carries the standard escapes: ctx.Done() →
 // SessionContextDone, the loop's Done → SessionLoopExited, and a missing primary
 // loop → SessionLoopNotFound. On any of those the returned id is the zero UUID,
 // because nothing was sent and there is no correlation to hand back.
@@ -728,9 +650,9 @@ func (s *Session) Interrupt(ctx context.Context) (bool, error) {
 		ack := make(chan bool, 1)
 		select {
 		// A manual Interrupt is a human-origination point (the human pressed interrupt),
-		// so it stamps Agency=AgencyUser. The programmatic boundary-cancel translation
-		// (interruptLoop, fired by an Invoke ctx cancel) is a SEPARATE method and
-		// stays machine — we never falsely attribute that machine action to a user.
+		// so it stamps Agency=AgencyUser. The programmatic per-loop interrupt
+		// (interruptLoop, the subagent drain's ctx-cancel fail-safe) is a SEPARATE method
+		// and stays machine — we never falsely attribute that machine action to a user.
 		case h.loop.Commands <- command.Interrupt{Header: command.Header{CommandID: id, Agency: identity.AgencyUser}, Ack: ack}:
 			targets = append(targets, interruptTarget{loop: h.loop, ack: ack})
 		case <-h.loop.Done:

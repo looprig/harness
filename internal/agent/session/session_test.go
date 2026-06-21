@@ -431,7 +431,7 @@ func TestRoutingMethodsLoopNotFound(t *testing.T) {
 		name string
 		call func(s *Session) error
 	}{
-		{name: "Invoke", call: func(s *Session) error { _, err := s.Invoke(context.Background(), nil); return err }},
+		{name: "Submit", call: func(s *Session) error { _, err := s.Submit(context.Background(), nil); return err }},
 		// Approve/Deny/ProvideUserInput resolve the target loop by id (the primary
 		// here), which misses once the primary entry is deleted below.
 		{name: "Approve", call: func(s *Session) error {
@@ -578,7 +578,7 @@ func (g *capturingIDGen) last() (uuid.UUID, bool) {
 }
 
 // first returns the earliest minted id. What that id means is call-site specific
-// (e.g. the turn-initiating UserInput's id for Invoke, or NewLoop's loop id, the
+// (e.g. the turn-initiating UserInput's id for Submit, or NewLoop's loop id, the
 // first of its two mints); each call site documents which id it expects.
 func (g *capturingIDGen) first() (uuid.UUID, bool) {
 	g.mu.Lock()
@@ -592,7 +592,7 @@ func (g *capturingIDGen) first() (uuid.UUID, bool) {
 // TestStampsCommandHeaderID asserts every command-sending method stamps a
 // fresh, non-zero Header.ID on the command it sends. Each method mints the ID
 // through the session's idGenerator seam, so a non-zero captured value proves
-// the stamp. For Invoke the loop also copies the command's Header.ID
+// the stamp. For Submit the loop also copies the command's Header.ID
 // onto each turn event's Cause.CommandID, so the Cause.CommandID observed through a hub
 // Subscription must equal the captured ID — an end-to-end check that the stamp
 // reaches the loop.
@@ -604,10 +604,10 @@ func TestStampsCommandHeaderID(t *testing.T) {
 		observeable bool // true when the stamped ID surfaces via a turn event's Cause.CommandID
 	}{
 		{
-			name: "Invoke",
+			name: "Submit",
 			call: func(t *testing.T, s *Session) {
-				if _, err := s.Invoke(context.Background(), nil); err != nil {
-					t.Fatalf("Invoke: %v", err)
+				if _, err := s.Submit(context.Background(), nil); err != nil {
+					t.Fatalf("Submit: %v", err)
 				}
 			},
 			observeable: true,
@@ -698,7 +698,7 @@ func TestNewCommandIDGenerationFailure(t *testing.T) {
 		name string
 		call func(s *Session) error
 	}{
-		{name: "Invoke", call: func(s *Session) error { _, err := s.Invoke(context.Background(), nil); return err }},
+		{name: "Submit", call: func(s *Session) error { _, err := s.Submit(context.Background(), nil); return err }},
 	}
 	for _, tt := range tests {
 		tt := tt
@@ -769,63 +769,6 @@ func TestShutdownIDGenFailureStillTearsDownAllLoops(t *testing.T) {
 	}
 }
 
-func TestInvokeReturnsTurnDone(t *testing.T) {
-	t.Parallel()
-	s, err := New(context.Background(), cfg(&stubLLM{chunks: []content.Chunk{textChunk("hello")}}))
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
-	t.Cleanup(func() { _ = s.Shutdown(context.Background()) })
-	ev, err := s.Invoke(context.Background(), nil)
-	if err != nil {
-		t.Fatalf("Invoke: %v", err)
-	}
-	if _, ok := ev.(event.TurnDone); !ok {
-		t.Fatalf("event = %T, want event.TurnDone", ev)
-	}
-}
-
-func TestInvokeCtxCancelReturnsInterrupted(t *testing.T) {
-	t.Parallel()
-	s, err := New(context.Background(), cfg(&stubLLM{blockUntilCancel: true}))
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
-	t.Cleanup(func() { _ = s.Shutdown(context.Background()) })
-	ctx, cancel := context.WithCancel(context.Background())
-	go func() { time.Sleep(20 * time.Millisecond); cancel() }()
-	ev, err := s.Invoke(ctx, nil)
-	if err != nil {
-		t.Fatalf("Invoke returned Go error %v, want TurnInterrupted event", err)
-	}
-	if _, ok := ev.(event.TurnInterrupted); !ok {
-		t.Fatalf("event = %T, want event.TurnInterrupted", ev)
-	}
-}
-
-func TestConcurrentInvokeIsRejected(t *testing.T) {
-	t.Parallel()
-	s, err := New(context.Background(), cfg(&stubLLM{blockUntilCancel: true}))
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
-	t.Cleanup(func() { _ = s.Shutdown(context.Background()) })
-
-	// first Invoke blocks (provider blocks); run it in the background
-	ctx1, cancel1 := context.WithCancel(context.Background())
-	defer cancel1()
-	started := make(chan struct{})
-	go func() { close(started); _, _ = s.Invoke(ctx1, nil) }()
-	<-started
-	time.Sleep(30 * time.Millisecond) // let the first turn occupy the loop
-
-	_, err = s.Invoke(context.Background(), nil)
-	var rej *TurnRejectedError
-	if !errors.As(err, &rej) || rej.Reason != event.RejectBusy {
-		t.Fatalf("second Invoke err = %v, want *TurnRejectedError{RejectBusy}", err)
-	}
-}
-
 func TestShutdownThenMethodsExit(t *testing.T) {
 	t.Parallel()
 	s, err := New(context.Background(), cfg(&stubLLM{chunks: []content.Chunk{textChunk("x")}}))
@@ -840,47 +783,20 @@ func TestShutdownThenMethodsExit(t *testing.T) {
 		t.Fatalf("second Shutdown: %v", err)
 	}
 	// methods after shutdown return SessionLoopExited, no deadlock
-	_, err = s.Invoke(context.Background(), nil)
+	_, err = s.Submit(context.Background(), nil)
 	var se *SessionError
 	if !errors.As(err, &se) || se.Kind != SessionLoopExited {
-		t.Fatalf("Invoke after shutdown err = %v, want *SessionError{SessionLoopExited}", err)
+		t.Fatalf("Submit after shutdown err = %v, want *SessionError{SessionLoopExited}", err)
 	}
 }
 
-// TestInvokeUnblocksOnLoopDeath guards the Invoke counterpart of fix #4: a caller
-// parked draining events must not hang forever when the loop is hard-killed and
-// the (ctx-ignoring) provider keeps the detached turn goroutine alive, so the
-// actor returns without closing the events channel.
-func TestInvokeUnblocksOnLoopDeath(t *testing.T) {
-	t.Parallel()
-	ctx, cancel := context.WithCancel(context.Background())
-	s, err := New(ctx, cfg(&stubLLM{blockUntilCancel: true, ignoreCtx: true}))
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
-	errCh := make(chan error, 1)
-	go func() {
-		_, err := s.Invoke(context.Background(), nil)
-		errCh <- err
-	}()
-	time.Sleep(40 * time.Millisecond) // ensure Invoke is parked draining events
-
-	cancel() // hard-kill the loop
-
-	select {
-	case err := <-errCh:
-		var se *SessionError
-		if !errors.As(err, &se) || se.Kind != SessionLoopExited {
-			t.Fatalf("Invoke after loop death = %v, want *SessionError{SessionLoopExited}", err)
-		}
-	case <-time.After(3 * time.Second):
-		t.Fatal("Invoke hung after loop death (missing loop.Done escape)")
-	}
-}
-
-// TestInterruptDuringInvoke: while Invoke blocks, Interrupt returns (true, nil)
-// and the Invoke returns a TurnInterrupted event.
-func TestInterruptDuringInvoke(t *testing.T) {
+// TestInterruptDuringRunningTurn is the session-level integration proof that a human
+// Interrupt against a REAL running primary turn returns (true, nil) AND ends that turn
+// on a TurnInterrupted terminal. The turn is started fire-and-forget via Submit (the
+// provider blocks so the turn stays running); both the running state and the terminal
+// are observed on the event fan-in (the same surface a TUI/CLI consumes), not a
+// blocking call's return value.
+func TestInterruptDuringRunningTurn(t *testing.T) {
 	t.Parallel()
 	s, err := New(context.Background(), cfg(&stubLLM{blockUntilCancel: true}))
 	if err != nil {
@@ -888,33 +804,35 @@ func TestInterruptDuringInvoke(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = s.Shutdown(context.Background()) })
 
-	evCh := make(chan event.Event, 1)
-	errCh := make(chan error, 1)
-	go func() {
-		ev, err := s.Invoke(context.Background(), nil)
-		evCh <- ev
-		errCh <- err
-	}()
-	time.Sleep(30 * time.Millisecond) // let the turn occupy the loop
+	// Subscribe BEFORE submitting (the hub has no replay) so the TurnStarted that
+	// proves the turn is running, and the TurnInterrupted terminal, are both observed.
+	sub, err := s.SubscribeEvents(allFilter())
+	if err != nil {
+		t.Fatalf("SubscribeEvents: %v", err)
+	}
+	t.Cleanup(func() { _ = sub.Close() })
+
+	if _, err := s.Submit(context.Background(), nil); err != nil {
+		t.Fatalf("Submit: %v", err)
+	}
+
+	// Wait until the turn is actually running (TurnStarted on the fan-in) so the
+	// Interrupt lands on a live turn deterministically.
+	if !drainFor[event.TurnStarted](t, sub) {
+		t.Fatal("turn never started")
+	}
 
 	cancelled, err := s.Interrupt(context.Background())
 	if err != nil {
 		t.Fatalf("Interrupt: %v", err)
 	}
 	if !cancelled {
-		t.Fatal("Interrupt returned false, want true")
+		t.Fatal("Interrupt returned false, want true (a running turn was cancelled)")
 	}
 
-	select {
-	case ev := <-evCh:
-		if err := <-errCh; err != nil {
-			t.Fatalf("Invoke returned Go error %v, want TurnInterrupted event", err)
-		}
-		if _, ok := ev.(event.TurnInterrupted); !ok {
-			t.Fatalf("Invoke event = %T, want event.TurnInterrupted", ev)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("Invoke did not return after Interrupt")
+	// The cancelled turn ends on a TurnInterrupted terminal, observed on the fan-in.
+	if !drainFor[event.TurnInterrupted](t, sub) {
+		t.Fatal("running turn did not end on a TurnInterrupted terminal after Interrupt")
 	}
 }
 
@@ -930,7 +848,9 @@ func TestInterruptCtxCancelledBeforeSend(t *testing.T) {
 
 	// occupy the loop so the unbuffered Commands send would block, forcing the
 	// ctx.Done() branch to win deterministically.
-	go func() { _, _ = s.Invoke(context.Background(), nil) }()
+	if _, err := s.Submit(context.Background(), nil); err != nil {
+		t.Fatalf("Submit: %v", err)
+	}
 	time.Sleep(30 * time.Millisecond)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -956,7 +876,9 @@ func TestShutdownCtxCancelledBeforeSend(t *testing.T) {
 	t.Cleanup(func() { _ = s.Shutdown(context.Background()) })
 
 	// occupy the loop so the Commands send blocks, forcing the ctx.Done() branch.
-	go func() { _, _ = s.Invoke(context.Background(), nil) }()
+	if _, err := s.Submit(context.Background(), nil); err != nil {
+		t.Fatalf("Submit: %v", err)
+	}
 	time.Sleep(30 * time.Millisecond)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -984,7 +906,9 @@ func TestShutdownSurfacesLoopTerminatedError(t *testing.T) {
 		t.Fatalf("New: %v", err)
 	}
 	// Occupy the loop with a turn that never completes (provider ignores ctx).
-	go func() { _, _ = s.Invoke(context.Background(), nil) }()
+	if _, err := s.Submit(context.Background(), nil); err != nil {
+		t.Fatalf("Submit: %v", err)
+	}
 	time.Sleep(40 * time.Millisecond)
 
 	// Shutdown parks waiting for the (never-arriving) internal result.
