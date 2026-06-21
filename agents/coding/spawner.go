@@ -20,7 +20,8 @@ import (
 // RECURSION. Each Spawn builds a FRESH ToolSet whose Subagent tool is wired with
 // THIS same spawner, so a sub-loop can itself spawn a grandchild. The recursion is
 // unbounded — the depth cap was intentionally dropped (design §8): subagent loops
-// are siblings under the session, persist idle, and route follow-ups back, so
+// persist as siblings under the session root, each recorded under its spawning
+// step's provenance (parent→child), persist idle, and route follow-ups back, so
 // there is no per-call child session to bound.
 
 // codingSpawner adapts the real session engine to tools.Spawner. It owns the
@@ -48,6 +49,11 @@ type codingSpawner struct {
 // grants never leak into the parent's policy, and vice versa (per-loop approval
 // isolation). The fresh tool set's Subagent tool is wired with THIS spawner, so a
 // sub-loop can recurse into a grandchild.
+//
+// ctx is the CALLING TURN's context (the parent step's): a ctx-cancel interrupts the
+// sub-loop's in-flight TURN (RunSubagent translates it into a loop-targeted Interrupt
+// and drains to TurnInterrupted) — it does NOT tear the persistent sub-loop down. The
+// sub-loop survives idle under the session root and routes follow-ups back (design §8).
 func (sp *codingSpawner) Spawn(ctx context.Context, parent loop.Provenance, message string) (string, error) {
 	toolSet := buildToolSet(sp.root, sp.httpCl, sp)
 	cfg := loop.Config{Client: sp.client, Model: sp.spec, Tools: toolSet}

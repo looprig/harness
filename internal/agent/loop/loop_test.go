@@ -73,27 +73,6 @@ func blockUntilEvents(t *testing.T, rec *recordingPublisher, pred func([]event.E
 	}
 }
 
-// newLoopRec is like newLoop but injects a recordingPublisher (instead of
-// noopPublisher{}) as the event publisher and returns it, so a test can observe
-// the full-fidelity events the production hub would see. It uses a 200ms
-// DrainTimeout; the root cancel is registered with t.Cleanup and also returned
-// for callers that cancel explicitly.
-func newLoopRec(t *testing.T, client llm.LLM) (*Loop, *recordingPublisher, context.CancelFunc) {
-	t.Helper()
-	ctx, cancel := context.WithCancel(context.Background())
-	rec := &recordingPublisher{}
-	l, err := New(ctx, mustID(t), mustID(t), Provenance{}, rec, Config{
-		Client:       client,
-		Model:        llm.ModelSpec{Model: "m"},
-		DrainTimeout: 200 * time.Millisecond,
-	})
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
-	t.Cleanup(cancel)
-	return l, rec, cancel
-}
-
 // newLoop starts a loop with a 200ms DrainTimeout wired to a recordingPublisher,
 // and returns it plus the recorder and the root cancel. Every loop event is observed
 // on the session fan-in (there is no per-turn stream), so the recorder is the single
@@ -199,7 +178,7 @@ func terminalIndex(rec *recordingPublisher, from int) int {
 // observed loop events through a sink.
 func TestRecordingPublisherObservesTurnStarted(t *testing.T) {
 	t.Parallel()
-	l, rec, _ := newLoopRec(t, &fakeLLM{chunks: []content.Chunk{textChunk("hi")}})
+	l, rec, _ := newLoop(t, &fakeLLM{chunks: []content.Chunk{textChunk("hi")}})
 	startTurn(t, l, rec, nil)
 
 	blockUntilEvents(t, rec, func(evs []event.Event) bool {
@@ -355,7 +334,7 @@ func TestSingleTurn(t *testing.T) {
 // observes via cfg.events.PublishEvent (the production hub path).
 func TestTurnEventCorrelationStamped(t *testing.T) {
 	t.Parallel()
-	l, rec, _ := newLoopRec(t, &fakeLLM{chunks: []content.Chunk{textChunk("hi")}})
+	l, rec, _ := newLoop(t, &fakeLLM{chunks: []content.Chunk{textChunk("hi")}})
 
 	cmdID, err := uuid.New()
 	if err != nil {
@@ -677,7 +656,7 @@ func awaitReply(t *testing.T, rec *recordingPublisher, inputID uuid.UUID) event.
 // the only evidence the turn ran (there is no per-turn stream).
 func TestFanInOnlyUserInputStartsTurn(t *testing.T) {
 	t.Parallel()
-	l, rec, _ := newLoopRec(t, &fakeLLM{chunks: []content.Chunk{textChunk("hi")}})
+	l, rec, _ := newLoop(t, &fakeLLM{chunks: []content.Chunk{textChunk("hi")}})
 
 	id := mustID(t)
 	l.Commands <- command.UserInput{Header: command.Header{CommandID: id}, Blocks: nil}

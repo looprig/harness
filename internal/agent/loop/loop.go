@@ -363,31 +363,12 @@ func runLoop(cfg loopConfig, state loopState) {
 	// fan-in's subscribers; the loop never emits one. PublishEvent returns nil even
 	// with no subscribers (the headless case), so a non-nil error is a genuine
 	// fault; log it and continue (event publication must not abort the loop). Every
-	// loop event reaches consumers through this single fan-in path: emitTurn and
-	// deliverTerminal are publish-only aliases used at the install/commit/terminal
-	// points so those sites read as "emit a turn event".
+	// loop event reaches consumers through this single fan-in path.
 	publish := func(ev event.Event) {
 		if err := cfg.events.PublishEvent(ctx, stampLoopHeader(ev, state.sessionID, state.id, state.turnID)); err != nil {
 			slog.Error("loop event publish to session fan-in failed", "error", err)
 		}
 	}
-
-	// emitTurn is the ACTOR-side emit, used at the commit point to emit the initial
-	// TurnStarted and each step's StepDone. It is now publish-only: every loop event
-	// reaches consumers through the session fan-in. The blocking commit handshake
-	// still guarantees the turn goroutine is parked in cfg.commit while the actor
-	// calls this, so a step's TokenDeltas (from the turn goroutine) all precede that
-	// step's StepDone (from here) on the fan-in. Retained as a named alias of publish
-	// so the commit/install sites keep reading as "emit a turn event".
-	emitTurn := publish
-
-	// deliverTerminal publishes the terminal event. With the per-turn stream removed
-	// it is now publish-only: the publish to the session fan-in IS the whole delivery.
-	// It is still called only by the actor, only after the turn goroutine has sent its
-	// result on `internal`, so the terminal is the last event the actor emits for the
-	// turn. Retained as a named alias of publish so the terminal-delivery sites read
-	// as "deliver the terminal".
-	deliverTerminal := publish
 
 	// emitLoopIdle announces the loop's running->idle transition: an Enduring,
 	// non-terminal LoopIdle carrying only the loop's identity (SessionID + LoopID;
@@ -462,7 +443,7 @@ func runLoop(cfg loopConfig, state loopState) {
 		// TurnStarted (Message + Cause.CommandID = inputID + InputID = inputID) at the
 		// SAME actor-owned point, BEFORE runTurn starts.
 		state.msgs = append(state.msgs, qi.msg)
-		emitTurn(event.TurnStarted{
+		publish(event.TurnStarted{
 			Header: event.Header{
 				Coordinates: identity.Coordinates{
 					SessionID: state.sessionID,
@@ -827,9 +808,9 @@ func runLoop(cfg loopConfig, state loopState) {
 			state.status = loopIdle
 		}
 		endedTurnID := state.turnID
-		// deliverTerminal publishes the terminal envelope, which must still carry this
-		// turn's correlation IDs, so clear them only afterward.
-		deliverTerminal(result.terminal)
+		// The terminal publish must still carry this turn's correlation IDs (stamped by
+		// publish from state.turnID), so clear them only afterward.
+		publish(result.terminal)
 		state.turnID = uuid.UUID{}
 		state.causationID = uuid.UUID{}
 		// A finished turn must not leave stale gates: the parked runners have already
@@ -971,7 +952,7 @@ func runLoop(cfg loopConfig, state loopState) {
 			// StepDone emitted here always follows that step's TokenDeltas on the
 			// fan-in. Ack last so the runner only resumes after the event is published.
 			state.msgs = append(state.msgs, req.commit.Messages...)
-			emitTurn(req.commit.Event)
+			publish(req.commit.Event)
 			// A folded user message is now committed: resolve its draining entry (its
 			// TurnFoldedInto was just emitted), so the abnormal-terminal return path
 			// does not also return it. StepDone commits carry no inbox entry.
@@ -998,7 +979,7 @@ func runLoop(cfg loopConfig, state loopState) {
 				// wedged there and would never have produced a terminal anyway.
 				select {
 				case result := <-internal:
-					deliverTerminal(result.terminal)
+					publish(result.terminal)
 				case <-time.After(config.DrainTimeout):
 					slog.Error("turn goroutine did not drain after ctx cancel; detaching",
 						"timeout", config.DrainTimeout)

@@ -34,7 +34,7 @@ func textBlocks(s string) []content.Block {
 // outcome.
 func TestSubmitToIdleStartsTurn(t *testing.T) {
 	t.Parallel()
-	l, rec, _ := newLoopRec(t, &fakeLLM{chunks: []content.Chunk{textChunk("hi")}})
+	l, rec, _ := newLoop(t, &fakeLLM{chunks: []content.Chunk{textChunk("hi")}})
 
 	inputID := mustID(t)
 	l.Commands <- command.UserInput{Header: command.Header{CommandID: inputID}, Blocks: textBlocks("hello")}
@@ -62,7 +62,7 @@ func TestSubmitToIdleStartsTurn(t *testing.T) {
 // rides the CHILD, which is the behavior the old FromLoopID provided.
 func TestSubagentResultToIdleStartsTurn(t *testing.T) {
 	t.Parallel()
-	l, rec, _ := newLoopRec(t, &fakeLLM{chunks: []content.Chunk{textChunk("hi")}})
+	l, rec, _ := newLoop(t, &fakeLLM{chunks: []content.Chunk{textChunk("hi")}})
 
 	inputID := mustID(t)
 	childLoop := mustID(t)  // the producing subagent (wake token)
@@ -92,7 +92,7 @@ func TestSubagentResultToIdleStartsTurn(t *testing.T) {
 func TestSubmitToRunningQueueableQueues(t *testing.T) {
 	t.Parallel()
 	// blockUntilCancel keeps the first turn running so the second submit queues.
-	l, rec, _ := newLoopRec(t, &fakeLLM{blockUntilCancel: true})
+	l, rec, _ := newLoop(t, &fakeLLM{blockUntilCancel: true})
 	startTurn(t, l, rec, nil) // occupy the loop
 
 	idA := mustID(t)
@@ -128,7 +128,7 @@ func TestSubmitToRunningQueueableQueues(t *testing.T) {
 // event.
 func TestSubagentResultToFullInboxQueues(t *testing.T) {
 	t.Parallel()
-	l, rec, _ := newLoopRec(t, &fakeLLM{blockUntilCancel: true})
+	l, rec, _ := newLoop(t, &fakeLLM{blockUntilCancel: true})
 	startTurn(t, l, rec, nil) // occupy the loop
 
 	// Fill the inbox to capacity with UserInputs.
@@ -234,7 +234,7 @@ func TestSubagentResultIDGenerationFailureCancels(t *testing.T) {
 // with event.TurnRejected{RejectQueueFull} (a length check; never blocks).
 func TestInboxFullRejected(t *testing.T) {
 	t.Parallel()
-	l, rec, _ := newLoopRec(t, &fakeLLM{blockUntilCancel: true})
+	l, rec, _ := newLoop(t, &fakeLLM{blockUntilCancel: true})
 	startTurn(t, l, rec, nil) // occupy the loop
 
 	// Fill the inbox to capacity.
@@ -257,7 +257,7 @@ func TestInboxFullRejected(t *testing.T) {
 // event.TurnRejected{RejectShuttingDown}.
 func TestShuttingDownRejected(t *testing.T) {
 	t.Parallel()
-	l, rec, _ := newLoopRec(t, &fakeLLM{blockUntilCancel: true})
+	l, rec, _ := newLoop(t, &fakeLLM{blockUntilCancel: true})
 	startTurn(t, l, rec, nil)
 
 	// Shutdown flips status to loopShuttingDown; the running turn winds down.

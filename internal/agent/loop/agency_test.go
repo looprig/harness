@@ -62,7 +62,7 @@ func TestTurnStartedCopiesCommandAgency(t *testing.T) {
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			l, rec, _ := newLoopRec(t, &fakeLLM{chunks: []content.Chunk{textChunk("hi")}})
+			l, rec, _ := newLoop(t, &fakeLLM{chunks: []content.Chunk{textChunk("hi")}})
 			inputID := mustID(t)
 			tt.send(t, l, inputID)
 
@@ -152,7 +152,7 @@ func TestInputCancelledCopiesCommandAgency(t *testing.T) {
 			t.Parallel()
 			// blockUntilCancel keeps the first turn running so the second submit queues
 			// and can then be retracted while still queued.
-			l, rec, _ := newLoopRec(t, &fakeLLM{blockUntilCancel: true})
+			l, rec, _ := newLoop(t, &fakeLLM{blockUntilCancel: true})
 			startTurn(t, l, rec, nil) // occupies the loop
 
 			queuedID := mustID(t)

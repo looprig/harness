@@ -42,7 +42,7 @@ func hasInputCancelled(evs []event.Event, inputID uuid.UUID, reason event.Cancel
 // (a second retract finds it gone and is a pure no-op — no second InputCancelled).
 func TestCancelWhileQueuedPublishesInputCancelled(t *testing.T) {
 	t.Parallel()
-	l, rec, _ := newLoopRec(t, &fakeLLM{blockUntilCancel: true})
+	l, rec, _ := newLoop(t, &fakeLLM{blockUntilCancel: true})
 	startTurn(t, l, rec, nil) // occupy the loop
 
 	// Queue an input behind the running turn.
@@ -75,7 +75,7 @@ func TestCancelWhileQueuedPublishesInputCancelled(t *testing.T) {
 // absence of an InputCancelled for the unknown id is meaningful, not just latency.
 func TestCancelUnknownInputIsNoop(t *testing.T) {
 	t.Parallel()
-	l, rec, _ := newLoopRec(t, &fakeLLM{blockUntilCancel: true})
+	l, rec, _ := newLoop(t, &fakeLLM{blockUntilCancel: true})
 	startTurn(t, l, rec, nil)
 
 	// Prove the loop is alive: queue a real input and observe its InputQueued.
@@ -136,7 +136,7 @@ func TestAbnormalTerminalReturnsQueuedInput(t *testing.T) {
 
 	t.Run("interrupt returns queued input as CancelTurnInterrupted", func(t *testing.T) {
 		t.Parallel()
-		l, rec, _ := newLoopRec(t, &fakeLLM{blockUntilCancel: true})
+		l, rec, _ := newLoop(t, &fakeLLM{blockUntilCancel: true})
 		startTurn(t, l, rec, nil)
 
 		// Queue an input while the turn runs.
