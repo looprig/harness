@@ -3,7 +3,9 @@ package journal
 import (
 	"context"
 	"errors"
+	"slices"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/inventivepotter/urvi/internal/uuid"
@@ -174,12 +176,16 @@ func NewSessionJournal(js nats.JetStreamContext, sessionID uuid.UUID, opts ...Op
 // JetStream context. It carries no context fields, so a sentinel is permitted.
 var errNilJetStream = errors.New("journal: nil JetStream context")
 
-// ensureStream creates the per-session stream, tolerating an already-existing one.
-// AddStream on a fresh name creates it; on an existing name with an identical config
-// JetStream returns success, and on an existing name with a DIFFERENT config it
-// returns ErrStreamNameAlreadyInUse — which we treat as "already provisioned, bind
-// it" rather than an error, because a rebind must not clobber a live stream's config
-// (config evolution is a deliberate later concern, not a constructor side effect).
+// ensureStream creates the per-session stream, tolerating an already-existing one
+// only when its config still honors the durability contract. AddStream on a fresh
+// name creates it; on an existing name with an IDENTICAL config JetStream returns
+// success; on an existing name with a DIFFERENT config it returns
+// ErrStreamNameAlreadyInUse. That already-in-use signal is NOT taken as "bind it as
+// is": a divergent stream (e.g. WorkQueue retention, narrower subjects) would silently
+// break the keep-everything guarantee. Instead we fetch the live config and verify it
+// — binding only a contract-compatible stream and failing closed with a typed verify
+// error otherwise. (A merely additive/forward config evolution is still deferred; we
+// verify the load-bearing invariants, not byte-equality.)
 func ensureStream(ctx context.Context, js nats.JetStreamContext, sessionID uuid.UUID) error {
 	name := StreamName(sessionID)
 	_, err := js.AddStream(streamConfig(sessionID), nats.Context(ctx))
@@ -187,11 +193,54 @@ func ensureStream(ctx context.Context, js nats.JetStreamContext, sessionID uuid.
 		return nil
 	}
 	if errors.Is(err, nats.ErrStreamNameAlreadyInUse) {
-		// Already provisioned by us or another binder; bind to it as-is. The
-		// follow-on StreamInfo read in NewSessionJournal confirms it is reachable.
-		return nil
+		// Already provisioned (by us or another binder) with a different config; do
+		// not fail open — verify it still satisfies the durability contract.
+		return verifyExistingStream(ctx, js, name, sessionID)
 	}
 	return &StreamSetupError{Stream: name, Phase: PhaseAdd, Cause: err}
+}
+
+// verifyExistingStream reads the live config of an already-provisioned stream and
+// confirms it still honors the load-bearing durability invariants the journal depends
+// on: Limits retention (never WorkQueue/Interest, which discard consumed records) and
+// the exact session-rooted subject filter (a narrower filter would silently drop
+// subjects of this session). On any divergence it fails closed with a typed verify
+// StreamSetupError rather than binding the divergent stream. On match it returns nil
+// and the caller binds as-is — config evolution beyond these invariants is deferred.
+func verifyExistingStream(ctx context.Context, js nats.JetStreamContext, name string, sessionID uuid.UUID) error {
+	info, err := js.StreamInfo(name, nats.Context(ctx))
+	if err != nil {
+		return &StreamSetupError{Stream: name, Phase: PhaseVerify, Cause: err}
+	}
+	if info.Config.Retention != nats.LimitsPolicy {
+		return &StreamSetupError{Stream: name, Phase: PhaseVerify, Cause: &streamConfigMismatchError{
+			Field: "retention", Want: nats.LimitsPolicy.String(), Got: info.Config.Retention.String(),
+		}}
+	}
+	wantSubjects := []string{streamSubjectFilter(sessionID)}
+	if !slices.Equal(info.Config.Subjects, wantSubjects) {
+		return &StreamSetupError{Stream: name, Phase: PhaseVerify, Cause: &streamConfigMismatchError{
+			Field: "subjects",
+			Want:  strings.Join(wantSubjects, ","),
+			Got:   strings.Join(info.Config.Subjects, ","),
+		}}
+	}
+	return nil
+}
+
+// streamConfigMismatchError is the leaf cause when an already-provisioned stream's
+// live config diverges from the durability contract on a verified field. It names the
+// field and the want/got values so a caller can errors.As it off the verify
+// StreamSetupError and report exactly which invariant was violated.
+type streamConfigMismatchError struct {
+	Field string
+	Want  string
+	Got   string
+}
+
+func (e *streamConfigMismatchError) Error() string {
+	return "existing stream " + strconv.Quote(e.Field) + " = " + strconv.Quote(e.Got) +
+		", want " + strconv.Quote(e.Want)
 }
 
 // streamConfig is the per-session stream's configuration: the keep-everything log.

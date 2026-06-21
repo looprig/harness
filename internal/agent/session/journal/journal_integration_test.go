@@ -4,6 +4,7 @@ package journal_test
 
 import (
 	"context"
+	"errors"
 	"reflect"
 	"testing"
 	"time"
@@ -189,6 +190,70 @@ func TestSessionJournalAppend(t *testing.T) {
 	}
 	if info.State.Msgs != uint64(len(cases)) {
 		t.Errorf("StreamInfo Msgs = %d, want %d", info.State.Msgs, len(cases))
+	}
+}
+
+// TestNewSessionJournalRejectsMismatchedStream asserts the constructor fails closed
+// when an existing stream under the per-session name diverges from the durability
+// contract. A stream pre-created with WorkQueue retention (or wrong subjects) is NOT
+// silently bound — ensureStream must verify the existing config and return a typed
+// *StreamSetupError (phase "verify"), protecting the keep-everything guarantee
+// against a fail-open rebind onto a divergent stream.
+func TestNewSessionJournalRejectsMismatchedStream(t *testing.T) {
+	tests := []struct {
+		name   string
+		preCfg func(sid uuid.UUID) *nats.StreamConfig
+	}{
+		{
+			name: "wrong retention (WorkQueue)",
+			preCfg: func(sid uuid.UUID) *nats.StreamConfig {
+				return &nats.StreamConfig{
+					Name:      journal.StreamName(sid),
+					Subjects:  []string{"urvi.session." + sid.String() + ".>"},
+					Retention: nats.WorkQueuePolicy,
+				}
+			},
+		},
+		{
+			name: "wrong subjects",
+			preCfg: func(sid uuid.UUID) *nats.StreamConfig {
+				return &nats.StreamConfig{
+					Name:      journal.StreamName(sid),
+					Subjects:  []string{"some.other.subject.>"},
+					Retention: nats.LimitsPolicy,
+				}
+			},
+		},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			sid := seedUUID(0x40)
+			_, js := newEmbeddedJS(t)
+
+			// Pre-create a divergent stream under the per-session name.
+			if _, err := js.AddStream(tt.preCfg(sid)); err != nil {
+				t.Fatalf("pre-create stream: %v", err)
+			}
+
+			j, err := journal.NewSessionJournal(js, sid)
+			if err == nil {
+				t.Fatalf("NewSessionJournal bound a divergent stream (j=%v); want a verify error", j)
+			}
+			if j != nil {
+				t.Errorf("NewSessionJournal returned non-nil journal %v alongside error", j)
+			}
+			var setupErr *journal.StreamSetupError
+			if !errors.As(err, &setupErr) {
+				t.Fatalf("error %v is not *StreamSetupError", err)
+			}
+			if setupErr.Phase != journal.PhaseVerify {
+				t.Errorf("StreamSetupError.Phase = %q, want %q", setupErr.Phase, journal.PhaseVerify)
+			}
+			if setupErr.Stream != journal.StreamName(sid) {
+				t.Errorf("StreamSetupError.Stream = %q, want %q", setupErr.Stream, journal.StreamName(sid))
+			}
+		})
 	}
 }
 
