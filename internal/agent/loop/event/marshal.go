@@ -2,6 +2,7 @@ package event
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 
 	"github.com/inventivepotter/urvi/internal/content"
@@ -243,10 +244,20 @@ func marshalRestoreErrored(e RestoreErrored) ([]byte, error) {
 // projectError projects a live error to its durable {kind,message} form. A nil
 // error projects to KindUnknown with an empty message (an absent cause), so the
 // restored event always carries a *RestoredError rather than a typed-nil — matching
-// the reconstructed-on-unmarshal contract the round-trip test asserts.
+// the reconstructed-on-unmarshal contract the round-trip test asserts. An already-
+// restored *RestoredError (the decode form, re-marshaled by journal compaction /
+// checkpoint re-persist) copies its fields directly rather than calling Error():
+// (*RestoredError).Error() renders "<kind>: <message>", so re-projecting through it
+// would accrete a "<kind>: " prefix onto Message on every cycle. Copying makes
+// re-marshal a fixed point — Kind AND Message stable across any number of round-trips
+// (ErrKind already keeps Kind stable the same way).
 func projectError(err error) *RestoredError {
 	if err == nil {
 		return &RestoredError{Kind: KindUnknown, Message: ""}
+	}
+	var restored *RestoredError
+	if errors.As(err, &restored) {
+		return &RestoredError{Kind: restored.Kind, Message: restored.Message}
 	}
 	return &RestoredError{Kind: ErrKind(err), Message: err.Error()}
 }

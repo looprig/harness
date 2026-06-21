@@ -425,6 +425,77 @@ func assertErrRoundTrip(t *testing.T, ev Event, getErr func(Event) error, wantKi
 	}
 }
 
+// TestMarshalEventErrReMarshalFixedPoint proves a decoded error-bearing event is a
+// FIXED POINT under re-marshal: marshaling a TurnFailed/RestoreErrored whose Err is
+// already a *RestoredError (the decode form) must reproduce the SAME {kind,message}
+// pair, not accrete a "<kind>: " prefix onto Message on every cycle. The journal
+// compaction / checkpoint re-persist paths (Phase 4/5) re-marshal decoded events, so
+// without idempotent projection the Message would grow unboundedly across cycles.
+// The double round-trip e -> e1 -> e2 asserts e1.Err == e2.Err as equal
+// *RestoredError values (same Kind AND same Message).
+func TestMarshalEventErrReMarshalFixedPoint(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		err  error
+	}{
+		{"in-package tool limit", &ToolLimitError{Iterations: 1, MaxIterations: 2, Calls: 3, MaxCalls: 4}},
+		{"provider-origin foreign error", errSentinel{}},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			// TurnFailed.
+			tf := TurnFailed{Header: fullHeaderTurn(), TurnIndex: 5, Err: tt.err}
+			assertErrFixedPoint(t, tf, func(ev Event) error { return ev.(TurnFailed).Err })
+
+			// RestoreErrored (session-scoped sibling carrying the same kind of Err).
+			re := RestoreErrored{Header: fullHeaderSession(), Err: tt.err}
+			assertErrFixedPoint(t, re, func(ev Event) error { return ev.(RestoreErrored).Err })
+		})
+	}
+}
+
+// assertErrFixedPoint round-trips ev twice (e -> e1 -> e2) and asserts the error
+// field (extracted by getErr) of e1 and e2 are equal *RestoredError values — same
+// Kind AND same Message, with no prefix accretion across the second cycle.
+func assertErrFixedPoint(t *testing.T, ev Event, getErr func(Event) error) {
+	t.Helper()
+
+	data1, err := MarshalEvent(ev)
+	if err != nil {
+		t.Fatalf("MarshalEvent(%T) #1 error = %v", ev, err)
+	}
+	e1, err := UnmarshalEvent(data1)
+	if err != nil {
+		t.Fatalf("UnmarshalEvent(%T) #1 error = %v\nwire: %s", ev, err, data1)
+	}
+
+	data2, err := MarshalEvent(e1)
+	if err != nil {
+		t.Fatalf("MarshalEvent(%T) #2 error = %v", e1, err)
+	}
+	e2, err := UnmarshalEvent(data2)
+	if err != nil {
+		t.Fatalf("UnmarshalEvent(%T) #2 error = %v\nwire: %s", e1, err, data2)
+	}
+
+	var re1, re2 *RestoredError
+	if !errors.As(getErr(e1), &re1) {
+		t.Fatalf("%T e1 Err = %T, want *RestoredError", ev, getErr(e1))
+	}
+	if !errors.As(getErr(e2), &re2) {
+		t.Fatalf("%T e2 Err = %T, want *RestoredError", ev, getErr(e2))
+	}
+	if !reflect.DeepEqual(re1, re2) {
+		t.Errorf("%T re-marshal not a fixed point:\n e1 = %#v\n e2 = %#v\n(Message must not accrete a %q prefix across cycles)", ev, re1, re2, "<kind>: ")
+	}
+}
+
 // TestMarshalEventPermissionRequestedFullRequest proves PermissionRequested
 // round-trips with its FULL Request (header-only would panic on TUI replay): the
 // reconstructed event's tool_execution_id matches and the Request's accessor
