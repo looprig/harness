@@ -53,10 +53,19 @@ projection.
 >   codec"). Only `content.Block` and `Message` have tagged-union codecs today;
 >   whole events don't round-trip. Build a sealed `MarshalEvent`/`UnmarshalEvent`
 >   (type discriminator + payload) over the 20 event types atop the block/message
->   codecs, with its own fuzz target. `json:"-"` fields don't serialize: on
->   persisted (Enduring) events that's only `PermissionRequested.Request` and
->   `TurnFailed.Err` — acceptable (gate neutralized by the crash-seam; error is
->   display-only), but stated.
+>   codecs, with its own fuzz target. The existing `json:"-"` tags are *in-memory-only*
+>   artifacts (events were never serialized before — the hub is pure in-memory), not
+>   a limit: **our codec decides what persists.** It serializes `TurnFailed.Err` as a
+>   `{kind, message}` projection → reconstructs a leaf `RestoredError` on read (the
+>   tombstone needs the text; a typed `error` can't round-trip). `PermissionRequested.Request`
+>   is *not needed* for restore — the prompt is always cleared (by its turn's terminal
+>   on replay, or the crash-seam if pending) — so persist header-only by default; add
+>   the body only for a gate audit trail.
+> - **Restore is itself recorded.** Emit `RestoreStarted` then `RestoreDone` (or
+>   `RestoreErrored`) — Enduring, session-scoped, appended to the **same** stream —
+>   and keep `SessionID` + every `LoopID` **unchanged** across restore (the reason
+>   for the dedicated `Restore` constructor; no fresh `SessionStarted`/`LoopStarted`).
+>   Three new Enduring session-scoped event types this design owns.
 > - **Restore needs a dedicated constructor.** `session.New` mints a fresh id,
 >   publishes `SessionStarted`, and spawns an empty primary loop — wrong for
 >   resume. Add a `Restore(ctx, cfg, sessionID, replayer)` path that folds the
@@ -293,6 +302,22 @@ the TUI's "a terminal event clears that loop's pending gates" rule
 (tui-event-adoption §7) drops the orphaned prompt. No restore-only code in either
 reducer — recovery is the stream healing itself to the last completed step.
 
+**Restore is recorded; identity is stable.** Restore runs through a dedicated
+`Restore(ctx, cfg, sessionID, replayer)` constructor (not `New`, which would mint
+a fresh id, publish a new `SessionStarted`, and spawn an empty primary loop).
+`Restore` reuses the original `SessionID` and reconstructs every loop under its
+**original `LoopID`** (from its `LoopStarted`), so nothing's identity changes and
+new events continue the same subjects. It brackets the operation with Enduring,
+session-scoped events appended to the same stream — `RestoreStarted` at the start,
+then `RestoreDone` on success or `RestoreErrored{Err}` on failure (fail-secure: a
+half-restored session does not come up; the failed attempt is durably recorded).
+The in-log sequence is `…history… → RestoreStarted → TurnInterrupted×(open turns)
+→ RestoreDone → …new live events…`. These persist back, so repeated restores leave
+an audit trail (folded as no-ops for `msgs`); the catalog bumps `LastActiveAt` /
+sets a "restored" marker off `RestoreDone`. `RestoreStarted`/`RestoreDone`/
+`RestoreErrored` are three new Enduring session-scoped event types this design adds
+to the event package.
+
 ## Session structural state (a fold, not a record)
 
 `sessionState` holds the session's structure — the loop map, the subagent
@@ -423,9 +448,13 @@ additive fields + an explicit `schemaVersion` tag.
   (verified 2026-06-21). `Event` is a sealed interface, so build a
   `MarshalEvent`/`UnmarshalEvent` tagged union (type tag + payload) over the 20
   event types, delegating block/message payloads to the existing codecs — one
-  codec style, a new `FuzzDecodeEvent` boundary. `json:"-"` fields are not
-  serialized: on persisted (Enduring) events only `PermissionRequested.Request`
-  and `TurnFailed.Err` (both acceptable to drop on restore — see reconciliation).
+  codec style, a new `FuzzDecodeEvent` boundary. The current `json:"-"` tags are
+  in-memory-only artifacts, not a limit — the codec decides what persists:
+  `TurnFailed.Err` serializes as a `{kind, message}` projection (reconstructed as a
+  leaf `RestoredError` — the tombstone needs the text; a typed `error` can't
+  round-trip). `PermissionRequested.Request` is not needed for restore (the prompt
+  is always cleared), so persist header-only by default; add the body only for a
+  gate audit trail.
 - **Debuggable.** The stream/FileStore can be inspected (`nats stream view`) and
   the events read directly — valuable during restore bring-up.
 - **Stdlib**, per `CLAUDE.md`.
