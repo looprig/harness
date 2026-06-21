@@ -1,7 +1,9 @@
 package event_test
 
 import (
+	"encoding/json"
 	"testing"
+	"time"
 
 	"github.com/inventivepotter/urvi/internal/agent/loop/event"
 	"github.com/inventivepotter/urvi/internal/agent/loop/identity"
@@ -176,6 +178,42 @@ func TestEventHeaderRoundTrip(t *testing.T) {
 			ev := event.StepDone{Header: tt.hdr}
 			if got := ev.EventHeader(); got != tt.hdr {
 				t.Errorf("EventHeader() = %+v, want %+v", got, tt.hdr)
+			}
+		})
+	}
+}
+
+// TestHeaderCreatedAt asserts Header.CreatedAt survives a JSON round-trip and is
+// surfaced verbatim by EventHeader() — the creation timestamp every Enduring
+// event must carry into the journal.
+func TestHeaderCreatedAt(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+		ts   time.Time
+	}{
+		{name: "non-zero UTC timestamp", ts: time.Date(2026, 6, 21, 15, 0, 0, 0, time.UTC)},
+		{name: "zero time is boundary", ts: time.Time{}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			hdr := event.Header{CreatedAt: tt.ts}
+
+			data, err := json.Marshal(hdr)
+			if err != nil {
+				t.Fatalf("json.Marshal(Header) err = %v", err)
+			}
+			var got event.Header
+			if err := json.Unmarshal(data, &got); err != nil {
+				t.Fatalf("json.Unmarshal(Header) err = %v", err)
+			}
+			if !got.CreatedAt.Equal(tt.ts) {
+				t.Errorf("round-trip CreatedAt = %v, want %v", got.CreatedAt, tt.ts)
+			}
+			ev := event.StepDone{Header: hdr}
+			if !ev.EventHeader().CreatedAt.Equal(tt.ts) {
+				t.Errorf("EventHeader().CreatedAt = %v, want %v", ev.EventHeader().CreatedAt, tt.ts)
 			}
 		})
 	}

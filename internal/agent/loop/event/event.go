@@ -1,6 +1,8 @@
 package event
 
 import (
+	"time"
+
 	"github.com/inventivepotter/urvi/internal/agent/loop/identity"
 	"github.com/inventivepotter/urvi/internal/uuid"
 )
@@ -76,6 +78,10 @@ type Header struct {
 	// EventID identifies this event. Header carries this identity directly; detailed
 	// wiring is sequenced after the journal follow-on.
 	EventID uuid.UUID `json:"event_id,omitzero"`
+
+	// CreatedAt is when this event was created (minted at creation, not delivery).
+	// It is the journal's creation timestamp for every Enduring event.
+	CreatedAt time.Time `json:"created_at,omitzero"`
 
 	// Cause is the direct cause of this event. For UserInput/SubagentResult
 	// resolution events (TurnStarted, TurnFoldedInto, InputCancelled, InputQueued,
