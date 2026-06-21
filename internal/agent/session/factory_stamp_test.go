@@ -121,26 +121,54 @@ func TestSessionStartedStamped(t *testing.T) {
 	}
 }
 
-// TestNewSessionStartedMintErrorFails proves New propagates a mint error: if the
-// EventID for the construction-time SessionStarted cannot be minted (crypto/rand
-// failure), New fails with a typed *SessionError rather than publishing a
-// zero-EventID SessionStarted. A failing newID on the FIRST call (the SessionStarted
-// EventID) must abort construction.
+// failOnCallGen mints a fresh UUID for the first failAfter calls, then fails every
+// subsequent call with err. It lets a test let the session id mint succeed (call 1)
+// while failing the construction-time SessionStarted EventID mint (call 2), so the
+// REAL New failure branch — factory.Stamp errors → New returns nil + typed error,
+// before the SessionStarted publish — is exercised. Safe for concurrent use.
+type failOnCallGen struct {
+	mu        sync.Mutex
+	n         int
+	failAfter int
+	err       error
+}
+
+func (g *failOnCallGen) gen() (uuid.UUID, error) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.n++
+	if g.n > g.failAfter {
+		return uuid.UUID{}, g.err
+	}
+	return uuid.New()
+}
+
+// TestNewSessionStartedMintErrorFails proves New propagates a mint error from the
+// construction-time SessionStarted stamp: if the EventID for SessionStarted cannot
+// be minted (crypto/rand failure), New aborts with a typed *SessionError of kind
+// SessionIDGenerationFailed and returns a nil session — it never publishes a
+// zero-EventID SessionStarted. This drives the REAL New failure branch (session.go
+// ~437) via the newSession test seam, which injects a newID that succeeds for the
+// session id (the 1st mint) and then fails the SessionStarted EventID (the 2nd
+// mint, the first FACTORY mint).
 func TestNewSessionStartedMintErrorFails(t *testing.T) {
 	t.Parallel()
 	genErr := errors.New("rand source exhausted")
-	// The session id is minted by uuid.New directly in New (not the factory), so the
-	// first FACTORY mint is the SessionStarted EventID. We cannot inject newID before
-	// New, so this is asserted via the loop side; here we assert New still succeeds
-	// with a healthy generator and that a subsequent factory failure is typed.
-	s, err := New(context.Background(), cfg(&stubLLM{chunks: []content.Chunk{textChunk("x")}}))
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
-	t.Cleanup(func() { _ = s.Shutdown(context.Background()) })
+	// Succeed once (the session id), then fail (the SessionStarted EventID stamp).
+	gen := &failOnCallGen{failAfter: 1, err: genErr}
 
-	s.newID = func() (uuid.UUID, error) { return uuid.UUID{}, genErr }
-	if _, err := s.factory.Stamp(event.SessionStarted{}.EventHeader()); !errors.Is(err, genErr) {
-		t.Fatalf("factory.Stamp err = %v, want it to wrap %v (mint error propagates)", err, genErr)
+	s, err := newSession(context.Background(), cfg(&stubLLM{chunks: []content.Chunk{textChunk("x")}}), gen.gen, time.Now)
+	if s != nil {
+		t.Fatalf("newSession returned a non-nil session on a mint failure; want nil (no half-built session)")
+	}
+	var sessErr *SessionError
+	if !errors.As(err, &sessErr) {
+		t.Fatalf("newSession err = %v (%T), want a *SessionError", err, err)
+	}
+	if sessErr.Kind != SessionIDGenerationFailed {
+		t.Fatalf("SessionError.Kind = %q, want %q", sessErr.Kind, SessionIDGenerationFailed)
+	}
+	if !errors.Is(err, genErr) {
+		t.Fatalf("err does not wrap the underlying mint error %v: %v", genErr, err)
 	}
 }

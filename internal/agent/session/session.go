@@ -403,13 +403,28 @@ func (s *Session) newCommandID() (uuid.UUID, error) {
 // so a subscriber that connects later does not observe it; reliable delivery of
 // the session start to late subscribers is a separate future follow-on.
 func New(ctx context.Context, cfg loop.Config) (*Session, error) {
+	// Production seams: crypto/rand id-gen + the wall clock. newSession is the
+	// unexported core that lets a same-package test inject a failing newID (or a
+	// pinned now) that is IN EFFECT during the construction-time SessionStarted
+	// stamp — the only way to exercise New's mint-error failure branch — mirroring
+	// how the loop injects idGen/now via Config before loop.New.
+	return newSession(ctx, cfg, uuid.New, time.Now)
+}
+
+// newSession is the construction core of New with the id-gen and clock seams made
+// explicit. New calls it with the production defaults (uuid.New, time.Now); a
+// same-package test calls it with a failing newID to drive the SessionStarted
+// mint-error branch (no zero-EventID SessionStarted is ever published; New returns
+// nil + a typed *SessionError). newID also mints the session id itself, so a
+// generator that fails on its FIRST call aborts before any event is stamped.
+func newSession(ctx context.Context, cfg loop.Config, newID idGenerator, now event.Clock) (*Session, error) {
 	select {
 	case <-ctx.Done():
 		return nil, &SessionError{Kind: SessionContextDone, Cause: ctx.Err()}
 	default:
 	}
 
-	id, err := uuid.New()
+	id, err := newID()
 	if err != nil {
 		return nil, &SessionError{Kind: SessionIDGenerationFailed, Cause: err}
 	}
@@ -421,8 +436,8 @@ func New(ctx context.Context, cfg loop.Config) (*Session, error) {
 		sessionCtx:    sessionCtx,
 		sessionCancel: sessionCancel,
 		loops:         make(map[uuid.UUID]*loopHandle),
-		newID:         uuid.New,
-		now:           time.Now,
+		newID:         newID,
+		now:           now,
 	}
 	// The Factory mints from closures over the LIVE newID + now fields, so a test
 	// that swaps either after construction pins the stamp too (the same seam the
