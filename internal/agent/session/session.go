@@ -416,37 +416,68 @@ func (s *Session) deliverSubagentResult(ctx context.Context, parentLoopID, fromL
 // loop handle and returns only the loop id, because callers route through
 // session methods rather than writing to a loop command channel directly.
 func (s *Session) NewLoop(parent loop.Provenance, cfg loop.Config) (uuid.UUID, error) {
-	// Cheap early-out + the PURE depth check: read closing/faulted and walk the parent
-	// chain depth under one RLock. The closing/faulted reads are an optimization only —
-	// the authoritative, race-free check is the one inside the registration critical
-	// section below (taken under the same loopsMu Shutdown/ReportFault use to set
-	// closing/faulted + snapshot the loops), which closes the window between this read and
-	// registration. The DEPTH check, by contrast, is final here: depth is a function of
-	// the FIXED parent chain (already-registered ancestors that never change), so once it
-	// passes there is no later depth race to re-check — and rejecting before any ID mint
-	// or loop.New means a too-deep spawn creates nothing and publishes no LoopStarted.
-	s.loopsMu.RLock()
-	closing := s.closing
-	faulted := s.faulted
-	faultErr := s.faultErr
-	depth := s.depthUnderLock(parent.LoopID)
-	// Resolve defaults at the check so the caps are always positive even on a
-	// struct-literal Session that bypassed newSession/restore (test seams): a zero-limits
-	// session must behave with the production defaults, never reject every spawn.
-	depthLimit := s.limits.withDefaults().Depth
-	s.loopsMu.RUnlock()
-	if faulted {
-		return uuid.UUID{}, &SessionError{Kind: SessionFaulted, Cause: faultErr}
+	// Whether this spawn counts toward the cumulative spawn quota. The PRIMARY loop is
+	// built by newSession via NewLoop with ZERO provenance (parent.LoopID zero) and must
+	// NOT consume a quota slot (design §6d: "primary excluded"); every subagent spawn
+	// carries a non-zero parent.LoopID. This is the SAME root/non-root discriminator the
+	// durable recount uses on restore (a non-root LoopStarted has a non-zero Header.Cause),
+	// so the live counter and the restored counter count exactly the same set.
+	counts := !parent.LoopID.IsZero()
+
+	// One authoritative critical section folds the closing/faulted gate, the PURE depth
+	// check, and the quota RESERVATION under a single loopsMu.Lock — so the cap decisions
+	// and the spawned++ reservation are atomic with respect to a concurrent NewLoop,
+	// Shutdown (sets closing), or ReportFault (sets faulted). On success it reserves a
+	// quota slot (spawned++) and unlocks; that reservation is ROLLED BACK by release()
+	// (below) on every later failure. Defaults are resolved here (withDefaults) so the
+	// caps are always positive even on a struct-literal Session that bypassed
+	// newSession/restore (test seams) — a zero-limits session behaves with the production
+	// defaults, never rejecting every spawn. Depth is final once it passes: it is a
+	// function of the FIXED parent chain (already-registered ancestors never change), so
+	// there is no later depth race to re-check.
+	s.loopsMu.Lock()
+	if s.faulted {
+		fe := s.faultErr
+		s.loopsMu.Unlock()
+		return uuid.UUID{}, &SessionError{Kind: SessionFaulted, Cause: fe}
 	}
-	if closing {
+	if s.closing {
+		s.loopsMu.Unlock()
 		return uuid.UUID{}, &SessionError{Kind: SessionClosing}
 	}
-	if depth >= depthLimit {
+	limits := s.limits.withDefaults()
+	if s.depthUnderLock(parent.LoopID) >= limits.Depth {
+		s.loopsMu.Unlock()
 		return uuid.UUID{}, &SessionError{Kind: SessionLoopDepthExceeded}
+	}
+	if counts && s.spawned >= limits.Quota {
+		s.loopsMu.Unlock()
+		return uuid.UUID{}, &SessionError{Kind: SessionLoopQuotaExceeded}
+	}
+	if counts {
+		s.spawned++ // reserve the quota slot; release() rolls it back on any later failure
+	}
+	s.loopsMu.Unlock()
+
+	// release rolls back the quota reservation made above. It is called on EVERY failure
+	// path after the reservation (id mint, loop.New, the registration-time closing/faulted
+	// re-check, and publish failure) ALONGSIDE the loop's cancel(), so a spawn that does
+	// not complete never permanently consumes a slot. It is a no-op when this spawn did not
+	// reserve (the primary / a zero-parent spawn). A SUCCESSFUL spawn never calls it, so
+	// the reservation stands permanently (loops are retained — the cumulative budget never
+	// decrements on idle, only on a rolled-back spawn).
+	release := func() {
+		if !counts {
+			return
+		}
+		s.loopsMu.Lock()
+		s.spawned--
+		s.loopsMu.Unlock()
 	}
 
 	loopID, err := s.newID()
 	if err != nil {
+		release()
 		return uuid.UUID{}, &SessionError{Kind: SessionLoopIDGenerationFailed, Cause: err}
 	}
 
@@ -469,12 +500,14 @@ func (s *Session) NewLoop(parent loop.Provenance, cfg loop.Config) (uuid.UUID, e
 		},
 	})
 	if err != nil {
+		release()
 		return uuid.UUID{}, &SessionError{Kind: SessionIDGenerationFailed, Cause: err}
 	}
 
 	loopCtx, cancel := context.WithCancel(s.sessionCtx)
 	l, err := loop.New(loopCtx, s.SessionID, loopID, parent, s, cfg)
 	if err != nil {
+		release()
 		cancel()
 		return uuid.UUID{}, err
 	}
@@ -485,17 +518,21 @@ func (s *Session) NewLoop(parent loop.Provenance, cfg loop.Config) (uuid.UUID, e
 	// sets faulted under this lock, so checking-then-registering atomically here
 	// guarantees a loop is never registered after a fault or after Shutdown's
 	// snapshot — it either makes it into the snapshot (registered before the latch)
-	// or is refused here. On refusal: register nothing, release the lock, tear down
-	// the already-built loop with cancel(), and return before the publish so no
-	// LoopStarted is ever emitted. Faulted is checked first (the stronger condition).
+	// or is refused here. On refusal: register nothing, release the lock, roll back the
+	// quota reservation (release()), tear down the already-built loop with cancel(), and
+	// return before the publish so no LoopStarted is ever emitted. Faulted is checked first
+	// (the stronger condition). release() takes loopsMu, so it is called AFTER Unlock (the
+	// mutex is not reentrant).
 	if s.faulted {
 		fe := s.faultErr
 		s.loopsMu.Unlock()
+		release()
 		cancel()
 		return uuid.UUID{}, &SessionError{Kind: SessionFaulted, Cause: fe}
 	}
 	if s.closing {
 		s.loopsMu.Unlock()
+		release()
 		cancel()
 		return uuid.UUID{}, &SessionError{Kind: SessionClosing}
 	}
@@ -516,12 +553,14 @@ func (s *Session) NewLoop(parent loop.Provenance, cfg loop.Config) (uuid.UUID, e
 	if err := s.PublishEvent(s.sessionCtx, ev); err != nil {
 		// Mirror New's cleanup-on-publish-failure: the loop is already registered and
 		// its loopCtx cancel is live, so a bare return would leak a cancel-orphaned
-		// loop. Unregister it, run its cancel, then surface the typed error. (hub
-		// PublishEvent returns nil today, so this path is presently unreachable — but
-		// it is correct-and-safe rather than dead-and-unsafe if that ever changes.)
+		// loop. Unregister it, roll back the quota reservation (release()), run its cancel,
+		// then surface the typed error. (hub PublishEvent returns nil today, so this path is
+		// presently unreachable — but it is correct-and-safe rather than dead-and-unsafe if
+		// that ever changes.)
 		s.loopsMu.Lock()
 		delete(s.loops, loopID)
 		s.loopsMu.Unlock()
+		release()
 		cancel()
 		return uuid.UUID{}, &SessionError{Kind: SessionContextDone, Cause: err}
 	}
