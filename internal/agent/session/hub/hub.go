@@ -91,27 +91,72 @@ func (h *Hub) unsubscribe(sub *EventSubscription) {
 	h.mu.Unlock()
 }
 
-// PublishEvent fans ev out to every matching subscriber and applies any
-// quiescence transition the event implies. It never blocks a publisher: delivery
-// is a non-blocking send into each subscription's bounded egress channel, and all
-// delivery happens outside the hub lock. It returns nil even with no subscribers
+// PublishEvent is the durable tap (design "Hub tap algorithm"): for an Enduring
+// event it appends BEFORE applying it to hub state (durable-first, fail-secure),
+// then applies the quiescence transition (which may DERIVE a session event D), then
+// mints+appends D, then delivers the triggering event followed by D — in causal
+// order. The precise ordering, honoring the lock rule (no I/O under the hub lock):
+//
+//  1. Ephemeral event: never persisted — fan out only (the unchanged path).
+//  2. Enduring event: appender.AppendEvent(ev) OUTSIDE the lock. On error →
+//     ReportFault, deliver NOTHING, return (do not apply a transition for an event
+//     that did not persist).
+//  3. Under the lock: apply ev's active/phase mutation, which may derive D
+//     (SessionActive/SessionIdle); snapshot the subscriber set. Unlock.
+//  4. If D was derived: mint it (Factory: EventID+CreatedAt) and append it OUTSIDE
+//     the lock. On error → ReportFault, deliver NEITHER ev nor D, return.
+//  5. Deliver live, outside the lock (existing fan-out policy): ev, then D. If D was
+//     a SessionIdle (the Active->Idle edge), wake WaitIdle waiters AFTER its durable
+//     append — never before (a failed append must not falsely report idle).
+//
+// It never blocks a publisher: delivery is a non-blocking send into each
+// subscription's bounded egress channel. It returns nil even with no subscribers
 // (the headless case) — the sessionState transition still runs.
 //
-// After SessionStopped, the event is still delivered (filtered) but no longer
-// mutates active/phase and never derives SessionIdle/SessionActive.
-func (h *Hub) PublishEvent(_ context.Context, ev event.Event) error {
-	subs, post := h.applyAndSnapshot(ev)
+// After SessionStopped, the event is still appended+delivered (filtered) but no
+// longer mutates active/phase and never derives SessionIdle/SessionActive.
+func (h *Hub) PublishEvent(ctx context.Context, ev event.Event) error {
+	// (1)+(2) Ephemeral: no append. Enduring: append before apply, fail-secure.
+	if ev.Class() == event.Enduring {
+		if err := h.appender.AppendEvent(ctx, ev); err != nil {
+			h.reporter.ReportFault(ctx, &SessionPersistenceFault{Event: ev, Cause: err})
+			return nil
+		}
+	}
+
+	// (3) Apply under the lock; derive the at-most-one session event D; snapshot subs.
+	subs, derived := h.applyAndSnapshot(ev)
+
+	// (4) Mint + durably append a derived session event before it (or ev) goes live.
+	// On failure neither ev nor D is delivered, and the fault is raised.
+	if derived != nil {
+		stamped, err := h.factory.Stamp(derived.EventHeader())
+		if err != nil {
+			h.reporter.ReportFault(ctx, &SessionPersistenceFault{Event: derived, Cause: err})
+			return nil
+		}
+		derived = withHeader(derived, stamped)
+		if err := h.appender.AppendEvent(ctx, derived); err != nil {
+			h.reporter.ReportFault(ctx, &SessionPersistenceFault{Event: derived, Cause: err})
+			return nil
+		}
+	}
+
+	// (5) Deliver live in causal order, then wake idle waiters AFTER the durable
+	// append of the SessionIdle edge.
 	h.deliver(subs, ev)
-	if post != nil {
-		h.deliver(subs, post)
+	if derived != nil {
+		h.deliver(subs, derived)
+		h.signalIdleIfEdge(derived)
 	}
 	return nil
 }
 
 // applyAndSnapshot is the locked critical section of a publish: it applies the
 // event's active/phase mutation (if any) and copies the subscriber slice. It
-// returns the snapshot and the at-most-one derived post event to deliver after
-// ev. Delivery is the caller's job, outside the lock.
+// returns the snapshot and the at-most-one RAW (unstamped) derived event to mint +
+// append + deliver after ev. No I/O happens here — appending the derived event and
+// waking waiters are the caller's job, outside the lock.
 func (h *Hub) applyAndSnapshot(ev event.Event) ([]*EventSubscription, event.Event) {
 	mutate, mutates := activeMutation(ev)
 	if !mutates {
@@ -123,10 +168,11 @@ func (h *Hub) applyAndSnapshot(ev event.Event) ([]*EventSubscription, event.Even
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	// applyActivity is a no-op (returns nil, never mutates) once SessionStopped, so
-	// a post-stop mutating event delivers without flipping phase. signalIdle wakes
-	// any blocked WaitIdle on the Active->Idle edge.
-	post := h.state.applyActivity(h.sessionID, func() { mutate(&h.state) }, h.signalIdleLocked)
-	return h.snapshotSubsLocked(), post
+	// a post-stop mutating event delivers without flipping phase. The derived event
+	// is returned RAW; the caller mints + appends it before delivery (and wakes
+	// WaitIdle waiters only after a SessionIdle edge's durable append succeeds).
+	derived := h.state.applyActivity(h.sessionID, func() { mutate(&h.state) })
+	return h.snapshotSubsLocked(), derived
 }
 
 // snapshotSubsLocked copies the subscriber set into a slice. The caller must hold
@@ -215,39 +261,131 @@ func (h *Hub) deliver(subs []*EventSubscription, ev event.Event) {
 // It derives SessionActive if the session was idle. It is exported for the session
 // (its sole caller); loops depend only on the narrow eventPublisher interface,
 // which excludes it, so a loop can never reach it.
-func (h *Hub) ExpectTurn(_ context.Context, subagentLoopID uuid.UUID) {
+//
+// There is no triggering EVENT here (the wake token is hub-internal), so only the
+// derived session event is durable: it is minted + appended OUTSIDE the lock before
+// delivery, fail-secure (a failed append delivers nothing and raises a fault).
+func (h *Hub) ExpectTurn(ctx context.Context, subagentLoopID uuid.UUID) {
 	h.mu.Lock()
-	post := h.state.applyActivity(h.sessionID,
-		func() { h.state.add(activityKey{kind: kindWake, id: subagentLoopID}) },
-		h.signalIdleLocked)
+	derived := h.state.applyActivity(h.sessionID,
+		func() { h.state.add(activityKey{kind: kindWake, id: subagentLoopID}) })
 	subs := h.snapshotSubsLocked()
 	h.mu.Unlock()
-	if post != nil {
-		h.deliver(subs, post)
-	}
+	h.appendAndDeliverDerived(ctx, subs, derived)
 }
 
 // CancelExpectTurn releases a {wake, subagentLoopID} token when its hand-back is
 // rejected or explicitly discarded. It derives SessionIdle if this emptied active.
 // Exported for the session only (see ExpectTurn).
-func (h *Hub) CancelExpectTurn(_ context.Context, subagentLoopID uuid.UUID) {
+func (h *Hub) CancelExpectTurn(ctx context.Context, subagentLoopID uuid.UUID) {
 	h.mu.Lock()
-	post := h.state.applyActivity(h.sessionID,
-		func() { h.state.remove(activityKey{kind: kindWake, id: subagentLoopID}) },
-		h.signalIdleLocked)
+	derived := h.state.applyActivity(h.sessionID,
+		func() { h.state.remove(activityKey{kind: kindWake, id: subagentLoopID}) })
 	subs := h.snapshotSubsLocked()
 	h.mu.Unlock()
-	if post != nil {
-		h.deliver(subs, post)
+	h.appendAndDeliverDerived(ctx, subs, derived)
+}
+
+// appendAndDeliverDerived is the create→append→deliver path for a session event
+// derived by ExpectTurn/CancelExpectTurn (which have no triggering event of their
+// own). It mints the derived event's header, durably appends it before delivery, and
+// on a SessionIdle edge wakes WaitIdle waiters only AFTER that append succeeds. Any
+// append/mint failure is fail-secure: deliver nothing, raise a fault. A nil derived
+// (no edge crossed) is a no-op. Called OUTSIDE the hub lock.
+func (h *Hub) appendAndDeliverDerived(ctx context.Context, subs []*EventSubscription, derived event.Event) {
+	if derived == nil {
+		return
+	}
+	stamped, err := h.factory.Stamp(derived.EventHeader())
+	if err != nil {
+		h.reporter.ReportFault(ctx, &SessionPersistenceFault{Event: derived, Cause: err})
+		return
+	}
+	derived = withHeader(derived, stamped)
+	if err := h.appender.AppendEvent(ctx, derived); err != nil {
+		h.reporter.ReportFault(ctx, &SessionPersistenceFault{Event: derived, Cause: err})
+		return
+	}
+	h.deliver(subs, derived)
+	h.signalIdleIfEdge(derived)
+}
+
+// signalIdleIfEdge wakes every WaitIdle waiter iff derived is a SessionIdle (the
+// Active->Idle edge). It runs OUTSIDE the lock, AFTER the SessionIdle's durable
+// append, so a failed append never falsely reports the session idle. Each waiter
+// channel is buffered(1), so the wake never blocks; a WaitIdle that registers after
+// this point re-reads phase under the lock and returns nil immediately, so no waiter
+// is lost in the gap between unlock and wake.
+func (h *Hub) signalIdleIfEdge(derived event.Event) {
+	if _, ok := derived.(event.SessionIdle); !ok {
+		return
+	}
+	h.mu.Lock()
+	h.signalIdleLocked()
+	h.mu.Unlock()
+}
+
+// withHeader returns a COPY of a hub-derived session event with hdr substituted for
+// its Header. The hub derives only SessionActive/SessionIdle (applyActivity) and
+// SessionStopped (StopSession); the switch is exhaustive over that set and panics on
+// any other type — a programming error, since no other event is ever stamped here.
+func withHeader(ev event.Event, hdr event.Header) event.Event {
+	switch e := ev.(type) {
+	case event.SessionActive:
+		e.Header = hdr
+		return e
+	case event.SessionIdle:
+		e.Header = hdr
+		return e
+	case event.SessionStopped:
+		e.Header = hdr
+		return e
+	default:
+		panic("hub: withHeader called on a non-derived event type")
 	}
 }
 
 // StopSession is the session-owned teardown transition. It is idempotent: if
-// already SessionStopped it returns without effect. Otherwise it clears active,
-// forces phase=SessionStopped (bypassing applyActivity so no SessionIdle is
-// derived), wakes every WaitIdle waiter with ErrSessionStopped, and delivers a
-// SessionStopped event. Exported for the session only (see ExpectTurn).
-func (h *Hub) StopSession(_ context.Context) {
+// already SessionStopped it returns without effect. Otherwise — honoring the durable
+// tap's append-before-apply, fail-secure rule — it:
+//
+//  1. Mints the synthesized SessionStopped (Factory: EventID+CreatedAt) and durably
+//     appends it OUTSIDE the lock, BEFORE any state change. On error → ReportFault,
+//     do NOT flip phase, wake nobody, deliver nothing, return (the session faults
+//     instead of stopping; its FaultReporter wakes WaitIdle waiters with the fault).
+//  2. Under the lock: clear active, force phase=SessionStopped (bypassing
+//     applyActivity so no SessionIdle is derived), wake every WaitIdle waiter with
+//     ErrSessionStopped, snapshot the subscriber set. Unlock.
+//  3. Deliver the (already durable) SessionStopped live.
+//
+// Exported for the session only (see ExpectTurn).
+func (h *Hub) StopSession(ctx context.Context) {
+	// Idempotency pre-check: if already stopped, do nothing (and no second append).
+	h.mu.RLock()
+	already := h.state.phase == SessionStopped
+	h.mu.RUnlock()
+	if already {
+		return
+	}
+
+	// (1) Mint + durably append BEFORE the in-memory stop. Fail-secure on error.
+	stopped, err := h.factory.NewHeader()
+	if err != nil {
+		h.reporter.ReportFault(ctx, &SessionPersistenceFault{Event: event.SessionStopped{}, Cause: err})
+		return
+	}
+	stopped.Coordinates = identity.Coordinates{SessionID: h.sessionID}
+	ev := event.SessionStopped{Header: stopped}
+	if err := h.appender.AppendEvent(ctx, ev); err != nil {
+		h.reporter.ReportFault(ctx, &SessionPersistenceFault{Event: ev, Cause: err})
+		return
+	}
+
+	// (2) The append committed: flip phase, wake waiters, snapshot. A concurrent
+	// StopSession that raced the pre-check is made safe by re-checking under the
+	// write lock — only the first flip wakes waiters and the second is a no-op (but
+	// it already appended a SessionStopped; the stream's EventID dedup absorbs the
+	// duplicate, and the read-side dedupes by EventID on replay).
 	h.mu.Lock()
 	if h.state.phase == SessionStopped {
 		h.mu.Unlock()
@@ -259,7 +397,8 @@ func (h *Hub) StopSession(_ context.Context) {
 	subs := h.snapshotSubsLocked()
 	h.mu.Unlock()
 
-	h.deliver(subs, event.SessionStopped{Header: event.Header{Coordinates: identity.Coordinates{SessionID: h.sessionID}}})
+	// (3) Deliver the durable SessionStopped live.
+	h.deliver(subs, ev)
 }
 
 // WaitIdle blocks until the session is quiescent (active empty), ctx is done, or
@@ -291,6 +430,20 @@ func (h *Hub) WaitIdle(ctx context.Context) error {
 		h.mu.Unlock()
 		return ctx.Err()
 	}
+}
+
+// FailWaiters wakes every WaitIdle waiter with err and clears the registry. It is
+// the session's escalation lever on a SessionPersistenceFault: a faulted session is
+// neither idle nor cleanly stopped, so its blocked WaitIdle callers must be released
+// with the fault rather than left hanging or falsely told "idle". Exported for the
+// session only (its FaultReporter implementation); loops never see it. It takes the
+// lock itself (called outside it). A waiter that registers AFTER this point will, on
+// a fresh WaitIdle, still block — the session's reject-new-work latch is the broader
+// backstop; this only releases the waiters outstanding at fault time.
+func (h *Hub) FailWaiters(err error) {
+	h.mu.Lock()
+	h.wakeWaitersLocked(err)
+	h.mu.Unlock()
 }
 
 // signalIdleLocked wakes every WaitIdle waiter with a nil error (the Active->Idle

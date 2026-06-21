@@ -68,16 +68,20 @@ func (s *sessionState) remove(k activityKey) { delete(s.active, k) }
 // cancelExpectTurn). It applies mutate, then derives the at-most-one phase edge:
 //
 //   - SessionStopped is terminal: return nil WITHOUT running mutate.
-//   - Active -> Idle (non-empty -> empty): set phase=SessionIdle, fire signalIdle,
-//     return a SessionIdle event.
+//   - Active -> Idle (non-empty -> empty): set phase=SessionIdle, return a SessionIdle
+//     event.
 //   - Idle -> Active (empty -> non-empty): set phase=SessionActive, return a
 //     SessionActive event.
 //   - otherwise (no emptiness edge): return nil.
 //
-// Derived events carry Header{SessionID} and zero loop/turn/step ids. signalIdle
-// is the hub's WaitIdle-waiter wake callback, invoked only on the Active->Idle
-// edge; sessionState itself owns no waiter registry (SRP).
-func (s *sessionState) applyActivity(sessionID uuid.UUID, mutate func(), signalIdle func()) event.Event {
+// Derived events carry Header{SessionID} and zero loop/turn/step ids — they are the
+// RAW (unstamped) edge events; the caller mints their EventID+CreatedAt via the
+// Factory before durably appending them. Waking WaitIdle waiters on the Active->Idle
+// edge is the CALLER's job, sequenced AFTER the derived SessionIdle is durably
+// appended (fail-secure: a failed append must not falsely wake a waiter to "idle").
+// The caller detects that edge by the returned event's concrete type (SessionIdle).
+// sessionState itself owns no waiter registry (SRP).
+func (s *sessionState) applyActivity(sessionID uuid.UUID, mutate func()) event.Event {
 	if s.phase == SessionStopped {
 		return nil // stopped is terminal; never mutate
 	}
@@ -88,7 +92,6 @@ func (s *sessionState) applyActivity(sessionID uuid.UUID, mutate func(), signalI
 	switch {
 	case !wasEmpty && isEmpty: // Active -> Idle
 		s.phase = SessionIdle
-		signalIdle()
 		return event.SessionIdle{Header: event.Header{Coordinates: identity.Coordinates{SessionID: sessionID}}}
 	case wasEmpty && !isEmpty: // Idle -> Active
 		s.phase = SessionActive

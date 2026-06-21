@@ -62,7 +62,6 @@ func TestApplyActivity(t *testing.T) {
 		mutate     func(s *sessionState)
 		want       wantEvent
 		wantPhase  SessionPhase
-		wantSignal bool // expect the signalIdle callback to fire
 		startPhase SessionPhase
 	}{
 		{
@@ -71,16 +70,14 @@ func TestApplyActivity(t *testing.T) {
 			mutate:     func(s *sessionState) { s.add(activityKey{kind: kindLoop, id: x}) },
 			want:       wantActive,
 			wantPhase:  SessionActive,
-			wantSignal: false,
 			startPhase: SessionIdle,
 		},
 		{
-			name:       "remove to empty -> SessionIdle and signal",
+			name:       "remove to empty -> SessionIdle (caller wakes waiters)",
 			seed:       func(s *sessionState) { s.add(activityKey{kind: kindLoop, id: x}); s.phase = SessionActive },
 			mutate:     func(s *sessionState) { s.remove(activityKey{kind: kindLoop, id: x}) },
 			want:       wantIdle,
 			wantPhase:  SessionIdle,
-			wantSignal: true,
 			startPhase: SessionActive,
 		},
 		{
@@ -91,7 +88,6 @@ func TestApplyActivity(t *testing.T) {
 			},
 			want:       wantNone,
 			wantPhase:  SessionActive,
-			wantSignal: false,
 			startPhase: SessionActive,
 		},
 		{
@@ -103,7 +99,6 @@ func TestApplyActivity(t *testing.T) {
 			},
 			want:       wantNone,
 			wantPhase:  SessionActive,
-			wantSignal: false,
 			startPhase: SessionActive,
 		},
 		{
@@ -112,7 +107,6 @@ func TestApplyActivity(t *testing.T) {
 			mutate:     func(s *sessionState) { s.add(activityKey{kind: kindWake, id: subagent}) },
 			want:       wantActive,
 			wantPhase:  SessionActive,
-			wantSignal: false,
 			startPhase: SessionIdle,
 		},
 		{
@@ -125,7 +119,6 @@ func TestApplyActivity(t *testing.T) {
 			mutate:     func(s *sessionState) { s.remove(activityKey{kind: kindLoop, id: x}) },
 			want:       wantNone,
 			wantPhase:  SessionActive,
-			wantSignal: false,
 			startPhase: SessionActive,
 		},
 		{
@@ -134,7 +127,6 @@ func TestApplyActivity(t *testing.T) {
 			mutate:     func(s *sessionState) { s.add(activityKey{kind: kindLoop, id: x}) },
 			want:       wantNone,
 			wantPhase:  SessionStopped,
-			wantSignal: false,
 			startPhase: SessionStopped,
 		},
 		{
@@ -143,7 +135,6 @@ func TestApplyActivity(t *testing.T) {
 			mutate:     func(s *sessionState) { s.remove(activityKey{kind: kindLoop, id: x}) },
 			want:       wantNone,
 			wantPhase:  SessionIdle,
-			wantSignal: false,
 			startPhase: SessionIdle,
 		},
 	}
@@ -153,8 +144,7 @@ func TestApplyActivity(t *testing.T) {
 			s := newSessionState()
 			tt.seed(&s)
 
-			signalled := false
-			got := s.applyActivity(session, func() { tt.mutate(&s) }, func() { signalled = true })
+			got := s.applyActivity(session, func() { tt.mutate(&s) })
 
 			// In the stopped no-op case, mutate must NOT have run.
 			if tt.startPhase == SessionStopped {
@@ -192,9 +182,6 @@ func TestApplyActivity(t *testing.T) {
 			if s.phase != tt.wantPhase {
 				t.Errorf("phase after applyActivity = %v, want %v", s.phase, tt.wantPhase)
 			}
-			if signalled != tt.wantSignal {
-				t.Errorf("signalIdle fired = %v, want %v", signalled, tt.wantSignal)
-			}
 		})
 	}
 }
@@ -208,14 +195,14 @@ func TestApplyActivitySetSemantics(t *testing.T) {
 	s := newSessionState()
 
 	// add X, add X again (idempotent) -> still one entry, Active.
-	_ = s.applyActivity(session, func() { s.add(activityKey{kind: kindLoop, id: x}) }, func() {})
-	_ = s.applyActivity(session, func() { s.add(activityKey{kind: kindLoop, id: x}) }, func() {})
+	_ = s.applyActivity(session, func() { s.add(activityKey{kind: kindLoop, id: x}) })
+	_ = s.applyActivity(session, func() { s.add(activityKey{kind: kindLoop, id: x}) })
 	if len(s.active) != 1 {
 		t.Fatalf("active len after doubled add = %d, want 1 (set semantics)", len(s.active))
 	}
 
 	// one remove returns to empty and fires Idle.
-	got := s.applyActivity(session, func() { s.remove(activityKey{kind: kindLoop, id: x}) }, func() {})
+	got := s.applyActivity(session, func() { s.remove(activityKey{kind: kindLoop, id: x}) })
 	if _, ok := got.(event.SessionIdle); !ok {
 		t.Fatalf("single remove after doubled add returned %T, want SessionIdle", got)
 	}
