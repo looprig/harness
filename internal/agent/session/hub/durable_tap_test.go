@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/inventivepotter/urvi/internal/agent/loop/event"
 	"github.com/inventivepotter/urvi/internal/agent/loop/identity"
@@ -209,6 +210,112 @@ func TestDerivedAppendFailureNeitherDelivered(t *testing.T) {
 	if _, ok := faults[0].Event.(event.SessionActive); !ok {
 		t.Errorf("fault.Event = %T, want SessionActive (the derived event whose append failed)", faults[0].Event)
 	}
+}
+
+// faultFailingReporter mirrors the Session's real FaultReporter: on a fault it wakes
+// every blocked WaitIdle waiter with that fault (via Hub.FailWaiters), and records the
+// fault. It lets a hub unit test prove the fail-secure escalation a SessionIdle
+// append failure triggers: a blocked WaitIdle returns the FAULT, never a false nil.
+type faultFailingReporter struct {
+	h *Hub
+	recordingReporter
+}
+
+func (r *faultFailingReporter) ReportFault(ctx context.Context, f *SessionPersistenceFault) {
+	r.recordingReporter.ReportFault(ctx, f)
+	r.h.FailWaiters(f)
+}
+
+// TestActiveToIdleDerivedAppendFailureDoesNotFalselyWakeWaitIdle is the dangerous
+// window: in-memory state went Active->Idle but the DERIVED SessionIdle's durable
+// append failed. The property under test is that signalIdleIfEdge runs only AFTER that
+// append, so a blocked WaitIdle is NEVER woken with a false nil "idle"; instead the
+// FaultReporter (wired here like the Session's) releases it with the fault. We also
+// assert a *SessionPersistenceFault naming SessionIdle was raised and that nothing was
+// delivered for the failed derived event.
+//
+// Guard proof: temporarily moving signalIdleIfEdge BEFORE the append-failure return in
+// PublishEvent makes this test FAIL — the blocked WaitIdle would wake with nil before
+// the fault.
+func TestActiveToIdleDerivedAppendFailureDoesNotFalselyWakeWaitIdle(t *testing.T) {
+	t.Parallel()
+	session := mustID(t)
+	loopA := mustID(t)
+	// Fail ONLY the derived SessionIdle append; the TurnStarted, derived SessionActive,
+	// and the triggering LoopIdle all persist. (Ordering-robust: fail by type, not index.)
+	app := failOnType(event.SessionIdle{})
+	rep := &faultFailingReporter{}
+	h := New(session, WithAppender(app), WithFactory(testFactory()), WithFaultReporter(rep))
+	rep.h = h
+	sub, err := h.SubscribeEvents(allFilter())
+	if err != nil {
+		t.Fatalf("SubscribeEvents = %v", err)
+	}
+
+	// Drive the session Active with a passing appender path: TurnStarted -> SessionActive.
+	if err := h.PublishEvent(context.Background(), event.TurnStarted{Header: event.Header{Coordinates: identity.Coordinates{SessionID: session, LoopID: loopA}}}); err != nil {
+		t.Fatalf("PublishEvent(TurnStarted) = %v", err)
+	}
+	if _, ok := recv(t, sub).(event.TurnStarted); !ok {
+		t.Fatalf("first delivered not TurnStarted")
+	}
+	if _, ok := recv(t, sub).(event.SessionActive); !ok {
+		t.Fatalf("second delivered not the derived SessionActive")
+	}
+
+	// Block a WaitIdle (session is Active). It MUST NOT wake with nil.
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	waitErr := make(chan error, 1)
+	go func() { waitErr <- h.WaitIdle(ctx) }()
+	select {
+	case err := <-waitErr:
+		t.Fatalf("WaitIdle returned %v before the Active->Idle edge; should be blocked (Active)", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	// Publish the Active->Idle trigger. The derived SessionIdle append fails: in-memory
+	// state is now idle, but the durable record did not commit -> fail-secure.
+	if err := h.PublishEvent(context.Background(), event.LoopIdle{Header: event.Header{Coordinates: identity.Coordinates{SessionID: session, LoopID: loopA}}}); err != nil {
+		t.Fatalf("PublishEvent(LoopIdle) = %v", err)
+	}
+
+	// The blocked WaitIdle wakes with the FAULT, NOT a false nil. (If signalIdleIfEdge
+	// ran before the append-failure return, this would receive nil.)
+	gotErr := <-waitErr
+	if gotErr == nil {
+		t.Fatalf("WaitIdle was falsely woken with nil after a failed SessionIdle append (must report the fault, not idle)")
+	}
+	var spf *SessionPersistenceFault
+	if !errors.As(gotErr, &spf) {
+		t.Fatalf("WaitIdle woke with %v, want a *SessionPersistenceFault", gotErr)
+	}
+	if _, ok := spf.Event.(event.SessionIdle); !ok {
+		t.Errorf("WaitIdle fault.Event = %T, want SessionIdle", spf.Event)
+	}
+
+	// Exactly one fault, naming the derived SessionIdle whose append failed.
+	faults := rep.reported()
+	if len(faults) != 1 {
+		t.Fatalf("reported %d faults, want 1", len(faults))
+	}
+	if _, ok := faults[0].Event.(event.SessionIdle); !ok {
+		t.Errorf("fault.Event = %T, want SessionIdle (the derived event whose append failed)", faults[0].Event)
+	}
+	if !errors.Is(faults[0].Cause, errAppend) {
+		t.Errorf("fault.Cause = %v, want errAppend", faults[0].Cause)
+	}
+
+	// The triggering LoopIdle was appended (it persisted) but the derived SessionIdle
+	// was NOT, and neither the LoopIdle nor the SessionIdle was delivered live after
+	// the failed derived append.
+	appended := app.events()
+	for _, ev := range appended {
+		if _, ok := ev.(event.SessionIdle); ok {
+			t.Errorf("a SessionIdle was recorded as appended; its append was supposed to fail")
+		}
+	}
+	expectNone(t, sub)
 }
 
 // TestStopSessionAppendsBeforeDeliver proves StopSession mints + appends the

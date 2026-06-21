@@ -405,6 +405,13 @@ func (h *Hub) StopSession(ctx context.Context) {
 // the session stops. It returns nil on idle, ctx.Err() on cancellation, and
 // ErrSessionStopped if the session is or becomes stopped. With no session
 // goroutine, waiters are woken by applyActivity (Active->Idle) and StopSession.
+//
+// Invariant for concurrent callers: the immediate "already idle" fast-return reflects
+// in-memory quiescence state only, which a concurrent derived-append failure may be
+// about to fault (the in-memory Active->Idle edge crossed, but its durable SessionIdle
+// append has not yet committed). A caller consulting WaitIdle concurrently with
+// publishes must therefore treat a subsequent SessionFaulted as authoritative over a
+// nil/idle result observed in that window.
 func (h *Hub) WaitIdle(ctx context.Context) error {
 	h.mu.Lock()
 	switch {

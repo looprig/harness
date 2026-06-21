@@ -2,6 +2,7 @@ package hub
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -45,6 +46,48 @@ func (f *fakeAppender) callCount() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.calls
+}
+
+// typeFailAppender records every appended event in order and fails the append of any
+// event whose concrete type matches a registered fail set. It is the ordering-robust
+// counterpart to fakeAppender.failAt: a test that needs "succeed on every append
+// EXCEPT the derived SessionIdle" cannot use a brittle 1-based call index (the index
+// shifts if the publish path appends a different number of events), so it names the
+// type to fail instead. Safe for concurrent use.
+type typeFailAppender struct {
+	mu       sync.Mutex
+	appended []event.Event
+	failOn   map[string]struct{} // fmt.Sprintf("%T", ev) values to fail
+	calls    int
+}
+
+// failOnType returns a typeFailAppender that fails AppendEvent for any event whose
+// %T matches one of evs, and succeeds (recording the event) for every other type.
+func failOnType(evs ...event.Event) *typeFailAppender {
+	set := make(map[string]struct{}, len(evs))
+	for _, ev := range evs {
+		set[fmt.Sprintf("%T", ev)] = struct{}{}
+	}
+	return &typeFailAppender{failOn: set}
+}
+
+func (f *typeFailAppender) AppendEvent(_ context.Context, ev event.Event) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls++
+	if _, fail := f.failOn[fmt.Sprintf("%T", ev)]; fail {
+		return errAppend
+	}
+	f.appended = append(f.appended, ev)
+	return nil
+}
+
+func (f *typeFailAppender) events() []event.Event {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]event.Event, len(f.appended))
+	copy(out, f.appended)
+	return out
 }
 
 // recordingReporter captures the faults the hub reports so a test can assert the
