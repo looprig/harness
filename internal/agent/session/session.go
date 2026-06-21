@@ -144,6 +144,23 @@ type Session struct {
 	faulted  bool
 	faultErr error
 
+	// limits are the in-session subagent-spawn safety caps NewLoop enforces (depth +
+	// quota). Defaulted in newSession (withDefaults) so the live values are always
+	// positive caps, and overridable via WithLimits. Read under loopsMu inside NewLoop's
+	// authoritative critical section (the same lock that gates closing/faulted), so the
+	// caps are evaluated atomically with the reservation. It is set once at construction
+	// and never mutated, so the lock is only for read-coherence with the spawned counter.
+	limits Limits
+
+	// spawned is the running count of sub-loops this session has spawned via the
+	// quota-counted NewLoop path (the primary loop, built by New, does NOT count). It is
+	// the quota's reservation counter: NewLoop reserves a slot (spawned++) under loopsMu
+	// once the depth + quota + closing/faulted checks pass, and ROLLS BACK (spawned--)
+	// under the same lock on every later failure (id-mint, loop.New, the registration-time
+	// closing re-check, publish failure). Restore re-seeds it by counting the durable
+	// non-root LoopStarted events, so the quota survives a restart. Guarded by loopsMu.
+	spawned int
+
 	// newID mints command-Header IDs and loop ids. It defaults to uuid.New; kept
 	// as a field only so tests can inject failure and prove the session never
 	// sends zero-id commands and never registers a zero-id loop.
@@ -592,6 +609,10 @@ func newSession(ctx context.Context, cfg loop.Config, newID idGenerator, now eve
 	for _, opt := range opts {
 		opt(s)
 	}
+	// Apply the spawn-cap defaults AFTER the options so an unset (or WithLimits-supplied)
+	// Limits resolves to positive caps before the first NewLoop — a zero or negative
+	// configured value never silently disables the depth/quota backstop.
+	s.limits = s.limits.withDefaults()
 	// The Factory mints from closures over the LIVE newID + now fields, so a test
 	// that swaps either after construction pins the stamp too (the same seam the
 	// session's command-id minting uses).

@@ -99,6 +99,18 @@ func WithLeaseRelease(release func(context.Context) error) Option {
 	}
 }
 
+// WithLimits sets the in-session subagent-spawn safety caps (depth + quota) NewLoop
+// enforces. A zero (or negative) field in the supplied Limits adopts the package default
+// (Depth 3 / Quota 64) when newSession applies withDefaults, so a caller can never disable
+// a cap with a missing or bad value. Without this option a session uses the defaults. It
+// applies on both New and Restore (the restore path re-seeds the spawn counter from the
+// durable log, then enforces these caps against it).
+func WithLimits(l Limits) Option {
+	return func(s *Session) {
+		s.limits = l
+	}
+}
+
 // WithAllowConfigMismatch is the restore-only opt-in to resume a session whose
 // persisted config fingerprint no longer matches the live config (a different model,
 // system prompt, or tool policy). Restore is fail-secure by DEFAULT — a mismatch
