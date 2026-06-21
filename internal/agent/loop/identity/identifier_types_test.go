@@ -15,6 +15,48 @@ func TestAgencyZeroValueIsMachine(t *testing.T) {
 	}
 }
 
+// TestAgentNameZeroValueIsUnset documents the contract: the zero AgentName is the
+// empty string, meaning "unset" (a plain loop, or a pre-AgentName persisted record).
+func TestAgentNameZeroValueIsUnset(t *testing.T) {
+	t.Parallel()
+	var n AgentName
+	if n != "" {
+		t.Errorf("zero AgentName = %q, want empty (unset)", n)
+	}
+}
+
+// TestAgentNameRoundTrip covers AgentName's string round-trip across the JSON
+// boundary it rides on event.Header: a set name survives encode/decode, and the
+// unset (empty) zero value round-trips to empty.
+func TestAgentNameRoundTrip(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+		in   AgentName
+	}{
+		{name: "unset (empty) name", in: ""},
+		{name: "operator", in: "operator"},
+		{name: "multi-word role name", in: "code reviewer"},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			data, err := json.Marshal(tt.in)
+			if err != nil {
+				t.Fatalf("json.Marshal err = %v", err)
+			}
+			var got AgentName
+			if err := json.Unmarshal(data, &got); err != nil {
+				t.Fatalf("json.Unmarshal err = %v", err)
+			}
+			if got != tt.in {
+				t.Errorf("round-trip = %q, want %q", got, tt.in)
+			}
+		})
+	}
+}
+
 func TestAgencyString(t *testing.T) {
 	t.Parallel()
 	tests := []struct {

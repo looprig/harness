@@ -21,6 +21,17 @@ type Coordinates struct {
 	StepID    uuid.UUID `json:"step_id,omitzero"`
 }
 
+// AgentName is the immutable attribution name a loop runs under — the role/identity
+// of the agent driving that loop (e.g. "operator", "code reviewer"). It is stamped on
+// the loop's LoopStarted at creation and never changes for the life of the loop, so the
+// durable record carries a stable answer to "which agent produced this?".
+//
+// The zero value (the empty string) means UNSET: a plain loop that was started without
+// an attribution name, or a record persisted before AgentName existed. Restore treats an
+// empty stored name as distinct from a configured non-empty one (it does not silently
+// accept the legacy zero as a match) so a name change is never resumed unnoticed.
+type AgentName string
+
 // Agency records who performed an action — per action, not per turn. It is an
 // audit/observability record (who approved, who interrupted), not the gate
 // decision. The zero value is AgencyMachine, the fail-secure default: a
