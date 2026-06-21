@@ -179,7 +179,8 @@ func TestNewAppliesToolSetDefaults(t *testing.T) {
 	}
 	// Config carries a fully zero-value ToolSet: nil Permission/Registry/
 	// Middlewares and zero caps. New must accept it and the loop must run.
-	l, err := New(ctx, sessionID, loopID, Provenance{}, noopPublisher{}, Config{
+	rec := &recordingPublisher{}
+	l, err := New(ctx, sessionID, loopID, Provenance{}, rec, Config{
 		Client:       &fakeLLM{chunks: []content.Chunk{textChunk("hi")}},
 		Model:        llm.ModelSpec{Model: "m"},
 		DrainTimeout: 200 * time.Millisecond,
@@ -188,8 +189,8 @@ func TestNewAppliesToolSetDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New with zero ToolSet = %v, want nil", err)
 	}
-	ev, _ := startTurn(t, l, context.Background(), nil)
-	if _, ok := drainToTerminal(t, ev).(event.TurnDone); !ok {
+	startTurn(t, l, rec, nil)
+	if _, ok := drainToTerminal(t, rec).(event.TurnDone); !ok {
 		t.Fatal("turn did not complete to TurnDone with zero-value ToolSet")
 	}
 }

@@ -59,9 +59,12 @@ type InputCancelled struct {
 type RejectReason uint8
 
 const (
-	// RejectBusy: the loop is running and the submit is not queueable
-	// (StartOnly / a non-queueable internal turn).
-	RejectBusy RejectReason = iota
+	// RejectUnspecified is the zero-value sentinel: NOT a reason the loop ever
+	// produces. It exists so a zero-valued TurnRejected{} does not masquerade as a
+	// real reason and so the json:"reason,omitzero" tag only drops a genuinely-empty
+	// reason (every real reason below is non-zero and always serializes). A
+	// RejectReason that compares equal to this came from a zero value, not a decision.
+	RejectUnspecified RejectReason = iota
 	// RejectQueueFull: the loop's inbox is at capacity.
 	RejectQueueFull
 	// RejectShuttingDown: the loop is shutting down and accepts no new input.
@@ -83,9 +86,9 @@ type InputQueued struct {
 }
 
 // TurnRejected is the Enduring Reply event for a UserInput the loop refused
-// (queue-full, shutting-down, busy/non-queueable, or a transient internal failure).
-// Enduring: a rejected user message must never silently vanish.
-// Header.Cause.CommandID is the submit command id.
+// (queue-full, shutting-down, or a transient internal failure). Enduring: a rejected
+// user message must never silently vanish. Header.Cause.CommandID is the submit
+// command id.
 type TurnRejected struct {
 	enduring
 	loopScoped

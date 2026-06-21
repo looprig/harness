@@ -4,7 +4,6 @@ import (
 	"testing"
 
 	"github.com/inventivepotter/urvi/internal/agent/loop/command"
-	"github.com/inventivepotter/urvi/internal/agent/loop/event"
 	"github.com/inventivepotter/urvi/internal/agent/loop/identity"
 	"github.com/inventivepotter/urvi/internal/content"
 	"github.com/inventivepotter/urvi/internal/uuid"
@@ -22,15 +21,13 @@ func newID(t *testing.T) uuid.UUID {
 // TestSubmitCommandsSatisfyCommand asserts UserInput and SubagentResult are sealed
 // Commands that round-trip their embedded Header. They carry NO Ctx field; the
 // loop derives the turn context from its loopCtx, so the table exercises the
-// fields that DO exist (Mode, optional stream, the two SubagentResult loop ids).
+// fields that DO exist (Blocks and, for SubagentResult, the two loop ids).
 func TestSubmitCommandsSatisfyCommand(t *testing.T) {
 	t.Parallel()
 
 	headerID := newID(t)
 	parentLoop := newID(t)
 	childLoop := newID(t)
-	ev := make(chan event.Event, 1)
-	ab := make(chan struct{})
 	blocks := []content.Block{&content.TextBlock{Text: "hi"}}
 
 	tests := []struct {
@@ -39,13 +36,8 @@ func TestSubmitCommandsSatisfyCommand(t *testing.T) {
 		wantHeader uuid.UUID
 	}{
 		{
-			name:       "UserInput AllowFold fan-in only (nil stream)",
-			cmd:        command.UserInput{Header: command.Header{CommandID: headerID}, Blocks: blocks, Mode: command.AllowFold},
-			wantHeader: headerID,
-		},
-		{
-			name:       "UserInput StartOnly with per-turn stream",
-			cmd:        command.UserInput{Header: command.Header{CommandID: headerID}, Blocks: blocks, Mode: command.StartOnly, Events: ev, Abandoned: ab},
+			name:       "UserInput with blocks (fan-in only)",
+			cmd:        command.UserInput{Header: command.Header{CommandID: headerID}, Blocks: blocks},
 			wantHeader: headerID,
 		},
 		{
@@ -129,29 +121,5 @@ func TestSubagentResultTwoLoopIDs(t *testing.T) {
 	// A hand-back is machine-originated: Agency stays the zero default AgencyMachine.
 	if sr.CommandHeader().Agency != identity.AgencyMachine {
 		t.Errorf("SubagentResult Agency = %v, want AgencyMachine (default)", sr.CommandHeader().Agency)
-	}
-}
-
-// TestInputModeValues pins the InputMode enum: AllowFold is the zero value
-// (default interactive mode) and StartOnly is distinct.
-func TestInputModeValues(t *testing.T) {
-	t.Parallel()
-	tests := []struct {
-		name string
-		mode command.InputMode
-		want command.InputMode
-	}{
-		{name: "AllowFold is zero", mode: command.AllowFold, want: 0},
-		{name: "StartOnly is one", mode: command.StartOnly, want: 1},
-		{name: "default mode is AllowFold", mode: command.UserInput{}.Mode, want: command.AllowFold},
-	}
-	for _, tt := range tests {
-		tt := tt
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-			if tt.mode != tt.want {
-				t.Errorf("mode = %d, want %d", tt.mode, tt.want)
-			}
-		})
 	}
 }

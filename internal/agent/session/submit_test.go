@@ -16,9 +16,8 @@ import (
 
 // TestSubmitFireAndForget asserts Submit's fire-and-forget contract end-to-end on
 // the command channel: a successful send returns a non-zero InputID (the submit
-// command's Header.ID) and a nil error, and the loop receives a queueable
-// (AllowFold) command.UserInput stamped with exactly that id, carrying the input
-// blocks and NO per-turn stream (Events/Abandoned nil) — the outcome is observed
+// command's Header.ID) and a nil error, and the loop receives a command.UserInput
+// stamped with exactly that id, carrying the input blocks — the outcome is observed
 // on the session fan-in, never returned. A send to a loop whose Done channel is
 // already closed must fail secure with *SessionError{SessionLoopExited} and the
 // returned id must be zero (no usable correlation when nothing was sent).
@@ -38,19 +37,16 @@ func TestSubmitFireAndForget(t *testing.T) {
 		loopGone      bool // close the fake loop's Done before Submit, forcing the exited path
 		wantErr       bool
 		wantKind      SessionErrorKind
-		wantMode      command.InputMode
 		wantNonZeroID bool
 	}{
 		{
-			name:          "idle session queues an AllowFold UserInput",
+			name:          "idle session queues a UserInput",
 			blocks:        []content.Block{&content.TextBlock{Text: "hello"}},
-			wantMode:      command.AllowFold,
 			wantNonZeroID: true,
 		},
 		{
 			name:          "nil blocks still send fire-and-forget",
 			blocks:        nil,
-			wantMode:      command.AllowFold,
 			wantNonZeroID: true,
 		},
 		{
@@ -123,20 +119,10 @@ func TestSubmitFireAndForget(t *testing.T) {
 			if !ok {
 				t.Fatalf("Submit sent %T, want command.UserInput", cmd)
 			}
-			if ui.Mode != tt.wantMode {
-				t.Errorf("Mode = %v, want %v (AllowFold = queueable)", ui.Mode, tt.wantMode)
-			}
 			// The returned InputID is the command's Header.ID — the Cause.CommandID the
 			// Reply events will carry. They must be identical.
 			if ui.Header.CommandID != res.id {
 				t.Errorf("UserInput.Header.ID = %v, want returned InputID %v", ui.Header.CommandID, res.id)
-			}
-			// Fire-and-forget: no per-turn stream is attached.
-			if ui.Events != nil {
-				t.Error("UserInput.Events is non-nil, want nil (fan-in-only, no per-turn stream)")
-			}
-			if ui.Abandoned != nil {
-				t.Error("UserInput.Abandoned is non-nil, want nil (fan-in-only)")
 			}
 			if len(ui.Blocks) != len(tt.blocks) {
 				t.Errorf("UserInput.Blocks len = %d, want %d", len(ui.Blocks), len(tt.blocks))

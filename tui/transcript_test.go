@@ -1463,7 +1463,7 @@ func TestTranscriptTurnRejected(t *testing.T) {
 		reason event.RejectReason
 		want   string
 	}{
-		{name: "busy", reason: event.RejectBusy, want: "loop busy"},
+		{name: "unspecified zero-value sentinel degrades to refused", reason: event.RejectUnspecified, want: "refused"},
 		{name: "queue full", reason: event.RejectQueueFull, want: "queue full"},
 		{name: "shutting down", reason: event.RejectShuttingDown, want: "shutting down"},
 		{name: "internal", reason: event.RejectInternal, want: "internal error"},

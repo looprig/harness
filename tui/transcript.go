@@ -428,12 +428,11 @@ func (m *transcriptModel) rejectInput(inputID uuid.UUID, reason event.RejectReas
 	*m = m.CommitNotice(noticeError, "input rejected: "+rejectReasonText(reason))
 }
 
-// rejectReasonText maps a RejectReason to a short user-facing phrase. An unknown
-// value degrades to a neutral "refused" rather than printing a raw enum number.
+// rejectReasonText maps a RejectReason to a short user-facing phrase. The
+// zero-value sentinel (RejectUnspecified) and any unknown value degrade to a
+// neutral "refused" rather than printing a raw enum number.
 func rejectReasonText(reason event.RejectReason) string {
 	switch reason {
-	case event.RejectBusy:
-		return "loop busy"
 	case event.RejectQueueFull:
 		return "queue full"
 	case event.RejectShuttingDown:

@@ -14,13 +14,12 @@ import (
 	"github.com/inventivepotter/urvi/internal/uuid"
 )
 
-// submitUserInput sends an AllowFold/StartOnly UserInput (fan-in only) with the
-// given id and returns the published outcome event (TurnStarted/InputQueued/
-// TurnRejected) observed via the recording publisher. It is the interactive submit
-// path (no per-turn stream).
-func submitUserInput(t *testing.T, l *Loop, rec *recordingPublisher, id uuid.UUID, mode command.InputMode) event.Event {
+// submitUserInput sends a UserInput with the given id and returns the published
+// outcome event (TurnStarted/InputQueued/TurnRejected) observed via the recording
+// publisher. Every submit observes its outcome on the session fan-in.
+func submitUserInput(t *testing.T, l *Loop, rec *recordingPublisher, id uuid.UUID) event.Event {
 	t.Helper()
-	l.Commands <- command.UserInput{Header: command.Header{CommandID: id}, Mode: mode}
+	l.Commands <- command.UserInput{Header: command.Header{CommandID: id}}
 	return awaitReply(t, rec, id)
 }
 
@@ -29,7 +28,7 @@ func textBlocks(s string) []content.Block {
 	return []content.Block{&content.TextBlock{Text: s}}
 }
 
-// TestSubmitToIdleStartsTurn: an AllowFold UserInput to an idle loop publishes
+// TestSubmitToIdleStartsTurn: a UserInput to an idle loop publishes
 // event.TurnStarted (the Started outcome) carrying InputID, Message, and
 // Cause.CommandID == InputID. There is no separate Started reply: the TurnStarted IS the
 // outcome.
@@ -38,7 +37,7 @@ func TestSubmitToIdleStartsTurn(t *testing.T) {
 	l, rec, _ := newLoopRec(t, &fakeLLM{chunks: []content.Chunk{textChunk("hi")}})
 
 	inputID := mustID(t)
-	l.Commands <- command.UserInput{Header: command.Header{CommandID: inputID}, Mode: command.AllowFold, Blocks: textBlocks("hello")}
+	l.Commands <- command.UserInput{Header: command.Header{CommandID: inputID}, Blocks: textBlocks("hello")}
 
 	ev := awaitReply(t, rec, inputID)
 	started, ok := ev.(event.TurnStarted)
@@ -87,20 +86,19 @@ func TestSubagentResultToIdleStartsTurn(t *testing.T) {
 	}
 }
 
-// TestSubmitToRunningQueueableQueues: an AllowFold UserInput to a running loop
-// publishes event.InputQueued{InputID} (Cause.CommandID == InputID, no TurnID) and is
-// held in the inbox in order.
+// TestSubmitToRunningQueueableQueues: a UserInput to a running loop publishes
+// event.InputQueued{InputID} (Cause.CommandID == InputID, no TurnID) and is held in
+// the inbox in order.
 func TestSubmitToRunningQueueableQueues(t *testing.T) {
 	t.Parallel()
 	// blockUntilCancel keeps the first turn running so the second submit queues.
 	l, rec, _ := newLoopRec(t, &fakeLLM{blockUntilCancel: true})
-	ev1, _ := startTurn(t, l, context.Background(), nil) // StartOnly: occupies the loop
-	_ = ev1
+	startTurn(t, l, rec, nil) // occupy the loop
 
 	idA := mustID(t)
 	idB := mustID(t)
-	qA := submitUserInput(t, l, rec, idA, command.AllowFold)
-	qB := submitUserInput(t, l, rec, idB, command.AllowFold)
+	qA := submitUserInput(t, l, rec, idA)
+	qB := submitUserInput(t, l, rec, idB)
 
 	for _, tc := range []struct {
 		name string
@@ -131,13 +129,12 @@ func TestSubmitToRunningQueueableQueues(t *testing.T) {
 func TestSubagentResultToFullInboxQueues(t *testing.T) {
 	t.Parallel()
 	l, rec, _ := newLoopRec(t, &fakeLLM{blockUntilCancel: true})
-	ev1, _ := startTurn(t, l, context.Background(), nil) // occupy the loop
-	_ = ev1
+	startTurn(t, l, rec, nil) // occupy the loop
 
-	// Fill the inbox to capacity with AllowFold UserInputs.
+	// Fill the inbox to capacity with UserInputs.
 	for i := 0; i < inboxCap; i++ {
 		id := mustID(t)
-		if _, ok := submitUserInput(t, l, rec, id, command.AllowFold).(event.InputQueued); !ok {
+		if _, ok := submitUserInput(t, l, rec, id).(event.InputQueued); !ok {
 			t.Fatalf("submit %d: want event.InputQueued", i)
 		}
 	}
@@ -233,73 +230,35 @@ func TestSubagentResultIDGenerationFailureCancels(t *testing.T) {
 	}
 }
 
-// TestStartOnlyBusyRejected: a StartOnly UserInput to a running loop publishes
-// event.TurnRejected{RejectBusy} (it must start or be rejected, never queue) and the
-// same reason is delivered on the caller's per-turn stream, which is then closed.
-func TestStartOnlyBusyRejected(t *testing.T) {
-	t.Parallel()
-	l, rec, _ := newLoopRec(t, &fakeLLM{blockUntilCancel: true})
-	ev1, _ := startTurn(t, l, context.Background(), nil)
-	_ = ev1
-
-	id := mustID(t)
-	ev := make(chan event.Event, 1)
-	ab := make(chan struct{})
-	defer close(ab)
-	l.Commands <- command.UserInput{Header: command.Header{CommandID: id}, Mode: command.StartOnly, Events: ev, Abandoned: ab}
-
-	// The per-turn stream carries the reason as its first event, then closes.
-	first, ok := <-ev
-	if !ok {
-		t.Fatal("per-turn stream closed without a TurnRejected event")
-	}
-	rej, ok := first.(event.TurnRejected)
-	if !ok || rej.Reason != event.RejectBusy {
-		t.Fatalf("per-turn outcome = %+v, want event.TurnRejected{RejectBusy}", first)
-	}
-	if _, open := <-ev; open {
-		t.Error("rejected turn's per-turn stream should be closed after the reason")
-	}
-
-	// And the published fan-in event mirrors it (Cause.CommandID == InputID).
-	pub, ok := awaitReply(t, rec, id).(event.TurnRejected)
-	if !ok || pub.Reason != event.RejectBusy || pub.Cause.CommandID != id {
-		t.Fatalf("published outcome = %+v, want event.TurnRejected{RejectBusy, Cause.CommandID:%v}", pub, id)
-	}
-}
-
-// TestInboxFullRejected: when the inbox is at inboxCap, a further AllowFold submit
-// is rejected with event.TurnRejected{RejectQueueFull} (a length check; never
-// blocks).
+// TestInboxFullRejected: when the inbox is at inboxCap, a further submit is rejected
+// with event.TurnRejected{RejectQueueFull} (a length check; never blocks).
 func TestInboxFullRejected(t *testing.T) {
 	t.Parallel()
 	l, rec, _ := newLoopRec(t, &fakeLLM{blockUntilCancel: true})
-	ev1, _ := startTurn(t, l, context.Background(), nil) // occupy the loop
-	_ = ev1
+	startTurn(t, l, rec, nil) // occupy the loop
 
 	// Fill the inbox to capacity.
 	for i := 0; i < inboxCap; i++ {
 		id := mustID(t)
-		if _, ok := submitUserInput(t, l, rec, id, command.AllowFold).(event.InputQueued); !ok {
+		if _, ok := submitUserInput(t, l, rec, id).(event.InputQueued); !ok {
 			t.Fatalf("submit %d: want event.InputQueued", i)
 		}
 	}
 	// One more: the queue is full.
 	id := mustID(t)
-	ev := submitUserInput(t, l, rec, id, command.AllowFold)
+	ev := submitUserInput(t, l, rec, id)
 	rej, ok := ev.(event.TurnRejected)
 	if !ok || rej.Reason != event.RejectQueueFull {
 		t.Fatalf("outcome = %+v, want event.TurnRejected{RejectQueueFull}", ev)
 	}
 }
 
-// TestShuttingDownRejected: an AllowFold submit after the loop is shutting down is
-// rejected with event.TurnRejected{RejectShuttingDown}.
+// TestShuttingDownRejected: a submit after the loop is shutting down is rejected with
+// event.TurnRejected{RejectShuttingDown}.
 func TestShuttingDownRejected(t *testing.T) {
 	t.Parallel()
 	l, rec, _ := newLoopRec(t, &fakeLLM{blockUntilCancel: true})
-	ev1, _ := startTurn(t, l, context.Background(), nil)
-	_ = ev1
+	startTurn(t, l, rec, nil)
 
 	// Shutdown flips status to loopShuttingDown; the running turn winds down.
 	sack := make(chan error, 1)
@@ -311,7 +270,7 @@ func TestShuttingDownRejected(t *testing.T) {
 	for {
 		id := mustID(t)
 		select {
-		case l.Commands <- command.UserInput{Header: command.Header{CommandID: id}, Mode: command.AllowFold}:
+		case l.Commands <- command.UserInput{Header: command.Header{CommandID: id}}:
 		case <-l.Done:
 			// Loop exited before we observed the rejection — acceptable: a stopped
 			// loop also refuses input. End the test.
@@ -373,17 +332,13 @@ func TestNormalCompletionPopsInbox(t *testing.T) {
 	client.mu.Lock()
 	client.onStreamN = map[int]func(){
 		0: func() {
-			l.Commands <- command.UserInput{Header: command.Header{CommandID: queuedID}, Mode: command.AllowFold}
+			l.Commands <- command.UserInput{Header: command.Header{CommandID: queuedID}}
 		},
 	}
 	client.mu.Unlock()
 
-	// Turn 1 starts (StartOnly).
-	ev1, _ := startTurn(t, l, context.Background(), textBlocks("turn1"))
-	go func() { // drain turn 1's per-turn stream so emit never blocks
-		for range ev1 {
-		}
-	}()
+	// Turn 1 starts.
+	startTurn(t, l, rec, textBlocks("turn1"))
 
 	// Turn 1 completes normally (TurnDone); the actor pops the queued entry and starts
 	// turn 2 from it. A second event.TurnStarted must appear carrying the queued InputID.

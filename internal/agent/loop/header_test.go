@@ -96,7 +96,7 @@ func TestStampLoopHeaderReplyEvents(t *testing.T) {
 			name: "TurnRejected pre-set session/loop is preserved (only zero fields filled)",
 			in: event.TurnRejected{
 				Header: event.Header{Coordinates: identity.Coordinates{SessionID: uuid.UUID{1}, LoopID: uuid.UUID{2}}},
-				Reason: event.RejectBusy,
+				Reason: event.RejectShuttingDown,
 			},
 			want: func(t *testing.T, got event.Event) {
 				r := got.(event.TurnRejected)

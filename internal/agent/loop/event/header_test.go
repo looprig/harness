@@ -325,11 +325,11 @@ func TestNewEventFields(t *testing.T) {
 		}
 	})
 
-	t.Run("TurnRejected zero Reason is RejectBusy boundary", func(t *testing.T) {
+	t.Run("TurnRejected zero Reason is RejectUnspecified boundary", func(t *testing.T) {
 		t.Parallel()
 		ev := event.TurnRejected{}
-		if ev.Reason != event.RejectBusy {
-			t.Errorf("zero Reason = %v, want %v (RejectBusy)", ev.Reason, event.RejectBusy)
+		if ev.Reason != event.RejectUnspecified {
+			t.Errorf("zero Reason = %v, want %v (RejectUnspecified)", ev.Reason, event.RejectUnspecified)
 		}
 	})
 }

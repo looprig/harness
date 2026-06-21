@@ -87,7 +87,7 @@ func TestInboxPopIDGenFailureReturnsEntry(t *testing.T) {
 	client.mu.Lock()
 	client.onStreamN = map[int]func(){
 		0: func() {
-			l.Commands <- command.UserInput{Header: command.Header{CommandID: queuedID}, Mode: command.AllowFold}
+			l.Commands <- command.UserInput{Header: command.Header{CommandID: queuedID}}
 			if _, ok := awaitReply(t, rec, queuedID).(event.InputQueued); !ok {
 				t.Errorf("queued submit during final step not InputQueued")
 			}
@@ -96,12 +96,8 @@ func TestInboxPopIDGenFailureReturnsEntry(t *testing.T) {
 	}
 	client.mu.Unlock()
 
-	// Turn 1 starts (StartOnly).
-	ev1, _ := startTurn(t, l, context.Background(), textBlocks("turn1"))
-	go func() { // drain turn 1's per-turn stream so emit never blocks
-		for range ev1 {
-		}
-	}()
+	// Turn 1 starts.
+	startTurn(t, l, rec, textBlocks("turn1"))
 
 	// The popped entry must NOT be stranded: it must surface as
 	// InputCancelled{CancelTurnFailed}. (Before the fix it is silently dropped.)

@@ -46,7 +46,7 @@ func recvReply(t *testing.T, reply <-chan command.Command, d time.Duration) (com
 // right answer. This is the case a single shared buffer-1 channel would corrupt.
 func TestListenRoutesTwoConcurrentUserInputGates(t *testing.T) {
 	t.Parallel()
-	l, _ := newLoop(t, &fakeLLM{})
+	l, _, _ := newLoop(t, &fakeLLM{})
 	idA := newCallID(t)
 	idB := newCallID(t)
 
@@ -75,7 +75,7 @@ func TestListenRoutesTwoConcurrentUserInputGates(t *testing.T) {
 // TestListenRoutesPermissionGate verifies an Approve reaches a gatePermission gate.
 func TestListenRoutesPermissionGate(t *testing.T) {
 	t.Parallel()
-	l, _ := newLoop(t, &fakeLLM{})
+	l, _, _ := newLoop(t, &fakeLLM{})
 	id := newCallID(t)
 	reply := registerGate(t, l, id, gatePermission)
 
@@ -94,7 +94,7 @@ func TestListenRoutesPermissionGate(t *testing.T) {
 // a real gate is still routed).
 func TestListenDropsWrongCallID(t *testing.T) {
 	t.Parallel()
-	l, _ := newLoop(t, &fakeLLM{})
+	l, _, _ := newLoop(t, &fakeLLM{})
 	id := newCallID(t)
 	stray := newCallID(t)
 	reply := registerGate(t, l, id, gateUserInput)
@@ -119,7 +119,7 @@ func TestListenDropsWrongCallID(t *testing.T) {
 // dropped (kind mismatch), and the gate still resolves on the right command kind.
 func TestListenDropsWrongKind(t *testing.T) {
 	t.Parallel()
-	l, _ := newLoop(t, &fakeLLM{})
+	l, _, _ := newLoop(t, &fakeLLM{})
 	id := newCallID(t)
 	reply := registerGate(t, l, id, gateUserInput)
 
@@ -139,7 +139,7 @@ func TestListenDropsWrongKind(t *testing.T) {
 // duplicate command for the same ToolExecutionID is dropped (no second delivery, no panic).
 func TestListenDropsDuplicateAfterDelivery(t *testing.T) {
 	t.Parallel()
-	l, _ := newLoop(t, &fakeLLM{})
+	l, _, _ := newLoop(t, &fakeLLM{})
 	id := newCallID(t)
 	reply := registerGate(t, l, id, gateUserInput)
 
@@ -169,7 +169,7 @@ func TestListenDropsDuplicateAfterDelivery(t *testing.T) {
 // real command is still delivered.
 func TestListenStaleCommandDoesNotDropLaterValidReply(t *testing.T) {
 	t.Parallel()
-	l, _ := newLoop(t, &fakeLLM{})
+	l, _, _ := newLoop(t, &fakeLLM{})
 	id := newCallID(t)
 
 	// A stale command arrives BEFORE any gate for this ToolExecutionID is registered.

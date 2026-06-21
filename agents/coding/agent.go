@@ -181,7 +181,7 @@ func newHTTPClient() *http.Client {
 }
 
 // Submit delivers a multimodal user message FIRE-AND-FORGET as a queueable
-// (AllowFold) UserInput and returns the InputID — the Cause.CommandID the resulting
+// UserInput and returns the InputID — the Cause.CommandID the resulting
 // Reply events (InputQueued / TurnStarted / TurnFoldedInto / TurnRejected /
 // InputCancelled) carry on the session fan-in. The Go error is non-nil only when
 // the command could not be handed to the loop (loop gone, or ctx done); the turn

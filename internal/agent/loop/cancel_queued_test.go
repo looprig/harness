@@ -43,15 +43,11 @@ func hasInputCancelled(evs []event.Event, inputID uuid.UUID, reason event.Cancel
 func TestCancelWhileQueuedPublishesInputCancelled(t *testing.T) {
 	t.Parallel()
 	l, rec, _ := newLoopRec(t, &fakeLLM{blockUntilCancel: true})
-	ev1, _ := startTurn(t, l, context.Background(), nil) // occupy the loop
-	go func() {
-		for range ev1 {
-		}
-	}()
+	startTurn(t, l, rec, nil) // occupy the loop
 
 	// Queue an input behind the running turn.
 	queuedID := mustID(t)
-	l.Commands <- command.UserInput{Header: command.Header{CommandID: queuedID}, Mode: command.AllowFold, Blocks: textBlocks("retract me")}
+	l.Commands <- command.UserInput{Header: command.Header{CommandID: queuedID}, Blocks: textBlocks("retract me")}
 	if _, ok := awaitReply(t, rec, queuedID).(event.InputQueued); !ok {
 		t.Fatal("submit not queued")
 	}
@@ -80,15 +76,11 @@ func TestCancelWhileQueuedPublishesInputCancelled(t *testing.T) {
 func TestCancelUnknownInputIsNoop(t *testing.T) {
 	t.Parallel()
 	l, rec, _ := newLoopRec(t, &fakeLLM{blockUntilCancel: true})
-	ev1, _ := startTurn(t, l, context.Background(), nil)
-	go func() {
-		for range ev1 {
-		}
-	}()
+	startTurn(t, l, rec, nil)
 
 	// Prove the loop is alive: queue a real input and observe its InputQueued.
 	queuedID := mustID(t)
-	l.Commands <- command.UserInput{Header: command.Header{CommandID: queuedID}, Mode: command.AllowFold, Blocks: textBlocks("alive")}
+	l.Commands <- command.UserInput{Header: command.Header{CommandID: queuedID}, Blocks: textBlocks("alive")}
 	if _, ok := awaitReply(t, rec, queuedID).(event.InputQueued); !ok {
 		t.Fatal("submit not queued")
 	}
@@ -145,15 +137,11 @@ func TestAbnormalTerminalReturnsQueuedInput(t *testing.T) {
 	t.Run("interrupt returns queued input as CancelTurnInterrupted", func(t *testing.T) {
 		t.Parallel()
 		l, rec, _ := newLoopRec(t, &fakeLLM{blockUntilCancel: true})
-		ev1, _ := startTurn(t, l, context.Background(), nil)
-		go func() {
-			for range ev1 {
-			}
-		}()
+		startTurn(t, l, rec, nil)
 
 		// Queue an input while the turn runs.
 		queuedID := mustID(t)
-		l.Commands <- command.UserInput{Header: command.Header{CommandID: queuedID}, Mode: command.AllowFold, Blocks: textBlocks("queued")}
+		l.Commands <- command.UserInput{Header: command.Header{CommandID: queuedID}, Blocks: textBlocks("queued")}
 		if _, ok := awaitReply(t, rec, queuedID).(event.InputQueued); !ok {
 			t.Fatal("submit not queued")
 		}
@@ -204,7 +192,7 @@ func TestAbnormalTerminalReturnsQueuedInput(t *testing.T) {
 		rec := &recordingPublisher{}
 		client.onStreamN = map[int]func(){
 			1: func() {
-				l.Commands <- command.UserInput{Header: command.Header{CommandID: queuedID}, Mode: command.AllowFold, Blocks: textBlocks("queued")}
+				l.Commands <- command.UserInput{Header: command.Header{CommandID: queuedID}, Blocks: textBlocks("queued")}
 				if _, ok := awaitReply(t, rec, queuedID).(event.InputQueued); !ok {
 					t.Errorf("submit at step 1 not queued")
 				}
@@ -217,11 +205,7 @@ func TestAbnormalTerminalReturnsQueuedInput(t *testing.T) {
 			t.Fatalf("New: %v", err)
 		}
 
-		ev1, _ := startTurn(t, l, context.Background(), nil)
-		go func() {
-			for range ev1 {
-			}
-		}()
+		startTurn(t, l, rec, nil)
 		<-bt.started
 
 		close(bt.release) // tool returns; step 0 drains (inbox empty), then step 1 queues + fails

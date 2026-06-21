@@ -243,9 +243,9 @@ func TestChainedTurnsEmitNoLoopIdleBetween(t *testing.T) {
 	t.Cleanup(func() { _ = sub.Close() })
 
 	queuedID := mustUUID()
-	// At the START of turn 1's only step, queue a second AllowFold UserInput. The first
-	// turn is running, so it is accepted into the inbox; on the normal terminal the
-	// actor chains directly into turn 2 from it (running->running, no LoopIdle).
+	// At the START of turn 1's only step, queue a second UserInput. The first turn is
+	// running, so it is accepted into the inbox; on the normal terminal the actor
+	// chains directly into turn 2 from it (running->running, no LoopIdle).
 	client.onCall[0] = func() {
 		l, _ := s.loopFor(s.primaryLoopID)
 		// The unbuffered send completes only once the actor has RECEIVED the command,
@@ -253,7 +253,7 @@ func TestChainedTurnsEmitNoLoopIdleBetween(t *testing.T) {
 		// (appended to the inbox) before turn 1's terminal — no ack needed now that the
 		// outcome (InputQueued) is published to the fan-in rather than replied.
 		select {
-		case l.Commands <- command.UserInput{Header: command.Header{CommandID: queuedID}, Mode: command.AllowFold, Blocks: textBlocks("turn2")}:
+		case l.Commands <- command.UserInput{Header: command.Header{CommandID: queuedID}, Blocks: textBlocks("turn2")}:
 		case <-l.Done:
 		}
 	}

@@ -65,16 +65,14 @@ func (e *SessionError) Unwrap() error { return e.Cause }
 // a turn for a subagent submit — a phase-1 event.TurnRejected for the submit's
 // Cause.CommandID means no turn will ever start, so the drain surfaces it as this
 // typed error. Reason carries the event RejectReason
-// (Busy/QueueFull/ShuttingDown/Internal) so callers can errors.As and branch (e.g.
-// retry-on-busy, or retry a transient RejectInternal).
+// (QueueFull/ShuttingDown/Internal) so callers can errors.As and branch (e.g.
+// retry-on-queue-full, or retry a transient RejectInternal).
 type TurnRejectedError struct {
 	Reason event.RejectReason
 }
 
 func (e *TurnRejectedError) Error() string {
 	switch e.Reason {
-	case event.RejectBusy:
-		return "session: turn rejected: loop busy"
 	case event.RejectQueueFull:
 		return "session: turn rejected: queue full"
 	case event.RejectShuttingDown:
@@ -84,6 +82,7 @@ func (e *TurnRejectedError) Error() string {
 		// the caller MAY retry. Distinct from RejectShuttingDown.
 		return "session: turn rejected: transient internal failure"
 	default:
+		// RejectUnspecified (the zero-value sentinel) or any unknown reason.
 		return "session: turn rejected"
 	}
 }
@@ -468,7 +467,7 @@ func (s *Session) interruptLoopID(loopID uuid.UUID) error {
 // person authored this input). Programmatic/machine callers go through
 // submitToLoop with Agency=AgencyMachine (the subagent path).
 //
-// Submit sends input as an AllowFold (queueable) UserInput to the primary loop,
+// Submit sends input as a queueable UserInput to the primary loop,
 // FIRE-AND-FORGET: it returns the InputID (the submit command's id, == the
 // Cause.CommandID on the resulting Reply events) and a transport error only if the
 // command could not be handed to the loop. The outcome — InputQueued /
@@ -476,10 +475,9 @@ func (s *Session) interruptLoopID(loopID uuid.UUID) error {
 // the event fan-in (each Reply carries Cause.CommandID == this returned id), NOT
 // returned here.
 //
-// AllowFold is the interactive queueable mode: a submit while a turn is running
-// QUEUES rather than rejecting; a submit while idle starts a turn. Submit attaches
-// no per-turn stream — it never reads a reply, so it returns the instant the
-// command is accepted by the loop.
+// A submit while a turn is running QUEUES rather than rejecting; a submit while idle
+// starts a turn. Submit never reads a reply, so it returns the instant the command
+// is accepted by the loop.
 //
 // The send carries the standard escapes: ctx.Done() →
 // SessionContextDone, the loop's Done → SessionLoopExited, and a missing primary
@@ -487,8 +485,8 @@ func (s *Session) interruptLoopID(loopID uuid.UUID) error {
 // because nothing was sent and there is no correlation to hand back.
 func (s *Session) Submit(ctx context.Context, input []content.Block) (uuid.UUID, error) {
 	// Submit IS the primary-loop, human-authored (AgencyUser) case of submitToLoop:
-	// the interactive (AllowFold) submit targets the primary loop and stamps user
-	// agency. The loop-targeted core (a sub-loop, machine agency) is the subagent path.
+	// the interactive submit targets the primary loop and stamps user agency. The
+	// loop-targeted core (a sub-loop, machine agency) is the subagent path.
 	return s.submitToLoop(ctx, s.primaryLoopID, input, identity.AgencyUser)
 }
 
@@ -497,7 +495,7 @@ func (s *Session) Submit(ctx context.Context, input []content.Block) (uuid.UUID,
 // It is the loop-targeted core of Submit: public Submit is the primary-loop,
 // AgencyUser case; the subagent path targets a sub-loop with AgencyMachine.
 //
-// Like Submit it is FIRE-AND-FORGET (Events/Abandoned nil): the outcome —
+// Like Submit it is FIRE-AND-FORGET: the outcome —
 // InputQueued / TurnStarted / TurnFoldedInto / TurnRejected / InputCancelled — is
 // observed on the event fan-in (each Reply carries Cause.CommandID == the returned
 // id), not returned here. The send carries the same escapes: ctx.Done() →
@@ -514,12 +512,11 @@ func (s *Session) submitToLoop(ctx context.Context, loopID uuid.UUID, blocks []c
 		return uuid.UUID{}, err
 	}
 	select {
-	// Queueable (AllowFold) turn: Cause.CommandID is zero (root); Events/Abandoned
-	// nil because the outcome is observed on the session fan-in, not a per-turn
-	// stream. Agency is caller-chosen — AgencyUser for the interactive human Submit,
-	// AgencyMachine for the subagent task submit — so a machine path never claims user
-	// agency.
-	case l.Commands <- command.UserInput{Header: command.Header{CommandID: id, Agency: agency}, Mode: command.AllowFold, Blocks: blocks}:
+	// Queueable submit: Cause.CommandID is zero (root); the outcome is observed on the
+	// session fan-in. Agency is caller-chosen — AgencyUser for the interactive human
+	// Submit, AgencyMachine for the subagent task submit — so a machine path never
+	// claims user agency.
+	case l.Commands <- command.UserInput{Header: command.Header{CommandID: id, Agency: agency}, Blocks: blocks}:
 		return id, nil
 	case <-ctx.Done():
 		return uuid.UUID{}, &SessionError{Kind: SessionContextDone, Cause: ctx.Err()}

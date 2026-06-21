@@ -1,7 +1,6 @@
 package loop
 
 import (
-	"context"
 	"testing"
 
 	"github.com/inventivepotter/urvi/internal/agent/loop/command"
@@ -29,7 +28,6 @@ func TestTurnStartedCopiesCommandAgency(t *testing.T) {
 			send: func(t *testing.T, l *Loop, id [16]byte) {
 				l.Commands <- command.UserInput{
 					Header: command.Header{CommandID: id, Agency: identity.AgencyUser},
-					Mode:   command.AllowFold,
 					Blocks: textBlocks("hello"),
 				}
 			},
@@ -40,7 +38,6 @@ func TestTurnStartedCopiesCommandAgency(t *testing.T) {
 			send: func(t *testing.T, l *Loop, id [16]byte) {
 				l.Commands <- command.UserInput{
 					Header: command.Header{CommandID: id}, // Agency unset = AgencyMachine
-					Mode:   command.AllowFold,
 					Blocks: textBlocks("hello"),
 				}
 			},
@@ -107,17 +104,12 @@ func TestTurnFoldedIntoCopiesCommandAgency(t *testing.T) {
 			}}
 			l, rec := newFoldLoop(t, client, ts)
 
-			ev1, _ := startTurn(t, l, context.Background(), textBlocks("turn1"))
-			go func() {
-				for range ev1 {
-				}
-			}()
+			startTurn(t, l, rec, textBlocks("turn1"))
 			<-bt.started
 
 			foldedID := mustID(t)
 			l.Commands <- command.UserInput{
 				Header: command.Header{CommandID: foldedID, Agency: tt.agency},
-				Mode:   command.AllowFold,
 				Blocks: textBlocks("folded"),
 			}
 			if _, ok := awaitReply(t, rec, foldedID).(event.InputQueued); !ok {
@@ -161,13 +153,11 @@ func TestInputCancelledCopiesCommandAgency(t *testing.T) {
 			// blockUntilCancel keeps the first turn running so the second submit queues
 			// and can then be retracted while still queued.
 			l, rec, _ := newLoopRec(t, &fakeLLM{blockUntilCancel: true})
-			ev1, _ := startTurn(t, l, context.Background(), nil) // StartOnly: occupies the loop
-			_ = ev1
+			startTurn(t, l, rec, nil) // occupies the loop
 
 			queuedID := mustID(t)
 			l.Commands <- command.UserInput{
 				Header: command.Header{CommandID: queuedID, Agency: tt.agency},
-				Mode:   command.AllowFold,
 				Blocks: textBlocks("queued"),
 			}
 			if _, ok := awaitReply(t, rec, queuedID).(event.InputQueued); !ok {

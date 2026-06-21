@@ -104,16 +104,12 @@ func TestFoldAtToolContinuation(t *testing.T) {
 	l, rec := newFoldLoop(t, client, ts)
 
 	// Turn 1 starts and parks in the blocking tool.
-	ev1, _ := startTurn(t, l, context.Background(), textBlocks("turn1"))
-	go func() {
-		for range ev1 {
-		}
-	}()
+	startTurn(t, l, rec, textBlocks("turn1"))
 	<-bt.started // step 0's tool is blocked; the inbox can be filled before the drain
 
 	// Queue an input while the tool step is in flight.
 	foldedID := mustID(t)
-	d := submitUserInputBlocks(t, l, rec, foldedID, command.AllowFold, textBlocks("folded text"))
+	d := submitUserInputBlocks(t, l, rec, foldedID, textBlocks("folded text"))
 	if _, ok := d.(event.InputQueued); !ok {
 		t.Fatalf("queued submit outcome = %T, want event.InputQueued", d)
 	}
@@ -195,11 +191,7 @@ func TestSubagentResultFoldStampsTriggeredBy(t *testing.T) {
 	}}
 	l, rec := newFoldLoop(t, client, ts)
 
-	ev1, _ := startTurn(t, l, context.Background(), textBlocks("turn1"))
-	go func() {
-		for range ev1 {
-		}
-	}()
+	startTurn(t, l, rec, textBlocks("turn1"))
 	<-bt.started
 
 	// Hand back a SubagentResult while the tool step is in flight: it queues, then
@@ -238,9 +230,9 @@ func TestSubagentResultFoldStampsTriggeredBy(t *testing.T) {
 // submitUserInputBlocks is submitUserInput with explicit blocks, so a fold test can
 // assert the folded message's content lands in the continuation request. It observes
 // the published outcome event (InputQueued/TurnStarted/TurnRejected) via the recorder.
-func submitUserInputBlocks(t *testing.T, l *Loop, rec *recordingPublisher, id uuid.UUID, mode command.InputMode, blocks []content.Block) event.Event {
+func submitUserInputBlocks(t *testing.T, l *Loop, rec *recordingPublisher, id uuid.UUID, blocks []content.Block) event.Event {
 	t.Helper()
-	l.Commands <- command.UserInput{Header: command.Header{CommandID: id}, Mode: mode, Blocks: blocks}
+	l.Commands <- command.UserInput{Header: command.Header{CommandID: id}, Blocks: blocks}
 	return awaitReply(t, rec, id)
 }
 
@@ -267,9 +259,9 @@ func TestNoToolFinalAnswerDoesNotFold(t *testing.T) {
 	client.mu.Lock()
 	client.onStreamN = map[int]func(){
 		0: func() {
-			// AllowFold submit while the turn is running -> InputQueued (observed on
-			// the recorder fan-in).
-			l.Commands <- command.UserInput{Header: command.Header{CommandID: queuedID}, Mode: command.AllowFold, Blocks: textBlocks("later")}
+			// Submit while the turn is running -> InputQueued (observed on the recorder
+			// fan-in).
+			l.Commands <- command.UserInput{Header: command.Header{CommandID: queuedID}, Blocks: textBlocks("later")}
 			if _, ok := awaitReply(t, rec, queuedID).(event.InputQueued); !ok {
 				t.Errorf("queued submit during final step not InputQueued")
 			}
@@ -277,11 +269,7 @@ func TestNoToolFinalAnswerDoesNotFold(t *testing.T) {
 	}
 	client.mu.Unlock()
 
-	ev1, _ := startTurn(t, l, context.Background(), textBlocks("turn1"))
-	go func() {
-		for range ev1 {
-		}
-	}()
+	startTurn(t, l, rec, textBlocks("turn1"))
 
 	// The queued input must NOT fold (no TurnFoldedInto for it) and must instead
 	// start a LATER turn (a TurnStarted carrying its InputID).
@@ -318,22 +306,13 @@ func TestInterruptDuringDrainFreesTurn(t *testing.T) {
 	}}
 	l, rec := newFoldLoop(t, client, ts)
 
-	ev1, _ := startTurn(t, l, context.Background(), textBlocks("turn1"))
-	terminalCh := make(chan event.Event, 1)
-	go func() {
-		for e := range ev1 {
-			if e.EndsTurn() {
-				terminalCh <- e
-				return
-			}
-		}
-	}()
+	startTurn(t, l, rec, textBlocks("turn1"))
 	<-bt.started
 
 	// Queue an input so the drain has something to pull (so runTurn enters the
 	// handshake meaningfully).
 	queuedID := mustID(t)
-	d := submitUserInputBlocks(t, l, rec, queuedID, command.AllowFold, textBlocks("queued"))
+	d := submitUserInputBlocks(t, l, rec, queuedID, textBlocks("queued"))
 	if _, ok := d.(event.InputQueued); !ok {
 		t.Fatalf("queued submit outcome = %T, want event.InputQueued", d)
 	}
@@ -345,14 +324,10 @@ func TestInterruptDuringDrainFreesTurn(t *testing.T) {
 	<-iack
 	close(bt.release)
 
-	// The turn must terminate (interrupt frees it); the loop must not wedge.
-	select {
-	case term := <-terminalCh:
-		if !term.EndsTurn() {
-			t.Fatalf("terminal does not end the turn: %T", term)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("turn did not terminate after Interrupt during the drain boundary")
+	// The turn must terminate (interrupt frees it); the loop must not wedge. The
+	// terminal is observed on the recorder fan-in.
+	if term := drainToTerminal(t, rec); !term.EndsTurn() {
+		t.Fatalf("terminal does not end the turn: %T", term)
 	}
 
 	// Strand-safety: the queued entry must reach exactly ONE terminal outcome —
@@ -455,20 +430,14 @@ func TestDrainingSweepReturnsEntryOnInterrupt(t *testing.T) {
 	l, rec, rc := newFoldLoopWithAfterDrain(t, client, ts, afterDrain)
 	rootCancel = rc
 
-	ev1, _ := startTurn(t, l, context.Background(), textBlocks("turn1"))
-	// Drain the per-turn stream so the actor's per-turn emits never block. The terminal
-	// is asserted via the RECORDER below, not here: on the hard-kill path deliverAndClose
-	// runs after forceAbandon, so it may take the abandoned branch and NOT deliver the
-	// terminal on the per-turn channel — but it ALWAYS publishes it to the fan-in.
-	go func() {
-		for range ev1 {
-		}
-	}()
+	startTurn(t, l, rec, textBlocks("turn1"))
+	// The terminal is asserted via the RECORDER below: every loop event (including the
+	// terminal on the hard-kill path) reaches consumers through the session fan-in.
 	<-bt.started // step 0's tool is blocked; queue an input before the drain runs
 
 	// Queue exactly one input so the drain moves exactly one entry into draining.
 	queuedID := mustID(t)
-	d := submitUserInputBlocks(t, l, rec, queuedID, command.AllowFold, textBlocks("queued"))
+	d := submitUserInputBlocks(t, l, rec, queuedID, textBlocks("queued"))
 	if _, ok := d.(event.InputQueued); !ok {
 		t.Fatalf("queued submit outcome = %T, want event.InputQueued", d)
 	}

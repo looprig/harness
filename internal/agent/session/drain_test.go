@@ -161,7 +161,7 @@ func TestDrainToFinalText(t *testing.T) {
 		},
 		{
 			name:             "TurnRejected before any turn yields a typed TurnRejectedError",
-			script:           []event.Event{turnRejected(cmd, event.RejectBusy)},
+			script:           []event.Event{turnRejected(cmd, event.RejectShuttingDown)},
 			wantErr:          true,
 			wantTurnRejected: true,
 		},
@@ -249,8 +249,8 @@ func TestDrainToFinalText(t *testing.T) {
 				if !errors.As(err, &re) {
 					t.Fatalf("err = %v, want *TurnRejectedError", err)
 				}
-				if re.Reason != event.RejectBusy {
-					t.Errorf("rejected reason = %v, want RejectBusy", re.Reason)
+				if re.Reason != event.RejectShuttingDown {
+					t.Errorf("rejected reason = %v, want RejectShuttingDown", re.Reason)
 				}
 			}
 			if tt.wantLost {

@@ -94,8 +94,11 @@ func newLoopRec(t *testing.T, client llm.LLM) (*Loop, *recordingPublisher, conte
 	return l, rec, cancel
 }
 
-// newLoop starts a loop with a 200ms DrainTimeout and returns it plus the root cancel.
-func newLoop(t *testing.T, client llm.LLM) (*Loop, context.CancelFunc) {
+// newLoop starts a loop with a 200ms DrainTimeout wired to a recordingPublisher,
+// and returns it plus the recorder and the root cancel. Every loop event is observed
+// on the session fan-in (there is no per-turn stream), so the recorder is the single
+// observation seam.
+func newLoop(t *testing.T, client llm.LLM) (*Loop, *recordingPublisher, context.CancelFunc) {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	sessionID, err := uuid.New()
@@ -106,46 +109,28 @@ func newLoop(t *testing.T, client llm.LLM) (*Loop, context.CancelFunc) {
 	if err != nil {
 		t.Fatalf("uuid.New: %v", err)
 	}
-	l, err := New(ctx, sessionID, loopID, Provenance{}, noopPublisher{}, Config{Client: client, Model: llm.ModelSpec{Model: "m"}, DrainTimeout: 200 * time.Millisecond})
+	rec := &recordingPublisher{}
+	l, err := New(ctx, sessionID, loopID, Provenance{}, rec, Config{Client: client, Model: llm.ModelSpec{Model: "m"}, DrainTimeout: 200 * time.Millisecond})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
 	t.Cleanup(cancel)
-	return l, cancel
+	return l, rec, cancel
 }
 
-// startTurn sends a StartOnly UserInput and returns the events channel + abandoned
-// closer. It asserts the loop STARTED the turn by reading the first event off the
-// per-turn stream and requiring it to be event.TurnStarted (the start-or-reject path
-// now delivers its outcome on the stream — TurnStarted on success, TurnRejected on a
-// refusal — instead of a command.Disposition reply). The peeked TurnStarted is NOT
-// re-injected, mirroring production Stream's re-yield only at the session boundary;
-// loop tests that need the TurnStarted from the stream read it before calling this or
-// observe it via a recordingPublisher. The ctx parameter is retained for source compatibility with
-// callers but is unused: submit commands carry no context, and the turn ctx derives
-// from loopCtx.
-func startTurn(t *testing.T, l *Loop, _ context.Context, input []content.Block) (<-chan event.Event, func()) {
+// startTurn sends a fan-in UserInput with a fresh input id and blocks until the loop
+// publishes event.TurnStarted for it (failing if the loop instead refused the submit).
+// It returns the input id (== the started turn's Cause.CommandID) and a no-op closer
+// kept only so the two-value `id, _ := startTurn(...)` destructuring at call sites
+// reads cleanly. Every outcome is observed on the session fan-in via rec.
+func startTurn(t *testing.T, l *Loop, rec *recordingPublisher, input []content.Block) (uuid.UUID, func()) {
 	t.Helper()
-	ev := make(chan event.Event, 64)
-	ab := make(chan struct{})
-	var once sync.Once
-	closeAb := func() { once.Do(func() { close(ab) }) }
-	l.Commands <- command.UserInput{Mode: command.StartOnly, Blocks: input, Events: ev, Abandoned: ab}
-	select {
-	case first, ok := <-ev:
-		if !ok {
-			closeAb()
-			t.Fatal("UserInput(StartOnly) per-turn stream closed without TurnStarted (rejected)")
-		}
-		if _, ok := first.(event.TurnStarted); !ok {
-			closeAb()
-			t.Fatalf("UserInput(StartOnly) first event = %T, want event.TurnStarted", first)
-		}
-	case <-time.After(2 * time.Second):
-		closeAb()
-		t.Fatal("UserInput(StartOnly): no event on per-turn stream within deadline")
+	id := mustID(t)
+	l.Commands <- command.UserInput{Header: command.Header{CommandID: id}, Blocks: input}
+	if _, ok := awaitReply(t, rec, id).(event.TurnStarted); !ok {
+		t.Fatalf("UserInput did not start a turn for %v (outcome was not TurnStarted)", id)
 	}
-	return ev, closeAb
+	return id, func() {}
 }
 
 // sendCmd sends cmd to the loop with the same Done escape every production sender
@@ -164,17 +149,47 @@ func sendCmd(t *testing.T, l *Loop, cmd command.Command) bool {
 	}
 }
 
-// drainToTerminal reads until a terminal event, returns it.
-func drainToTerminal(t *testing.T, ev <-chan event.Event) event.Event {
+// drainToTerminal blocks until a terminal event (TurnDone/TurnFailed/
+// TurnInterrupted) has been published, and returns the FIRST such terminal. For a
+// loop driven through a single turn this is that turn's terminal; tests that run
+// multiple turns use awaitTerminalAfter to select the later turn's terminal.
+func drainToTerminal(t *testing.T, rec *recordingPublisher) event.Event {
 	t.Helper()
-	for e := range ev {
-		switch e.(type) {
+	return awaitTerminalAfter(t, rec, 0)
+}
+
+// awaitTerminalAfter blocks until a terminal event appears at recorded-index >= from
+// and returns it. `from` lets a multi-turn test skip an earlier turn's terminal:
+// capture len(rec.events()) after turn 1's terminal, then await the next terminal
+// from that index. It returns the terminal AND its index so a caller can chain.
+func awaitTerminalAfter(t *testing.T, rec *recordingPublisher, from int) event.Event {
+	t.Helper()
+	var found event.Event
+	blockUntilEvents(t, rec, func(evs []event.Event) bool {
+		for i := from; i < len(evs); i++ {
+			switch evs[i].(type) {
+			case event.TurnDone, event.TurnFailed, event.TurnInterrupted:
+				found = evs[i]
+				return true
+			}
+		}
+		return false
+	})
+	return found
+}
+
+// terminalIndex returns the recorded index just past the first terminal at/after
+// `from` (the baseline a follow-up awaitTerminalAfter should use to find the NEXT
+// turn's terminal). It assumes a terminal at/after `from` already exists.
+func terminalIndex(rec *recordingPublisher, from int) int {
+	evs := rec.events()
+	for i := from; i < len(evs); i++ {
+		switch evs[i].(type) {
 		case event.TurnDone, event.TurnFailed, event.TurnInterrupted:
-			return e
+			return i + 1
 		}
 	}
-	t.Fatal("events channel closed without terminal")
-	return nil
+	return len(evs)
 }
 
 // TestRecordingPublisherObservesTurnStarted proves the recordingPublisher
@@ -185,11 +200,7 @@ func drainToTerminal(t *testing.T, ev <-chan event.Event) event.Event {
 func TestRecordingPublisherObservesTurnStarted(t *testing.T) {
 	t.Parallel()
 	l, rec, _ := newLoopRec(t, &fakeLLM{chunks: []content.Chunk{textChunk("hi")}})
-	ev, _ := startTurn(t, l, context.Background(), nil)
-	t.Cleanup(func() {
-		for range ev { // drain so the actor's emit/publish path never wedges
-		}
-	})
+	startTurn(t, l, rec, nil)
 
 	blockUntilEvents(t, rec, func(evs []event.Event) bool {
 		for _, e := range evs {
@@ -320,15 +331,17 @@ func TestNewLoopState(t *testing.T) {
 
 func TestSingleTurn(t *testing.T) {
 	t.Parallel()
-	l, _ := newLoop(t, &fakeLLM{chunks: []content.Chunk{textChunk("hi")}})
-	ev, _ := startTurn(t, l, context.Background(), nil)
-	terminal := drainToTerminal(t, ev)
+	l, rec, _ := newLoop(t, &fakeLLM{chunks: []content.Chunk{textChunk("hi")}})
+	startTurn(t, l, rec, nil)
+	terminal := drainToTerminal(t, rec)
 	if _, ok := terminal.(event.TurnDone); !ok {
 		t.Fatalf("terminal = %T, want TurnDone", terminal)
 	}
-	// actor is idle again: a second turn is accepted
-	ev2, _ := startTurn(t, l, context.Background(), nil)
-	if _, ok := drainToTerminal(t, ev2).(event.TurnDone); !ok {
+	// actor is idle again: a second turn is accepted and runs to its own terminal,
+	// which lands AFTER the first turn's terminal on the fan-in.
+	from := terminalIndex(rec, 0)
+	startTurn(t, l, rec, nil)
+	if _, ok := awaitTerminalAfter(t, rec, from).(event.TurnDone); !ok {
 		t.Fatal("second turn not accepted/idle")
 	}
 }
@@ -348,23 +361,15 @@ func TestTurnEventCorrelationStamped(t *testing.T) {
 	if err != nil {
 		t.Fatalf("uuid.New: %v", err)
 	}
-	ev := make(chan event.Event, 64)
-	ab := make(chan struct{})
-	defer close(ab)
 	l.Commands <- command.UserInput{
-		Header:    command.Header{CommandID: cmdID},
-		Mode:      command.StartOnly,
-		Blocks:    nil,
-		Events:    ev,
-		Abandoned: ab,
+		Header: command.Header{CommandID: cmdID},
+		Blocks: nil,
 	}
-	// The start-or-reject outcome is the first per-turn event: TurnStarted on success.
-	if first, ok := <-ev; !ok {
-		t.Fatal("per-turn stream closed without TurnStarted (rejected)")
-	} else if _, ok := first.(event.TurnStarted); !ok {
-		t.Fatalf("first per-turn event = %T, want event.TurnStarted", first)
+	// The submit's outcome is observed on the fan-in: TurnStarted on success.
+	if _, ok := awaitReply(t, rec, cmdID).(event.TurnStarted); !ok {
+		t.Fatal("submit did not start a turn (outcome was not TurnStarted)")
 	}
-	if _, ok := drainToTerminal(t, ev).(event.TurnDone); !ok {
+	if _, ok := drainToTerminal(t, rec).(event.TurnDone); !ok {
 		t.Fatal("terminal != TurnDone")
 	}
 
@@ -460,8 +465,10 @@ func (g *countedIDGen) gen() (uuid.UUID, error) {
 }
 
 // newLoopWithIDGen starts a loop wired with a custom id generator, exercising
-// the crypto/rand failure branches that uuid.New cannot reach in tests.
-func newLoopWithIDGen(t *testing.T, client llm.LLM, gen idGenerator) *Loop {
+// the crypto/rand failure branches that uuid.New cannot reach in tests. It wires a
+// recordingPublisher so the resulting outcome (e.g. TurnRejected) is observable on
+// the session fan-in, and returns it alongside the loop.
+func newLoopWithIDGen(t *testing.T, client llm.LLM, gen idGenerator) (*Loop, *recordingPublisher) {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	sessionID, err := uuid.New()
@@ -472,7 +479,8 @@ func newLoopWithIDGen(t *testing.T, client llm.LLM, gen idGenerator) *Loop {
 	if err != nil {
 		t.Fatalf("uuid.New: %v", err)
 	}
-	l, err := New(ctx, sessionID, loopID, Provenance{}, noopPublisher{}, Config{
+	rec := &recordingPublisher{}
+	l, err := New(ctx, sessionID, loopID, Provenance{}, rec, Config{
 		Client:       client,
 		Model:        llm.ModelSpec{Model: "m"},
 		DrainTimeout: 200 * time.Millisecond,
@@ -482,15 +490,15 @@ func newLoopWithIDGen(t *testing.T, client llm.LLM, gen idGenerator) *Loop {
 		t.Fatalf("New: %v", err)
 	}
 	t.Cleanup(cancel)
-	return l
+	return l, rec
 }
 
 // TestTurnIDGenerationFailure covers branch 1: when the id generator fails while
-// minting the per-turn TurnID for a StartOnly submit, the turn does not start, the
-// actor replies TurnRejected{RejectInternal} (fail-secure: it cannot mint a TurnID,
-// so it declines the work — but the loop is healthy and the caller MAY retry, so
-// the reason is the transient RejectInternal, NOT RejectShuttingDown), the Events
-// channel is closed, and the actor stays usable.
+// minting the per-turn TurnID for an idle-time submit, the turn does not start, and
+// the actor publishes TurnRejected{RejectInternal} on the session fan-in (fail-secure:
+// it cannot mint a TurnID, so it declines the work — but the loop is healthy and the
+// caller MAY retry, so the reason is the transient RejectInternal, NOT
+// RejectShuttingDown).
 func TestTurnIDGenerationFailure(t *testing.T) {
 	t.Parallel()
 	genErr := errors.New("rand source exhausted")
@@ -505,78 +513,59 @@ func TestTurnIDGenerationFailure(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			gen := &countedIDGen{okCount: tt.okCount, err: genErr}
-			l := newLoopWithIDGen(t, &fakeLLM{chunks: []content.Chunk{textChunk("hi")}}, gen.gen)
+			l, rec := newLoopWithIDGen(t, &fakeLLM{chunks: []content.Chunk{textChunk("hi")}}, gen.gen)
 
-			ev := make(chan event.Event, 64)
-			ab := make(chan struct{})
-			defer close(ab)
-			l.Commands <- command.UserInput{Mode: command.StartOnly, Blocks: nil, Events: ev, Abandoned: ab}
+			id := mustID(t)
+			l.Commands <- command.UserInput{Header: command.Header{CommandID: id}, Blocks: nil}
 
-			// The id-gen failure is surfaced on the per-turn stream as TurnRejected{Internal},
-			// then the stream is closed.
-			first, ok := <-ev
+			// The id-gen failure is surfaced on the fan-in as TurnRejected{Internal}.
+			reply := awaitReply(t, rec, id)
+			rej, ok := reply.(event.TurnRejected)
 			if !ok {
-				t.Fatal("per-turn stream closed without a TurnRejected event")
-			}
-			rej, ok := first.(event.TurnRejected)
-			if !ok {
-				t.Fatalf("first per-turn event = %T, want event.TurnRejected (id-gen failure)", first)
+				t.Fatalf("reply = %T, want event.TurnRejected (id-gen failure)", reply)
 			}
 			if rej.Reason != event.RejectInternal {
 				t.Fatalf("reject reason = %d, want RejectInternal (transient id-gen failure, not ShuttingDown)", rej.Reason)
-			}
-			if _, open := <-ev; open {
-				t.Error("rejected turn's Events channel should be closed")
 			}
 		})
 	}
 }
 
+// TestStartWhileRunning proves a submit that arrives while a turn is running is
+// QUEUED (not rejected): busy is no longer a rejection — the loop accepts the input
+// into the inbox and publishes InputQueued on the session fan-in.
 func TestStartWhileRunning(t *testing.T) {
 	t.Parallel()
 	// provider blocks until ctx cancel, so the first turn stays running
-	l, _ := newLoop(t, &fakeLLM{blockUntilCancel: true})
-	ev1, ab1 := startTurn(t, l, context.Background(), nil)
-	defer ab1()
+	l, rec, _ := newLoop(t, &fakeLLM{blockUntilCancel: true})
+	startTurn(t, l, rec, nil)
 
-	// second StartOnly submit must be rejected with TurnRejected{RejectBusy} on its
-	// per-turn stream, which is then closed.
-	ev2 := make(chan event.Event, 1)
-	ab2 := make(chan struct{})
-	defer close(ab2)
-	l.Commands <- command.UserInput{Mode: command.StartOnly, Blocks: nil, Events: ev2, Abandoned: ab2}
-	first, ok := <-ev2
-	if !ok {
-		t.Fatal("rejected turn's per-turn stream closed without a TurnRejected event")
+	// A second submit while the loop is busy queues behind the running turn.
+	id2 := mustID(t)
+	l.Commands <- command.UserInput{Header: command.Header{CommandID: id2}, Blocks: nil}
+	if _, ok := awaitReply(t, rec, id2).(event.InputQueued); !ok {
+		t.Fatalf("submit while running was not queued (outcome was not InputQueued)")
 	}
-	rej, ok := first.(event.TurnRejected)
-	if !ok || rej.Reason != event.RejectBusy {
-		t.Fatalf("per-turn outcome = %+v, want event.TurnRejected{RejectBusy}", first)
-	}
-	if _, open := <-ev2; open {
-		t.Error("rejected turn's Events channel should be closed")
-	}
-	_ = ev1
 }
 
 func TestInterruptMidTurn(t *testing.T) {
 	t.Parallel()
-	l, _ := newLoop(t, &fakeLLM{blockUntilCancel: true})
-	ev, _ := startTurn(t, l, context.Background(), nil)
+	l, rec, _ := newLoop(t, &fakeLLM{blockUntilCancel: true})
+	startTurn(t, l, rec, nil)
 
 	ack := make(chan bool, 1)
 	l.Commands <- command.Interrupt{Ack: ack}
 	if !<-ack {
 		t.Fatal("Interrupt ack = false, want true (turn was running)")
 	}
-	if _, ok := drainToTerminal(t, ev).(event.TurnInterrupted); !ok {
+	if _, ok := drainToTerminal(t, rec).(event.TurnInterrupted); !ok {
 		t.Fatal("terminal != TurnInterrupted")
 	}
 }
 
 func TestInterruptIdle(t *testing.T) {
 	t.Parallel()
-	l, _ := newLoop(t, &fakeLLM{chunks: []content.Chunk{textChunk("x")}})
+	l, _, _ := newLoop(t, &fakeLLM{chunks: []content.Chunk{textChunk("x")}})
 	ack := make(chan bool, 1)
 	l.Commands <- command.Interrupt{Ack: ack}
 	if <-ack {
@@ -586,7 +575,7 @@ func TestInterruptIdle(t *testing.T) {
 
 func TestShutdownIdle(t *testing.T) {
 	t.Parallel()
-	l, _ := newLoop(t, &fakeLLM{chunks: []content.Chunk{textChunk("x")}})
+	l, _, _ := newLoop(t, &fakeLLM{chunks: []content.Chunk{textChunk("x")}})
 	ack := make(chan error, 1)
 	l.Commands <- command.Shutdown{Ack: ack}
 	if err := <-ack; err != nil {
@@ -601,12 +590,12 @@ func TestShutdownIdle(t *testing.T) {
 
 func TestShutdownMidTurn(t *testing.T) {
 	t.Parallel()
-	l, _ := newLoop(t, &fakeLLM{blockUntilCancel: true})
-	ev, _ := startTurn(t, l, context.Background(), nil)
+	l, rec, _ := newLoop(t, &fakeLLM{blockUntilCancel: true})
+	startTurn(t, l, rec, nil)
 	ack := make(chan error, 1)
 	l.Commands <- command.Shutdown{Ack: ack}
-	// terminal still delivered to the caller
-	if _, ok := drainToTerminal(t, ev).(event.TurnInterrupted); !ok {
+	// terminal still published on the fan-in
+	if _, ok := drainToTerminal(t, rec).(event.TurnInterrupted); !ok {
 		t.Fatal("terminal != TurnInterrupted")
 	}
 	if err := <-ack; err != nil {
@@ -617,8 +606,8 @@ func TestShutdownMidTurn(t *testing.T) {
 
 func TestShutdownWhileShuttingDown(t *testing.T) {
 	t.Parallel()
-	l, _ := newLoop(t, &fakeLLM{blockUntilCancel: true})
-	ev, _ := startTurn(t, l, context.Background(), nil)
+	l, rec, _ := newLoop(t, &fakeLLM{blockUntilCancel: true})
+	startTurn(t, l, rec, nil)
 	ack1 := make(chan error, 1)
 	ack2 := make(chan error, 1)
 	// First Shutdown during the running turn: the actor is guaranteed to be reading
@@ -631,7 +620,7 @@ func TestShutdownWhileShuttingDown(t *testing.T) {
 	// production senders do; if the send lands the actor is still draining and ack2
 	// receives nil, otherwise the actor already exited (and ack1 covered the stop).
 	landed := sendCmd(t, l, command.Shutdown{Ack: ack2})
-	if _, ok := drainToTerminal(t, ev).(event.TurnInterrupted); !ok {
+	if _, ok := drainToTerminal(t, rec).(event.TurnInterrupted); !ok {
 		t.Fatal("terminal != TurnInterrupted")
 	}
 	if err := <-ack1; err != nil {
@@ -647,9 +636,9 @@ func TestShutdownWhileShuttingDown(t *testing.T) {
 
 func TestTurnPanic(t *testing.T) {
 	t.Parallel()
-	l, _ := newLoop(t, panicLLM{})
-	ev, _ := startTurn(t, l, context.Background(), nil)
-	terminal := drainToTerminal(t, ev)
+	l, rec, _ := newLoop(t, panicLLM{})
+	startTurn(t, l, rec, nil)
+	terminal := drainToTerminal(t, rec)
 	failed, ok := terminal.(event.TurnFailed)
 	if !ok {
 		t.Fatalf("terminal = %T, want TurnFailed", terminal)
@@ -682,25 +671,24 @@ func awaitReply(t *testing.T, rec *recordingPublisher, inputID uuid.UUID) event.
 	}
 }
 
-// TestFanInOnlyUserInputStartsTurn proves a fan-in-only AllowFold UserInput (nil
-// Events/Abandoned) starts a turn and runs it to completion through the fan-in
-// only: emit and deliverAndClose are nil-safe (no send-on-nil, no close-nil). The
-// published TurnStarted and the fan-in-observed TurnDone are the only evidence the
-// turn ran, since there is no per-turn stream.
+// TestFanInOnlyUserInputStartsTurn proves a UserInput starts a turn and runs it to
+// completion through the session fan-in: every loop event reaches consumers via the
+// single publish path. The published TurnStarted and the fan-in-observed TurnDone are
+// the only evidence the turn ran (there is no per-turn stream).
 func TestFanInOnlyUserInputStartsTurn(t *testing.T) {
 	t.Parallel()
 	l, rec, _ := newLoopRec(t, &fakeLLM{chunks: []content.Chunk{textChunk("hi")}})
 
 	id := mustID(t)
-	l.Commands <- command.UserInput{Header: command.Header{CommandID: id}, Mode: command.AllowFold, Blocks: nil} // nil Events/Abandoned
+	l.Commands <- command.UserInput{Header: command.Header{CommandID: id}, Blocks: nil}
 	if _, ok := awaitReply(t, rec, id).(event.TurnStarted); !ok {
-		t.Fatal("fan-in-only AllowFold submit did not publish TurnStarted")
+		t.Fatal("submit did not publish TurnStarted")
 	}
-	// The turn runs to a TurnDone observed on the fan-in only (no per-turn channel).
+	// The turn runs to a TurnDone observed on the fan-in.
 	blockUntilEvents(t, rec, hasTerminal)
 	// Actor is usable afterward.
 	id2 := mustID(t)
-	l.Commands <- command.UserInput{Header: command.Header{CommandID: id2}, Mode: command.AllowFold, Blocks: nil}
+	l.Commands <- command.UserInput{Header: command.Header{CommandID: id2}, Blocks: nil}
 	if _, ok := awaitReply(t, rec, id2).(event.TurnStarted); !ok {
 		t.Fatal("actor not usable after a fan-in-only turn")
 	}
@@ -712,22 +700,24 @@ func TestFanInOnlyUserInputStartsTurn(t *testing.T) {
 // TurnInterrupted; the actor stays usable for a second turn.
 func TestInterruptCancelsTurn(t *testing.T) {
 	t.Parallel()
-	l, _ := newLoop(t, &fakeLLM{blockUntilCancel: true})
-	ev, _ := startTurn(t, l, context.Background(), nil)
+	l, rec, _ := newLoop(t, &fakeLLM{blockUntilCancel: true})
+	startTurn(t, l, rec, nil)
 	iack := make(chan bool, 1)
 	l.Commands <- command.Interrupt{Ack: iack}
 	if !<-iack {
 		t.Fatal("Interrupt ack = false, want true (turn running)")
 	}
-	if _, ok := drainToTerminal(t, ev).(event.TurnInterrupted); !ok {
+	if _, ok := drainToTerminal(t, rec).(event.TurnInterrupted); !ok {
 		t.Fatal("terminal != TurnInterrupted")
 	}
-	// actor idle after: a fresh turn is accepted, then interrupted to finish.
-	ev2, _ := startTurn(t, l, context.Background(), nil)
+	// actor idle after: a fresh turn is accepted, then interrupted to finish. Its
+	// terminal lands AFTER the first turn's on the fan-in.
+	from := terminalIndex(rec, 0)
+	startTurn(t, l, rec, nil)
 	iack2 := make(chan bool, 1)
 	l.Commands <- command.Interrupt{Ack: iack2}
 	<-iack2
-	if _, ok := drainToTerminal(t, ev2).(event.TurnInterrupted); !ok {
+	if _, ok := awaitTerminalAfter(t, rec, from).(event.TurnInterrupted); !ok {
 		t.Fatal("second turn terminal != TurnInterrupted")
 	}
 }
@@ -735,9 +725,9 @@ func TestInterruptCancelsTurn(t *testing.T) {
 func TestTurnFailedProviderErrorTyped(t *testing.T) {
 	t.Parallel()
 	provErr := &llm.ValidationError{Field: "Model", Reason: "boom"}
-	l, _ := newLoop(t, &fakeLLM{streamErr: provErr})
-	ev, _ := startTurn(t, l, context.Background(), nil)
-	terminal := drainToTerminal(t, ev)
+	l, rec, _ := newLoop(t, &fakeLLM{streamErr: provErr})
+	startTurn(t, l, rec, nil)
+	terminal := drainToTerminal(t, rec)
 	failed, ok := terminal.(event.TurnFailed)
 	if !ok {
 		t.Fatalf("terminal = %T, want TurnFailed", terminal)
@@ -745,47 +735,6 @@ func TestTurnFailedProviderErrorTyped(t *testing.T) {
 	var ve *llm.ValidationError
 	if !errors.As(failed.Err, &ve) {
 		t.Fatalf("TurnFailed.Err = %T, want *llm.ValidationError", failed.Err)
-	}
-}
-
-// TestLeakedReaderDoesNotWedgeActor guards review fix #1: deliverAndClose's
-// ctx.Done() escape. The caller leaks the stream (never reads Events past the
-// buffer, never closes Abandoned). Events is buffered to EXACTLY the count of
-// non-terminal events (TurnStarted + 1 TokenDelta + 1 StepDone for the single
-// no-tool step) so the turn goroutine completes and the actor enters
-// deliverAndClose, where the terminal send blocks on the full unread buffer. Only
-// the ctx.Done() escape can free it.
-func TestLeakedReaderDoesNotWedgeActor(t *testing.T) {
-	t.Parallel()
-	rec := &recordingPublisher{}
-	ctx, cancel := context.WithCancel(context.Background())
-	sessionID, _ := uuid.New()
-	loopID, _ := uuid.New()
-	l, err := New(ctx, sessionID, loopID, Provenance{}, rec, Config{
-		Client:       &fakeLLM{chunks: []content.Chunk{textChunk("a")}},
-		Model:        llm.ModelSpec{Model: "m"},
-		DrainTimeout: 100 * time.Millisecond,
-	})
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
-
-	ev := make(chan event.Event, 3) // exactly TurnStarted + 1 TokenDelta + 1 StepDone; terminal cannot fit
-	ab := make(chan struct{})       // never closed -> leaked reader
-	// Leaked reader: never read from ev (so the buffer fills) and never close ab. The
-	// turn's TurnStarted is the first event on ev; we do NOT consume it (consuming
-	// would free a buffer slot and let the terminal fit, defeating the test).
-	l.Commands <- command.UserInput{Mode: command.StartOnly, Blocks: nil, Events: ev, Abandoned: ab}
-
-	// Wait until the actor has published the terminal (it does so inside
-	// deliverAndClose, immediately before blocking on the full Events buffer).
-	blockUntilEvents(t, rec, hasTerminal)
-
-	cancel() // only the deliverAndClose ctx.Done() escape can free the parked actor
-	select {
-	case <-l.Done:
-	case <-time.After(2 * time.Second):
-		t.Fatal("actor wedged in deliverAndClose: Loop.Done never closed after root-ctx cancel")
 	}
 }
 
@@ -804,7 +753,8 @@ func TestCtxIgnoringProviderDoesNotPinActor(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	sessionID, _ := uuid.New()
 	loopID, _ := uuid.New()
-	l, err := New(ctx, sessionID, loopID, Provenance{}, noopPublisher{}, Config{
+	rec := &recordingPublisher{}
+	l, err := New(ctx, sessionID, loopID, Provenance{}, rec, Config{
 		Client:       &fakeLLM{blockUntilCancel: true, ignoreCtx: true},
 		Model:        llm.ModelSpec{Model: "m"},
 		DrainTimeout: 100 * time.Millisecond,
@@ -812,11 +762,12 @@ func TestCtxIgnoringProviderDoesNotPinActor(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	ev := make(chan event.Event, 64)
-	ab := make(chan struct{})
-	defer close(ab)
-	l.Commands <- command.UserInput{Mode: command.StartOnly, Blocks: nil, Events: ev, Abandoned: ab}
-	<-ev // wait for TurnStarted (the turn is running) before cancelling
+	id := mustID(t)
+	l.Commands <- command.UserInput{Header: command.Header{CommandID: id}, Blocks: nil}
+	// Wait for TurnStarted on the fan-in (the turn is running) before cancelling.
+	if _, ok := awaitReply(t, rec, id).(event.TurnStarted); !ok {
+		t.Fatal("submit did not start a turn")
+	}
 	cancel()
 	select {
 	case <-l.Done:
@@ -835,22 +786,23 @@ func TestStepGranularityRollback(t *testing.T) {
 
 	t.Run("fail at step 0 keeps the committed initial UserMessage (no whole-turn rollback)", func(t *testing.T) {
 		t.Parallel()
-		rec := &recordingLLM{} // empty chunks -> EmptyResponseError on the first step
-		l, _ := newLoop(t, rec)
+		client := &recordingLLM{} // empty chunks -> EmptyResponseError on the first step
+		l, rec, _ := newLoop(t, client)
 
 		// turn 1 fails on an empty response: step 0 never completes, so its (absent)
 		// AIMessage is discarded — but the initial UserMessage was committed at
 		// TurnStarted and stays.
-		ev1, _ := startTurn(t, l, context.Background(), []content.Block{&content.TextBlock{Text: "first"}})
-		if _, ok := drainToTerminal(t, ev1).(event.TurnFailed); !ok {
+		startTurn(t, l, rec, []content.Block{&content.TextBlock{Text: "first"}})
+		if _, ok := drainToTerminal(t, rec).(event.TurnFailed); !ok {
 			t.Fatal("turn 1 terminal != TurnFailed")
 		}
 		// turn 2's request must contain turn 1's committed user message THEN turn 2's
 		// user message = 2 messages. The committed history grows; it is not rolled back.
-		rec.chunks = []content.Chunk{textChunk("ok")}
-		ev2, _ := startTurn(t, l, context.Background(), []content.Block{&content.TextBlock{Text: "second"}})
-		drainToTerminal(t, ev2)
-		req := rec.lastReq()
+		from := terminalIndex(rec, 0)
+		client.chunks = []content.Chunk{textChunk("ok")}
+		startTurn(t, l, rec, []content.Block{&content.TextBlock{Text: "second"}})
+		awaitTerminalAfter(t, rec, from)
+		req := client.lastReq()
 		if len(req.Messages) != 2 {
 			t.Fatalf("turn 2 request had %d messages, want 2 (committed user msg from turn 1 + turn 2 user msg)", len(req.Messages))
 		}
@@ -877,29 +829,26 @@ func TestStepGranularityRollback(t *testing.T) {
 		t.Cleanup(cancel)
 		sessionID, _ := uuid.New()
 		loopID, _ := uuid.New()
-		l, err := New(ctx, sessionID, loopID, Provenance{}, noopPublisher{},
+		rec := &recordingPublisher{}
+		l, err := New(ctx, sessionID, loopID, Provenance{}, rec,
 			Config{Client: client, Model: llm.ModelSpec{Model: "m"}, Tools: ts, DrainTimeout: 200 * time.Millisecond})
 		if err != nil {
 			t.Fatalf("New: %v", err)
 		}
 
-		ev, _ := startTurn(t, l, context.Background(), []content.Block{&content.TextBlock{Text: "go"}})
-		// Collect the per-turn stream: count StepDones and assert the terminal.
+		startTurn(t, l, rec, []content.Block{&content.TextBlock{Text: "go"}})
+		// On the fan-in: assert the terminal, then count the StepDones published before it.
+		terminal := drainToTerminal(t, rec)
+		if _, ok := terminal.(event.TurnFailed); !ok {
+			t.Fatalf("terminal = %T, want TurnFailed", terminal)
+		}
 		var sds int
-		var terminal event.Event
-		for e := range ev {
+		for _, e := range rec.events() {
 			switch e.(type) {
 			case event.StepDone:
 				sds++
 			case event.TurnDone, event.TurnFailed, event.TurnInterrupted:
-				terminal = e
 			}
-			if terminal != nil {
-				break
-			}
-		}
-		if _, ok := terminal.(event.TurnFailed); !ok {
-			t.Fatalf("terminal = %T, want TurnFailed", terminal)
 		}
 		if sds != 2 {
 			t.Errorf("StepDone count = %d, want 2 (steps 0 and 1 committed before the cap)", sds)
@@ -940,32 +889,26 @@ func TestStepGranularityRollback(t *testing.T) {
 // the first request the provider receives carrying exactly that user message).
 func TestActorCommitsInitialUserMessageAndTurnStarted(t *testing.T) {
 	t.Parallel()
-	rec := &recordingLLM{chunks: []content.Chunk{textChunk("hi")}}
-	l, _ := newLoop(t, rec)
+	client := &recordingLLM{chunks: []content.Chunk{textChunk("hi")}}
+	l, rec, _ := newLoop(t, client)
 
 	cmdID, err := uuid.New()
 	if err != nil {
 		t.Fatalf("uuid.New: %v", err)
 	}
-	ev := make(chan event.Event, 64)
-	ab := make(chan struct{})
-	defer close(ab)
 	input := []content.Block{&content.TextBlock{Text: "hello there"}}
 	l.Commands <- command.UserInput{
-		Header:    command.Header{CommandID: cmdID},
-		Mode:      command.StartOnly,
-		Blocks:    input,
-		Events:    ev,
-		Abandoned: ab,
+		Header: command.Header{CommandID: cmdID},
+		Blocks: input,
 	}
 
-	// The first per-turn event is TurnStarted, carrying the initial UserMessage and
-	// Cause.CommandID == the submit id. It is emitted by the actor at the commit point
-	// BEFORE any TokenDelta/StepDone.
-	first := <-ev
-	started, ok := first.(event.TurnStarted)
+	// The submit's outcome on the fan-in is TurnStarted, carrying the initial
+	// UserMessage and Cause.CommandID == the submit id. It is emitted by the actor at
+	// the commit point BEFORE any TokenDelta/StepDone.
+	reply := awaitReply(t, rec, cmdID)
+	started, ok := reply.(event.TurnStarted)
 	if !ok {
-		t.Fatalf("first event = %T, want TurnStarted", first)
+		t.Fatalf("reply = %T, want TurnStarted", reply)
 	}
 	if started.Cause.CommandID != cmdID {
 		t.Errorf("TurnStarted.Cause.CommandID = %v, want %v (the UserInput id)", started.Cause.CommandID, cmdID)
@@ -979,17 +922,12 @@ func TestActorCommitsInitialUserMessageAndTurnStarted(t *testing.T) {
 	if got := flattenToText(started.Message.Blocks); got != "hello there" {
 		t.Errorf("TurnStarted.Message text = %q, want %q", got, "hello there")
 	}
-	// InputID now carries the submit command id (== Cause.CommandID), so a consumer can
-	// correlate the event.TurnStarted back to the originating UserInput.
-	if started.Cause.CommandID != cmdID {
-		t.Errorf("TurnStarted.Cause.CommandID = %v, want the submit id %v", started.Cause.CommandID, cmdID)
-	}
-	if _, ok := drainToTerminal(t, ev).(event.TurnDone); !ok {
+	if _, ok := drainToTerminal(t, rec).(event.TurnDone); !ok {
 		t.Fatal("terminal != TurnDone")
 	}
 
 	// The committed UserMessage drove the very first provider request.
-	reqs := rec.reqs
+	reqs := client.reqs
 	if len(reqs) == 0 {
 		t.Fatal("no provider request recorded")
 	}
@@ -1001,12 +939,13 @@ func TestActorCommitsInitialUserMessageAndTurnStarted(t *testing.T) {
 	}
 }
 
-// TestActorPerTurnStreamOrdering asserts the actor-owned serialization invariant:
-// across the full actor path, every step's TokenDeltas precede that step's
-// StepDone (emitted by the actor at the commit point while runTurn is parked in
-// the handshake), and the single terminal is last. The blocking commit handshake
-// guarantees there are no concurrent writers to the per-turn stream.
-func TestActorPerTurnStreamOrdering(t *testing.T) {
+// TestActorEventOrderingOnFanIn asserts the actor-owned serialization invariant on
+// the session fan-in: every loop event reaches consumers through the single publish
+// path, in order — TurnStarted first, then for each step every TokenDelta precedes
+// that step's StepDone (emitted by the actor at the commit point while runTurn is
+// parked in the handshake), and the single terminal is last. The blocking commit
+// handshake guarantees there are no concurrent writers to the fan-in.
+func TestActorEventOrderingOnFanIn(t *testing.T) {
 	t.Parallel()
 	echo := &echoTool{name: "Echo", output: "ran"}
 	ts := agenticToolSet([]tool.InvokableTool{echo}, 25, 100)
@@ -1018,21 +957,19 @@ func TestActorPerTurnStreamOrdering(t *testing.T) {
 	t.Cleanup(cancel)
 	sessionID, _ := uuid.New()
 	loopID, _ := uuid.New()
-	l, err := New(ctx, sessionID, loopID, Provenance{}, noopPublisher{},
+	rec := &recordingPublisher{}
+	l, err := New(ctx, sessionID, loopID, Provenance{}, rec,
 		Config{Client: client, Model: llm.ModelSpec{Model: "m"}, Tools: ts, DrainTimeout: 200 * time.Millisecond})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	// Raw StartOnly submit (not the startTurn helper) so the leading TurnStarted stays
-	// on the stream to be asserted: the start-or-reject outcome IS the first per-turn
-	// event now, and this test verifies the full started/delta/stepdone/done ordering.
-	ev := make(chan event.Event, 64)
-	ab := make(chan struct{})
-	defer close(ab)
-	l.Commands <- command.UserInput{Mode: command.StartOnly, Blocks: []content.Block{&content.TextBlock{Text: "go"}}, Events: ev, Abandoned: ab}
+	l.Commands <- command.UserInput{Header: command.Header{CommandID: mustID(t)}, Blocks: []content.Block{&content.TextBlock{Text: "go"}}}
 
+	// Wait until the terminal has been published, then project the recorded fan-in
+	// events to the started/delta/stepdone/done ordering.
+	blockUntilEvents(t, rec, hasTerminal)
 	var kinds []string
-	for e := range ev {
+	for _, e := range rec.events() {
 		switch e.(type) {
 		case event.TurnStarted:
 			kinds = append(kinds, "started")
@@ -1087,13 +1024,14 @@ func TestActorToolTurnOrderedHistory(t *testing.T) {
 	t.Cleanup(cancel)
 	sessionID, _ := uuid.New()
 	loopID, _ := uuid.New()
-	l, err := New(ctx, sessionID, loopID, Provenance{}, noopPublisher{},
+	rec := &recordingPublisher{}
+	l, err := New(ctx, sessionID, loopID, Provenance{}, rec,
 		Config{Client: client, Model: llm.ModelSpec{Model: "m"}, Tools: ts, DrainTimeout: 200 * time.Millisecond})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	ev, _ := startTurn(t, l, context.Background(), []content.Block{&content.TextBlock{Text: "go"}})
-	if _, ok := drainToTerminal(t, ev).(event.TurnDone); !ok {
+	startTurn(t, l, rec, []content.Block{&content.TextBlock{Text: "go"}})
+	if _, ok := drainToTerminal(t, rec).(event.TurnDone); !ok {
 		t.Fatal("terminal != TurnDone")
 	}
 
@@ -1160,50 +1098,6 @@ func (b *blockingTool) InvokableRun(ctx context.Context, argsJSON string) (*tool
 	}
 }
 
-// TestCommitParkDoesNotWedgeOnRootCancel proves the ctx-cancellable commit
-// handshake never wedges the loop: a per-turn consumer that stops reading parks the
-// actor blocked in the commit-point StepDone emission while runTurn waits for the
-// ack; a root-ctx cancel (the universal escape) must free both so Loop.Done closes.
-func TestCommitParkDoesNotWedgeOnRootCancel(t *testing.T) {
-	t.Parallel()
-	ctx, cancel := context.WithCancel(context.Background())
-	sessionID, _ := uuid.New()
-	loopID, _ := uuid.New()
-	// A single no-tool step: runTurn emits one TokenDelta, then commits step 0; the
-	// actor emits StepDone at the commit point.
-	l, err := New(ctx, sessionID, loopID, Provenance{}, noopPublisher{}, Config{
-		Client:       &fakeLLM{chunks: []content.Chunk{textChunk("a")}},
-		Model:        llm.ModelSpec{Model: "m"},
-		DrainTimeout: 100 * time.Millisecond,
-	})
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
-	// Events buffered to EXACTLY TurnStarted + 1 TokenDelta; the StepDone send from
-	// the actor's commit point blocks on the full, unread buffer, parking the actor
-	// (and runTurn waiting for the ack). Only the emitTurn ctx.Done() escape frees it.
-	ev := make(chan event.Event, 2)
-	ab := make(chan struct{}) // never closed -> leaked reader
-	// Leaked reader: never read from ev (TurnStarted fills slot 1, the TokenDelta fills
-	// slot 2; the StepDone then blocks the actor). Reading would defeat the test.
-	l.Commands <- command.UserInput{Mode: command.StartOnly, Blocks: nil, Events: ev, Abandoned: ab}
-	// Give the turn time to fill the buffer and park the actor in the commit point.
-	deadline := time.After(2 * time.Second)
-	for len(ev) < 2 {
-		select {
-		case <-deadline:
-			t.Fatal("buffer never filled; actor did not reach the commit point")
-		case <-time.After(2 * time.Millisecond):
-		}
-	}
-	cancel() // root-ctx cancel: the universal escape for the parked commit point
-	select {
-	case <-l.Done:
-	case <-time.After(2 * time.Second):
-		t.Fatal("actor wedged at the commit point: Loop.Done never closed after root-ctx cancel")
-	}
-}
-
 // TestInterruptDuringToolBatchFreesTurn proves an Interrupt delivered while the
 // turn goroutine is parked deep in a tool batch (just before the next commit/LLM
 // request) frees the turn: the actor processes Interrupt, cancels turnCtx, the
@@ -1220,34 +1114,20 @@ func TestInterruptDuringToolBatchFreesTurn(t *testing.T) {
 	t.Cleanup(cancel)
 	sessionID, _ := uuid.New()
 	loopID, _ := uuid.New()
-	l, err := New(ctx, sessionID, loopID, Provenance{}, noopPublisher{},
+	rec := &recordingPublisher{}
+	l, err := New(ctx, sessionID, loopID, Provenance{}, rec,
 		Config{Client: client, Model: llm.ModelSpec{Model: "m"}, Tools: ts, DrainTimeout: 200 * time.Millisecond})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	ev, _ := startTurn(t, l, context.Background(), []content.Block{&content.TextBlock{Text: "go"}})
-	// Drain the per-turn stream in the background so emit never blocks the turn.
-	terminalCh := make(chan event.Event, 1)
-	go func() {
-		for e := range ev {
-			if e.EndsTurn() {
-				terminalCh <- e
-				return
-			}
-		}
-	}()
+	startTurn(t, l, rec, []content.Block{&content.TextBlock{Text: "go"}})
 	<-bt.started // the tool is now blocked; the turn goroutine is parked in the batch
 	iack := make(chan bool, 1)
 	l.Commands <- command.Interrupt{Ack: iack}
 	if !<-iack {
 		t.Fatal("Interrupt ack = false, want true (turn running)")
 	}
-	select {
-	case term := <-terminalCh:
-		if _, ok := term.(event.TurnInterrupted); !ok {
-			t.Fatalf("terminal = %T, want TurnInterrupted", term)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("turn did not terminate after Interrupt")
+	if _, ok := drainToTerminal(t, rec).(event.TurnInterrupted); !ok {
+		t.Fatal("turn did not terminate TurnInterrupted after Interrupt")
 	}
 }
