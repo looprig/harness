@@ -1,6 +1,8 @@
 package journal
 
 import (
+	"strconv"
+
 	"github.com/inventivepotter/urvi/internal/agent/loop/command"
 	"github.com/inventivepotter/urvi/internal/agent/loop/event"
 	"github.com/inventivepotter/urvi/internal/uuid"
@@ -91,3 +93,36 @@ func (r CommandRecord) Subject() string { return LoopCommandSubject(r.sessionID,
 
 // IdempotencyID is the command's CommandID rendered canonically.
 func (r CommandRecord) IdempotencyID() string { return r.cmd.CommandHeader().CommandID.String() }
+
+// LeaseFence is an internal journal record marking a lease-handover boundary: a
+// monotonically increasing Epoch fenced into the stream when ownership of a
+// session's writer lease changes. It is journal-private (not an event or a
+// command) and lands on the session's fence subject; the EventReplayer never
+// decodes it. Codec: MarshalLeaseFence/UnmarshalLeaseFence in record_json.go.
+type LeaseFence struct {
+	Epoch uint64 `json:"epoch"`
+}
+
+// FenceRecord wraps a LeaseFence as a JournalRecord. The fence carries no session
+// id of its own, so the writer supplies the target sessionID at construction; the
+// record lands on that session's fence subject and its idempotency id is the epoch.
+type FenceRecord struct {
+	sessionID uuid.UUID
+	fence     LeaseFence
+}
+
+// NewFenceRecord wraps fence as the fence record for session sessionID.
+func NewFenceRecord(sessionID uuid.UUID, fence LeaseFence) FenceRecord {
+	return FenceRecord{sessionID: sessionID, fence: fence}
+}
+
+// Fence returns the wrapped LeaseFence for the serializer to marshal.
+func (r FenceRecord) Fence() LeaseFence { return r.fence }
+
+func (FenceRecord) isJournalRecord() {}
+
+// Subject is the session's fence subject.
+func (r FenceRecord) Subject() string { return FenceSubject(r.sessionID) }
+
+// IdempotencyID is the epoch rendered as a decimal string.
+func (r FenceRecord) IdempotencyID() string { return strconv.FormatUint(r.fence.Epoch, 10) }
