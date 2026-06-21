@@ -4,6 +4,7 @@ import (
 	"time"
 
 	"github.com/inventivepotter/urvi/internal/agent/loop/event"
+	"github.com/inventivepotter/urvi/internal/agent/loop/identity"
 	"github.com/inventivepotter/urvi/internal/llm"
 )
 
@@ -11,6 +12,13 @@ type Config struct {
 	Client       llm.LLM       // required — caller constructs via auto.New at composition root
 	Model        llm.ModelSpec // model name, system prompt, sampling params — sent every turn
 	DrainTimeout time.Duration // optional — bounds the hard-kill wait for a cancelled turn to drain; New defaults it to 5s
+
+	// AgentName is the immutable attribution name the loop runs under (the agent/role
+	// driving it, e.g. "operator"). It is stamped onto the loop's LoopStarted at creation
+	// and never changes. Empty (the zero value) means an unnamed/plain loop. The session
+	// reads it when publishing LoopStarted; restore validates the root loop's stamped name
+	// against the configured primary's AgentName.
+	AgentName identity.AgentName
 
 	// Tools is the runner's view of the tool subsystem (the consumer surface in
 	// deps.go). Its runaway-guard caps are defaulted by New when zero;

@@ -75,6 +75,14 @@ type Header struct {
 	// step/tool scoped events. Session-scoped events leave LoopID/TurnID/StepID zero.
 	identity.Coordinates
 
+	// AgentName is the immutable attribution name of the agent driving the producing
+	// loop, stamped at loop creation onto its LoopStarted (and carried on the loop's
+	// other events via the same Header). It is empty (omitzero) for a plain loop and for
+	// any record persisted before AgentName existed, so old journals stay byte-compatible
+	// — the field serializes additively with no new codec case. Restore validates the
+	// root loop's stamped name against the configured primary's name.
+	AgentName identity.AgentName `json:"agent_name,omitzero"`
+
 	// EventID identifies this event. Header carries this identity directly; detailed
 	// wiring is sequenced after the journal follow-on.
 	EventID uuid.UUID `json:"event_id,omitzero"`

@@ -265,6 +265,64 @@ func TestNewLoop(t *testing.T) {
 	}
 }
 
+// cfgWithAgent is cfg with an AgentName set, so a test can assert the loop's
+// configured attribution name is stamped onto its published LoopStarted.
+func cfgWithAgent(client llm.LLM, name identity.AgentName) loop.Config {
+	c := cfg(client)
+	c.AgentName = name
+	return c
+}
+
+// TestNewLoopStampsAgentName proves NewLoop stamps the loop's configured AgentName
+// onto the published LoopStarted's Header — the immutable attribution record. An empty
+// (unset) configured name leaves the stamped name empty. We subscribe BEFORE the call
+// (the hub has no replay) and read the LoopStarted off the fan-in.
+func TestNewLoopStampsAgentName(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name  string
+		agent identity.AgentName
+	}{
+		{name: "named loop stamps its agent name", agent: "operator"},
+		{name: "unset agent name stamps empty", agent: ""},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			s, err := New(context.Background(), cfg(&stubLLM{chunks: []content.Chunk{textChunk("x")}}))
+			if err != nil {
+				t.Fatalf("New: %v", err)
+			}
+			t.Cleanup(func() { _ = s.Shutdown(context.Background()) })
+
+			sub, err := s.SubscribeEvents(allFilter())
+			if err != nil {
+				t.Fatalf("SubscribeEvents: %v", err)
+			}
+			t.Cleanup(func() { _ = sub.Close() })
+
+			loopID, err := s.NewLoop(loop.Provenance{}, cfgWithAgent(&stubLLM{chunks: []content.Chunk{textChunk("y")}}, tt.agent))
+			if err != nil {
+				t.Fatalf("NewLoop: %v", err)
+			}
+
+			ls, ok := firstMatching[event.LoopStarted](t, sub)
+			if !ok {
+				t.Fatal("did not observe a LoopStarted on the fan-in")
+			}
+			// Read the LoopStarted for the loop we just created (not the primary's, which
+			// was published before we subscribed — but guard regardless).
+			if ls.LoopID != loopID {
+				t.Fatalf("observed LoopStarted for loop %v, want the just-created %v", ls.LoopID, loopID)
+			}
+			if ls.Header.AgentName != tt.agent {
+				t.Errorf("LoopStarted.Header.AgentName = %q, want %q", ls.Header.AgentName, tt.agent)
+			}
+		})
+	}
+}
+
 // TestNewLoopIDGenerationFailure: when idGen fails, NewLoop returns a typed
 // *SessionError wrapping the generator error and registers no loop. NewLoop mints
 // two ids — the loop id (1st) then the LoopStarted EventID (2nd). A failure on the

@@ -424,6 +424,10 @@ func (s *Session) NewLoop(parent loop.Provenance, cfg loop.Config) (uuid.UUID, e
 	// preserves; only EventID + CreatedAt are added.
 	startedHeader, err := s.factory.Stamp(event.Header{
 		Coordinates: identity.Coordinates{SessionID: s.SessionID, LoopID: loopID},
+		// AgentName is the loop's immutable attribution name, stamped from its Config so
+		// the durable LoopStarted records which agent drove this loop. Empty for a plain
+		// loop; the primary loop carries its configured name through this same path.
+		AgentName: cfg.AgentName,
 		Cause: identity.Cause{
 			Coordinates: identity.Coordinates{LoopID: parent.LoopID, TurnID: parent.TurnID, StepID: parent.StepID},
 			Agency:      identity.AgencyMachine,

@@ -333,6 +333,7 @@ func TestMarshalEventRoundTripEnduring(t *testing.T) {
 		// RestoreErrored.Err handled in the dedicated err-projection test below.
 		{"LoopIdle", LoopIdle{Header: fullHeaderLoop()}},
 		{"LoopStarted", LoopStarted{Header: fullHeaderLoop()}},
+		{"LoopStarted with AgentName", LoopStarted{Header: loopHeaderWithAgent("operator")}},
 		{"TurnStarted", TurnStarted{Header: fullHeaderTurn(), TurnIndex: 7, Message: userMsg("hi")}},
 		{"StepDone", StepDone{Header: fullHeader(), Messages: sampleMessages()}},
 		{"TurnFoldedInto", TurnFoldedInto{Header: fullHeaderTurn(), TurnIndex: 2, Message: userMsg("fold")}},
@@ -783,5 +784,13 @@ func fullHeaderLoop() Header {
 func fullHeaderTurn() Header {
 	h := fullHeader()
 	h.StepID = uuid.UUID{}
+	return h
+}
+
+// loopHeaderWithAgent is a loop-scoped header carrying an AgentName, so a round-trip
+// proves the attribution name survives MarshalEvent/UnmarshalEvent additively.
+func loopHeaderWithAgent(name identity.AgentName) Header {
+	h := fullHeaderLoop()
+	h.AgentName = name
 	return h
 }
