@@ -76,9 +76,16 @@ One JetStream **stream per session**. Subjects:
 - `urvi.session.<sid>.loop.<lid>.cmd` — commands targeting that loop (the intent log).
   **All commands are loop-targeted** — `Interrupt`/`Shutdown` fan out per loop
   (`session.go:626`), so there is no session-level command subject.
+- `urvi.session.<sid>.fence` — internal `LeaseFence{epoch}` records (the durable handover
+  boundary). In the **same stream** — so a fence advances the shared sequence and fences
+  stale writers — but a **non-event** subject.
 
-Per-session means per-session lifecycle and a single ordered log. The loop goroutine is
-the **sole producer** per `…loop.<lid>` subject, so publish order is causal order.
+`EventReplayer` filters to the **event** subjects only (`…session` + `…loop.<lid>.event`),
+so `.cmd` and `.fence` are subjects it never decodes and `EventCursor.Next` stays typed to
+`event.Event`. Commands and fences are read on their own paths (the command log; the lease
+manager). Per-session means per-session lifecycle and a single ordered log; the loop
+goroutine is the **sole producer** per `…loop.<lid>` subject, so publish order is causal
+order.
 
 ## Single source of truth — event sourcing
 
@@ -162,10 +169,13 @@ durable, auditable handover boundary.
 
 **Bounded append & ambiguous acks.** The serializer is the correctness boundary, so each
 append carries its **own deadline, independent of the long-lived session context** (a
-stalled publish must not stall the session forever). On timeout the ack is *ambiguous* (the
-record may or may not have been stored): before any further append, **resolve** by looking
-the `EventID`/`CommandID` up in the stream (dedup window / last sequence) — if stored,
-advance expected := its sequence; if absent, retry within the dedup window; if unresolved,
+stalled publish must not stall the session forever). On timeout the ack is *ambiguous*. Do
+**not** "look up by id" — JetStream has no header index; resolve with a **sequence-based**
+algorithm. With expected sequence `N`: **retry the same record** (same `Nats-Msg-Id`,
+`Nats-Expected-Last-Sequence: N`). If the retry **succeeds**, the original never landed —
+done. If it **conflicts** (something is already at `N+1`), **direct-get sequence `N+1`** and
+verify its stored `Nats-Msg-Id` / payload hash: if it is our record, the original landed →
+advance expected := `N+1`; if it is **not** ours, the single-writer invariant is broken →
 raise `SessionPersistenceFault`. Never blindly re-append past an ambiguous ack.
 
 **Hub tap algorithm** (Enduring events; precise ordering & failure):
@@ -223,7 +233,8 @@ type SessionJournal interface {
     Append(ctx context.Context, rec JournalRecord) (seq uint64, err error)
 }
 
-// JournalRecord is the sealed sum the serializer writes.
+// JournalRecord is the sealed sum the serializer writes, each to its own subject:
+//   event → …session | …loop.<lid>.event   command → …loop.<lid>.cmd   LeaseFence → …fence
 type JournalRecord interface{ isJournalRecord() } // event | command | LeaseFence{epoch}
 
 // EventAppender / CommandAppender are thin typed façades over the one SessionJournal —
@@ -231,7 +242,9 @@ type JournalRecord interface{ isJournalRecord() } // event | command | LeaseFenc
 type EventAppender   interface{ Append(ctx context.Context, ev event.Event) (uint64, error) }
 type CommandAppender interface{ Append(ctx context.Context, rec CommandRecord) (uint64, error) }
 
-// Read side — backlog (and optionally live) for restore / TUI repaint.
+// Read side — backlog (and optionally live) for restore / TUI repaint. Reads ONLY the
+// event subjects (…session + …loop.<lid>.event); .cmd and .fence are separate subjects it
+// never decodes, so EventCursor.Next stays typed to event.Event.
 type EventReplayer interface {
     Open(ctx context.Context, req ReplayRequest) (EventCursor, error)
 }
