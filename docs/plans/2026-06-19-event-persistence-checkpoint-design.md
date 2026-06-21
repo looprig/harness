@@ -7,8 +7,9 @@ persists: the `Ephemeral`/`Enduring` classes, the per-step `StepDone` event
 (finalized `AIMessage` + its `ToolResultMessage`s), the turn/input lifecycle
 events (`TurnStarted`/`TurnFoldedInto`/`InputCancelled`/`TurnRejected`), the
 session/loop lifecycle events (`SessionStarted`/`SessionActive`/`SessionIdle`/
-`SessionStopped`/`LoopIdle`), producer-identity `Header` fields (`SessionID`,
-`LoopID`, `Header.ID`), and the publish/subscribe hub the loop emits to.
+`SessionStopped`/`LoopIdle`/`LoopStarted`), producer-identity `Header` fields
+(`Coordinates{SessionID,LoopID,TurnID,StepID}`, `EventID`, `Cause`), and the
+publish/subscribe hub the loop emits to.
 **Composes with:** `docs/plans/2026-06-18-tui-event-adoption-design.md` — the TUI
 as a projection of Enduring events via `ApplyEvent`; restore reuses that exact
 projection.
@@ -102,9 +103,10 @@ twice (local format *and* cross-worker coordination) and let them drift.
 
 ## Scope
 
-**In scope:** the durable Enduring-event journal; checkpoint/restore of a loop's
-`msgs`; TUI replay-repaint; the session catalog + lazy restore; the embedded vs
-clustered wiring; retention policy.
+**In scope:** the durable Enduring-event journal; the command (intent) log;
+per-record creation timestamps; checkpoint/restore of a loop's `msgs`; TUI
+replay-repaint (background fold, no UI hang); the session catalog + lazy restore;
+the embedded vs clustered wiring; retention policy.
 
 **Out of scope (named, not built here):**
 - **Cross-worker subagent routing/orchestration** — this layer *enables* it (the
@@ -156,15 +158,19 @@ Inversion).
 
 ### Stream & subject topology
 
-- **One JetStream stream per session.** Subject: `urvi.session.<sessionID>.loop.<loopID>`.
+- **One JetStream stream per session.** Subjects:
+  `urvi.session.<sid>.loop.<lid>.event` (events) and
+  `urvi.session.<sid>.loop.<lid>.cmd` (commands — see *Commands are persisted*);
+  session-level commands use `urvi.session.<sid>.cmd`.
 - Per-session means per-session lifecycle and a single ordered log; the per-loop
-  subject lets a consumer filter to one loop or subscribe to
-  `urvi.session.<sid>.loop.*` for all of them — which is exactly the
-  `EventFilter` per-`LoopID` semantics, and exactly how a future cross-worker
-  parent reads its subagents.
-- **Idempotent publish:** set `Nats-Msg-Id = Header.ID` (the EventID). JetStream's
-  dedup window makes retries effectively-once on the log. (Dedup uses metadata,
-  not payload — unaffected by the future at-rest encryption.)
+  subject lets a consumer filter to one loop, to `…loop.<lid>.event` for just its
+  events, or to `urvi.session.<sid>.loop.*.event` for all loops' events — which is
+  exactly the `EventFilter` per-`LoopID` semantics, and exactly how a future
+  cross-worker parent reads its subagents.
+- **Idempotent publish:** set `Nats-Msg-Id = Header.EventID` (events) /
+  `CommandRecord.CommandID` (commands). JetStream's dedup window makes retries
+  effectively-once on the log. (Dedup uses metadata, not payload — unaffected by
+  the future at-rest encryption.)
 
 ### One delivery path per class (no dedup seam)
 
@@ -225,15 +231,72 @@ seam** and add a periodic full-`msgs` snapshot *later, at `LoopIdle`* (the cheap
 coarse instant), purely as a replay-truncation optimization — never promoting it
 to a source of truth. YAGNI until a profiler says otherwise.
 
+## Commands are persisted too (the intent log)
+
+The Enduring **event** stream is the source of truth for *state* (above). On top
+of it we also persist **commands** — the inputs/intent (`Submit`, `Interrupt`,
+`Shutdown`, `SubagentResult`, `CancelQueuedInput`) — as a parallel **audit +
+deterministic-replay** layer. Commands and events are produced at different
+points: commands arrive at the **Session boundary** (before the loop actor);
+events are emitted **by** the loop actor. So the layer has two write entry points
+into the *same* per-session stream, on distinct subjects:
+
+- events → `urvi.session.<sid>.loop.<lid>.event`
+- commands → `urvi.session.<sid>.loop.<lid>.cmd` (loop-targeted) or
+  `urvi.session.<sid>.cmd` (session-level: `Interrupt`-all, `Shutdown`)
+
+**Commands are not state.** Restore-to-continue folds **events only**. A `Submit`
+carries input blocks, but the *committed* user message comes from `TurnStarted`;
+folding both would double-add it, and a *rejected* `Submit` (no `TurnStarted`)
+must never enter `msgs`. So events stay authoritative; commands are "what was
+attempted" — for audit, control-plane history (who interrupted, when), and
+deterministic input replay. Correlate to outcomes by
+`CommandRecord.CommandID == event.Cause.CommandID`; order against events by the
+shared JetStream sequence (one timeline per session).
+
+**Asymmetric fail-secure.** Event append is strict fail-secure — it is the restore
+source of truth, so a failed append degrades/stops the session. Command append is
+audit-only: losing one cannot corrupt restore, so it surfaces loudly but
+**proceeds** with dispatch — never block the user's action on the audit write.
+
+## Timestamps and ordering
+
+Every persisted record — event and command — carries a **creation** timestamp,
+stamped when created, not when delivered or stored:
+
+- Events gain `Header.CreatedAt time.Time`; commands carry `CommandRecord.CreatedAt`
+  (realizing the loop-machine "stamp `CreatedAt`/`EventID` at creation, not
+  delivery" intent). The clock is injected (`now func() time.Time`), mirroring the
+  existing `idGenerator` injection, so tests are deterministic.
+- **Timestamps are for audit / display / latency only — never ordering.** Wall
+  clocks skew and run backwards; the authoritative order is the **JetStream
+  sequence**, and since the loop is the sole producer per subject, sequence order
+  *is* causal order. JetStream also stamps a server-side store time in message
+  metadata; `CreatedAt` is the in-record, replay-stable companion to it.
+
 ## Interfaces (the DIP boundary)
 
 Two narrow interfaces (ISP — write and read sides are independent); the NATS
 implementation lives behind them and is wired at the composition root.
 
 ```go
-// Write side — used by the durable hub for Enduring events.
+// Write side (events) — used by the journalingPublisher decorator.
 type EventAppender interface {
-    Append(ctx context.Context, ev event.Event) error // idempotent by Header.ID
+    Append(ctx context.Context, ev event.Event) error // idempotent by Header.EventID
+}
+
+// Write side (commands) — used at the Session boundary (Submit/Interrupt/…).
+type CommandAppender interface {
+    Append(ctx context.Context, rec CommandRecord) error // idempotent by rec.CommandID
+}
+
+type CommandRecord struct {
+    CommandID    uuid.UUID
+    CreatedAt    time.Time       // stamped at creation (injected clock)
+    SessionID    uuid.UUID
+    TargetLoopID uuid.UUID       // zero for session-level (Interrupt-all / Shutdown)
+    Agency       identity.Agency // user | machine
+    Command      command.Command // sealed; serialized via MarshalCommand
 }
 
 // Read side — used by loop cold-restore and TUI repaint.
@@ -260,23 +323,27 @@ type SnapshotStore interface {
 }
 ```
 
-The **durable hub** implements the loop-machine's `eventPublisher` (loop emits
-here) and `eventSubscriber` (clients attach here):
-- `PublishEvent(Enduring)` → `EventAppender.Append`.
-- `PublishEvent(Ephemeral)` → local in-process fan-out only.
-- A subscriber's stream = merge of (its `EventReplayer` cursor, carrying Enduring
-  backlog→live) + (the local fan-out, carrying Ephemeral).
+The **`journalingPublisher`** implements the loop's narrow `eventPublisher` and
+wraps the existing `*hub.Hub`:
+- `PublishEvent(Enduring)` → `EventAppender.Append` (durable) **then** forward to
+  the hub (live fan-out). Append-failure is fail-secure (see reconciliation).
+- `PublishEvent(Ephemeral)` → forward to the hub only; never persisted.
 
-The NATS impl maps `LoopID`→subject filter, `From`→JetStream `DeliverPolicy`,
-`Follow`→a consumer that stays open vs. closes at `io.EOF`.
+The hub stays the live bus. Backlog on restore comes from `EventReplayer`
+(a JetStream fetch), **not** the hub subscription — so the 256-cap live buffer is
+never in the backlog path (see *Replay performance*). The NATS impl maps
+`LoopID`→subject filter, `From`→JetStream `DeliverPolicy`, `Follow`→a consumer
+that stays open vs. closes at `io.EOF`. Commands are appended at the Session
+boundary via `CommandAppender`, independent of this publish path.
 
 ## Restore flow — folds over one stream
 
 **Session structure first.** Before any loop is seeded, reconstruct
 `sessionState` — by folding the session's own stream, exactly like everything
 else, not from a side-record. The **set of loops = the `loop.*` subjects** in the
-session stream; the **subagent tree = `Header.ParentLoopID`** on their events; the
-**primary loop = the root** (no parent). A loop that was spawned but never
+session stream; the **subagent tree = `Header.Cause.Coordinates.LoopID`** on their
+`LoopStarted` events; the **primary loop = the root** (no parent). A loop that was
+spawned but never
 committed any Enduring event has no subject and no state to restore — consistent
 with "discard the incomplete." (See *Session structural state* for the one
 caveat.)
@@ -318,22 +385,47 @@ sets a "restored" marker off `RestoreDone`. `RestoreStarted`/`RestoreDone`/
 `RestoreErrored` are three new Enduring session-scoped event types this design adds
 to the event package.
 
+## Replay performance — no UI hang
+
+A big backlog must not freeze the TUI. It won't, because replay is a background
+batch fold rendered once — never a per-event repaint on the update loop:
+
+- **Backlog comes from `EventReplayer` (a JetStream fetch), not the hub
+  subscription**, so the 256-cap live buffer is never in the backlog path and
+  can't backpressure or fail.
+- **Fold off the UI loop.** In a background `tea.Cmd`/goroutine, decode and apply
+  all N events through the pure `transcript.ApplyEvent` / `interaction.ApplyEvent`
+  folds (in-memory, no I/O, no rendering) to build the final reducer state, then
+  hand the TUI **one** "restored" message.
+- **Render once into scrollback.** The TUI is scrollback-first: the rebuilt
+  transcript flushes to native terminal history in one pass (the terminal owns the
+  scroll history, so we don't keep N live-rendered entries), then live attaches.
+  Rendering is windowed to what's visible.
+
+**Cost of ~10k events** (a stress case — most sessions are tens-to-hundreds):
+sequential read + JSON decode (~10–20 MB) + slice-append fold is **well under
+~1 s**; the variable cost is *rendering* many entries, bounded by
+render-once-to-scrollback + viewport windowing (~1–2 s wall worst case). If cold
+restore ever hurts at that scale, the dormant **snapshot seam** turns it into
+*load snapshot + replay only the tail* (O(history) → O(since-last-snapshot)). We
+don't build it until a profiler says 10k hurts.
+
 ## Session structural state (a fold, not a record)
 
 `sessionState` holds the session's structure — the loop map, the subagent
 parent/child tree, the primary loop. This is **distinct** from the cross-session
 *index* below, and it is **not** persisted as a separate authoritative blob. Like
-`loopState.msgs`, it is a **fold over the session's own stream** (loops from
-subjects, tree from `Header.ParentLoopID`, primary = root).
+`loopState.msgs`, it is a **fold over the session's own stream** — the loop set
+from the `LoopStarted` events, the tree from each `LoopStarted`'s
+`Header.Cause.Coordinates.LoopID`, the primary loop = the root (zero `Cause`).
 
 The governing principle: **any must-survive session state that isn't
 re-derivable from config must be an Enduring event, never a side-record** — so it
-stays in the one source of truth. The one caveat: if a piece of structure can't
-be inferred from subjects + `Header.ParentLoopID` (e.g. an explicit primary
-designation, or a subagent's role), the loop-machine must emit a small structural
-Enduring event — a `LoopSpawned{LoopID, ParentLoopID, Role, IsPrimary}` — so it
-lands in the log too. This is an upstream loop-machine event-taxonomy amendment
-(the same kind the TUI-adoption spec makes), called out in *Sequencing*.
+stays in the one source of truth. This is already satisfied: `LoopStarted` (landed
+on `main`) carries the spawning provenance in `Header.Cause.Coordinates`, so the
+structure folds with no upstream amendment. (Were some future structural fact not
+inferable — e.g. an explicit role — it would be added as a field on `LoopStarted`
+rather than stored in a side-record.)
 
 ## Session catalog (index) & lazy restore
 
@@ -353,8 +445,8 @@ divergence.
   one tiny record per session, **zero event replay**. (`StreamInfo` additionally
   provides message counts / first/last timestamps for free.)
 - **Restore is lazy.** Only on *selecting* a session do we instantiate the
-  `AgentSession`, open a replayer per loop subject, fold → seed, repaint. Until
-  then nothing is read but metadata.
+  `Session` via `Restore`, open a replayer per loop subject, fold → seed, repaint.
+  Until then nothing is read but metadata.
 - **A `catalog` subscriber keeps metadata current** without coupling the loop to
   KV: it watches Enduring lifecycle events — `SessionStarted` upserts the record;
   the first `TurnStarted` sets `Title` (e.g. from the first user message);
@@ -437,10 +529,10 @@ redacted — confidentiality at rest is handled by topology:
 
 ## Serialization format — JSON
 
-The on-disk payload of each Enduring event is **JSON** (`encoding/json`), because
-it is a **long-lived compatibility surface**: old sessions are restored by new
-code, so the format must evolve forward/backward-compatibly. JSON does this with
-additive fields + an explicit `schemaVersion` tag.
+The on-disk payload of each record — event or command — is **JSON**
+(`encoding/json`), because it is a **long-lived compatibility surface**: old
+sessions are restored by new code, so the format must evolve forward/backward-
+compatibly. JSON does this with additive fields + an explicit `schemaVersion` tag.
 
 - **Must build an event-level codec, atop existing ones.** `content.Block` and
   `Message` already have sealed-interface JSON codecs (the ones `FuzzUnmarshalBlock`
@@ -461,6 +553,45 @@ additive fields + an explicit `schemaVersion` tag.
 - **Headers carry type + version.** `Event-Type` and `Schema-Version` go in the
   NATS message headers (body stays JSON), so the index/catalog and any filtering
   never decode a body.
+- **Commands use a parallel codec.** `MarshalCommand`/`UnmarshalCommand` (sealed
+  tagged union over the command types), delegating `Submit`'s blocks to the block
+  codec; transient fields (ack channels) are not serialized. The `CommandRecord`
+  envelope adds `CommandID`, `CreatedAt`, `TargetLoopID`, `Agency`.
+
+**On-disk shape** (short ids; JetStream metadata shown in the comment line, JSON
+body below):
+
+```jsonc
+// command — subject urvi.session.S1.loop.L1.cmd   (Nats-Msg-Id: C1, seq 8230)
+{
+  "type": "submit",
+  "command_id": "C1",
+  "created_at": "2026-06-21T15:04:04.880Z",
+  "session_id": "S1",
+  "target_loop_id": "L1",
+  "agency": "user",
+  "blocks": [{"type": "text", "text": "what's the module path?"}]
+}
+
+// event it caused — subject urvi.session.S1.loop.L1.event  (Nats-Msg-Id: E7, seq 8231)
+{
+  "type": "step_done",
+  "event_id": "E7",
+  "created_at": "2026-06-21T15:04:05.310Z",
+  "session_id": "S1", "loop_id": "L1", "turn_id": "T1", "step_id": "P1",
+  "cause": {"command_id": "C1"},
+  "messages": [
+    {"role": "assistant", "blocks": [
+      {"type": "text", "text": "It's github.com/…/urvi"}]},
+    {"role": "tool", "tool_use_id": "u1", "blocks": [
+      {"type": "tool_result", "text": "module github.com/…"}]}
+  ]
+}
+```
+
+`cause.command_id == command_id` links outcome to intent; `seq` orders the two;
+`created_at` is audit-only. (Block-type strings are the existing `content.Block`
+discriminators.)
 
 **Rejected:** `gob` — Go-native and compact, but type changes silently break old
 data, disqualifying for a durable format; `protobuf`/`CBOR` — an external dep +
@@ -471,23 +602,31 @@ codegen for no real win on coarse `StepDone`-granularity events.
 Per `CLAUDE.md`: table-driven, `-race`, integration-tagged for process-boundary
 code, fuzz the untrusted boundary.
 
-- **Unit:** durable-hub class routing (Enduring→appender only; Ephemeral→local
-  fan-out only, never persisted); the event→`msgs` fold round-trips
-  (`TurnStarted`/`StepDone` → exact `AgenticMessages`); idempotent append (same
-  `Header.ID` twice → one record); the crash-seam (a turn with no terminal event
-  → restore appends `TurnInterrupted` before resume); catalog updates
-  (`SessionStarted`/first `TurnStarted`/`SessionStopped` → expected `SessionMeta`).
+- **Unit:** `journalingPublisher` class routing (Enduring→append-then-forward;
+  Ephemeral→forward-only, never persisted); the event→`msgs` fold round-trips
+  (`TurnStarted`/`StepDone` → exact `AgenticMessages`); the event **and** command
+  codecs round-trip (incl. `TurnFailed.Err` → `RestoredError`; `Submit` blocks);
+  `CreatedAt` is stamped from the injected clock (deterministic); idempotent append
+  (same `Header.EventID` / `CommandID` twice → one record); the crash-seam (a turn
+  with no terminal event → restore appends `TurnInterrupted` before resume);
+  asymmetric fail-secure (event-append error stops/degrades; command-append error
+  surfaces but dispatch proceeds); catalog updates (`SessionStarted`/first
+  `TurnStarted`/`SessionStopped`/`RestoreDone` → expected `SessionMeta`).
 - **Integration (`//go:build integration`)** — NATS is a real engine even
   embedded: append N Enduring events → tear down → **new server, same
   `StoreDir`** → replay reconstructs `msgs` *byte-for-byte* and the TUI transcript
   identically; dedup window; replay-then-live on one cursor; per-loop subject
   filtering; crash mid-step (no `StepDone`) lands restore at the last completed
   step; **session structure (loop set / tree / primary) reconstructs from
-  subjects + `Header.ParentLoopID`**; lazy listing reads only the KV bucket (no
-  consumer opened until select).
-- **Fuzz:** `FuzzDecodeEvent` over the on-disk payload codec — restore decodes
-  untrusted bytes off disk, the same untrusted-restore boundary `FuzzUnmarshalBlock`
-  already guards.
+  `LoopStarted` + `Header.Cause.Coordinates.LoopID`**; commands replay/correlate to
+  their outcome events by `CommandID`; lazy listing reads only the KV bucket (no
+  consumer opened until select); restore is bracketed by
+  `RestoreStarted`/`RestoreDone` with `SessionID`/`LoopID`s unchanged.
+- **Fuzz:** `FuzzDecodeEvent` (and `FuzzDecodeCommand`) over the on-disk codecs —
+  restore decodes untrusted bytes off disk, the same untrusted-restore boundary
+  `FuzzUnmarshalBlock` already guards.
+- **Replay does not hang the UI:** a 10k-event backlog folds in a background
+  `tea.Cmd` and renders once; the live 256-buffer is never in the backlog path.
 - **Headline property test:** stream a session → `kill` → restore → `msgs`
   identical **and** transcript identical ("displayed == stored == restored").
 - Run with `go test -race ./...`; integration with `go test -tags integration
@@ -499,11 +638,13 @@ The loop-machine event model (classes, `StepDone`, the hub, `EventFilter`,
 `LoopStarted`) has **landed on `main` as of `fc93ee4`** — so there is no upstream
 design dependency left and this layer is buildable now. The `LoopSpawned`
 amendment is moot: `LoopStarted` + `Header.Cause.Coordinates` already make
-session structure foldable. Build order within this layer: event codec
-(`MarshalEvent`/`UnmarshalEvent` + fuzz) → `EventAppender`/`EventReplayer` (NATS)
-→ `journalingPublisher` decorator + composition wiring → `Restore` constructor →
-catalog (KV) → TUI replay-repaint. Orthogonal to and composes with the
-TUI-event-adoption work.
+session structure foldable. Build order within this layer: `Header.CreatedAt` +
+injected clock → event & command codecs (`MarshalEvent`/`UnmarshalEvent` +
+`MarshalCommand`/`UnmarshalCommand` + `FuzzDecodeEvent`) → `EventAppender` /
+`CommandAppender` / `EventReplayer` (NATS) → `journalingPublisher` decorator +
+Session-boundary command append + composition wiring → `Restore` constructor +
+the three `Restore*` events → catalog (KV) → TUI replay-repaint (background fold).
+Orthogonal to and composes with the TUI-event-adoption work.
 
 ## Open questions / risks
 
