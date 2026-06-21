@@ -181,6 +181,14 @@ func restoreCfg(client llm.LLM, model, system string) loop.Config {
 	}
 }
 
+// restoreCfgNamed is restoreCfg with an AgentName set, so a restore can validate the
+// configured primary's attribution name against the persisted root loop's stamped name.
+func restoreCfgNamed(client llm.LLM, model, system string, agent identity.AgentName) loop.Config {
+	c := restoreCfg(client, model, system)
+	c.AgentName = agent
+	return c
+}
+
 // --- original-run builders ---------------------------------------------------------
 
 // persistedStream is the durable record of an ORIGINAL session run plus the facts the
@@ -194,11 +202,20 @@ type persistedStream struct {
 	committedTurn event.TurnIndex
 }
 
-// newOriginalHub wires a journal-backed hub for an original run (the durable-tap
-// wiring): a real SessionJournal over a freshly-acquired lease, a JournalEventAppender
-// as the hub's required durable tap, and a deterministic Factory. It returns the hub,
-// the session/loop ids, the held lease, and the stamper used for direct publishes.
+// newOriginalHub wires a journal-backed hub for an original run with an UNNAMED root
+// loop (the common case). It is newOriginalHubNamed with an empty AgentName.
 func newOriginalHub(t *testing.T, js nats.JetStreamContext, fp event.ConfigFingerprint) (*hub.Hub, uuid.UUID, uuid.UUID, journal.Lease, *eventStamper) {
+	t.Helper()
+	return newOriginalHubNamed(t, js, fp, "")
+}
+
+// newOriginalHubNamed wires a journal-backed hub for an original run (the durable-tap
+// wiring): a real SessionJournal over a freshly-acquired lease, a JournalEventAppender as
+// the hub's required durable tap, and a deterministic Factory. It stamps the root
+// LoopStarted with agentName — exactly what NewLoop does from cfg.AgentName on a fresh run
+// — so a restore can validate the persisted root name. It returns the hub, the session/loop
+// ids, the held lease, and the stamper used for direct publishes.
+func newOriginalHubNamed(t *testing.T, js nats.JetStreamContext, fp event.ConfigFingerprint, agentName identity.AgentName) (*hub.Hub, uuid.UUID, uuid.UUID, journal.Lease, *eventStamper) {
 	t.Helper()
 	sessionID := mustSessionID(t)
 	primaryLoopID := mustSessionID(t)
@@ -219,18 +236,28 @@ func newOriginalHub(t *testing.T, js nats.JetStreamContext, fp event.ConfigFinge
 		Config: fp,
 	})
 	es.stamp(t, ctx, h, event.LoopStarted{
-		Header: event.Header{Coordinates: identity.Coordinates{SessionID: sessionID, LoopID: primaryLoopID}},
+		Header: event.Header{
+			Coordinates: identity.Coordinates{SessionID: sessionID, LoopID: primaryLoopID},
+			AgentName:   agentName,
+		},
 	})
 	return h, sessionID, primaryLoopID, lease, es
 }
 
-// buildOriginalRun drives `turns` COMPLETE turns through a REAL loop whose events persist
-// via the journal-backed hub, then snapshots the committed state and stops the loop. The
-// lease is left held for the caller to release (handover). This is the faithful
-// "drive a few turns" path.
+// buildOriginalRun drives `turns` complete turns through a REAL loop with an UNNAMED root
+// loop (the common case). It is buildOriginalRunNamed with an empty AgentName.
 func buildOriginalRun(t *testing.T, js nats.JetStreamContext, fp event.ConfigFingerprint, cfg loop.Config, turns int) persistedStream {
 	t.Helper()
-	h, sessionID, primaryLoopID, lease, _ := newOriginalHub(t, js, fp)
+	return buildOriginalRunNamed(t, js, fp, "", cfg, turns)
+}
+
+// buildOriginalRunNamed drives `turns` COMPLETE turns through a REAL loop whose events
+// persist via the journal-backed hub, stamping the root loop with agentName, then snapshots
+// the committed state and stops the loop. The lease is left held for the caller to release
+// (handover). This is the faithful "drive a few turns" path.
+func buildOriginalRunNamed(t *testing.T, js nats.JetStreamContext, fp event.ConfigFingerprint, agentName identity.AgentName, cfg loop.Config, turns int) persistedStream {
+	t.Helper()
+	h, sessionID, primaryLoopID, lease, _ := newOriginalHubNamed(t, js, fp, agentName)
 
 	// Subscribe so we can drain each turn to its terminal deterministically.
 	sub, err := h.SubscribeEvents(event.EventFilter{Enduring: event.LoopScope{All: true}})
@@ -627,6 +654,78 @@ func TestRestoreConfigMismatch(t *testing.T) {
 	t.Cleanup(func() { _ = s.Shutdown(context.Background()) })
 	if s.SessionID != orig.sessionID {
 		t.Errorf("override restore SessionID = %v, want %v", s.SessionID, orig.sessionID)
+	}
+}
+
+// TestRestoreAgentNameMismatch proves the fail-secure root-loop AgentName check end to end:
+// the persisted root LoopStarted's stamped name must match the configured primary's
+// AgentName. A different name — AND an empty (legacy/pre-AgentName) persisted name vs a
+// configured one — rejects with *AgentNameMismatchError and records a RestoreErrored (no
+// session comes up), unless WithAllowConfigMismatch. A matching name restores cleanly.
+func TestRestoreAgentNameMismatch(t *testing.T) {
+	tests := []struct {
+		name            string
+		persistedAgent  identity.AgentName
+		configuredAgent identity.AgentName
+		wantMismatch    bool
+	}{
+		{name: "different name rejects", persistedAgent: "operator", configuredAgent: "reviewer", wantMismatch: true},
+		{name: "empty legacy persisted vs configured rejects (not silently accepted)", persistedAgent: "", configuredAgent: "operator", wantMismatch: true},
+		{name: "matching name restores cleanly", persistedAgent: "operator", configuredAgent: "operator", wantMismatch: false},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			js := newEmbeddedJS(t)
+			fp := FingerprintFrom(restoreCfg(&stubLLM{}, "model-x", "be helpful"))
+
+			orig := buildOriginalRunNamed(t, js, fp, tt.persistedAgent,
+				restoreCfgNamed(&stubLLM{chunks: []content.Chunk{textChunk("reply")}}, "model-x", "be helpful", tt.persistedAgent), 1)
+			handOver(t, orig.lease)
+
+			objStore := mustObjectStore(t, js, orig.sessionID)
+
+			cfg := restoreCfgNamed(&stubLLM{}, "model-x", "be helpful", tt.configuredAgent)
+			s, err := Restore(context.Background(), cfg, orig.sessionID, js, objStore, mustLeaseManager(t, js))
+
+			if !tt.wantMismatch {
+				// Matching name (model/system/tools unchanged): the session comes up.
+				if err != nil {
+					t.Fatalf("Restore (matching agent name) err = %v, want success", err)
+				}
+				t.Cleanup(func() { _ = s.Shutdown(context.Background()) })
+				if s.SessionID != orig.sessionID {
+					t.Errorf("restored SessionID = %v, want %v", s.SessionID, orig.sessionID)
+				}
+				return
+			}
+
+			// Mismatch rejects with the typed error; no session comes up.
+			if s != nil {
+				t.Fatalf("Restore returned a non-nil Session on an agent-name mismatch")
+			}
+			var ame *AgentNameMismatchError
+			if !errors.As(err, &ame) {
+				t.Fatalf("Restore err = %v, want *AgentNameMismatchError", err)
+			}
+			if ame.Persisted != tt.persistedAgent || ame.Configured != tt.configuredAgent {
+				t.Errorf("AgentNameMismatchError carried persisted=%q configured=%q, want %q / %q",
+					ame.Persisted, ame.Configured, tt.persistedAgent, tt.configuredAgent)
+			}
+
+			// A RestoreErrored is recorded (no RestoreDone followed) — fail-secure.
+			tail := restoreEventTail(t, js, orig.sessionID, orig.primaryLoopID)
+			if !lastIs(tail, event.RestoreErrored{}) {
+				t.Errorf("restore-event tail does not end with RestoreErrored: %v", tailTypes(tail))
+			}
+
+			// The override proceeds despite the mismatch (the rejected attempt released its lease).
+			s2, err := Restore(context.Background(), cfg, orig.sessionID, js, objStore, mustLeaseManager(t, js), WithAllowConfigMismatch())
+			if err != nil {
+				t.Fatalf("Restore with WithAllowConfigMismatch (agent name) err = %v, want success", err)
+			}
+			t.Cleanup(func() { _ = s2.Shutdown(context.Background()) })
+		})
 	}
 }
 

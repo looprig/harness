@@ -1,6 +1,8 @@
 package session
 
 import (
+	"strconv"
+
 	"github.com/inventivepotter/urvi/internal/agent/loop/event"
 	"github.com/inventivepotter/urvi/internal/agent/loop/identity"
 	"github.com/inventivepotter/urvi/internal/content"
@@ -24,6 +26,27 @@ func (e *ConfigMismatchError) Error() string {
 	return "session: restore config mismatch: persisted model=" + e.Persisted.ModelID +
 		" != live model=" + e.Live.ModelID +
 		" (system/tool digests may also differ); pass WithAllowConfigMismatch to override"
+}
+
+// AgentNameMismatchError is the fail-secure rejection a restore returns when the root
+// loop's stamped AgentName (from its LoopStarted) does not match the AgentName of the
+// live primary loop.Config. The AgentName is the loop's immutable attribution identity;
+// resuming a session under a different agent name — including resuming a pre-AgentName
+// record (empty Persisted) under a now-named config, which is treated as a mismatch, not
+// silently accepted — would silently re-attribute the conversation, so the restore
+// refuses by default. An operator who knowingly wants to proceed passes the same
+// WithAllowConfigMismatch override the fingerprint check honors. Persisted is the name
+// from the journal's root LoopStarted; Configured is the name on the config Restore was
+// called with.
+type AgentNameMismatchError struct {
+	Persisted  identity.AgentName
+	Configured identity.AgentName
+}
+
+func (e *AgentNameMismatchError) Error() string {
+	return "session: restore agent name mismatch: persisted=" + strconv.Quote(string(e.Persisted)) +
+		" != configured=" + strconv.Quote(string(e.Configured)) +
+		"; pass WithAllowConfigMismatch to override"
 }
 
 // RestoreDiscoveryErrorKind classifies a failure to extract a required fact from the
@@ -74,6 +97,23 @@ func checkFingerprint(persisted, live event.ConfigFingerprint, allowMismatch boo
 	return &ConfigMismatchError{Persisted: persisted, Live: live}
 }
 
+// checkAgentName is the restore root-loop AgentName decision: it returns nil when the
+// persisted (root LoopStarted) name and the configured (primary loop.Config) name are
+// equal, a typed *AgentNameMismatchError when they differ, and — when allowMismatch is
+// set — nil even on a difference (the operator's explicit opt-in, shared with the
+// fingerprint override). It is fail-secure by default and treats an EMPTY persisted name
+// vs a non-empty configured one as a mismatch: a legacy/pre-AgentName record is never
+// silently accepted as a match (plain string inequality covers this — "" != "operator").
+func checkAgentName(persisted, configured identity.AgentName, allowMismatch bool) error {
+	if persisted == configured {
+		return nil
+	}
+	if allowMismatch {
+		return nil
+	}
+	return &AgentNameMismatchError{Persisted: persisted, Configured: configured}
+}
+
 // firstConfigFingerprint extracts the persisted config fingerprint from the FIRST
 // SessionStarted in the replayed event slice (stream-sequence order). A stream with no
 // SessionStarted fails closed with a typed *RestoreDiscoveryError — there is nothing to
@@ -87,22 +127,23 @@ func firstConfigFingerprint(events []event.Event) (event.ConfigFingerprint, erro
 	return event.ConfigFingerprint{}, &RestoreDiscoveryError{Kind: RestoreNoSessionStarted}
 }
 
-// findPrimaryLoopID locates the session's primary (root) loop id: the LoopID of the
-// LoopStarted whose Cause.Coordinates is zero (a root loop has no spawning
-// loop/turn/step). The session's identity must stay stable across restore, so the
-// recovered loop comes up under THIS id. A stream with no root LoopStarted fails closed
+// findRootLoopStarted locates the session's root LoopStarted: the one whose
+// Cause.Coordinates is zero (a root loop has no spawning loop/turn/step). Restore reads
+// two facts off it — the primary loop's stable id (the recovered loop comes up under THIS
+// id, keeping session identity stable) and its immutable stamped AgentName — so the "what
+// is the root loop" rule lives in one place. A stream with no root LoopStarted fails closed
 // with a typed *RestoreDiscoveryError.
-func findPrimaryLoopID(events []event.Event) (uuid.UUID, error) {
+func findRootLoopStarted(events []event.Event) (event.LoopStarted, error) {
 	for _, ev := range events {
 		ls, ok := ev.(event.LoopStarted)
 		if !ok {
 			continue
 		}
 		if ls.Cause.Coordinates == (identity.Coordinates{}) {
-			return ls.LoopID, nil
+			return ls, nil
 		}
 	}
-	return uuid.UUID{}, &RestoreDiscoveryError{Kind: RestoreNoPrimaryLoop}
+	return event.LoopStarted{}, &RestoreDiscoveryError{Kind: RestoreNoPrimaryLoop}
 }
 
 // foldResult is the reconstruction of one loop's committed conversation from its

@@ -88,10 +88,63 @@ func loopStarted(loopID uuid.UUID, parent identity.Coordinates) event.LoopStarte
 	}}
 }
 
-// TestFindPrimaryLoopID covers locating the root loop: the single LoopStarted whose
-// Cause.Coordinates is zero. Absence, and only-non-root LoopStarteds, are typed
-// failures (a stream with no primary loop cannot be restored).
-func TestFindPrimaryLoopID(t *testing.T) {
+// loopStartedNamed builds a root (zero-parent) LoopStarted carrying an AgentName, used
+// to drive the root-loop AgentName validation.
+func loopStartedNamed(loopID uuid.UUID, name identity.AgentName) event.LoopStarted {
+	ls := loopStarted(loopID, identity.Coordinates{})
+	ls.Header.AgentName = name
+	return ls
+}
+
+// TestCheckAgentName covers the restore root-loop AgentName decision: a match always
+// proceeds; a mismatch rejects with a typed *AgentNameMismatchError UNLESS the
+// allow-mismatch override is set. Critically, an EMPTY persisted name vs a non-empty
+// configured name is a MISMATCH (a pre-AgentName/legacy record is not silently accepted
+// as a match) — it routes through the same allow path, fail-secure by default.
+func TestCheckAgentName(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		persisted  identity.AgentName
+		configured identity.AgentName
+		allow      bool
+		wantErr    bool
+	}{
+		{name: "identical names proceed", persisted: "operator", configured: "operator", allow: false, wantErr: false},
+		{name: "both empty (plain loop) proceed", persisted: "", configured: "", allow: false, wantErr: false},
+		{name: "different names reject by default", persisted: "operator", configured: "reviewer", allow: false, wantErr: true},
+		{name: "empty persisted vs configured rejects (legacy not silently accepted)", persisted: "", configured: "operator", allow: false, wantErr: true},
+		{name: "configured empty vs named persisted rejects", persisted: "operator", configured: "", allow: false, wantErr: true},
+		{name: "mismatch proceeds when override set", persisted: "operator", configured: "reviewer", allow: true, wantErr: false},
+		{name: "empty-vs-named proceeds when override set", persisted: "", configured: "operator", allow: true, wantErr: false},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			err := checkAgentName(tt.persisted, tt.configured, tt.allow)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("checkAgentName() err = %v, wantErr %v", err, tt.wantErr)
+			}
+			if tt.wantErr {
+				var ame *AgentNameMismatchError
+				if !errors.As(err, &ame) {
+					t.Fatalf("err = %v, want *AgentNameMismatchError", err)
+				}
+				if ame.Persisted != tt.persisted || ame.Configured != tt.configured {
+					t.Errorf("AgentNameMismatchError carried persisted=%q configured=%q, want %q / %q",
+						ame.Persisted, ame.Configured, tt.persisted, tt.configured)
+				}
+			}
+		})
+	}
+}
+
+// TestFindRootLoopStarted covers locating the root LoopStarted (the one whose
+// Cause.Coordinates is zero) so restore can read both its LoopID and its stamped
+// AgentName. Absence (no root LoopStarted) is a typed *RestoreDiscoveryError.
+func TestFindRootLoopStarted(t *testing.T) {
 	t.Parallel()
 
 	primary := uuid.UUID{0x01}
@@ -99,40 +152,32 @@ func TestFindPrimaryLoopID(t *testing.T) {
 	parentCoords := identity.Coordinates{LoopID: primary, TurnID: uuid.UUID{0x09}}
 
 	tests := []struct {
-		name    string
-		events  []event.Event
-		want    uuid.UUID
-		wantErr bool
+		name      string
+		events    []event.Event
+		wantLoop  uuid.UUID
+		wantAgent identity.AgentName
+		wantErr   bool
 	}{
 		{
-			name: "single root loop",
-			events: []event.Event{
-				event.SessionStarted{},
-				loopStarted(primary, identity.Coordinates{}),
-			},
-			want: primary,
+			name:      "root loop with agent name",
+			events:    []event.Event{event.SessionStarted{}, loopStartedNamed(primary, "operator")},
+			wantLoop:  primary,
+			wantAgent: "operator",
 		},
 		{
-			name: "root among subagent loops returns the root",
-			events: []event.Event{
-				loopStarted(primary, identity.Coordinates{}),
-				loopStarted(sub, parentCoords),
-			},
-			want: primary,
+			name:     "root loop with empty agent name",
+			events:   []event.Event{loopStarted(primary, identity.Coordinates{})},
+			wantLoop: primary,
 		},
 		{
-			name: "no LoopStarted at all is an error",
-			events: []event.Event{
-				event.SessionStarted{},
-				event.TurnStarted{},
-			},
-			wantErr: true,
+			name:      "root among subagent loops returns the root",
+			events:    []event.Event{loopStartedNamed(primary, "operator"), loopStarted(sub, parentCoords)},
+			wantLoop:  primary,
+			wantAgent: "operator",
 		},
 		{
-			name: "only a non-root LoopStarted is an error",
-			events: []event.Event{
-				loopStarted(sub, parentCoords),
-			},
+			name:    "no root LoopStarted is an error",
+			events:  []event.Event{loopStarted(sub, parentCoords)},
 			wantErr: true,
 		},
 		{
@@ -145,18 +190,22 @@ func TestFindPrimaryLoopID(t *testing.T) {
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			got, err := findPrimaryLoopID(tt.events)
+			got, err := findRootLoopStarted(tt.events)
 			if (err != nil) != tt.wantErr {
-				t.Fatalf("findPrimaryLoopID() err = %v, wantErr %v", err, tt.wantErr)
-			}
-			if !tt.wantErr && got != tt.want {
-				t.Errorf("findPrimaryLoopID() = %v, want %v", got, tt.want)
+				t.Fatalf("findRootLoopStarted() err = %v, wantErr %v", err, tt.wantErr)
 			}
 			if tt.wantErr {
 				var rde *RestoreDiscoveryError
 				if !errors.As(err, &rde) {
 					t.Errorf("err = %v, want *RestoreDiscoveryError", err)
 				}
+				return
+			}
+			if got.LoopID != tt.wantLoop {
+				t.Errorf("findRootLoopStarted().LoopID = %v, want %v", got.LoopID, tt.wantLoop)
+			}
+			if got.Header.AgentName != tt.wantAgent {
+				t.Errorf("findRootLoopStarted().AgentName = %q, want %q", got.Header.AgentName, tt.wantAgent)
 			}
 		})
 	}

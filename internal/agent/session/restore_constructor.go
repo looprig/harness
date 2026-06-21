@@ -185,10 +185,19 @@ func restoreSession(
 		return recordErrored(err)
 	}
 
-	primaryLoopID, err := findPrimaryLoopID(all)
+	// The root LoopStarted carries both the primary loop's stable id (restore reuses it)
+	// and its immutable stamped AgentName. Validate the stamped name against the live
+	// primary config's AgentName — an empty (legacy/pre-AgentName) stored name vs a
+	// configured one is a mismatch, not silently accepted — routing through the same
+	// WithAllowConfigMismatch opt-in the fingerprint check honors.
+	rootLoop, err := findRootLoopStarted(all)
 	if err != nil {
 		return recordErrored(err)
 	}
+	if err := checkAgentName(rootLoop.Header.AgentName, cfg.AgentName, allowMismatch); err != nil {
+		return recordErrored(err)
+	}
+	primaryLoopID := rootLoop.LoopID
 
 	// (3) RestoreStarted — the FIRST restore mutation (after the lease fence).
 	if err := appendRestoreEvent(ctx, j, factory, event.RestoreStarted{
