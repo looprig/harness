@@ -2,6 +2,7 @@ package session
 
 import (
 	"context"
+	"log/slog"
 	"sync"
 
 	"github.com/inventivepotter/urvi/internal/agent/loop"
@@ -603,6 +604,78 @@ func (s *Session) submitToLoop(ctx context.Context, loopID uuid.UUID, blocks []c
 	case <-l.Done:
 		return uuid.UUID{}, &SessionError{Kind: SessionLoopExited}
 	}
+}
+
+// RunSubagent creates an in-session sub-loop, runs one turn on it for the given
+// blocks (machine-originated), and returns the sub-loop's final assistant text. It
+// is the SOLE exported entry point of the subagent composition: it wires together
+// the unexported building blocks (NewLoop + SubscribeEvents + submitToLoop +
+// drainToFinalText + interruptLoopID) so the Subagent tool's injected capability
+// (a later task) has one method to call and the blocks stay package-private.
+//
+// cfg is the sub-loop's loop.Config — the CALLER builds a FRESH cfg per call (its
+// own ToolSet/PermissionChecker) so each sub-loop has independent approval state;
+// RunSubagent never reuses a shared ToolSet. parent is the spawning loop/turn/step
+// provenance (recorded on the sub-loop's registry entry and stamped on its
+// LoopStarted). The submit is stamped Agency=AgencyMachine — a subagent turn is a
+// machine action, never falsely attributed to a human.
+//
+// The sub-loop PERSISTS idle after the turn (loops are never deleted, design §8):
+// RunSubagent closes only the SUBSCRIPTION, never the loop. The ordering is
+// load-bearing: it subscribes (scoped to the new sub-loop) BEFORE submitting, so the
+// opening TurnStarted the drain correlates on cannot be missed — the hub has no
+// replay (design §4).
+//
+// Errors propagate from the first block that fails: NewLoop (e.g.
+// SessionClosing while shutting down, or id-gen failure), SubscribeEvents, the
+// submit, or the drain's typed §5 failures (*drainFailedError / *TurnRejectedError /
+// *drainInterruptedError / *drainLostError). ctx is the calling turn's context;
+// because submits carry no ctx, a ctx cancel cannot reach the sub-loop's turn — the
+// drain translates it into a single loop-targeted Interrupt (the closure below) and
+// drains to the resulting TurnInterrupted terminal.
+func (s *Session) RunSubagent(ctx context.Context, parent loop.Provenance, cfg loop.Config, blocks []content.Block) (string, error) {
+	// NewLoop publishes LoopStarted and fails SessionClosing if the session is
+	// shutting down; either way no sub-loop is left behind a returned error.
+	subLoopID, err := s.NewLoop(parent, cfg)
+	if err != nil {
+		return "", err
+	}
+
+	// Subscribe BEFORE submitting (design §4): the hub has no replay, so a
+	// subscription created after the submit could miss the opening TurnStarted and the
+	// drain would then block until ctx-cancel or subscription loss. The filter is
+	// scoped to JUST this sub-loop (Enduring carries StepDone + terminals the drain
+	// needs); Ephemeral is left empty so the sub-loop's token firehose never enters
+	// this subscription's egress buffer.
+	sub, err := s.SubscribeEvents(event.EventFilter{
+		Enduring: event.LoopScope{Loops: map[uuid.UUID]struct{}{subLoopID: {}}},
+	})
+	if err != nil {
+		return "", err
+	}
+	// Close the SUBSCRIPTION (not the sub-loop — it persists idle, design §8).
+	// EventSubscription.Close is documented to always return nil (idempotent,
+	// records no error), so there is nothing to handle; this mirrors every other
+	// sub.Close() call site in the package.
+	defer func() { _ = sub.Close() }()
+
+	// Machine-originated submit: a subagent turn is our code's action, so it stamps
+	// AgencyMachine (the submitToLoop core, not the human-only Submit).
+	cmdID, err := s.submitToLoop(ctx, subLoopID, blocks, identity.AgencyMachine)
+	if err != nil {
+		return "", err
+	}
+
+	// Drain to the sub-loop's terminal. The interrupt closure is the drain's
+	// ctx-cancel fail-safe: it is loop-targeted to THIS sub-loop. interruptLoopID only
+	// errors SessionLoopNotFound, which is impossible for a sub-loop we just created
+	// and never delete; so a non-nil error here is best-effort-logged (never swallowed
+	// with _) rather than failing the drain.
+	return drainToFinalText(ctx, sub, cmdID, func() {
+		if ierr := s.interruptLoopID(subLoopID); ierr != nil {
+			slog.WarnContext(ctx, "subagent interrupt failed", "loop", subLoopID, "err", ierr)
+		}
+	})
 }
 
 // interruptTarget pairs a loop with the Ack channel of the command.Interrupt the
