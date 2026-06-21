@@ -443,7 +443,10 @@ func runLoop(cfg loopConfig, state loopState) {
 		if stamped.Class() == event.Enduring {
 			h, err := cfg.eventFactory.Stamp(stamped.EventHeader())
 			if err != nil {
-				// TODO(Phase 7): escalate to SessionPersistenceFault.
+				// A crypto/rand mint failure is catastrophic and astronomically rare; drop
+				// this Enduring event fail-secure (never publish a zero-EventID record). The
+				// hub raises SessionPersistenceFault for durable-append failures; a loop-side
+				// fault for this mint edge is a deferred refinement, not a Phase-7 gap.
 				slog.Error("event id mint failed; dropping Enduring loop event (fail-secure)",
 					"event", fmt.Sprintf("%T", stamped), "error", err)
 				return

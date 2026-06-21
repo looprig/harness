@@ -82,9 +82,9 @@ func (e *AppendError) Unwrap() error { return e.Cause }
 // here. It carries the contested sequence, the id we expected (ours), and the id we
 // found (the intruder's) so a caller can audit exactly which record collided.
 //
-// TODO(Phase 7): the hub maps this to a SessionPersistenceFault (reject new commands /
-// NewLoop, wake WaitIdle waiters). The journal layer must not reference hub types; it
-// surfaces this typed error and lets the composition root translate it.
+// The hub maps this to a SessionPersistenceFault (reject new commands / NewLoop, wake
+// WaitIdle waiters). The journal layer must not reference hub types; it surfaces this
+// typed error and the hub/composition root translates it.
 type FenceViolationError struct {
 	Subject   string
 	Sequence  uint64 // the contested stream sequence (the expected N+1)
@@ -408,9 +408,9 @@ func streamConfig(sessionID uuid.UUID) *nats.StreamConfig {
 		// message or pointer always fits well under this; a stray oversized inline
 		// publish is rejected by the server rather than silently truncated/accepted.
 		MaxMsgSize: streamInlineCeiling,
-		// TODO(Phase 10): set the embedded server's SyncInterval (power-loss durability
-		// knob, design round 5) at composition root — it is a server/FileStore option set
-		// when the embedded server is created in cmd/cli, not a StreamConfig field.
+		// The SyncInterval power-loss durability knob (design round 5) is a server/FileStore
+		// option, not a StreamConfig field — it is set on the embedded server at the
+		// composition root (internal/persistence/embedded.go).
 	}
 }
 
