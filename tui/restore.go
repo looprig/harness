@@ -69,6 +69,26 @@ func restoreBacklogCmd(ctx context.Context, agent Agent, primaryLoopID uuid.UUID
 	}
 }
 
+// handleRestored applies the background fold's result ONCE (Task 10.2 cold-restore
+// handoff). On a non-nil err it commits a faint, NON-FATAL restore-error notice (the
+// live stream is unaffected; history simply did not repaint) and flushes it. On success
+// it INSTALLS the rebuilt transcript + interaction wholesale (the state arrived
+// pre-folded — no per-event work here) and flushes the committed backlog to scrollback
+// ONCE via the print-once engine. A new session's empty transcript installs nothing and
+// flush is a no-op, so a fresh session behaves exactly as today (no repaint). The live
+// Subscribe path is attached separately (handleSubscribed) and, since cold restore comes
+// up idle, live events only follow a user Submit — so there is no backlog/live overlap
+// and no dedup is needed.
+func (m *Screen) handleRestored(msg restoredMsg) tea.Cmd {
+	if msg.err != nil {
+		m.transcript = m.transcript.CommitError(msg.err)
+		return m.flush()
+	}
+	m.transcript = msg.transcript
+	m.interaction = msg.interaction
+	return m.flush()
+}
+
 // compile-time guard: a restoredMsg is a tea.Msg (any value satisfies tea.Msg, but the
 // assignment documents intent and fails loudly if the alias ever narrows).
 var _ tea.Msg = restoredMsg{}

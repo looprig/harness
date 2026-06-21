@@ -93,9 +93,9 @@ func TestReplayBacklogSeam(t *testing.T) {
 // TestRestoreBacklogFoldsOffLoopOnce is the headline no-UI-hang property: a LARGE
 // backlog folds inside the background tea.Cmd (off the update loop) and yields EXACTLY
 // ONE restoredMsg — the reducers are applied per-event INSIDE the command, never via N
-// per-event update-loop messages. The Screen's update loop is driven O(1) times (once
-// with the single restoredMsg), not O(N) in backlog size, so a 5–10k-event backlog
-// cannot hang the UI by flooding it with per-event messages.
+// per-event update-loop messages. The Screen's Update is driven O(1) times (once with
+// the single restoredMsg), not O(N) in backlog size, so a 5–10k-event backlog cannot
+// hang the UI by flooding it with per-event messages.
 func TestRestoreBacklogFoldsOffLoopOnce(t *testing.T) {
 	t.Parallel()
 
@@ -128,18 +128,29 @@ func TestRestoreBacklogFoldsOffLoopOnce(t *testing.T) {
 	}
 
 	// Folding the same backlog directly through the reducers must equal the command's
-	// result: the command folded every event itself, off-loop, into the final state.
+	// result: the command folded every event itself, off-loop.
 	wantTr, _ := foldBacklog(primary, backlog)
 	if got, want := len(msg.transcript.committed), len(wantTr.committed); got != want {
 		t.Fatalf("folded committed = %d, want %d (the command must fold the WHOLE backlog off-loop)", got, want)
 	}
+
+	// Applying the single restoredMsg drives the update loop ONCE. It must NOT re-fold
+	// per event: the committed count after the single Update equals the pre-folded count,
+	// proving the reducers ran inside the command, not N times on the loop.
+	m := New(context.Background(), agent, fakeOpen(agent), AgentBanner{})
+	m, _ = updateScreen(t, m, tea.WindowSizeMsg{Width: 80, Height: 24})
+	before := len(m.transcript.committed)
+	m, _ = updateScreen(t, m, msg)
+	if got := len(m.transcript.committed) - before; got != len(wantTr.committed) {
+		t.Errorf("committed installed by ONE restoredMsg = %d, want %d (state must arrive pre-folded, applied once)", got, len(wantTr.committed))
+	}
 }
 
-// TestRestoreBacklogFoldCorrectness covers the repaint-correctness property at the fold:
-// a backlog of TurnStarted + StepDone (+ TurnFoldedInto) folds into the EXACT committed
-// transcript you get by feeding those same events through ApplyEvent directly, and a
-// pending gate in the backlog is reflected in the rebuilt interaction model.
-func TestRestoreBacklogFoldCorrectness(t *testing.T) {
+// TestRestoredMsgRepaintCorrectness covers the repaint-correctness property: a backlog
+// of TurnStarted + StepDone (+ TurnFoldedInto) folds into the EXACT committed transcript
+// you get by feeding those same events through ApplyEvent directly, and a pending gate
+// in the backlog is reflected in the rebuilt interaction model.
+func TestRestoredMsgRepaintCorrectness(t *testing.T) {
 	t.Parallel()
 
 	primary := callID(0xAA)
@@ -188,50 +199,156 @@ func TestRestoreBacklogFoldCorrectness(t *testing.T) {
 	}
 }
 
-// TestRestoreBacklogReadError covers the restore-read failure fold: a backlog read
-// failure yields a restoredMsg carrying a typed *RestoreBacklogError that unwraps to the
-// underlying cause, and an empty transcript (nothing to repaint).
-func TestRestoreBacklogReadError(t *testing.T) {
+// TestRestoredMsgFlushesScrollbackOnce covers the cold-restore handoff repaint (10.2):
+// applying a restoredMsg installs the rebuilt transcript/interaction and flushes the
+// committed transcript to scrollback ONCE (a single non-nil print command), then leaves
+// the Screen ready for the live Subscribe path.
+func TestRestoredMsgFlushesScrollbackOnce(t *testing.T) {
 	t.Parallel()
 
 	primary := callID(0xAA)
-	cause := errors.New("replay read")
-	agent := &fakeAgent{primaryLoopID: primary, replayErr: cause}
+	hdr := event.Header{Coordinates: identity.Coordinates{LoopID: primary}}
+	backlog := []event.Event{
+		event.TurnStarted{
+			Header:  hdr,
+			Message: &content.UserMessage{Message: content.Message{Role: content.RoleUser, Blocks: []content.Block{&content.TextBlock{Text: "q"}}}},
+		},
+		event.StepDone{Header: hdr, Messages: content.AgenticMessages{aiMessage("", "a")}},
+	}
+	agent := &fakeAgent{primaryLoopID: primary, backlog: backlog}
+
+	m := New(context.Background(), agent, fakeOpen(agent), AgentBanner{})
+	m, _ = updateScreen(t, m, tea.WindowSizeMsg{Width: 80, Height: 24})
 
 	msg := runRestoreCmd(t, restoreBacklogCmd(context.Background(), agent, primary))
-	if msg.err == nil {
-		t.Fatal("restoredMsg err = nil on a read failure, want a typed *RestoreBacklogError")
+	m, cmd := updateScreen(t, m, msg)
+
+	// The rebuilt transcript is installed.
+	wantTr, _ := foldBacklog(primary, backlog)
+	if got, want := len(m.transcript.committed), len(wantTr.committed); got != want {
+		t.Fatalf("installed committed = %d, want %d", got, want)
 	}
-	var be *RestoreBacklogError
-	if !errors.As(msg.err, &be) {
-		t.Fatalf("err = %T, want *RestoreBacklogError", msg.err)
+	// Exactly one repaint: a single non-nil flush command for the committed backlog.
+	if cmd == nil {
+		t.Fatal("restoredMsg cmd = nil, want a single flush command repainting the backlog")
 	}
-	if !errors.Is(msg.err, cause) {
-		t.Errorf("err does not unwrap to the underlying cause %v", cause)
+	// A SECOND apply of the same already-installed state is a no-op (print-once): the
+	// flush engine must not reprint entries it already committed to scrollback.
+	m2, cmd2 := updateScreen(t, m, msg)
+	if cmd2 != nil {
+		t.Error("re-applying restoredMsg reprinted scrollback; the print-once engine must flush each entry exactly once")
 	}
-	if len(msg.transcript.committed) != 0 {
-		t.Errorf("committed = %d on read error, want 0", len(msg.transcript.committed))
+	if len(m2.transcript.committed) != len(wantTr.committed) {
+		// installing the same pre-folded transcript twice is idempotent (it overwrites)
+		t.Errorf("second apply committed = %d, want %d (install is idempotent)", len(m2.transcript.committed), len(wantTr.committed))
 	}
 }
 
-// TestRestoreBacklogNewSessionEmptyFold covers the new-session case at the fold: an empty
-// backlog folds to an empty transcript with no pending gates — the Screen will install
-// this as a no-op, so a new session behaves exactly as today (no repaint).
-func TestRestoreBacklogNewSessionEmptyFold(t *testing.T) {
+// TestRestoredMsgHandoffToLiveSubscribe covers the handoff (10.2): after a restoredMsg
+// repaints the backlog, the live Subscribe path is attached (subscribedMsg installs the
+// stream) and a subsequently-delivered live event updates the transcript NORMALLY,
+// continuing from the repainted state — no backlog/live overlap, no dedup needed.
+func TestRestoredMsgHandoffToLiveSubscribe(t *testing.T) {
+	t.Parallel()
+
+	primary := callID(0xAA)
+	hdr := event.Header{Coordinates: identity.Coordinates{LoopID: primary}}
+	backlog := []event.Event{
+		event.TurnStarted{
+			Header:  hdr,
+			Message: &content.UserMessage{Message: content.Message{Role: content.RoleUser, Blocks: []content.Block{&content.TextBlock{Text: "history q"}}}},
+		},
+		event.StepDone{Header: hdr, Messages: content.AgenticMessages{aiMessage("", "history a")}},
+	}
+	sub := newFakeSubscription()
+	agent := &fakeAgent{primaryLoopID: primary, backlog: backlog, subStream: sub}
+
+	m := New(context.Background(), agent, fakeOpen(agent), AgentBanner{})
+	m, _ = updateScreen(t, m, tea.WindowSizeMsg{Width: 80, Height: 24})
+
+	// Repaint the cold backlog.
+	msg := runRestoreCmd(t, restoreBacklogCmd(context.Background(), agent, primary))
+	m, _ = updateScreen(t, m, msg)
+	repaintCount := len(m.transcript.committed)
+	if repaintCount == 0 {
+		t.Fatal("backlog did not repaint any committed entries")
+	}
+
+	// Attach the live subscription (the existing Subscribe path), exactly as the runtime
+	// would after restore.
+	m, _ = updateScreen(t, m, subscribedMsg{sub: sub})
+	if m.sub == nil {
+		t.Fatal("live subscription not installed after restore handoff")
+	}
+
+	// A live turn arrives AFTER restore and continues from the repainted state: a new
+	// user turn commits ON TOP of the restored history.
+	m = feed(t, m, event.TurnStarted{
+		Header:  hdr,
+		Message: &content.UserMessage{Message: content.Message{Role: content.RoleUser, Blocks: []content.Block{&content.TextBlock{Text: "live q"}}}},
+	})
+	if got := len(m.transcript.committed); got != repaintCount+1 {
+		t.Errorf("committed after live turn = %d, want %d (live event must extend the repainted transcript)", got, repaintCount+1)
+	}
+	if last := lastCommitted(t, m); committedText(last) != "live q" {
+		t.Errorf("last committed = %q, want %q (live continues from repainted state)", committedText(last), "live q")
+	}
+}
+
+// TestRestoredMsgError covers the restore-read failure path: a backlog read failure
+// surfaces a faint, non-fatal error notice (the user learns the restore could not
+// repaint history) WITHOUT installing any committed entries.
+func TestRestoredMsgError(t *testing.T) {
+	t.Parallel()
+
+	primary := callID(0xAA)
+	agent := &fakeAgent{primaryLoopID: primary, replayErr: errors.New("replay read")}
+
+	m := New(context.Background(), agent, fakeOpen(agent), AgentBanner{})
+	m, _ = updateScreen(t, m, tea.WindowSizeMsg{Width: 80, Height: 24})
+
+	msg := runRestoreCmd(t, restoreBacklogCmd(context.Background(), agent, primary))
+	if msg.err == nil {
+		t.Fatal("restoredMsg err = nil on a read failure, want the typed error")
+	}
+
+	m, cmd := updateScreen(t, m, msg)
+	if cmd == nil {
+		t.Error("restoredMsg error cmd = nil, want a flush of the error notice")
+	}
+	rec := lastCommitted(t, m)
+	if rec.Kind != kindNotice || rec.Level != noticeError {
+		t.Errorf("committed = (kind %d, level %d), want (kindNotice, noticeError)", rec.Kind, rec.Level)
+	}
+}
+
+// TestNewSessionNoRepaint covers the new-session case (empty backlog): the restore
+// command yields an empty restoredMsg, applying it commits NOTHING and prints NOTHING
+// — a new session behaves exactly as today (no repaint), so the existing screen tests
+// remain valid.
+func TestNewSessionNoRepaint(t *testing.T) {
 	t.Parallel()
 
 	primary := callID(0xAA)
 	agent := &fakeAgent{primaryLoopID: primary, backlog: nil}
+
+	m := New(context.Background(), agent, fakeOpen(agent), AgentBanner{})
+	m, _ = updateScreen(t, m, tea.WindowSizeMsg{Width: 80, Height: 24})
 
 	msg := runRestoreCmd(t, restoreBacklogCmd(context.Background(), agent, primary))
 	if msg.err != nil {
 		t.Fatalf("restoredMsg err = %v, want nil (empty backlog is not a failure)", msg.err)
 	}
 	if len(msg.transcript.committed) != 0 {
-		t.Errorf("empty-backlog fold committed = %d, want 0", len(msg.transcript.committed))
+		t.Fatalf("empty-backlog fold committed = %d, want 0", len(msg.transcript.committed))
 	}
-	if msg.interaction.PendingCount() != 0 {
-		t.Errorf("empty-backlog fold pending = %d, want 0", msg.interaction.PendingCount())
+
+	m, cmd := updateScreen(t, m, msg)
+	if cmd != nil {
+		t.Error("empty restoredMsg cmd = non-nil, want nil (a new session does not repaint)")
+	}
+	if len(m.transcript.committed) != 0 {
+		t.Errorf("committed = %d, want 0 (no repaint for a new session)", len(m.transcript.committed))
 	}
 }
 

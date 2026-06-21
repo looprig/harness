@@ -150,6 +150,8 @@ func (m Screen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.handleKey(msg)
 	case eventMsg:
 		return m, m.handleEvent(msg.ev)
+	case restoredMsg:
+		return m, m.handleRestored(msg)
 	case subscribedMsg:
 		return m, m.handleSubscribed(msg)
 	case subClosedMsg:
