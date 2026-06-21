@@ -27,6 +27,8 @@ const (
 	SessionContextDone            SessionErrorKind = "context_done"
 	SessionClosing                SessionErrorKind = "session_closing"
 	SessionFaulted                SessionErrorKind = "session_faulted"
+	SessionLoopDepthExceeded      SessionErrorKind = "loop_depth_exceeded"
+	SessionLoopQuotaExceeded      SessionErrorKind = "loop_quota_exceeded"
 )
 
 // SessionError is returned when a session method cannot complete.
@@ -55,6 +57,10 @@ func (e *SessionError) Error() string {
 		msg = "session: closing"
 	case SessionFaulted:
 		msg = "session: faulted (durable persistence failure)"
+	case SessionLoopDepthExceeded:
+		msg = "session: loop spawn depth limit exceeded"
+	case SessionLoopQuotaExceeded:
+		msg = "session: loop spawn quota exceeded"
 	default:
 		msg = "session: error"
 	}
