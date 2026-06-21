@@ -211,6 +211,72 @@ func TestFindRootLoopStarted(t *testing.T) {
 	}
 }
 
+// TestCountSpawnedLoops covers the restore-time spawn-counter re-seed: it counts the
+// NON-ROOT LoopStarted events (non-zero Header.Cause) and excludes the root (the primary),
+// so the restored quota matches the live one. It mirrors the live NewLoop counter, which
+// increments only on a successful subagent spawn.
+func TestCountSpawnedLoops(t *testing.T) {
+	t.Parallel()
+
+	primary := uuid.UUID{0x01}
+	subA := uuid.UUID{0x02}
+	subB := uuid.UUID{0x03}
+	subC := uuid.UUID{0x04}
+	parentPrimary := identity.Coordinates{LoopID: primary, TurnID: uuid.UUID{0x09}}
+	parentSubA := identity.Coordinates{LoopID: subA, TurnID: uuid.UUID{0x0A}}
+
+	tests := []struct {
+		name   string
+		events []event.Event
+		want   int
+	}{
+		{name: "empty stream counts zero", events: nil, want: 0},
+		{
+			name:   "root only (primary) counts zero",
+			events: []event.Event{event.SessionStarted{}, loopStarted(primary, identity.Coordinates{})},
+			want:   0,
+		},
+		{
+			name: "one subagent counts one",
+			events: []event.Event{
+				loopStarted(primary, identity.Coordinates{}),
+				loopStarted(subA, parentPrimary),
+			},
+			want: 1,
+		},
+		{
+			name: "chain of subagents counts each non-root",
+			events: []event.Event{
+				loopStarted(primary, identity.Coordinates{}),
+				loopStarted(subA, parentPrimary), // child of primary
+				loopStarted(subB, parentPrimary), // sibling
+				loopStarted(subC, parentSubA),    // child of subA (deeper)
+			},
+			want: 3,
+		},
+		{
+			name: "non-LoopStarted events are ignored",
+			events: []event.Event{
+				event.SessionStarted{},
+				loopStarted(primary, identity.Coordinates{}),
+				event.LoopIdle{},
+				loopStarted(subA, parentPrimary),
+				event.RestoreStarted{},
+			},
+			want: 1,
+		},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := countSpawnedLoops(tt.events); got != tt.want {
+				t.Errorf("countSpawnedLoops() = %d, want %d", got, tt.want)
+			}
+		})
+	}
+}
+
 // TestFirstSessionStarted covers extracting the persisted config fingerprint from
 // the stream's first SessionStarted. Absence is a typed discovery failure.
 func TestFirstSessionStarted(t *testing.T) {

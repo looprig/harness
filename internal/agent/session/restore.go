@@ -146,6 +146,33 @@ func findRootLoopStarted(events []event.Event) (event.LoopStarted, error) {
 	return event.LoopStarted{}, &RestoreDiscoveryError{Kind: RestoreNoPrimaryLoop}
 }
 
+// countSpawnedLoops counts the durable NON-ROOT LoopStarted events in the replayed
+// stream — those whose Header.Cause.Coordinates is non-zero (a subagent spawn carries the
+// spawning loop/turn/step in its Cause). It is the restore-time re-seed of the session's
+// cumulative spawn counter: the live counter increments only on a successful NewLoop spawn
+// (a rejected or rolled-back spawn emits NO LoopStarted, §6d), so counting the durable
+// non-root LoopStarted events reproduces exactly the live `spawned` value at crash time.
+// The ROOT LoopStarted (the primary, Cause zero) is excluded — the primary never counts
+// toward the quota — using the SAME root/non-root discriminator findRootLoopStarted and the
+// live NewLoop counter use, so the restored quota matches the live one and a restart cannot
+// grant a fresh budget.
+//
+// It scans the full-stream replay (the `all` slice restore already drains for discovery,
+// which spans EVERY loop's events — it is not loop-scoped), so no extra read is needed.
+func countSpawnedLoops(events []event.Event) int {
+	n := 0
+	for _, ev := range events {
+		ls, ok := ev.(event.LoopStarted)
+		if !ok {
+			continue
+		}
+		if ls.Cause.Coordinates != (identity.Coordinates{}) {
+			n++
+		}
+	}
+	return n
+}
+
 // foldResult is the reconstruction of one loop's committed conversation from its
 // ordered Enduring event sequence. It is what the Restore constructor (Task 8.3)
 // seeds a re-created loop with: the committed message history, the next live

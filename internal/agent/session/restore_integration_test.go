@@ -813,3 +813,112 @@ func TestRestoreComplexShapesRoundTrip(t *testing.T) {
 		t.Errorf("post-restore turnIndex = %d, want %d", idx2, orig.committedTurn+1)
 	}
 }
+
+// buildRunWithSubagents drives one complete primary turn AND stamps `subagents` durable
+// NON-ROOT LoopStarted events (each carrying a non-zero Header.Cause = a subagent spawn),
+// then snapshots and stops the loop. It models a crashed session that had spawned
+// `subagents` sub-loops over its lifetime — the durable record restore must recount to
+// re-seed the cumulative spawn quota. The lease is left held for the caller to release.
+func buildRunWithSubagents(t *testing.T, js nats.JetStreamContext, fp event.ConfigFingerprint, cfg loop.Config, subagents int) persistedStream {
+	t.Helper()
+	h, sessionID, primaryLoopID, lease, es := newOriginalHub(t, js, fp)
+
+	sub, err := h.SubscribeEvents(event.EventFilter{Enduring: event.LoopScope{All: true}})
+	if err != nil {
+		t.Fatalf("SubscribeEvents: %v", err)
+	}
+	defer func() { _ = sub.Close() }()
+
+	loopCtx, loopCancel := context.WithCancel(context.Background())
+	l, err := loop.New(loopCtx, sessionID, primaryLoopID, loop.Provenance{}, h, cfg)
+	if err != nil {
+		t.Fatalf("loop.New: %v", err)
+	}
+
+	// One complete primary turn so the stream is a realistic run.
+	l.Commands <- command.UserInput{Header: command.Header{CommandID: mustSessionID(t)}, Blocks: []content.Block{&content.TextBlock{Text: "turn input"}}}
+	drainSubToTerminal(t, sub)
+	want := content.AgenticMessages{foldUserMsg("turn input"), aiMessage("reply")}
+
+	// Stamp `subagents` NON-ROOT LoopStarted events directly through the journal-backed hub.
+	// Each carries a non-zero Cause (parent = the primary loop), exactly what NewLoop stamps
+	// on a real subagent spawn — so countSpawnedLoops counts them on restore.
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	for i := 0; i < subagents; i++ {
+		subLoopID := mustSessionID(t)
+		es.stamp(t, ctx, h, event.LoopStarted{Header: event.Header{
+			Coordinates: identity.Coordinates{SessionID: sessionID, LoopID: subLoopID},
+			Cause:       identity.Cause{Coordinates: identity.Coordinates{LoopID: primaryLoopID}, Agency: identity.AgencyMachine},
+		}})
+	}
+
+	snapCtx, snapCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer snapCancel()
+	msgs, idx, err := l.Snapshot(snapCtx)
+	if err != nil {
+		t.Fatalf("original Snapshot: %v", err)
+	}
+	if !reflect.DeepEqual(msgs, want) {
+		t.Fatalf("original committed msgs =\n  %#v\nwant\n  %#v", msgs, want)
+	}
+	loopCancel()
+	<-l.Done
+
+	return persistedStream{
+		sessionID:     sessionID,
+		primaryLoopID: primaryLoopID,
+		lease:         lease,
+		committedMsgs: msgs,
+		committedTurn: idx,
+	}
+}
+
+// TestRestoreRecountsSpawnQuota proves the quota SURVIVES restore: an original run that
+// spawned K subagents (K durable non-root LoopStarted events) restores with spawned == K,
+// so the restored session enforces the quota against the durable history — a restart never
+// grants a fresh budget. Concretely: with Quota == K+1, exactly ONE more spawn is allowed
+// post-restore and the next is refused with SessionLoopQuotaExceeded.
+func TestRestoreRecountsSpawnQuota(t *testing.T) {
+	const k = 3
+	js := newEmbeddedJS(t)
+	fp := FingerprintFrom(restoreCfg(&stubLLM{}, "model-x", "be helpful"))
+
+	orig := buildRunWithSubagents(t, js, fp,
+		restoreCfg(&stubLLM{chunks: []content.Chunk{textChunk("reply")}}, "model-x", "be helpful"), k)
+	handOver(t, orig.lease)
+
+	objStore := mustObjectStore(t, js, orig.sessionID)
+	leases := mustLeaseManager(t, js)
+
+	// Restore with Quota == k+1: the durable recount must set spawned == k, leaving room
+	// for exactly one more spawn.
+	s, err := Restore(context.Background(),
+		restoreCfg(&stubLLM{chunks: []content.Chunk{textChunk("after restore")}}, "model-x", "be helpful"),
+		orig.sessionID, js, objStore, leases,
+		WithLimits(Limits{Depth: 10, Quota: k + 1}))
+	if err != nil {
+		t.Fatalf("Restore: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Shutdown(context.Background()) })
+
+	// The counter was re-seeded from the durable non-root LoopStarted events.
+	s.loopsMu.RLock()
+	gotSpawned := s.spawned
+	s.loopsMu.RUnlock()
+	if gotSpawned != k {
+		t.Fatalf("restored spawned = %d, want %d (recounted from durable LoopStarted)", gotSpawned, k)
+	}
+
+	// Exactly one more spawn fits within Quota == k+1.
+	if _, err := s.NewLoop(loop.Provenance{LoopID: s.PrimaryLoopID()}, cfg(&stubLLM{chunks: []content.Chunk{textChunk("ok")}})); err != nil {
+		t.Fatalf("spawn within restored quota (k+1) err = %v, want success", err)
+	}
+
+	// The NEXT spawn exceeds Quota-k (== 1 post-restore) and is refused.
+	_, err = s.NewLoop(loop.Provenance{LoopID: s.PrimaryLoopID()}, cfg(&stubLLM{chunks: []content.Chunk{textChunk("over")}}))
+	var se *SessionError
+	if !errors.As(err, &se) || se.Kind != SessionLoopQuotaExceeded {
+		t.Fatalf("spawn past restored quota err = %v, want *SessionError{SessionLoopQuotaExceeded}", err)
+	}
+}

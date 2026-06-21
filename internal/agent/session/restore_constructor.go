@@ -199,6 +199,13 @@ func restoreSession(
 	}
 	primaryLoopID := rootLoop.LoopID
 
+	// Re-seed the cumulative spawn counter from the durable log so the quota SURVIVES the
+	// restart: count the non-root LoopStarted events (subagent spawns). `all` is the
+	// full-stream replay (every loop's events, not loop-scoped), so it already carries
+	// every subagent LoopStarted — no extra read. Without this, `spawned` would reset to 0
+	// and a restart would grant a fresh quota (a trivial cap bypass, design §16.3).
+	spawnedCount := countSpawnedLoops(all)
+
 	// (3) RestoreStarted — the FIRST restore mutation (after the lease fence).
 	if err := appendRestoreEvent(ctx, j, factory, event.RestoreStarted{
 		Header: event.Header{Coordinates: identity.Coordinates{SessionID: sessionID}},
@@ -249,7 +256,7 @@ func restoreSession(
 	// opts so the restore owns the lease lifecycle (a caller cannot accidentally override
 	// the releaser with a stale one).
 	leaseOpts := append(append([]Option(nil), opts...), WithLeaseRelease(lease.Release))
-	s, err := buildRestoredSession(ctx, cfg, sessionID, primaryLoopID, folded, j, factory, newID, now, leaseOpts...)
+	s, err := buildRestoredSession(ctx, cfg, sessionID, primaryLoopID, spawnedCount, folded, j, factory, newID, now, leaseOpts...)
 	if err != nil {
 		return recordErrored(err)
 	}
@@ -266,6 +273,7 @@ func buildRestoredSession(
 	ctx context.Context,
 	cfg loop.Config,
 	sessionID, primaryLoopID uuid.UUID,
+	spawnedCount int,
 	folded foldResult,
 	j journal.SessionJournal,
 	factory *event.Factory,
@@ -283,13 +291,21 @@ func buildRestoredSession(
 		now:           now,
 		cmdAppender:   nopCommandAppender{},
 		factory:       factory,
+		// Re-seed the cumulative spawn counter from the durable non-root LoopStarted count
+		// so the quota survives restart (§16.3). Set before the session is reachable, so no
+		// lock is needed yet; once up, NewLoop enforces the quota against this restored base.
+		spawned: spawnedCount,
 	}
 	// Apply the same opts the probe read (WithCommandAppender wires the durable intent
-	// log; WithAllowConfigMismatch is a no-op here — already consumed). A nil appender
-	// option leaves the nop default installed.
+	// log; WithAllowConfigMismatch is a no-op here — already consumed; WithLimits sets the
+	// spawn caps the restored session enforces against the re-seeded counter). A nil
+	// appender option leaves the nop default installed.
 	for _, opt := range opts {
 		opt(s)
 	}
+	// Resolve the spawn-cap defaults AFTER the options, mirroring newSession, so a restore
+	// (with or without WithLimits) has positive depth/quota caps from the first NewLoop.
+	s.limits = s.limits.withDefaults()
 
 	// The hub uses the journal-backed REQUIRED durable tap and the session as its
 	// FaultReporter (fail-secure on a required-append failure), sharing the Factory so a
