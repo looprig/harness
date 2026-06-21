@@ -2,11 +2,65 @@ package tui
 
 import (
 	"context"
+	"reflect"
 
 	tea "charm.land/bubbletea/v2"
 
+	"github.com/inventivepotter/urvi/internal/agent/loop/event"
 	"github.com/inventivepotter/urvi/internal/uuid"
 )
+
+// DisplayProjection is the committed TUI projection of a fold over the primary loop's
+// Enduring events — the "displayed" transcript the event-persistence design's headline
+// property compares (displayed == stored == restored). It bundles the two pure reducer
+// states (the scrollback transcript and the pending-gate interaction surface) so the
+// restore-repaint path and the persistence property tests build the displayed view
+// through one named seam. It is value-typed and immutable; FoldDisplay is its only
+// constructor.
+type DisplayProjection struct {
+	transcript  transcriptModel
+	interaction interactionModel
+}
+
+// FoldDisplay folds events through the SAME pure reducers the live path and the
+// cold-restore repaint use (transcript.ApplyEvent + interaction.ApplyEvent), starting
+// from the zero reducer state scoped to primaryLoopID, and returns the resulting
+// displayed projection. It is the single fold the TUI uses to turn a slice of Enduring
+// events into a repaintable transcript: restoreBacklogCmd folds the restored backlog
+// through it, and the persistence property tests fold both a restored ReplayBacklog and
+// the original live Enduring sequence through it to assert the two displayed views are
+// identical. The fold is order-sensitive and side-effect-free — folding the same events
+// twice yields an EqualTranscript pair.
+func FoldDisplay(events []event.Event, primaryLoopID uuid.UUID) DisplayProjection {
+	tr := transcriptModel{primaryLoopID: primaryLoopID}
+	in := newInteractionModel()
+	for _, ev := range events {
+		tr = tr.ApplyEvent(ev)
+		in = in.ApplyEvent(ev)
+	}
+	return DisplayProjection{transcript: tr, interaction: in}
+}
+
+// EqualTranscript reports whether p and other have the byte-for-byte identical
+// committed transcript (the displayed scrollback), via reflect.DeepEqual over the
+// transcript reducer state. It is the headline-property comparator: a restored
+// session's repainted transcript EqualTranscript the original session's live transcript
+// iff the repaint reproduced the displayed view exactly. The interaction surface (its
+// input editor carries cursor state and completion-panel closures that are not value-
+// comparable) is intentionally NOT part of this equality — assert PendingPrompts for
+// the pending-gate dimension instead.
+func (p DisplayProjection) EqualTranscript(other DisplayProjection) bool {
+	return reflect.DeepEqual(p.transcript, other.transcript)
+}
+
+// CommittedLen is the number of committed (finalized) transcript entries — the rows the
+// repaint flushes to scrollback.
+func (p DisplayProjection) CommittedLen() int { return len(p.transcript.committed) }
+
+// PendingPrompts is the number of pending prompts (permission gates + AskUser requests)
+// the projection's interaction surface holds — the gate dimension a transcript deep-
+// equal does not cover.
+func (p DisplayProjection) PendingPrompts() int { return p.interaction.PendingCount() }
 
 // RestoreBacklogError reports a failure to read a restored session's historical
 // Enduring backlog for repaint (the Agent.ReplayBacklog call failed). It is a
@@ -59,13 +113,8 @@ func restoreBacklogCmd(ctx context.Context, agent Agent, primaryLoopID uuid.UUID
 		if err != nil {
 			return restoredMsg{err: &RestoreBacklogError{Cause: err}}
 		}
-		tr := transcriptModel{primaryLoopID: primaryLoopID}
-		in := newInteractionModel()
-		for _, ev := range backlog {
-			tr = tr.ApplyEvent(ev)
-			in = in.ApplyEvent(ev)
-		}
-		return restoredMsg{transcript: tr, interaction: in}
+		proj := FoldDisplay(backlog, primaryLoopID)
+		return restoredMsg{transcript: proj.transcript, interaction: proj.interaction}
 	}
 }
 
