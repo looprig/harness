@@ -416,21 +416,33 @@ func (s *Session) deliverSubagentResult(ctx context.Context, parentLoopID, fromL
 // loop handle and returns only the loop id, because callers route through
 // session methods rather than writing to a loop command channel directly.
 func (s *Session) NewLoop(parent loop.Provenance, cfg loop.Config) (uuid.UUID, error) {
-	// Cheap early-out: if the session is already closing OR faulted, refuse before
-	// minting or building anything. This is an optimization only — the authoritative,
-	// race-free check is the one inside the registration critical section below
-	// (taken under the same loopsMu Shutdown/ReportFault use to set closing/faulted +
-	// snapshot the loops), which closes the window between this read and registration.
+	// Cheap early-out + the PURE depth check: read closing/faulted and walk the parent
+	// chain depth under one RLock. The closing/faulted reads are an optimization only —
+	// the authoritative, race-free check is the one inside the registration critical
+	// section below (taken under the same loopsMu Shutdown/ReportFault use to set
+	// closing/faulted + snapshot the loops), which closes the window between this read and
+	// registration. The DEPTH check, by contrast, is final here: depth is a function of
+	// the FIXED parent chain (already-registered ancestors that never change), so once it
+	// passes there is no later depth race to re-check — and rejecting before any ID mint
+	// or loop.New means a too-deep spawn creates nothing and publishes no LoopStarted.
 	s.loopsMu.RLock()
 	closing := s.closing
 	faulted := s.faulted
 	faultErr := s.faultErr
+	depth := s.depthUnderLock(parent.LoopID)
+	// Resolve defaults at the check so the caps are always positive even on a
+	// struct-literal Session that bypassed newSession/restore (test seams): a zero-limits
+	// session must behave with the production defaults, never reject every spawn.
+	depthLimit := s.limits.withDefaults().Depth
 	s.loopsMu.RUnlock()
 	if faulted {
 		return uuid.UUID{}, &SessionError{Kind: SessionFaulted, Cause: faultErr}
 	}
 	if closing {
 		return uuid.UUID{}, &SessionError{Kind: SessionClosing}
+	}
+	if depth >= depthLimit {
+		return uuid.UUID{}, &SessionError{Kind: SessionLoopDepthExceeded}
 	}
 
 	loopID, err := s.newID()
@@ -514,6 +526,33 @@ func (s *Session) NewLoop(parent loop.Provenance, cfg loop.Config) (uuid.UUID, e
 		return uuid.UUID{}, &SessionError{Kind: SessionContextDone, Cause: err}
 	}
 	return loopID, nil
+}
+
+// depthUnderLock returns the ancestor-chain length a NEW loop spawned under parentLoopID
+// would have: it walks parentLoopID up the registry's parent links (loopHandle.parent.LoopID)
+// and counts each registered ancestor. A zero parentLoopID (a root spawn — the primary,
+// built by New) has no ancestors and returns 0; a child of the primary returns 1, its child
+// 2, and so on. NewLoop rejects when this count >= limits.Depth, so the deepest spawnable
+// loop has an ancestor chain of limits.Depth-1.
+//
+// It is a PURE read over the FIXED parent chain (ancestors never change), so the caller's
+// depth decision needs no later re-check. The caller MUST hold loopsMu (the registry read
+// must be coherent); the cycle guard (capping the walk at len(s.loops)) is defensive — the
+// registry is a tree (each loop has at most one parent, set once at creation), so a cycle
+// is impossible, but an unbounded walk must never be possible from a corrupt registry.
+func (s *Session) depthUnderLock(parentLoopID uuid.UUID) int {
+	depth := 0
+	cur := parentLoopID
+	max := len(s.loops)
+	for !cur.IsZero() && depth <= max {
+		h, ok := s.loops[cur]
+		if !ok {
+			break
+		}
+		depth++
+		cur = h.parent.LoopID
+	}
+	return depth
 }
 
 // loopFor returns the loop's channel handle for command routing. The registry
