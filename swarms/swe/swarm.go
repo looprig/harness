@@ -26,6 +26,14 @@ const (
 	orchestratorSpawnQuota = 64
 )
 
+// orchestratorLimits is the single source of the orchestrator session's subagent-spawn
+// safety caps (depth + quota). Both the headless New path and the persisted Open path
+// build the session under these caps via session.WithLimits, so the cap is identical
+// however the session is opened (new, resumed, or reopened on /clear).
+func orchestratorLimits() session.Limits {
+	return session.Limits{Depth: orchestratorSpawnDepth, Quota: orchestratorSpawnQuota}
+}
+
 // orchestratorAutoApprovedTools is the orchestrator's hard-approve set in 4A:
 // EVERY tool it carries. The orchestrator only reads/searches the workspace, plans
 // (Todo), and asks the user (AskUser) — nothing it can do is side-effecting — so
@@ -106,8 +114,5 @@ func newWithClient(ctx context.Context, client llm.LLM, factory ModelFactory) (*
 	}
 
 	cfg := orchestratorConfig(client, factory, root)
-	return newSessionAgent(ctx, cfg, session.WithLimits(session.Limits{
-		Depth: orchestratorSpawnDepth,
-		Quota: orchestratorSpawnQuota,
-	}))
+	return newSessionAgent(ctx, cfg, session.WithLimits(orchestratorLimits()))
 }

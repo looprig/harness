@@ -2,13 +2,18 @@ package swe
 
 import (
 	"context"
+	"errors"
+	"io"
+	"sync"
 
 	"github.com/inventivepotter/urvi/internal/agent/loop"
 	"github.com/inventivepotter/urvi/internal/agent/loop/event"
 	"github.com/inventivepotter/urvi/internal/agent/session"
+	"github.com/inventivepotter/urvi/internal/agent/session/journal"
 	"github.com/inventivepotter/urvi/internal/content"
 	"github.com/inventivepotter/urvi/internal/tool"
 	"github.com/inventivepotter/urvi/internal/uuid"
+	"github.com/nats-io/nats.go"
 )
 
 // sessionAgent is a thin wrapper over a session.Session that exposes the tui.Agent
@@ -23,8 +28,27 @@ import (
 // agent-owned root cancel) and reporting the static AcceptsImages modality.
 type sessionAgent struct {
 	session       *session.Session
+	rootCtx       context.Context    // the agent-owned root the session runs under; persistence schedules GC under it
 	cancel        context.CancelFunc // cancels the session's root context; called by Close
 	acceptsImages bool               // captured from the primary spec at construction; reported by AcceptsImages
+
+	// teardown is the composition-root persistence teardown the persisted constructors
+	// install: it stops the GC ticker. It is nil for a non-persisted (headless / fake-only)
+	// agent, so Close is unchanged in that mode. Run AFTER session.Shutdown so the journal
+	// has finished its last append before teardown. The single-writer lease is released by
+	// the SESSION on Shutdown (the WithLeaseRelease hook for a new session, or the hook
+	// Restore installed), so teardown owns only the GC lifecycle. Idempotent (guarded by
+	// teardownOnce) so Close can safely be called more than once.
+	teardown     func(context.Context) error
+	teardownOnce sync.Once
+
+	// replayer is the journal-backed read side a RESTORED session's ReplayBacklog drains
+	// for the TUI's cold-restore repaint. It is nil for a NEW or headless session (no
+	// backlog to repaint → ReplayBacklog returns nil). restoredSessionID/
+	// restoredPrimaryLoopID scope the cold replay to the primary loop's session view.
+	replayer              journal.EventReplayer
+	restoredSessionID     uuid.UUID
+	restoredPrimaryLoopID uuid.UUID
 }
 
 // newSessionAgent constructs a sessionAgent from a finished primary loop.Config and
@@ -49,7 +73,47 @@ func newSessionAgent(ctx context.Context, primary loop.Config, opts ...session.O
 		cancel()
 		return nil, err
 	}
-	return &sessionAgent{session: sess, cancel: cancel, acceptsImages: primary.Model.AcceptsImages}, nil
+	return &sessionAgent{session: sess, rootCtx: rootCtx, cancel: cancel, acceptsImages: primary.Model.AcceptsImages}, nil
+}
+
+// newPersistentSessionAgent constructs a sessionAgent over a NEW persisted session: it is
+// the persisted counterpart to newSessionAgent (same agent-owned, background-derived root
+// + fail-fast on a cancelled caller ctx) that calls session.New with the composition
+// root's persistence options (the injected sessionID, event + command appenders, and the
+// lease-release hook) plus the spawn caps. It is the single place persistence.go turns a
+// finished primary cfg + persistence opts into the wrapper, so the new-vs-headless paths
+// cannot drift. The caller (persistence.go) installs the GC teardown after this returns.
+func newPersistentSessionAgent(ctx context.Context, primary loop.Config, opts ...session.Option) (*sessionAgent, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, &session.SessionError{Kind: session.SessionContextDone, Cause: err}
+	}
+	rootCtx, cancel := context.WithCancel(context.Background())
+	sess, err := session.New(rootCtx, primary, opts...)
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+	return &sessionAgent{session: sess, rootCtx: rootCtx, cancel: cancel, acceptsImages: primary.Model.AcceptsImages}, nil
+}
+
+// newRestoredSessionAgent constructs a sessionAgent over a RESTORED session via
+// session.Restore: it mirrors newSessionAgent's lifetime ownership (background-derived
+// root, fail-fast on a cancelled caller ctx, cancel-on-failure) but seeds the primary loop
+// from the durable log instead of minting a fresh one. Restore acquires + owns the
+// single-writer lease internally and installs its own lease-release-on-Shutdown hook. The
+// caller (persistence.go) wires the replayer + restored ids + GC teardown after this
+// returns so ReplayBacklog can repaint the restored transcript.
+func newRestoredSessionAgent(ctx context.Context, primary loop.Config, sessionID uuid.UUID, js nats.JetStreamContext, objects nats.ObjectStore, leases *journal.LeaseManager, opts ...session.Option) (*sessionAgent, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, &session.SessionError{Kind: session.SessionContextDone, Cause: err}
+	}
+	rootCtx, cancel := context.WithCancel(context.Background())
+	sess, err := session.Restore(rootCtx, primary, sessionID, js, objects, leases, opts...)
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+	return &sessionAgent{session: sess, rootCtx: rootCtx, cancel: cancel, acceptsImages: primary.Model.AcceptsImages}, nil
 }
 
 // Submit delivers a multimodal user message FIRE-AND-FORGET as a queueable
@@ -73,13 +137,45 @@ func (a *sessionAgent) Subscribe(filter event.EventFilter) (event.Subscription, 
 // EventFilter (primary-only Ephemeral + all-loop Enduring).
 func (a *sessionAgent) PrimaryLoopID() uuid.UUID { return a.session.PrimaryLoopID() }
 
-// ReplayBacklog returns nil/nil: a headless (non-persisted) session has no journal
-// to replay, so there is no cold-restore backlog to repaint — the TUI then behaves
-// exactly as a fresh session. A persisted variant (a later phase) would open the
-// journal replayer here, mirroring agents/coding's restored path.
+// ReplayBacklog returns the RESTORED session's historical Enduring events for the TUI's
+// cold-restore repaint, in session order. A NEW or headless session has no replayer wired
+// (a.replayer is nil), so this returns nil and the TUI skips the repaint — the
+// new/headless behavior is unchanged. A RESTORED session opens the primary loop's Enduring
+// view (session subject + that loop's event subject), drains the EventCursor to io.EOF into
+// a materialized slice, and surfaces the journal's typed fail-secure errors (a
+// missing/corrupt offload object) unchanged — the TUI shows a non-fatal restore-error
+// notice; the live stream is unaffected. ctx bounds the read.
 func (a *sessionAgent) ReplayBacklog(ctx context.Context) ([]event.Event, error) {
-	return nil, nil
+	if a.replayer == nil {
+		return nil, nil // not a restore (new/headless session) — nothing to repaint
+	}
+	cursor, err := a.replayer.Open(ctx, journal.ReplayRequest{
+		SessionID: a.restoredSessionID,
+		LoopID:    a.restoredPrimaryLoopID,
+		From:      journal.Beginning(),
+		Follow:    false, // cold restore: io.EOF at the backlog end
+	})
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = cursor.Close() }()
+
+	var out []event.Event
+	for {
+		ev, _, err := cursor.Next(ctx)
+		if errors.Is(err, io.EOF) {
+			return out, nil
+		}
+		if err != nil {
+			return nil, err // typed fail-secure error (object missing/corrupt) — surfaced unchanged
+		}
+		out = append(out, ev)
+	}
 }
+
+// SessionID returns the underlying session's id — the composition root reads it to print
+// the session being resumed and to key the catalog/lease. It is read-only identity.
+func (a *sessionAgent) SessionID() uuid.UUID { return a.session.SessionID }
 
 // Interrupt cancels the running turn. Returns true if a turn was cancelled.
 func (a *sessionAgent) Interrupt(ctx context.Context) (bool, error) {
@@ -116,8 +212,22 @@ func (a *sessionAgent) ProvideAnswer(ctx context.Context, loopID, callID uuid.UU
 // backstop so the actor goroutine cannot leak even if Shutdown timed out on ctx.
 // Cancelling the root also tears down every in-session sub-loop (they run under the
 // same session root). Safe to call more than once.
+//
+// For a PERSISTED agent it then runs the composition-root teardown ONCE (stopping the GC
+// ticker) — AFTER session.Shutdown so the journal has finished its last append before
+// teardown. The single-writer lease is released by the SESSION on Shutdown (the
+// WithLeaseRelease hook for a new session, or the hook Restore installed), so teardown
+// owns only the GC lifecycle. The teardown runs even when Shutdown returns an error. A
+// teardown error is joined onto the Shutdown error so neither is lost.
 func (a *sessionAgent) Close(ctx context.Context) error {
 	err := a.session.Shutdown(ctx)
 	a.cancel()
+	if a.teardown != nil {
+		a.teardownOnce.Do(func() {
+			if terr := a.teardown(ctx); terr != nil {
+				err = errors.Join(err, terr)
+			}
+		})
+	}
 	return err
 }
