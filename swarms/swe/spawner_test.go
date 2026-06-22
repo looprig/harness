@@ -59,7 +59,7 @@ func newTestSwarmSpawner(t *testing.T) (*swarmSpawner, *fakeRunner) {
 	if err != nil {
 		t.Fatalf("leafRegistry() error = %v", err)
 	}
-	sp := newSwarmSpawner(reg, deps, &fakeLLM{}, newModelFactory("test-key"), loader)
+	sp := newSwarmSpawner(reg, deps, &fakeLLM{}, newModelFactory("test-key"), loader, NewRuntimeContextProvider())
 	runner := &fakeRunner{reply: "subagent done"}
 	sp.session = runner // late-bind a fake, exactly where bind sets the live session
 	return sp, runner
@@ -155,6 +155,22 @@ func TestSpawnResolvesPermittedAgent(t *testing.T) {
 				t.Errorf("leaf %q toolset = %v, must NOT contain Subagent (a leaf cannot spawn)", tt.name, names)
 			}
 		})
+	}
+}
+
+// TestSpawnEnablesRuntimeContext proves a spawned leaf's fresh loop.Config carries the
+// spawner's RuntimeContextProvider, so every leaf agent (not just the orchestrator)
+// gets the volatile date/cwd/git tail injected each turn.
+func TestSpawnEnablesRuntimeContext(t *testing.T) {
+	t.Parallel()
+	parent := loop.Provenance{LoopID: mustUUID(t)}
+
+	sp, runner := newTestSwarmSpawner(t)
+	if _, err := sp.Spawn(context.Background(), parent, operator.Name, "do it"); err != nil {
+		t.Fatalf("Spawn error = %v", err)
+	}
+	if runner.gotCfg.RuntimeContext == nil {
+		t.Error("leaf cfg.RuntimeContext = nil, want the spawner's wired provider")
 	}
 }
 

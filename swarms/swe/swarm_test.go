@@ -24,7 +24,7 @@ func testWiring(t *testing.T) (*swarmSpawner, []tools.SubagentCatalogEntry) {
 	if err != nil {
 		t.Fatalf("leafRegistry() error = %v", err)
 	}
-	return newSwarmSpawner(reg, deps, &fakeLLM{}, newModelFactory("test-key"), loader), toolCatalog(reg)
+	return newSwarmSpawner(reg, deps, &fakeLLM{}, newModelFactory("test-key"), loader, NewRuntimeContextProvider()), toolCatalog(reg)
 }
 
 // TestNewWithClientHappy proves swe.New (via the fake-client seam) builds a usable
@@ -53,7 +53,7 @@ func TestOrchestratorConfigIsPrimaryWithIdentityAndRole(t *testing.T) {
 	t.Parallel()
 
 	spawner, catalog := testWiring(t)
-	cfg := orchestratorConfig(&fakeLLM{}, newModelFactory("test-key"), "/tmp/workspace-root", spawner, catalog)
+	cfg := orchestratorConfig(&fakeLLM{}, newModelFactory("test-key"), "/tmp/workspace-root", spawner, catalog, NewRuntimeContextProvider())
 
 	if cfg.AgentName != orchestrator.Name {
 		t.Errorf("cfg.AgentName = %q, want %q", cfg.AgentName, orchestrator.Name)
@@ -70,6 +70,47 @@ func TestOrchestratorConfigIsPrimaryWithIdentityAndRole(t *testing.T) {
 	}
 	if !strings.Contains(cfg.Model.System, "<role name=\"orchestrator\">") {
 		t.Error("system prompt missing the orchestrator role block")
+	}
+}
+
+// TestOrchestratorConfigCarriesRuntimeContext proves the orchestrator's primary
+// loop.Config has a non-nil RuntimeContext when one is wired (so the loop injects the
+// volatile date/cwd/git tail every turn), and that a nil provider leaves it OFF.
+func TestOrchestratorConfigCarriesRuntimeContext(t *testing.T) {
+	t.Parallel()
+
+	t.Run("provider wired -> non-nil RuntimeContext", func(t *testing.T) {
+		t.Parallel()
+		spawner, catalog := testWiring(t)
+		rc := NewRuntimeContextProvider()
+		cfg := orchestratorConfig(&fakeLLM{}, newModelFactory("test-key"), "/tmp/workspace-root", spawner, catalog, rc)
+		if cfg.RuntimeContext == nil {
+			t.Error("orchestrator cfg.RuntimeContext = nil, want the wired provider")
+		}
+	})
+
+	t.Run("nil provider -> RuntimeContext stays nil (OFF)", func(t *testing.T) {
+		t.Parallel()
+		spawner, catalog := testWiring(t)
+		cfg := orchestratorConfig(&fakeLLM{}, newModelFactory("test-key"), "/tmp/workspace-root", spawner, catalog, nil)
+		if cfg.RuntimeContext != nil {
+			t.Error("orchestrator cfg.RuntimeContext != nil with a nil provider, want OFF")
+		}
+	})
+}
+
+// TestBuildOrchestratorWiringEnablesRuntimeContext proves the SHARED construction
+// seam (used by New, openNew, openResume) wires a non-nil RuntimeContext onto the
+// orchestrator's primary cfg, so every construction path inherits runtime-context
+// injection.
+func TestBuildOrchestratorWiringEnablesRuntimeContext(t *testing.T) {
+	t.Parallel()
+	wiring, err := buildOrchestratorWiring(&fakeLLM{}, newModelFactory("test-key"), "/tmp/workspace-root", Config{})
+	if err != nil {
+		t.Fatalf("buildOrchestratorWiring() error = %v", err)
+	}
+	if wiring.cfg.RuntimeContext == nil {
+		t.Error("wiring.cfg.RuntimeContext = nil, want runtime context enabled for the orchestrator")
 	}
 }
 

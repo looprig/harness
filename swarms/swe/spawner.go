@@ -68,12 +68,13 @@ func (e *UnknownAgentError) Error() string {
 // factory, the SkillDescriber it reads each leaf's <available_skills> catalog through,
 // and a late-bound reference to the live session that runs each sub-loop.
 type swarmSpawner struct {
-	session   subagentRunner       // late-bound after the session is built (see bind)
-	registry  *Registry            // authoritative spawnable leaf set
-	deps      LeafToolDeps         // per-spawn tool-construction deps (root + HTTP client)
-	client    llm.LLM              // provider client shared with the parent (no per-loop client)
-	factory   ModelFactory         // builds each leaf's model spec from its finished system prompt
-	describer tools.SkillDescriber // reads a leaf's allowed-skill metadata for the catalog
+	session    subagentRunner              // late-bound after the session is built (see bind)
+	registry   *Registry                   // authoritative spawnable leaf set
+	deps       LeafToolDeps                // per-spawn tool-construction deps (root + HTTP client)
+	client     llm.LLM                     // provider client shared with the parent (no per-loop client)
+	factory    ModelFactory                // builds each leaf's model spec from its finished system prompt
+	describer  tools.SkillDescriber        // reads a leaf's allowed-skill metadata for the catalog
+	runtimeCtx loop.RuntimeContextProvider // volatile per-turn context (date/cwd/git) every leaf gets; shared with the orchestrator
 }
 
 // newSwarmSpawner builds an UNBOUND swarmSpawner (its session is nil until bind is
@@ -81,9 +82,11 @@ type swarmSpawner struct {
 // Subagent tool with this spawner, builds the session, then calls bind exactly once.
 // describer is the same per-agent-scoped loader the registry's Skill tools are built
 // over: a leaf's <available_skills> catalog can only list a skill it is allowed to
-// load.
-func newSwarmSpawner(registry *Registry, deps LeafToolDeps, client llm.LLM, factory ModelFactory, describer tools.SkillDescriber) *swarmSpawner {
-	return &swarmSpawner{registry: registry, deps: deps, client: client, factory: factory, describer: describer}
+// load. runtimeCtx is the swarm-wide RuntimeContextProvider (shared with the
+// orchestrator) every spawned leaf's loop.Config carries, so leaves get the same
+// volatile per-turn context as the primary; nil leaves a leaf with runtime context OFF.
+func newSwarmSpawner(registry *Registry, deps LeafToolDeps, client llm.LLM, factory ModelFactory, describer tools.SkillDescriber, runtimeCtx loop.RuntimeContextProvider) *swarmSpawner {
+	return &swarmSpawner{registry: registry, deps: deps, client: client, factory: factory, describer: describer, runtimeCtx: runtimeCtx}
 }
 
 // bind late-binds the live session onto the spawner. It is called exactly once,
@@ -112,10 +115,11 @@ func (sp *swarmSpawner) Spawn(ctx context.Context, parent loop.Provenance, agent
 	// through the per-agent-scoped describer, so it lists only authorized skills.
 	system := Identity + a.Role + availableSkillsCatalog(ctx, sp.describer, a.Name, a.Skills)
 	cfg := loop.Config{
-		Client:    sp.client,
-		Model:     sp.factory(system),
-		Tools:     a.BuildTools(sp.deps),
-		AgentName: a.Name,
+		Client:         sp.client,
+		Model:          sp.factory(system),
+		Tools:          a.BuildTools(sp.deps),
+		AgentName:      a.Name,
+		RuntimeContext: sp.runtimeCtx, // swarm-wide volatile per-turn context, shared with the orchestrator
 	}
 	blocks := []content.Block{&content.TextBlock{Text: message}}
 	return sp.session.RunSubagent(ctx, parent, cfg, blocks)

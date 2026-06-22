@@ -322,7 +322,7 @@ func TestAcceptanceLeavesCannotSpawn(t *testing.T) {
 	}
 
 	// Orchestrator: Subagent present + auto-approved; the set is exactly the six.
-	orchSpawner := newSwarmSpawner(reg, deps, newScriptedSwarmLLM(), newModelFactory("k"), loader)
+	orchSpawner := newSwarmSpawner(reg, deps, newScriptedSwarmLLM(), newModelFactory("k"), loader, NewRuntimeContextProvider())
 	orchTS := orchestratorToolSet(deps.Root, orchSpawner, toolCatalog(reg))
 	orchNames := toolNames(t, orchTS)
 	if !containsName(orchNames, "Subagent") {

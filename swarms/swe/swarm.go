@@ -126,17 +126,20 @@ func toolCatalog(reg *Registry) []tools.SubagentCatalogEntry {
 // orchestratorConfig assembles the orchestrator's primary loop.Config: the shared
 // client, a model spec whose system prompt is the swarm Identity prepended to the
 // orchestrator's Role (the swarm owns identity; the agent owns its role), its toolset
-// (read/search + Todo + AskUser + the agent-aware Subagent wired to spawner), and its
-// attribution name. It is the single place the orchestrator's primary config is built
-// so every construction path (New, openNew, openResume) cannot drift. spawner is the
+// (read/search + Todo + AskUser + the agent-aware Subagent wired to spawner), its
+// attribution name, and the volatile runtime-context provider the loop appends at each
+// turn's tail. It is the single place the orchestrator's primary config is built so
+// every construction path (New, openNew, openResume) cannot drift. spawner is the
 // UNBOUND swarmSpawner the Subagent tool forwards to; the caller binds the live session
-// onto it after the session is built.
-func orchestratorConfig(client llm.LLM, factory ModelFactory, root string, spawner *swarmSpawner, catalog []tools.SubagentCatalogEntry) loop.Config {
+// onto it after the session is built. rc is the RuntimeContextProvider (nil = OFF); the
+// SAME provider is shared with the spawner so leaves get identical runtime context.
+func orchestratorConfig(client llm.LLM, factory ModelFactory, root string, spawner *swarmSpawner, catalog []tools.SubagentCatalogEntry, rc loop.RuntimeContextProvider) loop.Config {
 	return loop.Config{
-		Client:    client,
-		Model:     factory(Identity + orchestrator.Role),
-		Tools:     orchestratorToolSet(root, spawner, catalog),
-		AgentName: orchestrator.Name,
+		Client:         client,
+		Model:          factory(Identity + orchestrator.Role),
+		Tools:          orchestratorToolSet(root, spawner, catalog),
+		AgentName:      orchestrator.Name,
+		RuntimeContext: rc,
 	}
 }
 
@@ -183,8 +186,13 @@ func buildOrchestratorWiring(client llm.LLM, factory ModelFactory, root string, 
 	if err != nil {
 		return orchestratorWiring{}, err
 	}
-	spawner := newSwarmSpawner(registry, deps, client, factory, loader)
-	orchCfg := orchestratorConfig(client, factory, root, spawner, toolCatalog(registry))
+	// One runtime-context provider for the whole swarm: the orchestrator's primary cfg
+	// AND every spawned leaf share it, so all agents get the same volatile date/cwd/git
+	// tail each turn. The provider is stateless + cheap + non-fatal (it never errors a
+	// turn), so sharing one instance is safe and keeps the loop free of os/exec.
+	rc := NewRuntimeContextProvider()
+	spawner := newSwarmSpawner(registry, deps, client, factory, loader, rc)
+	orchCfg := orchestratorConfig(client, factory, root, spawner, toolCatalog(registry), rc)
 	return orchestratorWiring{cfg: orchCfg, spawner: spawner}, nil
 }
 

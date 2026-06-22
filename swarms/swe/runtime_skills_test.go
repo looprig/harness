@@ -164,7 +164,7 @@ func TestRuntimeSkillsOrchestratorNeverGetsTool(t *testing.T) {
 			if err != nil {
 				t.Fatalf("leafRegistry() error = %v", err)
 			}
-			sp := newSwarmSpawner(reg, deps, &fakeLLM{}, newModelFactory("k"), loader)
+			sp := newSwarmSpawner(reg, deps, &fakeLLM{}, newModelFactory("k"), loader, NewRuntimeContextProvider())
 			ts := orchestratorToolSet(deps.Root, sp, toolCatalog(reg))
 			if containsName(toolNames(t, ts), "Skill") {
 				t.Errorf("orchestrator toolset has a Skill tool (mode=%v), want none (delegate-only)", mode)
