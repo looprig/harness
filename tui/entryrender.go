@@ -36,9 +36,25 @@ func renderEntry(e entry, expand bool, width int) []string {
 		return renderNotice(e.Level, firstText(e.Blocks), width)
 	case kindInterrupted:
 		return []string{styles.InterruptedStyle.Render(interruptedTombstone)}
+	case kindSubagent:
+		return renderSubagentLine(e.Agent, e.Verb, width)
 	default:
 		return nil
 	}
+}
+
+// renderSubagentLine renders a collapsed subagent activity entry as one faint
+// "▸ <agent>: <verb>" row (design §6d Option B), width-truncated. agent is the resolved
+// attribution label (the agent name, or the loopID short form — never empty, set by
+// commitSubagentLine), so the row never reads "▸ : verb". An empty agent (defensive)
+// still renders the cursor + verb rather than a dangling colon.
+func renderSubagentLine(agent, verb string, width int) []string {
+	label := agent
+	if label != "" {
+		label += ": "
+	}
+	line := styles.SubagentCursor + label + verb
+	return []string{styles.SubagentStyle.Render(truncate(line, width))}
 }
 
 // renderNotice renders one leveled notice as "▌ "-bar lines colored per level (info
@@ -90,9 +106,15 @@ func renderPromptRecord(p *promptContext, width int) []string {
 // notification: the "▌ "-barred Question followed by every offered choice as a
 // "▌ "-barred numbered line (promptChoiceLines). Every line carries the neutral info
 // bar (styles.NoticeInfoStyle) so the request reads as one information notice. A
-// free-text request (no choices) records just the question.
+// free-text request (no choices) records just the question. A SUBAGENT-attributed
+// record (p.Agent set) prefixes the question with "<agent>: " so the user sees WHICH
+// agent is asking; a primary-loop record (p.Agent empty) renders the question as-is.
 func renderUserInputRecord(p promptContext, width int) []string {
-	lines := append([]string{p.Question}, promptChoiceLines(p.Choices)...)
+	question := p.Question
+	if p.Agent != "" {
+		question = p.Agent + ": " + question
+	}
+	lines := append([]string{question}, promptChoiceLines(p.Choices)...)
 	return barWrap(styles.NoticeInfoStyle, lines, width)
 }
 

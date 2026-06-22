@@ -147,6 +147,18 @@ var PromptHintStyle = lipgloss.NewStyle().Faint(true)
 // the selection stands out from the unselected rows.
 var PromptCursorStyle = lipgloss.NewStyle().Bold(true)
 
+// SubagentCursor is the leading marker of a collapsed subagent activity line — the
+// "▸ <agent>: <verb>" row attributing a subagent loop's StepDone to its agent. It
+// reuses the same ▸ glyph as the prompt choice cursor (a "drill-in"/secondary marker),
+// plus a trailing space.
+const SubagentCursor = "▸ "
+
+// SubagentStyle renders a collapsed subagent activity line ("▸ <agent>: done"). It is
+// FAINT so a subagent's collapsed-but-present step reads as quieter, subordinate
+// chatter beneath the primary (orchestrator) narration — matching the faint tool-card
+// and queued-affordance tone, distinct from the bold primary user/assistant rows.
+var SubagentStyle = lipgloss.NewStyle().Faint(true)
+
 // ThinkingStyle renders the model's reasoning block: faint (never italic),
 // subordinate to the assistant narration it precedes. Italic is deliberately
 // omitted — it skewed the "│ " left rail and broke the column alignment; a

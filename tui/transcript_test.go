@@ -110,6 +110,25 @@ func stepDone(msgs ...content.Conversation) event.Event {
 	return event.StepDone{Messages: content.AgenticMessages(msgs)}
 }
 
+// stepDoneFrom builds an event.StepDone stamped with a producing loop id, so a test
+// can drive a SUBAGENT loop's collapsed StepDone (a primary StepDone uses the zero/
+// primary loop id via stepDone above).
+func stepDoneFrom(loopID uuid.UUID, msgs ...content.Conversation) event.Event {
+	return event.StepDone{
+		Header:   event.Header{Coordinates: identity.Coordinates{LoopID: loopID}},
+		Messages: content.AgenticMessages(msgs),
+	}
+}
+
+// loopStarted builds an event.LoopStarted stamped with a loop id and the agent name
+// driving it, the source of the transcript's LoopID→agent attribution map.
+func loopStarted(loopID uuid.UUID, name identity.AgentName) event.Event {
+	return event.LoopStarted{Header: event.Header{
+		Coordinates: identity.Coordinates{LoopID: loopID},
+		AgentName:   name,
+	}}
+}
+
 // blockText returns the Text of b if it is a *content.TextBlock, else "".
 func blockText(b content.Block) string {
 	if tb, ok := b.(*content.TextBlock); ok {
@@ -1574,6 +1593,186 @@ func TestGateDecisionFlow(t *testing.T) {
 				if !strings.Contains(got, w) {
 					t.Errorf("rendered card = %q, want %q", got, w)
 				}
+			}
+		})
+	}
+}
+
+// TestSubagentStepDoneAttribution covers P4 Phase 2: a SUBAGENT loop's StepDone
+// renders as ONE compact "▸ <agent>: done" collapsed line attributed by the agent
+// name learned from its LoopStarted, never as the full assistant + tool group (that
+// would interleave the subagent's narration into the root transcript). The PRIMARY
+// loop's StepDone is unchanged (it is the main narration, not a subagent line), and a
+// subagent whose agent name is unknown/empty falls back to the loopID short form — no
+// empty label, no panic.
+func TestSubagentStepDoneAttribution(t *testing.T) {
+	t.Parallel()
+
+	primary := callID(0xA1)
+	sub := callID(0xB2)
+
+	t.Run("subagent StepDone renders one labeled line attributed to its agent", func(t *testing.T) {
+		t.Parallel()
+		m := transcriptModel{primaryLoopID: primary}
+		m = m.ApplyEvent(loopStarted(sub, identity.AgentName("researcher")))
+		m = m.ApplyEvent(stepDoneFrom(sub, aiMessage("", "I dug through the repo", toolUse("tu-1", "Grep", `{}`)), toolResult("tu-1", "match")))
+
+		if len(m.committed) != 1 {
+			t.Fatalf("committed = %d, want exactly 1 collapsed subagent line", len(m.committed))
+		}
+		e := m.committed[0]
+		if e.Kind != kindSubagent {
+			t.Fatalf("committed[0].Kind = %v, want kindSubagent", e.Kind)
+		}
+		got := stripANSI(strings.Join(renderEntry(e, true, 80), "\n"))
+		for _, w := range []string{"▸", "researcher", "done"} {
+			if !strings.Contains(got, w) {
+				t.Errorf("rendered subagent line = %q, want to contain %q", got, w)
+			}
+		}
+		// The subagent's narration MUST NOT leak into the root transcript as its own
+		// assistant entry.
+		if strings.Contains(got, "I dug through the repo") {
+			t.Errorf("subagent narration leaked into the collapsed line: %q", got)
+		}
+	})
+
+	t.Run("primary StepDone is NOT a subagent line (narration unchanged)", func(t *testing.T) {
+		t.Parallel()
+		m := transcriptModel{primaryLoopID: primary}
+		m = m.ApplyEvent(loopStarted(primary, identity.AgentName("orchestrator")))
+		m = m.ApplyEvent(stepDoneFrom(primary, aiMessage("", "here is the plan")))
+
+		for _, e := range m.committed {
+			if e.Kind == kindSubagent {
+				t.Fatalf("primary StepDone committed a kindSubagent line: %+v", e)
+			}
+		}
+		// The primary narration commits as a normal assistant entry.
+		var sawNarration bool
+		for _, e := range m.committed {
+			if e.Kind == kindAssistant && assistantText(e.Blocks) == "here is the plan" {
+				sawNarration = true
+			}
+		}
+		if !sawNarration {
+			t.Errorf("primary narration not committed as a normal assistant entry; committed=%+v", m.committed)
+		}
+	})
+
+	t.Run("subagent with unknown agent name falls back to loopID short form", func(t *testing.T) {
+		t.Parallel()
+		m := transcriptModel{primaryLoopID: primary}
+		// No LoopStarted seen for sub → agent name unknown.
+		m = m.ApplyEvent(stepDoneFrom(sub, aiMessage("", "scanned", toolUse("tu-1", "Read", `{}`)), toolResult("tu-1", "ok")))
+
+		if len(m.committed) != 1 {
+			t.Fatalf("committed = %d, want 1 collapsed subagent line", len(m.committed))
+		}
+		e := m.committed[0]
+		if e.Kind != kindSubagent {
+			t.Fatalf("committed[0].Kind = %v, want kindSubagent", e.Kind)
+		}
+		got := stripANSI(strings.Join(renderEntry(e, true, 80), "\n"))
+		short := loopShortForm(sub)
+		if short == "" {
+			t.Fatal("loopShortForm returned empty for a non-zero loop id")
+		}
+		if !strings.Contains(got, short) {
+			t.Errorf("fallback line = %q, want to contain loopID short form %q", got, short)
+		}
+		// Must not render a dangling/empty label.
+		if strings.Contains(got, "▸ :") || strings.Contains(got, "▸  ") {
+			t.Errorf("fallback line shows an empty label: %q", got)
+		}
+	})
+
+	t.Run("empty agent name on LoopStarted falls back to loopID short form", func(t *testing.T) {
+		t.Parallel()
+		m := transcriptModel{primaryLoopID: primary}
+		m = m.ApplyEvent(loopStarted(sub, identity.AgentName(""))) // explicit empty name
+		m = m.ApplyEvent(stepDoneFrom(sub, aiMessage("", "done work")))
+
+		if len(m.committed) != 1 {
+			t.Fatalf("committed = %d, want 1 collapsed subagent line", len(m.committed))
+		}
+		got := stripANSI(strings.Join(renderEntry(m.committed[0], true, 80), "\n"))
+		if !strings.Contains(got, loopShortForm(sub)) {
+			t.Errorf("empty-name fallback = %q, want loopID short form %q", got, loopShortForm(sub))
+		}
+	})
+
+	t.Run("subagent AskUser prompt record is attributed to its agent", func(t *testing.T) {
+		t.Parallel()
+		m := transcriptModel{primaryLoopID: primary}
+		m = m.ApplyEvent(loopStarted(sub, identity.AgentName("reviewer")))
+		m = m.ApplyEvent(event.UserInputRequested{
+			Header:   event.Header{Coordinates: identity.Coordinates{LoopID: sub}},
+			Question: "Proceed?",
+			Choices:  []string{"yes", "no"},
+		})
+
+		var rec *entry
+		for i := range m.committed {
+			if m.committed[i].Kind == kindPromptRecord {
+				rec = &m.committed[i]
+			}
+		}
+		if rec == nil {
+			t.Fatal("no kindPromptRecord committed for the subagent AskUser")
+		}
+		got := stripANSI(strings.Join(renderEntry(*rec, true, 80), "\n"))
+		if !strings.Contains(got, "reviewer") {
+			t.Errorf("subagent prompt record not attributed: %q, want to contain %q", got, "reviewer")
+		}
+		if !strings.Contains(got, "Proceed?") {
+			t.Errorf("prompt record lost its question: %q", got)
+		}
+	})
+
+	t.Run("primary AskUser prompt record is NOT agent-labeled", func(t *testing.T) {
+		t.Parallel()
+		m := transcriptModel{primaryLoopID: primary}
+		m = m.ApplyEvent(loopStarted(primary, identity.AgentName("orchestrator")))
+		m = m.ApplyEvent(event.UserInputRequested{
+			Header:   event.Header{Coordinates: identity.Coordinates{LoopID: primary}},
+			Question: "Pick one",
+			Choices:  []string{"a"},
+		})
+
+		var rec *entry
+		for i := range m.committed {
+			if m.committed[i].Kind == kindPromptRecord {
+				rec = &m.committed[i]
+			}
+		}
+		if rec == nil {
+			t.Fatal("no kindPromptRecord committed for the primary AskUser")
+		}
+		if rec.Prompt == nil || rec.Prompt.Agent != "" {
+			t.Errorf("primary prompt record carries an agent label %q, want empty", rec.Prompt.Agent)
+		}
+	})
+}
+
+// TestLoopShortForm covers the loopID fallback label (the 8-hex first group of the
+// uuid string), used when a subagent has no/empty agent name.
+func TestLoopShortForm(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		in   uuid.UUID
+		want string
+	}{
+		{name: "non-zero id yields first hex group", in: callID(0xAB), want: "ab000000"},
+		{name: "zero id yields the zero short form", in: uuid.UUID{}, want: "00000000"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := loopShortForm(tt.in); got != tt.want {
+				t.Errorf("loopShortForm(%v) = %q, want %q", tt.in, got, tt.want)
 			}
 		})
 	}

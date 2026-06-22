@@ -4,6 +4,7 @@ import (
 	"strings"
 
 	"github.com/inventivepotter/urvi/internal/agent/loop/event"
+	"github.com/inventivepotter/urvi/internal/agent/loop/identity"
 	"github.com/inventivepotter/urvi/internal/content"
 	"github.com/inventivepotter/urvi/internal/uuid"
 )
@@ -112,6 +113,14 @@ const (
 	// and a noticeLevel; renderEntry renders it with the shared "▌ " accent bar colored
 	// per level (see noticeLevel and styles.NoticeStyle).
 	kindNotice
+	// kindSubagent is the COLLAPSED-but-present activity line for a SUBAGENT loop's
+	// StepDone (design §6d Option B): one compact "▸ <agent>: <verb>" row attributing
+	// the step to the agent driving that loop (the agent name learned from the loop's
+	// LoopStarted, or the loopID short form when unknown/empty). It deliberately does
+	// NOT fold the subagent's narration/tool cards into the root transcript — that would
+	// interleave concurrent subagent streams (Option A, deferred). It carries Agent +
+	// Verb; renderEntry renders it via renderSubagentLine.
+	kindSubagent
 )
 
 // noticeLevel grades a kindNotice's severity, selecting its accent-bar color. The
@@ -136,6 +145,12 @@ const (
 type promptContext struct {
 	Question string   // the AskUser question
 	Choices  []string // every offered choice, in order
+	// Agent attributes the prompt to the SUBAGENT that opened it (design §6d Option B:
+	// child gates surface as attributed records). It is the resolved label — the
+	// subagent's agent name, or its loopID short form when the name is unknown/empty.
+	// It is EMPTY for a PRIMARY-loop AskUser (the orchestrator's own question is not
+	// agent-labeled); renderUserInputRecord prepends "<agent>: " only when it is set.
+	Agent string
 }
 
 // entry is one committed (finalized) row of the transcript. It stores the minimal
@@ -167,6 +182,13 @@ type entry struct {
 	// the committed form of an empty-text step that ran exactly one tool call. Set ONLY
 	// by stepDone for that case; every other kindTool entry renders as a normal card.
 	promoted bool
+	// Agent is the attribution label of a kindSubagent line — the agent name driving the
+	// producing subagent loop, or that loop's id short form when the name is unknown/
+	// empty. Meaningful ONLY for kindSubagent; empty for every other kind.
+	Agent string
+	// Verb is the activity word of a kindSubagent line ("done" for a committed StepDone).
+	// Meaningful ONLY for kindSubagent; empty for every other kind.
+	Verb string
 }
 
 // liveSeg is the in-progress assistant segment for the current turn: the streamed
@@ -230,10 +252,20 @@ type transcriptModel struct {
 	// Agent.PrimaryLoopID() at construction (see screen.go New / handleReopenResult);
 	// the zero value matches a zero-LoopID primary turn (the single-loop default).
 	primaryLoopID uuid.UUID
+	// loopAgents maps a loop id to the agent name driving it, learned from each loop's
+	// LoopStarted.AgentName (P1) as those Enduring/all-loops events arrive on the TUI's
+	// lifetime subscription. It is the source of a subagent's attribution label (the
+	// "▸ <agent>: done" collapsed StepDone line and an attributed AskUser record). A
+	// loop absent from the map (LoopStarted not yet seen) or mapped to an empty name (a
+	// legacy/no-name loop) falls back to the loopID short form — see agentLabel. It is
+	// cloned on write so the by-value reducer never aliases a prior model's map.
+	loopAgents map[uuid.UUID]identity.AgentName
 }
 
 // ApplyEvent folds one turn-stream event into the model and returns the next
-// model. TurnStarted begins/keeps a live assistant segment AND — for GENUINE user
+// model. LoopStarted records the producing loop's agent name (LoopID→AgentName) for
+// later subagent attribution; it commits nothing. TurnStarted begins/keeps a live
+// assistant segment AND — for GENUINE user
 // input only (Header.Cause.LoopID == 0; a subagent hand-back carries a
 // non-zero one and commits NO user row) — commits the authoritative user row from
 // its Message and drops the matching queued affordance. TurnFoldedInto does the
@@ -269,6 +301,8 @@ type transcriptModel struct {
 // interactionModel's job, not the transcript's.
 func (m transcriptModel) ApplyEvent(ev event.Event) transcriptModel {
 	switch ev := ev.(type) {
+	case event.LoopStarted:
+		m.recordLoopAgent(ev.LoopID, ev.AgentName)
 	case event.TurnStarted:
 		m.live.active = true
 		m.startTurnUser(ev.LoopID, ev.Cause.LoopID, ev.Cause.CommandID, ev.Message)
@@ -300,6 +334,44 @@ func (m transcriptModel) ApplyEvent(ev event.Event) transcriptModel {
 		m.turnFailed(ev)
 	}
 	return m
+}
+
+// recordLoopAgent records the agent name driving loopID (the LoopStarted boundary), so
+// a later subagent StepDone/AskUser from that loop can be attributed by name. The map
+// is cloned on write (value-copy contract) so the by-value reducer never aliases a
+// prior model's map. A re-seen loop id overwrites — the name is immutable, so this is
+// idempotent in practice.
+func (m *transcriptModel) recordLoopAgent(loopID uuid.UUID, name identity.AgentName) {
+	next := make(map[uuid.UUID]identity.AgentName, len(m.loopAgents)+1)
+	for k, v := range m.loopAgents {
+		next[k] = v
+	}
+	next[loopID] = name
+	m.loopAgents = next
+}
+
+// agentLabel resolves the attribution label for loopID: the agent name learned from
+// its LoopStarted when known and non-empty, else the loopID short form (loopShortForm)
+// — never an empty string, so a label is always shown and a missing/legacy name never
+// renders a dangling "▸ :". It is the single resolver shared by the subagent StepDone
+// line and the attributed AskUser record.
+func (m transcriptModel) agentLabel(loopID uuid.UUID) string {
+	if name, ok := m.loopAgents[loopID]; ok && name != "" {
+		return string(name)
+	}
+	return loopShortForm(loopID)
+}
+
+// loopShortForm is the loopID fallback label: the first hyphen-delimited group of the
+// canonical uuid string (its 8 leading hex chars), a compact stable id for a loop with
+// no known/empty agent name. The zero loop id yields "00000000" (still a non-empty,
+// unambiguous label).
+func loopShortForm(loopID uuid.UUID) string {
+	s := loopID.String()
+	if i := strings.IndexByte(s, '-'); i >= 0 {
+		return s[:i]
+	}
+	return s
 }
 
 // CommitUser appends the user's submitted message as one kindUser entry with a
@@ -522,14 +594,20 @@ func cloneGates(g map[uuid.UUID]gateDecision) map[uuid.UUID]gateDecision {
 // userInputRequested is the AskUser prompt-open boundary: it commits the FULL
 // user-input context (Question + ALL Choices) as a kindPromptRecord entry. Choices
 // are copied so a later mutation of the event's slice cannot reach the committed
-// record. It does NOT commit pending live prose: the provisional narration stays in
-// the live segment and is committed exactly once by the step's StepDone (committing it
-// here would duplicate it in append-only scrollback). live is NOT reset — the turn
-// continues while the gate is pending.
+// record. A SUBAGENT loop's AskUser (LoopID != primaryLoopID) is attributed: ctx.Agent
+// is set to the loop's label (agentLabel) so the record reads "<agent>: <question>"; a
+// PRIMARY-loop AskUser leaves Agent empty (the orchestrator's own question is not
+// agent-labeled). It does NOT commit pending live prose: the provisional narration
+// stays in the live segment and is committed exactly once by the step's StepDone
+// (committing it here would duplicate it in append-only scrollback). live is NOT reset
+// — the turn continues while the gate is pending.
 func (m *transcriptModel) userInputRequested(ev event.UserInputRequested) {
 	ctx := promptContext{Question: ev.Question}
 	if len(ev.Choices) > 0 {
 		ctx.Choices = append([]string(nil), ev.Choices...)
+	}
+	if ev.LoopID != m.primaryLoopID {
+		ctx.Agent = m.agentLabel(ev.LoopID)
 	}
 	m.commitPrompt(ctx)
 }
@@ -647,8 +725,12 @@ func (m *transcriptModel) toolCompleted(ev event.ToolCallCompleted) {
 	// unknown ToolExecutionID: no-op
 }
 
-// stepDone is the StepDone commit point: it SNAPS the transcript to the loop's
-// finalized step group. It builds each tool-use block's card (reusing the resolved
+// stepDone is the StepDone commit point. A SUBAGENT loop's step (LoopID !=
+// primaryLoopID) is committed COLLAPSED as a single attributed "▸ <agent>: done" line
+// (commitSubagentLine) and returns early — its narration/tool group is deliberately
+// NOT folded into the root transcript (design §6d Option B). For the PRIMARY loop it
+// SNAPS the transcript to the loop's finalized step group: it builds each tool-use
+// block's card (reusing the resolved
 // LIVE card — with its redacted Summary, capped preview, and permission Decision — or
 // falling back to the stored block + ToolResultMessage when no live card streamed),
 // commits the step's AIMessage prose / headline as one kindAssistant entry, then
@@ -660,6 +742,14 @@ func (m *transcriptModel) toolCompleted(ev event.ToolCallCompleted) {
 // (active preserved): the dropped/partial TokenDeltas of this step vanish — the
 // self-heal — and the step's gate decisions are cleared.
 func (m *transcriptModel) stepDone(ev event.StepDone) {
+	// A SUBAGENT loop's step is COLLAPSED-but-present (design §6d Option B): it commits
+	// ONE attributed "▸ <agent>: done" line, NOT the full assistant + tool group, so
+	// concurrent subagent narration never interleaves into the root transcript. The
+	// PRIMARY loop is the main narration and falls through to the full commit below.
+	if ev.LoopID != m.primaryLoopID {
+		m.commitSubagentLine(ev.LoopID, subagentVerbDone)
+		return
+	}
 	ai, results := splitStepGroup(ev.Messages)
 	uses := toolUsesOf(ai)
 	cards := make([]ToolCallView, len(uses))
@@ -675,6 +765,24 @@ func (m *transcriptModel) stepDone(ev event.StepDone) {
 	// step (or its terminal) is still seen as in-progress.
 	active := m.live.active
 	m.live = liveSeg{active: active}
+}
+
+// subagentVerbDone is the activity word of a committed subagent StepDone line: a
+// finalized step reads "done".
+const subagentVerbDone = "done"
+
+// commitSubagentLine appends ONE collapsed kindSubagent entry attributing a subagent
+// loop's step to its agent (agentLabel: the agent name, or the loopID short form when
+// unknown/empty) with the given verb. It does NOT touch the primary live segment — a
+// subagent's step is out-of-band from the orchestrator's in-progress narration.
+func (m *transcriptModel) commitSubagentLine(loopID uuid.UUID, verb string) {
+	m.nextID++
+	m.committed = append(m.committed, entry{
+		ID:    m.nextID,
+		Kind:  kindSubagent,
+		Agent: m.agentLabel(loopID),
+		Verb:  verb,
+	})
 }
 
 // commitStepAssistant commits the AIMessage's prose / headline as one kindAssistant
