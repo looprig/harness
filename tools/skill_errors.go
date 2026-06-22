@@ -34,3 +34,22 @@ func (e *MalformedSkillError) Error() string {
 	}
 	return "tools: malformed skill " + e.Name + ": " + e.Reason
 }
+
+// SkillNotFoundError is returned when a skill name has passed the per-agent
+// authorization check (it is a member of the agent's closed allow-set) but its
+// SKILL.md document is absent from the backing file system. This is distinct
+// from UnknownSkillError — which denies an untrusted, unauthorized name — and
+// signals a catalogue/embed integrity problem (an allowed skill whose file was
+// not shipped) rather than a denied request. It is errors.As-recoverable so the
+// caller can surface the missing skill name; the underlying fs error is wrapped
+// and reachable via errors.Unwrap for diagnostics.
+type SkillNotFoundError struct {
+	Name string // the authorized skill whose SKILL.md is missing
+	Err  error  // the wrapped fs error (e.g. fs.ErrNotExist)
+}
+
+func (e *SkillNotFoundError) Error() string {
+	return "tools: skill " + e.Name + " not found in catalogue"
+}
+
+func (e *SkillNotFoundError) Unwrap() error { return e.Err }
