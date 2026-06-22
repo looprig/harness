@@ -8,6 +8,7 @@ import (
 
 	"github.com/inventivepotter/urvi/internal/agent/loop/identity"
 	"github.com/inventivepotter/urvi/internal/tool"
+	"github.com/inventivepotter/urvi/internal/uuid"
 )
 
 // skillToolBody is the markdown body of the well-formed fixture skill, returned
@@ -160,16 +161,135 @@ func TestSkillAuditSummary(t *testing.T) {
 	}
 }
 
-// TestSkillCapabilities is a compile-time + behavioral assertion that Skill is an
-// InvokableTool and Auditable, and is NOT a PermissionPrompter (it auto-approves
-// via being named in HardApprove, the same class as ReadFile/Subagent).
+// TestSkillCapabilities is a compile-time + behavioral assertion of the Skill
+// capability surface under the enforced-gate model. Skill is ALWAYS an
+// InvokableTool + Auditable, and ALSO a Preparer + EffectChecker +
+// PermissionPrompter (so a workspace-enabled instance is gated). The capability
+// methods are present on the type unconditionally, but for an EMBEDDED-ONLY
+// instance they must BEHAVE as auto-approve, side-effect-free: CheckEffect for an
+// embedded name yields handled=false (falls through to HardApprove) and Prepare
+// yields a nil artifact (no snapshot, no gate). This pins that the embedded P2
+// behavior is unchanged despite the wider type surface.
 func TestSkillCapabilities(t *testing.T) {
 	t.Parallel()
 	loader := NewEmbeddedSkillLoader(newSkillToolFS(), skillToolAllow())
 	s := NewSkill(loader, identity.AgentName("operator"))
+
 	var _ tool.InvokableTool = s
 	var _ tool.Auditable = s
-	if _, isPrompter := interface{}(s).(tool.PermissionPrompter); isPrompter {
-		t.Error("Skill implements PermissionPrompter; it must auto-approve via HardApprove, not prompt")
+	var _ tool.Preparer = s
+	var _ tool.PermissionPrompter = s
+	var _ EffectChecker = s
+
+	// Embedded-only behavior must be auto-approve + no artifact.
+	if eff, handled := s.CheckEffect(`{"name":"code-style"}`); handled {
+		t.Errorf("CheckEffect(embedded) handled = true (eff=%v); want false so it falls through to HardApprove (auto-approve)", eff)
+	}
+	prepared, err := s.Prepare(context.Background(), uuid.UUID{}, `{"name":"code-style"}`)
+	if err != nil {
+		t.Errorf("Prepare(embedded) error = %v, want nil", err)
+	}
+	if prepared != nil {
+		t.Errorf("Prepare(embedded) = %v, want nil artifact (embedded handled by loader at exec)", prepared)
+	}
+}
+
+// TestSkillCheckEffectEmbeddedOnly proves CheckEffect's decision WITHOUT a
+// workspace source: an embedded name and an unknown name BOTH yield handled=false
+// (auto-approve via HardApprove), and unparseable args also yield handled=false
+// (the call auto-approves, then InvokableRun renders the error). No row may pin
+// EffectAsk: an embedded-only Skill never gates.
+func TestSkillCheckEffectEmbeddedOnly(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		argsJSON string
+	}{
+		{name: "embedded name falls through to HardApprove", argsJSON: `{"name":"code-style"}`},
+		{name: "unknown name falls through (fails secure at result)", argsJSON: `{"name":"secret-skill"}`},
+		{name: "empty name falls through", argsJSON: `{"name":""}`},
+		{name: "unparseable args falls through", argsJSON: `not json`},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			loader := NewEmbeddedSkillLoader(newSkillToolFS(), skillToolAllow())
+			s := NewSkill(loader, identity.AgentName("operator"))
+
+			if eff, handled := s.CheckEffect(tt.argsJSON); handled {
+				t.Errorf("CheckEffect(%q) handled = true (eff=%v); embedded-only must never gate", tt.argsJSON, eff)
+			}
+		})
+	}
+}
+
+// TestSkillEmbeddedOnlyUnknownAutoApproves proves the embedded-only unknown-name
+// path is fail-secure at the RESULT, not the gate: CheckEffect/Prepare do not gate
+// (handled=false, nil artifact), and InvokableRun (no artifact in ctx) returns the
+// UnknownSkillError string and never a body.
+func TestSkillEmbeddedOnlyUnknownAutoApproves(t *testing.T) {
+	t.Parallel()
+	loader := NewEmbeddedSkillLoader(newSkillToolFS(), skillToolAllow())
+	s := NewSkill(loader, identity.AgentName("operator"))
+
+	args := `{"name":"not-a-skill"}`
+
+	if eff, handled := s.CheckEffect(args); handled {
+		t.Errorf("CheckEffect = handled (eff=%v); want auto-approve fall-through", eff)
+	}
+	prepared, err := s.Prepare(context.Background(), uuid.UUID{}, args)
+	if err != nil {
+		t.Fatalf("Prepare error = %v, want nil (no workspace to consult)", err)
+	}
+	if prepared != nil {
+		t.Fatalf("Prepare = %v, want nil artifact", prepared)
+	}
+	// No artifact in ctx → embedded path → loader miss → UnknownSkillError string.
+	res, err := s.InvokableRun(context.Background(), args)
+	if err != nil {
+		t.Fatalf("InvokableRun Go error = %v, want nil", err)
+	}
+	got := textOf(t, res)
+	if !strings.Contains(got, "error:") || !strings.Contains(got, "not-a-skill") {
+		t.Errorf("result = %q, want an error string naming the unknown skill", got)
+	}
+	if strings.Contains(got, skillToolBody) {
+		t.Errorf("result = %q leaks a body on the unknown path", got)
+	}
+}
+
+// TestSkillBuildRequestFailSecure proves BuildRequest is fail-secure when it is
+// reached without the workspace snapshot it expects (embedded never gates, so this
+// path should not occur in practice — but it must not fabricate a request): a nil,
+// wrong-typed, or non-workspace artifact yields an error so the runner falls back
+// to a redacted UnknownRequest rather than guessing a SkillLoadRequest.
+func TestSkillBuildRequestFailSecure(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		prepared tool.PreparedArtifact
+	}{
+		{name: "nil artifact", prepared: nil},
+		{name: "wrong artifact type", prepared: tool.TokenArtifact{Token: "x"}},
+		{name: "non-workspace skill artifact", prepared: &tool.SkillArtifact{Workspace: false, Body: "b"}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			loader := NewEmbeddedSkillLoader(newSkillToolFS(), skillToolAllow())
+			s := NewSkill(loader, identity.AgentName("operator"))
+
+			req, err := s.BuildRequest(`{"name":"x"}`, tt.prepared)
+			if err == nil {
+				t.Errorf("BuildRequest = (%v, nil), want a fail-secure error", req)
+			}
+			if req != nil {
+				t.Errorf("BuildRequest req = %v, want nil on the fail-secure path", req)
+			}
+		})
 	}
 }

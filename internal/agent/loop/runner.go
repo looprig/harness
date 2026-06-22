@@ -482,7 +482,7 @@ func runOne(
 	gateReg chan<- gateRegistration,
 	emit func(event.Event),
 ) (res result) {
-	ctx2 := withPrepared(withGateReg(withEmit(withCallID(ctx, r.callID), emit), gateReg), r.prepared)
+	ctx2 := WithPrepared(withGateReg(withEmit(withCallID(ctx, r.callID), emit), gateReg), r.prepared)
 
 	defer func() {
 		if rec := recover(); rec != nil {

@@ -18,8 +18,18 @@ import (
 // serve every agent in a swarm while still scoping each call to that agent's own
 // allowed-skill set. Implementations MUST be fail-secure: an unauthorized or
 // unknown name is denied, never guessed.
+//
+// Allowed is the read-only membership predicate over the SAME closed allow-set
+// Load authorizes against, WITHOUT touching the filesystem: it answers "is name an
+// embedded skill this agent may load?". The workspace-aware Skill tool uses it as
+// the embedded-wins discriminator (embedded names auto-approve and resolve via
+// Load; only a NON-embedded name is ever considered for an untrusted workspace
+// load). It is fail-secure: an unknown agent, a nil allow-map, or a non-member
+// name all report false. Both methods are used by the single Skill-tool consumer,
+// so combining them does not over-widen the interface (interface segregation).
 type SkillLoader interface {
 	Load(ctx context.Context, agent identity.AgentName, name string) (string, error)
+	Allowed(agent identity.AgentName, name string) bool
 }
 
 // SkillDescriber resolves a named skill into its frontmatter METADATA
@@ -126,6 +136,15 @@ func (l *embeddedSkillLoader) resolve(ctx context.Context, agent identity.AgentN
 	}
 
 	return meta, body, nil
+}
+
+// Allowed reports whether name is an embedded skill this agent may load, reading
+// the closed allow-set ONLY (no filesystem touch). It is the exported, read-only
+// view of the same gate Load authorizes against; the workspace-aware Skill tool
+// consults it as the embedded-wins discriminator. Fail-secure: unknown agent, nil
+// map, or non-member name → false.
+func (l *embeddedSkillLoader) Allowed(agent identity.AgentName, name string) bool {
+	return l.authorized(agent, name)
 }
 
 // authorized reports whether agent may load the named skill: true iff name is a

@@ -82,11 +82,14 @@ func withGateReg(ctx context.Context, gateReg chan<- gateRegistration) context.C
 	return context.WithValue(ctx, gateRegKey{}, gateReg)
 }
 
-// withPrepared returns a child ctx carrying the per-call PreparedArtifact a
+// WithPrepared returns a child ctx carrying the per-call PreparedArtifact a
 // Preparer tool produced for THIS call. The runner injects it per tool call; the
 // producing tool's InvokableRun reads it back via PreparedFromContext. It is nil
-// for non-Preparer tools, which never look.
-func withPrepared(ctx context.Context, prepared tool.PreparedArtifact) context.Context {
+// for non-Preparer tools, which never look. It is the symmetric write side of the
+// exported PreparedFromContext read side (mirroring WithProvenance/ProvenanceFrom),
+// so a Preparer tool defined in another package can be exercised in isolation
+// without driving the whole runner.
+func WithPrepared(ctx context.Context, prepared tool.PreparedArtifact) context.Context {
 	return context.WithValue(ctx, preparedKey{}, prepared)
 }
 
