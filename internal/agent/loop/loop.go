@@ -551,9 +551,11 @@ func runLoop(cfg loopConfig, state loopState) {
 	}
 
 	// buildTurnConfig assembles the per-turn turnConfig: the static deps (base/model/
-	// tools/client/gateReg/idGen) plus the two ctx-cancellable handshake closures the
-	// turn goroutine calls back through, and the publish-only emit. This is the WIRING
-	// half of starting a turn (distinct from committing + announcing it).
+	// tools/client/gateReg/idGen), the runtime-context provider (consulted ONCE per turn
+	// by runTurn on the turn goroutine — never here on the actor, since it may run git),
+	// plus the two ctx-cancellable handshake closures the turn goroutine calls back
+	// through, and the publish-only emit. This is the WIRING half of starting a turn
+	// (distinct from committing + announcing it).
 	//
 	//   - commit: per-step commit handshake. Selects on the buffered(1) ack AND
 	//     turnCtx.Done so an Interrupt/Shutdown during the handshake frees runTurn.
@@ -596,16 +598,17 @@ func runLoop(cfg loopConfig, state loopState) {
 			}
 		}
 		return turnConfig{
-			base:         base,
-			model:        config.Model,
-			tools:        config.Tools,
-			client:       config.Client,
-			gateReg:      gateReg,
-			idGen:        config.idGen,
-			commit:       commit,
-			drainPending: drainPending,
-			emit:         publish,
-			afterDrain:   config.afterDrain,
+			base:           base,
+			runtimeContext: config.RuntimeContext,
+			model:          config.Model,
+			tools:          config.Tools,
+			client:         config.Client,
+			gateReg:        gateReg,
+			idGen:          config.idGen,
+			commit:         commit,
+			drainPending:   drainPending,
+			emit:           publish,
+			afterDrain:     config.afterDrain,
 		}
 	}
 

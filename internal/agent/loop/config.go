@@ -26,6 +26,16 @@ type Config struct {
 	// (nil is valid).
 	Tools ToolSet
 
+	// RuntimeContext, when non-nil, yields the volatile per-turn context blocks
+	// (date/cwd/git) the loop appends at the TAIL of each turn's request — AFTER the
+	// committed messages, and as a transient addition that NEVER enters committed
+	// history and NEVER touches Model.System (the cached prefix). It is consulted once
+	// per turn, so each turn rides a single FRESH block and stale blocks never
+	// accumulate. nil (the zero value, the New default) means OFF: the request is
+	// assembled exactly as it was before — no extra blocks. The interface keeps the
+	// loop free of os/exec; the concrete provider is wired at the composition root.
+	RuntimeContext RuntimeContextProvider
+
 	// idGen mints the loop's correlation IDs: the per-turn TurnID, each StepID,
 	// and each tool-call ToolExecutionID. It is unexported, so the composition root cannot
 	// set it: New defaults it to uuid.New. It exists only as a test seam for

@@ -72,6 +72,17 @@ type turnConfig struct {
 	// loopState.msgs while runTurn reads base concurrently.
 	base content.AgenticMessages
 
+	// runtimeContext, when non-nil, yields the volatile runtime-context blocks the turn
+	// appends at the TAIL of EVERY step's request this turn (after base + turnState.msgs).
+	// runTurn consults it ONCE at turn start (on the turn GOROUTINE, never the actor —
+	// the provider may run git, which must not block the serialized actor) and reuses the
+	// resulting tail for every step. The appended tail is purely TRANSIENT: it rides the
+	// request only, never enters turnState.msgs/loopState.msgs and never touches
+	// model.System (the cached prefix), so committed history never grows with it and the
+	// cached prefix stays byte-stable turn-to-turn. nil means no provider: the request is
+	// assembled exactly as before. The provider contract is non-fatal — it never errors.
+	runtimeContext RuntimeContextProvider
+
 	model   llm.ModelSpec
 	tools   ToolSet
 	client  llm.LLM
@@ -163,11 +174,23 @@ func runTurn(ctx context.Context, cfg turnConfig, ts turnState) event.Event {
 	identity := turnIdentity{sessionID: ts.sessionID, loopID: ts.loopID, turnID: ts.id}
 	defs := toolDefs(ctx, cfg.tools.Registry)
 
+	// Consult the runtime-context provider ONCE per turn, here on the turn goroutine
+	// (never the actor — the provider may run git, which must not stall the serialized
+	// actor). The resulting volatile tail is reused for EVERY step this turn, so the
+	// provider runs once and every step sees the same fresh snapshot. nil tail when no
+	// provider is configured (or it yielded no blocks): the request is then assembled
+	// exactly as before.
+	runtimeTail := runtimeContextTail(ctx, cfg.runtimeContext)
+
 	for stepIdx := StepIndex(0); ; stepIdx++ {
-		// Request base is the committed history clone + this turn's staged messages.
+		// Request base is the committed history clone + this turn's staged messages,
+		// plus the volatile runtime-context tail (when configured) appended LAST so the
+		// model sees fresh date/cwd/git at the very end of the input every step. The
+		// tail is transient: it is part of the REQUEST only, never of ts.msgs/base, so
+		// committed history never grows with it and the cached model.System is untouched.
 		req := llm.Request{
 			Model:    cfg.model,
-			Messages: requestMessages(cfg.base, ts.msgs),
+			Messages: requestMessages(cfg.base, ts.msgs, runtimeTail),
 			Tools:    defs,
 		}
 
@@ -327,13 +350,40 @@ func foldPending(ctx context.Context, cfg turnConfig, ts *turnState) error {
 	return nil
 }
 
+// runtimeContextTail consults the runtime-context provider once and wraps the
+// returned volatile blocks into a single turn-tail UserMessage. It returns nil when
+// no provider is configured or the provider yields no blocks (OFF / degraded): the
+// request is then assembled exactly as before. The provider contract is non-fatal
+// (it never errors), so this never fails a turn. The result is purely transient —
+// runTurn appends it to the request only, never to committed history or model.System.
+func runtimeContextTail(ctx context.Context, rc RuntimeContextProvider) *content.UserMessage {
+	if rc == nil {
+		return nil
+	}
+	blocks := rc.Blocks(ctx)
+	if len(blocks) == 0 {
+		return nil
+	}
+	return &content.UserMessage{Message: content.Message{Role: content.RoleUser, Blocks: blocks}}
+}
+
 // requestMessages builds the LLM request message slice from the committed base
-// clone followed by the turn's staged messages. The result is a fresh slice so the
-// request never aliases either input's backing array.
-func requestMessages(base, staged content.AgenticMessages) content.AgenticMessages {
-	out := make(content.AgenticMessages, 0, len(base)+len(staged))
+// clone followed by the turn's staged messages, then (when non-nil) the volatile
+// runtimeTail at the very END — the turn-tail volatile context. The result is a
+// fresh slice so the request never aliases any input's backing array, and the tail
+// is appended ONLY here (the request), never to base or staged, so it stays
+// transient. A nil tail appends nothing (the pre-runtime-context behavior).
+func requestMessages(base, staged content.AgenticMessages, runtimeTail *content.UserMessage) content.AgenticMessages {
+	n := len(base) + len(staged)
+	if runtimeTail != nil {
+		n++
+	}
+	out := make(content.AgenticMessages, 0, n)
 	out = append(out, base...)
 	out = append(out, staged...)
+	if runtimeTail != nil {
+		out = append(out, runtimeTail)
+	}
 	return out
 }
 
