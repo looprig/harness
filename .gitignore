@@ -28,6 +28,9 @@
 # Claude Code project settings
 .claude/
 
+# Migration review provenance (Codex review outputs) — keep locally, don't commit
+/scripts/migration/codex_review_*
+
 # Vendored dependency tree — committed in full and built offline (-mod=vendor).
 # The global ignores above (*.pem, *.key, .env.*, *.test, *.out, ...) otherwise
 # silently drop vendored files (e.g. go-tdx-guest's embedded trusted_root.pem),
