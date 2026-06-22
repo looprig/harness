@@ -53,3 +53,24 @@ func (e *SkillNotFoundError) Error() string {
 }
 
 func (e *SkillNotFoundError) Unwrap() error { return e.Err }
+
+// SkillContainmentError is returned when an UNTRUSTED workspace skill name or
+// path is rejected by the containment rules of the workspace loader (design §7a):
+// a name that is not a bounded ASCII slug (empty, ".", "..", a path separator, a
+// control character, uppercase, or over-length), or a resolved path that escapes
+// the workspace root (an intermediate-dir or final-file symlink leaving the root,
+// a ".." traversal) or whose target is not a regular file (a directory, device,
+// FIFO, or symlink). It is fail-secure — the load is denied, never guessed — and
+// errors.As-recoverable so the caller can surface the offending name and a
+// non-secret reason WITHOUT loading the untrusted body. It is distinct from
+// UnknownSkillError (an unauthorized embedded name) and SkillNotFoundError (an
+// authorized name whose file is absent): this one means the request itself
+// violated containment.
+type SkillContainmentError struct {
+	Name   string // the rejected workspace skill name
+	Reason string // non-secret, human-readable reason for the rejection
+}
+
+func (e *SkillContainmentError) Error() string {
+	return "tools: workspace skill " + e.Name + " rejected: " + e.Reason
+}
