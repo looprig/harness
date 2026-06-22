@@ -206,6 +206,10 @@ func TestEnduringOverflowFailsSubscription(t *testing.T) {
 	loopA := mustID(t)
 	h := New(session)
 
+	// slow never reads, so its egress buffer fills and the (defaultEgressBuffer+1)th
+	// Enduring event overflows and fails it. fast is drained in LOCKSTEP with
+	// publishing, so its buffer never accumulates and it is never failed — proving a
+	// slow subscriber's loss is isolated to that subscriber.
 	slow, err := h.SubscribeEvents(allFilter())
 	if err != nil {
 		t.Fatalf("SubscribeEvents = %v", err)
@@ -215,62 +219,47 @@ func TestEnduringOverflowFailsSubscription(t *testing.T) {
 		t.Fatalf("SubscribeEvents = %v", err)
 	}
 
-	// fast drains continuously so it never overflows; slow never reads.
-	fastSeen := make(chan event.Event, defaultEgressBuffer*4)
-	go func() {
-		for ev := range fast.Events() {
-			fastSeen <- ev
-		}
-	}()
-
-	// Fill slow's buffer entirely with Enduring events (it never reads), then one
-	// more to overflow and fail it.
+	// PublishEvent fans out synchronously, so on return fast already has the event
+	// buffered; draining it each iteration keeps fast's buffer from filling regardless
+	// of goroutine scheduling. (A prior version drained fast on a separate goroutine and
+	// was flaky under load / GOMAXPROCS=1: the drainer could be starved through the
+	// non-blocking publish burst, spuriously overflowing fast.)
 	for i := 0; i < defaultEgressBuffer+1; i++ {
 		if err := h.PublishEvent(context.Background(), event.StepDone{Header: event.Header{Coordinates: identity.Coordinates{SessionID: session, LoopID: loopA}}}); err != nil {
-			t.Fatalf("PublishEvent = %v", err)
+			t.Fatalf("PublishEvent #%d = %v", i, err)
+		}
+		select {
+		case got, ok := <-fast.Events():
+			if !ok {
+				t.Fatalf("fast.Events() closed at publish #%d — fast was wrongly failed", i)
+			}
+			if got.Class() != event.Enduring {
+				t.Errorf("fast got %T (class %v), want an Enduring StepDone", got, got.Class())
+			}
+		default:
+			t.Fatalf("fast had no buffered event after synchronous publish #%d", i)
 		}
 	}
 
-	// slow is failed with the typed loss error and its channel is closed.
-	deadline := time.After(time.Second)
+	// slow is failed with the typed loss error. Delivery is synchronous, so the
+	// overflowing publish above already failed it and closed its channel.
+	var lerr *SubscriptionLossError
+	if !errors.As(slow.Err(), &lerr) {
+		t.Fatalf("slow.Err() = %v, want *SubscriptionLossError", slow.Err())
+	}
+	if lerr.DroppedClass != event.Enduring {
+		t.Errorf("DroppedClass = %v, want Enduring", lerr.DroppedClass)
+	}
+	// slow's egress channel is closed; draining its buffered events reaches the close.
 	for {
-		var lerr *SubscriptionLossError
-		if errors.As(slow.Err(), &lerr) {
-			if lerr.DroppedClass != event.Enduring {
-				t.Errorf("DroppedClass = %v, want Enduring", lerr.DroppedClass)
-			}
+		if _, ok := <-slow.Events(); !ok {
 			break
 		}
-		select {
-		case <-deadline:
-			t.Fatalf("slow subscription never failed with SubscriptionLossError")
-		case <-time.After(time.Millisecond):
-		}
-	}
-	// Draining slow eventually hits a closed channel.
-	closed := false
-	for !closed {
-		select {
-		case _, ok := <-slow.Events():
-			if !ok {
-				closed = true
-			}
-		case <-time.After(time.Second):
-			t.Fatalf("slow.Events() never closed after loss")
-		}
 	}
 
-	// fast is unaffected: it received the events and is still live.
+	// fast is unaffected: it received every event and is still live.
 	if err := fast.Err(); err != nil {
 		t.Errorf("fast subscriber Err() = %v, want nil", err)
-	}
-	select {
-	case got := <-fastSeen:
-		if got.Class() != event.Enduring {
-			t.Errorf("fast got %T, want a StepDone", got)
-		}
-	case <-time.After(time.Second):
-		t.Fatalf("fast subscriber received nothing")
 	}
 }
 
