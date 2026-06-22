@@ -1676,6 +1676,66 @@ func TestSubmitUserRowFromEventNotSubmit(t *testing.T) {
 	}
 }
 
+// TestFirstUserRowSurvivesEmptyRestore is the regression test for the startup
+// displayID collision that silently dropped the FIRST user message from the TUI.
+//
+// At startup commitStartup commits the banner (an opening UI-only notice) as transcript
+// displayID 1 and flushes it, so the scrollback print-once engine records id 1 as
+// printed. The background restore fold then lands: for a NEW session it folds to an
+// EMPTY backlog. The bug was that handleRestored installed that empty transcript
+// WHOLESALE — discarding the banner and resetting the displayID counter to 0 — while
+// leaving the print-once engine still holding id 1. The next commit, the first user
+// row, then reused displayID 1, which scrollback.Flush treats as "already printed" and
+// skips: the user's first message never reaches scrollback (though the loop ran it and
+// the model replied). Every later message is fine, because the counter then advances
+// past the printed set. This test reproduces that exact ordering and asserts the first
+// user row reaches scrollback with a displayID that was NOT already printed.
+func TestFirstUserRowSurvivesEmptyRestore(t *testing.T) {
+	t.Parallel()
+
+	primary := callID(0xAA)
+	agent := &fakeAgent{primaryLoopID: primary}
+	m := New(context.Background(), agent, fakeOpen(agent), AgentBanner{Name: "SWE"})
+
+	// Real startup ordering: size, then the banner commit (systemReady) which flushes
+	// the banner to scrollback, then the background restore fold landing for a NEW
+	// session (empty backlog).
+	m, _ = updateScreen(t, m, tea.WindowSizeMsg{Width: 80, Height: 24})
+	m, cmd := updateScreen(t, m, systemReadyMsg{})
+	drainCmd(t, cmd) // run the banner flush
+	if got := userRowCount(m); got != 0 {
+		t.Fatalf("user rows after banner = %d, want 0", got)
+	}
+
+	// The new-session restore fold: an empty backlog (FoldDisplay over no events).
+	m, _ = updateScreen(t, m, restoredMsg{transcript: transcriptModel{primaryLoopID: primary}, interaction: newInteractionModel()})
+
+	// Snapshot the displayIDs already emitted to scrollback BEFORE the first user turn.
+	// The first user row must not reuse any of them, or the print-once engine drops it.
+	alreadyPrinted := make(map[displayID]bool, len(m.scrollback.printed))
+	for id := range m.scrollback.printed {
+		alreadyPrinted[id] = true
+	}
+
+	// The loop's TurnStarted for the genuine first user message (Cause.LoopID == 0,
+	// Header.LoopID == primary): commits the authoritative user row and flushes it.
+	m = feed(t, m, event.TurnStarted{
+		Header:  event.Header{Coordinates: identity.Coordinates{LoopID: primary}, Cause: identity.Cause{CommandID: fixedFakeSubmitID}},
+		Message: userMsg("Hello"),
+	})
+
+	rec := lastCommitted(t, m)
+	if rec.Kind != kindUser || committedText(rec) != "Hello" {
+		t.Fatalf("last committed = (kind %d, text %q), want (kindUser, %q)", rec.Kind, committedText(rec), "Hello")
+	}
+	if alreadyPrinted[rec.ID] {
+		t.Fatalf("first user row reused displayID %d already printed by the banner — the print-once engine skips it, so the first user message never reaches scrollback", rec.ID)
+	}
+	if !m.scrollback.printed[rec.ID] {
+		t.Error("first user row was not flushed to scrollback")
+	}
+}
+
 // TestSubagentHandbackCommitsNoUserRow is the Screen-level proof that a SubagentResult
 // hand-back (TurnStarted/TurnFoldedInto with a non-zero Cause.LoopID) commits NO
 // user row — only genuine user input (Cause.LoopID == 0) gets a row.
