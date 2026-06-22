@@ -19,11 +19,11 @@ import (
 )
 
 const (
-	// defaultDirName is the per-user urvi data directory under the home root. It matches
+	// defaultDirName is the per-user looprig data directory under the home root. It matches
 	// the existing ~/.looprig convention (where the CLI already writes looprig.log), so all
-	// urvi state lives under one directory.
+	// looprig state lives under one directory.
 	defaultDirName = ".looprig"
-	// jetstreamDirName is the subdirectory under the urvi data dir that holds the
+	// jetstreamDirName is the subdirectory under the looprig data dir that holds the
 	// embedded server's StoreDir (its file-backed streams + KV + object buckets).
 	jetstreamDirName = "jetstream"
 	// storeDirPerm is the StoreDir permission: owner-only (0700). The durable journal may

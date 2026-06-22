@@ -23,8 +23,8 @@ import (
 // file.
 
 const (
-	// urviDirName is the per-user urvi store directory under the home dir.
-	urviDirName = ".looprig"
+	// looprigDirName is the per-user looprig store directory under the home dir.
+	looprigDirName = ".looprig"
 	// workspacesDirName holds one subdirectory per workspace (named by hash).
 	workspacesDirName = "workspaces"
 	// userApprovalsName is the user-global approvals file (~/.looprig/approvals.json).
@@ -56,13 +56,13 @@ func workspaceHash(workspaceRoot string) (string, error) {
 // userApprovalsPath returns the path to the user-global approvals file given a
 // resolved home directory: <home>/.looprig/approvals.json.
 func userApprovalsPath(home string) string {
-	return filepath.Join(home, urviDirName, userApprovalsName)
+	return filepath.Join(home, looprigDirName, userApprovalsName)
 }
 
 // workspaceApprovalsPath returns the path to the workspace-scoped approvals file:
 // <home>/.looprig/workspaces/<hash>/approvals.json.
 func workspaceApprovalsPath(home, hash string) string {
-	return filepath.Join(home, urviDirName, workspacesDirName, hash, workspaceApprovalsName)
+	return filepath.Join(home, looprigDirName, workspacesDirName, hash, workspaceApprovalsName)
 }
 
 // PolicyPathError is the typed failure for resolving a policy-store path (e.g. an

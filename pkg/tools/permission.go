@@ -102,7 +102,7 @@ var defaultDeniedReadPaths = []string{
 	"**/.env",       // dotenv secrets anywhere in the tree
 	"**/*.pem",      // PEM-encoded keys/certs anywhere
 	"**/id_rsa",     // bare SSH private key anywhere
-	"~/.looprig/**", // the urvi policy/config store (approvals, identity)
+	"~/.looprig/**", // the looprig policy/config store (approvals, identity)
 	"**/.skills/**", // workspace skill source: reachable ONLY via the gated Skill tool, never slurped/written by generic file tools (gate-bypass prevention)
 }
 

@@ -37,14 +37,14 @@ func TestGrantTightensAllAncestorDirs(t *testing.T) {
 		{
 			name: "pre-existing loose ~/.looprig and ~/.looprig/workspaces",
 			precreate: map[string]os.FileMode{
-				filepath.Join(urviDirName):                    0o777,
-				filepath.Join(urviDirName, workspacesDirName): 0o777,
+				filepath.Join(looprigDirName):                    0o777,
+				filepath.Join(looprigDirName, workspacesDirName): 0o777,
 			},
 		},
 		{
 			name: "pre-existing loose ~/.looprig only",
 			precreate: map[string]os.FileMode{
-				filepath.Join(urviDirName): 0o755,
+				filepath.Join(looprigDirName): 0o755,
 			},
 		},
 	}
@@ -86,8 +86,8 @@ func TestGrantTightensAllAncestorDirs(t *testing.T) {
 			wsFile := wsApprovalsPathFor(t, home, ws)
 			// ALL THREE store components under <home> must be exactly 0700.
 			for _, dir := range []string{
-				filepath.Join(home, urviDirName),
-				filepath.Join(home, urviDirName, workspacesDirName),
+				filepath.Join(home, looprigDirName),
+				filepath.Join(home, looprigDirName, workspacesDirName),
 				filepath.Dir(wsFile), // the <hash> leaf.
 			} {
 				di, err := os.Stat(dir)
@@ -126,8 +126,8 @@ func TestMkdirStoreDirTightensComponents(t *testing.T) {
 		{
 			name: "loose ~/.looprig + workspaces",
 			precreate: map[string]os.FileMode{
-				urviDirName: 0o777,
-				filepath.Join(urviDirName, workspacesDirName): 0o775,
+				looprigDirName: 0o777,
+				filepath.Join(looprigDirName, workspacesDirName): 0o775,
 			},
 		},
 	}
@@ -144,13 +144,13 @@ func TestMkdirStoreDirTightensComponents(t *testing.T) {
 					t.Fatalf("chmod %q: %v", dir, mode)
 				}
 			}
-			leaf := filepath.Join(home, urviDirName, workspacesDirName, "deadbeef")
+			leaf := filepath.Join(home, looprigDirName, workspacesDirName, "deadbeef")
 			if err := mkdirStoreDir(home, leaf); err != nil {
 				t.Fatalf("mkdirStoreDir: %v", err)
 			}
 			for _, dir := range []string{
-				filepath.Join(home, urviDirName),
-				filepath.Join(home, urviDirName, workspacesDirName),
+				filepath.Join(home, looprigDirName),
+				filepath.Join(home, looprigDirName, workspacesDirName),
 				leaf,
 			} {
 				di, err := os.Stat(dir)
@@ -189,16 +189,16 @@ func TestGrantTightenAncestorFailsSecure(t *testing.T) {
 	}
 	// Pre-create ~/.looprig, then lock it to 0000 so neither MkdirAll nor the chmod
 	// walk can reach/alter the components beneath it — the attack signal.
-	urvi := filepath.Join(home, urviDirName)
-	if err := os.MkdirAll(urvi, 0o700); err != nil {
+	looprig := filepath.Join(home, looprigDirName)
+	if err := os.MkdirAll(looprig, 0o700); err != nil {
 		t.Fatalf("mkdir ~/.looprig: %v", err)
 	}
-	if err := os.Chmod(urvi, 0o000); err != nil {
+	if err := os.Chmod(looprig, 0o000); err != nil {
 		t.Fatalf("chmod ~/.looprig 0000: %v", err)
 	}
 	t.Cleanup(func() {
 		// Restore search/write so t.TempDir cleanup can recurse and remove the tree.
-		_ = os.Chmod(urvi, 0o700)
+		_ = os.Chmod(looprig, 0o700)
 	})
 
 	pc := NewPermissionChecker(PermissionPolicy{WorkspaceRoot: ws, HardDeny: DefaultHardDeny()})
@@ -214,7 +214,7 @@ func TestGrantTightenAncestorFailsSecure(t *testing.T) {
 	}
 
 	// Restore perms to inspect: NO approvals file should have been written.
-	if err := os.Chmod(urvi, 0o700); err != nil {
+	if err := os.Chmod(looprig, 0o700); err != nil {
 		t.Fatalf("restore chmod: %v", err)
 	}
 	wsFile := workspaceApprovalsPath(home, hash)

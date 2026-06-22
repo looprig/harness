@@ -113,7 +113,7 @@ func TestLoaderRejectsSymlinkedComponent(t *testing.T) {
 	}
 	home := t.TempDir()
 	// Build the full valid store under a DECOY dir, then symlink ~/.looprig -> decoy.
-	decoy := filepath.Join(home, "decoy-urvi")
+	decoy := filepath.Join(home, "decoy-looprig")
 	hash, err := workspaceHash(ws)
 	if err != nil {
 		t.Fatalf("workspaceHash: %v", err)
@@ -127,7 +127,7 @@ func TestLoaderRejectsSymlinkedComponent(t *testing.T) {
 		t.Fatalf("write decoy approvals: %v", err)
 	}
 	// ~/.looprig is a symlink to the decoy directory.
-	if err := os.Symlink(decoy, filepath.Join(home, urviDirName)); err != nil {
+	if err := os.Symlink(decoy, filepath.Join(home, looprigDirName)); err != nil {
 		t.Fatalf("symlink ~/.looprig -> decoy: %v", err)
 	}
 
@@ -156,9 +156,9 @@ func TestLoaderRejectsWorldWritableAncestorDir(t *testing.T) {
 		want     loop.Effect
 	}{
 		{name: "control: all dirs 0700", looseRel: "", want: loop.EffectAutoApprove},
-		{name: "world-writable ~/.looprig rejected", looseRel: urviDirName, mode: 0o777, want: loop.EffectAsk},
-		{name: "world-writable ~/.looprig/workspaces rejected", looseRel: filepath.Join(urviDirName, workspacesDirName), mode: 0o777, want: loop.EffectAsk},
-		{name: "group-writable ~/.looprig rejected", looseRel: urviDirName, mode: 0o770, want: loop.EffectAsk},
+		{name: "world-writable ~/.looprig rejected", looseRel: looprigDirName, mode: 0o777, want: loop.EffectAsk},
+		{name: "world-writable ~/.looprig/workspaces rejected", looseRel: filepath.Join(looprigDirName, workspacesDirName), mode: 0o777, want: loop.EffectAsk},
+		{name: "group-writable ~/.looprig rejected", looseRel: looprigDirName, mode: 0o770, want: loop.EffectAsk},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -221,7 +221,7 @@ func TestLoaderRejectsLooseAncestorWarnsPathOnly(t *testing.T) {
 		t.Fatalf("write ws approvals: %v", err)
 	}
 	// Loosen ~/.looprig/workspaces (an ancestor) to world-writable.
-	if err := os.Chmod(filepath.Join(home, urviDirName, workspacesDirName), 0o777); err != nil {
+	if err := os.Chmod(filepath.Join(home, looprigDirName, workspacesDirName), 0o777); err != nil {
 		t.Fatalf("chmod ancestor: %v", err)
 	}
 

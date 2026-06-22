@@ -69,7 +69,7 @@ func fakeHome(t *testing.T, wsRoot string, wsBytes, userBytes []byte) (string, f
 	homeFn := func() (string, error) { return home, nil }
 
 	if userBytes != nil {
-		userFile := filepath.Join(home, urviDirName, userApprovalsName)
+		userFile := filepath.Join(home, looprigDirName, userApprovalsName)
 		if err := os.MkdirAll(filepath.Dir(userFile), 0o700); err != nil {
 			t.Fatalf("mkdir user store: %v", err)
 		}
@@ -82,7 +82,7 @@ func fakeHome(t *testing.T, wsRoot string, wsBytes, userBytes []byte) (string, f
 		if err != nil {
 			t.Fatalf("workspaceHash: %v", err)
 		}
-		wsFile := filepath.Join(home, urviDirName, workspacesDirName, hash, workspaceApprovalsName)
+		wsFile := filepath.Join(home, looprigDirName, workspacesDirName, hash, workspaceApprovalsName)
 		if err := os.MkdirAll(filepath.Dir(wsFile), 0o700); err != nil {
 			t.Fatalf("mkdir ws store: %v", err)
 		}
@@ -698,7 +698,7 @@ func TestReadGuard(t *testing.T) {
 		{name: "id_rsa denied", absPath: "/ws/keys/id_rsa", want: true},
 		{name: "home ssh denied", absPath: "/home/tester/.ssh/id_ed25519", want: true},
 		{name: "home ssh nested denied", absPath: "/home/tester/.ssh/config", want: true},
-		{name: "home urvi denied", absPath: "/home/tester/.looprig/approvals.json", want: true},
+		{name: "home looprig denied", absPath: "/home/tester/.looprig/approvals.json", want: true},
 		{name: "ordinary go file allowed", absPath: "/ws/main.go", want: false},
 		{name: "envrc not env", absPath: "/ws/.envrc", want: false},
 		{name: "other home ssh-like not matched", absPath: "/home/other/.ssh/id_rsa", want: true}, // **/id_rsa matches anywhere
@@ -743,7 +743,7 @@ func TestMatchHardDenyAbs(t *testing.T) {
 		{name: "doublestar env at root", pattern: "**/.env", abs: "/ws/.env", want: true},
 		{name: "tilde ssh expands to home", pattern: "~/.ssh/**", abs: "/home/tester/.ssh/id_rsa", want: true},
 		{name: "tilde ssh exact dir not under not matched", pattern: "~/.ssh/**", abs: "/home/tester/.config/id_rsa", want: false},
-		{name: "tilde urvi nested", pattern: "~/.looprig/**", abs: "/home/tester/.looprig/workspaces/x/approvals.json", want: true},
+		{name: "tilde looprig nested", pattern: "~/.looprig/**", abs: "/home/tester/.looprig/workspaces/x/approvals.json", want: true},
 		{name: "pem glob within segment", pattern: "**/*.pem", abs: "/ws/a/cert.pem", want: true},
 		{name: "non-match", pattern: "**/.env", abs: "/ws/.environment", want: false},
 		{name: "id_rsa anywhere", pattern: "**/id_rsa", abs: "/deep/nested/path/id_rsa", want: true},

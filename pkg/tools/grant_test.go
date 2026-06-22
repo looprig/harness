@@ -83,7 +83,7 @@ func TestGrantWorkspaceWritesOutOfRepo(t *testing.T) {
 		t.Errorf("approvals file perm = %o, want 0600", perm)
 	}
 	// Dir perms 0700 (both <home>/.looprig and the workspace hash dir).
-	for _, dir := range []string{filepath.Join(home, urviDirName), filepath.Dir(wsFile)} {
+	for _, dir := range []string{filepath.Join(home, looprigDirName), filepath.Dir(wsFile)} {
 		di, err := os.Stat(dir)
 		if err != nil {
 			t.Fatalf("stat dir %q: %v", dir, err)

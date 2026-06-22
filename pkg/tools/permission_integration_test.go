@@ -70,13 +70,13 @@ func TestIntegrationSymlinkedPolicyDirRejected(t *testing.T) {
 		linkComponent func(t *testing.T, home, wsRoot string) (decoy string)
 	}{
 		{
-			name: "urvi dir is a symlink",
+			name: "looprig dir is a symlink",
 			linkComponent: func(t *testing.T, home, wsRoot string) string {
-				decoy := filepath.Join(home, "decoy-urvi")
+				decoy := filepath.Join(home, "decoy-looprig")
 				if err := os.MkdirAll(decoy, 0o700); err != nil {
 					t.Fatalf("mkdir decoy: %v", err)
 				}
-				if err := os.Symlink(decoy, filepath.Join(home, urviDirName)); err != nil {
+				if err := os.Symlink(decoy, filepath.Join(home, looprigDirName)); err != nil {
 					t.Fatalf("symlink ~/.looprig -> decoy: %v", err)
 				}
 				return decoy
@@ -90,7 +90,7 @@ func TestIntegrationSymlinkedPolicyDirRejected(t *testing.T) {
 					t.Fatalf("workspaceHash: %v", err)
 				}
 				// Real ~/.looprig/workspaces, but the <hash> entry is a symlink to a decoy.
-				wsParent := filepath.Join(home, urviDirName, workspacesDirName)
+				wsParent := filepath.Join(home, looprigDirName, workspacesDirName)
 				if err := os.MkdirAll(wsParent, 0o700); err != nil {
 					t.Fatalf("mkdir workspaces: %v", err)
 				}
@@ -139,7 +139,7 @@ func TestIntegrationSymlinkedPolicyDirRejected(t *testing.T) {
 				t.Fatalf("workspaceHash: %v", err)
 			}
 			var plant string
-			if tt.name == "urvi dir is a symlink" {
+			if tt.name == "looprig dir is a symlink" {
 				plant = filepath.Join(decoy, workspacesDirName, hash, workspaceApprovalsName)
 			} else {
 				plant = filepath.Join(decoy, workspaceApprovalsName)

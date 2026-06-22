@@ -1,4 +1,4 @@
-// Package cli is the shared CLI runtime for urvi's TUI entry points. It owns the
+// Package cli is the shared CLI runtime for looprig's TUI entry points. It owns the
 // process-level plumbing that every entry point repeats — structured logging to
 // ~/.looprig/looprig.log, signal-driven shutdown, stdout/stderr capture so third-party
 // libraries don't corrupt live scrollback, building and running the Bubble Tea
@@ -57,7 +57,7 @@ const (
 // closeTimeout bounds the best-effort teardown Close of the current agent.
 const closeTimeout = 5 * time.Second
 
-// logDirName / logFileName locate urvi's log file under the user's home directory
+// logDirName / logFileName locate looprig's log file under the user's home directory
 // (~/.looprig/looprig.log). Both the structured app logger (slog) and the captured
 // third-party stderr write here. envLogLevel overrides the minimum slog level.
 const (

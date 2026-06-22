@@ -66,7 +66,7 @@ func TestBuildOffloadMessage(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			putter := &fakePutter{errPut: tt.putErr}
-			rec := foreignRecord{subject: "urvi.test.subject", id: "test-msg-id"}
+			rec := foreignRecord{subject: "looprig.test.subject", id: "test-msg-id"}
 
 			msg, err := buildOffloadMessage(context.Background(), putter, rec, tt.payload)
 
