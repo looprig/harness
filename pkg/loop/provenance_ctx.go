@@ -23,3 +23,18 @@ func ProvenanceFrom(ctx context.Context) (Provenance, bool) {
 	p, ok := ctx.Value(provenanceKey{}).(Provenance)
 	return p, ok
 }
+
+// WithToolUseID returns a child ctx carrying the active tool call's provider
+// tool-use id (content.ToolUseBlock.ID). The runner injects it per call; the
+// exported read side is ToolUseIDFrom. It mirrors WithProvenance/ProvenanceFrom so
+// a tool (e.g. the Subagent tool) that forwards its own tool-use id when spawning a
+// sub-loop can be exercised in isolation without driving the whole runner.
+func WithToolUseID(ctx context.Context, id string) context.Context {
+	return withToolUseID(ctx, id)
+}
+
+// ToolUseIDFrom returns the provider tool-use id set by WithToolUseID, and whether
+// it was present. An absent key yields "" and false.
+func ToolUseIDFrom(ctx context.Context) (string, bool) {
+	return toolUseIDFromContext(ctx)
+}

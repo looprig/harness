@@ -62,6 +62,7 @@ func accepts(kind gateKind, cmd command.Command) bool {
 // constructed by an outside package.
 type emitKey struct{}
 type callIDKey struct{}
+type toolUseIDKey struct{}
 type gateRegKey struct{}
 type preparedKey struct{}
 
@@ -74,6 +75,13 @@ func withEmit(ctx context.Context, emit func(event.Event)) context.Context {
 // withCallID returns a child ctx carrying the active tool call's ToolExecutionID.
 func withCallID(ctx context.Context, callID uuid.UUID) context.Context {
 	return context.WithValue(ctx, callIDKey{}, callID)
+}
+
+// withToolUseID returns a child ctx carrying the active tool call's provider
+// tool-use id (content.ToolUseBlock.ID), the durable handle a spawned subagent
+// loop links back to the parent Subagent tool call.
+func withToolUseID(ctx context.Context, id string) context.Context {
+	return context.WithValue(ctx, toolUseIDKey{}, id)
 }
 
 // withGateReg returns a child ctx carrying the actor's gate-registration handle.
@@ -96,6 +104,12 @@ func WithPrepared(ctx context.Context, prepared tool.PreparedArtifact) context.C
 // callIDFromContext reads the active ToolExecutionID, false when absent.
 func callIDFromContext(ctx context.Context) (uuid.UUID, bool) {
 	v, ok := ctx.Value(callIDKey{}).(uuid.UUID)
+	return v, ok
+}
+
+// toolUseIDFromContext reads the active provider tool-use id, false when absent.
+func toolUseIDFromContext(ctx context.Context) (string, bool) {
+	v, ok := ctx.Value(toolUseIDKey{}).(string)
 	return v, ok
 }
 
