@@ -12,13 +12,12 @@ GO_DIRS := $(shell go list -f '{{.Dir}}' ./...)
 export GOFLAGS := -mod=vendor
 
 build:
-	CGO_ENABLED=0 go build -trimpath -o bin/urvi ./cmd/cli
+	CGO_ENABLED=0 go build -trimpath -o bin/swe ./cmd/swe
 
 # Run the TUI directly. Loads .env (if present) so LLM_API_KEY and friends are
-# exported for the process. Select an agent with AGENT=<name> (default: coding).
-# e.g. make run AGENT=coding
+# exported for the process.
 run:
-	set -a; [ -f .env ] && . ./.env; set +a; go run ./cmd/cli $(AGENT)
+	set -a; [ -f .env ] && . ./.env; set +a; go run ./cmd/swe
 
 test:
 	go test -race ./...
