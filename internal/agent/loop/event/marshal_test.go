@@ -513,6 +513,12 @@ func TestMarshalEventPermissionRequestedFullRequest(t *testing.T) {
 		{"fetch", tool.FetchRequest{Method: "GET", URL: "https://example.com"}},
 		{"web search", tool.WebSearchRequest{Query: "how to escape a sandbox"}},
 		{"unknown", tool.UnknownRequest{Tool: "Mystery", Summary: "redacted"}},
+		{"skill load", tool.SkillLoadRequest{
+			RelPath: ".skills/lint/SKILL.md",
+			Agent:   identity.AgentName("explorer"),
+			Size:    2048,
+			SHA256:  "feedfacefeedfacefeedfacefeedfacefeedfacefeedfacefeedfacefeedface0",
+		}},
 	}
 
 	for _, tt := range tests {
@@ -705,6 +711,7 @@ func FuzzDecodeEvent(f *testing.F) {
 		TurnDone{Header: fullHeaderTurn(), Message: aiMsg("done")},
 		TurnFailed{Header: fullHeaderTurn(), Err: &ToolLimitError{}},
 		PermissionRequested{Header: fullHeader(), ToolExecutionID: seededUUID(0x77), Request: tool.BashRequest{Command: "ls"}},
+		PermissionRequested{Header: fullHeader(), ToolExecutionID: seededUUID(0x78), Request: tool.SkillLoadRequest{RelPath: ".skills/x/SKILL.md", Agent: identity.AgentName("explorer"), Size: 10, SHA256: "abc"}},
 		TurnInterrupted{Header: fullHeaderTurn()},
 	}
 	for _, ev := range seedEvents {

@@ -1,9 +1,13 @@
 package tool
 
 import (
+	"encoding/json"
 	"errors"
 	"reflect"
+	"strings"
 	"testing"
+
+	"github.com/inventivepotter/urvi/internal/agent/loop/identity"
 )
 
 // sameRequest reports whether two PermissionRequests are observably equal through
@@ -43,6 +47,8 @@ func TestPermissionRequestCodecRoundTrip(t *testing.T) {
 		{name: "web search empty", req: WebSearchRequest{}},
 		{name: "unknown", req: UnknownRequest{Tool: "MysteryTool", Summary: "did a redacted thing"}},
 		{name: "unknown empty", req: UnknownRequest{}},
+		{name: "skill load", req: SkillLoadRequest{RelPath: ".skills/lint/SKILL.md", Agent: identity.AgentName("explorer"), Size: 1234, SHA256: "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"}},
+		{name: "skill load empty", req: SkillLoadRequest{}},
 	}
 	for _, tt := range tests {
 		tt := tt
@@ -63,6 +69,65 @@ func TestPermissionRequestCodecRoundTrip(t *testing.T) {
 				t.Errorf("reconstructed type = %T, want %T", got, tt.req)
 			}
 		})
+	}
+}
+
+// TestSkillLoadRequestCodecMetadataNoBody proves the SkillLoadRequest codec persists
+// its safe metadata + full SHA-256 intact across a round-trip AND that the wire form
+// carries ONLY that metadata — no "body"/"content"/"data" key — so a persisted record
+// can never smuggle a workspace skill body (which the type carries no field for by
+// construction; design §7a). The full digest survives (not the truncated prompt prefix).
+func TestSkillLoadRequestCodecMetadataNoBody(t *testing.T) {
+	t.Parallel()
+
+	full := "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	in := SkillLoadRequest{
+		RelPath: ".skills/review/SKILL.md",
+		Agent:   identity.AgentName("researcher"),
+		Size:    4096,
+		SHA256:  full,
+	}
+
+	data, err := MarshalPermissionRequest(in)
+	if err != nil {
+		t.Fatalf("MarshalPermissionRequest() error = %v", err)
+	}
+
+	// The wire form is metadata only: assert no body-bearing key ever appears.
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		t.Fatalf("unmarshal wire to key map: %v", err)
+	}
+	for _, banned := range []string{"body", "Body", "content", "Content", "data", "Data", "snapshot", "Snapshot"} {
+		if _, ok := fields[banned]; ok {
+			t.Errorf("wire form carries a body-bearing key %q; metadata only is permitted: %s", banned, data)
+		}
+	}
+	// Belt-and-suspenders: the full 64-char digest is the only place the body's hash
+	// appears; the body text itself must never be present.
+	if strings.Contains(string(data), "SKILL body") {
+		t.Errorf("wire form appears to carry skill body text: %s", data)
+	}
+
+	got, err := UnmarshalPermissionRequest(data)
+	if err != nil {
+		t.Fatalf("UnmarshalPermissionRequest() error = %v", err)
+	}
+	skill, ok := got.(SkillLoadRequest)
+	if !ok {
+		t.Fatalf("reconstructed type = %T, want SkillLoadRequest", got)
+	}
+	if skill.RelPath != in.RelPath {
+		t.Errorf("RelPath = %q, want %q", skill.RelPath, in.RelPath)
+	}
+	if skill.Agent != in.Agent {
+		t.Errorf("Agent = %q, want %q", skill.Agent, in.Agent)
+	}
+	if skill.Size != in.Size {
+		t.Errorf("Size = %d, want %d", skill.Size, in.Size)
+	}
+	if skill.SHA256 != in.SHA256 {
+		t.Errorf("SHA256 = %q, want %q (full digest must survive intact)", skill.SHA256, in.SHA256)
 	}
 }
 
@@ -176,6 +241,7 @@ func FuzzUnmarshalPermissionRequest(f *testing.F) {
 		[]byte(`{"type":"fetch","Method":"GET","URL":"https://x"}`),
 		[]byte(`{"type":"web_search","Query":"q"}`),
 		[]byte(`{"type":"unknown","Tool":"T","Summary":"s"}`),
+		[]byte(`{"type":"skill_load","RelPath":".skills/x/SKILL.md","Agent":"explorer","Size":10,"SHA256":"abc"}`),
 		[]byte(`{"type":"telepathy"}`),
 		[]byte(`not json`),
 		[]byte(``),

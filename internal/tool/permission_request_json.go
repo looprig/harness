@@ -16,13 +16,15 @@ const (
 	typeBash      requestType = "bash"
 	typeFetch     requestType = "fetch"
 	typeWebSearch requestType = "web_search"
+	typeSkill     requestType = "skill_load"
 	typeUnknown   requestType = "unknown"
 )
 
 // maxPermissionRequestBytes caps the serialized size accepted at the untrusted
 // restore boundary. A permission request carries only small redacted strings
-// (path, command, URL, query, summary), so a generous cap still fails closed on
-// absurd input. Conservative starting value; tune to real sizes later.
+// (path, command, URL, query, summary, or a skill load's rel-path + agent + size +
+// hex digest — NEVER a skill body), so a generous cap still fails closed on absurd
+// input. Conservative starting value; tune to real sizes later.
 const maxPermissionRequestBytes = 1 << 20 // 1 MiB
 
 // UnknownPermissionRequestError is returned by the codec when serialized bytes
@@ -114,6 +116,13 @@ func requestTag(r PermissionRequest) (requestType, error) {
 			return "", &NilPermissionRequestError{}
 		}
 		return typeWebSearch, nil
+	case SkillLoadRequest:
+		return typeSkill, nil
+	case *SkillLoadRequest:
+		if v == nil {
+			return "", &NilPermissionRequestError{}
+		}
+		return typeSkill, nil
 	case UnknownRequest:
 		return typeUnknown, nil
 	case *UnknownRequest:
@@ -182,6 +191,8 @@ func UnmarshalPermissionRequest(data []byte) (PermissionRequest, error) {
 		return decodeRequest[FetchRequest](data)
 	case typeWebSearch:
 		return decodeRequest[WebSearchRequest](data)
+	case typeSkill:
+		return decodeRequest[SkillLoadRequest](data)
 	case typeUnknown:
 		return decodeRequest[UnknownRequest](data)
 	default:
