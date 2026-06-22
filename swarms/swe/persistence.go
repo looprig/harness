@@ -128,10 +128,17 @@ func (p *Persistence) openWithClient(ctx context.Context, client llm.LLM, factor
 		return nil, err
 	}
 
+	// The swarm-level config-fingerprint fields (AgentKind + RuntimeSkills mode + canonical
+	// workspace-root id) are computed once here, where root + cfg are in scope, and threaded
+	// into both construction paths so a NEW session stamps them and a RESUMED session compares
+	// them (a different skill-trust mode or workspace then rejects). Same fields the headless
+	// New path injects, so the persisted and headless fingerprints cannot drift.
+	fields := orchestratorFingerprintFields(root, cfg)
+
 	if sel.Resume.IsZero() {
-		return p.openNew(ctx, wiring)
+		return p.openNew(ctx, wiring, fields)
 	}
-	return p.openResume(ctx, wiring, sel)
+	return p.openResume(ctx, wiring, sel, fields)
 }
 
 // openNew opens a NEW persisted session. It resolves the journal chicken-and-egg by
@@ -141,7 +148,7 @@ func (p *Persistence) openWithClient(ctx context.Context, client llm.LLM, factor
 // both appenders + the lease-release hook (so a clean Shutdown frees ownership) + the
 // orchestrator spawn caps. On any failure before the session is built it releases the
 // lease so a retry can re-acquire without waiting out the TTL.
-func (p *Persistence) openNew(ctx context.Context, wiring orchestratorWiring) (*sessionAgent, error) {
+func (p *Persistence) openNew(ctx context.Context, wiring orchestratorWiring, fields session.ConfigFingerprintFields) (*sessionAgent, error) {
 	// (1) Mint the sessionID FIRST — the journal needs it to bind the stream + write the
 	// opening LeaseFence before the session exists. (chicken-and-egg resolution)
 	sessionID, err := uuid.New()
@@ -182,6 +189,7 @@ func (p *Persistence) openNew(ctx context.Context, wiring orchestratorWiring) (*
 		session.WithCommandAppender(cmdAppender),
 		session.WithLeaseRelease(lease.Release),
 		session.WithLimits(orchestratorLimits()),
+		session.WithConfigFingerprintFields(fields),
 	)
 	if err != nil {
 		releaseLeaseBestEffort(lease)
@@ -199,13 +207,19 @@ func (p *Persistence) openNew(ctx context.Context, wiring orchestratorWiring) (*
 // loop up idle, and installs its own lease-release-on-Shutdown hook (so a clean Shutdown
 // frees ownership). The resumed agent's replayer is wired so ReplayBacklog can repaint the
 // restored transcript under the orchestrator spawn caps.
-func (p *Persistence) openResume(ctx context.Context, wiring orchestratorWiring, sel SessionSelector) (*sessionAgent, error) {
+func (p *Persistence) openResume(ctx context.Context, wiring orchestratorWiring, sel SessionSelector, fields session.ConfigFingerprintFields) (*sessionAgent, error) {
 	objects, err := p.js.ObjectStore(journal.SessionObjectBucket(sel.Resume))
 	if err != nil {
 		return nil, err
 	}
 
-	opts := []session.Option{session.WithLimits(orchestratorLimits())}
+	// Inject the SAME swarm-level fingerprint fields the original run stamped, so Restore's
+	// live fingerprint is computed identically; a different skill-trust mode or workspace
+	// then rejects (unless WithAllowConfigMismatch).
+	opts := []session.Option{
+		session.WithLimits(orchestratorLimits()),
+		session.WithConfigFingerprintFields(fields),
+	}
 	if sel.AllowConfigMismatch {
 		opts = append(opts, session.WithAllowConfigMismatch())
 	}

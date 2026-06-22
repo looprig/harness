@@ -199,6 +199,14 @@ type Session struct {
 	// consults it. Default false = fail-secure (a mismatch rejects the restore).
 	allowConfigMismatch bool
 
+	// configFingerprintFields are the swarm-level fingerprint inputs not on loop.Config
+	// (AgentKind, RuntimeSkills, WorkspaceRoot), injected via WithConfigFingerprintFields.
+	// New merges them onto the loop-derived fingerprint it stamps on SessionStarted;
+	// Restore merges them onto the LIVE fingerprint it compares against the persisted one
+	// (so a different skill-trust mode or workspace can't silently resume). Zero (the
+	// default, no option) leaves them empty — a non-swarm/legacy session is unaffected.
+	configFingerprintFields ConfigFingerprintFields
+
 	// injectedSessionID is the externally-minted sessionID the composition root supplies
 	// via WithSessionID, read ONLY by newSession to resolve the journal chicken-and-egg:
 	// the journal needs the sid before session construction, so the composition root mints
@@ -733,7 +741,10 @@ func newSession(ctx context.Context, cfg loop.Config, newID idGenerator, now eve
 	// nobody (a no-op), but it is the session's authoritative session-scoped start.
 	// Config is the fingerprint of the agent configuration this session started
 	// under, stamped here so a durable journal can detect a config change on restore.
-	if err := s.hub.PublishEvent(sessionCtx, event.SessionStarted{Header: startedHeader, Config: FingerprintFrom(cfg)}); err != nil {
+	// It merges the loop-derived fingerprint with the swarm-level fields the composition
+	// root injected (AgentKind/RuntimeSkills/WorkspaceRoot), via the SAME fingerprintWith
+	// the restore comparison uses, so the stamped and compared-against fingerprints match.
+	if err := s.hub.PublishEvent(sessionCtx, event.SessionStarted{Header: startedHeader, Config: fingerprintWith(cfg, s.configFingerprintFields)}); err != nil {
 		sessionCancel()
 		return nil, &SessionError{Kind: SessionContextDone, Cause: err}
 	}

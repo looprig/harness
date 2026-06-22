@@ -134,6 +134,11 @@ func restoreSession(
 		opt(probe)
 	}
 	allowMismatch := probe.allowConfigMismatch
+	// The swarm-level fingerprint fields (AgentKind/RuntimeSkills/WorkspaceRoot) the
+	// composition root injected via WithConfigFingerprintFields are read off the same
+	// probe, so the LIVE fingerprint the restore compares is computed identically to the
+	// one New stamped — a different skill-trust mode or workspace then rejects.
+	fingerprintFields := probe.configFingerprintFields
 
 	// (1) Acquire the single-writer lease, then construct the journal (which writes the
 	// opening LeaseFence as its first append — the handover boundary) and the replayer.
@@ -181,7 +186,7 @@ func restoreSession(
 	if err != nil {
 		return recordErrored(err)
 	}
-	if err := checkFingerprint(persisted, FingerprintFrom(cfg), allowMismatch); err != nil {
+	if err := checkFingerprint(persisted, fingerprintWith(cfg, fingerprintFields), allowMismatch); err != nil {
 		return recordErrored(err)
 	}
 

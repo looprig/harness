@@ -8,6 +8,7 @@ import (
 	"crypto/tls"
 	"net/http"
 	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/inventivepotter/urvi/agents/orchestrator"
@@ -18,6 +19,41 @@ import (
 	"github.com/inventivepotter/urvi/tools"
 	"github.com/inventivepotter/urvi/tui"
 )
+
+// orchestratorAgentKind is the swarm + primary agent identity stamped onto the session's
+// config fingerprint (the AgentKind field). It binds a persisted session to the SWE swarm
+// running the orchestrator as its primary, so a prior coding/other-swarm session (a
+// different or empty AgentKind, and anyway a different system-prompt/tool-policy digest)
+// can never silently resume as SWE. Format is "<swarm>:<primary agent>".
+const orchestratorAgentKind = "swe:" + string(orchestrator.Name)
+
+// canonicalWorkspaceRoot returns the canonical absolute id of the workspace root for the
+// config fingerprint: filepath.Abs (os.Getwd already returns absolute, but a future caller
+// may not) then filepath.Clean. Two runs against the same repo produce the same id; two
+// repos produce different ids — so a session cannot silently resume under a different
+// repo's .skills/ (the RuntimeSkills mode flag alone does not distinguish them).
+func canonicalWorkspaceRoot(root string) string {
+	abs, err := filepath.Abs(root)
+	if err != nil {
+		// Abs only fails when the cwd is unavailable; root from os.Getwd is already
+		// absolute, so fall back to a Clean of the input rather than fail the fingerprint.
+		return filepath.Clean(root)
+	}
+	return filepath.Clean(abs)
+}
+
+// orchestratorFingerprintFields assembles the swarm-level config-fingerprint inputs that
+// do NOT live on loop.Config: the swarm+primary AgentKind, the human-set RuntimeSkills
+// mode (so a session can't resume under a different skill-trust mode), and the canonical
+// workspace-root id (so it can't resume against a different repo's workspace). The session
+// merges these onto the loop-derived fingerprint at New and compares them at Restore.
+func orchestratorFingerprintFields(root string, cfg Config) session.ConfigFingerprintFields {
+	return session.ConfigFingerprintFields{
+		AgentKind:     orchestratorAgentKind,
+		RuntimeSkills: cfg.RuntimeSkills,
+		WorkspaceRoot: canonicalWorkspaceRoot(root),
+	}
+}
 
 // Subagent-spawn safety caps applied to the orchestrator's session. They are the
 // two independent backstops against a runaway agent tree: orchestratorSpawnDepth
@@ -193,7 +229,10 @@ func newWithClient(ctx context.Context, client llm.LLM, factory ModelFactory, cf
 	if err != nil {
 		return nil, err
 	}
-	agent, err := newSessionAgent(ctx, wiring.cfg, session.WithLimits(orchestratorLimits()))
+	agent, err := newSessionAgent(ctx, wiring.cfg,
+		session.WithLimits(orchestratorLimits()),
+		session.WithConfigFingerprintFields(orchestratorFingerprintFields(root, cfg)),
+	)
 	if err != nil {
 		return nil, err
 	}

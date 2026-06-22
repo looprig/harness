@@ -94,13 +94,88 @@ func TestFingerprintFromDiffers(t *testing.T) {
 	}
 }
 
-// TestFingerprintFromAgentKindEmpty pins the documented gap: loop.Config does not
-// carry an agent kind yet, so AgentKind is left empty (the TODO in FingerprintFrom).
-func TestFingerprintFromAgentKindEmpty(t *testing.T) {
+// TestFingerprintFromSwarmFieldsEmpty pins that FingerprintFrom derives ONLY the
+// loop.Config fields: the swarm-level fields (AgentKind, RuntimeSkills, WorkspaceRoot)
+// are NOT on loop.Config, so a bare FingerprintFrom leaves them empty/zero — they are
+// injected by the composition root via WithConfigFingerprintFields and merged with
+// fingerprintWith.
+func TestFingerprintFromSwarmFieldsEmpty(t *testing.T) {
 	t.Parallel()
 	fp := FingerprintFrom(fpConfig("model-x", "prompt", "Read"))
 	if fp.AgentKind != "" {
-		t.Errorf("AgentKind = %q, want \"\" (loop.Config exposes no agent kind yet)", fp.AgentKind)
+		t.Errorf("AgentKind = %q, want \"\" (not a loop.Config field)", fp.AgentKind)
+	}
+	if fp.RuntimeSkills {
+		t.Error("RuntimeSkills = true, want false (not a loop.Config field)")
+	}
+	if fp.WorkspaceRoot != "" {
+		t.Errorf("WorkspaceRoot = %q, want \"\" (not a loop.Config field)", fp.WorkspaceRoot)
+	}
+}
+
+// TestFingerprintWithMergesSwarmFields asserts fingerprintWith applies the injected
+// swarm-level fields onto the loop-derived fingerprint, and that a difference in ANY
+// one of them (AgentKind, RuntimeSkills, WorkspaceRoot) alone — same loop.Config —
+// yields an unequal fingerprint. This is what makes a restore reject a session resuming
+// under a different agent identity, skill-trust mode, or workspace.
+func TestFingerprintWithMergesSwarmFields(t *testing.T) {
+	t.Parallel()
+
+	cfg := fpConfig("model-x", "prompt", "Read")
+	base := ConfigFingerprintFields{
+		AgentKind:     "swe:orchestrator",
+		RuntimeSkills: true,
+		WorkspaceRoot: "/home/user/repo",
+	}
+	baseFP := fingerprintWith(cfg, base)
+
+	// The merged fingerprint carries the injected fields verbatim.
+	if baseFP.AgentKind != base.AgentKind {
+		t.Errorf("AgentKind = %q, want %q", baseFP.AgentKind, base.AgentKind)
+	}
+	if baseFP.RuntimeSkills != base.RuntimeSkills {
+		t.Errorf("RuntimeSkills = %v, want %v", baseFP.RuntimeSkills, base.RuntimeSkills)
+	}
+	if baseFP.WorkspaceRoot != base.WorkspaceRoot {
+		t.Errorf("WorkspaceRoot = %q, want %q", baseFP.WorkspaceRoot, base.WorkspaceRoot)
+	}
+
+	diffKind := base
+	diffKind.AgentKind = "swe:operator"
+	diffSkills := base
+	diffSkills.RuntimeSkills = false
+	diffRoot := base
+	diffRoot.WorkspaceRoot = "/other/repo"
+
+	tests := []struct {
+		name   string
+		fields ConfigFingerprintFields
+	}{
+		{"AgentKind differs", diffKind},
+		{"RuntimeSkills differs", diffSkills},
+		{"WorkspaceRoot differs", diffRoot},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got := fingerprintWith(cfg, tt.fields)
+			if baseFP.Equal(got) {
+				t.Errorf("fingerprint did not change for %s: both %+v", tt.name, got)
+			}
+		})
+	}
+}
+
+// TestFingerprintWithEmptyFieldsMatchesBare asserts the additive-compatibility path: a
+// fingerprint computed with the zero ConfigFingerprintFields (a non-swarm caller) is
+// Equal to the bare FingerprintFrom over the same config — so an old session persisted
+// before the swarm fields existed restores equal to one re-derived today without them.
+func TestFingerprintWithEmptyFieldsMatchesBare(t *testing.T) {
+	t.Parallel()
+	cfg := fpConfig("model-x", "prompt", "Read")
+	if !fingerprintWith(cfg, ConfigFingerprintFields{}).Equal(FingerprintFrom(cfg)) {
+		t.Error("fingerprintWith with empty fields != bare FingerprintFrom; the compatibility path is broken")
 	}
 }
 

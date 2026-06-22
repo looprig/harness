@@ -15,6 +15,8 @@ func fullFingerprint() event.ConfigFingerprint {
 		ModelID:         "claude-test",
 		SystemPromptRev: "abc123",
 		ToolPolicyRev:   "def456",
+		RuntimeSkills:   true,
+		WorkspaceRoot:   "/home/user/repo",
 	}
 }
 
@@ -34,6 +36,10 @@ func TestConfigFingerprintEqual(t *testing.T) {
 	diffPrompt.SystemPromptRev = "999999"
 	diffTools := base
 	diffTools.ToolPolicyRev = "000000"
+	diffRuntimeSkills := base
+	diffRuntimeSkills.RuntimeSkills = false
+	diffWorkspaceRoot := base
+	diffWorkspaceRoot.WorkspaceRoot = "/other/repo"
 
 	tests := []struct {
 		name string
@@ -46,6 +52,8 @@ func TestConfigFingerprintEqual(t *testing.T) {
 		{"ModelID differs", base, diffModel, false},
 		{"SystemPromptRev differs", base, diffPrompt, false},
 		{"ToolPolicyRev differs", base, diffTools, false},
+		{"RuntimeSkills differs", base, diffRuntimeSkills, false},
+		{"WorkspaceRoot differs", base, diffWorkspaceRoot, false},
 		{"zero vs full differs", event.ConfigFingerprint{}, base, false},
 	}
 	for _, tt := range tests {
@@ -76,6 +84,8 @@ func TestConfigFingerprintJSONRoundTrip(t *testing.T) {
 		{"full", fullFingerprint()},
 		{"zero is boundary", event.ConfigFingerprint{}},
 		{"only model set", event.ConfigFingerprint{ModelID: "m"}},
+		{"runtime skills only", event.ConfigFingerprint{RuntimeSkills: true}},
+		{"workspace root only", event.ConfigFingerprint{WorkspaceRoot: "/r"}},
 	}
 	for _, tt := range tests {
 		tt := tt
@@ -103,6 +113,42 @@ func TestConfigFingerprintJSONRoundTrip(t *testing.T) {
 	}
 	if string(data) != "{}" {
 		t.Errorf("zero ConfigFingerprint marshalled to %s, want {} (all fields omitzero)", data)
+	}
+}
+
+// TestConfigFingerprintOldRecordCompat asserts the new fields (RuntimeSkills,
+// WorkspaceRoot) are ADDITIVE: an OLD journal record that predates them — its JSON
+// carries only the original four keys — decodes to a fingerprint whose new fields are
+// the zero values, and compares Equal to a fingerprint built today with the new fields
+// left empty. This is the compatibility path: a session persisted before P2b restores
+// equal to the same config re-derived today (the new fields default to empty), so the
+// additive evolution never spuriously rejects an old record.
+func TestConfigFingerprintOldRecordCompat(t *testing.T) {
+	t.Parallel()
+
+	// An old SessionStarted record: only the original four fingerprint keys exist.
+	oldJSON := `{"agent_kind":"primary","model_id":"claude-test","system_prompt_rev":"abc123","tool_policy_rev":"def456"}`
+	var fromOld event.ConfigFingerprint
+	if err := json.Unmarshal([]byte(oldJSON), &fromOld); err != nil {
+		t.Fatalf("json.Unmarshal(old record): %v", err)
+	}
+	if fromOld.RuntimeSkills {
+		t.Errorf("RuntimeSkills decoded from old record = true, want false (absent key)")
+	}
+	if fromOld.WorkspaceRoot != "" {
+		t.Errorf("WorkspaceRoot decoded from old record = %q, want \"\" (absent key)", fromOld.WorkspaceRoot)
+	}
+
+	// A fingerprint built today from the same config but with the new fields left empty
+	// (e.g. a non-swarm caller that does not set them) must compare Equal to the old one.
+	today := event.ConfigFingerprint{
+		AgentKind:       "primary",
+		ModelID:         "claude-test",
+		SystemPromptRev: "abc123",
+		ToolPolicyRev:   "def456",
+	}
+	if !fromOld.Equal(today) {
+		t.Errorf("old record %+v not Equal to today's empty-new-fields fingerprint %+v", fromOld, today)
 	}
 }
 

@@ -657,6 +657,89 @@ func TestRestoreConfigMismatch(t *testing.T) {
 	}
 }
 
+// TestRestoreSwarmFingerprintMismatch proves the fail-secure config check end to end for
+// the injected swarm-level fingerprint fields (AgentKind/RuntimeSkills/WorkspaceRoot): a
+// session persisted under one set of these fields rejects a restore that injects a
+// DIFFERENT value via WithConfigFingerprintFields — even when the loop.Config (model,
+// system, tools) is identical. A mismatch in any one field rejects with
+// *ConfigMismatchError and records a RestoreErrored, unless WithAllowConfigMismatch. This
+// is what stops a session silently resuming under a different skill-trust mode or repo.
+func TestRestoreSwarmFingerprintMismatch(t *testing.T) {
+	persistedFields := ConfigFingerprintFields{
+		AgentKind:     "swe:orchestrator",
+		RuntimeSkills: true,
+		WorkspaceRoot: "/home/user/repo",
+	}
+	diffKind := persistedFields
+	diffKind.AgentKind = "swe:operator"
+	diffSkills := persistedFields
+	diffSkills.RuntimeSkills = false
+	diffRoot := persistedFields
+	diffRoot.WorkspaceRoot = "/home/user/OTHER"
+
+	tests := []struct {
+		name      string
+		liveField ConfigFingerprintFields
+	}{
+		{"AgentKind differs", diffKind},
+		{"RuntimeSkills differs", diffSkills},
+		{"WorkspaceRoot differs", diffRoot},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			js := newEmbeddedJS(t)
+			cfg := restoreCfg(&stubLLM{}, "model-x", "be helpful")
+			// Persist the fingerprint the original ran under: loop-derived + the swarm fields.
+			persistedFP := fingerprintWith(cfg, persistedFields)
+
+			orig := buildOriginalRun(t, js, persistedFP,
+				restoreCfg(&stubLLM{chunks: []content.Chunk{textChunk("reply")}}, "model-x", "be helpful"), 1)
+			handOver(t, orig.lease)
+			objStore := mustObjectStore(t, js, orig.sessionID)
+
+			// Restore with the SAME loop.Config but a DIFFERENT injected swarm field → reject.
+			s, err := Restore(context.Background(), cfg, orig.sessionID, js, objStore, mustLeaseManager(t, js),
+				WithConfigFingerprintFields(tt.liveField))
+			if s != nil {
+				t.Fatalf("Restore returned a non-nil Session on a swarm fingerprint mismatch")
+			}
+			var cme *ConfigMismatchError
+			if !errors.As(err, &cme) {
+				t.Fatalf("Restore err = %v, want *ConfigMismatchError", err)
+			}
+			if !cme.Persisted.Equal(persistedFP) {
+				t.Errorf("ConfigMismatchError.Persisted = %+v, want %+v", cme.Persisted, persistedFP)
+			}
+
+			// A RestoreErrored is recorded — fail-secure (no RestoreDone followed).
+			tail := restoreEventTail(t, js, orig.sessionID, orig.primaryLoopID)
+			if !lastIs(tail, event.RestoreErrored{}) {
+				t.Errorf("restore-event tail does not end with RestoreErrored: %v", tailTypes(tail))
+			}
+
+			// The override proceeds despite the mismatch (the rejected attempt released its lease).
+			s2, err := Restore(context.Background(), cfg, orig.sessionID, js, objStore, mustLeaseManager(t, js),
+				WithConfigFingerprintFields(tt.liveField), WithAllowConfigMismatch())
+			if err != nil {
+				t.Fatalf("Restore with WithAllowConfigMismatch (swarm field) err = %v, want success", err)
+			}
+			// Shutdown releases the lease Restore installed, so a successor can re-acquire.
+			if err := s2.Shutdown(context.Background()); err != nil {
+				t.Fatalf("Shutdown override session: %v", err)
+			}
+
+			// A MATCHING injected field set restores cleanly (the agreement/compatibility path).
+			s3, err := Restore(context.Background(), cfg, orig.sessionID, js, objStore, mustLeaseManager(t, js),
+				WithConfigFingerprintFields(persistedFields))
+			if err != nil {
+				t.Fatalf("Restore with matching swarm fields err = %v, want success", err)
+			}
+			t.Cleanup(func() { _ = s3.Shutdown(context.Background()) })
+		})
+	}
+}
+
 // TestRestoreAgentNameMismatch proves the fail-secure root-loop AgentName check end to end:
 // the persisted root LoopStarted's stamped name must match the configured primary's
 // AgentName. A different name — AND an empty (legacy/pre-AgentName) persisted name vs a

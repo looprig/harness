@@ -123,6 +123,19 @@ func WithAllowConfigMismatch() Option {
 	}
 }
 
+// WithConfigFingerprintFields injects the swarm-level config-fingerprint inputs that do
+// NOT live on loop.Config (AgentKind, RuntimeSkills, WorkspaceRoot). New merges them
+// onto the loop-derived fingerprint it stamps on SessionStarted; Restore merges them
+// onto the LIVE fingerprint it compares against the persisted one, so a session cannot
+// silently resume under a different agent identity, skill-trust mode, or workspace
+// (mismatch → *ConfigMismatchError unless WithAllowConfigMismatch). Without this option
+// the fields stay empty (a non-swarm/legacy session is unaffected — additive evolution).
+func WithConfigFingerprintFields(fields ConfigFingerprintFields) Option {
+	return func(s *Session) {
+		s.configFingerprintFields = fields
+	}
+}
+
 // stampNow returns the session clock's current time, defaulting to the wall clock if
 // the clock seam is unset (a struct-literal test session). The session stamps this onto
 // every dispatched command's Header.CreatedAt at the dispatch boundary, so a journaled
