@@ -55,7 +55,7 @@ func (f *fakeRunner) RunSubagent(_ context.Context, parent loop.Provenance, cfg 
 func newTestSwarmSpawner(t *testing.T) (*swarmSpawner, *fakeRunner) {
 	t.Helper()
 	deps := LeafToolDeps{Root: "/tmp/workspace-root", HTTPCl: &http.Client{}}
-	reg, loader, err := leafRegistry(deps)
+	reg, loader, err := leafRegistry(deps, Config{})
 	if err != nil {
 		t.Fatalf("leafRegistry() error = %v", err)
 	}

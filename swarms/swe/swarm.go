@@ -135,47 +135,53 @@ type orchestratorWiring struct {
 // buildOrchestratorWiring is the single seam that assembles the orchestratorWiring used
 // by ALL THREE construction paths (New, openNew, openResume), so the spawner + Subagent
 // wiring cannot drift across them. It builds the leaf Registry + shared HTTP client, the
-// unbound spawner, and the primary cfg (with Subagent wired to the spawner). The caller
-// builds the session from wiring.cfg and then calls wiring.spawner.bind(session) once.
-func buildOrchestratorWiring(client llm.LLM, factory ModelFactory, root string) (orchestratorWiring, error) {
+// unbound spawner, and the primary cfg (with Subagent wired to the spawner). cfg carries
+// the human-set construction modes (today: RuntimeSkills) down to leafRegistry, so a
+// workspace-eligible leaf's Skill tool is workspace-enabled when the mode is on. The
+// workspace root the Skill tool reads is the SAME root the file tools use (LeafToolDeps.
+// Root). The caller builds the session from wiring.cfg and then calls
+// wiring.spawner.bind(session) once.
+func buildOrchestratorWiring(client llm.LLM, factory ModelFactory, root string, cfg Config) (orchestratorWiring, error) {
 	deps := LeafToolDeps{Root: root, HTTPCl: newHTTPClient()}
-	registry, loader, err := leafRegistry(deps)
+	registry, loader, err := leafRegistry(deps, cfg)
 	if err != nil {
 		return orchestratorWiring{}, err
 	}
 	spawner := newSwarmSpawner(registry, deps, client, factory, loader)
-	cfg := orchestratorConfig(client, factory, root, spawner, toolCatalog(registry))
-	return orchestratorWiring{cfg: cfg, spawner: spawner}, nil
+	orchCfg := orchestratorConfig(client, factory, root, spawner, toolCatalog(registry))
+	return orchestratorWiring{cfg: orchCfg, spawner: spawner}, nil
 }
 
 // New constructs the SWE-Swarm and returns it as a tui.Agent driven by the
 // orchestrator running as the PRIMARY loop. It reads LLM_API_KEY (the only
 // env-sourced value; fail-loud via *MissingEnvError if a required key is missing),
 // builds the shared provider client + ModelFactory, resolves the workspace root,
-// and starts the orchestrator's session under the spawn caps. The session runs
-// under an agent-owned root context, so ctx bounds only construction — Close, not
-// ctx, controls the session's lifetime. The caller owns the agent and must Close it.
+// and starts the orchestrator's session under the spawn caps. cfg carries the
+// human-set construction modes (RuntimeSkills) — the model never sets them. The
+// session runs under an agent-owned root context, so ctx bounds only construction —
+// Close, not ctx, controls the session's lifetime. The caller owns the agent and must
+// Close it.
 //
 // The orchestrator's toolset is read/search + Todo + AskUser + the agent-aware Subagent,
 // so the orchestrator can spawn the leaf registry's agents by name; a spawned leaf has no
 // Subagent tool (least privilege — only the primary holds the spawn capability).
-func New(ctx context.Context) (tui.Agent, error) {
+func New(ctx context.Context, cfg Config) (tui.Agent, error) {
 	client, factory, err := buildClient()
 	if err != nil {
 		return nil, err
 	}
-	return newWithClient(ctx, client, factory)
+	return newWithClient(ctx, client, factory, cfg)
 }
 
 // newWithClient is the construction seam shared by New and tests; tests inject a
 // fake llm.LLM + a key-bound ModelFactory here, avoiding real environment reads and
 // network calls. It resolves the workspace root (fail-fast on os.Getwd error), builds
 // the orchestrator wiring (leaf registry + unbound spawner + primary cfg with Subagent
-// wired), starts the session under the spawn caps via newSessionAgent (which owns the
-// agent-rooted lifetime), then binds the live session onto the spawner BEFORE returning
-// (no turn can run before bind, so the Subagent tool always sees a live session). ctx
-// bounds only this construction call.
-func newWithClient(ctx context.Context, client llm.LLM, factory ModelFactory) (*sessionAgent, error) {
+// wired) under cfg (the human-set modes), starts the session under the spawn caps via
+// newSessionAgent (which owns the agent-rooted lifetime), then binds the live session
+// onto the spawner BEFORE returning (no turn can run before bind, so the Subagent tool
+// always sees a live session). ctx bounds only this construction call.
+func newWithClient(ctx context.Context, client llm.LLM, factory ModelFactory, cfg Config) (*sessionAgent, error) {
 	// The workspace root is the process working directory: file tools are confined
 	// to it and the PermissionChecker uses it for containment + path relativisation.
 	root, err := os.Getwd()
@@ -183,7 +189,7 @@ func newWithClient(ctx context.Context, client llm.LLM, factory ModelFactory) (*
 		return nil, &WorkspaceRootError{Cause: err}
 	}
 
-	wiring, err := buildOrchestratorWiring(client, factory, root)
+	wiring, err := buildOrchestratorWiring(client, factory, root, cfg)
 	if err != nil {
 		return nil, err
 	}

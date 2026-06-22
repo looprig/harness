@@ -95,16 +95,18 @@ type SessionSelector struct {
 
 // Open constructs a fully-persisted SWE-Swarm session over p, opening the session sel
 // selects (new or resumed), and returns it as a tui.Agent. It is the production entry the
-// composition root calls after building the embedded engine + Persistence. It builds the
-// provider client + ModelFactory exactly like New (reads LLM_API_KEY, refuses an
-// unclassified provider, fails loud on a missing key) then delegates to the persisted
-// construction seam. The returned *sessionAgent satisfies tui.Agent.
-func (p *Persistence) Open(ctx context.Context, sel SessionSelector) (*sessionAgent, error) {
+// composition root calls after building the embedded engine + Persistence. cfg carries the
+// human-set construction modes (RuntimeSkills) through to the wiring, identically to the
+// headless New path. It builds the provider client + ModelFactory exactly like New (reads
+// LLM_API_KEY, refuses an unclassified provider, fails loud on a missing key) then
+// delegates to the persisted construction seam. The returned *sessionAgent satisfies
+// tui.Agent.
+func (p *Persistence) Open(ctx context.Context, sel SessionSelector, cfg Config) (*sessionAgent, error) {
 	client, factory, err := buildClient()
 	if err != nil {
 		return nil, err
 	}
-	return p.openWithClient(ctx, client, factory, sel)
+	return p.openWithClient(ctx, client, factory, sel, cfg)
 }
 
 // openWithClient is the persisted construction seam shared by Open and the integration
@@ -112,16 +114,16 @@ func (p *Persistence) Open(ctx context.Context, sel SessionSelector) (*sessionAg
 // Resume opens a NEW persisted session, a non-zero Resume RESTORES it. It resolves the
 // workspace root once (fail-fast on os.Getwd error) and builds the SAME orchestratorWiring
 // the headless New uses (leaf registry + unbound spawner + primary cfg with Subagent
-// wired), so both branches construct an identical orchestrator and both bind the live
-// session onto the spawner after building it.
-func (p *Persistence) openWithClient(ctx context.Context, client llm.LLM, factory ModelFactory, sel SessionSelector) (*sessionAgent, error) {
+// wired) under cfg (the human-set modes — RuntimeSkills), so both branches construct an
+// identical orchestrator and both bind the live session onto the spawner after building it.
+func (p *Persistence) openWithClient(ctx context.Context, client llm.LLM, factory ModelFactory, sel SessionSelector, cfg Config) (*sessionAgent, error) {
 	// The workspace root is the process working directory: file tools are confined to it
 	// and the PermissionChecker uses it for containment + path relativisation.
 	root, err := os.Getwd()
 	if err != nil {
 		return nil, &WorkspaceRootError{Cause: err}
 	}
-	wiring, err := buildOrchestratorWiring(client, factory, root)
+	wiring, err := buildOrchestratorWiring(client, factory, root, cfg)
 	if err != nil {
 		return nil, err
 	}

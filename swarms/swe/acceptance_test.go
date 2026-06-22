@@ -209,7 +209,7 @@ const acceptanceDeadline = 5 * time.Second
 // network). The agent is Closed on cleanup.
 func newAcceptanceSwarm(t *testing.T, client *scriptedSwarmLLM) *sessionAgent {
 	t.Helper()
-	agent, err := newWithClient(context.Background(), client, newModelFactory("test-key"))
+	agent, err := newWithClient(context.Background(), client, newModelFactory("test-key"), Config{})
 	if err != nil {
 		t.Fatalf("newWithClient() error = %v", err)
 	}
@@ -316,7 +316,7 @@ func TestAcceptanceLeavesCannotSpawn(t *testing.T) {
 	t.Parallel()
 
 	deps := LeafToolDeps{Root: t.TempDir(), HTTPCl: newHTTPClient()}
-	reg, loader, err := leafRegistry(deps)
+	reg, loader, err := leafRegistry(deps, Config{})
 	if err != nil {
 		t.Fatalf("leafRegistry() error = %v", err)
 	}
@@ -519,7 +519,7 @@ func TestAcceptanceQuotaCapRejectsSpawn(t *testing.T) {
 func newCappedAcceptanceSwarm(t *testing.T, client *scriptedSwarmLLM, limits session.Limits) *sessionAgent {
 	t.Helper()
 	root := t.TempDir()
-	wiring, err := buildOrchestratorWiring(client, newModelFactory("test-key"), root)
+	wiring, err := buildOrchestratorWiring(client, newModelFactory("test-key"), root, Config{})
 	if err != nil {
 		t.Fatalf("buildOrchestratorWiring() error = %v", err)
 	}

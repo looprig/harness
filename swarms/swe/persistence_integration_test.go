@@ -85,7 +85,7 @@ func TestPersistenceNewSessionBasics(t *testing.T) {
 	}
 
 	a, err := p.openWithClient(context.Background(),
-		&fakeLLM{chunks: []content.Chunk{textChunk("first reply")}}, newModelFactory("test-key"), SessionSelector{})
+		&fakeLLM{chunks: []content.Chunk{textChunk("first reply")}}, newModelFactory("test-key"), SessionSelector{}, Config{})
 	if err != nil {
 		t.Fatalf("openWithClient (new): %v", err)
 	}
@@ -139,7 +139,7 @@ func TestPersistenceRoundTrip(t *testing.T) {
 	}
 
 	a, err := p.openWithClient(context.Background(),
-		&fakeLLM{chunks: []content.Chunk{textChunk("first reply")}}, newModelFactory("test-key"), SessionSelector{})
+		&fakeLLM{chunks: []content.Chunk{textChunk("first reply")}}, newModelFactory("test-key"), SessionSelector{}, Config{})
 	if err != nil {
 		t.Fatalf("openWithClient (new): %v", err)
 	}
@@ -168,7 +168,7 @@ func TestPersistenceRoundTrip(t *testing.T) {
 
 	// --- resume the same session (the Restore path) ---
 	a2, err := p2.openWithClient(context.Background(),
-		&fakeLLM{chunks: []content.Chunk{textChunk("after restore")}}, newModelFactory("test-key"), SessionSelector{Resume: sessionID})
+		&fakeLLM{chunks: []content.Chunk{textChunk("after restore")}}, newModelFactory("test-key"), SessionSelector{Resume: sessionID}, Config{})
 	if err != nil {
 		t.Fatalf("openWithClient (resume): %v", err)
 	}
@@ -227,7 +227,7 @@ func TestPersistenceListAndResumeSeams(t *testing.T) {
 	}
 
 	a, err := p.openWithClient(context.Background(),
-		&fakeLLM{chunks: []content.Chunk{textChunk("reply")}}, newModelFactory("test-key"), SessionSelector{})
+		&fakeLLM{chunks: []content.Chunk{textChunk("reply")}}, newModelFactory("test-key"), SessionSelector{}, Config{})
 	if err != nil {
 		t.Fatalf("openWithClient: %v", err)
 	}
@@ -249,7 +249,7 @@ func TestPersistenceListAndResumeSeams(t *testing.T) {
 
 	// After a clean Close the lease is released: a successor Restore re-acquires it.
 	a2, err := p.openWithClient(context.Background(),
-		&fakeLLM{chunks: []content.Chunk{textChunk("resumed")}}, newModelFactory("test-key"), SessionSelector{Resume: sessionID})
+		&fakeLLM{chunks: []content.Chunk{textChunk("resumed")}}, newModelFactory("test-key"), SessionSelector{Resume: sessionID}, Config{})
 	if err != nil {
 		t.Fatalf("resume after Close (lease not released?): %v", err)
 	}

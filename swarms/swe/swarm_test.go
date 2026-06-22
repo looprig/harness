@@ -20,7 +20,7 @@ import (
 func testWiring(t *testing.T) (*swarmSpawner, []tools.SubagentCatalogEntry) {
 	t.Helper()
 	deps := LeafToolDeps{Root: "/tmp/workspace-root", HTTPCl: &http.Client{}}
-	reg, loader, err := leafRegistry(deps)
+	reg, loader, err := leafRegistry(deps, Config{})
 	if err != nil {
 		t.Fatalf("leafRegistry() error = %v", err)
 	}
@@ -32,7 +32,7 @@ func testWiring(t *testing.T) (*swarmSpawner, []tools.SubagentCatalogEntry) {
 func TestNewWithClientHappy(t *testing.T) {
 	t.Parallel()
 
-	agent, err := newWithClient(context.Background(), &fakeLLM{}, newModelFactory("test-key"))
+	agent, err := newWithClient(context.Background(), &fakeLLM{}, newModelFactory("test-key"), Config{})
 	if err != nil {
 		t.Fatalf("newWithClient() error = %v", err)
 	}

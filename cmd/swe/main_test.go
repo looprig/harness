@@ -18,17 +18,22 @@ func TestParseFlags(t *testing.T) {
 		t.Fatalf("uuid.New: %v", err)
 	}
 	tests := []struct {
-		name       string
-		args       []string
-		wantList   bool
-		wantResume uuid.UUID
-		wantErr    bool
+		name              string
+		args              []string
+		wantList          bool
+		wantResume        uuid.UUID
+		wantRuntimeSkills bool
+		wantErr           bool
 	}{
 		{name: "no flags → new session", args: nil},
 		{name: "list flag", args: []string{"-list"}, wantList: true},
 		{name: "list flag double dash", args: []string{"--list"}, wantList: true},
 		{name: "resume a session", args: []string{"-resume", validID.String()}, wantResume: validID},
 		{name: "resume double dash", args: []string{"--resume", validID.String()}, wantResume: validID},
+		{name: "runtime-skills off by default", args: nil, wantRuntimeSkills: false},
+		{name: "runtime-skills flag", args: []string{"-runtime-skills"}, wantRuntimeSkills: true},
+		{name: "runtime-skills flag double dash", args: []string{"--runtime-skills"}, wantRuntimeSkills: true},
+		{name: "runtime-skills with resume", args: []string{"-runtime-skills", "-resume", validID.String()}, wantResume: validID, wantRuntimeSkills: true},
 		{name: "invalid resume id rejected", args: []string{"-resume", "not-a-uuid"}, wantErr: true},
 		{name: "empty resume id rejected", args: []string{"-resume", ""}, wantErr: true},
 		{name: "list and resume are mutually exclusive", args: []string{"-list", "-resume", validID.String()}, wantErr: true},
@@ -50,6 +55,9 @@ func TestParseFlags(t *testing.T) {
 			}
 			if got.resume != tt.wantResume {
 				t.Errorf("resume = %v, want %v", got.resume, tt.wantResume)
+			}
+			if got.runtimeSkills != tt.wantRuntimeSkills {
+				t.Errorf("runtimeSkills = %v, want %v", got.runtimeSkills, tt.wantRuntimeSkills)
 			}
 		})
 	}

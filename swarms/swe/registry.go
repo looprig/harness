@@ -46,6 +46,20 @@ type LeafToolDeps struct {
 	HTTPCl *http.Client
 }
 
+// Config is the swarm's human-set construction config — the knobs a launch flag /
+// operator decision sets, never the model (§2, §15). Today it carries only the
+// runtime-skills enablement mode; it is a struct (not a bare bool) so future opt-in
+// modes extend it without churning every construction signature. The zero value is
+// the fail-secure default (every mode off).
+type Config struct {
+	// RuntimeSkills enables the untrusted, human-gated workspace skill source
+	// (<workspaceRoot>/.skills/<name>/SKILL.md) for the agents whose definition sets
+	// AllowsRuntimeSkills (the read-only explorer + researcher per §7a). Off by
+	// default: embedded-only. The model can never set it — only a launch flag does
+	// (cmd/swe's --runtime-skills). When off, no leaf gains a workspace skill source.
+	RuntimeSkills bool
+}
+
 // ModelFactory turns a finished system prompt into an llm.ModelSpec. The swarm
 // owns the provider/model/sampling; agents never see it.
 type ModelFactory func(systemPrompt string) llm.ModelSpec

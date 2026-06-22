@@ -41,12 +41,14 @@ const (
 	exitFailed = 1
 )
 
-// cliFlags is the parsed CLI invocation: whether to list sessions and exit (--list), and
-// which session to resume (--resume <uuid>; zero = new session). There is
-// no positional agent name — swe is a single swarm.
+// cliFlags is the parsed CLI invocation: whether to list sessions and exit (--list),
+// which session to resume (--resume <uuid>; zero = new session), and whether to enable
+// the untrusted, human-gated workspace skill source (--runtime-skills; off by default,
+// §7a). There is no positional agent name — swe is a single swarm.
 type cliFlags struct {
-	list   bool
-	resume uuid.UUID
+	list          bool
+	resume        uuid.UUID
+	runtimeSkills bool
 }
 
 // FlagParseError reports a malformed CLI invocation (an unknown flag, a non-UUID --resume
@@ -77,8 +79,9 @@ func parseFlags(args []string) (cliFlags, error) {
 	fs := flag.NewFlagSet("swe", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	var (
-		list   = fs.Bool("list", false, "list resumable sessions and exit")
-		resume = fs.String("resume", "", "resume the session with this id")
+		list          = fs.Bool("list", false, "list resumable sessions and exit")
+		resume        = fs.String("resume", "", "resume the session with this id")
+		runtimeSkills = fs.Bool("runtime-skills", false, "enable the untrusted, human-gated workspace skill source (.skills/) for read-only agents")
 	)
 	if err := fs.Parse(args); err != nil {
 		return cliFlags{}, &FlagParseError{Reason: "invalid flags", Cause: err}
@@ -90,7 +93,7 @@ func parseFlags(args []string) (cliFlags, error) {
 		return cliFlags{}, &FlagParseError{Reason: "unexpected argument " + strconv.Quote(fs.Arg(0))}
 	}
 
-	out := cliFlags{list: *list}
+	out := cliFlags{list: *list, runtimeSkills: *runtimeSkills}
 
 	// Detect whether --resume was explicitly given (vs left at its empty default): an
 	// explicit --resume with an empty/whitespace value is a malformed invocation, rejected
@@ -169,9 +172,10 @@ func listSessions(ctx context.Context, p *swe.Persistence, w io.Writer) error {
 // PERSISTED swarm session: the FIRST call honors resume (a non-zero id restores that
 // session); every later call (a /clear reopen) starts a fresh NEW session, so /clear never
 // re-restores the same id. The first-call latch is guarded so a reopen is deterministically
-// a new session. The returned thunk yields a
-// tui.Agent (the persisted *sessionAgent satisfies it).
-func openThunk(p *swe.Persistence, resume uuid.UUID) tui.OpenAgent {
+// a new session. cfg carries the human-set construction modes (RuntimeSkills) and applies to
+// every open, including a /clear reopen (the launch flag holds for the whole process). The
+// returned thunk yields a tui.Agent (the persisted *sessionAgent satisfies it).
+func openThunk(p *swe.Persistence, resume uuid.UUID, cfg swe.Config) tui.OpenAgent {
 	var opened bool
 	return func(c context.Context) (tui.Agent, error) {
 		sel := swe.SessionSelector{}
@@ -179,7 +183,7 @@ func openThunk(p *swe.Persistence, resume uuid.UUID) tui.OpenAgent {
 			sel.Resume = resume // only the first open resumes; /clear reopens start fresh
 		}
 		opened = true
-		return p.Open(c, sel)
+		return p.Open(c, sel, cfg)
 	}
 }
 
@@ -217,8 +221,9 @@ func run(ctx context.Context, args []string, out, errOut io.Writer) int {
 	}
 
 	// The initial open honors --resume; every /clear reopen starts a FRESH persisted
-	// session. internal/cli.Run owns logging, signal teardown, the TUI, and bounded Close.
-	open := openThunk(persist, flags.resume)
+	// session. The --runtime-skills mode applies to every open. internal/cli.Run owns
+	// logging, signal teardown, the TUI, and bounded Close.
+	open := openThunk(persist, flags.resume, swe.Config{RuntimeSkills: flags.runtimeSkills})
 	return cli.Run(ctx, open, cli.Banner{Name: bannerName})
 }
 

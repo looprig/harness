@@ -40,7 +40,7 @@ func equalStringSlice(a, b []string) bool {
 func TestLeafRegistryHasExactlyTheFourLeaves(t *testing.T) {
 	t.Parallel()
 
-	reg, _, err := leafRegistry(testLeafDeps())
+	reg, _, err := leafRegistry(testLeafDeps(), Config{})
 	if err != nil {
 		t.Fatalf("leafRegistry() error = %v", err)
 	}
@@ -66,7 +66,7 @@ func TestLeafRegistryHasExactlyTheFourLeaves(t *testing.T) {
 func TestLeafRegistryOrchestratorAbsent(t *testing.T) {
 	t.Parallel()
 
-	reg, _, err := leafRegistry(testLeafDeps())
+	reg, _, err := leafRegistry(testLeafDeps(), Config{})
 	if err != nil {
 		t.Fatalf("leafRegistry() error = %v", err)
 	}
@@ -82,51 +82,59 @@ func TestLeafRegistryLookupCarriesLeafData(t *testing.T) {
 	t.Parallel()
 
 	deps := testLeafDeps()
-	reg, _, err := leafRegistry(deps)
+	reg, _, err := leafRegistry(deps, Config{})
 	if err != nil {
 		t.Fatalf("leafRegistry() error = %v", err)
 	}
 
 	tests := []struct {
-		name       identity.AgentName
-		wantDesc   string
-		wantRole   string
-		wantTools  []string
-		wantSkills []string // the agent's allowed-skill names (nil = none)
+		name              string
+		agent             identity.AgentName
+		wantDesc          string
+		wantRole          string
+		wantTools         []string
+		wantSkills        []string // the agent's allowed-skill names (nil = none)
+		wantRuntimeSkills bool     // §7a eligibility — true for the read-only explorer + researcher
 	}{
 		{
-			name:       operator.Name,
+			name:       "operator",
+			agent:      operator.Name,
 			wantDesc:   operator.Description,
 			wantRole:   operator.Role,
 			wantTools:  []string{"AskUser", "Bash", "EditFile", "Glob", "Grep", "ReadFile", "Skill", "Todo", "WriteFile"},
 			wantSkills: []string{"code-style"},
 		},
 		{
-			name:      researcher.Name,
-			wantDesc:  researcher.Description,
-			wantRole:  researcher.Role,
-			wantTools: []string{"AskUser", "Fetch", "Glob", "Grep", "ReadFile", "WebSearch"},
+			name:              "researcher",
+			agent:             researcher.Name,
+			wantDesc:          researcher.Description,
+			wantRole:          researcher.Role,
+			wantTools:         []string{"AskUser", "Fetch", "Glob", "Grep", "ReadFile", "WebSearch"},
+			wantRuntimeSkills: true,
 		},
 		{
-			name:      explorer.Name,
-			wantDesc:  explorer.Description,
-			wantRole:  explorer.Role,
-			wantTools: []string{"AskUser", "Glob", "Grep", "ReadFile"},
+			name:              "explorer",
+			agent:             explorer.Name,
+			wantDesc:          explorer.Description,
+			wantRole:          explorer.Role,
+			wantTools:         []string{"AskUser", "Glob", "Grep", "ReadFile"},
+			wantRuntimeSkills: true,
 		},
 		{
-			name:      reviewer.Name,
+			name:      "reviewer",
+			agent:     reviewer.Name,
 			wantDesc:  reviewer.Description,
 			wantRole:  reviewer.Role,
 			wantTools: []string{"AskUser", "Bash", "Glob", "Grep", "ReadFile", "Todo"},
 		},
 	}
 	for _, tt := range tests {
-		t.Run(string(tt.name), func(t *testing.T) {
+		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			a, ok := reg.Lookup(tt.name)
+			a, ok := reg.Lookup(tt.agent)
 			if !ok {
-				t.Fatalf("Lookup(%q) not found", tt.name)
+				t.Fatalf("Lookup(%q) not found", tt.agent)
 			}
 			if a.Description != tt.wantDesc {
 				t.Errorf("Description = %q, want %q", a.Description, tt.wantDesc)
@@ -134,8 +142,8 @@ func TestLeafRegistryLookupCarriesLeafData(t *testing.T) {
 			if a.Role != tt.wantRole {
 				t.Errorf("Role = %q, want %q", a.Role, tt.wantRole)
 			}
-			if a.AllowsRuntimeSkills {
-				t.Errorf("AllowsRuntimeSkills = true, want false (P1)")
+			if a.AllowsRuntimeSkills != tt.wantRuntimeSkills {
+				t.Errorf("AllowsRuntimeSkills = %v, want %v (§7a: read-only agents only)", a.AllowsRuntimeSkills, tt.wantRuntimeSkills)
 			}
 			if !equalStringSlice(a.Skills, tt.wantSkills) {
 				t.Errorf("Skills = %v, want %v", a.Skills, tt.wantSkills)
