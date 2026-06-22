@@ -1,4 +1,4 @@
-.PHONY: build run test fmt fmt-check lint vuln verify secure fuzz
+.PHONY: test fmt fmt-check lint vuln verify secure fuzz
 
 # Module's own package dirs, excluding vendor/ and the nested .worktrees/ modules
 # (go list ./... stops at nested module boundaries and skips vendor).
@@ -10,14 +10,6 @@ GO_DIRS := $(shell go list -f '{{.Dir}}' ./...)
 # stray global GOFLAGS (e.g. -mod=mod) can't silently switch the build off the
 # vendored tree. Do NOT use -mod=readonly here — it ignores vendor/ entirely.
 export GOFLAGS := -mod=vendor
-
-build:
-	CGO_ENABLED=0 go build -trimpath -o bin/swe ./cmd/swe
-
-# Run the TUI directly. Loads .env (if present) so LLM_API_KEY and friends are
-# exported for the process.
-run:
-	set -a; [ -f .env ] && . ./.env; set +a; go run ./cmd/swe
 
 test:
 	go test -race ./...
