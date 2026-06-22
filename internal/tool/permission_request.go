@@ -1,6 +1,10 @@
 package tool
 
-import "fmt"
+import (
+	"fmt"
+
+	"github.com/inventivepotter/urvi/internal/agent/loop/identity"
+)
 
 // PermissionRequest is the sealed approval-prompt contract a tool's
 // PermissionPrompter.BuildRequest returns. The unexported permissionRequest
@@ -100,3 +104,50 @@ func (UnknownRequest) permissionRequest()             {}
 func (r UnknownRequest) ToolName() string             { return r.Tool }
 func (r UnknownRequest) Description() string          { return r.Summary }
 func (UnknownRequest) AllowedScopes() []ApprovalScope { return []ApprovalScope{ScopeOnce} }
+
+// skillHashPrefixLen is the number of leading hex characters of a skill body's
+// SHA-256 surfaced in the human gate prompt. A short prefix is enough for a
+// person to eyeball-compare the snapshot the gate approves against an expected
+// digest, without rendering an unwieldy 64-char string; the full digest is
+// retained in the SHA256 field (and the persisted codec) for exact binding.
+const skillHashPrefixLen = 12
+
+// SkillLoadRequest is the approval prompt for loading an UNTRUSTED workspace
+// skill (`.skills/<name>/SKILL.md`) into an agent's context (design §7a). A
+// workspace skill body becomes instructions in the agent's context, so the load
+// is a human-gated trust boundary — distinct from the trusted, auto-approved
+// embedded skill source.
+//
+// The fields are the SAFE metadata of a TOCTOU-safe snapshot taken BEFORE the
+// prompt (an os.Root descriptor-relative read + SHA-256): RelPath is the
+// workspace-relative path the snapshot came from, Agent is the requesting agent,
+// Size is the snapshot byte length, and SHA256 is the snapshot's full digest.
+// Description renders ONLY this metadata — NEVER the body — so the prompt cannot
+// itself smuggle injected instructions past the human.
+//
+// AllowedScopes is fail-secure {ScopeOnce} only: a workspace skill is untrusted,
+// so an approval is NEVER session- or workspace-persisted — every load
+// re-prompts and re-binds a fresh snapshot.
+type SkillLoadRequest struct {
+	RelPath string             // workspace-relative path, e.g. ".skills/<name>/SKILL.md"
+	Agent   identity.AgentName // the agent requesting the load
+	Size    int64              // snapshot length in bytes
+	SHA256  string             // full hex SHA-256 of the snapshot bytes
+}
+
+func (SkillLoadRequest) permissionRequest() {}
+func (SkillLoadRequest) ToolName() string   { return "Skill" }
+
+// Description renders the safe snapshot metadata for the human gate: the relative
+// path, the requesting agent, the size, and a SHORT hash prefix. It never renders
+// the skill body (SkillLoadRequest carries no body field by construction).
+func (r SkillLoadRequest) Description() string {
+	short := r.SHA256
+	if len(short) > skillHashPrefixLen {
+		short = short[:skillHashPrefixLen]
+	}
+	return fmt.Sprintf("agent %s load %s (%d bytes, sha256:%s)", r.Agent, r.RelPath, r.Size, short)
+}
+
+// AllowedScopes is {ScopeOnce} only — a workspace skill load is never persisted.
+func (SkillLoadRequest) AllowedScopes() []ApprovalScope { return []ApprovalScope{ScopeOnce} }
