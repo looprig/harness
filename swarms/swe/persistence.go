@@ -17,7 +17,7 @@ import (
 // persistence.go is the SWE-Swarm's composition-root wiring for the durable session
 // journal: it turns the bare session.New / session.Restore into a fully-persisted
 // orchestrator-primary session over an embedded JetStream context. It is salvaged from
-// agents/coding/persistence.go and adapted to the swarm's orchestratorConfig builder, so
+// the prior coding agent's persistence.go and adapted to the swarm's orchestratorConfig builder, so
 // the persistence layer owns ONLY the new-vs-resume decision, the sessionID
 // chicken-and-egg resolution (mint first → build journal → inject the SAME id into
 // session.New), and GC scheduling. The single-writer lease's lifecycle is owned by the
@@ -85,7 +85,7 @@ func (p *Persistence) List(ctx context.Context) ([]journal.SessionMeta, error) {
 // SessionSelector chooses which session a persisted Open opens. The zero value (Resume
 // zero) opens a NEW session; a non-zero Resume opens (restores) that existing session.
 // AllowConfigMismatch is the resume-only opt-in to proceed despite a config fingerprint
-// change (otherwise a mismatch is rejected fail-secure). It mirrors agents/coding's
+// change (otherwise a mismatch is rejected fail-secure). It mirrors the prior coding agent's
 // SessionSelector shape so the swarm's --list/--resume wiring matches the coding CLI.
 type SessionSelector struct {
 	Resume              uuid.UUID

@@ -66,7 +66,7 @@ type Screen struct {
 }
 
 // AgentBanner is the agent metadata shown as the startup info notice — its Name and
-// Description, threaded in at construction from the composition root (cmd/cli) so the
+// Description, threaded in at construction from the composition root (cmd/swe) so the
 // Agent interface need not expose them. The zero value renders a name-less banner;
 // bannerText degrades gracefully when either field is empty.
 type AgentBanner struct {
@@ -131,7 +131,7 @@ func (m Screen) Init() tea.Cmd {
 	)
 }
 
-// Agent returns the live agent. cmd/cli uses this for a bounded backstop Close
+// Agent returns the live agent. cmd/swe uses this for a bounded backstop Close
 // of whichever agent /clear may have swapped in.
 func (m Screen) Agent() Agent { return m.agent }
 

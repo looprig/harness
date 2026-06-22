@@ -42,7 +42,7 @@ const (
 )
 
 // cliFlags is the parsed CLI invocation: whether to list sessions and exit (--list), and
-// which session to resume (--resume <uuid>; zero = new session). Unlike cmd/cli there is
+// which session to resume (--resume <uuid>; zero = new session). There is
 // no positional agent name — swe is a single swarm.
 type cliFlags struct {
 	list   bool
@@ -72,7 +72,7 @@ func (e *FlagParseError) Unwrap() error { return e.Cause }
 // no positional args are accepted (swe is a single swarm — there is no agent to name). It
 // uses an isolated FlagSet (ContinueOnError, discarded output) so a bad flag returns a
 // typed error rather than calling os.Exit, keeping main the single exit point and making
-// the parser unit-testable. It mirrors cmd/cli's parseFlags.
+// the parser unit-testable.
 func parseFlags(args []string) (cliFlags, error) {
 	fs := flag.NewFlagSet("swe", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
@@ -169,7 +169,7 @@ func listSessions(ctx context.Context, p *swe.Persistence, w io.Writer) error {
 // PERSISTED swarm session: the FIRST call honors resume (a non-zero id restores that
 // session); every later call (a /clear reopen) starts a fresh NEW session, so /clear never
 // re-restores the same id. The first-call latch is guarded so a reopen is deterministically
-// a new session. It mirrors cmd/cli's openThunk semantics. The returned thunk yields a
+// a new session. The returned thunk yields a
 // tui.Agent (the persisted *sessionAgent satisfies it).
 func openThunk(p *swe.Persistence, resume uuid.UUID) tui.OpenAgent {
 	var opened bool

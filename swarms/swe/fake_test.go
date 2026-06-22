@@ -11,7 +11,7 @@ import (
 )
 
 // fakeLLM is a controllable llm.LLM for tests. The loop only ever calls Stream,
-// so Invoke is a stub. Salvaged from agents/coding/fake_test.go.
+// so Invoke is a stub. Salvaged from the prior coding agent's fake_test.go.
 type fakeLLM struct {
 	chunks    []content.Chunk
 	streamErr error         // returned from Stream() before any chunk

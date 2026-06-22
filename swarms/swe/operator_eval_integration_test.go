@@ -29,8 +29,8 @@ var errTurnInterrupted = errors.New("turn interrupted")
 // it runs one turn for the input prompt over the session subscription transport
 // and projects the terminal TurnDone.Message to text (reusing the aiMessageText
 // projection from text_test.go — this test is in package swe, so the unexported
-// helper is in scope). Salvaged from agents/coding's togoRunner; only the agent
-// type changed (the operator session primary, not the coding wrapper).
+// helper is in scope). Salvaged from the prior coding agent's togoRunner; only the
+// agent type changed (the operator session primary, not the coding wrapper).
 type operatorRunner struct{ agent *sessionAgent }
 
 // Run subscribes to the session fan-in, submits a single turn fire-and-forget, and
@@ -132,7 +132,7 @@ func newOperatorPrimary(ctx context.Context, client llm.LLM, factory ModelFactor
 
 // TestOperatorEvalIntegration runs the live operator agent — built as a session
 // PRIMARY loop — through the golden-set with the deterministic Contains metric and a
-// model-backed Judge. It is the Phase 7A migration of agents/coding's eval: the eval
+// model-backed Judge. It is the Phase 7A migration of the prior coding agent's eval: the eval
 // engine (internal/eval) is reused unchanged; only the agent under test changed from
 // the coding agent to operator-as-primary. It skips cleanly when LLM_API_KEY is
 // unset, so the default (untagged) suite and a tagged build without a key never

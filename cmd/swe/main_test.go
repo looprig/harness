@@ -9,8 +9,7 @@ import (
 // TestParseFlags covers the SWE CLI flag parser: --list, --resume <uuid>, and the boundary
 // validation (an invalid/empty resume id fails at the boundary, not deep in the wiring;
 // --list and --resume are mutually exclusive). The swarm has no positional agent name (it
-// is a single swarm), so an unexpected positional arg is rejected. It mirrors cmd/cli's
-// TestParseFlags shape.
+// is a single swarm), so an unexpected positional arg is rejected.
 func TestParseFlags(t *testing.T) {
 	t.Parallel()
 

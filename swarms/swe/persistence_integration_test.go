@@ -125,7 +125,7 @@ func primaryLoopAgentName(evs []event.Event, loopID uuid.UUID) identity.AgentNam
 // embedded server is RESTARTED on the SAME StoreDir, and the SAME session is RESUMED via
 // the Restore path. The restored session's ReplayBacklog reproduces the committed Enduring
 // events and a fresh turn continues — proving the durable log survived a full
-// process-restart cycle. It mirrors agents/coding's TestPersistenceWiringRoundTrip.
+// process-restart cycle. It mirrors the prior coding agent's TestPersistenceWiringRoundTrip.
 func TestPersistenceRoundTrip(t *testing.T) {
 	root := t.TempDir()
 	t.Setenv("XDG_DATA_HOME", root)
@@ -207,7 +207,7 @@ func TestPersistenceRoundTrip(t *testing.T) {
 // TestPersistenceListAndResumeSeams covers the --list / --resume building blocks at the
 // swarm layer: a NEW persisted session appears in the catalog listing (replay-free), and
 // the lease is released on Close so a successor Resume can re-acquire it. It mirrors
-// agents/coding's TestPersistenceListAndResumeSeams.
+// the prior coding agent's TestPersistenceListAndResumeSeams.
 func TestPersistenceListAndResumeSeams(t *testing.T) {
 	root := t.TempDir()
 	t.Setenv("XDG_DATA_HOME", root)

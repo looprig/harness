@@ -13,7 +13,7 @@ import (
 // integration-tagged operator_eval_integration_test.go) to flatten a turn's
 // terminal AIMessage into a plain string. It lives in this untagged _test.go
 // helper so it is available to both the default and -tags integration builds.
-// Salvaged from agents/coding/text_test.go.
+// Salvaged from the prior coding agent's text_test.go.
 func aiMessageText(m *content.AIMessage) string {
 	if m == nil {
 		return ""

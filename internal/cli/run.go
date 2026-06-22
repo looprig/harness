@@ -3,7 +3,7 @@
 // ~/.urvi/urvi.log, signal-driven shutdown, stdout/stderr capture so third-party
 // libraries don't corrupt live scrollback, building and running the Bubble Tea
 // program, and bounded teardown — parameterized by an agent constructor and a
-// startup banner. Entry points (cmd/cli, cmd/swe) stay thin: they select an agent
+// startup banner. Entry points (cmd/swe) stay thin: they select an agent
 // and call Run; all runtime behavior lives here.
 package cli
 
