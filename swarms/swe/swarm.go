@@ -5,7 +5,10 @@ package swe
 
 import (
 	"context"
+	"crypto/tls"
+	"net/http"
 	"os"
+	"time"
 
 	"github.com/inventivepotter/urvi/agents/orchestrator"
 	"github.com/inventivepotter/urvi/internal/agent/loop"
@@ -34,21 +37,25 @@ func orchestratorLimits() session.Limits {
 	return session.Limits{Depth: orchestratorSpawnDepth, Quota: orchestratorSpawnQuota}
 }
 
-// orchestratorAutoApprovedTools is the orchestrator's hard-approve set in 4A:
-// EVERY tool it carries. The orchestrator only reads/searches the workspace, plans
-// (Todo), and asks the user (AskUser) — nothing it can do is side-effecting — so
-// every tool runs without prompting. Subagent is deliberately ABSENT: it is not
-// wired until 4B (the tool-arg flip), so it appears in neither the registry nor the
-// approve set here. Names match each tool's Info().Name exactly.
-var orchestratorAutoApprovedTools = []string{"ReadFile", "Glob", "Grep", "Todo", "AskUser"}
+// orchestratorAutoApprovedTools is the orchestrator's hard-approve set: EVERY tool it
+// carries. The orchestrator reads/searches the workspace, plans (Todo), asks the user
+// (AskUser), and spawns named leaf agents (Subagent) — none of these is directly
+// side-effecting (a spawned leaf's own side-effecting tools are gated by the leaf's
+// OWN PermissionChecker, built fresh per spawn) — so every orchestrator tool runs
+// without prompting. Subagent itself has no path/command boundary (classUnknown), so
+// it reaches AutoApprove only by being named here. Names match each tool's Info().Name
+// exactly.
+var orchestratorAutoApprovedTools = []string{"ReadFile", "Glob", "Grep", "Todo", "AskUser", "Subagent"}
 
-// orchestratorToolSet assembles the orchestrator's 4A toolset behind a FRESH
-// fail-secure PermissionChecker: ReadFile, Glob, Grep, Todo, AskUser — all five
-// auto-approved. Least privilege: the read/search tools get the workspace root +
-// the checker as their ReadGuard; Todo/AskUser are self-contained. There is
-// deliberately NO Subagent (added in 4B), NO write/edit tool, NO shell, and NO
-// network tool — the 4A orchestrator only reads, plans, and asks.
-func orchestratorToolSet(root string) loop.ToolSet {
+// orchestratorToolSet assembles the orchestrator's toolset behind a FRESH fail-secure
+// PermissionChecker: ReadFile, Glob, Grep, Todo, AskUser, Subagent — all auto-approved.
+// Least privilege: the read/search tools get the workspace root + the checker as their
+// ReadGuard; Todo/AskUser are self-contained; Subagent depends only on the narrow
+// swarmSpawner (which resolves named leaves against the registry) + the spawnable-agent
+// catalog it renders into its description. There is deliberately NO write/edit tool, NO
+// shell, and NO network tool on the orchestrator itself — it reads, plans, asks, and
+// delegates side-effecting work to spawned leaves (each gated by the leaf's own checker).
+func orchestratorToolSet(root string, spawner *swarmSpawner, catalog []tools.SubagentCatalogEntry) loop.ToolSet {
 	policy := tools.PermissionPolicy{
 		WorkspaceRoot: root,
 		HardDeny:      tools.DefaultHardDeny(),
@@ -62,22 +69,83 @@ func orchestratorToolSet(root string) loop.ToolSet {
 		tools.NewGrep(root, pc),
 		tools.NewTodo(),
 		tools.NewAskUser(),
+		tools.NewSubagent(spawner, catalog),
 	}
 	return loop.ToolSet{Permission: pc, Registry: registry}
 }
 
+// toolCatalog projects the swarm's registry catalog (swe.AgentCatalogEntry) onto the
+// tools-level []tools.SubagentCatalogEntry the Subagent tool renders into its
+// description. It is the composition-root seam that keeps tools/ from importing
+// swarms/swe: the swarm owns the agent set; the tool only needs name+description.
+func toolCatalog(reg *Registry) []tools.SubagentCatalogEntry {
+	entries := reg.Catalog()
+	out := make([]tools.SubagentCatalogEntry, 0, len(entries))
+	for _, e := range entries {
+		out = append(out, tools.SubagentCatalogEntry{Name: e.Name, Description: e.Description})
+	}
+	return out
+}
+
 // orchestratorConfig assembles the orchestrator's primary loop.Config: the shared
 // client, a model spec whose system prompt is the swarm Identity prepended to the
-// orchestrator's Role (the swarm owns identity; the agent owns its role), its 4A
-// toolset, and its attribution name. It is the single place the orchestrator's
-// primary config is built so New and the test seam cannot drift.
-func orchestratorConfig(client llm.LLM, factory ModelFactory, root string) loop.Config {
+// orchestrator's Role (the swarm owns identity; the agent owns its role), its toolset
+// (read/search + Todo + AskUser + the agent-aware Subagent wired to spawner), and its
+// attribution name. It is the single place the orchestrator's primary config is built
+// so every construction path (New, openNew, openResume) cannot drift. spawner is the
+// UNBOUND swarmSpawner the Subagent tool forwards to; the caller binds the live session
+// onto it after the session is built.
+func orchestratorConfig(client llm.LLM, factory ModelFactory, root string, spawner *swarmSpawner, catalog []tools.SubagentCatalogEntry) loop.Config {
 	return loop.Config{
 		Client:    client,
 		Model:     factory(Identity + orchestrator.Role),
-		Tools:     orchestratorToolSet(root),
+		Tools:     orchestratorToolSet(root, spawner, catalog),
 		AgentName: orchestrator.Name,
 	}
+}
+
+// httpClientTimeout bounds every web request a spawned leaf's Fetch/WebSearch tools
+// make, so a hung endpoint can never block a tool call indefinitely (CLAUDE.md: no
+// unbounded blocking).
+const httpClientTimeout = 30 * time.Second
+
+// newHTTPClient builds the single *http.Client shared by every spawned leaf's web
+// tools (Fetch + the DuckDuckGo provider). It sets an explicit overall timeout and
+// pins the TLS floor to 1.2 (never InsecureSkipVerify), per CLAUDE.md's TLS rules.
+func newHTTPClient() *http.Client {
+	return &http.Client{
+		Timeout: httpClientTimeout,
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12},
+		},
+	}
+}
+
+// orchestratorWiring is the assembled orchestrator construction: the primary cfg
+// (Subagent wired) plus the UNBOUND swarmSpawner the Subagent tool forwards to. A
+// construction path builds it, creates/restores the session from cfg, then binds the
+// live session onto the spawner (see swarmSpawner's LATE-BIND note). The leaf Registry
+// is the authoritative spawnable set; a build error (a duplicate leaf name) fails the
+// whole construction (fail secure — no half-wired orchestrator).
+type orchestratorWiring struct {
+	cfg     loop.Config
+	spawner *swarmSpawner
+}
+
+// buildOrchestratorWiring is the single seam that assembles the orchestratorWiring used
+// by ALL THREE construction paths (New, openNew, openResume), so the spawner + Subagent
+// wiring cannot drift across them. It builds the leaf Registry + shared HTTP client, the
+// unbound spawner, and the primary cfg (with Subagent wired to the spawner). The caller
+// builds the session from wiring.cfg and then calls wiring.spawner.bind(session) once.
+func buildOrchestratorWiring(client llm.LLM, factory ModelFactory, root string) (orchestratorWiring, error) {
+	deps := LeafToolDeps{Root: root, HTTPCl: newHTTPClient()}
+	registry, err := leafRegistry(deps)
+	if err != nil {
+		return orchestratorWiring{}, err
+	}
+	spawner := newSwarmSpawner(registry, deps, client, factory)
+	cfg := orchestratorConfig(client, factory, root, spawner, toolCatalog(registry))
+	return orchestratorWiring{cfg: cfg, spawner: spawner}, nil
 }
 
 // New constructs the SWE-Swarm and returns it as a tui.Agent driven by the
@@ -88,9 +156,9 @@ func orchestratorConfig(client llm.LLM, factory ModelFactory, root string) loop.
 // under an agent-owned root context, so ctx bounds only construction — Close, not
 // ctx, controls the session's lifetime. The caller owns the agent and must Close it.
 //
-// 4A scope: the orchestrator's toolset is read/search + Todo + AskUser only. The
-// Subagent tool is NOT wired this phase (it needs the tool-arg flip in 4B), so the
-// orchestrator cannot yet spawn the leaf registry's agents.
+// The orchestrator's toolset is read/search + Todo + AskUser + the agent-aware Subagent,
+// so the orchestrator can spawn the leaf registry's agents by name; a spawned leaf has no
+// Subagent tool (least privilege — only the primary holds the spawn capability).
 func New(ctx context.Context) (tui.Agent, error) {
 	client, factory, err := buildClient()
 	if err != nil {
@@ -101,10 +169,12 @@ func New(ctx context.Context) (tui.Agent, error) {
 
 // newWithClient is the construction seam shared by New and tests; tests inject a
 // fake llm.LLM + a key-bound ModelFactory here, avoiding real environment reads and
-// network calls. It resolves the workspace root (fail-fast on os.Getwd error),
-// builds the orchestrator's primary config, and starts the session under the spawn
-// caps via newSessionAgent (which owns the agent-rooted lifetime). ctx bounds only
-// this construction call.
+// network calls. It resolves the workspace root (fail-fast on os.Getwd error), builds
+// the orchestrator wiring (leaf registry + unbound spawner + primary cfg with Subagent
+// wired), starts the session under the spawn caps via newSessionAgent (which owns the
+// agent-rooted lifetime), then binds the live session onto the spawner BEFORE returning
+// (no turn can run before bind, so the Subagent tool always sees a live session). ctx
+// bounds only this construction call.
 func newWithClient(ctx context.Context, client llm.LLM, factory ModelFactory) (*sessionAgent, error) {
 	// The workspace root is the process working directory: file tools are confined
 	// to it and the PermissionChecker uses it for containment + path relativisation.
@@ -113,6 +183,14 @@ func newWithClient(ctx context.Context, client llm.LLM, factory ModelFactory) (*
 		return nil, &WorkspaceRootError{Cause: err}
 	}
 
-	cfg := orchestratorConfig(client, factory, root)
-	return newSessionAgent(ctx, cfg, session.WithLimits(orchestratorLimits()))
+	wiring, err := buildOrchestratorWiring(client, factory, root)
+	if err != nil {
+		return nil, err
+	}
+	agent, err := newSessionAgent(ctx, wiring.cfg, session.WithLimits(orchestratorLimits()))
+	if err != nil {
+		return nil, err
+	}
+	wiring.spawner.bind(agent.session) // late-bind before any turn runs
+	return agent, nil
 }

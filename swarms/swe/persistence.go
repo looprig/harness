@@ -6,7 +6,6 @@ import (
 	"os"
 	"time"
 
-	"github.com/inventivepotter/urvi/internal/agent/loop"
 	"github.com/inventivepotter/urvi/internal/agent/session"
 	"github.com/inventivepotter/urvi/internal/agent/session/journal"
 	"github.com/inventivepotter/urvi/internal/llm"
@@ -27,11 +26,13 @@ import (
 // nats.JetStreamContext (the embedded server is started in internal/persistence at the
 // cmd/swe root, never here), so the swarm package never imports nats-server.
 //
-// Subagent seam (next phase): the persisted + restored sessions are both built from
-// orchestratorConfig(client, factory, root) — the SAME single-source cfg builder New
-// uses. When the Subagent tool is wired into orchestratorConfig (the 4B tool-arg flip),
-// it flows automatically into BOTH the new and the resumed persisted sessions with no
-// change here. This layer deliberately leaves that seam clean and does NOT wire Subagent.
+// Subagent wiring: the persisted + restored sessions are both built from the SAME
+// orchestratorWiring (leaf registry + unbound spawner + primary cfg with Subagent
+// wired) that the headless New path uses, via buildOrchestratorWiring. Both openNew and
+// openResume bind the live session onto the wiring's spawner AFTER the session is built
+// (before any turn runs), so a persisted or restored orchestrator can spawn leaves by
+// name exactly like a headless one. There is one wiring per Open call (its spawner is
+// session-scoped), so a /clear reopen builds a fresh wiring for the fresh session.
 
 // gcInterval is how often the background GC ticker runs one lease-guarded orphan-GC pass.
 // GC is idempotent + lease-guarded, so the cadence only trades disk reclaim latency for a
@@ -109,8 +110,10 @@ func (p *Persistence) Open(ctx context.Context, sel SessionSelector) (*sessionAg
 // openWithClient is the persisted construction seam shared by Open and the integration
 // tests (which inject a fake llm.LLM + key-bound ModelFactory). It branches on sel: a zero
 // Resume opens a NEW persisted session, a non-zero Resume RESTORES it. It resolves the
-// workspace root once (fail-fast on os.Getwd error) so both branches build the SAME
-// orchestratorConfig the headless New uses.
+// workspace root once (fail-fast on os.Getwd error) and builds the SAME orchestratorWiring
+// the headless New uses (leaf registry + unbound spawner + primary cfg with Subagent
+// wired), so both branches construct an identical orchestrator and both bind the live
+// session onto the spawner after building it.
 func (p *Persistence) openWithClient(ctx context.Context, client llm.LLM, factory ModelFactory, sel SessionSelector) (*sessionAgent, error) {
 	// The workspace root is the process working directory: file tools are confined to it
 	// and the PermissionChecker uses it for containment + path relativisation.
@@ -118,12 +121,15 @@ func (p *Persistence) openWithClient(ctx context.Context, client llm.LLM, factor
 	if err != nil {
 		return nil, &WorkspaceRootError{Cause: err}
 	}
-	cfg := orchestratorConfig(client, factory, root)
+	wiring, err := buildOrchestratorWiring(client, factory, root)
+	if err != nil {
+		return nil, err
+	}
 
 	if sel.Resume.IsZero() {
-		return p.openNew(ctx, cfg)
+		return p.openNew(ctx, wiring)
 	}
-	return p.openResume(ctx, cfg, sel)
+	return p.openResume(ctx, wiring, sel)
 }
 
 // openNew opens a NEW persisted session. It resolves the journal chicken-and-egg by
@@ -133,7 +139,7 @@ func (p *Persistence) openWithClient(ctx context.Context, client llm.LLM, factor
 // both appenders + the lease-release hook (so a clean Shutdown frees ownership) + the
 // orchestrator spawn caps. On any failure before the session is built it releases the
 // lease so a retry can re-acquire without waiting out the TTL.
-func (p *Persistence) openNew(ctx context.Context, cfg loop.Config) (*sessionAgent, error) {
+func (p *Persistence) openNew(ctx context.Context, wiring orchestratorWiring) (*sessionAgent, error) {
 	// (1) Mint the sessionID FIRST — the journal needs it to bind the stream + write the
 	// opening LeaseFence before the session exists. (chicken-and-egg resolution)
 	sessionID, err := uuid.New()
@@ -168,7 +174,7 @@ func (p *Persistence) openNew(ctx context.Context, cfg loop.Config) (*sessionAge
 	// (4) Build the persisted session with the INJECTED sessionID + appenders +
 	// lease-release hook + spawn caps → a fully-persisted session that frees ownership on
 	// a clean Shutdown.
-	agent, err := newPersistentSessionAgent(ctx, cfg,
+	agent, err := newPersistentSessionAgent(ctx, wiring.cfg,
 		session.WithSessionID(sessionID),
 		session.WithEventAppender(eventAppender),
 		session.WithCommandAppender(cmdAppender),
@@ -179,6 +185,7 @@ func (p *Persistence) openNew(ctx context.Context, cfg loop.Config) (*sessionAge
 		releaseLeaseBestEffort(lease)
 		return nil, err
 	}
+	wiring.spawner.bind(agent.session) // late-bind before any turn runs
 
 	// A NEW session has no backlog to repaint: the replayer stays nil → ReplayBacklog nil.
 	agent.teardown = stopGCTeardown(scheduleGC(agent.rootCtx, p.js, sessionID, lease))
@@ -190,7 +197,7 @@ func (p *Persistence) openNew(ctx context.Context, cfg loop.Config) (*sessionAge
 // loop up idle, and installs its own lease-release-on-Shutdown hook (so a clean Shutdown
 // frees ownership). The resumed agent's replayer is wired so ReplayBacklog can repaint the
 // restored transcript under the orchestrator spawn caps.
-func (p *Persistence) openResume(ctx context.Context, cfg loop.Config, sel SessionSelector) (*sessionAgent, error) {
+func (p *Persistence) openResume(ctx context.Context, wiring orchestratorWiring, sel SessionSelector) (*sessionAgent, error) {
 	objects, err := p.js.ObjectStore(journal.SessionObjectBucket(sel.Resume))
 	if err != nil {
 		return nil, err
@@ -201,10 +208,11 @@ func (p *Persistence) openResume(ctx context.Context, cfg loop.Config, sel Sessi
 		opts = append(opts, session.WithAllowConfigMismatch())
 	}
 
-	agent, err := newRestoredSessionAgent(ctx, cfg, sel.Resume, p.js, objects, p.leases, opts...)
+	agent, err := newRestoredSessionAgent(ctx, wiring.cfg, sel.Resume, p.js, objects, p.leases, opts...)
 	if err != nil {
 		return nil, err
 	}
+	wiring.spawner.bind(agent.session) // late-bind before any turn runs
 
 	// GC for a RESUMED session is a documented follow-on: orphan-GC needs a journal.Lease
 	// handle to gate each pass, but session.Restore acquires + owns the lease internally

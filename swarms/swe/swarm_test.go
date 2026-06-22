@@ -2,14 +2,30 @@ package swe
 
 import (
 	"context"
+	"net/http"
 	"sort"
 	"strings"
 	"testing"
 
 	"github.com/inventivepotter/urvi/agents/orchestrator"
 	"github.com/inventivepotter/urvi/internal/agent/loop"
+	"github.com/inventivepotter/urvi/tools"
 	"github.com/inventivepotter/urvi/tui"
 )
+
+// testWiring builds the orchestrator's spawner + Subagent catalog from the real leaf
+// registry for the toolset/config tests. The spawner is UNBOUND (its session is nil);
+// these tests only assemble + inspect the cfg/toolset and never run a turn, so no bind
+// is needed.
+func testWiring(t *testing.T) (*swarmSpawner, []tools.SubagentCatalogEntry) {
+	t.Helper()
+	deps := LeafToolDeps{Root: "/tmp/workspace-root", HTTPCl: &http.Client{}}
+	reg, err := leafRegistry(deps)
+	if err != nil {
+		t.Fatalf("leafRegistry() error = %v", err)
+	}
+	return newSwarmSpawner(reg, deps, &fakeLLM{}, newModelFactory("test-key")), toolCatalog(reg)
+}
 
 // TestNewWithClientHappy proves swe.New (via the fake-client seam) builds a usable
 // tui.Agent that is releasable via Close.
@@ -36,7 +52,8 @@ func TestNewWithClientHappy(t *testing.T) {
 func TestOrchestratorConfigIsPrimaryWithIdentityAndRole(t *testing.T) {
 	t.Parallel()
 
-	cfg := orchestratorConfig(&fakeLLM{}, newModelFactory("test-key"), "/tmp/workspace-root")
+	spawner, catalog := testWiring(t)
+	cfg := orchestratorConfig(&fakeLLM{}, newModelFactory("test-key"), "/tmp/workspace-root", spawner, catalog)
 
 	if cfg.AgentName != orchestrator.Name {
 		t.Errorf("cfg.AgentName = %q, want %q", cfg.AgentName, orchestrator.Name)
@@ -56,18 +73,19 @@ func TestOrchestratorConfigIsPrimaryWithIdentityAndRole(t *testing.T) {
 	}
 }
 
-// TestOrchestratorToolSetIsExactlyTheFive proves the orchestrator's toolset in 4A
-// is EXACTLY ReadFile, Glob, Grep, Todo, AskUser — and that Subagent is deliberately
-// ABSENT (it is wired in 4B after the tool-arg flip).
-func TestOrchestratorToolSetIsExactlyTheFive(t *testing.T) {
+// TestOrchestratorToolSetIsExactlyTheSix proves the orchestrator's toolset is EXACTLY
+// ReadFile, Glob, Grep, Todo, AskUser, Subagent — and in particular that the agent-aware
+// Subagent IS now wired (the orchestrator can spawn leaf agents by name).
+func TestOrchestratorToolSetIsExactlyTheSix(t *testing.T) {
 	t.Parallel()
 
-	ts := orchestratorToolSet("/tmp/workspace-root")
+	spawner, catalog := testWiring(t)
+	ts := orchestratorToolSet("/tmp/workspace-root", spawner, catalog)
 	if ts.Permission == nil {
 		t.Fatal("orchestratorToolSet() Permission = nil, want non-nil PermissionChecker")
 	}
 
-	want := []string{"AskUser", "Glob", "Grep", "ReadFile", "Todo"}
+	want := []string{"AskUser", "Glob", "Grep", "ReadFile", "Subagent", "Todo"}
 	got := make([]string, 0, len(ts.Registry))
 	for _, tl := range ts.Registry {
 		info, err := tl.Info(t.Context())
@@ -86,21 +104,27 @@ func TestOrchestratorToolSetIsExactlyTheFive(t *testing.T) {
 			t.Fatalf("orchestrator tool names = %v, want %v", got, want)
 		}
 	}
+
+	var hasSubagent bool
 	for _, n := range got {
 		if n == "Subagent" {
-			t.Errorf("Subagent is wired, want absent in 4A (added in 4B)")
+			hasSubagent = true
 		}
+	}
+	if !hasSubagent {
+		t.Error("Subagent is absent, want it wired (the orchestrator must be able to spawn leaves)")
 	}
 }
 
-// TestOrchestratorAutoApproveSetIsTheFive proves the orchestrator's hard-approve
-// set is exactly the five toolset members — every tool the orchestrator has is
-// auto-approved (it only reads/searches/plans/asks; never mutates or networks) and
-// Subagent is absent.
-func TestOrchestratorAutoApproveSetIsTheFive(t *testing.T) {
+// TestOrchestratorAutoApproveSetIsTheSix proves the orchestrator's hard-approve set is
+// exactly the six toolset members — every tool the orchestrator has is auto-approved
+// (it reads/searches/plans/asks/spawns; never directly mutates or networks) and Subagent
+// IS in the set (it has no path/command boundary, so it auto-approves only by being
+// named here).
+func TestOrchestratorAutoApproveSetIsTheSix(t *testing.T) {
 	t.Parallel()
 
-	want := []string{"AskUser", "Glob", "Grep", "ReadFile", "Todo"}
+	want := []string{"AskUser", "Glob", "Grep", "ReadFile", "Subagent", "Todo"}
 	got := append([]string(nil), orchestratorAutoApprovedTools...)
 	sort.Strings(got)
 	if len(got) != len(want) {
@@ -111,19 +135,25 @@ func TestOrchestratorAutoApproveSetIsTheFive(t *testing.T) {
 			t.Fatalf("orchestratorAutoApprovedTools = %v, want %v", got, want)
 		}
 	}
+
+	var hasSubagent bool
 	for _, n := range got {
 		if n == "Subagent" {
-			t.Errorf("Subagent is auto-approved, want absent in 4A (added in 4B)")
+			hasSubagent = true
 		}
+	}
+	if !hasSubagent {
+		t.Error("Subagent is not auto-approved, want it in the hard-approve set")
 	}
 }
 
 // TestOrchestratorToolSetAllToolsAutoApproved proves the PermissionChecker
 // auto-approves every tool the orchestrator carries with a valid in-workspace call
-// — none gate. This is the 4A contract: a read/search/plan/ask-only orchestrator
-// never prompts. Each tool is driven with args that clear the Stage-1 containment
-// boundary (an in-root path), so the assertion exercises the HardApprove stage, not
-// a malformed-args fail-secure ask.
+// — none gate. This is the contract: a read/search/plan/ask/spawn orchestrator never
+// prompts. Each tool is driven with args that clear the Stage-1 containment boundary
+// (an in-root path); Subagent has no path boundary and reaches AutoApprove via the
+// hard-approve list — so the assertion exercises the HardApprove stage, not a
+// malformed-args fail-secure ask.
 func TestOrchestratorToolSetAllToolsAutoApproved(t *testing.T) {
 	t.Parallel()
 
@@ -131,16 +161,18 @@ func TestOrchestratorToolSetAllToolsAutoApproved(t *testing.T) {
 	// root) clears for the read/search tools.
 	root := t.TempDir()
 	// Per-tool valid args: the read/search tools carry an in-root path/root field so
-	// containment clears; Todo/AskUser are path-free.
+	// containment clears; Todo/AskUser are path-free; Subagent carries a name+message.
 	args := map[string]string{
 		"ReadFile": `{"path":"file.txt"}`,
 		"Glob":     `{"pattern":"*.go","root":"."}`,
 		"Grep":     `{"pattern":"foo","path":"."}`,
 		"Todo":     `{}`,
 		"AskUser":  `{}`,
+		"Subagent": `{"agent":"operator","message":"do it"}`,
 	}
 
-	ts := orchestratorToolSet(root)
+	spawner, catalog := testWiring(t)
+	ts := orchestratorToolSet(root, spawner, catalog)
 	for _, tl := range ts.Registry {
 		info, err := tl.Info(t.Context())
 		if err != nil {
