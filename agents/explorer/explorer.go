@@ -41,11 +41,20 @@ var autoApprovedTools = []string{"ReadFile", "Glob", "Grep", "AskUser"}
 // read tools get the workspace root + the checker as their ReadGuard; AskUser is
 // self-contained. There is deliberately NO Subagent (a leaf cannot spawn), NO
 // network tool, NO shell, and NO write/edit tool — explorer is read-only.
-func BuildTools(root string) loop.ToolSet {
+//
+// skill is the OPTIONAL per-agent Skill tool the swarm wires when explorer has
+// ≥1 allowed skill (nil otherwise). When non-nil it is added to the registry and
+// "Skill" is appended to the hard-approve set so it auto-approves — a scoped,
+// side-effect-free read of trusted in-repo content, the same class as ReadFile.
+func BuildTools(root string, skill tool.InvokableTool) loop.ToolSet {
+	approved := autoApprovedTools
+	if skill != nil {
+		approved = append(append([]string(nil), autoApprovedTools...), "Skill")
+	}
 	policy := tools.PermissionPolicy{
 		WorkspaceRoot: root,
 		HardDeny:      tools.DefaultHardDeny(),
-		HardApprove:   tools.HardApproveRules{Tools: autoApprovedTools},
+		HardApprove:   tools.HardApproveRules{Tools: approved},
 	}
 	pc := tools.NewPermissionChecker(policy)
 
@@ -54,6 +63,9 @@ func BuildTools(root string) loop.ToolSet {
 		tools.NewGlob(root, pc),
 		tools.NewGrep(root, pc),
 		tools.NewAskUser(),
+	}
+	if skill != nil {
+		registry = append(registry, skill)
 	}
 	return loop.ToolSet{Permission: pc, Registry: registry}
 }

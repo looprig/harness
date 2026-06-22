@@ -3,6 +3,7 @@ package researcher
 import (
 	"context"
 	"crypto/tls"
+	"encoding/json"
 	"encoding/xml"
 	"net/http"
 	"os"
@@ -16,6 +17,19 @@ import (
 	"github.com/inventivepotter/urvi/internal/agent/loop/identity"
 	"github.com/inventivepotter/urvi/internal/tool"
 )
+
+// fakeSkill is a minimal tool.InvokableTool named "Skill" used to prove the leaf
+// wiring: BuildTools adds the injected skill tool to the registry and lists
+// "Skill" in HardApprove (so it auto-approves) ONLY when the tool is non-nil.
+type fakeSkill struct{}
+
+func (fakeSkill) Info(context.Context) (*tool.ToolInfo, error) {
+	return &tool.ToolInfo{Name: "Skill", Desc: "fake", Schema: json.RawMessage(`{"type":"object"}`)}, nil
+}
+
+func (fakeSkill) InvokableRun(context.Context, string) (*tool.ToolResult, error) {
+	return tool.TextResult("fake"), nil
+}
 
 // testHTTPClient builds the kind of client the swarm would pass: explicit
 // timeout, TLS 1.2 floor. The leaf tests never make a real request.
@@ -75,7 +89,7 @@ func equalStrings(a, b []string) bool {
 func TestBuildToolSetAllowlist(t *testing.T) {
 	t.Parallel()
 
-	ts := BuildTools("/tmp/workspace-root", testHTTPClient())
+	ts := BuildTools("/tmp/workspace-root", testHTTPClient(), nil)
 	if ts.Permission == nil {
 		t.Fatal("BuildTools() ToolSet.Permission = nil, want non-nil PermissionChecker")
 	}
@@ -108,7 +122,7 @@ func TestBuildToolSetAllowlist(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(root, "f.txt"), []byte("x"), 0o600); err != nil {
 		t.Fatalf("seed file: %v", err)
 	}
-	tsReal := BuildTools(root, testHTTPClient())
+	tsReal := BuildTools(root, testHTTPClient(), nil)
 	reg := byName(t, tsReal.Registry)
 	cases := []struct {
 		tool string
@@ -130,6 +144,29 @@ func TestBuildToolSetAllowlist(t *testing.T) {
 		if eff := tsReal.Permission.Check(context.Background(), tl, tc.tool, tc.args); eff != tc.want {
 			t.Errorf("Check(%q) effect = %v, want %v", tc.tool, eff, tc.want)
 		}
+	}
+}
+
+// TestBuildToolSetWithSkill proves that when a non-nil Skill tool is injected,
+// BuildTools adds it to the registry AND it auto-approves through the wired
+// PermissionChecker — a scoped, side-effect-free read, the same class as
+// ReadFile. The base allowlist is otherwise unchanged.
+func TestBuildToolSetWithSkill(t *testing.T) {
+	t.Parallel()
+
+	ts := BuildTools("/tmp/workspace-root", testHTTPClient(), fakeSkill{})
+	wantTools := []string{"AskUser", "Fetch", "Glob", "Grep", "ReadFile", "Skill", "WebSearch"}
+	got := toolNames(t, ts.Registry)
+	if !equalStrings(got, wantTools) {
+		t.Errorf("registry tool names = %v, want %v (Skill added)", got, wantTools)
+	}
+	reg := byName(t, ts.Registry)
+	tl, ok := reg["Skill"]
+	if !ok {
+		t.Fatal("Skill tool not in registry")
+	}
+	if eff := ts.Permission.Check(context.Background(), tl, "Skill", `{"name":"code-style"}`); eff != loop.EffectAutoApprove {
+		t.Errorf("Check(Skill) effect = %v, want %v (Skill must auto-approve)", eff, loop.EffectAutoApprove)
 	}
 }
 

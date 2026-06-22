@@ -48,11 +48,20 @@ var autoApprovedTools = []string{"ReadFile", "Glob", "Grep", "AskUser"}
 // + the checker as their ReadGuard; the web tools get only the HTTP client and
 // never touch the filesystem; AskUser is self-contained. There is deliberately
 // NO Subagent tool — a leaf cannot spawn.
-func BuildTools(root string, httpCl *http.Client) loop.ToolSet {
+//
+// skill is the OPTIONAL per-agent Skill tool the swarm wires when researcher has
+// ≥1 allowed skill (nil otherwise). When non-nil it is added to the registry and
+// "Skill" is appended to the hard-approve set so it auto-approves — a scoped,
+// side-effect-free read of trusted in-repo content, the same class as ReadFile.
+func BuildTools(root string, httpCl *http.Client, skill tool.InvokableTool) loop.ToolSet {
+	approved := autoApprovedTools
+	if skill != nil {
+		approved = append(append([]string(nil), autoApprovedTools...), "Skill")
+	}
 	policy := tools.PermissionPolicy{
 		WorkspaceRoot: root,
 		HardDeny:      tools.DefaultHardDeny(),
-		HardApprove:   tools.HardApproveRules{Tools: autoApprovedTools},
+		HardApprove:   tools.HardApproveRules{Tools: approved},
 	}
 	pc := tools.NewPermissionChecker(policy)
 
@@ -63,6 +72,9 @@ func BuildTools(root string, httpCl *http.Client) loop.ToolSet {
 		tools.NewWebSearch(tools.NewDuckDuckGoProvider(httpCl)),
 		tools.NewFetch(httpCl),
 		tools.NewAskUser(),
+	}
+	if skill != nil {
+		registry = append(registry, skill)
 	}
 	return loop.ToolSet{Permission: pc, Registry: registry}
 }

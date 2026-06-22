@@ -23,9 +23,16 @@ type Agent struct {
 	Description string // shown in the Subagent catalog + greeting
 	Role        string // role prompt; the swarm prepends identity
 
+	// Skills is the agent's closed set of allowed embedded-skill names — part of
+	// its boundary. An agent with ≥1 skill is wired with the Skill tool and an
+	// <available_skills> catalog in its system prompt; an empty set gets neither.
+	// The swarm builds the loader's per-agent allow-map from these names.
+	Skills []string
+
 	// BuildTools constructs the agent's OWN tool allowlist. The swarm calls it
 	// per spawn so each invocation gets a fresh PermissionChecker (no shared
-	// mutable permission state across loops).
+	// mutable permission state across loops). The optional Skill tool is threaded
+	// in by the leaf adapter when the agent has ≥1 skill.
 	BuildTools func(LeafToolDeps) loop.ToolSet
 
 	AllowsRuntimeSkills bool // P2b; false in P1

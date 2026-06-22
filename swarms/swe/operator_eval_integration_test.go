@@ -121,7 +121,7 @@ func newOperatorPrimary(ctx context.Context, client llm.LLM, factory ModelFactor
 	cfg := loop.Config{
 		Client:    client,
 		Model:     factory(Identity + operator.Role),
-		Tools:     operator.BuildTools(root),
+		Tools:     operator.BuildTools(root, nil),
 		AgentName: operator.Name,
 	}
 	return newSessionAgent(ctx, cfg, session.WithLimits(session.Limits{

@@ -27,25 +27,26 @@ func leafRegistry(_ LeafToolDeps) (*Registry, error) {
 			Name:        operator.Name,
 			Description: operator.Description,
 			Role:        operator.Role,
-			BuildTools:  func(d LeafToolDeps) loop.ToolSet { return operator.BuildTools(d.Root) },
+			Skills:      []string{"code-style"},
+			BuildTools:  func(d LeafToolDeps) loop.ToolSet { return operator.BuildTools(d.Root, nil) },
 		},
 		Agent{
 			Name:        researcher.Name,
 			Description: researcher.Description,
 			Role:        researcher.Role,
-			BuildTools:  func(d LeafToolDeps) loop.ToolSet { return researcher.BuildTools(d.Root, d.HTTPCl) },
+			BuildTools:  func(d LeafToolDeps) loop.ToolSet { return researcher.BuildTools(d.Root, d.HTTPCl, nil) },
 		},
 		Agent{
 			Name:        explorer.Name,
 			Description: explorer.Description,
 			Role:        explorer.Role,
-			BuildTools:  func(d LeafToolDeps) loop.ToolSet { return explorer.BuildTools(d.Root) },
+			BuildTools:  func(d LeafToolDeps) loop.ToolSet { return explorer.BuildTools(d.Root, nil) },
 		},
 		Agent{
 			Name:        reviewer.Name,
 			Description: reviewer.Description,
 			Role:        reviewer.Role,
-			BuildTools:  func(d LeafToolDeps) loop.ToolSet { return reviewer.BuildTools(d.Root) },
+			BuildTools:  func(d LeafToolDeps) loop.ToolSet { return reviewer.BuildTools(d.Root, nil) },
 		},
 	)
 }
