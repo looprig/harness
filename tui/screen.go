@@ -72,6 +72,15 @@ type Screen struct {
 type AgentBanner struct {
 	Name        string
 	Description string
+
+	// Greeting is the OPTIONAL, UI-only startup greeting (§5a): a deterministic, already-
+	// built capability description (composed by the composition root from the agent
+	// registry — never the model). When non-empty it is committed as a SECOND opening
+	// transcript notice, after the banner, by the systemReady handler. It is purely a
+	// rendered opening entry — NOT a turn, NOT a command, never in the model's context —
+	// so the primary loop's history stays empty until the first real user message. Empty
+	// (the default-off case) → no greeting entry, behavior identical to today.
+	Greeting string
 }
 
 // bannerText renders the startup banner line from the agent metadata: "<Name> —
@@ -165,12 +174,25 @@ func (m Screen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case promptResultMsg:
 		return m, m.handlePromptResult(msg)
 	case systemReadyMsg:
-		m.transcript = m.transcript.CommitNotice(noticeInfo, m.banner.bannerText())
-		return m, m.flush()
+		return m, m.commitStartup()
 	case blinkMsg:
 		return m, m.handleBlink()
 	}
 	return m, nil
+}
+
+// commitStartup commits the opening transcript entries on the systemReady boundary: the
+// startup banner (always) followed by the OPTIONAL greeting (only when banner.Greeting is
+// non-empty/non-blank). Both are committed via the plain info-notice path — they are
+// rendered opening entries, NOT turns or commands: this never calls Submit, never drives
+// a loop, and never enters the model's context. It flushes the new entries to scrollback
+// and returns the print command (non-nil because at least the banner is always committed).
+func (m *Screen) commitStartup() tea.Cmd {
+	m.transcript = m.transcript.CommitNotice(noticeInfo, m.banner.bannerText())
+	if greeting := strings.TrimSpace(m.banner.Greeting); greeting != "" {
+		m.transcript = m.transcript.CommitNotice(noticeInfo, greeting)
+	}
+	return m.flush()
 }
 
 // handleBlink advances the live-surface animation by one frame and, ONLY while the

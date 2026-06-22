@@ -58,6 +58,14 @@ type Config struct {
 	// default: embedded-only. The model can never set it — only a launch flag does
 	// (cmd/swe's --runtime-skills). When off, no leaf gains a workspace skill source.
 	RuntimeSkills bool
+
+	// Greeting enables the OPTIONAL, UI-only startup greeting (§5a): a deterministic,
+	// LLM-free opening transcript entry listing the swarm's agents (+ embedded skills),
+	// rendered by the TUI before any turn. Off by default (fail-secure): off → no
+	// greeting, behavior identical to today. It is purely a rendered opening entry — NOT
+	// a turn, NOT a command, never in the model's context. The model can never set it;
+	// only a launch flag does (cmd/swe's --greeting). See Greeting() and greeting.go.
+	Greeting bool
 }
 
 // ModelFactory turns a finished system prompt into an llm.ModelSpec. The swarm

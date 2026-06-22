@@ -23,6 +23,7 @@ func TestParseFlags(t *testing.T) {
 		wantList          bool
 		wantResume        uuid.UUID
 		wantRuntimeSkills bool
+		wantGreeting      bool
 		wantErr           bool
 	}{
 		{name: "no flags → new session", args: nil},
@@ -34,6 +35,10 @@ func TestParseFlags(t *testing.T) {
 		{name: "runtime-skills flag", args: []string{"-runtime-skills"}, wantRuntimeSkills: true},
 		{name: "runtime-skills flag double dash", args: []string{"--runtime-skills"}, wantRuntimeSkills: true},
 		{name: "runtime-skills with resume", args: []string{"-runtime-skills", "-resume", validID.String()}, wantResume: validID, wantRuntimeSkills: true},
+		{name: "greeting off by default", args: nil, wantGreeting: false},
+		{name: "greeting flag", args: []string{"-greeting"}, wantGreeting: true},
+		{name: "greeting flag double dash", args: []string{"--greeting"}, wantGreeting: true},
+		{name: "greeting with resume", args: []string{"-greeting", "-resume", validID.String()}, wantResume: validID, wantGreeting: true},
 		{name: "invalid resume id rejected", args: []string{"-resume", "not-a-uuid"}, wantErr: true},
 		{name: "empty resume id rejected", args: []string{"-resume", ""}, wantErr: true},
 		{name: "list and resume are mutually exclusive", args: []string{"-list", "-resume", validID.String()}, wantErr: true},
@@ -58,6 +63,9 @@ func TestParseFlags(t *testing.T) {
 			}
 			if got.runtimeSkills != tt.wantRuntimeSkills {
 				t.Errorf("runtimeSkills = %v, want %v", got.runtimeSkills, tt.wantRuntimeSkills)
+			}
+			if got.greeting != tt.wantGreeting {
+				t.Errorf("greeting = %v, want %v", got.greeting, tt.wantGreeting)
 			}
 		})
 	}

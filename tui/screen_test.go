@@ -1564,6 +1564,82 @@ func TestUpdateStartupBanner(t *testing.T) {
 	}
 }
 
+// TestUpdateStartupGreeting covers the OPTIONAL, UI-only startup greeting (§5a): when a
+// non-empty Greeting is threaded in via AgentBanner, the systemReadyMsg commits TWO
+// opening info notices — the banner first, then the greeting — both to scrollback (a
+// non-nil flush cmd). When the greeting is empty (the default-OFF case) ONLY the banner
+// is committed, so behavior is identical to today. The greeting is a pure opening
+// transcript entry: it is committed via the same notice path, never a turn or command.
+func TestUpdateStartupGreeting(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name         string
+		banner       AgentBanner
+		wantCommits  int
+		wantGreeting string // when wantCommits == 2, the second committed entry's text
+	}{
+		{
+			name:         "greeting on commits banner then greeting",
+			banner:       AgentBanner{Name: "SWE", Greeting: "SWE can help with: orchestrator — delegates."},
+			wantCommits:  2,
+			wantGreeting: "SWE can help with: orchestrator — delegates.",
+		},
+		{
+			name:        "greeting off commits only the banner",
+			banner:      AgentBanner{Name: "SWE"},
+			wantCommits: 1,
+		},
+		{
+			name:        "whitespace-only greeting is treated as off",
+			banner:      AgentBanner{Name: "SWE", Greeting: "   \n\t  "},
+			wantCommits: 1,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			agent := &fakeAgent{}
+			m := New(context.Background(), agent, fakeOpen(agent), tt.banner)
+
+			m, cmd := updateScreen(t, m, systemReadyMsg{})
+			if cmd == nil {
+				t.Fatal("systemReady cmd = nil, want non-nil (flush)")
+			}
+
+			if got := len(m.transcript.committed); got != tt.wantCommits {
+				t.Fatalf("committed entries = %d, want %d", got, tt.wantCommits)
+			}
+
+			// The banner is always the FIRST opening entry.
+			banner := m.transcript.committed[0]
+			if banner.Kind != kindNotice || banner.Level != noticeInfo {
+				t.Errorf("banner entry = (kind %d, level %d), want (kindNotice, noticeInfo)", banner.Kind, banner.Level)
+			}
+
+			if tt.wantCommits == 2 {
+				greeting := m.transcript.committed[1]
+				if greeting.Kind != kindNotice || greeting.Level != noticeInfo {
+					t.Errorf("greeting entry = (kind %d, level %d), want (kindNotice, noticeInfo)", greeting.Kind, greeting.Level)
+				}
+				if got := committedText(greeting); got != tt.wantGreeting {
+					t.Errorf("greeting text = %q, want %q", got, tt.wantGreeting)
+				}
+			}
+
+			// Lifecycle-neutral: the greeting is NOT a turn or a command. It must never
+			// submit anything and must not flip the model off Idle.
+			if agent.submitCalled {
+				t.Error("greeting must not call agent.Submit (it is not a turn/command)")
+			}
+			if m.status != StatusIdle {
+				t.Errorf("status after greeting = %d, want StatusIdle (greeting is lifecycle-neutral)", m.status)
+			}
+		})
+	}
+}
+
 // TestSubmitUserRowFromEventNotSubmit is the Screen-level proof of the event-driven
 // user row: after a submit there is NO kindUser row (the optimistic commit is gone);
 // feeding the loop's TurnStarted (genuine input, Message present) commits exactly one

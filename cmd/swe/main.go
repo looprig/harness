@@ -42,13 +42,15 @@ const (
 )
 
 // cliFlags is the parsed CLI invocation: whether to list sessions and exit (--list),
-// which session to resume (--resume <uuid>; zero = new session), and whether to enable
+// which session to resume (--resume <uuid>; zero = new session), whether to enable
 // the untrusted, human-gated workspace skill source (--runtime-skills; off by default,
-// §7a). There is no positional agent name — swe is a single swarm.
+// §7a), and whether to show the optional UI-only startup greeting (--greeting; off by
+// default, §5a). There is no positional agent name — swe is a single swarm.
 type cliFlags struct {
 	list          bool
 	resume        uuid.UUID
 	runtimeSkills bool
+	greeting      bool
 }
 
 // FlagParseError reports a malformed CLI invocation (an unknown flag, a non-UUID --resume
@@ -82,6 +84,7 @@ func parseFlags(args []string) (cliFlags, error) {
 		list          = fs.Bool("list", false, "list resumable sessions and exit")
 		resume        = fs.String("resume", "", "resume the session with this id")
 		runtimeSkills = fs.Bool("runtime-skills", false, "enable the untrusted, human-gated workspace skill source (.skills/) for read-only agents")
+		greeting      = fs.Bool("greeting", false, "show a UI-only startup greeting listing the swarm's agents and skills")
 	)
 	if err := fs.Parse(args); err != nil {
 		return cliFlags{}, &FlagParseError{Reason: "invalid flags", Cause: err}
@@ -93,7 +96,7 @@ func parseFlags(args []string) (cliFlags, error) {
 		return cliFlags{}, &FlagParseError{Reason: "unexpected argument " + strconv.Quote(fs.Arg(0))}
 	}
 
-	out := cliFlags{list: *list, runtimeSkills: *runtimeSkills}
+	out := cliFlags{list: *list, runtimeSkills: *runtimeSkills, greeting: *greeting}
 
 	// Detect whether --resume was explicitly given (vs left at its empty default): an
 	// explicit --resume with an empty/whitespace value is a malformed invocation, rejected
@@ -221,10 +224,14 @@ func run(ctx context.Context, args []string, out, errOut io.Writer) int {
 	}
 
 	// The initial open honors --resume; every /clear reopen starts a FRESH persisted
-	// session. The --runtime-skills mode applies to every open. internal/cli.Run owns
-	// logging, signal teardown, the TUI, and bounded Close.
-	open := openThunk(persist, flags.resume, swe.Config{RuntimeSkills: flags.runtimeSkills})
-	return cli.Run(ctx, open, cli.Banner{Name: bannerName})
+	// session. The --runtime-skills and --greeting modes apply to every open. The startup
+	// greeting (§5a) is built ONCE here from the registry (deterministic, no LLM call) —
+	// empty unless --greeting is set — and handed to the TUI as an opening transcript
+	// entry via the Banner; it is NOT a turn, NOT a command, and never enters the model's
+	// context. internal/cli.Run owns logging, signal teardown, the TUI, and bounded Close.
+	cfg := swe.Config{RuntimeSkills: flags.runtimeSkills, Greeting: flags.greeting}
+	open := openThunk(persist, flags.resume, cfg)
+	return cli.Run(ctx, open, cli.Banner{Name: bannerName, Greeting: swe.Greeting(cfg)})
 }
 
 func main() {

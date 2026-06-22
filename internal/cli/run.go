@@ -24,17 +24,24 @@ import (
 )
 
 // Banner is the startup metadata shown in the TUI's session-ready notice: the
-// agent's user-facing display Name and an optional one-line Description. It is the
-// runtime's narrow view of the banner; entry points construct it and pass it to Run,
-// which maps it onto the TUI's tui.AgentBanner.
+// agent's user-facing display Name, an optional one-line Description, and an OPTIONAL
+// already-built startup Greeting. It is the runtime's narrow view of the banner; entry
+// points construct it and pass it to Run, which maps it onto the TUI's tui.AgentBanner.
 type Banner struct {
 	Name        string
 	Description string
+
+	// Greeting is the OPTIONAL, UI-only startup greeting (§5a): a deterministic
+	// capability description the entry point built from its agent registry (never the
+	// model). When non-empty the TUI renders it as a SECOND opening transcript entry,
+	// after the banner — NOT a turn, NOT a command, never in the model's context. Empty
+	// (the default-off case) → no greeting entry. Run passes it through verbatim.
+	Greeting string
 }
 
 // agentBanner maps the runtime Banner onto the TUI's banner type verbatim.
 func (b Banner) agentBanner() tui.AgentBanner {
-	return tui.AgentBanner{Name: b.Name, Description: b.Description}
+	return tui.AgentBanner{Name: b.Name, Description: b.Description, Greeting: b.Greeting}
 }
 
 // Process exit codes Run returns to its caller (which passes them to os.Exit). They
