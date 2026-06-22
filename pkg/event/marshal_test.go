@@ -334,6 +334,7 @@ func TestMarshalEventRoundTripEnduring(t *testing.T) {
 		{"LoopIdle", LoopIdle{Header: fullHeaderLoop()}},
 		{"LoopStarted", LoopStarted{Header: fullHeaderLoop()}},
 		{"LoopStarted with AgentName", LoopStarted{Header: loopHeaderWithAgent("operator")}},
+		{"LoopStarted with ParentToolUseID", LoopStarted{Header: fullHeaderLoop(), ParentToolUseID: "toolu_abc123"}},
 		{"TurnStarted", TurnStarted{Header: fullHeaderTurn(), TurnIndex: 7, Message: userMsg("hi")}},
 		{"StepDone", StepDone{Header: fullHeader(), Messages: sampleMessages()}},
 		{"TurnFoldedInto", TurnFoldedInto{Header: fullHeaderTurn(), TurnIndex: 2, Message: userMsg("fold")}},
