@@ -5,11 +5,11 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/inventivepotter/urvi/agents/explorer"
-	"github.com/inventivepotter/urvi/agents/operator"
-	"github.com/inventivepotter/urvi/internal/agent/loop"
-	"github.com/inventivepotter/urvi/internal/agent/loop/identity"
-	"github.com/inventivepotter/urvi/internal/tool"
+	"github.com/ciram-co/looprig/agents/explorer"
+	"github.com/ciram-co/looprig/agents/operator"
+	"github.com/ciram-co/looprig/pkg/identity"
+	"github.com/ciram-co/looprig/pkg/loop"
+	"github.com/ciram-co/looprig/pkg/tool"
 )
 
 // skills_wiring_test.go proves the Task-3 composition: a SKILLED leaf (operator)

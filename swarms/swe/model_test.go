@@ -4,7 +4,7 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/inventivepotter/urvi/internal/llm"
+	"github.com/ciram-co/looprig/pkg/llm"
 )
 
 // TestModelFactorySystemPrompt proves the ModelFactory bakes the caller's system

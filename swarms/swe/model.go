@@ -4,8 +4,8 @@ import (
 	"os"
 	"strings"
 
-	"github.com/inventivepotter/urvi/internal/llm"
-	"github.com/inventivepotter/urvi/internal/llm/auto"
+	"github.com/ciram-co/looprig/pkg/llm"
+	"github.com/ciram-co/looprig/pkg/llm/auto"
 )
 
 // model is the named model every agent in the SWE-Swarm runs on. P1 reuses Kimi

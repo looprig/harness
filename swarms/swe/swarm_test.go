@@ -7,10 +7,10 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/inventivepotter/urvi/agents/orchestrator"
-	"github.com/inventivepotter/urvi/internal/agent/loop"
-	"github.com/inventivepotter/urvi/tools"
-	"github.com/inventivepotter/urvi/tui"
+	"github.com/ciram-co/looprig/agents/orchestrator"
+	"github.com/ciram-co/looprig/pkg/loop"
+	"github.com/ciram-co/looprig/pkg/tools"
+	"github.com/ciram-co/looprig/pkg/tui"
 )
 
 // testWiring builds the orchestrator's spawner + Subagent catalog from the real leaf

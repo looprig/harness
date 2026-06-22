@@ -10,9 +10,9 @@ import (
 	"net/http"
 	"strconv"
 
-	"github.com/inventivepotter/urvi/internal/agent/loop"
-	"github.com/inventivepotter/urvi/internal/agent/loop/identity"
-	"github.com/inventivepotter/urvi/internal/llm"
+	"github.com/ciram-co/looprig/pkg/identity"
+	"github.com/ciram-co/looprig/pkg/llm"
+	"github.com/ciram-co/looprig/pkg/loop"
 )
 
 // Agent is what an agent PACKAGE exposes. It owns its role prompt + toolset

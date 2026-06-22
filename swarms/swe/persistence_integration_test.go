@@ -9,13 +9,13 @@ import (
 	"testing"
 	"time"
 
-	"github.com/inventivepotter/urvi/agents/orchestrator"
-	"github.com/inventivepotter/urvi/internal/agent/loop/event"
-	"github.com/inventivepotter/urvi/internal/agent/loop/identity"
-	"github.com/inventivepotter/urvi/internal/agent/session/journal"
-	"github.com/inventivepotter/urvi/internal/content"
-	"github.com/inventivepotter/urvi/internal/persistence"
-	"github.com/inventivepotter/urvi/internal/uuid"
+	"github.com/ciram-co/looprig/agents/orchestrator"
+	"github.com/ciram-co/looprig/pkg/content"
+	"github.com/ciram-co/looprig/pkg/event"
+	"github.com/ciram-co/looprig/pkg/identity"
+	"github.com/ciram-co/looprig/pkg/journal"
+	"github.com/ciram-co/looprig/pkg/persistence"
+	"github.com/ciram-co/looprig/pkg/uuid"
 )
 
 // textChunk wraps s as a streamed text chunk for the fake LLM. (The fake_test fakeLLM is

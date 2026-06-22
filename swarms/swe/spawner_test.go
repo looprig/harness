@@ -7,10 +7,10 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/inventivepotter/urvi/agents/operator"
-	"github.com/inventivepotter/urvi/internal/agent/loop"
-	"github.com/inventivepotter/urvi/internal/agent/loop/identity"
-	"github.com/inventivepotter/urvi/internal/content"
+	"github.com/ciram-co/looprig/agents/operator"
+	"github.com/ciram-co/looprig/pkg/content"
+	"github.com/ciram-co/looprig/pkg/identity"
+	"github.com/ciram-co/looprig/pkg/loop"
 )
 
 // spawner_test.go exercises swarmSpawner against a FAKE subagentRunner (DIP: the

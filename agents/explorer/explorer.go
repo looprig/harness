@@ -7,10 +7,10 @@
 package explorer
 
 import (
-	"github.com/inventivepotter/urvi/internal/agent/loop"
-	"github.com/inventivepotter/urvi/internal/agent/loop/identity"
-	"github.com/inventivepotter/urvi/internal/tool"
-	"github.com/inventivepotter/urvi/tools"
+	"github.com/ciram-co/looprig/pkg/identity"
+	"github.com/ciram-co/looprig/pkg/loop"
+	"github.com/ciram-co/looprig/pkg/tool"
+	"github.com/ciram-co/looprig/pkg/tools"
 )
 
 // Name is the explorer's immutable attribution name.

@@ -9,15 +9,15 @@ import (
 	"testing"
 	"time"
 
-	"github.com/inventivepotter/urvi/agents/operator"
-	"github.com/inventivepotter/urvi/internal/agent/loop/event"
-	"github.com/inventivepotter/urvi/internal/agent/loop/identity"
-	"github.com/inventivepotter/urvi/internal/agent/session"
-	"github.com/inventivepotter/urvi/internal/content"
-	"github.com/inventivepotter/urvi/internal/llm"
-	"github.com/inventivepotter/urvi/internal/tool"
-	"github.com/inventivepotter/urvi/internal/uuid"
-	"github.com/inventivepotter/urvi/tui"
+	"github.com/ciram-co/looprig/agents/operator"
+	"github.com/ciram-co/looprig/pkg/content"
+	"github.com/ciram-co/looprig/pkg/event"
+	"github.com/ciram-co/looprig/pkg/identity"
+	"github.com/ciram-co/looprig/pkg/llm"
+	"github.com/ciram-co/looprig/pkg/session"
+	"github.com/ciram-co/looprig/pkg/tool"
+	"github.com/ciram-co/looprig/pkg/tui"
+	"github.com/ciram-co/looprig/pkg/uuid"
 )
 
 // acceptance_test.go is the swarm's CROSS-CUTTING acceptance suite: it drives the

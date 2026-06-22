@@ -1,4 +1,4 @@
-module github.com/inventivepotter/urvi
+module github.com/ciram-co/looprig
 
 go 1.26.4
 

@@ -4,7 +4,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/inventivepotter/urvi/agents/orchestrator"
+	"github.com/ciram-co/looprig/agents/orchestrator"
 )
 
 // greeting.go builds the OPTIONAL, UI-only startup greeting (§5a): a deterministic,

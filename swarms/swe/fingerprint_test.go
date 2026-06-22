@@ -4,8 +4,8 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/inventivepotter/urvi/agents/orchestrator"
-	"github.com/inventivepotter/urvi/internal/agent/session"
+	"github.com/ciram-co/looprig/agents/orchestrator"
+	"github.com/ciram-co/looprig/pkg/session"
 )
 
 // TestOrchestratorFingerprintFields asserts the swarm-level config-fingerprint fields the

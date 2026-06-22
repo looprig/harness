@@ -6,8 +6,8 @@ import (
 	"io"
 	"sync"
 
-	"github.com/inventivepotter/urvi/internal/content"
-	"github.com/inventivepotter/urvi/internal/llm"
+	"github.com/ciram-co/looprig/pkg/content"
+	"github.com/ciram-co/looprig/pkg/llm"
 )
 
 // fakeLLM is a controllable llm.LLM for tests. The loop only ever calls Stream,

@@ -10,9 +10,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/inventivepotter/urvi/internal/agent/loop"
-	"github.com/inventivepotter/urvi/internal/agent/loop/identity"
-	"github.com/inventivepotter/urvi/internal/tool"
+	"github.com/ciram-co/looprig/pkg/identity"
+	"github.com/ciram-co/looprig/pkg/loop"
+	"github.com/ciram-co/looprig/pkg/tool"
 )
 
 // fakeSkill is a minimal tool.InvokableTool named "Skill" used to prove the leaf

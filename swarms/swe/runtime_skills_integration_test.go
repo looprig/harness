@@ -9,12 +9,12 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/inventivepotter/urvi/agents/researcher"
-	"github.com/inventivepotter/urvi/internal/agent/loop/event"
-	"github.com/inventivepotter/urvi/internal/agent/session"
-	"github.com/inventivepotter/urvi/internal/content"
-	"github.com/inventivepotter/urvi/internal/tool"
-	"github.com/inventivepotter/urvi/internal/uuid"
+	"github.com/ciram-co/looprig/agents/researcher"
+	"github.com/ciram-co/looprig/pkg/content"
+	"github.com/ciram-co/looprig/pkg/event"
+	"github.com/ciram-co/looprig/pkg/session"
+	"github.com/ciram-co/looprig/pkg/tool"
+	"github.com/ciram-co/looprig/pkg/uuid"
 )
 
 // runtime_skills_integration_test.go is the P2b Phase 3c END-TO-END acceptance: with

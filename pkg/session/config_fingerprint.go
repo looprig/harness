@@ -1,0 +1,97 @@
+package session
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"sort"
+	"strings"
+
+	"github.com/ciram-co/looprig/pkg/event"
+	"github.com/ciram-co/looprig/pkg/loop"
+)
+
+// ConfigFingerprintFields are the swarm-level fingerprint inputs that do NOT live on
+// loop.Config and so cannot be derived by FingerprintFrom alone. The composition root
+// (the swarm) injects them via WithConfigFingerprintFields; both the New and Restore
+// construction paths merge them onto the loop-derived fingerprint, so a session cannot
+// silently resume under a different agent identity, skill-trust mode, or workspace.
+//
+//   - AgentKind: the swarm + primary agent identity (e.g. "swe:orchestrator").
+//   - RuntimeSkills: whether the untrusted, human-gated workspace skill source was on.
+//   - WorkspaceRoot: the canonical absolute workspace-root id (filepath.Clean of abs).
+//
+// A zero-valued ConfigFingerprintFields (the default, no option) leaves all three
+// empty, so a non-swarm/legacy caller is unaffected and the fingerprint is purely the
+// loop-derived one (additive evolution).
+type ConfigFingerprintFields struct {
+	AgentKind     string
+	RuntimeSkills bool
+	WorkspaceRoot string
+}
+
+// FingerprintFrom derives the stable config fingerprint a session stamps onto its
+// SessionStarted from the loop.Config it ran under. It lives in the session package
+// because the session is the layer that both owns the loop.Config and constructs
+// SessionStarted (the event package defines only the value + its equality, and must
+// not import loop). The derivation is deterministic — identical config yields an
+// Equal fingerprint — and changes when the model, system prompt, or tool set
+// changes:
+//
+//   - ModelID is the model spec id verbatim.
+//   - SystemPromptRev is a hex sha256 of the system-prompt text, so a prompt change
+//     is detectable without persisting the prompt.
+//   - ToolPolicyRev is a hex sha256 over the tool set's stable identity (its sorted,
+//     newline-joined tool names), so reordering the registry does not perturb it but
+//     adding/removing/renaming a tool does.
+//
+// The swarm-level fields (AgentKind, RuntimeSkills, WorkspaceRoot) are NOT on
+// loop.Config and are left zero here; the composition root injects them via
+// WithConfigFingerprintFields, and the construction paths merge them with
+// fingerprintWith. A bare FingerprintFrom (no injection) therefore leaves them empty.
+func FingerprintFrom(cfg loop.Config) event.ConfigFingerprint {
+	return event.ConfigFingerprint{
+		ModelID:         cfg.Model.Model,
+		SystemPromptRev: hexSHA256(cfg.Model.System),
+		ToolPolicyRev:   toolPolicyRev(cfg.Tools),
+	}
+}
+
+// fingerprintWith returns the loop-derived fingerprint with the injected swarm-level
+// fields applied. It is the single merge point both New and Restore use to compute the
+// LIVE fingerprint, so the stamped (New) and compared-against (Restore) fingerprints
+// are derived identically — the restore comparison would spuriously mismatch otherwise.
+// Zero-valued fields leave the corresponding loop-derived/empty value unchanged.
+func fingerprintWith(cfg loop.Config, fields ConfigFingerprintFields) event.ConfigFingerprint {
+	fpr := FingerprintFrom(cfg)
+	fpr.AgentKind = fields.AgentKind
+	fpr.RuntimeSkills = fields.RuntimeSkills
+	fpr.WorkspaceRoot = fields.WorkspaceRoot
+	return fpr
+}
+
+// hexSHA256 returns the lowercase-hex sha256 digest of s. An empty input yields the
+// well-defined digest of the empty string (stable across calls), so the fingerprint
+// is always populated and comparable.
+func hexSHA256(s string) string {
+	sum := sha256.Sum256([]byte(s))
+	return hex.EncodeToString(sum[:])
+}
+
+// toolPolicyRev digests the tool set's stable identity: the sorted, newline-joined
+// names of the registered tools. Names are sorted so registry order never changes
+// the digest; a tool's Info error excludes only that tool (best-effort — the
+// fingerprint is an identity hash for change detection, not a security boundary).
+// The digest covers the empty string when no tool reports a name.
+func toolPolicyRev(ts loop.ToolSet) string {
+	names := make([]string, 0, len(ts.Registry))
+	for _, t := range ts.Registry {
+		info, err := t.Info(context.Background())
+		if err != nil || info == nil {
+			continue
+		}
+		names = append(names, info.Name)
+	}
+	sort.Strings(names)
+	return hexSHA256(strings.Join(names, "\n"))
+}

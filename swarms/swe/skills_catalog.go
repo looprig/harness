@@ -5,8 +5,8 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/inventivepotter/urvi/internal/agent/loop/identity"
-	"github.com/inventivepotter/urvi/tools"
+	"github.com/ciram-co/looprig/pkg/identity"
+	"github.com/ciram-co/looprig/pkg/tools"
 )
 
 // skills_catalog.go is the composition-root seam that turns the swarm's per-agent

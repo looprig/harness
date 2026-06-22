@@ -18,11 +18,11 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/inventivepotter/urvi/internal/cli"
-	"github.com/inventivepotter/urvi/internal/persistence"
-	"github.com/inventivepotter/urvi/internal/uuid"
-	"github.com/inventivepotter/urvi/swarms/swe"
-	"github.com/inventivepotter/urvi/tui"
+	"github.com/ciram-co/looprig/pkg/cli"
+	"github.com/ciram-co/looprig/pkg/persistence"
+	"github.com/ciram-co/looprig/pkg/tui"
+	"github.com/ciram-co/looprig/pkg/uuid"
+	"github.com/ciram-co/looprig/swarms/swe"
 )
 
 // bannerName is the SWE-Swarm's user-facing banner name shown in the TUI session-ready

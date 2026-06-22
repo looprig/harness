@@ -10,15 +10,15 @@ import (
 	"testing"
 	"time"
 
-	"github.com/inventivepotter/urvi/agents/operator"
-	"github.com/inventivepotter/urvi/internal/agent/loop"
-	"github.com/inventivepotter/urvi/internal/agent/loop/event"
-	"github.com/inventivepotter/urvi/internal/agent/session"
-	"github.com/inventivepotter/urvi/internal/content"
-	"github.com/inventivepotter/urvi/internal/eval"
-	"github.com/inventivepotter/urvi/internal/llm"
-	"github.com/inventivepotter/urvi/internal/llm/auto"
-	"github.com/inventivepotter/urvi/internal/uuid"
+	"github.com/ciram-co/looprig/agents/operator"
+	"github.com/ciram-co/looprig/pkg/content"
+	"github.com/ciram-co/looprig/pkg/eval"
+	"github.com/ciram-co/looprig/pkg/event"
+	"github.com/ciram-co/looprig/pkg/llm"
+	"github.com/ciram-co/looprig/pkg/llm/auto"
+	"github.com/ciram-co/looprig/pkg/loop"
+	"github.com/ciram-co/looprig/pkg/session"
+	"github.com/ciram-co/looprig/pkg/uuid"
 )
 
 // errTurnInterrupted is the eval-harness sentinel for a turn whose context was

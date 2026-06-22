@@ -11,13 +11,13 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/inventivepotter/urvi/agents/orchestrator"
-	"github.com/inventivepotter/urvi/internal/agent/loop"
-	"github.com/inventivepotter/urvi/internal/agent/session"
-	"github.com/inventivepotter/urvi/internal/llm"
-	"github.com/inventivepotter/urvi/internal/tool"
-	"github.com/inventivepotter/urvi/tools"
-	"github.com/inventivepotter/urvi/tui"
+	"github.com/ciram-co/looprig/agents/orchestrator"
+	"github.com/ciram-co/looprig/pkg/llm"
+	"github.com/ciram-co/looprig/pkg/loop"
+	"github.com/ciram-co/looprig/pkg/session"
+	"github.com/ciram-co/looprig/pkg/tool"
+	"github.com/ciram-co/looprig/pkg/tools"
+	"github.com/ciram-co/looprig/pkg/tui"
 )
 
 // orchestratorAgentKind is the swarm + primary agent identity stamped onto the session's

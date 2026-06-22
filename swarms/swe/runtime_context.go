@@ -10,8 +10,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/inventivepotter/urvi/internal/agent/loop"
-	"github.com/inventivepotter/urvi/internal/content"
+	"github.com/ciram-co/looprig/pkg/content"
+	"github.com/ciram-co/looprig/pkg/loop"
 )
 
 const (

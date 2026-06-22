@@ -5,9 +5,9 @@ import (
 	"net/http"
 	"testing"
 
-	"github.com/inventivepotter/urvi/internal/agent/loop"
-	"github.com/inventivepotter/urvi/internal/agent/loop/identity"
-	"github.com/inventivepotter/urvi/internal/llm"
+	"github.com/ciram-co/looprig/pkg/identity"
+	"github.com/ciram-co/looprig/pkg/llm"
+	"github.com/ciram-co/looprig/pkg/loop"
 )
 
 // stubAgent builds a minimal Agent with a no-op BuildTools so the table rows are terse.

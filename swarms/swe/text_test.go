@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/inventivepotter/urvi/internal/content"
+	"github.com/ciram-co/looprig/pkg/content"
 )
 
 // aiMessageText concatenates the text of every *content.TextBlock in m, ignoring

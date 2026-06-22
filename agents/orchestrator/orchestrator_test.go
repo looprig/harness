@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/inventivepotter/urvi/internal/agent/loop/identity"
+	"github.com/ciram-co/looprig/pkg/identity"
 )
 
 // TestNameIsOrchestrator pins the agent's attribution name. The swarm catalog

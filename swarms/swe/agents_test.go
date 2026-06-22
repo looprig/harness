@@ -5,12 +5,12 @@ import (
 	"sort"
 	"testing"
 
-	"github.com/inventivepotter/urvi/agents/explorer"
-	"github.com/inventivepotter/urvi/agents/operator"
-	"github.com/inventivepotter/urvi/agents/orchestrator"
-	"github.com/inventivepotter/urvi/agents/researcher"
-	"github.com/inventivepotter/urvi/agents/reviewer"
-	"github.com/inventivepotter/urvi/internal/agent/loop/identity"
+	"github.com/ciram-co/looprig/agents/explorer"
+	"github.com/ciram-co/looprig/agents/operator"
+	"github.com/ciram-co/looprig/agents/orchestrator"
+	"github.com/ciram-co/looprig/agents/researcher"
+	"github.com/ciram-co/looprig/agents/reviewer"
+	"github.com/ciram-co/looprig/pkg/identity"
 )
 
 // testLeafDeps is a minimal LeafToolDeps for registry-shape tests: a throwaway

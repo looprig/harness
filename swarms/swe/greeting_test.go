@@ -4,8 +4,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/inventivepotter/urvi/agents/orchestrator"
-	"github.com/inventivepotter/urvi/internal/agent/loop/identity"
+	"github.com/ciram-co/looprig/agents/orchestrator"
+	"github.com/ciram-co/looprig/pkg/identity"
 )
 
 // TestBuildGreeting pins the deterministic, LLM-free greeting builder: it is derived

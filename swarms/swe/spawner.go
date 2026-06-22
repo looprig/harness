@@ -4,12 +4,12 @@ import (
 	"context"
 	"strconv"
 
-	"github.com/inventivepotter/urvi/internal/agent/loop"
-	"github.com/inventivepotter/urvi/internal/agent/loop/identity"
-	"github.com/inventivepotter/urvi/internal/agent/session"
-	"github.com/inventivepotter/urvi/internal/content"
-	"github.com/inventivepotter/urvi/internal/llm"
-	"github.com/inventivepotter/urvi/tools"
+	"github.com/ciram-co/looprig/pkg/content"
+	"github.com/ciram-co/looprig/pkg/identity"
+	"github.com/ciram-co/looprig/pkg/llm"
+	"github.com/ciram-co/looprig/pkg/loop"
+	"github.com/ciram-co/looprig/pkg/session"
+	"github.com/ciram-co/looprig/pkg/tools"
 )
 
 // subagentRunner is the ONE session method the spawner needs (interface segregation /

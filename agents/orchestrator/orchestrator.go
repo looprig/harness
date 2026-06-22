@@ -6,7 +6,7 @@
 // data so the swarm composition root can adapt it without an import cycle.
 package orchestrator
 
-import "github.com/inventivepotter/urvi/internal/agent/loop/identity"
+import "github.com/ciram-co/looprig/pkg/identity"
 
 // Name is the orchestrator's immutable attribution name. The swarm catalog and
 // Subagent delegation key on it.

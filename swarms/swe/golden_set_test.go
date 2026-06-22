@@ -3,7 +3,7 @@ package swe
 import (
 	"testing"
 
-	"github.com/inventivepotter/urvi/internal/eval"
+	"github.com/ciram-co/looprig/pkg/eval"
 )
 
 // TestGoldenSetLoads proves the checked-in golden cases are valid JSON that

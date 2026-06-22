@@ -1,14 +1,14 @@
 package swe
 
 import (
-	"github.com/inventivepotter/urvi/agents/explorer"
-	"github.com/inventivepotter/urvi/agents/operator"
-	"github.com/inventivepotter/urvi/agents/researcher"
-	"github.com/inventivepotter/urvi/agents/reviewer"
-	"github.com/inventivepotter/urvi/internal/agent/loop"
-	"github.com/inventivepotter/urvi/internal/agent/loop/identity"
-	"github.com/inventivepotter/urvi/internal/tool"
-	"github.com/inventivepotter/urvi/tools"
+	"github.com/ciram-co/looprig/agents/explorer"
+	"github.com/ciram-co/looprig/agents/operator"
+	"github.com/ciram-co/looprig/agents/researcher"
+	"github.com/ciram-co/looprig/agents/reviewer"
+	"github.com/ciram-co/looprig/pkg/identity"
+	"github.com/ciram-co/looprig/pkg/loop"
+	"github.com/ciram-co/looprig/pkg/tool"
+	"github.com/ciram-co/looprig/pkg/tools"
 )
 
 // operatorSkills is the operator leaf's closed set of allowed embedded skills. The

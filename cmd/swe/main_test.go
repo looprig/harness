@@ -3,7 +3,7 @@ package main
 import (
 	"testing"
 
-	"github.com/inventivepotter/urvi/internal/uuid"
+	"github.com/ciram-co/looprig/pkg/uuid"
 )
 
 // TestParseFlags covers the SWE CLI flag parser: --list, --resume <uuid>, and the boundary

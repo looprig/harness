@@ -5,12 +5,12 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/inventivepotter/urvi/internal/agent/loop"
-	"github.com/inventivepotter/urvi/internal/agent/session"
-	"github.com/inventivepotter/urvi/internal/llm"
-	"github.com/inventivepotter/urvi/internal/tool"
-	"github.com/inventivepotter/urvi/internal/uuid"
-	"github.com/inventivepotter/urvi/tui"
+	"github.com/ciram-co/looprig/pkg/llm"
+	"github.com/ciram-co/looprig/pkg/loop"
+	"github.com/ciram-co/looprig/pkg/session"
+	"github.com/ciram-co/looprig/pkg/tool"
+	"github.com/ciram-co/looprig/pkg/tui"
+	"github.com/ciram-co/looprig/pkg/uuid"
 )
 
 // Compile-time proof that *sessionAgent satisfies the TUI's Agent surface (the

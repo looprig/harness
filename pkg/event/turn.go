@@ -1,0 +1,165 @@
+package event
+
+import (
+	"github.com/ciram-co/looprig/pkg/content"
+)
+
+// TurnStarted is emitted when runLoop commits a turn's initial UserMessage. It is
+// the first enduring turn event. Header.Cause.CommandID is the submit command id.
+// Message is the exact UserMessage committed as the first message of the turn.
+type TurnStarted struct {
+	enduring
+	loopScoped
+	Header
+	TurnIndex TurnIndex            `json:"turn_index,omitzero"`
+	Message   *content.UserMessage `json:"message,omitzero"`
+}
+
+// StepDone is the enduring event emitted when a completed step's finalized group
+// is committed: the step's single AIMessage followed by its ToolResultMessages.
+// It is emitted at step completion (the actor-owned commit point once the commit
+// handshake lands), so it is never a lie.
+type StepDone struct {
+	enduring
+	loopScoped
+	Header
+	Messages content.AgenticMessages `json:"messages,omitempty"`
+}
+
+// TurnFoldedInto is emitted when queued input folds into a mandatory
+// tool-continuation request. Header.Cause.CommandID is the submit command id;
+// Header.Cause.LoopID is set for a SubagentResult hand-back. Message is the folded
+// user message.
+type TurnFoldedInto struct {
+	enduring
+	loopScoped
+	Header
+	TurnIndex TurnIndex            `json:"turn_index,omitzero"`
+	Message   *content.UserMessage `json:"message,omitzero"`
+}
+
+// InputCancelled is emitted when a queued input leaves the loop queue without
+// committing — client retract, or a return after an abnormal turn end.
+// Header.Cause.CommandID is the submit command id; Header.TurnID is the active turn
+// that caused a return, or zero for a pure client retract outside a turn. Message is
+// the returned/retracted user message.
+type InputCancelled struct {
+	enduring
+	loopScoped
+	Header
+	TurnIndex TurnIndex            `json:"turn_index,omitzero"`
+	Reason    CancelReason         `json:"reason,omitzero"`
+	Message   *content.UserMessage `json:"message,omitzero"`
+}
+
+// RejectReason explains why a UserInput submit was refused (carried by TurnRejected).
+// It is the single source of truth for submit-rejection reasons — the loop publishes
+// it on the event stream; there is no command-side copy (the former
+// command.Disposition reply, with its command.RejectReason, was removed).
+type RejectReason uint8
+
+const (
+	// RejectUnspecified is the zero-value sentinel: NOT a reason the loop ever
+	// produces. It exists so a zero-valued TurnRejected{} does not masquerade as a
+	// real reason and so the json:"reason,omitzero" tag only drops a genuinely-empty
+	// reason (every real reason below is non-zero and always serializes). A
+	// RejectReason that compares equal to this came from a zero value, not a decision.
+	RejectUnspecified RejectReason = iota
+	// RejectQueueFull: the loop's inbox is at capacity.
+	RejectQueueFull
+	// RejectShuttingDown: the loop is shutting down and accepts no new input.
+	RejectShuttingDown
+	// RejectInternal: a transient internal failure (e.g. id generation); the loop is
+	// healthy and the caller MAY retry.
+	RejectInternal
+)
+
+// InputQueued is the Ephemeral Reply event for a UserInput accepted into the loop
+// inbox but not yet assigned to a turn (it later resolves to TurnStarted,
+// TurnFoldedInto, or InputCancelled). Header.Cause.CommandID is the submit command
+// id. Ephemeral: it self-heals — the authoritative resolution event still follows
+// if this is dropped.
+type InputQueued struct {
+	ephemeral
+	loopScoped
+	Header
+}
+
+// TurnRejected is the Enduring Reply event for a UserInput the loop refused
+// (queue-full, shutting-down, or a transient internal failure). Enduring: a rejected
+// user message must never silently vanish. Header.Cause.CommandID is the submit
+// command id.
+type TurnRejected struct {
+	enduring
+	loopScoped
+	Header
+	Reason RejectReason `json:"reason,omitzero"`
+}
+
+func (InputQueued) isEvent()  {}
+func (TurnRejected) isEvent() {}
+
+func (InputQueued) isReply()  {}
+func (TurnRejected) isReply() {}
+
+// TokenDelta is emitted for each streaming chunk from the LLM. TokenDelta and
+// the ToolCallStarted/ToolCallCompleted events (in tool.go) are the Ephemeral
+// events.
+type TokenDelta struct {
+	ephemeral
+	loopScoped
+	Header
+	TurnIndex TurnIndex `json:"turn_index,omitzero"`
+	// Chunk is content.Chunk, a sealed interface that is never serialized (chunks
+	// have no wire codec — see content.Chunk); TokenDelta is an Ephemeral streaming
+	// delta that never reaches the journal, so the field is tagged json:"-".
+	Chunk content.Chunk `json:"-"`
+}
+
+// TurnDone is the terminal success event for a turn.
+type TurnDone struct {
+	terminal
+	loopScoped
+	Header
+	TurnIndex TurnIndex `json:"turn_index,omitzero"`
+	// Message is the complete AI response.
+	Message *content.AIMessage `json:"message,omitzero"`
+}
+
+// TurnFailed is the terminal event for non-cancellation LLM/provider errors. Err
+// carries the typed cause; callers may errors.As it to inspect and retry.
+type TurnFailed struct {
+	terminal
+	loopScoped
+	Header
+	TurnIndex TurnIndex `json:"turn_index,omitzero"`
+	// Err is the typed cause; an error value cannot round-trip through
+	// encoding/json (no codec, no stable shape), so it is tagged json:"-" to keep
+	// the journal output clean rather than emitting garbage. Callers read it
+	// in-memory via errors.As; a journal records the failure via the event itself.
+	Err error `json:"-"`
+}
+
+// TurnInterrupted is the terminal event when the turn context is cancelled.
+type TurnInterrupted struct {
+	terminal
+	loopScoped
+	Header
+	TurnIndex TurnIndex `json:"turn_index,omitzero"`
+}
+
+func (TurnStarted) isEvent()     {}
+func (StepDone) isEvent()        {}
+func (TurnFoldedInto) isEvent()  {}
+func (InputCancelled) isEvent()  {}
+func (TokenDelta) isEvent()      {}
+func (TurnDone) isEvent()        {}
+func (TurnFailed) isEvent()      {}
+func (TurnInterrupted) isEvent() {}
+
+// isReply marks the command-outcome events. Together with InputQueued/TurnRejected
+// (declared above) these are exactly the five Reply events: a command issuer
+// recognises its answer via ReplyTo() == its command id.
+func (TurnStarted) isReply()    {}
+func (TurnFoldedInto) isReply() {}
+func (InputCancelled) isReply() {}

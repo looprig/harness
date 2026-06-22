@@ -6,10 +6,10 @@ import (
 	"os"
 	"time"
 
-	"github.com/inventivepotter/urvi/internal/agent/session"
-	"github.com/inventivepotter/urvi/internal/agent/session/journal"
-	"github.com/inventivepotter/urvi/internal/llm"
-	"github.com/inventivepotter/urvi/internal/uuid"
+	"github.com/ciram-co/looprig/pkg/journal"
+	"github.com/ciram-co/looprig/pkg/llm"
+	"github.com/ciram-co/looprig/pkg/session"
+	"github.com/ciram-co/looprig/pkg/uuid"
 	"github.com/nats-io/nats.go"
 )
 
