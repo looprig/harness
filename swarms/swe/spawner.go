@@ -65,20 +65,25 @@ func (e *UnknownAgentError) Error() string {
 // swarmSpawner adapts the real session engine to tools.Spawner, agent-aware. It owns
 // the leaf Registry (the authoritative spawnable set), the per-spawn tool-construction
 // deps (workspace root + shared HTTP client), the shared provider client, the model
-// factory, and a late-bound reference to the live session that runs each sub-loop.
+// factory, the SkillDescriber it reads each leaf's <available_skills> catalog through,
+// and a late-bound reference to the live session that runs each sub-loop.
 type swarmSpawner struct {
-	session  subagentRunner // late-bound after the session is built (see bind)
-	registry *Registry      // authoritative spawnable leaf set
-	deps     LeafToolDeps   // per-spawn tool-construction deps (root + HTTP client)
-	client   llm.LLM        // provider client shared with the parent (no per-loop client)
-	factory  ModelFactory   // builds each leaf's model spec from its finished system prompt
+	session   subagentRunner       // late-bound after the session is built (see bind)
+	registry  *Registry            // authoritative spawnable leaf set
+	deps      LeafToolDeps         // per-spawn tool-construction deps (root + HTTP client)
+	client    llm.LLM              // provider client shared with the parent (no per-loop client)
+	factory   ModelFactory         // builds each leaf's model spec from its finished system prompt
+	describer tools.SkillDescriber // reads a leaf's allowed-skill metadata for the catalog
 }
 
 // newSwarmSpawner builds an UNBOUND swarmSpawner (its session is nil until bind is
 // called). The caller (the swarm's construction seam) wires the orchestrator's
 // Subagent tool with this spawner, builds the session, then calls bind exactly once.
-func newSwarmSpawner(registry *Registry, deps LeafToolDeps, client llm.LLM, factory ModelFactory) *swarmSpawner {
-	return &swarmSpawner{registry: registry, deps: deps, client: client, factory: factory}
+// describer is the same per-agent-scoped loader the registry's Skill tools are built
+// over: a leaf's <available_skills> catalog can only list a skill it is allowed to
+// load.
+func newSwarmSpawner(registry *Registry, deps LeafToolDeps, client llm.LLM, factory ModelFactory, describer tools.SkillDescriber) *swarmSpawner {
+	return &swarmSpawner{registry: registry, deps: deps, client: client, factory: factory, describer: describer}
 }
 
 // bind late-binds the live session onto the spawner. It is called exactly once,
@@ -102,9 +107,13 @@ func (sp *swarmSpawner) Spawn(ctx context.Context, parent loop.Provenance, agent
 	if !ok {
 		return "", &UnknownAgentError{Name: agent}
 	}
+	// The leaf's system prompt is Identity + Role + its <available_skills> catalog
+	// (empty for a skill-less leaf, so its prompt is unchanged). The catalog is read
+	// through the per-agent-scoped describer, so it lists only authorized skills.
+	system := Identity + a.Role + availableSkillsCatalog(ctx, sp.describer, a.Name, a.Skills)
 	cfg := loop.Config{
 		Client:    sp.client,
-		Model:     sp.factory(Identity + a.Role),
+		Model:     sp.factory(system),
 		Tools:     a.BuildTools(sp.deps),
 		AgentName: a.Name,
 	}

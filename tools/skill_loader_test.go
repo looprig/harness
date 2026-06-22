@@ -183,8 +183,99 @@ func TestEmbeddedSkillLoaderLoad(t *testing.T) {
 }
 
 // TestEmbeddedSkillLoaderImplementsInterface is a compile-time assertion that the
-// concrete type satisfies the narrow SkillLoader interface.
+// concrete type satisfies the narrow SkillLoader and SkillDescriber interfaces.
 func TestEmbeddedSkillLoaderImplementsInterface(t *testing.T) {
 	t.Parallel()
 	var _ SkillLoader = NewEmbeddedSkillLoader(newTestSkillFS(), testAllow())
+	var _ SkillDescriber = NewEmbeddedSkillLoader(newTestSkillFS(), testAllow())
+}
+
+// TestEmbeddedSkillLoaderDescribe proves Describe authorizes (agent, name) against
+// the same closed allow-set as Load, then returns the parsed frontmatter
+// (name+description) WITHOUT the body — the metadata the swarm renders into the
+// <available_skills> catalog. It is fail-secure: an unauthorized/unknown name,
+// a missing file, and a malformed file all error with the same typed errors as
+// Load.
+func TestEmbeddedSkillLoaderDescribe(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name        string
+		agent       identity.AgentName
+		skill       string
+		wantName    string
+		wantDesc    string
+		wantUnknown bool
+		wantMalform bool
+		wantMissing bool
+	}{
+		{
+			name:     "authorized agent and skill returns metadata",
+			agent:    agentReviewer,
+			skill:    "code-style",
+			wantName: "code-style",
+			wantDesc: "A short checklist.",
+		},
+		{
+			name:        "skill not in agent set is unauthorized",
+			agent:       agentReviewer,
+			skill:       "secret-skill",
+			wantUnknown: true,
+		},
+		{
+			name:        "agent absent from allow-map denies all",
+			agent:       agentCoder,
+			skill:       "code-style",
+			wantUnknown: true,
+		},
+		{
+			name:        "authorized but file missing is not-found",
+			agent:       agentReviewer,
+			skill:       "ghost",
+			wantMissing: true,
+		},
+		{
+			name:        "authorized but malformed file propagates malformed",
+			agent:       agentReviewer,
+			skill:       "broken",
+			wantMalform: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			loader := NewEmbeddedSkillLoader(newTestSkillFS(), testAllow())
+			meta, err := loader.Describe(context.Background(), tt.agent, tt.skill)
+
+			switch {
+			case tt.wantUnknown:
+				var ue *UnknownSkillError
+				if !errors.As(err, &ue) {
+					t.Fatalf("Describe() error = %v, want *UnknownSkillError", err)
+				}
+			case tt.wantMissing:
+				var nf *SkillNotFoundError
+				if !errors.As(err, &nf) {
+					t.Fatalf("Describe() error = %v, want *SkillNotFoundError", err)
+				}
+			case tt.wantMalform:
+				var me *MalformedSkillError
+				if !errors.As(err, &me) {
+					t.Fatalf("Describe() error = %v, want *MalformedSkillError", err)
+				}
+			default:
+				if err != nil {
+					t.Fatalf("Describe() unexpected error = %v", err)
+				}
+				if meta.Name != tt.wantName {
+					t.Errorf("Describe() Name = %q, want %q", meta.Name, tt.wantName)
+				}
+				if meta.Description != tt.wantDesc {
+					t.Errorf("Describe() Description = %q, want %q", meta.Description, tt.wantDesc)
+				}
+			}
+		})
+	}
 }

@@ -139,11 +139,11 @@ type orchestratorWiring struct {
 // builds the session from wiring.cfg and then calls wiring.spawner.bind(session) once.
 func buildOrchestratorWiring(client llm.LLM, factory ModelFactory, root string) (orchestratorWiring, error) {
 	deps := LeafToolDeps{Root: root, HTTPCl: newHTTPClient()}
-	registry, err := leafRegistry(deps)
+	registry, loader, err := leafRegistry(deps)
 	if err != nil {
 		return orchestratorWiring{}, err
 	}
-	spawner := newSwarmSpawner(registry, deps, client, factory)
+	spawner := newSwarmSpawner(registry, deps, client, factory, loader)
 	cfg := orchestratorConfig(client, factory, root, spawner, toolCatalog(registry))
 	return orchestratorWiring{cfg: cfg, spawner: spawner}, nil
 }

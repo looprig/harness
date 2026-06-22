@@ -165,6 +165,12 @@ func toolCallReply(id, name, argsJSON string) scriptedReply {
 	}}
 }
 
+// skillCallReply scripts a turn that emits ONE Skill tool call naming skill, so the loop
+// invokes the wired Skill tool (used to drive a skilled leaf to load an embedded skill).
+func skillCallReply(id, skill string) scriptedReply {
+	return toolCallReply(id, "Skill", `{"name":`+jsonString(skill)+`}`)
+}
+
 // jsonString quotes s as a JSON string literal (the test args are simple ASCII; this
 // keeps the scripted args readable without pulling in encoding/json for one field).
 func jsonString(s string) string {
@@ -310,13 +316,13 @@ func TestAcceptanceLeavesCannotSpawn(t *testing.T) {
 	t.Parallel()
 
 	deps := LeafToolDeps{Root: t.TempDir(), HTTPCl: newHTTPClient()}
-	reg, err := leafRegistry(deps)
+	reg, loader, err := leafRegistry(deps)
 	if err != nil {
 		t.Fatalf("leafRegistry() error = %v", err)
 	}
 
 	// Orchestrator: Subagent present + auto-approved; the set is exactly the six.
-	orchSpawner := newSwarmSpawner(reg, deps, newScriptedSwarmLLM(), newModelFactory("k"))
+	orchSpawner := newSwarmSpawner(reg, deps, newScriptedSwarmLLM(), newModelFactory("k"), loader)
 	orchTS := orchestratorToolSet(deps.Root, orchSpawner, toolCatalog(reg))
 	orchNames := toolNames(t, orchTS)
 	if !containsName(orchNames, "Subagent") {
@@ -593,6 +599,85 @@ func TestAcceptanceGateAttributedToLeaf(t *testing.T) {
 	// ends — proving the gate decision unblocked the right loop.
 	if _, ok := rec.waitFor(isPrimaryTurnDone(primary)); !ok {
 		t.Fatal("orchestrator turn never completed after the leaf gate was approved")
+	}
+}
+
+// newAllScopeRecorder subscribes the agent's whole-session stream with EPHEMERAL +
+// ENDURING delivery for EVERY loop (so a SPAWNED leaf's ToolCallCompleted — an
+// Ephemeral, loop-scoped event — is observable, which observerFilter deliberately
+// mutes for non-primary loops). It otherwise behaves like newRecorder.
+func newAllScopeRecorder(t *testing.T, agent *sessionAgent) *recorder {
+	t.Helper()
+	sub, err := agent.Subscribe(event.EventFilter{
+		Ephemeral: event.LoopScope{All: true},
+		Enduring:  event.LoopScope{All: true},
+	})
+	if err != nil {
+		t.Fatalf("Subscribe() error = %v", err)
+	}
+	t.Cleanup(func() { _ = sub.Close() })
+	rec := &recorder{}
+	go func() {
+		for ev := range sub.Events() {
+			rec.mu.Lock()
+			rec.events = append(rec.events, ev)
+			rec.mu.Unlock()
+		}
+	}()
+	return rec
+}
+
+// TestAcceptanceSkillLoadedEndToEnd drives the assembled swarm to prove a skilled leaf
+// loads an embedded skill end-to-end: the orchestrator spawns the operator (the leaf
+// the swarm assigns the code-style skill), the operator is scripted to call
+// Skill{name:"code-style"} then end its turn, and the test asserts — on the leaf loop's
+// own ToolCallCompleted — that the Skill tool returned the embedded SKILL.md body (a
+// known phrase from skills/code-style/SKILL.md), NOT an error. This exercises the full
+// Task-3 wiring: the per-agent loader, the operator-bound Skill tool (auto-approved),
+// and the embedded catalogue, through the real session.
+func TestAcceptanceSkillLoadedEndToEnd(t *testing.T) {
+	t.Parallel()
+
+	client := newScriptedSwarmLLM()
+	client.script(routeOrchestrator,
+		subagentCallReply("call-1", operator.Name, "apply the style checklist"),
+		textReply("orchestrator: operator loaded the skill"),
+	)
+	// The operator loads the skill (auto-approved), then ends its turn.
+	client.script(route(operator.Name),
+		skillCallReply("op-skill-1", "code-style"),
+		textReply("operator: applied the checklist"),
+	)
+
+	agent := newAcceptanceSwarm(t, client)
+	primary := agent.PrimaryLoopID()
+	rec := newAllScopeRecorder(t, agent)
+
+	if _, err := agent.Submit(context.Background(), []content.Block{&content.TextBlock{Text: "use the style skill"}}); err != nil {
+		t.Fatalf("Submit() error = %v", err)
+	}
+
+	// The operator's Skill ToolCallCompleted (on the LEAF's loop, not the primary)
+	// carries the embedded SKILL.md body — a known phrase from the curated file —
+	// proving the Skill tool resolved the skill and returned its content.
+	ev, ok := rec.waitFor(func(ev event.Event) bool {
+		tc, isTC := ev.(event.ToolCallCompleted)
+		return isTC && tc.Coordinates.LoopID != primary && strings.Contains(tc.ResultPreview, "Code Style Checklist")
+	})
+	if !ok {
+		t.Fatal("never observed the operator's Skill ToolCallCompleted carrying the embedded skill body")
+	}
+	tc := ev.(event.ToolCallCompleted)
+	if tc.IsError {
+		t.Errorf("Skill ToolCallCompleted IsError = true, want false (the skill loaded successfully): %q", tc.ResultPreview)
+	}
+	if strings.Contains(tc.ResultPreview, "error:") {
+		t.Errorf("Skill result carries an error string, want the skill body: %q", tc.ResultPreview)
+	}
+
+	// The orchestrator's turn completes with its scripted final text.
+	if _, ok := rec.waitFor(isPrimaryTurnDone(primary)); !ok {
+		t.Fatal("never observed the orchestrator's terminal TurnDone")
 	}
 }
 

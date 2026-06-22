@@ -22,6 +22,17 @@ type SkillLoader interface {
 	Load(ctx context.Context, agent identity.AgentName, name string) (string, error)
 }
 
+// SkillDescriber resolves a named skill into its frontmatter METADATA
+// (name+description) WITHOUT the body — the data the swarm renders into an
+// agent's <available_skills> catalog. It authorizes (agent, name) against the
+// SAME closed allow-set as SkillLoader.Load, so a catalog can only ever list a
+// skill the agent is actually allowed to load. It is a separate, focused
+// interface (interface segregation): the Skill tool depends only on SkillLoader;
+// the catalog builder depends only on SkillDescriber.
+type SkillDescriber interface {
+	Describe(ctx context.Context, agent identity.AgentName, name string) (SkillMeta, error)
+}
+
 // embeddedSkillLoader reads SKILL.md documents from a compiled-in fs.FS (the
 // swarm injects swarms/swe.SkillsFS at the composition root) and authorizes each
 // request against a static, per-agent allow-map.
@@ -50,26 +61,47 @@ func NewEmbeddedSkillLoader(fsys fs.FS, allow map[identity.AgentName]map[string]
 }
 
 // Load authorizes (agent, name) against the closed allow-set, then reads and
-// parses skills/<name>/SKILL.md, returning the markdown body.
-//
-// The order is deliberate and is the traversal-safety guarantee: authorization
-// happens BEFORE any path is built. The model-supplied name is untrusted, so it
-// must first be proven to be a member of the agent's closed allow-set; only a
-// validated member is ever joined into a path. A traversal payload such as
-// "../../etc/passwd" can never be a member of the curated set, so it is rejected
-// at the authorization gate and no path is ever constructed from it. The
-// subsequent path.Join + path.Clean is defense-in-depth, not the boundary.
+// parses skills/<name>/SKILL.md, returning the markdown body. It delegates to
+// resolve, which owns the deliberate authorize-before-path traversal-safety
+// guarantee.
 func (l *embeddedSkillLoader) Load(ctx context.Context, agent identity.AgentName, name string) (string, error) {
+	_, body, err := l.resolve(ctx, agent, name)
+	if err != nil {
+		return "", err
+	}
+	return body, nil
+}
+
+// Describe authorizes (agent, name) against the SAME closed allow-set as Load,
+// then reads and parses skills/<name>/SKILL.md and returns ONLY its frontmatter
+// metadata (name+description), discarding the body. The swarm uses it to build
+// the trusted <available_skills> catalog injected into the agent's system prompt.
+func (l *embeddedSkillLoader) Describe(ctx context.Context, agent identity.AgentName, name string) (SkillMeta, error) {
+	meta, _, err := l.resolve(ctx, agent, name)
+	if err != nil {
+		return SkillMeta{}, err
+	}
+	return meta, nil
+}
+
+// resolve is the shared authorize→build-path→read→parse core behind Load and
+// Describe. The authorization gate runs BEFORE any path is built (the
+// traversal-safety guarantee): the model-supplied name is untrusted, so it must
+// first be proven a member of the agent's closed allow-set; only a validated
+// member is ever joined into a path. A traversal payload like "../../etc/passwd"
+// can never be a member of the curated set, so it is rejected at the gate and no
+// path is ever constructed from it. The subsequent path.Join is defense-in-depth.
+func (l *embeddedSkillLoader) resolve(ctx context.Context, agent identity.AgentName, name string) (SkillMeta, string, error) {
 	// Honor cancellation up front; reads below are from a compiled-in fs and do
 	// not otherwise observe the context, so this is the one place it can matter.
 	if err := ctx.Err(); err != nil {
-		return "", err
+		return SkillMeta{}, "", err
 	}
 
 	// 1. Authorize first (fail-secure). The name is untrusted until it is proven
 	// to be a member of this agent's closed allow-set.
 	if !l.authorized(agent, name) {
-		return "", &UnknownSkillError{Agent: agent, Name: name}
+		return SkillMeta{}, "", &UnknownSkillError{Agent: agent, Name: name}
 	}
 
 	// 2. Build the path only now that name is a validated closed-set member.
@@ -79,22 +111,21 @@ func (l *embeddedSkillLoader) Load(ctx context.Context, agent identity.AgentName
 
 	raw, err := fs.ReadFile(l.fsys, skillPath)
 	if err != nil {
-		return "", &SkillNotFoundError{Name: name, Err: err}
+		return SkillMeta{}, "", &SkillNotFoundError{Name: name, Err: err}
 	}
 
-	// 3. Parse and return the body. Propagate the parser's *MalformedSkillError,
-	// stamping the now-known skill name (the parser sets Name="" since it sees
-	// only raw bytes).
-	_, body, err := parseSkill(raw)
+	// 3. Parse. Propagate the parser's *MalformedSkillError, stamping the now-known
+	// skill name (the parser sets Name="" since it sees only raw bytes).
+	meta, body, err := parseSkill(raw)
 	if err != nil {
 		var me *MalformedSkillError
 		if errors.As(err, &me) && me.Name == "" {
 			me.Name = name
 		}
-		return "", err
+		return SkillMeta{}, "", err
 	}
 
-	return body, nil
+	return meta, body, nil
 }
 
 // authorized reports whether agent may load the named skill: true iff name is a

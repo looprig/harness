@@ -20,11 +20,11 @@ import (
 func testWiring(t *testing.T) (*swarmSpawner, []tools.SubagentCatalogEntry) {
 	t.Helper()
 	deps := LeafToolDeps{Root: "/tmp/workspace-root", HTTPCl: &http.Client{}}
-	reg, err := leafRegistry(deps)
+	reg, loader, err := leafRegistry(deps)
 	if err != nil {
 		t.Fatalf("leafRegistry() error = %v", err)
 	}
-	return newSwarmSpawner(reg, deps, &fakeLLM{}, newModelFactory("test-key")), toolCatalog(reg)
+	return newSwarmSpawner(reg, deps, &fakeLLM{}, newModelFactory("test-key"), loader), toolCatalog(reg)
 }
 
 // TestNewWithClientHappy proves swe.New (via the fake-client seam) builds a usable

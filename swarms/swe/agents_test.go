@@ -19,6 +19,20 @@ func testLeafDeps() LeafToolDeps {
 	return LeafToolDeps{Root: "/tmp/workspace-root", HTTPCl: &http.Client{}}
 }
 
+// equalStringSlice reports element-wise equality, treating nil and empty as equal
+// (a skill-less agent's Skills is nil; the expectation is also nil).
+func equalStringSlice(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
 // TestLeafRegistryHasExactlyTheFourLeaves proves leafRegistry registers EXACTLY
 // the four spawnable leaf agents — operator, researcher, explorer, reviewer — in
 // that order, and that the orchestrator is deliberately absent (it is the primary,
@@ -26,7 +40,7 @@ func testLeafDeps() LeafToolDeps {
 func TestLeafRegistryHasExactlyTheFourLeaves(t *testing.T) {
 	t.Parallel()
 
-	reg, err := leafRegistry(testLeafDeps())
+	reg, _, err := leafRegistry(testLeafDeps())
 	if err != nil {
 		t.Fatalf("leafRegistry() error = %v", err)
 	}
@@ -52,7 +66,7 @@ func TestLeafRegistryHasExactlyTheFourLeaves(t *testing.T) {
 func TestLeafRegistryOrchestratorAbsent(t *testing.T) {
 	t.Parallel()
 
-	reg, err := leafRegistry(testLeafDeps())
+	reg, _, err := leafRegistry(testLeafDeps())
 	if err != nil {
 		t.Fatalf("leafRegistry() error = %v", err)
 	}
@@ -68,22 +82,24 @@ func TestLeafRegistryLookupCarriesLeafData(t *testing.T) {
 	t.Parallel()
 
 	deps := testLeafDeps()
-	reg, err := leafRegistry(deps)
+	reg, _, err := leafRegistry(deps)
 	if err != nil {
 		t.Fatalf("leafRegistry() error = %v", err)
 	}
 
 	tests := []struct {
-		name      identity.AgentName
-		wantDesc  string
-		wantRole  string
-		wantTools []string
+		name       identity.AgentName
+		wantDesc   string
+		wantRole   string
+		wantTools  []string
+		wantSkills []string // the agent's allowed-skill names (nil = none)
 	}{
 		{
-			name:      operator.Name,
-			wantDesc:  operator.Description,
-			wantRole:  operator.Role,
-			wantTools: []string{"AskUser", "Bash", "EditFile", "Glob", "Grep", "ReadFile", "Todo", "WriteFile"},
+			name:       operator.Name,
+			wantDesc:   operator.Description,
+			wantRole:   operator.Role,
+			wantTools:  []string{"AskUser", "Bash", "EditFile", "Glob", "Grep", "ReadFile", "Skill", "Todo", "WriteFile"},
+			wantSkills: []string{"code-style"},
 		},
 		{
 			name:      researcher.Name,
@@ -120,6 +136,9 @@ func TestLeafRegistryLookupCarriesLeafData(t *testing.T) {
 			}
 			if a.AllowsRuntimeSkills {
 				t.Errorf("AllowsRuntimeSkills = true, want false (P1)")
+			}
+			if !equalStringSlice(a.Skills, tt.wantSkills) {
+				t.Errorf("Skills = %v, want %v", a.Skills, tt.wantSkills)
 			}
 			if a.BuildTools == nil {
 				t.Fatal("BuildTools = nil, want non-nil")

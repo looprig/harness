@@ -55,11 +55,11 @@ func (f *fakeRunner) RunSubagent(_ context.Context, parent loop.Provenance, cfg 
 func newTestSwarmSpawner(t *testing.T) (*swarmSpawner, *fakeRunner) {
 	t.Helper()
 	deps := LeafToolDeps{Root: "/tmp/workspace-root", HTTPCl: &http.Client{}}
-	reg, err := leafRegistry(deps)
+	reg, loader, err := leafRegistry(deps)
 	if err != nil {
 		t.Fatalf("leafRegistry() error = %v", err)
 	}
-	sp := newSwarmSpawner(reg, deps, &fakeLLM{}, newModelFactory("test-key"))
+	sp := newSwarmSpawner(reg, deps, &fakeLLM{}, newModelFactory("test-key"), loader)
 	runner := &fakeRunner{reply: "subagent done"}
 	sp.session = runner // late-bind a fake, exactly where bind sets the live session
 	return sp, runner
