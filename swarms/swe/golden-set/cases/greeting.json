@@ -1,0 +1,5 @@
+{
+  "name": "greeting",
+  "input": "Reply with exactly the single word: hello",
+  "expectedOutput": "hello"
+}
