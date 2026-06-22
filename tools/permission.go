@@ -91,15 +91,19 @@ type PermissionPolicy struct {
 // truncated by the ReadGuard rather than streamed unbounded into the model.
 const defaultMaxReadBytes int64 = 1 << 20
 
-// The default secret-path globs that may never be READ by a file tool. These are
-// also (a subset of) the write-deny set: you may never write what you may not
-// read.
+// The default paths a generic file tool may never READ. These are secret-path
+// globs (ssh keys, dotenv, PEM, id_rsa, the .urvi store) PLUS the workspace
+// .skills/ source tree, which is reachable only through the gated Skill tool and
+// must never be slurped by an auto-approved ReadFile/Glob/Grep (P2b §7a/§10).
+// The whole set is also (a subset of) the write-deny set: you may never write
+// what you may not read.
 var defaultDeniedReadPaths = []string{
-	"~/.ssh/**",  // private keys + known_hosts + config
-	"**/.env",    // dotenv secrets anywhere in the tree
-	"**/*.pem",   // PEM-encoded keys/certs anywhere
-	"**/id_rsa",  // bare SSH private key anywhere
-	"~/.urvi/**", // the urvi policy/config store (approvals, identity)
+	"~/.ssh/**",     // private keys + known_hosts + config
+	"**/.env",       // dotenv secrets anywhere in the tree
+	"**/*.pem",      // PEM-encoded keys/certs anywhere
+	"**/id_rsa",     // bare SSH private key anywhere
+	"~/.urvi/**",    // the urvi policy/config store (approvals, identity)
+	"**/.skills/**", // workspace skill source: reachable ONLY via the gated Skill tool, never slurped/written by generic file tools (gate-bypass prevention)
 }
 
 // The write-only additions on top of the read-deny set. These protect VCS and

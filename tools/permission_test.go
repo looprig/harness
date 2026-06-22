@@ -25,6 +25,9 @@ func TestDefaultHardDeny(t *testing.T) {
 		{name: "read denies id_rsa", set: d.DeniedReadPaths, want: "**/id_rsa"},
 		// Policy store (user-level) is read-denied.
 		{name: "read denies user urvi store", set: d.DeniedReadPaths, want: "~/.urvi/**"},
+		// Workspace skill source is read-denied for generic file tools (gate-bypass
+		// prevention): only the gated Skill tool may reach it (via embed.FS).
+		{name: "read denies workspace skills", set: d.DeniedReadPaths, want: "**/.skills/**"},
 
 		// Secret globs must ALSO be in the WRITE deny set (write set ⊇ read set).
 		{name: "write denies ssh", set: d.DeniedWritePaths, want: "~/.ssh/**"},
@@ -34,6 +37,9 @@ func TestDefaultHardDeny(t *testing.T) {
 		// Write-only additions.
 		{name: "write denies git config", set: d.DeniedWritePaths, want: "**/.git/config"},
 		{name: "write denies go.sum", set: d.DeniedWritePaths, want: "**/go.sum"},
+		// Workspace skill source must ALSO be write-denied (write set ⊇ read set), so
+		// no generic tool can write the .skills/ source either.
+		{name: "write denies workspace skills", set: d.DeniedWritePaths, want: "**/.skills/**"},
 		// Policy-store deny-write entries — the security-critical requirement.
 		{name: "write denies in-repo urvi store", set: d.DeniedWritePaths, want: "**/.urvi/**"},
 		{name: "write denies user urvi store", set: d.DeniedWritePaths, want: "~/.urvi/**"},
@@ -86,5 +92,47 @@ func TestDefaultHardDenyWriteSupersetsRead(t *testing.T) {
 		if !slices.Contains(d.DeniedWritePaths, r) {
 			t.Errorf("read-deny glob %q is not in the write-deny set (write must superset read)", r)
 		}
+	}
+}
+
+// TestDeniedReadWorkspaceSkills proves, through the DeniedRead surface the read
+// tools call, that the workspace .skills/ source tree is hard-denied for generic
+// file tools (P2b §7a/§10 gate-bypass prevention) while NORMAL workspace paths
+// that merely resemble it are NOT — pinning the "**/.skills/**" glob's precision.
+// It uses the real DefaultHardDeny() so it exercises the shipped policy, and a
+// fixed home so the ~/ globs cannot accidentally match the /ws candidates.
+func TestDeniedReadWorkspaceSkills(t *testing.T) {
+	t.Parallel()
+	pc := NewPermissionChecker(PermissionPolicy{
+		WorkspaceRoot: "/ws",
+		HardDeny:      DefaultHardDeny(),
+	})
+	pc.SetHomeDir(func() (string, error) { return "/home/tester", nil })
+
+	tests := []struct {
+		name    string
+		absPath string
+		want    bool
+	}{
+		// Denied: the .skills dir itself, its contents, and a nested .skills tree.
+		{name: "skills dir itself denied", absPath: "/ws/.skills", want: true},
+		{name: "skills subdir denied", absPath: "/ws/.skills/foo", want: true},
+		{name: "skills file denied", absPath: "/ws/.skills/foo/SKILL.md", want: true},
+		{name: "nested skills tree denied", absPath: "/ws/pkg/.skills/bar/SKILL.md", want: true},
+		// Allowed: precision — a same-named Go file, a non-dotted skills dir, and
+		// near-miss segment names must NOT be denied (no over-broad match).
+		{name: "skills.go source allowed", absPath: "/ws/skills.go", want: false},
+		{name: "non-dot skills dir allowed", absPath: "/ws/src/skills/x", want: false},
+		{name: "skills-prefixed name allowed", absPath: "/ws/.skillsx/foo", want: false},
+		{name: "dotted suffix name allowed", absPath: "/ws/a.skills/b", want: false},
+		{name: "ordinary go file allowed", absPath: "/ws/main.go", want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := pc.DeniedRead(tt.absPath); got != tt.want {
+				t.Errorf("DeniedRead(%q) = %v, want %v", tt.absPath, got, tt.want)
+			}
+		})
 	}
 }
