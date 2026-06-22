@@ -29,7 +29,7 @@ const inlineThreshold = 512 * 1024 // 512 KiB
 const streamInlineCeiling = 1 << 20 // 1 MiB
 
 // objectBucketSuffix is appended to the per-session prefix to form the object-store
-// bucket name. Keeping the bucket per-session (urvi_session_<sid>_obj) scopes Phase-6
+// bucket name. Keeping the bucket per-session (looprig_session_<sid>_obj) scopes Phase-6
 // orphan-GC and future deletion to one session: dropping a session drops its bucket.
 const objectBucketSuffix = "_obj"
 
@@ -42,21 +42,21 @@ const pointerCodecVersion uint32 = 1
 // pointer (its presence, not its absence, is the detection signal the Task 5.3
 // replayer keys on) and carries the content-addressed object id for a fast,
 // body-free check. The body still carries the authoritative pointerRecord; the
-// header just lets the replayer route without decoding. The Urvi- prefix avoids the
+// header just lets the replayer route without decoding. The Looprig- prefix avoids the
 // JetStream-reserved Nats-* namespace.
-const objectIDHeader = "Urvi-Object-Id"
+const objectIDHeader = "Looprig-Object-Id"
 
 // objectLenHeader carries the offloaded object's byte length alongside the id header,
 // so an observer can size the object without reading the body. It mirrors the body's
 // Length field; the body remains authoritative.
-const objectLenHeader = "Urvi-Object-Len"
+const objectLenHeader = "Looprig-Object-Len"
 
 // codecVersionHeader carries the pointer codec version alongside the id header. It
 // mirrors the body's CodecVersion; the body remains authoritative.
-const codecVersionHeader = "Urvi-Codec-Version"
+const codecVersionHeader = "Looprig-Codec-Version"
 
 // SessionObjectBucket returns the per-session object-store bucket name:
-// "urvi_session_<sid>_obj". It reuses the stream's session-scoped prefix and uuid
+// "looprig_session_<sid>_obj". It reuses the stream's session-scoped prefix and uuid
 // (whose dashes/underscores are legal in a NATS bucket name, ^[a-zA-Z0-9_-]+$) so the
 // bucket is scoped to exactly one session and never collides with the stream name.
 func SessionObjectBucket(sessionID uuid.UUID) string {
@@ -229,7 +229,7 @@ func ensureObjectStore(js nats.JetStreamContext, sessionID uuid.UUID) (nats.Obje
 // (BEFORE the caller appends, so a dangling pointer is impossible) and returns a stream
 // message whose body is the small pointer record and whose headers carry the same
 // Nats-Msg-Id as the original record (so the fence/dedup path is identical — only the
-// body changes) plus the Urvi- offload markers. On any upload failure it returns a
+// body changes) plus the Looprig- offload markers. On any upload failure it returns a
 // *RecordTooLargeError, failing closed rather than inlining an over-threshold record.
 //
 // The returned message is otherwise wired exactly like the inline message in Append

@@ -76,7 +76,7 @@ func drainTurn(t *testing.T, a *sessionAgent, text string) {
 func TestPersistenceNewSessionBasics(t *testing.T) {
 	root := t.TempDir()
 	t.Setenv("XDG_DATA_HOME", root)
-	dir := filepath.Join(root, "urvi", "jetstream")
+	dir := filepath.Join(root, "looprig", "jetstream")
 
 	eng := openEngine(t, dir)
 	p, err := NewPersistence(eng.JetStream())
@@ -129,7 +129,7 @@ func primaryLoopAgentName(evs []event.Event, loopID uuid.UUID) identity.AgentNam
 func TestPersistenceRoundTrip(t *testing.T) {
 	root := t.TempDir()
 	t.Setenv("XDG_DATA_HOME", root)
-	dir := filepath.Join(root, "urvi", "jetstream")
+	dir := filepath.Join(root, "looprig", "jetstream")
 
 	// --- original run: a NEW persisted session ---
 	eng := openEngine(t, dir)
@@ -211,7 +211,7 @@ func TestPersistenceRoundTrip(t *testing.T) {
 func TestPersistenceListAndResumeSeams(t *testing.T) {
 	root := t.TempDir()
 	t.Setenv("XDG_DATA_HOME", root)
-	dir := filepath.Join(root, "urvi", "jetstream")
+	dir := filepath.Join(root, "looprig", "jetstream")
 
 	eng := openEngine(t, dir)
 	p, err := NewPersistence(eng.JetStream())

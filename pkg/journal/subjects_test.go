@@ -149,14 +149,14 @@ func TestParseSubjectErrors(t *testing.T) {
 	}{
 		{name: "empty", subj: ""},
 		{name: "wrong prefix", subj: "other.session." + sid.String() + ".session"},
-		{name: "too few tokens", subj: "urvi.session"},
-		{name: "unknown session-leaf", subj: "urvi.session." + sid.String() + ".bogus"},
-		{name: "bad session uuid", subj: "urvi.session.not-a-uuid.session"},
-		{name: "loop subject missing leaf", subj: "urvi.session." + sid.String() + ".loop." + lid.String()},
-		{name: "loop subject unknown leaf", subj: "urvi.session." + sid.String() + ".loop." + lid.String() + ".bogus"},
-		{name: "loop subject bad loop uuid", subj: "urvi.session." + sid.String() + ".loop.not-a-uuid.event"},
-		{name: "wildcard token", subj: "urvi.session.*.session"},
-		{name: "trailing token after fence", subj: "urvi.session." + sid.String() + ".fence.extra"},
+		{name: "too few tokens", subj: "looprig.session"},
+		{name: "unknown session-leaf", subj: "looprig.session." + sid.String() + ".bogus"},
+		{name: "bad session uuid", subj: "looprig.session.not-a-uuid.session"},
+		{name: "loop subject missing leaf", subj: "looprig.session." + sid.String() + ".loop." + lid.String()},
+		{name: "loop subject unknown leaf", subj: "looprig.session." + sid.String() + ".loop." + lid.String() + ".bogus"},
+		{name: "loop subject bad loop uuid", subj: "looprig.session." + sid.String() + ".loop.not-a-uuid.event"},
+		{name: "wildcard token", subj: "looprig.session.*.session"},
+		{name: "trailing token after fence", subj: "looprig.session." + sid.String() + ".fence.extra"},
 	}
 	for _, tt := range tests {
 		tt := tt

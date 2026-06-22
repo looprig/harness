@@ -366,7 +366,7 @@ func TestFSMaxReadBytesCaps(t *testing.T) {
 
 // TestFSAtomicWrite proves WriteFile and EditFile produce the expected on-disk
 // content via the atomic temp+rename, create nested parent dirs, end at the
-// owner-only 0600 mode, and leave NO temp litter (.urvi-write-*) behind.
+// owner-only 0600 mode, and leave NO temp litter (.looprig-write-*) behind.
 func TestFSAtomicWrite(t *testing.T) {
 	root := fsWorkspace(t)
 	write := NewWriteFile(root)
@@ -447,7 +447,7 @@ func TestFSAtomicWrite(t *testing.T) {
 	})
 }
 
-// assertNoTempLitter fails if any .urvi-write-* temp file remains in dir after an
+// assertNoTempLitter fails if any .looprig-write-* temp file remains in dir after an
 // atomic write (the temp must have been renamed into place or removed on failure).
 func assertNoTempLitter(t *testing.T, dir string) {
 	t.Helper()
@@ -457,7 +457,7 @@ func assertNoTempLitter(t *testing.T, dir string) {
 	}
 	for _, e := range entries {
 		name := e.Name()
-		if strings.HasPrefix(name, ".urvi-write-") || strings.HasSuffix(name, ".tmp") {
+		if strings.HasPrefix(name, ".looprig-write-") || strings.HasSuffix(name, ".tmp") {
 			t.Errorf("leftover temp file %q in %q after atomic write", name, dir)
 		}
 	}

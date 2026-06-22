@@ -81,7 +81,7 @@ func TestBannerAgentBanner(t *testing.T) {
 	}
 }
 
-// TestLogFilePath proves the log path resolves to <dir>/.urvi/urvi.log against a
+// TestLogFilePath proves the log path resolves to <dir>/.looprig/looprig.log against a
 // supplied home, joining with filepath.Join (no hardcoded separators).
 func TestLogFilePath(t *testing.T) {
 	t.Parallel()

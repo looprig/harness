@@ -202,7 +202,7 @@ func TestStreamConfigDurabilityContract(t *testing.T) {
 		t.Errorf("Subjects = %v, want %v", cfg.Subjects, wantSubjects)
 	}
 	// The subject filter is exactly the session-rooted wildcard.
-	if want := "urvi.session." + sid.String() + ".>"; cfg.Subjects[0] != want {
+	if want := "looprig.session." + sid.String() + ".>"; cfg.Subjects[0] != want {
 		t.Errorf("Subjects[0] = %q, want %q", cfg.Subjects[0], want)
 	}
 	if cfg.Retention != nats.LimitsPolicy {

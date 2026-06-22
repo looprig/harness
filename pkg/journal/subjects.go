@@ -8,13 +8,13 @@ import (
 )
 
 // subjectRoot is the constant first two tokens of every journal subject:
-// "urvi.session". Concrete subjects extend it with the session id and a kind.
-const subjectRoot = "urvi.session"
+// "looprig.session". Concrete subjects extend it with the session id and a kind.
+const subjectRoot = "looprig.session"
 
 // streamPrefix is the constant prefix of a per-session JetStream stream name.
 // NATS stream names disallow '.', ' ', '*' and '>', so the prefix uses '_' and
 // the uuid (whose dashes are legal) is appended verbatim.
-const streamPrefix = "urvi_session_"
+const streamPrefix = "looprig_session_"
 
 // Subject-leaf tokens. They are the trailing token of a concrete subject and the
 // single source of truth for both the builders and the parser.
@@ -32,13 +32,13 @@ const (
 type SubjectKind uint8
 
 const (
-	// SubjectSessionEvent is "urvi.session.<sid>.session" — session-scoped events.
+	// SubjectSessionEvent is "looprig.session.<sid>.session" — session-scoped events.
 	SubjectSessionEvent SubjectKind = iota
-	// SubjectLoopEvent is "urvi.session.<sid>.loop.<lid>.event" — a loop's events.
+	// SubjectLoopEvent is "looprig.session.<sid>.loop.<lid>.event" — a loop's events.
 	SubjectLoopEvent
-	// SubjectLoopCommand is "urvi.session.<sid>.loop.<lid>.cmd" — the intent log.
+	// SubjectLoopCommand is "looprig.session.<sid>.loop.<lid>.cmd" — the intent log.
 	SubjectLoopCommand
-	// SubjectFence is "urvi.session.<sid>.fence" — internal LeaseFence records.
+	// SubjectFence is "looprig.session.<sid>.fence" — internal LeaseFence records.
 	SubjectFence
 )
 
@@ -85,25 +85,25 @@ func StreamName(sessionID uuid.UUID) string {
 }
 
 // SessionEventSubject returns the subject carrying a session's session-scoped
-// enduring events: "urvi.session.<sid>.session".
+// enduring events: "looprig.session.<sid>.session".
 func SessionEventSubject(sessionID uuid.UUID) string {
 	return subjectRoot + "." + sessionID.String() + "." + leafSession
 }
 
 // LoopEventSubject returns the subject carrying a loop's enduring events:
-// "urvi.session.<sid>.loop.<lid>.event".
+// "looprig.session.<sid>.loop.<lid>.event".
 func LoopEventSubject(sessionID, loopID uuid.UUID) string {
 	return loopSubjectPrefix(sessionID, loopID) + "." + leafEvent
 }
 
 // LoopCommandSubject returns the subject carrying commands targeting a loop (the
-// intent log): "urvi.session.<sid>.loop.<lid>.cmd".
+// intent log): "looprig.session.<sid>.loop.<lid>.cmd".
 func LoopCommandSubject(sessionID, loopID uuid.UUID) string {
 	return loopSubjectPrefix(sessionID, loopID) + "." + leafCommand
 }
 
 // allLoopsEventSubject returns the wildcard subject matching every loop's event
-// subject in a session: "urvi.session.<sid>.loop.*.event". The '*' wildcards exactly
+// subject in a session: "looprig.session.<sid>.loop.*.event". The '*' wildcards exactly
 // the loop-id token, so it captures all loops' events and ONLY events (never .cmd).
 // It is built from the same constant leaves as the concrete builders so the filter
 // cannot drift from what the writer emits. It is the EventReplayer's all-loops filter
@@ -113,13 +113,13 @@ func allLoopsEventSubject(sessionID uuid.UUID) string {
 }
 
 // FenceSubject returns the subject carrying a session's internal LeaseFence
-// records: "urvi.session.<sid>.fence".
+// records: "looprig.session.<sid>.fence".
 func FenceSubject(sessionID uuid.UUID) string {
 	return subjectRoot + "." + sessionID.String() + "." + leafFence
 }
 
 // allSessionSubjects returns the single '>' wildcard matching EVERY subject in a
-// session's stream: "urvi.session.<sid>.>". Unlike allLoopsEventSubject (events only),
+// session's stream: "looprig.session.<sid>.>". Unlike allLoopsEventSubject (events only),
 // this captures session events, loop events, loop commands AND fences — every subject a
 // pointer record can land on. It is orphan-GC's reference-scan filter: the writer
 // offloads any over-threshold record by size regardless of kind (buildMessage), so an
@@ -130,7 +130,7 @@ func allSessionSubjects(sessionID uuid.UUID) string {
 	return subjectRoot + "." + sessionID.String() + ".>"
 }
 
-// loopSubjectPrefix returns "urvi.session.<sid>.loop.<lid>", the shared head of
+// loopSubjectPrefix returns "looprig.session.<sid>.loop.<lid>", the shared head of
 // every loop-scoped subject.
 func loopSubjectPrefix(sessionID, loopID uuid.UUID) string {
 	return subjectRoot + "." + sessionID.String() + "." + leafLoop + "." + loopID.String()
@@ -156,8 +156,8 @@ func ParseSubject(subj string) (SubjectKind, uuid.UUID, uuid.UUID, error) {
 	var zero uuid.UUID
 	toks := strings.Split(subj, ".")
 	// Every concrete subject begins with the two root tokens then the session id.
-	if len(toks) < 4 || toks[0] != "urvi" || toks[1] != leafSession {
-		return 0, zero, zero, &SubjectParseError{Subject: subj, Reason: "not a urvi.session subject"}
+	if len(toks) < 4 || toks[0] != "looprig" || toks[1] != leafSession {
+		return 0, zero, zero, &SubjectParseError{Subject: subj, Reason: "not a looprig.session subject"}
 	}
 	sid, err := parseToken(subj, toks[2])
 	if err != nil {
@@ -183,11 +183,11 @@ func ParseSubject(subj string) (SubjectKind, uuid.UUID, uuid.UUID, error) {
 
 // parseLoopSubject parses the tail of a "...loop.<lid>.<leaf>" subject. toks is the
 // already-split subject and sid the parsed session id; the loop subject is exactly
-// six tokens (urvi.session.<sid>.loop.<lid>.<leaf>).
+// six tokens (looprig.session.<sid>.loop.<lid>.<leaf>).
 func parseLoopSubject(subj string, toks []string, sid uuid.UUID) (SubjectKind, uuid.UUID, uuid.UUID, error) {
 	var zero uuid.UUID
 	if len(toks) != 6 {
-		return 0, zero, zero, &SubjectParseError{Subject: subj, Reason: "loop subject must be urvi.session.<sid>.loop.<lid>.<leaf>"}
+		return 0, zero, zero, &SubjectParseError{Subject: subj, Reason: "loop subject must be looprig.session.<sid>.loop.<lid>.<leaf>"}
 	}
 	lid, err := parseToken(subj, toks[4])
 	if err != nil {

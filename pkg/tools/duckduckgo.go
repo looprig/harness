@@ -66,7 +66,7 @@ func (p *DuckDuckGoProvider) Search(ctx context.Context, query string, max int) 
 	}
 	// DuckDuckGo's HTML endpoint returns an empty page without a browser-like
 	// User-Agent. Set a simple, non-deceptive one (no secrets).
-	req.Header.Set("User-Agent", "urvi-websearch/1.0")
+	req.Header.Set("User-Agent", "looprig-websearch/1.0")
 
 	resp, err := p.client.Do(req)
 	if err != nil {

@@ -7,7 +7,7 @@ import (
 
 // TestDefaultHardDeny asserts the DefaultHardDeny() constructor returns the
 // fail-secure defaults from design §3c: the secret read/write globs, the
-// .urvi policy-store deny-write entries (so the tool system can never mutate
+// .looprig policy-store deny-write entries (so the tool system can never mutate
 // its own approvals), the dangerous Bash prefixes, and the 1 MiB read cap.
 func TestDefaultHardDeny(t *testing.T) {
 	t.Parallel()
@@ -24,7 +24,7 @@ func TestDefaultHardDeny(t *testing.T) {
 		{name: "read denies pem", set: d.DeniedReadPaths, want: "**/*.pem"},
 		{name: "read denies id_rsa", set: d.DeniedReadPaths, want: "**/id_rsa"},
 		// Policy store (user-level) is read-denied.
-		{name: "read denies user urvi store", set: d.DeniedReadPaths, want: "~/.urvi/**"},
+		{name: "read denies user urvi store", set: d.DeniedReadPaths, want: "~/.looprig/**"},
 		// Workspace skill source is read-denied for generic file tools (gate-bypass
 		// prevention): only the gated Skill tool may reach it (via embed.FS).
 		{name: "read denies workspace skills", set: d.DeniedReadPaths, want: "**/.skills/**"},
@@ -41,8 +41,8 @@ func TestDefaultHardDeny(t *testing.T) {
 		// no generic tool can write the .skills/ source either.
 		{name: "write denies workspace skills", set: d.DeniedWritePaths, want: "**/.skills/**"},
 		// Policy-store deny-write entries — the security-critical requirement.
-		{name: "write denies in-repo urvi store", set: d.DeniedWritePaths, want: "**/.urvi/**"},
-		{name: "write denies user urvi store", set: d.DeniedWritePaths, want: "~/.urvi/**"},
+		{name: "write denies in-repo urvi store", set: d.DeniedWritePaths, want: "**/.looprig/**"},
+		{name: "write denies user urvi store", set: d.DeniedWritePaths, want: "~/.looprig/**"},
 
 		// Dangerous Bash prefixes.
 		{name: "bash denies rm -rf root", set: d.DeniedBashPrefixes, want: "rm -rf /"},

@@ -20,9 +20,9 @@ import (
 
 const (
 	// defaultDirName is the per-user urvi data directory under the home root. It matches
-	// the existing ~/.urvi convention (where the CLI already writes urvi.log), so all
+	// the existing ~/.looprig convention (where the CLI already writes looprig.log), so all
 	// urvi state lives under one directory.
-	defaultDirName = ".urvi"
+	defaultDirName = ".looprig"
 	// jetstreamDirName is the subdirectory under the urvi data dir that holds the
 	// embedded server's StoreDir (its file-backed streams + KV + object buckets).
 	jetstreamDirName = "jetstream"
@@ -87,7 +87,7 @@ type EngineOptions struct {
 }
 
 // DefaultEngineOptions returns the production engine options: StoreDir at
-// ~/.urvi/jetstream (overridable by $XDG_DATA_HOME → $XDG_DATA_HOME/urvi/jetstream) and
+// ~/.looprig/jetstream (overridable by $XDG_DATA_HOME → $XDG_DATA_HOME/looprig/jetstream) and
 // the conservative explicit SyncInterval. It resolves the home/XDG root via os, failing
 // closed (typed *StoreDirError) if neither is available.
 func DefaultEngineOptions() (EngineOptions, error) {
@@ -99,12 +99,12 @@ func DefaultEngineOptions() (EngineOptions, error) {
 }
 
 // defaultDataDir computes the default StoreDir. It honors $XDG_DATA_HOME when set
-// ($XDG_DATA_HOME/urvi/jetstream); otherwise it falls back to ~/.urvi/jetstream, matching
-// the existing ~/.urvi convention (urvi.log). It never returns an unconfined path: the
+// ($XDG_DATA_HOME/looprig/jetstream); otherwise it falls back to ~/.looprig/jetstream, matching
+// the existing ~/.looprig convention (looprig.log). It never returns an unconfined path: the
 // XDG/home root is treated as the containment root.
 func defaultDataDir() (string, error) {
 	if xdg := strings.TrimSpace(os.Getenv("XDG_DATA_HOME")); xdg != "" {
-		return filepath.Join(xdg, "urvi", jetstreamDirName), nil
+		return filepath.Join(xdg, "looprig", jetstreamDirName), nil
 	}
 	home, err := os.UserHomeDir()
 	if err != nil {

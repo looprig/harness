@@ -20,7 +20,7 @@ import (
 // SessionMeta per session, keyed by session id. It is a rebuildable cache, NOT a
 // source of truth — the per-session stream is authoritative; this bucket is a
 // replay-free index for the session picker.
-const catalogBucket = "urvi_sessions"
+const catalogBucket = "looprig_sessions"
 
 // titleMaxLen bounds the derived Title: a short label cut from the first user
 // message's text. A picker shows a one-line preview, so the title is the message's

@@ -229,7 +229,7 @@ func uniqueWriteTempPath(dir string) (string, error) {
 	if _, err := rand.Read(b[:]); err != nil {
 		return "", &writeFileError{reason: "could not generate temp file name", cause: err}
 	}
-	return filepath.Join(dir, ".urvi-write-"+hex.EncodeToString(b[:])+".tmp"), nil
+	return filepath.Join(dir, ".looprig-write-"+hex.EncodeToString(b[:])+".tmp"), nil
 }
 
 // writeFileError is the typed failure for a WriteFile/EditFile write attempt. It

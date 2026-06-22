@@ -11,7 +11,7 @@ import (
 )
 
 // store_hardening_test.go exercises the §3c WRITE-side store hardening: EVERY
-// store directory component under <home> (`.urvi`, `.urvi/workspaces`, and the
+// store directory component under <home> (`.looprig`, `.looprig/workspaces`, and the
 // `<hash>` leaf) is tightened to 0700 by a ScopeWorkspace Grant, even when a
 // pre-existing ancestor was created world-writable. A chmod failure on a
 // component (e.g. an ancestor owned by another user) makes Grant fail secure
@@ -19,8 +19,8 @@ import (
 
 // TestGrantTightensAllAncestorDirs proves a ScopeWorkspace Grant forces 0700 on
 // every store component under <home> — not just the <hash> leaf — closing the
-// store-poisoning vector where a pre-existing loose ~/.urvi or
-// ~/.urvi/workspaces lets a non-owner plant an attacker-owned approvals.json.
+// store-poisoning vector where a pre-existing loose ~/.looprig or
+// ~/.looprig/workspaces lets a non-owner plant an attacker-owned approvals.json.
 func TestGrantTightensAllAncestorDirs(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
@@ -35,14 +35,14 @@ func TestGrantTightensAllAncestorDirs(t *testing.T) {
 			precreate: nil,
 		},
 		{
-			name: "pre-existing loose ~/.urvi and ~/.urvi/workspaces",
+			name: "pre-existing loose ~/.looprig and ~/.looprig/workspaces",
 			precreate: map[string]os.FileMode{
 				filepath.Join(urviDirName):                    0o777,
 				filepath.Join(urviDirName, workspacesDirName): 0o777,
 			},
 		},
 		{
-			name: "pre-existing loose ~/.urvi only",
+			name: "pre-existing loose ~/.looprig only",
 			precreate: map[string]os.FileMode{
 				filepath.Join(urviDirName): 0o755,
 			},
@@ -124,7 +124,7 @@ func TestMkdirStoreDirTightensComponents(t *testing.T) {
 	}{
 		{name: "clean install", precreate: nil},
 		{
-			name: "loose ~/.urvi + workspaces",
+			name: "loose ~/.looprig + workspaces",
 			precreate: map[string]os.FileMode{
 				urviDirName: 0o777,
 				filepath.Join(urviDirName, workspacesDirName): 0o775,
@@ -169,7 +169,7 @@ func TestMkdirStoreDirTightensComponents(t *testing.T) {
 // created/tightened — the locked-or-other-user-owned-ancestor attack signal (the
 // real case being an EPERM chmod on a dir owned by another user) — Grant returns
 // a typed *PolicyStoreError and writes NOTHING. It is simulated locally by making
-// ~/.urvi mode 0000 (unsearchable/unwritable) so reaching/tightening the deeper
+// ~/.looprig mode 0000 (unsearchable/unwritable) so reaching/tightening the deeper
 // store components is denied; the chmod-EPERM case is the same fail-secure exit.
 func TestGrantTightenAncestorFailsSecure(t *testing.T) {
 	// Not parallel: mutates directory modes; a cleanup restores them so t.TempDir
@@ -187,14 +187,14 @@ func TestGrantTightenAncestorFailsSecure(t *testing.T) {
 	if err != nil {
 		t.Fatalf("workspaceHash: %v", err)
 	}
-	// Pre-create ~/.urvi, then lock it to 0000 so neither MkdirAll nor the chmod
+	// Pre-create ~/.looprig, then lock it to 0000 so neither MkdirAll nor the chmod
 	// walk can reach/alter the components beneath it — the attack signal.
 	urvi := filepath.Join(home, urviDirName)
 	if err := os.MkdirAll(urvi, 0o700); err != nil {
-		t.Fatalf("mkdir ~/.urvi: %v", err)
+		t.Fatalf("mkdir ~/.looprig: %v", err)
 	}
 	if err := os.Chmod(urvi, 0o000); err != nil {
-		t.Fatalf("chmod ~/.urvi 0000: %v", err)
+		t.Fatalf("chmod ~/.looprig 0000: %v", err)
 	}
 	t.Cleanup(func() {
 		// Restore search/write so t.TempDir cleanup can recurse and remove the tree.

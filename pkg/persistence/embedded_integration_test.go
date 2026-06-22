@@ -20,7 +20,7 @@ func TestEngineLifecycle(t *testing.T) {
 	// when set, else home), then place the StoreDir under it — the realistic config.
 	root := t.TempDir()
 	t.Setenv("XDG_DATA_HOME", root)
-	dir := filepath.Join(root, "urvi", "jetstream")
+	dir := filepath.Join(root, "looprig", "jetstream")
 
 	eng, err := Open(EngineOptions{DataDir: dir, SyncInterval: 2 * time.Second})
 	if err != nil {

@@ -295,14 +295,14 @@ func (g *ObjectGC) listObjects(ctx context.Context) ([]*nats.ObjectInfo, error) 
 
 // collectReferenced scans the WHOLE session stream (every subject) and builds the set of
 // object ids referenced by an in-stream pointer record — read from each message's
-// Urvi-Object-Id header (no body decode, no object fetch: GC must NOT rehydrate, or a
+// Looprig-Object-Id header (no body decode, no object fetch: GC must NOT rehydrate, or a
 // deliberately-orphaned object would make the scan fail). The scan scope is tied to the
 // writer's OFFLOAD scope: the writer offloads any over-threshold record by size
 // regardless of record kind (buildMessage), so a pointer can land on a .cmd subject (a
 // large UserInput/SubagentResult) just as on an .event one — GC must therefore scan every
 // subject a pointer can land on (events AND commands), not events alone, or it would
 // classify a still-referenced object as an orphan and reap it. Fence records carry no
-// Urvi-Object-Id header and are harmlessly scanned. It binds its own ephemeral AckNone
+// Looprig-Object-Id header and are harmlessly scanned. It binds its own ephemeral AckNone
 // pull consumer over the all-subjects wildcard, walks the backlog to the Open-time tip,
 // and returns the id set. It fails closed with a *GCScanError on any non-benign failure:
 // an incomplete referenced set could orphan a live object.
@@ -346,7 +346,7 @@ func (g *ObjectGC) collectReferenced(ctx context.Context) (map[string]struct{}, 
 }
 
 // drainReferenced pulls the matching backlog one message at a time, recording each
-// message's Urvi-Object-Id header (when present) into referenced, until the consumer
+// message's Looprig-Object-Id header (when present) into referenced, until the consumer
 // reports NumPending==0 (drained). A benign fetch timeout while records remain — or any
 // other fetch failure — fails closed as a *GCScanError: the scan must be COMPLETE
 // before any delete, so a partial scan never proceeds to reaping.
@@ -365,7 +365,7 @@ func (g *ObjectGC) drainReferenced(ctx context.Context, sub *nats.Subscription, 
 		}
 		msg := msgs[0]
 
-		// A pointer record is MARKED by the presence of the Urvi-Object-Id header; an
+		// A pointer record is MARKED by the presence of the Looprig-Object-Id header; an
 		// inline event has no such header and references no object.
 		if id := msg.Header.Get(objectIDHeader); id != "" {
 			referenced[id] = struct{}{}

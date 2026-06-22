@@ -246,7 +246,7 @@ func TestNewSessionJournalRejectsMismatchedStream(t *testing.T) {
 			preCfg: func(sid uuid.UUID) *nats.StreamConfig {
 				return &nats.StreamConfig{
 					Name:      journal.StreamName(sid),
-					Subjects:  []string{"urvi.session." + sid.String() + ".>"},
+					Subjects:  []string{"looprig.session." + sid.String() + ".>"},
 					Retention: nats.WorkQueuePolicy,
 				}
 			},

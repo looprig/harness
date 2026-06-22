@@ -19,10 +19,10 @@ import (
 	"github.com/nats-io/nats.go"
 )
 
-// The Urvi- offload header marker the write side stamps on a pointer message. Mirrors
+// The Looprig- offload header marker the write side stamps on a pointer message. Mirrors
 // the unexported constant in objectstore.go (this is package journal_test, so it
 // cannot reference it directly); the value is the contract the Task 5.3 replayer reads.
-const objectIDHeaderName = "Urvi-Object-Id"
+const objectIDHeaderName = "Looprig-Object-Id"
 
 // smallTextEvent builds a session-scoped SessionStarted event — a tiny record that
 // always marshals well under the inline threshold.

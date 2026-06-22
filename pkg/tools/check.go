@@ -387,7 +387,7 @@ func (c *PermissionChecker) stagePersistedApprovals(ctx context.Context, toolNam
 // loadWorkspaceApprovals reads + parses the workspace-scoped approvals file. A
 // missing file → no records (not an error); a read or parse error → no records +
 // a single warning (fail open to the next stage). It NEVER reads any in-repo
-// path — only <home>/.urvi/workspaces/<hash>/approvals.json.
+// path — only <home>/.looprig/workspaces/<hash>/approvals.json.
 func (c *PermissionChecker) loadWorkspaceApprovals(ctx context.Context, home string) []ApprovalRecord {
 	hash, err := workspaceHash(c.policy.WorkspaceRoot)
 	if err != nil {
@@ -443,7 +443,7 @@ func loadApprovalRecords(ctx context.Context, cache *hashcache.Cache[ApprovalsFi
 // unreadable file (a single path-only warning, never contents). The checks, in
 // order (all fail-secure → treat-as-empty):
 //  1. no symlinked path component from home down to p (don't read through a
-//     symlinked ~/.urvi or workspaces/<hash>);
+//     symlinked ~/.looprig or workspaces/<hash>);
 //  2. open with O_RDONLY|O_NOFOLLOW so a SYMLINKED FILE p fails to open (rather
 //     than following it) — closing the resolve→open TOCTOU window;
 //  3. fstat the OPEN fd (not the path) and require a REGULAR file (reject a dir,

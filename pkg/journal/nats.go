@@ -385,7 +385,7 @@ func (e *streamConfigMismatchError) Error() string {
 // streamConfig is the per-session stream's configuration: the keep-everything log.
 // Limits retention with unlimited messages/bytes and no max-age means nothing is
 // ever discarded; one replica suits the embedded single-node server. The subject
-// filter urvi.session.<sid>.> captures every session/loop/command/fence subject for
+// filter looprig.session.<sid>.> captures every session/loop/command/fence subject for
 // this session (and only this session — the sid token isolates streams).
 func streamConfig(sessionID uuid.UUID) *nats.StreamConfig {
 	return &nats.StreamConfig{
@@ -415,7 +415,7 @@ func streamConfig(sessionID uuid.UUID) *nats.StreamConfig {
 }
 
 // streamSubjectFilter returns the wildcard subject the session stream binds:
-// "urvi.session.<sid>.>" — every subject under this session's root. The trailing
+// "looprig.session.<sid>.>" — every subject under this session's root. The trailing
 // '>' captures the session, loop-event, command, and fence leaves uniformly.
 func streamSubjectFilter(sessionID uuid.UUID) string {
 	return subjectRoot + "." + sessionID.String() + ".>"

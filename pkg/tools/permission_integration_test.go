@@ -60,7 +60,7 @@ func intWriteApprovals(t *testing.T, recs ...ApprovalRecord) []byte {
 // TestIntegrationSymlinkedPolicyDirRejected proves a symlinked policy directory is
 // refused on BOTH the write path (Grant returns a typed *PolicyStoreError and
 // writes nothing through the symlink) and the read path (the loader treats the
-// store as empty → Check Asks). Two sub-cases: ~/.urvi itself, and the deeper
+// store as empty → Check Asks). Two sub-cases: ~/.looprig itself, and the deeper
 // workspaces/<hash> dir, are each a symlink.
 func TestIntegrationSymlinkedPolicyDirRejected(t *testing.T) {
 	tests := []struct {
@@ -77,7 +77,7 @@ func TestIntegrationSymlinkedPolicyDirRejected(t *testing.T) {
 					t.Fatalf("mkdir decoy: %v", err)
 				}
 				if err := os.Symlink(decoy, filepath.Join(home, urviDirName)); err != nil {
-					t.Fatalf("symlink ~/.urvi -> decoy: %v", err)
+					t.Fatalf("symlink ~/.looprig -> decoy: %v", err)
 				}
 				return decoy
 			},
@@ -89,7 +89,7 @@ func TestIntegrationSymlinkedPolicyDirRejected(t *testing.T) {
 				if err != nil {
 					t.Fatalf("workspaceHash: %v", err)
 				}
-				// Real ~/.urvi/workspaces, but the <hash> entry is a symlink to a decoy.
+				// Real ~/.looprig/workspaces, but the <hash> entry is a symlink to a decoy.
 				wsParent := filepath.Join(home, urviDirName, workspacesDirName)
 				if err := os.MkdirAll(wsParent, 0o700); err != nil {
 					t.Fatalf("mkdir workspaces: %v", err)

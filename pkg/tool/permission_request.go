@@ -29,7 +29,7 @@ const (
 	// ScopeSession adds an in-memory session policy for the rest of the session.
 	ScopeSession
 	// ScopeWorkspace persists an approval to
-	// ~/.urvi/workspaces/<hash>/approvals.json (out of the repo).
+	// ~/.looprig/workspaces/<hash>/approvals.json (out of the repo).
 	ScopeWorkspace
 )
 

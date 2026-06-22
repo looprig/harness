@@ -103,7 +103,7 @@ func TestLoaderRejectsSymlinkedFile(t *testing.T) {
 }
 
 // TestLoaderRejectsSymlinkedComponent proves a symlinked PARENT directory anywhere
-// in the policy path (here ~/.urvi itself) makes the loader treat the store as
+// in the policy path (here ~/.looprig itself) makes the loader treat the store as
 // empty (don't read through a symlinked policy dir).
 func TestLoaderRejectsSymlinkedComponent(t *testing.T) {
 	t.Parallel()
@@ -112,7 +112,7 @@ func TestLoaderRejectsSymlinkedComponent(t *testing.T) {
 		t.Fatalf("write main.go: %v", err)
 	}
 	home := t.TempDir()
-	// Build the full valid store under a DECOY dir, then symlink ~/.urvi -> decoy.
+	// Build the full valid store under a DECOY dir, then symlink ~/.looprig -> decoy.
 	decoy := filepath.Join(home, "decoy-urvi")
 	hash, err := workspaceHash(ws)
 	if err != nil {
@@ -126,23 +126,23 @@ func TestLoaderRejectsSymlinkedComponent(t *testing.T) {
 	if err := os.WriteFile(wsFileUnderDecoy, recs, 0o600); err != nil {
 		t.Fatalf("write decoy approvals: %v", err)
 	}
-	// ~/.urvi is a symlink to the decoy directory.
+	// ~/.looprig is a symlink to the decoy directory.
 	if err := os.Symlink(decoy, filepath.Join(home, urviDirName)); err != nil {
-		t.Fatalf("symlink ~/.urvi -> decoy: %v", err)
+		t.Fatalf("symlink ~/.looprig -> decoy: %v", err)
 	}
 
 	pc := NewPermissionChecker(PermissionPolicy{WorkspaceRoot: ws, HardDeny: DefaultHardDeny()})
 	pc.SetHomeDir(func() (string, error) { return home, nil })
 	got := pc.Check(context.Background(), plainTool{name: "ReadFile"}, "ReadFile", `{"path":"main.go"}`)
 	if got != loop.EffectAsk {
-		t.Errorf("Check() = %v, want EffectAsk (symlinked ~/.urvi must be treated empty)", got)
+		t.Errorf("Check() = %v, want EffectAsk (symlinked ~/.looprig must be treated empty)", got)
 	}
 }
 
 // TestLoaderRejectsWorldWritableAncestorDir proves the loader rejects the store
 // (→ Ask, never AutoApprove) when ANY store DIRECTORY component under <home> is
 // group- or world-writable, even though the file itself is a valid 0600 regular
-// file. A pre-existing world-writable ~/.urvi/workspaces (the ancestor) lets a
+// file. A pre-existing world-writable ~/.looprig/workspaces (the ancestor) lets a
 // non-owner plant an attacker-owned approvals.json that would otherwise pass
 // every file-level check — this is the store-poisoning vector being closed.
 func TestLoaderRejectsWorldWritableAncestorDir(t *testing.T) {
@@ -156,9 +156,9 @@ func TestLoaderRejectsWorldWritableAncestorDir(t *testing.T) {
 		want     loop.Effect
 	}{
 		{name: "control: all dirs 0700", looseRel: "", want: loop.EffectAutoApprove},
-		{name: "world-writable ~/.urvi rejected", looseRel: urviDirName, mode: 0o777, want: loop.EffectAsk},
-		{name: "world-writable ~/.urvi/workspaces rejected", looseRel: filepath.Join(urviDirName, workspacesDirName), mode: 0o777, want: loop.EffectAsk},
-		{name: "group-writable ~/.urvi rejected", looseRel: urviDirName, mode: 0o770, want: loop.EffectAsk},
+		{name: "world-writable ~/.looprig rejected", looseRel: urviDirName, mode: 0o777, want: loop.EffectAsk},
+		{name: "world-writable ~/.looprig/workspaces rejected", looseRel: filepath.Join(urviDirName, workspacesDirName), mode: 0o777, want: loop.EffectAsk},
+		{name: "group-writable ~/.looprig rejected", looseRel: urviDirName, mode: 0o770, want: loop.EffectAsk},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -220,7 +220,7 @@ func TestLoaderRejectsLooseAncestorWarnsPathOnly(t *testing.T) {
 	if err := os.WriteFile(wsFile, recs, 0o600); err != nil {
 		t.Fatalf("write ws approvals: %v", err)
 	}
-	// Loosen ~/.urvi/workspaces (an ancestor) to world-writable.
+	// Loosen ~/.looprig/workspaces (an ancestor) to world-writable.
 	if err := os.Chmod(filepath.Join(home, urviDirName, workspacesDirName), 0o777); err != nil {
 		t.Fatalf("chmod ancestor: %v", err)
 	}

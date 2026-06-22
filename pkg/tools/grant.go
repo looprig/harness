@@ -26,7 +26,7 @@ var _ loop.PermissionGate = (*PermissionChecker)(nil)
 //	ScopeSession   → append an in-memory ToolPolicy (visible to subsequent Checks
 //	                 this session); nothing is written to disk.
 //	ScopeWorkspace → append an ApprovalRecord to
-//	                 <home>/.urvi/workspaces/<sha256(resolvedRoot)>/approvals.json
+//	                 <home>/.looprig/workspaces/<sha256(resolvedRoot)>/approvals.json
 //	                 (load → append → atomic-write the whole file); NEVER the repo.
 //	ScopeOnce      → refused (*UnsupportedScopeError): a once-grant persists
 //	                 nothing by definition and the runner never passes it. Any
@@ -83,14 +83,14 @@ func (c *PermissionChecker) grantWorkspace(ctx context.Context, toolName, match 
 	dir := filepath.Dir(finalPath)
 
 	// Reject a symlinked component anywhere from home down to the target file BEFORE
-	// creating anything (don't follow a symlinked ~/.urvi or workspaces/<hash>).
+	// creating anything (don't follow a symlinked ~/.looprig or workspaces/<hash>).
 	if err := assertNoSymlinkComponent(home, finalPath); err != nil {
 		return err
 	}
 
 	// Create + harden the store directories: tighten EVERY store component under
-	// home to 0700 (not just the leaf), so a pre-existing loose ~/.urvi or
-	// ~/.urvi/workspaces cannot survive as a store-poisoning vector.
+	// home to 0700 (not just the leaf), so a pre-existing loose ~/.looprig or
+	// ~/.looprig/workspaces cannot survive as a store-poisoning vector.
 	if err := mkdirStoreDir(home, dir); err != nil {
 		return err
 	}

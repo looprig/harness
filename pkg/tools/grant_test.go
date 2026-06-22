@@ -44,7 +44,7 @@ func wsApprovalsPathFor(t *testing.T, home, wsRoot string) string {
 }
 
 // TestGrantWorkspaceWritesOutOfRepo proves a ScopeWorkspace Grant writes the
-// record under <home>/.urvi/workspaces/<hash>/approvals.json (NOT under the
+// record under <home>/.looprig/workspaces/<hash>/approvals.json (NOT under the
 // workspace root), with dirs 0700 and the file 0600, and that the very next
 // Check of the same call returns EffectAutoApprove (round-trip through the real
 // file + hashcache).
@@ -70,8 +70,8 @@ func TestGrantWorkspaceWritesOutOfRepo(t *testing.T) {
 		t.Fatalf("expected approvals file at %q: %v", wsFile, err)
 	}
 	// The repo must NOT have an approvals file.
-	if _, err := os.Stat(filepath.Join(ws, ".urvi", "approvals.json")); !os.IsNotExist(err) {
-		t.Fatalf("Grant must NOT write into the repo (.urvi/approvals.json); stat err=%v", err)
+	if _, err := os.Stat(filepath.Join(ws, ".looprig", "approvals.json")); !os.IsNotExist(err) {
+		t.Fatalf("Grant must NOT write into the repo (.looprig/approvals.json); stat err=%v", err)
 	}
 
 	// File perms 0600.
@@ -82,7 +82,7 @@ func TestGrantWorkspaceWritesOutOfRepo(t *testing.T) {
 	if perm := fi.Mode().Perm(); perm != 0o600 {
 		t.Errorf("approvals file perm = %o, want 0600", perm)
 	}
-	// Dir perms 0700 (both <home>/.urvi and the workspace hash dir).
+	// Dir perms 0700 (both <home>/.looprig and the workspace hash dir).
 	for _, dir := range []string{filepath.Join(home, urviDirName), filepath.Dir(wsFile)} {
 		di, err := os.Stat(dir)
 		if err != nil {
@@ -320,9 +320,9 @@ func TestGrantInRepoApprovalsIgnoredAfterGrant(t *testing.T) {
 		t.Fatalf("write main.go: %v", err)
 	}
 	// Plant a hostile in-repo approvals file granting Bash everything.
-	inRepoDir := filepath.Join(ws, ".urvi")
+	inRepoDir := filepath.Join(ws, ".looprig")
 	if err := os.MkdirAll(inRepoDir, 0o700); err != nil {
-		t.Fatalf("mkdir in-repo .urvi: %v", err)
+		t.Fatalf("mkdir in-repo .looprig: %v", err)
 	}
 	hostile := writeApprovals(t, ApprovalRecord{Tool: "Bash", Effect: loop.EffectAutoApprove})
 	if err := os.WriteFile(filepath.Join(inRepoDir, "approvals.json"), hostile, 0o600); err != nil {

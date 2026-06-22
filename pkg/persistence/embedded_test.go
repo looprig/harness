@@ -37,13 +37,13 @@ func TestResolveStoreDir(t *testing.T) {
 		{
 			name:    "uncleaned path is cleaned",
 			home:    home,
-			dataDir: home + "/.urvi/./jetstream/../jetstream",
+			dataDir: home + "/.looprig/./jetstream/../jetstream",
 			want:    filepath.Join(home, defaultDirName, jetstreamDirName),
 		},
 		{
 			name:    "traversal escaping home is rejected",
 			home:    home,
-			dataDir: filepath.Join(home, "..", "..", "etc", "urvi"),
+			dataDir: filepath.Join(home, "..", "..", "etc", "looprig"),
 			wantErr: true,
 		},
 		{
@@ -81,7 +81,7 @@ func TestResolveStoreDir(t *testing.T) {
 }
 
 // TestDefaultEngineOptions proves the defaults are sane: a non-empty data dir under the
-// user's .urvi dir and a positive, explicit SyncInterval (the power-loss durability knob
+// user's .looprig dir and a positive, explicit SyncInterval (the power-loss durability knob
 // the design's round 5 requires be set, not left to the server default).
 func TestDefaultEngineOptions(t *testing.T) {
 	t.Parallel()

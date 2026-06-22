@@ -1,6 +1,6 @@
 // Package cli is the shared CLI runtime for urvi's TUI entry points. It owns the
 // process-level plumbing that every entry point repeats — structured logging to
-// ~/.urvi/urvi.log, signal-driven shutdown, stdout/stderr capture so third-party
+// ~/.looprig/looprig.log, signal-driven shutdown, stdout/stderr capture so third-party
 // libraries don't corrupt live scrollback, building and running the Bubble Tea
 // program, and bounded teardown — parameterized by an agent constructor and a
 // startup banner. Entry points (cmd/swe) stay thin: they select an agent
@@ -58,12 +58,12 @@ const (
 const closeTimeout = 5 * time.Second
 
 // logDirName / logFileName locate urvi's log file under the user's home directory
-// (~/.urvi/urvi.log). Both the structured app logger (slog) and the captured
+// (~/.looprig/looprig.log). Both the structured app logger (slog) and the captured
 // third-party stderr write here. envLogLevel overrides the minimum slog level.
 const (
-	logDirName  = ".urvi"
-	logFileName = "urvi.log"
-	envLogLevel = "URVI_LOG_LEVEL"
+	logDirName  = ".looprig"
+	logFileName = "looprig.log"
+	envLogLevel = "LOOPRIG_LOG_LEVEL"
 )
 
 // logFilePath resolves the log directory and file path under home, joining with
@@ -74,7 +74,7 @@ func logFilePath(home string) (dir, file string) {
 	return dir, filepath.Join(dir, logFileName)
 }
 
-// openLogFile opens (creating as needed) the append-mode ~/.urvi/urvi.log file.
+// openLogFile opens (creating as needed) the append-mode ~/.looprig/looprig.log file.
 func openLogFile() (*os.File, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
@@ -120,7 +120,7 @@ func Run(ctx context.Context, newAgent func(context.Context) (tui.Agent, error),
 
 	// Open the shared log file and build the injected structured logger up front so
 	// startup and early failures are captured. slog and the later stderr redirect
-	// both write to ~/.urvi/urvi.log. Best-effort: if the file can't be opened the
+	// both write to ~/.looprig/looprig.log. Best-effort: if the file can't be opened the
 	// logger falls back to discarding records (zero-value Config) and the TUI runs.
 	logFile, logErr := openLogFile()
 	logger := logging.New(logging.Config{})
@@ -129,7 +129,7 @@ func Run(ctx context.Context, newAgent func(context.Context) (tui.Agent, error),
 		logger = logging.New(logging.Config{Writer: logFile, Level: lvl})
 		defer func() { _ = logFile.Close() }()
 	}
-	logger.Info("urvi starting", "agent", banner.Name)
+	logger.Info("looprig starting", "agent", banner.Name)
 
 	// open is the OpenAgent thunk: it constructs the initial agent and is reused as
 	// the TUI's /clear reopen thunk, so a /clear builds a fresh agent the same way.

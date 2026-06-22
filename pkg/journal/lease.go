@@ -48,7 +48,7 @@ type ownershipToken interface {
 
 // defaultLeaseBucket is the JetStream KV bucket holding one entry per session,
 // keyed by session id. Single-node embedded server: one replica.
-const defaultLeaseBucket = "urvi_session_leases"
+const defaultLeaseBucket = "looprig_session_leases"
 
 // defaultLeaseTTL is the lease validity window: an entry whose ExpiresAt is older
 // than now (per the injected clock) is treated as expired and eligible for CAS

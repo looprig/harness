@@ -561,8 +561,8 @@ func TestCheckSkippedRecordsWarn(t *testing.T) {
 	}
 }
 
-// TestCheckInRepoApprovalsIgnored proves an in-repo <ws>/.urvi/approvals.json has
-// NO effect — only ~/.urvi/workspaces/<hash>/ is read.
+// TestCheckInRepoApprovalsIgnored proves an in-repo <ws>/.looprig/approvals.json has
+// NO effect — only ~/.looprig/workspaces/<hash>/ is read.
 func TestCheckInRepoApprovalsIgnored(t *testing.T) {
 	t.Parallel()
 	ws := newWS(t)
@@ -570,9 +570,9 @@ func TestCheckInRepoApprovalsIgnored(t *testing.T) {
 		t.Fatalf("write main.go: %v", err)
 	}
 	// Plant a hostile in-repo approvals file granting Bash everything.
-	inRepoDir := filepath.Join(ws, ".urvi")
+	inRepoDir := filepath.Join(ws, ".looprig")
 	if err := os.MkdirAll(inRepoDir, 0o700); err != nil {
-		t.Fatalf("mkdir in-repo .urvi: %v", err)
+		t.Fatalf("mkdir in-repo .looprig: %v", err)
 	}
 	hostile := writeApprovals(t, ApprovalRecord{Tool: "ReadFile", Effect: loop.EffectAutoApprove})
 	if err := os.WriteFile(filepath.Join(inRepoDir, "approvals.json"), hostile, 0o600); err != nil {
@@ -681,7 +681,7 @@ func TestReadGuard(t *testing.T) {
 	pc := NewPermissionChecker(PermissionPolicy{
 		WorkspaceRoot: "/ws",
 		HardDeny: HardDenyRules{
-			DeniedReadPaths: []string{"~/.ssh/**", "**/.env", "**/*.pem", "**/id_rsa", "~/.urvi/**"},
+			DeniedReadPaths: []string{"~/.ssh/**", "**/.env", "**/*.pem", "**/id_rsa", "~/.looprig/**"},
 			MaxReadBytes:    4096,
 		},
 	})
@@ -698,7 +698,7 @@ func TestReadGuard(t *testing.T) {
 		{name: "id_rsa denied", absPath: "/ws/keys/id_rsa", want: true},
 		{name: "home ssh denied", absPath: "/home/tester/.ssh/id_ed25519", want: true},
 		{name: "home ssh nested denied", absPath: "/home/tester/.ssh/config", want: true},
-		{name: "home urvi denied", absPath: "/home/tester/.urvi/approvals.json", want: true},
+		{name: "home urvi denied", absPath: "/home/tester/.looprig/approvals.json", want: true},
 		{name: "ordinary go file allowed", absPath: "/ws/main.go", want: false},
 		{name: "envrc not env", absPath: "/ws/.envrc", want: false},
 		{name: "other home ssh-like not matched", absPath: "/home/other/.ssh/id_rsa", want: true}, // **/id_rsa matches anywhere
@@ -743,7 +743,7 @@ func TestMatchHardDenyAbs(t *testing.T) {
 		{name: "doublestar env at root", pattern: "**/.env", abs: "/ws/.env", want: true},
 		{name: "tilde ssh expands to home", pattern: "~/.ssh/**", abs: "/home/tester/.ssh/id_rsa", want: true},
 		{name: "tilde ssh exact dir not under not matched", pattern: "~/.ssh/**", abs: "/home/tester/.config/id_rsa", want: false},
-		{name: "tilde urvi nested", pattern: "~/.urvi/**", abs: "/home/tester/.urvi/workspaces/x/approvals.json", want: true},
+		{name: "tilde urvi nested", pattern: "~/.looprig/**", abs: "/home/tester/.looprig/workspaces/x/approvals.json", want: true},
 		{name: "pem glob within segment", pattern: "**/*.pem", abs: "/ws/a/cert.pem", want: true},
 		{name: "non-match", pattern: "**/.env", abs: "/ws/.environment", want: false},
 		{name: "id_rsa anywhere", pattern: "**/id_rsa", abs: "/deep/nested/path/id_rsa", want: true},

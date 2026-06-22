@@ -43,7 +43,7 @@ type HardDenyRules struct {
 	DeniedReadPaths []string
 	// DeniedWritePaths globs that WriteFile/EditFile may never write. By
 	// construction this is a superset of DeniedReadPaths plus write-only entries
-	// (VCS/build integrity files and the .urvi policy store).
+	// (VCS/build integrity files and the .looprig policy store).
 	DeniedWritePaths []string
 	// DeniedBashPrefixes normalized command prefixes Bash may never run.
 	DeniedBashPrefixes []string
@@ -92,7 +92,7 @@ type PermissionPolicy struct {
 const defaultMaxReadBytes int64 = 1 << 20
 
 // The default paths a generic file tool may never READ. These are secret-path
-// globs (ssh keys, dotenv, PEM, id_rsa, the .urvi store) PLUS the workspace
+// globs (ssh keys, dotenv, PEM, id_rsa, the .looprig store) PLUS the workspace
 // .skills/ source tree, which is reachable only through the gated Skill tool and
 // must never be slurped by an auto-approved ReadFile/Glob/Grep (P2b §7a/§10).
 // The whole set is also (a subset of) the write-deny set: you may never write
@@ -102,20 +102,20 @@ var defaultDeniedReadPaths = []string{
 	"**/.env",       // dotenv secrets anywhere in the tree
 	"**/*.pem",      // PEM-encoded keys/certs anywhere
 	"**/id_rsa",     // bare SSH private key anywhere
-	"~/.urvi/**",    // the urvi policy/config store (approvals, identity)
+	"~/.looprig/**", // the urvi policy/config store (approvals, identity)
 	"**/.skills/**", // workspace skill source: reachable ONLY via the gated Skill tool, never slurped/written by generic file tools (gate-bypass prevention)
 }
 
 // The write-only additions on top of the read-deny set. These protect VCS and
-// build-integrity files and — security-critically — the .urvi policy store, so
+// build-integrity files and — security-critically — the .looprig policy store, so
 // the tool system can NEVER mutate its own approvals via WriteFile/EditFile.
-// "**/.urvi/**" covers any in-repo .urvi directory; "~/.urvi/**" the user store.
+// "**/.looprig/**" covers any in-repo .looprig directory; "~/.looprig/**" the user store.
 // Only PermissionChecker.Grant may ever write the policy store.
 var defaultDeniedWriteOnlyPaths = []string{
 	"**/.git/config", // git remote/hook config (RCE-via-hook surface)
 	"**/go.sum",      // module checksum integrity
-	"**/.urvi/**",    // in-repo policy store: deny-write (defense in depth)
-	"~/.urvi/**",     // user policy store: deny-write (only Grant writes it)
+	"**/.looprig/**", // in-repo policy store: deny-write (defense in depth)
+	"~/.looprig/**",  // user policy store: deny-write (only Grant writes it)
 }
 
 // The default dangerous Bash command prefixes that may never run.
@@ -128,7 +128,7 @@ var defaultDeniedBashPrefixes = []string{
 
 // DefaultHardDeny returns the fail-secure default HardDenyRules from design §3c.
 // The write-deny set is the read-deny set PLUS the write-only additions (so it
-// is always a superset), guaranteeing the .urvi policy store and every secret
+// is always a superset), guaranteeing the .looprig policy store and every secret
 // glob are deny-write. MaxReadBytes defaults to 1 MiB.
 //
 // Each call returns fresh slices (no shared backing array) so a caller may

@@ -24,13 +24,13 @@ import (
 
 const (
 	// urviDirName is the per-user urvi store directory under the home dir.
-	urviDirName = ".urvi"
+	urviDirName = ".looprig"
 	// workspacesDirName holds one subdirectory per workspace (named by hash).
 	workspacesDirName = "workspaces"
-	// userApprovalsName is the user-global approvals file (~/.urvi/approvals.json).
+	// userApprovalsName is the user-global approvals file (~/.looprig/approvals.json).
 	userApprovalsName = "approvals.json"
 	// workspaceApprovalsName is the per-workspace approvals file
-	// (~/.urvi/workspaces/<hash>/approvals.json).
+	// (~/.looprig/workspaces/<hash>/approvals.json).
 	workspaceApprovalsName = "approvals.json"
 )
 
@@ -54,13 +54,13 @@ func workspaceHash(workspaceRoot string) (string, error) {
 }
 
 // userApprovalsPath returns the path to the user-global approvals file given a
-// resolved home directory: <home>/.urvi/approvals.json.
+// resolved home directory: <home>/.looprig/approvals.json.
 func userApprovalsPath(home string) string {
 	return filepath.Join(home, urviDirName, userApprovalsName)
 }
 
 // workspaceApprovalsPath returns the path to the workspace-scoped approvals file:
-// <home>/.urvi/workspaces/<hash>/approvals.json.
+// <home>/.looprig/workspaces/<hash>/approvals.json.
 func workspaceApprovalsPath(home, hash string) string {
 	return filepath.Join(home, urviDirName, workspacesDirName, hash, workspaceApprovalsName)
 }
@@ -87,7 +87,7 @@ func (e *PolicyPathError) Unwrap() error { return e.Err }
 // security-sensitive, so directories are owner-only and files are owner
 // read/write only — a group/world bit on either is a hardening violation.
 const (
-	// storeDirPerm is the mode for ~/.urvi and ~/.urvi/workspaces/<hash> (owner rwx).
+	// storeDirPerm is the mode for ~/.looprig and ~/.looprig/workspaces/<hash> (owner rwx).
 	storeDirPerm os.FileMode = 0o700
 	// storeFilePerm is the mode for the approvals.json file (owner rw).
 	storeFilePerm os.FileMode = 0o600
@@ -118,7 +118,7 @@ func storeRelSegments(base, full string) ([]string, error) {
 
 // assertNoSymlinkComponent walks every path component from base (inclusive,
 // exclusive of base's own ancestry) down to full and rejects if ANY component is
-// a symlink. It is the §3c "don't follow a symlinked ~/.urvi or workspaces/<hash>"
+// a symlink. It is the §3c "don't follow a symlinked ~/.looprig or workspaces/<hash>"
 // rule, shared by the write path (Grant) and the read path (the loader). base
 // must be an ancestor of full and is assumed trusted (the resolved home dir); it
 // is NOT itself re-checked here (the home dir is the trust anchor). A component
@@ -154,7 +154,7 @@ func assertNoSymlinkComponent(base, full string) error {
 // assertHardenedStorePath is the READ-side store-path hardening walk (§3c). In a
 // SINGLE os.Lstat pass over every component from home (exclusive) down to full it
 // rejects, fail-secure, if ANY component is:
-//   - a symlink (don't follow a symlinked ~/.urvi or workspaces/<hash>); or
+//   - a symlink (don't follow a symlinked ~/.looprig or workspaces/<hash>); or
 //   - a DIRECTORY that is group- or world-writable (mode & 0o022 != 0) — a
 //     non-owner could otherwise have planted/tampered with the approvals.json via
 //     the loose ancestor dir, bypassing the file's own 0600 check.
@@ -199,7 +199,7 @@ func assertHardenedStorePath(home, full string) error {
 // tightens EVERY store-owned component UNDER home to exactly 0700 — not just the
 // leaf. MkdirAll honours the umask (which may have stripped group/other bits) but
 // an EXISTING component keeps its old (possibly group/world-writable) mode, so a
-// pre-existing loose ~/.urvi or ~/.urvi/workspaces would otherwise survive and
+// pre-existing loose ~/.looprig or ~/.looprig/workspaces would otherwise survive and
 // let a non-owner plant a poisoned approvals.json. We therefore chmod each
 // component from the shallowest store dir DOWN to dir. base (the resolved home)
 // is the trust anchor: it (and anything above it) is NEVER chmod-ed. A chmod
