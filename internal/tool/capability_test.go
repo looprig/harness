@@ -3,6 +3,8 @@ package tool
 import (
 	"context"
 	"testing"
+
+	"github.com/inventivepotter/urvi/internal/uuid"
 )
 
 // capableTool implements every optional capability interface, proving each is
@@ -16,11 +18,14 @@ func (capableTool) InvokableRun(ctx context.Context, argsJSON string) (*ToolResu
 }
 func (capableTool) Sequential() bool                    { return true }
 func (capableTool) AuditSummary(argsJSON string) string { return "summary" }
-func (capableTool) BuildRequest(argsJSON string) (PermissionRequest, error) {
+func (capableTool) BuildRequest(argsJSON string, _ PreparedArtifact) (PermissionRequest, error) {
 	return UnknownRequest{Tool: "capable", Summary: "does a thing"}, nil
 }
 func (capableTool) WriteTarget(argsJSON string) (string, bool, error) {
 	return "/tmp/x", true, nil
+}
+func (capableTool) Prepare(ctx context.Context, callID uuid.UUID, argsJSON string) (PreparedArtifact, error) {
+	return TokenArtifact{Token: callID.String()}, nil
 }
 
 // Compile-time assertions: a tool implementing each optional capability is
@@ -31,6 +36,8 @@ var (
 	_ Auditable          = capableTool{}
 	_ PermissionPrompter = capableTool{}
 	_ WriteTarget        = capableTool{}
+	_ Preparer           = capableTool{}
+	_ PreparedArtifact   = TokenArtifact{}
 )
 
 // TestCapabilityInterfaces verifies, via type assertion (the runner's real
@@ -66,6 +73,9 @@ func TestCapabilityInterfaces(t *testing.T) {
 			}
 			if _, ok := tt.tool.(WriteTarget); ok != tt.wantOptionals {
 				t.Errorf("WriteTarget assertion = %v, want %v", ok, tt.wantOptionals)
+			}
+			if _, ok := tt.tool.(Preparer); ok != tt.wantOptionals {
+				t.Errorf("Preparer assertion = %v, want %v", ok, tt.wantOptionals)
 			}
 		})
 	}

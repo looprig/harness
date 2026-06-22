@@ -108,7 +108,7 @@ func (a auditTool) AuditSummary(argsJSON string) string { return a.fakeRunTool.a
 // promptTool adds the PermissionPrompter capability.
 type promptTool struct{ *fakeRunTool }
 
-func (p promptTool) BuildRequest(argsJSON string) (tool.PermissionRequest, error) {
+func (p promptTool) BuildRequest(argsJSON string, _ tool.PreparedArtifact) (tool.PermissionRequest, error) {
 	return p.fakeRunTool.promptFn(argsJSON)
 }
 

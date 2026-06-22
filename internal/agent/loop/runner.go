@@ -39,6 +39,11 @@ const (
 	// opened (a missing ToolExecutionID can't safely route a permission gate), but the model
 	// still sees a paired error result.
 	errIDGenFailure = "error: internal: could not generate call id"
+	// errPreparePrefix is the fail-secure tool-result prefix for a call whose
+	// Preparer.Prepare failed: the call is NOT executed and NO gate is opened (a
+	// failed per-call artifact can't safely gate or run the call), but the model
+	// still sees a paired error result.
+	errPreparePrefix = "error: tool preparation failed: "
 )
 
 // ResultPreview caps. ResultPreview may hold a slice of tool output, so it is
@@ -70,6 +75,12 @@ type resolved struct {
 
 	t       tool.InvokableTool // nil for an unknown tool
 	summary string             // ToolCallStarted.Summary (redacted)
+
+	// prepared is the per-call artifact a Preparer tool produced for THIS call,
+	// computed ONCE in newResolved (after the callID is minted + args validated)
+	// and threaded to BOTH the permission decision (buildRequest) and execution
+	// (the per-call ctx in runOne). nil for non-Preparer tools.
+	prepared tool.PreparedArtifact
 
 	// failed marks a pre-execution failure (unknown tool, invalid args,
 	// permission denied, WriteTarget error). Its result is fixed before any
@@ -179,9 +190,10 @@ type indexedResolved struct {
 }
 
 // newResolved builds the per-call working state: mints a ToolExecutionID via idGen, looks
-// up the tool, validates args JSON, queries WriteTarget, and computes the redacted
-// Summary. Pre-execution failures (id-gen failure, unknown tool, invalid args,
-// WriteTarget error) are recorded here; permission is resolved later (sequentially).
+// up the tool, validates args JSON, runs Preparer.Prepare (once), queries WriteTarget,
+// and computes the redacted Summary. Pre-execution failures (id-gen failure, unknown
+// tool, invalid args, Prepare error, WriteTarget error) are recorded here; permission
+// is resolved later (sequentially).
 //
 // An idGen error is fail-secure: the call is marked failed with errIDGenFailure
 // (so it is NOT executed and NO gate is opened — a missing ToolExecutionID can't safely
@@ -213,6 +225,23 @@ func newResolved(ctx context.Context, c content.ToolUseBlock, ts ToolSet, idGen 
 	if !json.Valid(c.Input) {
 		r.fail(errInvalidArgs)
 		return r
+	}
+
+	// If the tool is a Preparer, compute its per-call artifact ONCE here — after the
+	// callID is minted, the tool resolved, and args validated — bound to the call by
+	// callID. The artifact is threaded to BOTH the permission decision (buildRequest)
+	// and execution (the per-call ctx). A Prepare error is fail-secure: the call is
+	// marked failed (so it is NOT executed and NO gate is opened) and the error is
+	// surfaced as a model-visible tool-result, not swallowed.
+	if p, ok := r.t.(tool.Preparer); ok {
+		prepared, err := p.Prepare(ctx, r.callID, r.argsstr)
+		if err != nil {
+			slog.Warn("loop: tool Prepare failed; failing call fail-secure (not executed, no gate)",
+				"tool", c.Name, "error", err)
+			r.fail(errPreparePrefix + err.Error())
+			return r
+		}
+		r.prepared = prepared
 	}
 
 	if wt, ok := r.t.(tool.WriteTarget); ok {
@@ -300,7 +329,7 @@ func askPermission(
 	gateReg chan<- gateRegistration,
 	emit func(event.Event),
 ) error {
-	req := buildRequest(r.t, r.block.Name, r.summary, r.argsstr)
+	req := buildRequest(r.t, r.block.Name, r.summary, r.argsstr, r.prepared)
 
 	// reply is buffered(1) (runner is the sole reader, so the actor's routed send
 	// never blocks). ack is unbuffered: the actor closes it to signal installation.
@@ -361,10 +390,12 @@ func applyDecision(ctx context.Context, r *resolved, ts ToolSet, cmd command.Com
 
 // buildRequest derives the approval-prompt request: via PermissionPrompter when
 // the tool implements it (falling back to UnknownRequest if BuildRequest errors),
-// else an UnknownRequest carrying the redacted summary (never raw args).
-func buildRequest(t tool.InvokableTool, name, summary, argsJSON string) tool.PermissionRequest {
+// else an UnknownRequest carrying the redacted summary (never raw args). prepared
+// is the per-call Preparer artifact for this call (nil for non-Preparer tools,
+// which ignore it).
+func buildRequest(t tool.InvokableTool, name, summary, argsJSON string, prepared tool.PreparedArtifact) tool.PermissionRequest {
 	if p, ok := t.(tool.PermissionPrompter); ok {
-		if req, err := p.BuildRequest(argsJSON); err == nil && req != nil {
+		if req, err := p.BuildRequest(argsJSON, prepared); err == nil && req != nil {
 			return req
 		}
 	}
@@ -440,9 +471,10 @@ func execute(
 }
 
 // runOne executes a single resolved call: builds the per-call ctx (ToolExecutionID + emit +
-// gateReg injected so the tool can emit / request user input), wraps InvokableRun
-// in the middleware chain (first listed = outermost), recovers a panic into an
-// error result, and normalizes the outcome to a result. It never aborts the batch.
+// gateReg + the per-call Preparer artifact injected so the tool can emit / request
+// user input / read back its prepared artifact), wraps InvokableRun in the middleware
+// chain (first listed = outermost), recovers a panic into an error result, and
+// normalizes the outcome to a result. It never aborts the batch.
 func runOne(
 	ctx context.Context,
 	r *resolved,
@@ -450,7 +482,7 @@ func runOne(
 	gateReg chan<- gateRegistration,
 	emit func(event.Event),
 ) (res result) {
-	ctx2 := withGateReg(withEmit(withCallID(ctx, r.callID), emit), gateReg)
+	ctx2 := withPrepared(withGateReg(withEmit(withCallID(ctx, r.callID), emit), gateReg), r.prepared)
 
 	defer func() {
 		if rec := recover(); rec != nil {

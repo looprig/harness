@@ -257,7 +257,7 @@ func TestFetchBuildRequest(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			req, err := f.BuildRequest(tt.argsJSON)
+			req, err := f.BuildRequest(tt.argsJSON, nil)
 			if (err != nil) != tt.wantErr {
 				t.Fatalf("BuildRequest() error = %v, wantErr %v", err, tt.wantErr)
 			}

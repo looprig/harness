@@ -252,7 +252,7 @@ func TestWriteFileBuildRequest(t *testing.T) {
 	root := t.TempDir()
 	wf := NewWriteFile(root)
 
-	req, err := wf.BuildRequest(`{"path":"sub/x.txt","content":"secret-content-here"}`)
+	req, err := wf.BuildRequest(`{"path":"sub/x.txt","content":"secret-content-here"}`, nil)
 	if err != nil {
 		t.Fatalf("BuildRequest err = %v", err)
 	}
@@ -268,7 +268,7 @@ func TestWriteFileBuildRequest(t *testing.T) {
 		t.Errorf("request Description leaked content: %q", fw.Description())
 	}
 
-	if _, err := wf.BuildRequest(`{"path":"../escape","content":"x"}`); err == nil {
+	if _, err := wf.BuildRequest(`{"path":"../escape","content":"x"}`, nil); err == nil {
 		t.Errorf("BuildRequest(escape) err = nil, want non-nil")
 	}
 }

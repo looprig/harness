@@ -99,7 +99,7 @@ func (e *EditFile) AuditSummary(argsJSON string) string {
 
 // BuildRequest derives the approval prompt (the resolved path only — never the
 // substrings). An unparseable args document or an escaping path is a typed error.
-func (e *EditFile) BuildRequest(argsJSON string) (tool.PermissionRequest, error) {
+func (e *EditFile) BuildRequest(argsJSON string, _ tool.PreparedArtifact) (tool.PermissionRequest, error) {
 	abs, err := e.resolveEditPath(argsJSON)
 	if err != nil {
 		return nil, err

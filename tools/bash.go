@@ -113,7 +113,7 @@ func (b *Bash) AuditSummary(argsJSON string) string {
 // BuildRequest derives the approval prompt: the command string (which doubles as
 // the persisted exact-command Match). An unparseable args document or an empty
 // command is a typed error so the runner treats the call as invalid.
-func (b *Bash) BuildRequest(argsJSON string) (tool.PermissionRequest, error) {
+func (b *Bash) BuildRequest(argsJSON string, _ tool.PreparedArtifact) (tool.PermissionRequest, error) {
 	var a bashArgs
 	if err := json.Unmarshal([]byte(argsJSON), &a); err != nil {
 		return nil, &bashError{reason: "invalid arguments: not a JSON object", cause: err}

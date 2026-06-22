@@ -220,7 +220,7 @@ func TestEditFileWriteTarget(t *testing.T) {
 func TestEditFileBuildRequest(t *testing.T) {
 	t.Parallel()
 	root := t.TempDir()
-	req, err := NewEditFile(root).BuildRequest(`{"path":"x.txt","old":"secret-old","new":"secret-new"}`)
+	req, err := NewEditFile(root).BuildRequest(`{"path":"x.txt","old":"secret-old","new":"secret-new"}`, nil)
 	if err != nil {
 		t.Fatalf("BuildRequest err = %v", err)
 	}

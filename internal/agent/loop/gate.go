@@ -5,6 +5,7 @@ import (
 
 	"github.com/inventivepotter/urvi/internal/agent/loop/command"
 	"github.com/inventivepotter/urvi/internal/agent/loop/event"
+	"github.com/inventivepotter/urvi/internal/tool"
 	"github.com/inventivepotter/urvi/internal/uuid"
 )
 
@@ -62,6 +63,7 @@ func accepts(kind gateKind, cmd command.Command) bool {
 type emitKey struct{}
 type callIDKey struct{}
 type gateRegKey struct{}
+type preparedKey struct{}
 
 // withEmit returns a child ctx carrying the per-turn emit func. The runner injects
 // it per tool call; EmitFromContext / RequestUserInput read it back.
@@ -78,6 +80,14 @@ func withCallID(ctx context.Context, callID uuid.UUID) context.Context {
 // Only the loop wires this; RequestUserInput reads it to open a gateUserInput gate.
 func withGateReg(ctx context.Context, gateReg chan<- gateRegistration) context.Context {
 	return context.WithValue(ctx, gateRegKey{}, gateReg)
+}
+
+// withPrepared returns a child ctx carrying the per-call PreparedArtifact a
+// Preparer tool produced for THIS call. The runner injects it per tool call; the
+// producing tool's InvokableRun reads it back via PreparedFromContext. It is nil
+// for non-Preparer tools, which never look.
+func withPrepared(ctx context.Context, prepared tool.PreparedArtifact) context.Context {
+	return context.WithValue(ctx, preparedKey{}, prepared)
 }
 
 // callIDFromContext reads the active ToolExecutionID, false when absent.
@@ -99,6 +109,17 @@ func gateRegFromContext(ctx context.Context) (chan<- gateRegistration, bool) {
 func EmitFromContext(ctx context.Context) (func(event.Event), bool) {
 	v, ok := ctx.Value(emitKey{}).(func(event.Event))
 	return v, ok
+}
+
+// PreparedFromContext returns the per-call PreparedArtifact the runner injected
+// for THIS call, and false when none is present (a non-Preparer tool, or the tool
+// run outside a turn). It is the sanctioned way for a Preparer tool's InvokableRun
+// to read back the artifact its own Prepare produced, without depending on loop
+// internals. A nil artifact (a Preparer that returned nil, no error) reports ok
+// false — there is nothing to read.
+func PreparedFromContext(ctx context.Context) (tool.PreparedArtifact, bool) {
+	v, ok := ctx.Value(preparedKey{}).(tool.PreparedArtifact)
+	return v, ok && v != nil
 }
 
 // GateContextMissing identifies which injected ctx value RequestUserInput could

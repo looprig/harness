@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 
 	"github.com/inventivepotter/urvi/internal/content"
+	"github.com/inventivepotter/urvi/internal/uuid"
 )
 
 // ToolInfo is a tool's self-description. Schema is a JSON Schema describing the
@@ -63,12 +64,41 @@ type Sequential interface {
 	Sequential() bool
 }
 
+// PreparedArtifact is the opaque, per-call artifact a Preparer produces — read by
+// the producing tool at both BuildRequest and InvokableRun time, opaque to the
+// runner. Sealed via an unexported marker so only deliberate types satisfy it (no
+// bare any): a type in another package cannot supply the unexported method, so it
+// cannot masquerade as a PreparedArtifact. Concrete artifacts therefore live in
+// this package alongside the seal (mirroring PermissionRequest).
+type PreparedArtifact interface{ preparedArtifact() }
+
+// TokenArtifact is the minimal concrete PreparedArtifact: it carries a single
+// opaque Token (e.g. a content hash or a callID-bound nonce) that the producing
+// tool reads at both BuildRequest and InvokableRun time. It is the simplest
+// artifact a Preparer can return when the bound value is a single string; richer
+// Preparers declare their own concrete artifact type in this package.
+type TokenArtifact struct{ Token string }
+
+func (TokenArtifact) preparedArtifact() {}
+
+// Preparer is the optional capability: compute a per-call artifact ONCE (e.g. a
+// TOCTOU-safe snapshot + hash), bound to the call by ToolExecutionID. The runner
+// invokes Prepare right after minting the callID (and validating args) and threads
+// the artifact to BOTH the permission decision (via BuildRequest) and execution
+// (via the per-call ctx). A Prepare error is fail-secure: the call is not executed
+// and no gate is opened.
+type Preparer interface {
+	Prepare(ctx context.Context, callID uuid.UUID, argsJSON string) (PreparedArtifact, error)
+}
+
 // PermissionPrompter is implemented by tools whose execution may require user
 // approval. BuildRequest derives a sealed PermissionRequest from the
 // (untrusted) argsJSON for the approval prompt; it returns an error when the
-// args cannot be parsed into a request.
+// args cannot be parsed into a request. prepared is the per-call artifact a
+// Preparer tool produced for THIS call (nil for non-Preparer tools, which ignore
+// it — behavior identical).
 type PermissionPrompter interface {
-	BuildRequest(argsJSON string) (PermissionRequest, error)
+	BuildRequest(argsJSON string, prepared PreparedArtifact) (PermissionRequest, error)
 }
 
 // Auditable is implemented by tools that can emit a redacted, length-capped

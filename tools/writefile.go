@@ -112,7 +112,7 @@ func (w *WriteFile) AuditSummary(argsJSON string) string {
 // carries only the resolved write path (never the content). An unparseable args
 // document or a path that escapes the workspace is a typed error so the runner
 // treats the call as invalid (and never prompts for an out-of-bounds write).
-func (w *WriteFile) BuildRequest(argsJSON string) (tool.PermissionRequest, error) {
+func (w *WriteFile) BuildRequest(argsJSON string, _ tool.PreparedArtifact) (tool.PermissionRequest, error) {
 	abs, err := w.resolveWritePath(argsJSON)
 	if err != nil {
 		return nil, err

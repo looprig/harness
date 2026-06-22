@@ -147,7 +147,7 @@ func (f *Fetch) AuditSummary(argsJSON string) string {
 // approves the exact target). An unparseable args document, a missing/invalid
 // URL, or an unsupported method is a typed error so the runner treats the call as
 // invalid (and never prompts with a malformed request).
-func (f *Fetch) BuildRequest(argsJSON string) (tool.PermissionRequest, error) {
+func (f *Fetch) BuildRequest(argsJSON string, _ tool.PreparedArtifact) (tool.PermissionRequest, error) {
 	a, method, _, err := parseFetchArgs(argsJSON)
 	if err != nil {
 		return nil, err

@@ -171,7 +171,7 @@ func TestBashWorkdir(t *testing.T) {
 
 func TestBashBuildRequest(t *testing.T) {
 	t.Parallel()
-	req, err := NewBash(t.TempDir()).BuildRequest(`{"command":"go test ./..."}`)
+	req, err := NewBash(t.TempDir()).BuildRequest(`{"command":"go test ./..."}`, nil)
 	if err != nil {
 		t.Fatalf("BuildRequest err = %v", err)
 	}
@@ -182,10 +182,10 @@ func TestBashBuildRequest(t *testing.T) {
 	if br.Command != "go test ./..." {
 		t.Errorf("BashRequest.Command = %q, want %q", br.Command, "go test ./...")
 	}
-	if _, err := NewBash(t.TempDir()).BuildRequest(`{}`); err == nil {
+	if _, err := NewBash(t.TempDir()).BuildRequest(`{}`, nil); err == nil {
 		t.Errorf("BuildRequest(no command) err = nil, want non-nil")
 	}
-	if _, err := NewBash(t.TempDir()).BuildRequest(`not json`); err == nil {
+	if _, err := NewBash(t.TempDir()).BuildRequest(`not json`, nil); err == nil {
 		t.Errorf("BuildRequest(bad json) err = nil, want non-nil")
 	}
 }

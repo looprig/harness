@@ -131,7 +131,7 @@ func TestDuckDuckGoProviderLiveScrape(t *testing.T) {
 func TestWebSearchLiveEndToEnd(t *testing.T) {
 	ws := NewWebSearch(NewDuckDuckGoProvider(tls12Client()))
 
-	req, err := ws.BuildRequest(`{"query":"golang"}`)
+	req, err := ws.BuildRequest(`{"query":"golang"}`, nil)
 	if err != nil {
 		t.Fatalf("BuildRequest() error = %v", err)
 	}

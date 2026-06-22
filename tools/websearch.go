@@ -111,7 +111,7 @@ func (w *WebSearch) AuditSummary(argsJSON string) string {
 // BuildRequest derives the approval prompt: the query string. An unparseable args
 // document or an empty query is a typed error so the runner treats the call as
 // invalid.
-func (w *WebSearch) BuildRequest(argsJSON string) (tool.PermissionRequest, error) {
+func (w *WebSearch) BuildRequest(argsJSON string, _ tool.PreparedArtifact) (tool.PermissionRequest, error) {
 	a, err := parseWebSearchArgs(argsJSON)
 	if err != nil {
 		return nil, err
