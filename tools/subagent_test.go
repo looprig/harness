@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/inventivepotter/urvi/internal/agent/loop"
+	"github.com/inventivepotter/urvi/internal/agent/loop/identity"
 	"github.com/inventivepotter/urvi/internal/tool"
 	"github.com/inventivepotter/urvi/internal/uuid"
 )
@@ -22,19 +23,32 @@ func mustUUID(t *testing.T) uuid.UUID {
 	return id
 }
 
-// subagent_test.go exercises the Subagent tool against a FAKE Spawner (DIP: the
-// tool never touches the real session.Session). The fake records what it was
-// called with so the tests can assert the security-critical invariants:
+// subagent_test.go exercises the agent-aware Subagent tool against a FAKE Spawner
+// (DIP: the tool never touches the real session.Session). The fake records what it
+// was called with so the tests can assert the security-critical invariants:
 //
+//   - the tool forwards the {agent} name (typed identity.AgentName) and {message}
+//     to Spawn,
 //   - the tool reads its OWN provenance from ctx (loop.ProvenanceFrom) and passes
-//     it as the `parent` to Spawn (zero provenance when ctx carries none), and
-//   - the audit summary never leaks the (possibly sensitive) message.
+//     it as the `parent` to Spawn (zero provenance when ctx carries none),
+//   - Info().Desc renders the available-subagents catalog so the model can pick an
+//     agent, and
+//   - the audit summary never leaks the (possibly sensitive) agent name or message.
 //
 // (textOf, the shared *tool.ToolResult → string helper, lives in fetch_test.go.)
 
-// fakeSpawner is a fake Spawner. It records the parent provenance and message it
-// was asked to spawn with, and returns either reply or spawnErr. If echo is set
-// it returns "echo: <message>" instead of reply.
+// testCatalog is a small fixed catalog used to assert the <available_subagents>
+// rendering in Info().Desc.
+func testCatalog() []SubagentCatalogEntry {
+	return []SubagentCatalogEntry{
+		{Name: "operator", Description: "edits files and runs commands"},
+		{Name: "explorer", Description: "searches the workspace"},
+	}
+}
+
+// fakeSpawner is a fake Spawner. It records the parent provenance, agent name, and
+// message it was asked to spawn with, and returns either reply or spawnErr. If echo
+// is set it returns "echo: <agent>: <message>" instead of reply.
 type fakeSpawner struct {
 	mu         sync.Mutex
 	reply      string
@@ -42,20 +56,22 @@ type fakeSpawner struct {
 	spawnErr   error
 	called     bool
 	gotParent  loop.Provenance
+	gotAgent   identity.AgentName
 	gotMessage string
 }
 
-func (f *fakeSpawner) Spawn(_ context.Context, parent loop.Provenance, message string) (string, error) {
+func (f *fakeSpawner) Spawn(_ context.Context, parent loop.Provenance, agent identity.AgentName, message string) (string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.called = true
 	f.gotParent = parent
+	f.gotAgent = agent
 	f.gotMessage = message
 	if f.spawnErr != nil {
 		return "", f.spawnErr
 	}
 	if f.echo {
-		return "echo: " + message, nil
+		return "echo: " + string(agent) + ": " + message, nil
 	}
 	return f.reply, nil
 }
@@ -67,11 +83,12 @@ type stubSpawnError struct{ msg string }
 func (e *stubSpawnError) Error() string { return e.msg }
 
 // TestSubagentInfo asserts the self-description: the name MUST be exactly
-// "Subagent" (the classifyTool/manifest contract), the schema requires "message",
-// and nothing mentions a skill (the skill arg was removed).
+// "Subagent" (the classifyTool/manifest contract), the schema requires BOTH "agent"
+// and "message", and Info().Desc renders the available-subagents catalog so the
+// model knows which agents it may spawn.
 func TestSubagentInfo(t *testing.T) {
 	t.Parallel()
-	s := NewSubagent(&fakeSpawner{})
+	s := NewSubagent(&fakeSpawner{}, testCatalog())
 	info, err := s.Info(context.Background())
 	if err != nil {
 		t.Fatalf("Info() error = %v", err)
@@ -89,26 +106,53 @@ func TestSubagentInfo(t *testing.T) {
 		t.Error("Info().Schema is empty")
 	}
 	schema := string(info.Schema)
+	if !strings.Contains(schema, `"agent"`) {
+		t.Errorf("Info().Schema = %q, want it to require an \"agent\" property", schema)
+	}
 	if !strings.Contains(schema, `"message"`) {
 		t.Errorf("Info().Schema = %q, want it to require a \"message\" property", schema)
 	}
-	if !strings.Contains(schema, `"required"`) || !strings.Contains(schema, `["message"]`) {
-		t.Errorf("Info().Schema = %q, want \"message\" listed in required", schema)
+	if !strings.Contains(schema, `["agent", "message"]`) {
+		t.Errorf("Info().Schema = %q, want \"agent\" and \"message\" listed in required", schema)
 	}
-	if strings.Contains(strings.ToLower(schema), "skill") {
-		t.Errorf("Info().Schema = %q must NOT mention skill (skill arg removed)", schema)
+
+	// The catalog is rendered as an <available_subagents> listing naming each agent.
+	if !strings.Contains(info.Desc, "<available_subagents>") || !strings.Contains(info.Desc, "</available_subagents>") {
+		t.Errorf("Info().Desc = %q, want an <available_subagents> block", info.Desc)
 	}
-	if strings.Contains(strings.ToLower(info.Desc), "skill") {
-		t.Errorf("Info().Desc = %q must NOT mention skill (skill arg removed)", info.Desc)
+	for _, e := range testCatalog() {
+		if !strings.Contains(info.Desc, string(e.Name)) {
+			t.Errorf("Info().Desc = %q, want it to list agent %q", info.Desc, e.Name)
+		}
+		if !strings.Contains(info.Desc, e.Description) {
+			t.Errorf("Info().Desc = %q, want it to list description %q", info.Desc, e.Description)
+		}
 	}
 }
 
-// TestSubagentAuditSummary asserts the audit summary is the constant "Subagent"
-// and NEVER contains the message — the message may carry sensitive context and
+// TestSubagentInfoEmptyCatalog asserts an empty catalog renders only the static
+// prefix (no empty <available_subagents> block) — the boundary case.
+func TestSubagentInfoEmptyCatalog(t *testing.T) {
+	t.Parallel()
+	s := NewSubagent(&fakeSpawner{}, nil)
+	info, err := s.Info(context.Background())
+	if err != nil {
+		t.Fatalf("Info() error = %v", err)
+	}
+	if info.Desc != subagentDescPrefix {
+		t.Errorf("Info().Desc = %q, want the bare prefix %q for an empty catalog", info.Desc, subagentDescPrefix)
+	}
+	if strings.Contains(info.Desc, "<available_subagents>") {
+		t.Errorf("Info().Desc = %q, want NO catalog block for an empty catalog", info.Desc)
+	}
+}
+
+// TestSubagentAuditSummary asserts the audit summary is the constant "Subagent" and
+// NEVER contains the agent name or message — both may carry sensitive context and
 // must not reach the audit event.
 func TestSubagentAuditSummary(t *testing.T) {
 	t.Parallel()
-	s := NewSubagent(&fakeSpawner{})
+	s := NewSubagent(&fakeSpawner{}, testCatalog())
 
 	tests := []struct {
 		name    string
@@ -117,8 +161,13 @@ func TestSubagentAuditSummary(t *testing.T) {
 	}{
 		{
 			name:    "message redacted",
-			args:    `{"message":"my secret password is hunter2"}`,
+			args:    `{"agent":"operator","message":"my secret password is hunter2"}`,
 			notWant: "hunter2",
+		},
+		{
+			name:    "agent name redacted",
+			args:    `{"agent":"super-secret-agent","message":"m"}`,
+			notWant: "super-secret-agent",
 		},
 		{name: "unparsable args", args: `not json`},
 		{name: "empty object", args: `{}`},
@@ -132,15 +181,16 @@ func TestSubagentAuditSummary(t *testing.T) {
 				t.Errorf("AuditSummary() = %q, want %q", got, "Subagent")
 			}
 			if tt.notWant != "" && strings.Contains(got, tt.notWant) {
-				t.Errorf("AuditSummary() = %q leaks message substring %q", got, tt.notWant)
+				t.Errorf("AuditSummary() = %q leaks substring %q", got, tt.notWant)
 			}
 		})
 	}
 }
 
-// TestSubagentRoundTrip asserts the happy path: the tool returns the Spawner's
-// final text, the Spawner saw the message, and it saw the provenance carried in
-// ctx (a wrapped parent vs. the zero/root provenance when ctx has none).
+// TestSubagentRoundTrip asserts the happy path: the tool forwards the {agent} +
+// {message} to the Spawner, returns the Spawner's final text, and passes the
+// provenance carried in ctx (a wrapped parent vs. the zero/root provenance when ctx
+// has none).
 func TestSubagentRoundTrip(t *testing.T) {
 	t.Parallel()
 	parent := loop.Provenance{
@@ -170,17 +220,20 @@ func TestSubagentRoundTrip(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			f := &fakeSpawner{echo: true}
-			s := NewSubagent(f)
+			s := NewSubagent(f, testCatalog())
 
-			res, err := s.InvokableRun(tt.ctx, `{"message":"hello there"}`)
+			res, err := s.InvokableRun(tt.ctx, `{"agent":"operator","message":"hello there"}`)
 			if err != nil {
 				t.Fatalf("InvokableRun() Go error = %v (must be nil; failures are tool-result strings)", err)
 			}
-			if got := textOf(t, res); got != "echo: hello there" {
-				t.Errorf("result = %q, want %q", got, "echo: hello there")
+			if got := textOf(t, res); got != "echo: operator: hello there" {
+				t.Errorf("result = %q, want %q", got, "echo: operator: hello there")
 			}
 			if !f.called {
 				t.Error("Spawn was never called")
+			}
+			if f.gotAgent != identity.AgentName("operator") {
+				t.Errorf("Spawn got agent %q, want %q", f.gotAgent, "operator")
 			}
 			if f.gotMessage != "hello there" {
 				t.Errorf("Spawn got message %q, want %q", f.gotMessage, "hello there")
@@ -192,9 +245,9 @@ func TestSubagentRoundTrip(t *testing.T) {
 	}
 }
 
-// TestSubagentErrors covers the failure paths: a Spawn error, an empty/whitespace
-// message, and unparsable args. Every one is a tool-result error STRING (the Go
-// error from InvokableRun is always nil).
+// TestSubagentErrors covers the failure paths: a Spawn error, a missing/empty agent,
+// a missing/empty message, and unparsable args. Every one is a tool-result error
+// STRING (the Go error from InvokableRun is always nil).
 func TestSubagentErrors(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
@@ -205,12 +258,14 @@ func TestSubagentErrors(t *testing.T) {
 	}{
 		{
 			name:     "spawn error",
-			args:     `{"message":"m"}`,
-			spawnErr: &stubSpawnError{msg: "loop crashed"},
-			wantSub:  "error: subagent failed: loop crashed",
+			args:     `{"agent":"operator","message":"m"}`,
+			spawnErr: &stubSpawnError{msg: "unknown agent"},
+			wantSub:  "error: subagent failed: unknown agent",
 		},
-		{name: "missing message", args: `{}`, wantSub: "error: a non-empty 'message' is required"},
-		{name: "empty message", args: `{"message":"   "}`, wantSub: "error: a non-empty 'message' is required"},
+		{name: "missing agent", args: `{"message":"m"}`, wantSub: "error: a non-empty 'agent' is required"},
+		{name: "empty agent", args: `{"agent":"   ","message":"m"}`, wantSub: "error: a non-empty 'agent' is required"},
+		{name: "missing message", args: `{"agent":"operator"}`, wantSub: "error: a non-empty 'message' is required"},
+		{name: "empty message", args: `{"agent":"operator","message":"   "}`, wantSub: "error: a non-empty 'message' is required"},
 		{name: "unparsable args", args: `not json`, wantSub: "error: invalid arguments: not a JSON object"},
 	}
 	for _, tt := range tests {
@@ -218,7 +273,7 @@ func TestSubagentErrors(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			f := &fakeSpawner{echo: true, spawnErr: tt.spawnErr}
-			s := NewSubagent(f)
+			s := NewSubagent(f, testCatalog())
 
 			res, err := s.InvokableRun(context.Background(), tt.args)
 			if err != nil {
@@ -231,12 +286,12 @@ func TestSubagentErrors(t *testing.T) {
 	}
 }
 
-// TestSubagentCapabilities pins the capability surface: Subagent is an
-// InvokableTool and Auditable, and is deliberately NOT a PermissionPrompter
-// (AutoApprove) and NOT a WriteTarget.
+// TestSubagentCapabilities pins the capability surface: Subagent is an InvokableTool
+// and Auditable, and is deliberately NOT a PermissionPrompter (AutoApprove) and NOT
+// a WriteTarget.
 func TestSubagentCapabilities(t *testing.T) {
 	t.Parallel()
-	var s any = NewSubagent(&fakeSpawner{})
+	var s any = NewSubagent(&fakeSpawner{}, testCatalog())
 	if _, ok := s.(tool.InvokableTool); !ok {
 		t.Error("Subagent is not an InvokableTool")
 	}
@@ -249,4 +304,40 @@ func TestSubagentCapabilities(t *testing.T) {
 	if _, ok := s.(tool.WriteTarget); ok {
 		t.Error("Subagent must NOT be a WriteTarget")
 	}
+}
+
+// FuzzSubagentArgs fuzzes the untrusted argsJSON decoder: InvokableRun parses model
+// output, so it must NEVER panic and must ALWAYS return a nil Go error (every failure
+// is a tool-result string). The fake Spawner echoes, so a well-formed call returns
+// the echo and a malformed one returns an error string — either way, no panic, no Go
+// error.
+func FuzzSubagentArgs(f *testing.F) {
+	seeds := []string{
+		`{"agent":"operator","message":"hello"}`,
+		`{"agent":"","message":"m"}`,
+		`{"agent":"operator","message":""}`,
+		`{"message":"m"}`,
+		`{"agent":"operator"}`,
+		`{}`,
+		`not json`,
+		``,
+		`{"agent":123,"message":true}`,
+		`{"agent":"x","message":"m"}`,
+		`[1,2,3]`,
+		"{\"agent\":\" \",\"message\":\"\uffff\"}",
+		`{"agent":"operator","message":"m","extra":{"nested":[null]}}`,
+	}
+	for _, s := range seeds {
+		f.Add(s)
+	}
+	s := NewSubagent(&fakeSpawner{echo: true}, testCatalog())
+	f.Fuzz(func(t *testing.T, argsJSON string) {
+		res, err := s.InvokableRun(context.Background(), argsJSON)
+		if err != nil {
+			t.Fatalf("InvokableRun() Go error = %v (failures must be tool-result strings, never a Go error)", err)
+		}
+		if res == nil {
+			t.Fatal("InvokableRun() returned a nil result")
+		}
+	})
 }
