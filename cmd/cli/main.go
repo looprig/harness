@@ -6,24 +6,19 @@ package main
 
 import (
 	"context"
-	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
 
-	tea "charm.land/bubbletea/v2"
-
 	"github.com/inventivepotter/urvi/agents/coding"
-	"github.com/inventivepotter/urvi/internal/logging"
+	"github.com/inventivepotter/urvi/internal/cli"
 	"github.com/inventivepotter/urvi/internal/persistence"
 	"github.com/inventivepotter/urvi/internal/registry"
-	"github.com/inventivepotter/urvi/internal/ttylog"
 	"github.com/inventivepotter/urvi/internal/uuid"
 	"github.com/inventivepotter/urvi/tui"
 )
@@ -58,9 +53,6 @@ func agentDisplayName(name string) string {
 	}
 	return name
 }
-
-// closeTimeout bounds the best-effort teardown Close of the current agent.
-const closeTimeout = 5 * time.Second
 
 // listTimeout bounds the --list catalog read.
 const listTimeout = 10 * time.Second
@@ -228,29 +220,6 @@ func buildRegistry() *registry.Registry[tui.Agent] {
 	return reg
 }
 
-// logDirName / logFileName locate urvi's log file under the user's home directory
-// (~/.urvi/urvi.log). Both the structured app logger (slog) and the captured
-// third-party stderr write here. envLogLevel overrides the minimum slog level.
-const (
-	logDirName  = ".urvi"
-	logFileName = "urvi.log"
-	envLogLevel = "URVI_LOG_LEVEL"
-)
-
-// openLogFile opens (creating as needed) the append-mode ~/.urvi/urvi.log file.
-func openLogFile() (*os.File, error) {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return nil, err
-	}
-	dir := filepath.Join(home, logDirName)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return nil, err
-	}
-	// #nosec G304 -- fixed filename under the user's own home directory, not input.
-	return os.OpenFile(filepath.Join(dir, logFileName), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
-}
-
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -262,20 +231,16 @@ func main() {
 	}
 	name := flags.agent
 
-	// Open the shared log file and build the injected structured logger up front so
-	// startup and early failures are captured. slog and the later stderr redirect
-	// both write to ~/.urvi/urvi.log. Best-effort: if the file can't be opened the
-	// logger falls back to discarding records (zero-value Config) and the TUI runs.
-	logFile, logErr := openLogFile()
-	logger := logging.New(logging.Config{})
-	if logErr == nil {
-		lvl, _ := logging.ParseLevel(os.Getenv(envLogLevel))
-		logger = logging.New(logging.Config{Writer: logFile, Level: lvl})
-		defer func() { _ = logFile.Close() }()
-	}
-	logger.Info("urvi starting", "agent", name)
-
 	reg := buildRegistry()
+
+	// Reject an unknown agent at this boundary (where the registry lives) so the
+	// shared runtime never sees it: the persisted coding thunk handles defaultAgent,
+	// and every other name must be a registered agent. This preserves the dedicated
+	// exit code 2 + "available:" hint that the lazy first-open used to surface.
+	if name != defaultAgent && !knownAgent(reg, name) {
+		fmt.Fprintf(os.Stderr, "unknown agent %q; available: %v\n", name, reg.Names())
+		os.Exit(2)
+	}
 
 	// Start the embedded JetStream engine (in-process, no TCP) over the persistent
 	// StoreDir under the user data dir. This is what turns persistence on in the real CLI:
@@ -285,15 +250,12 @@ func main() {
 	// the point) — but only the coding agent is journaled; other agents run unpersisted.
 	engine, persist, perr := startPersistence()
 	if perr != nil {
-		logger.Error("start persistence engine failed", "err", perr.Error())
 		fmt.Fprintln(os.Stderr, "persistence:", perr)
 		os.Exit(1)
 	}
 	defer func() {
 		if engine != nil {
-			if cerr := engine.Close(); cerr != nil {
-				logger.Warn("embedded engine close error", "err", cerr.Error())
-			}
+			_ = engine.Close()
 		}
 	}()
 
@@ -301,7 +263,6 @@ func main() {
 	// only the KV index, so it is cheap even with many sessions.
 	if flags.list {
 		if err := listSessions(ctx, persist, os.Stdout); err != nil {
-			logger.Error("list sessions failed", "err", err.Error())
 			fmt.Fprintln(os.Stderr, "list:", err)
 			os.Exit(1)
 		}
@@ -310,71 +271,20 @@ func main() {
 
 	// open is the OpenAgent thunk: the initial open honors --resume (resume that session),
 	// and every /clear reopen starts a FRESH persisted session. Only the coding agent is
-	// journaled; any other agent falls back to the registry (unpersisted).
+	// journaled; any other agent falls back to the registry (unpersisted). The shared
+	// runtime owns logging, signal-driven shutdown, stdio capture, the TUI program, and
+	// bounded teardown — it takes this thunk as both the initial constructor and the
+	// /clear reopen thunk.
 	open := openThunk(name, reg, persist, flags.resume)
+	os.Exit(cli.Run(ctx, open, cli.Banner{Name: agentDisplayName(name), Description: agentDescription(name)}))
+}
 
-	agent, err := open(ctx)
-	if err != nil {
-		logger.Error("open agent failed", "agent", name, "err", err.Error())
-		var unknown *registry.UnknownNameError
-		if errors.As(err, &unknown) {
-			fmt.Fprintf(os.Stderr, "unknown agent %q; available: %v\n", name, reg.Names())
-			os.Exit(2)
-		}
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
-	}
-
-	// Hand the TUI a dedicated handle to the real terminal, then point the process's
-	// stdout+stderr at the log file. Libraries that log to stdout or stderr — e.g. the
-	// TDX attestation verifier, which calls logger.Init(os.Stdout) at package init —
-	// then land in the log instead of corrupting live scrollback. Best-effort: on
-	// failure the TUI renders to the real stdout as usual. Restored right after Run so
-	// the teardown/error reporting below still reaches the terminal.
-	//
-	// The only program option ever needed is the ttylog redirect (WithOutput). In v2,
-	// scrollback-first = no alt-screen / no mouse is NOT a program option: it is
-	// achieved by screen.View() leaving the returned tea.View's AltScreen false and
-	// MouseMode at MouseModeNone (the v2 zero values), so the program stays on the
-	// normal screen (tea.Println writes to native scrollback) and never grabs the mouse.
-	var progOpts []tea.ProgramOption
-	restoreStdio := func() error { return nil }
-	if logErr == nil {
-		if capture, cerr := ttylog.CaptureStdio(logFile); cerr == nil {
-			progOpts = append(progOpts, tea.WithOutput(capture.TTY))
-			restoreStdio = capture.Restore
+// knownAgent reports whether name is a registered agent in reg.
+func knownAgent(reg *registry.Registry[tui.Agent], name string) bool {
+	for _, n := range reg.Names() {
+		if n == name {
+			return true
 		}
 	}
-
-	screen := tui.New(ctx, agent, open, tui.AgentBanner{Name: agentDisplayName(name), Description: agentDescription(name)})
-	prog := tea.NewProgram(screen, progOpts...)
-
-	// SIGINT/SIGTERM (non-keyboard) cancels ctx → quit the TUI for a clean
-	// teardown; no-op if already quit. defer stop() cancels ctx on return, so
-	// this goroutine is reaped at exit and never leaks.
-	go func() {
-		<-ctx.Done()
-		prog.Quit()
-	}()
-
-	final, runErr := prog.Run()
-	_ = restoreStdio()
-
-	// Backstop bounded Close of the *current* agent (which /clear may have
-	// swapped), even on a Run error: prefer the live agent off the final model,
-	// else fall back to the initial one. Close is idempotent, so the double call
-	// with the TUI's own Ctrl+C teardown is safe. Best-effort on teardown.
-	toClose := agent
-	if s, ok := final.(tui.Screen); ok {
-		toClose = s.Agent()
-	}
-	closeCtx, cancel := context.WithTimeout(context.Background(), closeTimeout)
-	defer cancel()
-	_ = toClose.Close(closeCtx)
-
-	if runErr != nil {
-		logger.Error("tui exited with error", "err", runErr.Error())
-		fmt.Fprintln(os.Stderr, "tui error:", runErr)
-		os.Exit(1)
-	}
+	return false
 }
