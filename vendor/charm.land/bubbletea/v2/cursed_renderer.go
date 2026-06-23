@@ -704,6 +704,18 @@ func (s *cursedRenderer) setWidthMethod(method ansi.Method) {
 }
 
 // insertAbove implements renderer.
+//
+// It pages the input so that every individual insert satisfies
+// offset+h <= termRows, where h is the managed-region height
+// (s.cellbuf.Height()) and termRows is the full terminal height (s.height).
+// This guarantees the CursorUp(offset+h-1) emitted by insertAboveChunk never
+// clamps at the top of the screen, which previously stranded the managed
+// region into scrollback whenever offset+h > termRows.
+//
+// The lock is held across the whole loop: cellbuf/h are stable within the call
+// and insertAboveChunk does NOT take the lock itself. insertAboveChunk resets
+// the cursor via SetPosition(0,0) after each chunk, so every chunk re-enters
+// with y=0.
 func (s *cursedRenderer) insertAbove(str string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -712,6 +724,32 @@ func (s *cursedRenderer) insertAbove(str string) error {
 		return nil
 	}
 
+	w, h, termRows := s.cellbuf.Width(), s.cellbuf.Height(), s.height
+	capRows := termRows - h
+	if capRows < 1 {
+		// Degenerate h>=termRows geometry: fall back to a 1-row transient per
+		// page. A single oversized line still cannot be split (documented
+		// residual); this only bounds the common case.
+		capRows = 1
+	}
+
+	for _, chunk := range pageByOffset(strings.Split(str, "\n"), w, capRows) {
+		if err := s.insertAboveChunk(chunk); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// insertAboveChunk emits the scroll/insert-line/write sequence for a single
+// chunk of already-split logical lines. The caller must hold s.mu; this method
+// does NOT take the lock itself.
+//
+// This is a behavior-preserving extraction of the body of insertAbove (the row
+// model is delegated to chunkOffset so paging stays self-consistent with this
+// path). Task 3 will call it once per page to fix the stranding bug.
+func (s *cursedRenderer) insertAboveChunk(lines []string) error {
 	var sb strings.Builder
 	w, h := s.cellbuf.Width(), s.cellbuf.Height()
 	_, y := s.scr.Position()
@@ -723,14 +761,7 @@ func (s *cursedRenderer) insertAbove(str string) error {
 		sb.WriteString(ansi.CursorDown(down))
 	}
 
-	lines := strings.Split(str, "\n")
-	offset := len(lines)
-	for _, line := range lines {
-		lineWidth := ansi.StringWidth(line)
-		if w > 0 && lineWidth > w {
-			offset += (lineWidth / w)
-		}
-	}
+	offset := chunkOffset(lines, w)
 
 	// Scroll the screen up by the offset to make room for the new lines.
 	sb.WriteString(strings.Repeat("\n", offset))
