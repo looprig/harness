@@ -274,6 +274,12 @@ type transcriptModel struct {
 	// it from scratch. The orchestrator's StepDone reconciles each Subagent block against
 	// it by spawn key. It is cloned on write (value-copy contract).
 	subagentAccum map[spawnKey]*subagentAccumulator
+	// accumOrder is the stable creation order of the subagentAccum keys (appended when an
+	// accumulator is first created in ensureAccum), so pendingSubagentCards renders the
+	// in-flight nested cards deterministically (map iteration order is unspecified). It is
+	// cloned on write (value-copy contract) — appended to a fresh slice, never mutated in
+	// a shared backing array — mirroring the map clone-on-write alongside it.
+	accumOrder []spawnKey
 }
 
 // spawnKey identifies one Subagent tool call's spawn: the parent loop/turn/step
@@ -304,6 +310,13 @@ type subagentAccumulator struct {
 	steps    int            // count of the child's StepDone events
 	status   subStatus      // the child terminal state (running until a terminal arrives)
 	nested   int            // depth-2 collapsed counter (Task 7; zero here)
+	// reconciled marks that the orchestrator's StepDone has copied this accumulator onto
+	// its committed Subagent card (reconcileSubagent). Until then the accumulator is
+	// PENDING — pendingSubagentCards exposes it so the LIVE tail renders the in-flight
+	// nested card; once reconciled the card lives in scrollback and pendingSubagentCards
+	// skips it (no double render). It is set in-place at reconciliation, consistent with
+	// the rest of the accumulator's in-place fill.
+	reconciled bool
 }
 
 // ApplyEvent folds one turn-stream event into the model and returns the next
@@ -999,7 +1012,39 @@ func (m *transcriptModel) reconcileSubagent(ev event.StepDone, use content.ToolU
 	// The done summary is the hand-back text; suppress the card's own result body so it
 	// is not also shown as the normal result preview (design §4: no doubling).
 	card.Result = splitLines(subagentTruncate(toolResultText(results[use.ID])))
+	// Mark the accumulator reconciled (in-place, consistent with the rest of the
+	// accumulator's fill): the card now lives in the committed transcript, so the live
+	// tail must stop rendering it as a pending in-flight card (pendingSubagentCards).
+	acc.reconciled = true
 	return card
+}
+
+// pendingSubagentCards returns, in stable creation order (accumOrder), one ToolCallView
+// per NOT-YET-reconciled accumulator — the in-flight subagent cards the LIVE tail renders
+// WHILE the subagent streams (its ENDURING child events fill the accumulator before the
+// orchestrator's StepDone commits the card). Each card mirrors what reconcileSubagent will
+// later copy onto the committed card (agent/task/children/steps/status/nested), with the
+// children copied so a caller cannot reach the live accumulator's backing slice. A
+// reconciled accumulator (its card already in scrollback) is skipped — no double render —
+// as is a nil entry (defensive). It is DISPLAY-ONLY: it never mutates the model.
+func (m transcriptModel) pendingSubagentCards() []ToolCallView {
+	var out []ToolCallView
+	for _, key := range m.accumOrder {
+		acc := m.subagentAccum[key]
+		if acc == nil || acc.reconciled {
+			continue
+		}
+		out = append(out, ToolCallView{
+			ToolName:  subagentToolName,
+			Agent:     acc.agent,
+			Task:      acc.task,
+			Children:  append([]ToolCallView(nil), acc.children...),
+			Steps:     acc.steps,
+			SubStatus: acc.status,
+			Nested:    acc.nested,
+		})
+	}
+	return out
 }
 
 // subagentToolName is the tool name the orchestrator's StepDone matches to promote a
@@ -1026,6 +1071,10 @@ func (m *transcriptModel) ensureAccum(key spawnKey) *subagentAccumulator {
 	acc := &subagentAccumulator{}
 	next[key] = acc
 	m.subagentAccum = next
+	// Record the key's stable creation order in a CLONED slice (value-copy contract — a
+	// fresh backing array, never an in-place append into a slice a prior model holds), so
+	// pendingSubagentCards renders in-flight cards deterministically.
+	m.accumOrder = append(append([]spawnKey(nil), m.accumOrder...), key)
 	return acc
 }
 

@@ -434,14 +434,19 @@ func (m Screen) View() tea.View {
 }
 
 // renderLiveTail renders the in-progress assistant segment (streamed thinking,
-// narration, and any still-running tool cards) to its display lines. It is empty
-// when there is no live content, so the surface omits the tail region entirely.
+// narration, any still-running tool cards, and any in-flight nested Subagent cards) to
+// its display lines. It is empty when there is no live content AND no pending subagent
+// card, so the surface omits the tail region entirely.
 func (m Screen) renderLiveTail() string {
 	live := m.transcript.live
-	if live.empty() {
+	pending := m.transcript.pendingSubagentCards()
+	if live.empty() && len(pending) == 0 {
 		return ""
 	}
-	return renderLiveAssistant(live.Thinking, live.Text, live.Calls, m.expand, m.width, m.anim)
+	// Suppress the orchestrator's raw running Subagent tool card — its activity is shown
+	// by the nested pending card (renderSubagentCard) instead, so it must not be doubled.
+	calls := nonSubagentCalls(live.Calls)
+	return renderLiveAssistant(live.Thinking, live.Text, calls, pending, m.expand, m.width, m.anim)
 }
 
 // renderQueued renders the transcript's pending queued-input affordances (the

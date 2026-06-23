@@ -291,7 +291,7 @@ func TestSurfaceViewNeverExceedsWidth(t *testing.T) {
 		Status:   ToolOK,
 		Result:   []string{longWord, "ok"},
 	}}
-	tail := renderLiveAssistant("reasoning\n"+longWord, "narration "+longWord, calls, true, 80, animState{})
+	tail := renderLiveAssistant("reasoning\n"+longWord, "narration "+longWord, calls, nil, true, 80, animState{})
 
 	// Widths cover an ample terminal, several shrinking steps (a resize drag), and a
 	// tiny width where the input-box border itself overflowed pre-fix.

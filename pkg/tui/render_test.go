@@ -336,7 +336,7 @@ func TestRenderLiveAssistantCards(t *testing.T) {
 		t.Parallel()
 
 		calls := []ToolCallView{{ToolName: "Bash", Summary: "ls", Status: ToolRunning}}
-		got := stripANSI(renderLiveAssistant("", "checking now", calls, false, 80, a))
+		got := stripANSI(renderLiveAssistant("", "checking now", calls, nil, false, 80, a))
 		for _, w := range []string{"checking now", "Bash", "ls"} {
 			if !strings.Contains(got, w) {
 				t.Errorf("renderLiveAssistant() = %q, want to contain %q", got, w)
@@ -348,13 +348,75 @@ func TestRenderLiveAssistantCards(t *testing.T) {
 		t.Parallel()
 
 		calls := []ToolCallView{{ToolName: "Bash", Status: ToolRunning}}
-		got := stripANSI(renderLiveAssistant("", "", calls, false, 80, a))
+		got := stripANSI(renderLiveAssistant("", "", calls, nil, false, 80, a))
 		for _, w := range []string{strings.TrimSpace(styles.Dot), "Bash"} {
 			if !strings.Contains(got, w) {
 				t.Errorf("renderLiveAssistant() = %q, want to contain %q", got, w)
 			}
 		}
 	})
+}
+
+// TestRenderLiveAssistantSubagentCard (live-tail card path): a pending Subagent card in
+// the live tail renders the SAME nested "● Subagent(<agent>)" card as the committed form
+// (header + ⎿ children + "running · N steps"), and — because the only activity in the
+// step is the spawned subagent (no ordinary calls) — does NOT show a rotating
+// working-word headline.
+func TestRenderLiveAssistantSubagentCard(t *testing.T) {
+	t.Parallel()
+
+	subagentCards := []ToolCallView{{
+		ToolName: "Subagent", Agent: "explorer", Task: "map repo",
+		Children:  []ToolCallView{{ToolName: "Glob", Status: ToolOK}},
+		Steps:     1,
+		SubStatus: subRunning,
+	}}
+	got := stripANSI(renderLiveAssistant("", "", nil, subagentCards, false, 80, animState{}))
+
+	for _, w := range []string{"Subagent(explorer)", "map repo", "Glob", "running" + hintSeparator + "1 step"} {
+		if !strings.Contains(got, w) {
+			t.Errorf("live subagent card = %q, want to contain %q", got, w)
+		}
+	}
+	// No working-word: the step only spawned a subagent, so there is no ordinary
+	// card-only headline.
+	for _, w := range workingWords {
+		if strings.Contains(got, w) {
+			t.Errorf("live subagent card = %q, must NOT show a working-word (%q)", got, w)
+		}
+	}
+}
+
+// TestRenderLiveAssistantSuppressesRawSubagentCall (live-tail suppression): while a
+// subagent streams, the orchestrator's own live tool list carries a raw running
+// "Subagent(Subagent)" tool card. That raw call must be SUPPRESSED in the live tail (it
+// is replaced by the nested pending card), so the tail shows the nested card and not the
+// doubled raw Subagent tool row.
+func TestRenderLiveAssistantSuppressesRawSubagentCall(t *testing.T) {
+	t.Parallel()
+
+	// nonSubagentCalls is what renderLiveTail passes for `calls`: the raw Subagent call is
+	// filtered out before reaching renderLiveAssistant.
+	rawCalls := []ToolCallView{{ToolName: "Subagent", Summary: "Subagent", Status: ToolRunning}}
+	filtered := nonSubagentCalls(rawCalls)
+	if len(filtered) != 0 {
+		t.Fatalf("nonSubagentCalls dropped %d of %d raw Subagent calls, want all filtered", len(rawCalls)-len(filtered), len(rawCalls))
+	}
+
+	pending := []ToolCallView{{
+		ToolName: "Subagent", Agent: "explorer", Task: "map repo",
+		Children:  []ToolCallView{{ToolName: "Glob", Status: ToolOK}},
+		Steps:     1,
+		SubStatus: subRunning,
+	}}
+	got := stripANSI(renderLiveAssistant("", "", filtered, pending, false, 80, animState{}))
+
+	if strings.Contains(got, "Subagent(Subagent)") {
+		t.Errorf("live tail shows the raw Subagent(Subagent) tool card; want it suppressed: %q", got)
+	}
+	if !strings.Contains(got, "Subagent(explorer)") {
+		t.Errorf("live tail missing the nested Subagent(explorer) card: %q", got)
+	}
 }
 
 // TestRenderLiveRunningCardIsHeaderOnly locks the live→committed handoff fix
@@ -375,7 +437,7 @@ func TestRenderLiveRunningCardIsHeaderOnly(t *testing.T) {
 		t.Parallel()
 
 		calls := []ToolCallView{{ToolName: "Fetch", Summary: "GET weather.com", Status: ToolRunning}}
-		got := stripANSI(renderLiveAssistant("", "", calls, true, 80, a))
+		got := stripANSI(renderLiveAssistant("", "", calls, nil, true, 80, a))
 		// The bare bullet (●/◦) is its own line; the running card is exactly one more.
 		lines := strings.Split(got, "\n")
 		if len(lines) != 2 {
@@ -400,7 +462,7 @@ func TestRenderLiveRunningCardIsHeaderOnly(t *testing.T) {
 		calls := []ToolCallView{{
 			ToolName: "Bash", Summary: "ls", Status: ToolOK, Result: []string{"file-a", "file-b"},
 		}}
-		got := stripANSI(renderLiveAssistant("", "", calls, true, 80, a))
+		got := stripANSI(renderLiveAssistant("", "", calls, nil, true, 80, a))
 		for _, w := range []string{"Bash", "ls", "file-a", "file-b"} {
 			if !strings.Contains(got, w) {
 				t.Errorf("resolved live card = %q, want to contain %q", got, w)
@@ -796,7 +858,7 @@ func TestRenderLiveAssistantWorkingWord(t *testing.T) {
 
 	calls := []ToolCallView{{ToolName: "Bash", Status: ToolRunning}}
 	for _, frame := range []uint{0, 1, 5} {
-		got := stripANSI(renderLiveAssistant("", "", calls, false, 80, animState{frame: frame}))
+		got := stripANSI(renderLiveAssistant("", "", calls, nil, false, 80, animState{frame: frame}))
 		headline := got
 		if i := strings.IndexByte(got, '\n'); i >= 0 {
 			headline = got[:i] // the headline is the first line; cards follow below

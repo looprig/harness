@@ -182,8 +182,8 @@ func TestRenderLiveAssistantBlink(t *testing.T) {
 
 	const text = "working on it"
 
-	lit := renderLiveAssistant("", text, nil, false, 80, animState{blink: false})
-	dim := renderLiveAssistant("", text, nil, false, 80, animState{blink: true})
+	lit := renderLiveAssistant("", text, nil, nil, false, 80, animState{blink: false})
+	dim := renderLiveAssistant("", text, nil, nil, false, 80, animState{blink: true})
 
 	if lit == dim {
 		t.Fatalf("live assistant identical across blink phases (%q); the live dot must blink", stripANSI(lit))
@@ -211,7 +211,7 @@ func TestRenderLiveAssistantSpinner(t *testing.T) {
 
 		calls := []ToolCallView{{ToolName: "Bash", Summary: "ls", Status: ToolRunning}}
 		for _, frame := range []uint{0, 1, 5} {
-			got := stripANSI(renderLiveAssistant("", "checking", calls, false, 80, animState{frame: frame}))
+			got := stripANSI(renderLiveAssistant("", "checking", calls, nil, false, 80, animState{frame: frame}))
 			if !strings.Contains(got, spinnerGlyph(frame)) {
 				t.Errorf("frame %d: live render %q missing spinner glyph %q", frame, got, spinnerGlyph(frame))
 			}
@@ -226,7 +226,7 @@ func TestRenderLiveAssistantSpinner(t *testing.T) {
 		t.Parallel()
 
 		calls := []ToolCallView{{ToolName: "Bash", Summary: "ls", Status: ToolOK, Result: []string{"a.go"}}}
-		got := stripANSI(renderLiveAssistant("", "done", calls, false, 80, animState{frame: 3}))
+		got := stripANSI(renderLiveAssistant("", "done", calls, nil, false, 80, animState{frame: 3}))
 		if !strings.Contains(got, glyphOK) {
 			t.Errorf("resolved card live render %q missing static OK glyph %q", got, glyphOK)
 		}
@@ -239,8 +239,8 @@ func TestRenderLiveAssistantSpinner(t *testing.T) {
 		t.Parallel()
 
 		calls := []ToolCallView{{ToolName: "Bash", Status: ToolRunning}}
-		lit := stripANSI(renderLiveAssistant("", "", calls, false, 80, animState{blink: false}))
-		dim := stripANSI(renderLiveAssistant("", "", calls, false, 80, animState{blink: true, frame: 1}))
+		lit := stripANSI(renderLiveAssistant("", "", calls, nil, false, 80, animState{blink: false}))
+		dim := stripANSI(renderLiveAssistant("", "", calls, nil, false, 80, animState{blink: true, frame: 1}))
 		if lit == dim {
 			t.Errorf("card-only live segment identical across blink phases (%q); the bare bullet must blink", lit)
 		}

@@ -2481,3 +2481,73 @@ func TestSubagentInterruption(t *testing.T) {
 		t.Errorf("rendered card = %q, must NOT show a summary for an interrupted child", rendered)
 	}
 }
+
+// TestPendingSubagentCards (live-tail card path): WHILE a subagent streams — its
+// accumulator filled by ENDURING child events but the orchestrator's StepDone NOT yet
+// seen — pendingSubagentCards exposes the in-flight card so the live tail can render the
+// SAME nested card it will later commit. Once the orchestrator's StepDone reconciles the
+// accumulator into the committed card, the accumulator is marked reconciled and drops out
+// of pendingSubagentCards (it moved to scrollback — no double render).
+func TestPendingSubagentCards(t *testing.T) {
+	t.Parallel()
+
+	primary := callID(0xA1)
+	sub := callID(0xB2)
+	turn := callID(0xC3)
+	step := callID(0xD4)
+
+	m := transcriptModel{primaryLoopID: primary}
+	m = m.ApplyEvent(childLoopStarted(sub, "explorer", primary, turn, step, "toolu_X"))
+	m = m.ApplyEvent(childTurnStarted(sub, "map repo"))
+	m = m.ApplyEvent(stepDoneFrom(sub,
+		aiMessage("", "", toolUse("c-grep", "Grep", `{"q":"foo"}`)),
+		toolResult("c-grep", "grep hit"),
+	))
+
+	// In-flight: the orchestrator's StepDone has NOT arrived, so the card is pending.
+	pending := m.pendingSubagentCards()
+	if len(pending) != 1 {
+		t.Fatalf("pendingSubagentCards() = %d, want 1 in-flight card", len(pending))
+	}
+	c := pending[0]
+	if c.ToolName != subagentToolName {
+		t.Errorf("pending card.ToolName = %q, want %q", c.ToolName, subagentToolName)
+	}
+	if c.Agent != "explorer" {
+		t.Errorf("pending card.Agent = %q, want explorer", c.Agent)
+	}
+	if c.Task != "map repo" {
+		t.Errorf("pending card.Task = %q, want %q", c.Task, "map repo")
+	}
+	if len(c.Children) != 1 {
+		t.Fatalf("pending card.Children = %d, want 1 (Grep); %+v", len(c.Children), c.Children)
+	}
+	if c.Children[0].ToolName != "Grep" {
+		t.Errorf("pending child.ToolName = %q, want Grep", c.Children[0].ToolName)
+	}
+	if c.Steps != 1 {
+		t.Errorf("pending card.Steps = %d, want 1", c.Steps)
+	}
+	if c.SubStatus != subRunning {
+		t.Errorf("pending card.SubStatus = %v, want subRunning", c.SubStatus)
+	}
+
+	// Reconcile: the orchestrator's StepDone moves the card to the committed transcript and
+	// marks the accumulator reconciled — it drops out of the pending set.
+	m = m.ApplyEvent(orchestratorStepDone(primary, turn, step,
+		aiMessage("", "", toolUse("toolu_X", "Subagent", `{"agent":"explorer","message":"map repo"}`)),
+		toolResult("toolu_X", "result text"),
+	))
+
+	key := spawnKey{primary, turn, step, "toolu_X"}
+	acc, ok := m.subagentAccum[key]
+	if !ok {
+		t.Fatalf("no accumulator for key %+v after reconcile", key)
+	}
+	if !acc.reconciled {
+		t.Errorf("accumulator.reconciled = false after orchestrator StepDone, want true")
+	}
+	if got := m.pendingSubagentCards(); len(got) != 0 {
+		t.Errorf("pendingSubagentCards() = %d after reconcile, want 0 (moved to committed card); %+v", len(got), got)
+	}
+}

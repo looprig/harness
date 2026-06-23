@@ -394,13 +394,38 @@ func plural(n int, unit string) string {
 	return strconv.Itoa(n) + " " + unit + "s"
 }
 
+// nonSubagentCalls returns the calls that are NOT raw Subagent tool cards (ToolName ==
+// subagentToolName). The LIVE tail suppresses the orchestrator's own raw Subagent running
+// card (a generic "Subagent(Subagent)" row) because that activity is shown by the nested
+// pending Subagent card instead (pendingSubagentCards → renderSubagentCard); rendering
+// both would double it. It returns nil when every call is a Subagent call (so the
+// working-word headline path is also suppressed for a subagent-only step). The result is a
+// fresh slice; the input is not mutated.
+func nonSubagentCalls(calls []ToolCallView) []ToolCallView {
+	var out []ToolCallView
+	for _, c := range calls {
+		if c.ToolName == subagentToolName {
+			continue
+		}
+		out = append(out, c)
+	}
+	return out
+}
+
 // renderLiveAssistant renders the in-progress (live) assistant segment with the
 // animation state threaded in: the leading bullet blinks (liveDot) and a still-running
 // tool card's glyph cycles through the spinner (spinnerGlyph), while resolved cards
 // keep their static ✓/✗. It mirrors renderAssistant's ordering (thinking → narration
 // → cards) but is the LIVE path ONLY — the committed renderAssistant stays static and
 // is never given an anim. Empty parts are omitted.
-func renderLiveAssistant(thinking, text string, calls []ToolCallView, expand bool, width int, a animState) string {
+//
+// calls is the NON-Subagent live tool list (the caller filters the raw Subagent call out
+// via nonSubagentCalls); subagentCards are the in-flight nested Subagent cards
+// (pendingSubagentCards), each rendered as its own "●"-level card (renderSubagentCard)
+// below the ordinary calls, separated by a blank line. The working-word headline shows
+// ONLY when there is no narration AND at least one ORDINARY call (len(calls) > 0) — a step
+// that only spawned subagents does NOT show "◦ Whirring", its activity is the nested card.
+func renderLiveAssistant(thinking, text string, calls, subagentCards []ToolCallView, expand bool, width int, a animState) string {
 	var b strings.Builder
 
 	if t := renderThinking(thinking, expand, width); t != "" {
@@ -411,7 +436,8 @@ func renderLiveAssistant(thinking, text string, calls []ToolCallView, expand boo
 	if body == "" && len(calls) > 0 {
 		// Live empty-text tool step: a rotating working-word beside the blinking dot —
 		// the provisional, pre-StepDone counterpart of the committed promoted-tool /
-		// "Multiple actions" headline. The word may rotate while the step runs.
+		// "Multiple actions" headline. The word may rotate while the step runs. It is
+		// keyed on the NON-Subagent calls, so a subagent-only step shows no working-word.
 		body = strings.TrimRight(liveDot(a.blink), " ") + " " + styles.HeadlineStyle.Render(workingWord(a.frame))
 	}
 	if body != "" {
@@ -429,6 +455,15 @@ func renderLiveAssistant(thinking, text string, calls []ToolCallView, expand boo
 		// so the live→committed handoff is a one-line→full-card continuation, not a
 		// multi-line live shrink (see renderToolCard).
 		b.WriteString(renderToolCallsGlyph(calls, expand, width, liveToolGlyph(a.frame), true))
+	}
+
+	// Each pending subagent card is its OWN "●"-level card (like the committed form),
+	// separated by a blank line from whatever precedes it.
+	for i := range subagentCards {
+		if b.Len() > 0 {
+			b.WriteString("\n\n")
+		}
+		b.WriteString(renderSubagentCard(subagentCards[i], expand, width))
 	}
 	return b.String()
 }
