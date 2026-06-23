@@ -2045,3 +2045,198 @@ func TestSubagentEmptyParentToolUseIDFallback(t *testing.T) {
 		t.Errorf("fallback line = {Agent:%q Verb:%q}, want {explorer done}", e.Agent, e.Verb)
 	}
 }
+
+// committedHeadlines returns every committed kindAssistant entry's headline (Task 7
+// topology assertions).
+func committedHeadlines(m transcriptModel) []string {
+	var out []string
+	for _, e := range m.committed {
+		if e.Kind == kindAssistant {
+			out = append(out, e.headline)
+		}
+	}
+	return out
+}
+
+// TestSubagentAllSubagentStepNoUmbrella (Task 7 / design §5): a step whose tool-uses are
+// ALL Subagent (and no narration) commits NO "Multiple actions" umbrella — the named
+// "●" Subagent cards stack directly. Reuses the concurrent two-subagent setup.
+func TestSubagentAllSubagentStepNoUmbrella(t *testing.T) {
+	t.Parallel()
+
+	primary := callID(0xA1)
+	subA := callID(0xB2)
+	subB := callID(0xB3)
+	turn := callID(0xC3)
+	step := callID(0xD4)
+
+	m := transcriptModel{primaryLoopID: primary}
+	m = m.ApplyEvent(childLoopStarted(subA, "explorer", primary, turn, step, "toolu_A"))
+	m = m.ApplyEvent(childTurnStarted(subA, "task A"))
+	m = m.ApplyEvent(stepDoneFrom(subA, aiMessage("", "", toolUse("a-grep", "Grep", `{}`)), toolResult("a-grep", "A hit")))
+	m = m.ApplyEvent(event.TurnDone{Header: event.Header{Coordinates: identity.Coordinates{LoopID: subA}}})
+	m = m.ApplyEvent(childLoopStarted(subB, "builder", primary, turn, step, "toolu_B"))
+	m = m.ApplyEvent(childTurnStarted(subB, "task B"))
+	m = m.ApplyEvent(stepDoneFrom(subB, aiMessage("", "", toolUse("b-read", "Read", `{}`)), toolResult("b-read", "B content")))
+	m = m.ApplyEvent(event.TurnDone{Header: event.Header{Coordinates: identity.Coordinates{LoopID: subB}}})
+
+	m = m.ApplyEvent(orchestratorStepDone(primary, turn, step,
+		aiMessage("", "",
+			toolUse("toolu_A", "Subagent", `{"agent":"explorer"}`),
+			toolUse("toolu_B", "Subagent", `{"agent":"builder"}`),
+		),
+		toolResult("toolu_A", "A done"),
+		toolResult("toolu_B", "B done"),
+	))
+
+	for _, h := range committedHeadlines(m) {
+		if h == multipleActionsHeadline {
+			t.Errorf("all-subagent step committed a %q umbrella, want none; committed=%+v", multipleActionsHeadline, m.committed)
+		}
+	}
+	// Two Subagent cards committed as their own kindTool entries, neither promoted (each
+	// renders as a "●" Subagent card via Agent != "").
+	subCards := 0
+	for _, e := range m.committed {
+		if e.Kind != kindTool {
+			continue
+		}
+		for _, c := range e.Calls {
+			if c.Agent != "" {
+				subCards++
+				if e.promoted {
+					t.Errorf("Subagent card entry marked promoted; want a plain Subagent-card entry: %+v", e)
+				}
+			}
+		}
+	}
+	if subCards != 2 {
+		t.Fatalf("committed %d Subagent cards, want 2; committed=%+v", subCards, m.committed)
+	}
+}
+
+// TestSubagentMixedStepTopology (Task 7 / design §5): a mixed step — narration + an
+// ordinary Bash tool + a Subagent call — commits the narration as the "●" assistant
+// bullet, the Bash as an ordinary (non-promoted) "⎿" card, and the Subagent as its OWN
+// "●" card. No "Multiple actions" umbrella (there IS narration).
+func TestSubagentMixedStepTopology(t *testing.T) {
+	t.Parallel()
+
+	primary := callID(0xA1)
+	sub := callID(0xB2)
+	turn := callID(0xC3)
+	step := callID(0xD4)
+
+	m := transcriptModel{primaryLoopID: primary}
+	m = m.ApplyEvent(childLoopStarted(sub, "explorer", primary, turn, step, "toolu_X"))
+	m = m.ApplyEvent(childTurnStarted(sub, "investigate"))
+	m = m.ApplyEvent(stepDoneFrom(sub, aiMessage("", "", toolUse("c-grep", "Grep", `{}`)), toolResult("c-grep", "child hit")))
+	m = m.ApplyEvent(event.TurnDone{Header: event.Header{Coordinates: identity.Coordinates{LoopID: sub}}})
+
+	m = m.ApplyEvent(orchestratorStepDone(primary, turn, step,
+		aiMessage("", "looking into it",
+			toolUse("p-bash", "Bash", `{"command":"ls"}`),
+			toolUse("toolu_X", "Subagent", `{"agent":"explorer"}`),
+		),
+		toolResult("p-bash", "parent bash out"),
+		toolResult("toolu_X", "subagent summary"),
+	))
+
+	// Narration bullet, no umbrella.
+	sawNarration := false
+	for _, e := range m.committed {
+		if e.Kind == kindAssistant {
+			if e.headline == multipleActionsHeadline {
+				t.Errorf("mixed step committed a %q umbrella, want none", multipleActionsHeadline)
+			}
+			if textOnly(e.Blocks) == "looking into it" {
+				sawNarration = true
+			}
+		}
+	}
+	if !sawNarration {
+		t.Errorf("mixed step did not commit the narration bullet; committed=%+v", m.committed)
+	}
+
+	// The ordinary Bash card: a non-promoted kindTool with no Agent.
+	sawBash, sawSub := false, false
+	for _, e := range m.committed {
+		if e.Kind != kindTool {
+			continue
+		}
+		for _, c := range e.Calls {
+			switch {
+			case c.Agent != "":
+				sawSub = true
+				if e.promoted {
+					t.Errorf("Subagent card entry marked promoted: %+v", e)
+				}
+			case c.ToolName == "Bash":
+				sawBash = true
+				if e.promoted {
+					t.Errorf("ordinary Bash card promoted in a mixed step: %+v", e)
+				}
+			}
+		}
+	}
+	if !sawBash {
+		t.Errorf("mixed step missing the ordinary Bash ⎿ card; committed=%+v", m.committed)
+	}
+	if !sawSub {
+		t.Errorf("mixed step missing the Subagent ● card; committed=%+v", m.committed)
+	}
+}
+
+// TestSubagentDepth2Nested (Task 7 / design §6): a depth-2 StepDone (a sub-subagent
+// spawned by the depth-1 subagent) does NOT render its own card — it increments the
+// depth-1 card's Nested counter, attributed by walking the LoopStarted.Cause.LoopID
+// ancestry up to the depth-1 loop (the one whose parent is the primary and which has a
+// non-empty ParentToolUseID).
+func TestSubagentDepth2Nested(t *testing.T) {
+	t.Parallel()
+
+	primary := callID(0xA1)
+	depth1 := callID(0xB2)
+	depth2 := callID(0xB3)
+	turn := callID(0xC3)
+	step := callID(0xD4)
+	d1turn := callID(0xE5)
+	d1step := callID(0xF6)
+
+	m := transcriptModel{primaryLoopID: primary}
+	// depth-1: spawned by the primary via toolu_X.
+	m = m.ApplyEvent(childLoopStarted(depth1, "explorer", primary, turn, step, "toolu_X"))
+	m = m.ApplyEvent(childTurnStarted(depth1, "map repo"))
+	// depth-1 runs a step that itself spawns depth-2 (the Subagent tool-use), and the
+	// depth-1 StepDone carries that step's coordinates (d1turn/d1step) on its header.
+	m = m.ApplyEvent(event.StepDone{
+		Header:   event.Header{Coordinates: identity.Coordinates{LoopID: depth1, TurnID: d1turn, StepID: d1step}},
+		Messages: content.AgenticMessages{aiMessage("", "", toolUse("toolu_Y", "Subagent", `{"agent":"deep"}`)), toolResult("toolu_Y", "spawned deep")},
+	})
+	// depth-2: spawned by depth-1 via toolu_Y (Cause points at the depth-1 loop/turn/step).
+	m = m.ApplyEvent(childLoopStarted(depth2, "deep", depth1, d1turn, d1step, "toolu_Y"))
+	m = m.ApplyEvent(childTurnStarted(depth2, "deep task"))
+	// A depth-2 StepDone — must NOT render its own card; bumps the depth-1 Nested.
+	m = m.ApplyEvent(stepDoneFrom(depth2, aiMessage("", "", toolUse("d-grep", "Grep", `{}`)), toolResult("d-grep", "deep hit")))
+	m = m.ApplyEvent(event.TurnDone{Header: event.Header{Coordinates: identity.Coordinates{LoopID: depth2}}})
+	m = m.ApplyEvent(event.TurnDone{Header: event.Header{Coordinates: identity.Coordinates{LoopID: depth1}}})
+
+	// The orchestrator hands depth-1 back.
+	m = m.ApplyEvent(orchestratorStepDone(primary, turn, step,
+		aiMessage("", "", toolUse("toolu_X", "Subagent", `{"agent":"explorer"}`)),
+		toolResult("toolu_X", "explorer summary"),
+	))
+
+	card := findSubagentCard(t, m)
+	if card.Nested != 1 {
+		t.Errorf("depth-1 card.Nested = %d, want 1 (one depth-2 StepDone, attributed by ancestry walk)", card.Nested)
+	}
+	// The depth-2 StepDone must NOT have produced its OWN nested child on the depth-1
+	// card (it is collapsed into the counter, not rendered as a child tool card). The
+	// depth-1 card's own step (the Subagent spawn) IS a child; the depth-2 Grep is not.
+	for _, c := range card.Children {
+		if c.ToolName == "Grep" {
+			t.Errorf("depth-2 Grep leaked into the depth-1 card children, want it collapsed into Nested: %+v", card.Children)
+		}
+	}
+}

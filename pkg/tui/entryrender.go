@@ -26,6 +26,11 @@ func renderEntry(e entry, expand bool, width int) []string {
 	case kindAssistant:
 		return splitNonEmpty(renderAssistant(thinkingText(e.Blocks), assistantText(e.Blocks), e.headline, expand, width))
 	case kindTool:
+		// A reconciled Subagent card (Agent set) renders as its OWN "●"-level card with
+		// "⎿" children and a done line (design §5), never as an ordinary "⎿" card.
+		if len(e.Calls) == 1 && e.Calls[0].Agent != "" {
+			return splitNonEmpty(renderSubagentCard(e.Calls[0], expand, width))
+		}
 		if e.promoted && len(e.Calls) == 1 {
 			return splitNonEmpty(renderPromotedTool(e.Calls[0], expand, width))
 		}

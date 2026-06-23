@@ -308,6 +308,88 @@ func renderPromotedTool(c ToolCallView, expand bool, width int) string {
 	return strings.Join(lines, "\n")
 }
 
+// subagentTerminalVerb maps a child loop's terminal status to its done-line verb
+// (design §4): subDone→"done", subFailed→"failed", subInterrupted→"interrupted". An
+// outstanding child (subRunning, the zero value) reads "running" — a defensive label
+// for a card committed before its terminal (a card normally commits only after the
+// child has handed back, so this is the rare in-flight case).
+func subagentTerminalVerb(s subStatus) string {
+	switch s {
+	case subDone:
+		return "done"
+	case subFailed:
+		return "failed"
+	case subInterrupted:
+		return "interrupted"
+	default:
+		return "running"
+	}
+}
+
+// renderSubagentCard renders a committed Subagent card (design §5/§4): a "●"-level
+// header "Subagent(<agent>)  \"<task>\"" beside the lit dot, the subagent's nested tool
+// calls as ordinary "⎿" cards ONE indent level under the header (never "⎿ ⎿"), then a
+// final "⎿ <verb> · N steps — \"<summary>\"" line whose verb comes from SubStatus and
+// whose summary is the card's own (suppressed-elsewhere) Result — so the hand-back text
+// shows ONLY here, never doubled as a normal result body. A subInterrupted card omits
+// the summary; subFailed shows its error text. When Nested > 0 a trailing
+// "⎿ +M nested subagent steps" line collapses the depth-2 activity (design §6). expand
+// drives the child cards' result-preview fold.
+func renderSubagentCard(c ToolCallView, expand bool, width int) string {
+	head := strings.TrimRight(styles.LitDot, " ") + " " +
+		styles.HeadlineStyle.Render(subagentHeaderText(c))
+	lines := make([]string, 0, len(c.Children)+3)
+	lines = append(lines, head)
+
+	// Children render as the existing "⎿" tool cards, one indent level under the header.
+	if body := renderToolCalls(c.Children, expand, width); body != "" {
+		lines = append(lines, body)
+	}
+
+	// The done/failed/interrupted child carries the step count and (for done/failed) the
+	// summary — the ONLY place the hand-back text appears (no doubling).
+	lines = append(lines, subagentDoneLine(c, width))
+
+	if c.Nested > 0 {
+		nested := cardIndent + styles.ToolCallStyle.Render(
+			cardConnector+"+"+strconv.Itoa(c.Nested)+" nested subagent steps")
+		lines = append(lines, nested)
+	}
+	return strings.Join(lines, "\n")
+}
+
+// subagentHeaderText assembles a Subagent card's header body: the standard tool-card
+// form "Subagent(<agent>)" (tool name + the agent as its argument) plus the truncated
+// task in quotes when present. The task quotes are omitted for an empty task.
+func subagentHeaderText(c ToolCallView) string {
+	head := c.ToolName + "(" + c.Agent + ")"
+	if c.Task != "" {
+		head += `  "` + c.Task + `"`
+	}
+	return head
+}
+
+// subagentDoneLine builds the Subagent card's terminal "⎿" child: "<verb> · N steps"
+// from SubStatus + Steps, plus the truncated summary (the card's own Result, the
+// suppressed hand-back text) appended as `— "<summary>"` for done/failed. An
+// interrupted child omits the summary (design §4). It is width-wrapped like a card body.
+func subagentDoneLine(c ToolCallView, width int) string {
+	line := subagentTerminalVerb(c.SubStatus) + hintSeparator + pluralSteps(c.Steps)
+	if summary := strings.Join(c.Result, " "); summary != "" && c.SubStatus != subInterrupted {
+		line += " — " + `"` + summary + `"`
+	}
+	return cardIndent + styles.ToolCallStyle.Render(cardConnector+line)
+}
+
+// pluralSteps renders a step count with grammatical agreement: "1 step" (singular) for
+// n == 1, "N steps" (plural) otherwise. Used by the Subagent done line.
+func pluralSteps(n int) string {
+	if n == 1 {
+		return "1 step"
+	}
+	return strconv.Itoa(n) + " steps"
+}
+
 // renderLiveAssistant renders the in-progress (live) assistant segment with the
 // animation state threaded in: the leading bullet blinks (liveDot) and a still-running
 // tool card's glyph cycles through the spinner (spinnerGlyph), while resolved cards

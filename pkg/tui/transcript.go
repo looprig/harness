@@ -815,14 +815,25 @@ func (m *transcriptModel) stepDone(ev event.StepDone) {
 	ai, results := splitStepGroup(ev.Messages)
 	uses := toolUsesOf(ai)
 	cards := make([]ToolCallView, len(uses))
+	ordinary := 0 // cards that render as ordinary "⎿" cards (NOT promoted Subagent "●" cards)
 	for i := range uses {
 		cards[i] = m.stepToolCard(uses[i], results, i)
 		cards[i] = m.reconcileSubagent(ev, uses[i], results, cards[i])
+		if cards[i].Agent == "" {
+			ordinary++
+		}
 	}
-	m.commitStepAssistant(ai, len(cards))
-	promotedSingle := ai != nil && textOnly(ai.Blocks) == "" && len(cards) == 1
+	// Topology (design §5): a reconciled Subagent card (Agent set) is ALWAYS its own
+	// "●"-level card — never an indented "⎿" card and never under a "Multiple actions"
+	// umbrella — so the umbrella / single-promotion decisions count ONLY the ordinary
+	// cards. An all-Subagent empty-text step therefore commits no umbrella; its named
+	// cards stack directly.
+	m.commitStepAssistant(ai, ordinary)
+	promotedSingle := ai != nil && textOnly(ai.Blocks) == "" && ordinary == 1
 	for i := range cards {
-		m.commitCall(cards[i], promotedSingle)
+		// A Subagent card never promotes-to-the-bullet via renderPromotedTool: it renders
+		// as its OWN "●" Subagent card (renderSubagentCard, keyed on Agent != "").
+		m.commitCall(cards[i], promotedSingle && cards[i].Agent == "")
 	}
 	// SNAP: drop the provisional live for this step; active stays so the turn's next
 	// step (or its terminal) is still seen as in-progress.
@@ -895,8 +906,20 @@ func (m *transcriptModel) subagentTask(loopID uuid.UUID, msg *content.UserMessag
 // cards live on the accumulator until the orchestrator's StepDone reconciles them onto
 // the parent Subagent card. loopID is known to be a recorded child (the caller checked
 // loopParent).
+//
+// A DEPTH-2 (or deeper) loop's StepDone is NOT folded as a child card (design §6):
+// instead it increments the DEPTH-1 ancestor card's collapsed Nested counter, found by
+// walking the spawn-parent chain up to the loop whose parent is the primary. A depth-1
+// loop's own StepDone (its spawn parent IS the primary) folds children normally.
 func (m *transcriptModel) subagentStep(ev event.StepDone) {
 	key := m.loopParent[ev.LoopID]
+	if key.parentLoopID != m.primaryLoopID {
+		// Depth ≥ 2: collapse into the depth-1 ancestor's Nested counter, never a card.
+		if d1, ok := m.depth1Key(ev.LoopID); ok {
+			m.ensureAccum(d1).nested++
+		}
+		return
+	}
 	ai, results := splitStepGroup(ev.Messages)
 	uses := toolUsesOf(ai)
 	acc := m.ensureAccum(key)
@@ -904,6 +927,28 @@ func (m *transcriptModel) subagentStep(ev event.StepDone) {
 		acc.children = append(acc.children, storedStepToolCard(uses[i], results))
 	}
 	acc.steps++
+}
+
+// depth1Key walks the spawn-parent chain from loopID up to the DEPTH-1 loop — the one
+// whose spawn parent is the primary loop — and returns that loop's spawn key (design
+// §6: attribute a deeper StepDone to the right depth-1 card by ancestry, not the spawn
+// id). It follows each loop's recorded spawnKey.parentLoopID; the chain ends at the loop
+// whose parent is m.primaryLoopID. It returns false if the chain breaks before reaching
+// a primary-parented loop (an orphaned/unknown ancestor — fail-safe, no counter bump). A
+// guard caps the walk at the number of known child loops so a malformed cycle cannot
+// spin.
+func (m transcriptModel) depth1Key(loopID uuid.UUID) (spawnKey, bool) {
+	for i := 0; i <= len(m.loopParent); i++ {
+		key, ok := m.loopParent[loopID]
+		if !ok {
+			return spawnKey{}, false
+		}
+		if key.parentLoopID == m.primaryLoopID {
+			return key, true
+		}
+		loopID = key.parentLoopID
+	}
+	return spawnKey{}, false
 }
 
 // subagentTerminal records a child loop's terminal status on its accumulator and
@@ -1011,12 +1056,15 @@ const subagentLineCap = 80
 // commitStepAssistant commits the AIMessage's prose / headline as one kindAssistant
 // entry. A nil AIMessage commits nothing. It commits the thinking rail (if any) and
 // the narration (if any); when there is NO narration it sets a bullet headline only
-// for an empty-text step that ran MORE than one tool ("Multiple actions") — a
+// for an empty-text step that ran MORE than one ORDINARY tool ("Multiple actions") — a
 // single-tool empty-text step commits no umbrella here (its one card is promoted to
-// the bullet by stepDone). So a thinking-only message renders just the rail, a
-// single-tool empty-text step with no thinking commits nothing here at all, and a
-// multi-tool empty-text step gets the "● Multiple actions" umbrella.
-func (m *transcriptModel) commitStepAssistant(ai *content.AIMessage, cardCount int) {
+// the bullet by stepDone). ordinaryCards is the count of cards that render as ordinary
+// "⎿" cards — reconciled Subagent cards are EXCLUDED (each is its own "●" card, design
+// §5), so an all-Subagent empty-text step has ordinaryCards == 0 and commits no
+// umbrella. So a thinking-only message renders just the rail, a single-ordinary-tool
+// empty-text step with no thinking commits nothing here at all, and a
+// multi-ordinary-tool empty-text step gets the "● Multiple actions" umbrella.
+func (m *transcriptModel) commitStepAssistant(ai *content.AIMessage, ordinaryCards int) {
 	if ai == nil {
 		return
 	}
@@ -1029,7 +1077,7 @@ func (m *transcriptModel) commitStepAssistant(ai *content.AIMessage, cardCount i
 		blocks = append(blocks, &content.TextBlock{Text: text})
 	}
 	headline := ""
-	if text == "" && cardCount > 1 {
+	if text == "" && ordinaryCards > 1 {
 		headline = multipleActionsHeadline
 	}
 	if len(blocks) == 0 && headline == "" {

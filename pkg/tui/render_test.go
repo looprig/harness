@@ -658,6 +658,134 @@ func TestRenderEntryHeadline(t *testing.T) {
 	}
 }
 
+// TestRenderEntrySubagentCard covers the committed Subagent card render (design §5/§4):
+// a kindTool entry whose ToolCallView has Agent set renders as a "●"-level card
+// "Subagent(<agent>)  \"<task>\"" with its children as "⎿" rows and a final
+// "⎿ done · N steps — \"<summary>\"" line. The card's own Result (the done summary)
+// must appear ONLY in that done child, never also as a separate result body (no
+// doubling). The "+M nested subagent steps" line shows only when Nested > 0.
+func TestRenderEntrySubagentCard(t *testing.T) {
+	t.Parallel()
+
+	e := entry{
+		Kind: kindTool,
+		Calls: []ToolCallView{{
+			ToolName:  "Subagent",
+			Agent:     "explorer",
+			Task:      "map repo",
+			Steps:     6,
+			SubStatus: subDone,
+			Result:    []string{"found 12 packages"},
+			Children: []ToolCallView{
+				{ToolName: "Grep", Status: ToolOK, Result: []string{"hit"}},
+				{ToolName: "Read", Status: ToolOK, Result: []string{"contents"}},
+			},
+		}},
+	}
+	got := stripANSI(strings.Join(renderEntry(e, false, 100), "\n"))
+
+	// Header: the "●" bullet, the standard tool-card "Subagent(explorer)" form, and the
+	// task in quotes.
+	for _, w := range []string{strings.TrimSpace(styles.Dot), "Subagent(explorer)", `"map repo"`} {
+		if !strings.Contains(got, w) {
+			t.Errorf("subagent card = %q, want %q", got, w)
+		}
+	}
+	// Two child cards under the header, each at the ⎿ level.
+	if !strings.Contains(got, "Grep") || !strings.Contains(got, "Read") {
+		t.Errorf("subagent card = %q, want the Grep and Read child rows", got)
+	}
+	// The done child: verb + step count + summary.
+	for _, w := range []string{"done", "6 steps", "found 12 packages"} {
+		if !strings.Contains(got, w) {
+			t.Errorf("subagent card = %q, want the done child %q", got, w)
+		}
+	}
+	// No doubling: "found 12 packages" appears exactly once (only in the done child),
+	// not also as a separate result-preview body.
+	if n := strings.Count(got, "found 12 packages"); n != 1 {
+		t.Errorf("subagent card = %q, summary appears %d times, want exactly 1 (no doubling)", got, n)
+	}
+	// Never a doubled "⎿ ⎿" connector — children are ONE indent level under the header.
+	if strings.Contains(got, cardConnector+cardConnector) {
+		t.Errorf("subagent card = %q, must NOT nest ⎿ under ⎿", got)
+	}
+	// Nested == 0 → no nested-steps line.
+	if strings.Contains(got, "nested subagent steps") {
+		t.Errorf("subagent card = %q, must NOT show the nested line when Nested==0", got)
+	}
+}
+
+// TestRenderEntrySubagentCardTerminals covers the done-line verb per SubStatus and the
+// nested-steps line: failed shows the error text, interrupted omits the summary, and a
+// positive Nested adds the "+M nested subagent steps" line.
+func TestRenderEntrySubagentCardTerminals(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		status subStatus
+		result []string
+		nested int
+		want   []string
+		absent []string
+	}{
+		{
+			name:   "done shows the summary",
+			status: subDone,
+			result: []string{"all good"},
+			want:   []string{"done", "all good"},
+		},
+		{
+			name:   "failed shows the error text",
+			status: subFailed,
+			result: []string{"boom: it broke"},
+			want:   []string{"failed", "boom: it broke"},
+			absent: []string{"done"},
+		},
+		{
+			name:   "interrupted omits the summary",
+			status: subInterrupted,
+			result: []string{"ignored summary"},
+			want:   []string{"interrupted"},
+			absent: []string{"ignored summary"},
+		},
+		{
+			name:   "nested counter shows when positive",
+			status: subDone,
+			result: []string{"ok"},
+			nested: 3,
+			want:   []string{"+3 nested subagent steps"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			e := entry{Kind: kindTool, Calls: []ToolCallView{{
+				ToolName:  "Subagent",
+				Agent:     "explorer",
+				Task:      "task",
+				Steps:     2,
+				SubStatus: tt.status,
+				Result:    tt.result,
+				Nested:    tt.nested,
+			}}}
+			got := stripANSI(strings.Join(renderEntry(e, false, 100), "\n"))
+			for _, w := range tt.want {
+				if !strings.Contains(got, w) {
+					t.Errorf("subagent card (%s) = %q, want %q", tt.name, got, w)
+				}
+			}
+			for _, a := range tt.absent {
+				if strings.Contains(got, a) {
+					t.Errorf("subagent card (%s) = %q, must NOT contain %q", tt.name, got, a)
+				}
+			}
+		})
+	}
+}
+
 // TestRenderLiveAssistantWorkingWord covers the LIVE empty-text tool step (design §3
 // rule 4): a card-only live segment renders a working-word from workingWords beside the
 // blinking dot — a live "doing work" affordance — rather than a bare bullet. The
