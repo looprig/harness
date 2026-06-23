@@ -115,6 +115,10 @@ func surfaceView(in surfaceInputs) string {
 		rows = append(rows, "", status)
 	}
 	rows = appendNonEmpty(rows, tip)
+	// Width MUST be clamped before height: clampSurfaceWidth truncates (never wraps), so
+	// every logical line is exactly one physical row before clampSurfaceHeight counts
+	// lines. Reversing the order would let a wide line wrap onto an extra physical row
+	// after the height count, reintroducing the very row-count desync these guards prevent.
 	return clampSurfaceHeight(clampSurfaceWidth(strings.Join(rows, "\n"), in.Width), in.Height)
 }
 
@@ -136,9 +140,12 @@ func surfaceView(in surfaceInputs) string {
 // It drops from the TOP (keeping the bottom-most height lines) to MATCH the renderer's
 // own over-tall-frame handling (cursed_renderer.go keeps the bottom s.height lines when
 // frameHeight > s.height) AND to preserve the most important chrome: the bottom box,
-// status, and tip always stay; only the live tail's oldest rows (already committed to
-// scrollback) are shed first. A non-positive height is a degenerate terminal (no
-// managed region) — the surface is dropped to the empty string.
+// status, and tip stay visible longest. In the common case it sheds the live tail's
+// oldest rows first (already committed to scrollback, so nothing is lost). When the
+// terminal is small enough that even the chrome overflows, chrome rows are shed from the
+// top too — unavoidable at that size, and consistent with the renderer's own over-tall
+// handling. A non-positive height is a degenerate terminal (no managed region) — the
+// surface is dropped to the empty string.
 func clampSurfaceHeight(surface string, height int) string {
 	if height <= 0 {
 		return ""
