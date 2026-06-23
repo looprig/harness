@@ -17,20 +17,34 @@ const (
 	boxBorderH = 2 // the bottom box's top + bottom frame rows (a prompt box's border; the minimal composer has none, so this over-reserves harmlessly in compose mode)
 )
 
-// liveTailCap is the number of rows the live tail may occupy: the terminal height
-// less the status line, the rows reserved below the tail (reservedH = the slash
-// panel + the queued-input affordance, 0 when both hidden) and the bottom box
-// (box frame + contentH). contentH is the composer height in compose/answer mode or
-// the prompt-control height in prompt mode. The result is floored at 0 and is never
-// negative — when the chrome alone fills the terminal the tail vanishes (its rows are
-// already committed to scrollback at the next boundary).
+// liveTailCap is the number of rows the live tail may occupy. It starts from the free
+// space — the terminal height less the status line, the rows reserved below the tail
+// (reservedH = the slash panel + the queued-input affordance, 0 when both hidden) and the
+// bottom box (box frame + contentH; contentH is the composer height in compose/answer mode
+// or the prompt-control height in prompt mode) — and then reserves HALF of it as commit
+// headroom. The result is floored at 0 and is never negative.
+//
+// The halving is the fix for the "input box stranded / repainted twice" bug, not a cosmetic
+// cap. The live tail is part of the bubbletea inline renderer's managed region of height h.
+// At a step boundary the WHOLE tail commits to native scrollback in one tea.Println, which
+// the renderer performs with insertAbove (cursed_renderer.go): it scrolls to the bottom and
+// moves the cursor up `offset + h - 1` rows, where offset is the committed payload height.
+// That cursor-up only lands correctly while `offset + h <= term`; past that it clamps at the
+// top of the screen and the InsertLine writes at the wrong row, leaving the previous managed
+// region (input box, status, permission prompt) behind in scrollback. Because the committed
+// payload ≈ the tail height (offset ≈ tail) and the surface is tail + chrome, the strand-free
+// condition `offset + h <= term` becomes `2*tail + chrome <= term` — i.e. the tail may use at
+// most HALF the free space, the other half being the headroom insertAbove needs. Capping each
+// render section (thinking/cards/children) alone could not guarantee this: it bounded the
+// pieces but left liveTailCap itself handing out the entire free space, so a busy step still
+// grew the managed region to the full terminal. See TestLiveTailCapReservesCommitHeadroom.
 func liveTailCap(term, statusH, reservedH, contentH int) int {
 	bottomH := boxBorderH + contentH
-	capacity := term - statusH - reservedH - bottomH
-	if capacity < 0 {
+	free := term - statusH - reservedH - bottomH
+	if free <= 0 {
 		return 0
 	}
-	return capacity
+	return free / 2
 }
 
 // surfaceInputs is the synthetic, agent-free snapshot surfaceView composes from:

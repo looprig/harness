@@ -13,9 +13,10 @@ import (
 	"github.com/ciram-co/looprig/pkg/tui/styles"
 )
 
-// TestLiveTailCap covers the pure active-surface budget: the live tail gets the
-// terminal height minus the status line, the slash panel (when visible), and the
-// bottom box (box frame + content; no separator row). It is floored at 0 and never
+// TestLiveTailCap covers the pure active-surface budget: from the free space (terminal
+// height minus the status line, the slash panel when visible, and the bottom box frame +
+// content; no separator row) the tail gets HALF, the other half reserved as commit headroom
+// (see liveTailCap and TestLiveTailCapReservesCommitHeadroom). It is floored at 0, never
 // negative.
 func TestLiveTailCap(t *testing.T) {
 	t.Parallel()
@@ -25,12 +26,14 @@ func TestLiveTailCap(t *testing.T) {
 		term, statusH, slashH, contentH int
 		want                            int
 	}{
-		{name: "ample room", term: 40, statusH: 1, slashH: 0, contentH: 1, want: 36},
-		// bottomH = box frame(2) + content(1) = 3; 40 - 1 - 0 - 3 = 36 (no separator row)
-		{name: "with slash panel", term: 40, statusH: 1, slashH: 3, contentH: 1, want: 33},
-		{name: "grown composer shrinks tail", term: 40, statusH: 1, slashH: 0, contentH: 10, want: 27},
+		{name: "ample room", term: 40, statusH: 1, slashH: 0, contentH: 1, want: 18},
+		// bottomH = box frame(2) + content(1) = 3; free = 40 - 1 - 0 - 3 = 36; tail = 36/2 = 18
+		{name: "with slash panel", term: 40, statusH: 1, slashH: 3, contentH: 1, want: 16},
+		// free = 40 - 1 - 3 - 3 = 33; tail = 33/2 = 16
+		{name: "grown composer shrinks tail", term: 40, statusH: 1, slashH: 0, contentH: 10, want: 13},
+		// bottomH = 12; free = 40 - 1 - 0 - 12 = 27; tail = 27/2 = 13
 		{name: "exact fit floors at zero", term: 4, statusH: 1, slashH: 0, contentH: 1, want: 0},
-		// bottomH = 3; 4 - 1 - 0 - 3 = 0
+		// bottomH = 3; free = 4 - 1 - 0 - 3 = 0
 		{name: "overflow floored at zero never negative", term: 3, statusH: 1, slashH: 0, contentH: 1, want: 0},
 		{name: "tiny terminal floored at zero", term: 0, statusH: 1, slashH: 0, contentH: 1, want: 0},
 	}
@@ -48,6 +51,33 @@ func TestLiveTailCap(t *testing.T) {
 				t.Errorf("liveTailCap returned negative %d", got)
 			}
 		})
+	}
+}
+
+// TestLiveTailCapReservesCommitHeadroom is the root-cause guard for the "input box
+// stranded / repainted twice" bug. The bubbletea inline renderer commits history to native
+// scrollback with insertAbove (cursed_renderer.go), whose cursor math `up = offset + h - 1`
+// only lands correctly when the managed region h plus the committed payload offset fit the
+// terminal: offset + h <= term. The WHOLE live tail commits as one tea.Println at a step
+// boundary (printPayload flattens it), so offset ≈ the tail height — the tail must leave room
+// for an equal-sized commit on top of the surface it's part of: 2*cap + chrome <= term. A
+// liveTailCap that hands out the full free space (term - chrome) violates this and strands.
+func TestLiveTailCapReservesCommitHeadroom(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct{ term, statusH, reservedH, contentH int }{
+		{term: 40, statusH: 3, reservedH: 0, contentH: 1},
+		{term: 24, statusH: 3, reservedH: 0, contentH: 1},
+		{term: 50, statusH: 3, reservedH: 2, contentH: 4},
+		{term: 80, statusH: 3, reservedH: 0, contentH: 1},
+	}
+	for _, c := range cases {
+		capacity := liveTailCap(c.term, c.statusH, c.reservedH, c.contentH)
+		chrome := c.statusH + c.reservedH + boxBorderH + c.contentH
+		if 2*capacity+chrome > c.term {
+			t.Errorf("liveTailCap(%d,%d,%d,%d)=%d: 2*cap+chrome=%d exceeds term=%d — no commit headroom, insertAbove strands the input box",
+				c.term, c.statusH, c.reservedH, c.contentH, capacity, 2*capacity+chrome, c.term)
+		}
 	}
 }
 
