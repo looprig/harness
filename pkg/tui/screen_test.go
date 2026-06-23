@@ -1020,12 +1020,11 @@ func TestCtrlTTogglesExpandGlobally(t *testing.T) {
 	}
 }
 
-// TestCtrlTFlipsLiveTailRendering pins that ctrl+t actually changes what the live
-// tail renders, not just a bool. A fresh Screen renders thinking + tool output
-// EXPANDED by default (full "│ " thinking body + full tool result, no collapse
-// hints); the first ctrl+t collapses both (compact "thinking · N lines" summary +
-// "… N more lines" tool fold); the second restores the full rendering.
-func TestCtrlTFlipsLiveTailRendering(t *testing.T) {
+// TestCtrlTFlipsThinkingNotToolOutputInLiveTail pins that ctrl+t flips the live tail's
+// THINKING block (full "│ " body ↔ compact "thinking · N lines" summary), while the
+// tool-result preview stays HARD-capped to previewLineCap lines in BOTH states — the
+// ctrl+t fold no longer un-caps tool output (so a huge result can't fill the live tail).
+func TestCtrlTFlipsThinkingNotToolOutputInLiveTail(t *testing.T) {
 	t.Parallel()
 
 	agent := &fakeAgent{}
@@ -1033,7 +1032,7 @@ func TestCtrlTFlipsLiveTailRendering(t *testing.T) {
 	m, _ = updateScreen(t, m, tea.WindowSizeMsg{Width: 80, Height: 40})
 
 	// A live segment with multi-line thinking AND a completed tool card whose result
-	// exceeds previewLineCap, so both folds are observable.
+	// exceeds previewLineCap, so the thinking fold flips and the tool cap is observable.
 	resultLines := make([]string, 0, previewLineCap+3)
 	for i := 0; i < previewLineCap+3; i++ {
 		resultLines = append(resultLines, "result-line-"+strconv.Itoa(i))
@@ -1050,42 +1049,43 @@ func TestCtrlTFlipsLiveTailRendering(t *testing.T) {
 		active: true,
 	}
 
-	expandedHas := "first reasoning line" // full thinking body line (expanded only)
-	expandedTail := "result-line-" + strconv.Itoa(previewLineCap+2)
-	collapsedHints := []string{"more lines", "thinking" + hintSeparator}
+	thinkingBody := "first reasoning line"                            // full thinking body line (expanded only)
+	cappedTailLine := "result-line-" + strconv.Itoa(previewLineCap+2) // a tool line past the cap (never shown)
 
-	// Default: expanded — full thinking body + full tool result, NO collapse hints.
+	capped := func(out string) bool { // tool result is hard-capped: more-marker present, past-cap line absent
+		return strings.Contains(out, "more lines") && !strings.Contains(out, cappedTailLine)
+	}
+
+	// Default: thinking expanded (full "│ " body); tool output ALREADY hard-capped.
 	def := stripANSI(m.renderLiveTail())
-	if !strings.Contains(def, expandedHas) {
-		t.Errorf("default live tail missing full thinking body %q; got %q", expandedHas, def)
+	if !strings.Contains(def, thinkingBody) {
+		t.Errorf("default live tail missing full thinking body %q; got %q", thinkingBody, def)
 	}
-	if !strings.Contains(def, expandedTail) {
-		t.Errorf("default live tail missing tail tool result %q; got %q", expandedTail, def)
-	}
-	if strings.Contains(def, "more lines") {
-		t.Errorf("default live tail shows the collapsed tool fold; want full result; got %q", def)
+	if !capped(def) {
+		t.Errorf("default live tail tool result not hard-capped; got %q", def)
 	}
 
-	// First ctrl+t: collapsed — compact thinking summary + folded tool result.
+	// First ctrl+t: thinking collapses to its compact summary; tool output UNCHANGED (capped).
 	m, _ = updateScreen(t, m, tea.KeyPressMsg{Code: 't', Mod: tea.ModCtrl})
 	col := stripANSI(m.renderLiveTail())
-	for _, h := range collapsedHints {
-		if !strings.Contains(col, h) {
-			t.Errorf("collapsed live tail missing %q; got %q", h, col)
-		}
+	if !strings.Contains(col, "thinking"+hintSeparator) {
+		t.Errorf("collapsed live tail missing the compact thinking summary; got %q", col)
 	}
-	if strings.Contains(col, expandedTail) {
-		t.Errorf("collapsed live tail still shows tail tool result %q; want folded; got %q", expandedTail, col)
+	if strings.Contains(col, thinkingBody) {
+		t.Errorf("collapsed live tail still shows the full thinking body; got %q", col)
+	}
+	if !capped(col) {
+		t.Errorf("tool result must stay hard-capped after ctrl+t; got %q", col)
 	}
 
-	// Second ctrl+t: expanded again.
+	// Second ctrl+t: thinking expands again; tool output STILL capped.
 	m, _ = updateScreen(t, m, tea.KeyPressMsg{Code: 't', Mod: tea.ModCtrl})
 	exp := stripANSI(m.renderLiveTail())
-	if !strings.Contains(exp, expandedHas) || !strings.Contains(exp, expandedTail) {
-		t.Errorf("re-expanded live tail missing full content; got %q", exp)
+	if !strings.Contains(exp, thinkingBody) {
+		t.Errorf("re-expanded live tail missing full thinking body; got %q", exp)
 	}
-	if strings.Contains(exp, "more lines") {
-		t.Errorf("re-expanded live tail still shows collapsed fold; got %q", exp)
+	if !capped(exp) {
+		t.Errorf("tool result must stay hard-capped after second ctrl+t; got %q", exp)
 	}
 }
 

@@ -161,28 +161,28 @@ func TestRenderToolCalls(t *testing.T) {
 			want:  []string{glyphCancelled},
 		},
 		{
-			name:        "collapsed shows first K lines and a more-marker",
+			name:        "result over the cap is trimmed with a more-marker (no ctrl+t)",
 			calls:       []ToolCallView{{ToolName: "ReadFile", Status: ToolOK, Result: makeLines(10)}},
 			expandTools: false,
 			width:       80,
-			// K = 6 → lines 0..5 shown, lines 6..9 hidden, "4 more" marker.
-			want:   []string{"line0", "line5", "4 more lines", "ctrl+t"},
-			absent: []string{"line6", "line9"},
+			// HARD cap = previewLineCap (3) → lines 0..2 shown, 3..9 hidden, "7 more" marker.
+			want:   []string{"line0", "line2", "7 more lines"},
+			absent: []string{"line3", "line9", "ctrl+t"},
 		},
 		{
-			name:        "expanded shows all lines and no marker",
+			name:        "expanded still hard-caps the tool result (ignores expand)",
 			calls:       []ToolCallView{{ToolName: "ReadFile", Status: ToolOK, Result: makeLines(10)}},
 			expandTools: true,
 			width:       80,
-			want:        []string{"line0", "line6", "line9"},
-			absent:      []string{"more lines"},
+			want:        []string{"line0", "line2", "7 more lines"},
+			absent:      []string{"line3", "line9"},
 		},
 		{
-			name:        "exactly K lines shows all with no marker",
+			name:        "exactly cap lines shows all with no marker",
 			calls:       []ToolCallView{{ToolName: "ReadFile", Status: ToolOK, Result: makeLines(previewLineCap)}},
 			expandTools: false,
 			width:       80,
-			want:        []string{"line0", "line5"},
+			want:        []string{"line0"},
 			absent:      []string{"more lines"},
 		},
 		{
@@ -588,22 +588,22 @@ func TestRenderThinkingExpandedRailOnEveryLine(t *testing.T) {
 // folded (first K lines + "more lines" marker). Expanded (expand=true): the full
 // "│ "-prefixed thinking body renders AND the tool result shows every line. The
 // SAME flag flips both — there is no separate thinking key.
-func TestRenderAssistantUnifiedExpand(t *testing.T) {
+func TestExpandFoldsThinkingNotToolOutput(t *testing.T) {
 	t.Parallel()
 
 	const thinking = "reason one\nreason two\nreason three"
 	calls := []ToolCallView{{ToolName: "ReadFile", Status: ToolOK, Result: makeLines(10)}}
 
-	// The thinking fold lives in renderAssistant; the tool-result fold in renderToolCalls.
-	// Screen threads the SAME expand flag to both (entryrender.go), so collapsed/expanded
-	// must flip them together.
+	// The thinking fold (renderAssistant) honors the ctrl+t expand flag. The tool-result
+	// preview (renderToolCalls) is HARD-capped to previewLineCap lines regardless of expand,
+	// so a huge result can never fill the live tail or strand a commit-time gap.
 	thinkCollapsed := stripANSI(renderAssistant(thinking, "the answer", "", false, 80))
-	toolCollapsed := stripANSI(renderToolCalls(calls, false, 80))
 	thinkExpanded := stripANSI(renderAssistant(thinking, "the answer", "", true, 80))
+	toolCollapsed := stripANSI(renderToolCalls(calls, false, 80))
 	toolExpanded := stripANSI(renderToolCalls(calls, true, 80))
 
-	// Collapsed: thinking is the compact summary (count + ctrl+t), no "│ " body;
-	// the tool result is folded (first K lines, a more-marker, later lines hidden).
+	// Thinking DOES flip: collapsed is the compact "thinking · N lines · ctrl+t" summary
+	// (no "│ " body); expanded is the full "│ "-prefixed body.
 	for _, w := range []string{"thinking", "3 lines", "ctrl+t"} {
 		if !strings.Contains(thinkCollapsed, w) {
 			t.Errorf("collapsed thinking missing %q in %q", w, thinkCollapsed)
@@ -612,31 +612,28 @@ func TestRenderAssistantUnifiedExpand(t *testing.T) {
 	if strings.Contains(thinkCollapsed, "│ reason one") {
 		t.Errorf("collapsed thinking must NOT show the body in %q", thinkCollapsed)
 	}
-	for _, w := range []string{"line0", "line5", "more lines"} {
-		if !strings.Contains(toolCollapsed, w) {
-			t.Errorf("collapsed tool missing %q in %q", w, toolCollapsed)
-		}
-	}
-	for _, a := range []string{"line6", "line9"} {
-		if strings.Contains(toolCollapsed, a) {
-			t.Errorf("collapsed tool must NOT contain %q in %q", a, toolCollapsed)
-		}
-	}
-
-	// Expanded: the full "│ "-prefixed thinking body — header included — AND every
-	// tool-result line.
 	for _, w := range []string{"│ thinking", "│ reason one", "│ reason three"} {
 		if !strings.Contains(thinkExpanded, w) {
 			t.Errorf("expanded thinking missing %q in %q", w, thinkExpanded)
 		}
 	}
-	for _, w := range []string{"line6", "line9"} {
-		if !strings.Contains(toolExpanded, w) {
-			t.Errorf("expanded tool missing %q in %q", w, toolExpanded)
+
+	// Tool output does NOT flip: BOTH expand states hard-cap to previewLineCap (3) lines
+	// with a "… N more lines" marker; later lines never show, and there is no ctrl+t hint.
+	for _, label := range []struct {
+		name string
+		out  string
+	}{{"collapsed", toolCollapsed}, {"expanded", toolExpanded}} {
+		for _, w := range []string{"line0", "line2", "more lines"} {
+			if !strings.Contains(label.out, w) {
+				t.Errorf("%s tool missing %q in %q", label.name, w, label.out)
+			}
 		}
-	}
-	if strings.Contains(toolExpanded, "more lines") {
-		t.Errorf("expanded tool must NOT contain the more-marker in %q", toolExpanded)
+		for _, a := range []string{"line3", "line9", "ctrl+t"} {
+			if strings.Contains(label.out, a) {
+				t.Errorf("%s tool must NOT contain %q in %q", label.name, a, label.out)
+			}
+		}
 	}
 }
 

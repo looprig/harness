@@ -11,10 +11,13 @@ import (
 	"github.com/ciram-co/looprig/pkg/tui/styles"
 )
 
-// previewLineCap (K) is how many result-preview lines a collapsed tool card shows
-// before the "… N more lines · ctrl+t" marker. Expanding (ctrl+t) shows all of the
-// runner-capped preview, so this is purely a display fold, not a content cap.
-const previewLineCap = 6
+// previewLineCap is the HARD cap on result-preview lines a tool card shows: a result with
+// more lines is trimmed to the first previewLineCap lines plus a "… N more lines" marker.
+// The cap applies ALWAYS — regardless of the ctrl+t expand fold (which now governs only the
+// thinking block). A huge tool result (e.g. a long diff) otherwise fills the live tail,
+// scrolling the assistant bullet off the top AND, on commit, stranding a screen-height
+// scrollback gap (the inline renderer's insertAbove math is sized off the tall live tail).
+const previewLineCap = 3
 
 // noOutput is the placeholder shown for a completed tool call with no result lines.
 const noOutput = "(no output)"
@@ -142,12 +145,12 @@ func toolGlyph(s ToolStatus) string {
 }
 
 // renderToolCalls renders a segment's tool-call children as indented cards, each a
-// header line ("⎿ ToolName(Summary)  <glyph>") followed by its result preview. When
-// expandTools is false the preview is folded to the first previewLineCap lines plus
-// a "… N more lines · ctrl+t" marker; when true every (already runner-capped) line
-// shows. An empty result renders "(no output)". An error card's result always shows
-// (subject to the same fold), never hidden. Lines are width-wrapped so a long card
-// never blows the viewport. Returns "" when there are no calls.
+// header line ("⎿ ToolName(Summary)  <glyph>") followed by its result preview. The
+// preview is HARD-capped to previewLineCap lines plus a "… N more lines" marker
+// regardless of expandTools (the ctrl+t fold governs only the thinking block now), so a
+// huge result can never fill the live tail. An empty result renders "(no output)". An
+// error card's result is capped the same way, never hidden. Lines are width-wrapped so a
+// long card never blows the viewport. Returns "" when there are no calls.
 func renderToolCalls(calls []ToolCallView, expandTools bool, width int) string {
 	// Committed/scrollback path: full cards, static glyphs, never header-only (a
 	// stray running card committed at a terminal still shows its body).
@@ -231,17 +234,21 @@ func decisionVerb(d gateDecision) string {
 // more than previewLineCap lines, it returns the first previewLineCap lines plus a
 // "… N more lines · ctrl+t" marker (N = the remainder). When expanded, every line
 // shows (the runner already capped the preview — no extra TUI cap).
-func previewLines(result []string, expandTools bool) []string {
+func previewLines(result []string, _ bool) []string {
+	// The expand flag is intentionally IGNORED for tool results: the preview is HARD-capped
+	// to previewLineCap lines regardless of ctrl+t, so a huge result can never fill the live
+	// tail (hiding the assistant bullet) or strand a commit-time scrollback gap. ctrl+t still
+	// folds the thinking block. (The bool param is retained for call-site compatibility.)
 	if len(result) == 0 {
 		return []string{noOutput}
 	}
-	if expandTools || len(result) <= previewLineCap {
+	if len(result) <= previewLineCap {
 		return result
 	}
 	remaining := len(result) - previewLineCap
 	shown := make([]string, 0, previewLineCap+1)
 	shown = append(shown, result[:previewLineCap]...)
-	shown = append(shown, "… "+strconv.Itoa(remaining)+" more lines"+hintSeparator+expandHint)
+	shown = append(shown, "… "+strconv.Itoa(remaining)+" more lines")
 	return shown
 }
 
