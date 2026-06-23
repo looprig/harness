@@ -105,4 +105,4 @@ require (
 	honnef.co/go/tools v0.7.0 // indirect
 )
 
-replace charm.land/bubbletea/v2 => ../bubbletea-fork
+replace charm.land/bubbletea/v2 => github.com/ciram-co/bubbletea/v2 v2.0.0-20260623210731-9571e88971cd
