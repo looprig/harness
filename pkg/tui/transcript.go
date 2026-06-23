@@ -260,6 +260,63 @@ type transcriptModel struct {
 	// legacy/no-name loop) falls back to the loopID short form — see agentLabel. It is
 	// cloned on write so the by-value reducer never aliases a prior model's map.
 	loopAgents map[uuid.UUID]identity.AgentName
+	// loopParent maps a SUBAGENT child loop id to its spawn key — the parent loop/turn/
+	// step coordinates plus the durable provider tool-use id of the Subagent call that
+	// spawned it — recorded from a child LoopStarted whose ParentToolUseID is non-empty
+	// (design §3). A child loop NOT in this map (empty/absent ParentToolUseID, e.g. a
+	// non-tool spawn) keeps the legacy collapsed "▸ <agent>: done" fallback line. It is
+	// cloned on write (value-copy contract).
+	loopParent map[uuid.UUID]spawnKey
+	// subagentAccum holds, per spawn key, the detached accumulator a child's ENDURING
+	// events build up (design §1/§3): agent, task, nested children, step count, terminal
+	// status. It is DETACHED (not state on a card) because the child's events precede the
+	// parent's StepDone (the parent card does not exist yet) and a cold restore rebuilds
+	// it from scratch. The orchestrator's StepDone reconciles each Subagent block against
+	// it by spawn key. It is cloned on write (value-copy contract).
+	subagentAccum map[spawnKey]*subagentAccumulator
+	// accumOrder is the stable creation order of the subagentAccum keys (appended when an
+	// accumulator is first created in ensureAccum), so pendingSubagentCards renders the
+	// in-flight nested cards deterministically (map iteration order is unspecified). It is
+	// cloned on write (value-copy contract) — appended to a fresh slice, never mutated in
+	// a shared backing array — mirroring the map clone-on-write alongside it.
+	accumOrder []spawnKey
+}
+
+// spawnKey identifies one Subagent tool call's spawn: the parent loop/turn/step
+// coordinates (where the Subagent block lives, read from the orchestrator's StepDone
+// header) plus the durable provider tool-use id of that block. It is built identically
+// on the two sides that must meet — the child LoopStarted (Cause.* + ParentToolUseID)
+// and the orchestrator StepDone (its own LoopID/TurnID/StepID + block.ID) — so the
+// accumulator a child fills is the one the parent card looks up.
+type spawnKey struct {
+	parentLoopID uuid.UUID
+	parentTurnID uuid.UUID
+	parentStepID uuid.UUID
+	toolUseID    string
+}
+
+// subagentAccumulator is the detached, per-spawn build-up of a subagent's nested card,
+// assembled PURELY from the child's ENDURING events (LoopStarted→agent, first
+// TurnStarted→task, each StepDone→a child card + steps++, the terminal→status). The
+// orchestrator's StepDone copies these onto the committed Subagent ToolCallView (design
+// §3). It is a pointer in the map so an in-place field bump (steps++, append a child)
+// is visible without re-storing — but the MAP is cloned on write so a by-value reducer
+// never aliases a prior model's map; a freshly-cloned map's pointers are themselves
+// freshly allocated when first created here (see ensureAccum).
+type subagentAccumulator struct {
+	agent    string         // the child LoopStarted.AgentName
+	task     string         // the child's first TurnStarted.Message, truncated
+	children []ToolCallView // nested tool cards from the child's StepDone groups
+	steps    int            // count of the child's StepDone events
+	status   subStatus      // the child terminal state (running until a terminal arrives)
+	nested   int            // depth-2 collapsed counter (Task 7; zero here)
+	// reconciled marks that the orchestrator's StepDone has copied this accumulator onto
+	// its committed Subagent card (reconcileSubagent). Until then the accumulator is
+	// PENDING — pendingSubagentCards exposes it so the LIVE tail renders the in-flight
+	// nested card; once reconciled the card lives in scrollback and pendingSubagentCards
+	// skips it (no double render). It is set in-place at reconciliation, consistent with
+	// the rest of the accumulator's in-place fill.
+	reconciled bool
 }
 
 // ApplyEvent folds one turn-stream event into the model and returns the next
@@ -303,8 +360,10 @@ func (m transcriptModel) ApplyEvent(ev event.Event) transcriptModel {
 	switch ev := ev.(type) {
 	case event.LoopStarted:
 		m.recordLoopAgent(ev.LoopID, ev.AgentName)
+		m.loopSpawned(ev)
 	case event.TurnStarted:
 		m.live.active = true
+		m.subagentTask(ev.LoopID, ev.Message)
 		m.startTurnUser(ev.LoopID, ev.Cause.LoopID, ev.Cause.CommandID, ev.Message)
 	case event.TurnFoldedInto:
 		m.startTurnUser(ev.LoopID, ev.Cause.LoopID, ev.Cause.CommandID, ev.Message)
@@ -327,10 +386,19 @@ func (m transcriptModel) ApplyEvent(ev event.Event) transcriptModel {
 	case event.UserInputRequested:
 		m.userInputRequested(ev)
 	case event.TurnDone:
+		if m.subagentTerminal(ev.LoopID, subDone) {
+			break // a child terminal: record status, never touch the primary live segment
+		}
 		m.commitLive()
 	case event.TurnInterrupted:
+		if m.subagentTerminal(ev.LoopID, subInterrupted) {
+			break
+		}
 		m.turnInterrupted()
 	case event.TurnFailed:
+		if m.subagentTerminal(ev.LoopID, subFailed) {
+			break
+		}
 		m.turnFailed(ev)
 	}
 	return m
@@ -742,24 +810,43 @@ func (m *transcriptModel) toolCompleted(ev event.ToolCallCompleted) {
 // (active preserved): the dropped/partial TokenDeltas of this step vanish — the
 // self-heal — and the step's gate decisions are cleared.
 func (m *transcriptModel) stepDone(ev event.StepDone) {
-	// A SUBAGENT loop's step is COLLAPSED-but-present (design §6d Option B): it commits
-	// ONE attributed "▸ <agent>: done" line, NOT the full assistant + tool group, so
-	// concurrent subagent narration never interleaves into the root transcript. The
-	// PRIMARY loop is the main narration and falls through to the full commit below.
+	// A SUBAGENT loop's step routes by whether it has a recorded spawn parent:
+	//   - WITH a loopParent entry (a tool-spawned subagent): its tool group accumulates
+	//     under the parent Subagent card (subagentStep) — no collapsed line; the card is
+	//     committed later when the orchestrator's StepDone reconciles it (design §1/§3).
+	//   - WITHOUT one (empty/absent ParentToolUseID, e.g. a non-tool spawn): the LEGACY
+	//     collapsed "▸ <agent>: done" line, retained as the fallback (design §6d Option B).
+	// Either way a subagent step returns early; the PRIMARY loop falls through to commit.
 	if ev.LoopID != m.primaryLoopID {
+		if _, ok := m.loopParent[ev.LoopID]; ok {
+			m.subagentStep(ev)
+			return
+		}
 		m.commitSubagentLine(ev.LoopID, subagentVerbDone)
 		return
 	}
 	ai, results := splitStepGroup(ev.Messages)
 	uses := toolUsesOf(ai)
 	cards := make([]ToolCallView, len(uses))
+	ordinary := 0 // cards that render as ordinary "⎿" cards (NOT promoted Subagent "●" cards)
 	for i := range uses {
 		cards[i] = m.stepToolCard(uses[i], results, i)
+		cards[i] = m.reconcileSubagent(ev, uses[i], results, cards[i])
+		if cards[i].Agent == "" {
+			ordinary++
+		}
 	}
-	m.commitStepAssistant(ai, len(cards))
-	promotedSingle := ai != nil && textOnly(ai.Blocks) == "" && len(cards) == 1
+	// Topology (design §5): a reconciled Subagent card (Agent set) is ALWAYS its own
+	// "●"-level card — never an indented "⎿" card and never under a "Multiple actions"
+	// umbrella — so the umbrella / single-promotion decisions count ONLY the ordinary
+	// cards. An all-Subagent empty-text step therefore commits no umbrella; its named
+	// cards stack directly.
+	m.commitStepAssistant(ai, ordinary)
+	promotedSingle := ai != nil && textOnly(ai.Blocks) == "" && ordinary == 1
 	for i := range cards {
-		m.commitCall(cards[i], promotedSingle)
+		// A Subagent card never promotes-to-the-bullet via renderPromotedTool: it renders
+		// as its OWN "●" Subagent card (renderSubagentCard, keyed on Agent != "").
+		m.commitCall(cards[i], promotedSingle && cards[i].Agent == "")
 	}
 	// SNAP: drop the provisional live for this step; active stays so the turn's next
 	// step (or its terminal) is still seen as in-progress.
@@ -785,15 +872,256 @@ func (m *transcriptModel) commitSubagentLine(loopID uuid.UUID, verb string) {
 	})
 }
 
+// loopSpawned records a TOOL-spawned subagent's spawn relationship at its child
+// LoopStarted: a non-empty ParentToolUseID means the loop was spawned by a Subagent
+// call, so it maps child loopID → spawnKey{Cause.LoopID,Cause.TurnID,Cause.StepID,
+// ParentToolUseID} (loopParent) and seeds the detached accumulator with the agent name
+// (subagentAccum). An empty ParentToolUseID (primary/non-tool spawn) is left alone —
+// that loop keeps the legacy collapsed "▸ <agent>: done" fallback. Both maps are cloned
+// on write (value-copy contract).
+func (m *transcriptModel) loopSpawned(ev event.LoopStarted) {
+	if ev.ParentToolUseID == "" {
+		return
+	}
+	key := spawnKey{ev.Cause.LoopID, ev.Cause.TurnID, ev.Cause.StepID, ev.ParentToolUseID}
+	m.loopParent = cloneLoopParent(m.loopParent)
+	m.loopParent[ev.LoopID] = key
+	acc := m.ensureAccum(key)
+	acc.agent = string(ev.AgentName)
+}
+
+// subagentTask sets a child accumulator's task from the child's FIRST TurnStarted
+// message (truncated to one line), if loopID is a recorded subagent child. Only the
+// first message wins: a later TurnStarted for the same loop (a folded continuation)
+// leaves the task as the original spawn task. A non-child loop, a missing accumulator,
+// or an absent/empty message is a no-op.
+func (m *transcriptModel) subagentTask(loopID uuid.UUID, msg *content.UserMessage) {
+	key, ok := m.loopParent[loopID]
+	if !ok || msg == nil {
+		return
+	}
+	acc, ok := m.subagentAccum[key]
+	if !ok || acc.task != "" {
+		return
+	}
+	text := subagentTruncate(textOnly(msg.Blocks))
+	if text == "" {
+		return
+	}
+	acc = m.ensureAccum(key)
+	acc.task = text
+}
+
+// subagentStep folds one child StepDone into its accumulator (design §1): it splits the
+// finalized group and builds each tool-use block's card via the PURE storedStepToolCard
+// (NEVER stepToolCard — a child must not consult m.live.Calls), appends them as nested
+// children, and increments the child's step count. It does NOT commit anything — the
+// cards live on the accumulator until the orchestrator's StepDone reconciles them onto
+// the parent Subagent card. loopID is known to be a recorded child (the caller checked
+// loopParent).
+//
+// A DEPTH-2 (or deeper) loop's StepDone is NOT folded as a child card (design §6):
+// instead it increments the DEPTH-1 ancestor card's collapsed Nested counter, found by
+// walking the spawn-parent chain up to the loop whose parent is the primary. A depth-1
+// loop's own StepDone (its spawn parent IS the primary) folds children normally.
+func (m *transcriptModel) subagentStep(ev event.StepDone) {
+	key := m.loopParent[ev.LoopID]
+	if key.parentLoopID != m.primaryLoopID {
+		// Depth ≥ 2: collapse into the depth-1 ancestor's Nested counter, never a card.
+		if d1, ok := m.depth1Key(ev.LoopID); ok {
+			m.ensureAccum(d1).nested++
+		}
+		return
+	}
+	ai, results := splitStepGroup(ev.Messages)
+	uses := toolUsesOf(ai)
+	acc := m.ensureAccum(key)
+	for i := range uses {
+		acc.children = append(acc.children, storedStepToolCard(uses[i], results))
+	}
+	acc.steps++
+}
+
+// depth1Key walks the spawn-parent chain from loopID up to the DEPTH-1 loop — the one
+// whose spawn parent is the primary loop — and returns that loop's spawn key (design
+// §6: attribute a deeper StepDone to the right depth-1 card by ancestry, not the spawn
+// id). It follows each loop's recorded spawnKey.parentLoopID; the chain ends at the loop
+// whose parent is m.primaryLoopID. It returns false if the chain breaks before reaching
+// a primary-parented loop (an orphaned/unknown ancestor — fail-safe, no counter bump). A
+// guard caps the walk at the number of known child loops so a malformed cycle cannot
+// spin.
+func (m transcriptModel) depth1Key(loopID uuid.UUID) (spawnKey, bool) {
+	for i := 0; i <= len(m.loopParent); i++ {
+		key, ok := m.loopParent[loopID]
+		if !ok {
+			return spawnKey{}, false
+		}
+		if key.parentLoopID == m.primaryLoopID {
+			return key, true
+		}
+		loopID = key.parentLoopID
+	}
+	return spawnKey{}, false
+}
+
+// subagentTerminal records a child loop's terminal status on its accumulator and
+// reports whether loopID was a recorded subagent child (so ApplyEvent skips the
+// primary-loop terminal handling for it — a child terminal must never flush the
+// orchestrator's live segment). A non-child loop returns false (the normal terminal
+// path runs).
+func (m *transcriptModel) subagentTerminal(loopID uuid.UUID, status subStatus) bool {
+	key, ok := m.loopParent[loopID]
+	if !ok {
+		return false
+	}
+	acc := m.ensureAccum(key)
+	acc.status = status
+	return true
+}
+
+// reconcileSubagent attaches a child accumulator onto the orchestrator's committed
+// Subagent card (design §3). For a Subagent tool-use block it computes the spawn key
+// from the orchestrator's OWN coordinates (ev.LoopID/TurnID/StepID) + block.ID and
+// looks up subagentAccum: on a hit it copies the agent/task/children/steps/status and
+// sets the done summary from the block's paired ToolResultMessage text (truncated),
+// then SUPPRESSES the card's normal result body so the hand-back text shows ONLY in the
+// done child, not doubled (Task 7 renders the suppression; here Agent being set is the
+// marker). On a miss (spawn failed before any child LoopStarted) the card is returned
+// unchanged — it renders normally with its error result text. A non-Subagent block is
+// returned unchanged.
+func (m *transcriptModel) reconcileSubagent(ev event.StepDone, use content.ToolUseBlock, results map[string]*content.ToolResultMessage, card ToolCallView) ToolCallView {
+	if use.Name != subagentToolName {
+		return card
+	}
+	key := spawnKey{ev.LoopID, ev.TurnID, ev.StepID, use.ID}
+	acc, ok := m.subagentAccum[key]
+	if !ok {
+		return card // spawn failed before any child loop: render the error result normally
+	}
+	card.Agent = acc.agent
+	card.Task = acc.task
+	// Copy the children: the committed card must be structurally FROZEN, never aliasing
+	// the live subagentAccum backing slice (the one place a committed entry could share
+	// mutable backing with live reducer state). Safe-by-construction, not by ordering —
+	// it hardens the reflect.DeepEqual restore-equivalence (Task 8) ahead of Task 7's
+	// further accumulator mutation (Nested).
+	card.Children = append([]ToolCallView(nil), acc.children...)
+	card.Steps = acc.steps
+	card.SubStatus = acc.status
+	card.Nested = acc.nested
+	// The done summary is the hand-back text; suppress the card's own result body so it
+	// is not also shown as the normal result preview (design §4: no doubling).
+	card.Result = splitLines(subagentTruncate(toolResultText(results[use.ID])))
+	// Mark the accumulator reconciled (in-place, consistent with the rest of the
+	// accumulator's fill): the card now lives in the committed transcript, so the live
+	// tail must stop rendering it as a pending in-flight card (pendingSubagentCards).
+	acc.reconciled = true
+	return card
+}
+
+// pendingSubagentCards returns, in stable creation order (accumOrder), one ToolCallView
+// per NOT-YET-reconciled accumulator — the in-flight subagent cards the LIVE tail renders
+// WHILE the subagent streams (its ENDURING child events fill the accumulator before the
+// orchestrator's StepDone commits the card). Each card mirrors what reconcileSubagent will
+// later copy onto the committed card (agent/task/children/steps/status/nested), with the
+// children copied so a caller cannot reach the live accumulator's backing slice. A
+// reconciled accumulator (its card already in scrollback) is skipped — no double render —
+// as is a nil entry (defensive). It is DISPLAY-ONLY: it never mutates the model.
+func (m transcriptModel) pendingSubagentCards() []ToolCallView {
+	var out []ToolCallView
+	for _, key := range m.accumOrder {
+		acc := m.subagentAccum[key]
+		if acc == nil || acc.reconciled {
+			continue
+		}
+		// Cap the LIVE card's children to the most recent liveCallCap: a subagent that runs
+		// many tools would otherwise grow the live tail to fill the screen (the "running · N
+		// steps" line still conveys the total). The FULL children commit to scrollback at the
+		// orchestrator StepDone via reconcileSubagent.
+		children := acc.children
+		if len(children) > liveCallCap {
+			children = children[len(children)-liveCallCap:]
+		}
+		out = append(out, ToolCallView{
+			ToolName:  subagentToolName,
+			Agent:     acc.agent,
+			Task:      acc.task,
+			Children:  append([]ToolCallView(nil), children...),
+			Steps:     acc.steps,
+			SubStatus: acc.status,
+			Nested:    acc.nested,
+		})
+	}
+	return out
+}
+
+// subagentToolName is the tool name the orchestrator's StepDone matches to promote a
+// tool-use block to a nested Subagent card. It INTENTIONALLY duplicates the literal in
+// pkg/tools (Subagent.Info().Name / its unexported subagentToolName) rather than import
+// it: that constant is unexported and a tui→tools dependency just for a string match is
+// not worth it. The two MUST stay in sync — if the tool's name changes, change this too.
+const subagentToolName = "Subagent"
+
+// ensureAccum returns the accumulator for key, creating it (and cloning the map on
+// write) when absent so a child event can fill it before the parent card exists. The
+// returned pointer is owned by the (possibly freshly cloned) map, so in-place mutation
+// of its fields is the intended write path — the MAP clone, not a per-accumulator
+// clone, is what upholds the value-copy reducer contract (a child's events are folded
+// in document order into the one accumulator the parent later reads).
+func (m *transcriptModel) ensureAccum(key spawnKey) *subagentAccumulator {
+	if acc, ok := m.subagentAccum[key]; ok {
+		return acc
+	}
+	next := make(map[spawnKey]*subagentAccumulator, len(m.subagentAccum)+1)
+	for k, v := range m.subagentAccum {
+		next[k] = v
+	}
+	acc := &subagentAccumulator{}
+	next[key] = acc
+	m.subagentAccum = next
+	// Record the key's stable creation order in a CLONED slice (value-copy contract — a
+	// fresh backing array, never an in-place append into a slice a prior model holds), so
+	// pendingSubagentCards renders in-flight cards deterministically.
+	m.accumOrder = append(append([]spawnKey(nil), m.accumOrder...), key)
+	return acc
+}
+
+// cloneLoopParent returns a fresh copy of the child→spawnKey map (nil-safe), so a
+// by-value reducer mutation never writes through a map a prior model still holds — the
+// map analogue of the slice value-copy contract used throughout this model.
+func cloneLoopParent(p map[uuid.UUID]spawnKey) map[uuid.UUID]spawnKey {
+	next := make(map[uuid.UUID]spawnKey, len(p)+1)
+	for k, v := range p {
+		next[k] = v
+	}
+	return next
+}
+
+// subagentTruncate normalizes a task/summary string to a single transcript line:
+// newlines→spaces, trim, then cap at subagentLineCap display runes with an ellipsis
+// (truncate). The full text remains in the durable journal. An empty/whitespace string
+// yields "".
+func subagentTruncate(s string) string {
+	s = strings.ReplaceAll(s, "\n", " ")
+	s = strings.TrimSpace(s)
+	return truncate(s, subagentLineCap)
+}
+
+// subagentLineCap is the ~80-col cap for a subagent task/summary line (design §Definitions).
+const subagentLineCap = 80
+
 // commitStepAssistant commits the AIMessage's prose / headline as one kindAssistant
 // entry. A nil AIMessage commits nothing. It commits the thinking rail (if any) and
 // the narration (if any); when there is NO narration it sets a bullet headline only
-// for an empty-text step that ran MORE than one tool ("Multiple actions") — a
+// for an empty-text step that ran MORE than one ORDINARY tool ("Multiple actions") — a
 // single-tool empty-text step commits no umbrella here (its one card is promoted to
-// the bullet by stepDone). So a thinking-only message renders just the rail, a
-// single-tool empty-text step with no thinking commits nothing here at all, and a
-// multi-tool empty-text step gets the "● Multiple actions" umbrella.
-func (m *transcriptModel) commitStepAssistant(ai *content.AIMessage, cardCount int) {
+// the bullet by stepDone). ordinaryCards is the count of cards that render as ordinary
+// "⎿" cards — reconciled Subagent cards are EXCLUDED (each is its own "●" card, design
+// §5), so an all-Subagent empty-text step has ordinaryCards == 0 and commits no
+// umbrella. So a thinking-only message renders just the rail, a single-ordinary-tool
+// empty-text step with no thinking commits nothing here at all, and a
+// multi-ordinary-tool empty-text step gets the "● Multiple actions" umbrella.
+func (m *transcriptModel) commitStepAssistant(ai *content.AIMessage, ordinaryCards int) {
 	if ai == nil {
 		return
 	}
@@ -806,7 +1134,7 @@ func (m *transcriptModel) commitStepAssistant(ai *content.AIMessage, cardCount i
 		blocks = append(blocks, &content.TextBlock{Text: text})
 	}
 	headline := ""
-	if text == "" && cardCount > 1 {
+	if text == "" && ordinaryCards > 1 {
 		headline = multipleActionsHeadline
 	}
 	if len(blocks) == 0 && headline == "" {
@@ -822,13 +1150,13 @@ func (m *transcriptModel) commitStepAssistant(ai *content.AIMessage, cardCount i
 }
 
 // stepToolCard builds the committed ToolCallView for the index-th tool-use block of a
-// step. It prefers the resolved live card at the same position (carrying the redacted
-// Summary and capped preview already shown live); when there is none it falls back to
-// the stored block's tool name and the matching ToolResultMessage text (correlated by
-// ToolUseID). The fallback shows no summary (the redacted summary is not carried in
-// the stored message); its ✓/✗ status comes from ToolResultMessage.IsError, which the
-// stored message now preserves (an error result commits a ✗ card even on the fallback
-// path, no longer relying on the live card's preview).
+// PRIMARY-loop step. It prefers the resolved live card at the same position (carrying
+// the redacted Summary and capped preview already shown live); when there is none it
+// falls back to storedStepToolCard (the stored block + matching ToolResultMessage). The
+// live-preference branch is correct ONLY for the primary loop's own step — a child's
+// nested cards must NOT consult m.live.Calls (it would steal a same-index parent live
+// card in a mixed batch), so child reconstruction uses storedStepToolCard exclusively
+// (design §3a).
 func (m *transcriptModel) stepToolCard(use content.ToolUseBlock, results map[string]*content.ToolResultMessage, idx int) ToolCallView {
 	if idx < len(m.live.Calls) {
 		live := m.live.Calls[idx]
@@ -839,6 +1167,19 @@ func (m *transcriptModel) stepToolCard(use content.ToolUseBlock, results map[str
 			return live
 		}
 	}
+	return storedStepToolCard(use, results)
+}
+
+// storedStepToolCard builds a ToolCallView PURELY from the stored tool-use block and
+// its paired ToolResultMessage (correlated by use.ID), with NO m.live.Calls access. It
+// is the durable, position-independent card builder: the shared fallback of
+// stepToolCard (the primary loop) AND the EXCLUSIVE builder for a subagent's nested
+// children (where a same-index parent live card must never leak in — design §3a). The
+// card shows no summary (the redacted summary is not carried in the stored message);
+// its ✓/✗ status comes from ToolResultMessage.IsError, which the stored message
+// preserves (an error result commits a ✗ card on this path too). It is a free function
+// — it depends on nothing but its arguments, which is the property the design relies on.
+func storedStepToolCard(use content.ToolUseBlock, results map[string]*content.ToolResultMessage) ToolCallView {
 	card := ToolCallView{ToolName: use.Name, Status: ToolOK}
 	if r, ok := results[use.ID]; ok {
 		card.Result = splitLines(toolResultText(r))

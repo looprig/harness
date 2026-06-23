@@ -932,3 +932,56 @@ func TestInteractionPopRevealsNextThenCompose(t *testing.T) {
 		t.Errorf("restored draft = %q, want %q", m.input.Value(), "saved")
 	}
 }
+
+// TestInteractionChildGateRoutable (Task 8, design §7 / test 9): a CHILD loop's
+// PermissionRequested still enqueues a pending prompt attributed to the child loop. The
+// nested Subagent-card work is display-only and lives entirely in the transcript reducer
+// — it must NOT have broken the interaction model's gate surfacing/routing. A child gate
+// (LoopID == a subagent loop, distinct from the primary) enqueues exactly as a primary
+// gate does, with the prompt's LoopID stamped to the child so the per-loop terminal
+// clearing (ClearPromptsForLoop) routes correctly.
+func TestInteractionChildGateRoutable(t *testing.T) {
+	t.Parallel()
+
+	primary := loopID(1)
+	child := loopID(2) // a subagent loop, distinct from the primary
+
+	m := newInteractionModel()
+	m = m.ApplyEvent(event.PermissionRequested{
+		Header:          event.Header{Coordinates: identity.Coordinates{LoopID: child}},
+		ToolExecutionID: callID(0x77),
+		Request:         tool.BashRequest{Command: "rm -rf build"},
+	})
+
+	if m.PendingCount() != 1 {
+		t.Fatalf("PendingCount = %d, want 1 (child gate enqueued)", m.PendingCount())
+	}
+	head := m.ActivePrompt()
+	if head == nil {
+		t.Fatal("ActivePrompt = nil, want the child loop's gate at the head")
+	}
+	if head.LoopID != child {
+		t.Errorf("active prompt LoopID = %v, want the CHILD loop %v (gate attributed to its loop)", head.LoopID, child)
+	}
+	if head.ToolExecutionID != callID(0x77) {
+		t.Errorf("active prompt ToolExecutionID = %v, want %v", head.ToolExecutionID, callID(0x77))
+	}
+	if head.Kind != promptPermission || head.ToolName != "Bash" {
+		t.Errorf("active prompt = %+v, want a Bash permission gate", *head)
+	}
+	if m.mode != modePermissionPrompt {
+		t.Errorf("mode = %d, want modePermissionPrompt (%d)", m.mode, modePermissionPrompt)
+	}
+
+	// The child gate is routable per loop: the PRIMARY loop terminating does NOT clear the
+	// child's still-pending gate (design §7 — only the finishing loop's prompts clear).
+	m = m.ApplyEvent(event.TurnDone{Header: event.Header{Coordinates: identity.Coordinates{LoopID: primary}}})
+	if m.PendingCount() != 1 {
+		t.Fatalf("PendingCount after primary TurnDone = %d, want 1 (child gate survives a sibling terminal)", m.PendingCount())
+	}
+	// The CHILD loop terminating clears its own gate.
+	m = m.ApplyEvent(event.TurnDone{Header: event.Header{Coordinates: identity.Coordinates{LoopID: child}}})
+	if m.PendingCount() != 0 {
+		t.Errorf("PendingCount after child TurnDone = %d, want 0 (child gate cleared by its own terminal)", m.PendingCount())
+	}
+}

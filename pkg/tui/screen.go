@@ -41,13 +41,14 @@ type Screen struct {
 	status Status      // Idle | Running | Interrupting | Resetting
 	sub    EventStream // the session-lifetime event subscription; nil until subscribed
 
-	// expand drives the unified ctrl+t fold for thinking + tool output. It defaults
-	// to TRUE (expanded — full thinking body + full tool result) because native
-	// scrollback is append-only: an entry prints once and can never be retroactively
-	// re-rendered, so a toggle cannot expand text already committed to history. To
-	// avoid permanently truncating that history, the transcript shows FULL content by
-	// default; ctrl+t flips it to collapsed, which only reduces verbosity for the live
-	// tail + future commits (expanded→collapsed and back).
+	// expand drives the ctrl+t fold for the THINKING block only. It defaults to TRUE
+	// (full "│ " thinking body) because native scrollback is append-only: an entry prints
+	// once and can never be retroactively re-rendered, so a toggle cannot expand thinking
+	// already committed to history; showing it full by default avoids permanently
+	// truncating that history. ctrl+t flips it to the compact "thinking · N lines" summary
+	// for the live tail + future commits. Tool RESULT output is NOT governed by this flag —
+	// it is hard-capped to previewLineCap lines always (see render.go), so a huge result
+	// can't fill the live tail or strand a commit-time scrollback gap.
 	expand        bool
 	width, height int
 	ready         bool
@@ -104,8 +105,9 @@ func (b AgentBanner) bannerText() string {
 
 // New constructs an idle Screen driving agent, with open as the /clear thunk and
 // banner the agent name/description shown as the startup info notice. The expand flag
-// starts TRUE so thinking + tool output render in full from the start — see the field
-// comment for why append-only scrollback forces expanded-by-default.
+// starts TRUE so the thinking block renders in full from the start — see the field
+// comment for why append-only scrollback forces expanded-by-default (tool output is
+// hard-capped independently of this flag).
 func New(ctx context.Context, agent Agent, open OpenAgent, banner AgentBanner) Screen {
 	return Screen{
 		agent:       agent,
@@ -434,14 +436,19 @@ func (m Screen) View() tea.View {
 }
 
 // renderLiveTail renders the in-progress assistant segment (streamed thinking,
-// narration, and any still-running tool cards) to its display lines. It is empty
-// when there is no live content, so the surface omits the tail region entirely.
+// narration, any still-running tool cards, and any in-flight nested Subagent cards) to
+// its display lines. It is empty when there is no live content AND no pending subagent
+// card, so the surface omits the tail region entirely.
 func (m Screen) renderLiveTail() string {
 	live := m.transcript.live
-	if live.empty() {
+	pending := m.transcript.pendingSubagentCards()
+	if live.empty() && len(pending) == 0 {
 		return ""
 	}
-	return renderLiveAssistant(live.Thinking, live.Text, live.Calls, m.expand, m.width, m.anim)
+	// Suppress the orchestrator's raw running Subagent tool card — its activity is shown
+	// by the nested pending card (renderSubagentCard) instead, so it must not be doubled.
+	calls := nonSubagentCalls(live.Calls)
+	return renderLiveAssistant(live.Thinking, live.Text, calls, pending, m.expand, m.width, m.anim)
 }
 
 // renderQueued renders the transcript's pending queued-input affordances (the

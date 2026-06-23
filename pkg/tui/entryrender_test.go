@@ -107,9 +107,10 @@ func TestRenderEntryAssistant(t *testing.T) {
 	}
 }
 
-// TestRenderEntryTool locks the tool-kind render: the resolved tool card with its
-// header (ToolName + Summary + status glyph), and the result preview honoring the
-// expand fold (collapsed → "… N more lines · ctrl+t"; expanded → every line).
+// TestRenderEntryTool locks the tool-kind render: the resolved tool card with its header
+// (ToolName + Summary + status glyph), and the result preview HARD-capped to previewLineCap
+// lines with a "… N more lines" marker — the SAME in both expand states (the ctrl+t fold no
+// longer un-caps tool output; it governs only the thinking block).
 func TestRenderEntryTool(t *testing.T) {
 	t.Parallel()
 	result := make([]string, 0, previewLineCap+3)
@@ -136,11 +137,17 @@ func TestRenderEntryTool(t *testing.T) {
 	if !strings.Contains(collapsed, glyphOK) {
 		t.Errorf("tool render = %q, want the OK glyph", collapsed)
 	}
-	if !strings.Contains(collapsed, expandHint) {
-		t.Errorf("collapsed tool render = %q, want the fold hint", collapsed)
+	// Tool output is HARD-capped regardless of expand: BOTH views trim to previewLineCap
+	// lines with a "… N more lines" marker, and NEITHER carries the ctrl+t fold hint (that
+	// now governs only the thinking block).
+	if !strings.Contains(collapsed, "more lines") {
+		t.Errorf("collapsed tool render = %q, want the '… N more lines' trim marker", collapsed)
 	}
-	if strings.Contains(expanded, expandHint) {
-		t.Errorf("expanded tool render = %q, must NOT carry the fold hint", expanded)
+	if !strings.Contains(expanded, "more lines") {
+		t.Errorf("expanded tool render = %q, must ALSO be hard-capped (expand does not un-cap tool output)", expanded)
+	}
+	if strings.Contains(collapsed, expandHint) || strings.Contains(expanded, expandHint) {
+		t.Errorf("tool render must NOT carry the ctrl+t hint (collapsed=%q expanded=%q)", collapsed, expanded)
 	}
 }
 

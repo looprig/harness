@@ -23,9 +23,20 @@ var DotColor = lipgloss.Color("#D4F84D")
 // "39") and MarkdownInlineCodeColor replaces glamour's inline `code` red (ANSI 256
 // "203"), both with the same softer brand blue. They are hex strings (not
 // lipgloss.Color) because glamour's StylePrimitive.Color is a *string.
+//
+// MarkdownCodeNeutralColor recolors the RED structural symbols inside fenced/indented
+// CODE BLOCKS. Glamour's DarkStyleConfig code-block chroma theme paints the chroma
+// Operator token (#EF8080, salmon-red → ANSI 256 "210") — which covers structural
+// punctuation like "/", "+", "-", "=", "->" — and the GenericDeleted token (#FD5B5B,
+// red → ANSI 256 "203") used for diff "-" lines. Those made path slashes, arrows and
+// +/- markers render red in the live TUI. We retone both to #C4C4C4 — the chroma
+// theme's OWN neutral Text/Name foreground (already used for unhighlighted code) — so
+// structural symbols read as plain code text instead of red, while every other syntax
+// color (keywords, strings, functions, …) is left untouched.
 var (
-	MarkdownHeadingColor    = "#A2D2FF"
-	MarkdownInlineCodeColor = "#A2D2FF"
+	MarkdownHeadingColor     = "#A2D2FF"
+	MarkdownInlineCodeColor  = "#A2D2FF"
+	MarkdownCodeNeutralColor = "#C4C4C4"
 )
 
 // LitDot is the COLORED leading marker actually rendered before an assistant bullet:
@@ -185,9 +196,20 @@ var ThinkingStyle = lipgloss.NewStyle().Faint(true)
 // leading/trailing space), so a `code` span renders as bare colored text. The H2–H6
 // heading prefixes (glamour's literal "## ", "### ", … markers) are cleared so a
 // heading renders as clean styled text rather than echoing its markdown hashes; H1
-// keeps its colored background bar (it never carried a "#" marker). cfg is a value
-// copy of DarkStyleConfig, so reassigning its fields never mutates the shared
-// package-level config (the same copy-then-override pattern as the document margin).
+// keeps its colored background bar (it never carried a "#" marker).
+//
+// The code-block chroma theme's two RED structural tokens are also retoned to
+// MarkdownCodeNeutralColor: Operator (glamour's salmon-red #EF8080, which colors "/",
+// "+", "-", "=", "->", … inside highlighted code) and GenericDeleted (glamour's red
+// #FD5B5B, the diff "-" line color). This stops path slashes, arrows and +/- markers
+// from rendering red inside code blocks. Chroma is a *struct pointer shared with the
+// package-level DarkStyleConfig, so it is deep-copied (value copy of the pointee, then
+// re-pointed) before its fields are mutated — otherwise the override would leak into
+// the shared global. Every other chroma color is left at glamour's defaults.
+//
+// cfg is a value copy of DarkStyleConfig, so reassigning its (non-pointer) fields never
+// mutates the shared package-level config (the same copy-then-override pattern as the
+// document margin).
 //
 // Returns an error if glamour fails to construct (caller decides fallback).
 func NewMarkdownRenderer(width int) (*glamour.TermRenderer, error) {
@@ -208,6 +230,18 @@ func NewMarkdownRenderer(width int) (*glamour.TermRenderer, error) {
 	cfg.Code.BackgroundColor = nil // no background fill
 	cfg.Code.Prefix = ""           // no leading U+00A0 padding space
 	cfg.Code.Suffix = ""           // no trailing U+00A0 padding space
+
+	// Retone the code-block chroma theme's two RED structural tokens (Operator,
+	// GenericDeleted) to a neutral gray. cfg.CodeBlock.Chroma is a *Chroma shared with
+	// the package-level DarkStyleConfig, so deep-copy the pointee before mutating —
+	// otherwise the override would corrupt the shared global on every call.
+	if cfg.CodeBlock.Chroma != nil {
+		chromaCopy := *cfg.CodeBlock.Chroma
+		neutral := MarkdownCodeNeutralColor
+		chromaCopy.Operator.Color = &neutral       // "/", "+", "-", "=", "->" in code
+		chromaCopy.GenericDeleted.Color = &neutral // diff "-" lines
+		cfg.CodeBlock.Chroma = &chromaCopy
+	}
 
 	return glamour.NewTermRenderer(
 		glamour.WithStyles(cfg),

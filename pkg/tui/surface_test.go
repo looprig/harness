@@ -7,14 +7,16 @@ import (
 
 	"charm.land/lipgloss/v2"
 
+	"github.com/ciram-co/looprig/pkg/content"
 	"github.com/ciram-co/looprig/pkg/event"
 	"github.com/ciram-co/looprig/pkg/tool"
 	"github.com/ciram-co/looprig/pkg/tui/styles"
 )
 
-// TestLiveTailCap covers the pure active-surface budget: the live tail gets the
-// terminal height minus the status line, the slash panel (when visible), and the
-// bottom box (box frame + content; no separator row). It is floored at 0 and never
+// TestLiveTailCap covers the pure active-surface budget: from the free space (terminal
+// height minus the status line, the slash panel when visible, and the bottom box frame +
+// content; no separator row) the tail gets HALF, the other half reserved as commit headroom
+// (see liveTailCap and TestLiveTailCapReservesCommitHeadroom). It is floored at 0, never
 // negative.
 func TestLiveTailCap(t *testing.T) {
 	t.Parallel()
@@ -24,12 +26,14 @@ func TestLiveTailCap(t *testing.T) {
 		term, statusH, slashH, contentH int
 		want                            int
 	}{
-		{name: "ample room", term: 40, statusH: 1, slashH: 0, contentH: 1, want: 36},
-		// bottomH = box frame(2) + content(1) = 3; 40 - 1 - 0 - 3 = 36 (no separator row)
-		{name: "with slash panel", term: 40, statusH: 1, slashH: 3, contentH: 1, want: 33},
-		{name: "grown composer shrinks tail", term: 40, statusH: 1, slashH: 0, contentH: 10, want: 27},
+		{name: "ample room", term: 40, statusH: 1, slashH: 0, contentH: 1, want: 18},
+		// bottomH = box frame(2) + content(1) = 3; free = 40 - 1 - 0 - 3 = 36; tail = 36/2 = 18
+		{name: "with slash panel", term: 40, statusH: 1, slashH: 3, contentH: 1, want: 16},
+		// free = 40 - 1 - 3 - 3 = 33; tail = 33/2 = 16
+		{name: "grown composer shrinks tail", term: 40, statusH: 1, slashH: 0, contentH: 10, want: 13},
+		// bottomH = 12; free = 40 - 1 - 0 - 12 = 27; tail = 27/2 = 13
 		{name: "exact fit floors at zero", term: 4, statusH: 1, slashH: 0, contentH: 1, want: 0},
-		// bottomH = 3; 4 - 1 - 0 - 3 = 0
+		// bottomH = 3; free = 4 - 1 - 0 - 3 = 0
 		{name: "overflow floored at zero never negative", term: 3, statusH: 1, slashH: 0, contentH: 1, want: 0},
 		{name: "tiny terminal floored at zero", term: 0, statusH: 1, slashH: 0, contentH: 1, want: 0},
 	}
@@ -47,6 +51,33 @@ func TestLiveTailCap(t *testing.T) {
 				t.Errorf("liveTailCap returned negative %d", got)
 			}
 		})
+	}
+}
+
+// TestLiveTailCapReservesCommitHeadroom is the root-cause guard for the "input box
+// stranded / repainted twice" bug. The bubbletea inline renderer commits history to native
+// scrollback with insertAbove (cursed_renderer.go), whose cursor math `up = offset + h - 1`
+// only lands correctly when the managed region h plus the committed payload offset fit the
+// terminal: offset + h <= term. The WHOLE live tail commits as one tea.Println at a step
+// boundary (printPayload flattens it), so offset ≈ the tail height — the tail must leave room
+// for an equal-sized commit on top of the surface it's part of: 2*cap + chrome <= term. A
+// liveTailCap that hands out the full free space (term - chrome) violates this and strands.
+func TestLiveTailCapReservesCommitHeadroom(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct{ term, statusH, reservedH, contentH int }{
+		{term: 40, statusH: 3, reservedH: 0, contentH: 1},
+		{term: 24, statusH: 3, reservedH: 0, contentH: 1},
+		{term: 50, statusH: 3, reservedH: 2, contentH: 4},
+		{term: 80, statusH: 3, reservedH: 0, contentH: 1},
+	}
+	for _, c := range cases {
+		capacity := liveTailCap(c.term, c.statusH, c.reservedH, c.contentH)
+		chrome := c.statusH + c.reservedH + boxBorderH + c.contentH
+		if 2*capacity+chrome > c.term {
+			t.Errorf("liveTailCap(%d,%d,%d,%d)=%d: 2*cap+chrome=%d exceeds term=%d — no commit headroom, insertAbove strands the input box",
+				c.term, c.statusH, c.reservedH, c.contentH, capacity, 2*capacity+chrome, c.term)
+		}
 	}
 }
 
@@ -165,6 +196,98 @@ func TestSurfaceCappedTail(t *testing.T) {
 	}
 }
 
+// TestSurfaceViewNeverExceedsHeight is the big-gap regression: the composed active
+// surface must never emit MORE logical lines than the terminal height, for ANY input
+// combination. This is the HEIGHT half of the bubbletea v2 inline-renderer invariant
+// (the WIDTH half is clampSurfaceWidth): the renderer sizes its managed region from
+// the View's logical line count (strings.Count(view,"\n")+1) and assumes each logical
+// line is one physical row, so an over-tall surface desyncs insertAbove's (tea.Println)
+// relative-cursor math and strands a big block of blank rows into native scrollback —
+// the "big gap once the AI message responded" symptom.
+//
+// Pre-fix the surface only CAPS THE LIVE TAIL; when the bottom chrome alone (a grown
+// composer, a queued affordance, or a prompt control whose budget floors above the
+// terminal) plus the status/tip rows exceeds the terminal height, surfaceView emits
+// more logical lines than in.Height with no fail-safe. clampSurfaceHeight closes that
+// gap. Each case below over-emitted pre-fix (verified by removing the clamp).
+func TestSurfaceViewNeverExceedsHeight(t *testing.T) {
+	t.Parallel()
+
+	bigTail := strings.Repeat("● tail line content here\n", 200)
+
+	cases := []struct {
+		name  string
+		build func(h int) surfaceInputs
+	}{
+		{
+			name: "large tail with queued affordance",
+			build: func(h int) surfaceInputs {
+				im := newInteractionModel()
+				im.input.Resize(80)
+				queued := renderQueued([][]content.Block{{&content.TextBlock{Text: strings.Repeat("queued words ", 30)}}}, 80)
+				return surfaceInputs{Interaction: im, LiveTail: bigTail, Queued: queued,
+					Status: StatusRunning, StatusState: statusInputs{streaming: true}, Width: 80, Height: h}
+			},
+		},
+		{
+			name: "large tail with grown multi-line composer",
+			build: func(h int) surfaceInputs {
+				im := newInteractionModel()
+				im.input.Resize(80)
+				im.input.SetValue(strings.Repeat("composer line\n", 8))
+				return surfaceInputs{Interaction: im, LiveTail: bigTail,
+					Status: StatusRunning, StatusState: statusInputs{streaming: true}, Width: 80, Height: h}
+			},
+		},
+		{
+			name: "large tail with choice prompt (many choices)",
+			build: func(h int) surfaceInputs {
+				choices := make([]string, 30)
+				for i := range choices {
+					choices[i] = "choice option with a fairly long descriptive label"
+				}
+				im := newInteractionModel()
+				im = im.ApplyEvent(event.UserInputRequested{ToolExecutionID: callID(2),
+					Question: strings.Repeat("Long question text that wraps. ", 5), Choices: choices})
+				return surfaceInputs{Interaction: im, LiveTail: bigTail,
+					Status: StatusRunning, StatusState: statusInputs{userInputActive: true}, Width: 80, Height: h}
+			},
+		},
+		{
+			name: "large tail with answer prompt",
+			build: func(h int) surfaceInputs {
+				im := newInteractionModel()
+				im = im.ApplyEvent(event.UserInputRequested{ToolExecutionID: callID(3),
+					Question: strings.Repeat("Multi line question. ", 10)})
+				return surfaceInputs{Interaction: im, LiveTail: bigTail,
+					Status: StatusRunning, StatusState: statusInputs{userInputActive: true}, Width: 80, Height: h}
+			},
+		},
+	}
+
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			// Sweep ample down to constrained heights: the invariant holds at EVERY size.
+			for _, h := range []int{40, 30, 24, 20, 12, 10, 8, 6, 4, 2, 1} {
+				in := c.build(h)
+				out := surfaceView(in)
+				// lipgloss.Height and the raw logical \n-count must agree (clampSurfaceWidth
+				// guarantees no wrapping) and must never exceed the terminal height.
+				if logical := strings.Count(out, "\n") + 1; logical > in.Height {
+					t.Errorf("h=%d: surfaceView emitted %d logical lines (> terminal height %d):\n%s",
+						h, logical, in.Height, stripANSI(out))
+				}
+				if got := lipgloss.Height(out); got > in.Height {
+					t.Errorf("h=%d: lipgloss.Height(surfaceView)=%d exceeds terminal height %d",
+						h, got, in.Height)
+				}
+			}
+		})
+	}
+}
+
 // assertNoLineExceedsWidth fails if any line of surface is wider than width display
 // columns. This is the active-surface invariant the bubbletea v2 inline renderer
 // requires: a line wider than the terminal soft-wraps onto an extra physical row,
@@ -198,7 +321,7 @@ func TestSurfaceViewNeverExceedsWidth(t *testing.T) {
 		Status:   ToolOK,
 		Result:   []string{longWord, "ok"},
 	}}
-	tail := renderLiveAssistant("reasoning\n"+longWord, "narration "+longWord, calls, true, 80, animState{})
+	tail := renderLiveAssistant("reasoning\n"+longWord, "narration "+longWord, calls, nil, true, 80, animState{})
 
 	// Widths cover an ample terminal, several shrinking steps (a resize drag), and a
 	// tiny width where the input-box border itself overflowed pre-fix.
@@ -263,6 +386,54 @@ func TestClampSurfaceWidth(t *testing.T) {
 				if w := lipgloss.Width(line); w > tt.wantMax {
 					t.Errorf("line %d display-width %d exceeds %d: %q", i, w, tt.wantMax, stripANSI(line))
 				}
+			}
+		})
+	}
+}
+
+// TestClampSurfaceHeight covers the height fail-safe directly: an over-tall surface is
+// trimmed to height rows by dropping LEADING lines (the renderer keeps the bottom rows,
+// so we match it — the bottom box/status/tip survive), a within-budget surface is
+// untouched, and a zero/negative height drops the surface to empty.
+func TestClampSurfaceHeight(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		surface string
+		height  int
+		// wantHeight is the exact line count expected; -1 means the output must be empty.
+		wantHeight int
+		// wantKeepsBottom, when non-empty, must be the LAST line of the output (the fail-
+		// safe keeps the bottom-most lines).
+		wantKeepsBottom string
+	}{
+		{name: "over-tall trimmed to height", surface: "a\nb\nc\nd\ne", height: 3, wantHeight: 3, wantKeepsBottom: "e"},
+		{name: "exact fit untouched", surface: "a\nb\nc", height: 3, wantHeight: 3, wantKeepsBottom: "c"},
+		{name: "shorter than height untouched", surface: "a\nb", height: 5, wantHeight: 2, wantKeepsBottom: "b"},
+		{name: "single line height one", surface: "only", height: 1, wantHeight: 1, wantKeepsBottom: "only"},
+		{name: "zero height drops surface", surface: "a\nb\nc", height: 0, wantHeight: -1},
+		{name: "negative height drops surface", surface: "a\nb\nc", height: -2, wantHeight: -1},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			got := clampSurfaceHeight(tt.surface, tt.height)
+			if tt.wantHeight < 0 {
+				if got != "" {
+					t.Errorf("clampSurfaceHeight(height=%d) = %q, want empty", tt.height, got)
+				}
+				return
+			}
+			if h := strings.Count(got, "\n") + 1; h != tt.wantHeight {
+				t.Errorf("clampSurfaceHeight(height=%d) line count = %d, want %d:\n%s", tt.height, h, tt.wantHeight, got)
+			}
+			lines := strings.Split(got, "\n")
+			if last := lines[len(lines)-1]; last != tt.wantKeepsBottom {
+				t.Errorf("clampSurfaceHeight(height=%d) last line = %q, want %q (must keep the bottom)", tt.height, last, tt.wantKeepsBottom)
 			}
 		})
 	}

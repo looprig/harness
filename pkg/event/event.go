@@ -244,6 +244,12 @@ type LoopStarted struct {
 	enduring
 	loopScoped
 	Header
+	// ParentToolUseID is the durable provider tool-use id of the Subagent tool call
+	// that spawned this loop (content.ToolUseBlock.ID), empty for loops not spawned by
+	// a tool call (e.g. the primary/root). It is the durable carrier that correlates a
+	// child loop back to its parent tool call across persist/restore; omitzero so old
+	// journal records without the field decode to "".
+	ParentToolUseID string `json:"parent_tool_use_id,omitzero"`
 }
 
 func (SessionStarted) isEvent() {}

@@ -1020,12 +1020,11 @@ func TestCtrlTTogglesExpandGlobally(t *testing.T) {
 	}
 }
 
-// TestCtrlTFlipsLiveTailRendering pins that ctrl+t actually changes what the live
-// tail renders, not just a bool. A fresh Screen renders thinking + tool output
-// EXPANDED by default (full "│ " thinking body + full tool result, no collapse
-// hints); the first ctrl+t collapses both (compact "thinking · N lines" summary +
-// "… N more lines" tool fold); the second restores the full rendering.
-func TestCtrlTFlipsLiveTailRendering(t *testing.T) {
+// TestCtrlTFlipsThinkingNotToolOutputInLiveTail pins that ctrl+t flips the live tail's
+// THINKING block (full "│ " body ↔ compact "thinking · N lines" summary), while the
+// tool-result preview stays HARD-capped to previewLineCap lines in BOTH states — the
+// ctrl+t fold no longer un-caps tool output (so a huge result can't fill the live tail).
+func TestCtrlTFlipsThinkingNotToolOutputInLiveTail(t *testing.T) {
 	t.Parallel()
 
 	agent := &fakeAgent{}
@@ -1033,7 +1032,7 @@ func TestCtrlTFlipsLiveTailRendering(t *testing.T) {
 	m, _ = updateScreen(t, m, tea.WindowSizeMsg{Width: 80, Height: 40})
 
 	// A live segment with multi-line thinking AND a completed tool card whose result
-	// exceeds previewLineCap, so both folds are observable.
+	// exceeds previewLineCap, so the thinking fold flips and the tool cap is observable.
 	resultLines := make([]string, 0, previewLineCap+3)
 	for i := 0; i < previewLineCap+3; i++ {
 		resultLines = append(resultLines, "result-line-"+strconv.Itoa(i))
@@ -1050,42 +1049,98 @@ func TestCtrlTFlipsLiveTailRendering(t *testing.T) {
 		active: true,
 	}
 
-	expandedHas := "first reasoning line" // full thinking body line (expanded only)
-	expandedTail := "result-line-" + strconv.Itoa(previewLineCap+2)
-	collapsedHints := []string{"more lines", "thinking" + hintSeparator}
+	thinkingBody := "first reasoning line"                            // full thinking body line (expanded only)
+	cappedTailLine := "result-line-" + strconv.Itoa(previewLineCap+2) // a tool line past the cap (never shown)
 
-	// Default: expanded — full thinking body + full tool result, NO collapse hints.
+	capped := func(out string) bool { // tool result is hard-capped: more-marker present, past-cap line absent
+		return strings.Contains(out, "more lines") && !strings.Contains(out, cappedTailLine)
+	}
+
+	// Default: thinking expanded (full "│ " body); tool output ALREADY hard-capped.
 	def := stripANSI(m.renderLiveTail())
-	if !strings.Contains(def, expandedHas) {
-		t.Errorf("default live tail missing full thinking body %q; got %q", expandedHas, def)
+	if !strings.Contains(def, thinkingBody) {
+		t.Errorf("default live tail missing full thinking body %q; got %q", thinkingBody, def)
 	}
-	if !strings.Contains(def, expandedTail) {
-		t.Errorf("default live tail missing tail tool result %q; got %q", expandedTail, def)
-	}
-	if strings.Contains(def, "more lines") {
-		t.Errorf("default live tail shows the collapsed tool fold; want full result; got %q", def)
+	if !capped(def) {
+		t.Errorf("default live tail tool result not hard-capped; got %q", def)
 	}
 
-	// First ctrl+t: collapsed — compact thinking summary + folded tool result.
+	// First ctrl+t: thinking collapses to its compact summary; tool output UNCHANGED (capped).
 	m, _ = updateScreen(t, m, tea.KeyPressMsg{Code: 't', Mod: tea.ModCtrl})
 	col := stripANSI(m.renderLiveTail())
-	for _, h := range collapsedHints {
-		if !strings.Contains(col, h) {
-			t.Errorf("collapsed live tail missing %q; got %q", h, col)
-		}
+	if !strings.Contains(col, "thinking"+hintSeparator) {
+		t.Errorf("collapsed live tail missing the compact thinking summary; got %q", col)
 	}
-	if strings.Contains(col, expandedTail) {
-		t.Errorf("collapsed live tail still shows tail tool result %q; want folded; got %q", expandedTail, col)
+	if strings.Contains(col, thinkingBody) {
+		t.Errorf("collapsed live tail still shows the full thinking body; got %q", col)
+	}
+	if !capped(col) {
+		t.Errorf("tool result must stay hard-capped after ctrl+t; got %q", col)
 	}
 
-	// Second ctrl+t: expanded again.
+	// Second ctrl+t: thinking expands again; tool output STILL capped.
 	m, _ = updateScreen(t, m, tea.KeyPressMsg{Code: 't', Mod: tea.ModCtrl})
 	exp := stripANSI(m.renderLiveTail())
-	if !strings.Contains(exp, expandedHas) || !strings.Contains(exp, expandedTail) {
-		t.Errorf("re-expanded live tail missing full content; got %q", exp)
+	if !strings.Contains(exp, thinkingBody) {
+		t.Errorf("re-expanded live tail missing full thinking body; got %q", exp)
 	}
-	if strings.Contains(exp, "more lines") {
-		t.Errorf("re-expanded live tail still shows collapsed fold; got %q", exp)
+	if !capped(exp) {
+		t.Errorf("tool result must stay hard-capped after second ctrl+t; got %q", exp)
+	}
+}
+
+// TestLiveTailStaysBoundedAcrossSteps is the architectural guard against the "input block
+// repainted twice / stranded" bug. In an inline (non-alt-screen) TUI the live tail is the
+// renderer's MANAGED region; if it grows toward the screen height the relative-cursor
+// renderer can't track the terminal scroll and strands a copy of the bottom region (input +
+// status + prompt). So the live tail MUST stay small regardless of how much a step streams.
+// This drives two pathologically large in-progress steps (100-line reasoning + many big tool
+// results) and asserts the live tail height stays under a small bound at each — even though
+// the UNcapped render would be 500+ lines. (The actual stranding is a bubbletea renderer
+// behavior that needs a real TTY to observe; this asserts the invariant that prevents it.)
+func TestLiveTailStaysBoundedAcrossSteps(t *testing.T) {
+	t.Parallel()
+
+	m := runningScreen(t, &fakeAgent{})
+	m, _ = updateScreen(t, m, tea.WindowSizeMsg{Width: 80, Height: 40})
+
+	bigThinking := func() string {
+		var b strings.Builder
+		for i := 0; i < 100; i++ {
+			b.WriteString("a long reasoning line that the model streamed\n")
+		}
+		return b.String()
+	}
+	manyBigCalls := func(n int) []ToolCallView {
+		calls := make([]ToolCallView, 0, n)
+		for i := 0; i < n; i++ {
+			out := make([]string, 20)
+			for j := range out {
+				out[j] = "a line of tool output"
+			}
+			calls = append(calls, ToolCallView{ToolName: "Bash", Summary: "cmd", Status: ToolOK, Result: out})
+		}
+		return calls
+	}
+
+	// Generous ceiling: thinking cap (~10) + body + "… earlier" + liveCallCap cards ×
+	// (header + previewLineCap output) + separators. The uncapped render would be 100 +
+	// 20×21 ≈ 520 lines.
+	const bound = 35
+
+	height := func() int { return strings.Count(m.renderLiveTail(), "\n") + 1 }
+
+	// Step 1: a huge in-progress step (long reasoning + many big tool results).
+	m.transcript.live = liveSeg{Thinking: bigThinking(), Text: "the narration", Calls: manyBigCalls(20), active: true}
+	if h := height(); h > bound {
+		t.Fatalf("step 1 live tail height = %d, want <= %d (a tall live tail strands the input region)", h, bound)
+	}
+
+	// Step 2: the prior step committed (live resets) and a NEW huge step begins. The live
+	// tail must not have accumulated across steps and must still be bounded.
+	m.transcript.live = liveSeg{Thinking: bigThinking(), Calls: manyBigCalls(15), active: true}
+	if h := height(); h > bound {
+		t.Fatalf("step 2 live tail height = %d, want <= %d", h, bound)
 	}
 }
 
@@ -1673,6 +1728,66 @@ func TestSubmitUserRowFromEventNotSubmit(t *testing.T) {
 	}
 	if !m.scrollback.printed[rec.ID] {
 		t.Error("event-committed user row not flushed to scrollback")
+	}
+}
+
+// TestFirstUserRowSurvivesEmptyRestore is the regression test for the startup
+// displayID collision that silently dropped the FIRST user message from the TUI.
+//
+// At startup commitStartup commits the banner (an opening UI-only notice) as transcript
+// displayID 1 and flushes it, so the scrollback print-once engine records id 1 as
+// printed. The background restore fold then lands: for a NEW session it folds to an
+// EMPTY backlog. The bug was that handleRestored installed that empty transcript
+// WHOLESALE — discarding the banner and resetting the displayID counter to 0 — while
+// leaving the print-once engine still holding id 1. The next commit, the first user
+// row, then reused displayID 1, which scrollback.Flush treats as "already printed" and
+// skips: the user's first message never reaches scrollback (though the loop ran it and
+// the model replied). Every later message is fine, because the counter then advances
+// past the printed set. This test reproduces that exact ordering and asserts the first
+// user row reaches scrollback with a displayID that was NOT already printed.
+func TestFirstUserRowSurvivesEmptyRestore(t *testing.T) {
+	t.Parallel()
+
+	primary := callID(0xAA)
+	agent := &fakeAgent{primaryLoopID: primary}
+	m := New(context.Background(), agent, fakeOpen(agent), AgentBanner{Name: "SWE"})
+
+	// Real startup ordering: size, then the banner commit (systemReady) which flushes
+	// the banner to scrollback, then the background restore fold landing for a NEW
+	// session (empty backlog).
+	m, _ = updateScreen(t, m, tea.WindowSizeMsg{Width: 80, Height: 24})
+	m, cmd := updateScreen(t, m, systemReadyMsg{})
+	drainCmd(t, cmd) // run the banner flush
+	if got := userRowCount(m); got != 0 {
+		t.Fatalf("user rows after banner = %d, want 0", got)
+	}
+
+	// The new-session restore fold: an empty backlog (FoldDisplay over no events).
+	m, _ = updateScreen(t, m, restoredMsg{transcript: transcriptModel{primaryLoopID: primary}, interaction: newInteractionModel()})
+
+	// Snapshot the displayIDs already emitted to scrollback BEFORE the first user turn.
+	// The first user row must not reuse any of them, or the print-once engine drops it.
+	alreadyPrinted := make(map[displayID]bool, len(m.scrollback.printed))
+	for id := range m.scrollback.printed {
+		alreadyPrinted[id] = true
+	}
+
+	// The loop's TurnStarted for the genuine first user message (Cause.LoopID == 0,
+	// Header.LoopID == primary): commits the authoritative user row and flushes it.
+	m = feed(t, m, event.TurnStarted{
+		Header:  event.Header{Coordinates: identity.Coordinates{LoopID: primary}, Cause: identity.Cause{CommandID: fixedFakeSubmitID}},
+		Message: userMsg("Hello"),
+	})
+
+	rec := lastCommitted(t, m)
+	if rec.Kind != kindUser || committedText(rec) != "Hello" {
+		t.Fatalf("last committed = (kind %d, text %q), want (kindUser, %q)", rec.Kind, committedText(rec), "Hello")
+	}
+	if alreadyPrinted[rec.ID] {
+		t.Fatalf("first user row reused displayID %d already printed by the banner — the print-once engine skips it, so the first user message never reaches scrollback", rec.ID)
+	}
+	if !m.scrollback.printed[rec.ID] {
+		t.Error("first user row was not flushed to scrollback")
 	}
 }
 

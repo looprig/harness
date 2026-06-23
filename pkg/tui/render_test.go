@@ -2,6 +2,7 @@ package tui
 
 import (
 	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -161,28 +162,28 @@ func TestRenderToolCalls(t *testing.T) {
 			want:  []string{glyphCancelled},
 		},
 		{
-			name:        "collapsed shows first K lines and a more-marker",
+			name:        "result over the cap is trimmed with a more-marker (no ctrl+t)",
 			calls:       []ToolCallView{{ToolName: "ReadFile", Status: ToolOK, Result: makeLines(10)}},
 			expandTools: false,
 			width:       80,
-			// K = 6 → lines 0..5 shown, lines 6..9 hidden, "4 more" marker.
-			want:   []string{"line0", "line5", "4 more lines", "ctrl+t"},
-			absent: []string{"line6", "line9"},
+			// HARD cap = previewLineCap (3) → lines 0..2 shown, 3..9 hidden, "7 more" marker.
+			want:   []string{"line0", "line2", "7 more lines"},
+			absent: []string{"line3", "line9", "ctrl+t"},
 		},
 		{
-			name:        "expanded shows all lines and no marker",
+			name:        "expanded still hard-caps the tool result (ignores expand)",
 			calls:       []ToolCallView{{ToolName: "ReadFile", Status: ToolOK, Result: makeLines(10)}},
 			expandTools: true,
 			width:       80,
-			want:        []string{"line0", "line6", "line9"},
-			absent:      []string{"more lines"},
+			want:        []string{"line0", "line2", "7 more lines"},
+			absent:      []string{"line3", "line9"},
 		},
 		{
-			name:        "exactly K lines shows all with no marker",
+			name:        "exactly cap lines shows all with no marker",
 			calls:       []ToolCallView{{ToolName: "ReadFile", Status: ToolOK, Result: makeLines(previewLineCap)}},
 			expandTools: false,
 			width:       80,
-			want:        []string{"line0", "line5"},
+			want:        []string{"line0"},
 			absent:      []string{"more lines"},
 		},
 		{
@@ -336,7 +337,7 @@ func TestRenderLiveAssistantCards(t *testing.T) {
 		t.Parallel()
 
 		calls := []ToolCallView{{ToolName: "Bash", Summary: "ls", Status: ToolRunning}}
-		got := stripANSI(renderLiveAssistant("", "checking now", calls, false, 80, a))
+		got := stripANSI(renderLiveAssistant("", "checking now", calls, nil, false, 80, a))
 		for _, w := range []string{"checking now", "Bash", "ls"} {
 			if !strings.Contains(got, w) {
 				t.Errorf("renderLiveAssistant() = %q, want to contain %q", got, w)
@@ -348,13 +349,100 @@ func TestRenderLiveAssistantCards(t *testing.T) {
 		t.Parallel()
 
 		calls := []ToolCallView{{ToolName: "Bash", Status: ToolRunning}}
-		got := stripANSI(renderLiveAssistant("", "", calls, false, 80, a))
+		got := stripANSI(renderLiveAssistant("", "", calls, nil, false, 80, a))
 		for _, w := range []string{strings.TrimSpace(styles.Dot), "Bash"} {
 			if !strings.Contains(got, w) {
 				t.Errorf("renderLiveAssistant() = %q, want to contain %q", got, w)
 			}
 		}
 	})
+
+	t.Run("many calls keep only the most recent, with an earlier-calls marker", func(t *testing.T) {
+		t.Parallel()
+
+		calls := make([]ToolCallView, 0, liveCallCap+3)
+		for i := 0; i < liveCallCap+3; i++ {
+			calls = append(calls, ToolCallView{ToolName: "Bash", Summary: "cmd" + strconv.Itoa(i), Status: ToolOK, Result: []string{"out"}})
+		}
+		// The narration ("the answer") is the top content the assistant bullet anchors.
+		got := stripANSI(renderLiveAssistant("", "the answer", calls, nil, false, 80, a))
+
+		hidden := len(calls) - liveCallCap
+		if !strings.Contains(got, "… "+strconv.Itoa(hidden)+" earlier calls") {
+			t.Errorf("missing '… %d earlier calls' marker in %q", hidden, got)
+		}
+		if !strings.Contains(got, "the answer") {
+			t.Errorf("top narration dropped; the bullet must stay anchored: %q", got)
+		}
+		if strings.Contains(got, "cmd0") { // oldest cards are elided
+			t.Errorf("oldest card cmd0 should be elided in %q", got)
+		}
+		if last := "cmd" + strconv.Itoa(len(calls)-1); !strings.Contains(got, last) { // newest shows
+			t.Errorf("most recent card %q missing in %q", last, got)
+		}
+	})
+}
+
+// TestRenderLiveAssistantSubagentCard (live-tail card path): a pending Subagent card in
+// the live tail renders the SAME nested "● Subagent(<agent>)" card as the committed form
+// (header + ⎿ children + "running · N steps"), and — because the only activity in the
+// step is the spawned subagent (no ordinary calls) — does NOT show a rotating
+// working-word headline.
+func TestRenderLiveAssistantSubagentCard(t *testing.T) {
+	t.Parallel()
+
+	subagentCards := []ToolCallView{{
+		ToolName: "Subagent", Agent: "explorer", Task: "map repo",
+		Children:  []ToolCallView{{ToolName: "Glob", Status: ToolOK}},
+		Steps:     1,
+		SubStatus: subRunning,
+	}}
+	got := stripANSI(renderLiveAssistant("", "", nil, subagentCards, false, 80, animState{}))
+
+	for _, w := range []string{"Subagent(explorer)", "map repo", "Glob", "running" + hintSeparator + "1 step"} {
+		if !strings.Contains(got, w) {
+			t.Errorf("live subagent card = %q, want to contain %q", got, w)
+		}
+	}
+	// No working-word: the step only spawned a subagent, so there is no ordinary
+	// card-only headline.
+	for _, w := range workingWords {
+		if strings.Contains(got, w) {
+			t.Errorf("live subagent card = %q, must NOT show a working-word (%q)", got, w)
+		}
+	}
+}
+
+// TestRenderLiveAssistantSuppressesRawSubagentCall (live-tail suppression): while a
+// subagent streams, the orchestrator's own live tool list carries a raw running
+// "Subagent(Subagent)" tool card. That raw call must be SUPPRESSED in the live tail (it
+// is replaced by the nested pending card), so the tail shows the nested card and not the
+// doubled raw Subagent tool row.
+func TestRenderLiveAssistantSuppressesRawSubagentCall(t *testing.T) {
+	t.Parallel()
+
+	// nonSubagentCalls is what renderLiveTail passes for `calls`: the raw Subagent call is
+	// filtered out before reaching renderLiveAssistant.
+	rawCalls := []ToolCallView{{ToolName: "Subagent", Summary: "Subagent", Status: ToolRunning}}
+	filtered := nonSubagentCalls(rawCalls)
+	if len(filtered) != 0 {
+		t.Fatalf("nonSubagentCalls dropped %d of %d raw Subagent calls, want all filtered", len(rawCalls)-len(filtered), len(rawCalls))
+	}
+
+	pending := []ToolCallView{{
+		ToolName: "Subagent", Agent: "explorer", Task: "map repo",
+		Children:  []ToolCallView{{ToolName: "Glob", Status: ToolOK}},
+		Steps:     1,
+		SubStatus: subRunning,
+	}}
+	got := stripANSI(renderLiveAssistant("", "", filtered, pending, false, 80, animState{}))
+
+	if strings.Contains(got, "Subagent(Subagent)") {
+		t.Errorf("live tail shows the raw Subagent(Subagent) tool card; want it suppressed: %q", got)
+	}
+	if !strings.Contains(got, "Subagent(explorer)") {
+		t.Errorf("live tail missing the nested Subagent(explorer) card: %q", got)
+	}
 }
 
 // TestRenderLiveRunningCardIsHeaderOnly locks the live→committed handoff fix
@@ -375,7 +463,7 @@ func TestRenderLiveRunningCardIsHeaderOnly(t *testing.T) {
 		t.Parallel()
 
 		calls := []ToolCallView{{ToolName: "Fetch", Summary: "GET weather.com", Status: ToolRunning}}
-		got := stripANSI(renderLiveAssistant("", "", calls, true, 80, a))
+		got := stripANSI(renderLiveAssistant("", "", calls, nil, true, 80, a))
 		// The bare bullet (●/◦) is its own line; the running card is exactly one more.
 		lines := strings.Split(got, "\n")
 		if len(lines) != 2 {
@@ -400,7 +488,7 @@ func TestRenderLiveRunningCardIsHeaderOnly(t *testing.T) {
 		calls := []ToolCallView{{
 			ToolName: "Bash", Summary: "ls", Status: ToolOK, Result: []string{"file-a", "file-b"},
 		}}
-		got := stripANSI(renderLiveAssistant("", "", calls, true, 80, a))
+		got := stripANSI(renderLiveAssistant("", "", calls, nil, true, 80, a))
 		for _, w := range []string{"Bash", "ls", "file-a", "file-b"} {
 			if !strings.Contains(got, w) {
 				t.Errorf("resolved live card = %q, want to contain %q", got, w)
@@ -526,22 +614,22 @@ func TestRenderThinkingExpandedRailOnEveryLine(t *testing.T) {
 // folded (first K lines + "more lines" marker). Expanded (expand=true): the full
 // "│ "-prefixed thinking body renders AND the tool result shows every line. The
 // SAME flag flips both — there is no separate thinking key.
-func TestRenderAssistantUnifiedExpand(t *testing.T) {
+func TestExpandFoldsThinkingNotToolOutput(t *testing.T) {
 	t.Parallel()
 
 	const thinking = "reason one\nreason two\nreason three"
 	calls := []ToolCallView{{ToolName: "ReadFile", Status: ToolOK, Result: makeLines(10)}}
 
-	// The thinking fold lives in renderAssistant; the tool-result fold in renderToolCalls.
-	// Screen threads the SAME expand flag to both (entryrender.go), so collapsed/expanded
-	// must flip them together.
+	// The thinking fold (renderAssistant) honors the ctrl+t expand flag. The tool-result
+	// preview (renderToolCalls) is HARD-capped to previewLineCap lines regardless of expand,
+	// so a huge result can never fill the live tail or strand a commit-time gap.
 	thinkCollapsed := stripANSI(renderAssistant(thinking, "the answer", "", false, 80))
-	toolCollapsed := stripANSI(renderToolCalls(calls, false, 80))
 	thinkExpanded := stripANSI(renderAssistant(thinking, "the answer", "", true, 80))
+	toolCollapsed := stripANSI(renderToolCalls(calls, false, 80))
 	toolExpanded := stripANSI(renderToolCalls(calls, true, 80))
 
-	// Collapsed: thinking is the compact summary (count + ctrl+t), no "│ " body;
-	// the tool result is folded (first K lines, a more-marker, later lines hidden).
+	// Thinking DOES flip: collapsed is the compact "thinking · N lines · ctrl+t" summary
+	// (no "│ " body); expanded is the full "│ "-prefixed body.
 	for _, w := range []string{"thinking", "3 lines", "ctrl+t"} {
 		if !strings.Contains(thinkCollapsed, w) {
 			t.Errorf("collapsed thinking missing %q in %q", w, thinkCollapsed)
@@ -550,31 +638,28 @@ func TestRenderAssistantUnifiedExpand(t *testing.T) {
 	if strings.Contains(thinkCollapsed, "│ reason one") {
 		t.Errorf("collapsed thinking must NOT show the body in %q", thinkCollapsed)
 	}
-	for _, w := range []string{"line0", "line5", "more lines"} {
-		if !strings.Contains(toolCollapsed, w) {
-			t.Errorf("collapsed tool missing %q in %q", w, toolCollapsed)
-		}
-	}
-	for _, a := range []string{"line6", "line9"} {
-		if strings.Contains(toolCollapsed, a) {
-			t.Errorf("collapsed tool must NOT contain %q in %q", a, toolCollapsed)
-		}
-	}
-
-	// Expanded: the full "│ "-prefixed thinking body — header included — AND every
-	// tool-result line.
 	for _, w := range []string{"│ thinking", "│ reason one", "│ reason three"} {
 		if !strings.Contains(thinkExpanded, w) {
 			t.Errorf("expanded thinking missing %q in %q", w, thinkExpanded)
 		}
 	}
-	for _, w := range []string{"line6", "line9"} {
-		if !strings.Contains(toolExpanded, w) {
-			t.Errorf("expanded tool missing %q in %q", w, toolExpanded)
+
+	// Tool output does NOT flip: BOTH expand states hard-cap to previewLineCap (3) lines
+	// with a "… N more lines" marker; later lines never show, and there is no ctrl+t hint.
+	for _, label := range []struct {
+		name string
+		out  string
+	}{{"collapsed", toolCollapsed}, {"expanded", toolExpanded}} {
+		for _, w := range []string{"line0", "line2", "more lines"} {
+			if !strings.Contains(label.out, w) {
+				t.Errorf("%s tool missing %q in %q", label.name, w, label.out)
+			}
 		}
-	}
-	if strings.Contains(toolExpanded, "more lines") {
-		t.Errorf("expanded tool must NOT contain the more-marker in %q", toolExpanded)
+		for _, a := range []string{"line3", "line9", "ctrl+t"} {
+			if strings.Contains(label.out, a) {
+				t.Errorf("%s tool must NOT contain %q in %q", label.name, a, label.out)
+			}
+		}
 	}
 }
 
@@ -658,6 +743,134 @@ func TestRenderEntryHeadline(t *testing.T) {
 	}
 }
 
+// TestRenderEntrySubagentCard covers the committed Subagent card render (design §5/§4):
+// a kindTool entry whose ToolCallView has Agent set renders as a "●"-level card
+// "Subagent(<agent>)  \"<task>\"" with its children as "⎿" rows and a final
+// "⎿ done · N steps — \"<summary>\"" line. The card's own Result (the done summary)
+// must appear ONLY in that done child, never also as a separate result body (no
+// doubling). The "+M nested subagent steps" line shows only when Nested > 0.
+func TestRenderEntrySubagentCard(t *testing.T) {
+	t.Parallel()
+
+	e := entry{
+		Kind: kindTool,
+		Calls: []ToolCallView{{
+			ToolName:  "Subagent",
+			Agent:     "explorer",
+			Task:      "map repo",
+			Steps:     6,
+			SubStatus: subDone,
+			Result:    []string{"found 12 packages"},
+			Children: []ToolCallView{
+				{ToolName: "Grep", Status: ToolOK, Result: []string{"hit"}},
+				{ToolName: "Read", Status: ToolOK, Result: []string{"contents"}},
+			},
+		}},
+	}
+	got := stripANSI(strings.Join(renderEntry(e, false, 100), "\n"))
+
+	// Header: the "●" bullet, the standard tool-card "Subagent(explorer)" form, and the
+	// task in quotes.
+	for _, w := range []string{strings.TrimSpace(styles.Dot), "Subagent(explorer)", `"map repo"`} {
+		if !strings.Contains(got, w) {
+			t.Errorf("subagent card = %q, want %q", got, w)
+		}
+	}
+	// Two child cards under the header, each at the ⎿ level.
+	if !strings.Contains(got, "Grep") || !strings.Contains(got, "Read") {
+		t.Errorf("subagent card = %q, want the Grep and Read child rows", got)
+	}
+	// The done child: verb + step count + summary.
+	for _, w := range []string{"done", "6 steps", "found 12 packages"} {
+		if !strings.Contains(got, w) {
+			t.Errorf("subagent card = %q, want the done child %q", got, w)
+		}
+	}
+	// No doubling: "found 12 packages" appears exactly once (only in the done child),
+	// not also as a separate result-preview body.
+	if n := strings.Count(got, "found 12 packages"); n != 1 {
+		t.Errorf("subagent card = %q, summary appears %d times, want exactly 1 (no doubling)", got, n)
+	}
+	// Never a doubled "⎿ ⎿" connector — children are ONE indent level under the header.
+	if strings.Contains(got, cardConnector+cardConnector) {
+		t.Errorf("subagent card = %q, must NOT nest ⎿ under ⎿", got)
+	}
+	// Nested == 0 → no nested-steps line.
+	if strings.Contains(got, "nested subagent steps") {
+		t.Errorf("subagent card = %q, must NOT show the nested line when Nested==0", got)
+	}
+}
+
+// TestRenderEntrySubagentCardTerminals covers the done-line verb per SubStatus and the
+// nested-steps line: failed shows the error text, interrupted omits the summary, and a
+// positive Nested adds the "+M nested subagent steps" line.
+func TestRenderEntrySubagentCardTerminals(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		status subStatus
+		result []string
+		nested int
+		want   []string
+		absent []string
+	}{
+		{
+			name:   "done shows the summary",
+			status: subDone,
+			result: []string{"all good"},
+			want:   []string{"done", "all good"},
+		},
+		{
+			name:   "failed shows the error text",
+			status: subFailed,
+			result: []string{"boom: it broke"},
+			want:   []string{"failed", "boom: it broke"},
+			absent: []string{"done"},
+		},
+		{
+			name:   "interrupted omits the summary",
+			status: subInterrupted,
+			result: []string{"ignored summary"},
+			want:   []string{"interrupted"},
+			absent: []string{"ignored summary"},
+		},
+		{
+			name:   "nested counter shows when positive",
+			status: subDone,
+			result: []string{"ok"},
+			nested: 3,
+			want:   []string{"+3 nested subagent steps"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			e := entry{Kind: kindTool, Calls: []ToolCallView{{
+				ToolName:  "Subagent",
+				Agent:     "explorer",
+				Task:      "task",
+				Steps:     2,
+				SubStatus: tt.status,
+				Result:    tt.result,
+				Nested:    tt.nested,
+			}}}
+			got := stripANSI(strings.Join(renderEntry(e, false, 100), "\n"))
+			for _, w := range tt.want {
+				if !strings.Contains(got, w) {
+					t.Errorf("subagent card (%s) = %q, want %q", tt.name, got, w)
+				}
+			}
+			for _, a := range tt.absent {
+				if strings.Contains(got, a) {
+					t.Errorf("subagent card (%s) = %q, must NOT contain %q", tt.name, got, a)
+				}
+			}
+		})
+	}
+}
+
 // TestRenderLiveAssistantWorkingWord covers the LIVE empty-text tool step (design §3
 // rule 4): a card-only live segment renders a working-word from workingWords beside the
 // blinking dot — a live "doing work" affordance — rather than a bare bullet. The
@@ -668,7 +881,7 @@ func TestRenderLiveAssistantWorkingWord(t *testing.T) {
 
 	calls := []ToolCallView{{ToolName: "Bash", Status: ToolRunning}}
 	for _, frame := range []uint{0, 1, 5} {
-		got := stripANSI(renderLiveAssistant("", "", calls, false, 80, animState{frame: frame}))
+		got := stripANSI(renderLiveAssistant("", "", calls, nil, false, 80, animState{frame: frame}))
 		headline := got
 		if i := strings.IndexByte(got, '\n'); i >= 0 {
 			headline = got[:i] // the headline is the first line; cards follow below

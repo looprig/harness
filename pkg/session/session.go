@@ -424,6 +424,21 @@ func (s *Session) deliverSubagentResult(ctx context.Context, parentLoopID, fromL
 // loop handle and returns only the loop id, because callers route through
 // session methods rather than writing to a loop command channel directly.
 func (s *Session) NewLoop(parent loop.Provenance, cfg loop.Config) (uuid.UUID, error) {
+	// A plain NewLoop is never spawned by a Subagent tool call, so it carries no
+	// parent tool-use id; the private newLoop does the real work. RunSubagent is the
+	// only path that threads a non-empty id (its child's LoopStarted correlates back
+	// to the spawning tool call).
+	return s.newLoop(parent, cfg, "")
+}
+
+// newLoop is the private loop-creation core behind NewLoop and RunSubagent. It is
+// identical to the public NewLoop except that parentToolUseID is stamped onto the new
+// loop's LoopStarted (event.LoopStarted.ParentToolUseID): the durable carrier that
+// correlates a tool-spawned child loop back to its parent Subagent tool call. NewLoop
+// passes ""; RunSubagent passes the provider tool-use id of the spawning call. The id
+// rides as a plain parameter into the LoopStarted build only — it touches no identity /
+// Provenance / Header struct, so it never perturbs the loop tree or the quota/depth math.
+func (s *Session) newLoop(parent loop.Provenance, cfg loop.Config, parentToolUseID string) (uuid.UUID, error) {
 	// Whether this spawn counts toward the cumulative spawn quota. The PRIMARY loop is
 	// built by newSession via NewLoop with ZERO provenance (parent.LoopID zero) and must
 	// NOT consume a quota slot (design §6d: "primary excluded"); every subagent spawn
@@ -557,7 +572,7 @@ func (s *Session) NewLoop(parent loop.Provenance, cfg loop.Config) (uuid.UUID, e
 	// ctx param, so it publishes on the session lifetime (s.sessionCtx). The header
 	// (Coordinates/Cause + minted EventID/CreatedAt) was stamped above before the loop
 	// was built.
-	ev := event.LoopStarted{Header: startedHeader}
+	ev := event.LoopStarted{Header: startedHeader, ParentToolUseID: parentToolUseID}
 	if err := s.PublishEvent(s.sessionCtx, ev); err != nil {
 		// Mirror New's cleanup-on-publish-failure: the loop is already registered and
 		// its loopCtx cancel is live, so a bare return would leak a cancel-orphaned
@@ -903,10 +918,12 @@ func (s *Session) submitToLoop(ctx context.Context, loopID uuid.UUID, blocks []c
 // because submits carry no ctx, a ctx cancel cannot reach the sub-loop's turn — the
 // drain translates it into a single loop-targeted Interrupt (the closure below) and
 // drains to the resulting TurnInterrupted terminal.
-func (s *Session) RunSubagent(ctx context.Context, parent loop.Provenance, cfg loop.Config, blocks []content.Block) (string, error) {
-	// NewLoop publishes LoopStarted and fails SessionClosing if the session is
+func (s *Session) RunSubagent(ctx context.Context, parent loop.Provenance, cfg loop.Config, blocks []content.Block, parentToolUseID string) (string, error) {
+	// newLoop publishes LoopStarted and fails SessionClosing if the session is
 	// shutting down; either way no sub-loop is left behind a returned error.
-	subLoopID, err := s.NewLoop(parent, cfg)
+	// parentToolUseID is stamped onto that LoopStarted so the sub-loop correlates back
+	// to the spawning Subagent tool call across persist/restore.
+	subLoopID, err := s.newLoop(parent, cfg, parentToolUseID)
 	if err != nil {
 		return "", err
 	}

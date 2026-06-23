@@ -11,10 +11,28 @@ import (
 	"github.com/ciram-co/looprig/pkg/tui/styles"
 )
 
-// previewLineCap (K) is how many result-preview lines a collapsed tool card shows
-// before the "… N more lines · ctrl+t" marker. Expanding (ctrl+t) shows all of the
-// runner-capped preview, so this is purely a display fold, not a content cap.
-const previewLineCap = 6
+// previewLineCap is the HARD cap on result-preview lines a tool card shows: a result with
+// more lines is trimmed to the first previewLineCap lines plus a "… N more lines" marker.
+// The cap applies ALWAYS — regardless of the ctrl+t expand fold (which now governs only the
+// thinking block). A huge tool result (e.g. a long diff) otherwise fills the live tail,
+// scrolling the assistant bullet off the top AND, on commit, stranding a screen-height
+// scrollback gap (the inline renderer's insertAbove math is sized off the tall live tail).
+const previewLineCap = 3
+
+// liveCallCap bounds how many of a step's tool cards the LIVE tail shows: only the most
+// recent liveCallCap, prefixed with a "… N earlier calls" marker. A step that fires many
+// tools would otherwise grow the live tail (the bubbletea managed region) to fill the whole
+// screen — scrolling the assistant bullet off the top and forcing a full-screen repaint each
+// frame. The elided cards still commit IN FULL to scrollback at the step's StepDone.
+const liveCallCap = 3
+
+// liveThinkingCap bounds how many reasoning lines the LIVE tail shows when thinking is
+// expanded: only the last liveThinkingCap, behind a leading "…". A long streaming reasoning
+// block would otherwise grow the live tail (the managed region) toward the screen height,
+// which the inline renderer can't track — stranding the input/status region. The FULL
+// thinking still commits to scrollback at StepDone. Collapsed thinking is already a one-line
+// summary, so it is not affected.
+const liveThinkingCap = 8
 
 // noOutput is the placeholder shown for a completed tool call with no result lines.
 const noOutput = "(no output)"
@@ -142,12 +160,12 @@ func toolGlyph(s ToolStatus) string {
 }
 
 // renderToolCalls renders a segment's tool-call children as indented cards, each a
-// header line ("⎿ ToolName(Summary)  <glyph>") followed by its result preview. When
-// expandTools is false the preview is folded to the first previewLineCap lines plus
-// a "… N more lines · ctrl+t" marker; when true every (already runner-capped) line
-// shows. An empty result renders "(no output)". An error card's result always shows
-// (subject to the same fold), never hidden. Lines are width-wrapped so a long card
-// never blows the viewport. Returns "" when there are no calls.
+// header line ("⎿ ToolName(Summary)  <glyph>") followed by its result preview. The
+// preview is HARD-capped to previewLineCap lines plus a "… N more lines" marker
+// regardless of expandTools (the ctrl+t fold governs only the thinking block now), so a
+// huge result can never fill the live tail. An empty result renders "(no output)". An
+// error card's result is capped the same way, never hidden. Lines are width-wrapped so a
+// long card never blows the viewport. Returns "" when there are no calls.
 func renderToolCalls(calls []ToolCallView, expandTools bool, width int) string {
 	// Committed/scrollback path: full cards, static glyphs, never header-only (a
 	// stray running card committed at a terminal still shows its body).
@@ -231,17 +249,21 @@ func decisionVerb(d gateDecision) string {
 // more than previewLineCap lines, it returns the first previewLineCap lines plus a
 // "… N more lines · ctrl+t" marker (N = the remainder). When expanded, every line
 // shows (the runner already capped the preview — no extra TUI cap).
-func previewLines(result []string, expandTools bool) []string {
+func previewLines(result []string, _ bool) []string {
+	// The expand flag is intentionally IGNORED for tool results: the preview is HARD-capped
+	// to previewLineCap lines regardless of ctrl+t, so a huge result can never fill the live
+	// tail (hiding the assistant bullet) or strand a commit-time scrollback gap. ctrl+t still
+	// folds the thinking block. (The bool param is retained for call-site compatibility.)
 	if len(result) == 0 {
 		return []string{noOutput}
 	}
-	if expandTools || len(result) <= previewLineCap {
+	if len(result) <= previewLineCap {
 		return result
 	}
 	remaining := len(result) - previewLineCap
 	shown := make([]string, 0, previewLineCap+1)
 	shown = append(shown, result[:previewLineCap]...)
-	shown = append(shown, "… "+strconv.Itoa(remaining)+" more lines"+hintSeparator+expandHint)
+	shown = append(shown, "… "+strconv.Itoa(remaining)+" more lines")
 	return shown
 }
 
@@ -308,16 +330,143 @@ func renderPromotedTool(c ToolCallView, expand bool, width int) string {
 	return strings.Join(lines, "\n")
 }
 
+// subagentTerminalVerb maps a child loop's terminal status to its done-line verb
+// (design §4): subDone→"done", subFailed→"failed", subInterrupted→"interrupted". An
+// outstanding child (subRunning, the zero value) reads "running" — a defensive label
+// for a card committed before its terminal (a card normally commits only after the
+// child has handed back, so this is the rare in-flight case).
+func subagentTerminalVerb(s subStatus) string {
+	switch s {
+	case subDone:
+		return "done"
+	case subFailed:
+		return "failed"
+	case subInterrupted:
+		return "interrupted"
+	default:
+		return "running"
+	}
+}
+
+// renderSubagentCard renders a committed Subagent card (design §5/§4): a "●"-level
+// header "Subagent(<agent>)  \"<task>\"" beside the lit dot, the subagent's nested tool
+// calls as ordinary "⎿" cards ONE indent level under the header (never "⎿ ⎿"), then a
+// final "⎿ <verb> · N steps — \"<summary>\"" line whose verb comes from SubStatus and
+// whose summary is the card's own (suppressed-elsewhere) Result — so the hand-back text
+// shows ONLY here, never doubled as a normal result body. A subInterrupted card omits
+// the summary; subFailed shows its error text. When Nested > 0 a trailing
+// "⎿ +M nested subagent steps" line collapses the depth-2 activity (design §6). expand
+// drives the child cards' result-preview fold.
+func renderSubagentCard(c ToolCallView, expand bool, width int) string {
+	head := strings.TrimRight(styles.LitDot, " ") + " " +
+		styles.HeadlineStyle.Render(subagentHeaderText(c))
+	// Cap accounts for: header (1), the children's ONE joined element from
+	// renderToolCalls (1), the done line (1), and the optional nested line (1).
+	lines := make([]string, 0, 4)
+	lines = append(lines, head)
+
+	// Children render as the existing "⎿" tool cards, one indent level under the header.
+	if body := renderToolCalls(c.Children, expand, width); body != "" {
+		lines = append(lines, body)
+	}
+
+	// The done/failed/interrupted child carries the step count and (for done/failed) the
+	// summary — the ONLY place the hand-back text appears (no doubling).
+	lines = append(lines, subagentDoneLine(c, width))
+
+	if c.Nested > 0 {
+		nested := cardIndent + styles.ToolCallStyle.Render(
+			cardConnector+"+"+strconv.Itoa(c.Nested)+" nested subagent steps")
+		lines = append(lines, nested)
+	}
+	return strings.Join(lines, "\n")
+}
+
+// subagentHeaderText assembles a Subagent card's header body: the standard tool-card
+// form "Subagent(<agent>)" (tool name + the agent as its argument) plus the truncated
+// task in quotes when present. The task quotes are omitted for an empty task.
+func subagentHeaderText(c ToolCallView) string {
+	head := c.ToolName + "(" + c.Agent + ")"
+	if c.Task != "" {
+		head += `  "` + c.Task + `"`
+	}
+	return head
+}
+
+// subagentDoneLine builds the Subagent card's terminal "⎿" child: "<verb> · N steps"
+// from SubStatus + Steps, plus the truncated summary (the card's own Result, the
+// suppressed hand-back text) appended as `— "<summary>"` for done/failed. An
+// interrupted child omits the summary (design §4). It is width-wrapped like a card body.
+// Result is expected single-line, pre-truncated at the reduce layer; this only joins it.
+func subagentDoneLine(c ToolCallView, width int) string {
+	line := subagentTerminalVerb(c.SubStatus) + hintSeparator + plural(c.Steps, "step")
+	if summary := strings.Join(c.Result, " "); summary != "" && c.SubStatus != subInterrupted {
+		line += " — " + `"` + summary + `"`
+	}
+	return cardIndent + styles.ToolCallStyle.Render(cardConnector+line)
+}
+
+// plural renders a count with grammatical agreement on unit: "1 <unit>" (singular) for
+// n == 1, "N <unit>s" (plural) otherwise. Used by the Subagent done line ("step") and
+// the collapsed thinking summary ("line").
+func plural(n int, unit string) string {
+	if n == 1 {
+		return "1 " + unit
+	}
+	return strconv.Itoa(n) + " " + unit + "s"
+}
+
+// nonSubagentCalls returns the calls that are NOT raw Subagent tool cards (ToolName ==
+// subagentToolName). The LIVE tail suppresses the orchestrator's own raw Subagent running
+// card (a generic "Subagent(Subagent)" row) because that activity is shown by the nested
+// pending Subagent card instead (pendingSubagentCards → renderSubagentCard); rendering
+// both would double it. It returns nil when every call is a Subagent call (so the
+// working-word headline path is also suppressed for a subagent-only step). The result is a
+// fresh slice; the input is not mutated.
+func nonSubagentCalls(calls []ToolCallView) []ToolCallView {
+	var out []ToolCallView
+	for _, c := range calls {
+		if c.ToolName == subagentToolName {
+			continue
+		}
+		out = append(out, c)
+	}
+	return out
+}
+
 // renderLiveAssistant renders the in-progress (live) assistant segment with the
 // animation state threaded in: the leading bullet blinks (liveDot) and a still-running
 // tool card's glyph cycles through the spinner (spinnerGlyph), while resolved cards
 // keep their static ✓/✗. It mirrors renderAssistant's ordering (thinking → narration
 // → cards) but is the LIVE path ONLY — the committed renderAssistant stays static and
 // is never given an anim. Empty parts are omitted.
-func renderLiveAssistant(thinking, text string, calls []ToolCallView, expand bool, width int, a animState) string {
+//
+// calls is the NON-Subagent live tool list (the caller filters the raw Subagent call out
+// via nonSubagentCalls); subagentCards are the in-flight nested Subagent cards
+// (pendingSubagentCards), each rendered as its own "●"-level card (renderSubagentCard)
+// below the ordinary calls, separated by a blank line. The working-word headline shows
+// ONLY when there is no narration AND at least one ORDINARY call (len(calls) > 0) — a step
+// that only spawned subagents does NOT show "◦ Whirring", its activity is the nested card.
+// liveThinkingTail trims an EXPANDED live thinking block to its last liveThinkingCap lines,
+// behind a leading "…", so a long streaming reasoning block can't grow the live tail past the
+// inline renderer's small-managed-region budget (a tall managed region is what strands the
+// input/status rows). Collapsed thinking is already a one-line summary, so it is returned
+// unchanged; the FULL thinking still commits to scrollback at StepDone.
+func liveThinkingTail(s string, expand bool) string {
+	if !expand {
+		return s
+	}
+	lines := strings.Split(strings.TrimRight(s, "\n"), "\n")
+	if len(lines) <= liveThinkingCap {
+		return s
+	}
+	return "…\n" + strings.Join(lines[len(lines)-liveThinkingCap:], "\n")
+}
+
+func renderLiveAssistant(thinking, text string, calls, subagentCards []ToolCallView, expand bool, width int, a animState) string {
 	var b strings.Builder
 
-	if t := renderThinking(thinking, expand, width); t != "" {
+	if t := renderThinking(liveThinkingTail(thinking, expand), expand, width); t != "" {
 		b.WriteString(t)
 	}
 
@@ -325,7 +474,8 @@ func renderLiveAssistant(thinking, text string, calls []ToolCallView, expand boo
 	if body == "" && len(calls) > 0 {
 		// Live empty-text tool step: a rotating working-word beside the blinking dot —
 		// the provisional, pre-StepDone counterpart of the committed promoted-tool /
-		// "Multiple actions" headline. The word may rotate while the step runs.
+		// "Multiple actions" headline. The word may rotate while the step runs. It is
+		// keyed on the NON-Subagent calls, so a subagent-only step shows no working-word.
 		body = strings.TrimRight(liveDot(a.blink), " ") + " " + styles.HeadlineStyle.Render(workingWord(a.frame))
 	}
 	if body != "" {
@@ -339,10 +489,28 @@ func renderLiveAssistant(thinking, text string, calls []ToolCallView, expand boo
 		if b.Len() > 0 {
 			b.WriteString("\n")
 		}
+		// Cap the live tail to the most recent liveCallCap tool cards (keeping the running
+		// one), prefixed with a "… N earlier calls" marker, so a many-tool step can't grow
+		// the managed region to fill the screen and drop the assistant bullet. The full set
+		// commits to scrollback at StepDone.
+		shown := calls
+		if hidden := len(calls) - liveCallCap; hidden > 0 {
+			shown = calls[hidden:]
+			b.WriteString(cardIndent + styles.ToolCallStyle.Render(cardConnector+"… "+strconv.Itoa(hidden)+" earlier calls") + "\n")
+		}
 		// liveRunning=true: a still-running card renders header-only in the live tail
 		// so the live→committed handoff is a one-line→full-card continuation, not a
 		// multi-line live shrink (see renderToolCard).
-		b.WriteString(renderToolCallsGlyph(calls, expand, width, liveToolGlyph(a.frame), true))
+		b.WriteString(renderToolCallsGlyph(shown, expand, width, liveToolGlyph(a.frame), true))
+	}
+
+	// Each pending subagent card is its OWN "●"-level card (like the committed form),
+	// separated by a blank line from whatever precedes it.
+	for i := range subagentCards {
+		if b.Len() > 0 {
+			b.WriteString("\n\n")
+		}
+		b.WriteString(renderSubagentCard(subagentCards[i], expand, width))
 	}
 	return b.String()
 }
@@ -459,7 +627,7 @@ func renderThinking(s string, expand bool, width int) string {
 	}
 	if !expand {
 		n := strings.Count(s, "\n") + 1 // thinking content lines
-		summary := styles.ThinkingHeader + hintSeparator + pluralLines(n) + hintSeparator + expandHint
+		summary := styles.ThinkingHeader + hintSeparator + plural(n, "line") + hintSeparator + expandHint
 		return styles.ThinkingStyle.Render(summary)
 	}
 	out := []string{styles.ThinkingStyle.Render(thinkingRail + styles.ThinkingHeader)}
@@ -469,15 +637,6 @@ func renderThinking(s string, expand bool, width int) string {
 		}
 	}
 	return strings.Join(out, "\n")
-}
-
-// pluralLines renders a line count with grammatical agreement: "1 line" (singular)
-// for n == 1, "N lines" (plural) otherwise. Used by the collapsed thinking summary.
-func pluralLines(n int) string {
-	if n == 1 {
-		return "1 line"
-	}
-	return strconv.Itoa(n) + " lines"
 }
 
 // wrapToWidth word-wraps s to width columns and returns the resulting rows with
