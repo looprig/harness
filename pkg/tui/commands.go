@@ -185,9 +185,21 @@ func printPayload(actions []printAction) string {
 // printToScrollback emits the assembled payload to the native terminal scrollback
 // via tea.Println. It returns nil (a no-op command) when there is nothing to print,
 // so the caller can dispatch it unconditionally.
+//
+// Two no-op cases: no actions, and a non-empty action set whose assembled payload is
+// still empty. The latter is defensive-in-depth: every COMMITTED entry renders to at
+// least one line (renderEntry's assistant/user/tool/notice paths are all non-empty for a
+// committed entry — empty assistant/prose is rejected at the commit guards, every
+// committed tool entry carries exactly one card), so a blank payload should never occur.
+// But the non-emptiness rests on those UPSTREAM commit invariants, not on anything local
+// here; guarding on the assembled payload keeps this layer self-contained rather than
+// leaning on the renderer's own `len(str)==0` early-return in insertAbove. A blank
+// payload is dropped (a stray tea.Println("") would page nothing anyway) so it is never
+// silently turned into a scrollback no-op we cannot see — it simply does not dispatch.
 func printToScrollback(actions []printAction) tea.Cmd {
-	if len(actions) == 0 {
+	payload := printPayload(actions)
+	if payload == "" {
 		return nil
 	}
-	return tea.Println(printPayload(actions))
+	return tea.Println(payload)
 }

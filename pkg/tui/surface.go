@@ -137,7 +137,7 @@ func surfaceView(in surfaceInputs) string {
 }
 
 // clampSurfaceHeight drops leading lines so the composed active surface never exceeds
-// height physical rows — the HEIGHT fail-safe symmetric to clampSurfaceWidth, and just
+// height-1 physical rows — the HEIGHT fail-safe symmetric to clampSurfaceWidth, and just
 // as hard an invariant for the bubbletea v2 inline renderer. The renderer sizes its
 // managed region from the View's LOGICAL line count (strings.Count(view,"\n")+1) and
 // assumes each line is one physical row; if the surface emits MORE lines than the
@@ -145,30 +145,40 @@ func surfaceView(in surfaceInputs) string {
 // which positions itself off cellbuf.Height() — desyncs and strands a block of blank
 // rows into native scrollback (the "big gap once the AI message responded" symptom).
 //
+// We clamp to height-1, NOT height, to RESERVE one row of headroom the renderer needs.
+// The vendored, paged insertAbove commits scrollback in pages capped at `cap = termRows
+// - h`, where h is the managed-region height (this surface's rendered line count) and
+// termRows is the terminal height. Rendering a surface that fills the ENTIRE terminal
+// (h == termRows) drives cap to 0, which the renderer floors to 1 — its degenerate
+// 1-row-transient path, where a single committed row can transiently clamp at the top of
+// the screen and strand the managed region. Keeping the surface at most termRows-1 rows
+// holds h <= termRows-1, so cap >= 1 and the renderer never enters that degenerate path.
+//
 // The per-region budget (liveTailCap + cappedTail) normally keeps the surface within
 // height, but it only caps the LIVE TAIL: when the bottom chrome alone (a grown
 // composer, a queued affordance, or a prompt control whose budget floors above the
 // terminal) plus the status/tip rows already exceeds height, the tail floors at 0 yet
 // the chrome still overflows. This fail-safe guarantees the invariant unconditionally.
 //
-// It drops from the TOP (keeping the bottom-most height lines) to MATCH the renderer's
+// It drops from the TOP (keeping the bottom-most height-1 lines) to MATCH the renderer's
 // own over-tall-frame handling (cursed_renderer.go keeps the bottom s.height lines when
 // frameHeight > s.height) AND to preserve the most important chrome: the bottom box,
 // status, and tip stay visible longest. In the common case it sheds the live tail's
 // oldest rows first (already committed to scrollback, so nothing is lost). When the
 // terminal is small enough that even the chrome overflows, chrome rows are shed from the
 // top too — unavoidable at that size, and consistent with the renderer's own over-tall
-// handling. A non-positive height is a degenerate terminal (no managed region) — the
-// surface is dropped to the empty string.
+// handling. A height <= 1 is a degenerate terminal (height-1 leaves no renderable row) —
+// the surface is dropped to the empty string.
 func clampSurfaceHeight(surface string, height int) string {
-	if height <= 0 {
+	limit := height - 1 // reserve one row of headroom for the renderer's insertAbove (cap = termRows - h)
+	if limit <= 0 {
 		return ""
 	}
 	lines := strings.Split(surface, "\n")
-	if len(lines) <= height {
+	if len(lines) <= limit {
 		return surface
 	}
-	return strings.Join(lines[len(lines)-height:], "\n")
+	return strings.Join(lines[len(lines)-limit:], "\n")
 }
 
 // queuedHeight is the row count of the pre-rendered queued affordance (0 when

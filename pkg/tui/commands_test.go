@@ -338,6 +338,10 @@ func TestPrintToScrollback(t *testing.T) {
 	}{
 		{name: "empty is no-op (nil cmd)", actions: nil, wantNil: true},
 		{name: "non-empty returns a command", actions: []printAction{{Lines: []string{"a", ""}}}, wantNil: false},
+		// Defensive: an action carrying no renderable content (Lines that join to "")
+		// must NOT dispatch tea.Println("") — see printToScrollback's blank-payload guard.
+		{name: "action with nil lines is no-op", actions: []printAction{{EntryID: 1, Lines: nil}}, wantNil: true},
+		{name: "action with a single empty line is no-op", actions: []printAction{{EntryID: 1, Lines: []string{""}}}, wantNil: true},
 	}
 
 	for _, tt := range tests {

@@ -391,10 +391,12 @@ func TestClampSurfaceWidth(t *testing.T) {
 	}
 }
 
-// TestClampSurfaceHeight covers the height fail-safe directly: an over-tall surface is
-// trimmed to height rows by dropping LEADING lines (the renderer keeps the bottom rows,
-// so we match it — the bottom box/status/tip survive), a within-budget surface is
-// untouched, and a zero/negative height drops the surface to empty.
+// TestClampSurfaceHeight covers the height fail-safe directly: the surface is trimmed
+// to height-1 rows (one row of headroom is RESERVED, never rendered — see
+// clampSurfaceHeight) by dropping LEADING lines (the renderer keeps the bottom rows, so
+// we match it — the bottom box/status/tip survive), a surface already within the
+// height-1 budget is untouched, and a height <= 1 drops the surface to empty (no managed
+// region the renderer can page around).
 func TestClampSurfaceHeight(t *testing.T) {
 	t.Parallel()
 
@@ -408,10 +410,16 @@ func TestClampSurfaceHeight(t *testing.T) {
 		// safe keeps the bottom-most lines).
 		wantKeepsBottom string
 	}{
-		{name: "over-tall trimmed to height", surface: "a\nb\nc\nd\ne", height: 3, wantHeight: 3, wantKeepsBottom: "e"},
-		{name: "exact fit untouched", surface: "a\nb\nc", height: 3, wantHeight: 3, wantKeepsBottom: "c"},
+		// A surface of exactly H rows clamps to H-1 (the reserved headroom row).
+		{name: "exactly height clamps to height minus one", surface: "a\nb\nc\nd\ne", height: 5, wantHeight: 4, wantKeepsBottom: "e"},
+		// Over-tall: keep the bottom-most height-1 rows.
+		{name: "over-tall trimmed to height minus one", surface: "a\nb\nc\nd\ne", height: 3, wantHeight: 2, wantKeepsBottom: "e"},
+		// A surface already <= H-1 is unchanged.
+		{name: "already within budget untouched", surface: "a\nb\nc", height: 5, wantHeight: 3, wantKeepsBottom: "c"},
+		{name: "exactly height minus one untouched", surface: "a\nb", height: 3, wantHeight: 2, wantKeepsBottom: "b"},
 		{name: "shorter than height untouched", surface: "a\nb", height: 5, wantHeight: 2, wantKeepsBottom: "b"},
-		{name: "single line height one", surface: "only", height: 1, wantHeight: 1, wantKeepsBottom: "only"},
+		// H == 1 yields "" (height-1 == 0: no renderable row).
+		{name: "height one drops surface", surface: "only", height: 1, wantHeight: -1},
 		{name: "zero height drops surface", surface: "a\nb\nc", height: 0, wantHeight: -1},
 		{name: "negative height drops surface", surface: "a\nb\nc", height: -2, wantHeight: -1},
 	}
