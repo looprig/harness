@@ -1089,6 +1089,61 @@ func TestCtrlTFlipsThinkingNotToolOutputInLiveTail(t *testing.T) {
 	}
 }
 
+// TestLiveTailStaysBoundedAcrossSteps is the architectural guard against the "input block
+// repainted twice / stranded" bug. In an inline (non-alt-screen) TUI the live tail is the
+// renderer's MANAGED region; if it grows toward the screen height the relative-cursor
+// renderer can't track the terminal scroll and strands a copy of the bottom region (input +
+// status + prompt). So the live tail MUST stay small regardless of how much a step streams.
+// This drives two pathologically large in-progress steps (100-line reasoning + many big tool
+// results) and asserts the live tail height stays under a small bound at each — even though
+// the UNcapped render would be 500+ lines. (The actual stranding is a bubbletea renderer
+// behavior that needs a real TTY to observe; this asserts the invariant that prevents it.)
+func TestLiveTailStaysBoundedAcrossSteps(t *testing.T) {
+	t.Parallel()
+
+	m := runningScreen(t, &fakeAgent{})
+	m, _ = updateScreen(t, m, tea.WindowSizeMsg{Width: 80, Height: 40})
+
+	bigThinking := func() string {
+		var b strings.Builder
+		for i := 0; i < 100; i++ {
+			b.WriteString("a long reasoning line that the model streamed\n")
+		}
+		return b.String()
+	}
+	manyBigCalls := func(n int) []ToolCallView {
+		calls := make([]ToolCallView, 0, n)
+		for i := 0; i < n; i++ {
+			out := make([]string, 20)
+			for j := range out {
+				out[j] = "a line of tool output"
+			}
+			calls = append(calls, ToolCallView{ToolName: "Bash", Summary: "cmd", Status: ToolOK, Result: out})
+		}
+		return calls
+	}
+
+	// Generous ceiling: thinking cap (~10) + body + "… earlier" + liveCallCap cards ×
+	// (header + previewLineCap output) + separators. The uncapped render would be 100 +
+	// 20×21 ≈ 520 lines.
+	const bound = 35
+
+	height := func() int { return strings.Count(m.renderLiveTail(), "\n") + 1 }
+
+	// Step 1: a huge in-progress step (long reasoning + many big tool results).
+	m.transcript.live = liveSeg{Thinking: bigThinking(), Text: "the narration", Calls: manyBigCalls(20), active: true}
+	if h := height(); h > bound {
+		t.Fatalf("step 1 live tail height = %d, want <= %d (a tall live tail strands the input region)", h, bound)
+	}
+
+	// Step 2: the prior step committed (live resets) and a NEW huge step begins. The live
+	// tail must not have accumulated across steps and must still be bounded.
+	m.transcript.live = liveSeg{Thinking: bigThinking(), Calls: manyBigCalls(15), active: true}
+	if h := height(); h > bound {
+		t.Fatalf("step 2 live tail height = %d, want <= %d", h, bound)
+	}
+}
+
 // TestComposeBlinkCmdPlumbed covers the deferred Task-8 item: a printable key in
 // compose mode forwards to the editor AND surfaces the textarea's blink Cmd, which
 // Screen batches so the composer cursor keeps blinking.
