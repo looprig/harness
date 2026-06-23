@@ -56,16 +56,22 @@ type surfaceInputs struct {
 // desync; see styles.BoxStyle). It allocates no transcript viewport. Empty regions are omitted so
 // the surface never emits stray blank rows.
 //
-// Every composed line is clamped to in.Width as the final step (clampSurfaceWidth).
-// This is a hard invariant for the bubbletea v2 inline renderer: it sizes its
-// managed region from the View's LOGICAL line count (strings.Count(view, "\n")+1)
-// and assumes each line occupies exactly one physical row. A line wider than the
-// terminal soft-wraps onto an extra physical row, so the renderer's relative-cursor
-// tracking under-counts the rows it drew; on the next frame (e.g. each step of a
-// resize drag) it repaints from the wrong row and strands the prior frame's lines
-// (the separator rule + input-box top border) into native scrollback — the resize
-// artifact cascade. Truncating (never wrapping) keeps the logical line count equal
-// to the physical row count, which is exactly what the renderer requires.
+// Every composed line is clamped to in.Width AND the whole surface to in.Height as the
+// final step (clampSurfaceWidth then clampSurfaceHeight). Both are hard invariants for
+// the bubbletea v2 inline renderer: it sizes its managed region from the View's LOGICAL
+// line count (strings.Count(view, "\n")+1) and assumes each line occupies exactly one
+// physical row. A line wider than the terminal soft-wraps onto an extra physical row,
+// so the renderer's relative-cursor tracking under-counts the rows it drew; on the next
+// frame (e.g. each step of a resize drag) it repaints from the wrong row and strands the
+// prior frame's lines (the separator rule + input-box top border) into native scrollback
+// — the resize artifact cascade. Symmetrically, a surface TALLER than the terminal
+// desyncs the renderer's insertAbove (tea.Println) cursor math and strands a block of
+// blank rows below the chrome — the "big gap once the AI message responded" symptom. The
+// per-region budget (liveTailCap + cappedTail) caps only the live tail, so when the
+// bottom chrome alone overflows the terminal, clampSurfaceHeight is the fail-safe that
+// keeps the surface within in.Height. Truncating (never wrapping) and height-clamping
+// keep the logical line count equal to the physical row count and within the terminal,
+// which is exactly what the renderer requires.
 func surfaceView(in surfaceInputs) string {
 	bottom := bottomBox(in)
 	slash := slashPanel(in.Interaction)
@@ -109,7 +115,46 @@ func surfaceView(in surfaceInputs) string {
 		rows = append(rows, "", status)
 	}
 	rows = appendNonEmpty(rows, tip)
-	return clampSurfaceWidth(strings.Join(rows, "\n"), in.Width)
+	// Width MUST be clamped before height: clampSurfaceWidth truncates (never wraps), so
+	// every logical line is exactly one physical row before clampSurfaceHeight counts
+	// lines. Reversing the order would let a wide line wrap onto an extra physical row
+	// after the height count, reintroducing the very row-count desync these guards prevent.
+	return clampSurfaceHeight(clampSurfaceWidth(strings.Join(rows, "\n"), in.Width), in.Height)
+}
+
+// clampSurfaceHeight drops leading lines so the composed active surface never exceeds
+// height physical rows — the HEIGHT fail-safe symmetric to clampSurfaceWidth, and just
+// as hard an invariant for the bubbletea v2 inline renderer. The renderer sizes its
+// managed region from the View's LOGICAL line count (strings.Count(view,"\n")+1) and
+// assumes each line is one physical row; if the surface emits MORE lines than the
+// terminal height, the renderer's insertAbove (tea.Println) relative-cursor math —
+// which positions itself off cellbuf.Height() — desyncs and strands a block of blank
+// rows into native scrollback (the "big gap once the AI message responded" symptom).
+//
+// The per-region budget (liveTailCap + cappedTail) normally keeps the surface within
+// height, but it only caps the LIVE TAIL: when the bottom chrome alone (a grown
+// composer, a queued affordance, or a prompt control whose budget floors above the
+// terminal) plus the status/tip rows already exceeds height, the tail floors at 0 yet
+// the chrome still overflows. This fail-safe guarantees the invariant unconditionally.
+//
+// It drops from the TOP (keeping the bottom-most height lines) to MATCH the renderer's
+// own over-tall-frame handling (cursed_renderer.go keeps the bottom s.height lines when
+// frameHeight > s.height) AND to preserve the most important chrome: the bottom box,
+// status, and tip stay visible longest. In the common case it sheds the live tail's
+// oldest rows first (already committed to scrollback, so nothing is lost). When the
+// terminal is small enough that even the chrome overflows, chrome rows are shed from the
+// top too — unavoidable at that size, and consistent with the renderer's own over-tall
+// handling. A non-positive height is a degenerate terminal (no managed region) — the
+// surface is dropped to the empty string.
+func clampSurfaceHeight(surface string, height int) string {
+	if height <= 0 {
+		return ""
+	}
+	lines := strings.Split(surface, "\n")
+	if len(lines) <= height {
+		return surface
+	}
+	return strings.Join(lines[len(lines)-height:], "\n")
 }
 
 // queuedHeight is the row count of the pre-rendered queued affordance (0 when

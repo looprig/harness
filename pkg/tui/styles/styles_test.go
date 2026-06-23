@@ -1,6 +1,7 @@
 package styles
 
 import (
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -168,6 +169,129 @@ func TestNewMarkdownRendererHeadingNoHashes(t *testing.T) {
 			}
 			if strings.Contains(out, "#") {
 				t.Errorf("Render(%q) = %q, must NOT contain a '#' hash marker", tt.md, out)
+			}
+		})
+	}
+}
+
+// markdownSGR matches CSI ... m (SGR) escape sequences in glamour output.
+var markdownSGR = regexp.MustCompile("\x1b\\[([0-9;]*)m")
+
+// sgrParamIsRed reports whether a single SGR param list sets a RED foreground.
+// It parses tokens (split on ';') so 256-color/truecolor introducers are matched as
+// whole color tokens — NOT naive substrings (which would falsely match "38;5;1"
+// inside "38;5;187"). Red = basic 31/91, the reddish 256-color palette glamour's
+// code-block chroma theme emits (Operator #EF8080 → "210", GenericDeleted #FD5B5B →
+// "203", plus other true reds), or a truecolor with a high-R, low-G/B foreground.
+func sgrParamIsRed(params string) bool {
+	red256 := map[int]bool{
+		1: true, 9: true, 196: true, 203: true, 210: true,
+		160: true, 161: true, 167: true, 197: true, 204: true,
+	}
+	atoi := func(s string) int {
+		n := 0
+		for _, c := range s {
+			if c < '0' || c > '9' {
+				return -1
+			}
+			n = n*10 + int(c-'0')
+		}
+		return n
+	}
+	toks := strings.Split(params, ";")
+	for i := 0; i < len(toks); i++ {
+		if toks[i] == "31" || toks[i] == "91" {
+			return true
+		}
+		if toks[i] == "38" && i+2 < len(toks) && toks[i+1] == "5" {
+			if red256[atoi(toks[i+2])] {
+				return true
+			}
+			i += 2
+			continue
+		}
+		if toks[i] == "38" && i+4 < len(toks) && toks[i+1] == "2" {
+			r, g, b := atoi(toks[i+2]), atoi(toks[i+3]), atoi(toks[i+4])
+			if r >= 180 && g >= 0 && g <= 150 && b >= 0 && b <= 150 {
+				return true
+			}
+			i += 4
+			continue
+		}
+	}
+	return false
+}
+
+// renderHasRedRun reports whether any non-whitespace text run in the rendered output
+// carries a red SGR foreground (the leading SGR escape before the run). Walks the SGR
+// escapes and inspects the text between each escape and the next.
+func renderHasRedRun(out string) (string, bool) {
+	idxs := markdownSGR.FindAllStringSubmatchIndex(out, -1)
+	for i, m := range idxs {
+		params := out[m[2]:m[3]]
+		if !sgrParamIsRed(params) {
+			continue
+		}
+		runStart := m[1]
+		runEnd := len(out)
+		if i+1 < len(idxs) {
+			runEnd = idxs[i+1][0]
+		}
+		run := out[runStart:runEnd]
+		if strings.TrimSpace(run) != "" {
+			return run, true
+		}
+	}
+	return "", false
+}
+
+// TestNewMarkdownRendererCodeBlockNoRedSymbols is the regression guard for the TUI
+// bug where structural symbols in CODE BLOCKS rendered RED. Root cause: glamour's
+// DarkStyleConfig code-block chroma theme colors the Operator token ("/", "+", "-",
+// "=", "->", …) salmon-red (#EF8080 → ANSI 256 "210") and the GenericDeleted token
+// (diff "-" lines) red (#FD5B5B → "203"). NewMarkdownRenderer now retones both to a
+// neutral gray. This asserts NO red SGR run survives for representative code blocks
+// exercising those symbols; before the fix the Operator/GenericDeleted runs were red.
+func TestNewMarkdownRendererCodeBlockNoRedSymbols(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		md   string
+	}{
+		{
+			name: "go operators (slash, plus, minus, arrow)",
+			md:   "```go\nx := a / b + c - d\ny <- ch\n```\n",
+		},
+		{
+			name: "diff add/remove markers",
+			md:   "```diff\n- removed cmd/swe/ line\n+ added line\n```\n",
+		},
+		{
+			name: "sql arithmetic operators",
+			md:   "```sql\nSELECT a/b, c+d FROM t WHERE x = 1;\n```\n",
+		},
+		{
+			name: "python operators",
+			md:   "```python\nx = a / b + c - d\n```\n",
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			r, err := NewMarkdownRenderer(80)
+			if err != nil {
+				t.Fatalf("NewMarkdownRenderer error = %v, want nil", err)
+			}
+			out, err := r.Render(tt.md)
+			if err != nil {
+				t.Fatalf("Render(%q) error = %v, want nil", tt.md, err)
+			}
+			if run, red := renderHasRedRun(out); red {
+				t.Errorf("Render(%q): a code-block run rendered RED: %q\nfull=%q", tt.md, run, out)
 			}
 		})
 	}
