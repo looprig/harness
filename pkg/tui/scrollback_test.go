@@ -111,6 +111,14 @@ func TestScrollbackFlushTightAttach(t *testing.T) {
 			wantBlank: []bool{false, true},
 		},
 		{
+			name: "assistant then a Subagent card → assistant keeps its blank (● card, not a tool child)",
+			committed: []entry{
+				{ID: 1, Kind: kindAssistant},
+				{ID: 2, Kind: kindTool, Calls: []ToolCallView{{Agent: "explorer"}}},
+			},
+			wantBlank: []bool{true, true},
+		},
+		{
 			name: "assistant then multiple cards → group tight, only last card blank",
 			committed: []entry{
 				{ID: 1, Kind: kindAssistant}, {ID: 2, Kind: kindTool},

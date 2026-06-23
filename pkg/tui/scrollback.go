@@ -68,12 +68,23 @@ func (s scrollbackModel) Flush(committed []entry, render func(entry) []string) (
 // A promoted tool card renders AS its own assistant bullet, so it STARTS a new group
 // and is never tight; every non-promoted tool card commits directly beneath its
 // step's assistant narration / "Multiple actions" umbrella (or a sibling card), so
-// it attaches tightly. Returns false at the tail (no following entry).
+// it attaches tightly. A reconciled Subagent card (Agent set) is its OWN "●"-level
+// card (renderSubagentCard), NOT a tool child of the message above, so it is never
+// tight — it gets the same blank-line separation as an assistant bullet (otherwise it
+// glues to the orchestrator's thinking/narration). Returns false at the tail.
 func attachesTight(committed []entry, i int) bool {
 	j := i + 1
 	if j >= len(committed) {
 		return false
 	}
 	next := committed[j]
-	return next.Kind == kindTool && !next.promoted
+	return next.Kind == kindTool && !next.promoted && !isSubagentEntry(next)
+}
+
+// isSubagentEntry reports whether a committed entry is a reconciled Subagent card —
+// a single-call kindTool entry carrying an Agent label (the same discriminator
+// renderEntry uses to route to renderSubagentCard). Such a card renders at the "●"
+// level, so the scrollback spacing treats it like an assistant bullet, not a tool child.
+func isSubagentEntry(e entry) bool {
+	return e.Kind == kindTool && len(e.Calls) == 1 && e.Calls[0].Agent != ""
 }
