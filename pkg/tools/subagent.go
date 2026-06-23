@@ -56,7 +56,7 @@ const subagentToolName = "Subagent"
 // impl (wired by the swarm) resolves `agent` against the leaf registry and adapts
 // session.Session.RunSubagent; an unknown agent is returned as an error.
 type Spawner interface {
-	Spawn(ctx context.Context, parent loop.Provenance, agent identity.AgentName, message string) (string, error)
+	Spawn(ctx context.Context, parent loop.Provenance, agent identity.AgentName, message string, parentToolUseID string) (string, error)
 }
 
 // SubagentCatalogEntry is one spawnable agent the tool advertises in its Info().Desc
@@ -166,7 +166,12 @@ func (s *Subagent) InvokableRun(ctx context.Context, argsJSON string) (*tool.Too
 	// so this is not a CLAUDE.md error-swallow violation.
 	parent, _ := loop.ProvenanceFrom(ctx)
 
-	finalText, err := s.spawner.Spawn(ctx, parent, identity.AgentName(args.Agent), args.Message)
+	// The discarded bool is PRESENCE: an absent tool-use id (e.g. a run outside a
+	// turn) yields "" — the correct graceful default that forwards no parent to
+	// correlate downstream — so this is not a CLAUDE.md error-swallow violation.
+	tuid, _ := loop.ToolUseIDFrom(ctx)
+
+	finalText, err := s.spawner.Spawn(ctx, parent, identity.AgentName(args.Agent), args.Message, tuid)
 	if err != nil {
 		return tool.TextResult("error: subagent failed: " + err.Error()), nil
 	}

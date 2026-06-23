@@ -46,27 +46,30 @@ func testCatalog() []SubagentCatalogEntry {
 	}
 }
 
-// fakeSpawner is a fake Spawner. It records the parent provenance, agent name, and
-// message it was asked to spawn with, and returns either reply or spawnErr. If echo
-// is set it returns "echo: <agent>: <message>" instead of reply.
+// fakeSpawner is a fake Spawner. It records the parent provenance, agent name,
+// message, and parent tool-use id it was asked to spawn with, and returns either
+// reply or spawnErr. If echo is set it returns "echo: <agent>: <message>" instead of
+// reply.
 type fakeSpawner struct {
-	mu         sync.Mutex
-	reply      string
-	echo       bool
-	spawnErr   error
-	called     bool
-	gotParent  loop.Provenance
-	gotAgent   identity.AgentName
-	gotMessage string
+	mu           sync.Mutex
+	reply        string
+	echo         bool
+	spawnErr     error
+	called       bool
+	gotParent    loop.Provenance
+	gotAgent     identity.AgentName
+	gotMessage   string
+	gotToolUseID string
 }
 
-func (f *fakeSpawner) Spawn(_ context.Context, parent loop.Provenance, agent identity.AgentName, message string) (string, error) {
+func (f *fakeSpawner) Spawn(_ context.Context, parent loop.Provenance, agent identity.AgentName, message string, parentToolUseID string) (string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.called = true
 	f.gotParent = parent
 	f.gotAgent = agent
 	f.gotMessage = message
+	f.gotToolUseID = parentToolUseID
 	if f.spawnErr != nil {
 		return "", f.spawnErr
 	}
@@ -242,6 +245,19 @@ func TestSubagentRoundTrip(t *testing.T) {
 				t.Errorf("Spawn got parent %+v, want %+v", f.gotParent, tt.wantParent)
 			}
 		})
+	}
+}
+
+// TestSubagentForwardsToolUseID asserts the tool reads its OWN provider tool-use id
+// from ctx (loop.ToolUseIDFrom) and forwards it as the parentToolUseID arg to Spawn,
+// so the spawned loop can be correlated to the Subagent tool call that requested it.
+func TestSubagentForwardsToolUseID(t *testing.T) {
+	t.Parallel()
+	ctx := loop.WithToolUseID(context.Background(), "toolu_55")
+	fs := &fakeSpawner{}
+	_, _ = NewSubagent(fs, testCatalog()).InvokableRun(ctx, `{"agent":"explorer","message":"map repo"}`)
+	if fs.gotToolUseID != "toolu_55" {
+		t.Fatalf("Spawn parentToolUseID = %q, want toolu_55", fs.gotToolUseID)
 	}
 }
 
