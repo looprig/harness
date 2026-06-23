@@ -2240,3 +2240,244 @@ func TestSubagentDepth2Nested(t *testing.T) {
 		}
 	}
 }
+
+// renderSubagentCardEntry renders the single committed entry holding a populated
+// Subagent card (Agent != "") as ANSI-stripped text, or fails if there is not exactly
+// one. It is the render-layer twin of findSubagentCard, used by the end-to-end terminal
+// tests to assert the reducer's status drives the rendered done line.
+func renderSubagentCardEntry(t *testing.T, m transcriptModel, width int) string {
+	t.Helper()
+	var rendered []string
+	for _, e := range m.committed {
+		if e.Kind != kindTool {
+			continue
+		}
+		for _, c := range e.Calls {
+			if c.Agent != "" {
+				rendered = append(rendered, stripANSI(strings.Join(renderEntry(e, false, width), "\n")))
+				break
+			}
+		}
+	}
+	if len(rendered) != 1 {
+		t.Fatalf("found %d rendered Subagent cards, want exactly 1; committed=%+v", len(rendered), m.committed)
+	}
+	return rendered[0]
+}
+
+// subagentFlowEvents builds the full Enduring event sequence for one tool-spawned
+// subagent flow that paints a populated card: child LoopStarted (with the spawning
+// parent coordinates + provider tool-use id), child TurnStarted (task), two child
+// StepDones (so the card carries multiple nested children + a Steps count > 1), the
+// child terminal (TurnDone), then the orchestrator's StepDone whose Subagent block
+// reconciles the accumulator. It is shared by the restore-equivalence property test so
+// the LIVE per-event fold and the FoldDisplay restore fold consume the IDENTICAL slice.
+func subagentFlowEvents(primary, sub, turn, step uuid.UUID, toolUseID string) []event.Event {
+	return []event.Event{
+		childLoopStarted(sub, "explorer", primary, turn, step, toolUseID),
+		childTurnStarted(sub, "map the repo"),
+		stepDoneFrom(sub,
+			aiMessage("", "", toolUse("c-grep", "Grep", `{"q":"foo"}`)),
+			toolResult("c-grep", "grep hit one"),
+		),
+		stepDoneFrom(sub,
+			aiMessage("", "", toolUse("c-read", "Read", `{"path":"x"}`)),
+			toolResult("c-read", "file body"),
+		),
+		event.TurnDone{Header: event.Header{Coordinates: identity.Coordinates{LoopID: sub}}},
+		orchestratorStepDone(primary, turn, step,
+			aiMessage("", "", toolUse(toolUseID, "Subagent", `{"agent":"explorer","message":"map the repo"}`)),
+			toolResult(toolUseID, "mapped 12 packages"),
+		),
+	}
+}
+
+// TestSubagentRestoreEquivalence (Task 8, design test 3 — HEADLINE property): the cold-
+// restore repaint reproduces the live transcript EXACTLY for a populated Subagent card.
+// It folds the SAME Enduring sequence through (a) the LIVE per-event path (transcript +
+// interaction ApplyEvent, the way the live session consumes events) and (b) FoldDisplay
+// (the restore path restoreBacklogCmd runs), then asserts EqualTranscript — the
+// reflect.DeepEqual over the committed transcript. This is the property the defensive
+// Children copy in reconcileSubagent protects: a committed card must be structurally
+// FROZEN, never aliasing the live subagentAccum backing slice, so the two folds are
+// byte-for-byte equal. The card is asserted populated (agent, task, two nested children,
+// Steps==2, subDone, summary) so the equality genuinely exercises a filled-in card.
+func TestSubagentRestoreEquivalence(t *testing.T) {
+	t.Parallel()
+
+	primary := callID(0xA1)
+	sub := callID(0xB2)
+	turn := callID(0xC3)
+	step := callID(0xD4)
+	events := subagentFlowEvents(primary, sub, turn, step, "toolu_X")
+
+	// LIVE path: fold every event through the pure reducers per-event, exactly as the
+	// live session does, then wrap the resulting reducer state as a DisplayProjection.
+	liveTr := transcriptModel{primaryLoopID: primary}
+	liveIn := newInteractionModel()
+	for _, ev := range events {
+		liveTr = liveTr.ApplyEvent(ev)
+		liveIn = liveIn.ApplyEvent(ev)
+	}
+	live := DisplayProjection{transcript: liveTr, interaction: liveIn}
+
+	// RESTORE path: fold the SAME slice through FoldDisplay (restoreBacklogCmd's fold).
+	restored := FoldDisplay(events, primary)
+
+	// First, prove the card is genuinely POPULATED — otherwise EqualTranscript could pass
+	// over two empty transcripts and assert nothing.
+	card := findSubagentCard(t, restored.transcript)
+	if card.Agent != "explorer" || card.Task != "map the repo" {
+		t.Fatalf("restored card not populated: Agent=%q Task=%q", card.Agent, card.Task)
+	}
+	if card.Steps != 2 {
+		t.Fatalf("restored card.Steps = %d, want 2 (two child StepDones)", card.Steps)
+	}
+	if card.SubStatus != subDone {
+		t.Fatalf("restored card.SubStatus = %v, want subDone", card.SubStatus)
+	}
+	if len(card.Children) != 2 {
+		t.Fatalf("restored card.Children = %d, want 2 (Grep + Read); %+v", len(card.Children), card.Children)
+	}
+	if got := strings.Join(card.Result, "\n"); got != "mapped 12 packages" {
+		t.Fatalf("restored done summary = %q, want %q", got, "mapped 12 packages")
+	}
+
+	// HEADLINE: the restored transcript EqualTranscript the live transcript.
+	if !restored.EqualTranscript(live) {
+		t.Errorf("restore != live for a populated Subagent card\n live committed = %+v\n restored committed = %+v",
+			live.transcript.committed, restored.transcript.committed)
+	}
+
+	// The committed card must be FROZEN — never aliasing the live subagentAccum backing
+	// slice (the defensive append-copy in reconcileSubagent, design §3 freeze). Mutate the
+	// live model's accumulator IN PLACE (overwrite an existing child, so no realloc masks
+	// an alias) AFTER commit and confirm the committed card is unaffected: had the card
+	// aliased acc.children, this write would leak into the committed transcript. This is
+	// the regression the Task 6 defensive copy guards.
+	key := spawnKey{primary, turn, step, "toolu_X"}
+	acc, ok := liveTr.subagentAccum[key]
+	if !ok {
+		t.Fatalf("no live accumulator for key %+v; subagentAccum=%+v", key, liveTr.subagentAccum)
+	}
+	if len(acc.children) == 0 {
+		t.Fatalf("accumulator carries no children to mutate; acc=%+v", acc)
+	}
+	acc.children[0] = ToolCallView{ToolName: "LEAK", Result: []string{"should not appear"}}
+	frozen := findSubagentCard(t, liveTr)
+	if frozen.Children[0].ToolName != "Grep" {
+		t.Errorf("committed card aliases the live accumulator: in-place mutation leaked into the frozen card (Children[0]=%+v, want the original Grep)", frozen.Children[0])
+	}
+}
+
+// TestSubagentFailureBeforeChildLoop (Task 8, design test 5): the Subagent spawn FAILS
+// before any child LoopStarted (unknown agent / spawn error → the tool returns an
+// "error: ..." text result, no child loop, no accumulator). The orchestrator's StepDone
+// then carries a Subagent tool-use whose paired ToolResultMessage is that error text.
+// With no accumulator, reconcileSubagent leaves the card unchanged: Agent=="" so it is
+// NOT promoted to a "●" Subagent card — it commits as an ORDINARY tool card whose body
+// IS the error text, with NO children and NO done child.
+func TestSubagentFailureBeforeChildLoop(t *testing.T) {
+	t.Parallel()
+
+	primary := callID(0xA1)
+	turn := callID(0xC3)
+	step := callID(0xD4)
+
+	const errText = "error: subagent failed: unknown agent"
+
+	m := transcriptModel{primaryLoopID: primary}
+	// NO child LoopStarted is ever fed — the spawn failed before a child loop existed.
+	m = m.ApplyEvent(orchestratorStepDone(primary, turn, step,
+		aiMessage("", "", toolUse("toolu_X", "Subagent", `{"agent":"unknown","message":"go"}`)),
+		toolResult("toolu_X", errText),
+	))
+
+	// No populated Subagent card (Agent never set) — confirm there is none.
+	for _, e := range m.committed {
+		for _, c := range e.Calls {
+			if c.Agent != "" {
+				t.Fatalf("spawn failure produced a populated Subagent card, want a plain error tool card: %+v", c)
+			}
+		}
+	}
+
+	// The Subagent tool-use commits as an ordinary tool card whose body is the error text.
+	var found *ToolCallView
+	for _, e := range m.committed {
+		if e.Kind != kindTool {
+			continue
+		}
+		for i := range e.Calls {
+			if e.Calls[i].ToolName == "Subagent" {
+				cc := e.Calls[i]
+				found = &cc
+			}
+		}
+	}
+	if found == nil {
+		t.Fatalf("no Subagent tool card committed; committed=%+v", m.committed)
+	}
+	if found.Agent != "" {
+		t.Errorf("error card Agent = %q, want empty (a plain tool card, not a nested ● card)", found.Agent)
+	}
+	if len(found.Children) != 0 {
+		t.Errorf("error card has %d children, want 0 (no child loop ran): %+v", len(found.Children), found.Children)
+	}
+	if got := strings.Join(found.Result, "\n"); got != errText {
+		t.Errorf("error card body = %q, want the error result %q", got, errText)
+	}
+	// The rendered card must show the error text as an ordinary tool-card body, NOT a
+	// Subagent "done · N steps" done child or a "Subagent(<agent>)" header.
+	for _, e := range m.committed {
+		got := stripANSI(strings.Join(renderEntry(e, true, 80), "\n"))
+		if strings.Contains(got, " steps") || strings.Contains(got, "Subagent(") {
+			t.Errorf("error card rendered as a Subagent card: %q", got)
+		}
+	}
+}
+
+// TestSubagentInterruption (Task 8, design test 6): a child loop is INTERRUPTED
+// (TurnInterrupted) after its StepDone. End to end (reducer → render): the committed
+// card carries SubStatus == subInterrupted and renders the "interrupted" done line with
+// NO summary (design §4: interrupted omits the summary).
+func TestSubagentInterruption(t *testing.T) {
+	t.Parallel()
+
+	primary := callID(0xA1)
+	sub := callID(0xB2)
+	turn := callID(0xC3)
+	step := callID(0xD4)
+
+	m := transcriptModel{primaryLoopID: primary}
+	m = m.ApplyEvent(childLoopStarted(sub, "explorer", primary, turn, step, "toolu_X"))
+	m = m.ApplyEvent(childTurnStarted(sub, "investigate"))
+	m = m.ApplyEvent(stepDoneFrom(sub,
+		aiMessage("", "", toolUse("c-grep", "Grep", `{}`)),
+		toolResult("c-grep", "partial hit"),
+	))
+	// The child is interrupted mid-flight (no TurnDone).
+	m = m.ApplyEvent(event.TurnInterrupted{Header: event.Header{Coordinates: identity.Coordinates{LoopID: sub}}})
+
+	m = m.ApplyEvent(orchestratorStepDone(primary, turn, step,
+		aiMessage("", "", toolUse("toolu_X", "Subagent", `{"agent":"explorer"}`)),
+		toolResult("toolu_X", "stopped early"),
+	))
+
+	card := findSubagentCard(t, m)
+	if card.SubStatus != subInterrupted {
+		t.Fatalf("card.SubStatus = %v, want subInterrupted", card.SubStatus)
+	}
+	if card.Steps != 1 {
+		t.Errorf("card.Steps = %d, want 1", card.Steps)
+	}
+
+	// Render the committed card: the done line reads "interrupted" and OMITS the summary.
+	rendered := renderSubagentCardEntry(t, m, 100)
+	if !strings.Contains(rendered, "interrupted") {
+		t.Errorf("rendered card = %q, want the \"interrupted\" done line", rendered)
+	}
+	if strings.Contains(rendered, "stopped early") {
+		t.Errorf("rendered card = %q, must NOT show a summary for an interrupted child", rendered)
+	}
+}
