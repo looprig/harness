@@ -2551,3 +2551,45 @@ func TestPendingSubagentCards(t *testing.T) {
 		t.Errorf("pendingSubagentCards() = %d after reconcile, want 0 (moved to committed card); %+v", len(got), got)
 	}
 }
+
+// TestPendingSubagentCardsCapsChildren verifies the LIVE subagent card shows only the most
+// recent liveCallCap children — a subagent that runs many tools can't grow the live tail to
+// fill the screen — while the total Steps count is preserved (the full children commit at
+// reconcile).
+func TestPendingSubagentCardsCapsChildren(t *testing.T) {
+	t.Parallel()
+
+	key := spawnKey{toolUseID: "toolu_many"}
+	children := make([]ToolCallView, 0, liveCallCap+4)
+	for i := 0; i < liveCallCap+4; i++ {
+		children = append(children, ToolCallView{ToolName: "Bash", Status: ToolOK})
+	}
+	children[0].Summary = "OLDEST"
+	children[len(children)-1].Summary = "NEWEST"
+
+	m := transcriptModel{
+		accumOrder: []spawnKey{key},
+		subagentAccum: map[spawnKey]*subagentAccumulator{
+			key: {agent: "operator", steps: 9, status: subRunning, children: children},
+		},
+	}
+
+	cards := m.pendingSubagentCards()
+	if len(cards) != 1 {
+		t.Fatalf("pendingSubagentCards() = %d, want 1", len(cards))
+	}
+	if got := len(cards[0].Children); got != liveCallCap {
+		t.Errorf("live card children = %d, want capped to liveCallCap (%d)", got, liveCallCap)
+	}
+	if cards[0].Children[len(cards[0].Children)-1].Summary != "NEWEST" {
+		t.Errorf("most recent child must be kept; got %+v", cards[0].Children)
+	}
+	for _, c := range cards[0].Children {
+		if c.Summary == "OLDEST" {
+			t.Errorf("oldest child must be elided from the live card; got %+v", cards[0].Children)
+		}
+	}
+	if cards[0].Steps != 9 {
+		t.Errorf("Steps total must be preserved; got %d, want 9", cards[0].Steps)
+	}
+}

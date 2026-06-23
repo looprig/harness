@@ -1034,11 +1034,19 @@ func (m transcriptModel) pendingSubagentCards() []ToolCallView {
 		if acc == nil || acc.reconciled {
 			continue
 		}
+		// Cap the LIVE card's children to the most recent liveCallCap: a subagent that runs
+		// many tools would otherwise grow the live tail to fill the screen (the "running · N
+		// steps" line still conveys the total). The FULL children commit to scrollback at the
+		// orchestrator StepDone via reconcileSubagent.
+		children := acc.children
+		if len(children) > liveCallCap {
+			children = children[len(children)-liveCallCap:]
+		}
 		out = append(out, ToolCallView{
 			ToolName:  subagentToolName,
 			Agent:     acc.agent,
 			Task:      acc.task,
-			Children:  append([]ToolCallView(nil), acc.children...),
+			Children:  append([]ToolCallView(nil), children...),
 			Steps:     acc.steps,
 			SubStatus: acc.status,
 			Nested:    acc.nested,
