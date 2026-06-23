@@ -942,7 +942,12 @@ func (m *transcriptModel) reconcileSubagent(ev event.StepDone, use content.ToolU
 	}
 	card.Agent = acc.agent
 	card.Task = acc.task
-	card.Children = acc.children
+	// Copy the children: the committed card must be structurally FROZEN, never aliasing
+	// the live subagentAccum backing slice (the one place a committed entry could share
+	// mutable backing with live reducer state). Safe-by-construction, not by ordering —
+	// it hardens the reflect.DeepEqual restore-equivalence (Task 8) ahead of Task 7's
+	// further accumulator mutation (Nested).
+	card.Children = append([]ToolCallView(nil), acc.children...)
 	card.Steps = acc.steps
 	card.SubStatus = acc.status
 	card.Nested = acc.nested
@@ -953,7 +958,10 @@ func (m *transcriptModel) reconcileSubagent(ev event.StepDone, use content.ToolU
 }
 
 // subagentToolName is the tool name the orchestrator's StepDone matches to promote a
-// tool-use block to a nested Subagent card.
+// tool-use block to a nested Subagent card. It INTENTIONALLY duplicates the literal in
+// pkg/tools (Subagent.Info().Name / its unexported subagentToolName) rather than import
+// it: that constant is unexported and a tui→tools dependency just for a string match is
+// not worth it. The two MUST stay in sync — if the tool's name changes, change this too.
 const subagentToolName = "Subagent"
 
 // ensureAccum returns the accumulator for key, creating it (and cloning the map on

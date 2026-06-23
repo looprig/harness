@@ -2004,7 +2004,7 @@ func TestSubagentConcurrent(t *testing.T) {
 		}
 	}
 	if cardA == nil || cardB == nil {
-		t.Fatalf("missing a Subagent card: explorer=%v builder=%v; committed=%+v", cardA, cardB, cardB)
+		t.Fatalf("missing a Subagent card: explorer=%v builder=%v; committed=%+v", cardA, cardB, m.committed)
 	}
 	if len(cardA.Children) != 1 || cardA.Children[0].ToolName != "Grep" {
 		t.Errorf("explorer card children = %+v, want exactly the Grep row", cardA.Children)
