@@ -338,7 +338,9 @@ func subagentTerminalVerb(s subStatus) string {
 func renderSubagentCard(c ToolCallView, expand bool, width int) string {
 	head := strings.TrimRight(styles.LitDot, " ") + " " +
 		styles.HeadlineStyle.Render(subagentHeaderText(c))
-	lines := make([]string, 0, len(c.Children)+3)
+	// Cap accounts for: header (1), the children's ONE joined element from
+	// renderToolCalls (1), the done line (1), and the optional nested line (1).
+	lines := make([]string, 0, 4)
 	lines = append(lines, head)
 
 	// Children render as the existing "⎿" tool cards, one indent level under the header.
@@ -373,21 +375,23 @@ func subagentHeaderText(c ToolCallView) string {
 // from SubStatus + Steps, plus the truncated summary (the card's own Result, the
 // suppressed hand-back text) appended as `— "<summary>"` for done/failed. An
 // interrupted child omits the summary (design §4). It is width-wrapped like a card body.
+// Result is expected single-line, pre-truncated at the reduce layer; this only joins it.
 func subagentDoneLine(c ToolCallView, width int) string {
-	line := subagentTerminalVerb(c.SubStatus) + hintSeparator + pluralSteps(c.Steps)
+	line := subagentTerminalVerb(c.SubStatus) + hintSeparator + plural(c.Steps, "step")
 	if summary := strings.Join(c.Result, " "); summary != "" && c.SubStatus != subInterrupted {
 		line += " — " + `"` + summary + `"`
 	}
 	return cardIndent + styles.ToolCallStyle.Render(cardConnector+line)
 }
 
-// pluralSteps renders a step count with grammatical agreement: "1 step" (singular) for
-// n == 1, "N steps" (plural) otherwise. Used by the Subagent done line.
-func pluralSteps(n int) string {
+// plural renders a count with grammatical agreement on unit: "1 <unit>" (singular) for
+// n == 1, "N <unit>s" (plural) otherwise. Used by the Subagent done line ("step") and
+// the collapsed thinking summary ("line").
+func plural(n int, unit string) string {
 	if n == 1 {
-		return "1 step"
+		return "1 " + unit
 	}
-	return strconv.Itoa(n) + " steps"
+	return strconv.Itoa(n) + " " + unit + "s"
 }
 
 // renderLiveAssistant renders the in-progress (live) assistant segment with the
@@ -541,7 +545,7 @@ func renderThinking(s string, expand bool, width int) string {
 	}
 	if !expand {
 		n := strings.Count(s, "\n") + 1 // thinking content lines
-		summary := styles.ThinkingHeader + hintSeparator + pluralLines(n) + hintSeparator + expandHint
+		summary := styles.ThinkingHeader + hintSeparator + plural(n, "line") + hintSeparator + expandHint
 		return styles.ThinkingStyle.Render(summary)
 	}
 	out := []string{styles.ThinkingStyle.Render(thinkingRail + styles.ThinkingHeader)}
@@ -551,15 +555,6 @@ func renderThinking(s string, expand bool, width int) string {
 		}
 	}
 	return strings.Join(out, "\n")
-}
-
-// pluralLines renders a line count with grammatical agreement: "1 line" (singular)
-// for n == 1, "N lines" (plural) otherwise. Used by the collapsed thinking summary.
-func pluralLines(n int) string {
-	if n == 1 {
-		return "1 line"
-	}
-	return strconv.Itoa(n) + " lines"
 }
 
 // wrapToWidth word-wraps s to width columns and returns the resulting rows with

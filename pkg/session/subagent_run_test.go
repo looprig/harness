@@ -59,10 +59,11 @@ func TestRunSubagentReturnsFinalText(t *testing.T) {
 
 	// On the observer: find the sub-loop's LoopStarted (a non-primary loop id) and the
 	// TurnStarted attributed to that SAME loop id with machine agency.
-	subLoopID, ok := waitLoopStartedNonPrimary(t, obs, s.PrimaryLoopID())
+	subLS, ok := waitLoopStartedNonPrimaryEvent(t, obs, s.PrimaryLoopID())
 	if !ok {
 		t.Fatal("never observed a LoopStarted for a fresh (non-primary) sub-loop")
 	}
+	subLoopID := subLS.Coordinates.LoopID
 	ts, ok := waitTurnStartedOnLoop(t, obs, subLoopID)
 	if !ok {
 		t.Fatalf("never observed a TurnStarted attributed to sub-loop %v", subLoopID)
@@ -119,8 +120,7 @@ func TestRunSubagentStampsParentToolUseID(t *testing.T) {
 	}
 
 	// A plain NewLoop (the primary, not spawned by a tool call) carries the empty id.
-	primaryID := s.PrimaryLoopID()
-	primLoopID, err := s.NewLoop(loop.Provenance{LoopID: primaryID}, cfg(&stubLLM{chunks: []content.Chunk{textChunk("child")}}))
+	primLoopID, err := s.NewLoop(loop.Provenance{LoopID: s.PrimaryLoopID()}, cfg(&stubLLM{chunks: []content.Chunk{textChunk("child")}}))
 	if err != nil {
 		t.Fatalf("NewLoop: %v", err)
 	}
@@ -159,29 +159,6 @@ func TestRunSubagentPropagatesSessionClosing(t *testing.T) {
 	var se *SessionError
 	if !errors.As(err, &se) || se.Kind != SessionClosing {
 		t.Fatalf("RunSubagent err = %v, want *SessionError{SessionClosing}", err)
-	}
-}
-
-// waitLoopStartedNonPrimary reads the observer until a LoopStarted for a loop id
-// other than primary arrives, returning that sub-loop id. The session emits a
-// LoopStarted for every NewLoop; the sub-loop is the only non-primary one here.
-func waitLoopStartedNonPrimary(t *testing.T, sub interface {
-	Events() <-chan event.Event
-}, primary [16]byte) ([16]byte, bool) {
-	t.Helper()
-	deadline := time.After(2 * time.Second)
-	for {
-		select {
-		case ev, ok := <-sub.Events():
-			if !ok {
-				return [16]byte{}, false
-			}
-			if ls, ok := ev.(event.LoopStarted); ok && ls.Coordinates.LoopID != primary {
-				return ls.Coordinates.LoopID, true
-			}
-		case <-deadline:
-			return [16]byte{}, false
-		}
 	}
 }
 

@@ -167,8 +167,9 @@ func (s *Subagent) InvokableRun(ctx context.Context, argsJSON string) (*tool.Too
 	parent, _ := loop.ProvenanceFrom(ctx)
 
 	// The discarded bool is PRESENCE: an absent tool-use id (e.g. a run outside a
-	// turn) yields "" — the correct graceful default that forwards no parent to
-	// correlate downstream — so this is not a CLAUDE.md error-swallow violation.
+	// turn) yields "" — the correct graceful default: no provider tool-use id to
+	// correlate the spawned loop against downstream — so this is not a CLAUDE.md
+	// error-swallow violation.
 	tuid, _ := loop.ToolUseIDFrom(ctx)
 
 	finalText, err := s.spawner.Spawn(ctx, parent, identity.AgentName(args.Agent), args.Message, tuid)
