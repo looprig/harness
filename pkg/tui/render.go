@@ -19,6 +19,13 @@ import (
 // scrollback gap (the inline renderer's insertAbove math is sized off the tall live tail).
 const previewLineCap = 3
 
+// liveCallCap bounds how many of a step's tool cards the LIVE tail shows: only the most
+// recent liveCallCap, prefixed with a "… N earlier calls" marker. A step that fires many
+// tools would otherwise grow the live tail (the bubbletea managed region) to fill the whole
+// screen — scrolling the assistant bullet off the top and forcing a full-screen repaint each
+// frame. The elided cards still commit IN FULL to scrollback at the step's StepDone.
+const liveCallCap = 3
+
 // noOutput is the placeholder shown for a completed tool call with no result lines.
 const noOutput = "(no output)"
 
@@ -458,10 +465,19 @@ func renderLiveAssistant(thinking, text string, calls, subagentCards []ToolCallV
 		if b.Len() > 0 {
 			b.WriteString("\n")
 		}
+		// Cap the live tail to the most recent liveCallCap tool cards (keeping the running
+		// one), prefixed with a "… N earlier calls" marker, so a many-tool step can't grow
+		// the managed region to fill the screen and drop the assistant bullet. The full set
+		// commits to scrollback at StepDone.
+		shown := calls
+		if hidden := len(calls) - liveCallCap; hidden > 0 {
+			shown = calls[hidden:]
+			b.WriteString(cardIndent + styles.ToolCallStyle.Render(cardConnector+"… "+strconv.Itoa(hidden)+" earlier calls") + "\n")
+		}
 		// liveRunning=true: a still-running card renders header-only in the live tail
 		// so the live→committed handoff is a one-line→full-card continuation, not a
 		// multi-line live shrink (see renderToolCard).
-		b.WriteString(renderToolCallsGlyph(calls, expand, width, liveToolGlyph(a.frame), true))
+		b.WriteString(renderToolCallsGlyph(shown, expand, width, liveToolGlyph(a.frame), true))
 	}
 
 	// Each pending subagent card is its OWN "●"-level card (like the committed form),

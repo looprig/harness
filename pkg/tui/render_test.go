@@ -2,6 +2,7 @@ package tui
 
 import (
 	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -353,6 +354,31 @@ func TestRenderLiveAssistantCards(t *testing.T) {
 			if !strings.Contains(got, w) {
 				t.Errorf("renderLiveAssistant() = %q, want to contain %q", got, w)
 			}
+		}
+	})
+
+	t.Run("many calls keep only the most recent, with an earlier-calls marker", func(t *testing.T) {
+		t.Parallel()
+
+		calls := make([]ToolCallView, 0, liveCallCap+3)
+		for i := 0; i < liveCallCap+3; i++ {
+			calls = append(calls, ToolCallView{ToolName: "Bash", Summary: "cmd" + strconv.Itoa(i), Status: ToolOK, Result: []string{"out"}})
+		}
+		// The narration ("the answer") is the top content the assistant bullet anchors.
+		got := stripANSI(renderLiveAssistant("", "the answer", calls, nil, false, 80, a))
+
+		hidden := len(calls) - liveCallCap
+		if !strings.Contains(got, "… "+strconv.Itoa(hidden)+" earlier calls") {
+			t.Errorf("missing '… %d earlier calls' marker in %q", hidden, got)
+		}
+		if !strings.Contains(got, "the answer") {
+			t.Errorf("top narration dropped; the bullet must stay anchored: %q", got)
+		}
+		if strings.Contains(got, "cmd0") { // oldest cards are elided
+			t.Errorf("oldest card cmd0 should be elided in %q", got)
+		}
+		if last := "cmd" + strconv.Itoa(len(calls)-1); !strings.Contains(got, last) { // newest shows
+			t.Errorf("most recent card %q missing in %q", last, got)
 		}
 	})
 }
