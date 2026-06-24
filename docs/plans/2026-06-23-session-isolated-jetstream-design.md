@@ -3,7 +3,7 @@
 **Date:** 2026-06-23  
 **Status:** Implemented (2026-06-23) — see the implementation plan and the
 `feature/session-isolated-jetstream` branches in `looprig` and `../swe`.  
-**Scope:** Local `swe` persistence, session discovery, best-effort generated session titles, and safe transition away from the legacy shared StoreDir.
+**Scope:** Local `swe` persistence, session discovery, best-effort generated session titles, and explicit clean-slate removal of the legacy shared StoreDir.
 
 ## Implementation Notes
 
@@ -31,7 +31,7 @@ listable without starting every embedded server.
 ## Directory Contract
 
 ```text
-~/.looprig/
+<looprig-data-root>/                 # $XDG_DATA_HOME/looprig or ~/.looprig
   sessions/
     <session-id>/
       session.json
@@ -39,7 +39,9 @@ listable without starting every embedded server.
       nats/
 ```
 
-`<session-id>` is a canonical UUID. A new session mints its UUID before opening
+`<looprig-data-root>` follows the existing XDG rule: `$XDG_DATA_HOME/looprig`
+when `XDG_DATA_HOME` is set, otherwise `~/.looprig`. `<session-id>` is a
+canonical UUID. A new session mints its UUID before opening
 an engine, creates the session directory with owner-only permissions, and opens
 the embedded engine on `<session-dir>/nats`. NATS creates its own `jetstream/`
 child below that configured StoreDir, so naming the configured directory `nats`
@@ -51,15 +53,16 @@ manifest used only for session discovery and display:
 
 - `session_id`
 - `title`
-- `title_source` (`generated` or `first_user_message`)
+- `title_source` (`none`, `generated`, or `first_user_message`)
 - `created_at`
 - `last_active_at`
 - `status` (`active` or `stopped`)
 
-No `llm.ModelSpec`, API key, prompt, or transcript is written to the manifest,
-except for the deliberately selected title fallback: a sanitized, length-bounded
-snippet of the first accepted user message. The session directory is owner-only
-because both this title and the JetStream transcript are private user data.
+No raw `llm.ModelSpec`, API key, prompt, or transcript field is written to the
+manifest. A deliberately selected title is allowed: either a sanitized,
+length-bounded snippet of the first accepted user message or a generated summary
+of the first exchange. The session directory is owner-only because both title
+forms and the JetStream transcript are private user data.
 
 ## Process Ownership
 
@@ -72,6 +75,9 @@ engine. It is acquired before the server starts and rejects a second process
 attempting to open the *same* session directory. This protects a resumed session
 from two embedded servers touching the same StoreDir; the journal lease remains
 the single-writer fence within the server.
+
+Every engine-construction failure closes the lock before returning. Engine close
+releases the lock even when the NATS connection drain reports an error.
 
 The initial local-embedded implementation supports Unix-like hosts through a
 small build-tagged `syscall.Flock` adapter and returns a typed unsupported-platform
@@ -100,6 +106,9 @@ NATS node has its own StoreDir.
    owner-only file, fsyncs it, renames it atomically, and fsyncs the parent
    directory. It updates `last_active_at` on creation, successful resume,
    accepted user input, a terminal turn, and clean shutdown.
+   Creation and restore treat the first manifest write as required: failure
+   closes the just-opened engine and returns a typed setup error. Later metadata
+   refresh failures are logged without interrupting an already-running session.
 5. `status` is the last persisted lifecycle state, not a liveness probe. An
    `active` manifest after a process crash is displayed as `active/unclean`;
    only a clean shutdown changes it to `stopped` before releasing the lock.
@@ -109,7 +118,7 @@ NATS node has its own StoreDir.
    A failed replacement leaves the old session open. Neither path affects a
    session owned by another CLI process.
 
-## Composition and Legacy Compatibility
+## Composition and Legacy Cleanup
 
 The existing process-wide `startPersistence` / `swe.Persistence` composition is
 replaced by a session-store factory. It mints or receives a session ID, resolves
@@ -119,12 +128,18 @@ not used in isolated-store mode; directory manifests provide listing.
 
 `--list` runs before any engine is opened. It enumerates manifests directly.
 
-The legacy `~/.looprig/jetstream` StoreDir is never overwritten or silently
-discarded. Moving old sessions into individual stores requires an explicit,
-user-approved migration policy because it must export each stream and its object
-bucket into a distinct new server. Until that policy is approved and implemented,
-the isolated-store switch must retain a readable legacy mode rather than hiding
-existing resumable sessions.
+There is no legacy compatibility or migration mode. The user has explicitly
+accepted permanent removal of all pre-existing sessions in the shared legacy
+StoreDir. An explicit `--purge-legacy-sessions` command performs that one-way
+cleanup before the isolated-store workflow is used.
+
+The purge command never starts a JetStream engine. It resolves the exact legacy
+StoreDir through the same containment checks as persistence startup, rejects a
+symlinked path, and removes only that verified directory; it must never remove
+`~/.looprig`, its logs, or `sessions/`. The operator must stop every old `swe`
+process before running the purge, because the older process has no lock that can
+reliably prove it is not actively using the legacy files. A successful purge
+prints the removed path. A missing legacy StoreDir is a successful no-op.
 
 ## Optional Model Tiers and Titles
 
@@ -138,15 +153,18 @@ type ModelCatalog struct {
 }
 ```
 
-The lists are ordered. Construction validates every supplied spec, including its
-provider, and initializes only the client for the selected spec. The first model
-in the selected tier is chosen; there is no silent mid-session failover to a
-different model. Specs, including their API keys, remain in memory and are never
-logged or serialized.
+The lists are ordered. Configuration validates every supplied spec: it requires
+a non-empty model and known provider, then applies `ModelSpec.Validate`. The
+tier resolver materializes a provider client for the selected Standard model and,
+only when a title is due, the selected Economy model; the two may use different
+providers. The first model in each selected tier is used with no silent
+mid-session failover. Specs, including their API keys, remain in memory and are
+never logged or serialized.
 
 - An empty `Economy` list means no title-model call. On the first accepted user
-  input, the title immediately falls back to a sanitized, length-bounded message
-  snippet so a crashed first turn is still listable.
+  input, the title immediately falls back to a sanitized, length-bounded first
+  non-empty text block so a crashed first turn is still listable. A multimodal
+  input with no text keeps `title_source:none` until a generated title exists.
 - A non-empty `Economy` list enables one asynchronous, best-effort title call
   after the first completed turn. A bounded background context and the metadata
   writer replace the fallback only on valid success; it cannot block a turn,
@@ -158,9 +176,11 @@ logged or serialized.
   no premium model is available; a future explicit tier-selection feature may
   consume it. There is no implicit escalation based on task content or errors.
 
-Title-model output is untrusted text: it is validated as one short plain-text
-line before an atomic manifest update. Failure, timeout, empty output, or an
-invalid output preserves the first-user-message fallback.
+The title request has no tools, a fixed title-only system instruction, a hard
+timeout, and bounded excerpts of the first user message and first final assistant
+reply. Title-model output is untrusted text: it is validated as one short
+plain-text line before an atomic manifest update. Failure, timeout, empty output,
+or an invalid output preserves the first-user-message fallback.
 
 ## Testing and Acceptance
 
@@ -177,8 +197,8 @@ invalid output preserves the first-user-message fallback.
   secrets.
 - Economy title generation succeeds without delaying turns; absent or failed
   Economy configuration produces the first-user-message fallback.
-- The legacy shared StoreDir remains discoverable and readable until an explicit
-  migration policy is approved and implemented.
+- `--purge-legacy-sessions` deletes only the verified legacy StoreDir, is a
+  no-op when it is absent, and never deletes the broader Looprig data directory.
 - Clean single-instance shutdown still has no unexpected lease-lost error-level
   log. Directory isolation removes shared-StoreDir corruption; it does not
   replace the independent shutdown/lease-lifecycle fix.
