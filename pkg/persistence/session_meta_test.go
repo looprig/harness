@@ -276,3 +276,29 @@ func TestSessionMetaReadMissingIsTyped(t *testing.T) {
 		t.Fatalf("Read before Init error = %v, want errMissingSessionMeta", err)
 	}
 }
+
+// TestSessionMetaInitRepairsCorruptManifest proves Init repairs (overwrites) a corrupt
+// manifest rather than failing, so a resumed session whose manifest was truncated/garbled
+// becomes listable again — JetStream remains authoritative for the conversation.
+func TestSessionMetaInitRepairsCorruptManifest(t *testing.T) {
+	root, store, id := openTestMeta(t)
+
+	dir, err := root.CreateSessionDir(id)
+	if err != nil {
+		t.Fatalf("CreateSessionDir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, sessionMetaFileName), []byte("{corrupt-not-json"), 0o600); err != nil {
+		t.Fatalf("write corrupt manifest: %v", err)
+	}
+
+	meta, err := store.Init(testClock())
+	if err != nil {
+		t.Fatalf("Init did not repair a corrupt manifest: %v", err)
+	}
+	if meta.ID != id || meta.Status != SessionStatusActive {
+		t.Errorf("repaired manifest = %+v, want id %v / active", meta, id)
+	}
+	if _, err := store.Read(); err != nil {
+		t.Fatalf("Read after repair failed: %v", err)
+	}
+}

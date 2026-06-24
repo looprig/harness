@@ -211,6 +211,9 @@ func confinedChild(root, child string) (string, error) {
 // create, but never chmods or rejects an already-existing real directory's mode, because
 // the data root belongs to the user, not the feature.
 func ensureRootDirectory(path string) error {
+	// #nosec G703 -- path is confined: app/session paths are built via confinedChild (rejects
+	// traversal + root escape) and symlink-checked here; the data root is the user's own
+	// XDG_DATA_HOME/home directory. The taint source is the legitimate, intended data root.
 	info, err := os.Lstat(path)
 	if err == nil {
 		if info.Mode()&os.ModeSymlink != 0 {
@@ -232,6 +235,8 @@ func ensureRootDirectory(path string) error {
 	if err := ensureRootDirectory(parent); err != nil {
 		return err
 	}
+	// #nosec G703 -- see the confinement note above; only components below the nearest
+	// existing, non-symlinked ancestor are created.
 	if err := os.Mkdir(path, storeDirPerm); err != nil && !errors.Is(err, os.ErrExist) {
 		return err
 	}
@@ -239,14 +244,18 @@ func ensureRootDirectory(path string) error {
 }
 
 func ensurePrivateDirectory(path string) error {
+	// #nosec G703 -- path is a confined app/session directory (built via confinedChild,
+	// symlink-checked below). The data root is the user's own XDG_DATA_HOME/home directory.
 	info, err := os.Lstat(path)
 	if err != nil {
 		if !errors.Is(err, os.ErrNotExist) {
 			return err
 		}
+		// #nosec G703 -- confined path; see the note above.
 		if err := os.Mkdir(path, storeDirPerm); err != nil && !errors.Is(err, os.ErrExist) {
 			return err
 		}
+		// #nosec G703 -- confined path; re-stat to reject a symlink raced in after Mkdir.
 		info, err = os.Lstat(path)
 		if err != nil {
 			return err
@@ -258,6 +267,7 @@ func ensurePrivateDirectory(path string) error {
 	if !info.IsDir() {
 		return fmt.Errorf("%w: %s", errSessionStoreNotDir, path)
 	}
+	// #nosec G703 -- confined path, already symlink-checked above; normalises owner-only mode.
 	if err := os.Chmod(path, storeDirPerm); err != nil {
 		return err
 	}

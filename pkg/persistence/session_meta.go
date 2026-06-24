@@ -118,8 +118,9 @@ func (s *SessionMetaStore) Init(now time.Time) (SessionMeta, error) {
 	switch {
 	case err == nil:
 		return meta, nil
-	case errors.Is(err, errMissingSessionMeta):
-		// fall through to create
+	case errors.Is(err, errMissingSessionMeta), errors.Is(err, errCorruptSessionMeta):
+		// Missing or corrupt: (re)create a fresh manifest. The journal is authoritative for
+		// the conversation, so repairing the non-load-bearing manifest is always safe.
 	default:
 		return SessionMeta{}, err
 	}
