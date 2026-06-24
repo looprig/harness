@@ -2,6 +2,7 @@ package session
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"time"
 
@@ -159,19 +160,60 @@ func (s *Session) stampNow() time.Time {
 // appender is nil-guarded (a struct-literal test session leaves it unset) so the path
 // is a safe no-op in no-persistence mode.
 func (s *Session) appendCommand(ctx context.Context, loopID uuid.UUID, cmd command.Command) {
+	s.appendCommandWithPolicy(ctx, loopID, cmd, false)
+}
+
+// appendShutdownCommand is the shutdown-path intent-log write. It is identical to
+// appendCommand except that a TYPED lease-lost append failure is EXPECTED: Shutdown releases
+// the single-writer lease as part of teardown (or the heartbeat already observed the loss),
+// so a final shutdown-command append refused for lease loss is benign — not a fault. That
+// one path is logged at debug; every OTHER append failure (and an ordinary, non-shutdown
+// lease loss) still logs loudly at error. It does not change dispatch semantics.
+func (s *Session) appendShutdownCommand(ctx context.Context, loopID uuid.UUID, cmd command.Command) {
+	s.appendCommandWithPolicy(ctx, loopID, cmd, true)
+}
+
+// appendCommandWithPolicy performs the audit-only intent-log append and applies the
+// failure-log policy: a lease-lost failure is downgraded to debug only when
+// leaseLostExpected (the shutdown path); otherwise any failure logs loudly. It always
+// proceeds — the append is never load-bearing for dispatch.
+func (s *Session) appendCommandWithPolicy(ctx context.Context, loopID uuid.UUID, cmd command.Command, leaseLostExpected bool) {
 	app := s.cmdAppender
 	if app == nil {
 		return
 	}
 	rec := journal.NewCommandRecord(s.SessionID, loopID, cmd)
-	if err := app.AppendCommand(ctx, rec); err != nil {
-		// Audit-only: log loudly and proceed. Never block the dispatch, never fault the
-		// session — a lost intent-log record is recoverable; a blocked user action is not.
-		slog.ErrorContext(ctx, "session: intent-log command append failed (audit-only, proceeding)",
+	err := app.AppendCommand(ctx, rec)
+	if err == nil {
+		return
+	}
+
+	if leaseLostExpected && isJournalLeaseLost(err) {
+		// Expected on a clean shutdown: ownership is relinquished during teardown, so a final
+		// shutdown-command append refused for lease loss is benign. Log at debug, not error —
+		// this is the incident's false-alarm path.
+		slog.DebugContext(ctx, "session: shutdown intent-log append skipped after lease loss (expected)",
 			"session", s.SessionID,
 			"loop", loopID,
 			"command_id", cmd.CommandHeader().CommandID,
 			"err", err,
 		)
+		return
 	}
+
+	// Audit-only: log loudly and proceed. Never block the dispatch, never fault the
+	// session — a lost intent-log record is recoverable; a blocked user action is not.
+	slog.ErrorContext(ctx, "session: intent-log command append failed (audit-only, proceeding)",
+		"session", s.SessionID,
+		"loop", loopID,
+		"command_id", cmd.CommandHeader().CommandID,
+		"err", err,
+	)
+}
+
+// isJournalLeaseLost reports whether err is (or wraps) a *journal.JournalLeaseLostError —
+// the typed "append refused because ownership was lost" signal.
+func isJournalLeaseLost(err error) bool {
+	var leaseLost *journal.JournalLeaseLostError
+	return errors.As(err, &leaseLost)
 }

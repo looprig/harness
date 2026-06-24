@@ -3,6 +3,8 @@ package session
 import (
 	"context"
 	"errors"
+	"log/slog"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -16,6 +18,134 @@ import (
 	"github.com/ciram-co/looprig/pkg/tool"
 	"github.com/ciram-co/looprig/pkg/uuid"
 )
+
+// capturingHandler records every slog record's level and message so a test can assert the
+// log LEVEL of the intent-log append path (an expected shutdown lease loss must not be
+// error-level; a real append failure must be).
+type capturingHandler struct {
+	mu      sync.Mutex
+	records []slog.Record
+}
+
+func (h *capturingHandler) Enabled(context.Context, slog.Level) bool { return true }
+
+func (h *capturingHandler) Handle(_ context.Context, r slog.Record) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.records = append(h.records, r.Clone())
+	return nil
+}
+
+func (h *capturingHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h *capturingHandler) WithGroup(string) slog.Handler      { return h }
+
+// errorMessagesContaining returns the messages of every error-level record whose message
+// contains substr.
+func (h *capturingHandler) errorMessagesContaining(substr string) []string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	var out []string
+	for _, r := range h.records {
+		if r.Level >= slog.LevelError && strings.Contains(r.Message, substr) {
+			out = append(out, r.Message)
+		}
+	}
+	return out
+}
+
+// captureLogs swaps the default slog logger for a capturing handler for the test duration.
+// The tests using it must not run in parallel (they mutate the process-global logger).
+func captureLogs(t *testing.T) *capturingHandler {
+	t.Helper()
+	h := &capturingHandler{}
+	prev := slog.Default()
+	slog.SetDefault(slog.New(h))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+	return h
+}
+
+// drainShutdownAcks reads the Shutdown command off each loop's channel and acks it, so a
+// driven Shutdown completes.
+func drainShutdownAcks(t *testing.T, cmds map[uuid.UUID]chan command.Command, loopIDs ...uuid.UUID) {
+	t.Helper()
+	for _, lid := range loopIDs {
+		ch := cmds[lid]
+		go func() {
+			c := recvCommand(t, ch)
+			if sc, ok := c.(command.Shutdown); ok && sc.Ack != nil {
+				sc.Ack <- nil
+			}
+		}()
+	}
+}
+
+const appendFailedMsg = "append failed"
+
+// TestShutdownLeaseLostAppendIsNotErrorLevel proves the incident's false alarm is gone: a
+// multi-loop Shutdown whose intent-log appends are refused for a lost lease completes
+// cleanly and logs the expected lease loss BELOW error level (never an error-level audit
+// record), while still appending one shutdown record per loop.
+func TestShutdownLeaseLostAppendIsNotErrorLevel(t *testing.T) {
+	logs := captureLogs(t)
+	ts := time.Date(2026, 6, 23, 10, 0, 0, 0, time.UTC)
+	app := &fakeCommandAppender{err: &journal.JournalLeaseLostError{SessionID: mustUUID(), Epoch: 7}}
+	loopA, loopB := mustUUID(), mustUUID()
+	s, cmds := fakeAppenderSession(app, ts, loopA, loopB)
+
+	drainShutdownAcks(t, cmds, loopA, loopB)
+
+	if err := s.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown = %v, want nil (must complete despite lease-lost appends)", err)
+	}
+	if got := len(app.snapshot()); got != 2 {
+		t.Fatalf("appended %d shutdown records, want 2 (one per loop)", got)
+	}
+	if msgs := logs.errorMessagesContaining(appendFailedMsg); len(msgs) != 0 {
+		t.Errorf("shutdown lease-lost append produced error-level audit record(s): %v", msgs)
+	}
+}
+
+// TestOrdinaryLeaseLostAppendLogsError proves the downgrade is shutdown-only: an ordinary
+// (non-shutdown) command whose append is refused for a lost lease still logs loudly at
+// error — losing an intent-log record during normal operation is a real fault.
+func TestOrdinaryLeaseLostAppendLogsError(t *testing.T) {
+	logs := captureLogs(t)
+	ts := time.Date(2026, 6, 23, 10, 1, 0, 0, time.UTC)
+	app := &fakeCommandAppender{err: &journal.JournalLeaseLostError{SessionID: mustUUID(), Epoch: 3}}
+	lid := mustUUID()
+	s, cmds := fakeAppenderSession(app, ts, lid)
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() { defer wg.Done(); recvCommand(t, cmds[lid]) }()
+	if _, err := s.Submit(context.Background(), nil); err != nil {
+		t.Fatalf("Submit = %v, want nil (audit-only)", err)
+	}
+	wg.Wait()
+
+	if msgs := logs.errorMessagesContaining(appendFailedMsg); len(msgs) == 0 {
+		t.Error("ordinary lease-lost append did not log at error level")
+	}
+}
+
+// TestShutdownNonLeaseLostAppendLogsError proves only the EXPECTED path is downgraded: a
+// shutdown whose append fails for any non-lease-lost reason still logs at error.
+func TestShutdownNonLeaseLostAppendLogsError(t *testing.T) {
+	logs := captureLogs(t)
+	ts := time.Date(2026, 6, 23, 10, 2, 0, 0, time.UTC)
+	app := &fakeCommandAppender{err: errors.New("journal unavailable")}
+	loopA := mustUUID()
+	s, cmds := fakeAppenderSession(app, ts, loopA)
+
+	drainShutdownAcks(t, cmds, loopA)
+
+	if err := s.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown = %v, want nil", err)
+	}
+	if msgs := logs.errorMessagesContaining(appendFailedMsg); len(msgs) == 0 {
+		t.Error("a non-lease-lost shutdown append should still log at error level")
+	}
+}
 
 // fakeCommandAppender is a commandAppender double that records every CommandRecord the
 // session appends and optionally fails. It is concurrency-safe because Interrupt and

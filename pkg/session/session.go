@@ -1150,8 +1150,10 @@ func (s *Session) Shutdown(ctx context.Context) error {
 		ack := make(chan error, 1)
 		cmd := command.Shutdown{Header: command.Header{CommandID: id, CreatedAt: s.stampNow()}, Ack: ack}
 		// Intent log (audit-only): one record per loop (the command is per-loop), appended
-		// BEFORE this loop's send; an append failure is logged and the fan-out proceeds.
-		s.appendCommand(ctx, ls.loopID, cmd)
+		// BEFORE this loop's send; an append failure is logged and the fan-out proceeds. This
+		// is the shutdown-aware append: a typed lease-lost failure here is expected (ownership
+		// is relinquished during teardown) and logged below error, not as a false alarm.
+		s.appendShutdownCommand(ctx, ls.loopID, cmd)
 		select {
 		case ls.handle.loop.Commands <- cmd:
 			targets = append(targets, shutdownTarget{loop: ls.handle.loop, ack: ack})
