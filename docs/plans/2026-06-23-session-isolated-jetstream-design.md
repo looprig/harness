@@ -1,8 +1,26 @@
 # Session-Isolated Embedded JetStream Design
 
 **Date:** 2026-06-23  
-**Status:** Approved design  
+**Status:** Implemented (2026-06-23) — see the implementation plan and the
+`feature/session-isolated-jetstream` branches in `looprig` and `../swe`.  
 **Scope:** Local `swe` persistence, session discovery, best-effort generated session titles, and safe transition away from the legacy shared StoreDir.
+
+## Implementation Notes
+
+- The single-instance guard is a **Unix-only** `syscall.Flock` on
+  `<session-dir>/session.lock`, acquired before the embedded server starts and
+  released on `Close`. Non-Unix platforms fail closed
+  (`errSessionLockUnsupported`) rather than run an unguarded engine.
+- The persistence session API is keyed on `looprig/pkg/uuid` (not `google/uuid`)
+  for internal consistency with the journal/session packages and to avoid adding a
+  direct dependency to `../swe`.
+- The session manifest is created (active) when a session is opened, so a new
+  session is immediately listable; `Init` repairs a missing **or corrupt**
+  manifest from the authoritative store on resume.
+- The destructive legacy purge is exposed as `swe --purge-legacy-sessions`
+  (mutually exclusive with `--list`/`--resume`); it derives and
+  containment-checks the `~/.looprig/jetstream` path internally and never accepts
+  a deletion path.
 
 ## Goal
 
