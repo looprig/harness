@@ -6,7 +6,6 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/google/uuid"
 	"github.com/nats-io/nats.go"
 )
 
@@ -26,7 +25,7 @@ func newIntegrationStoreRoot(t *testing.T) *SessionStoreRoot {
 // so the session can be reopened.
 func TestSessionEngineLifecycle(t *testing.T) {
 	root := newIntegrationStoreRoot(t)
-	id := uuid.New()
+	id := mustUUID(t)
 
 	first, err := root.OpenSessionEngine(id)
 	if err != nil {
@@ -71,13 +70,13 @@ func TestSessionEngineLifecycle(t *testing.T) {
 func TestSessionEngineDistinctIDsCoexist(t *testing.T) {
 	root := newIntegrationStoreRoot(t)
 
-	a, err := root.OpenSessionEngine(uuid.New())
+	a, err := root.OpenSessionEngine(mustUUID(t))
 	if err != nil {
 		t.Fatalf("OpenSessionEngine(a): %v", err)
 	}
 	t.Cleanup(func() { _ = a.Close() })
 
-	b, err := root.OpenSessionEngine(uuid.New())
+	b, err := root.OpenSessionEngine(mustUUID(t))
 	if err != nil {
 		t.Fatalf("OpenSessionEngine(b): %v", err)
 	}

@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/google/uuid"
+	"github.com/ciram-co/looprig/pkg/uuid"
 )
 
 func testClock() time.Time {
@@ -21,7 +21,7 @@ func testClock() time.Time {
 func openTestMeta(t *testing.T) (*SessionStoreRoot, *SessionMetaStore, uuid.UUID) {
 	t.Helper()
 	root := newTestSessionStoreRoot(t)
-	id := uuid.New()
+	id := mustUUID(t)
 	store, err := root.OpenSessionMeta(id)
 	if err != nil {
 		t.Fatalf("OpenSessionMeta: %v", err)
@@ -164,7 +164,7 @@ func TestSessionMetaConcurrentUpdate(t *testing.T) {
 // transcript.
 func TestSessionMetaNoSecretsInJSON(t *testing.T) {
 	meta := SessionMeta{
-		ID:          uuid.New(),
+		ID:          mustUUID(t),
 		Title:       "a title",
 		TitleSource: TitleSourceGenerated,
 		Status:      SessionStatusActive,
@@ -206,13 +206,13 @@ func TestListSessionMeta(t *testing.T) {
 	newer := writeListedSession(t, root, "newer session", testClock().Add(time.Hour))
 
 	// A session directory with no manifest (missing).
-	missingID := uuid.New()
+	missingID := mustUUID(t)
 	if _, err := root.CreateSessionDir(missingID); err != nil {
 		t.Fatalf("CreateSessionDir(missing): %v", err)
 	}
 
 	// A session directory with corrupt manifest bytes.
-	corruptID := uuid.New()
+	corruptID := mustUUID(t)
 	corruptDir, err := root.CreateSessionDir(corruptID)
 	if err != nil {
 		t.Fatalf("CreateSessionDir(corrupt): %v", err)
@@ -256,7 +256,7 @@ func TestListSessionMeta(t *testing.T) {
 
 func writeListedSession(t *testing.T, root *SessionStoreRoot, title string, now time.Time) uuid.UUID {
 	t.Helper()
-	id := uuid.New()
+	id := mustUUID(t)
 	store, err := root.OpenSessionMeta(id)
 	if err != nil {
 		t.Fatalf("OpenSessionMeta: %v", err)

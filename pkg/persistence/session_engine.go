@@ -4,7 +4,7 @@ import (
 	"errors"
 	"path/filepath"
 
-	"github.com/google/uuid"
+	"github.com/ciram-co/looprig/pkg/uuid"
 	"github.com/nats-io/nats.go"
 )
 

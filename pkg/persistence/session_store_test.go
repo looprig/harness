@@ -6,8 +6,28 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/google/uuid"
+	"github.com/ciram-co/looprig/pkg/uuid"
 )
+
+// mustUUID returns a fresh random UUID, failing the test on a generation error.
+func mustUUID(t *testing.T) uuid.UUID {
+	t.Helper()
+	id, err := uuid.New()
+	if err != nil {
+		t.Fatalf("uuid.New: %v", err)
+	}
+	return id
+}
+
+// mustParseUUID parses a canonical UUID string, failing the test on a parse error.
+func mustParseUUID(t *testing.T, s string) uuid.UUID {
+	t.Helper()
+	var id uuid.UUID
+	if err := id.UnmarshalText([]byte(s)); err != nil {
+		t.Fatalf("parse uuid %q: %v", s, err)
+	}
+	return id
+}
 
 func TestSessionDataRootFrom(t *testing.T) {
 	tests := []struct {
@@ -246,7 +266,7 @@ func TestConfinedChild(t *testing.T) {
 }
 
 func TestSessionDir(t *testing.T) {
-	canonicalID := uuid.MustParse("5d65ceae-6ec4-4232-a4c6-628820c2ae31")
+	canonicalID := mustParseUUID(t, "5d65ceae-6ec4-4232-a4c6-628820c2ae31")
 
 	tests := []struct {
 		name      string
@@ -324,7 +344,7 @@ func TestSessionDir(t *testing.T) {
 }
 
 func TestCreateSessionDir(t *testing.T) {
-	canonicalID := uuid.MustParse("76759057-6978-44d1-ae52-1582430fd117")
+	canonicalID := mustParseUUID(t, "76759057-6978-44d1-ae52-1582430fd117")
 
 	tests := []struct {
 		name      string

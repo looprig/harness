@@ -13,7 +13,7 @@ import (
 	"unicode"
 	"unicode/utf8"
 
-	"github.com/google/uuid"
+	"github.com/ciram-co/looprig/pkg/uuid"
 )
 
 const (
@@ -213,7 +213,7 @@ func readSessionMeta(path string) (SessionMeta, error) {
 	if err := json.Unmarshal(data, &meta); err != nil {
 		return SessionMeta{}, fmt.Errorf("%w: %v", errCorruptSessionMeta, err)
 	}
-	if meta.ID == uuid.Nil || !meta.TitleSource.valid() || !meta.Status.valid() {
+	if meta.ID.IsZero() || !meta.TitleSource.valid() || !meta.Status.valid() {
 		return SessionMeta{}, fmt.Errorf("%w: malformed fields", errCorruptSessionMeta)
 	}
 	return meta, nil
@@ -323,8 +323,8 @@ func (r *SessionStoreRoot) ListSessionMeta() ([]SessionListEntry, error) {
 		if !de.IsDir() {
 			continue
 		}
-		id, perr := uuid.Parse(de.Name())
-		if perr != nil {
+		var id uuid.UUID
+		if perr := id.UnmarshalText([]byte(de.Name())); perr != nil {
 			continue // not a session directory
 		}
 

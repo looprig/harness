@@ -5,8 +5,6 @@ package persistence
 import (
 	"testing"
 	"time"
-
-	"github.com/google/uuid"
 )
 
 // TestSessionMetaPersistsAcrossStoreRoots proves a manifest written through one store root
@@ -19,7 +17,7 @@ func TestSessionMetaPersistsAcrossStoreRoots(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OpenSessionStoreRoot (write): %v", err)
 	}
-	id := uuid.New()
+	id := mustUUID(t)
 	store, err := writeRoot.OpenSessionMeta(id)
 	if err != nil {
 		t.Fatalf("OpenSessionMeta: %v", err)

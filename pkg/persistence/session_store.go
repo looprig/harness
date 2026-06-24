@@ -7,7 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/google/uuid"
+	"github.com/ciram-co/looprig/pkg/uuid"
 )
 
 const (
@@ -116,7 +116,7 @@ func openSessionStoreRootAt(root, appDirName string) (*SessionStoreRoot, error) 
 // SessionDir returns the directory for a non-zero session ID. It never accepts a caller
 // supplied path component: UUID.String produces the canonical directory name.
 func (r *SessionStoreRoot) SessionDir(id uuid.UUID) (string, error) {
-	if id == uuid.Nil {
+	if id.IsZero() {
 		return "", &SessionStoreError{Operation: SessionStoreResolve, Cause: errInvalidSessionID}
 	}
 	if err := r.validate(); err != nil {
@@ -282,7 +282,7 @@ func validateExistingDirectory(path string) error {
 }
 
 func sessionIDPath(r *SessionStoreRoot, id uuid.UUID) string {
-	if r == nil || r.sessionsDir == "" || id == uuid.Nil {
+	if r == nil || r.sessionsDir == "" || id.IsZero() {
 		return ""
 	}
 	return filepath.Join(r.sessionsDir, id.String())
