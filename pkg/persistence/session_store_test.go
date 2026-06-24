@@ -426,3 +426,95 @@ func assertSessionStoreError(t *testing.T, err error) {
 		t.Fatalf("error = %T %v, want *SessionStoreError", err, err)
 	}
 }
+
+func TestPurgeLegacyStore(t *testing.T) {
+	t.Run("removes legacy directory with files", func(t *testing.T) {
+		root := newTestSessionStoreRoot(t)
+		legacy := filepath.Join(root.appDir, jetstreamDirName)
+		if err := os.MkdirAll(filepath.Join(legacy, "streams"), 0o700); err != nil {
+			t.Fatalf("seed legacy: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(legacy, "streams", "data"), []byte("x"), 0o600); err != nil {
+			t.Fatalf("seed file: %v", err)
+		}
+
+		result, err := root.PurgeLegacyStore()
+		if err != nil {
+			t.Fatalf("PurgeLegacyStore: %v", err)
+		}
+		if !result.Removed {
+			t.Errorf("Removed = false, want true")
+		}
+		if result.Path != legacy {
+			t.Errorf("Path = %q, want %q", result.Path, legacy)
+		}
+		if _, err := os.Lstat(legacy); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("legacy dir still present: err = %v", err)
+		}
+	})
+
+	t.Run("absent legacy directory is a no-op", func(t *testing.T) {
+		root := newTestSessionStoreRoot(t)
+
+		result, err := root.PurgeLegacyStore()
+		if err != nil {
+			t.Fatalf("PurgeLegacyStore: %v", err)
+		}
+		if result.Removed {
+			t.Errorf("Removed = true, want false for absent legacy store")
+		}
+	})
+
+	t.Run("symlinked legacy path is rejected", func(t *testing.T) {
+		root := newTestSessionStoreRoot(t)
+		target := t.TempDir()
+		sentinel := filepath.Join(target, "keep")
+		if err := os.WriteFile(sentinel, []byte("survive"), 0o600); err != nil {
+			t.Fatalf("seed sentinel: %v", err)
+		}
+		legacy := filepath.Join(root.appDir, jetstreamDirName)
+		if err := os.Symlink(target, legacy); err != nil {
+			t.Fatalf("Symlink: %v", err)
+		}
+
+		if _, err := root.PurgeLegacyStore(); err == nil {
+			t.Fatal("PurgeLegacyStore on a symlink succeeded, want error")
+		} else {
+			assertSessionStoreError(t, err)
+		}
+		if _, err := os.Lstat(sentinel); err != nil {
+			t.Errorf("symlink target was followed and deleted: %v", err)
+		}
+	})
+
+	t.Run("sessions root and log sibling survive", func(t *testing.T) {
+		root := newTestSessionStoreRoot(t)
+		legacy := filepath.Join(root.appDir, jetstreamDirName)
+		if err := os.MkdirAll(legacy, 0o700); err != nil {
+			t.Fatalf("seed legacy: %v", err)
+		}
+		logSibling := filepath.Join(root.appDir, "looprig.log")
+		if err := os.WriteFile(logSibling, []byte("log"), 0o600); err != nil {
+			t.Fatalf("seed log: %v", err)
+		}
+
+		if _, err := root.PurgeLegacyStore(); err != nil {
+			t.Fatalf("PurgeLegacyStore: %v", err)
+		}
+		if _, err := os.Stat(root.sessionsDir); err != nil {
+			t.Errorf("sessions root removed: %v", err)
+		}
+		if _, err := os.Stat(logSibling); err != nil {
+			t.Errorf("log sibling removed: %v", err)
+		}
+	})
+
+	t.Run("malformed root is refused", func(t *testing.T) {
+		root := &SessionStoreRoot{appDir: t.TempDir(), sessionsDir: t.TempDir()}
+		if _, err := root.PurgeLegacyStore(); err == nil {
+			t.Fatal("PurgeLegacyStore on a malformed root succeeded, want error")
+		} else {
+			assertSessionStoreError(t, err)
+		}
+	})
+}

@@ -287,3 +287,49 @@ func sessionIDPath(r *SessionStoreRoot, id uuid.UUID) string {
 	}
 	return filepath.Join(r.sessionsDir, id.String())
 }
+
+// SessionStorePurge is the operation context for a legacy-store purge failure.
+const SessionStorePurge SessionStoreOperation = "purge legacy store"
+
+// PurgeLegacyResult reports the outcome of a legacy-store purge for CLI output. Path is the
+// exact legacy StoreDir considered; Removed is true only when a directory was deleted (an
+// absent legacy store is a successful no-op).
+type PurgeLegacyResult struct {
+	Path    string
+	Removed bool
+}
+
+// PurgeLegacyStore removes the former shared embedded StoreDir (<app-dir>/jetstream) and
+// nothing else. The path is derived internally — never supplied by a caller — and is
+// verified to be a confined, non-symlinked child of the validated app directory before any
+// deletion. An absent legacy store is a no-op; a symlink is refused so the target is never
+// followed. The sessions root and unrelated siblings (e.g. looprig.log) are left intact.
+func (r *SessionStoreRoot) PurgeLegacyStore() (PurgeLegacyResult, error) {
+	if err := r.validate(); err != nil {
+		return PurgeLegacyResult{}, &SessionStoreError{Operation: SessionStorePurge, Cause: err}
+	}
+
+	legacyDir, err := confinedChild(r.appDir, jetstreamDirName)
+	if err != nil {
+		return PurgeLegacyResult{}, &SessionStoreError{Operation: SessionStorePurge, Path: r.appDir, Cause: err}
+	}
+
+	info, err := os.Lstat(legacyDir)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return PurgeLegacyResult{Path: legacyDir, Removed: false}, nil
+		}
+		return PurgeLegacyResult{}, &SessionStoreError{Operation: SessionStorePurge, Path: legacyDir, Cause: err}
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return PurgeLegacyResult{}, &SessionStoreError{Operation: SessionStorePurge, Path: legacyDir, Cause: errSessionStoreSymlink}
+	}
+	if !info.IsDir() {
+		return PurgeLegacyResult{}, &SessionStoreError{Operation: SessionStorePurge, Path: legacyDir, Cause: errSessionStoreNotDir}
+	}
+
+	if err := os.RemoveAll(legacyDir); err != nil {
+		return PurgeLegacyResult{}, &SessionStoreError{Operation: SessionStorePurge, Path: legacyDir, Cause: err}
+	}
+	return PurgeLegacyResult{Path: legacyDir, Removed: true}, nil
+}
