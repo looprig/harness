@@ -139,5 +139,86 @@ or go-ethereum `crypto`) — two modes: 65-byte recoverable (receipts) and 64-by
 
 ## swe impact
 
-None beyond the `auto.New` provider mapping. Config already correct. Re-verify GLM-5.2
-end-to-end after Phase 1 lands.
+None beyond the `auto.New` provider mapping. This is an SDK capability, not a GLM-5.2 fix —
+SDK users choose the provider. Re-verify end-to-end (any model) after it lands.
+
+---
+
+## FINAL SCOPE (2026-06-24) — supersedes the phasing above
+
+This is a **max-security SDK feature**: looprig exposes a confidential client for the Dstack
+`private-ai-gateway` (Phala/RedPill). **Chutes** already provides the post-quantum
+(ML-KEM-768) confidential path; **Phala** gets its ceiling, **ACI E2EE v2**. SDK users pick.
+The "Phase 1 / Phase 2" split is **dropped** — the single deliverable is
+**full-DCAP attestation + ACI E2EE v2 sealing + mandatory receipt verification**. Plaintext
+mode is never a shipped posture. (Spec sources: Dstack `private-ai-gateway@1b43f76`,
+`src/aci/*` and `examples/verify_aci_artifacts.rs`.)
+
+### Confidentiality facts (verified against the source)
+- The gateway **serves plain HTTP**; TLS is terminated by an **external, un-attested**
+  component (`tls_spkis()` is empty in-TEE). TLS-SPKI pinning is therefore **not** a valid
+  confidentiality anchor here — operator confidentiality requires **E2EE v2**.
+- E2EE v2 ships **no client** (server + Rust lib + tests only); we implement the client.
+- E2EE v2 is **classical** (secp256k1 ECDH). ML-KEM (PQ) exists only on the gateway→Chutes
+  hop, not user→gateway. Quantum-safe user confidentiality ⇒ use the Chutes provider.
+
+### Security model & review resolutions (all six accepted)
+1. **Trust policy (required) + no false TLS pin.** `aci.New(baseURL, apiKey, Policy)` where
+   `Policy{ AcceptedWorkloadIDs, AcceptedSourceProvenance{repo,commit}, AcceptedAppIDs/RTMRs,
+   AcceptedKMSRootPubKeys }`. Anchors are **caller-supplied out-of-band** (never trusted from
+   the report itself — that would be circular). Ship documented **pinned Phala/RedPill
+   defaults** derived from a known-good attestation + commit `1b43f76`, flagged "verify
+   independently." No TLS-SPKI pin (not anchorable on this gateway).
+2. **Full DCAP.** Add `Options{GetCollateral,CheckRevocations}` to `tee.VerifyTDXQuote`
+   (today both false — confirmed `intel_quote.go`); enable collateral + revocation/TCB; add
+   RTMR3 event-log replay (SHA-384 over zeroed-48 accumulator vs quote RTMR3), app-id
+   extraction, `source_provenance` repo+commit vs policy, and the dstack-KMS custody chain
+   (two recoverable secp256k1 sigs → root ∈ policy).
+3. **Mandatory receipt checks** — exact request/response **wire-hash** match,
+   `endpoint`/`method`/`api_version`, and `upstream.verified.result=="verified"` for the
+   expected provider/model. Signature-valid-but-mismatched ⇒ reject.
+4. **Streaming = buffer until verified.** Accumulate the full sealed response, open + verify
+   receipt/hashes/upstream, then emit. No pre-verification output.
+5. **Canonical endpoints + commit pin** — `GET /v1/aci/attestation`, `/v1/aci/receipts/{id}`
+   (both live, 200). Pin protocol to commit `1b43f76` (== deployed `repo_commit`); old
+   `/v1/attestation/report`, `/v1/signature/{id}` are compat-only.
+6. **Constrained JCS** (rejects floats/non-integers; UTF-16-ordered keys) with **fixed
+   cross-language vectors** captured from the Rust `verify_aci_artifacts`.
+
+### Verification algorithm (full DCAP) — condensed
+All digests = `"sha256:"+hex(sha256(JCS(v)))`.
+1. `api_version == "aci/1"` else `ErrUnsupportedAPIVersion`.
+2. recompute `workload_id` (JCS of identity `{algo,public_key}`) and `workload_keyset_digest`
+   (JCS of full keyset); compare to report.
+3. `report_data = sha256(JCS({purpose:"aci.report_data.v1", workload_id,
+   workload_keyset_digest, nonce}))`; compare to `attestation.report_data` (32B hex).
+4. `tee.VerifyTDXQuote(hex(evidence.quote), Options{collateral,revocations})` → 64B
+   report_data; require `[0:32]==report_data && [32:64]==0`; check `tee_type`; RTMR3 replay;
+   app-id; `source_provenance` ∈ policy.
+5. `keyset_endorsement`: algo == identity algo; verify identity key over
+   `JCS({purpose:"aci.keyset.endorsement.v1", workload_keyset_digest})` (ed25519 raw, or
+   **secp256k1 64B** over sha256(payload)).
+6. KMS custody chain → root ∈ `policy.AcceptedKMSRootPubKeys`.
+7. freshness: `fetched_at <= now < stale_after`.
+
+### E2EE v2 seal/open — condensed
+- Algo `secp256k1-aes-256-gcm-hkdf-sha256`; key = keyset `e2ee_public_keys` entry.
+- Per message: ephemeral secp256k1 keypair → ECDH(model pubkey) → HKDF-SHA256
+  (info `aci.e2ee.v2.secp256k1`) → AES-256-GCM key. **Field-level**: encrypt
+  `messages[].content` / `prompt` / `input`; ciphertext = `hex(ephem_uncompressed(65) ‖
+  nonce(12) ‖ ct+tag)`. **AAD** = `v2|req|algo=…|model=…|m=<i>|c=<sel>|n=<nonce>|ts=<ts>`.
+  **Headers**: `X-E2EE-Version:2`, `X-Client-Pub-Key`, `X-Model-Pub-Key`, `X-E2EE-Nonce`,
+  `X-E2EE-Timestamp`.
+- Response: gateway re-encrypts `content`/`reasoning_content`/`embedding` to the client
+  pubkey with `resp` AAD; client opens with its ephemeral secret. 5-min replay window.
+
+### Receipt — condensed
+`GET /v1/aci/receipts/{id}` (id from `x-receipt-id`); identity match (`workload_id`,
+`workload_keyset_digest`); key = `receipt_signing_keys[]` by `signature.key_id`; canonical =
+`JCS(receipt minus signature.value)`; verify ed25519 raw (64B over bytes) or **secp256k1
+65B `r‖s‖v`** (over sha256(bytes), recover-and-equal). Mandatory checks per resolution 3.
+
+### Dependencies (approved)
+`github.com/decred/dcrd/dcrec/secp256k1/v4` (+`/ecdsa`) — secp256k1 verify(64B)+recover(65B)
++ ECDH for E2EE; `x/crypto/sha3` (Keccak-256); `crypto/ed25519`; DCAP via `pkg/llm/tee`
+(go-tdx-guest). Recorded in `CLAUDE.md`.
