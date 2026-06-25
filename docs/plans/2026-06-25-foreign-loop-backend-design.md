@@ -27,7 +27,7 @@ foreign loop is a sibling of `pkg/loop`, not a sibling of an `llm` provider.
 
 **In:**
 
-- A `Backend` interface (defined in `pkg/session`, the consumer) that both the
+- A `Backend` interface (defined in `pkg/loop`, the leaf both engines import) that both the
   native `*loop.Loop` and a new `*foreignloop.Loop` satisfy.
 - A new `pkg/foreignloop` package: a loop actor with the native loop's handle
   shape, whose runner spawns a foreign agent subprocess per turn instead of
@@ -104,6 +104,19 @@ interface** that both engines satisfy, change `loopHandle.loop *loop.Loop` to
 `loopHandle.backend loop.Backend`, and select the engine at the single
 construction chokepoint.
 
+**Migration is wider than `loopHandle` — every `*loop.Loop` reference in Session
+becomes `loop.Backend`.** Audited sites in `pkg/session/session.go`:
+`loopHandle.loop` (252), `deliverSubagentResult` (389), `loopFor` return type
+(623), `interruptLoop` (787), the `interruptTarget`/`shutdownTarget` structs
+(983/1083), `resolveGate` return type (1258), and `routeGate` parameter (1283),
+plus `submitToLoop` (862). All of these touch the loop only through `.Commands`
+(send), `.Done` (receive), or `.Snapshot` — verified by reading `resolveGate`
+(it just looks the loop up and builds a `GateRoute`) and `routeGate` (it only
+sends `cmd` to `.Commands` and selects on `.Done`). No native-only gate method is
+called, so the 3-method `Backend` below covers every path. Restore's
+`restore_constructor.go:329` call to `loop.NewRestored` is a separate site (see
+Restore).
+
 **Where the interface lives — `pkg/loop`, not `pkg/session`.** The import graph is
 one-way `session → loop`, and `pkg/loop` is a leaf (imports nothing above it).
 `pkg/foreignloop` must import `pkg/loop` for `loop.Config`, `loop.Provenance`, and
@@ -135,9 +148,12 @@ has no analogue for.
 ```go
 // In pkg/loop. Both *loop.Loop and *foreignloop.Loop satisfy it.
 type Backend interface {
-    CommandSink() chan<- command.Command        // Session submits UserInput/Interrupt/Shutdown
-    DoneChan() <-chan struct{}                   // closed when the actor has fully exited
-    Snapshot(ctx context.Context) (Snapshot, error) // committed state for restore verification
+    CommandSink() chan<- command.Command  // Session submits UserInput/Interrupt/Shutdown
+    DoneChan() <-chan struct{}            // closed when the actor has fully exited
+    // Snapshot returns committed state for restore verification + dormant reads.
+    // EXACT signature matches the existing *loop.Loop.Snapshot (restored.go:69) —
+    // no new Snapshot type is introduced.
+    Snapshot(ctx context.Context) (content.AgenticMessages, event.TurnIndex, error)
 }
 
 // Engine selects which backend newLoop builds. Zero value = native.
@@ -150,22 +166,29 @@ const (
 ```
 
 `Engine` is a new field on `loop.Config` (zero value `EngineNative`, so existing
-construction is unchanged). `*loop.Loop` already has `Snapshot`; it gains two
-**additive** accessor methods — `CommandSink()` returning its existing `Commands`
-field and `DoneChan()` returning `Done` — so it satisfies `Backend` despite those
-being struct fields. No behavior changes; nothing else in `pkg/loop` moves.
-`loop.New` keeps its body and either returns `*loop.Loop` (which `newLoop` assigns
-to a `loop.Backend`) or, for explicitness, returns `loop.Backend`.
+construction is unchanged). `*loop.Loop` already has `Snapshot` with this exact
+signature; it gains two **additive** accessor methods — `CommandSink()` returning
+its existing `Commands` field and `DoneChan()` returning `Done` — so it satisfies
+`Backend` despite those being struct fields. No behavior changes; nothing else in
+`pkg/loop` moves. `loop.New` keeps its body and either returns `*loop.Loop` (which
+`newLoop` assigns to a `loop.Backend`) or, for explicitness, returns
+`loop.Backend`. The foreign actor accepts the same `command.Command` set but
+**no-ops commands it cannot honor** (gate answers, `SubagentResult`): they can
+never legitimately arrive (a foreign loop emits no `PermissionRequested` and
+spawns no looprig subagents), and a `default:` case logs-and-drops them so the
+actor never deadlocks — honoring the "accept commands" contract (Liskov).
 
 ## The foreign loop actor (`pkg/foreignloop`)
 
-A `*foreignloop.Loop` is an actor with the native loop's handle shape
-(`Commands`, `Done`) and the same command/event discipline, so Session cannot
-tell it apart from a native loop:
+A `*foreignloop.Loop` is an actor satisfying `loop.Backend` (its `CommandSink()`
+and `DoneChan()` expose the same command/`Done` discipline) so Session cannot tell
+it apart from a native loop. At **creation** it mints its per-loop sid and emits
+`LoopStarted` then `ForeignSessionStarted` (journaling the sid up front). Per
+command:
 
 - **`UserInput`** → run one foreign turn: spawn/resume the subprocess, decode its
-  stream, publish live events, then commit the authoritative result from the
-  transcript, then record the foreign session id.
+  stream, publish live events, then commit the authoritative result (messages)
+  from the transcript. The sid is already journaled — not re-recorded here.
 - **`Interrupt`** → SIGINT the child, then kill after a short grace; publish
   `TurnInterrupted`.
 - **`Shutdown`** → finish or abort the in-flight turn, then close `Done`.
@@ -186,11 +209,13 @@ type ForeignAgent interface {
 }
 
 type ForeignTurn struct {
-    SystemPrompt string              // delivered via the agent's native channel
-    ForeignSID   string              // "" => new session (we mint the id); else resume
-    Input        []*content.Block    // the user turn
-    ToolPolicy   ForeignToolPolicy   // allowedTools, permission-mode, add-dir
-    Cwd          string              // working directory (also keys the transcript path)
+    SystemPrompt string           // delivered via the agent's native channel
+    ForeignSID   string           // "" => new session (mint + --session-id); else --resume
+    Input        []content.Block  // the user turn (content.Block is a sealed interface; not a pointer)
+    Cwd          string           // working directory (also keys the transcript path)
+    Posture      string           // the single non-interactive --permission-mode value (v1)
+    // NOTE: tool-capability restriction (--tools / --allowedTools) is parked — no
+    // policy field in v1 (observe-only boundary). Add one when a real need arises.
 }
 
 type ForeignStream interface {
@@ -256,13 +281,23 @@ committed events:
 | Source | Role | Drives |
 |---|---|---|
 | Live `stream-json` stdout (`--output-format stream-json --include-partial-messages`) | Real-time, documented contract | `TurnStarted`, `TokenDelta`, observed `ToolCallStarted`/`ToolCallCompleted` |
-| On-disk transcript `~/.claude/projects/<cwd→->/<sid>.jsonl` | Authoritative, durable record | Committed `StepDone`/`TurnDone` (exact content + usage), restore/replay of full scrollback, subagent sidechains |
+| On-disk transcript `~/.claude/projects/<cwd→->/<sid>.jsonl` | Authoritative, durable record | Committed `StepDone`/`TurnDone` (exact content; usage deferred — see mapping), restore/replay of full scrollback, subagent sidechains |
 
-We **mint** the foreign session id with `--session-id <uuid>` (we already have
-`pkg/uuid`). Because we own both the `cwd` and the `sid`, the transcript path is
-deterministic and known *before* the process starts — so the durable handle is
-journaled up front, with no window where a crash loses it and no need to scrape
-the id out of stdout.
+### Foreign session id: minted and journaled at loop creation (resolved)
+
+A foreign loop corresponds to exactly **one** Claude session, so its `sid` is a
+**per-loop** value, not per-turn. We **mint** it with `pkg/uuid` at foreign-loop
+construction and pass it via `--session-id <uuid>` on the first turn (and
+`--resume <uuid>` thereafter). Because we own both the `cwd` and the `sid`, the
+transcript path is deterministic and known before any process starts.
+
+The sid is journaled **once, up front**, via a new typed enduring event
+`ForeignSessionStarted{LoopID, AgentName, ForeignSID, Cwd}`, emitted by the
+foreign actor immediately after its `LoopStarted` — before the first spawn. This
+is the single source of truth for the handle: there is no window where a crash
+loses it, and nothing is scraped from stdout. (The per-turn data flow below does
+**not** re-journal the sid; turn end only commits the turn's *messages*.) Restore
+recovers the sid by folding this event during replay (see Restore).
 
 The transcript records map almost 1:1 onto our model: assistant
 `message.content[]` block types are exactly `text` / `thinking` / `tool_use`
@@ -283,17 +318,21 @@ crashing and never trusting an unrecognized format.
 Session.StartTurn(input)
   -> foreignloop actor receives UserInput
   -> mint sid (first turn) or reuse journaled sid
-  -> ForeignAgent.Spawn:
-       claude -p --resume <sid> \
-         --output-format stream-json --include-partial-messages \
+  -> ForeignAgent.Spawn (first turn uses --session-id <uuid>; later turns --resume <uuid>):
+       claude -p --session-id <uuid> \
+         --output-format stream-json --include-partial-messages --verbose \
          --append-system-prompt <sys> \
-         --permission-mode <mode> --allowedTools <...> --add-dir <cwd> \
+         --permission-mode <non-interactive-posture> --add-dir <cwd> \
          --model <model>
   -> decode stdout JSONL -> ForeignEvent -> event.Event (publish live)
   -> process exits
   -> read transcript tail -> emit committed StepDone/TurnDone (authoritative)
-  -> record foreign_sid in journal
 ```
+
+(The sid is already journaled at loop creation; this path does not re-journal it.
+`--verbose` is passed defensively — `-p`+`stream-json` historically requires it;
+the integration test pins the requirement against the installed CLI version.
+Tool-capability flags are intentionally absent — see Security.)
 
 Event mapping:
 
@@ -304,9 +343,57 @@ Event mapping:
 | assistant `tool_use` block | `ToolCallStarted` (observed) |
 | user `tool_result` / `toolUseResult` | `ToolCallCompleted` (observed) |
 | assistant round complete | `StepDone` (committed from transcript) |
-| `result` `{success, usage}` | `TurnDone` (+ usage) |
-| `result` `{error, error_max_turns, …}` | `TurnFailed` |
+| `result` `{success}` | `TurnDone` (Message only) |
+| `result` `{error, error_max_turns, …}` | `TurnFailed` (typed `Err`) |
 | child killed via Interrupt | `TurnInterrupted` |
+
+**ID minting and correlation (resolved).** looprig events carry `uuid.UUID`
+correlation ids (`TurnID`, `StepID`, `ToolExecutionID`); Claude's ids are opaque
+strings (`toolu_…`). The foreign actor mints its own uuids via the loop's `idGen`
+(the same seam the native loop uses) and keeps a **per-turn map
+`foreignToolUseID(string) → ToolExecutionID(uuid)`** so a `tool_use` and its later
+`tool_result` map to the same `ToolCallStarted`/`ToolCallCompleted` pair. The map
+is turn-scoped and discarded at turn end.
+
+**Usage is deferred (resolved).** `event.TurnDone` has no usage field and
+`content.AIMessage` is `struct{ Message }`, so Claude's per-message `usage` has
+nowhere to land without a taxonomy change. v1 does **not** surface usage through
+events (it remains visible in the transcript); adding a usage-bearing event is a
+separate, later change.
+
+## Restore
+
+Restore today is a second hardcoded native construction site:
+`restore_constructor.go:329` calls `loop.NewRestored(... RestoredState{Msgs,
+TurnIndex})`, seeding the primary loop with its folded committed history. A
+foreign-backed session needs a parallel path, so restore branches on `cfg.Engine`
+exactly as `newLoop` does:
+
+```text
+restore: switch cfg.Engine {
+  native  -> loop.NewRestored(... RestoredState{Msgs, TurnIndex})        (unchanged)
+  foreign -> foreignloop.NewRestored(... RestoredForeign{ForeignSID, TurnIndex})
+}
+```
+
+- **SID recovery.** The fold over replayed events (which already produces
+  `folded.Msgs`/`folded.TurnIndex`) additionally extracts the latest
+  `ForeignSessionStarted.ForeignSID` for the loop. That sid + the recovered
+  `TurnIndex` are all a foreign loop needs to come back: Claude owns the
+  conversation, so we do **not** replay messages into the agent — we resume its
+  session by sid on the next turn. The folded `Msgs` are retained only for
+  `Snapshot`/restore-verify and TUI scrollback, never re-sent to the agent.
+- **Crash with an open foreign turn.** Each turn is a one-shot subprocess, so a
+  crash mid-turn leaves no looprig state to reconcile: the half-finished turn
+  committed no terminal, so restore brings the loop up **idle** at the recovered
+  `TurnIndex`, and the journaled partial events replay for scrollback only. The
+  next `UserInput` resumes the foreign session by sid; Claude's own transcript
+  already reflects whatever completed before the crash. No orphan-process cleanup
+  is required (the child died with its parent; even if it survived headless, it
+  only appends to its own transcript, which we re-read on the next turn).
+- **Restore verification.** `checkFingerprint`/`checkAgentName` are unchanged; the
+  foreign loop's `Snapshot` returns its retained `Msgs`/`TurnIndex` so the same
+  verification path applies.
 
 ## Error handling
 
@@ -320,10 +407,25 @@ unresponsive child is killed when it elapses.
 
 ## Security
 
-- **Least privilege:** constrain the foreign agent via `--permission-mode` /
-  `--allowedTools` / `--add-dir`. Never pass `--dangerously-skip-permissions`.
+The trust boundary is **observe-only**: looprig does not gate the foreign agent's
+tools; it mirrors what the agent did. Two distinct axes follow from that, and only
+one is in v1 scope.
+
+- **Approval posture (in scope, minimal).** A headless `-p` agent has no human to
+  answer a permission prompt, so it must not *hang*. v1 sets exactly one
+  non-interactive `--permission-mode` so the agent proceeds autonomously, and
+  passes `--add-dir <cwd>` to scope filesystem context. It never passes
+  `--dangerously-skip-permissions`.
+- **Capability restriction (parked).** *Which* tools Claude may use — the
+  `--tools` capability set and `--allowedTools`/`--disallowedTools` lists — is
+  **deliberately deferred**. v1 runs the agent with its default capabilities under
+  the observe-only boundary. A future read-only / restricted mode becomes a new
+  attribute on the foreign loop's config when a concrete need arises; this design
+  does not pre-build it (YAGNI). (Note the axes are independent in the CLI:
+  `--tools` = capability set, `--allowedTools` = run-without-prompting list,
+  `--permission-mode` = posture.)
 - **No shell string:** spawn via `exec.CommandContext` with an **argv list**, not
-  `sh -c`. The system prompt, model, and tool lists are separate args.
+  `sh -c`. System prompt, model, and dirs are separate args.
 - **Path safety:** `cwd` and `sid` are validated and `filepath.Clean`'d, and the
   derived transcript path is verified to stay within the expected
   `~/.claude/projects` root before opening (defeats traversal via a crafted sid).
@@ -342,30 +444,49 @@ unresponsive child is killed when it elapses.
 - **Fuzz target** on both JSONL decoders (external, untrusted input).
 - **Actor tests** for `foreignloop` use a fake `ForeignAgent` — no subprocess in
   unit tests; assert the command/event contract (UserInput→events→terminal,
-  Interrupt→TurnInterrupted, Shutdown→Done).
+  Interrupt→TurnInterrupted, Shutdown→Done), the `ForeignSessionStarted` emission
+  on creation, and that an unexpected gate/`SubagentResult` command is dropped
+  without deadlock.
+- **Restore tests** for the foreign branch: fold a journal containing
+  `ForeignSessionStarted` → recover the sid, come up idle at the right
+  `TurnIndex`, and resume by `--resume` on the next turn (fake agent). Include the
+  crash-with-open-turn case (no terminal committed → idle restore).
+- **Session migration tests:** a fake `loop.Backend` substituted at the `newLoop`
+  branch exercises interrupt/shutdown/gate-route/subagent-result paths against the
+  interface (guards the `*loop.Loop`→`loop.Backend` refactor).
 - **Integration tests** (`//go:build integration`) that actually spawn
   `claude -p` against a recorded prompt and assert sid continuity across a
-  follow-up `--resume`.
+  follow-up `--resume`, and pin the `--verbose`/`--permission-mode` requirements.
 - All tests run under `-race`.
 
 ## Resolved seam decisions
 
 - **Interface placement:** `Backend` + `Engine` live in `pkg/loop` (the leaf both
   engines import); not in `pkg/session`.
-- **Selection point:** a `switch cfg.Engine` in `session.newLoop` (the one
-  `loop.New` call site, shared by primary + all subagents). No `BackendFactory`
-  type; no `nativeBackend` wrapper.
+- **Selection point:** a `switch cfg.Engine` in `session.newLoop` AND a matching
+  branch in `restore_constructor.go` (the two construction sites). No
+  `BackendFactory` type; no `nativeBackend` wrapper.
 - **`pkg/loop` change is additive only:** `Backend`/`Engine` declarations, an
   `Engine` field on `Config`, and `CommandSink()`/`DoneChan()` accessor methods on
   `*loop.Loop`.
-- **`loopHandle`:** `loop *loop.Loop` becomes `backend loop.Backend`.
+- **Migration:** every `*loop.Loop` in `pkg/session` (audited site list above)
+  becomes `loop.Backend`; `Backend` is 3 methods (no gate method needed).
+- **`Backend.Snapshot` signature:** the existing tuple
+  `(content.AgenticMessages, event.TurnIndex, error)` — no new type.
+- **Foreign sid:** per-loop, minted at creation, journaled once via a typed
+  `ForeignSessionStarted` event, recovered on restore by folding it.
+- **IDs:** foreign loop mints `uuid` correlation ids via `idGen` and keeps a
+  per-turn `foreignToolUseID→ToolExecutionID` map.
+- **`ForeignTurn.Input`:** `[]content.Block` (sealed interface, not pointer).
+- **Tool capability restriction:** parked (observe-only; v1 sets only a
+  non-interactive permission posture).
+- **Usage:** deferred (no event field exists in v1).
 
 ## Open questions for the implementation plan
 
-- Whether `Snapshot` for a foreign loop reconstructs from the transcript or
-  returns a minimal "sid + last terminal" view.
-- Exact `ForeignToolPolicy` shape and its mapping to Claude flags.
 - Whether `loop.New` changes its return type to `loop.Backend` or keeps
   `*loop.Loop` (assigned to the interface at the `newLoop` call site).
-- Journaling the foreign sid: new typed event/journal field vs. piggybacking on an
-  existing record.
+- The exact non-interactive `--permission-mode` value (`default` vs `acceptEdits`
+  vs `dontAsk`) — pinned by the integration test against the installed CLI.
+- Whether `--verbose` is still required alongside `-p`+`stream-json` in 2.1.191
+  (confirmed in the integration test).
