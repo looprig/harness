@@ -38,8 +38,14 @@ foreign loop is a sibling of `pkg/loop`, not a sibling of an `llm` provider.
   on-disk transcript decoder — both normalizing to a small `ForeignEvent` union,
   and a mapper from `ForeignEvent` to `event.Event`.
 - Durable continuity via the foreign session id, recorded in our journal.
+- The `pkg/session` seam that makes a foreign agent spawnable as **either the
+  primary loop or a subagent**: the `Engine` switch in `newLoop` and
+  `loopHandle.backend`.
 
 **Out (deferred):**
+
+- The swarm-catalog wiring that maps a named agent to `cfg.Engine` (lands in the
+  swarm package; this plan delivers the seam it plugs into).
 
 - Codex and OpenCode adapters (the interface is designed for them; they are
   later work).
@@ -75,36 +81,50 @@ These six decisions were settled during design and frame everything below.
 ## Architecture
 
 ```text
-pkg/session  ── defines ──>  Backend (interface)
-                                  ^            ^
-                                  | (Go structural typing — implementations
-                                  |  do not import the interface; no cycle)
-                    +-------------+            +-------------+
-            pkg/loop  *loop.Loop                  pkg/foreignloop  *foreignloop.Loop
-            (UNCHANGED native engine)             (NEW — spawns claude -p per turn)
-                                                          |
-                                                          v
-                                                  ForeignAgent (interface)
-                                                          |
-                                                  adapters/claude  (now)
-                                                  adapters/codex   (later)
-                                                  adapters/opencode(later)
+            ┌──────────────── import direction (acyclic, verified) ────────────────┐
+            │                                                                       │
+        pkg/session ──► pkg/loop ◄── pkg/foreignloop                                │
+            │  (branch)    │  (defines Backend, Engine)   │                         │
+            │              ▲                               │                        │
+            │              └──────── implements ───────────┘                        │
+            │                                                                        │
+            └─ session.newLoop: switch cfg.Engine { native → loop.New; foreign → foreignloop.New }
+                                 both return loop.Backend; stored in loopHandle.backend
+
+        pkg/foreignloop.Loop ──► ForeignAgent (interface)
+                                     ├─ adapters/claude   (now)
+                                     ├─ adapters/codex    (later)
+                                     └─ adapters/opencode (later)
 ```
 
-`Session` currently holds a concrete `*loop.Loop` and drives it purely through
-its `Commands chan command.Command` and `Done` channel, publishing `event.Event`
-to the hub. We extract the **narrow `Backend` interface** capturing exactly what
-Session needs, and have Session depend on it. The composition root (the CLI
-factory) picks native vs. foreign per session (and per subagent).
+`Session` currently holds a concrete `*loop.Loop` (`loopHandle.loop`) and drives
+it purely through its `Commands chan command.Command` and `Done` channel,
+publishing `event.Event` to the hub. We introduce a narrow **`loop.Backend`
+interface** that both engines satisfy, change `loopHandle.loop *loop.Loop` to
+`loopHandle.backend loop.Backend`, and select the engine at the single
+construction chokepoint.
 
-Per CLAUDE.md Open/Closed ("add a new type or wrap it; never modify a working
-type"), `pkg/loop` is left **byte-for-byte unchanged**. Because Go interfaces are
-methods and `Loop` exposes `Commands`/`Done` as struct *fields*, a ~10-line
-`nativeBackend{ *loop.Loop }` wrapper in `pkg/session` adapts the field-shaped
-handle to the method-shaped interface. The foreign loop, being new, implements
-the `Backend` methods directly.
+**Where the interface lives — `pkg/loop`, not `pkg/session`.** The import graph is
+one-way `session → loop`, and `pkg/loop` is a leaf (imports nothing above it).
+`pkg/foreignloop` must import `pkg/loop` for `loop.Config`, `loop.Provenance`, and
+`loop.Snapshot`. So `loop` is the only package both engines can depend on — it
+owns `Backend`. (If `Backend` lived in `session`, `loop.New` could not return it
+without a `session → loop → session` cycle.)
 
-### The `Backend` interface
+**Where the branch lives — `session.newLoop`, not `loop.New`.** There is exactly
+one `loop.New` call site in the tree (`pkg/session/session.go:531`, inside
+`newLoop`), and `newLoop` is the sole core behind the primary loop
+(`newSession → NewLoop`), model-driven subagents (`NewLoop`), and swarm subagents
+(`RunSubagent`). Branching there makes every loop native-or-foreign in one place.
+The branch cannot live in `loop.New`: that would force `loop → foreignloop` while
+`foreignloop → loop`, a compile-breaking cycle, and would put a composition
+decision inside a low-level engine (violating "wire at the composition root").
+
+**No separate `BackendFactory` type.** The `switch cfg.Engine` in `newLoop` *is*
+the factory (YAGNI). A named factory interface is extracted only if/when the swarm
+needs to inject custom builders (e.g. test doubles).
+
+### The `loop.Backend` interface
 
 `Backend` is the minimal subset of the loop contract Session actually uses —
 command submission, completion signalling, and the committed-state snapshot used
@@ -113,21 +133,29 @@ seams (gate registration, per-step commit/drain handshakes) that a foreign loop
 has no analogue for.
 
 ```go
-// Backend is a turn engine Session can drive. Both the native loop and a
-// foreign-agent-backed loop satisfy it.
+// In pkg/loop. Both *loop.Loop and *foreignloop.Loop satisfy it.
 type Backend interface {
-    // CommandSink is where Session submits UserInput, Interrupt, and Shutdown.
-    CommandSink() chan<- command.Command
-    // Done is closed when the backend actor has fully exited.
-    Done() <-chan struct{}
-    // Snapshot returns committed conversation state for restore verification
-    // and dormant reads.
-    Snapshot(ctx context.Context) (loop.Snapshot, error)
+    CommandSink() chan<- command.Command        // Session submits UserInput/Interrupt/Shutdown
+    DoneChan() <-chan struct{}                   // closed when the actor has fully exited
+    Snapshot(ctx context.Context) (Snapshot, error) // committed state for restore verification
 }
+
+// Engine selects which backend newLoop builds. Zero value = native.
+type Engine uint8
+const (
+    EngineNative Engine = iota
+    EngineForeignClaude
+    // EngineForeignCodex, EngineForeignOpenCode — later
+)
 ```
 
-(Exact method set is finalized in the implementation plan; the principle is
-"narrowest contract Session needs," per Interface Segregation.)
+`Engine` is a new field on `loop.Config` (zero value `EngineNative`, so existing
+construction is unchanged). `*loop.Loop` already has `Snapshot`; it gains two
+**additive** accessor methods — `CommandSink()` returning its existing `Commands`
+field and `DoneChan()` returning `Done` — so it satisfies `Backend` despite those
+being struct fields. No behavior changes; nothing else in `pkg/loop` moves.
+`loop.New` keeps its body and either returns `*loop.Loop` (which `newLoop` assigns
+to a `loop.Backend`) or, for explicitness, returns `loop.Backend`.
 
 ## The foreign loop actor (`pkg/foreignloop`)
 
@@ -176,6 +204,48 @@ type ForeignStream interface {
 tool-result, step-complete, terminal{ok|error}) that both decoders emit and the
 mapper consumes — neither the actor nor the mapper depends on Claude-specific
 shapes.
+
+## Swarm / subagent integration
+
+Because every loop — primary, model-driven subagent, and swarm subagent — funnels
+through the single `newLoop` chokepoint, a foreign-backed agent becomes spawnable
+as a subagent for **free**, with no change to the model-facing contract:
+
+```text
+model: Subagent{agent:"claude-coder", message:"…"}        (UNCHANGED)
+  -> Spawner.Spawn(parent, "claude-coder", msg)            (UNCHANGED — narrow iface)
+  -> swarm resolves the name in its registry catalog        (entry now carries Engine)
+  -> Session.RunSubagent(parent, cfg, blocks)              (UNCHANGED signature)
+  -> newLoop -> switch cfg.Engine { native | foreign }      (the one new branch)
+```
+
+The `Subagent` tool depends only on the narrow `Spawner` interface and a typed
+`identity.AgentName`; it never sees the engine. The swarm's agent definition
+(which already yields a `loop.Config`) just sets `cfg.Engine` and the foreign
+bits (tool policy, cwd, model alias). Everything Session expresses in terms of
+commands + events keeps working with a foreign backend in the `loopHandle`:
+provenance/lineage, depth & quota caps, Interrupt/Shutdown fan-out, event
+publishing, agent-card rendering, and `RunSubagent`'s drain-to-final-text (the
+foreign loop's `TurnDone` result text *is* the returned string).
+
+Two semantic boundaries this creates, stated deliberately:
+
+- **A foreign subagent is a leaf in looprig's loop tree.** It runs its own loop
+  with its own tools and does not carry looprig's `Subagent` tool, so it cannot
+  spawn looprig subagents. If it fans out internally (Claude Code's own
+  Task/sidechains — `isSidechain` in the transcript), that fan-out is
+  observed-only and sits *outside* looprig's depth/quota accounting. Our caps
+  bound our tree; the foreign agent governs its own.
+- **Concurrent foreign subagents need cwd isolation.** Each is its own subprocess
+  with its own minted sid, so concurrency is safe — but two coding agents editing
+  the same `cwd` will clobber each other. A foreign subagent should therefore get
+  a per-subagent working dir (a git worktree, which the swarm already uses), as a
+  policy knob on the agent definition.
+
+The swarm-catalog wiring itself (mapping a catalog entry to `cfg.Engine`) lands in
+the swarm package (currently the `swe-swarm` branch); this design and its plan
+cover the `pkg/loop` + `pkg/session` + `pkg/foreignloop` seam that makes it
+possible.
 
 ## Two-source continuity model
 
@@ -278,12 +348,24 @@ unresponsive child is killed when it elapses.
   follow-up `--resume`.
 - All tests run under `-race`.
 
+## Resolved seam decisions
+
+- **Interface placement:** `Backend` + `Engine` live in `pkg/loop` (the leaf both
+  engines import); not in `pkg/session`.
+- **Selection point:** a `switch cfg.Engine` in `session.newLoop` (the one
+  `loop.New` call site, shared by primary + all subagents). No `BackendFactory`
+  type; no `nativeBackend` wrapper.
+- **`pkg/loop` change is additive only:** `Backend`/`Engine` declarations, an
+  `Engine` field on `Config`, and `CommandSink()`/`DoneChan()` accessor methods on
+  `*loop.Loop`.
+- **`loopHandle`:** `loop *loop.Loop` becomes `backend loop.Backend`.
+
 ## Open questions for the implementation plan
 
-- Final method set on `Backend` (does Session need more than
-  Commands/Done/Snapshot — e.g. an id accessor for journaling?).
 - Whether `Snapshot` for a foreign loop reconstructs from the transcript or
   returns a minimal "sid + last terminal" view.
 - Exact `ForeignToolPolicy` shape and its mapping to Claude flags.
-- Where the composition root chooses native vs. foreign (CLI flag, config, or
-  per-agent registry entry).
+- Whether `loop.New` changes its return type to `loop.Backend` or keeps
+  `*loop.Loop` (assigned to the interface at the `newLoop` call site).
+- Journaling the foreign sid: new typed event/journal field vs. piggybacking on an
+  existing record.
