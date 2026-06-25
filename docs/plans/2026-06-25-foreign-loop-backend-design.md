@@ -281,28 +281,63 @@ type Spec struct {
 }
 ```
 
-`newLoop` cannot read this from `loop.Config` (cycle), so Session is constructed
-with an **injected builder closure** — a `func` field, not a new exported factory
-type:
+`newLoop` cannot read this from `loop.Config` (cycle), so Session is given a
+foreign **builder** via a functional `Option` — the same `type Option
+func(*Session)` mechanism `New`/`Restore` already use (`command_journal.go:44`),
+and both `New(ctx, cfg, opts…)` and `Restore(ctx, cfg, …, opts…)` accept it, so
+live and restored sessions wire the builder identically:
 
 ```go
-// on Session, wired at the composition root; nil for native-only sessions.
-foreignBuild func(loopCtx context.Context, sessionID, loopID uuid.UUID,
+// pkg/foreignloop — the builder signature. EventPublisher is an EXPORTED
+// interface defined HERE (the native loop's eventPublisher is unexported);
+// *session.Session satisfies it via its existing PublishEvent (session.go:315).
+type EventPublisher interface { PublishEvent(context.Context, event.Event) error }
+
+type Builder func(loopCtx context.Context, sessionID, loopID uuid.UUID,
     parent loop.Provenance, pub EventPublisher, cfg loop.Config,
     idGen func() (uuid.UUID, error), fac *event.Factory) (loop.Backend, string, error)
-//                                                                   ^ returns the minted ForeignSID
+//                                                                  ^ returns the minted ForeignSID
 
-// in newLoop's switch:
-//   EngineNative  -> loop.New(...)            (direct, as today)
-//   EngineForeign -> s.foreignBuild(...)      (closure owns Spec resolution by cfg.AgentName)
+// pkg/session — option + nil-by-default field (native-only sessions never set it).
+func WithForeignBuilder(b foreignloop.Builder) Option { return func(s *Session){ s.foreignBuild = b } }
+
+// in newLoop's switch (and the restore_constructor switch):
+//   EngineNative  -> loop.New(...) / loop.NewRestored(...)   (direct, as today)
+//   EngineForeign -> s.foreignBuild(...)                     (resolves Spec by cfg.AgentName)
 ```
 
-If `cfg.Engine` is foreign and `foreignBuild` is nil, `newLoop` fails closed with
-a typed config error. The closure (owned by the swarm / composition root) resolves
-the per-agent `Spec` from `cfg.AgentName`, so the agent catalog — not `pkg/loop` —
+If `cfg.Engine` is foreign and `foreignBuild` is nil, `newLoop`/restore fail closed
+with a typed config error. The builder (owned by the swarm / composition root)
+resolves the per-agent `Spec` from `cfg.AgentName`, so the agent catalog — not `pkg/loop` —
 owns cwd/posture/exec/env/adapter selection. This is still "the switch is the
 factory" for native; the foreign arm is one injected `func`, carrying the config
 `loop.Config` may not.
+
+### `loop.Config` field semantics under `EngineForeign`
+
+`loop.Config` is shared by both engines, but its fields mean different things (or
+nothing) for a foreign loop. Critically, `loop`'s own constructor core
+(`newLoopWithSeed`, shared by `New` *and* `NewRestored`) hard-rejects a nil
+`Client` with `ConfigMissingClient` — but a foreign loop **never goes through
+`loop.New`**, so that check does not apply; instead `foreignloop.New` does its own
+validation. Per field, for `Engine == EngineForeign`:
+
+| `loop.Config` field | Foreign meaning |
+|---|---|
+| `Client` (`llm.LLM`) | **Ignored / not required.** Foreign never calls an `llm.LLM`. `foreignloop.New` must NOT require it (and native's `ConfigMissingClient` is bypassed). |
+| `Model.Model` | **Used** → `--model`. |
+| `Model.System` | **Used** → `--append-system-prompt`. |
+| `Model.{Temperature,TopP,MaxTokens,Stop,ThinkingBudget,ReasoningEffort}` | **Ignored** — the foreign agent owns its own sampling. |
+| `Model.{APIKey,BaseURL}` | **Ignored** — the foreign credential is supplied via `Spec.Env`, never via `cfg`. |
+| `Tools` | **Ignored** — foreign runs its own tools (observe-only). |
+| `RuntimeContext` | **Ignored** — the foreign agent injects its own date/cwd/git context. |
+| `DrainTimeout` | **Reused** as the subprocess kill-after-grace (foreign default if zero). |
+| `AgentName` | **Used** — attribution + `Spec` resolution. |
+| `Engine` | **Used** — the selector. |
+
+`foreignloop.New`'s validation is explicit and typed: require `Model.System`
+(a foreign loop with no system prompt is a config error), require a resolved
+`Spec` (adapter, cwd, posture, exec path), and ignore the native-only fields above.
 
 ## Swarm / subagent integration
 
@@ -486,15 +521,31 @@ restore: switch cfg.Engine {
     process group** (`Setpgid`) and, on `Interrupt`/`Shutdown` or turn-ctx
     deadline, signals the **whole group** (not just the leader), so no descendant
     survives a normal stop.
-  - **Liveness lock + fail-closed restore.** Each foreign loop holds a
-    per-`(sid,cwd)` lockfile recording the live child PID. On restore, if a live
-    process still holds that lock, restore is **fail-closed** for that loop: it
-    refuses the next `UserInput` (returns a typed `ForeignSessionBusyError`) until
-    the prior child is confirmed gone or reaped, rather than racing a second
-    `claude` onto the same session. Never assume the child is dead.
-- **Restore verification.** `checkFingerprint`/`checkAgentName` are unchanged; the
-  foreign loop's `Snapshot` returns its retained `Msgs`/`TurnIndex` so the same
-  verification path applies.
+  - **Liveness lock — a per-spawn guard, not a restore-time gate (resolved).**
+    `Restore` itself **always succeeds** with respect to liveness; it never blocks
+    or probes for a stale child. Instead the actor acquires a per-`(sid,cwd)`
+    lockfile (recording the child PID) **before every spawn**. If a live process
+    already holds it, that `UserInput`'s turn fails with a typed
+    `ForeignSessionBusyError` (→ `TurnFailed`) until the prior child is gone or
+    reaped. This one guard covers both the post-crash case and any concurrent-spawn
+    bug, and removes the earlier ambiguity (Restore vs. next turn): **the session
+    restores; the next turn is what fails if a stale child is alive.** Never assume
+    the child is dead.
+- **Restore verification + config fingerprint (resolved).** `checkFingerprint`/
+  `checkAgentName` are unchanged; the foreign loop's `Snapshot` returns its
+  retained `Msgs`/`TurnIndex` so the same path applies. The foreign-specific
+  behavior inputs are folded into the **existing** fingerprint
+  (`WithConfigFingerprintFields`, `ConfigFingerprintFields`) rather than left
+  invisible:
+  - **Fingerprinted (drift → `ConfigMismatchError` unless `WithAllowConfigMismatch`):**
+    `Spec.Cwd` (maps to the existing `WorkspaceRoot` field — and is load-bearing:
+    Claude scopes sessions by project/cwd, so a changed cwd would make
+    `--resume <sid>` miss the session), the adapter identity, and the
+    `PermissionPosture`. `Cwd` is **re-supplied by the builder** at restore (the
+    composition root owns it) and the fingerprint catches an unintended change.
+  - **Permitted to drift (not fingerprinted, logged):** the resolved `ExecPath`
+    and `claude` version (CLI upgrades are normal; pinning would block every
+    post-upgrade restore) and the `Spec.Env` whitelist contents.
 
 ## Error handling
 
@@ -506,8 +557,9 @@ security/observability event and soft-degrade to a stream-derived `StepDone` (th
 accumulated assistant message) followed by `TurnDone` (so restored history is
 intact — see the Robustness rule). Interrupt signals the child's **process group**
 (SIGINT then kill-after-grace). The turn ctx carries a deadline; an unresponsive
-group is killed when it elapses. A restore that finds the prior child still alive
-on the loop's `(sid,cwd)` lock fails closed with `ForeignSessionBusyError`.
+group is killed when it elapses. Before every spawn the actor acquires the loop's
+`(sid,cwd)` lock; if a live process already holds it, that turn fails with
+`ForeignSessionBusyError` (`Restore` itself does not gate on this — see Restore).
 
 ## Security
 
@@ -568,10 +620,14 @@ one is in v1 scope.
   the soft-degrade path emits `StepDone`→`TurnDone`, and that an unexpected
   gate/`SubagentResult` command is dropped without deadlock. `newLoop` (not the
   actor) is asserted to publish a single `LoopStarted` carrying `ForeignSID`.
-- **`pkg/event` tests** for the new field: `LoopStarted.ForeignSID` round-trips
-  through marshal/unmarshal; an old record without the field decodes to `""`
-  (replay compat); validation requires a foreign loop's `LoopStarted` to carry a
-  non-empty `ForeignSID` and a native one to leave it empty.
+- **`pkg/event` tests** for the new field — **structural only**: `LoopStarted.
+  ForeignSID` round-trips through marshal/unmarshal, and an old record without the
+  field decodes to `""` (replay compat). `pkg/event` does **not** know a loop's
+  engine, so it cannot (and must not) enforce "foreign requires `ForeignSID`."
+- **Session/restore tests** enforce that invariant where `Engine` IS known:
+  `session.newLoop` stamps a non-empty `ForeignSID` for `EngineForeign` and leaves
+  it empty for native; restore treats a foreign `LoopStarted` with empty
+  `ForeignSID` as fail-closed.
 - **Restore tests** for the foreign branch: fold a journal whose `LoopStarted`
   carries `ForeignSID` → recover the sid, pass folded `Msgs` into
   `RestoredForeign`, come up idle at the right `TurnIndex`, `Snapshot` returns the
@@ -641,7 +697,12 @@ one is in v1 scope.
 
 - Whether `loop.New` changes its return type to `loop.Backend` or keeps
   `*loop.Loop` (assigned to the interface at the `newLoop` call site).
+
+## Implementation must pin (decided approach, value pinned in code/tests)
+
 - The exact non-interactive `--permission-mode` value (`default` vs `acceptEdits`
-  vs `dontAsk`) — pinned by the integration test against the installed CLI.
-- Whether `--verbose` is still required alongside `-p`+`stream-json` in 2.1.191
-  (confirmed in the integration test).
+  vs `dontAsk`) — the integration test selects and locks one against the installed
+  CLI; `PermissionPosture` encodes only that chosen value.
+- Whether `--verbose` is required alongside `-p`+`stream-json` in 2.1.191 — the
+  integration test asserts it; the adapter passes `--verbose` defensively until
+  proven unnecessary.
