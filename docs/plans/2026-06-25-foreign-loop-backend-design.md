@@ -61,8 +61,11 @@ These six decisions were settled during design and frame everything below.
 
 1. **Pluggable backend.** The native `pkg/loop` stays as one implementation; the
    foreign loop is a sibling satisfying the same session/turn contract. Session,
-   hub, journal, and TUI are unchanged; the `event.Event` taxonomy gains exactly
-   **one additive** type — `ForeignSessionStarted` — and nothing else changes.
+   hub, journal, and TUI are unchanged. **No new event type** is added: the
+   foreign session id rides as one `omitzero` field, `ForeignSID`, on the existing
+   `LoopStarted` event (mirroring `ParentToolUseID`), so it is written in the same
+   single durable append `newLoop` already makes — no second event, no inter-event
+   crash window.
 2. **Foreign owns tools; we observe.** The foreign agent runs its own tools. We
    set only a non-interactive `--permission-mode` (so a headless agent never hangs)
    and `--add-dir <cwd>`, and *observe* the resulting tool events to mirror them into our
@@ -75,9 +78,10 @@ These six decisions were settled during design and frame everything below.
 5. **Foreign session id is the durable handle.** We journal the foreign session
    id plus the adapted event stream. The foreign agent owns the real
    conversation; follow-up = resume by id; restore = reload the id and resume.
-6. **One-shot subprocess per turn.** Each turn spawns a fresh `claude -p --resume
-   <sid>`, streams to completion, and exits. Maps 1:1 onto our single-flight
-   turn model. Interrupt = signal/kill the child.
+6. **One-shot subprocess per turn.** Each turn spawns a fresh `claude -p` (first
+   turn `--session-id <sid>`, later turns `--resume <sid>`), streams to completion,
+   and exits. Maps 1:1 onto our single-flight turn model. Interrupt = signal/kill
+   the child's process group.
 
 ## Architecture
 
@@ -185,12 +189,16 @@ A `*foreignloop.Loop` is an actor satisfying `loop.Backend` (its `CommandSink()`
 and `DoneChan()` expose the same command/`Done` discipline) so Session cannot tell
 it apart from a native loop.
 
-**Creation / sid journaling — Session publishes, not the actor.** Today
+**Creation / sid journaling — one atomic append on `LoopStarted`.** Today
 `session.newLoop` (not the loop actor) builds and publishes `LoopStarted`
-(`session.go:575`). We keep that ownership: `foreignloop.New` **mints the per-loop
-sid** and returns it as metadata; `newLoop`, after registration, publishes
-`LoopStarted` and then `ForeignSessionStarted{LoopID, AgentName, ForeignSID, Cwd}`
-in that order. The actor never publishes lifecycle events itself.
+(`session.go:575`). We keep that ownership and **carry the sid on that same
+event**: `foreignloop.New` mints the per-loop sid and returns it as metadata;
+`newLoop` stamps it onto `LoopStarted.ForeignSID` and publishes the one event. The
+actor never publishes lifecycle events itself. Because the sid lands in the single
+`LoopStarted` append, there is no two-event window where a crash could leave a
+foreign loop with `LoopStarted` but no sid. (`LoopStarted` for a native loop
+leaves `ForeignSID` empty — `omitzero`, exactly like its existing
+`ParentToolUseID`.)
 
 Per command:
 
@@ -254,6 +262,48 @@ tool-result, step-complete, terminal{ok|error}) that both decoders emit and the
 mapper consumes — neither the actor nor the mapper depends on Claude-specific
 shapes.
 
+### Foreign config & wiring — kept out of `loop.Config` (no cycle)
+
+`loop.Config` must **not** gain any `foreignloop` types (no `ForeignAgent`, no
+`foreignloop.Spec`) — that would force `loop → foreignloop` against the existing
+`foreignloop → loop` edge, a cycle. `loop.Config` gains only the plain `Engine`
+enum (and already has `AgentName`). All foreign-specific wiring lives in a
+`pkg/foreignloop`-owned struct built at the composition root:
+
+```go
+// pkg/foreignloop
+type Spec struct {
+    Agent    ForeignAgent       // adapter selection (claude now; codex/opencode later)
+    ExecPath string             // resolved `claude` binary path (validated)
+    Cwd      string             // workspace dir — ideally a per-loop git worktree
+    Posture  PermissionPosture  // non-interactive permission mode
+    Env      []string           // WHITELISTED child environment (not os.Environ())
+}
+```
+
+`newLoop` cannot read this from `loop.Config` (cycle), so Session is constructed
+with an **injected builder closure** — a `func` field, not a new exported factory
+type:
+
+```go
+// on Session, wired at the composition root; nil for native-only sessions.
+foreignBuild func(loopCtx context.Context, sessionID, loopID uuid.UUID,
+    parent loop.Provenance, pub EventPublisher, cfg loop.Config,
+    idGen func() (uuid.UUID, error), fac *event.Factory) (loop.Backend, string, error)
+//                                                                   ^ returns the minted ForeignSID
+
+// in newLoop's switch:
+//   EngineNative  -> loop.New(...)            (direct, as today)
+//   EngineForeign -> s.foreignBuild(...)      (closure owns Spec resolution by cfg.AgentName)
+```
+
+If `cfg.Engine` is foreign and `foreignBuild` is nil, `newLoop` fails closed with
+a typed config error. The closure (owned by the swarm / composition root) resolves
+the per-agent `Spec` from `cfg.AgentName`, so the agent catalog — not `pkg/loop` —
+owns cwd/posture/exec/env/adapter selection. This is still "the switch is the
+factory" for native; the foreign arm is one injected `func`, carrying the config
+`loop.Config` may not.
+
 ## Swarm / subagent integration
 
 Because every loop — primary, model-driven subagent, and swarm subagent — funnels
@@ -315,13 +365,13 @@ construction and pass it via `--session-id <uuid>` on the first turn (and
 `--resume <uuid>` thereafter). Because we own both the `cwd` and the `sid`, the
 transcript path is deterministic and known before any process starts.
 
-The sid is journaled **once, up front**, via a new typed enduring event
-`ForeignSessionStarted{LoopID, AgentName, ForeignSID, Cwd}`, emitted by the
-foreign actor immediately after its `LoopStarted` — before the first spawn. This
-is the single source of truth for the handle: there is no window where a crash
-loses it, and nothing is scraped from stdout. (The per-turn data flow below does
-**not** re-journal the sid; turn end only commits the turn's *messages*.) Restore
-recovers the sid by folding this event during replay (see Restore).
+The sid is journaled **once, up front**, as the `ForeignSID` field on the
+`LoopStarted` event that `newLoop` already writes at loop creation — no new event,
+one atomic append. It is the single source of truth for the handle: there is no
+window where a crash loses it, and nothing is scraped from stdout. (The per-turn
+data flow below does **not** re-journal the sid; turn end only commits the turn's
+*messages*.) Restore recovers the sid by reading `LoopStarted.ForeignSID` during
+replay (see Restore).
 
 The transcript records map almost 1:1 onto our model: assistant
 `message.content[]` block types are exactly `text` / `thinking` / `tool_use`
@@ -380,13 +430,19 @@ Event mapping:
 | `result` `{error, error_max_turns, …}` | `TurnFailed` (typed `Err`) |
 | child killed via Interrupt | `TurnInterrupted` |
 
-**ID minting and correlation (resolved).** looprig events carry `uuid.UUID`
-correlation ids (`TurnID`, `StepID`, `ToolExecutionID`); Claude's ids are opaque
-strings (`toolu_…`). The foreign actor mints its own uuids via the loop's `idGen`
-(the same seam the native loop uses) and keeps a **per-turn map
-`foreignToolUseID(string) → ToolExecutionID(uuid)`** so a `tool_use` and its later
-`tool_result` map to the same `ToolCallStarted`/`ToolCallCompleted` pair. The map
-is turn-scoped and discarded at turn end.
+**ID minting and stamping — explicit constructor deps (resolved).** looprig events
+carry `uuid.UUID` correlation ids (`TurnID`, `StepID`, `ToolExecutionID`); Claude's
+ids are opaque strings (`toolu_…`). The native loop mints these from
+`loop.Config.idGen` and stamps Enduring events with `cfg.eventFactory` — but both
+are **unexported** (`config.go`), so a sibling `pkg/foreignloop` cannot reach them.
+`foreignloop.New` therefore takes its own **exported** dependencies: a correlation
+id generator `func() (uuid.UUID, error)` and an `*event.Factory` (built via the
+exported `event.NewFactory(IDGen, Clock)`), wired at the composition root
+(defaulted to `uuid.New`/`time.Now`, with test seams for determinism). It stamps
+Enduring events at its own publish chokepoint, **fail-secure** on a mint error —
+mirroring `loop.go:443`. The actor keeps a **per-turn map `foreignToolUseID(string)
+→ ToolExecutionID(uuid)`** so a `tool_use` and its later `tool_result` map to the
+same `ToolCallStarted`/`ToolCallCompleted` pair; the map is turn-scoped.
 
 **Usage is deferred (resolved).** `event.TurnDone` has no usage field and
 `content.AIMessage` is `struct{ Message }`, so Claude's per-message `usage` has
@@ -409,14 +465,16 @@ restore: switch cfg.Engine {
 }
 ```
 
-- **SID recovery.** The fold over replayed events (which already produces
-  `folded.Msgs`/`folded.TurnIndex`) additionally extracts the latest
-  `ForeignSessionStarted.ForeignSID` for the loop. The sid + `TurnIndex` let the
-  loop resume Claude's session by sid on the next turn; Claude owns the
-  conversation, so we do **not** replay messages into the agent. The folded `Msgs`
-  are passed into `RestoredForeign` and **retained** so the foreign loop's
-  `Snapshot` returns the same `(Msgs, TurnIndex)` as a native loop (restore-verify
-  + TUI scrollback) — they are never re-sent to the agent.
+- **SID recovery.** Restore already folds `LoopStarted` (to find the root loop and
+  its `AgentName`); it now also reads `LoopStarted.ForeignSID` for that loop — the
+  sid is present because it was written in the same atomic append. The sid +
+  recovered `TurnIndex` let the loop resume Claude's session by sid on the next
+  turn; Claude owns the conversation, so we do **not** replay messages into the
+  agent. The folded `Msgs` are passed into `RestoredForeign` and **retained** so
+  the foreign loop's `Snapshot` returns the same `(Msgs, TurnIndex)` as a native
+  loop (restore-verify + TUI scrollback) — never re-sent to the agent. (If a
+  foreign `LoopStarted` somehow carries an empty `ForeignSID`, restore fails closed
+  for that loop — it cannot fabricate a session handle.)
 - **Crash with an open foreign turn.** The half-finished turn committed no
   terminal, so restore brings the loop up **idle** at the recovered `TurnIndex`
   and replays the journaled partial events for scrollback only. But a crashed
@@ -453,6 +511,13 @@ on the loop's `(sid,cwd)` lock fails closed with `ForeignSessionBusyError`.
 
 ## Security
 
+**Trust model (stated plainly).** With capability restriction parked and default
+tools enabled, a foreign loop is a **fully-trusted local coding-agent process** —
+it can read and write its workspace and run commands with the user's own
+privileges, exactly like a human running `claude` in that directory. It is **not a
+sandbox**. Only spawn foreign agents you trust at that level; the containment below
+limits *blast radius*, not *capability*.
+
 The trust boundary is **observe-only**: looprig does not gate the foreign agent's
 tools; it mirrors what the agent did. Two distinct axes follow from that, and only
 one is in v1 scope.
@@ -472,10 +537,18 @@ one is in v1 scope.
   `--permission-mode` = posture.)
 - **No shell string:** spawn via `exec.CommandContext` with an **argv list**, not
   `sh -c`. System prompt, model, and dirs are separate args.
+- **Env whitelisting (containment):** the child runs with a **curated**
+  environment (`Spec.Env`), not an inherited `os.Environ()` — an allowlist of what
+  `claude` needs (PATH, HOME, terminal vars, the one required credential), so
+  unrelated secrets in looprig's process env never reach the child.
+- **Workspace containment (containment):** `Cwd` is an explicit, validated
+  workspace dir — **ideally a dedicated git worktree per foreign loop** — to bound
+  filesystem reach and let concurrent foreign loops run without clobbering each
+  other. `--add-dir` is added deliberately and narrowly, never the whole FS.
 - **Path safety:** `cwd` and `sid` are validated and `filepath.Clean`'d, and the
   derived transcript path is verified to stay within the expected
   `~/.claude/projects` root before opening (defeats traversal via a crafted sid).
-- **Secrets:** any foreign API key/credential is passed through the child's
+- **Secrets:** the foreign credential is passed only through the whitelisted child
   environment, never logged and never placed on the command line (argv is visible
   in `ps`).
 - **Validate at boundary:** every JSONL line (live and transcript) is validated;
@@ -494,14 +567,18 @@ one is in v1 scope.
   Shutdown→Done), a **spawn failure still yields `TurnStarted` then `TurnFailed`**,
   the soft-degrade path emits `StepDone`→`TurnDone`, and that an unexpected
   gate/`SubagentResult` command is dropped without deadlock. `newLoop` (not the
-  actor) is asserted to publish `LoopStarted`→`ForeignSessionStarted` in order.
-- **Restore tests** for the foreign branch: fold a journal containing
-  `ForeignSessionStarted` → recover the sid, pass folded `Msgs` into
+  actor) is asserted to publish a single `LoopStarted` carrying `ForeignSID`.
+- **`pkg/event` tests** for the new field: `LoopStarted.ForeignSID` round-trips
+  through marshal/unmarshal; an old record without the field decodes to `""`
+  (replay compat); validation requires a foreign loop's `LoopStarted` to carry a
+  non-empty `ForeignSID` and a native one to leave it empty.
+- **Restore tests** for the foreign branch: fold a journal whose `LoopStarted`
+  carries `ForeignSID` → recover the sid, pass folded `Msgs` into
   `RestoredForeign`, come up idle at the right `TurnIndex`, `Snapshot` returns the
   retained `(Msgs, TurnIndex)`, and resume by `--resume` next turn (fake agent).
-  Include crash-with-open-turn (no terminal → idle restore) and the
-  **fail-closed** case: a live `(sid,cwd)` lock → next `UserInput` returns
-  `ForeignSessionBusyError`.
+  Include crash-with-open-turn (no terminal → idle restore), an **empty-ForeignSID
+  → fail-closed** restore, and the **busy** case: a live `(sid,cwd)` lock → next
+  `UserInput` returns `ForeignSessionBusyError`.
 - **Session migration tests:** a fake `loop.Backend` substituted at the `newLoop`
   branch exercises interrupt/shutdown/gate-route/subagent-result paths against the
   interface (guards the `*loop.Loop`→`loop.Backend` refactor).
@@ -515,19 +592,28 @@ one is in v1 scope.
 - **Interface placement:** `Backend` + `Engine` live in `pkg/loop` (the leaf both
   engines import); not in `pkg/session`.
 - **Selection point:** a `switch cfg.Engine` in `session.newLoop` AND a matching
-  branch in `restore_constructor.go` (the two construction sites). No
-  `BackendFactory` type; no `nativeBackend` wrapper.
+  branch in `restore_constructor.go` (the two construction sites). Native arm calls
+  `loop.New` directly; foreign arm calls the injected `Session.foreignBuild`
+  closure (a `func` field, not an exported `BackendFactory` type); no
+  `nativeBackend` wrapper.
 - **`pkg/loop` change is additive only:** `Backend`/`Engine` declarations, an
-  `Engine` field on `Config`, and `CommandSink()`/`DoneChan()` accessor methods on
-  `*loop.Loop`.
+  `Engine` field on `Config`, `CommandSink()`/`DoneChan()` accessors on
+  `*loop.Loop`, and one `omitzero` `ForeignSID` field on `event.LoopStarted`.
+  `loop.Config` gains **no** `foreignloop` types (no cycle).
+- **Foreign wiring lives at the composition root:** a `foreignloop.Spec`
+  (adapter, exec path, cwd, posture, env whitelist) resolved by an injected
+  `Session.foreignBuild` closure — never on `loop.Config`.
+- **ID/stamping deps:** `foreignloop.New` takes an **exported** id generator +
+  `*event.Factory` (the loop's `idGen`/`eventFactory` are unexported); stamps
+  Enduring events fail-secure like `loop.go:443`.
 - **Migration:** every `*loop.Loop` in `pkg/session` (audited site list above)
   becomes `loop.Backend`; `Backend` is 3 methods (no gate method needed).
 - **`Backend.Snapshot` signature:** the existing tuple
   `(content.AgenticMessages, event.TurnIndex, error)` — no new type.
-- **Foreign sid:** per-loop, minted by `foreignloop.New`, returned as metadata;
-  `session.newLoop` publishes `LoopStarted` then the additive typed
-  `ForeignSessionStarted` event (the actor publishes no lifecycle events).
-  Recovered on restore by folding it.
+- **Foreign sid:** per-loop, minted by `foreignloop.New`, returned to `newLoop`,
+  stamped onto the single `LoopStarted` append as `ForeignSID` (no new event type);
+  recovered on restore by reading `LoopStarted.ForeignSID`; empty on a foreign loop
+  → fail-closed restore.
 - **`TurnStarted` timing:** emitted with the user message on `UserInput`
   acceptance, **before** spawn — so a spawn failure journals the request then
   `TurnFailed`. `system/init` maps to no event (sid confirmation only).
@@ -540,12 +626,15 @@ one is in v1 scope.
 - **Process safety:** child in its own process group (group-signalled on
   stop/deadline) + a per-`(sid,cwd)` liveness lock; restore is **fail-closed**
   (`ForeignSessionBusyError`) if the prior child is still alive.
-- **IDs:** foreign loop mints `uuid` correlation ids via `idGen` and keeps a
-  per-turn `foreignToolUseID→ToolExecutionID` map.
+- **IDs:** foreign loop mints `uuid` correlation ids via its **injected exported**
+  id generator and keeps a per-turn `foreignToolUseID→ToolExecutionID` map.
 - **`ForeignTurn.Input`:** `[]content.Block` (sealed interface, not pointer).
 - **Posture:** typed `PermissionPosture` enum (no raw permission-mode strings).
 - **Tool capability restriction:** parked (observe-only; v1 sets only a
   non-interactive permission posture).
+- **Trust model:** a foreign loop is a fully-trusted local coding-agent process
+  (not a sandbox); blast radius is contained by **env whitelisting** (`Spec.Env`,
+  not `os.Environ()`) and **workspace/worktree `cwd` containment**, stated as such.
 - **Usage:** deferred (no event field exists in v1).
 
 ## Open questions for the implementation plan
