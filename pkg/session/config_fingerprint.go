@@ -20,14 +20,23 @@ import (
 //   - AgentKind: the swarm + primary agent identity (e.g. "swe:orchestrator").
 //   - RuntimeSkills: whether the untrusted, human-gated workspace skill source was on.
 //   - WorkspaceRoot: the canonical absolute workspace-root id (filepath.Clean of abs).
+//   - AdapterID: the foreign-agent adapter identity (e.g. "claude"); empty for native.
+//   - Posture: the foreign agent's non-interactive permission posture (e.g. "default");
+//     empty for native.
 //
-// A zero-valued ConfigFingerprintFields (the default, no option) leaves all three
-// empty, so a non-swarm/legacy caller is unaffected and the fingerprint is purely the
-// loop-derived one (additive evolution).
+// A zero-valued ConfigFingerprintFields (the default, no option) leaves all fields
+// empty, so a non-swarm/native/legacy caller is unaffected and the fingerprint is
+// purely the loop-derived one (additive evolution).
 type ConfigFingerprintFields struct {
 	AgentKind     string
 	RuntimeSkills bool
 	WorkspaceRoot string
+	// AdapterID is the foreign-agent adapter identity the composition root injects
+	// (e.g. "claude"). Empty for a native session.
+	AdapterID string
+	// Posture is the foreign agent's non-interactive permission posture string the
+	// composition root injects (e.g. "default", "acceptEdits"). Empty for a native session.
+	Posture string
 }
 
 // FingerprintFrom derives the stable config fingerprint a session stamps onto its
@@ -67,6 +76,8 @@ func fingerprintWith(cfg loop.Config, fields ConfigFingerprintFields) event.Conf
 	fpr.AgentKind = fields.AgentKind
 	fpr.RuntimeSkills = fields.RuntimeSkills
 	fpr.WorkspaceRoot = fields.WorkspaceRoot
+	fpr.AgentAdapter = fields.AdapterID
+	fpr.PermissionPosture = fields.Posture
 	return fpr
 }
 

@@ -11,16 +11,18 @@ import (
 // identical-baseline in the Equal table.
 func fullFingerprint() event.ConfigFingerprint {
 	return event.ConfigFingerprint{
-		AgentKind:       "primary",
-		ModelID:         "claude-test",
-		SystemPromptRev: "abc123",
-		ToolPolicyRev:   "def456",
-		RuntimeSkills:   true,
-		WorkspaceRoot:   "/home/user/repo",
+		AgentKind:         "primary",
+		ModelID:           "claude-test",
+		SystemPromptRev:   "abc123",
+		ToolPolicyRev:     "def456",
+		RuntimeSkills:     true,
+		WorkspaceRoot:     "/home/user/repo",
+		AgentAdapter:      "claude",
+		PermissionPosture: "default",
 	}
 }
 
-// TestConfigFingerprintEqual asserts Equal is true iff all four fields match: the
+// TestConfigFingerprintEqual asserts Equal is true iff every field matches: the
 // identical-baseline is equal, and each single-field difference (one per field) is
 // not. Zero-vs-zero is the boundary case (two empty fingerprints are equal).
 func TestConfigFingerprintEqual(t *testing.T) {
@@ -40,6 +42,10 @@ func TestConfigFingerprintEqual(t *testing.T) {
 	diffRuntimeSkills.RuntimeSkills = false
 	diffWorkspaceRoot := base
 	diffWorkspaceRoot.WorkspaceRoot = "/other/repo"
+	diffAdapter := base
+	diffAdapter.AgentAdapter = "codex"
+	diffPosture := base
+	diffPosture.PermissionPosture = "acceptEdits"
 
 	tests := []struct {
 		name string
@@ -54,6 +60,8 @@ func TestConfigFingerprintEqual(t *testing.T) {
 		{"ToolPolicyRev differs", base, diffTools, false},
 		{"RuntimeSkills differs", base, diffRuntimeSkills, false},
 		{"WorkspaceRoot differs", base, diffWorkspaceRoot, false},
+		{"AgentAdapter differs", base, diffAdapter, false},
+		{"PermissionPosture differs", base, diffPosture, false},
 		{"zero vs full differs", event.ConfigFingerprint{}, base, false},
 	}
 	for _, tt := range tests {
@@ -86,6 +94,8 @@ func TestConfigFingerprintJSONRoundTrip(t *testing.T) {
 		{"only model set", event.ConfigFingerprint{ModelID: "m"}},
 		{"runtime skills only", event.ConfigFingerprint{RuntimeSkills: true}},
 		{"workspace root only", event.ConfigFingerprint{WorkspaceRoot: "/r"}},
+		{"agent adapter only", event.ConfigFingerprint{AgentAdapter: "claude"}},
+		{"permission posture only", event.ConfigFingerprint{PermissionPosture: "default"}},
 	}
 	for _, tt := range tests {
 		tt := tt

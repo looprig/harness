@@ -323,7 +323,7 @@ func TestMarshalEventRoundTripEnduring(t *testing.T) {
 	}{
 		{"SessionStarted", SessionStarted{
 			Header: fullHeaderSession(),
-			Config: ConfigFingerprint{AgentKind: "primary", ModelID: "m-1", SystemPromptRev: "abc", ToolPolicyRev: "def"},
+			Config: ConfigFingerprint{AgentKind: "primary", ModelID: "m-1", SystemPromptRev: "abc", ToolPolicyRev: "def", AgentAdapter: "claude", PermissionPosture: "default"},
 		}},
 		{"SessionActive", SessionActive{Header: fullHeaderSession()}},
 		{"SessionIdle", SessionIdle{Header: fullHeaderSession()}},

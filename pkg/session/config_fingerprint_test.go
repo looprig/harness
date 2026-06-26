@@ -167,6 +167,91 @@ func TestFingerprintWithMergesSwarmFields(t *testing.T) {
 	}
 }
 
+// TestFingerprintWithForeignFields asserts a foreign loop's fingerprint dimensions —
+// cwd (folded into WorkspaceRoot), adapter identity (AdapterID), and permission posture
+// (Posture) — are all inputs to fingerprintWith: same fields yield an Equal fingerprint,
+// and a change in ANY one alone (same loop.Config) yields an unequal one. This is what
+// makes a restore reject a foreign session resuming under a different working directory,
+// adapter, or permission posture.
+//
+// The foreign exec path and child env are DELIBERATELY absent from the fingerprint
+// (permitted to drift, log-only): fingerprintWith takes only (cfg, fields) and neither
+// the exec path nor the child env is a field, so two calls that differ only in those
+// (i.e. differ in nothing the fingerprint sees) compare Equal — asserted below.
+func TestFingerprintWithForeignFields(t *testing.T) {
+	t.Parallel()
+
+	cfg := fpConfig("model-x", "prompt", "Read")
+	base := ConfigFingerprintFields{
+		WorkspaceRoot: "/work/foreign",
+		AdapterID:     "claude",
+		Posture:       "default",
+	}
+	baseFP := fingerprintWith(cfg, base)
+
+	// The merged fingerprint carries the injected foreign fields verbatim.
+	if baseFP.WorkspaceRoot != base.WorkspaceRoot {
+		t.Errorf("WorkspaceRoot = %q, want %q", baseFP.WorkspaceRoot, base.WorkspaceRoot)
+	}
+	if baseFP.AgentAdapter != base.AdapterID {
+		t.Errorf("AgentAdapter = %q, want %q", baseFP.AgentAdapter, base.AdapterID)
+	}
+	if baseFP.PermissionPosture != base.Posture {
+		t.Errorf("PermissionPosture = %q, want %q", baseFP.PermissionPosture, base.Posture)
+	}
+
+	diffCwd := base
+	diffCwd.WorkspaceRoot = "/work/other"
+	diffAdapter := base
+	diffAdapter.AdapterID = "codex"
+	diffPosture := base
+	diffPosture.Posture = "acceptEdits"
+
+	tests := []struct {
+		name      string
+		fields    ConfigFingerprintFields
+		wantEqual bool
+	}{
+		{"identical fields stay equal", base, true},
+		{"cwd (WorkspaceRoot) differs", diffCwd, false},
+		{"AdapterID differs", diffAdapter, false},
+		{"Posture differs", diffPosture, false},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got := fingerprintWith(cfg, tt.fields)
+			if baseFP.Equal(got) != tt.wantEqual {
+				t.Errorf("Equal = %v, want %v for %s: base=%+v got=%+v",
+					baseFP.Equal(got), tt.wantEqual, tt.name, baseFP, got)
+			}
+		})
+	}
+}
+
+// TestFingerprintWithExecAndEnvNotInputs pins that the foreign loop's exec path and
+// child env are NOT fingerprinted (they are permitted to drift across a restore and are
+// log-only). fingerprintWith's only inputs are the loop.Config and ConfigFingerprintFields;
+// there is no exec-path or env field, so two fingerprints over the same cfg + same fields
+// are Equal regardless of any exec-path/env change that happened out of band.
+func TestFingerprintWithExecAndEnvNotInputs(t *testing.T) {
+	t.Parallel()
+
+	cfg := fpConfig("model-x", "prompt", "Read")
+	fields := ConfigFingerprintFields{
+		WorkspaceRoot: "/work/foreign",
+		AdapterID:     "claude",
+		Posture:       "default",
+	}
+	// Two calls identical in every fingerprint input. Were exec path or child env an
+	// input, this would be where they would diverge; they are intentionally absent, so
+	// the fingerprints must be Equal.
+	if !fingerprintWith(cfg, fields).Equal(fingerprintWith(cfg, fields)) {
+		t.Error("fingerprintWith is non-deterministic for identical inputs; exec path / env must not be fingerprinted")
+	}
+}
+
 // TestFingerprintWithEmptyFieldsMatchesBare asserts the additive-compatibility path: a
 // fingerprint computed with the zero ConfigFingerprintFields (a non-swarm caller) is
 // Equal to the bare FingerprintFrom over the same config — so an old session persisted

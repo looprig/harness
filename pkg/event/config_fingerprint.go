@@ -3,15 +3,16 @@ package event
 // ConfigFingerprint is the stable identity of the agent configuration a session
 // started under, stamped onto SessionStarted so a durable journal can detect when a
 // restore is being attempted against a materially changed config (a different
-// model, system prompt, tool policy, skill-trust mode, or workspace). It is a
-// fingerprint, not the config itself: each field is either a verbatim identifier
-// (AgentKind, ModelID, WorkspaceRoot), a content digest (SystemPromptRev,
-// ToolPolicyRev), or a mode flag (RuntimeSkills) — never the raw prompt text or tool
-// definitions — so it is safe to persist and compare without leaking config
-// internals. The derivation from a loop.Config lives in the session package
-// (FingerprintFrom), which is the layer that owns the config; the swarm-level fields
-// not on loop.Config (AgentKind, RuntimeSkills, WorkspaceRoot) are injected at the
-// composition root. This package only defines the value and its equality.
+// model, system prompt, tool policy, skill-trust mode, workspace, foreign adapter, or
+// permission posture). It is a fingerprint, not the config itself: each field is either
+// a verbatim identifier (AgentKind, ModelID, WorkspaceRoot, AgentAdapter,
+// PermissionPosture), a content digest (SystemPromptRev, ToolPolicyRev), or a mode flag
+// (RuntimeSkills) — never the raw prompt text or tool definitions — so it is safe to
+// persist and compare without leaking config internals. The derivation from a
+// loop.Config lives in the session package (FingerprintFrom), which is the layer that
+// owns the config; the fields not on loop.Config (AgentKind, RuntimeSkills,
+// WorkspaceRoot, AgentAdapter, PermissionPosture) are injected at the composition root.
+// This package only defines the value and its equality.
 //
 // The fields evolve ADDITIVELY: every field is omitzero, so an old journal record
 // that predates a field decodes it as the zero value and compares Equal to a record
@@ -41,6 +42,14 @@ type ConfigFingerprint struct {
 	// it ran against, so a session cannot silently resume under a different repo's
 	// workspace. Empty for a caller that does not inject a root.
 	WorkspaceRoot string `json:"workspace_root,omitzero"`
+	// AgentAdapter identifies the foreign-agent adapter that backed this session
+	// (e.g. "claude"). Empty for a native session. A session must not silently resume
+	// under a different foreign adapter, so it is part of the fingerprint.
+	AgentAdapter string `json:"agent_adapter,omitzero"`
+	// PermissionPosture is the non-interactive permission mode the foreign agent ran
+	// under (e.g. "default", "acceptEdits"). Empty for a native session. A change in
+	// posture is a behavior change that must not resume unnoticed.
+	PermissionPosture string `json:"permission_posture,omitzero"`
 }
 
 // Equal reports whether two fingerprints identify the same configuration: true iff
@@ -53,5 +62,7 @@ func (f ConfigFingerprint) Equal(other ConfigFingerprint) bool {
 		f.SystemPromptRev == other.SystemPromptRev &&
 		f.ToolPolicyRev == other.ToolPolicyRev &&
 		f.RuntimeSkills == other.RuntimeSkills &&
-		f.WorkspaceRoot == other.WorkspaceRoot
+		f.WorkspaceRoot == other.WorkspaceRoot &&
+		f.AgentAdapter == other.AgentAdapter &&
+		f.PermissionPosture == other.PermissionPosture
 }
