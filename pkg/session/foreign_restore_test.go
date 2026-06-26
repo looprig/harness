@@ -1,0 +1,188 @@
+package session
+
+import (
+	"context"
+	"errors"
+	"reflect"
+	"testing"
+	"time"
+
+	"github.com/ciram-co/looprig/pkg/content"
+	"github.com/ciram-co/looprig/pkg/event"
+	"github.com/ciram-co/looprig/pkg/journal"
+	"github.com/ciram-co/looprig/pkg/loop"
+	"github.com/ciram-co/looprig/pkg/uuid"
+)
+
+// fakeSessionJournal is a no-op journal.SessionJournal whose Append always succeeds. It
+// lets a non-integration test build the restored session's journal-backed hub without an
+// embedded JetStream server: the restore branch under test is the Engine switch + sid
+// recovery, NOT the durable tap (the round-trip integration tests cover the real tap).
+type fakeSessionJournal struct{}
+
+func (fakeSessionJournal) Append(context.Context, journal.JournalRecord) (uint64, error) {
+	return 1, nil
+}
+
+// TestForeignRestore covers buildRestoredSession's Engine switch: a foreign cfg.Engine
+// reconstructs the primary loop through the wired RestoredBuilder, recovering the root
+// LoopStarted's ForeignSID into the seed; an empty recovered sid (or a missing restored
+// builder) fails closed; a native cfg restores through loop.NewRestored unchanged.
+func TestForeignRestore(t *testing.T) {
+	t.Parallel()
+
+	// A small clean primary history the fold reconstructs: user + one step + TurnDone →
+	// Msgs = [user "hello", ai "hi"], TurnIndex = 1, no open turn.
+	foldedEvents := []event.Event{
+		event.TurnStarted{Message: foldUserMsg("hello")},
+		foldStepGroup(aiMessage("hi")),
+		event.TurnDone{Message: aiMessage("hi")},
+	}
+
+	const recoveredSID = "recovered-foreign-sid-abc"
+
+	tests := []struct {
+		name        string
+		engine      loop.Engine
+		foreignSID  string
+		wireBuilder bool
+		wantErr     bool
+		wantKind    RestoreErrorKind
+	}{
+		{
+			name:        "foreign restore recovers the sid into the restored builder",
+			engine:      loop.EngineForeignClaude,
+			foreignSID:  recoveredSID,
+			wireBuilder: true,
+		},
+		{
+			name:        "foreign restore with empty ForeignSID fails closed",
+			engine:      loop.EngineForeignClaude,
+			foreignSID:  "",
+			wireBuilder: true,
+			wantErr:     true,
+			wantKind:    RestoreForeignSIDMissing,
+		},
+		{
+			name:        "foreign restore without a restored builder fails closed",
+			engine:      loop.EngineForeignClaude,
+			foreignSID:  recoveredSID,
+			wireBuilder: false,
+			wantErr:     true,
+			wantKind:    RestoreForeignBuilderMissing,
+		},
+		{
+			name:        "native restore is unaffected",
+			engine:      loop.EngineNative,
+			foreignSID:  "", // irrelevant for native — the branch never reads it
+			wireBuilder: false,
+		},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			folded := foldPrimaryLoop(foldedEvents)
+
+			builder := &fakeForeignBuilder{}
+			// Only the happy foreign path actually invokes the restored builder, so only it
+			// needs a (goroutine-backed) fake backend; the fail-closed rows return before the
+			// builder is ever called.
+			if tt.wireBuilder && !tt.wantErr {
+				fb := newFakeBackend()
+				fb.msgs = folded.Msgs
+				fb.turnIndex = folded.TurnIndex
+				builder.backend = fb
+			}
+
+			c := cfg(&stubLLM{chunks: []content.Chunk{textChunk("x")}})
+			c.Engine = tt.engine
+			c.Model.System = "be helpful"
+
+			sessionID := mustUUID()
+			primaryLoopID := mustUUID()
+			fac := event.NewFactory(uuid.New, time.Now)
+
+			var opts []Option
+			if tt.wireBuilder {
+				opts = append(opts, WithForeignBuilder(builder.build, builder.buildRestored))
+			}
+
+			s, err := buildRestoredSession(context.Background(), c, sessionID, primaryLoopID,
+				tt.foreignSID, 0, folded, fakeSessionJournal{}, fac, uuid.New, time.Now, opts...)
+
+			if tt.wantErr {
+				if s != nil {
+					t.Fatalf("buildRestoredSession returned a non-nil Session on a fail-closed restore")
+				}
+				var re *RestoreError
+				if !errors.As(err, &re) || re.Kind != tt.wantKind {
+					t.Fatalf("err = %v, want *RestoreError{%v}", err, tt.wantKind)
+				}
+				return
+			}
+
+			if err != nil {
+				t.Fatalf("buildRestoredSession: %v", err)
+			}
+			t.Cleanup(func() { _ = s.Shutdown(context.Background()) })
+
+			// Identity is stable: the recovered session keeps its sessionID + primary loop id.
+			if s.SessionID != sessionID {
+				t.Errorf("restored SessionID = %v, want %v", s.SessionID, sessionID)
+			}
+			if s.PrimaryLoopID() != primaryLoopID {
+				t.Errorf("restored primaryLoopID = %v, want %v", s.PrimaryLoopID(), primaryLoopID)
+			}
+
+			// The primary loop comes up registered (idle) and its Snapshot returns the folded
+			// committed thread at the recovered turn index.
+			l, ok := s.loopFor(primaryLoopID)
+			if !ok {
+				t.Fatal("restored session has no primary loop registered")
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			msgs, idx, err := l.Snapshot(ctx)
+			if err != nil {
+				t.Fatalf("restored Snapshot: %v", err)
+			}
+			if !reflect.DeepEqual(msgs, folded.Msgs) {
+				t.Errorf("restored msgs =\n  %#v\nwant\n  %#v", msgs, folded.Msgs)
+			}
+			if idx != folded.TurnIndex {
+				t.Errorf("restored turnIndex = %d, want %d", idx, folded.TurnIndex)
+			}
+
+			if tt.engine == loop.EngineForeignClaude {
+				// The RESTORED builder was invoked once with the recovered seed: the journal's
+				// ForeignSID plus the folded committed state — the heart of F3.
+				builder.mu.Lock()
+				calls := builder.restoreCall
+				seed := builder.restoreSeed
+				calledSID := builder.calledSID
+				calledLID := builder.calledLID
+				builder.mu.Unlock()
+				if calls != 1 {
+					t.Errorf("restored Builder invoked %d times, want exactly 1", calls)
+				}
+				if seed.ForeignSID != tt.foreignSID {
+					t.Errorf("restored seed.ForeignSID = %q, want %q", seed.ForeignSID, tt.foreignSID)
+				}
+				if seed.TurnIndex != folded.TurnIndex {
+					t.Errorf("restored seed.TurnIndex = %d, want %d", seed.TurnIndex, folded.TurnIndex)
+				}
+				if !reflect.DeepEqual(seed.Msgs, folded.Msgs) {
+					t.Errorf("restored seed.Msgs =\n  %#v\nwant\n  %#v", seed.Msgs, folded.Msgs)
+				}
+				if calledSID != sessionID {
+					t.Errorf("restored Builder sessionID = %v, want %v", calledSID, sessionID)
+				}
+				if calledLID != primaryLoopID {
+					t.Errorf("restored Builder loopID = %v, want %v", calledLID, primaryLoopID)
+				}
+			}
+		})
+	}
+}

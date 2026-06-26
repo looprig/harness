@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/ciram-co/looprig/pkg/event"
+	"github.com/ciram-co/looprig/pkg/foreignloop"
 	"github.com/ciram-co/looprig/pkg/hub"
 	"github.com/ciram-co/looprig/pkg/identity"
 	"github.com/ciram-co/looprig/pkg/journal"
@@ -43,6 +44,14 @@ const (
 	RestoreContextDone RestoreErrorKind = "context_done"
 	// RestoreIDGenerationFailed: a crypto/rand failure minting a restore-event id.
 	RestoreIDGenerationFailed RestoreErrorKind = "id_generation_failed"
+	// RestoreForeignSIDMissing: the root LoopStarted of a foreign-engine session carried
+	// an empty ForeignSID, so the foreign session cannot be --resumed. Restore fails
+	// closed rather than orphaning the recorded foreign session under a fresh sid.
+	RestoreForeignSIDMissing RestoreErrorKind = "foreign_sid_missing"
+	// RestoreForeignBuilderMissing: a foreign-engine session was restored but no foreign
+	// RestoredBuilder was wired (WithForeignBuilder). Restore fails closed rather than
+	// silently rebuilding the primary as a native loop.
+	RestoreForeignBuilderMissing RestoreErrorKind = "foreign_builder_missing"
 )
 
 // RestoreError is the typed wrapper for a restore failure. Kind classifies the stage;
@@ -261,7 +270,12 @@ func restoreSession(
 	// opts so the restore owns the lease lifecycle (a caller cannot accidentally override
 	// the releaser with a stale one).
 	leaseOpts := append(append([]Option(nil), opts...), WithLeaseRelease(lease.Release))
-	s, err := buildRestoredSession(ctx, cfg, sessionID, primaryLoopID, spawnedCount, folded, j, factory, newID, now, leaseOpts...)
+	// rootLoop.ForeignSID is the recovered foreign session id (empty for a native session).
+	// It is read off the SAME root LoopStarted findRootLoopStarted already returned (which
+	// also yields primaryLoopID + AgentName), so the "what is the root loop" facts stay in
+	// one place. The restore branch in buildRestoredSession fails closed on an empty sid for
+	// a foreign engine.
+	s, err := buildRestoredSession(ctx, cfg, sessionID, primaryLoopID, rootLoop.ForeignSID, spawnedCount, folded, j, factory, newID, now, leaseOpts...)
 	if err != nil {
 		return recordErrored(err)
 	}
@@ -278,6 +292,7 @@ func buildRestoredSession(
 	ctx context.Context,
 	cfg loop.Config,
 	sessionID, primaryLoopID uuid.UUID,
+	foreignSID string,
 	spawnedCount int,
 	folded foldResult,
 	j journal.SessionJournal,
@@ -324,10 +339,34 @@ func buildRestoredSession(
 
 	// Seed the primary loop under its ORIGINAL id (identity stable), coming up idle with
 	// the folded committed history + turnIndex. No empty loop is spawned and no
-	// LoopStarted is published — the loop already exists in the durable record.
+	// LoopStarted is published — the loop already exists in the durable record. The Engine
+	// switch mirrors newLoop's: a native cfg.Engine seeds through loop.NewRestored exactly
+	// as before; a foreign cfg.Engine reconstructs through the injected RestoredBuilder,
+	// recovering the foreign session id from the root LoopStarted. It fails CLOSED on an
+	// empty recovered sid (the foreign session could not be --resumed) or a missing builder
+	// (never silently rebuild the primary as a native loop). Every error path cancels the
+	// loopCtx and the session backstop, exactly like the native path.
 	loopCtx, cancel := context.WithCancel(sessionCtx)
-	l, err := loop.NewRestored(loopCtx, sessionID, primaryLoopID, s, cfg,
-		loop.RestoredState{Msgs: folded.Msgs, TurnIndex: folded.TurnIndex})
+	var l loop.Backend
+	switch cfg.Engine {
+	case loop.EngineNative:
+		l, err = loop.NewRestored(loopCtx, sessionID, primaryLoopID, s, cfg,
+			loop.RestoredState{Msgs: folded.Msgs, TurnIndex: folded.TurnIndex})
+	default:
+		if foreignSID == "" {
+			cancel()
+			sessionCancel()
+			return nil, &RestoreError{Kind: RestoreForeignSIDMissing}
+		}
+		if s.foreignBuildRestored == nil {
+			cancel()
+			sessionCancel()
+			return nil, &RestoreError{Kind: RestoreForeignBuilderMissing}
+		}
+		l, err = s.foreignBuildRestored(loopCtx, sessionID, primaryLoopID, loop.Provenance{}, s, cfg,
+			func() (uuid.UUID, error) { return newID() }, factory,
+			foreignloop.RestoredForeign{ForeignSID: foreignSID, TurnIndex: folded.TurnIndex, Msgs: folded.Msgs})
+	}
 	if err != nil {
 		cancel()
 		sessionCancel()
