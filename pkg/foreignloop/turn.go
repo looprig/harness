@@ -149,6 +149,17 @@ func (l *Loop) applyOutcome(cur event.TurnIndex, out turnOutcome, pub func(event
 func (l *Loop) driveTurn(turnCtx context.Context, cancel context.CancelFunc, ft ForeignTurn,
 	cur event.TurnIndex, pub func(event.Event), result chan turnOutcome) {
 	defer cancel()
+	lk, err := acquireForeignLock(l.sid, l.spec.Cwd)
+	if err != nil {
+		// A live process already drives this (sid,cwd) Claude session (or the lock I/O
+		// failed): refuse to spawn a second driver that would corrupt the transcript.
+		// TurnStarted was already published, so the turn is closed with TurnFailed; no
+		// session was created, so hasSpawned stays false and nothing is committed.
+		pub(event.TurnFailed{TurnIndex: cur, Err: err})
+		result <- turnOutcome{}
+		return
+	}
+	defer lk.release()
 	stream, err := l.spec.Agent.Spawn(turnCtx, ft)
 	if err != nil {
 		// Spawn never came up: TurnStarted was already published, so the turn is closed

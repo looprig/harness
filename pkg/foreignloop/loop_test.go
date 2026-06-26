@@ -22,6 +22,13 @@ func validCfg() loop.Config {
 // correlation idGen and a working EventID factory, registering ctx cleanup.
 func newTestLoop(t *testing.T, spec Spec, pub EventPublisher) (*Loop, string) {
 	t.Helper()
+	// The deterministic seqIDGen mints the SAME first uuid in every test, so every loop
+	// shares a sid. The per-(sid,cwd) spawn lock would then collide across tests sharing
+	// a cwd; give each loop its own tempdir cwd (the fake agent ignores cwd) unless the
+	// caller pinned one to drive a specific lock path.
+	if spec.Cwd == "" {
+		spec.Cwd = t.TempDir()
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	l, sid, err := New(ctx, mustID(t), mustID(t), loop.Provenance{}, pub, validCfg(), spec, seqIDGen(), workingFac())
