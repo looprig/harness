@@ -174,9 +174,19 @@ func decodeAssistant(sl streamLine) ([]ForeignEvent, error) {
 	if err != nil {
 		return nil, err
 	}
-	var out []ForeignEvent
+	out := toolUseEvents(msg.Content)
+	ai := &content.AIMessage{Message: content.Message{
+		Role:   content.RoleAssistant,
+		Blocks: assistantBlocks(msg.Content),
+	}}
+	return append(out, ForeignEvent{Kind: ForeignStepComplete, Message: ai}), nil
+}
+
+// assistantBlocks builds the in-memory content blocks of an assistant message
+// (text / thinking / tool_use). Shared by the stream and transcript decoders.
+func assistantBlocks(sbs []streamBlock) []content.Block {
 	var blocks []content.Block
-	for _, b := range msg.Content {
+	for _, b := range sbs {
 		switch b.Type {
 		case blockText:
 			blocks = append(blocks, &content.TextBlock{Text: b.Text})
@@ -184,11 +194,20 @@ func decodeAssistant(sl streamLine) ([]ForeignEvent, error) {
 			blocks = append(blocks, &content.ThinkingBlock{Thinking: b.Thinking, Signature: b.Signature})
 		case blockToolUse:
 			blocks = append(blocks, &content.ToolUseBlock{ID: b.ID, Name: b.Name, Input: b.Input})
+		}
+	}
+	return blocks
+}
+
+// toolUseEvents emits one ForeignToolUse per tool_use block, in order.
+func toolUseEvents(sbs []streamBlock) []ForeignEvent {
+	var out []ForeignEvent
+	for _, b := range sbs {
+		if b.Type == blockToolUse {
 			out = append(out, ForeignEvent{Kind: ForeignToolUse, ToolUseID: b.ID, ToolName: b.Name})
 		}
 	}
-	ai := &content.AIMessage{Message: content.Message{Role: content.RoleAssistant, Blocks: blocks}}
-	return append(out, ForeignEvent{Kind: ForeignStepComplete, Message: ai}), nil
+	return out
 }
 
 func decodeUser(sl streamLine) ([]ForeignEvent, error) {
@@ -253,16 +272,21 @@ func resultMessage(text string) *content.AIMessage {
 	}}
 }
 
-// renderToolResultPreview renders a tool_result `content` (a JSON string or an
-// array of text parts) to a capped plain string. ASSUMPTION: claude tool_result
-// content is either a bare string or an array of {type,text} parts.
+// renderToolResultPreview is the capped rendering used in live stream events.
 func renderToolResultPreview(raw json.RawMessage) string {
+	return capPreview(renderToolResultText(raw))
+}
+
+// renderToolResultText renders a tool_result `content` (a JSON string or an array
+// of text parts) to a plain string, uncapped. ASSUMPTION: claude tool_result
+// content is either a bare string or an array of {type,text} parts.
+func renderToolResultText(raw json.RawMessage) string {
 	if len(raw) == 0 {
 		return ""
 	}
 	var s string
 	if err := json.Unmarshal(raw, &s); err == nil {
-		return capPreview(s)
+		return s
 	}
 	var parts []struct {
 		Text string `json:"text"`
@@ -272,9 +296,9 @@ func renderToolResultPreview(raw json.RawMessage) string {
 		for _, p := range parts {
 			b.WriteString(p.Text)
 		}
-		return capPreview(b.String())
+		return b.String()
 	}
-	return capPreview(string(raw))
+	return string(raw)
 }
 
 func capPreview(s string) string {
