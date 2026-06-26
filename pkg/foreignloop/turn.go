@@ -2,6 +2,7 @@ package foreignloop
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 
@@ -133,8 +134,10 @@ func (l *Loop) driveTurn(turnCtx context.Context, cancel context.CancelFunc, ft 
 	defer cancel()
 	stream, err := l.spec.Agent.Spawn(turnCtx, ft)
 	if err != nil {
-		// D3 implements the TurnFailed publish on a spawn error. D2 hands back a
-		// no-commit, never-spawned outcome.
+		// Spawn never came up: TurnStarted was already published, so the turn is closed
+		// with TurnFailed. The agent never spawned, so hasSpawned stays false (the next
+		// turn retries StartNew). Nothing is committed.
+		pub(event.TurnFailed{TurnIndex: cur, Err: &SpawnError{Cause: err}})
 		result <- turnOutcome{}
 		return
 	}
@@ -202,18 +205,36 @@ func (l *Loop) publishMapped(m *mapper, fe ForeignEvent, pub func(event.Event)) 
 }
 
 // commitTurn reads the authoritative on-disk transcript and publishes one StepDone
-// per assistant round, accumulating the committed history. D2 handles the present
-// transcript; the transcript-unavailable soft-degrade lands in D3.
-func (l *Loop) commitTurn(path string, cur event.TurnIndex, _ []*content.AIMessage, pub func(event.Event)) content.AgenticMessages {
+// per assistant round, accumulating the committed history. If the transcript is
+// unavailable it SOFT-DEGRADES to the assistant messages seen on the live stream —
+// emitting a synthetic StepDone per message so restore still keeps the reply rather
+// than losing the turn's output entirely.
+func (l *Loop) commitTurn(path string, cur event.TurnIndex, assistant []*content.AIMessage, pub func(event.Event)) content.AgenticMessages {
 	groups, err := decodeTranscriptTail(path, int(cur)-1)
 	if err != nil {
-		slog.Warn("foreignloop: transcript unavailable; committing nothing", "error", err)
-		return nil
+		var unavailable *TranscriptUnavailableError
+		if !errors.As(err, &unavailable) {
+			slog.Warn("foreignloop: transcript decode failed; degrading to stream assistant", "error", err)
+		}
+		return commitFromAssistant(assistant, pub)
 	}
 	var committed content.AgenticMessages
 	for _, group := range groups {
 		pub(event.StepDone{Messages: group})
 		committed = append(committed, group...)
+	}
+	return committed
+}
+
+// commitFromAssistant is the transcript-loss fallback: it publishes one synthetic
+// StepDone per assistant message collected from the live stream and returns them as
+// the committed history, so a turn whose transcript could not be read still commits
+// the assistant reply rather than dropping it.
+func commitFromAssistant(assistant []*content.AIMessage, pub func(event.Event)) content.AgenticMessages {
+	var committed content.AgenticMessages
+	for _, am := range assistant {
+		pub(event.StepDone{Messages: content.AgenticMessages{am}})
+		committed = append(committed, am)
 	}
 	return committed
 }

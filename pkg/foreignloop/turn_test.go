@@ -2,6 +2,7 @@ package foreignloop
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -117,6 +118,21 @@ func writeTranscript(t *testing.T, text string) string {
 	return path
 }
 
+// waitForKind polls the publisher until an event of the named kind appears.
+func waitForKind(t *testing.T, pub *fakePublisher, kind string) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		for _, ev := range pub.snapshot() {
+			if eventKind(ev) == kind {
+				return
+			}
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	t.Fatalf("no %s event published within timeout; got %v", kind, eventKinds(pub.snapshot()))
+}
+
 func submitUserInput(t *testing.T, l *Loop, text string) {
 	t.Helper()
 	cmd := command.UserInput{
@@ -189,6 +205,74 @@ func TestUserInputHappyPath(t *testing.T) {
 	}
 	if len(msgs) != 1 || firstText(t, msgs[0]) != "committed reply" {
 		t.Fatalf("committed msgs = %v, want one AIMessage 'committed reply'", msgs)
+	}
+	shutdown(t, l)
+}
+
+func TestSpawnFailureTurnFailed(t *testing.T) {
+	t.Parallel()
+	agent := &fakeAgent{spawnErr: errors.New("agent failed to start")}
+	l, pub := newDrivenLoop(t, agent)
+
+	submitUserInput(t, l, "go")
+	waitForKind(t, pub, "TurnFailed")
+
+	evs := pub.snapshot()
+	want := []string{"TurnStarted", "TurnFailed"}
+	if got := eventKinds(evs); !eqStrs(got, want) {
+		t.Fatalf("published sequence = %v, want %v", got, want)
+	}
+	tf, ok := evs[1].(event.TurnFailed)
+	if !ok {
+		t.Fatalf("evs[1] = %T, want TurnFailed", evs[1])
+	}
+	var spawnErr *SpawnError
+	if !errors.As(tf.Err, &spawnErr) {
+		t.Fatalf("TurnFailed.Err = %T %v, want *SpawnError", tf.Err, tf.Err)
+	}
+	// A failed turn commits nothing and does not advance the turn count.
+	msgs, ti, err := l.Snapshot(context.Background())
+	if err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+	if len(msgs) != 0 || ti != 0 {
+		t.Fatalf("after spawn failure: msgs=%d turnIndex=%d, want 0/0", len(msgs), ti)
+	}
+	shutdown(t, l)
+}
+
+func TestTranscriptLossSoftDegrade(t *testing.T) {
+	t.Parallel()
+	missing := filepath.Join(t.TempDir(), "does-not-exist.jsonl")
+	agent := &fakeAgent{
+		transcript: missing,
+		events: []ForeignEvent{
+			{Kind: ForeignTextDelta, Text: "thinking"},
+			{Kind: ForeignStepComplete, Message: aiMessage("soft reply")},
+			{Kind: ForeignTerminalOK},
+		},
+	}
+	l, pub := newDrivenLoop(t, agent)
+
+	submitUserInput(t, l, "go")
+	waitTurnIndex(t, l, 1)
+
+	evs := pub.snapshot()
+	want := []string{"TurnStarted", "TokenDelta", "StepDone", "TurnDone"}
+	if got := eventKinds(evs); !eqStrs(got, want) {
+		t.Fatalf("published sequence = %v, want %v", got, want)
+	}
+	sd, ok := evs[2].(event.StepDone)
+	if !ok || len(sd.Messages) != 1 || firstText(t, sd.Messages[0]) != "soft reply" {
+		t.Fatalf("synthetic StepDone = %+v, want assistant 'soft reply'", sd)
+	}
+	// The soft-degraded assistant message is committed so restore keeps the reply.
+	msgs, _, err := l.Snapshot(context.Background())
+	if err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+	if len(msgs) != 1 || firstText(t, msgs[0]) != "soft reply" {
+		t.Fatalf("committed msgs = %v, want one AIMessage 'soft reply'", msgs)
 	}
 	shutdown(t, l)
 }
