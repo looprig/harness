@@ -1,0 +1,194 @@
+package foreignloop
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"path/filepath"
+	"testing"
+	"time"
+
+	"github.com/ciram-co/looprig/pkg/command"
+	"github.com/ciram-co/looprig/pkg/content"
+	"github.com/ciram-co/looprig/pkg/event"
+)
+
+// eventKind names a foreign event for an ordered-sequence assertion.
+func eventKind(ev event.Event) string {
+	switch ev.(type) {
+	case event.TurnStarted:
+		return "TurnStarted"
+	case event.TokenDelta:
+		return "TokenDelta"
+	case event.ToolCallStarted:
+		return "ToolCallStarted"
+	case event.ToolCallCompleted:
+		return "ToolCallCompleted"
+	case event.StepDone:
+		return "StepDone"
+	case event.TurnDone:
+		return "TurnDone"
+	case event.TurnFailed:
+		return "TurnFailed"
+	case event.TurnInterrupted:
+		return "TurnInterrupted"
+	default:
+		return fmt.Sprintf("%T", ev)
+	}
+}
+
+func eventKinds(evs []event.Event) []string {
+	out := make([]string, len(evs))
+	for i, ev := range evs {
+		out[i] = eventKind(ev)
+	}
+	return out
+}
+
+func eqStrs(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// firstText returns the first TextBlock text of a conversation message, or "".
+func firstText(t *testing.T, c content.Conversation) string {
+	t.Helper()
+	switch m := c.(type) {
+	case *content.AIMessage:
+		return firstBlockText(t, m.Blocks)
+	case *content.UserMessage:
+		return firstBlockText(t, m.Blocks)
+	default:
+		t.Fatalf("unexpected conversation type %T", c)
+		return ""
+	}
+}
+
+func firstBlockText(t *testing.T, blocks []content.Block) string {
+	t.Helper()
+	for _, b := range blocks {
+		if tb, ok := b.(*content.TextBlock); ok {
+			return tb.Text
+		}
+	}
+	return ""
+}
+
+// newDrivenLoop wires a loop to a scripted fakeAgent + fakePublisher and returns
+// all three, with ctx cleanup registered.
+func newDrivenLoop(t *testing.T, agent *fakeAgent) (*Loop, *fakePublisher) {
+	t.Helper()
+	pub := &fakePublisher{}
+	l, _ := newTestLoop(t, Spec{Agent: agent}, pub)
+	return l, pub
+}
+
+// waitTurnIndex polls Snapshot until the committed turnIndex reaches want, which
+// proves the actor applied the turn outcome and returned to idle.
+func waitTurnIndex(t *testing.T, l *Loop, want event.TurnIndex) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		_, ti, err := l.Snapshot(context.Background())
+		if err == nil && ti == want {
+			return
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	t.Fatalf("turnIndex did not reach %d within timeout", want)
+}
+
+// writeTranscript writes a single-assistant-record transcript file and returns its
+// path. The record decodes to one AIMessage carrying the given text.
+func writeTranscript(t *testing.T, text string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "session.jsonl")
+	line := fmt.Sprintf(`{"type":"assistant","message":{"content":[{"type":"text","text":%q}]}}`, text)
+	if err := os.WriteFile(path, []byte(line+"\n"), 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+	return path
+}
+
+func submitUserInput(t *testing.T, l *Loop, text string) {
+	t.Helper()
+	cmd := command.UserInput{
+		Header: command.Header{CommandID: mustID(t)},
+		Blocks: []content.Block{&content.TextBlock{Text: text}},
+	}
+	select {
+	case l.Commands <- cmd:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out submitting UserInput")
+	}
+}
+
+func TestUserInputHappyPath(t *testing.T) {
+	t.Parallel()
+	transcript := writeTranscript(t, "committed reply")
+	agent := &fakeAgent{
+		transcript: transcript,
+		events: []ForeignEvent{
+			{Kind: ForeignInit, SessionID: ""},
+			{Kind: ForeignTextDelta, Text: "hi"},
+			{Kind: ForeignToolUse, ToolUseID: "t1", ToolName: "Bash"},
+			{Kind: ForeignToolResult, ToolUseID: "t1", ResultPreview: "ok"},
+			{Kind: ForeignStepComplete, Message: aiMessage("step")},
+			{Kind: ForeignTerminalOK, Message: aiMessage("done")},
+		},
+	}
+	l, pub := newDrivenLoop(t, agent)
+
+	var spawnAtCount int
+	agent.onSpawn = func() { spawnAtCount = pub.count() }
+
+	submitUserInput(t, l, "do the thing")
+	waitTurnIndex(t, l, 1)
+
+	evs := pub.snapshot()
+	want := []string{"TurnStarted", "TokenDelta", "ToolCallStarted", "ToolCallCompleted", "StepDone", "TurnDone"}
+	if got := eventKinds(evs); !eqStrs(got, want) {
+		t.Fatalf("published sequence = %v, want %v", got, want)
+	}
+
+	// TurnStarted carries the user blocks, and Spawn ran AFTER it was published.
+	ts, ok := evs[0].(event.TurnStarted)
+	if !ok {
+		t.Fatalf("evs[0] = %T, want TurnStarted", evs[0])
+	}
+	if ts.Message == nil || firstText(t, ts.Message) != "do the thing" {
+		t.Fatalf("TurnStarted.Message = %+v, want user blocks 'do the thing'", ts.Message)
+	}
+	if spawnAtCount < 1 {
+		t.Fatalf("Spawn observed %d published events, want >=1 (TurnStarted before Spawn)", spawnAtCount)
+	}
+	if agent.calls() != 1 {
+		t.Fatalf("Spawn called %d times, want 1", agent.calls())
+	}
+
+	// StepDone carries the transcript-derived assistant message.
+	sd, ok := evs[4].(event.StepDone)
+	if !ok || len(sd.Messages) != 1 || firstText(t, sd.Messages[0]) != "committed reply" {
+		t.Fatalf("StepDone = %+v, want transcript message 'committed reply'", sd)
+	}
+
+	// Snapshot reflects the committed (transcript-derived) assistant message.
+	msgs, ti, err := l.Snapshot(context.Background())
+	if err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+	if ti != 1 {
+		t.Fatalf("turnIndex = %d, want 1", ti)
+	}
+	if len(msgs) != 1 || firstText(t, msgs[0]) != "committed reply" {
+		t.Fatalf("committed msgs = %v, want one AIMessage 'committed reply'", msgs)
+	}
+	shutdown(t, l)
+}
