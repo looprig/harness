@@ -9,6 +9,7 @@ import (
 	"github.com/ciram-co/looprig/pkg/command"
 	"github.com/ciram-co/looprig/pkg/content"
 	"github.com/ciram-co/looprig/pkg/event"
+	"github.com/ciram-co/looprig/pkg/foreignloop"
 	"github.com/ciram-co/looprig/pkg/hub"
 	"github.com/ciram-co/looprig/pkg/identity"
 	"github.com/ciram-co/looprig/pkg/loop"
@@ -29,6 +30,11 @@ const (
 	SessionFaulted                SessionErrorKind = "session_faulted"
 	SessionLoopDepthExceeded      SessionErrorKind = "loop_depth_exceeded"
 	SessionLoopQuotaExceeded      SessionErrorKind = "loop_quota_exceeded"
+	// SessionForeignBuilderMissing: a loop.Config selected a foreign Engine but no
+	// foreign Builder was wired (WithForeignBuilder). newLoop fails closed rather than
+	// silently falling back to a native loop — a foreign engine must never resolve to a
+	// different backend than the caller asked for.
+	SessionForeignBuilderMissing SessionErrorKind = "foreign_builder_missing"
 )
 
 // SessionError is returned when a session method cannot complete.
@@ -61,6 +67,8 @@ func (e *SessionError) Error() string {
 		msg = "session: loop spawn depth limit exceeded"
 	case SessionLoopQuotaExceeded:
 		msg = "session: loop spawn quota exceeded"
+	case SessionForeignBuilderMissing:
+		msg = "session: foreign engine selected but no foreign builder wired"
 	default:
 		msg = "session: error"
 	}
@@ -232,6 +240,16 @@ type Session struct {
 	// concrete lease, only the narrow release closure.
 	leaseRelease func(context.Context) error
 	releaseOnce  sync.Once
+
+	// foreignBuild and foreignBuildRestored are the composition-root seams newLoop and
+	// the restore path use to construct a foreign-engine loop (live + restored). They are
+	// wired via WithForeignBuilder; nil (the default) means foreign engines are not
+	// supported, so a foreign cfg.Engine fails closed (SessionForeignBuilderMissing /
+	// RestoreForeignBuilderMissing). The session depends only on these narrow function
+	// seams, never on the foreignloop concrete loop (Dependency Inversion): loop.New
+	// itself only ever builds native, and the foreign backend is injected here.
+	foreignBuild         foreignloop.Builder
+	foreignBuildRestored foreignloop.RestoredBuilder
 }
 
 // eventAppender is the session's narrow view of the hub's REQUIRED durable event tap:
@@ -527,8 +545,29 @@ func (s *Session) newLoop(parent loop.Provenance, cfg loop.Config, parentToolUse
 		return uuid.UUID{}, &SessionError{Kind: SessionIDGenerationFailed, Cause: err}
 	}
 
+	// Engine switch — the single loop-construction chokepoint for BOTH the primary loop
+	// (built via newSession → NewLoop with zero provenance) and every subagent. A native
+	// cfg.Engine (the zero value) builds through loop.New exactly as before. A foreign
+	// cfg.Engine routes to the injected foreign Builder seam and fails CLOSED if none is
+	// wired (a foreign engine must never silently resolve to a native loop). The minted
+	// foreign sid the builder returns is stamped onto the published LoopStarted below;
+	// it is "" for native (omitzero drops it). Every failure path rolls back the quota
+	// reservation (release()) and cancels the loopCtx, exactly like the surrounding code.
 	loopCtx, cancel := context.WithCancel(s.sessionCtx)
-	l, err := loop.New(loopCtx, s.SessionID, loopID, parent, s, cfg)
+	var b loop.Backend
+	var foreignSID string
+	switch cfg.Engine {
+	case loop.EngineNative:
+		b, err = loop.New(loopCtx, s.SessionID, loopID, parent, s, cfg)
+	default:
+		if s.foreignBuild == nil {
+			release()
+			cancel()
+			return uuid.UUID{}, &SessionError{Kind: SessionForeignBuilderMissing}
+		}
+		b, foreignSID, err = s.foreignBuild(loopCtx, s.SessionID, loopID, parent, s, cfg,
+			func() (uuid.UUID, error) { return s.newID() }, s.factory)
+	}
 	if err != nil {
 		release()
 		cancel()
@@ -559,7 +598,7 @@ func (s *Session) newLoop(parent loop.Provenance, cfg loop.Config, parentToolUse
 		cancel()
 		return uuid.UUID{}, &SessionError{Kind: SessionClosing}
 	}
-	s.loops[loopID] = &loopHandle{backend: l, parent: parent, cancel: cancel}
+	s.loops[loopID] = &loopHandle{backend: b, parent: parent, cancel: cancel}
 	s.loopsMu.Unlock()
 
 	// Announce the new loop to subscribers active at creation time. Published AFTER
@@ -572,7 +611,7 @@ func (s *Session) newLoop(parent loop.Provenance, cfg loop.Config, parentToolUse
 	// ctx param, so it publishes on the session lifetime (s.sessionCtx). The header
 	// (Coordinates/Cause + minted EventID/CreatedAt) was stamped above before the loop
 	// was built.
-	ev := event.LoopStarted{Header: startedHeader, ParentToolUseID: parentToolUseID}
+	ev := event.LoopStarted{Header: startedHeader, ParentToolUseID: parentToolUseID, ForeignSID: foreignSID}
 	if err := s.PublishEvent(s.sessionCtx, ev); err != nil {
 		// Mirror New's cleanup-on-publish-failure: the loop is already registered and
 		// its loopCtx cancel is live, so a bare return would leak a cancel-orphaned

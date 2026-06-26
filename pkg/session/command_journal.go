@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/ciram-co/looprig/pkg/command"
+	"github.com/ciram-co/looprig/pkg/foreignloop"
 	"github.com/ciram-co/looprig/pkg/journal"
 	"github.com/ciram-co/looprig/pkg/uuid"
 )
@@ -134,6 +135,19 @@ func WithAllowConfigMismatch() Option {
 func WithConfigFingerprintFields(fields ConfigFingerprintFields) Option {
 	return func(s *Session) {
 		s.configFingerprintFields = fields
+	}
+}
+
+// WithForeignBuilder wires the composition-root seam that constructs foreign-engine
+// loops (live + restored). Without it, a foreign cfg.Engine fails closed at newLoop
+// (SessionForeignBuilderMissing) and at restore (RestoreForeignBuilderMissing) — a
+// foreign engine never silently resolves to a native loop. The two seams travel
+// together (a live build and a restored build of the same agent), so they are wired as
+// one option; either being nil leaves foreign engines unsupported for that path.
+func WithForeignBuilder(b foreignloop.Builder, rb foreignloop.RestoredBuilder) Option {
+	return func(s *Session) {
+		s.foreignBuild = b
+		s.foreignBuildRestored = rb
 	}
 }
 
