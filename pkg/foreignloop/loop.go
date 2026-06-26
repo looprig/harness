@@ -55,20 +55,8 @@ var _ loop.Backend = (*Loop)(nil)
 func New(loopCtx context.Context, sessionID, loopID uuid.UUID, parent loop.Provenance,
 	pub EventPublisher, cfg loop.Config, spec Spec,
 	idGen func() (uuid.UUID, error), fac *event.Factory) (*Loop, string, error) {
-	if cfg.Model.System == "" {
-		return nil, "", &ConfigError{Field: "Model.System", Reason: "required"}
-	}
-	if spec.Agent == nil {
-		return nil, "", &ConfigError{Field: "Spec.Agent", Reason: "required"}
-	}
-	if idGen == nil {
-		return nil, "", &ConfigError{Field: "idGen", Reason: "required"}
-	}
-	if fac == nil {
-		return nil, "", &ConfigError{Field: "fac", Reason: "required"}
-	}
-	if pub == nil {
-		return nil, "", &ConfigError{Field: "pub", Reason: "required"}
+	if err := validateWiring(cfg, spec, idGen, fac, pub); err != nil {
+		return nil, "", err
 	}
 	u, err := idGen()
 	if err != nil {
@@ -91,6 +79,25 @@ func New(loopCtx context.Context, sessionID, loopID uuid.UUID, parent loop.Prove
 	}
 	go l.run(loopCtx)
 	return l, sid, nil
+}
+
+// validateWiring fail-secure validates the caller-supplied wiring shared by New and
+// NewRestored, returning a typed *ConfigError on the first missing dependency. It does
+// NOT validate the restore seed; that is the restored constructor's own concern.
+func validateWiring(cfg loop.Config, spec Spec, idGen func() (uuid.UUID, error), fac *event.Factory, pub EventPublisher) error {
+	switch {
+	case cfg.Model.System == "":
+		return &ConfigError{Field: "Model.System", Reason: "required"}
+	case spec.Agent == nil:
+		return &ConfigError{Field: "Spec.Agent", Reason: "required"}
+	case idGen == nil:
+		return &ConfigError{Field: "idGen", Reason: "required"}
+	case fac == nil:
+		return &ConfigError{Field: "fac", Reason: "required"}
+	case pub == nil:
+		return &ConfigError{Field: "pub", Reason: "required"}
+	}
+	return nil
 }
 
 // BuildWith adapts New to the foreignloop.Builder seam the composition root wires:

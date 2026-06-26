@@ -151,3 +151,11 @@ func (a *fakeAgent) calls() int {
 	defer a.mu.Unlock()
 	return a.spawnCalls
 }
+
+// lastForeignTurn returns the ForeignTurn passed to the most recent Spawn, read under
+// the mutex so a test can inspect resume/start-new wiring without racing the actor.
+func (a *fakeAgent) lastForeignTurn() ForeignTurn {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.lastTurn
+}
