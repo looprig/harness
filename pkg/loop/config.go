@@ -8,6 +8,15 @@ import (
 	"github.com/ciram-co/looprig/pkg/llm"
 )
 
+// Engine selects which backend constructs this loop. The zero value is native, so
+// existing Config construction is unchanged.
+type Engine uint8
+
+const (
+	EngineNative Engine = iota
+	EngineForeignClaude
+)
+
 type Config struct {
 	Client       llm.LLM       // required — caller constructs via auto.New at composition root
 	Model        llm.ModelSpec // model name, system prompt, sampling params — sent every turn
@@ -19,6 +28,11 @@ type Config struct {
 	// reads it when publishing LoopStarted; restore validates the root loop's stamped name
 	// against the configured primary's AgentName.
 	AgentName identity.AgentName
+
+	// Engine selects the loop backend. Zero = EngineNative (the historical path).
+	// EngineForeignClaude routes construction through the injected foreign Builder
+	// at the session composition root; loop.New itself only ever builds native.
+	Engine Engine
 
 	// Tools is the runner's view of the tool subsystem (the consumer surface in
 	// deps.go). Its runaway-guard caps are defaulted by New when zero;
