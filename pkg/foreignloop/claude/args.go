@@ -1,7 +1,3 @@
-// Package claude is the real `claude` subprocess adapter for the foreign loop. It
-// builds the child argv, derives the deterministic transcript path, gates the child
-// environment, and spawns the CLI in its own process group, satisfying
-// foreignloop.ForeignAgent.
 package claude
 
 import "github.com/ciram-co/looprig/pkg/foreignloop"
