@@ -250,6 +250,12 @@ type LoopStarted struct {
 	// child loop back to its parent tool call across persist/restore; omitzero so old
 	// journal records without the field decode to "".
 	ParentToolUseID string `json:"parent_tool_use_id,omitzero"`
+	// ForeignSID is the foreign agent's session id this loop is bound to, for
+	// foreign-engine loops only; empty for native loops. It is the durable handle
+	// used to --resume the foreign session across turns and across restore. omitzero
+	// so old journal records (and native loops) decode to "". Mirrors
+	// ParentToolUseID: identity metadata carried on the loop's start event.
+	ForeignSID string `json:"foreign_sid,omitzero"`
 }
 
 func (SessionStarted) isEvent() {}
