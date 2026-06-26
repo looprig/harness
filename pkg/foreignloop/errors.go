@@ -16,6 +16,13 @@ type ForeignExitError struct{ Code int }
 
 func (e *ForeignExitError) Error() string { return fmt.Sprintf("foreignloop: agent exited %d", e.Code) }
 
+// ForeignResultError is the typed cause for a foreign turn that ended with a
+// result-level error (e.g. error_max_turns) reported on the stream, as opposed to
+// a process exit code (ForeignExitError).
+type ForeignResultError struct{ Detail string }
+
+func (e *ForeignResultError) Error() string { return "foreignloop: foreign result error: " + e.Detail }
+
 type TranscriptUnavailableError struct {
 	Path  string
 	Cause error
