@@ -276,3 +276,119 @@ func TestTranscriptLossSoftDegrade(t *testing.T) {
 	}
 	shutdown(t, l)
 }
+
+// assertNoTerminalExcept fails if any TurnDone/TurnFailed was published.
+func assertNoSuccessOrFailTerminal(t *testing.T, pub *fakePublisher) {
+	t.Helper()
+	for _, ev := range pub.snapshot() {
+		switch ev.(type) {
+		case event.TurnDone, event.TurnFailed:
+			t.Fatalf("unexpected non-interrupt terminal %T published", ev)
+		}
+	}
+}
+
+func sendInterrupt(t *testing.T, l *Loop) {
+	t.Helper()
+	ack := make(chan bool, 1)
+	select {
+	case l.Commands <- command.Interrupt{Ack: ack}:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out submitting Interrupt")
+	}
+	select {
+	case got := <-ack:
+		if !got {
+			t.Fatal("Interrupt ack = false, want true (a turn was running)")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Interrupt never acked")
+	}
+}
+
+func TestInterruptDuringTurn(t *testing.T) {
+	t.Parallel()
+	agent := &fakeAgent{block: true, events: []ForeignEvent{{Kind: ForeignInit}}}
+	l, pub := newDrivenLoop(t, agent)
+
+	submitUserInput(t, l, "long running task")
+	waitForKind(t, pub, "TurnStarted")
+
+	sendInterrupt(t, l)
+	waitForKind(t, pub, "TurnInterrupted")
+	assertNoSuccessOrFailTerminal(t, pub)
+
+	want := []string{"TurnStarted", "TurnInterrupted"}
+	if got := eventKinds(pub.snapshot()); !eqStrs(got, want) {
+		t.Fatalf("published sequence = %v, want %v", got, want)
+	}
+	// An interrupted turn commits nothing.
+	msgs, ti, err := l.Snapshot(context.Background())
+	if err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+	if len(msgs) != 0 || ti != 0 {
+		t.Fatalf("after interrupt: msgs=%d turnIndex=%d, want 0/0", len(msgs), ti)
+	}
+	shutdown(t, l)
+}
+
+func TestDropCommandDuringTurnThenInterrupt(t *testing.T) {
+	t.Parallel()
+	agent := &fakeAgent{block: true, events: []ForeignEvent{{Kind: ForeignInit}}}
+	l, pub := newDrivenLoop(t, agent)
+
+	submitUserInput(t, l, "long running task")
+	waitForKind(t, pub, "TurnStarted")
+
+	// An un-honorable command mid-turn must be dropped without blocking the actor
+	// and without publishing anything.
+	approve := command.ApproveToolCall{
+		Header:    command.Header{CommandID: mustID(t)},
+		GateRoute: command.GateRoute{ToolExecutionID: mustID(t)},
+	}
+	select {
+	case l.Commands <- approve:
+	case <-time.After(2 * time.Second):
+		t.Fatal("ApproveToolCall during turn was not consumed (actor blocked)")
+	}
+
+	// Interrupt still works after the drop.
+	sendInterrupt(t, l)
+	waitForKind(t, pub, "TurnInterrupted")
+
+	want := []string{"TurnStarted", "TurnInterrupted"}
+	if got := eventKinds(pub.snapshot()); !eqStrs(got, want) {
+		t.Fatalf("published sequence = %v, want %v (drop must publish nothing)", got, want)
+	}
+	shutdown(t, l)
+}
+
+func TestShutdownDuringTurn(t *testing.T) {
+	t.Parallel()
+	agent := &fakeAgent{block: true, events: []ForeignEvent{{Kind: ForeignInit}}}
+	l, pub := newDrivenLoop(t, agent)
+
+	submitUserInput(t, l, "long running task")
+	waitForKind(t, pub, "TurnStarted")
+
+	ack := make(chan error, 1)
+	select {
+	case l.Commands <- command.Shutdown{Ack: ack}:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out submitting Shutdown during turn")
+	}
+	select {
+	case err := <-ack:
+		if err != nil {
+			t.Fatalf("Shutdown ack = %v, want nil", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Shutdown during turn never acked")
+	}
+	select {
+	case <-l.Done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("Done did not close after Shutdown during turn")
+	}
+}

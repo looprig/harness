@@ -92,15 +92,32 @@ func (l *Loop) awaitTurn(loopCtx context.Context, cur event.TurnIndex,
 	}
 }
 
-// handleTurnCommand routes a command that arrives WHILE a turn runs. D2 honors only
-// the snapshot/result/loop-ctx paths (handled by awaitTurn); every command here is
-// dropped with a warning. Interrupt and Shutdown handling land in D4. done reports
-// whether the turn is resolved (the actor leaves awaitTurn); exit reports whether the
-// whole actor must stop.
-func (l *Loop) handleTurnCommand(cmd command.Command, _ event.TurnIndex,
-	_ context.CancelFunc, _ func(event.Event), _ chan turnOutcome) (done, exit bool) {
-	slog.Warn("foreignloop: dropping un-honorable command during turn", "type", fmt.Sprintf("%T", cmd))
-	return false, false
+// handleTurnCommand routes a command that arrives WHILE a turn runs. Interrupt
+// cancels the turn ctx, waits for the goroutine to drain, and publishes
+// TurnInterrupted (via applyOutcome). Shutdown cancels, drains, acks, and exits the
+// actor. Every other command is an un-honorable mid-turn command — dropped with a
+// warning, never blocking and never publishing. done reports whether the turn is
+// resolved (the actor leaves awaitTurn); exit reports whether the whole actor stops.
+func (l *Loop) handleTurnCommand(cmd command.Command, cur event.TurnIndex,
+	cancel context.CancelFunc, pub func(event.Event), result chan turnOutcome) (done, exit bool) {
+	switch c := cmd.(type) {
+	case command.Interrupt:
+		cancel()
+		// applyOutcome publishes TurnInterrupted for the interrupted outcome; if the
+		// turn raced to completion before cancel landed, it commits that outcome instead
+		// (no double terminal — the goroutine already published its own).
+		l.applyOutcome(cur, <-result, pub)
+		c.Ack <- true
+		return true, false
+	case command.Shutdown:
+		cancel()
+		<-result // drain the cancelled turn goroutine before exiting.
+		c.Ack <- nil
+		return true, true
+	default:
+		slog.Warn("foreignloop: dropping un-honorable command during turn", "type", fmt.Sprintf("%T", cmd))
+		return false, false
+	}
 }
 
 // applyOutcome commits a resolved turn into the actor-owned state. On an interrupt it
