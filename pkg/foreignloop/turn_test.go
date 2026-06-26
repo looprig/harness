@@ -12,6 +12,7 @@ import (
 	"github.com/ciram-co/looprig/pkg/command"
 	"github.com/ciram-co/looprig/pkg/content"
 	"github.com/ciram-co/looprig/pkg/event"
+	"github.com/ciram-co/looprig/pkg/uuid"
 )
 
 // eventKind names a foreign event for an ordered-sequence assertion.
@@ -135,8 +136,16 @@ func waitForKind(t *testing.T, pub *fakePublisher, kind string) {
 
 func submitUserInput(t *testing.T, l *Loop, text string) {
 	t.Helper()
+	submitUserInputWithID(t, l, text, mustID(t))
+}
+
+// submitUserInputWithID submits a UserInput carrying an explicit CommandID so a test
+// can assert the published TurnStarted's Cause.CommandID echoes it (the session drain
+// correlates the opening turn on exactly this field).
+func submitUserInputWithID(t *testing.T, l *Loop, text string, commandID uuid.UUID) {
+	t.Helper()
 	cmd := command.UserInput{
-		Header: command.Header{CommandID: mustID(t)},
+		Header: command.Header{CommandID: commandID},
 		Blocks: []content.Block{&content.TextBlock{Text: text}},
 	}
 	select {
@@ -165,7 +174,8 @@ func TestUserInputHappyPath(t *testing.T) {
 	var spawnAtCount int
 	agent.onSpawn = func() { spawnAtCount = pub.count() }
 
-	submitUserInput(t, l, "do the thing")
+	commandID := mustID(t)
+	submitUserInputWithID(t, l, "do the thing", commandID)
 	waitTurnIndex(t, l, 1)
 
 	evs := pub.snapshot()
@@ -181,6 +191,11 @@ func TestUserInputHappyPath(t *testing.T) {
 	}
 	if ts.Message == nil || firstText(t, ts.Message) != "do the thing" {
 		t.Fatalf("TurnStarted.Message = %+v, want user blocks 'do the thing'", ts.Message)
+	}
+	// TurnStarted.Cause.CommandID echoes the submit id so the session drain can
+	// correlate the opening turn (this Cause survives the publish chokepoint + Stamp).
+	if got := ts.EventHeader().Cause.CommandID; got != commandID {
+		t.Fatalf("TurnStarted.Cause.CommandID = %v, want submit id %v", got, commandID)
 	}
 	if spawnAtCount < 1 {
 		t.Fatalf("Spawn observed %d published events, want >=1 (TurnStarted before Spawn)", spawnAtCount)

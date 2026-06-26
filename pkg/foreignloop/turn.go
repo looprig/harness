@@ -9,6 +9,7 @@ import (
 	"github.com/ciram-co/looprig/pkg/command"
 	"github.com/ciram-co/looprig/pkg/content"
 	"github.com/ciram-co/looprig/pkg/event"
+	"github.com/ciram-co/looprig/pkg/identity"
 )
 
 // turnOutcome is the turn goroutine's hand-back to the actor. The turn goroutine
@@ -49,8 +50,16 @@ func (l *Loop) runTurn(loopCtx context.Context, c command.UserInput) (exit bool)
 
 	user := &content.UserMessage{Message: content.Message{Role: content.RoleUser, Blocks: c.Blocks}}
 	// TurnStarted is published BEFORE Spawn: a turn is announced the moment the actor
-	// commits to it, independent of whether the agent process comes up.
-	pub(event.TurnStarted{TurnIndex: cur, Message: user})
+	// commits to it, independent of whether the agent process comes up. Its Cause
+	// carries the submit command id so the session's drain (drainToFinalText) can
+	// correlate the opening turn — RunSubagent over a foreign loop hangs without it.
+	// The publish chokepoint only fills Coordinates (leaving Cause intact) and
+	// Factory.Stamp adds only EventID+CreatedAt, so this Cause survives stamping.
+	pub(event.TurnStarted{
+		Header:    event.Header{Cause: identity.Cause{CommandID: c.Header.CommandID, Agency: c.Header.Agency}},
+		TurnIndex: cur,
+		Message:   user,
+	})
 
 	ft := ForeignTurn{
 		SystemPrompt: l.cfg.Model.System,
