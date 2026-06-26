@@ -177,8 +177,8 @@ func TestNew(t *testing.T) {
 		if s.primaryLoopID.IsZero() {
 			t.Error("primaryLoopID is zero")
 		}
-		if h.loop == nil {
-			t.Error("primary loopHandle.loop is nil")
+		if h.backend == nil {
+			t.Error("primary loopHandle.backend is nil")
 		}
 		// The primary loop has no parent (zero provenance).
 		if h.parent != (loop.Provenance{}) {
@@ -243,8 +243,8 @@ func TestNewLoop(t *testing.T) {
 			if !ok {
 				t.Fatal("NewLoop did not store the loop in the registry")
 			}
-			if h.loop == nil {
-				t.Error("stored loopHandle.loop is nil")
+			if h.backend == nil {
+				t.Error("stored loopHandle.backend is nil")
 			}
 			if h.parent != tt.parent {
 				t.Errorf("stored loopHandle.parent = %+v, want %+v", h.parent, tt.parent)
@@ -257,7 +257,7 @@ func TestNewLoop(t *testing.T) {
 			// (via sessionCancel) must hard-kill the new loop, closing its Done.
 			s.sessionCancel()
 			select {
-			case <-h.loop.Done:
+			case <-h.backend.DoneChan():
 			case <-time.After(2 * time.Second):
 				t.Fatal("new loop's Done did not close after sessionCancel; loopCtx not derived from sessionCtx")
 			}
@@ -806,8 +806,8 @@ func TestShutdownIDGenFailureStillTearsDownAllLoops(t *testing.T) {
 	}
 
 	s.loopsMu.RLock()
-	primaryDone := s.loops[s.primaryLoopID].loop.Done
-	subDone := s.loops[subID].loop.Done
+	primaryDone := s.loops[s.primaryLoopID].backend.DoneChan()
+	subDone := s.loops[subID].backend.DoneChan()
 	s.loopsMu.RUnlock()
 
 	// Fail every command-id mint during Shutdown.
@@ -1033,7 +1033,7 @@ func sessionWithFakeLoop() (s *Session, cmds chan command.Command, done chan str
 		sessionCtx:    sessionCtx,
 		sessionCancel: sessionCancel,
 		loops: map[uuid.UUID]*loopHandle{
-			primaryLoopID: {loop: &loop.Loop{Commands: cmds, Done: done}},
+			primaryLoopID: {backend: &loop.Loop{Commands: cmds, Done: done}},
 		},
 		primaryLoopID: primaryLoopID,
 		newID:         uuid.New,
@@ -1331,8 +1331,8 @@ func sessionWithTwoFakeLoops() (s *Session, loopA, loopB uuid.UUID, cmdsA, cmdsB
 		sessionCtx:    sessionCtx,
 		sessionCancel: sessionCancel,
 		loops: map[uuid.UUID]*loopHandle{
-			loopA: {loop: &loop.Loop{Commands: cmdsA, Done: doneA}},
-			loopB: {loop: &loop.Loop{Commands: cmdsB, Done: doneB}},
+			loopA: {backend: &loop.Loop{Commands: cmdsA, Done: doneA}},
+			loopB: {backend: &loop.Loop{Commands: cmdsB, Done: doneB}},
 		},
 		primaryLoopID: loopA,
 		newID:         uuid.New,
@@ -1585,8 +1585,8 @@ func sessionWithTwoFakeLoopsAndDone() (s *Session, cmdsA, cmdsB chan command.Com
 		sessionCtx:    sessionCtx,
 		sessionCancel: sessionCancel,
 		loops: map[uuid.UUID]*loopHandle{
-			loopA: {loop: &loop.Loop{Commands: cmdsA, Done: doneA}, cancel: func() {}},
-			loopB: {loop: &loop.Loop{Commands: cmdsB, Done: doneB}, cancel: func() {}},
+			loopA: {backend: &loop.Loop{Commands: cmdsA, Done: doneA}, cancel: func() {}},
+			loopB: {backend: &loop.Loop{Commands: cmdsB, Done: doneB}, cancel: func() {}},
 		},
 		primaryLoopID: loopA,
 		newID:         uuid.New,
@@ -1852,8 +1852,8 @@ func TestShutdownClosesAllRealLoopsAndLatchesClosing(t *testing.T) {
 
 	// Capture both actors' Done channels before shutdown.
 	s.loopsMu.RLock()
-	primaryDone := s.loops[s.primaryLoopID].loop.Done
-	subDone := s.loops[subID].loop.Done
+	primaryDone := s.loops[s.primaryLoopID].backend.DoneChan()
+	subDone := s.loops[subID].backend.DoneChan()
 	s.loopsMu.RUnlock()
 
 	if err := s.Shutdown(context.Background()); err != nil {

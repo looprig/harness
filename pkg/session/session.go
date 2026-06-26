@@ -250,9 +250,9 @@ type eventAppender interface {
 // provenance of the turn/step that spawned it (zero for the primary loop), and
 // the cancel for this loop's loopCtx (a session-owned backstop).
 type loopHandle struct {
-	loop   *loop.Loop
-	parent loop.Provenance
-	cancel context.CancelFunc
+	backend loop.Backend
+	parent  loop.Provenance
+	cancel  context.CancelFunc
 }
 
 // eventSubscriber is the consumer-facing half of the session fan-in: a TUI/CLI (or
@@ -408,9 +408,9 @@ func (s *Session) deliverSubagentResult(ctx context.Context, parentLoopID, fromL
 	// the hand-back proceeds. Targets the PARENT loop (the command's delivery target).
 	s.appendCommand(ctx, parentLoopID, cmd)
 	select {
-	case l.Commands <- cmd:
+	case l.CommandSink() <- cmd:
 		return nil
-	case <-l.Done:
+	case <-l.DoneChan():
 		return &SessionError{Kind: SessionLoopExited}
 	case <-ctx.Done():
 		return &SessionError{Kind: SessionContextDone, Cause: ctx.Err()}
@@ -559,7 +559,7 @@ func (s *Session) newLoop(parent loop.Provenance, cfg loop.Config, parentToolUse
 		cancel()
 		return uuid.UUID{}, &SessionError{Kind: SessionClosing}
 	}
-	s.loops[loopID] = &loopHandle{loop: l, parent: parent, cancel: cancel}
+	s.loops[loopID] = &loopHandle{backend: l, parent: parent, cancel: cancel}
 	s.loopsMu.Unlock()
 
 	// Announce the new loop to subscribers active at creation time. Published AFTER
@@ -620,14 +620,14 @@ func (s *Session) depthUnderLock(parentLoopID uuid.UUID) int {
 // loopFor returns the loop's channel handle for command routing. The registry
 // stores *loopHandle; this derefs to the handle's loop. The parent provenance is
 // read only by future tree walks, which read s.loops directly.
-func (s *Session) loopFor(loopID uuid.UUID) (*loop.Loop, bool) {
+func (s *Session) loopFor(loopID uuid.UUID) (loop.Backend, bool) {
 	s.loopsMu.RLock()
 	defer s.loopsMu.RUnlock()
 	h, ok := s.loops[loopID]
 	if !ok {
 		return nil, false
 	}
-	return h.loop, true
+	return h.backend, true
 }
 
 // newCommandID mints a fresh correlation ID for a command Header. Any
@@ -784,7 +784,7 @@ func newSession(ctx context.Context, cfg loop.Config, newID idGenerator, now eve
 // loopID is the dispatch target, passed in for the intent-log append (the Interrupt
 // itself carries no addressing); it is appended audit-only before the send on the
 // session lifetime ctx (interruptLoop has no ctx of its own — it is best-effort).
-func (s *Session) interruptLoop(loopID uuid.UUID, l *loop.Loop) {
+func (s *Session) interruptLoop(loopID uuid.UUID, l loop.Backend) {
 	id, err := s.newID()
 	if err != nil {
 		return
@@ -795,8 +795,8 @@ func (s *Session) interruptLoop(loopID uuid.UUID, l *loop.Loop) {
 	// best-effort interrupt proceeds.
 	s.appendCommand(s.sessionCtx, loopID, cmd)
 	select {
-	case l.Commands <- cmd:
-	case <-l.Done:
+	case l.CommandSink() <- cmd:
+	case <-l.DoneChan():
 	}
 }
 
@@ -882,11 +882,11 @@ func (s *Session) submitToLoop(ctx context.Context, loopID uuid.UUID, blocks []c
 	// the submit proceeds (a lost record must never block the user's input).
 	s.appendCommand(ctx, loopID, cmd)
 	select {
-	case l.Commands <- cmd:
+	case l.CommandSink() <- cmd:
 		return id, nil
 	case <-ctx.Done():
 		return uuid.UUID{}, &SessionError{Kind: SessionContextDone, Cause: ctx.Err()}
-	case <-l.Done:
+	case <-l.DoneChan():
 		return uuid.UUID{}, &SessionError{Kind: SessionLoopExited}
 	}
 }
@@ -980,7 +980,7 @@ type loopSnapshot struct {
 // the wait phase reads them back. The Ack is chan bool (cancelled?), distinct from
 // shutdownTarget's chan error (graceful-exit error).
 type interruptTarget struct {
-	loop *loop.Loop
+	loop loop.Backend
 	ack  chan bool
 }
 
@@ -1032,9 +1032,9 @@ func (s *Session) Interrupt(ctx context.Context) (bool, error) {
 		// BEFORE this loop's send; an append failure is logged and the fan-out proceeds.
 		s.appendCommand(ctx, ls.loopID, cmd)
 		select {
-		case ls.handle.loop.Commands <- cmd:
-			targets = append(targets, interruptTarget{loop: ls.handle.loop, ack: ack})
-		case <-ls.handle.loop.Done:
+		case ls.handle.backend.CommandSink() <- cmd:
+			targets = append(targets, interruptTarget{loop: ls.handle.backend, ack: ack})
+		case <-ls.handle.backend.DoneChan():
 			// Loop already exited; nothing to cancel.
 		case <-ctx.Done():
 			return false, &SessionError{Kind: SessionContextDone, Cause: ctx.Err()}
@@ -1048,7 +1048,7 @@ func (s *Session) Interrupt(ctx context.Context) (bool, error) {
 		select {
 		case cancelled := <-t.ack:
 			any = any || cancelled
-		case <-t.loop.Done:
+		case <-t.loop.DoneChan():
 			// Actor exited without (or before we read) an ack; nothing was cancelled
 			// by us — leave any unchanged.
 		case <-ctx.Done():
@@ -1080,7 +1080,7 @@ func (s *Session) releaseLease(ctx context.Context) {
 // is Shutdown-internal: the send phase records one per loop actually reached, and
 // the wait phase reads them back.
 type shutdownTarget struct {
-	loop *loop.Loop
+	loop loop.Backend
 	ack  chan error
 }
 
@@ -1155,9 +1155,9 @@ func (s *Session) Shutdown(ctx context.Context) error {
 		// is relinquished during teardown) and logged below error, not as a false alarm.
 		s.appendShutdownCommand(ctx, ls.loopID, cmd)
 		select {
-		case ls.handle.loop.Commands <- cmd:
-			targets = append(targets, shutdownTarget{loop: ls.handle.loop, ack: ack})
-		case <-ls.handle.loop.Done:
+		case ls.handle.backend.CommandSink() <- cmd:
+			targets = append(targets, shutdownTarget{loop: ls.handle.backend, ack: ack})
+		case <-ls.handle.backend.DoneChan():
 			// Loop already exited; nothing to wait for.
 		case <-ctx.Done():
 			return &SessionError{Kind: SessionContextDone, Cause: ctx.Err()}
@@ -1174,7 +1174,7 @@ func (s *Session) Shutdown(ctx context.Context) error {
 			if e != nil && firstErr == nil {
 				firstErr = e
 			}
-		case <-t.loop.Done:
+		case <-t.loop.DoneChan():
 			// Actor exited without (or before we read) an ack; nothing to wait for.
 		case <-ctx.Done():
 			return &SessionError{Kind: SessionContextDone, Cause: ctx.Err()}
@@ -1255,7 +1255,7 @@ func (s *Session) ProvideUserInput(ctx context.Context, loopID, toolExecutionID 
 // never approve a tool call on a loop the caller did not address. The returned
 // GateRoute carries the RESOLVED loop id (the loop actually dispatched to) and the
 // match key (ToolExecutionID), so the route is concrete and self-describing.
-func (s *Session) resolveGate(loopID, toolExecutionID uuid.UUID) (*loop.Loop, command.GateRoute, error) {
+func (s *Session) resolveGate(loopID, toolExecutionID uuid.UUID) (loop.Backend, command.GateRoute, error) {
 	targetLoopID := loopID
 	if targetLoopID.IsZero() {
 		targetLoopID = s.PrimaryLoopID()
@@ -1280,12 +1280,12 @@ func (s *Session) resolveGate(loopID, toolExecutionID uuid.UUID) (*loop.Loop, co
 // loopID is the resolved dispatch target (route.LoopID), passed in for the intent-log
 // append — appended audit-only BEFORE the send; an append failure is logged and the
 // gate reply proceeds (a lost record must never block a human's approval/denial).
-func (s *Session) routeGate(ctx context.Context, loopID uuid.UUID, l *loop.Loop, cmd command.Command) error {
+func (s *Session) routeGate(ctx context.Context, loopID uuid.UUID, l loop.Backend, cmd command.Command) error {
 	s.appendCommand(ctx, loopID, cmd)
 	select {
-	case l.Commands <- cmd:
+	case l.CommandSink() <- cmd:
 		return nil
-	case <-l.Done:
+	case <-l.DoneChan():
 		return &SessionError{Kind: SessionLoopExited}
 	case <-ctx.Done():
 		return &SessionError{Kind: SessionContextDone, Cause: ctx.Err()}

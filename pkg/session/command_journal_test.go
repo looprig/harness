@@ -189,7 +189,7 @@ func fakeAppenderSession(app *fakeCommandAppender, ts time.Time, loopIDs ...uuid
 	for _, lid := range loopIDs {
 		ch := make(chan command.Command)
 		cmds[lid] = ch
-		loops[lid] = &loopHandle{loop: &loop.Loop{Commands: ch, Done: make(chan struct{})}}
+		loops[lid] = &loopHandle{backend: &loop.Loop{Commands: ch, Done: make(chan struct{})}}
 	}
 	s = &Session{
 		SessionID:     id,

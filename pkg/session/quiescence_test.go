@@ -253,8 +253,8 @@ func TestChainedTurnsEmitNoLoopIdleBetween(t *testing.T) {
 		// (appended to the inbox) before turn 1's terminal — no ack needed now that the
 		// outcome (InputQueued) is published to the fan-in rather than replied.
 		select {
-		case l.Commands <- command.UserInput{Header: command.Header{CommandID: queuedID}, Blocks: textBlocks("turn2")}:
-		case <-l.Done:
+		case l.CommandSink() <- command.UserInput{Header: command.Header{CommandID: queuedID}, Blocks: textBlocks("turn2")}:
+		case <-l.DoneChan():
 		}
 	}
 

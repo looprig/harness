@@ -333,7 +333,7 @@ func buildRestoredSession(
 		sessionCancel()
 		return nil, &RestoreError{Kind: RestoreLoopFailed, Cause: err}
 	}
-	s.loops[primaryLoopID] = &loopHandle{loop: l, parent: loop.Provenance{}, cancel: cancel}
+	s.loops[primaryLoopID] = &loopHandle{backend: l, parent: loop.Provenance{}, cancel: cancel}
 	s.primaryLoopID = primaryLoopID
 	return s, nil
 }

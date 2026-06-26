@@ -33,7 +33,7 @@ func sessionWithHubAndFakeLoop() (s *Session, cmds chan command.Command, done ch
 		sessionCtx:    sessionCtx,
 		sessionCancel: sessionCancel,
 		loops: map[uuid.UUID]*loopHandle{
-			primaryLoopID: {loop: &loop.Loop{Commands: cmds, Done: done}},
+			primaryLoopID: {backend: &loop.Loop{Commands: cmds, Done: done}},
 		},
 		primaryLoopID: primaryLoopID,
 		newID:         uuid.New,
