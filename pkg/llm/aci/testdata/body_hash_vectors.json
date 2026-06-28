@@ -7,8 +7,10 @@
     "digest_fn": "src/aci/canonical.rs::sha256_hex == \"sha256:\"+hex(sha256(bytes))",
     "generated_by": "tests/zz_aci_vector_harness.rs::emit_body_hash_vectors (scratch harness, not committed upstream)"
   },
+  "float_note": "Some bodies carry NON-INTEGER floats (temperature/top_p). serde_json parses the wire literal to f64 then re-emits via ryu shortest-round-trip (NOT verbatim: 0.70->\"0.7\", 1e0->\"1.0\"). For the realistic temperature/top_p domain (non-integer values roughly in [1e-5, 1e16)) Go's shortest-float emission matches serde byte-for-byte; whole-number floats (1.0) and exotic magnitudes (>=1e16) diverge but never occur on this wire. The strict JCS path (Canonicalize) still REJECTS all floats; only CompactJSON accepts/emits them.",
   "fields": {
     "name": "stable vector identifier",
+    "note": "optional human-readable description of what the vector pins (not load-bearing)",
     "body": "the request body Value (parsed; for human readability only — order shown is insertion order)",
     "body_text": "the EXACT compact serialization as a UTF-8 string (authoritative key order)",
     "compact_hex": "lowercase hex of the compact serde_json::to_vec bytes (authoritative)",
@@ -75,6 +77,62 @@
       "body_text": "{\"stream\":false,\"model\":\"z-ai/glm-5.2\",\"messages\":[{\"role\":\"system\",\"content\":\"be terse\"}]}",
       "compact_hex": "7b2273747265616d223a66616c73652c226d6f64656c223a227a2d61692f676c6d2d352e32222c226d65737361676573223a5b7b22726f6c65223a2273797374656d222c22636f6e74656e74223a226265207465727365227d5d7d",
       "sha256": "sha256:886f02bbaa26fe362a5832b17ef7eb1fe0612a13b53732f174d706bc036403f0"
+    },
+    {
+      "name": "chat_float_temperature_top_p",
+      "note": "Non-integer float sampling params (temperature=0.7, top_p=0.9) — the realistic domain. serde re-parses the wire literal to f64 then re-emits via ryu shortest: 0.7->\"0.7\", 0.9->\"0.9\" (no exponent). Pins float parity for the Go CompactJSON encoder.",
+      "body": {
+        "model": "z-ai/glm-5.2",
+        "messages": [
+          {
+            "role": "user",
+            "content": "hi"
+          }
+        ],
+        "temperature": 0.7,
+        "top_p": 0.9,
+        "stream": false
+      },
+      "body_text": "{\"model\":\"z-ai/glm-5.2\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"temperature\":0.7,\"top_p\":0.9,\"stream\":false}",
+      "compact_hex": "7b226d6f64656c223a227a2d61692f676c6d2d352e32222c226d65737361676573223a5b7b22726f6c65223a2275736572222c22636f6e74656e74223a226869227d5d2c2274656d7065726174757265223a302e372c22746f705f70223a302e392c2273747265616d223a66616c73657d",
+      "sha256": "sha256:2ec009a62cc13c52c0f991e0c7b00bb03f7a77900bdd16a0850eb2e685e1ee95"
+    },
+    {
+      "name": "chat_fractional_temperature",
+      "note": "A single fractional value (temperature=1.5) within the valid [0,2] domain. Pins 1.5->\"1.5\".",
+      "body": {
+        "model": "z-ai/glm-5.2",
+        "messages": [
+          {
+            "role": "user",
+            "content": "hi"
+          }
+        ],
+        "temperature": 1.5
+      },
+      "body_text": "{\"model\":\"z-ai/glm-5.2\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"temperature\":1.5}",
+      "compact_hex": "7b226d6f64656c223a227a2d61692f676c6d2d352e32222c226d65737361676573223a5b7b22726f6c65223a2275736572222c22636f6e74656e74223a226869227d5d2c2274656d7065726174757265223a312e357d",
+      "sha256": "sha256:bec1ce60d57fd2d133a51057403dbdd0e3e0aca66c00976c65c840a412499da2"
+    },
+    {
+      "name": "chat_float_and_int_mixed",
+      "note": "A non-integer float (top_p=0.5) mixed with integer fields (temperature=1, max_tokens=256) in one object — proves float emission for fractional f64 and integer emission for i64 side by side. serde emits 1->\"1\", 0.5->\"0.5\", 256->\"256\".",
+      "body": {
+        "model": "z-ai/glm-5.2",
+        "messages": [
+          {
+            "role": "user",
+            "content": "hi"
+          }
+        ],
+        "temperature": 1,
+        "top_p": 0.5,
+        "max_tokens": 256,
+        "stream": false
+      },
+      "body_text": "{\"model\":\"z-ai/glm-5.2\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"temperature\":1,\"top_p\":0.5,\"max_tokens\":256,\"stream\":false}",
+      "compact_hex": "7b226d6f64656c223a227a2d61692f676c6d2d352e32222c226d65737361676573223a5b7b22726f6c65223a2275736572222c22636f6e74656e74223a226869227d5d2c2274656d7065726174757265223a312c22746f705f70223a302e352c226d61785f746f6b656e73223a3235362c2273747265616d223a66616c73657d",
+      "sha256": "sha256:a77fe28491572251733767c0a2659ece0bc29700ad9800f72c37780938bcb9a2"
     }
   ]
 }

@@ -48,13 +48,25 @@ with `canonical_hex` / `sha256` `null`. Consumed by Task 1.2 (`jcs.go`).
 
 ### `body_hash_vectors.json` — compact serde_json body-hash vectors (present, authoritative)
 
-3 vectors. The receipt body-hash is `sha256_hex(serde_json::to_vec(body))` with
-serde_json's **`preserve_order`** feature on, so map key order is the client's
-**insertion order — NOT sorted**. Each: `{ name, body, body_text, compact_hex, sha256 }`.
-`body_text` / `compact_hex` are the authoritative byte sequence; `body` is the
-parsed value for readability only. Go's `encoding/json` sorts map keys and will
-**not** match these byte-for-byte — Task 1.3's encoder must preserve order.
-This file is the byte-exact arbiter for that.
+6 vectors (3 integer-only + 3 float-bearing). The receipt body-hash is
+`sha256_hex(serde_json::to_vec(body))` with serde_json's **`preserve_order`**
+feature on, so map key order is the client's **insertion order — NOT sorted**.
+Each: `{ name, [note], body, body_text, compact_hex, sha256 }`. `body_text` /
+`compact_hex` are the authoritative byte sequence; `body` is the parsed value for
+readability only. Go's `encoding/json` sorts map keys and will **not** match these
+byte-for-byte — Task 1.3's encoder must preserve order. This file is the byte-exact
+arbiter for that.
+
+The three float-bearing vectors (`chat_float_temperature_top_p`,
+`chat_fractional_temperature`, `chat_float_and_int_mixed`) pin serde_json's f64
+emission for the realistic temperature/top_p domain: serde re-parses the wire
+literal to f64 then re-emits via ryu shortest-round-trip (`0.7`->`"0.7"`,
+`0.9`->`"0.9"`, `1.5`->`"1.5"`, `0.5`->`"0.5"` — no exponent). For non-integer
+values in this domain Go's shortest-float emission matches serde byte-for-byte;
+the divergence cases (whole-number floats `1.0`->serde `"1.0"` vs Go `"1"`, and
+magnitudes `>=1e16` where serde switches to exponent form) never occur on this
+wire (see `float_note` in the JSON). The strict JCS path (`Canonicalize`) still
+**rejects** all floats; only `CompactJSON` accepts/emits them — Task 1.3.
 
 ### `receipt_aci1.json` — DEFERRED (absent by design)
 

@@ -55,6 +55,15 @@ type Uint uint64
 // fallthrough.
 type Number json.Number
 
+// Float is a NON-integer JSON number used ONLY by the compact body serializer
+// (CompactJSON), not by the JCS canonical path. Real chat-request bodies carry
+// fractional sampling params (temperature/top_p, e.g. 0.7, 0.9), so the body
+// hash must serialize floats; the constrained JCS profile forbids them. Float
+// therefore lives in the shared Value union but is REJECTED by Canonicalize
+// (it surfaces *FloatNotAllowedError there) and accepted only by CompactJSON.
+// See body.go for the emission rules and their validated serde_json domain.
+type Float float64
+
 // Bool is a JSON boolean.
 type Bool bool
 
@@ -81,6 +90,7 @@ func (String) isValue()  {}
 func (Int) isValue()     {}
 func (Uint) isValue()    {}
 func (Number) isValue()  {}
+func (Float) isValue()   {}
 func (Bool) isValue()    {}
 func (Null) isValue()    {}
 func (Array) isValue()   {}
@@ -270,6 +280,13 @@ func emit(b *strings.Builder, v Value) error {
 		}
 		b.WriteString(lit)
 		return nil
+	case Float:
+		// The constrained JCS profile forbids non-integer numbers. Float exists
+		// only for the compact body path (CompactJSON); it must NEVER reach the
+		// canonical digest. Reject it as the typed *FloatNotAllowedError, carrying
+		// the offending value as its shortest decimal literal so the JCS path
+		// stays fail-closed and indistinguishable from a fractional Number.
+		return &FloatNotAllowedError{Literal: strconv.FormatFloat(float64(t), 'g', -1, 64)}
 	case Array:
 		return emitArray(b, t)
 	case *Object:
