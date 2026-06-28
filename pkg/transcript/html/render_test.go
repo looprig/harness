@@ -5,6 +5,7 @@ import (
 	"errors"
 	"flag"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -165,5 +166,158 @@ func TestRenderError(t *testing.T) {
 				t.Errorf("errors.Is(err, cause) = false, want true (err=%v)", err)
 			}
 		})
+	}
+}
+
+// TestRenderMarkdown proves the goldmark seam renders CommonMark structure and
+// that the GFM extension is enabled: headings, lists and inline code render, and
+// GFM-specific strikethrough (~~…~~ → <del>) and bare-URL autolinking work. Plain
+// goldmark (no GFM) would leave ~~strike~~ and the bare URL as literal text, so
+// these rows fail until extension.GFM is wired in.
+func TestRenderMarkdown(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		in        string
+		contains  []string
+		wantEmpty bool
+	}{
+		{
+			name:      "empty input early return",
+			in:        "",
+			wantEmpty: true,
+		},
+		{
+			name:     "heading list and inline code",
+			in:       "# Title\n\n- a\n- b\n\n`code`",
+			contains: []string{"<h1", "<ul>", "<li>a</li>", "<li>b</li>", "<code>code</code>"},
+		},
+		{
+			name:     "gfm strikethrough",
+			in:       "~~strike~~",
+			contains: []string{"<del>strike</del>"},
+		},
+		{
+			name:     "gfm autolink of bare url",
+			in:       "see https://example.com now",
+			contains: []string{`<a href="https://example.com">https://example.com</a>`},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got, err := renderMarkdown(tt.in)
+			if err != nil {
+				t.Fatalf("renderMarkdown(%q) error = %v", tt.in, err)
+			}
+			out := string(got)
+			if tt.wantEmpty && out != "" {
+				t.Errorf("renderMarkdown(%q) = %q, want empty (early-return path)", tt.in, out)
+			}
+			for _, sub := range tt.contains {
+				if !strings.Contains(out, sub) {
+					t.Errorf("renderMarkdown(%q) = %q, want substring %q", tt.in, out, sub)
+				}
+			}
+		})
+	}
+}
+
+// TestRenderMarkdownXSS is the security core (Decision 11): raw HTML in message
+// text must never survive as live markup. goldmark runs with raw-HTML passthrough
+// OFF, so a raw tag is omitted (replaced by an HTML comment) and a tag inside a
+// code span/fence is escaped to &lt;…&gt;. Each row scans the rendered bytes for
+// live attack vectors and confirms they are inert. Note: ` onload=` is forbidden
+// only for the raw-HTML rows (where the whole tag is dropped); in the code-fence
+// row it legitimately appears as escaped, inert text, so only the live `<svg`
+// opener is forbidden there.
+func TestRenderMarkdownXSS(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		in        string
+		forbidden []string // must NOT appear (case-insensitive): live vectors
+		required  []string // must appear (exact case): proof of neutralization
+	}{
+		{
+			name:      "user script tag omitted",
+			in:        "<script>alert(1)</script>",
+			forbidden: []string{"<script", "alert(1)", "<svg", "<img", " onerror=", " onload="},
+			required:  []string{"<!-- raw HTML omitted -->"},
+		},
+		{
+			name:      "ai closing-script then img onerror omitted",
+			in:        "</script><img onerror=alert(1) src=x>",
+			forbidden: []string{"<script", "<img", " onerror=", "alert(1)"},
+			required:  []string{"<!-- raw HTML omitted -->"},
+		},
+		{
+			name:      "raw svg onload omitted",
+			in:        "<svg onload=alert(1)>",
+			forbidden: []string{"<svg", " onload=", "alert(1)"},
+			required:  []string{"<!-- raw HTML omitted -->"},
+		},
+		{
+			name:      "svg in code fence is escaped not live",
+			in:        "```\n<svg onload=alert(1)>\n```",
+			forbidden: []string{"<svg", "<script"},
+			required:  []string{"&lt;svg onload=alert(1)&gt;"},
+		},
+		{
+			name:      "javascript url scheme filtered",
+			in:        "[click](javascript:alert(1))",
+			forbidden: []string{"javascript:", "alert(1)"},
+			// Lock the neutralized shape: the dangerous scheme is stripped to an
+			// empty href, the link text survives. A future goldmark upgrade that
+			// changed dangerous-URL handling could not silently pass this row.
+			required: []string{`href=""`, `>click</a>`},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got, err := renderMarkdown(tt.in)
+			if err != nil {
+				t.Fatalf("renderMarkdown(%q) error = %v", tt.in, err)
+			}
+			out := string(got)
+			low := strings.ToLower(out)
+			for _, bad := range tt.forbidden {
+				if strings.Contains(low, strings.ToLower(bad)) {
+					t.Errorf("renderMarkdown(%q) = %q\nmust NOT contain live vector %q", tt.in, out, bad)
+				}
+			}
+			for _, want := range tt.required {
+				if !strings.Contains(out, want) {
+					t.Errorf("renderMarkdown(%q) = %q\nwant neutralized marker %q", tt.in, out, want)
+				}
+			}
+		})
+	}
+}
+
+// TestRenderXSSEndToEnd renders a full page whose user and AI messages carry XSS
+// payloads, proving the payload's signature never reaches the output as live
+// markup. The assertions key on tokens unique to the payload (alert(1), onerror=,
+// <img>, <svg>) that the renderer's own <style>/<script>/template chrome never
+// contains, so they isolate injected markup from the page's legitimate scripting.
+func TestRenderXSSEndToEnd(t *testing.T) {
+	t.Parallel()
+
+	s := minimalSession()
+	s.Root.Turns[0].User.Blocks = []content.Block{&content.TextBlock{Text: "<script>alert(1)</script>"}}
+	s.Root.Turns[0].Steps[0].AI.Blocks = []content.Block{&content.TextBlock{Text: "</script><img onerror=alert(1) src=x>"}}
+
+	var buf bytes.Buffer
+	if err := Render(&buf, s); err != nil {
+		t.Fatalf("Render() error = %v", err)
+	}
+	low := strings.ToLower(buf.String())
+	for _, bad := range []string{"alert(1)", " onerror=", " onload=", "<img", "<svg"} {
+		if strings.Contains(low, strings.ToLower(bad)) {
+			t.Errorf("full page contains live XSS vector %q\n%s", bad, buf.String())
+		}
 	}
 }

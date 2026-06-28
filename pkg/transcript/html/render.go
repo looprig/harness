@@ -1,9 +1,9 @@
 // Package html renders a reconstructed transcript.Session to a single
 // self-contained HTML document: inline <style>/<script>, no external assets, so
-// the file opens offline. Markdown in message text is rendered by goldmark with
-// raw-HTML passthrough disabled (the default, safe configuration) and placed via
-// template.HTML only after goldmark has escaped it; every other dynamic value
-// flows through html/template contextual auto-escaping.
+// the file opens offline. Markdown in message text is rendered by goldmark (GFM
+// extension) with raw-HTML passthrough disabled — the safe configuration — and
+// placed via template.HTML only after goldmark has escaped it; every other dynamic
+// value flows through html/template contextual auto-escaping.
 package html
 
 import (
@@ -16,6 +16,7 @@ import (
 	"github.com/ciram-co/looprig/pkg/content"
 	"github.com/ciram-co/looprig/pkg/transcript"
 	"github.com/yuin/goldmark"
+	"github.com/yuin/goldmark/extension"
 )
 
 // timestampLayout formats the absolute session timestamps; clockLayout formats
@@ -26,11 +27,13 @@ const (
 	clockLayout     = "15:04:05"
 )
 
-// markdown is the shared, safe CommonMark renderer. It is created WITHOUT
-// html.WithUnsafe(): goldmark's default omits raw HTML, which is the XSS boundary
-// (Task 8 hardens and tests this; the safe config is wired here so the dependency
-// is justified and the minimal golden shows rendered markdown).
-var markdown = goldmark.New()
+// markdown is the shared, safe GitHub-Flavored-Markdown renderer. The GFM
+// extension adds tables, strikethrough, autolinks and task lists; it is created
+// WITHOUT the renderer's WithUnsafe option, so goldmark omits raw HTML — the XSS
+// boundary (Decision 11). renderMarkdown is the single chokepoint through which all
+// message text flows; TestRenderMarkdownXSS and FuzzRenderMarkdown prove raw HTML
+// can never survive as live markup.
+var markdown = goldmark.New(goldmark.WithExtensions(extension.GFM))
 
 // pageTemplate is parsed once from the embedded template at package init; a parse
 // failure is a programmer error in the embedded asset, so a panic via Must is
