@@ -80,10 +80,40 @@ func stamp(ev event.Event, loopID uuid.UUID, at time.Time) event.Event {
 	case event.TurnDone:
 		e.Header.LoopID, e.Header.CreatedAt = loopID, at
 		return e
+	case event.TurnFailed:
+		e.Header.LoopID, e.Header.CreatedAt = loopID, at
+		return e
+	case event.TurnInterrupted:
+		e.Header.LoopID, e.Header.CreatedAt = loopID, at
+		return e
+	case event.TurnFoldedInto:
+		e.Header.LoopID, e.Header.CreatedAt = loopID, at
+		return e
 	case event.PermissionRequested:
 		e.Header.LoopID, e.Header.CreatedAt = loopID, at
 		return e
 	case event.UserInputRequested:
+		e.Header.LoopID, e.Header.CreatedAt = loopID, at
+		return e
+	case event.SessionActive:
+		e.Header.LoopID, e.Header.CreatedAt = loopID, at
+		return e
+	case event.SessionIdle:
+		e.Header.LoopID, e.Header.CreatedAt = loopID, at
+		return e
+	case event.SessionStopped:
+		e.Header.LoopID, e.Header.CreatedAt = loopID, at
+		return e
+	case event.RestoreStarted:
+		e.Header.LoopID, e.Header.CreatedAt = loopID, at
+		return e
+	case event.RestoreDone:
+		e.Header.LoopID, e.Header.CreatedAt = loopID, at
+		return e
+	case event.RestoreErrored:
+		e.Header.LoopID, e.Header.CreatedAt = loopID, at
+		return e
+	case event.LoopIdle:
 		e.Header.LoopID, e.Header.CreatedAt = loopID, at
 		return e
 	default:
@@ -1032,5 +1062,435 @@ func TestReconstructOrphanWarningOrder(t *testing.T) {
 		if warnings[0].At.After(warnings[1].At) {
 			t.Fatalf("run %d: warnings not ordered by time: %v then %v", i, warnings[0].At, warnings[1].At)
 		}
+	}
+}
+
+// onlyTurn returns the single turn of the root loop, failing if the model is not
+// exactly one loop / one turn.
+func onlyTurn(t *testing.T, s *Session) *Turn {
+	t.Helper()
+	if s == nil || s.Root == nil {
+		t.Fatal("nil session or root loop")
+	}
+	if len(s.Root.Turns) != 1 {
+		t.Fatalf("len(Turns) = %d, want 1", len(s.Root.Turns))
+	}
+	return s.Root.Turns[0]
+}
+
+// allTexts collects the text of every *content.TextBlock in blocks, in order.
+func allTexts(blocks []content.Block) []string {
+	var out []string
+	for _, b := range blocks {
+		if tb, ok := b.(*content.TextBlock); ok {
+			out = append(out, tb.Text)
+		}
+	}
+	return out
+}
+
+// errTurn is the in-memory cause a TurnFailed carries; TurnFailed.Err is json:"-",
+// so the test sets it directly to exercise the in-memory-capture path.
+var errTurn = errors.New("provider exploded")
+
+// errRestore is the in-memory cause a RestoreErrored carries (also json:"-").
+var errRestore = errors.New("journal truncated")
+
+func TestReconstructOutcomes(t *testing.T) {
+	loopID := mustUUID(t)
+	base := time.Date(2026, 6, 28, 12, 0, 0, 0, time.UTC)
+
+	tests := []struct {
+		name  string
+		src   RecordSource
+		check func(t *testing.T, s *Session, warnings []Warning)
+	}{
+		{
+			name: "turn failed sets Failed outcome and captures in-memory error text",
+			src: newSliceSource(loopID, base,
+				event.LoopStarted{ParentToolUseID: ""},
+				event.TurnStarted{TurnIndex: 1, Message: userMsg("do it")},
+				event.StepDone{Messages: content.AgenticMessages{aiText("working")}},
+				event.TurnFailed{TurnIndex: 1, Err: errTurn},
+			),
+			check: func(t *testing.T, s *Session, warnings []Warning) {
+				if len(warnings) != 0 {
+					t.Fatalf("unexpected warnings: %+v", warnings)
+				}
+				turn := onlyTurn(t, s)
+				if turn.Outcome != OutcomeFailed {
+					t.Errorf("Outcome = %d, want OutcomeFailed", turn.Outcome)
+				}
+				if turn.Err != errTurn.Error() {
+					t.Errorf("Err = %q, want %q", turn.Err, errTurn.Error())
+				}
+				if want := base.Add(3 * time.Second); !turn.EndedAt.Equal(want) {
+					t.Errorf("EndedAt = %v, want %v (terminal time)", turn.EndedAt, want)
+				}
+			},
+		},
+		{
+			name: "turn failed with nil error leaves Err empty (replayed record)",
+			src: newSliceSource(loopID, base,
+				event.LoopStarted{ParentToolUseID: ""},
+				event.TurnStarted{TurnIndex: 1, Message: userMsg("do it")},
+				event.TurnFailed{TurnIndex: 1, Err: nil},
+			),
+			check: func(t *testing.T, s *Session, warnings []Warning) {
+				if len(warnings) != 0 {
+					t.Fatalf("unexpected warnings: %+v", warnings)
+				}
+				turn := onlyTurn(t, s)
+				if turn.Outcome != OutcomeFailed {
+					t.Errorf("Outcome = %d, want OutcomeFailed", turn.Outcome)
+				}
+				if turn.Err != "" {
+					t.Errorf("Err = %q, want \"\" (nil replayed error)", turn.Err)
+				}
+			},
+		},
+		{
+			name: "turn interrupted sets Interrupted outcome",
+			src: newSliceSource(loopID, base,
+				event.LoopStarted{ParentToolUseID: ""},
+				event.TurnStarted{TurnIndex: 1, Message: userMsg("stop")},
+				event.TurnInterrupted{TurnIndex: 1},
+			),
+			check: func(t *testing.T, s *Session, warnings []Warning) {
+				if len(warnings) != 0 {
+					t.Fatalf("unexpected warnings: %+v", warnings)
+				}
+				turn := onlyTurn(t, s)
+				if turn.Outcome != OutcomeInterrupted {
+					t.Errorf("Outcome = %d, want OutcomeInterrupted", turn.Outcome)
+				}
+			},
+		},
+		{
+			name: "turn with no terminal at stream end stays Running (zero value)",
+			src: newSliceSource(loopID, base,
+				event.LoopStarted{ParentToolUseID: ""},
+				event.TurnStarted{TurnIndex: 1, Message: userMsg("mid-prompt")},
+				event.StepDone{Messages: content.AgenticMessages{aiText("thinking")}},
+			),
+			check: func(t *testing.T, s *Session, warnings []Warning) {
+				if len(warnings) != 0 {
+					t.Fatalf("unexpected warnings: %+v", warnings)
+				}
+				turn := onlyTurn(t, s)
+				if turn.Outcome != OutcomeRunning {
+					t.Errorf("Outcome = %d, want OutcomeRunning (zero value)", turn.Outcome)
+				}
+				if !turn.EndedAt.IsZero() {
+					t.Errorf("EndedAt = %v, want zero (turn never terminated)", turn.EndedAt)
+				}
+			},
+		},
+		{
+			name: "folded input appends onto the open turn's user message",
+			src: newSliceSource(loopID, base,
+				event.LoopStarted{ParentToolUseID: ""},
+				event.TurnStarted{TurnIndex: 1, Message: userMsg("first")},
+				event.TurnFoldedInto{TurnIndex: 1, Message: userMsg("then this")},
+				event.StepDone{Messages: content.AgenticMessages{aiText("ok")}},
+				event.TurnDone{TurnIndex: 1},
+			),
+			check: func(t *testing.T, s *Session, warnings []Warning) {
+				if len(warnings) != 0 {
+					t.Fatalf("unexpected warnings: %+v", warnings)
+				}
+				turn := onlyTurn(t, s)
+				if turn.User == nil {
+					t.Fatal("turn.User is nil")
+				}
+				got := allTexts(turn.User.Blocks)
+				if len(got) != 2 || got[0] != "first" || got[1] != "then this" {
+					t.Errorf("User texts = %v, want [first \"then this\"] (folded input appended)", got)
+				}
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			s, warnings, err := Reconstruct(context.Background(), tt.src, noPrompts{})
+			if err != nil {
+				t.Fatalf("Reconstruct() error = %v", err)
+			}
+			tt.check(t, s, warnings)
+		})
+	}
+}
+
+func TestReconstructNotices(t *testing.T) {
+	t.Parallel()
+	loopID := mustUUID(t)
+	base := time.Date(2026, 6, 28, 12, 0, 0, 0, time.UTC)
+
+	src := newSliceSource(loopID, base,
+		event.SessionActive{},
+		event.SessionIdle{},
+		event.SessionStopped{},
+		event.RestoreStarted{},
+		event.RestoreDone{},
+		event.RestoreErrored{Err: errRestore},
+	)
+
+	s, warnings, err := Reconstruct(context.Background(), src, noPrompts{})
+	if err != nil {
+		t.Fatalf("Reconstruct() error = %v", err)
+	}
+	if len(warnings) != 0 {
+		t.Fatalf("lifecycle events must not warn, got: %+v", warnings)
+	}
+
+	wantKinds := []NoticeKind{
+		NoticeSessionActive,
+		NoticeSessionIdle,
+		NoticeSessionStopped,
+		NoticeRestoreStarted,
+		NoticeRestoreDone,
+		NoticeRestoreErrored,
+	}
+	if len(s.Notices) != len(wantKinds) {
+		t.Fatalf("len(Notices) = %d, want %d", len(s.Notices), len(wantKinds))
+	}
+	for i, want := range wantKinds {
+		n := s.Notices[i]
+		if n.Kind != want {
+			t.Errorf("Notices[%d].Kind = %d, want %d", i, n.Kind, want)
+		}
+		if n.Text == "" {
+			t.Errorf("Notices[%d].Text is empty", i)
+		}
+		if wantAt := base.Add(time.Duration(i) * time.Second); !n.At.Equal(wantAt) {
+			t.Errorf("Notices[%d].At = %v, want %v (Header.CreatedAt)", i, n.At, wantAt)
+		}
+		if i > 0 && n.At.Before(s.Notices[i-1].At) {
+			t.Errorf("Notices not in journal order at %d", i)
+		}
+	}
+	// RestoreErrored captures the in-memory error cause in its label.
+	if got := s.Notices[5].Text; !strings.Contains(got, errRestore.Error()) {
+		t.Errorf("RestoreErrored notice = %q, want it to mention %q", got, errRestore.Error())
+	}
+}
+
+func TestReconstructFailSecure(t *testing.T) {
+	loopID := mustUUID(t)
+	base := time.Date(2026, 6, 28, 12, 0, 0, 0, time.UTC)
+
+	tests := []struct {
+		name  string
+		src   RecordSource
+		check func(t *testing.T, s *Session, warnings []Warning)
+	}{
+		{
+			name: "orphan tool result with no matching tool-use warns without panic",
+			src: newSliceSource(loopID, base,
+				event.LoopStarted{ParentToolUseID: ""},
+				event.TurnStarted{TurnIndex: 1, Message: userMsg("go")},
+				event.StepDone{Messages: content.AgenticMessages{
+					aiText("no tools here"),
+					toolResult("ghost", "stranded result"),
+				}},
+				event.TurnDone{TurnIndex: 1},
+			),
+			check: func(t *testing.T, s *Session, warnings []Warning) {
+				if len(warnings) != 1 {
+					t.Fatalf("len(warnings) = %d, want 1 (orphan result)", len(warnings))
+				}
+				if !strings.Contains(warnings[0].Text, "ghost") {
+					t.Errorf("warning = %q, want it to mention the orphan tool-use id", warnings[0].Text)
+				}
+				step := onlyStep(t, s)
+				if len(step.Tools) != 0 {
+					t.Errorf("len(Tools) = %d, want 0 (no tool-use to pair)", len(step.Tools))
+				}
+			},
+		},
+		{
+			name: "unknown/unhandled event type warns without panic",
+			src: newSliceSource(loopID, base,
+				event.LoopStarted{ParentToolUseID: ""},
+				event.TurnStarted{TurnIndex: 1, Message: userMsg("go")},
+				event.LoopIdle{}, // a real event the builder does not model
+				event.TurnDone{TurnIndex: 1},
+			),
+			check: func(t *testing.T, s *Session, warnings []Warning) {
+				if len(warnings) != 1 {
+					t.Fatalf("len(warnings) = %d, want 1 (unhandled event)", len(warnings))
+				}
+				if !strings.Contains(warnings[0].Text, "LoopIdle") {
+					t.Errorf("warning = %q, want it to name the concrete event type", warnings[0].Text)
+				}
+				// The session is still built: the turn closed normally.
+				turn := onlyTurn(t, s)
+				if turn.Outcome != OutcomeDone {
+					t.Errorf("Outcome = %d, want OutcomeDone", turn.Outcome)
+				}
+			},
+		},
+		{
+			name: "step committed with no open turn warns without panic",
+			src: newSliceSource(loopID, base,
+				event.LoopStarted{ParentToolUseID: ""},
+				// A StepDone with no preceding TurnStarted: a truncated/reordered stream.
+				event.StepDone{Messages: content.AgenticMessages{aiText("orphan step")}},
+			),
+			check: func(t *testing.T, s *Session, warnings []Warning) {
+				if len(warnings) != 1 {
+					t.Fatalf("len(warnings) = %d, want 1 (step with no open turn)", len(warnings))
+				}
+				if !strings.Contains(warnings[0].Text, "no open turn") {
+					t.Errorf("warning = %q, want it to flag the missing open turn", warnings[0].Text)
+				}
+				// The session is still built (fail-secure): Root exists, with no turns.
+				if s == nil || s.Root == nil {
+					t.Fatal("session/Root must still be built")
+				}
+				if len(s.Root.Turns) != 0 {
+					t.Errorf("len(Turns) = %d, want 0 (no turn ever opened)", len(s.Root.Turns))
+				}
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			s, warnings, err := Reconstruct(context.Background(), tt.src, noPrompts{})
+			if err != nil {
+				t.Fatalf("Reconstruct() error = %v", err)
+			}
+			tt.check(t, s, warnings)
+		})
+	}
+}
+
+func TestReconstructLeftoverGates(t *testing.T) {
+	loopID := mustUUID(t)
+	e1, e2 := mustUUID(t), mustUUID(t)
+	base := time.Date(2026, 6, 28, 12, 0, 0, 0, time.UTC)
+
+	tests := []struct {
+		name  string
+		src   RecordSource
+		check func(t *testing.T, s *Session, warnings []Warning)
+	}{
+		{
+			name: "pending gate then interrupt with no StepDone warns exactly once",
+			src: newSliceSource(loopID, base,
+				event.LoopStarted{ParentToolUseID: ""},
+				event.TurnStarted{TurnIndex: 1, Message: userMsg("run")},
+				event.PermissionRequested{ToolExecutionID: e1, Request: tool.BashRequest{Command: "go test ./..."}},
+				event.TurnInterrupted{TurnIndex: 1},
+			),
+			check: func(t *testing.T, s *Session, warnings []Warning) {
+				// Drained once at the terminal; finalize must NOT re-warn (warn-once).
+				if len(warnings) != 1 {
+					t.Fatalf("len(warnings) = %d, want 1 (leftover gate drained once)", len(warnings))
+				}
+				if !strings.Contains(warnings[0].Text, "Bash") {
+					t.Errorf("warning = %q, want it to mention the unresolved tool", warnings[0].Text)
+				}
+				turn := onlyTurn(t, s)
+				if turn.Outcome != OutcomeInterrupted {
+					t.Errorf("Outcome = %d, want OutcomeInterrupted", turn.Outcome)
+				}
+			},
+		},
+		{
+			name: "approved gate then interrupt with no StepDone reports the decision, not unresolved",
+			src: newMixedSource(loopID, base,
+				evItem(event.LoopStarted{ParentToolUseID: ""}),
+				evItem(event.TurnStarted{TurnIndex: 1, Message: userMsg("run")}),
+				evItem(event.PermissionRequested{ToolExecutionID: e1, Request: tool.BashRequest{Command: "go test ./..."}}),
+				cmdItem(command.ApproveToolCall{
+					GateRoute: command.GateRoute{ToolExecutionID: e1},
+					Scope:     tool.ScopeOnce,
+					Header:    command.Header{Agency: identity.AgencyUser},
+				}),
+				evItem(event.TurnInterrupted{TurnIndex: 1}),
+			),
+			check: func(t *testing.T, s *Session, warnings []Warning) {
+				// A decided gate that races ahead of its StepDone is still drained once at
+				// the terminal, but the warning must surface the user's real action.
+				if len(warnings) != 1 {
+					t.Fatalf("len(warnings) = %d, want 1 (decided gate drained once)", len(warnings))
+				}
+				txt := warnings[0].Text
+				if !strings.Contains(txt, "decided") || !strings.Contains(txt, "approved") {
+					t.Errorf("warning = %q, want it to report the decision (decided/approved)", txt)
+				}
+				if strings.Contains(txt, "unresolved") {
+					t.Errorf("warning = %q, must not misreport a decided gate as unresolved", txt)
+				}
+				if !strings.Contains(txt, "Bash") {
+					t.Errorf("warning = %q, want it to mention the tool", txt)
+				}
+				turn := onlyTurn(t, s)
+				if turn.Outcome != OutcomeInterrupted {
+					t.Errorf("Outcome = %d, want OutcomeInterrupted", turn.Outcome)
+				}
+			},
+		},
+		{
+			name: "pending gate at end of stream (snapshot mid-prompt) warns exactly once",
+			src: newSliceSource(loopID, base,
+				event.LoopStarted{ParentToolUseID: ""},
+				event.TurnStarted{TurnIndex: 1, Message: userMsg("run")},
+				event.PermissionRequested{ToolExecutionID: e1, Request: tool.BashRequest{Command: "ls"}},
+				// No StepDone, no terminal: the turn is still open at the snapshot edge.
+			),
+			check: func(t *testing.T, s *Session, warnings []Warning) {
+				if len(warnings) != 1 {
+					t.Fatalf("len(warnings) = %d, want 1 (leftover gate at finalize)", len(warnings))
+				}
+				if !strings.Contains(warnings[0].Text, "Bash") {
+					t.Errorf("warning = %q, want it to mention the unresolved tool", warnings[0].Text)
+				}
+				turn := onlyTurn(t, s)
+				if turn.Outcome != OutcomeRunning {
+					t.Errorf("Outcome = %d, want OutcomeRunning", turn.Outcome)
+				}
+			},
+		},
+		{
+			name: "two pending gates at end of stream warn in deterministic OpenedAt order",
+			src: newSliceSource(loopID, base,
+				event.LoopStarted{ParentToolUseID: ""},
+				event.TurnStarted{TurnIndex: 1, Message: userMsg("run two")},
+				event.PermissionRequested{ToolExecutionID: e1, Request: tool.BashRequest{Command: "first"}},
+				event.PermissionRequested{ToolExecutionID: e2, Request: tool.UnknownRequest{Tool: "Glob"}},
+			),
+			check: func(t *testing.T, s *Session, warnings []Warning) {
+				if len(warnings) != 2 {
+					t.Fatalf("len(warnings) = %d, want 2", len(warnings))
+				}
+				// e1 opened before e2 (earlier CreatedAt) -> warns first.
+				if !strings.Contains(warnings[0].Text, "Bash") {
+					t.Errorf("warnings[0] = %q, want Bash (earlier OpenedAt first)", warnings[0].Text)
+				}
+				if !strings.Contains(warnings[1].Text, "Glob") {
+					t.Errorf("warnings[1] = %q, want Glob", warnings[1].Text)
+				}
+				if warnings[0].At.After(warnings[1].At) {
+					t.Errorf("leftover-gate warnings not ordered by time: %v then %v", warnings[0].At, warnings[1].At)
+				}
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			s, warnings, err := Reconstruct(context.Background(), tt.src, noPrompts{})
+			if err != nil {
+				t.Fatalf("Reconstruct() error = %v", err)
+			}
+			tt.check(t, s, warnings)
+		})
 	}
 }
