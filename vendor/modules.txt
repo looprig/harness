@@ -357,7 +357,7 @@ github.com/wk8/go-ordered-map/v2
 # github.com/xo/terminfo v0.0.0-20220910002029-abceb7e1c41e
 ## explicit; go 1.19
 github.com/xo/terminfo
-# github.com/yuin/goldmark v1.7.13
+# github.com/yuin/goldmark v1.8.2
 ## explicit; go 1.22
 github.com/yuin/goldmark
 github.com/yuin/goldmark/ast

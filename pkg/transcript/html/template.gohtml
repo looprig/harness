@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{.Title}}</title>
+<style>
+{{.Styles}}
+</style>
+</head>
+<body>
+<header class="session-header">
+<h1 class="session-title">{{.Title}}</h1>
+<dl class="session-meta">
+<div class="meta-row"><dt>Session</dt><dd class="mono">{{.SessionID}}</dd></div>
+<div class="meta-row"><dt>Model</dt><dd>{{.ModelID}}</dd></div>
+<div class="meta-row"><dt>Agent</dt><dd>{{.AgentKind}}</dd></div>
+<div class="meta-row"><dt>Permissions</dt><dd>{{.Posture}}</dd></div>
+<div class="meta-row"><dt>Started</dt><dd>{{.StartedAt}}</dd></div>
+<div class="meta-row"><dt>Ended</dt><dd>{{.EndedAt}}</dd></div>
+<div class="meta-row"><dt>Exported</dt><dd>{{.ExportedAt}}</dd></div>
+</dl>
+</header>
+<main class="session-body">
+{{- with .Loop}}
+<section class="loop" data-depth="{{.Depth}}">
+{{- range .Turns}}
+<article class="turn" data-turn="{{.Index}}">
+<div class="message user-message">
+<span class="accent-bar" aria-hidden="true">▌</span>
+<span class="msg-time mono">{{.At}}</span>
+<div class="msg-body">{{.User}}</div>
+</div>
+{{- range .Steps}}
+<div class="message ai-message">
+<span class="ai-dot" aria-hidden="true">●</span>
+<span class="agent-name">{{.AgentName}}</span>
+<span class="msg-time mono">{{.At}}</span>
+<div class="msg-body">{{.AI}}</div>
+</div>
+{{- end}}
+</article>
+{{- end}}
+</section>
+{{- end}}
+</main>
+<script>
+{{.Script}}
+</script>
+</body>
+</html>

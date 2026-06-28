@@ -1,0 +1,175 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Minimal transcript</title>
+<style>
+/* TUI-inspired dark theme. Palette mirrors pkg/tui/styles/styles.go so the
+   export tracks the terminal: lime AI bullet (#D4F84D), blue headings/inline-code
+   (#A2D2FF), gray user accent bar (#737373). Task 9 fleshes out the full layout
+   (collapsibles, tool cards, gate chips, nested subagents, toolbar); this skeleton
+   keeps the variables and base type so that work is additive. */
+:root {
+  --bg: #16161a;
+  --fg: #e6e6e6;
+  --muted: #9a9a9a;
+  --accent-bar: #737373;
+  --ai-dot: #D4F84D;
+  --heading: #A2D2FF;
+  --inline-code: #A2D2FF;
+  --card-bg: #1e1e24;
+  --border: #2a2a32;
+  --prose: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  padding: 2rem 1.25rem 4rem;
+  background: var(--bg);
+  color: var(--fg);
+  font-family: var(--prose);
+  line-height: 1.55;
+  max-width: 56rem;
+  margin-inline: auto;
+}
+
+.mono { font-family: var(--mono); }
+
+.session-header {
+  border-bottom: 1px solid var(--border);
+  padding-bottom: 1rem;
+  margin-bottom: 1.5rem;
+}
+
+.session-title {
+  color: var(--heading);
+  font-size: 1.5rem;
+  margin: 0 0 0.75rem;
+}
+
+.session-meta {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 0.15rem 1rem;
+  margin: 0;
+  font-size: 0.85rem;
+}
+
+.meta-row { display: contents; }
+
+.session-meta dt { color: var(--muted); }
+.session-meta dd { margin: 0; }
+
+.turn {
+  border-bottom: 1px solid var(--border);
+  padding: 1rem 0;
+}
+
+.message {
+  display: grid;
+  grid-template-columns: auto auto 1fr;
+  align-items: baseline;
+  column-gap: 0.5rem;
+  margin: 0.5rem 0;
+}
+
+.accent-bar { color: var(--accent-bar); }
+.ai-dot { color: var(--ai-dot); }
+
+.agent-name {
+  color: var(--ai-dot);
+  font-weight: 600;
+  font-size: 0.85rem;
+}
+
+.msg-time {
+  color: var(--muted);
+  font-size: 0.75rem;
+}
+
+.msg-body {
+  grid-column: 1 / -1;
+  margin-top: 0.25rem;
+}
+
+.msg-body h1, .msg-body h2, .msg-body h3,
+.msg-body h4, .msg-body h5, .msg-body h6 {
+  color: var(--heading);
+  line-height: 1.3;
+}
+
+.msg-body code {
+  font-family: var(--mono);
+  color: var(--inline-code);
+  background: var(--card-bg);
+  padding: 0.1em 0.3em;
+  border-radius: 3px;
+  font-size: 0.9em;
+}
+
+.msg-body pre {
+  background: var(--card-bg);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  padding: 0.75rem;
+  overflow-x: auto;
+}
+
+.msg-body pre code {
+  background: none;
+  padding: 0;
+  color: var(--fg);
+}
+
+</style>
+</head>
+<body>
+<header class="session-header">
+<h1 class="session-title">Minimal transcript</h1>
+<dl class="session-meta">
+<div class="meta-row"><dt>Session</dt><dd class="mono">01234567-89ab-cdef-0123-456789abcdef</dd></div>
+<div class="meta-row"><dt>Model</dt><dd>claude-opus-4-8</dd></div>
+<div class="meta-row"><dt>Agent</dt><dd>operator</dd></div>
+<div class="meta-row"><dt>Permissions</dt><dd>ask</dd></div>
+<div class="meta-row"><dt>Started</dt><dd>2026-06-28 10:00:00 UTC</dd></div>
+<div class="meta-row"><dt>Ended</dt><dd>2026-06-28 10:05:00 UTC</dd></div>
+<div class="meta-row"><dt>Exported</dt><dd>2026-06-28 10:06:00 UTC</dd></div>
+</dl>
+</header>
+<main class="session-body">
+<section class="loop" data-depth="0">
+<article class="turn" data-turn="1">
+<div class="message user-message">
+<span class="accent-bar" aria-hidden="true">▌</span>
+<span class="msg-time mono">10:00:01</span>
+<div class="msg-body"><p>Run the tests please.</p>
+</div>
+</div>
+<div class="message ai-message">
+<span class="ai-dot" aria-hidden="true">●</span>
+<span class="agent-name">operator</span>
+<span class="msg-time mono">10:00:02</span>
+<div class="msg-body"><h2>Done</h2>
+<p>Ran with <code>go test ./...</code> and all passed.</p>
+</div>
+</div>
+</article>
+</section>
+</main>
+<script>
+// Self-contained, dependency-free behavior for the transcript export. The minimal
+// skeleton has no interactive controls yet; Task 9 adds collapse/expand-all,
+// collapse-all-thinking, and jump-to-top here. Kept as a real (inert) script so
+// the output structure is stable and the page remains fully offline.
+(function () {
+  "use strict";
+  // Intentionally empty: no collapsibles or toolbar in the minimal skeleton.
+})();
+
+</script>
+</body>
+</html>
