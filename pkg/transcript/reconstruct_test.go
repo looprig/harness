@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"strings"
 	"testing"
 	"time"
 
@@ -137,10 +138,58 @@ func stampCommand(c command.Command, at time.Time) command.Command {
 	}
 }
 
+// loopNode is a Task-4 fixture entry: exactly one of ev/cmd, the loop id the event
+// belongs to, and (for a child LoopStarted) the parent loop id to stamp onto
+// Header.Cause. newLoopSource stamps each with its loop id and base+N*sec, so a
+// table row can interleave events across a parent and a child loop in REAL journal
+// order — the child's whole lifecycle before the parent's StepDone (Decision 6).
+type loopNode struct {
+	ev          event.Event
+	cmd         command.Command
+	loopID      uuid.UUID
+	causeLoopID uuid.UUID // parent loop id for a child LoopStarted; zero otherwise
+}
+
+func evNode(loopID uuid.UUID, e event.Event) loopNode { return loopNode{ev: e, loopID: loopID} }
+func cmdNode(c command.Command) loopNode              { return loopNode{cmd: c} }
+func childStart(loopID, parentLoopID uuid.UUID, e event.LoopStarted) loopNode {
+	return loopNode{ev: e, loopID: loopID, causeLoopID: parentLoopID}
+}
+
+// newLoopSource stamps each node with its loop id and an increasing CreatedAt and
+// returns a source yielding the records in order (io.EOF past the end). A child
+// LoopStarted additionally gets its Header.Cause.LoopID set to the parent loop.
+func newLoopSource(base time.Time, nodes ...loopNode) *sliceSource {
+	recs := make([]Record, len(nodes))
+	for i, n := range nodes {
+		at := base.Add(time.Duration(i) * time.Second)
+		switch {
+		case n.cmd != nil:
+			recs[i] = CommandRecord{Command: stampCommand(n.cmd, at)}
+		case n.ev != nil:
+			ev := stamp(n.ev, n.loopID, at)
+			if ls, ok := ev.(event.LoopStarted); ok && n.causeLoopID != (uuid.UUID{}) {
+				ls.Header.Cause.LoopID = n.causeLoopID
+				ev = ls
+			}
+			recs[i] = EventRecord{Event: ev}
+		}
+	}
+	return &sliceSource{records: recs}
+}
+
 // userMsg builds a single-text-block user message for a fixture turn.
 func userMsg(text string) *content.UserMessage {
 	return &content.UserMessage{Message: content.Message{
 		Role:   content.RoleUser,
+		Blocks: []content.Block{&content.TextBlock{Text: text}},
+	}}
+}
+
+// aiText builds an AIMessage whose only block is the given text (no tool uses).
+func aiText(text string) *content.AIMessage {
+	return &content.AIMessage{Message: content.Message{
+		Role:   content.RoleAssistant,
 		Blocks: []content.Block{&content.TextBlock{Text: text}},
 	}}
 }
@@ -671,5 +720,317 @@ func TestReconstructGates(t *testing.T) {
 			}
 			tt.check(t, s, warnings)
 		})
+	}
+}
+
+// onlyChildStep returns the single step of the single turn of a child loop, failing
+// if it is not exactly one turn / one step.
+func onlyChildStep(t *testing.T, child *Loop) *Step {
+	t.Helper()
+	if child == nil {
+		t.Fatal("nil child loop")
+	}
+	if len(child.Turns) != 1 {
+		t.Fatalf("child len(Turns) = %d, want 1", len(child.Turns))
+	}
+	if len(child.Turns[0].Steps) != 1 {
+		t.Fatalf("child len(Steps) = %d, want 1", len(child.Turns[0].Steps))
+	}
+	return child.Turns[0].Steps[0]
+}
+
+func TestReconstructSubagents(t *testing.T) {
+	base := time.Date(2026, 6, 28, 12, 0, 0, 0, time.UTC)
+
+	approveOnce := func(exec uuid.UUID) command.ApproveToolCall {
+		return command.ApproveToolCall{
+			GateRoute: command.GateRoute{ToolExecutionID: exec},
+			Scope:     tool.ScopeOnce,
+			Header:    command.Header{Agency: identity.AgencyUser},
+		}
+	}
+
+	tests := []struct {
+		name  string
+		src   RecordSource
+		check func(t *testing.T, s *Session, warnings []Warning)
+	}{
+		{
+			name: "child loop nests under its spawning Subagent tool call",
+			src: func() RecordSource {
+				primary, child := mustUUID(t), mustUUID(t)
+				return newLoopSource(base,
+					evNode(primary, event.LoopStarted{ParentToolUseID: ""}),
+					evNode(primary, event.TurnStarted{TurnIndex: 1, Message: userMsg("review this")}),
+					childStart(child, primary, event.LoopStarted{
+						ParentToolUseID: "sub1",
+						Header:          event.Header{AgentName: identity.AgentName("reviewer")},
+					}),
+					evNode(child, event.TurnStarted{TurnIndex: 1, Message: userMsg("on it")}),
+					evNode(child, event.StepDone{Messages: content.AgenticMessages{aiText("looks good")}}),
+					evNode(child, event.TurnDone{TurnIndex: 1}),
+					evNode(primary, event.StepDone{Messages: content.AgenticMessages{
+						aiToolUse(&content.ToolUseBlock{ID: "sub1", Name: "Subagent", Input: json.RawMessage(`{"agent":"reviewer"}`)}),
+						toolResult("sub1", "done"),
+					}}),
+					evNode(primary, event.TurnDone{TurnIndex: 1}),
+				)
+			}(),
+			check: func(t *testing.T, s *Session, warnings []Warning) {
+				if len(warnings) != 0 {
+					t.Fatalf("unexpected warnings: %+v", warnings)
+				}
+				step := onlyStep(t, s)
+				if len(step.Tools) != 1 {
+					t.Fatalf("len(Tools) = %d, want 1", len(step.Tools))
+				}
+				tc := step.Tools[0]
+				if tc.ToolUseID != "sub1" || tc.Name != "Subagent" {
+					t.Fatalf("tool = {%q,%q}, want {sub1,Subagent}", tc.ToolUseID, tc.Name)
+				}
+				if tc.Child == nil {
+					t.Fatal("Subagent tool call has nil Child")
+				}
+				if tc.Child.AgentName != "reviewer" {
+					t.Errorf("Child.AgentName = %q, want reviewer", tc.Child.AgentName)
+				}
+				if tc.Child == s.Root {
+					t.Error("child loop must not be Root")
+				}
+				if s.Root.ParentToolUseID != "" {
+					t.Errorf("Root.ParentToolUseID = %q, want \"\" (primary only)", s.Root.ParentToolUseID)
+				}
+				cs := onlyChildStep(t, tc.Child)
+				if cs.AI == nil || firstText(cs.AI.Blocks) != "looks good" {
+					t.Errorf("child step AI = %q, want \"looks good\"", msgText(cs.AI))
+				}
+			},
+		},
+		{
+			name: "two concurrent children attach to their own tool calls",
+			src: func() RecordSource {
+				primary, c1, c2 := mustUUID(t), mustUUID(t), mustUUID(t)
+				return newLoopSource(base,
+					evNode(primary, event.LoopStarted{ParentToolUseID: ""}),
+					evNode(primary, event.TurnStarted{TurnIndex: 1, Message: userMsg("spawn two")}),
+					childStart(c1, primary, event.LoopStarted{ParentToolUseID: "sub1", Header: event.Header{AgentName: identity.AgentName("reviewer")}}),
+					evNode(c1, event.TurnStarted{TurnIndex: 1, Message: userMsg("one")}),
+					evNode(c1, event.StepDone{Messages: content.AgenticMessages{aiText("child one")}}),
+					evNode(c1, event.TurnDone{TurnIndex: 1}),
+					childStart(c2, primary, event.LoopStarted{ParentToolUseID: "sub2", Header: event.Header{AgentName: identity.AgentName("tester")}}),
+					evNode(c2, event.TurnStarted{TurnIndex: 1, Message: userMsg("two")}),
+					evNode(c2, event.StepDone{Messages: content.AgenticMessages{aiText("child two")}}),
+					evNode(c2, event.TurnDone{TurnIndex: 1}),
+					evNode(primary, event.StepDone{Messages: content.AgenticMessages{
+						aiToolUse(
+							&content.ToolUseBlock{ID: "sub1", Name: "Subagent"},
+							&content.ToolUseBlock{ID: "sub2", Name: "Subagent"},
+						),
+						toolResult("sub1", "a"),
+						toolResult("sub2", "b"),
+					}}),
+					evNode(primary, event.TurnDone{TurnIndex: 1}),
+				)
+			}(),
+			check: func(t *testing.T, s *Session, warnings []Warning) {
+				if len(warnings) != 0 {
+					t.Fatalf("unexpected warnings: %+v", warnings)
+				}
+				step := onlyStep(t, s)
+				if len(step.Tools) != 2 {
+					t.Fatalf("len(Tools) = %d, want 2", len(step.Tools))
+				}
+				one, two := step.Tools[0], step.Tools[1]
+				if one.Child == nil || one.Child.AgentName != "reviewer" {
+					t.Errorf("Tools[0].Child = %+v, want reviewer", one.Child)
+				}
+				if two.Child == nil || two.Child.AgentName != "tester" {
+					t.Errorf("Tools[1].Child = %+v, want tester", two.Child)
+				}
+				if one.Child == two.Child {
+					t.Error("the two tool calls cross-attached to the same child")
+				}
+				if got := firstText(onlyChildStep(t, one.Child).AI.Blocks); got != "child one" {
+					t.Errorf("Tools[0].Child step = %q, want \"child one\"", got)
+				}
+				if got := firstText(onlyChildStep(t, two.Child).AI.Blocks); got != "child two" {
+					t.Errorf("Tools[1].Child step = %q, want \"child two\"", got)
+				}
+			},
+		},
+		{
+			name: "orphan child whose parent tool-use never appears warns once",
+			src: func() RecordSource {
+				primary, child := mustUUID(t), mustUUID(t)
+				return newLoopSource(base,
+					evNode(primary, event.LoopStarted{ParentToolUseID: ""}),
+					evNode(primary, event.TurnStarted{TurnIndex: 1, Message: userMsg("go")}),
+					childStart(child, primary, event.LoopStarted{ParentToolUseID: "nope", Header: event.Header{AgentName: identity.AgentName("ghost")}}),
+					evNode(child, event.TurnStarted{TurnIndex: 1, Message: userMsg("orphaned")}),
+					evNode(child, event.StepDone{Messages: content.AgenticMessages{aiText("nobody owns me")}}),
+					evNode(child, event.TurnDone{TurnIndex: 1}),
+					evNode(primary, event.StepDone{Messages: content.AgenticMessages{
+						aiToolUse(&content.ToolUseBlock{ID: "sub1", Name: "Subagent"}),
+						toolResult("sub1", "done"),
+					}}),
+					evNode(primary, event.TurnDone{TurnIndex: 1}),
+				)
+			}(),
+			check: func(t *testing.T, s *Session, warnings []Warning) {
+				if len(warnings) != 1 {
+					t.Fatalf("len(warnings) = %d, want 1 (orphan child)", len(warnings))
+				}
+				step := onlyStep(t, s)
+				if len(step.Tools) != 1 {
+					t.Fatalf("len(Tools) = %d, want 1", len(step.Tools))
+				}
+				if step.Tools[0].Child != nil {
+					t.Error("Subagent tool wrongly attached the orphan child")
+				}
+				// The orphan is unreachable from Root: it never became a ToolCall.Child.
+				if s.Root.ParentToolUseID != "" {
+					t.Errorf("Root.ParentToolUseID = %q, want \"\"", s.Root.ParentToolUseID)
+				}
+			},
+		},
+		{
+			name: "per-loop gate isolation: child gate binds child tool, parent gate binds parent tool",
+			src: func() RecordSource {
+				primary, child := mustUUID(t), mustUUID(t)
+				ec, ep := mustUUID(t), mustUUID(t)
+				return newLoopSource(base,
+					evNode(primary, event.LoopStarted{ParentToolUseID: ""}),
+					evNode(primary, event.TurnStarted{TurnIndex: 1, Message: userMsg("review + run")}),
+					childStart(child, primary, event.LoopStarted{ParentToolUseID: "sub1", Header: event.Header{AgentName: identity.AgentName("reviewer")}}),
+					evNode(child, event.TurnStarted{TurnIndex: 1, Message: userMsg("on it")}),
+					// Child gate opens, then the parent's own gate opens, BOTH before the
+					// child StepDone — a global buffer would dump both onto the child step.
+					evNode(child, event.PermissionRequested{ToolExecutionID: ec, Request: tool.BashRequest{Command: "go vet ./..."}}),
+					cmdNode(approveOnce(ec)),
+					evNode(primary, event.PermissionRequested{ToolExecutionID: ep, Request: tool.BashRequest{Command: "ls"}}),
+					cmdNode(approveOnce(ep)),
+					evNode(child, event.StepDone{Messages: content.AgenticMessages{
+						aiToolUse(&content.ToolUseBlock{ID: "ctu1", Name: "Bash", Input: json.RawMessage(`{"command":"go vet ./..."}`)}),
+						toolResult("ctu1", "ok"),
+					}}),
+					evNode(child, event.TurnDone{TurnIndex: 1}),
+					evNode(primary, event.StepDone{Messages: content.AgenticMessages{
+						aiToolUse(
+							&content.ToolUseBlock{ID: "sub1", Name: "Subagent"},
+							&content.ToolUseBlock{ID: "ptu1", Name: "Bash", Input: json.RawMessage(`{"command":"ls"}`)},
+						),
+						toolResult("sub1", "reviewed"),
+						toolResult("ptu1", "ok"),
+					}}),
+					evNode(primary, event.TurnDone{TurnIndex: 1}),
+				)
+			}(),
+			check: func(t *testing.T, s *Session, warnings []Warning) {
+				if len(warnings) != 0 {
+					t.Fatalf("unexpected warnings: %+v", warnings)
+				}
+				parentStep := onlyStep(t, s)
+				if len(parentStep.Tools) != 2 {
+					t.Fatalf("parent len(Tools) = %d, want 2", len(parentStep.Tools))
+				}
+				sub, parentBash := parentStep.Tools[0], parentStep.Tools[1]
+				if sub.Name != "Subagent" || sub.Child == nil {
+					t.Fatalf("Tools[0] = {%q, child=%v}, want Subagent with child", sub.Name, sub.Child)
+				}
+				if sub.Gate != nil {
+					t.Error("Subagent tool wrongly carries a gate")
+				}
+				// Parent gate (ep) binds to the PARENT's Bash, on the PARENT step.
+				if len(parentStep.Gates) != 1 {
+					t.Fatalf("parent len(Gates) = %d, want 1", len(parentStep.Gates))
+				}
+				if parentStep.Gates[0].ToolUseID != "ptu1" {
+					t.Errorf("parent gate bound to %q, want ptu1", parentStep.Gates[0].ToolUseID)
+				}
+				if parentBash.Gate != parentStep.Gates[0] {
+					t.Error("parent Bash tool is not bound to the parent gate")
+				}
+				// Child gate (ec) binds to the CHILD's Bash, on the CHILD step — never leaks
+				// onto the parent step.
+				childStep := onlyChildStep(t, sub.Child)
+				if len(childStep.Gates) != 1 {
+					t.Fatalf("child len(Gates) = %d, want 1", len(childStep.Gates))
+				}
+				if childStep.Gates[0].ToolUseID != "ctu1" {
+					t.Errorf("child gate bound to %q, want ctu1", childStep.Gates[0].ToolUseID)
+				}
+				if childStep.Gates[0].Decision != DecisionApproved {
+					t.Errorf("child gate Decision = %d, want DecisionApproved", childStep.Gates[0].Decision)
+				}
+				if childStep.Tools[0].Gate != childStep.Gates[0] {
+					t.Error("child Bash tool is not bound to the child gate")
+				}
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			s, warnings, err := Reconstruct(context.Background(), tt.src, noPrompts{})
+			if err != nil {
+				t.Fatalf("Reconstruct() error = %v", err)
+			}
+			tt.check(t, s, warnings)
+		})
+	}
+}
+
+// TestReconstructOrphanWarningOrder pins the deterministic order of end-of-stream
+// orphan warnings. finalize ranges a (randomized) map, so the order must come from an
+// explicit sort by StartedAt — here "orphanA" is journaled before "orphanB", so its
+// loop has the earlier StartedAt and must always warn first. Reconstructing the same
+// stream many times must yield the identical order every run (a single run could pass
+// by luck under map randomization).
+func TestReconstructOrphanWarningOrder(t *testing.T) {
+	t.Parallel()
+	base := time.Date(2026, 6, 28, 12, 0, 0, 0, time.UTC)
+
+	// newSrc builds a fresh stream that orphans two children (their parent tool-use ids
+	// never appear as a tool-use): orphanA's LoopStarted precedes orphanB's.
+	newSrc := func() RecordSource {
+		primary, c1, c2 := mustUUID(t), mustUUID(t), mustUUID(t)
+		return newLoopSource(base,
+			evNode(primary, event.LoopStarted{ParentToolUseID: ""}),
+			evNode(primary, event.TurnStarted{TurnIndex: 1, Message: userMsg("go")}),
+			childStart(c1, primary, event.LoopStarted{ParentToolUseID: "orphanA", Header: event.Header{AgentName: identity.AgentName("first")}}),
+			evNode(c1, event.TurnStarted{TurnIndex: 1, Message: userMsg("a")}),
+			evNode(c1, event.StepDone{Messages: content.AgenticMessages{aiText("a")}}),
+			evNode(c1, event.TurnDone{TurnIndex: 1}),
+			childStart(c2, primary, event.LoopStarted{ParentToolUseID: "orphanB", Header: event.Header{AgentName: identity.AgentName("second")}}),
+			evNode(c2, event.TurnStarted{TurnIndex: 1, Message: userMsg("b")}),
+			evNode(c2, event.StepDone{Messages: content.AgenticMessages{aiText("b")}}),
+			evNode(c2, event.TurnDone{TurnIndex: 1}),
+			evNode(primary, event.StepDone{Messages: content.AgenticMessages{
+				aiToolUse(&content.ToolUseBlock{ID: "sub1", Name: "Subagent"}),
+				toolResult("sub1", "done"),
+			}}),
+			evNode(primary, event.TurnDone{TurnIndex: 1}),
+		)
+	}
+
+	const runs = 50
+	for i := 0; i < runs; i++ {
+		_, warnings, err := Reconstruct(context.Background(), newSrc(), noPrompts{})
+		if err != nil {
+			t.Fatalf("run %d: Reconstruct() error = %v", i, err)
+		}
+		if len(warnings) != 2 {
+			t.Fatalf("run %d: len(warnings) = %d, want 2", i, len(warnings))
+		}
+		if !strings.Contains(warnings[0].Text, "orphanA") {
+			t.Fatalf("run %d: warnings[0] = %q, want it to mention orphanA (earlier StartedAt first)", i, warnings[0].Text)
+		}
+		if !strings.Contains(warnings[1].Text, "orphanB") {
+			t.Fatalf("run %d: warnings[1] = %q, want it to mention orphanB", i, warnings[1].Text)
+		}
+		if warnings[0].At.After(warnings[1].At) {
+			t.Fatalf("run %d: warnings not ordered by time: %v then %v", i, warnings[0].At, warnings[1].At)
+		}
 	}
 }

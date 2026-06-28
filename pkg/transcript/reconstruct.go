@@ -1,9 +1,11 @@
 package transcript
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
+	"sort"
 	"time"
 
 	"github.com/ciram-co/looprig/pkg/command"
@@ -29,6 +31,7 @@ func Reconstruct(ctx context.Context, src RecordSource, prompts SystemPromptReso
 		}
 		b.fold(rec)
 	}
+	b.finalize()
 	return b.session, b.session.Warnings, nil
 }
 
@@ -48,23 +51,37 @@ type builder struct {
 	// key that pairs a tool result (and, in a later task, a child loop) back to its
 	// call.
 	toolByUseID map[string]*ToolCall
-	// gatesByExecID indexes the open (not-yet-flushed) gates of the current step by
-	// their tool-execution id, so a resolving user command can find the gate it
-	// decides. On replay a gate and its command land BEFORE the StepDone that carries
-	// the tool, so gates cannot bind on arrival; they are buffered and flushed at
-	// StepDone (see flushGates). Cleared at each flush, so it only ever holds the
-	// current step's gates.
-	//
-	// Task 4: this single/global buffer must become per-loop (key by gate event
-	// Header.LoopID, flush at that loop's StepDone) once subagent loops interleave —
-	// otherwise a parent gate can flush onto a child's step.
+	// gatesByExecID indexes the open (not-yet-flushed) gates by their tool-execution
+	// id, so a resolving user command can find the gate it decides. On replay a gate
+	// and its command land BEFORE the StepDone that carries the tool, so gates cannot
+	// bind on arrival; they are buffered and flushed at StepDone (see flushGates). It
+	// is GLOBAL across loops because a tool-execution id is unique session-wide; each
+	// loop's flush forgets only its own flushed gates (see flushGates / forgetGates),
+	// never another loop's still-open ones.
 	gatesByExecID map[uuid.UUID]*GateAction
-	// stepGateBuf accumulates the current step's gates in arrival order; flushGates
-	// moves it onto Step.Gates and clears it at StepDone.
-	//
-	// Task 4: see gatesByExecID — this buffer must likewise become per-loop once
-	// subagent loops interleave.
-	stepGateBuf []*GateAction
+	// stepGateBuf accumulates each loop's pending gates in arrival order, keyed by the
+	// gate event's Header.LoopID; flushGates moves one loop's slice onto its Step.Gates
+	// and deletes that key at the loop's StepDone. Keying by loop is what keeps a
+	// parent-loop gate from flushing onto an interleaved child loop's step (and vice
+	// versa) once subagent loops nest.
+	stepGateBuf map[uuid.UUID][]*GateAction
+	// childByParent buffers each spawned subagent loop until the parent StepDone that
+	// carries its Subagent tool-use arrives. A child loop's entire lifecycle is
+	// journaled BEFORE that parent StepDone, so the parent ToolCall does not exist when
+	// the child LoopStarted lands; the child is buffered under {parent loop id, spawning
+	// tool-use id} and grafted onto ToolCall.Child at the matching StepDone. Keying by
+	// the parent loop id (the child's LoopStarted.Cause.LoopID) keeps tool-use ids that
+	// repeat across loops from cross-attaching.
+	childByParent map[childKey]*Loop
+}
+
+// childKey identifies a buffered child loop by its parent loop and the tool-use id
+// of the Subagent call that spawned it. The parent loop id comes from the child
+// LoopStarted's Cause.LoopID; pairing it with the tool-use id keeps a tool-use id
+// reused in different loops from colliding.
+type childKey struct {
+	parentLoopID uuid.UUID
+	toolUseID    string
 }
 
 func newBuilder(prompts SystemPromptResolver) *builder {
@@ -75,6 +92,8 @@ func newBuilder(prompts SystemPromptResolver) *builder {
 		openTurns:     make(map[uuid.UUID]*Turn),
 		toolByUseID:   make(map[string]*ToolCall),
 		gatesByExecID: make(map[uuid.UUID]*GateAction),
+		stepGateBuf:   make(map[uuid.UUID][]*GateAction),
+		childByParent: make(map[childKey]*Loop),
 	}
 }
 
@@ -124,8 +143,8 @@ func (b *builder) foldEvent(ev event.Event) {
 	case event.UserInputRequested:
 		b.onUserInputRequested(e)
 	default:
-		// Subagent nesting, non-Done outcomes, and notices land in later tasks as
-		// additional cases.
+		// Non-Done outcomes and notices land in a later task as additional cases (and
+		// turn the default into a Warning).
 	}
 }
 
@@ -166,9 +185,12 @@ func (b *builder) onSessionStarted(e event.SessionStarted) {
 	}
 }
 
-// onLoopStarted registers a new loop; the primary (no parent tool-use id) becomes
-// the session Root. Attaching a spawned loop as a child of its parent tool call is
-// a later task. SystemPrompt resolution via b.prompts is also a later task.
+// onLoopStarted registers a new loop. The primary (no parent tool-use id) becomes
+// the session Root; a spawned subagent loop is buffered under {parent loop id,
+// spawning tool-use id} for attach at the parent StepDone (the parent ToolCall does
+// not exist yet — Decision 6). Either way the loop is indexed in b.loops so its later
+// turn/step events route by Header.LoopID. SystemPrompt resolution via b.prompts is a
+// later task.
 func (b *builder) onLoopStarted(e event.LoopStarted) {
 	loop := &Loop{
 		LoopID:          e.Header.LoopID,
@@ -179,7 +201,10 @@ func (b *builder) onLoopStarted(e event.LoopStarted) {
 	b.loops[loop.LoopID] = loop
 	if e.ParentToolUseID == "" {
 		b.session.Root = loop
+		return
 	}
+	key := childKey{parentLoopID: e.Header.Cause.LoopID, toolUseID: e.ParentToolUseID}
+	b.childByParent[key] = loop
 }
 
 // onTurnStarted opens a turn on the owning loop and records its initial user
@@ -202,7 +227,8 @@ func (b *builder) onTurnStarted(e event.TurnStarted) {
 // becomes Step.AI and its ToolUseBlocks become ToolCalls, and each trailing
 // ToolResultMessage is paired to its call by tool-use id.
 func (b *builder) onStepDone(e event.StepDone) {
-	turn := b.openTurns[e.Header.LoopID]
+	loopID := e.Header.LoopID
+	turn := b.openTurns[loopID]
 	if turn == nil {
 		return // No open turn; a later task surfaces this as a Warning.
 	}
@@ -216,8 +242,23 @@ func (b *builder) onStepDone(e event.StepDone) {
 			b.pairResult(m)
 		}
 	}
-	b.flushGates(step)
+	b.attachChildren(loopID, step.Tools)
+	b.flushGates(loopID, step)
 	turn.Steps = append(turn.Steps, step)
+}
+
+// attachChildren grafts any buffered subagent loop onto the tool call that spawned
+// it: for each tool call in this loop's just-built step, a child buffered under
+// {loopID, tool-use id} becomes ToolCall.Child and is removed from the buffer. An
+// unattached child stays buffered and is reported by finalize at end-of-stream.
+func (b *builder) attachChildren(loopID uuid.UUID, tools []*ToolCall) {
+	for _, tc := range tools {
+		key := childKey{parentLoopID: loopID, toolUseID: tc.ToolUseID}
+		if child, ok := b.childByParent[key]; ok {
+			tc.Child = child
+			delete(b.childByParent, key)
+		}
+	}
 }
 
 // onTurnDone closes the loop's open turn as successfully completed.
@@ -242,7 +283,7 @@ func (b *builder) onPermissionRequested(e event.PermissionRequested) {
 		g.ToolName = e.Request.ToolName()
 		g.Description = e.Request.Description()
 	}
-	b.bufferGate(e.ToolExecutionID, g)
+	b.bufferGate(e.Header.LoopID, e.ToolExecutionID, g)
 }
 
 // onUserInputRequested buffers a pending ask-user gate for the current step,
@@ -255,14 +296,16 @@ func (b *builder) onUserInputRequested(e event.UserInputRequested) {
 		Choices:  e.Choices,
 		OpenedAt: e.Header.CreatedAt,
 	}
-	b.bufferGate(e.ToolExecutionID, g)
+	b.bufferGate(e.Header.LoopID, e.ToolExecutionID, g)
 }
 
-// bufferGate indexes a pending gate by its tool-execution id (for the resolving
-// command) and appends it to the current step's buffer (for the StepDone flush).
-func (b *builder) bufferGate(execID uuid.UUID, g *GateAction) {
+// bufferGate indexes a pending gate by its (session-unique) tool-execution id for the
+// resolving command, and appends it to the producing loop's step buffer for the
+// StepDone flush. Keying the buffer by loopID keeps an interleaved child loop's gates
+// from flushing onto the parent loop's step.
+func (b *builder) bufferGate(loopID, execID uuid.UUID, g *GateAction) {
 	b.gatesByExecID[execID] = g
-	b.stepGateBuf = append(b.stepGateBuf, g)
+	b.stepGateBuf[loopID] = append(b.stepGateBuf[loopID], g)
 }
 
 // resolveGate records a user decision on the gate the command targets and returns it
@@ -279,26 +322,74 @@ func (b *builder) resolveGate(execID uuid.UUID, d Decision, at time.Time) *GateA
 	return g
 }
 
-// flushGates moves the step's buffered gates onto step.Gates and binds each to the
-// tool call it gated. A permission gate binds to the first not-yet-bound tool whose
-// Name equals the gate's ToolName, so two same-named gated calls in one step bind
-// positionally; an ask-user gate (no ToolName) binds to the lone unbound AskUser
+// flushGates moves the given loop's buffered gates onto step.Gates and binds each to
+// the tool call it gated. A permission gate binds to the first not-yet-bound tool
+// whose Name equals the gate's ToolName, so two same-named gated calls in one step
+// bind positionally; an ask-user gate (no ToolName) binds to the lone unbound AskUser
 // call if present. Binding sets ToolCall.Gate and GateAction.ToolUseID to the same
 // pointer; an unmatched gate stays unbound on step.Gates, still renderable from its
-// own durable data. The buffer and its exec-id index are cleared after the flush.
+// own durable data. Only the named loop's buffer entry is removed and only its flushed
+// gates leave the exec-id index, so an interleaved loop's still-open gates are
+// untouched.
 //
 // (Task 5's turn-terminal-with-pending-gate edge — a buffered gate whose turn ends
 // without a StepDone — will plug in by flushing the leftover buffer at the terminal.)
-func (b *builder) flushGates(step *Step) {
-	step.Gates = b.stepGateBuf
-	for _, g := range step.Gates {
+func (b *builder) flushGates(loopID uuid.UUID, step *Step) {
+	gates := b.stepGateBuf[loopID]
+	step.Gates = gates
+	for _, g := range gates {
 		if tc := firstUnboundNamed(step.Tools, gateToolName(g)); tc != nil {
 			tc.Gate = g
 			g.ToolUseID = tc.ToolUseID
 		}
 	}
-	b.stepGateBuf = nil
-	clear(b.gatesByExecID)
+	delete(b.stepGateBuf, loopID)
+	b.forgetGates(gates)
+}
+
+// forgetGates drops the flushed gates from the global exec-id index, so a user command
+// that arrives after a gate's step has closed is detected as an anomaly rather than
+// re-deciding an already-rendered gate (and so the index does not grow without bound).
+// The index is keyed by session-unique tool-execution ids, so deleting by gate pointer
+// removes only these gates, never another loop's still-open ones.
+func (b *builder) forgetGates(gates []*GateAction) {
+	if len(gates) == 0 {
+		return
+	}
+	flushed := make(map[*GateAction]struct{}, len(gates))
+	for _, g := range gates {
+		flushed[g] = struct{}{}
+	}
+	for execID, g := range b.gatesByExecID {
+		if _, ok := flushed[g]; ok {
+			delete(b.gatesByExecID, execID)
+		}
+	}
+}
+
+// finalize runs end-of-stream reconciliation: a subagent loop still buffered means its
+// spawning Subagent tool-use never materialised (the parent StepDone never arrived, or
+// the journal was truncated mid-prompt), so it is reported as a Warning and left out of
+// the tree — a fail-secure degradation at the untrusted-record boundary, never a panic.
+//
+// The orphans are emitted in a deterministic order — by StartedAt, then by LoopID — so
+// the same journal always yields the same Warnings (they feed byte-compared HTML
+// goldens and a re-exportable audit artifact); ranging the childByParent map directly
+// would randomize the order.
+func (b *builder) finalize() {
+	orphans := make([]*Loop, 0, len(b.childByParent))
+	for key := range b.childByParent {
+		orphans = append(orphans, b.childByParent[key])
+	}
+	sort.Slice(orphans, func(i, j int) bool {
+		if !orphans[i].StartedAt.Equal(orphans[j].StartedAt) {
+			return orphans[i].StartedAt.Before(orphans[j].StartedAt)
+		}
+		return bytes.Compare(orphans[i].LoopID[:], orphans[j].LoopID[:]) < 0
+	})
+	for _, child := range orphans {
+		b.warn("subagent loop "+child.LoopID.String()+" references parent tool-use "+child.ParentToolUseID+" that never appeared", child.StartedAt)
+	}
 }
 
 // askUserToolName is the tool name an ask-user gate binds to. The AskUser tool emits
