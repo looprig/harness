@@ -4,6 +4,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"testing"
@@ -144,10 +145,22 @@ func TestJCSCanonicalizeNumbers(t *testing.T) {
 		{name: "int64 max", value: Int(9223372036854775807), want: "9223372036854775807"},
 		{name: "uint64 above int64 max", value: Uint(9223372036854775808), want: "9223372036854775808"},
 		{name: "uint64 max", value: Uint(18446744073709551615), want: "18446744073709551615"},
+		// "-0" is grammar-valid JSON; like serde_json it normalizes to "0".
+		{name: "negative zero normalizes", value: rawNumber("-0"), want: "0"},
 		{name: "fraction rejected", value: rawNumber("1.5"), wantErr: true},
 		{name: "exponent rejected", value: rawNumber("1e5"), wantErr: true},
 		{name: "leading-dot-ish rejected", value: rawNumber("0.0"), wantErr: true},
 		{name: "out of range rejected", value: rawNumber("99999999999999999999999"), wantErr: true},
+		// Strict JSON-integer grammar gate (off the parse path): strconv would
+		// silently normalize these, but a digest validator must fail closed.
+		{name: "leading plus rejected", value: rawNumber("+1"), wantErr: true},
+		{name: "leading zero rejected", value: rawNumber("01"), wantErr: true},
+		{name: "double zero rejected", value: rawNumber("00"), wantErr: true},
+		{name: "negative leading zero rejected", value: rawNumber("-01"), wantErr: true},
+		{name: "negative double zero rejected", value: rawNumber("-00"), wantErr: true},
+		{name: "empty literal rejected", value: rawNumber(""), wantErr: true},
+		{name: "lone minus rejected", value: rawNumber("-"), wantErr: true},
+		{name: "whitespace literal rejected", value: rawNumber(" 1"), wantErr: true},
 	}
 	for _, tt := range tests {
 		tt := tt
@@ -399,6 +412,174 @@ func TestJCSFloatNotAllowedError(t *testing.T) {
 			}
 			if fe.Error() == "" {
 				t.Errorf("Error() is empty")
+			}
+		})
+	}
+}
+
+// TestJCSObjectDuplicateKeys verifies IndexMap / serde_json(preserve_order)
+// duplicate-key semantics: the last value wins and the key keeps its first
+// position. This holds both for the programmatic Set API and for the ParseValue
+// path, and the canonical emit must therefore contain the key exactly once.
+func TestJCSObjectDuplicateKeys(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name     string
+		build    func() Value // produce the Value under test
+		wantKeys []string     // expected keys in INSERTION order (pre-sort)
+		wantVal  string       // canonical bytes (post UTF-16 sort)
+	}{
+		{
+			name:     "Set last value wins keeps position",
+			build:    func() Value { return NewObject().Set("a", Int(1)).Set("b", Int(2)).Set("a", Int(9)) },
+			wantKeys: []string{"a", "b"},
+			wantVal:  `{"a":9,"b":2}`,
+		},
+		{
+			name:     "parse duplicate key last wins",
+			build:    func() Value { v, _ := ParseValue([]byte(`{"a":1,"b":2,"a":9}`)); return v },
+			wantKeys: []string{"a", "b"},
+			wantVal:  `{"a":9,"b":2}`,
+		},
+		{
+			name:     "parse triple duplicate",
+			build:    func() Value { v, _ := ParseValue([]byte(`{"k":1,"k":2,"k":3}`)); return v },
+			wantKeys: []string{"k"},
+			wantVal:  `{"k":3}`,
+		},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			v := tt.build()
+			obj, ok := v.(*Object)
+			if !ok {
+				t.Fatalf("built value is %T, want *Object", v)
+			}
+			if obj.Len() != len(tt.wantKeys) {
+				t.Fatalf("Len() = %d, want %d (keys %v)", obj.Len(), len(tt.wantKeys), tt.wantKeys)
+			}
+			for i, want := range tt.wantKeys {
+				if got := obj.KeyAt(i); got != want {
+					t.Errorf("KeyAt(%d) = %q, want %q", i, got, want)
+				}
+			}
+			got, err := Canonicalize(v)
+			if err != nil {
+				t.Fatalf("Canonicalize: %v", err)
+			}
+			if string(got) != tt.wantVal {
+				t.Errorf("Canonicalize = %q, want %q", got, tt.wantVal)
+			}
+		})
+	}
+}
+
+// TestJCSInvalidUTF8 verifies the fail-closed UTF-8 guard: a String value or an
+// object key containing invalid UTF-8 must yield a typed *InvalidUTF8Error
+// rather than emit bytes that diverge from the []rune-based key sort. Valid
+// UTF-8 (including multi-byte and supplementary) must still canonicalize.
+func TestJCSInvalidUTF8(t *testing.T) {
+	t.Parallel()
+	const badUTF8 = "\xff\xfe" // a lone continuation/invalid lead — never valid UTF-8
+	tests := []struct {
+		name      string
+		value     Value
+		wantErr   bool
+		wantWhere string
+	}{
+		{name: "valid ascii string", value: String("ok")},
+		{name: "valid multibyte string", value: String("héllo")},
+		{name: "valid supplementary string", value: String("😀")},
+		{name: "invalid utf8 string value", value: String(badUTF8), wantErr: true, wantWhere: "string"},
+		{
+			name:      "invalid utf8 object key",
+			value:     NewObject().Set(badUTF8, Int(1)),
+			wantErr:   true,
+			wantWhere: "object key",
+		},
+		{
+			name:      "invalid utf8 nested in array",
+			value:     Array{String("ok"), String(badUTF8)},
+			wantErr:   true,
+			wantWhere: "string",
+		},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			_, err := Canonicalize(tt.value)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("Canonicalize() err = %v, wantErr %v", err, tt.wantErr)
+			}
+			if !tt.wantErr {
+				return
+			}
+			var ue *InvalidUTF8Error
+			if !errors.As(err, &ue) {
+				t.Fatalf("error %v (%T) is not *InvalidUTF8Error", err, err)
+			}
+			if ue.Where != tt.wantWhere {
+				t.Errorf("Where = %q, want %q", ue.Where, tt.wantWhere)
+			}
+			// Security: the error must not echo the offending raw bytes.
+			if got := ue.Error(); got == "" {
+				t.Errorf("Error() is empty")
+			}
+		})
+	}
+}
+
+// TestJCSParseErrorTyped verifies that ParseValue wraps stdlib json.Decoder
+// failures in a typed *parseError whose Unwrap chains the underlying cause, so
+// errors.As(*parseError) and errors.Is(io.EOF) both hold — a uniform typed-error
+// contract on the exported API.
+func TestJCSParseErrorTyped(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name     string
+		input    string
+		wantEOF  bool // expect the chained cause to be io.EOF / unexpected-EOF family
+		wantKind string
+	}{
+		{name: "empty input is EOF", input: "", wantEOF: true, wantKind: "parse"},
+		{name: "unterminated object", input: `{"a":1`, wantKind: "parse"},
+		{name: "garbage", input: `@@@`, wantKind: "parse"},
+		{name: "trailing data", input: `{} {}`, wantKind: "trailing"},
+		{name: "float still float error", input: `{"x":1.5}`, wantKind: "float"},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			_, err := ParseValue([]byte(tt.input))
+			if err == nil {
+				t.Fatalf("ParseValue(%q) = nil error, want error", tt.input)
+			}
+			switch tt.wantKind {
+			case "parse":
+				var pe *parseError
+				if !errors.As(err, &pe) {
+					t.Fatalf("error %v (%T) is not *parseError", err, err)
+				}
+				if errors.Unwrap(pe) == nil {
+					t.Errorf("parseError.Unwrap() = nil, want a chained cause")
+				}
+			case "trailing":
+				var te *trailingDataError
+				if !errors.As(err, &te) {
+					t.Fatalf("error %v (%T) is not *trailingDataError", err, err)
+				}
+			case "float":
+				var fe *FloatNotAllowedError
+				if !errors.As(err, &fe) {
+					t.Fatalf("error %v (%T) is not *FloatNotAllowedError", err, err)
+				}
+			}
+			if tt.wantEOF && !errors.Is(err, io.EOF) {
+				t.Errorf("errors.Is(err, io.EOF) = false, want true (err=%v)", err)
 			}
 		})
 	}

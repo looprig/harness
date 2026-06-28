@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"unicode/utf16"
+	"unicode/utf8"
 )
 
 // This file implements the constrained JCS (canonical-JSON) profile used by the
@@ -88,10 +89,20 @@ func (*Object) isValue() {}
 // NewObject returns an empty Object ready for ordered Set calls.
 func NewObject() *Object { return &Object{} }
 
-// Set appends a (key, value) pair, preserving insertion order, and returns the
-// Object so calls can chain. It does NOT de-duplicate or reorder; the canonical
-// emitter is responsible for ordering.
+// Set inserts or updates a (key, value) pair and returns the Object so calls can
+// chain. It follows IndexMap / serde_json(preserve_order) semantics: a new key is
+// appended (preserving insertion order); an existing key keeps its original
+// position and has its value overwritten (last value wins). This guarantees an
+// Object never holds duplicate keys, so the emitter can never produce invalid
+// JSON — the same parity serde_json yields on the deserialize path. The canonical
+// emitter is still responsible for the UTF-16 key SORT; Set only dedups.
 func (o *Object) Set(key string, val Value) *Object {
+	for i := range o.members {
+		if o.members[i].key == key {
+			o.members[i].val = val
+			return o
+		}
+	}
 	o.members = append(o.members, objMember{key: key, val: val})
 	return o
 }
@@ -106,20 +117,27 @@ func (o *Object) KeyAt(i int) string { return o.members[i].key }
 // ValueAt returns the value of the i-th member in insertion order.
 func (o *Object) ValueAt(i int) Value { return o.members[i].val }
 
-// FloatNotAllowedError reports a JSON number that is not a valid integer under
-// the constrained JCS profile: a fraction, an exponent, or a value outside the
-// i64 ∪ u64 range. It carries the offending decimal literal so callers can
-// inspect the cause; it is the Go analogue of the Rust CanonicalError variant
-// FloatNotAllowed. It is an internal canonicalization failure, distinct from the
-// protocol-level *llm.AttestationError reasons.
+// FloatNotAllowedError reports a JSON number that is not an acceptable integer
+// under the constrained JCS profile: a fraction, an exponent, a value outside
+// the i64 ∪ u64 range, OR a literal that is not in canonical JSON-integer form
+// (a leading '+' or a leading zero such as "01"). It carries the offending decimal
+// literal so callers can inspect the cause; it is the Go analogue of the Rust
+// CanonicalError variant FloatNotAllowed. It is an internal canonicalization
+// failure, distinct from the protocol-level *llm.AttestationError reasons.
+//
+// The grammar gate matters off the JSON-parse path: serde_json (and Go's
+// json.Decoder) only ever produce grammar-valid number literals, so on the parse
+// path the looser cases never occur. But a programmatically-constructed
+// Number("+1") / Number("01") must fail closed rather than be silently
+// normalized — a digest validator must reject anything it would not have emitted.
 type FloatNotAllowedError struct {
-	// Literal is the offending JSON number literal (e.g. "1.5", "1e5"). It is a
-	// numeric token only and carries no secret material.
+	// Literal is the offending JSON number literal (e.g. "1.5", "1e5", "+1",
+	// "01"). It is a numeric token only and carries no secret material.
 	Literal string
 }
 
 func (e *FloatNotAllowedError) Error() string {
-	return "aci/jcs: number " + e.Literal + " is not an integer (floats are not allowed)"
+	return "aci/jcs: number " + e.Literal + " is not an acceptable integer literal"
 }
 
 // nilValueError reports a nil Value handed to the emitter — a programming bug,
@@ -129,13 +147,44 @@ type nilValueError struct{}
 
 func (e *nilValueError) Error() string { return "aci/jcs: nil Value" }
 
+// InvalidUTF8Error reports a String value or object key that is not valid UTF-8.
+// The emitter writes string bytes verbatim while the key sort decodes them via
+// []rune (which folds invalid sequences to U+FFFD); those two views diverge on
+// malformed input, so a digest validator must reject it rather than risk an
+// order/encoding mismatch. On the JSON-parse path this never occurs (json
+// guarantees valid UTF-8), but Task 1.3 builds String values programmatically.
+//
+// It deliberately does NOT echo the offending bytes (they may be arbitrary,
+// possibly secret-adjacent payload); it reports only where the fault was found.
+type InvalidUTF8Error struct {
+	// Where names the location of the fault: "string" for a String value or
+	// "object key" for a member key. It is a fixed label, never external data.
+	Where string
+}
+
+func (e *InvalidUTF8Error) Error() string { return "aci/jcs: invalid UTF-8 in " + e.Where }
+
 // integerLiteral validates a JSON number literal under the integer-only rule and
-// returns its canonical decimal form. It accepts an i64 first, then a u64 (so
-// the full 0..2^64-1 range is valid), matching the Rust as_i64/as_u64 fallback;
-// any fractional, exponential, or out-of-range literal returns a
-// *FloatNotAllowedError.
+// returns its canonical decimal form. It first enforces the strict JSON-integer
+// grammar (-?(0|[1-9][0-9]*): no leading '+', no leading zeros), then accepts an
+// i64, then a u64 (so the full 0..2^64-1 range is valid), matching the Rust
+// as_i64/as_u64 fallback. Any fractional, exponential, malformed, or
+// out-of-range literal returns a *FloatNotAllowedError. "-0" is grammar-valid
+// and normalizes to "0" (as serde_json does).
+//
+// The grammar pre-gate is load-bearing because strconv.ParseInt/ParseUint are
+// looser than JSON: they silently accept and normalize "+1"→"1", "01"→"1". On
+// the JSON-parse path json.Decoder already rejects those, but a
+// programmatically-built Number("+1") would be normalized instead of rejected —
+// the wrong posture for a digest validator and looser than serde_json::Number.
+// "-0" is the one case the gate intentionally lets through, because serde_json
+// accepts it and emits "0"; rejecting it would diverge from the reference on
+// valid JSON input.
 func integerLiteral(num json.Number) (string, *FloatNotAllowedError) {
 	s := string(num)
+	if !isStrictJSONInteger(s) {
+		return "", &FloatNotAllowedError{Literal: s}
+	}
 	if i, err := strconv.ParseInt(s, 10, 64); err == nil {
 		return strconv.FormatInt(i, 10), nil
 	}
@@ -143,6 +192,42 @@ func integerLiteral(num json.Number) (string, *FloatNotAllowedError) {
 		return strconv.FormatUint(u, 10), nil
 	}
 	return "", &FloatNotAllowedError{Literal: s}
+}
+
+// isStrictJSONInteger reports whether s matches the JSON number integer grammar
+// -?(0|[1-9][0-9]*): an optional single leading '-', then either a single '0' or
+// a non-zero digit followed by more digits. It rejects '+' signs, leading zeros
+// ("01", "00", "-01"), empty/lone-"-" input, and any non-digit byte (so
+// fractions/exponents fail here too).
+//
+// "-0" IS accepted: it is grammar-valid JSON, and the Rust reference
+// (serde_json::Number::as_i64) parses it to the integer 0 and emits "0". The
+// subsequent ParseInt normalizes "-0"→"0", matching that. The gate's purpose is
+// to reject literals that are NOT canonical JSON integers — exactly the forms
+// strconv would otherwise silently normalize ("+1", "01") — without diverging
+// from Rust on any literal a real serde_json::Number could hold.
+func isStrictJSONInteger(s string) bool {
+	if s == "" {
+		return false
+	}
+	if s[0] == '-' {
+		s = s[1:]
+		if s == "" { // a lone "-"
+			return false
+		}
+	}
+	if s == "0" {
+		return true // a single '0' (or "-0") is the only zero form allowed
+	}
+	if s[0] == '0' { // leading zero (covers "00", "01", "-00", "-01", ...)
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // Canonicalize emits the constrained-JCS canonical UTF-8 encoding of v. Object
@@ -171,8 +256,7 @@ func emit(b *strings.Builder, v Value) error {
 		}
 		return nil
 	case String:
-		emitString(b, string(t))
-		return nil
+		return emitString(b, string(t), "string")
 	case Int:
 		b.WriteString(strconv.FormatInt(int64(t), 10))
 		return nil
@@ -217,7 +301,16 @@ func emitArray(b *strings.Builder, a Array) error {
 // emitObject writes {"k0":v0,"k1":v1,…} with keys sorted by UTF-16 code units
 // and no whitespace. Sorting is done on a copy of the member slice so the
 // Object's insertion order is left untouched (the type stays order-preserving).
+//
+// Keys are validated as UTF-8 BEFORE sorting: lessUTF16 decodes via []rune
+// (folding invalid bytes to U+FFFD), so an invalid key must fail closed up front
+// rather than be silently reordered to a U+FFFD-based position.
 func emitObject(b *strings.Builder, o *Object) error {
+	for _, m := range o.members {
+		if !utf8.ValidString(m.key) {
+			return &InvalidUTF8Error{Where: "object key"}
+		}
+	}
 	sorted := make([]objMember, len(o.members))
 	copy(sorted, o.members)
 	sort.SliceStable(sorted, func(i, j int) bool {
@@ -228,7 +321,9 @@ func emitObject(b *strings.Builder, o *Object) error {
 		if i > 0 {
 			b.WriteByte(',')
 		}
-		emitString(b, m.key)
+		if err := emitString(b, m.key, "object key"); err != nil {
+			return err
+		}
 		b.WriteByte(':')
 		if err := emit(b, m.val); err != nil {
 			return err
@@ -264,7 +359,14 @@ const hexDigits = "0123456789abcdef"
 // backslash-escaped; the short C escapes \b \t \n \f \r are used where defined;
 // every other code point below 0x20 becomes a lowercase \u00xx; all other bytes
 // (including the multi-byte UTF-8 of non-ASCII characters) are written raw.
-func emitString(b *strings.Builder, s string) {
+//
+// where labels the call site ("string" or "object key") for the
+// *InvalidUTF8Error returned when s is not valid UTF-8 — a fail-closed guard so
+// the raw-byte emit can never diverge from the []rune-based key sort.
+func emitString(b *strings.Builder, s, where string) error {
+	if !utf8.ValidString(s) {
+		return &InvalidUTF8Error{Where: where}
+	}
 	b.WriteByte('"')
 	// Iterate by byte: every byte >= 0x20 except " and \ is passed through
 	// verbatim, which preserves valid UTF-8 sequences for non-ASCII runes
@@ -295,6 +397,7 @@ func emitString(b *strings.Builder, s string) {
 		}
 	}
 	b.WriteByte('"')
+	return nil
 }
 
 // Sha256Raw returns the raw SHA-256 digest of the canonical encoding of v.
@@ -316,10 +419,44 @@ func Sha256Hex(v Value) (string, error) {
 	return "sha256:" + hex.EncodeToString(sum[:]), nil
 }
 
+// parseError wraps a stdlib json.Decoder failure (malformed JSON, unexpected
+// EOF, …) in a typed error so the exported ParseValue contract is uniformly
+// typed per CLAUDE.md, while still chaining the underlying cause via Unwrap (so
+// errors.Is(err, io.EOF) and errors.As to *json.SyntaxError keep working).
+type parseError struct {
+	cause error
+}
+
+func (e *parseError) Error() string { return "aci/jcs: parse: " + e.cause.Error() }
+func (e *parseError) Unwrap() error { return e.cause }
+
+// trailingDataError reports extra tokens after a complete JSON value (e.g.
+// "{} {}"). It is a typed parse failure carrying no payload because the only
+// fact is "there was more".
+type trailingDataError struct{}
+
+func (e *trailingDataError) Error() string {
+	return "aci/jcs: trailing data after JSON value"
+}
+
+// malformedTokenError reports a json.Token that violates the decoder's own
+// contract — a bare close-delimiter where a value was expected, a non-string
+// object key, or (with UseNumber) a float64. These are UNREACHABLE on real input
+// because json.Decoder rejects such structures before yielding the token; they
+// exist purely as fail-closed guards so a future decoder change cannot silently
+// produce a wrong Value.
+type malformedTokenError struct{}
+
+func (e *malformedTokenError) Error() string {
+	return "aci/jcs: malformed JSON token"
+}
+
 // ParseValue decodes JSON bytes into the ordered Value union. Objects keep
 // insertion order (Go maps would lose it), numbers are validated against the
 // integer rule on the way in, and the only any in the package lives here at the
-// json.Token boundary, immediately narrowed to a concrete Value.
+// json.Token boundary, immediately narrowed to a concrete Value. All stdlib
+// decoder failures are wrapped in *parseError (Unwrap-able); the integer rule
+// yields *FloatNotAllowedError; surplus tokens yield *trailingDataError.
 func ParseValue(data []byte) (Value, error) {
 	dec := json.NewDecoder(strings.NewReader(string(data)))
 	dec.UseNumber()
@@ -333,18 +470,9 @@ func ParseValue(data []byte) (Value, error) {
 		if err == nil {
 			return nil, &trailingDataError{}
 		}
-		return nil, err
+		return nil, &parseError{cause: err}
 	}
 	return v, nil
-}
-
-// trailingDataError reports extra tokens after a complete JSON value. It is a
-// typed parse failure (per the no-bare-error rule) distinct from the float
-// rule; it carries no payload because the only fact is "there was more".
-type trailingDataError struct{}
-
-func (e *trailingDataError) Error() string {
-	return "aci/jcs: trailing data after JSON value"
 }
 
 // parseValue reads exactly one JSON value from dec. The first Token() drives the
@@ -352,7 +480,7 @@ func (e *trailingDataError) Error() string {
 func parseValue(dec *json.Decoder) (Value, error) {
 	tok, err := dec.Token()
 	if err != nil {
-		return nil, err
+		return nil, &parseError{cause: err}
 	}
 	return parseToken(dec, tok)
 }
@@ -368,8 +496,9 @@ func parseToken(dec *json.Decoder, tok json.Token) (Value, error) {
 		case '[':
 			return parseArray(dec)
 		default:
-			// A bare '}' or ']' here means malformed input.
-			return nil, &trailingDataError{}
+			// Unreachable: json.Decoder never yields a bare '}' or ']' as the
+			// start of a value. Fail-closed guard.
+			return nil, &malformedTokenError{}
 		}
 	case string:
 		return String(t), nil
@@ -383,24 +512,26 @@ func parseToken(dec *json.Decoder, tok json.Token) (Value, error) {
 	case nil:
 		return Null{}, nil
 	default:
-		// json with UseNumber never yields float64; any other type is a
-		// decoder contract violation.
-		return nil, &trailingDataError{}
+		// Unreachable: with UseNumber the decoder never yields float64, and the
+		// cases above are exhaustive over json.Token. Fail-closed guard.
+		return nil, &malformedTokenError{}
 	}
 }
 
 // parseObject reads members until the closing '}', preserving insertion order.
-// The opening '{' has already been consumed by the caller.
+// The opening '{' has already been consumed by the caller. Duplicate keys follow
+// IndexMap semantics via Object.Set (last value wins, first position kept).
 func parseObject(dec *json.Decoder) (Value, error) {
 	obj := NewObject()
 	for dec.More() {
 		keyTok, err := dec.Token()
 		if err != nil {
-			return nil, err
+			return nil, &parseError{cause: err}
 		}
 		key, ok := keyTok.(string)
 		if !ok {
-			return nil, &trailingDataError{}
+			// Unreachable: json.Decoder always yields a string key here.
+			return nil, &malformedTokenError{}
 		}
 		val, err := parseValue(dec)
 		if err != nil {
@@ -410,7 +541,7 @@ func parseObject(dec *json.Decoder) (Value, error) {
 	}
 	// Consume the closing '}'.
 	if _, err := dec.Token(); err != nil {
-		return nil, err
+		return nil, &parseError{cause: err}
 	}
 	return obj, nil
 }
@@ -428,7 +559,7 @@ func parseArray(dec *json.Decoder) (Value, error) {
 	}
 	// Consume the closing ']'.
 	if _, err := dec.Token(); err != nil {
-		return nil, err
+		return nil, &parseError{cause: err}
 	}
 	return arr, nil
 }
