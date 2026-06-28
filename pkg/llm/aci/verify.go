@@ -3,6 +3,8 @@ package aci
 import (
 	"bytes"
 	"encoding/hex"
+	"strconv"
+	"time"
 
 	"github.com/ciram-co/looprig/pkg/llm/tee"
 )
@@ -153,3 +155,201 @@ func (e *reportDataPlacementError) Error() string {
 // compile-time assertion: the live verifier satisfies the seam type exactly, so
 // no adapter is needed and Task 2.8 can pass defaultQuoteVerifier directly.
 var _ quoteVerifier = tee.VerifyTDXQuoteWithOptions
+
+// =============================================================================
+// Task 2.8: VerifyReport — the assembled attestation chain (steps 1–9)
+// =============================================================================
+//
+// verifyReport runs the full Dstack ACI ("aci/1") report verification — the
+// ordered chain from the design's §Attestation steps 1–9 — and returns the FIRST
+// failing step's typed *llm.AttestationError, or a *VerifiedReport on success.
+// The order is load-bearing: a report that fails an early structural check is
+// rejected with that step's reason BEFORE any later (potentially more expensive or
+// more permissive) check runs, so the earliest failure always wins.
+//
+// The chain wires the prior Phase-2 functions in this exact order:
+//
+//	1. api_version          ParseReport            -> unsupported_api_version / parse error
+//	2. identity digests     verifyIdentityDigests  -> keyset_digest_mismatch
+//	3. report_data binding  verifyReportDataBinding-> report_data_mismatch
+//	4. TDX quote            verifyQuote (seam)     -> quote_invalid
+//	5. RTMR3 + app-id +     verifyEventLogAndAppID -> quote_invalid
+//	   provenance           checkAppIDPolicy       -> policy_rejected
+//	                        checkProvenancePolicy  -> policy_rejected
+//	6. keyset endorsement   verifyKeysetEndorsement-> endorsement_invalid
+//	7. KMS custody          verifyKMSCustody       -> kms_root_untrusted
+//	8. freshness            (this file)            -> stale_report
+//	9. workload_id policy   (this file)            -> policy_rejected
+//
+// The quoteVerifier is an INJECTED SEAM (step 4): offline tests pass a fake that
+// returns the fixture's real quote_report_data so the whole chain runs without
+// network I/O; the public VerifyReport passes defaultQuoteVerifier (the live DCAP
+// verifier), which fails offline because it needs Intel collateral.
+
+// VerifiedReport is the validated output of a passing attestation chain: the
+// workload identity (workload_id + keyset digest) and the FULL validated keyset.
+// Phase 3 (E2EE sealing) reads Keyset.E2EEPublicKeys; Phase 4 (receipt
+// verification) reads Keyset.ReceiptSigningKeys; both get their key ids, algos,
+// and public keys from the embedded Keyset, which is the exact value whose digest
+// was recomputed and matched in step 2 (so the keys are the attested ones, not
+// merely claimed). Returned only on a fully successful chain; nil on any failure.
+type VerifiedReport struct {
+	// WorkloadID is the validated workload_id ("sha256:<hex>"), recomputed and
+	// matched in step 2.
+	WorkloadID string
+	// WorkloadKeysetDigest is the validated workload_keyset_digest
+	// ("sha256:<hex>"), recomputed and matched in step 2.
+	WorkloadKeysetDigest string
+	// Keyset is the full validated keyset: identity, epoch, and the
+	// receipt-signing / E2EE / TLS key lists Phase 3/4/5 consume. It is the value
+	// whose digest step 2 verified, so its keys are attestation-backed.
+	Keyset Keyset
+}
+
+// verifyReport is the chain workhorse: it runs attestation steps 1–9 in order
+// against reportJSON, using nonce for the report_data binding (step 3/4), now for
+// freshness (step 8), policy for the allow-list checks (steps 5/7/9), and verifyFn
+// as the injected quote-verifier seam (step 4). It returns the FIRST failing
+// step's typed *llm.AttestationError (or ParseReport's typed parse error for
+// malformed JSON), so the earliest failure wins; on full success it returns the
+// populated *VerifiedReport. It is unexported so offline tests can inject a fake
+// seam; the public VerifyReport wires the live verifier.
+func verifyReport(reportJSON []byte, nonce *string, now time.Time, policy Policy, verifyFn quoteVerifier) (*VerifiedReport, error) {
+	// Step 1: api_version (and JSON well-formedness).
+	rep, err := ParseReport(reportJSON)
+	if err != nil {
+		return nil, err
+	}
+
+	// Step 2: recomputed identity / keyset digests match the claimed values.
+	if err := verifyIdentityDigests(rep); err != nil {
+		return nil, err
+	}
+
+	// Step 3: report_data binds the recomputed statement under this nonce.
+	if err := verifyReportDataBinding(rep, nonce); err != nil {
+		return nil, err
+	}
+
+	// Step 4: the TDX quote verifies and binds binding(32) ‖ zeros(32).
+	if err := verifyQuote(rep, nonce, verifyFn); err != nil {
+		return nil, err
+	}
+
+	// Step 5: event-log replay matches the quote's RTMR3, yielding the app-id;
+	// then the app-id and source provenance must pass policy.
+	appID, err := verifyEventLogAndAppID(rep)
+	if err != nil {
+		return nil, err
+	}
+	if err := checkAppIDPolicy(appID, policy.AcceptedAppIDs); err != nil {
+		return nil, err
+	}
+	if err := checkProvenancePolicy(rep.Attestation.SourceProvenance, policy.AcceptedSourceProvenance); err != nil {
+		return nil, err
+	}
+
+	// Step 6: the keyset endorsement is a valid signature by the identity key.
+	if err := verifyKeysetEndorsement(rep); err != nil {
+		return nil, err
+	}
+
+	// Step 7: the identity key's custody chain recovers a trusted KMS root.
+	if err := verifyKMSCustody(rep, appID, policy.AcceptedKMSRootPubKeys); err != nil {
+		return nil, err
+	}
+
+	// Step 8: the report is within its freshness window.
+	if err := verifyFreshness(rep.Attestation.Freshness, now); err != nil {
+		return nil, err
+	}
+
+	// Step 9: workload_id is allow-listed WHEN CONFIGURED (empty set skips).
+	if err := checkWorkloadIDPolicy(rep.WorkloadID, policy.AcceptedWorkloadIDs); err != nil {
+		return nil, err
+	}
+
+	return &VerifiedReport{
+		WorkloadID:           rep.WorkloadID,
+		WorkloadKeysetDigest: rep.WorkloadKeysetDigest,
+		Keyset:               rep.Attestation.Keyset,
+	}, nil
+}
+
+// VerifyReport runs the full Dstack ACI attestation chain (steps 1–9) against
+// reportJSON with the LIVE DCAP quote verifier and returns the validated
+// *VerifiedReport, or the first failing step's typed *llm.AttestationError. nonce
+// is the report_data binding nonce (nil if none was sent), now is the wall clock
+// for the freshness check, and policy is the acceptance allow-list (use
+// DefaultPhalaPolicy for the pinned preset). It delegates to verifyReport with
+// defaultQuoteVerifier, so step 4 fetches Intel collateral over the bounded
+// HTTPS-only getter — meaning this entry point requires network access and cannot
+// run fully offline (offline tests use the unexported verifyReport with a fake
+// seam).
+func VerifyReport(reportJSON []byte, nonce *string, now time.Time, policy Policy) (*VerifiedReport, error) {
+	return verifyReport(reportJSON, nonce, now, policy, defaultQuoteVerifier)
+}
+
+// verifyFreshness is attestation step 8: the report is fresh iff its freshness
+// window contains now, as the HALF-OPEN interval [fetched_at, stale_after) in Unix
+// seconds — fetched_at inclusive, stale_after EXCLUSIVE. So now == fetched_at is
+// fresh, now == stale_after is stale, and the last fresh second is stale_after-1.
+// It fails closed with reason stale_report (typed *freshnessError cause) on any
+// now outside the window; the values are wall-clock seconds, never secrets.
+func verifyFreshness(f Freshness, now time.Time) error {
+	nowUnix := now.Unix()
+	if nowUnix < f.FetchedAt || nowUnix >= f.StaleAfter {
+		return attestErr(reasonStaleReport, &freshnessError{
+			now:        nowUnix,
+			fetchedAt:  f.FetchedAt,
+			staleAfter: f.StaleAfter,
+		})
+	}
+	return nil
+}
+
+// checkWorkloadIDPolicy is attestation step 9: it enforces the workload_id
+// allow-list WHEN CONFIGURED — if accepted is non-empty, the report's workload_id
+// must be a member, else policy_rejected. An empty or nil accepted set skips the
+// check (returns nil), because the workload_id rotates with the keyset epoch and
+// trust is anchored by the stable app-id + provenance + KMS-root checks. The key
+// is the workload_id string ("sha256:<hex>"); Policy.AcceptedWorkloadIDs uses that
+// same form.
+func checkWorkloadIDPolicy(workloadID string, accepted map[string]struct{}) error {
+	if len(accepted) == 0 {
+		return nil
+	}
+	if _, ok := accepted[workloadID]; !ok {
+		return attestErr(reasonPolicyRejected, &workloadIDRejectedError{workloadID: workloadID})
+	}
+	return nil
+}
+
+// freshnessError is the typed cause wrapped inside the stale_report
+// *llm.AttestationError. It carries now, fetched_at, and stale_after (all Unix
+// seconds) so the cause keeps type identity (per CLAUDE.md: no bare fmt.Errorf
+// from package APIs) and callers can errors.As to inspect the window. The values
+// are wall-clock timestamps, never key material or secrets.
+type freshnessError struct {
+	now        int64
+	fetchedAt  int64
+	staleAfter int64
+}
+
+func (e *freshnessError) Error() string {
+	return "aci/verify: report not fresh: now " + strconv.FormatInt(e.now, 10) +
+		" outside [" + strconv.FormatInt(e.fetchedAt, 10) +
+		", " + strconv.FormatInt(e.staleAfter, 10) + ")"
+}
+
+// workloadIDRejectedError is the typed cause wrapped inside the policy_rejected
+// *llm.AttestationError when a configured AcceptedWorkloadIDs set does not contain
+// the report's workload_id. workloadID is the public "sha256:<hex>" digest string,
+// not key material, so logging it leaks no secret.
+type workloadIDRejectedError struct {
+	workloadID string
+}
+
+func (e *workloadIDRejectedError) Error() string {
+	return "aci/verify: workload_id " + e.workloadID + " not in accepted set"
+}
