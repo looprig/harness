@@ -427,6 +427,7 @@ func (m Screen) View() tea.View {
 		Status:      m.status,
 		StatusState: m.statusInputs(),
 		Blink:       m.anim.blink,
+		Phase:       m.anim.frame,
 		Tip:         m.tip,
 		Width:       m.width,
 		Height:      m.height,

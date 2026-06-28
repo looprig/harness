@@ -12,7 +12,7 @@ import (
 // separator rule, the bottom box, an optional slash panel, and one status line.
 const (
 	statusH    = 1 // the single status line
-	statusPadH = 1 // a blank line between the bottom box and the status line
+	statusPadH = 1 // one blank pad line; the status row carries one above and one below it
 	tipH       = 1 // the rotating Tips line at the very bottom, below the status line
 	boxBorderH = 2 // the bottom box's top + bottom frame rows (a prompt box's border; the minimal composer has none, so this over-reserves harmlessly in compose mode)
 )
@@ -58,13 +58,15 @@ type surfaceInputs struct {
 	Status        Status
 	StatusState   statusInputs
 	Blink         bool   // live-surface blink phase, pulses the status dot while waiting/thinking
+	Phase         uint   // live animation frame; flows the status-label gradient while a turn runs (0 at rest)
 	Tip           string // the rotating hint shown faint on the Tips line at the very bottom
 	Width, Height int
 }
 
-// surfaceView composes the active surface top to bottom: the capped live tail, the
-// bottom box (composer, prompt control, or answer field by interaction mode), the
-// slash-completion panel when visible, and one status line. The composer is a
+// surfaceView composes the active surface top to bottom: the capped live tail, one
+// status line set off by a blank pad row above and below it, the bottom box (composer,
+// prompt control, or answer field by interaction mode), and the slash-completion panel
+// when visible. The composer is a
 // borderless, ▌-edged dark-gray panel — there is no separator rule above it (a
 // full-width rule was the most visible artifact stranded into scrollback on a resize
 // desync; see styles.BoxStyle). It allocates no transcript viewport. Empty regions are omitted so
@@ -89,7 +91,7 @@ type surfaceInputs struct {
 func surfaceView(in surfaceInputs) string {
 	bottom := bottomBox(in)
 	slash := slashPanel(in.Interaction)
-	status := renderStatusLine(in.Status, in.StatusState, in.Blink)
+	status := renderStatusLine(in.Status, in.StatusState, in.Blink, in.Phase)
 	tip := renderTip(in.Tip)
 
 	contentH := bottomContentHeight(in)
@@ -99,9 +101,11 @@ func surfaceView(in surfaceInputs) string {
 	// the logical line count equal to the physical row count the v2 inline renderer
 	// requires (see clampSurfaceWidth).
 	reserved := lipgloss.Height(slash) + queuedHeight(in.Queued)
-	// statusPadH (the blank above the status row) and tipH (the Tips line below it) are
-	// reserved alongside statusH so the tail budget accounts for the whole bottom chrome.
-	capacity := liveTailCap(in.Height, statusH+statusPadH+tipH, reserved, contentH)
+	// The status row carries a blank pad above and below it (2*statusPadH) and tipH (the
+	// Tips line at the very bottom) are reserved alongside statusH so the tail budget
+	// accounts for the whole bottom chrome. During a live turn the tail's own trailing
+	// blank doubles as the status's pad-above, so this slightly over-reserves — harmless.
+	capacity := liveTailCap(in.Height, statusH+2*statusPadH+tipH, reserved, contentH)
 
 	// The live tail carries a trailing blank line, mirroring the one
 	// scrollbackModel.Flush appends after every committed entry — so the gap below the
@@ -113,21 +117,26 @@ func surfaceView(in surfaceInputs) string {
 		tail = cappedTail(in.LiveTail, capacity-1)
 	}
 
-	rows := make([]string, 0, 6)
+	rows := make([]string, 0, 7)
 	if tail != "" {
 		rows = append(rows, tail, "") // tail + trailing blank (matches a committed entry's spacing)
 	}
 	rows = appendNonEmpty(rows, in.Queued)
+	// The status row sits ABOVE the bottom box, set off by a blank pad line above and
+	// below (statusPadH each). The row is always present (statusLabel never returns ""):
+	// it reads "○ idle" at rest and the live label during a turn, so the composer's
+	// vertical position is stable across the turn (every row is budgeted). The pad-above
+	// is skipped when the preceding row is already blank — the live tail's trailing blank
+	// doubles as it — so the gap above the status never grows to two rows.
+	if status != "" {
+		if len(rows) == 0 || rows[len(rows)-1] != "" {
+			rows = append(rows, "") // pad above
+		}
+		rows = append(rows, status, "") // status + pad below
+	}
 	rows = appendNonEmpty(rows, bottom)
 	rows = appendNonEmpty(rows, slash)
-	// A blank line of padding (statusPadH) separates the bottom box from the status
-	// row, which is always present (statusLabel never returns ""): it reads "○ idle" at
-	// rest and the live label during a turn. Keeping the row whatever the state holds
-	// the composer's vertical position stable across the turn (both rows are budgeted).
-	// The rotating Tips line (tipH), when present, sits on the very bottom below it.
-	if status != "" {
-		rows = append(rows, "", status)
-	}
+	// The rotating Tips line (tipH), when present, sits on the very bottom.
 	rows = appendNonEmpty(rows, tip)
 	// Width MUST be clamped before height: clampSurfaceWidth truncates (never wraps), so
 	// every logical line is exactly one physical row before clampSurfaceHeight counts
@@ -162,8 +171,9 @@ func surfaceView(in surfaceInputs) string {
 //
 // It drops from the TOP (keeping the bottom-most height-1 lines) to MATCH the renderer's
 // own over-tall-frame handling (cursed_renderer.go keeps the bottom s.height lines when
-// frameHeight > s.height) AND to preserve the most important chrome: the bottom box,
-// status, and tip stay visible longest. In the common case it sheds the live tail's
+// frameHeight > s.height) AND to preserve the most important chrome: the bottom box, slash
+// panel, and tip stay visible longest (the status now sits just above the box, so it sheds
+// before the box does). In the common case it sheds the live tail's
 // oldest rows first (already committed to scrollback, so nothing is lost). When the
 // terminal is small enough that even the chrome overflows, chrome rows are shed from the
 // top too — unavoidable at that size, and consistent with the renderer's own over-tall

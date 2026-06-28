@@ -82,8 +82,8 @@ func TestLiveTailCapReservesCommitHeadroom(t *testing.T) {
 }
 
 // TestSurfaceViewCompose covers the composed active surface in compose mode: the
-// capped live tail, then the borderless composer panel (no separator rule), then the
-// status line — top to bottom, no transcript viewport.
+// capped live tail, then the status line, then the borderless composer panel (no
+// separator rule) below it — top to bottom, no transcript viewport.
 func TestSurfaceViewCompose(t *testing.T) {
 	t.Parallel()
 
@@ -109,13 +109,13 @@ func TestSurfaceViewCompose(t *testing.T) {
 	if strings.Contains(got, strings.Repeat("─", 10)) {
 		t.Errorf("surfaceView should emit no separator rule now, got:\n%s", got)
 	}
-	// Order: live tail on top, the composer (its placeholder) in the middle, the status
-	// line at the very bottom — composer sits directly below the tail, no separator.
+	// Order: live tail on top, then the status line, then the composer (its placeholder)
+	// below it — the status sits ABOVE the box, padded by a blank row above and below.
 	tailIdx := strings.Index(got, "live narration")
-	composerIdx := strings.Index(got, "Type a message…")
-	statusIdx := strings.LastIndex(got, "streaming…")
-	if !(tailIdx < composerIdx && composerIdx < statusIdx) {
-		t.Errorf("surfaceView order wrong: tail=%d composer=%d status=%d\n%s", tailIdx, composerIdx, statusIdx, got)
+	statusIdx := strings.Index(got, "streaming…")
+	composerIdx := strings.LastIndex(got, "Type a message…")
+	if !(tailIdx < statusIdx && statusIdx < composerIdx) {
+		t.Errorf("surfaceView order wrong: tail=%d status=%d composer=%d\n%s", tailIdx, statusIdx, composerIdx, got)
 	}
 }
 

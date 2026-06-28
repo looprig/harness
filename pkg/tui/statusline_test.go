@@ -61,8 +61,10 @@ func TestRenderStatusLine(t *testing.T) {
 			if got == "" {
 				t.Errorf("RenderStatusLine(%v) = empty, want non-empty", tt.status)
 			}
-			if !strings.Contains(got, tt.wantSubstr) {
-				t.Errorf("RenderStatusLine(%v) = %q, want substring %q", tt.status, got, tt.wantSubstr)
+			// The label is gradient-colored per glyph, so strip the per-character SGR
+			// runs before matching the contiguous word.
+			if plain := stripANSI(got); !strings.Contains(plain, tt.wantSubstr) {
+				t.Errorf("RenderStatusLine(%v) = %q, want substring %q", tt.status, plain, tt.wantSubstr)
 			}
 		})
 	}

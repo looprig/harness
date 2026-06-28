@@ -63,7 +63,7 @@ func statusLabel(status Status, in statusInputs) string {
 // — refines it via renderStatusLine. The empty label renders to "", every other
 // label through the faint StatusStyle. Retained for callers holding only the status.
 func RenderStatusLine(s Status) string {
-	return renderStatusLine(s, statusInputs{thinking: s == StatusRunning}, false)
+	return renderStatusLine(s, statusInputs{thinking: s == StatusRunning}, false, 0)
 }
 
 // Status-line dot glyphs: a hollow ring at rest, a filled dot while a turn is live.
@@ -81,17 +81,18 @@ func renderTip(tip string) string {
 	return styles.StatusStyle.Render("Tips: " + tip)
 }
 
-// renderStatusLine styles the derived label through the faint StatusStyle, prefixed by
-// the status dot (see statusDot). blink is the live-surface blink phase, used to pulse
-// the dot while waiting/thinking. statusLabel always returns a non-empty label (idle
-// reads "idle"), so the status row is always present below the composer; the
-// empty-label guard is a defensive no-op.
-func renderStatusLine(status Status, in statusInputs, blink bool) string {
+// renderStatusLine renders the derived label as an animated lime↔blue gradient
+// (gradientLabel), prefixed by the status dot (see statusDot). blink is the live-surface
+// blink phase, used to pulse the dot while waiting/thinking; phase is the live animation
+// frame that flows the label's gradient (0 at rest → a static gradient). statusLabel
+// always returns a non-empty label (idle reads "idle"), so the status row is always
+// present above the composer; the empty-label guard is a defensive no-op.
+func renderStatusLine(status Status, in statusInputs, blink bool, phase uint) string {
 	label := statusLabel(status, in)
 	if label == "" {
 		return ""
 	}
-	return statusDot(status, in, blink) + " " + styles.StatusStyle.Render(label)
+	return statusDot(status, in, blink) + " " + gradientLabel(label, phase)
 }
 
 // statusDot renders the leading status dot for the current state:
