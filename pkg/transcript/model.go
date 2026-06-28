@@ -105,9 +105,12 @@ type Loop struct {
 	LoopID          uuid.UUID
 	AgentName       string
 	ParentToolUseID string
-	SystemPrompt    string
-	StartedAt       time.Time
-	Turns           []*Turn
+	// SystemPrompt is the loop's resolved live system-prompt text (Decision 4). It is
+	// "" when the prompt was unavailable (a restored session whose live config is gone);
+	// in that case a Session.Warnings entry, keyed by this loop's id, records the gap.
+	SystemPrompt string
+	StartedAt    time.Time
+	Turns        []*Turn
 }
 
 // Turn is one user-input-to-resolution cycle within a Loop, numbered per loop by

@@ -17,11 +17,25 @@ import (
 	"github.com/ciram-co/looprig/pkg/uuid"
 )
 
-// noPrompts is a SystemPromptResolver that never resolves a prompt. Task 6 wires
-// real resolution; Task 2 only needs the parameter to be accepted.
-type noPrompts struct{}
+// emptyPrompts is a permissive SystemPromptResolver: it resolves every loop to an
+// empty system prompt (ok=true). The tests outside TestReconstructSystemPrompt do not
+// exercise prompt resolution, so they use this to keep resolution successful — a
+// resolver that returned ok=false would emit a (correct) degradation Warning per loop
+// and perturb their warning-count assertions. TestReconstructSystemPrompt drives the
+// resolved/unresolved behavior explicitly via fakePrompts.
+type emptyPrompts struct{}
 
-func (noPrompts) SystemPrompt(uuid.UUID) (string, bool) { return "", false }
+func (emptyPrompts) SystemPrompt(uuid.UUID) (string, bool) { return "", true }
+
+// fakePrompts is a map-backed SystemPromptResolver keyed by loop id: a loop present
+// in the map resolves to its text (ok=true); an absent loop resolves to ("", false),
+// the restored-session degradation path.
+type fakePrompts map[uuid.UUID]string
+
+func (f fakePrompts) SystemPrompt(loopID uuid.UUID) (string, bool) {
+	text, ok := f[loopID]
+	return text, ok
+}
 
 // sliceSource is a slice-backed RecordSource fake: it yields its records in order
 // and returns io.EOF once exhausted.
@@ -405,7 +419,7 @@ func TestReconstruct(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			s, warnings, err := Reconstruct(context.Background(), tt.src, noPrompts{})
+			s, warnings, err := Reconstruct(context.Background(), tt.src, emptyPrompts{})
 			tt.check(t, s, warnings, err)
 		})
 	}
@@ -744,7 +758,7 @@ func TestReconstructGates(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			s, warnings, err := Reconstruct(context.Background(), tt.src, noPrompts{})
+			s, warnings, err := Reconstruct(context.Background(), tt.src, emptyPrompts{})
 			if err != nil {
 				t.Fatalf("Reconstruct() error = %v", err)
 			}
@@ -1002,7 +1016,7 @@ func TestReconstructSubagents(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			s, warnings, err := Reconstruct(context.Background(), tt.src, noPrompts{})
+			s, warnings, err := Reconstruct(context.Background(), tt.src, emptyPrompts{})
 			if err != nil {
 				t.Fatalf("Reconstruct() error = %v", err)
 			}
@@ -1046,7 +1060,7 @@ func TestReconstructOrphanWarningOrder(t *testing.T) {
 
 	const runs = 50
 	for i := 0; i < runs; i++ {
-		_, warnings, err := Reconstruct(context.Background(), newSrc(), noPrompts{})
+		_, warnings, err := Reconstruct(context.Background(), newSrc(), emptyPrompts{})
 		if err != nil {
 			t.Fatalf("run %d: Reconstruct() error = %v", i, err)
 		}
@@ -1214,7 +1228,7 @@ func TestReconstructOutcomes(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			s, warnings, err := Reconstruct(context.Background(), tt.src, noPrompts{})
+			s, warnings, err := Reconstruct(context.Background(), tt.src, emptyPrompts{})
 			if err != nil {
 				t.Fatalf("Reconstruct() error = %v", err)
 			}
@@ -1237,7 +1251,7 @@ func TestReconstructNotices(t *testing.T) {
 		event.RestoreErrored{Err: errRestore},
 	)
 
-	s, warnings, err := Reconstruct(context.Background(), src, noPrompts{})
+	s, warnings, err := Reconstruct(context.Background(), src, emptyPrompts{})
 	if err != nil {
 		t.Fatalf("Reconstruct() error = %v", err)
 	}
@@ -1360,13 +1374,171 @@ func TestReconstructFailSecure(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			s, warnings, err := Reconstruct(context.Background(), tt.src, noPrompts{})
+			s, warnings, err := Reconstruct(context.Background(), tt.src, emptyPrompts{})
 			if err != nil {
 				t.Fatalf("Reconstruct() error = %v", err)
 			}
 			tt.check(t, s, warnings)
 		})
 	}
+}
+
+// TestReconstructSystemPrompt covers Decision 4: the live system-prompt text comes
+// from the resolver (the running loop config), not the journal — the journal records
+// only a digest. A resolved loop carries the text with no warning; an unresolved loop
+// (a restored session whose live config is gone) leaves SystemPrompt empty and surfaces
+// exactly one degradation Warning that identifies the loop (id + AgentName) and carries
+// the journaled SystemPromptRev digest. The subagent row locks that resolution runs for
+// every loop — primary and subagent alike — and that each degrades under its own id.
+func TestReconstructSystemPrompt(t *testing.T) {
+	base := time.Date(2026, 6, 28, 12, 0, 0, 0, time.UTC)
+	const rev = "sha256:deadbeefcafe"
+
+	primaryID := mustUUID(t)
+	childID := mustUUID(t)
+	const childAgent = "reviewer"
+
+	// primarySrc builds a one-turn primary-loop stream whose SessionStarted carries the
+	// SystemPromptRev digest (set before LoopStarted, so it is available when the loop
+	// resolves its prompt) and whose single loop is stamped with primaryID.
+	primarySrc := func() RecordSource {
+		return newSliceSource(primaryID, base,
+			event.SessionStarted{Config: event.ConfigFingerprint{SystemPromptRev: rev}},
+			event.LoopStarted{ParentToolUseID: ""},
+			event.TurnStarted{TurnIndex: 1, Message: userMsg("hi")},
+			event.StepDone{Messages: content.AgenticMessages{aiText("hello")}},
+			event.TurnDone{TurnIndex: 1},
+		)
+	}
+
+	// subagentSrc builds a stream where the primary loop spawns a subagent (childID,
+	// AgentName childAgent) that nests cleanly under the parent Subagent tool call — so
+	// it is no orphan, and the only degradation warning is the child's own.
+	subagentSrc := func() RecordSource {
+		return newLoopSource(base,
+			evNode(primaryID, event.SessionStarted{Config: event.ConfigFingerprint{SystemPromptRev: rev}}),
+			evNode(primaryID, event.LoopStarted{ParentToolUseID: ""}),
+			evNode(primaryID, event.TurnStarted{TurnIndex: 1, Message: userMsg("review this")}),
+			childStart(childID, primaryID, event.LoopStarted{
+				ParentToolUseID: "sub1",
+				Header:          event.Header{AgentName: identity.AgentName(childAgent)},
+			}),
+			evNode(childID, event.TurnStarted{TurnIndex: 1, Message: userMsg("on it")}),
+			evNode(childID, event.StepDone{Messages: content.AgenticMessages{aiText("looks good")}}),
+			evNode(childID, event.TurnDone{TurnIndex: 1}),
+			evNode(primaryID, event.StepDone{Messages: content.AgenticMessages{
+				aiToolUse(&content.ToolUseBlock{ID: "sub1", Name: "Subagent"}),
+				toolResult("sub1", "done"),
+			}}),
+			evNode(primaryID, event.TurnDone{TurnIndex: 1}),
+		)
+	}
+
+	tests := []struct {
+		name    string
+		src     RecordSource
+		prompts SystemPromptResolver
+		check   func(t *testing.T, s *Session, warnings []Warning)
+	}{
+		{
+			name:    "resolved prompt sets Root.SystemPrompt with no warning",
+			src:     primarySrc(),
+			prompts: fakePrompts{primaryID: "SYSTEM TEXT"},
+			check: func(t *testing.T, s *Session, warnings []Warning) {
+				if len(warnings) != 0 {
+					t.Fatalf("unexpected warnings: %+v", warnings)
+				}
+				if s.Root == nil {
+					t.Fatal("Root loop is nil")
+				}
+				if s.Root.SystemPrompt != "SYSTEM TEXT" {
+					t.Errorf("Root.SystemPrompt = %q, want %q", s.Root.SystemPrompt, "SYSTEM TEXT")
+				}
+			},
+		},
+		{
+			name:    "unresolved primary prompt warns with loop id and rev digest",
+			src:     primarySrc(),
+			prompts: fakePrompts{}, // primary loop absent -> SystemPrompt returns ("", false)
+			check: func(t *testing.T, s *Session, warnings []Warning) {
+				if s.Root == nil {
+					t.Fatal("Root loop is nil")
+				}
+				if s.Root.SystemPrompt != "" {
+					t.Errorf("Root.SystemPrompt = %q, want \"\" (unavailable)", s.Root.SystemPrompt)
+				}
+				if len(warnings) != 1 {
+					t.Fatalf("len(warnings) = %d, want 1 (unavailable system prompt)", len(warnings))
+				}
+				txt := warnings[0].Text
+				if !strings.Contains(txt, "system prompt unavailable") {
+					t.Errorf("warning = %q, want it to flag the unavailable system prompt", txt)
+				}
+				if !strings.Contains(txt, primaryID.String()) {
+					t.Errorf("warning = %q, want it to identify the loop %q", txt, primaryID)
+				}
+				if !strings.Contains(txt, rev) {
+					t.Errorf("warning = %q, want it to carry the SystemPromptRev digest %q", txt, rev)
+				}
+			},
+		},
+		{
+			name:    "unresolved subagent prompt degrades under its own loop id and AgentName",
+			src:     subagentSrc(),
+			prompts: fakePrompts{primaryID: "PRIMARY SYS"}, // child absent -> only the child degrades
+			check: func(t *testing.T, s *Session, warnings []Warning) {
+				if s.Root == nil || s.Root.SystemPrompt != "PRIMARY SYS" {
+					t.Fatalf("Root.SystemPrompt = %q, want \"PRIMARY SYS\" (primary resolved)", msgRoot(s))
+				}
+				// Exactly one warning: the child's degradation (the child nests cleanly,
+				// so there is no orphan warning).
+				if len(warnings) != 1 {
+					t.Fatalf("len(warnings) = %d, want 1 (subagent degradation only)", len(warnings))
+				}
+				txt := warnings[0].Text
+				if !strings.Contains(txt, "system prompt unavailable") {
+					t.Errorf("warning = %q, want it to flag the unavailable system prompt", txt)
+				}
+				if !strings.Contains(txt, childID.String()) {
+					t.Errorf("warning = %q, want it to identify the subagent loop %q", txt, childID)
+				}
+				if !strings.Contains(txt, childAgent) {
+					t.Errorf("warning = %q, want it to name the subagent AgentName %q", txt, childAgent)
+				}
+				if !strings.Contains(txt, rev) {
+					t.Errorf("warning = %q, want it to carry the SystemPromptRev digest %q", txt, rev)
+				}
+				// The child loop itself carries no prompt (it degraded).
+				child := s.Root.Turns[0].Steps[0].Tools[0].Child
+				if child == nil {
+					t.Fatal("subagent child loop did not attach to its Subagent tool call")
+				}
+				if child.SystemPrompt != "" {
+					t.Errorf("child.SystemPrompt = %q, want \"\" (unavailable)", child.SystemPrompt)
+				}
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			s, warnings, err := Reconstruct(context.Background(), tt.src, tt.prompts)
+			if err != nil {
+				t.Fatalf("Reconstruct() error = %v", err)
+			}
+			tt.check(t, s, warnings)
+		})
+	}
+}
+
+// msgRoot is a nil-safe accessor for the root loop's system prompt, for readable
+// failure messages.
+func msgRoot(s *Session) string {
+	if s == nil || s.Root == nil {
+		return "<nil root>"
+	}
+	return s.Root.SystemPrompt
 }
 
 func TestReconstructLeftoverGates(t *testing.T) {
@@ -1486,7 +1658,7 @@ func TestReconstructLeftoverGates(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			s, warnings, err := Reconstruct(context.Background(), tt.src, noPrompts{})
+			s, warnings, err := Reconstruct(context.Background(), tt.src, emptyPrompts{})
 			if err != nil {
 				t.Fatalf("Reconstruct() error = %v", err)
 			}

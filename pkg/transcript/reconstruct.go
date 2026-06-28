@@ -19,7 +19,9 @@ import (
 // src until io.EOF, folding each Record into the growing tree; a non-EOF read
 // failure aborts with a *ReconstructError (Stage "read"). Reconstruction is
 // otherwise best-effort: malformed or unpaired records degrade to Warnings, never
-// to an error. prompts resolves live system-prompt text (wired in a later task).
+// to an error. prompts supplies each loop's live system-prompt text: every loop gets
+// one resolution attempt at LoopStarted, degrading to a Warning when unavailable (a
+// restored session whose live config is gone — Decision 4).
 func Reconstruct(ctx context.Context, src RecordSource, prompts SystemPromptResolver) (*Session, []Warning, error) {
 	b := newBuilder(prompts)
 	for {
@@ -49,8 +51,9 @@ type builder struct {
 	// or terminal turn event resolves to the right turn.
 	openTurns map[uuid.UUID]*Turn
 	// toolByUseID indexes every ToolCall by its provider tool-use id, the durable
-	// key that pairs a tool result (and, in a later task, a child loop) back to its
-	// call.
+	// key that pairs a tool result back to its call. Child-loop correlation does NOT
+	// go through this index: a subagent loop attaches to its spawning ToolCall via
+	// childByParent (keyed by {parent loop id, tool-use id}) at the parent StepDone.
 	toolByUseID map[string]*ToolCall
 	// gatesByExecID indexes the open (not-yet-flushed) gates by their tool-execution
 	// id, so a resolving user command can find the gate it decides. On replay a gate
@@ -226,8 +229,8 @@ func (b *builder) onSessionStarted(e event.SessionStarted) {
 // the session Root; a spawned subagent loop is buffered under {parent loop id,
 // spawning tool-use id} for attach at the parent StepDone (the parent ToolCall does
 // not exist yet — Decision 6). Either way the loop is indexed in b.loops so its later
-// turn/step events route by Header.LoopID. SystemPrompt resolution via b.prompts is a
-// later task.
+// turn/step events route by Header.LoopID, and every loop gets one system-prompt
+// resolution attempt (see resolveSystemPrompt).
 func (b *builder) onLoopStarted(e event.LoopStarted) {
 	loop := &Loop{
 		LoopID:          e.Header.LoopID,
@@ -235,6 +238,7 @@ func (b *builder) onLoopStarted(e event.LoopStarted) {
 		ParentToolUseID: e.ParentToolUseID,
 		StartedAt:       e.Header.CreatedAt,
 	}
+	b.resolveSystemPrompt(loop, e.Header.CreatedAt)
 	b.loops[loop.LoopID] = loop
 	if e.ParentToolUseID == "" {
 		b.session.Root = loop
@@ -242,6 +246,36 @@ func (b *builder) onLoopStarted(e event.LoopStarted) {
 	}
 	key := childKey{parentLoopID: e.Header.Cause.LoopID, toolUseID: e.ParentToolUseID}
 	b.childByParent[key] = loop
+}
+
+// resolveSystemPrompt fills the loop's live system-prompt text from the resolver, or
+// warns when it cannot. The text comes from the running loop config (Decision 4) — the
+// journal records only a digest (Config.SystemPromptRev), never the text. Behavior:
+//   - nil resolver (no live config wired, e.g. a pure-replay test): no resolution is
+//     attempted, so the loop stays prompt-less silently — not a degradation to report.
+//   - resolver returns ok: SystemPrompt is set (possibly empty).
+//   - resolver returns !ok (a restored session whose live config is gone): the loop
+//     renders without its prompt and one Warning carries the journaled SystemPromptRev
+//     digest so the gap is auditable.
+//
+// It runs for every loop — primary and subagent alike — so each carries either its own
+// prompt or its own degradation Warning. The session Config is already set (SessionStarted
+// precedes any LoopStarted), so the digest is available here.
+//
+// The Warning is identified by loop id + AgentName so a restored multi-loop session yields
+// per-loop-distinguishable warnings (consistent with the file's other loop-keyed warnings),
+// not byte-identical strings. The digest, however, is the session-level
+// Config.SystemPromptRev reused for every loop's warning: event.LoopStarted carries no
+// per-loop rev, so there is nothing more specific to emit.
+func (b *builder) resolveSystemPrompt(loop *Loop, at time.Time) {
+	if b.prompts == nil {
+		return
+	}
+	if text, ok := b.prompts.SystemPrompt(loop.LoopID); ok {
+		loop.SystemPrompt = text
+		return
+	}
+	b.warn("system prompt unavailable for loop "+loop.LoopID.String()+" ("+loop.AgentName+") (rev "+b.session.Config.SystemPromptRev+")", at)
 }
 
 // onTurnStarted opens a turn on the owning loop and records its initial user
