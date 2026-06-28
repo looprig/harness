@@ -290,13 +290,16 @@ Test `pkg/transcript/html/render_test.go` (+ `testdata/full.golden.html`).
 - tool card shows `name`, decision verb `Approved ✓` / `Denied ✗`, and an expandable result;
 - a **user-action chip** with scope+timestamp (`You approved · session · HH:MM:SS`);
 - a nested subagent loop block (indented, `data-depth="1"`);
+- **`Session.Notices`** rendered as session lifecycle notifications (restore start/done, idle, stopped) in timeline order;
+- **`Session.Warnings`** rendered in a distinct "reconstruction notes/warnings" section (so the audit surfaces anomalies — incl. Task 6's per-loop `system prompt unavailable …` degradations; otherwise that work is invisible). Assert a warning entry appears for a model carrying one;
 - toolbar controls present (`collapse-all`, `expand-all`);
 - still self-contained (no external `src=`/`href=`); golden byte-equal after timestamp normalization.
 **Step 2:** FAIL. **Step 3 (implement):** flesh `template.gohtml` per D7 layout; CSS uses the TUI
 palette (lime `#D4F84D` AI bullet, blue `#A2D2FF` headings, gray `#737373` user bar, faint tool
 cards, dark theme) with web-native typography (proportional prose, monospace code/tool output);
 `app.js` wires collapse/expand-all + jump-to-top (vanilla JS, no deps). Pretty-print tool `Input`
-JSON; cap oversized tool `Result` with a "… N bytes elided" note. **Step 4:** PASS.
+JSON; cap oversized tool `Result` with a "… N bytes elided" note. **Render `s.Notices` and
+`s.Warnings`** (the view model gains notice/warning view types). **Step 4:** PASS.
 **Step 5:** `git commit -m "feat(transcript/html): full TUI-styled layout with collapsibles, gate chips, nested subagents"`.
 
 ---
