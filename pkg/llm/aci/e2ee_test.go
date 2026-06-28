@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"math"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -12,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ciram-co/looprig/pkg/llm"
 	secp256k1 "github.com/decred/dcrd/dcrec/secp256k1/v4"
 )
 
@@ -931,4 +933,516 @@ func TestSealRequestProductionWrapper(t *testing.T) {
 	if sr.Nonce == sr2.Nonce {
 		t.Fatalf("two production nonces identical: %q", sr.Nonce)
 	}
+}
+
+// =============================================================================
+// Task 3.3: openResponse — response open (content/reasoning/embedding) + replay
+// window. The gateway SEALS the response to the client's pubkey under a response
+// AAD; openResponse INVERTS it. These tests mimic the gateway: they seal each
+// field with the SAME AAD the gateway builds, emit the sealed body, then assert
+// openResponse recovers the ORIGINAL cleartext body byte-for-byte.
+// =============================================================================
+
+// chatRespAAD builds the EXACT expected chat-response AAD string. It is pinned
+// here (not referenced from production) so a production typo is caught.
+func chatRespAAD(model, id string, choice uint64, field, nonce string, ts uint64) string {
+	return "v2|resp|algo=" + testE2EEAlgo + "|model=" + model +
+		"|id=" + id + "|choice=" + strconv.FormatUint(choice, 10) +
+		"|field=" + field + "|n=" + nonce + "|ts=" + strconv.FormatUint(ts, 10)
+}
+
+// embeddingRespAAD builds the EXACT expected embedding-response AAD string.
+func embeddingRespAAD(model, id string, data uint64, field, nonce string, ts uint64) string {
+	return "v2|resp|algo=" + testE2EEAlgo + "|model=" + model +
+		"|id=" + id + "|data=" + strconv.FormatUint(data, 10) +
+		"|field=" + field + "|n=" + nonce + "|ts=" + strconv.FormatUint(ts, 10)
+}
+
+// newClientKeypair returns a fresh secp256k1 keypair. The test holds the PUBLIC
+// key to SEAL the response (as the gateway would) and the PRIVATE key to open it
+// via openResponse (as the client does).
+func newClientKeypair(t *testing.T) *secp256k1.PrivateKey {
+	t.Helper()
+	priv, err := secp256k1.GeneratePrivateKey()
+	if err != nil {
+		t.Fatalf("generate client key: %v", err)
+	}
+	return priv
+}
+
+// mustCompact serializes a Value to its compact JSON bytes or fails the test.
+func mustCompact(t *testing.T, v Value) []byte {
+	t.Helper()
+	b, err := CompactJSON(v)
+	if err != nil {
+		t.Fatalf("CompactJSON: %v", err)
+	}
+	return b
+}
+
+// mustSeal seals plaintext for clientPub under aad as the gateway would, or fails.
+func mustSeal(t *testing.T, clientPub *secp256k1.PublicKey, plaintext []byte, aad string) string {
+	t.Helper()
+	ct, err := seal(clientPub, plaintext, []byte(aad))
+	if err != nil {
+		t.Fatalf("seal: %v", err)
+	}
+	return ct
+}
+
+// asAttestErr asserts err is a fail-closed *llm.AttestationError with reason
+// e2ee_failed (the only failure openResponse may emit).
+func asAttestErr(t *testing.T, err error) {
+	t.Helper()
+	var ae *llm.AttestationError
+	if !errors.As(err, &ae) {
+		t.Fatalf("error %T (%v) is not *llm.AttestationError", err, err)
+	}
+	if ae.Reason != reasonE2EEFailed {
+		t.Fatalf("reason = %q, want %q", ae.Reason, reasonE2EEFailed)
+	}
+}
+
+// TestOpenResponseChat seals a chat response (content + reasoning_content) for
+// the client key as the gateway would, then asserts openResponse recovers the
+// ORIGINAL cleartext body byte-for-byte and used the exact per-field AADs.
+func TestOpenResponseChat(t *testing.T) {
+	t.Parallel()
+	clientPriv := newClientKeypair(t)
+	clientPub := clientPriv.PubKey()
+
+	const model = "z-ai/glm-5.2"
+	const id = "chatcmpl-abc123"
+	const nonce = "0011223344556677889900aabbccddee"
+	const ts = uint64(1750000000)
+
+	// Original CLEARTEXT body the gateway would produce before sealing.
+	cleartext := `{"id":"` + id + `","object":"chat.completion","model":"` + model +
+		`","choices":[{"index":0,"message":{"role":"assistant","content":"hi",` +
+		`"reasoning_content":"because"}}],"usage":{"total_tokens":7}}`
+	wantBody := mustCompact(t, mustParseBody(t, cleartext))
+
+	// SEAL the body exactly as the gateway does: replace content/reasoning with the
+	// hex blobs sealed under the response AAD; everything else passes through.
+	sealed := mustParseBody(t, cleartext)
+	choice := walkPath(t, sealed, "choices", 0).(*Object)
+	msg := walkPath(t, choice, "message").(*Object)
+	contentAAD := chatRespAAD(model, id, 0, "content", nonce, ts)
+	reasonAAD := chatRespAAD(model, id, 0, "reasoning_content", nonce, ts)
+	msg.Set("content", String(mustSeal(t, clientPub, []byte("hi"), contentAAD)))
+	msg.Set("reasoning_content", String(mustSeal(t, clientPub, []byte("because"), reasonAAD)))
+	sealedBody := mustCompact(t, sealed)
+
+	got, err := openResponse(sealedBody, clientPriv, model, nonce, ts, time.Unix(int64(ts), 0))
+	if err != nil {
+		t.Fatalf("openResponse: %v", err)
+	}
+	if !bytes.Equal(got, wantBody) {
+		t.Fatalf("cleartext body mismatch:\n got  %s\n want %s", got, wantBody)
+	}
+}
+
+// TestOpenResponseChatMultiChoiceExplicitIndex confirms openResponse uses the
+// choice's explicit "index" field (not the array position) when building the AAD.
+func TestOpenResponseChatMultiChoiceExplicitIndex(t *testing.T) {
+	t.Parallel()
+	clientPriv := newClientKeypair(t)
+	clientPub := clientPriv.PubKey()
+
+	const model = "m"
+	const id = "id-multi"
+	const nonce = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	const ts = uint64(1750000001)
+
+	// Two choices: array positions 0,1 but explicit index 2,5. The AAD must use
+	// the explicit index, so seal under choice=2 and choice=5.
+	cleartext := `{"id":"` + id + `","choices":[` +
+		`{"index":2,"message":{"content":"first"}},` +
+		`{"index":5,"message":{"content":"second"}}]}`
+	wantBody := mustCompact(t, mustParseBody(t, cleartext))
+
+	sealed := mustParseBody(t, cleartext)
+	m0 := walkPath(t, sealed, "choices", 0, "message").(*Object)
+	m1 := walkPath(t, sealed, "choices", 1, "message").(*Object)
+	m0.Set("content", String(mustSeal(t, clientPub, []byte("first"), chatRespAAD(model, id, 2, "content", nonce, ts))))
+	m1.Set("content", String(mustSeal(t, clientPub, []byte("second"), chatRespAAD(model, id, 5, "content", nonce, ts))))
+	sealedBody := mustCompact(t, sealed)
+
+	got, err := openResponse(sealedBody, clientPriv, model, nonce, ts, time.Unix(int64(ts), 0))
+	if err != nil {
+		t.Fatalf("openResponse: %v", err)
+	}
+	if !bytes.Equal(got, wantBody) {
+		t.Fatalf("cleartext body mismatch:\n got  %s\n want %s", got, wantBody)
+	}
+}
+
+// TestOpenResponseChatPositionalIndex confirms openResponse falls back to the
+// ARRAY POSITION for the AAD when a choice has no explicit "index".
+func TestOpenResponseChatPositionalIndex(t *testing.T) {
+	t.Parallel()
+	clientPriv := newClientKeypair(t)
+	clientPub := clientPriv.PubKey()
+
+	const model = "m"
+	const id = "id-pos"
+	const nonce = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	const ts = uint64(1750000002)
+
+	// No "index" field -> AAD uses position 0 then 1.
+	cleartext := `{"id":"` + id + `","choices":[` +
+		`{"message":{"content":"p0"}},{"message":{"content":"p1"}}]}`
+	wantBody := mustCompact(t, mustParseBody(t, cleartext))
+
+	sealed := mustParseBody(t, cleartext)
+	m0 := walkPath(t, sealed, "choices", 0, "message").(*Object)
+	m1 := walkPath(t, sealed, "choices", 1, "message").(*Object)
+	m0.Set("content", String(mustSeal(t, clientPub, []byte("p0"), chatRespAAD(model, id, 0, "content", nonce, ts))))
+	m1.Set("content", String(mustSeal(t, clientPub, []byte("p1"), chatRespAAD(model, id, 1, "content", nonce, ts))))
+	sealedBody := mustCompact(t, sealed)
+
+	got, err := openResponse(sealedBody, clientPriv, model, nonce, ts, time.Unix(int64(ts), 0))
+	if err != nil {
+		t.Fatalf("openResponse: %v", err)
+	}
+	if !bytes.Equal(got, wantBody) {
+		t.Fatalf("cleartext body mismatch:\n got  %s\n want %s", got, wantBody)
+	}
+}
+
+// TestOpenResponseChatNoReasoning confirms a choice WITHOUT reasoning_content
+// opens only content (no spurious field) and round-trips byte-for-byte.
+func TestOpenResponseChatNoReasoning(t *testing.T) {
+	t.Parallel()
+	clientPriv := newClientKeypair(t)
+	clientPub := clientPriv.PubKey()
+
+	const model = "m"
+	const id = "id-noreason"
+	const nonce = "cccccccccccccccccccccccccccccccc"
+	const ts = uint64(1750000003)
+
+	cleartext := `{"id":"` + id + `","choices":[{"index":0,"message":{"role":"assistant","content":"only"}}]}`
+	wantBody := mustCompact(t, mustParseBody(t, cleartext))
+
+	sealed := mustParseBody(t, cleartext)
+	msg := walkPath(t, sealed, "choices", 0, "message").(*Object)
+	msg.Set("content", String(mustSeal(t, clientPub, []byte("only"), chatRespAAD(model, id, 0, "content", nonce, ts))))
+	sealedBody := mustCompact(t, sealed)
+
+	got, err := openResponse(sealedBody, clientPriv, model, nonce, ts, time.Unix(int64(ts), 0))
+	if err != nil {
+		t.Fatalf("openResponse: %v", err)
+	}
+	if !bytes.Equal(got, wantBody) {
+		t.Fatalf("cleartext body mismatch:\n got  %s\n want %s", got, wantBody)
+	}
+}
+
+// TestOpenResponseEmbedding seals an embedding response (a float array) for the
+// client key, then asserts openResponse recovers the float array byte-identically
+// (it parses the plaintext as JSON, not as a raw string).
+func TestOpenResponseEmbedding(t *testing.T) {
+	t.Parallel()
+	clientPriv := newClientKeypair(t)
+	clientPub := clientPriv.PubKey()
+
+	const model = "text-embedding-3"
+	const id = "emb-1"
+	const nonce = "12341234123412341234123412341234"
+	const ts = uint64(1750000004)
+
+	cleartext := `{"id":"` + id + `","object":"list","model":"` + model +
+		`","data":[{"index":0,"object":"embedding","embedding":[0.1,0.2,-0.3]}]}`
+	wantBody := mustCompact(t, mustParseBody(t, cleartext))
+
+	sealed := mustParseBody(t, cleartext)
+	item := walkPath(t, sealed, "data", 0).(*Object)
+	// The gateway seals serde_json::to_vec(embedding): the compact JSON of the
+	// float array.
+	embVal := walkPath(t, sealed, "data", 0, "embedding")
+	embBytes := mustCompact(t, embVal)
+	embAAD := embeddingRespAAD(model, id, 0, "embedding", nonce, ts)
+	item.Set("embedding", String(mustSeal(t, clientPub, embBytes, embAAD)))
+	sealedBody := mustCompact(t, sealed)
+
+	got, err := openResponse(sealedBody, clientPriv, model, nonce, ts, time.Unix(int64(ts), 0))
+	if err != nil {
+		t.Fatalf("openResponse: %v", err)
+	}
+	if !bytes.Equal(got, wantBody) {
+		t.Fatalf("cleartext body mismatch:\n got  %s\n want %s", got, wantBody)
+	}
+}
+
+// TestOpenResponseEmbeddingPositional confirms the embedding data_index falls
+// back to the array position when no explicit "index" is present.
+func TestOpenResponseEmbeddingPositional(t *testing.T) {
+	t.Parallel()
+	clientPriv := newClientKeypair(t)
+	clientPub := clientPriv.PubKey()
+
+	const model = "te-3"
+	const id = "emb-pos"
+	const nonce = "dddddddddddddddddddddddddddddddd"
+	const ts = uint64(1750000005)
+
+	cleartext := `{"id":"` + id + `","data":[` +
+		`{"object":"embedding","embedding":[1.5]},` +
+		`{"object":"embedding","embedding":[2.5,3.5]}]}`
+	wantBody := mustCompact(t, mustParseBody(t, cleartext))
+
+	sealed := mustParseBody(t, cleartext)
+	i0 := walkPath(t, sealed, "data", 0).(*Object)
+	i1 := walkPath(t, sealed, "data", 1).(*Object)
+	i0.Set("embedding", String(mustSeal(t, clientPub, mustCompact(t, walkPath(t, sealed, "data", 0, "embedding")), embeddingRespAAD(model, id, 0, "embedding", nonce, ts))))
+	i1.Set("embedding", String(mustSeal(t, clientPub, mustCompact(t, walkPath(t, sealed, "data", 1, "embedding")), embeddingRespAAD(model, id, 1, "embedding", nonce, ts))))
+	sealedBody := mustCompact(t, sealed)
+
+	got, err := openResponse(sealedBody, clientPriv, model, nonce, ts, time.Unix(int64(ts), 0))
+	if err != nil {
+		t.Fatalf("openResponse: %v", err)
+	}
+	if !bytes.Equal(got, wantBody) {
+		t.Fatalf("cleartext body mismatch:\n got  %s\n want %s", got, wantBody)
+	}
+}
+
+// TestOpenResponseCompletionText covers the legacy completion shape: choices[].text
+// sealed under field=text, recovered as a raw string.
+func TestOpenResponseCompletionText(t *testing.T) {
+	t.Parallel()
+	clientPriv := newClientKeypair(t)
+	clientPub := clientPriv.PubKey()
+
+	const model = "m"
+	const id = "cmpl-1"
+	const nonce = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+	const ts = uint64(1750000006)
+
+	cleartext := `{"id":"` + id + `","object":"text_completion","choices":[{"index":0,"text":"foo"}]}`
+	wantBody := mustCompact(t, mustParseBody(t, cleartext))
+
+	sealed := mustParseBody(t, cleartext)
+	choice := walkPath(t, sealed, "choices", 0).(*Object)
+	textAAD := chatRespAAD(model, id, 0, "text", nonce, ts)
+	choice.Set("text", String(mustSeal(t, clientPub, []byte("foo"), textAAD)))
+	sealedBody := mustCompact(t, sealed)
+
+	got, err := openResponse(sealedBody, clientPriv, model, nonce, ts, time.Unix(int64(ts), 0))
+	if err != nil {
+		t.Fatalf("openResponse: %v", err)
+	}
+	if !bytes.Equal(got, wantBody) {
+		t.Fatalf("cleartext body mismatch:\n got  %s\n want %s", got, wantBody)
+	}
+}
+
+// TestOpenResponseMissingID confirms a body without "id" uses id="" in the AAD.
+func TestOpenResponseMissingID(t *testing.T) {
+	t.Parallel()
+	clientPriv := newClientKeypair(t)
+	clientPub := clientPriv.PubKey()
+
+	const model = "m"
+	const nonce = "00ff00ff00ff00ff00ff00ff00ff00ff"
+	const ts = uint64(1750000007)
+
+	cleartext := `{"object":"chat.completion","choices":[{"index":0,"message":{"content":"x"}}]}`
+	wantBody := mustCompact(t, mustParseBody(t, cleartext))
+
+	sealed := mustParseBody(t, cleartext)
+	msg := walkPath(t, sealed, "choices", 0, "message").(*Object)
+	msg.Set("content", String(mustSeal(t, clientPub, []byte("x"), chatRespAAD(model, "", 0, "content", nonce, ts))))
+	sealedBody := mustCompact(t, sealed)
+
+	got, err := openResponse(sealedBody, clientPriv, model, nonce, ts, time.Unix(int64(ts), 0))
+	if err != nil {
+		t.Fatalf("openResponse: %v", err)
+	}
+	if !bytes.Equal(got, wantBody) {
+		t.Fatalf("cleartext body mismatch:\n got  %s\n want %s", got, wantBody)
+	}
+}
+
+// TestOpenResponseAADMismatch covers every AAD/nonce/model/ts mismatch and a
+// tampered/short ciphertext: each must fail closed with e2ee_failed.
+func TestOpenResponseAADMismatch(t *testing.T) {
+	t.Parallel()
+	clientPriv := newClientKeypair(t)
+	clientPub := clientPriv.PubKey()
+
+	const model = "m"
+	const id = "id-neg"
+	const nonce = "0123456789abcdef0123456789abcdef"
+	const ts = uint64(1750000008)
+
+	// Seal content under the CORRECT AAD; each negative case opens with a wrong
+	// param so the recomputed AAD differs (or the ciphertext itself is broken).
+	contentAAD := chatRespAAD(model, id, 0, "content", nonce, ts)
+	goodCT := mustSeal(t, clientPub, []byte("secret"), contentAAD)
+
+	buildBody := func(ct string) []byte {
+		b := mustParseBody(t, `{"id":"`+id+`","choices":[{"index":0,"message":{"content":"placeholder"}}]}`)
+		msg := walkPath(t, b, "choices", 0, "message").(*Object)
+		msg.Set("content", String(ct))
+		return mustCompact(t, b)
+	}
+
+	// A ciphertext tampered in its tag byte.
+	tamperedBlob := mustDecodeHex(t, goodCT)
+	tamperedBlob[len(tamperedBlob)-1] ^= 0x01
+	tamperedCT := hex.EncodeToString(tamperedBlob)
+
+	tests := []struct {
+		name  string
+		body  []byte
+		model string
+		nonce string
+		ts    uint64
+	}{
+		{name: "wrong nonce", body: buildBody(goodCT), model: model, nonce: "ffffffffffffffffffffffffffffffff", ts: ts},
+		{name: "wrong model", body: buildBody(goodCT), model: "other-model", nonce: nonce, ts: ts},
+		{name: "wrong ts", body: buildBody(goodCT), model: model, nonce: nonce, ts: ts + 1},
+		{name: "tampered ciphertext", body: buildBody(tamperedCT), model: model, nonce: nonce, ts: ts},
+		{name: "content not hex", body: buildBody("zznothex"), model: model, nonce: nonce, ts: ts},
+		{name: "content too short", body: buildBody("00"), model: model, nonce: nonce, ts: ts},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got, err := openResponse(tt.body, clientPriv, tt.model, tt.nonce, tt.ts, time.Unix(int64(tt.ts), 0))
+			if err == nil {
+				t.Fatalf("openResponse succeeded, want e2ee_failed; got %s", got)
+			}
+			if got != nil {
+				t.Fatalf("openResponse returned non-nil body %q with error", got)
+			}
+			asAttestErr(t, err)
+		})
+	}
+}
+
+// TestOpenResponseReplayWindow pins the 5-minute (300s) replay window, including
+// the exact boundaries (300s ok, 301s rejected) in both clock directions.
+func TestOpenResponseReplayWindow(t *testing.T) {
+	t.Parallel()
+	clientPriv := newClientKeypair(t)
+	clientPub := clientPriv.PubKey()
+
+	const model = "m"
+	const id = "id-replay"
+	const nonce = "11111111111111111111111111111111"
+	const ts = uint64(1750000100)
+
+	sealed := mustParseBody(t, `{"id":"`+id+`","choices":[{"index":0,"message":{"content":"x"}}]}`)
+	msg := walkPath(t, sealed, "choices", 0, "message").(*Object)
+	msg.Set("content", String(mustSeal(t, clientPub, []byte("x"), chatRespAAD(model, id, 0, "content", nonce, ts))))
+	body := mustCompact(t, sealed)
+
+	tests := []struct {
+		name    string
+		now     time.Time
+		wantErr bool
+	}{
+		{name: "now == ts", now: time.Unix(int64(ts), 0), wantErr: false},
+		{name: "now == ts+300 (boundary ok)", now: time.Unix(int64(ts)+300, 0), wantErr: false},
+		{name: "now == ts-300 (boundary ok)", now: time.Unix(int64(ts)-300, 0), wantErr: false},
+		{name: "now == ts+301 (too new)", now: time.Unix(int64(ts)+301, 0), wantErr: true},
+		{name: "now == ts-301 (too old)", now: time.Unix(int64(ts)-301, 0), wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got, err := openResponse(body, clientPriv, model, nonce, ts, tt.now)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("openResponse succeeded, want e2ee_failed (replay); got %s", got)
+				}
+				asAttestErr(t, err)
+				return
+			}
+			if err != nil {
+				t.Fatalf("openResponse failed inside window: %v", err)
+			}
+		})
+	}
+}
+
+// TestOpenResponsePassthroughOrder confirms non-sealed fields (model, object,
+// usage) are byte-identical and top-level field order is preserved.
+func TestOpenResponsePassthroughOrder(t *testing.T) {
+	t.Parallel()
+	clientPriv := newClientKeypair(t)
+	clientPub := clientPriv.PubKey()
+
+	const model = "m"
+	const id = "id-order"
+	const nonce = "22222222222222222222222222222222"
+	const ts = uint64(1750000200)
+
+	// Deliberately non-alphabetical key order at the top level.
+	cleartext := `{"z_first":1,"id":"` + id + `","object":"chat.completion",` +
+		`"choices":[{"index":0,"message":{"content":"body"}}],"model":"` + model +
+		`","usage":{"total_tokens":3},"a_last":true}`
+	wantBody := mustCompact(t, mustParseBody(t, cleartext))
+
+	sealed := mustParseBody(t, cleartext)
+	msg := walkPath(t, sealed, "choices", 0, "message").(*Object)
+	msg.Set("content", String(mustSeal(t, clientPub, []byte("body"), chatRespAAD(model, id, 0, "content", nonce, ts))))
+	sealedBody := mustCompact(t, sealed)
+
+	got, err := openResponse(sealedBody, clientPriv, model, nonce, ts, time.Unix(int64(ts), 0))
+	if err != nil {
+		t.Fatalf("openResponse: %v", err)
+	}
+	if !bytes.Equal(got, wantBody) {
+		t.Fatalf("cleartext body mismatch:\n got  %s\n want %s", got, wantBody)
+	}
+	// The recovered body must START with the first (non-alphabetical) key.
+	if !strings.HasPrefix(string(got), `{"z_first":1,`) {
+		t.Fatalf("recovered body does not preserve leading key order: %s", got)
+	}
+}
+
+// TestOpenResponseNotJSON confirms a non-JSON / malformed sealedResp fails closed
+// with e2ee_failed (parse error), not a panic.
+func TestOpenResponseNotJSON(t *testing.T) {
+	t.Parallel()
+	clientPriv := newClientKeypair(t)
+	const ts = uint64(1750000300)
+
+	tests := []struct {
+		name string
+		body []byte
+	}{
+		{name: "not json", body: []byte("not json at all")},
+		{name: "truncated json", body: []byte(`{"id":"x","choices":[`)},
+		{name: "json array not object", body: []byte(`[1,2,3]`)},
+		{name: "empty", body: []byte("")},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got, err := openResponse(tt.body, clientPriv, "m", "nonce", ts, time.Unix(int64(ts), 0))
+			if err == nil {
+				t.Fatalf("openResponse succeeded on %s, want error; got %s", tt.name, got)
+			}
+			asAttestErr(t, err)
+		})
+	}
+}
+
+// TestOpenResponseTimestampOverflow confirms a ts above MaxInt64 (not a real
+// unix-seconds value) fails closed with e2ee_failed rather than wrapping the
+// signed-clock conversion.
+func TestOpenResponseTimestampOverflow(t *testing.T) {
+	t.Parallel()
+	clientPriv := newClientKeypair(t)
+	body := []byte(`{"id":"x","choices":[]}`)
+	got, err := openResponse(body, clientPriv, "m", "nonce", math.MaxUint64, time.Unix(0, 0))
+	if err == nil {
+		t.Fatalf("openResponse succeeded with overflow ts, want e2ee_failed; got %s", got)
+	}
+	asAttestErr(t, err)
 }

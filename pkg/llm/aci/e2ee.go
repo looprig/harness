@@ -34,6 +34,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"io"
+	"math"
 	"strconv"
 	"strings"
 	"time"
@@ -664,5 +665,354 @@ func sealMessageContent(msg *Object, content Value, modelPub *secp256k1.PublicKe
 		return nil
 	default:
 		return nil
+	}
+}
+
+// =============================================================================
+// Task 3.3: openResponse — response open (content / reasoning_content /
+// embedding / text) + 5-minute replay window.
+// =============================================================================
+//
+// The gateway SEALS the response to the CLIENT's public key (the X-Client-Pub-Key
+// from 3.2) under a response AAD bound by the request's model/nonce/timestamp;
+// openResponse INVERTS that, in place over the ORDERED body (Task 1.3 *Object),
+// then re-serializes with CompactJSON so the opened cleartext body's bytes match
+// the gateway's serde_json::to_vec exactly (Task 5.2 hashes those bytes for the
+// receipt cleartext_hash — blocker #1).
+//
+// Per-field response AAD (reproduced byte-exact from the Rust reference
+// src/aggregator/service/e2ee_crypto.rs so the bytes match the gateway's seal):
+//
+//   - chat (choices[i]): for each choice's message.content and
+//     message.reasoning_content (and the legacy choices[i].text):
+//     "v2|resp|algo={algo}|model={model}|id={id}|choice={ci}|field={field}|n={nonce}|ts={ts}"
+//   - embedding (data[i].embedding):
+//     "v2|resp|algo={algo}|model={model}|id={id}|data={di}|field={field}|n={nonce}|ts={ts}"
+//
+// {algo} is e2eeRequestAlgo; {model} is the REQUEST model (the param — for AciV2
+// the gateway binds ctx.request_model, NOT the response body's model); {id} is the
+// response body's "id" string (default ""); {ci}/{di} is the item's explicit
+// "index" (u64) when present, else its array position; {nonce}/{ts} are the
+// request's nonce/timestamp (the same values 3.2 surfaced).
+//
+// Dispatch mirrors the gateway: a body with "data" is an embedding response;
+// otherwise "choices" is a chat/completion response.
+//
+// Field reconstruction is byte-critical for the cleartext hash:
+//   - content / reasoning_content / text: the gateway sealed the RAW string bytes,
+//     so the opened plaintext is set back as String(plaintext) — NOT JSON-parsed.
+//   - embedding: the gateway sealed serde_json::to_vec(embedding), so the opened
+//     plaintext is PARSED with ParseBodyValue and set back as that Value (it
+//     round-trips a float array or base64 string to its original type).
+//
+// Fail-secure: any parse failure, any open failure, or a replay-window violation
+// returns the fail-closed *llm.AttestationError (reason e2ee_failed) with a typed,
+// secret-free cause and a nil body — no partial cleartext ever escapes.
+
+// e2eeReplayWindowSeconds is the maximum tolerated skew (in seconds) between now
+// and the request timestamp bound into the response AAD. It is a defensive client
+// freshness guard: the live path uses a fresh per-request ts, so a larger skew
+// means the response (or the caller's clock) is stale and the open is refused.
+const e2eeReplayWindowSeconds = 300
+
+// Response body keys read during dispatch, and the per-field names bound into
+// each response AAD. They are the OpenAI response shape the gateway seals; pinned
+// as constants so a typo cannot silently desync from the gateway. The respField*
+// values double as the {field} token in the AAD AND the object key to open, so
+// reconstruction and AAD construction can never drift.
+const (
+	bodyKeyID      = "id"
+	bodyKeyChoices = "choices"
+	bodyKeyData    = "data"
+	bodyKeyMessage = "message"
+	bodyKeyIndex   = "index"
+
+	respFieldContent          = "content"
+	respFieldReasoningContent = "reasoning_content"
+	respFieldText             = "text"
+	respFieldEmbedding        = "embedding"
+)
+
+// e2eeReplayError is the typed cause wrapped inside the e2ee_failed
+// AttestationError when the response timestamp is outside the replay window. It
+// carries the skew (in seconds) — a numeric label, never a secret — so the caller
+// can inspect how stale the response was without parsing the message.
+type e2eeReplayError struct {
+	SkewSeconds   int64
+	WindowSeconds int64
+}
+
+func (e *e2eeReplayError) Error() string {
+	return "aci e2ee response: timestamp skew " + strconv.FormatInt(e.SkewSeconds, 10) +
+		"s exceeds replay window " + strconv.FormatInt(e.WindowSeconds, 10) + "s"
+}
+
+// e2eeBodyShapeError is the typed cause wrapped inside the e2ee_failed
+// AttestationError when the sealed response is not a JSON object (the only shape
+// the gateway emits). It names the actual top-level kind so the failure is
+// inspectable; the kind label is structural, never payload bytes.
+type e2eeBodyShapeError struct {
+	Kind string
+}
+
+func (e *e2eeBodyShapeError) Error() string {
+	return "aci e2ee response: body is " + e.Kind + ", want a JSON object"
+}
+
+// chatResponseAAD builds the chat-response AAD for one choice field
+// (content / reasoning_content / text).
+func chatResponseAAD(algo, model, id string, choiceIndex uint64, field, nonce string, ts uint64) []byte {
+	return []byte("v2|resp|algo=" + algo + "|model=" + model +
+		"|id=" + id + "|choice=" + strconv.FormatUint(choiceIndex, 10) +
+		"|field=" + field + "|n=" + nonce + "|ts=" + strconv.FormatUint(ts, 10))
+}
+
+// embeddingResponseAAD builds the embedding-response AAD for one data item's
+// embedding field.
+func embeddingResponseAAD(algo, model, id string, dataIndex uint64, field, nonce string, ts uint64) []byte {
+	return []byte("v2|resp|algo=" + algo + "|model=" + model +
+		"|id=" + id + "|data=" + strconv.FormatUint(dataIndex, 10) +
+		"|field=" + field + "|n=" + nonce + "|ts=" + strconv.FormatUint(ts, 10))
+}
+
+// valueAsUint64 returns the u64 value of v when it is an integer JSON number
+// (Number / Int / Uint), and false otherwise. The gateway's index fields are u64;
+// a missing or non-integer index falls back to the array position at the call
+// site, so this never errors — it only reports presence.
+func valueAsUint64(v Value) (uint64, bool) {
+	switch t := v.(type) {
+	case Uint:
+		return uint64(t), true
+	case Int:
+		if t < 0 {
+			return 0, false
+		}
+		return uint64(t), true
+	case Number:
+		n, err := strconv.ParseUint(string(t), 10, 64)
+		if err != nil {
+			return 0, false
+		}
+		return n, true
+	default:
+		return 0, false
+	}
+}
+
+// itemIndex returns the item's explicit "index" (u64) when present and integral,
+// else the array position pos. It mirrors the gateway: choices[i]["index"] /
+// data[i]["index"] when set, otherwise the positional index. pos is a slice index
+// (always >= 0 from range); the guard makes that bound explicit so the unsigned
+// conversion cannot wrap.
+func itemIndex(item *Object, pos int) uint64 {
+	if v, ok := objectGet(item, bodyKeyIndex); ok {
+		if n, ok := valueAsUint64(v); ok {
+			return n
+		}
+	}
+	if pos < 0 {
+		return 0
+	}
+	return uint64(pos)
+}
+
+// openResponse opens a gateway-sealed E2EE v2 response with the client private
+// key and returns the cleartext body (CompactJSON of the order-preserving
+// *Object). model/nonce/ts are the REQUEST values bound into every response AAD
+// (surfaced by 3.2's sealRequest); now is injected so callers control the replay
+// clock. Every failure — a bad parse, a non-object body, a stale timestamp, or
+// any field open failure — returns the fail-closed *llm.AttestationError (reason
+// e2ee_failed) with a typed, secret-free cause and a nil body.
+func openResponse(sealedResp []byte, clientPriv *secp256k1.PrivateKey, model, nonce string, ts uint64, now time.Time) ([]byte, error) {
+	if clientPriv == nil {
+		return nil, attestErr(reasonE2EEFailed, &e2eeOpenError{Stage: "nil client key"})
+	}
+
+	// Replay window: refuse a response whose bound timestamp is more than the
+	// window away from now, in either clock direction. A ts above MaxInt64 is not
+	// a real unix-seconds value (it cannot fit a signed clock) — fail closed rather
+	// than wrap on the int64 conversion.
+	if ts > math.MaxInt64 {
+		return nil, attestErr(reasonE2EEFailed, &e2eeReplayError{SkewSeconds: math.MaxInt64, WindowSeconds: e2eeReplayWindowSeconds})
+	}
+	skew := now.Unix() - int64(ts)
+	if skew < 0 {
+		skew = -skew
+	}
+	if skew > e2eeReplayWindowSeconds {
+		return nil, attestErr(reasonE2EEFailed, &e2eeReplayError{SkewSeconds: skew, WindowSeconds: e2eeReplayWindowSeconds})
+	}
+
+	parsed, err := ParseBodyValue(sealedResp)
+	if err != nil {
+		return nil, attestErr(reasonE2EEFailed, err)
+	}
+	body, ok := parsed.(*Object)
+	if !ok {
+		return nil, attestErr(reasonE2EEFailed, &e2eeBodyShapeError{Kind: valueKind(parsed)})
+	}
+
+	responseID := responseBodyID(body)
+
+	if v, ok := objectGet(body, bodyKeyData); ok {
+		if err := openEmbeddingData(v, clientPriv, model, responseID, nonce, ts); err != nil {
+			return nil, attestErr(reasonE2EEFailed, err)
+		}
+	} else if v, ok := objectGet(body, bodyKeyChoices); ok {
+		if err := openChatChoices(v, clientPriv, model, responseID, nonce, ts); err != nil {
+			return nil, attestErr(reasonE2EEFailed, err)
+		}
+	}
+
+	out, err := CompactJSON(body)
+	if err != nil {
+		return nil, attestErr(reasonE2EEFailed, err)
+	}
+	return out, nil
+}
+
+// responseBodyID returns the body's "id" string (the AAD {id}), defaulting to ""
+// when absent or not a string — matching the gateway's id.unwrap_or_default().
+func responseBodyID(body *Object) string {
+	v, ok := objectGet(body, bodyKeyID)
+	if !ok {
+		return ""
+	}
+	s, ok := v.(String)
+	if !ok {
+		return ""
+	}
+	return string(s)
+}
+
+// openChatChoices opens each choice's sealed content / reasoning_content / text
+// fields in place. A non-array choices value or a non-object choice is left
+// untouched; only present STRING fields are sealed blobs and get opened.
+func openChatChoices(v Value, clientPriv *secp256k1.PrivateKey, model, id, nonce string, ts uint64) error {
+	choices, ok := v.(Array)
+	if !ok {
+		return nil
+	}
+	for i := range choices {
+		choice, ok := choices[i].(*Object)
+		if !ok {
+			continue
+		}
+		ci := itemIndex(choice, i)
+
+		// Legacy completion: a choices[i].text string is a sealed blob.
+		if err := openStringField(choice, respFieldText, clientPriv,
+			chatResponseAAD(e2eeRequestAlgo, model, id, ci, respFieldText, nonce, ts)); err != nil {
+			return err
+		}
+
+		msg, ok := objectGet(choice, bodyKeyMessage)
+		if !ok {
+			continue
+		}
+		msgObj, ok := msg.(*Object)
+		if !ok {
+			continue
+		}
+		if err := openStringField(msgObj, respFieldContent, clientPriv,
+			chatResponseAAD(e2eeRequestAlgo, model, id, ci, respFieldContent, nonce, ts)); err != nil {
+			return err
+		}
+		if err := openStringField(msgObj, respFieldReasoningContent, clientPriv,
+			chatResponseAAD(e2eeRequestAlgo, model, id, ci, respFieldReasoningContent, nonce, ts)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// openEmbeddingData opens each data item's sealed embedding field in place. A
+// non-array data value or a non-object item is left untouched.
+func openEmbeddingData(v Value, clientPriv *secp256k1.PrivateKey, model, id, nonce string, ts uint64) error {
+	data, ok := v.(Array)
+	if !ok {
+		return nil
+	}
+	for i := range data {
+		item, ok := data[i].(*Object)
+		if !ok {
+			continue
+		}
+		di := itemIndex(item, i)
+		if err := openEmbeddingField(item, clientPriv,
+			embeddingResponseAAD(e2eeRequestAlgo, model, id, di, respFieldEmbedding, nonce, ts)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// openStringField opens a sealed STRING field (content / reasoning_content /
+// text) in place: it decrypts the hex blob under aad and sets the field back to
+// the RAW recovered string (no JSON parse). A missing field or a non-string value
+// is a no-op (the field is not in the E2EE flow). An open failure propagates.
+func openStringField(obj *Object, field string, clientPriv *secp256k1.PrivateKey, aad []byte) error {
+	v, ok := objectGet(obj, field)
+	if !ok {
+		return nil
+	}
+	s, ok := v.(String)
+	if !ok {
+		return nil // e.g. null content: not a sealed blob.
+	}
+	plaintext, err := open(clientPriv, string(s), aad)
+	if err != nil {
+		return err
+	}
+	objectSet(obj, field, String(string(plaintext)))
+	return nil
+}
+
+// openEmbeddingField opens a sealed embedding field in place: it decrypts the hex
+// blob under aad, then PARSES the recovered plaintext with ParseBodyValue and sets
+// the field to that Value (the gateway sealed serde_json::to_vec(embedding), so
+// the plaintext is JSON — a float array or a base64 string). A missing field or a
+// non-string value is a no-op. An open or parse failure propagates.
+func openEmbeddingField(obj *Object, clientPriv *secp256k1.PrivateKey, aad []byte) error {
+	v, ok := objectGet(obj, respFieldEmbedding)
+	if !ok {
+		return nil
+	}
+	s, ok := v.(String)
+	if !ok {
+		return nil
+	}
+	plaintext, err := open(clientPriv, string(s), aad)
+	if err != nil {
+		return err
+	}
+	parsed, err := ParseBodyValue(plaintext)
+	if err != nil {
+		return err
+	}
+	objectSet(obj, respFieldEmbedding, parsed)
+	return nil
+}
+
+// valueKind returns a short structural label for a Value, used only in the
+// non-object body-shape error. It never renders payload bytes.
+func valueKind(v Value) string {
+	switch v.(type) {
+	case String:
+		return "string"
+	case Int, Uint, Number:
+		return "number"
+	case Float:
+		return "float"
+	case Bool:
+		return "bool"
+	case Null:
+		return "null"
+	case Array:
+		return "array"
+	case *Object:
+		return "object"
+	default:
+		return "unknown"
 	}
 }
