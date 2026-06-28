@@ -1,0 +1,80 @@
+{
+  "description": "Authoritative body-hash golden vectors. body_hash / cleartext_hash in ACI receipts is sha256_hex(compact serde_json::to_vec(body)) where serde_json has the preserve_order feature on, so map key order is the INSERTION order the client sent — NOT sorted. This is the byte-for-byte target the Go encoder (Task 1.3) must reproduce; Go's encoding/json sorts map keys and will NOT match unless ordering is preserved explicitly.",
+  "source": {
+    "repo": "Dstack-TEE private-ai-gateway",
+    "commit": "1b43f76e43c2459856faebe9cd97d8e01cb0df0c",
+    "serializer": "serde_json::to_vec with crate feature preserve_order (Cargo.toml: serde_json features=[\"preserve_order\"])",
+    "digest_fn": "src/aci/canonical.rs::sha256_hex == \"sha256:\"+hex(sha256(bytes))",
+    "generated_by": "tests/zz_aci_vector_harness.rs::emit_body_hash_vectors (scratch harness, not committed upstream)"
+  },
+  "fields": {
+    "name": "stable vector identifier",
+    "body": "the request body Value (parsed; for human readability only — order shown is insertion order)",
+    "body_text": "the EXACT compact serialization as a UTF-8 string (authoritative key order)",
+    "compact_hex": "lowercase hex of the compact serde_json::to_vec bytes (authoritative)",
+    "sha256": "\"sha256:\"+hex(sha256(compact_hex bytes))"
+  },
+  "vectors": [
+    {
+      "name": "chat_string_content",
+      "body": {
+        "model": "z-ai/glm-5.2",
+        "messages": [
+          {
+            "role": "user",
+            "content": "Hello, world"
+          }
+        ],
+        "temperature": 0,
+        "stream": false
+      },
+      "body_text": "{\"model\":\"z-ai/glm-5.2\",\"messages\":[{\"role\":\"user\",\"content\":\"Hello, world\"}],\"temperature\":0,\"stream\":false}",
+      "compact_hex": "7b226d6f64656c223a227a2d61692f676c6d2d352e32222c226d65737361676573223a5b7b22726f6c65223a2275736572222c22636f6e74656e74223a2248656c6c6f2c20776f726c64227d5d2c2274656d7065726174757265223a302c2273747265616d223a66616c73657d",
+      "sha256": "sha256:bcdba18f57c27ee29361cecf7448996302ae4a6b12e4e07689c29ae354743772"
+    },
+    {
+      "name": "chat_array_content_text_and_image",
+      "body": {
+        "model": "z-ai/glm-5.2",
+        "messages": [
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "What is in this image?"
+              },
+              {
+                "type": "image_url",
+                "image_url": {
+                  "url": "https://example.com/cat.png"
+                }
+              }
+            ]
+          }
+        ],
+        "temperature": 1,
+        "stream": true
+      },
+      "body_text": "{\"model\":\"z-ai/glm-5.2\",\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"What is in this image?\"},{\"type\":\"image_url\",\"image_url\":{\"url\":\"https://example.com/cat.png\"}}]}],\"temperature\":1,\"stream\":true}",
+      "compact_hex": "7b226d6f64656c223a227a2d61692f676c6d2d352e32222c226d65737361676573223a5b7b22726f6c65223a2275736572222c22636f6e74656e74223a5b7b2274797065223a2274657874222c2274657874223a225768617420697320696e207468697320696d6167653f227d2c7b2274797065223a22696d6167655f75726c222c22696d6167655f75726c223a7b2275726c223a2268747470733a2f2f6578616d706c652e636f6d2f6361742e706e67227d7d5d7d5d2c2274656d7065726174757265223a312c2273747265616d223a747275657d",
+      "sha256": "sha256:ff5689ba9de9da2901dca7189d0aea3a86ba7bc517fe079722ace37c0995176e"
+    },
+    {
+      "name": "chat_insertion_order_not_sorted",
+      "body": {
+        "stream": false,
+        "model": "z-ai/glm-5.2",
+        "messages": [
+          {
+            "role": "system",
+            "content": "be terse"
+          }
+        ]
+      },
+      "body_text": "{\"stream\":false,\"model\":\"z-ai/glm-5.2\",\"messages\":[{\"role\":\"system\",\"content\":\"be terse\"}]}",
+      "compact_hex": "7b2273747265616d223a66616c73652c226d6f64656c223a227a2d61692f676c6d2d352e32222c226d65737361676573223a5b7b22726f6c65223a2273797374656d222c22636f6e74656e74223a226265207465727365227d5d7d",
+      "sha256": "sha256:886f02bbaa26fe362a5832b17ef7eb1fe0612a13b53732f174d706bc036403f0"
+    }
+  ]
+}
