@@ -136,7 +136,11 @@ func verifyEd25519Endorsement(pub, payload, sig []byte) error {
 // verifySecp256k1Endorsement verifies a fixed 64-byte r‖s secp256k1 signature
 // (no recovery byte) over sha256(payload) with a SEC1 (33/65-byte) public key.
 // r = sig[:32], s = sig[32:64], big-endian; a scalar that overflows the curve
-// order N is rejected (SetByteSlice reports the overflow).
+// order N is rejected (SetByteSlice reports the overflow), and decred's Verify
+// itself rejects r/s == 0 (it requires r, s in [1, N-1]). Low-S is intentionally
+// NOT enforced: the k256 reference does not mandate it on the verify path, and a
+// high-S (malleable) signature is harmless here because verification binds the
+// RECOMPUTED keyset digest — there is no second signed object to forge against.
 func verifySecp256k1Endorsement(pub, payload, sig []byte) error {
 	if len(sig) != secp256k1SignatureSize {
 		return endorsementInvalid(algoSecp256k1, "secp256k1 signature wrong length", nil)
