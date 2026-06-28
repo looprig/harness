@@ -197,8 +197,18 @@ Note: child system-prompt resolution stays Task 6.
    `Notice`s on `Session.Notices`.
 5. *Fail-secure:* an orphan `ToolResultMessage` (no matching tool-use) and an unknown event type →
    `Warning`, never panic. (Untrusted-input boundary, D11.)
-**Step 2:** FAIL. **Step 3 (implement):** add the terminal/notice/fold fold-rows and a default
-branch that records a `Warning` rather than failing. **Step 4:** PASS.
+6. *Leftover gate at terminal (the Task-4-flagged edge):* a `PermissionRequested` (pending, no
+   resolving command) followed by `TurnInterrupted` with **no** `StepDone` for that step → the
+   buffered gate is not silently dropped: exactly one `Warning` (e.g. "gate for <tool> unresolved at
+   turn terminal"), buffer cleared. Same at end-of-stream `finalize` for a snapshot mid-prompt (turn
+   never terminated) → one `Warning`, no double-counting. (A *denied* gate still yields a `StepDone`
+   with the error result, so it flushes normally — only a *pending* gate reaches this path.)
+**Step 2:** FAIL. **Step 3 (implement):** add the terminal/notice/fold fold-rows and a `default`
+branch that records a `Warning` rather than failing. For the turn terminals (`TurnDone`/`Failed`/
+`Interrupted`) and in `finalize`, drain any still-buffered per-loop gates (`stepGateBuf[loopID]` +
+their `gatesByExecID` entries) as one `Warning` each so they never leak/drop; keep `finalize`'s
+warning emission **deterministic** (emit child-orphan warnings, then leftover-gate warnings, each in
+a stable order — consistent with Task 4's sorted orphan warnings). **Step 4:** PASS.
 **Step 5:** `git commit -m "feat(transcript): outcomes, folded input, notices, fail-secure warnings"`.
 
 ---
