@@ -176,11 +176,11 @@ type Warning struct { Text string; At time.Time }
 | Record | Action |
 |--------|--------|
 | `SessionStarted` | set `Config` (from `ConfigFingerprint`: `ModelID`, `AgentKind`, `PermissionPosture`, `SystemPromptRev`), `StartedAt`. |
-| `LoopStarted` | new `Loop`; resolve `SystemPrompt` via the resolver; if `ParentToolUseID != ""`, attach as `Child` of the matching `ToolCall` (found by `ToolUseID`); else it is `Root`. |
+| `LoopStarted` | new `Loop`; resolve `SystemPrompt` via the resolver. If `ParentToolUseID == ""` it is `Root`; else **buffer** the child keyed by `{Cause.LoopID, ParentToolUseID}` — the parent `ToolCall` does not exist yet (Decision 6). Its later turn/step events route by `Header.LoopID`. |
 | `TurnStarted` / `TurnFoldedInto` | open a `Turn` on the owning loop (`Header.Coordinates.LoopID`), set `User` from `.Message`. |
 | `PermissionRequested` / `UserInputRequested` | **buffer** a `GateAction{Decision: pending, …}` for the current (not-yet-emitted) step, keyed by `ToolExecutionID` — capturing `ToolName`/`Description` (permission) or `Question`/`Choices` (askUser) from the durable event, plus `OpenedAt` (Decision 5). |
 | `ApproveToolCall` / `DenyToolCall` / `ProvideUserInput` **(commands, `Agency==User`)** | resolve the buffered gate by `ToolExecutionID` → `approved`(+`Scope`) / `denied` / `answered`(+`Answer`) + `DecidedAt`; an unmatched command → `Warning`. |
-| `StepDone` | split `.Messages` (`content.AgenticMessages`) into the leading `AIMessage` + trailing `ToolResultMessage`s; create a `Step`; pair each `ToolUseBlock` to its `ToolResultMessage` by `ToolUseID`. Then **flush** the step's buffered gates onto `Step.Gates`, binding each to a `ToolCall` by tool **name** (exact when unique in the step, else positional among same-named; sets `ToolCall.Gate` + `GateAction.ToolUseID`); clear the buffer. |
+| `StepDone` | split `.Messages` (`content.AgenticMessages`) into the leading `AIMessage` + trailing `ToolResultMessage`s; create a `Step`; pair each `ToolUseBlock` to its `ToolResultMessage` by `ToolUseID`. Then **flush** the step's buffered gates onto `Step.Gates`, binding each to a `ToolCall` by tool **name** (exact when unique in the step, else positional among same-named; sets `ToolCall.Gate` + `GateAction.ToolUseID`); clear the buffer. Also **attach** any buffered child loop whose `{loopID, ToolUseID}` matches a `ToolCall` → `ToolCall.Child` (Decision 6). |
 | `TurnDone` / `TurnFailed` / `TurnInterrupted` | close the open turn with `Outcome` (+ error text for failed). |
 | `SessionActive`/`Idle`/`Stopped`, `RestoreStarted`/`Done`/`Errored` | append a `Notice`. |
 | `FenceRecord`, ephemeral events | never reach the builder / not journaled. |
@@ -238,8 +238,14 @@ territory by Task 5: such buffered gates flush to the turn's last step (or a `Wa
 
 `LoopStarted.ParentToolUseID` (the field added in the subagent-card design) is the link: a child
 loop attaches as `ToolCall.Child` on the `Subagent` call whose `ToolUseID == ParentToolUseID`.
-The renderer draws the child's whole transcript indented beneath that card, collapsible, with a
-per-depth left-border color. looprig owns this entirely from `ParentToolUseID` + `Cause`
+**Ordering:** the child's `LoopStarted` and entire lifecycle are journaled BEFORE the parent's
+`StepDone` (the `Subagent` tool runs the child to completion, then the parent step commits — the
+same "child precedes parent `StepDone`" reality the subagent-card design relies on). So the parent
+`ToolCall` does not exist when the child appears; the builder **buffers** each child keyed by
+`{Cause.LoopID, ParentToolUseID}` and attaches it when the parent `StepDone` creates the matching
+`ToolCall`. A child whose parent tool-use never materialises → `Warning`. The renderer draws the
+child's whole transcript indented beneath that card, collapsible, with a per-depth left-border
+color. looprig owns this entirely from `ParentToolUseID` + `Cause`
 ancestry; **swe has no say in the nesting**. Depth is whatever the journal records (swe is
 structurally depth-1, but the model and renderer are depth-general).
 

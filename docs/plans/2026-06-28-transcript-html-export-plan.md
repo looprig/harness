@@ -158,24 +158,28 @@ embedded `command.GateRoute` and `Agency` on `Header`.
 
 ---
 
-### Task 4: Subagent nesting — child loop attaches under its spawning tool call (D6)
+### Task 4: Subagent nesting — buffer child loop, reconcile at parent StepDone (D6)
 
-**Files:** Modify `pkg/transcript/reconstruct.go`; Test rows.
+**Durable ordering reality (matches the 2026-06-22 subagent-card design, "child `StepDone` precedes parent `StepDone`"):** a child loop's `LoopStarted` and its ENTIRE lifecycle land in the journal **BEFORE** the parent `StepDone` that carries the `Subagent` tool-use + result (the Subagent tool runs the child to completion, then the parent step commits). So the parent `ToolCall` does not exist when the child `LoopStarted` arrives — **buffer the child and attach it at the parent `StepDone`** (same shape as Task 3's gate flush). The child `LoopStarted` carries the parent coordinates in `Cause` (`Cause.LoopID` = parent loop) plus `ParentToolUseID`.
 
-**Step 1 (failing tests):**
-1. Primary `StepDone` contains `ToolUseBlock{ID:"sub1", Name:"Subagent"}`; later a
-   `LoopStarted{LoopID:child, AgentName:"reviewer", ParentToolUseID:"sub1"}` + the child's own
-   `TurnStarted`/`StepDone`/`TurnDone`. Assert the primary `ToolCall` with `ToolUseID=="sub1"` has a
-   non-nil `Child *Loop` whose `AgentName=="reviewer"` and whose `Turns` hold the child's step; the
-   child is **not** in `Root`.
-2. Two concurrent children (`sub1`,`sub2`) attach to their respective tool calls — no cross-attach.
-3. `LoopStarted` whose `ParentToolUseID` matches no tool-use → child becomes a top-level `Warning`
-   (orphan loop), never a panic.
-**Step 2:** FAIL. **Step 3 (implement):** keep `toolByUseID map[string]*ToolCall` populated as steps
-fold. On `LoopStarted` with non-empty `ParentToolUseID`, look up the tool call and set its `Child`;
-route that loop's later `TurnStarted`/`StepDone`/terminal events to the child `Loop` (loops are keyed
-by `Header.Coordinates.LoopID`). Resolve the system prompt for the child via the resolver (Task 6).
-**Step 4:** PASS. **Step 5:** `git commit -m "feat(transcript): nest subagent loops under spawning tool call"`.
+**Also folds in Task 3's M1 marker — make gate buffering per-loop:** now that loops interleave, key the per-step gate buffer by the gate event's `Header.LoopID` and flush at that loop's `StepDone`, else a child-loop gate could flush onto the parent's step.
+
+**Files:** Modify `pkg/transcript/reconstruct.go`; Test rows in `reconstruct_test.go`.
+
+**Step 1 (failing tests)** — feed events in REAL journal order (child *before* parent StepDone):
+1. Parent `TurnStarted` → child `LoopStarted{LoopID:child, AgentName:"reviewer", ParentToolUseID:"sub1", Cause:{LoopID:primary, TurnID, StepID}}` → child `TurnStarted`/`StepDone`/`TurnDone` → parent `StepDone{[AIMessage{ToolUseBlock{ID:"sub1", Name:"Subagent"}}, ToolResult{ToolUseID:"sub1"}]}` → parent `TurnDone`. Assert: primary `ToolCall` `ToolUseID=="sub1"` has non-nil `Child *Loop` (`AgentName=="reviewer"`, its `Turns` hold the child step); the child is NOT `Root`; `Root` is the primary only.
+2. Two concurrent children (`sub1`,`sub2`, both before the parent StepDone) attach to their respective tool calls — no cross-attach.
+3. Orphan: child `LoopStarted{ParentToolUseID:"nope"}` whose id never appears as a tool-use → one `Warning`, no panic, child not in `Root`.
+4. **Per-loop gate isolation (M1 regression):** a child-loop permission gate (`Header.LoopID==child`) approved, interleaved before BOTH the child `StepDone` and the parent `StepDone` → binds to the CHILD's tool, NOT the parent's.
+
+**Step 2:** FAIL. **Step 3 (implement):**
+- Buffer `childByParent map[childKey]*Loop` with `childKey = {parentLoopID uuid.UUID; toolUseID string}` (parentLoopID from the child `LoopStarted.Cause.LoopID` — matches the subagent-card spawnKey precedent and avoids cross-loop ToolUseID collisions). On `LoopStarted` with `ParentToolUseID != ""`: create the child `Loop`, register it in `loops` (so its later events route by `LoopID`, already working), and buffer under `{Cause.LoopID, ParentToolUseID}` — do NOT set `Root`.
+- `onStepDone` (loop `L = Header.LoopID`): after tools built, for each `tc`, look up `childByParent[{L, tc.ToolUseID}]`; if present set `tc.Child` and delete the entry.
+- End-of-stream: any child still buffered (parent tool-use never appeared) → one `Warning` each (fail-secure).
+- Gate buffer per-loop: `stepGateBuf map[uuid.UUID][]*GateAction` keyed by loopID; `onPermissionRequested`/`onUserInputRequested` append under `Header.LoopID`; `flushGates(loopID, step)` flushes that loop's buffer. (`gatesByExecID` stays global.)
+**Step 4:** PASS. **Step 5:** `git commit -m "feat(transcript): nest subagent loops via buffer+reconcile; per-loop gate buffering"`.
+
+Note: child system-prompt resolution stays Task 6.
 
 ---
 
