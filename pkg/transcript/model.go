@@ -131,6 +131,10 @@ type Step struct {
 	StepID uuid.UUID
 	AI     *Message
 	Tools  []*ToolCall
+	// Gates are every human-in-the-loop gate raised during this step, in arrival
+	// order. A gate bound to one of this step's tool calls is ALSO referenced by
+	// that ToolCall.Gate (the same pointer); an unbound gate lives only here.
+	Gates []*GateAction
 }
 
 // ToolCall is a single tool invocation: the request, its paired result, and the
@@ -155,10 +159,25 @@ type GateAction struct {
 	// Scope is meaningful only when Kind == GateKindPermission. An AskUser gate's
 	// zero Scope is not significant, so callers must branch on Kind before reading
 	// it.
-	Scope     tool.ApprovalScope
-	Question  string
-	Choices   []string
-	Answer    string
+	Scope tool.ApprovalScope
+	// ToolName is the requesting tool's name, recovered from the durable
+	// PermissionRequest (e.g. "Bash"). It is the key a permission gate binds to its
+	// ToolCall by; empty for an AskUser gate.
+	ToolName string
+	// Description is the redacted approval-prompt body from the PermissionRequest
+	// (never raw args). Empty for an AskUser gate.
+	Description string
+	Question    string
+	Choices     []string
+	Answer      string
+	// ToolUseID is the content.ToolUseBlock.ID of the tool call this gate bound to,
+	// or "" if the gate bound to no call (it then renders as a bare notification).
+	ToolUseID string
+	// OpenedAt is when the gate was raised (the PermissionRequested /
+	// UserInputRequested event's CreatedAt).
+	OpenedAt time.Time
+	// DecidedAt is when the resolving user command landed; the zero time while the
+	// gate is still pending.
 	DecidedAt time.Time
 }
 

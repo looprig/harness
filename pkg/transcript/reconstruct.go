@@ -45,22 +45,36 @@ type builder struct {
 	// or terminal turn event resolves to the right turn.
 	openTurns map[uuid.UUID]*Turn
 	// toolByUseID indexes every ToolCall by its provider tool-use id, the durable
-	// key that pairs a tool result (and, in a later task, a gate or child loop) back
-	// to its call.
+	// key that pairs a tool result (and, in a later task, a child loop) back to its
+	// call.
 	toolByUseID map[string]*ToolCall
-	// toolByExecID indexes ToolCalls by tool-execution id for gate correlation; a
-	// later task populates it.
-	toolByExecID map[uuid.UUID]*ToolCall
+	// gatesByExecID indexes the open (not-yet-flushed) gates of the current step by
+	// their tool-execution id, so a resolving user command can find the gate it
+	// decides. On replay a gate and its command land BEFORE the StepDone that carries
+	// the tool, so gates cannot bind on arrival; they are buffered and flushed at
+	// StepDone (see flushGates). Cleared at each flush, so it only ever holds the
+	// current step's gates.
+	//
+	// Task 4: this single/global buffer must become per-loop (key by gate event
+	// Header.LoopID, flush at that loop's StepDone) once subagent loops interleave —
+	// otherwise a parent gate can flush onto a child's step.
+	gatesByExecID map[uuid.UUID]*GateAction
+	// stepGateBuf accumulates the current step's gates in arrival order; flushGates
+	// moves it onto Step.Gates and clears it at StepDone.
+	//
+	// Task 4: see gatesByExecID — this buffer must likewise become per-loop once
+	// subagent loops interleave.
+	stepGateBuf []*GateAction
 }
 
 func newBuilder(prompts SystemPromptResolver) *builder {
 	return &builder{
-		prompts:      prompts,
-		session:      &Session{},
-		loops:        make(map[uuid.UUID]*Loop),
-		openTurns:    make(map[uuid.UUID]*Turn),
-		toolByUseID:  make(map[string]*ToolCall),
-		toolByExecID: make(map[uuid.UUID]*ToolCall),
+		prompts:       prompts,
+		session:       &Session{},
+		loops:         make(map[uuid.UUID]*Loop),
+		openTurns:     make(map[uuid.UUID]*Turn),
+		toolByUseID:   make(map[string]*ToolCall),
+		gatesByExecID: make(map[uuid.UUID]*GateAction),
 	}
 }
 
@@ -105,16 +119,39 @@ func (b *builder) foldEvent(ev event.Event) {
 		b.onStepDone(e)
 	case event.TurnDone:
 		b.onTurnDone(e)
+	case event.PermissionRequested:
+		b.onPermissionRequested(e)
+	case event.UserInputRequested:
+		b.onUserInputRequested(e)
 	default:
-		// Gates, subagent nesting, non-Done outcomes, and notices land in later
-		// tasks as additional cases.
+		// Subagent nesting, non-Done outcomes, and notices land in later tasks as
+		// additional cases.
 	}
 }
 
-// foldCommand dispatches a user command. Gate-resolving commands are handled in a
-// later task; for now every command no-ops.
-func (b *builder) foldCommand(command.Command) {
-	// Approve/Deny/ProvideUserInput gate resolution lands in a later task.
+// foldCommand resolves a buffered gate from the user command that decided it. The
+// gate-resolving commands are value types (matching the journal codec, which decodes
+// commands by value), so the switch is over value cases. A command that targets no
+// open gate is an anomaly at the untrusted-record boundary: it degrades to a Warning,
+// never a panic (fail-secure).
+//
+// We deliberately do NOT check Header.Agency == identity.AgencyUser here: this is a
+// read-only reconstruction of an already-journaled session, and only a user action
+// ever resolves a gate, so the recorded command is trusted as-is. (Agency is enforced
+// at the live command boundary, not at replay.)
+func (b *builder) foldCommand(cmd command.Command) {
+	switch c := cmd.(type) {
+	case command.ApproveToolCall:
+		if g := b.resolveGate(c.GateRoute.ToolExecutionID, DecisionApproved, c.Header.CreatedAt); g != nil {
+			g.Scope = c.Scope
+		}
+	case command.DenyToolCall:
+		b.resolveGate(c.GateRoute.ToolExecutionID, DecisionDenied, c.Header.CreatedAt)
+	case command.ProvideUserInput:
+		if g := b.resolveGate(c.GateRoute.ToolExecutionID, DecisionAnswered, c.Header.CreatedAt); g != nil {
+			g.Answer = c.Answer
+		}
+	}
 }
 
 // onSessionStarted seeds the session identity, config fingerprint, and start time.
@@ -179,6 +216,7 @@ func (b *builder) onStepDone(e event.StepDone) {
 			b.pairResult(m)
 		}
 	}
+	b.flushGates(step)
 	turn.Steps = append(turn.Steps, step)
 }
 
@@ -191,6 +229,117 @@ func (b *builder) onTurnDone(e event.TurnDone) {
 	turn.Outcome = OutcomeDone
 	turn.EndedAt = e.Header.CreatedAt
 	delete(b.openTurns, e.Header.LoopID)
+}
+
+// onPermissionRequested buffers a pending permission gate for the current step,
+// capturing the requesting tool's name and redacted description from the durable
+// PermissionRequest. The Request is nil-guarded: a replayed event whose request did
+// not round-trip yields a gate with empty name/description, still a valid pending
+// notification.
+func (b *builder) onPermissionRequested(e event.PermissionRequested) {
+	g := &GateAction{Kind: GateKindPermission, Decision: DecisionPending, OpenedAt: e.Header.CreatedAt}
+	if e.Request != nil {
+		g.ToolName = e.Request.ToolName()
+		g.Description = e.Request.Description()
+	}
+	b.bufferGate(e.ToolExecutionID, g)
+}
+
+// onUserInputRequested buffers a pending ask-user gate for the current step,
+// capturing the durable question and choices.
+func (b *builder) onUserInputRequested(e event.UserInputRequested) {
+	g := &GateAction{
+		Kind:     GateKindAskUser,
+		Decision: DecisionPending,
+		Question: e.Question,
+		Choices:  e.Choices,
+		OpenedAt: e.Header.CreatedAt,
+	}
+	b.bufferGate(e.ToolExecutionID, g)
+}
+
+// bufferGate indexes a pending gate by its tool-execution id (for the resolving
+// command) and appends it to the current step's buffer (for the StepDone flush).
+func (b *builder) bufferGate(execID uuid.UUID, g *GateAction) {
+	b.gatesByExecID[execID] = g
+	b.stepGateBuf = append(b.stepGateBuf, g)
+}
+
+// resolveGate records a user decision on the gate the command targets and returns it
+// so the caller can attach scope or answer. An unmatched command targets no open
+// gate — fail-secure: it records a Warning and returns nil rather than panicking.
+func (b *builder) resolveGate(execID uuid.UUID, d Decision, at time.Time) *GateAction {
+	g, ok := b.gatesByExecID[execID]
+	if !ok {
+		b.warn("gate command targets no open gate (tool-execution id "+execID.String()+")", at)
+		return nil
+	}
+	g.Decision = d
+	g.DecidedAt = at
+	return g
+}
+
+// flushGates moves the step's buffered gates onto step.Gates and binds each to the
+// tool call it gated. A permission gate binds to the first not-yet-bound tool whose
+// Name equals the gate's ToolName, so two same-named gated calls in one step bind
+// positionally; an ask-user gate (no ToolName) binds to the lone unbound AskUser
+// call if present. Binding sets ToolCall.Gate and GateAction.ToolUseID to the same
+// pointer; an unmatched gate stays unbound on step.Gates, still renderable from its
+// own durable data. The buffer and its exec-id index are cleared after the flush.
+//
+// (Task 5's turn-terminal-with-pending-gate edge — a buffered gate whose turn ends
+// without a StepDone — will plug in by flushing the leftover buffer at the terminal.)
+func (b *builder) flushGates(step *Step) {
+	step.Gates = b.stepGateBuf
+	for _, g := range step.Gates {
+		if tc := firstUnboundNamed(step.Tools, gateToolName(g)); tc != nil {
+			tc.Gate = g
+			g.ToolUseID = tc.ToolUseID
+		}
+	}
+	b.stepGateBuf = nil
+	clear(b.gatesByExecID)
+}
+
+// askUserToolName is the tool name an ask-user gate binds to. The AskUser tool emits
+// no PermissionRequest, so its gate carries no ToolName; binding falls back to the
+// tool call's own name.
+//
+// This MUST stay in lockstep with the unexported askUserToolName in
+// pkg/tools/askuser.go (the tool's authoritative Info().Name). transcript is
+// pure-data-deps only and cannot import pkg/tools, so this is a deliberate duplicate
+// of that constant, not a divergent literal.
+const askUserToolName = "AskUser"
+
+// gateToolName returns the tool name a gate binds to: the permission gate's recovered
+// ToolName, or the AskUser tool name for an ask-user gate.
+func gateToolName(g *GateAction) string {
+	if g.Kind == GateKindAskUser {
+		return askUserToolName
+	}
+	return g.ToolName
+}
+
+// firstUnboundNamed returns the first ToolCall in tools whose Name == name and whose
+// Gate is still nil, or nil if none. Skipping already-bound calls is what makes
+// same-named gates bind positionally (each claims a distinct card).
+func firstUnboundNamed(tools []*ToolCall, name string) *ToolCall {
+	if name == "" {
+		return nil
+	}
+	for _, tc := range tools {
+		if tc.Name == name && tc.Gate == nil {
+			return tc
+		}
+	}
+	return nil
+}
+
+// warn appends a reconstruction anomaly to the session, stamped with the time of the
+// record that surfaced it. Reconstruction is best-effort: anomalies become Warnings,
+// never errors (the untrusted-record boundary fails secure).
+func (b *builder) warn(text string, at time.Time) {
+	b.session.Warnings = append(b.session.Warnings, Warning{Text: text, At: at})
 }
 
 // toolCalls extracts the AIMessage's ToolUseBlocks into ToolCalls and registers
