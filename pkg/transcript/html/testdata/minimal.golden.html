@@ -5,21 +5,27 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Minimal transcript</title>
 <style>
-/* TUI-inspired dark theme. Palette mirrors pkg/tui/styles/styles.go so the
-   export tracks the terminal: lime AI bullet (#D4F84D), blue headings/inline-code
-   (#A2D2FF), gray user accent bar (#737373). Task 9 fleshes out the full layout
-   (collapsibles, tool cards, gate chips, nested subagents, toolbar); this skeleton
-   keeps the variables and base type so that work is additive. */
+/* TUI-inspired dark theme, web-native typography. The palette mirrors
+   pkg/tui/styles/styles.go so the export tracks the terminal: lime AI bullet
+   (#D4F84D), blue headings/inline-code (#A2D2FF), gray user accent bar (#737373).
+   Prose is proportional; only code and tool I/O are monospace. All markers and
+   colors live here in one place so they track the TUI. */
 :root {
   --bg: #16161a;
+  --bg-2: #1b1b21;
   --fg: #e6e6e6;
   --muted: #9a9a9a;
+  --faint: #737373;
   --accent-bar: #737373;
   --ai-dot: #D4F84D;
   --heading: #A2D2FF;
   --inline-code: #A2D2FF;
   --card-bg: #1e1e24;
   --border: #2a2a32;
+  --approve: #D4F84D;
+  --deny: #ff6b6b;
+  --answer: #A2D2FF;
+  --warn: #f0c674;
   --prose: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
   --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
 }
@@ -28,7 +34,7 @@
 
 body {
   margin: 0;
-  padding: 2rem 1.25rem 4rem;
+  padding: 0 1.25rem 4rem;
   background: var(--bg);
   color: var(--fg);
   font-family: var(--prose);
@@ -39,6 +45,53 @@ body {
 
 .mono { font-family: var(--mono); }
 
+/* Collapsible disclosure marker. The native triangle is hidden and replaced by a
+   rotating caret on every <details> summary, so AI messages, thinking, tool cards
+   and the system prompt all show an obvious open/closed affordance. The caret is a
+   CSS-generated pseudo-element (presentational, not in the accessibility tree). */
+details > summary {
+  list-style: none;
+  cursor: pointer;
+}
+details > summary::-webkit-details-marker { display: none; }
+details > summary::before {
+  content: "▸ ";
+  color: var(--faint);
+  font-size: 0.85em;
+}
+details[open] > summary::before { content: "▾ "; }
+
+/* Sticky toolbar. */
+.toolbar {
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.5rem 0;
+  margin-bottom: 1rem;
+  background: var(--bg);
+  border-bottom: 1px solid var(--border);
+}
+
+.toolbar-title { color: var(--muted); font-size: 0.8rem; letter-spacing: 0.05em; }
+.toolbar-spacer { flex: 1; }
+
+.toolbar-btn {
+  font-family: var(--prose);
+  font-size: 0.8rem;
+  color: var(--fg);
+  background: var(--card-bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.25rem 0.6rem;
+  cursor: pointer;
+}
+
+.toolbar-btn:hover { border-color: var(--heading); color: var(--heading); }
+
+/* Header. */
 .session-header {
   border-bottom: 1px solid var(--border);
   padding-bottom: 1rem;
@@ -64,45 +117,62 @@ body {
 .session-meta dt { color: var(--muted); }
 .session-meta dd { margin: 0; }
 
+/* Loops and turns. */
 .turn {
   border-bottom: 1px solid var(--border);
   padding: 1rem 0;
 }
 
-.message {
+/* System prompt — collapsed by default. */
+details.system-prompt { margin: 0.25rem 0 1rem; }
+details.system-prompt > summary {
+  color: var(--muted);
+  font-size: 0.85rem;
+  cursor: pointer;
+}
+.prompt-text {
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--muted);
+  background: var(--card-bg);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  padding: 0.75rem;
+  margin-top: 0.4rem;
+  font-size: 0.85rem;
+}
+
+/* User message — accent bar + timestamp. */
+.user-message {
   display: grid;
   grid-template-columns: auto auto 1fr;
   align-items: baseline;
   column-gap: 0.5rem;
   margin: 0.5rem 0;
 }
-
 .accent-bar { color: var(--accent-bar); }
+.user-message .msg-body { grid-column: 1 / -1; margin-top: 0.25rem; }
+
+/* AI message — collapsible, expanded by default. */
+details.ai-message { margin: 0.75rem 0; }
+details.ai-message > summary {
+  display: flex;
+  align-items: baseline;
+  gap: 0.5rem;
+}
 .ai-dot { color: var(--ai-dot); }
+.agent-name { color: var(--ai-dot); font-weight: 600; font-size: 0.85rem; }
+.msg-time { color: var(--muted); font-size: 0.75rem; }
+.msg-body { margin-top: 0.25rem; }
 
-.agent-name {
-  color: var(--ai-dot);
-  font-weight: 600;
-  font-size: 0.85rem;
-}
-
-.msg-time {
-  color: var(--muted);
-  font-size: 0.75rem;
-}
-
-.msg-body {
-  grid-column: 1 / -1;
-  margin-top: 0.25rem;
-}
-
+/* Shared prose styling for rendered markdown. */
 .msg-body h1, .msg-body h2, .msg-body h3,
 .msg-body h4, .msg-body h5, .msg-body h6 {
   color: var(--heading);
   line-height: 1.3;
 }
 
-.msg-body code {
+.msg-body code, .thinking-body code {
   font-family: var(--mono);
   color: var(--inline-code);
   background: var(--card-bg);
@@ -111,7 +181,7 @@ body {
   font-size: 0.9em;
 }
 
-.msg-body pre {
+.msg-body pre, .thinking-body pre {
   background: var(--card-bg);
   border: 1px solid var(--border);
   border-radius: 5px;
@@ -119,15 +189,142 @@ body {
   overflow-x: auto;
 }
 
-.msg-body pre code {
+.msg-body pre code, .thinking-body pre code {
   background: none;
   padding: 0;
   color: var(--fg);
 }
 
+/* Thinking — faint, italic, collapsed by default. */
+details.thinking { margin: 0.4rem 0 0.4rem 1rem; }
+details.thinking > summary {
+  color: var(--faint);
+  font-size: 0.8rem;
+  font-style: italic;
+  cursor: pointer;
+}
+.thinking-body {
+  color: var(--muted);
+  font-style: italic;
+  font-size: 0.92rem;
+  border-left: 2px solid var(--border);
+  padding-left: 0.75rem;
+  margin-top: 0.3rem;
+}
+
+/* Tool cards — faint cards, collapsed by default. */
+details.tool-card {
+  margin: 0.4rem 0 0.4rem 1rem;
+  background: var(--card-bg);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+}
+details.tool-card.tool-error { border-color: var(--deny); }
+details.tool-card > summary {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  padding: 0.4rem 0.6rem;
+}
+.tool-name { color: var(--heading); font-size: 0.85rem; }
+.tool-decision {
+  font-size: 0.72rem;
+  padding: 0.05rem 0.4rem;
+  border-radius: 3px;
+  border: 1px solid var(--border);
+}
+.tool-decision.approved { color: var(--approve); border-color: var(--approve); }
+.tool-decision.denied { color: var(--deny); border-color: var(--deny); }
+.tool-decision.answered { color: var(--answer); border-color: var(--answer); }
+.tool-decision.pending { color: var(--warn); border-color: var(--warn); }
+
+.tool-body { padding: 0 0.6rem 0.6rem; }
+.tool-label {
+  color: var(--muted);
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  margin: 0.5rem 0 0.2rem;
+}
+.tool-io {
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.6rem;
+  margin: 0;
+  max-height: 28rem;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-size: 0.85rem;
+  color: var(--fg);
+}
+.elided { color: var(--warn); font-style: italic; }
+
+/* User-action chips — visually distinct from agent content. */
+.gate-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  margin: 0.5rem 0 0.5rem 1rem;
+}
+.gate-chip {
+  font-size: 0.75rem;
+  padding: 0.15rem 0.6rem;
+  border-radius: 999px;
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  color: var(--muted);
+}
+.gate-chip.approved { color: var(--approve); border-color: var(--approve); }
+.gate-chip.denied { color: var(--deny); border-color: var(--deny); }
+.gate-chip.answered { color: var(--answer); border-color: var(--answer); }
+
+/* Nested subagent — indented, with a colored left rail. */
+.subagent {
+  margin: 0.5rem 0 0.25rem;
+  border-left: 2px solid var(--heading);
+  padding-left: 0.85rem;
+}
+.subagent .turn { border-bottom: none; padding: 0.4rem 0; }
+
+/* Notices and warnings sections. */
+.section-title {
+  color: var(--heading);
+  font-size: 1rem;
+  border-bottom: 1px solid var(--border);
+  padding-bottom: 0.3rem;
+  margin-bottom: 0.6rem;
+}
+.notices, .warnings { margin-top: 2rem; }
+.notice-list, .warning-list { list-style: none; padding: 0; margin: 0; }
+.notice, .warning {
+  display: flex;
+  gap: 0.6rem;
+  align-items: baseline;
+  font-size: 0.85rem;
+  padding: 0.25rem 0;
+}
+.notice-time, .warning-time { color: var(--faint); font-size: 0.75rem; }
+.notice-label {
+  color: var(--muted);
+  text-transform: uppercase;
+  font-size: 0.7rem;
+  letter-spacing: 0.05em;
+}
+.warnings .section-title { color: var(--warn); border-color: var(--warn); }
+.warning-text { color: var(--warn); }
+
 </style>
 </head>
-<body>
+<body id="top">
+<nav class="toolbar" aria-label="Transcript controls">
+<span class="toolbar-title mono">transcript</span>
+<span class="toolbar-spacer"></span>
+<button type="button" id="collapse-all" class="toolbar-btn">Collapse all</button>
+<button type="button" id="expand-all" class="toolbar-btn">Expand all</button>
+<button type="button" id="jump-to-top" class="toolbar-btn">↑ Top</button>
+</nav>
 <header class="session-header">
 <h1 class="session-title">Minimal transcript</h1>
 <dl class="session-meta">
@@ -135,13 +332,13 @@ body {
 <div class="meta-row"><dt>Model</dt><dd>claude-opus-4-8</dd></div>
 <div class="meta-row"><dt>Agent</dt><dd>operator</dd></div>
 <div class="meta-row"><dt>Permissions</dt><dd>ask</dd></div>
+<div class="meta-row"><dt>Counts</dt><dd>1 turns · 0 tools · 0 gates</dd></div>
 <div class="meta-row"><dt>Started</dt><dd>2026-06-28 10:00:00 UTC</dd></div>
 <div class="meta-row"><dt>Ended</dt><dd>2026-06-28 10:05:00 UTC</dd></div>
 <div class="meta-row"><dt>Exported</dt><dd>2026-06-28 10:06:00 UTC</dd></div>
 </dl>
 </header>
-<main class="session-body">
-<section class="loop" data-depth="0">
+<main class="session-body"><section class="loop" data-depth="0">
 <article class="turn" data-turn="1">
 <div class="message user-message">
 <span class="accent-bar" aria-hidden="true">▌</span>
@@ -149,25 +346,48 @@ body {
 <div class="msg-body"><p>Run the tests please.</p>
 </div>
 </div>
-<div class="message ai-message">
-<span class="ai-dot" aria-hidden="true">●</span>
-<span class="agent-name">operator</span>
-<span class="msg-time mono">10:00:02</span>
+<details class="message ai-message" open>
+<summary><span class="ai-dot" aria-hidden="true">●</span> <span class="agent-name">operator</span> <span class="msg-time mono">10:00:02</span></summary>
 <div class="msg-body"><h2>Done</h2>
 <p>Ran with <code>go test ./...</code> and all passed.</p>
 </div>
-</div>
+</details>
 </article>
 </section>
 </main>
 <script>
-// Self-contained, dependency-free behavior for the transcript export. The minimal
-// skeleton has no interactive controls yet; Task 9 adds collapse/expand-all,
-// collapse-all-thinking, and jump-to-top here. Kept as a real (inert) script so
-// the output structure is stable and the page remains fully offline.
+// Self-contained, dependency-free behavior for the transcript export: bulk
+// collapse/expand of every <details> (AI messages, thinking, tool cards, system
+// prompt, nested subagents) and a jump-to-top control. Vanilla DOM only — no
+// external scripts — so the page stays fully offline.
 (function () {
   "use strict";
-  // Intentionally empty: no collapsibles or toolbar in the minimal skeleton.
+
+  function setAllDetails(open) {
+    var all = document.querySelectorAll("details");
+    for (var i = 0; i < all.length; i++) {
+      all[i].open = open;
+    }
+  }
+
+  function on(id, handler) {
+    var el = document.getElementById(id);
+    if (el) {
+      el.addEventListener("click", handler);
+    }
+  }
+
+  document.addEventListener("DOMContentLoaded", function () {
+    on("collapse-all", function () {
+      setAllDetails(false);
+    });
+    on("expand-all", function () {
+      setAllDetails(true);
+    });
+    on("jump-to-top", function () {
+      window.scrollTo({ top: 0, behavior: "smooth" });
+    });
+  });
 })();
 
 </script>

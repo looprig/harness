@@ -1,3 +1,10 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Full transcript</title>
+<style>
 /* TUI-inspired dark theme, web-native typography. The palette mirrors
    pkg/tui/styles/styles.go so the export tracks the terminal: lime AI bullet
    (#D4F84D), blue headings/inline-code (#A2D2FF), gray user accent bar (#737373).
@@ -307,3 +314,157 @@ details.tool-card > summary {
 }
 .warnings .section-title { color: var(--warn); border-color: var(--warn); }
 .warning-text { color: var(--warn); }
+
+</style>
+</head>
+<body id="top">
+<nav class="toolbar" aria-label="Transcript controls">
+<span class="toolbar-title mono">transcript</span>
+<span class="toolbar-spacer"></span>
+<button type="button" id="collapse-all" class="toolbar-btn">Collapse all</button>
+<button type="button" id="expand-all" class="toolbar-btn">Expand all</button>
+<button type="button" id="jump-to-top" class="toolbar-btn">↑ Top</button>
+</nav>
+<header class="session-header">
+<h1 class="session-title">Full transcript</h1>
+<dl class="session-meta">
+<div class="meta-row"><dt>Session</dt><dd class="mono">01234567-89ab-cdef-0123-456789abcdef</dd></div>
+<div class="meta-row"><dt>Model</dt><dd>claude-opus-4-8</dd></div>
+<div class="meta-row"><dt>Agent</dt><dd>operator</dd></div>
+<div class="meta-row"><dt>Permissions</dt><dd>ask</dd></div>
+<div class="meta-row"><dt>Counts</dt><dd>2 turns · 3 tools · 3 gates</dd></div>
+<div class="meta-row"><dt>Started</dt><dd>2026-06-28 10:00:00 UTC</dd></div>
+<div class="meta-row"><dt>Ended</dt><dd>2026-06-28 10:05:00 UTC</dd></div>
+<div class="meta-row"><dt>Exported</dt><dd>2026-06-28 10:06:00 UTC</dd></div>
+</dl>
+</header>
+<main class="session-body"><section class="loop" data-depth="0">
+<details class="system-prompt">
+<summary>System prompt · operator</summary>
+<pre class="mono prompt-text">You are a helpful operator. Run tests and review the diff.</pre>
+</details>
+<article class="turn" data-turn="1">
+<div class="message user-message">
+<span class="accent-bar" aria-hidden="true">▌</span>
+<span class="msg-time mono">10:00:01</span>
+<div class="msg-body"><p>Please run the tests, then have a reviewer check the diff.</p>
+</div>
+</div>
+<details class="message ai-message" open>
+<summary><span class="ai-dot" aria-hidden="true">●</span> <span class="agent-name">operator</span> <span class="msg-time mono">10:00:05</span></summary>
+<div class="msg-body"><p>I'll run the tests and spin up a <strong>reviewer</strong>.</p>
+</div>
+</details>
+<details class="thinking">
+<summary>Thinking</summary>
+<div class="thinking-body"><p>First confirm the build, then run the full suite.</p>
+</div>
+</details>
+<details class="tool-card">
+<summary><span class="tool-name mono">Bash</span> <span class="tool-decision approved">Approved ✓</span> <span class="msg-time mono">10:00:05</span></summary>
+<div class="tool-body">
+<div class="tool-section"><div class="tool-label">Input</div><pre class="mono tool-io">{
+  &#34;command&#34;: &#34;go test ./...&#34;
+}</pre></div>
+<div class="tool-section"><div class="tool-label">Result</div><pre class="mono tool-io">ok
+all tests passed</pre></div>
+</div>
+</details>
+<details class="tool-card tool-error">
+<summary><span class="tool-name mono">EditFile</span> <span class="tool-decision denied">Denied ✗</span> <span class="msg-time mono">10:00:05</span></summary>
+<div class="tool-body">
+<div class="tool-section"><div class="tool-label">Input</div><pre class="mono tool-io">{
+  &#34;path&#34;: &#34;main.go&#34;,
+  &#34;old&#34;: &#34;a&#34;,
+  &#34;new&#34;: &#34;b&#34;
+}</pre></div>
+<div class="tool-section"><div class="tool-label">Result</div><pre class="mono tool-io">permission denied by user</pre></div>
+</div>
+</details>
+<details class="tool-card">
+<summary><span class="tool-name mono">Subagent</span> <span class="msg-time mono">10:00:05</span></summary>
+<div class="tool-body">
+<div class="tool-section"><div class="tool-label">Input</div><pre class="mono tool-io">{
+  &#34;agent&#34;: &#34;reviewer&#34;,
+  &#34;task&#34;: &#34;review diff&#34;
+}</pre></div>
+<div class="tool-section"><div class="tool-label">Result</div><pre class="mono tool-io">review complete: no issues</pre></div>
+<div class="subagent"><section class="loop" data-depth="1">
+<article class="turn" data-turn="1">
+<div class="message user-message">
+<span class="accent-bar" aria-hidden="true">▌</span>
+<span class="msg-time mono">10:00:10</span>
+<div class="msg-body"><p>Review the test output.</p>
+</div>
+</div>
+<details class="message ai-message" open>
+<summary><span class="ai-dot" aria-hidden="true">●</span> <span class="agent-name">reviewer</span> <span class="msg-time mono">10:00:11</span></summary>
+<div class="msg-body"><p>Looks good. No issues found.</p>
+</div>
+</details>
+</article>
+</section>
+</div>
+</div>
+</details>
+<div class="gate-chips">
+<span class="gate-chip approved">You approved · session · 10:00:03</span>
+<span class="gate-chip denied">You denied · 10:00:07</span>
+<span class="gate-chip answered">You answered · 10:00:09 — &#34;Which environment?&#34; → staging</span>
+</div>
+</article>
+</section>
+<section class="notices">
+<h2 class="section-title">Session events</h2>
+<ul class="notice-list">
+<li class="notice notice-restore"><span class="notice-time mono">09:59:58</span> <span class="notice-label">restore</span> <span class="notice-text">restoring session from journal</span></li>
+<li class="notice notice-restore"><span class="notice-time mono">09:59:59</span> <span class="notice-label">restore</span> <span class="notice-text">session restored</span></li>
+<li class="notice notice-idle"><span class="notice-time mono">10:04:00</span> <span class="notice-label">idle</span> <span class="notice-text">session went idle</span></li>
+<li class="notice notice-stopped"><span class="notice-time mono">10:05:00</span> <span class="notice-label">stopped</span> <span class="notice-text">session stopped</span></li>
+</ul>
+</section>
+<section class="warnings">
+<h2 class="section-title">Reconstruction notes</h2>
+<ul class="warning-list">
+<li class="warning"><span class="warning-time mono">10:00:00</span> <span class="warning-text">system prompt unavailable for loop abcdef01-2345-6789-abcd-ef0123456789 (reviewer) (rev rev-1)</span></li>
+</ul>
+</section>
+</main>
+<script>
+// Self-contained, dependency-free behavior for the transcript export: bulk
+// collapse/expand of every <details> (AI messages, thinking, tool cards, system
+// prompt, nested subagents) and a jump-to-top control. Vanilla DOM only — no
+// external scripts — so the page stays fully offline.
+(function () {
+  "use strict";
+
+  function setAllDetails(open) {
+    var all = document.querySelectorAll("details");
+    for (var i = 0; i < all.length; i++) {
+      all[i].open = open;
+    }
+  }
+
+  function on(id, handler) {
+    var el = document.getElementById(id);
+    if (el) {
+      el.addEventListener("click", handler);
+    }
+  }
+
+  document.addEventListener("DOMContentLoaded", function () {
+    on("collapse-all", function () {
+      setAllDetails(false);
+    });
+    on("expand-all", function () {
+      setAllDetails(true);
+    });
+    on("jump-to-top", function () {
+      window.scrollTo({ top: 0, behavior: "smooth" });
+    });
+  });
+})();
+
+</script>
+</body>
+</html>

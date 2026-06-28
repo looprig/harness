@@ -4,9 +4,9 @@ package html
 // HTML. It wraps any failure along the render path — markdown rendering
 // (goldmark), template execution, or the write to the destination io.Writer;
 // Cause is the wrapped underlying error, recoverable via errors.As / Unwrap.
-// Reconstruction anomalies never reach the renderer — those are surfaced as
-// transcript.Warning on the model and rendered by the full layout (Task 9), not
-// yet in this skeleton.
+// Reconstruction anomalies never reach the renderer as errors — those are
+// surfaced as transcript.Warning on the model and rendered into the document's
+// distinct reconstruction-notes section by the full layout.
 type RenderError struct {
 	Cause error
 }
