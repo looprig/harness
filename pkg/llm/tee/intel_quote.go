@@ -87,6 +87,43 @@ func VerifyTDXQuoteWithOptions(rawQuote []byte, opts Options) ([]byte, error) {
 	return rd, nil
 }
 
+// rtmrLength is the byte length of each TDX runtime measurement register
+// (RTMR). The TDX quote body carries four of them, each a 48-byte SHA-384
+// measurement.
+const rtmrLength = 48
+
+// rtmr3Index is the position of RTMR3 in the quote body's RTMRs slice. RTMR3 is
+// the runtime-extended register the Dstack event log's IMR3 replay must match.
+const rtmr3Index = 3
+
+// TDXQuoteRTMR3 parses raw TDX quote bytes and returns a copy of RTMR3 (the 4th
+// runtime measurement register, 48 bytes) from the quote body. It performs no
+// signature or chain verification and no network I/O — it is a pure parse-and-
+// extract used by the Dstack ACI event-log replay to compare the replayed IMR3
+// against the value the (separately verified) quote attests.
+//
+// The returned slice is a fresh copy, so callers may mutate it without
+// affecting the parsed quote. Any failure — unparseable bytes, an unexpected
+// quote type, or a missing/short RTMR3 — returns a *tee.Error with
+// ReasonEvidenceMalformed.
+func TDXQuoteRTMR3(rawQuote []byte) ([]byte, error) {
+	q, err := abi.QuoteToProto(rawQuote)
+	if err != nil {
+		return nil, &Error{Reason: ReasonEvidenceMalformed, Err: err}
+	}
+	qv4, ok := q.(*pb.QuoteV4)
+	if !ok {
+		return nil, &Error{Reason: ReasonEvidenceMalformed, Err: errors.New("unexpected quote type (not QuoteV4)")}
+	}
+	rtmrs := qv4.GetTdQuoteBody().GetRtmrs()
+	if len(rtmrs) <= rtmr3Index || len(rtmrs[rtmr3Index]) != rtmrLength {
+		return nil, &Error{Reason: ReasonEvidenceMalformed, Err: errors.New("RTMR3 missing or not 48 bytes")}
+	}
+	out := make([]byte, rtmrLength)
+	copy(out, rtmrs[rtmr3Index])
+	return out, nil
+}
+
 // resolveGetter returns the caller-supplied getter, or the bounded default if
 // none was supplied. It never returns the library's unbounded
 // trust.DefaultHTTPSGetter (which wraps the http.Get-backed SimpleHTTPSGetter

@@ -338,5 +338,77 @@ func TestVerifyTDXQuoteWithOptions_NowCalled(t *testing.T) {
 	}
 }
 
+// wantRTMR3Hex is the RTMR3 the fixture aci/1 quote carries (4th entry of the
+// TDX quote body's RTMRs, 48 bytes). Independently confirmed against the
+// IMR3 event-log replay (the aci package replays the same value).
+const wantRTMR3Hex = "4861f99a6e910713667986c6ae6b4830c562eec3aad9e55d25a15bcf7c8dfc0a6b4fde2c326cdc6b3fcf708df20c10c9"
+
+func TestTDXQuoteRTMR3_Fixture(t *testing.T) {
+	t.Parallel()
+	raw, _ := loadTestQuote(t)
+
+	got, err := TDXQuoteRTMR3(raw)
+	if err != nil {
+		t.Fatalf("TDXQuoteRTMR3() unexpected error: %v", err)
+	}
+	if len(got) != 48 {
+		t.Fatalf("RTMR3 len = %d, want 48", len(got))
+	}
+	if hex.EncodeToString(got) != wantRTMR3Hex {
+		t.Fatalf("RTMR3 = %s, want %s", hex.EncodeToString(got), wantRTMR3Hex)
+	}
+}
+
+func TestTDXQuoteRTMR3_ReturnsCopy(t *testing.T) {
+	t.Parallel()
+	raw, _ := loadTestQuote(t)
+
+	first, err := TDXQuoteRTMR3(raw)
+	if err != nil {
+		t.Fatalf("first call error: %v", err)
+	}
+	// Mutating the returned slice must not poison a subsequent parse of the
+	// same quote bytes: the accessor must hand back a copy, not an alias into
+	// the parsed quote body.
+	for i := range first {
+		first[i] ^= 0xFF
+	}
+	second, err := TDXQuoteRTMR3(raw)
+	if err != nil {
+		t.Fatalf("second call error: %v", err)
+	}
+	if hex.EncodeToString(second) != wantRTMR3Hex {
+		t.Fatalf("second RTMR3 = %s, want %s (returned slice aliased quote body)", hex.EncodeToString(second), wantRTMR3Hex)
+	}
+}
+
+func TestTDXQuoteRTMR3_Malformed(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+		raw  []byte
+	}{
+		{name: "empty bytes", raw: []byte{}},
+		{name: "garbage bytes", raw: []byte("not a tdx quote at all")},
+		{name: "nil", raw: nil},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			_, err := TDXQuoteRTMR3(tt.raw)
+			if err == nil {
+				t.Fatalf("expected error, got nil")
+			}
+			var teeErr *Error
+			if !errors.As(err, &teeErr) {
+				t.Fatalf("expected *tee.Error, got %T: %v", err, err)
+			}
+			if teeErr.Reason != ReasonEvidenceMalformed {
+				t.Fatalf("reason = %q, want %q", teeErr.Reason, ReasonEvidenceMalformed)
+			}
+		})
+	}
+}
+
 // Compile-time assertion that boundedGetter satisfies the library interface.
 var _ trust.HTTPSGetter = (*boundedGetter)(nil)
