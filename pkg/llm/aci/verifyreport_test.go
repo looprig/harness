@@ -34,8 +34,11 @@ const (
 // fakeQuoteVerifier returns the fixture's real 64-byte quote_report_data as the
 // "verified" report_data, standing in for the live DCAP verifier offline.
 func fakeQuoteVerifier(rep *Report) quoteVerifier {
-	rd, _ := hex.DecodeString(rep.Attestation.Evidence.QuoteReportData)
+	rd, err := hex.DecodeString(rep.Attestation.Evidence.QuoteReportData)
 	return func(raw []byte, opts tee.Options) ([]byte, error) {
+		if err != nil {
+			return nil, err
+		}
 		return rd, nil
 	}
 }
