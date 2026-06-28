@@ -37,6 +37,7 @@ import (
 
 	secp256k1 "github.com/decred/dcrd/dcrec/secp256k1/v4"
 	"github.com/decred/dcrd/dcrec/secp256k1/v4/ecdsa"
+	"golang.org/x/crypto/sha3"
 )
 
 // keysetEndorsementPurpose is the fixed purpose tag of the endorsement payload.
@@ -201,3 +202,215 @@ func (e *endorsementError) Error() string {
 }
 
 func (e *endorsementError) Unwrap() error { return e.cause }
+
+// =============================================================================
+// Task 2.7: KMS custody chain (recoverable secp256k1 over Keccak256)
+// =============================================================================
+//
+// verifyKMSCustody establishes that the workload's identity key descends from a
+// trusted KMS root, mirroring the Rust reference
+// dstack::verify_dstack_kms_identity_custody. It walks a fixed 2-link chain of
+// recoverable secp256k1 signatures, each over a Keccak256 digest:
+//
+//   chain[0]: recover the app key from a signature over the UTF-8 bytes
+//             "{purpose}:{compressed_identity_pubkey_hex}".
+//   chain[1]: recover the KMS root from a signature over the byte concatenation
+//             "dstack-kms-issued" ‖ ":" ‖ app_id ‖ app_pubkey_sec1.
+//
+// The recovered root's compressed SEC1 hex must be a member of the caller's
+// acceptedRoots set; anything else — wrong provider, missing identity entry,
+// pubkey mismatch, malformed chain, recovery failure, an unaccepted root, or an
+// EMPTY accepted set — fails closed with reason kms_root_untrusted. Every failure
+// means the same thing: we could not tie the identity key to a trusted KMS root.
+//
+// The digest is Keccak256 (sha3.NewLegacyKeccak256), the Ethereum/pre-standard
+// Keccak — NOT FIPS-202 SHA3-256. The two differ in their padding byte, so using
+// the FIPS variant here would silently recover the wrong key.
+
+// dstackKMSProvider is the only key-custody provider this client trusts. A
+// custody record naming any other provider fails closed.
+const dstackKMSProvider = "dstack-kms"
+
+// identityCustodyRole is the role string of the identity key's custody entry.
+const identityCustodyRole = "identity"
+
+// kmsChainLength is the exact number of links in a Dstack KMS custody chain:
+// chain[0] (purpose -> app key) and chain[1] (issued -> KMS root).
+const kmsChainLength = 2
+
+// recoverableSigSize is the byte length of a recoverable secp256k1 signature:
+// r(32) ‖ s(32) ‖ v(1), the r‖s‖v (v-LAST) layout Dstack emits.
+const recoverableSigSize = 65
+
+// kmsIssuedPrefix is the fixed byte prefix of the chain[1] root_message:
+// "dstack-kms-issued" ‖ ":" — the app_id and app pubkey are appended to it.
+const kmsIssuedPrefix = "dstack-kms-issued:"
+
+// recoverK256 recovers the secp256k1 public key that signed message, from a
+// 65-byte recoverable signature in Dstack's r‖s‖v (v-last) layout, over the
+// Keccak256 digest of message.
+//
+// It normalizes the recovery id (a v byte in [27,30] is shifted down by 27, the
+// Ethereum convention; a raw 0..3 is used as-is), reorders to decred's v-FIRST
+// compact layout [27+recid]‖r‖s, hashes message with Keccak256, and calls
+// ecdsa.RecoverCompact. The returned wasCompressed bool is ignored; callers
+// serialize the recovered key themselves (SerializeCompressed). Any malformed
+// length, out-of-range recid, or recovery failure returns a typed error.
+func recoverK256(message, sig65 []byte) (*secp256k1.PublicKey, error) {
+	if len(sig65) != recoverableSigSize {
+		return nil, &kmsCustodyError{reason: "recoverable signature wrong length"}
+	}
+
+	// Normalize the recovery id. Dstack puts v LAST (r‖s‖v); a v in [27,30] is
+	// the Ethereum-offset form (27 + recid), so subtract 27 to get the raw recid.
+	v := sig65[64]
+	if v >= 27 && v <= 30 {
+		v -= 27
+	}
+	if v > 3 {
+		return nil, &kmsCustodyError{reason: "recoverable signature recovery id out of range"}
+	}
+
+	// decred's RecoverCompact wants the recovery byte FIRST: [27+recid]‖r‖s. The
+	// +4 "compressed" flag is omitted (it only signals output preference, which we
+	// override by serializing ourselves). r = sig[:32], s = sig[32:64].
+	compact := make([]byte, recoverableSigSize)
+	compact[0] = secp256k1CompactMagic + v
+	copy(compact[1:33], sig65[:32])
+	copy(compact[33:65], sig65[32:64])
+
+	// Keccak256 (legacy Keccak, NOT FIPS SHA3-256) of the message is the digest
+	// the signature commits to.
+	h := sha3.NewLegacyKeccak256()
+	h.Write(message)
+	digest := h.Sum(nil)
+
+	pub, _, err := ecdsa.RecoverCompact(compact, digest)
+	if err != nil {
+		return nil, &kmsCustodyError{reason: "secp256k1 recovery failed", cause: err}
+	}
+	return pub, nil
+}
+
+// secp256k1CompactMagic is decred's compact-signature recovery-code offset (27),
+// inherited from Bitcoin. recoverK256 adds the raw recid to it to build the
+// v-first compact recovery byte RecoverCompact expects.
+const secp256k1CompactMagic = 27
+
+// verifyKMSCustody confirms the workload identity key descends from a trusted
+// KMS root by recovering and checking the 2-link custody chain. appID is the
+// 20-byte workload app-id from the event log (Task 2.5's verifyEventLogAndAppID);
+// acceptedRoots is the set of trusted KMS-root compressed-SEC1 hex strings.
+//
+// It returns nil ONLY when the recovered root's compressed hex is a member of
+// acceptedRoots. Every other outcome — including an empty or nil acceptedRoots —
+// returns the fail-closed *llm.AttestationError with reason kms_root_untrusted.
+func verifyKMSCustody(rep *Report, appID []byte, acceptedRoots map[string]struct{}) error {
+	custody := rep.Attestation.Evidence.KeyCustody
+	if custody.Provider != dstackKMSProvider {
+		return kmsRootUntrusted("key-custody provider is not "+dstackKMSProvider, nil)
+	}
+
+	identity, ok := findIdentityCustodyEntry(custody)
+	if !ok {
+		return kmsRootUntrusted("no identity-role key-custody entry", nil)
+	}
+
+	// The identity custody key must equal the report's published identity key:
+	// the chain proves custody of THAT key, not some other one.
+	reportIdentityHex := rep.Attestation.Keyset.Identity.PublicKey.PublicKeyHex
+	if identity.PublicKeyHex != reportIdentityHex {
+		return kmsRootUntrusted("identity custody public key does not match report identity", nil)
+	}
+
+	if len(identity.SignatureChain) != kmsChainLength {
+		return kmsRootUntrusted("identity signature_chain is not a 2-link chain", nil)
+	}
+
+	// Compress the identity key to SEC1 (33 bytes); it is the report's
+	// uncompressed (65-byte) SEC1 key, used in the chain[0] message.
+	identityRaw, err := hex.DecodeString(identity.PublicKeyHex)
+	if err != nil {
+		return kmsRootUntrusted("identity custody public key is not hex", err)
+	}
+	identityPub, err := secp256k1.ParsePubKey(identityRaw)
+	if err != nil {
+		return kmsRootUntrusted("identity custody public key does not parse", err)
+	}
+	compressedIdentity := hex.EncodeToString(identityPub.SerializeCompressed())
+
+	// chain[0]: recover the app key from "{purpose}:{compressed_identity}".
+	purposeSig, err := hex.DecodeString(identity.SignatureChain[0])
+	if err != nil {
+		return kmsRootUntrusted("chain[0] signature is not hex", err)
+	}
+	purposeMessage := []byte(identity.Purpose + ":" + compressedIdentity)
+	appPub, err := recoverK256(purposeMessage, purposeSig)
+	if err != nil {
+		return kmsRootUntrusted("chain[0] app-key recovery failed", err)
+	}
+	appPubSec1 := appPub.SerializeCompressed()
+
+	// chain[1]: recover the KMS root from
+	// "dstack-kms-issued:" ‖ app_id ‖ app_pubkey_sec1.
+	appSig, err := hex.DecodeString(identity.SignatureChain[1])
+	if err != nil {
+		return kmsRootUntrusted("chain[1] signature is not hex", err)
+	}
+	rootMessage := make([]byte, 0, len(kmsIssuedPrefix)+len(appID)+len(appPubSec1))
+	rootMessage = append(rootMessage, kmsIssuedPrefix...)
+	rootMessage = append(rootMessage, appID...)
+	rootMessage = append(rootMessage, appPubSec1...)
+	rootPub, err := recoverK256(rootMessage, appSig)
+	if err != nil {
+		return kmsRootUntrusted("chain[1] KMS-root recovery failed", err)
+	}
+
+	rootCompressedHex := hex.EncodeToString(rootPub.SerializeCompressed())
+	if _, accepted := acceptedRoots[rootCompressedHex]; !accepted {
+		// Fail-secure: an empty/nil acceptedRoots reaches here and rejects.
+		return kmsRootUntrusted("recovered KMS root is not in the accepted set", nil)
+	}
+	return nil
+}
+
+// findIdentityCustodyEntry returns the role=="identity" custody entry, or ok
+// false when absent. It returns a copy by value; callers only read it.
+func findIdentityCustodyEntry(custody KeyCustody) (KeyCustodyEntry, bool) {
+	for _, k := range custody.Keys {
+		if k.Role == identityCustodyRole {
+			return k, true
+		}
+	}
+	return KeyCustodyEntry{}, false
+}
+
+// kmsRootUntrusted builds the fail-closed *llm.AttestationError for a custody
+// failure, wrapping a typed *kmsCustodyError cause (per CLAUDE.md: no bare
+// fmt.Errorf from package APIs). cause may be nil for failures with no underlying
+// error to chain (e.g. a provider mismatch or an unaccepted root).
+func kmsRootUntrusted(reason string, cause error) error {
+	return attestErr(reasonKMSRootUntrusted, &kmsCustodyError{reason: reason, cause: cause})
+}
+
+// kmsCustodyError is the typed cause wrapped inside the kms_root_untrusted
+// *llm.AttestationError (and returned directly by recoverK256). It carries only a
+// fixed, code-defined reason label and an optional chained cause — never key
+// material (this path handles only public compressed-SEC1 hexes), so logging it
+// leaks no secret.
+type kmsCustodyError struct {
+	// reason is a fixed, code-defined label, never external data.
+	reason string
+	// cause is the chained underlying error, or nil.
+	cause error
+}
+
+func (e *kmsCustodyError) Error() string {
+	msg := "aci/keys: kms custody: " + e.reason
+	if e.cause != nil {
+		return msg + ": " + e.cause.Error()
+	}
+	return msg
+}
+
+func (e *kmsCustodyError) Unwrap() error { return e.cause }
