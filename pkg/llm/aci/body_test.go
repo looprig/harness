@@ -120,28 +120,28 @@ func TestCompactJSONVectors(t *testing.T) {
 func TestCompactJSONInsertionOrder(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
-		name         string
-		obj          *Object
-		wantCompact  string
-		wantCanonacl string // canonical (sorted) form, to contrast
+		name          string
+		obj           *Object
+		wantCompact   string
+		wantCanonical string // canonical (sorted) form, to contrast
 	}{
 		{
-			name:         "reverse-alphabetical keys kept",
-			obj:          NewObject().Set("b", Int(1)).Set("a", Int(2)),
-			wantCompact:  `{"b":1,"a":2}`,
-			wantCanonacl: `{"a":2,"b":1}`,
+			name:          "reverse-alphabetical keys kept",
+			obj:           NewObject().Set("b", Int(1)).Set("a", Int(2)),
+			wantCompact:   `{"b":1,"a":2}`,
+			wantCanonical: `{"a":2,"b":1}`,
 		},
 		{
-			name:         "stream before model (insertion)",
-			obj:          NewObject().Set("stream", Bool(false)).Set("model", String("m")),
-			wantCompact:  `{"stream":false,"model":"m"}`,
-			wantCanonacl: `{"model":"m","stream":false}`,
+			name:          "stream before model (insertion)",
+			obj:           NewObject().Set("stream", Bool(false)).Set("model", String("m")),
+			wantCompact:   `{"stream":false,"model":"m"}`,
+			wantCanonical: `{"model":"m","stream":false}`,
 		},
 		{
-			name:         "mixed case insertion vs utf16 sort",
-			obj:          NewObject().Set("Z", Int(1)).Set("a", Int(2)).Set("A", Int(3)),
-			wantCompact:  `{"Z":1,"a":2,"A":3}`,
-			wantCanonacl: `{"A":3,"Z":1,"a":2}`,
+			name:          "mixed case insertion vs utf16 sort",
+			obj:           NewObject().Set("Z", Int(1)).Set("a", Int(2)).Set("A", Int(3)),
+			wantCompact:   `{"Z":1,"a":2,"A":3}`,
+			wantCanonical: `{"A":3,"Z":1,"a":2}`,
 		},
 	}
 	for _, tt := range tests {
@@ -159,8 +159,8 @@ func TestCompactJSONInsertionOrder(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Canonicalize error: %v", err)
 			}
-			if string(gotCanon) != tt.wantCanonacl {
-				t.Errorf("Canonicalize = %q, want %q (compact path must differ)", gotCanon, tt.wantCanonacl)
+			if string(gotCanon) != tt.wantCanonical {
+				t.Errorf("Canonicalize = %q, want %q (compact path must differ)", gotCanon, tt.wantCanonical)
 			}
 		})
 	}
