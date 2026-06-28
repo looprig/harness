@@ -128,32 +128,33 @@ A `builder` holds `loops map[uuid.UUID]*Loop`, the current open turn per loop, a
 
 ---
 
-### Task 3: Gate resolution — permission + AskUser, events ⨉ user commands (D5)
+### Task 3: Gate resolution — buffer-and-flush, bind by tool name (D5)
 
-**Files:** Modify `pkg/transcript/reconstruct.go`; Test `pkg/transcript/reconstruct_test.go` (rows).
+**Durable reality (verified, see D5):** the gate and its resolving command land in the journal
+**BEFORE** the `StepDone` that carries the tool — so the `ToolCall` doesn't exist yet when the gate
+arrives; the builder must **buffer** gates per step and **flush** them at `StepDone`. There is no
+durable `ToolExecutionID → ToolUseBlock.ID` link, so binding is **by tool name**. `PermissionRequested`
+durably carries its `Request` (recover `Request.ToolName()` + redacted `Request.Description()`);
+`UserInputRequested` carries `Question`+`Choices`; the commands carry `ToolExecutionID` in their
+embedded `command.GateRoute` and `Agency` on `Header`.
 
-**Step 1 (failing tests, new table rows):**
-1. *Approved at session scope:* after the tool's `StepDone`, feed
-   `PermissionRequested{ToolExecutionID:e1}` (its `Cause`/coordinates locate the step's tool-use),
-   then the user command `ApproveToolCall{Cause:{ToolExecutionID:e1}, Scope: session}` (Agency User).
-   Assert the matching `ToolCall.Gate` = `{Kind:Permission, Decision:Approved, Scope:session,
-   DecidedAt: cmd time}`.
-2. *Denied:* `DenyToolCall` → `Decision:Denied`.
-3. *AskUser answered:* `UserInputRequested{ToolExecutionID:e2, Question:"which?", Choices:[a,b]}`
-   then `ProvideUserInput{Cause:{ToolExecutionID:e2}, …answer "a"}` → `Gate{Kind:AskUser,
-   Decision:Answered, Question, Choices, Answer:"a"}`.
-4. *Unresolved gate (snapshot mid-prompt):* `PermissionRequested` with no resolving command →
-   `Decision:Pending`, **no Warning**.
-5. *Resolving command with no gate:* an `ApproveToolCall` whose `ToolExecutionID` matches nothing →
-   one `Warning`, no panic.
-**Step 2:** FAIL. **Step 3 (implement):** maintain `pendingGates map[uuid.UUID]*ToolCall` keyed by
-`ToolExecutionID`. On `PermissionRequested`/`UserInputRequested`, find the owning tool-use within the
-just-closed step (via the event's `Cause`/coordinates → loop/turn/step → the tool whose
-`ToolExecutionID` the runner assigned; correlate by the same provider-id precedent as
-`2026-06-22-subagent-card-rendering-design.md` D2) and set `Gate{Decision:Pending}` + index it. On
-the three **commands** (read `Cause.ToolExecutionID`, `Agency==User`), resolve the indexed gate;
-unmatched → append `Warning`. Keep a `CommandRecord` switch alongside the `EventRecord` switch.
-**Step 4:** PASS. **Step 5:** `git commit -m "feat(transcript): resolve permission/askuser gates from user commands"`.
+**Files:** Modify `pkg/transcript/model.go` (extend `GateAction` + add `Step.Gates`), `pkg/transcript/reconstruct.go`; Test `pkg/transcript/reconstruct_test.go` (rows).
+
+**Model edits first:** add to `GateAction`: `ToolName, Description string`, `ToolUseID string` (bound tool; "" if unbound), `OpenedAt time.Time` (keep `DecidedAt`). Add `Gates []*GateAction` to `Step`.
+
+**Step 1 (failing tests, new table rows)** — note the gate+command come BEFORE the StepDone:
+1. *Approved at session scope:* feed `PermissionRequested{ToolExecutionID:e1, Request: tool.BashRequest{Command:"go test ./..."}}` → `ApproveToolCall{GateRoute:{ToolExecutionID:e1}, Scope: tool.ScopeSession, Header:{Agency: identity.AgencyUser}}` → `StepDone{Messages:[AIMessage{ToolUseBlock{ID:"tu1", Name:"Bash"}}, ToolResult{ToolUseID:"tu1"}]}` → `TurnDone`. Assert `Step.Gates[0]` = `{Kind:Permission, Decision:Approved, Scope:ScopeSession, ToolName:"Bash", ToolUseID:"tu1", DecidedAt: cmd time}` **and** `Tools[0].Gate` is the same pointer.
+2. *Denied:* `DenyToolCall` instead → `Decision:Denied`.
+3. *AskUser answered:* `UserInputRequested{ToolExecutionID:e2, Question:"which?", Choices:["a","b"]}` → `ProvideUserInput{GateRoute:{ToolExecutionID:e2}, Answer:"a", Header:{Agency:User}}` → a `StepDone` whose tool is the AskUser call → `Step.Gates[0] = {Kind:AskUser, Decision:Answered, Question:"which?", Choices:["a","b"], Answer:"a"}`. (Binding an askUser gate to a tool card is best-effort/optional; asserting it lands on `Step.Gates` is the requirement.)
+4. *Unresolved gate (snapshot mid-prompt):* `PermissionRequested` then `StepDone` with **no** resolving command → `Step.Gates[0].Decision == Pending`, **no Warning**.
+5. *Resolving command with no gate:* an `ApproveToolCall` whose `ToolExecutionID` matches nothing → one `Warning`, no panic, no gate.
+6. *Positional bind (same-named tools):* two `PermissionRequested` (e1,e2, both Bash) both approved, then a `StepDone` with two `Bash` tool-uses (tu1,tu2) → gate(e1)→tu1, gate(e2)→tu2 in order.
+
+**Step 2:** FAIL. **Step 3 (implement):** replace the Task-2 `toolByExecID map[uuid.UUID]*ToolCall` scaffold with `gatesByExecID map[uuid.UUID]*GateAction` and a per-step buffer `stepGateBuf []*GateAction`.
+- `PermissionRequested` → `GateAction{Kind:Permission, Decision:Pending, ToolName:req.ToolName(), Description:req.Description(), OpenedAt: hdr.CreatedAt}` (guard nil `Request`); `UserInputRequested` → `GateAction{Kind:AskUser, Decision:Pending, Question, Choices, OpenedAt}`. Index by `ToolExecutionID`, append to `stepGateBuf`.
+- `foldCommand` (now populated): `ApproveToolCall`/`DenyToolCall`/`ProvideUserInput` (these are `command.Command` types — type-switch in `foldCommand`); read `ToolExecutionID` from the embedded `GateRoute`; look up `gatesByExecID`; set `Decision` (+`Scope` from Approve / `Answer` from ProvideUserInput) and `DecidedAt` from the command `Header.CreatedAt`; unmatched → `Warning`. (Optionally assert `Header.Agency == identity.AgencyUser`.)
+- `onStepDone` (extend Task 2's): after tools are built, set `step.Gates = stepGateBuf`; **bind** each gate to a `ToolCall` by `Name == gate.ToolName` — first unbound tool of that name (so two same-named tools bind positionally), setting `tc.Gate = gate` and `gate.ToolUseID = tc.ToolUseID`; an askUser gate (no `ToolName`) binds to the sole unbound `AskUser`-named tool if present, else stays unbound. Clear `stepGateBuf` and the flushed entries from `gatesByExecID`.
+**Step 4:** PASS. **Step 5:** `git commit -m "feat(transcript): buffer + name-bind permission/askuser gates from user commands"`.
 
 ---
 

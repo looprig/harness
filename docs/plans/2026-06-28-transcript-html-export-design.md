@@ -138,6 +138,8 @@ type Step struct {
     StepID uuid.UUID
     AI     *Message            // the AIMessage from StepDone.Messages
     Tools  []*ToolCall         // ToolUseBlocks paired to their ToolResultMessages
+    Gates  []*GateAction       // every gate raised during this step, in order (Decision 5);
+                               // a bound gate is ALSO referenced by its ToolCall.Gate (same pointer)
 }
 
 type ToolCall struct {
@@ -147,16 +149,20 @@ type ToolCall struct {
     Result    []content.Block   // from the paired ToolResultMessage (ToolUseID match)
     IsError   bool
     At        time.Time
-    Gate      *GateAction       // non-nil iff this call required approval / asked the user
+    Gate      *GateAction       // non-nil iff a Step.Gate was bound to this call (same pointer); Decision 5
     Child     *Loop             // non-nil iff this call spawned a subagent (inline nesting)
 }
 
 type GateAction struct {
     Kind     GateKind           // permission | askUser
     Decision Decision           // approved | denied | answered | pending
-    Scope    ApprovalScope      // once | session | workspace (permission only)
-    Question string; Choices []string; Answer string   // askUser only
-    DecidedAt time.Time
+    Scope    tool.ApprovalScope // once | session | workspace (meaningful iff Kind==permission)
+    ToolName    string          // permission: Request.ToolName() (durable via the wire form, Decision 5)
+    Description string          // permission: Request.Description() — redacted prompt body, never raw args
+    Question string; Choices []string; Answer string   // askUser only (Question/Choices durable on the event)
+    ToolUseID string            // the tool this gate bound to ("" if unbound → renders as a bare notification)
+    OpenedAt  time.Time         // PermissionRequested/UserInputRequested timestamp
+    DecidedAt time.Time         // resolving command timestamp (zero while pending)
     // Agency is always User for a resolved gate (the only thing that resolves it).
 }
 
@@ -172,9 +178,9 @@ type Warning struct { Text string; At time.Time }
 | `SessionStarted` | set `Config` (from `ConfigFingerprint`: `ModelID`, `AgentKind`, `PermissionPosture`, `SystemPromptRev`), `StartedAt`. |
 | `LoopStarted` | new `Loop`; resolve `SystemPrompt` via the resolver; if `ParentToolUseID != ""`, attach as `Child` of the matching `ToolCall` (found by `ToolUseID`); else it is `Root`. |
 | `TurnStarted` / `TurnFoldedInto` | open a `Turn` on the owning loop (`Header.Coordinates.LoopID`), set `User` from `.Message`. |
-| `StepDone` | split `.Messages` (`content.AgenticMessages`) into the leading `AIMessage` + trailing `ToolResultMessage`s; create a `Step`; pair each `AIMessage` `ToolUseBlock` to its `ToolResultMessage` by `ToolUseID`. |
-| `PermissionRequested` / `UserInputRequested` | attach a `Gate{Decision: pending, …}` to the `ToolCall` whose `ToolUseID` correlates (via `ToolExecutionID`→tool-use mapping; see Decision 5). |
-| `ApproveToolCall` / `DenyToolCall` / `ProvideUserInput` **(commands, `Agency==User`)** | resolve the matching pending gate → `approved`(+scope) / `denied` / `answered`(+answer). |
+| `PermissionRequested` / `UserInputRequested` | **buffer** a `GateAction{Decision: pending, …}` for the current (not-yet-emitted) step, keyed by `ToolExecutionID` — capturing `ToolName`/`Description` (permission) or `Question`/`Choices` (askUser) from the durable event, plus `OpenedAt` (Decision 5). |
+| `ApproveToolCall` / `DenyToolCall` / `ProvideUserInput` **(commands, `Agency==User`)** | resolve the buffered gate by `ToolExecutionID` → `approved`(+`Scope`) / `denied` / `answered`(+`Answer`) + `DecidedAt`; an unmatched command → `Warning`. |
+| `StepDone` | split `.Messages` (`content.AgenticMessages`) into the leading `AIMessage` + trailing `ToolResultMessage`s; create a `Step`; pair each `ToolUseBlock` to its `ToolResultMessage` by `ToolUseID`. Then **flush** the step's buffered gates onto `Step.Gates`, binding each to a `ToolCall` by tool **name** (exact when unique in the step, else positional among same-named; sets `ToolCall.Gate` + `GateAction.ToolUseID`); clear the buffer. |
 | `TurnDone` / `TurnFailed` / `TurnInterrupted` | close the open turn with `Outcome` (+ error text for failed). |
 | `SessionActive`/`Idle`/`Stopped`, `RestoreStarted`/`Done`/`Errored` | append a `Notice`. |
 | `FenceRecord`, ephemeral events | never reach the builder / not journaled. |
@@ -191,17 +197,42 @@ only `SystemPromptRev` — a **sha256 digest**, not the text. The text rides on
   returns `ok == false`; the loop renders `system prompt unavailable (rev <digest>)` and a
   `Warning` is recorded. Honest degradation, no fabrication.
 
-## Decision 5 — gate↔tool correlation reuses the subagent-card precedent
+## Decision 5 — gate↔tool correlation: buffer-and-flush, bind by tool name
 
-Permission/AskUser gates carry a `ToolExecutionID` (UUID), while the durable tool record keys on
-the provider `content.ToolUseBlock.ID` string — the same two-namespace split documented in
-`2026-06-22-subagent-card-rendering-design.md` (Decision 2). `PermissionRequested`/
-`UserInputRequested` (`pkg/event/tool.go`) carry `ToolExecutionID`; the resolving **commands**
-carry it too (in their `Cause.ToolExecutionID`). The builder keeps a transient
-`map[ToolExecutionID]*ToolCall` populated when the gate event arrives (the owning step's
-tool-use is already known within the step), then resolves the command against it. A gate whose
-tool-use never materialises (spawn-before-loop failures, etc.) becomes a `Warning`, never a
-panic.
+**The durable reality (verified against the runner/event/command code):**
+
+- **Ordering.** For a gated call the journal order is `PermissionRequested` → resolving command
+  (`ApproveToolCall`/`DenyToolCall`/`ProvideUserInput`) → *(ephemeral `ToolCallStarted`/
+  `Completed`, dropped)* → `StepDone`. So the gate and its resolution land **before** the
+  `StepDone` that carries the tool's `ToolUseBlock` + result — the `ToolCall` model object does
+  **not exist yet** when the gate arrives.
+- **What's durable.** `PermissionRequested` *does* persist its `Request` (a
+  `permissionRequestedWire` in `pkg/event/marshal.go` round-trips it via
+  `tool.MarshalPermissionRequest`), so on replay we recover `Request.ToolName()` (e.g. `Bash`) and
+  `Request.Description()` (a **redacted** prompt body — never raw args), plus `ToolExecutionID`.
+  `UserInputRequested` persists `Question`+`Choices`+`ToolExecutionID`. The commands persist
+  `ToolExecutionID` (in `GateRoute`), `Agency==User`, `CreatedAt`, plus `Scope` (Approve) /
+  `Answer` (ProvideUserInput).
+- **No durable `ToolExecutionID → ToolUseBlock.ID` link** exists; the live TUI bridges it only via
+  the *ephemeral* `ToolCallStarted` (keyed by `ToolExecutionID`), which a cold replay never sees.
+
+**Therefore the builder buffers and flushes** (it cannot bind on gate arrival):
+
+1. On `PermissionRequested`/`UserInputRequested`: build a `GateAction{Decision: pending}` capturing
+   `ToolName`/`Description` (permission) or `Question`/`Choices` (askUser) and `OpenedAt`; index it
+   by `ToolExecutionID` and append to the **current step's gate buffer**.
+2. On the resolving command: look up by `ToolExecutionID`, set `Decision` (+`Scope`/`Answer`) and
+   `DecidedAt`. An unmatched command → `Warning` (fail-secure, never panic).
+3. On `StepDone`: after the tools are built, move the buffer onto `Step.Gates` and **bind each gate
+   to a `ToolCall` by tool name** — exact when the step has a single tool of that name (the common
+   case), else **positional** among same-named tools (best-effort, documented). Binding sets
+   `ToolCall.Gate` and `GateAction.ToolUseID`. A gate that matches no tool stays unbound on
+   `Step.Gates` — still fully renderable as a notification from its own `ToolName`/`Description`.
+
+This satisfies the product requirement (every user gate action is shown as a timestamped
+notification, from the gate's own durable data) and adds best-effort per-card decision verbs.
+Edge case (gate left pending at a turn terminal with no `StepDone`) is handled in Decision-5
+territory by Task 5: such buffered gates flush to the turn's last step (or a `Warning`).
 
 ## Decision 6 — subagents render inline, nested under the spawning tool call
 
