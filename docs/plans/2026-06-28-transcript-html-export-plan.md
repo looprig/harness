@@ -219,10 +219,14 @@ a stable order — consistent with Task 4's sorted orphan warnings). **Step 4:**
 
 **Step 1 (failing tests):** (1) resolver returns `("SYSTEM TEXT", true)` for the primary loop id →
 `Root.SystemPrompt=="SYSTEM TEXT"`; (2) resolver returns `("", false)` → `Root.SystemPrompt==""` **and**
-one `Warning` ("system prompt unavailable (rev <SystemPromptRev>)"). Use a fake resolver keyed by
-loop id. **Step 2:** FAIL. **Step 3 (implement):** on `LoopStarted`, call
-`prompts.SystemPrompt(loopID)`; set `Loop.SystemPrompt` or record the degradation `Warning`,
-carrying `Config.SystemPromptRev` from `SessionStarted`. **Step 4:** PASS.
+one `Warning` identifying the loop and carrying the digest, e.g. `"system prompt unavailable for loop
+<LoopID> (<AgentName>) (rev <SystemPromptRev>)"`; (3) a **subagent** loop also degrades with its own
+loop-identified warning (locks "primary and subagent alike"). Use a fake resolver keyed by loop id.
+**Step 2:** FAIL. **Step 3 (implement):** on `LoopStarted`, call `prompts.SystemPrompt(loopID)`; set
+`Loop.SystemPrompt` or record the degradation `Warning` — **include the loop id + AgentName** (so a
+restored multi-loop session yields per-loop-distinguishable warnings, consistent with the file's other
+warnings) plus the session-level `Config.SystemPromptRev` (the journal holds only one digest, in
+`SessionStarted` — reused for every loop's warning). **Step 4:** PASS.
 **Step 5:** `git commit -m "feat(transcript): resolve live system prompt with restored-session fallback"`.
 
 ---
