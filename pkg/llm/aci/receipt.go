@@ -379,3 +379,331 @@ func (e *receiptVerifyError) Error() string {
 }
 
 func (e *receiptVerifyError) Unwrap() error { return e.cause }
+
+// ----------------------------------------------------------------------------
+// Task 4.2 — mandatory receipt checks (VerifyReceipt).
+//
+// VerifyReceipt binds a signed §9 receipt to an attested keyset: it verifies the
+// signature FIRST (Task 4.1), then enforces — fail-closed — every mandatory
+// binding the design doc §Receipt requires, mirroring the Rust reference
+// src/aci/receipt.rs:
+//
+//   - identity (workload_id + workload_keyset_digest match the VerifiedReport;
+//     api_version == "aci/1"; endpoint/method == expected);
+//   - request.received.body_hash == Sha256HexBytes(expect.ReqBody) (the COMPACT
+//     serde_json bytes of the cleartext request body, which the caller computes
+//     via CompactJSON — Task 1.3);
+//   - response.returned.cleartext_hash == Sha256HexBytes(expect.RespBodyCleartext),
+//     and (when expect.RespWireBytes != nil) wire_hash == Sha256HexBytes(...);
+//   - a matching upstream.verified event (result == "verified", model_id ==
+//     expect.ModelID, and — when expect.Vendor != "" — provider == expect.Vendor).
+//
+// The first four families (and the signature) fail with reason receipt_invalid;
+// the upstream check fails with reason upstream_unverified. Every miss is
+// fail-closed: a single binding that does not hold rejects the whole receipt.
+
+// supportedReceiptAPIVersion is the only receipt api_version this client accepts.
+// It is the same wire string as SupportedAPIVersion; named separately so the
+// receipt path documents its own contract at the call site.
+const supportedReceiptAPIVersion = SupportedAPIVersion
+
+// upstreamResultVerified is the upstream.verified event's result value that
+// satisfies the mandatory upstream check; any other value (e.g. "failed") fails.
+const upstreamResultVerified = "verified"
+
+// Receipt event types and the flattened field keys the mandatory checks read.
+// They are wire strings, pinned here so a single typo can't silently skip a
+// check.
+const (
+	eventTypeRequestReceived  = "request.received"
+	eventTypeResponseReturned = "response.returned"
+	eventTypeUpstreamVerified = "upstream.verified"
+
+	fieldBodyHash      = "body_hash"
+	fieldCleartextHash = "cleartext_hash"
+	fieldWireHash      = "wire_hash"
+	fieldResult        = "result"
+	fieldProvider      = "provider"
+	fieldModelID       = "model_id"
+)
+
+// ReceiptExpect carries the caller-supplied expectations VerifyReceipt binds the
+// receipt against. The request body is supplied as the ALREADY-COMPACT
+// serde_json bytes (the caller — Task 5.2 — computes CompactJSON over the
+// decrypted cleartext request body); VerifyReceipt hashes those bytes directly
+// with Sha256HexBytes. The response cleartext and wire fields are likewise
+// already-serialized bytes. RespWireBytes is nil to SKIP the wire_hash check
+// (the wire-bytes hash is optional in the design doc). Vendor is the upstream
+// provider TYPE (the design doc's "vendor" maps to the event's `provider`
+// field); an empty Vendor skips the provider check, binding the upstream event
+// on result + model_id alone.
+type ReceiptExpect struct {
+	Endpoint          string
+	Method            string
+	Vendor            string
+	ModelID           string
+	ReqBody           []byte
+	RespBodyCleartext []byte
+	RespWireBytes     []byte
+}
+
+// VerifyReceipt verifies a signed §9 receipt against an attested VerifiedReport
+// and the caller's expectations, enforcing every mandatory binding fail-closed.
+//
+// It accepts the receipt JSON either bare ({...}) or wrapped ({"receipt": {...}})
+// — when a top-level "receipt" object key is present it is unwrapped first. It
+// then verifies the signature (Task 4.1) and, only on a valid signature, the
+// identity / request-body / response-hash / upstream bindings. The first failing
+// check wins: identity, body, and response misses (and the signature) return the
+// fail-closed *llm.AttestationError with reason receipt_invalid; an absent or
+// non-matching upstream.verified event returns reason upstream_unverified. The
+// returned error wraps a typed cause and never carries secret material. It
+// returns nil only when ALL mandatory bindings hold.
+func VerifyReceipt(receiptJSON []byte, verified *VerifiedReport, expect ReceiptExpect) error {
+	if verified == nil {
+		return receiptInvalid("", "nil verified report", nil)
+	}
+
+	inner, err := unwrapReceipt(receiptJSON)
+	if err != nil {
+		return err
+	}
+
+	r, err := ParseReceipt(inner)
+	if err != nil {
+		return receiptInvalid("", "receipt parse failed", err)
+	}
+
+	// Signature first: bind the receipt's canonical bytes to an attested
+	// receipt-signing key before trusting any of its fields.
+	canonical, err := canonicalReceipt(r)
+	if err != nil {
+		return receiptInvalid("", "canonical projection failed", err)
+	}
+	if err := verifyReceiptSig(*verified, r.Signature.KeyID, canonical, r.Signature.ValueHex); err != nil {
+		return err // already a fail-closed receipt_invalid
+	}
+
+	if err := checkReceiptIdentity(r, verified, expect); err != nil {
+		return err
+	}
+	if err := checkRequestBodyHash(r, expect); err != nil {
+		return err
+	}
+	if err := checkResponseHashes(r, expect); err != nil {
+		return err
+	}
+	return checkUpstreamVerified(r, expect)
+}
+
+// receiptEnvelope is the optional {"receipt": {...}} wrapper. The field is a
+// pointer so an absent key (the bare form) is distinguishable from a present-but-
+// null one; only a present non-null object is unwrapped.
+type receiptEnvelope struct {
+	Receipt *json.RawMessage `json:"receipt"`
+}
+
+// unwrapReceipt returns the inner receipt JSON: the value of a top-level
+// "receipt" object key when present, else the input unchanged. On a malformed or
+// non-object input the bytes are returned unchanged so the downstream
+// ParseReceipt produces the single, typed parse failure rather than this helper
+// masking it. The bare {...} form — which has no "receipt" key — passes through;
+// a document that happens to carry a top-level "receipt" member is unwrapped,
+// matching the design doc's "if present, use it". It returns no error today; the
+// error result is kept so a future stricter envelope policy can fail closed here
+// without changing the call site.
+func unwrapReceipt(receiptJSON []byte) ([]byte, error) {
+	var env receiptEnvelope
+	if err := json.Unmarshal(receiptJSON, &env); err != nil {
+		// Not an object, or malformed: leave it to ParseReceipt to produce the
+		// typed parse failure rather than masking it here.
+		return receiptJSON, nil
+	}
+	if env.Receipt != nil {
+		return *env.Receipt, nil
+	}
+	return receiptJSON, nil
+}
+
+// checkReceiptIdentity enforces the identity bindings: workload_id and
+// workload_keyset_digest match the attested VerifiedReport, api_version is the
+// supported version, and endpoint/method match the caller's expectations. Any
+// miss is fail-closed receipt_invalid.
+func checkReceiptIdentity(r *Receipt, verified *VerifiedReport, expect ReceiptExpect) error {
+	if r.WorkloadID != verified.WorkloadID {
+		return receiptInvalid("", "workload_id does not match the attested report", nil)
+	}
+	if r.WorkloadKeysetDigest != verified.WorkloadKeysetDigest {
+		return receiptInvalid("", "workload_keyset_digest does not match the attested report", nil)
+	}
+	if r.APIVersion != supportedReceiptAPIVersion {
+		return receiptInvalid("", "receipt api_version is not supported", nil)
+	}
+	if r.Endpoint != expect.Endpoint {
+		return receiptInvalid("", "receipt endpoint does not match the expected endpoint", nil)
+	}
+	if r.Method != expect.Method {
+		return receiptInvalid("", "receipt method does not match the expected method", nil)
+	}
+	return nil
+}
+
+// checkRequestBodyHash enforces the MANDATORY request body binding: the
+// request.received event's body_hash equals Sha256HexBytes(expect.ReqBody) (the
+// caller-supplied compact serde_json bytes of the cleartext request body). An
+// absent event or field, or a mismatch, is fail-closed receipt_invalid.
+func checkRequestBodyHash(r *Receipt, expect ReceiptExpect) error {
+	ev, ok := findEvent(r, eventTypeRequestReceived)
+	if !ok {
+		return receiptInvalid("", "receipt has no request.received event", nil)
+	}
+	bodyHash, ok := eventField(ev, fieldBodyHash)
+	if !ok {
+		return receiptInvalid("", "request.received event has no body_hash", nil)
+	}
+	want, err := Sha256HexBytes(expect.ReqBody)
+	if err != nil {
+		return receiptInvalid("", "request body hash failed", err)
+	}
+	if bodyHash != want {
+		return receiptInvalid("", "request.received body_hash does not match the request body", nil)
+	}
+	return nil
+}
+
+// checkResponseHashes enforces the response.returned bindings: cleartext_hash
+// equals Sha256HexBytes(expect.RespBodyCleartext) (MANDATORY) and, when
+// expect.RespWireBytes is non-nil, wire_hash equals Sha256HexBytes(...). An
+// absent event or field, or any mismatch, is fail-closed receipt_invalid.
+func checkResponseHashes(r *Receipt, expect ReceiptExpect) error {
+	ev, ok := findEvent(r, eventTypeResponseReturned)
+	if !ok {
+		return receiptInvalid("", "receipt has no response.returned event", nil)
+	}
+
+	cleartextHash, ok := eventField(ev, fieldCleartextHash)
+	if !ok {
+		return receiptInvalid("", "response.returned event has no cleartext_hash", nil)
+	}
+	wantCleartext, err := Sha256HexBytes(expect.RespBodyCleartext)
+	if err != nil {
+		return receiptInvalid("", "response cleartext hash failed", err)
+	}
+	if cleartextHash != wantCleartext {
+		return receiptInvalid("", "response.returned cleartext_hash does not match the response body", nil)
+	}
+
+	if expect.RespWireBytes == nil {
+		return nil // wire_hash is optional; the caller opted out.
+	}
+	wireHash, ok := eventField(ev, fieldWireHash)
+	if !ok {
+		return receiptInvalid("", "response.returned event has no wire_hash", nil)
+	}
+	wantWire, err := Sha256HexBytes(expect.RespWireBytes)
+	if err != nil {
+		return receiptInvalid("", "response wire hash failed", err)
+	}
+	if wireHash != wantWire {
+		return receiptInvalid("", "response.returned wire_hash does not match the response wire bytes", nil)
+	}
+	return nil
+}
+
+// checkUpstreamVerified enforces the MANDATORY upstream binding: there must exist
+// an upstream.verified event whose result is "verified", whose model_id equals
+// expect.ModelID, and — when expect.Vendor != "" — whose provider equals
+// expect.Vendor (the design doc's "vendor" maps to the event's provider field).
+// Any miss is fail-closed upstream_unverified. The loop matches the FIRST event
+// that satisfies all required fields, so a failed event does not mask a later
+// verified one.
+func checkUpstreamVerified(r *Receipt, expect ReceiptExpect) error {
+	for i := range r.EventLog {
+		ev := &r.EventLog[i]
+		if ev.EventType != eventTypeUpstreamVerified {
+			continue
+		}
+		if !upstreamEventMatches(ev, expect) {
+			continue
+		}
+		return nil
+	}
+	return attestErr(reasonUpstreamUnverified, &upstreamUnverifiedError{
+		provider: expect.Vendor,
+		modelID:  expect.ModelID,
+	})
+}
+
+// upstreamEventMatches reports whether one upstream.verified event satisfies all
+// required fields: result == "verified", model_id == expect.ModelID, and (when
+// expect.Vendor != "") provider == expect.Vendor.
+func upstreamEventMatches(ev *ReceiptEvent, expect ReceiptExpect) bool {
+	result, ok := eventField(ev, fieldResult)
+	if !ok || result != upstreamResultVerified {
+		return false
+	}
+	modelID, ok := eventField(ev, fieldModelID)
+	if !ok || modelID != expect.ModelID {
+		return false
+	}
+	if expect.Vendor != "" {
+		provider, ok := eventField(ev, fieldProvider)
+		if !ok || provider != expect.Vendor {
+			return false
+		}
+	}
+	return true
+}
+
+// findEvent returns the first event in the log whose type equals eventType, or
+// ok false when none matches. It returns a pointer into the receipt's event-log
+// slice; callers only read it.
+func findEvent(r *Receipt, eventType string) (*ReceiptEvent, bool) {
+	for i := range r.EventLog {
+		if r.EventLog[i].EventType == eventType {
+			return &r.EventLog[i], true
+		}
+	}
+	return nil, false
+}
+
+// eventField reads a string-valued flattened field from one event's raw Fields
+// JSON. It returns ok false when the event has no fields, the key is absent, or
+// the value is not a JSON string — so a malformed or wrong-typed field reads as
+// "absent" and the caller's mandatory check fails closed rather than panicking.
+func eventField(ev *ReceiptEvent, key string) (string, bool) {
+	if len(ev.Fields) == 0 {
+		return "", false
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(ev.Fields, &fields); err != nil {
+		return "", false
+	}
+	raw, ok := fields[key]
+	if !ok {
+		return "", false
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err != nil {
+		return "", false
+	}
+	return s, true
+}
+
+// upstreamUnverifiedError is the typed cause wrapped inside the
+// upstream_unverified *llm.AttestationError. It records the expected provider and
+// model_id (caller-supplied identifiers, not secrets) so a caller can errors.As
+// to inspect what upstream verification was required. An empty provider means the
+// provider check was skipped (expect.Vendor == "").
+type upstreamUnverifiedError struct {
+	provider string
+	modelID  string
+}
+
+func (e *upstreamUnverifiedError) Error() string {
+	msg := "aci/receipt: no verified upstream event for model_id " + e.modelID
+	if e.provider != "" {
+		msg += " from provider " + e.provider
+	}
+	return msg
+}
