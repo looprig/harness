@@ -1544,12 +1544,32 @@ func TestTranscriptRecordSubmitValueCopy(t *testing.T) {
 // form.
 func TestGateDecisionFlow(t *testing.T) {
 	tests := []struct {
-		name     string
-		decision gateDecision
-		wantVerb string
+		name       string
+		request    tool.PermissionRequest
+		toolName   string
+		summary    string
+		decision   gateDecision
+		wantVerb   string
+		wantHeader string
 	}{
-		{name: "approved", decision: gateApproved, wantVerb: "Approved"},
-		{name: "denied", decision: gateDenied, wantVerb: "Denied"},
+		{
+			name:       "approved bash",
+			request:    tool.BashRequest{Command: "date"},
+			toolName:   "Bash",
+			summary:    "redacted command",
+			decision:   gateApproved,
+			wantVerb:   "Approved",
+			wantHeader: "Bash(date)",
+		},
+		{
+			name:       "denied fetch",
+			request:    tool.FetchRequest{Method: "GET", URL: "https://google.com/search?q=looprig"},
+			toolName:   "Fetch",
+			summary:    "GET google.com",
+			decision:   gateDenied,
+			wantVerb:   "Denied",
+			wantHeader: "Fetch(GET https://google.com/search?q=looprig)",
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -1557,16 +1577,16 @@ func TestGateDecisionFlow(t *testing.T) {
 			var m transcriptModel
 			m = m.ApplyEvent(event.TurnStarted{})
 			m = m.ApplyEvent(thinkingChunk("let me run it"))
-			m = m.ApplyEvent(event.PermissionRequested{ToolExecutionID: callID(1), Request: tool.BashRequest{Command: "date"}})
+			m = m.ApplyEvent(event.PermissionRequested{ToolExecutionID: callID(1), Request: tt.request})
 			// The gate commits nothing; the thinking stays live (uncommitted).
 			if len(m.committed) != 0 {
 				t.Fatalf("committed after gate = %d, want 0", len(m.committed))
 			}
 			// Screen records the keypress decision, then the loop runs the tool.
 			m = m.ResolveGate(callID(1), tt.decision)
-			m = m.ApplyEvent(toolStarted(callID(1), "Bash", "date"))
+			m = m.ApplyEvent(toolStarted(callID(1), tt.toolName, tt.summary))
 			m = m.ApplyEvent(toolCompleted(callID(1), tt.decision == gateDenied, "out"))
-			m = m.ApplyEvent(stepDone(aiMessage("let me run it", "", toolUse("tu-1", "Bash", `{}`)), toolResult("tu-1", "out")))
+			m = m.ApplyEvent(stepDone(aiMessage("let me run it", "", toolUse("tu-1", tt.toolName, `{}`)), toolResult("tu-1", "out")))
 
 			// committed: a thinking-only entry then the promoted card carrying the decision.
 			if len(m.committed) != 2 {
@@ -1589,10 +1609,64 @@ func TestGateDecisionFlow(t *testing.T) {
 				t.Errorf("card Decision = %v, want %v", got, tt.decision)
 			}
 			got := stripANSI(strings.Join(renderEntry(card, false, 80), "\n"))
-			for _, w := range []string{tt.wantVerb, "Bash(date)"} {
+			for _, w := range []string{tt.wantVerb, tt.wantHeader} {
 				if !strings.Contains(got, w) {
 					t.Errorf("rendered card = %q, want %q", got, w)
 				}
+			}
+		})
+	}
+}
+
+// TestStoredStepToolCardSummarizesInput covers the durable reconstruction path
+// used when live ToolCallStarted summaries are unavailable, including subagent
+// nested cards. It must still show the relevant target/command/request.
+func TestStoredStepToolCardSummarizesInput(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name        string
+		use         content.ToolUseBlock
+		wantSummary string
+	}{
+		{
+			name:        "read file path",
+			use:         toolUse("read-1", "ReadFile", `{"path":"pkg/tui/render.go"}`),
+			wantSummary: "pkg/tui/render.go",
+		},
+		{
+			name:        "write file path and byte count",
+			use:         toolUse("write-1", "WriteFile", `{"path":"README.md","content":"hello"}`),
+			wantSummary: "README.md (5 bytes)",
+		},
+		{
+			name:        "bash command",
+			use:         toolUse("bash-1", "Bash", `{"command":"curl -p https://example.com"}`),
+			wantSummary: "curl -p https://example.com",
+		},
+		{
+			name:        "fetch method and url",
+			use:         toolUse("fetch-1", "Fetch", `{"method":"GET","url":"https://google.com"}`),
+			wantSummary: "GET https://google.com",
+		},
+		{
+			name:        "grep pattern and path",
+			use:         toolUse("grep-1", "Grep", `{"pattern":"needle","path":"pkg"}`),
+			wantSummary: "needle in pkg",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			card := storedStepToolCard(tt.use, nil)
+			if card.Summary != tt.wantSummary {
+				t.Errorf("storedStepToolCard().Summary = %q, want %q", card.Summary, tt.wantSummary)
+			}
+			got := stripANSI(strings.Join(renderEntry(entry{Kind: kindTool, Calls: []ToolCallView{card}}, false, 100), "\n"))
+			if !strings.Contains(got, tt.use.Name+"("+tt.wantSummary+")") {
+				t.Errorf("rendered card = %q, want %s(%s)", got, tt.use.Name, tt.wantSummary)
 			}
 		})
 	}
@@ -1944,8 +2018,31 @@ func TestSubagentMixedBatchSameIndexIsolation(t *testing.T) {
 		t.Fatalf("card.Children = %d, want 1 nested Bash row; %+v", len(card.Children), card.Children)
 	}
 	child := card.Children[0]
+	if child.Summary != "ls" {
+		t.Errorf("nested child Bash summary = %q, want command %q", child.Summary, "ls")
+	}
 	if got := strings.Join(child.Result, "\n"); got != "CHILD bash output" {
 		t.Errorf("nested child Bash result = %q, want the CHILD's result %q (not the parent live card)", got, "CHILD bash output")
+	}
+	renderedSubagent := stripANSI(renderSubagentCard(card, false, 120))
+	if !strings.Contains(renderedSubagent, "Bash(ls)") {
+		t.Errorf("rendered subagent card = %q, want nested Bash command", renderedSubagent)
+	}
+
+	var parentBash *entry
+	for i := range m.committed {
+		e := &m.committed[i]
+		if e.Kind == kindTool && len(e.Calls) == 1 && e.Calls[0].ToolName == "Bash" && strings.Join(e.Calls[0].Result, "\n") == "PARENT bash output" {
+			parentBash = e
+			break
+		}
+	}
+	if parentBash == nil {
+		t.Fatalf("missing committed parent Bash card; committed=%+v", m.committed)
+	}
+	renderedParent := stripANSI(strings.Join(renderEntry(*parentBash, false, 120), "\n"))
+	if !strings.Contains(renderedParent, "Bash(make)") {
+		t.Errorf("rendered parent Bash card = %q, want parent command", renderedParent)
 	}
 }
 

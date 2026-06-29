@@ -54,6 +54,7 @@ type ToolCallView struct {
 	ToolExecutionID uuid.UUID
 	ToolName        string       // ToolCallStarted.ToolName
 	Summary         string       // ToolCallStarted.Summary (already redacted, one line)
+	Permission      string       // PermissionRequest.Description for gated calls, if available
 	Status          ToolStatus   // lifecycle state
 	Result          []string     // capped preview lines from ToolCallCompleted; nil while running
 	Decision        gateDecision // the user's permission decision, if this call prompted (else gateNone)

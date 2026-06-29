@@ -208,6 +208,10 @@ type liveSeg struct {
 	// bakes the decision into its live card, so the committed card reads "Approved …" /
 	// "Denied …". It is reset (to nil) at each StepDone with the rest of the segment.
 	gateDecisions map[uuid.UUID]gateDecision
+	// gateDescriptions records the same gate's human-readable permission body
+	// (PermissionRequest.Description), so the committed card can show exactly what
+	// was approved/denied rather than only the redacted audit summary.
+	gateDescriptions map[uuid.UUID]string
 }
 
 // empty reports whether the live segment carries no committable content — no
@@ -632,6 +636,11 @@ func (m *transcriptModel) permissionRequested(ev event.PermissionRequested) {
 	g := cloneGates(m.live.gateDecisions)
 	g[ev.ToolExecutionID] = gatePending
 	m.live.gateDecisions = g
+	if ev.Request != nil {
+		d := cloneGateDescriptions(m.live.gateDescriptions)
+		d[ev.ToolExecutionID] = ev.Request.Description()
+		m.live.gateDescriptions = d
+	}
 }
 
 // ResolveGate records the user's decision for a pending permission gate (callID),
@@ -653,6 +662,16 @@ func (m transcriptModel) ResolveGate(callID uuid.UUID, decision gateDecision) tr
 // analogue of the slice value-copy contract used elsewhere in this model.
 func cloneGates(g map[uuid.UUID]gateDecision) map[uuid.UUID]gateDecision {
 	next := make(map[uuid.UUID]gateDecision, len(g)+1)
+	for k, v := range g {
+		next[k] = v
+	}
+	return next
+}
+
+// cloneGateDescriptions returns a fresh copy of the permission-description map
+// keyed by ToolExecutionID.
+func cloneGateDescriptions(g map[uuid.UUID]string) map[uuid.UUID]string {
+	next := make(map[uuid.UUID]string, len(g)+1)
 	for k, v := range g {
 		next[k] = v
 	}
@@ -761,6 +780,7 @@ func (m *transcriptModel) toolStarted(ev event.ToolCallStarted) {
 		ToolExecutionID: ev.ToolExecutionID,
 		ToolName:        ev.ToolName,
 		Summary:         ev.Summary,
+		Permission:      m.live.gateDescriptions[ev.ToolExecutionID],
 		Status:          ToolRunning,
 		// Bake in the permission decision (if this call prompted): permission resolves
 		// BEFORE ToolCallStarted, so the gate is already gateApproved/gateDenied here
@@ -1164,6 +1184,9 @@ func (m *transcriptModel) stepToolCard(use content.ToolUseBlock, results map[str
 			if live.Status == ToolRunning {
 				live.Status = ToolOK // the step finalized: a still-"running" live card resolves OK
 			}
+			if summary := toolUseSummary(use.Name, use.Input); summary != "" {
+				live.Summary = summary
+			}
 			return live
 		}
 	}
@@ -1180,7 +1203,7 @@ func (m *transcriptModel) stepToolCard(use content.ToolUseBlock, results map[str
 // preserves (an error result commits a ✗ card on this path too). It is a free function
 // — it depends on nothing but its arguments, which is the property the design relies on.
 func storedStepToolCard(use content.ToolUseBlock, results map[string]*content.ToolResultMessage) ToolCallView {
-	card := ToolCallView{ToolName: use.Name, Status: ToolOK}
+	card := ToolCallView{ToolName: use.Name, Summary: toolUseSummary(use.Name, use.Input), Status: ToolOK}
 	if r, ok := results[use.ID]; ok {
 		card.Result = splitLines(toolResultText(r))
 		if r.IsError {

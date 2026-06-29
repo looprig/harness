@@ -136,7 +136,12 @@ func renderPermissionBox(p prompt, width, pending int) string {
 	}
 	keys = append(keys, "[n] deny") // deny is always offered (fail-secure)
 	header := styles.PromptHeaderStyle.Render("Approve " + p.ToolName + "?")
-	body := strings.Join(keys, "   ")
+	rows := make([]string, 0, 2)
+	if p.Description != "" {
+		rows = append(rows, strings.Join(wrapToWidth(p.Description, promptInnerWidth(width)), "\n"))
+	}
+	rows = append(rows, strings.Join(keys, "   "))
+	body := strings.Join(rows, "\n")
 	return promptBox(header, body, width, pending)
 }
 

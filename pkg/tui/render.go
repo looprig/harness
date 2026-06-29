@@ -221,13 +221,44 @@ func renderToolCard(c ToolCallView, expandTools bool, width int, glyph func(Tool
 // parens. The parens and the summary gap are omitted when there is no summary.
 func toolHeaderText(c ToolCallView, glyph string) string {
 	head := c.ToolName
-	if c.Summary != "" {
-		head = c.ToolName + "(" + c.Summary + ")"
+	if detail := toolCallDetail(c); detail != "" {
+		head = c.ToolName + "(" + detail + ")"
 	}
 	if v := decisionVerb(c.Decision); v != "" {
 		head = v + " " + head
 	}
 	return head + "  " + glyph
+}
+
+// toolCallDetail returns the argument/target text to render inside ToolName(...).
+// A permission prompt body is preferred because it is what the user approved.
+// Otherwise the redacted audit summary is normalized to avoid duplicating the
+// tool name inside the header.
+func toolCallDetail(c ToolCallView) string {
+	if c.Permission != "" {
+		return c.Permission
+	}
+	return stripToolNamePrefix(c.ToolName, c.Summary)
+}
+
+// stripToolNamePrefix trims summaries such as "Bash: make test" and
+// "ReadFile main.go" down to their argument text. The card header already renders
+// the tool name, so repeating it obscures the useful detail.
+func stripToolNamePrefix(toolName, summary string) string {
+	s := strings.TrimSpace(summary)
+	if s == "" {
+		return ""
+	}
+	if s == toolName {
+		return ""
+	}
+	if rest, ok := strings.CutPrefix(s, toolName+":"); ok {
+		return strings.TrimSpace(rest)
+	}
+	if rest, ok := strings.CutPrefix(s, toolName+" "); ok {
+		return strings.TrimSpace(rest)
+	}
+	return s
 }
 
 // decisionVerb maps a permission decision to its card-header verb. A call that never

@@ -26,14 +26,21 @@ func TestRenderPermissionBox(t *testing.T) {
 			name:        "bash offers all scopes plus deny",
 			req:         tool.BashRequest{Command: "go build"},
 			pending:     1,
-			wantContain: []string{"Approve Bash?", "[y] once", "[s] session", "[w] workspace", "[n] deny"},
+			wantContain: []string{"Approve Bash?", "go build", "[y] once", "[s] session", "[w] workspace", "[n] deny"},
+			wantAbsent:  []string{"more pending"},
+		},
+		{
+			name:        "fetch shows method and url",
+			req:         tool.FetchRequest{Method: "GET", URL: "https://google.com"},
+			pending:     1,
+			wantContain: []string{"Approve Fetch?", "GET https://google.com", "[y] once", "[s] session", "[w] workspace", "[n] deny"},
 			wantAbsent:  []string{"more pending"},
 		},
 		{
 			name:        "unknown offers only once and deny",
 			req:         tool.UnknownRequest{Tool: "Mystery", Summary: "does a thing"},
 			pending:     1,
-			wantContain: []string{"Approve Mystery?", "[y] once", "[n] deny"},
+			wantContain: []string{"Approve Mystery?", "does a thing", "[y] once", "[n] deny"},
 			wantAbsent:  []string{"[s] session", "[w] workspace"},
 		},
 		{

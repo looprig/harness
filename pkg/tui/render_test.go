@@ -123,6 +123,50 @@ func TestToolGlyph(t *testing.T) {
 	}
 }
 
+// TestToolHeaderTextNormalizesAuditableSummaries covers live tool events whose
+// AuditSummary already includes the tool name. The card header owns the tool name,
+// so the argument display should not duplicate it.
+func TestToolHeaderTextNormalizesAuditableSummaries(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		call ToolCallView
+		want string
+	}{
+		{
+			name: "bash colon prefix",
+			call: ToolCallView{ToolName: "Bash", Summary: "Bash: curl -p https://example.com"},
+			want: "Bash(curl -p https://example.com)  ✓",
+		},
+		{
+			name: "readfile space prefix",
+			call: ToolCallView{ToolName: "ReadFile", Summary: "ReadFile pkg/tui/render.go"},
+			want: "ReadFile(pkg/tui/render.go)  ✓",
+		},
+		{
+			name: "fetch summary without tool prefix",
+			call: ToolCallView{ToolName: "Fetch", Summary: "GET google.com"},
+			want: "Fetch(GET google.com)  ✓",
+		},
+		{
+			name: "summary equal to tool name is omitted",
+			call: ToolCallView{ToolName: "Subagent", Summary: "Subagent"},
+			want: "Subagent  ✓",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			if got := toolHeaderText(tt.call, glyphOK); got != tt.want {
+				t.Errorf("toolHeaderText() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
 // TestRenderToolCalls covers card rendering: glyphs, collapsed vs expanded preview,
 // the truncation marker, (no output), error-always-shown, multi-card batches, and
 // width wrapping (design §3).
