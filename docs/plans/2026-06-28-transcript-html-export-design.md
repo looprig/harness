@@ -296,14 +296,26 @@ All in looprig (`pkg/tui`), mirroring the existing `/clear` path:
    ```go
    // ExportSource returns a snapshot RecordSource over this session's full journal
    // (enduring events + user commands) from the beginning, plus a live system-prompt resolver.
+   // Returns *journalsource.ExportUnavailableError for a non-persisted (in-memory) session.
    ExportSource(ctx context.Context) (transcript.RecordSource, transcript.SystemPromptResolver, error)
    ```
 
-   The journal-backed `RecordSource` adapter (wrapping `journal.RecordReplayer`, mapping
-   `JournalRecord` → `transcript.Record`, dropping fences) lives next to the session, **not** in
-   `pkg/transcript`.
-6. **swe** (`swarms/swe/agent.go`): `sessionAgent.ExportSource` **forwards** to the looprig
-   session (which owns its journal + loop configs). No swe logic, no swe-side rendering.
+   The journal→transcript adapter lives in a small looprig **bridge** package
+   `pkg/transcript/journalsource` (it imports BOTH `journal` and `transcript`, so `pkg/transcript`
+   stays storage-pure): `journalsource.Open(rr, req)` wraps a `journal.RecordReplayer`, maps
+   `JournalRecord` → `transcript.Record`, and **drops fences**.
+
+6. **Placement reality (verified):** looprig's `session.Session` does NOT hold `js`/objects, and the
+   analogous `ReplayBacklog` already lives on **swe's `*sessionAgent`** (using a `journal.EventReplayer`
+   swe builds in `persistence.go`). So there is **no `session.Session.ExportSource`**. swe's
+   `sessionAgent.ExportSource` **builds** a `journal.RecordReplayer` from the `js`+object-store it has
+   in `persistence.go` (`openNew` AND `openResume`) — exactly as it builds the EventReplayer — calls
+   `journalsource.Open(...)` with `LoopID` zero (all loops), and supplies a **primary-only**
+   `SystemPromptResolver` (the primary loop's `Config.Model.System`, captured at construction). This is
+   thin wiring, not business logic — the model reconstruction + HTML rendering remain entirely in
+   looprig (`pkg/transcript` + `pkg/transcript/html`). **Subagent system prompts are not retained**
+   (built transiently at spawn), so they degrade to the Decision-4 "unavailable" warning; capturing
+   them is a documented future enhancement. A non-persisted/headless session → `ExportUnavailableError`.
 
 ## Decision 9 — file output & the permission exception
 

@@ -331,28 +331,33 @@ dispatch to `EventRecord`/`CommandRecord`/`FenceRecord`. Reuse/clone its typed e
 
 ---
 
-## Phase D — wiring: session seam → tui action → swe pass-through → integration
+## Phase D — wiring: bridge → swe seam → tui action → integration
 
-### Task 11: `session.Session.ExportSource` — journal-backed `RecordSource` + `SystemPromptResolver`
+> **Wiring reality (verified, supersedes the original plan):** looprig's `session.Session` does
+> NOT hold `js`/objects, and the analogous `ReplayBacklog` lives on **swe's `*sessionAgent`** (using
+> a `journal.EventReplayer` swe builds in `persistence.go`, where `js`+objects are in scope). So
+> there is **no `session.Session.ExportSource`**. Instead: (Task 11) a small looprig **bridge**
+> package adapts `journal.RecordReplayer → transcript.RecordSource`; (Task 13) **swe's
+> `sessionAgent.ExportSource`** builds the `RecordReplayer` from `js`+objects and a primary-only
+> resolver. **Order: 11 → 13 → 12** so swe satisfies the about-to-change `tui.Agent` before the
+> interface changes (no cross-repo build break).
+
+### Task 11: looprig bridge — `journal.RecordReplayer` → `transcript.RecordSource` (+ `ExportUnavailableError`)
+
+**Why a bridge:** `pkg/transcript` stays storage-pure (no `journal` import) and `pkg/journal` doesn't
+know `transcript`. The adapter that maps `journal.JournalRecord` → `transcript.Record` (dropping
+fences) lives in its OWN small looprig package importing both. Reusable; swe (Task 13) just calls it.
 
 **Files:**
-- Modify: `pkg/session/session.go` (add `ExportSource`; an unexported adapter mapping
-  `journal.JournalRecord` → `transcript.Record`, dropping fences; a resolver over the session's
-  loop configs)
-- Test: `pkg/session/export_test.go`
+- Create: `pkg/transcript/journalsource/source.go` — `Open(rr journal.RecordReplayer, req journal.ReplayRequest) transcript.RecordSource`: a `RecordSource` whose `Next` lazily opens the cursor on first call, maps `journal.EventRecord`→`transcript.EventRecord` and `journal.CommandRecord`→`transcript.CommandRecord`, **skips `FenceRecord`** (loops), returns `io.EOF` at the underlying EOF, and `Close`s the cursor at EOF/error. Plus a typed `ExportUnavailableError` (callers return it when no journal stream exists; the TUI `errors.As`-es it for a friendly notice).
+- Test: `pkg/transcript/journalsource/source_test.go` — a FAKE `journal.RecordReplayer`/`RecordCursor` over an in-memory slice (**no NATS**).
 
-**Step 1 (failing test):** over a persisted test session with one turn, call
-`ExportSource(ctx)`; drain the returned `transcript.RecordSource` and assert it yields the expected
-`transcript.Record`s in order, and that `SystemPrompt(primaryLoopID)` returns the loop config's
-`Model.System` text. For a **non-persisted** session, assert `ExportSource` returns a typed
-`*ExportUnavailableError` (no journal stream to replay — see Notes/risks). **Step 2:** FAIL.
-**Step 3 (implement):** `ExportSource(ctx) (transcript.RecordSource, transcript.SystemPromptResolver,
-error)`: construct a `journal.RecordReplayer` over the session's stream (`js`+objects the session
-already holds), open at `Beginning()` with `Follow:false`, wrap its `RecordCursor` in an adapter
-implementing `transcript.RecordSource.Next` (map `EventRecord`/`CommandRecord`, skip `FenceRecord`);
-build a `SystemPromptResolver` from the per-loop `loop.Config.Model.System`. Non-persisted →
-`&ExportUnavailableError{}`. **Step 4:** PASS. **Step 5:**
-`git commit -m "feat(session): ExportSource exposes journal record stream + system prompts"`.
+**Step 1 (failing tests):**
+1. Fake replayer yields `EventRecord, CommandRecord, FenceRecord, EventRecord` → the source yields the two events + the command as `transcript.EventRecord`/`CommandRecord` **in order**, the **fence dropped**, then `io.EOF`; the cursor is `Close`d exactly once.
+2. Cursor returns a non-EOF error mid-stream → the source surfaces it (so `Reconstruct` maps it to `*ReconstructError`).
+3. Lazy open: the cursor is opened on first `Next`; an `Open`-time error from the replayer surfaces on first `Next`.
+4. `ExportUnavailableError` is `errors.As`-able.
+**Step 3 (implement):** the adapter + `ExportUnavailableError`. Verify `pkg/transcript` core stays import-clean (`go list -deps ./pkg/transcript` shows NO `journal`; the bridge subpackage is the only impure spot). **Step 5:** `git commit -m "feat(transcript/journalsource): journal→transcript record-source bridge + ExportUnavailableError"`.
 
 ---
 
@@ -381,31 +386,33 @@ in any status — snapshot semantics, D1). `export.go`: `transcript.Reconstruct`
 `bytes.Buffer` → path `filepath.Join(home, "Downloads", sessionID.String()+".html")` (`os.UserHomeDir`,
 `filepath.Clean`, `os.MkdirAll`) → **atomic** temp+rename `0644` (mirror `pkg/tools/writefile.go`'s
 `atomicWriteFile`). All failures → typed errors → notices; **only the path is logged, never content**
-(D9). **Step 4:** PASS. **Step 5:** `git commit -m "feat(tui): /export command writes self-contained HTML transcript to ~/Downloads"`.
+(D9). A `*journalsource.ExportUnavailableError` from `agent.ExportSource` (non-persisted/in-memory
+session) → a friendly **info/warn** notice ("export needs a persisted session"), NOT an error crash.
+**Step 4:** PASS. **Step 5:** `git commit -m "feat(tui): /export command writes self-contained HTML transcript to ~/Downloads"`.
 
-> Note: adding `ExportSource` to `tui.Agent` breaks swe's compile-time `var _ tui.Agent =
-> (*sessionAgent)(nil)` until Task 13 — complete Task 13 before any cross-repo `go build`.
+> Note: Task 13 lands FIRST, so swe's `*sessionAgent` already implements `ExportSource` when this task
+> adds it to `tui.Agent` — the compile-time `var _ tui.Agent = (*sessionAgent)(nil)` stays green. The
+> `tui` action calls `agent.ExportSource()` (returns the Task-11 bridge `RecordSource` + resolver) →
+> `transcript.Reconstruct` → `html.Render`. The `tui` may import `pkg/transcript/journalsource` solely
+> to `errors.As` the `ExportUnavailableError`.
 
 ---
 
-### Task 13: swe `*sessionAgent.ExportSource` pass-through (no logic)
+### Task 13 (do BEFORE Task 12): swe `sessionAgent.ExportSource` + persistence wiring
+
+swe owns the journal wiring, so swe builds the `journal.RecordReplayer` exactly where it builds the
+EventReplayer. Landing this BEFORE Task 12 means swe already satisfies the about-to-change `tui.Agent`.
 
 **Files:**
-- Modify: `swarms/swe/agent.go` (forward to `a.session.ExportSource(ctx)`)
-- Test: `swarms/swe/agent_test.go` (the existing `var _ tui.Agent = (*sessionAgent)(nil)` now also
-  proves the new method; add a focused forward test)
+- Modify `swarms/swe/agent.go`: add to `sessionAgent` — `recordReplayer journal.RecordReplayer` (nil for in-memory), `exportSessionID uuid.UUID`, `primarySystemPrompt string`, `primaryLoopID uuid.UUID`. Add `ExportSource(ctx) (transcript.RecordSource, transcript.SystemPromptResolver, error)`: if `recordReplayer == nil` → `&journalsource.ExportUnavailableError{}`; else return `journalsource.Open(recordReplayer, journal.ReplayRequest{SessionID: exportSessionID, LoopID: uuid.Nil /* ALL loops */, From: journal.Beginning(), Follow: false})` plus a **primary-only** `SystemPromptResolver` (returns `primarySystemPrompt` for `primaryLoopID`; `("", false)` for any other loop → subagents degrade per D4).
+- Modify `swarms/swe/persistence.go`: in BOTH `openNew` and `openResume`, get the per-session object store (`p.js.ObjectStore(journal.SessionObjectBucket(sessionID))`) and set `agent.recordReplayer = journal.NewRecordReplayer(p.js, objects)`, `agent.exportSessionID = sessionID`, and capture `primarySystemPrompt`/`primaryLoopID` from `wiring.cfg` (the primary `loop.Config.Model.System` + its loop id). The in-memory `newSessionAgent` leaves `recordReplayer` nil.
+- Test `swarms/swe/agent_test.go` (+ persistence test as needed): a `sessionAgent` with a fake `recordReplayer` returns a working `RecordSource` and a resolver that resolves `primaryLoopID` and degrades others; an in-memory agent (`recordReplayer==nil`) returns `*journalsource.ExportUnavailableError`. The compile-time `var _ tui.Agent = (*sessionAgent)(nil)` still holds (the method exists before the interface requires it — fine).
 
-**Step 1 (failing test):** assert `(*sessionAgent).ExportSource` forwards to the session seam (over a
-fake/closed session it returns the session's result/error unchanged); the interface-satisfaction var
-compiles. **Step 2:** `cd /Users/ipotter/code/swe && go test ./swarms/swe/ -run TestExportSource -v`
-→ FAIL (method missing). **Step 3 (implement):** one method:
-```go
-func (a *sessionAgent) ExportSource(ctx context.Context) (transcript.RecordSource, transcript.SystemPromptResolver, error) {
-	return a.session.ExportSource(ctx)
-}
-```
-**Step 4:** PASS; `cd looprig && go build ./...` and `cd swe && go build ./...` both green.
-**Step 5:** `git commit -m "feat(swe): forward ExportSource to the looprig session"`.
+**Step 4:** `cd /Users/ipotter/code/swe && go build ./... && go test ./swarms/swe/... -race` green. **Step 5:** `git commit -m "feat(swe): sessionAgent.ExportSource via journal RecordReplayer + primary system prompt"`.
+
+> Subagent system prompts are NOT retained (built transiently in `spawner.Spawn`), so they degrade to
+> the D4 "unavailable" warning. Capturing them (a spawn-time hook into a `loopID→prompt` map) is a
+> documented future enhancement, out of scope here.
 
 ---
 
