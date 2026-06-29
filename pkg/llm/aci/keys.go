@@ -248,15 +248,31 @@ const kmsIssuedPrefix = "dstack-kms-issued:"
 
 // recoverK256 recovers the secp256k1 public key that signed message, from a
 // 65-byte recoverable signature in Dstack's r‖s‖v (v-last) layout, over the
-// Keccak256 digest of message.
+// Keccak256 digest of message. It hashes message with Keccak256 (legacy Keccak,
+// NOT FIPS SHA3-256) and delegates the recovery to recoverCompactFromDigest, the
+// shared hash-agnostic core (the receipt path reuses that core over sha256).
+func recoverK256(message, sig65 []byte) (*secp256k1.PublicKey, error) {
+	// Keccak256 (legacy Keccak, NOT FIPS SHA3-256) of the message is the digest
+	// the signature commits to.
+	h := sha3.NewLegacyKeccak256()
+	h.Write(message)
+	return recoverCompactFromDigest(h.Sum(nil), sig65)
+}
+
+// recoverCompactFromDigest recovers the secp256k1 public key that signed digest,
+// from a 65-byte recoverable signature in Dstack's r‖s‖v (v-last) layout. It is
+// the hash-agnostic core extracted from recoverK256: the caller supplies the
+// already-computed digest (Keccak256 for the KMS-custody chain, sha256 for the
+// receipt signature), so the same recovery logic is shared (DRY) across both
+// hash domains.
 //
 // It normalizes the recovery id (a v byte in [27,30] is shifted down by 27, the
 // Ethereum convention; a raw 0..3 is used as-is), reorders to decred's v-FIRST
-// compact layout [27+recid]‖r‖s, hashes message with Keccak256, and calls
-// ecdsa.RecoverCompact. The returned wasCompressed bool is ignored; callers
-// serialize the recovered key themselves (SerializeCompressed). Any malformed
-// length, out-of-range recid, or recovery failure returns a typed error.
-func recoverK256(message, sig65 []byte) (*secp256k1.PublicKey, error) {
+// compact layout [27+recid]‖r‖s, and calls ecdsa.RecoverCompact over digest. The
+// returned wasCompressed bool is ignored; callers serialize the recovered key
+// themselves. Any malformed length, out-of-range recid, or recovery failure
+// returns a typed error.
+func recoverCompactFromDigest(digest, sig65 []byte) (*secp256k1.PublicKey, error) {
 	if len(sig65) != recoverableSigSize {
 		return nil, &kmsCustodyError{reason: "recoverable signature wrong length"}
 	}
@@ -278,12 +294,6 @@ func recoverK256(message, sig65 []byte) (*secp256k1.PublicKey, error) {
 	compact[0] = secp256k1CompactMagic + v
 	copy(compact[1:33], sig65[:32])
 	copy(compact[33:65], sig65[32:64])
-
-	// Keccak256 (legacy Keccak, NOT FIPS SHA3-256) of the message is the digest
-	// the signature commits to.
-	h := sha3.NewLegacyKeccak256()
-	h.Write(message)
-	digest := h.Sum(nil)
 
 	pub, _, err := ecdsa.RecoverCompact(compact, digest)
 	if err != nil {
