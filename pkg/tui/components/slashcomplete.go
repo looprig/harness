@@ -13,10 +13,17 @@ type SlashCmd struct {
 	Desc string // e.g. "clear the conversation"
 }
 
+// CmdExport is the canonical name of the transcript-export slash command. It is the
+// single source of truth shared by the SlashCommands entry below and package tui's
+// dispatch (slashAction + runSlash), so the command name cannot drift between the
+// completer table and the action that handles it.
+const CmdExport = "/export"
+
 // SlashCommands is the canonical list (exported so package tui can map Name→action).
 var SlashCommands = []SlashCmd{
 	{"/clear", "clear the conversation"},
 	{"/help", "list commands"},
+	{CmdExport, "export session transcript to HTML"},
 }
 
 // SlashComplete is a filtered command list with a wrapping cursor.

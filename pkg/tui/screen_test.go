@@ -14,6 +14,7 @@ import (
 	"github.com/ciram-co/looprig/pkg/hub"
 	"github.com/ciram-co/looprig/pkg/identity"
 	"github.com/ciram-co/looprig/pkg/tool"
+	"github.com/ciram-co/looprig/pkg/transcript"
 	"github.com/ciram-co/looprig/pkg/tui/components"
 	"github.com/ciram-co/looprig/pkg/uuid"
 )
@@ -74,6 +75,14 @@ type fakeAgent struct {
 	backlog      []event.Event
 	replayErr    error
 	replayCalled bool
+
+	// export recorder: exportSrc/exportPrompts are returned by ExportSource on success;
+	// exportErr (e.g. a *journalsource.ExportUnavailableError) is returned instead when
+	// set, and exportCalled records that the seam was exercised.
+	exportSrc     transcript.RecordSource
+	exportPrompts transcript.SystemPromptResolver
+	exportErr     error
+	exportCalled  bool
 }
 
 // fixedFakeSubmitID is the deterministic InputID a fakeAgent returns when no
@@ -143,6 +152,14 @@ func (f *fakeAgent) ReplayBacklog(_ context.Context) ([]event.Event, error) {
 		return nil, f.replayErr
 	}
 	return f.backlog, nil
+}
+
+func (f *fakeAgent) ExportSource(context.Context) (transcript.RecordSource, transcript.SystemPromptResolver, error) {
+	f.exportCalled = true
+	if f.exportErr != nil {
+		return nil, nil, f.exportErr
+	}
+	return f.exportSrc, f.exportPrompts, nil
 }
 
 // fakeSubscription is a test-controlled event.Subscription: a buffered channel a

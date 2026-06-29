@@ -28,6 +28,11 @@ const (
 	uiAnswer
 	// uiInterrupt requests a turn interrupt. (Produced in Task 8.)
 	uiInterrupt
+	// uiExport requests a session-transcript HTML export (the /export command). It
+	// carries no payload — the snapshot is taken from the agent's journal at dispatch
+	// time — and is allowed in ANY status (snapshot semantics), unlike /clear. Screen
+	// routes it through runSlash("/export").
+	uiExport
 )
 
 // uiAction is the single typed result the interactionModel hands back from an

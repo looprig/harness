@@ -369,7 +369,7 @@ func (m interactionModel) composeKey(msg tea.KeyPressMsg) (interactionModel, uiA
 			name := m.slash.Selected().Name
 			m.input.Reset()
 			m.slash = nil
-			return m, uiAction{Kind: uiRunSlash, Slash: name}, nil
+			return m, slashAction(name), nil
 		}
 		switch msg.String() {
 		case "tab":
@@ -444,7 +444,7 @@ func (m interactionModel) composeEnter() (interactionModel, uiAction) {
 		if isSlashCommand(name) {
 			m.input.Reset()
 			m.slash = nil
-			return m, uiAction{Kind: uiRunSlash, Slash: name}
+			return m, slashAction(name)
 		}
 		// Unknown command: fall through to a plain-text submit.
 	}
@@ -485,6 +485,19 @@ func helpText() string {
 		b.WriteString("\n  " + c.Name + " — " + c.Desc)
 	}
 	return b.String()
+}
+
+// slashAction maps a recognized slash-command name to the typed uiAction Screen acts
+// on. Most commands share the generic uiRunSlash carrier (Screen.runSlash switches on
+// the name); /export is the one exception with its own uiExport kind so its
+// snapshot-anytime semantics read distinctly from /help and /clear at the action layer.
+// Screen still funnels uiExport back through runSlash("/export"), keeping all
+// status-gated slash execution in one place.
+func slashAction(name string) uiAction {
+	if name == components.CmdExport {
+		return uiAction{Kind: uiExport}
+	}
+	return uiAction{Kind: uiRunSlash, Slash: name}
 }
 
 // isSlashCommand reports whether name is one of the canonical slash commands.
