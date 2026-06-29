@@ -1,6 +1,8 @@
 package html
 
 import (
+	"bytes"
+	"encoding/json"
 	"regexp"
 	"strings"
 	"testing"
@@ -92,6 +94,43 @@ func FuzzRenderMarkdown(f *testing.F) {
 		}
 		if containsLiveEventHandler(string(got)) {
 			t.Fatalf("live event handler in output for input %q\n%s", in, got)
+		}
+	})
+}
+
+// FuzzPrettyJSON keeps the external tool-input JSON pretty-printer total: arbitrary
+// bytes either indent as JSON or return unchanged, but must not panic or hang.
+func FuzzPrettyJSON(f *testing.F) {
+	seeds := [][]byte{
+		nil,
+		[]byte(""),
+		[]byte(`{"command":"go test ./..."}`),
+		[]byte("{bad"),
+		[]byte(`{"nested":[{"a":{"b":{"c":{"d":true}}}}]}`),
+		[]byte(`"</script><svg onload=alert(1)>"`),
+	}
+	for _, seed := range seeds {
+		f.Add(seed)
+	}
+
+	f.Fuzz(func(t *testing.T, in []byte) {
+		got := prettyJSON(json.RawMessage(in))
+		if len(in) == 0 {
+			if got != "" {
+				t.Fatalf("prettyJSON(%q) = %q, want empty", string(in), got)
+			}
+			return
+		}
+
+		var indented bytes.Buffer
+		if err := json.Indent(&indented, in, "", "  "); err != nil {
+			if got != string(in) {
+				t.Fatalf("prettyJSON(%q) = %q, want raw fallback", string(in), got)
+			}
+			return
+		}
+		if got != indented.String() {
+			t.Fatalf("prettyJSON(%q) = %q, want %q", string(in), got, indented.String())
 		}
 	})
 }

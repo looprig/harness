@@ -143,6 +143,40 @@ func TestRenderDeterministic(t *testing.T) {
 	}
 }
 
+func TestRenderTitleFallback(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		s        *transcript.Session
+		required []string
+	}{
+		{
+			name: "empty title falls back to short session id",
+			s:    &transcript.Session{SessionID: fixedSessionID},
+			required: []string{
+				"<title>Session 01234567</title>",
+				`<h1 class="session-title">Session 01234567</h1>`,
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			var buf bytes.Buffer
+			if err := Render(&buf, tt.s); err != nil {
+				t.Fatalf("Render() error = %v", err)
+			}
+			got := buf.String()
+			for _, sub := range tt.required {
+				if !strings.Contains(got, sub) {
+					t.Errorf("Render() output missing %q\n%s", sub, got)
+				}
+			}
+		})
+	}
+}
+
 // failWriter fails every Write to exercise the RenderError path.
 type failWriter struct{ err error }
 

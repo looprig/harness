@@ -396,6 +396,47 @@ func TestReconstruct(t *testing.T) {
 			},
 		},
 		{
+			name: "title derived from first root user message as one truncated line",
+			src: newSliceSource(loopID, base,
+				event.SessionStarted{Config: event.ConfigFingerprint{
+					ModelID:   "claude-opus-4-8",
+					AgentKind: "operator",
+				}},
+				event.LoopStarted{ParentToolUseID: ""},
+				event.TurnStarted{
+					TurnIndex: 1,
+					Message:   userMsg(strings.Repeat("a", 78) + "\n bbbbb"),
+				},
+			),
+			check: func(t *testing.T, s *Session, warnings []Warning, err error) {
+				if err != nil {
+					t.Fatalf("Reconstruct() error = %v", err)
+				}
+				if len(warnings) != 0 {
+					t.Fatalf("unexpected warnings: %+v", warnings)
+				}
+				want := strings.Repeat("a", 78) + " b…"
+				if s.Title != want {
+					t.Errorf("Title = %q, want %q", s.Title, want)
+				}
+			},
+		},
+		{
+			name: "title remains empty for empty session",
+			src:  &sliceSource{},
+			check: func(t *testing.T, s *Session, warnings []Warning, err error) {
+				if err != nil {
+					t.Fatalf("Reconstruct() error = %v", err)
+				}
+				if len(warnings) != 0 {
+					t.Fatalf("unexpected warnings: %+v", warnings)
+				}
+				if s.Title != "" {
+					t.Errorf("Title = %q, want empty", s.Title)
+				}
+			},
+		},
+		{
 			name: "read error: a non-EOF source failure is a typed ReconstructError",
 			src:  &errSource{err: errRead},
 			check: func(t *testing.T, s *Session, warnings []Warning, err error) {

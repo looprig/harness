@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/ciram-co/looprig/pkg/command"
@@ -14,6 +15,8 @@ import (
 	"github.com/ciram-co/looprig/pkg/event"
 	"github.com/ciram-co/looprig/pkg/uuid"
 )
+
+const sessionTitleRuneLimit = 80
 
 // Reconstruct folds a journal record stream into a Session model. It reads from
 // src until io.EOF, folding each Record into the growing tree; a non-EOF read
@@ -523,8 +526,47 @@ func (b *builder) forgetGates(gates []*GateAction) {
 // emitted in an explicit, stable order rather than the randomized order a map range
 // would give.
 func (b *builder) finalize() {
+	b.deriveSessionTitle()
 	b.warnOrphanChildren()
 	b.warnLeftoverGates()
+}
+
+// deriveSessionTitle fills the pure transcript fallback title from the first root
+// user message. Catalog metadata titles live in the journal/export layer, not in
+// this pure record-reconstruction package.
+func (b *builder) deriveSessionTitle() {
+	if b.session.Title != "" || b.session.Root == nil || len(b.session.Root.Turns) == 0 {
+		return
+	}
+	title := firstTextBlock(b.session.Root.Turns[0].User)
+	if title == "" {
+		return
+	}
+	b.session.Title = truncateSessionTitle(title)
+}
+
+func firstTextBlock(m *Message) string {
+	if m == nil {
+		return ""
+	}
+	for _, blk := range m.Blocks {
+		if tb, ok := blk.(*content.TextBlock); ok {
+			return tb.Text
+		}
+	}
+	return ""
+}
+
+func truncateSessionTitle(s string) string {
+	s = strings.Join(strings.Fields(s), " ")
+	if s == "" {
+		return ""
+	}
+	runes := []rune(s)
+	if len(runes) <= sessionTitleRuneLimit {
+		return s
+	}
+	return string(runes[:sessionTitleRuneLimit]) + "…"
 }
 
 // warnOrphanChildren reports each subagent loop still buffered at end of stream: its

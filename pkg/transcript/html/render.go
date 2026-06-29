@@ -32,6 +32,8 @@ const (
 	clockLayout     = "15:04:05"
 )
 
+const fallbackTitleIDLen = 8
+
 // resultByteCap bounds how many bytes of a tool result are rendered into the page.
 // Output beyond the cap is dropped with a "… N bytes elided" note — the full text
 // always remains in the journal. 16 KiB keeps a pathological tool result from
@@ -174,7 +176,7 @@ func newPageView(s *transcript.Session) (pageView, error) {
 	turns, tools, gates := countLoop(s.Root)
 	pv := pageView{
 		SessionID:  s.SessionID.String(),
-		Title:      s.Title,
+		Title:      displayTitle(s),
 		ModelID:    s.Config.ModelID,
 		AgentKind:  s.Config.AgentKind,
 		Posture:    s.Config.PermissionPosture,
@@ -184,8 +186,8 @@ func newPageView(s *transcript.Session) (pageView, error) {
 		StartedAt:  formatTimestamp(s.StartedAt),
 		EndedAt:    formatTimestamp(s.EndedAt),
 		ExportedAt: formatTimestamp(s.ExportedAt),
-		Styles:     template.CSS(stylesCSS),
-		Script:     template.JS(appJS),
+		Styles:     template.CSS(stylesCSS), // #nosec G203 -- embedded compile-time CSS, never session data.
+		Script:     template.JS(appJS),      // #nosec G203 -- embedded compile-time JS, never session data.
 	}
 	if s.Root != nil {
 		lv, err := newLoopView(s.Root, 0)
@@ -201,6 +203,17 @@ func newPageView(s *transcript.Session) (pageView, error) {
 		pv.Warnings = append(pv.Warnings, warningView{Text: w.Text, At: formatClock(w.At)})
 	}
 	return pv, nil
+}
+
+func displayTitle(s *transcript.Session) string {
+	if title := strings.TrimSpace(s.Title); title != "" {
+		return title
+	}
+	id := s.SessionID.String()
+	if len(id) > fallbackTitleIDLen {
+		id = id[:fallbackTitleIDLen]
+	}
+	return "Session " + id
 }
 
 // countLoop totals the turns, tool calls and gate actions across a loop and every
@@ -523,7 +536,7 @@ func renderMarkdown(src string) (template.HTML, error) {
 	if err := markdown.Convert([]byte(src), &buf); err != nil {
 		return "", err
 	}
-	return template.HTML(buf.String()), nil
+	return template.HTML(buf.String()), nil // #nosec G203 -- goldmark escapes raw HTML; XSS tests and fuzz pin this boundary.
 }
 
 // formatTimestamp renders an absolute timestamp deterministically; a zero time
