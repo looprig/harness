@@ -339,8 +339,15 @@ dispatch to `EventRecord`/`CommandRecord`/`FenceRecord`. Reuse/clone its typed e
 > there is **no `session.Session.ExportSource`**. Instead: (Task 11) a small looprig **bridge**
 > package adapts `journal.RecordReplayer → transcript.RecordSource`; (Task 13) **swe's
 > `sessionAgent.ExportSource`** builds the `RecordReplayer` from `js`+objects and a primary-only
-> resolver. **Order: 11 → 13 → 12** so swe satisfies the about-to-change `tui.Agent` before the
-> interface changes (no cross-repo build break).
+> resolver.
+>
+> **Cross-repo note (important):** this branch is a **looprig** branch in a worktree; the **swe** repo
+> is a separate module that resolves looprig via the workspace's *main* checkout, NOT this branch. So
+> the looprig worktree builds only looprig — Tasks 11/12/14(looprig pipeline) are **self-contained here**,
+> and Task 12's tui is tested with a **fake `tui.Agent`** (no swe needed). **Task 13 is a downstream swe
+> change** needing the looprig branch consumable by swe (merge, or a temporary dev `replace`); it's done
+> against the swe repo separately. Practical order on THIS branch: **11 → 12 → 14 (looprig end-to-end
+> pipeline integration)**; swe-side **13** + the live `make run` verify are the downstream step.
 
 ### Task 11: looprig bridge — `journal.RecordReplayer` → `transcript.RecordSource` (+ `ExportUnavailableError`)
 
