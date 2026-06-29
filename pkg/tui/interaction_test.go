@@ -874,11 +874,12 @@ func TestInteractionComposeSlashNavigation(t *testing.T) {
 		t.Parallel()
 		m := newInteractionModel()
 		m, _, _ = m.Update(runeKey('/'))
-		// Up from /clear wraps to /help (the completer wraps).
+		// Up from /clear wraps to the LAST command (/export); the completer wraps. /export
+		// dispatches its own uiExport kind (not the generic uiRunSlash) — see slashAction.
 		m, _, _ = m.Update(tea.KeyPressMsg{Code: tea.KeyUp})
 		_, action, _ := m.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
-		if action.Kind != uiRunSlash || action.Slash != "/help" {
-			t.Fatalf("action = %+v, want uiRunSlash '/help' (wrapped highlight)", action)
+		if action.Kind != uiExport {
+			t.Fatalf("action = %+v, want uiExport (wrapped highlight to /export)", action)
 		}
 	})
 

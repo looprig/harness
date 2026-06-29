@@ -51,6 +51,7 @@
 - `golang.org/x/net/idna` — IDNA/punycode host normalization (same `golang.org/x/net` module as above); required by the `Fetch` tool's persisted-approval host matching to defeat unicode homographs (stdlib has no IDNA)
 - `github.com/nats-io/nats.go` — JetStream client (pub/sub, JetStream ctx, KV, object store, durable consumers); required by internal/agent/session/journal for session persistence.
 - `github.com/nats-io/nats-server/v2` — embedded in-process JetStream server (no TCP) for the CLI's local durable journal; the client alone persists nothing.
+- `github.com/yuin/goldmark` — CommonMark markdown → HTML for the transcript export renderer (`pkg/transcript/html`); the stdlib has no markdown renderer, which is why a dep is warranted. Pure-Go, no cgo, CommonMark-compliant, safe HTML output. Rendered with raw-HTML passthrough **disabled** (no `html.WithUnsafe()`) — that is the XSS boundary; the result is placed via `template.HTML` only because goldmark has already escaped it. **Approved by the user on 2026-06-28.**
 
 ## Secure Coding Patterns
 

@@ -6,6 +6,7 @@ import (
 	"github.com/ciram-co/looprig/pkg/content"
 	"github.com/ciram-co/looprig/pkg/event"
 	"github.com/ciram-co/looprig/pkg/tool"
+	"github.com/ciram-co/looprig/pkg/transcript"
 	"github.com/ciram-co/looprig/pkg/uuid"
 )
 
@@ -67,6 +68,13 @@ type Agent interface {
 	// the right loop. It is the TUI-facing name for the session's ProvideUserInput;
 	// the wrapper delegates to it.
 	ProvideAnswer(ctx context.Context, loopID, callID uuid.UUID, answer string) error
+
+	// ExportSource returns a snapshot RecordSource over this session's full journal (events +
+	// user commands) from the beginning, plus a live system-prompt resolver. The /export
+	// action folds these through transcript.Reconstruct + html.Render into a self-contained
+	// HTML file. Returns a *journalsource.ExportUnavailableError for a non-persisted
+	// (in-memory) session, which the TUI errors.As to a friendly notice rather than an error.
+	ExportSource(ctx context.Context) (transcript.RecordSource, transcript.SystemPromptResolver, error)
 }
 
 // DefaultEventFilter is the single-loop TUI's declared interest for a session

@@ -11,6 +11,7 @@ import (
 	"github.com/ciram-co/looprig/pkg/content"
 	"github.com/ciram-co/looprig/pkg/event"
 	"github.com/ciram-co/looprig/pkg/tool"
+	"github.com/ciram-co/looprig/pkg/transcript"
 	"github.com/ciram-co/looprig/pkg/tui"
 	"github.com/ciram-co/looprig/pkg/uuid"
 )
@@ -39,6 +40,9 @@ func (a *fakeAgent) Approve(context.Context, uuid.UUID, uuid.UUID, tool.Approval
 func (a *fakeAgent) Deny(context.Context, uuid.UUID, uuid.UUID) error { return nil }
 func (a *fakeAgent) ProvideAnswer(context.Context, uuid.UUID, uuid.UUID, string) error {
 	return nil
+}
+func (a *fakeAgent) ExportSource(context.Context) (transcript.RecordSource, transcript.SystemPromptResolver, error) {
+	return nil, nil, nil
 }
 func (a *fakeAgent) Close(context.Context) error {
 	if a.closed != nil {

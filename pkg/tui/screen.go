@@ -7,6 +7,7 @@ import (
 	tea "charm.land/bubbletea/v2"
 
 	"github.com/ciram-co/looprig/pkg/event"
+	"github.com/ciram-co/looprig/pkg/tui/components"
 )
 
 // Screen is the Elm model for the chat TUI. In scrollback-first mode it is a thin
@@ -176,6 +177,8 @@ func (m Screen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, m.handleReopenResult(msg)
 	case promptResultMsg:
 		return m, m.handlePromptResult(msg)
+	case exportResultMsg:
+		return m, m.handleExportResult(msg)
 	case systemReadyMsg:
 		return m, m.commitStartup()
 	case blinkMsg:
@@ -541,6 +544,10 @@ func (m *Screen) mapAction(a uiAction) tea.Cmd {
 		return provideAnswerCmd(m.appCtx, m.agent, a.LoopID, a.ToolExecutionID, a.Text)
 	case uiInterrupt:
 		return m.interruptRunning()
+	case uiExport:
+		// /export is funneled through runSlash so all status-gated slash dispatch lives
+		// in one place; runSlash allows it in ANY status (snapshot semantics, D1).
+		return m.runSlash(components.CmdExport)
 	default: // uiNoop
 		return nil
 	}
@@ -584,6 +591,12 @@ func (m *Screen) runSlash(name string) tea.Cmd {
 			return reopenAgent(m.appCtx, m.openAgent)
 		}
 		return nil
+	case components.CmdExport:
+		// Allowed in ANY status: export is a journal SNAPSHOT (D1), so a mid-turn
+		// /export captures records committed so far without blocking the live turn —
+		// unlike /clear, which is gated to Idle. The async cmd does reconstruct →
+		// render → atomic write off the update loop and reports an exportResultMsg.
+		return exportCmd(m.appCtx, m.agent)
 	default:
 		return nil
 	}

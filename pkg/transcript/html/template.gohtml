@@ -1,0 +1,123 @@
+{{define "loop" -}}
+{{- /* data-depth is a test/inspection hook only; the visible nesting indentation comes from compounding .subagent left-padding in styles.css, not from this attribute. */ -}}
+<section class="loop" data-depth="{{.Depth}}">
+{{- if .SystemPrompt}}
+<details class="system-prompt">
+<summary>System prompt · {{.AgentName}}</summary>
+<pre class="mono prompt-text">{{.SystemPrompt}}</pre>
+</details>
+{{- end}}
+{{- range .Turns}}
+<article class="turn" data-turn="{{.Index}}">
+{{- if .User}}
+<div class="message user-message">
+<span class="accent-bar" aria-hidden="true">▌</span>
+<span class="msg-time mono">{{.At}}</span>
+<div class="msg-body">{{.User}}</div>
+</div>
+{{- end}}
+{{- range .Steps}}
+{{- if .AI}}
+<details class="message ai-message" open>
+<summary><span class="ai-dot" aria-hidden="true">●</span> <span class="agent-name">{{.AgentName}}</span> <span class="msg-time mono">{{.At}}</span></summary>
+<div class="msg-body">{{.AI}}</div>
+</details>
+{{- end}}
+{{- if .Thinking}}
+<details class="thinking">
+<summary>Thinking</summary>
+<div class="thinking-body">{{.Thinking}}</div>
+</details>
+{{- end}}
+{{- range .Tools}}
+<details class="tool-card{{if .IsError}} tool-error{{end}}">
+<summary><span class="tool-name mono">{{.Name}}</span>{{if .DecisionVerb}} <span class="tool-decision {{.DecisionClass}}">{{.DecisionVerb}}</span>{{end}}{{if .At}} <span class="msg-time mono">{{.At}}</span>{{end}}</summary>
+<div class="tool-body">
+{{- if .InputJSON}}
+<div class="tool-section"><div class="tool-label">Input</div><pre class="mono tool-io">{{.InputJSON}}</pre></div>
+{{- end}}
+{{- if .Result}}
+<div class="tool-section"><div class="tool-label">Result</div><pre class="mono tool-io">{{.Result}}{{if .ResultElided}}
+<span class="elided">{{.ResultElided}}</span>{{end}}</pre></div>
+{{- end}}
+{{- with .Child}}
+<div class="subagent">
+{{- template "loop" .}}
+</div>
+{{- end}}
+</div>
+</details>
+{{- end}}
+{{- if .Gates}}
+<div class="gate-chips">
+{{- range .Gates}}
+<span class="gate-chip {{.Class}}">{{.Text}}</span>
+{{- end}}
+</div>
+{{- end}}
+{{- end}}
+</article>
+{{- end}}
+</section>
+{{- end -}}
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{.Title}}</title>
+<style>
+{{.Styles}}
+</style>
+</head>
+<body id="top">
+<nav class="toolbar" aria-label="Transcript controls">
+<span class="toolbar-title mono">transcript</span>
+<span class="toolbar-spacer"></span>
+<button type="button" id="collapse-all" class="toolbar-btn">Collapse all</button>
+<button type="button" id="expand-all" class="toolbar-btn">Expand all</button>
+<button type="button" id="jump-to-top" class="toolbar-btn">↑ Top</button>
+</nav>
+<header class="session-header">
+<h1 class="session-title">{{.Title}}</h1>
+<dl class="session-meta">
+<div class="meta-row"><dt>Session</dt><dd class="mono">{{.SessionID}}</dd></div>
+<div class="meta-row"><dt>Model</dt><dd>{{.ModelID}}</dd></div>
+<div class="meta-row"><dt>Agent</dt><dd>{{.AgentKind}}</dd></div>
+<div class="meta-row"><dt>Permissions</dt><dd>{{.Posture}}</dd></div>
+<div class="meta-row"><dt>Counts</dt><dd>{{.TurnCount}} turns · {{.ToolCount}} tools · {{.GateCount}} gates</dd></div>
+<div class="meta-row"><dt>Started</dt><dd>{{.StartedAt}}</dd></div>
+<div class="meta-row"><dt>Ended</dt><dd>{{.EndedAt}}</dd></div>
+<div class="meta-row"><dt>Exported</dt><dd>{{.ExportedAt}}</dd></div>
+</dl>
+</header>
+<main class="session-body">
+{{- with .Loop}}
+{{- template "loop" .}}
+{{- end}}
+{{- if .Notices}}
+<section class="notices">
+<h2 class="section-title">Session events</h2>
+<ul class="notice-list">
+{{- range .Notices}}
+<li class="notice notice-{{.Class}}"><span class="notice-time mono">{{.At}}</span> <span class="notice-label">{{.Label}}</span> <span class="notice-text">{{.Text}}</span></li>
+{{- end}}
+</ul>
+</section>
+{{- end}}
+{{- if .Warnings}}
+<section class="warnings">
+<h2 class="section-title">Reconstruction notes</h2>
+<ul class="warning-list">
+{{- range .Warnings}}
+<li class="warning"><span class="warning-time mono">{{.At}}</span> <span class="warning-text">{{.Text}}</span></li>
+{{- end}}
+</ul>
+</section>
+{{- end}}
+</main>
+<script>
+{{.Script}}
+</script>
+</body>
+</html>
