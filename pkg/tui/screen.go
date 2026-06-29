@@ -55,9 +55,10 @@ type Screen struct {
 
 	// anim holds the LIVE-surface animation state (blink phase + spinner frame +
 	// ticking guard). It is advanced once per blinkTick while Running, threaded into
-	// renderLiveTail AND the status dot (its blink phase pulses the waiting/thinking
-	// dot), and reset to its zero value when the turn ends. The committed scrollback
-	// path never consults it. See animState and the blinkMsg handler.
+	// renderLiveTail (its blink phase pulses the live assistant dot) AND the status line
+	// (its frame counter flows the status-line gradient — label and dot), and reset to its
+	// zero value when the turn ends. The committed scrollback path never consults it. See
+	// animState and the blinkMsg handler.
 	anim animState
 
 	// tip is the rotating educational hint shown faint below the status line. It is
@@ -426,7 +427,6 @@ func (m Screen) View() tea.View {
 		Queued:      m.renderQueued(),
 		Status:      m.status,
 		StatusState: m.statusInputs(),
-		Blink:       m.anim.blink,
 		Phase:       m.anim.frame,
 		Tip:         m.tip,
 		Width:       m.width,

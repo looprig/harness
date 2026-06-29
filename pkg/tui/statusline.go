@@ -61,9 +61,10 @@ func statusLabel(status Status, in statusInputs) string {
 // derives the label from the session status alone (no live interaction signals), so
 // a Running turn reads "thinking…" until the surface — which knows the live segment
 // — refines it via renderStatusLine. The empty label renders to "", every other
-// label through the faint StatusStyle. Retained for callers holding only the status.
+// label as a (here static, phase-0) lime↔blue gradient. Retained for callers holding
+// only the status.
 func RenderStatusLine(s Status) string {
-	return renderStatusLine(s, statusInputs{thinking: s == StatusRunning}, false, 0)
+	return renderStatusLine(s, statusInputs{thinking: s == StatusRunning}, 0)
 }
 
 // Status-line dot glyphs: a hollow ring at rest, a filled dot while a turn is live.
@@ -71,6 +72,12 @@ const (
 	dotHollow = "○"
 	dotFilled = "●"
 )
+
+// dotGradientPos is the dot's sample position on the gradient wave, in label-glyph columns:
+// the dot sits two columns left of label glyph 0 (the dot itself plus the separating
+// space), so sampling at −2 makes the dot ride the same flowing band as the label — one
+// continuous gradient across "● <label>".
+const dotGradientPos = -2
 
 // renderTip renders the rotating educational hint as a faint "Tips: …" line below the
 // status row, or "" when there is no tip (so the surface omits the row).
@@ -82,39 +89,29 @@ func renderTip(tip string) string {
 }
 
 // renderStatusLine renders the derived label as an animated lime↔blue gradient
-// (gradientLabel), prefixed by the status dot (see statusDot). blink is the live-surface
-// blink phase, used to pulse the dot while waiting/thinking; phase is the live animation
-// frame that flows the label's gradient (0 at rest → a static gradient). statusLabel
-// always returns a non-empty label (idle reads "idle"), so the status row is always
-// present above the composer; the empty-label guard is a defensive no-op.
-func renderStatusLine(status Status, in statusInputs, blink bool, phase uint) string {
+// (gradientLabel), prefixed by the status dot, which rides the same gradient (see
+// statusDot). phase is the live animation frame that flows both the label and the dot
+// (0 at rest → a static gradient). statusLabel always returns a non-empty label (idle
+// reads "idle"), so the status row is always present above the composer; the empty-label
+// guard is a defensive no-op.
+func renderStatusLine(status Status, in statusInputs, phase uint) string {
 	label := statusLabel(status, in)
 	if label == "" {
 		return ""
 	}
-	return statusDot(status, in, blink) + " " + gradientLabel(label, phase)
+	return statusDot(status, phase) + " " + gradientLabel(label, phase)
 }
 
-// statusDot renders the leading status dot for the current state:
-//   - idle: a faint hollow ring (○) — the resting cue.
-//   - actively working (Running, not blocked on a prompt) with text streaming: a solid
-//     lit (lime) dot.
-//   - actively working but still waiting/thinking (no narration yet): a filled dot that
-//     pulses lime ↔ white on the blink phase, a gentle "the model is cogitating" beat.
-//   - otherwise (awaiting a prompt, interrupting, clearing): a faint filled dot.
-func statusDot(status Status, in statusInputs, blink bool) string {
+// statusDot renders the leading status dot, colored by the flowing gradient so it sweeps
+// lime↔blue in step with the label (replacing the old lime/white pulse). The glyph is a
+// hollow ring (○) at rest and a filled dot (●) once a turn is live; both ride the gradient
+// at dotGradientPos, animating with phase while a turn runs and holding a static gradient
+// at rest. The Running sub-state (waiting / thinking / streaming / blocked-on-a-prompt) is
+// carried by the label, not the dot, so the dot needs only the status to pick its glyph.
+func statusDot(status Status, phase uint) string {
+	glyph := dotFilled
 	if status == StatusIdle {
-		return styles.StatusStyle.Render(dotHollow)
+		glyph = dotHollow
 	}
-	working := status == StatusRunning && !in.permissionActive && !in.userInputActive
-	switch {
-	case !working:
-		return styles.StatusStyle.Render(dotFilled)
-	case in.streaming:
-		return styles.StatusWorkingStyle.Render(dotFilled)
-	case blink:
-		return styles.StatusWorkingStyle.Render(dotFilled) // lit (lime)
-	default:
-		return styles.StatusWorkingAltStyle.Render(dotFilled) // blink alternate (white)
-	}
+	return gradientGlyph(glyph, dotGradientPos, phase)
 }

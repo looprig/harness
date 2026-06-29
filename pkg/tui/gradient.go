@@ -2,6 +2,7 @@ package tui
 
 import (
 	"fmt"
+	"image/color"
 	"math"
 	"strings"
 
@@ -23,11 +24,12 @@ var (
 // within one short word.
 //
 // gradStepPerFrame is the angular SHIFT PER ANIMATION FRAME (radians): how far the band
-// slides each blink tick (~450ms). Matching it to gradSpatialFreq advances the gradient by
-// ~one character per tick — a calm left-to-right shimmer in step with the dot pulse.
+// slides each blink tick (~450ms). At ~0.7 it advances a bit over one and a half characters
+// per tick — a brisk-but-calm left-to-right flow, deliberately faster than the spatial
+// period so the band visibly travels rather than crawling.
 const (
 	gradSpatialFreq  = 0.45
-	gradStepPerFrame = 0.45
+	gradStepPerFrame = 0.7
 )
 
 // rgb is an 8-bit-per-channel color used only for gradient interpolation (lipgloss.Color
@@ -57,13 +59,31 @@ func (c rgb) hex() string {
 	return fmt.Sprintf("#%02X%02X%02X", int(c.r+0.5), int(c.g+0.5), int(c.b+0.5))
 }
 
-// gradientLabel renders s as a horizontal lime↔blue gradient that flows with phase: glyph
-// i is colored by a cosine wave ((1-cos θ)/2 ∈ [0,1]) sampled at θ = i·gradSpatialFreq −
-// phase·gradStepPerFrame, so the band slides one tick's worth each frame and reverses
-// smoothly at the endpoints (a cosine has no seam, so the flow never jumps). Spaces are
-// emitted uncolored — an SGR run around a blank cell is invisible and wasteful. phase is
-// the live animation frame; at rest it is 0, yielding a static (but still gradient) label.
-// It is pure and width-preserving: the per-glyph SGR styling adds no display columns.
+// gradientColorAt returns the lime↔blue gradient color sampled at glyph-column position
+// pos for the given animation phase: a cosine wave ((1-cos θ)/2 ∈ [0,1]) at θ =
+// pos·gradSpatialFreq − phase·gradStepPerFrame, so the band flows with phase and reverses
+// smoothly at the endpoints (a cosine has no seam, so the flow never jumps). pos may be
+// negative — the status dot samples a position left of the label so it rides the same band.
+// It is pure: the color is a function of pos and phase alone; profile downsampling happens
+// later, at Render time.
+func gradientColorAt(pos float64, phase uint) color.Color {
+	theta := pos*gradSpatialFreq - float64(phase)*gradStepPerFrame
+	t := (1 - math.Cos(theta)) / 2
+	return lipgloss.Color(gradLime.lerp(gradBlue, t).hex())
+}
+
+// gradientGlyph renders a single glyph foreground-colored by the gradient sampled at column
+// position pos for the given phase. gradientLabel colors each label glyph with this; the
+// status dot reuses it so the dot flows with the same band as the label.
+func gradientGlyph(glyph string, pos float64, phase uint) string {
+	return lipgloss.NewStyle().Foreground(gradientColorAt(pos, phase)).Render(glyph)
+}
+
+// gradientLabel renders s as a horizontal lime↔blue gradient that flows with phase: glyph i
+// rides gradientColorAt(i, phase). Spaces are emitted uncolored — an SGR run around a blank
+// cell is invisible and wasteful. phase is the live animation frame; at rest it is 0,
+// yielding a static (but still gradient) label. It is width-preserving: the per-glyph SGR
+// styling adds no display columns.
 func gradientLabel(s string, phase uint) string {
 	var b strings.Builder
 	for i, r := range []rune(s) {
@@ -71,10 +91,7 @@ func gradientLabel(s string, phase uint) string {
 			b.WriteRune(r)
 			continue
 		}
-		theta := float64(i)*gradSpatialFreq - float64(phase)*gradStepPerFrame
-		t := (1 - math.Cos(theta)) / 2
-		col := lipgloss.Color(gradLime.lerp(gradBlue, t).hex())
-		b.WriteString(lipgloss.NewStyle().Foreground(col).Render(string(r)))
+		b.WriteString(gradientGlyph(string(r), float64(i), phase))
 	}
 	return b.String()
 }

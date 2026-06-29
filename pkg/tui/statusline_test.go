@@ -146,42 +146,34 @@ func TestStatusLabel(t *testing.T) {
 	}
 }
 
-// TestStatusDot covers the leading status dot: a hollow ring at rest, a filled dot
-// while a turn is live, a lime↔white pulse (output differs by blink phase) while
-// waiting/thinking, and a steady dot while streaming.
+// TestStatusDot covers the leading status dot: a hollow ring at rest, a filled dot while
+// a turn is live, and a gradient color that flows with the animation phase (replacing the
+// old lime↔white blink pulse). The Running sub-state is carried by the label, so only the
+// status selects the dot glyph.
 func TestStatusDot(t *testing.T) {
 	t.Parallel()
 
 	glyph := []struct {
 		name   string
 		status Status
-		in     statusInputs
 		want   string
 	}{
-		{name: "idle is hollow", status: StatusIdle, in: statusInputs{}, want: dotHollow},
-		{name: "waiting is filled", status: StatusRunning, in: statusInputs{}, want: dotFilled},
-		{name: "thinking is filled", status: StatusRunning, in: statusInputs{thinking: true}, want: dotFilled},
-		{name: "streaming is filled", status: StatusRunning, in: statusInputs{streaming: true}, want: dotFilled},
-		{name: "prompt is filled", status: StatusRunning, in: statusInputs{permissionActive: true}, want: dotFilled},
+		{name: "idle is hollow", status: StatusIdle, want: dotHollow},
+		{name: "running is filled", status: StatusRunning, want: dotFilled},
+		{name: "interrupting is filled", status: StatusInterrupting, want: dotFilled},
+		{name: "resetting is filled", status: StatusResetting, want: dotFilled},
 	}
 	for _, tt := range glyph {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			if got := stripANSI(statusDot(tt.status, tt.in, false)); got != tt.want {
-				t.Errorf("statusDot(%v, %+v) glyph = %q, want %q", tt.status, tt.in, got, tt.want)
+			if got := stripANSI(statusDot(tt.status, 0)); got != tt.want {
+				t.Errorf("statusDot(%v) glyph = %q, want %q", tt.status, got, tt.want)
 			}
 		})
 	}
 
-	// Waiting/thinking pulse: the rendered dot must differ between blink phases.
-	pulse := []statusInputs{{}, {thinking: true}}
-	for _, in := range pulse {
-		if statusDot(StatusRunning, in, true) == statusDot(StatusRunning, in, false) {
-			t.Errorf("statusDot(running, %+v) does not pulse across the blink phase", in)
-		}
-	}
-	// Streaming holds steady (no pulse).
-	if statusDot(StatusRunning, statusInputs{streaming: true}, true) != statusDot(StatusRunning, statusInputs{streaming: true}, false) {
-		t.Error("statusDot(streaming) should not pulse across the blink phase")
+	// The dot rides the gradient: its rendered color flows across animation phases.
+	if statusDot(StatusRunning, 0) == statusDot(StatusRunning, 2) {
+		t.Error("statusDot(running) does not flow across the animation phase")
 	}
 }

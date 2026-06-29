@@ -57,8 +57,7 @@ type surfaceInputs struct {
 	Queued        string // pre-rendered dim queued-input affordance lines (below the live tail)
 	Status        Status
 	StatusState   statusInputs
-	Blink         bool   // live-surface blink phase, pulses the status dot while waiting/thinking
-	Phase         uint   // live animation frame; flows the status-label gradient while a turn runs (0 at rest)
+	Phase         uint   // live animation frame; flows the status-line gradient (label + dot) while a turn runs (0 at rest)
 	Tip           string // the rotating hint shown faint on the Tips line at the very bottom
 	Width, Height int
 }
@@ -91,7 +90,7 @@ type surfaceInputs struct {
 func surfaceView(in surfaceInputs) string {
 	bottom := bottomBox(in)
 	slash := slashPanel(in.Interaction)
-	status := renderStatusLine(in.Status, in.StatusState, in.Blink, in.Phase)
+	status := renderStatusLine(in.Status, in.StatusState, in.Phase)
 	tip := renderTip(in.Tip)
 
 	contentH := bottomContentHeight(in)
