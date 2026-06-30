@@ -1,8 +1,10 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"io"
 	"path/filepath"
 	"testing"
 
@@ -56,10 +58,24 @@ func (a *fakeAgent) Close(context.Context) error {
 type fakeProgram struct {
 	final tea.Model
 	err   error
+	onRun func()
 }
 
-func (p *fakeProgram) Run() (tea.Model, error) { return p.final, p.err }
-func (p *fakeProgram) Quit()                   {}
+func (p *fakeProgram) Run() (tea.Model, error) {
+	if p.onRun != nil {
+		p.onRun()
+	}
+	return p.final, p.err
+}
+func (p *fakeProgram) Quit() {}
+
+type failingWriter struct {
+	err error
+}
+
+func (w failingWriter) Write([]byte) (int, error) {
+	return 0, w.err
+}
 
 // TestBannerAgentBanner proves Banner maps verbatim onto tui.AgentBanner (no
 // defaulting, no field swap) so the startup notice shows exactly what the caller set.
@@ -118,6 +134,85 @@ func TestLogFilePath(t *testing.T) {
 			}
 			if log != tt.wantLog {
 				t.Errorf("log = %q, want %q", log, tt.wantLog)
+			}
+		})
+	}
+}
+
+func TestClearTerminalForFreshLaunch(t *testing.T) {
+	writeErr := errors.New("write failed")
+	success := &bytes.Buffer{}
+
+	tests := []struct {
+		name    string
+		writer  io.Writer
+		output  func() string
+		want    string
+		wantErr bool
+	}{
+		{
+			name:   "clears visible screen and scrollback",
+			writer: success,
+			output: success.String,
+			want:   "\x1b[2J\x1b[3J\x1b[H",
+		},
+		{
+			name:    "writer failure is returned",
+			writer:  failingWriter{err: writeErr},
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := clearTerminalForFreshLaunch(tt.writer)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("clearTerminalForFreshLaunch() error = %v, wantErr %v", err, tt.wantErr)
+			}
+			if tt.wantErr {
+				return
+			}
+			if got := tt.output(); got != tt.want {
+				t.Errorf("clearTerminalForFreshLaunch() wrote %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestRunClearsTerminalBeforeProgramRun(t *testing.T) {
+	tests := []struct {
+		name string
+	}{
+		{name: "success path"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var order []string
+			swapClearTerminal(t, func(io.Writer) error {
+				order = append(order, "clear")
+				return nil
+			})
+			swapNewProgram(t, func(m tea.Model, _ ...tea.ProgramOption) program {
+				return &fakeProgram{
+					final: m,
+					onRun: func() {
+						order = append(order, "run")
+					},
+				}
+			})
+
+			var closed bool
+			newAgent := func(context.Context) (tui.Agent, error) {
+				return &fakeAgent{loopID: newLoopID(t), closed: &closed}, nil
+			}
+
+			got := Run(context.Background(), newAgent, Banner{Name: "SWE"})
+			if got != exitOK {
+				t.Errorf("Run() exit = %d, want %d", got, exitOK)
+			}
+			if want := []string{"clear", "run"}; !equalStrings(order, want) {
+				t.Errorf("order = %v, want %v", order, want)
 			}
 		})
 	}
@@ -203,6 +298,25 @@ func swapNewProgram(t *testing.T, fn func(tea.Model, ...tea.ProgramOption) progr
 	prev := newProgram
 	newProgram = fn
 	t.Cleanup(func() { newProgram = prev })
+}
+
+func swapClearTerminal(t *testing.T, fn func(io.Writer) error) {
+	t.Helper()
+	prev := clearTerminalForFreshLaunch
+	clearTerminalForFreshLaunch = fn
+	t.Cleanup(func() { clearTerminalForFreshLaunch = prev })
+}
+
+func equalStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // newLoopID mints a non-zero loop id for a fake agent's PrimaryLoopID.

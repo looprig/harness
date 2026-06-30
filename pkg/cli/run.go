@@ -10,6 +10,7 @@ package cli
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -65,6 +66,21 @@ const (
 	logFileName = "looprig.log"
 	envLogLevel = "LOOPRIG_LOG_LEVEL"
 )
+
+// ANSI terminal reset used at process start for normal-screen mode. EraseDisplay(2)
+// clears the visible screen, EraseDisplay(3) clears xterm-compatible scrollback, and
+// CursorHome moves the first TUI frame to the top-left. This is deliberately outside
+// Bubble Tea: tea.ClearScreen only clears the renderer's managed buffer after the
+// program has started, which is too late to remove prior-process residue.
+const freshLaunchClearSequence = "\x1b[2J\x1b[3J\x1b[H"
+
+// clearTerminalForFreshLaunch clears the real terminal before Bubble Tea's inline
+// renderer starts. It is a var so tests can assert Run's startup ordering without
+// requiring a real TTY.
+var clearTerminalForFreshLaunch = func(w io.Writer) error {
+	_, err := io.WriteString(w, freshLaunchClearSequence)
+	return err
+}
 
 // logFilePath resolves the log directory and file path under home, joining with
 // filepath.Join so it is correct on every platform. It is a pure helper (no I/O) so
@@ -155,12 +171,18 @@ func Run(ctx context.Context, newAgent func(context.Context) (tui.Agent, error),
 	// MouseMode at MouseModeNone (the v2 zero values), so the program stays on the
 	// normal screen (tea.Println writes to native scrollback) and never grabs the mouse.
 	var progOpts []tea.ProgramOption
+	terminalOutput := io.Writer(os.Stdout)
 	restoreStdio := func() error { return nil }
 	if logErr == nil {
 		if capture, cerr := ttylog.CaptureStdio(logFile); cerr == nil {
 			progOpts = append(progOpts, tea.WithOutput(capture.TTY))
+			terminalOutput = capture.TTY
 			restoreStdio = capture.Restore
 		}
+	}
+
+	if err := clearTerminalForFreshLaunch(terminalOutput); err != nil {
+		logger.Warn("clear terminal failed", "err", err.Error())
 	}
 
 	screen := tui.New(ctx, agent, open, banner.agentBanner())
