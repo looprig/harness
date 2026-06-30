@@ -296,3 +296,126 @@ func TestNewMarkdownRendererCodeBlockNoRedSymbols(t *testing.T) {
 		})
 	}
 }
+
+// sgrParamIsRedBackground reports whether a single SGR param list sets a RED
+// BACKGROUND. It is the background analogue of sgrParamIsRed: it parses tokens
+// (split on ';') so 256-color/truecolor introducers are matched as whole color
+// tokens, never naive substrings. Red background = basic 41/101, the reddish
+// 256-color palette glamour's chroma Error token emits (#F05B5B → "203"), or a
+// truecolor with high-R, low-G/B. Foreground introducers (38;...) are skipped.
+func sgrParamIsRedBackground(params string) bool {
+	red256 := map[int]bool{
+		1: true, 9: true, 196: true, 203: true, 210: true,
+		160: true, 161: true, 167: true, 197: true, 204: true,
+	}
+	atoi := func(s string) int {
+		n := 0
+		for _, c := range s {
+			if c < '0' || c > '9' {
+				return -1
+			}
+			n = n*10 + int(c-'0')
+		}
+		return n
+	}
+	toks := strings.Split(params, ";")
+	for i := 0; i < len(toks); i++ {
+		// Skip foreground color introducers so their args aren't misread as bg.
+		if toks[i] == "38" && i+1 < len(toks) && toks[i+1] == "5" {
+			i += 2
+			continue
+		}
+		if toks[i] == "38" && i+1 < len(toks) && toks[i+1] == "2" {
+			i += 4
+			continue
+		}
+		if toks[i] == "41" || toks[i] == "101" {
+			return true
+		}
+		if toks[i] == "48" && i+2 < len(toks) && toks[i+1] == "5" {
+			if red256[atoi(toks[i+2])] {
+				return true
+			}
+			i += 2
+			continue
+		}
+		if toks[i] == "48" && i+4 < len(toks) && toks[i+1] == "2" {
+			r, g, b := atoi(toks[i+2]), atoi(toks[i+3]), atoi(toks[i+4])
+			if r >= 180 && g >= 0 && g <= 150 && b >= 0 && b <= 150 {
+				return true
+			}
+			i += 4
+			continue
+		}
+	}
+	return false
+}
+
+// renderHasRedBackgroundRun reports whether any non-whitespace text run in the
+// rendered output carries a red SGR background (the leading SGR escape before the
+// run). Mirrors renderHasRedRun but for background fills.
+func renderHasRedBackgroundRun(out string) (string, bool) {
+	idxs := markdownSGR.FindAllStringSubmatchIndex(out, -1)
+	for i, m := range idxs {
+		params := out[m[2]:m[3]]
+		if !sgrParamIsRedBackground(params) {
+			continue
+		}
+		runStart := m[1]
+		runEnd := len(out)
+		if i+1 < len(idxs) {
+			runEnd = idxs[i+1][0]
+		}
+		run := out[runStart:runEnd]
+		if strings.TrimSpace(run) != "" {
+			return run, true
+		}
+	}
+	return "", false
+}
+
+// TestNewMarkdownRendererCodeBlockNoRedBackground is the regression guard for the
+// TUI bug where box-drawing tree characters (├ └ │ ─) rendered on a RED BACKGROUND.
+// Root cause: chroma's strict lexers (e.g. Go) cannot tokenize box-drawing glyphs,
+// so they emit them as the Error token, and glamour's DarkStyleConfig styles that
+// token with background_color #F05B5B (red, → ANSI 256 "48;5;203"). The earlier
+// fix only retoned foreground tokens (Operator, GenericDeleted) and never touched
+// Chroma.Error, so the red BACKGROUND survived. NewMarkdownRenderer now clears the
+// Error token's red background. This asserts NO red-background run survives for
+// code blocks containing untokenizable glyphs across several fence languages; before
+// the fix the ├──/└── runs carried "48;5;203".
+func TestNewMarkdownRendererCodeBlockNoRedBackground(t *testing.T) {
+	t.Parallel()
+
+	tree := ".\n├── foo\n│   └── bar.go\n└── baz\n"
+	tests := []struct {
+		name string
+		md   string
+	}{
+		{name: "go fence tree", md: "```go\n" + tree + "```\n"},
+		{name: "rust fence tree", md: "```rust\n" + tree + "```\n"},
+		{name: "python fence tree", md: "```python\n" + tree + "```\n"},
+		{name: "json fence tree", md: "```json\n" + tree + "```\n"},
+		{name: "no-language fence tree", md: "```\n" + tree + "```\n"},
+		{name: "go operators still neutral", md: "```go\nx := a / b + c - d\n```\n"},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			r, err := NewMarkdownRenderer(80)
+			if err != nil {
+				t.Fatalf("NewMarkdownRenderer error = %v, want nil", err)
+			}
+			out, err := r.Render(tt.md)
+			if err != nil {
+				t.Fatalf("Render(%q) error = %v, want nil", tt.md, err)
+			}
+			if run, red := renderHasRedBackgroundRun(out); red {
+				t.Errorf("Render(%q): a code-block run rendered on a RED BACKGROUND: %q\nfull=%q", tt.md, run, out)
+			}
+		})
+	}
+}

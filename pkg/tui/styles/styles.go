@@ -5,6 +5,7 @@ package styles
 
 import (
 	"charm.land/glamour/v2"
+	"charm.land/glamour/v2/ansi"
 	glamourstyles "charm.land/glamour/v2/styles"
 	"charm.land/lipgloss/v2"
 )
@@ -18,26 +19,89 @@ const Dot = "● "
 // DotColor is the assistant bullet's foreground color.
 var DotColor = lipgloss.Color("#D4F84D")
 
-// Markdown palette overrides applied by NewMarkdownRenderer over glamour's
-// DarkStyleConfig. MarkdownHeadingColor replaces glamour's heading blue (ANSI 256
-// "39") and MarkdownInlineCodeColor replaces glamour's inline `code` red (ANSI 256
-// "203"), both with the same softer brand blue. They are hex strings (not
-// lipgloss.Color) because glamour's StylePrimitive.Color is a *string.
-//
-// MarkdownCodeNeutralColor recolors the RED structural symbols inside fenced/indented
-// CODE BLOCKS. Glamour's DarkStyleConfig code-block chroma theme paints the chroma
-// Operator token (#EF8080, salmon-red → ANSI 256 "210") — which covers structural
-// punctuation like "/", "+", "-", "=", "->" — and the GenericDeleted token (#FD5B5B,
-// red → ANSI 256 "203") used for diff "-" lines. Those made path slashes, arrows and
-// +/- markers render red in the live TUI. We retone both to #C4C4C4 — the chroma
-// theme's OWN neutral Text/Name foreground (already used for unhighlighted code) — so
-// structural symbols read as plain code text instead of red, while every other syntax
-// color (keywords, strings, functions, …) is left untouched.
+// Nexus markdown palette applied by NewMarkdownRenderer over glamour's DarkStyleConfig
+// for non-code markdown, plus the base neutral shared with the code-block theme below.
+// MarkdownHeadingColor replaces glamour's heading blue (ANSI 256 "39") and
+// MarkdownInlineCodeColor replaces glamour's inline `code` red (ANSI 256 "203"), both
+// with the same softer brand blue. MarkdownCodeNeutralColor is the base foreground for
+// code text. They are hex strings (not lipgloss.Color) because glamour's
+// StylePrimitive.Color is a *string.
 var (
 	MarkdownHeadingColor     = "#A2D2FF"
 	MarkdownInlineCodeColor  = "#A2D2FF"
 	MarkdownCodeNeutralColor = "#C4C4C4"
 )
+
+// Nexus code-block syntax-highlighting palette — four calm tones over a dark fill.
+// Deliberately contains NO red: glamour's stock chroma theme is full of reds (salmon
+// operators, red diff/deleted lines, and a RED-background Error token that painted
+// box-drawing file trees like "├──" as alarm bars), and the old approach of inheriting
+// that theme and patching reds token-by-token left every un-patched token a latent red.
+// nexusChroma owns the whole theme instead, so a token can only ever be a color we chose.
+var (
+	codeKeywordColor = "#A2D2FF" // keywords, types, builtins, function/class names — brand blue
+	codeStringColor  = "#D4F84D" // string literals — lime accent (matches the assistant dot)
+	codeCommentColor = "#737373" // comments — faint gray (matches the input/accent bars)
+	codeBgColor      = "#373737" // code-block fill — dark gray (glamour's default block bg)
+)
+
+// colorPtr / flagPtr adapt palette values to glamour's pointer-typed StylePrimitive fields.
+func colorPtr(s string) *string { return &s }
+func flagPtr(b bool) *bool      { return &b }
+
+// nexusChroma is the single source of truth for code-block syntax highlighting: a
+// complete chroma theme built from the Nexus palette. NewMarkdownRenderer assigns it to
+// cfg.CodeBlock.Chroma, so glamour highlights against our colors directly and never
+// touches glamour's DarkStyleConfig chroma defaults. Every token is set explicitly — an
+// unset token would fall back to chroma's own built-in style — and none is red. It is
+// read-only package state and is never mutated, so sharing the pointer is safe.
+var nexusChroma = ansi.Chroma{
+	// Base — identifiers, operators, punctuation, numbers, and chroma's Error catch-all
+	// (the token emitted for input a lexer can't parse, e.g. box-drawing tree glyphs):
+	// all neutral, so untokenizable text reads as plain code rather than a red alarm.
+	Text:          ansi.StylePrimitive{Color: colorPtr(MarkdownCodeNeutralColor)},
+	Error:         ansi.StylePrimitive{Color: colorPtr(MarkdownCodeNeutralColor)},
+	Operator:      ansi.StylePrimitive{Color: colorPtr(MarkdownCodeNeutralColor)},
+	Punctuation:   ansi.StylePrimitive{Color: colorPtr(MarkdownCodeNeutralColor)},
+	Name:          ansi.StylePrimitive{Color: colorPtr(MarkdownCodeNeutralColor)},
+	NameAttribute: ansi.StylePrimitive{Color: colorPtr(MarkdownCodeNeutralColor)},
+	NameConstant:  ansi.StylePrimitive{Color: colorPtr(MarkdownCodeNeutralColor)},
+	NameOther:     ansi.StylePrimitive{Color: colorPtr(MarkdownCodeNeutralColor)},
+	Literal:       ansi.StylePrimitive{Color: colorPtr(MarkdownCodeNeutralColor)},
+	LiteralNumber: ansi.StylePrimitive{Color: colorPtr(MarkdownCodeNeutralColor)},
+	LiteralDate:   ansi.StylePrimitive{Color: colorPtr(MarkdownCodeNeutralColor)},
+
+	// Language constructs — keywords, types, builtins, definitions, decorators, tags.
+	Keyword:          ansi.StylePrimitive{Color: colorPtr(codeKeywordColor)},
+	KeywordReserved:  ansi.StylePrimitive{Color: colorPtr(codeKeywordColor)},
+	KeywordNamespace: ansi.StylePrimitive{Color: colorPtr(codeKeywordColor)},
+	KeywordType:      ansi.StylePrimitive{Color: colorPtr(codeKeywordColor)},
+	NameBuiltin:      ansi.StylePrimitive{Color: colorPtr(codeKeywordColor)},
+	NameClass:        ansi.StylePrimitive{Color: colorPtr(codeKeywordColor), Bold: flagPtr(true)},
+	NameFunction:     ansi.StylePrimitive{Color: colorPtr(codeKeywordColor)},
+	NameDecorator:    ansi.StylePrimitive{Color: colorPtr(codeKeywordColor)},
+	NameTag:          ansi.StylePrimitive{Color: colorPtr(codeKeywordColor)},
+	NameException:    ansi.StylePrimitive{Color: colorPtr(codeKeywordColor)},
+
+	// Strings — lime.
+	LiteralString:       ansi.StylePrimitive{Color: colorPtr(codeStringColor)},
+	LiteralStringEscape: ansi.StylePrimitive{Color: colorPtr(codeStringColor)},
+
+	// Comments & meta — faint gray.
+	Comment:           ansi.StylePrimitive{Color: colorPtr(codeCommentColor)},
+	CommentPreproc:    ansi.StylePrimitive{Color: colorPtr(codeCommentColor)},
+	GenericSubheading: ansi.StylePrimitive{Color: colorPtr(codeCommentColor)},
+
+	// Diff markers stay neutral (no red removed-lines, no green added-lines); emphasis
+	// and strong keep their weight rather than a color.
+	GenericDeleted:  ansi.StylePrimitive{Color: colorPtr(MarkdownCodeNeutralColor)},
+	GenericInserted: ansi.StylePrimitive{Color: colorPtr(MarkdownCodeNeutralColor)},
+	GenericEmph:     ansi.StylePrimitive{Color: colorPtr(MarkdownCodeNeutralColor), Italic: flagPtr(true)},
+	GenericStrong:   ansi.StylePrimitive{Color: colorPtr(MarkdownCodeNeutralColor), Bold: flagPtr(true)},
+
+	// The dark fill behind highlighted code.
+	Background: ansi.StylePrimitive{BackgroundColor: colorPtr(codeBgColor)},
+}
 
 // LitDot is the COLORED leading marker actually rendered before an assistant bullet:
 // the DotColor-foregrounded glyph plus a plain trailing space. Its display width equals
@@ -198,14 +262,11 @@ var ThinkingStyle = lipgloss.NewStyle().Faint(true)
 // heading renders as clean styled text rather than echoing its markdown hashes; H1
 // keeps its colored background bar (it never carried a "#" marker).
 //
-// The code-block chroma theme's two RED structural tokens are also retoned to
-// MarkdownCodeNeutralColor: Operator (glamour's salmon-red #EF8080, which colors "/",
-// "+", "-", "=", "->", … inside highlighted code) and GenericDeleted (glamour's red
-// #FD5B5B, the diff "-" line color). This stops path slashes, arrows and +/- markers
-// from rendering red inside code blocks. Chroma is a *struct pointer shared with the
-// package-level DarkStyleConfig, so it is deep-copied (value copy of the pointee, then
-// re-pointed) before its fields are mutated — otherwise the override would leak into
-// the shared global. Every other chroma color is left at glamour's defaults.
+// Code-block syntax highlighting uses the Nexus theme outright: cfg.CodeBlock.Chroma is
+// pointed at the package-level nexusChroma rather than inheriting glamour's reds-laden
+// DarkStyleConfig chroma and patching it token by token. See nexusChroma for the palette
+// and the rationale (this is why box-drawing file trees no longer render on a red
+// background, and why path slashes, arrows and +/- markers are not red).
 //
 // cfg is a value copy of DarkStyleConfig, so reassigning its (non-pointer) fields never
 // mutates the shared package-level config (the same copy-then-override pattern as the
@@ -231,17 +292,10 @@ func NewMarkdownRenderer(width int) (*glamour.TermRenderer, error) {
 	cfg.Code.Prefix = ""           // no leading U+00A0 padding space
 	cfg.Code.Suffix = ""           // no trailing U+00A0 padding space
 
-	// Retone the code-block chroma theme's two RED structural tokens (Operator,
-	// GenericDeleted) to a neutral gray. cfg.CodeBlock.Chroma is a *Chroma shared with
-	// the package-level DarkStyleConfig, so deep-copy the pointee before mutating —
-	// otherwise the override would corrupt the shared global on every call.
-	if cfg.CodeBlock.Chroma != nil {
-		chromaCopy := *cfg.CodeBlock.Chroma
-		neutral := MarkdownCodeNeutralColor
-		chromaCopy.Operator.Color = &neutral       // "/", "+", "-", "=", "->" in code
-		chromaCopy.GenericDeleted.Color = &neutral // diff "-" lines
-		cfg.CodeBlock.Chroma = &chromaCopy
-	}
+	// Own the code-block syntax theme outright: point at the Nexus chroma palette rather
+	// than inheriting glamour's DarkStyleConfig chroma and patching its reds token by
+	// token. nexusChroma is read-only and never mutated, so sharing the pointer is safe.
+	cfg.CodeBlock.Chroma = &nexusChroma
 
 	return glamour.NewTermRenderer(
 		glamour.WithStyles(cfg),
