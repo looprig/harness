@@ -8,8 +8,9 @@ import (
 
 // Active-surface row budget (design §"Input box · Active-surface budgeting"). The
 // surface is the only managed region in scrollback-first mode: the terminal owns
-// history, so there is no transcript viewport — only a capped live tail, a
-// separator rule, the bottom box, an optional slash panel, and one status line.
+// history, so there is no transcript viewport — only any unprinted startup entries,
+// a capped live tail, the bottom box, an optional slash panel, one status line, and
+// the rotating tip.
 const (
 	statusH    = 1 // the single status line
 	statusPadH = 1 // one blank pad line; the status row carries one above and one below it
@@ -48,11 +49,13 @@ func liveTailCap(term, statusH, reservedH, contentH int) int {
 }
 
 // surfaceInputs is the synthetic, agent-free snapshot surfaceView composes from:
-// the interaction model (mode + active prompt + composer + slash), the rendered
-// live-tail string, the session status and its live signals, and the terminal
-// dimensions. It carries no agent and is never mutated — surfaceView is pure.
+// the interaction model (mode + active prompt + composer + slash), the unprinted
+// startup block, the rendered live-tail string, the session status and its live
+// signals, and the terminal dimensions. It carries no agent and is never mutated —
+// surfaceView is pure.
 type surfaceInputs struct {
 	Interaction   interactionModel
+	Startup       string // committed startup entries not yet printed to native scrollback
 	LiveTail      string // pre-rendered live thinking/text/tool ⋯ lines
 	Queued        string // pre-rendered dim queued-input affordance lines (below the live tail)
 	Status        Status
@@ -62,10 +65,10 @@ type surfaceInputs struct {
 	Width, Height int
 }
 
-// surfaceView composes the active surface top to bottom: the capped live tail, one
-// status line set off by a blank pad row above and below it, the bottom box (composer,
-// prompt control, or answer field by interaction mode), and the slash-completion panel
-// when visible. The composer is a
+// surfaceView composes the active surface top to bottom: any unprinted startup entries,
+// the capped live tail, one status line set off by a blank pad row above and below it,
+// the bottom box (composer, prompt control, or answer field by interaction mode), and
+// the slash-completion panel when visible. The composer is a
 // borderless, ▌-edged dark-gray panel — there is no separator rule above it (a
 // full-width rule was the most visible artifact stranded into scrollback on a resize
 // desync; see styles.BoxStyle). It allocates no transcript viewport. Empty regions are omitted so
@@ -99,7 +102,7 @@ func surfaceView(in surfaceInputs) string {
 	// (slash), so the tail gets only the rows left after BOTH are reserved — keeping
 	// the logical line count equal to the physical row count the v2 inline renderer
 	// requires (see clampSurfaceWidth).
-	reserved := lipgloss.Height(slash) + queuedHeight(in.Queued)
+	reserved := lipgloss.Height(slash) + queuedHeight(in.Queued) + startupHeight(in.Startup)
 	// The status row carries a blank pad above and below it (2*statusPadH) and tipH (the
 	// Tips line at the very bottom) are reserved alongside statusH so the tail budget
 	// accounts for the whole bottom chrome. During a live turn the tail's own trailing
@@ -117,6 +120,10 @@ func surfaceView(in surfaceInputs) string {
 	}
 
 	rows := make([]string, 0, 7)
+	rows = appendNonEmpty(rows, in.Startup)
+	if in.Startup != "" {
+		rows = append(rows, "") // startup entries visually hand off to scrollback spacing
+	}
 	if tail != "" {
 		rows = append(rows, tail, "") // tail + trailing blank (matches a committed entry's spacing)
 	}
@@ -142,6 +149,13 @@ func surfaceView(in surfaceInputs) string {
 	// lines. Reversing the order would let a wide line wrap onto an extra physical row
 	// after the height count, reintroducing the very row-count desync these guards prevent.
 	return clampSurfaceHeight(clampSurfaceWidth(strings.Join(rows, "\n"), in.Width), in.Height)
+}
+
+func startupHeight(startup string) int {
+	if startup == "" {
+		return 0
+	}
+	return lipgloss.Height(startup) + 1
 }
 
 // clampSurfaceHeight drops leading lines so the composed active surface never exceeds

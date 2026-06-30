@@ -69,9 +69,10 @@ const (
 
 // ANSI terminal reset used at process start for normal-screen mode. EraseDisplay(2)
 // clears the visible screen, EraseDisplay(3) clears xterm-compatible scrollback, and
-// CursorHome moves the first TUI frame to the top-left. This is deliberately outside
-// Bubble Tea: tea.ClearScreen only clears the renderer's managed buffer after the
-// program has started, which is too late to remove prior-process residue.
+// CursorHome removes blank rows left above the first managed TUI frame. This is
+// deliberately outside Bubble Tea: tea.ClearScreen only clears the renderer's managed
+// buffer after the program has started, which is too late to remove prior-process
+// residue.
 const freshLaunchClearSequence = "\x1b[2J\x1b[3J\x1b[H"
 
 // clearTerminalForFreshLaunch clears the real terminal before Bubble Tea's inline

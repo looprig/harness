@@ -54,6 +54,14 @@ type Screen struct {
 	width, height int
 	ready         bool
 
+	// startupPending/startupCommitted coordinate the opening banner with Bubble Tea's
+	// first sized frame. systemReadyMsg may arrive before WindowSizeMsg. The startup
+	// entries are committed once, kept unprinted while idle, and rendered in the active
+	// surface until the first real scrollback flush carries them into native history.
+	startupPending   bool
+	startupCommitted bool
+	startupEntryIDs  []displayID
+
 	// anim holds the LIVE-surface animation state (blink phase + spinner frame +
 	// ticking guard). It is advanced once per blinkTick while Running, threaded into
 	// renderLiveTail (its blink phase pulses the live assistant dot) AND the status line
@@ -158,6 +166,9 @@ func (m Screen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.ready = true
 		m.scrollback.width = msg.Width
 		m.interaction.input.Resize(msg.Width)
+		if m.startupPending && !m.startupCommitted {
+			return m, m.commitStartup()
+		}
 		return m, nil
 	case tea.KeyPressMsg:
 		return m.handleKey(msg)
@@ -180,25 +191,52 @@ func (m Screen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case exportResultMsg:
 		return m, m.handleExportResult(msg)
 	case systemReadyMsg:
-		return m, m.commitStartup()
+		return m, m.handleSystemReady()
 	case blinkMsg:
 		return m, m.handleBlink()
 	}
 	return m, nil
 }
 
-// commitStartup commits the opening transcript entries on the systemReady boundary: the
-// startup banner (always) followed by the OPTIONAL greeting (only when banner.Greeting is
+// handleSystemReady commits the opening transcript once the active surface has its
+// first terminal size. If Bubble Tea delivers systemReadyMsg before WindowSizeMsg, the
+// commit is deferred so the banner can render in the first managed frame instead of
+// landing one row outside the active screen.
+func (m *Screen) handleSystemReady() tea.Cmd {
+	if m.startupCommitted {
+		return nil
+	}
+	if !m.ready {
+		m.startupPending = true
+		return nil
+	}
+	return m.commitStartup()
+}
+
+// commitStartup commits the opening transcript entries once per session: the startup
+// banner (always) followed by the OPTIONAL greeting (only when banner.Greeting is
 // non-empty/non-blank). Both are committed via the plain info-notice path — they are
-// rendered opening entries, NOT turns or commands: this never calls Submit, never drives
-// a loop, and never enters the model's context. It flushes the new entries to scrollback
-// and returns the print command (non-nil because at least the banner is always committed).
+// rendered opening entries, NOT turns or commands: this never calls Submit, never
+// drives a loop, and never enters the model's context. It does NOT flush immediately:
+// while idle, renderStartupSurface shows these unprinted entries in the active surface;
+// the first real transcript commit flushes them into native scrollback exactly once.
 func (m *Screen) commitStartup() tea.Cmd {
+	if m.startupCommitted {
+		return nil
+	}
+	m.startupPending = false
+	m.startupCommitted = true
+
+	start := len(m.transcript.committed)
 	m.transcript = m.transcript.CommitNotice(noticeInfo, m.banner.bannerText())
 	if greeting := strings.TrimSpace(m.banner.Greeting); greeting != "" {
 		m.transcript = m.transcript.CommitNotice(noticeInfo, greeting)
 	}
-	return m.flush()
+	m.startupEntryIDs = m.startupEntryIDs[:0]
+	for _, e := range m.transcript.committed[start:] {
+		m.startupEntryIDs = append(m.startupEntryIDs, e.ID)
+	}
+	return nil
 }
 
 // handleBlink advances the live-surface animation by one frame and, ONLY while the
@@ -369,6 +407,9 @@ func (m *Screen) handleReopenResult(msg reopenResultMsg) tea.Cmd {
 	m.scrollback = newScrollbackModel(m.width)
 	m.interaction = m.interaction.ClearPrompts()
 	m.status = StatusIdle
+	m.startupPending = false
+	m.startupCommitted = false
+	m.startupEntryIDs = nil
 	return tea.Batch(closeAgent(old), subscribeCmd(m.agent))
 }
 
@@ -426,6 +467,7 @@ func (m Screen) View() tea.View {
 	}
 	v := tea.NewView(surfaceView(surfaceInputs{
 		Interaction: m.interaction,
+		Startup:     m.renderStartupSurface(),
 		LiveTail:    m.renderLiveTail(),
 		Queued:      m.renderQueued(),
 		Status:      m.status,
@@ -437,6 +479,39 @@ func (m Screen) View() tea.View {
 	}))
 	v.KeyboardEnhancements.ReportAllKeysAsEscapeCodes = true
 	return v
+}
+
+// renderStartupSurface renders the committed-but-not-yet-printed startup entries in
+// the active surface. Once any flush prints those entries to native scrollback, this
+// returns empty so there is never a second visible banner.
+func (m Screen) renderStartupSurface() string {
+	if len(m.startupEntryIDs) == 0 {
+		return ""
+	}
+	lines := make([]string, 0, len(m.startupEntryIDs)*2)
+	for _, id := range m.startupEntryIDs {
+		if m.scrollback.printed[id] {
+			continue
+		}
+		e, ok := m.committedByID(id)
+		if !ok {
+			continue
+		}
+		if len(lines) > 0 {
+			lines = append(lines, "")
+		}
+		lines = append(lines, renderEntry(e, m.expand, m.width)...)
+	}
+	return strings.Join(lines, "\n")
+}
+
+func (m Screen) committedByID(id displayID) (entry, bool) {
+	for _, e := range m.transcript.committed {
+		if e.ID == id {
+			return e, true
+		}
+	}
+	return entry{}, false
 }
 
 // renderLiveTail renders the in-progress assistant segment (streamed thinking,

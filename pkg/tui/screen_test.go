@@ -362,14 +362,15 @@ func TestWindowSizeMsg(t *testing.T) {
 	}
 }
 
-// TestWindowSizeMsgNoScrollbackPrint pins half of the resize-artifact root cause: a
-// WindowSizeMsg must ONLY update dimensions + repaint the View — it must NEVER return
-// a command (which, on the flush paths, would emit a tea.Println / insertAbove that
-// writes to native scrollback). A nil command guarantees a resize cannot itself print
-// to scrollback; combined with the width clamp (the other half — see
-// TestSurfaceViewNeverExceedsWidth), the resize cascade is eliminated. The case with
-// committed content present proves it stays a no-op even when there is history that a
-// stray flush could reprint.
+// TestWindowSizeMsgNoScrollbackPrint pins half of the resize-artifact root cause: an
+// ordinary WindowSizeMsg must ONLY update dimensions + repaint the View — it must not
+// return a command (which, on the flush paths, would emit a tea.Println / insertAbove
+// that writes to native scrollback). A nil command guarantees a resize cannot itself
+// print to scrollback; combined with the width clamp (the other half — see
+// TestSurfaceViewNeverExceedsWidth), the resize cascade is eliminated. The startup
+// banner path is covered separately by TestStartupBannerWaitsForFirstFrame and still
+// returns no print command. The case with committed content present proves ordinary
+// resizes stay no-op even when there is history that a stray flush could reprint.
 func TestWindowSizeMsgNoScrollbackPrint(t *testing.T) {
 	t.Parallel()
 
@@ -393,7 +394,7 @@ func TestWindowSizeMsgNoScrollbackPrint(t *testing.T) {
 				// Commit a couple of entries so a stray flush WOULD have something to print.
 				m.transcript = m.transcript.CommitSystem("first")
 				m.transcript = m.transcript.CommitSystem("second")
-				m, _ = updateScreen(t, m, systemReadyMsg{}) // drains the flush so committed are printed-once
+				m, _ = updateScreen(t, m, systemReadyMsg{})
 			}
 
 			// A resize (and several drag steps) must each return a nil command.
@@ -495,6 +496,48 @@ func TestViewComposesSurfaceNoViewport(t *testing.T) {
 	}
 	if strings.Contains(view, "committed-history-line") {
 		t.Errorf("View() re-rendered a committed entry; it belongs in native scrollback, got %q", view)
+	}
+}
+
+func TestViewShowsUnprintedStartupBanner(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		banner AgentBanner
+		text   string
+	}{
+		{name: "agent name", banner: AgentBanner{Name: "SWE"}, text: "SWE"},
+		{name: "name and description", banner: AgentBanner{Name: "SWE", Description: "coding agent"}, text: "SWE — coding agent"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			agent := &fakeAgent{}
+			m := New(context.Background(), agent, fakeOpen(agent), tt.banner)
+			m, _ = updateScreen(t, m, tea.WindowSizeMsg{Width: 60, Height: 18})
+			m, cmd := updateScreen(t, m, systemReadyMsg{})
+			if cmd != nil {
+				t.Fatal("systemReady cmd = non-nil, want nil until a real scrollback entry commits")
+			}
+
+			if got := len(m.transcript.committed); got != 1 {
+				t.Fatalf("committed startup entries = %d, want 1", got)
+			}
+			if got := committedText(m.transcript.committed[0]); got != tt.text {
+				t.Fatalf("startup banner text = %q, want %q", got, tt.text)
+			}
+
+			view := stripANSI(m.View().Content)
+			if !strings.Contains(view, tt.text) {
+				t.Errorf("View() missing unprinted startup banner %q in active surface; got %q", tt.text, view)
+			}
+			if !strings.Contains(view, "Type a message…") {
+				t.Errorf("View() missing composer; got %q", view)
+			}
+		})
 	}
 }
 
@@ -1582,11 +1625,91 @@ func TestPromptResultMsgNonFatal(t *testing.T) {
 	})
 }
 
-// TestUpdateStartupBanner covers the startup-ready path: the systemReadyMsg commits
-// an INFO-level notice carrying the agent name + description (NOT the bland "session
-// ready"), threaded in at construction via AgentBanner. It also covers the
-// empty-description edge: the banner degrades to the bare name. A nil-flush cmd would
-// mean the entry never reaches scrollback, so a non-nil cmd is required.
+// TestStartupBannerWaitsForFirstFrame covers the startup race that placed the banner
+// just above the active screen: systemReadyMsg may arrive before Bubble Tea has sent
+// the first WindowSizeMsg. In that ordering the banner must be deferred until the
+// first sized frame exists. Startup commits are kept unprinted and rendered in the
+// active surface until the first real transcript row flushes them into scrollback.
+func TestStartupBannerWaitsForFirstFrame(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name                string
+		first               tea.Msg
+		second              tea.Msg
+		wantFirstCmd        bool
+		wantFirstCommitted  int
+		wantSecondCmd       bool
+		wantSecondCommitted int
+	}{
+		{
+			name:                "system ready before window size waits",
+			first:               systemReadyMsg{},
+			second:              tea.WindowSizeMsg{Width: 80, Height: 24},
+			wantFirstCmd:        false,
+			wantFirstCommitted:  0,
+			wantSecondCmd:       false,
+			wantSecondCommitted: 1,
+		},
+		{
+			name:                "window size before system ready prints",
+			first:               tea.WindowSizeMsg{Width: 80, Height: 24},
+			second:              systemReadyMsg{},
+			wantFirstCmd:        false,
+			wantFirstCommitted:  0,
+			wantSecondCmd:       false,
+			wantSecondCommitted: 1,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			agent := &fakeAgent{}
+			m := New(context.Background(), agent, fakeOpen(agent), AgentBanner{Name: "SWE"})
+
+			m, cmd := updateScreen(t, m, tt.first)
+			if got := cmd != nil; got != tt.wantFirstCmd {
+				t.Fatalf("first cmd non-nil = %v, want %v", got, tt.wantFirstCmd)
+			}
+			if got := len(m.transcript.committed); got != tt.wantFirstCommitted {
+				t.Fatalf("first committed entries = %d, want %d", got, tt.wantFirstCommitted)
+			}
+
+			m, cmd = updateScreen(t, m, tt.second)
+			if got := cmd != nil; got != tt.wantSecondCmd {
+				t.Fatalf("second cmd non-nil = %v, want %v", got, tt.wantSecondCmd)
+			}
+			if got := len(m.transcript.committed); got != tt.wantSecondCommitted {
+				t.Fatalf("second committed entries = %d, want %d", got, tt.wantSecondCommitted)
+			}
+			if got := committedText(m.transcript.committed[0]); got != "SWE" {
+				t.Fatalf("startup banner text = %q, want %q", got, "SWE")
+			}
+
+			view := stripANSI(m.View().Content)
+			if !strings.Contains(view, "SWE") {
+				t.Fatalf("View() missing unprinted startup banner; got %q", view)
+			}
+
+			m, cmd = updateScreen(t, m, systemReadyMsg{})
+			if cmd != nil {
+				t.Fatal("duplicate systemReady cmd = non-nil, want nil")
+			}
+			if got := len(m.transcript.committed); got != 1 {
+				t.Fatalf("committed entries after duplicate systemReady = %d, want 1", got)
+			}
+		})
+	}
+}
+
+// TestUpdateStartupBanner covers the startup-ready path: after the first terminal
+// size is known, systemReadyMsg commits an INFO-level notice carrying the agent name
+// + description (NOT the bland "session ready"), threaded in at construction via
+// AgentBanner. It also covers the empty-description edge: the banner degrades to the
+// bare name. The startup entry is intentionally not flushed yet; while idle it is
+// rendered in the active surface, then the first real entry flushes it to scrollback.
 func TestUpdateStartupBanner(t *testing.T) {
 	t.Parallel()
 
@@ -1617,10 +1740,11 @@ func TestUpdateStartupBanner(t *testing.T) {
 			t.Parallel()
 			agent := &fakeAgent{}
 			m := New(context.Background(), agent, fakeOpen(agent), tt.banner)
+			m, _ = updateScreen(t, m, tea.WindowSizeMsg{Width: 80, Height: 24})
 
 			m, cmd := updateScreen(t, m, systemReadyMsg{})
-			if cmd == nil {
-				t.Error("systemReady cmd = nil, want non-nil (flush)")
+			if cmd != nil {
+				t.Error("systemReady cmd = non-nil, want nil until a real scrollback entry commits")
 			}
 			rec := lastCommitted(t, m)
 			if rec.Kind != kindNotice || rec.Level != noticeInfo {
@@ -1636,12 +1760,14 @@ func TestUpdateStartupBanner(t *testing.T) {
 	}
 }
 
-// TestUpdateStartupGreeting covers the OPTIONAL, UI-only startup greeting (§5a): when a
-// non-empty Greeting is threaded in via AgentBanner, the systemReadyMsg commits TWO
-// opening info notices — the banner first, then the greeting — both to scrollback (a
-// non-nil flush cmd). When the greeting is empty (the default-OFF case) ONLY the banner
-// is committed, so behavior is identical to today. The greeting is a pure opening
-// transcript entry: it is committed via the same notice path, never a turn or command.
+// TestUpdateStartupGreeting covers the OPTIONAL, UI-only startup greeting (§5a): when
+// a non-empty Greeting is threaded in via AgentBanner, systemReadyMsg commits TWO
+// opening info notices after the first terminal size is known — the banner first, then
+// the greeting — both visible in the active surface until a real transcript entry
+// flushes them to scrollback. When the greeting is empty (the default-OFF case) ONLY
+// the banner is committed, so behavior is identical to today. The greeting is a pure
+// opening transcript entry: it is committed via the same notice path, never a turn or
+// command.
 func TestUpdateStartupGreeting(t *testing.T) {
 	t.Parallel()
 
@@ -1674,10 +1800,11 @@ func TestUpdateStartupGreeting(t *testing.T) {
 			t.Parallel()
 			agent := &fakeAgent{}
 			m := New(context.Background(), agent, fakeOpen(agent), tt.banner)
+			m, _ = updateScreen(t, m, tea.WindowSizeMsg{Width: 80, Height: 24})
 
 			m, cmd := updateScreen(t, m, systemReadyMsg{})
-			if cmd == nil {
-				t.Fatal("systemReady cmd = nil, want non-nil (flush)")
+			if cmd != nil {
+				t.Fatal("systemReady cmd = non-nil, want nil until a real scrollback entry commits")
 			}
 
 			if got := len(m.transcript.committed); got != tt.wantCommits {
@@ -1707,6 +1834,64 @@ func TestUpdateStartupGreeting(t *testing.T) {
 			}
 			if m.status != StatusIdle {
 				t.Errorf("status after greeting = %d, want StatusIdle (greeting is lifecycle-neutral)", m.status)
+			}
+		})
+	}
+}
+
+func TestStartupBannerFlushesWithFirstTranscriptEntry(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+	}{
+		{name: "first user row carries startup banner into scrollback"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			primary := callID(0xAA)
+			agent := &fakeAgent{primaryLoopID: primary}
+			m := New(context.Background(), agent, fakeOpen(agent), AgentBanner{Name: "SWE"})
+			m, _ = updateScreen(t, m, tea.WindowSizeMsg{Width: 80, Height: 24})
+			m, cmd := updateScreen(t, m, systemReadyMsg{})
+			if cmd != nil {
+				t.Fatal("systemReady cmd = non-nil, want nil")
+			}
+
+			startup := m.transcript.committed[0]
+			if m.scrollback.printed[startup.ID] {
+				t.Fatal("startup banner printed before the first real transcript entry")
+			}
+			if view := stripANSI(m.View().Content); !strings.Contains(view, "SWE") {
+				t.Fatalf("View() missing unprinted startup banner; got %q", view)
+			}
+
+			m, cmd = updateScreen(t, m, eventMsg{ev: event.TurnStarted{
+				Header:  event.Header{Coordinates: identity.Coordinates{LoopID: primary}, Cause: identity.Cause{CommandID: fixedFakeSubmitID}},
+				Message: userMsg("hello"),
+			}})
+			if cmd == nil {
+				t.Fatal("first transcript event cmd = nil, want flush")
+			}
+
+			if got := len(m.transcript.committed); got != 2 {
+				t.Fatalf("committed entries = %d, want startup + user", got)
+			}
+			if !m.scrollback.printed[startup.ID] {
+				t.Fatal("startup banner was not flushed with the first real transcript entry")
+			}
+			user := m.transcript.committed[1]
+			if user.Kind != kindUser || committedText(user) != "hello" {
+				t.Fatalf("second committed = (kind %d, text %q), want user %q", user.Kind, committedText(user), "hello")
+			}
+			if !m.scrollback.printed[user.ID] {
+				t.Fatal("first user row was not flushed to scrollback")
+			}
+			if view := stripANSI(m.View().Content); strings.Contains(view, "SWE") {
+				t.Fatalf("View() still shows startup banner after it was flushed; got %q", view)
 			}
 		})
 	}
@@ -1752,16 +1937,16 @@ func TestSubmitUserRowFromEventNotSubmit(t *testing.T) {
 // displayID collision that silently dropped the FIRST user message from the TUI.
 //
 // At startup commitStartup commits the banner (an opening UI-only notice) as transcript
-// displayID 1 and flushes it, so the scrollback print-once engine records id 1 as
-// printed. The background restore fold then lands: for a NEW session it folds to an
-// EMPTY backlog. The bug was that handleRestored installed that empty transcript
-// WHOLESALE — discarding the banner and resetting the displayID counter to 0 — while
-// leaving the print-once engine still holding id 1. The next commit, the first user
-// row, then reused displayID 1, which scrollback.Flush treats as "already printed" and
-// skips: the user's first message never reaches scrollback (though the loop ran it and
-// the model replied). Every later message is fine, because the counter then advances
-// past the printed set. This test reproduces that exact ordering and asserts the first
-// user row reaches scrollback with a displayID that was NOT already printed.
+// displayID 1. While idle it may still be active-surface-only; after any early flush it
+// may already be recorded by the scrollback print-once engine. The background restore
+// fold then lands: for a NEW session it folds to an EMPTY backlog. The bug was that
+// handleRestored installed that empty transcript WHOLESALE — discarding the banner and
+// resetting the displayID counter to 0. If the banner had already printed, the first
+// user row reused displayID 1, which scrollback.Flush treated as "already printed" and
+// skipped; if the banner had not printed, the visible startup marker disappeared before
+// it could hand off into scrollback. This test reproduces the empty-restore ordering
+// and asserts the first user row reaches scrollback with a displayID that was NOT
+// already printed.
 func TestFirstUserRowSurvivesEmptyRestore(t *testing.T) {
 	t.Parallel()
 
@@ -1769,12 +1954,11 @@ func TestFirstUserRowSurvivesEmptyRestore(t *testing.T) {
 	agent := &fakeAgent{primaryLoopID: primary}
 	m := New(context.Background(), agent, fakeOpen(agent), AgentBanner{Name: "SWE"})
 
-	// Real startup ordering: size, then the banner commit (systemReady) which flushes
-	// the banner to scrollback, then the background restore fold landing for a NEW
-	// session (empty backlog).
+	// Real startup ordering: size, then the banner commit (systemReady), then the
+	// background restore fold landing for a NEW session (empty backlog).
 	m, _ = updateScreen(t, m, tea.WindowSizeMsg{Width: 80, Height: 24})
 	m, cmd := updateScreen(t, m, systemReadyMsg{})
-	drainCmd(t, cmd) // run the banner flush
+	drainCmd(t, cmd)
 	if got := userRowCount(m); got != 0 {
 		t.Fatalf("user rows after banner = %d, want 0", got)
 	}

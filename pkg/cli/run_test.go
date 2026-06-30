@@ -151,7 +151,7 @@ func TestClearTerminalForFreshLaunch(t *testing.T) {
 		wantErr bool
 	}{
 		{
-			name:   "clears visible screen and scrollback",
+			name:   "clears visible screen and scrollback then homes cursor",
 			writer: success,
 			output: success.String,
 			want:   "\x1b[2J\x1b[3J\x1b[H",
