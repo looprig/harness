@@ -38,6 +38,7 @@ type Screen struct {
 	transcript  transcriptModel
 	scrollback  scrollbackModel
 	interaction interactionModel
+	liveSpill   liveSpillState
 
 	status Status      // Idle | Running | Interrupting | Resetting
 	sub    EventStream // the session-lifetime event subscription; nil until subscribed
@@ -74,6 +75,15 @@ type Screen struct {
 	// seeded at construction and refreshed (nextTip) on every turn terminal, so a fresh
 	// hint shows after each turn.
 	tip string
+}
+
+// liveSpillState tracks the prefix of the current live assistant prose/thinking that
+// has already been emitted to native scrollback while the step is still streaming.
+// StepDone later suppresses the same prefix from the authoritative committed assistant
+// entry, avoiding a duplicate answer while still letting long streams free-flow.
+type liveSpillState struct {
+	printedLines []string
+	finalizing   bool
 }
 
 // AgentBanner is the agent metadata shown as the startup info notice — its Name and
@@ -265,9 +275,14 @@ func (m *Screen) handleBlink() tea.Cmd {
 // (approve/deny/answer) is what releases it. A prompt event dispatches nothing
 // here; the trio call happens later when the user resolves it.
 func (m *Screen) handleEvent(ev event.Event) tea.Cmd {
+	finalizingLive := m.finalizesPrimaryLive(ev)
 	m.transcript = m.transcript.ApplyEvent(ev)
 	m.interaction = m.interaction.ApplyEvent(ev)
 	statusCmd := m.applyTurnStatus(ev)
+	if finalizingLive {
+		m.liveSpill.finalizing = true
+	}
+	spillCmd := m.spillLive()
 	// Re-arm only while a live subscription is installed: during the /clear window
 	// m.sub is transiently nil, and the fresh subscription's reader is (re)started
 	// by handleSubscribed, not here. subNext is also nil-guarded as a backstop. A
@@ -279,7 +294,19 @@ func (m *Screen) handleEvent(ev event.Event) tea.Cmd {
 	if m.sub != nil {
 		rearm = subNext(m.sub)
 	}
-	return tea.Batch(rearm, statusCmd, m.flush())
+	return tea.Batch(rearm, statusCmd, spillCmd, m.flush())
+}
+
+func (m Screen) finalizesPrimaryLive(ev event.Event) bool {
+	if ev.EventHeader().LoopID != m.agent.PrimaryLoopID() {
+		return false
+	}
+	switch ev.(type) {
+	case event.StepDone, event.TurnDone, event.TurnInterrupted, event.TurnFailed:
+		return true
+	default:
+		return false
+	}
 }
 
 // applyTurnStatus derives the turn status from a turn-lifecycle event for the
@@ -356,11 +383,36 @@ func (m *Screen) handleSubmitResult(msg submitResultMsg) tea.Cmd {
 // and returns the print command (nil when nothing is new). renderEntry is given the
 // current expand flag and width so scrollback and the live tail render identically.
 func (m *Screen) flush() tea.Cmd {
+	return printToScrollback(m.flushActions())
+}
+
+func (m *Screen) flushActions() []printAction {
+	pendingSpill := append([]string(nil), m.liveSpill.printedLines...)
 	var actions []printAction
 	m.scrollback, actions = m.scrollback.Flush(m.transcript.committed, func(e entry) []string {
-		return renderEntry(e, m.expand, m.width)
+		lines := renderEntry(e, m.expand, m.width)
+		if m.liveSpill.finalizing && e.Kind == kindAssistant && len(pendingSpill) > 0 {
+			lines, pendingSpill = trimMatchingPrefix(lines, pendingSpill)
+		}
+		return lines
 	})
-	return printToScrollback(actions)
+	if m.liveSpill.finalizing {
+		m.liveSpill = liveSpillState{}
+	}
+	return actions
+}
+
+func trimMatchingPrefix(lines, prefix []string) ([]string, []string) {
+	n := matchingPrefixCount(lines, prefix)
+	return lines[n:], prefix[n:]
+}
+
+func matchingPrefixCount(lines, prefix []string) int {
+	n := 0
+	for n < len(lines) && n < len(prefix) && lines[n] == prefix[n] {
+		n++
+	}
+	return n
 }
 
 // handleInterruptResult applies the outcome of an Interrupt call. On error the turn
@@ -406,6 +458,7 @@ func (m *Screen) handleReopenResult(msg reopenResultMsg) tea.Cmd {
 	m.transcript = transcriptModel{primaryLoopID: m.agent.PrimaryLoopID()}
 	m.scrollback = newScrollbackModel(m.width)
 	m.interaction = m.interaction.ClearPrompts()
+	m.liveSpill = liveSpillState{}
 	m.status = StatusIdle
 	m.startupPending = false
 	m.startupCommitted = false
@@ -441,12 +494,11 @@ func (m *Screen) startBlink() tea.Cmd {
 }
 
 // View renders an empty string until the first WindowSizeMsg (avoids a 0×0 first
-// frame), then composes the active surface via surfaceView: the capped live tail
-// (rendered from the live segment), the separator rule, the bottom box (composer /
-// prompt control / answer field by interaction mode), the slash panel when visible,
-// and one status line. Committed entries are NOT re-rendered here — they live in
-// native scrollback. The View leaves AltScreen false and MouseMode none (the v2 zero
-// values), the scrollback-first configuration.
+// frame), then composes the active surface via surfaceView: the unspilled live tail,
+// the bottom box (composer / prompt control / answer field by interaction mode), the
+// slash panel when visible, and one status line. Committed entries are NOT re-rendered
+// here — they live in native scrollback. The View leaves AltScreen false and MouseMode
+// none (the v2 zero values), the scrollback-first configuration.
 //
 // KeyboardEnhancements.ReportAllKeysAsEscapeCodes is requested so the composer's
 // Shift+Enter binding works (see tui/components/input.go). v2's DEFAULT Kitty request
@@ -465,10 +517,16 @@ func (m Screen) View() tea.View {
 	if !m.ready {
 		return tea.NewView("")
 	}
-	v := tea.NewView(surfaceView(surfaceInputs{
+	v := tea.NewView(surfaceView(m.surfaceInputs(m.renderLiveTail())))
+	v.KeyboardEnhancements.ReportAllKeysAsEscapeCodes = true
+	return v
+}
+
+func (m Screen) surfaceInputs(liveTail string) surfaceInputs {
+	return surfaceInputs{
 		Interaction: m.interaction,
 		Startup:     m.renderStartupSurface(),
-		LiveTail:    m.renderLiveTail(),
+		LiveTail:    liveTail,
 		Queued:      m.renderQueued(),
 		Status:      m.status,
 		StatusState: m.statusInputs(),
@@ -476,9 +534,7 @@ func (m Screen) View() tea.View {
 		Tip:         m.tip,
 		Width:       m.width,
 		Height:      m.height,
-	}))
-	v.KeyboardEnhancements.ReportAllKeysAsEscapeCodes = true
-	return v
+	}
 }
 
 // renderStartupSurface renders the committed-but-not-yet-printed startup entries in
@@ -519,6 +575,11 @@ func (m Screen) committedByID(id displayID) (entry, bool) {
 // its display lines. It is empty when there is no live content AND no pending subagent
 // card, so the surface omits the tail region entirely.
 func (m Screen) renderLiveTail() string {
+	spilled := matchingPrefixCount(m.spillableAssistantLines(), m.liveSpill.printedLines)
+	return dropLiveSpillPrefix(m.renderLiveTailFull(), spilled)
+}
+
+func (m Screen) renderLiveTailFull() string {
 	live := m.transcript.live
 	pending := m.transcript.pendingSubagentCards()
 	if live.empty() && len(pending) == 0 {
@@ -528,6 +589,56 @@ func (m Screen) renderLiveTail() string {
 	// by the nested pending card (renderSubagentCard) instead, so it must not be doubled.
 	calls := nonSubagentCalls(live.Calls)
 	return renderLiveAssistant(live.Thinking, live.Text, calls, pending, m.expand, m.width, m.anim)
+}
+
+func (m *Screen) spillLive() tea.Cmd {
+	if !m.ready || m.liveSpill.finalizing {
+		return nil
+	}
+	fullTail := m.renderLiveTailFull()
+	if fullTail == "" {
+		return nil
+	}
+	assistantLines := m.spillableAssistantLines()
+	if len(assistantLines) == 0 {
+		return nil
+	}
+	tailBudget := liveTailDisplayCap(m.surfaceInputs(""))
+	fullTailLines := strings.Split(fullTail, "\n")
+	spillUntil := len(fullTailLines) - tailBudget
+	if spillUntil > len(assistantLines) {
+		spillUntil = len(assistantLines)
+	}
+	already := len(m.liveSpill.printedLines)
+	if spillUntil <= already {
+		return nil
+	}
+	newLines := append([]string(nil), assistantLines[already:spillUntil]...)
+	m.liveSpill.printedLines = append(m.liveSpill.printedLines, newLines...)
+	return printToScrollback([]printAction{{Lines: newLines}})
+}
+
+func (m Screen) spillableAssistantLines() []string {
+	live := m.transcript.live
+	if live.Thinking == "" && live.Text == "" {
+		return nil
+	}
+	return splitNonEmpty(renderAssistant(live.Thinking, live.Text, "", m.expand, m.width))
+}
+
+func dropLiveSpillPrefix(tail string, n int) string {
+	if tail == "" || n <= 0 {
+		return tail
+	}
+	lines := strings.Split(tail, "\n")
+	if n >= len(lines) {
+		return ""
+	}
+	lines = lines[n:]
+	for len(lines) > 0 && lines[0] == "" {
+		lines = lines[1:]
+	}
+	return strings.Join(lines, "\n")
 }
 
 // renderQueued renders the transcript's pending queued-input affordances (the

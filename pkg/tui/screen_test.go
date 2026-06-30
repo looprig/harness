@@ -542,8 +542,7 @@ func TestViewShowsUnprintedStartupBanner(t *testing.T) {
 }
 
 // TestViewRendersLiveTail asserts the in-progress (live) assistant segment renders
-// in the View's capped live tail above the composer panel — it is NOT yet committed, so
-// it cannot be in scrollback.
+// above the composer panel while it remains in the active tail.
 func TestViewRendersLiveTail(t *testing.T) {
 	t.Parallel()
 
@@ -1149,16 +1148,12 @@ func TestCtrlTFlipsThinkingNotToolOutputInLiveTail(t *testing.T) {
 	}
 }
 
-// TestLiveTailStaysBoundedAcrossSteps is the architectural guard against the "input block
-// repainted twice / stranded" bug. In an inline (non-alt-screen) TUI the live tail is the
-// renderer's MANAGED region; if it grows toward the screen height the relative-cursor
-// renderer can't track the terminal scroll and strands a copy of the bottom region (input +
-// status + prompt). So the live tail MUST stay small regardless of how much a step streams.
-// This drives two pathologically large in-progress steps (100-line reasoning + many big tool
-// results) and asserts the live tail height stays under a small bound at each — even though
-// the UNcapped render would be 500+ lines. (The actual stranding is a bubbletea renderer
-// behavior that needs a real TTY to observe; this asserts the invariant that prevents it.)
-func TestLiveTailStaysBoundedAcrossSteps(t *testing.T) {
+// TestLiveTailSpillsOverflowAcrossSteps covers the free-flow streaming path: a large
+// live assistant block prints stable overflow rows into native scrollback and leaves only
+// the remaining tail in Bubble Tea's managed frame. The active frame therefore stays
+// within its terminal budget without folding the whole streaming response into a small
+// fixed window.
+func TestLiveTailSpillsOverflowAcrossSteps(t *testing.T) {
 	t.Parallel()
 
 	m := runningScreen(t, &fakeAgent{})
@@ -1183,24 +1178,62 @@ func TestLiveTailStaysBoundedAcrossSteps(t *testing.T) {
 		return calls
 	}
 
-	// Generous ceiling: thinking cap (~10) + body + "… earlier" + liveCallCap cards ×
-	// (header + previewLineCap output) + separators. The uncapped render would be 100 +
-	// 20×21 ≈ 520 lines.
-	const bound = 35
-
 	height := func() int { return strings.Count(m.renderLiveTail(), "\n") + 1 }
+	budget := liveTailDisplayCap(m.surfaceInputs(""))
 
 	// Step 1: a huge in-progress step (long reasoning + many big tool results).
 	m.transcript.live = liveSeg{Thinking: bigThinking(), Text: "the narration", Calls: manyBigCalls(20), active: true}
-	if h := height(); h > bound {
-		t.Fatalf("step 1 live tail height = %d, want <= %d (a tall live tail strands the input region)", h, bound)
+	if cmd := m.spillLive(); cmd == nil {
+		t.Fatal("step 1 spillLive cmd = nil, want overflow to print into scrollback")
+	}
+	if len(m.liveSpill.printedLines) == 0 {
+		t.Fatal("step 1 did not record spilled live lines")
+	}
+	if h := height(); h > budget {
+		t.Fatalf("step 1 live tail height = %d, want <= active budget %d after spill", h, budget)
 	}
 
-	// Step 2: the prior step committed (live resets) and a NEW huge step begins. The live
-	// tail must not have accumulated across steps and must still be bounded.
+	// Step 2: a NEW huge step gets its own spill state; it must not accumulate the
+	// prior step's already-spilled prefix.
+	m.liveSpill = liveSpillState{}
 	m.transcript.live = liveSeg{Thinking: bigThinking(), Calls: manyBigCalls(15), active: true}
-	if h := height(); h > bound {
-		t.Fatalf("step 2 live tail height = %d, want <= %d", h, bound)
+	if cmd := m.spillLive(); cmd == nil {
+		t.Fatal("step 2 spillLive cmd = nil, want overflow to print into scrollback")
+	}
+	if h := height(); h > budget {
+		t.Fatalf("step 2 live tail height = %d, want <= active budget %d after spill", h, budget)
+	}
+}
+
+func TestRenderLiveTailKeepsMismatchedSpillPrefix(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		spilled []string
+		want    string
+	}{
+		{
+			name:    "display-mode mismatch does not drop current prefix by stale count",
+			spilled: []string{"not the current render", "still not the current render"},
+			want:    "alpha",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			m := runningScreen(t, &fakeAgent{})
+			m.width = 80
+			m.transcript.live = liveSeg{Thinking: "alpha\nbeta", active: true}
+			m.liveSpill.printedLines = append([]string(nil), tt.spilled...)
+
+			got := stripANSI(m.renderLiveTail())
+			if !strings.Contains(got, tt.want) {
+				t.Errorf("renderLiveTail() = %q, want to keep %q when spilled prefix no longer matches", got, tt.want)
+			}
+		})
 	}
 }
 
@@ -2147,5 +2180,64 @@ func TestFlushPrintsEachEntryOnce(t *testing.T) {
 	second := m.flush()
 	if second != nil {
 		t.Error("second flush cmd = non-nil, want nil (entry already printed once)")
+	}
+}
+
+func TestFlushSuppressesSpilledAssistantPrefix(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name        string
+		spillLines  int
+		wantAbsent  []string
+		wantPresent []string
+	}{
+		{
+			name:        "matching spilled prefix is not printed again",
+			spillLines:  2,
+			wantAbsent:  []string{"alpha"},
+			wantPresent: []string{"beta", "gamma"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			agent := &fakeAgent{}
+			m := New(context.Background(), agent, fakeOpen(agent), AgentBanner{})
+			m.width = 80
+			m.expand = true
+			thinking := "alpha\nbeta\ngamma"
+			assistant := entry{
+				ID:     1,
+				Kind:   kindAssistant,
+				Blocks: []content.Block{&content.ThinkingBlock{Thinking: thinking}},
+			}
+			rendered := renderEntry(assistant, m.expand, m.width)
+			if len(rendered) < tt.spillLines {
+				t.Fatalf("rendered assistant has %d lines, need %d", len(rendered), tt.spillLines)
+			}
+			m.liveSpill = liveSpillState{
+				printedLines: append([]string(nil), rendered[:tt.spillLines]...),
+				finalizing:   true,
+			}
+			m.transcript.committed = []entry{assistant}
+
+			payload := stripANSI(printPayload(m.flushActions()))
+			for _, absent := range tt.wantAbsent {
+				if strings.Contains(payload, absent) {
+					t.Errorf("flush payload = %q, want spilled prefix %q absent", payload, absent)
+				}
+			}
+			for _, present := range tt.wantPresent {
+				if !strings.Contains(payload, present) {
+					t.Errorf("flush payload = %q, want unspilled suffix %q present", payload, present)
+				}
+			}
+			if len(m.liveSpill.printedLines) != 0 || m.liveSpill.finalizing {
+				t.Errorf("liveSpill after flush = %+v, want reset", m.liveSpill)
+			}
+		})
 	}
 }

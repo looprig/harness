@@ -427,6 +427,52 @@ func TestRenderLiveAssistantCards(t *testing.T) {
 	})
 }
 
+func TestRenderLiveAssistantExpandedThinkingShowsFullBody(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		lineCnt  int
+		first    string
+		middle   string
+		last     string
+		expanded bool
+	}{
+		{
+			name:     "expanded long thinking keeps earliest and latest lines",
+			lineCnt:  12,
+			first:    "reason-00",
+			middle:   "reason-04",
+			last:     "reason-11",
+			expanded: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			lines := make([]string, tt.lineCnt)
+			for i := range lines {
+				lines[i] = "reason-" + strconv.Itoa(i/10) + strconv.Itoa(i%10)
+			}
+			got := stripANSI(renderLiveAssistant(strings.Join(lines, "\n"), "", nil, nil, tt.expanded, 80, animState{}))
+
+			for _, want := range []string{tt.first, tt.last} {
+				if !strings.Contains(got, want) {
+					t.Errorf("renderLiveAssistant() = %q, want to contain %q", got, want)
+				}
+			}
+			if strings.HasPrefix(strings.TrimSpace(got), "│ …") {
+				t.Errorf("renderLiveAssistant() = %q, want no live thinking tail truncation marker", got)
+			}
+			if tt.middle != "" && !strings.Contains(got, tt.middle) {
+				t.Errorf("renderLiveAssistant() = %q, want middle thinking line %q to remain visible", got, tt.middle)
+			}
+		})
+	}
+}
+
 // TestRenderLiveAssistantSubagentCard (live-tail card path): a pending Subagent card in
 // the live tail renders the SAME nested "● Subagent(<agent>)" card as the committed form
 // (header + ⎿ children + "running · N steps"), and — because the only activity in the

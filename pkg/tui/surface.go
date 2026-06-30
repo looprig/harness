@@ -9,8 +9,8 @@ import (
 // Active-surface row budget (design §"Input box · Active-surface budgeting"). The
 // surface is the only managed region in scrollback-first mode: the terminal owns
 // history, so there is no transcript viewport — only any unprinted startup entries,
-// a capped live tail, the bottom box, an optional slash panel, one status line, and
-// the rotating tip.
+// a live tail budgeted to the available rows, the bottom box, an optional slash panel,
+// one status line, and the rotating tip.
 const (
 	statusH    = 1 // the single status line
 	statusPadH = 1 // one blank pad line; the status row carries one above and one below it
@@ -18,34 +18,24 @@ const (
 	boxBorderH = 2 // the bottom box's top + bottom frame rows (a prompt box's border; the minimal composer has none, so this over-reserves harmlessly in compose mode)
 )
 
-// liveTailCap is the number of rows the live tail may occupy. It starts from the free
-// space — the terminal height less the status line, the rows reserved below the tail
-// (reservedH = the slash panel + the queued-input affordance, 0 when both hidden) and the
-// bottom box (box frame + contentH; contentH is the composer height in compose/answer mode
-// or the prompt-control height in prompt mode) — and then reserves HALF of it as commit
-// headroom. The result is floored at 0 and is never negative.
+// liveTailCap is the number of rows the live tail may occupy: the terminal height less
+// the status/tip rows, the rows reserved below the tail (reservedH = startup + slash
+// panel + queued-input affordance), and the bottom box (box frame + contentH; contentH
+// is the composer height in compose/answer mode or the prompt-control height in prompt
+// mode). The result is floored at 0 and is never negative.
 //
-// The halving is the fix for the "input box stranded / repainted twice" bug, not a cosmetic
-// cap. The live tail is part of the bubbletea inline renderer's managed region of height h.
-// At a step boundary the WHOLE tail commits to native scrollback in one tea.Println, which
-// the renderer performs with insertAbove (cursed_renderer.go): it scrolls to the bottom and
-// moves the cursor up `offset + h - 1` rows, where offset is the committed payload height.
-// That cursor-up only lands correctly while `offset + h <= term`; past that it clamps at the
-// top of the screen and the InsertLine writes at the wrong row, leaving the previous managed
-// region (input box, status, permission prompt) behind in scrollback. Because the committed
-// payload ≈ the tail height (offset ≈ tail) and the surface is tail + chrome, the strand-free
-// condition `offset + h <= term` becomes `2*tail + chrome <= term` — i.e. the tail may use at
-// most HALF the free space, the other half being the headroom insertAbove needs. Capping each
-// render section (thinking/cards/children) alone could not guarantee this: it bounded the
-// pieces but left liveTailCap itself handing out the entire free space, so a busy step still
-// grew the managed region to the full terminal. See TestLiveTailCapReservesCommitHeadroom.
+// This is a terminal-safety budget, not a small-window policy. The live tail gets all
+// rows left after chrome so long thinking/messages can fill the active screen while
+// streaming. clampSurfaceHeight remains the hard invariant that keeps the managed frame
+// below the terminal height; the vendored scrollback renderer pages large commits, so the
+// older half-screen headroom rule is no longer needed here.
 func liveTailCap(term, statusH, reservedH, contentH int) int {
 	bottomH := boxBorderH + contentH
 	free := term - statusH - reservedH - bottomH
 	if free <= 0 {
 		return 0
 	}
-	return free / 2
+	return free
 }
 
 // surfaceInputs is the synthetic, agent-free snapshot surfaceView composes from:
@@ -66,9 +56,9 @@ type surfaceInputs struct {
 }
 
 // surfaceView composes the active surface top to bottom: any unprinted startup entries,
-// the capped live tail, one status line set off by a blank pad row above and below it,
-// the bottom box (composer, prompt control, or answer field by interaction mode), and
-// the slash-completion panel when visible. The composer is a
+// the live tail, one status line set off by a blank pad row above and below it, the
+// bottom box (composer, prompt control, or answer field by interaction mode), and the
+// slash-completion panel when visible. The composer is a
 // borderless, ▌-edged dark-gray panel — there is no separator rule above it (a
 // full-width rule was the most visible artifact stranded into scrollback on a resize
 // desync; see styles.BoxStyle). It allocates no transcript viewport. Empty regions are omitted so
@@ -96,19 +86,6 @@ func surfaceView(in surfaceInputs) string {
 	status := renderStatusLine(in.Status, in.StatusState, in.Phase)
 	tip := renderTip(in.Tip)
 
-	contentH := bottomContentHeight(in)
-	// The queued affordance and slash panel are first-class reserved rows: they sit
-	// between the live tail and the bottom box (queued) or below the bottom box
-	// (slash), so the tail gets only the rows left after BOTH are reserved — keeping
-	// the logical line count equal to the physical row count the v2 inline renderer
-	// requires (see clampSurfaceWidth).
-	reserved := lipgloss.Height(slash) + queuedHeight(in.Queued) + startupHeight(in.Startup)
-	// The status row carries a blank pad above and below it (2*statusPadH) and tipH (the
-	// Tips line at the very bottom) are reserved alongside statusH so the tail budget
-	// accounts for the whole bottom chrome. During a live turn the tail's own trailing
-	// blank doubles as the status's pad-above, so this slightly over-reserves — harmless.
-	capacity := liveTailCap(in.Height, statusH+2*statusPadH+tipH, reserved, contentH)
-
 	// The live tail carries a trailing blank line, mirroring the one
 	// scrollbackModel.Flush appends after every committed entry — so the gap below the
 	// streaming assistant already matches its committed look, and the layout does not
@@ -116,7 +93,7 @@ func surfaceView(in surfaceInputs) string {
 	// capacity (capacity-1) so the surface row budget is unchanged.
 	tail := ""
 	if in.LiveTail != "" {
-		tail = cappedTail(in.LiveTail, capacity-1)
+		tail = cappedTail(in.LiveTail, liveTailDisplayCap(in))
 	}
 
 	rows := make([]string, 0, 7)
@@ -149,6 +126,25 @@ func surfaceView(in surfaceInputs) string {
 	// lines. Reversing the order would let a wide line wrap onto an extra physical row
 	// after the height count, reintroducing the very row-count desync these guards prevent.
 	return clampSurfaceHeight(clampSurfaceWidth(strings.Join(rows, "\n"), in.Width), in.Height)
+}
+
+func liveTailDisplayCap(in surfaceInputs) int {
+	contentH := bottomContentHeight(in)
+	// The queued affordance and slash panel are first-class reserved rows: they sit
+	// between the live tail and the bottom box (queued) or below the bottom box
+	// (slash), so the tail gets only the rows left after BOTH are reserved — keeping
+	// the logical line count equal to the physical row count the v2 inline renderer
+	// requires (see clampSurfaceWidth).
+	reserved := lipgloss.Height(slashPanel(in.Interaction)) + queuedHeight(in.Queued) + startupHeight(in.Startup)
+	// The status row carries a blank pad above and below it (2*statusPadH) and tipH (the
+	// Tips line at the very bottom) are reserved alongside statusH so the tail budget
+	// accounts for the whole bottom chrome. During a live turn the tail's own trailing
+	// blank doubles as the status's pad-above, so this slightly over-reserves — harmless.
+	capacity := liveTailCap(in.Height, statusH+2*statusPadH+tipH, reserved, contentH)
+	if capacity <= 0 {
+		return 0
+	}
+	return capacity - 1
 }
 
 func startupHeight(startup string) int {
@@ -186,12 +182,12 @@ func startupHeight(startup string) int {
 // own over-tall-frame handling (cursed_renderer.go keeps the bottom s.height lines when
 // frameHeight > s.height) AND to preserve the most important chrome: the bottom box, slash
 // panel, and tip stay visible longest (the status now sits just above the box, so it sheds
-// before the box does). In the common case it sheds the live tail's
-// oldest rows first (already committed to scrollback, so nothing is lost). When the
-// terminal is small enough that even the chrome overflows, chrome rows are shed from the
-// top too — unavoidable at that size, and consistent with the renderer's own over-tall
-// handling. A height <= 1 is a degenerate terminal (height-1 leaves no renderable row) —
-// the surface is dropped to the empty string.
+// before the box does). In the common case it sheds the oldest live-tail rows first when
+// the terminal itself is out of space; StepDone still commits the full authoritative
+// content to scrollback. When the terminal is small enough that even the chrome overflows,
+// chrome rows are shed from the top too — unavoidable at that size, and consistent with
+// the renderer's own over-tall handling. A height <= 1 is a degenerate terminal (height-1
+// leaves no renderable row) — the surface is dropped to the empty string.
 func clampSurfaceHeight(surface string, height int) string {
 	limit := height - 1 // reserve one row of headroom for the renderer's insertAbove (cap = termRows - h)
 	if limit <= 0 {
@@ -319,10 +315,10 @@ func slashPanel(m interactionModel) string {
 	}
 }
 
-// cappedTail returns the last capacity lines of the (pre-rendered) live tail,
-// dropping the oldest rows when the tail exceeds the budget. A capacity of 0 (or
-// an empty tail) yields "". The dropped rows are already committed to scrollback
-// at the next boundary, so nothing is lost.
+// cappedTail returns the last capacity lines of the pre-rendered live tail, dropping the
+// oldest rows when the terminal cannot fit the full active block. A capacity of 0 (or an
+// empty tail) yields "". StepDone later commits the full authoritative step to scrollback,
+// so this is only a live-frame visibility limit.
 func cappedTail(tail string, capacity int) string {
 	if capacity <= 0 || tail == "" {
 		return ""

@@ -26,14 +26,6 @@ const previewLineCap = 3
 // frame. The elided cards still commit IN FULL to scrollback at the step's StepDone.
 const liveCallCap = 3
 
-// liveThinkingCap bounds how many reasoning lines the LIVE tail shows when thinking is
-// expanded: only the last liveThinkingCap, behind a leading "…". A long streaming reasoning
-// block would otherwise grow the live tail (the managed region) toward the screen height,
-// which the inline renderer can't track — stranding the input/status region. The FULL
-// thinking still commits to scrollback at StepDone. Collapsed thinking is already a one-line
-// summary, so it is not affected.
-const liveThinkingCap = 8
-
 // noOutput is the placeholder shown for a completed tool call with no result lines.
 const noOutput = "(no output)"
 
@@ -478,26 +470,10 @@ func nonSubagentCalls(calls []ToolCallView) []ToolCallView {
 // below the ordinary calls, separated by a blank line. The working-word headline shows
 // ONLY when there is no narration AND at least one ORDINARY call (len(calls) > 0) — a step
 // that only spawned subagents does NOT show "◦ Whirring", its activity is the nested card.
-// liveThinkingTail trims an EXPANDED live thinking block to its last liveThinkingCap lines,
-// behind a leading "…", so a long streaming reasoning block can't grow the live tail past the
-// inline renderer's small-managed-region budget (a tall managed region is what strands the
-// input/status rows). Collapsed thinking is already a one-line summary, so it is returned
-// unchanged; the FULL thinking still commits to scrollback at StepDone.
-func liveThinkingTail(s string, expand bool) string {
-	if !expand {
-		return s
-	}
-	lines := strings.Split(strings.TrimRight(s, "\n"), "\n")
-	if len(lines) <= liveThinkingCap {
-		return s
-	}
-	return "…\n" + strings.Join(lines[len(lines)-liveThinkingCap:], "\n")
-}
-
 func renderLiveAssistant(thinking, text string, calls, subagentCards []ToolCallView, expand bool, width int, a animState) string {
 	var b strings.Builder
 
-	if t := renderThinking(liveThinkingTail(thinking, expand), expand, width); t != "" {
+	if t := renderThinking(thinking, expand, width); t != "" {
 		b.WriteString(t)
 	}
 
