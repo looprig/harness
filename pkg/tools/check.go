@@ -147,7 +147,10 @@ func (c *PermissionChecker) Check(ctx context.Context, t tool.InvokableTool, too
 	}
 
 	// Stage 3: EffectChecker (an explicit per-call override from the tool).
-	if eff, handled := stageEffectChecker(t, argsJSON); handled {
+	// Under the Unattended posture an EffectAutoApprove is NOT honored (it would
+	// bypass the declared allowlist); the call falls through. Deny/Ask are honored.
+	if eff, handled := stageEffectChecker(t, argsJSON); handled &&
+		!(c.unattended && eff == loop.EffectAutoApprove) {
 		return eff
 	}
 
@@ -156,9 +159,12 @@ func (c *PermissionChecker) Check(ctx context.Context, t tool.InvokableTool, too
 		return loop.EffectAutoApprove
 	}
 
-	// Stage 5: persisted approvals (deny beats allow across BOTH files).
-	if eff, decided := c.stagePersistedApprovals(ctx, toolName, class, argsJSON); decided {
-		return eff
+	// Stage 5: persisted approvals — SKIPPED under the Unattended posture so only
+	// the definer's declared allowlist (Stage 4/6) can approve.
+	if !c.unattended {
+		if eff, decided := c.stagePersistedApprovals(ctx, toolName, class, argsJSON); decided {
+			return eff
+		}
 	}
 
 	// Stage 6: in-memory session policies.

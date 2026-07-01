@@ -238,6 +238,14 @@ type checkerConfig struct {
 // post-construction setter could not) and tests can force the failure.
 func WithHomeDir(fn homeDirFunc) Option { return func(c *checkerConfig) { c.homeFn = fn } }
 
+// WithUnattended puts the checker in the headless posture: it (1) does NOT honor a
+// Stage-3 EffectChecker EffectAutoApprove (the call falls through to the allowlist
+// stages, so a tool cannot self-approve ahead of the definer's declared allowlist)
+// and (2) skips Stage-5 persisted approvals (a stale ~/.looprig grant can never
+// auto-approve a call the definer did not declare). EffectChecker EffectDeny is
+// still honored (a safety veto). Pair with NonInteractiveGate (Task 5).
+func WithUnattended() Option { return func(c *checkerConfig) { c.unattended = true } }
+
 // NewPermissionChecker builds a PermissionChecker for the given policy. It resolves
 // the home dir ONCE via the (optionally injected) seam; if resolution fails while
 // any "~/…" hard-deny OR read-deny pattern is configured it returns a typed
