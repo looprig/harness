@@ -24,6 +24,23 @@ type EffectChecker interface {
 	CheckEffect(argsJSON string) (effect loop.Effect, handled bool)
 }
 
+// HomeUnresolvableError is returned by NewPermissionChecker when the user's home
+// directory cannot be resolved WHILE the policy configures a home-relative ("~/…")
+// hard-deny or read-deny pattern. Such a checker cannot enforce those secret-deny
+// rules (a "~/.ssh/**" glob has nothing to expand against), so construction fails
+// LOUDLY rather than silently running fail-open (CLAUDE.md: fail loudly on missing/
+// unresolvable required config). It is fail-secure and typed per CLAUDE.md.
+type HomeUnresolvableError struct {
+	// Cause is the underlying os.UserHomeDir (or injected seam) error.
+	Cause error
+}
+
+func (e *HomeUnresolvableError) Error() string {
+	return "tools: home directory unresolvable but a ~/ hard-deny pattern is configured: " + e.Cause.Error()
+}
+
+func (e *HomeUnresolvableError) Unwrap() error { return e.Cause }
+
 // HardApproveRules names tools that are auto-approved unconditionally (after
 // containment + hard-deny). These are intrinsically safe, side-effect-free tools
 // (e.g. a within-workspace search) that never need a prompt.
