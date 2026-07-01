@@ -30,13 +30,19 @@ func TestDefaultPhalaPolicyAnchors(t *testing.T) {
 		t.Errorf("AcceptedAppIDs missing fixture app-id %q", fixtureAppIDHex)
 	}
 
-	// source-provenance: exactly the one fixture {repo_url, repo_commit} pair.
-	if len(p.AcceptedSourceProvenance) != 1 {
-		t.Fatalf("AcceptedSourceProvenance has %d entries, want 1", len(p.AcceptedSourceProvenance))
+	// source-provenance: two accepted {repo_url, repo_commit} pairs — the
+	// fixture-audited commit and the live-deployed commit observed at Task 6.1
+	// (both attest to the same workload_keyset_digest).
+	if len(p.AcceptedSourceProvenance) != 2 {
+		t.Fatalf("AcceptedSourceProvenance has %d entries, want 2", len(p.AcceptedSourceProvenance))
 	}
 	wantProv := provenanceKey{RepoURL: fixtureRepoURL, RepoCommit: fixtureRepoCommit}
 	if _, ok := p.AcceptedSourceProvenance[wantProv]; !ok {
 		t.Errorf("AcceptedSourceProvenance missing fixture provenance %+v", wantProv)
+	}
+	wantProvDeployed := provenanceKey{RepoURL: fixtureRepoURL, RepoCommit: "e776e9cf1f9c2d61730da5d2f4b717e49041da0d"}
+	if _, ok := p.AcceptedSourceProvenance[wantProvDeployed]; !ok {
+		t.Errorf("AcceptedSourceProvenance missing live-deployed provenance %+v", wantProvDeployed)
 	}
 
 	// KMS root: exactly the one fixture-recovered compressed-SEC1 hex (blocker #3).

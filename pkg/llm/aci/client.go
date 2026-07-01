@@ -275,11 +275,14 @@ func (c *Client) Invoke(ctx context.Context, req llm.Request) (*llm.Response, er
 	expect := ReceiptExpect{
 		Endpoint: endpointChat,
 		Method:   methodPost,
-		// Vendor is intentionally EMPTY: the live provider value is unconfirmed
-		// until the live round-trip (Task 6.1), so the upstream event is bound on
-		// result + model_id alone for now. Confirm and pin Vendor at 6.1.
+		// Vendor and ModelID are intentionally EMPTY: confirmed live at Task 6.1
+		// that upstream.verified carries the gateway-RESOLVED upstream identity
+		// (e.g. provider "chutes", model_id "zai-org/GLM-5.2-TEE") for a requested
+		// "z-ai/glm-5.2", and it varies by the attested gateway's routing. The
+		// requested model is already bound via request.received.body_hash, so the
+		// upstream binding is just result == "verified" on the attested gateway.
 		Vendor:            "",
-		ModelID:           model,
+		ModelID:           "",
 		ReqBody:           cleartextReqBody,
 		RespBodyCleartext: opened,
 		RespWireBytes:     wireBytes,
@@ -367,9 +370,11 @@ func (c *Client) Stream(ctx context.Context, req llm.Request) (*llm.StreamReader
 	expect := ReceiptExpect{
 		Endpoint: endpointChat,
 		Method:   methodPost,
-		// Vendor intentionally EMPTY until the live round-trip (Task 6.1) pins it.
+		// Vendor and ModelID intentionally EMPTY (see Invoke): upstream.verified
+		// carries the gateway-resolved upstream identity, which varies by routing;
+		// the requested model is bound via body_hash, so bind on result=="verified".
 		Vendor:            "",
-		ModelID:           model,
+		ModelID:           "",
 		ReqBody:           cleartextReqBody,
 		RespBodyCleartext: nil, // streaming: skip cleartext_hash (wire_hash + E2EE cover it)
 		RespWireBytes:     wireBytes,

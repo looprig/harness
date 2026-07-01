@@ -65,11 +65,21 @@ const (
 	// production trust (blocker #3).
 	defaultPhalaAppID = "fdb7a14e5a6675f752e2cb69c9067a98ca402918"
 
-	// defaultPhalaRepoURL / defaultPhalaRepoCommit are the build provenance.
-	// Verify independently against a published Phala/Dstack source before
-	// production trust (blocker #3).
-	defaultPhalaRepoURL    = "https://github.com/Dstack-TEE/private-ai-gateway.git"
+	// defaultPhalaRepoURL / defaultPhalaRepoCommit* are the build provenance.
+	// TWO commits are accepted: the fixture-audited commit and the currently
+	// deployed commit observed live at Task 6.1. Both attest to the byte-identical
+	// workload_keyset_digest (sha256:46cdea44…) — i.e. the same attested keyset,
+	// app-id, identity key, and KMS root — so the live deployment is the same
+	// workload redeployed at a bumped commit tag, not a different build.
+	// Verify each independently against a published Phala/Dstack source before
+	// production trust (blocker #3), and prune stale commits as the gateway upgrades.
+	defaultPhalaRepoURL = "https://github.com/Dstack-TEE/private-ai-gateway.git"
+	// defaultPhalaRepoCommit is the commit the offline fixture (report_aci1.json)
+	// was captured against.
 	defaultPhalaRepoCommit = "1b43f76e43c2459856faebe9cd97d8e01cb0df0c"
+	// defaultPhalaRepoCommitDeployed is the commit the live gateway reported at
+	// Task 6.1 (2026-07-01); same workload_keyset_digest as the fixture commit.
+	defaultPhalaRepoCommitDeployed = "e776e9cf1f9c2d61730da5d2f4b717e49041da0d"
 
 	// defaultPhalaKMSRoot is the KMS-root public key, compressed-SEC1 hex (Task
 	// 2.7 form). RECOVERED FROM THE FIXTURE custody chain and NOT yet externally
@@ -93,7 +103,8 @@ func DefaultPhalaPolicy() Policy {
 	return Policy{
 		AcceptedWorkloadIDs: map[string]struct{}{},
 		AcceptedSourceProvenance: map[provenanceKey]struct{}{
-			{RepoURL: defaultPhalaRepoURL, RepoCommit: defaultPhalaRepoCommit}: {},
+			{RepoURL: defaultPhalaRepoURL, RepoCommit: defaultPhalaRepoCommit}:         {},
+			{RepoURL: defaultPhalaRepoURL, RepoCommit: defaultPhalaRepoCommitDeployed}: {},
 		},
 		AcceptedAppIDs: map[string]struct{}{
 			defaultPhalaAppID: {},

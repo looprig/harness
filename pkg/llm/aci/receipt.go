@@ -636,11 +636,13 @@ func checkResponseHashes(r *Receipt, expect ReceiptExpect) error {
 
 // checkUpstreamVerified enforces the MANDATORY upstream binding: there must exist
 // an upstream.verified event whose result is "verified", whose model_id equals
-// expect.ModelID, and — when expect.Vendor != "" — whose provider equals
+// expect.ModelID WHEN set, and — when expect.Vendor != "" — whose provider equals
 // expect.Vendor (the design doc's "vendor" maps to the event's provider field).
-// Any miss is fail-closed upstream_unverified. The loop matches the FIRST event
-// that satisfies all required fields, so a failed event does not mask a later
-// verified one.
+// The client passes ModelID == "" and Vendor == "" because the event carries the
+// gateway-resolved upstream identity (which varies by routing), so on an attested
+// gateway a verified upstream event is the binding. Any miss is fail-closed
+// upstream_unverified. The loop matches the FIRST event that satisfies all
+// required fields, so a failed event does not mask a later verified one.
 func checkUpstreamVerified(r *Receipt, expect ReceiptExpect) error {
 	for i := range r.EventLog {
 		ev := &r.EventLog[i]
@@ -666,9 +668,18 @@ func upstreamEventMatches(ev *ReceiptEvent, expect ReceiptExpect) bool {
 	if !ok || result != upstreamResultVerified {
 		return false
 	}
-	modelID, ok := eventField(ev, fieldModelID)
-	if !ok || modelID != expect.ModelID {
-		return false
+	// model_id is matched only when the caller pins one. The event's model_id is
+	// the gateway-RESOLVED upstream model (e.g. "zai-org/GLM-5.2-TEE" via the
+	// "chutes" provider for a requested "z-ai/glm-5.2"), which differs from the
+	// client's requested model and varies by the attested gateway's routing
+	// (confirmed live at Task 6.1). The requested model is already bound via
+	// request.received.body_hash, so on an attested gateway a verified upstream
+	// event is the meaningful binding; the client passes ModelID == "".
+	if expect.ModelID != "" {
+		modelID, ok := eventField(ev, fieldModelID)
+		if !ok || modelID != expect.ModelID {
+			return false
+		}
 	}
 	if expect.Vendor != "" {
 		provider, ok := eventField(ev, fieldProvider)

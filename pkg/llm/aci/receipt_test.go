@@ -897,6 +897,45 @@ func TestVerifyReceiptUpstreamUnverified(t *testing.T) {
 	}
 }
 
+// TestVerifyReceiptUpstreamModelIDEmpty proves the client's real mode (ModelID
+// and Vendor both empty) binds the upstream ONLY on result=="verified": a
+// verified event whose model_id/provider are the gateway-RESOLVED upstream
+// (differing from the requested model, as observed live at Task 6.1) still
+// passes, while a non-verified event still fails closed.
+func TestVerifyReceiptUpstreamModelIDEmpty(t *testing.T) {
+	t.Parallel()
+	respCleartext := []byte("resp-cleartext")
+	respWire := []byte("resp-wire")
+
+	build := func(t *testing.T, result string) ([]byte, VerifiedReport, ReceiptExpect) {
+		t.Helper()
+		vr, priv, keyID := synthVerifiedReport(t)
+		p := validReceiptParams(t, vr, synthReqBody, respCleartext, respWire, synthProvider, synthModelID)
+		// Gateway-resolved upstream identity, different from the requested model.
+		p.upstreamModelID = "zai-org/GLM-5.2-TEE"
+		p.upstreamProvider = "chutes"
+		p.upstreamResult = result
+		receiptJSON := buildSignedReceipt(t, p, keyID, priv)
+		e := synthExpect(p.reqBodyCompact, respCleartext, respWire)
+		e.ModelID = ""
+		e.Vendor = ""
+		return receiptJSON, vr, e
+	}
+
+	t.Run("verified upstream passes despite resolved model_id", func(t *testing.T) {
+		t.Parallel()
+		receiptJSON, vr, expect := build(t, "verified")
+		if err := VerifyReceipt(receiptJSON, &vr, expect); err != nil {
+			t.Fatalf("VerifyReceipt with empty ModelID/Vendor = %v, want nil", err)
+		}
+	})
+	t.Run("failed upstream still rejected", func(t *testing.T) {
+		t.Parallel()
+		receiptJSON, vr, expect := build(t, "failed")
+		requireUpstreamUnverified(t, VerifyReceipt(receiptJSON, &vr, expect))
+	})
+}
+
 // dstackRSV signs sha256(message) recoverably and reorders decred's v-first
 // compact [27+recid]‖r‖s into the Dstack v-last r‖s‖v (v = recid 0-3) layout.
 func dstackRSV(t *testing.T, priv *secp256k1.PrivateKey, message []byte) []byte {
