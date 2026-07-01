@@ -331,6 +331,9 @@ func (c *PermissionChecker) containAndHardDeny(rawPath string, deniedGlobs []str
 	// home here can never disable an enforceable ~/ deny — fail-secure by invariant.
 	home := c.home
 	for _, pat := range deniedGlobs {
+		if strings.HasPrefix(pat, "~/") && home == "" {
+			return loop.EffectDeny, boundaryDenied // defensive fail-closed (see DeniedRead).
+		}
 		if matchHardDenyAbs(pat, abs, home) {
 			return loop.EffectDeny, boundaryDenied // Stage 2.
 		}

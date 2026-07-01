@@ -78,3 +78,38 @@ func TestNewPermissionChecker_HomeResolvedOnce(t *testing.T) {
 		t.Errorf("home = %q, want /home/tester", c.home)
 	}
 }
+
+func TestDeniedRead_HomeResolvedAtConstruction(t *testing.T) {
+	t.Parallel()
+	c, err := NewPermissionChecker(
+		PermissionPolicy{HardDeny: HardDenyRules{DeniedReadPaths: []string{"~/.ssh/**"}}},
+		WithHomeDir(func() (string, error) { return "/home/tester", nil }),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !c.DeniedRead("/home/tester/.ssh/id_rsa") {
+		t.Errorf("~/.ssh/** must deny /home/tester/.ssh/id_rsa")
+	}
+	if c.DeniedRead("/home/tester/project/main.go") {
+		t.Errorf("non-secret path must not be denied")
+	}
+}
+
+func TestDeniedRead_DefensiveFailClosed_EmptyHome(t *testing.T) {
+	t.Parallel()
+	// Constructed with a NON-home policy so construction succeeds with home="",
+	// then a ~/ read pattern is present -> defensive deny (backstop; should not
+	// occur post-construction, but must fail closed if it ever does).
+	c, err := NewPermissionChecker(
+		PermissionPolicy{HardDeny: HardDenyRules{DeniedReadPaths: []string{"**/.env"}}},
+		WithHomeDir(func() (string, error) { return "", errors.New("no home") }),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.policy.HardDeny.DeniedReadPaths = append(c.policy.HardDeny.DeniedReadPaths, "~/.ssh/**")
+	if !c.DeniedRead("/anything/.ssh/id_rsa") {
+		t.Errorf("empty home + ~/ pattern must fail CLOSED (deny)")
+	}
+}

@@ -311,6 +311,12 @@ func (c *PermissionChecker) DeniedRead(absPath string) bool {
 	c.mu.Unlock()
 
 	for _, pat := range denied {
+		if strings.HasPrefix(pat, "~/") && home == "" {
+			// Defensive backstop: a ~/ pattern with no resolved home cannot be
+			// matched, so fail CLOSED (deny) rather than no-match (fail-open).
+			// Construction (Task 2) normally prevents this state.
+			return true
+		}
 		if matchHardDenyAbs(pat, absPath, home) {
 			return true
 		}
