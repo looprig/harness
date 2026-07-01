@@ -183,9 +183,10 @@ func TestFingerprintWithForeignFields(t *testing.T) {
 
 	cfg := fpConfig("model-x", "prompt", "Read")
 	base := ConfigFingerprintFields{
-		WorkspaceRoot: "/work/foreign",
-		AdapterID:     "claude",
-		Posture:       "default",
+		WorkspaceRoot:             "/work/foreign",
+		AdapterID:                 "claude",
+		Posture:                   "default",
+		NativePermissionPolicyRev: "policyrev-aaa",
 	}
 	baseFP := fingerprintWith(cfg, base)
 
@@ -199,6 +200,9 @@ func TestFingerprintWithForeignFields(t *testing.T) {
 	if baseFP.PermissionPosture != base.Posture {
 		t.Errorf("PermissionPosture = %q, want %q", baseFP.PermissionPosture, base.Posture)
 	}
+	if baseFP.NativePermissionPolicyRev != base.NativePermissionPolicyRev {
+		t.Errorf("NativePermissionPolicyRev = %q, want %q", baseFP.NativePermissionPolicyRev, base.NativePermissionPolicyRev)
+	}
 
 	diffCwd := base
 	diffCwd.WorkspaceRoot = "/work/other"
@@ -206,6 +210,8 @@ func TestFingerprintWithForeignFields(t *testing.T) {
 	diffAdapter.AdapterID = "codex"
 	diffPosture := base
 	diffPosture.Posture = "acceptEdits"
+	diffPolicyRev := base
+	diffPolicyRev.NativePermissionPolicyRev = "policyrev-bbb"
 
 	tests := []struct {
 		name      string
@@ -216,6 +222,7 @@ func TestFingerprintWithForeignFields(t *testing.T) {
 		{"cwd (WorkspaceRoot) differs", diffCwd, false},
 		{"AdapterID differs", diffAdapter, false},
 		{"Posture differs", diffPosture, false},
+		{"NativePermissionPolicyRev differs", diffPolicyRev, false},
 	}
 	for _, tt := range tests {
 		tt := tt

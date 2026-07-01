@@ -56,6 +56,8 @@ type HardApproveRules struct {
 // denied regardless of persisted approvals, session policies, or an
 // EffectChecker. Path entries are globs matched by MatchFileGlob; Bash entries
 // are normalized command prefixes.
+//
+// NOTE: any field added here that affects enforcement MUST be represented in PolicyFingerprint (policyrev.go), or a durable session could restore under a drifted policy.
 type HardDenyRules struct {
 	// DeniedReadPaths globs that ReadFile/Glob/Grep may never read (secrets).
 	DeniedReadPaths []string
@@ -98,6 +100,8 @@ type ApprovalsFile struct {
 // PermissionChecker evaluates against. WorkspaceRoot is the resolved root for
 // containment + path relativisation; Policies holds session-scope ToolPolicy
 // grants (extended in place by a ScopeSession Grant).
+//
+// NOTE: any field added here that affects enforcement MUST be represented in PolicyFingerprint (policyrev.go), or a durable session could restore under a drifted policy.
 type PermissionPolicy struct {
 	WorkspaceRoot string
 	HardApprove   HardApproveRules

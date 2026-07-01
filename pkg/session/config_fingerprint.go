@@ -37,6 +37,11 @@ type ConfigFingerprintFields struct {
 	// Posture is the foreign agent's non-interactive permission posture string the
 	// composition root injects (e.g. "default", "acceptEdits"). Empty for a native session.
 	Posture string
+	// NativePermissionPolicyRev is the content digest of the NATIVE permission
+	// configuration (allowlist + hard-deny lists + MaxReadBytes + headless mode bits),
+	// computed by tools.PolicyFingerprint at the composition root and injected. Empty
+	// for a foreign session (which uses Posture) or a caller that does not inject it.
+	NativePermissionPolicyRev string
 }
 
 // FingerprintFrom derives the stable config fingerprint a session stamps onto its
@@ -78,6 +83,7 @@ func fingerprintWith(cfg loop.Config, fields ConfigFingerprintFields) event.Conf
 	fpr.WorkspaceRoot = fields.WorkspaceRoot
 	fpr.AgentAdapter = fields.AdapterID
 	fpr.PermissionPosture = fields.Posture
+	fpr.NativePermissionPolicyRev = fields.NativePermissionPolicyRev
 	return fpr
 }
 

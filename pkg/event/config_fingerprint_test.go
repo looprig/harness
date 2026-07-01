@@ -79,6 +79,25 @@ func TestConfigFingerprintEqual(t *testing.T) {
 	}
 }
 
+// TestConfigFingerprint_NativePermissionPolicyRev asserts the native permission
+// policy digest field participates in Equal: two records that differ only in it are
+// not Equal, two that share it are, and it evolves additively (empty vs empty Equal).
+func TestConfigFingerprint_NativePermissionPolicyRev(t *testing.T) {
+	t.Parallel()
+	a := event.ConfigFingerprint{NativePermissionPolicyRev: "aaa"}
+	b := event.ConfigFingerprint{NativePermissionPolicyRev: "bbb"}
+	if a.Equal(b) {
+		t.Errorf("different NativePermissionPolicyRev must not be Equal")
+	}
+	if !a.Equal(event.ConfigFingerprint{NativePermissionPolicyRev: "aaa"}) {
+		t.Errorf("same NativePermissionPolicyRev must be Equal")
+	}
+	// Additive/omitzero: an old record (empty) equals a current record that also leaves it empty.
+	if !(event.ConfigFingerprint{}).Equal(event.ConfigFingerprint{}) {
+		t.Errorf("empty fingerprints must be Equal")
+	}
+}
+
 // TestConfigFingerprintJSONRoundTrip asserts a ConfigFingerprint survives a JSON
 // round-trip with snake_case keys, and that a zero fingerprint omits every field
 // (omitzero) so an empty fingerprint adds nothing to the SessionStarted journal

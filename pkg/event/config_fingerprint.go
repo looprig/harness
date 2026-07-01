@@ -50,6 +50,13 @@ type ConfigFingerprint struct {
 	// under (e.g. "default", "acceptEdits"). Empty for a native session. A change in
 	// posture is a behavior change that must not resume unnoticed.
 	PermissionPosture string `json:"permission_posture,omitzero"`
+	// NativePermissionPolicyRev is a content digest (hex sha256) of the NATIVE
+	// permission configuration (allowlist + hard-deny lists + MaxReadBytes + the
+	// headless mode bits), computed by tools.PolicyFingerprint at the composition
+	// root and injected. Empty for a foreign session (which uses PermissionPosture)
+	// or a caller that does not inject it. A change is a behavior change that must
+	// not resume unnoticed.
+	NativePermissionPolicyRev string `json:"native_permission_policy_rev,omitzero"`
 }
 
 // Equal reports whether two fingerprints identify the same configuration: true iff
@@ -64,5 +71,6 @@ func (f ConfigFingerprint) Equal(other ConfigFingerprint) bool {
 		f.RuntimeSkills == other.RuntimeSkills &&
 		f.WorkspaceRoot == other.WorkspaceRoot &&
 		f.AgentAdapter == other.AgentAdapter &&
-		f.PermissionPosture == other.PermissionPosture
+		f.PermissionPosture == other.PermissionPosture &&
+		f.NativePermissionPolicyRev == other.NativePermissionPolicyRev
 }
