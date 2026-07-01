@@ -76,8 +76,10 @@ func TestGrantTightensAllAncestorDirs(t *testing.T) {
 				t.Fatalf("stat home before: %v", err)
 			}
 
-			pc := NewPermissionChecker(PermissionPolicy{WorkspaceRoot: ws, HardDeny: DefaultHardDeny()})
-			pc.SetHomeDir(func() (string, error) { return home, nil })
+			pc, err := NewPermissionChecker(PermissionPolicy{WorkspaceRoot: ws, HardDeny: DefaultHardDeny()}, WithHomeDir(func() (string, error) { return home, nil }))
+			if err != nil {
+				t.Fatalf("NewPermissionChecker: %v", err)
+			}
 
 			if err := pc.Grant(context.Background(), "ReadFile", `{"path":"main.go"}`, tool.ScopeWorkspace); err != nil {
 				t.Fatalf("Grant(ScopeWorkspace): %v", err)
@@ -201,8 +203,10 @@ func TestGrantTightenAncestorFailsSecure(t *testing.T) {
 		_ = os.Chmod(looprig, 0o700)
 	})
 
-	pc := NewPermissionChecker(PermissionPolicy{WorkspaceRoot: ws, HardDeny: DefaultHardDeny()})
-	pc.SetHomeDir(func() (string, error) { return home, nil })
+	pc, err := NewPermissionChecker(PermissionPolicy{WorkspaceRoot: ws, HardDeny: DefaultHardDeny()}, WithHomeDir(func() (string, error) { return home, nil }))
+	if err != nil {
+		t.Fatalf("NewPermissionChecker: %v", err)
+	}
 
 	grantErr := pc.Grant(context.Background(), "ReadFile", `{"path":"main.go"}`, tool.ScopeWorkspace)
 	if grantErr == nil {

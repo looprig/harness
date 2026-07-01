@@ -132,11 +132,13 @@ func TestCheckContainment(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			pc := NewPermissionChecker(PermissionPolicy{
+			pc, err := NewPermissionChecker(PermissionPolicy{
 				WorkspaceRoot: ws,
 				HardDeny:      DefaultHardDeny(),
-			})
-			pc.SetHomeDir(func() (string, error) { return t.TempDir(), nil })
+			}, WithHomeDir(func() (string, error) { return t.TempDir(), nil }))
+			if err != nil {
+				t.Fatalf("NewPermissionChecker: %v", err)
+			}
 			got := pc.Check(context.Background(), plainTool{name: tt.toolName}, tt.toolName, tt.args)
 			if got != tt.want {
 				t.Errorf("Check() = %v, want %v", got, tt.want)
@@ -156,8 +158,10 @@ func TestCheckContainmentSymlinkEscape(t *testing.T) {
 	if err := os.Symlink(outside, link); err != nil {
 		t.Fatalf("symlink: %v", err)
 	}
-	pc := NewPermissionChecker(PermissionPolicy{WorkspaceRoot: ws, HardDeny: DefaultHardDeny()})
-	pc.SetHomeDir(func() (string, error) { return t.TempDir(), nil })
+	pc, err := NewPermissionChecker(PermissionPolicy{WorkspaceRoot: ws, HardDeny: DefaultHardDeny()}, WithHomeDir(func() (string, error) { return t.TempDir(), nil }))
+	if err != nil {
+		t.Fatalf("NewPermissionChecker: %v", err)
+	}
 	got := pc.Check(context.Background(), plainTool{name: "ReadFile"}, "ReadFile", `{"path":"escape/secret"}`)
 	if got != loop.EffectDeny {
 		t.Errorf("symlink escape Check() = %v, want EffectDeny", got)
@@ -202,9 +206,11 @@ func TestCheckHardDenyBeatsEverything(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			pc := NewPermissionChecker(tt.pol)
 			_, homeFn := fakeHome(t, ws, tt.ws, tt.user)
-			pc.SetHomeDir(homeFn)
+			pc, err := NewPermissionChecker(tt.pol, WithHomeDir(homeFn))
+			if err != nil {
+				t.Fatalf("NewPermissionChecker: %v", err)
+			}
 			got := pc.Check(context.Background(), tt.t, "ReadFile", `{"path":".env"}`)
 			if got != loop.EffectDeny {
 				t.Errorf("Check() = %v, want EffectDeny (hard-deny must beat approval)", got)
@@ -234,12 +240,14 @@ func TestCheckHardDenyBash(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			pc := NewPermissionChecker(PermissionPolicy{
+			pc, err := NewPermissionChecker(PermissionPolicy{
 				WorkspaceRoot: ws,
 				HardDeny:      DefaultHardDeny(),
 				HardApprove:   HardApproveRules{Tools: []string{wildcardTool}},
-			})
-			pc.SetHomeDir(func() (string, error) { return t.TempDir(), nil })
+			}, WithHomeDir(func() (string, error) { return t.TempDir(), nil }))
+			if err != nil {
+				t.Fatalf("NewPermissionChecker: %v", err)
+			}
 			args, _ := json.Marshal(map[string]string{"command": tt.cmd})
 			got := pc.Check(context.Background(), plainTool{name: "Bash"}, "Bash", string(args))
 			if got != tt.want {
@@ -364,9 +372,11 @@ func TestCheckStages(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			pc := NewPermissionChecker(tt.pol)
 			_, homeFn := fakeHome(t, ws, tt.ws, tt.user)
-			pc.SetHomeDir(homeFn)
+			pc, err := NewPermissionChecker(tt.pol, WithHomeDir(homeFn))
+			if err != nil {
+				t.Fatalf("NewPermissionChecker: %v", err)
+			}
 			got := pc.Check(context.Background(), tt.tl, tt.toolName, tt.args)
 			if got != tt.want {
 				t.Errorf("Check() = %v, want %v", got, tt.want)
@@ -419,9 +429,11 @@ func TestCheckDenyBeatsAllow(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			pc := NewPermissionChecker(PermissionPolicy{WorkspaceRoot: ws, HardDeny: DefaultHardDeny()})
 			_, homeFn := fakeHome(t, ws, tt.ws, tt.user)
-			pc.SetHomeDir(homeFn)
+			pc, err := NewPermissionChecker(PermissionPolicy{WorkspaceRoot: ws, HardDeny: DefaultHardDeny()}, WithHomeDir(homeFn))
+			if err != nil {
+				t.Fatalf("NewPermissionChecker: %v", err)
+			}
 			got := pc.Check(context.Background(), plainTool{name: "ReadFile"}, "ReadFile", `{"path":"main.go"}`)
 			if got != tt.want {
 				t.Errorf("Check() = %v, want %v", got, tt.want)
@@ -461,9 +473,11 @@ func TestCheckMalformedApprovals(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			pc := NewPermissionChecker(PermissionPolicy{WorkspaceRoot: ws, HardDeny: DefaultHardDeny()})
 			_, homeFn := fakeHome(t, ws, tt.ws, nil)
-			pc.SetHomeDir(homeFn)
+			pc, err := NewPermissionChecker(PermissionPolicy{WorkspaceRoot: ws, HardDeny: DefaultHardDeny()}, WithHomeDir(homeFn))
+			if err != nil {
+				t.Fatalf("NewPermissionChecker: %v", err)
+			}
 			got := pc.Check(context.Background(), plainTool{name: "ReadFile"}, "ReadFile", `{"path":"main.go"}`)
 			if got != tt.want {
 				t.Errorf("Check() = %v, want %v", got, tt.want)
@@ -491,9 +505,11 @@ func TestCheckMalformedApprovalsWarns(t *testing.T) {
 	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
 	t.Cleanup(func() { slog.SetDefault(prev) })
 
-	pc := NewPermissionChecker(PermissionPolicy{WorkspaceRoot: ws, HardDeny: DefaultHardDeny()})
 	_, homeFn := fakeHome(t, ws, corrupt, nil)
-	pc.SetHomeDir(homeFn)
+	pc, err := NewPermissionChecker(PermissionPolicy{WorkspaceRoot: ws, HardDeny: DefaultHardDeny()}, WithHomeDir(homeFn))
+	if err != nil {
+		t.Fatalf("NewPermissionChecker: %v", err)
+	}
 
 	got := pc.Check(context.Background(), plainTool{name: "ReadFile"}, "ReadFile", `{"path":"main.go"}`)
 	if got != loop.EffectAsk {
@@ -536,9 +552,11 @@ func TestCheckSkippedRecordsWarn(t *testing.T) {
 	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
 	t.Cleanup(func() { slog.SetDefault(prev) })
 
-	pc := NewPermissionChecker(PermissionPolicy{WorkspaceRoot: ws, HardDeny: DefaultHardDeny()})
 	_, homeFn := fakeHome(t, ws, skipped, nil)
-	pc.SetHomeDir(homeFn)
+	pc, err := NewPermissionChecker(PermissionPolicy{WorkspaceRoot: ws, HardDeny: DefaultHardDeny()}, WithHomeDir(homeFn))
+	if err != nil {
+		t.Fatalf("NewPermissionChecker: %v", err)
+	}
 
 	// The valid allow record must still apply (skip is fail-secure, not fatal).
 	got := pc.Check(context.Background(), plainTool{name: "ReadFile"}, "ReadFile", `{"path":"main.go"}`)
@@ -579,11 +597,13 @@ func TestCheckInRepoApprovalsIgnored(t *testing.T) {
 		t.Fatalf("write in-repo approvals: %v", err)
 	}
 
-	pc := NewPermissionChecker(PermissionPolicy{WorkspaceRoot: ws, HardDeny: DefaultHardDeny()})
 	// Fake home is EMPTY (no out-of-repo approvals), so the only approvals on disk
 	// are the in-repo hostile ones — which must be ignored.
 	_, homeFn := fakeHome(t, ws, nil, nil)
-	pc.SetHomeDir(homeFn)
+	pc, err := NewPermissionChecker(PermissionPolicy{WorkspaceRoot: ws, HardDeny: DefaultHardDeny()}, WithHomeDir(homeFn))
+	if err != nil {
+		t.Fatalf("NewPermissionChecker: %v", err)
+	}
 	got := pc.Check(context.Background(), plainTool{name: "ReadFile"}, "ReadFile", `{"path":"main.go"}`)
 	if got != loop.EffectAsk {
 		t.Errorf("Check() = %v, want EffectAsk (in-repo approvals must be ignored)", got)
@@ -598,8 +618,19 @@ func TestCheckMissingHomeFailsSecure(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(ws, "main.go"), []byte("package main"), 0o600); err != nil {
 		t.Fatalf("write main.go: %v", err)
 	}
-	pc := NewPermissionChecker(PermissionPolicy{WorkspaceRoot: ws, HardDeny: DefaultHardDeny()})
-	pc.SetHomeDir(func() (string, error) { return "", os.ErrNotExist })
+	// With the fallible constructor, an unresolvable home WHILE a "~/…" pattern is
+	// configured is a CONSTRUCTION error (covered by
+	// TestNewPermissionChecker_HomeUnresolvable). To still exercise the RUNTIME
+	// persisted-stage fail-secure path this test cares about, use a policy with NO
+	// "~/…" pattern: construction then succeeds with home=="", and the persisted
+	// stage must still contribute nothing → Ask (never auto-approve without a home).
+	pc, err := NewPermissionChecker(
+		PermissionPolicy{WorkspaceRoot: ws, HardDeny: HardDenyRules{DeniedReadPaths: []string{"**/.env"}}},
+		WithHomeDir(func() (string, error) { return "", os.ErrNotExist }),
+	)
+	if err != nil {
+		t.Fatalf("NewPermissionChecker: %v", err)
+	}
 	got := pc.Check(context.Background(), plainTool{name: "ReadFile"}, "ReadFile", `{"path":"main.go"}`)
 	if got != loop.EffectAsk {
 		t.Errorf("Check() = %v, want EffectAsk when home dir unresolvable", got)
@@ -629,8 +660,10 @@ func TestCheckUnknownToolWithPathFailsSecure(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			pc := NewPermissionChecker(PermissionPolicy{WorkspaceRoot: ws, HardDeny: DefaultHardDeny()})
-			pc.SetHomeDir(func() (string, error) { return t.TempDir(), nil })
+			pc, err := NewPermissionChecker(PermissionPolicy{WorkspaceRoot: ws, HardDeny: DefaultHardDeny()}, WithHomeDir(func() (string, error) { return t.TempDir(), nil }))
+			if err != nil {
+				t.Fatalf("NewPermissionChecker: %v", err)
+			}
 			got := pc.Check(context.Background(), plainTool{name: "MysteryTool"}, "MysteryTool", tt.args)
 			if got != tt.want {
 				t.Errorf("Check() = %v, want %v", got, tt.want)
@@ -659,12 +692,14 @@ func TestCheckMalformedArgsFailSecure(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			pc := NewPermissionChecker(PermissionPolicy{
+			pc, err := NewPermissionChecker(PermissionPolicy{
 				WorkspaceRoot: ws,
 				HardDeny:      DefaultHardDeny(),
 				HardApprove:   HardApproveRules{Tools: []string{wildcardTool}},
-			})
-			pc.SetHomeDir(func() (string, error) { return t.TempDir(), nil })
+			}, WithHomeDir(func() (string, error) { return t.TempDir(), nil }))
+			if err != nil {
+				t.Fatalf("NewPermissionChecker: %v", err)
+			}
 			got := pc.Check(context.Background(), plainTool{name: tt.toolName}, tt.toolName, tt.args)
 			if got != tt.want {
 				t.Errorf("Check() = %v, want %v", got, tt.want)
@@ -678,14 +713,16 @@ func TestCheckMalformedArgsFailSecure(t *testing.T) {
 func TestReadGuard(t *testing.T) {
 	t.Parallel()
 	home := "/home/tester"
-	pc := NewPermissionChecker(PermissionPolicy{
+	pc, err := NewPermissionChecker(PermissionPolicy{
 		WorkspaceRoot: "/ws",
 		HardDeny: HardDenyRules{
 			DeniedReadPaths: []string{"~/.ssh/**", "**/.env", "**/*.pem", "**/id_rsa", "~/.looprig/**"},
 			MaxReadBytes:    4096,
 		},
-	})
-	pc.SetHomeDir(func() (string, error) { return home, nil })
+	}, WithHomeDir(func() (string, error) { return home, nil }))
+	if err != nil {
+		t.Fatalf("NewPermissionChecker: %v", err)
+	}
 
 	tests := []struct {
 		name    string
@@ -766,9 +803,11 @@ func TestCheckConcurrent(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(ws, "main.go"), []byte("package main"), 0o600); err != nil {
 		t.Fatalf("write main.go: %v", err)
 	}
-	pc := NewPermissionChecker(PermissionPolicy{WorkspaceRoot: ws, HardDeny: DefaultHardDeny()})
 	_, homeFn := fakeHome(t, ws, nil, nil)
-	pc.SetHomeDir(homeFn)
+	pc, err := NewPermissionChecker(PermissionPolicy{WorkspaceRoot: ws, HardDeny: DefaultHardDeny()}, WithHomeDir(homeFn))
+	if err != nil {
+		t.Fatalf("NewPermissionChecker: %v", err)
+	}
 
 	var wg sync.WaitGroup
 	// Readers: concurrent Check calls.

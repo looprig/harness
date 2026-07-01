@@ -114,12 +114,14 @@ func TestIntegrationSymlinkedPolicyDirRejected(t *testing.T) {
 			home := t.TempDir()
 			decoy := tt.linkComponent(t, home, ws)
 
-			pc := NewPermissionChecker(PermissionPolicy{WorkspaceRoot: ws, HardDeny: DefaultHardDeny()})
-			pc.SetHomeDir(func() (string, error) { return home, nil })
+			pc, err := NewPermissionChecker(PermissionPolicy{WorkspaceRoot: ws, HardDeny: DefaultHardDeny()}, WithHomeDir(func() (string, error) { return home, nil }))
+			if err != nil {
+				t.Fatalf("NewPermissionChecker: %v", err)
+			}
 
 			// WRITE PATH: Grant must refuse (typed error) and write nothing through
 			// the symlink (the decoy must stay empty of an approvals.json).
-			err := pc.Grant(context.Background(), "ReadFile", `{"path":"main.go"}`, tool.ScopeWorkspace)
+			err = pc.Grant(context.Background(), "ReadFile", `{"path":"main.go"}`, tool.ScopeWorkspace)
 			if err == nil {
 				t.Fatal("Grant through a symlinked policy dir = nil, want a typed *PolicyStoreError")
 			}
@@ -185,8 +187,10 @@ func TestIntegrationWorldWritableFileRejected(t *testing.T) {
 		t.Fatalf("chmod: %v", err)
 	}
 
-	pc := NewPermissionChecker(PermissionPolicy{WorkspaceRoot: ws, HardDeny: DefaultHardDeny()})
-	pc.SetHomeDir(func() (string, error) { return home, nil })
+	pc, err := NewPermissionChecker(PermissionPolicy{WorkspaceRoot: ws, HardDeny: DefaultHardDeny()}, WithHomeDir(func() (string, error) { return home, nil }))
+	if err != nil {
+		t.Fatalf("NewPermissionChecker: %v", err)
+	}
 
 	got := pc.Check(context.Background(), plainTool{name: "ReadFile"}, "ReadFile", `{"path":"main.go"}`)
 	if got != loop.EffectAsk {
@@ -205,8 +209,10 @@ func TestIntegrationDenyBeatsAllowTwoRealFiles(t *testing.T) {
 	}
 	home := t.TempDir()
 
-	pc := NewPermissionChecker(PermissionPolicy{WorkspaceRoot: ws, HardDeny: DefaultHardDeny()})
-	pc.SetHomeDir(func() (string, error) { return home, nil })
+	pc, err := NewPermissionChecker(PermissionPolicy{WorkspaceRoot: ws, HardDeny: DefaultHardDeny()}, WithHomeDir(func() (string, error) { return home, nil }))
+	if err != nil {
+		t.Fatalf("NewPermissionChecker: %v", err)
+	}
 
 	// Workspace ALLOW via the real Grant write path.
 	if err := pc.Grant(context.Background(), "ReadFile", `{"path":"main.go"}`, tool.ScopeWorkspace); err != nil {

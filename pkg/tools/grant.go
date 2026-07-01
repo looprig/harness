@@ -114,19 +114,17 @@ func (c *PermissionChecker) grantWorkspace(ctx context.Context, toolName, match 
 	return writeApprovalsFileAtomically(dir, finalPath, af)
 }
 
-// resolveHomeForWrite resolves the home dir via the seam for a WRITE. Unlike the
-// read path (which fails open to "store absent"), a Grant that cannot resolve home
-// must fail with a typed error — there is nowhere safe to write.
+// resolveHomeForWrite returns the construction-time-resolved home dir for a WRITE.
+// Unlike the read path (which fails open to "store absent"), a Grant that has no
+// resolved home must fail with a typed error — there is nowhere safe to write. An
+// empty home means resolution failed at construction (and no ~/ pattern needed it,
+// else construction itself would have failed with *HomeUnresolvableError).
 func (c *PermissionChecker) resolveHomeForWrite() (string, error) {
 	c.mu.Lock()
-	homeFn := c.homeDir
+	home := c.home
 	c.mu.Unlock()
-	if homeFn == nil {
-		return "", &PolicyStoreError{Path: "", Reason: "home dir resolver is nil"}
-	}
-	home, err := homeFn()
-	if err != nil {
-		return "", &PolicyStoreError{Path: "", Reason: "home dir could not be resolved for grant", Err: err}
+	if home == "" {
+		return "", &PolicyStoreError{Path: "", Reason: "home dir could not be resolved for grant"}
 	}
 	return home, nil
 }

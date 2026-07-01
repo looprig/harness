@@ -103,11 +103,13 @@ func TestDefaultHardDenyWriteSupersetsRead(t *testing.T) {
 // fixed home so the ~/ globs cannot accidentally match the /ws candidates.
 func TestDeniedReadWorkspaceSkills(t *testing.T) {
 	t.Parallel()
-	pc := NewPermissionChecker(PermissionPolicy{
+	pc, err := NewPermissionChecker(PermissionPolicy{
 		WorkspaceRoot: "/ws",
 		HardDeny:      DefaultHardDeny(),
-	})
-	pc.SetHomeDir(func() (string, error) { return "/home/tester", nil })
+	}, WithHomeDir(func() (string, error) { return "/home/tester", nil }))
+	if err != nil {
+		t.Fatalf("NewPermissionChecker: %v", err)
+	}
 
 	tests := []struct {
 		name    string

@@ -56,8 +56,10 @@ func TestGrantWorkspaceWritesOutOfRepo(t *testing.T) {
 	}
 	home := t.TempDir()
 
-	pc := NewPermissionChecker(PermissionPolicy{WorkspaceRoot: ws, HardDeny: DefaultHardDeny()})
-	pc.SetHomeDir(func() (string, error) { return home, nil })
+	pc, err := NewPermissionChecker(PermissionPolicy{WorkspaceRoot: ws, HardDeny: DefaultHardDeny()}, WithHomeDir(func() (string, error) { return home, nil }))
+	if err != nil {
+		t.Fatalf("NewPermissionChecker: %v", err)
+	}
 
 	if err := pc.Grant(context.Background(), "ReadFile", `{"path":"main.go"}`, tool.ScopeWorkspace); err != nil {
 		t.Fatalf("Grant(ScopeWorkspace): %v", err)
@@ -123,8 +125,10 @@ func TestGrantSessionHonoredByCheck(t *testing.T) {
 	}
 	home := t.TempDir()
 
-	pc := NewPermissionChecker(PermissionPolicy{WorkspaceRoot: ws, HardDeny: DefaultHardDeny()})
-	pc.SetHomeDir(func() (string, error) { return home, nil })
+	pc, err := NewPermissionChecker(PermissionPolicy{WorkspaceRoot: ws, HardDeny: DefaultHardDeny()}, WithHomeDir(func() (string, error) { return home, nil }))
+	if err != nil {
+		t.Fatalf("NewPermissionChecker: %v", err)
+	}
 
 	if err := pc.Grant(context.Background(), "ReadFile", `{"path":"main.go"}`, tool.ScopeSession); err != nil {
 		t.Fatalf("Grant(ScopeSession): %v", err)
@@ -148,10 +152,12 @@ func TestGrantOnceIsNotPersisted(t *testing.T) {
 	t.Parallel()
 	ws := newWS(t)
 	home := t.TempDir()
-	pc := NewPermissionChecker(PermissionPolicy{WorkspaceRoot: ws, HardDeny: DefaultHardDeny()})
-	pc.SetHomeDir(func() (string, error) { return home, nil })
+	pc, err := NewPermissionChecker(PermissionPolicy{WorkspaceRoot: ws, HardDeny: DefaultHardDeny()}, WithHomeDir(func() (string, error) { return home, nil }))
+	if err != nil {
+		t.Fatalf("NewPermissionChecker: %v", err)
+	}
 
-	err := pc.Grant(context.Background(), "ReadFile", `{"path":"main.go"}`, tool.ScopeOnce)
+	err = pc.Grant(context.Background(), "ReadFile", `{"path":"main.go"}`, tool.ScopeOnce)
 	if err == nil {
 		t.Fatal("Grant(ScopeOnce) = nil, want a typed error (must not persist)")
 	}
@@ -175,10 +181,12 @@ func TestGrantUnknownScopeRejected(t *testing.T) {
 	t.Parallel()
 	ws := newWS(t)
 	home := t.TempDir()
-	pc := NewPermissionChecker(PermissionPolicy{WorkspaceRoot: ws, HardDeny: DefaultHardDeny()})
-	pc.SetHomeDir(func() (string, error) { return home, nil })
+	pc, err := NewPermissionChecker(PermissionPolicy{WorkspaceRoot: ws, HardDeny: DefaultHardDeny()}, WithHomeDir(func() (string, error) { return home, nil }))
+	if err != nil {
+		t.Fatalf("NewPermissionChecker: %v", err)
+	}
 
-	err := pc.Grant(context.Background(), "ReadFile", `{"path":"main.go"}`, tool.ApprovalScope(99))
+	err = pc.Grant(context.Background(), "ReadFile", `{"path":"main.go"}`, tool.ApprovalScope(99))
 	var scopeErr *UnsupportedScopeError
 	if !errors.As(err, &scopeErr) {
 		t.Errorf("Grant(unknown scope) error = %T, want *UnsupportedScopeError", err)
@@ -238,8 +246,10 @@ func TestGrantMatchDerivation(t *testing.T) {
 				t.Fatalf("mkdir src: %v", err)
 			}
 			home := t.TempDir()
-			pc := NewPermissionChecker(PermissionPolicy{WorkspaceRoot: ws, HardDeny: DefaultHardDeny()})
-			pc.SetHomeDir(func() (string, error) { return home, nil })
+			pc, err := NewPermissionChecker(PermissionPolicy{WorkspaceRoot: ws, HardDeny: DefaultHardDeny()}, WithHomeDir(func() (string, error) { return home, nil }))
+			if err != nil {
+				t.Fatalf("NewPermissionChecker: %v", err)
+			}
 
 			if err := pc.Grant(context.Background(), tt.toolName, tt.argsJSON, tool.ScopeWorkspace); err != nil {
 				t.Fatalf("Grant: %v", err)
@@ -268,8 +278,10 @@ func TestGrantAppendsDoesNotClobber(t *testing.T) {
 	t.Parallel()
 	ws := newWS(t)
 	home := t.TempDir()
-	pc := NewPermissionChecker(PermissionPolicy{WorkspaceRoot: ws, HardDeny: DefaultHardDeny()})
-	pc.SetHomeDir(func() (string, error) { return home, nil })
+	pc, err := NewPermissionChecker(PermissionPolicy{WorkspaceRoot: ws, HardDeny: DefaultHardDeny()}, WithHomeDir(func() (string, error) { return home, nil }))
+	if err != nil {
+		t.Fatalf("NewPermissionChecker: %v", err)
+	}
 
 	if err := pc.Grant(context.Background(), "Bash", `{"command":"go test ./..."}`, tool.ScopeWorkspace); err != nil {
 		t.Fatalf("first Grant: %v", err)
@@ -296,10 +308,22 @@ func TestGrantAppendsDoesNotClobber(t *testing.T) {
 func TestGrantWorkspaceHomeUnresolvableFailsSecure(t *testing.T) {
 	t.Parallel()
 	ws := newWS(t)
-	pc := NewPermissionChecker(PermissionPolicy{WorkspaceRoot: ws, HardDeny: DefaultHardDeny()})
-	pc.SetHomeDir(func() (string, error) { return "", os.ErrNotExist })
+	// With the fallible constructor, an unresolvable home WHILE a "~/…" pattern is
+	// configured is a CONSTRUCTION error (covered by
+	// TestNewPermissionChecker_HomeUnresolvable). To still exercise the RUNTIME
+	// grant-WRITE fail-secure path this test cares about, use a policy with NO
+	// "~/…" pattern: construction succeeds with home=="", and the ScopeWorkspace
+	// Grant must still fail with a typed *PolicyStoreError (nowhere safe to write)
+	// and persist nothing.
+	pc, err := NewPermissionChecker(
+		PermissionPolicy{WorkspaceRoot: ws, HardDeny: HardDenyRules{DeniedReadPaths: []string{"**/.env"}}},
+		WithHomeDir(func() (string, error) { return "", os.ErrNotExist }),
+	)
+	if err != nil {
+		t.Fatalf("NewPermissionChecker: %v", err)
+	}
 
-	err := pc.Grant(context.Background(), "ReadFile", `{"path":"main.go"}`, tool.ScopeWorkspace)
+	err = pc.Grant(context.Background(), "ReadFile", `{"path":"main.go"}`, tool.ScopeWorkspace)
 	if err == nil {
 		t.Fatal("Grant with unresolvable home = nil, want a typed error")
 	}
@@ -330,8 +354,10 @@ func TestGrantInRepoApprovalsIgnoredAfterGrant(t *testing.T) {
 	}
 
 	home := t.TempDir()
-	pc := NewPermissionChecker(PermissionPolicy{WorkspaceRoot: ws, HardDeny: DefaultHardDeny()})
-	pc.SetHomeDir(func() (string, error) { return home, nil })
+	pc, err := NewPermissionChecker(PermissionPolicy{WorkspaceRoot: ws, HardDeny: DefaultHardDeny()}, WithHomeDir(func() (string, error) { return home, nil }))
+	if err != nil {
+		t.Fatalf("NewPermissionChecker: %v", err)
+	}
 
 	// Grant ReadFile out-of-repo.
 	if err := pc.Grant(context.Background(), "ReadFile", `{"path":"main.go"}`, tool.ScopeWorkspace); err != nil {

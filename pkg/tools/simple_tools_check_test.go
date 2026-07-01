@@ -48,11 +48,14 @@ func TestSimpleToolsCheckClassification(t *testing.T) {
 				if tt.want == loop.EffectAutoApprove && approve == nil {
 					approve = []string{tl.name}
 				}
-				pc := NewPermissionChecker(PermissionPolicy{
+				pc, err := NewPermissionChecker(PermissionPolicy{
 					WorkspaceRoot: ws,
 					HardDeny:      DefaultHardDeny(),
 					HardApprove:   HardApproveRules{Tools: approve},
 				})
+				if err != nil {
+					t.Fatalf("NewPermissionChecker: %v", err)
+				}
 				got := pc.Check(context.Background(), tl.t, tl.name, tl.args)
 				if got != tt.want {
 					t.Errorf("Check(%s) = %v, want %v", tl.name, got, tt.want)

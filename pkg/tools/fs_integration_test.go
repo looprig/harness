@@ -60,9 +60,11 @@ func fsChecker(t *testing.T, root string, maxReadBytes int64) *PermissionChecker
 	if maxReadBytes > 0 {
 		hd.MaxReadBytes = maxReadBytes
 	}
-	pc := NewPermissionChecker(PermissionPolicy{WorkspaceRoot: root, HardDeny: hd})
 	home := t.TempDir()
-	pc.SetHomeDir(func() (string, error) { return home, nil })
+	pc, err := NewPermissionChecker(PermissionPolicy{WorkspaceRoot: root, HardDeny: hd}, WithHomeDir(func() (string, error) { return home, nil }))
+	if err != nil {
+		t.Fatalf("NewPermissionChecker: %v", err)
+	}
 	return pc
 }
 

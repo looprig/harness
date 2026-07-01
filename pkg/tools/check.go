@@ -326,7 +326,10 @@ func (c *PermissionChecker) containAndHardDeny(rawPath string, deniedGlobs []str
 		// Escapes the workspace or cannot be resolved → deny (Stage 1).
 		return loop.EffectDeny, boundaryDenied
 	}
-	home := resolveHomeOrEmpty(c.homeDir)
+	// c.home is resolved once at construction and is "" only when the policy has
+	// no ~/ pattern (policyHasHomePattern gates that at construction), so an empty
+	// home here can never disable an enforceable ~/ deny — fail-secure by invariant.
+	home := c.home
 	for _, pat := range deniedGlobs {
 		if matchHardDenyAbs(pat, abs, home) {
 			return loop.EffectDeny, boundaryDenied // Stage 2.
@@ -368,10 +371,13 @@ func (c *PermissionChecker) stageHardApprove(toolName string) bool {
 func (c *PermissionChecker) stagePersistedApprovals(ctx context.Context, toolName string, class toolClass, argsJSON string) (loop.Effect, bool) {
 	matcher := c.recordMatcher(toolName, class, argsJSON)
 
-	home, err := c.homeDir()
-	if err != nil {
-		// Home unresolvable → both store files absent → contribute nothing.
-		slog.WarnContext(ctx, "tools: home dir unresolvable; persisted approvals skipped", "err", err)
+	home := c.home
+	if home == "" {
+		// Home was unresolvable at construction (and no ~/ pattern needed it, else
+		// construction would have failed). A persisted-approvals file lives under
+		// ~/.looprig; with no home it cannot be located → both store files absent →
+		// contribute nothing (fail-secure: never auto-approve without the store).
+		slog.WarnContext(ctx, "tools: home dir unresolved; persisted approvals skipped")
 		return loop.EffectAsk, false
 	}
 

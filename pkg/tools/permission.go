@@ -3,6 +3,7 @@ package tools
 import (
 	"os"
 	"slices"
+	"strings"
 	"sync"
 
 	"github.com/ciram-co/looprig/internal/hashcache"
@@ -26,7 +27,7 @@ type EffectChecker interface {
 
 // HomeUnresolvableError is returned by NewPermissionChecker when the user's home
 // directory cannot be resolved WHILE the policy configures a home-relative ("~/…")
-// hard-deny or read-deny pattern. Such a checker cannot enforce those secret-deny
+// read- or write-deny pattern. Such a checker cannot enforce those secret-deny
 // rules (a "~/.ssh/**" glob has nothing to expand against), so construction fails
 // LOUDLY rather than silently running fail-open (CLAUDE.md: fail loudly on missing/
 // unresolvable required config). It is fail-secure and typed per CLAUDE.md.
@@ -164,10 +165,12 @@ func DefaultHardDeny() HardDenyRules {
 	}
 }
 
-// homeDirFunc resolves the user's home directory. It is a seam: the default is
-// os.UserHomeDir, overridable in tests (and by Grant, which uses the SAME seam
-// to write the out-of-repo store). Returning an error makes the persisted stage
-// fail secure (treat both store files as absent — contribute no approvals).
+// homeDirFunc resolves the user's home directory. It is a construction-time seam:
+// the default is os.UserHomeDir, overridable via WithHomeDir (tests, the future
+// Grant store hardening). It is invoked ONCE by NewPermissionChecker; the resolved
+// value is stored as the checker's home. Returning an error leaves home "" (and
+// fails construction if a "~/…" pattern needs it), which makes the persisted stage
+// fail secure downstream (treat both store files as absent — contribute nothing).
 type homeDirFunc func() (string, error)
 
 // PermissionChecker is the seven-stage, fail-secure permission decision engine
@@ -198,9 +201,19 @@ type homeDirFunc func() (string, error)
 // stays as-is; the security core (the decision + the single-mutex structure) is
 // verified and must not regress.
 type PermissionChecker struct {
-	mu      sync.Mutex
-	policy  PermissionPolicy
-	homeDir homeDirFunc
+	mu     sync.Mutex
+	policy PermissionPolicy
+
+	// home is the user's home directory, resolved ONCE at construction via the
+	// (optionally injected) seam. It is "" when home was unresolvable AND no
+	// home-relative ("~/…") pattern needed it (an unresolvable home while such a
+	// pattern IS configured fails construction with *HomeUnresolvableError). It is
+	// set once and never mutated, so Check/Grant may read it under (or without) mu.
+	home string
+
+	// unattended flips the two headless suppressions (wired at construction; read
+	// starting in Task 4).
+	unattended bool
 
 	// Two caches memoize the JSON parse of the workspace and user approvals files
 	// keyed by content hash, so an unchanged file is not re-parsed on every Check.
@@ -208,26 +221,65 @@ type PermissionChecker struct {
 	userCache *hashcache.Cache[ApprovalsFile]
 }
 
-// NewPermissionChecker builds a PermissionChecker for the given policy. The
-// home-dir seam defaults to os.UserHomeDir; tests (and the future Grant store
-// hardening) override it via SetHomeDir. Each approvals cache parses bytes into
-// an ApprovalsFile via parseApprovalsFile (strict, fail-secure).
-func NewPermissionChecker(policy PermissionPolicy) *PermissionChecker {
-	return &PermissionChecker{
-		policy:    policy,
-		homeDir:   os.UserHomeDir,
-		wsCache:   hashcache.New(parseApprovalsFile),
-		userCache: hashcache.New(parseApprovalsFile),
-	}
+// Option configures a PermissionChecker at construction (functional-option idiom).
+type Option func(*checkerConfig)
+
+// checkerConfig holds construction-time knobs applied by Options before the
+// PermissionChecker is built. homeFn is the home-dir seam; unattended flips the
+// two headless suppressions (Task 4).
+type checkerConfig struct {
+	homeFn     homeDirFunc
+	unattended bool
 }
 
-// SetHomeDir overrides the home-dir resolution seam. It is intended for tests
-// (and the composition root) to point the policy store at a controlled location;
-// production code uses the os.UserHomeDir default from NewPermissionChecker.
-func (c *PermissionChecker) SetHomeDir(fn homeDirFunc) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.homeDir = fn
+// WithHomeDir overrides the home-dir resolution seam at CONSTRUCTION (default
+// os.UserHomeDir). It REPLACES the former post-construction SetHomeDir: home is
+// resolved once, in the constructor, so an unresolvable home fails fast (a
+// post-construction setter could not) and tests can force the failure.
+func WithHomeDir(fn homeDirFunc) Option { return func(c *checkerConfig) { c.homeFn = fn } }
+
+// NewPermissionChecker builds a PermissionChecker for the given policy. It resolves
+// the home dir ONCE via the (optionally injected) seam; if resolution fails while
+// any "~/…" hard-deny OR read-deny pattern is configured it returns a typed
+// *HomeUnresolvableError (fail-fast — the checker could not enforce those secret
+// globs). With no "~/…" pattern, an unresolvable home is fine (home stays "").
+// Each approvals cache parses bytes into an ApprovalsFile via parseApprovalsFile
+// (strict, fail-secure).
+func NewPermissionChecker(policy PermissionPolicy, opts ...Option) (*PermissionChecker, error) {
+	cfg := checkerConfig{homeFn: os.UserHomeDir}
+	for _, o := range opts {
+		o(&cfg)
+	}
+	home, herr := cfg.homeFn()
+	if herr != nil {
+		home = ""
+		if policyHasHomePattern(policy) {
+			return nil, &HomeUnresolvableError{Cause: herr}
+		}
+	}
+	return &PermissionChecker{
+		policy:     policy,
+		home:       home,
+		unattended: cfg.unattended,
+		wsCache:    hashcache.New(parseApprovalsFile),
+		userCache:  hashcache.New(parseApprovalsFile),
+	}, nil
+}
+
+// policyHasHomePattern reports whether any read- or write-deny glob is
+// home-relative ("~/…"), i.e. requires a resolved home to enforce.
+func policyHasHomePattern(policy PermissionPolicy) bool {
+	for _, p := range policy.HardDeny.DeniedReadPaths {
+		if strings.HasPrefix(p, "~/") {
+			return true
+		}
+	}
+	for _, p := range policy.HardDeny.DeniedWritePaths {
+		if strings.HasPrefix(p, "~/") {
+			return true
+		}
+	}
+	return false
 }
 
 // appendSessionPolicy appends an in-memory ToolPolicy under the lock. It is the
@@ -255,10 +307,9 @@ func (c *PermissionChecker) appendSessionPolicy(p loop.ToolPolicy) {
 func (c *PermissionChecker) DeniedRead(absPath string) bool {
 	c.mu.Lock()
 	denied := c.policy.HardDeny.DeniedReadPaths
-	homeFn := c.homeDir
+	home := c.home
 	c.mu.Unlock()
 
-	home := resolveHomeOrEmpty(homeFn)
 	for _, pat := range denied {
 		if matchHardDenyAbs(pat, absPath, home) {
 			return true
@@ -273,20 +324,4 @@ func (c *PermissionChecker) MaxReadBytes() int64 {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.policy.HardDeny.MaxReadBytes
-}
-
-// resolveHomeOrEmpty resolves the home dir, returning "" on error. A "" home
-// makes the ~/ expansion in matchHardDenyAbs a no-op for home-relative globs
-// (those globs then cannot match — fail-secure for the read filter: a non-home
-// glob like **/.env is unaffected, a ~/ glob simply does not contribute a match
-// rather than matching something wrong).
-func resolveHomeOrEmpty(fn homeDirFunc) string {
-	if fn == nil {
-		return ""
-	}
-	home, err := fn()
-	if err != nil {
-		return ""
-	}
-	return home
 }

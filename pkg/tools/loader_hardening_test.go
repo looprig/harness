@@ -57,8 +57,10 @@ func TestLoaderRejectsWorldWritableFile(t *testing.T) {
 				t.Fatalf("chmod: %v", err)
 			}
 
-			pc := NewPermissionChecker(PermissionPolicy{WorkspaceRoot: ws, HardDeny: DefaultHardDeny()})
-			pc.SetHomeDir(func() (string, error) { return home, nil })
+			pc, err := NewPermissionChecker(PermissionPolicy{WorkspaceRoot: ws, HardDeny: DefaultHardDeny()}, WithHomeDir(func() (string, error) { return home, nil }))
+			if err != nil {
+				t.Fatalf("NewPermissionChecker: %v", err)
+			}
 			got := pc.Check(context.Background(), plainTool{name: "ReadFile"}, "ReadFile", `{"path":"main.go"}`)
 			if got != tt.want {
 				t.Errorf("Check() = %v, want %v (perm %o)", got, tt.want, tt.perm)
@@ -94,8 +96,10 @@ func TestLoaderRejectsSymlinkedFile(t *testing.T) {
 		t.Fatalf("symlink approvals file: %v", err)
 	}
 
-	pc := NewPermissionChecker(PermissionPolicy{WorkspaceRoot: ws, HardDeny: DefaultHardDeny()})
-	pc.SetHomeDir(func() (string, error) { return home, nil })
+	pc, err := NewPermissionChecker(PermissionPolicy{WorkspaceRoot: ws, HardDeny: DefaultHardDeny()}, WithHomeDir(func() (string, error) { return home, nil }))
+	if err != nil {
+		t.Fatalf("NewPermissionChecker: %v", err)
+	}
 	got := pc.Check(context.Background(), plainTool{name: "ReadFile"}, "ReadFile", `{"path":"main.go"}`)
 	if got != loop.EffectAsk {
 		t.Errorf("Check() = %v, want EffectAsk (symlinked approvals file must be treated empty)", got)
@@ -131,8 +135,10 @@ func TestLoaderRejectsSymlinkedComponent(t *testing.T) {
 		t.Fatalf("symlink ~/.looprig -> decoy: %v", err)
 	}
 
-	pc := NewPermissionChecker(PermissionPolicy{WorkspaceRoot: ws, HardDeny: DefaultHardDeny()})
-	pc.SetHomeDir(func() (string, error) { return home, nil })
+	pc, err := NewPermissionChecker(PermissionPolicy{WorkspaceRoot: ws, HardDeny: DefaultHardDeny()}, WithHomeDir(func() (string, error) { return home, nil }))
+	if err != nil {
+		t.Fatalf("NewPermissionChecker: %v", err)
+	}
 	got := pc.Check(context.Background(), plainTool{name: "ReadFile"}, "ReadFile", `{"path":"main.go"}`)
 	if got != loop.EffectAsk {
 		t.Errorf("Check() = %v, want EffectAsk (symlinked ~/.looprig must be treated empty)", got)
@@ -188,8 +194,10 @@ func TestLoaderRejectsWorldWritableAncestorDir(t *testing.T) {
 				}
 			}
 
-			pc := NewPermissionChecker(PermissionPolicy{WorkspaceRoot: ws, HardDeny: DefaultHardDeny()})
-			pc.SetHomeDir(func() (string, error) { return home, nil })
+			pc, err := NewPermissionChecker(PermissionPolicy{WorkspaceRoot: ws, HardDeny: DefaultHardDeny()}, WithHomeDir(func() (string, error) { return home, nil }))
+			if err != nil {
+				t.Fatalf("NewPermissionChecker: %v", err)
+			}
 			got := pc.Check(context.Background(), plainTool{name: "ReadFile"}, "ReadFile", `{"path":"main.go"}`)
 			if got != tt.want {
 				t.Errorf("Check() = %v, want %v (ancestor %q mode %o)", got, tt.want, tt.looseRel, tt.mode)
@@ -230,8 +238,10 @@ func TestLoaderRejectsLooseAncestorWarnsPathOnly(t *testing.T) {
 	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
 	t.Cleanup(func() { slog.SetDefault(prev) })
 
-	pc := NewPermissionChecker(PermissionPolicy{WorkspaceRoot: ws, HardDeny: DefaultHardDeny()})
-	pc.SetHomeDir(func() (string, error) { return home, nil })
+	pc, err := NewPermissionChecker(PermissionPolicy{WorkspaceRoot: ws, HardDeny: DefaultHardDeny()}, WithHomeDir(func() (string, error) { return home, nil }))
+	if err != nil {
+		t.Fatalf("NewPermissionChecker: %v", err)
+	}
 	if got := pc.Check(context.Background(), plainTool{name: "ReadFile"}, "ReadFile", `{"path":"main.go"}`); got != loop.EffectAsk {
 		t.Fatalf("Check() = %v, want EffectAsk (loose ancestor must reject store)", got)
 	}
@@ -276,8 +286,10 @@ func TestLoaderRejectionWarns(t *testing.T) {
 	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
 	t.Cleanup(func() { slog.SetDefault(prev) })
 
-	pc := NewPermissionChecker(PermissionPolicy{WorkspaceRoot: ws, HardDeny: DefaultHardDeny()})
-	pc.SetHomeDir(func() (string, error) { return home, nil })
+	pc, err := NewPermissionChecker(PermissionPolicy{WorkspaceRoot: ws, HardDeny: DefaultHardDeny()}, WithHomeDir(func() (string, error) { return home, nil }))
+	if err != nil {
+		t.Fatalf("NewPermissionChecker: %v", err)
+	}
 	if got := pc.Check(context.Background(), plainTool{name: "ReadFile"}, "ReadFile", `{"path":"main.go"}`); got != loop.EffectAsk {
 		t.Fatalf("Check() = %v, want EffectAsk", got)
 	}
