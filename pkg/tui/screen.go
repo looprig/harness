@@ -40,6 +40,21 @@ type Screen struct {
 	interaction interactionModel
 	liveSpill   liveSpillState
 
+	// heldLines is the rolling HELD TAIL: committed scrollback lines (already spill-trimmed
+	// and marked printed by flushActions) rendered in the active surface, above the live
+	// tail, instead of being emitted to native scrollback immediately. It is the
+	// freeze-in-place mechanism. Emitting a finalized step to scrollback the instant the
+	// live tail collapses shrinks the managed region by the step's full height in one frame;
+	// the inline renderer repaints the shorter surface from its top, springing the input box
+	// upward and stranding blank rows below it (the "input jumped to the top" symptom) — at
+	// commit AND, if released all at once, at the next turn's start. Instead the held lines
+	// spill to scrollback from the TOP one line at a time as the live tail grows (spillHeld),
+	// so the surface height stays constant and the input box never jumps: the previous
+	// response and the new user row scroll up into history exactly as fast as the new
+	// response fills in below them. While idle it holds the last response frozen above the
+	// input, capped at the live-tail budget. nil when nothing is held.
+	heldLines []string
+
 	status Status      // Idle | Running | Interrupting | Resetting
 	sub    EventStream // the session-lifetime event subscription; nil until subscribed
 
@@ -172,6 +187,11 @@ func (m Screen) Agent() Agent { return m.agent }
 func (m Screen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
+		// A resize must NOT print to scrollback (see TestWindowSizeMsgNoScrollbackPrint): the
+		// scrollback-strand fix depends on resize only re-rendering the managed region. The
+		// held tail therefore rides the resize in place — its stored lines are at the old
+		// width, so a narrower terminal truncates them until the next event drains them, a
+		// minor transient bounded by the tail budget (never a strand).
 		m.width, m.height = msg.Width, msg.Height
 		m.ready = true
 		m.scrollback.width = msg.Width
@@ -282,6 +302,12 @@ func (m *Screen) handleEvent(ev event.Event) tea.Cmd {
 	if finalizingLive {
 		m.liveSpill.finalizing = true
 	}
+	// Route newly committed entries into the held tail (rendered in the surface) rather
+	// than emitting them to scrollback, then drain the held tail from the top to fit the
+	// budget as the live tail grows. spillHeld runs BEFORE spillLive so the older held lines
+	// reach scrollback ahead of the newer live-prose overflow, keeping history in order.
+	holdCmd := m.hold(finalizingLive)
+	heldSpillCmd := m.spillHeld()
 	spillCmd := m.spillLive()
 	// Re-arm only while a live subscription is installed: during the /clear window
 	// m.sub is transiently nil, and the fresh subscription's reader is (re)started
@@ -294,7 +320,70 @@ func (m *Screen) handleEvent(ev event.Event) tea.Cmd {
 	if m.sub != nil {
 		rearm = subNext(m.sub)
 	}
-	return tea.Batch(rearm, statusCmd, spillCmd, m.flush())
+	return tea.Batch(rearm, statusCmd, holdCmd, heldSpillCmd, spillCmd)
+}
+
+// hold moves newly committed entries into the held tail (rendered in the surface) instead
+// of emitting them to scrollback, so they hand off to native history gradually (spillHeld)
+// as new content grows — the freeze-in-place mechanism. A finalized step is ALWAYS held so
+// the live tail's collapse cannot jump the input; other commits are held only when
+// something is already held, to preserve scrollback order and continue a gradual handoff.
+// With nothing held and no finalized step — the session's opening entries (startup banner,
+// first user row) — there is no live tail to collapse and no ordering to preserve, so they
+// go straight to scrollback rather than being delayed.
+func (m *Screen) hold(finalizing bool) tea.Cmd {
+	actions := m.flushActions()
+	if !finalizing && len(m.heldLines) == 0 {
+		return printToScrollback(actions)
+	}
+	m.heldLines = append(m.heldLines, flattenActions(actions)...)
+	return nil
+}
+
+// spillHeld drains the held tail to native scrollback from the TOP (oldest first) so the
+// held lines plus the live tail fit the live-tail budget. As a new turn streams, the
+// previous frozen response and the new user row spill up into history one line at a time
+// while the new response grows below them — the surface height stays constant, so the input
+// box does not jump. While idle (no live tail) it caps the frozen tail at the budget,
+// flushing only the overflow of a step that arrived taller than the surface (e.g. a
+// non-streamed StepDone whose spill never ran). Returns the overflow print command, or nil
+// when the held tail already fits.
+func (m *Screen) spillHeld() tea.Cmd {
+	if len(m.heldLines) == 0 {
+		return nil
+	}
+	avail := liveTailDisplayCap(m.surfaceInputs("")) - m.liveTailHeight()
+	if avail < 0 {
+		avail = 0
+	}
+	if len(m.heldLines) <= avail {
+		return nil
+	}
+	n := len(m.heldLines) - avail
+	overflow := append([]string(nil), m.heldLines[:n]...)
+	m.heldLines = append([]string(nil), m.heldLines[n:]...)
+	return printToScrollback([]printAction{{Lines: overflow}})
+}
+
+// liveTailHeight is the physical row count of the currently rendered live tail (0 when
+// there is none) — the rows spillHeld reserves for the live segment when budgeting the
+// held tail.
+func (m Screen) liveTailHeight() int {
+	live := m.renderLiveTail()
+	if live == "" {
+		return 0
+	}
+	return strings.Count(live, "\n") + 1
+}
+
+// flattenActions concatenates every action's Lines, in order, into one slice — the row
+// view the held tail is stored and budgeted as.
+func flattenActions(actions []printAction) []string {
+	var lines []string
+	for _, a := range actions {
+		lines = append(lines, a.Lines...)
+	}
+	return lines
 }
 
 func (m Screen) finalizesPrimaryLive(ev event.Event) bool {
@@ -379,11 +468,19 @@ func (m *Screen) handleSubmitResult(msg submitResultMsg) tea.Cmd {
 	return nil
 }
 
-// flush renders every newly committed transcript entry to scrollback exactly once
-// and returns the print command (nil when nothing is new). renderEntry is given the
-// current expand flag and width so scrollback and the live tail render identically.
+// flush renders every newly committed transcript entry to scrollback exactly once and
+// returns the print command (nil when nothing is new). renderEntry is given the current
+// expand flag and width so scrollback and the live tail render identically. Any HELD tail
+// is released to scrollback first (then the new entries, in committed order): an explicit
+// flush means fresh out-of-band content is being committed (an error, a notice, /help, the
+// build-error user row), so the held tail hands off to history rather than staying stranded
+// in the surface. The freeze-aware turn path uses hold + spillHeld (which keep content in
+// the surface and drain it gradually); flush is the direct path for those out-of-band
+// commits, where an immediate handoff is acceptable.
 func (m *Screen) flush() tea.Cmd {
-	return printToScrollback(m.flushActions())
+	lines := append(append([]string(nil), m.heldLines...), flattenActions(m.flushActions())...)
+	m.heldLines = nil
+	return printToScrollback([]printAction{{Lines: lines}})
 }
 
 func (m *Screen) flushActions() []printAction {
@@ -459,6 +556,7 @@ func (m *Screen) handleReopenResult(msg reopenResultMsg) tea.Cmd {
 	m.scrollback = newScrollbackModel(m.width)
 	m.interaction = m.interaction.ClearPrompts()
 	m.liveSpill = liveSpillState{}
+	m.heldLines = nil
 	m.status = StatusIdle
 	m.startupPending = false
 	m.startupCommitted = false
@@ -517,9 +615,32 @@ func (m Screen) View() tea.View {
 	if !m.ready {
 		return tea.NewView("")
 	}
-	v := tea.NewView(surfaceView(m.surfaceInputs(m.renderLiveTail())))
+	v := tea.NewView(surfaceView(m.surfaceInputs(m.tailView())))
 	v.KeyboardEnhancements.ReportAllKeysAsEscapeCodes = true
 	return v
+}
+
+// tailView is the active surface's tail content: the HELD tail (committed lines not yet in
+// scrollback — the just-finished response and, mid-handoff, the new user row) stacked above
+// the streaming live tail. Held and live share the tail region; spillHeld keeps their
+// combined height within the budget by draining the held lines from the top as the live
+// tail grows, so the input box stays put. While idle the held tail alone is the frozen
+// response above the input; while streaming with nothing held it is just the live tail. The
+// trailing blank each committed entry carries separates held from live (and is trimmed at
+// the very end — surfaceView supplies the tail's own trailing blank).
+func (m Screen) tailView() string {
+	held := strings.Join(m.heldLines, "\n")
+	live := m.renderLiveTail()
+	var combined string
+	switch {
+	case held == "":
+		combined = live
+	case live == "":
+		combined = held
+	default:
+		combined = held + "\n" + live
+	}
+	return strings.TrimRight(combined, "\n")
 }
 
 func (m Screen) surfaceInputs(liveTail string) surfaceInputs {
@@ -687,7 +808,17 @@ func (m *Screen) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			_ = m.sub.Close()
 			m.sub = nil
 		}
-		return *m, tea.Sequence(closeAgent(m.agent), tea.Quit)
+		// Flush the held tail to native scrollback BEFORE quitting: it lives in the managed
+		// region, which the renderer erases on close, so without this the last response
+		// would vanish from the terminal on exit. Sequenced ahead of the close so the
+		// tea.Println lands while the renderer is still live.
+		cmds := make([]tea.Cmd, 0, 3)
+		if len(m.heldLines) > 0 {
+			cmds = append(cmds, printToScrollback([]printAction{{Lines: m.heldLines}}))
+			m.heldLines = nil
+		}
+		cmds = append(cmds, closeAgent(m.agent), tea.Quit)
+		return *m, tea.Sequence(cmds...)
 	case "ctrl+t":
 		m.expand = !m.expand // pure display state; default expanded, so this collapses first
 		return *m, nil

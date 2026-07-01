@@ -24,10 +24,10 @@ const runningGlyphs = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 //   - The running tool card paints live (spinner glyph appears in the stream) and is a
 //     compact ONE-LINE indicator — the multi-line live card (header + result body) is
 //     what used to be removed all at once on commit, fracturing the handoff.
-//   - On ToolCallCompleted the live tail shrinks (running card removed) AND the full
-//     card is tea.Println-committed to scrollback in the same pass. The completed card
-//     is inserted exactly ONCE (no duplicate), and the running-card body placeholder
-//     ("(no output)") never reaches scrollback.
+//   - On ToolCallCompleted the live tail resolves the card in place; StepDone commits the
+//     full card but FREEZES it in the surface (freeze-in-place), and it is emitted to
+//     scrollback exactly ONCE at teardown (the ctrl+c freeze-flush) — no duplicate, and
+//     the running-card body placeholder ("(no output)") never reaches scrollback.
 //
 // The test is deterministic: it hand-delivers each turn event as an eventMsg (the
 // agent reader blocks, keeping the turn Running) and settles between sends so each
@@ -115,7 +115,13 @@ func TestToolRunningToCompletedHandoff(t *testing.T) {
 		},
 	}})
 
-	prog.Quit()
+	// Quit via the app's own ctrl+c. A finalized step is FROZEN in the active surface
+	// after commit (freeze-in-place: it is not emitted to native scrollback until the next
+	// turn or exit, so the input box does not jump when the live tail collapses), and
+	// ctrl+c flushes that held-back step to scrollback before quitting. This is the
+	// committed card's scrollback appearance.
+	prog.Send(tea.KeyPressMsg{Code: 'c', Mod: tea.ModCtrl})
+	settle()
 	in.Close()
 	<-done
 	full := out.String()
@@ -134,14 +140,16 @@ func TestToolRunningToCompletedHandoff(t *testing.T) {
 			noOutput, preComplete)
 	}
 
-	// 3. The resolved (✓) card reaches scrollback on commit. Under the StepDone-group
-	//    model the card header paints three times across the run: the live RUNNING
-	//    indicator, the live RESOLVED card (ToolCallCompleted resolves it in place
-	//    before the step boundary), and the one COMMITTED card snapped in by StepDone.
-	//    The committed card must appear (the ✓ glyph reaches scrollback), and the
-	//    running-card body placeholder ("(no output)") must never have been committed.
+	// 3. The resolved (✓) card reaches the user and then scrollback. The card header
+	//    paints three times across the run: the live RUNNING indicator, the live RESOLVED
+	//    card (ToolCallCompleted resolves it in place before the step boundary), and the
+	//    COMMITTED card. StepDone snaps the committed card in but FREEZES it in the surface
+	//    (identical to the live resolved card, so no extra repaint there); it is emitted to
+	//    scrollback once, by the ctrl+c freeze-flush at teardown. The committed card must
+	//    appear (the ✓ glyph reaches scrollback), and the running-card body placeholder
+	//    ("(no output)") must never have been committed.
 	if got := strings.Count(full, "⎿ Fetch(GET weather.com)"); got != 3 {
-		t.Errorf("Fetch card header appeared %d times, want 3 (live running indicator, live resolved, committed)\n%q",
+		t.Errorf("Fetch card header appeared %d times, want 3 (live running indicator, live resolved, committed via freeze-flush)\n%q",
 			got, full)
 	}
 	if !strings.Contains(full, glyphOK) {
