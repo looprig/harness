@@ -1,5 +1,7 @@
 # Design B — Invoke Control Semantics & Autonomous Headless Mode
 
+> **SUPERSEDED (2026-07-01) by [Open Gate — Posture-Driven Unattended Tool Approval](2026-07-01-open-gate-posture-design.md).** This design's foundations are gone from `main`: `Session.Invoke`/`Session.Stream` were deleted, the Design-A event taxonomy + `Sink`/`NotificationEvent` were deleted or never built, and the declared agents it targeted never landed on `main`. Kept for history; see the successor for the current plan.
+
 **Date:** 2026-06-16
 **Status:** Approved design, pending implementation plan
 **Depends on:** ⚠️ **stale** — the former [Design A — Session Observability & Taxonomy Foundation] has been superseded by [Cleanup — Remove Event Sink, Redaction & EventEnvelope Scaffolding](2026-06-19-remove-sink-redaction-envelope.md). The concepts this doc leans on (`ControlEvent`/`TerminalEvent` markers, envelope delivery, unified `Sink`, `NotificationEvent`) were either dropped ("add when needed"), built differently on main (`Class`×`Scope`+`Reply`+`EndsTurn`, `Header`-carried identity, hub `Subscription`), or deleted (the sink path). **This design needs its own reconciliation against main before implementation.**
