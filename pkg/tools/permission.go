@@ -216,7 +216,7 @@ type PermissionChecker struct {
 	home string
 
 	// unattended flips the two headless suppressions (wired at construction; read
-	// starting in Task 4).
+	// by Check to gate Stage 3 and skip Stage 5).
 	unattended bool
 
 	// Two caches memoize the JSON parse of the workspace and user approvals files
@@ -230,7 +230,7 @@ type Option func(*checkerConfig)
 
 // checkerConfig holds construction-time knobs applied by Options before the
 // PermissionChecker is built. homeFn is the home-dir seam; unattended flips the
-// two headless suppressions (Task 4).
+// two headless suppressions.
 type checkerConfig struct {
 	homeFn     homeDirFunc
 	unattended bool
@@ -247,7 +247,7 @@ func WithHomeDir(fn homeDirFunc) Option { return func(c *checkerConfig) { c.home
 // stages, so a tool cannot self-approve ahead of the definer's declared allowlist)
 // and (2) skips Stage-5 persisted approvals (a stale ~/.looprig grant can never
 // auto-approve a call the definer did not declare). EffectChecker EffectDeny is
-// still honored (a safety veto). Pair with NonInteractiveGate (Task 5).
+// still honored (a safety veto). Pair with NonInteractiveGate.
 func WithUnattended() Option { return func(c *checkerConfig) { c.unattended = true } }
 
 // NewPermissionChecker builds a PermissionChecker for the given policy. It resolves
@@ -296,7 +296,7 @@ func policyHasHomePattern(policy PermissionPolicy) bool {
 
 // appendSessionPolicy appends an in-memory ToolPolicy under the lock. It is the
 // Stage-6 mutation point a ScopeSession Grant uses; exported behavior is via
-// Grant (added in a later task). Kept here so the lock that guards Check also
+// Grant. Kept here so the lock that guards Check also
 // guards the slice mutation, making concurrent Check + grant -race clean.
 func (c *PermissionChecker) appendSessionPolicy(p loop.ToolPolicy) {
 	c.mu.Lock()
@@ -326,7 +326,7 @@ func (c *PermissionChecker) DeniedRead(absPath string) bool {
 		if strings.HasPrefix(pat, "~/") && home == "" {
 			// Defensive backstop: a ~/ pattern with no resolved home cannot be
 			// matched, so fail CLOSED (deny) rather than no-match (fail-open).
-			// Construction (Task 2) normally prevents this state.
+			// Construction normally prevents this state.
 			return true
 		}
 		if matchHardDenyAbs(pat, absPath, home) {
