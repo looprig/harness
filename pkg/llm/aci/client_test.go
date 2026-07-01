@@ -121,6 +121,8 @@ type gatewayTweaks struct {
 	tamperWire bool
 	// wrongBodyHash injects a bogus request body_hash into the receipt.
 	wrongBodyHash bool
+	// wrongWireHash injects a bogus response wire_hash into the receipt.
+	wrongWireHash bool
 	// signWithWrongKey signs the receipt with a fresh key not in the keyset.
 	signWithWrongKey bool
 	// upstreamResult overrides the upstream.verified result ("" => "verified").
@@ -134,6 +136,11 @@ type fakeDoer struct {
 	t      *testing.T
 	keys   gatewayKeys
 	tweaks gatewayTweaks
+
+	// stream, when true, makes the POST handler serve a sealed SSE stream
+	// (multiple data: {chunk}\n\n events + data: [DONE]\n\n) instead of a single
+	// buffered chat.completion — the shape Client.Stream buffers and verifies.
+	stream bool
 
 	receipt     []byte // set during POST, returned on the receipt GET
 	sawAuthPost bool
@@ -179,6 +186,10 @@ func (f *fakeDoer) handleInference(req *http.Request) (*http.Response, error) {
 	// CompactJSON — this is byte-for-byte the cleartext the client compacted
 	// before sealing (the receipt's body_hash preimage).
 	cleartextReqBody := f.openRequest(sealedBody, hdrModel, nonce, ts)
+
+	if f.stream {
+		return f.handleStreamInference(cleartextReqBody, clientPub, hdrModel, nonce, ts)
+	}
 
 	// Build the canned cleartext response and SEAL its content to the client
 	// pubkey under the response AAD; everything else passes through.
@@ -302,6 +313,9 @@ func (f *fakeDoer) buildReceipt(reqBody, respCleartext, respWire []byte, model s
 	}
 	cleartextHash := mustHash(f.t, respCleartext)
 	wireHash := mustHash(f.t, respWire)
+	if f.tweaks.wrongWireHash {
+		wireHash = "sha256:" + strings.Repeat("00", 32)
+	}
 
 	upstreamResult := f.tweaks.upstreamResult
 	if upstreamResult == "" {
@@ -422,6 +436,23 @@ func mustSealPub(t *testing.T, clientPub *secp256k1.PublicKey, plaintext, aad []
 		t.Fatalf("seal response: %v", err)
 	}
 	return ct
+}
+
+// flipHexByte flips the last hex nibble of a sealed ciphertext hex string so its
+// AEAD open fails (the blob stays valid hex of the same length, so only the
+// authenticated decrypt breaks — not the surrounding JSON framing).
+func flipHexByte(h string) string {
+	if h == "" {
+		return h
+	}
+	b := []byte(h)
+	last := b[len(b)-1]
+	if last == '0' {
+		b[len(b)-1] = '1'
+	} else {
+		b[len(b)-1] = '0'
+	}
+	return string(b)
 }
 
 // tamperBytes flips the last byte of b so a sealed blob no longer opens.
@@ -637,3 +668,328 @@ func TestInvokeTransportError(t *testing.T) {
 type errDoer struct{ err error }
 
 func (e *errDoer) Do(*http.Request) (*http.Response, error) { return nil, e.err }
+
+// ----------------------------------------------------------------------------
+// Task 5.3 — Client.Stream (buffer-until-verified) tests.
+//
+// Stream buffers the FULL sealed SSE response, opens + verifies (wire_hash +
+// body_hash + upstream + signature; cleartext_hash SKIPPED — the client only
+// sees the wire bytes, not the raw upstream framing), and ONLY THEN returns a
+// reader replaying the already-verified opened deltas. On ANY verification
+// failure it returns (nil, typed error) and the caller observes ZERO chunks.
+//
+// The streaming fake gateway builds a multi-chunk cleartext SSE, seals each
+// chunk's delta.content to the client pubkey under chatResponseAAD keyed by that
+// chunk's OWN id, hashes the WIRE bytes for wire_hash, and signs a receipt whose
+// cleartext_hash the client will NOT check.
+// ----------------------------------------------------------------------------
+
+// streamDelta is one cleartext content delta the streaming gateway emits: the
+// chunk id (bound into that chunk's response AAD) and the plaintext content.
+type streamDelta struct {
+	id      string
+	content string
+}
+
+// testStreamDeltas is the canned two-chunk content stream. Draining Stream's
+// reader must yield exactly these two strings, in order, as *content.TextChunk.
+var testStreamDeltas = []streamDelta{
+	{id: "chunk-0", content: "he"},
+	{id: "chunk-1", content: "llo"},
+}
+
+// handleStreamInference serves a sealed SSE stream: for each canned delta it
+// builds a chat.completion.chunk with delta.content SEALED to the client pubkey
+// under that chunk's response AAD, frames it as a data: {json}\n\n event,
+// appends data: [DONE]\n\n, hashes the wire bytes for wire_hash, signs a
+// receipt, and returns the wire SSE with the x-receipt-id header.
+func (f *fakeDoer) handleStreamInference(cleartextReqBody []byte, clientPub *secp256k1.PublicKey, model, nonce string, ts uint64) (*http.Response, error) {
+	var wire strings.Builder
+	var cleartextWire strings.Builder // the RAW upstream framing (cleartext_hash preimage; client never checks it)
+	for i, d := range testStreamDeltas {
+		// Cleartext chunk (the raw upstream SSE the gateway would have hashed).
+		cleartextChunk := f.streamChunkJSON(model, d.id, d.content)
+		cleartextWire.WriteString("data: " + cleartextChunk + "\n\n")
+
+		// Sealed chunk: same shape, delta.content replaced by the sealed blob.
+		aad := chatResponseAAD(e2eeRequestAlgo, model, d.id, 0, respFieldContent, nonce, ts)
+		sealedContent := mustSealPub(f.t, clientPub, []byte(d.content), aad)
+		// Tamper the FIRST sealed delta's ciphertext so its open fails while every
+		// OTHER binding (wire_hash included) still matches the bytes the client
+		// receives — isolating the E2EE open failure.
+		if f.tweaks.tamperWire && i == 0 {
+			sealedContent = flipHexByte(sealedContent)
+		}
+		sealedChunk := f.streamChunkJSON(model, d.id, sealedContent)
+		wire.WriteString("data: " + sealedChunk + "\n\n")
+	}
+	cleartextWire.WriteString("data: [DONE]\n\n")
+	wire.WriteString("data: [DONE]\n\n")
+
+	wireBytes := []byte(wire.String())
+
+	// The receipt binds the request body, the RAW upstream cleartext (cleartext_hash,
+	// which the client skips for streaming), and the WIRE bytes (wire_hash, checked).
+	f.receipt = f.buildReceipt(cleartextReqBody, []byte(cleartextWire.String()), wireBytes, model)
+
+	if f.tweaks.status != 0 {
+		return f.response(f.tweaks.status, []byte(`{"error":"upstream rejected"}`), ""), nil
+	}
+	return f.streamResponse(http.StatusOK, wireBytes, testReceiptID), nil
+}
+
+// streamChunkJSON renders one chat.completion.chunk with a single choice whose
+// delta.content is contentValue (cleartext for the hash preimage, or the sealed
+// blob for the wire event). index is fixed at 0 (matching the AAD choice=0).
+func (f *fakeDoer) streamChunkJSON(model, id, contentValue string) string {
+	// Build via the ordered body so the compact bytes are stable and the client's
+	// order-preserving parse round-trips them.
+	chunk := `{"id":"` + id + `","object":"chat.completion.chunk","model":"` + model +
+		`","choices":[{"index":0,"delta":{"content":"` + contentValue + `"}}]}`
+	return string(mustCompact(f.t, mustParseBody(f.t, chunk)))
+}
+
+// streamResponse builds an SSE *http.Response: text/event-stream content type,
+// the wire bytes as the body, and the x-receipt-id header.
+func (f *fakeDoer) streamResponse(status int, body []byte, receiptID string) *http.Response {
+	resp := f.response(status, body, receiptID)
+	resp.Header.Set("Content-Type", "text/event-stream")
+	return resp
+}
+
+// drainStream pulls every chunk from a reader until io.EOF, returning them in
+// order. A non-EOF error fails the test. It also asserts Close is a no-op error.
+func drainStream(t *testing.T, r *llm.StreamReader[content.Chunk]) []content.Chunk {
+	t.Helper()
+	var chunks []content.Chunk
+	for {
+		chunk, err := r.Next()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			t.Fatalf("StreamReader.Next() error = %v, want nil or io.EOF", err)
+		}
+		chunks = append(chunks, chunk)
+	}
+	if err := r.Close(); err != nil {
+		t.Fatalf("StreamReader.Close() error = %v, want nil", err)
+	}
+	return chunks
+}
+
+// TestStreamHappyPath drives the full buffer-until-verified streaming flow
+// against the honest streaming gateway and asserts Stream returns a reader whose
+// drained chunks are the opened deltas in order ("he","llo") as *TextChunks, nil
+// error — and that the request carried the bearer token.
+func TestStreamHappyPath(t *testing.T) {
+	t.Parallel()
+	keys := newGatewayKeys(t)
+	doer := &fakeDoer{t: t, keys: keys, stream: true}
+	client := newTestClient(t, doer, keys)
+
+	reader, err := client.Stream(context.Background(), testRequest())
+	if err != nil {
+		t.Fatalf("Stream() error = %v, want nil", err)
+	}
+	if reader == nil {
+		t.Fatalf("Stream() reader = nil, want non-nil")
+	}
+
+	chunks := drainStream(t, reader)
+	if len(chunks) != len(testStreamDeltas) {
+		t.Fatalf("drained %d chunks, want %d", len(chunks), len(testStreamDeltas))
+	}
+	for i, want := range testStreamDeltas {
+		tc, ok := chunks[i].(*content.TextChunk)
+		if !ok {
+			t.Fatalf("chunk[%d] is %T, want *content.TextChunk", i, chunks[i])
+		}
+		if tc.Text != want.content {
+			t.Fatalf("chunk[%d].Text = %q, want %q", i, tc.Text, want.content)
+		}
+	}
+	if !doer.sawAuthPost {
+		t.Errorf("POST did not carry the bearer token")
+	}
+	if !doer.sawAuthGet {
+		t.Errorf("receipt GET did not carry the bearer token")
+	}
+}
+
+// TestStreamReasoningDelta proves a sealed delta.reasoning_content is opened and
+// mapped to a *content.ThinkingChunk (the reasoning path), distinct from content.
+func TestStreamReasoningDelta(t *testing.T) {
+	t.Parallel()
+	keys := newGatewayKeys(t)
+	doer := &reasoningStreamDoer{fakeDoer: fakeDoer{t: t, keys: keys, stream: true}}
+	attest := func(_ context.Context, _ string) (*VerifiedReport, error) { return keys.verified, nil }
+	client := New(testBaseURL, testAPIKey, Policy{},
+		WithHTTPDoer(doer), WithNow(testNow), WithAttestFunc(attest))
+
+	reader, err := client.Stream(context.Background(), testRequest())
+	if err != nil {
+		t.Fatalf("Stream() error = %v, want nil", err)
+	}
+	chunks := drainStream(t, reader)
+	if len(chunks) != 1 {
+		t.Fatalf("drained %d chunks, want 1", len(chunks))
+	}
+	tc, ok := chunks[0].(*content.ThinkingChunk)
+	if !ok {
+		t.Fatalf("chunk[0] is %T, want *content.ThinkingChunk", chunks[0])
+	}
+	if tc.Thinking != testReasoning {
+		t.Fatalf("chunk[0].Thinking = %q, want %q", tc.Thinking, testReasoning)
+	}
+}
+
+const testReasoning = "because"
+
+// reasoningStreamDoer overrides the streaming gateway to emit ONE chunk carrying
+// a sealed delta.reasoning_content instead of delta.content.
+type reasoningStreamDoer struct{ fakeDoer }
+
+func (d *reasoningStreamDoer) Do(req *http.Request) (*http.Response, error) {
+	if req.Method == http.MethodPost && req.URL.Path == "/v1/chat/completions" {
+		return d.handleReasoning(req)
+	}
+	return d.fakeDoer.Do(req)
+}
+
+func (d *reasoningStreamDoer) handleReasoning(req *http.Request) (*http.Response, error) {
+	d.sawAuthPost = req.Header.Get("Authorization") == "Bearer "+testAPIKey
+	hdrModel := d.headerModel(req)
+	nonce := req.Header.Get(hdrE2EENonce)
+	ts, err := strconv.ParseUint(req.Header.Get(hdrE2EETimestamp), 10, 64)
+	if err != nil {
+		d.t.Fatalf("bad timestamp: %v", err)
+	}
+	clientPub := d.parsePub(req.Header.Get(hdrClientPubKey))
+	cleartextReqBody := d.openRequest(d.readBody(req), hdrModel, nonce, ts)
+
+	const chunkID = "chunk-r"
+	aad := chatResponseAAD(e2eeRequestAlgo, hdrModel, chunkID, 0, respFieldReasoningContent, nonce, ts)
+	sealed := mustSealPub(d.t, clientPub, []byte(testReasoning), aad)
+	sealedChunk := string(mustCompact(d.t, mustParseBody(d.t,
+		`{"id":"`+chunkID+`","object":"chat.completion.chunk","model":"`+hdrModel+
+			`","choices":[{"index":0,"delta":{"reasoning_content":"`+sealed+`"}}]}`)))
+	cleartextChunk := string(mustCompact(d.t, mustParseBody(d.t,
+		`{"id":"`+chunkID+`","object":"chat.completion.chunk","model":"`+hdrModel+
+			`","choices":[{"index":0,"delta":{"reasoning_content":"`+testReasoning+`"}}]}`)))
+
+	wireBytes := []byte("data: " + sealedChunk + "\n\ndata: [DONE]\n\n")
+	cleartextWire := []byte("data: " + cleartextChunk + "\n\ndata: [DONE]\n\n")
+	d.receipt = d.buildReceipt(cleartextReqBody, cleartextWire, wireBytes, hdrModel)
+	return d.streamResponse(http.StatusOK, wireBytes, testReceiptID), nil
+}
+
+// TestStreamFailuresZeroChunks table-drives the fail-closed streaming paths: each
+// tweak makes exactly one verification stage fail, and Stream must return a NIL
+// reader and a typed error — the caller observes ZERO chunks. The error string
+// must never leak the API key.
+func TestStreamFailuresZeroChunks(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		tweaks gatewayTweaks
+		reason string
+	}{
+		{
+			name:   "wrong wire_hash -> receipt_invalid",
+			tweaks: gatewayTweaks{wrongWireHash: true},
+			reason: reasonReceiptInvalid,
+		},
+		{
+			name:   "tampered sealed delta (open fails) -> e2ee_failed",
+			tweaks: gatewayTweaks{tamperWire: true},
+			reason: reasonE2EEFailed,
+		},
+		{
+			name:   "upstream result failed -> upstream_unverified",
+			tweaks: gatewayTweaks{upstreamResult: "failed"},
+			reason: reasonUpstreamUnverified,
+		},
+		{
+			name:   "receipt signed by wrong key -> receipt_invalid",
+			tweaks: gatewayTweaks{signWithWrongKey: true},
+			reason: reasonReceiptInvalid,
+		},
+		{
+			name:   "wrong request body_hash -> receipt_invalid",
+			tweaks: gatewayTweaks{wrongBodyHash: true},
+			reason: reasonReceiptInvalid,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			keys := newGatewayKeys(t)
+			doer := &fakeDoer{t: t, keys: keys, tweaks: tt.tweaks, stream: true}
+			client := newTestClient(t, doer, keys)
+
+			reader, err := client.Stream(context.Background(), testRequest())
+			if reader != nil {
+				t.Fatalf("Stream() reader = %+v, want nil on failure (zero chunks observable)", reader)
+			}
+			if err == nil {
+				t.Fatalf("Stream() error = nil, want a typed error")
+			}
+			asAttestReason(t, err, tt.reason)
+			if strings.Contains(err.Error(), testAPIKey) {
+				t.Fatalf("API key leaked into error string: %q", err.Error())
+			}
+		})
+	}
+}
+
+// TestStreamNon2xx asserts a non-2xx POST surfaces as a typed *llm.APIError with
+// a nil reader (zero chunks), no key leak.
+func TestStreamNon2xx(t *testing.T) {
+	t.Parallel()
+	keys := newGatewayKeys(t)
+	doer := &fakeDoer{t: t, keys: keys, tweaks: gatewayTweaks{status: http.StatusBadGateway}, stream: true}
+	client := newTestClient(t, doer, keys)
+
+	reader, err := client.Stream(context.Background(), testRequest())
+	if reader != nil {
+		t.Fatalf("Stream() reader = %+v, want nil", reader)
+	}
+	var apiErr *llm.APIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("error = %T (%v), want *llm.APIError", err, err)
+	}
+	if apiErr.Status != http.StatusBadGateway {
+		t.Errorf("APIError.Status = %d, want %d", apiErr.Status, http.StatusBadGateway)
+	}
+	if strings.Contains(err.Error(), testAPIKey) {
+		t.Fatalf("API key leaked into error string: %q", err.Error())
+	}
+}
+
+// TestStreamTransportError asserts a transport-level Do failure surfaces as a
+// typed *llm.NetworkError with a nil reader (no key leak).
+func TestStreamTransportError(t *testing.T) {
+	t.Parallel()
+	keys := newGatewayKeys(t)
+	attest := func(_ context.Context, _ string) (*VerifiedReport, error) {
+		return keys.verified, nil
+	}
+	failDoer := &errDoer{err: errors.New("dial tcp: connection refused")}
+	client := New(testBaseURL, testAPIKey, Policy{},
+		WithHTTPDoer(failDoer), WithNow(testNow), WithAttestFunc(attest))
+
+	reader, err := client.Stream(context.Background(), testRequest())
+	if reader != nil {
+		t.Fatalf("Stream() reader = %+v, want nil", reader)
+	}
+	var netErr *llm.NetworkError
+	if !errors.As(err, &netErr) {
+		t.Fatalf("error = %T (%v), want *llm.NetworkError", err, err)
+	}
+	if strings.Contains(err.Error(), testAPIKey) {
+		t.Fatalf("API key leaked into error string: %q", err.Error())
+	}
+}

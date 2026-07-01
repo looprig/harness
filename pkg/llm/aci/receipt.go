@@ -393,8 +393,10 @@ func (e *receiptVerifyError) Unwrap() error { return e.cause }
 //   - request.received.body_hash == Sha256HexBytes(expect.ReqBody) (the COMPACT
 //     serde_json bytes of the cleartext request body, which the caller computes
 //     via CompactJSON — Task 1.3);
-//   - response.returned.cleartext_hash == Sha256HexBytes(expect.RespBodyCleartext),
-//     and (when expect.RespWireBytes != nil) wire_hash == Sha256HexBytes(...);
+//   - response.returned.cleartext_hash == Sha256HexBytes(expect.RespBodyCleartext)
+//     (when expect.RespBodyCleartext != nil — the streaming caller passes nil and
+//     relies on wire_hash + the E2EE open), and (when expect.RespWireBytes != nil)
+//     wire_hash == Sha256HexBytes(...);
 //   - a matching upstream.verified event (result == "verified", model_id ==
 //     expect.ModelID, and — when expect.Vendor != "" — provider == expect.Vendor).
 //
@@ -432,11 +434,20 @@ const (
 // serde_json bytes (the caller — Task 5.2 — computes CompactJSON over the
 // decrypted cleartext request body); VerifyReceipt hashes those bytes directly
 // with Sha256HexBytes. The response cleartext and wire fields are likewise
-// already-serialized bytes. RespWireBytes is nil to SKIP the wire_hash check
-// (the wire-bytes hash is optional in the design doc). Vendor is the upstream
-// provider TYPE (the design doc's "vendor" maps to the event's `provider`
-// field); an empty Vendor skips the provider check, binding the upstream event
-// on result + model_id alone.
+// already-serialized bytes.
+//
+// RespBodyCleartext is nil to SKIP the cleartext_hash check. The non-streaming
+// caller (Invoke) supplies it, so cleartext_hash is enforced; the STREAMING
+// caller (Stream — Task 5.3) passes nil, because the client only sees the sealed
+// WIRE bytes and cannot reconstruct the raw upstream framing the gateway hashed
+// for cleartext_hash. For streaming, wire_hash (over the exact wire bytes) plus
+// the E2EE-authenticated open of each delta cover content authenticity instead.
+//
+// RespWireBytes is nil to SKIP the wire_hash check (the wire-bytes hash is
+// optional in the design doc). The two response-hash checks are independent: a
+// nil preimage skips only its own hash. Vendor is the upstream provider TYPE (the
+// design doc's "vendor" maps to the event's `provider` field); an empty Vendor
+// skips the provider check, binding the upstream event on result + model_id alone.
 type ReceiptExpect struct {
 	Endpoint          string
 	Method            string
@@ -571,26 +582,39 @@ func checkRequestBodyHash(r *Receipt, expect ReceiptExpect) error {
 	return nil
 }
 
-// checkResponseHashes enforces the response.returned bindings: cleartext_hash
-// equals Sha256HexBytes(expect.RespBodyCleartext) (MANDATORY) and, when
-// expect.RespWireBytes is non-nil, wire_hash equals Sha256HexBytes(...). An
-// absent event or field, or any mismatch, is fail-closed receipt_invalid.
+// checkResponseHashes enforces the response.returned bindings, each independently
+// conditional on the caller supplying the corresponding preimage:
+//
+//   - when expect.RespBodyCleartext != nil, cleartext_hash must equal
+//     Sha256HexBytes(expect.RespBodyCleartext);
+//   - when expect.RespWireBytes != nil, wire_hash must equal Sha256HexBytes(...).
+//
+// The non-streaming caller (Invoke) supplies BOTH, so both are checked. The
+// STREAMING caller (Stream) supplies RespWireBytes but NIL RespBodyCleartext: it
+// only ever sees the wire bytes, not the raw upstream framing the gateway hashed
+// for cleartext_hash, so it cannot reconstruct that preimage — wire_hash plus the
+// E2EE-authenticated open of each delta carry content authenticity instead. An
+// absent event, an absent field for a preimage that WAS supplied, or any mismatch,
+// is fail-closed receipt_invalid. A nil preimage skips only its own hash; every
+// other binding still holds.
 func checkResponseHashes(r *Receipt, expect ReceiptExpect) error {
 	ev, ok := findEvent(r, eventTypeResponseReturned)
 	if !ok {
 		return receiptInvalid("", "receipt has no response.returned event", nil)
 	}
 
-	cleartextHash, ok := eventField(ev, fieldCleartextHash)
-	if !ok {
-		return receiptInvalid("", "response.returned event has no cleartext_hash", nil)
-	}
-	wantCleartext, err := Sha256HexBytes(expect.RespBodyCleartext)
-	if err != nil {
-		return receiptInvalid("", "response cleartext hash failed", err)
-	}
-	if cleartextHash != wantCleartext {
-		return receiptInvalid("", "response.returned cleartext_hash does not match the response body", nil)
+	if expect.RespBodyCleartext != nil {
+		cleartextHash, ok := eventField(ev, fieldCleartextHash)
+		if !ok {
+			return receiptInvalid("", "response.returned event has no cleartext_hash", nil)
+		}
+		wantCleartext, err := Sha256HexBytes(expect.RespBodyCleartext)
+		if err != nil {
+			return receiptInvalid("", "response cleartext hash failed", err)
+		}
+		if cleartextHash != wantCleartext {
+			return receiptInvalid("", "response.returned cleartext_hash does not match the response body", nil)
+		}
 	}
 
 	if expect.RespWireBytes == nil {

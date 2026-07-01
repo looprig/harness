@@ -703,6 +703,38 @@ func TestVerifyReceiptWireHashSkippedWhenNil(t *testing.T) {
 	}
 }
 
+// TestVerifyReceiptCleartextHashSkippedWhenNil proves cleartext_hash is NOT
+// checked when RespBodyCleartext is nil, while wire_hash STILL is (the streaming
+// path — Task 5.3): the client only ever sees the wire bytes, not the raw
+// upstream framing, so it cannot reconstruct cleartext_hash; wire_hash + the
+// E2EE-authenticated open cover content authenticity instead. A receipt whose
+// cleartext_hash would mismatch passes when RespBodyCleartext is nil, but a
+// wrong wire_hash still fails closed.
+func TestVerifyReceiptCleartextHashSkippedWhenNil(t *testing.T) {
+	t.Parallel()
+	vr, priv, keyID := synthVerifiedReport(t)
+	respWire := []byte("resp-wire-bytes")
+
+	// Happy: cleartext_hash bogus, but skipped; wire_hash matches -> passes.
+	p := validReceiptParams(t, vr, synthReqBody, []byte("ignored-cleartext"), respWire, synthProvider, synthModelID)
+	p.cleartextHash = "sha256:" + strings.Repeat("a", 64) // would NOT match any cleartext
+	receiptJSON := buildSignedReceipt(t, p, keyID, priv)
+
+	expect := synthExpect(p.reqBodyCompact, nil, respWire) // RespBodyCleartext nil -> skip cleartext_hash
+	if err := VerifyReceipt(receiptJSON, &vr, expect); err != nil {
+		t.Fatalf("VerifyReceipt(cleartext skip) error = %v, want nil", err)
+	}
+
+	// Fail-closed guard: with cleartext_hash skipped, a wrong wire_hash STILL
+	// rejects the receipt (wire_hash is the retained binding for streaming).
+	p2 := validReceiptParams(t, vr, synthReqBody, []byte("ignored-cleartext"), respWire, synthProvider, synthModelID)
+	p2.wireHash = "sha256:" + strings.Repeat("b", 64) // wrong wire_hash
+	receiptJSON2 := buildSignedReceipt(t, p2, keyID, priv)
+
+	expect2 := synthExpect(p2.reqBodyCompact, nil, respWire) // still skip cleartext, provide wire
+	requireReceiptInvalid(t, VerifyReceipt(receiptJSON2, &vr, expect2))
+}
+
 // TestVerifyReceiptVendorEmptySkipsProvider proves an empty expect.Vendor skips
 // the provider check: a receipt whose provider differs still passes on model_id
 // + result alone.

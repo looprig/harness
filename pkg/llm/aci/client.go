@@ -35,6 +35,7 @@ import (
 	"github.com/ciram-co/looprig/pkg/content"
 	"github.com/ciram-co/looprig/pkg/llm"
 	"github.com/ciram-co/looprig/pkg/llm/openaiapi"
+	secp256k1 "github.com/decred/dcrd/dcrec/secp256k1/v4"
 )
 
 // Endpoint paths (relative to baseURL). They are protocol-pinned; the gateway
@@ -295,10 +296,225 @@ func (c *Client) Invoke(ctx context.Context, req llm.Request) (*llm.Response, er
 	return resp, nil
 }
 
-// Stream is not yet implemented for the ACI client (Task 5.4). It returns a typed
-// error so the llm.LLM contract is satisfied without a silent nil.
-func (c *Client) Stream(_ context.Context, _ llm.Request) (*llm.StreamReader[content.Chunk], error) {
-	return nil, &notImplementedError{op: "Stream"}
+// Stream runs the buffer-until-verified flow for a streaming chat request. It
+// buffers the FULL sealed SSE response, opens + verifies it (receipt signature +
+// request body_hash + wire_hash + upstream + the E2EE-authenticated open of every
+// delta), and ONLY THEN returns a *llm.StreamReader replaying the already-verified
+// opened deltas. On ANY failure it returns a typed error and a NIL reader, so the
+// caller observes ZERO chunks — no unverified delta is ever observable.
+//
+// Streaming SKIPS the receipt cleartext_hash check (RespBodyCleartext is nil): the
+// client only sees the sealed WIRE bytes, not the raw upstream SSE framing the
+// gateway hashed for cleartext_hash, so it cannot reconstruct that preimage.
+// wire_hash (over the exact wire bytes) plus the per-delta AEAD open — each delta
+// AAD-bound to the attested gateway — carry content authenticity instead.
+func (c *Client) Stream(ctx context.Context, req llm.Request) (*llm.StreamReader[content.Chunk], error) {
+	if err := req.Model.Validate(); err != nil {
+		return nil, err
+	}
+	model := req.Model.Model
+
+	// 1. Attest (cached).
+	verified, err := c.cache.get(ctx, model)
+	if err != nil {
+		return nil, err
+	}
+
+	// 2. Encode with stream=true, re-parse into the ORDERED body, snapshot the
+	//    cleartext compact bytes (the receipt body_hash preimage) BEFORE sealing.
+	body, err := openaiapi.EncodeRequest(req, true)
+	if err != nil {
+		return nil, &encodeError{Err: err}
+	}
+	parsed, err := ParseBodyValue(body)
+	if err != nil {
+		return nil, &encodeError{Err: err}
+	}
+	orderedBody, ok := parsed.(*Object)
+	if !ok {
+		return nil, &encodeError{Err: &bodyShapeError{}}
+	}
+	cleartextReqBody, err := CompactJSON(orderedBody)
+	if err != nil {
+		return nil, &encodeError{Err: err}
+	}
+
+	// 3. Seal the request E2EE to the attested model key (in place).
+	sealed, err := sealRequest(orderedBody, verified, c.now)
+	if err != nil {
+		return nil, err
+	}
+
+	// 4. POST the sealed body; buffer the FULL SSE wire response and the receipt id.
+	wireBytes, receiptID, err := c.postInference(ctx, sealed)
+	if err != nil {
+		return nil, err
+	}
+
+	// 5. Parse the buffered SSE and OPEN every sealed delta in order. Any open
+	//    failure is fail-closed e2ee_failed; no chunk escapes.
+	chunks, err := openStreamDeltas(wireBytes, sealed.ClientPriv, model, sealed.Nonce, sealed.Timestamp)
+	if err != nil {
+		return nil, err
+	}
+
+	// 6. Fetch + verify the receipt. Streaming binds request body_hash, wire_hash,
+	//    and the upstream event; cleartext_hash is SKIPPED (RespBodyCleartext nil).
+	receiptJSON, err := c.fetchReceipt(ctx, receiptID)
+	if err != nil {
+		return nil, err
+	}
+	expect := ReceiptExpect{
+		Endpoint: endpointChat,
+		Method:   methodPost,
+		// Vendor intentionally EMPTY until the live round-trip (Task 6.1) pins it.
+		Vendor:            "",
+		ModelID:           model,
+		ReqBody:           cleartextReqBody,
+		RespBodyCleartext: nil, // streaming: skip cleartext_hash (wire_hash + E2EE cover it)
+		RespWireBytes:     wireBytes,
+	}
+	if err := VerifyReceipt(receiptJSON, verified, expect); err != nil {
+		return nil, err
+	}
+
+	// 7. ONLY NOW — every check passed — hand back a reader replaying the verified
+	//    deltas. Nothing produced this reader before verification, so a failure
+	//    above yields no reader and zero observable chunks.
+	return newReplayReader(chunks), nil
+}
+
+// newReplayReader builds a *llm.StreamReader that replays a pre-built, already-
+// verified chunk slice: Next returns each chunk in order and (nil, io.EOF) once
+// exhausted; Close is a no-op (the wire response was fully buffered and closed
+// during Stream, so there is no underlying connection to release). The cursor is
+// closed over locally, so a fresh reader is independent.
+func newReplayReader(chunks []content.Chunk) *llm.StreamReader[content.Chunk] {
+	i := 0
+	next := func() (content.Chunk, error) {
+		if i >= len(chunks) {
+			return nil, io.EOF
+		}
+		chunk := chunks[i]
+		i++
+		return chunk, nil
+	}
+	return llm.NewStreamReader[content.Chunk](next, nil)
+}
+
+// bodyKeyDelta is the streaming chunk's per-choice sealed-field container: the
+// gateway seals choices[].delta.content / choices[].delta.reasoning_content (the
+// streaming analogue of the non-streaming choices[].message.* fields).
+const bodyKeyDelta = "delta"
+
+// openStreamDeltas parses the buffered SSE wire bytes and opens every sealed
+// delta in order, returning the cleartext deltas as content.Chunks: a sealed
+// choices[].delta.content maps to a *content.TextChunk, reasoning_content to a
+// *content.ThinkingChunk. Each field is opened with the client key under the SAME
+// chatResponseAAD used non-streaming, bound to that CHUNK's own id and the
+// choice index. The [DONE] event terminates the stream. Any SSE read failure, a
+// non-object chunk payload, or any AEAD open failure is fail-closed (open
+// failures surface as e2ee_failed) so NO chunk escapes an unverified stream.
+func openStreamDeltas(wireBytes []byte, clientPriv *secp256k1.PrivateKey, model, nonce string, ts uint64) ([]content.Chunk, error) {
+	if clientPriv == nil {
+		return nil, attestErr(reasonE2EEFailed, &e2eeOpenError{Stage: "nil client key"})
+	}
+
+	sse := openaiapi.NewSSEReader(bytes.NewReader(wireBytes))
+	var chunks []content.Chunk
+	for {
+		payload, err := sse.Next()
+		if err == io.EOF {
+			return chunks, nil
+		}
+		if err != nil {
+			return nil, &streamParseError{reason: "SSE read failed", cause: err}
+		}
+
+		eventChunks, err := openStreamEvent([]byte(payload), clientPriv, model, nonce, ts)
+		if err != nil {
+			return nil, err
+		}
+		chunks = append(chunks, eventChunks...)
+	}
+}
+
+// openStreamEvent opens one SSE chunk event: it order-preservingly parses the
+// chunk JSON, reads the chunk id (the AAD {id}) and its choices, and opens each
+// choice's sealed delta.content / delta.reasoning_content in order. A non-object
+// payload is a malformed stream (fail-closed streamParseError); an open failure
+// propagates as the fail-closed e2ee_failed AttestationError.
+func openStreamEvent(payload []byte, clientPriv *secp256k1.PrivateKey, model, nonce string, ts uint64) ([]content.Chunk, error) {
+	parsed, err := ParseBodyValue(payload)
+	if err != nil {
+		return nil, &streamParseError{reason: "chunk is not valid JSON", cause: err}
+	}
+	chunkObj, ok := parsed.(*Object)
+	if !ok {
+		return nil, &streamParseError{reason: "chunk is not a JSON object"}
+	}
+
+	chunkID := responseBodyID(chunkObj)
+	choicesV, ok := objectGet(chunkObj, bodyKeyChoices)
+	if !ok {
+		return nil, nil // e.g. a keep-alive / usage-only chunk: no deltas.
+	}
+	choices, ok := choicesV.(Array)
+	if !ok {
+		return nil, nil
+	}
+
+	var out []content.Chunk
+	for i := range choices {
+		choice, ok := choices[i].(*Object)
+		if !ok {
+			continue
+		}
+		ci := itemIndex(choice, i)
+		deltaV, ok := objectGet(choice, bodyKeyDelta)
+		if !ok {
+			continue
+		}
+		delta, ok := deltaV.(*Object)
+		if !ok {
+			continue
+		}
+
+		// content -> TextChunk. Open in place, then read the cleartext back.
+		if err := openStringField(delta, respFieldContent, clientPriv,
+			chatResponseAAD(e2eeRequestAlgo, model, chunkID, ci, respFieldContent, nonce, ts)); err != nil {
+			return nil, attestErr(reasonE2EEFailed, err)
+		}
+		if s, ok := stringField(delta, respFieldContent); ok {
+			out = append(out, &content.TextChunk{Text: s})
+		}
+
+		// reasoning_content -> ThinkingChunk.
+		if err := openStringField(delta, respFieldReasoningContent, clientPriv,
+			chatResponseAAD(e2eeRequestAlgo, model, chunkID, ci, respFieldReasoningContent, nonce, ts)); err != nil {
+			return nil, attestErr(reasonE2EEFailed, err)
+		}
+		if s, ok := stringField(delta, respFieldReasoningContent); ok {
+			out = append(out, &content.ThinkingChunk{Thinking: s})
+		}
+	}
+	return out, nil
+}
+
+// stringField returns the opened string value of a delta field (content /
+// reasoning_content) after openStringField has replaced the sealed blob with the
+// cleartext. It returns ok false when the field is absent or not a string, so a
+// delta that carried no sealed field produces no chunk.
+func stringField(obj *Object, field string) (string, bool) {
+	v, ok := objectGet(obj, field)
+	if !ok {
+		return "", false
+	}
+	s, ok := v.(String)
+	if !ok {
+		return "", false
+	}
+	return string(s), true
 }
 
 // postInference POSTs the sealed body to /v1/chat/completions with the E2EE
@@ -541,13 +757,21 @@ func (e *responseTooLargeError) Error() string {
 		strconv.Itoa(e.limit) + " bytes"
 }
 
-// notImplementedError reports an llm.LLM operation the ACI client does not yet
-// support (Stream, until Task 5.4). op names the operation; a fixed label, never
-// external data.
-type notImplementedError struct {
-	op string
+// streamParseError reports a malformed buffered SSE stream: a data event whose
+// payload is not a JSON object (the only chunk shape the gateway emits), or an
+// SSE read failure. It is fail-closed — a malformed stream yields no reader — and
+// carries no payload beyond a fixed reason label and any chained cause.
+type streamParseError struct {
+	reason string
+	cause  error
 }
 
-func (e *notImplementedError) Error() string {
-	return "aci/client: " + e.op + " is not implemented"
+func (e *streamParseError) Error() string {
+	msg := "aci/client: stream parse: " + e.reason
+	if e.cause != nil {
+		return msg + ": " + e.cause.Error()
+	}
+	return msg
 }
+
+func (e *streamParseError) Unwrap() error { return e.cause }
