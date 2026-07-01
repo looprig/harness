@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/ciram-co/looprig/pkg/llm"
+	"github.com/ciram-co/looprig/pkg/llm/aci"
 )
 
 func temp(f float64) *float64 { return &f }
@@ -45,5 +46,20 @@ func TestNew(t *testing.T) {
 				t.Fatalf("New() llm = %v, wantLLM %v", got, tt.wantLLM)
 			}
 		})
+	}
+}
+
+// TestNewPhalaReturnsACIClient pins the Phala provider to the confidential-inference
+// aci.Client (built via aci.New with aci.DefaultPhalaPolicy). The table above only
+// asserts non-nil; this asserts the concrete type so the wiring can't silently
+// regress to another client.
+func TestNewPhalaReturnsACIClient(t *testing.T) {
+	t.Parallel()
+	got, err := New(llm.ModelSpec{Provider: llm.ProviderPhala, BaseURL: "http://x", APIKey: "k"})
+	if err != nil {
+		t.Fatalf("New() err = %v, want nil", err)
+	}
+	if _, ok := got.(*aci.Client); !ok {
+		t.Fatalf("New() llm = %T, want *aci.Client", got)
 	}
 }
