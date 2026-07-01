@@ -1,0 +1,25 @@
+{
+  "description": "Authoritative DETERMINISTIC cross-implementation reference vector for the ACI E2EE v2 seal/open primitive (secp256k1 ECDH -> HKDF-SHA256 -> AES-256-GCM). Generated and round-trip-verified in Python using the standard algorithm: secp256k1 ECDH shared secret = affine X-coordinate (32 bytes); HKDF-SHA256 with salt=nil, info=\"aci.e2ee.v2.secp256k1\" -> 32-byte key; AES-256-GCM with a 12-byte nonce; Go's GCM appends the 16-byte tag. The ephemeral private key and nonce here are FIXED (not random) purely so the output is byte-reproducible; production seal uses crypto/rand for both. This vector is a deterministic cross-impl arbiter only. The authoritative live-gateway byte match is proven by the live round-trip (Task 6.1), because the real Dstack gateway uses a random ephemeral+nonce per field and ships no static vectors.",
+  "source": {
+    "algorithm": "secp256k1 ECDH (affine X-coord) + HKDF-SHA256(salt=nil, info=\"aci.e2ee.v2.secp256k1\") + AES-256-GCM(12-byte nonce, 16-byte tag)",
+    "reference": "Rust src/aci/e2ee.rs::encrypt_for_public_key / decrypt_with_secret_key (k256 raw_secret_bytes == decred secp256k1.GenerateSharedSecret == Python X-coord)",
+    "generated_by": "deterministic Python cross-impl harness (fixed ephemeral + nonce); round-trip-verified"
+  },
+  "constants": {
+    "public_key_len": 65,
+    "nonce_len": 12,
+    "tag_len": 16,
+    "hkdf_info": "aci.e2ee.v2.secp256k1"
+  },
+  "blob_layout": "bytes[0:65] = ephemeral pubkey uncompressed (starts 0x04); bytes[65:77] = nonce; bytes[77:] = AES-256-GCM ciphertext+tag",
+  "vector": {
+    "model_priv": "1111111111111111111111111111111111111111111111111111111111111111",
+    "eph_priv": "2222222222222222222222222222222222222222222222222222222222222222",
+    "model_pub": "044f355bdcb7cc0af728ef3cceb9615d90684bb5b2ca5f859ab0f0b704075871aa385b6b1b8ead809ca67454d9683fcf2ba03456d6fe2c4abe2b07f0fbdbb2f1c1",
+    "plaintext": "hello confidential world",
+    "aad": "v2|req|algo=secp256k1-aes-256-gcm-hkdf-sha256|m=0|c=-",
+    "nonce": "0a0b0c0d0e0f101112131415",
+    "shared_x": "77e0510d5042e2f5e9e59c977b81eeed590cf7d20c1c51da451a8eaa9fdc45ff",
+    "ciphertext_hex": "04466d7fcae563e5cb09a0d1870bb580344804617879a14949cf22285f1bae3f276728176c3c6431f8eeda4538dc37c865e2784f3a9e77d044f33e407797e1278a0a0b0c0d0e0f10111213141518d7f5fb5e0d9b371ee853693aa4c260c94d0897b7cfdb4c9df59fcdedb38bc6067c8ad6f0a1a959"
+  }
+}

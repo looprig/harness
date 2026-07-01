@@ -2,9 +2,9 @@ package auto
 
 import (
 	"github.com/ciram-co/looprig/pkg/llm"
+	"github.com/ciram-co/looprig/pkg/llm/aci"
 	"github.com/ciram-co/looprig/pkg/llm/openaiapi/chutes"
 	"github.com/ciram-co/looprig/pkg/llm/openaiapi/lmstudio"
-	"github.com/ciram-co/looprig/pkg/llm/openaiapi/phala"
 )
 
 // New validates spec and constructs the concrete provider client for spec.Provider.
@@ -18,7 +18,7 @@ func New(spec llm.ModelSpec) (llm.LLM, error) {
 	case llm.ProviderLMStudio:
 		return lmstudio.New(spec.BaseURL), nil
 	case llm.ProviderPhala:
-		return phala.New(spec.BaseURL, spec.APIKey), nil
+		return aci.New(spec.BaseURL, spec.APIKey, aci.DefaultPhalaPolicy()), nil
 	case llm.ProviderChutes:
 		return chutes.New(spec.BaseURL, spec.APIKey), nil
 	default:

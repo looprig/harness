@@ -13,6 +13,7 @@ require (
 	charm.land/bubbletea/v2 v2.0.7
 	charm.land/glamour/v2 v2.0.1
 	charm.land/lipgloss/v2 v2.0.4
+	github.com/decred/dcrd/dcrec/secp256k1/v4 v4.4.1
 	github.com/google/go-tdx-guest v0.3.1
 	github.com/nats-io/nats-server/v2 v2.14.2
 	github.com/nats-io/nats.go v1.52.0
