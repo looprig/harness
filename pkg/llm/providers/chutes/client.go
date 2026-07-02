@@ -28,6 +28,7 @@ var _ llm.LLM = (*Client)(nil)
 // Default attestation-service URLs (WIRE.md section 7). The NRAS path is /v3,
 // not /v4. Tests override these via WithNRAS.
 const (
+	defaultAPIBase = "https://api.chutes.ai"
 	defaultLLMBase = "https://llm.chutes.ai"
 	defaultNRASURL = "https://nras.attestation.nvidia.com/v3/attest/gpu"
 	defaultJWKSURL = "https://nras.attestation.nvidia.com/.well-known/jwks.json"
@@ -107,6 +108,9 @@ func WithNRAS(nrasURL, jwksURL string) Option {
 // http.Client, the caches, and the real attestFn) are applied first, then
 // options override.
 func New(apiBase, apiKey string, opts ...Option) *Client {
+	if apiBase == "" {
+		apiBase = defaultAPIBase
+	}
 	c := &Client{
 		http:         &http.Client{},
 		apiBase:      apiBase,

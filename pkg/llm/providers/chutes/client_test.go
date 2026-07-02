@@ -679,3 +679,29 @@ func TestClientInvoke_WarmCache(t *testing.T) {
 		})
 	}
 }
+
+// TestNewDefaultsAPIBase verifies New self-defaults an empty apiBase to the
+// canonical evidence host and leaves a non-empty apiBase untouched.
+func TestNewDefaultsAPIBase(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		apiBase string
+		want    string
+	}{
+		{name: "empty defaults to canonical host", apiBase: "", want: "https://api.chutes.ai"},
+		{name: "non-empty passes through unchanged", apiBase: "https://custom.example", want: "https://custom.example"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			c := chutes.New(tt.apiBase, "sk-test")
+			if got := c.APIBaseForTest(); got != tt.want {
+				t.Errorf("apiBase = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
