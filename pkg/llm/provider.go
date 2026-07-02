@@ -43,6 +43,20 @@ func (p Provider) supportsAPIFormat(f APIFormat) bool {
 	}
 }
 
+// allowsEmptyBaseURL reports whether an empty Model.BaseURL is acceptable for the
+// provider — true when the base is resolvable to a canonical endpoint: Bedrock is
+// region-routed (no base), and every other current provider has a default endpoint
+// the SDK supplies when BaseURL is empty. Fail-closed: an unknown/future provider
+// with no default returns false, so Validate keeps requiring an explicit base for it.
+func (p Provider) allowsEmptyBaseURL() bool {
+	switch p {
+	case ProviderBedrock, ProviderChutes, ProviderPhala, ProviderOpenRouter, ProviderLMStudio, ProviderGoogle:
+		return true
+	default:
+		return false
+	}
+}
+
 // RequiredAuth reports which credential kind the provider needs, erroring on an unknown provider
 // so a newly added one must be classified here before use. Multi-auth-ready successor to
 // RequiresKey; fail-closed by the same rationale (a permissive default would fail open).

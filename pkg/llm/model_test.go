@@ -106,8 +106,18 @@ func TestModel_Validate(t *testing.T) {
 			wantErr: true,
 		},
 		{
-			name:    "error empty base url",
+			name:    "valid chutes empty baseurl accepted by validate",
 			model:   llm.Model{Provider: llm.ProviderChutes, APIFormat: llm.APIFormatOpenAI, BaseURL: "", Name: "m"},
+			wantErr: false,
+		},
+		{
+			name:    "valid lmstudio empty baseurl accepted by validate",
+			model:   llm.Model{Provider: llm.ProviderLMStudio, APIFormat: llm.APIFormatOpenAI, BaseURL: "", Name: "qwen"},
+			wantErr: false,
+		},
+		{
+			name:    "error unknown provider empty baseurl rejected",
+			model:   llm.Model{Provider: llm.Provider("bogus"), APIFormat: llm.APIFormatOpenAI, BaseURL: "", Name: "m"},
 			wantErr: true,
 		},
 		{
