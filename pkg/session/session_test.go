@@ -127,8 +127,20 @@ func (r *recordingSub) waitTurnCausationID(d time.Duration) (uuid.UUID, bool) {
 	}
 }
 
+// validModel returns a minimal but VALID llm.Model (passes llm.Model.Validate): a
+// known provider speaking a supported dialect at a loopback endpoint. It replaces the
+// retired ModelSpec in session tests that construct a loop.Config.
+func validModel(name string) llm.Model {
+	return llm.Model{
+		Provider:  llm.ProviderLMStudio,
+		APIFormat: llm.APIFormatOpenAI,
+		BaseURL:   "http://localhost:1234",
+		Name:      name,
+	}
+}
+
 func cfg(client llm.LLM) loop.Config {
-	return loop.Config{Client: client, Model: llm.ModelSpec{Model: "m"}, DrainTimeout: 100 * time.Millisecond}
+	return loop.Config{Client: client, Model: validModel("m"), DrainTimeout: 100 * time.Millisecond}
 }
 
 func TestNew(t *testing.T) {
@@ -575,7 +587,7 @@ func TestNewLoopReturnsLoopNewError(t *testing.T) {
 
 	// loop.New rejects a nil Client with *ConfigError{ConfigMissingClient} before
 	// starting any goroutine — the cheapest validation failure to inject.
-	badCfg := loop.Config{Model: llm.ModelSpec{Model: "m"}}
+	badCfg := loop.Config{Model: validModel("m")}
 	loopID, err := s.NewLoop(loop.Provenance{}, badCfg)
 
 	// (a) the loop.New error is returned, unwrapped, not remapped to *SessionError.

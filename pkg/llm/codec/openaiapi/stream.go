@@ -2,7 +2,6 @@
 package openaiapi
 
 import (
-	"encoding/json"
 	"io"
 
 	"github.com/ciram-co/looprig/pkg/content"
@@ -12,57 +11,38 @@ import (
 
 // NewStream constructs a StreamReader[content.Chunk] from an HTTP response body
 // containing OpenAI SSE events. The caller must Close the reader when done.
+//
+// It de-frames each SSE data line via the shared sse.Reader and decodes it with
+// decodeEvent — the exact same per-event logic Codec.DecodeEvent exposes — then
+// emits one chunk per Next(). A single delta line that yields more than one chunk
+// (multiple tool-call entries) is buffered in pending and drained one per call so
+// none are dropped. Retained for chutes and the existing OpenAI-dialect tests;
+// the transport's StreamChunks is the codec-injected equivalent.
 func NewStream(body io.ReadCloser) *llm.StreamReader[content.Chunk] {
 	reader := sse.NewReader(body)
-	// pending holds tool-call entries left over from a single SSE delta line that
-	// carried more than one entry. The loop emits one chunk per Next(); these are
-	// drained before the next SSE line is read so multi-entry lines are not dropped.
-	var pending []sseToolCallDelta
+	// pending holds chunks left over from a single SSE line that decoded to more
+	// than one chunk; they are drained before the next line is read.
+	var pending []content.Chunk
 	return llm.NewStreamReader(func() (content.Chunk, error) {
 		for {
-			// Drain any buffered tool-call entries from a prior multi-entry line first.
 			if len(pending) > 0 {
-				tc := pending[0]
+				c := pending[0]
 				pending = pending[1:]
-				return &content.ToolUseChunk{
-					Index:     tc.Index,
-					ID:        tc.ID,
-					Name:      tc.Function.Name,
-					InputJSON: tc.Function.Arguments,
-				}, nil
+				return c, nil
 			}
-
 			line, err := reader.Next()
 			if err != nil {
 				return nil, err
 			}
-			var ev sseChunk
-			if err := json.Unmarshal([]byte(line), &ev); err != nil {
-				continue // skip malformed lines
+			chunks, err := decodeEvent([]byte(line))
+			if err != nil {
+				return nil, err
 			}
-			if len(ev.Choices) == 0 {
-				continue
+			if len(chunks) == 0 {
+				continue // malformed / empty / role-only: keep reading
 			}
-			delta := ev.Choices[0].Delta
-
-			if delta.ReasoningContent != "" {
-				return &content.ThinkingChunk{Thinking: delta.ReasoningContent}, nil
-			}
-			if delta.Content != "" {
-				return &content.TextChunk{Text: delta.Content}, nil
-			}
-			if len(delta.ToolCalls) > 0 {
-				// Buffer this line's entries (dropping wholly-empty ones) and let the
-				// drain branch at the top of the loop emit them one per Next().
-				for _, tc := range delta.ToolCalls {
-					if tc.ID == "" && tc.Function.Name == "" && tc.Function.Arguments == "" {
-						continue
-					}
-					pending = append(pending, tc)
-				}
-				continue
-			}
-			// Empty delta (role-only or finish): keep reading.
+			pending = chunks[1:]
+			return chunks[0], nil
 		}
 	}, body.Close)
 }

@@ -88,6 +88,15 @@ type httpDoer interface {
 //
 // It implements llm.LLM. It is safe for concurrent use: the only mutable shared
 // state is the session cache, which is internally synchronized.
+//
+// Connection-binding note (fail-safe asymmetry): unlike the generic
+// transport.Client — which binds one Endpoint and rejects a request whose
+// Model.Provider/BaseURL differs with a pre-I/O *llm.ModelMismatchError — this
+// client binds its gateway endpoint at construction (New's baseURL) and enforces
+// model identity per request via TEE attestation. A provider/endpoint mismatch
+// therefore surfaces as an *AttestationError (attestation cannot succeed against
+// the wrong model/gateway), not an *llm.ModelMismatchError. This is fail-safe:
+// the request is never sent when the check fails; only the error type differs.
 type Client struct {
 	baseURL string
 	apiKey  string
@@ -218,7 +227,7 @@ func (c *Client) Invoke(ctx context.Context, req llm.Request) (*llm.Response, er
 	if err := req.Model.Validate(); err != nil {
 		return nil, err
 	}
-	model := req.Model.Model
+	model := req.Model.Name
 
 	// 1. Attest (cached). A failure here is already a typed *llm.AttestationError.
 	verified, err := c.cache.get(ctx, model)
@@ -316,7 +325,7 @@ func (c *Client) Stream(ctx context.Context, req llm.Request) (*llm.StreamReader
 	if err := req.Model.Validate(); err != nil {
 		return nil, err
 	}
-	model := req.Model.Model
+	model := req.Model.Name
 
 	// 1. Attest (cached).
 	verified, err := c.cache.get(ctx, model)

@@ -14,20 +14,26 @@ import (
 // struct. Exported so provider packages can embed or extend the result before
 // marshaling (e.g. chutes adds e2e_response_pk as a typed field).
 func BuildChatRequest(req llm.Request, stream bool) (ChatRequest, error) {
-	cr := ChatRequest{
-		Model:           req.Model.Model,
-		Temperature:     req.Model.Temperature,
-		TopP:            req.Model.TopP,
-		MaxTokens:       req.Model.MaxTokens,
-		Stop:            req.Model.Stop,
-		Stream:          stream,
-		ReasoningEffort: string(req.Model.ReasoningEffort),
+	// Effective sampling: a non-nil per-call Override wins over Model.Sampling.
+	sampling := req.Model.Sampling
+	if req.Override != nil {
+		sampling = *req.Override
 	}
 
-	if req.Model.System != "" {
+	cr := ChatRequest{
+		Model:           req.Model.Name,
+		Temperature:     sampling.Temperature,
+		TopP:            sampling.TopP,
+		MaxTokens:       sampling.MaxTokens,
+		Stop:            sampling.Stop,
+		Stream:          stream,
+		ReasoningEffort: reasoningEffort(sampling.Effort),
+	}
+
+	if req.System != "" {
 		cr.Messages = append(cr.Messages, chatMessage{
 			Role:    "system",
-			Content: req.Model.System,
+			Content: req.System,
 		})
 	}
 
@@ -55,13 +61,31 @@ func BuildChatRequest(req llm.Request, stream bool) (ChatRequest, error) {
 
 // EncodeRequest converts a provider-neutral llm.Request to an OpenAI chat
 // completions JSON body. stream=true adds "stream":true to the body.
-// ModelSpec.System is prepended as a system message if non-empty.
+// Request.System is prepended as a system message if non-empty.
 func EncodeRequest(req llm.Request, stream bool) ([]byte, error) {
 	cr, err := BuildChatRequest(req, stream)
 	if err != nil {
 		return nil, err
 	}
 	return json.Marshal(cr)
+}
+
+// reasoningEffort maps the dialect-neutral llm.Effort to the OpenAI Chat
+// Completions reasoning_effort wire value. OpenAI's o-series accepts only
+// "low" | "medium" | "high" (there is no "max"), so llm.EffortMax clamps to
+// "high" — the strongest value the wire accepts. EffortNone (and any unknown
+// value, fail-safe) yields "", which the omitempty tag drops from the body.
+func reasoningEffort(e llm.Effort) string {
+	switch e {
+	case llm.EffortLow:
+		return "low"
+	case llm.EffortMedium:
+		return "medium"
+	case llm.EffortHigh, llm.EffortMax:
+		return "high"
+	default: // EffortNone or unknown → omit
+		return ""
+	}
 }
 
 // encodeConversation dispatches a content.Conversation to the appropriate

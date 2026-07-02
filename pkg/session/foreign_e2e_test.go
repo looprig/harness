@@ -12,7 +12,6 @@ import (
 	"github.com/ciram-co/looprig/pkg/content"
 	"github.com/ciram-co/looprig/pkg/event"
 	"github.com/ciram-co/looprig/pkg/foreignloop"
-	"github.com/ciram-co/looprig/pkg/llm"
 	"github.com/ciram-co/looprig/pkg/loop"
 	"github.com/ciram-co/looprig/pkg/uuid"
 )
@@ -212,19 +211,19 @@ func foreignSubLoopStarted(r *recordingEventAppender, primary uuid.UUID) (event.
 }
 
 // foreignPrimaryCfg builds a foreign-engine loop.Config for a primary loop. cfg() seeds a
-// usable native cfg; the foreign engine ignores Client, but Model.System is required by
+// usable native cfg; the foreign engine ignores Client, but System is required by
 // the foreign actor's wiring validation.
 func foreignPrimaryCfg() loop.Config {
 	c := cfg(&stubLLM{chunks: []content.Chunk{textChunk("unused")}})
 	c.Engine = loop.EngineForeignClaude
-	c.Model.System = "sys"
+	c.System = "sys"
 	return c
 }
 
 // foreignSubCfg builds the FRESH foreign-engine cfg a RunSubagent call passes for its
-// sub-loop (a foreign loop needs only Engine + Model.System).
+// sub-loop (a foreign loop needs only Engine + System).
 func foreignSubCfg() loop.Config {
-	return loop.Config{Engine: loop.EngineForeignClaude, Model: llm.ModelSpec{System: "sys"}}
+	return loop.Config{Engine: loop.EngineForeignClaude, System: "sys"}
 }
 
 // TestForeignPrimaryE2E runs the REAL foreign actor as the session PRIMARY: New mints a

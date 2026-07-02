@@ -22,7 +22,7 @@ import (
 // The fixture (testdata/report_aci1.json) is the arbiter. Its freshness window
 // is [1782664738, 1782668338) (a 1-hour half-open window); the offline full
 // chain uses now = 1782664738 (the inclusive lower bound) with the capture nonce
-// and DefaultPhalaPolicy.
+// and testPolicy.
 
 // fixtureNow is a time inside the fixture's freshness window (== fetched_at, the
 // inclusive lower bound of the half-open [fetched_at, stale_after) window).
@@ -30,6 +30,31 @@ const (
 	fixtureFetchedAt  int64 = 1782664738
 	fixtureStaleAfter int64 = 1782668338
 )
+
+// testPolicy builds an attestation acceptance Policy whose anchors MATCH THE
+// FIXTURE (testdata/report_aci1.json): the fixture app-id, its {repo_url,
+// repo_commit} source provenance, and its recovered KMS root, with an empty
+// AcceptedWorkloadIDs (step 9 skipped by default). These generic chain tests need
+// *a* valid policy for the fixture, not the shipped provider preset — the pinned
+// production Phala anchors now live in pkg/llm/providers/phala (phala.DefaultPolicy).
+// It draws the values from the same fixture-derived constants the per-step tests
+// use (fixtureAppIDHex, fixtureRepoURL/fixtureRepoCommit, fixtureKMSRoot), so a
+// drift in the fixture is still caught, and it returns a fresh value each call so
+// a test may narrow it without corrupting another.
+func testPolicy() Policy {
+	return Policy{
+		AcceptedWorkloadIDs: map[string]struct{}{},
+		AcceptedSourceProvenance: map[ProvenanceKey]struct{}{
+			{RepoURL: fixtureRepoURL, RepoCommit: fixtureRepoCommit}: {},
+		},
+		AcceptedAppIDs: map[string]struct{}{
+			fixtureAppIDHex: {},
+		},
+		AcceptedKMSRootPubKeys: map[string]struct{}{
+			fixtureKMSRoot: {},
+		},
+	}
+}
 
 // fakeQuoteVerifier returns the fixture's real 64-byte quote_report_data as the
 // "verified" report_data, standing in for the live DCAP verifier offline.
@@ -72,7 +97,7 @@ func remarshalReport(t *testing.T, rep *Report) []byte {
 
 // TestVerifyReportOfflineFullChain is THE arbiter for Task 2.8: the whole chain
 // (steps 1–9) passes offline against the fixture with the capture nonce, a now
-// inside the freshness window, DefaultPhalaPolicy, and the fake quote seam. The
+// inside the freshness window, testPolicy, and the fake quote seam. The
 // returned *VerifiedReport must carry the fixture's workload_id, keyset digest,
 // and the validated e2ee + receipt-signing keys (Phase 3/4 consumers).
 func TestVerifyReportOfflineFullChain(t *testing.T) {
@@ -80,7 +105,7 @@ func TestVerifyReportOfflineFullChain(t *testing.T) {
 	raw := readFixture(t)
 	rep := fixtureReport(t)
 
-	vr, err := verifyReport(raw, strPtr(captureNonce), time.Unix(fixtureFetchedAt, 0), DefaultPhalaPolicy(), fakeQuoteVerifier(rep))
+	vr, err := verifyReport(raw, strPtr(captureNonce), time.Unix(fixtureFetchedAt, 0), testPolicy(), fakeQuoteVerifier(rep))
 	if err != nil {
 		t.Fatalf("verifyReport(full chain) = %v, want nil", err)
 	}
@@ -128,7 +153,7 @@ func TestVerifyReportPerStepFailures(t *testing.T) {
 				rep := fixtureReport(t)
 				vf := fakeQuoteVerifier(rep)
 				rep.APIVersion = "aci/2"
-				return remarshalReport(t, rep), strPtr(captureNonce), time.Unix(fixtureFetchedAt, 0), DefaultPhalaPolicy(), vf
+				return remarshalReport(t, rep), strPtr(captureNonce), time.Unix(fixtureFetchedAt, 0), testPolicy(), vf
 			},
 			wantReason: reasonUnsupportedAPIVersion,
 		},
@@ -139,7 +164,7 @@ func TestVerifyReportPerStepFailures(t *testing.T) {
 				vf := fakeQuoteVerifier(rep)
 				// flip the claimed keyset digest so recomputed != claimed.
 				rep.WorkloadKeysetDigest = "sha256:" + "00000000000000000000000000000000000000000000000000000000000000ff"
-				return remarshalReport(t, rep), strPtr(captureNonce), time.Unix(fixtureFetchedAt, 0), DefaultPhalaPolicy(), vf
+				return remarshalReport(t, rep), strPtr(captureNonce), time.Unix(fixtureFetchedAt, 0), testPolicy(), vf
 			},
 			wantReason: reasonKeysetDigestMismatch,
 		},
@@ -148,7 +173,7 @@ func TestVerifyReportPerStepFailures(t *testing.T) {
 			build: func(t *testing.T) ([]byte, *string, time.Time, Policy, quoteVerifier) {
 				rep := fixtureReport(t)
 				vf := fakeQuoteVerifier(rep)
-				return remarshalReport(t, rep), strPtr(wrongNonce), time.Unix(fixtureFetchedAt, 0), DefaultPhalaPolicy(), vf
+				return remarshalReport(t, rep), strPtr(wrongNonce), time.Unix(fixtureFetchedAt, 0), testPolicy(), vf
 			},
 			wantReason: reasonReportDataMismatch,
 		},
@@ -160,7 +185,7 @@ func TestVerifyReportPerStepFailures(t *testing.T) {
 				tampered := append([]byte(nil), rd...)
 				tampered[0] ^= 0xFF
 				vf := func(raw []byte, opts tee.Options) ([]byte, error) { return tampered, nil }
-				return remarshalReport(t, rep), strPtr(captureNonce), time.Unix(fixtureFetchedAt, 0), DefaultPhalaPolicy(), vf
+				return remarshalReport(t, rep), strPtr(captureNonce), time.Unix(fixtureFetchedAt, 0), testPolicy(), vf
 			},
 			wantReason: reasonQuoteInvalid,
 		},
@@ -183,7 +208,7 @@ func TestVerifyReportPerStepFailures(t *testing.T) {
 					}
 					return out
 				})
-				return remarshalReport(t, rep), strPtr(captureNonce), time.Unix(fixtureFetchedAt, 0), DefaultPhalaPolicy(), vf
+				return remarshalReport(t, rep), strPtr(captureNonce), time.Unix(fixtureFetchedAt, 0), testPolicy(), vf
 			},
 			wantReason: reasonQuoteInvalid,
 		},
@@ -192,7 +217,7 @@ func TestVerifyReportPerStepFailures(t *testing.T) {
 			build: func(t *testing.T) ([]byte, *string, time.Time, Policy, quoteVerifier) {
 				rep := fixtureReport(t)
 				vf := fakeQuoteVerifier(rep)
-				p := DefaultPhalaPolicy()
+				p := testPolicy()
 				// keep provenance/KMS valid; replace the app-id allow-list with a
 				// non-matching one so only the app-id check rejects.
 				p.AcceptedAppIDs = map[string]struct{}{"deadbeef": {}}
@@ -205,8 +230,8 @@ func TestVerifyReportPerStepFailures(t *testing.T) {
 			build: func(t *testing.T) ([]byte, *string, time.Time, Policy, quoteVerifier) {
 				rep := fixtureReport(t)
 				vf := fakeQuoteVerifier(rep)
-				p := DefaultPhalaPolicy()
-				p.AcceptedSourceProvenance = map[provenanceKey]struct{}{
+				p := testPolicy()
+				p.AcceptedSourceProvenance = map[ProvenanceKey]struct{}{
 					{RepoURL: "https://example.com/evil.git", RepoCommit: "0"}: {},
 				}
 				return remarshalReport(t, rep), strPtr(captureNonce), time.Unix(fixtureFetchedAt, 0), p, vf
@@ -221,7 +246,7 @@ func TestVerifyReportPerStepFailures(t *testing.T) {
 				// flip a byte in the endorsement signature so verification fails.
 				sig := rep.Attestation.KeysetEndorsement.ValueHex
 				rep.Attestation.KeysetEndorsement.ValueHex = "00" + sig[2:]
-				return remarshalReport(t, rep), strPtr(captureNonce), time.Unix(fixtureFetchedAt, 0), DefaultPhalaPolicy(), vf
+				return remarshalReport(t, rep), strPtr(captureNonce), time.Unix(fixtureFetchedAt, 0), testPolicy(), vf
 			},
 			wantReason: reasonEndorsementInvalid,
 		},
@@ -230,7 +255,7 @@ func TestVerifyReportPerStepFailures(t *testing.T) {
 			build: func(t *testing.T) ([]byte, *string, time.Time, Policy, quoteVerifier) {
 				rep := fixtureReport(t)
 				vf := fakeQuoteVerifier(rep)
-				p := DefaultPhalaPolicy()
+				p := testPolicy()
 				p.AcceptedKMSRootPubKeys = map[string]struct{}{"02ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff": {}}
 				return remarshalReport(t, rep), strPtr(captureNonce), time.Unix(fixtureFetchedAt, 0), p, vf
 			},
@@ -241,7 +266,7 @@ func TestVerifyReportPerStepFailures(t *testing.T) {
 			build: func(t *testing.T) ([]byte, *string, time.Time, Policy, quoteVerifier) {
 				rep := fixtureReport(t)
 				vf := fakeQuoteVerifier(rep)
-				return remarshalReport(t, rep), strPtr(captureNonce), time.Unix(fixtureFetchedAt-1, 0), DefaultPhalaPolicy(), vf
+				return remarshalReport(t, rep), strPtr(captureNonce), time.Unix(fixtureFetchedAt-1, 0), testPolicy(), vf
 			},
 			wantReason: reasonStaleReport,
 		},
@@ -250,7 +275,7 @@ func TestVerifyReportPerStepFailures(t *testing.T) {
 			build: func(t *testing.T) ([]byte, *string, time.Time, Policy, quoteVerifier) {
 				rep := fixtureReport(t)
 				vf := fakeQuoteVerifier(rep)
-				return remarshalReport(t, rep), strPtr(captureNonce), time.Unix(fixtureStaleAfter, 0), DefaultPhalaPolicy(), vf
+				return remarshalReport(t, rep), strPtr(captureNonce), time.Unix(fixtureStaleAfter, 0), testPolicy(), vf
 			},
 			wantReason: reasonStaleReport,
 		},
@@ -259,7 +284,7 @@ func TestVerifyReportPerStepFailures(t *testing.T) {
 			build: func(t *testing.T) ([]byte, *string, time.Time, Policy, quoteVerifier) {
 				rep := fixtureReport(t)
 				vf := fakeQuoteVerifier(rep)
-				p := DefaultPhalaPolicy()
+				p := testPolicy()
 				p.AcceptedWorkloadIDs = map[string]struct{}{"sha256:wrong": {}}
 				return remarshalReport(t, rep), strPtr(captureNonce), time.Unix(fixtureFetchedAt, 0), p, vf
 			},
@@ -301,7 +326,7 @@ func TestVerifyReportFreshnessBoundary(t *testing.T) {
 			t.Parallel()
 			raw := readFixture(t)
 			rep := fixtureReport(t)
-			_, err := verifyReport(raw, strPtr(captureNonce), time.Unix(tt.now, 0), DefaultPhalaPolicy(), fakeQuoteVerifier(rep))
+			_, err := verifyReport(raw, strPtr(captureNonce), time.Unix(tt.now, 0), testPolicy(), fakeQuoteVerifier(rep))
 			if tt.wantErr {
 				requireReason(t, err, reasonStaleReport)
 				return
@@ -335,7 +360,7 @@ func TestVerifyReportWorkloadIDPolicy(t *testing.T) {
 			t.Parallel()
 			raw := readFixture(t)
 			rep := fixtureReport(t)
-			p := DefaultPhalaPolicy()
+			p := testPolicy()
 			p.AcceptedWorkloadIDs = tt.workloadIDs
 			_, err := verifyReport(raw, strPtr(captureNonce), time.Unix(fixtureFetchedAt, 0), p, fakeQuoteVerifier(rep))
 			if tt.wantErr {
@@ -359,7 +384,7 @@ func TestVerifyReportStepOrder(t *testing.T) {
 	rep.APIVersion = "aci/2" // step 1 fails
 	raw := remarshalReport(t, rep)
 	// now is also out of the freshness window (step 8 would fail), but step 1 wins.
-	_, err := verifyReport(raw, strPtr(captureNonce), time.Unix(fixtureFetchedAt-1, 0), DefaultPhalaPolicy(), vf)
+	_, err := verifyReport(raw, strPtr(captureNonce), time.Unix(fixtureFetchedAt-1, 0), testPolicy(), vf)
 	requireReason(t, err, reasonUnsupportedAPIVersion)
 }
 
@@ -368,7 +393,7 @@ func TestVerifyReportStepOrder(t *testing.T) {
 func TestVerifyReportMalformedJSON(t *testing.T) {
 	t.Parallel()
 	rep := fixtureReport(t)
-	_, err := verifyReport([]byte("{not json"), strPtr(captureNonce), time.Unix(fixtureFetchedAt, 0), DefaultPhalaPolicy(), fakeQuoteVerifier(rep))
+	_, err := verifyReport([]byte("{not json"), strPtr(captureNonce), time.Unix(fixtureFetchedAt, 0), testPolicy(), fakeQuoteVerifier(rep))
 	if err == nil {
 		t.Fatalf("verifyReport(malformed) = nil, want parse error")
 	}
@@ -385,7 +410,7 @@ func TestVerifyReportMalformedJSON(t *testing.T) {
 // public entry point's wiring is exercised without a network call.
 func TestVerifyReportPublicWiring(t *testing.T) {
 	t.Parallel()
-	_, err := VerifyReport([]byte("{not json"), strPtr(captureNonce), time.Unix(fixtureFetchedAt, 0), DefaultPhalaPolicy())
+	_, err := VerifyReport([]byte("{not json"), strPtr(captureNonce), time.Unix(fixtureFetchedAt, 0), testPolicy())
 	if err == nil {
 		t.Fatalf("VerifyReport(malformed) = nil, want parse error")
 	}

@@ -228,7 +228,7 @@ func restoreSession(
 	}
 
 	// (5) Fold the primary loop's Enduring events (a SCOPED replay) into committed msgs +
-	// turnIndex. Re-seeding the system prompt is implicit: it rides cfg.Model.System (the
+	// turnIndex. Re-seeding the system prompt is implicit: it rides cfg.System (the
 	// loop never stores it in msgs), so the seeded loop carries it via cfg.
 	primaryEvents, err := drainReplay(ctx, replayer, journal.ReplayRequest{
 		SessionID: sessionID, LoopID: primaryLoopID, From: journal.Beginning(), Follow: false,

@@ -161,7 +161,7 @@ func TestForeignNewLoop(t *testing.T) {
 
 			c := cfg(&stubLLM{chunks: []content.Chunk{textChunk("x")}})
 			c.Engine = tt.engine
-			c.Model.System = "x"
+			c.System = "x"
 
 			opts := []Option{WithEventAppender(rec)}
 			if tt.wireBuilder {

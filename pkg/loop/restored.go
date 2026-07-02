@@ -16,7 +16,7 @@ import (
 //
 // Msgs is the committed conversation ONLY — it does NOT carry a SystemMessage. The
 // loop never stores the system prompt in loopState.msgs; the prompt rides
-// Config.Model.System and is sent on every request, so a restored loop "re-seeds" the
+// Config.System and is sent on every request, so a restored loop "re-seeds" the
 // system prompt simply by carrying the same Config. TurnIndex is the count of turns
 // already started, so the next live turn numbers from TurnIndex+1 (installActiveTurn
 // increments it), continuing the loop's numbering without a gap.

@@ -256,7 +256,7 @@ const (
 	fixtureAppPubKey = "02cdcc3ffd3e22f60a0e4f7c0dfcc3fb62d4765295dd43997c538109b732bdb835"
 	// fixtureKMSRoot is the chain[1] recovered KMS root, compressed SEC1 hex.
 	// (Blocker #3: cross-check against a published Phala/Dstack KMS root before
-	// merge; Task 2.8's DefaultPhalaPolicy pins it as an accepted root.)
+	// merge; the Phala provider default policy pins it as an accepted root.)
 	fixtureKMSRoot = "0334c76e0c3f52ec64cbf9bbf5c910c272330166fd656c0a86bb330963e46910e1"
 	// fixtureCompressedIdentity is the identity custody key compressed to SEC1.
 	fixtureCompressedIdentity = "02d3b51dcb45d74434a76fc1b7e2bc152cf81190eab43bdbf5c2c624321232c76a"

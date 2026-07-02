@@ -49,12 +49,13 @@ const (
 	systemReadyEvent = "system-ready"
 )
 
-// provenanceKey is the comparable allow-list key for source provenance: the
-// {repo_url, repo_commit} pair. Task 2.8's policy uses this exact key form for
-// its AcceptedSourceProvenance set so checkProvenancePolicy can do a single map
-// lookup. It is a struct (not a joined string) so neither field can be confused
-// with a delimiter inside the other.
-type provenanceKey struct {
+// ProvenanceKey is the comparable allow-list key for source provenance: the
+// {repo_url, repo_commit} pair. A Policy's AcceptedSourceProvenance set uses this
+// exact key form so checkProvenancePolicy can do a single map lookup. It is a
+// struct (not a joined string) so neither field can be confused with a delimiter
+// inside the other. It is exported so callers outside this package (a provider's
+// pinned-policy constructor) can populate AcceptedSourceProvenance directly.
+type ProvenanceKey struct {
 	RepoURL    string
 	RepoCommit string
 }
@@ -181,13 +182,13 @@ func checkAppIDPolicy(appID []byte, accepted map[string]struct{}) error {
 // checkProvenancePolicy enforces the source-provenance allow-list WHEN
 // CONFIGURED: if accepted is non-empty, the report's {repo_url, repo_commit}
 // pair must be a member, else policy_rejected. An empty or nil accepted set skips
-// the check. The key is the provenanceKey struct; Task 2.8's
+// the check. The key is the ProvenanceKey struct; a Policy's
 // AcceptedSourceProvenance must key on the same struct.
-func checkProvenancePolicy(prov SourceProvenance, accepted map[provenanceKey]struct{}) error {
+func checkProvenancePolicy(prov SourceProvenance, accepted map[ProvenanceKey]struct{}) error {
 	if len(accepted) == 0 {
 		return nil
 	}
-	key := provenanceKey{RepoURL: prov.RepoURL, RepoCommit: prov.RepoCommit}
+	key := ProvenanceKey{RepoURL: prov.RepoURL, RepoCommit: prov.RepoCommit}
 	if _, ok := accepted[key]; !ok {
 		return attestErr(reasonPolicyRejected, &provenanceRejectedError{
 			repoURL:    prov.RepoURL,

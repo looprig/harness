@@ -229,7 +229,7 @@ func newLoopWithSeed(loopCtx context.Context, sessionID, loopID uuid.UUID, paren
 		// Restore seed: come up with the folded committed history and turn count. The
 		// status stays loopIdle (newLoopState's zero default), so the resumed loop
 		// accepts the next submit immediately and numbers its next turn from turnIndex.
-		// The system prompt is NOT in msgs — it rides cfg.Model.System, sent every turn
+		// The system prompt is NOT in msgs — it rides cfg.System, sent every turn
 		// — so seeding msgs alone reproduces loopState exactly as it was committed.
 		state.msgs = cloneMessages(seed.Msgs)
 		state.turnIndex = seed.TurnIndex
@@ -601,6 +601,7 @@ func runLoop(cfg loopConfig, state loopState) {
 			base:           base,
 			runtimeContext: config.RuntimeContext,
 			model:          config.Model,
+			system:         config.System,
 			tools:          config.Tools,
 			client:         config.Client,
 			gateReg:        gateReg,

@@ -89,7 +89,7 @@ func newLoop(t *testing.T, client llm.LLM) (*Loop, *recordingPublisher, context.
 		t.Fatalf("uuid.New: %v", err)
 	}
 	rec := &recordingPublisher{}
-	l, err := New(ctx, sessionID, loopID, Provenance{}, rec, Config{Client: client, Model: llm.ModelSpec{Model: "m"}, DrainTimeout: 200 * time.Millisecond})
+	l, err := New(ctx, sessionID, loopID, Provenance{}, rec, Config{Client: client, Model: testModel(), DrainTimeout: 200 * time.Millisecond})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -220,7 +220,7 @@ func TestNew_Validation(t *testing.T) {
 
 	t.Run("missing client", func(t *testing.T) {
 		t.Parallel()
-		_, err := New(ctx, sessionID, loopID, Provenance{}, noopPublisher{}, Config{Model: llm.ModelSpec{Model: "m"}})
+		_, err := New(ctx, sessionID, loopID, Provenance{}, noopPublisher{}, Config{Model: testModel()})
 		var ce *ConfigError
 		if !errors.As(err, &ce) || ce.Kind != ConfigMissingClient {
 			t.Fatalf("err = %v, want *ConfigError{ConfigMissingClient}", err)
@@ -228,7 +228,7 @@ func TestNew_Validation(t *testing.T) {
 	})
 	t.Run("invalid model unwraps to ValidationError", func(t *testing.T) {
 		t.Parallel()
-		bad := llm.ModelSpec{Model: "m", ThinkingBudget: 1, Temperature: func() *float64 { f := 0.5; return &f }()}
+		bad := llm.Model{Name: "m"} // no Provider/APIFormat/BaseURL — fails llm.Model.Validate
 		_, err := New(ctx, sessionID, loopID, Provenance{}, noopPublisher{}, Config{Client: &fakeLLM{}, Model: bad})
 		var ce *ConfigError
 		if !errors.As(err, &ce) || ce.Kind != ConfigInvalidModel {
@@ -241,7 +241,7 @@ func TestNew_Validation(t *testing.T) {
 	})
 	t.Run("nil publisher", func(t *testing.T) {
 		t.Parallel()
-		_, err := New(ctx, sessionID, loopID, Provenance{}, nil, Config{Client: &fakeLLM{}, Model: llm.ModelSpec{Model: "m"}})
+		_, err := New(ctx, sessionID, loopID, Provenance{}, nil, Config{Client: &fakeLLM{}, Model: testModel()})
 		var ce *ConfigError
 		if !errors.As(err, &ce) || ce.Kind != ConfigMissingPublisher {
 			t.Fatalf("err = %v, want *ConfigError{ConfigMissingPublisher}", err)
@@ -461,7 +461,7 @@ func newLoopWithIDGen(t *testing.T, client llm.LLM, gen idGenerator) (*Loop, *re
 	rec := &recordingPublisher{}
 	l, err := New(ctx, sessionID, loopID, Provenance{}, rec, Config{
 		Client:       client,
-		Model:        llm.ModelSpec{Model: "m"},
+		Model:        testModel(),
 		DrainTimeout: 200 * time.Millisecond,
 		idGen:        gen,
 		// The injected gen fails the CORRELATION-id mint (the branch under test); give
@@ -739,7 +739,7 @@ func TestCtxIgnoringProviderDoesNotPinActor(t *testing.T) {
 	rec := &recordingPublisher{}
 	l, err := New(ctx, sessionID, loopID, Provenance{}, rec, Config{
 		Client:       &fakeLLM{blockUntilCancel: true, ignoreCtx: true},
-		Model:        llm.ModelSpec{Model: "m"},
+		Model:        testModel(),
 		DrainTimeout: 100 * time.Millisecond,
 	})
 	if err != nil {
@@ -814,7 +814,7 @@ func TestStepGranularityRollback(t *testing.T) {
 		loopID, _ := uuid.New()
 		rec := &recordingPublisher{}
 		l, err := New(ctx, sessionID, loopID, Provenance{}, rec,
-			Config{Client: client, Model: llm.ModelSpec{Model: "m"}, Tools: ts, DrainTimeout: 200 * time.Millisecond})
+			Config{Client: client, Model: testModel(), Tools: ts, DrainTimeout: 200 * time.Millisecond})
 		if err != nil {
 			t.Fatalf("New: %v", err)
 		}
@@ -942,7 +942,7 @@ func TestActorEventOrderingOnFanIn(t *testing.T) {
 	loopID, _ := uuid.New()
 	rec := &recordingPublisher{}
 	l, err := New(ctx, sessionID, loopID, Provenance{}, rec,
-		Config{Client: client, Model: llm.ModelSpec{Model: "m"}, Tools: ts, DrainTimeout: 200 * time.Millisecond})
+		Config{Client: client, Model: testModel(), Tools: ts, DrainTimeout: 200 * time.Millisecond})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -1009,7 +1009,7 @@ func TestActorToolTurnOrderedHistory(t *testing.T) {
 	loopID, _ := uuid.New()
 	rec := &recordingPublisher{}
 	l, err := New(ctx, sessionID, loopID, Provenance{}, rec,
-		Config{Client: client, Model: llm.ModelSpec{Model: "m"}, Tools: ts, DrainTimeout: 200 * time.Millisecond})
+		Config{Client: client, Model: testModel(), Tools: ts, DrainTimeout: 200 * time.Millisecond})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -1099,7 +1099,7 @@ func TestInterruptDuringToolBatchFreesTurn(t *testing.T) {
 	loopID, _ := uuid.New()
 	rec := &recordingPublisher{}
 	l, err := New(ctx, sessionID, loopID, Provenance{}, rec,
-		Config{Client: client, Model: llm.ModelSpec{Model: "m"}, Tools: ts, DrainTimeout: 200 * time.Millisecond})
+		Config{Client: client, Model: testModel(), Tools: ts, DrainTimeout: 200 * time.Millisecond})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}

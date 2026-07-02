@@ -86,8 +86,8 @@ func New(loopCtx context.Context, sessionID, loopID uuid.UUID, parent loop.Prove
 // NOT validate the restore seed; that is the restored constructor's own concern.
 func validateWiring(cfg loop.Config, spec Spec, idGen func() (uuid.UUID, error), fac *event.Factory, pub EventPublisher) error {
 	switch {
-	case cfg.Model.System == "":
-		return &ConfigError{Field: "Model.System", Reason: "required"}
+	case cfg.System == "":
+		return &ConfigError{Field: "System", Reason: "required"}
 	case spec.Agent == nil:
 		return &ConfigError{Field: "Spec.Agent", Reason: "required"}
 	case idGen == nil:

@@ -8,14 +8,13 @@ import (
 
 	"github.com/ciram-co/looprig/pkg/command"
 	"github.com/ciram-co/looprig/pkg/event"
-	"github.com/ciram-co/looprig/pkg/llm"
 	"github.com/ciram-co/looprig/pkg/loop"
 )
 
 // validCfg is the minimal loop.Config a foreign loop accepts: a non-empty system
 // prompt (the only field foreignloop.New validates).
 func validCfg() loop.Config {
-	return loop.Config{Model: llm.ModelSpec{Model: "m", System: "you are a test agent"}}
+	return loop.Config{System: "you are a test agent"}
 }
 
 // newTestLoop wires a foreign loop to a fakePublisher with a deterministic

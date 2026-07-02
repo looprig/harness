@@ -283,8 +283,8 @@ func TestCheckAppIDPolicy(t *testing.T) {
 func TestCheckProvenancePolicy(t *testing.T) {
 	t.Parallel()
 	prov := SourceProvenance{RepoURL: fixtureRepoURL, RepoCommit: fixtureRepoCommit}
-	accept := func(keys ...provenanceKey) map[provenanceKey]struct{} {
-		m := make(map[provenanceKey]struct{}, len(keys))
+	accept := func(keys ...ProvenanceKey) map[ProvenanceKey]struct{} {
+		m := make(map[ProvenanceKey]struct{}, len(keys))
 		for _, k := range keys {
 			m[k] = struct{}{}
 		}
@@ -294,30 +294,30 @@ func TestCheckProvenancePolicy(t *testing.T) {
 	tests := []struct {
 		name     string
 		prov     SourceProvenance
-		accepted map[provenanceKey]struct{}
+		accepted map[ProvenanceKey]struct{}
 		wantErr  bool
 	}{
 		{
 			name:     "provenance in accepted set passes",
 			prov:     prov,
-			accepted: accept(provenanceKey{RepoURL: fixtureRepoURL, RepoCommit: fixtureRepoCommit}),
+			accepted: accept(ProvenanceKey{RepoURL: fixtureRepoURL, RepoCommit: fixtureRepoCommit}),
 		},
 		{
 			name:     "different commit is rejected",
 			prov:     prov,
-			accepted: accept(provenanceKey{RepoURL: fixtureRepoURL, RepoCommit: "0000000000000000000000000000000000000000"}),
+			accepted: accept(ProvenanceKey{RepoURL: fixtureRepoURL, RepoCommit: "0000000000000000000000000000000000000000"}),
 			wantErr:  true,
 		},
 		{
 			name:     "different repo is rejected",
 			prov:     prov,
-			accepted: accept(provenanceKey{RepoURL: "https://example.com/other.git", RepoCommit: fixtureRepoCommit}),
+			accepted: accept(ProvenanceKey{RepoURL: "https://example.com/other.git", RepoCommit: fixtureRepoCommit}),
 			wantErr:  true,
 		},
 		{
 			name:     "empty set skips the check",
 			prov:     prov,
-			accepted: map[provenanceKey]struct{}{},
+			accepted: map[ProvenanceKey]struct{}{},
 		},
 		{
 			name:     "nil set skips the check",

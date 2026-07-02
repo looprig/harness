@@ -17,50 +17,55 @@ import (
 	"github.com/ciram-co/looprig/pkg/content"
 	"github.com/ciram-co/looprig/pkg/llm"
 	"github.com/ciram-co/looprig/pkg/llm/e2e"
-	"github.com/ciram-co/looprig/pkg/llm/openaiapi/chutes"
+	"github.com/ciram-co/looprig/pkg/llm/providers/chutes"
 )
 
 // compile-time assertion: *Client satisfies llm.LLM.
 var _ llm.LLM = (*chutes.Client)(nil)
 
-func ptr(f float64) *float64 { return &f }
+// validChutesModel returns a Model that passes llm.Model.Validate for the chutes
+// provider (OpenAI dialect, https chutes host). Tests that want an invalid Model
+// override one field.
+func validChutesModel(name string) llm.Model {
+	return llm.Model{
+		Provider:  llm.ProviderChutes,
+		APIFormat: llm.APIFormatOpenAI,
+		BaseURL:   "https://api.chutes.ai",
+		Name:      name,
+	}
+}
 
-// TestClient_ValidateCalledOnInvoke verifies that Validate() is called before
-// any network I/O. Invalid cases use a nil context so that if Validate()
-// somehow passes and the method tries to use ctx, it would panic — proving
-// Validate() short-circuits correctly.
+// TestClient_ValidateCalledOnInvoke verifies that Model.Validate() is called
+// before any network I/O: an invalid descriptor short-circuits with a
+// *llm.ValidationError, while a valid one proceeds to the (failing) network call
+// without ever surfacing a ValidationError.
 func TestClient_ValidateCalledOnInvoke(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
 		name    string
-		budget  int
-		temp    *float64
+		model   llm.Model
 		wantErr bool
 	}{
 		{
-			name:    "happy path: valid spec with no budget",
-			budget:  0,
-			temp:    nil,
+			name:    "happy path: valid chutes model",
+			model:   validChutesModel("test-model"),
 			wantErr: false, // Validate passes; network will fail but that's ok
 		},
 		{
-			name:    "invalid: budget with wrong temp",
-			budget:  1000,
-			temp:    ptr(0.7),
+			name:    "invalid: empty model name",
+			model:   llm.Model{Provider: llm.ProviderChutes, APIFormat: llm.APIFormatOpenAI, BaseURL: "https://api.chutes.ai", Name: ""},
 			wantErr: true,
 		},
 		{
-			name:    "invalid: budget with nil temp",
-			budget:  1000,
-			temp:    nil,
+			name:    "invalid: unknown provider",
+			model:   llm.Model{Provider: llm.Provider("bogus"), APIFormat: llm.APIFormatOpenAI, BaseURL: "https://api.chutes.ai", Name: "test-model"},
 			wantErr: true,
 		},
 		{
-			name:    "boundary: budget zero with any temp",
-			budget:  0,
-			temp:    ptr(0.5),
-			wantErr: false, // no budget constraint, Validate passes
+			name:    "invalid: unsupported api format",
+			model:   llm.Model{Provider: llm.ProviderChutes, APIFormat: llm.APIFormatAnthropic, BaseURL: "https://api.chutes.ai", Name: "test-model"},
+			wantErr: true,
 		},
 	}
 
@@ -69,13 +74,7 @@ func TestClient_ValidateCalledOnInvoke(t *testing.T) {
 			t.Parallel()
 
 			c := chutes.New("http://127.0.0.1:0", "test-key")
-			req := llm.Request{
-				Model: llm.ModelSpec{
-					Model:          "test-model",
-					ThinkingBudget: tt.budget,
-					Temperature:    tt.temp,
-				},
-			}
+			req := llm.Request{Model: tt.model}
 
 			if tt.wantErr {
 				// Validate() must short-circuit before any ctx use.
@@ -112,33 +111,28 @@ func TestClient_ValidateCalledOnStream(t *testing.T) {
 
 	tests := []struct {
 		name    string
-		budget  int
-		temp    *float64
+		model   llm.Model
 		wantErr bool
 	}{
 		{
-			name:    "happy path: valid spec with no budget",
-			budget:  0,
-			temp:    nil,
+			name:    "happy path: valid chutes model",
+			model:   validChutesModel("test-model"),
 			wantErr: false,
 		},
 		{
-			name:    "invalid: budget with wrong temp",
-			budget:  500,
-			temp:    ptr(0.3),
+			name:    "invalid: empty model name",
+			model:   llm.Model{Provider: llm.ProviderChutes, APIFormat: llm.APIFormatOpenAI, BaseURL: "https://api.chutes.ai", Name: ""},
 			wantErr: true,
 		},
 		{
-			name:    "invalid: budget with nil temp",
-			budget:  500,
-			temp:    nil,
+			name:    "invalid: unknown provider",
+			model:   llm.Model{Provider: llm.Provider("bogus"), APIFormat: llm.APIFormatOpenAI, BaseURL: "https://api.chutes.ai", Name: "test-model"},
 			wantErr: true,
 		},
 		{
-			name:    "boundary: budget zero, temp set",
-			budget:  0,
-			temp:    ptr(1.0),
-			wantErr: false,
+			name:    "invalid: unsupported api format",
+			model:   llm.Model{Provider: llm.ProviderChutes, APIFormat: llm.APIFormatAnthropic, BaseURL: "https://api.chutes.ai", Name: "test-model"},
+			wantErr: true,
 		},
 	}
 
@@ -147,13 +141,7 @@ func TestClient_ValidateCalledOnStream(t *testing.T) {
 			t.Parallel()
 
 			c := chutes.New("http://127.0.0.1:0", "test-key")
-			req := llm.Request{
-				Model: llm.ModelSpec{
-					Model:          "test-model",
-					ThinkingBudget: tt.budget,
-					Temperature:    tt.temp,
-				},
-			}
+			req := llm.Request{Model: tt.model}
 
 			if tt.wantErr {
 				_, err := c.Stream(context.Background(), req)
@@ -302,7 +290,7 @@ func (e *testEnclave) handler(t *testing.T, chuteID, model string) http.Handler 
 
 func invokeReq(model string) llm.Request {
 	return llm.Request{
-		Model: llm.ModelSpec{Model: model},
+		Model: validChutesModel(model),
 		Messages: content.AgenticMessages{
 			&content.UserMessage{
 				Message: content.Message{
@@ -390,33 +378,28 @@ func TestClientInvoke_ValidateShortCircuit(t *testing.T) {
 
 	tests := []struct {
 		name    string
-		budget  int
-		temp    *float64
+		model   llm.Model
 		wantErr bool
 	}{
 		{
-			name:    "happy path: no budget constraint",
-			budget:  0,
-			temp:    nil,
+			name:    "happy path: valid chutes model",
+			model:   validChutesModel("test-model"),
 			wantErr: false,
 		},
 		{
-			name:    "error path: budget with wrong temperature",
-			budget:  1000,
-			temp:    ptr(0.5),
+			name:    "error path: empty model name",
+			model:   llm.Model{Provider: llm.ProviderChutes, APIFormat: llm.APIFormatOpenAI, BaseURL: "https://api.chutes.ai", Name: ""},
 			wantErr: true,
 		},
 		{
-			name:    "error path: budget with nil temperature",
-			budget:  1000,
-			temp:    nil,
+			name:    "error path: unknown provider",
+			model:   llm.Model{Provider: llm.Provider("bogus"), APIFormat: llm.APIFormatOpenAI, BaseURL: "https://api.chutes.ai", Name: "test-model"},
 			wantErr: true,
 		},
 		{
-			name:    "boundary: budget zero ignores temperature",
-			budget:  0,
-			temp:    ptr(0.5),
-			wantErr: false,
+			name:    "error path: non-loopback http base url",
+			model:   llm.Model{Provider: llm.ProviderChutes, APIFormat: llm.APIFormatOpenAI, BaseURL: "http://api.chutes.ai", Name: "test-model"},
+			wantErr: true,
 		},
 	}
 
@@ -425,13 +408,7 @@ func TestClientInvoke_ValidateShortCircuit(t *testing.T) {
 			t.Parallel()
 
 			c := chutes.New("http://127.0.0.1:0", "test-key")
-			req := llm.Request{
-				Model: llm.ModelSpec{
-					Model:          "test-model",
-					ThinkingBudget: tt.budget,
-					Temperature:    tt.temp,
-				},
-			}
+			req := llm.Request{Model: tt.model}
 
 			if tt.wantErr {
 				_, err := c.Invoke(context.Background(), req)
@@ -465,33 +442,28 @@ func TestClientStream_ValidateShortCircuit(t *testing.T) {
 
 	tests := []struct {
 		name    string
-		budget  int
-		temp    *float64
+		model   llm.Model
 		wantErr bool
 	}{
 		{
-			name:    "happy path: no budget constraint",
-			budget:  0,
-			temp:    nil,
+			name:    "happy path: valid chutes model",
+			model:   validChutesModel("test-model"),
 			wantErr: false,
 		},
 		{
-			name:    "error path: budget with wrong temperature",
-			budget:  500,
-			temp:    ptr(0.3),
+			name:    "error path: empty model name",
+			model:   llm.Model{Provider: llm.ProviderChutes, APIFormat: llm.APIFormatOpenAI, BaseURL: "https://api.chutes.ai", Name: ""},
 			wantErr: true,
 		},
 		{
-			name:    "error path: budget with nil temperature",
-			budget:  500,
-			temp:    nil,
+			name:    "error path: unknown provider",
+			model:   llm.Model{Provider: llm.Provider("bogus"), APIFormat: llm.APIFormatOpenAI, BaseURL: "https://api.chutes.ai", Name: "test-model"},
 			wantErr: true,
 		},
 		{
-			name:    "boundary: budget zero with any temperature",
-			budget:  0,
-			temp:    ptr(0.9),
-			wantErr: false,
+			name:    "error path: non-loopback http base url",
+			model:   llm.Model{Provider: llm.ProviderChutes, APIFormat: llm.APIFormatOpenAI, BaseURL: "http://api.chutes.ai", Name: "test-model"},
+			wantErr: true,
 		},
 	}
 
@@ -500,13 +472,7 @@ func TestClientStream_ValidateShortCircuit(t *testing.T) {
 			t.Parallel()
 
 			c := chutes.New("http://127.0.0.1:0", "test-key")
-			req := llm.Request{
-				Model: llm.ModelSpec{
-					Model:          "test-model",
-					ThinkingBudget: tt.budget,
-					Temperature:    tt.temp,
-				},
-			}
+			req := llm.Request{Model: tt.model}
 
 			if tt.wantErr {
 				_, err := c.Stream(context.Background(), req)
@@ -671,7 +637,7 @@ func TestClientStream_FullRoundTrip(t *testing.T) {
 			// to fail (no /instances/.../evidence route). So we just verify
 			// Stream doesn't panic on valid model spec and the error is typed.
 			c := chutes.New(srv.URL, "testkey", chutes.WithHTTPClient(srv.Client()), chutes.WithLLMBase(srv.URL))
-			req := llm.Request{Model: llm.ModelSpec{Model: model}}
+			req := llm.Request{Model: validChutesModel(model)}
 
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()

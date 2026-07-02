@@ -78,12 +78,13 @@ type turnConfig struct {
 	// the provider may run git, which must not block the serialized actor) and reuses the
 	// resulting tail for every step. The appended tail is purely TRANSIENT: it rides the
 	// request only, never enters turnState.msgs/loopState.msgs and never touches
-	// model.System (the cached prefix), so committed history never grows with it and the
+	// the System prompt (the cached prefix), so committed history never grows with it and the
 	// cached prefix stays byte-stable turn-to-turn. nil means no provider: the request is
 	// assembled exactly as before. The provider contract is non-fatal — it never errors.
 	runtimeContext RuntimeContextProvider
 
-	model   llm.ModelSpec
+	model   llm.Model
+	system  string
 	tools   ToolSet
 	client  llm.LLM
 	gateReg chan<- gateRegistration
@@ -187,9 +188,10 @@ func runTurn(ctx context.Context, cfg turnConfig, ts turnState) event.Event {
 		// plus the volatile runtime-context tail (when configured) appended LAST so the
 		// model sees fresh date/cwd/git at the very end of the input every step. The
 		// tail is transient: it is part of the REQUEST only, never of ts.msgs/base, so
-		// committed history never grows with it and the cached model.System is untouched.
+		// committed history never grows with it and the cached System prompt is untouched.
 		req := llm.Request{
 			Model:    cfg.model,
+			System:   cfg.system,
 			Messages: requestMessages(cfg.base, ts.msgs, runtimeTail),
 			Tools:    defs,
 		}
@@ -355,7 +357,7 @@ func foldPending(ctx context.Context, cfg turnConfig, ts *turnState) error {
 // no provider is configured or the provider yields no blocks (OFF / degraded): the
 // request is then assembled exactly as before. The provider contract is non-fatal
 // (it never errors), so this never fails a turn. The result is purely transient —
-// runTurn appends it to the request only, never to committed history or model.System.
+// runTurn appends it to the request only, never to committed history or the System prompt.
 func runtimeContextTail(ctx context.Context, rc RuntimeContextProvider) *content.UserMessage {
 	if rc == nil {
 		return nil

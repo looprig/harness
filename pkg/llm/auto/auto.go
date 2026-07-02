@@ -1,27 +1,81 @@
+// Package auto is the composition root that selects and wires a concrete llm.LLM
+// for a validated Model. It is the single place that imports every provider, so
+// business logic depends only on the llm.LLM interface — never on a concrete
+// provider — and every credential/attestation decision is made here, once. It maps
+// a Provider to its client and enforces the provider's fail-closed auth contract
+// before any network object is constructed.
 package auto
 
 import (
 	"github.com/ciram-co/looprig/pkg/llm"
-	"github.com/ciram-co/looprig/pkg/llm/aci"
-	"github.com/ciram-co/looprig/pkg/llm/openaiapi/chutes"
-	"github.com/ciram-co/looprig/pkg/llm/openaiapi/lmstudio"
+	"github.com/ciram-co/looprig/pkg/llm/auth"
+	"github.com/ciram-co/looprig/pkg/llm/codec/openaiapi"
+	"github.com/ciram-co/looprig/pkg/llm/providers/chutes"
+	"github.com/ciram-co/looprig/pkg/llm/providers/phala"
+	"github.com/ciram-co/looprig/pkg/llm/transport"
 )
 
-// New validates spec and constructs the concrete provider client for spec.Provider.
-// An unknown or empty provider yields a *llm.ValidationError, as does a
-// self-contradictory spec (validated before dispatch).
-func New(spec llm.ModelSpec) (llm.LLM, error) {
-	if err := spec.Validate(); err != nil {
+// New validates model, enforces the provider's fail-closed auth requirement, then
+// constructs the concrete provider client. Ordered:
+//  1. Model.Validate — a self-contradictory or unknown-provider model yields a
+//     *llm.ValidationError before anything else.
+//  2. Provider.RequiredAuth — an unknown provider fails closed with a
+//     *llm.ValidationError (never a permissive default).
+//  3. A provider that requires an API key but is given none yields a
+//     *llm.AuthRequiredError — fail-closed, before any network object exists.
+//  4. Dispatch on Provider to the concrete client.
+//
+// No live I/O happens here; the returned llm.LLM performs its own per-request
+// guards (binding, Validate, auth) when Invoke/Stream is called.
+func New(model llm.Model, key auth.APIKey) (llm.LLM, error) {
+	if err := model.Validate(); err != nil {
 		return nil, err
 	}
-	switch spec.Provider {
-	case llm.ProviderLMStudio:
-		return lmstudio.New(spec.BaseURL), nil
+	kind, err := model.Provider.RequiredAuth()
+	if err != nil {
+		return nil, err
+	}
+	if kind == llm.AuthAPIKey && key == "" {
+		return nil, &llm.AuthRequiredError{Provider: model.Provider, Kind: kind}
+	}
+	switch model.Provider {
 	case llm.ProviderPhala:
-		return aci.New(spec.BaseURL, spec.APIKey, aci.DefaultPhalaPolicy()), nil
+		return phala.New(model.BaseURL, key, phala.DefaultPolicy())
 	case llm.ProviderChutes:
-		return chutes.New(spec.BaseURL, spec.APIKey), nil
+		return chutes.New(model.BaseURL, string(key)), nil
+	case llm.ProviderLMStudio:
+		// LM Studio (and any generic httpLLM) can conceptually speak either dialect,
+		// so supportsAPIFormat admits both — but auto only has an OpenAI codec today.
+		// Select the codec by the model's declared APIFormat and fail closed on any
+		// format with no codec, rather than silently mis-encoding as OpenAI.
+		codec, err := codecFor(model.APIFormat)
+		if err != nil {
+			return nil, err
+		}
+		return transport.New(codec, transport.Endpoint{
+			Provider: model.Provider,
+			BaseURL:  model.BaseURL,
+			ChatPath: transport.DefaultChatPath,
+		}, auth.None()), nil
 	default:
-		return nil, &llm.ValidationError{Field: "Provider", Reason: "unknown or empty"}
+		// Defensive: RequiredAuth above already rejects any provider not handled
+		// here, so this is unreachable for a validated model — but a permissive
+		// fall-through would fail open, so deny by default.
+		return nil, &llm.ValidationError{Field: "Provider", Reason: "unsupported provider"}
+	}
+}
+
+// codecFor selects the wire codec for a generic (transport-backed) provider by its
+// declared APIFormat. Model.Validate already admits every APIFormat the SDK knows,
+// and a provider may legitimately support a format auto cannot yet encode; codecFor
+// is the fail-closed boundary that turns "no codec implemented" into a typed
+// *llm.ValidationError at construction rather than a silent wrong-dialect encode.
+// Adding a new dialect (e.g. codec/anthropicapi) is one new case here.
+func codecFor(f llm.APIFormat) (llm.Codec, error) {
+	switch f {
+	case llm.APIFormatOpenAI:
+		return openaiapi.Codec{}, nil
+	default:
+		return nil, &llm.ValidationError{Field: "APIFormat", Reason: "no codec implemented for this API format yet"}
 	}
 }

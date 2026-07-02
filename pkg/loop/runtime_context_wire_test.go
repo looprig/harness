@@ -38,7 +38,8 @@ func newLoopWithRuntime(t *testing.T, client llm.LLM, rc RuntimeContextProvider)
 	rec := &recordingPublisher{}
 	l, err := New(ctx, sessionID, loopID, Provenance{}, rec, Config{
 		Client:         client,
-		Model:          llm.ModelSpec{Model: "m", System: "CACHED-PREFIX"},
+		Model:          testModel(),
+		System:         "CACHED-PREFIX",
 		DrainTimeout:   200 * time.Millisecond,
 		RuntimeContext: rc,
 	})
@@ -153,11 +154,11 @@ func TestRuntimeContextAppendedAtTurnTail(t *testing.T) {
 
 		// Cache-safety: the system prompt (cached prefix) is byte-identical turn 1 vs
 		// turn 2, even though the appended runtime block changed.
-		if r1.Model.System != r2.Model.System {
-			t.Errorf("Model.System changed across turns: turn1=%q turn2=%q", r1.Model.System, r2.Model.System)
+		if r1.System != r2.System {
+			t.Errorf("System changed across turns: turn1=%q turn2=%q", r1.System, r2.System)
 		}
-		if r1.Model.System != "CACHED-PREFIX" {
-			t.Errorf("Model.System = %q, want the untouched cached prefix %q", r1.Model.System, "CACHED-PREFIX")
+		if r1.System != "CACHED-PREFIX" {
+			t.Errorf("System = %q, want the untouched cached prefix %q", r1.System, "CACHED-PREFIX")
 		}
 	})
 

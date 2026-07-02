@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"github.com/ciram-co/looprig/pkg/content"
-	"github.com/ciram-co/looprig/pkg/llm"
 	"github.com/ciram-co/looprig/pkg/loop"
 )
 
@@ -140,7 +139,7 @@ func TestNewLoopQuotaRollback(t *testing.T) {
 	// reservation), forcing the rollback path. Repeat MORE than `quota` times: without
 	// rollback the quota would be exhausted by these failures and the valid spawns below
 	// would be wrongly refused.
-	badCfg := loop.Config{Model: llm.ModelSpec{Model: "m"}} // nil Client
+	badCfg := loop.Config{Model: validModel("m")} // nil Client
 	for i := 0; i < quota+2; i++ {
 		_, err := s.NewLoop(loop.Provenance{LoopID: s.PrimaryLoopID()}, badCfg)
 		var ce *loop.ConfigError

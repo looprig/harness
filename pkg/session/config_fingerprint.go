@@ -52,7 +52,7 @@ type ConfigFingerprintFields struct {
 // Equal fingerprint — and changes when the model, system prompt, or tool set
 // changes:
 //
-//   - ModelID is the model spec id verbatim.
+//   - ModelID is the Model.Name (the model id) verbatim.
 //   - SystemPromptRev is a hex sha256 of the system-prompt text, so a prompt change
 //     is detectable without persisting the prompt.
 //   - ToolPolicyRev is a hex sha256 over the tool set's stable identity (its sorted,
@@ -65,8 +65,8 @@ type ConfigFingerprintFields struct {
 // fingerprintWith. A bare FingerprintFrom (no injection) therefore leaves them empty.
 func FingerprintFrom(cfg loop.Config) event.ConfigFingerprint {
 	return event.ConfigFingerprint{
-		ModelID:         cfg.Model.Model,
-		SystemPromptRev: hexSHA256(cfg.Model.System),
+		ModelID:         cfg.Model.Name,
+		SystemPromptRev: hexSHA256(cfg.System),
 		ToolPolicyRev:   toolPolicyRev(cfg.Tools),
 	}
 }

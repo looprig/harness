@@ -19,7 +19,8 @@ const (
 
 type Config struct {
 	Client       llm.LLM       // required — caller constructs via auto.New at composition root
-	Model        llm.ModelSpec // model name, system prompt, sampling params — sent every turn
+	Model        llm.Model     // secret-free model descriptor (name, endpoint, sampling) — stamped onto every Request; carries NO system prompt and NO secret
+	System       string        // per-agent system prompt — sent on every Request AND hashed into the config fingerprint; the connection secret rides the Client, never here
 	DrainTimeout time.Duration // optional — bounds the hard-kill wait for a cancelled turn to drain; New defaults it to 5s
 
 	// AgentName is the immutable attribution name the loop runs under (the agent/role
@@ -43,7 +44,7 @@ type Config struct {
 	// RuntimeContext, when non-nil, yields the volatile per-turn context blocks
 	// (date/cwd/git) the loop appends at the TAIL of each turn's request — AFTER the
 	// committed messages, and as a transient addition that NEVER enters committed
-	// history and NEVER touches Model.System (the cached prefix). It is consulted once
+	// history and NEVER touches the System prompt (the cached prefix). It is consulted once
 	// per turn, so each turn rides a single FRESH block and stale blocks never
 	// accumulate. nil (the zero value, the New default) means OFF: the request is
 	// assembled exactly as it was before — no extra blocks. The interface keeps the

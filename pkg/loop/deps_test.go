@@ -9,7 +9,6 @@ import (
 
 	"github.com/ciram-co/looprig/pkg/content"
 	"github.com/ciram-co/looprig/pkg/event"
-	"github.com/ciram-co/looprig/pkg/llm"
 	"github.com/ciram-co/looprig/pkg/tool"
 	"github.com/ciram-co/looprig/pkg/uuid"
 )
@@ -182,7 +181,7 @@ func TestNewAppliesToolSetDefaults(t *testing.T) {
 	rec := &recordingPublisher{}
 	l, err := New(ctx, sessionID, loopID, Provenance{}, rec, Config{
 		Client:       &fakeLLM{chunks: []content.Chunk{textChunk("hi")}},
-		Model:        llm.ModelSpec{Model: "m"},
+		Model:        testModel(),
 		DrainTimeout: 200 * time.Millisecond,
 		Tools:        ToolSet{},
 	})

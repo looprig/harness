@@ -280,8 +280,9 @@ func verifyReport(reportJSON []byte, nonce *string, now time.Time, policy Policy
 // reportJSON with the LIVE DCAP quote verifier and returns the validated
 // *VerifiedReport, or the first failing step's typed *llm.AttestationError. nonce
 // is the report_data binding nonce (nil if none was sent), now is the wall clock
-// for the freshness check, and policy is the acceptance allow-list (use
-// DefaultPhalaPolicy for the pinned preset). It delegates to verifyReport with
+// for the freshness check, and policy is the acceptance allow-list (a zero
+// Policy{} accepts any genuine report; a provider package supplies a pinned
+// preset, e.g. phala.DefaultPolicy()). It delegates to verifyReport with
 // defaultQuoteVerifier, so step 4 fetches Intel collateral over the bounded
 // HTTPS-only getter — meaning this entry point requires network access and cannot
 // run fully offline (offline tests use the unexported verifyReport with a fake

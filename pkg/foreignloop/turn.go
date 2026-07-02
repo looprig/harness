@@ -62,7 +62,7 @@ func (l *Loop) runTurn(loopCtx context.Context, c command.UserInput) (exit bool)
 	})
 
 	ft := ForeignTurn{
-		SystemPrompt: l.cfg.Model.System,
+		SystemPrompt: l.cfg.System,
 		ForeignSID:   l.sid,
 		StartNew:     !l.hasSpawned,
 		Input:        c.Blocks,
