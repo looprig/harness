@@ -149,12 +149,16 @@ func (s *server) limitBody(next http.Handler) http.Handler {
 }
 
 // routes registers the HTTP routes on mux using Go 1.22 method+pattern routing.
-// Task 12 wires only GET /healthz — the single explicitly-unauthenticated route.
+// GET /healthz is the single explicitly-unauthenticated route; the session-
+// lifecycle group creates, deletes, and interrupts a session by {sid}.
 func (s *server) routes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /healthz", s.handleHealthz)
 
-	// Task 13 registers the session + gate-routing endpoints here, e.g.:
-	//   mux.HandleFunc("POST /sessions", s.handleCreateSession)
+	// Session lifecycle (Task 13, group A).
+	mux.HandleFunc("POST /sessions", s.handleCreateSession)
+
+	// Remaining Task 13 groups register the input/events/gates/export endpoints
+	// here, e.g.:
 	//   mux.HandleFunc("POST /sessions/{sid}/input", s.handleInput)
 	//   mux.HandleFunc("GET /sessions/{sid}/events", s.handleEvents)   // SSE
 	//   mux.HandleFunc("POST /sessions/{sid}/gates/{tid}/approve", ...)
