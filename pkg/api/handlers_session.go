@@ -19,6 +19,11 @@ type (
 	sidResponse struct {
 		SID string `json:"sid"`
 	}
+	// interruptResponse reports whether the interrupt actually cancelled in-flight
+	// work (true) or found nothing to cancel (false).
+	interruptResponse struct {
+		Interrupted bool `json:"interrupted"`
+	}
 	// errorResponse is the uniform 4xx/5xx body: a single generic message with no
 	// internal detail. The concrete cause is logged, never returned.
 	errorResponse struct {
@@ -32,6 +37,7 @@ const (
 	msgInvalidSessionID = "invalid session id"
 	msgInvalidResumeID  = "invalid resume session id"
 	msgCreateFailed     = "could not create session"
+	msgInterruptFailed  = "could not interrupt session"
 	msgSessionNotFound  = "session not found"
 )
 
@@ -168,4 +174,30 @@ func (s *server) handleDeleteSession(w http.ResponseWriter, r *http.Request) {
 		slog.Error("api: delete agent close", "err", err)
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// handleInterruptSession serves POST /sessions/{sid}/interrupt. It looks the
+// session up (unknown => 404, malformed id => 400) and calls Interrupt, returning
+// 200 with the interrupted bool. An Interrupt error is a 500 that leaks nothing.
+func (s *server) handleInterruptSession(w http.ResponseWriter, r *http.Request) {
+	sid, err := parseSessionID(r)
+	if err != nil {
+		slog.Warn("api: interrupt rejected invalid id", "err", err)
+		writeError(w, http.StatusBadRequest, msgInvalidSessionID)
+		return
+	}
+
+	entry, ok := s.getSession(sid)
+	if !ok {
+		writeError(w, http.StatusNotFound, msgSessionNotFound)
+		return
+	}
+
+	interrupted, err := entry.agent.Interrupt(r.Context())
+	if err != nil {
+		slog.Error("api: interrupt failed", "err", err)
+		writeError(w, http.StatusInternalServerError, msgInterruptFailed)
+		return
+	}
+	writeJSON(w, http.StatusOK, interruptResponse{Interrupted: interrupted})
 }

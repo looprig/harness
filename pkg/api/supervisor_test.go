@@ -97,14 +97,20 @@ func (s *fakeSub) fail(err error) {
 }
 
 // fakeAgent implements the full api.Agent interface. Subscribe carries behavior
-// (hands back the injected sub or a forced error) for the supervisor; Close
-// records that it ran for the delete endpoint's off-lock teardown. The remaining
-// methods are inert stubs.
+// (hands back the injected sub or a forced error) for the supervisor; Interrupt
+// and Close carry behavior for the session-lifecycle endpoints (interrupt returns
+// the injected result/err; Close records that it ran). The remaining methods are
+// inert stubs.
 type fakeAgent struct {
 	sub    *fakeSub
 	subErr error
 
 	gotFilter event.EventFilter
+
+	// interruptResult/interruptErr are what Interrupt returns — the interrupt
+	// endpoint surfaces the bool and maps a non-nil error to 500.
+	interruptResult bool
+	interruptErr    error
 
 	// mu guards closed, which records that Close was called. The delete endpoint
 	// closes the agent OFF-lock in the server goroutine, so the test's assertion
@@ -130,7 +136,9 @@ func (a *fakeAgent) Approve(_ context.Context, _, _ uuid.UUID, _ tool.ApprovalSc
 }
 func (a *fakeAgent) Deny(_ context.Context, _, _ uuid.UUID) error                    { return nil }
 func (a *fakeAgent) ProvideAnswer(_ context.Context, _, _ uuid.UUID, _ string) error { return nil }
-func (a *fakeAgent) Interrupt(_ context.Context) (bool, error)                       { return false, nil }
+func (a *fakeAgent) Interrupt(_ context.Context) (bool, error) {
+	return a.interruptResult, a.interruptErr
+}
 func (a *fakeAgent) Close(_ context.Context) error {
 	a.mu.Lock()
 	a.closed = true

@@ -13,9 +13,12 @@ import (
 	"github.com/ciram-co/looprig/pkg/uuid"
 )
 
-// errFactory is a leaf sentinel for the create 500 path: a Factory that refuses
-// to build an agent.
-var errFactory = errors.New("api_test: factory boom")
+// errFactory / errInterrupt are leaf sentinels for the 500 paths: a Factory that
+// refuses to build an agent, and an agent whose Interrupt fails.
+var (
+	errFactory   = errors.New("api_test: factory boom")
+	errInterrupt = errors.New("api_test: interrupt boom")
+)
 
 // recordingFactory is a Factory that records the AgentRequest it was handed (so a
 // test can assert the create/resume path minted the right SessionID + Resume flag)
@@ -255,4 +258,100 @@ func TestDeleteSession(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestInterruptSession proves POST /sessions/{sid}/interrupt surfaces the agent's
+// interrupted bool (200), 404s an unknown session, 400s a malformed id, and maps
+// an Interrupt error to a 500 that leaks no internal detail.
+func TestInterruptSession(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name            string
+		setup           func(t *testing.T, s *server) string
+		wantStatus      int
+		wantDecode      bool
+		wantInterrupted bool
+	}{
+		{
+			name: "interrupt reports true",
+			setup: func(t *testing.T, s *server) string {
+				return putInterruptSession(t, s, mkID(0x31), &fakeAgent{sub: newFakeSub(), interruptResult: true})
+			},
+			wantStatus:      http.StatusOK,
+			wantDecode:      true,
+			wantInterrupted: true,
+		},
+		{
+			name: "interrupt reports false",
+			setup: func(t *testing.T, s *server) string {
+				return putInterruptSession(t, s, mkID(0x32), &fakeAgent{sub: newFakeSub(), interruptResult: false})
+			},
+			wantStatus:      http.StatusOK,
+			wantDecode:      true,
+			wantInterrupted: false,
+		},
+		{
+			name: "interrupt error returns 500",
+			setup: func(t *testing.T, s *server) string {
+				return putInterruptSession(t, s, mkID(0x33), &fakeAgent{sub: newFakeSub(), interruptErr: errInterrupt})
+			},
+			wantStatus: http.StatusInternalServerError,
+		},
+		{
+			name: "unknown session returns 404",
+			setup: func(_ *testing.T, _ *server) string {
+				return "/sessions/" + mkID(0xEE).String() + "/interrupt"
+			},
+			wantStatus: http.StatusNotFound,
+		},
+		{
+			name: "malformed id returns 400",
+			setup: func(_ *testing.T, _ *server) string {
+				return "/sessions/not-a-uuid/interrupt"
+			},
+			wantStatus: http.StatusBadRequest,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			s := newServer(Config{}, fakeFactory)
+			ts := httptest.NewServer(s.handler())
+			defer ts.Close()
+			t.Cleanup(func() { stopAll(s) })
+
+			path := tt.setup(t, s)
+			resp := doReq(t, ts, http.MethodPost, path)
+			defer func() { _ = resp.Body.Close() }()
+
+			if resp.StatusCode != tt.wantStatus {
+				t.Fatalf("POST %s status = %d, want %d", path, resp.StatusCode, tt.wantStatus)
+			}
+			if !tt.wantDecode {
+				return
+			}
+			var body interruptResponse
+			if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+				t.Fatalf("decode interruptResponse: %v", err)
+			}
+			if body.Interrupted != tt.wantInterrupted {
+				t.Errorf("interrupted = %v, want %v", body.Interrupted, tt.wantInterrupted)
+			}
+		})
+	}
+}
+
+// putInterruptSession registers fa under id with a live supervisor and returns the
+// interrupt path, cleaning the supervisor up when the subtest ends.
+func putInterruptSession(t *testing.T, s *server, id uuid.UUID, fa *fakeAgent) string {
+	t.Helper()
+	sup, err := newSupervisor(fa)
+	if err != nil {
+		t.Fatalf("newSupervisor() error = %v", err)
+	}
+	t.Cleanup(func() { _ = sup.stop() })
+	s.putSession(id, &sessionEntry{agent: fa, sup: sup})
+	return "/sessions/" + id.String() + "/interrupt"
 }
