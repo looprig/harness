@@ -7,12 +7,13 @@ import (
 
 	"github.com/ciram-co/looprig/pkg/content"
 	"github.com/ciram-co/looprig/pkg/llm"
+	"github.com/ciram-co/looprig/pkg/llm/codec/sse"
 )
 
 // NewStream constructs a StreamReader[content.Chunk] from an HTTP response body
 // containing OpenAI SSE events. The caller must Close the reader when done.
 func NewStream(body io.ReadCloser) *llm.StreamReader[content.Chunk] {
-	sse := NewSSEReader(body)
+	reader := sse.NewReader(body)
 	// pending holds tool-call entries left over from a single SSE delta line that
 	// carried more than one entry. The loop emits one chunk per Next(); these are
 	// drained before the next SSE line is read so multi-entry lines are not dropped.
@@ -31,7 +32,7 @@ func NewStream(body io.ReadCloser) *llm.StreamReader[content.Chunk] {
 				}, nil
 			}
 
-			line, err := sse.Next()
+			line, err := reader.Next()
 			if err != nil {
 				return nil, err
 			}
