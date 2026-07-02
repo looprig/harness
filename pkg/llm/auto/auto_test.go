@@ -271,3 +271,23 @@ func TestNewLMStudioLocal(t *testing.T) {
 		t.Fatal("New(LMStudioLocal, \"\") = nil, want non-nil client")
 	}
 }
+
+func TestDefaultGenericBaseURL(t *testing.T) {
+	tests := []struct {
+		name string
+		p    llm.Provider
+		want string
+	}{
+		{"openrouter", llm.ProviderOpenRouter, "https://openrouter.ai/api/v1"},
+		{"lmstudio", llm.ProviderLMStudio, "http://localhost:1234/v1"},
+		{"no default for others", llm.ProviderChutes, ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := defaultGenericBaseURL(tt.p); got != tt.want {
+				t.Errorf("defaultGenericBaseURL(%s) = %q, want %q", tt.p, got, tt.want)
+			}
+		})
+	}
+}

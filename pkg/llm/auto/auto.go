@@ -108,11 +108,40 @@ func genericHTTP(model llm.Model, a llm.Authenticator) (llm.LLM, error) {
 	if err != nil {
 		return nil, err
 	}
+	baseURL := model.BaseURL
+	if baseURL == "" {
+		baseURL = defaultGenericBaseURL(model.Provider)
+	}
 	return transport.New(codec, transport.Endpoint{
 		Provider: model.Provider,
-		BaseURL:  model.BaseURL,
+		BaseURL:  baseURL,
 		ChatPath: transport.DefaultChatPath,
 	}, a), nil
+}
+
+const (
+	openRouterBaseURL = "https://openrouter.ai/api/v1"
+	lmStudioBaseURL   = "http://localhost:1234/v1"
+)
+
+// defaultGenericBaseURL returns the canonical endpoint for a generic-transport
+// provider, or "" if it has none (the caller then relies on an explicit base).
+// INVARIANT: any generic-transport provider (one routed through genericHTTP) for
+// which llm.Provider.allowsEmptyBaseURL() reports true MUST have a default here —
+// otherwise an empty Model.BaseURL passes Validate but yields a hostless endpoint
+// that only fails at request time. The generic-transport providers are currently
+// exactly {openrouter, lmstudio}, and both have a default below; the other
+// allowsEmptyBaseURL providers (chutes, phala, google) self-default the base in
+// their own dedicated clients, and bedrock is region-routed with no base.
+func defaultGenericBaseURL(p llm.Provider) string {
+	switch p {
+	case llm.ProviderOpenRouter:
+		return openRouterBaseURL
+	case llm.ProviderLMStudio:
+		return lmStudioBaseURL
+	default:
+		return ""
+	}
 }
 
 // codecFor selects the wire codec for a generic (transport-backed) provider by its
