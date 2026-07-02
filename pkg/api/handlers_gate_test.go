@@ -8,7 +8,14 @@ import (
 	"testing"
 
 	"github.com/ciram-co/looprig/pkg/content"
+	"github.com/ciram-co/looprig/pkg/event"
+	"github.com/ciram-co/looprig/pkg/tool"
+	"github.com/ciram-co/looprig/pkg/uuid"
 )
+
+// gatePrompt is the human-facing description the permission gate carries in these
+// tests (BashRequest.Description() returns its Command verbatim).
+const gatePrompt = "rm -rf /tmp/x"
 
 // doReqBody issues method+path against ts with a JSON body and returns the
 // response; the caller closes the body. It fatals on a construction/transport
@@ -109,6 +116,196 @@ func TestInput(t *testing.T) {
 			}
 			if tb.Text != "hi" {
 				t.Errorf("Submit block text = %q, want %q", tb.Text, "hi")
+			}
+		})
+	}
+}
+
+// TestGateResolution is the core routing test: it proves POST
+// /sessions/{sid}/gates/{tid} resolves an OPEN gate by pulling the producing
+// LoopID from the supervisor registry (never the client body), validates the
+// action against the gate Kind (fail-secure 409 on a mismatch), and dispatches
+// Approve/Deny/ProvideAnswer with the tool-execution id. No SSE client is ever
+// attached — the supervisor owns its own subscription.
+func TestGateResolution(t *testing.T) {
+	t.Parallel()
+
+	const kindNone = ""
+
+	tests := []struct {
+		name        string
+		gateKind    string // kindNone => feed no gate (tid stays unregistered)
+		body        string
+		approveErr  error
+		sidOverride string
+		tidOverride string
+		wantStatus  int
+		assert      func(t *testing.T, fa *fakeAgent, tid, lid uuid.UUID)
+	}{
+		{
+			name: "approve permission gate routes registry LoopID", gateKind: kindPermission,
+			body: `{"action":"approve","scope":0}`, wantStatus: http.StatusNoContent,
+			assert: func(t *testing.T, fa *fakeAgent, tid, lid uuid.UUID) {
+				called, loopID, callID, scope := fa.approveArgs()
+				if !called {
+					t.Fatal("Approve not called")
+				}
+				if loopID != lid {
+					t.Errorf("Approve loopID = %v, want registry lid %v", loopID, lid)
+				}
+				if callID != tid {
+					t.Errorf("Approve callID = %v, want tid %v", callID, tid)
+				}
+				if scope != tool.ScopeOnce {
+					t.Errorf("Approve scope = %v, want ScopeOnce", scope)
+				}
+			},
+		},
+		{
+			name: "approve default scope is ScopeOnce", gateKind: kindPermission,
+			body: `{"action":"approve"}`, wantStatus: http.StatusNoContent,
+			assert: func(t *testing.T, fa *fakeAgent, _, _ uuid.UUID) {
+				called, _, _, scope := fa.approveArgs()
+				if !called || scope != tool.ScopeOnce {
+					t.Errorf("Approve called=%v scope=%v, want called=true scope=ScopeOnce", called, scope)
+				}
+			},
+		},
+		{
+			name: "approve honors explicit session scope", gateKind: kindPermission,
+			body: `{"action":"approve","scope":1}`, wantStatus: http.StatusNoContent,
+			assert: func(t *testing.T, fa *fakeAgent, _, _ uuid.UUID) {
+				_, _, _, scope := fa.approveArgs()
+				if scope != tool.ScopeSession {
+					t.Errorf("Approve scope = %v, want ScopeSession", scope)
+				}
+			},
+		},
+		{
+			name: "deny permission gate routes registry LoopID", gateKind: kindPermission,
+			body: `{"action":"deny"}`, wantStatus: http.StatusNoContent,
+			assert: func(t *testing.T, fa *fakeAgent, tid, lid uuid.UUID) {
+				called, loopID, callID := fa.denyArgs()
+				if !called {
+					t.Fatal("Deny not called")
+				}
+				if loopID != lid || callID != tid {
+					t.Errorf("Deny (loopID,callID) = (%v,%v), want (%v,%v)", loopID, callID, lid, tid)
+				}
+			},
+		},
+		{
+			name: "answer user-input gate routes registry LoopID", gateKind: kindUserInput,
+			body: `{"action":"answer","answer":"blue"}`, wantStatus: http.StatusNoContent,
+			assert: func(t *testing.T, fa *fakeAgent, tid, lid uuid.UUID) {
+				called, loopID, callID, answer := fa.answerArgs()
+				if !called {
+					t.Fatal("ProvideAnswer not called")
+				}
+				if loopID != lid || callID != tid {
+					t.Errorf("ProvideAnswer (loopID,callID) = (%v,%v), want (%v,%v)", loopID, callID, lid, tid)
+				}
+				if answer != "blue" {
+					t.Errorf("ProvideAnswer answer = %q, want %q", answer, "blue")
+				}
+			},
+		},
+		{
+			name: "unknown tool-execution id returns 404", gateKind: kindNone,
+			body: `{"action":"approve"}`, wantStatus: http.StatusNotFound,
+		},
+		{
+			name: "answer on a permission gate is a 409 mismatch", gateKind: kindPermission,
+			body: `{"action":"answer","answer":"x"}`, wantStatus: http.StatusConflict,
+			assert: func(t *testing.T, fa *fakeAgent, _, _ uuid.UUID) {
+				ac, _, _, _ := fa.approveArgs()
+				dc, _, _ := fa.denyArgs()
+				an, _, _, _ := fa.answerArgs()
+				if ac || dc || an {
+					t.Error("a kind-mismatched action dispatched a control (want fail-secure: nothing dispatched)")
+				}
+			},
+		},
+		{
+			name: "approve on a user-input gate is a 409 mismatch", gateKind: kindUserInput,
+			body: `{"action":"approve"}`, wantStatus: http.StatusConflict,
+		},
+		{
+			name: "unknown action is a 400", gateKind: kindPermission,
+			body: `{"action":"frobnicate"}`, wantStatus: http.StatusBadRequest,
+		},
+		{
+			name: "out-of-range scope is a 400", gateKind: kindPermission,
+			body: `{"action":"approve","scope":99}`, wantStatus: http.StatusBadRequest,
+		},
+		{
+			name: "negative scope is a 400", gateKind: kindPermission,
+			body: `{"action":"approve","scope":-1}`, wantStatus: http.StatusBadRequest,
+		},
+		{
+			name: "malformed json is a 400", gateKind: kindPermission,
+			body: `{"action":`, wantStatus: http.StatusBadRequest,
+		},
+		{
+			name: "agent Approve error is a 500", gateKind: kindPermission,
+			body: `{"action":"approve"}`, approveErr: errInterrupt, wantStatus: http.StatusInternalServerError,
+		},
+		{
+			name: "unknown session returns 404", gateKind: kindNone,
+			body: `{"action":"approve"}`, sidOverride: mkID(0xEE).String(), wantStatus: http.StatusNotFound,
+		},
+		{
+			name: "malformed session id returns 400", gateKind: kindNone,
+			body: `{"action":"approve"}`, sidOverride: "not-a-uuid", wantStatus: http.StatusBadRequest,
+		},
+		{
+			name: "malformed tool-execution id returns 400", gateKind: kindNone,
+			body: `{"action":"approve"}`, tidOverride: "not-a-uuid", wantStatus: http.StatusBadRequest,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			s := newServer(Config{}, fakeFactory)
+			ts := httptest.NewServer(s.handler())
+			defer ts.Close()
+			t.Cleanup(func() { stopAll(s) })
+
+			fs := newFakeSub()
+			fa := &fakeAgent{sub: fs, approveErr: tt.approveErr}
+			sup := mustSupervisor(t, fa)
+			sid, tid, lid := mkID(0xB1), mkID(0xC1), mkID(0xD1)
+			s.putSession(sid, &sessionEntry{agent: fa, sup: sup})
+
+			switch tt.gateKind {
+			case kindPermission:
+				fs.feed(event.PermissionRequested{Header: loopHeader(lid), ToolExecutionID: tid, Request: tool.BashRequest{Command: gatePrompt}})
+			case kindUserInput:
+				fs.feed(event.UserInputRequested{Header: loopHeader(lid), ToolExecutionID: tid, Question: "pick a color"})
+			}
+			if tt.gateKind != kindNone {
+				if !pollUntil(t, func() bool { _, ok := sup.lookup(tid); return ok }) {
+					t.Fatalf("gate %v not recorded within %v", tid, pollDeadline)
+				}
+			}
+
+			sidPart := sid.String()
+			if tt.sidOverride != "" {
+				sidPart = tt.sidOverride
+			}
+			tidPart := tid.String()
+			if tt.tidOverride != "" {
+				tidPart = tt.tidOverride
+			}
+			resp := doReqBody(t, ts, http.MethodPost, "/sessions/"+sidPart+"/gates/"+tidPart, tt.body)
+			defer func() { _ = resp.Body.Close() }()
+
+			if resp.StatusCode != tt.wantStatus {
+				t.Fatalf("POST gate status = %d, want %d", resp.StatusCode, tt.wantStatus)
+			}
+			if tt.assert != nil {
+				tt.assert(t, fa, tid, lid)
 			}
 		})
 	}

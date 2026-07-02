@@ -98,9 +98,11 @@ func (s *fakeSub) fail(err error) {
 
 // fakeAgent implements the full api.Agent interface. Subscribe carries behavior
 // (hands back the injected sub or a forced error) for the supervisor; Interrupt
-// and Close carry behavior for the session-lifecycle endpoints; Submit carries
-// behavior for the input endpoint (returns its injected id/err and records the
-// blocks it was handed). The remaining methods are inert stubs.
+// and Close carry behavior for the session-lifecycle endpoints; Submit/Approve/
+// Deny/ProvideAnswer carry behavior for the input + gate-routing endpoints (each
+// returns its injected result/err and records the arguments it was handed so a
+// test can assert the LoopID came from the registry, not the client). The
+// remaining methods are inert stubs.
 type fakeAgent struct {
 	sub    *fakeSub
 	subErr error
@@ -113,18 +115,37 @@ type fakeAgent struct {
 	interruptErr    error
 
 	// submitID/submitErr are what Submit returns: the input endpoint echoes the id
-	// back as input_id and maps a non-nil error to 500. Set at construction (before
-	// the server handles a request), so they are read without the mutex.
-	submitID  uuid.UUID
-	submitErr error
+	// back as input_id and maps a non-nil error to 500. approveErr/denyErr/answerErr
+	// force the gate-dispatch 500 paths. These are set at construction (before the
+	// server handles a request), so they are read without the mutex.
+	submitID   uuid.UUID
+	submitErr  error
+	approveErr error
+	denyErr    error
+	answerErr  error
 
-	// mu guards the recorded-call fields below (closed + the submitted blocks). The
-	// endpoints run in the server's handler goroutine while the test asserts from
-	// its own goroutine, so every recorded write must be synchronized under -race.
+	// mu guards the recorded-call fields below (closed + the Submit/Approve/Deny/
+	// ProvideAnswer arguments). The endpoints run in the server's handler goroutine
+	// while the test asserts from its own goroutine, so every recorded write must be
+	// synchronized to stay clean under -race.
 	mu     sync.Mutex
 	closed bool
 
 	submittedBlocks []content.Block
+
+	approveCalled bool
+	approveLoopID uuid.UUID
+	approveCallID uuid.UUID
+	approveScope  tool.ApprovalScope
+
+	denyCalled bool
+	denyLoopID uuid.UUID
+	denyCallID uuid.UUID
+
+	answerCalled bool
+	answerLoopID uuid.UUID
+	answerCallID uuid.UUID
+	answerText   string
 }
 
 func (a *fakeAgent) Subscribe(filter event.EventFilter) (event.Subscription, error) {
@@ -142,11 +163,24 @@ func (a *fakeAgent) Submit(_ context.Context, blocks []content.Block) (uuid.UUID
 	return a.submitID, a.submitErr
 }
 func (a *fakeAgent) PrimaryLoopID() uuid.UUID { return uuid.UUID{} }
-func (a *fakeAgent) Approve(_ context.Context, _, _ uuid.UUID, _ tool.ApprovalScope) error {
-	return nil
+func (a *fakeAgent) Approve(_ context.Context, loopID, callID uuid.UUID, scope tool.ApprovalScope) error {
+	a.mu.Lock()
+	a.approveCalled, a.approveLoopID, a.approveCallID, a.approveScope = true, loopID, callID, scope
+	a.mu.Unlock()
+	return a.approveErr
 }
-func (a *fakeAgent) Deny(_ context.Context, _, _ uuid.UUID) error                    { return nil }
-func (a *fakeAgent) ProvideAnswer(_ context.Context, _, _ uuid.UUID, _ string) error { return nil }
+func (a *fakeAgent) Deny(_ context.Context, loopID, callID uuid.UUID) error {
+	a.mu.Lock()
+	a.denyCalled, a.denyLoopID, a.denyCallID = true, loopID, callID
+	a.mu.Unlock()
+	return a.denyErr
+}
+func (a *fakeAgent) ProvideAnswer(_ context.Context, loopID, callID uuid.UUID, answer string) error {
+	a.mu.Lock()
+	a.answerCalled, a.answerLoopID, a.answerCallID, a.answerText = true, loopID, callID, answer
+	a.mu.Unlock()
+	return a.answerErr
+}
 func (a *fakeAgent) Interrupt(_ context.Context) (bool, error) {
 	return a.interruptResult, a.interruptErr
 }
@@ -175,6 +209,28 @@ func (a *fakeAgent) submittedBlocksSnapshot() []content.Block {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return a.submittedBlocks
+}
+
+// approveArgs / denyArgs / answerArgs report whether the corresponding gate
+// method was dispatched and the arguments it received, so a test can assert the
+// LoopID was pulled from the registry (not the client body) and routed with the
+// tool-execution id + scope/answer. All are mutex-guarded for -race.
+func (a *fakeAgent) approveArgs() (called bool, loopID, callID uuid.UUID, scope tool.ApprovalScope) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.approveCalled, a.approveLoopID, a.approveCallID, a.approveScope
+}
+
+func (a *fakeAgent) denyArgs() (called bool, loopID, callID uuid.UUID) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.denyCalled, a.denyLoopID, a.denyCallID
+}
+
+func (a *fakeAgent) answerArgs() (called bool, loopID, callID uuid.UUID, answer string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.answerCalled, a.answerLoopID, a.answerCallID, a.answerText
 }
 
 // TestSupervisor_RecordsAndDropsGate proves the registry records a gate from a

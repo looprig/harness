@@ -159,11 +159,13 @@ func (s *server) routes(mux *http.ServeMux) {
 	mux.HandleFunc("DELETE /sessions/{sid}", s.handleDeleteSession)
 	mux.HandleFunc("POST /sessions/{sid}/interrupt", s.handleInterruptSession)
 
-	// Input submission (Task 13, group B).
+	// Input submission + gate routing (Task 13, group B). The gate POST resolves a
+	// gate by tool-execution id — the LoopID comes from the supervisor registry,
+	// never the client.
 	mux.HandleFunc("POST /sessions/{sid}/input", s.handleInput)
+	mux.HandleFunc("POST /sessions/{sid}/gates/{tid}", s.handleResolveGate)
 
-	// Remaining group B (gate routing) and group C (events/export) register here:
-	//   mux.HandleFunc("POST /sessions/{sid}/gates/{tid}", s.handleResolveGate)
+	// Remaining group B (list gates) and group C (events/export) register here:
 	//   mux.HandleFunc("GET /sessions/{sid}/gates", s.handleListGates)
 	//   mux.HandleFunc("GET /sessions/{sid}/events", s.handleEvents)   // SSE
 	//   mux.HandleFunc("GET /sessions/{sid}/export", s.handleExport)
