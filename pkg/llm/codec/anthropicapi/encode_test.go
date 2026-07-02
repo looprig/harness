@@ -370,6 +370,78 @@ func TestEncodeRequest_EffortThinking(t *testing.T) {
 	}
 }
 
+// --- TestEncodeRequest_ThinkingOmitsSampling ------------------------------
+
+// Current adaptive-thinking Anthropic models reject temperature/top_p sent
+// alongside thinking (HTTP 400). The codec reconciles this: when thinking is
+// enabled for the request (Caps.Thinking AND a real Effort), temperature and
+// top_p are omitted from the body even if the caller set them; otherwise they
+// pass through unchanged.
+func TestEncodeRequest_ThinkingOmitsSampling(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name         string
+		thinkingCap  bool
+		effort       llm.Effort
+		wantThinking bool // thinking + output_config present
+		wantSampling bool // temperature + top_p present
+	}{
+		{
+			name:         "thinking enabled omits temperature and top_p",
+			thinkingCap:  true,
+			effort:       llm.EffortHigh,
+			wantThinking: true,
+			wantSampling: false,
+		},
+		{
+			name:         "thinking-capable but effort none keeps temperature and top_p",
+			thinkingCap:  true,
+			effort:       llm.EffortNone,
+			wantThinking: false,
+			wantSampling: true,
+		},
+		{
+			name:         "not thinking-capable keeps temperature and top_p even with effort",
+			thinkingCap:  false,
+			effort:       llm.EffortHigh,
+			wantThinking: false,
+			wantSampling: true,
+		},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			m := baseModel()
+			m.Caps.Thinking = tc.thinkingCap
+			// Both temperature and top_p are set on every case so absence is the
+			// codec's reconciliation, not a missing input.
+			m.Sampling = llm.Sampling{Temperature: f64ptr(0.7), TopP: f64ptr(0.9), Effort: tc.effort}
+			req := llm.Request{Model: m, Messages: content.AgenticMessages{userMsg(textBlock("hi"))}}
+			data, err := anthropicapi.EncodeRequest(req, false)
+			if err != nil {
+				t.Fatalf("EncodeRequest: %v", err)
+			}
+			body := decodeObj(t, data)
+
+			if _, ok := body["thinking"]; ok != tc.wantThinking {
+				t.Errorf("thinking present = %v, want %v", ok, tc.wantThinking)
+			}
+			if _, ok := body["output_config"]; ok != tc.wantThinking {
+				t.Errorf("output_config present = %v, want %v", ok, tc.wantThinking)
+			}
+			if _, ok := body["temperature"]; ok != tc.wantSampling {
+				t.Errorf("temperature present = %v, want %v", ok, tc.wantSampling)
+			}
+			if _, ok := body["top_p"]; ok != tc.wantSampling {
+				t.Errorf("top_p present = %v, want %v", ok, tc.wantSampling)
+			}
+		})
+	}
+}
+
 // --- TestEncodeRequest_MaxTokensAndSampling -------------------------------
 
 func TestEncodeRequest_MaxTokensAndSampling(t *testing.T) {

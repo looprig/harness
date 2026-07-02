@@ -71,8 +71,6 @@ func buildMessagesRequest(req llm.Request, stream bool) (messagesRequest, error)
 		System:        system,
 		Messages:      messages,
 		MaxTokens:     effectiveMaxTokens(sampling.MaxTokens),
-		Temperature:   sampling.Temperature,
-		TopP:          sampling.TopP,
 		StopSequences: sampling.Stop,
 		Stream:        stream,
 	}
@@ -88,11 +86,23 @@ func buildMessagesRequest(req llm.Request, stream bool) (messagesRequest, error)
 	// effort → thinking, gated by the model's advertised Thinking capability. A
 	// non-none Effort enables adaptive thinking and maps the level to
 	// output_config.effort; EffortNone (or a model that can't think) emits neither.
+	thinkingEnabled := false
 	if req.Model.Caps.Thinking {
 		if ev := effortValue(sampling.Effort); ev != "" {
 			r.Thinking = &thinkingConfig{Type: thinkingTypeAdaptive}
 			r.OutputConfig = &outputConfig{Effort: ev}
+			thinkingEnabled = true
 		}
+	}
+
+	// temperature/top_p reconciliation: current adaptive-thinking Anthropic models
+	// reject temperature or top_p sent alongside thinking with an HTTP 400, so when
+	// thinking is enabled for this request the codec OMITS both. Otherwise they pass
+	// through only when set (omitempty on the wire struct). This is the codec's job
+	// per the sampling design — the dialect-validity rule lives here, not on Sampling.
+	if !thinkingEnabled {
+		r.Temperature = sampling.Temperature
+		r.TopP = sampling.TopP
 	}
 
 	return r, nil

@@ -19,6 +19,20 @@ func (e *EncodeError) Error() string {
 
 func (e *EncodeError) Unwrap() error { return e.Err }
 
+// UnsupportedBlockError is returned by the encoder when a user or model content
+// block has a concrete type the Gemini generateContent dialect does not model
+// (e.g. audio or document blocks). Block holds the Go type name for diagnosis.
+// Fail-secure per CLAUDE.md and consistent with the sibling anthropicapi codec:
+// an unmodeled block is refused, never silently dropped, so the model never
+// receives less than the caller sent. Callers may errors.As to detect it.
+type UnsupportedBlockError struct {
+	Block string
+}
+
+func (e *UnsupportedBlockError) Error() string {
+	return "gemini: unsupported content block type " + e.Block
+}
+
 // DecodeError is a failure while parsing a Gemini response body into a
 // provider-neutral Response (a JSON unmarshal failure). The distinct
 // "no candidates" case returns *llm.APIError instead, matching the sibling

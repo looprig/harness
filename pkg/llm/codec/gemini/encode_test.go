@@ -3,6 +3,7 @@ package gemini_test
 import (
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"testing"
 
 	"github.com/ciram-co/looprig/pkg/content"
@@ -673,6 +674,50 @@ func TestEncodeRequest_ThinkingConfig(t *testing.T) {
 			}
 			if budget != tc.wantBudget {
 				t.Errorf("thinkingBudget = %d, want %d", budget, tc.wantBudget)
+			}
+		})
+	}
+}
+
+// --- TestEncodeRequest_UnsupportedBlock ---
+
+// A user or model block the Gemini dialect does not model (audio, document) must
+// fail secure with a *gemini.UnsupportedBlockError rather than being silently
+// dropped — the model must never receive less than the caller sent. This mirrors
+// the sibling anthropicapi codec. A ThinkingBlock on an assistant turn remains an
+// intentional (documented) skip, not an error — covered by TestEncodeRequest_ThinkingIgnored.
+func TestEncodeRequest_UnsupportedBlock(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name string
+		msgs content.AgenticMessages
+	}{
+		{
+			name: "audio block in a user turn is unsupported",
+			msgs: content.AgenticMessages{userMsg(&content.AudioBlock{MediaType: content.MediaTypeAudioMPEG, Data: []byte{1}})},
+		},
+		{
+			name: "document block in a user turn is unsupported",
+			msgs: content.AgenticMessages{userMsg(&content.DocumentBlock{MediaType: content.MediaTypeDocumentPDF, Data: []byte{1}})},
+		},
+		{
+			name: "audio block in an assistant turn is unsupported",
+			msgs: content.AgenticMessages{aiMsg(&content.AudioBlock{MediaType: content.MediaTypeAudioMPEG, Data: []byte{1}})},
+		},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			_, err := gemini.EncodeRequest(llm.Request{Model: llm.Model{Name: "m"}, Messages: tc.msgs})
+			if err == nil {
+				t.Fatalf("expected error, got nil")
+			}
+			var ube *gemini.UnsupportedBlockError
+			if !errors.As(err, &ube) {
+				t.Errorf("error = %v (%T), want *gemini.UnsupportedBlockError", err, err)
 			}
 		})
 	}

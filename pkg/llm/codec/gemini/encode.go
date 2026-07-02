@@ -68,9 +68,17 @@ func buildContents(system string, msgs content.AgenticMessages) ([]geminiContent
 		case *content.SystemMessage:
 			systemParts = append(systemParts, textParts(m.Blocks)...)
 		case *content.UserMessage:
-			contents = append(contents, geminiContent{Role: roleUser, Parts: encodeUserParts(m.Blocks)})
+			parts, err := encodeUserParts(m.Blocks)
+			if err != nil {
+				return nil, nil, err
+			}
+			contents = append(contents, geminiContent{Role: roleUser, Parts: parts})
 		case *content.AIMessage:
-			contents = append(contents, geminiContent{Role: roleModel, Parts: encodeAIParts(m, toolNames)})
+			parts, err := encodeAIParts(m, toolNames)
+			if err != nil {
+				return nil, nil, err
+			}
+			contents = append(contents, geminiContent{Role: roleModel, Parts: parts})
 		case *content.ToolResultMessage:
 			part, err := encodeToolResult(m, toolNames)
 			if err != nil {
@@ -98,8 +106,10 @@ func textParts(blocks []content.Block) []geminiPart {
 }
 
 // encodeUserParts maps a user turn's blocks to Gemini parts: text -> text,
-// image -> inlineData (bytes) or fileData (URL). Block order is preserved.
-func encodeUserParts(blocks []content.Block) []geminiPart {
+// image -> inlineData (bytes) or fileData (URL). Block order is preserved. A block
+// type the dialect does not model (audio, document, …) yields an
+// *UnsupportedBlockError — fail-secure, never a silent drop.
+func encodeUserParts(blocks []content.Block) ([]geminiPart, error) {
 	parts := make([]geminiPart, 0, len(blocks))
 	for _, b := range blocks {
 		switch b := b.(type) {
@@ -107,9 +117,11 @@ func encodeUserParts(blocks []content.Block) []geminiPart {
 			parts = append(parts, geminiPart{Text: b.Text})
 		case *content.ImageBlock:
 			parts = append(parts, imagePart(b))
+		default:
+			return nil, &UnsupportedBlockError{Block: fmt.Sprintf("%T", b)}
 		}
 	}
-	return parts
+	return parts, nil
 }
 
 // imagePart maps an ImageBlock to a Gemini part. Inline bytes are preferred
@@ -127,10 +139,12 @@ func imagePart(img *content.ImageBlock) geminiPart {
 }
 
 // encodeAIParts maps a model turn's blocks to Gemini parts: text -> text,
-// tool_use -> functionCall. ThinkingBlock is dropped — the domain model does not
-// carry Gemini's thoughtSignature, so a thought part cannot be faithfully echoed
-// back. Each tool call's id -> name is recorded for the matching functionResponse.
-func encodeAIParts(m *content.AIMessage, toolNames map[string]string) []geminiPart {
+// tool_use -> functionCall. ThinkingBlock is the one intentional drop — the domain
+// model does not carry Gemini's thoughtSignature, so a thought part cannot be
+// faithfully echoed back (documented, not an error). Each tool call's id -> name is
+// recorded for the matching functionResponse. Any other unmodeled block type yields
+// an *UnsupportedBlockError — fail-secure, never a silent drop.
+func encodeAIParts(m *content.AIMessage, toolNames map[string]string) ([]geminiPart, error) {
 	parts := make([]geminiPart, 0, len(m.Blocks))
 	for _, b := range m.Blocks {
 		switch b := b.(type) {
@@ -145,9 +159,11 @@ func encodeAIParts(m *content.AIMessage, toolNames map[string]string) []geminiPa
 			}})
 		case *content.ThinkingBlock:
 			// Deliberately ignored: no thoughtSignature round-trip in the domain model.
+		default:
+			return nil, &UnsupportedBlockError{Block: fmt.Sprintf("%T", b)}
 		}
 	}
-	return parts
+	return parts, nil
 }
 
 // functionResponsePayload is the JSON object wrapper for a tool result. Gemini's
