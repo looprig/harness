@@ -15,3 +15,17 @@ func (p Provider) RequiresKey() (bool, error) {
 		return false, &ValidationError{Field: "Provider", Reason: "unknown provider; API-key policy undefined"}
 	}
 }
+
+// RequiredAuth reports which credential kind the provider needs, erroring on an unknown provider
+// so a newly added one must be classified here before use. Multi-auth-ready successor to
+// RequiresKey; fail-closed by the same rationale (a permissive default would fail open).
+func (p Provider) RequiredAuth() (AuthKind, error) {
+	switch p {
+	case ProviderLMStudio:
+		return AuthNone, nil
+	case ProviderPhala, ProviderChutes:
+		return AuthAPIKey, nil
+	default:
+		return "", &ValidationError{Field: "Provider", Reason: "unknown provider; auth policy undefined"}
+	}
+}

@@ -40,3 +40,37 @@ func TestProviderRequiresKey(t *testing.T) {
 		})
 	}
 }
+
+func TestProviderRequiredAuth(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name     string
+		provider llm.Provider
+		want     llm.AuthKind
+		wantErr  bool
+	}{
+		{name: "lmstudio needs none", provider: llm.ProviderLMStudio, want: llm.AuthNone},
+		{name: "phala needs api key", provider: llm.ProviderPhala, want: llm.AuthAPIKey},
+		{name: "chutes needs api key", provider: llm.ProviderChutes, want: llm.AuthAPIKey},
+		{name: "empty is error", provider: "", wantErr: true},
+		{name: "unknown is error", provider: "bedrock", wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got, err := tt.provider.RequiredAuth()
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("RequiredAuth() err = %v, wantErr %v", err, tt.wantErr)
+			}
+			if tt.wantErr {
+				var ve *llm.ValidationError
+				if !errors.As(err, &ve) {
+					t.Errorf("RequiredAuth() error = %v, want *llm.ValidationError", err)
+				}
+			}
+			if got != tt.want {
+				t.Errorf("RequiredAuth() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
