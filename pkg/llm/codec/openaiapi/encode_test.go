@@ -102,7 +102,7 @@ func TestEncodeRequest_System(t *testing.T) {
 		wantMsgRole string
 	}{
 		{
-			name:       "system from ModelSpec prepended",
+			name:       "system from Request prepended",
 			systemSpec: "You are helpful.",
 			messages:   content.AgenticMessages{userMsg(textBlock("hi"))},
 			wantFirst:  "system",
@@ -127,7 +127,8 @@ func TestEncodeRequest_System(t *testing.T) {
 			t.Parallel()
 
 			req := llm.Request{
-				Model:    llm.ModelSpec{Model: "test-model", System: tc.systemSpec},
+				Model:    llm.Model{Name: "test-model"},
+				System:   tc.systemSpec,
 				Messages: tc.messages,
 			}
 			got, err := openaiapi.EncodeRequest(req, false)
@@ -167,7 +168,7 @@ func TestEncodeRequest_StreamFlag(t *testing.T) {
 			t.Parallel()
 
 			req := llm.Request{
-				Model:    llm.ModelSpec{Model: "m"},
+				Model:    llm.Model{Name: "m"},
 				Messages: content.AgenticMessages{userMsg(textBlock("x"))},
 			}
 			got, err := openaiapi.EncodeRequest(req, tc.stream)
@@ -335,7 +336,7 @@ func TestEncodeRequest_Messages(t *testing.T) {
 			t.Parallel()
 
 			req := llm.Request{
-				Model:    llm.ModelSpec{Model: "m"},
+				Model:    llm.Model{Name: "m"},
 				Messages: tc.msgs,
 			}
 			got, err := openaiapi.EncodeRequest(req, false)
@@ -388,7 +389,7 @@ func TestEncodeRequest_ToolResultErrorReachesModel(t *testing.T) {
 			t.Parallel()
 
 			req := llm.Request{
-				Model:    llm.ModelSpec{Model: "m"},
+				Model:    llm.Model{Name: "m"},
 				Messages: content.AgenticMessages{tc.msg},
 			}
 			got, err := openaiapi.EncodeRequest(req, false)
@@ -455,7 +456,7 @@ func TestEncodeRequest_Tools(t *testing.T) {
 			t.Parallel()
 
 			req := llm.Request{
-				Model:    llm.ModelSpec{Model: "m"},
+				Model:    llm.Model{Name: "m"},
 				Messages: content.AgenticMessages{userMsg(textBlock("hello"))},
 				Tools:    tc.tools,
 			}
@@ -521,7 +522,7 @@ func TestEncodeRequest_ThinkingIgnored(t *testing.T) {
 			t.Parallel()
 
 			req := llm.Request{
-				Model:    llm.ModelSpec{Model: "m"},
+				Model:    llm.Model{Name: "m"},
 				Messages: tc.msgs,
 			}
 			got, err := openaiapi.EncodeRequest(req, false)
@@ -580,7 +581,7 @@ func TestEncodeRequest_ImageBlock_DataURL(t *testing.T) {
 			t.Parallel()
 
 			req := llm.Request{
-				Model:    llm.ModelSpec{Model: "m"},
+				Model:    llm.Model{Name: "m"},
 				Messages: content.AgenticMessages{userMsg(imageDataBlock(tc.mediaType, tc.data))},
 			}
 			got, err := openaiapi.EncodeRequest(req, false)
@@ -652,20 +653,22 @@ func TestEncodeRequest_ValidJSON(t *testing.T) {
 		{
 			name: "minimal request",
 			req: llm.Request{
-				Model:    llm.ModelSpec{Model: "m"},
+				Model:    llm.Model{Name: "m"},
 				Messages: content.AgenticMessages{userMsg(textBlock("hi"))},
 			},
 		},
 		{
 			name: "full request with tools and system",
 			req: llm.Request{
-				Model: llm.ModelSpec{
-					Model:       "gpt-4o",
-					System:      "Be helpful.",
-					Temperature: &temp,
-					MaxTokens:   &maxTok,
-					Stop:        []string{"STOP"},
+				Model: llm.Model{
+					Name: "gpt-4o",
+					Sampling: llm.Sampling{
+						Temperature: &temp,
+						MaxTokens:   &maxTok,
+						Stop:        []string{"STOP"},
+					},
 				},
+				System: "Be helpful.",
 				Messages: content.AgenticMessages{
 					userMsg(textBlock("hello"), imageURLBlock("https://x.com/img.jpg")),
 					aiMsg(textBlock("hi there")),
@@ -679,7 +682,7 @@ func TestEncodeRequest_ValidJSON(t *testing.T) {
 		{
 			name: "stream=true",
 			req: llm.Request{
-				Model:    llm.ModelSpec{Model: "m"},
+				Model:    llm.Model{Name: "m"},
 				Messages: content.AgenticMessages{userMsg(textBlock("stream me"))},
 			},
 		},
@@ -697,6 +700,185 @@ func TestEncodeRequest_ValidJSON(t *testing.T) {
 			}
 			if !json.Valid(got) {
 				t.Errorf("output is not valid JSON: %s", got)
+			}
+		})
+	}
+}
+
+// --- TestEncodeRequest_Sampling ---
+
+// TestEncodeRequest_Sampling locks the reshaped-domain sampling migration:
+//   - effective sampling is Request.Override when non-nil, else Model.Sampling;
+//   - Temperature/TopP/MaxTokens/Stop from the effective Sampling reach the wire;
+//   - llm.Effort maps to the reasoning_effort wire value, with EffortNone (and
+//     any unknown value, fail-safe) omitting the field and EffortMax clamping to
+//     "high" (OpenAI's o-series accepts only low|medium|high — there is no "max").
+func TestEncodeRequest_Sampling(t *testing.T) {
+	t.Parallel()
+
+	temp := 0.3
+	topP := 0.9
+	maxTok := 256
+	stopVals := []string{"STOP", "END"}
+	overrideTemp := 0.99
+
+	cases := []struct {
+		name          string
+		model         llm.Model
+		override      *llm.Sampling
+		wantTemp      *float64 // nil = temperature key must be absent
+		wantTopP      *float64 // nil = top_p key must be absent
+		wantMaxTokens *int     // nil = max_tokens key must be absent
+		wantStop      []string // nil = stop key must be absent
+		wantEffort    string   // "" = reasoning_effort key must be absent
+	}{
+		{
+			name:          "model sampling: temperature/top_p/max_tokens/stop on wire",
+			model:         llm.Model{Name: "m", Sampling: llm.Sampling{Temperature: &temp, TopP: &topP, MaxTokens: &maxTok, Stop: stopVals}},
+			wantTemp:      &temp,
+			wantTopP:      &topP,
+			wantMaxTokens: &maxTok,
+			wantStop:      stopVals,
+		},
+		{
+			name:       "effort none omits reasoning_effort",
+			model:      llm.Model{Name: "m", Sampling: llm.Sampling{Effort: llm.EffortNone}},
+			wantEffort: "",
+		},
+		{
+			name:       "effort low maps to low",
+			model:      llm.Model{Name: "m", Sampling: llm.Sampling{Effort: llm.EffortLow}},
+			wantEffort: "low",
+		},
+		{
+			name:       "effort medium maps to medium",
+			model:      llm.Model{Name: "m", Sampling: llm.Sampling{Effort: llm.EffortMedium}},
+			wantEffort: "medium",
+		},
+		{
+			name:       "effort high maps to high",
+			model:      llm.Model{Name: "m", Sampling: llm.Sampling{Effort: llm.EffortHigh}},
+			wantEffort: "high",
+		},
+		{
+			name:       "effort max clamps to high",
+			model:      llm.Model{Name: "m", Sampling: llm.Sampling{Effort: llm.EffortMax}},
+			wantEffort: "high",
+		},
+		{
+			// Unknown enum value hits the fail-safe default branch: omit rather
+			// than forward a value the server would reject.
+			name:       "unknown effort value omits reasoning_effort",
+			model:      llm.Model{Name: "m", Sampling: llm.Sampling{Effort: llm.Effort("garbage")}},
+			wantEffort: "",
+		},
+		{
+			name:       "override wins over model sampling",
+			model:      llm.Model{Name: "m", Sampling: llm.Sampling{Temperature: &temp, Effort: llm.EffortLow}},
+			override:   &llm.Sampling{Temperature: &overrideTemp, Effort: llm.EffortMax},
+			wantTemp:   &overrideTemp,
+			wantEffort: "high",
+		},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			req := llm.Request{
+				Model:    tc.model,
+				Override: tc.override,
+				Messages: content.AgenticMessages{userMsg(textBlock("hi"))},
+			}
+			got, err := openaiapi.EncodeRequest(req, false)
+			if err != nil {
+				t.Fatalf("EncodeRequest error: %v", err)
+			}
+			raw := mustDecode(t, got)
+
+			// reasoning_effort: mapped from Effort; absent for EffortNone.
+			effRaw, effOK := raw["reasoning_effort"]
+			if tc.wantEffort == "" {
+				if effOK {
+					t.Errorf("reasoning_effort present (%s), want absent", effRaw)
+				}
+			} else {
+				if !effOK {
+					t.Fatal("reasoning_effort absent, want present")
+				}
+				var eff string
+				if err := json.Unmarshal(effRaw, &eff); err != nil {
+					t.Fatalf("unmarshal reasoning_effort: %v", err)
+				}
+				if eff != tc.wantEffort {
+					t.Errorf("reasoning_effort = %q, want %q", eff, tc.wantEffort)
+				}
+			}
+
+			// temperature: from the effective sampling (override or model).
+			if tc.wantTemp != nil {
+				tRaw, ok := raw["temperature"]
+				if !ok {
+					t.Fatal("temperature absent, want present")
+				}
+				var tv float64
+				if err := json.Unmarshal(tRaw, &tv); err != nil {
+					t.Fatalf("unmarshal temperature: %v", err)
+				}
+				if tv != *tc.wantTemp {
+					t.Errorf("temperature = %v, want %v", tv, *tc.wantTemp)
+				}
+			}
+
+			// top_p: from the effective sampling.
+			if tc.wantTopP != nil {
+				pRaw, ok := raw["top_p"]
+				if !ok {
+					t.Fatal("top_p absent, want present")
+				}
+				var pv float64
+				if err := json.Unmarshal(pRaw, &pv); err != nil {
+					t.Fatalf("unmarshal top_p: %v", err)
+				}
+				if pv != *tc.wantTopP {
+					t.Errorf("top_p = %v, want %v", pv, *tc.wantTopP)
+				}
+			}
+
+			// max_tokens: from the effective sampling.
+			if tc.wantMaxTokens != nil {
+				mRaw, ok := raw["max_tokens"]
+				if !ok {
+					t.Fatal("max_tokens absent, want present")
+				}
+				var mv int
+				if err := json.Unmarshal(mRaw, &mv); err != nil {
+					t.Fatalf("unmarshal max_tokens: %v", err)
+				}
+				if mv != *tc.wantMaxTokens {
+					t.Errorf("max_tokens = %d, want %d", mv, *tc.wantMaxTokens)
+				}
+			}
+
+			// stop: from the effective sampling (array must match element-wise).
+			if tc.wantStop != nil {
+				sRaw, ok := raw["stop"]
+				if !ok {
+					t.Fatal("stop absent, want present")
+				}
+				var sv []string
+				if err := json.Unmarshal(sRaw, &sv); err != nil {
+					t.Fatalf("unmarshal stop: %v", err)
+				}
+				if len(sv) != len(tc.wantStop) {
+					t.Fatalf("stop len = %d, want %d (%v)", len(sv), len(tc.wantStop), sv)
+				}
+				for i, want := range tc.wantStop {
+					if sv[i] != want {
+						t.Errorf("stop[%d] = %q, want %q", i, sv[i], want)
+					}
+				}
 			}
 		})
 	}

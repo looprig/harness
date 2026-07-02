@@ -33,7 +33,7 @@ func TestEncodeToolCallArgumentsAreJSONString(t *testing.T) {
 			t.Parallel()
 
 			req := llm.Request{
-				Model: llm.ModelSpec{Model: "test-model"},
+				Model: llm.Model{Name: "test-model"},
 				Messages: content.AgenticMessages{
 					&content.AIMessage{Message: content.Message{
 						Role: content.RoleAssistant,
