@@ -3,6 +3,8 @@ package api
 import (
 	"bufio"
 	"context"
+	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -11,8 +13,36 @@ import (
 
 	"github.com/ciram-co/looprig/pkg/event"
 	"github.com/ciram-co/looprig/pkg/identity"
+	"github.com/ciram-co/looprig/pkg/transcript"
+	"github.com/ciram-co/looprig/pkg/transcript/journalsource"
 	"github.com/ciram-co/looprig/pkg/uuid"
 )
+
+// export-path leaf sentinels: errExportSource stands in for a non-unavailable
+// ExportSource failure (a 500), errReconstruct for a journal read failure surfaced
+// by RecordSource.Next (Reconstruct returns a *ReconstructError -> 500).
+var (
+	errExportSource = errors.New("api_test: export source boom")
+	errReconstruct  = errors.New("api_test: reconstruct read boom")
+)
+
+// eofSource is a transcript.RecordSource for an empty journal: Next yields io.EOF
+// immediately, which Reconstruct folds into an empty-but-renderable Session.
+type eofSource struct{}
+
+func (eofSource) Next(_ context.Context) (transcript.Record, error) { return nil, io.EOF }
+
+// errSource is a transcript.RecordSource whose Next fails with a non-EOF error, so
+// Reconstruct aborts with a *ReconstructError the export handler maps to 500.
+type errSource struct{}
+
+func (errSource) Next(_ context.Context) (transcript.Record, error) { return nil, errReconstruct }
+
+// noPrompts resolves no system prompt for any loop (ok == false) — the empty-source
+// happy path needs a well-typed resolver even though it is never consulted.
+type noPrompts struct{}
+
+func (noPrompts) SystemPrompt(_ uuid.UUID) (string, bool) { return "", false }
 
 // streamReadDeadline bounds every blocking read/end-of-stream assertion in the SSE
 // test so a regression (a frame that never arrives, a stream that never ends on
@@ -175,6 +205,94 @@ func TestEvents_Errors(t *testing.T) {
 
 			if resp.StatusCode != tt.wantStatus {
 				t.Fatalf("GET %s status = %d, want %d", path, resp.StatusCode, tt.wantStatus)
+			}
+		})
+	}
+}
+
+// TestExport proves GET /sessions/{sid}/export renders a journal-backed transcript
+// to HTML (200, text/html, non-empty body) over a real Reconstruct+Render of an
+// empty source; maps an ExportUnavailableError to 409 and any other ExportSource or
+// Reconstruct failure to 500; and fails secure on a bad/unknown id (400/404).
+func TestExport(t *testing.T) {
+	t.Parallel()
+
+	const sid = 0x60
+
+	tests := []struct {
+		name       string
+		agent      *fakeAgent // nil => not registered (unknown-session path)
+		rawPath    string     // non-empty => used verbatim (malformed-id path)
+		wantStatus int
+		wantHTML   bool
+	}{
+		{
+			name:       "happy path renders html from empty source",
+			agent:      &fakeAgent{exportSrc: eofSource{}, exportPrompts: noPrompts{}},
+			wantStatus: http.StatusOK,
+			wantHTML:   true,
+		},
+		{
+			name:       "export unavailable returns 409",
+			agent:      &fakeAgent{exportErr: &journalsource.ExportUnavailableError{Reason: "in-memory session"}},
+			wantStatus: http.StatusConflict,
+		},
+		{
+			name:       "export source other error returns 500",
+			agent:      &fakeAgent{exportErr: errExportSource},
+			wantStatus: http.StatusInternalServerError,
+		},
+		{
+			name:       "reconstruct read error returns 500",
+			agent:      &fakeAgent{exportSrc: errSource{}, exportPrompts: noPrompts{}},
+			wantStatus: http.StatusInternalServerError,
+		},
+		{
+			name:       "unknown session returns 404",
+			agent:      nil,
+			wantStatus: http.StatusNotFound,
+		},
+		{
+			name:       "malformed id returns 400",
+			rawPath:    "/sessions/not-a-uuid/export",
+			wantStatus: http.StatusBadRequest,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			s := newServer(Config{}, fakeFactory)
+			ts := httptest.NewServer(s.handler())
+			defer ts.Close()
+
+			path := tt.rawPath
+			if path == "" {
+				id := mkID(sid)
+				if tt.agent != nil {
+					registerAgent(t, s, id, tt.agent)
+				}
+				path = "/sessions/" + id.String() + "/export"
+			}
+
+			resp := doReq(t, ts, http.MethodGet, path)
+			defer func() { _ = resp.Body.Close() }()
+
+			if resp.StatusCode != tt.wantStatus {
+				t.Fatalf("GET %s status = %d, want %d", path, resp.StatusCode, tt.wantStatus)
+			}
+			if !tt.wantHTML {
+				return
+			}
+			if ct := resp.Header.Get("Content-Type"); !strings.HasPrefix(ct, "text/html") {
+				t.Errorf("Content-Type = %q, want it to start with text/html", ct)
+			}
+			body, err := io.ReadAll(resp.Body)
+			if err != nil {
+				t.Fatalf("ReadAll(export body) error = %v", err)
+			}
+			if len(body) == 0 {
+				t.Error("export body is empty, want rendered HTML")
 			}
 		})
 	}

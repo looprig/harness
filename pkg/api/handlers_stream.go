@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -8,12 +9,18 @@ import (
 	"time"
 
 	"github.com/ciram-co/looprig/pkg/event"
+	"github.com/ciram-co/looprig/pkg/transcript"
+	"github.com/ciram-co/looprig/pkg/transcript/html"
+	"github.com/ciram-co/looprig/pkg/transcript/journalsource"
 )
 
-// msgSubscribeFailed is the client-safe body when the events stream cannot open its
-// subscription. Deliberately generic so a response never leaks internal state; the
-// concrete cause is logged.
-const msgSubscribeFailed = "could not subscribe to session events"
+// Client-safe messages for the stream + export endpoints. Deliberately generic so a
+// response never leaks the runner's internal state; the concrete cause is logged.
+const (
+	msgSubscribeFailed   = "could not subscribe to session events"
+	msgExportUnavailable = "transcript export is not available for this session"
+	msgExportFailed      = "could not export session transcript"
+)
 
 // allEventsFilter is the whole-session subscription the SSE stream opens: both
 // classes, every loop. It mirrors the supervisor's subscription — the marshaler
@@ -102,5 +109,63 @@ func streamEvents(r *http.Request, w http.ResponseWriter, rc *http.ResponseContr
 				return
 			}
 		}
+	}
+}
+
+// handleExport serves GET /sessions/{sid}/export: it reconstructs the session's
+// journal into a transcript and renders it to a self-contained HTML document. It
+// looks the session up (malformed id => 400, unknown => 404). A non-journal-backed
+// session has no exportable transcript (ExportUnavailableError => 409); any other
+// ExportSource or Reconstruct failure is a 500. The document is rendered into a
+// buffer FIRST so a Render failure is a clean 500 with no partial 200 body.
+func (s *server) handleExport(w http.ResponseWriter, r *http.Request) {
+	sid, err := parseSessionID(r)
+	if err != nil {
+		slog.Warn("api: export rejected invalid id", "err", err)
+		writeError(w, http.StatusBadRequest, msgInvalidSessionID)
+		return
+	}
+
+	entry, ok := s.getSession(sid)
+	if !ok {
+		writeError(w, http.StatusNotFound, msgSessionNotFound)
+		return
+	}
+
+	// OFF-lock: getSession released s.mu, so no agent call runs under the registry
+	// lock.
+	src, prompts, err := entry.agent.ExportSource(r.Context())
+	if err != nil {
+		var unavailable *journalsource.ExportUnavailableError
+		if errors.As(err, &unavailable) {
+			slog.Warn("api: export unavailable", "err", err)
+			writeError(w, http.StatusConflict, msgExportUnavailable)
+			return
+		}
+		slog.Error("api: export source failed", "err", err)
+		writeError(w, http.StatusInternalServerError, msgExportFailed)
+		return
+	}
+
+	sess, _, err := transcript.Reconstruct(r.Context(), src, prompts)
+	if err != nil {
+		slog.Error("api: export reconstruct failed", "err", err)
+		writeError(w, http.StatusInternalServerError, msgExportFailed)
+		return
+	}
+
+	// Render into a buffer first: only a successful render commits a 200 + body, so
+	// a Render failure is a clean 500 with nothing partial written.
+	var buf bytes.Buffer
+	if err := html.Render(&buf, sess); err != nil {
+		slog.Error("api: export render failed", "err", err)
+		writeError(w, http.StatusInternalServerError, msgExportFailed)
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	if _, err := w.Write(buf.Bytes()); err != nil {
+		slog.Error("api: export write body", "err", err)
 	}
 }

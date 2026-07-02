@@ -124,6 +124,14 @@ type fakeAgent struct {
 	denyErr    error
 	answerErr  error
 
+	// exportSrc/exportPrompts/exportErr are what ExportSource returns for the export
+	// endpoint: the source+resolver Reconstruct+Render fold into an HTML transcript,
+	// or exportErr forces the 409 (ExportUnavailableError) / 500 (any other) paths.
+	// Set at construction, read without the mutex.
+	exportSrc     transcript.RecordSource
+	exportPrompts transcript.SystemPromptResolver
+	exportErr     error
+
 	// mu guards the recorded-call fields below (closed + the Submit/Approve/Deny/
 	// ProvideAnswer arguments). The endpoints run in the server's handler goroutine
 	// while the test asserts from its own goroutine, so every recorded write must be
@@ -191,7 +199,7 @@ func (a *fakeAgent) Close(_ context.Context) error {
 	return nil
 }
 func (a *fakeAgent) ExportSource(_ context.Context) (transcript.RecordSource, transcript.SystemPromptResolver, error) {
-	return nil, nil, nil
+	return a.exportSrc, a.exportPrompts, a.exportErr
 }
 
 // wasClosed reports whether Close has been called (mutex-guarded so the delete
