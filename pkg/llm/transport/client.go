@@ -160,7 +160,10 @@ func (c *Client) Stream(ctx context.Context, req llm.Request) (*llm.StreamReader
 // checkBinding fails closed when the request's Model names a provider or endpoint
 // other than the one this Client is bound to, before any I/O.
 func (c *Client) checkBinding(m llm.Model) error {
-	if m.Provider != c.ep.Provider || m.BaseURL != c.ep.BaseURL {
+	// An empty request base means "use the bound endpoint" (the Model.BaseURL
+	// contract); only a non-empty base that disagrees with the binding is a
+	// cross-wiring error.
+	if m.Provider != c.ep.Provider || (m.BaseURL != "" && m.BaseURL != c.ep.BaseURL) {
 		return &llm.ModelMismatchError{
 			BoundProvider:   c.ep.Provider,
 			RequestProvider: m.Provider,
