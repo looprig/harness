@@ -11,7 +11,7 @@ package aci
 // receipt verification — nothing is injected that weakens verification. The client
 // is built exactly as production wires it:
 //
-//	New("https://inference.phala.com", key, DefaultPhalaPolicy())
+//	New("https://inference.phala.com", key, testPolicy())
 //
 // Both tests are GATED on PHALA_API_KEY: with no key set they t.Skip, so the
 // default `go test` run (and any CI without the secret) stays green. The runner
@@ -90,7 +90,7 @@ func liveRequest() llm.Request {
 func TestLiveInvoke(t *testing.T) {
 	key := liveKey(t)
 
-	client := New(livePhalaBaseURL, key, DefaultPhalaPolicy())
+	client := New(livePhalaBaseURL, key, testPolicy())
 
 	ctx, cancel := context.WithTimeout(context.Background(), liveTimeout)
 	defer cancel()
@@ -118,7 +118,7 @@ func TestLiveInvoke(t *testing.T) {
 func TestLiveStream(t *testing.T) {
 	key := liveKey(t)
 
-	client := New(livePhalaBaseURL, key, DefaultPhalaPolicy())
+	client := New(livePhalaBaseURL, key, testPolicy())
 
 	ctx, cancel := context.WithTimeout(context.Background(), liveTimeout)
 	defer cancel()
