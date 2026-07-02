@@ -1,11 +1,8 @@
 package llm_test
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
-	"log/slog"
-	"strings"
 	"testing"
 
 	"github.com/ciram-co/looprig/pkg/content"
@@ -63,114 +60,6 @@ func TestReasoningEffort_Constants(t *testing.T) {
 	})
 }
 
-func TestModelSpec_Validate(t *testing.T) {
-	t.Parallel()
-
-	temp := func(v float64) *float64 { return &v }
-	tokens := func(v int) *int { return &v }
-
-	cases := []struct {
-		name    string
-		spec    llm.ModelSpec
-		wantErr bool
-	}{
-		{
-			name:    "valid zero value",
-			spec:    llm.ModelSpec{},
-			wantErr: false,
-		},
-		{
-			name: "valid thinking budget with temperature 1.0",
-			spec: llm.ModelSpec{
-				ThinkingBudget: 1000,
-				Temperature:    temp(1.0),
-			},
-			wantErr: false,
-		},
-		{
-			name:    "valid reasoning effort low",
-			spec:    llm.ModelSpec{ReasoningEffort: llm.ReasoningEffortLow},
-			wantErr: false,
-		},
-		{
-			name:    "valid reasoning effort medium",
-			spec:    llm.ModelSpec{ReasoningEffort: llm.ReasoningEffortMedium},
-			wantErr: false,
-		},
-		{
-			name:    "valid reasoning effort high",
-			spec:    llm.ModelSpec{ReasoningEffort: llm.ReasoningEffortHigh},
-			wantErr: false,
-		},
-		{
-			name:    "valid empty reasoning effort",
-			spec:    llm.ModelSpec{ReasoningEffort: ""},
-			wantErr: false,
-		},
-		{
-			name: "invalid thinking budget nil temperature",
-			spec: llm.ModelSpec{
-				ThinkingBudget: 1000,
-				Temperature:    nil,
-			},
-			wantErr: true,
-		},
-		{
-			name: "invalid thinking budget temperature not 1.0",
-			spec: llm.ModelSpec{
-				ThinkingBudget: 1000,
-				Temperature:    temp(0.7),
-			},
-			wantErr: true,
-		},
-		{
-			name:    "invalid reasoning effort extreme",
-			spec:    llm.ModelSpec{ReasoningEffort: "extreme"},
-			wantErr: true,
-		},
-		{
-			name: "boundary thinking budget zero temperature 0.7 no constraint",
-			spec: llm.ModelSpec{
-				ThinkingBudget: 0,
-				Temperature:    temp(0.7),
-			},
-			wantErr: false,
-		},
-		{
-			name: "boundary all optional fields nil",
-			spec: llm.ModelSpec{
-				MaxTokens: nil,
-				TopP:      nil,
-				Stop:      nil,
-			},
-			wantErr: false,
-		},
-		{
-			name: "boundary all optional fields set",
-			spec: llm.ModelSpec{
-				Temperature: temp(0.5),
-				TopP:        temp(0.9),
-				MaxTokens:   tokens(256),
-				Stop:        []string{"</s>"},
-			},
-			wantErr: false,
-		},
-	}
-
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-			err := tc.spec.Validate()
-			if tc.wantErr && err == nil {
-				t.Error("Validate() returned nil, want error")
-			}
-			if !tc.wantErr && err != nil {
-				t.Errorf("Validate() returned unexpected error: %v", err)
-			}
-		})
-	}
-}
-
 func TestLLM_InterfaceCompliance(t *testing.T) {
 	t.Parallel()
 	// compile-time assertion is at the top of the file via var _ llm.LLM = (*fakeLLM)(nil).
@@ -192,6 +81,40 @@ func TestLLM_InterfaceCompliance(t *testing.T) {
 	}
 	if sr != nil {
 		t.Errorf("fakeLLM.Stream returned non-nil StreamReader, want nil")
+	}
+}
+
+// TestRequest_Fields verifies a Request carries a secret-free Model, a per-agent
+// System prompt, messages, tools, and an optional per-call Sampling override.
+func TestRequest_Fields(t *testing.T) {
+	t.Parallel()
+
+	override := &llm.Sampling{Temperature: f64ptr(0.2)}
+	req := llm.Request{
+		Model:    llm.ChutesKimiK2(),
+		System:   "you are helpful",
+		Messages: content.AgenticMessages{},
+		Tools:    []llm.Tool{{Name: "search"}},
+		Override: override,
+	}
+
+	if req.Model.Provider != llm.ProviderChutes {
+		t.Errorf("Request.Model.Provider = %q, want chutes", req.Model.Provider)
+	}
+	if req.System != "you are helpful" {
+		t.Errorf("Request.System = %q, want %q", req.System, "you are helpful")
+	}
+	if len(req.Tools) != 1 || req.Tools[0].Name != "search" {
+		t.Errorf("Request.Tools = %+v, want one tool named search", req.Tools)
+	}
+	if req.Override == nil || req.Override.Temperature == nil || *req.Override.Temperature != 0.2 {
+		t.Errorf("Request.Override = %+v, want Temperature 0.2", req.Override)
+	}
+
+	// A nil Override is the documented "use Model.Sampling" default.
+	def := llm.Request{Model: llm.ChutesKimiK2()}
+	if def.Override != nil {
+		t.Errorf("zero-value Request.Override = %+v, want nil", def.Override)
 	}
 }
 
@@ -239,7 +162,7 @@ func TestTool_Schema(t *testing.T) {
 	}
 }
 
-func TestModelSpecProviderFields(t *testing.T) {
+func TestProviderConstants(t *testing.T) {
 	t.Parallel()
 
 	cases := []struct {
@@ -258,15 +181,6 @@ func TestModelSpecProviderFields(t *testing.T) {
 			if string(tc.provider) != tc.want {
 				t.Errorf("Provider = %q, want %q", tc.provider, tc.want)
 			}
-			spec := llm.ModelSpec{
-				Provider: tc.provider,
-				BaseURL:  "http://localhost:1234",
-				APIKey:   "sk-test",
-				Model:    "qwen",
-			}
-			if err := spec.Validate(); err != nil {
-				t.Errorf("Validate() on a benign spec = %v, want nil", err)
-			}
 		})
 	}
 
@@ -284,53 +198,6 @@ func TestModelSpecProviderFields(t *testing.T) {
 			seen[p] = true
 		}
 	})
-}
-
-func TestModelSpec_Redaction(t *testing.T) {
-	t.Parallel()
-
-	const secret = "sk-supersecret"
-
-	cases := []struct {
-		name          string
-		apiKey        string
-		wantRedacted  bool // String()/log must contain "[REDACTED]" / "REDACTED"
-		wantSecretOut bool // never true; documents the security invariant
-	}{
-		{name: "non-empty key is redacted", apiKey: secret, wantRedacted: true},
-		{name: "empty key has no redaction marker", apiKey: "", wantRedacted: false},
-	}
-
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-			spec := llm.ModelSpec{
-				Provider: llm.ProviderChutes,
-				BaseURL:  "http://x",
-				APIKey:   tc.apiKey,
-				Model:    "m",
-			}
-
-			got := spec.String()
-			if strings.Contains(got, secret) {
-				t.Errorf("String() leaked secret: %q", got)
-			}
-			if strings.Contains(got, "[REDACTED]") != tc.wantRedacted {
-				t.Errorf("String() = %q, wantRedacted %v", got, tc.wantRedacted)
-			}
-
-			var buf bytes.Buffer
-			logger := slog.New(slog.NewTextHandler(&buf, nil))
-			logger.Info("x", "spec", spec)
-			logged := buf.String()
-			if strings.Contains(logged, secret) {
-				t.Errorf("slog output leaked secret: %q", logged)
-			}
-			if strings.Contains(logged, "REDACTED") != tc.wantRedacted {
-				t.Errorf("slog output = %q, want REDACTED present=%v", logged, tc.wantRedacted)
-			}
-		})
-	}
 }
 
 func TestUsage(t *testing.T) {

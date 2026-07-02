@@ -16,6 +16,20 @@ func (p Provider) RequiresKey() (bool, error) {
 	}
 }
 
+// supportsAPIFormat reports whether provider p is known to speak wire dialect f.
+// It is fail-closed: an unknown provider supports no formats, so a newly added
+// provider must be classified here before any Model naming it can Validate.
+func (p Provider) supportsAPIFormat(f APIFormat) bool {
+	switch p {
+	case ProviderPhala, ProviderChutes:
+		return f == APIFormatOpenAI
+	case ProviderLMStudio:
+		return f == APIFormatOpenAI || f == APIFormatAnthropic
+	default:
+		return false
+	}
+}
+
 // RequiredAuth reports which credential kind the provider needs, erroring on an unknown provider
 // so a newly added one must be classified here before use. Multi-auth-ready successor to
 // RequiresKey; fail-closed by the same rationale (a permissive default would fail open).
