@@ -9,8 +9,8 @@ import (
 	"os"
 
 	"github.com/ciram-co/looprig/pkg/llm"
+	"github.com/ciram-co/looprig/pkg/llm/codec/openaiapi"
 	"github.com/ciram-co/looprig/pkg/llm/e2e"
-	"github.com/ciram-co/looprig/pkg/llm/openaiapi"
 )
 
 // decodeResponse opens the sealed /e2e/invoke response: respMlkemCT(1088) is

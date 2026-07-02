@@ -1,5 +1,5 @@
-// internal/llm/openaiapi/sse_test.go
-package openaiapi_test
+// pkg/llm/codec/sse/sse_test.go
+package sse_test
 
 import (
 	"errors"
@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/ciram-co/looprig/pkg/llm/openaiapi"
+	"github.com/ciram-co/looprig/pkg/llm/codec/sse"
 )
 
 // errorReader returns an error after emitting a fixed prefix.
@@ -27,7 +27,7 @@ func (e *errorReader) Read(p []byte) (int, error) {
 }
 
 // collectNext drives r.Next() until error, returning payloads and the terminal error.
-func collectNext(r *openaiapi.SSEReader) ([]string, error) {
+func collectNext(r *sse.Reader) ([]string, error) {
 	var payloads []string
 	for {
 		p, err := r.Next()
@@ -38,7 +38,7 @@ func collectNext(r *openaiapi.SSEReader) ([]string, error) {
 	}
 }
 
-func TestSSEReader_Next(t *testing.T) {
+func TestReader_Next(t *testing.T) {
 	t.Parallel()
 
 	cases := []struct {
@@ -89,7 +89,7 @@ func TestSSEReader_Next(t *testing.T) {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			r := openaiapi.NewSSEReader(strings.NewReader(tc.body))
+			r := sse.NewReader(strings.NewReader(tc.body))
 			got, err := collectNext(r)
 			if !errors.Is(err, tc.wantErr) {
 				t.Fatalf("terminal error: got %v, want %v", err, tc.wantErr)
@@ -106,7 +106,7 @@ func TestSSEReader_Next(t *testing.T) {
 	}
 }
 
-func TestSSEReader_IgnoresNonDataLines(t *testing.T) {
+func TestReader_IgnoresNonDataLines(t *testing.T) {
 	t.Parallel()
 
 	cases := []struct {
@@ -140,7 +140,7 @@ func TestSSEReader_IgnoresNonDataLines(t *testing.T) {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			r := openaiapi.NewSSEReader(strings.NewReader(tc.body))
+			r := sse.NewReader(strings.NewReader(tc.body))
 			got, err := collectNext(r)
 			if !errors.Is(err, io.EOF) {
 				t.Fatalf("unexpected terminal error: %v", err)
@@ -157,7 +157,7 @@ func TestSSEReader_IgnoresNonDataLines(t *testing.T) {
 	}
 }
 
-func TestSSEReader_ScannerError(t *testing.T) {
+func TestReader_ScannerError(t *testing.T) {
 	t.Parallel()
 
 	errConnectionReset := errors.New("connection reset")
@@ -188,7 +188,7 @@ func TestSSEReader_ScannerError(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			er := &errorReader{prefix: []byte(tc.prefix), err: tc.readErr}
-			r := openaiapi.NewSSEReader(er)
+			r := sse.NewReader(er)
 			_, gotErr := collectNext(r)
 			if gotErr == nil {
 				t.Fatal("expected error, got nil")
@@ -200,7 +200,7 @@ func TestSSEReader_ScannerError(t *testing.T) {
 	}
 }
 
-func TestNewSSEReader(t *testing.T) {
+func TestNewReader(t *testing.T) {
 	t.Parallel()
 
 	cases := []struct {
@@ -208,7 +208,7 @@ func TestNewSSEReader(t *testing.T) {
 		body string
 	}{
 		{
-			name: "non-nil reader returns usable SSEReader",
+			name: "non-nil reader returns usable Reader",
 			body: "data: {}\n\ndata: [DONE]\n\n",
 		},
 		{
@@ -221,9 +221,9 @@ func TestNewSSEReader(t *testing.T) {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			r := openaiapi.NewSSEReader(strings.NewReader(tc.body))
+			r := sse.NewReader(strings.NewReader(tc.body))
 			if r == nil {
-				t.Fatal("NewSSEReader returned nil")
+				t.Fatal("NewReader returned nil")
 			}
 			_, err := r.Next()
 			if err == nil && tc.body == "" {
@@ -233,13 +233,13 @@ func TestNewSSEReader(t *testing.T) {
 	}
 }
 
-func FuzzSSEReader(f *testing.F) {
+func FuzzReader(f *testing.F) {
 	f.Add("data: {\"choices\":[]}\n\ndata: [DONE]\n\n")
 	f.Add("data: [DONE]\n\n")
 	f.Add("")
 	f.Add(": keep-alive\n\n")
 	f.Fuzz(func(t *testing.T, body string) {
-		r := openaiapi.NewSSEReader(strings.NewReader(body))
+		r := sse.NewReader(strings.NewReader(body))
 		for {
 			_, err := r.Next()
 			if err != nil {

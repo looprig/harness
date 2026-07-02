@@ -34,7 +34,8 @@ import (
 
 	"github.com/ciram-co/looprig/pkg/content"
 	"github.com/ciram-co/looprig/pkg/llm"
-	"github.com/ciram-co/looprig/pkg/llm/openaiapi"
+	"github.com/ciram-co/looprig/pkg/llm/codec/openaiapi"
+	"github.com/ciram-co/looprig/pkg/llm/codec/sse"
 	secp256k1 "github.com/decred/dcrd/dcrec/secp256k1/v4"
 )
 
@@ -425,10 +426,10 @@ func openStreamDeltas(wireBytes []byte, clientPriv *secp256k1.PrivateKey, model,
 		return nil, attestErr(reasonE2EEFailed, &e2eeOpenError{Stage: "nil client key"})
 	}
 
-	sse := openaiapi.NewSSEReader(bytes.NewReader(wireBytes))
+	reader := sse.NewReader(bytes.NewReader(wireBytes))
 	var chunks []content.Chunk
 	for {
-		payload, err := sse.Next()
+		payload, err := reader.Next()
 		if err == io.EOF {
 			return chunks, nil
 		}

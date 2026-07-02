@@ -1,4 +1,4 @@
-// internal/llm/openaiapi/decode_test.go
+// pkg/llm/codec/openaiapi/decode_test.go
 package openaiapi_test
 
 import (
@@ -7,7 +7,7 @@ import (
 
 	"github.com/ciram-co/looprig/pkg/content"
 	"github.com/ciram-co/looprig/pkg/llm"
-	"github.com/ciram-co/looprig/pkg/llm/openaiapi"
+	"github.com/ciram-co/looprig/pkg/llm/codec/openaiapi"
 )
 
 // TestDecodeResponse_CompileTimeCheck asserts the exact signature of DecodeResponse.

@@ -1,5 +1,9 @@
-// internal/llm/openaiapi/sse.go
-package openaiapi
+// pkg/llm/codec/sse/sse.go
+
+// Package sse de-frames OpenAI-style Server-Sent Event streams into their
+// per-event JSON payloads. It is transport-agnostic (reads any io.Reader) and
+// shared across OpenAI-compatible dialects.
+package sse
 
 import (
 	"bufio"
@@ -7,21 +11,21 @@ import (
 	"strings"
 )
 
-// SSEReader reads OpenAI-style Server-Sent Events from an HTTP response body.
+// Reader reads OpenAI-style Server-Sent Events from an io.Reader.
 // Each call to Next returns the JSON payload from one "data: <json>" line.
 // Returns io.EOF after "data: [DONE]" or end of stream.
-type SSEReader struct {
+type Reader struct {
 	scanner *bufio.Scanner
 }
 
-// NewSSEReader constructs an SSEReader from an HTTP response body.
-func NewSSEReader(r io.Reader) *SSEReader {
-	return &SSEReader{scanner: bufio.NewScanner(r)}
+// NewReader constructs a Reader from an io.Reader.
+func NewReader(r io.Reader) *Reader {
+	return &Reader{scanner: bufio.NewScanner(r)}
 }
 
 // Next returns the next SSE data payload, stripping the "data: " prefix.
 // Returns io.EOF when the stream ends (either [DONE] or connection close).
-func (s *SSEReader) Next() (string, error) {
+func (s *Reader) Next() (string, error) {
 	for s.scanner.Scan() {
 		line := s.scanner.Text()
 		if !strings.HasPrefix(line, "data: ") {

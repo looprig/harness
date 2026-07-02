@@ -3,7 +3,7 @@ package lmstudio
 
 import (
 	"github.com/ciram-co/looprig/pkg/llm"
-	"github.com/ciram-co/looprig/pkg/llm/openaiapi"
+	"github.com/ciram-co/looprig/pkg/llm/codec/openaiapi"
 )
 
 func encodeRequest(req llm.Request, stream bool) ([]byte, error) {
