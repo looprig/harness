@@ -142,7 +142,7 @@ func (c *Client) Invoke(ctx context.Context, req llm.Request) (*llm.Response, er
 	if err := req.Model.Validate(); err != nil {
 		return nil, err
 	}
-	chuteID, err := c.resolveChute(ctx, req.Model.Model)
+	chuteID, err := c.resolveChute(ctx, req.Model.Name)
 	if err != nil {
 		return nil, err
 	}
@@ -191,7 +191,7 @@ func (c *Client) Stream(ctx context.Context, req llm.Request) (*llm.StreamReader
 	if err := req.Model.Validate(); err != nil {
 		return nil, err
 	}
-	chuteID, err := c.resolveChute(ctx, req.Model.Model)
+	chuteID, err := c.resolveChute(ctx, req.Model.Name)
 	if err != nil {
 		return nil, err
 	}

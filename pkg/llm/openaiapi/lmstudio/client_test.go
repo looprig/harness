@@ -1,4 +1,4 @@
-// internal/llm/openaiapi/lmstudio/client_test.go
+// pkg/llm/openaiapi/lmstudio/client_test.go
 package lmstudio_test
 
 import (
@@ -20,12 +20,22 @@ import (
 // compile-time interface assertion
 var _ llm.LLM = (*lmstudio.Client)(nil)
 
-func ptr[T any](v T) *T { return &v }
+// validModel returns a Model that passes llm.Model.Validate for the LM Studio
+// provider (OpenAI dialect, loopback http endpoint). Tests that want an invalid
+// Model override one field.
+func validModel(model string) llm.Model {
+	return llm.Model{
+		Provider:  llm.ProviderLMStudio,
+		APIFormat: llm.APIFormatOpenAI,
+		BaseURL:   "http://localhost:1234",
+		Name:      model,
+	}
+}
 
-// validRequest returns a minimal llm.Request with no validation constraints.
+// validRequest returns a minimal, valid llm.Request for the given model name.
 func validRequest(model string) llm.Request {
 	return llm.Request{
-		Model: llm.ModelSpec{Model: model},
+		Model: validModel(model),
 		Messages: content.AgenticMessages{
 			&content.UserMessage{
 				Message: content.Message{
@@ -261,41 +271,27 @@ func TestClient_Validate(t *testing.T) {
 
 	cases := []struct {
 		name   string
-		spec   llm.ModelSpec
+		model  llm.Model
 		method string // "invoke" or "stream"
 	}{
 		{
-			name: "ThinkingBudget=1000 Temperature=0.7 fails validation (invoke)",
-			spec: llm.ModelSpec{
-				Model:          "test-model",
-				ThinkingBudget: 1000,
-				Temperature:    ptr(0.7),
-			},
+			name:   "empty model name fails validation (invoke)",
+			model:  llm.Model{Provider: llm.ProviderLMStudio, APIFormat: llm.APIFormatOpenAI, BaseURL: "http://localhost:1234", Name: ""},
 			method: "invoke",
 		},
 		{
-			name: "ThinkingBudget=1000 Temperature=0.7 fails validation (stream)",
-			spec: llm.ModelSpec{
-				Model:          "test-model",
-				ThinkingBudget: 1000,
-				Temperature:    ptr(0.7),
-			},
+			name:   "empty model name fails validation (stream)",
+			model:  llm.Model{Provider: llm.ProviderLMStudio, APIFormat: llm.APIFormatOpenAI, BaseURL: "http://localhost:1234", Name: ""},
 			method: "stream",
 		},
 		{
-			name: "ThinkingBudget set without Temperature fails validation (invoke)",
-			spec: llm.ModelSpec{
-				Model:          "test-model",
-				ThinkingBudget: 500,
-			},
+			name:   "unknown provider fails validation (invoke)",
+			model:  llm.Model{Provider: llm.Provider("bogus"), APIFormat: llm.APIFormatOpenAI, BaseURL: "http://localhost:1234", Name: "test-model"},
 			method: "invoke",
 		},
 		{
-			name: "invalid ReasoningEffort fails validation (invoke)",
-			spec: llm.ModelSpec{
-				Model:           "test-model",
-				ReasoningEffort: "ultra", // not a valid value
-			},
+			name:   "unsupported api format fails validation (invoke)",
+			model:  llm.Model{Provider: llm.ProviderLMStudio, APIFormat: llm.APIFormatBedrockConverse, BaseURL: "http://localhost:1234", Name: "test-model"},
 			method: "invoke",
 		},
 	}
@@ -315,7 +311,7 @@ func TestClient_Validate(t *testing.T) {
 
 			c := lmstudio.New(srv.URL+"/v1", lmstudio.WithHTTPClient(srv.Client()))
 			req := llm.Request{
-				Model: tc.spec,
+				Model: tc.model,
 				Messages: content.AgenticMessages{
 					&content.UserMessage{
 						Message: content.Message{

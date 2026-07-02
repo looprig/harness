@@ -1,4 +1,4 @@
-// internal/llm/openaiapi/lmstudio/decode.go
+// pkg/llm/openaiapi/lmstudio/decode.go
 package lmstudio
 
 import (
