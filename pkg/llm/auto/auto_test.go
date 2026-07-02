@@ -5,7 +5,6 @@ import (
 	"testing"
 
 	"github.com/ciram-co/looprig/pkg/llm"
-	"github.com/ciram-co/looprig/pkg/llm/aci"
 	"github.com/ciram-co/looprig/pkg/llm/auth"
 	"github.com/ciram-co/looprig/pkg/llm/codec/anthropicapi"
 	"github.com/ciram-co/looprig/pkg/llm/codec/gemini"
@@ -31,7 +30,6 @@ func TestNew(t *testing.T) {
 		wantAuthReq bool   // when wantErr: expect *llm.AuthRequiredError, else *llm.ValidationError
 		wantField   string // when set (ValidationError path): assert ValidationError.Field
 	}{
-		{name: "phala with key", model: llm.GLM46Phala(), key: "k"},
 		{name: "chutes with key", model: llm.ChutesKimiK2(), key: "k"},
 		{name: "openrouter with key", model: llm.OpenRouter("x"), key: "sk-or-key"},
 		{name: "google with key", model: llm.GeminiFlash(), key: "AIza-k"},
@@ -137,10 +135,44 @@ func TestNewBedrockDirectsToConstructor(t *testing.T) {
 	}
 }
 
+// TestNewPhalaNotConstructible confirms the Policy dispatch decision: a Phala model
+// reaches New's dispatch with a present key (its RequiredAuth is AuthAPIKey, so the
+// empty-APIKey guard does NOT fire) and returns a *PolicyNotConstructibleError
+// directing the caller to phala.New, with no client. auto.New's inputs are
+// (model, key) only — it carries no attestation acceptance Policy — so a Phala client
+// cannot be built here; a defaulted policy would fail open.
+func TestNewPhalaNotConstructible(t *testing.T) {
+	t.Parallel()
+	m := llm.CustomModel(llm.ProviderPhala, llm.APIFormatOpenAI, "https://inference.phala.com", "zai-org/GLM-4.6")
+	got, err := New(m, "sk-live")
+	if got != nil {
+		t.Fatalf("New() returned non-nil client (%T) for a policy-requiring provider", got)
+	}
+	var pne *PolicyNotConstructibleError
+	if !errors.As(err, &pne) {
+		t.Fatalf("want *PolicyNotConstructibleError, got %v", err)
+	}
+	if pne.Provider != llm.ProviderPhala {
+		t.Errorf("PolicyNotConstructibleError.Provider = %q, want %q", pne.Provider, llm.ProviderPhala)
+	}
+	if pne.Use != "phala.New" {
+		t.Errorf("PolicyNotConstructibleError.Use = %q, want %q", pne.Use, "phala.New")
+	}
+
+	// It must specifically NOT be an AuthRequiredError: auth is checked before the
+	// construct-directly dispatch, and a present key means the empty-APIKey guard is
+	// skipped, so the policy dispatch — not an auth failure — is what surfaces here.
+	var are *llm.AuthRequiredError
+	if errors.As(err, &are) {
+		t.Error("phala present-key returned *llm.AuthRequiredError; the policy construct-directly dispatch must surface, not an auth failure")
+	}
+}
+
 // TestNewConcreteTypes pins each provider to its concrete client so the wiring
 // cannot silently regress to a different implementation. Behavior differs by
-// provider (phala attests via aci, chutes runs its own e2e client, lmstudio is the
-// generic transport client), so the concrete type is the observable contract.
+// provider (chutes runs its own e2e client, lmstudio is the generic transport
+// client, google is the bespoke gemini client), so the concrete type is the
+// observable contract.
 func TestNewConcreteTypes(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
@@ -150,12 +182,6 @@ func TestNewConcreteTypes(t *testing.T) {
 		is    func(llm.LLM) bool
 		want  string
 	}{
-		{
-			name:  "phala wires the aci attestation client",
-			model: llm.GLM46Phala(), key: "k",
-			is:   func(l llm.LLM) bool { _, ok := l.(*aci.Client); return ok },
-			want: "*aci.Client",
-		},
 		{
 			name:  "chutes wires the chutes client",
 			model: llm.ChutesKimiK2(), key: "k",

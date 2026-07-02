@@ -1,9 +1,14 @@
 // Package auto is the composition root that selects and wires a concrete llm.LLM
-// for a validated Model. It is the single place that imports every provider, so
-// business logic depends only on the llm.LLM interface — never on a concrete
-// provider — and every credential/attestation decision is made here, once. It maps
-// a Provider to its client and enforces the provider's fail-closed auth contract
-// before any network object is constructed.
+// for a validated Model. It imports every provider it can fully construct from
+// (model, key) alone, so business logic depends only on the llm.LLM interface —
+// never on a concrete provider — and every credential/attestation decision is made
+// here, once. Two providers it deliberately does NOT import take an input auto.New
+// does not carry: Bedrock needs AWS SigV4 credentials, and Phala needs an attestation
+// acceptance Policy. For each, New dispatches to a typed construct-directly error
+// (SigV4NotConstructibleError, PolicyNotConstructibleError) that directs the caller to
+// the named constructor rather than building a fail-open client with defaulted
+// credentials. It maps a Provider to its client and enforces the provider's
+// fail-closed auth contract before any network object is constructed.
 package auto
 
 import (
@@ -16,7 +21,6 @@ import (
 	"github.com/ciram-co/looprig/pkg/llm/codec/openaiapi"
 	"github.com/ciram-co/looprig/pkg/llm/providers/chutes"
 	geminiprovider "github.com/ciram-co/looprig/pkg/llm/providers/gemini"
-	"github.com/ciram-co/looprig/pkg/llm/providers/phala"
 	"github.com/ciram-co/looprig/pkg/llm/transport"
 )
 
@@ -34,6 +38,20 @@ type SigV4NotConstructibleError struct {
 
 func (e *SigV4NotConstructibleError) Error() string {
 	return fmt.Sprintf("provider %q requires AWS SigV4 credentials that auto.New cannot supply; construct it directly via %s", e.Provider, e.Use)
+}
+
+// PolicyNotConstructibleError is returned by New for a provider that needs an
+// attestation acceptance Policy auto.New cannot supply (currently Phala). auto.New's
+// inputs are (model, key) only — it carries no Policy — so the caller must construct the
+// client directly via the named constructor with their own verified policy. Fail-closed
+// and directive, never a silent client with a defaulted policy.
+type PolicyNotConstructibleError struct {
+	Provider llm.Provider
+	Use      string
+}
+
+func (e *PolicyNotConstructibleError) Error() string {
+	return fmt.Sprintf("provider %q requires an attestation policy that auto.New cannot supply; construct it directly via %s", e.Provider, e.Use)
 }
 
 // New validates model, enforces the provider's fail-closed auth requirement, then
@@ -61,7 +79,14 @@ func New(model llm.Model, key auth.APIKey) (llm.LLM, error) {
 	}
 	switch model.Provider {
 	case llm.ProviderPhala:
-		return phala.New(model.BaseURL, key, phala.DefaultPolicy())
+		// Phala's client attests the TEE and enforces an attestation acceptance Policy.
+		// auto.New's inputs are (model, key) only — it carries no Policy — so a Phala
+		// client cannot be built here; direct the caller to phala.New (which takes their
+		// own verified policy). Fail-closed with a directive typed error, never a silent
+		// client with a defaulted policy that would fail open. This is why auto no longer
+		// imports the phala package: it dispatches to an error, not to a constructor it
+		// cannot feed.
+		return nil, &PolicyNotConstructibleError{Provider: llm.ProviderPhala, Use: "phala.New"}
 	case llm.ProviderChutes:
 		return chutes.New(model.BaseURL, string(key)), nil
 	case llm.ProviderLMStudio:
