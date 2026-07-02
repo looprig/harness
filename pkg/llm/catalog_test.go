@@ -116,6 +116,45 @@ func TestLMStudioLocal(t *testing.T) {
 	}
 }
 
+// TestClaudeOnBedrockCatalog covers the Bedrock row separately from the API-key
+// rows: it is region-routed (empty BaseURL, permitted by Validate for Bedrock),
+// authenticates with SigV4 (RequiredAuth → AuthSigV4, never a bearer key),
+// declares the Anthropic dialect, is tool- and image-capable, and passes Validate.
+// name (the Bedrock model id, colon and all) passes through verbatim.
+func TestClaudeOnBedrockCatalog(t *testing.T) {
+	t.Parallel()
+	const modelID = "anthropic.claude-3-5-sonnet-20241022-v2:0"
+	m := llm.ClaudeOnBedrock(modelID)
+	if m.Provider != llm.ProviderBedrock {
+		t.Errorf("Provider = %q, want %q", m.Provider, llm.ProviderBedrock)
+	}
+	if m.APIFormat != llm.APIFormatAnthropic {
+		t.Errorf("APIFormat = %q, want %q", m.APIFormat, llm.APIFormatAnthropic)
+	}
+	if m.BaseURL != "" {
+		t.Errorf("BaseURL = %q, want empty (region-routed)", m.BaseURL)
+	}
+	if m.Name != modelID {
+		t.Errorf("Name = %q, want %q", m.Name, modelID)
+	}
+	if m.Origin != llm.OriginCatalog {
+		t.Errorf("Origin = %v, want catalog", m.Origin)
+	}
+	if !m.Caps.Tools {
+		t.Errorf("Caps.Tools = %v, want true", m.Caps.Tools)
+	}
+	if !m.Caps.AcceptsImages {
+		t.Errorf("Caps.AcceptsImages = %v, want true", m.Caps.AcceptsImages)
+	}
+	kind, err := m.Provider.RequiredAuth()
+	if err != nil || kind != llm.AuthSigV4 {
+		t.Errorf("RequiredAuth() = (%v, %v), want (sigv4, nil)", kind, err)
+	}
+	if err := m.Validate(); err != nil {
+		t.Errorf("Validate() on Bedrock row = %v, want nil (empty BaseURL permitted for Bedrock)", err)
+	}
+}
+
 // TestOpenRouterCatalog covers the OpenRouter row: it is OpenAI-compatible, requires
 // an API key (RequiredAuth → AuthAPIKey — Bearer), advertises tool-calling, and passes
 // Validate against its https BaseURL. name is passed through verbatim as the model.

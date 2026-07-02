@@ -63,6 +63,33 @@ func OpenRouter(name string) Model {
 	}
 }
 
+// ClaudeOnBedrock returns a Model for Anthropic Claude served through AWS Bedrock
+// Runtime. Bedrock is region-routed: the endpoint host is derived from the AWS
+// region by bedrock.New, so BaseURL is empty (permitted for ProviderBedrock by
+// Model.Validate). name is the Bedrock model id sent in the request path (e.g.
+// "anthropic.claude-3-5-sonnet-20241022-v2:0", whose ":" the SigV4 signer encodes
+// into the canonical URI). APIFormat is Anthropic (the implemented codec); the
+// body is the Anthropic Messages body minus "model" plus "anthropic_version",
+// which bedrock.New's client produces. Credentials are AWS SigV4 (RequiredAuth ->
+// AuthSigV4), never a bearer key. Capabilities are conservative: Claude on Bedrock
+// is tool- and image-capable; hidden thinking is model-version-specific and left
+// off (fail-safe — the codec then never emits a thinking field). Returned by value
+// so callers cannot mutate shared catalog state.
+func ClaudeOnBedrock(name string) Model {
+	return Model{
+		Provider:  ProviderBedrock,
+		APIFormat: APIFormatAnthropic,
+		BaseURL:   "", // region-routed; bedrock.New derives the endpoint from the region
+		Name:      name,
+		Origin:    OriginCatalog,
+		Caps: Capabilities{
+			MaxContext:    200_000,
+			Tools:         true,
+			AcceptsImages: true,
+		},
+	}
+}
+
 // GLM46Phala returns the zai-org/GLM-4.6 model definition served through Phala's
 // TEE-attested OpenAI-compatible gateway. Returned by value so callers cannot
 // mutate shared catalog state.

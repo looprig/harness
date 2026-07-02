@@ -23,6 +23,7 @@ const (
 	ProviderPhala      Provider = "phala"
 	ProviderChutes     Provider = "chutes"
 	ProviderOpenRouter Provider = "openrouter"
+	ProviderBedrock    Provider = "bedrock"
 )
 
 // Request is the provider-neutral inference request. It carries a secret-free

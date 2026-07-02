@@ -102,6 +102,38 @@ func TestNew(t *testing.T) {
 	}
 }
 
+// TestNewBedrockDirectsToConstructor confirms the SigV4 dispatch decision: a
+// Bedrock model reaches New's dispatch (its RequiredAuth is AuthSigV4, so the
+// empty-APIKey guard does NOT fire — no AuthRequiredError confusion) and returns a
+// *SigV4NotConstructibleError directing the caller to bedrock.New, with no client.
+// auto.New's only credential is an auth.APIKey, which cannot carry SigV4 creds.
+func TestNewBedrockDirectsToConstructor(t *testing.T) {
+	t.Parallel()
+
+	// An empty key must NOT surface as an AuthRequiredError here: bedrock's auth
+	// kind is SigV4, not APIKey, so the Phase-1 empty-APIKey guard is skipped.
+	got, err := New(llm.ClaudeOnBedrock("anthropic.claude-3-5-sonnet-20241022-v2:0"), "")
+	if got != nil {
+		t.Fatalf("New() returned non-nil client (%T) for a SigV4 provider", got)
+	}
+	var sigErr *SigV4NotConstructibleError
+	if !errors.As(err, &sigErr) {
+		t.Fatalf("err = %T, want *SigV4NotConstructibleError", err)
+	}
+	if sigErr.Provider != llm.ProviderBedrock {
+		t.Errorf("SigV4NotConstructibleError.Provider = %q, want %q", sigErr.Provider, llm.ProviderBedrock)
+	}
+	if sigErr.Use != "bedrock.New" {
+		t.Errorf("SigV4NotConstructibleError.Use = %q, want %q", sigErr.Use, "bedrock.New")
+	}
+
+	// It must specifically NOT be an AuthRequiredError (the empty-APIKey path).
+	var are *llm.AuthRequiredError
+	if errors.As(err, &are) {
+		t.Error("bedrock empty-key returned *llm.AuthRequiredError; SigV4 providers must skip the empty-APIKey guard")
+	}
+}
+
 // TestNewConcreteTypes pins each provider to its concrete client so the wiring
 // cannot silently regress to a different implementation. Behavior differs by
 // provider (phala attests via aci, chutes runs its own e2e client, lmstudio is the

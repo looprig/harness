@@ -25,6 +25,11 @@ func (p Provider) supportsAPIFormat(f APIFormat) bool {
 		return f == APIFormatOpenAI
 	case ProviderLMStudio:
 		return f == APIFormatOpenAI || f == APIFormatAnthropic
+	case ProviderBedrock:
+		// Anthropic-on-Bedrock speaks the Anthropic Messages dialect (the
+		// implemented codec); the native Bedrock Converse dialect is reserved for a
+		// future codec but is a legitimate Bedrock format, so both are admitted here.
+		return f == APIFormatAnthropic || f == APIFormatBedrockConverse
 	default:
 		return false
 	}
@@ -39,6 +44,10 @@ func (p Provider) RequiredAuth() (AuthKind, error) {
 		return AuthNone, nil
 	case ProviderPhala, ProviderChutes, ProviderOpenRouter:
 		return AuthAPIKey, nil
+	case ProviderBedrock:
+		// Bedrock authenticates with AWS SigV4, not a bearer API key; auto.New cannot
+		// supply SigV4 credentials, so a Bedrock client is built directly via bedrock.New.
+		return AuthSigV4, nil
 	default:
 		return "", &ValidationError{Field: "Provider", Reason: "unknown provider; auth policy undefined"}
 	}

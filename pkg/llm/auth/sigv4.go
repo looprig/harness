@@ -31,6 +31,10 @@ const (
 	headerAmzToken = "X-Amz-Security-Token"
 	headerAuthz    = "Authorization"
 	headerHost     = "host"
+	// serviceS3 is the one service whose canonical URI is single-encoded. Every
+	// other service requires the path to be URI-encoded a second time (see
+	// canonicalURI).
+	serviceS3 = "s3"
 )
 
 // MissingSigV4CredentialsError is returned by a SigV4 Authenticator when the AccessKeyID or
@@ -108,7 +112,7 @@ func (s *sigV4Auth) Authorize(_ context.Context, r *http.Request) error {
 	canonicalHeaders, signedHeaders := canonicalizeHeaders(r)
 	canonicalRequest := strings.Join([]string{
 		r.Method,
-		canonicalURI(r),
+		canonicalURI(r, s.service),
 		canonicalQueryString(r.URL.Query()),
 		canonicalHeaders,
 		signedHeaders,
@@ -142,13 +146,26 @@ func (s *sigV4Auth) signingKey(shortDate string) []byte {
 	return hmacSHA256(kService, []byte(sigV4Terminator))
 }
 
-// canonicalURI returns the URI-encoded absolute path, defaulting to "/" for an empty path.
-func canonicalURI(r *http.Request) string {
+// canonicalURI returns the SigV4 canonical URI path, defaulting to "/" for an
+// empty path. For every service EXCEPT s3, AWS requires the already-escaped path
+// to be URI-encoded a SECOND time (RFC-3986 unreserved rules, preserving the "/"
+// segment separators). net/url leaves ":" unescaped inside a path segment, so a
+// Bedrock model path like /model/anthropic.claude-...-v2:0/invoke keeps a literal
+// ":" in EscapedPath(); the second pass turns it into "%3A", which is what the
+// AWS server derives when it canonicalizes the received path — without it the
+// signature does not match and Bedrock returns 403. s3 canonical URIs are
+// single-encoded (the object key is signed verbatim), so the second pass is
+// skipped there. Keying this on the service inside the signer keeps callers from
+// having to split-brain the canonicalization.
+func canonicalURI(r *http.Request, service string) string {
 	p := r.URL.EscapedPath()
 	if p == "" {
 		return "/"
 	}
-	return p
+	if service == serviceS3 {
+		return p
+	}
+	return awsEncode(p, true)
 }
 
 // canonicalQueryString builds the sorted, AWS-URI-encoded query string. Keys and values are
@@ -235,10 +252,14 @@ func hashAndRestoreBody(r *http.Request) (string, error) {
 	return sha256Hex(data), nil
 }
 
-// awsURIEncode percent-encodes s per RFC 3986, leaving the unreserved set (A-Za-z0-9-_.~)
-// untouched and encoding every other byte (including "/") as uppercase %XX. Used for query
-// components; path encoding is delegated to net/url's EscapedPath.
-func awsURIEncode(s string) string {
+// awsEncode percent-encodes s per RFC 3986, leaving the unreserved set
+// (A-Za-z0-9-_.~) untouched and encoding every other byte as uppercase %XX.
+// keepSlash preserves "/" (the path-segment separator) for canonical-URI path
+// encoding; when false, "/" is encoded too, as a query component requires. It
+// operates byte-wise, so applying it to an already-escaped string double-encodes
+// each existing "%XX" octet's "%" to "%25" — exactly the non-s3 canonical-URI
+// second pass.
+func awsEncode(s string, keepSlash bool) string {
 	var b strings.Builder
 	for i := 0; i < len(s); i++ {
 		c := s[i]
@@ -246,12 +267,19 @@ func awsURIEncode(s string) string {
 		case c >= 'A' && c <= 'Z', c >= 'a' && c <= 'z', c >= '0' && c <= '9',
 			c == '-', c == '_', c == '.', c == '~':
 			b.WriteByte(c)
+		case c == '/' && keepSlash:
+			b.WriteByte(c)
 		default:
 			b.WriteString(fmt.Sprintf("%%%02X", c))
 		}
 	}
 	return b.String()
 }
+
+// awsURIEncode percent-encodes a query component per RFC 3986, encoding every
+// byte outside the unreserved set (including "/"). Canonical-URI path encoding
+// preserves "/" via awsEncode(s, true).
+func awsURIEncode(s string) string { return awsEncode(s, false) }
 
 func sha256Hex(b []byte) string {
 	sum := sha256.Sum256(b)

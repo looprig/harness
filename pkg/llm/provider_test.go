@@ -54,8 +54,9 @@ func TestProviderRequiredAuth(t *testing.T) {
 		{name: "phala needs api key", provider: llm.ProviderPhala, want: llm.AuthAPIKey},
 		{name: "chutes needs api key", provider: llm.ProviderChutes, want: llm.AuthAPIKey},
 		{name: "openrouter needs api key", provider: llm.ProviderOpenRouter, want: llm.AuthAPIKey},
+		{name: "bedrock needs sigv4", provider: llm.ProviderBedrock, want: llm.AuthSigV4},
 		{name: "empty is error", provider: "", wantErr: true},
-		{name: "unknown is error", provider: "bedrock", wantErr: true},
+		{name: "unknown is error", provider: "cohere", wantErr: true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

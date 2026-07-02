@@ -106,6 +106,98 @@ func TestSigV4KnownVectors(t *testing.T) {
 	}
 }
 
+// TestAWSEncode locks the byte-level RFC-3986 encoding, including the
+// double-encoding property (an already-escaped "%20" becomes "%2520") and the
+// keepSlash distinction between path (keep "/") and query ("/"->"%2F") encoding.
+func TestAWSEncode(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name      string
+		in        string
+		keepSlash bool
+		want      string
+	}{
+		{name: "colon encodes to %3A (path)", in: ":", keepSlash: true, want: "%3A"},
+		{name: "slash preserved when keepSlash", in: "/", keepSlash: true, want: "/"},
+		{name: "slash encoded when not keepSlash (query)", in: "/", keepSlash: false, want: "%2F"},
+		{name: "unreserved preserved", in: "aZ0-_.~", keepSlash: true, want: "aZ0-_.~"},
+		{name: "space encodes to %20", in: " ", keepSlash: true, want: "%20"},
+		{name: "already-escaped octet double-encodes", in: "%20", keepSlash: true, want: "%2520"},
+		{name: "bedrock model segment colon", in: "anthropic.claude-3-5-sonnet-20241022-v2:0", keepSlash: true, want: "anthropic.claude-3-5-sonnet-20241022-v2%3A0"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := awsEncode(tt.in, tt.keepSlash); got != tt.want {
+				t.Errorf("awsEncode(%q, %v) = %q, want %q", tt.in, tt.keepSlash, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestCanonicalURI proves the non-s3 second URI-encode pass: a Bedrock-style
+// colon path is double-encoded (":" -> "%3A") for any non-s3 service, while the
+// same path signed for s3 keeps the colon verbatim (single-encoded). Root and
+// unreserved paths are unchanged.
+func TestCanonicalURI(t *testing.T) {
+	t.Parallel()
+	const colonPath = "/model/anthropic.claude-3-5-sonnet-20241022-v2:0/invoke"
+	tests := []struct {
+		name    string
+		service string
+		path    string
+		want    string
+	}{
+		{name: "bedrock colon path double-encoded", service: "bedrock", path: colonPath, want: "/model/anthropic.claude-3-5-sonnet-20241022-v2%3A0/invoke"},
+		{name: "generic non-s3 service double-encoded", service: vecService, path: colonPath, want: "/model/anthropic.claude-3-5-sonnet-20241022-v2%3A0/invoke"},
+		{name: "s3 colon path verbatim (single-encoded)", service: serviceS3, path: colonPath, want: colonPath},
+		{name: "root path unchanged non-s3", service: "bedrock", path: "/", want: "/"},
+		{name: "unreserved path unchanged non-s3", service: "bedrock", path: "/a-b_c.d~e/f", want: "/a-b_c.d~e/f"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			req, err := http.NewRequest(http.MethodPost, "https://example.amazonaws.com"+tt.path, nil)
+			if err != nil {
+				t.Fatalf("NewRequest: %v", err)
+			}
+			if got := canonicalURI(req, tt.service); got != tt.want {
+				t.Errorf("canonicalURI(%q, %q) = %q, want %q", tt.path, tt.service, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestSigV4ColonPathSignatureDiffersByService is the behavioral guard on the fix:
+// signing an identical colon-bearing request as a non-s3 service (bedrock) versus
+// s3 must yield different Authorization signatures, because their canonical URIs
+// differ ("%3A" vs ":"). If the double-encode were dropped the two would collide.
+func TestSigV4ColonPathSignatureDiffersByService(t *testing.T) {
+	t.Parallel()
+	const colonURL = "https://bedrock-runtime.us-east-1.amazonaws.com/model/anthropic.claude-3-5-sonnet-20241022-v2:0/invoke"
+	creds := SigV4Credentials{AccessKeyID: vecAccessKey, SecretAccessKey: vecSecretKey}
+
+	sign := func(service string) string {
+		req, err := http.NewRequest(http.MethodPost, colonURL, strings.NewReader(`{}`))
+		if err != nil {
+			t.Fatalf("NewRequest: %v", err)
+		}
+		if err := newSigV4(creds, "us-east-1", service, fixedClock).Authorize(context.Background(), req); err != nil {
+			t.Fatalf("Authorize(%s): %v", service, err)
+		}
+		return req.Header.Get("Authorization")
+	}
+
+	bedrockAuthz := sign("bedrock")
+	s3Authz := sign(serviceS3)
+	if bedrockAuthz == "" || s3Authz == "" {
+		t.Fatal("empty Authorization header")
+	}
+	if bedrockAuthz == s3Authz {
+		t.Errorf("bedrock and s3 signatures collided; canonical URI was not double-encoded for non-s3:\n  %q", bedrockAuthz)
+	}
+}
+
 func TestSigV4BodyReadableAfterSigning(t *testing.T) {
 	t.Parallel()
 

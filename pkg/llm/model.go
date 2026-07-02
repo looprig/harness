@@ -47,6 +47,14 @@ func (m Model) Validate() error {
 	if m.Name == "" {
 		return &ValidationError{Field: "Name", Reason: "model name must not be empty"}
 	}
+	// Bedrock is region-routed: bedrock.New derives the endpoint host from the AWS
+	// region (and validates the region), so a Bedrock Model legitimately carries an
+	// empty BaseURL. Every other provider is BaseURL-bound and must supply a valid
+	// https URL. A Bedrock Model that DOES carry a BaseURL is still validated, so a
+	// malformed one is never silently accepted.
+	if m.Provider == ProviderBedrock && m.BaseURL == "" {
+		return nil
+	}
 	if err := validateHTTPBaseURL(m.BaseURL); err != nil {
 		return err
 	}

@@ -7,6 +7,8 @@
 package auto
 
 import (
+	"fmt"
+
 	"github.com/ciram-co/looprig/pkg/llm"
 	"github.com/ciram-co/looprig/pkg/llm/auth"
 	"github.com/ciram-co/looprig/pkg/llm/codec/anthropicapi"
@@ -16,6 +18,22 @@ import (
 	"github.com/ciram-co/looprig/pkg/llm/providers/phala"
 	"github.com/ciram-co/looprig/pkg/llm/transport"
 )
+
+// SigV4NotConstructibleError is returned by New for a provider whose required
+// credential kind is AuthSigV4 (currently Bedrock). auto.New's only credential
+// input is an auth.APIKey, which cannot carry AWS SigV4 credentials, so such a
+// provider must be constructed directly via its own constructor (named by Use,
+// e.g. "bedrock.New"). Fail-closed and directive — never a silent nil client.
+// This is why auto does NOT import the bedrock package: it dispatches to an error,
+// not to a constructor it cannot feed.
+type SigV4NotConstructibleError struct {
+	Provider llm.Provider
+	Use      string
+}
+
+func (e *SigV4NotConstructibleError) Error() string {
+	return fmt.Sprintf("provider %q requires AWS SigV4 credentials that auto.New cannot supply; construct it directly via %s", e.Provider, e.Use)
+}
 
 // New validates model, enforces the provider's fail-closed auth requirement, then
 // constructs the concrete provider client. Ordered:
@@ -56,6 +74,13 @@ func New(model llm.Model, key auth.APIKey) (llm.LLM, error) {
 		// fail-closed empty-key guard above (RequiredAuth → AuthAPIKey) already rejected a
 		// missing key, so key is present here; wrap it as Bearer auth.
 		return genericHTTP(model, auth.Key(key))
+	case llm.ProviderBedrock:
+		// Bedrock's RequiredAuth is AuthSigV4, so the empty-APIKey guard above does not
+		// fire and control reaches here. auto.New's only credential is an auth.APIKey,
+		// which cannot carry AWS SigV4 credentials, so a Bedrock client cannot be built
+		// here; direct the caller to bedrock.New (which takes auth.SigV4Credentials + a
+		// region). Fail-closed with a directive typed error, not a silent nil.
+		return nil, &SigV4NotConstructibleError{Provider: llm.ProviderBedrock, Use: "bedrock.New"}
 	default:
 		// Defensive: RequiredAuth above already rejects any provider not handled
 		// here, so this is unreachable for a validated model — but a permissive
