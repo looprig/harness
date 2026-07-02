@@ -19,9 +19,10 @@ type LLM interface {
 type Provider string
 
 const (
-	ProviderLMStudio Provider = "lmstudio"
-	ProviderPhala    Provider = "phala"
-	ProviderChutes   Provider = "chutes"
+	ProviderLMStudio   Provider = "lmstudio"
+	ProviderPhala      Provider = "phala"
+	ProviderChutes     Provider = "chutes"
+	ProviderOpenRouter Provider = "openrouter"
 )
 
 // Request is the provider-neutral inference request. It carries a secret-free

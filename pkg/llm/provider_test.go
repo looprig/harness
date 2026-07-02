@@ -18,6 +18,7 @@ func TestProviderRequiresKey(t *testing.T) {
 		{name: "lmstudio no key", provider: llm.ProviderLMStudio, want: false, wantErr: false},
 		{name: "phala requires key", provider: llm.ProviderPhala, want: true, wantErr: false},
 		{name: "chutes requires key", provider: llm.ProviderChutes, want: true, wantErr: false},
+		{name: "openrouter requires key", provider: llm.ProviderOpenRouter, want: true, wantErr: false},
 		{name: "unknown errors", provider: llm.Provider("bogus"), want: false, wantErr: true},
 		{name: "empty errors", provider: llm.Provider(""), want: false, wantErr: true},
 	}
@@ -52,6 +53,7 @@ func TestProviderRequiredAuth(t *testing.T) {
 		{name: "lmstudio needs none", provider: llm.ProviderLMStudio, want: llm.AuthNone},
 		{name: "phala needs api key", provider: llm.ProviderPhala, want: llm.AuthAPIKey},
 		{name: "chutes needs api key", provider: llm.ProviderChutes, want: llm.AuthAPIKey},
+		{name: "openrouter needs api key", provider: llm.ProviderOpenRouter, want: llm.AuthAPIKey},
 		{name: "empty is error", provider: "", wantErr: true},
 		{name: "unknown is error", provider: "bedrock", wantErr: true},
 	}

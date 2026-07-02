@@ -43,6 +43,26 @@ func LMStudioLocal(name string) Model {
 	}
 }
 
+// OpenRouter returns a Model for OpenRouter's OpenAI-compatible aggregation gateway.
+// OpenRouter fronts many upstream models behind one OpenAI-format API and one Bearer
+// key (Provider.RequiredAuth → AuthAPIKey), so APIFormat is APIFormatOpenAI and name
+// is the OpenRouter model slug (e.g. "anthropic/claude-3.5-sonnet") sent verbatim on
+// every request. Capabilities are conservative — tool-calling is broadly available,
+// while image input and hidden thinking are model-specific and left false. Returned
+// by value so callers cannot mutate shared catalog state.
+func OpenRouter(name string) Model {
+	return Model{
+		Provider:  ProviderOpenRouter,
+		APIFormat: APIFormatOpenAI,
+		BaseURL:   "https://openrouter.ai/api/v1",
+		Name:      name,
+		Origin:    OriginCatalog,
+		Caps: Capabilities{
+			Tools: true,
+		},
+	}
+}
+
 // GLM46Phala returns the zai-org/GLM-4.6 model definition served through Phala's
 // TEE-attested OpenAI-compatible gateway. Returned by value so callers cannot
 // mutate shared catalog state.

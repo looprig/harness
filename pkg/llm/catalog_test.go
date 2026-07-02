@@ -115,3 +115,36 @@ func TestLMStudioLocal(t *testing.T) {
 		t.Errorf("Validate() on LM Studio row = %v, want nil", err)
 	}
 }
+
+// TestOpenRouterCatalog covers the OpenRouter row: it is OpenAI-compatible, requires
+// an API key (RequiredAuth → AuthAPIKey — Bearer), advertises tool-calling, and passes
+// Validate against its https BaseURL. name is passed through verbatim as the model.
+func TestOpenRouterCatalog(t *testing.T) {
+	t.Parallel()
+	m := llm.OpenRouter("anthropic/claude-3.5-sonnet")
+	if m.Provider != llm.ProviderOpenRouter {
+		t.Errorf("Provider = %q, want %q", m.Provider, llm.ProviderOpenRouter)
+	}
+	if m.APIFormat != llm.APIFormatOpenAI {
+		t.Errorf("APIFormat = %q, want %q", m.APIFormat, llm.APIFormatOpenAI)
+	}
+	if m.BaseURL != "https://openrouter.ai/api/v1" {
+		t.Errorf("BaseURL = %q, want %q", m.BaseURL, "https://openrouter.ai/api/v1")
+	}
+	if m.Name != "anthropic/claude-3.5-sonnet" {
+		t.Errorf("Name = %q, want %q", m.Name, "anthropic/claude-3.5-sonnet")
+	}
+	if m.Origin != llm.OriginCatalog {
+		t.Errorf("Origin = %v, want catalog", m.Origin)
+	}
+	if !m.Caps.Tools {
+		t.Errorf("Caps.Tools = %v, want true", m.Caps.Tools)
+	}
+	kind, err := m.Provider.RequiredAuth()
+	if err != nil || kind != llm.AuthAPIKey {
+		t.Errorf("RequiredAuth() = (%v, %v), want (apikey, nil)", kind, err)
+	}
+	if err := m.Validate(); err != nil {
+		t.Errorf("Validate() on OpenRouter row = %v, want nil", err)
+	}
+}

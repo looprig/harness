@@ -7,6 +7,9 @@ import (
 	"github.com/ciram-co/looprig/pkg/llm"
 	"github.com/ciram-co/looprig/pkg/llm/aci"
 	"github.com/ciram-co/looprig/pkg/llm/auth"
+	"github.com/ciram-co/looprig/pkg/llm/codec/anthropicapi"
+	"github.com/ciram-co/looprig/pkg/llm/codec/gemini"
+	"github.com/ciram-co/looprig/pkg/llm/codec/openaiapi"
 	"github.com/ciram-co/looprig/pkg/llm/providers/chutes"
 	"github.com/ciram-co/looprig/pkg/llm/transport"
 )
@@ -29,10 +32,12 @@ func TestNew(t *testing.T) {
 	}{
 		{name: "phala with key", model: llm.GLM46Phala(), key: "k"},
 		{name: "chutes with key", model: llm.ChutesKimiK2(), key: "k"},
+		{name: "openrouter with key", model: llm.OpenRouter("x"), key: "sk-or-key"},
 		{name: "lmstudio without key (AuthNone)", model: llm.LMStudioLocal("qwen"), key: ""},
 		{name: "lmstudio ignores a supplied key", model: llm.LMStudioLocal("qwen"), key: "k"},
 		{name: "phala empty key fails closed", model: llm.GLM46Phala(), key: "", wantErr: true, wantAuthReq: true},
 		{name: "chutes empty key fails closed", model: llm.ChutesKimiK2(), key: "", wantErr: true, wantAuthReq: true},
+		{name: "openrouter empty key fails closed", model: llm.OpenRouter("x"), key: "", wantErr: true, wantAuthReq: true},
 		{
 			name:    "unknown provider rejected before dispatch",
 			model:   llm.Model{Provider: "nope", APIFormat: llm.APIFormatOpenAI, BaseURL: "https://x.example.test", Name: "m"},
@@ -47,14 +52,13 @@ func TestNew(t *testing.T) {
 			wantErr: true,
 		},
 		{
-			// lmstudio legitimately supports the anthropic dialect (Validate passes),
-			// but auto has no anthropic codec yet, so it must fail closed at
-			// construction with a *llm.ValidationError rather than mis-encode as OpenAI.
-			name:      "lmstudio+anthropic fails closed (no codec)",
-			model:     llm.CustomModel(llm.ProviderLMStudio, llm.APIFormatAnthropic, "http://localhost:1234", "m"),
-			key:       "",
-			wantErr:   true,
-			wantField: "APIFormat",
+			// lmstudio legitimately supports the anthropic dialect (Validate passes).
+			// Phase 1 fail-closed here (no anthropic codec); Phase 2 wired the
+			// anthropicapi codec into codecFor, so this now resolves a real codec and
+			// succeeds instead of erroring.
+			name:  "lmstudio+anthropic now succeeds (anthropic codec wired)",
+			model: llm.CustomModel(llm.ProviderLMStudio, llm.APIFormatAnthropic, "http://localhost:1234", "m"),
+			key:   "",
 		},
 	}
 	for _, tt := range tests {
@@ -129,6 +133,12 @@ func TestNewConcreteTypes(t *testing.T) {
 			is:   func(l llm.LLM) bool { _, ok := l.(*transport.Client); return ok },
 			want: "*transport.Client",
 		},
+		{
+			name:  "openrouter wires the generic transport client",
+			model: llm.OpenRouter("x"), key: "sk-or-key",
+			is:   func(l llm.LLM) bool { _, ok := l.(*transport.Client); return ok },
+			want: "*transport.Client",
+		},
 	}
 	for _, tt := range tests {
 		tt := tt
@@ -140,6 +150,68 @@ func TestNewConcreteTypes(t *testing.T) {
 			}
 			if !tt.is(got) {
 				t.Fatalf("New() llm = %T, want %s", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestCodecFor pins the codec-selection registry: each wire dialect auto can encode
+// resolves to its concrete codec, and a format with no codec yet fails closed with a
+// *llm.ValidationError (Field "APIFormat") rather than silently mis-encoding. This is
+// the internal seam that makes lmstudio+anthropic and OpenRouter+openai work.
+func TestCodecFor(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name    string
+		format  llm.APIFormat
+		is      func(llm.Codec) bool
+		want    string
+		wantErr bool
+	}{
+		{
+			name:   "openai",
+			format: llm.APIFormatOpenAI,
+			is:     func(c llm.Codec) bool { _, ok := c.(openaiapi.Codec); return ok },
+			want:   "openaiapi.Codec",
+		},
+		{
+			name:   "anthropic",
+			format: llm.APIFormatAnthropic,
+			is:     func(c llm.Codec) bool { _, ok := c.(anthropicapi.Codec); return ok },
+			want:   "anthropicapi.Codec",
+		},
+		{
+			name:   "gemini",
+			format: llm.APIFormatGemini,
+			is:     func(c llm.Codec) bool { _, ok := c.(gemini.Codec); return ok },
+			want:   "gemini.Codec",
+		},
+		{name: "bedrock-converse has no codec yet", format: llm.APIFormatBedrockConverse, wantErr: true},
+		{name: "unknown format fails closed", format: llm.APIFormat("bogus"), wantErr: true},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got, err := codecFor(tt.format)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("codecFor(%q) err = %v, wantErr %v", tt.format, err, tt.wantErr)
+			}
+			if tt.wantErr {
+				if got != nil {
+					t.Fatalf("codecFor(%q) returned non-nil codec (%T) alongside an error", tt.format, got)
+				}
+				var ve *llm.ValidationError
+				if !errors.As(err, &ve) {
+					t.Fatalf("codecFor err = %T, want *llm.ValidationError", err)
+				}
+				if ve.Field != "APIFormat" {
+					t.Errorf("ValidationError.Field = %q, want %q", ve.Field, "APIFormat")
+				}
+				return
+			}
+			if !tt.is(got) {
+				t.Fatalf("codecFor(%q) = %T, want %s", tt.format, got, tt.want)
 			}
 		})
 	}
