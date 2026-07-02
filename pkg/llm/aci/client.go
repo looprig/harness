@@ -158,7 +158,15 @@ func WithNonceFunc(newNonce func() string) Option {
 // clock, so WithNow (when supplied) must take effect before the default cache is
 // built; we therefore apply options that may need the clock after seeding the
 // defaults, and (re)build the default cache only if no WithAttestFunc replaced it.
-func New(baseURL, apiKey string, policy Policy, opts ...Option) llm.LLM {
+//
+// New FAILS CLOSED on an unpinned policy: if policy pins no acceptance set and did
+// not explicitly opt out via UnpinnedPolicy(), New returns (nil,
+// *UnpinnedPolicyError) BEFORE any network object is constructed, so attestation
+// can never be silently accepted against an empty allow-list.
+func New(baseURL, apiKey string, policy Policy, opts ...Option) (llm.LLM, error) {
+	if err := policy.requireAcceptable(); err != nil {
+		return nil, err
+	}
 	c := &Client{
 		baseURL:       baseURL,
 		apiKey:        apiKey,
@@ -182,7 +190,7 @@ func New(baseURL, apiKey string, policy Policy, opts ...Option) llm.LLM {
 		c.cache = newSessionCache(c.attestModel, defaultSessionTTL, c.now)
 	}
 
-	return c
+	return c, nil
 }
 
 // newHTTPClient builds the production *http.Client with an explicit timeout

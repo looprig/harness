@@ -52,6 +52,10 @@ const (
 	// confirmed — verify independently against a published Phala/Dstack KMS root
 	// before production trust (blocker #3).
 	defaultKMSRoot = "0334c76e0c3f52ec64cbf9bbf5c910c272330166fd656c0a86bb330963e46910e1"
+
+	// defaultBaseURL is the canonical Phala inference host, used when New is given "".
+	// PROVISIONAL — confirm the production host with ops before release (design §4.2).
+	defaultBaseURL = "https://inference.phala.com"
 )
 
 // DefaultPolicy returns the production-leaning aci.Policy preset that pins the
@@ -85,13 +89,20 @@ func DefaultPolicy() aci.Policy {
 // New builds an attested Phala confidential-inference client: it composes the
 // reusable aci attestation protocol with the supplied acceptance Policy (pass
 // DefaultPolicy for the pinned preset). baseURL is the gateway origin (e.g.
-// https://inference.phala.com); key is the bearer credential and is REQUIRED — the
+// https://inference.phala.com); an empty baseURL self-defaults to the canonical
+// Phala host (defaultBaseURL). key is the bearer credential and is REQUIRED — the
 // typed auth.APIKey parameter encodes that at compile time, and New fails closed on
-// an empty string with a typed *llm.AuthRequiredError before any network call. On
-// success it returns the llm.LLM aci implements.
+// an empty string with a typed *llm.AuthRequiredError before any network call
+// (checked BEFORE the base-URL default, so a missing key always wins). It then
+// forwards to aci.New, which fails closed with *UnpinnedPolicyError on a policy that
+// pins no acceptance set and did not opt out via aci.UnpinnedPolicy(). On success it
+// returns the llm.LLM aci implements.
 func New(baseURL string, key auth.APIKey, p aci.Policy) (llm.LLM, error) {
 	if key == "" {
 		return nil, &llm.AuthRequiredError{Provider: llm.ProviderPhala, Kind: llm.AuthAPIKey}
 	}
-	return aci.New(baseURL, string(key), p), nil
+	if baseURL == "" {
+		baseURL = defaultBaseURL
+	}
+	return aci.New(baseURL, string(key), p)
 }

@@ -90,7 +90,10 @@ func liveRequest() llm.Request {
 func TestLiveInvoke(t *testing.T) {
 	key := liveKey(t)
 
-	client := New(livePhalaBaseURL, key, testPolicy())
+	client, err := New(livePhalaBaseURL, key, testPolicy())
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), liveTimeout)
 	defer cancel()
@@ -118,7 +121,10 @@ func TestLiveInvoke(t *testing.T) {
 func TestLiveStream(t *testing.T) {
 	key := liveKey(t)
 
-	client := New(livePhalaBaseURL, key, testPolicy())
+	client, err := New(livePhalaBaseURL, key, testPolicy())
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), liveTimeout)
 	defer cancel()

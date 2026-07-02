@@ -490,11 +490,15 @@ func newTestClient(t *testing.T, doer *fakeDoer, keys gatewayKeys) llm.LLM {
 	attest := func(_ context.Context, _ string) (*VerifiedReport, error) {
 		return keys.verified, nil
 	}
-	return New(testBaseURL, testAPIKey, Policy{},
+	client, err := New(testBaseURL, testAPIKey, UnpinnedPolicy(),
 		WithHTTPDoer(doer),
 		WithNow(testNow),
 		WithAttestFunc(attest),
 	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return client
 }
 
 // asAttestReason asserts err is a fail-closed *llm.AttestationError with reason.
@@ -623,8 +627,12 @@ func TestInvokeFailures(t *testing.T) {
 				attest := func(_ context.Context, _ string) (*VerifiedReport, error) {
 					return nil, tt.attestErr
 				}
-				client = New(testBaseURL, testAPIKey, Policy{},
+				var err error
+				client, err = New(testBaseURL, testAPIKey, UnpinnedPolicy(),
 					WithHTTPDoer(doer), WithNow(testNow), WithAttestFunc(attest))
+				if err != nil {
+					t.Fatal(err)
+				}
 			} else {
 				client = newTestClient(t, doer, keys)
 			}
@@ -653,8 +661,11 @@ func TestInvokeTransportError(t *testing.T) {
 		return keys.verified, nil
 	}
 	failDoer := &errDoer{err: errors.New("dial tcp: connection refused")}
-	client := New(testBaseURL, testAPIKey, Policy{},
+	client, err := New(testBaseURL, testAPIKey, UnpinnedPolicy(),
 		WithHTTPDoer(failDoer), WithNow(testNow), WithAttestFunc(attest))
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	resp, err := client.Invoke(context.Background(), testRequest())
 	if resp != nil {
@@ -829,8 +840,11 @@ func TestStreamReasoningDelta(t *testing.T) {
 	keys := newGatewayKeys(t)
 	doer := &reasoningStreamDoer{fakeDoer: fakeDoer{t: t, keys: keys, stream: true}}
 	attest := func(_ context.Context, _ string) (*VerifiedReport, error) { return keys.verified, nil }
-	client := New(testBaseURL, testAPIKey, Policy{},
+	client, err := New(testBaseURL, testAPIKey, UnpinnedPolicy(),
 		WithHTTPDoer(doer), WithNow(testNow), WithAttestFunc(attest))
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	reader, err := client.Stream(context.Background(), testRequest())
 	if err != nil {
@@ -983,8 +997,11 @@ func TestStreamTransportError(t *testing.T) {
 		return keys.verified, nil
 	}
 	failDoer := &errDoer{err: errors.New("dial tcp: connection refused")}
-	client := New(testBaseURL, testAPIKey, Policy{},
+	client, err := New(testBaseURL, testAPIKey, UnpinnedPolicy(),
 		WithHTTPDoer(failDoer), WithNow(testNow), WithAttestFunc(attest))
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	reader, err := client.Stream(context.Background(), testRequest())
 	if reader != nil {
@@ -996,5 +1013,47 @@ func TestStreamTransportError(t *testing.T) {
 	}
 	if strings.Contains(err.Error(), testAPIKey) {
 		t.Fatalf("API key leaked into error string: %q", err.Error())
+	}
+}
+
+// TestNewRejectsUnpinnedPolicy proves the load-bearing fail-closed gate: New
+// rejects an unpinned Policy with a typed *UnpinnedPolicyError before any network
+// object exists, so an allow-list can never be silently skipped — yet it does NOT
+// over-reject: a pinned policy (or the explicit UnpinnedPolicy() opt-out) builds a
+// non-nil client with no error.
+func TestNewRejectsUnpinnedPolicy(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		policy  Policy
+		wantErr bool
+	}{
+		{name: "empty policy rejected fail-closed", policy: Policy{}, wantErr: true},
+		{name: "pinned policy accepted", policy: Policy{AcceptedAppIDs: map[string]struct{}{"a": {}}}, wantErr: false},
+		{name: "explicit unpinned opt-out accepted", policy: UnpinnedPolicy(), wantErr: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			client, err := New("https://gw.example", "sk", tt.policy)
+			if tt.wantErr {
+				var upe *UnpinnedPolicyError
+				if !errors.As(err, &upe) {
+					t.Fatalf("want *UnpinnedPolicyError, got %v", err)
+				}
+				if client != nil {
+					t.Errorf("New() returned non-nil client alongside error")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("New() error = %v, want nil", err)
+			}
+			if client == nil {
+				t.Errorf("New() = nil client, want non-nil llm.LLM")
+			}
+		})
 	}
 }
