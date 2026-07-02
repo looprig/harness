@@ -156,6 +156,7 @@ func (s *server) routes(mux *http.ServeMux) {
 
 	// Session lifecycle (Task 13, group A).
 	mux.HandleFunc("POST /sessions", s.handleCreateSession)
+	mux.HandleFunc("DELETE /sessions/{sid}", s.handleDeleteSession)
 
 	// Remaining Task 13 groups register the input/events/gates/export endpoints
 	// here, e.g.:

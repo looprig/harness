@@ -96,14 +96,21 @@ func (s *fakeSub) fail(err error) {
 	s.once.Do(func() { close(s.ch) })
 }
 
-// fakeAgent implements the full api.Agent interface. Only Subscribe carries
-// behavior (hands back the injected sub or a forced error); the other eight
-// methods are inert stubs — the supervisor never calls them.
+// fakeAgent implements the full api.Agent interface. Subscribe carries behavior
+// (hands back the injected sub or a forced error) for the supervisor; Close
+// records that it ran for the delete endpoint's off-lock teardown. The remaining
+// methods are inert stubs.
 type fakeAgent struct {
 	sub    *fakeSub
 	subErr error
 
 	gotFilter event.EventFilter
+
+	// mu guards closed, which records that Close was called. The delete endpoint
+	// closes the agent OFF-lock in the server goroutine, so the test's assertion
+	// must be synchronized against that write to stay clean under -race.
+	mu     sync.Mutex
+	closed bool
 }
 
 func (a *fakeAgent) Subscribe(filter event.EventFilter) (event.Subscription, error) {
@@ -124,9 +131,23 @@ func (a *fakeAgent) Approve(_ context.Context, _, _ uuid.UUID, _ tool.ApprovalSc
 func (a *fakeAgent) Deny(_ context.Context, _, _ uuid.UUID) error                    { return nil }
 func (a *fakeAgent) ProvideAnswer(_ context.Context, _, _ uuid.UUID, _ string) error { return nil }
 func (a *fakeAgent) Interrupt(_ context.Context) (bool, error)                       { return false, nil }
-func (a *fakeAgent) Close(_ context.Context) error                                   { return nil }
+func (a *fakeAgent) Close(_ context.Context) error {
+	a.mu.Lock()
+	a.closed = true
+	a.mu.Unlock()
+	return nil
+}
 func (a *fakeAgent) ExportSource(_ context.Context) (transcript.RecordSource, transcript.SystemPromptResolver, error) {
 	return nil, nil, nil
+}
+
+// wasClosed reports whether Close has been called (mutex-guarded so the delete
+// handler's off-lock Close synchronizes cleanly with the test assertion under
+// -race).
+func (a *fakeAgent) wasClosed() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.closed
 }
 
 // TestSupervisor_RecordsAndDropsGate proves the registry records a gate from a

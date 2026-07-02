@@ -29,8 +29,10 @@ type (
 // Client-safe error messages. Deliberately generic so a response never leaks the
 // runner's internal state or the concrete cause (which is logged via slog).
 const (
-	msgInvalidResumeID = "invalid resume session id"
-	msgCreateFailed    = "could not create session"
+	msgInvalidSessionID = "invalid session id"
+	msgInvalidResumeID  = "invalid resume session id"
+	msgCreateFailed     = "could not create session"
+	msgSessionNotFound  = "session not found"
 )
 
 // invalidSessionIDError reports that a path- or query-supplied session id could
@@ -48,6 +50,18 @@ func (e invalidSessionIDError) Error() string {
 }
 
 func (e invalidSessionIDError) Unwrap() error { return e.Cause }
+
+// parseSessionID reads the {sid} path value and parses it as a UUID, returning a
+// typed invalidSessionIDError on any malformed input (empty, wrong length, non-
+// hex). It validates at the boundary before the id reaches the registry.
+func parseSessionID(r *http.Request) (uuid.UUID, error) {
+	raw := r.PathValue("sid")
+	var id uuid.UUID
+	if err := id.UnmarshalText([]byte(raw)); err != nil {
+		return uuid.UUID{}, invalidSessionIDError{Value: raw, Cause: err}
+	}
+	return id, nil
+}
 
 // writeJSON sets the JSON content type, writes status, and encodes v. This is the
 // one place any is permitted (the serialization boundary); an encode failure is
@@ -124,4 +138,34 @@ func buildAgentRequest(r *http.Request) (AgentRequest, error) {
 		return AgentRequest{}, err
 	}
 	return AgentRequest{SessionID: newID, Resume: false}, nil
+}
+
+// handleDeleteSession serves DELETE /sessions/{sid}. It evicts the session under
+// the lock (via deleteSession, which returns the entry) and then, OFF-lock, stops
+// the supervisor and closes the agent best-effort, answering 204. An unknown id
+// is 404 and a malformed id is 400 — both fail secure without touching an agent.
+func (s *server) handleDeleteSession(w http.ResponseWriter, r *http.Request) {
+	sid, err := parseSessionID(r)
+	if err != nil {
+		slog.Warn("api: delete rejected invalid id", "err", err)
+		writeError(w, http.StatusBadRequest, msgInvalidSessionID)
+		return
+	}
+
+	entry, ok := s.deleteSession(sid)
+	if !ok {
+		writeError(w, http.StatusNotFound, msgSessionNotFound)
+		return
+	}
+
+	// OFF-lock teardown: deleteSession already released s.mu, so no agent/
+	// supervisor call happens under the registry lock. Best-effort — a wedged
+	// teardown is logged, never surfaced to the caller.
+	if err := entry.sup.stop(); err != nil {
+		slog.Error("api: delete supervisor stop", "err", err)
+	}
+	if err := entry.agent.Close(r.Context()); err != nil {
+		slog.Error("api: delete agent close", "err", err)
+	}
+	w.WriteHeader(http.StatusNoContent)
 }

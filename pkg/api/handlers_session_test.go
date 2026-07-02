@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -160,6 +161,97 @@ func TestCreateSession(t *testing.T) {
 			case <-entry.sup.done:
 				t.Error("supervisor already exited after create; want it running")
 			default:
+			}
+		})
+	}
+}
+
+// TestDeleteSession proves DELETE /sessions/{sid} evicts the session and tears it
+// down OFF-lock (204, gone from the registry, supervisor stopped, agent closed);
+// an unknown id fails secure with 404; a malformed id fails secure with 400.
+func TestDeleteSession(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name         string
+		setup        func(t *testing.T, s *server) (path string, sid uuid.UUID, fa *fakeAgent, sup *supervisor)
+		wantStatus   int
+		wantTornDown bool
+	}{
+		{
+			name: "delete existing tears down and returns 204",
+			setup: func(t *testing.T, s *server) (string, uuid.UUID, *fakeAgent, *supervisor) {
+				t.Helper()
+				id := mkID(0x21)
+				fa := &fakeAgent{sub: newFakeSub()}
+				sup, err := newSupervisor(fa)
+				if err != nil {
+					t.Fatalf("newSupervisor() error = %v", err)
+				}
+				s.putSession(id, &sessionEntry{agent: fa, sup: sup})
+				return "/sessions/" + id.String(), id, fa, sup
+			},
+			wantStatus:   http.StatusNoContent,
+			wantTornDown: true,
+		},
+		{
+			name: "delete unknown returns 404",
+			setup: func(_ *testing.T, _ *server) (string, uuid.UUID, *fakeAgent, *supervisor) {
+				return "/sessions/" + mkID(0x99).String(), uuid.UUID{}, nil, nil
+			},
+			wantStatus: http.StatusNotFound,
+		},
+		{
+			name: "delete malformed id returns 400",
+			setup: func(_ *testing.T, _ *server) (string, uuid.UUID, *fakeAgent, *supervisor) {
+				return "/sessions/not-a-uuid", uuid.UUID{}, nil, nil
+			},
+			wantStatus: http.StatusBadRequest,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			s := newServer(Config{}, fakeFactory)
+			ts := httptest.NewServer(s.handler())
+			defer ts.Close()
+			t.Cleanup(func() { stopAll(s) })
+
+			path, sid, fa, sup := tt.setup(t, s)
+			if sup != nil {
+				t.Cleanup(func() { _ = sup.stop() })
+			}
+
+			resp := doReq(t, ts, http.MethodDelete, path)
+			defer func() { _ = resp.Body.Close() }()
+
+			if resp.StatusCode != tt.wantStatus {
+				t.Fatalf("DELETE %s status = %d, want %d", path, resp.StatusCode, tt.wantStatus)
+			}
+
+			if !tt.wantTornDown {
+				return
+			}
+
+			// 204 must carry an empty body.
+			b, err := io.ReadAll(resp.Body)
+			if err != nil {
+				t.Fatalf("ReadAll(delete body) error = %v", err)
+			}
+			if len(b) != 0 {
+				t.Errorf("delete body = %q, want empty", b)
+			}
+			if _, ok := s.getSession(sid); ok {
+				t.Error("session still in registry after DELETE")
+			}
+			if !fa.wasClosed() {
+				t.Error("agent Close not called on DELETE")
+			}
+			select {
+			case <-sup.done:
+			default:
+				t.Error("supervisor not stopped on DELETE")
 			}
 		})
 	}
