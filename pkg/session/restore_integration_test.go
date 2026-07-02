@@ -176,7 +176,8 @@ func setHeader(t *testing.T, ev event.Event, hdr event.Header) event.Event {
 func restoreCfg(client llm.LLM, model, system string) loop.Config {
 	return loop.Config{
 		Client:       client,
-		Model:        llm.ModelSpec{Model: model, System: system},
+		Model:        validModel(model),
+		System:       system,
 		DrainTimeout: 200 * time.Millisecond,
 	}
 }

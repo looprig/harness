@@ -32,7 +32,7 @@ func newFoldLoop(t *testing.T, client llm.LLM, ts ToolSet) (*Loop, *recordingPub
 	}
 	rec := &recordingPublisher{}
 	l, err := New(ctx, sessionID, loopID, Provenance{}, rec,
-		Config{Client: client, Model: llm.ModelSpec{Model: "m"}, Tools: ts, DrainTimeout: 500 * time.Millisecond})
+		Config{Client: client, Model: testModel(), Tools: ts, DrainTimeout: 500 * time.Millisecond})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -59,7 +59,7 @@ func newFoldLoopWithAfterDrain(t *testing.T, client llm.LLM, ts ToolSet, afterDr
 	}
 	rec := &recordingPublisher{}
 	l, err := New(ctx, sessionID, loopID, Provenance{}, rec,
-		Config{Client: client, Model: llm.ModelSpec{Model: "m"}, Tools: ts, DrainTimeout: 500 * time.Millisecond, afterDrain: afterDrain})
+		Config{Client: client, Model: testModel(), Tools: ts, DrainTimeout: 500 * time.Millisecond, afterDrain: afterDrain})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}

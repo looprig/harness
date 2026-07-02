@@ -23,6 +23,18 @@ func textChunk(s string) content.Chunk {
 	return &content.TextChunk{Text: s}
 }
 
+// testModel returns a minimal but VALID llm.Model (passes llm.Model.Validate):
+// a known provider speaking a supported wire dialect at a loopback endpoint. Tests
+// that only need a well-formed descriptor use it in place of the retired ModelSpec.
+func testModel() llm.Model {
+	return llm.Model{
+		Provider:  llm.ProviderLMStudio,
+		APIFormat: llm.APIFormatOpenAI,
+		BaseURL:   "http://localhost:1234",
+		Name:      "m",
+	}
+}
+
 func (f *fakeLLM) Invoke(ctx context.Context, req llm.Request) (*llm.Response, error) {
 	return nil, errors.New("fakeLLM.Invoke not used")
 }

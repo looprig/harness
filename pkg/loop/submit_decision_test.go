@@ -10,7 +10,6 @@ import (
 	"github.com/ciram-co/looprig/pkg/content"
 	"github.com/ciram-co/looprig/pkg/event"
 	"github.com/ciram-co/looprig/pkg/identity"
-	"github.com/ciram-co/looprig/pkg/llm"
 	"github.com/ciram-co/looprig/pkg/uuid"
 )
 
@@ -186,7 +185,7 @@ func TestSubagentResultIDGenerationFailureCancels(t *testing.T) {
 			t.Cleanup(cancel)
 			l, err := New(ctx, mustID(t), mustID(t), Provenance{}, rec, Config{
 				Client:       &fakeLLM{chunks: []content.Chunk{textChunk("hi")}},
-				Model:        llm.ModelSpec{Model: "m"},
+				Model:        testModel(),
 				DrainTimeout: 200 * time.Millisecond,
 				idGen:        gen.gen,
 				// The injected gen fails the CORRELATION-id mint (the branch under test); give
@@ -325,7 +324,7 @@ func TestNormalCompletionPopsInbox(t *testing.T) {
 	loopID, _ := uuid.New()
 	rec := &recordingPublisher{}
 	l, err := New(ctx, sessionID, loopID, Provenance{}, rec,
-		Config{Client: client, Model: llm.ModelSpec{Model: "m"}, Tools: ts, DrainTimeout: 500 * time.Millisecond})
+		Config{Client: client, Model: testModel(), Tools: ts, DrainTimeout: 500 * time.Millisecond})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}

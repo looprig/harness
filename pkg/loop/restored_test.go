@@ -9,7 +9,6 @@ import (
 
 	"github.com/ciram-co/looprig/pkg/content"
 	"github.com/ciram-co/looprig/pkg/event"
-	"github.com/ciram-co/looprig/pkg/llm"
 )
 
 // seededUser builds the committed UserMessage form the loop appends for a turn.
@@ -89,7 +88,7 @@ func TestNewRestored(t *testing.T) {
 			rec := &recordingPublisher{}
 
 			l, err := NewRestored(ctx, sessionID, loopID, rec,
-				Config{Client: client, Model: llm.ModelSpec{Model: "m"}, DrainTimeout: 200 * time.Millisecond},
+				Config{Client: client, Model: testModel(), DrainTimeout: 200 * time.Millisecond},
 				RestoredState{Msgs: tt.initialMsgs, TurnIndex: tt.initialTurn})
 			if err != nil {
 				t.Fatalf("NewRestored: %v", err)
@@ -151,13 +150,13 @@ func TestNewRestored_Validation(t *testing.T) {
 	}{
 		{
 			name:    "missing client",
-			cfg:     Config{Model: llm.ModelSpec{Model: "m"}},
+			cfg:     Config{Model: testModel()},
 			events:  &recordingPublisher{},
 			wantErr: ConfigMissingClient,
 		},
 		{
 			name:    "nil publisher",
-			cfg:     Config{Client: &fakeLLM{}, Model: llm.ModelSpec{Model: "m"}},
+			cfg:     Config{Client: &fakeLLM{}, Model: testModel()},
 			events:  nil,
 			wantErr: ConfigMissingPublisher,
 		},
@@ -190,7 +189,7 @@ func TestLoopSnapshot(t *testing.T) {
 	rec := &recordingPublisher{}
 
 	l, err := NewRestored(ctx, sessionID, loopID, rec,
-		Config{Client: client, Model: llm.ModelSpec{Model: "m"}, DrainTimeout: 200 * time.Millisecond},
+		Config{Client: client, Model: testModel(), DrainTimeout: 200 * time.Millisecond},
 		RestoredState{Msgs: seeded, TurnIndex: 1})
 	if err != nil {
 		t.Fatalf("NewRestored: %v", err)

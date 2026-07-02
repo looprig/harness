@@ -57,7 +57,7 @@ func newLoopWithFactory(t *testing.T, client llm.LLM, ts time.Time) (*Loop, *rec
 	rec := &recordingPublisher{}
 	l, err := New(ctx, mustID(t), mustID(t), Provenance{}, rec, Config{
 		Client:       client,
-		Model:        llm.ModelSpec{Model: "m"},
+		Model:        testModel(),
 		DrainTimeout: 200 * time.Millisecond,
 		idGen:        gen.gen,
 		now:          fixedClock(ts),
@@ -146,7 +146,7 @@ func TestEnduringMintErrorSkipsPublish(t *testing.T) {
 	failingFactory := event.NewFactory(func() (uuid.UUID, error) { return uuid.UUID{}, mintErr }, fixedClock(ts))
 	l, err := New(ctx, mustID(t), mustID(t), Provenance{}, rec, Config{
 		Client:       &fakeLLM{chunks: []content.Chunk{textChunk("hi")}},
-		Model:        llm.ModelSpec{Model: "m"},
+		Model:        testModel(),
 		DrainTimeout: 200 * time.Millisecond,
 		idGen:        gen.gen,
 		eventFactory: failingFactory,

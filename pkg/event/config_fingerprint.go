@@ -22,7 +22,7 @@ type ConfigFingerprint struct {
 	// AgentKind names the agent role+swarm this session ran (e.g. "swe:orchestrator").
 	// It is empty for a caller that does not inject a kind (a non-swarm/legacy session).
 	AgentKind string `json:"agent_kind,omitzero"`
-	// ModelID is the model identifier the session ran against (the ModelSpec.Model).
+	// ModelID is the model identifier the session ran against (the llm.Model.Name).
 	ModelID string `json:"model_id,omitzero"`
 	// SystemPromptRev is a content digest (hex sha256) of the system prompt text, so
 	// a prompt change is detectable without persisting the prompt itself.

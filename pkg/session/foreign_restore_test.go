@@ -98,7 +98,7 @@ func TestForeignRestore(t *testing.T) {
 
 			c := cfg(&stubLLM{chunks: []content.Chunk{textChunk("x")}})
 			c.Engine = tt.engine
-			c.Model.System = "be helpful"
+			c.System = "be helpful"
 
 			sessionID := mustUUID()
 			primaryLoopID := mustUUID()

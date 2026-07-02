@@ -69,7 +69,7 @@ func TestRunStep(t *testing.T) {
 		t.Parallel()
 		client := &fakeLLM{chunks: []content.Chunk{textChunk("hel"), textChunk("lo")}}
 		var emitted []event.Event
-		cfg := stepConfig{req: llm.Request{Model: llm.ModelSpec{Model: "m"}}, client: client, emit: drainEmit(&emitted)}
+		cfg := stepConfig{req: llm.Request{Model: testModel()}, client: client, emit: drainEmit(&emitted)}
 
 		res := runStep(context.Background(), cfg, 5, newTestStep(t, 0))
 
@@ -119,7 +119,7 @@ func TestRunStep(t *testing.T) {
 			toolUseChunk(0, "id-1", "Echo", `{"x":1}`),
 		}}}
 		var emitted []event.Event
-		cfg := stepConfig{req: llm.Request{Model: llm.ModelSpec{Model: "m"}}, client: client, emit: drainEmit(&emitted)}
+		cfg := stepConfig{req: llm.Request{Model: testModel()}, client: client, emit: drainEmit(&emitted)}
 
 		res := runStep(context.Background(), cfg, 5, newTestStep(t, 0))
 
@@ -152,7 +152,7 @@ func TestRunStep(t *testing.T) {
 		t.Parallel()
 		client := &fakeLLM{chunks: nil}
 		var emitted []event.Event
-		cfg := stepConfig{req: llm.Request{Model: llm.ModelSpec{Model: "m"}}, client: client, emit: drainEmit(&emitted)}
+		cfg := stepConfig{req: llm.Request{Model: testModel()}, client: client, emit: drainEmit(&emitted)}
 
 		res := runStep(context.Background(), cfg, 5, newTestStep(t, 0))
 
@@ -177,7 +177,7 @@ func TestRunStep(t *testing.T) {
 		chunks := []content.Chunk{textChunk(""), textChunk("")}
 		client := &fakeLLM{chunks: chunks}
 		var emitted []event.Event
-		cfg := stepConfig{req: llm.Request{Model: llm.ModelSpec{Model: "m"}}, client: client, emit: drainEmit(&emitted)}
+		cfg := stepConfig{req: llm.Request{Model: testModel()}, client: client, emit: drainEmit(&emitted)}
 
 		res := runStep(context.Background(), cfg, 5, newTestStep(t, 0))
 
@@ -205,7 +205,7 @@ func TestRunStep(t *testing.T) {
 		t.Parallel()
 		boom := &llm.ValidationError{Field: "x", Reason: "boom"}
 		client := &fakeLLM{streamErr: boom}
-		cfg := stepConfig{req: llm.Request{Model: llm.ModelSpec{Model: "m"}}, client: client, emit: func(event.Event) {}}
+		cfg := stepConfig{req: llm.Request{Model: testModel()}, client: client, emit: func(event.Event) {}}
 
 		res := runStep(context.Background(), cfg, 5, newTestStep(t, 0))
 
@@ -226,7 +226,7 @@ func TestRunStep(t *testing.T) {
 		t.Parallel()
 		boom := &llm.ValidationError{Field: "y", Reason: "midstream"}
 		client := &fakeLLM{chunks: []content.Chunk{textChunk("partial")}, nextErr: boom}
-		cfg := stepConfig{req: llm.Request{Model: llm.ModelSpec{Model: "m"}}, client: client, emit: func(event.Event) {}}
+		cfg := stepConfig{req: llm.Request{Model: testModel()}, client: client, emit: func(event.Event) {}}
 
 		res := runStep(context.Background(), cfg, 5, newTestStep(t, 0))
 
@@ -245,7 +245,7 @@ func TestRunStep(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
 		client := &fakeLLM{streamErr: context.Canceled}
-		cfg := stepConfig{req: llm.Request{Model: llm.ModelSpec{Model: "m"}}, client: client, emit: func(event.Event) {}}
+		cfg := stepConfig{req: llm.Request{Model: testModel()}, client: client, emit: func(event.Event) {}}
 
 		res := runStep(ctx, cfg, 5, newTestStep(t, 0))
 
@@ -262,7 +262,7 @@ func TestRunStep(t *testing.T) {
 		client := &scriptedLLM{scripts: [][]content.Chunk{{
 			toolUseChunk(0, "id-bad", "Echo", `{not valid json`),
 		}}}
-		cfg := stepConfig{req: llm.Request{Model: llm.ModelSpec{Model: "m"}}, client: client, emit: func(event.Event) {}}
+		cfg := stepConfig{req: llm.Request{Model: testModel()}, client: client, emit: func(event.Event) {}}
 
 		res := runStep(context.Background(), cfg, 5, newTestStep(t, 0))
 

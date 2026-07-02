@@ -130,7 +130,7 @@ func newTurnFixture(input []content.Block, base content.AgenticMessages, ts Tool
 	st := newTurnState(id.sessionID, id.loopID, id.turnID, 1, uuid.UUID{}, user)
 	cfg := turnConfig{
 		base:         cloneMessages(base),
-		model:        llm.ModelSpec{Model: "m"},
+		model:        testModel(),
 		tools:        ts,
 		client:       client,
 		gateReg:      gateReg,

@@ -8,7 +8,6 @@ import (
 	"github.com/ciram-co/looprig/pkg/command"
 	"github.com/ciram-co/looprig/pkg/content"
 	"github.com/ciram-co/looprig/pkg/event"
-	"github.com/ciram-co/looprig/pkg/llm"
 	"github.com/ciram-co/looprig/pkg/tool"
 	"github.com/ciram-co/looprig/pkg/uuid"
 )
@@ -200,7 +199,7 @@ func TestAbnormalTerminalReturnsQueuedInput(t *testing.T) {
 		}
 		var err error
 		l, err = New(ctx, sessionID, loopID, Provenance{}, rec,
-			Config{Client: client, Model: llm.ModelSpec{Model: "m"}, Tools: tools, DrainTimeout: 500 * time.Millisecond})
+			Config{Client: client, Model: testModel(), Tools: tools, DrainTimeout: 500 * time.Millisecond})
 		if err != nil {
 			t.Fatalf("New: %v", err)
 		}

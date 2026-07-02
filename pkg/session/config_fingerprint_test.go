@@ -6,7 +6,6 @@ import (
 	"time"
 
 	"github.com/ciram-co/looprig/pkg/event"
-	"github.com/ciram-co/looprig/pkg/llm"
 	"github.com/ciram-co/looprig/pkg/loop"
 	"github.com/ciram-co/looprig/pkg/tool"
 )
@@ -31,8 +30,46 @@ func fpConfig(model, system string, toolNames ...string) loop.Config {
 	}
 	return loop.Config{
 		Client: &stubLLM{},
-		Model:  llm.ModelSpec{Model: model, System: system},
+		Model:  validModel(model),
+		System: system,
 		Tools:  loop.ToolSet{Registry: reg},
+	}
+}
+
+// TestFingerprintFromRestoreStable is the RESTORE-STABILITY guard for the
+// ModelSpec→(Model + System) split: it pins a KNOWN config to its EXACT fingerprint
+// so the refactor cannot silently perturb the value a persisted session was stamped
+// with (a change would make every existing session fail its restore comparison). The
+// three golden strings are computed INDEPENDENTLY of this package's code, exactly as
+// the pre-refactor derivation did:
+//   - ModelID is the model id verbatim (old cfg.Model.Model, now cfg.Model.Name — the
+//     SAME string), so it stays "gpt-4o-2024".
+//   - SystemPromptRev is sha256hex of the system prompt (old cfg.Model.System, now
+//     cfg.System — the SAME string): sha256("You are a helpful assistant.").
+//   - ToolPolicyRev is sha256hex of the sorted tool names joined by "\n":
+//     sha256("Read\nWrite") (unchanged by this refactor).
+//
+// If any hashed input, field home, ordering, or hash algorithm changes, one of these
+// literals stops matching and this test fails — catching an accidental fingerprint
+// change before it breaks session restore for existing users.
+func TestFingerprintFromRestoreStable(t *testing.T) {
+	t.Parallel()
+	const (
+		wantModelID = "gpt-4o-2024"
+		// sha256("You are a helpful assistant.")
+		wantSystemPromptRev = "75357d685f238b6afd7738be9786fdafde641eb6ca9a3be7471939715a68a4de"
+		// sha256("Read\nWrite") — tool names sorted then newline-joined
+		wantToolPolicyRev = "fb0af83c64ef5c27e469abea2e7b687f23f281f6619218d3ea42a35a2222af25"
+	)
+	fp := FingerprintFrom(fpConfig("gpt-4o-2024", "You are a helpful assistant.", "Read", "Write"))
+	if fp.ModelID != wantModelID {
+		t.Errorf("ModelID = %q, want %q", fp.ModelID, wantModelID)
+	}
+	if fp.SystemPromptRev != wantSystemPromptRev {
+		t.Errorf("SystemPromptRev = %q, want %q (sha256 of the system prompt)", fp.SystemPromptRev, wantSystemPromptRev)
+	}
+	if fp.ToolPolicyRev != wantToolPolicyRev {
+		t.Errorf("ToolPolicyRev = %q, want %q (sha256 of the sorted tool names)", fp.ToolPolicyRev, wantToolPolicyRev)
 	}
 }
 

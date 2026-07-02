@@ -10,7 +10,6 @@ import (
 	"github.com/ciram-co/looprig/pkg/command"
 	"github.com/ciram-co/looprig/pkg/content"
 	"github.com/ciram-co/looprig/pkg/event"
-	"github.com/ciram-co/looprig/pkg/llm"
 	"github.com/ciram-co/looprig/pkg/uuid"
 )
 
@@ -72,7 +71,7 @@ func TestInboxPopIDGenFailureReturnsEntry(t *testing.T) {
 	rec := &recordingPublisher{}
 	l, err := New(ctx, sessionID, loopID, Provenance{}, rec, Config{
 		Client:       client,
-		Model:        llm.ModelSpec{Model: "m"},
+		Model:        testModel(),
 		Tools:        ts,
 		DrainTimeout: 500 * time.Millisecond,
 		idGen:        gen.gen,
