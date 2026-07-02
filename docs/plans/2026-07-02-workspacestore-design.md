@@ -68,8 +68,12 @@ type Ref string
 // unchanged workspace re-snapshots into a no-op upload.
 func (s *Store) Snapshot(ctx context.Context, root string) (Ref, error)
 
-// Materialize restores ref into dest. Idempotent: if dest already holds ref
-// (marker check), it is a no-op; otherwise dest must be empty.
+// Materialize restores ref into dest. An empty dest is the truth path (extract).
+// A non-empty dest is never trusted and never wiped: Materialize re-archives it
+// deterministically and compares digests — a match (a warm volume holding exactly
+// ref) is a verified no-op; a mismatch returns *DestNotEmptyError and the caller
+// decides whether to clear and retry. No marker files: reuse is proven by
+// content, since markers go stale the moment a resumed turn mutates the tree.
 func (s *Store) Materialize(ctx context.Context, ref Ref, dest string) error
 
 // Delete removes a snapshot's blobs. Used only by GC (below).
@@ -86,8 +90,9 @@ func (s *Store) Delete(ctx context.Context, ref Ref) error
   upload completes; the working set never needs to fit in memory).
 - `Ref = "v1:sha256:<hex>"`. The version prefix is the evolution seam — a future
   incremental format becomes `v2:` without breaking stored history.
-- A marker file `.workspacestore-ref` is written into dest by Materialize (and ignored by
-  Snapshot) to support the idempotent fast path.
+- Determinism is also what makes the verified warm-volume fast path sound: re-archiving an
+  unchanged tree reproduces the digest bit-for-bit, so reuse is proven by content — never
+  by a marker or timestamp that can go stale after a crashed turn mutates the tree.
 
 ### Journal linkage (the resume token)
 
@@ -135,8 +140,12 @@ was considered and rejected as the primary:
 3. Fencing extends to files with snapshots (each resume materializes its own copy); mounts
    let concurrent resumes stomp each other.
 
-A mounted persistent volume remains useful as a **cache**: Materialize's marker fast-path
-makes a warm volume a no-op resume. The design does not know mounts exist.
+A mounted persistent volume remains useful as a **cache**: Materialize's verified fast
+path (local re-archive + digest compare — CPU and local I/O, no network fetch) makes a
+warm volume holding exactly the checkpointed tree a no-op resume, while a drifted tree —
+mutated by a turn that crashed after the last checkpoint — fails closed with
+`*DestNotEmptyError` instead of silently resurrecting unjournaled files. The design does
+not know mounts exist.
 
 ## Deployment profiles
 
@@ -148,7 +157,8 @@ makes a warm volume a no-op resume. The design does not know mounts exist.
 
 - **Fleet** is the canonical cloud shape and this design's target: every append crosses the
   network as it happens; the container may be killed at any instant; the lost in-flight
-  turn is recovered by replay.
+  turn is recovered by replay. A pgstore-backed session store takes its offload Blobs from
+  the same object-store backend used here, assembled via `storekit.Composite`.
 - **Scale-to-zero** is the "everything local, sync outward" composition: legitimate,
   provided the platform kills only after the archive step (these platforms suspend between
   turns by construction) and with fencing honestly delegated to the control plane. The
@@ -165,7 +175,7 @@ makes a warm volume a no-op resume. The design does not know mounts exist.
 | `ciram-co/fsstore` | ✓ | blobs under `<root>/blobs/`; laptop default |
 | `ciram-co/natsstore` | ✓ | JetStream ObjectStore; suits small/medium workspaces in NATS-only deployments |
 | `ciram-co/rclonestore` | ✓ (Blobs **only**) | the cloud workhorse — any of rclone's ~70 remotes |
-| `ciram-co/pgstore` | ✗ | bulk bytes do not belong in Postgres; pair with rclonestore |
+| `ciram-co/pgstore` | ✗ | bulk bytes do not belong in Postgres; a pgstore-backed deployment takes Blobs from an object-store backend via `storekit.Composite` (companion spec), covering both session offload and workspaces |
 
 rclone cannot be a session store (no CAS → cannot pass ledger conformance); Postgres is a
 poor workspace store. Each backend lands on the side of the line its semantics support —
@@ -205,8 +215,9 @@ Implements `storekit.Blobs` by **exec'ing the rclone binary** — never linking 
 - storetest Blobs conformance for every backend claiming Blobs (rclonestore's suite runs
   under `//go:build integration` against a local `rclone` + temp remote).
 - workspacestore property tests: snapshot→materialize round-trip yields an identical tree
-  (contents, modes, symlinks); identical trees yield identical refs; marker fast-path
-  no-ops; hostile-archive corpus (traversal names, symlink escapes, bombs) all rejected —
+  (contents, modes, symlinks); identical trees yield identical refs; verified reuse no-ops
+  on an exact warm tree and rejects a drifted one (`DestNotEmptyError`, tree untouched);
+  hostile-archive corpus (traversal names, symlink escapes, bombs) all rejected —
   table-driven per CLAUDE.md, `-race` always.
 - End-to-end (integration tag): snapshot → append `WorkspaceCheckpointed` → new store
   instance → replay → materialize → tree equality. The suspend/resume path in one test.
@@ -238,3 +249,8 @@ reference at every layer; no store is shared by contract, only (optionally) by b
 5. natsstore also provides workspace Blobs (JetStream ObjectStore).
 6. Fleet profile is the design target; scale-to-zero is a documented composition with
    fencing delegated to the orchestrator.
+7. Review fix (2026-07-02): the marker-file fast path was unsound — a warm volume drifts
+   when a turn crashes after the last checkpoint, and a marker would trust it anyway.
+   Materialize now proves reuse by deterministic re-archive + digest compare, requires an
+   empty dest otherwise, and never wipes (`DestNotEmptyError` leaves the decision to the
+   caller).

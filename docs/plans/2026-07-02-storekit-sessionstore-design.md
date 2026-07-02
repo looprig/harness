@@ -116,6 +116,21 @@ Append outcomes are a tri-state:
 
 Any other error is a definite failure (fail closed, tip unadvanced).
 
+Edge semantics, pinned so conformance tests encode decisions rather than accidents:
+
+- **Absent == empty.** A never-written (or deleted) ledger behaves as an empty one: `Tip`
+  returns 0; `Read` yields an immediately-drained cursor; `Append` with expected 0 creates
+  it implicitly; `Delete` of an absent ledger is a no-op success (idempotent — GC retries
+  safely). There is no create/exists surface at this layer; whether a *session* exists is
+  the catalog's job (KV).
+- **Reads beyond the tip are empty, not errors.** Any `from > tip` (including tip+1, the
+  resume-from-tip pattern) yields a drained cursor. Cursors are bounded: they observe the
+  tip as of `Read` and never tail later appends.
+- **Payloads are caller-owned.** A backend must not reuse or mutate `Record.Payload` after
+  `Next` returns. Zero-length payloads are legal.
+- **Listings are canonical.** `KV.Keys` and `Blobs.List` return lexicographically
+  ascending, duplicate-free results.
+
 ### AppendDefinite — ambiguity resolution, written once
 
 The retry-then-verify algorithm currently buried in looprig's NATS journal
@@ -149,9 +164,14 @@ type Leaser interface {
 type Lease interface {
 	Epoch() uint64
 	Lost() <-chan struct{} // closed when ownership is lost (expiry, takeover)
-	Release() error
+	Release(ctx context.Context) error // releasing may cross the network; ctx bounds it
 }
 ```
+
+storekit deliberately has no `Valid()`: liveness is fully expressed by the `Lost()` channel
+(`Valid` is a non-blocking select away). The sessionstore facade adapts a backend lease into
+the existing `journal.Lease` shape — deriving `Valid()` from `Lost()`, passing `Release`
+through — so nothing above the facade changes.
 
 The lease is the **fast-path** guard. The **hard** guard is the opening-fence discipline in
 the engine layer (below): a new owner appends a fence record before anything else, advancing
@@ -179,13 +199,37 @@ type Blobs interface {
 }
 ```
 
+### Composite — pairing partial backends
+
+Not every backend provides every primitive (pgstore has no Blobs). `Composite` assembles a
+full backend from parts at the composition root, with nil fields rejected by the consuming
+engine's `Open`:
+
+```go
+// Composite satisfies Ledger+Leaser+KV+Blobs by embedding one provider per
+// primitive. Assembled where dependencies are wired, never inside engines.
+type Composite struct {
+	Ledger
+	Leaser
+	KV
+	Blobs
+}
+```
+
+This is how a fleet deployment runs sessions on Postgres: `pgstore` supplies the log,
+leases, and catalog; an object-store backend (e.g. rclonestore) supplies the Blobs that
+back large-record offload — the same pairing the workspace store uses.
+
 ### Name and key grammar (normalization)
 
-Ledger names, KV keys, and blob keys match `[a-z0-9][a-z0-9/_.-]*`, max 512 bytes, no `..`
-segment. This is *our* grammar; backends escape into their native namespaces (JetStream
-subject tokens, file paths) internally. NATS subject rules never constrain the contract.
-The restricted charset also removes argv/path-injection surface in exec- and fs-backed
-implementations.
+Ledger names, KV keys, and blob keys are **canonical by construction**: one or more
+segments joined by single `/`, where each segment matches `[a-z0-9][a-z0-9_.-]*`; no
+leading or trailing `/`; max 512 bytes total. The segment-first-character rule makes empty,
+`.`, and `..` segments unrepresentable, so no two distinct valid names can alias one
+backend location (`a//b`, `a/./b`, `a/b/` are all invalid, not merely discouraged). This is
+*our* grammar; backends escape into their native namespaces (JetStream subject tokens, file
+paths) internally — NATS subject rules never constrain the contract. The restricted charset
+also removes argv/path-injection surface in exec- and fs-backed implementations.
 
 ### Payload floor and offload policy (normalization)
 
@@ -197,10 +241,11 @@ message cap stops being an architectural constant.
 ### Typed errors
 
 `ConflictError{Name, Expected}`, `AmbiguousError{Name, Expected, Cause}`,
-`LedgerNotFoundError{Name}`, `RecordNotFoundError{Name, Seq}`, `KeyNotFoundError{Key}`,
+`RecordNotFoundError{Name, Seq}`, `KeyNotFoundError{Key}`,
 `BlobNotFoundError{Key}`, `LeaseHeldError{Name, HolderEpoch}`, `LeaseLostError{Name, Epoch}`,
 `InvalidNameError{Name, Rule}`. All concrete structs in storekit; backends return them
-(wrapping causes). Engines classify with `errors.As` only — never by string.
+(wrapping causes). Engines classify with `errors.As` only — never by string. There is no
+ledger-not-found error: an absent ledger reads as empty (edge semantics above).
 
 ### memstore and storetest (in storekit)
 
@@ -214,7 +259,9 @@ message cap stops being an architectural constant.
   1-based sequencing; CAS conflict on wrong expected; expected==0 semantics; concurrent
   appender linearization; stale-writer-fenced-after-opening-fence; lease epoch monotonicity;
   LeaseHeldError while held; reclaim after holder death (where testable); KV rev CAS; blob
-  round-trip and absence errors; name-grammar rejection; payload floor acceptance.
+  round-trip and absence errors; name-grammar rejection (empty/dot segments, doubled or
+  trailing slashes); payload floor acceptance; absent-ledger emptiness (Tip 0, drained
+  cursor, idempotent Delete); reads from beyond the tip; sorted duplicate-free listings.
 
 ## looprig: pkg/sessionstore (domain facade)
 
@@ -272,7 +319,8 @@ envelope v1 (JSON): {"v":1, "kind":"event"|"command"|"fence"|"blobptr", "id":"<i
 `OpenJournal` (holding a valid lease) appends the opening fence record
 (`fence{epoch}`) via `AppendDefinite` before returning — taking ownership of the tip.
 `Append` then, under the journal's single-writer mutex: fast-path lease check
-(`Valid()` + `Lost()`), marshal, offload-if-over-threshold, `AppendDefinite` at the tracked
+(a non-blocking `Lost()` select, surfaced as `journal.Lease.Valid()` by the facade's
+adapter), marshal, offload-if-over-threshold, `AppendDefinite` at the tracked
 tip, advance the tip. Per-append deadline independent of the session context is preserved.
 All of this is today's semantics with `nats.PublishMsg` swapped for `storekit`.
 
@@ -338,14 +386,17 @@ Receives the current NATS machinery as an implementation of the four primitives:
 
 ### pgstore (future, named for completeness)
 
-Transactions give CAS trivially; advisory locks are native leases. No Blobs (bulk bytes do
-not belong in Postgres; pair with rclonestore for workspaces).
+Transactions give CAS trivially; advisory locks are native leases. No Blobs — bulk bytes do
+not belong in Postgres — so a pgstore-backed session store is assembled via
+`storekit.Composite` with an object-store Blobs provider (e.g. rclonestore), which also
+serves the workspace store.
 
 ## Composition (swe)
 
 ```go
 fs, err := fsstore.Open(fsstore.Options{Root: filepath.Join(sweData, "store")})
 // swap: natsstore.Open(natsstore.Options{URL: os.Getenv("NATS_URL")}) — nothing below changes
+// mixed backing: sessionstore.Open(storekit.Composite{Ledger: pg, Leaser: pg, KV: pg, Blobs: rc})
 
 sessions, err := sessionstore.Open(fs)
 lease, err := sessions.AcquireLease(ctx, id)
@@ -407,3 +458,10 @@ type (YAGNI).
 6. sessionstore and flow's checkpoint store unify **at the primitive** (`Ledger`), not at
    the domain contract; looprig keeps two domain facades (sessions, workspaces).
 7. Primitive named `Ledger` (BookKeeper precedent), not `Log`.
+8. Review fixes (2026-07-02): `storekit.Composite` assembles partial backends
+   (pgstore + object-store Blobs) so `sessionstore.Backend` stays all-four without
+   contradiction; `Lease.Release` takes ctx and `Valid()` is a facade-adapter derivation
+   from `Lost()` (storekit stays minimal); ledger edge semantics pinned (absent == empty,
+   bounded cursors, caller-owned payloads, sorted listings — `LedgerNotFoundError`
+   dropped); name grammar made canonical (single-`/`-joined segments, no empty/dot
+   segments, no trailing slash).
