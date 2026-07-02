@@ -134,6 +134,9 @@ End with: end-of-commit trailer `Co-Authored-By: Claude Opus 4.8 (1M context) <n
 cd <WORKTREE>
 git rm -r pkg/tui pkg/cli
 git rm pkg/session/headline_integration_test.go   # option A (self-contained; see plan header)
+# internal/logging + internal/ttylog are imported ONLY by pkg/cli (verified) and are
+# self-contained — they moved to looprig-console with cli, so they are now orphaned here.
+git rm -r internal/logging internal/ttylog
 ```
 
 **Step 2: Tidy + re-vendor (workspace OFF)**
