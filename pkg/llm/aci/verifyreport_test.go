@@ -419,3 +419,17 @@ func TestVerifyReportPublicWiring(t *testing.T) {
 		t.Errorf("VerifyReport(malformed) error = %T (%v), want *reportParseError", err, err)
 	}
 }
+
+// TestVerifyReportRejectsUnpinnedPolicy pins the fail-closed gate on the public
+// entry point: a bare Policy{} (pins nothing, no UnpinnedPolicy() opt-in) is
+// rejected with *UnpinnedPolicyError BEFORE any parse or network collateral
+// fetch. The []byte(`{}`) body is never parsed and the live DCAP verifier is
+// never reached, so this test needs no network — the gate short-circuits first.
+func TestVerifyReportRejectsUnpinnedPolicy(t *testing.T) {
+	t.Parallel()
+	_, err := VerifyReport([]byte(`{}`), nil, time.Unix(0, 0), Policy{})
+	var upe *UnpinnedPolicyError
+	if !errors.As(err, &upe) {
+		t.Fatalf("want *UnpinnedPolicyError, got %v", err)
+	}
+}

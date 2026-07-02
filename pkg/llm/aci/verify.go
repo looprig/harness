@@ -280,14 +280,25 @@ func verifyReport(reportJSON []byte, nonce *string, now time.Time, policy Policy
 // reportJSON with the LIVE DCAP quote verifier and returns the validated
 // *VerifiedReport, or the first failing step's typed *llm.AttestationError. nonce
 // is the report_data binding nonce (nil if none was sent), now is the wall clock
-// for the freshness check, and policy is the acceptance allow-list (a zero
-// Policy{} accepts any genuine report; a provider package supplies a pinned
-// preset, e.g. phala.DefaultPolicy()). It delegates to verifyReport with
+// for the freshness check, and policy is the acceptance allow-list.
+//
+// FAIL CLOSED. This is a public entry point, so the fail-closed policy gate runs
+// FIRST: a policy that pins no acceptance set is rejected with *UnpinnedPolicyError
+// BEFORE the chain runs and BEFORE any parse or network collateral fetch — unless
+// the caller explicitly opts into genuineness-only verification by passing
+// UnpinnedPolicy(). Supply a pinned Policy (a provider package ships a preset) or
+// UnpinnedPolicy() to opt out; a bare Policy{} is refused.
+//
+// On an acceptable policy it delegates to the unexported verifyReport with
 // defaultQuoteVerifier, so step 4 fetches Intel collateral over the bounded
 // HTTPS-only getter — meaning this entry point requires network access and cannot
-// run fully offline (offline tests use the unexported verifyReport with a fake
-// seam).
+// run fully offline. verifyReport remains the UNGUARDED low-level runner shared with
+// the client's per-request attest path (already gated at construction by aci.New)
+// and offline tests, which inject a fake quote seam.
 func VerifyReport(reportJSON []byte, nonce *string, now time.Time, policy Policy) (*VerifiedReport, error) {
+	if err := policy.requireAcceptable(); err != nil {
+		return nil, err
+	}
 	return verifyReport(reportJSON, nonce, now, policy, defaultQuoteVerifier)
 }
 

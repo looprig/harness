@@ -34,8 +34,8 @@ package aci
 // field skips its check ("when configured"); a non-empty field requires
 // membership. At the LOW-LEVEL verifyReport (verify.go) a zero value Policy{}
 // still accepts any genuine, quote-backed report (no allow-listing) — that is the
-// mechanism. The PUBLIC entry points (New/VerifyReport, wired in later tasks)
-// instead FAIL CLOSED via requireAcceptable: an unpinned Policy is rejected with
+// mechanism. The PUBLIC entry points (New and VerifyReport both call
+// requireAcceptable) instead FAIL CLOSED: an unpinned Policy is rejected with
 // *UnpinnedPolicyError unless the caller opts in with UnpinnedPolicy(). Callers
 // narrow trust by populating fields.
 type Policy struct {
