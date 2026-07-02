@@ -1,4 +1,4 @@
-// internal/llm/openaiapi/types.go
+// pkg/llm/codec/openaiapi/types.go
 package openaiapi
 
 import "encoding/json"

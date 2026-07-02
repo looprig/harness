@@ -1,10 +1,10 @@
-// internal/llm/openaiapi/fuzz_test.go
+// pkg/llm/codec/openaiapi/fuzz_test.go
 package openaiapi_test
 
 import (
 	"testing"
 
-	"github.com/ciram-co/looprig/pkg/llm/openaiapi"
+	"github.com/ciram-co/looprig/pkg/llm/codec/openaiapi"
 )
 
 // FuzzDecodeResponse ensures DecodeResponse never panics on arbitrary input.

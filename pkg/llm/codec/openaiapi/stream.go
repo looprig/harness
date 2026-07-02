@@ -1,4 +1,4 @@
-// internal/llm/openaiapi/stream.go
+// pkg/llm/codec/openaiapi/stream.go
 package openaiapi
 
 import (

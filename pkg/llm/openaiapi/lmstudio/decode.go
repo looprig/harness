@@ -3,7 +3,7 @@ package lmstudio
 
 import (
 	"github.com/ciram-co/looprig/pkg/llm"
-	"github.com/ciram-co/looprig/pkg/llm/openaiapi"
+	"github.com/ciram-co/looprig/pkg/llm/codec/openaiapi"
 )
 
 func decodeResponse(body []byte) (*llm.Response, error) {

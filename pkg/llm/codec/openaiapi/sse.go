@@ -1,4 +1,4 @@
-// internal/llm/openaiapi/sse.go
+// pkg/llm/codec/openaiapi/sse.go
 package openaiapi
 
 import (

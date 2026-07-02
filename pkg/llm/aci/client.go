@@ -34,7 +34,7 @@ import (
 
 	"github.com/ciram-co/looprig/pkg/content"
 	"github.com/ciram-co/looprig/pkg/llm"
-	"github.com/ciram-co/looprig/pkg/llm/openaiapi"
+	"github.com/ciram-co/looprig/pkg/llm/codec/openaiapi"
 	secp256k1 "github.com/decred/dcrd/dcrec/secp256k1/v4"
 )
 

@@ -11,7 +11,7 @@ import (
 
 	"github.com/ciram-co/looprig/pkg/content"
 	"github.com/ciram-co/looprig/pkg/llm"
-	"github.com/ciram-co/looprig/pkg/llm/openaiapi"
+	"github.com/ciram-co/looprig/pkg/llm/codec/openaiapi"
 )
 
 const defaultBaseURL = "http://localhost:1234/v1"

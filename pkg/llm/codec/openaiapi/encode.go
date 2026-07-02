@@ -1,4 +1,4 @@
-// internal/llm/openaiapi/encode.go
+// pkg/llm/codec/openaiapi/encode.go
 package openaiapi
 
 import (

@@ -13,8 +13,8 @@ import (
 
 	"github.com/ciram-co/looprig/pkg/content"
 	"github.com/ciram-co/looprig/pkg/llm"
+	"github.com/ciram-co/looprig/pkg/llm/codec/openaiapi"
 	"github.com/ciram-co/looprig/pkg/llm/e2e"
-	"github.com/ciram-co/looprig/pkg/llm/openaiapi"
 )
 
 // errStreamInitMissing is returned when an e2e frame arrives before the

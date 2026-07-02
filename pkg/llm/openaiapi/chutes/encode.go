@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 
 	"github.com/ciram-co/looprig/pkg/llm"
-	"github.com/ciram-co/looprig/pkg/llm/openaiapi"
+	"github.com/ciram-co/looprig/pkg/llm/codec/openaiapi"
 )
 
 // chutesRequest extends the standard OpenAI chat request with the chutes-specific

@@ -1,4 +1,4 @@
-// internal/llm/openaiapi/sse_test.go
+// pkg/llm/codec/openaiapi/sse_test.go
 package openaiapi_test
 
 import (
@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/ciram-co/looprig/pkg/llm/openaiapi"
+	"github.com/ciram-co/looprig/pkg/llm/codec/openaiapi"
 )
 
 // errorReader returns an error after emitting a fixed prefix.
