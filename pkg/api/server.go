@@ -166,9 +166,9 @@ func (s *server) routes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /sessions/{sid}/gates/{tid}", s.handleResolveGate)
 	mux.HandleFunc("GET /sessions/{sid}/gates", s.handleListGates)
 
-	// Group C registers the SSE event stream and the transcript export here, e.g.:
-	//   mux.HandleFunc("GET /sessions/{sid}/events", s.handleEvents)   // SSE
-	//   mux.HandleFunc("GET /sessions/{sid}/export", s.handleExport)
+	// Event stream (Task 13, group C). A long-lived SSE stream of the session's
+	// whole-session event fan-in.
+	mux.HandleFunc("GET /sessions/{sid}/events", s.handleEvents)
 }
 
 // handleHealthz answers 200 with an intentionally data-free body: it is the one
