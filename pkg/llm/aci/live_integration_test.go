@@ -62,15 +62,16 @@ func liveKey(t *testing.T) string {
 	return key
 }
 
-// liveRequest builds the provider-neutral chat request: the Phala model spec (real
-// base URL + key + model) and a single one-line user text message.
-func liveRequest(key string) llm.Request {
+// liveRequest builds the provider-neutral chat request: the secret-free Phala model
+// descriptor (real base URL + model; the API key is supplied to New, not the Model)
+// and a single one-line user text message.
+func liveRequest() llm.Request {
 	return llm.Request{
-		Model: llm.ModelSpec{
-			Provider: llm.ProviderPhala,
-			BaseURL:  livePhalaBaseURL,
-			APIKey:   key,
-			Model:    liveModel,
+		Model: llm.Model{
+			Provider:  llm.ProviderPhala,
+			APIFormat: llm.APIFormatOpenAI,
+			BaseURL:   livePhalaBaseURL,
+			Name:      liveModel,
 		},
 		Messages: content.AgenticMessages{
 			&content.UserMessage{Message: content.Message{
@@ -94,7 +95,7 @@ func TestLiveInvoke(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), liveTimeout)
 	defer cancel()
 
-	resp, err := client.Invoke(ctx, liveRequest(key))
+	resp, err := client.Invoke(ctx, liveRequest())
 	if err != nil {
 		t.Fatalf("Invoke() error = %v, want nil", err)
 	}
@@ -122,7 +123,7 @@ func TestLiveStream(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), liveTimeout)
 	defer cancel()
 
-	sr, err := client.Stream(ctx, liveRequest(key))
+	sr, err := client.Stream(ctx, liveRequest())
 	if err != nil {
 		t.Fatalf("Stream() error = %v, want nil", err)
 	}

@@ -468,7 +468,12 @@ func tamperBytes(b []byte) []byte {
 // testRequest builds a minimal chat Request with one user message.
 func testRequest() llm.Request {
 	return llm.Request{
-		Model: llm.ModelSpec{Model: testClientModel},
+		Model: llm.Model{
+			Provider:  llm.ProviderPhala,
+			APIFormat: llm.APIFormatOpenAI,
+			BaseURL:   testBaseURL,
+			Name:      testClientModel,
+		},
 		Messages: content.AgenticMessages{
 			&content.UserMessage{Message: content.Message{
 				Role:   content.RoleUser,

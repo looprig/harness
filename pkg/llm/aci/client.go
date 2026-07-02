@@ -218,7 +218,7 @@ func (c *Client) Invoke(ctx context.Context, req llm.Request) (*llm.Response, er
 	if err := req.Model.Validate(); err != nil {
 		return nil, err
 	}
-	model := req.Model.Model
+	model := req.Model.Name
 
 	// 1. Attest (cached). A failure here is already a typed *llm.AttestationError.
 	verified, err := c.cache.get(ctx, model)
@@ -316,7 +316,7 @@ func (c *Client) Stream(ctx context.Context, req llm.Request) (*llm.StreamReader
 	if err := req.Model.Validate(); err != nil {
 		return nil, err
 	}
-	model := req.Model.Model
+	model := req.Model.Name
 
 	// 1. Attest (cached).
 	verified, err := c.cache.get(ctx, model)
