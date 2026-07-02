@@ -8,7 +8,10 @@ package aci
 // KMS root, and (optionally) workload_id we accept. Every check is "when
 // configured" — an empty/nil accepted set skips that check (the corresponding
 // verify.go helper returns nil on an empty set), so a zero-value Policy{} accepts
-// any genuine report.
+// any genuine report. NOTE: that fail-open behavior is the LOW-LEVEL verifyReport
+// mechanism only; the PUBLIC entry points (New/VerifyReport) fail closed via
+// Policy.requireAcceptable, rejecting an unpinned Policy unless the caller opts in
+// with UnpinnedPolicy() (see the Policy type doc below).
 //
 // Policy is deliberately provider-agnostic: it carries no pinned values of its
 // own. A provider package (e.g. pkg/llm/providers/phala) owns the pinned trust
@@ -29,8 +32,12 @@ package aci
 // Policy is the attestation acceptance allow-list set: which app-ids, source
 // provenances, KMS roots, and workload_ids VerifyReport will accept. A nil/empty
 // field skips its check ("when configured"); a non-empty field requires
-// membership. The zero value Policy{} therefore accepts any genuine, quote-backed
-// report (no allow-listing) — callers narrow trust by populating fields.
+// membership. At the LOW-LEVEL verifyReport (verify.go) a zero value Policy{}
+// still accepts any genuine, quote-backed report (no allow-listing) — that is the
+// mechanism. The PUBLIC entry points (New/VerifyReport, wired in later tasks)
+// instead FAIL CLOSED via requireAcceptable: an unpinned Policy is rejected with
+// *UnpinnedPolicyError unless the caller opts in with UnpinnedPolicy(). Callers
+// narrow trust by populating fields.
 type Policy struct {
 	// AcceptedWorkloadIDs is the set of accepted workload_id strings
 	// ("sha256:<hex>"). Commonly left EMPTY: the workload_id is a digest of the
@@ -52,4 +59,35 @@ type Policy struct {
 	// compressed-SEC1 hex. Checked in step 7 (key custody recovers the root and
 	// requires membership).
 	AcceptedKMSRootPubKeys map[string]struct{}
+
+	// allowUnpinned, set ONLY by UnpinnedPolicy(), opts into genuineness-only
+	// verification with no allow-listing. Unexported so no struct literal outside this
+	// package can select the fail-open path by accident; the constructor is the only door.
+	allowUnpinned bool
+}
+
+// IsPinned reports whether the policy pins at least one acceptance set. Any non-empty
+// set means VerifyReport runs at least one allow-list check (steps 5/7/9), so the
+// policy is not fail-open. AcceptedWorkloadIDs counts: a workload-ID-only policy is the
+// strictest pin (one exact keyset digest).
+func (p Policy) IsPinned() bool {
+	return len(p.AcceptedWorkloadIDs) > 0 ||
+		len(p.AcceptedSourceProvenance) > 0 ||
+		len(p.AcceptedAppIDs) > 0 ||
+		len(p.AcceptedKMSRootPubKeys) > 0
+}
+
+// UnpinnedPolicy returns a Policy that explicitly accepts any cryptographically genuine
+// report WITHOUT allow-listing a workload. This is a deliberate, greppable opt-out of
+// the fail-closed default; prefer a pinned Policy in production.
+func UnpinnedPolicy() Policy { return Policy{allowUnpinned: true} }
+
+// requireAcceptable is the shared fail-closed gate applied at every public aci entry
+// (New, VerifyReport): a policy that pins nothing and did not opt into unpinned mode is
+// rejected before any chain runs or network object exists.
+func (p Policy) requireAcceptable() error {
+	if !p.IsPinned() && !p.allowUnpinned {
+		return &UnpinnedPolicyError{}
+	}
+	return nil
 }

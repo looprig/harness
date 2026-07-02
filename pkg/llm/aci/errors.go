@@ -2,9 +2,13 @@
 // confidential-inference protocol. This file defines the attestation failure
 // reasons and the typed errors the package returns.
 //
-// Every attestation failure is reported as the provider-neutral, fail-closed
-// *llm.AttestationError (defined in pkg/llm). This package does not introduce a
-// new exported error type; it supplies the reason strings and thin constructors.
+// Every attestation-chain failure is reported as the provider-neutral,
+// fail-closed *llm.AttestationError (defined in pkg/llm); for those this package
+// only supplies the reason strings and thin constructors. The one exported error
+// type it does introduce is UnpinnedPolicyError, which is deliberately NOT an
+// *llm.AttestationError: it is a pre-attestation configuration refusal (the
+// supplied Policy pins nothing) raised before any chain runs, not an attestation
+// result.
 package aci
 
 import "github.com/ciram-co/looprig/pkg/llm"
@@ -53,6 +57,17 @@ type apiVersionMismatchError struct {
 
 func (e *apiVersionMismatchError) Error() string {
 	return "api_version " + e.Got + " is not supported, want " + e.Want
+}
+
+// UnpinnedPolicyError is returned by the public aci entry points when a Policy
+// pins no acceptance set and did not explicitly opt into unpinned mode via
+// UnpinnedPolicy(). Fail-secure: attestation refuses to run allow-list-free
+// unless the caller asks for it. Like apiVersionMismatchError it uses a pointer
+// receiver and is returned as *UnpinnedPolicyError so callers can errors.As it.
+type UnpinnedPolicyError struct{}
+
+func (e *UnpinnedPolicyError) Error() string {
+	return "aci: policy pins no acceptance set; supply a pinned Policy or aci.UnpinnedPolicy() to opt out"
 }
 
 // errUnsupportedAPIVersion reports a report whose api_version is not
