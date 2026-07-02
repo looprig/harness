@@ -94,6 +94,21 @@ func (s *server) putSession(id uuid.UUID, e *sessionEntry) {
 	s.sessions[id] = e
 }
 
+// putSessionIfAbsent registers e under id only if no session is already live for
+// id, reporting whether it did. It is the fail-secure guard against a client-
+// controlled resume id silently overwriting (and orphaning the agent+supervisor
+// of) a live session: create rejects a collision rather than leaking the prior
+// entry. Mutex-guarded; it performs no agent/supervisor call under s.mu.
+func (s *server) putSessionIfAbsent(id uuid.UUID, e *sessionEntry) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, exists := s.sessions[id]; exists {
+		return false
+	}
+	s.sessions[id] = e
+	return true
+}
+
 // deleteSession removes and returns the entry for id so the caller can stop the
 // supervisor and close the agent OUTSIDE the lock. Mutex-guarded; it performs no
 // teardown itself, precisely so no agent/supervisor call happens under s.mu.

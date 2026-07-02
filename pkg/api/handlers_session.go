@@ -37,6 +37,7 @@ const (
 	msgInvalidSessionID = "invalid session id"
 	msgInvalidResumeID  = "invalid resume session id"
 	msgCreateFailed     = "could not create session"
+	msgSessionExists    = "session already exists"
 	msgInterruptFailed  = "could not interrupt session"
 	msgSessionNotFound  = "session not found"
 )
@@ -123,7 +124,20 @@ func (s *server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.putSession(req.SessionID, &sessionEntry{agent: agent, sup: sup})
+	entry := &sessionEntry{agent: agent, sup: sup}
+	if !s.putSessionIfAbsent(req.SessionID, entry) {
+		// A session with this id is already live (a client-supplied ?resume=<sid>
+		// that collides). Never overwrite the live entry — tear down what we just
+		// built (OFF-lock) so it is not orphaned, and refuse with 409.
+		if sErr := sup.stop(); sErr != nil {
+			slog.Error("api: create stop supervisor after id collision", "err", sErr)
+		}
+		if cErr := agent.Close(r.Context()); cErr != nil {
+			slog.Error("api: create close agent after id collision", "err", cErr)
+		}
+		writeError(w, http.StatusConflict, msgSessionExists)
+		return
+	}
 	writeJSON(w, http.StatusCreated, sidResponse{SID: req.SessionID.String()})
 }
 

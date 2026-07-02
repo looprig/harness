@@ -355,3 +355,66 @@ func putInterruptSession(t *testing.T, s *server, id uuid.UUID, fa *fakeAgent) s
 	s.putSession(id, &sessionEntry{agent: fa, sup: sup})
 	return "/sessions/" + id.String() + "/interrupt"
 }
+
+// TestCreateSession_ResumeAlreadyLive_409 proves the fail-secure guard against a
+// client-controlled ?resume=<sid> that collides with a LIVE session: create must
+// refuse with 409 WITHOUT overwriting (and thus orphaning) the existing agent+
+// supervisor, and it must tear down the resources it just built so they do not
+// leak. It registers an original live session, then resumes its id and asserts the
+// original is untouched while the just-built agent was Closed.
+func TestCreateSession_ResumeAlreadyLive_409(t *testing.T) {
+	t.Parallel()
+
+	sid := mkID(0x5A)
+
+	// The original, live session that must survive the colliding resume untouched.
+	fa1 := &fakeAgent{sub: newFakeSub()}
+	sup1, err := newSupervisor(fa1)
+	if err != nil {
+		t.Fatalf("newSupervisor(original) error = %v", err)
+	}
+
+	// The factory hands back a DISTINCT agent the create handler builds on the
+	// resume path; on the collision it must be torn down, never registered.
+	fa2 := &fakeAgent{sub: newFakeSub()}
+	factory := func(_ context.Context, _ AgentRequest) (Agent, error) { return fa2, nil }
+
+	s := newServer(Config{}, factory)
+	if !s.putSessionIfAbsent(sid, &sessionEntry{agent: fa1, sup: sup1}) {
+		t.Fatalf("putSessionIfAbsent(original) = false, want true")
+	}
+	ts := httptest.NewServer(s.handler())
+	defer ts.Close()
+	t.Cleanup(func() { stopAll(s) })
+
+	resp := doReq(t, ts, http.MethodPost, "/sessions?resume="+sid.String())
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("resume of a live session status = %d, want 409", resp.StatusCode)
+	}
+
+	// The live session was NOT overwritten: the registry still holds the original.
+	entry, ok := s.getSession(sid)
+	if !ok {
+		t.Fatal("original session evicted by a colliding resume; want it preserved")
+	}
+	if entry.agent != fa1 {
+		t.Error("registry entry replaced by the colliding resume; want the original agent")
+	}
+	// The original is untouched: not closed, supervisor still running.
+	if fa1.wasClosed() {
+		t.Error("original agent was closed by a colliding resume; want it untouched")
+	}
+	select {
+	case <-sup1.done:
+		t.Error("original supervisor stopped by a colliding resume; want it running")
+	default:
+	}
+	// The just-built resources were torn down (not leaked). The handler joins the
+	// supervisor stop + agent Close synchronously before writing 409, so this is
+	// settled by the time the response arrives.
+	if !fa2.wasClosed() {
+		t.Error("the just-built agent was not closed on collision; it would leak")
+	}
+}

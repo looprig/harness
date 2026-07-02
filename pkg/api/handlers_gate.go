@@ -150,6 +150,7 @@ func (s *server) handleInput(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if len(blocks) == 0 {
+		slog.Warn("api: input rejected empty blocks")
 		writeError(w, http.StatusBadRequest, msgInvalidInput)
 		return
 	}
