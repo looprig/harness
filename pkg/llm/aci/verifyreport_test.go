@@ -36,7 +36,7 @@ const (
 // repo_commit} source provenance, and its recovered KMS root, with an empty
 // AcceptedWorkloadIDs (step 9 skipped by default). These generic chain tests need
 // *a* valid policy for the fixture, not the shipped provider preset — the pinned
-// production Phala anchors now live in pkg/llm/providers/phala (phala.DefaultPolicy).
+// production Phala anchors are supplied by the consumer (swe), not the SDK.
 // It draws the values from the same fixture-derived constants the per-step tests
 // use (fixtureAppIDHex, fixtureRepoURL/fixtureRepoCommit, fixtureKMSRoot), so a
 // drift in the fixture is still caught, and it returns a fresh value each call so

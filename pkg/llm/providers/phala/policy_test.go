@@ -10,88 +10,16 @@ import (
 	"github.com/ciram-co/looprig/pkg/llm/providers/phala"
 )
 
-// This file tests the Phala provider preset: DefaultPolicy's pinned,
-// fixture-derived trust anchors and the New constructor's fail-closed credential
-// contract. The pinned values are re-pinned here as independent literals (NOT read
-// back from the package under test) so a drift between the shipped constants and
-// the expected values is caught — the same drift-detection the aci per-step tests
-// give against the fixture (rtmr_test.go / keys_test.go).
-//
-// Blocker #3 reminder: every DefaultPolicy anchor is recovered from the aci/1
-// fixture and NOT yet externally confirmed against a published Phala/Dstack
-// source. These tests pin the CURRENT values; they are not an endorsement of their
-// production trustworthiness.
+// This file tests the Phala provider's New constructor: its fail-closed credential
+// contract, its empty-baseURL self-default, and its forwarding of the caller's
+// acceptance Policy into aci. The package ships no pinned trust anchors; the caller
+// supplies the Policy, so these tests build a minimal pinned policy inline
+// (testPinnedPolicy) to exercise construction/forwarding.
 
-// The expected pinned anchors, as independent literals (see file doc).
-const (
-	wantAppID              = "fdb7a14e5a6675f752e2cb69c9067a98ca402918"
-	wantRepoURL            = "https://github.com/Dstack-TEE/private-ai-gateway.git"
-	wantRepoCommit         = "1b43f76e43c2459856faebe9cd97d8e01cb0df0c"
-	wantRepoCommitDeployed = "e776e9cf1f9c2d61730da5d2f4b717e49041da0d"
-	wantKMSRoot            = "0334c76e0c3f52ec64cbf9bbf5c910c272330166fd656c0a86bb330963e46910e1"
-)
-
-// TestDefaultPolicyAnchors asserts DefaultPolicy pins exactly the fixture-derived
-// app-id, source-provenance, and KMS-root anchors, and leaves AcceptedWorkloadIDs
-// empty (aci step 9 skipped by default — the keyset, and thus workload_id,
-// rotates; trust is anchored by app-id + provenance + KMS custody).
-func TestDefaultPolicyAnchors(t *testing.T) {
-	t.Parallel()
-	p := phala.DefaultPolicy()
-
-	// app-id: exactly the one fixture anchor, in lowercase-hex form.
-	if len(p.AcceptedAppIDs) != 1 {
-		t.Fatalf("AcceptedAppIDs has %d entries, want 1", len(p.AcceptedAppIDs))
-	}
-	if _, ok := p.AcceptedAppIDs[wantAppID]; !ok {
-		t.Errorf("AcceptedAppIDs missing fixture app-id %q", wantAppID)
-	}
-
-	// source-provenance: two accepted {repo_url, repo_commit} pairs — the
-	// fixture-audited commit and the live-deployed commit observed at Task 6.1
-	// (both attest to the same workload_keyset_digest).
-	if len(p.AcceptedSourceProvenance) != 2 {
-		t.Fatalf("AcceptedSourceProvenance has %d entries, want 2", len(p.AcceptedSourceProvenance))
-	}
-	wantProv := aci.ProvenanceKey{RepoURL: wantRepoURL, RepoCommit: wantRepoCommit}
-	if _, ok := p.AcceptedSourceProvenance[wantProv]; !ok {
-		t.Errorf("AcceptedSourceProvenance missing fixture provenance %+v", wantProv)
-	}
-	wantProvDeployed := aci.ProvenanceKey{RepoURL: wantRepoURL, RepoCommit: wantRepoCommitDeployed}
-	if _, ok := p.AcceptedSourceProvenance[wantProvDeployed]; !ok {
-		t.Errorf("AcceptedSourceProvenance missing live-deployed provenance %+v", wantProvDeployed)
-	}
-
-	// KMS root: exactly the one fixture-recovered compressed-SEC1 hex (blocker #3).
-	if len(p.AcceptedKMSRootPubKeys) != 1 {
-		t.Fatalf("AcceptedKMSRootPubKeys has %d entries, want 1", len(p.AcceptedKMSRootPubKeys))
-	}
-	if _, ok := p.AcceptedKMSRootPubKeys[wantKMSRoot]; !ok {
-		t.Errorf("AcceptedKMSRootPubKeys missing fixture KMS root %q", wantKMSRoot)
-	}
-
-	// workload_id: empty by design (step 9 skipped by default).
-	if len(p.AcceptedWorkloadIDs) != 0 {
-		t.Errorf("AcceptedWorkloadIDs = %d entries, want 0 (empty by design)", len(p.AcceptedWorkloadIDs))
-	}
-}
-
-// TestDefaultPolicyIsCopy asserts DefaultPolicy returns an independent value each
-// call: mutating one returned policy's maps must not leak into the next, so a
-// caller that narrows a policy cannot corrupt the package default.
-func TestDefaultPolicyIsCopy(t *testing.T) {
-	t.Parallel()
-	a := phala.DefaultPolicy()
-	a.AcceptedWorkloadIDs["sha256:tampered"] = struct{}{}
-	delete(a.AcceptedAppIDs, wantAppID)
-
-	b := phala.DefaultPolicy()
-	if _, ok := b.AcceptedWorkloadIDs["sha256:tampered"]; ok {
-		t.Errorf("DefaultPolicy() AcceptedWorkloadIDs shares state across calls")
-	}
-	if _, ok := b.AcceptedAppIDs[wantAppID]; !ok {
-		t.Errorf("DefaultPolicy() AcceptedAppIDs shares state across calls (lost fixture app-id)")
-	}
+// testPinnedPolicy builds a minimal pinned aci.Policy for construction/forwarding
+// tests. The app-id is a fixture-derived value used ONLY as test input.
+func testPinnedPolicy() aci.Policy {
+	return aci.Policy{AcceptedAppIDs: map[string]struct{}{"fdb7a14e5a6675f752e2cb69c9067a98ca402918": {}}}
 }
 
 // TestNew pins the constructor's fail-closed credential contract AND its two
@@ -114,10 +42,10 @@ func TestNew(t *testing.T) {
 		wantAuthErr  bool // expect *llm.AuthRequiredError
 		wantUnpinned bool // expect *aci.UnpinnedPolicyError
 	}{
-		{name: "empty key rejected fail-closed", baseURL: "https://inference.phala.com", key: "", policy: phala.DefaultPolicy(), wantErr: true, wantAuthErr: true},
-		{name: "non-empty key builds client", baseURL: "https://inference.phala.com", key: "sk-live-xyz", policy: phala.DefaultPolicy(), wantErr: false},
-		{name: "empty key rejected even with empty baseURL", baseURL: "", key: "", policy: phala.DefaultPolicy(), wantErr: true, wantAuthErr: true},
-		{name: "empty baseURL self-defaults with valid key", baseURL: "", key: "sk-live-xyz", policy: phala.DefaultPolicy(), wantErr: false},
+		{name: "empty key rejected fail-closed", baseURL: "https://inference.phala.com", key: "", policy: testPinnedPolicy(), wantErr: true, wantAuthErr: true},
+		{name: "non-empty key builds client", baseURL: "https://inference.phala.com", key: "sk-live-xyz", policy: testPinnedPolicy(), wantErr: false},
+		{name: "empty key rejected even with empty baseURL", baseURL: "", key: "", policy: testPinnedPolicy(), wantErr: true, wantAuthErr: true},
+		{name: "empty baseURL self-defaults with valid key", baseURL: "", key: "sk-live-xyz", policy: testPinnedPolicy(), wantErr: false},
 		{name: "unpinned policy forwarded as typed error", baseURL: "https://inference.phala.com", key: "sk-live-xyz", policy: aci.Policy{}, wantErr: true, wantUnpinned: true},
 	}
 
