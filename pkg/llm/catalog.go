@@ -21,6 +21,28 @@ func ChutesKimiK2() Model {
 	}
 }
 
+// LMStudioLocal returns a Model for a local LM Studio server at its default
+// loopback endpoint. LM Studio speaks the OpenAI-compatible dialect and needs no
+// credentials (Provider.RequiredAuth → AuthNone). Unlike the former lmstudio.New,
+// the generic transport client demands an explicit, Validate-passing BaseURL, so
+// the default localhost endpoint is materialized here — the http:// loopback host
+// is permitted by Validate's loopback exception. Capabilities are conservative:
+// tool-calling is commonly supported by local OpenAI-compatible servers, while
+// image input and hidden thinking are model-specific and left false. Returned by
+// value so callers cannot mutate shared catalog state.
+func LMStudioLocal(name string) Model {
+	return Model{
+		Provider:  ProviderLMStudio,
+		APIFormat: APIFormatOpenAI,
+		BaseURL:   "http://localhost:1234/v1",
+		Name:      name,
+		Origin:    OriginCatalog,
+		Caps: Capabilities{
+			Tools: true,
+		},
+	}
+}
+
 // GLM46Phala returns the zai-org/GLM-4.6 model definition served through Phala's
 // TEE-attested OpenAI-compatible gateway. Returned by value so callers cannot
 // mutate shared catalog state.

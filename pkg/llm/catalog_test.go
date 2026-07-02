@@ -84,3 +84,34 @@ func TestCatalogModels(t *testing.T) {
 		})
 	}
 }
+
+// TestLMStudioLocal covers the local LM Studio row separately from the key-requiring
+// rows above: it is credential-free (RequiredAuth → AuthNone) and — critically for
+// the generic transport client that replaced lmstudio.New — passes Validate with its
+// explicit http:// loopback BaseURL (permitted by Validate's loopback exception).
+func TestLMStudioLocal(t *testing.T) {
+	t.Parallel()
+	m := llm.LMStudioLocal("qwen")
+	if m.Provider != llm.ProviderLMStudio {
+		t.Errorf("Provider = %q, want %q", m.Provider, llm.ProviderLMStudio)
+	}
+	if m.APIFormat != llm.APIFormatOpenAI {
+		t.Errorf("APIFormat = %q, want %q", m.APIFormat, llm.APIFormatOpenAI)
+	}
+	if m.BaseURL != "http://localhost:1234/v1" {
+		t.Errorf("BaseURL = %q, want %q", m.BaseURL, "http://localhost:1234/v1")
+	}
+	if m.Name != "qwen" {
+		t.Errorf("Name = %q, want %q", m.Name, "qwen")
+	}
+	if m.Origin != llm.OriginCatalog {
+		t.Errorf("Origin = %v, want catalog", m.Origin)
+	}
+	kind, err := m.Provider.RequiredAuth()
+	if err != nil || kind != llm.AuthNone {
+		t.Errorf("RequiredAuth() = (%v, %v), want (none, nil)", kind, err)
+	}
+	if err := m.Validate(); err != nil {
+		t.Errorf("Validate() on LM Studio row = %v, want nil", err)
+	}
+}
