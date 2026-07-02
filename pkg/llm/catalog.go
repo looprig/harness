@@ -43,6 +43,78 @@ func LMStudioLocal(name string) Model {
 	}
 }
 
+// OpenRouter returns a Model for OpenRouter's OpenAI-compatible aggregation gateway.
+// OpenRouter fronts many upstream models behind one OpenAI-format API and one Bearer
+// key (Provider.RequiredAuth → AuthAPIKey), so APIFormat is APIFormatOpenAI and name
+// is the OpenRouter model slug (e.g. "anthropic/claude-3.5-sonnet") sent verbatim on
+// every request. Capabilities are conservative — tool-calling is broadly available,
+// while image input and hidden thinking are model-specific and left false. Returned
+// by value so callers cannot mutate shared catalog state.
+func OpenRouter(name string) Model {
+	return Model{
+		Provider:  ProviderOpenRouter,
+		APIFormat: APIFormatOpenAI,
+		BaseURL:   "https://openrouter.ai/api/v1",
+		Name:      name,
+		Origin:    OriginCatalog,
+		Caps: Capabilities{
+			Tools: true,
+		},
+	}
+}
+
+// ClaudeOnBedrock returns a Model for Anthropic Claude served through AWS Bedrock
+// Runtime. Bedrock is region-routed: the endpoint host is derived from the AWS
+// region by bedrock.New, so BaseURL is empty (permitted for ProviderBedrock by
+// Model.Validate). name is the Bedrock model id sent in the request path (e.g.
+// "anthropic.claude-3-5-sonnet-20241022-v2:0", whose ":" the SigV4 signer encodes
+// into the canonical URI). APIFormat is Anthropic (the implemented codec); the
+// body is the Anthropic Messages body minus "model" plus "anthropic_version",
+// which bedrock.New's client produces. Credentials are AWS SigV4 (RequiredAuth ->
+// AuthSigV4), never a bearer key. Capabilities are conservative: Claude on Bedrock
+// is tool- and image-capable; hidden thinking is model-version-specific and left
+// off (fail-safe — the codec then never emits a thinking field). Returned by value
+// so callers cannot mutate shared catalog state.
+func ClaudeOnBedrock(name string) Model {
+	return Model{
+		Provider:  ProviderBedrock,
+		APIFormat: APIFormatAnthropic,
+		BaseURL:   "", // region-routed; bedrock.New derives the endpoint from the region
+		Name:      name,
+		Origin:    OriginCatalog,
+		Caps: Capabilities{
+			MaxContext:    200_000,
+			Tools:         true,
+			AcceptsImages: true,
+		},
+	}
+}
+
+// GeminiFlash returns the Google Gemini 2.5 Flash model served through Google's
+// generateContent API. Provider is ProviderGoogle (auth is an x-goog-api-key
+// header, RequiredAuth → AuthAPIKey) and APIFormat is APIFormatGemini — the two
+// axes are kept distinct: the backend is "google", the wire dialect is "gemini".
+// Name is the model id sent in the request path (…/models/<name>:generateContent).
+// BaseURL is the v1beta generateContent root, which the bespoke providers/gemini
+// client binds. Gemini 2.5 Flash is tool-, image-, and thinking-capable with a
+// ~1M-token context. Returned by value so callers cannot mutate shared catalog
+// state.
+func GeminiFlash() Model {
+	return Model{
+		Provider:  ProviderGoogle,
+		APIFormat: APIFormatGemini,
+		BaseURL:   "https://generativelanguage.googleapis.com/v1beta",
+		Name:      "gemini-2.5-flash",
+		Origin:    OriginCatalog,
+		Caps: Capabilities{
+			MaxContext:    1_000_000,
+			Tools:         true,
+			AcceptsImages: true,
+			Thinking:      true,
+		},
+	}
+}
+
 // GLM46Phala returns the zai-org/GLM-4.6 model definition served through Phala's
 // TEE-attested OpenAI-compatible gateway. Returned by value so callers cannot
 // mutate shared catalog state.

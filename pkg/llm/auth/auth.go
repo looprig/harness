@@ -4,6 +4,7 @@ package auth
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"net/http"
 
@@ -34,6 +35,16 @@ func (headerAuth) String() string { return "auth.headerAuth(REDACTED)" }
 
 // LogValue redacts the credential for slog structured logging.
 func (headerAuth) LogValue() slog.Value { return slog.StringValue("REDACTED") }
+
+// GoString redacts the credential under the %#v verb (fmt.GoStringer) so even
+// Go-syntax debug formatting never exposes the secret header value.
+func (headerAuth) GoString() string { return "auth.headerAuth(REDACTED)" }
+
+var (
+	_ fmt.Stringer   = headerAuth{}
+	_ fmt.GoStringer = headerAuth{}
+	_ slog.LogValuer = headerAuth{}
+)
 
 // Key returns an Authenticator that sets "Authorization: Bearer <k>".
 func Key(k APIKey) llm.Authenticator {

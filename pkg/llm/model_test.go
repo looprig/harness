@@ -86,6 +86,21 @@ func TestModel_Validate(t *testing.T) {
 			wantErr: true,
 		},
 		{
+			name:    "valid bedrock anthropic empty baseurl (region-routed)",
+			model:   llm.Model{Provider: llm.ProviderBedrock, APIFormat: llm.APIFormatAnthropic, BaseURL: "", Name: "anthropic.claude-3-5-sonnet-20241022-v2:0"},
+			wantErr: false,
+		},
+		{
+			name:    "valid bedrock with explicit https baseurl still validates",
+			model:   llm.Model{Provider: llm.ProviderBedrock, APIFormat: llm.APIFormatAnthropic, BaseURL: "https://bedrock-runtime.us-east-1.amazonaws.com", Name: "anthropic.claude-3-5-sonnet-20241022-v2:0"},
+			wantErr: false,
+		},
+		{
+			name:    "error bedrock with non-loopback http baseurl (exception is empty-only)",
+			model:   llm.Model{Provider: llm.ProviderBedrock, APIFormat: llm.APIFormatAnthropic, BaseURL: "http://evil.example.com", Name: "m"},
+			wantErr: true,
+		},
+		{
 			name:    "error empty name",
 			model:   llm.Model{Provider: llm.ProviderChutes, APIFormat: llm.APIFormatOpenAI, BaseURL: "https://api.chutes.ai", Name: ""},
 			wantErr: true,

@@ -63,6 +63,7 @@ func TestAuthenticatorRedactsSecret(t *testing.T) {
 				fmt.Sprintf("%v", tt.a),
 				fmt.Sprintf("%+v", tt.a),
 				fmt.Sprintf("%s", tt.a),
+				fmt.Sprintf("%#v", tt.a),
 			} {
 				if strings.Contains(s, secret) {
 					t.Errorf("formatted authenticator leaked secret: %q", s)
