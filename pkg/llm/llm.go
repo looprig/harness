@@ -13,16 +13,6 @@ type LLM interface {
 	Stream(ctx context.Context, req Request) (*StreamReader[content.Chunk], error)
 }
 
-// ReasoningEffort selects o-series inference intensity. Zero value = disabled.
-// Silently ignored by providers that do not support it.
-type ReasoningEffort string
-
-const (
-	ReasoningEffortLow    ReasoningEffort = "low"
-	ReasoningEffortMedium ReasoningEffort = "medium"
-	ReasoningEffortHigh   ReasoningEffort = "high"
-)
-
 // Provider names the concrete backend an internal/llm/auto factory dispatches on.
 // Unknown values are rejected by Model.Validate; auto.New additionally enforces
 // each provider's auth requirement.

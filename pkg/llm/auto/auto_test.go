@@ -24,7 +24,8 @@ func TestNew(t *testing.T) {
 		model       llm.Model
 		key         auth.APIKey
 		wantErr     bool
-		wantAuthReq bool // when wantErr: expect *llm.AuthRequiredError, else *llm.ValidationError
+		wantAuthReq bool   // when wantErr: expect *llm.AuthRequiredError, else *llm.ValidationError
+		wantField   string // when set (ValidationError path): assert ValidationError.Field
 	}{
 		{name: "phala with key", model: llm.GLM46Phala(), key: "k"},
 		{name: "chutes with key", model: llm.ChutesKimiK2(), key: "k"},
@@ -44,6 +45,16 @@ func TestNew(t *testing.T) {
 			model:   llm.CustomModel(llm.ProviderPhala, llm.APIFormatAnthropic, "https://api.phala.network/v1", "m"),
 			key:     "k",
 			wantErr: true,
+		},
+		{
+			// lmstudio legitimately supports the anthropic dialect (Validate passes),
+			// but auto has no anthropic codec yet, so it must fail closed at
+			// construction with a *llm.ValidationError rather than mis-encode as OpenAI.
+			name:      "lmstudio+anthropic fails closed (no codec)",
+			model:     llm.CustomModel(llm.ProviderLMStudio, llm.APIFormatAnthropic, "http://localhost:1234", "m"),
+			key:       "",
+			wantErr:   true,
+			wantField: "APIFormat",
 		},
 	}
 	for _, tt := range tests {
@@ -74,6 +85,9 @@ func TestNew(t *testing.T) {
 				var ve *llm.ValidationError
 				if !errors.As(err, &ve) {
 					t.Fatalf("err = %T, want *llm.ValidationError", err)
+				}
+				if tt.wantField != "" && ve.Field != tt.wantField {
+					t.Errorf("ValidationError.Field = %q, want %q", ve.Field, tt.wantField)
 				}
 				return
 			}

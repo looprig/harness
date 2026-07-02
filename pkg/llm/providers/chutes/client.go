@@ -45,6 +45,16 @@ const sessionTTL = 50 * time.Second
 //
 // A Client is safe for concurrent use: the model->chute and session caches are
 // guarded by mu.
+//
+// Connection-binding note (fail-safe asymmetry): unlike the generic
+// transport.Client — which binds one Endpoint and rejects a request whose
+// Model.Provider/BaseURL differs with a pre-I/O *llm.ModelMismatchError — this
+// client binds its gateway endpoints at construction (New's apiBase/llmBase) and
+// enforces model identity per request via NVIDIA TEE attestation. A
+// provider/endpoint mismatch therefore surfaces as an attestation failure
+// (attestation cannot bind to the wrong model/instance), not an
+// *llm.ModelMismatchError. This is fail-safe: the request is never sent when the
+// check fails; only the error type differs.
 type Client struct {
 	http    *http.Client
 	apiBase string // https://api.chutes.ai — e2e + evidence endpoints

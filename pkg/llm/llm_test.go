@@ -23,43 +23,6 @@ func (f *fakeLLM) Stream(_ context.Context, _ llm.Request) (*llm.StreamReader[co
 // compile-time interface check
 var _ llm.LLM = (*fakeLLM)(nil)
 
-func TestReasoningEffort_Constants(t *testing.T) {
-	t.Parallel()
-
-	cases := []struct {
-		name  string
-		value llm.ReasoningEffort
-		want  string
-	}{
-		{name: "Low", value: llm.ReasoningEffortLow, want: "low"},
-		{name: "Medium", value: llm.ReasoningEffortMedium, want: "medium"},
-		{name: "High", value: llm.ReasoningEffortHigh, want: "high"},
-	}
-
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-			if string(tc.value) != tc.want {
-				t.Errorf("ReasoningEffort%s = %q, want %q", tc.name, tc.value, tc.want)
-			}
-		})
-	}
-
-	// Distinctness check: all three constants must be mutually unique.
-	// Done outside parallel subtests to avoid a shared-map data race.
-	t.Run("all_distinct", func(t *testing.T) {
-		t.Parallel()
-		all := []llm.ReasoningEffort{llm.ReasoningEffortLow, llm.ReasoningEffortMedium, llm.ReasoningEffortHigh}
-		seen := make(map[llm.ReasoningEffort]bool, len(all))
-		for _, v := range all {
-			if seen[v] {
-				t.Errorf("duplicate ReasoningEffort value: %q", v)
-			}
-			seen[v] = true
-		}
-	})
-}
-
 func TestLLM_InterfaceCompliance(t *testing.T) {
 	t.Parallel()
 	// compile-time assertion is at the top of the file via var _ llm.LLM = (*fakeLLM)(nil).

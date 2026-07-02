@@ -44,7 +44,15 @@ func New(model llm.Model, key auth.APIKey) (llm.LLM, error) {
 	case llm.ProviderChutes:
 		return chutes.New(model.BaseURL, string(key)), nil
 	case llm.ProviderLMStudio:
-		return transport.New(openaiapi.Codec{}, transport.Endpoint{
+		// LM Studio (and any generic httpLLM) can conceptually speak either dialect,
+		// so supportsAPIFormat admits both — but auto only has an OpenAI codec today.
+		// Select the codec by the model's declared APIFormat and fail closed on any
+		// format with no codec, rather than silently mis-encoding as OpenAI.
+		codec, err := codecFor(model.APIFormat)
+		if err != nil {
+			return nil, err
+		}
+		return transport.New(codec, transport.Endpoint{
 			Provider: model.Provider,
 			BaseURL:  model.BaseURL,
 			ChatPath: transport.DefaultChatPath,
@@ -54,5 +62,20 @@ func New(model llm.Model, key auth.APIKey) (llm.LLM, error) {
 		// here, so this is unreachable for a validated model — but a permissive
 		// fall-through would fail open, so deny by default.
 		return nil, &llm.ValidationError{Field: "Provider", Reason: "unsupported provider"}
+	}
+}
+
+// codecFor selects the wire codec for a generic (transport-backed) provider by its
+// declared APIFormat. Model.Validate already admits every APIFormat the SDK knows,
+// and a provider may legitimately support a format auto cannot yet encode; codecFor
+// is the fail-closed boundary that turns "no codec implemented" into a typed
+// *llm.ValidationError at construction rather than a silent wrong-dialect encode.
+// Adding a new dialect (e.g. codec/anthropicapi) is one new case here.
+func codecFor(f llm.APIFormat) (llm.Codec, error) {
+	switch f {
+	case llm.APIFormatOpenAI:
+		return openaiapi.Codec{}, nil
+	default:
+		return nil, &llm.ValidationError{Field: "APIFormat", Reason: "no codec implemented for this API format yet"}
 	}
 }
