@@ -121,15 +121,22 @@ func defaultEndpoint(region string) string {
 
 // Invoke sends a non-streaming InvokeModel request and returns the decoded
 // Anthropic response. Ordered, all pre-I/O guards first: (1) provider binding,
-// (2) Model.Validate, (3) encode Anthropic body + rewrite to the Bedrock body,
-// (4) build the ctx-bound POST to the per-model path, (5) SigV4-sign, (6) do + map
-// transport/non-2xx failures, (7) decode the Anthropic response.
+// (2) Model.Validate, (3) API-format guard (Anthropic-only), (4) encode Anthropic
+// body + rewrite to the Bedrock body, (5) build the ctx-bound POST to the
+// per-model path, (6) SigV4-sign, (7) do + map transport/non-2xx failures,
+// (8) decode the Anthropic response.
 func (c *Client) Invoke(ctx context.Context, req llm.Request) (*llm.Response, error) {
 	if err := c.checkBinding(req.Model); err != nil {
 		return nil, err
 	}
 	if err := req.Model.Validate(); err != nil {
 		return nil, err
+	}
+	// supportsAPIFormat(bedrock) admits both Anthropic and Bedrock Converse, so a
+	// Converse Model passes Validate; this client only implements the Anthropic
+	// dialect, so fail closed rather than silently Anthropic-encode a Converse call.
+	if req.Model.APIFormat != llm.APIFormatAnthropic {
+		return nil, &UnsupportedAPIFormatError{APIFormat: req.Model.APIFormat}
 	}
 
 	anthropicBody, err := c.codec.EncodeRequest(req, llm.RequestModeInvoke)
@@ -203,14 +210,3 @@ func (c *Client) buildRequest(ctx context.Context, modelID string, body []byte) 
 	httpReq.Header.Set("Accept", contentTypeJSON)
 	return httpReq, nil
 }
-
-// RequestBuildError is a failure to CONSTRUCT the outbound HTTP request (a
-// malformed endpoint/URL), kept distinct from *llm.NetworkError (reserved for
-// transport failures out of hc.Do) so errors.As never misclassifies a config bug
-// as a transport fault. Unwrap exposes the net/http cause.
-type RequestBuildError struct {
-	Err error
-}
-
-func (e *RequestBuildError) Error() string { return "bedrock: build request: " + e.Err.Error() }
-func (e *RequestBuildError) Unwrap() error { return e.Err }

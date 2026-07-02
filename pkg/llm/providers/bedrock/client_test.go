@@ -246,10 +246,11 @@ func TestBedrockPreIOGuards(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		name       string
-		mutate     func(*llm.Request)
-		wantMM     bool
-		wantValErr bool
+		name               string
+		mutate             func(*llm.Request)
+		wantMM             bool
+		wantValErr         bool
+		wantUnsupportedFmt bool
 	}{
 		{
 			name:   "wrong provider is a model mismatch",
@@ -260,6 +261,14 @@ func TestBedrockPreIOGuards(t *testing.T) {
 			name:       "empty name fails validation",
 			mutate:     func(r *llm.Request) { r.Model.Name = "" },
 			wantValErr: true,
+		},
+		{
+			// Bedrock Converse passes Validate (supportsAPIFormat admits it) but this
+			// client only encodes the Anthropic dialect, so it must fail closed rather
+			// than silently Anthropic-encode a Converse request.
+			name:               "bedrock-converse format is unsupported (fail closed, not silent)",
+			mutate:             func(r *llm.Request) { r.Model.APIFormat = llm.APIFormatBedrockConverse },
+			wantUnsupportedFmt: true,
 		},
 	}
 
@@ -291,6 +300,15 @@ func TestBedrockPreIOGuards(t *testing.T) {
 				var ve *llm.ValidationError
 				if !errors.As(err, &ve) {
 					t.Fatalf("err = %T, want *llm.ValidationError", err)
+				}
+			}
+			if tt.wantUnsupportedFmt {
+				var uf *bedrock.UnsupportedAPIFormatError
+				if !errors.As(err, &uf) {
+					t.Fatalf("err = %T, want *bedrock.UnsupportedAPIFormatError", err)
+				}
+				if uf.APIFormat != llm.APIFormatBedrockConverse {
+					t.Errorf("UnsupportedAPIFormatError.APIFormat = %q, want %q", uf.APIFormat, llm.APIFormatBedrockConverse)
 				}
 			}
 			if called.Load() {

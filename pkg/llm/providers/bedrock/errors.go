@@ -1,6 +1,37 @@
 package bedrock
 
-import "fmt"
+import (
+	"fmt"
+
+	"github.com/ciram-co/looprig/pkg/llm"
+)
+
+// UnsupportedAPIFormatError is a fail-closed rejection, before any I/O, of a
+// request whose Model.APIFormat this client cannot honor. Provider.supportsAPIFormat
+// admits both APIFormatAnthropic and APIFormatBedrockConverse for Bedrock (so a
+// Converse Model passes Model.Validate), but this client implements only the
+// Anthropic-native dialect for now; a Converse codec is a documented follow-up.
+// Returning this — rather than silently Anthropic-encoding a Converse request —
+// keeps the client from "silently doing less" than its declared contract. Carries
+// the offending format so callers can branch via errors.As.
+type UnsupportedAPIFormatError struct {
+	APIFormat llm.APIFormat
+}
+
+func (e *UnsupportedAPIFormatError) Error() string {
+	return fmt.Sprintf("bedrock: API format %q is not implemented; this client encodes only the Anthropic dialect (%q)", e.APIFormat, llm.APIFormatAnthropic)
+}
+
+// RequestBuildError is a failure to CONSTRUCT the outbound HTTP request (a
+// malformed endpoint/URL), kept distinct from *llm.NetworkError (reserved for
+// transport failures out of hc.Do) so errors.As never misclassifies a config bug
+// as a transport fault. Unwrap exposes the net/http cause.
+type RequestBuildError struct {
+	Err error
+}
+
+func (e *RequestBuildError) Error() string { return "bedrock: build request: " + e.Err.Error() }
+func (e *RequestBuildError) Unwrap() error { return e.Err }
 
 // ConfigError is a fail-closed rejection of an invalid bedrock.New configuration:
 // an empty AWS region or empty SigV4 credentials. No Client is returned and no

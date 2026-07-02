@@ -303,11 +303,14 @@ func TestSigV4CredentialsRedaction(t *testing.T) {
 		SessionToken:    token,
 	}
 
-	// fmt verbs and String() must never leak the secret or session token.
+	// fmt verbs (incl. the Go-syntax %#v, covered by GoString) and String() must
+	// never leak the secret or session token.
 	for _, s := range []string{
 		fmt.Sprintf("%v", creds),
 		fmt.Sprintf("%+v", creds),
 		fmt.Sprintf("%v", &creds),
+		fmt.Sprintf("%#v", creds),
+		fmt.Sprintf("%#v", &creds),
 		creds.String(),
 	} {
 		if strings.Contains(s, secret) || strings.Contains(s, token) {
