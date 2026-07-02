@@ -2,15 +2,20 @@ package llm
 
 // RequiresKey reports whether the provider needs an API key, and errors on an
 // unknown provider so a newly added one must be classified here before it can be
-// used. Hosted providers (phala, chutes, openrouter) require a key; a local LM
-// Studio endpoint does not. A bare default-false would fail open — the bug this
-// method exists to prevent.
+// used. Hosted key providers (phala, chutes, openrouter, google) require a key; a
+// local LM Studio endpoint does not. A bare default-false would fail open — the
+// bug this method exists to prevent. This is the legacy boolean superseded by
+// RequiredAuth (which is the real gate and can express non-key auth like SigV4).
 func (p Provider) RequiresKey() (bool, error) {
 	switch p {
 	case ProviderLMStudio:
 		return false, nil
 	case ProviderPhala, ProviderChutes, ProviderOpenRouter, ProviderGoogle:
 		return true, nil
+	case ProviderBedrock:
+		// Bedrock authenticates with SigV4 credentials, not an API key; this legacy
+		// boolean cannot express that. RequiredAuth() is the real gate (AuthSigV4).
+		return false, nil
 	default:
 		return false, &ValidationError{Field: "Provider", Reason: "unknown provider; API-key policy undefined"}
 	}

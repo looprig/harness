@@ -20,6 +20,7 @@ func TestProviderRequiresKey(t *testing.T) {
 		{name: "chutes requires key", provider: llm.ProviderChutes, want: true, wantErr: false},
 		{name: "openrouter requires key", provider: llm.ProviderOpenRouter, want: true, wantErr: false},
 		{name: "google requires key", provider: llm.ProviderGoogle, want: true, wantErr: false},
+		{name: "bedrock uses sigv4 not api key", provider: llm.ProviderBedrock, want: false, wantErr: false},
 		{name: "unknown errors", provider: llm.Provider("bogus"), want: false, wantErr: true},
 		{name: "empty errors", provider: llm.Provider(""), want: false, wantErr: true},
 	}
