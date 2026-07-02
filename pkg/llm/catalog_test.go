@@ -43,6 +43,17 @@ func TestCatalogModels(t *testing.T) {
 			wantThinking: true,
 			wantImages:   false,
 		},
+		{
+			name:         "gemini 2.5 flash",
+			model:        llm.GeminiFlash(),
+			wantProvider: llm.ProviderGoogle,
+			wantFormat:   llm.APIFormatGemini,
+			wantBaseURL:  "https://generativelanguage.googleapis.com/v1beta",
+			wantName:     "gemini-2.5-flash",
+			wantTools:    true,
+			wantThinking: true,
+			wantImages:   true,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

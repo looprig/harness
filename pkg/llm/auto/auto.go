@@ -15,6 +15,7 @@ import (
 	"github.com/ciram-co/looprig/pkg/llm/codec/gemini"
 	"github.com/ciram-co/looprig/pkg/llm/codec/openaiapi"
 	"github.com/ciram-co/looprig/pkg/llm/providers/chutes"
+	geminiprovider "github.com/ciram-co/looprig/pkg/llm/providers/gemini"
 	"github.com/ciram-co/looprig/pkg/llm/providers/phala"
 	"github.com/ciram-co/looprig/pkg/llm/transport"
 )
@@ -74,6 +75,13 @@ func New(model llm.Model, key auth.APIKey) (llm.LLM, error) {
 		// fail-closed empty-key guard above (RequiredAuth → AuthAPIKey) already rejected a
 		// missing key, so key is present here; wrap it as Bearer auth.
 		return genericHTTP(model, auth.Key(key))
+	case llm.ProviderGoogle:
+		// Google's Gemini generateContent API is not plain codec-over-HTTP (per-model
+		// ":generateContent" path + an x-goog-api-key header), so it uses the bespoke
+		// providers/gemini client rather than genericHTTP. The empty-key guard above
+		// (RequiredAuth → AuthAPIKey) already rejected a missing key; gemini.New re-checks
+		// and fails closed on empty regardless.
+		return geminiprovider.New(key)
 	case llm.ProviderBedrock:
 		// Bedrock's RequiredAuth is AuthSigV4, so the empty-APIKey guard above does not
 		// fire and control reaches here. auto.New's only credential is an auth.APIKey,

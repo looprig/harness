@@ -90,6 +90,31 @@ func ClaudeOnBedrock(name string) Model {
 	}
 }
 
+// GeminiFlash returns the Google Gemini 2.5 Flash model served through Google's
+// generateContent API. Provider is ProviderGoogle (auth is an x-goog-api-key
+// header, RequiredAuth → AuthAPIKey) and APIFormat is APIFormatGemini — the two
+// axes are kept distinct: the backend is "google", the wire dialect is "gemini".
+// Name is the model id sent in the request path (…/models/<name>:generateContent).
+// BaseURL is the v1beta generateContent root, which the bespoke providers/gemini
+// client binds. Gemini 2.5 Flash is tool-, image-, and thinking-capable with a
+// ~1M-token context. Returned by value so callers cannot mutate shared catalog
+// state.
+func GeminiFlash() Model {
+	return Model{
+		Provider:  ProviderGoogle,
+		APIFormat: APIFormatGemini,
+		BaseURL:   "https://generativelanguage.googleapis.com/v1beta",
+		Name:      "gemini-2.5-flash",
+		Origin:    OriginCatalog,
+		Caps: Capabilities{
+			MaxContext:    1_000_000,
+			Tools:         true,
+			AcceptsImages: true,
+			Thinking:      true,
+		},
+	}
+}
+
 // GLM46Phala returns the zai-org/GLM-4.6 model definition served through Phala's
 // TEE-attested OpenAI-compatible gateway. Returned by value so callers cannot
 // mutate shared catalog state.

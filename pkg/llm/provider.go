@@ -9,7 +9,7 @@ func (p Provider) RequiresKey() (bool, error) {
 	switch p {
 	case ProviderLMStudio:
 		return false, nil
-	case ProviderPhala, ProviderChutes, ProviderOpenRouter:
+	case ProviderPhala, ProviderChutes, ProviderOpenRouter, ProviderGoogle:
 		return true, nil
 	default:
 		return false, &ValidationError{Field: "Provider", Reason: "unknown provider; API-key policy undefined"}
@@ -30,6 +30,9 @@ func (p Provider) supportsAPIFormat(f APIFormat) bool {
 		// implemented codec); the native Bedrock Converse dialect is reserved for a
 		// future codec but is a legitimate Bedrock format, so both are admitted here.
 		return f == APIFormatAnthropic || f == APIFormatBedrockConverse
+	case ProviderGoogle:
+		// Google's generateContent backend speaks only the Gemini dialect.
+		return f == APIFormatGemini
 	default:
 		return false
 	}
@@ -42,7 +45,7 @@ func (p Provider) RequiredAuth() (AuthKind, error) {
 	switch p {
 	case ProviderLMStudio:
 		return AuthNone, nil
-	case ProviderPhala, ProviderChutes, ProviderOpenRouter:
+	case ProviderPhala, ProviderChutes, ProviderOpenRouter, ProviderGoogle:
 		return AuthAPIKey, nil
 	case ProviderBedrock:
 		// Bedrock authenticates with AWS SigV4, not a bearer API key; auto.New cannot

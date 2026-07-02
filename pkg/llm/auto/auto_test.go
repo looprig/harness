@@ -11,6 +11,7 @@ import (
 	"github.com/ciram-co/looprig/pkg/llm/codec/gemini"
 	"github.com/ciram-co/looprig/pkg/llm/codec/openaiapi"
 	"github.com/ciram-co/looprig/pkg/llm/providers/chutes"
+	geminiprovider "github.com/ciram-co/looprig/pkg/llm/providers/gemini"
 	"github.com/ciram-co/looprig/pkg/llm/transport"
 )
 
@@ -33,11 +34,13 @@ func TestNew(t *testing.T) {
 		{name: "phala with key", model: llm.GLM46Phala(), key: "k"},
 		{name: "chutes with key", model: llm.ChutesKimiK2(), key: "k"},
 		{name: "openrouter with key", model: llm.OpenRouter("x"), key: "sk-or-key"},
+		{name: "google with key", model: llm.GeminiFlash(), key: "AIza-k"},
 		{name: "lmstudio without key (AuthNone)", model: llm.LMStudioLocal("qwen"), key: ""},
 		{name: "lmstudio ignores a supplied key", model: llm.LMStudioLocal("qwen"), key: "k"},
 		{name: "phala empty key fails closed", model: llm.GLM46Phala(), key: "", wantErr: true, wantAuthReq: true},
 		{name: "chutes empty key fails closed", model: llm.ChutesKimiK2(), key: "", wantErr: true, wantAuthReq: true},
 		{name: "openrouter empty key fails closed", model: llm.OpenRouter("x"), key: "", wantErr: true, wantAuthReq: true},
+		{name: "google empty key fails closed", model: llm.GeminiFlash(), key: "", wantErr: true, wantAuthReq: true},
 		{
 			name:    "unknown provider rejected before dispatch",
 			model:   llm.Model{Provider: "nope", APIFormat: llm.APIFormatOpenAI, BaseURL: "https://x.example.test", Name: "m"},
@@ -170,6 +173,12 @@ func TestNewConcreteTypes(t *testing.T) {
 			model: llm.OpenRouter("x"), key: "sk-or-key",
 			is:   func(l llm.LLM) bool { _, ok := l.(*transport.Client); return ok },
 			want: "*transport.Client",
+		},
+		{
+			name:  "google wires the bespoke gemini client",
+			model: llm.GeminiFlash(), key: "AIza-k",
+			is:   func(l llm.LLM) bool { _, ok := l.(*geminiprovider.Client); return ok },
+			want: "*geminiprovider.Client",
 		},
 	}
 	for _, tt := range tests {

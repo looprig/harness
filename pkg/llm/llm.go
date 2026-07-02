@@ -24,6 +24,12 @@ const (
 	ProviderChutes     Provider = "chutes"
 	ProviderOpenRouter Provider = "openrouter"
 	ProviderBedrock    Provider = "bedrock"
+	// ProviderGoogle is Google's Gemini generateContent backend. The provider (the
+	// backend "google") and the dialect (APIFormatGemini) are distinct axes: google
+	// speaks only the Gemini wire format, authenticated with an x-goog-api-key header
+	// (RequiredAuth → AuthAPIKey), and is served by the bespoke providers/gemini
+	// client (the generic transport assumes a static /chat/completions path).
+	ProviderGoogle Provider = "google"
 )
 
 // Request is the provider-neutral inference request. It carries a secret-free
