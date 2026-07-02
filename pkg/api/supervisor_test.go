@@ -98,9 +98,9 @@ func (s *fakeSub) fail(err error) {
 
 // fakeAgent implements the full api.Agent interface. Subscribe carries behavior
 // (hands back the injected sub or a forced error) for the supervisor; Interrupt
-// and Close carry behavior for the session-lifecycle endpoints (interrupt returns
-// the injected result/err; Close records that it ran). The remaining methods are
-// inert stubs.
+// and Close carry behavior for the session-lifecycle endpoints; Submit carries
+// behavior for the input endpoint (returns its injected id/err and records the
+// blocks it was handed). The remaining methods are inert stubs.
 type fakeAgent struct {
 	sub    *fakeSub
 	subErr error
@@ -112,11 +112,19 @@ type fakeAgent struct {
 	interruptResult bool
 	interruptErr    error
 
-	// mu guards closed, which records that Close was called. The delete endpoint
-	// closes the agent OFF-lock in the server goroutine, so the test's assertion
-	// must be synchronized against that write to stay clean under -race.
+	// submitID/submitErr are what Submit returns: the input endpoint echoes the id
+	// back as input_id and maps a non-nil error to 500. Set at construction (before
+	// the server handles a request), so they are read without the mutex.
+	submitID  uuid.UUID
+	submitErr error
+
+	// mu guards the recorded-call fields below (closed + the submitted blocks). The
+	// endpoints run in the server's handler goroutine while the test asserts from
+	// its own goroutine, so every recorded write must be synchronized under -race.
 	mu     sync.Mutex
 	closed bool
+
+	submittedBlocks []content.Block
 }
 
 func (a *fakeAgent) Subscribe(filter event.EventFilter) (event.Subscription, error) {
@@ -127,8 +135,11 @@ func (a *fakeAgent) Subscribe(filter event.EventFilter) (event.Subscription, err
 	return a.sub, nil
 }
 
-func (a *fakeAgent) Submit(_ context.Context, _ []content.Block) (uuid.UUID, error) {
-	return uuid.UUID{}, nil
+func (a *fakeAgent) Submit(_ context.Context, blocks []content.Block) (uuid.UUID, error) {
+	a.mu.Lock()
+	a.submittedBlocks = blocks
+	a.mu.Unlock()
+	return a.submitID, a.submitErr
 }
 func (a *fakeAgent) PrimaryLoopID() uuid.UUID { return uuid.UUID{} }
 func (a *fakeAgent) Approve(_ context.Context, _, _ uuid.UUID, _ tool.ApprovalScope) error {
@@ -156,6 +167,14 @@ func (a *fakeAgent) wasClosed() bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return a.closed
+}
+
+// submittedBlocksSnapshot returns the blocks the last Submit was handed (mutex-
+// guarded so the input handler's write synchronizes with the test read).
+func (a *fakeAgent) submittedBlocksSnapshot() []content.Block {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.submittedBlocks
 }
 
 // TestSupervisor_RecordsAndDropsGate proves the registry records a gate from a

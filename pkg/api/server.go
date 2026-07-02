@@ -159,14 +159,14 @@ func (s *server) routes(mux *http.ServeMux) {
 	mux.HandleFunc("DELETE /sessions/{sid}", s.handleDeleteSession)
 	mux.HandleFunc("POST /sessions/{sid}/interrupt", s.handleInterruptSession)
 
-	// Remaining Task 13 groups register the input/events/gates/export endpoints
-	// here, e.g.:
-	//   mux.HandleFunc("POST /sessions/{sid}/input", s.handleInput)
-	//   mux.HandleFunc("GET /sessions/{sid}/events", s.handleEvents)   // SSE
-	//   mux.HandleFunc("POST /sessions/{sid}/gates/{tid}/approve", ...)
-	//   mux.HandleFunc("POST /sessions/{sid}/gates/{tid}/deny", ...)
-	//   mux.HandleFunc("POST /sessions/{sid}/gates/{tid}/answer", ...)
+	// Input submission (Task 13, group B).
+	mux.HandleFunc("POST /sessions/{sid}/input", s.handleInput)
+
+	// Remaining group B (gate routing) and group C (events/export) register here:
+	//   mux.HandleFunc("POST /sessions/{sid}/gates/{tid}", s.handleResolveGate)
 	//   mux.HandleFunc("GET /sessions/{sid}/gates", s.handleListGates)
+	//   mux.HandleFunc("GET /sessions/{sid}/events", s.handleEvents)   // SSE
+	//   mux.HandleFunc("GET /sessions/{sid}/export", s.handleExport)
 }
 
 // handleHealthz answers 200 with an intentionally data-free body: it is the one
