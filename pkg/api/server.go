@@ -161,12 +161,12 @@ func (s *server) routes(mux *http.ServeMux) {
 
 	// Input submission + gate routing (Task 13, group B). The gate POST resolves a
 	// gate by tool-execution id — the LoopID comes from the supervisor registry,
-	// never the client.
+	// never the client; the GET lists open gates for a reconnecting client.
 	mux.HandleFunc("POST /sessions/{sid}/input", s.handleInput)
 	mux.HandleFunc("POST /sessions/{sid}/gates/{tid}", s.handleResolveGate)
+	mux.HandleFunc("GET /sessions/{sid}/gates", s.handleListGates)
 
-	// Remaining group B (list gates) and group C (events/export) register here:
-	//   mux.HandleFunc("GET /sessions/{sid}/gates", s.handleListGates)
+	// Group C registers the SSE event stream and the transcript export here, e.g.:
 	//   mux.HandleFunc("GET /sessions/{sid}/events", s.handleEvents)   // SSE
 	//   mux.HandleFunc("GET /sessions/{sid}/export", s.handleExport)
 }

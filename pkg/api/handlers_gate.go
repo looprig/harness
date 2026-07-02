@@ -33,6 +33,19 @@ type (
 		Answer string `json:"answer"`
 		Scope  *int   `json:"scope"`
 	}
+	// gateView is one open gate in the reconnect snapshot (GET /gates), with every
+	// id rendered as its string form.
+	gateView struct {
+		ToolExecutionID string `json:"tool_execution_id"`
+		LoopID          string `json:"loop_id"`
+		Kind            string `json:"kind"`
+		Prompt          string `json:"prompt"`
+	}
+	// gatesResponse wraps the open-gate list so an empty registry serializes as
+	// {"gates":[]} rather than a bare null.
+	gatesResponse struct {
+		Gates []gateView `json:"gates"`
+	}
 )
 
 // Gate action verbs. The client names the control to apply; the handler validates
@@ -54,6 +67,7 @@ const (
 	msgInvalidScope      = "invalid approval scope"
 	msgGateKindMismatch  = "gate action does not match gate kind"
 	msgGateResolveFailed = "could not resolve gate"
+	msgGatesUnavailable  = "gate registry unavailable"
 )
 
 // invalidToolExecutionIDError reports that the {tid} path value could not be
@@ -278,4 +292,41 @@ func writeGateDispatchError(w http.ResponseWriter, err error) {
 	}
 	slog.Error("api: gate dispatch unexpected error", "err", err)
 	writeError(w, http.StatusInternalServerError, msgGateResolveFailed)
+}
+
+// handleListGates serves GET /sessions/{sid}/gates: the reconnect-discovery
+// snapshot of every open gate. It fails secure with 503 when the supervisor's
+// subscription has DIED (exitError non-nil) — its registry is frozen and stale, so
+// it must not be served as the live set. Otherwise it returns 200 with the
+// open-gate list (empty => {"gates":[]}). Unknown session is 404, malformed id is
+// 400.
+func (s *server) handleListGates(w http.ResponseWriter, r *http.Request) {
+	sid, err := parseSessionID(r)
+	if err != nil {
+		slog.Warn("api: list gates rejected invalid session id", "err", err)
+		writeError(w, http.StatusBadRequest, msgInvalidSessionID)
+		return
+	}
+	entry, ok := s.getSession(sid)
+	if !ok {
+		writeError(w, http.StatusNotFound, msgSessionNotFound)
+		return
+	}
+	if err := entry.sup.exitError(); err != nil {
+		slog.Error("api: list gates on dead supervisor", "err", err)
+		writeError(w, http.StatusServiceUnavailable, msgGatesUnavailable)
+		return
+	}
+
+	open := entry.sup.list()
+	views := make([]gateView, 0, len(open))
+	for _, g := range open {
+		views = append(views, gateView{
+			ToolExecutionID: g.ToolExecutionID.String(),
+			LoopID:          g.LoopID.String(),
+			Kind:            g.Kind,
+			Prompt:          g.Prompt,
+		})
+	}
+	writeJSON(w, http.StatusOK, gatesResponse{Gates: views})
 }

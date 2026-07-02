@@ -2,6 +2,7 @@ package api
 
 import (
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -306,6 +307,124 @@ func TestGateResolution(t *testing.T) {
 			}
 			if tt.assert != nil {
 				tt.assert(t, fa, tid, lid)
+			}
+		})
+	}
+}
+
+// TestListGates proves GET /sessions/{sid}/gates returns the live open-gate set
+// for a reconnecting client, emits an empty JSON array (never null) for a session
+// with no open gates, fails secure with 503 when the supervisor's subscription
+// has DIED (its registry is stale), 404s an unknown session, and 400s a malformed
+// id.
+func TestListGates(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name           string
+		setup          func(t *testing.T, s *server) (path string, tid, lid uuid.UUID)
+		wantStatus     int
+		wantGates      int
+		wantEmptyArray bool
+		wantMatch      bool
+	}{
+		{
+			name: "one open gate is listed",
+			setup: func(t *testing.T, s *server) (string, uuid.UUID, uuid.UUID) {
+				fs := newFakeSub()
+				fa := &fakeAgent{sub: fs}
+				sup := mustSupervisor(t, fa)
+				sid, tid, lid := mkID(0xB1), mkID(0xC1), mkID(0xD1)
+				s.putSession(sid, &sessionEntry{agent: fa, sup: sup})
+				fs.feed(event.PermissionRequested{Header: loopHeader(lid), ToolExecutionID: tid, Request: tool.BashRequest{Command: gatePrompt}})
+				if !pollUntil(t, func() bool { _, ok := sup.lookup(tid); return ok }) {
+					t.Fatalf("gate %v not recorded within %v", tid, pollDeadline)
+				}
+				return "/sessions/" + sid.String() + "/gates", tid, lid
+			},
+			wantStatus: http.StatusOK, wantGates: 1, wantMatch: true,
+		},
+		{
+			name: "empty session yields an empty array",
+			setup: func(t *testing.T, s *server) (string, uuid.UUID, uuid.UUID) {
+				fa := &fakeAgent{sub: newFakeSub()}
+				sup := mustSupervisor(t, fa)
+				sid := mkID(0xB2)
+				s.putSession(sid, &sessionEntry{agent: fa, sup: sup})
+				return "/sessions/" + sid.String() + "/gates", uuid.UUID{}, uuid.UUID{}
+			},
+			wantStatus: http.StatusOK, wantGates: 0, wantEmptyArray: true,
+		},
+		{
+			name: "dead supervisor fails secure with 503",
+			setup: func(t *testing.T, s *server) (string, uuid.UUID, uuid.UUID) {
+				fs := newFakeSub()
+				fa := &fakeAgent{sub: fs}
+				sup := mustSupervisor(t, fa)
+				sid := mkID(0xB3)
+				s.putSession(sid, &sessionEntry{agent: fa, sup: sup})
+				fs.fail(errStreamLost)
+				if !pollUntil(t, func() bool { return sup.exitError() != nil }) {
+					t.Fatalf("supervisor did not record exit error within %v", pollDeadline)
+				}
+				return "/sessions/" + sid.String() + "/gates", uuid.UUID{}, uuid.UUID{}
+			},
+			wantStatus: http.StatusServiceUnavailable,
+		},
+		{
+			name: "unknown session returns 404",
+			setup: func(_ *testing.T, _ *server) (string, uuid.UUID, uuid.UUID) {
+				return "/sessions/" + mkID(0xEE).String() + "/gates", uuid.UUID{}, uuid.UUID{}
+			},
+			wantStatus: http.StatusNotFound,
+		},
+		{
+			name: "malformed session id returns 400",
+			setup: func(_ *testing.T, _ *server) (string, uuid.UUID, uuid.UUID) {
+				return "/sessions/not-a-uuid/gates", uuid.UUID{}, uuid.UUID{}
+			},
+			wantStatus: http.StatusBadRequest,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			s := newServer(Config{}, fakeFactory)
+			ts := httptest.NewServer(s.handler())
+			defer ts.Close()
+			t.Cleanup(func() { stopAll(s) })
+
+			path, tid, lid := tt.setup(t, s)
+			resp := doReq(t, ts, http.MethodGet, path)
+			defer func() { _ = resp.Body.Close() }()
+
+			if resp.StatusCode != tt.wantStatus {
+				t.Fatalf("GET gates status = %d, want %d", resp.StatusCode, tt.wantStatus)
+			}
+			if tt.wantStatus != http.StatusOK {
+				return
+			}
+
+			raw, err := io.ReadAll(resp.Body)
+			if err != nil {
+				t.Fatalf("ReadAll(gates body) error = %v", err)
+			}
+			var body gatesResponse
+			if err := json.Unmarshal(raw, &body); err != nil {
+				t.Fatalf("decode gatesResponse: %v", err)
+			}
+			if len(body.Gates) != tt.wantGates {
+				t.Fatalf("gates len = %d, want %d", len(body.Gates), tt.wantGates)
+			}
+			if tt.wantEmptyArray && !strings.Contains(string(raw), `"gates":[]`) {
+				t.Errorf("empty body = %q, want it to contain \"gates\":[] (not null)", raw)
+			}
+			if tt.wantMatch {
+				want := gateView{ToolExecutionID: tid.String(), LoopID: lid.String(), Kind: kindPermission, Prompt: gatePrompt}
+				if body.Gates[0] != want {
+					t.Errorf("gate = %+v, want %+v", body.Gates[0], want)
+				}
 			}
 		})
 	}
