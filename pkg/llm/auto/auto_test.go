@@ -14,6 +14,25 @@ import (
 	"github.com/ciram-co/looprig/pkg/llm/transport"
 )
 
+// The helpers below stand in for the deleted model catalogue: each returns a valid
+// Model (OriginCustom) via llm.CustomModel, used purely as a test fixture. They keep
+// the repeated model rows DRY across this file's dispatch tables.
+func chutesKimiK2Model() llm.Model {
+	return llm.CustomModel(llm.ProviderChutes, llm.APIFormatOpenAI, "https://api.chutes.ai", "moonshotai/Kimi-K2.6-TEE", llm.WithMaxContext(128_000), llm.WithTools(), llm.WithThinking())
+}
+
+func openRouterModel(name string) llm.Model {
+	return llm.CustomModel(llm.ProviderOpenRouter, llm.APIFormatOpenAI, "https://openrouter.ai/api/v1", name, llm.WithTools())
+}
+
+func geminiFlashModel() llm.Model {
+	return llm.CustomModel(llm.ProviderGoogle, llm.APIFormatGemini, "https://generativelanguage.googleapis.com/v1beta", "gemini-2.5-flash", llm.WithMaxContext(1_000_000), llm.WithTools(), llm.WithImages(), llm.WithThinking())
+}
+
+func lmStudioLocalModel(name string) llm.Model {
+	return llm.CustomModel(llm.ProviderLMStudio, llm.APIFormatOpenAI, "http://localhost:1234/v1", name, llm.WithTools())
+}
+
 // TestNew exercises the dispatch + fail-closed auth contract: valid models build a
 // non-nil client, an unknown/self-contradictory model is rejected before dispatch
 // with a *llm.ValidationError, and a key-requiring provider given no key fails
@@ -30,15 +49,15 @@ func TestNew(t *testing.T) {
 		wantAuthReq bool   // when wantErr: expect *llm.AuthRequiredError, else *llm.ValidationError
 		wantField   string // when set (ValidationError path): assert ValidationError.Field
 	}{
-		{name: "chutes with key", model: llm.ChutesKimiK2(), key: "k"},
-		{name: "openrouter with key", model: llm.OpenRouter("x"), key: "sk-or-key"},
-		{name: "google with key", model: llm.GeminiFlash(), key: "AIza-k"},
-		{name: "lmstudio without key (AuthNone)", model: llm.LMStudioLocal("qwen"), key: ""},
-		{name: "lmstudio ignores a supplied key", model: llm.LMStudioLocal("qwen"), key: "k"},
-		{name: "phala empty key fails closed", model: llm.GLM46Phala(), key: "", wantErr: true, wantAuthReq: true},
-		{name: "chutes empty key fails closed", model: llm.ChutesKimiK2(), key: "", wantErr: true, wantAuthReq: true},
-		{name: "openrouter empty key fails closed", model: llm.OpenRouter("x"), key: "", wantErr: true, wantAuthReq: true},
-		{name: "google empty key fails closed", model: llm.GeminiFlash(), key: "", wantErr: true, wantAuthReq: true},
+		{name: "chutes with key", model: chutesKimiK2Model(), key: "k"},
+		{name: "openrouter with key", model: openRouterModel("x"), key: "sk-or-key"},
+		{name: "google with key", model: geminiFlashModel(), key: "AIza-k"},
+		{name: "lmstudio without key (AuthNone)", model: lmStudioLocalModel("qwen"), key: ""},
+		{name: "lmstudio ignores a supplied key", model: lmStudioLocalModel("qwen"), key: "k"},
+		{name: "phala empty key fails closed", model: llm.CustomModel(llm.ProviderPhala, llm.APIFormatOpenAI, "https://api.phala.network/v1", "zai-org/GLM-4.6", llm.WithMaxContext(200_000), llm.WithTools(), llm.WithThinking()), key: "", wantErr: true, wantAuthReq: true},
+		{name: "chutes empty key fails closed", model: chutesKimiK2Model(), key: "", wantErr: true, wantAuthReq: true},
+		{name: "openrouter empty key fails closed", model: openRouterModel("x"), key: "", wantErr: true, wantAuthReq: true},
+		{name: "google empty key fails closed", model: geminiFlashModel(), key: "", wantErr: true, wantAuthReq: true},
 		{
 			name:    "unknown provider rejected before dispatch",
 			model:   llm.Model{Provider: "nope", APIFormat: llm.APIFormatOpenAI, BaseURL: "https://x.example.test", Name: "m"},
@@ -113,7 +132,7 @@ func TestNewBedrockDirectsToConstructor(t *testing.T) {
 
 	// An empty key must NOT surface as an AuthRequiredError here: bedrock's auth
 	// kind is SigV4, not APIKey, so the Phase-1 empty-APIKey guard is skipped.
-	got, err := New(llm.ClaudeOnBedrock("anthropic.claude-3-5-sonnet-20241022-v2:0"), "")
+	got, err := New(llm.CustomModel(llm.ProviderBedrock, llm.APIFormatAnthropic, "", "anthropic.claude-3-5-sonnet-20241022-v2:0", llm.WithMaxContext(200_000), llm.WithTools(), llm.WithImages()), "")
 	if got != nil {
 		t.Fatalf("New() returned non-nil client (%T) for a SigV4 provider", got)
 	}
@@ -184,25 +203,25 @@ func TestNewConcreteTypes(t *testing.T) {
 	}{
 		{
 			name:  "chutes wires the chutes client",
-			model: llm.ChutesKimiK2(), key: "k",
+			model: chutesKimiK2Model(), key: "k",
 			is:   func(l llm.LLM) bool { _, ok := l.(*chutes.Client); return ok },
 			want: "*chutes.Client",
 		},
 		{
 			name:  "lmstudio wires the generic transport client",
-			model: llm.LMStudioLocal("qwen"), key: "",
+			model: lmStudioLocalModel("qwen"), key: "",
 			is:   func(l llm.LLM) bool { _, ok := l.(*transport.Client); return ok },
 			want: "*transport.Client",
 		},
 		{
 			name:  "openrouter wires the generic transport client",
-			model: llm.OpenRouter("x"), key: "sk-or-key",
+			model: openRouterModel("x"), key: "sk-or-key",
 			is:   func(l llm.LLM) bool { _, ok := l.(*transport.Client); return ok },
 			want: "*transport.Client",
 		},
 		{
 			name:  "google wires the bespoke gemini client",
-			model: llm.GeminiFlash(), key: "AIza-k",
+			model: geminiFlashModel(), key: "AIza-k",
 			is:   func(l llm.LLM) bool { _, ok := l.(*geminiprovider.Client); return ok },
 			want: "*geminiprovider.Client",
 		},
@@ -284,17 +303,17 @@ func TestCodecFor(t *testing.T) {
 	}
 }
 
-// TestNewLMStudioLocal is the task's explicit assertion that the dissolved lmstudio
-// package's default endpoint now works via a catalog row + the generic client, with
-// no credentials.
-func TestNewLMStudioLocal(t *testing.T) {
+// TestNewLMStudioDefaultEndpoint is the explicit assertion that the dissolved
+// lmstudio package's default loopback endpoint now works via a CustomModel row + the
+// generic client, with no credentials.
+func TestNewLMStudioDefaultEndpoint(t *testing.T) {
 	t.Parallel()
-	got, err := New(llm.LMStudioLocal("m"), "")
+	got, err := New(lmStudioLocalModel("m"), "")
 	if err != nil {
-		t.Fatalf("New(LMStudioLocal, \"\") err = %v, want nil", err)
+		t.Fatalf("New(lmStudioLocalModel, \"\") err = %v, want nil", err)
 	}
 	if got == nil {
-		t.Fatal("New(LMStudioLocal, \"\") = nil, want non-nil client")
+		t.Fatal("New(lmStudioLocalModel, \"\") = nil, want non-nil client")
 	}
 }
 

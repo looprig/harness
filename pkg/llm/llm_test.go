@@ -23,6 +23,13 @@ func (f *fakeLLM) Stream(_ context.Context, _ llm.Request) (*llm.StreamReader[co
 // compile-time interface check
 var _ llm.LLM = (*fakeLLM)(nil)
 
+// chutesKimiK2Model is a small local model builder standing in for the deleted
+// catalogue constructor: it yields a valid ProviderChutes Model (OriginCustom)
+// used purely as a Request.Model fixture in this file.
+func chutesKimiK2Model() llm.Model {
+	return llm.CustomModel(llm.ProviderChutes, llm.APIFormatOpenAI, "https://api.chutes.ai", "moonshotai/Kimi-K2.6-TEE", llm.WithMaxContext(128_000), llm.WithTools(), llm.WithThinking())
+}
+
 func TestLLM_InterfaceCompliance(t *testing.T) {
 	t.Parallel()
 	// compile-time assertion is at the top of the file via var _ llm.LLM = (*fakeLLM)(nil).
@@ -54,7 +61,7 @@ func TestRequest_Fields(t *testing.T) {
 
 	override := &llm.Sampling{Temperature: f64ptr(0.2)}
 	req := llm.Request{
-		Model:    llm.ChutesKimiK2(),
+		Model:    chutesKimiK2Model(),
 		System:   "you are helpful",
 		Messages: content.AgenticMessages{},
 		Tools:    []llm.Tool{{Name: "search"}},
@@ -75,7 +82,7 @@ func TestRequest_Fields(t *testing.T) {
 	}
 
 	// A nil Override is the documented "use Model.Sampling" default.
-	def := llm.Request{Model: llm.ChutesKimiK2()}
+	def := llm.Request{Model: chutesKimiK2Model()}
 	if def.Override != nil {
 		t.Errorf("zero-value Request.Override = %+v, want nil", def.Override)
 	}

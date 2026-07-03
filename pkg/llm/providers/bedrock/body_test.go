@@ -131,7 +131,7 @@ func bytesEqualJSON(a, b json.RawMessage) bool {
 // bedrockRequest builds a minimal valid ProviderBedrock request for name.
 func bedrockRequest(name string) llm.Request {
 	return llm.Request{
-		Model: llm.ClaudeOnBedrock(name),
+		Model: llm.CustomModel(llm.ProviderBedrock, llm.APIFormatAnthropic, "", name, llm.WithMaxContext(200_000), llm.WithTools(), llm.WithImages()),
 		Messages: content.AgenticMessages{
 			&content.UserMessage{Message: content.Message{
 				Role:   content.RoleUser,
