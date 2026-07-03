@@ -48,6 +48,9 @@ order and making the journal the complete resume token.
   may exist as a *cache*, never as truth — see profiles).
 - Linking rclone as a library (exec only).
 - VM/memory snapshotting (a platform concern, orthogonal to this design).
+- Age-based / last-seen GC (deleting old unreferenced snapshot blobs *without* a full live
+  set) — deferred: it needs a `Stat`/last-modified surface on `storekit.Blobs`, which the v1
+  contract does not have. GC is live-set-only for now (see GC).
 
 ## Contract: pkg/workspacestore (looprig core)
 
@@ -93,6 +96,14 @@ func (s *Store) Delete(ctx context.Context, ref Ref) error
 - Determinism is also what makes the verified warm-volume fast path sound: re-archiving an
   unchanged tree reproduces the digest bit-for-bit, so reuse is proven by content — never
   by a marker or timestamp that can go stale after a crashed turn mutates the tree.
+- **Determinism holds within a Go toolchain version.** The archive bytes include the
+  `compress/gzip` body, which is DEFLATE from `compress/flate`; the exact encoder output is
+  explicitly *not* part of Go's compatibility promise and has changed across Go releases. A
+  toolchain upgrade can therefore re-snapshot an unchanged tree to a new ref. This is a known
+  property, not a bug, and is harmless for correctness: the new snapshot is a valid content
+  address, the old blob is GC'd once unreferenced, and the only thing lost is *cross-version*
+  dedup — resume and integrity are unaffected. Identical refs are guaranteed only for
+  archives produced by the same toolchain.
 
 ### Journal linkage (the resume token)
 
@@ -119,11 +130,18 @@ resumes may append; the loser has its own materialized copy and corrupts nothing
 
 ### GC
 
-Mark-and-sweep at the composition root, mirroring the journal's blob GC: refs reachable
-from any live session's `WorkspaceCheckpointed` events are live; unreferenced snapshot
-blobs older than a policy age are deleted via `Store.Delete`. Content-addressing makes
-this safe against races with in-flight snapshots of identical trees (a re-Put of the same
-key is a no-op).
+Mark-and-sweep at the composition root, mirroring the journal's blob GC. The composition
+root computes the **live set** — the refs reachable from any live session's
+`WorkspaceCheckpointed` events — and calls `GC(ctx, live)`, which lists the stored snapshot
+blobs and deletes every one whose ref is not in that set, returning the refs it removed.
+
+v1 is **live-set-only**: there is no age or last-seen safety net, so GC **must not run
+concurrently with active snapshotting** — a `Snapshot` writing a not-yet-live ref (a
+brand-new checkpoint, or a re-`Put` of an identical tree) could otherwise be swept
+mid-flight. GC is fail-secure: a key under the `workspaces/` prefix that does not parse as a
+valid v1 ref is left untouched, so GC only ever removes blobs it recognizes as its own
+snapshots. Content-addressing keeps a re-`Put` of an identical tree a no-op, so a checkpoint
+that survives a concurrent sweep is at worst re-uploaded, never corrupted.
 
 ## Runtime model: snapshots are truth, mounts are cache
 
