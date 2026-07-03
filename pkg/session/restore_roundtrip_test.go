@@ -1,5 +1,3 @@
-//go:build integration
-
 package session
 
 import (
@@ -18,41 +16,24 @@ import (
 	"github.com/ciram-co/looprig/pkg/journal"
 	"github.com/ciram-co/looprig/pkg/llm"
 	"github.com/ciram-co/looprig/pkg/loop"
+	"github.com/ciram-co/looprig/pkg/sessionstore"
 	"github.com/ciram-co/looprig/pkg/uuid"
-	"github.com/nats-io/nats-server/v2/server"
-	"github.com/nats-io/nats.go"
+	"github.com/ciram-co/storekit/memstore"
 )
 
-// --- embedded-server + journal test wiring (local to package session) -------------
+// --- memstore-backed store + journal test wiring (local to package session) ---------
 
-// newEmbeddedJS starts an in-process JetStream server (no TCP) and returns a connected
-// client, torn down via t.Cleanup. It mirrors the journal package's helper (kept local
-// because that one lives in package journal_test).
-func newEmbeddedJS(t *testing.T) nats.JetStreamContext {
+// newRestoreStore opens a sessionstore.Store over a fresh in-memory storekit backend —
+// the whole durable round trip (lease, journal, replay) runs in-process, no NATS server.
+// One store per test; the original run AND Restore share it so the restored session reads
+// the same ledger the original wrote.
+func newRestoreStore(t *testing.T) *sessionstore.Store {
 	t.Helper()
-	srv, err := server.NewServer(&server.Options{
-		JetStream:  true,
-		StoreDir:   t.TempDir(),
-		DontListen: true,
-	})
+	store, err := sessionstore.Open(memstore.New())
 	if err != nil {
-		t.Fatalf("NewServer: %v", err)
+		t.Fatalf("sessionstore.Open: %v", err)
 	}
-	go srv.Start()
-	if !srv.ReadyForConnections(5 * time.Second) {
-		t.Fatal("server not ready")
-	}
-	t.Cleanup(srv.Shutdown)
-	nc, err := nats.Connect("", nats.InProcessServer(srv))
-	if err != nil {
-		t.Fatalf("Connect: %v", err)
-	}
-	t.Cleanup(nc.Close)
-	js, err := nc.JetStream()
-	if err != nil {
-		t.Fatalf("JetStream: %v", err)
-	}
-	return js
+	return store
 }
 
 func mustSessionID(t *testing.T) uuid.UUID {
@@ -64,24 +45,14 @@ func mustSessionID(t *testing.T) uuid.UUID {
 	return id
 }
 
-func mustLeaseManager(t *testing.T, js nats.JetStreamContext) *journal.LeaseManager {
+// mustAcquireLease acquires single-writer ownership of sid's stream through the store.
+func mustAcquireLease(t *testing.T, store *sessionstore.Store, sid uuid.UUID) journal.Lease {
 	t.Helper()
-	lm, err := journal.NewLeaseManager(js)
-	if err != nil {
-		t.Fatalf("NewLeaseManager: %v", err)
-	}
-	return lm
-}
-
-// mustAcquireLease acquires a lease for sid (released on cleanup).
-func mustAcquireLease(t *testing.T, js nats.JetStreamContext, sid uuid.UUID) journal.Lease {
-	t.Helper()
-	lm := mustLeaseManager(t, js)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	lease, err := lm.Acquire(ctx, sid)
+	lease, err := store.AcquireLease(ctx, sid)
 	if err != nil {
-		t.Fatalf("Acquire lease for %v: %v", sid, err)
+		t.Fatalf("AcquireLease for %v: %v", sid, err)
 	}
 	return lease
 }
@@ -97,16 +68,6 @@ func handOver(t *testing.T, lease journal.Lease) {
 	}
 }
 
-// mustObjectStore binds the per-session object store the journal created.
-func mustObjectStore(t *testing.T, js nats.JetStreamContext, sid uuid.UUID) nats.ObjectStore {
-	t.Helper()
-	store, err := js.ObjectStore(journal.SessionObjectBucket(sid))
-	if err != nil {
-		t.Fatalf("ObjectStore: %v", err)
-	}
-	return store
-}
-
 // testFactory mints deterministic, monotonically increasing EventIDs and a fixed
 // CreatedAt so persisted events get stable, non-zero ids/times for journal dedup.
 func testFactory() *event.Factory {
@@ -119,7 +80,7 @@ func testFactory() *event.Factory {
 }
 
 // eventStamper mints a fresh, distinct EventID for each directly-published event so the
-// journal's Nats-Msg-Id (the EventID) never collides — a zero EventID on every event
+// journal's idempotency id (the EventID) never collides — a zero EventID on every event
 // would dedup them all to one. The hub does NOT stamp a TRIGGERING event (only its
 // derived session events), so a direct publisher must stamp them itself, exactly as the
 // real loop's eventFactory does for the events it emits.
@@ -205,9 +166,9 @@ type persistedStream struct {
 
 // newOriginalHub wires a journal-backed hub for an original run with an UNNAMED root
 // loop (the common case). It is newOriginalHubNamed with an empty AgentName.
-func newOriginalHub(t *testing.T, js nats.JetStreamContext, fp event.ConfigFingerprint) (*hub.Hub, uuid.UUID, uuid.UUID, journal.Lease, *eventStamper) {
+func newOriginalHub(t *testing.T, store *sessionstore.Store, fp event.ConfigFingerprint) (*hub.Hub, uuid.UUID, uuid.UUID, journal.Lease, *eventStamper) {
 	t.Helper()
-	return newOriginalHubNamed(t, js, fp, "")
+	return newOriginalHubNamed(t, store, fp, "")
 }
 
 // newOriginalHubNamed wires a journal-backed hub for an original run (the durable-tap
@@ -216,14 +177,17 @@ func newOriginalHub(t *testing.T, js nats.JetStreamContext, fp event.ConfigFinge
 // LoopStarted with agentName — exactly what NewLoop does from cfg.AgentName on a fresh run
 // — so a restore can validate the persisted root name. It returns the hub, the session/loop
 // ids, the held lease, and the stamper used for direct publishes.
-func newOriginalHubNamed(t *testing.T, js nats.JetStreamContext, fp event.ConfigFingerprint, agentName identity.AgentName) (*hub.Hub, uuid.UUID, uuid.UUID, journal.Lease, *eventStamper) {
+func newOriginalHubNamed(t *testing.T, store *sessionstore.Store, fp event.ConfigFingerprint, agentName identity.AgentName) (*hub.Hub, uuid.UUID, uuid.UUID, journal.Lease, *eventStamper) {
 	t.Helper()
 	sessionID := mustSessionID(t)
 	primaryLoopID := mustSessionID(t)
-	lease := mustAcquireLease(t, js, sessionID)
-	j, err := journal.NewSessionJournal(js, sessionID, lease)
+	lease := mustAcquireLease(t, store, sessionID)
+
+	openCtx, openCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer openCancel()
+	j, err := store.OpenJournal(openCtx, sessionID, lease)
 	if err != nil {
-		t.Fatalf("NewSessionJournal: %v", err)
+		t.Fatalf("OpenJournal: %v", err)
 	}
 	h := hub.New(sessionID, hub.WithAppender(journal.NewJournalEventAppender(j)), hub.WithFactory(testFactory()))
 
@@ -247,18 +211,18 @@ func newOriginalHubNamed(t *testing.T, js nats.JetStreamContext, fp event.Config
 
 // buildOriginalRun drives `turns` complete turns through a REAL loop with an UNNAMED root
 // loop (the common case). It is buildOriginalRunNamed with an empty AgentName.
-func buildOriginalRun(t *testing.T, js nats.JetStreamContext, fp event.ConfigFingerprint, cfg loop.Config, turns int) persistedStream {
+func buildOriginalRun(t *testing.T, store *sessionstore.Store, fp event.ConfigFingerprint, cfg loop.Config, turns int) persistedStream {
 	t.Helper()
-	return buildOriginalRunNamed(t, js, fp, "", cfg, turns)
+	return buildOriginalRunNamed(t, store, fp, "", cfg, turns)
 }
 
 // buildOriginalRunNamed drives `turns` COMPLETE turns through a REAL loop whose events
 // persist via the journal-backed hub, stamping the root loop with agentName, then snapshots
 // the committed state and stops the loop. The lease is left held for the caller to release
 // (handover). This is the faithful "drive a few turns" path.
-func buildOriginalRunNamed(t *testing.T, js nats.JetStreamContext, fp event.ConfigFingerprint, agentName identity.AgentName, cfg loop.Config, turns int) persistedStream {
+func buildOriginalRunNamed(t *testing.T, store *sessionstore.Store, fp event.ConfigFingerprint, agentName identity.AgentName, cfg loop.Config, turns int) persistedStream {
 	t.Helper()
-	h, sessionID, primaryLoopID, lease, _ := newOriginalHubNamed(t, js, fp, agentName)
+	h, sessionID, primaryLoopID, lease, _ := newOriginalHubNamed(t, store, fp, agentName)
 
 	// Subscribe so we can drain each turn to its terminal deterministically.
 	sub, err := h.SubscribeEvents(event.EventFilter{Enduring: event.LoopScope{All: true}})
@@ -306,9 +270,9 @@ func buildOriginalRunNamed(t *testing.T, js nats.JetStreamContext, fp event.Conf
 // these directly through the journal-backed hub (deterministic — no goroutine race), so
 // the fold sees exactly user + completed step and OpenTurn=true. The committed msgs it
 // reports are what the fold must reconstruct.
-func buildCrashedRun(t *testing.T, js nats.JetStreamContext, fp event.ConfigFingerprint) persistedStream {
+func buildCrashedRun(t *testing.T, store *sessionstore.Store, fp event.ConfigFingerprint) persistedStream {
 	t.Helper()
-	h, sessionID, primaryLoopID, lease, es := newOriginalHub(t, js, fp)
+	h, sessionID, primaryLoopID, lease, es := newOriginalHub(t, store, fp)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
@@ -365,9 +329,9 @@ func buildCrashedRun(t *testing.T, js nats.JetStreamContext, fp event.ConfigFing
 // is the independently-built slice the restored Snapshot must deep-equal — proving the
 // journaled BYTES of a multi-message StepDone group and a TurnFoldedInto rehydrate into
 // the identical AgenticMessages, not merely that the pure fold is correct.
-func buildComplexShapesRun(t *testing.T, js nats.JetStreamContext, fp event.ConfigFingerprint) persistedStream {
+func buildComplexShapesRun(t *testing.T, store *sessionstore.Store, fp event.ConfigFingerprint) persistedStream {
 	t.Helper()
-	h, sessionID, primaryLoopID, lease, es := newOriginalHub(t, js, fp)
+	h, sessionID, primaryLoopID, lease, es := newOriginalHub(t, store, fp)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
@@ -409,6 +373,118 @@ func buildComplexShapesRun(t *testing.T, js nats.JetStreamContext, fp event.Conf
 	}
 }
 
+// buildTwoLoopRun direct-publishes a durable stream for a session with TWO loops: the
+// PRIMARY loop's one complete turn AND a SUBAGENT loop's one complete turn (a non-root
+// LoopStarted plus its own TurnStarted/StepDone/TurnDone). It is the fixture proving
+// restore's primary-loop narrowing: the discovery drain (UNNARROWED) must COUNT the
+// subagent LoopStarted, while the fold drain (NARROWED to primaryLoopID) must EXCLUDE the
+// subagent loop's turn events from the folded primary thread. committedMsgs is the PRIMARY
+// thread ONLY — what the narrowed fold must reconstruct. It returns the subagent loop id.
+func buildTwoLoopRun(t *testing.T, store *sessionstore.Store, fp event.ConfigFingerprint) (persistedStream, uuid.UUID) {
+	t.Helper()
+	h, sessionID, primaryLoopID, lease, es := newOriginalHub(t, store, fp)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	subLoopID := mustSessionID(t)
+	primaryTurn := mustSessionID(t)
+	primaryStep := mustSessionID(t)
+	subTurn := mustSessionID(t)
+	subStep := mustSessionID(t)
+
+	pTurnCoord := identity.Coordinates{SessionID: sessionID, LoopID: primaryLoopID, TurnID: primaryTurn}
+	pStepCoord := identity.Coordinates{SessionID: sessionID, LoopID: primaryLoopID, TurnID: primaryTurn, StepID: primaryStep}
+	sTurnCoord := identity.Coordinates{SessionID: sessionID, LoopID: subLoopID, TurnID: subTurn}
+	sStepCoord := identity.Coordinates{SessionID: sessionID, LoopID: subLoopID, TurnID: subTurn, StepID: subStep}
+
+	// Primary loop: one complete turn — the only messages the narrowed fold must keep.
+	es.stamp(t, ctx, h, event.TurnStarted{Header: event.Header{Coordinates: pTurnCoord}, TurnIndex: 1, Message: foldUserMsg("primary user")})
+	es.stamp(t, ctx, h, event.StepDone{Header: event.Header{Coordinates: pStepCoord}, Messages: content.AgenticMessages{aiMessage("primary reply")}})
+	es.stamp(t, ctx, h, event.TurnDone{Header: event.Header{Coordinates: pTurnCoord}, TurnIndex: 1, Message: aiMessage("primary reply")})
+
+	// Subagent loop: a NON-ROOT LoopStarted (Cause = the primary loop) plus its own complete
+	// turn. Its loop-scoped turn events must NEVER reach the folded PRIMARY thread — that is
+	// the narrowing the fold drain's LoopID enforces.
+	es.stamp(t, ctx, h, event.LoopStarted{Header: event.Header{
+		Coordinates: identity.Coordinates{SessionID: sessionID, LoopID: subLoopID},
+		Cause:       identity.Cause{Coordinates: identity.Coordinates{LoopID: primaryLoopID}, Agency: identity.AgencyMachine},
+	}})
+	es.stamp(t, ctx, h, event.TurnStarted{Header: event.Header{Coordinates: sTurnCoord}, TurnIndex: 1, Message: foldUserMsg("SUBAGENT user")})
+	es.stamp(t, ctx, h, event.StepDone{Header: event.Header{Coordinates: sStepCoord}, Messages: content.AgenticMessages{aiMessage("SUBAGENT reply")}})
+	es.stamp(t, ctx, h, event.TurnDone{Header: event.Header{Coordinates: sTurnCoord}, TurnIndex: 1, Message: aiMessage("SUBAGENT reply")})
+
+	return persistedStream{
+		sessionID:     sessionID,
+		primaryLoopID: primaryLoopID,
+		lease:         lease,
+		committedMsgs: content.AgenticMessages{
+			foldUserMsg("primary user"),
+			aiMessage("primary reply"),
+		},
+		committedTurn: 1,
+	}, subLoopID
+}
+
+// buildRunWithSubagents drives one complete primary turn AND stamps `subagents` durable
+// NON-ROOT LoopStarted events (each carrying a non-zero Header.Cause = a subagent spawn),
+// then snapshots and stops the loop. It models a crashed session that had spawned
+// `subagents` sub-loops over its lifetime — the durable record restore must recount to
+// re-seed the cumulative spawn quota. The lease is left held for the caller to release.
+func buildRunWithSubagents(t *testing.T, store *sessionstore.Store, fp event.ConfigFingerprint, cfg loop.Config, subagents int) persistedStream {
+	t.Helper()
+	h, sessionID, primaryLoopID, lease, es := newOriginalHub(t, store, fp)
+
+	sub, err := h.SubscribeEvents(event.EventFilter{Enduring: event.LoopScope{All: true}})
+	if err != nil {
+		t.Fatalf("SubscribeEvents: %v", err)
+	}
+	defer func() { _ = sub.Close() }()
+
+	loopCtx, loopCancel := context.WithCancel(context.Background())
+	l, err := loop.New(loopCtx, sessionID, primaryLoopID, loop.Provenance{}, h, cfg)
+	if err != nil {
+		t.Fatalf("loop.New: %v", err)
+	}
+
+	// One complete primary turn so the stream is a realistic run.
+	l.Commands <- command.UserInput{Header: command.Header{CommandID: mustSessionID(t)}, Blocks: []content.Block{&content.TextBlock{Text: "turn input"}}}
+	drainSubToTerminal(t, sub)
+	want := content.AgenticMessages{foldUserMsg("turn input"), aiMessage("reply")}
+
+	// Stamp `subagents` NON-ROOT LoopStarted events directly through the journal-backed hub.
+	// Each carries a non-zero Cause (parent = the primary loop), exactly what NewLoop stamps
+	// on a real subagent spawn — so countSpawnedLoops counts them on restore.
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	for i := 0; i < subagents; i++ {
+		subLoopID := mustSessionID(t)
+		es.stamp(t, ctx, h, event.LoopStarted{Header: event.Header{
+			Coordinates: identity.Coordinates{SessionID: sessionID, LoopID: subLoopID},
+			Cause:       identity.Cause{Coordinates: identity.Coordinates{LoopID: primaryLoopID}, Agency: identity.AgencyMachine},
+		}})
+	}
+
+	snapCtx, snapCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer snapCancel()
+	msgs, idx, err := l.Snapshot(snapCtx)
+	if err != nil {
+		t.Fatalf("original Snapshot: %v", err)
+	}
+	if !reflect.DeepEqual(msgs, want) {
+		t.Fatalf("original committed msgs =\n  %#v\nwant\n  %#v", msgs, want)
+	}
+	loopCancel()
+	<-l.Done
+
+	return persistedStream{
+		sessionID:     sessionID,
+		primaryLoopID: primaryLoopID,
+		lease:         lease,
+		committedMsgs: msgs,
+		committedTurn: idx,
+	}
+}
+
 // --- restore assertions ------------------------------------------------------------
 
 // restoredSnapshot reads the restored primary loop's committed msgs + turnIndex through
@@ -432,13 +508,17 @@ func restoredSnapshot(t *testing.T, s *Session) (content.AgenticMessages, event.
 // restoreEventTail replays the stream scoped to the primary loop (session events + that
 // loop's events, in stream order) and returns only the restore-lifecycle events
 // (RestoreStarted/RestoreDone/RestoreErrored and any TurnInterrupted that closed an open
-// turn) — the tail the assertions check.
-func restoreEventTail(t *testing.T, js nats.JetStreamContext, sessionID, primaryLoopID uuid.UUID) []event.Event {
+// turn) — the tail the assertions check. It goes through the SAME facade Restore uses:
+// FromSeq 0 on the replayer, the primary LoopID narrowing carried on the Open request.
+func restoreEventTail(t *testing.T, store *sessionstore.Store, sessionID, primaryLoopID uuid.UUID) []event.Event {
 	t.Helper()
-	r := journal.NewEventReplayer(js, mustObjectStore(t, js, sessionID))
+	r, err := store.OpenEventReplayer(sessionID, sessionstore.ReplayRequest{FromSeq: 0})
+	if err != nil {
+		t.Fatalf("OpenEventReplayer: %v", err)
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	cursor, err := r.Open(ctx, journal.ReplayRequest{SessionID: sessionID, LoopID: primaryLoopID, From: journal.Beginning(), Follow: false})
+	cursor, err := r.Open(ctx, journal.ReplayRequest{LoopID: primaryLoopID, Follow: false})
 	if err != nil {
 		t.Fatalf("replay Open: %v", err)
 	}
@@ -537,18 +617,15 @@ func submitAndDrain(t *testing.T, s *Session, input []content.Block) {
 // stable identity, the expected restore-event tail, and a working new Submit that numbers
 // from the restored turnIndex.
 func TestRestoreRoundTrip(t *testing.T) {
-	js := newEmbeddedJS(t)
+	store := newRestoreStore(t)
 	fp := FingerprintFrom(restoreCfg(&stubLLM{}, "model-x", "be helpful"))
 
-	orig := buildOriginalRun(t, js, fp, restoreCfg(&stubLLM{chunks: []content.Chunk{textChunk("reply")}}, "model-x", "be helpful"), 2)
+	orig := buildOriginalRun(t, store, fp, restoreCfg(&stubLLM{chunks: []content.Chunk{textChunk("reply")}}, "model-x", "be helpful"), 2)
 	handOver(t, orig.lease)
-
-	objStore := mustObjectStore(t, js, orig.sessionID)
-	leases := mustLeaseManager(t, js)
 
 	restoreClient := &stubLLM{chunks: []content.Chunk{textChunk("after restore")}}
 	s, err := Restore(context.Background(), restoreCfg(restoreClient, "model-x", "be helpful"),
-		orig.sessionID, js, objStore, leases)
+		orig.sessionID, store)
 	if err != nil {
 		t.Fatalf("Restore: %v", err)
 	}
@@ -572,7 +649,7 @@ func TestRestoreRoundTrip(t *testing.T) {
 	}
 
 	// The restore-event tail (no open turn): RestoreStarted → RestoreDone.
-	assertTail(t, restoreEventTail(t, js, orig.sessionID, orig.primaryLoopID),
+	assertTail(t, restoreEventTail(t, store, orig.sessionID, orig.primaryLoopID),
 		[]event.Event{event.RestoreStarted{}, event.RestoreDone{}})
 
 	// A new Submit is accepted; the next turn numbers from the restored turnIndex.
@@ -586,23 +663,70 @@ func TestRestoreRoundTrip(t *testing.T) {
 	}
 }
 
+// TestRestorePrimaryLoopNarrowing is the multi-loop restore that proves the fold drain's
+// LoopID narrowing survives the facade swap: a session with a primary turn AND a subagent
+// turn restores with a PRIMARY-ONLY folded thread (the subagent's turn events are dropped),
+// while the discovery drain — UNNARROWED — still counts the subagent's non-root LoopStarted
+// into the re-seeded spawn quota. Getting the narrowing wrong (a zero LoopID on the fold
+// drain) would fold the subagent's "SUBAGENT user"/"SUBAGENT reply" into the primary thread
+// and bump turnIndex to 2 — silently corrupting multi-loop session restore.
+func TestRestorePrimaryLoopNarrowing(t *testing.T) {
+	store := newRestoreStore(t)
+	fp := FingerprintFrom(restoreCfg(&stubLLM{}, "model-x", "be helpful"))
+
+	orig, _ := buildTwoLoopRun(t, store, fp)
+	handOver(t, orig.lease)
+
+	s, err := Restore(context.Background(),
+		restoreCfg(&stubLLM{chunks: []content.Chunk{textChunk("after restore")}}, "model-x", "be helpful"),
+		orig.sessionID, store)
+	if err != nil {
+		t.Fatalf("Restore (two-loop): %v", err)
+	}
+	t.Cleanup(func() { _ = s.Shutdown(context.Background()) })
+
+	// The FOLD drain is narrowed to the primary loop: the restored thread is the PRIMARY
+	// loop's turn ONLY. If the fold were unnarrowed, the subagent messages would appear here
+	// and turnIndex would be 2.
+	msgs, idx := restoredSnapshot(t, s)
+	if !reflect.DeepEqual(msgs, orig.committedMsgs) {
+		t.Errorf("restored (two-loop) primary msgs =\n  %#v\nwant primary-only\n  %#v", msgs, orig.committedMsgs)
+	}
+	if idx != orig.committedTurn {
+		t.Errorf("restored (two-loop) turnIndex = %d, want %d (primary turn only)", idx, orig.committedTurn)
+	}
+
+	// The DISCOVERY drain is UNNARROWED: it counted the subagent's non-root LoopStarted, so
+	// the restored spawn quota re-seeds to 1. This proves the two drains apply DIFFERENT
+	// narrowing — unnarrowed discovery (sees the subagent spawn) + narrowed fold (drops its
+	// turns).
+	s.loopsMu.RLock()
+	gotSpawned := s.spawned
+	s.loopsMu.RUnlock()
+	if gotSpawned != 1 {
+		t.Errorf("restored spawned = %d, want 1 (discovery drain must be unnarrowed and count the subagent LoopStarted)", gotSpawned)
+	}
+
+	// The tail is a clean RestoreStarted → RestoreDone (no open turn).
+	assertTail(t, restoreEventTail(t, store, orig.sessionID, orig.primaryLoopID),
+		[]event.Event{event.RestoreStarted{}, event.RestoreDone{}})
+}
+
 // TestRestoreReleasesLeaseOnShutdown proves the Phase-10 lease-release-on-teardown wiring
 // for a RESTORED session: Restore holds the single-writer lease for the session lifetime,
 // and a clean Shutdown releases it so a SECOND Restore can re-acquire single-writer
 // ownership without waiting out the TTL. Without the release, the second Restore would
 // fail *LeaseHeldError until the lease expired.
 func TestRestoreReleasesLeaseOnShutdown(t *testing.T) {
-	js := newEmbeddedJS(t)
+	store := newRestoreStore(t)
 	fp := FingerprintFrom(restoreCfg(&stubLLM{}, "model-x", "be helpful"))
 
-	orig := buildOriginalRun(t, js, fp, restoreCfg(&stubLLM{chunks: []content.Chunk{textChunk("reply")}}, "model-x", "be helpful"), 1)
+	orig := buildOriginalRun(t, store, fp, restoreCfg(&stubLLM{chunks: []content.Chunk{textChunk("reply")}}, "model-x", "be helpful"), 1)
 	handOver(t, orig.lease)
-
-	objStore := mustObjectStore(t, js, orig.sessionID)
 
 	// First restore acquires + holds the lease.
 	s1, err := Restore(context.Background(), restoreCfg(&stubLLM{}, "model-x", "be helpful"),
-		orig.sessionID, js, objStore, mustLeaseManager(t, js))
+		orig.sessionID, store)
 	if err != nil {
 		t.Fatalf("Restore #1: %v", err)
 	}
@@ -613,7 +737,7 @@ func TestRestoreReleasesLeaseOnShutdown(t *testing.T) {
 
 	// Second restore re-acquires immediately (no TTL wait) — proving the lease was released.
 	s2, err := Restore(context.Background(), restoreCfg(&stubLLM{}, "model-x", "be helpful"),
-		orig.sessionID, js, objStore, mustLeaseManager(t, js))
+		orig.sessionID, store)
 	if err != nil {
 		t.Fatalf("Restore #2 (lease not released on Shutdown #1?): %v", err)
 	}
@@ -624,31 +748,29 @@ func TestRestoreReleasesLeaseOnShutdown(t *testing.T) {
 // *ConfigMismatchError, the session does not come up, and a RestoreErrored is recorded —
 // unless WithAllowConfigMismatch.
 func TestRestoreConfigMismatch(t *testing.T) {
-	js := newEmbeddedJS(t)
+	store := newRestoreStore(t)
 	fp := FingerprintFrom(restoreCfg(&stubLLM{}, "model-x", "be helpful"))
 
-	orig := buildOriginalRun(t, js, fp, restoreCfg(&stubLLM{chunks: []content.Chunk{textChunk("reply")}}, "model-x", "be helpful"), 1)
+	orig := buildOriginalRun(t, store, fp, restoreCfg(&stubLLM{chunks: []content.Chunk{textChunk("reply")}}, "model-x", "be helpful"), 1)
 	handOver(t, orig.lease)
-
-	objStore := mustObjectStore(t, js, orig.sessionID)
 
 	// Mismatch (different model) rejects by default; the session does not come up.
 	_, err := Restore(context.Background(), restoreCfg(&stubLLM{}, "model-DIFFERENT", "be helpful"),
-		orig.sessionID, js, objStore, mustLeaseManager(t, js))
+		orig.sessionID, store)
 	var cme *ConfigMismatchError
 	if !errors.As(err, &cme) {
 		t.Fatalf("Restore err = %v, want *ConfigMismatchError", err)
 	}
 
 	// A RestoreErrored is recorded (no RestoreDone followed).
-	tail := restoreEventTail(t, js, orig.sessionID, orig.primaryLoopID)
+	tail := restoreEventTail(t, store, orig.sessionID, orig.primaryLoopID)
 	if !lastIs(tail, event.RestoreErrored{}) {
 		t.Errorf("restore-event tail does not end with RestoreErrored: %v", tailTypes(tail))
 	}
 
 	// The override proceeds despite the mismatch (the rejected attempt released its lease).
 	s, err := Restore(context.Background(), restoreCfg(&stubLLM{}, "model-DIFFERENT", "be helpful"),
-		orig.sessionID, js, objStore, mustLeaseManager(t, js), WithAllowConfigMismatch())
+		orig.sessionID, store, WithAllowConfigMismatch())
 	if err != nil {
 		t.Fatalf("Restore with WithAllowConfigMismatch: %v", err)
 	}
@@ -693,18 +815,18 @@ func TestRestoreSwarmFingerprintMismatch(t *testing.T) {
 	for _, tt := range tests {
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
-			js := newEmbeddedJS(t)
+			t.Parallel()
+			store := newRestoreStore(t)
 			cfg := restoreCfg(&stubLLM{}, "model-x", "be helpful")
 			// Persist the fingerprint the original ran under: loop-derived + the swarm fields.
 			persistedFP := fingerprintWith(cfg, persistedFields)
 
-			orig := buildOriginalRun(t, js, persistedFP,
+			orig := buildOriginalRun(t, store, persistedFP,
 				restoreCfg(&stubLLM{chunks: []content.Chunk{textChunk("reply")}}, "model-x", "be helpful"), 1)
 			handOver(t, orig.lease)
-			objStore := mustObjectStore(t, js, orig.sessionID)
 
 			// Restore with the SAME loop.Config but a DIFFERENT injected swarm field → reject.
-			s, err := Restore(context.Background(), cfg, orig.sessionID, js, objStore, mustLeaseManager(t, js),
+			s, err := Restore(context.Background(), cfg, orig.sessionID, store,
 				WithConfigFingerprintFields(tt.liveField))
 			if s != nil {
 				t.Fatalf("Restore returned a non-nil Session on a swarm fingerprint mismatch")
@@ -718,13 +840,13 @@ func TestRestoreSwarmFingerprintMismatch(t *testing.T) {
 			}
 
 			// A RestoreErrored is recorded — fail-secure (no RestoreDone followed).
-			tail := restoreEventTail(t, js, orig.sessionID, orig.primaryLoopID)
+			tail := restoreEventTail(t, store, orig.sessionID, orig.primaryLoopID)
 			if !lastIs(tail, event.RestoreErrored{}) {
 				t.Errorf("restore-event tail does not end with RestoreErrored: %v", tailTypes(tail))
 			}
 
 			// The override proceeds despite the mismatch (the rejected attempt released its lease).
-			s2, err := Restore(context.Background(), cfg, orig.sessionID, js, objStore, mustLeaseManager(t, js),
+			s2, err := Restore(context.Background(), cfg, orig.sessionID, store,
 				WithConfigFingerprintFields(tt.liveField), WithAllowConfigMismatch())
 			if err != nil {
 				t.Fatalf("Restore with WithAllowConfigMismatch (swarm field) err = %v, want success", err)
@@ -735,7 +857,7 @@ func TestRestoreSwarmFingerprintMismatch(t *testing.T) {
 			}
 
 			// A MATCHING injected field set restores cleanly (the agreement/compatibility path).
-			s3, err := Restore(context.Background(), cfg, orig.sessionID, js, objStore, mustLeaseManager(t, js),
+			s3, err := Restore(context.Background(), cfg, orig.sessionID, store,
 				WithConfigFingerprintFields(persistedFields))
 			if err != nil {
 				t.Fatalf("Restore with matching swarm fields err = %v, want success", err)
@@ -764,17 +886,16 @@ func TestRestoreAgentNameMismatch(t *testing.T) {
 	for _, tt := range tests {
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
-			js := newEmbeddedJS(t)
+			t.Parallel()
+			store := newRestoreStore(t)
 			fp := FingerprintFrom(restoreCfg(&stubLLM{}, "model-x", "be helpful"))
 
-			orig := buildOriginalRunNamed(t, js, fp, tt.persistedAgent,
+			orig := buildOriginalRunNamed(t, store, fp, tt.persistedAgent,
 				restoreCfgNamed(&stubLLM{chunks: []content.Chunk{textChunk("reply")}}, "model-x", "be helpful", tt.persistedAgent), 1)
 			handOver(t, orig.lease)
 
-			objStore := mustObjectStore(t, js, orig.sessionID)
-
 			cfg := restoreCfgNamed(&stubLLM{}, "model-x", "be helpful", tt.configuredAgent)
-			s, err := Restore(context.Background(), cfg, orig.sessionID, js, objStore, mustLeaseManager(t, js))
+			s, err := Restore(context.Background(), cfg, orig.sessionID, store)
 
 			if !tt.wantMismatch {
 				// Matching name (model/system/tools unchanged): the session comes up.
@@ -802,13 +923,13 @@ func TestRestoreAgentNameMismatch(t *testing.T) {
 			}
 
 			// A RestoreErrored is recorded (no RestoreDone followed) — fail-secure.
-			tail := restoreEventTail(t, js, orig.sessionID, orig.primaryLoopID)
+			tail := restoreEventTail(t, store, orig.sessionID, orig.primaryLoopID)
 			if !lastIs(tail, event.RestoreErrored{}) {
 				t.Errorf("restore-event tail does not end with RestoreErrored: %v", tailTypes(tail))
 			}
 
 			// The override proceeds despite the mismatch (the rejected attempt released its lease).
-			s2, err := Restore(context.Background(), cfg, orig.sessionID, js, objStore, mustLeaseManager(t, js), WithAllowConfigMismatch())
+			s2, err := Restore(context.Background(), cfg, orig.sessionID, store, WithAllowConfigMismatch())
 			if err != nil {
 				t.Fatalf("Restore with WithAllowConfigMismatch (agent name) err = %v, want success", err)
 			}
@@ -820,16 +941,14 @@ func TestRestoreAgentNameMismatch(t *testing.T) {
 // TestRestoreCrashMidTurn proves the crash seam: a stream ending on an open turn restores
 // user + completed steps (no partial), appends a TurnInterrupted, and comes up idle.
 func TestRestoreCrashMidTurn(t *testing.T) {
-	js := newEmbeddedJS(t)
+	store := newRestoreStore(t)
 	fp := FingerprintFrom(restoreCfg(&stubLLM{}, "model-x", "be helpful"))
 
-	orig := buildCrashedRun(t, js, fp)
+	orig := buildCrashedRun(t, store, fp)
 	handOver(t, orig.lease)
 
-	objStore := mustObjectStore(t, js, orig.sessionID)
-
 	s, err := Restore(context.Background(), restoreCfg(&stubLLM{chunks: []content.Chunk{textChunk("recovered")}}, "model-x", "be helpful"),
-		orig.sessionID, js, objStore, mustLeaseManager(t, js))
+		orig.sessionID, store)
 	if err != nil {
 		t.Fatalf("Restore (crash mid-turn): %v", err)
 	}
@@ -845,7 +964,7 @@ func TestRestoreCrashMidTurn(t *testing.T) {
 	}
 
 	// A TurnInterrupted closed the open turn: tail is RestoreStarted → TurnInterrupted → RestoreDone.
-	assertTail(t, restoreEventTail(t, js, orig.sessionID, orig.primaryLoopID),
+	assertTail(t, restoreEventTail(t, store, orig.sessionID, orig.primaryLoopID),
 		[]event.Event{event.RestoreStarted{}, event.TurnInterrupted{}, event.RestoreDone{}})
 
 	// Comes up idle: a new Submit numbers from the restored index.
@@ -865,16 +984,14 @@ func TestRestoreCrashMidTurn(t *testing.T) {
 // multi-message StepDone group and a TurnFoldedInto fold into the IDENTICAL slice — not
 // merely that the pure foldPrimaryLoop is correct.
 func TestRestoreComplexShapesRoundTrip(t *testing.T) {
-	js := newEmbeddedJS(t)
+	store := newRestoreStore(t)
 	fp := FingerprintFrom(restoreCfg(&stubLLM{}, "model-x", "be helpful"))
 
-	orig := buildComplexShapesRun(t, js, fp)
+	orig := buildComplexShapesRun(t, store, fp)
 	handOver(t, orig.lease)
 
-	objStore := mustObjectStore(t, js, orig.sessionID)
-
 	s, err := Restore(context.Background(), restoreCfg(&stubLLM{chunks: []content.Chunk{textChunk("after restore")}}, "model-x", "be helpful"),
-		orig.sessionID, js, objStore, mustLeaseManager(t, js))
+		orig.sessionID, store)
 	if err != nil {
 		t.Fatalf("Restore (complex shapes): %v", err)
 	}
@@ -892,73 +1009,13 @@ func TestRestoreComplexShapesRoundTrip(t *testing.T) {
 	}
 
 	// The turn closed cleanly (TurnDone), so no interrupt: tail is RestoreStarted -> RestoreDone.
-	assertTail(t, restoreEventTail(t, js, orig.sessionID, orig.primaryLoopID),
+	assertTail(t, restoreEventTail(t, store, orig.sessionID, orig.primaryLoopID),
 		[]event.Event{event.RestoreStarted{}, event.RestoreDone{}})
 
 	// Comes up idle: a new Submit numbers from the restored index.
 	submitAndDrain(t, s, []content.Block{&content.TextBlock{Text: "keep going"}})
 	if _, idx2 := restoredSnapshot(t, s); idx2 != orig.committedTurn+1 {
 		t.Errorf("post-restore turnIndex = %d, want %d", idx2, orig.committedTurn+1)
-	}
-}
-
-// buildRunWithSubagents drives one complete primary turn AND stamps `subagents` durable
-// NON-ROOT LoopStarted events (each carrying a non-zero Header.Cause = a subagent spawn),
-// then snapshots and stops the loop. It models a crashed session that had spawned
-// `subagents` sub-loops over its lifetime — the durable record restore must recount to
-// re-seed the cumulative spawn quota. The lease is left held for the caller to release.
-func buildRunWithSubagents(t *testing.T, js nats.JetStreamContext, fp event.ConfigFingerprint, cfg loop.Config, subagents int) persistedStream {
-	t.Helper()
-	h, sessionID, primaryLoopID, lease, es := newOriginalHub(t, js, fp)
-
-	sub, err := h.SubscribeEvents(event.EventFilter{Enduring: event.LoopScope{All: true}})
-	if err != nil {
-		t.Fatalf("SubscribeEvents: %v", err)
-	}
-	defer func() { _ = sub.Close() }()
-
-	loopCtx, loopCancel := context.WithCancel(context.Background())
-	l, err := loop.New(loopCtx, sessionID, primaryLoopID, loop.Provenance{}, h, cfg)
-	if err != nil {
-		t.Fatalf("loop.New: %v", err)
-	}
-
-	// One complete primary turn so the stream is a realistic run.
-	l.Commands <- command.UserInput{Header: command.Header{CommandID: mustSessionID(t)}, Blocks: []content.Block{&content.TextBlock{Text: "turn input"}}}
-	drainSubToTerminal(t, sub)
-	want := content.AgenticMessages{foldUserMsg("turn input"), aiMessage("reply")}
-
-	// Stamp `subagents` NON-ROOT LoopStarted events directly through the journal-backed hub.
-	// Each carries a non-zero Cause (parent = the primary loop), exactly what NewLoop stamps
-	// on a real subagent spawn — so countSpawnedLoops counts them on restore.
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	for i := 0; i < subagents; i++ {
-		subLoopID := mustSessionID(t)
-		es.stamp(t, ctx, h, event.LoopStarted{Header: event.Header{
-			Coordinates: identity.Coordinates{SessionID: sessionID, LoopID: subLoopID},
-			Cause:       identity.Cause{Coordinates: identity.Coordinates{LoopID: primaryLoopID}, Agency: identity.AgencyMachine},
-		}})
-	}
-
-	snapCtx, snapCancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer snapCancel()
-	msgs, idx, err := l.Snapshot(snapCtx)
-	if err != nil {
-		t.Fatalf("original Snapshot: %v", err)
-	}
-	if !reflect.DeepEqual(msgs, want) {
-		t.Fatalf("original committed msgs =\n  %#v\nwant\n  %#v", msgs, want)
-	}
-	loopCancel()
-	<-l.Done
-
-	return persistedStream{
-		sessionID:     sessionID,
-		primaryLoopID: primaryLoopID,
-		lease:         lease,
-		committedMsgs: msgs,
-		committedTurn: idx,
 	}
 }
 
@@ -969,21 +1026,18 @@ func buildRunWithSubagents(t *testing.T, js nats.JetStreamContext, fp event.Conf
 // post-restore and the next is refused with SessionLoopQuotaExceeded.
 func TestRestoreRecountsSpawnQuota(t *testing.T) {
 	const k = 3
-	js := newEmbeddedJS(t)
+	store := newRestoreStore(t)
 	fp := FingerprintFrom(restoreCfg(&stubLLM{}, "model-x", "be helpful"))
 
-	orig := buildRunWithSubagents(t, js, fp,
+	orig := buildRunWithSubagents(t, store, fp,
 		restoreCfg(&stubLLM{chunks: []content.Chunk{textChunk("reply")}}, "model-x", "be helpful"), k)
 	handOver(t, orig.lease)
-
-	objStore := mustObjectStore(t, js, orig.sessionID)
-	leases := mustLeaseManager(t, js)
 
 	// Restore with Quota == k+1: the durable recount must set spawned == k, leaving room
 	// for exactly one more spawn.
 	s, err := Restore(context.Background(),
 		restoreCfg(&stubLLM{chunks: []content.Chunk{textChunk("after restore")}}, "model-x", "be helpful"),
-		orig.sessionID, js, objStore, leases,
+		orig.sessionID, store,
 		WithLimits(Limits{Depth: 10, Quota: k + 1}))
 	if err != nil {
 		t.Fatalf("Restore: %v", err)
