@@ -141,6 +141,23 @@ func (e *MaterializeError) Error() string {
 
 func (e *MaterializeError) Unwrap() error { return e.Cause }
 
+// IntegrityError reports that an archive fetched from Blobs extracted cleanly but
+// the sha256 of its bytes (Got, a bare hex) does not equal the digest Ref names —
+// a tampered or corrupted blob whose content still decodes. Materialize wipes the
+// partial destination and fails closed, surfacing this as a *MaterializeError's
+// Cause. Ref is the expected content address; both fields are log-safe. A blob so
+// corrupt it breaks gzip or tar surfaces earlier as an extract error instead.
+type IntegrityError struct {
+	Ref Ref
+	Got string
+}
+
+func (e *IntegrityError) Error() string {
+	return "workspacestore: archive for ref " + string(e.Ref) +
+		" failed integrity check: computed digest " + strconv.Quote(e.Got) +
+		" does not match"
+}
+
 // ArchiveEntryError reports that an archive entry was rejected during Materialize as
 // hostile or unsupported: an absolute or ".."-bearing Name (zip-slip), a symlink
 // escaping the destination, or a device/fifo/hardlink entry. Name is the offending
