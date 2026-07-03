@@ -191,9 +191,10 @@ Implements `storekit.Blobs` by **exec'ing the rclone binary** — never linking 
 - `Options{Remote string, Prefix string, Binary string /* default "rclone", resolved via
   exec.LookPath */, ConfigPath string, Timeout time.Duration}`.
 - Security (per CLAUDE.md): argv exec only, no shell; `--` before positional arguments;
-  storekit's key grammar (`[a-z0-9][a-z0-9/_.-]*`, no `..`) plus a validated remote name
-  means no argument can be mistaken for a flag; every call context-bounded; rclone config
-  (credentials) is referenced by path, never parsed, logged, or copied.
+  storekit's canonical segment grammar (single `/` separators, no empty/`.`/`..` segments,
+  no leading or trailing `/`) plus a validated remote name means no argument can be
+  mistaken for a flag; every call context-bounded; rclone config (credentials) is
+  referenced by path, never parsed, logged, or copied.
 - Startup check: binary present and executable, remote resolvable (`rclone lsf --max-depth 0`
   probe) — fail loudly at Open, per fail-secure.
 

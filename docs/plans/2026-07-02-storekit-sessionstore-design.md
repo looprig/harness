@@ -190,7 +190,10 @@ type KV interface {
 }
 
 // Blobs holds bulk immutable bytes (large-record offload; workspace snapshots).
-// Put streams; keys are content-addressed by callers.
+// Put streams; keys are content-addressed by callers. Existing byte-identical
+// content is a success/no-op; existing different content returns
+// *BlobConflictError and leaves the original object unchanged. Delete is
+// idempotent: deleting an absent key succeeds.
 type Blobs interface {
 	Put(ctx context.Context, key string, r io.Reader) error
 	Get(ctx context.Context, key string) (io.ReadCloser, error)
@@ -202,8 +205,8 @@ type Blobs interface {
 ### Composite — pairing partial backends
 
 Not every backend provides every primitive (pgstore has no Blobs). `Composite` assembles a
-full backend from parts at the composition root, with nil fields rejected by the consuming
-engine's `Open`:
+full backend from parts at the composition root through a constructor that rejects missing
+primitives up front:
 
 ```go
 // Composite satisfies Ledger+Leaser+KV+Blobs by embedding one provider per
@@ -214,6 +217,8 @@ type Composite struct {
 	KV
 	Blobs
 }
+
+func NewComposite(l Ledger, le Leaser, kv KV, bl Blobs) (*Composite, error)
 ```
 
 This is how a fleet deployment runs sessions on Postgres: `pgstore` supplies the log,
@@ -242,7 +247,7 @@ message cap stops being an architectural constant.
 
 `ConflictError{Name, Expected}`, `AmbiguousError{Name, Expected, Cause}`,
 `RecordNotFoundError{Name, Seq}`, `KeyNotFoundError{Key}`,
-`BlobNotFoundError{Key}`, `LeaseHeldError{Name, HolderEpoch}`, `LeaseLostError{Name, Epoch}`,
+`BlobNotFoundError{Key}`, `BlobConflictError{Key}`, `LeaseHeldError{Name, HolderEpoch}`, `LeaseLostError{Name, Epoch}`,
 `InvalidNameError{Name, Rule}`. All concrete structs in storekit; backends return them
 (wrapping causes). Engines classify with `errors.As` only — never by string. There is no
 ledger-not-found error: an absent ledger reads as empty (edge semantics above).
@@ -259,7 +264,8 @@ ledger-not-found error: an absent ledger reads as empty (edge semantics above).
   1-based sequencing; CAS conflict on wrong expected; expected==0 semantics; concurrent
   appender linearization; stale-writer-fenced-after-opening-fence; lease epoch monotonicity;
   LeaseHeldError while held; reclaim after holder death (where testable); KV rev CAS; blob
-  round-trip and absence errors; name-grammar rejection (empty/dot segments, doubled or
+  round-trip, absence errors, idempotent Delete, byte-identical re-Put success, different
+  content conflict without overwrite; name-grammar rejection (empty/dot segments, doubled or
   trailing slashes); payload floor acceptance; absent-ledger emptiness (Tip 0, drained
   cursor, idempotent Delete); reads from beyond the tip; sorted duplicate-free listings.
 
