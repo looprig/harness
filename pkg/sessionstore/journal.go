@@ -20,8 +20,8 @@ import (
 // the AppendDefinite) independent of the caller's context. The writer holds its
 // mutex across the whole operation, so an unbounded backend call would wedge every
 // queued Append behind it; this per-append deadline fails one stuck call fast and
-// keeps the serialized writer live. It mirrors the value of journal.defaultAppendTimeout
-// (unexported there), reused per the extraction contract.
+// keeps the serialized writer live. The value matches the journal's historical
+// per-append publish deadline, carried over to the storekit-backed writer.
 const appendTimeout = 5 * time.Second
 
 // blobsInfix is the name segment separating a session's ledger prefix from its
@@ -181,7 +181,7 @@ func (b *sessionJournal) writeLocked(ctx context.Context, rec journal.JournalRec
 // (blob-durable-before-pointer). It runs under mu (writeLocked holds it), so the
 // upload is serialized with the append that references it.
 func (b *sessionJournal) frame(ctx context.Context, rec journal.JournalRecord) ([]byte, error) {
-	k, body, err := encodeRecordBody(rec)
+	k, body, err := b.encodeRecordBody(rec)
 	if err != nil {
 		return nil, err
 	}
@@ -210,7 +210,7 @@ func (b *sessionJournal) offload(ctx context.Context, rec journal.JournalRecord,
 	// Blob durable first: no dangling pointer.
 	if err := b.blobs.Put(ctx, key, bytes.NewReader(env)); err != nil {
 		return nil, &journal.RecordTooLargeError{
-			Subject: rec.Subject(),
+			Subject: b.name,
 			MsgID:   rec.IdempotencyID(),
 			Length:  len(env),
 			Cause:   err,
@@ -232,11 +232,11 @@ func (b *sessionJournal) offload(ctx context.Context, rec journal.JournalRecord,
 func (b *sessionJournal) mapAppendErr(rec journal.JournalRecord, err error) error {
 	var conflict *storekit.ConflictError
 	if errors.As(err, &conflict) {
-		return &journal.AppendError{Subject: rec.Subject(), MsgID: rec.IdempotencyID(), Expected: b.trackedTip, Cause: err}
+		return &journal.AppendError{Subject: b.name, MsgID: rec.IdempotencyID(), Expected: b.trackedTip, Cause: err}
 	}
 	var ambiguous *storekit.AmbiguousError
 	if errors.As(err, &ambiguous) {
-		return &journal.AmbiguousAckError{Subject: rec.Subject(), MsgID: rec.IdempotencyID(), Expected: b.trackedTip, Cause: err}
+		return &journal.AmbiguousAckError{Subject: b.name, MsgID: rec.IdempotencyID(), Expected: b.trackedTip, Cause: err}
 	}
 	// AppendDefinite's verifyAppend could not read the contested tip to resolve a
 	// conflict, so the append outcome is genuinely UNKNOWN — the same unresolved,
@@ -245,7 +245,7 @@ func (b *sessionJournal) mapAppendErr(rec journal.JournalRecord, err error) erro
 	// type through the facade.
 	var verify *storekit.AppendVerifyError
 	if errors.As(err, &verify) {
-		return &journal.AmbiguousAckError{Subject: rec.Subject(), MsgID: rec.IdempotencyID(), Expected: b.trackedTip, Cause: err}
+		return &journal.AmbiguousAckError{Subject: b.name, MsgID: rec.IdempotencyID(), Expected: b.trackedTip, Cause: err}
 	}
 	return err
 }
@@ -255,30 +255,31 @@ func (b *sessionJournal) mapAppendErr(rec journal.JournalRecord, err error) erro
 // command via command.MarshalCommand, a fence via journal.MarshalLeaseFence. The
 // switch is over the sealed JournalRecord sum, so the default arm is unreachable
 // for an in-package record; it fails closed with a typed *journal.RecordKindError
-// rather than panicking if a foreign type ever satisfies the marker. This mirrors
-// the NATS journal's marshalRecord, additionally returning the envelope kind
-// (JournalRecord exposes no Kind(); the concrete type is the source of truth).
-func encodeRecordBody(rec journal.JournalRecord) (kind, []byte, error) {
+// rather than panicking if a foreign type ever satisfies the marker. It additionally
+// returns the envelope kind (JournalRecord exposes no Kind(); the concrete type is the
+// source of truth). Error context uses the ledger name (b.name), the record's
+// backend-neutral destination.
+func (b *sessionJournal) encodeRecordBody(rec journal.JournalRecord) (kind, []byte, error) {
 	switch r := rec.(type) {
 	case journal.EventRecord:
 		body, err := event.MarshalEvent(r.Event())
 		if err != nil {
-			return "", nil, &journal.MarshalRecordError{Subject: rec.Subject(), Cause: err}
+			return "", nil, &journal.MarshalRecordError{Subject: b.name, Cause: err}
 		}
 		return kindEvent, body, nil
 	case journal.CommandRecord:
 		body, err := command.MarshalCommand(r.Command())
 		if err != nil {
-			return "", nil, &journal.MarshalRecordError{Subject: rec.Subject(), Cause: err}
+			return "", nil, &journal.MarshalRecordError{Subject: b.name, Cause: err}
 		}
 		return kindCommand, body, nil
 	case journal.FenceRecord:
 		body, err := journal.MarshalLeaseFence(r.Fence())
 		if err != nil {
-			return "", nil, &journal.MarshalRecordError{Subject: rec.Subject(), Cause: err}
+			return "", nil, &journal.MarshalRecordError{Subject: b.name, Cause: err}
 		}
 		return kindFence, body, nil
 	default:
-		return "", nil, &journal.RecordKindError{Subject: rec.Subject()}
+		return "", nil, &journal.RecordKindError{Subject: b.name}
 	}
 }

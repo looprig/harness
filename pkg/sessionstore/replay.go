@@ -368,10 +368,8 @@ func (c *eventCursor) Next(ctx context.Context) (event.Event, uint64, error) {
 
 // deliver reports whether ev passes this cursor's loop filter. An unnarrowed cursor
 // (zero loopID) delivers every event. A narrowed cursor delivers session-scoped
-// events (captured by the NATS filter's session-event subject) and events of its own
-// loop, and drops every other loop's events — routing on Scope()/LoopID exactly as
-// journal.EventRecord.Subject() does, so the storekit filter cannot diverge from the
-// subject filter it stands in for.
+// events and events of its own loop, and drops every other loop's events — routing on
+// the event's Scope()/LoopID, the same routing the journal's event records carry.
 func (c *eventCursor) deliver(ev event.Event) bool {
 	if c.loopID.IsZero() {
 		return true
