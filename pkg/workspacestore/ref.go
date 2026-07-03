@@ -199,3 +199,32 @@ func (e *ArchiveLimitError) Error() string {
 	return "workspacestore: archive exceeds " + string(e.Limit) + " limit: observed " +
 		strconv.FormatInt(e.Observed, 10) + " > cap " + strconv.FormatInt(e.Cap, 10)
 }
+
+// gcOpList and gcOpDelete are the only two values GCError.Op ever carries: they
+// name the backend Blobs call that failed during a sweep. They are named
+// constants rather than inline literals so the operation is spelled exactly once.
+const (
+	gcOpList   = "list"
+	gcOpDelete = "delete"
+)
+
+// GCError wraps a backend Blobs failure encountered during GC: either the List
+// that enumerates snapshot blobs (Op == gcOpList, Ref empty) or a Delete that
+// removes one unreferenced snapshot (Op == gcOpDelete, Ref naming the blob whose
+// removal failed). Cause is the underlying error, reachable via errors.As and
+// errors.Unwrap. Op is one of the two package constants; a Ref carries no secret;
+// so every field is safe to log.
+type GCError struct {
+	Op    string
+	Ref   Ref
+	Cause error
+}
+
+func (e *GCError) Error() string {
+	if e.Ref == "" {
+		return "workspacestore: gc " + e.Op + ": " + e.Cause.Error()
+	}
+	return "workspacestore: gc " + e.Op + " ref " + string(e.Ref) + ": " + e.Cause.Error()
+}
+
+func (e *GCError) Unwrap() error { return e.Cause }
