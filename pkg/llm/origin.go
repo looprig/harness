@@ -6,7 +6,7 @@ type Origin uint8
 
 const (
 	OriginCustom  Origin = iota // user-supplied; capabilities are asserted, not verified
-	OriginCatalog               // curated row; capabilities are trusted
+	OriginCatalog               // curated by the consumer or integration layer (not necessarily this SDK); capabilities are trusted
 )
 
 func (o Origin) String() string {
