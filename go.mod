@@ -9,6 +9,7 @@ tool (
 )
 
 require (
+	github.com/ciram-co/fsstore v0.0.0-00010101000000-000000000000
 	github.com/decred/dcrd/dcrec/secp256k1/v4 v4.4.1
 	github.com/google/go-tdx-guest v0.3.1
 	github.com/yuin/goldmark v1.8.2
@@ -74,3 +75,9 @@ require (
 )
 
 replace github.com/ciram-co/storekit => ../../../ciram-co/storekit
+
+// fsstore is a storekit filesystem backend, normally wired at the composition root
+// (not by looprig). It is pulled in ONLY by the //go:build integration
+// workspace suspend/resume e2e test, via this test-scoped local replace mirroring the
+// storekit one above (fsstore has no remote; the replace resolves it locally).
+replace github.com/ciram-co/fsstore => ../../../ciram-co/fsstore
