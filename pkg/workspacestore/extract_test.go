@@ -187,6 +187,113 @@ func TestExtractArchiveRoundTrip(t *testing.T) {
 	}
 }
 
+// chmodTreeWritable makes every directory under root owner-writable so a test's
+// t.TempDir cleanup can remove a tree that contains restrictive (e.g. 0o555)
+// directories. WalkDir does not follow symlinks, so it never escapes root.
+func chmodTreeWritable(root string) {
+	_ = filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if d.IsDir() {
+			_ = os.Chmod(p, 0o755)
+		}
+		return nil
+	})
+}
+
+func TestExtractArchiveRestoresReadOnlyDir(t *testing.T) {
+	t.Parallel()
+
+	src := t.TempDir()
+	// The file node precedes the directory node so buildTree writes the child
+	// into the directory BEFORE chmod'ing it read-only (0o555). writeArchive then
+	// emits entries parent-before-child in sorted order, which is exactly the
+	// order that would break a naive extractor that chmods a dir before writing
+	// its children.
+	buildTree(t, src, []node{
+		{path: "ro/inside.txt", kind: kindFile, content: "locked\n", mode: 0o444},
+		{path: "ro", kind: kindDir, mode: 0o555},
+	})
+	t.Cleanup(func() { chmodTreeWritable(src) })
+
+	var buf bytes.Buffer
+	if err := writeArchive(&buf, src); err != nil {
+		t.Fatalf("writeArchive: %v", err)
+	}
+
+	dest := t.TempDir()
+	t.Cleanup(func() { chmodTreeWritable(dest) })
+	if err := extractArchive(context.Background(), bytes.NewReader(buf.Bytes()), dest, generousLimits()); err != nil {
+		t.Fatalf("extractArchive of a read-only dir with a child: %v", err)
+	}
+
+	got, err := os.ReadFile(filepath.Join(dest, "ro", "inside.txt")) // #nosec G304 -- test-controlled path under t.TempDir
+	if err != nil {
+		t.Fatalf("child of read-only dir missing: %v", err)
+	}
+	if string(got) != "locked\n" {
+		t.Errorf("child content = %q, want %q", got, "locked\n")
+	}
+	info, err := os.Lstat(filepath.Join(dest, "ro"))
+	if err != nil {
+		t.Fatalf("Lstat(dest/ro): %v", err)
+	}
+	if info.Mode().Perm() != 0o555 {
+		t.Errorf("restored dir mode = %o, want %o (read-only mode must round-trip)", info.Mode().Perm(), 0o555)
+	}
+}
+
+func TestExtractArchiveRejectsDeepSymlinkAncestor(t *testing.T) {
+	t.Parallel()
+
+	// The spec asks for containment on EVERY path component, not just the
+	// immediate parent. Here the escaping symlink is at depth 2 ("a/b") and the
+	// write targets "a/b/c/d" — the write must be rejected as a hostile entry and
+	// nothing may land at the symlink target.
+	tests := []struct {
+		name   string
+		target string
+		abs    bool
+	}{
+		{name: "absolute target", abs: true},
+		{name: "relative parent-escape target", target: "../../../../escape"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			outside := t.TempDir()
+			target := tt.target
+			if tt.abs {
+				target = outside
+			}
+
+			arc := gzTar(t, []rawEntry{
+				{hdr: tar.Header{Name: "a", Typeflag: tar.TypeDir, Mode: 0o755}},
+				{hdr: tar.Header{Name: "a/b", Typeflag: tar.TypeSymlink, Linkname: target}},
+				{hdr: tar.Header{Name: "a/b/c/d", Typeflag: tar.TypeReg, Mode: 0o644}, data: "must not escape"},
+			})
+
+			dest := t.TempDir()
+			err := extractArchive(context.Background(), bytes.NewReader(arc), dest, generousLimits())
+			if err == nil {
+				t.Fatal("extractArchive returned nil; want rejection of a write through a deep symlink ancestor")
+			}
+			var aee *ArchiveEntryError
+			if !errors.As(err, &aee) {
+				t.Fatalf("extractArchive error = %v (%T), want *ArchiveEntryError", err, err)
+			}
+			// Nothing may have been written through the symlink into its target.
+			if _, statErr := os.Lstat(filepath.Join(outside, "c")); !errors.Is(statErr, fs.ErrNotExist) {
+				t.Errorf("escaped into symlink target %q: Lstat(c) err = %v, want NotExist", outside, statErr)
+			}
+			assertDestEmpty(t, dest)
+		})
+	}
+}
+
 func TestExtractArchiveRejectsHostileEntries(t *testing.T) {
 	t.Parallel()
 

@@ -10,15 +10,18 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 )
 
-// dirCreatePerm is the mode new directories are created with before their
-// archived mode is restored: owner-writable/searchable so children can be
-// written into them regardless of the (possibly restrictive) archived mode,
-// which a final Chmod then applies.
-const dirCreatePerm fs.FileMode = 0o755
+// dirWorkPerm is the mode new directories are created with during extraction,
+// before their archived mode is restored in a final pass. It is owner
+// writable/searchable so children can always be written into a directory even
+// when its archived mode is restrictive (e.g. a read-only 0o555 tree, as the Go
+// module cache uses). A deferred chmod applies the real mode once every entry
+// beneath the directory has been written.
+const dirWorkPerm fs.FileMode = 0o700
 
 // maxEntryNameLen bounds the byte length of an archive entry name. It exceeds
 // every real filesystem's path limit (Linux PATH_MAX is 4096, darwin 1024), so
@@ -35,6 +38,14 @@ const maxEntryNameLen = 4096
 type limits struct {
 	maxEntries int64
 	maxBytes   int64
+}
+
+// pendingDirMode records a directory whose archived permission bits must be
+// restored after every entry beneath it has been written — deferred so a
+// restrictive mode never blocks writing the directory's children mid-extraction.
+type pendingDirMode struct {
+	name string
+	mode fs.FileMode
 }
 
 // extractArchive restores the gzip-compressed tar read from r into dest — the
@@ -54,7 +65,7 @@ func extractArchive(ctx context.Context, r io.Reader, dest string, lim limits) e
 	defer func() { _ = root.Close() }()
 
 	if err := extractEntries(ctx, root, r, lim); err != nil {
-		removeContents(dest)
+		removeContents(root)
 		return err
 	}
 	return nil
@@ -72,6 +83,7 @@ func extractEntries(ctx context.Context, root *os.Root, r io.Reader, lim limits)
 	defer func() { _ = gz.Close() }()
 
 	tr := tar.NewReader(gz)
+	var pendingDirs []pendingDirMode
 	var seen, written int64
 	for {
 		if err := ctx.Err(); err != nil {
@@ -79,7 +91,7 @@ func extractEntries(ctx context.Context, root *os.Root, r io.Reader, lim limits)
 		}
 		hdr, err := tr.Next()
 		if errors.Is(err, io.EOF) {
-			return nil
+			break
 		}
 		if err != nil {
 			return err
@@ -88,19 +100,36 @@ func extractEntries(ctx context.Context, root *os.Root, r io.Reader, lim limits)
 		if seen > lim.maxEntries {
 			return &ArchiveLimitError{Limit: ArchiveLimitEntries, Cap: lim.maxEntries, Observed: seen}
 		}
-		n, err := extractEntry(root, hdr, tr, lim, written)
+		n, err := extractEntry(root, hdr, tr, lim, written, &pendingDirs)
 		if err != nil {
 			return err
 		}
 		written += n
 	}
+	// Every entry is written; only now restore restrictive directory modes.
+	return restoreDirModes(root, pendingDirs)
+}
+
+// restoreDirModes applies each recorded directory's archived permission bits.
+// It processes the deepest paths first (longest name first): a directory is a
+// strict prefix of its children, so a child's name is always longer, and this
+// order guarantees every child is chmod'd — and reached through still-writable
+// ancestors — before its parent is locked down to a possibly no-search mode.
+func restoreDirModes(root *os.Root, dirs []pendingDirMode) error {
+	sort.Slice(dirs, func(i, j int) bool { return len(dirs[i].name) > len(dirs[j].name) })
+	for _, d := range dirs {
+		if err := root.Chmod(d.name, d.mode); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // extractEntry validates one entry's name, confirms no ancestor component is a
 // symlink, and dispatches on the entry type. It returns the number of content
 // bytes written (nonzero only for regular files) so the caller can maintain the
 // cumulative-byte total.
-func extractEntry(root *os.Root, hdr *tar.Header, tr io.Reader, lim limits, written int64) (int64, error) {
+func extractEntry(root *os.Root, hdr *tar.Header, tr io.Reader, lim limits, written int64, dirs *[]pendingDirMode) (int64, error) {
 	if err := validateEntryName(hdr.Name); err != nil {
 		return 0, err
 	}
@@ -110,7 +139,7 @@ func extractEntry(root *os.Root, hdr *tar.Header, tr io.Reader, lim limits, writ
 	}
 	switch hdr.Typeflag {
 	case tar.TypeDir:
-		return 0, extractDir(root, name, hdr)
+		return 0, extractDir(root, name, hdr, dirs)
 	case tar.TypeReg:
 		// tar.Reader normalizes the deprecated old-style regular-file flag
 		// (TypeRegA) to TypeReg on read, so this one case covers every regular
@@ -156,41 +185,60 @@ func validateEntryName(name string) error {
 	return nil
 }
 
-// rejectSymlinkAncestor verifies this entry's immediate parent directory is not a
+// rejectSymlinkAncestor verifies no parent path component of this entry is a
 // symlink, so a symlink planted by an earlier entry can never be traversed to
-// redirect this entry's write. It Lstats the parent through the root sandbox,
-// which does not follow the final component (revealing a symlink parent as such)
-// and refuses to follow any escaping symlink deeper in the path (surfacing that
-// as a plain sandbox error) — os.Root is the independent backstop for the deeper
-// case. A not-yet-created parent is fine: MkdirAll will make it a real directory.
-// origName is the raw entry name used in any resulting *ArchiveEntryError.
+// redirect this entry's write outside dest. It descends component by component
+// through nested *os.Root sandboxes, Lstat'ing each single component without
+// following it: a symlink component is reported as a typed *ArchiveEntryError at
+// any depth. A not-yet-created ancestor is fine — MkdirAll will make it a real
+// directory. os.Root remains the independent hard backstop; this check exists so
+// the boundary reports a hostile entry as *ArchiveEntryError rather than a raw
+// sandbox error. origName is the raw entry name carried in the error.
 func rejectSymlinkAncestor(root *os.Root, origName, name string) error {
 	dir := filepath.Dir(name)
 	if dir == "." || dir == string(filepath.Separator) {
 		return nil
 	}
-	info, err := root.Lstat(dir)
-	if err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
-			return nil // parent does not exist yet; nothing to traverse
+	cur := root
+	closeCur := func() {
+		if cur != root {
+			_ = cur.Close()
 		}
-		return err
 	}
-	if info.Mode()&fs.ModeSymlink != 0 {
-		return &ArchiveEntryError{Name: origName, Reason: "the parent path component is a symlink"}
+	for _, seg := range strings.Split(dir, string(filepath.Separator)) {
+		info, err := cur.Lstat(seg)
+		if err != nil {
+			closeCur()
+			if errors.Is(err, fs.ErrNotExist) {
+				return nil // this ancestor does not exist yet; nothing to traverse
+			}
+			return err
+		}
+		if info.Mode()&fs.ModeSymlink != 0 {
+			closeCur()
+			return &ArchiveEntryError{Name: origName, Reason: "a parent path component is a symlink"}
+		}
+		next, err := cur.OpenRoot(seg)
+		closeCur()
+		if err != nil {
+			return err
+		}
+		cur = next
 	}
+	closeCur()
 	return nil
 }
 
-// extractDir creates the directory named name (with any missing ancestors) and
-// restores its archived permission bits. Directories are first created
-// world-nothing-beyond dirCreatePerm so children remain writable, then chmod'd
-// to the exact archived mode.
-func extractDir(root *os.Root, name string, hdr *tar.Header) error {
-	if err := root.MkdirAll(name, dirCreatePerm); err != nil {
+// extractDir creates the directory named name (with any missing ancestors) at
+// the working mode and records its archived permission bits for restoration in
+// the final pass. Deferring the chmod keeps the directory writable while its
+// children are written, so a restrictive archived mode (e.g. 0o555) round-trips.
+func extractDir(root *os.Root, name string, hdr *tar.Header, dirs *[]pendingDirMode) error {
+	if err := root.MkdirAll(name, dirWorkPerm); err != nil {
 		return err
 	}
-	return root.Chmod(name, hdr.FileInfo().Mode().Perm())
+	*dirs = append(*dirs, pendingDirMode{name: name, mode: hdr.FileInfo().Mode().Perm()})
+	return nil
 }
 
 // extractSymlink creates name as a symlink to the archived target. The target is
@@ -253,28 +301,44 @@ func copyCapped(dst io.Writer, src io.Reader, remaining int64) (int64, bool, err
 }
 
 // ensureParent creates the parent directory chain for name if name is nested.
-// Directories are created with dirCreatePerm; an explicit directory entry (if
-// present in the archive) later restores the exact archived mode.
+// Directories are created at the working mode; an explicit directory entry (if
+// present in the archive) restores the exact archived mode in the final pass.
 func ensureParent(root *os.Root, name string) error {
 	dir := filepath.Dir(name)
 	if dir == "." || dir == string(filepath.Separator) {
 		return nil
 	}
-	return root.MkdirAll(dir, dirCreatePerm)
+	return root.MkdirAll(dir, dirWorkPerm)
 }
 
-// removeContents best-effort deletes every top-level entry under dest, emptying
-// it without removing dest itself (which the caller created). os.RemoveAll does
-// not follow symlinks, so a symlink planted during a partial extraction is
-// unlinked, never traversed. Errors are ignored: cleanup is best-effort and the
-// original extraction error is the meaningful one.
-func removeContents(dest string) {
-	entries, err := os.ReadDir(dest)
+// removeContents best-effort empties the root's directory without removing the
+// directory itself (which the caller created). It first makes every directory
+// owner-writable so RemoveAll can unlink the children of a directory whose
+// (possibly already-restored) archived mode is read-only, then removes each
+// top-level entry. Every operation goes through the *os.Root sandbox and the
+// walk never follows symlinks, so a symlink planted during a partial extraction
+// is unlinked, never traversed. Errors are ignored: cleanup is best-effort and
+// the original extraction error is the meaningful one.
+func removeContents(root *os.Root) {
+	fsys := root.FS()
+	// Re-enable write/search on every directory. WalkDir visits a directory
+	// before reading its children, so chmod'ing it here also re-opens descent
+	// into an otherwise no-search directory.
+	_ = fs.WalkDir(fsys, ".", func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if p != "." && d.IsDir() {
+			_ = root.Chmod(p, dirWorkPerm)
+		}
+		return nil
+	})
+	entries, err := fs.ReadDir(fsys, ".")
 	if err != nil {
 		return
 	}
 	for _, e := range entries {
-		_ = os.RemoveAll(filepath.Join(dest, e.Name()))
+		_ = root.RemoveAll(e.Name())
 	}
 }
 
