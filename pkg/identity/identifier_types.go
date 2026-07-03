@@ -7,7 +7,7 @@ package identity
 import (
 	"strconv"
 
-	"github.com/ciram-co/looprig/pkg/uuid"
+	"github.com/looprig/harness/pkg/uuid"
 )
 
 // Coordinates is the four nesting ids that locate any action in the hierarchy:

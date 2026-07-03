@@ -4,7 +4,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/ciram-co/looprig/pkg/loop"
+	"github.com/looprig/harness/pkg/loop"
 )
 
 // fakeReadGuard is a configurable test double for loop.ReadGuard. denied holds

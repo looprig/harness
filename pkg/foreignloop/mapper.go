@@ -3,9 +3,9 @@ package foreignloop
 import (
 	"log"
 
-	"github.com/ciram-co/looprig/pkg/content"
-	"github.com/ciram-co/looprig/pkg/event"
-	"github.com/ciram-co/looprig/pkg/uuid"
+	"github.com/looprig/harness/pkg/content"
+	"github.com/looprig/harness/pkg/event"
+	"github.com/looprig/harness/pkg/uuid"
 )
 
 // mapper is the turn-scoped, pure translation from the normalized ForeignEvent

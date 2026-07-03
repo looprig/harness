@@ -8,7 +8,7 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/ciram-co/looprig/pkg/llm"
+	"github.com/looprig/harness/pkg/llm"
 	secp256k1 "github.com/decred/dcrd/dcrec/secp256k1/v4"
 )
 

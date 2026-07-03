@@ -6,9 +6,9 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/ciram-co/looprig/pkg/content"
-	"github.com/ciram-co/looprig/pkg/llm"
-	"github.com/ciram-co/looprig/pkg/llm/codec/gemini"
+	"github.com/looprig/harness/pkg/content"
+	"github.com/looprig/harness/pkg/llm"
+	"github.com/looprig/harness/pkg/llm/codec/gemini"
 )
 
 // --- shared helpers (used across the package's test files) ---

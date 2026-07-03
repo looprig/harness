@@ -38,7 +38,7 @@ definer-owned choice.
 
 ## 1a. Scope & module boundary
 
-This design lives in **looprig** (`github.com/ciram-co/looprig`), a reusable
+This design lives in **looprig** (`github.com/looprig/harness`), a reusable
 **SDK/module**. looprig provides **agent-agnostic capability** — the headless
 permission posture (§3) and a reusable HTTP API runner, `pkg/api` (§3f) — but hosts
 **no concrete agents and no `cmd/` entrypoint**, and it **declares no auto-approve
@@ -48,7 +48,7 @@ policy of its own**. Those live in the consumer.
   composition-root `Intent` selector (§3a — a wiring choice, **not** session state), the
   transport-agnostic gate/event model (§3c), and the reusable `pkg/api` runner (§3f). All
   agent-agnostic; all policy-free.
-- **swe (`github.com/ciram-co/swe`, the consumer)** `require`s looprig and owns
+- **swe (`github.com/looprig/swe`, the consumer)** `require`s looprig and owns
   `agents/` (reviewer, operator, coding, personal-assistant, …), `swarms/`, and
   `cmd/swe`. It **wires its agents** — choosing `Interactive` vs the `Unattended` intent
   per agent, **and declaring each agent's auto-approve `PermissionPolicy` allowlist** —
@@ -118,7 +118,7 @@ dismantled. Verified against `main`:
 | Prior section | Premise (2026-06-16) | Reality on `main` | Verdict |
 |---|---|---|---|
 | **B1** — `Invoke` control-event semantics | Fix `Session.Invoke` (blocks, silently discards control events); contrast with `Session.Stream` | Both methods **deleted** — `Invoke` in `9d0867e`, `Stream` in `adf1d53`. Programmatic turn path is now `Submit()` + subscribe + `drainToFinalText` | **Obsolete** — targets deleted methods |
-| **B2** — `WithAutonomous()` on declared agents | Add option to `personalassistant.New`/`coding.New`; replace their `autoApprovedTools`; propagate to `SubagentFactory` | `agents/` **does not exist in looprig** — concrete agents legitimately live in the **swe consumer** (`github.com/ciram-co/swe`), not the SDK (§1a) | **Wrong layer** — retarget as an agent-agnostic SDK posture; the allowlist is the consumer's |
+| **B2** — `WithAutonomous()` on declared agents | Add option to `personalassistant.New`/`coding.New`; replace their `autoApprovedTools`; propagate to `SubagentFactory` | `agents/` **does not exist in looprig** — concrete agents legitimately live in the **swe consumer** (`github.com/looprig/swe`), not the SDK (§1a) | **Wrong layer** — retarget as an agent-agnostic SDK posture; the allowlist is the consumer's |
 | **B3** — `NotificationEvent` + Sink journal | Emit `NotificationEvent`s; "Sinks hold the full redacted journal"; render in TUI | `Sink`/`EventEnvelope`/`Redactable` **deleted** (`4a5faaf`, "zero implementers"); `NotificationEvent` **never built**. Delivery is `Hub` + full-fidelity `Subscription` + durable journal | **Dropped** — no event to render |
 | Event taxonomy (Design A) | `ControlEvent`/`TerminalEvent` markers, `NotificationEvent`, unified `Sink` | Replaced by `Class`×`Scope` + `EndsTurn` + `Header` + `Reply`; delivery via `Hub` + `Subscription` | **Replaced wholesale** |
 | Safety floor + auto-approve | Wildcard `HardApprove` over non-bypassable Containment + HardDeny | **Holds** — a typed `loop.Effect` pipeline in `pkg/tools`; the allowlist mechanism (`HardApprove` + `Policies`) already exists; only the `.urvi` → `~/.looprig` store rename + new deny-write rules | **Reused** — the allowlist is existing machinery (§3b) |

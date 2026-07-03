@@ -6,10 +6,10 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/ciram-co/looprig/pkg/identity"
-	"github.com/ciram-co/looprig/pkg/loop"
-	"github.com/ciram-co/looprig/pkg/tool"
-	"github.com/ciram-co/looprig/pkg/uuid"
+	"github.com/looprig/harness/pkg/identity"
+	"github.com/looprig/harness/pkg/loop"
+	"github.com/looprig/harness/pkg/tool"
+	"github.com/looprig/harness/pkg/uuid"
 )
 
 // mustUUID generates a fresh non-zero UUID for building a non-root parent

@@ -13,8 +13,8 @@ import (
 	"strings"
 	"syscall"
 
-	"github.com/ciram-co/looprig/pkg/loop"
-	"github.com/ciram-co/looprig/pkg/tool"
+	"github.com/looprig/harness/pkg/loop"
+	"github.com/looprig/harness/pkg/tool"
 )
 
 // readfile.go implements the ReadFile tool: a workspace-contained, denied-path-

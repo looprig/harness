@@ -4,9 +4,9 @@ package openaiapi
 import (
 	"io"
 
-	"github.com/ciram-co/looprig/pkg/content"
-	"github.com/ciram-co/looprig/pkg/llm"
-	"github.com/ciram-co/looprig/pkg/llm/codec/sse"
+	"github.com/looprig/harness/pkg/content"
+	"github.com/looprig/harness/pkg/llm"
+	"github.com/looprig/harness/pkg/llm/codec/sse"
 )
 
 // NewStream constructs a StreamReader[content.Chunk] from an HTTP response body

@@ -4,7 +4,7 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/ciram-co/looprig/pkg/uuid"
+	"github.com/looprig/harness/pkg/uuid"
 )
 
 // fixedUUID builds a deterministic non-zero uuid from a single seed byte so the

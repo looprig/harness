@@ -11,9 +11,9 @@ import (
 	"strings"
 	"syscall"
 
-	"github.com/ciram-co/looprig/internal/hashcache"
-	"github.com/ciram-co/looprig/pkg/loop"
-	"github.com/ciram-co/looprig/pkg/tool"
+	"github.com/looprig/harness/internal/hashcache"
+	"github.com/looprig/harness/pkg/loop"
+	"github.com/looprig/harness/pkg/tool"
 )
 
 // check.go implements the seven-stage, fail-secure PermissionChecker.Check

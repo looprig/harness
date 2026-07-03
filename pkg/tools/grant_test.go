@@ -8,8 +8,8 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/ciram-co/looprig/pkg/loop"
-	"github.com/ciram-co/looprig/pkg/tool"
+	"github.com/looprig/harness/pkg/loop"
+	"github.com/looprig/harness/pkg/tool"
 )
 
 // grant_test.go exercises the WRITE side of the policy store: Grant's per-scope

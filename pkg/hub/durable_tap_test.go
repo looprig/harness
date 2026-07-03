@@ -6,8 +6,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ciram-co/looprig/pkg/event"
-	"github.com/ciram-co/looprig/pkg/identity"
+	"github.com/looprig/harness/pkg/event"
+	"github.com/looprig/harness/pkg/identity"
 )
 
 // orderingAppender records, on each AppendEvent call, a snapshot of how many events a

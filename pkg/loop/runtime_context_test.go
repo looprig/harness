@@ -4,7 +4,7 @@ import (
 	"context"
 	"testing"
 
-	"github.com/ciram-co/looprig/pkg/content"
+	"github.com/looprig/harness/pkg/content"
 )
 
 // fakeRuntimeContextProvider is a trivial in-test implementation proving the

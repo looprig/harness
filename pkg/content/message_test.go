@@ -3,7 +3,7 @@ package content_test
 import (
 	"testing"
 
-	"github.com/ciram-co/looprig/pkg/content"
+	"github.com/looprig/harness/pkg/content"
 )
 
 // TestConversation_InterfaceCompliance is a compile-time check — no runtime assertions needed.

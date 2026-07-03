@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/ciram-co/looprig/pkg/llm/codec/sse"
+	"github.com/looprig/harness/pkg/llm/codec/sse"
 )
 
 // errorReader returns an error after emitting a fixed prefix.

@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ciram-co/looprig/pkg/llm"
-	"github.com/ciram-co/looprig/pkg/llm/tee"
+	"github.com/looprig/harness/pkg/llm"
+	"github.com/looprig/harness/pkg/llm/tee"
 )
 
 // This file tests Task 2.8's assembled chain: verifyReport runs attestation

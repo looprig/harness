@@ -6,7 +6,7 @@
 
 **Architecture:** Everything here is a *new symbol* in package `llm` (or the new `pkg/llm/auth` sub-package). No existing struct gains a field; no call site changes behavior. The one edit to an existing type is an *additive method* (`Provider.RequiredAuth()`) that sits beside `RequiresKey()`. Design source: `docs/plans/2026-07-01-llm-provider-codec-layout-design.md` (§ Interfaces, § ModelSpec redesign, § Auth enforcement, § Migration → Phase 0).
 
-**Tech Stack:** Go (module `github.com/ciram-co/looprig`), stdlib only (`context`, `net/http`, `fmt`, `errors`). Table-driven tests with `t.Parallel()`, run under `-race`. Typed errors per `CLAUDE.md`.
+**Tech Stack:** Go (module `github.com/looprig/harness`), stdlib only (`context`, `net/http`, `fmt`, `errors`). Table-driven tests with `t.Parallel()`, run under `-race`. Typed errors per `CLAUDE.md`.
 
 **Scope guardrails:**
 - **Do NOT touch** `pkg/llm/model.go` (`Model`), the `ModelSpec` struct, or `Request`/`Response` in `pkg/llm/llm.go`. Those reshape in Phase 1.
@@ -368,7 +368,7 @@ import (
 	"net/http"
 	"testing"
 
-	"github.com/ciram-co/looprig/pkg/content"
+	"github.com/looprig/harness/pkg/content"
 )
 
 type fakeCodec struct{}
@@ -409,7 +409,7 @@ func TestAuthenticatorSatisfiable(t *testing.T) {
 ```go
 package llm
 
-import "github.com/ciram-co/looprig/pkg/content"
+import "github.com/looprig/harness/pkg/content"
 
 // Codec owns one wire dialect's JSON + stream-event semantics. It does NOT own wire framing:
 // the transport de-frames the response (SSE / AWS eventstream, via the shared codec/sse helper)
@@ -610,7 +610,7 @@ import (
 	"context"
 	"net/http"
 
-	"github.com/ciram-co/looprig/pkg/llm"
+	"github.com/looprig/harness/pkg/llm"
 )
 
 // APIKey is a bearer/API-key secret. Named type so a base URL cannot be passed where a key

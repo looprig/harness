@@ -3,7 +3,7 @@ package loop
 import (
 	"testing"
 
-	"github.com/ciram-co/looprig/pkg/command"
+	"github.com/looprig/harness/pkg/command"
 )
 
 // compile-time: *Loop must satisfy Backend.

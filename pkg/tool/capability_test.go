@@ -4,7 +4,7 @@ import (
 	"context"
 	"testing"
 
-	"github.com/ciram-co/looprig/pkg/uuid"
+	"github.com/looprig/harness/pkg/uuid"
 )
 
 // capableTool implements every optional capability interface, proving each is

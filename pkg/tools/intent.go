@@ -1,6 +1,6 @@
 package tools
 
-import "github.com/ciram-co/looprig/pkg/loop"
+import "github.com/looprig/harness/pkg/loop"
 
 // Intent is the composition-root selector for how autonomous tool approval is.
 // It is NOT session state — neither loop.Config nor Session stores it; the

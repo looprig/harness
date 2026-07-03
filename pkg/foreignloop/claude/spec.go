@@ -1,6 +1,6 @@
 package claude
 
-import "github.com/ciram-co/looprig/pkg/foreignloop"
+import "github.com/looprig/harness/pkg/foreignloop"
 
 // SpecConfigError is the fail-closed result of resolving an invalid SpecConfig into a
 // foreignloop.Spec: a required field (ExecPath or Model) was empty. It is distinct from

@@ -3,7 +3,7 @@ package journal
 import (
 	"context"
 
-	"github.com/ciram-co/looprig/pkg/event"
+	"github.com/looprig/harness/pkg/event"
 )
 
 // NilJournalError reports that a JournalEventAppender was constructed over a nil

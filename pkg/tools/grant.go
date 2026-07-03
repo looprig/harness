@@ -4,8 +4,8 @@ import (
 	"context"
 	"path/filepath"
 
-	"github.com/ciram-co/looprig/pkg/loop"
-	"github.com/ciram-co/looprig/pkg/tool"
+	"github.com/looprig/harness/pkg/loop"
+	"github.com/looprig/harness/pkg/tool"
 )
 
 // grant.go implements the WRITE side of the policy store (design §3c): the

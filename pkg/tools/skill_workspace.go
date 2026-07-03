@@ -9,7 +9,7 @@ import (
 	"os"
 	"syscall"
 
-	"github.com/ciram-co/looprig/pkg/tool"
+	"github.com/looprig/harness/pkg/tool"
 )
 
 // maxSkillNameLen caps a workspace skill name. A skill name is a single path

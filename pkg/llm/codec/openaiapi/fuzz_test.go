@@ -4,7 +4,7 @@ package openaiapi_test
 import (
 	"testing"
 
-	"github.com/ciram-co/looprig/pkg/llm/codec/openaiapi"
+	"github.com/looprig/harness/pkg/llm/codec/openaiapi"
 )
 
 // FuzzDecodeResponse ensures DecodeResponse never panics on arbitrary input.

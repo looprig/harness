@@ -4,7 +4,7 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/ciram-co/looprig/pkg/event"
+	"github.com/looprig/harness/pkg/event"
 )
 
 // SessionPersistenceFault is the typed error the hub raises when a REQUIRED durable

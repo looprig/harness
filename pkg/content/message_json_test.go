@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/ciram-co/looprig/pkg/content"
+	"github.com/looprig/harness/pkg/content"
 )
 
 // TestToolResultMessageJSONPreservesToolUseID is the key regression:

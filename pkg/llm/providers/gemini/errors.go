@@ -3,7 +3,7 @@ package gemini
 import (
 	"fmt"
 
-	"github.com/ciram-co/looprig/pkg/llm"
+	"github.com/looprig/harness/pkg/llm"
 )
 
 // UnsupportedAPIFormatError is a fail-closed rejection, before any I/O, of a

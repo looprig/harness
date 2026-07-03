@@ -8,7 +8,7 @@ import (
 	"io"
 	"net/http"
 
-	"github.com/ciram-co/looprig/pkg/llm"
+	"github.com/looprig/harness/pkg/llm"
 )
 
 // mlkemPubKeySize is the raw byte length of an ML-KEM-768 encapsulation key

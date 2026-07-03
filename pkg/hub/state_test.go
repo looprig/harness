@@ -3,8 +3,8 @@ package hub
 import (
 	"testing"
 
-	"github.com/ciram-co/looprig/pkg/event"
-	"github.com/ciram-co/looprig/pkg/uuid"
+	"github.com/looprig/harness/pkg/event"
+	"github.com/looprig/harness/pkg/uuid"
 )
 
 // TestSessionStateZeroValue confirms the enum zero value: a freshly built

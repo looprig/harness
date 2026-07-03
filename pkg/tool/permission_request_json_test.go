@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/ciram-co/looprig/pkg/identity"
+	"github.com/looprig/harness/pkg/identity"
 )
 
 // sameRequest reports whether two PermissionRequests are observably equal through

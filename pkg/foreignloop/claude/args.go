@@ -1,6 +1,6 @@
 package claude
 
-import "github.com/ciram-co/looprig/pkg/foreignloop"
+import "github.com/looprig/harness/pkg/foreignloop"
 
 // Fixed claude CLI flag tokens. Each is a SEPARATE argv element; a flag and its
 // value are never concatenated ("--model x", never "--model=x").

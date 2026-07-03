@@ -6,10 +6,10 @@ import (
 	"fmt"
 	"log/slog"
 
-	"github.com/ciram-co/looprig/pkg/command"
-	"github.com/ciram-co/looprig/pkg/content"
-	"github.com/ciram-co/looprig/pkg/event"
-	"github.com/ciram-co/looprig/pkg/identity"
+	"github.com/looprig/harness/pkg/command"
+	"github.com/looprig/harness/pkg/content"
+	"github.com/looprig/harness/pkg/event"
+	"github.com/looprig/harness/pkg/identity"
 )
 
 // turnOutcome is the turn goroutine's hand-back to the actor. The turn goroutine

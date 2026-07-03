@@ -3,7 +3,7 @@ package tool
 import (
 	"fmt"
 
-	"github.com/ciram-co/looprig/pkg/identity"
+	"github.com/looprig/harness/pkg/identity"
 )
 
 // PermissionRequest is the sealed approval-prompt contract a tool's

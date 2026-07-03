@@ -7,7 +7,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/ciram-co/looprig/pkg/loop"
+	"github.com/looprig/harness/pkg/loop"
 )
 
 // policySchemaVersion is bumped whenever the fingerprint input shape changes, so

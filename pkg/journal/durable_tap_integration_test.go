@@ -7,11 +7,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ciram-co/looprig/pkg/event"
-	"github.com/ciram-co/looprig/pkg/hub"
-	"github.com/ciram-co/looprig/pkg/identity"
-	"github.com/ciram-co/looprig/pkg/journal"
-	"github.com/ciram-co/looprig/pkg/uuid"
+	"github.com/looprig/harness/pkg/event"
+	"github.com/looprig/harness/pkg/hub"
+	"github.com/looprig/harness/pkg/identity"
+	"github.com/looprig/harness/pkg/journal"
+	"github.com/looprig/harness/pkg/uuid"
 )
 
 // TestHubDurableTapReplayable is the end-to-end Phase-7 assertion: publishing Enduring

@@ -7,8 +7,8 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/ciram-co/looprig/pkg/content"
-	"github.com/ciram-co/looprig/pkg/llm"
+	"github.com/looprig/harness/pkg/content"
+	"github.com/looprig/harness/pkg/llm"
 )
 
 // EncodeRequest converts a provider-neutral llm.Request into an Anthropic

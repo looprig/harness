@@ -4,7 +4,7 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/ciram-co/looprig/pkg/command"
+	"github.com/looprig/harness/pkg/command"
 )
 
 func TestShutdownValidate(t *testing.T) {

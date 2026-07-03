@@ -6,7 +6,7 @@
   awaiting explicit go-ahead.
 - **Goal:** make this repository an **importable framework** (`looprig`) that a separate
   **`swe`** swarm repo depends on. Rename module `github.com/inventivepotter/urvi` →
-  `github.com/ciram-co/looprig` (matches the `looprig` remote at
+  `github.com/looprig/harness` (matches the `looprig` remote at
   `git@github.com:ciram-co/looprig.git`). Promote the engine out of `internal/` into a flat
   `pkg/`. Extract the swe swarm (`agents/`, `swarms/`, `cmd/`) into its own module/repo.
 - **Why this is small:** the dependency graph is **already a clean DAG** — no framework code
@@ -19,8 +19,8 @@
 
 | Repo | Module | Contents |
 |---|---|---|
-| **looprig** (this repo, after pruning) | `github.com/ciram-co/looprig` | engine in `pkg/*`, reusable `pkg/tools` + `pkg/tui`, framework-private `internal/*`. A **library** (no `main`). |
-| **swe** (new) | `github.com/ciram-co/swe` | `agents/{5 roles}`, `swarms/swe`, `cmd/swe`. Depends on `looprig`. |
+| **looprig** (this repo, after pruning) | `github.com/looprig/harness` | engine in `pkg/*`, reusable `pkg/tools` + `pkg/tui`, framework-private `internal/*`. A **library** (no `main`). |
+| **swe** (new) | `github.com/looprig/swe` | `agents/{5 roles}`, `swarms/swe`, `cmd/swe`. Depends on `looprig`. |
 
 **Stop at two.** The only natural *future* seams (defer — YAGNI) are `pkg/llm/openaiapi`
 (pulls `go-tdx-guest`, `x/crypto`) and `pkg/journal` (pulls embedded `nats-server`) as
@@ -72,7 +72,7 @@ git add -A && git commit -m "refactor: promote engine internal/->pkg/, rename mo
 
 ### The rewrite rules (also embedded in the script)
 
-`OLD=github.com/inventivepotter/urvi`, `NEW=github.com/ciram-co/looprig`. The file set is
+`OLD=github.com/inventivepotter/urvi`, `NEW=github.com/looprig/harness`. The file set is
 discovered with **`git grep -lzF "$OLD" -- '*.go' '*.mod' ':(exclude)vendor'`** — tracked files
 in **this worktree only**, so it never descends into the gitignored `.worktrees/` (which holds
 ~500 unrelated Go files that must NOT be rewritten) and excludes `vendor/`. The list is piped
@@ -217,7 +217,7 @@ go work init ./urvi ./swe    # use ./looprig instead if you renamed the dir
 `~/code/go.work` sits above both repos so neither tracks it; `go build`/`go test` then use the
 local looprig. Note `go mod tidy` **ignores** the workspace (it tidies a single module), so for
 anything you tag, publish looprig and rely on the real `require`. A single-module equivalent is an
-**uncommitted** `go mod edit -replace=github.com/ciram-co/looprig=/abs/path/to/urvi` — never commit
+**uncommitted** `go mod edit -replace=github.com/looprig/harness=/abs/path/to/urvi` — never commit
 it (it would pin a machine-local path into the tag).
 
 ## 5. Sizing (mechanical, low-complexity)
@@ -263,7 +263,7 @@ Phase 2: each repo independently `CGO_ENABLED=0 go build -trimpath ./... && go t
 - MAJOR: `02` used a predictable `/tmp/swe_rewrite_files` (race/symlink) → `mktemp`+`trap`.
 - NIT: boundary classes now include a backtick (raw-string imports); gofmt re-list uses `-F`;
   `--` added before perl/gofmt file operands.
-- New: `GOPRIVATE=github.com/ciram-co/*` added before swe's `go mod tidy` (looprig is `--private`).
+- New: `GOPRIVATE=github.com/looprig/*` added before swe's `go mod tidy` (looprig is `--private`).
 - Confirmed OK by Codex: bare rule still rewrites the `module` line (perl `$` before final
   newline); Phase 2 leaves `looprig/pkg/...` untouched; tag-before-tidy ordering not racy;
   `$ENV{OLD}` regex-escaped via `\Q\E`; xargs NUL-safe and under ARG_MAX.
@@ -324,7 +324,7 @@ imports covered):
 
 **Round 7 → `03` hardened** (Phase 1 GO re-confirmed; all of `03`/`04` otherwise fail-closed):
 - BLOCKER: `03` didn't prove Phase 1 ran (could prune+tag a `looprig v0.1.0` still on the old
-  module path) → added a step 0 gate: `go list -m == github.com/ciram-co/looprig`, required
+  module path) → added a step 0 gate: `go list -m == github.com/looprig/harness`, required
   `pkg/*` layout, and `git grep` reject of any remaining `inventivepotter/urvi` build input.
 - MAJOR: `$SWE_DIR` could resolve *inside* the looprig worktree and be staged into the tag via
   `git add -A` → canonicalize (`pwd -P`) + reject any path under `REPO_ROOT`, and **scope the

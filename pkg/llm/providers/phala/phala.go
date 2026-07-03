@@ -8,9 +8,9 @@
 package phala
 
 import (
-	"github.com/ciram-co/looprig/pkg/llm"
-	"github.com/ciram-co/looprig/pkg/llm/aci"
-	"github.com/ciram-co/looprig/pkg/llm/auth"
+	"github.com/looprig/harness/pkg/llm"
+	"github.com/looprig/harness/pkg/llm/aci"
+	"github.com/looprig/harness/pkg/llm/auth"
 )
 
 // defaultBaseURL is the canonical Phala inference host, used when New is given "".

@@ -8,12 +8,12 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/ciram-co/looprig/pkg/command"
-	"github.com/ciram-co/looprig/pkg/content"
-	"github.com/ciram-co/looprig/pkg/event"
-	"github.com/ciram-co/looprig/pkg/llm"
-	"github.com/ciram-co/looprig/pkg/tool"
-	"github.com/ciram-co/looprig/pkg/uuid"
+	"github.com/looprig/harness/pkg/command"
+	"github.com/looprig/harness/pkg/content"
+	"github.com/looprig/harness/pkg/event"
+	"github.com/looprig/harness/pkg/llm"
+	"github.com/looprig/harness/pkg/tool"
+	"github.com/looprig/harness/pkg/uuid"
 )
 
 // turnRecorder stands in for the actor during runTurn unit tests. It records the

@@ -10,8 +10,8 @@ import (
 	"context"
 	"encoding/json"
 
-	"github.com/ciram-co/looprig/pkg/content"
-	"github.com/ciram-co/looprig/pkg/uuid"
+	"github.com/looprig/harness/pkg/content"
+	"github.com/looprig/harness/pkg/uuid"
 )
 
 // ToolInfo is a tool's self-description. Schema is a JSON Schema describing the

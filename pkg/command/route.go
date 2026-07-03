@@ -1,8 +1,8 @@
 package command
 
 import (
-	"github.com/ciram-co/looprig/pkg/identity"
-	"github.com/ciram-co/looprig/pkg/uuid"
+	"github.com/looprig/harness/pkg/identity"
+	"github.com/looprig/harness/pkg/uuid"
 )
 
 // GateRoute is the routing key for a gate reply. identity.Coordinates locates the

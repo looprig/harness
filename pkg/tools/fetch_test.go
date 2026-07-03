@@ -8,8 +8,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ciram-co/looprig/pkg/content"
-	"github.com/ciram-co/looprig/pkg/tool"
+	"github.com/looprig/harness/pkg/content"
+	"github.com/looprig/harness/pkg/tool"
 )
 
 // textOf extracts the single text-block payload from a tool result, failing the

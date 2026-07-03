@@ -13,16 +13,16 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/ciram-co/looprig/pkg/command"
-	"github.com/ciram-co/looprig/pkg/content"
-	"github.com/ciram-co/looprig/pkg/event"
-	"github.com/ciram-co/looprig/pkg/identity"
-	"github.com/ciram-co/looprig/pkg/journal"
-	"github.com/ciram-co/looprig/pkg/tool"
-	"github.com/ciram-co/looprig/pkg/transcript"
-	"github.com/ciram-co/looprig/pkg/transcript/html"
-	"github.com/ciram-co/looprig/pkg/transcript/journalsource"
-	"github.com/ciram-co/looprig/pkg/uuid"
+	"github.com/looprig/harness/pkg/command"
+	"github.com/looprig/harness/pkg/content"
+	"github.com/looprig/harness/pkg/event"
+	"github.com/looprig/harness/pkg/identity"
+	"github.com/looprig/harness/pkg/journal"
+	"github.com/looprig/harness/pkg/tool"
+	"github.com/looprig/harness/pkg/transcript"
+	"github.com/looprig/harness/pkg/transcript/html"
+	"github.com/looprig/harness/pkg/transcript/journalsource"
+	"github.com/looprig/harness/pkg/uuid"
 )
 
 // primaryPromptResolver is the export-time SystemPromptResolver swe wires: it resolves

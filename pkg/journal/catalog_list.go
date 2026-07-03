@@ -6,8 +6,8 @@ import (
 	"io"
 	"time"
 
-	"github.com/ciram-co/looprig/pkg/event"
-	"github.com/ciram-co/looprig/pkg/uuid"
+	"github.com/looprig/harness/pkg/event"
+	"github.com/looprig/harness/pkg/uuid"
 	"github.com/nats-io/nats.go"
 )
 

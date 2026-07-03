@@ -6,9 +6,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ciram-co/looprig/pkg/command"
-	"github.com/ciram-co/looprig/pkg/event"
-	"github.com/ciram-co/looprig/pkg/loop"
+	"github.com/looprig/harness/pkg/command"
+	"github.com/looprig/harness/pkg/event"
+	"github.com/looprig/harness/pkg/loop"
 )
 
 // validCfg is the minimal loop.Config a foreign loop accepts: a non-empty system

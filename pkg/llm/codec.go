@@ -1,6 +1,6 @@
 package llm
 
-import "github.com/ciram-co/looprig/pkg/content"
+import "github.com/looprig/harness/pkg/content"
 
 // Codec owns one wire dialect's JSON + stream-event semantics. It does NOT own wire framing:
 // the transport de-frames the response (SSE / AWS eventstream, via the shared codec/sse helper)

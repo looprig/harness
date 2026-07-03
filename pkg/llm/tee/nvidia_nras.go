@@ -16,7 +16,7 @@ import (
 	"math/big"
 	"net/http"
 
-	"github.com/ciram-co/looprig/pkg/llm"
+	"github.com/looprig/harness/pkg/llm"
 )
 
 // GPUEvidence is one entry of the per-instance gpu_evidence list returned by a

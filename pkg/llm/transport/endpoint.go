@@ -7,7 +7,7 @@
 // helper and hands the codec one event payload at a time.
 package transport
 
-import "github.com/ciram-co/looprig/pkg/llm"
+import "github.com/looprig/harness/pkg/llm"
 
 // DefaultChatPath is the OpenAI-compatible chat completions request path, used
 // when an Endpoint leaves ChatPath empty.

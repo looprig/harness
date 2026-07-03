@@ -8,7 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 
-	"github.com/ciram-co/looprig/pkg/llm"
+	"github.com/looprig/harness/pkg/llm"
 )
 
 // APIKey is a bearer/API-key secret. Named type so a base URL cannot be passed where a key

@@ -10,7 +10,7 @@ import (
 	"io"
 	"strconv"
 
-	"github.com/ciram-co/looprig/pkg/uuid"
+	"github.com/looprig/harness/pkg/uuid"
 	"github.com/nats-io/nats.go"
 )
 

@@ -3,7 +3,7 @@ package hub
 import (
 	"sync"
 
-	"github.com/ciram-co/looprig/pkg/event"
+	"github.com/looprig/harness/pkg/event"
 )
 
 // defaultEgressBuffer is the capacity of each subscription's bounded egress

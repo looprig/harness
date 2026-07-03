@@ -4,7 +4,7 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/ciram-co/looprig/pkg/llm"
+	"github.com/looprig/harness/pkg/llm"
 )
 
 func f64ptr(v float64) *float64 { return &v }

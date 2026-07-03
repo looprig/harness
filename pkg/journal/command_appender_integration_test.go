@@ -7,9 +7,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ciram-co/looprig/pkg/command"
-	"github.com/ciram-co/looprig/pkg/identity"
-	"github.com/ciram-co/looprig/pkg/journal"
+	"github.com/looprig/harness/pkg/command"
+	"github.com/looprig/harness/pkg/identity"
+	"github.com/looprig/harness/pkg/journal"
 	"github.com/nats-io/nats.go"
 )
 

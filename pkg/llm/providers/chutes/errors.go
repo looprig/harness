@@ -1,6 +1,6 @@
 package chutes
 
-import "github.com/ciram-co/looprig/pkg/llm"
+import "github.com/looprig/harness/pkg/llm"
 
 // AttestReason names the specific attestation check that failed. It lets
 // callers branch on the failure mode via errors.As without parsing strings.

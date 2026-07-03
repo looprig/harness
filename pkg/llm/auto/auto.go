@@ -14,14 +14,14 @@ package auto
 import (
 	"fmt"
 
-	"github.com/ciram-co/looprig/pkg/llm"
-	"github.com/ciram-co/looprig/pkg/llm/auth"
-	"github.com/ciram-co/looprig/pkg/llm/codec/anthropicapi"
-	"github.com/ciram-co/looprig/pkg/llm/codec/gemini"
-	"github.com/ciram-co/looprig/pkg/llm/codec/openaiapi"
-	"github.com/ciram-co/looprig/pkg/llm/providers/chutes"
-	geminiprovider "github.com/ciram-co/looprig/pkg/llm/providers/gemini"
-	"github.com/ciram-co/looprig/pkg/llm/transport"
+	"github.com/looprig/harness/pkg/llm"
+	"github.com/looprig/harness/pkg/llm/auth"
+	"github.com/looprig/harness/pkg/llm/codec/anthropicapi"
+	"github.com/looprig/harness/pkg/llm/codec/gemini"
+	"github.com/looprig/harness/pkg/llm/codec/openaiapi"
+	"github.com/looprig/harness/pkg/llm/providers/chutes"
+	geminiprovider "github.com/looprig/harness/pkg/llm/providers/gemini"
+	"github.com/looprig/harness/pkg/llm/transport"
 )
 
 // SigV4NotConstructibleError is returned by New for a provider whose required

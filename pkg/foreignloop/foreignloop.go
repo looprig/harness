@@ -3,10 +3,10 @@ package foreignloop
 import (
 	"context"
 
-	"github.com/ciram-co/looprig/pkg/content"
-	"github.com/ciram-co/looprig/pkg/event"
-	"github.com/ciram-co/looprig/pkg/loop"
-	"github.com/ciram-co/looprig/pkg/uuid"
+	"github.com/looprig/harness/pkg/content"
+	"github.com/looprig/harness/pkg/event"
+	"github.com/looprig/harness/pkg/loop"
+	"github.com/looprig/harness/pkg/uuid"
 )
 
 // PermissionPosture is the typed, non-interactive permission mode passed to the

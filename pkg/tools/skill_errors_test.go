@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/ciram-co/looprig/pkg/identity"
+	"github.com/looprig/harness/pkg/identity"
 )
 
 func TestUnknownSkillError(t *testing.T) {

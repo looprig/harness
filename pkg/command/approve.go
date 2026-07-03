@@ -1,8 +1,8 @@
 package command
 
 import (
-	"github.com/ciram-co/looprig/pkg/tool"
-	"github.com/ciram-co/looprig/pkg/uuid"
+	"github.com/looprig/harness/pkg/tool"
+	"github.com/looprig/harness/pkg/uuid"
 )
 
 // ApproveToolCall approves a pending tool call identified by ToolExecutionID, granting it

@@ -4,7 +4,7 @@ import (
 	"slices"
 	"testing"
 
-	"github.com/ciram-co/looprig/pkg/loop"
+	"github.com/looprig/harness/pkg/loop"
 )
 
 // fingerprintBase returns a fully-populated base policy for the digest tests. It is

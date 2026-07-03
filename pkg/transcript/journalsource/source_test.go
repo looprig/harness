@@ -9,11 +9,11 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/ciram-co/looprig/pkg/command"
-	"github.com/ciram-co/looprig/pkg/event"
-	"github.com/ciram-co/looprig/pkg/journal"
-	"github.com/ciram-co/looprig/pkg/transcript"
-	"github.com/ciram-co/looprig/pkg/uuid"
+	"github.com/looprig/harness/pkg/command"
+	"github.com/looprig/harness/pkg/event"
+	"github.com/looprig/harness/pkg/journal"
+	"github.com/looprig/harness/pkg/transcript"
+	"github.com/looprig/harness/pkg/uuid"
 )
 
 // errBoom is the sentinel non-EOF read error a fakeCursor injects mid-stream.

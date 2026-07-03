@@ -8,10 +8,10 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/ciram-co/looprig/pkg/event"
-	"github.com/ciram-co/looprig/pkg/transcript"
-	"github.com/ciram-co/looprig/pkg/transcript/html"
-	"github.com/ciram-co/looprig/pkg/transcript/journalsource"
+	"github.com/looprig/harness/pkg/event"
+	"github.com/looprig/harness/pkg/transcript"
+	"github.com/looprig/harness/pkg/transcript/html"
+	"github.com/looprig/harness/pkg/transcript/journalsource"
 )
 
 // Client-safe messages for the stream + export endpoints. Deliberately generic so a

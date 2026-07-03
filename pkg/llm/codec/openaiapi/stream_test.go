@@ -6,8 +6,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/ciram-co/looprig/pkg/content"
-	"github.com/ciram-co/looprig/pkg/llm/codec/openaiapi"
+	"github.com/looprig/harness/pkg/content"
+	"github.com/looprig/harness/pkg/llm/codec/openaiapi"
 )
 
 // closerSpy wraps an io.Reader and records whether Close was called.

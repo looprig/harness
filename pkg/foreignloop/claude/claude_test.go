@@ -5,7 +5,7 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/ciram-co/looprig/pkg/foreignloop"
+	"github.com/looprig/harness/pkg/foreignloop"
 )
 
 // Agent must satisfy the foreign-agent port.

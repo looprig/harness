@@ -7,7 +7,7 @@ import (
 	"encoding/json"
 	"strconv"
 
-	"github.com/ciram-co/looprig/pkg/llm/tee"
+	"github.com/looprig/harness/pkg/llm/tee"
 )
 
 // This file implements attestation step 5 of the Dstack ACI ("aci/1") report

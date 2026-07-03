@@ -3,7 +3,7 @@ package claude
 import (
 	"testing"
 
-	"github.com/ciram-co/looprig/pkg/foreignloop"
+	"github.com/looprig/harness/pkg/foreignloop"
 )
 
 // indexOf returns the first index of v in argv, or -1 when absent.

@@ -8,7 +8,7 @@
 
 **Architecture:** Wire the Phase-0 types (`APIFormat`, `Origin`, `Capabilities`, `Sampling`, `Effort`, `Codec`, `Authenticator`, `AuthKind`, `ModelMismatchError`, `pkg/llm/auth`) into the domain. The client binds `Provider`+endpoint+`Authenticator` once; each `Request` carries a secret-free `Model` whose connection fields must match the bound client (else `*ModelMismatchError`, pre-I/O). Codec selected per turn from `req.Model.APIFormat`. Source of truth: `docs/plans/2026-07-01-llm-provider-codec-layout-design.md` (§ ModelSpec redesign → After, § Auth enforcement, § Consumer impact, § Migration → Phase 1).
 
-**Tech Stack:** Go (`github.com/ciram-co/looprig`), stdlib + already-approved deps. Table-driven `-race` tests; typed errors. Worktree + `GOWORK=off` on every `go`/`make` command (worktree is outside the parent `go.work`).
+**Tech Stack:** Go (`github.com/looprig/harness`), stdlib + already-approved deps. Table-driven `-race` tests; typed errors. Worktree + `GOWORK=off` on every `go`/`make` command (worktree is outside the parent `go.work`).
 
 ---
 

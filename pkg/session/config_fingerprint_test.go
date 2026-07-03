@@ -5,9 +5,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ciram-co/looprig/pkg/event"
-	"github.com/ciram-co/looprig/pkg/loop"
-	"github.com/ciram-co/looprig/pkg/tool"
+	"github.com/looprig/harness/pkg/event"
+	"github.com/looprig/harness/pkg/loop"
+	"github.com/looprig/harness/pkg/tool"
 )
 
 // fpTool is a minimal InvokableTool whose Info reports a fixed name, used to drive

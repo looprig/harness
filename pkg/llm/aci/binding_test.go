@@ -5,7 +5,7 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/ciram-co/looprig/pkg/llm"
+	"github.com/looprig/harness/pkg/llm"
 )
 
 // The arbiter values for attestation step 3 (report_data binding), independently

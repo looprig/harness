@@ -10,7 +10,7 @@ import (
 	"strconv"
 	"syscall"
 
-	"github.com/ciram-co/looprig/pkg/tool"
+	"github.com/looprig/harness/pkg/tool"
 )
 
 // writefile.go implements the WriteFile tool: a workspace-contained atomic file

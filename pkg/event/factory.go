@@ -3,7 +3,7 @@ package event
 import (
 	"time"
 
-	"github.com/ciram-co/looprig/pkg/uuid"
+	"github.com/looprig/harness/pkg/uuid"
 )
 
 // Clock and IDGen are injected so tests are deterministic (mirrors session's

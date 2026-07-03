@@ -10,7 +10,7 @@ import (
 	"strings"
 	"syscall"
 
-	"github.com/ciram-co/looprig/pkg/tool"
+	"github.com/looprig/harness/pkg/tool"
 )
 
 // editfile.go implements the EditFile tool: an exact-string-replace editor over a

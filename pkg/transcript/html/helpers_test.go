@@ -7,9 +7,9 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/ciram-co/looprig/pkg/content"
-	"github.com/ciram-co/looprig/pkg/tool"
-	"github.com/ciram-co/looprig/pkg/transcript"
+	"github.com/looprig/harness/pkg/content"
+	"github.com/looprig/harness/pkg/tool"
+	"github.com/looprig/harness/pkg/transcript"
 )
 
 func TestMessageText(t *testing.T) {

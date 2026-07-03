@@ -6,8 +6,8 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/ciram-co/looprig/internal/hashcache"
-	"github.com/ciram-co/looprig/pkg/loop"
+	"github.com/looprig/harness/internal/hashcache"
+	"github.com/looprig/harness/pkg/loop"
 )
 
 // permission.go defines the policy data structures, fail-secure default

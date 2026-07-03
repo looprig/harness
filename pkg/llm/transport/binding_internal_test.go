@@ -4,9 +4,9 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/ciram-co/looprig/pkg/llm"
-	"github.com/ciram-co/looprig/pkg/llm/auth"
-	"github.com/ciram-co/looprig/pkg/llm/codec/openaiapi"
+	"github.com/looprig/harness/pkg/llm"
+	"github.com/looprig/harness/pkg/llm/auth"
+	"github.com/looprig/harness/pkg/llm/codec/openaiapi"
 )
 
 // TestCheckBindingEmptyBase locks the "empty request base means the bound

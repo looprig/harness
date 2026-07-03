@@ -6,7 +6,7 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/ciram-co/looprig/pkg/llm/tee"
+	"github.com/looprig/harness/pkg/llm/tee"
 )
 
 // This file implements attestation step 4 of the Dstack ACI ("aci/1") report

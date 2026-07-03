@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/ciram-co/looprig/pkg/llm"
+	"github.com/looprig/harness/pkg/llm"
 )
 
 // TestSupportedAPIVersion pins the wire api_version this client speaks.

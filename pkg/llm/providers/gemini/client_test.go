@@ -11,10 +11,10 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"github.com/ciram-co/looprig/pkg/content"
-	"github.com/ciram-co/looprig/pkg/llm"
-	"github.com/ciram-co/looprig/pkg/llm/auth"
-	gemini "github.com/ciram-co/looprig/pkg/llm/providers/gemini"
+	"github.com/looprig/harness/pkg/content"
+	"github.com/looprig/harness/pkg/llm"
+	"github.com/looprig/harness/pkg/llm/auth"
+	gemini "github.com/looprig/harness/pkg/llm/providers/gemini"
 )
 
 // Client must satisfy the llm.LLM contract.

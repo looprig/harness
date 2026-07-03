@@ -8,8 +8,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/ciram-co/looprig/pkg/content"
-	"github.com/ciram-co/looprig/pkg/tool"
+	"github.com/looprig/harness/pkg/content"
+	"github.com/looprig/harness/pkg/tool"
 )
 
 // runWriteFile invokes WriteFile and extracts the single text block, failing on

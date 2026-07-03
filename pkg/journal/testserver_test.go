@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ciram-co/looprig/pkg/journal"
-	"github.com/ciram-co/looprig/pkg/uuid"
+	"github.com/looprig/harness/pkg/journal"
+	"github.com/looprig/harness/pkg/uuid"
 	"github.com/nats-io/nats-server/v2/server"
 	"github.com/nats-io/nats.go"
 )

@@ -2,7 +2,7 @@
 
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
-**Goal:** Turn this repo into an importable framework (`github.com/ciram-co/looprig`) and split the SWE swarm into its own module (`github.com/ciram-co/swe`) that depends on it — with zero logic changes, only relocation + rename.
+**Goal:** Turn this repo into an importable framework (`github.com/looprig/harness`) and split the SWE swarm into its own module (`github.com/looprig/swe`) that depends on it — with zero logic changes, only relocation + rename.
 
 **Architecture:** Two ordered phases driven by reviewed, fail-closed scripts. **Phase 1** (one module, in place): rename `urvi→looprig`, promote the engine `internal/→pkg/` (flattened), promote `tools/`+`tui/` → `pkg/`. **Phase 2** (split): tag looprig as a library, extract `agents/ swarms/ cmd/` into a new swe module that requires the published looprig tag. The dependency graph is already a clean DAG (no framework→consumer back-edge), so this is pure relocation.
 
@@ -70,7 +70,7 @@ Expected: all tests pass under `-race`; `make secure` (gofmt-check + vet + stati
 **Step 4 — spot-check the result**
 
 Run: `head -1 go.mod ; ls -d pkg/* ; git grep -c 'inventivepotter/urvi' -- '*.go' '*.mod' ':(exclude)vendor' | head`
-Expected: `module github.com/ciram-co/looprig`; flat `pkg/{loop,command,event,identity,session,hub,journal,content,llm,tool,uuid,persistence,eval,cli,tools,tui}`; **zero** old-path matches.
+Expected: `module github.com/looprig/harness`; flat `pkg/{loop,command,event,identity,session,hub,journal,content,llm,tool,uuid,persistence,eval,cli,tools,tui}`; **zero** old-path matches.
 
 **Step 5 — commit**
 

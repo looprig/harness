@@ -4,8 +4,8 @@ import (
 	"context"
 	"testing"
 
-	"github.com/ciram-co/looprig/pkg/loop"
-	"github.com/ciram-co/looprig/pkg/tool"
+	"github.com/looprig/harness/pkg/loop"
+	"github.com/looprig/harness/pkg/tool"
 )
 
 // simple_tools_check_test.go pins the security CLASSIFICATION of the two SIMPLE,

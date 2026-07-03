@@ -9,8 +9,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/ciram-co/looprig/pkg/content"
-	"github.com/ciram-co/looprig/pkg/tool"
+	"github.com/looprig/harness/pkg/content"
+	"github.com/looprig/harness/pkg/tool"
 )
 
 // requireSh skips a test when no POSIX sh is on PATH (Bash tests exec it).

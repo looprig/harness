@@ -1,4 +1,4 @@
-module github.com/ciram-co/looprig
+module github.com/looprig/harness
 
 go 1.26.4
 

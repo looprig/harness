@@ -3,8 +3,8 @@ package loop
 import (
 	"testing"
 
-	"github.com/ciram-co/looprig/pkg/content"
-	"github.com/ciram-co/looprig/pkg/uuid"
+	"github.com/looprig/harness/pkg/content"
+	"github.com/looprig/harness/pkg/uuid"
 )
 
 // testUserMsg builds a UserMessage carrying a single text block.

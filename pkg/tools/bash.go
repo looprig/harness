@@ -9,7 +9,7 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/ciram-co/looprig/pkg/tool"
+	"github.com/looprig/harness/pkg/tool"
 )
 
 // bash.go implements the Bash tool: it runs a single shell command via `sh -c`

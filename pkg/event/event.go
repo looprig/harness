@@ -3,8 +3,8 @@ package event
 import (
 	"time"
 
-	"github.com/ciram-co/looprig/pkg/identity"
-	"github.com/ciram-co/looprig/pkg/uuid"
+	"github.com/looprig/harness/pkg/identity"
+	"github.com/looprig/harness/pkg/uuid"
 )
 
 // Event is the sealed root of every loop event. Every concrete event embeds a

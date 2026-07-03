@@ -3,7 +3,7 @@ package gemini_test
 import (
 	"testing"
 
-	"github.com/ciram-co/looprig/pkg/llm/codec/gemini"
+	"github.com/looprig/harness/pkg/llm/codec/gemini"
 )
 
 // FuzzDecode ensures the two untrusted-input parsers — DecodeResponse (a full

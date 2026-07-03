@@ -8,7 +8,7 @@ import (
 	"errors"
 	"net/http"
 
-	"github.com/ciram-co/looprig/pkg/llm/tee"
+	"github.com/looprig/harness/pkg/llm/tee"
 )
 
 // bindingHash computes the report_data key-binding hash for chutes_version >=

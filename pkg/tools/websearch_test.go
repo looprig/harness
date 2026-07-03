@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/ciram-co/looprig/pkg/tool"
+	"github.com/looprig/harness/pkg/tool"
 )
 
 // fakeSearchProvider is a canned SearchProvider for unit-testing the WebSearch

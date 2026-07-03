@@ -48,7 +48,7 @@
 - `github.com/nats-io/nats.go` — JetStream client (pub/sub, JetStream ctx, KV, object store, durable consumers); required by internal/agent/session/journal for session persistence.
 - `github.com/nats-io/nats-server/v2` — embedded in-process JetStream server (no TCP) for the CLI's local durable journal; the client alone persists nothing.
 - `github.com/yuin/goldmark` — CommonMark markdown → HTML for the transcript export renderer (`pkg/transcript/html`); the stdlib has no markdown renderer, which is why a dep is warranted. Pure-Go, no cgo, CommonMark-compliant, safe HTML output. Rendered with raw-HTML passthrough **disabled** (no `html.WithUnsafe()`) — that is the XSS boundary; the result is placed via `template.HTML` only because goldmark has already escaped it. **Approved by the user on 2026-06-28.**
-- The TUI + CLI presentation layer (and its charm.land stack) now lives in the sibling module github.com/ciram-co/looprig-console.
+- The TUI + CLI presentation layer (and its charm.land stack) now lives in the sibling module github.com/looprig/cli.
 
 ## Secure Coding Patterns
 
