@@ -6,6 +6,7 @@ import (
 	"compress/gzip"
 	"context"
 	"errors"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -298,8 +299,9 @@ func TestExtractArchiveRejectsHostileEntries(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		name    string
-		entries []rawEntry
+		name       string
+		entries    []rawEntry
+		wantReason string // optional substring the ArchiveEntryError.Reason must contain
 	}{
 		{
 			name:    "parent-escape file name",
@@ -333,6 +335,19 @@ func TestExtractArchiveRejectsHostileEntries(t *testing.T) {
 			name:    "fifo entry",
 			entries: []rawEntry{{hdr: tar.Header{Name: "pipe", Typeflag: tar.TypeFifo}}},
 		},
+		{
+			name: "duplicate entry name",
+			entries: []rawEntry{
+				{hdr: tar.Header{Name: "dup.txt", Typeflag: tar.TypeReg, Mode: 0o644}, data: "first"},
+				{hdr: tar.Header{Name: "dup.txt", Typeflag: tar.TypeReg, Mode: 0o644}, data: "second"},
+			},
+			wantReason: "duplicate",
+		},
+		{
+			name:       "unknown typeflag",
+			entries:    []rawEntry{{hdr: tar.Header{Name: "weird", Typeflag: tar.TypeCont}}},
+			wantReason: "typeflag",
+		},
 	}
 
 	for _, tt := range tests {
@@ -355,6 +370,9 @@ func TestExtractArchiveRejectsHostileEntries(t *testing.T) {
 			}
 			if aee.Reason == "" {
 				t.Errorf("ArchiveEntryError.Reason is empty; want the rule broken")
+			}
+			if tt.wantReason != "" && !strings.Contains(aee.Reason, tt.wantReason) {
+				t.Errorf("ArchiveEntryError.Reason = %q, want it to contain %q", aee.Reason, tt.wantReason)
 			}
 			assertDestEmpty(t, dest)
 		})
@@ -515,20 +533,118 @@ func TestExtractArchiveEnforcesLimits(t *testing.T) {
 func TestExtractArchiveHonorsContextCancellation(t *testing.T) {
 	t.Parallel()
 
+	tests := []struct {
+		name    string
+		entries []rawEntry
+	}{
+		{
+			name: "small entries",
+			entries: []rawEntry{
+				{hdr: tar.Header{Name: "a.txt", Typeflag: tar.TypeReg}, data: "a"},
+				{hdr: tar.Header{Name: "b.txt", Typeflag: tar.TypeReg}, data: "b"},
+			},
+		},
+		{
+			// A large entry proves a cancelled context aborts extraction rather
+			// than blocking on a long copy.
+			name:    "large entry",
+			entries: []rawEntry{{hdr: tar.Header{Name: "big.bin", Typeflag: tar.TypeReg}, data: strings.Repeat("x", 4<<20)}},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel() // cancelled before extraction begins
+
+			arc := gzTar(t, tt.entries)
+			dest := t.TempDir()
+			err := extractArchive(ctx, bytes.NewReader(arc), dest, generousLimits())
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("extractArchive error = %v, want context.Canceled", err)
+			}
+			assertDestEmpty(t, dest)
+		})
+	}
+}
+
+// cancelAfterFirstRead cancels a context as a side effect of its first delegated
+// Read, so a ctxReader wrapping it aborts on its NEXT read (the pre-check) after
+// partial progress — a deterministic stand-in for mid-copy cancellation.
+type cancelAfterFirstRead struct {
+	r      io.Reader
+	cancel context.CancelFunc
+	fired  bool
+}
+
+func (c *cancelAfterFirstRead) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	if !c.fired {
+		c.fired = true
+		c.cancel()
+	}
+	return n, err
+}
+
+func TestCopyCappedHonorsCancellationMidCopy(t *testing.T) {
+	t.Parallel()
+
+	const total = 512 * 1024
 	ctx, cancel := context.WithCancel(context.Background())
-	cancel() // cancelled before extraction begins
+	src := &cancelAfterFirstRead{r: bytes.NewReader(make([]byte, total)), cancel: cancel}
+	cr := &ctxReader{ctx: ctx, r: src}
 
-	arc := gzTar(t, []rawEntry{
-		{hdr: tar.Header{Name: "a.txt", Typeflag: tar.TypeReg}, data: "a"},
-		{hdr: tar.Header{Name: "b.txt", Typeflag: tar.TypeReg}, data: "b"},
-	})
-
-	dest := t.TempDir()
-	err := extractArchive(ctx, bytes.NewReader(arc), dest, generousLimits())
+	n, exceeded, err := copyCapped(io.Discard, cr, 1<<30)
 	if !errors.Is(err, context.Canceled) {
-		t.Fatalf("extractArchive error = %v, want context.Canceled", err)
+		t.Fatalf("copyCapped error = %v, want context.Canceled", err)
+	}
+	if exceeded {
+		t.Errorf("copyCapped exceeded = true, want false on cancellation")
+	}
+	if n <= 0 || n >= total {
+		t.Errorf("copyCapped copied n = %d, want partial progress in (0, %d)", n, total)
+	}
+}
+
+func TestExtractArchiveEmptyArchive(t *testing.T) {
+	t.Parallel()
+
+	arc := gzTar(t, nil) // a valid gzip tar with no entries
+	dest := t.TempDir()
+	if err := extractArchive(context.Background(), bytes.NewReader(arc), dest, generousLimits()); err != nil {
+		t.Fatalf("extractArchive of an empty archive: %v", err)
 	}
 	assertDestEmpty(t, dest)
+}
+
+func TestExtractArchiveMalformedInput(t *testing.T) {
+	t.Parallel()
+
+	valid := gzTar(t, []rawEntry{{hdr: tar.Header{Name: "a.txt", Typeflag: tar.TypeReg}, data: "hello"}})
+
+	tests := []struct {
+		name  string
+		input []byte
+	}{
+		{name: "not gzip", input: []byte("this is plainly not a gzip stream at all")},
+		{name: "empty input", input: nil},
+		{name: "truncated gzip", input: valid[:len(valid)/2]},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			dest := t.TempDir()
+			err := extractArchive(context.Background(), bytes.NewReader(tt.input), dest, generousLimits())
+			if err == nil {
+				t.Fatal("extractArchive returned nil; want a decode error")
+			}
+			assertDestEmpty(t, dest)
+		})
+	}
 }
 
 func TestValidateEntryName(t *testing.T) {

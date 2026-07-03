@@ -100,7 +100,7 @@ func extractEntries(ctx context.Context, root *os.Root, r io.Reader, lim limits)
 		if seen > lim.maxEntries {
 			return &ArchiveLimitError{Limit: ArchiveLimitEntries, Cap: lim.maxEntries, Observed: seen}
 		}
-		n, err := extractEntry(root, hdr, tr, lim, written, &pendingDirs)
+		n, err := extractEntry(ctx, root, hdr, tr, lim, written, &pendingDirs)
 		if err != nil {
 			return err
 		}
@@ -128,8 +128,8 @@ func restoreDirModes(root *os.Root, dirs []pendingDirMode) error {
 // extractEntry validates one entry's name, confirms no ancestor component is a
 // symlink, and dispatches on the entry type. It returns the number of content
 // bytes written (nonzero only for regular files) so the caller can maintain the
-// cumulative-byte total.
-func extractEntry(root *os.Root, hdr *tar.Header, tr io.Reader, lim limits, written int64, dirs *[]pendingDirMode) (int64, error) {
+// cumulative-byte total. ctx bounds the per-entry content copy.
+func extractEntry(ctx context.Context, root *os.Root, hdr *tar.Header, tr io.Reader, lim limits, written int64, dirs *[]pendingDirMode) (int64, error) {
 	if err := validateEntryName(hdr.Name); err != nil {
 		return 0, err
 	}
@@ -144,7 +144,7 @@ func extractEntry(root *os.Root, hdr *tar.Header, tr io.Reader, lim limits, writ
 		// tar.Reader normalizes the deprecated old-style regular-file flag
 		// (TypeRegA) to TypeReg on read, so this one case covers every regular
 		// file; any other flag falls through to the fail-closed default.
-		return extractRegular(root, name, hdr, tr, lim, written)
+		return extractRegular(ctx, root, name, hdr, tr, lim, written)
 	case tar.TypeSymlink:
 		return 0, extractSymlink(root, name, hdr)
 	default:
@@ -179,6 +179,9 @@ func validateEntryName(name string) error {
 	if cleaned == "." {
 		return &ArchiveEntryError{Name: name, Reason: "entry name resolves to the destination root"}
 	}
+	// Unreachable given the ".." rejection and absolute check above (Clean cannot
+	// synthesize a "..", "../" prefix, or leading "/" from a name lacking them) —
+	// kept as defense in depth so a future grammar change fails closed here too.
 	if cleaned == ".." || strings.HasPrefix(cleaned, "../") || path.IsAbs(cleaned) {
 		return &ArchiveEntryError{Name: name, Reason: "entry name escapes the destination"}
 	}
@@ -205,7 +208,8 @@ func rejectSymlinkAncestor(root *os.Root, origName, name string) error {
 			_ = cur.Close()
 		}
 	}
-	for _, seg := range strings.Split(dir, string(filepath.Separator)) {
+	segs := strings.Split(dir, string(filepath.Separator))
+	for i, seg := range segs {
 		info, err := cur.Lstat(seg)
 		if err != nil {
 			closeCur()
@@ -217,6 +221,9 @@ func rejectSymlinkAncestor(root *os.Root, origName, name string) error {
 		if info.Mode()&fs.ModeSymlink != 0 {
 			closeCur()
 			return &ArchiveEntryError{Name: origName, Reason: "a parent path component is a symlink"}
+		}
+		if i == len(segs)-1 {
+			break // last component needs only the Lstat above, not a descent
 		}
 		next, err := cur.OpenRoot(seg)
 		closeCur()
@@ -245,32 +252,46 @@ func extractDir(root *os.Root, name string, hdr *tar.Header, dirs *[]pendingDirM
 // written verbatim (never resolved): a hostile absolute or escaping target is
 // stored as-is but is inert, because every subsequent write is name-validated and
 // refuses to traverse a symlink component (see rejectSymlinkAncestor and os.Root).
+// A name already taken by a prior entry fails closed as a typed duplicate.
 func extractSymlink(root *os.Root, name string, hdr *tar.Header) error {
 	if err := ensureParent(root, name); err != nil {
 		return err
 	}
-	return root.Symlink(hdr.Linkname, name)
+	return asDuplicateEntry(hdr.Name, root.Symlink(hdr.Linkname, name))
+}
+
+// asDuplicateEntry translates an "already exists" error from creating an entry
+// into a typed *ArchiveEntryError — a malformed or hostile archive may repeat a
+// name, and the boundary reports that as a rejected entry rather than a raw os
+// error. Any other error (including nil) is returned unchanged.
+func asDuplicateEntry(name string, err error) error {
+	if errors.Is(err, fs.ErrExist) {
+		return &ArchiveEntryError{Name: name, Reason: "duplicate entry name"}
+	}
+	return err
 }
 
 // extractRegular writes a regular file's contents, capping the copy at the
-// remaining byte budget so a bomb cannot inflate past lim.maxBytes. It returns
-// the number of bytes written even on error so the caller's cumulative total
-// stays accurate for the *ArchiveLimitError it may raise. The file mode is
+// remaining byte budget so a bomb cannot inflate past lim.maxBytes. The copy is
+// bounded by ctx, so a cancelled context or deadline aborts a large entry
+// promptly rather than only between entries. The bytes-written count is returned
+// so callers can advance the running total; on a byte-limit breach it is folded
+// into the *ArchiveLimitError's Observed (written+n) here. The file mode is
 // restricted to permission bits (setuid/setgid/sticky are never restored from an
 // untrusted archive) and applied after the write to defeat the umask.
-func extractRegular(root *os.Root, name string, hdr *tar.Header, tr io.Reader, lim limits, written int64) (int64, error) {
+func extractRegular(ctx context.Context, root *os.Root, name string, hdr *tar.Header, tr io.Reader, lim limits, written int64) (int64, error) {
 	if err := ensureParent(root, name); err != nil {
 		return 0, err
 	}
 	perm := hdr.FileInfo().Mode().Perm()
 	// name is validated (no absolute, no "..") and confined to the os.Root
 	// sandbox, which refuses any symlink traversal or escape; O_EXCL fails closed
-	// on a duplicate/overwrite entry.
+	// on a duplicate/overwrite entry (reported as a typed duplicate).
 	f, err := root.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_EXCL, perm) // #nosec G304 -- validated name inside os.Root sandbox
 	if err != nil {
-		return 0, err
+		return 0, asDuplicateEntry(hdr.Name, err)
 	}
-	n, exceeded, copyErr := copyCapped(f, tr, lim.maxBytes-written)
+	n, exceeded, copyErr := copyCapped(f, &ctxReader{ctx: ctx, r: tr}, lim.maxBytes-written)
 	closeErr := f.Close()
 	if copyErr != nil {
 		return n, copyErr
@@ -282,6 +303,23 @@ func extractRegular(root *os.Root, name string, hdr *tar.Header, tr io.Reader, l
 		return n, closeErr
 	}
 	return n, root.Chmod(name, perm)
+}
+
+// ctxReader bounds a copy by a context: each Read returns ctx.Err() before
+// delegating, so a cancelled context or passed deadline aborts a long copy
+// between the underlying reader's chunks (io.Copy's ~32 KiB reads) rather than
+// only at entry boundaries. It matters most once the source is a streaming
+// network Get, where one entry could otherwise block unbounded.
+type ctxReader struct {
+	ctx context.Context
+	r   io.Reader
+}
+
+func (c *ctxReader) Read(p []byte) (int, error) {
+	if err := c.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return c.r.Read(p)
 }
 
 // copyCapped copies from src to dst, reading at most remaining+1 bytes. It
