@@ -28,16 +28,17 @@ const appendTimeout = 5 * time.Second
 // content-addressed offload blobs: a blob lands at "sessions/<uuid>/blobs/<sha>".
 const blobsInfix = "/blobs/"
 
-// NilLeaseError reports that OpenJournal was handed a nil lease. The lease is a
-// required dependency (DIP): the composition root acquires it via AcquireLease and
-// passes it in. OpenJournal fails closed with this typed error rather than
-// dereferencing nil when it stamps the epoch into the opening fence.
+// NilLeaseError reports that a Store constructor (OpenJournal or OpenObjectGC) was
+// handed a nil lease. The lease is a required dependency (DIP): the composition root
+// acquires it via AcquireLease and passes it in. The constructor fails closed with
+// this typed error rather than deferring a nil dereference to first use (stamping the
+// epoch into the opening fence, or the GC lease guard).
 type NilLeaseError struct {
 	SessionID uuid.UUID
 }
 
 func (e *NilLeaseError) Error() string {
-	return "sessionstore: session " + e.SessionID.String() + " open journal: nil lease"
+	return "sessionstore: session " + e.SessionID.String() + ": nil lease"
 }
 
 // sessionJournal is the concrete single-writer serializer over a storekit ledger:
