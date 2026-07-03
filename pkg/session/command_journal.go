@@ -10,6 +10,7 @@ import (
 	"github.com/ciram-co/looprig/pkg/foreignloop"
 	"github.com/ciram-co/looprig/pkg/journal"
 	"github.com/ciram-co/looprig/pkg/uuid"
+	"github.com/ciram-co/looprig/pkg/workspacestore"
 )
 
 // commandAppender is the session's narrow durable-write seam for the INTENT LOG:
@@ -148,6 +149,22 @@ func WithForeignBuilder(b foreignloop.Builder, rb foreignloop.RestoredBuilder) O
 	return func(s *Session) {
 		s.foreignBuild = b
 		s.foreignBuildRestored = rb
+	}
+}
+
+// WithWorkspaceStore wires the workspace snapshot store and the workspace root this
+// session checkpoints. Both are required for CheckpointWorkspace; without this option the
+// capability is unconfigured and CheckpointWorkspace fails closed with a typed
+// *WorkspaceNotConfiguredError. The composition root decides WHEN to checkpoint (a
+// quiescence point); looprig only exposes the capability. A nil store is ignored (the
+// default unconfigured state stays), so a wiring slip can never install a store the
+// capability would nil-deref on.
+func WithWorkspaceStore(ws *workspacestore.Store, root string) Option {
+	return func(s *Session) {
+		if ws != nil {
+			s.ws = ws
+			s.wsRoot = root
+		}
 	}
 }
 

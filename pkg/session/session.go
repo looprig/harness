@@ -15,6 +15,7 @@ import (
 	"github.com/ciram-co/looprig/pkg/loop"
 	"github.com/ciram-co/looprig/pkg/tool"
 	"github.com/ciram-co/looprig/pkg/uuid"
+	"github.com/ciram-co/looprig/pkg/workspacestore"
 )
 
 type SessionErrorKind string
@@ -250,6 +251,15 @@ type Session struct {
 	// itself only ever builds native, and the foreign backend is injected here.
 	foreignBuild         foreignloop.Builder
 	foreignBuildRestored foreignloop.RestoredBuilder
+
+	// ws is the workspace snapshot store CheckpointWorkspace archives the session's
+	// working tree into, and wsRoot is the directory it archives. Both are wired
+	// together by WithWorkspaceStore; nil ws (the default, no option) leaves the
+	// capability unconfigured, so CheckpointWorkspace fails closed with a typed
+	// *WorkspaceNotConfiguredError. The session depends only on the narrow *Store
+	// (Dependency Inversion): it never sees the Blobs backend beneath it.
+	ws     *workspacestore.Store // nil unless WithWorkspaceStore wired it; gates CheckpointWorkspace
+	wsRoot string                // the workspace directory Snapshot archives
 }
 
 // eventAppender is the session's narrow view of the hub's REQUIRED durable event tap:
