@@ -5,7 +5,7 @@ import (
 	"github.com/ciram-co/storekit"
 )
 
-// defaultOffloadThreshold is the payload size, in bytes, at or above which a record
+// defaultOffloadThreshold is the payload size, in bytes, above which a record
 // is offloaded to the blob store rather than inlined in the ledger (512 KiB). It sits
 // comfortably under storekit's 1 MiB per-record ceiling, leaving headroom for the
 // envelope framing around the payload.
@@ -18,7 +18,7 @@ const sessionsPrefix = "sessions/"
 // Options are the resolved knobs a Store operates under. It is populated by Open from
 // the defaults plus any Option overrides; callers never construct it directly.
 type Options struct {
-	// OffloadThreshold is the payload size (bytes) at or above which a record is
+	// OffloadThreshold is the payload size (bytes) above which a record is
 	// stored as an out-of-line blob instead of inline in the ledger.
 	OffloadThreshold int
 }
