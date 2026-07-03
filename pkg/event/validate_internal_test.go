@@ -94,6 +94,7 @@ func TestClassifyExhaustive(t *testing.T) {
 		{"RestoreStarted", RestoreStarted{}},
 		{"RestoreDone", RestoreDone{}},
 		{"RestoreErrored", RestoreErrored{}},
+		{"WorkspaceCheckpointed", WorkspaceCheckpointed{}},
 		{"LoopIdle", LoopIdle{}},
 		{"LoopStarted", LoopStarted{}},
 		{"TokenDelta", TokenDelta{}},

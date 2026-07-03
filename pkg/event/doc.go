@@ -24,6 +24,7 @@ var (
 	_ Event = RestoreStarted{}
 	_ Event = RestoreDone{}
 	_ Event = RestoreErrored{}
+	_ Event = WorkspaceCheckpointed{}
 
 	// Loop-scoped events.
 	_ Event = LoopIdle{}

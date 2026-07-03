@@ -330,6 +330,13 @@ func TestMarshalEventRoundTripEnduring(t *testing.T) {
 		{"SessionStopped", SessionStopped{Header: fullHeaderSession()}},
 		{"RestoreStarted", RestoreStarted{Header: fullHeaderSession()}},
 		{"RestoreDone", RestoreDone{Header: fullHeaderSession()}},
+		{"WorkspaceCheckpointed", WorkspaceCheckpointed{
+			Header: fullHeaderSession(),
+			Ref:    "v1:sha256:aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899",
+		}},
+		// Empty Ref is a legal string at the event layer (codec fidelity, not Ref
+		// grammar validity): it must round-trip back to "".
+		{"WorkspaceCheckpointed empty ref", WorkspaceCheckpointed{Header: fullHeaderSession()}},
 		// RestoreErrored.Err handled in the dedicated err-projection test below.
 		{"LoopIdle", LoopIdle{Header: fullHeaderLoop()}},
 		{"LoopStarted", LoopStarted{Header: fullHeaderLoop()}},
@@ -362,6 +369,37 @@ func TestMarshalEventRoundTripEnduring(t *testing.T) {
 				t.Errorf("round-trip(%s) mismatch:\n got = %#v\nwant = %#v\nwire: %s", tt.name, got, tt.ev, data)
 			}
 		})
+	}
+}
+
+// TestMarshalWorkspaceCheckpointedWire proves the WorkspaceCheckpointed envelope
+// carries the stable "type" discriminator (== its classify name) and the "ref"
+// payload key with the opaque ref value verbatim — the resume token's pointer to
+// the workspace store must reach the journal intact.
+func TestMarshalWorkspaceCheckpointedWire(t *testing.T) {
+	t.Parallel()
+
+	const ref = "v1:sha256:aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899"
+	data, err := MarshalEvent(WorkspaceCheckpointed{Header: fullHeaderSession(), Ref: ref})
+	if err != nil {
+		t.Fatalf("MarshalEvent(WorkspaceCheckpointed) error = %v", err)
+	}
+	keys := topLevelKeys(t, data)
+
+	var gotType string
+	if err := json.Unmarshal(keys["type"], &gotType); err != nil {
+		t.Fatalf("unmarshal type tag: %v", err)
+	}
+	if gotType != "WorkspaceCheckpointed" {
+		t.Errorf("wire type tag = %q, want %q\nraw: %s", gotType, "WorkspaceCheckpointed", data)
+	}
+
+	var gotRef string
+	if err := json.Unmarshal(keys["ref"], &gotRef); err != nil {
+		t.Fatalf("unmarshal ref key: %v", err)
+	}
+	if gotRef != ref {
+		t.Errorf("wire ref = %q, want %q\nraw: %s", gotRef, ref, data)
 	}
 }
 
@@ -568,7 +606,7 @@ func TestMarshalEventPermissionRequestedFullRequest(t *testing.T) {
 // without codec coverage changes the live count derived from classify+Class() and
 // fails TestMarshalEventCoversEveryEnduringType. A missed Enduring type is an
 // unpersistable event = silent restore data loss, which this guard forbids.
-const wantEnduringTypes = 19
+const wantEnduringTypes = 20
 
 // unionInstances is one instance of EVERY type in the sealed union (Enduring and
 // Ephemeral alike), mirroring TestClassifyExhaustive. The drift guard partitions
@@ -577,7 +615,7 @@ const wantEnduringTypes = 19
 func unionInstances() []Event {
 	return []Event{
 		SessionStarted{}, SessionActive{}, SessionIdle{}, SessionStopped{},
-		RestoreStarted{}, RestoreDone{}, RestoreErrored{},
+		RestoreStarted{}, RestoreDone{}, RestoreErrored{}, WorkspaceCheckpointed{},
 		LoopIdle{}, LoopStarted{},
 		TokenDelta{}, TurnStarted{}, StepDone{}, TurnFoldedInto{}, InputCancelled{},
 		InputQueued{}, TurnRejected{}, TurnDone{}, TurnFailed{}, TurnInterrupted{},

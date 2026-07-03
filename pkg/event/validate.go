@@ -164,6 +164,11 @@ func classify(ev Event) (name string, profile idProfile, ok bool) {
 		return "RestoreDone", sessionProfile(), true
 	case RestoreErrored:
 		return "RestoreErrored", sessionProfile(), true
+	case WorkspaceCheckpointed:
+		// Session-scoped: a session-global workspace snapshot appended at quiescence
+		// (same shape as RestoreDone/SessionIdle) — only SessionID set. Ref is an
+		// opaque payload string the validator never constrains.
+		return "WorkspaceCheckpointed", sessionProfile(), true
 	case LoopIdle:
 		return "LoopIdle", loopProfile(), true
 	case LoopStarted:
