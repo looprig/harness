@@ -153,3 +153,32 @@ type ArchiveEntryError struct {
 func (e *ArchiveEntryError) Error() string {
 	return "workspacestore: rejected archive entry " + strconv.Quote(e.Name) + ": " + e.Reason
 }
+
+// ArchiveLimit names which decompression-bomb guard an archive tripped: the
+// per-archive entry count or the cumulative extracted-byte count. It is a typed
+// enum so callers match a specific breach without stringly-typed comparisons.
+type ArchiveLimit string
+
+const (
+	// ArchiveLimitEntries marks a breach of the maximum archive entry count.
+	ArchiveLimitEntries ArchiveLimit = "entries"
+	// ArchiveLimitBytes marks a breach of the maximum cumulative extracted bytes.
+	ArchiveLimitBytes ArchiveLimit = "bytes"
+)
+
+// ArchiveLimitError reports that a snapshot archive exceeded a decompression-bomb
+// guard during Materialize and was rejected before finishing extraction. Limit
+// names the guard (entries or bytes), Cap is the configured maximum, and Observed
+// is the count that breached it. Observed is measured from bytes actually written
+// or entries actually read — never a header's declared size — so a lying header
+// cannot understate the breach. All fields are numeric or a fixed enum, log-safe.
+type ArchiveLimitError struct {
+	Limit    ArchiveLimit
+	Cap      int64
+	Observed int64
+}
+
+func (e *ArchiveLimitError) Error() string {
+	return "workspacestore: archive exceeds " + string(e.Limit) + " limit: observed " +
+		strconv.FormatInt(e.Observed, 10) + " > cap " + strconv.FormatInt(e.Cap, 10)
+}
