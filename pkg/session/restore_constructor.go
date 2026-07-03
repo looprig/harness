@@ -14,6 +14,7 @@ import (
 	"github.com/ciram-co/looprig/pkg/loop"
 	"github.com/ciram-co/looprig/pkg/sessionstore"
 	"github.com/ciram-co/looprig/pkg/uuid"
+	"github.com/ciram-co/looprig/pkg/workspacestore"
 )
 
 // RestoreErrorKind classifies a restore failure that is not one of the already-typed
@@ -52,6 +53,13 @@ const (
 	// RestoredBuilder was wired (WithForeignBuilder). Restore fails closed rather than
 	// silently rebuilding the primary as a native loop.
 	RestoreForeignBuilderMissing RestoreErrorKind = "foreign_builder_missing"
+	// RestoreMaterializeFailed: the checkpointed workspace snapshot could not be
+	// materialized into the configured root (a corrupt journal ref, an absent/tampered
+	// blob, or a drifted non-empty root). The restore fails closed rather than come up on
+	// a workspace that does not match the durable checkpoint. The Cause is a concrete
+	// *workspacestore error (*InvalidRefError / *MaterializeError / *DestNotEmptyError),
+	// errors.As-reachable through RestoreError.Unwrap.
+	RestoreMaterializeFailed RestoreErrorKind = "materialize_failed"
 )
 
 // RestoreError is the typed wrapper for a restore failure. Kind classifies the stage;
@@ -228,6 +236,12 @@ func restoreSession(
 	// and a restart would grant a fresh quota (a trivial cap bypass, design §16.3).
 	spawnedCount := countSpawnedLoops(all)
 
+	// The last durable workspace snapshot to materialize on resume (if any). Scanned over
+	// the SAME unnarrowed discovery drain — WorkspaceCheckpointed is session-scoped, so it
+	// is present in `all` — alongside the other discovery facts. Consumed at the pre-Restore
+	// Done seam below; empty/false when the session was never checkpointed.
+	wsRef, hasWSCheckpoint := lastWorkspaceCheckpoint(all)
+
 	// (3) RestoreStarted — the FIRST restore mutation (after the lease fence).
 	if err := appendRestoreEvent(ctx, j, factory, event.RestoreStarted{
 		Header: event.Header{Coordinates: identity.Coordinates{SessionID: sessionID}},
@@ -262,6 +276,26 @@ func restoreSession(
 			TurnIndex: turnIdx,
 		}); err != nil {
 			return recordErrored(&RestoreError{Kind: RestoreAppendFailed, Cause: err})
+		}
+	}
+
+	// (6b) Materialize the checkpointed workspace BEFORE declaring the restore done, so
+	// RestoreDone is appended only if the workspace is also restored (fail closed — the
+	// session never comes up on a workspace that does not match the durable checkpoint). It
+	// uses probe.ws/probe.wsRoot because the real *Session is not built until AFTER
+	// RestoreDone. Skipped when no workspace store is wired (a conversation-only restore —
+	// the composition root opted out) or the journal carries no checkpoint (a not-yet-
+	// checkpointed session): the root is left untouched in both cases. The journal-sourced
+	// ref is validated through ParseRef (a trust boundary — a corrupt log fails closed) and
+	// any Materialize failure routes through the SAME recordErrored exit as every other
+	// restore failure.
+	if probe.ws != nil && hasWSCheckpoint {
+		ref, err := workspacestore.ParseRef(wsRef)
+		if err != nil {
+			return recordErrored(&RestoreError{Kind: RestoreMaterializeFailed, Cause: err})
+		}
+		if err := probe.ws.Materialize(ctx, ref, probe.wsRoot); err != nil {
+			return recordErrored(&RestoreError{Kind: RestoreMaterializeFailed, Cause: err})
 		}
 	}
 
