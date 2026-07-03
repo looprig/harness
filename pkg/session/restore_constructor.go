@@ -12,8 +12,9 @@ import (
 	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/journal"
 	"github.com/looprig/harness/pkg/loop"
+	"github.com/looprig/harness/pkg/sessionstore"
 	"github.com/looprig/harness/pkg/uuid"
-	"github.com/nats-io/nats.go"
+	"github.com/looprig/harness/pkg/workspacestore"
 )
 
 // RestoreErrorKind classifies a restore failure that is not one of the already-typed
@@ -52,6 +53,13 @@ const (
 	// RestoredBuilder was wired (WithForeignBuilder). Restore fails closed rather than
 	// silently rebuilding the primary as a native loop.
 	RestoreForeignBuilderMissing RestoreErrorKind = "foreign_builder_missing"
+	// RestoreMaterializeFailed: the checkpointed workspace snapshot could not be
+	// materialized into the configured root (a corrupt journal ref, an absent/tampered
+	// blob, or a drifted non-empty root). The restore fails closed rather than come up on
+	// a workspace that does not match the durable checkpoint. The Cause is a concrete
+	// *workspacestore error (*InvalidRefError / *MaterializeError / *DestNotEmptyError),
+	// errors.As-reachable through RestoreError.Unwrap.
+	RestoreMaterializeFailed RestoreErrorKind = "materialize_failed"
 )
 
 // RestoreError is the typed wrapper for a restore failure. Kind classifies the stage;
@@ -107,12 +115,10 @@ func Restore(
 	ctx context.Context,
 	cfg loop.Config,
 	sessionID uuid.UUID,
-	js nats.JetStreamContext,
-	objectStore nats.ObjectStore,
-	leases *journal.LeaseManager,
+	store *sessionstore.Store,
 	opts ...Option,
 ) (*Session, error) {
-	return restoreSession(ctx, cfg, sessionID, js, objectStore, leases, uuid.New, time.Now, opts...)
+	return restoreSession(ctx, cfg, sessionID, store, uuid.New, time.Now, opts...)
 }
 
 // restoreSession is the construction core of Restore with the id-gen and clock seams
@@ -122,9 +128,7 @@ func restoreSession(
 	ctx context.Context,
 	cfg loop.Config,
 	sessionID uuid.UUID,
-	js nats.JetStreamContext,
-	objectStore nats.ObjectStore,
-	leases *journal.LeaseManager,
+	store *sessionstore.Store,
 	newID idGenerator,
 	now event.Clock,
 	opts ...Option,
@@ -150,17 +154,29 @@ func restoreSession(
 	fingerprintFields := probe.configFingerprintFields
 
 	// (1) Acquire the single-writer lease, then construct the journal (which writes the
-	// opening LeaseFence as its first append — the handover boundary) and the replayer.
-	lease, err := leases.Acquire(ctx, sessionID)
+	// opening LeaseFence as its first append — the handover boundary) and the replayer,
+	// all through the sessionstore facade over the composition-root-wired backend.
+	lease, err := store.AcquireLease(ctx, sessionID)
 	if err != nil {
 		return nil, &RestoreError{Kind: RestoreLeaseFailed, Cause: err}
 	}
-	j, err := journal.NewSessionJournal(js, sessionID, lease)
+	j, err := store.OpenJournal(ctx, sessionID, lease)
 	if err != nil {
 		releaseLease(lease)
 		return nil, &RestoreError{Kind: RestoreJournalFailed, Cause: err}
 	}
-	replayer := journal.NewEventReplayer(js, objectStore)
+	// The replayer is bound to the stream BEGINNING (FromSeq 0); the LoopID + Follow
+	// narrowing each drain needs is carried on the journal.ReplayRequest drainReplay
+	// passes to Open (the facade replayer reads req.LoopID/req.Follow, and its start
+	// from the bound FromSeq — journal.StartPos is package-private out here). Opening it
+	// is a step-1 setup step (parallel to the journal): a failure releases the lease and
+	// returns without a RestoreErrored, exactly like the journal-setup failure above (the
+	// first restore MUTATION, RestoreStarted, has not been written yet).
+	replayer, err := store.OpenEventReplayer(sessionID, sessionstore.ReplayRequest{FromSeq: 0})
+	if err != nil {
+		releaseLease(lease)
+		return nil, &RestoreError{Kind: RestoreReplayFailed, Cause: err}
+	}
 
 	// The restore-lifecycle events (RestoreStarted/RestoreDone/RestoreErrored and the
 	// crash-seam TurnInterrupted) are stamped from the SAME id-gen + clock seam the
@@ -183,10 +199,10 @@ func restoreSession(
 	}
 
 	// (2) Replay the whole stream once for discovery (the persisted fingerprint + the
-	// primary loop id). Fail closed on any replay error.
-	all, err := drainReplay(ctx, replayer, journal.ReplayRequest{
-		SessionID: sessionID, From: journal.Beginning(), Follow: false,
-	})
+	// primary loop id + the subagent spawn count). A ZERO LoopID leaves the replay
+	// UNNARROWED — every loop's events — so findRootLoopStarted and countSpawnedLoops see
+	// the subagent LoopStarted events, not just the primary's. Fail closed on any error.
+	all, err := drainReplay(ctx, replayer, journal.ReplayRequest{Follow: false})
 	if err != nil {
 		return recordErrored(&RestoreError{Kind: RestoreReplayFailed, Cause: err})
 	}
@@ -220,6 +236,12 @@ func restoreSession(
 	// and a restart would grant a fresh quota (a trivial cap bypass, design §16.3).
 	spawnedCount := countSpawnedLoops(all)
 
+	// The last durable workspace snapshot to materialize on resume (if any). Scanned over
+	// the SAME unnarrowed discovery drain — WorkspaceCheckpointed is session-scoped, so it
+	// is present in `all` — alongside the other discovery facts. Consumed at the pre-Restore
+	// Done seam below; empty/false when the session was never checkpointed.
+	wsRef, hasWSCheckpoint := lastWorkspaceCheckpoint(all)
+
 	// (3) RestoreStarted — the FIRST restore mutation (after the lease fence).
 	if err := appendRestoreEvent(ctx, j, factory, event.RestoreStarted{
 		Header: event.Header{Coordinates: identity.Coordinates{SessionID: sessionID}},
@@ -228,10 +250,14 @@ func restoreSession(
 	}
 
 	// (5) Fold the primary loop's Enduring events (a SCOPED replay) into committed msgs +
-	// turnIndex. Re-seeding the system prompt is implicit: it rides cfg.System (the
-	// loop never stores it in msgs), so the seeded loop carries it via cfg.
+	// turnIndex. The primaryLoopID NARROWS the drain to the session-scoped events plus the
+	// primary loop's events, dropping every OTHER loop's events — the SAME narrowing the
+	// NATS EventReplayer's loop-subject filter gave, and load-bearing: an unnarrowed drain
+	// would fold a subagent loop's turns into the primary thread and corrupt it. Re-seeding
+	// the system prompt is implicit: it rides cfg.System (the loop never stores it in
+	// msgs), so the seeded loop carries it via cfg.
 	primaryEvents, err := drainReplay(ctx, replayer, journal.ReplayRequest{
-		SessionID: sessionID, LoopID: primaryLoopID, From: journal.Beginning(), Follow: false,
+		LoopID: primaryLoopID, Follow: false,
 	})
 	if err != nil {
 		return recordErrored(&RestoreError{Kind: RestoreReplayFailed, Cause: err})
@@ -250,6 +276,26 @@ func restoreSession(
 			TurnIndex: turnIdx,
 		}); err != nil {
 			return recordErrored(&RestoreError{Kind: RestoreAppendFailed, Cause: err})
+		}
+	}
+
+	// (6b) Materialize the checkpointed workspace BEFORE declaring the restore done, so
+	// RestoreDone is appended only if the workspace is also restored (fail closed — the
+	// session never comes up on a workspace that does not match the durable checkpoint). It
+	// uses probe.ws/probe.wsRoot because the real *Session is not built until AFTER
+	// RestoreDone. Skipped when no workspace store is wired (a conversation-only restore —
+	// the composition root opted out) or the journal carries no checkpoint (a not-yet-
+	// checkpointed session): the root is left untouched in both cases. The journal-sourced
+	// ref is validated through ParseRef (a trust boundary — a corrupt log fails closed) and
+	// any Materialize failure routes through the SAME recordErrored exit as every other
+	// restore failure.
+	if probe.ws != nil && hasWSCheckpoint {
+		ref, err := workspacestore.ParseRef(wsRef)
+		if err != nil {
+			return recordErrored(&RestoreError{Kind: RestoreMaterializeFailed, Cause: err})
+		}
+		if err := probe.ws.Materialize(ctx, ref, probe.wsRoot); err != nil {
+			return recordErrored(&RestoreError{Kind: RestoreMaterializeFailed, Cause: err})
 		}
 	}
 

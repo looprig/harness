@@ -1,5 +1,3 @@
-//go:build integration
-
 package session
 
 import (
@@ -63,22 +61,19 @@ func TestRestoreSessionFailSecureExits(t *testing.T) {
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			js := newEmbeddedJS(t)
+			store := newRestoreStore(t)
 			fp := FingerprintFrom(restoreCfg(&stubLLM{}, "model-x", "be helpful"))
 
 			// A clean original run (ends on TurnDone, no open turn): the restore mints
 			// exactly RestoreStarted, RestoreDone, then RestoreErrored on the failure path.
-			orig := buildOriginalRun(t, js, fp, restoreCfg(&stubLLM{chunks: []content.Chunk{textChunk("reply")}}, "model-x", "be helpful"), 1)
+			orig := buildOriginalRun(t, store, fp, restoreCfg(&stubLLM{chunks: []content.Chunk{textChunk("reply")}}, "model-x", "be helpful"), 1)
 			handOver(t, orig.lease)
-
-			objStore := mustObjectStore(t, js, orig.sessionID)
-			leases := mustLeaseManager(t, js)
 
 			seam := &failingNewID{failOnCall: tt.failOnCall}
 			s, err := restoreSession(
 				context.Background(),
 				restoreCfg(&stubLLM{}, "model-x", "be helpful"),
-				orig.sessionID, js, objStore, leases,
+				orig.sessionID, store,
 				seam.next, fixedClock,
 			)
 
@@ -101,7 +96,7 @@ func TestRestoreSessionFailSecureExits(t *testing.T) {
 
 			// (c) A RestoreErrored is durably recorded (the failure is in the log, and no
 			// RestoreDone followed it — the restore did not silently half-succeed).
-			tail := restoreEventTail(t, js, orig.sessionID, orig.primaryLoopID)
+			tail := restoreEventTail(t, store, orig.sessionID, orig.primaryLoopID)
 			if !lastIs(tail, event.RestoreErrored{}) {
 				t.Errorf("restore-event tail does not end with RestoreErrored: %v", tailTypes(tail))
 			}
@@ -111,11 +106,11 @@ func TestRestoreSessionFailSecureExits(t *testing.T) {
 				}
 			}
 
-			// (d) The lease was released: a successor LeaseManager can re-acquire it (the
+			// (d) The lease was released: a successor can re-acquire it through the store (the
 			// failed restore must not leave the session's single-writer lease held).
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 			defer cancel()
-			successorLease, acqErr := mustLeaseManager(t, js).Acquire(ctx, orig.sessionID)
+			successorLease, acqErr := store.AcquireLease(ctx, orig.sessionID)
 			if acqErr != nil {
 				t.Fatalf("successor Acquire after failed restore = %v, want success (lease should have been released)", acqErr)
 			}

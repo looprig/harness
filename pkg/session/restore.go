@@ -173,6 +173,23 @@ func countSpawnedLoops(events []event.Event) int {
 	return n
 }
 
+// lastWorkspaceCheckpoint returns the Ref of the LAST WorkspaceCheckpointed event in the
+// replay — the most recent durable workspace snapshot to materialize on resume — and false
+// if the session was never checkpointed. WorkspaceCheckpointed is session-scoped, so it is
+// present in the unnarrowed discovery drain; scanning to the end (the last one wins) picks
+// the newest snapshot, since a re-checkpoint appends a fresh event rather than replacing the
+// prior one. It is a single-purpose discovery scanner, mirroring firstConfigFingerprint /
+// findRootLoopStarted / countSpawnedLoops, so foldPrimaryLoop stays pure.
+func lastWorkspaceCheckpoint(events []event.Event) (string, bool) {
+	ref, ok := "", false
+	for _, ev := range events {
+		if wc, isWC := ev.(event.WorkspaceCheckpointed); isWC {
+			ref, ok = wc.Ref, true // keep scanning; the LAST one wins
+		}
+	}
+	return ref, ok
+}
+
 // foldResult is the reconstruction of one loop's committed conversation from its
 // ordered Enduring event sequence. It is what the Restore constructor (Task 8.3)
 // seeds a re-created loop with: the committed message history, the next live

@@ -228,6 +228,18 @@ type RestoreErrored struct {
 	Err error `json:"-"`
 }
 
+// WorkspaceCheckpointed records that the session's workspace was durably
+// snapshotted as Ref at this point in the event order. It is session-scoped and
+// Enduring — the resume token's pointer to the workspace store; Header.SessionID
+// is set, LoopID/TurnID/StepID are zero. Ref is an opaque "v1:sha256:<hex>" string
+// (typed as workspacestore.Ref at the producer; pkg/event stays dependency-light).
+type WorkspaceCheckpointed struct {
+	enduring
+	sessionScoped
+	Header
+	Ref string `json:"ref"`
+}
+
 // LoopIdle is emitted when a loop parks with no active turn. Header.SessionID and
 // Header.LoopID are set; TurnID/StepID are zero. It drives session quiescence.
 type LoopIdle struct {
@@ -258,12 +270,13 @@ type LoopStarted struct {
 	ForeignSID string `json:"foreign_sid,omitzero"`
 }
 
-func (SessionStarted) isEvent() {}
-func (SessionActive) isEvent()  {}
-func (SessionIdle) isEvent()    {}
-func (SessionStopped) isEvent() {}
-func (RestoreStarted) isEvent() {}
-func (RestoreDone) isEvent()    {}
-func (RestoreErrored) isEvent() {}
-func (LoopIdle) isEvent()       {}
-func (LoopStarted) isEvent()    {}
+func (SessionStarted) isEvent()        {}
+func (SessionActive) isEvent()         {}
+func (SessionIdle) isEvent()           {}
+func (SessionStopped) isEvent()        {}
+func (RestoreStarted) isEvent()        {}
+func (RestoreDone) isEvent()           {}
+func (RestoreErrored) isEvent()        {}
+func (WorkspaceCheckpointed) isEvent() {}
+func (LoopIdle) isEvent()              {}
+func (LoopStarted) isEvent()           {}

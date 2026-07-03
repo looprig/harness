@@ -30,9 +30,8 @@ func (j *recordingJournal) Append(_ context.Context, rec JournalRecord) (uint64,
 }
 
 // TestJournalEventAppenderRoutes proves the façade wraps an event.Event in an
-// EventRecord that self-routes to the right subject (session-scoped → session subject;
-// loop-scoped → loop event subject) and carries the event's EventID as the idempotency
-// id, then calls the underlying journal's Append.
+// EventRecord that carries the event's EventID as the idempotency id, then calls the
+// underlying journal's Append.
 func TestJournalEventAppenderRoutes(t *testing.T) {
 	t.Parallel()
 	sid := fixedUUID(0x21)
@@ -40,19 +39,16 @@ func TestJournalEventAppenderRoutes(t *testing.T) {
 	evID := fixedUUID(0x23)
 
 	tests := []struct {
-		name        string
-		ev          event.Event
-		wantSubject string
+		name string
+		ev   event.Event
 	}{
 		{
-			name:        "session-scoped event routes to the session subject",
-			ev:          event.SessionActive{Header: event.Header{Coordinates: identity.Coordinates{SessionID: sid}, EventID: evID}},
-			wantSubject: SessionEventSubject(sid),
+			name: "session-scoped event",
+			ev:   event.SessionActive{Header: event.Header{Coordinates: identity.Coordinates{SessionID: sid}, EventID: evID}},
 		},
 		{
-			name:        "loop-scoped event routes to the loop event subject",
-			ev:          event.LoopIdle{Header: event.Header{Coordinates: identity.Coordinates{SessionID: sid, LoopID: lid}, EventID: evID}},
-			wantSubject: LoopEventSubject(sid, lid),
+			name: "loop-scoped event",
+			ev:   event.LoopIdle{Header: event.Header{Coordinates: identity.Coordinates{SessionID: sid, LoopID: lid}, EventID: evID}},
 		},
 	}
 	for _, tt := range tests {
@@ -69,9 +65,6 @@ func TestJournalEventAppenderRoutes(t *testing.T) {
 				t.Fatalf("appended %d records, want 1", len(j.records))
 			}
 			rec := j.records[0]
-			if rec.Subject() != tt.wantSubject {
-				t.Errorf("record subject = %q, want %q", rec.Subject(), tt.wantSubject)
-			}
 			if rec.IdempotencyID() != evID.String() {
 				t.Errorf("record idempotency id = %q, want %q", rec.IdempotencyID(), evID.String())
 			}
@@ -170,8 +163,8 @@ func TestJournalEventAppenderCatalogSkippedOnFailure(t *testing.T) {
 }
 
 // TestJournalCommandAppenderRoutes proves the command façade wraps a command in a
-// CommandRecord targeting the given session+loop (the intent-log subject) and carries
-// the command's CommandID as the idempotency id, then calls the underlying Append.
+// CommandRecord targeting the given session+loop (exposed via SessionID/LoopID) and
+// carries the command's CommandID as the idempotency id, then calls the underlying Append.
 func TestJournalCommandAppenderRoutes(t *testing.T) {
 	t.Parallel()
 	sid := fixedUUID(0x41)
@@ -200,15 +193,15 @@ func TestJournalCommandAppenderRoutes(t *testing.T) {
 				t.Fatalf("appended %d records, want 1", len(j.records))
 			}
 			got := j.records[0]
-			if got.Subject() != LoopCommandSubject(sid, lid) {
-				t.Errorf("record subject = %q, want %q", got.Subject(), LoopCommandSubject(sid, lid))
-			}
 			if got.IdempotencyID() != cmdID.String() {
 				t.Errorf("record idempotency id = %q, want %q", got.IdempotencyID(), cmdID.String())
 			}
 			cr, ok := got.(CommandRecord)
 			if !ok {
 				t.Fatalf("record type = %T, want CommandRecord", got)
+			}
+			if cr.SessionID() != sid || cr.LoopID() != lid {
+				t.Errorf("record target = (%v, %v), want (%v, %v)", cr.SessionID(), cr.LoopID(), sid, lid)
 			}
 			if cr.Command().CommandHeader().CommandID != cmdID {
 				t.Errorf("wrapped command id = %v, want %v", cr.Command().CommandHeader().CommandID, cmdID)

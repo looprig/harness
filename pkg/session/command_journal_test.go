@@ -218,13 +218,12 @@ func recvCommand(t *testing.T, ch chan command.Command) command.Command {
 	}
 }
 
-// assertRecord checks the appended record's target subject (session+loop), idempotency
-// id (CommandID), and the dispatched command's CommandID/Agency/non-zero CreatedAt.
+// assertRecord checks the appended record's target (session+loop), idempotency id
+// (CommandID), and the dispatched command's CommandID/Agency/non-zero CreatedAt.
 func assertRecord(t *testing.T, rec journal.CommandRecord, sid, loopID uuid.UUID, dispatched command.Command, wantAgency identity.Agency, wantTS time.Time) {
 	t.Helper()
-	wantSubject := journal.LoopCommandSubject(sid, loopID)
-	if rec.Subject() != wantSubject {
-		t.Errorf("record subject = %q, want %q", rec.Subject(), wantSubject)
+	if rec.SessionID() != sid || rec.LoopID() != loopID {
+		t.Errorf("record target = (%v, %v), want (%v, %v)", rec.SessionID(), rec.LoopID(), sid, loopID)
 	}
 	dh := dispatched.CommandHeader()
 	if rec.IdempotencyID() != dh.CommandID.String() {
@@ -440,9 +439,9 @@ func TestInterruptAppendsOneRecordPerLoop(t *testing.T) {
 	if len(recs) != 2 {
 		t.Fatalf("appended %d records, want 2 (one per loop)", len(recs))
 	}
-	seen := map[string]bool{}
+	seen := map[uuid.UUID]bool{}
 	for _, rec := range recs {
-		seen[rec.Subject()] = true
+		seen[rec.LoopID()] = true
 		if _, ok := rec.Command().(command.Interrupt); !ok {
 			t.Errorf("record command = %T, want command.Interrupt", rec.Command())
 		}
@@ -453,8 +452,8 @@ func TestInterruptAppendsOneRecordPerLoop(t *testing.T) {
 			t.Error("record CreatedAt is zero, want the injected clock stamp")
 		}
 	}
-	if !seen[journal.LoopCommandSubject(s.SessionID, loopA)] || !seen[journal.LoopCommandSubject(s.SessionID, loopB)] {
-		t.Errorf("records did not target both loop subjects: %v", seen)
+	if !seen[loopA] || !seen[loopB] {
+		t.Errorf("records did not target both loops: %v", seen)
 	}
 }
 

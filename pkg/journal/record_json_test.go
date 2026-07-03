@@ -69,7 +69,7 @@ func TestUnmarshalLeaseFenceErrors(t *testing.T) {
 	}
 }
 
-func TestFenceRecordSubjectAndID(t *testing.T) {
+func TestFenceRecordIDAndPayload(t *testing.T) {
 	t.Parallel()
 	sid := fixedUUID(0x31)
 	tests := []struct {
@@ -87,17 +87,14 @@ func TestFenceRecordSubjectAndID(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			rec := NewFenceRecord(sid, LeaseFence{Epoch: tt.epoch})
-			if got := rec.Subject(); got != FenceSubject(sid) {
-				t.Errorf("Subject() = %q, want %q", got, FenceSubject(sid))
-			}
 			if got := rec.IdempotencyID(); got != tt.wantID {
 				t.Errorf("IdempotencyID() = %q, want %q", got, tt.wantID)
 			}
+			if rec.SessionID() != sid {
+				t.Errorf("SessionID() = %v, want %v", rec.SessionID(), sid)
+			}
 			if rec.Fence() != (LeaseFence{Epoch: tt.epoch}) {
 				t.Errorf("Fence() did not return the wrapped fence")
-			}
-			if IsEventSubject(rec.Subject()) {
-				t.Errorf("fence subject %q classified as an event subject", rec.Subject())
 			}
 		})
 	}
@@ -108,9 +105,6 @@ func TestFenceRecordSubjectAndID(t *testing.T) {
 func TestFenceRecordIsJournalRecord(t *testing.T) {
 	t.Parallel()
 	var r JournalRecord = NewFenceRecord(fixedUUID(0x51), LeaseFence{Epoch: 3})
-	if r.Subject() == "" {
-		t.Errorf("fence record Subject() is empty")
-	}
 	if r.IdempotencyID() != "3" {
 		t.Errorf("fence record IdempotencyID() = %q, want \"3\"", r.IdempotencyID())
 	}
