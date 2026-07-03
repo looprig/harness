@@ -13,7 +13,7 @@ storage-neutral, but every constructor takes `nats.JetStreamContext`/`nats.Objec
 `nats-server` per session directory. Consumers pay the embedded-JetStream dependency tree to
 append a few dozen enduring events per session to local disk.
 
-Separately, the sibling project `github.com/ciram-co/flow` (durable graph engine) has its own
+Separately, the sibling project `github.com/looprig/flow` (durable graph engine) has its own
 append-only store (`CheckpointStore`) with its own NATS module — the same storage primitive,
 implemented twice.
 
@@ -63,12 +63,12 @@ engine releases never touch backends. looprig and flow still never import each o
 
 | Module | Contents | Imports |
 |---|---|---|
-| `github.com/ciram-co/storekit` | contracts (`Ledger`, `Leaser`, `KV`, `Blobs`), typed errors, `AppendDefinite`, `memstore`, `storetest` | stdlib only |
-| `github.com/ciram-co/looprig` | `pkg/sessionstore` (domain facade), existing `pkg/journal` record types/codecs/appenders/interfaces | + storekit |
-| `github.com/ciram-co/fsstore` | all four primitives on local disk | stdlib + storekit |
-| `github.com/ciram-co/natsstore` | all four primitives on JetStream; embedded-server option (absorbs `pkg/persistence`) | storekit + nats.go + nats-server |
-| `github.com/ciram-co/pgstore` (future) | `Ledger`/`Leaser`/`KV` on Postgres | storekit + pg driver |
-| `github.com/ciram-co/rclonestore` (workspace spec) | `Blobs` via exec'd rclone binary | stdlib + storekit |
+| `github.com/looprig/storekit` | contracts (`Ledger`, `Leaser`, `KV`, `Blobs`), typed errors, `AppendDefinite`, `memstore`, `storetest` | stdlib only |
+| `github.com/looprig/harness` | `pkg/sessionstore` (domain facade), existing `pkg/journal` record types/codecs/appenders/interfaces | + storekit |
+| `github.com/looprig/fsstore` | all four primitives on local disk | stdlib + storekit |
+| `github.com/looprig/natsstore` | all four primitives on JetStream; embedded-server option (absorbs `pkg/persistence`) | storekit + nats.go + nats-server |
+| `github.com/looprig/pgstore` (future) | `Ledger`/`Leaser`/`KV` on Postgres | storekit + pg driver |
+| `github.com/looprig/rclonestore` (workspace spec) | `Blobs` via exec'd rclone binary | stdlib + storekit |
 
 Backend-first packaging: one module per technology, implementing whichever primitives it can
 honestly pass conformance for. Repo names carry no `looprig-` prefix and no contract prefix.

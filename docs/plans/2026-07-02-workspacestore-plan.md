@@ -250,7 +250,7 @@ during replay; after a successful fold and before the session goes live, `Materi
 ### Task C1: Scaffold + exec runner
 
 **Files:**
-- Create: `~/code/ciram-co/rclonestore/` — go.mod (module `github.com/ciram-co/rclonestore`,
+- Create: `~/code/ciram-co/rclonestore/` — go.mod (module `github.com/looprig/rclonestore`,
   go 1.25.0, require storekit + replace), CLAUDE.md (stdlib + storekit only; drives the
   external rclone binary; never librclone), Makefile (with `test-integration`)
 - Create: `runner.go`, `runner_test.go`

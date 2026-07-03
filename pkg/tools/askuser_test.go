@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/ciram-co/looprig/pkg/tool"
+	"github.com/looprig/harness/pkg/tool"
 )
 
 // stubInputError is a typed error a stub requestUserInput seam can return to

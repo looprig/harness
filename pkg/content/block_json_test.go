@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/ciram-co/looprig/pkg/content"
+	"github.com/looprig/harness/pkg/content"
 )
 
 // TestBlockCodecRoundTrip verifies that every concrete Block variant survives a

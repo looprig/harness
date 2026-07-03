@@ -7,7 +7,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/ciram-co/looprig/pkg/tool"
+	"github.com/looprig/harness/pkg/tool"
 )
 
 // TestTodoInfo asserts the self-description: the name MUST be exactly "Todo"

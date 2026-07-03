@@ -4,7 +4,7 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/ciram-co/looprig/pkg/llm"
+	"github.com/looprig/harness/pkg/llm"
 )
 
 // The live gateway's claimed digests from testdata/report_aci1.json. These are

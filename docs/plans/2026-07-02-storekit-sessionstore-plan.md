@@ -22,7 +22,7 @@
   - test: `GOWORK=off go test -race ./...`
 - **Cross-module wiring during development:** the new modules are unpublished. Use
   `replace` directives (e.g. in looprig's go.mod:
-  `replace github.com/ciram-co/storekit => ../ciram-co/storekit`) and re-vendor
+  `replace github.com/looprig/storekit => ../ciram-co/storekit`) and re-vendor
   (`GOWORK=off go mod vendor`) after every go.mod change in looprig. Task E2 removes the
   replaces and pins tags. Set `GOPRIVATE=github.com/ciram-co` when fetching tags.
 - **Ordering constraint:** natsstore (Phase D) ports code out of looprig's `pkg/journal`
@@ -49,7 +49,7 @@
 **Step 2:** Write `go.mod`:
 
 ```
-module github.com/ciram-co/storekit
+module github.com/looprig/storekit
 
 go 1.25.0
 ```
@@ -289,8 +289,8 @@ copy-in/copy-out); shared cases live in storetest only (DRY).
 **Step 1:** In looprig: `git tag pre-storekit-extraction && git checkout -b feat/storekit-extraction`
 (the tag is what Phase D ports from).
 
-**Step 2:** Add to go.mod: `require github.com/ciram-co/storekit v0.0.0` +
-`replace github.com/ciram-co/storekit => ../ciram-co/storekit`. Run
+**Step 2:** Add to go.mod: `require github.com/looprig/storekit v0.0.0` +
+`replace github.com/looprig/storekit => ../ciram-co/storekit`. Run
 `GOWORK=off go mod tidy && GOWORK=off go mod vendor`.
 
 **Step 3:** `GOWORK=off go build ./...` clean. Commit `chore: depend on storekit (dev replace)`.
@@ -492,7 +492,7 @@ only pkg/persistence remains).
 verify `nats-io` is gone from go.mod and `vendor/github.com/nats-io` no longer exists.
 
 **Step 2:** CLAUDE.md approved-deps list: remove both `nats-io` entries; add:
-`github.com/ciram-co/storekit — leaf storage contracts (Ledger/Leaser/KV/Blobs) +
+`github.com/looprig/storekit — leaf storage contracts (Ledger/Leaser/KV/Blobs) +
 memstore + conformance suite; stdlib-only. The NATS deps moved to the ciram-co/natsstore
 backend module.`
 
@@ -505,8 +505,8 @@ backend module.`
 
 ### Task C1: Scaffold
 
-Same shape as Task A1 at `~/code/ciram-co/fsstore`: module `github.com/ciram-co/fsstore`,
-go 1.25.0, `require github.com/ciram-co/storekit` + `replace => ../storekit`, CLAUDE.md
+Same shape as Task A1 at `~/code/ciram-co/fsstore`: module `github.com/looprig/fsstore`,
+go 1.25.0, `require github.com/looprig/storekit` + `replace => ../storekit`, CLAUDE.md
 (stdlib + storekit only), Makefile. Commit.
 
 ### Task C2: Ledger frame codec
@@ -584,7 +584,7 @@ storekit.KV; storekit.Blobs } = (*Store)(nil)`; full `make check`; `gosec` if av
 ### Task D1: Scaffold + embedded engine port
 
 **Files:**
-- Create: `~/code/ciram-co/natsstore/` — go.mod (module `github.com/ciram-co/natsstore`,
+- Create: `~/code/ciram-co/natsstore/` — go.mod (module `github.com/looprig/natsstore`,
   go 1.25.0; require storekit (replace), `nats-io/nats.go v1.52.0`,
   `nats-io/nats-server/v2 v2.14.2`), CLAUDE.md (NATS deps sanctioned HERE, moved from
   looprig), Makefile with `test-integration: GOWORK=off go test -tags integration -race ./...`
@@ -668,7 +668,7 @@ config surface. Run swe's full suite. Commit in swe.
 **Steps:**
 1. Tag `storekit v0.1.0`, `fsstore v0.1.0`, `natsstore v0.1.0` (push if remotes exist;
    `GOPRIVATE=github.com/ciram-co`).
-2. looprig: remove the `replace`, `require github.com/ciram-co/storekit v0.1.0`,
+2. looprig: remove the `replace`, `require github.com/looprig/storekit v0.1.0`,
    `GOWORK=off go mod tidy && go mod vendor`, `make secure`, full `-race` suite.
 3. fsstore/natsstore: same de-replace against storekit v0.1.0.
 4. Merge `feat/storekit-extraction`; tag looprig `v0.5.0`.

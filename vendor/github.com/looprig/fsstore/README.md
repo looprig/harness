@@ -7,7 +7,7 @@ contracts: the ledger is an append-only frame log (length-prefixed, CRC-32C-chec
 with automatic torn-tail recovery on reopen; leases are `flock`-fenced lock files carrying a
 durable, strictly-increasing epoch counter; KV is one revision-CAS'd file per key (atomic
 temp-file + rename writes); and Blobs are content-addressed immutable byte objects. It depends
-only on the Go standard library and `github.com/ciram-co/storekit`.
+only on the Go standard library and `github.com/looprig/storekit`.
 
 The backend assumes **single-writer-per-name**: reads take no advisory lock and trust that no
 one rewrites committed bytes concurrently. Enforcing that discipline is the **caller's

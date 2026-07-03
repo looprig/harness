@@ -11,7 +11,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/ciram-co/looprig/pkg/tool"
+	"github.com/looprig/harness/pkg/tool"
 )
 
 // fetch.go implements the Fetch tool: it performs a single bounded HTTP GET or

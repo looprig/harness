@@ -5,11 +5,11 @@ import (
 	"encoding/json"
 	"testing"
 
-	"github.com/ciram-co/looprig/pkg/content"
-	"github.com/ciram-co/looprig/pkg/llm"
-	"github.com/ciram-co/looprig/pkg/llm/auth"
-	"github.com/ciram-co/looprig/pkg/llm/codec/anthropicapi"
-	"github.com/ciram-co/looprig/pkg/llm/providers/bedrock"
+	"github.com/looprig/harness/pkg/content"
+	"github.com/looprig/harness/pkg/llm"
+	"github.com/looprig/harness/pkg/llm/auth"
+	"github.com/looprig/harness/pkg/llm/codec/anthropicapi"
+	"github.com/looprig/harness/pkg/llm/providers/bedrock"
 )
 
 // TestBedrockBodyTransform verifies the Anthropic->Bedrock body rewrite via the

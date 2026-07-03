@@ -1,8 +1,8 @@
 package sessionstore
 
 import (
-	"github.com/ciram-co/looprig/pkg/uuid"
-	"github.com/ciram-co/storekit"
+	"github.com/looprig/harness/pkg/uuid"
+	"github.com/looprig/storekit"
 )
 
 // defaultOffloadThreshold is the payload size, in bytes, above which a record

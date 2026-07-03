@@ -3,8 +3,8 @@ package foreignloop
 import (
 	"context"
 
-	"github.com/ciram-co/looprig/pkg/content"
-	"github.com/ciram-co/looprig/pkg/event"
+	"github.com/looprig/harness/pkg/content"
+	"github.com/looprig/harness/pkg/event"
 )
 
 // snapshotReq is the actor-served committed-state query handshake. The actor is the

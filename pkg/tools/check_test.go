@@ -11,8 +11,8 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/ciram-co/looprig/pkg/loop"
-	"github.com/ciram-co/looprig/pkg/tool"
+	"github.com/looprig/harness/pkg/loop"
+	"github.com/looprig/harness/pkg/tool"
 )
 
 // check_test.go exercises the security core: the seven-stage fail-secure

@@ -3,7 +3,7 @@ package aci
 import (
 	"encoding/json"
 
-	"github.com/ciram-co/looprig/pkg/llm"
+	"github.com/looprig/harness/pkg/llm"
 )
 
 // This file defines the Go model of a Dstack ACI ("aci/1") attestation report

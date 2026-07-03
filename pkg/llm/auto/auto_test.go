@@ -4,15 +4,15 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/ciram-co/looprig/pkg/llm"
-	"github.com/ciram-co/looprig/pkg/llm/aci"
-	"github.com/ciram-co/looprig/pkg/llm/auth"
-	"github.com/ciram-co/looprig/pkg/llm/codec/anthropicapi"
-	"github.com/ciram-co/looprig/pkg/llm/codec/gemini"
-	"github.com/ciram-co/looprig/pkg/llm/codec/openaiapi"
-	"github.com/ciram-co/looprig/pkg/llm/providers/chutes"
-	geminiprovider "github.com/ciram-co/looprig/pkg/llm/providers/gemini"
-	"github.com/ciram-co/looprig/pkg/llm/transport"
+	"github.com/looprig/harness/pkg/llm"
+	"github.com/looprig/harness/pkg/llm/aci"
+	"github.com/looprig/harness/pkg/llm/auth"
+	"github.com/looprig/harness/pkg/llm/codec/anthropicapi"
+	"github.com/looprig/harness/pkg/llm/codec/gemini"
+	"github.com/looprig/harness/pkg/llm/codec/openaiapi"
+	"github.com/looprig/harness/pkg/llm/providers/chutes"
+	geminiprovider "github.com/looprig/harness/pkg/llm/providers/gemini"
+	"github.com/looprig/harness/pkg/llm/transport"
 )
 
 // TestNew exercises the dispatch + fail-closed auth contract: valid models build a

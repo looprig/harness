@@ -4,9 +4,9 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/ciram-co/looprig/pkg/uuid"
-	"github.com/ciram-co/storekit"
-	"github.com/ciram-co/storekit/memstore"
+	"github.com/looprig/harness/pkg/uuid"
+	"github.com/looprig/storekit"
+	"github.com/looprig/storekit/memstore"
 )
 
 // mustUUID parses the canonical 8-4-4-4-12 form or fails the test. It gives the

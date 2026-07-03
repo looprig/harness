@@ -10,10 +10,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ciram-co/looprig/pkg/content"
-	"github.com/ciram-co/looprig/pkg/tool"
-	"github.com/ciram-co/looprig/pkg/transcript"
-	"github.com/ciram-co/looprig/pkg/uuid"
+	"github.com/looprig/harness/pkg/content"
+	"github.com/looprig/harness/pkg/tool"
+	"github.com/looprig/harness/pkg/transcript"
+	"github.com/looprig/harness/pkg/uuid"
 )
 
 // update regenerates the golden files when set: go test -run TestRenderMinimal -update.

@@ -7,7 +7,7 @@ import (
 	"testing"
 	"testing/fstest"
 
-	"github.com/ciram-co/looprig/pkg/identity"
+	"github.com/looprig/harness/pkg/identity"
 )
 
 // newTestSkillFS builds an in-memory skill tree shaped exactly like the embedded

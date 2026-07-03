@@ -4,7 +4,7 @@ import (
 	"context"
 	"testing"
 
-	"github.com/ciram-co/looprig/pkg/loop"
+	"github.com/looprig/harness/pkg/loop"
 )
 
 func TestUnattended_SuppressesEffectCheckerAutoApprove(t *testing.T) {

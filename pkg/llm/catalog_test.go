@@ -3,7 +3,7 @@ package llm_test
 import (
 	"testing"
 
-	"github.com/ciram-co/looprig/pkg/llm"
+	"github.com/looprig/harness/pkg/llm"
 )
 
 // TestCatalogModels verifies each hand-authored catalog row has the expected

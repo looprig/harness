@@ -6,7 +6,7 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/ciram-co/looprig/pkg/llm/e2e"
+	"github.com/looprig/harness/pkg/llm/e2e"
 )
 
 func TestSealOpen_RoundTrip(t *testing.T) {

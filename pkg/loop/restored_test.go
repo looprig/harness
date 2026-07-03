@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ciram-co/looprig/pkg/content"
-	"github.com/ciram-co/looprig/pkg/event"
+	"github.com/looprig/harness/pkg/content"
+	"github.com/looprig/harness/pkg/event"
 )
 
 // seededUser builds the committed UserMessage form the loop appends for a turn.

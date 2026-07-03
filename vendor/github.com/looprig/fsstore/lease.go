@@ -10,7 +10,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/ciram-co/storekit"
+	"github.com/looprig/storekit"
 )
 
 // This file implements storekit.Leaser over the local filesystem: one lock file

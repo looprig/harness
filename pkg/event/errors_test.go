@@ -3,7 +3,7 @@ package event_test
 import (
 	"testing"
 
-	"github.com/ciram-co/looprig/pkg/event"
+	"github.com/looprig/harness/pkg/event"
 )
 
 func TestEventErrorMessages(t *testing.T) {

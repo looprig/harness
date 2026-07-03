@@ -5,8 +5,8 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/ciram-co/looprig/pkg/content"
-	"github.com/ciram-co/looprig/pkg/loop"
+	"github.com/looprig/harness/pkg/content"
+	"github.com/looprig/harness/pkg/loop"
 )
 
 // newRestoredTestLoop wires a journal-seeded foreign loop to a fakePublisher with the

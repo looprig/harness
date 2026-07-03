@@ -3,7 +3,7 @@ package workspacestore
 import (
 	"testing"
 
-	"github.com/ciram-co/storekit/memstore"
+	"github.com/looprig/storekit/memstore"
 )
 
 // TestOpenResolvesLimitDefaults guards the wiring the plan called out explicitly:

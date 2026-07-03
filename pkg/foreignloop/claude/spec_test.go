@@ -5,7 +5,7 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/ciram-co/looprig/pkg/foreignloop"
+	"github.com/looprig/harness/pkg/foreignloop"
 )
 
 // TestNewSpec proves the turn-key resolver builds a foreignloop.Spec backed by the

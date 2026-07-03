@@ -5,10 +5,10 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/ciram-co/looprig/pkg/content"
-	"github.com/ciram-co/looprig/pkg/event"
-	"github.com/ciram-co/looprig/pkg/llm"
-	"github.com/ciram-co/looprig/pkg/uuid"
+	"github.com/looprig/harness/pkg/content"
+	"github.com/looprig/harness/pkg/event"
+	"github.com/looprig/harness/pkg/llm"
+	"github.com/looprig/harness/pkg/uuid"
 )
 
 // mustUUID mints a UUID for tests or fails the test (crypto/rand should never

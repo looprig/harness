@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ciram-co/looprig/pkg/event"
+	"github.com/looprig/harness/pkg/event"
 )
 
 // deadPID returns a process id guaranteed to be dead: it runs `true` to completion

@@ -6,8 +6,8 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/ciram-co/looprig/pkg/llm"
-	"github.com/ciram-co/looprig/pkg/llm/tee"
+	"github.com/looprig/harness/pkg/llm"
+	"github.com/looprig/harness/pkg/llm/tee"
 )
 
 // This file is attestation step 4's test (verifyQuote): the quote signature/chain

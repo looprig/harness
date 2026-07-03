@@ -384,7 +384,7 @@ import (
 	"context"
 	"testing"
 
-	"github.com/ciram-co/looprig/pkg/loop"
+	"github.com/looprig/harness/pkg/loop"
 )
 
 // selfApprovingTool is an InvokableTool that also implements EffectChecker and
@@ -503,8 +503,8 @@ import (
 	"context"
 	"testing"
 
-	"github.com/ciram-co/looprig/pkg/loop"
-	"github.com/ciram-co/looprig/pkg/tool"
+	"github.com/looprig/harness/pkg/loop"
+	"github.com/looprig/harness/pkg/tool"
 )
 
 type stubGate struct {
@@ -569,8 +569,8 @@ package tools
 import (
 	"context"
 
-	"github.com/ciram-co/looprig/pkg/loop"
-	"github.com/ciram-co/looprig/pkg/tool"
+	"github.com/looprig/harness/pkg/loop"
+	"github.com/looprig/harness/pkg/tool"
 )
 
 // NonInteractiveGate makes any loop.PermissionGate safe to run with no human
@@ -634,7 +634,7 @@ package tools
 import (
 	"testing"
 
-	"github.com/ciram-co/looprig/pkg/loop"
+	"github.com/looprig/harness/pkg/loop"
 )
 
 func TestIntent_Wrap(t *testing.T) {
@@ -661,7 +661,7 @@ Expected: FAIL — `Interactive`/`Unattended`/`Wrap` undefined.
 ```go
 package tools
 
-import "github.com/ciram-co/looprig/pkg/loop"
+import "github.com/looprig/harness/pkg/loop"
 
 // Intent is the composition-root selector for how autonomous tool approval is.
 // It is NOT session state — neither loop.Config nor Session stores it; the
@@ -765,7 +765,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/ciram-co/looprig/pkg/loop"
+	"github.com/looprig/harness/pkg/loop"
 )
 
 // policySchemaVersion is bumped whenever the fingerprint input shape changes, so
@@ -946,11 +946,11 @@ import (
 	"context"
 	"time"
 
-	"github.com/ciram-co/looprig/pkg/content"
-	"github.com/ciram-co/looprig/pkg/event"
-	"github.com/ciram-co/looprig/pkg/tool"
-	"github.com/ciram-co/looprig/pkg/transcript"
-	"github.com/ciram-co/looprig/pkg/uuid"
+	"github.com/looprig/harness/pkg/content"
+	"github.com/looprig/harness/pkg/event"
+	"github.com/looprig/harness/pkg/tool"
+	"github.com/looprig/harness/pkg/transcript"
+	"github.com/looprig/harness/pkg/uuid"
 )
 
 // Agent is the narrow surface the HTTP runner drives (Interface Segregation: a
@@ -1033,4 +1033,4 @@ Run `GOWORK=off go test -race ./pkg/api/`, `GOWORK=off go vet ./pkg/api/`, `gofm
 
 # Phase 3 — swe consumer (OUT of looprig scope)
 
-Not implemented here (different repo, `github.com/ciram-co/swe`). On its next looprig upgrade swe must: (1) migrate its `NewPermissionChecker(policy)` call site (`swarms/swe/swarm.go`) to the fallible `NewPermissionChecker(policy, opts...)` (handle the error; use `WithHomeDir`/`WithUnattended` as needed); (2) add a `cmd/swe-serve` that builds each agent with the `Unattended` intent + its declared `PermissionPolicy` allowlist, wraps the gate via `tools.Unattended.Wrap`, injects the `NativePermissionPolicyRev` fingerprint field, and passes an `api.Factory` to `api.Serve`; (3) own credentials, auth (front the `http.Handler`), and deployment.
+Not implemented here (different repo, `github.com/looprig/swe`). On its next looprig upgrade swe must: (1) migrate its `NewPermissionChecker(policy)` call site (`swarms/swe/swarm.go`) to the fallible `NewPermissionChecker(policy, opts...)` (handle the error; use `WithHomeDir`/`WithUnattended` as needed); (2) add a `cmd/swe-serve` that builds each agent with the `Unattended` intent + its declared `PermissionPolicy` allowlist, wraps the gate via `tools.Unattended.Wrap`, injects the `NativePermissionPolicyRev` fingerprint field, and passes an `api.Factory` to `api.Serve`; (3) own credentials, auth (front the `http.Handler`), and deployment.

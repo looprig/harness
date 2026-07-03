@@ -3,7 +3,7 @@ package tools
 import (
 	"testing"
 
-	"github.com/ciram-co/looprig/pkg/loop"
+	"github.com/looprig/harness/pkg/loop"
 )
 
 // FuzzApprovalsParse asserts the approvals-file parser is TOTAL and FAIL-SECURE

@@ -3,8 +3,8 @@ package tools
 import (
 	"context"
 
-	"github.com/ciram-co/looprig/pkg/loop"
-	"github.com/ciram-co/looprig/pkg/tool"
+	"github.com/looprig/harness/pkg/loop"
+	"github.com/looprig/harness/pkg/tool"
 )
 
 // NonInteractiveGate makes any loop.PermissionGate safe to run with no human

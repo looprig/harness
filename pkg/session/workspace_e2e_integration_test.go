@@ -6,10 +6,10 @@ import (
 	"context"
 	"testing"
 
-	"github.com/ciram-co/fsstore"
-	"github.com/ciram-co/looprig/pkg/event"
-	"github.com/ciram-co/looprig/pkg/sessionstore"
-	"github.com/ciram-co/looprig/pkg/workspacestore"
+	"github.com/looprig/fsstore"
+	"github.com/looprig/harness/pkg/event"
+	"github.com/looprig/harness/pkg/sessionstore"
+	"github.com/looprig/harness/pkg/workspacestore"
 )
 
 // This is the end-to-end suspend/resume proof for the workspace-store feature against a

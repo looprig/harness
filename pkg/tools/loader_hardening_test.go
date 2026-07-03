@@ -9,7 +9,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/ciram-co/looprig/pkg/loop"
+	"github.com/looprig/harness/pkg/loop"
 )
 
 // loader_hardening_test.go exercises the READ-side store hardening (design §3c):

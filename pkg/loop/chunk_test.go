@@ -3,8 +3,8 @@ package loop
 import (
 	"testing"
 
-	"github.com/ciram-co/looprig/pkg/content"
-	"github.com/ciram-co/looprig/pkg/event"
+	"github.com/looprig/harness/pkg/content"
+	"github.com/looprig/harness/pkg/event"
 )
 
 // TestChunkProcessorEmitThenAccumulate proves the chunk layer's ordering

@@ -18,11 +18,11 @@ import (
 	"net/url"
 	"time"
 
-	"github.com/ciram-co/looprig/pkg/content"
-	"github.com/ciram-co/looprig/pkg/llm"
-	"github.com/ciram-co/looprig/pkg/llm/auth"
-	geminicodec "github.com/ciram-co/looprig/pkg/llm/codec/gemini"
-	"github.com/ciram-co/looprig/pkg/llm/transport"
+	"github.com/looprig/harness/pkg/content"
+	"github.com/looprig/harness/pkg/llm"
+	"github.com/looprig/harness/pkg/llm/auth"
+	geminicodec "github.com/looprig/harness/pkg/llm/codec/gemini"
+	"github.com/looprig/harness/pkg/llm/transport"
 )
 
 // Compile-time proof that Client honors the llm.LLM contract.

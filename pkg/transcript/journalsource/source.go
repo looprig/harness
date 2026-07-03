@@ -1,6 +1,6 @@
 // Package journalsource bridges the journal read side to the transcript builder. It is
-// the ONLY place that imports both github.com/ciram-co/looprig/pkg/journal and
-// github.com/ciram-co/looprig/pkg/transcript: pkg/transcript stays storage-pure (it
+// the ONLY place that imports both github.com/looprig/harness/pkg/journal and
+// github.com/looprig/harness/pkg/transcript: pkg/transcript stays storage-pure (it
 // never imports journal) and pkg/journal never knows about transcript. This adapter maps
 // a journal.RecordReplayer's stream onto a transcript.RecordSource, translating
 // journal.EventRecord/CommandRecord into their transcript counterparts and DROPPING
@@ -14,8 +14,8 @@ import (
 	"fmt"
 	"io"
 
-	"github.com/ciram-co/looprig/pkg/journal"
-	"github.com/ciram-co/looprig/pkg/transcript"
+	"github.com/looprig/harness/pkg/journal"
+	"github.com/looprig/harness/pkg/transcript"
 )
 
 // Open adapts a journal.RecordReplayer into a transcript.RecordSource over the records

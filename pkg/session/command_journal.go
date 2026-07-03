@@ -6,11 +6,11 @@ import (
 	"log/slog"
 	"time"
 
-	"github.com/ciram-co/looprig/pkg/command"
-	"github.com/ciram-co/looprig/pkg/foreignloop"
-	"github.com/ciram-co/looprig/pkg/journal"
-	"github.com/ciram-co/looprig/pkg/uuid"
-	"github.com/ciram-co/looprig/pkg/workspacestore"
+	"github.com/looprig/harness/pkg/command"
+	"github.com/looprig/harness/pkg/foreignloop"
+	"github.com/looprig/harness/pkg/journal"
+	"github.com/looprig/harness/pkg/uuid"
+	"github.com/looprig/harness/pkg/workspacestore"
 )
 
 // commandAppender is the session's narrow durable-write seam for the INTENT LOG:

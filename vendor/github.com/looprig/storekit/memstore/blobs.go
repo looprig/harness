@@ -8,7 +8,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/ciram-co/storekit"
+	"github.com/looprig/storekit"
 )
 
 // blobStore is the in-memory Blobs backing type: content-addressed immutable

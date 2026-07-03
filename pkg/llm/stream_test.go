@@ -5,7 +5,7 @@ import (
 	"io"
 	"testing"
 
-	"github.com/ciram-co/looprig/pkg/llm"
+	"github.com/looprig/harness/pkg/llm"
 )
 
 func TestStreamReader_Next(t *testing.T) {

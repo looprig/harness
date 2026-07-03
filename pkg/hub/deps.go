@@ -3,7 +3,7 @@ package hub
 import (
 	"context"
 
-	"github.com/ciram-co/looprig/pkg/event"
+	"github.com/looprig/harness/pkg/event"
 )
 
 // eventAppender is the hub's narrow durable-write seam: append one Enduring event to

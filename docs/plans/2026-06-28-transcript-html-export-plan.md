@@ -28,7 +28,7 @@ scope (v1)").
 
 **Conventions:**
 - **Worktree isolation:** prefix every Go command with
-  `GOWORK=off GOPRIVATE='github.com/ciram-co/*' GOSUMDB=off` so the worktree's own module is
+  `GOWORK=off GOPRIVATE='github.com/looprig/*' GOSUMDB=off` so the worktree's own module is
   exercised, not the main checkout (the parent `go.work` masks it otherwise). Abbreviated as `go …`
   below.
 - TDD: write the failing test first, watch it fail, implement the minimum, watch it pass, commit.

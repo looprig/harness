@@ -1,8 +1,8 @@
 package command
 
 import (
-	"github.com/ciram-co/looprig/pkg/content"
-	"github.com/ciram-co/looprig/pkg/identity"
+	"github.com/looprig/harness/pkg/content"
+	"github.com/looprig/harness/pkg/identity"
 )
 
 // UserInput is interactive input. The loop decides its outcome; the caller never

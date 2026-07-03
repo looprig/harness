@@ -4,8 +4,8 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/ciram-co/looprig/pkg/command"
-	"github.com/ciram-co/looprig/pkg/identity"
+	"github.com/looprig/harness/pkg/command"
+	"github.com/looprig/harness/pkg/identity"
 )
 
 // TestValidateCommandValid asserts every addressed command type, populated to its

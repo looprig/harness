@@ -6,9 +6,9 @@ import (
 	"io"
 	"strconv"
 
-	"github.com/ciram-co/looprig/pkg/journal"
-	"github.com/ciram-co/looprig/pkg/uuid"
-	"github.com/ciram-co/storekit"
+	"github.com/looprig/harness/pkg/journal"
+	"github.com/looprig/harness/pkg/uuid"
+	"github.com/looprig/storekit"
 )
 
 // GCLeaseNotHeldError reports that GC was refused because the session's single-writer

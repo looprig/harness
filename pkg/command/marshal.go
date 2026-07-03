@@ -4,8 +4,8 @@ import (
 	"encoding/json"
 	"fmt"
 
-	"github.com/ciram-co/looprig/pkg/content"
-	"github.com/ciram-co/looprig/pkg/identity"
+	"github.com/looprig/harness/pkg/content"
+	"github.com/looprig/harness/pkg/identity"
 )
 
 // schemaVersion is the current wire-envelope schema version stamped into every

@@ -1,6 +1,6 @@
 package bedrock
 
-import "github.com/ciram-co/looprig/pkg/llm/auth"
+import "github.com/looprig/harness/pkg/llm/auth"
 
 // NewWithEndpoint is a test-only constructor that overrides the region-derived
 // Bedrock Runtime endpoint so Invoke can be exercised against an httptest.Server.

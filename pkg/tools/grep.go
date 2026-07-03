@@ -18,8 +18,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/ciram-co/looprig/pkg/loop"
-	"github.com/ciram-co/looprig/pkg/tool"
+	"github.com/looprig/harness/pkg/loop"
+	"github.com/looprig/harness/pkg/tool"
 )
 
 // grep.go implements the Grep tool: a workspace-contained content search that

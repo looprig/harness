@@ -12,7 +12,7 @@ import (
 	"io"
 	"sync"
 
-	"github.com/ciram-co/storekit"
+	"github.com/looprig/storekit"
 )
 
 // New assembles the in-memory reference backend: a *storekit.Composite wiring

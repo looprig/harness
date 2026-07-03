@@ -3,8 +3,8 @@ package api
 import (
 	"sync"
 
-	"github.com/ciram-co/looprig/pkg/event"
-	"github.com/ciram-co/looprig/pkg/uuid"
+	"github.com/looprig/harness/pkg/event"
+	"github.com/looprig/harness/pkg/uuid"
 )
 
 // Gate kinds. A gate is either a permission approval (PermissionRequested) or a

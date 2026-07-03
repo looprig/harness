@@ -11,10 +11,10 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/ciram-co/looprig/pkg/content"
-	"github.com/ciram-co/looprig/pkg/llm"
-	"github.com/ciram-co/looprig/pkg/llm/codec/openaiapi"
-	"github.com/ciram-co/looprig/pkg/llm/e2e"
+	"github.com/looprig/harness/pkg/content"
+	"github.com/looprig/harness/pkg/llm"
+	"github.com/looprig/harness/pkg/llm/codec/openaiapi"
+	"github.com/looprig/harness/pkg/llm/e2e"
 )
 
 // errStreamInitMissing is returned when an e2e frame arrives before the

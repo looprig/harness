@@ -6,8 +6,8 @@ import (
 	"io"
 	"sync"
 
-	"github.com/ciram-co/looprig/pkg/content"
-	"github.com/ciram-co/looprig/pkg/llm"
+	"github.com/looprig/harness/pkg/content"
+	"github.com/looprig/harness/pkg/llm"
 )
 
 // fakeLLM is a controllable llm.LLM for tests.

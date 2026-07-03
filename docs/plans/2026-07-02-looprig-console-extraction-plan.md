@@ -2,7 +2,7 @@
 
 > **For Claude:** REQUIRED SUB-SKILL: execute with superpowers:subagent-driven-development (chosen), one fresh subagent per task, code review between tasks.
 
-**Goal:** Move the TUI + CLI presentation layer out of `looprig` into a new sibling module `github.com/ciram-co/looprig-console`, so `looprig`'s root `go.mod` no longer carries the `charm.land` stack — and rewire the `swe` consumer.
+**Goal:** Move the TUI + CLI presentation layer out of `looprig` into a new sibling module `github.com/looprig/cli`, so `looprig`'s root `go.mod` no longer carries the `charm.land` stack — and rewire the `swe` consumer.
 
 **Architecture:** Clean one-way leaf-cut. `looprig-console → looprig` (never reverse). Packages relocate via `cp`/`sed` (no git-history preservation). New repo mirrors looprig's security posture (vendored, `make secure`, adapted `CLAUDE.md`). Local `replace => ../looprig` avoids version skew (looprig HEAD is past the published `v0.3.0`). The `looprig` cleanup lands on a branch in a git worktree.
 
@@ -45,8 +45,8 @@ cp -R /Users/ipotter/code/looprig/pkg/cli /Users/ipotter/code/looprig-console/cl
 
 ```bash
 find /Users/ipotter/code/looprig-console/tui /Users/ipotter/code/looprig-console/cli -name '*.go' -type f -exec sed -i '' \
-  -e 's|github.com/ciram-co/looprig/pkg/tui|github.com/ciram-co/looprig-console/tui|g' \
-  -e 's|github.com/ciram-co/looprig/pkg/cli|github.com/ciram-co/looprig-console/cli|g' \
+  -e 's|github.com/looprig/harness/pkg/tui|github.com/looprig/cli/tui|g' \
+  -e 's|github.com/looprig/harness/pkg/cli|github.com/looprig/cli/cli|g' \
   {} +
 ```
 Verify (expect NO output): `grep -rn "ciram-co/looprig/pkg/\(tui\|cli\)" /Users/ipotter/code/looprig-console`
@@ -54,7 +54,7 @@ Verify (expect NO output): `grep -rn "ciram-co/looprig/pkg/\(tui\|cli\)" /Users/
 **Step 3: Write `go.mod`** (`/Users/ipotter/code/looprig-console/go.mod`) — minimal; `go mod tidy` fills requires.
 
 ```
-module github.com/ciram-co/looprig-console
+module github.com/looprig/cli
 
 go 1.26.4
 
@@ -64,16 +64,16 @@ tool (
 	honnef.co/go/tools/cmd/staticcheck
 )
 
-require github.com/ciram-co/looprig v0.0.0
+require github.com/looprig/harness v0.0.0
 
 // Local, unpublished dependency on the looprig SDK. looprig-console is extracted
 // FROM the current looprig working tree, so it must build against that exact tree
 // (published tags lag). At release: drop this replace and pin a real looprig tag.
-replace github.com/ciram-co/looprig => ../looprig
+replace github.com/looprig/harness => ../looprig
 
 // The TUI requires the ciram-co bubbletea fork for the Kitty keyboard protocol
 // (true Shift+Enter). Copied verbatim from looprig/go.mod — MUST stay in sync.
-replace charm.land/bubbletea/v2 => github.com/ciram-co/bubbletea/v2 v2.0.0-20260623210731-9571e88971cd
+replace charm.land/bubbletea/v2 => github.com/looprig/bubbletea/v2 v2.0.0-20260623210731-9571e88971cd
 ```
 
 **Step 4: Write `Makefile`** — copy `/Users/ipotter/code/looprig/Makefile` verbatim, then add this note above `export GOFLAGS := -mod=vendor`:
@@ -89,7 +89,7 @@ replace charm.land/bubbletea/v2 => github.com/ciram-co/bubbletea/v2 v2.0.0-20260
 **Step 6: Write `CLAUDE.md`** — copy `/Users/ipotter/code/looprig/CLAUDE.md`, then edit ONLY the `## Dependencies` approved-list to keep the entries this module owns and drop the rest:
 - **KEEP:** `gosec`, `govulncheck`, `staticcheck` (dev tools), `charm.land/bubbletea` (v2), `charm.land/bubbles` (v2), `charm.land/lipgloss` (v2), `charm.land/glamour`, `github.com/atotto/clipboard`.
 - **REMOVE:** `go-tdx-guest`, `secp256k1`, `golang.org/x/crypto`, `golang.org/x/net/*`, `nats.go`, `nats-server`, `goldmark` (these belong to looprig-core packages this module does not directly import).
-- Add one line at the top of `## Dependencies`: `This module is the presentation layer extracted from github.com/ciram-co/looprig; it depends on that SDK for core types (content, event, transcript, …).`
+- Add one line at the top of `## Dependencies`: `This module is the presentation layer extracted from github.com/looprig/harness; it depends on that SDK for core types (content, event, transcript, …).`
 Then symlink AGENTS.md: `ln -s CLAUDE.md /Users/ipotter/code/looprig-console/AGENTS.md`
 
 **Step 7: Write `README.md`** — short: what the module is (looprig's TUI + CLI presentation layer), the `looprig-console → looprig` relationship, and the `GOWORK=off make secure` build note.
@@ -157,7 +157,7 @@ grep -E 'charm.land/(bubbletea|bubbles|lipgloss|glamour)' go.mod && echo "FAIL: 
 Expected: both "OK".
 
 **Step 4: Update `<WORKTREE>/CLAUDE.md`** — in `## Dependencies`, REMOVE the four `charm.land/*` entries and the `github.com/atotto/clipboard` entry (they now live in looprig-console). KEEP all others (`gosec`/`govulncheck`/`staticcheck`, `go-tdx-guest`, `x/crypto`, `secp256k1`, `x/net/*`, `nats.go`, `nats-server`, `goldmark`). Add a pointer bullet:
-`- The TUI + CLI presentation layer (and its charm.land stack) now lives in the sibling module github.com/ciram-co/looprig-console.`
+`- The TUI + CLI presentation layer (and its charm.land stack) now lives in the sibling module github.com/looprig/cli.`
 
 **Step 5: Verify build + tests + secure**
 
@@ -196,15 +196,15 @@ use (
 
 ```bash
 find /Users/ipotter/code/swe/cmd/swe /Users/ipotter/code/swe/swarms/swe -name '*.go' -type f -exec sed -i '' \
-  -e 's|github.com/ciram-co/looprig/pkg/cli|github.com/ciram-co/looprig-console/cli|g' \
-  -e 's|github.com/ciram-co/looprig/pkg/tui|github.com/ciram-co/looprig-console/tui|g' \
+  -e 's|github.com/looprig/harness/pkg/cli|github.com/looprig/cli/cli|g' \
+  -e 's|github.com/looprig/harness/pkg/tui|github.com/looprig/cli/tui|g' \
   {} +
 ```
 Verify (expect NO output): `grep -rn "ciram-co/looprig/pkg/\(tui\|cli\)" /Users/ipotter/code/swe --include='*.go' | grep -v /vendor/`
 
-**Step 3: Add the looprig-console dependency to `swe/go.mod`** — add a `require github.com/ciram-co/looprig-console v0.0.0` and a local replace (swe does NOT vendor; unpublished dep needs the replace for module-mode commands):
+**Step 3: Add the looprig-console dependency to `swe/go.mod`** — add a `require github.com/looprig/cli v0.0.0` and a local replace (swe does NOT vendor; unpublished dep needs the replace for module-mode commands):
 ```
-replace github.com/ciram-co/looprig-console => ../looprig-console
+replace github.com/looprig/cli => ../looprig-console
 ```
 (Note in a comment: drop the replace + pin a tag at release.)
 

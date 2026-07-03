@@ -3,7 +3,7 @@ package tools
 import (
 	"testing"
 
-	"github.com/ciram-co/looprig/pkg/loop"
+	"github.com/looprig/harness/pkg/loop"
 )
 
 func TestIntent_Wrap(t *testing.T) {

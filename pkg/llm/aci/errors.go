@@ -7,7 +7,7 @@
 // new exported error type; it supplies the reason strings and thin constructors.
 package aci
 
-import "github.com/ciram-co/looprig/pkg/llm"
+import "github.com/looprig/harness/pkg/llm"
 
 // SupportedAPIVersion is the only Dstack ACI wire api_version this client
 // speaks. A report declaring any other version is rejected

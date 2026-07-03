@@ -18,7 +18,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/ciram-co/looprig/pkg/content"
+	"github.com/looprig/harness/pkg/content"
 )
 
 // Thinking folds streamed ThinkingChunk deltas into a single ThinkingBlock.

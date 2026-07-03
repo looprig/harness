@@ -3,9 +3,9 @@ package loop
 import (
 	"context"
 
-	"github.com/ciram-co/looprig/pkg/command"
-	"github.com/ciram-co/looprig/pkg/content"
-	"github.com/ciram-co/looprig/pkg/event"
+	"github.com/looprig/harness/pkg/command"
+	"github.com/looprig/harness/pkg/content"
+	"github.com/looprig/harness/pkg/event"
 )
 
 // Backend is the narrow turn-engine contract Session drives. Both *loop.Loop and

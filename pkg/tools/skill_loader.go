@@ -6,7 +6,7 @@ import (
 	"io/fs"
 	"path"
 
-	"github.com/ciram-co/looprig/pkg/identity"
+	"github.com/looprig/harness/pkg/identity"
 )
 
 // SkillLoader resolves a named skill into the markdown body to inject into an

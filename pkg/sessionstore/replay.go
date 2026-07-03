@@ -9,11 +9,11 @@ import (
 	"strconv"
 	"sync"
 
-	"github.com/ciram-co/looprig/pkg/command"
-	"github.com/ciram-co/looprig/pkg/event"
-	"github.com/ciram-co/looprig/pkg/journal"
-	"github.com/ciram-co/looprig/pkg/uuid"
-	"github.com/ciram-co/storekit"
+	"github.com/looprig/harness/pkg/command"
+	"github.com/looprig/harness/pkg/event"
+	"github.com/looprig/harness/pkg/journal"
+	"github.com/looprig/harness/pkg/uuid"
+	"github.com/looprig/storekit"
 )
 
 // ReplayRequest positions a sessionstore replay. It carries an exported inclusive

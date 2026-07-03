@@ -45,9 +45,9 @@
 - `github.com/decred/dcrd/dcrec/secp256k1/v4` (+`/ecdsa`) — secp256k1 ECDSA verify (64-byte) and public-key recovery (65-byte r‖s‖v), required by `pkg/llm/aci` to verify Dstack `aci/1` receipt signatures, keyset endorsements, and the KMS-custody chain (the gateway signs with `ecdsa-secp256k1`; stdlib has no secp256k1). **Approved 2026-06-24.** Chosen over `go-ethereum/crypto` for a far smaller dependency surface; same curve math. Note: secp256k1 is classical (protocol-mandated, verify-only) — not a quantum-safety choice.
 - `golang.org/x/net/html` — HTML tokenizer; required by the `WebSearch` tool's DuckDuckGo HTML-scrape `SearchProvider` (stdlib has no HTML parser)
 - `golang.org/x/net/idna` — IDNA/punycode host normalization (same `golang.org/x/net` module as above); required by the `Fetch` tool's persisted-approval host matching to defeat unicode homographs (stdlib has no IDNA)
-- `github.com/ciram-co/storekit` — leaf storage contracts (`Ledger`/`Leaser`/`KV`/`Blobs`) + in-memory reference backend (`memstore`) + conformance suite (`storetest`); stdlib-only. The NATS deps moved to the `ciram-co/natsstore` backend module; `fsstore`/`rclonestore` are the other storekit backends.
+- `github.com/looprig/storekit` — leaf storage contracts (`Ledger`/`Leaser`/`KV`/`Blobs`) + in-memory reference backend (`memstore`) + conformance suite (`storetest`); stdlib-only. The NATS deps moved to the `looprig/natsstore` backend module; `fsstore`/`rclonestore` are the other storekit backends.
 - `github.com/yuin/goldmark` — CommonMark markdown → HTML for the transcript export renderer (`pkg/transcript/html`); the stdlib has no markdown renderer, which is why a dep is warranted. Pure-Go, no cgo, CommonMark-compliant, safe HTML output. Rendered with raw-HTML passthrough **disabled** (no `html.WithUnsafe()`) — that is the XSS boundary; the result is placed via `template.HTML` only because goldmark has already escaped it. **Approved by the user on 2026-06-28.**
-- The TUI + CLI presentation layer (and its charm.land stack) now lives in the sibling module github.com/ciram-co/looprig-console.
+- The TUI + CLI presentation layer (and its charm.land stack) now lives in the sibling module github.com/looprig/cli.
 
 ## Secure Coding Patterns
 

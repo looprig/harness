@@ -10,8 +10,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ciram-co/looprig/pkg/content"
-	"github.com/ciram-co/looprig/pkg/llm"
+	"github.com/looprig/harness/pkg/content"
+	"github.com/looprig/harness/pkg/llm"
 )
 
 // TestModelAPIFormatSelectsCodecEndToEnd proves the Model.APIFormat axis drives

@@ -4,8 +4,8 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/ciram-co/looprig/pkg/content"
-	"github.com/ciram-co/looprig/pkg/content/streamaccumulator"
+	"github.com/looprig/harness/pkg/content"
+	"github.com/looprig/harness/pkg/content/streamaccumulator"
 )
 
 func TestToolUses(t *testing.T) {

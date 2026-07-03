@@ -24,7 +24,7 @@ that stack is only reachable through the TUI/CLI packages.
 
 ## 2. Decisions (locked)
 
-- **Module path / name:** `github.com/ciram-co/looprig-console`.
+- **Module path / name:** `github.com/looprig/cli`.
   Chosen over `looprig-tui` because the module also holds the CLI runner, and over
   thematic names (`loom`, `shuttle`) for discoverability as an obvious `looprig` sibling.
 - **Repo strategy:** a **new, separate repository** (not a nested submodule), matching
@@ -65,16 +65,16 @@ swe            ──▶ looprig, looprig-console
 
 | From (`looprig`)        | To (`looprig-console`) | New import path                                  |
 |-------------------------|------------------------|--------------------------------------------------|
-| `pkg/tui`               | `tui`                  | `github.com/ciram-co/looprig-console/tui`        |
-| `pkg/tui/components`    | `tui/components`       | `github.com/ciram-co/looprig-console/tui/components` |
-| `pkg/tui/styles`        | `tui/styles`           | `github.com/ciram-co/looprig-console/tui/styles` |
-| `pkg/cli`               | `cli`                  | `github.com/ciram-co/looprig-console/cli`        |
+| `pkg/tui`               | `tui`                  | `github.com/looprig/cli/tui`        |
+| `pkg/tui/components`    | `tui/components`       | `github.com/looprig/cli/tui/components` |
+| `pkg/tui/styles`        | `tui/styles`           | `github.com/looprig/cli/tui/styles` |
+| `pkg/cli`               | `cli`                  | `github.com/looprig/cli/cli`        |
 
 `sed` rewrites, applied only under the copied tree:
 
 ```
-s|github.com/ciram-co/looprig/pkg/tui|github.com/ciram-co/looprig-console/tui|g
-s|github.com/ciram-co/looprig/pkg/cli|github.com/ciram-co/looprig-console/cli|g
+s|github.com/looprig/harness/pkg/tui|github.com/looprig/cli/tui|g
+s|github.com/looprig/harness/pkg/cli|github.com/looprig/cli/cli|g
 ```
 
 (The `tui` rule also fixes `tui/components` and `tui/styles`.) All other
@@ -133,15 +133,15 @@ Either way, `looprig` core ends with **zero** references to `tui`/`cli`.
 
 The new repo is seeded to match looprig:
 
-- **`go.mod`** — `module github.com/ciram-co/looprig-console`, `go 1.26.4`, the same
+- **`go.mod`** — `module github.com/looprig/cli`, `go 1.26.4`, the same
   `tool (...)` block (gosec / govulncheck / staticcheck) so `make secure` works, and two
   `replace` directives:
-  - `replace github.com/ciram-co/looprig => ../looprig` — **local, unpublished**
+  - `replace github.com/looprig/harness => ../looprig` — **local, unpublished**
     dependency. looprig-console is extracted from the current looprig *working tree*, so
     it must build against that exact tree (published tags lag: HEAD is past `v0.3.3`,
     while `swe` still pins `v0.3.0`). **At release:** drop this replace and pin a real
     looprig tag.
-  - `replace charm.land/bubbletea/v2 => github.com/ciram-co/bubbletea/v2 <pseudo>` —
+  - `replace charm.land/bubbletea/v2 => github.com/looprig/bubbletea/v2 <pseudo>` —
     copied verbatim from looprig; the TUI regresses (Shift+Enter / Kitty protocol)
     without it. Must stay in sync with looprig's pin.
   - `require`s for the charm stack + transitives are produced by `go mod tidy`.
@@ -167,7 +167,7 @@ A workspace already lives at `/Users/ipotter/code/go.work`:
 ```
 go 1.26.4
 use ( ./looprig  ./swe )
-replace charm.land/bubbletea/v2 => github.com/ciram-co/bubbletea/v2 <pseudo>
+replace charm.land/bubbletea/v2 => github.com/looprig/bubbletea/v2 <pseudo>
 ```
 
 - Add `./looprig-console` to its `use (...)` block.
@@ -181,7 +181,7 @@ replace charm.land/bubbletea/v2 => github.com/ciram-co/bubbletea/v2 <pseudo>
 
 ## 8. Consumer (`swe`) rewiring
 
-`swe` (`github.com/ciram-co/swe`, currently `require github.com/ciram-co/looprig
+`swe` (`github.com/looprig/swe`, currently `require github.com/looprig/harness
 v0.3.0`) imports the presentation layer in **6 spots**:
 
 - `cmd/swe/main.go` — `looprig/pkg/cli` **and** `looprig/pkg/tui`
@@ -190,10 +190,10 @@ v0.3.0`) imports the presentation layer in **6 spots**:
 
 Rewiring (via `sed`):
 ```
-s|github.com/ciram-co/looprig/pkg/cli|github.com/ciram-co/looprig-console/cli|g
-s|github.com/ciram-co/looprig/pkg/tui|github.com/ciram-co/looprig-console/tui|g
+s|github.com/looprig/harness/pkg/cli|github.com/looprig/cli/cli|g
+s|github.com/looprig/harness/pkg/tui|github.com/looprig/cli/tui|g
 ```
-Then add `require github.com/ciram-co/looprig-console` to `swe/go.mod` (resolved locally
+Then add `require github.com/looprig/cli` to `swe/go.mod` (resolved locally
 via the workspace `use`; `swe` does not vendor). The public API is unchanged:
 `cli.Run(ctx, newAgent func(context.Context) (tui.Agent, error), banner cli.Banner) int`
 plus the `tui.Agent` interface and `cli.Banner` struct.
@@ -207,7 +207,7 @@ plus the `tui.Agent` interface and `cli.Banner` struct.
 - **`looprig/CLAUDE.md`:** remove the `charm.land/*` + `atotto/clipboard` entries from
   the Dependencies approved-list (they now live in looprig-console's CLAUDE.md), and add
   a short pointer noting the TUI/CLI presentation layer — and its charm stack — now lives
-  in `github.com/ciram-co/looprig-console`. Keep `goldmark` (transcript/html stays),
+  in `github.com/looprig/cli`. Keep `goldmark` (transcript/html stays),
   `nats`, `go-tdx-guest`, `x/crypto`, `secp256k1`, `x/net` entries as-is.
 
 ## 10. Migration sequence (keeps every module building at each checkpoint)

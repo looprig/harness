@@ -10,10 +10,10 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"github.com/ciram-co/looprig/pkg/event"
-	"github.com/ciram-co/looprig/pkg/workspacestore"
-	"github.com/ciram-co/storekit"
-	"github.com/ciram-co/storekit/memstore"
+	"github.com/looprig/harness/pkg/event"
+	"github.com/looprig/harness/pkg/workspacestore"
+	"github.com/looprig/storekit"
+	"github.com/looprig/storekit/memstore"
 )
 
 // checkpointOrderProbe shares one monotonic sequence between the Blobs Put wrapper

@@ -10,11 +10,11 @@ import (
 	"strings"
 	"time"
 
-	"github.com/ciram-co/looprig/pkg/content"
-	"github.com/ciram-co/looprig/pkg/event"
-	"github.com/ciram-co/looprig/pkg/journal"
-	"github.com/ciram-co/looprig/pkg/uuid"
-	"github.com/ciram-co/storekit"
+	"github.com/looprig/harness/pkg/content"
+	"github.com/looprig/harness/pkg/event"
+	"github.com/looprig/harness/pkg/journal"
+	"github.com/looprig/harness/pkg/uuid"
+	"github.com/looprig/storekit"
 )
 
 // titleMaxLen bounds the derived Title: a short label cut from the first user message's

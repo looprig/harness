@@ -4,8 +4,8 @@ package gemini
 import (
 	"encoding/json"
 
-	"github.com/ciram-co/looprig/pkg/content"
-	"github.com/ciram-co/looprig/pkg/llm"
+	"github.com/looprig/harness/pkg/content"
+	"github.com/looprig/harness/pkg/llm"
 )
 
 // DecodeResponse parses a Gemini generateContent JSON response body into a

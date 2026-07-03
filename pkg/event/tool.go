@@ -1,8 +1,8 @@
 package event
 
 import (
-	"github.com/ciram-co/looprig/pkg/tool"
-	"github.com/ciram-co/looprig/pkg/uuid"
+	"github.com/looprig/harness/pkg/tool"
+	"github.com/looprig/harness/pkg/uuid"
 )
 
 // PermissionRequested is emitted when a tool call needs interactive approval.

@@ -7,8 +7,8 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/ciram-co/looprig/pkg/event"
-	"github.com/ciram-co/looprig/pkg/loop"
+	"github.com/looprig/harness/pkg/event"
+	"github.com/looprig/harness/pkg/loop"
 )
 
 // ConfigFingerprintFields are the swarm-level fingerprint inputs that do NOT live on

@@ -11,8 +11,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/ciram-co/looprig/pkg/content"
-	"github.com/ciram-co/looprig/pkg/foreignloop"
+	"github.com/looprig/harness/pkg/content"
+	"github.com/looprig/harness/pkg/foreignloop"
 )
 
 // closeGrace is how long the process group has to exit on SIGINT before SIGKILL.

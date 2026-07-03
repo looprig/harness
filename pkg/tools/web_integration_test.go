@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ciram-co/looprig/pkg/tool"
+	"github.com/looprig/harness/pkg/tool"
 )
 
 // web_integration_test.go exercises the two WEB tools against REAL endpoints and

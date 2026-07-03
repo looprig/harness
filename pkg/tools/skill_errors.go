@@ -1,6 +1,6 @@
 package tools
 
-import "github.com/ciram-co/looprig/pkg/identity"
+import "github.com/looprig/harness/pkg/identity"
 
 // UnknownSkillError is returned when a skill is requested by name that is not
 // known to — or not authorized for — the requesting agent. It is fail-secure:

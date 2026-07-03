@@ -11,8 +11,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/ciram-co/looprig/pkg/content"
-	"github.com/ciram-co/looprig/pkg/llm"
+	"github.com/looprig/harness/pkg/content"
+	"github.com/looprig/harness/pkg/llm"
 )
 
 // Client is a connection-bound llm.LLM: one Codec (wire dialect) x one Endpoint

@@ -12,10 +12,10 @@ import (
 	"strconv"
 	"testing"
 
-	"github.com/ciram-co/looprig/pkg/journal"
-	"github.com/ciram-co/looprig/pkg/uuid"
-	"github.com/ciram-co/storekit"
-	"github.com/ciram-co/storekit/memstore"
+	"github.com/looprig/harness/pkg/journal"
+	"github.com/looprig/harness/pkg/uuid"
+	"github.com/looprig/storekit"
+	"github.com/looprig/storekit/memstore"
 )
 
 // gcBlobPrefix is the content-addressed blob prefix GC sweeps for session id:

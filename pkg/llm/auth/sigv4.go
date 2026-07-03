@@ -14,7 +14,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/ciram-co/looprig/pkg/llm"
+	"github.com/looprig/harness/pkg/llm"
 )
 
 // AWS Signature Version 4 constants (see the AWS "aws-sig-v4-test-suite" reference).

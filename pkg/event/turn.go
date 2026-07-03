@@ -1,7 +1,7 @@
 package event
 
 import (
-	"github.com/ciram-co/looprig/pkg/content"
+	"github.com/looprig/harness/pkg/content"
 )
 
 // TurnStarted is emitted when runLoop commits a turn's initial UserMessage. It is

@@ -11,11 +11,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ciram-co/looprig/pkg/event"
-	"github.com/ciram-co/looprig/pkg/identity"
-	"github.com/ciram-co/looprig/pkg/transcript"
-	"github.com/ciram-co/looprig/pkg/transcript/journalsource"
-	"github.com/ciram-co/looprig/pkg/uuid"
+	"github.com/looprig/harness/pkg/event"
+	"github.com/looprig/harness/pkg/identity"
+	"github.com/looprig/harness/pkg/transcript"
+	"github.com/looprig/harness/pkg/transcript/journalsource"
+	"github.com/looprig/harness/pkg/uuid"
 )
 
 // export-path leaf sentinels: errExportSource stands in for a non-unavailable

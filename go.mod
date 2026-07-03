@@ -1,4 +1,4 @@
-module github.com/ciram-co/looprig
+module github.com/looprig/harness
 
 go 1.26.4
 
@@ -9,7 +9,7 @@ tool (
 )
 
 require (
-	github.com/ciram-co/fsstore v0.0.0-00010101000000-000000000000
+	github.com/looprig/fsstore v0.0.0-00010101000000-000000000000
 	github.com/decred/dcrd/dcrec/secp256k1/v4 v4.4.1
 	github.com/google/go-tdx-guest v0.3.1
 	github.com/yuin/goldmark v1.8.2
@@ -27,7 +27,7 @@ require (
 	github.com/buger/jsonparser v1.2.0 // indirect
 	github.com/ccojocar/zxcvbn-go v1.0.4 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
-	github.com/ciram-co/storekit v0.0.0
+	github.com/looprig/storekit v0.0.0
 	github.com/felixge/httpsnoop v1.0.4 // indirect
 	github.com/go-logr/logr v1.4.3 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
@@ -74,10 +74,10 @@ require (
 	honnef.co/go/tools v0.7.0 // indirect
 )
 
-replace github.com/ciram-co/storekit => ../../../ciram-co/storekit
+replace github.com/looprig/storekit => ../../../ciram-co/storekit
 
 // fsstore is a storekit filesystem backend, normally wired at the composition root
 // (not by looprig). It is pulled in ONLY by the //go:build integration
 // workspace suspend/resume e2e test, via this test-scoped local replace mirroring the
 // storekit one above (fsstore has no remote; the replace resolves it locally).
-replace github.com/ciram-co/fsstore => ../../../ciram-co/fsstore
+replace github.com/looprig/fsstore => ../../../ciram-co/fsstore

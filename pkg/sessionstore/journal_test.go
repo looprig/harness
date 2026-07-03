@@ -13,12 +13,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ciram-co/looprig/pkg/command"
-	"github.com/ciram-co/looprig/pkg/content"
-	"github.com/ciram-co/looprig/pkg/journal"
-	"github.com/ciram-co/looprig/pkg/uuid"
-	"github.com/ciram-co/storekit"
-	"github.com/ciram-co/storekit/memstore"
+	"github.com/looprig/harness/pkg/command"
+	"github.com/looprig/harness/pkg/content"
+	"github.com/looprig/harness/pkg/journal"
+	"github.com/looprig/harness/pkg/uuid"
+	"github.com/looprig/storekit"
+	"github.com/looprig/storekit/memstore"
 )
 
 // leaseFor returns a journal.Lease (the real *sessionLease adapter over a

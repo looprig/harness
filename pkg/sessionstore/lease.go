@@ -4,9 +4,9 @@ import (
 	"context"
 	"errors"
 
-	"github.com/ciram-co/looprig/pkg/journal"
-	"github.com/ciram-co/looprig/pkg/uuid"
-	"github.com/ciram-co/storekit"
+	"github.com/looprig/harness/pkg/journal"
+	"github.com/looprig/harness/pkg/uuid"
+	"github.com/looprig/storekit"
 )
 
 // sessionLease adapts a storekit.Lease to journal.Lease. storekit's lease is

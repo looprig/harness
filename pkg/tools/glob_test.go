@@ -9,8 +9,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/ciram-co/looprig/pkg/content"
-	"github.com/ciram-co/looprig/pkg/tool"
+	"github.com/looprig/harness/pkg/content"
+	"github.com/looprig/harness/pkg/tool"
 )
 
 func runGlob(t *testing.T, root string, guard *fakeReadGuard, args map[string]any) string {

@@ -1,6 +1,6 @@
 package command
 
-import "github.com/ciram-co/looprig/pkg/uuid"
+import "github.com/looprig/harness/pkg/uuid"
 
 // ProvideUserInput supplies the user's Answer to a pending AskUser request
 // identified by ToolExecutionID. Like the approve/deny pair it is a fire-and-route control
