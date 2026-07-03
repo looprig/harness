@@ -1,9 +1,10 @@
 # Design — LLM mechanism/policy ownership: retire the catalogue, own base URLs in clients, fail-close attestation
 
 - **Date:** 2026-07-02
-- **Status:** Approved — design decisions confirmed (catalogue→swe, A2 full removal,
-  OriginCatalog keep+reword). Ready for an implementation plan; only ops confirmation of the
-  Phala production host remains before merge.
+- **Status:** Implemented on branch `feat/llm-mechanism-policy-ownership` (Tasks 1–12 of the
+  companion plan; every task spec- and quality-reviewed, `-race` suite + `make secure` green).
+  Pre-merge follow-ups: ops confirmation of the Phala production host (`inference.phala.com`,
+  §4.2) and the coordinated `swe` migration (§5, breaking — after this tags).
 - **Scope:** `pkg/llm` and its sub-packages in the `looprig` SDK, plus a coordinated migration in the `swe` consumer.
 
 ## 1. Context
