@@ -6,7 +6,7 @@ import (
 	"log/slog"
 
 	"github.com/looprig/harness/pkg/event"
-	"github.com/looprig/harness/pkg/uuid"
+	"github.com/looprig/core/uuid"
 )
 
 // fillForeignHeader stamps the producer COORDINATES onto a foreign event from the

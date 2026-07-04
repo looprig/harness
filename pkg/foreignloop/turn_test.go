@@ -12,7 +12,7 @@ import (
 	"github.com/looprig/harness/pkg/command"
 	"github.com/looprig/harness/pkg/content"
 	"github.com/looprig/harness/pkg/event"
-	"github.com/looprig/harness/pkg/uuid"
+	"github.com/looprig/core/uuid"
 )
 
 // eventKind names a foreign event for an ordered-sequence assertion.

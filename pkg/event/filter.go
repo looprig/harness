@@ -1,6 +1,6 @@
 package event
 
-import "github.com/looprig/harness/pkg/uuid"
+import "github.com/looprig/core/uuid"
 
 // EventFilter is a subscriber's declared interest: which loop producers it wants
 // events from, separated by class. It is declared interest (deterministic,

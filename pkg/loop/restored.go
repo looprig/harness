@@ -5,7 +5,7 @@ import (
 
 	"github.com/looprig/harness/pkg/content"
 	"github.com/looprig/harness/pkg/event"
-	"github.com/looprig/harness/pkg/uuid"
+	"github.com/looprig/core/uuid"
 )
 
 // RestoredState is the pre-built committed state a restored loop comes up with: the

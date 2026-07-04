@@ -7,7 +7,7 @@ import (
 	"github.com/looprig/harness/pkg/content"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/loop"
-	"github.com/looprig/harness/pkg/uuid"
+	"github.com/looprig/core/uuid"
 )
 
 // RestoredForeign is the journal-recovered seed for a foreign loop: the recovered

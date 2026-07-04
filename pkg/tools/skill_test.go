@@ -8,7 +8,7 @@ import (
 
 	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/tool"
-	"github.com/looprig/harness/pkg/uuid"
+	"github.com/looprig/core/uuid"
 )
 
 // skillToolBody is the markdown body of the well-formed fixture skill, returned

@@ -6,7 +6,7 @@ import (
 	"testing"
 
 	"github.com/looprig/harness/pkg/event"
-	"github.com/looprig/harness/pkg/uuid"
+	"github.com/looprig/core/uuid"
 )
 
 // recordingEventAppender is an eventAppender double for the hub's REQUIRED durable

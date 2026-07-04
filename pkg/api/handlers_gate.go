@@ -10,7 +10,7 @@ import (
 
 	"github.com/looprig/harness/pkg/content"
 	"github.com/looprig/harness/pkg/tool"
-	"github.com/looprig/harness/pkg/uuid"
+	"github.com/looprig/core/uuid"
 )
 
 // Gate-routing request/response bodies. Domain payloads are typed structs (never

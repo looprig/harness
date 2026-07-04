@@ -5,7 +5,7 @@ import (
 
 	"github.com/looprig/harness/pkg/command"
 	"github.com/looprig/harness/pkg/event"
-	"github.com/looprig/harness/pkg/uuid"
+	"github.com/looprig/core/uuid"
 )
 
 // JournalRecord is the sealed sum a session's serialized writer persists: an

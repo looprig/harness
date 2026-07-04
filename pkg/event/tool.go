@@ -2,7 +2,7 @@ package event
 
 import (
 	"github.com/looprig/harness/pkg/tool"
-	"github.com/looprig/harness/pkg/uuid"
+	"github.com/looprig/core/uuid"
 )
 
 // PermissionRequested is emitted when a tool call needs interactive approval.

@@ -11,7 +11,7 @@ import (
 	"github.com/looprig/harness/pkg/content"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/llm"
-	"github.com/looprig/harness/pkg/uuid"
+	"github.com/looprig/core/uuid"
 )
 
 // fixedClock returns a constant instant so a test can assert CreatedAt

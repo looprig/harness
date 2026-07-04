@@ -7,7 +7,7 @@ import (
 
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/identity"
-	"github.com/looprig/harness/pkg/uuid"
+	"github.com/looprig/core/uuid"
 )
 
 // TestFactoryNewHeader asserts NewHeader mints a fresh EventID from the injected

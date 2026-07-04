@@ -5,7 +5,7 @@ import (
 	"time"
 
 	"github.com/looprig/harness/pkg/command"
-	"github.com/looprig/harness/pkg/uuid"
+	"github.com/looprig/core/uuid"
 )
 
 // registerGate sends a gateRegistration through the actor's gateReg seam and waits

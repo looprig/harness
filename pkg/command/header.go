@@ -4,7 +4,7 @@ import (
 	"time"
 
 	"github.com/looprig/harness/pkg/identity"
-	"github.com/looprig/harness/pkg/uuid"
+	"github.com/looprig/core/uuid"
 )
 
 // Header is the correlation/idempotency metadata embedded in every command.

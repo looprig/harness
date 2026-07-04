@@ -4,7 +4,7 @@ import (
 	"context"
 	"strconv"
 
-	"github.com/looprig/harness/pkg/uuid"
+	"github.com/looprig/core/uuid"
 )
 
 // Lease is the single-writer ownership token for one session's durable log. A

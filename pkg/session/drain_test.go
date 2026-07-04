@@ -10,7 +10,7 @@ import (
 	"github.com/looprig/harness/pkg/content"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/identity"
-	"github.com/looprig/harness/pkg/uuid"
+	"github.com/looprig/core/uuid"
 )
 
 // drainUUID builds a deterministic non-zero UUID from a seed for correlation

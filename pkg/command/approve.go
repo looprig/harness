@@ -2,7 +2,7 @@ package command
 
 import (
 	"github.com/looprig/harness/pkg/tool"
-	"github.com/looprig/harness/pkg/uuid"
+	"github.com/looprig/core/uuid"
 )
 
 // ApproveToolCall approves a pending tool call identified by ToolExecutionID, granting it

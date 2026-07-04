@@ -4,7 +4,7 @@ import (
 	"testing"
 
 	"github.com/looprig/harness/pkg/event"
-	"github.com/looprig/harness/pkg/uuid"
+	"github.com/looprig/core/uuid"
 )
 
 // TestSessionStateZeroValue confirms the enum zero value: a freshly built

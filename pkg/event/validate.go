@@ -2,7 +2,7 @@ package event
 
 import (
 	"github.com/looprig/harness/pkg/identity"
-	"github.com/looprig/harness/pkg/uuid"
+	"github.com/looprig/core/uuid"
 )
 
 // EventName is the concrete event type name an InvalidEventError points at.

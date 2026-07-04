@@ -1,7 +1,7 @@
 package sessionstore
 
 import (
-	"github.com/looprig/harness/pkg/uuid"
+	"github.com/looprig/core/uuid"
 	"github.com/looprig/storekit"
 )
 

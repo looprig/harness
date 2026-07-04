@@ -4,7 +4,7 @@ import (
 	"time"
 
 	"github.com/looprig/harness/pkg/identity"
-	"github.com/looprig/harness/pkg/uuid"
+	"github.com/looprig/core/uuid"
 )
 
 // Event is the sealed root of every loop event. Every concrete event embeds a

@@ -4,7 +4,7 @@ import (
 	"testing"
 
 	"github.com/looprig/harness/pkg/content"
-	"github.com/looprig/harness/pkg/uuid"
+	"github.com/looprig/core/uuid"
 )
 
 // testUserMsg builds a UserMessage carrying a single text block.

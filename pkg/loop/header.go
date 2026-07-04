@@ -2,7 +2,7 @@ package loop
 
 import (
 	"github.com/looprig/harness/pkg/event"
-	"github.com/looprig/harness/pkg/uuid"
+	"github.com/looprig/core/uuid"
 )
 
 // stampLoopHeader returns ev with its producer-identity Header completed from the

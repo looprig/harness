@@ -1,6 +1,6 @@
 package command
 
-import "github.com/looprig/harness/pkg/uuid"
+import "github.com/looprig/core/uuid"
 
 // DenyToolCall denies a pending tool call identified by ToolExecutionID. Like
 // ApproveToolCall it is a fire-and-route control command with no Ack: the actor

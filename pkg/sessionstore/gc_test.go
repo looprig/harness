@@ -13,7 +13,7 @@ import (
 	"testing"
 
 	"github.com/looprig/harness/pkg/journal"
-	"github.com/looprig/harness/pkg/uuid"
+	"github.com/looprig/core/uuid"
 	"github.com/looprig/storekit"
 	"github.com/looprig/storekit/memstore"
 )

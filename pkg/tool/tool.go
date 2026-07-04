@@ -11,7 +11,7 @@ import (
 	"encoding/json"
 
 	"github.com/looprig/harness/pkg/content"
-	"github.com/looprig/harness/pkg/uuid"
+	"github.com/looprig/core/uuid"
 )
 
 // ToolInfo is a tool's self-description. Schema is a JSON Schema describing the

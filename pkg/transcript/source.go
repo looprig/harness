@@ -5,7 +5,7 @@ import (
 
 	"github.com/looprig/harness/pkg/command"
 	"github.com/looprig/harness/pkg/event"
-	"github.com/looprig/harness/pkg/uuid"
+	"github.com/looprig/core/uuid"
 )
 
 // Record is one journaled item the builder folds in: an enduring Event or a

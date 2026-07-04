@@ -3,7 +3,7 @@ package journal
 import (
 	"strconv"
 
-	"github.com/looprig/harness/pkg/uuid"
+	"github.com/looprig/core/uuid"
 )
 
 // This file holds the journal's backend-neutral error vocabulary: the typed failures a

@@ -9,7 +9,7 @@ import (
 	"github.com/looprig/harness/pkg/command"
 	"github.com/looprig/harness/pkg/foreignloop"
 	"github.com/looprig/harness/pkg/journal"
-	"github.com/looprig/harness/pkg/uuid"
+	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/workspacestore"
 )
 

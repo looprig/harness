@@ -10,7 +10,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/looprig/harness/pkg/uuid"
+	"github.com/looprig/core/uuid"
 )
 
 // errFactory / errInterrupt are leaf sentinels for the 500 paths: a Factory that

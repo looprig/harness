@@ -5,7 +5,7 @@ import (
 	"testing"
 
 	"github.com/looprig/harness/pkg/identity"
-	"github.com/looprig/harness/pkg/uuid"
+	"github.com/looprig/core/uuid"
 )
 
 // unknownEvent is a test-only concrete Event NOT in the sealed union (it is not

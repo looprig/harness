@@ -10,7 +10,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/looprig/harness/pkg/uuid"
+	"github.com/looprig/core/uuid"
 )
 
 // Hardened-server and body-cap defaults. Named so no magic numbers are scattered

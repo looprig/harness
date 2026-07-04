@@ -4,7 +4,7 @@ import (
 	"sync"
 
 	"github.com/looprig/harness/pkg/event"
-	"github.com/looprig/harness/pkg/uuid"
+	"github.com/looprig/core/uuid"
 )
 
 // Gate kinds. A gate is either a permission approval (PermissionRequested) or a

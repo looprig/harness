@@ -149,10 +149,13 @@ github.com/gorilla/websocket
 # github.com/invopop/jsonschema v0.13.0
 ## explicit; go 1.18
 github.com/invopop/jsonschema
-# github.com/looprig/fsstore v0.0.0-00010101000000-000000000000 => ../ciram-co/fsstore
+# github.com/looprig/core v0.0.0 => ../core
+## explicit; go 1.25.0
+github.com/looprig/core/uuid
+# github.com/looprig/fsstore v0.0.0-00010101000000-000000000000 => ../fsstore
 ## explicit; go 1.25.0
 github.com/looprig/fsstore
-# github.com/looprig/storekit v0.0.0 => ../ciram-co/storekit
+# github.com/looprig/storekit v0.0.0 => ../storekit
 ## explicit; go 1.25.0
 github.com/looprig/storekit
 github.com/looprig/storekit/memstore
@@ -711,5 +714,6 @@ honnef.co/go/tools/stylecheck/st1021
 honnef.co/go/tools/stylecheck/st1022
 honnef.co/go/tools/stylecheck/st1023
 honnef.co/go/tools/unused
-# github.com/looprig/storekit => ../ciram-co/storekit
-# github.com/looprig/fsstore => ../ciram-co/fsstore
+# github.com/looprig/storekit => ../storekit
+# github.com/looprig/fsstore => ../fsstore
+# github.com/looprig/core => ../core

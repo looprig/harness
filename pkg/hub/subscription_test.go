@@ -5,7 +5,7 @@ import (
 	"testing"
 
 	"github.com/looprig/harness/pkg/event"
-	"github.com/looprig/harness/pkg/uuid"
+	"github.com/looprig/core/uuid"
 )
 
 // TestSubscriptionLossErrorError covers the typed loss error's message rendering,

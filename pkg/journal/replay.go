@@ -5,7 +5,7 @@ import (
 	"strconv"
 
 	"github.com/looprig/harness/pkg/event"
-	"github.com/looprig/harness/pkg/uuid"
+	"github.com/looprig/core/uuid"
 )
 
 // StartPos is the closed value type naming where a replay begins: the log beginning

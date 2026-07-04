@@ -5,7 +5,7 @@ import (
 
 	"github.com/looprig/harness/pkg/command"
 	"github.com/looprig/harness/pkg/tool"
-	"github.com/looprig/harness/pkg/uuid"
+	"github.com/looprig/core/uuid"
 )
 
 // gateRouter is the narrow accessor runLoop uses to route a control command to

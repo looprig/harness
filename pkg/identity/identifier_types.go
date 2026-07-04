@@ -7,7 +7,7 @@ package identity
 import (
 	"strconv"
 
-	"github.com/looprig/harness/pkg/uuid"
+	"github.com/looprig/core/uuid"
 )
 
 // Coordinates is the four nesting ids that locate any action in the hierarchy:
