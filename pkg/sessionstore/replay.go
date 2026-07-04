@@ -13,7 +13,7 @@ import (
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/journal"
 	"github.com/looprig/core/uuid"
-	"github.com/looprig/storekit"
+	"github.com/looprig/storage"
 )
 
 // ReplayRequest positions a sessionstore replay. It carries an exported inclusive

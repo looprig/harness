@@ -2,7 +2,7 @@ package sessionstore
 
 import (
 	"github.com/looprig/core/uuid"
-	"github.com/looprig/storekit"
+	"github.com/looprig/storage"
 )
 
 // defaultOffloadThreshold is the payload size, in bytes, above which a record

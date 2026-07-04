@@ -5,8 +5,8 @@ import (
 	"testing"
 
 	"github.com/looprig/core/uuid"
-	"github.com/looprig/storekit"
-	"github.com/looprig/storekit/memstore"
+	"github.com/looprig/storage"
+	"github.com/looprig/storage/memstore"
 )
 
 // mustUUID parses the canonical 8-4-4-4-12 form or fails the test. It gives the

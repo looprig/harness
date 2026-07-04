@@ -157,10 +157,10 @@ github.com/looprig/core/uuid
 # github.com/looprig/fsstore v0.0.0-00010101000000-000000000000 => ../fsstore
 ## explicit; go 1.25.0
 github.com/looprig/fsstore
-# github.com/looprig/storekit v0.0.0 => ../storekit
+# github.com/looprig/storage v0.0.0 => ../storage
 ## explicit; go 1.25.0
-github.com/looprig/storekit
-github.com/looprig/storekit/memstore
+github.com/looprig/storage
+github.com/looprig/storage/memstore
 # github.com/mailru/easyjson v0.9.2
 ## explicit; go 1.20
 github.com/mailru/easyjson/buffer
@@ -716,6 +716,6 @@ honnef.co/go/tools/stylecheck/st1021
 honnef.co/go/tools/stylecheck/st1022
 honnef.co/go/tools/stylecheck/st1023
 honnef.co/go/tools/unused
-# github.com/looprig/storekit => ../storekit
 # github.com/looprig/fsstore => ../fsstore
 # github.com/looprig/core => ../core
+# github.com/looprig/storage => ../storage

@@ -1,7 +1,7 @@
 package workspacestore
 
 import (
-	"github.com/looprig/storekit"
+	"github.com/looprig/storage"
 )
 
 // Store captures and restores a session's workspace tree as immutable,

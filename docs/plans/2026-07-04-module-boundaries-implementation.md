@@ -203,7 +203,7 @@ These repo-specific facts are the reason several tasks below are not "just `git 
 
 **Step 1:** `cd storekit && git mv` is not needed for the module path itself — edit `go.mod` module line to `github.com/looprig/storage`. Decide repo dir: rename `storekit/` → `storage/` (`mv storekit storage`; the `.git` moves with it). Update the umbrella `go.work` path.
 
-**Step 2:** RECIPE-REWRITE `github.com/looprig/storekit` `github.com/looprig/storage` `storage` (rewrites intra-module imports in `memstore/*`, `storetest/*`).
+**Step 2:** RECIPE-REWRITE `github.com/looprig/storage` `github.com/looprig/storage` `storage` (rewrites intra-module imports in `memstore/*`, `storetest/*`).
 
 **Step 3:** Update `storage/CLAUDE.md`, `README.md` name references. Keep package names (`memstore`, `storetest`) — only the module path changes; the design does **not** rename `storage`'s subpackages.
 
@@ -211,7 +211,7 @@ These repo-specific facts are the reason several tasks below are not "just `git 
 
 ### Task 4.2: Repoint the three backend stores
 
-**Step 1:** For each of `fsstore`, `natsstore`, `rclonestore`: edit `go.mod` `require` + fix the `replace` to `=> ../storage`; RECIPE-REWRITE `github.com/looprig/storekit` `github.com/looprig/storage` `<store>`; `go mod tidy`.
+**Step 1:** For each of `fsstore`, `natsstore`, `rclonestore`: edit `go.mod` `require` + fix the `replace` to `=> ../storage`; RECIPE-REWRITE `github.com/looprig/storage` `github.com/looprig/storage` `<store>`; `go mod tidy`.
 
 **Step 2:** RECIPE-GATE each (natsstore/rclonestore conformance tests are `//go:build integration` — run `go build ./...` + unit tests; note the integration suites in the commit message as not run locally if no NATS/rclone backend).
 
@@ -221,7 +221,7 @@ These repo-specific facts are the reason several tasks below are not "just `git 
 
 **Step 1:** In `harness/go.mod`: replace the `storekit` require/replace with `storage`, and **fix** the stale path (`../ciram-co/storekit` → `../storage`). Also fix the stale `fsstore` replace (`../ciram-co/fsstore` → `../fsstore`) while here.
 
-**Step 2:** RECIPE-REWRITE `github.com/looprig/storekit` `github.com/looprig/storage` `harness` (sites in `pkg/sessionstore/*`, `pkg/workspacestore/*`, `pkg/session/*_test.go` — root + `memstore`).
+**Step 2:** RECIPE-REWRITE `github.com/looprig/storage` `github.com/looprig/storage` `harness` (sites in `pkg/sessionstore/*`, `pkg/workspacestore/*`, `pkg/session/*_test.go` — root + `memstore`).
 
 **Step 3:** `go mod tidy` + `go mod vendor` (harness vendors `storekit` today → the vendored dir becomes `vendor/github.com/looprig/storage`).
 

@@ -6,7 +6,7 @@ import (
 
 	"github.com/looprig/harness/pkg/journal"
 	"github.com/looprig/core/uuid"
-	"github.com/looprig/storekit"
+	"github.com/looprig/storage"
 )
 
 // sessionLease adapts a storekit.Lease to journal.Lease. storekit's lease is

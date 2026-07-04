@@ -7,8 +7,8 @@ import (
 
 	"github.com/looprig/harness/pkg/journal"
 	"github.com/looprig/core/uuid"
-	"github.com/looprig/storekit"
-	"github.com/looprig/storekit/memstore"
+	"github.com/looprig/storage"
+	"github.com/looprig/storage/memstore"
 )
 
 // fakeLease is a controllable storekit.Lease for unit-testing the adapter's

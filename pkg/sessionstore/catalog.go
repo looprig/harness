@@ -14,7 +14,7 @@ import (
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/journal"
 	"github.com/looprig/core/uuid"
-	"github.com/looprig/storekit"
+	"github.com/looprig/storage"
 )
 
 // titleMaxLen bounds the derived Title: a short label cut from the first user message's

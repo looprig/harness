@@ -12,8 +12,8 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"github.com/looprig/storekit"
-	"github.com/looprig/storekit/memstore"
+	"github.com/looprig/storage"
+	"github.com/looprig/storage/memstore"
 )
 
 // countingGetBlobs wraps a storekit.Blobs and counts Get invocations so a test

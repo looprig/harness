@@ -14,8 +14,8 @@ import (
 
 	"github.com/looprig/harness/pkg/journal"
 	"github.com/looprig/core/uuid"
-	"github.com/looprig/storekit"
-	"github.com/looprig/storekit/memstore"
+	"github.com/looprig/storage"
+	"github.com/looprig/storage/memstore"
 )
 
 // gcBlobPrefix is the content-addressed blob prefix GC sweeps for session id:

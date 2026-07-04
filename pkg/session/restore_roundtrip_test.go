@@ -18,7 +18,7 @@ import (
 	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/harness/pkg/sessionstore"
 	"github.com/looprig/core/uuid"
-	"github.com/looprig/storekit/memstore"
+	"github.com/looprig/storage/memstore"
 )
 
 // --- memstore-backed store + journal test wiring (local to package session) ---------

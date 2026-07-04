@@ -1,6 +1,6 @@
-# CLAUDE.md — storekit
+# CLAUDE.md — storage
 
-`storekit` is a **stdlib-only leaf module**. It defines storage contracts; it depends on
+`storage` is a **stdlib-only leaf module**. It defines storage contracts; it depends on
 nothing outside the Go standard library, and it must stay that way.
 
 ## Dependencies

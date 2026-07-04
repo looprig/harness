@@ -5,7 +5,7 @@ local filesystem. It is a concrete backend, not a contract module.
 
 ## Dependencies
 
-- **stdlib + `github.com/looprig/storekit` only.** No other third-party dependency, ever.
+- **stdlib + `github.com/looprig/storage` only.** No other third-party dependency, ever.
   Do not `go get` anything else. If a task seems to need an external package, the task is
   wrong for this module.
 

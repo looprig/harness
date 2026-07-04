@@ -11,7 +11,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/looprig/storekit"
+	"github.com/looprig/storage"
 )
 
 // This file implements storekit.Ledger over the local filesystem: one append-only

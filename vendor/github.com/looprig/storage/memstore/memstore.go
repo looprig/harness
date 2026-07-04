@@ -12,7 +12,7 @@ import (
 	"io"
 	"sync"
 
-	"github.com/looprig/storekit"
+	"github.com/looprig/storage"
 )
 
 // New assembles the in-memory reference backend: a *storekit.Composite wiring

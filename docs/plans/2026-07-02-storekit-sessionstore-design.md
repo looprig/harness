@@ -63,7 +63,7 @@ engine releases never touch backends. looprig and flow still never import each o
 
 | Module | Contents | Imports |
 |---|---|---|
-| `github.com/looprig/storekit` | contracts (`Ledger`, `Leaser`, `KV`, `Blobs`), typed errors, `AppendDefinite`, `memstore`, `storetest` | stdlib only |
+| `github.com/looprig/storage` | contracts (`Ledger`, `Leaser`, `KV`, `Blobs`), typed errors, `AppendDefinite`, `memstore`, `storetest` | stdlib only |
 | `github.com/looprig/harness` | `pkg/sessionstore` (domain facade), existing `pkg/journal` record types/codecs/appenders/interfaces | + storekit |
 | `github.com/looprig/fsstore` | all four primitives on local disk | stdlib + storekit |
 | `github.com/looprig/natsstore` | all four primitives on JetStream; embedded-server option (absorbs `pkg/persistence`) | storekit + nats.go + nats-server |

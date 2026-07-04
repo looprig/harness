@@ -17,8 +17,8 @@ import (
 	"github.com/looprig/core/content"
 	"github.com/looprig/harness/pkg/journal"
 	"github.com/looprig/core/uuid"
-	"github.com/looprig/storekit"
-	"github.com/looprig/storekit/memstore"
+	"github.com/looprig/storage"
+	"github.com/looprig/storage/memstore"
 )
 
 // leaseFor returns a journal.Lease (the real *sessionLease adapter over a

@@ -6,7 +6,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/looprig/storekit"
+	"github.com/looprig/storage"
 )
 
 // kvEntry is a single stored KV value with its current per-key revision. The

@@ -8,7 +8,7 @@ import (
 
 	"github.com/looprig/harness/pkg/journal"
 	"github.com/looprig/core/uuid"
-	"github.com/looprig/storekit"
+	"github.com/looprig/storage"
 )
 
 // GCLeaseNotHeldError reports that GC was refused because the session's single-writer

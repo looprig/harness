@@ -12,8 +12,8 @@ import (
 
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/workspacestore"
-	"github.com/looprig/storekit"
-	"github.com/looprig/storekit/memstore"
+	"github.com/looprig/storage"
+	"github.com/looprig/storage/memstore"
 )
 
 // checkpointOrderProbe shares one monotonic sequence between the Blobs Put wrapper

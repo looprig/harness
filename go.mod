@@ -40,7 +40,7 @@ require (
 	github.com/gorilla/websocket v1.5.3 // indirect
 	github.com/invopop/jsonschema v0.13.0 // indirect
 	github.com/looprig/core v0.0.0
-	github.com/looprig/storekit v0.0.0
+	github.com/looprig/storage v0.0.0
 	github.com/mailru/easyjson v0.9.2 // indirect
 	github.com/openai/openai-go/v3 v3.37.0 // indirect
 	github.com/securego/gosec/v2 v2.27.1 // indirect
@@ -75,8 +75,6 @@ require (
 	honnef.co/go/tools v0.7.0 // indirect
 )
 
-replace github.com/looprig/storekit => ../storekit
-
 // fsstore is a storekit filesystem backend, normally wired at the composition root
 // (not by looprig). It is pulled in ONLY by the //go:build integration
 // workspace suspend/resume e2e test, via this test-scoped local replace mirroring the
@@ -84,3 +82,5 @@ replace github.com/looprig/storekit => ../storekit
 replace github.com/looprig/fsstore => ../fsstore
 
 replace github.com/looprig/core => ../core
+
+replace github.com/looprig/storage => ../storage

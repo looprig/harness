@@ -8,7 +8,7 @@ import (
 	"strconv"
 	"sync"
 
-	"github.com/looprig/storekit"
+	"github.com/looprig/storage"
 )
 
 // This file is fsstore's composition root: it wires the four filesystem backends

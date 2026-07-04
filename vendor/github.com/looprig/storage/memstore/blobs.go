@@ -8,7 +8,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/looprig/storekit"
+	"github.com/looprig/storage"
 )
 
 // blobStore is the in-memory Blobs backing type: content-addressed immutable

@@ -1,8 +1,8 @@
-# storekit
+# storage
 
 Neutral, stdlib-only storage contracts for durable session/workspace persistence.
 
-`storekit` defines four small primitives — **`Ledger`** (append-only, CAS-sequenced
+`storage` defines four small primitives — **`Ledger`** (append-only, CAS-sequenced
 record log), **`Leaser`** (single-writer epoch lease), **`KV`** (revision-CAS key/value),
 and **`Blobs`** (content-addressed immutable bytes) — plus a typed error taxonomy, the
 `AppendDefinite` ambiguity resolver, an in-memory reference backend (`memstore`), and a

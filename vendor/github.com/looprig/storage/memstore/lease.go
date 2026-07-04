@@ -4,7 +4,7 @@ import (
 	"context"
 	"sync"
 
-	"github.com/looprig/storekit"
+	"github.com/looprig/storage"
 )
 
 // leaserStore is the in-memory Leaser backing type: it grants exclusive,

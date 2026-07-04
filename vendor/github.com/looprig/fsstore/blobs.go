@@ -12,7 +12,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/looprig/storekit"
+	"github.com/looprig/storage"
 )
 
 // This file implements storekit.Blobs over the local filesystem: one file per key,
