@@ -3,7 +3,7 @@ package session
 import (
 	"strconv"
 
-	"github.com/looprig/harness/pkg/content"
+	"github.com/looprig/core/content"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/core/uuid"

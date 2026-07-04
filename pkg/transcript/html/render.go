@@ -17,7 +17,7 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/looprig/harness/pkg/content"
+	"github.com/looprig/core/content"
 	"github.com/looprig/harness/pkg/tool"
 	"github.com/looprig/harness/pkg/transcript"
 	"github.com/yuin/goldmark"

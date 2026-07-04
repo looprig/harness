@@ -368,7 +368,7 @@ import (
 	"net/http"
 	"testing"
 
-	"github.com/looprig/harness/pkg/content"
+	"github.com/looprig/core/content"
 )
 
 type fakeCodec struct{}
@@ -409,7 +409,7 @@ func TestAuthenticatorSatisfiable(t *testing.T) {
 ```go
 package llm
 
-import "github.com/looprig/harness/pkg/content"
+import "github.com/looprig/core/content"
 
 // Codec owns one wire dialect's JSON + stream-event semantics. It does NOT own wire framing:
 // the transport de-frames the response (SSE / AWS eventstream, via the shared codec/sse helper)

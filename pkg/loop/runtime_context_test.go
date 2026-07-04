@@ -4,7 +4,7 @@ import (
 	"context"
 	"testing"
 
-	"github.com/looprig/harness/pkg/content"
+	"github.com/looprig/core/content"
 )
 
 // fakeRuntimeContextProvider is a trivial in-test implementation proving the

@@ -3,7 +3,7 @@ package foreignloop
 import (
 	"context"
 
-	"github.com/looprig/harness/pkg/content"
+	"github.com/looprig/core/content"
 	"github.com/looprig/harness/pkg/event"
 )
 

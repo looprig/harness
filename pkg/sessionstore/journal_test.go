@@ -14,7 +14,7 @@ import (
 	"time"
 
 	"github.com/looprig/harness/pkg/command"
-	"github.com/looprig/harness/pkg/content"
+	"github.com/looprig/core/content"
 	"github.com/looprig/harness/pkg/journal"
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/storekit"

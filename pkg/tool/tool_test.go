@@ -4,7 +4,7 @@ import (
 	"context"
 	"testing"
 
-	"github.com/looprig/harness/pkg/content"
+	"github.com/looprig/core/content"
 )
 
 // fakeTool is a minimal InvokableTool used to prove the contract is satisfiable

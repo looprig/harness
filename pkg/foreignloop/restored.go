@@ -4,7 +4,7 @@ import (
 	"context"
 
 	"github.com/looprig/harness/pkg/command"
-	"github.com/looprig/harness/pkg/content"
+	"github.com/looprig/core/content"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/core/uuid"

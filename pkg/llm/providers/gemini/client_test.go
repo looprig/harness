@@ -11,7 +11,7 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"github.com/looprig/harness/pkg/content"
+	"github.com/looprig/core/content"
 	"github.com/looprig/harness/pkg/llm"
 	"github.com/looprig/harness/pkg/llm/auth"
 	gemini "github.com/looprig/harness/pkg/llm/providers/gemini"

@@ -4,7 +4,7 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/looprig/harness/pkg/content"
+	"github.com/looprig/core/content"
 )
 
 // feedBlock folds a slice of chunks into a fresh blockState, dispatching by the

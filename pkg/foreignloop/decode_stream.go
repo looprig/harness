@@ -7,7 +7,7 @@ import (
 	"io"
 	"strings"
 
-	"github.com/looprig/harness/pkg/content"
+	"github.com/looprig/core/content"
 )
 
 // maxLineBytes is the scanner's per-line ceiling. claude stream-json lines can be

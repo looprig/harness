@@ -150,7 +150,7 @@ These repo-specific facts are the reason several tasks below are not "just `git 
 
 **Step 1:** `cp -R harness/pkg/content/* core/content/` (this brings `streamaccumulator/` along as `core/content/streamaccumulator/`).
 
-**Step 2:** Rewrite intra-package self-imports inside the copied tree: RECIPE-REWRITE `github.com/looprig/harness/pkg/content` `github.com/looprig/core/content` `core` (catches `streamaccumulator.go`'s import of `content`).
+**Step 2:** Rewrite intra-package self-imports inside the copied tree: RECIPE-REWRITE `github.com/looprig/core/content` `github.com/looprig/core/content` `core` (catches `streamaccumulator.go`'s import of `content`).
 
 **Step 3:** RECIPE-GATE `core` (content is stdlib-only; `streamaccumulator` imports only stdlib + `core/content`). Confirm `core` stays stdlib-only: `go list -deps ./content/... | rg -v '^github.com/looprig/core' | rg looprig` must be empty.
 
@@ -160,7 +160,7 @@ These repo-specific facts are the reason several tasks below are not "just `git 
 
 **Step 1:** `harness` and `cli` already require `core` (Phase 1) — `swe` too. No new RECIPE-WIRE needed except confirming `core` version pin is current; re-vendor harness/cli after the rewrite.
 
-**Step 2:** RECIPE-REWRITE `github.com/looprig/harness/pkg/content/streamaccumulator` `github.com/looprig/core/content/streamaccumulator` **first** (more specific path), then RECIPE-REWRITE `github.com/looprig/harness/pkg/content` `github.com/looprig/core/content` — for each of `harness`, `cli`, `swe`. Order matters so the longer path isn't partially rewritten by the shorter one.
+**Step 2:** RECIPE-REWRITE `github.com/looprig/core/content/streamaccumulator` `github.com/looprig/core/content/streamaccumulator` **first** (more specific path), then RECIPE-REWRITE `github.com/looprig/core/content` `github.com/looprig/core/content` — for each of `harness`, `cli`, `swe`. Order matters so the longer path isn't partially rewritten by the shorter one.
 
 **Step 3:** `git rm -r harness/pkg/content`.
 

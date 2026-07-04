@@ -3,7 +3,7 @@ package loop
 import (
 	"context"
 
-	"github.com/looprig/harness/pkg/content"
+	"github.com/looprig/core/content"
 )
 
 // RuntimeContextProvider yields the volatile per-turn context blocks (date/cwd/git)

@@ -151,6 +151,8 @@ github.com/gorilla/websocket
 github.com/invopop/jsonschema
 # github.com/looprig/core v0.0.0 => ../core
 ## explicit; go 1.25.0
+github.com/looprig/core/content
+github.com/looprig/core/content/streamaccumulator
 github.com/looprig/core/uuid
 # github.com/looprig/fsstore v0.0.0-00010101000000-000000000000 => ../fsstore
 ## explicit; go 1.25.0

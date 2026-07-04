@@ -18,7 +18,7 @@ import (
 	"net/url"
 	"time"
 
-	"github.com/looprig/harness/pkg/content"
+	"github.com/looprig/core/content"
 	"github.com/looprig/harness/pkg/llm"
 	"github.com/looprig/harness/pkg/llm/auth"
 	geminicodec "github.com/looprig/harness/pkg/llm/codec/gemini"

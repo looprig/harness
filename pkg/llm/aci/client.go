@@ -32,7 +32,7 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/looprig/harness/pkg/content"
+	"github.com/looprig/core/content"
 	"github.com/looprig/harness/pkg/llm"
 	"github.com/looprig/harness/pkg/llm/codec/openaiapi"
 	"github.com/looprig/harness/pkg/llm/codec/sse"

@@ -10,7 +10,7 @@ import (
 	"context"
 	"encoding/json"
 
-	"github.com/looprig/harness/pkg/content"
+	"github.com/looprig/core/content"
 	"github.com/looprig/core/uuid"
 )
 

@@ -1,8 +1,8 @@
 package loop
 
 import (
-	"github.com/looprig/harness/pkg/content"
-	"github.com/looprig/harness/pkg/content/streamaccumulator"
+	"github.com/looprig/core/content"
+	"github.com/looprig/core/content/streamaccumulator"
 )
 
 // blockState is the assistant block state for one AIMessage: thinking, text, and

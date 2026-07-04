@@ -5,7 +5,7 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/looprig/harness/pkg/content"
+	"github.com/looprig/core/content"
 	"github.com/looprig/harness/pkg/tool"
 	"github.com/looprig/core/uuid"
 )

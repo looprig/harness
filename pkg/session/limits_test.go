@@ -4,7 +4,7 @@ import (
 	"context"
 	"testing"
 
-	"github.com/looprig/harness/pkg/content"
+	"github.com/looprig/core/content"
 )
 
 // TestLimitsWithDefaults proves the zero-value defaulting rule: a zero Depth/Quota

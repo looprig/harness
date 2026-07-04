@@ -4,7 +4,7 @@ package openaiapi
 import (
 	"encoding/json"
 
-	"github.com/looprig/harness/pkg/content"
+	"github.com/looprig/core/content"
 	"github.com/looprig/harness/pkg/llm"
 )
 
