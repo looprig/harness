@@ -9,7 +9,6 @@ tool (
 )
 
 require (
-	github.com/looprig/fsstore v0.1.0
 	github.com/yuin/goldmark v1.8.2
 	golang.org/x/net v0.55.0
 )
@@ -72,12 +71,6 @@ require (
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 	honnef.co/go/tools v0.7.0 // indirect
 )
-
-// fsstore is a storekit filesystem backend, normally wired at the composition root
-// (not by looprig). It is pulled in ONLY by the //go:build integration
-// workspace suspend/resume e2e test, via this test-scoped local replace mirroring the
-// storekit one above (fsstore has no remote; the replace resolves it locally).
-replace github.com/looprig/fsstore => ../fsstore
 
 replace github.com/looprig/core => ../core
 
