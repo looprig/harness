@@ -9,7 +9,7 @@ tool (
 )
 
 require (
-	github.com/looprig/fsstore v0.0.0-00010101000000-000000000000
+	github.com/looprig/fsstore v0.1.0
 	github.com/yuin/goldmark v1.8.2
 	golang.org/x/net v0.55.0
 )
@@ -37,9 +37,9 @@ require (
 	github.com/gookit/color v1.6.1 // indirect
 	github.com/gorilla/websocket v1.5.3 // indirect
 	github.com/invopop/jsonschema v0.13.0 // indirect
-	github.com/looprig/core v0.0.0
-	github.com/looprig/inference v0.0.0
-	github.com/looprig/storage v0.0.0
+	github.com/looprig/core v0.1.0
+	github.com/looprig/inference v0.1.0
+	github.com/looprig/storage v0.1.0
 	github.com/mailru/easyjson v0.9.2 // indirect
 	github.com/openai/openai-go/v3 v3.37.0 // indirect
 	github.com/securego/gosec/v2 v2.27.1 // indirect
