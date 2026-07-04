@@ -9,13 +9,12 @@ tool (
 )
 
 require (
-	github.com/decred/dcrd/dcrec/secp256k1/v4 v4.4.1
-	github.com/google/go-tdx-guest v0.3.1
 	github.com/looprig/fsstore v0.0.0-00010101000000-000000000000
 	github.com/yuin/goldmark v1.8.2
-	golang.org/x/crypto v0.52.0
 	golang.org/x/net v0.55.0
 )
+
+require golang.org/x/crypto v0.52.0 // indirect
 
 require (
 	cloud.google.com/go v0.123.0 // indirect
@@ -31,7 +30,6 @@ require (
 	github.com/go-logr/logr v1.4.3 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
 	github.com/google/go-cmp v0.7.0 // indirect
-	github.com/google/logger v1.1.1 // indirect
 	github.com/google/s2a-go v0.1.9 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/googleapis/enterprise-certificate-proxy v0.3.14 // indirect
@@ -40,6 +38,7 @@ require (
 	github.com/gorilla/websocket v1.5.3 // indirect
 	github.com/invopop/jsonschema v0.13.0 // indirect
 	github.com/looprig/core v0.0.0
+	github.com/looprig/inference v0.0.0
 	github.com/looprig/storage v0.0.0
 	github.com/mailru/easyjson v0.9.2 // indirect
 	github.com/openai/openai-go/v3 v3.37.0 // indirect
@@ -56,7 +55,6 @@ require (
 	go.opentelemetry.io/otel v1.44.0 // indirect
 	go.opentelemetry.io/otel/metric v1.44.0 // indirect
 	go.opentelemetry.io/otel/trace v1.44.0 // indirect
-	go.uber.org/multierr v1.11.0 // indirect
 	go.yaml.in/yaml/v3 v3.0.4 // indirect
 	golang.org/x/exp/typeparams v0.0.0-20231108232855-2478ac86f678 // indirect
 	golang.org/x/mod v0.36.0 // indirect
@@ -84,3 +82,5 @@ replace github.com/looprig/fsstore => ../fsstore
 replace github.com/looprig/core => ../core
 
 replace github.com/looprig/storage => ../storage
+
+replace github.com/looprig/inference => ../inference

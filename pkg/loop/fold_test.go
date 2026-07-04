@@ -6,19 +6,19 @@ import (
 	"testing"
 	"time"
 
-	"github.com/looprig/harness/pkg/command"
 	"github.com/looprig/core/content"
+	"github.com/looprig/core/uuid"
+	"github.com/looprig/harness/pkg/command"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/identity"
-	"github.com/looprig/harness/pkg/llm"
 	"github.com/looprig/harness/pkg/tool"
-	"github.com/looprig/core/uuid"
+	"github.com/looprig/inference"
 )
 
 // newFoldLoop builds a loop with the given scripted client + blocking tool, a
 // recordingPublisher to observe the full-fidelity events the production hub sees,
 // and a generous DrainTimeout. It returns the loop and the recorder.
-func newFoldLoop(t *testing.T, client llm.LLM, ts ToolSet) (*Loop, *recordingPublisher) {
+func newFoldLoop(t *testing.T, client inference.Client, ts ToolSet) (*Loop, *recordingPublisher) {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
@@ -45,7 +45,7 @@ func newFoldLoop(t *testing.T, client llm.LLM, ts ToolSet) (*Loop, *recordingPub
 // draining buffer and BEFORE the first TurnFoldedInto commit. A test uses it to cancel
 // the loop in the post-drain/pre-commit window deterministically. The seam is
 // unexported and never set in production.
-func newFoldLoopWithAfterDrain(t *testing.T, client llm.LLM, ts ToolSet, afterDrain func()) (*Loop, *recordingPublisher, context.CancelFunc) {
+func newFoldLoopWithAfterDrain(t *testing.T, client inference.Client, ts ToolSet, afterDrain func()) (*Loop, *recordingPublisher, context.CancelFunc) {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
@@ -69,7 +69,7 @@ func newFoldLoopWithAfterDrain(t *testing.T, client llm.LLM, ts ToolSet, afterDr
 // waitForRequests polls the scripted client until it has recorded at least n
 // requests, or fails. The continuation request after a fold is issued asynchronously
 // (after the fold commits), so a test must wait for it rather than read once.
-func waitForRequests(t *testing.T, client *scriptedLLM, n int) []llm.Request {
+func waitForRequests(t *testing.T, client *scriptedLLM, n int) []inference.Request {
 	t.Helper()
 	deadline := time.After(2 * time.Second)
 	for {

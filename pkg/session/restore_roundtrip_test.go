@@ -8,16 +8,16 @@ import (
 	"testing"
 	"time"
 
-	"github.com/looprig/harness/pkg/command"
 	"github.com/looprig/core/content"
+	"github.com/looprig/core/uuid"
+	"github.com/looprig/harness/pkg/command"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/hub"
 	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/journal"
-	"github.com/looprig/harness/pkg/llm"
 	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/harness/pkg/sessionstore"
-	"github.com/looprig/core/uuid"
+	"github.com/looprig/inference"
 	"github.com/looprig/storage/memstore"
 )
 
@@ -137,7 +137,7 @@ func setHeader(t *testing.T, ev event.Event, hdr event.Header) event.Event {
 
 // restoreCfg is the loop.Config both the original run AND the restore use. A System
 // prompt + model id make the config fingerprint non-empty, so match/mismatch is real.
-func restoreCfg(client llm.LLM, model, system string) loop.Config {
+func restoreCfg(client inference.Client, model, system string) loop.Config {
 	return loop.Config{
 		Client:       client,
 		Model:        validModel(model),
@@ -148,7 +148,7 @@ func restoreCfg(client llm.LLM, model, system string) loop.Config {
 
 // restoreCfgNamed is restoreCfg with an AgentName set, so a restore can validate the
 // configured primary's attribution name against the persisted root loop's stamped name.
-func restoreCfgNamed(client llm.LLM, model, system string, agent identity.AgentName) loop.Config {
+func restoreCfgNamed(client inference.Client, model, system string, agent identity.AgentName) loop.Config {
 	c := restoreCfg(client, model, system)
 	c.AgentName = agent
 	return c

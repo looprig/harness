@@ -5,7 +5,7 @@ import (
 
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/identity"
-	"github.com/looprig/harness/pkg/llm"
+	"github.com/looprig/inference"
 )
 
 // Engine selects which backend constructs this loop. The zero value is native, so
@@ -18,10 +18,10 @@ const (
 )
 
 type Config struct {
-	Client       llm.LLM       // required — caller constructs via auto.New at composition root
-	Model        llm.Model     // secret-free model descriptor (name, endpoint, sampling) — stamped onto every Request; carries NO system prompt and NO secret
-	System       string        // per-agent system prompt — sent on every Request AND hashed into the config fingerprint; the connection secret rides the Client, never here
-	DrainTimeout time.Duration // optional — bounds the hard-kill wait for a cancelled turn to drain; New defaults it to 5s
+	Client       inference.Client // required — caller constructs via auto.New at composition root
+	Model        inference.Model  // secret-free model descriptor (name, endpoint, sampling) — stamped onto every Request; carries NO system prompt and NO secret
+	System       string           // per-agent system prompt — sent on every Request AND hashed into the config fingerprint; the connection secret rides the Client, never here
+	DrainTimeout time.Duration    // optional — bounds the hard-kill wait for a cancelled turn to drain; New defaults it to 5s
 
 	// AgentName is the immutable attribution name the loop runs under (the agent/role
 	// driving it, e.g. "operator"). It is stamped onto the loop's LoopStarted at creation

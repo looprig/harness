@@ -8,12 +8,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/looprig/harness/pkg/command"
 	"github.com/looprig/core/content"
-	"github.com/looprig/harness/pkg/event"
-	"github.com/looprig/harness/pkg/llm"
-	"github.com/looprig/harness/pkg/tool"
 	"github.com/looprig/core/uuid"
+	"github.com/looprig/harness/pkg/command"
+	"github.com/looprig/harness/pkg/event"
+	"github.com/looprig/harness/pkg/tool"
+	"github.com/looprig/inference"
 )
 
 // mustID returns a fresh UUID or fails the test.
@@ -77,7 +77,7 @@ func blockUntilEvents(t *testing.T, rec *recordingPublisher, pred func([]event.E
 // and returns it plus the recorder and the root cancel. Every loop event is observed
 // on the session fan-in (there is no per-turn stream), so the recorder is the single
 // observation seam.
-func newLoop(t *testing.T, client llm.LLM) (*Loop, *recordingPublisher, context.CancelFunc) {
+func newLoop(t *testing.T, client inference.Client) (*Loop, *recordingPublisher, context.CancelFunc) {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	sessionID, err := uuid.New()
@@ -228,15 +228,15 @@ func TestNew_Validation(t *testing.T) {
 	})
 	t.Run("invalid model unwraps to ValidationError", func(t *testing.T) {
 		t.Parallel()
-		bad := llm.Model{Name: "m"} // no Provider/APIFormat/BaseURL — fails llm.Model.Validate
+		bad := inference.Model{} // empty Name — fails inference.Model.Validate (structural check)
 		_, err := New(ctx, sessionID, loopID, Provenance{}, noopPublisher{}, Config{Client: &fakeLLM{}, Model: bad})
 		var ce *ConfigError
 		if !errors.As(err, &ce) || ce.Kind != ConfigInvalidModel {
 			t.Fatalf("err = %v, want *ConfigError{ConfigInvalidModel}", err)
 		}
-		var ve *llm.ValidationError
+		var ve *inference.ValidationError
 		if !errors.As(err, &ve) {
-			t.Fatalf("err does not unwrap to *llm.ValidationError")
+			t.Fatalf("err does not unwrap to *inference.ValidationError")
 		}
 	})
 	t.Run("nil publisher", func(t *testing.T) {
@@ -447,7 +447,7 @@ func (g *countedIDGen) gen() (uuid.UUID, error) {
 // the crypto/rand failure branches that uuid.New cannot reach in tests. It wires a
 // recordingPublisher so the resulting outcome (e.g. TurnRejected) is observable on
 // the session fan-in, and returns it alongside the loop.
-func newLoopWithIDGen(t *testing.T, client llm.LLM, gen idGenerator) (*Loop, *recordingPublisher) {
+func newLoopWithIDGen(t *testing.T, client inference.Client, gen idGenerator) (*Loop, *recordingPublisher) {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	sessionID, err := uuid.New()
@@ -707,7 +707,7 @@ func TestInterruptCancelsTurn(t *testing.T) {
 
 func TestTurnFailedProviderErrorTyped(t *testing.T) {
 	t.Parallel()
-	provErr := &llm.ValidationError{Field: "Model", Reason: "boom"}
+	provErr := &inference.ValidationError{Field: "Model", Reason: "boom"}
 	l, rec, _ := newLoop(t, &fakeLLM{streamErr: provErr})
 	startTurn(t, l, rec, nil)
 	terminal := drainToTerminal(t, rec)
@@ -715,9 +715,9 @@ func TestTurnFailedProviderErrorTyped(t *testing.T) {
 	if !ok {
 		t.Fatalf("terminal = %T, want TurnFailed", terminal)
 	}
-	var ve *llm.ValidationError
+	var ve *inference.ValidationError
 	if !errors.As(failed.Err, &ve) {
-		t.Fatalf("TurnFailed.Err = %T, want *llm.ValidationError", failed.Err)
+		t.Fatalf("TurnFailed.Err = %T, want *inference.ValidationError", failed.Err)
 	}
 }
 

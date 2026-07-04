@@ -6,11 +6,11 @@ import (
 	"log/slog"
 
 	"github.com/looprig/core/content"
+	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/identity"
-	"github.com/looprig/harness/pkg/llm"
 	"github.com/looprig/harness/pkg/tool"
-	"github.com/looprig/core/uuid"
+	"github.com/looprig/inference"
 )
 
 // turnState is the staged turn conversation owned by the turn goroutine. msgs
@@ -83,10 +83,10 @@ type turnConfig struct {
 	// assembled exactly as before. The provider contract is non-fatal — it never errors.
 	runtimeContext RuntimeContextProvider
 
-	model   llm.Model
+	model   inference.Model
 	system  string
 	tools   ToolSet
-	client  llm.LLM
+	client  inference.Client
 	gateReg chan<- gateRegistration
 	idGen   idGenerator
 
@@ -189,7 +189,7 @@ func runTurn(ctx context.Context, cfg turnConfig, ts turnState) event.Event {
 		// model sees fresh date/cwd/git at the very end of the input every step. The
 		// tail is transient: it is part of the REQUEST only, never of ts.msgs/base, so
 		// committed history never grows with it and the cached System prompt is untouched.
-		req := llm.Request{
+		req := inference.Request{
 			Model:    cfg.model,
 			System:   cfg.system,
 			Messages: requestMessages(cfg.base, ts.msgs, runtimeTail),
@@ -429,7 +429,7 @@ func stepDoneEvent(st stepState) event.StepDone {
 // closeStream closes a stream reader, logging (but not surfacing) a close error:
 // a close failure must not change the turn's outcome, which is already decided by
 // the stream's content or a prior terminal.
-func closeStream(sr *llm.StreamReader[content.Chunk]) {
+func closeStream(sr *inference.StreamReader[content.Chunk]) {
 	if cerr := sr.Close(); cerr != nil {
 		slog.Warn("loop: stream close error", "error", cerr)
 	}
@@ -520,23 +520,23 @@ func toolResultMessage(r result) *content.ToolResultMessage {
 	}
 }
 
-// toolDefs maps each registered tool's Info(ctx) to an llm.Tool definition
-// (ToolInfo.Schema is json.RawMessage, 1:1 with llm.Tool.Schema). A tool whose
+// toolDefs maps each registered tool's Info(ctx) to an inference.Tool definition
+// (ToolInfo.Schema is json.RawMessage, 1:1 with inference.Tool.Schema). A tool whose
 // Info errors (or returns nil) is SKIPPED rather than aborting the turn or
 // panicking: a misbehaving tool definition must not block all tool use. The skip
 // is logged for observability.
-func toolDefs(ctx context.Context, registry []tool.InvokableTool) []llm.Tool {
+func toolDefs(ctx context.Context, registry []tool.InvokableTool) []inference.Tool {
 	if len(registry) == 0 {
 		return nil
 	}
-	defs := make([]llm.Tool, 0, len(registry))
+	defs := make([]inference.Tool, 0, len(registry))
 	for _, t := range registry {
 		info, err := t.Info(ctx)
 		if err != nil || info == nil {
 			slog.Warn("loop: skipping tool with unavailable Info in tool definitions", "error", err)
 			continue
 		}
-		defs = append(defs, llm.Tool{
+		defs = append(defs, inference.Tool{
 			Name:        info.Name,
 			Description: info.Desc,
 			Schema:      info.Schema,

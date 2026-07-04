@@ -8,18 +8,18 @@ import (
 	"testing"
 	"time"
 
-	"github.com/looprig/harness/pkg/command"
 	"github.com/looprig/core/content"
+	"github.com/looprig/core/uuid"
+	"github.com/looprig/harness/pkg/command"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/hub"
 	"github.com/looprig/harness/pkg/identity"
-	"github.com/looprig/harness/pkg/llm"
 	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/harness/pkg/tool"
-	"github.com/looprig/core/uuid"
+	"github.com/looprig/inference"
 )
 
-// stubLLM is a controllable llm.LLM for session tests.
+// stubLLM is a controllable inference.Client for session tests.
 type stubLLM struct {
 	chunks           []content.Chunk
 	blockUntilCancel bool
@@ -30,10 +30,10 @@ func textChunk(s string) content.Chunk {
 	return &content.TextChunk{Text: s}
 }
 
-func (s *stubLLM) Invoke(ctx context.Context, req llm.Request) (*llm.Response, error) {
+func (s *stubLLM) Invoke(ctx context.Context, req inference.Request) (*inference.Response, error) {
 	return nil, errors.New("stubLLM.Invoke not used")
 }
-func (s *stubLLM) Stream(ctx context.Context, req llm.Request) (*llm.StreamReader[content.Chunk], error) {
+func (s *stubLLM) Stream(ctx context.Context, req inference.Request) (*inference.StreamReader[content.Chunk], error) {
 	i := 0
 	next := func() (content.Chunk, error) {
 		if i < len(s.chunks) {
@@ -50,7 +50,7 @@ func (s *stubLLM) Stream(ctx context.Context, req llm.Request) (*llm.StreamReade
 		}
 		return nil, io.EOF
 	}
-	return llm.NewStreamReader(next, nil), nil
+	return inference.NewStreamReader(next, nil), nil
 }
 
 // recordingSub drains a hub Subscription — the same consumer API the TUI/CLI use
@@ -127,19 +127,19 @@ func (r *recordingSub) waitTurnCausationID(d time.Duration) (uuid.UUID, bool) {
 	}
 }
 
-// validModel returns a minimal but VALID llm.Model (passes llm.Model.Validate): a
+// validModel returns a minimal but VALID inference.Model (passes inference.Model.Validate): a
 // known provider speaking a supported dialect at a loopback endpoint. It replaces the
 // retired ModelSpec in session tests that construct a loop.Config.
-func validModel(name string) llm.Model {
-	return llm.Model{
-		Provider:  llm.ProviderLMStudio,
-		APIFormat: llm.APIFormatOpenAI,
+func validModel(name string) inference.Model {
+	return inference.Model{
+		Provider:  inference.ProviderName("lmstudio"),
+		APIFormat: inference.APIFormatOpenAI,
 		BaseURL:   "http://localhost:1234",
 		Name:      name,
 	}
 }
 
-func cfg(client llm.LLM) loop.Config {
+func cfg(client inference.Client) loop.Config {
 	return loop.Config{Client: client, Model: validModel("m"), DrainTimeout: 100 * time.Millisecond}
 }
 
@@ -279,7 +279,7 @@ func TestNewLoop(t *testing.T) {
 
 // cfgWithAgent is cfg with an AgentName set, so a test can assert the loop's
 // configured attribution name is stamped onto its published LoopStarted.
-func cfgWithAgent(client llm.LLM, name identity.AgentName) loop.Config {
+func cfgWithAgent(client inference.Client, name identity.AgentName) loop.Config {
 	c := cfg(client)
 	c.AgentName = name
 	return c

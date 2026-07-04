@@ -7,11 +7,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/looprig/harness/pkg/command"
 	"github.com/looprig/core/content"
-	"github.com/looprig/harness/pkg/event"
-	"github.com/looprig/harness/pkg/llm"
 	"github.com/looprig/core/uuid"
+	"github.com/looprig/harness/pkg/command"
+	"github.com/looprig/harness/pkg/event"
+	"github.com/looprig/inference"
 )
 
 // fixedClock returns a constant instant so a test can assert CreatedAt
@@ -49,7 +49,7 @@ func workingFactory() *event.Factory {
 // deterministic event Factory (fixed clock + sequential id-gen). The same id-gen
 // feeds the loop's correlation ids (TurnID/StepID/ToolExecutionID) and the
 // Factory's EventID mint, mirroring production where one generator backs both.
-func newLoopWithFactory(t *testing.T, client llm.LLM, ts time.Time) (*Loop, *recordingPublisher) {
+func newLoopWithFactory(t *testing.T, client inference.Client, ts time.Time) (*Loop, *recordingPublisher) {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)

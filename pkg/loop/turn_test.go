@@ -8,12 +8,12 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/looprig/harness/pkg/command"
 	"github.com/looprig/core/content"
-	"github.com/looprig/harness/pkg/event"
-	"github.com/looprig/harness/pkg/llm"
-	"github.com/looprig/harness/pkg/tool"
 	"github.com/looprig/core/uuid"
+	"github.com/looprig/harness/pkg/command"
+	"github.com/looprig/harness/pkg/event"
+	"github.com/looprig/harness/pkg/tool"
+	"github.com/looprig/inference"
 )
 
 // turnRecorder stands in for the actor during runTurn unit tests. It records the
@@ -123,7 +123,7 @@ func testIdentity() turnIdentity {
 // history clone (the actor commits the initial UserMessage separately; in these
 // unit tests the committed view is base + recorder.committed). The committed
 // loop history a strict provider would see is committedHistory(base, rec).
-func newTurnFixture(input []content.Block, base content.AgenticMessages, ts ToolSet, client llm.LLM, gateReg chan<- gateRegistration) (turnConfig, turnState, *turnRecorder) {
+func newTurnFixture(input []content.Block, base content.AgenticMessages, ts ToolSet, client inference.Client, gateReg chan<- gateRegistration) (turnConfig, turnState, *turnRecorder) {
 	rec := &turnRecorder{}
 	id := testIdentity()
 	user := &content.UserMessage{Message: content.Message{Role: content.RoleUser, Blocks: input}}
@@ -169,16 +169,16 @@ func committedHistory(base content.AgenticMessages, user *content.UserMessage, r
 type scriptedLLM struct {
 	mu        sync.Mutex
 	scripts   [][]content.Chunk
-	reqs      []llm.Request
+	reqs      []inference.Request
 	calls     int
 	onStreamN map[int]func()
 }
 
-func (s *scriptedLLM) Invoke(ctx context.Context, req llm.Request) (*llm.Response, error) {
+func (s *scriptedLLM) Invoke(ctx context.Context, req inference.Request) (*inference.Response, error) {
 	return nil, errors.New("scriptedLLM.Invoke not used")
 }
 
-func (s *scriptedLLM) Stream(ctx context.Context, req llm.Request) (*llm.StreamReader[content.Chunk], error) {
+func (s *scriptedLLM) Stream(ctx context.Context, req inference.Request) (*inference.StreamReader[content.Chunk], error) {
 	s.mu.Lock()
 	n := s.calls
 	s.calls++
@@ -211,13 +211,13 @@ func (s *scriptedLLM) Stream(ctx context.Context, req llm.Request) (*llm.StreamR
 		}
 		return nil, io.EOF
 	}
-	return llm.NewStreamReader(next, nil), nil
+	return inference.NewStreamReader(next, nil), nil
 }
 
-func (s *scriptedLLM) requests() []llm.Request {
+func (s *scriptedLLM) requests() []inference.Request {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	out := make([]llm.Request, len(s.reqs))
+	out := make([]inference.Request, len(s.reqs))
 	copy(out, s.reqs)
 	return out
 }
@@ -887,7 +887,7 @@ func TestRunTurnAgentic(t *testing.T) {
 		if len(defs) != 2 {
 			t.Fatalf("req.Tools len = %d, want 2", len(defs))
 		}
-		byName := map[string]llm.Tool{}
+		byName := map[string]inference.Tool{}
 		for _, d := range defs {
 			byName[d.Name] = d
 		}
@@ -1097,7 +1097,7 @@ func TestRunTurn(t *testing.T) {
 
 	t.Run("stream error discards the in-flight step (no commit), TurnFailed carries typed cause", func(t *testing.T) {
 		t.Parallel()
-		boom := &llm.ValidationError{Field: "x", Reason: "boom"}
+		boom := &inference.ValidationError{Field: "x", Reason: "boom"}
 		client := &fakeLLM{streamErr: boom}
 		cfg, st, rec := newTurnFixture(input, nil, emptyTS(), client, noGateReg())
 		terminal := runTurn(context.Background(), cfg, st)
@@ -1106,9 +1106,9 @@ func TestRunTurn(t *testing.T) {
 		if !ok {
 			t.Fatalf("terminal = %T, want TurnFailed", terminal)
 		}
-		var ve *llm.ValidationError
+		var ve *inference.ValidationError
 		if !errors.As(failed.Err, &ve) {
-			t.Fatalf("TurnFailed.Err = %T, want *llm.ValidationError via errors.As", failed.Err)
+			t.Fatalf("TurnFailed.Err = %T, want *inference.ValidationError via errors.As", failed.Err)
 		}
 		// The step never finalized an AIMessage, so nothing was committed.
 		if len(rec.commits) != 0 {
@@ -1188,7 +1188,7 @@ func TestRunTurn(t *testing.T) {
 
 	t.Run("mid-stream Next error discards the in-flight step with typed cause", func(t *testing.T) {
 		t.Parallel()
-		boom := &llm.ValidationError{Field: "y", Reason: "midstream"}
+		boom := &inference.ValidationError{Field: "y", Reason: "midstream"}
 		client := &fakeLLM{chunks: []content.Chunk{textChunk("partial")}, nextErr: boom}
 		cfg, st, rec := newTurnFixture(input, nil, emptyTS(), client, noGateReg())
 		terminal := runTurn(context.Background(), cfg, st)
@@ -1197,9 +1197,9 @@ func TestRunTurn(t *testing.T) {
 		if !ok {
 			t.Fatalf("terminal = %T, want TurnFailed", terminal)
 		}
-		var ve *llm.ValidationError
+		var ve *inference.ValidationError
 		if !errors.As(failed.Err, &ve) {
-			t.Fatalf("TurnFailed.Err = %T, want *llm.ValidationError", failed.Err)
+			t.Fatalf("TurnFailed.Err = %T, want *inference.ValidationError", failed.Err)
 		}
 		if len(rec.commits) != 0 {
 			t.Errorf("commit count = %d, want 0 (in-flight step discarded)", len(rec.commits))

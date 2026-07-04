@@ -7,10 +7,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/looprig/harness/pkg/command"
 	"github.com/looprig/core/content"
+	"github.com/looprig/harness/pkg/command"
 	"github.com/looprig/harness/pkg/event"
-	"github.com/looprig/harness/pkg/llm"
+	"github.com/looprig/inference"
 )
 
 // drainSub reads from sub until the predicate is satisfied (returns true) or a
@@ -196,11 +196,11 @@ type chainStubLLM struct {
 	text   string
 }
 
-func (c *chainStubLLM) Invoke(context.Context, llm.Request) (*llm.Response, error) {
+func (c *chainStubLLM) Invoke(context.Context, inference.Request) (*inference.Response, error) {
 	return nil, io.EOF
 }
 
-func (c *chainStubLLM) Stream(ctx context.Context, _ llm.Request) (*llm.StreamReader[content.Chunk], error) {
+func (c *chainStubLLM) Stream(ctx context.Context, _ inference.Request) (*inference.StreamReader[content.Chunk], error) {
 	c.mu.Lock()
 	n := c.calls
 	c.calls++
@@ -217,7 +217,7 @@ func (c *chainStubLLM) Stream(ctx context.Context, _ llm.Request) (*llm.StreamRe
 		}
 		return nil, io.EOF
 	}
-	return llm.NewStreamReader(next, nil), nil
+	return inference.NewStreamReader(next, nil), nil
 }
 
 // TestChainedTurnsEmitNoLoopIdleBetween proves the running->running transition: when

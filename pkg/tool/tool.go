@@ -15,7 +15,7 @@ import (
 )
 
 // ToolInfo is a tool's self-description. Schema is a JSON Schema describing the
-// tool's argument object; it maps 1:1 to llm.Tool.Schema.
+// tool's argument object; it maps 1:1 to inference.Tool.Schema.
 type ToolInfo struct {
 	Name   string
 	Desc   string

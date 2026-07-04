@@ -6,9 +6,9 @@ import (
 	"testing"
 
 	"github.com/looprig/core/content"
-	"github.com/looprig/harness/pkg/event"
-	"github.com/looprig/harness/pkg/llm"
 	"github.com/looprig/core/uuid"
+	"github.com/looprig/harness/pkg/event"
+	"github.com/looprig/inference"
 )
 
 // mustUUID mints a UUID for tests or fails the test (crypto/rand should never
@@ -69,7 +69,7 @@ func TestRunStep(t *testing.T) {
 		t.Parallel()
 		client := &fakeLLM{chunks: []content.Chunk{textChunk("hel"), textChunk("lo")}}
 		var emitted []event.Event
-		cfg := stepConfig{req: llm.Request{Model: testModel()}, client: client, emit: drainEmit(&emitted)}
+		cfg := stepConfig{req: inference.Request{Model: testModel()}, client: client, emit: drainEmit(&emitted)}
 
 		res := runStep(context.Background(), cfg, 5, newTestStep(t, 0))
 
@@ -119,7 +119,7 @@ func TestRunStep(t *testing.T) {
 			toolUseChunk(0, "id-1", "Echo", `{"x":1}`),
 		}}}
 		var emitted []event.Event
-		cfg := stepConfig{req: llm.Request{Model: testModel()}, client: client, emit: drainEmit(&emitted)}
+		cfg := stepConfig{req: inference.Request{Model: testModel()}, client: client, emit: drainEmit(&emitted)}
 
 		res := runStep(context.Background(), cfg, 5, newTestStep(t, 0))
 
@@ -152,7 +152,7 @@ func TestRunStep(t *testing.T) {
 		t.Parallel()
 		client := &fakeLLM{chunks: nil}
 		var emitted []event.Event
-		cfg := stepConfig{req: llm.Request{Model: testModel()}, client: client, emit: drainEmit(&emitted)}
+		cfg := stepConfig{req: inference.Request{Model: testModel()}, client: client, emit: drainEmit(&emitted)}
 
 		res := runStep(context.Background(), cfg, 5, newTestStep(t, 0))
 
@@ -177,7 +177,7 @@ func TestRunStep(t *testing.T) {
 		chunks := []content.Chunk{textChunk(""), textChunk("")}
 		client := &fakeLLM{chunks: chunks}
 		var emitted []event.Event
-		cfg := stepConfig{req: llm.Request{Model: testModel()}, client: client, emit: drainEmit(&emitted)}
+		cfg := stepConfig{req: inference.Request{Model: testModel()}, client: client, emit: drainEmit(&emitted)}
 
 		res := runStep(context.Background(), cfg, 5, newTestStep(t, 0))
 
@@ -203,9 +203,9 @@ func TestRunStep(t *testing.T) {
 
 	t.Run("Stream() error returns terminal carrying the typed cause", func(t *testing.T) {
 		t.Parallel()
-		boom := &llm.ValidationError{Field: "x", Reason: "boom"}
+		boom := &inference.ValidationError{Field: "x", Reason: "boom"}
 		client := &fakeLLM{streamErr: boom}
-		cfg := stepConfig{req: llm.Request{Model: testModel()}, client: client, emit: func(event.Event) {}}
+		cfg := stepConfig{req: inference.Request{Model: testModel()}, client: client, emit: func(event.Event) {}}
 
 		res := runStep(context.Background(), cfg, 5, newTestStep(t, 0))
 
@@ -213,9 +213,9 @@ func TestRunStep(t *testing.T) {
 		if !ok {
 			t.Fatalf("terminal = %T, want event.TurnFailed", res.terminal)
 		}
-		var ve *llm.ValidationError
+		var ve *inference.ValidationError
 		if !errors.As(failed.Err, &ve) {
-			t.Fatalf("terminal.Err = %T, want *llm.ValidationError", failed.Err)
+			t.Fatalf("terminal.Err = %T, want *inference.ValidationError", failed.Err)
 		}
 		if len(res.state.msgs) != 0 {
 			t.Errorf("msgs len = %d, want 0", len(res.state.msgs))
@@ -224,9 +224,9 @@ func TestRunStep(t *testing.T) {
 
 	t.Run("mid-stream Next error returns terminal carrying the typed cause", func(t *testing.T) {
 		t.Parallel()
-		boom := &llm.ValidationError{Field: "y", Reason: "midstream"}
+		boom := &inference.ValidationError{Field: "y", Reason: "midstream"}
 		client := &fakeLLM{chunks: []content.Chunk{textChunk("partial")}, nextErr: boom}
-		cfg := stepConfig{req: llm.Request{Model: testModel()}, client: client, emit: func(event.Event) {}}
+		cfg := stepConfig{req: inference.Request{Model: testModel()}, client: client, emit: func(event.Event) {}}
 
 		res := runStep(context.Background(), cfg, 5, newTestStep(t, 0))
 
@@ -234,9 +234,9 @@ func TestRunStep(t *testing.T) {
 		if !ok {
 			t.Fatalf("terminal = %T, want event.TurnFailed", res.terminal)
 		}
-		var ve *llm.ValidationError
+		var ve *inference.ValidationError
 		if !errors.As(failed.Err, &ve) {
-			t.Fatalf("terminal.Err = %T, want *llm.ValidationError", failed.Err)
+			t.Fatalf("terminal.Err = %T, want *inference.ValidationError", failed.Err)
 		}
 	})
 
@@ -245,7 +245,7 @@ func TestRunStep(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
 		client := &fakeLLM{streamErr: context.Canceled}
-		cfg := stepConfig{req: llm.Request{Model: testModel()}, client: client, emit: func(event.Event) {}}
+		cfg := stepConfig{req: inference.Request{Model: testModel()}, client: client, emit: func(event.Event) {}}
 
 		res := runStep(ctx, cfg, 5, newTestStep(t, 0))
 
@@ -262,7 +262,7 @@ func TestRunStep(t *testing.T) {
 		client := &scriptedLLM{scripts: [][]content.Chunk{{
 			toolUseChunk(0, "id-bad", "Echo", `{not valid json`),
 		}}}
-		cfg := stepConfig{req: llm.Request{Model: testModel()}, client: client, emit: func(event.Event) {}}
+		cfg := stepConfig{req: inference.Request{Model: testModel()}, client: client, emit: func(event.Event) {}}
 
 		res := runStep(context.Background(), cfg, 5, newTestStep(t, 0))
 

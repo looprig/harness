@@ -9,7 +9,7 @@ import (
 
 	"github.com/looprig/core/content"
 	"github.com/looprig/harness/pkg/event"
-	"github.com/looprig/harness/pkg/llm"
+	"github.com/looprig/inference"
 )
 
 // countingRuntimeProvider returns a single fresh <runtime_context> block whose
@@ -29,7 +29,7 @@ func (p *countingRuntimeProvider) Blocks(context.Context) []content.Block {
 // newLoopWithRuntime starts a loop wired with the given RuntimeContextProvider and
 // a recording client/publisher, mirroring newLoop but threading the provider into
 // loop.Config. A nil provider exercises the OFF (current-behavior) path.
-func newLoopWithRuntime(t *testing.T, client llm.LLM, rc RuntimeContextProvider) (*Loop, *recordingPublisher) {
+func newLoopWithRuntime(t *testing.T, client inference.Client, rc RuntimeContextProvider) (*Loop, *recordingPublisher) {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
@@ -52,7 +52,7 @@ func newLoopWithRuntime(t *testing.T, client llm.LLM, rc RuntimeContextProvider)
 // runtimeBlockText returns the flattened text of every block across all messages in
 // req that look like a runtime_context block (text starting with the tag). It lets a
 // test count how many runtime blocks rode in a single request (must be exactly one).
-func runtimeBlockTexts(req llm.Request) []string {
+func runtimeBlockTexts(req inference.Request) []string {
 	var out []string
 	for _, m := range req.Messages {
 		um, ok := m.(*content.UserMessage)
@@ -74,7 +74,7 @@ func runtimeBlockTexts(req llm.Request) []string {
 
 // waitForScriptedRequests blocks until the scriptedLLM has recorded at least n
 // requests, returning them (a defensive copy).
-func waitForScriptedRequests(t *testing.T, client *scriptedLLM, n int) []llm.Request {
+func waitForScriptedRequests(t *testing.T, client *scriptedLLM, n int) []inference.Request {
 	t.Helper()
 	deadline := time.After(2 * time.Second)
 	for {
@@ -93,7 +93,7 @@ func waitForScriptedRequests(t *testing.T, client *scriptedLLM, n int) []llm.Req
 
 // runTwoTurns drives two sequential text-only turns to completion and returns the
 // per-request slice the scriptedLLM saw. Each turn is one request (no tools).
-func runTwoTurns(t *testing.T, l *Loop, rec *recordingPublisher, client *scriptedLLM) []llm.Request {
+func runTwoTurns(t *testing.T, l *Loop, rec *recordingPublisher, client *scriptedLLM) []inference.Request {
 	t.Helper()
 	startTurn(t, l, rec, []content.Block{&content.TextBlock{Text: "turn one"}})
 	if _, ok := drainToTerminal(t, rec).(event.TurnDone); !ok {

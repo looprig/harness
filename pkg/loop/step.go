@@ -6,9 +6,9 @@ import (
 	"io"
 
 	"github.com/looprig/core/content"
-	"github.com/looprig/harness/pkg/event"
-	"github.com/looprig/harness/pkg/llm"
 	"github.com/looprig/core/uuid"
+	"github.com/looprig/harness/pkg/event"
+	"github.com/looprig/inference"
 )
 
 // StepIndex is the turn-local index of a step. Each turn numbers its own steps
@@ -37,8 +37,8 @@ const (
 // TokenDeltas. Config/dependencies stay at this boundary; stepState owns one
 // step's messages and block state.
 type stepConfig struct {
-	req    llm.Request
-	client llm.LLM
+	req    inference.Request
+	client inference.Client
 	emit   func(event.Event)
 }
 
