@@ -107,22 +107,40 @@ type grepOptions struct {
 // Grep searches workspace file contents. It depends only on the workspace root
 // and the narrow loop.ReadGuard. useRg is resolved at construction (ripgrep on
 // PATH) and is overridable in tests to force the deterministic fallback.
+// argvRunner is the OPTIONAL confined-execution seam (§10.1): nil means the rg
+// backend execs ripgrep directly (the bare-harness default), non-nil routes the
+// built rg argv through the injected runner (e.g. the sandbox Executor).
 type Grep struct {
-	root  string
-	guard loop.ReadGuard
-	useRg bool
+	root       string
+	guard      loop.ReadGuard
+	useRg      bool
+	argvRunner tool.ArgvRunner
+}
+
+// GrepOption configures a Grep at construction (functional-options pattern).
+type GrepOption func(*Grep)
+
+// WithArgvRunner injects a confined argv runner. When set, the rg backend routes
+// the built ripgrep argv through r.RunArgv instead of exec.CommandContext. A nil
+// runner (the default) preserves the exact bare-harness direct-execution behavior.
+func WithArgvRunner(r tool.ArgvRunner) GrepOption {
+	return func(g *Grep) { g.argvRunner = r }
 }
 
 // NewGrep constructs a Grep bound to the workspace root and read guard, preferring
 // ripgrep when it is found on PATH.
-func NewGrep(root string, guard loop.ReadGuard) *Grep {
+func NewGrep(root string, guard loop.ReadGuard, opts ...GrepOption) *Grep {
 	_, err := exec.LookPath(rgBinary)
-	return newGrepWithBackend(root, guard, err == nil)
+	return newGrepWithBackend(root, guard, err == nil, opts...)
 }
 
 // newGrepWithBackend constructs a Grep with an explicit backend choice (test seam).
-func newGrepWithBackend(root string, guard loop.ReadGuard, useRg bool) *Grep {
-	return &Grep{root: root, guard: guard, useRg: useRg}
+func newGrepWithBackend(root string, guard loop.ReadGuard, useRg bool, opts ...GrepOption) *Grep {
+	g := &Grep{root: root, guard: guard, useRg: useRg}
+	for _, opt := range opts {
+		opt(g)
+	}
+	return g
 }
 
 // Info returns Grep's self-description. Name MUST equal "Grep".
@@ -285,6 +303,9 @@ type deniedGlobLister interface {
 // cancellation/timeout so the caller renders the timeout tool-result.
 func (g *Grep) runRg(ctx context.Context, pattern, searchAbs, resolvedRoot string, opts grepOptions) (matches []string, truncated, expired bool) {
 	args := buildRgArgs(pattern, searchAbs, opts, g.rgDenyGlobs())
+	if g.argvRunner != nil {
+		return g.runRgViaRunner(ctx, args, resolvedRoot)
+	}
 	// #nosec G204 -- fixed binary "rg"; pattern/path are passed as VALUES after
 	// --regexp / -- so they can never be interpreted as flags (no shell, arg list).
 	cmd := exec.CommandContext(ctx, rgBinary, args...)
@@ -304,6 +325,31 @@ func (g *Grep) runRg(ctx context.Context, pattern, searchAbs, resolvedRoot strin
 		}
 	}
 	matches, truncated = g.collectRgLines(&out, resolvedRoot)
+	return matches, truncated, false
+}
+
+// runRgViaRunner is the confined variant of runRg: it routes the full rg argv
+// (binary + args) through the injected ArgvRunner and adapts its
+// (output, exitCode, err) return into the (matches, truncated, expired) shape,
+// mirroring the direct-exec path. The runner folds a timeout/cancel into err (it
+// returns ctx.Err()); a rg exit code of 1 means "no matches" (not a failure), any
+// other non-zero code is a genuine failure yielding no matches.
+func (g *Grep) runRgViaRunner(ctx context.Context, args []string, resolvedRoot string) (matches []string, truncated, expired bool) {
+	argv := append([]string{rgBinary}, args...)
+	outBytes, exitCode, err := g.argvRunner.RunArgv(ctx, g.root, argv)
+	if err != nil {
+		// A ctx timeout/cancel (folded into err by the runner) is a bounded-I/O
+		// timeout rather than a silent empty result.
+		if ctx.Err() != nil {
+			return nil, false, true
+		}
+		// rg exits 1 when there are simply no matches; any other code is a genuine
+		// failure — fall back to nothing.
+		if exitCode != 1 {
+			return nil, false, false
+		}
+	}
+	matches, truncated = g.collectRgLines(bytes.NewBuffer(outBytes), resolvedRoot)
 	return matches, truncated, false
 }
 

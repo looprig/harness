@@ -79,14 +79,33 @@ type bashArgs struct {
 
 // Bash runs a single shell command in a workspace-contained directory. It depends
 // only on the workspace root (least privilege); the advisory DeniedBashPrefixes
-// gate is the PermissionChecker's concern, not the tool's.
+// gate is the PermissionChecker's concern, not the tool's. runner is the OPTIONAL
+// confined-execution seam (§10.1): nil means direct `sh -c` execution (the
+// bare-harness default), non-nil routes the command through the injected runner
+// (e.g. the sandbox Executor) instead.
 type Bash struct {
-	root string
+	root   string
+	runner tool.CommandRunner
 }
 
-// NewBash constructs a Bash tool bound to the workspace root.
-func NewBash(root string) *Bash {
-	return &Bash{root: root}
+// BashOption configures a Bash at construction (functional-options pattern).
+type BashOption func(*Bash)
+
+// WithRunner injects a confined command runner. When set, InvokableRun routes the
+// command through r.RunCommand instead of the direct `sh -c` path. A nil runner
+// (the default) preserves the exact bare-harness direct-execution behavior.
+func WithRunner(r tool.CommandRunner) BashOption {
+	return func(b *Bash) { b.runner = r }
+}
+
+// NewBash constructs a Bash tool bound to the workspace root. With no options the
+// runner is nil (direct execution); WithRunner injects a confined runner.
+func NewBash(root string, opts ...BashOption) *Bash {
+	b := &Bash{root: root}
+	for _, opt := range opts {
+		opt(b)
+	}
+	return b
 }
 
 // Info returns Bash's self-description. Name MUST equal "Bash".
@@ -153,7 +172,29 @@ func (b *Bash) InvokableRun(ctx context.Context, argsJSON string) (*tool.ToolRes
 	ctx2, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	out, exitCode, timedOut, runErr := runShellCommand(ctx2, dir, a.Command)
+	var (
+		out      string
+		exitCode int
+		timedOut bool
+		runErr   error
+	)
+	if b.runner != nil {
+		// Confined path: the injected runner (e.g. the sandbox Executor) folds a
+		// timeout/cancel into err (it returns ctx.Err()); adapt its byte output +
+		// error into the (output, exitCode, timedOut, startErr) shape below.
+		outBytes, ec, err := b.runner.RunCommand(ctx2, dir, a.Command)
+		out, exitCode = string(outBytes), ec
+		switch {
+		case err == nil:
+			// success: timedOut/runErr stay zero.
+		case errors.Is(err, context.DeadlineExceeded) || ctx2.Err() == context.DeadlineExceeded:
+			timedOut = true
+		default:
+			runErr = err
+		}
+	} else {
+		out, exitCode, timedOut, runErr = runShellCommand(ctx2, dir, a.Command)
+	}
 	if timedOut {
 		return tool.TextResult("error: command timed out after " + timeout.String()), nil
 	}

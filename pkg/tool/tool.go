@@ -126,6 +126,33 @@ type ToolExecuteFunc func(ctx context.Context, argsJSON string) (*ToolResult, er
 // must call next to proceed (or short-circuit by not calling it).
 type ToolMiddleware func(ctx context.Context, t InvokableTool, argsJSON string, next ToolExecuteFunc) (*ToolResult, error)
 
+// Command/argv runner-injection seam. These interfaces let an OPTIONAL OS
+// sandbox wrap a tool's command execution WITHOUT harness ever importing the
+// sandbox: their signatures are stdlib-only, so the sandbox module's Executor
+// satisfies them structurally (no import either way). The coupling is
+// deliberately structural (SPEC §10.1). A nil runner means direct execution —
+// the bare-harness default — so injecting one is purely additive.
+
+// CommandRunner runs a shell command in a confined environment. A nil runner
+// means direct execution (bare-harness default). Implemented by the sandbox
+// Executor; harness never imports sandbox — the coupling is structural (§10.1).
+type CommandRunner interface {
+	RunCommand(ctx context.Context, dir, command string) (output []byte, exitCode int, err error)
+}
+
+// ArgvRunner runs a direct argv (no shell interpretation) — used by Grep, whose
+// rg invocation is already a safe argv and must not gain a shell.
+type ArgvRunner interface {
+	RunArgv(ctx context.Context, dir string, argv []string) (output []byte, exitCode int, err error)
+}
+
+// GrantedRunner is an optional capability (probed by type assertion) for running
+// a command with escalation grant tokens. Wiring the grant flow is a later task;
+// the interface lives here with the others.
+type GrantedRunner interface {
+	RunCommandWithGrants(ctx context.Context, dir, command string, grants []string) (output []byte, exitCode int, err error)
+}
+
 // PermissionRequest (the sealed approval-prompt contract returned by
 // PermissionPrompter.BuildRequest) and ApprovalScope are declared in
 // permission_request.go alongside their concrete implementers.
