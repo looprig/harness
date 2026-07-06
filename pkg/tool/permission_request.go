@@ -58,7 +58,17 @@ func (FileWriteRequest) AllowedScopes() []ApprovalScope { return persistableScop
 // executor; harness never mints or interprets them). A GrantDisplay only ever
 // exists for a token whose executor-side MAC verification SUCCEEDED — a fabricated
 // or tampered token is rejected before a GrantDisplay is built, so one can never
-// reach a prompt (SPEC §10.7). The lowercase json tags are the durable wire form.
+// reach a prompt (SPEC §10.7).
+//
+// Token is retained (not dropped after rendering Description) so the durable
+// approval/audit record binds the operator's decision to the EXACT grants shown —
+// the same tokens can be reconciled against what the executor later applies. It is
+// NOT a capability at rest: harness cannot mint or apply it, and DescribeGrant
+// re-verifies its MAC on any later use.
+//
+// The lowercase json tags are the durable wire form (SPEC §10.7): like the sibling
+// requestType discriminator, "token"/"description" must NOT be renamed — old
+// journals carry the old keys.
 type GrantDisplay struct {
 	Token       string `json:"token"`
 	Description string `json:"description"`
@@ -71,15 +81,25 @@ type GrantDisplay struct {
 // approving this call (SPEC §9.3): each carries the executor's opaque token and its
 // bound human-readable description, so the prompt shows "allow network egress for:
 // git push" rather than an opaque token. It is omitempty so a call that needs no
-// escalation marshals byte-identically to a pre-Grants BashRequest (durable
-// backward compatibility).
+// escalation marshals byte-identically to a pre-Grants BashRequest (durable backward
+// compatibility); the tag "grants" must NOT be renamed (SPEC §10.7 durability).
+//
+// Grants are deliberately NOT folded into Description() (which stays Command-only so
+// the persisted exact-command Match is unchanged): they are durably journaled here
+// and rendered by the cli TUI, which type-asserts tool.BashRequest and reads .Grants
+// directly (the same way it renders richer file-diff detail). A maintainer should not
+// read Grants as wired through Description() — the rendering lives in the cli module.
 type BashRequest struct {
 	Command string
 	Grants  []GrantDisplay `json:"grants,omitempty"`
 }
 
-func (BashRequest) permissionRequest()             {}
-func (BashRequest) ToolName() string               { return "Bash" }
+func (BashRequest) permissionRequest() {}
+func (BashRequest) ToolName() string   { return "Bash" }
+
+// Description is Command only — Grants are intentionally excluded (the TUI renders
+// them via type-assertion; see the BashRequest doc) so the persisted exact-command
+// Match stays stable.
 func (r BashRequest) Description() string          { return r.Command }
 func (BashRequest) AllowedScopes() []ApprovalScope { return persistableScopes() }
 

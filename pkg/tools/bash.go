@@ -140,6 +140,13 @@ func (b *Bash) AuditSummary(argsJSON string) string {
 // call would apply (SPEC §9.3). An unparseable args document or an empty command is
 // a typed error so the runner treats the call as invalid; a planned grant token that
 // fails MAC verification also fails the build so it never reaches a prompt.
+//
+// Two distinct notions of "grants" meet here and MUST NOT be conflated: the display
+// grants attached below come from planGrants (executor-AUTHORIZED tokens the operator
+// approves) — NOT from a.Grants, which are the model's OPAQUE retry tokens carried
+// verbatim and consumed separately at InvokableRun. BuildRequest never puts a.Grants
+// on the prompt (a model-supplied token is not executor-verified, so it must not be
+// shown as an authorized grant).
 func (b *Bash) BuildRequest(argsJSON string, _ tool.PreparedArtifact) (tool.PermissionRequest, error) {
 	var a bashArgs
 	if err := json.Unmarshal([]byte(argsJSON), &a); err != nil {
@@ -165,9 +172,16 @@ func (b *Bash) BuildRequest(argsJSON string, _ tool.PreparedArtifact) (tool.Perm
 // For each candidate token DescribeGrant must return ok==true (the token is
 // executor-minted and MAC-intact); a token that fails verification is fabricated or
 // tampered and MUST NOT reach the prompt, so the whole build fails (SPEC §10.7). The
-// dir is derived exactly as InvokableRun derives it, so grants are planned for the
-// call's real working directory; an escaping workdir has no confined dir to plan for
-// (the run would reject it anyway), so it plans no grants rather than failing.
+// dir is derived via the shared resolveDir (same as InvokableRun), so grants are
+// planned for the call's real working directory; an escaping workdir has no confined
+// dir to plan for (the run would reject it anyway), so it plans no grants rather than
+// failing.
+//
+// It deliberately does NOT read bashArgs.Grants: those are the model's opaque retry
+// tokens (unverified; consumed at InvokableRun), whereas these display grants are the
+// executor's own PlanGrants→DescribeGrant output. Wiring a.Grants in here would put an
+// unverified model-supplied token on the prompt as if it were authorized — exactly the
+// fail-secure violation this seam exists to prevent.
 func (b *Bash) planGrants(workdir, command string) ([]tool.GrantDisplay, error) {
 	pg, okPlan := b.runner.(interface {
 		PlanGrants(dir, command string) []string
@@ -179,13 +193,9 @@ func (b *Bash) planGrants(workdir, command string) ([]tool.GrantDisplay, error) 
 		return nil, nil
 	}
 
-	dir := b.root
-	if workdir != "" {
-		resolved, err := containedPath(b.root, workdir)
-		if err != nil {
-			return nil, nil
-		}
-		dir = resolved
+	dir, err := b.resolveDir(workdir)
+	if err != nil {
+		return nil, nil
 	}
 
 	tokens := pg.PlanGrants(dir, command)
@@ -203,6 +213,19 @@ func (b *Bash) planGrants(workdir, command string) ([]tool.GrantDisplay, error) 
 	return grants, nil
 }
 
+// resolveDir resolves a workspace-relative workdir to the confined absolute directory
+// a command runs in: the workspace root when empty, else containedPath(root, workdir)
+// (which rejects any escape). It is the single derivation shared by InvokableRun (which
+// maps its error to a tool-result string) and planGrants (which plans no grants on
+// error), so "grants are planned for the same dir InvokableRun runs in" is a structural
+// guarantee, not a copy-paste coincidence.
+func (b *Bash) resolveDir(workdir string) (string, error) {
+	if workdir == "" {
+		return b.root, nil
+	}
+	return containedPath(b.root, workdir)
+}
+
 // InvokableRun runs the command and returns its combined output + exit code as a
 // tool result. A non-zero exit is a normal result; a timeout, an escaping
 // workdir, or an unparseable args document is a tool-result error string. It
@@ -218,13 +241,9 @@ func (b *Bash) InvokableRun(ctx context.Context, argsJSON string) (*tool.ToolRes
 
 	// Resolve the working directory under the workspace root (default: the root).
 	// An escape is rejected (defense in depth; the gate also contains the workdir).
-	dir := b.root
-	if a.Workdir != "" {
-		resolved, err := containedPath(b.root, a.Workdir)
-		if err != nil {
-			return tool.TextResult("error: workdir is outside the workspace: " + a.Workdir), nil
-		}
-		dir = resolved
+	dir, err := b.resolveDir(a.Workdir)
+	if err != nil {
+		return tool.TextResult("error: workdir is outside the workspace: " + a.Workdir), nil
 	}
 
 	// Gather escalation grants from BOTH sources: the tool's own args and any the

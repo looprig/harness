@@ -271,6 +271,30 @@ func TestBashBuildRequestGrants(t *testing.T) {
 			wantErr: true,
 		},
 		{
+			// Empty-token boundary: PlanGrants mints a non-empty slice containing the
+			// empty token, which DescribeGrant misses → fail-secure (an empty string is
+			// not a verifiable grant and must not reach a prompt).
+			name: "an empty planned token fails the build (fail-secure)",
+			runner: &fakeGrantRunner{
+				plan:     map[string][]string{"git push": {""}},
+				describe: map[string]string{},
+			},
+			args:    `{"command":"git push"}`,
+			wantErr: true,
+		},
+		{
+			// Escaping-workdir boundary: containedPath rejects "../..", so resolveDir
+			// errors and planGrants plans no grants (nil, no error) — the run itself
+			// rejects the escape at InvokableRun, so no unverified grant is ever shown.
+			name: "escaping workdir plans no grants (no error)",
+			runner: &fakeGrantRunner{
+				plan:     map[string][]string{"git push": {"tok-net"}},
+				describe: map[string]string{"tok-net": "allow network egress"},
+			},
+			args:       `{"command":"git push","workdir":"../.."}`,
+			wantGrants: nil,
+		},
+		{
 			name: "planner mints no tokens leaves Grants nil",
 			runner: &fakeGrantRunner{
 				plan:     map[string][]string{},
