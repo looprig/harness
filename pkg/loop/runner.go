@@ -319,7 +319,7 @@ func resolvePermission(
 
 	switch ts.Permission.Check(ctx, r.t, r.block.Name, r.argsstr) {
 	case EffectAutoApprove:
-		applyApprovedGrants(r, ts)
+		applyApprovedGrants(ctx, r, ts)
 		return nil
 	case EffectDeny:
 		r.fail(errPermissionDenied)
@@ -337,15 +337,16 @@ func resolvePermission(
 // without the method, or a call with no delta-bearing match (the gate returns no
 // tokens), leaves r.grants nil, so the common auto-approve path is unchanged. The
 // method is asserted structurally (no new interface in the shared package): only the
-// concrete checker in tools/ implements it.
-func applyApprovedGrants(r *resolved, ts ToolSet) {
+// concrete checker in tools/ implements it. ctx is threaded so the gate's re-mint keeps
+// the call's trace context on this security path.
+func applyApprovedGrants(ctx context.Context, r *resolved, ts ToolSet) {
 	ag, ok := ts.Permission.(interface {
-		ApprovedGrants(toolName, argsJSON string) []string
+		ApprovedGrants(ctx context.Context, toolName, argsJSON string) []string
 	})
 	if !ok {
 		return
 	}
-	if grants := ag.ApprovedGrants(r.block.Name, r.argsstr); len(grants) > 0 {
+	if grants := ag.ApprovedGrants(ctx, r.block.Name, r.argsstr); len(grants) > 0 {
 		r.grants = grants
 	}
 }

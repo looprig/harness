@@ -76,6 +76,17 @@ func (c *PermissionChecker) describeGrants(tokens []string) []string {
 // invariant WorkspaceRoot == Bash.root) equals the dir the spawn uses, so the executor's
 // hashCommand(dir, command) token binding verifies at spawn.
 //
+// RUNNER-IDENTITY INVARIANT: re-minted tokens verify at spawn ONLY because the checker
+// holds the SAME confined runner INSTANCE the Bash tool runs through (same HMAC key) — a
+// composition-root invariant honored in the swe consumer. It is fail-SECURE if violated:
+// a token minted under a different runner's key simply fails the spawn's verification, so
+// the command runs WITHOUT the escalation rather than with an unauthorized one.
+//
+// PURITY CONTRACT: PlanGrants is invoked SPECULATIVELY here and its result discarded (the
+// seam reads only the descriptions for the delta-set match), so it MUST be pure and cheap
+// — an HMAC over (dir, command, capability), no I/O and no side effects. The speculative
+// 2–3× minting per decision (Check's two stages + ApprovedGrants) relies on that.
+//
 // ok=false (fail-closed) when: there is no planner runner, the command cannot be
 // extracted (a non-Bash call has none — grant deltas only arise from Bash), or the
 // workdir escapes the workspace (no confined dir to plan for). The returned tokens are
@@ -153,9 +164,12 @@ func canonicalizeDeltas(d []string) []string {
 // persisted/session delta-bearing ALLOW record's delta set equals the call's current set
 // (drift). When one DOES match it re-mints via PlanGrants and returns the freshly-minted
 // tokens whose MAC-verified description is in the record's delta set — bound (by the
-// executor) to hashCommand(spawnDir, command), so they verify at spawn. It RE-MINTS on
-// every call (single-mint).
-func (c *PermissionChecker) ApprovedGrants(toolName, argsJSON string) []string {
+// executor) to hashCommand(spawnDir, command), so they verify at spawn (see
+// planCallTokens' runner-identity invariant). It RE-MINTS on every call (single-mint).
+//
+// ctx is threaded from the runner so the Stage-5 record load keeps the call's trace
+// context on this security path.
+func (c *PermissionChecker) ApprovedGrants(ctx context.Context, toolName, argsJSON string) []string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -167,7 +181,7 @@ func (c *PermissionChecker) ApprovedGrants(toolName, argsJSON string) []string {
 	if len(callDeltas) == 0 {
 		return nil // nothing verifiable to grant.
 	}
-	if !c.hasMatchingDeltaRecord(toolName, argsJSON, callDeltas) {
+	if !c.hasMatchingDeltaRecord(ctx, toolName, argsJSON, callDeltas) {
 		return nil // auto-approve came from a non-delta path, or the set drifted.
 	}
 	return c.filterTokensToDeltas(tokens, callDeltas)
@@ -179,10 +193,10 @@ func (c *PermissionChecker) ApprovedGrants(toolName, argsJSON string) []string {
 // condition recordMatcher's delta-bearing branch uses to auto-approve. Gathering the
 // records the way Check's Stage 5/6 do keeps the re-mint decision from ever disagreeing
 // with the auto-approve.
-func (c *PermissionChecker) hasMatchingDeltaRecord(toolName, argsJSON string, callDeltas []string) bool {
+func (c *PermissionChecker) hasMatchingDeltaRecord(ctx context.Context, toolName, argsJSON string, callDeltas []string) bool {
 	class := classifyTool(toolName)
 	base := c.baseRecordMatcher(toolName, class, argsJSON)
-	for _, rec := range c.collectDeltaRecords() {
+	for _, rec := range c.collectDeltaRecords(ctx) {
 		if rec.Effect != loop.EffectAutoApprove || len(rec.GrantDeltas) == 0 {
 			continue
 		}
@@ -194,20 +208,13 @@ func (c *PermissionChecker) hasMatchingDeltaRecord(toolName, argsJSON string, ca
 }
 
 // collectDeltaRecords gathers the persisted (workspace→user) and in-memory session
-// approval records the same way Check's Stage 5/6 do: persisted records are SKIPPED
-// under the Unattended posture (matching Check's Stage-5 skip), and a "" home
-// contributes none (fail-secure — the store cannot be located). The background ctx is
-// only used by the loaders for slog. It is called under c.mu (held by ApprovedGrants),
-// so it drives the approval caches exactly as Check does.
-func (c *PermissionChecker) collectDeltaRecords() []ApprovalRecord {
-	var all []ApprovalRecord
-	if !c.unattended && c.home != "" {
-		ctx := context.Background()
-		all = append(all, c.loadWorkspaceApprovals(ctx, c.home)...)
-		all = append(all, c.loadUserApprovals(ctx, c.home)...)
-	}
-	all = append(all, sessionPoliciesToRecords(c.policy.Policies)...)
-	return all
+// approval records the same way Check's Stage 5/6 do: the persisted set comes from the
+// SHARED loadPersistedRecords gatherer (nil under the Unattended posture or when home is
+// "" — fail-secure), then the session policies. It is called under c.mu (held by
+// ApprovedGrants), so it drives the approval caches exactly as Check does.
+func (c *PermissionChecker) collectDeltaRecords(ctx context.Context) []ApprovalRecord {
+	all := c.loadPersistedRecords(ctx)
+	return append(all, sessionPoliciesToRecords(c.policy.Policies)...)
 }
 
 // filterTokensToDeltas keeps each re-minted token whose MAC-verified DescribeGrant

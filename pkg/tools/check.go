@@ -391,24 +391,32 @@ func (c *PermissionChecker) stageHardApprove(toolName string) bool {
 // else (_, false) to fall through.
 func (c *PermissionChecker) stagePersistedApprovals(ctx context.Context, toolName string, class toolClass, argsJSON string) (loop.Effect, bool) {
 	matcher := c.recordMatcher(toolName, class, argsJSON)
+	return reduceApprovalRecords(c.loadPersistedRecords(ctx), matcher)
+}
 
+// loadPersistedRecords is the SINGLE Stage-5 gatherer: the workspace-then-user
+// persisted approval records, in that order. It returns nil (contributes nothing)
+// when the Unattended posture skips Stage 5, or when home is "" (a persisted-approvals
+// file lives under ~/.looprig; with no home it cannot be located → both store files
+// absent → fail-secure: never auto-approve without the store). Sharing it between
+// Check's stagePersistedApprovals and ApprovedGrants' collectDeltaRecords makes
+// "gathered exactly as Stage 5" STRUCTURAL, not merely asserted in a comment.
+func (c *PermissionChecker) loadPersistedRecords(ctx context.Context) []ApprovalRecord {
+	if c.unattended {
+		return nil // Stage 5 is skipped headless (only the declared allowlist may approve).
+	}
 	home := c.home
 	if home == "" {
-		// Home was unresolvable at construction (and no ~/ pattern needed it, else
-		// construction would have failed). A persisted-approvals file lives under
-		// ~/.looprig; with no home it cannot be located → both store files absent →
-		// contribute nothing (fail-secure: never auto-approve without the store).
 		slog.WarnContext(ctx, "tools: home dir unresolved; persisted approvals skipped")
-		return loop.EffectAsk, false
+		return nil
 	}
-
 	wsRecords := c.loadWorkspaceApprovals(ctx, home)
 	userRecords := c.loadUserApprovals(ctx, home)
 
 	all := make([]ApprovalRecord, 0, len(wsRecords)+len(userRecords))
 	all = append(all, wsRecords...)
 	all = append(all, userRecords...)
-	return reduceApprovalRecords(all, matcher)
+	return all
 }
 
 // loadWorkspaceApprovals reads + parses the workspace-scoped approvals file. A
@@ -636,10 +644,11 @@ func (c *PermissionChecker) recordMatcher(toolName string, class toolClass, args
 	callHasGrants := hasGrants(argsJSON)
 
 	// The live call's CURRENTLY-required delta set is computed LAZILY and at most once
-	// per matcher: only a base-matching delta-bearing ALLOW record needs it, and
-	// re-minting (PlanGrants) has a cost, so a grant-free call against deltaless records
-	// never mints. Check holds c.mu for its whole duration and drives the matcher
-	// synchronously, so this non-atomic memo is race-free within a single decision.
+	// per matcher (Check builds one matcher per stage → up to twice per decision): only
+	// a base-matching delta-bearing ALLOW record needs it, and re-minting (PlanGrants)
+	// has a cost, so a grant-free call against deltaless records never mints. Check
+	// holds c.mu for its whole duration and drives the matcher synchronously, so this
+	// non-atomic memo is race-free within a single decision.
 	var (
 		deltasDone bool
 		callDeltas []string

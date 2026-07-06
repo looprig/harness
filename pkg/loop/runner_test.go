@@ -1102,7 +1102,9 @@ func (autoApproveRemintGate) Check(context.Context, tool.InvokableTool, string, 
 func (autoApproveRemintGate) Grant(context.Context, string, string, tool.ApprovalScope) error {
 	return nil
 }
-func (g autoApproveRemintGate) ApprovedGrants(toolName, argsJSON string) []string { return g.remint }
+func (g autoApproveRemintGate) ApprovedGrants(_ context.Context, toolName, argsJSON string) []string {
+	return g.remint
+}
 
 // TestRunBatch_AutoApproveRemintReachesSpawnCtx: when Check auto-approves (no Ask
 // gate) and the gate re-mints tokens via the optional ApprovedGrants method, those
