@@ -1091,6 +1091,57 @@ func TestRunBatch_NoGrantsCtxClean(t *testing.T) {
 	}
 }
 
+// autoApproveRemintGate is an EffectAutoApprove gate that ALSO implements the optional
+// ApprovedGrants re-mint method the runner probes by type assertion (SPEC §9.3
+// session-scope escalation). remint is the set of freshly-minted tokens it returns.
+type autoApproveRemintGate struct{ remint []string }
+
+func (autoApproveRemintGate) Check(context.Context, tool.InvokableTool, string, string) Effect {
+	return EffectAutoApprove
+}
+func (autoApproveRemintGate) Grant(context.Context, string, string, tool.ApprovalScope) error {
+	return nil
+}
+func (g autoApproveRemintGate) ApprovedGrants(toolName, argsJSON string) []string { return g.remint }
+
+// TestRunBatch_AutoApproveRemintReachesSpawnCtx: when Check auto-approves (no Ask
+// gate) and the gate re-mints tokens via the optional ApprovedGrants method, those
+// fresh tokens land on the spawn's per-call ctx (GrantsFromContext), so a session-
+// scope repeat escalation carries LIVE tokens without a prompt.
+func TestRunBatch_AutoApproveRemintReachesSpawnCtx(t *testing.T) {
+	t.Parallel()
+	probe := &grantProbeTool{name: "T"}
+	gate := autoApproveRemintGate{remint: []string{"remint-tok"}}
+	ts := ToolSet{Permission: gate, Registry: []tool.InvokableTool{probe}, MaxParallelToolCalls: 4}
+	emit, _ := collectEmit()
+
+	results := runBatchNoGate(context.Background(), []content.ToolUseBlock{call(t, "T", `{}`)}, ts, emit)
+	if results[0].IsError {
+		t.Fatalf("result = %+v, want success", results[0])
+	}
+	if got := probe.grants(); len(got) != 1 || got[0] != "remint-tok" {
+		t.Errorf("per-call ctx grants = %#v, want [\"remint-tok\"] (re-minted on auto-approve)", got)
+	}
+}
+
+// TestRunBatch_AutoApproveNoRemintMethodCtxClean: a plain EffectAutoApprove gate that
+// does NOT implement ApprovedGrants leaves the spawn ctx grant-free (the probe is
+// purely additive — the common auto-approve path is unchanged).
+func TestRunBatch_AutoApproveNoRemintMethodCtxClean(t *testing.T) {
+	t.Parallel()
+	probe := &grantProbeTool{name: "T"}
+	ts := ToolSet{Permission: autoApproveGate{}, Registry: []tool.InvokableTool{probe}, MaxParallelToolCalls: 4}
+	emit, _ := collectEmit()
+
+	results := runBatchNoGate(context.Background(), []content.ToolUseBlock{call(t, "T", `{}`)}, ts, emit)
+	if results[0].IsError {
+		t.Fatalf("result = %+v, want success", results[0])
+	}
+	if got := probe.grants(); got != nil {
+		t.Errorf("per-call ctx grants = %#v, want nil (gate has no ApprovedGrants)", got)
+	}
+}
+
 // TestRunBatch_MiddlewareOutermostFirst: the first-listed middleware is the
 // outermost wrapper of InvokableRun.
 func TestRunBatch_MiddlewareOutermostFirst(t *testing.T) {

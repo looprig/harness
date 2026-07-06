@@ -617,16 +617,42 @@ func reduceApprovalRecords(records []ApprovalRecord, match recordPredicate) (loo
 //     an explicit deny must still block a grant-carrying call.
 //   - an ALLOW record WITHOUT GrantDeltas matches ONLY a grant-free call, so a
 //     stored deltaless allow can never auto-approve an escalation.
-//   - an ALLOW record WITH GrantDeltas matches ONLY a grant-bearing call whose delta
-//     set equals it. Computing the live call's required deltas and re-minting fresh
-//     single-mint tokens onto the per-call ctx is Task 17d; until then a
-//     delta-bearing allow does not auto-match (fail-secure toward Ask).
+//   - an ALLOW record WITH GrantDeltas (Task 17d — seam OPEN) matches a call whose
+//     CURRENTLY-computed delta set (re-minted via the runner's PlanGrants → verified
+//     via DescribeGrant — the same structural probe Bash uses, no sandbox import)
+//     EQUALS the record's set. On a match Check returns EffectAutoApprove and the
+//     runner re-mints fresh single-mint tokens via ApprovedGrants (grant_remint.go).
+//     Fail-closed: a runner that cannot plan/verify grants, or a drifted delta set
+//     (the runner's capability set changed), does NOT match and falls through to Ask.
+//     Because a repeat grant-bearing call now AUTO-APPROVES (Grant is not re-invoked),
+//     the 17c per-repeat record accumulation no longer occurs.
 //
 // A live call is grant-carrying when its args carry a non-empty top-level "grants"
-// array (hasGrants) — the same signal Stage 6.5 uses.
+// array (hasGrants) — the same signal Stage 6.5 uses; it gates the DELTALESS branch
+// only. The delta-bearing branch matches on the COMPUTED delta set, so a repeat the
+// classifier predicts needs the same deltas matches even without re-attached tokens.
 func (c *PermissionChecker) recordMatcher(toolName string, class toolClass, argsJSON string) recordPredicate {
 	base := c.baseRecordMatcher(toolName, class, argsJSON)
 	callHasGrants := hasGrants(argsJSON)
+
+	// The live call's CURRENTLY-required delta set is computed LAZILY and at most once
+	// per matcher: only a base-matching delta-bearing ALLOW record needs it, and
+	// re-minting (PlanGrants) has a cost, so a grant-free call against deltaless records
+	// never mints. Check holds c.mu for its whole duration and drives the matcher
+	// synchronously, so this non-atomic memo is race-free within a single decision.
+	var (
+		deltasDone bool
+		callDeltas []string
+		callOK     bool
+	)
+	callDeltasOnce := func() ([]string, bool) {
+		if !deltasDone {
+			callDeltas, callOK = c.computeCallDeltas(argsJSON)
+			deltasDone = true
+		}
+		return callDeltas, callOK
+	}
+
 	return func(rec ApprovalRecord) bool {
 		if !base(rec) {
 			return false
@@ -637,16 +663,14 @@ func (c *PermissionChecker) recordMatcher(toolName string, class toolClass, args
 		if len(rec.GrantDeltas) == 0 {
 			return !callHasGrants // a deltaless allow never auto-approves an escalation.
 		}
-		// TODO(Task 17d): compare rec.GrantDeltas to the live call's required delta
-		// set and, on a match, re-mint fresh grant tokens onto the per-call ctx.
-		// Until then a delta-bearing allow declines to auto-match (fail-secure).
-		//
-		// KNOWN LIMITATION until 17d: because a delta-bearing record never
-		// auto-matches, each repeat grant-bearing approval re-Asks and Grant appends
-		// ANOTHER record (no dedup) — so approvals.json / the session policy list grows
-		// one record per repeat. 17d should dedup-on-append (an equal Tool+Match+delta
-		// set is a no-op) once it makes delta-bearing records auto-match.
-		return false
+		// Delta-bearing seam (Task 17d): match iff the call's computed delta set equals
+		// the record's. Fail-closed on a runner that cannot plan/verify (callOK=false)
+		// or on drift (unequal sets) → no match → Ask.
+		cd, ok := callDeltasOnce()
+		if !ok {
+			return false
+		}
+		return equalDeltaSet(cd, rec.GrantDeltas)
 	}
 }
 

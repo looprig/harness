@@ -214,16 +214,30 @@ func (b *Bash) planGrants(workdir, command string) ([]tool.GrantDisplay, error) 
 }
 
 // resolveDir resolves a workspace-relative workdir to the confined absolute directory
-// a command runs in: the workspace root when empty, else containedPath(root, workdir)
-// (which rejects any escape). It is the single derivation shared by InvokableRun (which
-// maps its error to a tool-result string) and planGrants (which plans no grants on
-// error), so "grants are planned for the same dir InvokableRun runs in" is a structural
-// guarantee, not a copy-paste coincidence.
+// a command runs in. It delegates to the package-level resolveSpawnDir so InvokableRun
+// (which maps its error to a tool-result string), planGrants (which plans no grants on
+// error), AND the PermissionChecker's grant re-mint seam all derive the spawn dir
+// identically — "grants are planned/minted for the same dir InvokableRun runs in" is a
+// structural guarantee, not a copy-paste coincidence.
 func (b *Bash) resolveDir(workdir string) (string, error) {
+	return resolveSpawnDir(b.root, workdir)
+}
+
+// resolveSpawnDir maps a workspace-relative workdir to the confined absolute directory
+// a Bash command runs in: the root VERBATIM when workdir is empty, else
+// containedPath(root, workdir) (which rejects any escape). It is the SINGLE definition
+// of "the spawn dir", shared by Bash.resolveDir (the run/plan dir) and the
+// PermissionChecker's grant re-mint seam (grant_remint.go), which MUST plan/mint grants
+// for the SAME dir the spawn uses — the executor binds each token to
+// hashCommand(dir, command) and re-verifies it against the actual spawn dir. Because
+// both callers pass the same workspace root string — a composition-root invariant: the
+// checker's WorkspaceRoot IS the Bash tool's root (the same invariant workspaceRelPath
+// already relies on) — dir-consistency is structural, not a coincidence.
+func resolveSpawnDir(root, workdir string) (string, error) {
 	if workdir == "" {
-		return b.root, nil
+		return root, nil
 	}
-	return containedPath(b.root, workdir)
+	return containedPath(root, workdir)
 }
 
 // InvokableRun runs the command and returns its combined output + exit code as a

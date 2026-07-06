@@ -3,7 +3,6 @@ package tools
 import (
 	"context"
 	"path/filepath"
-	"slices"
 
 	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/harness/pkg/tool"
@@ -67,45 +66,18 @@ func (c *PermissionChecker) Grant(ctx context.Context, toolName, argsJSON string
 	}
 }
 
-// deriveGrantDeltas MAC-verifies each accepted grant token against the held runner
-// and returns the SORTED, DEDUPED delta DESCRIPTIONS to persist. It probes c.runner
-// STRUCTURALLY for DescribeGrant (harness never imports sandbox, §10.1); a runner
-// that is nil or does not describe grants yields NO deltas (so an undescribable
-// token is never stored as an unverified delta). A token whose DescribeGrant returns
-// ok==false is fabricated/tampered/expired and is SKIPPED — never persisted (SPEC
-// §10.7 fail-secure). The persisted record stores these DESCRIPTIONS, never the
-// single-mint tokens.
+// deriveGrantDeltas MAC-verifies each accepted grant token against the held runner and
+// returns the SORTED, DEDUPED delta DESCRIPTIONS to persist. It delegates to the shared
+// describeGrants (grant_remint.go) — the SINGLE definition of "a token set's delta set"
+// — so the WRITE side (what a grant persists) and the READ side (what the re-mint seam
+// compares a live call against) can never derive it differently. It probes c.runner
+// STRUCTURALLY for DescribeGrant (harness never imports sandbox, §10.1); a nil or
+// non-describing runner yields NO deltas (an undescribable token is never stored as an
+// unverified delta), and a token whose DescribeGrant returns ok==false is
+// fabricated/tampered/expired and is SKIPPED (SPEC §10.7 fail-secure). The persisted
+// record stores these DESCRIPTIONS, never the single-mint tokens.
 func (c *PermissionChecker) deriveGrantDeltas(tokens []string) []string {
-	if len(tokens) == 0 {
-		return nil
-	}
-	if c.runner == nil {
-		// No runner → no MAC-verifier. Guard the nil BEFORE the type assertion so a
-		// typed-nil runner implementing DescribeGrant can't pass the assertion into a
-		// nil-receiver call (mirrors runnerLevel/runnerGuaranteeBits in posture.go).
-		return nil
-	}
-	dg, ok := c.runner.(interface {
-		DescribeGrant(token string) (string, bool)
-	})
-	if !ok {
-		return nil // no MAC-verifier → cannot verify any delta; persist none.
-	}
-	seen := make(map[string]struct{}, len(tokens))
-	var deltas []string
-	for _, tok := range tokens {
-		desc, ok := dg.DescribeGrant(tok)
-		if !ok {
-			continue // unverifiable token → never persist as a delta.
-		}
-		if _, dup := seen[desc]; dup {
-			continue
-		}
-		seen[desc] = struct{}{}
-		deltas = append(deltas, desc)
-	}
-	slices.Sort(deltas)
-	return deltas
+	return c.describeGrants(tokens)
 }
 
 // matchSlice maps a derived Match string to a ToolPolicy.Match slice: an empty

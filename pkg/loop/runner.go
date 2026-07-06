@@ -319,12 +319,34 @@ func resolvePermission(
 
 	switch ts.Permission.Check(ctx, r.t, r.block.Name, r.argsstr) {
 	case EffectAutoApprove:
+		applyApprovedGrants(r, ts)
 		return nil
 	case EffectDeny:
 		r.fail(errPermissionDenied)
 		return nil
 	default: // EffectAsk (the fail-secure zero value)
 		return askPermission(ctx, r, ts, gateReg, emit)
+	}
+}
+
+// applyApprovedGrants probes the gate for the OPTIONAL ApprovedGrants re-mint method
+// (SPEC §9.3 session/workspace-scope escalation). When Check auto-approved a call via a
+// delta-bearing grant record, the gate re-mints FRESH single-mint tokens for THIS call;
+// recording them on r.grants makes runOne nest them on the spawn ctx via
+// tool.WithGrants — the SAME seam a pre-ask approval's AcceptedGrants uses. A gate
+// without the method, or a call with no delta-bearing match (the gate returns no
+// tokens), leaves r.grants nil, so the common auto-approve path is unchanged. The
+// method is asserted structurally (no new interface in the shared package): only the
+// concrete checker in tools/ implements it.
+func applyApprovedGrants(r *resolved, ts ToolSet) {
+	ag, ok := ts.Permission.(interface {
+		ApprovedGrants(toolName, argsJSON string) []string
+	})
+	if !ok {
+		return
+	}
+	if grants := ag.ApprovedGrants(r.block.Name, r.argsstr); len(grants) > 0 {
+		r.grants = grants
 	}
 }
 
