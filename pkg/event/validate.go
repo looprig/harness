@@ -1,8 +1,8 @@
 package event
 
 import (
-	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/core/uuid"
+	"github.com/looprig/harness/pkg/identity"
 )
 
 // EventName is the concrete event type name an InvalidEventError points at.
@@ -169,6 +169,11 @@ func classify(ev Event) (name string, profile idProfile, ok bool) {
 		// (same shape as RestoreDone/SessionIdle) — only SessionID set. Ref is an
 		// opaque payload string the validator never constrains.
 		return "WorkspaceCheckpointed", sessionProfile(), true
+	case SecurityCeilingChanged:
+		// Session-scoped: a session-global ceiling clamp appended when the operator
+		// changes it (same shape as WorkspaceCheckpointed) — only SessionID set. Level is
+		// an opaque ordinal the validator never constrains.
+		return "SecurityCeilingChanged", sessionProfile(), true
 	case LoopIdle:
 		return "LoopIdle", loopProfile(), true
 	case LoopStarted:

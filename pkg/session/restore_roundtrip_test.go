@@ -129,6 +129,9 @@ func setHeader(t *testing.T, ev event.Event, hdr event.Header) event.Event {
 	case event.WorkspaceCheckpointed:
 		e.Header = hdr
 		return e
+	case event.SecurityCeilingChanged:
+		e.Header = hdr
+		return e
 	default:
 		t.Fatalf("setHeader: unexpected event %T", ev)
 		return nil

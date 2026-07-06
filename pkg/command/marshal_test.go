@@ -89,6 +89,8 @@ func TestMarshalCommandRoundTrip(t *testing.T) {
 		}},
 		{"Interrupt", Interrupt{Header: fullHeader()}},
 		{"Shutdown", Shutdown{Header: fullHeader()}},
+		{"SetSecurityCeiling", SetSecurityCeiling{Header: fullHeader(), Level: 2}},
+		{"SetSecurityCeiling zero", SetSecurityCeiling{Header: fullHeader()}},
 	}
 
 	for _, tt := range tests {
@@ -185,6 +187,7 @@ func TestMarshalCommandEnvelopeKeys(t *testing.T) {
 		{"CancelQueuedInput", CancelQueuedInput{Header: fullHeader()}, CommandCancelQueuedInput},
 		{"Interrupt", Interrupt{Header: fullHeader()}, CommandInterrupt},
 		{"Shutdown", Shutdown{Header: fullHeader()}, CommandShutdown},
+		{"SetSecurityCeiling", SetSecurityCeiling{Header: fullHeader()}, CommandSetSecurityCeiling},
 	}
 
 	for _, tt := range tests {
@@ -218,7 +221,7 @@ func TestMarshalCommandEnvelopeKeys(t *testing.T) {
 // fails TestMarshalCommandCoversEveryType. A missed command type is an
 // unpersistable intent-log record = silent restore data loss, which this guard
 // forbids.
-const wantCommandTypes = 8
+const wantCommandTypes = 9
 
 // unionInstances is one zero-valued instance of EVERY concrete command type. The
 // drift guard asserts the codec handles each, so a new union member is forced
@@ -228,6 +231,7 @@ func unionInstances() []Command {
 		UserInput{}, SubagentResult{},
 		ApproveToolCall{}, DenyToolCall{}, ProvideUserInput{},
 		CancelQueuedInput{}, Interrupt{}, Shutdown{},
+		SetSecurityCeiling{},
 	}
 }
 

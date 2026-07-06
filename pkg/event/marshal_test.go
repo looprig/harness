@@ -337,6 +337,8 @@ func TestMarshalEventRoundTripEnduring(t *testing.T) {
 		// Empty Ref is a legal string at the event layer (codec fidelity, not Ref
 		// grammar validity): it must round-trip back to "".
 		{"WorkspaceCheckpointed empty ref", WorkspaceCheckpointed{Header: fullHeaderSession()}},
+		{"SecurityCeilingChanged", SecurityCeilingChanged{Header: fullHeaderSession(), Level: 2}},
+		{"SecurityCeilingChanged zero", SecurityCeilingChanged{Header: fullHeaderSession()}},
 		// RestoreErrored.Err handled in the dedicated err-projection test below.
 		{"LoopIdle", LoopIdle{Header: fullHeaderLoop()}},
 		{"LoopStarted", LoopStarted{Header: fullHeaderLoop()}},
@@ -606,7 +608,7 @@ func TestMarshalEventPermissionRequestedFullRequest(t *testing.T) {
 // without codec coverage changes the live count derived from classify+Class() and
 // fails TestMarshalEventCoversEveryEnduringType. A missed Enduring type is an
 // unpersistable event = silent restore data loss, which this guard forbids.
-const wantEnduringTypes = 20
+const wantEnduringTypes = 21
 
 // unionInstances is one instance of EVERY type in the sealed union (Enduring and
 // Ephemeral alike), mirroring TestClassifyExhaustive. The drift guard partitions
@@ -616,6 +618,7 @@ func unionInstances() []Event {
 	return []Event{
 		SessionStarted{}, SessionActive{}, SessionIdle{}, SessionStopped{},
 		RestoreStarted{}, RestoreDone{}, RestoreErrored{}, WorkspaceCheckpointed{},
+		SecurityCeilingChanged{},
 		LoopIdle{}, LoopStarted{},
 		TokenDelta{}, TurnStarted{}, StepDone{}, TurnFoldedInto{}, InputCancelled{},
 		InputQueued{}, TurnRejected{}, TurnDone{}, TurnFailed{}, TurnInterrupted{},

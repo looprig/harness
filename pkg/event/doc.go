@@ -25,6 +25,7 @@ var (
 	_ Event = RestoreDone{}
 	_ Event = RestoreErrored{}
 	_ Event = WorkspaceCheckpointed{}
+	_ Event = SecurityCeilingChanged{}
 
 	// Loop-scoped events.
 	_ Event = LoopIdle{}

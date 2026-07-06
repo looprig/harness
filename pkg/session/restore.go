@@ -4,9 +4,9 @@ import (
 	"strconv"
 
 	"github.com/looprig/core/content"
+	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/identity"
-	"github.com/looprig/core/uuid"
 )
 
 // ConfigMismatchError is the fail-secure rejection a restore returns when the live
@@ -188,6 +188,24 @@ func lastWorkspaceCheckpoint(events []event.Event) (string, bool) {
 		}
 	}
 	return ref, ok
+}
+
+// lastSecurityCeiling returns the ordinal of the LAST SecurityCeilingChanged event in the
+// replay — the live security ceiling to re-seed on resume (last write wins) — and false if
+// the session never changed its ceiling (it then resumes at the fail-secure most-restrictive
+// default). SecurityCeilingChanged is session-scoped, so it is present in the unnarrowed
+// discovery drain; scanning to the end picks the newest (a change appends a fresh event,
+// never replacing the prior one). It mirrors lastWorkspaceCheckpoint — a single-purpose
+// discovery scanner — so the restore constructor stays a straight-line assembly and
+// foldPrimaryLoop stays pure.
+func lastSecurityCeiling(events []event.Event) (uint8, bool) {
+	level, ok := uint8(0), false
+	for _, ev := range events {
+		if sc, isSC := ev.(event.SecurityCeilingChanged); isSC {
+			level, ok = sc.Level, true // keep scanning; the LAST one wins
+		}
+	}
+	return level, ok
 }
 
 // foldResult is the reconstruction of one loop's committed conversation from its

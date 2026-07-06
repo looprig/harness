@@ -6,6 +6,8 @@ import (
 	"io"
 	"time"
 
+	"github.com/looprig/core/uuid"
+	"github.com/looprig/harness/pkg/ceiling"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/foreignloop"
 	"github.com/looprig/harness/pkg/hub"
@@ -13,7 +15,6 @@ import (
 	"github.com/looprig/harness/pkg/journal"
 	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/harness/pkg/sessionstore"
-	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/workspacestore"
 )
 
@@ -242,6 +243,12 @@ func restoreSession(
 	// Done seam below; empty/false when the session was never checkpointed.
 	wsRef, hasWSCheckpoint := lastWorkspaceCheckpoint(all)
 
+	// The last durable security-ceiling ordinal to re-seed on resume (if the session ever
+	// changed it) — folded from the SAME unnarrowed discovery drain (SecurityCeilingChanged
+	// is session-scoped), last write wins. Absent means the session resumes at the fail-
+	// secure most-restrictive default. Seeded into the restored session below.
+	ceilingLevel, hasCeiling := lastSecurityCeiling(all)
+
 	// (3) RestoreStarted — the FIRST restore mutation (after the lease fence).
 	if err := appendRestoreEvent(ctx, j, factory, event.RestoreStarted{
 		Header: event.Header{Coordinates: identity.Coordinates{SessionID: sessionID}},
@@ -321,7 +328,7 @@ func restoreSession(
 	// also yields primaryLoopID + AgentName), so the "what is the root loop" facts stay in
 	// one place. The restore branch in buildRestoredSession fails closed on an empty sid for
 	// a foreign engine.
-	s, err := buildRestoredSession(ctx, cfg, sessionID, primaryLoopID, rootLoop.ForeignSID, spawnedCount, folded, j, factory, newID, now, leaseOpts...)
+	s, err := buildRestoredSession(ctx, cfg, sessionID, primaryLoopID, rootLoop.ForeignSID, spawnedCount, ceilingLevel, hasCeiling, folded, j, factory, newID, now, leaseOpts...)
 	if err != nil {
 		return recordErrored(err)
 	}
@@ -340,6 +347,8 @@ func buildRestoredSession(
 	sessionID, primaryLoopID uuid.UUID,
 	foreignSID string,
 	spawnedCount int,
+	ceilingLevel uint8,
+	hasCeiling bool,
 	folded foldResult,
 	j journal.SessionJournal,
 	factory *event.Factory,
@@ -368,6 +377,17 @@ func buildRestoredSession(
 	// appender option leaves the nop default installed.
 	for _, opt := range opts {
 		opt(s)
+	}
+	// Default-mint the security-ceiling source (unless WithCeiling injected the shared one),
+	// then re-seed it from the folded SecurityCeilingChanged events so the recovered session
+	// — and any checker sharing this source — comes up under the ceiling it crashed at (last
+	// write wins). No lock is needed: the session is not yet reachable. An absent ceiling
+	// (never changed) leaves the fail-secure most-restrictive default.
+	if s.ceiling == nil {
+		s.ceiling = ceiling.New()
+	}
+	if hasCeiling {
+		s.ceiling.Set(ceilingLevel)
 	}
 	// Resolve the spawn-cap defaults AFTER the options, mirroring newSession, so a restore
 	// (with or without WithLimits) has positive depth/quota caps from the first NewLoop.

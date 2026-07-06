@@ -6,15 +6,16 @@ import (
 	"sync"
 	"time"
 
-	"github.com/looprig/harness/pkg/command"
 	"github.com/looprig/core/content"
+	"github.com/looprig/core/uuid"
+	"github.com/looprig/harness/pkg/ceiling"
+	"github.com/looprig/harness/pkg/command"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/foreignloop"
 	"github.com/looprig/harness/pkg/hub"
 	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/harness/pkg/tool"
-	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/workspacestore"
 )
 
@@ -260,6 +261,17 @@ type Session struct {
 	// (Dependency Inversion): it never sees the Blobs backend beneath it.
 	ws     *workspacestore.Store // nil unless WithWorkspaceStore wired it; gates CheckpointWorkspace
 	wsRoot string                // the workspace directory Snapshot archives
+
+	// ceiling is the session's live SECURITY-CEILING ordinal source (SPEC §8/§10.2): the
+	// clamp SetSecurityCeiling mutates and CeilingSource exposes. It is default-minted at
+	// construction (New/Restore) so it is NEVER nil for a constructed session; the
+	// composition root overrides it via WithCeiling with the SAME *ceiling.State it wires
+	// into the permission checker (tools.WithCeilingPostures), so a ceiling change is
+	// visible to the checker on the next Check. On restore it is re-seeded from the folded
+	// SecurityCeilingChanged events (last write wins). Concurrency-safe (atomic) — a
+	// checker reads Current on a loop goroutine while SetSecurityCeiling applies on the
+	// dispatch goroutine.
+	ceiling *ceiling.State
 }
 
 // eventAppender is the session's narrow view of the hub's REQUIRED durable event tap:
@@ -764,6 +776,13 @@ func newSession(ctx context.Context, cfg loop.Config, newID idGenerator, now eve
 	// default stays installed). WithSessionID is a no-op here (already consumed above).
 	for _, opt := range opts {
 		opt(s)
+	}
+	// Default-mint the security-ceiling source when the composition root did not inject
+	// one via WithCeiling, so SetSecurityCeiling/CeilingSource are always safe (never a
+	// nil-deref). A fresh session starts at the fail-secure most-restrictive ordinal (0)
+	// until a SetSecurityCeiling command changes it.
+	if s.ceiling == nil {
+		s.ceiling = ceiling.New()
 	}
 	// Apply the spawn-cap defaults AFTER the options so an unset (or WithLimits-supplied)
 	// Limits resolves to positive caps before the first NewLoop — a zero or negative

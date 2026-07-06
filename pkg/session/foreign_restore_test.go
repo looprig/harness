@@ -110,7 +110,7 @@ func TestForeignRestore(t *testing.T) {
 			}
 
 			s, err := buildRestoredSession(context.Background(), c, sessionID, primaryLoopID,
-				tt.foreignSID, 0, folded, fakeSessionJournal{}, fac, uuid.New, time.Now, opts...)
+				tt.foreignSID, 0, 0, false, folded, fakeSessionJournal{}, fac, uuid.New, time.Now, opts...)
 
 			if tt.wantErr {
 				if s != nil {

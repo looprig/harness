@@ -6,10 +6,11 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/looprig/core/uuid"
+	"github.com/looprig/harness/pkg/ceiling"
 	"github.com/looprig/harness/pkg/command"
 	"github.com/looprig/harness/pkg/foreignloop"
 	"github.com/looprig/harness/pkg/journal"
-	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/workspacestore"
 )
 
@@ -53,6 +54,23 @@ func WithCommandAppender(a commandAppender) Option {
 	return func(s *Session) {
 		if a != nil {
 			s.cmdAppender = a
+		}
+	}
+}
+
+// WithCeiling injects the session's SECURITY-CEILING source — the SAME *ceiling.State the
+// composition root wires into the permission checker via tools.WithCeilingPostures.
+// Sharing ONE state is what makes SetSecurityCeiling's clamp visible to the checker on the
+// next Check (SPEC §8). Without this option the session mints its own internal state
+// (SetSecurityCeiling still journals/applies/emits, but no checker observes it). A nil
+// state is ignored (the default internal state stays), so a wiring slip can never null the
+// field. It applies to both New and Restore — Restore re-seeds the injected state from the
+// folded SecurityCeilingChanged events, so the checker sees the recovered ceiling on
+// resume.
+func WithCeiling(cs *ceiling.State) Option {
+	return func(s *Session) {
+		if cs != nil {
+			s.ceiling = cs
 		}
 	}
 }
