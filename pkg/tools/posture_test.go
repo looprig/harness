@@ -320,12 +320,132 @@ func TestPostureRequiredLevelFloor(t *testing.T) {
 	}
 }
 
-// TestPostureNilUnchanged: a checker with NO posture option behaves exactly as
-// today — Bash falls through to Ask (nil posture = pre-existing behavior).
+// TestPostureNilUnchanged: a checker that configures no auto-approval behaves
+// exactly as today — Bash falls through to Ask. Both a nil posture (no option) and
+// an all-flags-off posture must match the no-posture baseline.
 func TestPostureNilUnchanged(t *testing.T) {
 	t.Parallel()
-	c := newPostureChecker(t, PermissionPolicy{})
-	if got := c.Check(context.Background(), plainTool{name: toolBash}, toolBash, `{"command":"echo hi"}`); got != loop.EffectAsk {
-		t.Errorf("Check() = %v, want EffectAsk (no posture => today's default)", got)
+	tests := []struct {
+		name string
+		opts []Option
+	}{
+		{name: "no posture configured", opts: nil},
+		{
+			name: "posture configured but all auto-approve flags off",
+			opts: []Option{WithPosture(Posture{}, &fakeGuaranteeRunner{bits: gA | gB | gC})},
+		},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			c := newPostureChecker(t, PermissionPolicy{}, tt.opts...)
+			got := c.Check(context.Background(), plainTool{name: toolBash}, toolBash, `{"command":"echo hi"}`)
+			if got != loop.EffectAsk {
+				t.Errorf("Check() = %v, want EffectAsk (no auto-approve => today's default)", got)
+			}
+		})
+	}
+}
+
+// posturesEqual compares two Postures field-by-field. Posture holds a func field
+// (TrivialBash) so it is not comparable with ==; TrivialBash is compared by
+// nil-ness only (sufficient for selector tests, none of which set it).
+func posturesEqual(a, b Posture) bool {
+	return a.AutoApproveEdits == b.AutoApproveEdits &&
+		a.AutoApproveBash == b.AutoApproveBash &&
+		a.RequiredGuarantees == b.RequiredGuarantees &&
+		a.RequiredLevel == b.RequiredLevel &&
+		a.GrantCarryingAlwaysAsk == b.GrantCarryingAlwaysAsk &&
+		(a.TrivialBash == nil) == (b.TrivialBash == nil)
+}
+
+// TestCeilingPosturesSelect exercises the dynamic selector directly (not through
+// Check): empty table, nil source, in-range, and out-of-range ordinals — all
+// fail-closed to the most restrictive entry (table[0], or the zero Posture).
+func TestCeilingPosturesSelect(t *testing.T) {
+	t.Parallel()
+	restrictive := Posture{}
+	mid := Posture{AutoApproveEdits: true}
+	trusted := Posture{AutoApproveBash: true, RequiredGuarantees: gA}
+	table := []Posture{restrictive, mid, trusted}
+
+	tests := []struct {
+		name  string
+		src   CeilingSource
+		table []Posture
+		want  Posture
+	}{
+		{name: "empty table -> zero posture", src: &fakeCeiling{cur: 0}, table: nil, want: Posture{}},
+		{name: "nil source -> table[0]", src: nil, table: table, want: restrictive},
+		{name: "in-range ordinal 1 -> table[1]", src: &fakeCeiling{cur: 1}, table: table, want: mid},
+		{name: "in-range ordinal 2 -> table[2]", src: &fakeCeiling{cur: 2}, table: table, want: trusted},
+		{name: "out-of-range ordinal -> table[0]", src: &fakeCeiling{cur: 99}, table: table, want: restrictive},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got := ceilingPostures{src: tt.src, table: tt.table}.current()
+			if !posturesEqual(got, tt.want) {
+				t.Errorf("current() = %+v, want %+v", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestDenyBeatsPosture pins the Stage-6.5 ordering: even with a PASSING interlock
+// and AutoApproveBash, a Stage-3 EffectChecker veto (deny/ask) and a Stage-6
+// session-policy deny still win. The control row proves the same setup WOULD
+// auto-approve absent a veto/deny — so the deny cases are genuinely overriding it.
+// (Stage-5 persisted deny shares reduceApprovalRecords with Stage 6, which is
+// representative.) Guards against a refactor that moves stagePosture earlier.
+func TestDenyBeatsPosture(t *testing.T) {
+	t.Parallel()
+	required := gA | gB
+	posture := Posture{AutoApproveBash: true, RequiredGuarantees: required, GrantCarryingAlwaysAsk: true}
+	runner := &fakeGuaranteeRunner{bits: required} // interlock PASSES.
+
+	tests := []struct {
+		name   string
+		tool   tool.InvokableTool
+		policy PermissionPolicy
+		want   loop.Effect
+	}{
+		{
+			name:   "control: no veto/deny -> posture auto-approves",
+			tool:   plainTool{name: toolBash},
+			policy: PermissionPolicy{},
+			want:   loop.EffectAutoApprove,
+		},
+		{
+			name:   "stage-3 EffectChecker deny beats posture",
+			tool:   staticEffect{name: toolBash, effect: loop.EffectDeny, handled: true},
+			policy: PermissionPolicy{},
+			want:   loop.EffectDeny,
+		},
+		{
+			name:   "stage-3 EffectChecker ask beats posture",
+			tool:   staticEffect{name: toolBash, effect: loop.EffectAsk, handled: true},
+			policy: PermissionPolicy{},
+			want:   loop.EffectAsk,
+		},
+		{
+			name:   "stage-6 session-policy deny beats posture",
+			tool:   plainTool{name: toolBash},
+			policy: PermissionPolicy{Policies: []loop.ToolPolicy{{Tool: toolBash, Effect: loop.EffectDeny}}},
+			want:   loop.EffectDeny,
+		},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			c := newPostureChecker(t, tt.policy, WithPosture(posture, runner))
+			got := c.Check(context.Background(), tt.tool, toolBash, `{"command":"echo hi"}`)
+			if got != tt.want {
+				t.Errorf("Check() = %v, want %v (a deny/veto must beat posture auto-approve)", got, tt.want)
+			}
+		})
 	}
 }

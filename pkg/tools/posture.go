@@ -60,6 +60,12 @@ type Posture struct {
 	// AutoApproveBash is false and TrivialBash is non-nil, only commands the
 	// classifier deems trivial auto-approve (and only when the interlock passes);
 	// every other command falls to Ask. nil means the slot is unused.
+	//
+	// CONCURRENCY CONTRACT: TrivialBash — like CeilingSource.Current and the
+	// runner's GuaranteeBits()/Level() probes — is invoked while the checker's mutex
+	// is held during Check. It must be cheap and pure and MUST NOT call back into
+	// Check (the mutex is non-reentrant → re-entry deadlocks; mirrors the Stage-3
+	// EffectChecker contract).
 	TrivialBash func(command string) bool
 
 	// GrantCarryingAlwaysAsk maps a grant-carrying call (a non-empty top-level
@@ -81,6 +87,11 @@ const fieldGrants = "grants"
 type CeilingSource interface {
 	// Current returns the live ceiling ordinal (0 = most restrictive). It is read
 	// on every Check, so a downgrade takes effect on the very next decision.
+	//
+	// CONCURRENCY CONTRACT: Current is invoked while the checker's mutex is held
+	// during Check — it must be cheap and MUST NOT call back into Check (the mutex
+	// is non-reentrant → re-entry deadlocks; mirrors the Stage-3 EffectChecker
+	// contract).
 	Current() uint8
 }
 
