@@ -10,11 +10,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/looprig/harness/pkg/command"
 	"github.com/looprig/core/content"
+	"github.com/looprig/core/uuid"
+	"github.com/looprig/harness/pkg/command"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/tool"
-	"github.com/looprig/core/uuid"
 )
 
 // ---------------------------------------------------------------------------
@@ -142,9 +142,10 @@ type fakePermissionGate struct {
 }
 
 type grantRecord struct {
-	name  string
-	args  string
-	scope tool.ApprovalScope
+	name      string
+	args      string
+	scope     tool.ApprovalScope
+	ctxGrants []string // grants tool.WithGrants placed on the ctx handed to Grant
 }
 
 func (g *fakePermissionGate) Check(ctx context.Context, t tool.InvokableTool, name, argsJSON string) Effect {
@@ -156,7 +157,7 @@ func (g *fakePermissionGate) Check(ctx context.Context, t tool.InvokableTool, na
 
 func (g *fakePermissionGate) Grant(ctx context.Context, name, argsJSON string, scope tool.ApprovalScope) error {
 	g.mu.Lock()
-	g.grants = append(g.grants, grantRecord{name: name, args: argsJSON, scope: scope})
+	g.grants = append(g.grants, grantRecord{name: name, args: argsJSON, scope: scope, ctxGrants: tool.GrantsFromContext(ctx)})
 	if g.granted == nil {
 		g.granted = map[string]bool{}
 	}
@@ -969,6 +970,124 @@ func TestRunBatch_ScopeOnceNoGrant(t *testing.T) {
 	gate.mu.Unlock()
 	if nGrants != 0 {
 		t.Errorf("Grant called %d times for ScopeOnce, want 0", nGrants)
+	}
+}
+
+// grantProbeTool records the escalation grants the runner placed on the per-call
+// ctx (tool.GrantsFromContext) at InvokableRun time, so a test can assert the
+// pre-ask approval's accepted grants reached the FIRST spawn's ctx.
+type grantProbeTool struct {
+	name    string
+	mu      sync.Mutex
+	seen    []string
+	sawCall bool
+}
+
+func (g *grantProbeTool) Info(ctx context.Context) (*tool.ToolInfo, error) {
+	return &tool.ToolInfo{Name: g.name}, nil
+}
+func (g *grantProbeTool) InvokableRun(ctx context.Context, argsJSON string) (*tool.ToolResult, error) {
+	g.mu.Lock()
+	g.seen = tool.GrantsFromContext(ctx)
+	g.sawCall = true
+	g.mu.Unlock()
+	return tool.TextResult("ran"), nil
+}
+func (g *grantProbeTool) grants() []string {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.seen
+}
+
+// approveWithGrants drives a single permission gate, replying with an
+// ApproveToolCall carrying the given AcceptedGrants at the given scope.
+func approveWithGrants(gateReg chan gateRegistration, scope tool.ApprovalScope, grants []string) {
+	go func() {
+		reg := <-gateReg
+		close(reg.ack)
+		reg.reply <- command.ApproveToolCall{
+			GateRoute:      command.GateRoute{ToolExecutionID: reg.callID},
+			Scope:          scope,
+			AcceptedGrants: grants,
+		}
+	}()
+}
+
+// TestRunBatch_PreAskGrantsReachFirstSpawnCtx: an ApproveToolCall carrying
+// AcceptedGrants places those opaque tokens on the FIRST spawn's per-call ctx (so
+// tool.GrantsFromContext returns them at InvokableRun — the pre-ask escalation is
+// applied without a run-fail-rerun), AND, for a non-Once scope, Grant is handed a
+// grant-bearing ctx so it can derive+persist the deltas.
+func TestRunBatch_PreAskGrantsReachFirstSpawnCtx(t *testing.T) {
+	t.Parallel()
+	probe := &grantProbeTool{name: "T"}
+	gate := &fakePermissionGate{checkFn: func(name, args string) Effect { return EffectAsk }}
+	ts := ToolSet{Permission: gate, Registry: []tool.InvokableTool{probe}, MaxParallelToolCalls: 4}
+	emit, _ := collectEmit()
+	gateReg := make(chan gateRegistration)
+	approveWithGrants(gateReg, tool.ScopeWorkspace, []string{"tok"})
+
+	results := RunBatch(context.Background(), []content.ToolUseBlock{call(t, "T", `{}`)}, ts, gateReg, uuid.New, emit)
+	if results[0].IsError {
+		t.Fatalf("result = %+v, want success", results[0])
+	}
+	if got := probe.grants(); len(got) != 1 || got[0] != "tok" {
+		t.Errorf("per-call ctx grants = %#v, want [\"tok\"]", got)
+	}
+	// The grant-bearing ctx reached Grant so it can persist the deltas.
+	gate.mu.Lock()
+	defer gate.mu.Unlock()
+	if len(gate.grants) != 1 {
+		t.Fatalf("Grant called %d times, want 1", len(gate.grants))
+	}
+	if g := gate.grants[0].ctxGrants; len(g) != 1 || g[0] != "tok" {
+		t.Errorf("Grant received ctx grants = %#v, want [\"tok\"]", g)
+	}
+}
+
+// TestRunBatch_PreAskGrantsOnceNoPersist: a Once-scope approval carrying
+// AcceptedGrants still delivers the grants to the per-call ctx (the single spawn is
+// escalated), but Grant is NOT called (Once persists nothing).
+func TestRunBatch_PreAskGrantsOnceNoPersist(t *testing.T) {
+	t.Parallel()
+	probe := &grantProbeTool{name: "T"}
+	gate := &fakePermissionGate{checkFn: func(name, args string) Effect { return EffectAsk }}
+	ts := ToolSet{Permission: gate, Registry: []tool.InvokableTool{probe}, MaxParallelToolCalls: 4}
+	emit, _ := collectEmit()
+	gateReg := make(chan gateRegistration)
+	approveWithGrants(gateReg, tool.ScopeOnce, []string{"tok"})
+
+	results := RunBatch(context.Background(), []content.ToolUseBlock{call(t, "T", `{}`)}, ts, gateReg, uuid.New, emit)
+	if results[0].IsError {
+		t.Fatalf("result = %+v, want success", results[0])
+	}
+	if got := probe.grants(); len(got) != 1 || got[0] != "tok" {
+		t.Errorf("per-call ctx grants = %#v, want [\"tok\"] even for Once scope", got)
+	}
+	gate.mu.Lock()
+	defer gate.mu.Unlock()
+	if len(gate.grants) != 0 {
+		t.Errorf("Grant called %d times for ScopeOnce, want 0", len(gate.grants))
+	}
+}
+
+// TestRunBatch_NoGrantsCtxClean: a grant-free approval leaves the per-call ctx with
+// no grants (GrantsFromContext returns nil) — the pre-ask path is purely additive.
+func TestRunBatch_NoGrantsCtxClean(t *testing.T) {
+	t.Parallel()
+	probe := &grantProbeTool{name: "T"}
+	gate := &fakePermissionGate{checkFn: func(name, args string) Effect { return EffectAsk }}
+	ts := ToolSet{Permission: gate, Registry: []tool.InvokableTool{probe}, MaxParallelToolCalls: 4}
+	emit, _ := collectEmit()
+	gateReg := make(chan gateRegistration)
+	approveWithGrants(gateReg, tool.ScopeWorkspace, nil)
+
+	results := RunBatch(context.Background(), []content.ToolUseBlock{call(t, "T", `{}`)}, ts, gateReg, uuid.New, emit)
+	if results[0].IsError {
+		t.Fatalf("result = %+v, want success", results[0])
+	}
+	if got := probe.grants(); got != nil {
+		t.Errorf("per-call ctx grants = %#v, want nil for a grant-free approval", got)
 	}
 }
 

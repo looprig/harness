@@ -77,11 +77,20 @@ type HardDenyRules struct {
 // command (Bash), or the "METHOD scheme://host[path]" grammar (Fetch). An empty
 // Match means "all calls of this tool". Prefix is the Bash-only, hand-edited,
 // risky opt-in to prefix (rather than exact) command matching.
+//
+// GrantDeltas are the MAC-verified escalation delta DESCRIPTIONS (sorted, deduped)
+// this approval was granted with — the DescribeGrant output for the accepted
+// tokens, NEVER the single-mint tokens themselves (SPEC §9.3/§10.7). A record WITH
+// GrantDeltas matches only a grant-bearing call whose delta set equals it; a record
+// WITHOUT them matches only grant-free calls. omitempty keeps a grant-free record
+// byte-identical to the pre-Grants on-disk shape; the tag "grant_deltas" must NOT
+// be renamed (durable wire form).
 type ApprovalRecord struct {
-	Tool   string      `json:"tool"`
-	Match  string      `json:"match,omitempty"`
-	Prefix bool        `json:"prefix,omitempty"`
-	Effect loop.Effect `json:"effect"`
+	Tool        string      `json:"tool"`
+	Match       string      `json:"match,omitempty"`
+	Prefix      bool        `json:"prefix,omitempty"`
+	Effect      loop.Effect `json:"effect"`
+	GrantDeltas []string    `json:"grant_deltas,omitempty"`
 }
 
 // ApprovalsFile is the on-disk approvals document. Version pins the schema so a

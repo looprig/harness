@@ -38,8 +38,32 @@ func clonePolicy(p PermissionPolicy) PermissionPolicy {
 	p.Policies = slices.Clone(p.Policies)
 	for i := range p.Policies {
 		p.Policies[i].Match = slices.Clone(p.Policies[i].Match)
+		p.Policies[i].GrantDeltas = slices.Clone(p.Policies[i].GrantDeltas)
 	}
 	return p
+}
+
+// TestPolicyFingerprint_GrantDeltasCanonical proves GrantDeltas are canonicalized
+// like Match: two policies differing only in delta ORDER digest equally, while a
+// difference in delta CONTENT digests differently (so a grant restores only under a
+// matching delta set).
+func TestPolicyFingerprint_GrantDeltasCanonical(t *testing.T) {
+	t.Parallel()
+	base, mode := fingerprintBase()
+
+	a := clonePolicy(base)
+	a.Policies[0].GrantDeltas = []string{"egress", "fs-write"}
+	b := clonePolicy(base)
+	b.Policies[0].GrantDeltas = []string{"fs-write", "egress"} // reorder → same
+	c := clonePolicy(base)
+	c.Policies[0].GrantDeltas = []string{"egress"} // different content → differ
+
+	if PolicyFingerprint(a, mode) != PolicyFingerprint(b, mode) {
+		t.Errorf("GrantDeltas reorder changed the digest (must be canonicalized)")
+	}
+	if PolicyFingerprint(a, mode) == PolicyFingerprint(c, mode) {
+		t.Errorf("different GrantDeltas produced the same digest (must be enforcement-affecting)")
+	}
 }
 
 // TestPolicyFingerprint_StableAndSensitive locks the digest contract field-by-field:
@@ -82,6 +106,8 @@ func TestPolicyFingerprint_StableAndSensitive(t *testing.T) {
 	reorderPolicies.Policies[0], reorderPolicies.Policies[1] = reorderPolicies.Policies[1], reorderPolicies.Policies[0]
 	reorderMatch := clonePolicy(base)
 	reorderMatch.Policies[0].Match = []string{"go build", "go test"}
+	addGrantDeltas := clonePolicy(base)
+	addGrantDeltas.Policies[0].GrantDeltas = []string{"egress"}
 
 	tests := []struct {
 		name     string
@@ -103,6 +129,7 @@ func TestPolicyFingerprint_StableAndSensitive(t *testing.T) {
 		{"Policy Match change changes", changeMatch, baseMode, false},
 		{"Policies reorder is same", reorderPolicies, baseMode, true},
 		{"Policy Match reorder is same", reorderMatch, baseMode, true},
+		{"Policy GrantDeltas add changes", addGrantDeltas, baseMode, false},
 	}
 	for _, tt := range tests {
 		tt := tt
@@ -122,7 +149,7 @@ func TestPolicyFingerprint_StableAndSensitive(t *testing.T) {
 // policy).
 func TestPolicyFingerprint_Golden(t *testing.T) {
 	t.Parallel()
-	const want = "a43ef08e25059e77060a47b27f2321d1e3493848159d78c6c78411f8c366da66"
+	const want = "9b2cc68dc37ccc82398599a717857e19e28cb2ee6b6390f2c3aa75d7de877528"
 	base, baseMode := fingerprintBase()
 	got := PolicyFingerprint(base, baseMode)
 	if got != want {

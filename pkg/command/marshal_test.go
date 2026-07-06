@@ -4,12 +4,13 @@ import (
 	"encoding/json"
 	"errors"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/looprig/core/content"
+	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/tool"
-	"github.com/looprig/core/uuid"
 )
 
 // seededUUID builds a deterministic non-zero uuid from a single seed byte so the
@@ -405,6 +406,83 @@ func FuzzDecodeCommand(f *testing.F) {
 			t.Errorf("UnmarshalCommand returned nil command with nil error for input %q", data)
 		}
 	})
+}
+
+// grantFreeApproveWire is the byte-exact durable wire form of a fully-populated
+// grant-FREE ApproveToolCall (Scope=ScopeWorkspace, no AcceptedGrants). Adding the
+// AcceptedGrants field (json:"accepted_grants,omitempty") MUST leave this byte
+// stream unchanged — an old journal record and a new grant-free command marshal
+// identically. If this drifts, the omitempty was dropped or a field was renamed;
+// fix the code, never silently repin (old journals carry the old bytes).
+const grantFreeApproveWire = `{"agency":1,"cause":{"session_id":"22222222-2222-2222-2222-222222222222","loop_id":"33333333-3333-3333-3333-333333333333","command_id":"44444444-4444-4444-4444-444444444444","event_id":"55555555-5555-5555-5555-555555555555","tool_execution_id":"66666666-6666-6666-6666-666666666666","agency":1},"command_id":"11111111-1111-1111-1111-111111111111","loop_id":"33333333-3333-3333-3333-333333333333","scope":2,"tool_execution_id":"77777777-7777-7777-7777-777777777777","type":"ApproveToolCall","v":1}`
+
+// goldenApprove is the fixed, fully-populated grant-FREE ApproveToolCall whose wire
+// form grantFreeApproveWire pins.
+func goldenApprove() ApproveToolCall {
+	return ApproveToolCall{
+		Header:    fullHeader(),
+		GateRoute: GateRoute{Coordinates: identity.Coordinates{LoopID: seededUUID(0x33)}, ToolExecutionID: seededUUID(0x77)},
+		Scope:     tool.ScopeWorkspace,
+	}
+}
+
+// TestApproveToolCall_GrantFreeByteIdentical proves a grant-free ApproveToolCall
+// marshals byte-identically to its pre-AcceptedGrants wire form (the omitempty
+// field is absent), so introducing pre-ask grants does not break durable restore
+// of an existing intent-log record.
+func TestApproveToolCall_GrantFreeByteIdentical(t *testing.T) {
+	t.Parallel()
+	data, err := MarshalCommand(goldenApprove())
+	if err != nil {
+		t.Fatalf("MarshalCommand: %v", err)
+	}
+	if string(data) != grantFreeApproveWire {
+		t.Errorf("grant-free ApproveToolCall wire drifted:\n got = %s\nwant = %s", data, grantFreeApproveWire)
+	}
+	if strings.Contains(string(data), "accepted_grants") {
+		t.Errorf("grant-free wire must not carry the accepted_grants key: %s", data)
+	}
+}
+
+// TestApproveToolCall_WithGrantsRoundTrip proves an ApproveToolCall carrying
+// AcceptedGrants round-trips deep-equal (the accepted tokens survive the durable
+// codec), and the key appears on the wire when non-empty.
+func TestApproveToolCall_WithGrantsRoundTrip(t *testing.T) {
+	t.Parallel()
+	orig := goldenApprove()
+	orig.AcceptedGrants = []string{"tok-egress", "tok-fswrite"}
+	data, err := MarshalCommand(orig)
+	if err != nil {
+		t.Fatalf("MarshalCommand: %v", err)
+	}
+	if !strings.Contains(string(data), "accepted_grants") {
+		t.Errorf("with-grants wire must carry the accepted_grants key: %s", data)
+	}
+	got, err := UnmarshalCommand(data)
+	if err != nil {
+		t.Fatalf("UnmarshalCommand: %v\nwire: %s", err, data)
+	}
+	if !reflect.DeepEqual(got, orig) {
+		t.Errorf("with-grants round-trip mismatch:\n got = %#v\nwant = %#v\nwire: %s", got, orig, data)
+	}
+}
+
+// TestApproveToolCall_OldCommandDecodesNilGrants proves a pre-existing command with
+// NO accepted_grants key decodes to a nil AcceptedGrants (backward compatibility:
+// old journals never wrote the field).
+func TestApproveToolCall_OldCommandDecodesNilGrants(t *testing.T) {
+	t.Parallel()
+	got, err := UnmarshalCommand([]byte(grantFreeApproveWire))
+	if err != nil {
+		t.Fatalf("UnmarshalCommand(old wire): %v", err)
+	}
+	atc, ok := got.(ApproveToolCall)
+	if !ok {
+		t.Fatalf("decoded %T, want ApproveToolCall", got)
+	}
+	if atc.AcceptedGrants != nil {
+		t.Errorf("AcceptedGrants = %#v, want nil for an old command", atc.AcceptedGrants)
+	}
 }
 
 // isTypedDecodeError reports whether err is one of the codec's concrete error

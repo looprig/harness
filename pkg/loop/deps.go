@@ -106,10 +106,17 @@ func (e *Effect) UnmarshalJSON(b []byte) error {
 // ToolPolicy is a single user-editable approval rule. Match is tool-interpreted
 // (path glob for file tools, the EXACT command for Bash, or "METHOD scheme://host"
 // for Fetch); an empty Match means "all calls to this tool".
+//
+// GrantDeltas are the MAC-verified escalation delta DESCRIPTIONS (sorted, deduped)
+// bound to this approval when it was granted for a grant-carrying call (SPEC §9.3).
+// They are DESCRIPTIONS, never the single-mint tokens. A policy WITH GrantDeltas
+// matches only a grant-bearing call whose delta set equals it; a policy WITHOUT
+// them matches only grant-free calls. Empty for the common (grant-free) grant.
 type ToolPolicy struct {
-	Tool   string
-	Effect Effect
-	Match  []string
+	Tool        string
+	Effect      Effect
+	Match       []string
+	GrantDeltas []string
 }
 
 // PermissionGate is the runner's view of permission checking. It is satisfied by

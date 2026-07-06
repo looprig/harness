@@ -3,6 +3,7 @@ package tools
 import (
 	"context"
 	"path/filepath"
+	"slices"
 
 	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/harness/pkg/tool"
@@ -36,21 +37,61 @@ func (c *PermissionChecker) Grant(ctx context.Context, toolName, argsJSON string
 	if err != nil {
 		return err
 	}
+	// A pre-ask approval places the accepted escalation grant TOKENS on the ctx
+	// (tool.WithGrants). Derive the MAC-verified delta DESCRIPTIONS to persist —
+	// never the single-mint tokens (SPEC §9.3/§10.7). Empty for a grant-free grant.
+	deltas := c.deriveGrantDeltas(tool.GrantsFromContext(ctx))
 
 	switch scope {
 	case tool.ScopeSession:
 		c.appendSessionPolicy(loop.ToolPolicy{
-			Tool:   toolName,
-			Effect: loop.EffectAutoApprove,
-			Match:  matchSlice(match),
+			Tool:        toolName,
+			Effect:      loop.EffectAutoApprove,
+			Match:       matchSlice(match),
+			GrantDeltas: deltas,
 		})
 		return nil
 	case tool.ScopeWorkspace:
-		return c.grantWorkspace(ctx, toolName, match)
+		return c.grantWorkspace(ctx, toolName, match, deltas)
 	default:
 		// ScopeOnce or any out-of-range value: never persist (fail-secure).
 		return &UnsupportedScopeError{Scope: uint8(scope)}
 	}
+}
+
+// deriveGrantDeltas MAC-verifies each accepted grant token against the held runner
+// and returns the SORTED, DEDUPED delta DESCRIPTIONS to persist. It probes c.runner
+// STRUCTURALLY for DescribeGrant (harness never imports sandbox, §10.1); a runner
+// that is nil or does not describe grants yields NO deltas (so an undescribable
+// token is never stored as an unverified delta). A token whose DescribeGrant returns
+// ok==false is fabricated/tampered/expired and is SKIPPED — never persisted (SPEC
+// §10.7 fail-secure). The persisted record stores these DESCRIPTIONS, never the
+// single-mint tokens.
+func (c *PermissionChecker) deriveGrantDeltas(tokens []string) []string {
+	if len(tokens) == 0 {
+		return nil
+	}
+	dg, ok := c.runner.(interface {
+		DescribeGrant(token string) (string, bool)
+	})
+	if !ok {
+		return nil // no MAC-verifier → cannot verify any delta; persist none.
+	}
+	seen := make(map[string]struct{}, len(tokens))
+	var deltas []string
+	for _, tok := range tokens {
+		desc, ok := dg.DescribeGrant(tok)
+		if !ok {
+			continue // unverifiable token → never persist as a delta.
+		}
+		if _, dup := seen[desc]; dup {
+			continue
+		}
+		seen[desc] = struct{}{}
+		deltas = append(deltas, desc)
+	}
+	slices.Sort(deltas)
+	return deltas
 }
 
 // matchSlice maps a derived Match string to a ToolPolicy.Match slice: an empty
@@ -69,7 +110,7 @@ func matchSlice(match string) []string {
 // dirs 0700, loads the existing records, appends the new allow, and atomically
 // rewrites the whole file 0600. Any failure is a typed *PolicyStoreError and
 // leaves nothing half-written in the wrong place (fail-secure).
-func (c *PermissionChecker) grantWorkspace(ctx context.Context, toolName, match string) error {
+func (c *PermissionChecker) grantWorkspace(ctx context.Context, toolName, match string, deltas []string) error {
 	home, err := c.resolveHomeForWrite()
 	if err != nil {
 		return err
@@ -109,7 +150,7 @@ func (c *PermissionChecker) grantWorkspace(ctx context.Context, toolName, match 
 
 	af := ApprovalsFile{
 		Version:   1,
-		Approvals: append(existing, ApprovalRecord{Tool: toolName, Match: match, Effect: loop.EffectAutoApprove}),
+		Approvals: append(existing, ApprovalRecord{Tool: toolName, Match: match, Effect: loop.EffectAutoApprove, GrantDeltas: deltas}),
 	}
 	return writeApprovalsFileAtomically(dir, finalPath, af)
 }

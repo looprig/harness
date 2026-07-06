@@ -1,8 +1,8 @@
 package command
 
 import (
-	"github.com/looprig/harness/pkg/tool"
 	"github.com/looprig/core/uuid"
+	"github.com/looprig/harness/pkg/tool"
 )
 
 // ApproveToolCall approves a pending tool call identified by ToolExecutionID, granting it
@@ -16,6 +16,21 @@ type ApproveToolCall struct {
 	// pending gate (ToolExecutionID), which the actor matches against.
 	GateRoute
 	Scope tool.ApprovalScope `json:"scope,omitzero"`
+
+	// AcceptedGrants carries the opaque escalation grant TOKENS the operator
+	// accepted by approving this call — the same tokens shown as GrantDisplay in
+	// the permission prompt (SPEC §9.3, §10.7). The runner places them on the
+	// FIRST spawn's per-call ctx so the delta is applied without a run-fail-rerun,
+	// and hands the grant-bearing ctx to Permission.Grant so a non-Once approval
+	// persists the MAC-verified grant DELTA DESCRIPTIONS (never the single-mint
+	// tokens). The tokens themselves are opaque: harness carries them, never mints
+	// or interprets them.
+	//
+	// omitempty keeps a grant-free ApproveToolCall byte-identical to the
+	// pre-Grants wire form (durable backward compatibility): an old journal record
+	// decodes with a nil AcceptedGrants, and a grant-free command marshals without
+	// the key. The tag "accepted_grants" must NOT be renamed (SPEC §10.7).
+	AcceptedGrants []string `json:"accepted_grants,omitempty"`
 }
 
 func (ApproveToolCall) isCommand() {}

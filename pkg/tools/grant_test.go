@@ -6,11 +6,188 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
+	"strings"
 	"testing"
 
 	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/harness/pkg/tool"
 )
+
+// fakeDescribeRunner is a tool.CommandRunner that ALSO MAC-verifies grant tokens
+// via DescribeGrant — the structural capability Grant probes to derive the delta
+// DESCRIPTIONS it persists (harness never imports sandbox). desc maps a token → its
+// bound description; a token ABSENT from desc fails verification (ok==false),
+// modelling a fabricated/tampered/expired token that must never be persisted.
+type fakeDescribeRunner struct {
+	desc map[string]string
+}
+
+func (f *fakeDescribeRunner) RunCommand(context.Context, string, string) ([]byte, int, error) {
+	return nil, 0, nil
+}
+
+func (f *fakeDescribeRunner) DescribeGrant(token string) (string, bool) {
+	d, ok := f.desc[token]
+	return d, ok
+}
+
+var _ tool.CommandRunner = (*fakeDescribeRunner)(nil)
+
+// lastSessionPolicy returns the most-recently-appended in-memory session policy.
+func lastSessionPolicy(t *testing.T, pc *PermissionChecker) loop.ToolPolicy {
+	t.Helper()
+	pc.mu.Lock()
+	defer pc.mu.Unlock()
+	if len(pc.policy.Policies) == 0 {
+		t.Fatal("no session policy was appended")
+	}
+	return pc.policy.Policies[len(pc.policy.Policies)-1]
+}
+
+// assertNoTokens fails if any raw token string appears anywhere in the JSON
+// serialization of v (proving the single-mint tokens are NEVER persisted).
+func assertNoTokens(t *testing.T, v any, tokens []string) {
+	t.Helper()
+	b, err := json.Marshal(v)
+	if err != nil {
+		t.Fatalf("marshal for token scan: %v", err)
+	}
+	for _, tok := range tokens {
+		if strings.Contains(string(b), tok) {
+			t.Errorf("persisted record leaks grant token %q: %s", tok, b)
+		}
+	}
+}
+
+// TestGrantSessionPersistsGrantDeltas proves a ScopeSession Grant carrying grant
+// tokens on the ctx persists the MAC-verified delta DESCRIPTIONS (sorted, deduped)
+// on the in-memory ToolPolicy — and NEVER the tokens. A token that DescribeGrant
+// rejects is skipped (not persisted as an unverified delta).
+func TestGrantSessionPersistsGrantDeltas(t *testing.T) {
+	t.Parallel()
+	ws := newWS(t)
+	home := t.TempDir()
+	runner := &fakeDescribeRunner{desc: map[string]string{"tokA": "egress", "tokB": "egress", "tokC": "fs-write"}}
+	pc, err := NewPermissionChecker(
+		PermissionPolicy{WorkspaceRoot: ws, HardDeny: DefaultHardDeny()},
+		WithHomeDir(func() (string, error) { return home, nil }),
+		WithPosture(Posture{}, runner),
+	)
+	if err != nil {
+		t.Fatalf("NewPermissionChecker: %v", err)
+	}
+
+	// tokC→fs-write, tokA/tokB→egress (dup), tokBad→unverifiable (skipped).
+	ctx := tool.WithGrants(context.Background(), []string{"tokC", "tokA", "tokB", "tokBad"})
+	if err := pc.Grant(ctx, "Bash", `{"command":"git push"}`, tool.ScopeSession); err != nil {
+		t.Fatalf("Grant(ScopeSession): %v", err)
+	}
+
+	pol := lastSessionPolicy(t, pc)
+	want := []string{"egress", "fs-write"}
+	if !slices.Equal(pol.GrantDeltas, want) {
+		t.Errorf("GrantDeltas = %#v, want %#v (sorted, deduped, unverified skipped)", pol.GrantDeltas, want)
+	}
+	assertNoTokens(t, pol, []string{"tokA", "tokB", "tokC", "tokBad"})
+}
+
+// TestGrantWorkspacePersistsGrantDeltas proves a ScopeWorkspace Grant carrying grant
+// tokens persists the delta DESCRIPTIONS on the on-disk ApprovalRecord, and that NO
+// token string ever reaches the file bytes.
+func TestGrantWorkspacePersistsGrantDeltas(t *testing.T) {
+	t.Parallel()
+	ws := newWS(t)
+	home := t.TempDir()
+	runner := &fakeDescribeRunner{desc: map[string]string{"tokA": "egress", "tokC": "fs-write"}}
+	pc, err := NewPermissionChecker(
+		PermissionPolicy{WorkspaceRoot: ws, HardDeny: DefaultHardDeny()},
+		WithHomeDir(func() (string, error) { return home, nil }),
+		WithPosture(Posture{}, runner),
+	)
+	if err != nil {
+		t.Fatalf("NewPermissionChecker: %v", err)
+	}
+
+	ctx := tool.WithGrants(context.Background(), []string{"tokC", "tokA"})
+	if err := pc.Grant(ctx, "Bash", `{"command":"git push"}`, tool.ScopeWorkspace); err != nil {
+		t.Fatalf("Grant(ScopeWorkspace): %v", err)
+	}
+
+	wsFile := wsApprovalsPathFor(t, home, ws)
+	raw, err := os.ReadFile(wsFile) // #nosec G304 -- test fixture under t.TempDir().
+	if err != nil {
+		t.Fatalf("read approvals file: %v", err)
+	}
+	for _, tok := range []string{"tokA", "tokC"} {
+		if strings.Contains(string(raw), tok) {
+			t.Errorf("approvals file leaks grant token %q: %s", tok, raw)
+		}
+	}
+	af := readApprovalsFile(t, wsFile)
+	if len(af.Approvals) != 1 {
+		t.Fatalf("approvals len = %d, want 1", len(af.Approvals))
+	}
+	rec := af.Approvals[0]
+	want := []string{"egress", "fs-write"}
+	if !slices.Equal(rec.GrantDeltas, want) {
+		t.Errorf("record GrantDeltas = %#v, want %#v", rec.GrantDeltas, want)
+	}
+}
+
+// TestGrantNoDescribeRunnerPersistsNoDeltas proves that with tokens on the ctx but a
+// runner that cannot DescribeGrant (a plain CommandRunner), NO delta is persisted —
+// an undescribable token is never stored as an unverified delta (fail-secure).
+func TestGrantNoDescribeRunnerPersistsNoDeltas(t *testing.T) {
+	t.Parallel()
+	ws := newWS(t)
+	home := t.TempDir()
+	pc, err := NewPermissionChecker(
+		PermissionPolicy{WorkspaceRoot: ws, HardDeny: DefaultHardDeny()},
+		WithHomeDir(func() (string, error) { return home, nil }),
+		WithPosture(Posture{}, &fakeCommandRunner{}), // RunCommand-only: no DescribeGrant.
+	)
+	if err != nil {
+		t.Fatalf("NewPermissionChecker: %v", err)
+	}
+	ctx := tool.WithGrants(context.Background(), []string{"tokA"})
+	if err := pc.Grant(ctx, "Bash", `{"command":"git push"}`, tool.ScopeSession); err != nil {
+		t.Fatalf("Grant: %v", err)
+	}
+	if d := lastSessionPolicy(t, pc).GrantDeltas; len(d) != 0 {
+		t.Errorf("GrantDeltas = %#v, want empty (no DescribeGrant capability)", d)
+	}
+}
+
+// TestDeltalessRecordRejectsGrantCarryingCall proves the grant-delta match shape: a
+// persisted DELTALESS allow record auto-approves a grant-FREE call (as before) but
+// NEVER a grant-carrying call (an escalation must be human-reviewed — the record
+// carries no matching deltas).
+func TestDeltalessRecordRejectsGrantCarryingCall(t *testing.T) {
+	t.Parallel()
+	ws := newWS(t)
+	home := t.TempDir()
+	pc, err := NewPermissionChecker(
+		PermissionPolicy{WorkspaceRoot: ws, HardDeny: DefaultHardDeny()},
+		WithHomeDir(func() (string, error) { return home, nil }),
+	)
+	if err != nil {
+		t.Fatalf("NewPermissionChecker: %v", err)
+	}
+	// A grant-free session grant persists a DELTALESS allow for Bash "git push".
+	if err := pc.Grant(context.Background(), "Bash", `{"command":"git push"}`, tool.ScopeSession); err != nil {
+		t.Fatalf("Grant: %v", err)
+	}
+
+	// Grant-free call: still auto-approved by the deltaless record.
+	if got := pc.Check(context.Background(), plainTool{name: toolBash}, toolBash, `{"command":"git push"}`); got != loop.EffectAutoApprove {
+		t.Errorf("grant-free Check = %v, want EffectAutoApprove", got)
+	}
+	// Grant-carrying call: the deltaless record must NOT auto-approve it.
+	if got := pc.Check(context.Background(), plainTool{name: toolBash}, toolBash, `{"command":"git push","grants":["tok"]}`); got != loop.EffectAsk {
+		t.Errorf("grant-carrying Check = %v, want EffectAsk (deltaless record must not auto-approve an escalation)", got)
+	}
+}
 
 // grant_test.go exercises the WRITE side of the policy store: Grant's per-scope
 // behaviour (session append, out-of-repo workspace write, ScopeOnce no-op),

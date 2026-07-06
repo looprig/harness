@@ -8,11 +8,11 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/looprig/harness/pkg/command"
 	"github.com/looprig/core/content"
+	"github.com/looprig/core/uuid"
+	"github.com/looprig/harness/pkg/command"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/tool"
-	"github.com/looprig/core/uuid"
 )
 
 // runner.go is the heart of the agentic loop: RunBatch resolves permissions
@@ -81,6 +81,14 @@ type resolved struct {
 	// and threaded to BOTH the permission decision (buildRequest) and execution
 	// (the per-call ctx in runOne). nil for non-Preparer tools.
 	prepared tool.PreparedArtifact
+
+	// grants are the opaque escalation grant TOKENS an ApproveToolCall carried
+	// (its AcceptedGrants). applyDecision records them here; runOne nests them onto
+	// the per-call ctx via tool.WithGrants so the FIRST spawn's InvokableRun reads
+	// them back (pre-ask escalation with no run-fail-rerun). nil when the approval
+	// carried no grants (the common case). The tokens stay opaque — harness only
+	// carries them from the approval to execution and to Grant.
+	grants []string
 
 	// failed marks a pre-execution failure (unknown tool, invalid args,
 	// permission denied, WriteTarget error). Its result is fixed before any
@@ -371,8 +379,15 @@ func applyDecision(ctx context.Context, r *resolved, ts ToolSet, cmd command.Com
 			r.fail(errPermissionDenied)
 			return nil
 		}
+		// Pre-ask grant flow (SPEC §9.3): the operator's approval carries the
+		// accepted escalation grant TOKENS. Record them on resolved so runOne places
+		// them on the FIRST spawn's per-call ctx (the escalation is applied without a
+		// run-fail-rerun). For a non-Once scope, hand Grant a grant-BEARING ctx so it
+		// can MAC-verify the tokens and persist the grant DELTAS (never the tokens).
+		r.grants = c.AcceptedGrants
 		if c.Scope != tool.ScopeOnce {
-			if err := ts.Permission.Grant(ctx, r.block.Name, r.argsstr, c.Scope); err != nil {
+			grantCtx := tool.WithGrants(ctx, c.AcceptedGrants)
+			if err := ts.Permission.Grant(grantCtx, r.block.Name, r.argsstr, c.Scope); err != nil {
 				slog.Warn("loop: permission grant did not persist; proceeding with approved call",
 					"tool", r.block.Name, "scope", c.Scope, "error", err)
 			}
@@ -483,6 +498,13 @@ func runOne(
 	emit func(event.Event),
 ) (res result) {
 	ctx2 := WithPrepared(withGateReg(withEmit(withToolUseID(withCallID(ctx, r.callID), r.block.ID), emit), gateReg), r.prepared)
+	// Nest any pre-ask escalation grants onto the per-call ctx so the tool's
+	// InvokableRun reads them via tool.GrantsFromContext (feeding the merge with the
+	// tool's own arg-borne grants). Only when present, so a grant-free call's ctx is
+	// untouched.
+	if len(r.grants) > 0 {
+		ctx2 = tool.WithGrants(ctx2, r.grants)
+	}
 
 	defer func() {
 		if rec := recover(); rec != nil {

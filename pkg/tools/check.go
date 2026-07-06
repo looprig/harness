@@ -564,16 +564,18 @@ func (c *PermissionChecker) stageSessionPolicies(toolName string, class toolClas
 
 // sessionPoliciesToRecords flattens session ToolPolicies into ApprovalRecords. A
 // policy with no Match becomes a single empty-Match (all-calls) record; a policy
-// with N matches becomes N records sharing the policy's tool+effect.
+// with N matches becomes N records sharing the policy's tool+effect. The policy's
+// GrantDeltas ride onto every projected record so the grant-delta match shape
+// applies uniformly to session grants.
 func sessionPoliciesToRecords(policies []loop.ToolPolicy) []ApprovalRecord {
 	var out []ApprovalRecord
 	for _, p := range policies {
 		if len(p.Match) == 0 {
-			out = append(out, ApprovalRecord{Tool: p.Tool, Effect: p.Effect})
+			out = append(out, ApprovalRecord{Tool: p.Tool, Effect: p.Effect, GrantDeltas: p.GrantDeltas})
 			continue
 		}
 		for _, m := range p.Match {
-			out = append(out, ApprovalRecord{Tool: p.Tool, Match: m, Effect: p.Effect})
+			out = append(out, ApprovalRecord{Tool: p.Tool, Match: m, Effect: p.Effect, GrantDeltas: p.GrantDeltas})
 		}
 	}
 	return out
@@ -608,14 +610,48 @@ func reduceApprovalRecords(records []ApprovalRecord, match recordPredicate) (loo
 	return loop.EffectAsk, false
 }
 
-// recordMatcher builds the per-call predicate that decides whether a stored
+// recordMatcher builds the per-call predicate, layering the grant-delta MATCH SHAPE
+// (SPEC §9.3/§10.7) over the per-class Tool+Match predicate:
+//
+//   - a DENY record always applies (deny-beats-everything, never weakened by grants):
+//     an explicit deny must still block a grant-carrying call.
+//   - an ALLOW record WITHOUT GrantDeltas matches ONLY a grant-free call, so a
+//     stored deltaless allow can never auto-approve an escalation.
+//   - an ALLOW record WITH GrantDeltas matches ONLY a grant-bearing call whose delta
+//     set equals it. Computing the live call's required deltas and re-minting fresh
+//     single-mint tokens onto the per-call ctx is Task 17d; until then a
+//     delta-bearing allow does not auto-match (fail-secure toward Ask).
+//
+// A live call is grant-carrying when its args carry a non-empty top-level "grants"
+// array (hasGrants) — the same signal Stage 6.5 uses.
+func (c *PermissionChecker) recordMatcher(toolName string, class toolClass, argsJSON string) recordPredicate {
+	base := c.baseRecordMatcher(toolName, class, argsJSON)
+	callHasGrants := hasGrants(argsJSON)
+	return func(rec ApprovalRecord) bool {
+		if !base(rec) {
+			return false
+		}
+		if rec.Effect == loop.EffectDeny {
+			return true // a deny is never weakened by the grant-delta shape.
+		}
+		if len(rec.GrantDeltas) == 0 {
+			return !callHasGrants // a deltaless allow never auto-approves an escalation.
+		}
+		// TODO(Task 17d): compare rec.GrantDeltas to the live call's required delta
+		// set and, on a match, re-mint fresh grant tokens onto the per-call ctx.
+		// Until then a delta-bearing allow declines to auto-match (fail-secure).
+		return false
+	}
+}
+
+// baseRecordMatcher builds the per-call predicate that decides whether a stored
 // record's Tool+Match applies to this live call. A record matches only if its
 // Tool equals toolName; the Match interpretation is per the tool's class (file
 // glob on the ws-relative path, exact/prefix Bash, Fetch grammar, WebSearch
 // tool-level). An empty Match means "all calls of this tool". Any extraction
 // failure makes the predicate reject every record (fail-secure: no match → no
 // approval), so an unparseable live call can never be matched by a stored allow.
-func (c *PermissionChecker) recordMatcher(toolName string, class toolClass, argsJSON string) recordPredicate {
+func (c *PermissionChecker) baseRecordMatcher(toolName string, class toolClass, argsJSON string) recordPredicate {
 	switch class {
 	case classRead, classWrite, classUnknown:
 		return c.pathRecordMatcher(toolName, readOrWriteBoundaryField(toolName, class), argsJSON)
