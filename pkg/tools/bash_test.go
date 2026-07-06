@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -187,6 +188,163 @@ func TestBashBuildRequest(t *testing.T) {
 	}
 	if _, err := NewBash(t.TempDir()).BuildRequest(`not json`, nil); err == nil {
 		t.Errorf("BuildRequest(bad json) err = nil, want non-nil")
+	}
+}
+
+// plainRunner is a bare tool.CommandRunner with NO escalation-planner methods. The
+// Bash tool's structural probe must find it is not a planner and plan no grants.
+type plainRunner struct{}
+
+func (plainRunner) RunCommand(context.Context, string, string) ([]byte, int, error) {
+	return nil, 0, nil
+}
+
+// fakeGrantRunner is a test double implementing tool.CommandRunner plus the
+// structural PlanGrants/DescribeGrant escalation-planner methods the Bash tool
+// probes for (no sandbox import). plan maps a command to the candidate tokens
+// PlanGrants mints; describe maps a token to its bound description — a token ABSENT
+// from describe returns (,false), simulating a fabricated/tampered token that fails
+// MAC verification. gotDir records the last dir PlanGrants was called with so a test
+// can assert dir derivation.
+type fakeGrantRunner struct {
+	plan     map[string][]string
+	describe map[string]string
+	gotDir   string
+}
+
+func (f *fakeGrantRunner) RunCommand(context.Context, string, string) ([]byte, int, error) {
+	return nil, 0, nil
+}
+
+func (f *fakeGrantRunner) PlanGrants(dir, command string) []string {
+	f.gotDir = dir
+	return f.plan[command]
+}
+
+func (f *fakeGrantRunner) DescribeGrant(token string) (string, bool) {
+	desc, ok := f.describe[token]
+	return desc, ok
+}
+
+// TestBashBuildRequestGrants proves BuildRequest attaches MAC-verified escalation
+// grant descriptions to the BashRequest when (and only when) the runner is a
+// structural escalation planner, and FAILS the build if any planned token cannot be
+// verified (SPEC §10.7 — an unverifiable token must never reach a prompt).
+func TestBashBuildRequestGrants(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		runner     tool.CommandRunner // nil => no runner
+		args       string
+		wantGrants []tool.GrantDisplay
+		wantErr    bool
+	}{
+		{
+			name: "planner attaches a MAC-verified grant",
+			runner: &fakeGrantRunner{
+				plan:     map[string][]string{"git push": {"tok-net"}},
+				describe: map[string]string{"tok-net": "allow network egress for: git push"},
+			},
+			args:       `{"command":"git push"}`,
+			wantGrants: []tool.GrantDisplay{{Token: "tok-net", Description: "allow network egress for: git push"}},
+		},
+		{
+			name: "multiple verified grants preserved in plan order",
+			runner: &fakeGrantRunner{
+				plan:     map[string][]string{"deploy": {"tok-net", "tok-write"}},
+				describe: map[string]string{"tok-net": "allow network egress", "tok-write": "allow write to /out"},
+			},
+			args: `{"command":"deploy"}`,
+			wantGrants: []tool.GrantDisplay{
+				{Token: "tok-net", Description: "allow network egress"},
+				{Token: "tok-write", Description: "allow write to /out"},
+			},
+		},
+		{
+			name: "an unverifiable token fails the build (never prompts)",
+			runner: &fakeGrantRunner{
+				plan:     map[string][]string{"git push": {"tok-real", "tok-forged"}},
+				describe: map[string]string{"tok-real": "allow network egress"},
+			},
+			args:    `{"command":"git push"}`,
+			wantErr: true,
+		},
+		{
+			name: "planner mints no tokens leaves Grants nil",
+			runner: &fakeGrantRunner{
+				plan:     map[string][]string{},
+				describe: map[string]string{},
+			},
+			args:       `{"command":"echo hi"}`,
+			wantGrants: nil,
+		},
+		{
+			name:       "plain CommandRunner is not a planner",
+			runner:     plainRunner{},
+			args:       `{"command":"git push"}`,
+			wantGrants: nil,
+		},
+		{
+			name:       "nil runner plans no grants",
+			runner:     nil,
+			args:       `{"command":"git push"}`,
+			wantGrants: nil,
+		},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			var opts []BashOption
+			if tt.runner != nil {
+				opts = append(opts, WithRunner(tt.runner))
+			}
+			b := NewBash(t.TempDir(), opts...)
+			req, err := b.BuildRequest(tt.args, nil)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("BuildRequest() err = %v, wantErr %v", err, tt.wantErr)
+			}
+			if tt.wantErr {
+				if req != nil {
+					t.Fatalf("BuildRequest() returned request %v on error; an unverifiable grant must never reach a prompt", req)
+				}
+				return
+			}
+			br, ok := req.(tool.BashRequest)
+			if !ok {
+				t.Fatalf("request type = %T, want tool.BashRequest", req)
+			}
+			if !reflect.DeepEqual(br.Grants, tt.wantGrants) {
+				t.Errorf("BashRequest.Grants = %#v, want %#v", br.Grants, tt.wantGrants)
+			}
+		})
+	}
+}
+
+// TestBashBuildRequestGrantsUsesResolvedWorkdir proves PlanGrants is asked about the
+// SAME resolved working directory InvokableRun would run in — so grants are planned
+// for the call's actual dir, not the workspace root.
+func TestBashBuildRequestGrantsUsesResolvedWorkdir(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	sub := filepath.Join(root, "sub")
+	if err := os.MkdirAll(sub, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	wantDir, err := containedPath(root, "sub")
+	if err != nil {
+		t.Fatalf("containedPath: %v", err)
+	}
+	fr := &fakeGrantRunner{
+		plan:     map[string][]string{"git push": {"tok"}},
+		describe: map[string]string{"tok": "egress"},
+	}
+	if _, err := NewBash(root, WithRunner(fr)).BuildRequest(`{"command":"git push","workdir":"sub"}`, nil); err != nil {
+		t.Fatalf("BuildRequest() err = %v", err)
+	}
+	if fr.gotDir != wantDir {
+		t.Errorf("PlanGrants dir = %q, want resolved workdir %q", fr.gotDir, wantDir)
 	}
 }
 

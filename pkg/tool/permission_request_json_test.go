@@ -131,6 +131,79 @@ func TestSkillLoadRequestCodecMetadataNoBody(t *testing.T) {
 	}
 }
 
+// TestBashRequestGrantsCodec proves the Grants field (added in 17b) survives the
+// durable permission-request codec with full fidelity AND that a grant-free
+// BashRequest is byte-identical to its pre-Grants wire form (the omitempty
+// backward-compat guarantee). A codec change that broke old-journal decode is the
+// failure this test exists to catch.
+func TestBashRequestGrantsCodec(t *testing.T) {
+	t.Parallel()
+
+	t.Run("grant-free is byte-identical to the pre-Grants wire form", func(t *testing.T) {
+		t.Parallel()
+		data, err := MarshalPermissionRequest(BashRequest{Command: "ls -la"})
+		if err != nil {
+			t.Fatalf("MarshalPermissionRequest() error = %v", err)
+		}
+		// Before Grants existed, a bash request marshaled to exactly this (map keys
+		// are marshaled in sorted order: Command < type). omitempty MUST drop the
+		// grants key so an absent-grants request is unchanged on the wire.
+		const want = `{"Command":"ls -la","type":"bash"}`
+		if string(data) != want {
+			t.Errorf("grant-free bash wire = %s, want byte-identical pre-change form %s", data, want)
+		}
+		var fields map[string]json.RawMessage
+		if err := json.Unmarshal(data, &fields); err != nil {
+			t.Fatalf("unmarshal wire to key map: %v", err)
+		}
+		if _, ok := fields["grants"]; ok {
+			t.Errorf("grant-free bash wire carries a grants key: %s", data)
+		}
+	})
+
+	t.Run("grants round-trip with full fidelity", func(t *testing.T) {
+		t.Parallel()
+		in := BashRequest{
+			Command: "git push",
+			Grants: []GrantDisplay{
+				{Token: "tok-net", Description: "allow network egress for: git push"},
+				{Token: "tok-write", Description: "allow write to /out"},
+			},
+		}
+		data, err := MarshalPermissionRequest(in)
+		if err != nil {
+			t.Fatalf("MarshalPermissionRequest() error = %v", err)
+		}
+		got, err := UnmarshalPermissionRequest(data)
+		if err != nil {
+			t.Fatalf("UnmarshalPermissionRequest() error = %v", err)
+		}
+		if !reflect.DeepEqual(got, in) {
+			t.Errorf("round-trip = %#v, want %#v", got, in)
+		}
+	})
+
+	t.Run("pre-Grants journal record decodes to nil Grants", func(t *testing.T) {
+		t.Parallel()
+		// A record written before Grants existed has no "grants" key; it must decode
+		// unchanged with Grants:nil (no error).
+		got, err := UnmarshalPermissionRequest([]byte(`{"type":"bash","Command":"ls"}`))
+		if err != nil {
+			t.Fatalf("UnmarshalPermissionRequest() error = %v", err)
+		}
+		br, ok := got.(BashRequest)
+		if !ok {
+			t.Fatalf("reconstructed type = %T, want BashRequest", got)
+		}
+		if br.Command != "ls" {
+			t.Errorf("Command = %q, want %q", br.Command, "ls")
+		}
+		if br.Grants != nil {
+			t.Errorf("Grants = %#v, want nil for a pre-Grants journal record", br.Grants)
+		}
+	})
+}
+
 // TestUnmarshalPermissionRequestUnknownTag proves an unknown or missing tag fails
 // closed with a typed *UnknownPermissionRequestError (mirrors blockTag).
 func TestUnmarshalPermissionRequestUnknownTag(t *testing.T) {

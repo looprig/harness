@@ -53,10 +53,29 @@ func (FileWriteRequest) ToolName() string               { return "WriteFile" }
 func (r FileWriteRequest) Description() string          { return r.Path }
 func (FileWriteRequest) AllowedScopes() []ApprovalScope { return persistableScopes() }
 
+// GrantDisplay is a MAC-verified escalation grant shown in a permission prompt:
+// an opaque Token plus its bound human-readable Description (both from the sandbox
+// executor; harness never mints or interprets them). A GrantDisplay only ever
+// exists for a token whose executor-side MAC verification SUCCEEDED — a fabricated
+// or tampered token is rejected before a GrantDisplay is built, so one can never
+// reach a prompt (SPEC §10.7). The lowercase json tags are the durable wire form.
+type GrantDisplay struct {
+	Token       string `json:"token"`
+	Description string `json:"description"`
+}
+
 // BashRequest is the approval prompt for the Bash tool. Command is the exact
 // command string, which doubles as the persisted exact-command Match (§4b, §5d).
+//
+// Grants are the MAC-verified escalation grants the operator would apply by
+// approving this call (SPEC §9.3): each carries the executor's opaque token and its
+// bound human-readable description, so the prompt shows "allow network egress for:
+// git push" rather than an opaque token. It is omitempty so a call that needs no
+// escalation marshals byte-identically to a pre-Grants BashRequest (durable
+// backward compatibility).
 type BashRequest struct {
 	Command string
+	Grants  []GrantDisplay `json:"grants,omitempty"`
 }
 
 func (BashRequest) permissionRequest()             {}
