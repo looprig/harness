@@ -26,6 +26,19 @@ func (e *SpawnConfigError) Error() string {
 	return "claude: spawn config: " + e.Field + ": " + e.Reason
 }
 
+// WrapError is the fail-closed result of the injected Wrap seam failing to confine
+// the foreign process (SPEC §10.6): the child is never started. It wraps the cause
+// so callers can errors.As/Is to the underlying wrapper failure.
+type WrapError struct{ Cause error }
+
+func (e *WrapError) Error() string { return "claude: wrap foreign process: " + e.Cause.Error() }
+func (e *WrapError) Unwrap() error { return e.Cause }
+
+// errNilWrappedCmd is the leaf cause when an injected Wrap returns a nil command
+// with no error — a misbehaving wrapper. We fail closed rather than start an
+// unconfined process.
+var errNilWrappedCmd = errors.New("wrap returned a nil command")
+
 // Agent is the real `claude` subprocess adapter; it satisfies
 // foreignloop.ForeignAgent. Env is the FULL, already-whitelisted child environment:
 // the composition root builds it via whitelistEnv, and the adapter uses it verbatim
@@ -35,6 +48,16 @@ type Agent struct {
 	Home     string
 	Model    string
 	Env      []string
+	// Wrap, if non-nil, confines the foreign process tree before it starts
+	// (SPEC §10.6): start calls cmd = Wrap(cmd) between building the command and
+	// starting it, so a consumer can prepend an OS sandbox to the argv. The
+	// signature is deliberately stdlib-only and matches the sandbox module's
+	// Executor.Wrap structurally — harness does NOT import sandbox. A returned
+	// error (or a nil command) fails the spawn closed with a *WrapError; nil Wrap
+	// leaves today's behavior unchanged. The external-isolation marker (§10.6) is
+	// carried in the wrapped command's environment by the policy the consumer
+	// builds (ForeignAgentPolicy sets it via Env.Set), not by a separate field here.
+	Wrap func(*exec.Cmd) (*exec.Cmd, error)
 }
 
 // Spawn starts the claude CLI for one foreign turn in its own process group and
@@ -74,6 +97,20 @@ func (a *Agent) start(t foreignloop.ForeignTurn) (*exec.Cmd, io.Reader, error) {
 	cmd.Stdin = strings.NewReader(promptText(t.Input))
 	cmd.Stderr = io.Discard
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	// Confine the foreign process tree before it runs (SPEC §10.6). Applied to the
+	// fully-configured command and before StdoutPipe/Start, so the pipe and process
+	// group attach to the command the wrapper hands back. A wrapper that overrides
+	// SysProcAttr must preserve Setpgid (process-group teardown depends on it).
+	if a.Wrap != nil {
+		wrapped, werr := a.Wrap(cmd)
+		if werr != nil {
+			return nil, nil, &WrapError{Cause: werr}
+		}
+		if wrapped == nil {
+			return nil, nil, &WrapError{Cause: errNilWrappedCmd}
+		}
+		cmd = wrapped
+	}
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return nil, nil, err
