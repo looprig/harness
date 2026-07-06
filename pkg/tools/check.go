@@ -118,6 +118,8 @@ func classifyTool(toolName string) toolClass {
 //	Stage 4  HardApprove   — operator always-allow (tool name or "*")
 //	Stage 5  Persisted     — ws then user approvals files; deny beats allow
 //	Stage 6  Session       — in-memory policy list
+//	Stage 6.5 Posture      — posture-driven auto-approve under the guarantee
+//	                         interlock (§10.2/§10.3); nil posture = no-op
 //	Stage 7  Default       — EffectAsk
 func (c *PermissionChecker) Check(ctx context.Context, t tool.InvokableTool, toolName, argsJSON string) loop.Effect {
 	c.mu.Lock()
@@ -169,6 +171,16 @@ func (c *PermissionChecker) Check(ctx context.Context, t tool.InvokableTool, too
 
 	// Stage 6: in-memory session policies.
 	if eff, decided := c.stageSessionPolicies(toolName, class, argsJSON); decided {
+		return eff
+	}
+
+	// Stage 6.5: posture-driven auto-approve (SPEC §10.2/§10.3). Deliberately LAST
+	// before the default: it runs after every stage that can DENY (1-2 hard-deny,
+	// 3 EffectChecker veto, 5-6 persisted/session deny), so it can only ever upgrade
+	// a still-undecided call to AutoApprove — never override a deny. It is
+	// fail-closed (the guarantee interlock, a nil runner, a grant-carrying call, or
+	// a non-trivial command all fall through to Ask). nil posture = no-op.
+	if eff, decided := c.stagePosture(toolName, class, argsJSON); decided {
 		return eff
 	}
 

@@ -8,6 +8,7 @@ import (
 
 	"github.com/looprig/harness/internal/hashcache"
 	"github.com/looprig/harness/pkg/loop"
+	"github.com/looprig/harness/pkg/tool"
 )
 
 // permission.go defines the policy data structures, fail-secure default
@@ -219,6 +220,19 @@ type PermissionChecker struct {
 	// by Check to gate Stage 3 and skip Stage 5).
 	unattended bool
 
+	// posture, when non-nil, enables the posture-driven auto-approve stage (Stage
+	// 6.5, SPEC §10.2/§10.3). nil = the bare checker (no posture; today's behavior).
+	// A fixedPosture (WithPosture) or a ceilingPostures (WithCeilingPostures). Set
+	// once at construction, never mutated; read under mu in Check.
+	posture postureSelector
+
+	// runner is the ONE confined-runner reference the checker holds (SPEC §10.2) —
+	// the same reference the Task-17 grant plumbing will reuse. It is held as a
+	// stdlib tool.CommandRunner and probed STRUCTURALLY for its optional
+	// GuaranteeBits()/Level() capabilities (harness never imports sandbox). nil
+	// unless a posture option supplied one. Set once at construction, never mutated.
+	runner tool.CommandRunner
+
 	// Two caches memoize the JSON parse of the workspace and user approvals files
 	// keyed by content hash, so an unchanged file is not re-parsed on every Check.
 	wsCache   *hashcache.Cache[ApprovalsFile]
@@ -230,10 +244,13 @@ type Option func(*checkerConfig)
 
 // checkerConfig holds construction-time knobs applied by Options before the
 // PermissionChecker is built. homeFn is the home-dir seam; unattended flips the
-// two headless suppressions.
+// two headless suppressions; posture + runner wire the posture-driven auto-approve
+// stage (nil posture = disabled).
 type checkerConfig struct {
 	homeFn     homeDirFunc
 	unattended bool
+	posture    postureSelector
+	runner     tool.CommandRunner
 }
 
 // WithHomeDir overrides the home-dir resolution seam at CONSTRUCTION (default
@@ -273,6 +290,8 @@ func NewPermissionChecker(policy PermissionPolicy, opts ...Option) (*PermissionC
 		policy:     policy,
 		home:       home,
 		unattended: cfg.unattended,
+		posture:    cfg.posture,
+		runner:     cfg.runner,
 		wsCache:    hashcache.New(parseApprovalsFile),
 		userCache:  hashcache.New(parseApprovalsFile),
 	}, nil
