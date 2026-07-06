@@ -32,10 +32,14 @@ import (
 // treats it opaquely. The zero Posture auto-approves nothing (fail-closed default,
 // used as the most-restrictive table[0] and when no posture is configured).
 type Posture struct {
-	// AutoApproveEdits auto-approves file-edit/write tools (WriteFile/EditFile).
-	// Edits are NOT gated on the runner interlock: they are already confined by the
-	// non-bypassable write-containment + hard-deny stages and the in-process
-	// ReadGuard, not by the OS sandbox's subprocess guarantees.
+	// AutoApproveEdits auto-approves file-edit/write tools (WriteFile/EditFile) — but,
+	// like Bash, ONLY when the guarantee interlock passes: the held runner must enforce
+	// RequiredGuaranteesEdits (and any RequiredLevel floor). Edits are ALSO confined by
+	// the non-bypassable write-containment + hard-deny stages and the in-process
+	// ReadGuard, but in-process containment alone is not an OS write-boundary — so on a
+	// non-enforcing backend (nil / null-backend runner) the interlock fails and edits
+	// degrade to Ask, uniform with Bash. A zero RequiredGuaranteesEdits requires nothing
+	// (no interlock — the backward-compatible / unconfined choice).
 	AutoApproveEdits bool
 
 	// AutoApproveBash auto-approves Bash — but ONLY when the guarantee interlock
@@ -49,6 +53,17 @@ type Posture struct {
 	// nothing (the consumer's explicit "no interlock" choice, e.g. an unconfined
 	// mode); any non-zero mask fails closed against a nil / non-probing runner.
 	RequiredGuarantees uint64
+
+	// RequiredGuaranteesEdits is the guarantee bitmask the runner must enforce for an
+	// AutoApproveEdits auto-approve to fire — the edit counterpart of RequiredGuarantees
+	// (kept SEPARATE because an edit typically needs only the OS write-boundary, NOT the
+	// network boundary a Bash auto-approve requires). The interlock passes only when
+	// runnerBits & RequiredGuaranteesEdits == RequiredGuaranteesEdits. A zero mask
+	// requires nothing — an AutoApproveEdits posture with a zero mask auto-approves edits
+	// with no interlock (backward-compatible; the unconfined "no interlock" choice) — but
+	// any non-zero mask fails closed against a nil / non-probing runner, degrading edits
+	// to Ask exactly as Bash does.
+	RequiredGuaranteesEdits uint64
 
 	// RequiredLevel is an OPTIONAL coarse secondary floor on the runner's Level()
 	// (SPEC §10.3): the runner's Level() must be >= RequiredLevel. Zero means no
@@ -182,7 +197,11 @@ func (c *PermissionChecker) stagePosture(toolName string, class toolClass, argsJ
 
 	switch class {
 	case classWrite:
-		if p.AutoApproveEdits {
+		// Edits are interlock-gated too (SPEC §10.3): auto-approve only when the held
+		// runner ACTUALLY enforces RequiredGuaranteesEdits (and any RequiredLevel floor).
+		// A nil / non-probing runner against a non-zero edit mask fails closed → Ask; a
+		// zero edit mask requires nothing (backward-compatible auto-approve).
+		if p.AutoApproveEdits && c.interlockPassesMask(p, p.RequiredGuaranteesEdits) {
 			return loop.EffectAutoApprove, true
 		}
 	case classBash:
@@ -215,16 +234,24 @@ func (c *PermissionChecker) postureBash(p Posture, argsJSON string) (loop.Effect
 }
 
 // interlockPasses reports whether the held runner ACTUALLY enforces the posture's
-// required guarantees (SPEC §10.3). It is the safety gate for Bash auto-approve.
-// Both checks are fail-closed:
-//   - guarantee bits: pass only when runnerBits & Required == Required. A nil
-//     runner or one without GuaranteeBits contributes 0 bits, so any non-zero
-//     Required mask fails.
+// Bash-required guarantees (RequiredGuarantees, SPEC §10.3). It is the safety gate
+// for Bash auto-approve — a thin alias over interlockPassesMask with the Bash mask.
+func (c *PermissionChecker) interlockPasses(p Posture) bool {
+	return c.interlockPassesMask(p, p.RequiredGuarantees)
+}
+
+// interlockPassesMask reports whether the held runner ACTUALLY enforces the given
+// guarantee mask AND meets the posture's optional Level floor (SPEC §10.3). It is the
+// SHARED fail-closed gate for BOTH Bash auto-approve (mask = RequiredGuarantees) and
+// edit auto-approve (mask = RequiredGuaranteesEdits), so the two paths degrade
+// identically on a non-enforcing runner. Both checks are fail-closed:
+//   - guarantee bits: pass only when runnerBits & mask == mask. A nil runner or one
+//     without GuaranteeBits contributes 0 bits, so any non-zero mask fails.
 //   - Level floor (optional): when RequiredLevel > 0 the runner's Level() must be
 //     >= it. A nil runner or one without Level() contributes 0, so a positive floor
 //     fails closed.
-func (c *PermissionChecker) interlockPasses(p Posture) bool {
-	if c.runnerGuaranteeBits()&p.RequiredGuarantees != p.RequiredGuarantees {
+func (c *PermissionChecker) interlockPassesMask(p Posture, mask uint64) bool {
+	if c.runnerGuaranteeBits()&mask != mask {
 		return false
 	}
 	if p.RequiredLevel > 0 && c.runnerLevel() < p.RequiredLevel {

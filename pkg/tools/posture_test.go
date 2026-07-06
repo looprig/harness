@@ -157,6 +157,73 @@ func TestPostureAutoApproveEdits(t *testing.T) {
 	}
 }
 
+// TestPostureAutoApproveEditsInterlock: file-edit auto-approve is now gated on the
+// guarantee interlock the SAME way Bash is — it fires ONLY when the held runner's
+// guarantee bits satisfy RequiredGuaranteesEdits (edits typically require only the
+// OS write-boundary, a NARROWER mask than Bash). A nil / non-probing runner (bits 0)
+// against a non-zero edit mask fails closed to Ask; a ZERO edit mask keeps the
+// pre-fix backward-compatible auto-approve (no interlock, edits auto).
+func TestPostureAutoApproveEditsInterlock(t *testing.T) {
+	t.Parallel()
+	required := gA | gB
+	tests := []struct {
+		name      string
+		editsMask uint64
+		runner    tool.CommandRunner
+		want      loop.Effect
+	}{
+		{name: "all required edit bits set -> approve", editsMask: required, runner: &fakeGuaranteeRunner{bits: gA | gB}, want: loop.EffectAutoApprove},
+		{name: "superset of required -> approve", editsMask: required, runner: &fakeGuaranteeRunner{bits: gA | gB | gC}, want: loop.EffectAutoApprove},
+		{name: "missing one required edit bit -> ask", editsMask: required, runner: &fakeGuaranteeRunner{bits: gA}, want: loop.EffectAsk},
+		{name: "nil runner + non-zero edit mask -> ask", editsMask: required, runner: nil, want: loop.EffectAsk},
+		{name: "runner without GuaranteeBits + non-zero edit mask -> ask", editsMask: required, runner: &fakeCommandRunner{}, want: loop.EffectAsk},
+		{name: "zero edit mask -> auto (backward-compat)", editsMask: 0, runner: &fakeGuaranteeRunner{}, want: loop.EffectAutoApprove},
+		{name: "zero edit mask + nil runner -> auto (backward-compat)", editsMask: 0, runner: nil, want: loop.EffectAutoApprove},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			ws := newWS(t)
+			posture := Posture{AutoApproveEdits: true, RequiredGuaranteesEdits: tt.editsMask}
+			c := newPostureChecker(t, PermissionPolicy{WorkspaceRoot: ws}, WithPosture(posture, tt.runner))
+			got := c.Check(context.Background(), plainTool{name: toolWriteFile}, toolWriteFile, `{"path":"a.txt"}`)
+			if got != tt.want {
+				t.Errorf("Check() = %v, want %v (editsMask=%b)", got, tt.want, tt.editsMask)
+			}
+		})
+	}
+}
+
+// TestPostureEditsRequiredLevelFloor: the edit interlock honors the optional Level()
+// floor symmetrically with Bash — a runner below the floor does not edit-auto-approve
+// even when the edit guarantee bits are satisfied.
+func TestPostureEditsRequiredLevelFloor(t *testing.T) {
+	t.Parallel()
+	ws := newWS(t)
+	posture := Posture{AutoApproveEdits: true, RequiredGuaranteesEdits: gA, RequiredLevel: 2}
+	tests := []struct {
+		name   string
+		runner tool.CommandRunner
+		want   loop.Effect
+	}{
+		{name: "level meets floor -> approve", runner: &fakeGuaranteeRunner{bits: gA, level: 2}, want: loop.EffectAutoApprove},
+		{name: "level below floor -> ask", runner: &fakeGuaranteeRunner{bits: gA, level: 1}, want: loop.EffectAsk},
+		{name: "no Level probe -> ask", runner: &fakeBitsOnlyRunner{bits: gA}, want: loop.EffectAsk},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			c := newPostureChecker(t, PermissionPolicy{WorkspaceRoot: ws}, WithPosture(posture, tt.runner))
+			got := c.Check(context.Background(), plainTool{name: toolWriteFile}, toolWriteFile, `{"path":"a.txt"}`)
+			if got != tt.want {
+				t.Errorf("Check() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
 // TestPostureGrantCarryingAlwaysAsk: a grant-carrying call (non-empty top-level
 // "grants" array) is never auto-approved by posture, even when the interlock would
 // otherwise pass; an empty/absent grants field does not block auto-approve.
