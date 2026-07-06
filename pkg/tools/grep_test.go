@@ -12,10 +12,11 @@ import (
 	"testing"
 
 	"github.com/looprig/core/content"
+	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/harness/pkg/tool"
 )
 
-func runGrep(t *testing.T, root string, guard *fakeReadGuard, args map[string]any) string {
+func runGrep(t *testing.T, root string, guard loop.ReadGuard, args map[string]any) string {
 	t.Helper()
 	b, err := json.Marshal(args)
 	if err != nil {
@@ -178,6 +179,35 @@ func TestGrep(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestGrepHonorsEnvDenyGuard mirrors TestReadFileHonorsEnvDenyGuard for Grep: a
+// ReadGuard that denies the §5.3 "**/.env*" secret set (a policy-derived RULE via
+// patternReadGuard) must make Grep SKIP every .env-family file — never emitting the
+// filename or the secret line — while still matching a sibling non-.env file. This
+// pins the §10.5 seam for the content-search read tool: the one guard the swe
+// sandbox adapter builds binds Grep identically to a sandboxed search. The
+// deterministic WalkDir backend is forced (via runGrep) so the assertion holds
+// whether or not ripgrep is installed.
+func TestGrepHonorsEnvDenyGuard(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	mustWrite(t, filepath.Join(root, ".env"), "SECRET_TOKEN=needle\n")
+	mustWrite(t, filepath.Join(root, ".env.local"), "SECRET_TOKEN=needle\n")
+	mustWrite(t, filepath.Join(root, "config", ".env.production"), "SECRET_TOKEN=needle\n")
+	mustWrite(t, filepath.Join(root, "app.go"), "// needle in a non-secret file\n")
+
+	guard := &patternReadGuard{deny: denyDotEnv, maxBytes: 1 << 20}
+	got := runGrep(t, root, guard, map[string]any{"pattern": "needle"})
+
+	if !strings.Contains(got, "app.go") || !strings.Contains(got, "non-secret") {
+		t.Errorf("Grep did not match the permitted non-.env file; output:\n%s", got)
+	}
+	for _, absent := range []string{".env", "SECRET_TOKEN"} {
+		if strings.Contains(got, absent) {
+			t.Errorf("Grep leaked denied .env content/name %q; output:\n%s", absent, got)
+		}
 	}
 }
 

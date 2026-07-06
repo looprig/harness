@@ -2,6 +2,7 @@ package tools
 
 import (
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/looprig/harness/pkg/loop"
@@ -31,6 +32,33 @@ func (g *fakeReadGuard) MaxReadBytes() int64            { return g.maxBytes }
 
 // compile-time assertion that the fake satisfies the narrow read guard.
 var _ loop.ReadGuard = (*fakeReadGuard)(nil)
+
+// patternReadGuard is a loop.ReadGuard double that decides DeniedRead with a
+// PREDICATE over the absolute path rather than an enumerated set. It models the
+// §10.5 read-adaptation seam faithfully: the swe sandbox adapter derives
+// DeniedRead from the sandbox Policy's read RULES (globs like "**/.env*"), not a
+// fixed path list, so pinning the seam with a rule-shaped guard proves the native
+// read tools honour a policy-derived deny, not just an exact path.
+type patternReadGuard struct {
+	deny     func(absPath string) bool
+	maxBytes int64
+}
+
+func (g *patternReadGuard) DeniedRead(absPath string) bool { return g.deny(absPath) }
+func (g *patternReadGuard) MaxReadBytes() int64            { return g.maxBytes }
+
+// compile-time assertion that the pattern guard satisfies the narrow read guard.
+var _ loop.ReadGuard = (*patternReadGuard)(nil)
+
+// denyDotEnv models the §5.3 secret deny-read "**/.env*": it returns true for any
+// absolute path whose FINAL component begins with ".env" (.env, .env.local,
+// .env.production, …) at ANY directory depth — the same set the doublestar glob
+// "**/.env*" selects, expressed with stdlib only. Per the DeniedRead canonical-path
+// contract this match is purely lexical; the caller feeds an absolute, cleaned,
+// symlink-resolved path (which the native read tools do).
+func denyDotEnv(absPath string) bool {
+	return strings.HasPrefix(filepath.Base(absPath), ".env")
+}
 
 // resolvedJoin returns the symlink-resolved absolute path of rel under root —
 // the exact form containedPath produces and DeniedRead's contract expects (on

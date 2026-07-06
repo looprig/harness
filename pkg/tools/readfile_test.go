@@ -9,12 +9,13 @@ import (
 	"testing"
 
 	"github.com/looprig/core/content"
+	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/harness/pkg/tool"
 )
 
 // runReadFile is a small helper to invoke ReadFile and extract the single text
 // block, failing the test on any structural surprise.
-func runReadFile(t *testing.T, root string, guard *fakeReadGuard, args map[string]any) string {
+func runReadFile(t *testing.T, root string, guard loop.ReadGuard, args map[string]any) string {
 	t.Helper()
 	b, err := json.Marshal(args)
 	if err != nil {
@@ -144,6 +145,53 @@ func TestReadFile(t *testing.T) {
 			}
 
 			got := runReadFile(t, root, tt.guard(root), tt.args(root))
+			for _, want := range tt.wantContain {
+				if !strings.Contains(got, want) {
+					t.Errorf("output missing %q\n---\n%s", want, got)
+				}
+			}
+			for _, absent := range tt.wantAbsent {
+				if strings.Contains(got, absent) {
+					t.Errorf("output should not contain %q\n---\n%s", absent, got)
+				}
+			}
+		})
+	}
+}
+
+// TestReadFileHonorsEnvDenyGuard pins the §10.5 read-adaptation seam for ReadFile:
+// a ReadGuard whose DeniedRead denies the §5.3 "**/.env*" secret set (a policy-
+// derived RULE, via patternReadGuard, not an enumerated path) must make ReadFile
+// REFUSE every .env-family file — WITHOUT echoing the secret body — and still ALLOW
+// a sibling non-.env file. This is the "one source of truth" guarantee: the exact
+// guard the swe sandbox adapter builds from the sandbox Policy binds the native
+// ReadFile tool identically to how it would bind a sandboxed `sh -c cat`.
+func TestReadFileHonorsEnvDenyGuard(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name        string
+		path        string
+		wantContain []string
+		wantAbsent  []string
+	}{
+		{name: "dotenv is denied", path: ".env", wantContain: []string{"error", "denied"}, wantAbsent: []string{"SECRET_TOKEN"}},
+		{name: "dotenv variant is denied", path: ".env.local", wantContain: []string{"error", "denied"}, wantAbsent: []string{"SECRET_TOKEN"}},
+		{name: "nested dotenv is denied", path: "config/.env.production", wantContain: []string{"error", "denied"}, wantAbsent: []string{"SECRET_TOKEN"}},
+		{name: "non-dotenv sibling is allowed", path: "app.go", wantContain: []string{"package main"}, wantAbsent: []string{"error"}},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			root := t.TempDir()
+			mustWrite(t, filepath.Join(root, ".env"), "SECRET_TOKEN=aaa\n")
+			mustWrite(t, filepath.Join(root, ".env.local"), "SECRET_TOKEN=bbb\n")
+			mustWrite(t, filepath.Join(root, "config", ".env.production"), "SECRET_TOKEN=ccc\n")
+			mustWrite(t, filepath.Join(root, "app.go"), "package main\n")
+
+			guard := &patternReadGuard{deny: denyDotEnv, maxBytes: 1 << 20}
+			got := runReadFile(t, root, guard, map[string]any{"path": tt.path})
 			for _, want := range tt.wantContain {
 				if !strings.Contains(got, want) {
 					t.Errorf("output missing %q\n---\n%s", want, got)

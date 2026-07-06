@@ -138,8 +138,34 @@ type PermissionGate interface {
 // (Interface Segregation: read tools depend only on this, not the full gate).
 // DeniedRead filters denied paths during Glob/Grep traversal and results;
 // MaxReadBytes is the per-file cap ReadFile/Grep apply via io.LimitReader.
+//
+// This is the §10.5 read-adaptation SEAM: it is deliberately stdlib-typed (no
+// import of any sandbox package) so a sandbox consumer (swe) can build ONE
+// ReadGuard from the sandbox Policy's read rules and bind the native ReadFile/
+// Grep/Glob tools IDENTICALLY to a sandboxed `sh -c cat` — a single source of
+// truth, with no drift between the in-process guards and OS enforcement. The
+// concrete PermissionChecker already satisfies ReadGuard (via DeniedRead/
+// MaxReadBytes), so the bare harness and a sandboxed harness share one read-deny
+// contract; the swe adapter simply wraps the sandbox resolver's Resolve behind the
+// same two methods.
 type ReadGuard interface {
+	// DeniedRead reports whether reading absPath is denied by policy (e.g. the
+	// §5.3 secret deny-reads such as "**/.env*", or a zerotrust restricted-read).
+	//
+	// CANONICAL-PATH CONTRACT (fail-secure): absPath MUST be an ABSOLUTE,
+	// filepath.Clean'ed, SYMLINK-RESOLVED path. The guard is purely LEXICAL — it
+	// matches the string it is handed and performs NO filesystem resolution of its
+	// own. Resolving symlinks (and, on a case-insensitive volume such as default
+	// macOS/APFS, canonicalising case) BEFORE the call is the CALLER's (the tool's)
+	// responsibility: a guard fed a non-canonical path can be bypassed by a symlink
+	// or a case variant that resolves to the denied file. The native read tools
+	// honour this — ReadFile passes the containedPath-resolved abs, Grep/Glob pass
+	// the EvalSymlinks'd path via denyFilteredRel. This mirrors the sandbox Resolve
+	// contract, so the swe adapter and the native tools MUST both feed canonical
+	// paths or a deny is trivially evaded.
 	DeniedRead(absPath string) bool
+	// MaxReadBytes is the per-file read cap (bytes) ReadFile/Grep apply via
+	// io.LimitReader.
 	MaxReadBytes() int64
 }
 
