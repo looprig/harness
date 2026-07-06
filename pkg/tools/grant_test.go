@@ -189,6 +189,80 @@ func TestDeltalessRecordRejectsGrantCarryingCall(t *testing.T) {
 	}
 }
 
+// TestDeltaBearingRecordDoesNotAutoApproveBefore17d pins the fail-secure seam
+// through Check: a persisted DELTA-BEARING allow record must NOT auto-approve a
+// grant-carrying call before Task 17d wires the delta-set match + token re-mint —
+// recordMatcher's len(rec.GrantDeltas) != 0 → return false branch. It covers BOTH
+// the in-memory session-projected record AND an on-disk workspace record RELOADED
+// from approvals.json through a fresh checker (so a future 17d edit cannot silently
+// open the seam on either path).
+func TestDeltaBearingRecordDoesNotAutoApproveBefore17d(t *testing.T) {
+	t.Parallel()
+	const grantCarrying = `{"command":"git push","grants":["x"]}`
+
+	t.Run("session-projected record", func(t *testing.T) {
+		t.Parallel()
+		ws := newWS(t)
+		home := t.TempDir()
+		runner := &fakeDescribeRunner{desc: map[string]string{"tok": "egress"}}
+		pc, err := NewPermissionChecker(
+			PermissionPolicy{WorkspaceRoot: ws, HardDeny: DefaultHardDeny()},
+			WithHomeDir(func() (string, error) { return home, nil }),
+			WithPosture(Posture{}, runner),
+		)
+		if err != nil {
+			t.Fatalf("NewPermissionChecker: %v", err)
+		}
+		// A pre-ask grant persists a DELTA-BEARING session allow for Bash "git push".
+		ctx := tool.WithGrants(context.Background(), []string{"tok"})
+		if err := pc.Grant(ctx, "Bash", `{"command":"git push"}`, tool.ScopeSession); err != nil {
+			t.Fatalf("Grant: %v", err)
+		}
+		if d := lastSessionPolicy(t, pc).GrantDeltas; len(d) == 0 {
+			t.Fatalf("precondition: session policy has no GrantDeltas")
+		}
+		if got := pc.Check(context.Background(), plainTool{name: toolBash}, toolBash, grantCarrying); got != loop.EffectAsk {
+			t.Errorf("Check(grant-carrying vs delta-bearing session record) = %v, want EffectAsk (17c seam: must not auto-approve before 17d)", got)
+		}
+	})
+
+	t.Run("on-disk workspace record reloaded through Check", func(t *testing.T) {
+		t.Parallel()
+		ws := newWS(t)
+		home := t.TempDir()
+		runner := &fakeDescribeRunner{desc: map[string]string{"tok": "egress"}}
+		writer, err := NewPermissionChecker(
+			PermissionPolicy{WorkspaceRoot: ws, HardDeny: DefaultHardDeny()},
+			WithHomeDir(func() (string, error) { return home, nil }),
+			WithPosture(Posture{}, runner),
+		)
+		if err != nil {
+			t.Fatalf("NewPermissionChecker(writer): %v", err)
+		}
+		ctx := tool.WithGrants(context.Background(), []string{"tok"})
+		if err := writer.Grant(ctx, "Bash", `{"command":"git push"}`, tool.ScopeWorkspace); err != nil {
+			t.Fatalf("Grant(ScopeWorkspace): %v", err)
+		}
+		// Precondition: the on-disk record carries the persisted delta.
+		af := readApprovalsFile(t, wsApprovalsPathFor(t, home, ws))
+		if len(af.Approvals) != 1 || len(af.Approvals[0].GrantDeltas) == 0 {
+			t.Fatalf("precondition: on-disk record missing GrantDeltas: %+v", af.Approvals)
+		}
+		// A FRESH checker reloads approvals.json from disk and Checks the grant-carrying
+		// call — the persisted grant_deltas must gate it (never auto-approve).
+		reader, err := NewPermissionChecker(
+			PermissionPolicy{WorkspaceRoot: ws, HardDeny: DefaultHardDeny()},
+			WithHomeDir(func() (string, error) { return home, nil }),
+		)
+		if err != nil {
+			t.Fatalf("NewPermissionChecker(reader): %v", err)
+		}
+		if got := reader.Check(context.Background(), plainTool{name: toolBash}, toolBash, grantCarrying); got != loop.EffectAsk {
+			t.Errorf("Check(grant-carrying vs delta-bearing on-disk record) = %v, want EffectAsk (17c seam)", got)
+		}
+	})
+}
+
 // grant_test.go exercises the WRITE side of the policy store: Grant's per-scope
 // behaviour (session append, out-of-repo workspace write, ScopeOnce no-op),
 // the Match derivation per tool, the filesystem hardening (dir/file perms,

@@ -640,6 +640,12 @@ func (c *PermissionChecker) recordMatcher(toolName string, class toolClass, args
 		// TODO(Task 17d): compare rec.GrantDeltas to the live call's required delta
 		// set and, on a match, re-mint fresh grant tokens onto the per-call ctx.
 		// Until then a delta-bearing allow declines to auto-match (fail-secure).
+		//
+		// KNOWN LIMITATION until 17d: because a delta-bearing record never
+		// auto-matches, each repeat grant-bearing approval re-Asks and Grant appends
+		// ANOTHER record (no dedup) — so approvals.json / the session policy list grows
+		// one record per repeat. 17d should dedup-on-append (an equal Tool+Match+delta
+		// set is a no-op) once it makes delta-bearing records auto-match.
 		return false
 	}
 }

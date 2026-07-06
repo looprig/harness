@@ -12,8 +12,12 @@ import (
 
 // policySchemaVersion is bumped whenever the fingerprint input shape changes, so
 // digests computed by different schema versions never compare equal by accident.
-// v2 added the per-policy GrantDeltas section (Task 17c).
-const policySchemaVersion = 2
+// Task 17c added a per-policy GrantDeltas section but did NOT bump this: the
+// section is OMITTED when empty (see writePolicies), so a grant-free policy line is
+// byte-identical to the pre-17c form and every existing grant-free session keeps
+// its exact fingerprint across the upgrade (no spurious re-ask). Only a new
+// grant-BEARING policy — which could not exist before 17c — yields a new digest.
+const policySchemaVersion = 1
 
 // FingerprintMode carries the headless mode bits that affect the effective
 // permission decision but are not on PermissionPolicy: whether the gate is
@@ -90,14 +94,19 @@ func writePolicies(b *strings.Builder, in []loop.ToolPolicy) {
 		// GrantDeltas are enforcement-affecting (a grant restores only under a
 		// matching delta set) and are canonicalized (sorted + length-prefixed) exactly
 		// like Match, so delta reordering is digest-stable and any content change is
-		// digest-sensitive. Always present (even count 0) so the section is unambiguous.
-		d := slices.Clone(p.GrantDeltas)
-		slices.Sort(d)
-		lb.WriteByte('#')
-		lb.WriteString(strconv.Itoa(len(d)))
-		for _, e := range d {
-			lb.WriteByte(':')
-			writeLen(&lb, e)
+		// digest-sensitive. The section is OMITTED when empty so a grant-free policy
+		// line is byte-identical to the pre-17c form — existing grant-free sessions
+		// keep their exact fingerprint across the upgrade (no schema-version bump, no
+		// spurious re-ask). The leading '#' preceding the count keeps a present
+		// (non-empty) section unambiguous from the trailing Match entries.
+		if d := slices.Clone(p.GrantDeltas); len(d) > 0 {
+			slices.Sort(d)
+			lb.WriteByte('#')
+			lb.WriteString(strconv.Itoa(len(d)))
+			for _, e := range d {
+				lb.WriteByte(':')
+				writeLen(&lb, e)
+			}
 		}
 		lines = append(lines, lb.String())
 	}

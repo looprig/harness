@@ -37,6 +37,13 @@ func (c *PermissionChecker) Grant(ctx context.Context, toolName, argsJSON string
 	if err != nil {
 		return err
 	}
+	// Refuse an unpersistable scope BEFORE probing the runner for grant deltas:
+	// ScopeOnce (and any out-of-range value) persists nothing by definition, so it
+	// must not MAC-verify tokens only to discard the result (fail-secure — the
+	// runner never passes such a scope anyway).
+	if scope != tool.ScopeSession && scope != tool.ScopeWorkspace {
+		return &UnsupportedScopeError{Scope: uint8(scope)}
+	}
 	// A pre-ask approval places the accepted escalation grant TOKENS on the ctx
 	// (tool.WithGrants). Derive the MAC-verified delta DESCRIPTIONS to persist —
 	// never the single-mint tokens (SPEC §9.3/§10.7). Empty for a grant-free grant.
@@ -54,7 +61,8 @@ func (c *PermissionChecker) Grant(ctx context.Context, toolName, argsJSON string
 	case tool.ScopeWorkspace:
 		return c.grantWorkspace(ctx, toolName, match, deltas)
 	default:
-		// ScopeOnce or any out-of-range value: never persist (fail-secure).
+		// Unreachable: the early guard above already refused any non-persistable
+		// scope. Kept as defense-in-depth, fail-secure.
 		return &UnsupportedScopeError{Scope: uint8(scope)}
 	}
 }
@@ -69,6 +77,12 @@ func (c *PermissionChecker) Grant(ctx context.Context, toolName, argsJSON string
 // single-mint tokens.
 func (c *PermissionChecker) deriveGrantDeltas(tokens []string) []string {
 	if len(tokens) == 0 {
+		return nil
+	}
+	if c.runner == nil {
+		// No runner → no MAC-verifier. Guard the nil BEFORE the type assertion so a
+		// typed-nil runner implementing DescribeGrant can't pass the assertion into a
+		// nil-receiver call (mirrors runnerLevel/runnerGuaranteeBits in posture.go).
 		return nil
 	}
 	dg, ok := c.runner.(interface {

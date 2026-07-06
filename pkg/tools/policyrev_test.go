@@ -149,7 +149,7 @@ func TestPolicyFingerprint_StableAndSensitive(t *testing.T) {
 // policy).
 func TestPolicyFingerprint_Golden(t *testing.T) {
 	t.Parallel()
-	const want = "9b2cc68dc37ccc82398599a717857e19e28cb2ee6b6390f2c3aa75d7de877528"
+	const want = "a43ef08e25059e77060a47b27f2321d1e3493848159d78c6c78411f8c366da66"
 	base, baseMode := fingerprintBase()
 	got := PolicyFingerprint(base, baseMode)
 	if got != want {
