@@ -63,7 +63,8 @@ const bashSchema = `{
   "properties": {
     "command": {"type": "string", "description": "The shell command to run via 'sh -c'. May use pipes, globs, redirects, and '&&'."},
     "workdir": {"type": "string", "description": "Workspace-relative working directory for the command (optional; defaults to the workspace root)."},
-    "timeout": {"type": "integer", "minimum": 1, "maximum": 120, "description": "Maximum runtime in seconds (optional; default 30, hard cap 120)."}
+    "timeout": {"type": "integer", "minimum": 1, "maximum": 120, "description": "Maximum runtime in seconds (optional; default 30, hard cap 120)."},
+    "grants": {"type": "array", "items": {"type": "string"}, "description": "Escalation grant tokens received in a PRIOR denial result for this exact command. Attach them verbatim to retry; NEVER invent, guess, or modify a token."}
   },
   "required": ["command"]
 }`
@@ -75,6 +76,11 @@ type bashArgs struct {
 	Command string `json:"command"`
 	Workdir string `json:"workdir"`
 	Timeout int    `json:"timeout"`
+	// Grants are opaque escalation tokens the model re-attaches from a prior
+	// denial result for THIS command. They are OPAQUE to harness — it never
+	// mints or verifies them (the sandbox does); it only carries them to a
+	// GrantedRunner. Absent means no grants.
+	Grants []string `json:"grants,omitempty"`
 }
 
 // Bash runs a single shell command in a workspace-contained directory. It depends
@@ -167,6 +173,11 @@ func (b *Bash) InvokableRun(ctx context.Context, argsJSON string) (*tool.ToolRes
 		dir = resolved
 	}
 
+	// Gather escalation grants from BOTH sources: the tool's own args and any the
+	// runner placed on ctx after a pre-ask approval (union, dedup, order-stable).
+	// The tokens stay OPAQUE — harness only carries them to a GrantedRunner.
+	merged := mergeGrants(a.Grants, tool.GrantsFromContext(ctx))
+
 	// Bound the command's runtime: clamp the caller timeout into (0, 120s].
 	timeout := clampBashTimeout(a.Timeout)
 	ctx2, cancel := context.WithTimeout(ctx, timeout)
@@ -178,20 +189,21 @@ func (b *Bash) InvokableRun(ctx context.Context, argsJSON string) (*tool.ToolRes
 		timedOut bool
 		runErr   error
 	)
-	if b.runner != nil {
-		// Confined path: the injected runner (e.g. the sandbox Executor) folds a
-		// timeout/cancel into err (it returns ctx.Err()); adapt its byte output +
-		// error into the (output, exitCode, timedOut, startErr) shape below.
+	// Grant-aware dispatch: when grants are present AND the injected runner supports
+	// them, run via RunCommandWithGrants; otherwise the exact Task-15 behavior
+	// (RunCommand if a runner is set, else direct sh -c). Grants present but no
+	// GrantedRunner (nil runner, or a RunCommand-only runner) falls through — the
+	// tokens are ignored at the exec layer (the gate already saw them).
+	if gr, ok := b.runner.(tool.GrantedRunner); ok && len(merged) > 0 {
+		// Confined + escalated path: the injected runner (e.g. the sandbox Executor)
+		// folds a timeout/cancel into err (it returns ctx.Err()); adapt its byte
+		// output + error into the (output, exitCode, timedOut, startErr) shape.
+		outBytes, ec, err := gr.RunCommandWithGrants(ctx2, dir, a.Command, merged)
+		out, exitCode, timedOut, runErr = adaptRunnerResult(ctx2, outBytes, ec, err)
+	} else if b.runner != nil {
+		// Confined path: same adaptation as the grants path, without the tokens.
 		outBytes, ec, err := b.runner.RunCommand(ctx2, dir, a.Command)
-		out, exitCode = string(outBytes), ec
-		switch {
-		case err == nil:
-			// success: timedOut/runErr stay zero.
-		case errors.Is(err, context.DeadlineExceeded) || ctx2.Err() == context.DeadlineExceeded:
-			timedOut = true
-		default:
-			runErr = err
-		}
+		out, exitCode, timedOut, runErr = adaptRunnerResult(ctx2, outBytes, ec, err)
 	} else {
 		out, exitCode, timedOut, runErr = runShellCommand(ctx2, dir, a.Command)
 	}
@@ -217,6 +229,54 @@ func clampBashTimeout(seconds int) time.Duration {
 		return maxBashTimeout
 	}
 	return d
+}
+
+// adaptRunnerResult maps an injected runner's (output, exitCode, err) return into
+// the (out, exitCode, timedOut, startErr) shape InvokableRun consumes, applying
+// the DeadlineExceeded→timedOut rule: the sandbox executor folds a timeout/cancel
+// into its returned err (ctx.Err()), so a deadline-exceeded err (directly or via
+// the expired ctx) is a timeout, not a start error. It is shared by the plain and
+// grant-carrying runner dispatch paths so both adapt identically.
+func adaptRunnerResult(ctx context.Context, outBytes []byte, exitCode int, err error) (out string, code int, timedOut bool, startErr error) {
+	out, code = string(outBytes), exitCode
+	switch {
+	case err == nil:
+		// success: timedOut/startErr stay zero.
+	case errors.Is(err, context.DeadlineExceeded) || ctx.Err() == context.DeadlineExceeded:
+		timedOut = true
+	default:
+		startErr = err
+	}
+	return out, code, timedOut, startErr
+}
+
+// mergeGrants unions the tool's own grant args with any grants the runner placed
+// on the ctx (a pre-ask approval): de-duplicated and order-stable — args first (in
+// order, first occurrence wins), then ctx-only tokens not already present. Grant
+// tokens are OPAQUE — harness never inspects or mints them; this only carries and
+// de-dupes the strings. No grants from either source → nil (so len==0 selects the
+// non-escalated path).
+func mergeGrants(argsGrants, ctxGrants []string) []string {
+	if len(argsGrants) == 0 && len(ctxGrants) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(argsGrants)+len(ctxGrants))
+	merged := make([]string, 0, len(argsGrants)+len(ctxGrants))
+	add := func(tokens []string) {
+		for _, g := range tokens {
+			if _, dup := seen[g]; dup {
+				continue
+			}
+			seen[g] = struct{}{}
+			merged = append(merged, g)
+		}
+	}
+	add(argsGrants)
+	add(ctxGrants)
+	if len(merged) == 0 {
+		return nil
+	}
+	return merged
 }
 
 // runShellCommand runs `sh -c command` in dir, capturing COMBINED stdout+stderr
