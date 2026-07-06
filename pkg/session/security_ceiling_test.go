@@ -2,6 +2,8 @@ package session
 
 import (
 	"context"
+	"errors"
+	"sync"
 	"testing"
 	"time"
 
@@ -10,6 +12,54 @@ import (
 	"github.com/looprig/harness/pkg/hub"
 	"github.com/looprig/harness/pkg/identity"
 )
+
+// ceilingEmit records, for one SecurityCeilingChanged durably appended, the Level it
+// carried and the value of the shared ceiling source AT THE INSTANT of the append — the
+// probe that pins the apply/emit ORDER (the hub's durable tap runs synchronously before
+// fan-out, so this read happens exactly when the emit commits).
+type ceilingEmit struct {
+	level         uint8
+	currentAtEmit uint8
+}
+
+// ceilingTapSpy is a fake hub durable tap (eventAppender) that both PROBES the emit order
+// (recording ceilingEmit for every SecurityCeilingChanged) and can INJECT a durable-append
+// fault selectively on those events — the seam that drives the fault-ordering cases.
+// Non-ceiling events (SessionStarted/LoopStarted/LoopIdle/...) always succeed, so the
+// session comes up and the loop runs; only the ceiling emit is faulted when failSC is set.
+type ceilingTapSpy struct {
+	state *ceiling.State
+	mu    sync.Mutex
+	seen  []ceilingEmit
+	fail  bool
+}
+
+func (r *ceilingTapSpy) AppendEvent(_ context.Context, ev event.Event) error {
+	sc, ok := ev.(event.SecurityCeilingChanged)
+	if !ok {
+		return nil
+	}
+	r.mu.Lock()
+	r.seen = append(r.seen, ceilingEmit{level: sc.Level, currentAtEmit: r.state.Current()})
+	fail := r.fail
+	r.mu.Unlock()
+	if fail {
+		return errors.New("injected durable append failure (security ceiling)")
+	}
+	return nil
+}
+
+func (r *ceilingTapSpy) setFail(v bool) {
+	r.mu.Lock()
+	r.fail = v
+	r.mu.Unlock()
+}
+
+func (r *ceilingTapSpy) emits() []ceilingEmit {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]ceilingEmit(nil), r.seen...)
+}
 
 // collectSecurityCeilingChanged drains sub for up to d, returning every
 // SecurityCeilingChanged it saw (ignoring the other session/loop events that flow). It
@@ -118,6 +168,122 @@ func TestWithCeilingSharesSource(t *testing.T) {
 	}
 	if got := s.CeilingSource().Current(); got != 3 {
 		t.Fatalf("CeilingSource().Current() = %d, want 3", got)
+	}
+}
+
+// TestSetSecurityCeilingDirectionOrdering pins the direction-dependent apply/emit order
+// via the durable tap: a RAISE emits BEFORE it mutates Current() (so the emit sees the OLD
+// ordinal), while a LOWER mutates Current() BEFORE it emits (so the emit sees the NEW,
+// lower ordinal). This is the ordering guarantee that forbids an un-persisted loosening.
+func TestSetSecurityCeilingDirectionOrdering(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	shared := ceiling.New()
+	spy := &ceilingTapSpy{state: shared}
+	s, err := New(ctx, cfg(&stubLLM{}), WithCeiling(shared), WithEventAppender(spy))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Shutdown(context.Background()) })
+
+	// Raise 0 -> 2: emit-before-apply, so the emit observes the OLD ordinal (0).
+	if err := s.SetSecurityCeiling(ctx, 2); err != nil {
+		t.Fatalf("SetSecurityCeiling(2): %v", err)
+	}
+	if got := shared.Current(); got != 2 {
+		t.Fatalf("Current() after raise = %d, want 2", got)
+	}
+	// Lower 2 -> 1: apply-before-emit, so the emit observes the NEW ordinal (1).
+	if err := s.SetSecurityCeiling(ctx, 1); err != nil {
+		t.Fatalf("SetSecurityCeiling(1): %v", err)
+	}
+	if got := shared.Current(); got != 1 {
+		t.Fatalf("Current() after lower = %d, want 1", got)
+	}
+
+	emits := spy.emits()
+	if len(emits) != 2 {
+		t.Fatalf("recorded %d ceiling emits, want 2: %+v", len(emits), emits)
+	}
+	if emits[0].level != 2 || emits[0].currentAtEmit != 0 {
+		t.Errorf("raise emit = %+v, want {level:2, currentAtEmit:0} (emit BEFORE the raise is applied)", emits[0])
+	}
+	if emits[1].level != 1 || emits[1].currentAtEmit != 1 {
+		t.Errorf("lower emit = %+v, want {level:1, currentAtEmit:1} (apply BEFORE the emit)", emits[1])
+	}
+}
+
+// TestSetSecurityCeilingLooseningFaultKeepsOld proves a LOOSENING whose durable emit faults
+// leaves Current() at the OLD (lower) ordinal — never raised. The permissiveness increase
+// is not live in-memory because it has no durable record, closing the audit/permissiveness
+// gap even for an in-flight turn's checker sharing this source.
+func TestSetSecurityCeilingLooseningFaultKeepsOld(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	shared := ceiling.New() // starts at 0
+	spy := &ceilingTapSpy{state: shared, fail: true}
+	s, err := New(ctx, cfg(&stubLLM{}), WithCeiling(shared), WithEventAppender(spy))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Shutdown(context.Background()) })
+
+	// Raise 0 -> 2 whose emit faults: PublishEvent returns nil (hub contract), and the raise
+	// is NOT applied. Current() stays 0.
+	if err := s.SetSecurityCeiling(ctx, 2); err != nil {
+		t.Fatalf("SetSecurityCeiling(2) returned %v, want nil (fault surfaced out-of-band)", err)
+	}
+	if got := shared.Current(); got != 0 {
+		t.Fatalf("loosening whose emit faulted left Current() = %d, want 0 (not raised ahead of the journal)", got)
+	}
+	if s.faultIfFaulted() == nil {
+		t.Errorf("session not faulted after an injected ceiling-append failure")
+	}
+	// The emit DID happen (the durable record was attempted) before the raise was declined.
+	if emits := spy.emits(); len(emits) != 1 || emits[0].level != 2 || emits[0].currentAtEmit != 0 {
+		t.Errorf("emits = %+v, want one {level:2, currentAtEmit:0} (emit-before-apply on a raise)", emits)
+	}
+}
+
+// TestSetSecurityCeilingTighteningFaultStillApplies proves a TIGHTENING whose durable emit
+// faults STILL lowers Current() immediately (§8): more-restrictive-in-memory is the safe
+// direction, so a tightening applies ahead of its durable record.
+func TestSetSecurityCeilingTighteningFaultStillApplies(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	shared := ceiling.New()
+	spy := &ceilingTapSpy{state: shared}
+	s, err := New(ctx, cfg(&stubLLM{}), WithCeiling(shared), WithEventAppender(spy))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Shutdown(context.Background()) })
+
+	// Set up a non-zero ceiling first (a raise that succeeds).
+	if err := s.SetSecurityCeiling(ctx, 2); err != nil {
+		t.Fatalf("SetSecurityCeiling(2): %v", err)
+	}
+	if got := shared.Current(); got != 2 {
+		t.Fatalf("setup Current() = %d, want 2", got)
+	}
+
+	// Now fault the next ceiling emit and TIGHTEN 2 -> 1: apply-before-emit means Current()
+	// is already 1 when the emit faults.
+	spy.setFail(true)
+	if err := s.SetSecurityCeiling(ctx, 1); err != nil {
+		t.Fatalf("SetSecurityCeiling(1) returned %v, want nil", err)
+	}
+	if got := shared.Current(); got != 1 {
+		t.Fatalf("tightening whose emit faulted left Current() = %d, want 1 (still lowered immediately)", got)
+	}
+	if s.faultIfFaulted() == nil {
+		t.Errorf("session not faulted after an injected ceiling-append failure")
 	}
 }
 

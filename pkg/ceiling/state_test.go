@@ -65,6 +65,28 @@ func TestStateSet(t *testing.T) {
 	}
 }
 
+// TestStateClamp proves Clamp is a PURE projection (the same reduction Set applies) that
+// never mutates Current — the applier relies on this to learn the effective ordinal and
+// pick the apply/emit direction before committing.
+func TestStateClamp(t *testing.T) {
+	t.Parallel()
+	// No cap: Clamp is the identity.
+	if got := New().Clamp(200); got != 200 {
+		t.Errorf("New().Clamp(200) = %d, want 200 (no cap)", got)
+	}
+	// Capped: reduce above the cap, keep at/below.
+	capped := NewClamped(2)
+	for _, tc := range []struct{ in, want uint8 }{{5, 2}, {2, 2}, {1, 1}, {0, 0}} {
+		if got := capped.Clamp(tc.in); got != tc.want {
+			t.Errorf("NewClamped(2).Clamp(%d) = %d, want %d", tc.in, got, tc.want)
+		}
+	}
+	// Clamp must not mutate Current.
+	if got := capped.Current(); got != 0 {
+		t.Errorf("Current() after Clamp calls = %d, want 0 (Clamp is pure, never stores)", got)
+	}
+}
+
 // TestStateConcurrent proves Current and Set are safe under the race detector — a
 // checker reads Current on many goroutines while the applier Sets.
 func TestStateConcurrent(t *testing.T) {

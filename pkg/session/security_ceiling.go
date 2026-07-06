@@ -23,11 +23,24 @@ import (
 // and the ceiling is read only at Check time, never re-read mid-spawn — so tightening the
 // ceiling never retro-confines an in-flight call.
 //
-// Order is apply-then-emit so the clamp is live before the durable record is written (§8's
-// "takes effect immediately"). It is operator-originated (Agency=AgencyUser). Deterministic
-// on replay: folding the emitted SecurityCeilingChanged events reproduces the exact ordinal
-// (last write wins). A faulted session (a required durable append already failed) refuses
-// it, fail-secure, like every other new-work entry point.
+// Ordering is DIRECTION-DEPENDENT to close the un-persisted-loosening gap:
+//
+//   - TIGHTENING or no-change (effective <= current): APPLY first, THEN emit. §8 requires
+//     a tightening to be live at once; if the emit later faults, a more-restrictive-in-
+//     memory ceiling is the SAFE direction, so applying ahead of the durable record is
+//     acceptable.
+//   - LOOSENING (effective > current, a raise): EMIT first, then apply the raise ONLY if
+//     the emit did NOT fault the session. PublishEvent returns nil on a required-append
+//     fault (the hub latches it via ReportFault inline), so the fault-latch is checked
+//     AFTER the emit. A raise is thus NEVER live in-memory ahead of its durable record —
+//     no live window more permissive than the journal, even for the in-flight turn's
+//     checker sharing this same source.
+//
+// It is operator-originated (Agency=AgencyUser). Deterministic on replay: folding the
+// emitted SecurityCeilingChanged events reproduces the exact ordinal (last write wins). A
+// faulted session (a required durable append already failed) refuses it up front, fail-
+// secure, like every other new-work entry point. Returning nil after a faulting emit is
+// consistent with the hub's PublishEvent contract (the fault is surfaced out-of-band).
 func (s *Session) SetSecurityCeiling(ctx context.Context, level uint8) error {
 	if err := s.faultIfFaulted(); err != nil {
 		return err
@@ -46,31 +59,48 @@ func (s *Session) SetSecurityCeiling(ctx context.Context, level uint8) error {
 	// metadata — replay reconstructs the ceiling from the emitted events, not this record.
 	s.appendCommand(ctx, s.PrimaryLoopID(), cmd)
 
-	// Apply FIRST so the clamp is live on the very next Check (§8), then emit the durable
-	// event that makes the change auditable and replayable. Set clamps to any configured
-	// maximum and returns the EFFECTIVE ordinal the event carries, so a replay fold
-	// reproduces the exact live value.
-	effective := s.applyCeiling(level)
+	// Compute the EFFECTIVE (post-clamp) target and the current ordinal WITHOUT mutating
+	// state yet, so the direction decides the apply/emit order. Set(effective) below is a
+	// fixed point (effective is already clamped), so re-clamping cannot change it.
+	cs := s.ceilingState()
+	current := cs.Current()
+	effective := cs.Clamp(level)
 
 	stamped, err := s.factory.Stamp(event.Header{Coordinates: identity.Coordinates{SessionID: s.SessionID}})
 	if err != nil {
 		return &SessionError{Kind: SessionIDGenerationFailed, Cause: err}
 	}
-	if err := s.PublishEvent(ctx, event.SecurityCeilingChanged{Header: stamped, Level: effective}); err != nil {
+	changed := event.SecurityCeilingChanged{Header: stamped, Level: effective}
+
+	if effective <= current {
+		// Tighten / no-change: apply FIRST so the clamp is live on the very next Check (§8),
+		// even if the emit later faults (more-restrictive-in-memory is the safe direction).
+		cs.Set(effective)
+		if err := s.PublishEvent(ctx, changed); err != nil {
+			return &SessionError{Kind: SessionContextDone, Cause: err}
+		}
+		return nil
+	}
+
+	// Loosen (a raise): emit FIRST, then apply the raise ONLY if the durable emit did not
+	// fault the session — so a raise is never live in-memory ahead of its durable record.
+	if err := s.PublishEvent(ctx, changed); err != nil {
 		return &SessionError{Kind: SessionContextDone, Cause: err}
+	}
+	if s.faultIfFaulted() == nil {
+		cs.Set(effective)
 	}
 	return nil
 }
 
-// applyCeiling sets the session's live ceiling ordinal and returns the effective
-// (post-clamp) value. The state is always non-nil in a constructed session (New/Restore
-// default-mint it); the nil-guard only covers a struct-literal test session (single
-// goroutine, so no race).
-func (s *Session) applyCeiling(level uint8) uint8 {
+// ceilingState returns the session's live ceiling state, default-minting it when nil. The
+// state is always non-nil in a constructed session (New/Restore default-mint it); the
+// nil-guard only covers a struct-literal test session (single goroutine, so no race).
+func (s *Session) ceilingState() *ceiling.State {
 	if s.ceiling == nil {
 		s.ceiling = ceiling.New()
 	}
-	return s.ceiling.Set(level)
+	return s.ceiling
 }
 
 // CeilingSource returns the session's live security-ceiling source (READ-only): the same
@@ -81,8 +111,5 @@ func (s *Session) applyCeiling(level uint8) uint8 {
 // root injected its own source via WithCeiling, this returns that SAME instance (the
 // checker and the session already share it).
 func (s *Session) CeilingSource() ceiling.Source {
-	if s.ceiling == nil {
-		s.ceiling = ceiling.New()
-	}
-	return s.ceiling
+	return s.ceilingState()
 }

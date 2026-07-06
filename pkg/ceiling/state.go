@@ -58,6 +58,18 @@ func NewClamped(max uint8) *State { return &State{max: max, hasMax: true} }
 // so a Set is visible on the very next Check (the clamp takes effect immediately, §8).
 func (s *State) Current() uint8 { return uint8(s.current.Load()) }
 
+// Clamp returns level reduced to the configured cap (when one is set), WITHOUT storing
+// it — the PURE projection Set applies. The applier uses it to learn the EFFECTIVE
+// ordinal (and compare it to Current to decide tighten vs loosen) BEFORE committing the
+// change, so the apply/emit order can be chosen by direction. It is safe to call
+// concurrently.
+func (s *State) Clamp(level uint8) uint8 {
+	if s.hasMax && level > s.max {
+		return s.max
+	}
+	return level
+}
+
 // Set applies a new ceiling ordinal, clamping to the configured cap when one is set, and
 // returns the EFFECTIVE (stored) ordinal. Applying a command.SetSecurityCeiling calls
 // this; the returned effective ordinal is what event.SecurityCeilingChanged carries, so
@@ -65,10 +77,7 @@ func (s *State) Current() uint8 { return uint8(s.current.Load()) }
 // WINS (a later Set overwrites an earlier one). It is safe to call concurrently with
 // Current.
 func (s *State) Set(level uint8) uint8 {
-	eff := level
-	if s.hasMax && eff > s.max {
-		eff = s.max
-	}
+	eff := s.Clamp(level)
 	s.current.Store(uint32(eff))
 	return eff
 }
