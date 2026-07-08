@@ -4,9 +4,9 @@ import (
 	"context"
 
 	"github.com/looprig/core/content"
+	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/loop"
-	"github.com/looprig/core/uuid"
 )
 
 // PermissionPosture is the typed, non-interactive permission mode passed to the
@@ -16,6 +16,15 @@ type PermissionPosture uint8
 const (
 	PostureDefault PermissionPosture = iota
 	PostureAcceptEdits
+)
+
+// SIDMode selects whether the foreign sid is known when the loop is constructed
+// or learned later from the agent's first ForeignInit.
+type SIDMode uint8
+
+const (
+	SIDPrebound SIDMode = iota
+	SIDLateBound
 )
 
 // EventPublisher is the foreign loop's narrow consumer of the session event
@@ -31,8 +40,8 @@ type ForeignAgent interface {
 	Spawn(ctx context.Context, t ForeignTurn) (ForeignStream, error)
 }
 
-// ForeignTurn is one turn's input to an agent. The sid is ALWAYS set (minted at
-// loop creation); StartNew selects --session-id (first turn) vs --resume.
+// ForeignTurn is one turn's input to an agent. In prebound mode, the sid is set at
+// loop creation; StartNew selects --session-id (first turn) vs --resume.
 type ForeignTurn struct {
 	SystemPrompt string
 	ForeignSID   string
@@ -91,5 +100,6 @@ type Spec struct {
 	ExecPath string
 	Cwd      string
 	Posture  PermissionPosture
+	SIDMode  SIDMode
 	Env      []string // whitelisted child environment (NOT os.Environ())
 }

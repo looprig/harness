@@ -5,11 +5,11 @@ import (
 	"fmt"
 	"log/slog"
 
-	"github.com/looprig/harness/pkg/command"
 	"github.com/looprig/core/content"
+	"github.com/looprig/core/uuid"
+	"github.com/looprig/harness/pkg/command"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/loop"
-	"github.com/looprig/core/uuid"
 )
 
 // Loop is the foreign-loop ACTOR: a goroutine that satisfies loop.Backend, drives a
@@ -49,20 +49,28 @@ type Loop struct {
 var _ loop.Backend = (*Loop)(nil)
 
 // New constructs a foreign loop and starts its actor goroutine. It validates the
-// caller-supplied wiring (fail-secure, typed *ConfigError), mints the immutable
-// foreign session id, and returns the loop plus that sid (the caller stamps it onto
-// LoopStarted). loopCtx is the loop's lifetime; cancelling it tears the actor down.
+// caller-supplied wiring (fail-secure, typed *ConfigError), prebinds the foreign
+// session id when requested, and returns the loop plus that sid (the caller stamps
+// it onto LoopStarted). loopCtx is the loop's lifetime; cancelling it tears the
+// actor down.
 func New(loopCtx context.Context, sessionID, loopID uuid.UUID, parent loop.Provenance,
 	pub EventPublisher, cfg loop.Config, spec Spec,
 	idGen func() (uuid.UUID, error), fac *event.Factory) (*Loop, string, error) {
 	if err := validateWiring(cfg, spec, idGen, fac, pub); err != nil {
 		return nil, "", err
 	}
-	u, err := idGen()
-	if err != nil {
-		return nil, "", &SpawnError{Cause: err}
+	sid := ""
+	switch spec.SIDMode {
+	case SIDPrebound:
+		u, err := idGen()
+		if err != nil {
+			return nil, "", &SpawnError{Cause: err}
+		}
+		sid = u.String()
+	case SIDLateBound:
+	default:
+		return nil, "", &ConfigError{Field: "Spec.SIDMode", Reason: "unknown"}
 	}
-	sid := u.String()
 	l := &Loop{
 		Commands:  make(chan command.Command),
 		Done:      make(chan struct{}),

@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/command"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/loop"
@@ -91,6 +92,56 @@ func TestNewValidation(t *testing.T) {
 			}
 			shutdown(t, l)
 		})
+	}
+}
+
+func TestNewLateBoundSpecReturnsEmptyInitialSID(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	fake := &fakeAgent{}
+	idGenCalls := 0
+	l, sid, err := New(ctx, mustID(t), mustID(t), loop.Provenance{}, &fakePublisher{}, validCfg(), Spec{
+		Agent:   fake,
+		Cwd:     t.TempDir(),
+		SIDMode: SIDLateBound,
+	}, func() (uuid.UUID, error) {
+		idGenCalls++
+		return uuid.New()
+	}, workingFac())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if sid != "" {
+		t.Fatalf("sid = %q, want empty", sid)
+	}
+	if idGenCalls != 0 {
+		t.Fatalf("idGen calls = %d, want 0 for late-bound sid", idGenCalls)
+	}
+	shutdown(t, l)
+}
+
+func TestNewRejectsUnknownSIDMode(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	l, sid, err := New(ctx, mustID(t), mustID(t), loop.Provenance{}, &fakePublisher{}, validCfg(), Spec{
+		Agent:   &fakeAgent{},
+		Cwd:     t.TempDir(),
+		SIDMode: SIDMode(99),
+	}, seqIDGen(), workingFac())
+	if err == nil {
+		shutdown(t, l)
+		t.Fatalf("New sid=%q err=nil, want invalid SIDMode error", sid)
+	}
+	var cfgErr *ConfigError
+	if !errors.As(err, &cfgErr) {
+		t.Fatalf("err = %T %v, want *ConfigError", err, err)
+	}
+	if cfgErr.Field != "Spec.SIDMode" {
+		t.Fatalf("ConfigError.Field = %q, want Spec.SIDMode", cfgErr.Field)
 	}
 }
 
