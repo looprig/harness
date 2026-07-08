@@ -131,6 +131,8 @@ func toolExecutionID(ev Event) uuid.UUID {
 	switch e := ev.(type) {
 	case PermissionRequested:
 		return e.ToolExecutionID
+	case PermissionDecided:
+		return e.ToolExecutionID
 	case UserInputRequested:
 		return e.ToolExecutionID
 	case ToolCallStarted:
@@ -205,12 +207,20 @@ func classify(ev Event) (name string, profile idProfile, ok bool) {
 		return "TurnInterrupted", turnProfile(), true
 	case PermissionRequested:
 		return "PermissionRequested", toolProfile(), true
+	case PermissionDecided:
+		return "PermissionDecided", toolProfile(), true
 	case UserInputRequested:
 		return "UserInputRequested", toolProfile(), true
 	case ToolCallStarted:
 		return "ToolCallStarted", toolProfile(), true
 	case ToolCallCompleted:
 		return "ToolCallCompleted", toolProfile(), true
+	case GatePrepared:
+		return "GatePrepared", stepProfile(), true
+	case GateOpened:
+		return "GateOpened", stepProfile(), true
+	case GateResolved:
+		return "GateResolved", stepProfile(), true
 	default:
 		return "Event", idProfile{}, false
 	}

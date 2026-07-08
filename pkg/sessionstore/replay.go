@@ -9,10 +9,10 @@ import (
 	"strconv"
 	"sync"
 
+	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/command"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/journal"
-	"github.com/looprig/core/uuid"
 	"github.com/looprig/storage"
 )
 
@@ -358,8 +358,8 @@ func (c *eventCursor) Next(ctx context.Context) (event.Event, uint64, error) {
 				continue // loop-narrowed: another loop's event, dropped like the NATS filter
 			}
 			return ev, r.seq, nil
-		case kindCommand, kindFence:
-			continue // events only — commands and fences are filtered out
+		case kindCommand, kindFence, kindGatePrepared:
+			continue // events only — commands, fences, and private gate-prepared records are filtered out
 		default:
 			return nil, 0, &ReplayDecodeError{Seq: r.seq, Cause: &EnvelopeError{Reason: "unexpected kind " + strconv.Quote(string(r.kind))}}
 		}
@@ -428,6 +428,12 @@ func (c *recordCursor) Next(ctx context.Context) (journal.JournalRecord, uint64,
 			return nil, 0, &ReplayDecodeError{Seq: r.seq, Cause: err}
 		}
 		return journal.NewFenceRecord(c.id, fence), r.seq, nil
+	case kindGatePrepared:
+		rec, err := journal.UnmarshalGatePreparedRecord(r.body)
+		if err != nil {
+			return nil, 0, &ReplayDecodeError{Seq: r.seq, Cause: err}
+		}
+		return rec, r.seq, nil
 	default:
 		return nil, 0, &ReplayDecodeError{Seq: r.seq, Cause: &EnvelopeError{Reason: "unexpected kind " + strconv.Quote(string(r.kind))}}
 	}

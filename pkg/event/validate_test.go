@@ -4,9 +4,10 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/looprig/harness/pkg/event"
-	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/core/uuid"
+	"github.com/looprig/harness/pkg/event"
+	"github.com/looprig/harness/pkg/gate"
+	"github.com/looprig/harness/pkg/identity"
 )
 
 // vID mints a non-zero UUID for validation tests or fails.
@@ -73,9 +74,13 @@ func TestValidateEventValid(t *testing.T) {
 		{"TokenDelta", event.TokenDelta{Header: stepH}},
 		{"StepDone", event.StepDone{Header: stepH}},
 		{"PermissionRequested", event.PermissionRequested{Header: stepH, ToolExecutionID: toolID}},
+		{"PermissionDecided", event.PermissionDecided{Header: stepH, ToolExecutionID: toolID, Effect: event.PermissionEffectApprove}},
 		{"UserInputRequested", event.UserInputRequested{Header: stepH, ToolExecutionID: toolID}},
 		{"ToolCallStarted", event.ToolCallStarted{Header: stepH, ToolExecutionID: toolID}},
 		{"ToolCallCompleted", event.ToolCallCompleted{Header: stepH, ToolExecutionID: toolID}},
+		{"GatePrepared", event.GatePrepared{Header: stepH, Gate: gate.Gate{ID: gate.ID(toolID)}}},
+		{"GateOpened", event.GateOpened{Header: stepH, Gate: gate.Gate{ID: gate.ID(toolID)}}},
+		{"GateResolved", event.GateResolved{Header: stepH, GateID: gate.ID(toolID)}},
 	}
 	for _, tt := range tests {
 		tt := tt

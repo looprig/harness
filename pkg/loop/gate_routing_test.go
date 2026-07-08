@@ -1,12 +1,87 @@
 package loop
 
 import (
+	"context"
+	"errors"
 	"testing"
 	"time"
 
-	"github.com/looprig/harness/pkg/command"
 	"github.com/looprig/core/uuid"
+	"github.com/looprig/harness/pkg/command"
+	gatedomain "github.com/looprig/harness/pkg/gate"
+	"github.com/looprig/harness/pkg/tool"
 )
+
+type gateRegistrarPublisher struct {
+	recordingPublisher
+	gateID      gatedomain.ID
+	prepareErr  error
+	activateErr error
+	prepared    []gatedomain.Gate
+	activated   []gatedomain.Route
+	closed      []gatedomain.ID
+}
+
+func (p *gateRegistrarPublisher) PrepareGateOpen(_ context.Context, _ uuid.UUID, g gatedomain.Gate, _ gatedomain.Payload) (gatedomain.ID, error) {
+	if p.prepareErr != nil {
+		return gatedomain.ID{}, p.prepareErr
+	}
+	gateID := p.gateID
+	if gateID.IsZero() {
+		gateID = g.Subject.ToolExecutionID
+	}
+	p.prepared = append(p.prepared, g)
+	return gateID, nil
+}
+
+func (p *gateRegistrarPublisher) ActivateGate(_ context.Context, id gatedomain.ID, route gatedomain.Route) error {
+	if p.activateErr != nil {
+		return p.activateErr
+	}
+	route.GateID = id
+	p.activated = append(p.activated, route)
+	return nil
+}
+
+func (p *gateRegistrarPublisher) CloseGate(_ context.Context, id gatedomain.ID, _ gatedomain.CloseReason) error {
+	p.closed = append(p.closed, id)
+	return nil
+}
+
+func newLoopWithGateRegistrar(t *testing.T, registrar *gateRegistrarPublisher) (*Loop, context.CancelFunc) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	sessionID := mustID(t)
+	loopID := mustID(t)
+	l, err := New(ctx, sessionID, loopID, Provenance{}, registrar, Config{Client: &fakeLLM{}, Model: testModel(), DrainTimeout: 200 * time.Millisecond})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(cancel)
+	return l, cancel
+}
+
+func TestPermissionGateUsesStableStringScopeOptions(t *testing.T) {
+	t.Parallel()
+	g := permissionGate(newCallID(t), tool.BashRequest{Command: "echo ok"})
+	fields := g.Prompt.Schema.Fields
+	if len(fields) != 1 || fields[0].Name != "scope" {
+		t.Fatalf("permission gate fields = %#v, want one scope field", fields)
+	}
+	var got []string
+	for _, opt := range fields[0].Options {
+		got = append(got, opt.Value)
+	}
+	want := []string{"once", "session", "workspace"}
+	if len(got) != len(want) {
+		t.Fatalf("scope options = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("scope options = %v, want %v", got, want)
+		}
+	}
+}
 
 // registerGate sends a gateRegistration through the actor's gateReg seam and waits
 // for the ack (the actor closes it once the gate is installed). It returns the
@@ -15,14 +90,18 @@ import (
 func registerGate(t *testing.T, l *Loop, callID uuid.UUID, kind gateKind) <-chan command.Command {
 	t.Helper()
 	reply := make(chan command.Command, 1)
-	ack := make(chan struct{})
+	ack := make(chan gateInstallAck, 1)
+	g := gatedomain.Gate{ID: callID, Subject: gatedomain.Subject{ToolExecutionID: callID}}
 	select {
-	case l.gateReg <- gateRegistration{callID: callID, reply: reply, kind: kind, ack: ack}:
+	case l.gateReg <- gateRegistration{gate: g, callID: callID, reply: reply, kind: kind, ack: ack}:
 	case <-time.After(2 * time.Second):
 		t.Fatal("gateReg send wedged")
 	}
 	select {
-	case <-ack:
+	case got := <-ack:
+		if got.err != nil {
+			t.Fatalf("gate registration err = %v", got.err)
+		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("gate registration not acked")
 	}
@@ -37,6 +116,103 @@ func recvReply(t *testing.T, reply <-chan command.Command, d time.Duration) (com
 		return cmd, true
 	case <-time.After(d):
 		return nil, false
+	}
+}
+
+func TestLoopGatePrepareFailureDoesNotInstallLocalBlocker(t *testing.T) {
+	t.Parallel()
+	callID := newCallID(t)
+	registrar := &gateRegistrarPublisher{prepareErr: errors.New("prepare failed")}
+	l, _ := newLoopWithGateRegistrar(t, registrar)
+	reply := make(chan command.Command, 1)
+	ack := make(chan gateInstallAck, 1)
+
+	l.gateReg <- gateRegistration{
+		gate:   gatedomain.Gate{Subject: gatedomain.Subject{ToolExecutionID: callID}},
+		callID: callID,
+		reply:  reply,
+		kind:   gateUserInput,
+		ack:    ack,
+	}
+	got := <-ack
+	if got.err == nil {
+		t.Fatal("gate registration err = nil, want prepare failure")
+	}
+
+	l.Commands <- command.ProvideUserInput{GateRoute: command.GateRoute{ToolExecutionID: callID}, Answer: "late"}
+	if _, ok := recvReply(t, reply, 200*time.Millisecond); ok {
+		t.Fatal("gate reply delivered after prepare failure")
+	}
+}
+
+func TestLoopGateActivationFailureRemovesLocalBlocker(t *testing.T) {
+	t.Parallel()
+	callID := newCallID(t)
+	gateID := newCallID(t)
+	registrar := &gateRegistrarPublisher{gateID: gateID, activateErr: errors.New("activate failed")}
+	l, _ := newLoopWithGateRegistrar(t, registrar)
+	reply := make(chan command.Command, 1)
+	ack := make(chan gateInstallAck, 1)
+
+	l.gateReg <- gateRegistration{
+		gate:   gatedomain.Gate{Subject: gatedomain.Subject{ToolExecutionID: callID}},
+		callID: callID,
+		reply:  reply,
+		kind:   gateUserInput,
+		ack:    ack,
+	}
+	got := <-ack
+	if got.err == nil || got.gateID != gateID {
+		t.Fatalf("gate registration ack = %+v, want activation failure with gateID %v", got, gateID)
+	}
+	if len(registrar.closed) != 1 || registrar.closed[0] != gateID {
+		t.Fatalf("closed gates = %+v, want [%v]", registrar.closed, gateID)
+	}
+
+	l.Commands <- command.ProvideUserInput{GateRoute: command.GateRoute{GateID: gateID, ToolExecutionID: callID}, Answer: "late"}
+	if _, ok := recvReply(t, reply, 200*time.Millisecond); ok {
+		t.Fatal("gate reply delivered after activation failure")
+	}
+}
+
+func TestLoopGateRoutesByGateIDAfterActivation(t *testing.T) {
+	t.Parallel()
+	callID := newCallID(t)
+	gateID := newCallID(t)
+	registrar := &gateRegistrarPublisher{gateID: gateID}
+	l, _ := newLoopWithGateRegistrar(t, registrar)
+	reply := make(chan command.Command, 1)
+	ack := make(chan gateInstallAck, 1)
+
+	l.gateReg <- gateRegistration{
+		gate:   gatedomain.Gate{Subject: gatedomain.Subject{ToolExecutionID: callID}},
+		callID: callID,
+		reply:  reply,
+		kind:   gateUserInput,
+		ack:    ack,
+	}
+	if got := <-ack; got.err != nil || got.gateID != gateID {
+		t.Fatalf("gate registration ack = %+v, want gateID %v and nil err", got, gateID)
+	}
+	if len(registrar.activated) != 1 {
+		t.Fatalf("activated count = %d, want 1", len(registrar.activated))
+	}
+	if registrar.activated[0].GateID != gateID || registrar.activated[0].ToolExecutionID != callID {
+		t.Fatalf("activated route = %+v, want gateID/toolExecutionID", registrar.activated[0])
+	}
+
+	l.Commands <- command.ProvideUserInput{GateRoute: command.GateRoute{GateID: gateID, ToolExecutionID: callID}, Answer: "answer"}
+	got, ok := recvReply(t, reply, 2*time.Second)
+	if !ok {
+		t.Fatal("gate received no reply after activation")
+	}
+	if pui, ok := got.(command.ProvideUserInput); !ok || pui.Answer != "answer" {
+		t.Fatalf("gate reply = %+v, want ProvideUserInput answer", got)
+	}
+
+	l.Commands <- command.ProvideUserInput{GateRoute: command.GateRoute{GateID: gateID, ToolExecutionID: callID}, Answer: "duplicate"}
+	if _, ok := recvReply(t, reply, 200*time.Millisecond); ok {
+		t.Fatal("duplicate gate reply delivered")
 	}
 }
 

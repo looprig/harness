@@ -9,14 +9,15 @@ import (
 	"testing"
 
 	"github.com/looprig/core/content"
-	"github.com/looprig/harness/pkg/event"
-	"github.com/looprig/harness/pkg/tool"
-	"github.com/looprig/core/uuid"
+	"github.com/looprig/harness/pkg/gate"
 )
 
-// gatePrompt is the human-facing description the permission gate carries in these
-// tests (BashRequest.Description() returns its Command verbatim).
-const gatePrompt = "rm -rf /tmp/x"
+type fakeGateError struct {
+	kind string
+}
+
+func (e fakeGateError) Error() string         { return "fake gate error: " + e.kind }
+func (e fakeGateError) GateErrorKind() string { return e.kind }
 
 // doReqBody issues method+path against ts with a JSON body and returns the
 // response; the caller closes the body. It fatals on a construction/transport
@@ -122,146 +123,81 @@ func TestInput(t *testing.T) {
 	}
 }
 
-// TestGateResolution is the core routing test: it proves POST
-// /sessions/{sid}/gates/{tid} resolves an OPEN gate by pulling the producing
-// LoopID from the supervisor registry (never the client body), validates the
-// action against the gate Kind (fail-secure 409 on a mismatch), and dispatches
-// Approve/Deny/ProvideAnswer with the tool-execution id. No SSE client is ever
-// attached — the supervisor owns its own subscription.
+// TestGateResolution proves POST /sessions/{sid}/gates/{gid} treats {gid} as the
+// opaque gate.ID, decodes the generic gate.ResponseRequest body, stamps a user
+// source, and delegates the complete response to Agent.RespondGate. The API does
+// not inspect gate kind and does not consult an open-gate registry.
 func TestGateResolution(t *testing.T) {
 	t.Parallel()
 
-	const kindNone = ""
-
 	tests := []struct {
 		name        string
-		gateKind    string // kindNone => feed no gate (tid stays unregistered)
 		body        string
-		approveErr  error
+		respondErr  error
 		sidOverride string
-		tidOverride string
+		gidOverride string
 		wantStatus  int
-		assert      func(t *testing.T, fa *fakeAgent, tid, lid uuid.UUID)
+		assert      func(t *testing.T, fa *fakeAgent, gid gate.ID)
 	}{
 		{
-			name: "approve permission gate routes registry LoopID", gateKind: kindPermission,
-			body: `{"action":"approve","scope":0}`, wantStatus: http.StatusNoContent,
-			assert: func(t *testing.T, fa *fakeAgent, tid, lid uuid.UUID) {
-				called, loopID, callID, scope := fa.approveArgs()
+			name: "response request is delegated with gate id and user source",
+			body: `{"action":"approve","values":{"scope":"session","accepted_grants":["grant-a"]}}`, wantStatus: http.StatusAccepted,
+			assert: func(t *testing.T, fa *fakeAgent, gid gate.ID) {
+				called, got := fa.respondGateArgs()
 				if !called {
-					t.Fatal("Approve not called")
+					t.Fatal("RespondGate not called")
 				}
-				if loopID != lid {
-					t.Errorf("Approve loopID = %v, want registry lid %v", loopID, lid)
+				if got.GateID != gid {
+					t.Errorf("RespondGate GateID = %v, want %v", got.GateID, gid)
 				}
-				if callID != tid {
-					t.Errorf("Approve callID = %v, want tid %v", callID, tid)
+				if got.Action != "approve" {
+					t.Errorf("RespondGate Action = %q, want approve", got.Action)
 				}
-				if scope != tool.ScopeOnce {
-					t.Errorf("Approve scope = %v, want ScopeOnce", scope)
+				if got.Source.Kind != gate.ResponseFromUser {
+					t.Errorf("RespondGate Source.Kind = %q, want %q", got.Source.Kind, gate.ResponseFromUser)
 				}
-			},
-		},
-		{
-			name: "approve default scope is ScopeOnce", gateKind: kindPermission,
-			body: `{"action":"approve"}`, wantStatus: http.StatusNoContent,
-			assert: func(t *testing.T, fa *fakeAgent, _, _ uuid.UUID) {
-				called, _, _, scope := fa.approveArgs()
-				if !called || scope != tool.ScopeOnce {
-					t.Errorf("Approve called=%v scope=%v, want called=true scope=ScopeOnce", called, scope)
+				if got.Source.Reason != "" {
+					t.Errorf("RespondGate Source.Reason = %q, want empty", got.Source.Reason)
 				}
-			},
-		},
-		{
-			name: "approve honors explicit session scope", gateKind: kindPermission,
-			body: `{"action":"approve","scope":1}`, wantStatus: http.StatusNoContent,
-			assert: func(t *testing.T, fa *fakeAgent, _, _ uuid.UUID) {
-				_, _, _, scope := fa.approveArgs()
-				if scope != tool.ScopeSession {
-					t.Errorf("Approve scope = %v, want ScopeSession", scope)
+				if got := string(got.Values["scope"]); got != `"session"` {
+					t.Errorf("RespondGate Values[scope] = %s, want \"session\"", got)
+				}
+				if got := string(got.Values["accepted_grants"]); got != `["grant-a"]` {
+					t.Errorf("RespondGate Values[accepted_grants] = %s, want [\"grant-a\"]", got)
 				}
 			},
 		},
 		{
-			name: "deny permission gate routes registry LoopID", gateKind: kindPermission,
-			body: `{"action":"deny"}`, wantStatus: http.StatusNoContent,
-			assert: func(t *testing.T, fa *fakeAgent, tid, lid uuid.UUID) {
-				called, loopID, callID := fa.denyArgs()
-				if !called {
-					t.Fatal("Deny not called")
-				}
-				if loopID != lid || callID != tid {
-					t.Errorf("Deny (loopID,callID) = (%v,%v), want (%v,%v)", loopID, callID, lid, tid)
-				}
-			},
-		},
-		{
-			name: "answer user-input gate routes registry LoopID", gateKind: kindUserInput,
-			body: `{"action":"answer","answer":"blue"}`, wantStatus: http.StatusNoContent,
-			assert: func(t *testing.T, fa *fakeAgent, tid, lid uuid.UUID) {
-				called, loopID, callID, answer := fa.answerArgs()
-				if !called {
-					t.Fatal("ProvideAnswer not called")
-				}
-				if loopID != lid || callID != tid {
-					t.Errorf("ProvideAnswer (loopID,callID) = (%v,%v), want (%v,%v)", loopID, callID, lid, tid)
-				}
-				if answer != "blue" {
-					t.Errorf("ProvideAnswer answer = %q, want %q", answer, "blue")
-				}
-			},
-		},
-		{
-			name: "unknown tool-execution id returns 404", gateKind: kindNone,
-			body: `{"action":"approve"}`, wantStatus: http.StatusNotFound,
-		},
-		{
-			name: "answer on a permission gate is a 409 mismatch", gateKind: kindPermission,
-			body: `{"action":"answer","answer":"x"}`, wantStatus: http.StatusConflict,
-			assert: func(t *testing.T, fa *fakeAgent, _, _ uuid.UUID) {
-				ac, _, _, _ := fa.approveArgs()
-				dc, _, _ := fa.denyArgs()
-				an, _, _, _ := fa.answerArgs()
-				if ac || dc || an {
-					t.Error("a kind-mismatched action dispatched a control (want fail-secure: nothing dispatched)")
-				}
-			},
-		},
-		{
-			name: "approve on a user-input gate is a 409 mismatch", gateKind: kindUserInput,
-			body: `{"action":"approve"}`, wantStatus: http.StatusConflict,
-		},
-		{
-			name: "unknown action is a 400", gateKind: kindPermission,
-			body: `{"action":"frobnicate"}`, wantStatus: http.StatusBadRequest,
-		},
-		{
-			name: "out-of-range scope is a 400", gateKind: kindPermission,
-			body: `{"action":"approve","scope":99}`, wantStatus: http.StatusBadRequest,
-		},
-		{
-			name: "negative scope is a 400", gateKind: kindPermission,
-			body: `{"action":"approve","scope":-1}`, wantStatus: http.StatusBadRequest,
-		},
-		{
-			name: "malformed json is a 400", gateKind: kindPermission,
+			name: "malformed json is a 400",
 			body: `{"action":`, wantStatus: http.StatusBadRequest,
 		},
 		{
-			name: "agent Approve error is a 500", gateKind: kindPermission,
-			body: `{"action":"approve"}`, approveErr: errInterrupt, wantStatus: http.StatusInternalServerError,
+			name: "agent RespondGate error is a 500",
+			body: `{"action":"approve"}`, respondErr: errInterrupt, wantStatus: http.StatusInternalServerError,
 		},
 		{
-			name: "unknown session returns 404", gateKind: kindNone,
+			name: "gate not found returns 404",
+			body: `{"action":"approve"}`, respondErr: fakeGateError{kind: "not_found"}, wantStatus: http.StatusNotFound,
+		},
+		{
+			name: "invalid gate action returns 400",
+			body: `{"action":"bogus"}`, respondErr: fakeGateError{kind: "action_invalid"}, wantStatus: http.StatusBadRequest,
+		},
+		{
+			name: "not-ready gate returns 409",
+			body: `{"action":"approve"}`, respondErr: fakeGateError{kind: "not_ready"}, wantStatus: http.StatusConflict,
+		},
+		{
+			name: "unknown session returns 404",
 			body: `{"action":"approve"}`, sidOverride: mkID(0xEE).String(), wantStatus: http.StatusNotFound,
 		},
 		{
-			name: "malformed session id returns 400", gateKind: kindNone,
+			name: "malformed session id returns 400",
 			body: `{"action":"approve"}`, sidOverride: "not-a-uuid", wantStatus: http.StatusBadRequest,
 		},
 		{
-			name: "malformed tool-execution id returns 400", gateKind: kindNone,
-			body: `{"action":"approve"}`, tidOverride: "not-a-uuid", wantStatus: http.StatusBadRequest,
+			name: "malformed gate id returns 400",
+			body: `{"action":"approve"}`, gidOverride: "not-a-uuid", wantStatus: http.StatusBadRequest,
 		},
 	}
 	for _, tt := range tests {
@@ -273,115 +209,82 @@ func TestGateResolution(t *testing.T) {
 			defer ts.Close()
 			t.Cleanup(func() { stopAll(s) })
 
-			fs := newFakeSub()
-			fa := &fakeAgent{sub: fs, approveErr: tt.approveErr}
-			sup := mustSupervisor(t, fa)
-			sid, tid, lid := mkID(0xB1), mkID(0xC1), mkID(0xD1)
-			s.putSession(sid, &sessionEntry{agent: fa, sup: sup})
-
-			switch tt.gateKind {
-			case kindPermission:
-				fs.feed(event.PermissionRequested{Header: loopHeader(lid), ToolExecutionID: tid, Request: tool.BashRequest{Command: gatePrompt}})
-			case kindUserInput:
-				fs.feed(event.UserInputRequested{Header: loopHeader(lid), ToolExecutionID: tid, Question: "pick a color"})
-			}
-			if tt.gateKind != kindNone {
-				if !pollUntil(t, func() bool { _, ok := sup.lookup(tid); return ok }) {
-					t.Fatalf("gate %v not recorded within %v", tid, pollDeadline)
-				}
-			}
+			fa := &fakeAgent{sub: newFakeSub(), respondGateErr: tt.respondErr}
+			sid, gid := mkID(0xB1), gate.ID(mkID(0xC1))
+			s.putSession(sid, &sessionEntry{agent: fa, sup: mustSupervisor(t, fa)})
 
 			sidPart := sid.String()
 			if tt.sidOverride != "" {
 				sidPart = tt.sidOverride
 			}
-			tidPart := tid.String()
-			if tt.tidOverride != "" {
-				tidPart = tt.tidOverride
+			gidPart := gid.String()
+			if tt.gidOverride != "" {
+				gidPart = tt.gidOverride
 			}
-			resp := doReqBody(t, ts, http.MethodPost, "/sessions/"+sidPart+"/gates/"+tidPart, tt.body)
+			resp := doReqBody(t, ts, http.MethodPost, "/sessions/"+sidPart+"/gates/"+gidPart, tt.body)
 			defer func() { _ = resp.Body.Close() }()
 
 			if resp.StatusCode != tt.wantStatus {
 				t.Fatalf("POST gate status = %d, want %d", resp.StatusCode, tt.wantStatus)
 			}
 			if tt.assert != nil {
-				tt.assert(t, fa, tid, lid)
+				tt.assert(t, fa, gid)
 			}
 		})
 	}
 }
 
-// TestListGates proves GET /sessions/{sid}/gates returns the live open-gate set
-// for a reconnecting client, emits an empty JSON array (never null) for a session
-// with no open gates, fails secure with 503 when the supervisor's subscription
-// has DIED (its registry is stale), 404s an unknown session, and 400s a malformed
-// id.
+// TestListGates proves GET /sessions/{sid}/gates returns Agent.ListGates(ctx)
+// rather than an API-maintained shadow registry, emits an empty JSON array (never
+// null), 404s an unknown session, and 400s a malformed id.
 func TestListGates(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
 		name           string
-		setup          func(t *testing.T, s *server) (path string, tid, lid uuid.UUID)
+		setup          func(t *testing.T, s *server) (path string, want []gate.Gate)
 		wantStatus     int
-		wantGates      int
 		wantEmptyArray bool
-		wantMatch      bool
 	}{
 		{
-			name: "one open gate is listed",
-			setup: func(t *testing.T, s *server) (string, uuid.UUID, uuid.UUID) {
-				fs := newFakeSub()
-				fa := &fakeAgent{sub: fs}
-				sup := mustSupervisor(t, fa)
-				sid, tid, lid := mkID(0xB1), mkID(0xC1), mkID(0xD1)
-				s.putSession(sid, &sessionEntry{agent: fa, sup: sup})
-				fs.feed(event.PermissionRequested{Header: loopHeader(lid), ToolExecutionID: tid, Request: tool.BashRequest{Command: gatePrompt}})
-				if !pollUntil(t, func() bool { _, ok := sup.lookup(tid); return ok }) {
-					t.Fatalf("gate %v not recorded within %v", tid, pollDeadline)
-				}
-				return "/sessions/" + sid.String() + "/gates", tid, lid
+			name: "agent open gates are listed",
+			setup: func(t *testing.T, s *server) (string, []gate.Gate) {
+				want := []gate.Gate{{
+					ID:   gate.ID(mkID(0xC1)),
+					Kind: gate.KindPermission,
+					Prompt: gate.Prompt{
+						Body: "approve command?",
+					},
+				}}
+				fa := &fakeAgent{sub: newFakeSub(), listGates: want}
+				sid := mkID(0xB1)
+				s.putSession(sid, &sessionEntry{agent: fa, sup: mustSupervisor(t, fa)})
+				return "/sessions/" + sid.String() + "/gates", want
 			},
-			wantStatus: http.StatusOK, wantGates: 1, wantMatch: true,
+			wantStatus: http.StatusOK,
 		},
 		{
 			name: "empty session yields an empty array",
-			setup: func(t *testing.T, s *server) (string, uuid.UUID, uuid.UUID) {
-				fa := &fakeAgent{sub: newFakeSub()}
+			setup: func(t *testing.T, s *server) (string, []gate.Gate) {
+				fa := &fakeAgent{sub: newFakeSub(), listGates: nil}
 				sup := mustSupervisor(t, fa)
 				sid := mkID(0xB2)
 				s.putSession(sid, &sessionEntry{agent: fa, sup: sup})
-				return "/sessions/" + sid.String() + "/gates", uuid.UUID{}, uuid.UUID{}
+				return "/sessions/" + sid.String() + "/gates", nil
 			},
-			wantStatus: http.StatusOK, wantGates: 0, wantEmptyArray: true,
-		},
-		{
-			name: "dead supervisor fails secure with 503",
-			setup: func(t *testing.T, s *server) (string, uuid.UUID, uuid.UUID) {
-				fs := newFakeSub()
-				fa := &fakeAgent{sub: fs}
-				sup := mustSupervisor(t, fa)
-				sid := mkID(0xB3)
-				s.putSession(sid, &sessionEntry{agent: fa, sup: sup})
-				fs.fail(errStreamLost)
-				if !pollUntil(t, func() bool { return sup.exitError() != nil }) {
-					t.Fatalf("supervisor did not record exit error within %v", pollDeadline)
-				}
-				return "/sessions/" + sid.String() + "/gates", uuid.UUID{}, uuid.UUID{}
-			},
-			wantStatus: http.StatusServiceUnavailable,
+			wantStatus: http.StatusOK, wantEmptyArray: true,
 		},
 		{
 			name: "unknown session returns 404",
-			setup: func(_ *testing.T, _ *server) (string, uuid.UUID, uuid.UUID) {
-				return "/sessions/" + mkID(0xEE).String() + "/gates", uuid.UUID{}, uuid.UUID{}
+			setup: func(_ *testing.T, _ *server) (string, []gate.Gate) {
+				return "/sessions/" + mkID(0xEE).String() + "/gates", nil
 			},
 			wantStatus: http.StatusNotFound,
 		},
 		{
 			name: "malformed session id returns 400",
-			setup: func(_ *testing.T, _ *server) (string, uuid.UUID, uuid.UUID) {
-				return "/sessions/not-a-uuid/gates", uuid.UUID{}, uuid.UUID{}
+			setup: func(_ *testing.T, _ *server) (string, []gate.Gate) {
+				return "/sessions/not-a-uuid/gates", nil
 			},
 			wantStatus: http.StatusBadRequest,
 		},
@@ -395,7 +298,7 @@ func TestListGates(t *testing.T) {
 			defer ts.Close()
 			t.Cleanup(func() { stopAll(s) })
 
-			path, tid, lid := tt.setup(t, s)
+			path, want := tt.setup(t, s)
 			resp := doReq(t, ts, http.MethodGet, path)
 			defer func() { _ = resp.Body.Close() }()
 
@@ -410,21 +313,20 @@ func TestListGates(t *testing.T) {
 			if err != nil {
 				t.Fatalf("ReadAll(gates body) error = %v", err)
 			}
-			var body gatesResponse
+			var body struct {
+				Gates []gate.Gate `json:"gates"`
+			}
 			if err := json.Unmarshal(raw, &body); err != nil {
 				t.Fatalf("decode gatesResponse: %v", err)
 			}
-			if len(body.Gates) != tt.wantGates {
-				t.Fatalf("gates len = %d, want %d", len(body.Gates), tt.wantGates)
+			if len(body.Gates) != len(want) {
+				t.Fatalf("gates len = %d, want %d", len(body.Gates), len(want))
 			}
 			if tt.wantEmptyArray && !strings.Contains(string(raw), `"gates":[]`) {
 				t.Errorf("empty body = %q, want it to contain \"gates\":[] (not null)", raw)
 			}
-			if tt.wantMatch {
-				want := gateView{ToolExecutionID: tid.String(), LoopID: lid.String(), Kind: kindPermission, Prompt: gatePrompt}
-				if body.Gates[0] != want {
-					t.Errorf("gate = %+v, want %+v", body.Gates[0], want)
-				}
+			if len(want) > 0 && body.Gates[0].ID != want[0].ID {
+				t.Errorf("gate id = %v, want %v", body.Gates[0].ID, want[0].ID)
 			}
 		})
 	}

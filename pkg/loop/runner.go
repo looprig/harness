@@ -12,6 +12,7 @@ import (
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/command"
 	"github.com/looprig/harness/pkg/event"
+	gatedomain "github.com/looprig/harness/pkg/gate"
 	"github.com/looprig/harness/pkg/tool"
 )
 
@@ -317,16 +318,52 @@ func resolvePermission(
 		return nil
 	}
 
-	switch ts.Permission.Check(ctx, r.t, r.block.Name, r.argsstr) {
+	decision := checkPermissionDecision(ctx, r, ts)
+	switch decision.Effect {
 	case EffectAutoApprove:
+		emitPermissionDecided(r, decision, event.PermissionEffectApprove, emit)
 		applyApprovedGrants(ctx, r, ts)
 		return nil
 	case EffectDeny:
+		emitPermissionDecided(r, decision, event.PermissionEffectDeny, emit)
 		r.fail(errPermissionDenied)
 		return nil
 	default: // EffectAsk (the fail-secure zero value)
 		return askPermission(ctx, r, ts, gateReg, emit)
 	}
+}
+
+func checkPermissionDecision(ctx context.Context, r *resolved, ts ToolSet) PermissionDecision {
+	if dc, ok := ts.Permission.(interface {
+		CheckDecision(context.Context, tool.InvokableTool, string, string) PermissionDecision
+	}); ok {
+		return dc.CheckDecision(ctx, r.t, r.block.Name, r.argsstr)
+	}
+	return PermissionDecision{Effect: ts.Permission.Check(ctx, r.t, r.block.Name, r.argsstr)}
+}
+
+func emitPermissionDecided(
+	r *resolved,
+	decision PermissionDecision,
+	effect event.PermissionDecisionEffect,
+	emit func(event.Event),
+) {
+	reason := decision.Reason
+	if reason == "" {
+		switch effect {
+		case event.PermissionEffectApprove:
+			reason = "auto_approve"
+		case event.PermissionEffectDeny:
+			reason = "auto_deny"
+		}
+	}
+	emit(event.PermissionDecided{
+		ToolExecutionID: r.callID,
+		Effect:          effect,
+		Reason:          reason,
+		Subject:         r.block.Name,
+		Audit:           r.summary,
+	})
 }
 
 // applyApprovedGrants probes the gate for the OPTIONAL ApprovedGrants re-mint method
@@ -363,17 +400,23 @@ func askPermission(
 	req := buildRequest(r.t, r.block.Name, r.summary, r.argsstr, r.prepared)
 
 	// reply is buffered(1) (runner is the sole reader, so the actor's routed send
-	// never blocks). ack is unbuffered: the actor closes it to signal installation.
+	// never blocks). ack carries the session-minted GateID or the prepare/activate error.
 	reply := make(chan command.Command, 1)
-	ack := make(chan struct{})
+	ack := make(chan gateInstallAck, 1)
+	g := permissionGate(r.callID, req)
+	payload := gatedomain.PermissionPayload{Request: req}
 
 	select {
-	case gateReg <- gateRegistration{callID: r.callID, reply: reply, kind: gatePermission, ack: ack}:
+	case gateReg <- gateRegistration{gate: g, payload: payload, callID: r.callID, reply: reply, kind: gatePermission, ack: ack}:
 	case <-ctx.Done():
 		return ctx.Err()
 	}
+	var installed gateInstallAck
 	select {
-	case <-ack:
+	case installed = <-ack:
+		if installed.err != nil {
+			return installed.err
+		}
 	case <-ctx.Done():
 		return ctx.Err()
 	}
@@ -384,6 +427,16 @@ func askPermission(
 
 	select {
 	case cmd := <-reply:
+		switch c := cmd.(type) {
+		case command.ApproveToolCall:
+			if !c.GateRoute.GateID.IsZero() && c.GateRoute.GateID != installed.gateID {
+				return &GateReplyMismatchError{ToolExecutionID: r.callID}
+			}
+		case command.DenyToolCall:
+			if !c.GateRoute.GateID.IsZero() && c.GateRoute.GateID != installed.gateID {
+				return &GateReplyMismatchError{ToolExecutionID: r.callID}
+			}
+		}
 		return applyDecision(ctx, r, ts, cmd)
 	case <-ctx.Done():
 		return ctx.Err()

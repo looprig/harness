@@ -62,6 +62,16 @@ const (
 // its dir field — the workspace root itself.
 const defaultSearchDir = "."
 
+const (
+	reasonContainment       = "containment"
+	reasonHardDeny          = "hard_deny"
+	reasonEffectChecker     = "effect_checker"
+	reasonHardApprove       = "hard_approve"
+	reasonPersistedApproval = "persisted_approval"
+	reasonSessionPolicy     = "session_policy"
+	reasonPosture           = "posture"
+)
+
 // toolClass is how Check classifies a tool to know which boundary to extract.
 type toolClass uint8
 
@@ -122,6 +132,13 @@ func classifyTool(toolName string) toolClass {
 //	                         interlock (§10.2/§10.3); nil posture = no-op
 //	Stage 7  Default       — EffectAsk
 func (c *PermissionChecker) Check(ctx context.Context, t tool.InvokableTool, toolName, argsJSON string) loop.Effect {
+	return c.CheckDecision(ctx, t, toolName, argsJSON).Effect
+}
+
+// CheckDecision is Check plus a stable, redacted reason for non-gated decisions.
+// The runner probes this optional method structurally; Check remains the
+// compatibility interface for simpler gates.
+func (c *PermissionChecker) CheckDecision(ctx context.Context, t tool.InvokableTool, toolName, argsJSON string) loop.PermissionDecision {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -131,11 +148,11 @@ func (c *PermissionChecker) Check(ctx context.Context, t tool.InvokableTool, too
 	// denied (a boundary was provably crossed), askOnly (the call is malformed/
 	// ambiguous — it cleared the boundary but must NOT be auto-approved), or
 	// cleared (proceed to the approval stages).
-	switch eff, outcome := c.stageContainmentAndHardDeny(toolName, class, argsJSON); outcome {
+	switch eff, outcome, reason := c.stageContainmentAndHardDeny(toolName, class, argsJSON); outcome {
 	case boundaryDenied:
-		return eff
+		return loop.PermissionDecision{Effect: eff, Reason: reason}
 	case boundaryAskOnly:
-		return loop.EffectAsk
+		return loop.PermissionDecision{Effect: loop.EffectAsk}
 	}
 
 	// Fail-secure malformed-args gate (defense in depth — the runner normally
@@ -145,7 +162,7 @@ func (c *PermissionChecker) Check(ctx context.Context, t tool.InvokableTool, too
 	// EffectChecker, a HardApprove "*", a persisted allow, or a session policy).
 	// It falls straight to EffectAsk so the user is prompted.
 	if !argsAreObject(argsJSON) {
-		return loop.EffectAsk
+		return loop.PermissionDecision{Effect: loop.EffectAsk}
 	}
 
 	// Stage 3: EffectChecker (an explicit per-call override from the tool).
@@ -153,25 +170,25 @@ func (c *PermissionChecker) Check(ctx context.Context, t tool.InvokableTool, too
 	// bypass the declared allowlist); the call falls through. Deny/Ask are honored.
 	if eff, handled := stageEffectChecker(t, argsJSON); handled &&
 		!(c.unattended && eff == loop.EffectAutoApprove) {
-		return eff
+		return loop.PermissionDecision{Effect: eff, Reason: reasonEffectChecker}
 	}
 
 	// Stage 4: operator always-allow.
 	if c.stageHardApprove(toolName) {
-		return loop.EffectAutoApprove
+		return loop.PermissionDecision{Effect: loop.EffectAutoApprove, Reason: reasonHardApprove}
 	}
 
 	// Stage 5: persisted approvals — SKIPPED under the Unattended posture so only
 	// the definer's declared allowlist (Stage 4/6) can approve.
 	if !c.unattended {
 		if eff, decided := c.stagePersistedApprovals(ctx, toolName, class, argsJSON); decided {
-			return eff
+			return loop.PermissionDecision{Effect: eff, Reason: reasonPersistedApproval}
 		}
 	}
 
 	// Stage 6: in-memory session policies.
 	if eff, decided := c.stageSessionPolicies(toolName, class, argsJSON); decided {
-		return eff
+		return loop.PermissionDecision{Effect: eff, Reason: reasonSessionPolicy}
 	}
 
 	// Stage 6.5: posture-driven auto-approve (SPEC §10.2/§10.3). Deliberately LAST
@@ -181,11 +198,11 @@ func (c *PermissionChecker) Check(ctx context.Context, t tool.InvokableTool, too
 	// fail-closed (the guarantee interlock, a nil runner, a grant-carrying call, or
 	// a non-trivial command all fall through to Ask). nil posture = no-op.
 	if eff, decided := c.stagePosture(toolName, class, argsJSON); decided {
-		return eff
+		return loop.PermissionDecision{Effect: eff, Reason: reasonPosture}
 	}
 
 	// Stage 7: default.
-	return loop.EffectAsk
+	return loop.PermissionDecision{Effect: loop.EffectAsk}
 }
 
 // boundaryOutcome is the result of the Stage-1/2 safety evaluation.
@@ -214,7 +231,7 @@ const (
 // stageContainmentAndHardDeny runs Stages 1 and 2 for path/bash tools. Network
 // tools have no filesystem boundary and clear immediately. The returned Effect is
 // meaningful only when the outcome is boundaryDenied.
-func (c *PermissionChecker) stageContainmentAndHardDeny(toolName string, class toolClass, argsJSON string) (loop.Effect, boundaryOutcome) {
+func (c *PermissionChecker) stageContainmentAndHardDeny(toolName string, class toolClass, argsJSON string) (loop.Effect, boundaryOutcome, string) {
 	switch class {
 	case classRead:
 		// Glob/Grep boundary is a SEARCH DIR (defaults to the root when omitted);
@@ -227,7 +244,7 @@ func (c *PermissionChecker) stageContainmentAndHardDeny(toolName string, class t
 	case classNetwork:
 		// No filesystem boundary → cleared. The Effect is a don't-care here (only
 		// boundaryDenied carries a meaningful Effect); cleared proceeds to Stage 3+.
-		return loop.EffectAsk, boundaryCleared
+		return loop.EffectAsk, boundaryCleared, ""
 	default: // classUnknown
 		return c.checkUnknownBoundary(argsJSON)
 	}
@@ -261,11 +278,11 @@ func readBoundaryField(toolName string) string {
 // is a malformed call → fall through to Ask (never auto-approved, but not a
 // boundary-crossing deny either). Any extraction or containment error is a DENY
 // (fail-secure: an unparseable/escaping path tool call must not slip past).
-func (c *PermissionChecker) checkPathBoundary(argsJSON, field string, searchDir bool, deniedGlobs []string) (loop.Effect, boundaryOutcome) {
+func (c *PermissionChecker) checkPathBoundary(argsJSON, field string, searchDir bool, deniedGlobs []string) (loop.Effect, boundaryOutcome, string) {
 	raw, ok, err := extractStringField(argsJSON, field)
 	if err != nil {
 		// Unparseable args for a filesystem tool: cannot prove containment → deny.
-		return loop.EffectDeny, boundaryDenied
+		return loop.EffectDeny, boundaryDenied, reasonContainment
 	}
 	if !ok || raw == "" {
 		if searchDir {
@@ -273,7 +290,7 @@ func (c *PermissionChecker) checkPathBoundary(argsJSON, field string, searchDir 
 		} else {
 			// A file tool with no required path is malformed/ambiguous: it did not
 			// cross a boundary, but it must never be auto-approved → Ask only.
-			return loop.EffectAsk, boundaryAskOnly
+			return loop.EffectAsk, boundaryAskOnly, ""
 		}
 	}
 	return c.containAndHardDeny(raw, deniedGlobs)
@@ -284,29 +301,29 @@ func (c *PermissionChecker) checkPathBoundary(argsJSON, field string, searchDir 
 // Unparseable args fall through (false) — a bash call with no extractable command
 // cannot match a prefix and has no path to contain, so a later stage Asks; this
 // is fail-secure because Bash defaults to Ask and is never auto-approved here.
-func (c *PermissionChecker) checkBashBoundary(argsJSON string) (loop.Effect, boundaryOutcome) {
+func (c *PermissionChecker) checkBashBoundary(argsJSON string) (loop.Effect, boundaryOutcome, string) {
 	cmd, _, cmdErr := extractStringField(argsJSON, fieldCommand)
 	workdir, wdOK, wdErr := extractStringField(argsJSON, fieldWorkdir)
 	if cmdErr != nil || wdErr != nil {
 		// Unparseable args: no command/workdir to evaluate. The denied-prefix gate
 		// cannot inspect the command, so a malformed Bash call must NOT be
 		// auto-approved → Ask only (the malformed-args gate would also catch this).
-		return loop.EffectAsk, boundaryAskOnly
+		return loop.EffectAsk, boundaryAskOnly, ""
 	}
 
 	// Stage 1: contain the workdir if one was supplied.
 	if wdOK && workdir != "" {
 		if _, err := containedPath(c.policy.WorkspaceRoot, workdir); err != nil {
-			return loop.EffectDeny, boundaryDenied
+			return loop.EffectDeny, boundaryDenied, reasonContainment
 		}
 	}
 
 	// Stage 2: denied bash prefix on the normalized command.
 	if matchDeniedBashPrefix(cmd, c.policy.HardDeny.DeniedBashPrefixes) {
-		return loop.EffectDeny, boundaryDenied
+		return loop.EffectDeny, boundaryDenied, reasonHardDeny
 	}
 	// Cleared: the paired Effect is a don't-care (ignored unless boundaryDenied).
-	return loop.EffectAsk, boundaryCleared
+	return loop.EffectAsk, boundaryCleared, ""
 }
 
 // checkUnknownBoundary handles an unclassifiable tool that may still carry a
@@ -316,17 +333,17 @@ func (c *PermissionChecker) checkBashBoundary(argsJSON string) (loop.Effect, bou
 // approve). With no path field there is no filesystem boundary to enforce here;
 // the call falls through toward Ask (it cannot be hard-approved or matched by a
 // record unless an operator named it).
-func (c *PermissionChecker) checkUnknownBoundary(argsJSON string) (loop.Effect, boundaryOutcome) {
+func (c *PermissionChecker) checkUnknownBoundary(argsJSON string) (loop.Effect, boundaryOutcome, string) {
 	raw, ok, err := extractStringField(argsJSON, fieldPath)
 	if err != nil {
 		// Unparseable args, unknown tool: nothing we can prove. Ask only (an
 		// unknown tool also cannot be hard-approved/matched downstream anyway).
-		return loop.EffectAsk, boundaryAskOnly
+		return loop.EffectAsk, boundaryAskOnly, ""
 	}
 	if !ok || raw == "" {
 		// No path-shaped boundary to enforce; let it flow to the (Ask) default —
 		// an unknown tool is never hard-approved or matched by a record.
-		return loop.EffectAsk, boundaryCleared
+		return loop.EffectAsk, boundaryCleared, ""
 	}
 	// Apply the union of read + write deny sets (direction unknown → strictest).
 	union := make([]string, 0, len(c.policy.HardDeny.DeniedReadPaths)+len(c.policy.HardDeny.DeniedWritePaths))
@@ -338,11 +355,11 @@ func (c *PermissionChecker) checkUnknownBoundary(argsJSON string) (loop.Effect, 
 // containAndHardDeny runs containment (Stage 1) then the absolute hard-deny match
 // (Stage 2) for one resolved path. A containment failure or a hard-deny match
 // returns (EffectDeny, true). Clearing both returns (_, false).
-func (c *PermissionChecker) containAndHardDeny(rawPath string, deniedGlobs []string) (loop.Effect, boundaryOutcome) {
+func (c *PermissionChecker) containAndHardDeny(rawPath string, deniedGlobs []string) (loop.Effect, boundaryOutcome, string) {
 	abs, err := containedPath(c.policy.WorkspaceRoot, rawPath)
 	if err != nil {
 		// Escapes the workspace or cannot be resolved → deny (Stage 1).
-		return loop.EffectDeny, boundaryDenied
+		return loop.EffectDeny, boundaryDenied, reasonContainment
 	}
 	// c.home is resolved once at construction and is "" only when the policy has
 	// no ~/ pattern (policyHasHomePattern gates that at construction), so an empty
@@ -350,14 +367,14 @@ func (c *PermissionChecker) containAndHardDeny(rawPath string, deniedGlobs []str
 	home := c.home
 	for _, pat := range deniedGlobs {
 		if strings.HasPrefix(pat, "~/") && home == "" {
-			return loop.EffectDeny, boundaryDenied // defensive fail-closed (see DeniedRead).
+			return loop.EffectDeny, boundaryDenied, reasonHardDeny // defensive fail-closed (see DeniedRead).
 		}
 		if matchHardDenyAbs(pat, abs, home) {
-			return loop.EffectDeny, boundaryDenied // Stage 2.
+			return loop.EffectDeny, boundaryDenied, reasonHardDeny // Stage 2.
 		}
 	}
 	// Cleared: the paired Effect is a don't-care (ignored unless boundaryDenied).
-	return loop.EffectAsk, boundaryCleared
+	return loop.EffectAsk, boundaryCleared, ""
 }
 
 // stageEffectChecker consults the tool's optional EffectChecker (Stage 3). A tool

@@ -119,6 +119,15 @@ type ToolPolicy struct {
 	GrantDeltas []string
 }
 
+// PermissionDecision is the richer permission result optionally exposed by a
+// gate that can explain non-gated approve/deny outcomes. It preserves Check's
+// fail-secure Effect contract while letting the runner emit a redacted audit
+// event without importing a concrete checker.
+type PermissionDecision struct {
+	Effect Effect
+	Reason string
+}
+
 // PermissionGate is the runner's view of permission checking. It is satisfied by
 // the concrete checker in `tools/` (wired at the composition root). The runner
 // retains the toolName+argsJSON it passed to Check so it can later pass the same

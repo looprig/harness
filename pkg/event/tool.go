@@ -1,8 +1,18 @@
 package event
 
 import (
-	"github.com/looprig/harness/pkg/tool"
 	"github.com/looprig/core/uuid"
+	"github.com/looprig/harness/pkg/tool"
+)
+
+// PermissionDecisionEffect is the durable approve/deny outcome for a non-gated
+// permission decision. Ask is intentionally absent: gated asks are represented by
+// GateOpened/GateResolved, not PermissionDecided.
+type PermissionDecisionEffect string
+
+const (
+	PermissionEffectApprove PermissionDecisionEffect = "approve"
+	PermissionEffectDeny    PermissionDecisionEffect = "deny"
 )
 
 // PermissionRequested is emitted when a tool call needs interactive approval.
@@ -19,6 +29,19 @@ type PermissionRequested struct {
 	// serialization entirely — like TokenDelta.Chunk and TurnFailed.Err — and stays
 	// an in-memory-only field for the TUI to render.
 	Request tool.PermissionRequest `json:"-"`
+}
+
+// PermissionDecided is emitted for a non-gated permission decision. Subject and
+// Audit are redacted summaries; grant tokens and raw args must never appear here.
+type PermissionDecided struct {
+	enduring
+	loopScoped
+	Header
+	ToolExecutionID uuid.UUID                `json:"tool_execution_id,omitzero"`
+	Effect          PermissionDecisionEffect `json:"effect,omitempty"`
+	Reason          string                   `json:"reason,omitempty"`
+	Subject         string                   `json:"subject,omitempty"`
+	Audit           string                   `json:"audit,omitempty"`
 }
 
 // UserInputRequested is emitted when a tool (AskUser) needs free-form input. The
@@ -55,6 +78,7 @@ type ToolCallCompleted struct {
 }
 
 func (PermissionRequested) isEvent() {}
+func (PermissionDecided) isEvent()   {}
 func (UserInputRequested) isEvent()  {}
 func (ToolCallStarted) isEvent()     {}
 func (ToolCallCompleted) isEvent()   {}

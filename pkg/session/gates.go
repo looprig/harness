@@ -1,0 +1,664 @@
+package session
+
+import (
+	"context"
+	"encoding/json"
+	"time"
+
+	"github.com/looprig/core/uuid"
+	"github.com/looprig/harness/pkg/command"
+	"github.com/looprig/harness/pkg/event"
+	"github.com/looprig/harness/pkg/gate"
+	"github.com/looprig/harness/pkg/identity"
+	"github.com/looprig/harness/pkg/journal"
+	"github.com/looprig/harness/pkg/tool"
+)
+
+// gateState is the live state of a directory entry. It is never persisted — the
+// durable state is reconstructed from GatePreparedRecord/GateOpened/GateResolved
+// on restore. preparing and claiming are not client-visible.
+type gateState uint8
+
+const (
+	gatePreparing gateState = iota // durable GatePreparedRecord, no public GateOpened
+	gateOpen                       // durable GateOpened, listed and answerable
+	gateClaiming                   // in-memory only, between lock-claim and durable GateResolved
+	gateClosed                     // durable GateResolved, removed from directory
+)
+
+// gateEntry is the session-private directory entry: the public Gate envelope PLUS
+// the internal route, the typed resolver payload (never shipped to clients), the
+// event coordinates stamped at prepare time, and the live state. The route is set
+// only after ActivateGate appends GateOpened.
+type gateEntry struct {
+	gate        gate.Gate
+	route       gate.Route
+	payload     gate.Payload
+	coordinates identity.Coordinates
+	state       gateState
+}
+
+// gateAppender is the STRICT durable append seam for gate prepare/open/resolve.
+// Unlike the hub's PublishEvent (which faults and returns nil on append failure),
+// this seam returns the append error so PrepareGateOpen/ActivateGate can fail
+// closed — a failed prepare installs no directory entry, a failed activate leaves
+// the gate preparing. The nop default (nopGateAppender) keeps headless mode
+// unchanged; the composition root wires the real journal+hub adapter.
+type gateAppender interface {
+	AppendGatePrepared(ctx context.Context, rec journal.GatePreparedRecord) error
+	AppendGateOpened(ctx context.Context, ev event.GateOpened) error
+	AppendGateResolved(ctx context.Context, ev event.GateResolved) error
+}
+
+// nopGateAppender is the default gateAppender: all appends succeed without doing
+// anything. It keeps headless/no-persistence mode unchanged.
+type nopGateAppender struct{}
+
+func (nopGateAppender) AppendGatePrepared(context.Context, journal.GatePreparedRecord) error {
+	return nil
+}
+func (nopGateAppender) AppendGateOpened(context.Context, event.GateOpened) error {
+	return nil
+}
+func (nopGateAppender) AppendGateResolved(context.Context, event.GateResolved) error {
+	return nil
+}
+
+// GateCaps bounds the live gate directory. The cap counts preparing + open +
+// claiming so failed activations cannot accumulate invisible prepared entries.
+// Zero means no cap.
+type GateCaps struct {
+	MaxOpen    int
+	MaxTimeout time.Duration
+}
+
+// GateErrorKind names the failure mode of a gate directory operation.
+type GateErrorKind string
+
+const (
+	GateNotFound      GateErrorKind = "not_found"
+	GateNotReady      GateErrorKind = "not_ready"
+	GateKindMismatch  GateErrorKind = "kind_mismatch"
+	GateActionInvalid GateErrorKind = "action_invalid"
+	GateCapacity      GateErrorKind = "capacity"
+	GateAppendFailed  GateErrorKind = "append_failed"
+)
+
+// GateError is the typed error returned by gate directory operations. Callers
+// use errors.As to recover it and switch on Kind to branch on the failure mode.
+type GateError struct {
+	GateID gate.ID
+	Kind   GateErrorKind
+	Cause  error
+}
+
+func (e *GateError) Error() string {
+	prefix := "session: gate"
+	if e.GateID != (gate.ID{}) {
+		prefix += " " + e.GateID.String()
+	}
+	switch e.Kind {
+	case GateNotFound:
+		return prefix + " not found"
+	case GateNotReady:
+		return prefix + " not ready"
+	case GateKindMismatch:
+		return prefix + " kind mismatch"
+	case GateActionInvalid:
+		return prefix + " action invalid"
+	case GateCapacity:
+		return prefix + " capacity exceeded"
+	case GateAppendFailed:
+		if e.Cause != nil {
+			return prefix + " append failed: " + e.Cause.Error()
+		}
+		return prefix + " append failed"
+	default:
+		return prefix + " error"
+	}
+}
+
+func (e *GateError) Unwrap() error { return e.Cause }
+
+// GateErrorKind exposes the stable string kind for package boundaries (for
+// example pkg/api) that should not import pkg/session just to map response
+// errors.
+func (e *GateError) GateErrorKind() string { return string(e.Kind) }
+
+// WithGateAppender injects the strict durable append seam for gate
+// prepare/open/resolve. A nil appender is ignored (the nop default stays
+// installed). It is the gate-directory counterpart to WithCommandAppender.
+func WithGateAppender(a gateAppender) Option {
+	return func(s *Session) {
+		if a != nil {
+			s.gateAppender = a
+		}
+	}
+}
+
+// WithGateCaps injects the live gate directory bounds. Zero (the default) means
+// no cap. The cap counts preparing + open + claiming.
+func WithGateCaps(caps GateCaps) Option {
+	return func(s *Session) {
+		s.gateCaps = caps
+	}
+}
+
+// PrepareGateOpen durably commits the public envelope plus private payload as a
+// private GatePreparedRecord. It mints the GateID, stamps the GatePrepared event
+// with the session's coordinates and the caller's loopID, appends the record via
+// the strict gateAppender, and — only on success — inserts a non-listable
+// preparing entry. A failed append returns a typed *GateError{GateAppendFailed}
+// and does not mutate the directory. loopID is the producing loop's id (the
+// GatePrepared event is loopScoped); TurnID/StepID are read from the gate's
+// Subject.
+func (s *Session) PrepareGateOpen(ctx context.Context, loopID uuid.UUID, g gate.Gate, payload gate.Payload) (gate.ID, error) {
+	s.gatesMu.Lock()
+	defer s.gatesMu.Unlock()
+
+	if err := s.checkGateCap(); err != nil {
+		return gate.ID{}, err
+	}
+	policy, err := s.resolveGatePolicy(g)
+	if err != nil {
+		return gate.ID{}, err
+	}
+
+	gateID, err := s.mintGateID()
+	if err != nil {
+		return gate.ID{}, err
+	}
+	g.ID = gateID
+	g.ResponsePolicy = policy
+
+	coords := identity.Coordinates{
+		SessionID: s.SessionID,
+		LoopID:    loopID,
+		TurnID:    uuid.UUID(g.Subject.TurnID),
+		StepID:    uuid.UUID(g.Subject.StepID),
+	}
+	prepared, err := s.stampGateEvent(coords, g)
+	if err != nil {
+		return gate.ID{}, err
+	}
+
+	openPayload := gate.OpenPayload{GateID: gateID, Payload: payload}
+	rec := journal.NewGatePreparedRecord(prepared, openPayload)
+	if err := s.gateAppender.AppendGatePrepared(ctx, rec); err != nil {
+		return gate.ID{}, &GateError{GateID: gateID, Kind: GateAppendFailed, Cause: err}
+	}
+
+	s.gates[gateID] = gateEntry{gate: g, payload: payload, coordinates: coords, state: gatePreparing}
+	return gateID, nil
+}
+
+// ActivateGate is called by the owner after its local blocker/continuation exists.
+// It requires a preparing gate, appends the public GateOpened event via the strict
+// gateAppender, stores the private route, and flips the entry to open so
+// ListGates returns it. A failed append leaves the gate preparing. An unknown or
+// non-preparing gate returns a typed *GateError.
+func (s *Session) ActivateGate(ctx context.Context, id gate.ID, route gate.Route) error {
+	s.gatesMu.Lock()
+	defer s.gatesMu.Unlock()
+
+	entry, ok := s.gates[id]
+	if !ok {
+		return &GateError{GateID: id, Kind: GateNotFound}
+	}
+	if entry.state != gatePreparing {
+		return &GateError{GateID: id, Kind: GateNotReady}
+	}
+
+	stamped, err := s.factory.Stamp(event.Header{Coordinates: entry.coordinates})
+	if err != nil {
+		return &GateError{GateID: id, Kind: GateAppendFailed, Cause: err}
+	}
+	opened := event.GateOpened{Header: stamped, Gate: entry.gate}
+	if err := s.gateAppender.AppendGateOpened(ctx, opened); err != nil {
+		return &GateError{GateID: id, Kind: GateAppendFailed, Cause: err}
+	}
+
+	entry.route = route
+	entry.state = gateOpen
+	s.gates[id] = entry
+	s.startGatePolicyTimerLocked(id, entry)
+	return nil
+}
+
+// ListGates returns the public envelopes of all open gates — preparing, claiming,
+// and closed entries are excluded. The returned slice is a snapshot; mutating it
+// does not affect the directory.
+func (s *Session) ListGates(context.Context) []gate.Gate {
+	s.gatesMu.Lock()
+	defer s.gatesMu.Unlock()
+	out := make([]gate.Gate, 0, len(s.gates))
+	for _, entry := range s.gates {
+		if entry.state == gateOpen {
+			out = append(out, entry.gate)
+		}
+	}
+	return out
+}
+
+// CloseGate closes or abandons a session-owned gate without dispatching an
+// answer to the resolver. Preparing gates were never public, so they are removed
+// without a public GateResolved. Open gates are durably resolved before removal.
+func (s *Session) CloseGate(ctx context.Context, id gate.ID, reason gate.CloseReason) error {
+	s.gatesMu.Lock()
+	entry, ok := s.gates[id]
+	if !ok {
+		s.gatesMu.Unlock()
+		return &GateError{GateID: id, Kind: GateNotFound}
+	}
+	switch entry.state {
+	case gatePreparing:
+		s.stopGateTimerLocked(id)
+		delete(s.gates, id)
+		s.gatesMu.Unlock()
+		return nil
+	case gateOpen:
+		entry.state = gateClaiming
+		s.gates[id] = entry
+		s.gatesMu.Unlock()
+	case gateClaiming, gateClosed:
+		s.gatesMu.Unlock()
+		return &GateError{GateID: id, Kind: GateNotReady}
+	default:
+		s.gatesMu.Unlock()
+		return &GateError{GateID: id, Kind: GateNotReady}
+	}
+
+	resolved, err := s.buildGateClosed(entry, id, reason)
+	if err != nil {
+		s.revertClaiming(id)
+		return err
+	}
+	if err := s.gateAppender.AppendGateResolved(ctx, resolved); err != nil {
+		s.revertClaiming(id)
+		return &GateError{GateID: id, Kind: GateAppendFailed, Cause: err}
+	}
+
+	s.gatesMu.Lock()
+	s.stopGateTimerLocked(id)
+	delete(s.gates, id)
+	s.gatesMu.Unlock()
+	return nil
+}
+
+// checkGateCap returns a typed *GateError{GateCapacity} if the directory is at or
+// above the configured cap (counting preparing + open + claiming). A zero cap
+// means unlimited. The caller MUST hold gatesMu.
+func (s *Session) checkGateCap() error {
+	if s.gateCaps.MaxOpen <= 0 {
+		return nil
+	}
+	count := 0
+	for _, entry := range s.gates {
+		if entry.state == gatePreparing || entry.state == gateOpen || entry.state == gateClaiming {
+			count++
+		}
+	}
+	if count >= s.gateCaps.MaxOpen {
+		return &GateError{Kind: GateCapacity}
+	}
+	return nil
+}
+
+func (s *Session) resolveGatePolicy(g gate.Gate) (gate.ResponsePolicy, error) {
+	policy := g.ResponsePolicy
+	if policy.Timeout == 0 && policy.OnTimeout == "" && g.Kind == gate.KindPermission {
+		policy.Timeout = 5 * time.Minute
+		policy.OnTimeout = gate.PolicyRespond
+		policy.Response = gate.ResponseTemplate{Action: "deny"}
+	}
+	if s.gateCaps.MaxTimeout > 0 && policy.Timeout > s.gateCaps.MaxTimeout {
+		return gate.ResponsePolicy{}, &GateError{GateID: g.ID, Kind: GateCapacity}
+	}
+	switch policy.EffectiveAction() {
+	case gate.PolicyWait:
+		return policy, nil
+	case gate.PolicyRespond:
+		if policy.Timeout <= 0 || policy.Response.Action == "" {
+			return gate.ResponsePolicy{}, &GateError{GateID: g.ID, Kind: GateActionInvalid}
+		}
+		return policy, nil
+	case gate.PolicyModelDecide, gate.PolicySuspendSession:
+		return gate.ResponsePolicy{}, &GateError{GateID: g.ID, Kind: GateActionInvalid}
+	default:
+		return gate.ResponsePolicy{}, &GateError{GateID: g.ID, Kind: GateActionInvalid}
+	}
+}
+
+// startGatePolicyTimerLocked starts the activation-time timer for PolicyRespond.
+// The caller MUST hold gatesMu.
+func (s *Session) startGatePolicyTimerLocked(id gate.ID, entry gateEntry) {
+	policy := entry.gate.ResponsePolicy
+	if policy.EffectiveAction() != gate.PolicyRespond || policy.Timeout <= 0 {
+		return
+	}
+	if s.gateTimers == nil {
+		s.gateTimers = make(map[gate.ID]*time.Timer)
+	}
+	s.stopGateTimerLocked(id)
+	template := policy.Response
+	s.gateTimers[id] = time.AfterFunc(policy.Timeout, func() {
+		_ = s.RespondGate(s.sessionCtx, gate.GateResponse{
+			GateID: id,
+			Action: template.Action,
+			Values: cloneRawValues(template.Values),
+			Source: gate.ResponseSource{Kind: gate.ResponseFromPolicy, Reason: "timeout"},
+		})
+	})
+}
+
+// stopGateTimerLocked stops and removes a policy timer. The caller MUST hold
+// gatesMu.
+func (s *Session) stopGateTimerLocked(id gate.ID) {
+	if s.gateTimers == nil {
+		return
+	}
+	if timer := s.gateTimers[id]; timer != nil {
+		timer.Stop()
+	}
+	delete(s.gateTimers, id)
+}
+
+func cloneRawValues(in map[string]json.RawMessage) map[string]json.RawMessage {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make(map[string]json.RawMessage, len(in))
+	for k, v := range in {
+		out[k] = append(json.RawMessage(nil), v...)
+	}
+	return out
+}
+
+// mintGateID mints a fresh gate.ID via the session's id generator.
+func (s *Session) mintGateID() (gate.ID, error) {
+	id, err := s.newID()
+	if err != nil {
+		return gate.ID{}, &GateError{Kind: GateAppendFailed, Cause: err}
+	}
+	return gate.ID(id), nil
+}
+
+// stampGateEvent stamps a GatePrepared event with the given coordinates and gate.
+// The factory mints a fresh EventID and CreatedAt; the coordinates carry the
+// session, loop, turn, and step identity the event's stepProfile requires.
+func (s *Session) stampGateEvent(coords identity.Coordinates, g gate.Gate) (event.GatePrepared, error) {
+	stamped, err := s.factory.Stamp(event.Header{Coordinates: coords})
+	if err != nil {
+		return event.GatePrepared{}, &GateError{Kind: GateAppendFailed, Cause: err}
+	}
+	return event.GatePrepared{Header: stamped, Gate: g}, nil
+}
+
+// RespondGate claims an open gate, durably appends GateResolved, and dispatches
+// the translated command to the owning loop. It is durable-first: the GateResolved
+// append happens BEFORE the command dispatch, so a crash after the append leaves
+// the gate closed (not re-answerable) even if the command was not yet consumed.
+// A failed append reverts the in-memory claim and leaves the gate answerable.
+// Command dispatch uses s.sessionCtx (not the caller's ctx) so a client
+// disconnect after the durable commit does not cancel delivery.
+func (s *Session) RespondGate(ctx context.Context, response gate.GateResponse) error {
+	s.gatesMu.Lock()
+	entry, ok := s.gates[response.GateID]
+	if !ok {
+		s.gatesMu.Unlock()
+		return &GateError{GateID: response.GateID, Kind: GateNotFound}
+	}
+	if entry.state != gateOpen {
+		s.gatesMu.Unlock()
+		return &GateError{GateID: response.GateID, Kind: GateNotReady}
+	}
+	if !validateGateAction(entry.gate, response.Action) {
+		s.gatesMu.Unlock()
+		return &GateError{GateID: response.GateID, Kind: GateActionInvalid}
+	}
+	translated, err := s.translateGateResponse(entry, response)
+	if err != nil {
+		s.gatesMu.Unlock()
+		return err
+	}
+	entry.state = gateClaiming
+	s.gates[response.GateID] = entry
+	s.gatesMu.Unlock()
+
+	resolved, err := s.buildGateResolved(entry, response, translated.audit, translated.approvalScope)
+	if err != nil {
+		s.revertClaiming(response.GateID)
+		return err
+	}
+	if err := s.gateAppender.AppendGateResolved(ctx, resolved); err != nil {
+		s.revertClaiming(response.GateID)
+		return &GateError{GateID: response.GateID, Kind: GateAppendFailed, Cause: err}
+	}
+
+	s.gatesMu.Lock()
+	s.stopGateTimerLocked(response.GateID)
+	delete(s.gates, response.GateID)
+	s.gatesMu.Unlock()
+
+	_ = s.dispatchGateCommand(entry, translated.cmd)
+	return nil
+}
+
+// revertClaiming reverts a gate from claiming back to open after a failed
+// durable append. It is safe to call after the entry was already removed.
+func (s *Session) revertClaiming(id gate.ID) {
+	s.gatesMu.Lock()
+	defer s.gatesMu.Unlock()
+	if entry, ok := s.gates[id]; ok && entry.state == gateClaiming {
+		entry.state = gateOpen
+		s.gates[id] = entry
+	}
+}
+
+// validateGateAction reports whether action matches one of the gate's prompt
+// controls. An empty action or a gate with no controls fails secure.
+func validateGateAction(g gate.Gate, action string) bool {
+	if action == "" || len(g.Prompt.Controls) == 0 {
+		return false
+	}
+	for _, c := range g.Prompt.Controls {
+		if c.Action == action {
+			return true
+		}
+	}
+	return false
+}
+
+// buildGateResolved stamps and builds the GateResolved event from the response,
+// resolved audit, and already-validated approval scope.
+func (s *Session) buildGateResolved(entry gateEntry, response gate.GateResponse, audit gate.ResponseAudit, approvalScope *tool.ApprovalScope) (event.GateResolved, error) {
+	stamped, err := s.factory.Stamp(event.Header{Coordinates: entry.coordinates})
+	if err != nil {
+		return event.GateResolved{}, &GateError{GateID: response.GateID, Kind: GateAppendFailed, Cause: err}
+	}
+	resolved := event.GateResolved{
+		Header: stamped,
+		GateID: response.GateID,
+		Reason: gate.CloseAnswered,
+		Action: response.Action,
+		Source: response.Source,
+		Audit:  audit,
+	}
+	if approvalScope != nil {
+		resolved.ApprovalScope = *approvalScope
+	}
+	return resolved, nil
+}
+
+func (s *Session) buildGateClosed(entry gateEntry, id gate.ID, reason gate.CloseReason) (event.GateResolved, error) {
+	if reason == "" {
+		reason = gate.CloseOwnerClosed
+	}
+	stamped, err := s.factory.Stamp(event.Header{Coordinates: entry.coordinates})
+	if err != nil {
+		return event.GateResolved{}, &GateError{GateID: id, Kind: GateAppendFailed, Cause: err}
+	}
+	return event.GateResolved{
+		Header: stamped,
+		GateID: id,
+		Reason: reason,
+	}, nil
+}
+
+// dispatchGateCommand routes the translated command to the owning loop using
+// s.sessionCtx (not the caller's ctx) so a client disconnect after the durable
+// commit does not cancel delivery.
+func (s *Session) dispatchGateCommand(entry gateEntry, cmd command.Command) error {
+	l, ok := s.loopFor(entry.route.LoopID)
+	if !ok {
+		return &SessionError{Kind: SessionLoopNotFound}
+	}
+	return s.routeGate(s.sessionCtx, entry.route.LoopID, l, cmd)
+}
+
+type translatedGateResponse struct {
+	cmd           command.Command
+	audit         gate.ResponseAudit
+	approvalScope *tool.ApprovalScope
+}
+
+// translateGateResponse validates the payload-specific parts of the response and
+// builds the translated command, redacted audit, and validated approval scope. It
+// returns a typed *GateError on validation failure (invalid grants, missing
+// values, unknown kind).
+func (s *Session) translateGateResponse(entry gateEntry, response gate.GateResponse) (translatedGateResponse, error) {
+	cmdID, err := s.newCommandID()
+	if err != nil {
+		return translatedGateResponse{}, &GateError{GateID: response.GateID, Kind: GateAppendFailed, Cause: err}
+	}
+	hdr := command.Header{CommandID: cmdID, Agency: identity.AgencyUser, CreatedAt: s.stampNow()}
+	route := command.GateRoute{
+		Coordinates:     identity.Coordinates{SessionID: entry.coordinates.SessionID, LoopID: entry.coordinates.LoopID},
+		GateID:          response.GateID,
+		ToolExecutionID: uuid.UUID(entry.route.ToolExecutionID),
+	}
+	switch entry.gate.Kind {
+	case gate.KindPermission:
+		return s.translatePermissionResponse(hdr, route, entry.payload, response)
+	case gate.KindAskUser:
+		return s.translateAskUserResponse(hdr, route, response)
+	default:
+		return translatedGateResponse{}, &GateError{GateID: response.GateID, Kind: GateKindMismatch}
+	}
+}
+
+// translatePermissionResponse builds an ApproveToolCall or DenyToolCall from a
+// permission gate response. For approve, it extracts scope and accepted_grants
+// from Values and validates the grants against the payload's request.
+func (s *Session) translatePermissionResponse(hdr command.Header, route command.GateRoute, payload gate.Payload, response gate.GateResponse) (translatedGateResponse, error) {
+	switch response.Action {
+	case "approve":
+		scope, grants, audit, err := validatePermissionApprove(payload, response)
+		if err != nil {
+			return translatedGateResponse{}, err
+		}
+		return translatedGateResponse{
+			cmd:           command.ApproveToolCall{Header: hdr, GateRoute: route, Scope: scope, AcceptedGrants: grants},
+			audit:         audit,
+			approvalScope: &scope,
+		}, nil
+	case "deny":
+		return translatedGateResponse{cmd: command.DenyToolCall{Header: hdr, GateRoute: route}}, nil
+	default:
+		return translatedGateResponse{}, &GateError{GateID: response.GateID, Kind: GateActionInvalid}
+	}
+}
+
+// translateAskUserResponse builds a ProvideUserInput from an ask-user gate
+// response. It extracts the answer from Values["answer"].
+func (s *Session) translateAskUserResponse(hdr command.Header, route command.GateRoute, response gate.GateResponse) (translatedGateResponse, error) {
+	var answer string
+	if raw, ok := response.Values["answer"]; ok {
+		if err := json.Unmarshal(raw, &answer); err != nil {
+			return translatedGateResponse{}, &GateError{GateID: response.GateID, Kind: GateActionInvalid, Cause: err}
+		}
+	}
+	preview := answer
+	if len(preview) > 80 {
+		preview = preview[:80]
+	}
+	return translatedGateResponse{
+		cmd:   command.ProvideUserInput{Header: hdr, GateRoute: route, Answer: answer},
+		audit: gate.AskUserAudit{AnswerPreview: preview},
+	}, nil
+}
+
+// validatePermissionApprove extracts scope and accepted_grants from the response
+// Values, validates the scope against the payload request's AllowedScopes,
+// validates Bash grant tokens against the request's Grants, and builds the
+// PermissionAudit from the accepted grant descriptions (not tokens). A scope the
+// request did not offer or an accepted grant not in the request's Grants fails
+// secure.
+func validatePermissionApprove(payload gate.Payload, response gate.GateResponse) (tool.ApprovalScope, []string, gate.ResponseAudit, error) {
+	rawScope, ok := response.Values["scope"]
+	if !ok {
+		return 0, nil, nil, &GateError{GateID: response.GateID, Kind: GateActionInvalid}
+	}
+	var scopeValue string
+	if err := json.Unmarshal(rawScope, &scopeValue); err != nil {
+		return 0, nil, nil, &GateError{GateID: response.GateID, Kind: GateActionInvalid, Cause: err}
+	}
+	scope, ok := tool.ParseApprovalScopeValue(scopeValue)
+	if !ok {
+		return 0, nil, nil, &GateError{GateID: response.GateID, Kind: GateActionInvalid}
+	}
+	permPayload, ok := permissionPayloadFromGatePayload(payload)
+	if !ok || permPayload.Request == nil {
+		return 0, nil, nil, &GateError{GateID: response.GateID, Kind: GateActionInvalid}
+	}
+	if !approvalScopeAllowed(scope, permPayload.Request.AllowedScopes()) {
+		return 0, nil, nil, &GateError{GateID: response.GateID, Kind: GateActionInvalid}
+	}
+
+	var grants []string
+	if raw, ok := response.Values["accepted_grants"]; ok {
+		if err := json.Unmarshal(raw, &grants); err != nil {
+			return 0, nil, nil, &GateError{GateID: response.GateID, Kind: GateActionInvalid, Cause: err}
+		}
+	}
+	bashReq, ok := permPayload.Request.(tool.BashRequest)
+	if !ok {
+		return scope, grants, gate.PermissionAudit{}, nil
+	}
+	validTokens := make(map[string]string, len(bashReq.Grants))
+	for _, g := range bashReq.Grants {
+		validTokens[g.Token] = g.Description
+	}
+	descs := make([]string, 0, len(grants))
+	for _, t := range grants {
+		desc, exists := validTokens[t]
+		if !exists {
+			return 0, nil, nil, &GateError{GateID: response.GateID, Kind: GateActionInvalid}
+		}
+		descs = append(descs, desc)
+	}
+	return scope, grants, gate.PermissionAudit{AcceptedGrantDescriptions: descs}, nil
+}
+
+func permissionPayloadFromGatePayload(payload gate.Payload) (gate.PermissionPayload, bool) {
+	switch v := payload.(type) {
+	case gate.PermissionPayload:
+		return v, true
+	case *gate.PermissionPayload:
+		if v == nil {
+			return gate.PermissionPayload{}, false
+		}
+		return *v, true
+	default:
+		return gate.PermissionPayload{}, false
+	}
+}
+
+func approvalScopeAllowed(scope tool.ApprovalScope, allowed []tool.ApprovalScope) bool {
+	for _, candidate := range allowed {
+		if scope == candidate {
+			return true
+		}
+	}
+	return false
+}

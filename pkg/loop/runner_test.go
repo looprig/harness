@@ -851,6 +851,106 @@ func TestRunBatch_IDGenFailure(t *testing.T) {
 	}
 }
 
+func TestRunBatch_PermissionDecisionAuditAutoApproveAndDeny(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		effect     Effect
+		wantEffect event.PermissionDecisionEffect
+		wantError  bool
+	}{
+		{name: "auto approve", effect: EffectAutoApprove, wantEffect: event.PermissionEffectApprove},
+		{name: "auto deny", effect: EffectDeny, wantEffect: event.PermissionEffectDeny, wantError: true},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			tl := &fakeRunTool{name: "T", output: "ran", auditFn: func(argsJSON string) string {
+				return "T redacted"
+			}}
+			ts := ToolSet{
+				Permission: &fakePermissionGate{checkFn: func(name, args string) Effect { return tt.effect }},
+				Registry:   []tool.InvokableTool{auditTool{tl}},
+			}
+			emit, getEvents := collectEmit()
+
+			results := runBatchNoGate(context.Background(), []content.ToolUseBlock{call(t, "T", `{"secret":"token"}`)}, ts, emit)
+
+			if len(results) != 1 {
+				t.Fatalf("len(results) = %d, want 1", len(results))
+			}
+			if results[0].IsError != tt.wantError {
+				t.Fatalf("result IsError = %v, want %v", results[0].IsError, tt.wantError)
+			}
+
+			var got []event.PermissionDecided
+			for _, ev := range getEvents() {
+				if pd, ok := ev.(event.PermissionDecided); ok {
+					got = append(got, pd)
+				}
+				if _, ok := ev.(event.PermissionRequested); ok {
+					t.Fatalf("PermissionRequested emitted for non-gated %s decision", tt.name)
+				}
+			}
+			if len(got) != 1 {
+				t.Fatalf("PermissionDecided count = %d, want 1", len(got))
+			}
+			if got[0].Effect != tt.wantEffect {
+				t.Errorf("PermissionDecided.Effect = %q, want %q", got[0].Effect, tt.wantEffect)
+			}
+			if got[0].Subject != "T" || got[0].Audit != "T redacted" {
+				t.Errorf("PermissionDecided subject/audit = %q/%q, want redacted tool summary", got[0].Subject, got[0].Audit)
+			}
+			if strings.Contains(got[0].Audit, "token") {
+				t.Errorf("PermissionDecided.Audit leaked raw args/grant-like token: %q", got[0].Audit)
+			}
+		})
+	}
+}
+
+func TestRunBatch_PermissionDecisionAuditSkipsGatedAsk(t *testing.T) {
+	t.Parallel()
+
+	tl := &fakeRunTool{name: "T", output: "ran", promptFn: func(argsJSON string) (tool.PermissionRequest, error) {
+		return tool.UnknownRequest{Tool: "T", Summary: "redacted"}, nil
+	}}
+	ts := ToolSet{
+		Permission: &fakePermissionGate{checkFn: func(name, args string) Effect { return EffectAsk }},
+		Registry:   []tool.InvokableTool{promptTool{tl}},
+	}
+	emit, getEvents := collectEmit()
+	gateReg := make(chan gateRegistration)
+	go func() {
+		reg := <-gateReg
+		close(reg.ack)
+		reg.reply <- command.ApproveToolCall{GateRoute: command.GateRoute{ToolExecutionID: reg.callID}, Scope: tool.ScopeOnce}
+	}()
+
+	results := RunBatch(context.Background(), []content.ToolUseBlock{call(t, "T", `{}`)}, ts, gateReg, uuid.New, emit)
+
+	if len(results) != 1 || results[0].IsError {
+		t.Fatalf("results = %+v, want one approved success", results)
+	}
+	var nRequested, nDecided int
+	for _, ev := range getEvents() {
+		switch ev.(type) {
+		case event.PermissionRequested:
+			nRequested++
+		case event.PermissionDecided:
+			nDecided++
+		}
+	}
+	if nRequested != 1 {
+		t.Fatalf("PermissionRequested count = %d, want 1", nRequested)
+	}
+	if nDecided != 0 {
+		t.Fatalf("PermissionDecided count = %d, want 0 for gated ask", nDecided)
+	}
+}
+
 // TestRunBatch_ResultPreviewCapped: an oversized result is truncated + marked; a
 // small one is not.
 func TestRunBatch_ResultPreviewCapped(t *testing.T) {

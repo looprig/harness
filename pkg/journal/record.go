@@ -3,9 +3,10 @@ package journal
 import (
 	"strconv"
 
+	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/command"
 	"github.com/looprig/harness/pkg/event"
-	"github.com/looprig/core/uuid"
+	"github.com/looprig/harness/pkg/gate"
 )
 
 // JournalRecord is the sealed sum a session's serialized writer persists: an
@@ -115,3 +116,34 @@ func (FenceRecord) isJournalRecord() {}
 
 // IdempotencyID is the epoch rendered as a decimal string.
 func (r FenceRecord) IdempotencyID() string { return strconv.FormatUint(r.fence.Epoch, 10) }
+
+// GatePreparedRecord is the PRIVATE durable record for a gate's prepare step. It
+// carries the GatePrepared event (the public envelope stored privately until
+// ActivateGate appends the public GateOpened) PLUS the sealed gate.Payload the
+// resolver needs for response validation and restore — a payload that must NEVER
+// be exposed to SSE/history and must NEVER be appended through NewEventRecord or
+// hub.PublishEvent. Its idempotency id is the prepared event's EventID.
+type GatePreparedRecord struct {
+	prepared event.GatePrepared
+	payload  gate.OpenPayload
+}
+
+// NewGatePreparedRecord wraps the private prepared projection and its typed
+// payload as a single private journal record. The caller must NOT also append
+// the GatePrepared event as a public EventRecord.
+func NewGatePreparedRecord(prepared event.GatePrepared, payload gate.OpenPayload) GatePreparedRecord {
+	return GatePreparedRecord{prepared: prepared, payload: payload}
+}
+
+// Prepared returns the private prepared projection for the serializer to marshal.
+func (r GatePreparedRecord) Prepared() event.GatePrepared { return r.prepared }
+
+// Payload returns the private typed payload the resolver uses for validation/restore.
+func (r GatePreparedRecord) Payload() gate.OpenPayload { return r.payload }
+
+func (GatePreparedRecord) isJournalRecord() {}
+
+// IdempotencyID is the prepared event's EventID rendered canonically.
+func (r GatePreparedRecord) IdempotencyID() string {
+	return r.prepared.EventHeader().EventID.String()
+}

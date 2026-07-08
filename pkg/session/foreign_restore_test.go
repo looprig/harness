@@ -8,10 +8,10 @@ import (
 	"time"
 
 	"github.com/looprig/core/content"
+	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/journal"
 	"github.com/looprig/harness/pkg/loop"
-	"github.com/looprig/core/uuid"
 )
 
 // fakeSessionJournal is a no-op journal.SessionJournal whose Append always succeeds. It
@@ -110,7 +110,7 @@ func TestForeignRestore(t *testing.T) {
 			}
 
 			s, err := buildRestoredSession(context.Background(), c, sessionID, primaryLoopID,
-				tt.foreignSID, 0, 0, false, folded, fakeSessionJournal{}, fac, uuid.New, time.Now, opts...)
+				tt.foreignSID, 0, 0, false, folded, nil, fakeSessionJournal{}, fac, uuid.New, time.Now, opts...)
 
 			if tt.wantErr {
 				if s != nil {

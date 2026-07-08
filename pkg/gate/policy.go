@@ -25,6 +25,10 @@ type ResponsePolicy struct {
 	Timeout time.Duration `json:"timeout,omitzero"`
 	// OnTimeout is the action taken when Timeout elapses.
 	OnTimeout PolicyAction `json:"on_timeout,omitempty"`
+	// Response is the template submitted through RespondGate for PolicyRespond.
+	Response ResponseTemplate `json:"response,omitzero"`
+	// ModelDecision configures PolicyModelDecide when a responder exists.
+	ModelDecision ModelDecisionPolicy `json:"model_decision,omitzero"`
 }
 
 // EffectiveAction returns the configured timeout action, defaulting to PolicyWait.

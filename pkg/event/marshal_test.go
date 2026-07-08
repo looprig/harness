@@ -8,9 +8,9 @@ import (
 	"time"
 
 	"github.com/looprig/core/content"
+	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/tool"
-	"github.com/looprig/core/uuid"
 )
 
 // seededUUID builds a deterministic non-zero uuid from a single seed byte so the
@@ -119,6 +119,19 @@ func TestEventBodyJSONKeysAreStableSnakeCase(t *testing.T) {
 			},
 			wantKeys:   []string{"tool_execution_id"},
 			absentKeys: []string{"request", "Request"},
+		},
+		{
+			name: "PermissionDecided carries redacted decision fields",
+			event: PermissionDecided{
+				Header:          hdr,
+				ToolExecutionID: seededUUID(0x77),
+				Effect:          PermissionEffectDeny,
+				Reason:          "hard_deny",
+				Subject:         "ReadFile",
+				Audit:           "ReadFile .env",
+			},
+			wantKeys:   []string{"tool_execution_id", "effect", "reason", "subject", "audit"},
+			absentKeys: []string{"grants", "accepted_grants", "request", "args"},
 		},
 		{
 			name: "UserInputRequested carries question and choices",
@@ -608,7 +621,7 @@ func TestMarshalEventPermissionRequestedFullRequest(t *testing.T) {
 // without codec coverage changes the live count derived from classify+Class() and
 // fails TestMarshalEventCoversEveryEnduringType. A missed Enduring type is an
 // unpersistable event = silent restore data loss, which this guard forbids.
-const wantEnduringTypes = 21
+const wantEnduringTypes = 22
 
 // unionInstances is one instance of EVERY type in the sealed union (Enduring and
 // Ephemeral alike), mirroring TestClassifyExhaustive. The drift guard partitions
@@ -622,7 +635,7 @@ func unionInstances() []Event {
 		LoopIdle{}, LoopStarted{},
 		TokenDelta{}, TurnStarted{}, StepDone{}, TurnFoldedInto{}, InputCancelled{},
 		InputQueued{}, TurnRejected{}, TurnDone{}, TurnFailed{}, TurnInterrupted{},
-		PermissionRequested{}, UserInputRequested{}, ToolCallStarted{}, ToolCallCompleted{},
+		PermissionRequested{}, PermissionDecided{}, UserInputRequested{}, ToolCallStarted{}, ToolCallCompleted{},
 	}
 }
 
@@ -755,6 +768,7 @@ func FuzzDecodeEvent(f *testing.F) {
 		TurnFailed{Header: fullHeaderTurn(), Err: &ToolLimitError{}},
 		PermissionRequested{Header: fullHeader(), ToolExecutionID: seededUUID(0x77), Request: tool.BashRequest{Command: "ls"}},
 		PermissionRequested{Header: fullHeader(), ToolExecutionID: seededUUID(0x78), Request: tool.SkillLoadRequest{RelPath: ".skills/x/SKILL.md", Agent: identity.AgentName("explorer"), Size: 10, SHA256: "abc"}},
+		PermissionDecided{Header: fullHeader(), ToolExecutionID: seededUUID(0x79), Effect: PermissionEffectApprove, Reason: "hard_approve", Subject: "ReadFile", Audit: "ReadFile README.md"},
 		TurnInterrupted{Header: fullHeaderTurn()},
 	}
 	for _, ev := range seedEvents {

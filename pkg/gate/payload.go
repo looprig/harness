@@ -20,7 +20,10 @@ const (
 	payloadKindResumeInput payloadKind = "resume_input"
 )
 
-var errMissingPayloadData = errors.New("missing payload data")
+var (
+	errMissingPayloadData = errors.New("missing payload data")
+	errNullPayloadData    = errors.New("null payload data")
+)
 
 // Payload is the sealed union of durable gate payload records.
 type Payload interface {
@@ -134,6 +137,9 @@ func UnmarshalPayload(data []byte) (Payload, error) {
 	}
 	if len(wrapper.Data) == 0 {
 		return nil, &PayloadDecodeError{Kind: string(wrapper.Kind), Cause: errMissingPayloadData}
+	}
+	if isExplicitJSONNull(wrapper.Data) {
+		return nil, &PayloadDecodeError{Kind: string(wrapper.Kind), Cause: errNullPayloadData}
 	}
 	return unmarshalPayloadData(wrapper.Kind, wrapper.Data)
 }
@@ -306,4 +312,8 @@ func decodeStrict(data []byte, v any) error {
 		return err
 	}
 	return nil
+}
+
+func isExplicitJSONNull(data json.RawMessage) bool {
+	return bytes.Equal(bytes.TrimSpace(data), []byte("null"))
 }
