@@ -12,6 +12,13 @@ import (
 	"github.com/looprig/harness/pkg/gate"
 )
 
+type fakeGateError struct {
+	kind string
+}
+
+func (e fakeGateError) Error() string         { return "fake gate error: " + e.kind }
+func (e fakeGateError) GateErrorKind() string { return e.kind }
+
 // doReqBody issues method+path against ts with a JSON body and returns the
 // response; the caller closes the body. It fatals on a construction/transport
 // error so each subtest stays terse.
@@ -134,7 +141,7 @@ func TestGateResolution(t *testing.T) {
 	}{
 		{
 			name: "response request is delegated with gate id and user source",
-			body: `{"action":"approve","values":{"scope":1,"accepted_grants":["grant-a"]}}`, wantStatus: http.StatusAccepted,
+			body: `{"action":"approve","values":{"scope":"session","accepted_grants":["grant-a"]}}`, wantStatus: http.StatusAccepted,
 			assert: func(t *testing.T, fa *fakeAgent, gid gate.ID) {
 				called, got := fa.respondGateArgs()
 				if !called {
@@ -152,8 +159,8 @@ func TestGateResolution(t *testing.T) {
 				if got.Source.Reason != "" {
 					t.Errorf("RespondGate Source.Reason = %q, want empty", got.Source.Reason)
 				}
-				if got := string(got.Values["scope"]); got != "1" {
-					t.Errorf("RespondGate Values[scope] = %s, want 1", got)
+				if got := string(got.Values["scope"]); got != `"session"` {
+					t.Errorf("RespondGate Values[scope] = %s, want \"session\"", got)
 				}
 				if got := string(got.Values["accepted_grants"]); got != `["grant-a"]` {
 					t.Errorf("RespondGate Values[accepted_grants] = %s, want [\"grant-a\"]", got)
@@ -167,6 +174,18 @@ func TestGateResolution(t *testing.T) {
 		{
 			name: "agent RespondGate error is a 500",
 			body: `{"action":"approve"}`, respondErr: errInterrupt, wantStatus: http.StatusInternalServerError,
+		},
+		{
+			name: "gate not found returns 404",
+			body: `{"action":"approve"}`, respondErr: fakeGateError{kind: "not_found"}, wantStatus: http.StatusNotFound,
+		},
+		{
+			name: "invalid gate action returns 400",
+			body: `{"action":"bogus"}`, respondErr: fakeGateError{kind: "action_invalid"}, wantStatus: http.StatusBadRequest,
+		},
+		{
+			name: "not-ready gate returns 409",
+			body: `{"action":"approve"}`, respondErr: fakeGateError{kind: "not_ready"}, wantStatus: http.StatusConflict,
 		},
 		{
 			name: "unknown session returns 404",

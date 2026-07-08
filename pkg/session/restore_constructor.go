@@ -2,8 +2,6 @@ package session
 
 import (
 	"context"
-	"errors"
-	"io"
 	"time"
 
 	"github.com/looprig/core/uuid"
@@ -364,6 +362,11 @@ func buildRestoredSession(
 	opts ...Option,
 ) (*Session, error) {
 	sessionCtx, sessionCancel := context.WithCancel(ctx)
+	gateAppender, err := journal.NewJournalGateAppenderChecked(j)
+	if err != nil {
+		sessionCancel()
+		return nil, &RestoreError{Kind: RestoreJournalFailed, Cause: err}
+	}
 	s := &Session{
 		SessionID:     sessionID,
 		sessionCtx:    sessionCtx,
@@ -378,10 +381,10 @@ func buildRestoredSession(
 		// lock is needed yet; once up, NewLoop enforces the quota against this restored base.
 		spawned: spawnedCount,
 		gates:   cloneGateEntries(restoredGates),
-		// Gate directory: nop appender + empty timer map by default, mirroring New.
-		// Caller opts may replace the appender below.
+		// Gate directory: restored sessions own a journal-backed appender by default.
+		// Caller opts may replace it below for same-package tests.
 		gateTimers:   map[gate.ID]*time.Timer{},
-		gateAppender: nopGateAppender{},
+		gateAppender: gateAppender,
 	}
 	// Apply the same opts the probe read (WithCommandAppender wires the durable intent
 	// log; WithAllowConfigMismatch is a no-op here — already consumed; WithLimits sets the
@@ -505,30 +508,6 @@ func openTurnCoords(events []event.Event) (uuid.UUID, event.TurnIndex) {
 		}
 	}
 	return uuid.UUID{}, 0
-}
-
-// drainReplay opens a cold cursor for req and reads it to io.EOF, returning the events
-// in stream-sequence order. Any non-EOF read error (a setup, read, decode, or object
-// failure) fails closed: the partial slice is discarded and the typed error is returned,
-// so a restore never reconstructs truncated history. The cursor is always Closed.
-func drainReplay(ctx context.Context, replayer journal.EventReplayer, req journal.ReplayRequest) ([]event.Event, error) {
-	cursor, err := replayer.Open(ctx, req)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = cursor.Close() }()
-
-	var out []event.Event
-	for {
-		ev, _, err := cursor.Next(ctx)
-		if errors.Is(err, io.EOF) {
-			return out, nil
-		}
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, ev)
-	}
 }
 
 // releaseLease releases the lease on a bounded context, best-effort. On a failed restore

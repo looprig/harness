@@ -262,6 +262,9 @@ func (b *sessionJournal) mapAppendErr(rec journal.JournalRecord, err error) erro
 func (b *sessionJournal) encodeRecordBody(rec journal.JournalRecord) (kind, []byte, error) {
 	switch r := rec.(type) {
 	case journal.EventRecord:
+		if _, private := r.Event().(event.GatePrepared); private {
+			return "", nil, &journal.MarshalRecordError{Subject: b.name, Cause: errors.New("GatePrepared is private; append journal.GatePreparedRecord")}
+		}
 		body, err := event.MarshalEvent(r.Event())
 		if err != nil {
 			return "", nil, &journal.MarshalRecordError{Subject: b.name, Cause: err}

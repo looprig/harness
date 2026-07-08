@@ -688,7 +688,7 @@ func TestRespondGateApproveDispatchesCommand(t *testing.T) {
 		GateID: gateID,
 		Action: "approve",
 		Values: map[string]json.RawMessage{
-			"scope":           json.RawMessage(`1`),
+			"scope":           json.RawMessage(`"session"`),
 			"accepted_grants": json.RawMessage(`["t1","t2"]`),
 		},
 		Source: gate.ResponseSource{Kind: gate.ResponseFromUser},
@@ -717,6 +717,32 @@ func TestRespondGateApproveDispatchesCommand(t *testing.T) {
 	}
 	if app.resolved[0].ApprovalScope != tool.ScopeSession {
 		t.Errorf("resolved approval scope = %d, want %d (ScopeSession)", app.resolved[0].ApprovalScope, tool.ScopeSession)
+	}
+}
+
+func TestRespondGateApproveRequiresScope(t *testing.T) {
+	t.Parallel()
+	s, _, loopID, cmds := gateSession(t)
+	payload := gate.PermissionPayload{Request: tool.BashRequest{Command: "echo ok"}}
+	gateID := prepareAndActivate(t, s, loopID, payload)
+
+	err := s.RespondGate(context.Background(), gate.GateResponse{
+		GateID: gateID,
+		Action: "approve",
+		Source: gate.ResponseSource{Kind: gate.ResponseFromUser},
+	})
+	if err == nil {
+		t.Fatal("RespondGate() error = nil, want missing scope validation failure")
+	}
+	var ge *GateError
+	if !errors.As(err, &ge) || ge.Kind != GateActionInvalid {
+		t.Fatalf("RespondGate() error = %v, want *GateError{GateActionInvalid}", err)
+	}
+
+	select {
+	case c := <-cmds:
+		t.Errorf("missing scope dispatched a command %T, want none", c)
+	default:
 	}
 }
 
@@ -817,7 +843,7 @@ func TestRespondGateValidatesAcceptedGrants(t *testing.T) {
 		GateID: gateID,
 		Action: "approve",
 		Values: map[string]json.RawMessage{
-			"scope":           json.RawMessage(`0`),
+			"scope":           json.RawMessage(`"once"`),
 			"accepted_grants": json.RawMessage(`["fabricated-token"]`),
 		},
 		Source: gate.ResponseSource{Kind: gate.ResponseFromUser},
@@ -852,7 +878,7 @@ func TestRespondGateRejectsScopeOutsidePermissionRequest(t *testing.T) {
 		GateID: gateID,
 		Action: "approve",
 		Values: map[string]json.RawMessage{
-			"scope": json.RawMessage(`1`),
+			"scope": json.RawMessage(`"session"`),
 		},
 		Source: gate.ResponseSource{Kind: gate.ResponseFromUser},
 	})

@@ -79,6 +79,11 @@ type gateDispatchError struct {
 	Cause  error
 }
 
+type gateKindError interface {
+	error
+	GateErrorKind() string
+}
+
 func (e gateDispatchError) Error() string {
 	if e.Cause != nil {
 		return "api: gate dispatch (" + strconv.Itoa(e.Status) + "): " + e.Msg + ": " + e.Cause.Error()
@@ -182,6 +187,17 @@ func (s *server) handleResolveGate(w http.ResponseWriter, r *http.Request) {
 func wrapAgentErr(err error) error {
 	if err == nil {
 		return nil
+	}
+	var ge gateKindError
+	if errors.As(err, &ge) {
+		switch ge.GateErrorKind() {
+		case "not_found":
+			return gateDispatchError{Status: http.StatusNotFound, Msg: msgGateNotFound, Cause: err}
+		case "action_invalid", "kind_mismatch":
+			return gateDispatchError{Status: http.StatusBadRequest, Msg: msgInvalidGate, Cause: err}
+		case "not_ready":
+			return gateDispatchError{Status: http.StatusConflict, Msg: msgInvalidGate, Cause: err}
+		}
 	}
 	return gateDispatchError{Status: http.StatusInternalServerError, Msg: msgGateResolveFailed, Cause: err}
 }

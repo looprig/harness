@@ -2,7 +2,6 @@ package loop
 
 import (
 	"context"
-	"strconv"
 
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/command"
@@ -329,7 +328,11 @@ func askUserGate(callID uuid.UUID, question string, choices []string) gatedomain
 func approvalScopeOptions(scopes []tool.ApprovalScope) []gatedomain.Option {
 	out := make([]gatedomain.Option, 0, len(scopes))
 	for _, scope := range scopes {
-		out = append(out, gatedomain.Option{Value: strconv.Itoa(int(scope)), Label: approvalScopeLabel(scope)})
+		value, ok := tool.ApprovalScopeValue(scope)
+		if !ok {
+			continue
+		}
+		out = append(out, gatedomain.Option{Value: value, Label: approvalScopeLabel(scope)})
 	}
 	return out
 }
@@ -343,7 +346,7 @@ func approvalScopeLabel(scope tool.ApprovalScope) string {
 	case tool.ScopeWorkspace:
 		return "Workspace"
 	default:
-		return strconv.Itoa(int(scope))
+		return "Unknown"
 	}
 }
 

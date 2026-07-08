@@ -159,3 +159,42 @@ func (a *JournalCommandAppender) AppendCommand(ctx context.Context, rec CommandR
 	_, err := a.journal.Append(ctx, rec)
 	return err
 }
+
+// JournalGateAppender adapts a SessionJournal to the session gate directory's
+// strict durable append seam. GatePreparedRecord is appended as a private record;
+// GateOpened and GateResolved are public Enduring events and are wrapped in
+// EventRecord exactly like JournalEventAppender.
+type JournalGateAppender struct {
+	journal SessionJournal
+}
+
+// NewJournalGateAppender wraps journal as a gate appender. Like the other unchecked
+// appender constructors, it expects a validated journal; use
+// NewJournalGateAppenderChecked at composition roots.
+func NewJournalGateAppender(journal SessionJournal) *JournalGateAppender {
+	return &JournalGateAppender{journal: journal}
+}
+
+// NewJournalGateAppenderChecked fails loud on nil journal so composition wiring bugs
+// surface at construction instead of the first gate operation.
+func NewJournalGateAppenderChecked(journal SessionJournal) (*JournalGateAppender, error) {
+	if journal == nil {
+		return nil, &NilJournalError{}
+	}
+	return &JournalGateAppender{journal: journal}, nil
+}
+
+func (a *JournalGateAppender) AppendGatePrepared(ctx context.Context, rec GatePreparedRecord) error {
+	_, err := a.journal.Append(ctx, rec)
+	return err
+}
+
+func (a *JournalGateAppender) AppendGateOpened(ctx context.Context, ev event.GateOpened) error {
+	_, err := a.journal.Append(ctx, NewEventRecord(ev))
+	return err
+}
+
+func (a *JournalGateAppender) AppendGateResolved(ctx context.Context, ev event.GateResolved) error {
+	_, err := a.journal.Append(ctx, NewEventRecord(ev))
+	return err
+}

@@ -9,6 +9,7 @@ import (
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/command"
 	gatedomain "github.com/looprig/harness/pkg/gate"
+	"github.com/looprig/harness/pkg/tool"
 )
 
 type gateRegistrarPublisher struct {
@@ -58,6 +59,28 @@ func newLoopWithGateRegistrar(t *testing.T, registrar *gateRegistrarPublisher) (
 	}
 	t.Cleanup(cancel)
 	return l, cancel
+}
+
+func TestPermissionGateUsesStableStringScopeOptions(t *testing.T) {
+	t.Parallel()
+	g := permissionGate(newCallID(t), tool.BashRequest{Command: "echo ok"})
+	fields := g.Prompt.Schema.Fields
+	if len(fields) != 1 || fields[0].Name != "scope" {
+		t.Fatalf("permission gate fields = %#v, want one scope field", fields)
+	}
+	var got []string
+	for _, opt := range fields[0].Options {
+		got = append(got, opt.Value)
+	}
+	want := []string{"once", "session", "workspace"}
+	if len(got) != len(want) {
+		t.Fatalf("scope options = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("scope options = %v, want %v", got, want)
+		}
+	}
 }
 
 // registerGate sends a gateRegistration through the actor's gateReg seam and waits

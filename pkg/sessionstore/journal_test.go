@@ -13,10 +13,13 @@ import (
 	"testing"
 	"time"
 
-	"github.com/looprig/harness/pkg/command"
 	"github.com/looprig/core/content"
-	"github.com/looprig/harness/pkg/journal"
 	"github.com/looprig/core/uuid"
+	"github.com/looprig/harness/pkg/command"
+	"github.com/looprig/harness/pkg/event"
+	"github.com/looprig/harness/pkg/gate"
+	"github.com/looprig/harness/pkg/identity"
+	"github.com/looprig/harness/pkg/journal"
 	"github.com/looprig/storage"
 	"github.com/looprig/storage/memstore"
 )
@@ -119,6 +122,40 @@ func TestOpenJournalWritesOpeningFence(t *testing.T) {
 	}
 	if fence.Epoch != epoch {
 		t.Errorf("opening fence epoch = %d, want %d", fence.Epoch, epoch)
+	}
+}
+
+func TestAppendRejectsGatePreparedEventRecord(t *testing.T) {
+	t.Parallel()
+	st, err := Open(memstore.New())
+	if err != nil {
+		t.Fatalf("Open() err = %v", err)
+	}
+	id := newTestUUID(t)
+	lease, _ := leaseFor(1, id)
+	j, err := st.OpenJournal(context.Background(), id, lease)
+	if err != nil {
+		t.Fatalf("OpenJournal() err = %v", err)
+	}
+	ev := event.GatePrepared{
+		Header: event.Header{
+			Coordinates: identity.Coordinates{SessionID: id, LoopID: id, TurnID: id, StepID: id},
+			EventID:     newTestUUID(t),
+		},
+		Gate: gate.Gate{
+			ID:       gate.ID(newTestUUID(t)),
+			Kind:     gate.KindPermission,
+			Resolver: gate.ResolverLoop,
+			Subject:  gate.Subject{TurnID: gate.ID(id), StepID: gate.ID(id)},
+		},
+	}
+
+	seq, err := j.Append(context.Background(), journal.NewEventRecord(ev))
+	if err == nil {
+		t.Fatal("Append(GatePrepared EventRecord) err = nil, want private-event rejection")
+	}
+	if seq != 0 {
+		t.Errorf("Append(GatePrepared EventRecord) seq = %d, want 0", seq)
 	}
 }
 

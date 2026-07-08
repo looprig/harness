@@ -192,6 +192,52 @@ func TestRestoreGateOpenedWithoutResolutionClosesUnavailable(t *testing.T) {
 	}
 }
 
+func TestRestoreWiresGateAppenderForNewGates(t *testing.T) {
+	store := newRestoreStore(t)
+	cfg := restoreCfg(&stubLLM{}, "model-x", "be helpful")
+	orig := buildGateRestoreStream(t, store, cfg, false, false, false)
+	handOver(t, orig.lease)
+
+	s, err := Restore(context.Background(), cfg, orig.sessionID, store)
+	if err != nil {
+		t.Fatalf("Restore: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Shutdown(context.Background()) })
+
+	gateID, err := s.PrepareGateOpen(context.Background(), orig.primaryLoopID, permissionGate(), gate.PermissionPayload{Request: tool.BashRequest{Command: "echo ok"}})
+	if err != nil {
+		t.Fatalf("PrepareGateOpen: %v", err)
+	}
+	if err := s.ActivateGate(context.Background(), gateID, gate.Route{GateID: gateID, LoopID: orig.primaryLoopID}); err != nil {
+		t.Fatalf("ActivateGate: %v", err)
+	}
+
+	replayer, err := store.OpenRecordReplayer(orig.sessionID, sessionstore.ReplayRequest{FromSeq: 0})
+	if err != nil {
+		t.Fatalf("OpenRecordReplayer: %v", err)
+	}
+	records, err := drainRecordReplay(context.Background(), replayer, journal.ReplayRequest{From: journal.Beginning()})
+	if err != nil {
+		t.Fatalf("drainRecordReplay: %v", err)
+	}
+	var prepared, opened bool
+	for _, rec := range records {
+		switch r := rec.(type) {
+		case journal.GatePreparedRecord:
+			if r.Prepared().Gate.ID == gateID {
+				prepared = true
+			}
+		case journal.EventRecord:
+			if ev, ok := r.Event().(event.GateOpened); ok && ev.Gate.ID == gateID {
+				opened = true
+			}
+		}
+	}
+	if !prepared || !opened {
+		t.Fatalf("restored session gate appender persisted prepared=%v opened=%v, want both true", prepared, opened)
+	}
+}
+
 func TestRestoreGatePreparedWithoutOpenedIsInvisible(t *testing.T) {
 	store := newRestoreStore(t)
 	cfg := restoreCfg(&stubLLM{}, "model-x", "be helpful")

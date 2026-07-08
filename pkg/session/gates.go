@@ -120,6 +120,11 @@ func (e *GateError) Error() string {
 
 func (e *GateError) Unwrap() error { return e.Cause }
 
+// GateErrorKind exposes the stable string kind for package boundaries (for
+// example pkg/api) that should not import pkg/session just to map response
+// errors.
+func (e *GateError) GateErrorKind() string { return string(e.Kind) }
+
 // WithGateAppender injects the strict durable append seam for gate
 // prepare/open/resolve. A nil appender is ignored (the nop default stays
 // installed). It is the gate-directory counterpart to WithCommandAppender.
@@ -590,11 +595,17 @@ func (s *Session) translateAskUserResponse(hdr command.Header, route command.Gat
 // request did not offer or an accepted grant not in the request's Grants fails
 // secure.
 func validatePermissionApprove(payload gate.Payload, response gate.GateResponse) (tool.ApprovalScope, []string, gate.ResponseAudit, error) {
-	scope := tool.ScopeOnce
-	if raw, ok := response.Values["scope"]; ok {
-		if err := json.Unmarshal(raw, &scope); err != nil {
-			return 0, nil, nil, &GateError{GateID: response.GateID, Kind: GateActionInvalid, Cause: err}
-		}
+	rawScope, ok := response.Values["scope"]
+	if !ok {
+		return 0, nil, nil, &GateError{GateID: response.GateID, Kind: GateActionInvalid}
+	}
+	var scopeValue string
+	if err := json.Unmarshal(rawScope, &scopeValue); err != nil {
+		return 0, nil, nil, &GateError{GateID: response.GateID, Kind: GateActionInvalid, Cause: err}
+	}
+	scope, ok := tool.ParseApprovalScopeValue(scopeValue)
+	if !ok {
+		return 0, nil, nil, &GateError{GateID: response.GateID, Kind: GateActionInvalid}
 	}
 	permPayload, ok := permissionPayloadFromGatePayload(payload)
 	if !ok || permPayload.Request == nil {

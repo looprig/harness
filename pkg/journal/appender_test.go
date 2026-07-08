@@ -3,10 +3,12 @@ package journal
 import (
 	"context"
 	"errors"
+	"reflect"
 	"testing"
 
 	"github.com/looprig/harness/pkg/command"
 	"github.com/looprig/harness/pkg/event"
+	"github.com/looprig/harness/pkg/gate"
 	"github.com/looprig/harness/pkg/identity"
 )
 
@@ -76,6 +78,62 @@ func TestJournalEventAppenderRoutes(t *testing.T) {
 				t.Errorf("wrapped event = %v, want the appended event", er.Event())
 			}
 		})
+	}
+}
+
+func TestJournalGateAppenderRoutes(t *testing.T) {
+	t.Parallel()
+	sid := fixedUUID(0x81)
+	lid := fixedUUID(0x82)
+	turnID := fixedUUID(0x83)
+	stepID := fixedUUID(0x84)
+	gateID := gate.ID(fixedUUID(0x85))
+	evID := fixedUUID(0x86)
+	coords := identity.Coordinates{SessionID: sid, LoopID: lid, TurnID: turnID, StepID: stepID}
+	g := gate.Gate{
+		ID:       gateID,
+		Kind:     gate.KindPermission,
+		Resolver: gate.ResolverLoop,
+		Subject:  gate.Subject{TurnID: gate.ID(turnID), StepID: gate.ID(stepID)},
+	}
+	prepared := event.GatePrepared{Header: event.Header{Coordinates: coords, EventID: evID}, Gate: g}
+	openPayload := gate.OpenPayload{GateID: gateID, Payload: gate.PermissionPayload{}}
+	preparedRecord := NewGatePreparedRecord(prepared, openPayload)
+	opened := event.GateOpened{Header: event.Header{Coordinates: coords, EventID: fixedUUID(0x87)}, Gate: g}
+	resolved := event.GateResolved{Header: event.Header{Coordinates: coords, EventID: fixedUUID(0x88)}, GateID: gateID}
+
+	j := &recordingJournal{}
+	app := NewJournalGateAppender(j)
+
+	if err := app.AppendGatePrepared(context.Background(), preparedRecord); err != nil {
+		t.Fatalf("AppendGatePrepared = %v, want nil", err)
+	}
+	if err := app.AppendGateOpened(context.Background(), opened); err != nil {
+		t.Fatalf("AppendGateOpened = %v, want nil", err)
+	}
+	if err := app.AppendGateResolved(context.Background(), resolved); err != nil {
+		t.Fatalf("AppendGateResolved = %v, want nil", err)
+	}
+
+	if len(j.records) != 3 {
+		t.Fatalf("appended %d records, want 3", len(j.records))
+	}
+	if got, ok := j.records[0].(GatePreparedRecord); !ok || got.IdempotencyID() != preparedRecord.IdempotencyID() {
+		t.Fatalf("record[0] = %T/%q, want GatePreparedRecord/%q", j.records[0], j.records[0].IdempotencyID(), preparedRecord.IdempotencyID())
+	}
+	openedRecord, ok := j.records[1].(EventRecord)
+	if !ok {
+		t.Fatalf("record[1] = %T, want EventRecord", j.records[1])
+	}
+	if !reflect.DeepEqual(openedRecord.Event(), opened) {
+		t.Errorf("record[1] event = %#v, want %#v", openedRecord.Event(), opened)
+	}
+	resolvedRecord, ok := j.records[2].(EventRecord)
+	if !ok {
+		t.Fatalf("record[2] = %T, want EventRecord", j.records[2])
+	}
+	if !reflect.DeepEqual(resolvedRecord.Event(), resolved) {
+		t.Errorf("record[2] event = %#v, want %#v", resolvedRecord.Event(), resolved)
 	}
 }
 
