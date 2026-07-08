@@ -107,8 +107,13 @@ type Runner struct {
 	// mints-per-run; swe wires the checker to it. When the factory is nil the Runner falls
 	// back to today's behavior — the session default-mints its own internal ceiling state
 	// (whatever cfg carries is untouched).
-	ceilingFactory func() *ceiling.State
+	ceilingFactory CeilingFactory
 }
+
+// CeilingFactory mints a fresh security-ceiling state. The Runner calls it once per
+// Run/Restore so each session gets its own independent clamp (AMBIGUITY A1 on
+// Runner.ceilingFactory). It is a named type per the codebase's prefer-named-types rule.
+type CeilingFactory func() *ceiling.State
 
 // CompileOption configures a Runner at Compile time. Every caller-facing knob is captured
 // here (the runtime Run/Restore take none), mirroring flow's CompileOption model. A
@@ -179,7 +184,7 @@ func WithCompileAllowConfigMismatch() CompileOption {
 // *ceiling.State for each Run/Restore. A nil factory is ignored (the session default-mints
 // its own internal state). See AMBIGUITY A1 on Runner.ceilingFactory for why the ceiling
 // must be per-run and what the Runner deliberately leaves to swe.
-func WithCompileCeilingFactory(factory func() *ceiling.State) CompileOption {
+func WithCompileCeilingFactory(factory CeilingFactory) CompileOption {
 	return func(r *Runner) {
 		if factory != nil {
 			r.ceilingFactory = factory
