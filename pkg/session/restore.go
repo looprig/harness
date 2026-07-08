@@ -146,6 +146,20 @@ func findRootLoopStarted(events []event.Event) (event.LoopStarted, error) {
 	return event.LoopStarted{}, &RestoreDiscoveryError{Kind: RestoreNoPrimaryLoop}
 }
 
+func findForeignSID(events []event.Event) string {
+	for _, ev := range events {
+		if ls, ok := ev.(event.LoopStarted); ok && ls.ForeignSID != "" {
+			return ls.ForeignSID
+		}
+	}
+	for _, ev := range events {
+		if fb, ok := ev.(event.ForeignSessionBound); ok && fb.ForeignSID != "" {
+			return fb.ForeignSID
+		}
+	}
+	return ""
+}
+
 // countSpawnedLoops counts the durable NON-ROOT LoopStarted events in the replayed
 // stream — those whose Header.Cause.Coordinates is non-zero (a subagent spawn carries the
 // spawning loop/turn/step in its Cause). It is the restore-time re-seed of the session's

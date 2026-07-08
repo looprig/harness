@@ -24,10 +24,32 @@ func (fakeSessionJournal) Append(context.Context, journal.JournalRecord) (uint64
 	return 1, nil
 }
 
+func TestFindForeignSIDPrefersLoopStarted(t *testing.T) {
+	t.Parallel()
+	got := findForeignSID([]event.Event{
+		event.LoopStarted{ForeignSID: "from-loop-started"},
+		event.ForeignSessionBound{ForeignSID: "from-bound"},
+	})
+	if got != "from-loop-started" {
+		t.Fatalf("sid = %q, want LoopStarted sid", got)
+	}
+}
+
+func TestFindForeignSIDFallsBackToForeignSessionBound(t *testing.T) {
+	t.Parallel()
+	got := findForeignSID([]event.Event{
+		event.LoopStarted{},
+		event.ForeignSessionBound{ForeignSID: "from-bound"},
+	})
+	if got != "from-bound" {
+		t.Fatalf("sid = %q, want bound sid", got)
+	}
+}
+
 // TestForeignRestore covers buildRestoredSession's Engine switch: a foreign cfg.Engine
-// reconstructs the primary loop through the wired RestoredBuilder, recovering the root
-// LoopStarted's ForeignSID into the seed; an empty recovered sid (or a missing restored
-// builder) fails closed; a native cfg restores through loop.NewRestored unchanged.
+// reconstructs the primary loop through the wired RestoredBuilder, carrying the recovered
+// foreign sid into the seed; an empty recovered sid (or a missing restored builder) fails
+// closed; a native cfg restores through loop.NewRestored unchanged.
 func TestForeignRestore(t *testing.T) {
 	t.Parallel()
 

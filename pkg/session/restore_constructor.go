@@ -45,9 +45,9 @@ const (
 	RestoreContextDone RestoreErrorKind = "context_done"
 	// RestoreIDGenerationFailed: a crypto/rand failure minting a restore-event id.
 	RestoreIDGenerationFailed RestoreErrorKind = "id_generation_failed"
-	// RestoreForeignSIDMissing: the root LoopStarted of a foreign-engine session carried
-	// an empty ForeignSID, so the foreign session cannot be --resumed. Restore fails
-	// closed rather than orphaning the recorded foreign session under a fresh sid.
+	// RestoreForeignSIDMissing: the replayed primary-loop events carried no foreign
+	// session id, so the foreign session cannot be --resumed. Restore fails closed rather
+	// than orphaning the recorded foreign session under a fresh sid.
 	RestoreForeignSIDMissing RestoreErrorKind = "foreign_sid_missing"
 	// RestoreForeignBuilderMissing: a foreign-engine session was restored but no foreign
 	// RestoredBuilder was wired (WithForeignBuilder). Restore fails closed rather than
@@ -327,12 +327,11 @@ func restoreSession(
 	// opts so the restore owns the lease lifecycle (a caller cannot accidentally override
 	// the releaser with a stale one).
 	leaseOpts := append(append([]Option(nil), opts...), WithLeaseRelease(lease.Release))
-	// rootLoop.ForeignSID is the recovered foreign session id (empty for a native session).
-	// It is read off the SAME root LoopStarted findRootLoopStarted already returned (which
-	// also yields primaryLoopID + AgentName), so the "what is the root loop" facts stay in
-	// one place. The restore branch in buildRestoredSession fails closed on an empty sid for
-	// a foreign engine.
-	s, err := buildRestoredSession(ctx, cfg, sessionID, primaryLoopID, rootLoop.ForeignSID, spawnedCount, ceilingLevel, hasCeiling, folded, restoredGates.open, j, factory, newID, now, leaseOpts...)
+	// Recover the foreign session id from the primary loop's events. Prebound adapters
+	// stamped it on LoopStarted; late-bound adapters record it with ForeignSessionBound.
+	// buildRestoredSession fails closed on an empty sid for a foreign engine.
+	foreignSID := findForeignSID(primaryEvents)
+	s, err := buildRestoredSession(ctx, cfg, sessionID, primaryLoopID, foreignSID, spawnedCount, ceilingLevel, hasCeiling, folded, restoredGates.open, j, factory, newID, now, leaseOpts...)
 	if err != nil {
 		return recordErrored(err)
 	}
@@ -423,10 +422,10 @@ func buildRestoredSession(
 	// LoopStarted is published — the loop already exists in the durable record. The Engine
 	// switch mirrors newLoop's: a native cfg.Engine seeds through loop.NewRestored exactly
 	// as before; a foreign cfg.Engine reconstructs through the injected RestoredBuilder,
-	// recovering the foreign session id from the root LoopStarted. It fails CLOSED on an
-	// empty recovered sid (the foreign session could not be --resumed) or a missing builder
-	// (never silently rebuild the primary as a native loop). Every error path cancels the
-	// loopCtx and the session backstop, exactly like the native path.
+	// carrying the recovered foreign session id. It fails CLOSED on an empty recovered sid
+	// (the foreign session could not be --resumed) or a missing builder (never silently
+	// rebuild the primary as a native loop). Every error path cancels the loopCtx and the
+	// session backstop, exactly like the native path.
 	loopCtx, cancel := context.WithCancel(sessionCtx)
 	var l loop.Backend
 	switch cfg.Engine {
