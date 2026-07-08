@@ -19,10 +19,11 @@ const envelopeVersion = 1
 type kind string
 
 const (
-	kindEvent   kind = "event"
-	kindCommand kind = "command"
-	kindFence   kind = "fence"
-	kindBlobPtr kind = "blobptr"
+	kindEvent        kind = "event"
+	kindCommand      kind = "command"
+	kindFence        kind = "fence"
+	kindBlobPtr      kind = "blobptr"
+	kindGatePrepared kind = "gate_prepared"
 )
 
 // envelope is the versioned wire frame for one ledger record. Body is the record's
@@ -72,7 +73,7 @@ func (env envelope) validate() error {
 		return &EnvelopeError{Reason: "unsupported version " + strconv.Itoa(env.V)}
 	}
 	switch kind(env.Kind) {
-	case kindEvent, kindCommand, kindFence, kindBlobPtr:
+	case kindEvent, kindCommand, kindFence, kindBlobPtr, kindGatePrepared:
 		return nil
 	default:
 		return &EnvelopeError{Reason: "unknown kind " + strconv.Quote(env.Kind)}

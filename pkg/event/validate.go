@@ -211,6 +211,12 @@ func classify(ev Event) (name string, profile idProfile, ok bool) {
 		return "ToolCallStarted", toolProfile(), true
 	case ToolCallCompleted:
 		return "ToolCallCompleted", toolProfile(), true
+	case GatePrepared:
+		return "GatePrepared", stepProfile(), true
+	case GateOpened:
+		return "GateOpened", stepProfile(), true
+	case GateResolved:
+		return "GateResolved", stepProfile(), true
 	default:
 		return "Event", idProfile{}, false
 	}

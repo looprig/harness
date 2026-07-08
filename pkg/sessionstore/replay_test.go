@@ -10,12 +10,14 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"github.com/looprig/harness/pkg/command"
 	"github.com/looprig/core/content"
+	"github.com/looprig/core/uuid"
+	"github.com/looprig/harness/pkg/command"
 	"github.com/looprig/harness/pkg/event"
+	"github.com/looprig/harness/pkg/gate"
 	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/journal"
-	"github.com/looprig/core/uuid"
+	"github.com/looprig/harness/pkg/tool"
 	"github.com/looprig/storage"
 	"github.com/looprig/storage/memstore"
 )
@@ -711,3 +713,133 @@ func (b *corruptGetBlobs) List(ctx context.Context, prefix string) ([]string, er
 }
 
 var _ storekit.Blobs = (*corruptGetBlobs)(nil)
+
+// --- gate prepared record replay tests -----------------------------------
+
+// buildGateFixture opens a memstore-backed Store, acquires a real lease, opens the
+// journal (writing the opening fence), and appends a GatePreparedRecord followed
+// by the public GateOpened and GateResolved events. It returns the store, session
+// id, and the appended records in order (fence first) so a replay can compare
+// against them.
+func buildGateFixture(t *testing.T) fixture {
+	t.Helper()
+	st, err := Open(memstore.New(), WithOffloadThreshold(replayThreshold))
+	if err != nil {
+		t.Fatalf("Open() err = %v", err)
+	}
+	id := newTestUUID(t)
+	loopID := newTestUUID(t)
+	turnID := newTestUUID(t)
+	stepID := newTestUUID(t)
+	gateID := gate.ID(newTestUUID(t))
+	toolExecID := newTestUUID(t)
+
+	lease, err := st.AcquireLease(context.Background(), id)
+	if err != nil {
+		t.Fatalf("AcquireLease() err = %v", err)
+	}
+	epoch := lease.Epoch()
+
+	j, err := st.OpenJournal(context.Background(), id, lease)
+	if err != nil {
+		t.Fatalf("OpenJournal() err = %v", err)
+	}
+
+	stepH := event.Header{
+		Coordinates: identity.Coordinates{SessionID: id, LoopID: loopID, TurnID: turnID, StepID: stepID},
+		EventID:     newTestUUID(t),
+	}
+	g := gate.Gate{
+		ID:       gateID,
+		Kind:     gate.KindPermission,
+		Resolver: gate.ResolverLoop,
+		Blocks:   gate.BlocksToolCall,
+		Effect:   gate.EffectResume,
+		Subject:  gate.Subject{ToolExecutionID: toolExecID},
+		Prompt:   gate.Prompt{Title: "Approve", Body: "echo ok", Controls: []gate.Control{{Action: "approve", Label: "Approve"}, {Action: "deny", Label: "Deny"}}},
+	}
+	prepared := event.GatePrepared{Header: stepH, Gate: g}
+	openPayload := gate.OpenPayload{
+		GateID:  gateID,
+		Payload: gate.PermissionPayload{Request: tool.BashRequest{Command: "echo ok"}},
+	}
+	opened := event.GateOpened{Header: stepH, Gate: g}
+	resolved := event.GateResolved{
+		Header:        stepH,
+		GateID:        gateID,
+		Reason:        gate.CloseAnswered,
+		Action:        "approve",
+		ApprovalScope: tool.ScopeSession,
+		Source:        gate.ResponseSource{Kind: gate.ResponseFromUser},
+		Audit:         gate.PermissionAudit{AcceptedGrantDescriptions: []string{"network egress"}},
+	}
+
+	want := []journal.JournalRecord{
+		journal.NewFenceRecord(id, journal.LeaseFence{Epoch: epoch}),
+		journal.NewGatePreparedRecord(prepared, openPayload),
+		journal.NewEventRecord(opened),
+		journal.NewEventRecord(resolved),
+	}
+	for _, rec := range want[1:] {
+		if _, err := j.Append(context.Background(), rec); err != nil {
+			t.Fatalf("Append(%T) err = %v", rec, err)
+		}
+	}
+	return fixture{store: st, id: id, want: want}
+}
+
+// TestRecordReplayerReplaysGatePrepared proves the RecordReplayer surfaces the
+// private GatePreparedRecord with its typed payload intact, alongside the public
+// GateOpened and GateResolved events.
+func TestRecordReplayerReplaysGatePrepared(t *testing.T) {
+	t.Parallel()
+	fx := buildGateFixture(t)
+	rr, err := fx.store.OpenRecordReplayer(fx.id, ReplayRequest{FromSeq: 1})
+	if err != nil {
+		t.Fatalf("OpenRecordReplayer() err = %v", err)
+	}
+	got, _ := drainRecords(t, rr, journal.ReplayRequest{})
+	if len(got) != len(fx.want) {
+		t.Fatalf("replayed %d records, want %d", len(got), len(fx.want))
+	}
+	// Record 2 is the GatePreparedRecord — verify it carries the payload.
+	gpr, ok := got[1].(journal.GatePreparedRecord)
+	if !ok {
+		t.Fatalf("record[1] = %T, want journal.GatePreparedRecord", got[1])
+	}
+	wantGPR := fx.want[1].(journal.GatePreparedRecord)
+	if !reflect.DeepEqual(gpr.Prepared(), wantGPR.Prepared()) {
+		t.Errorf("Prepared() = %#v, want %#v", gpr.Prepared(), wantGPR.Prepared())
+	}
+	if !reflect.DeepEqual(gpr.Payload(), wantGPR.Payload()) {
+		t.Errorf("Payload() = %#v, want %#v", gpr.Payload(), wantGPR.Payload())
+	}
+	// Records 3 and 4 are the public events.
+	for i := 2; i < len(got); i++ {
+		if !reflect.DeepEqual(got[i], fx.want[i]) {
+			t.Errorf("record[%d] =\n%#v\nwant\n%#v", i, got[i], fx.want[i])
+		}
+	}
+}
+
+// TestEventReplayerSkipsGatePrepared proves the EventReplayer filters out the
+// private GatePreparedRecord (it is not a public event) while still surfacing the
+// public GateOpened and GateResolved events.
+func TestEventReplayerSkipsGatePrepared(t *testing.T) {
+	t.Parallel()
+	fx := buildGateFixture(t)
+	er, err := fx.store.OpenEventReplayer(fx.id, ReplayRequest{FromSeq: 1})
+	if err != nil {
+		t.Fatalf("OpenEventReplayer() err = %v", err)
+	}
+	got, _ := drainEvents(t, er, journal.ReplayRequest{})
+	// Only GateOpened and GateResolved — the fence and GatePreparedRecord are
+	// filtered out (events only).
+	want := []event.Event{
+		fx.want[2].(journal.EventRecord).Event(),
+		fx.want[3].(journal.EventRecord).Event(),
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("events =\n%#v\nwant\n%#v", got, want)
+	}
+}

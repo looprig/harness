@@ -9,10 +9,10 @@ import (
 	"sync"
 	"time"
 
+	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/command"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/journal"
-	"github.com/looprig/core/uuid"
 	"github.com/looprig/storage"
 )
 
@@ -279,6 +279,12 @@ func (b *sessionJournal) encodeRecordBody(rec journal.JournalRecord) (kind, []by
 			return "", nil, &journal.MarshalRecordError{Subject: b.name, Cause: err}
 		}
 		return kindFence, body, nil
+	case journal.GatePreparedRecord:
+		body, err := journal.MarshalGatePreparedRecord(r)
+		if err != nil {
+			return "", nil, &journal.MarshalRecordError{Subject: b.name, Cause: err}
+		}
+		return kindGatePrepared, body, nil
 	default:
 		return "", nil, &journal.RecordKindError{Subject: b.name}
 	}
