@@ -10,6 +10,7 @@ import (
 	"github.com/looprig/harness/pkg/ceiling"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/foreignloop"
+	"github.com/looprig/harness/pkg/gate"
 	"github.com/looprig/harness/pkg/hub"
 	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/journal"
@@ -166,14 +167,13 @@ func restoreSession(
 		releaseLease(lease)
 		return nil, &RestoreError{Kind: RestoreJournalFailed, Cause: err}
 	}
-	// The replayer is bound to the stream BEGINNING (FromSeq 0); the LoopID + Follow
-	// narrowing each drain needs is carried on the journal.ReplayRequest drainReplay
-	// passes to Open (the facade replayer reads req.LoopID/req.Follow, and its start
-	// from the bound FromSeq — journal.StartPos is package-private out here). Opening it
-	// is a step-1 setup step (parallel to the journal): a failure releases the lease and
+	// The replayer is bound to the stream BEGINNING (FromSeq 0). Restore intentionally
+	// drains RECORDS, not events, so the private GatePreparedRecord is visible while the
+	// normal event-based folds are derived from EventRecord payloads. Opening it is a
+	// step-1 setup step (parallel to the journal): a failure releases the lease and
 	// returns without a RestoreErrored, exactly like the journal-setup failure above (the
 	// first restore MUTATION, RestoreStarted, has not been written yet).
-	replayer, err := store.OpenEventReplayer(sessionID, sessionstore.ReplayRequest{FromSeq: 0})
+	replayer, err := store.OpenRecordReplayer(sessionID, sessionstore.ReplayRequest{FromSeq: 0})
 	if err != nil {
 		releaseLease(lease)
 		return nil, &RestoreError{Kind: RestoreReplayFailed, Cause: err}
@@ -200,13 +200,15 @@ func restoreSession(
 	}
 
 	// (2) Replay the whole stream once for discovery (the persisted fingerprint + the
-	// primary loop id + the subagent spawn count). A ZERO LoopID leaves the replay
-	// UNNARROWED — every loop's events — so findRootLoopStarted and countSpawnedLoops see
-	// the subagent LoopStarted events, not just the primary's. Fail closed on any error.
-	all, err := drainReplay(ctx, replayer, journal.ReplayRequest{Follow: false})
+	// primary loop id + the subagent spawn count) and gate recovery. A ZERO LoopID leaves
+	// the event projection UNNARROWED — every loop's events — so findRootLoopStarted and
+	// countSpawnedLoops see the subagent LoopStarted events, not just the primary's. Fail
+	// closed on any error.
+	allRecords, err := drainRecordReplay(ctx, replayer, journal.ReplayRequest{Follow: false})
 	if err != nil {
 		return recordErrored(&RestoreError{Kind: RestoreReplayFailed, Cause: err})
 	}
+	all := eventsFromRecords(allRecords, uuid.UUID{})
 
 	persisted, err := firstConfigFingerprint(all)
 	if err != nil {
@@ -249,10 +251,19 @@ func restoreSession(
 	// secure most-restrictive default. Seeded into the restored session below.
 	ceilingLevel, hasCeiling := lastSecurityCeiling(all)
 
+	// Gate recovery folds the same record replay so private GatePreparedRecord payloads are
+	// visible. Unsupported or payload-less open gates are durably closed below, after
+	// RestoreStarted, before RestoreDone makes the restored session reachable.
+	restoredGates := foldRestoredGates(allRecords)
+
 	// (3) RestoreStarted — the FIRST restore mutation (after the lease fence).
 	if err := appendRestoreEvent(ctx, j, factory, event.RestoreStarted{
 		Header: event.Header{Coordinates: identity.Coordinates{SessionID: sessionID}},
 	}); err != nil {
+		return recordErrored(&RestoreError{Kind: RestoreAppendFailed, Cause: err})
+	}
+
+	if err := appendRestoreUnavailableGates(ctx, j, factory, restoredGates.unavailable); err != nil {
 		return recordErrored(&RestoreError{Kind: RestoreAppendFailed, Cause: err})
 	}
 
@@ -263,12 +274,7 @@ func restoreSession(
 	// would fold a subagent loop's turns into the primary thread and corrupt it. Re-seeding
 	// the system prompt is implicit: it rides cfg.System (the loop never stores it in
 	// msgs), so the seeded loop carries it via cfg.
-	primaryEvents, err := drainReplay(ctx, replayer, journal.ReplayRequest{
-		LoopID: primaryLoopID, Follow: false,
-	})
-	if err != nil {
-		return recordErrored(&RestoreError{Kind: RestoreReplayFailed, Cause: err})
-	}
+	primaryEvents := eventsFromRecords(allRecords, primaryLoopID)
 	folded := foldPrimaryLoop(primaryEvents)
 
 	// (6) Crash-seam: an open turn (a TurnStarted with no terminal) is closed durably
@@ -328,7 +334,7 @@ func restoreSession(
 	// also yields primaryLoopID + AgentName), so the "what is the root loop" facts stay in
 	// one place. The restore branch in buildRestoredSession fails closed on an empty sid for
 	// a foreign engine.
-	s, err := buildRestoredSession(ctx, cfg, sessionID, primaryLoopID, rootLoop.ForeignSID, spawnedCount, ceilingLevel, hasCeiling, folded, j, factory, newID, now, leaseOpts...)
+	s, err := buildRestoredSession(ctx, cfg, sessionID, primaryLoopID, rootLoop.ForeignSID, spawnedCount, ceilingLevel, hasCeiling, folded, restoredGates.open, j, factory, newID, now, leaseOpts...)
 	if err != nil {
 		return recordErrored(err)
 	}
@@ -350,6 +356,7 @@ func buildRestoredSession(
 	ceilingLevel uint8,
 	hasCeiling bool,
 	folded foldResult,
+	restoredGates map[gate.ID]gateEntry,
 	j journal.SessionJournal,
 	factory *event.Factory,
 	newID idGenerator,
@@ -370,6 +377,11 @@ func buildRestoredSession(
 		// so the quota survives restart (§16.3). Set before the session is reachable, so no
 		// lock is needed yet; once up, NewLoop enforces the quota against this restored base.
 		spawned: spawnedCount,
+		gates:   cloneGateEntries(restoredGates),
+		// Gate directory: nop appender + empty timer map by default, mirroring New.
+		// Caller opts may replace the appender below.
+		gateTimers:   map[gate.ID]*time.Timer{},
+		gateAppender: nopGateAppender{},
 	}
 	// Apply the same opts the probe read (WithCommandAppender wires the durable intent
 	// log; WithAllowConfigMismatch is a no-op here — already consumed; WithLimits sets the
