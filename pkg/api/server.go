@@ -46,7 +46,7 @@ func (e ListenError) Error() string {
 func (e ListenError) Unwrap() error { return e.Cause }
 
 // sessionEntry is one live session: its driven agent plus the supervisor that
-// maintains that session's pending-gate registry. The two are torn down together
+// owns the session subscription lifecycle. The two are torn down together
 // (supervisor stopped, agent closed) when the session ends or the server shuts
 // down.
 type sessionEntry struct {
@@ -175,10 +175,10 @@ func (s *server) routes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /sessions/{sid}/interrupt", s.handleInterruptSession)
 
 	// Input submission + gate routing (Task 13, group B). The gate POST resolves a
-	// gate by tool-execution id — the LoopID comes from the supervisor registry,
-	// never the client; the GET lists open gates for a reconnecting client.
+	// gate by opaque gate id through the agent; the GET lists open gates from the
+	// agent's authoritative gate directory.
 	mux.HandleFunc("POST /sessions/{sid}/input", s.handleInput)
-	mux.HandleFunc("POST /sessions/{sid}/gates/{tid}", s.handleResolveGate)
+	mux.HandleFunc("POST /sessions/{sid}/gates/{gid}", s.handleResolveGate)
 	mux.HandleFunc("GET /sessions/{sid}/gates", s.handleListGates)
 
 	// Event stream + transcript export (Task 13, group C). The events route is a
