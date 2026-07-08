@@ -219,6 +219,30 @@ func TestCheckHardDenyBeatsEverything(t *testing.T) {
 	}
 }
 
+func TestPermissionDecisionHardDenyReason(t *testing.T) {
+	t.Parallel()
+	ws := newWS(t)
+	if err := os.WriteFile(filepath.Join(ws, ".env"), []byte("SECRET=1"), 0o600); err != nil {
+		t.Fatalf("write .env: %v", err)
+	}
+	pc, err := NewPermissionChecker(PermissionPolicy{
+		WorkspaceRoot: ws,
+		HardDeny:      DefaultHardDeny(),
+	}, WithHomeDir(func() (string, error) { return t.TempDir(), nil }))
+	if err != nil {
+		t.Fatalf("NewPermissionChecker: %v", err)
+	}
+
+	got := pc.CheckDecision(context.Background(), plainTool{name: "ReadFile"}, "ReadFile", `{"path":".env"}`)
+
+	if got.Effect != loop.EffectDeny {
+		t.Fatalf("CheckDecision Effect = %v, want EffectDeny", got.Effect)
+	}
+	if got.Reason != reasonHardDeny {
+		t.Fatalf("CheckDecision Reason = %q, want %q", got.Reason, reasonHardDeny)
+	}
+}
+
 // TestCheckHardDenyBash asserts a denied Bash prefix is denied, beating a wildcard
 // hard-approve.
 func TestCheckHardDenyBash(t *testing.T) {

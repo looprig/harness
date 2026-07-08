@@ -4,8 +4,8 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/core/uuid"
+	"github.com/looprig/harness/pkg/identity"
 )
 
 // unknownEvent is a test-only concrete Event NOT in the sealed union (it is not
@@ -109,6 +109,7 @@ func TestClassifyExhaustive(t *testing.T) {
 		{"TurnFailed", TurnFailed{}},
 		{"TurnInterrupted", TurnInterrupted{}},
 		{"PermissionRequested", PermissionRequested{}},
+		{"PermissionDecided", PermissionDecided{}},
 		{"UserInputRequested", UserInputRequested{}},
 		{"ToolCallStarted", ToolCallStarted{}},
 		{"ToolCallCompleted", ToolCallCompleted{}},

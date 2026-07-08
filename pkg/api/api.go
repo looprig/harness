@@ -13,10 +13,10 @@ import (
 	"time"
 
 	"github.com/looprig/core/content"
-	"github.com/looprig/harness/pkg/event"
-	"github.com/looprig/harness/pkg/tool"
-	"github.com/looprig/harness/pkg/transcript"
 	"github.com/looprig/core/uuid"
+	"github.com/looprig/harness/pkg/event"
+	"github.com/looprig/harness/pkg/gate"
+	"github.com/looprig/harness/pkg/transcript"
 )
 
 // Agent is the narrow surface the HTTP runner drives (Interface Segregation: a
@@ -26,9 +26,8 @@ type Agent interface {
 	Submit(ctx context.Context, blocks []content.Block) (uuid.UUID, error)
 	PrimaryLoopID() uuid.UUID
 	Subscribe(filter event.EventFilter) (event.Subscription, error)
-	Approve(ctx context.Context, loopID, callID uuid.UUID, scope tool.ApprovalScope) error
-	Deny(ctx context.Context, loopID, callID uuid.UUID) error
-	ProvideAnswer(ctx context.Context, loopID, callID uuid.UUID, answer string) error
+	RespondGate(ctx context.Context, response gate.GateResponse) error
+	ListGates(ctx context.Context) []gate.Gate
 	Interrupt(ctx context.Context) (bool, error)
 	Close(ctx context.Context) error
 	ExportSource(ctx context.Context) (transcript.RecordSource, transcript.SystemPromptResolver, error)

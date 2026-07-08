@@ -50,7 +50,7 @@ func (f *recordingFactory) snapshot() (int, AgentRequest) {
 	return f.calls, f.lastReq
 }
 
-// stopAll tears down every supervisor a test left in the registry so no run
+// stopAll tears down every supervisor a test left in the session map so no run
 // goroutine leaks past the subtest (stop is idempotent, so already-stopped
 // sessions are a harmless no-op).
 func stopAll(s *server) {

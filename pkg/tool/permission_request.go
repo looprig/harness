@@ -33,6 +33,35 @@ const (
 	ScopeWorkspace
 )
 
+// ApprovalScopeValue returns the stable wire value used in gate prompt options
+// and gate responses.
+func ApprovalScopeValue(scope ApprovalScope) (string, bool) {
+	switch scope {
+	case ScopeOnce:
+		return "once", true
+	case ScopeSession:
+		return "session", true
+	case ScopeWorkspace:
+		return "workspace", true
+	default:
+		return "", false
+	}
+}
+
+// ParseApprovalScopeValue parses the stable wire value used in gate responses.
+func ParseApprovalScopeValue(value string) (ApprovalScope, bool) {
+	switch value {
+	case "once":
+		return ScopeOnce, true
+	case "session":
+		return ScopeSession, true
+	case "workspace":
+		return ScopeWorkspace, true
+	default:
+		return 0, false
+	}
+}
+
 // persistableScopes is the scope set offered by a request whose action has a
 // stable Match representation the gate can persist (path glob, exact command,
 // METHOD scheme://host, or query). Returned as a fresh slice per call so a
