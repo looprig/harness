@@ -316,7 +316,9 @@ data: {"v":1,"type":"StepDone",…} data: {"v":1,"kind":"token_delta",…}
 
 - **`enduring`** — authoritative transitions (StepDone, gates, terminals `TurnDone`/`TurnFailed`/
   `TurnInterrupted`). Persisted by harness; replayable from the journal. Live delivery uses the
-  same event payload harness already publishes.
+  same event payload harness already publishes. Gate delivery is the public pair only:
+  `GateOpened` and `GateResolved`. `GatePrepared` is a private journal record used for restore and
+  must not appear in SSE/history.
 - **`ephemeral`** — `TokenDelta`, `ToolCallStarted/Completed`, `InputQueued`. **Live-only,
   unpersisted, best-effort, no `seq`.** Dropped on reconnect — it *self-heals* from the next
   authoritative `enduring` event. The client renders deltas live and reconciles to the
@@ -365,7 +367,9 @@ Three request lifetimes:
   display/correlation metadata; the decision comes *in* as a `ResponseRequest` POST to that
   `gate_id`. `serve` forwards the response to harness and returns `202 Accepted` when harness durably
   accepts the gate response; it does not prove runner consumption. It does not maintain open-gate
-  state, run response policies, or invent gate-kind-specific APIs.
+  state, run response policies, or invent gate-kind-specific APIs. Permission approval scope values
+  are stable strings in `values.scope` (`"once"`, `"session"`, `"workspace"`), matching the prompt
+  option values; numeric enum values are not part of the HTTP contract.
 - **Reconnect is the client's to assemble.** `serve` offers two primitives — live `…/events`
   (subscribe, lossy) and cold `…/history` (store replay) — and does not fuse them. A client that
   wants continuity reads `…/history` to the tip, then attaches `…/events`, accepting the seam race
@@ -438,8 +442,9 @@ The self-routing-fleet option (pods peer-forward using a `KV` directory) is reco
   deadline for its own stream only. Every session/journal call is `context`-bounded.
 - **Typed errors** for each distinct failure (`SessionNotFoundError`, `LoopNotFoundError`,
   `StoreReadError`, …); `errors.As` at call sites; audit auth failures and denied gates without
-  logging payloads/tokens/PII. Do not expose a `GateNotFoundError` from `serve` until harness can
-  report that authoritatively.
+  logging payloads/tokens/PII. Harness now reports gate response failures authoritatively, so `serve`
+  projects them without inspecting gate state: stale/unknown gate → `404`, invalid action/kind/scope
+  or grant values → `400`, not-ready races → `409`, persistence/session faults → `500`.
 
 ## 11. Testing (per CLAUDE.md)
 
@@ -447,10 +452,12 @@ The self-routing-fleet option (pods peer-forward using a `KV` directory) is reco
   interface) — no real loop, no LLM, deterministic.
 - **Gate forwarding:** gate POST validates `{sid,gid}` plus a `gate.ResponseRequest` body, calls
   `LiveSession.RespondGate` with a server-shaped `gate.GateResponse`, returns `202 Accepted` after the
-  harness session durably accepts the response, and does not require or maintain a `serve` open-gate map. Client
-  provenance is ignored/rejected. Wrong-kind, wrong-action, duplicate, and stale-gate behavior is not
-  asserted in `serve`; it belongs to harness session gate-router tests. Gate timeout/default/suspend
-  policies are also tested in harness, not in the HTTP wrapper.
+  harness session durably accepts the response, and does not require or maintain a `serve` open-gate
+  map. Client provenance is ignored/rejected. Handler tests assert the boundary mapping for
+  authoritative gate errors (`404` stale/unknown, `400` invalid response, `409` not ready) while the
+  deeper wrong-kind, response-policy, timeout/default/suspend, and grant-validation behavior remains
+  covered by harness session gate-router tests. Permission-scope values are asserted as stable
+  strings, not numeric enums.
 - **Event-wire codec:** a fuzz target (external SSE frame → decode); tests that live `enduring`
   frames use the existing durable event payload, `ephemeral` frames never carry a `seq`, and
   Ephemeral never round-trips through the journal.
@@ -516,8 +523,8 @@ The self-routing-fleet option (pods peer-forward using a `KV` directory) is reco
    when harness emits a gate event (interactive permissions or `AskUser`); `AskUser` still parks.
 7. **No `serve` open-gate registry.** Harness' session-owned gate directory is authoritative for
    open gates and stale/random/wrong-kind responses. `serve` forwards response requests through
-   `GateResponse` values with durable-acceptance semantics and projects any
-   authoritative listing/not-found behavior harness exposes.
+   `GateResponse` values with durable-acceptance semantics and projects authoritative gate errors to
+   status codes; it never mirrors open-gate state locally.
 8. **Ephemeral live-frame added.** `event: ephemeral` SSE frames carry token/tool-lifecycle
    deltas (live-only, unpersisted, no `seq`). Live `enduring` frames use the existing durable event
    payload. Exact journal `seq` on live Enduring frames is deferred until harness/storage exposes a
