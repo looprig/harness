@@ -358,6 +358,7 @@ func TestMarshalEventRoundTripEnduring(t *testing.T) {
 		{"LoopStarted with AgentName", LoopStarted{Header: loopHeaderWithAgent("operator")}},
 		{"LoopStarted with ParentToolUseID", LoopStarted{Header: fullHeaderLoop(), ParentToolUseID: "toolu_abc123"}},
 		{"LoopStarted with ForeignSID", LoopStarted{Header: fullHeaderLoop(), ForeignSID: "11111111-1111-1111-1111-111111111111"}},
+		{"ForeignSessionBound", ForeignSessionBound{Header: fullHeaderLoop(), ForeignSID: "sid"}},
 		{"TurnStarted", TurnStarted{Header: fullHeaderTurn(), TurnIndex: 7, Message: userMsg("hi")}},
 		{"StepDone", StepDone{Header: fullHeader(), Messages: sampleMessages()}},
 		{"TurnFoldedInto", TurnFoldedInto{Header: fullHeaderTurn(), TurnIndex: 2, Message: userMsg("fold")}},
@@ -621,7 +622,7 @@ func TestMarshalEventPermissionRequestedFullRequest(t *testing.T) {
 // without codec coverage changes the live count derived from classify+Class() and
 // fails TestMarshalEventCoversEveryEnduringType. A missed Enduring type is an
 // unpersistable event = silent restore data loss, which this guard forbids.
-const wantEnduringTypes = 22
+const wantEnduringTypes = 23
 
 // unionInstances is one instance of EVERY type in the sealed union (Enduring and
 // Ephemeral alike), mirroring TestClassifyExhaustive. The drift guard partitions
@@ -632,7 +633,7 @@ func unionInstances() []Event {
 		SessionStarted{}, SessionActive{}, SessionIdle{}, SessionStopped{},
 		RestoreStarted{}, RestoreDone{}, RestoreErrored{}, WorkspaceCheckpointed{},
 		SecurityCeilingChanged{},
-		LoopIdle{}, LoopStarted{},
+		LoopIdle{}, LoopStarted{}, ForeignSessionBound{},
 		TokenDelta{}, TurnStarted{}, StepDone{}, TurnFoldedInto{}, InputCancelled{},
 		InputQueued{}, TurnRejected{}, TurnDone{}, TurnFailed{}, TurnInterrupted{},
 		PermissionRequested{}, PermissionDecided{}, UserInputRequested{}, ToolCallStarted{}, ToolCallCompleted{},

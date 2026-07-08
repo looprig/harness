@@ -123,7 +123,7 @@ func encodePayload(ev Event) ([]byte, error) {
 		return marshalGateResolved(e)
 	case SessionStarted, SessionActive, SessionIdle, SessionStopped,
 		RestoreStarted, RestoreDone, WorkspaceCheckpointed, SecurityCeilingChanged,
-		LoopIdle, LoopStarted, TurnRejected,
+		LoopIdle, LoopStarted, ForeignSessionBound, TurnRejected,
 		UserInputRequested, TurnInterrupted,
 		TurnStarted, TurnFoldedInto, InputCancelled, TurnDone,
 		PermissionDecided, GatePrepared, GateOpened:
@@ -341,6 +341,8 @@ func decodePayload(tag string, data []byte) (Event, error) {
 		return decodePlain[LoopIdle](tag, data)
 	case "LoopStarted":
 		return decodePlain[LoopStarted](tag, data)
+	case "ForeignSessionBound":
+		return decodePlain[ForeignSessionBound](tag, data)
 	case "TurnStarted":
 		return decodePlain[TurnStarted](tag, data)
 	case "StepDone":

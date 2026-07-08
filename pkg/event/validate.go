@@ -183,6 +183,8 @@ func classify(ev Event) (name string, profile idProfile, ok bool) {
 		// zero). The spawning loop/turn/step rides in Header.Cause, which the validator
 		// never constrains — same shape as LoopIdle.
 		return "LoopStarted", loopProfile(), true
+	case ForeignSessionBound:
+		return "ForeignSessionBound", loopProfile(), true
 	case TokenDelta:
 		return "TokenDelta", stepProfile(), true
 	case TurnStarted:

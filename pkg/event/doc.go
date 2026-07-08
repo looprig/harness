@@ -30,6 +30,7 @@ var (
 	// Loop-scoped events.
 	_ Event = LoopIdle{}
 	_ Event = LoopStarted{}
+	_ Event = ForeignSessionBound{}
 
 	// Turn/step-scoped events.
 	_ Event = TokenDelta{}

@@ -3,8 +3,8 @@ package event
 import (
 	"time"
 
-	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/core/uuid"
+	"github.com/looprig/harness/pkg/identity"
 )
 
 // Event is the sealed root of every loop event. Every concrete event embeds a
@@ -280,6 +280,16 @@ type LoopStarted struct {
 	ForeignSID string `json:"foreign_sid,omitzero"`
 }
 
+// ForeignSessionBound records the foreign agent session id for adapters that
+// cannot accept a pre-minted id at LoopStarted time. It is loop-scoped and
+// Enduring because restore needs it to resume the foreign session.
+type ForeignSessionBound struct {
+	enduring
+	loopScoped
+	Header
+	ForeignSID string `json:"foreign_sid"`
+}
+
 func (SessionStarted) isEvent()        {}
 func (SessionActive) isEvent()         {}
 func (SessionIdle) isEvent()           {}
@@ -290,3 +300,4 @@ func (RestoreErrored) isEvent()        {}
 func (WorkspaceCheckpointed) isEvent() {}
 func (LoopIdle) isEvent()              {}
 func (LoopStarted) isEvent()           {}
+func (ForeignSessionBound) isEvent()   {}

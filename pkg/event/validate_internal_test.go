@@ -98,6 +98,7 @@ func TestClassifyExhaustive(t *testing.T) {
 		{"SecurityCeilingChanged", SecurityCeilingChanged{}},
 		{"LoopIdle", LoopIdle{}},
 		{"LoopStarted", LoopStarted{}},
+		{"ForeignSessionBound", ForeignSessionBound{}},
 		{"TokenDelta", TokenDelta{}},
 		{"TurnStarted", TurnStarted{}},
 		{"StepDone", StepDone{}},
