@@ -9,7 +9,6 @@ import (
 
 	"github.com/looprig/harness/pkg/ceiling"
 	"github.com/looprig/harness/pkg/event"
-	"github.com/looprig/harness/pkg/hub"
 	"github.com/looprig/harness/pkg/identity"
 )
 
@@ -64,7 +63,7 @@ func (r *ceilingTapSpy) emits() []ceilingEmit {
 // collectSecurityCeilingChanged drains sub for up to d, returning every
 // SecurityCeilingChanged it saw (ignoring the other session/loop events that flow). It
 // lets a test assert BOTH the level AND that EXACTLY ONE change event was emitted.
-func collectSecurityCeilingChanged(t *testing.T, sub *hub.EventSubscription, d time.Duration) []event.SecurityCeilingChanged {
+func collectSecurityCeilingChanged(t *testing.T, sub event.Subscription, d time.Duration) []event.SecurityCeilingChanged {
 	t.Helper()
 	var out []event.SecurityCeilingChanged
 	deadline := time.After(d)

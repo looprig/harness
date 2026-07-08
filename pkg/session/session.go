@@ -331,7 +331,7 @@ type loopHandle struct {
 // where it is consumed (the session), per Dependency Inversion. *Session
 // satisfies it by delegating to the hub.
 type eventSubscriber interface {
-	SubscribeEvents(event.EventFilter) (*hub.EventSubscription, error)
+	SubscribeEvents(event.EventFilter) (event.Subscription, error)
 }
 
 // Compile-time proof that *Session is the consumer-facing eventSubscriber.
@@ -390,7 +390,7 @@ func (s *Session) PublishEvent(ctx context.Context, ev event.Event) error {
 // SubscribeEvents attaches a consumer to the session fan-in with the given filter.
 // The returned subscription's Events() channel yields the filtered stream; the
 // caller must Close it when done. It delegates to the hub.
-func (s *Session) SubscribeEvents(filter event.EventFilter) (*hub.EventSubscription, error) {
+func (s *Session) SubscribeEvents(filter event.EventFilter) (event.Subscription, error) {
 	return s.hub.SubscribeEvents(filter)
 }
 

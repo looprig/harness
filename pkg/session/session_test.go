@@ -1896,3 +1896,13 @@ func TestShutdownClosesAllRealLoopsAndLatchesClosing(t *testing.T) {
 		t.Fatalf("NewLoop after Shutdown = %v, want *SessionError{SessionClosing}", err)
 	}
 }
+
+// TestSubscribeEventsReturnsInterface is a compile-time assertion that
+// *Session.SubscribeEvents returns the narrow event.Subscription interface (not
+// the concrete *hub.EventSubscription). This lets consumers (e.g. pkg/serve)
+// depend on pkg/event without importing pkg/hub.
+func TestSubscribeEventsReturnsInterface(t *testing.T) {
+	t.Parallel()
+	var s *Session
+	var _ func(event.EventFilter) (event.Subscription, error) = s.SubscribeEvents
+}

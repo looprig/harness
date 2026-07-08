@@ -225,7 +225,7 @@ func TestExpectCancelExpectTurnSessionWiring(t *testing.T) {
 
 // drainFor reads from the subscription until an event of type T arrives or a
 // timeout elapses. It returns true if T was seen.
-func drainFor[T event.Event](t *testing.T, sub *hub.EventSubscription) bool {
+func drainFor[T event.Event](t *testing.T, sub event.Subscription) bool {
 	t.Helper()
 	deadline := time.After(time.Second)
 	for {
@@ -247,7 +247,7 @@ func drainFor[T event.Event](t *testing.T, sub *hub.EventSubscription) bool {
 // timeout elapses, returning the matched event and true (zero value, false on
 // miss). Unlike drainFor it hands back the concrete event so a test can inspect
 // its Header/Cause.
-func firstMatching[T event.Event](t *testing.T, sub *hub.EventSubscription) (T, bool) {
+func firstMatching[T event.Event](t *testing.T, sub event.Subscription) (T, bool) {
 	t.Helper()
 	var zero T
 	deadline := time.After(time.Second)
