@@ -172,6 +172,13 @@ func TestPublishOrderingWithDerivedPosts(t *testing.T) {
 	}
 }
 
+// isEventType reports whether ev's concrete type is T. It lets a table row name the
+// expected event type without an inline type-switch per case.
+func isEventType[T event.Event](ev event.Event) bool {
+	_, ok := ev.(T)
+	return ok
+}
+
 // TestDeliveryCarriesJournalSeq proves the live delivery carries the durable append
 // sequence: an Ephemeral event (never persisted) delivers JournalSeq 0 with NO append;
 // an Enduring event delivers the sequence its append returned; a derived
@@ -181,100 +188,90 @@ func TestPublishOrderingWithDerivedPosts(t *testing.T) {
 func TestDeliveryCarriesJournalSeq(t *testing.T) {
 	t.Parallel()
 
-	t.Run("ephemeral delivers seq 0 and never appends", func(t *testing.T) {
-		t.Parallel()
-		session := mustID(t)
-		loopA := mustID(t)
-		app := &fakeAppender{}
-		h := New(session, WithAppender(app))
-		sub, err := h.SubscribeEvents(allFilter())
-		if err != nil {
-			t.Fatalf("SubscribeEvents = %v", err)
-		}
-		if err := h.PublishEvent(context.Background(), event.TokenDelta{Header: event.Header{Coordinates: identity.Coordinates{SessionID: session, LoopID: loopA}}}); err != nil {
-			t.Fatalf("PublishEvent(TokenDelta) = %v", err)
-		}
-		d := recvDelivery(t, sub)
-		if _, ok := d.Event.(event.TokenDelta); !ok {
-			t.Fatalf("delivered %T, want TokenDelta", d.Event)
-		}
-		if d.JournalSeq != 0 {
-			t.Errorf("ephemeral JournalSeq = %d, want 0", d.JournalSeq)
-		}
-		if app.callCount() != 0 {
-			t.Errorf("ephemeral triggered %d appends, want 0", app.callCount())
-		}
-	})
+	// wantDelivery is one expected fan-out: a type predicate and the JournalSeq it must
+	// carry. A case lists them in delivery order.
+	type wantDelivery struct {
+		typeName string
+		is       func(event.Event) bool
+		seq      uint64
+	}
+	tests := []struct {
+		name        string
+		act         func(t *testing.T, h *Hub, session, loopA uuid.UUID)
+		wants       []wantDelivery
+		wantAppends int
+	}{
+		{
+			name: "ephemeral delivers seq 0 and never appends",
+			act: func(t *testing.T, h *Hub, session, loopA uuid.UUID) {
+				if err := h.PublishEvent(context.Background(), event.TokenDelta{Header: event.Header{Coordinates: identity.Coordinates{SessionID: session, LoopID: loopA}}}); err != nil {
+					t.Fatalf("PublishEvent(TokenDelta) = %v", err)
+				}
+			},
+			wants:       []wantDelivery{{typeName: "TokenDelta", is: isEventType[event.TokenDelta], seq: 0}},
+			wantAppends: 0,
+		},
+		{
+			name: "enduring delivers the append sequence",
+			act: func(t *testing.T, h *Hub, session, loopA uuid.UUID) {
+				if err := h.PublishEvent(context.Background(), event.StepDone{Header: event.Header{Coordinates: identity.Coordinates{SessionID: session, LoopID: loopA}}}); err != nil {
+					t.Fatalf("PublishEvent(StepDone) = %v", err)
+				}
+			},
+			wants:       []wantDelivery{{typeName: "StepDone", is: isEventType[event.StepDone], seq: 1}},
+			wantAppends: 1,
+		},
+		{
+			name: "derived SessionActive carries its own append seq",
+			act: func(t *testing.T, h *Hub, session, loopA uuid.UUID) {
+				if err := h.PublishEvent(context.Background(), event.TurnStarted{Header: event.Header{Coordinates: identity.Coordinates{SessionID: session, LoopID: loopA}}}); err != nil {
+					t.Fatalf("PublishEvent(TurnStarted) = %v", err)
+				}
+			},
+			wants: []wantDelivery{
+				{typeName: "TurnStarted", is: isEventType[event.TurnStarted], seq: 1},
+				{typeName: "SessionActive", is: isEventType[event.SessionActive], seq: 2},
+			},
+			wantAppends: 2,
+		},
+		{
+			name: "StopSession SessionStopped carries its append seq",
+			act: func(t *testing.T, h *Hub, _, _ uuid.UUID) {
+				h.StopSession(context.Background())
+			},
+			wants:       []wantDelivery{{typeName: "SessionStopped", is: isEventType[event.SessionStopped], seq: 1}},
+			wantAppends: 1,
+		},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			session := mustID(t)
+			loopA := mustID(t)
+			app := &fakeAppender{}
+			h := New(session, WithAppender(app), WithFactory(testFactory()))
+			sub, err := h.SubscribeEvents(allFilter())
+			if err != nil {
+				t.Fatalf("SubscribeEvents = %v", err)
+			}
 
-	t.Run("enduring delivers the append sequence", func(t *testing.T) {
-		t.Parallel()
-		session := mustID(t)
-		loopA := mustID(t)
-		app := &fakeAppender{}
-		h := New(session, WithAppender(app))
-		sub, err := h.SubscribeEvents(allFilter())
-		if err != nil {
-			t.Fatalf("SubscribeEvents = %v", err)
-		}
-		if err := h.PublishEvent(context.Background(), event.StepDone{Header: event.Header{Coordinates: identity.Coordinates{SessionID: session, LoopID: loopA}}}); err != nil {
-			t.Fatalf("PublishEvent(StepDone) = %v", err)
-		}
-		d := recvDelivery(t, sub)
-		if _, ok := d.Event.(event.StepDone); !ok {
-			t.Fatalf("delivered %T, want StepDone", d.Event)
-		}
-		if d.JournalSeq != 1 {
-			t.Errorf("enduring JournalSeq = %d, want 1 (first append)", d.JournalSeq)
-		}
-	})
+			tt.act(t, h, session, loopA)
 
-	t.Run("derived SessionActive carries its own append seq", func(t *testing.T) {
-		t.Parallel()
-		session := mustID(t)
-		loopA := mustID(t)
-		app := &fakeAppender{}
-		h := New(session, WithAppender(app), WithFactory(testFactory()))
-		sub, err := h.SubscribeEvents(allFilter())
-		if err != nil {
-			t.Fatalf("SubscribeEvents = %v", err)
-		}
-		if err := h.PublishEvent(context.Background(), event.TurnStarted{Header: event.Header{Coordinates: identity.Coordinates{SessionID: session, LoopID: loopA}}}); err != nil {
-			t.Fatalf("PublishEvent(TurnStarted) = %v", err)
-		}
-		started := recvDelivery(t, sub)
-		if _, ok := started.Event.(event.TurnStarted); !ok {
-			t.Fatalf("first delivery %T, want TurnStarted", started.Event)
-		}
-		if started.JournalSeq != 1 {
-			t.Errorf("TurnStarted JournalSeq = %d, want 1", started.JournalSeq)
-		}
-		active := recvDelivery(t, sub)
-		if _, ok := active.Event.(event.SessionActive); !ok {
-			t.Fatalf("second delivery %T, want derived SessionActive", active.Event)
-		}
-		if active.JournalSeq != 2 {
-			t.Errorf("derived SessionActive JournalSeq = %d, want 2 (its own append)", active.JournalSeq)
-		}
-	})
-
-	t.Run("StopSession SessionStopped carries its append seq", func(t *testing.T) {
-		t.Parallel()
-		session := mustID(t)
-		app := &fakeAppender{}
-		h := New(session, WithAppender(app), WithFactory(testFactory()))
-		sub, err := h.SubscribeEvents(allFilter())
-		if err != nil {
-			t.Fatalf("SubscribeEvents = %v", err)
-		}
-		h.StopSession(context.Background())
-		d := recvDelivery(t, sub)
-		if _, ok := d.Event.(event.SessionStopped); !ok {
-			t.Fatalf("delivered %T, want SessionStopped", d.Event)
-		}
-		if d.JournalSeq != 1 {
-			t.Errorf("SessionStopped JournalSeq = %d, want 1 (first append)", d.JournalSeq)
-		}
-	})
+			for i, w := range tt.wants {
+				d := recvDelivery(t, sub)
+				if !w.is(d.Event) {
+					t.Fatalf("delivery #%d = %T, want %s", i, d.Event, w.typeName)
+				}
+				if d.JournalSeq != w.seq {
+					t.Errorf("delivery #%d (%s) JournalSeq = %d, want %d", i, w.typeName, d.JournalSeq, w.seq)
+				}
+			}
+			if got := app.callCount(); got != tt.wantAppends {
+				t.Errorf("appends = %d, want %d", got, tt.wantAppends)
+			}
+		})
+	}
 }
 
 // TestEphemeralOverflowDrops proves a slow Ephemeral subscriber (full buffer)

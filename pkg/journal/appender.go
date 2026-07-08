@@ -94,8 +94,7 @@ func NewJournalEventAppenderChecked(journal SessionJournal, opts ...AppenderOpti
 // session-scoped event to the session subject and a loop-scoped event to its loop
 // event subject, and uses the event's EventID as the Nats-Msg-Id (idempotency). An
 // Ephemeral event is never appended by the hub; if one were passed, the serializer's
-// event.MarshalEvent fails closed inside Append, so this path stays fail-secure. The
-// returned sequence is discarded — the hub needs only the success/failure signal.
+// event.MarshalEvent fails closed inside Append, so this path stays fail-secure.
 //
 // It returns the assigned durable journal sequence so the hub can ride it on the LIVE
 // delivery (event.Delivery.JournalSeq) — the sequence NEVER enters the persisted event
