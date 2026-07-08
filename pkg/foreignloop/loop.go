@@ -28,7 +28,8 @@ type Loop struct {
 	// the actor (the sole owner of msgs/turnIndex) replies a defensive clone.
 	snapshots chan snapshotReq
 
-	// Immutable identity + dependencies, set once by New and never mutated.
+	// Identity + dependencies, set by New and then read by the actor. Late-bound loops
+	// learn sid from the first ForeignInit.
 	sessionID uuid.UUID
 	loopID    uuid.UUID
 	sid       string // the minted foreign session id (stamped onto LoopStarted by the caller)
@@ -43,6 +44,7 @@ type Loop struct {
 	msgs       content.AgenticMessages
 	turnIndex  event.TurnIndex
 	hasSpawned bool
+	sidBound   bool
 }
 
 // compile-time proof the foreign loop satisfies the engine-agnostic Backend.
@@ -60,6 +62,7 @@ func New(loopCtx context.Context, sessionID, loopID uuid.UUID, parent loop.Prove
 		return nil, "", err
 	}
 	sid := ""
+	sidBound := false
 	switch spec.SIDMode {
 	case SIDPrebound:
 		u, err := idGen()
@@ -67,6 +70,7 @@ func New(loopCtx context.Context, sessionID, loopID uuid.UUID, parent loop.Prove
 			return nil, "", &SpawnError{Cause: err}
 		}
 		sid = u.String()
+		sidBound = true
 	case SIDLateBound:
 	default:
 		return nil, "", &ConfigError{Field: "Spec.SIDMode", Reason: "unknown"}
@@ -78,6 +82,7 @@ func New(loopCtx context.Context, sessionID, loopID uuid.UUID, parent loop.Prove
 		sessionID: sessionID,
 		loopID:    loopID,
 		sid:       sid,
+		sidBound:  sidBound,
 		parent:    parent,
 		pub:       pub,
 		cfg:       cfg,

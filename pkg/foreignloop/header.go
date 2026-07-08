@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"log/slog"
 
-	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/core/uuid"
+	"github.com/looprig/harness/pkg/event"
 )
 
 // fillForeignHeader stamps the producer COORDINATES onto a foreign event from the
@@ -21,6 +21,9 @@ func fillForeignHeader(ev event.Event, sessionID, loopID, turnID, stepID uuid.UU
 	switch e := ev.(type) {
 	case event.TurnStarted:
 		e.Header.SessionID, e.Header.LoopID, e.Header.TurnID = sessionID, loopID, turnID
+		return e
+	case event.ForeignSessionBound:
+		e.Header.SessionID, e.Header.LoopID = sessionID, loopID
 		return e
 	case event.TurnDone:
 		e.Header.SessionID, e.Header.LoopID, e.Header.TurnID = sessionID, loopID, turnID
@@ -55,6 +58,9 @@ func fillForeignHeader(ev event.Event, sessionID, loopID, turnID, stepID uuid.UU
 func withForeignHeader(ev event.Event, h event.Header) event.Event {
 	switch e := ev.(type) {
 	case event.TurnStarted:
+		e.Header = h
+		return e
+	case event.ForeignSessionBound:
 		e.Header = h
 		return e
 	case event.StepDone:

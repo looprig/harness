@@ -3,11 +3,11 @@ package foreignloop
 import (
 	"context"
 
-	"github.com/looprig/harness/pkg/command"
 	"github.com/looprig/core/content"
+	"github.com/looprig/core/uuid"
+	"github.com/looprig/harness/pkg/command"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/loop"
-	"github.com/looprig/core/uuid"
 )
 
 // RestoredForeign is the journal-recovered seed for a foreign loop: the recovered
@@ -52,6 +52,7 @@ func NewRestored(loopCtx context.Context, sessionID, loopID uuid.UUID, parent lo
 		msgs:       cloneMessages(seed.Msgs),
 		turnIndex:  seed.TurnIndex,
 		hasSpawned: true,
+		sidBound:   true,
 	}
 	go l.run(loopCtx)
 	return l, nil

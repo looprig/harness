@@ -113,6 +113,17 @@ func TestNewRestoredSeedSnapshot(t *testing.T) {
 	shutdown(t, l)
 }
 
+func TestNewRestoredMarksForeignSIDBound(t *testing.T) {
+	t.Parallel()
+	seed := RestoredForeign{ForeignSID: "sid-restored-bound", TurnIndex: 3}
+	l := newRestoredTestLoop(t, Spec{Agent: &fakeAgent{}}, &fakePublisher{}, seed)
+
+	if !l.sidBound {
+		t.Fatal("restored loop sidBound = false, want true")
+	}
+	shutdown(t, l)
+}
+
 // TestNewRestoredResumesSession proves the next turn RESUMES the recovered session: a
 // restored loop seeds hasSpawned=true, so the ForeignTurn carries StartNew=false and the
 // recovered sid, and the turn index advances from the seeded value.

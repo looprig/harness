@@ -6,13 +6,14 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
 	"time"
 
-	"github.com/looprig/harness/pkg/command"
 	"github.com/looprig/core/content"
-	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/core/uuid"
+	"github.com/looprig/harness/pkg/command"
+	"github.com/looprig/harness/pkg/event"
 )
 
 // eventKind names a foreign event for an ordered-sequence assertion.
@@ -20,6 +21,8 @@ func eventKind(ev event.Event) string {
 	switch ev.(type) {
 	case event.TurnStarted:
 		return "TurnStarted"
+	case event.ForeignSessionBound:
+		return "ForeignSessionBound"
 	case event.TokenDelta:
 		return "TokenDelta"
 	case event.ToolCallStarted:
@@ -224,6 +227,104 @@ func TestUserInputHappyPath(t *testing.T) {
 	shutdown(t, l)
 }
 
+func TestLateBoundSessionPublishesForeignSessionBound(t *testing.T) {
+	t.Parallel()
+	agent := &fakeAgent{
+		transcript: filepath.Join(t.TempDir(), "missing.jsonl"),
+		events: []ForeignEvent{
+			{Kind: ForeignInit, SessionID: "codex-thread-1"},
+			{Kind: ForeignStepComplete, Message: aiMessage("ok")},
+			{Kind: ForeignTerminalOK},
+		},
+	}
+	pub := &fakePublisher{}
+	l, sid := newTestLoop(t, Spec{
+		Agent:   agent,
+		Cwd:     t.TempDir(),
+		SIDMode: SIDLateBound,
+	}, pub)
+	if sid != "" {
+		t.Fatalf("initial sid = %q, want empty for late-bound loop", sid)
+	}
+
+	submitUserInput(t, l, "first")
+	waitTurnIndex(t, l, 1)
+
+	evs := pub.snapshot()
+	want := []string{"TurnStarted", "ForeignSessionBound", "StepDone", "TurnDone"}
+	if got := eventKinds(evs); !eqStrs(got, want) {
+		t.Fatalf("published sequence = %v, want %v", got, want)
+	}
+	bound, ok := evs[1].(event.ForeignSessionBound)
+	if !ok {
+		t.Fatalf("evs[1] = %T, want ForeignSessionBound", evs[1])
+	}
+	if bound.ForeignSID != "codex-thread-1" {
+		t.Fatalf("ForeignSessionBound.ForeignSID = %q, want codex-thread-1", bound.ForeignSID)
+	}
+	if err := event.ValidateEvent(bound); err != nil {
+		t.Fatalf("ForeignSessionBound failed validation: %v", err)
+	}
+	if !bound.EventHeader().Coordinates.TurnID.IsZero() {
+		t.Fatalf("ForeignSessionBound TurnID = %v, want zero", bound.EventHeader().Coordinates.TurnID)
+	}
+	if !bound.EventHeader().Coordinates.StepID.IsZero() {
+		t.Fatalf("ForeignSessionBound StepID = %v, want zero", bound.EventHeader().Coordinates.StepID)
+	}
+
+	submitUserInput(t, l, "second")
+	waitTurnIndex(t, l, 2)
+
+	ft := agent.lastForeignTurn()
+	if ft.StartNew {
+		t.Fatal("second ForeignTurn.StartNew = true, want false")
+	}
+	if ft.ForeignSID != "codex-thread-1" {
+		t.Fatalf("second ForeignTurn.ForeignSID = %q, want codex-thread-1", ft.ForeignSID)
+	}
+	shutdown(t, l)
+}
+
+func TestLateBoundFirstTurnUsesCurrentSIDLock(t *testing.T) {
+	t.Parallel()
+	cwd := t.TempDir()
+	agent := &fakeAgent{
+		transcript: filepath.Join(t.TempDir(), "missing.jsonl"),
+		events: []ForeignEvent{
+			{Kind: ForeignInit, SessionID: "codex-thread-1"},
+			{Kind: ForeignTerminalOK, Message: aiMessage("done")},
+		},
+	}
+	pub := &fakePublisher{}
+	l, sid := newTestLoop(t, Spec{
+		Agent:   agent,
+		Cwd:     cwd,
+		SIDMode: SIDLateBound,
+	}, pub)
+	if sid != "" {
+		t.Fatalf("initial sid = %q, want empty for late-bound loop", sid)
+	}
+
+	preWriteLock(t, sid, cwd, strconv.Itoa(os.Getpid()))
+
+	submitUserInput(t, l, "first")
+	waitForKind(t, pub, "TurnFailed")
+
+	want := []string{"TurnStarted", "TurnFailed"}
+	if got := eventKinds(pub.snapshot()); !eqStrs(got, want) {
+		t.Fatalf("published sequence = %v, want %v", got, want)
+	}
+	tf := findTurnFailed(t, pub)
+	var busy *ForeignSessionBusyError
+	if !errors.As(tf.Err, &busy) {
+		t.Fatalf("TurnFailed.Err = %T %v, want *ForeignSessionBusyError", tf.Err, tf.Err)
+	}
+	if agent.calls() != 0 {
+		t.Fatalf("agent spawned %d times under a busy empty-sid lock, want 0", agent.calls())
+	}
+	shutdown(t, l)
+}
+
 func TestSpawnFailureTurnFailed(t *testing.T) {
 	t.Parallel()
 	agent := &fakeAgent{spawnErr: errors.New("agent failed to start")}
@@ -344,6 +445,53 @@ func TestInterruptDuringTurn(t *testing.T) {
 	}
 	if len(msgs) != 0 || ti != 0 {
 		t.Fatalf("after interrupt: msgs=%d turnIndex=%d, want 0/0", len(msgs), ti)
+	}
+	shutdown(t, l)
+}
+
+func TestLateBoundInterruptedFirstTurnResumesBoundSession(t *testing.T) {
+	t.Parallel()
+	agent := &fakeAgent{
+		transcript: filepath.Join(t.TempDir(), "missing.jsonl"),
+		block:      true,
+		events: []ForeignEvent{
+			{Kind: ForeignInit, SessionID: "codex-thread-1"},
+		},
+	}
+	pub := &fakePublisher{}
+	l, sid := newTestLoop(t, Spec{
+		Agent:   agent,
+		Cwd:     t.TempDir(),
+		SIDMode: SIDLateBound,
+	}, pub)
+	if sid != "" {
+		t.Fatalf("initial sid = %q, want empty for late-bound loop", sid)
+	}
+
+	submitUserInput(t, l, "first")
+	waitForKind(t, pub, "ForeignSessionBound")
+
+	sendInterrupt(t, l)
+	waitForKind(t, pub, "TurnInterrupted")
+
+	agent.mu.Lock()
+	agent.block = false
+	agent.events = []ForeignEvent{
+		{Kind: ForeignInit, SessionID: "codex-thread-1"},
+		{Kind: ForeignStepComplete, Message: aiMessage("ok")},
+		{Kind: ForeignTerminalOK},
+	}
+	agent.mu.Unlock()
+
+	submitUserInput(t, l, "second")
+	waitTurnIndex(t, l, 1)
+
+	ft := agent.lastForeignTurn()
+	if ft.StartNew {
+		t.Fatal("second ForeignTurn.StartNew = true, want false")
+	}
+	if ft.ForeignSID != "codex-thread-1" {
+		t.Fatalf("second ForeignTurn.ForeignSID = %q, want codex-thread-1", ft.ForeignSID)
 	}
 	shutdown(t, l)
 }
