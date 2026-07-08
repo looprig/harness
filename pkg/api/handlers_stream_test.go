@@ -50,7 +50,7 @@ func (noPrompts) SystemPrompt(_ uuid.UUID) (string, bool) { return "", false }
 // assertion itself.
 const streamReadDeadline = 2 * time.Second
 
-// registerAgent puts agent into s's registry under id with an INERT supervisor
+// registerAgent puts agent into s's session map under id with an INERT supervisor
 // (built from a throwaway agent's own subscription) so the supervisor never
 // competes with the events handler for the events fed to agent's sub, and so the
 // cleanup tears the run goroutine down without leaking.
