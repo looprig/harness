@@ -18,6 +18,7 @@ type gateRegistrarPublisher struct {
 	activateErr error
 	prepared    []gatedomain.Gate
 	activated   []gatedomain.Route
+	closed      []gatedomain.ID
 }
 
 func (p *gateRegistrarPublisher) PrepareGateOpen(_ context.Context, _ uuid.UUID, g gatedomain.Gate, _ gatedomain.Payload) (gatedomain.ID, error) {
@@ -38,6 +39,11 @@ func (p *gateRegistrarPublisher) ActivateGate(_ context.Context, id gatedomain.I
 	}
 	route.GateID = id
 	p.activated = append(p.activated, route)
+	return nil
+}
+
+func (p *gateRegistrarPublisher) CloseGate(_ context.Context, id gatedomain.ID, _ gatedomain.CloseReason) error {
+	p.closed = append(p.closed, id)
 	return nil
 }
 
@@ -135,6 +141,9 @@ func TestLoopGateActivationFailureRemovesLocalBlocker(t *testing.T) {
 	got := <-ack
 	if got.err == nil || got.gateID != gateID {
 		t.Fatalf("gate registration ack = %+v, want activation failure with gateID %v", got, gateID)
+	}
+	if len(registrar.closed) != 1 || registrar.closed[0] != gateID {
+		t.Fatalf("closed gates = %+v, want [%v]", registrar.closed, gateID)
 	}
 
 	l.Commands <- command.ProvideUserInput{GateRoute: command.GateRoute{GateID: gateID, ToolExecutionID: callID}, Answer: "late"}

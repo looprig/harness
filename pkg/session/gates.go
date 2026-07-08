@@ -227,6 +227,49 @@ func (s *Session) ListGates(context.Context) []gate.Gate {
 	return out
 }
 
+// CloseGate closes or abandons a session-owned gate without dispatching an
+// answer to the resolver. Preparing gates were never public, so they are removed
+// without a public GateResolved. Open gates are durably resolved before removal.
+func (s *Session) CloseGate(ctx context.Context, id gate.ID, reason gate.CloseReason) error {
+	s.gatesMu.Lock()
+	entry, ok := s.gates[id]
+	if !ok {
+		s.gatesMu.Unlock()
+		return &GateError{GateID: id, Kind: GateNotFound}
+	}
+	switch entry.state {
+	case gatePreparing:
+		delete(s.gates, id)
+		s.gatesMu.Unlock()
+		return nil
+	case gateOpen:
+		entry.state = gateClaiming
+		s.gates[id] = entry
+		s.gatesMu.Unlock()
+	case gateClaiming, gateClosed:
+		s.gatesMu.Unlock()
+		return &GateError{GateID: id, Kind: GateNotReady}
+	default:
+		s.gatesMu.Unlock()
+		return &GateError{GateID: id, Kind: GateNotReady}
+	}
+
+	resolved, err := s.buildGateClosed(entry, id, reason)
+	if err != nil {
+		s.revertClaiming(id)
+		return err
+	}
+	if err := s.gateAppender.AppendGateResolved(ctx, resolved); err != nil {
+		s.revertClaiming(id)
+		return &GateError{GateID: id, Kind: GateAppendFailed, Cause: err}
+	}
+
+	s.gatesMu.Lock()
+	delete(s.gates, id)
+	s.gatesMu.Unlock()
+	return nil
+}
+
 // checkGateCap returns a typed *GateError{GateCapacity} if the directory is at or
 // above the configured cap (counting preparing + open + claiming). A zero cap
 // means unlimited. The caller MUST hold gatesMu.
@@ -361,6 +404,21 @@ func (s *Session) buildGateResolved(entry gateEntry, response gate.GateResponse,
 	return resolved, nil
 }
 
+func (s *Session) buildGateClosed(entry gateEntry, id gate.ID, reason gate.CloseReason) (event.GateResolved, error) {
+	if reason == "" {
+		reason = gate.CloseOwnerClosed
+	}
+	stamped, err := s.factory.Stamp(event.Header{Coordinates: entry.coordinates})
+	if err != nil {
+		return event.GateResolved{}, &GateError{GateID: id, Kind: GateAppendFailed, Cause: err}
+	}
+	return event.GateResolved{
+		Header: stamped,
+		GateID: id,
+		Reason: reason,
+	}, nil
+}
+
 // dispatchGateCommand routes the translated command to the owning loop using
 // s.sessionCtx (not the caller's ctx) so a client disconnect after the durable
 // commit does not cancel delivery.
@@ -390,6 +448,7 @@ func (s *Session) translateGateResponse(entry gateEntry, response gate.GateRespo
 	hdr := command.Header{CommandID: cmdID, Agency: identity.AgencyUser, CreatedAt: s.stampNow()}
 	route := command.GateRoute{
 		Coordinates:     identity.Coordinates{SessionID: entry.coordinates.SessionID, LoopID: entry.coordinates.LoopID},
+		GateID:          response.GateID,
 		ToolExecutionID: uuid.UUID(entry.route.ToolExecutionID),
 	}
 	switch entry.gate.Kind {

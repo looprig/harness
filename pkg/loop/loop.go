@@ -514,6 +514,9 @@ func runLoop(cfg loopConfig, state loopState) {
 	// that a late control command for a finished turn could match.
 	clearGates := func() {
 		if len(state.pendingGates) > 0 {
+			for gateID := range state.pendingGates {
+				_ = cfg.gates.CloseGate(ctx, gateID, gatedomain.CloseAbandoned)
+			}
 			state.pendingGates = make(map[gatedomain.ID]pendingGate)
 		}
 	}
@@ -1042,6 +1045,7 @@ func runLoop(cfg loopConfig, state loopState) {
 			route := gatedomain.Route{GateID: gateID, LoopID: state.id, ToolExecutionID: callID}
 			if err := cfg.gates.ActivateGate(ctx, gateID, route); err != nil {
 				delete(state.pendingGates, gateID)
+				_ = cfg.gates.CloseGate(ctx, gateID, gatedomain.CloseAbandoned)
 				reg.ack <- gateInstallAck{gateID: gateID, err: err}
 				break
 			}

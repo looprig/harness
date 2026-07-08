@@ -291,6 +291,71 @@ func TestGateActivateAlreadyActivatedFailsSecure(t *testing.T) {
 	}
 }
 
+func TestGateClosePreparingRemovesWithoutPublicResolve(t *testing.T) {
+	t.Parallel()
+	s, app, loopID, _ := gateSession(t)
+	gateID, err := s.PrepareGateOpen(context.Background(), loopID, permissionGate(), gate.PermissionPayload{})
+	if err != nil {
+		t.Fatalf("PrepareGateOpen() error = %v", err)
+	}
+
+	if err := s.CloseGate(context.Background(), gateID, gate.CloseAbandoned); err != nil {
+		t.Fatalf("CloseGate() error = %v", err)
+	}
+	if len(app.resolved) != 0 {
+		t.Fatalf("resolved events = %d, want 0 for preparing close", len(app.resolved))
+	}
+	if got := s.ListGates(context.Background()); len(got) != 0 {
+		t.Fatalf("ListGates() = %d, want 0", len(got))
+	}
+	if err := s.ActivateGate(context.Background(), gateID, gate.Route{GateID: gateID, LoopID: loopID}); err == nil {
+		t.Fatal("ActivateGate() after CloseGate(preparing) error = nil, want not found")
+	}
+}
+
+func TestGateCloseOpenAppendsOwnerClosedAndRemoves(t *testing.T) {
+	t.Parallel()
+	s, app, loopID, cmds := gateSession(t)
+	gateID := prepareAndActivate(t, s, loopID, gate.PermissionPayload{})
+
+	if err := s.CloseGate(context.Background(), gateID, gate.CloseOwnerClosed); err != nil {
+		t.Fatalf("CloseGate() error = %v", err)
+	}
+	if len(app.resolved) != 1 {
+		t.Fatalf("resolved events = %d, want 1", len(app.resolved))
+	}
+	if app.resolved[0].GateID != gateID || app.resolved[0].Reason != gate.CloseOwnerClosed {
+		t.Fatalf("resolved = %+v, want owner_closed for %v", app.resolved[0], gateID)
+	}
+	if got := s.ListGates(context.Background()); len(got) != 0 {
+		t.Fatalf("ListGates() = %d, want 0", len(got))
+	}
+	select {
+	case c := <-cmds:
+		t.Fatalf("CloseGate dispatched command %T, want none", c)
+	default:
+	}
+}
+
+func TestGateCloseAppendFailureLeavesOpen(t *testing.T) {
+	t.Parallel()
+	s, app, loopID, _ := gateSession(t)
+	gateID := prepareAndActivate(t, s, loopID, gate.PermissionPayload{})
+	app.resolveErr = errors.New("journal wedge")
+
+	err := s.CloseGate(context.Background(), gateID, gate.CloseAbandoned)
+	if err == nil {
+		t.Fatal("CloseGate() error = nil, want append failure")
+	}
+	var ge *GateError
+	if !errors.As(err, &ge) || ge.Kind != GateAppendFailed {
+		t.Fatalf("CloseGate() error = %v, want *GateError{GateAppendFailed}", err)
+	}
+	if got := s.ListGates(context.Background()); len(got) != 1 || got[0].ID != gateID {
+		t.Fatalf("ListGates() = %+v, want still-open gate %v", got, gateID)
+	}
+}
+
 // TestGateCapRejectsPrepareOverLimit proves the open-gate cap counts preparing +
 // open + claiming and rejects a PrepareGateOpen that would exceed it, returning a
 // typed capacity error before appending.

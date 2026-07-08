@@ -36,6 +36,7 @@ type pendingGate struct {
 type gateRegistrar interface {
 	PrepareGateOpen(ctx context.Context, loopID uuid.UUID, g gatedomain.Gate, payload gatedomain.Payload) (gatedomain.ID, error)
 	ActivateGate(ctx context.Context, id gatedomain.ID, route gatedomain.Route) error
+	CloseGate(ctx context.Context, id gatedomain.ID, reason gatedomain.CloseReason) error
 }
 
 type nopGateRegistrar struct{}
@@ -51,6 +52,10 @@ func (nopGateRegistrar) PrepareGateOpen(_ context.Context, _ uuid.UUID, g gatedo
 }
 
 func (nopGateRegistrar) ActivateGate(context.Context, gatedomain.ID, gatedomain.Route) error {
+	return nil
+}
+
+func (nopGateRegistrar) CloseGate(context.Context, gatedomain.ID, gatedomain.CloseReason) error {
 	return nil
 }
 
