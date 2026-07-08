@@ -70,6 +70,14 @@ func (f *fakeGateAppender) snapshotOpened() []event.GateOpened {
 	return out
 }
 
+func (f *fakeGateAppender) snapshotResolved() []event.GateResolved {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]event.GateResolved, len(f.resolved))
+	copy(out, f.resolved)
+	return out
+}
+
 // gateSession builds a struct-literal Session wired to a fakeGateAppender and a
 // real hub, with a pinned clock. It returns the session, the fake appender, a
 // loopID, and the loop's command channel so RespondGate tests can verify
@@ -92,6 +100,7 @@ func gateSession(t *testing.T) (*Session, *fakeGateAppender, uuid.UUID, chan com
 		now:           pinnedClock(time.Date(2026, time.July, 7, 12, 0, 0, 0, time.UTC)),
 		gateAppender:  app,
 		gates:         map[gate.ID]gateEntry{},
+		gateTimers:    map[gate.ID]*time.Timer{},
 	}
 	s.factory = event.NewFactory(func() (uuid.UUID, error) { return s.newID() }, func() time.Time { return s.now() })
 	s.loops[loopID] = &loopHandle{backend: &loop.Loop{Commands: cmds, Done: make(chan struct{})}}
@@ -399,6 +408,157 @@ func TestGateCapAllowsMultiplePreparing(t *testing.T) {
 	var ge *GateError
 	if !errors.As(err, &ge) || ge.Kind != GateCapacity {
 		t.Fatalf("PrepareGateOpen() #4 error = %v, want *GateError{GateCapacity}", err)
+	}
+}
+
+func TestGatePolicyPermissionDefaultDeny(t *testing.T) {
+	t.Parallel()
+	s, _, loopID, _ := gateSession(t)
+
+	gateID, err := s.PrepareGateOpen(context.Background(), loopID, permissionGate(), gate.PermissionPayload{})
+	if err != nil {
+		t.Fatalf("PrepareGateOpen() error = %v", err)
+	}
+	entry := s.gates[gateID]
+	if entry.gate.ResponsePolicy.Timeout != 5*time.Minute {
+		t.Fatalf("default timeout = %v, want 5m", entry.gate.ResponsePolicy.Timeout)
+	}
+	if entry.gate.ResponsePolicy.OnTimeout != gate.PolicyRespond || entry.gate.ResponsePolicy.Response.Action != "deny" {
+		t.Fatalf("default policy = %+v, want respond deny", entry.gate.ResponsePolicy)
+	}
+}
+
+func TestGatePolicyRespondSubmitsThroughRespondGate(t *testing.T) {
+	t.Parallel()
+	s, app, loopID, cmds := gateSession(t)
+	g := permissionGate()
+	g.ResponsePolicy = gate.ResponsePolicy{
+		Timeout:   10 * time.Millisecond,
+		OnTimeout: gate.PolicyRespond,
+		Response:  gate.ResponseTemplate{Action: "deny"},
+	}
+	gateID, err := s.PrepareGateOpen(context.Background(), loopID, g, gate.PermissionPayload{})
+	if err != nil {
+		t.Fatalf("PrepareGateOpen() error = %v", err)
+	}
+	if err := s.ActivateGate(context.Background(), gateID, gate.Route{GateID: gateID, LoopID: loopID, ToolExecutionID: mustUUID()}); err != nil {
+		t.Fatalf("ActivateGate() error = %v", err)
+	}
+
+	deadline := time.After(2 * time.Second)
+	var resolved []event.GateResolved
+	for {
+		resolved = app.snapshotResolved()
+		if len(resolved) == 1 {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("policy timer did not append GateResolved within deadline")
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+	if resolved[0].Source.Kind != gate.ResponseFromPolicy || resolved[0].Source.Reason != "timeout" {
+		t.Fatalf("resolved source = %+v, want policy timeout", resolved[0].Source)
+	}
+	if _, ok := recvCommand(t, cmds).(command.DenyToolCall); !ok {
+		t.Fatal("policy response did not dispatch DenyToolCall")
+	}
+}
+
+func TestGatePolicyRespondLosesToEarlierHumanResponse(t *testing.T) {
+	t.Parallel()
+	s, app, loopID, cmds := gateSession(t)
+	g := permissionGate()
+	g.ResponsePolicy = gate.ResponsePolicy{
+		Timeout:   50 * time.Millisecond,
+		OnTimeout: gate.PolicyRespond,
+		Response:  gate.ResponseTemplate{Action: "deny"},
+	}
+	gateID, err := s.PrepareGateOpen(context.Background(), loopID, g, gate.PermissionPayload{})
+	if err != nil {
+		t.Fatalf("PrepareGateOpen() error = %v", err)
+	}
+	if err := s.ActivateGate(context.Background(), gateID, gate.Route{GateID: gateID, LoopID: loopID, ToolExecutionID: mustUUID()}); err != nil {
+		t.Fatalf("ActivateGate() error = %v", err)
+	}
+	if err := s.RespondGate(context.Background(), gate.GateResponse{GateID: gateID, Action: "deny", Source: gate.ResponseSource{Kind: gate.ResponseFromUser}}); err != nil {
+		t.Fatalf("RespondGate() error = %v", err)
+	}
+	recvCommand(t, cmds)
+	time.Sleep(100 * time.Millisecond)
+	resolved := app.snapshotResolved()
+	if len(resolved) != 1 {
+		t.Fatalf("resolved events = %d, want exactly 1", len(resolved))
+	}
+	if resolved[0].Source.Kind != gate.ResponseFromUser {
+		t.Fatalf("resolved source = %+v, want user", resolved[0].Source)
+	}
+}
+
+func TestGatePolicyWaitWithNoTimeoutLeavesGateOpen(t *testing.T) {
+	t.Parallel()
+	s, _, loopID, _ := gateSession(t)
+	g := permissionGate()
+	g.ResponsePolicy = gate.ResponsePolicy{OnTimeout: gate.PolicyWait}
+	gateID, err := s.PrepareGateOpen(context.Background(), loopID, g, gate.PermissionPayload{})
+	if err != nil {
+		t.Fatalf("PrepareGateOpen() error = %v", err)
+	}
+	if err := s.ActivateGate(context.Background(), gateID, gate.Route{GateID: gateID, LoopID: loopID}); err != nil {
+		t.Fatalf("ActivateGate() error = %v", err)
+	}
+	if len(s.gateTimers) != 0 {
+		t.Fatalf("gate timers = %d, want 0 for wait policy", len(s.gateTimers))
+	}
+	if got := s.ListGates(context.Background()); len(got) != 1 || got[0].ID != gateID {
+		t.Fatalf("ListGates() = %+v, want open gate", got)
+	}
+}
+
+func TestGatePolicyRejectsUnsupportedActions(t *testing.T) {
+	t.Parallel()
+	tests := []gate.PolicyAction{gate.PolicyModelDecide, gate.PolicySuspendSession}
+	for _, action := range tests {
+		action := action
+		t.Run(string(action), func(t *testing.T) {
+			t.Parallel()
+			s, _, loopID, _ := gateSession(t)
+			g := permissionGate()
+			g.ResponsePolicy = gate.ResponsePolicy{Timeout: time.Second, OnTimeout: action}
+			_, err := s.PrepareGateOpen(context.Background(), loopID, g, gate.PermissionPayload{})
+			if err == nil {
+				t.Fatal("PrepareGateOpen() error = nil, want unsupported policy rejection")
+			}
+			var ge *GateError
+			if !errors.As(err, &ge) || ge.Kind != GateActionInvalid {
+				t.Fatalf("PrepareGateOpen() error = %v, want *GateError{GateActionInvalid}", err)
+			}
+		})
+	}
+}
+
+func TestGatePolicyTimeoutCapRejectsBeforeAppend(t *testing.T) {
+	t.Parallel()
+	s, app, loopID, _ := gateSession(t)
+	s.gateCaps = GateCaps{MaxTimeout: time.Second}
+	g := permissionGate()
+	g.ResponsePolicy = gate.ResponsePolicy{
+		Timeout:   2 * time.Second,
+		OnTimeout: gate.PolicyRespond,
+		Response:  gate.ResponseTemplate{Action: "deny"},
+	}
+
+	_, err := s.PrepareGateOpen(context.Background(), loopID, g, gate.PermissionPayload{})
+	if err == nil {
+		t.Fatal("PrepareGateOpen() error = nil, want timeout cap rejection")
+	}
+	var ge *GateError
+	if !errors.As(err, &ge) || ge.Kind != GateCapacity {
+		t.Fatalf("PrepareGateOpen() error = %v, want *GateError{GateCapacity}", err)
+	}
+	if len(app.snapshotPrepared()) != 0 {
+		t.Fatalf("prepared records = %d, want 0", len(app.snapshotPrepared()))
 	}
 }
 

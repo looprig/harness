@@ -299,6 +299,10 @@ type Session struct {
 	// claiming so failed activations cannot accumulate invisible prepared entries.
 	// Zero (the default) means no cap — the session accepts unlimited gates.
 	gateCaps GateCaps
+
+	// gateTimers holds activation-time response-policy timers keyed by GateID.
+	// Protected by gatesMu alongside gates.
+	gateTimers map[gate.ID]*time.Timer
 }
 
 // eventAppender is the session's narrow view of the hub's REQUIRED durable event tap:
@@ -799,6 +803,7 @@ func newSession(ctx context.Context, cfg loop.Config, newID idGenerator, now eve
 		// Gate directory: nop appender + empty directory by default; the composition
 		// root wires the real journal+hub adapter via WithGateAppender.
 		gates:        map[gate.ID]gateEntry{},
+		gateTimers:   map[gate.ID]*time.Timer{},
 		gateAppender: nopGateAppender{},
 	}
 	// Apply optional dependency injections (e.g. WithCommandAppender, WithEventAppender)

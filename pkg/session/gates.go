@@ -3,6 +3,7 @@ package session
 import (
 	"context"
 	"encoding/json"
+	"time"
 
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/command"
@@ -67,7 +68,8 @@ func (nopGateAppender) AppendGateResolved(context.Context, event.GateResolved) e
 // claiming so failed activations cannot accumulate invisible prepared entries.
 // Zero means no cap.
 type GateCaps struct {
-	MaxOpen int
+	MaxOpen    int
+	MaxTimeout time.Duration
 }
 
 // GateErrorKind names the failure mode of a gate directory operation.
@@ -152,12 +154,17 @@ func (s *Session) PrepareGateOpen(ctx context.Context, loopID uuid.UUID, g gate.
 	if err := s.checkGateCap(); err != nil {
 		return gate.ID{}, err
 	}
+	policy, err := s.resolveGatePolicy(g)
+	if err != nil {
+		return gate.ID{}, err
+	}
 
 	gateID, err := s.mintGateID()
 	if err != nil {
 		return gate.ID{}, err
 	}
 	g.ID = gateID
+	g.ResponsePolicy = policy
 
 	coords := identity.Coordinates{
 		SessionID: s.SessionID,
@@ -209,6 +216,7 @@ func (s *Session) ActivateGate(ctx context.Context, id gate.ID, route gate.Route
 	entry.route = route
 	entry.state = gateOpen
 	s.gates[id] = entry
+	s.startGatePolicyTimerLocked(id, entry)
 	return nil
 }
 
@@ -239,6 +247,7 @@ func (s *Session) CloseGate(ctx context.Context, id gate.ID, reason gate.CloseRe
 	}
 	switch entry.state {
 	case gatePreparing:
+		s.stopGateTimerLocked(id)
 		delete(s.gates, id)
 		s.gatesMu.Unlock()
 		return nil
@@ -265,6 +274,7 @@ func (s *Session) CloseGate(ctx context.Context, id gate.ID, reason gate.CloseRe
 	}
 
 	s.gatesMu.Lock()
+	s.stopGateTimerLocked(id)
 	delete(s.gates, id)
 	s.gatesMu.Unlock()
 	return nil
@@ -287,6 +297,76 @@ func (s *Session) checkGateCap() error {
 		return &GateError{Kind: GateCapacity}
 	}
 	return nil
+}
+
+func (s *Session) resolveGatePolicy(g gate.Gate) (gate.ResponsePolicy, error) {
+	policy := g.ResponsePolicy
+	if policy.Timeout == 0 && policy.OnTimeout == "" && g.Kind == gate.KindPermission {
+		policy.Timeout = 5 * time.Minute
+		policy.OnTimeout = gate.PolicyRespond
+		policy.Response = gate.ResponseTemplate{Action: "deny"}
+	}
+	if s.gateCaps.MaxTimeout > 0 && policy.Timeout > s.gateCaps.MaxTimeout {
+		return gate.ResponsePolicy{}, &GateError{GateID: g.ID, Kind: GateCapacity}
+	}
+	switch policy.EffectiveAction() {
+	case gate.PolicyWait:
+		return policy, nil
+	case gate.PolicyRespond:
+		if policy.Timeout <= 0 || policy.Response.Action == "" {
+			return gate.ResponsePolicy{}, &GateError{GateID: g.ID, Kind: GateActionInvalid}
+		}
+		return policy, nil
+	case gate.PolicyModelDecide, gate.PolicySuspendSession:
+		return gate.ResponsePolicy{}, &GateError{GateID: g.ID, Kind: GateActionInvalid}
+	default:
+		return gate.ResponsePolicy{}, &GateError{GateID: g.ID, Kind: GateActionInvalid}
+	}
+}
+
+// startGatePolicyTimerLocked starts the activation-time timer for PolicyRespond.
+// The caller MUST hold gatesMu.
+func (s *Session) startGatePolicyTimerLocked(id gate.ID, entry gateEntry) {
+	policy := entry.gate.ResponsePolicy
+	if policy.EffectiveAction() != gate.PolicyRespond || policy.Timeout <= 0 {
+		return
+	}
+	if s.gateTimers == nil {
+		s.gateTimers = make(map[gate.ID]*time.Timer)
+	}
+	s.stopGateTimerLocked(id)
+	template := policy.Response
+	s.gateTimers[id] = time.AfterFunc(policy.Timeout, func() {
+		_ = s.RespondGate(s.sessionCtx, gate.GateResponse{
+			GateID: id,
+			Action: template.Action,
+			Values: cloneRawValues(template.Values),
+			Source: gate.ResponseSource{Kind: gate.ResponseFromPolicy, Reason: "timeout"},
+		})
+	})
+}
+
+// stopGateTimerLocked stops and removes a policy timer. The caller MUST hold
+// gatesMu.
+func (s *Session) stopGateTimerLocked(id gate.ID) {
+	if s.gateTimers == nil {
+		return
+	}
+	if timer := s.gateTimers[id]; timer != nil {
+		timer.Stop()
+	}
+	delete(s.gateTimers, id)
+}
+
+func cloneRawValues(in map[string]json.RawMessage) map[string]json.RawMessage {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make(map[string]json.RawMessage, len(in))
+	for k, v := range in {
+		out[k] = append(json.RawMessage(nil), v...)
+	}
+	return out
 }
 
 // mintGateID mints a fresh gate.ID via the session's id generator.
@@ -351,6 +431,7 @@ func (s *Session) RespondGate(ctx context.Context, response gate.GateResponse) e
 	}
 
 	s.gatesMu.Lock()
+	s.stopGateTimerLocked(response.GateID)
 	delete(s.gates, response.GateID)
 	s.gatesMu.Unlock()
 
