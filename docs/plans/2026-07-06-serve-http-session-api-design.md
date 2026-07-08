@@ -8,12 +8,14 @@ Revised 2026-07-06: `serve` is an **in-harness package (`pkg/serve`)**, not a se
 **Compile-time deps:** harness `pkg/event` (event taxonomy + wire marshaling), `pkg/gate` (gate
 response requests/responses), and `github.com/looprig/core` `content`/`uuid` — the types in the
 driven-surface signatures.
-`serve` depends on the `LiveSession` *interface* (§3a), **not** `pkg/session`: the concrete session
-is passed in by the consumer, so `pkg/serve` never imports the engine (Decision #5).
+`serve` depends on narrow `Runner`/`LiveSession` *interfaces* (§3a-§3c), **not** `pkg/session`: the
+compiled runner is passed in by the consumer and returns live sessions structurally satisfying
+`LiveSession`, so `pkg/serve` never imports the engine (Decision #5).
 **Depends on (read plane):** a narrow catalog/replay interface; today a small adapter can be
 built from harness `pkg/sessionstore.Catalog` plus `Store.OpenEventReplayer`/`OpenRecordReplayer`
-over `github.com/looprig/storage`.
-**Supersedes:** `pkg/api` — its runner is reshaped into `pkg/serve` (session-first, not
+over `github.com/looprig/storage`. Full session reads/transcript reconstruction come from this
+read plane, not from the live session.
+**Supersedes:** `pkg/api` — its runner is reshaped into `pkg/serve` (runner-supplied, not
 factory-first). `Intent`/posture (`pkg/tools`) and the `Session` engine (`pkg/session`) are unchanged.
 **Related:** [Open-Gate Posture](2026-07-01-open-gate-posture-design.md) (headless posture),
 [Client web app](2026-07-02-client-web-app-design.md) (the *future, separate* front-end **module**
@@ -29,8 +31,8 @@ the shape are wrong for where we are going:
 
 1. **The runner is factory-first.** `pkg/api` owns the session lifecycle (an in-memory many-session
    map) and calls *down* into a consumer-supplied `Factory` to build each session on an incoming
-   `POST /sessions`. Control points the wrong way: the runner constructs sessions instead of
-   *wrapping* ones the consumer already built.
+   `POST /sessions`. Control points the wrong way: the HTTP layer knows about an agent factory instead
+   of operating over a consumer-supplied compiled runner.
 2. **The stream is live-only and lossy.** Its SSE stream drops every **Ephemeral** event (token
    deltas, tool-lifecycle) — `event.MarshalEvent` fails closed on them — so an HTTP consumer gets
    step-granularity, never token streaming; and there is no session-listing / cold-history surface.
@@ -38,8 +40,9 @@ the shape are wrong for where we are going:
 **Goal.** Reshape the HTTP surface into **`pkg/serve`** (replacing `pkg/api`, staying in harness),
 that:
 
-- is a **thin, session-first** HTTP projection of a session's driven surface — you build the
-  session the normal harness way and *wrap* it; `serve` never constructs agents;
+- is a **thin, runner-supplied** HTTP projection of a session's driven surface — you compile the
+  runner the normal harness way and `serve` creates/resumes runtime sessions through it; `serve`
+  never constructs agents;
 - adds **no extra engine semantics** beyond what harness already does — it is the over-the-wire
   shape of normal in-process SDK use, not a second session runtime or state machine;
 - is **plug-and-play**: it depends on neither your LLM nor any concrete storage backend — those are
@@ -64,28 +67,28 @@ it projects — no module version to align (Decision #1).
 |---|---|
 | harness `pkg/event` | the event taxonomy + wire marshaling (Enduring today; Ephemeral added here) |
 | harness `pkg/gate`, `github.com/looprig/core` `content`/`uuid` | gate responses, input-block, and identifier types in the driven-surface signatures |
-| the `LiveSession` interface (§3a) | the driven surface — **not** `pkg/session`; the concrete `*Session` is passed in by the consumer |
+| the `Runner`/`LiveSession` interfaces (§3a-§3c) | the runtime lifecycle and driven surface — **not** `pkg/session`; the compiled runner is passed in by the consumer |
 | catalog/replay interfaces | the stateless read plane and future sequenced replay-live join |
 | stdlib `net/http` | the server + SSE |
 
-**Does not import:** `pkg/session` (satisfied structurally by the `LiveSession` interface — keeps
-handler tests fakeable, §11), any LLM provider, any storage backend, any concrete agent, `swe`, any
-front-end/BFF, any TUI stack. `serve` is a transport over the session's driven surface plus a thin
-projection of read-side interfaces; it does not own engine state.
+**Does not import:** `pkg/session` (satisfied structurally by the `Runner`/`LiveSession` interfaces —
+keeps handler tests fakeable, §11), any LLM provider, any storage backend, any concrete agent, `swe`,
+any front-end/BFF, any TUI stack. `serve` is a transport over the session runtime contract plus a
+thin projection of read-side interfaces; it does not own engine state.
 
 **Explicitly out of scope (owned elsewhere):**
 
 - **Routing / session affinity** → infrastructure (helm charts, ingress, service mesh) in a
   later iteration. §9 states the *contract* infra must satisfy and the harness primitives that
-  make it safe, but `serve` implements no router.
+  make it safe, but `serve` implements no infrastructure or cross-pod router.
 - **The front-end / BFF** → the separate future `client` module. It consumes `serve`.
 - **`cmd/` binaries** → the consumer (`swe` or the front-end module). `serve` ships `pkg/` only.
 - **Browser rendering — the DTO/zod contract + rich UI** → the front-end module. `serve` emits
   wire JSON and the raw session list (§3d); folding it into components is the front-end's job.
   (Session **listing** and cold history *are* in scope here — but as a *separate* read-plane
-  handler, §3d, not part of the live-session wrap.)
+  route group, §3d, not part of the live/control routes.)
 
-## 3. Core shape: session-first, not factory-first
+## 3. Core shape: runner-supplied, not factory-first
 
 ### 3a. The driven surface
 
@@ -112,44 +115,50 @@ type LiveSession interface {
 }
 ```
 
-The live wrapper takes the `session_id` separately (`serve.New(id, s)`) because the interface is
-behavioral, not identity-bearing. That keeps the port minimal and avoids making harness grow a
-method solely for HTTP routing. If the path `{sid}` does not match the mounted id, the handler
-returns 404.
+The live surface is behavioral, not identity-bearing. `serve` keeps identity in its internal
+live-session table, keyed by the `session_id` returned from the supplied runner. That keeps the port
+minimal and avoids making harness grow an identity method solely for HTTP routing. If the path `{sid}`
+does not resolve to a live session in this process, live/control handlers return 404.
 
-### 3b. `serve.New(id, s)` — the primitive
+### 3b. `serve.Handler(runner, reads, opts...)` — the runtime HTTP adapter
 
-You build the session **exactly as you would without `serve`**, then wrap it. In-process and
-HTTP share identical construction; only the last line differs:
+You compile the session runner **exactly as you would without `serve`**, then hand the compiled
+runtime runner to the HTTP adapter. In-process and HTTP share the same design-time construction; only
+the runtime front door differs:
 
 ```go
 runner, _ := session.Compile(cfg, store)   // design-time: bind the agent def + deps (§3c)
-id, s, _  := runner.Run(ctx)               // runtime: mint a session id, bring it up live
 
-// in-process:      s.Submit(ctx, blocks)
-// over HTTP:        h := serve.New(id, s); serve.Serve(ctx, serve.Config{Addr: "127.0.0.1:0"}, h)
+// in-process:      id, s, _ := runner.Run(ctx); s.Submit(ctx, blocks)
+// over HTTP:        hdlr := serve.Handler(runner, reads); srv := serve.Server(addr, hdlr); srv.ListenAndServe()
 ```
 
-Control flow points the right way: **the consumer owns construction; `serve` only exposes.**
-There is no `Factory`, no `AgentRequest`, no `serve`-owned session lifecycle, and no background
-gate supervisor. Session construction is the consumer's, via `session.Runner` (§3c): `Run` brings up
-a new session and `Resume` *rebuilds one from its journal* (a construction / failover concern, §9) —
-**not** an event-replay API; `serve` calls neither. `serve.New(id, s)` returns an `http.Handler`;
-per-request SSE subscriptions are closed when the request ends.
+Control flow points the right way: **the consumer owns compile/design time; `serve` owns the HTTP
+runtime lifecycle over that compiled runner.** There is no `Factory`, no `AgentRequest`, and no
+background gate supervisor. `POST /sessions` calls `Runner.Run` to mint a new session id and bring up
+a live session; if the request body carries initial input blocks, the handler immediately submits
+them through `LiveSession.Submit` and returns the resulting `command_id`. `POST
+/sessions/{sid}/resume` calls `Runner.Resume` to rebuild one from its journal (a construction /
+failover concern, §9) — **not** an event-replay API. `serve.Handler` does not call
+`session.Compile`, `session.New`, or `session.Restore` directly; those remain behind the supplied
+runner. Per-request SSE subscriptions are closed when the request ends.
 
-### 3c. Multi-session per pod; create/resume via `session.Runner`
+### 3c. Multi-session per pod; create/resume via the supplied runner
 
 A pod routinely hosts **many** sessions. Agents/swarms that need no workspace or default tools are
 cheap, and kernel-sandboxed agents (via `looprig/sandbox` — Seatbelt on macOS; namespaces +
 Landlock + seccomp on Linux) are isolated *within* a shared pod, so isolation does **not** require
-one pod per session. `serve.Registry` holds `map[session_id]LiveSession`, populated by the *consumer*
-with sessions it built, and routes the `{sid}` path segment to the local session; it never
-constructs them (`session.New`/`Restore` stay the consumer's). Whether a pod holds one session or
-hundreds — and whether isolation is pod-per-session or kernel-sandbox-in-a-shared-pod — is the
-**consumer's deployment choice**, invisible to `serve`.
+one pod per session. `serve.Handler` owns a local, internal `map[session_id]LiveSession` and routes
+the `{sid}` path segment to the local session. Whether a pod holds one session or hundreds — and
+whether isolation is pod-per-session or kernel-sandbox-in-a-shared-pod — is the **consumer's
+deployment choice**, invisible to `serve`.
 
-**Create/resume is the consumer's, via `session.Runner` — a real API, not "deferred".** Building a
-session needs the agent's standing config (`loop.Config`: LLM, tools, posture) plus the store — a
+The internal live-session table is not a public API and not infrastructure routing. It answers
+"is `{sid}` live in this process, and if so which `LiveSession` handles it?" It is separate from the
+read-plane catalog, which lists durable sessions whether or not they are live here.
+
+**Create/resume is serve-owned at HTTP runtime, through the supplied runner.** Building a session
+needs the agent's standing config (`loop.Config`: LLM, tools, posture) plus the store — a
 **design-time** concern `serve` neither has nor should. `session.Runner` (a `pkg/session` addition,
 modeled on `flow.Runner`) makes the split explicit:
 
@@ -169,13 +178,23 @@ leaf identity/content module. Keep the session runner concrete/local to `pkg/ses
 may define the narrow interface it consumes. Extract only after two packages need the exact same
 method set and semantics.
 
-So the HTTP create/resume flow is a **consumer handler** — `runner.Run`/`Resume` →
-`serve.Registry.Register(id, s)` — built from the `session.Runner` API plus the one `serve` seam
-(`Register`). `serve` never constructs sessions. The only piece genuinely handed to infra is
-**placement** (*which pod* runs a new session, §9); locally it is trivial — one pod builds and
-registers. (`session.Runner` is specified separately; it is a Phase 0 prerequisite here, §12.)
+`pkg/serve` consumes only the narrow runtime contract it needs:
 
-### 3d. `serve.NewReader(reads)` — the read plane (listing + cold history)
+```go
+type Runner[S LiveSession] interface {
+    Run(ctx context.Context) (uuid.UUID, S, error)
+    Resume(ctx context.Context, id uuid.UUID) (S, error)
+}
+```
+
+So the HTTP create/resume flow is a **serve handler** — `runner.Run`/`Resume` → internal
+`session_id` attachment → optional initial `Submit` → `201/200`. `serve` never owns
+compile/design-time config. The only piece genuinely handed to infra is **placement** (*which pod*
+runs a new session, §9); locally it is trivial — the receiving pod runs/resumes and records the live
+session in memory. (`session.Runner` is specified separately; it is a Phase 0 prerequisite here,
+§12.)
+
+### 3d. `serve.NewReader(reads)` — the read plane (listing + session reads + cold history)
 
 Listing every session is neither a session's job (a `*Session` knows only itself) nor the live
 plane's — it is the **read plane**. Today harness `pkg/sessionstore` owns the derived catalog over
@@ -183,33 +202,58 @@ the generic `storage` module's `KV`; if that catalog later moves to `github.com/
 `serve`'s interface should not change. `sessionstore.Catalog.ListSessions(ctx) → []SessionMeta` is
 a derived, event-sourced projection, one `SessionMeta` per session, updated by folding the event
 stream. It needs **no live session**, so it lists ended sessions and sessions owned by other pods.
-Cold history/export come from the store's replay openers, not from the catalog itself. `serve`
-wraps those read-side capabilities as a **separate** handler:
+Cold history and full session reads come from the store's replay openers, not from the catalog
+itself. `serve` wraps those read-side capabilities as a **separate** route group:
 
 ```go
-live := serve.New(id, s)              // live+control for ONE session (sticky)
 read := serve.NewReader(reads)        // read plane: catalog + replay openers (stateless, any pod)
-//   GET /sessions        → ListSessions() → []SessionMeta
-//   GET /sessions/{sid}   → one SessionMeta
-//   GET /sessions/{sid}/history → cold Enduring replay from the store (from Beginning/FromSeq)
-//   GET /sessions/{sid}/export  → transcript render from replay
+
+hdlr := serve.Handler(runner, read, serve.WithAuth(authn))
+srv  := serve.Server(addr, hdlr)
+err  := srv.ListenAndServe()
 ```
 
-`serve.NewReader` depends on a narrow read interface (`ListSessions` + per-session metadata lookup
+`serve.Handler` mounts the live/control routes, HTTP create/resume routes, and read-plane routes on
+one handler. The live-session table stays internal; callers do not register sessions by hand.
+
+`serve.NewReader` depends on a narrow read interface (`ListSessions` + full-session read by id
 + cold event/record replay). Today that can be satisfied by an adapter over
 `sessionstore.Catalog.ListSessions` plus `sessionstore.Store.OpenEventReplayer`/
 `OpenRecordReplayer`; `Catalog` alone is the listing projection. Different dependency (a read
 source, not a live session), different affinity (stateless — any replica answers, no lease, no
-routing), different lifecycle: two small handlers in one package (ISP/SRP), mounted on one mux with
-**no path overlap** — the live handler owns `/events` (subscribe); the reader owns `/history`,
-`/export`, and the listing routes. The listing intelligence stays in `sessionstore`/storage; `serve`
-only projects it onto HTTP.
+routing), different lifecycle: two route groups in one package (ISP/SRP), mounted on one mux with
+**no path overlap** — the live routes own `/events` (subscribe); the reader owns `/history`,
+`GET /sessions/{sid}`, and the listing routes. The listing intelligence stays in
+`sessionstore`/storage; `serve` only projects it onto HTTP.
+
+```go
+type Page struct {
+    Skip  int // for list APIs
+    Limit int // default 100, hard cap 1000
+}
+
+type HistoryPage struct {
+    From  uint64 // inclusive ledger sequence; 0 means beginning
+    Limit int
+}
+
+type Reader interface {
+    ListSessions(ctx context.Context, page Page) (SessionList, error)
+    ReadSession(ctx context.Context, id uuid.UUID) (SessionDocument, error)
+    ReadHistory(ctx context.Context, id uuid.UUID, page HistoryPage) (EventHistoryPage, error)
+}
+```
+
+`SessionDocument` is the full product read model for one session: `SessionMeta` plus the
+reconstructed transcript/session view produced from record replay. It replaces the need for a
+live-session export method. `EventHistoryPage` is the raw Enduring event page with ledger sequence
+numbers.
 
 ## 4. Plug-and-play: the consumer owns LLM, storage, tools, posture
 
-`serve`'s only tie to the consumer's world is the `LiveSession` value it wraps. Everything the
-session needs is wired at the composition root, captured before `serve` sees anything — so
-`serve` **structurally cannot** couple to it:
+`serve`'s only tie to the consumer's world is the compiled runtime runner and read-plane adapter it
+receives. Everything the session needs is wired at the composition root, captured before `serve` sees
+anything — so `serve` **structurally cannot** couple to it:
 
 ```go
 // YOUR composition root (swe, or your own service)
@@ -223,9 +267,11 @@ cfg  := loop.Config{
     Tools:  loop.ToolSet{Permission: gate, Registry: myTools},   // ← YOUR tools + posture
 }
 runner, _ := session.Compile(cfg, store, session.WithWorkspace(ws, root)) // design-time: agent + deps
-id, s, _  := runner.Run(ctx)                                              // runtime: new live session
+read := serve.NewReader(reads)                                            // read plane: catalog + replay
 
-_ = serve.Serve(ctx, serve.Config{Addr: addr}, serve.New(id, s)) // serve knows none of the above
+hdlr := serve.Handler(runner, read, serve.WithAuth(authn))                 // runtime HTTP lifecycle
+srv  := serve.Server(addr, hdlr)
+err  := srv.ListenAndServe()
 ```
 
 Swapping the LLM, storage backend, tools, system prompt, model, or posture is a **local edit
@@ -259,28 +305,46 @@ construction.
 ## 6. HTTP surface
 
 Live/control paths are `session_id`-scoped for addressing (infra routes on `{sid}` — §9) and
-resolve to the wrapped session (or the registry's local session for that `{sid}`). Read-plane
-paths resolve to the catalog/replayer and do not require a live session on this pod.
+resolve to `serve`'s internal local live-session table for that `{sid}`. Read-plane paths resolve to
+the catalog/replayer and do not require a live session on this pod.
 
 | Method + path | Plane | Backed by |
 |---|---|---|
-| `GET  /sessions` | read | `sessionstore.Catalog.ListSessions` → `[]SessionMeta` (stateless; any pod) |
-| `GET  /sessions/{sid}` | read | catalog per-session `SessionMeta` (stateless; any pod) |
-| `POST /sessions` `{agent}` | create† | *consumer handler*: `Runner.Run` → `Registry.Register` → `201 {session_id}` |
-| `POST /sessions/{sid}/resume` | create† | *consumer handler*: `Runner.Resume(sid)` → `Registry.Register` → `200` |
+| `GET  /sessions?skip=<n>&limit=<n>` | read | paged `sessionstore.Catalog.ListSessions` → `[]SessionMeta` (stateless; any pod) |
+| `GET  /sessions/{sid}` | read | full session document reconstructed from record replay (metadata + transcript/session view; stateless; any pod) |
+| `POST /sessions` | create† | `serve` handler: supplied `Runner.Run` → internal live attach → optional initial `LiveSession.Submit` → `201 {session_id, command_id?}` |
+| `POST /sessions/{sid}/resume` | create† | `serve` handler: supplied `Runner.Resume(sid)` → internal live attach → `200 {session_id}` |
 | `POST /sessions/{sid}/input` | control | `LiveSession.Submit` (fire-and-forget → `CommandID`) |
 | `GET  /sessions/{sid}/events` | live | `LiveSession.SubscribeEvents` — live SSE from the subscription point; **lossy, no backlog** (mirrors the in-proc API exactly) |
-| `GET  /sessions/{sid}/history` | read | cold Enduring replay from the store (`OpenEventReplayer` from `Beginning()`/`FromSeq`, paged) — any pod, no live session |
+| `GET  /sessions/{sid}/history?from=<seq>&limit=<n>` | read | cold Enduring replay from the store (`OpenEventReplayer` from `FromSeq`, bounded in the handler) — any pod, no live session |
 | `POST /sessions/{sid}/gates/{gid}` | control | `LiveSession.RespondGate(gate.GateResponse)` from a `gate.ResponseRequest` body (`202 Accepted`; durably committed by harness) |
 | `POST /sessions/{sid}/interrupt` | control | `LiveSession.Interrupt` |
-| `GET  /sessions/{sid}/export` | read | read-plane transcript render from the session journal (optional shortcut / parity oracle) |
 
-- **Create/resume (†) are consumer handlers, not `serve` core.** They call `session.Runner` (§3c)
-  and `serve.Registry.Register`; `serve` provides the `Register` seam, never the agent config.
-  Placement (*which pod*) is infra's (§9); locally the receiving pod builds and registers.
+- **Create/resume (†) are `serve` handlers over a supplied runner.** They call the runner (§3c) and
+  attach the returned live session to the handler's internal live-session table. `serve` owns no agent
+  config and never compiles. Placement (*which pod*) is infra's (§9); locally the receiving pod
+  runs/resumes and keeps the live session in memory.
+- **Initial input on create:** `POST /sessions` accepts an optional JSON body
+  `{"blocks":[...]}` using the same `content.Block` array as `POST /sessions/{sid}/input`. If
+  `blocks` is present and non-empty, the handler calls `LiveSession.Submit` after attaching the new
+  live session and returns `{"session_id":"...","command_id":"..."}`. If no blocks are supplied, it
+  creates an idle live session and returns `{"session_id":"..."}`.
 - **Validate at the boundary:** `{sid}`/`{gid}` parse as `uuid.UUID`; malformed IDs return
-  400; an unknown live session or gate returns 404; `from`/`to` are bounded integers; bodies are
-  size-limited.
+  400; an unknown live session or gate returns 404; `skip`, `from`, and `limit` are bounded
+  integers; bodies are size-limited.
+- **Session listing paging contract:** `skip` is zero-based and defaults to 0; `limit` defaults to
+  100 with a hard cap of 1000; values above the cap return 400. `GET /sessions` returns
+  `{"sessions":[...],"skip":0,"limit":100,"next_skip":100,"done":false}`. `done=true` means fewer
+  than `limit` entries were returned. The catalog may initially implement this by reading all
+  `SessionMeta`, applying a stable sort (`last_active_at desc`, then `session_id asc`), and slicing;
+  a storage-backed cursor can replace that later without changing the HTTP contract.
+- **History paging contract:** `from` is an inclusive ledger sequence (`0`/absent means beginning),
+  and `limit` defaults to 100 with a hard cap of 1000. The current store read API has only
+  `ReplayRequest.FromSeq`; `serve` enforces `limit` by stopping after N yielded Enduring events.
+  The response is `{"events":[{"seq":123,"event":{...}}],"next_seq":124,"done":false}`.
+  `done=true` means the cold cursor drained before `limit`; `next_seq` is the next sequence a client
+  should ask for when `done=false`. No `to` parameter ships until the storage API has a native
+  bounded cursor.
 - **Live and cold are different endpoints with different sources — `serve` invents nothing.**
   `GET …/events` is exactly `SubscribeEvents`: a live, from-now, **lossy** stream (the session has
   no "from the beginning" API — subscribe late or drop, and you miss those events; that is the
@@ -288,6 +352,11 @@ paths resolve to the catalog/replayer and do not require a live session on this 
   journal — a different source (the durable log, any pod, no live session). Fusing them into one
   lossless replay-then-follow is a **client** concern (§7) and/or waits on a future harness sequenced
   source; `serve` exposes the two primitives as-is and promises no join.
+- **`GET /sessions/{sid}` vs `/history`:** `GET /sessions/{sid}` is the product/session read model:
+  metadata plus a reconstructed transcript/session view built from record replay. It is what a UI
+  opens to show a session. `GET /sessions/{sid}/history` is the lower-level event journal cursor:
+  raw Enduring events with ledger sequences for repair, debugging, replay pagination, and reconnect
+  stitching. It is intentionally not the primary UI document.
 - **Gate replies mirror harness semantics.** For v1 loop gates, a successful gate POST returns
   `202 Accepted`: the `GateResponse` was accepted and durably committed by the session gate router,
   not proven consumed by the parked runner. The public HTTP body is only
@@ -301,6 +370,10 @@ paths resolve to the catalog/replayer and do not require a live session on this 
 - **No HTTP destroy in v1.** `Interrupt` only cancels in-flight work. Graceful session shutdown,
   lease release, and store deletion/retention are composition-root lifecycle and storage-GC
   concerns, not part of this thin serving layer.
+- **No `/export` endpoint and no live-session export API in v1.** Transcript rendering is a helper
+  over the read-plane session document or record replay. `serve` must not require
+  `LiveSession.ExportSource` or any similar method; a non-live session must be readable/exportable
+  from storage alone.
 
 ## 7. Event model on the wire: Enduring + the new Ephemeral live-frame
 
@@ -310,8 +383,8 @@ stream carries only **Enduring** events. `serve` adds a **live-only wire frame**
 events, using named SSE event types without changing the durable event codec:
 
 ```
-event: enduring                 event: ephemeral
-data: {"v":1,"type":"StepDone",…} data: {"v":1,"kind":"token_delta",…}
+event: enduring                   event: ephemeral
+data: {"v":1,"event":{...}}        data: {"v":1,"kind":"token_delta","delta":{...},...}
 ```
 
 - **`enduring`** — authoritative transitions (StepDone, gates, terminals `TurnDone`/`TurnFailed`/
@@ -327,6 +400,32 @@ data: {"v":1,"type":"StepDone",…} data: {"v":1,"kind":"token_delta",…}
 Ephemeral frames **never** enter the journal and **never** carry a sequence — that invariant
 (`MarshalEvent` failing closed) is preserved; the ephemeral encoder is a *separate*, transport-
 only path.
+
+The ephemeral encoder has its own DTO because `content.Chunk` is intentionally not JSON-serializable
+in `core/content`:
+
+```go
+type EphemeralFrame struct {
+    V     int             `json:"v"`              // 1
+    Kind  string          `json:"kind"`           // token_delta, tool_call_started, tool_call_completed, input_queued
+    Header event.Header    `json:"header,omitzero"`
+    Delta json.RawMessage `json:"delta,omitempty"` // kind-specific, never a journal event
+}
+```
+
+For `TokenDelta`, `delta` is a tagged live-only chunk:
+
+```json
+{"chunk_type":"text","text":"hello"}
+{"chunk_type":"thinking","thinking":"reasoning"}
+{"chunk_type":"tool_use","index":0,"id":"call_1","name":"Bash","input_json":"{\"cmd\":"}
+```
+
+`ToolCallStarted`, `ToolCallCompleted`, and `InputQueued` use their existing public fields in
+`delta` (for example `tool_execution_id`, `tool_name`, `summary`, `is_error`, `result_preview`);
+the shared `header` carries session/loop/turn/step/cause correlation. Unknown future Ephemeral
+types are skipped with a debug log until the live DTO grows a new `kind` case; they are never sent
+as lossy ad-hoc JSON.
 
 **Sequenced reconnect is a harness/storage capability, not a `serve` invention.** `GET …/events`
 is the session's live subscription (lossy, no backlog, no `seq`); `GET …/history` is the store's
@@ -345,9 +444,9 @@ concern; `serve` emits the wire JSON.)
 
 The load-bearing fact: **a session is long-lived server state; HTTP requests are short RPCs
 against it.** `session.New` spawns the loop's goroutines, which live for the session's whole life
-(many turns). `serve.New(id, s)` makes that already-living thing reachable. Go's goroutine-per-request
-is fine: request goroutines are ephemeral front-doors that call the concurrency-safe session and
-return.
+(many turns). `serve.Handler` starts or resumes those sessions through the supplied runner and keeps
+the live values in an internal `session_id` table. Go's goroutine-per-request is fine: request
+goroutines are ephemeral front-doors that call the concurrency-safe session and return.
 
 Three request lifetimes:
 
@@ -355,7 +454,7 @@ Three request lifetimes:
 |---|---|---|
 | `POST …/input`, `…/gates/{gid}`, `…/interrupt` | milliseconds | delivers to the session, returns immediately |
 | `GET …/events` (SSE) | the whole session | the outbound event stream, spanning many turns |
-| `GET …/export` and read-plane listing/history | milliseconds | snapshot reads |
+| `GET /sessions`, `GET /sessions/{sid}`, and `GET …/history` | milliseconds | read-plane snapshot/cursor reads |
 
 - **Submit is fire-and-forget.** `LiveSession.Submit` returns a `CommandID` *before the turn starts*;
   the outcome (`InputQueued` / `TurnStarted` / `TurnFoldedInto` / `TurnRejected` /
@@ -406,7 +505,7 @@ deployment must satisfy:
    (the ownership directory can be built on the `storage` module's `KV`, which the catalog already
    uses; the `Lease` is the authoritative single-writer token).
 3. **Failover:** on pod loss, the lease's `Lost()`/expiry lets another pod acquire it and
-   `session.Restore(sid)` from the shared journal, then update the mapping. The fencing epoch
+   `Runner.Resume(ctx, sid)` from the shared journal, then update the mapping. The fencing epoch
    prevents a stale owner from writing. In-flight requests to the dead pod fail and re-route.
 
 What `serve` provides so infra *can* do this cleanly:
@@ -416,7 +515,7 @@ What `serve` provides so infra *can* do this cleanly:
   store, so those requests need **no** affinity (any replica answers). Only the live+control
   plane is sticky. Infra can route the read plane freely and only pin live/control.
 - **Honest liveness/durability split** — liveness is pod-pinned; durability is the shared
-  journal, so death→`Restore` handoff loses no committed history.
+  journal, so death→`Runner.Resume` handoff loses no committed history.
 
 **Ultimately the consumer's call, not just "infra's".** How sessions pack onto pods — one per pod,
 or hundreds behind kernel sandboxing (§3c) — whether a deployment even *needs* sticky routing, and
@@ -429,17 +528,40 @@ The self-routing-fleet option (pods peer-forward using a `KV` directory) is reco
 
 ## 10. Auth & security (per CLAUDE.md)
 
-- **Loopback default, fail-secure.** `serve.Config` binds `127.0.0.1` by default. Loopback may run
-  unauthenticated for local development, matching today's `pkg/api` posture. A non-loopback bind
-  requires both explicit public-bind opt-in and either an auth verifier or an explicitly named
-  unsafe no-auth development flag; no credentials configured must never silently expose a public
-  control surface.
-- **Bearer auth is boundary-checked when configured.** `serve` accepts a token verifier for the
-  driven surface; TLS is typically terminated at the infra ingress, but `serve` supports direct TLS
-  (`MinVersion: tls.VersionTLS12`, never `InsecureSkipVerify`). Secrets come from the
-  environment/secrets manager, never code, never logs.
-- **Explicit `http.Server` timeouts** (Read/Write/Idle/`MaxHeaderBytes`); SSE clears the write
-  deadline for its own stream only. Every session/journal call is `context`-bounded.
+Follow `flow/pkg/ingress`: auth is a caller-supplied seam on the HTTP handler, not a baked-in
+scheme. That keeps `serve` cohesive with other looprig HTTP modules and lets a future auth module
+export one adapter that returns `func(*http.Request) error` for both `flow/ingress.WithAuth` and
+`serve.WithAuth`.
+
+```go
+type Option func(*config)
+
+func WithAuth(authn func(*http.Request) error) Option
+func WithMaxBodyBytes(n int64) Option
+
+func Handler[S LiveSession](runner Runner[S], reads Reader, opts ...Option) http.Handler
+func Server(addr string, h http.Handler, opts ...ServerOption) *http.Server
+```
+
+- **No scheme baked in.** `WithAuth` installs a caller-supplied authenticator on every `serve` route:
+  a non-nil error returns generic `401 {"error":"unauthorized"}` before any live session or read
+  interface is touched. `nil` auth means no auth, matching `flow/pkg/ingress`; production services
+  wire auth at the composition root or behind an ingress/proxy. A future `auth` module can implement
+  bearer tokens, mTLS claims, tenant checks, or capability checks while still presenting the same
+  `func(*http.Request) error` seam to `flow` and `serve`.
+- **Authorization model — no built-in tenancy.** Like `flow/pkg/ingress`, `serve` has no intrinsic
+  session ownership model. A caller that passes `WithAuth` may still access any session id unless the
+  authenticator rejects it. Deployments that need tenancy enforce it in the authenticator (for
+  example by checking `{sid}` against request-derived claims) or in a fronting proxy.
+- **Loopback/server defaults.** The handler is auth-agnostic; transport hardening lives in the
+  `Server` helper, mirroring `flow/pkg/ingress.Server`: explicit ReadHeader/Read/Write/Idle
+  timeouts, `MaxHeaderBytes`, and `TLSConfig.MinVersion >= tls.VersionTLS12`. Loopback-only local
+  development can run no-auth. Public deployment should use `WithAuth` or an equivalent fronting
+  proxy. `serve.Server(addr, hdlr)` returns a configured `*http.Server`; callers start it with the
+  standard `srv.ListenAndServe()` / `srv.Serve(listener)` APIs.
+- **Request hardening.** `WithMaxBodyBytes` bounds decoded request bodies. Every session/journal call
+  is `context`-bounded. SSE uses no server-wide write timeout for the stream path, or explicitly
+  clears the write deadline for that response.
 - **Typed errors** for each distinct failure (`SessionNotFoundError`, `LoopNotFoundError`,
   `StoreReadError`, …); `errors.As` at call sites; audit auth failures and denied gates without
   logging payloads/tokens/PII. Harness now reports gate response failures authoritatively, so `serve`
@@ -460,7 +582,23 @@ The self-routing-fleet option (pods peer-forward using a `KV` directory) is reco
   strings, not numeric enums.
 - **Event-wire codec:** a fuzz target (external SSE frame → decode); tests that live `enduring`
   frames use the existing durable event payload, `ephemeral` frames never carry a `seq`, and
-  Ephemeral never round-trips through the journal.
+  Ephemeral never round-trips through the journal. Token-delta tests cover all three chunk DTOs
+  (`text`, `thinking`, `tool_use`) so `content.Chunk` never leaks into JSON via reflection.
+- **History paging:** handler tests cover absent `from`, explicit `from`, default `limit`,
+  `limit` above the hard cap rejected with 400, `next_seq`, `done`, malformed query params, and
+  replay errors mapped to typed HTTP failures.
+- **Auth/public bind:** default no-auth matches `flow/pkg/ingress`; `WithAuth` rejects before
+  touching the session/read interfaces; auth errors return sanitized 401s; a future auth module can
+  supply one authenticator function to both `flow` and `serve`. `serve.Server` timeout/TLS defaults
+  are tested separately from handler auth.
+- **Session list/read plane:** list tests cover absent `skip`, explicit `skip`, default `limit`,
+  `limit` above the hard cap rejected with 400, stable sort, `next_skip`, and `done`; `GET
+  /sessions/{sid}` tests prove the full session document comes from record replay and does not call a
+  live session/export method.
+- **Create/resume lifecycle:** `POST /sessions` tests cover idle create (`session_id` only),
+  create-with-initial-blocks (`session_id` + `command_id`, `Submit` called after attach), runner
+  failures, submit failures, malformed bodies, and `POST /sessions/{sid}/resume` reattaching the
+  resumed live session.
 - **Future sequenced seam tests (not Phase 1):** once harness/storage exposes a sequenced source,
   add replay-to-`seq`-then-attach coverage proving every `enduring` event is delivered exactly once
   across the join (no loss, no duplication), including an event appended in the join window.
@@ -477,11 +615,11 @@ The self-routing-fleet option (pods peer-forward using a `KV` directory) is reco
   same concrete hub subscription; confirm the rest of the `LiveSession` port matches existing
   `*session.Session` methods; decide the exact narrow read-plane interface over catalog/replay.
 - **Phase 1 — reshape & wrap:** move `pkg/api`'s live+control handlers into `pkg/serve` (same repo);
-  introduce the session-first `serve.New(id, s)` primitive + narrow `LiveSession` interface; add the
-  `serve.NewReader(reads)` read-plane handler (listing/history/export); delete the
-  `Factory`/many-session-create model (the registry is the multi-session path — first-class, a pod
-  hosts many; create/resume are consumer handlers over `session.Runner` + `Registry.Register`).
-  `pkg/api` is replaced by `pkg/serve`. Gate replies use a
+  introduce `serve.Handler(runner, reads, opts...)`, the narrow `LiveSession` and `Runner` interfaces,
+  an internal live-session table, and `serve.NewReader(reads)` for the read-plane route group
+  (listing/full-session-read/history); delete the `Factory`/`AgentRequest` model and public
+  attach/register surface. A pod hosts many sessions; HTTP create/resume are serve handlers over the
+  supplied compiled `session.Runner`. `pkg/api` is replaced by `pkg/serve`. Gate replies use a
   normalized `ResponseRequest`/`GateResponse` path against opaque gate ids; no `serve` gate registry
   ships.
 - **Phase 2 — ephemeral live-frame:** add the `event: ephemeral` SSE frame class over the existing
@@ -502,22 +640,25 @@ The self-routing-fleet option (pods peer-forward using a `KV` directory) is reco
    `Intent`/posture (`pkg/tools`) and the `Session` engine (`pkg/session`) are unchanged.
 2. **Name `pkg/serve`** (over keeping `api` or `host`): it is the serving layer; `api` reads generic
    and `host` blurs with the in-process path.
-3. **Session-first, not factory-first.** `serve.New(id, s)` wraps an already-built session; the
-   consumer owns create/resume via `session.Runner` (Decision #13). No `Factory`/`AgentRequest` in
-   `serve`. HTTP create/resume are consumer handlers (`Runner.Run`/`Resume` → `Registry.Register`),
-   not a `serve`-owned layer; only multi-pod *placement* is deferred to infra.
-4. **`NewSession` is the in-process method; `serve` is its over-the-wire twin.** One driven
-   surface (`*session.Session`/`serve.LiveSession`), two transports. `serve` must not add state or
-   semantics beyond what harness already exposes. In particular `GET …/events` is exactly
-   `SubscribeEvents` (live, lossy, no backlog); "from the beginning" is a store read (`…/history`),
-   not a session capability — `serve` invents neither, and does not fuse them into a replay-to-live
-   join (that is a client concern / a future sequenced-source capability). `Restore` rebuilds a
-   session from its journal to resume it; it is the consumer's, and is not an event-replay API.
-5. **Plug-and-play by construction; interface over the engine (Option B).** `serve` depends on the
-   `LiveSession` interface, **not** `pkg/session` — `*session.Session` satisfies it structurally, so
-   the consumer passes a real session while handler tests pass a fake (§11). LLM, storage backend,
-   tools, and posture are wired at the composition root and hidden behind the `LiveSession` and
-   read-plane interfaces; `serve` never imports them.
+3. **Runner-supplied, not factory-first.** `serve.Handler(runner, reads, opts...)` receives a compiled
+   runtime runner and owns HTTP create/resume by calling `Runner.Run`/`Resume`. No
+   `Factory`/`AgentRequest` in `serve`, no public attach/register API, and no agent config in the
+   serving layer; only multi-pod *placement* is deferred to infra.
+4. **`session.Compile` is design time; `Runner.Run`/`Resume` are runtime.** One driven surface
+   (`*session.Session`/`serve.LiveSession`), two transports. `serve.Handler` must not compile or own
+   agent config; it starts/resumes sessions only through the supplied runner and keeps returned live
+   sessions in an internal table. In particular `GET …/events` is exactly `SubscribeEvents` (live,
+   lossy, no
+   backlog); "from the beginning" is a store read (`…/history`), not a session capability — `serve`
+   invents neither, and does not fuse them into a replay-to-live join (that is a client concern / a
+   future sequenced-source capability). `Runner.Resume` rebuilds a session from its journal to resume
+   it; it is not an event-replay API.
+5. **Plug-and-play by construction; interfaces over the engine (Option B).** `serve` depends on the
+   `Runner` and `LiveSession` interfaces, **not** `pkg/session` — `*session.Runner` and
+   `*session.Session` satisfy them structurally, so the consumer passes the real compiled runner while
+   handler tests pass fakes (§11). LLM, storage backend, tools, and posture are wired at the
+   composition root and hidden behind the runner, live-session, and read-plane interfaces; `serve`
+   never imports them.
 6. **Posture-agnostic.** `Intent` (Interactive/Unattended) stays in harness `pkg/tools`, chosen
    at construction, discarded. Same endpoints for both modes; `ResponseRequest` POSTs are required
    when harness emits a gate event (interactive permissions or `AskUser`); `AskUser` still parks.
@@ -526,28 +667,34 @@ The self-routing-fleet option (pods peer-forward using a `KV` directory) is reco
    `GateResponse` values with durable-acceptance semantics and projects authoritative gate errors to
    status codes; it never mirrors open-gate state locally.
 8. **Ephemeral live-frame added.** `event: ephemeral` SSE frames carry token/tool-lifecycle
-   deltas (live-only, unpersisted, no `seq`). Live `enduring` frames use the existing durable event
-   payload. Exact journal `seq` on live Enduring frames is deferred until harness/storage exposes a
-   sequenced live source; `serve` must not synthesize it. The `MarshalEvent`-fails-closed-on-
-   ephemeral invariant is preserved (separate transport encoder).
+   deltas (live-only, unpersisted, no `seq`) through a live-only DTO. `TokenDelta` does not serialize
+   `content.Chunk` directly; the transport maps chunks to tagged `text` / `thinking` / `tool_use`
+   deltas. Live `enduring` frames use the existing durable event payload. Exact journal `seq` on live
+   Enduring frames is deferred until harness/storage exposes a sequenced live source; `serve` must
+   not synthesize it. The `MarshalEvent`-fails-closed-on-ephemeral invariant is preserved (separate
+   transport encoder).
 9. **SSE-out + POST-in, not WebSockets.** Asymmetric duplex fits an agent session and keeps HTTP
    affordances. WebSocket is an opt-in, evidence-driven transport layered on top of routing.
-10. **`serve` does not own routing — the consumer does.** Sessions are addressed by `session_id`;
-   routing to the owning pod is the **consumer's** deployment decision (realized in infra — future
-   helm charts / ingress). A pod may host one session or hundreds (lightweight or kernel-sandboxed
-   agents share a pod — §3c), so packing / isolation / stickiness granularity are the consumer's
-   call. `serve` states the contract (§9), exposes the enablers (`session_id` in every path;
-   read-plane statelessness), but implements no router. Affinity's *correctness* is backed by
-   harness's single-writer fencing lease; failover is `Lost()`→`Restore` from the shared journal.
+10. **`serve` does not own infrastructure routing — the consumer does.** Sessions are addressed by
+   `session_id`; routing to the owning pod is the **consumer's** deployment decision (realized in
+   infra — future helm charts / ingress). A pod may host one session or hundreds (lightweight or
+   kernel-sandboxed agents share a pod — §3c), so packing / isolation / stickiness granularity are
+   the consumer's call. `serve` provides only an internal local map from `{sid}` to `LiveSession`; it
+   does not implement cross-pod affinity, placement, or peer-forwarding.
+   Affinity's *correctness* is backed by harness's single-writer fencing lease; failover is
+   `Lost()`→`Runner.Resume` from the shared journal.
 11. **The front-end/BFF is a separate future module** that consumes `serve`. BFF concerns (token
     custody, same-origin, `sid→pod` proxying) are *not* imposed on `serve`'s consumers.
-12. **Listing/history is a read-plane handler in `serve`, backed by `sessionstore`/storage.**
-    `serve.NewReader(reads)` exposes `GET /sessions` (+ per-session metadata + cold history) over a
-    narrow adapter: `sessionstore.Catalog.ListSessions → []SessionMeta` for listing, plus
-    `Store.OpenEventReplayer`/`OpenRecordReplayer` for cold history/export. It is a *separate*,
-    stateless handler (any pod, no lease, no routing), distinct from the live `serve.New(id, s)`
-    wrap. The listing intelligence lives in `sessionstore` today over the generic storage module;
-    `serve` only projects it. The browser DTO / rich rendering stays the front-end's job.
+12. **Listing/session-read/history is a read-plane route group in `serve`, backed by
+    sessionstore/storage.** `serve.NewReader(reads)` plus `serve.Handler` exposes paged `GET
+    /sessions`, full-session `GET /sessions/{sid}`, and cold-history `GET /sessions/{sid}/history`
+    over a narrow adapter: `sessionstore.Catalog.ListSessions → []SessionMeta` for listing plus
+    `Store.OpenEventReplayer`/`OpenRecordReplayer` for raw history and reconstructed session
+    documents. It is a *separate*, stateless route group (any pod, no lease, no infrastructure
+    routing), distinct from the live/control routes backed by the internal live-session table. There
+    is no `/export` endpoint and no `LiveSession.ExportSource`; export/rendering is a helper over this
+    read plane. The listing intelligence lives in `sessionstore` today over the generic storage
+    module; `serve` only projects it. The browser DTO / rich rendering stays the front-end's job.
 13. **`session.Runner` separates design-time deps from runtime create/resume (Phase 0).** Modeled on
     `flow.Runner`: `session.Compile(cfg, store, opts…)` binds the agent definition (`loop.Config`:
     LLM, tools, posture) + deps into an immutable, reusable Runner and computes the config
@@ -557,6 +704,12 @@ The self-routing-fleet option (pods peer-forward using a `KV` directory) is reco
     unexported config — no exported `Deps`/`Config` grab-bag, matching flow's convention. Reuse
     flow's lifecycle invariants and naming discipline, not its concrete code: `flow.Runner[S]` and
     `session.Runner` do not share method signatures or state model, and a common `core.Runner`
-    interface is YAGNI until an identical method set has at least two consumers. This is why `serve`
-    needs no create layer: the consumer's handler calls `Runner.Run`/`Resume` and
-    `serve.Registry.Register`.
+    interface is YAGNI until an identical method set has at least two consumers. `serve` owns the
+    HTTP create/resume layer over that runner, while the consumer still owns compile/design time and
+    deployment placement.
+14. **Auth matches `flow/pkg/ingress`: caller-supplied request authenticator.** `serve.WithAuth`
+    accepts `func(*http.Request) error`, gates every serve-owned route before any session/read call,
+    and returns sanitized 401s. `serve` does not bake bearer tokens, principals, tenants, or
+    ownership into the package. A future auth module should expose adapters that produce the same
+    function for both `flow/ingress.WithAuth` and `serve.WithAuth`, so consumers can wire auth
+    cohesively across modules.
