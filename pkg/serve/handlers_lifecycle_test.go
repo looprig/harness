@@ -15,14 +15,18 @@ import (
 	"github.com/looprig/harness/pkg/gate"
 )
 
-// fakeSession is a test double for LiveSession: it records Submit calls and
-// returns a configured command id / error. The subscribe/gate/interrupt methods
-// satisfy the interface but are unused by the lifecycle routes.
+// fakeSession is a test double for LiveSession: it records Submit and Interrupt
+// calls and returns configured results / errors. The subscribe/gate methods
+// satisfy the interface but are unused by the lifecycle/control routes.
 type fakeSession struct {
 	submitID     uuid.UUID
 	submitErr    error
 	submitCalls  int
 	submitBlocks []content.Block
+
+	interruptResult bool
+	interruptErr    error
+	interruptCalls  int
 }
 
 func (f *fakeSession) Submit(_ context.Context, blocks []content.Block) (uuid.UUID, error) {
@@ -37,7 +41,10 @@ func (f *fakeSession) SubscribeEvents(event.EventFilter) (event.Subscription, er
 
 func (f *fakeSession) RespondGate(context.Context, gate.GateResponse) error { return nil }
 
-func (f *fakeSession) Interrupt(context.Context) (bool, error) { return false, nil }
+func (f *fakeSession) Interrupt(context.Context) (bool, error) {
+	f.interruptCalls++
+	return f.interruptResult, f.interruptErr
+}
 
 // fakeRunner is a test double for Runner[*fakeSession]: Run/Restore return the
 // configured id/session/error and count their calls, and Restore records the id it

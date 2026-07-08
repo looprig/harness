@@ -31,6 +31,8 @@ const (
 	msgRestoreFailed = "could not restore session"
 	msgInvalidSID    = "invalid session id"
 	msgNotFound      = "session not found"
+
+	msgInterruptFailed = "could not interrupt session"
 )
 
 // createRequest is the optional POST /v1/sessions body: an idle create sends no
