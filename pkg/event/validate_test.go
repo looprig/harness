@@ -74,6 +74,7 @@ func TestValidateEventValid(t *testing.T) {
 		{"TokenDelta", event.TokenDelta{Header: stepH}},
 		{"StepDone", event.StepDone{Header: stepH}},
 		{"PermissionRequested", event.PermissionRequested{Header: stepH, ToolExecutionID: toolID}},
+		{"PermissionDecided", event.PermissionDecided{Header: stepH, ToolExecutionID: toolID, Effect: event.PermissionEffectApprove}},
 		{"UserInputRequested", event.UserInputRequested{Header: stepH, ToolExecutionID: toolID}},
 		{"ToolCallStarted", event.ToolCallStarted{Header: stepH, ToolExecutionID: toolID}},
 		{"ToolCallCompleted", event.ToolCallCompleted{Header: stepH, ToolExecutionID: toolID}},

@@ -126,7 +126,7 @@ func encodePayload(ev Event) ([]byte, error) {
 		LoopIdle, LoopStarted, TurnRejected,
 		UserInputRequested, TurnInterrupted,
 		TurnStarted, TurnFoldedInto, InputCancelled, TurnDone,
-		GatePrepared, GateOpened:
+		PermissionDecided, GatePrepared, GateOpened:
 		// Every field round-trips through encoding/json directly: header + scalars/
 		// strings/slices, and for the Message-bearing four (TurnStarted/TurnFoldedInto/
 		// InputCancelled/TurnDone) the content.Message codec tags nested blocks. The
@@ -359,6 +359,8 @@ func decodePayload(tag string, data []byte) (Event, error) {
 		return decodePlain[TurnInterrupted](tag, data)
 	case "PermissionRequested":
 		return decodePermissionRequested(data)
+	case "PermissionDecided":
+		return decodePlain[PermissionDecided](tag, data)
 	case "UserInputRequested":
 		return decodePlain[UserInputRequested](tag, data)
 	case "GatePrepared":

@@ -318,16 +318,52 @@ func resolvePermission(
 		return nil
 	}
 
-	switch ts.Permission.Check(ctx, r.t, r.block.Name, r.argsstr) {
+	decision := checkPermissionDecision(ctx, r, ts)
+	switch decision.Effect {
 	case EffectAutoApprove:
+		emitPermissionDecided(r, decision, event.PermissionEffectApprove, emit)
 		applyApprovedGrants(ctx, r, ts)
 		return nil
 	case EffectDeny:
+		emitPermissionDecided(r, decision, event.PermissionEffectDeny, emit)
 		r.fail(errPermissionDenied)
 		return nil
 	default: // EffectAsk (the fail-secure zero value)
 		return askPermission(ctx, r, ts, gateReg, emit)
 	}
+}
+
+func checkPermissionDecision(ctx context.Context, r *resolved, ts ToolSet) PermissionDecision {
+	if dc, ok := ts.Permission.(interface {
+		CheckDecision(context.Context, tool.InvokableTool, string, string) PermissionDecision
+	}); ok {
+		return dc.CheckDecision(ctx, r.t, r.block.Name, r.argsstr)
+	}
+	return PermissionDecision{Effect: ts.Permission.Check(ctx, r.t, r.block.Name, r.argsstr)}
+}
+
+func emitPermissionDecided(
+	r *resolved,
+	decision PermissionDecision,
+	effect event.PermissionDecisionEffect,
+	emit func(event.Event),
+) {
+	reason := decision.Reason
+	if reason == "" {
+		switch effect {
+		case event.PermissionEffectApprove:
+			reason = "auto_approve"
+		case event.PermissionEffectDeny:
+			reason = "auto_deny"
+		}
+	}
+	emit(event.PermissionDecided{
+		ToolExecutionID: r.callID,
+		Effect:          effect,
+		Reason:          reason,
+		Subject:         r.block.Name,
+		Audit:           r.summary,
+	})
 }
 
 // applyApprovedGrants probes the gate for the OPTIONAL ApprovedGrants re-mint method
