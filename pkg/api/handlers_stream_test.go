@@ -11,11 +11,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/transcript"
 	"github.com/looprig/harness/pkg/transcript/journalsource"
-	"github.com/looprig/core/uuid"
 )
 
 // export-path leaf sentinels: errExportSource stands in for a non-unavailable
