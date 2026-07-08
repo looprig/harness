@@ -12,6 +12,7 @@ import (
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/command"
 	"github.com/looprig/harness/pkg/event"
+	gatedomain "github.com/looprig/harness/pkg/gate"
 	"github.com/looprig/harness/pkg/tool"
 )
 
@@ -363,17 +364,23 @@ func askPermission(
 	req := buildRequest(r.t, r.block.Name, r.summary, r.argsstr, r.prepared)
 
 	// reply is buffered(1) (runner is the sole reader, so the actor's routed send
-	// never blocks). ack is unbuffered: the actor closes it to signal installation.
+	// never blocks). ack carries the session-minted GateID or the prepare/activate error.
 	reply := make(chan command.Command, 1)
-	ack := make(chan struct{})
+	ack := make(chan gateInstallAck, 1)
+	g := permissionGate(r.callID, req)
+	payload := gatedomain.PermissionPayload{Request: req}
 
 	select {
-	case gateReg <- gateRegistration{callID: r.callID, reply: reply, kind: gatePermission, ack: ack}:
+	case gateReg <- gateRegistration{gate: g, payload: payload, callID: r.callID, reply: reply, kind: gatePermission, ack: ack}:
 	case <-ctx.Done():
 		return ctx.Err()
 	}
+	var installed gateInstallAck
 	select {
-	case <-ack:
+	case installed = <-ack:
+		if installed.err != nil {
+			return installed.err
+		}
 	case <-ctx.Done():
 		return ctx.Err()
 	}
@@ -384,6 +391,16 @@ func askPermission(
 
 	select {
 	case cmd := <-reply:
+		switch c := cmd.(type) {
+		case command.ApproveToolCall:
+			if !c.GateRoute.GateID.IsZero() && c.GateRoute.GateID != installed.gateID {
+				return &GateReplyMismatchError{ToolExecutionID: r.callID}
+			}
+		case command.DenyToolCall:
+			if !c.GateRoute.GateID.IsZero() && c.GateRoute.GateID != installed.gateID {
+				return &GateReplyMismatchError{ToolExecutionID: r.callID}
+			}
+		}
 		return applyDecision(ctx, r, ts, cmd)
 	case <-ctx.Done():
 		return ctx.Err()

@@ -6,11 +6,12 @@ import (
 	"log/slog"
 	"time"
 
-	"github.com/looprig/harness/pkg/command"
 	"github.com/looprig/core/content"
-	"github.com/looprig/harness/pkg/event"
-	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/core/uuid"
+	"github.com/looprig/harness/pkg/command"
+	"github.com/looprig/harness/pkg/event"
+	gatedomain "github.com/looprig/harness/pkg/gate"
+	"github.com/looprig/harness/pkg/identity"
 )
 
 // Loop is the handle to a running agent loop for internal packages.
@@ -107,6 +108,10 @@ type loopConfig struct {
 	// are never stamped (this also avoids a per-token crypto/rand call). It is a
 	// dependency wired at construction (its peer is events), defaulted by New.
 	eventFactory *event.Factory
+
+	// gates is the session-owned durable gate registrar. Loop-only tests that wire
+	// only an eventPublisher use nopGateRegistrar.
+	gates gateRegistrar
 }
 
 // idGenerator mints a fresh UUID for the loop's correlation IDs — the per-turn
@@ -198,6 +203,10 @@ func newLoopWithSeed(loopCtx context.Context, sessionID, loopID uuid.UUID, paren
 		// named types, so the conversion is explicit.
 		cfg.eventFactory = event.NewFactory(event.IDGen(cfg.idGen), cfg.now)
 	}
+	gates, ok := events.(gateRegistrar)
+	if !ok {
+		gates = nopGateRegistrar{}
+	}
 	commands := make(chan command.Command)
 	done := make(chan struct{})
 	// gateReg is unbuffered: registration is synchronous (the runner blocks on the
@@ -223,6 +232,7 @@ func newLoopWithSeed(loopCtx context.Context, sessionID, loopID uuid.UUID, paren
 		done:         done,
 		events:       events,
 		eventFactory: cfg.eventFactory,
+		gates:        gates,
 	}
 	state := newLoopState(sessionID, loopID, parent)
 	if seed != nil {
@@ -326,11 +336,10 @@ type loopState struct {
 
 	shutdownAcks []chan<- error
 
-	// pendingGates maps a tool call's ToolExecutionID to the gate a parked runner is blocked
-	// on. Owned SOLELY by runLoop/the actor — a turn goroutine never touches it. A
-	// control command (Approve/Deny/ProvideUserInput) is routed to the matching
-	// gate by ToolExecutionID AND kind, then the entry is deleted. Cleared on turn end.
-	pendingGates map[uuid.UUID]gate
+	// pendingGates maps an opaque GateID to the gate a parked runner is blocked on.
+	// Owned SOLELY by runLoop/the actor; control commands route by GateID and kind,
+	// then delete the entry. Cleared on turn end.
+	pendingGates map[gatedomain.ID]pendingGate
 }
 
 // newLoopState builds the actor-owned loop state with its identity (sessionID,
@@ -342,7 +351,7 @@ func newLoopState(sessionID, loopID uuid.UUID, parent Provenance) loopState {
 		id:           loopID,
 		sessionID:    sessionID,
 		parent:       parent,
-		pendingGates: make(map[uuid.UUID]gate),
+		pendingGates: make(map[gatedomain.ID]pendingGate),
 	}
 }
 
@@ -479,20 +488,24 @@ func runLoop(cfg loopConfig, state loopState) {
 	}
 
 	// routeControl delivers a control command (Approve/Deny/ProvideUserInput) to
-	// the parked runner blocked on its ToolExecutionID, but ONLY if a gate is open for that
-	// ToolExecutionID AND the gate kind accepts this command kind. On a match it delivers
+	// the parked runner blocked on its GateID, but ONLY if a gate is open for that
+	// GateID AND the gate kind accepts this command kind. On a match it delivers
 	// once (the gate's reply channel is buffered(1) and the runner is its sole
 	// reader, so the send never blocks the actor) and deletes the gate so a
-	// duplicate cannot deliver twice. Any miss — no gate (wrong/unknown ToolExecutionID,
+	// duplicate cannot deliver twice. Any miss — no gate (wrong/unknown GateID,
 	// stale or duplicate command) or a kind mismatch — is silently DROPPED
 	// (fail-safe): the actor never blocks and never panics.
-	routeControl := func(cmd command.Command, callID uuid.UUID) {
-		g, ok := state.pendingGates[callID]
+	routeControl := func(cmd command.Command, route command.GateRoute) {
+		gateID := route.GateID
+		if gateID.IsZero() {
+			gateID = route.ToolExecutionID
+		}
+		g, ok := state.pendingGates[gateID]
 		if !ok || !accepts(g.kind, cmd) {
 			return
 		}
 		g.reply <- cmd
-		delete(state.pendingGates, callID)
+		delete(state.pendingGates, gateID)
 	}
 
 	// clearGates drops every open gate at turn end / cancellation. A parked runner
@@ -501,7 +514,7 @@ func runLoop(cfg loopConfig, state loopState) {
 	// that a late control command for a finished turn could match.
 	clearGates := func() {
 		if len(state.pendingGates) > 0 {
-			state.pendingGates = make(map[uuid.UUID]gate)
+			state.pendingGates = make(map[gatedomain.ID]pendingGate)
 		}
 	}
 
@@ -1009,21 +1022,30 @@ func runLoop(cfg loopConfig, state loopState) {
 			// AND its kind accepts this command; any miss (unknown/stale ToolExecutionID, kind
 			// mismatch, duplicate after delivery) is silently dropped (fail-safe).
 			case command.ApproveToolCall:
-				routeControl(c, c.GateToolExecutionID())
+				routeControl(c, c.GateRoute)
 
 			case command.DenyToolCall:
-				routeControl(c, c.GateToolExecutionID())
+				routeControl(c, c.GateRoute)
 
 			case command.ProvideUserInput:
-				routeControl(c, c.GateToolExecutionID())
+				routeControl(c, c.GateRoute)
 			}
 
 		case reg := <-gateReg:
-			// Install-before-emit: record the gate under its ToolExecutionID, then close ack
-			// so the parked runner may emit its request event knowing a routed reply
-			// can no longer be dropped on a race. Only the actor touches pendingGates.
-			state.pendingGates[reg.callID] = gate{reply: reg.reply, kind: reg.kind}
-			close(reg.ack)
+			callID := reg.toolExecutionID()
+			gateID, err := cfg.gates.PrepareGateOpen(ctx, state.id, reg.gate, reg.payload)
+			if err != nil {
+				reg.ack <- gateInstallAck{err: err}
+				break
+			}
+			state.pendingGates[gateID] = pendingGate{reply: reg.reply, kind: reg.kind}
+			route := gatedomain.Route{GateID: gateID, LoopID: state.id, ToolExecutionID: callID}
+			if err := cfg.gates.ActivateGate(ctx, gateID, route); err != nil {
+				delete(state.pendingGates, gateID)
+				reg.ack <- gateInstallAck{gateID: gateID, err: err}
+				break
+			}
+			reg.ack <- gateInstallAck{gateID: gateID}
 
 		case req := <-snapshots:
 			// Committed-state query: the actor is the SOLE owner of loopState.msgs +

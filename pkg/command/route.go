@@ -1,8 +1,8 @@
 package command
 
 import (
-	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/core/uuid"
+	"github.com/looprig/harness/pkg/identity"
 )
 
 // GateRoute is the routing key for a gate reply. identity.Coordinates locates the
@@ -16,5 +16,6 @@ import (
 // ToolExecutionID, so the coordinates are the addressing envelope, not the match key.
 type GateRoute struct {
 	identity.Coordinates
+	GateID          uuid.UUID `json:"gate_id,omitzero"`
 	ToolExecutionID uuid.UUID `json:"tool_execution_id,omitzero"`
 }

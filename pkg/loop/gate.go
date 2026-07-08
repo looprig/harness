@@ -2,11 +2,13 @@ package loop
 
 import (
 	"context"
+	"strconv"
 
+	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/command"
 	"github.com/looprig/harness/pkg/event"
+	gatedomain "github.com/looprig/harness/pkg/gate"
 	"github.com/looprig/harness/pkg/tool"
-	"github.com/looprig/core/uuid"
 )
 
 // gateKind distinguishes the two kinds of parked-runner gate so runLoop can refuse
@@ -23,23 +25,58 @@ const (
 	gateUserInput
 )
 
-// gate is the actor-owned record of an open gate: the dedicated reply channel for
+// pendingGate is the actor-owned record of an open gate: the dedicated reply channel for
 // the parked runner and the kind of command it will accept. Stored in
-// loopState.pendingGates, keyed by ToolExecutionID, and touched ONLY by runLoop/the actor.
-type gate struct {
+// loopState.pendingGates, keyed by GateID, and touched ONLY by runLoop/the actor.
+type pendingGate struct {
 	reply chan<- command.Command
 	kind  gateKind
 }
 
+type gateRegistrar interface {
+	PrepareGateOpen(ctx context.Context, loopID uuid.UUID, g gatedomain.Gate, payload gatedomain.Payload) (gatedomain.ID, error)
+	ActivateGate(ctx context.Context, id gatedomain.ID, route gatedomain.Route) error
+}
+
+type nopGateRegistrar struct{}
+
+func (nopGateRegistrar) PrepareGateOpen(_ context.Context, _ uuid.UUID, g gatedomain.Gate, _ gatedomain.Payload) (gatedomain.ID, error) {
+	if !g.ID.IsZero() {
+		return g.ID, nil
+	}
+	if !g.Subject.ToolExecutionID.IsZero() {
+		return g.Subject.ToolExecutionID, nil
+	}
+	return uuid.New()
+}
+
+func (nopGateRegistrar) ActivateGate(context.Context, gatedomain.ID, gatedomain.Route) error {
+	return nil
+}
+
 // gateRegistration is the request a parked runner sends to the actor to install a
-// gate. The actor records {reply, kind} under callID, then closes ack to signal
-// install-before-emit: the runner may emit its request event only after the gate
-// is installed, so no routed reply can be dropped on a race.
+// gate. The actor prepares the gate durably through the session, records {reply,
+// kind} under the minted GateID, activates the public gate, then acks to signal
+// install-before-emit.
 type gateRegistration struct {
-	callID uuid.UUID
-	reply  chan<- command.Command
-	kind   gateKind
-	ack    chan<- struct{}
+	gate    gatedomain.Gate
+	payload gatedomain.Payload
+	callID  uuid.UUID
+	reply   chan<- command.Command
+	kind    gateKind
+	ack     chan<- gateInstallAck
+}
+
+type gateInstallAck struct {
+	gateID gatedomain.ID
+	err    error
+}
+
+func (r gateRegistration) toolExecutionID() uuid.UUID {
+	if !r.gate.Subject.ToolExecutionID.IsZero() {
+		return r.gate.Subject.ToolExecutionID
+	}
+	return r.callID
 }
 
 // accepts reports whether a control command may satisfy a gate of the given kind.
@@ -191,22 +228,28 @@ func RequestUserInput(ctx context.Context, question string, choices []string) (s
 	// reply is buffered(1) so the actor's routed send never blocks (runner is the
 	// sole reader). ack is unbuffered: the actor closes it to signal installation.
 	reply := make(chan command.Command, 1)
-	ack := make(chan struct{})
+	ack := make(chan gateInstallAck, 1)
+	g := askUserGate(callID, question, choices)
+	payload := gatedomain.AskUserPayload{Question: question, Choices: choices}
 
 	// Register synchronously, ctx-aware: no wedge if the actor is gone or the turn
 	// is cancelled.
 	select {
-	case gateReg <- gateRegistration{callID: callID, reply: reply, kind: gateUserInput, ack: ack}:
+	case gateReg <- gateRegistration{gate: g, payload: payload, callID: callID, reply: reply, kind: gateUserInput, ack: ack}:
 	case <-ctx.Done():
 		return "", ctx.Err()
 	}
+	var installed gateInstallAck
 	select {
-	case <-ack:
+	case installed = <-ack:
+		if installed.err != nil {
+			return "", installed.err
+		}
 	case <-ctx.Done():
 		return "", ctx.Err()
 	}
 
-	// Install-before-emit: only now is the gate guaranteed installed.
+	// Install-before-emit: only now is the session gate guaranteed active.
 	emit(event.UserInputRequested{ToolExecutionID: callID, Question: question, Choices: choices})
 
 	select {
@@ -214,7 +257,7 @@ func RequestUserInput(ctx context.Context, question string, choices []string) (s
 		// runLoop already matched by ToolExecutionID + kind; re-validate the ToolExecutionID as cheap
 		// defence in depth, and narrow to the concrete command for the answer.
 		pui, ok := cmd.(command.ProvideUserInput)
-		if !ok || pui.GateToolExecutionID() != callID {
+		if !ok || pui.GateToolExecutionID() != callID || (!pui.GateRoute.GateID.IsZero() && pui.GateRoute.GateID != installed.gateID) {
 			return "", &GateReplyMismatchError{ToolExecutionID: callID}
 		}
 		return pui.Answer, nil
@@ -231,4 +274,81 @@ type GateReplyMismatchError struct{ ToolExecutionID uuid.UUID }
 
 func (e *GateReplyMismatchError) Error() string {
 	return "loop: gate reply did not match expected ProvideUserInput for call " + e.ToolExecutionID.String()
+}
+
+func permissionGate(callID uuid.UUID, req tool.PermissionRequest) gatedomain.Gate {
+	return gatedomain.Gate{
+		Kind:     gatedomain.KindPermission,
+		Resolver: gatedomain.ResolverLoop,
+		Blocks:   gatedomain.BlocksToolCall,
+		Effect:   gatedomain.EffectResume,
+		Subject:  gatedomain.Subject{ToolExecutionID: callID},
+		Prompt: gatedomain.Prompt{
+			Title: "Approve tool call",
+			Body:  req.Description(),
+			Controls: []gatedomain.Control{
+				{Action: "approve", Label: "Approve"},
+				{Action: "deny", Label: "Deny"},
+			},
+			Schema: gatedomain.PromptSchema{Fields: []gatedomain.Field{
+				{
+					Name:     "scope",
+					Label:    "Scope",
+					Kind:     gatedomain.FieldSelect,
+					Required: true,
+					Options:  approvalScopeOptions(req.AllowedScopes()),
+				},
+			}},
+		},
+	}
+}
+
+func askUserGate(callID uuid.UUID, question string, choices []string) gatedomain.Gate {
+	return gatedomain.Gate{
+		Kind:     gatedomain.KindAskUser,
+		Resolver: gatedomain.ResolverLoop,
+		Blocks:   gatedomain.BlocksToolCall,
+		Effect:   gatedomain.EffectResume,
+		Subject:  gatedomain.Subject{ToolExecutionID: callID},
+		Prompt: gatedomain.Prompt{
+			Title: "User input requested",
+			Body:  question,
+			Controls: []gatedomain.Control{
+				{Action: "answer", Label: "Answer"},
+			},
+			Schema: gatedomain.PromptSchema{Fields: askUserFields(choices)},
+		},
+	}
+}
+
+func approvalScopeOptions(scopes []tool.ApprovalScope) []gatedomain.Option {
+	out := make([]gatedomain.Option, 0, len(scopes))
+	for _, scope := range scopes {
+		out = append(out, gatedomain.Option{Value: strconv.Itoa(int(scope)), Label: approvalScopeLabel(scope)})
+	}
+	return out
+}
+
+func approvalScopeLabel(scope tool.ApprovalScope) string {
+	switch scope {
+	case tool.ScopeOnce:
+		return "Once"
+	case tool.ScopeSession:
+		return "Session"
+	case tool.ScopeWorkspace:
+		return "Workspace"
+	default:
+		return strconv.Itoa(int(scope))
+	}
+}
+
+func askUserFields(choices []string) []gatedomain.Field {
+	if len(choices) == 0 {
+		return []gatedomain.Field{{Name: "answer", Label: "Answer", Kind: gatedomain.FieldText, Required: true}}
+	}
+	opts := make([]gatedomain.Option, 0, len(choices))
+	for _, choice := range choices {
+		opts = append(opts, gatedomain.Option{Value: choice, Label: choice})
+	}
+	return []gatedomain.Field{{Name: "answer", Label: "Answer", Kind: gatedomain.FieldSelect, Required: true, Options: opts}}
 }
