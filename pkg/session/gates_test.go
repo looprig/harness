@@ -2,16 +2,19 @@ package session
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/looprig/core/uuid"
+	"github.com/looprig/harness/pkg/command"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/gate"
 	"github.com/looprig/harness/pkg/hub"
 	"github.com/looprig/harness/pkg/journal"
+	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/harness/pkg/tool"
 )
 
@@ -67,15 +70,17 @@ func (f *fakeGateAppender) snapshotOpened() []event.GateOpened {
 }
 
 // gateSession builds a struct-literal Session wired to a fakeGateAppender and a
-// real hub, with a pinned clock. It returns the session, the fake appender, and
-// a loopID the gate events' loopScoped header requires.
-func gateSession(t *testing.T) (*Session, *fakeGateAppender, uuid.UUID) {
+// real hub, with a pinned clock. It returns the session, the fake appender, a
+// loopID, and the loop's command channel so RespondGate tests can verify
+// dispatch.
+func gateSession(t *testing.T) (*Session, *fakeGateAppender, uuid.UUID, chan command.Command) {
 	t.Helper()
 	id := mustUUID()
 	loopID := mustUUID()
 	sessionCtx, sessionCancel := context.WithCancel(context.Background())
 	t.Cleanup(sessionCancel)
 	app := &fakeGateAppender{}
+	cmds := make(chan command.Command, 4)
 	s := &Session{
 		SessionID:     id,
 		hub:           hub.New(id),
@@ -88,8 +93,8 @@ func gateSession(t *testing.T) (*Session, *fakeGateAppender, uuid.UUID) {
 		gates:         map[gate.ID]gateEntry{},
 	}
 	s.factory = event.NewFactory(func() (uuid.UUID, error) { return s.newID() }, func() time.Time { return s.now() })
-	s.loops[loopID] = &loopHandle{}
-	return s, app, loopID
+	s.loops[loopID] = &loopHandle{backend: &loop.Loop{Commands: cmds, Done: make(chan struct{})}}
+	return s, app, loopID, cmds
 }
 
 // permissionGate builds a representative permission gate envelope for the test
@@ -118,7 +123,7 @@ func permissionGate() gate.Gate {
 // carrying the gate and payload, and inserts a non-listable preparing entry.
 func TestGatePrepareAppendsPrivateRecordAndCreatesPreparing(t *testing.T) {
 	t.Parallel()
-	s, app, loopID := gateSession(t)
+	s, app, loopID, _ := gateSession(t)
 	payload := gate.PermissionPayload{Request: tool.BashRequest{Command: "echo ok"}}
 
 	gateID, err := s.PrepareGateOpen(context.Background(), loopID, permissionGate(), payload)
@@ -155,7 +160,7 @@ func TestGatePrepareAppendsPrivateRecordAndCreatesPreparing(t *testing.T) {
 // listable, and the minted id is not reusable.
 func TestGatePrepareAppendFailureLeavesNoDirectoryEntry(t *testing.T) {
 	t.Parallel()
-	s, app, loopID := gateSession(t)
+	s, app, loopID, _ := gateSession(t)
 	app.prepErr = errors.New("journal wedge")
 
 	_, err := s.PrepareGateOpen(context.Background(), loopID, permissionGate(), gate.PermissionPayload{})
@@ -178,7 +183,7 @@ func TestGatePrepareAppendFailureLeavesNoDirectoryEntry(t *testing.T) {
 // flips the entry to open so ListGates returns it.
 func TestGateActivateAppendsOpenedAndFlipsToOpen(t *testing.T) {
 	t.Parallel()
-	s, app, loopID := gateSession(t)
+	s, app, loopID, _ := gateSession(t)
 
 	gateID, err := s.PrepareGateOpen(context.Background(), loopID, permissionGate(), gate.PermissionPayload{Request: tool.BashRequest{Command: "echo ok"}})
 	if err != nil {
@@ -212,7 +217,7 @@ func TestGateActivateAppendsOpenedAndFlipsToOpen(t *testing.T) {
 // directory is not mutated.
 func TestGateActivateAppendFailureLeavesPreparing(t *testing.T) {
 	t.Parallel()
-	s, app, loopID := gateSession(t)
+	s, app, loopID, _ := gateSession(t)
 	app.openErr = errors.New("journal wedge")
 
 	gateID, err := s.PrepareGateOpen(context.Background(), loopID, permissionGate(), gate.PermissionPayload{})
@@ -240,7 +245,7 @@ func TestGateActivateAppendFailureLeavesPreparing(t *testing.T) {
 // prepared returns a typed not-found error and does not append.
 func TestGateActivateUnknownGateFailsSecure(t *testing.T) {
 	t.Parallel()
-	s, app, _ := gateSession(t)
+	s, app, _, _ := gateSession(t)
 
 	unknownID := gate.ID(mustUUID())
 	err := s.ActivateGate(context.Background(), unknownID, gate.Route{GateID: unknownID})
@@ -261,7 +266,7 @@ func TestGateActivateUnknownGateFailsSecure(t *testing.T) {
 // GateOpened.
 func TestGateActivateAlreadyActivatedFailsSecure(t *testing.T) {
 	t.Parallel()
-	s, app, loopID := gateSession(t)
+	s, app, loopID, _ := gateSession(t)
 
 	gateID, err := s.PrepareGateOpen(context.Background(), loopID, permissionGate(), gate.PermissionPayload{})
 	if err != nil {
@@ -290,7 +295,7 @@ func TestGateActivateAlreadyActivatedFailsSecure(t *testing.T) {
 // typed capacity error before appending.
 func TestGateCapRejectsPrepareOverLimit(t *testing.T) {
 	t.Parallel()
-	s, app, loopID := gateSession(t)
+	s, app, loopID, _ := gateSession(t)
 	s.gateCaps = GateCaps{MaxOpen: 1}
 
 	if _, err := s.PrepareGateOpen(context.Background(), loopID, permissionGate(), gate.PermissionPayload{}); err != nil {
@@ -313,7 +318,7 @@ func TestGateCapRejectsPrepareOverLimit(t *testing.T) {
 // preparing entries but not N+1.
 func TestGateCapAllowsMultiplePreparing(t *testing.T) {
 	t.Parallel()
-	s, _, loopID := gateSession(t)
+	s, _, loopID, _ := gateSession(t)
 	s.gateCaps = GateCaps{MaxOpen: 3}
 
 	for i := 0; i < 3; i++ {
@@ -370,7 +375,7 @@ func TestGateErrorTyped(t *testing.T) {
 // preparing and closed entries are excluded.
 func TestGateListGatesReturnsOnlyOpen(t *testing.T) {
 	t.Parallel()
-	s, _, loopID := gateSession(t)
+	s, _, loopID, _ := gateSession(t)
 
 	id1, err := s.PrepareGateOpen(context.Background(), loopID, permissionGate(), gate.PermissionPayload{})
 	if err != nil {
@@ -398,7 +403,7 @@ func TestGateListGatesReturnsOnlyOpen(t *testing.T) {
 // EventID/CreatedAt.
 func TestGatePrepareStampsHeaderWithSessionCoordinates(t *testing.T) {
 	t.Parallel()
-	s, app, loopID := gateSession(t)
+	s, app, loopID, _ := gateSession(t)
 
 	gateID, err := s.PrepareGateOpen(context.Background(), loopID, permissionGate(), gate.PermissionPayload{})
 	if err != nil {
@@ -423,4 +428,250 @@ func TestGatePrepareStampsHeaderWithSessionCoordinates(t *testing.T) {
 		t.Error("prepared CreatedAt is zero, want non-zero")
 	}
 	_ = gateID
+}
+
+// --- RespondGate tests ---------------------------------------------------
+
+// prepareAndActivate prepares and activates a permission gate, returning the
+// open gate id. It is the shared setup for RespondGate tests.
+func prepareAndActivate(t *testing.T, s *Session, loopID uuid.UUID, payload gate.Payload) gate.ID {
+	t.Helper()
+	gateID, err := s.PrepareGateOpen(context.Background(), loopID, permissionGate(), payload)
+	if err != nil {
+		t.Fatalf("PrepareGateOpen() error = %v", err)
+	}
+	if err := s.ActivateGate(context.Background(), gateID, gate.Route{GateID: gateID, LoopID: loopID, ToolExecutionID: mustUUID()}); err != nil {
+		t.Fatalf("ActivateGate() error = %v", err)
+	}
+	return gateID
+}
+
+// TestRespondGateApproveDispatchesCommand proves a human approve response claims
+// the open gate, appends GateResolved, and dispatches an ApproveToolCall command
+// with the extracted scope and accepted_grants.
+func TestRespondGateApproveDispatchesCommand(t *testing.T) {
+	t.Parallel()
+	s, app, loopID, cmds := gateSession(t)
+	payload := gate.PermissionPayload{Request: tool.BashRequest{
+		Command: "echo ok",
+		Grants:  []tool.GrantDisplay{{Token: "t1", Description: "network egress"}, {Token: "t2", Description: "write to /out"}},
+	}}
+	gateID := prepareAndActivate(t, s, loopID, payload)
+
+	resp := gate.GateResponse{
+		GateID: gateID,
+		Action: "approve",
+		Values: map[string]json.RawMessage{
+			"scope":           json.RawMessage(`1`),
+			"accepted_grants": json.RawMessage(`["t1","t2"]`),
+		},
+		Source: gate.ResponseSource{Kind: gate.ResponseFromUser},
+	}
+	if err := s.RespondGate(context.Background(), resp); err != nil {
+		t.Fatalf("RespondGate() error = %v", err)
+	}
+
+	cmd := recvCommand(t, cmds)
+	approve, ok := cmd.(command.ApproveToolCall)
+	if !ok {
+		t.Fatalf("dispatched command = %T, want ApproveToolCall", cmd)
+	}
+	if approve.Scope != tool.ScopeSession {
+		t.Errorf("Scope = %d, want %d (ScopeSession)", approve.Scope, tool.ScopeSession)
+	}
+	if len(approve.AcceptedGrants) != 2 || approve.AcceptedGrants[0] != "t1" || approve.AcceptedGrants[1] != "t2" {
+		t.Errorf("AcceptedGrants = %v, want [t1 t2]", approve.AcceptedGrants)
+	}
+
+	if len(app.resolved) != 1 {
+		t.Errorf("appender recorded %d resolved events, want 1", len(app.resolved))
+	}
+	if app.resolved[0].Reason != gate.CloseAnswered {
+		t.Errorf("resolved reason = %q, want %q", app.resolved[0].Reason, gate.CloseAnswered)
+	}
+}
+
+// TestRespondGateDenyDispatchesCommand proves a human deny response dispatches a
+// DenyToolCall command.
+func TestRespondGateDenyDispatchesCommand(t *testing.T) {
+	t.Parallel()
+	s, _, loopID, cmds := gateSession(t)
+	gateID := prepareAndActivate(t, s, loopID, gate.PermissionPayload{})
+
+	if err := s.RespondGate(context.Background(), gate.GateResponse{
+		GateID: gateID,
+		Action: "deny",
+		Source: gate.ResponseSource{Kind: gate.ResponseFromUser},
+	}); err != nil {
+		t.Fatalf("RespondGate() error = %v", err)
+	}
+
+	cmd := recvCommand(t, cmds)
+	if _, ok := cmd.(command.DenyToolCall); !ok {
+		t.Fatalf("dispatched command = %T, want DenyToolCall", cmd)
+	}
+}
+
+// TestRespondGateDuplicateIsStale proves a second response to an already-closed
+// gate returns a typed not-found error and does not dispatch a second command.
+func TestRespondGateDuplicateIsStale(t *testing.T) {
+	t.Parallel()
+	s, _, loopID, cmds := gateSession(t)
+	gateID := prepareAndActivate(t, s, loopID, gate.PermissionPayload{})
+
+	if err := s.RespondGate(context.Background(), gate.GateResponse{GateID: gateID, Action: "deny"}); err != nil {
+		t.Fatalf("RespondGate() #1 error = %v", err)
+	}
+	recvCommand(t, cmds)
+
+	err := s.RespondGate(context.Background(), gate.GateResponse{GateID: gateID, Action: "deny"})
+	if err == nil {
+		t.Fatal("RespondGate() #2 error = nil, want stale")
+	}
+	var ge *GateError
+	if !errors.As(err, &ge) || ge.Kind != GateNotFound {
+		t.Fatalf("RespondGate() #2 error = %v, want *GateError{GateNotFound}", err)
+	}
+
+	select {
+	case c := <-cmds:
+		t.Errorf("second response dispatched a command %T, want none", c)
+	default:
+	}
+}
+
+// TestRespondGateAppendFailureLeavesGateAnswerable proves a failed GateResolved
+// append reverts the claiming state back to open — the gate remains answerable
+// and no command is dispatched.
+func TestRespondGateAppendFailureLeavesGateAnswerable(t *testing.T) {
+	t.Parallel()
+	s, app, loopID, cmds := gateSession(t)
+	app.resolveErr = errors.New("journal wedge")
+	gateID := prepareAndActivate(t, s, loopID, gate.PermissionPayload{})
+
+	err := s.RespondGate(context.Background(), gate.GateResponse{GateID: gateID, Action: "deny"})
+	if err == nil {
+		t.Fatal("RespondGate() error = nil, want append failure")
+	}
+	var ge *GateError
+	if !errors.As(err, &ge) || ge.Kind != GateAppendFailed {
+		t.Fatalf("RespondGate() error = %v, want *GateError{GateAppendFailed}", err)
+	}
+
+	select {
+	case c := <-cmds:
+		t.Errorf("failed append dispatched a command %T, want none", c)
+	default:
+	}
+
+	got := s.ListGates(context.Background())
+	if len(got) != 1 {
+		t.Fatalf("ListGates() returned %d gates after failed append, want 1 (still answerable)", len(got))
+	}
+	if got[0].ID != gateID {
+		t.Errorf("ListGates()[0].ID = %v, want %v", got[0].ID, gateID)
+	}
+}
+
+// TestRespondGateValidatesAcceptedGrants proves a permission approve with
+// accepted_grants not in the request's GrantDisplay.Token values is rejected.
+func TestRespondGateValidatesAcceptedGrants(t *testing.T) {
+	t.Parallel()
+	s, _, loopID, cmds := gateSession(t)
+	payload := gate.PermissionPayload{Request: tool.BashRequest{
+		Command: "echo ok",
+		Grants:  []tool.GrantDisplay{{Token: "real-token", Description: "network egress"}},
+	}}
+	gateID := prepareAndActivate(t, s, loopID, payload)
+
+	err := s.RespondGate(context.Background(), gate.GateResponse{
+		GateID: gateID,
+		Action: "approve",
+		Values: map[string]json.RawMessage{
+			"scope":           json.RawMessage(`0`),
+			"accepted_grants": json.RawMessage(`["fabricated-token"]`),
+		},
+		Source: gate.ResponseSource{Kind: gate.ResponseFromUser},
+	})
+	if err == nil {
+		t.Fatal("RespondGate() error = nil, want grant validation failure")
+	}
+	var ge *GateError
+	if !errors.As(err, &ge) || ge.Kind != GateActionInvalid {
+		t.Fatalf("RespondGate() error = %v, want *GateError{GateActionInvalid}", err)
+	}
+
+	select {
+	case c := <-cmds:
+		t.Errorf("invalid grants dispatched a command %T, want none", c)
+	default:
+	}
+}
+
+// TestRespondGateUnknownGateFailsSecure proves responding to an unknown gate
+// returns a typed not-found error and does not append or dispatch.
+func TestRespondGateUnknownGateFailsSecure(t *testing.T) {
+	t.Parallel()
+	s, app, _, _ := gateSession(t)
+
+	err := s.RespondGate(context.Background(), gate.GateResponse{
+		GateID: gate.ID(mustUUID()),
+		Action: "deny",
+	})
+	if err == nil {
+		t.Fatal("RespondGate() error = nil, want not-found")
+	}
+	var ge *GateError
+	if !errors.As(err, &ge) || ge.Kind != GateNotFound {
+		t.Fatalf("RespondGate() error = %v, want *GateError{GateNotFound}", err)
+	}
+	if len(app.resolved) != 0 {
+		t.Errorf("appender recorded %d resolved events, want 0", len(app.resolved))
+	}
+}
+
+// TestRespondGatePreparingGateFailsSecure proves responding to a gate that is
+// still preparing (not yet activated) returns a typed not-ready error.
+func TestRespondGatePreparingGateFailsSecure(t *testing.T) {
+	t.Parallel()
+	s, _, loopID, _ := gateSession(t)
+	gateID, err := s.PrepareGateOpen(context.Background(), loopID, permissionGate(), gate.PermissionPayload{})
+	if err != nil {
+		t.Fatalf("PrepareGateOpen() error = %v", err)
+	}
+
+	err = s.RespondGate(context.Background(), gate.GateResponse{GateID: gateID, Action: "deny"})
+	if err == nil {
+		t.Fatal("RespondGate() error = nil, want not-ready")
+	}
+	var ge *GateError
+	if !errors.As(err, &ge) || ge.Kind != GateNotReady {
+		t.Fatalf("RespondGate() error = %v, want *GateError{GateNotReady}", err)
+	}
+}
+
+// TestRespondGateInvalidActionFailsSecure proves an action not in the gate's
+// prompt controls is rejected with a typed action-invalid error.
+func TestRespondGateInvalidActionFailsSecure(t *testing.T) {
+	t.Parallel()
+	s, _, loopID, cmds := gateSession(t)
+	gateID := prepareAndActivate(t, s, loopID, gate.PermissionPayload{})
+
+	err := s.RespondGate(context.Background(), gate.GateResponse{
+		GateID: gateID,
+		Action: "bogus",
+	})
+	if err == nil {
+		t.Fatal("RespondGate() error = nil, want action-invalid")
+	}
+	var ge *GateError
+	if !errors.As(err, &ge) || ge.Kind != GateActionInvalid {
+		t.Fatalf("RespondGate() error = %v, want *GateError{GateActionInvalid}", err)
+	}
+
+	select {
+	case c := <-cmds:
+		t.Errorf("invalid action dispatched a command %T, want none", c)
+	default:
+	}
 }

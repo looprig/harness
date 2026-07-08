@@ -2,12 +2,15 @@ package session
 
 import (
 	"context"
+	"encoding/json"
 
 	"github.com/looprig/core/uuid"
+	"github.com/looprig/harness/pkg/command"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/gate"
 	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/journal"
+	"github.com/looprig/harness/pkg/tool"
 )
 
 // gateState is the live state of a directory entry. It is never persisted — the
@@ -261,4 +264,209 @@ func (s *Session) stampGateEvent(coords identity.Coordinates, g gate.Gate) (even
 		return event.GatePrepared{}, &GateError{Kind: GateAppendFailed, Cause: err}
 	}
 	return event.GatePrepared{Header: stamped, Gate: g}, nil
+}
+
+// RespondGate claims an open gate, durably appends GateResolved, and dispatches
+// the translated command to the owning loop. It is durable-first: the GateResolved
+// append happens BEFORE the command dispatch, so a crash after the append leaves
+// the gate closed (not re-answerable) even if the command was not yet consumed.
+// A failed append reverts the in-memory claim and leaves the gate answerable.
+// Command dispatch uses s.sessionCtx (not the caller's ctx) so a client
+// disconnect after the durable commit does not cancel delivery.
+func (s *Session) RespondGate(ctx context.Context, response gate.GateResponse) error {
+	s.gatesMu.Lock()
+	entry, ok := s.gates[response.GateID]
+	if !ok {
+		s.gatesMu.Unlock()
+		return &GateError{GateID: response.GateID, Kind: GateNotFound}
+	}
+	if entry.state != gateOpen {
+		s.gatesMu.Unlock()
+		return &GateError{GateID: response.GateID, Kind: GateNotReady}
+	}
+	if !validateGateAction(entry.gate, response.Action) {
+		s.gatesMu.Unlock()
+		return &GateError{GateID: response.GateID, Kind: GateActionInvalid}
+	}
+	cmd, audit, err := s.translateGateResponse(entry, response)
+	if err != nil {
+		s.gatesMu.Unlock()
+		return err
+	}
+	entry.state = gateClaiming
+	s.gates[response.GateID] = entry
+	s.gatesMu.Unlock()
+
+	resolved, err := s.buildGateResolved(entry, response, audit)
+	if err != nil {
+		s.revertClaiming(response.GateID)
+		return err
+	}
+	if err := s.gateAppender.AppendGateResolved(ctx, resolved); err != nil {
+		s.revertClaiming(response.GateID)
+		return &GateError{GateID: response.GateID, Kind: GateAppendFailed, Cause: err}
+	}
+
+	s.gatesMu.Lock()
+	delete(s.gates, response.GateID)
+	s.gatesMu.Unlock()
+
+	return s.dispatchGateCommand(entry, cmd)
+}
+
+// revertClaiming reverts a gate from claiming back to open after a failed
+// durable append. It is safe to call after the entry was already removed.
+func (s *Session) revertClaiming(id gate.ID) {
+	s.gatesMu.Lock()
+	defer s.gatesMu.Unlock()
+	if entry, ok := s.gates[id]; ok && entry.state == gateClaiming {
+		entry.state = gateOpen
+		s.gates[id] = entry
+	}
+}
+
+// validateGateAction reports whether action matches one of the gate's prompt
+// controls. An empty action or a gate with no controls fails secure.
+func validateGateAction(g gate.Gate, action string) bool {
+	if action == "" || len(g.Prompt.Controls) == 0 {
+		return false
+	}
+	for _, c := range g.Prompt.Controls {
+		if c.Action == action {
+			return true
+		}
+	}
+	return false
+}
+
+// buildGateResolved stamps and builds the GateResolved event from the response
+// and the resolved audit. The scope is extracted from response.Values for
+// permission approve responses.
+func (s *Session) buildGateResolved(entry gateEntry, response gate.GateResponse, audit gate.ResponseAudit) (event.GateResolved, error) {
+	stamped, err := s.factory.Stamp(event.Header{Coordinates: entry.coordinates})
+	if err != nil {
+		return event.GateResolved{}, &GateError{GateID: response.GateID, Kind: GateAppendFailed, Cause: err}
+	}
+	resolved := event.GateResolved{
+		Header: stamped,
+		GateID: response.GateID,
+		Reason: gate.CloseAnswered,
+		Action: response.Action,
+		Source: response.Source,
+		Audit:  audit,
+	}
+	if raw, ok := response.Values["scope"]; ok {
+		if err := json.Unmarshal(raw, &resolved.ApprovalScope); err != nil {
+			return event.GateResolved{}, &GateError{GateID: response.GateID, Kind: GateActionInvalid, Cause: err}
+		}
+	}
+	return resolved, nil
+}
+
+// dispatchGateCommand routes the translated command to the owning loop using
+// s.sessionCtx (not the caller's ctx) so a client disconnect after the durable
+// commit does not cancel delivery.
+func (s *Session) dispatchGateCommand(entry gateEntry, cmd command.Command) error {
+	l, ok := s.loopFor(entry.route.LoopID)
+	if !ok {
+		return &SessionError{Kind: SessionLoopNotFound}
+	}
+	return s.routeGate(s.sessionCtx, entry.route.LoopID, l, cmd)
+}
+
+// translateGateResponse validates the payload-specific parts of the response and
+// builds the translated command and the redacted audit. It returns a typed
+// *GateError on validation failure (invalid grants, missing values, unknown kind).
+func (s *Session) translateGateResponse(entry gateEntry, response gate.GateResponse) (command.Command, gate.ResponseAudit, error) {
+	cmdID, err := s.newCommandID()
+	if err != nil {
+		return nil, nil, &GateError{GateID: response.GateID, Kind: GateAppendFailed, Cause: err}
+	}
+	hdr := command.Header{CommandID: cmdID, Agency: identity.AgencyUser, CreatedAt: s.stampNow()}
+	route := command.GateRoute{
+		Coordinates:     identity.Coordinates{SessionID: entry.coordinates.SessionID, LoopID: entry.coordinates.LoopID},
+		ToolExecutionID: uuid.UUID(entry.route.ToolExecutionID),
+	}
+	switch entry.gate.Kind {
+	case gate.KindPermission:
+		return s.translatePermissionResponse(hdr, route, entry.payload, response)
+	case gate.KindAskUser:
+		return s.translateAskUserResponse(hdr, route, response)
+	default:
+		return nil, nil, &GateError{GateID: response.GateID, Kind: GateKindMismatch}
+	}
+}
+
+// translatePermissionResponse builds an ApproveToolCall or DenyToolCall from a
+// permission gate response. For approve, it extracts scope and accepted_grants
+// from Values and validates the grants against the payload's request.
+func (s *Session) translatePermissionResponse(hdr command.Header, route command.GateRoute, payload gate.Payload, response gate.GateResponse) (command.Command, gate.ResponseAudit, error) {
+	switch response.Action {
+	case "approve":
+		scope, grants, audit, err := validatePermissionApprove(payload, response)
+		if err != nil {
+			return nil, nil, err
+		}
+		return command.ApproveToolCall{Header: hdr, GateRoute: route, Scope: scope, AcceptedGrants: grants}, audit, nil
+	case "deny":
+		return command.DenyToolCall{Header: hdr, GateRoute: route}, nil, nil
+	default:
+		return nil, nil, &GateError{GateID: response.GateID, Kind: GateActionInvalid}
+	}
+}
+
+// translateAskUserResponse builds a ProvideUserInput from an ask-user gate
+// response. It extracts the answer from Values["answer"].
+func (s *Session) translateAskUserResponse(hdr command.Header, route command.GateRoute, response gate.GateResponse) (command.Command, gate.ResponseAudit, error) {
+	var answer string
+	if raw, ok := response.Values["answer"]; ok {
+		if err := json.Unmarshal(raw, &answer); err != nil {
+			return nil, nil, &GateError{GateID: response.GateID, Kind: GateActionInvalid, Cause: err}
+		}
+	}
+	preview := answer
+	if len(preview) > 80 {
+		preview = preview[:80]
+	}
+	return command.ProvideUserInput{Header: hdr, GateRoute: route, Answer: answer}, gate.AskUserAudit{AnswerPreview: preview}, nil
+}
+
+// validatePermissionApprove extracts scope and accepted_grants from the response
+// Values, validates the grant tokens against the payload's BashRequest.Grants,
+// and builds the PermissionAudit from the accepted grant descriptions (not
+// tokens). An accepted grant not in the request's Grants fails secure.
+func validatePermissionApprove(payload gate.Payload, response gate.GateResponse) (tool.ApprovalScope, []string, gate.ResponseAudit, error) {
+	scope := tool.ScopeOnce
+	if raw, ok := response.Values["scope"]; ok {
+		if err := json.Unmarshal(raw, &scope); err != nil {
+			return 0, nil, nil, &GateError{GateID: response.GateID, Kind: GateActionInvalid, Cause: err}
+		}
+	}
+	var grants []string
+	if raw, ok := response.Values["accepted_grants"]; ok {
+		if err := json.Unmarshal(raw, &grants); err != nil {
+			return 0, nil, nil, &GateError{GateID: response.GateID, Kind: GateActionInvalid, Cause: err}
+		}
+	}
+	permPayload, ok := payload.(gate.PermissionPayload)
+	if !ok {
+		return scope, grants, gate.PermissionAudit{}, nil
+	}
+	bashReq, ok := permPayload.Request.(tool.BashRequest)
+	if !ok {
+		return scope, grants, gate.PermissionAudit{}, nil
+	}
+	validTokens := make(map[string]string, len(bashReq.Grants))
+	for _, g := range bashReq.Grants {
+		validTokens[g.Token] = g.Description
+	}
+	descs := make([]string, 0, len(grants))
+	for _, t := range grants {
+		desc, exists := validTokens[t]
+		if !exists {
+			return 0, nil, nil, &GateError{GateID: response.GateID, Kind: GateActionInvalid}
+		}
+		descs = append(descs, desc)
+	}
+	return scope, grants, gate.PermissionAudit{AcceptedGrantDescriptions: descs}, nil
 }
