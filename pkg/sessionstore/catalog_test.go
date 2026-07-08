@@ -12,6 +12,7 @@ import (
 
 	"github.com/looprig/core/content"
 	"github.com/looprig/harness/pkg/event"
+	"github.com/looprig/harness/pkg/gate"
 	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/journal"
 	"github.com/looprig/core/uuid"
@@ -322,12 +323,336 @@ func TestApplyEvent(t *testing.T) {
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			got, changed := applyEvent(tt.start, tt.ev, fixedClock(active))
+			got, changed := applyEvent(tt.start, tt.ev, 0, fixedClock(active))
 			if changed != tt.wantChanged {
 				t.Fatalf("applyEvent changed = %v, want %v", changed, tt.wantChanged)
 			}
 			tt.check(t, got)
 		})
+	}
+}
+
+// hdrTurn builds an event.Header carrying the session and an active turn id — the
+// coordinates a turn-scoped catalog event needs for the status fold's ActiveTurnID.
+func hdrTurn(sid, tid uuid.UUID) event.Header {
+	return event.Header{Coordinates: identity.Coordinates{SessionID: sid, TurnID: tid}}
+}
+
+// TestApplyEventStatusFold covers the status projection: each catalog-relevant event
+// maps to the derived State / LastJournalSeq / ActiveTurnID / WaitingGateID / summary
+// fields. It is pure (clock + seq injected), so it needs no KV.
+func TestApplyEventStatusFold(t *testing.T) {
+	t.Parallel()
+	sid := fixedUUID(0x01)
+	tid := fixedUUID(0x0A)
+	gid := fixedUUID(0x0B)
+	created := time.Date(2026, 7, 8, 8, 0, 0, 0, time.UTC)
+	clock := time.Date(2026, 7, 8, 9, 0, 0, 0, time.UTC)
+
+	tests := []struct {
+		name        string
+		start       SessionMeta
+		ev          event.Event
+		seq         uint64
+		wantChanged bool
+		check       func(*testing.T, SessionMeta)
+	}{
+		{
+			name: "SessionStarted folds to idle",
+			ev: event.SessionStarted{
+				Header: event.Header{Coordinates: identity.Coordinates{SessionID: sid}, CreatedAt: created},
+				Config: event.ConfigFingerprint{ModelID: "m"},
+			},
+			seq:         5,
+			wantChanged: true,
+			check: func(t *testing.T, m SessionMeta) {
+				if m.State != StateIdle {
+					t.Errorf("State = %q, want idle", m.State)
+				}
+				if m.LastJournalSeq != 5 {
+					t.Errorf("LastJournalSeq = %d, want 5", m.LastJournalSeq)
+				}
+			},
+		},
+		{
+			name:        "TurnStarted folds to running and sets ActiveTurnID",
+			start:       SessionMeta{SessionID: sid, State: StateIdle},
+			ev:          event.TurnStarted{Header: hdrTurn(sid, tid), Message: userMsg("go")},
+			seq:         6,
+			wantChanged: true,
+			check: func(t *testing.T, m SessionMeta) {
+				if m.State != StateRunning {
+					t.Errorf("State = %q, want running", m.State)
+				}
+				if m.ActiveTurnID != tid {
+					t.Errorf("ActiveTurnID = %v, want %v", m.ActiveTurnID, tid)
+				}
+				if m.LastJournalSeq != 6 {
+					t.Errorf("LastJournalSeq = %d, want 6", m.LastJournalSeq)
+				}
+			},
+		},
+		{
+			name:        "GateOpened folds to waiting_on_gate and sets WaitingGateID",
+			start:       SessionMeta{SessionID: sid, State: StateRunning, ActiveTurnID: tid},
+			ev:          event.GateOpened{Header: hdr(sid), Gate: gate.Gate{ID: gid}},
+			seq:         7,
+			wantChanged: true,
+			check: func(t *testing.T, m SessionMeta) {
+				if m.State != StateWaitingOnGate {
+					t.Errorf("State = %q, want waiting_on_gate", m.State)
+				}
+				if m.WaitingGateID != gid {
+					t.Errorf("WaitingGateID = %v, want %v", m.WaitingGateID, gid)
+				}
+			},
+		},
+		{
+			name:        "GateResolved clears gate and returns to running with an active turn",
+			start:       SessionMeta{SessionID: sid, State: StateWaitingOnGate, WaitingGateID: gid, ActiveTurnID: tid},
+			ev:          event.GateResolved{Header: hdr(sid), GateID: gid},
+			seq:         8,
+			wantChanged: true,
+			check: func(t *testing.T, m SessionMeta) {
+				if !m.WaitingGateID.IsZero() {
+					t.Errorf("WaitingGateID = %v, want cleared", m.WaitingGateID)
+				}
+				if m.State != StateRunning {
+					t.Errorf("State = %q, want running (active turn)", m.State)
+				}
+			},
+		},
+		{
+			name:        "GateResolved with no active turn returns to idle",
+			start:       SessionMeta{SessionID: sid, State: StateWaitingOnGate, WaitingGateID: gid},
+			ev:          event.GateResolved{Header: hdr(sid), GateID: gid},
+			seq:         9,
+			wantChanged: true,
+			check: func(t *testing.T, m SessionMeta) {
+				if !m.WaitingGateID.IsZero() {
+					t.Errorf("WaitingGateID = %v, want cleared", m.WaitingGateID)
+				}
+				if m.State != StateIdle {
+					t.Errorf("State = %q, want idle (no active turn)", m.State)
+				}
+			},
+		},
+		{
+			name:        "TurnDone folds to idle, records LastTurn, clears ActiveTurnID",
+			start:       SessionMeta{SessionID: sid, State: StateRunning, ActiveTurnID: tid},
+			ev:          event.TurnDone{Header: hdrTurn(sid, tid)},
+			seq:         10,
+			wantChanged: true,
+			check: func(t *testing.T, m SessionMeta) {
+				if m.State != StateIdle {
+					t.Errorf("State = %q, want idle", m.State)
+				}
+				if !m.ActiveTurnID.IsZero() {
+					t.Errorf("ActiveTurnID = %v, want cleared", m.ActiveTurnID)
+				}
+				if m.LastTurn == nil || m.LastTurn.JournalSeq != 10 || len(m.LastTurn.Event) == 0 {
+					t.Errorf("LastTurn = %+v, want summary at seq 10 with event bytes", m.LastTurn)
+				}
+			},
+		},
+		{
+			name:        "TurnFailed folds to failed and records LastTurn",
+			start:       SessionMeta{SessionID: sid, State: StateRunning},
+			ev:          event.TurnFailed{Header: hdrTurn(sid, tid)},
+			seq:         11,
+			wantChanged: true,
+			check: func(t *testing.T, m SessionMeta) {
+				if m.State != StateFailed {
+					t.Errorf("State = %q, want failed", m.State)
+				}
+				if m.LastTurn == nil || m.LastTurn.JournalSeq != 11 {
+					t.Errorf("LastTurn = %+v, want summary at seq 11", m.LastTurn)
+				}
+			},
+		},
+		{
+			name:        "TurnInterrupted folds to interrupted",
+			start:       SessionMeta{SessionID: sid, State: StateRunning},
+			ev:          event.TurnInterrupted{Header: hdrTurn(sid, tid)},
+			seq:         12,
+			wantChanged: true,
+			check: func(t *testing.T, m SessionMeta) {
+				if m.State != StateInterrupted {
+					t.Errorf("State = %q, want interrupted", m.State)
+				}
+			},
+		},
+		{
+			name:        "SessionStopped folds to stopped (terminal wins)",
+			start:       SessionMeta{SessionID: sid, State: StateRunning, Status: StatusActive},
+			ev:          event.SessionStopped{Header: hdr(sid)},
+			seq:         13,
+			wantChanged: true,
+			check: func(t *testing.T, m SessionMeta) {
+				if m.State != StateStopped {
+					t.Errorf("State = %q, want stopped", m.State)
+				}
+				if m.Status != StatusStopped {
+					t.Errorf("Status = %q, want stopped", m.Status)
+				}
+			},
+		},
+		{
+			name:        "StepDone records LastStep and bumps LastJournalSeq",
+			start:       SessionMeta{SessionID: sid, LastJournalSeq: 3},
+			ev:          event.StepDone{Header: hdr(sid)},
+			seq:         20,
+			wantChanged: true,
+			check: func(t *testing.T, m SessionMeta) {
+				if m.LastStep == nil || m.LastStep.JournalSeq != 20 || len(m.LastStep.Event) == 0 {
+					t.Errorf("LastStep = %+v, want summary at seq 20 with event bytes", m.LastStep)
+				}
+				if m.LastJournalSeq != 20 {
+					t.Errorf("LastJournalSeq = %d, want 20", m.LastJournalSeq)
+				}
+			},
+		},
+		{
+			name:        "unrelated event is a no-op leaving state untouched",
+			start:       SessionMeta{SessionID: sid, State: StateRunning, LastJournalSeq: 50},
+			ev:          event.SessionActive{Header: hdr(sid)},
+			seq:         99,
+			wantChanged: false,
+			check: func(t *testing.T, m SessionMeta) {
+				if m.State != StateRunning {
+					t.Errorf("State = %q, want unchanged running", m.State)
+				}
+				if m.LastJournalSeq != 50 {
+					t.Errorf("LastJournalSeq = %d, want unchanged 50 (no-op)", m.LastJournalSeq)
+				}
+			},
+		},
+		{
+			name:        "lower seq does not lower LastJournalSeq (monotonic max)",
+			start:       SessionMeta{SessionID: sid, State: StateIdle, LastJournalSeq: 100},
+			ev:          event.StepDone{Header: hdr(sid)},
+			seq:         5,
+			wantChanged: true,
+			check: func(t *testing.T, m SessionMeta) {
+				if m.LastJournalSeq != 100 {
+					t.Errorf("LastJournalSeq = %d, want 100 (max wins)", m.LastJournalSeq)
+				}
+			},
+		},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got, changed := applyEvent(tt.start, tt.ev, tt.seq, fixedClock(clock))
+			if changed != tt.wantChanged {
+				t.Fatalf("applyEvent changed = %v, want %v", changed, tt.wantChanged)
+			}
+			tt.check(t, got)
+		})
+	}
+}
+
+// TestSessionMetaStatusRoundTrip proves a SessionMeta carrying the status-fold fields —
+// State, ActiveTurnID, WaitingGateID, and the codec-safe LastTurn/LastStep summaries —
+// survives the package's DisallowUnknownFields decode path (decodeSessionMeta) and that
+// a summary's opaque event bytes reconstruct losslessly via event.UnmarshalEvent (the
+// A4 RawMessage resolution).
+func TestSessionMetaStatusRoundTrip(t *testing.T) {
+	t.Parallel()
+	sid := fixedUUID(0x21)
+	tid := fixedUUID(0x22)
+	gid := fixedUUID(0x23)
+	lid := fixedUUID(0x25)
+
+	// Fully-valid turn/step events so the reconstructed event survives ValidateEvent (run
+	// by UnmarshalEvent): turnProfile needs SessionID+LoopID+TurnID; stepProfile also needs
+	// StepID; both need EventID.
+	turnEv := event.TurnDone{Header: event.Header{
+		Coordinates: identity.Coordinates{SessionID: sid, LoopID: lid, TurnID: tid},
+		EventID:     fixedUUID(0x26),
+	}}
+	stepEv := event.StepDone{Header: event.Header{
+		Coordinates: identity.Coordinates{SessionID: sid, LoopID: lid, TurnID: tid, StepID: fixedUUID(0x27)},
+		EventID:     fixedUUID(0x28),
+	}}
+	turnSum, err := newEventSummary(turnEv, 10)
+	if err != nil {
+		t.Fatalf("newEventSummary(TurnDone) = %v", err)
+	}
+	stepSum, err := newEventSummary(stepEv, 11)
+	if err != nil {
+		t.Fatalf("newEventSummary(StepDone) = %v", err)
+	}
+	meta := SessionMeta{
+		SessionID:      sid,
+		Status:         StatusActive,
+		State:          StateWaitingOnGate,
+		LastJournalSeq: 12,
+		ActiveTurnID:   tid,
+		WaitingGateID:  gid,
+		LastTurn:       turnSum,
+		LastStep:       stepSum,
+	}
+
+	data, err := encodeSessionMeta(meta)
+	if err != nil {
+		t.Fatalf("encodeSessionMeta = %v", err)
+	}
+	got, err := decodeSessionMeta(data)
+	if err != nil {
+		t.Fatalf("decodeSessionMeta (DisallowUnknownFields) = %v, want nil", err)
+	}
+	if got.State != StateWaitingOnGate || got.LastJournalSeq != 12 {
+		t.Errorf("decoded state/seq = %q/%d, want waiting_on_gate/12", got.State, got.LastJournalSeq)
+	}
+	if got.ActiveTurnID != tid || got.WaitingGateID != gid {
+		t.Errorf("decoded ids = %v/%v, want %v/%v", got.ActiveTurnID, got.WaitingGateID, tid, gid)
+	}
+	if got.LastTurn == nil || got.LastTurn.JournalSeq != 10 {
+		t.Fatalf("decoded LastTurn = %+v, want summary at seq 10", got.LastTurn)
+	}
+	if got.LastStep == nil || got.LastStep.JournalSeq != 11 {
+		t.Fatalf("decoded LastStep = %+v, want summary at seq 11", got.LastStep)
+	}
+	// Lossless reconstruction: the opaque event bytes decode back to the concrete event.
+	ev, err := event.UnmarshalEvent(got.LastTurn.Event)
+	if err != nil {
+		t.Fatalf("UnmarshalEvent(LastTurn.Event) = %v", err)
+	}
+	if _, ok := ev.(event.TurnDone); !ok {
+		t.Errorf("reconstructed LastTurn event = %T, want event.TurnDone", ev)
+	}
+}
+
+// TestReadMeta proves ReadMeta is a projection-only single-key read: an absent id yields
+// found=false with no error, and a present id yields the projected meta.
+func TestReadMeta(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 7, 8, 10, 0, 0, 0, time.UTC)
+	c, sid := newTestCatalog(t, now)
+	ctx := context.Background()
+
+	if _, found, err := c.ReadMeta(ctx, fixedUUID(0x77)); err != nil || found {
+		t.Fatalf("ReadMeta(absent) = found=%v err=%v, want found=false nil", found, err)
+	}
+
+	started := event.SessionStarted{
+		Header: event.Header{Coordinates: identity.Coordinates{SessionID: sid}, CreatedAt: now},
+		Config: event.ConfigFingerprint{ModelID: "m"},
+	}
+	if err := c.UpdateOnEvent(ctx, started, 4); err != nil {
+		t.Fatalf("UpdateOnEvent = %v", err)
+	}
+	meta, found, err := c.ReadMeta(ctx, sid)
+	if err != nil || !found {
+		t.Fatalf("ReadMeta(present) = found=%v err=%v, want found=true nil", found, err)
+	}
+	if meta.SessionID != sid || meta.State != StateIdle || meta.Status != StatusActive {
+		t.Errorf("ReadMeta present meta = %+v, want idle/active for %v", meta, sid)
+	}
+	if meta.LastJournalSeq != 4 {
+		t.Errorf("LastJournalSeq = %d, want 4 (threaded from UpdateOnEvent)", meta.LastJournalSeq)
 	}
 }
 
