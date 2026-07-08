@@ -12,6 +12,7 @@ import (
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/command"
 	"github.com/looprig/harness/pkg/event"
+	"github.com/looprig/harness/pkg/gate"
 	"github.com/looprig/harness/pkg/hub"
 	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/loop"
@@ -494,21 +495,20 @@ func TestLoopFor(t *testing.T) {
 // no-op case (returns (false, nil)), NOT a SessionLoopNotFound error — there is no
 // longer a single-target miss to guard. Its every-loop fan-out is covered by
 // TestInterruptReachesEveryLoop.
+//
+// The Approve/Deny/ProvideUserInput trio was removed: those resolved the target
+// loop by id via resolveGate (also removed). Their replacement, RespondGate,
+// addresses a gate by GateID and — being durable-first — treats a post-append
+// dispatch-loop miss as a nil return (the response is already durably accepted),
+// not a SessionLoopNotFound; that path is covered by
+// TestRespondGateReturnsNilAfterDurableAppendWhenDispatchFails.
 func TestRoutingMethodsLoopNotFound(t *testing.T) {
 	t.Parallel()
-	callID := mustUUID()
 	tests := []struct {
 		name string
 		call func(s *Session) error
 	}{
 		{name: "Submit", call: func(s *Session) error { _, err := s.Submit(context.Background(), nil); return err }},
-		// Approve/Deny/ProvideUserInput resolve the target loop by id (the primary
-		// here), which misses once the primary entry is deleted below.
-		{name: "Approve", call: func(s *Session) error {
-			return s.Approve(context.Background(), s.primaryLoopID, callID, tool.ScopeOnce)
-		}},
-		{name: "Deny", call: func(s *Session) error { return s.Deny(context.Background(), s.primaryLoopID, callID) }},
-		{name: "ProvideUserInput", call: func(s *Session) error { return s.ProvideUserInput(context.Background(), s.primaryLoopID, callID, "x") }},
 	}
 	for _, tt := range tests {
 		tt := tt
@@ -1061,28 +1061,30 @@ func mustUUID() uuid.UUID {
 	return id
 }
 
-// TestGateCommandsSendCorrectCommand asserts each gate-answer method sends the
-// correct command type to loop.Commands, stamped with a fresh non-zero Header.ID
-// and the right ToolExecutionID/Scope/Answer, and returns nil. The fake loop's Commands
-// channel captures the exact command sent (these are fire-and-route — no Ack — so
-// this is the only observable effect).
+// TestGateCommandsSendCorrectCommand asserts RespondGate dispatches the correct
+// command type to the owning loop's Commands channel, stamped with a fresh
+// non-zero Header.ID and the right ToolExecutionID (from the gate's route) plus
+// Scope/Answer, and returns nil. The loop's Commands channel captures the exact
+// command dispatched. (This replaces the removed Approve/Deny/ProvideUserInput
+// trio, which sent these same commands directly.)
 func TestGateCommandsSendCorrectCommand(t *testing.T) {
 	t.Parallel()
-	callID := mustUUID()
 	tests := []struct {
-		name   string
-		call   func(s *Session) error
-		verify func(t *testing.T, cmd command.Command)
+		name    string
+		gate    gate.Gate
+		payload gate.Payload
+		respond func(gateID gate.ID) gate.GateResponse
+		verify  func(t *testing.T, cmd command.Command, callID uuid.UUID)
 	}{
 		{
-			name: "Approve",
-			call: func(s *Session) error {
-				return s.Approve(context.Background(), s.primaryLoopID, callID, tool.ScopeSession)
-			},
-			verify: func(t *testing.T, cmd command.Command) {
+			name:    "approve",
+			gate:    permissionGate(),
+			payload: bashPayload(),
+			respond: func(gateID gate.ID) gate.GateResponse { return userApprove(gateID, "session") },
+			verify: func(t *testing.T, cmd command.Command, callID uuid.UUID) {
 				c, ok := cmd.(command.ApproveToolCall)
 				if !ok {
-					t.Fatalf("sent %T, want command.ApproveToolCall", cmd)
+					t.Fatalf("dispatched %T, want command.ApproveToolCall", cmd)
 				}
 				if c.ToolExecutionID != callID {
 					t.Errorf("ToolExecutionID = %v, want %v", c.ToolExecutionID, callID)
@@ -1096,12 +1098,14 @@ func TestGateCommandsSendCorrectCommand(t *testing.T) {
 			},
 		},
 		{
-			name: "Deny",
-			call: func(s *Session) error { return s.Deny(context.Background(), s.primaryLoopID, callID) },
-			verify: func(t *testing.T, cmd command.Command) {
+			name:    "deny",
+			gate:    permissionGate(),
+			payload: bashPayload(),
+			respond: userDeny,
+			verify: func(t *testing.T, cmd command.Command, callID uuid.UUID) {
 				c, ok := cmd.(command.DenyToolCall)
 				if !ok {
-					t.Fatalf("sent %T, want command.DenyToolCall", cmd)
+					t.Fatalf("dispatched %T, want command.DenyToolCall", cmd)
 				}
 				if c.ToolExecutionID != callID {
 					t.Errorf("ToolExecutionID = %v, want %v", c.ToolExecutionID, callID)
@@ -1112,14 +1116,14 @@ func TestGateCommandsSendCorrectCommand(t *testing.T) {
 			},
 		},
 		{
-			name: "ProvideUserInput",
-			call: func(s *Session) error {
-				return s.ProvideUserInput(context.Background(), s.primaryLoopID, callID, "the answer")
-			},
-			verify: func(t *testing.T, cmd command.Command) {
+			name:    "answer",
+			gate:    askUserGate(),
+			payload: askUserPayload(),
+			respond: func(gateID gate.ID) gate.GateResponse { return userAnswer(gateID, "the answer") },
+			verify: func(t *testing.T, cmd command.Command, callID uuid.UUID) {
 				c, ok := cmd.(command.ProvideUserInput)
 				if !ok {
-					t.Fatalf("sent %T, want command.ProvideUserInput", cmd)
+					t.Fatalf("dispatched %T, want command.ProvideUserInput", cmd)
 				}
 				if c.ToolExecutionID != callID {
 					t.Errorf("ToolExecutionID = %v, want %v", c.ToolExecutionID, callID)
@@ -1137,101 +1141,117 @@ func TestGateCommandsSendCorrectCommand(t *testing.T) {
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			s, cmds, _ := sessionWithFakeLoop()
+			s, _, loopID, cmds := gateSession(t)
+			callID := mustUUID()
+			gateID := activateOn(t, s, loopID, callID, tt.gate, tt.payload)
 
 			errCh := make(chan error, 1)
-			go func() { errCh <- tt.call(s) }()
+			go func() { errCh <- s.RespondGate(context.Background(), tt.respond(gateID)) }()
 
 			select {
 			case cmd := <-cmds:
-				tt.verify(t, cmd)
+				tt.verify(t, cmd, callID)
 			case <-time.After(2 * time.Second):
-				t.Fatal("method never sent a command")
+				t.Fatal("RespondGate never dispatched a command")
 			}
 
 			select {
 			case err := <-errCh:
 				if err != nil {
-					t.Fatalf("method returned %v, want nil", err)
+					t.Fatalf("RespondGate returned %v, want nil", err)
 				}
 			case <-time.After(2 * time.Second):
-				t.Fatal("method never returned after send")
+				t.Fatal("RespondGate never returned after dispatch")
 			}
 		})
 	}
 }
 
-// TestGateCommandsFreshHeaderIDPerCall asserts each method mints a distinct
-// Header.ID on every invocation (fresh per command, not reused).
+// TestGateCommandsFreshHeaderIDPerCall asserts RespondGate mints a distinct
+// Header.ID on every dispatched command (fresh per command, not reused). Since a
+// gate answers only once, each of the two responses answers its own freshly
+// prepared+activated gate. (This replaces the removed trio.)
 func TestGateCommandsFreshHeaderIDPerCall(t *testing.T) {
 	t.Parallel()
-	callID := mustUUID()
 	tests := []struct {
-		name string
-		call func(s *Session) error
+		name    string
+		gate    gate.Gate
+		payload gate.Payload
+		respond func(gateID gate.ID) gate.GateResponse
 	}{
-		{name: "Approve", call: func(s *Session) error {
-			return s.Approve(context.Background(), s.primaryLoopID, callID, tool.ScopeOnce)
-		}},
-		{name: "Deny", call: func(s *Session) error { return s.Deny(context.Background(), s.primaryLoopID, callID) }},
-		{name: "ProvideUserInput", call: func(s *Session) error { return s.ProvideUserInput(context.Background(), s.primaryLoopID, callID, "x") }},
+		{name: "approve", gate: permissionGate(), payload: bashPayload(), respond: func(gateID gate.ID) gate.GateResponse { return userApprove(gateID, "once") }},
+		{name: "deny", gate: permissionGate(), payload: bashPayload(), respond: userDeny},
+		{name: "answer", gate: askUserGate(), payload: askUserPayload(), respond: func(gateID gate.ID) gate.GateResponse { return userAnswer(gateID, "x") }},
 	}
 	for _, tt := range tests {
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			s, cmds, _ := sessionWithFakeLoop()
+			s, _, loopID, cmds := gateSession(t)
 
 			ids := make([]uuid.UUID, 0, 2)
 			for i := 0; i < 2; i++ {
+				gateID := activateOn(t, s, loopID, mustUUID(), tt.gate, tt.payload)
 				errCh := make(chan error, 1)
-				go func() { errCh <- tt.call(s) }()
+				go func() { errCh <- s.RespondGate(context.Background(), tt.respond(gateID)) }()
 				select {
 				case cmd := <-cmds:
 					ids = append(ids, cmd.CommandHeader().CommandID)
 				case <-time.After(2 * time.Second):
-					t.Fatal("method never sent a command")
+					t.Fatal("RespondGate never dispatched a command")
 				}
 				if err := <-errCh; err != nil {
-					t.Fatalf("method returned %v, want nil", err)
+					t.Fatalf("RespondGate returned %v, want nil", err)
 				}
 			}
 			if ids[0] == ids[1] {
-				t.Fatalf("two calls reused Header.ID %v, want fresh ids", ids[0])
+				t.Fatalf("two responses reused Header.ID %v, want fresh ids", ids[0])
 			}
 		})
 	}
 }
 
-// TestGateCommandsCtxCancelled: a cancelled ctx makes each method return
-// *SessionError{SessionContextDone} without blocking and without sending a
-// command (the fake loop's Commands channel is never read).
-func TestGateCommandsCtxCancelled(t *testing.T) {
-	t.Parallel()
-	callID := mustUUID()
-	tests := []struct {
+// gateCommands returns representative gate commands, one per dispatched shape, so
+// the routeGate escape-hatch tests can prove the select behaves uniformly for
+// each command type the gate machinery routes.
+func gateCommands() []struct {
+	name string
+	cmd  command.Command
+} {
+	return []struct {
 		name string
-		call func(s *Session, ctx context.Context) error
+		cmd  command.Command
 	}{
-		{name: "Approve", call: func(s *Session, ctx context.Context) error {
-			return s.Approve(ctx, s.primaryLoopID, callID, tool.ScopeOnce)
-		}},
-		{name: "Deny", call: func(s *Session, ctx context.Context) error { return s.Deny(ctx, s.primaryLoopID, callID) }},
-		{name: "ProvideUserInput", call: func(s *Session, ctx context.Context) error {
-			return s.ProvideUserInput(ctx, s.primaryLoopID, callID, "x")
-		}},
+		{name: "ApproveToolCall", cmd: command.ApproveToolCall{Header: command.Header{CommandID: mustUUID()}}},
+		{name: "DenyToolCall", cmd: command.DenyToolCall{Header: command.Header{CommandID: mustUUID()}}},
+		{name: "ProvideUserInput", cmd: command.ProvideUserInput{Header: command.Header{CommandID: mustUUID()}}},
 	}
-	for _, tt := range tests {
+}
+
+// TestRouteGateCtxCancelled: a cancelled ctx makes routeGate return
+// *SessionError{SessionContextDone} without blocking and without sending (the
+// loop's Commands channel is never read). This exercises routeGate directly
+// because the Approve/Deny/ProvideUserInput trio that used to wrap it was removed;
+// routeGate is the still-live fire-and-route seam (now driven by RespondGate),
+// whose ctx.Done() escape is not observable through RespondGate (which dispatches
+// on the session context and swallows the routing error after the durable commit).
+func TestRouteGateCtxCancelled(t *testing.T) {
+	t.Parallel()
+	for _, tt := range gateCommands() {
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			s, _, _ := sessionWithFakeLoop() // Commands never read: a send would block
+			l, ok := s.loopFor(s.primaryLoopID)
+			if !ok {
+				t.Fatal("primary loop missing from registry")
+			}
 
 			ctx, cancel := context.WithCancel(context.Background())
 			cancel()
 
 			errCh := make(chan error, 1)
-			go func() { errCh <- tt.call(s, ctx) }()
+			go func() { errCh <- s.routeGate(ctx, s.primaryLoopID, l, tt.cmd) }()
 
 			select {
 			case err := <-errCh:
@@ -1240,36 +1260,32 @@ func TestGateCommandsCtxCancelled(t *testing.T) {
 					t.Fatalf("err = %v, want *SessionError{SessionContextDone}", err)
 				}
 			case <-time.After(2 * time.Second):
-				t.Fatal("method blocked on a cancelled ctx (no ctx.Done() escape)")
+				t.Fatal("routeGate blocked on a cancelled ctx (no ctx.Done() escape)")
 			}
 		})
 	}
 }
 
-// TestGateCommandsLoopExited: after the loop's Done channel is closed, each method
+// TestRouteGateLoopExited: after the loop's Done channel is closed, routeGate
 // returns *SessionError{SessionLoopExited} without blocking and without sending.
-func TestGateCommandsLoopExited(t *testing.T) {
+// Like TestRouteGateCtxCancelled it drives routeGate directly (the trio that used
+// to wrap it was removed); this loop.Done escape is a routeGate property that
+// RespondGate does not surface (it swallows the routing error post-commit).
+func TestRouteGateLoopExited(t *testing.T) {
 	t.Parallel()
-	callID := mustUUID()
-	tests := []struct {
-		name string
-		call func(s *Session) error
-	}{
-		{name: "Approve", call: func(s *Session) error {
-			return s.Approve(context.Background(), s.primaryLoopID, callID, tool.ScopeOnce)
-		}},
-		{name: "Deny", call: func(s *Session) error { return s.Deny(context.Background(), s.primaryLoopID, callID) }},
-		{name: "ProvideUserInput", call: func(s *Session) error { return s.ProvideUserInput(context.Background(), s.primaryLoopID, callID, "x") }},
-	}
-	for _, tt := range tests {
+	for _, tt := range gateCommands() {
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			s, _, done := sessionWithFakeLoop() // Commands never read
-			close(done)                         // loop has exited
+			l, ok := s.loopFor(s.primaryLoopID)
+			if !ok {
+				t.Fatal("primary loop missing from registry")
+			}
+			close(done) // loop has exited
 
 			errCh := make(chan error, 1)
-			go func() { errCh <- tt.call(s) }()
+			go func() { errCh <- s.routeGate(context.Background(), s.primaryLoopID, l, tt.cmd) }()
 
 			select {
 			case err := <-errCh:
@@ -1278,49 +1294,55 @@ func TestGateCommandsLoopExited(t *testing.T) {
 					t.Fatalf("err = %v, want *SessionError{SessionLoopExited}", err)
 				}
 			case <-time.After(2 * time.Second):
-				t.Fatal("method blocked after loop exited (no loop.Done escape)")
+				t.Fatal("routeGate blocked after loop exited (no loop.Done escape)")
 			}
 		})
 	}
 }
 
-// TestGateCommandsIDGenerationFailure: when the idGenerator fails, each method
-// fails secure with *SessionError{SessionIDGenerationFailed} and sends no command.
+// TestGateCommandsIDGenerationFailure: when the id generator fails while minting
+// the command id, RespondGate fails secure with *GateError{GateAppendFailed}
+// (wrapping the *SessionError{SessionIDGenerationFailed} that carries the
+// generator error) BEFORE claiming the gate or dispatching a command. The failure
+// surfaces as the gate machinery's typed error rather than the removed trio's
+// bare *SessionError; the underlying generator error is still recoverable via
+// errors.Is. No command is dispatched.
 func TestGateCommandsIDGenerationFailure(t *testing.T) {
 	t.Parallel()
 	genErr := errors.New("rand source exhausted")
-	callID := mustUUID()
 	tests := []struct {
-		name string
-		call func(s *Session) error
+		name    string
+		gate    gate.Gate
+		payload gate.Payload
+		respond func(gateID gate.ID) gate.GateResponse
 	}{
-		{name: "Approve", call: func(s *Session) error {
-			return s.Approve(context.Background(), s.primaryLoopID, callID, tool.ScopeOnce)
-		}},
-		{name: "Deny", call: func(s *Session) error { return s.Deny(context.Background(), s.primaryLoopID, callID) }},
-		{name: "ProvideUserInput", call: func(s *Session) error { return s.ProvideUserInput(context.Background(), s.primaryLoopID, callID, "x") }},
+		{name: "approve", gate: permissionGate(), payload: bashPayload(), respond: func(gateID gate.ID) gate.GateResponse { return userApprove(gateID, "once") }},
+		{name: "deny", gate: permissionGate(), payload: bashPayload(), respond: userDeny},
+		{name: "answer", gate: askUserGate(), payload: askUserPayload(), respond: func(gateID gate.ID) gate.GateResponse { return userAnswer(gateID, "x") }},
 	}
 	for _, tt := range tests {
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			s, _, _ := sessionWithFakeLoop() // Commands never read: a send would block
+			s, _, loopID, cmds := gateSession(t)
+			gateID := activateOn(t, s, loopID, mustUUID(), tt.gate, tt.payload)
+			// Fail id generation only after the gate is open, so the failure lands on
+			// the response's command-id mint (not on gate prepare/activate).
 			s.newID = func() (uuid.UUID, error) { return uuid.UUID{}, genErr }
 
-			errCh := make(chan error, 1)
-			go func() { errCh <- tt.call(s) }()
+			err := s.RespondGate(context.Background(), tt.respond(gateID))
+			var ge *GateError
+			if !errors.As(err, &ge) || ge.Kind != GateAppendFailed {
+				t.Fatalf("err = %v, want *GateError{GateAppendFailed}", err)
+			}
+			if !errors.Is(err, genErr) {
+				t.Fatalf("err = %v, want it to wrap the generator error", err)
+			}
 
 			select {
-			case err := <-errCh:
-				var se *SessionError
-				if !errors.As(err, &se) || se.Kind != SessionIDGenerationFailed {
-					t.Fatalf("err = %v, want *SessionError{SessionIDGenerationFailed}", err)
-				}
-				if !errors.Is(err, genErr) {
-					t.Fatalf("err = %v, want it to wrap the generator error", err)
-				}
-			case <-time.After(2 * time.Second):
-				t.Fatal("method blocked on id-generation failure (should fail before send)")
+			case c := <-cmds:
+				t.Fatalf("id-generation failure dispatched a command %T, want none", c)
+			default:
 			}
 		})
 	}
@@ -1353,29 +1375,31 @@ func sessionWithTwoFakeLoops() (s *Session, loopA, loopB uuid.UUID, cmdsA, cmdsB
 }
 
 // TestGateReplyRoutesToTargetLoopNeverSibling is the point of Task 13: a gate reply
-// addressed to loop A is dispatched to loop A's command channel and NEVER reaches
-// loop B. The session dispatches by GateRoute.LoopID; the command carries both
+// for a gate opened on loop A is dispatched to loop A's command channel and NEVER
+// reaches loop B. RespondGate dispatches by the gate's stored route (LoopID +
+// ToolExecutionID, both set at ActivateGate); the command carries both
 // Coordinates.LoopID (the dispatch target) and ToolExecutionID (the uuid match
 // key). Matching is by ToolExecutionID — a uuid, never the provider's ToolUseID
 // (a string), which is structurally impossible to confuse here because the field
-// is typed uuid.UUID.
+// is typed uuid.UUID. (This replaces the removed trio, which took loopID directly.)
 func TestGateReplyRoutesToTargetLoopNeverSibling(t *testing.T) {
 	t.Parallel()
-	callID := mustUUID()
 	tests := []struct {
-		name   string
-		call   func(s *Session, loopID uuid.UUID) error
-		verify func(t *testing.T, cmd command.Command, wantLoop uuid.UUID)
+		name    string
+		gate    gate.Gate
+		payload gate.Payload
+		respond func(gateID gate.ID) gate.GateResponse
+		verify  func(t *testing.T, cmd command.Command, wantLoop, callID uuid.UUID)
 	}{
 		{
-			name: "Approve",
-			call: func(s *Session, loopID uuid.UUID) error {
-				return s.Approve(context.Background(), loopID, callID, tool.ScopeSession)
-			},
-			verify: func(t *testing.T, cmd command.Command, wantLoop uuid.UUID) {
+			name:    "approve",
+			gate:    permissionGate(),
+			payload: bashPayload(),
+			respond: func(gateID gate.ID) gate.GateResponse { return userApprove(gateID, "session") },
+			verify: func(t *testing.T, cmd command.Command, wantLoop, callID uuid.UUID) {
 				c, ok := cmd.(command.ApproveToolCall)
 				if !ok {
-					t.Fatalf("sent %T, want command.ApproveToolCall", cmd)
+					t.Fatalf("dispatched %T, want command.ApproveToolCall", cmd)
 				}
 				if c.GateRoute.LoopID != wantLoop {
 					t.Errorf("GateRoute.LoopID = %v, want %v", c.GateRoute.LoopID, wantLoop)
@@ -1389,14 +1413,14 @@ func TestGateReplyRoutesToTargetLoopNeverSibling(t *testing.T) {
 			},
 		},
 		{
-			name: "Deny",
-			call: func(s *Session, loopID uuid.UUID) error {
-				return s.Deny(context.Background(), loopID, callID)
-			},
-			verify: func(t *testing.T, cmd command.Command, wantLoop uuid.UUID) {
+			name:    "deny",
+			gate:    permissionGate(),
+			payload: bashPayload(),
+			respond: userDeny,
+			verify: func(t *testing.T, cmd command.Command, wantLoop, callID uuid.UUID) {
 				c, ok := cmd.(command.DenyToolCall)
 				if !ok {
-					t.Fatalf("sent %T, want command.DenyToolCall", cmd)
+					t.Fatalf("dispatched %T, want command.DenyToolCall", cmd)
 				}
 				if c.GateRoute.LoopID != wantLoop {
 					t.Errorf("GateRoute.LoopID = %v, want %v", c.GateRoute.LoopID, wantLoop)
@@ -1407,14 +1431,14 @@ func TestGateReplyRoutesToTargetLoopNeverSibling(t *testing.T) {
 			},
 		},
 		{
-			name: "ProvideUserInput",
-			call: func(s *Session, loopID uuid.UUID) error {
-				return s.ProvideUserInput(context.Background(), loopID, callID, "the answer")
-			},
-			verify: func(t *testing.T, cmd command.Command, wantLoop uuid.UUID) {
+			name:    "answer",
+			gate:    askUserGate(),
+			payload: askUserPayload(),
+			respond: func(gateID gate.ID) gate.GateResponse { return userAnswer(gateID, "the answer") },
+			verify: func(t *testing.T, cmd command.Command, wantLoop, callID uuid.UUID) {
 				c, ok := cmd.(command.ProvideUserInput)
 				if !ok {
-					t.Fatalf("sent %T, want command.ProvideUserInput", cmd)
+					t.Fatalf("dispatched %T, want command.ProvideUserInput", cmd)
 				}
 				if c.GateRoute.LoopID != wantLoop {
 					t.Errorf("GateRoute.LoopID = %v, want %v", c.GateRoute.LoopID, wantLoop)
@@ -1432,28 +1456,25 @@ func TestGateReplyRoutesToTargetLoopNeverSibling(t *testing.T) {
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			s, loopA, _, cmdsA, cmdsB := sessionWithTwoFakeLoops()
+			s, loopA, _, cmdsA, cmdsB := gateSessionTwoLoops(t)
+			callID := mustUUID()
+			// Open the gate on loop A and assert B never sees the reply; the
+			// sibling-isolation guarantee is symmetric. Targeting A proves dispatch
+			// keys on the gate's own route, not "primary by default".
+			gateID := activateOn(t, s, loopA, callID, tt.gate, tt.payload)
 
-			errCh := make(chan error, 1)
-			// Address the reply to the NON-primary loop B... actually address loop A
-			// (the primary) here and assert B never sees it; the sibling-isolation
-			// guarantee is symmetric. We target A explicitly to prove dispatch keys
-			// on the supplied loop id, not on "primary by default".
-			go func() { errCh <- tt.call(s, loopA) }()
-
-			// The reply must arrive on loop A's channel. Loop B's channel is read
-			// non-blockingly throughout to prove a stray dispatch never lands there.
-			select {
-			case cmd := <-cmdsA:
-				tt.verify(t, cmd, loopA)
-			case cmd := <-cmdsB:
-				t.Fatalf("gate reply for loop A was delivered to sibling loop B: %T", cmd)
-			case <-time.After(2 * time.Second):
-				t.Fatal("gate reply never reached the target loop")
+			if err := s.RespondGate(context.Background(), tt.respond(gateID)); err != nil {
+				t.Fatalf("RespondGate returned %v, want nil", err)
 			}
 
-			if err := <-errCh; err != nil {
-				t.Fatalf("method returned %v, want nil", err)
+			// The reply must have arrived on loop A's channel and never on B's.
+			select {
+			case cmd := <-cmdsA:
+				tt.verify(t, cmd, loopA, callID)
+			case cmd := <-cmdsB:
+				t.Fatalf("gate reply for loop A was delivered to sibling loop B: %T", cmd)
+			default:
+				t.Fatal("gate reply never reached the target loop")
 			}
 
 			// Loop B must never receive anything.
@@ -1466,116 +1487,34 @@ func TestGateReplyRoutesToTargetLoopNeverSibling(t *testing.T) {
 	}
 }
 
-// TestGateReplyToNonPrimaryLoop proves dispatch follows the supplied loop id even
-// when it is NOT the primary: a reply addressed to loop B reaches B (not the
-// primary A). This is the latent multi-loop bug Task 13 fixes — today every gate
-// reply routes to the primary loop regardless of which loop opened the gate.
+// TestGateReplyToNonPrimaryLoop proves dispatch follows the gate's own route even
+// when the owning loop is NOT the primary: a reply to a gate opened on loop B
+// reaches B (not the primary A). This is the latent multi-loop bug Task 13 fixed —
+// a gate reply must route to the loop that opened the gate, not the primary.
+// (This replaces the removed trio, which was addressed by loopID directly.)
 func TestGateReplyToNonPrimaryLoop(t *testing.T) {
 	t.Parallel()
+	s, _, loopB, cmdsA, cmdsB := gateSessionTwoLoops(t)
 	callID := mustUUID()
-	s, _, loopB, cmdsA, cmdsB := sessionWithTwoFakeLoops()
+	gateID := activateOn(t, s, loopB, callID, permissionGate(), bashPayload())
 
-	errCh := make(chan error, 1)
-	go func() { errCh <- s.Approve(context.Background(), loopB, callID, tool.ScopeOnce) }()
+	if err := s.RespondGate(context.Background(), userApprove(gateID, "once")); err != nil {
+		t.Fatalf("RespondGate returned %v, want nil", err)
+	}
 
 	select {
 	case cmd := <-cmdsB:
 		c, ok := cmd.(command.ApproveToolCall)
 		if !ok {
-			t.Fatalf("sent %T, want command.ApproveToolCall", cmd)
+			t.Fatalf("dispatched %T, want command.ApproveToolCall", cmd)
 		}
 		if c.GateRoute.LoopID != loopB {
 			t.Errorf("GateRoute.LoopID = %v, want %v (loop B)", c.GateRoute.LoopID, loopB)
 		}
 	case cmd := <-cmdsA:
 		t.Fatalf("gate reply for loop B was misrouted to the primary loop A: %T", cmd)
-	case <-time.After(2 * time.Second):
+	default:
 		t.Fatal("gate reply never reached loop B")
-	}
-	if err := <-errCh; err != nil {
-		t.Fatalf("Approve returned %v, want nil", err)
-	}
-}
-
-// TestGateReplyUnknownLoopFailsSecure: a gate reply addressed to a loop id that is
-// NOT in the registry must fail secure with *SessionError{SessionLoopNotFound} and
-// send no command — an unroutable approval must never silently fall through to the
-// primary loop (which would approve a tool call the user meant for a dead/unknown
-// loop).
-func TestGateReplyUnknownLoopFailsSecure(t *testing.T) {
-	t.Parallel()
-	callID := mustUUID()
-	unknown := mustUUID()
-	tests := []struct {
-		name string
-		call func(s *Session) error
-	}{
-		{name: "Approve", call: func(s *Session) error { return s.Approve(context.Background(), unknown, callID, tool.ScopeOnce) }},
-		{name: "Deny", call: func(s *Session) error { return s.Deny(context.Background(), unknown, callID) }},
-		{name: "ProvideUserInput", call: func(s *Session) error { return s.ProvideUserInput(context.Background(), unknown, callID, "x") }},
-	}
-	for _, tt := range tests {
-		tt := tt
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-			s, _, _, cmdsA, cmdsB := sessionWithTwoFakeLoops() // neither channel is read
-
-			errCh := make(chan error, 1)
-			go func() { errCh <- tt.call(s) }()
-
-			select {
-			case err := <-errCh:
-				var se *SessionError
-				if !errors.As(err, &se) || se.Kind != SessionLoopNotFound {
-					t.Fatalf("err = %v, want *SessionError{SessionLoopNotFound}", err)
-				}
-			case <-time.After(2 * time.Second):
-				t.Fatal("method blocked on an unknown loop id (no fail-secure short-circuit)")
-			}
-
-			// No command may have been sent to ANY loop.
-			select {
-			case cmd := <-cmdsA:
-				t.Fatalf("unknown-loop reply leaked a command to loop A: %T", cmd)
-			case cmd := <-cmdsB:
-				t.Fatalf("unknown-loop reply leaked a command to loop B: %T", cmd)
-			default:
-			}
-		})
-	}
-}
-
-// TestGateReplyZeroLoopFallsBackToPrimary: a gate reply with a ZERO loop id (an
-// "unspecified at this granularity" route — e.g. a single-loop caller that does
-// not stamp a LoopID) falls back to the primary loop, preserving today's
-// single-loop behavior. A zero route is unspecified, not a hard misroute, so it is
-// safe to default to the only loop a single-loop session has.
-func TestGateReplyZeroLoopFallsBackToPrimary(t *testing.T) {
-	t.Parallel()
-	callID := mustUUID()
-	s, loopA, _, cmdsA, cmdsB := sessionWithTwoFakeLoops()
-
-	errCh := make(chan error, 1)
-	go func() { errCh <- s.Approve(context.Background(), uuid.UUID{}, callID, tool.ScopeOnce) }()
-
-	select {
-	case cmd := <-cmdsA: // primary loop
-		c, ok := cmd.(command.ApproveToolCall)
-		if !ok {
-			t.Fatalf("sent %T, want command.ApproveToolCall", cmd)
-		}
-		// The stamped LoopID is the resolved primary loop, not zero: the route is
-		// concretized to the loop the session actually dispatched to.
-		if c.GateRoute.LoopID != loopA {
-			t.Errorf("GateRoute.LoopID = %v, want primary %v", c.GateRoute.LoopID, loopA)
-		}
-	case cmd := <-cmdsB:
-		t.Fatalf("zero-loop reply went to sibling loop B instead of the primary: %T", cmd)
-	case <-time.After(2 * time.Second):
-		t.Fatal("zero-loop reply never reached the primary loop")
-	}
-	if err := <-errCh; err != nil {
-		t.Fatalf("Approve returned %v, want nil", err)
 	}
 }
 

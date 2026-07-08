@@ -672,6 +672,122 @@ func prepareAndActivate(t *testing.T, s *Session, loopID uuid.UUID, payload gate
 	return gateID
 }
 
+// askUserGate builds a representative ask-user gate envelope (action "answer"),
+// the ask-user counterpart to permissionGate. Subject carries non-zero
+// TurnID/StepID so the step-profiled event header validates.
+func askUserGate() gate.Gate {
+	return gate.Gate{
+		Kind:     gate.KindAskUser,
+		Resolver: gate.ResolverLoop,
+		Blocks:   gate.BlocksToolCall,
+		Effect:   gate.EffectResume,
+		Subject:  gate.Subject{TurnID: gate.ID(mustUUID()), StepID: gate.ID(mustUUID())},
+		Prompt: gate.Prompt{
+			Title:    "User input requested",
+			Body:     "question",
+			Controls: []gate.Control{{Action: "answer", Label: "Answer"}},
+		},
+	}
+}
+
+// bashPayload is a permission payload carrying a Bash request that offers the
+// persistable scopes, the representative payload for approve/deny RespondGate
+// tests (a permission approve requires a non-nil Request).
+func bashPayload() gate.Payload {
+	return gate.PermissionPayload{Request: tool.BashRequest{Command: "echo ok"}}
+}
+
+// askUserPayload is the payload for an ask-user gate.
+func askUserPayload() gate.Payload {
+	return gate.AskUserPayload{Question: "question"}
+}
+
+// activateOn prepares and activates gate g with payload on loopID, pinning the
+// route's ToolExecutionID to callID, and returns the open gate id. It is the
+// known-ToolExecutionID counterpart to prepareAndActivate.
+func activateOn(t *testing.T, s *Session, loopID, callID uuid.UUID, g gate.Gate, payload gate.Payload) gate.ID {
+	t.Helper()
+	gateID, err := s.PrepareGateOpen(context.Background(), loopID, g, payload)
+	if err != nil {
+		t.Fatalf("PrepareGateOpen() error = %v", err)
+	}
+	if err := s.ActivateGate(context.Background(), gateID, gate.Route{GateID: gateID, LoopID: loopID, ToolExecutionID: callID}); err != nil {
+		t.Fatalf("ActivateGate() error = %v", err)
+	}
+	return gateID
+}
+
+// mustJSON marshals v to a json.RawMessage, panicking on failure (test-only).
+func mustJSON(v string) json.RawMessage {
+	b, err := json.Marshal(v)
+	if err != nil {
+		panic(err)
+	}
+	return b
+}
+
+// userApprove/userDeny/userAnswer build the human GateResponse for each gate
+// kind, mirroring what the removed Approve/Deny/ProvideUserInput trio used to
+// send: a user-sourced approve at the given scope, a user-sourced deny, and a
+// user-sourced ask-user answer.
+func userApprove(gateID gate.ID, scope string) gate.GateResponse {
+	return gate.GateResponse{
+		GateID: gateID,
+		Action: "approve",
+		Values: map[string]json.RawMessage{"scope": mustJSON(scope)},
+		Source: gate.ResponseSource{Kind: gate.ResponseFromUser},
+	}
+}
+
+func userDeny(gateID gate.ID) gate.GateResponse {
+	return gate.GateResponse{
+		GateID: gateID,
+		Action: "deny",
+		Source: gate.ResponseSource{Kind: gate.ResponseFromUser},
+	}
+}
+
+func userAnswer(gateID gate.ID, answer string) gate.GateResponse {
+	return gate.GateResponse{
+		GateID: gateID,
+		Action: "answer",
+		Values: map[string]json.RawMessage{"answer": mustJSON(answer)},
+		Source: gate.ResponseSource{Kind: gate.ResponseFromUser},
+	}
+}
+
+// gateSessionTwoLoops builds a struct-literal Session wired to a fakeGateAppender
+// and TWO fake loops (A and B), each keyed by its own loop id with a buffered
+// command channel, so a RespondGate sibling-isolation test can observe exactly
+// which loop a gate reply was dispatched to. A is registered first; neither is
+// the "primary" (RespondGate routes by the gate's stored route, not primary).
+func gateSessionTwoLoops(t *testing.T) (s *Session, loopA, loopB uuid.UUID, cmdsA, cmdsB chan command.Command) {
+	t.Helper()
+	id := mustUUID()
+	loopA = mustUUID()
+	loopB = mustUUID()
+	sessionCtx, sessionCancel := context.WithCancel(context.Background())
+	t.Cleanup(sessionCancel)
+	cmdsA = make(chan command.Command, 4)
+	cmdsB = make(chan command.Command, 4)
+	s = &Session{
+		SessionID:     id,
+		hub:           hub.New(id),
+		sessionCtx:    sessionCtx,
+		sessionCancel: sessionCancel,
+		loops:         map[uuid.UUID]*loopHandle{},
+		newID:         uuid.New,
+		now:           pinnedClock(time.Date(2026, time.July, 7, 12, 0, 0, 0, time.UTC)),
+		gateAppender:  &fakeGateAppender{},
+		gates:         map[gate.ID]gateEntry{},
+		gateTimers:    map[gate.ID]*time.Timer{},
+	}
+	s.factory = event.NewFactory(func() (uuid.UUID, error) { return s.newID() }, func() time.Time { return s.now() })
+	s.loops[loopA] = &loopHandle{backend: &loop.Loop{Commands: cmdsA, Done: make(chan struct{})}}
+	s.loops[loopB] = &loopHandle{backend: &loop.Loop{Commands: cmdsB, Done: make(chan struct{})}}
+	return s, loopA, loopB, cmdsA, cmdsB
+}
+
 // TestRespondGateApproveDispatchesCommand proves a human approve response claims
 // the open gate, appends GateResolved, and dispatches an ApproveToolCall command
 // with the extracted scope and accepted_grants.

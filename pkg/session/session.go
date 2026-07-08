@@ -16,7 +16,6 @@ import (
 	"github.com/looprig/harness/pkg/hub"
 	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/loop"
-	"github.com/looprig/harness/pkg/tool"
 	"github.com/looprig/harness/pkg/workspacestore"
 )
 
@@ -1289,90 +1288,6 @@ func (s *Session) Shutdown(ctx context.Context) error {
 		return &SessionError{Kind: SessionContextDone, Cause: firstErr}
 	}
 	return nil
-}
-
-// Approve approves the pending tool call identified by toolExecutionID, granting
-// it at the given persistence scope. The reply is dispatched to loopID — the loop
-// that opened the gate — so a subagent loop's gate is never answered by routing to
-// the primary (the latent multi-loop misroute). loopID is resolved against the
-// registry; a zero loopID falls back to the primary loop (single-loop default),
-// and an unknown non-zero loopID fails secure with SessionLoopNotFound. It is
-// fire-and-route: the command carries no Ack, so Approve returns as soon as the
-// actor accepts it (the gate unblocking and the subsequent ToolCallStarted event
-// are the observable effect, not a reply). The select covers ctx.Done() and the
-// loop's Done channel so the unbuffered send can never block forever.
-func (s *Session) Approve(ctx context.Context, loopID, toolExecutionID uuid.UUID, scope tool.ApprovalScope) error {
-	l, route, err := s.resolveGate(loopID, toolExecutionID)
-	if err != nil {
-		return err
-	}
-	id, err := s.newCommandID()
-	if err != nil {
-		return err
-	}
-	// A human approve is a user-origination point (the gate replies): stamp AgencyUser.
-	return s.routeGate(ctx, route.LoopID, l, command.ApproveToolCall{Header: command.Header{CommandID: id, Agency: identity.AgencyUser, CreatedAt: s.stampNow()}, GateRoute: route, Scope: scope})
-}
-
-// Deny denies the pending tool call identified by toolExecutionID, failing it
-// closed (fail-secure). Like Approve it dispatches to loopID (the loop that opened
-// the gate) and is fire-and-route with no Ack and no scope — nothing is ever
-// persisted on a deny. A zero loopID falls back to the primary loop; an unknown
-// non-zero loopID fails secure with SessionLoopNotFound.
-func (s *Session) Deny(ctx context.Context, loopID, toolExecutionID uuid.UUID) error {
-	l, route, err := s.resolveGate(loopID, toolExecutionID)
-	if err != nil {
-		return err
-	}
-	id, err := s.newCommandID()
-	if err != nil {
-		return err
-	}
-	// A human deny is a user-origination point (the gate replies): stamp AgencyUser.
-	return s.routeGate(ctx, route.LoopID, l, command.DenyToolCall{Header: command.Header{CommandID: id, Agency: identity.AgencyUser, CreatedAt: s.stampNow()}, GateRoute: route})
-}
-
-// ProvideUserInput supplies the user's answer to the pending AskUser request
-// identified by toolExecutionID. Like the approve/deny pair it dispatches to
-// loopID (the loop that opened the gate) and is fire-and-route with no Ack: the
-// actor routes it to the parked user-input gate, which delivers answer to the
-// waiting tool. A zero loopID falls back to the primary loop; an unknown non-zero
-// loopID fails secure with SessionLoopNotFound.
-func (s *Session) ProvideUserInput(ctx context.Context, loopID, toolExecutionID uuid.UUID, answer string) error {
-	l, route, err := s.resolveGate(loopID, toolExecutionID)
-	if err != nil {
-		return err
-	}
-	id, err := s.newCommandID()
-	if err != nil {
-		return err
-	}
-	// A human answer is a user-origination point (the gate replies): stamp AgencyUser.
-	return s.routeGate(ctx, route.LoopID, l, command.ProvideUserInput{Header: command.Header{CommandID: id, Agency: identity.AgencyUser, CreatedAt: s.stampNow()}, GateRoute: route, Answer: answer})
-}
-
-// resolveGate selects the target loop for a gate reply and builds the command's
-// GateRoute. A zero loopID is "unspecified at this granularity": it falls back to
-// the primary loop (the single-loop default). A non-zero loopID is looked up in
-// the registry as-is; an unknown one fails secure with SessionLoopNotFound rather
-// than silently falling through to the primary loop — an unroutable approval must
-// never approve a tool call on a loop the caller did not address. The returned
-// GateRoute carries the RESOLVED loop id (the loop actually dispatched to) and the
-// match key (ToolExecutionID), so the route is concrete and self-describing.
-func (s *Session) resolveGate(loopID, toolExecutionID uuid.UUID) (loop.Backend, command.GateRoute, error) {
-	targetLoopID := loopID
-	if targetLoopID.IsZero() {
-		targetLoopID = s.PrimaryLoopID()
-	}
-	l, ok := s.loopFor(targetLoopID)
-	if !ok {
-		return nil, command.GateRoute{}, &SessionError{Kind: SessionLoopNotFound}
-	}
-	route := command.GateRoute{
-		Coordinates:     identity.Coordinates{SessionID: s.SessionID, LoopID: targetLoopID},
-		ToolExecutionID: toolExecutionID,
-	}
-	return l, route, nil
 }
 
 // routeGate sends a fire-and-route gate command to the resolved target loop. These
