@@ -119,9 +119,19 @@ func (h Header) EventHeader() Header { return h }
 // typed termination cause (nil for an intentional Close, the loss error for a
 // hub-forced drop).
 type Subscription interface {
-	Events() <-chan Event
+	Events() <-chan Delivery
 	Close() error
 	Err() error
+}
+
+// Delivery is one fan-in delivery: the event plus its durable journal sequence.
+// JournalSeq is 0 for Ephemeral deliveries (never persisted, never sequenced) and
+// the strictly-monotonic append sequence for Enduring deliveries. It rides only the
+// LIVE delivery path — it is never part of the persisted event codec, so the durable
+// envelope stays byte-compatible.
+type Delivery struct {
+	Event      Event
+	JournalSeq uint64
 }
 
 // ephemeral is the lifecycle mixin for a streaming delta: droppable, never

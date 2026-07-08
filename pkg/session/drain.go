@@ -99,22 +99,22 @@ func drainToFinalText(ctx context.Context, sub event.Subscription, commandID uui
 		// stays selectable once cancelled — re-selecting it would busy-loop). Just
 		// await the sub-loop's terminal (or a subscription loss).
 		if ctxClosed {
-			ev, ok := <-sub.Events()
+			d, ok := <-sub.Events()
 			if !ok {
 				return "", &drainLostError{Cause: sub.Err()}
 			}
-			if text, done, err := handleEvent(ev, commandID, &turnID, &loopID, &haveTurn, &lastStep); done {
+			if text, done, err := handleEvent(d.Event, commandID, &turnID, &loopID, &haveTurn, &lastStep); done {
 				return text, err
 			}
 			continue
 		}
 
 		select {
-		case ev, ok := <-sub.Events():
+		case d, ok := <-sub.Events():
 			if !ok {
 				return "", &drainLostError{Cause: sub.Err()}
 			}
-			if text, done, err := handleEvent(ev, commandID, &turnID, &loopID, &haveTurn, &lastStep); done {
+			if text, done, err := handleEvent(d.Event, commandID, &turnID, &loopID, &haveTurn, &lastStep); done {
 				return text, err
 			}
 		case <-ctx.Done():

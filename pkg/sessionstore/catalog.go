@@ -372,7 +372,13 @@ func (s *Store) OpenCatalog(opts ...CatalogOption) *Catalog {
 // MUST NEVER fail the underlying append — the catalog is derivable, so a lost update is
 // repaired later, never propagated. The returned error is always nil; the signature keeps a
 // nil-error contract for the appender seam.
-func (c *Catalog) UpdateOnEvent(ctx context.Context, ev event.Event) error {
+//
+// seq is the event's durable journal sequence, threaded through the widened catalogUpdater
+// seam. It is not yet folded into the projection (the status-fold that consumes it lands in
+// a later task); it is accepted here so *Catalog satisfies the seam. Do not remove the
+// parameter — the fold that reads it is pending.
+func (c *Catalog) UpdateOnEvent(ctx context.Context, ev event.Event, seq uint64) error {
+	_ = seq // reserved for the pending status-fold projection; see doc above.
 	// Decide relevance on a zero meta first so a no-op event never touches the KV.
 	if _, changed := applyEvent(SessionMeta{}, ev, c.now); !changed {
 		return nil

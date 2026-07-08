@@ -66,6 +66,33 @@ func TestReplyImplementations(t *testing.T) {
 	}
 }
 
+// TestDeliveryZeroValue asserts a Delivery carries its JournalSeq verbatim: the
+// zero value is seq 0, an ephemeral-style delivery (never persisted) is 0, and an
+// enduring-style delivery carries the append sequence unchanged. The Event rides
+// alongside untouched.
+func TestDeliveryZeroValue(t *testing.T) {
+	t.Parallel()
+	ev := event.StepDone{}
+	tests := []struct {
+		name    string
+		d       event.Delivery
+		wantSeq uint64
+	}{
+		{name: "zero value has seq 0", d: event.Delivery{}, wantSeq: 0},
+		{name: "ephemeral-style delivery has seq 0", d: event.Delivery{Event: ev, JournalSeq: 0}, wantSeq: 0},
+		{name: "enduring-style delivery carries append seq", d: event.Delivery{Event: ev, JournalSeq: 42}, wantSeq: 42},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if tt.d.JournalSeq != tt.wantSeq {
+				t.Errorf("JournalSeq = %d, want %d", tt.d.JournalSeq, tt.wantSeq)
+			}
+		})
+	}
+}
+
 // TestReplyToZeroCausation asserts ReplyTo() faithfully returns a zero Cause.CommandID
 // (the boundary value) rather than synthesizing an id.
 func TestReplyToZeroCausation(t *testing.T) {

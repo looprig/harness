@@ -113,11 +113,11 @@ func countLoopStarted(sub event.Subscription, d time.Duration) int {
 	n := 0
 	for {
 		select {
-		case ev, ok := <-sub.Events():
+		case d, ok := <-sub.Events():
 			if !ok {
 				return n
 			}
-			if _, isLS := ev.(event.LoopStarted); isLS {
+			if _, isLS := d.Event.(event.LoopStarted); isLS {
 				n++
 			}
 		case <-deadline:

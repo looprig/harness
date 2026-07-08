@@ -305,15 +305,15 @@ type Session struct {
 }
 
 // eventAppender is the session's narrow view of the hub's REQUIRED durable event tap:
-// append one Enduring event to the durable journal, returning a typed error if it did
-// not commit. The session holds it only to FORWARD it into the hub at construction
-// (hub.WithAppender); the session never calls AppendEvent itself (the hub owns the
-// durable tap). It mirrors the hub's own unexported eventAppender method-set, so the
-// concrete journal.JournalEventAppender satisfies both structurally and the session
-// never imports the journal's appender type. Defined here (where it is consumed) per
-// Dependency Inversion, exactly like commandAppender.
+// append one Enduring event to the durable journal, returning the assigned durable
+// sequence and a typed error if it did not commit. The session holds it only to FORWARD
+// it into the hub at construction (hub.WithAppender); the session never calls AppendEvent
+// itself (the hub owns the durable tap). It mirrors the hub's own unexported eventAppender
+// method-set, so the concrete journal.JournalEventAppender satisfies both structurally and
+// the session never imports the journal's appender type. Defined here (where it is
+// consumed) per Dependency Inversion, exactly like commandAppender.
 type eventAppender interface {
-	AppendEvent(ctx context.Context, ev event.Event) error
+	AppendEvent(ctx context.Context, ev event.Event) (uint64, error)
 }
 
 // loopHandle is the session's registry entry: the loop's channel handle, the

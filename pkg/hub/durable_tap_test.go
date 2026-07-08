@@ -22,15 +22,15 @@ type orderingAppender struct {
 	calls      int
 }
 
-func (a *orderingAppender) AppendEvent(_ context.Context, ev event.Event) error {
+func (a *orderingAppender) AppendEvent(_ context.Context, ev event.Event) (uint64, error) {
 	a.calls++
 	// Snapshot the watched subscription's egress depth at append time.
 	a.bufferedAt = append(a.bufferedAt, len(a.sub.events))
 	if a.failAt != 0 && a.calls == a.failAt {
-		return errAppend
+		return 0, errAppend
 	}
 	a.appended = append(a.appended, ev)
-	return nil
+	return uint64(len(a.appended)), nil
 }
 
 // TestEnduringAppendsBeforeDelivery proves an Enduring event is appended BEFORE it is

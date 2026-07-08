@@ -28,17 +28,21 @@ func drainUUID(seed byte) uuid.UUID {
 // It is the seam that lets drainToFinalText be driven with a deterministic event
 // sequence without a live hub/loop.
 type fakeSubscription struct {
-	events chan event.Event
+	events chan event.Delivery
 	err    error
 }
 
 func newFakeSubscription(buf int) *fakeSubscription {
-	return &fakeSubscription{events: make(chan event.Event, buf)}
+	return &fakeSubscription{events: make(chan event.Delivery, buf)}
 }
 
-func (f *fakeSubscription) Events() <-chan event.Event { return f.events }
-func (f *fakeSubscription) Close() error               { return nil }
-func (f *fakeSubscription) Err() error                 { return f.err }
+func (f *fakeSubscription) Events() <-chan event.Delivery { return f.events }
+func (f *fakeSubscription) Close() error                  { return nil }
+func (f *fakeSubscription) Err() error                    { return f.err }
+
+// feed wraps a scripted event in an event.Delivery (seq 0 — the drain helper ignores
+// the sequence) and pushes it onto the fake's buffered channel.
+func (f *fakeSubscription) feed(ev event.Event) { f.events <- event.Delivery{Event: ev} }
 
 // turnStarted builds a TurnStarted whose Cause.CommandID is cmd and whose
 // Coordinates.TurnID is turn — the opening resolution event drainToFinalText
@@ -213,7 +217,7 @@ func TestDrainToFinalText(t *testing.T) {
 			sub := newFakeSubscription(len(tt.script) + 1)
 			sub.err = tt.subErr
 			for _, ev := range tt.script {
-				sub.events <- ev
+				sub.feed(ev)
 			}
 			if tt.closeAfter {
 				close(sub.events)
@@ -282,7 +286,7 @@ func TestDrainToFinalTextInterruptOnCtxCancel(t *testing.T) {
 	turn := drainUUID(0x02)
 
 	sub := newFakeSubscription(4)
-	sub.events <- turnStarted(cmd, turn)
+	sub.feed(turnStarted(cmd, turn))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -313,7 +317,7 @@ func TestDrainToFinalTextInterruptOnCtxCancel(t *testing.T) {
 	}
 
 	// Feed the terminal the sub-loop produces once interrupted.
-	sub.events <- turnInterrupted(turn)
+	sub.feed(turnInterrupted(turn))
 
 	var res result
 	select {

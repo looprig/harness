@@ -25,14 +25,31 @@ func allFilter() event.EventFilter {
 func recv(t *testing.T, sub *EventSubscription) event.Event {
 	t.Helper()
 	select {
-	case ev, ok := <-sub.Events():
+	case d, ok := <-sub.Events():
 		if !ok {
 			t.Fatalf("Events() closed unexpectedly")
 		}
-		return ev
+		return d.Event
 	case <-time.After(time.Second):
 		t.Fatalf("timed out waiting for an event")
 		return nil
+	}
+}
+
+// recvDelivery reads one Delivery (event + journal seq) from the subscription within
+// a short timeout, failing the test if none arrives. Tests asserting the sequence use
+// this; tests asserting only the event use recv.
+func recvDelivery(t *testing.T, sub *EventSubscription) event.Delivery {
+	t.Helper()
+	select {
+	case d, ok := <-sub.Events():
+		if !ok {
+			t.Fatalf("Events() closed unexpectedly")
+		}
+		return d
+	case <-time.After(time.Second):
+		t.Fatalf("timed out waiting for a delivery")
+		return event.Delivery{}
 	}
 }
 
@@ -40,9 +57,9 @@ func recv(t *testing.T, sub *EventSubscription) event.Event {
 func expectNone(t *testing.T, sub *EventSubscription) {
 	t.Helper()
 	select {
-	case ev, ok := <-sub.Events():
+	case d, ok := <-sub.Events():
 		if ok {
-			t.Fatalf("unexpected event delivered: %T", ev)
+			t.Fatalf("unexpected event delivered: %T", d.Event)
 		}
 	case <-time.After(50 * time.Millisecond):
 	}
@@ -155,6 +172,111 @@ func TestPublishOrderingWithDerivedPosts(t *testing.T) {
 	}
 }
 
+// TestDeliveryCarriesJournalSeq proves the live delivery carries the durable append
+// sequence: an Ephemeral event (never persisted) delivers JournalSeq 0 with NO append;
+// an Enduring event delivers the sequence its append returned; a derived
+// SessionActive/SessionIdle carries ITS OWN append sequence; and a StopSession
+// SessionStopped carries the sequence its append returned. The fakeAppender assigns
+// seq = the 1-based count of successful appends.
+func TestDeliveryCarriesJournalSeq(t *testing.T) {
+	t.Parallel()
+
+	t.Run("ephemeral delivers seq 0 and never appends", func(t *testing.T) {
+		t.Parallel()
+		session := mustID(t)
+		loopA := mustID(t)
+		app := &fakeAppender{}
+		h := New(session, WithAppender(app))
+		sub, err := h.SubscribeEvents(allFilter())
+		if err != nil {
+			t.Fatalf("SubscribeEvents = %v", err)
+		}
+		if err := h.PublishEvent(context.Background(), event.TokenDelta{Header: event.Header{Coordinates: identity.Coordinates{SessionID: session, LoopID: loopA}}}); err != nil {
+			t.Fatalf("PublishEvent(TokenDelta) = %v", err)
+		}
+		d := recvDelivery(t, sub)
+		if _, ok := d.Event.(event.TokenDelta); !ok {
+			t.Fatalf("delivered %T, want TokenDelta", d.Event)
+		}
+		if d.JournalSeq != 0 {
+			t.Errorf("ephemeral JournalSeq = %d, want 0", d.JournalSeq)
+		}
+		if app.callCount() != 0 {
+			t.Errorf("ephemeral triggered %d appends, want 0", app.callCount())
+		}
+	})
+
+	t.Run("enduring delivers the append sequence", func(t *testing.T) {
+		t.Parallel()
+		session := mustID(t)
+		loopA := mustID(t)
+		app := &fakeAppender{}
+		h := New(session, WithAppender(app))
+		sub, err := h.SubscribeEvents(allFilter())
+		if err != nil {
+			t.Fatalf("SubscribeEvents = %v", err)
+		}
+		if err := h.PublishEvent(context.Background(), event.StepDone{Header: event.Header{Coordinates: identity.Coordinates{SessionID: session, LoopID: loopA}}}); err != nil {
+			t.Fatalf("PublishEvent(StepDone) = %v", err)
+		}
+		d := recvDelivery(t, sub)
+		if _, ok := d.Event.(event.StepDone); !ok {
+			t.Fatalf("delivered %T, want StepDone", d.Event)
+		}
+		if d.JournalSeq != 1 {
+			t.Errorf("enduring JournalSeq = %d, want 1 (first append)", d.JournalSeq)
+		}
+	})
+
+	t.Run("derived SessionActive carries its own append seq", func(t *testing.T) {
+		t.Parallel()
+		session := mustID(t)
+		loopA := mustID(t)
+		app := &fakeAppender{}
+		h := New(session, WithAppender(app), WithFactory(testFactory()))
+		sub, err := h.SubscribeEvents(allFilter())
+		if err != nil {
+			t.Fatalf("SubscribeEvents = %v", err)
+		}
+		if err := h.PublishEvent(context.Background(), event.TurnStarted{Header: event.Header{Coordinates: identity.Coordinates{SessionID: session, LoopID: loopA}}}); err != nil {
+			t.Fatalf("PublishEvent(TurnStarted) = %v", err)
+		}
+		started := recvDelivery(t, sub)
+		if _, ok := started.Event.(event.TurnStarted); !ok {
+			t.Fatalf("first delivery %T, want TurnStarted", started.Event)
+		}
+		if started.JournalSeq != 1 {
+			t.Errorf("TurnStarted JournalSeq = %d, want 1", started.JournalSeq)
+		}
+		active := recvDelivery(t, sub)
+		if _, ok := active.Event.(event.SessionActive); !ok {
+			t.Fatalf("second delivery %T, want derived SessionActive", active.Event)
+		}
+		if active.JournalSeq != 2 {
+			t.Errorf("derived SessionActive JournalSeq = %d, want 2 (its own append)", active.JournalSeq)
+		}
+	})
+
+	t.Run("StopSession SessionStopped carries its append seq", func(t *testing.T) {
+		t.Parallel()
+		session := mustID(t)
+		app := &fakeAppender{}
+		h := New(session, WithAppender(app), WithFactory(testFactory()))
+		sub, err := h.SubscribeEvents(allFilter())
+		if err != nil {
+			t.Fatalf("SubscribeEvents = %v", err)
+		}
+		h.StopSession(context.Background())
+		d := recvDelivery(t, sub)
+		if _, ok := d.Event.(event.SessionStopped); !ok {
+			t.Fatalf("delivered %T, want SessionStopped", d.Event)
+		}
+		if d.JournalSeq != 1 {
+			t.Errorf("SessionStopped JournalSeq = %d, want 1 (first append)", d.JournalSeq)
+		}
+	})
+}
+
 // TestEphemeralOverflowDrops proves a slow Ephemeral subscriber (full buffer)
 // drops TokenDelta without blocking the publisher or other subscribers and
 // without failing the subscription.
@@ -233,8 +355,8 @@ func TestEnduringOverflowFailsSubscription(t *testing.T) {
 			if !ok {
 				t.Fatalf("fast.Events() closed at publish #%d — fast was wrongly failed", i)
 			}
-			if got.Class() != event.Enduring {
-				t.Errorf("fast got %T (class %v), want an Enduring StepDone", got, got.Class())
+			if got.Event.Class() != event.Enduring {
+				t.Errorf("fast got %T (class %v), want an Enduring StepDone", got.Event, got.Event.Class())
 			}
 		default:
 			t.Fatalf("fast had no buffered event after synchronous publish #%d", i)
@@ -421,9 +543,9 @@ func TestStopSession(t *testing.T) {
 func expectNoMore(t *testing.T, sub *EventSubscription) {
 	t.Helper()
 	select {
-	case ev, ok := <-sub.Events():
+	case d, ok := <-sub.Events():
 		if ok {
-			t.Fatalf("unexpected extra event: %T", ev)
+			t.Fatalf("unexpected extra event: %T", d.Event)
 		}
 	case <-time.After(50 * time.Millisecond):
 	}

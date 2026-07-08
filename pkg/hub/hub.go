@@ -116,19 +116,25 @@ func (h *Hub) unsubscribe(sub *EventSubscription) {
 // After SessionStopped, the event is still appended+delivered (filtered) but no
 // longer mutates active/phase and never derives SessionIdle/SessionActive.
 func (h *Hub) PublishEvent(ctx context.Context, ev event.Event) error {
-	// (1)+(2) Ephemeral: no append. Enduring: append before apply, fail-secure.
+	// (1)+(2) Ephemeral: no append, seq stays 0. Enduring: append before apply,
+	// fail-secure; capture the durable sequence to ride the live delivery.
+	var seq uint64
 	if ev.Class() == event.Enduring {
-		if err := h.appender.AppendEvent(ctx, ev); err != nil {
+		s, err := h.appender.AppendEvent(ctx, ev)
+		if err != nil {
 			h.reporter.ReportFault(ctx, &SessionPersistenceFault{Event: ev, Cause: err})
 			return nil
 		}
+		seq = s
 	}
 
 	// (3) Apply under the lock; derive the at-most-one session event D; snapshot subs.
 	subs, derived := h.applyAndSnapshot(ev)
 
 	// (4) Mint + durably append a derived session event before it (or ev) goes live.
-	// On failure neither ev nor D is delivered, and the fault is raised.
+	// On failure neither ev nor D is delivered, and the fault is raised. D carries its
+	// OWN append sequence.
+	var derivedSeq uint64
 	if derived != nil {
 		stamped, err := h.factory.Stamp(derived.EventHeader())
 		if err != nil {
@@ -136,17 +142,19 @@ func (h *Hub) PublishEvent(ctx context.Context, ev event.Event) error {
 			return nil
 		}
 		derived = withHeader(derived, stamped)
-		if err := h.appender.AppendEvent(ctx, derived); err != nil {
+		ds, err := h.appender.AppendEvent(ctx, derived)
+		if err != nil {
 			h.reporter.ReportFault(ctx, &SessionPersistenceFault{Event: derived, Cause: err})
 			return nil
 		}
+		derivedSeq = ds
 	}
 
 	// (5) Deliver live in causal order, then wake idle waiters AFTER the durable
 	// append of the SessionIdle edge.
-	h.deliver(subs, ev)
+	h.deliver(subs, ev, seq)
 	if derived != nil {
-		h.deliver(subs, derived)
+		h.deliver(subs, derived, derivedSeq)
 		h.signalIdleIfEdge(derived)
 	}
 	return nil
@@ -230,18 +238,20 @@ func activeMutation(ev event.Event) (func(*sessionState), bool) {
 	}
 }
 
-// deliver fans one event out to a snapshot of subscribers, OUTSIDE the lock. Per
-// subscriber it applies the declared-interest filter (ShouldDeliver), then a
-// non-blocking send into the bounded egress channel. On overflow the class-aware
+// deliver fans one event out to a snapshot of subscribers, OUTSIDE the lock, wrapping
+// it with its durable journal sequence seq (0 for Ephemeral, the append sequence for
+// Enduring) in an event.Delivery. Per subscriber it applies the declared-interest
+// filter (ShouldDeliver) to the UNWRAPPED event, then a non-blocking send into the
+// bounded egress channel. On overflow the class-aware
 // policy applies: an Ephemeral event is dropped for that subscriber; an Enduring
 // event fails that subscription with a typed loss error (never silently dropped),
 // and delivery continues to other subscribers. It never blocks.
-func (h *Hub) deliver(subs []*EventSubscription, ev event.Event) {
+func (h *Hub) deliver(subs []*EventSubscription, ev event.Event, seq uint64) {
 	for _, sub := range subs {
 		if !event.ShouldDeliver(sub.filter, ev) {
 			continue
 		}
-		switch sub.trySend(ev) {
+		switch sub.trySend(event.Delivery{Event: ev, JournalSeq: seq}) {
 		case sendDelivered, sendClosed:
 			// Delivered, or the subscription is already torn down (a Close/fail
 			// racing this snapshot) — skip it either way.
@@ -302,11 +312,12 @@ func (h *Hub) appendAndDeliverDerived(ctx context.Context, subs []*EventSubscrip
 		return
 	}
 	derived = withHeader(derived, stamped)
-	if err := h.appender.AppendEvent(ctx, derived); err != nil {
+	seq, err := h.appender.AppendEvent(ctx, derived)
+	if err != nil {
 		h.reporter.ReportFault(ctx, &SessionPersistenceFault{Event: derived, Cause: err})
 		return
 	}
-	h.deliver(subs, derived)
+	h.deliver(subs, derived, seq)
 	h.signalIdleIfEdge(derived)
 }
 
@@ -376,7 +387,8 @@ func (h *Hub) StopSession(ctx context.Context) {
 	}
 	stopped.Coordinates = identity.Coordinates{SessionID: h.sessionID}
 	ev := event.SessionStopped{Header: stopped}
-	if err := h.appender.AppendEvent(ctx, ev); err != nil {
+	seq, err := h.appender.AppendEvent(ctx, ev)
+	if err != nil {
 		h.reporter.ReportFault(ctx, &SessionPersistenceFault{Event: ev, Cause: err})
 		return
 	}
@@ -397,8 +409,8 @@ func (h *Hub) StopSession(ctx context.Context) {
 	subs := h.snapshotSubsLocked()
 	h.mu.Unlock()
 
-	// (3) Deliver the durable SessionStopped live.
-	h.deliver(subs, ev)
+	// (3) Deliver the durable SessionStopped live, carrying its append sequence.
+	h.deliver(subs, ev, seq)
 }
 
 // WaitIdle blocks until the session is quiescent (active empty), ctx is done, or

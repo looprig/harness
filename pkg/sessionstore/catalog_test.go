@@ -492,7 +492,7 @@ func TestCatalogUpsertRoundTrip(t *testing.T) {
 		Header: event.Header{Coordinates: identity.Coordinates{SessionID: sid}, CreatedAt: now},
 		Config: event.ConfigFingerprint{ModelID: "m"},
 	}
-	if err := c.UpdateOnEvent(ctx, started); err != nil {
+	if err := c.UpdateOnEvent(ctx, started, 0); err != nil {
 		t.Fatalf("UpdateOnEvent = %v, want nil", err)
 	}
 
@@ -531,7 +531,7 @@ func TestCatalogUpdateSemantics(t *testing.T) {
 		event.SessionStopped{Header: hdr(sid)},
 	}
 	for _, ev := range evs {
-		if err := c.UpdateOnEvent(ctx, ev); err != nil {
+		if err := c.UpdateOnEvent(ctx, ev, 0); err != nil {
 			t.Fatalf("UpdateOnEvent(%T) = %v, want nil", ev, err)
 		}
 	}
@@ -582,7 +582,7 @@ func TestCatalogListOrder(t *testing.T) {
 	for _, seed := range []byte{0x33, 0x11, 0x22} {
 		sid := fixedUUID(seed)
 		ev := event.SessionStarted{Header: event.Header{Coordinates: identity.Coordinates{SessionID: sid}, CreatedAt: now}, Config: event.ConfigFingerprint{ModelID: "m"}}
-		if err := c.UpdateOnEvent(ctx, ev); err != nil {
+		if err := c.UpdateOnEvent(ctx, ev, 0); err != nil {
 			t.Fatalf("UpdateOnEvent = %v", err)
 		}
 	}
@@ -659,7 +659,7 @@ func TestCatalogUpdateBestEffort(t *testing.T) {
 		kv.putErr = errors.New("kv down")
 		log := &recordingLogger{}
 		c := &Catalog{kv: kv, now: fixedClock(now), log: log}
-		if err := c.UpdateOnEvent(context.Background(), started); err != nil {
+		if err := c.UpdateOnEvent(context.Background(), started, 0); err != nil {
 			t.Fatalf("UpdateOnEvent = %v, want nil (best-effort)", err)
 		}
 		if log.count() != 1 {
@@ -677,7 +677,7 @@ func TestCatalogUpdateBestEffort(t *testing.T) {
 		kv.getErr = errors.New("kv read down")
 		log := &recordingLogger{}
 		c := &Catalog{kv: kv, now: fixedClock(now), log: log}
-		if err := c.UpdateOnEvent(context.Background(), started); err != nil {
+		if err := c.UpdateOnEvent(context.Background(), started, 0); err != nil {
 			t.Fatalf("UpdateOnEvent = %v, want nil (best-effort)", err)
 		}
 		if log.count() != 1 {
@@ -697,7 +697,7 @@ func TestCatalogUpdateBestEffort(t *testing.T) {
 		kv := newFakeKV()
 		c := &Catalog{kv: kv, now: fixedClock(now), log: nopCatalogLogger{}}
 		ev := event.SessionActive{Header: hdr(sid)}
-		if err := c.UpdateOnEvent(context.Background(), ev); err != nil {
+		if err := c.UpdateOnEvent(context.Background(), ev, 0); err != nil {
 			t.Fatalf("UpdateOnEvent = %v, want nil", err)
 		}
 		if kv.puts != 0 || kv.gets != 0 {
@@ -719,7 +719,7 @@ func TestCatalogUpsertRetriesOnConflict(t *testing.T) {
 	c := &Catalog{kv: kv, now: fixedClock(now), log: log}
 	started := event.SessionStarted{Header: event.Header{Coordinates: identity.Coordinates{SessionID: sid}, CreatedAt: now}, Config: event.ConfigFingerprint{ModelID: "m"}}
 
-	if err := c.UpdateOnEvent(context.Background(), started); err != nil {
+	if err := c.UpdateOnEvent(context.Background(), started, 0); err != nil {
 		t.Fatalf("UpdateOnEvent = %v, want nil", err)
 	}
 	if log.count() != 0 {
@@ -747,7 +747,7 @@ func TestCatalogUpsertConflictExhausted(t *testing.T) {
 	c := &Catalog{kv: kv, now: fixedClock(now), log: log}
 	started := event.SessionStarted{Header: event.Header{Coordinates: identity.Coordinates{SessionID: sid}, CreatedAt: now}, Config: event.ConfigFingerprint{ModelID: "m"}}
 
-	if err := c.UpdateOnEvent(context.Background(), started); err != nil {
+	if err := c.UpdateOnEvent(context.Background(), started, 0); err != nil {
 		t.Fatalf("UpdateOnEvent = %v, want nil (best-effort even on exhaustion)", err)
 	}
 	if log.count() != 1 {
@@ -785,7 +785,7 @@ func TestCatalogConcurrentDistinctSessions(t *testing.T) {
 			defer wg.Done()
 			sid := fixedUUID(byte(i + 1))
 			ev := event.SessionStarted{Header: event.Header{Coordinates: identity.Coordinates{SessionID: sid}, CreatedAt: now}, Config: event.ConfigFingerprint{ModelID: "m"}}
-			if err := c.UpdateOnEvent(ctx, ev); err != nil {
+			if err := c.UpdateOnEvent(ctx, ev, 0); err != nil {
 				t.Errorf("concurrent UpdateOnEvent = %v, want nil", err)
 			}
 		}()
@@ -821,7 +821,7 @@ func TestCatalogConcurrentSameSession(t *testing.T) {
 	ctx := context.Background()
 
 	started := event.SessionStarted{Header: event.Header{Coordinates: identity.Coordinates{SessionID: sid}, CreatedAt: now}, Config: event.ConfigFingerprint{ModelID: "m"}}
-	if err := c.UpdateOnEvent(ctx, started); err != nil {
+	if err := c.UpdateOnEvent(ctx, started, 0); err != nil {
 		t.Fatalf("seed UpdateOnEvent = %v", err)
 	}
 
@@ -830,7 +830,7 @@ func TestCatalogConcurrentSameSession(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if err := c.UpdateOnEvent(ctx, event.LoopStarted{Header: hdr(sid)}); err != nil {
+			if err := c.UpdateOnEvent(ctx, event.LoopStarted{Header: hdr(sid)}, 0); err != nil {
 				t.Errorf("concurrent UpdateOnEvent = %v, want nil (best-effort)", err)
 			}
 		}()

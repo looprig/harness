@@ -82,8 +82,8 @@ func observe(t *testing.T, s *Session) (*recordingSub, event.Subscription) {
 	}
 	rec := &recordingSub{}
 	go func() {
-		for ev := range sub.Events() {
-			rec.record(ev)
+		for d := range sub.Events() {
+			rec.record(d.Event)
 		}
 	}()
 	return rec, sub

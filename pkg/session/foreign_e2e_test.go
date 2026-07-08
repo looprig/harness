@@ -155,17 +155,18 @@ func foreignEventKind(ev event.Event) string {
 // loop's turn shape. The foreign loop emits no LoopIdle, so the turn is drained to its
 // terminal, never to a quiescence signal.
 func drainForeignTurn(t *testing.T, sub interface {
-	Events() <-chan event.Event
+	Events() <-chan event.Delivery
 }) []event.Event {
 	t.Helper()
 	deadline := time.After(5 * time.Second)
 	var out []event.Event
 	for {
 		select {
-		case ev, ok := <-sub.Events():
+		case d, ok := <-sub.Events():
 			if !ok {
 				t.Fatalf("subscription closed before a turn terminal; got %v", foreignKinds(out))
 			}
+			ev := d.Event
 			if !isForeignTurnEvent(ev) {
 				continue // skip session-scoped quiescence transitions on the fan-in.
 			}

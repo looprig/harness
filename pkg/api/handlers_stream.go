@@ -93,11 +93,11 @@ func streamEvents(r *http.Request, w http.ResponseWriter, rc *http.ResponseContr
 		select {
 		case <-r.Context().Done():
 			return
-		case ev, ok := <-sub.Events():
+		case d, ok := <-sub.Events():
 			if !ok {
 				return
 			}
-			b, err := event.MarshalEvent(ev)
+			b, err := event.MarshalEvent(d.Event)
 			if err != nil {
 				slog.Debug("api: events skip unmarshalable event", "err", err)
 				continue

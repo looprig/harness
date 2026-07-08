@@ -16,18 +16,20 @@ import (
 // drainSub reads from sub until the predicate is satisfied (returns true) or a
 // timeout elapses. It returns the ordered slice of kinds it observed for the events
 // it saw, plus whether the predicate fired.
-func drainSub(t *testing.T, sub interface{ Events() <-chan event.Event }, want func(ev event.Event) bool) ([]event.Event, bool) {
+func drainSub(t *testing.T, sub interface {
+	Events() <-chan event.Delivery
+}, want func(ev event.Event) bool) ([]event.Event, bool) {
 	t.Helper()
 	var seen []event.Event
 	deadline := time.After(2 * time.Second)
 	for {
 		select {
-		case ev, ok := <-sub.Events():
+		case d, ok := <-sub.Events():
 			if !ok {
 				return seen, false
 			}
-			seen = append(seen, ev)
-			if want(ev) {
+			seen = append(seen, d.Event)
+			if want(d.Event) {
 				return seen, true
 			}
 		case <-deadline:
@@ -68,13 +70,13 @@ func TestEndToEndQuiescence(t *testing.T) {
 		defer close(done)
 		for {
 			select {
-			case ev, ok := <-sub.Events():
+			case d, ok := <-sub.Events():
 				if !ok {
 					return
 				}
 				mu.Lock()
-				seen = append(seen, ev)
-				stop := isSessionIdle(ev)
+				seen = append(seen, d.Event)
+				stop := isSessionIdle(d.Event)
 				mu.Unlock()
 				if stop {
 					return

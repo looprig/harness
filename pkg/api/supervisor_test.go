@@ -65,16 +65,16 @@ var (
 // channel WITHOUT an intentional stop(); Close reuses the same once so a later
 // stop() is a safe no-op rather than a double-close panic.
 type fakeSub struct {
-	ch   chan event.Event
+	ch   chan event.Delivery
 	once sync.Once
 
 	mu  sync.Mutex
 	err error
 }
 
-func newFakeSub() *fakeSub { return &fakeSub{ch: make(chan event.Event, 16)} }
+func newFakeSub() *fakeSub { return &fakeSub{ch: make(chan event.Delivery, 16)} }
 
-func (s *fakeSub) Events() <-chan event.Event { return s.ch }
+func (s *fakeSub) Events() <-chan event.Delivery { return s.ch }
 
 func (s *fakeSub) Close() error {
 	s.once.Do(func() { close(s.ch) })
@@ -87,7 +87,7 @@ func (s *fakeSub) Err() error {
 	return s.err
 }
 
-func (s *fakeSub) feed(ev event.Event) { s.ch <- ev }
+func (s *fakeSub) feed(ev event.Event) { s.ch <- event.Delivery{Event: ev} }
 
 func (s *fakeSub) fail(err error) {
 	s.mu.Lock()

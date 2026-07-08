@@ -178,11 +178,11 @@ func TestSubagentResultNeverRejectedReleasesWakeViaInputCancelled(t *testing.T) 
 	deadline := time.After(2 * time.Second)
 	for !sawRelease {
 		select {
-		case ev, ok := <-sub.Events():
+		case d, ok := <-sub.Events():
 			if !ok {
 				t.Fatal("subscription closed before the InputCancelled wake-release")
 			}
-			if ic, ok := ev.(event.InputCancelled); ok && ic.Cause.LoopID == subagentLoopID {
+			if ic, ok := d.Event.(event.InputCancelled); ok && ic.Cause.LoopID == subagentLoopID {
 				sawRelease = true
 			}
 		case <-deadline:

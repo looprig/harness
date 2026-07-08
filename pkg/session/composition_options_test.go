@@ -17,11 +17,11 @@ type recordingEventAppender struct {
 	events []event.Event
 }
 
-func (r *recordingEventAppender) AppendEvent(_ context.Context, ev event.Event) error {
+func (r *recordingEventAppender) AppendEvent(_ context.Context, ev event.Event) (uint64, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.events = append(r.events, ev)
-	return nil
+	return uint64(len(r.events)), nil
 }
 
 func (r *recordingEventAppender) snapshot() []event.Event {

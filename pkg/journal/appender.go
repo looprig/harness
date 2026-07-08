@@ -26,7 +26,7 @@ func (*NilJournalError) Error() string {
 // it). The appender therefore ignores its return, and a catalog failure can never
 // affect the append's success/failure semantics.
 type catalogUpdater interface {
-	UpdateOnEvent(ctx context.Context, ev event.Event) error
+	UpdateOnEvent(ctx context.Context, ev event.Event, seq uint64) error
 }
 
 // nopCatalogUpdater is the default catalogUpdater: it indexes nothing. It is the safe
@@ -34,7 +34,7 @@ type catalogUpdater interface {
 // behaves exactly as before — no catalog, no extra I/O.
 type nopCatalogUpdater struct{}
 
-func (nopCatalogUpdater) UpdateOnEvent(context.Context, event.Event) error { return nil }
+func (nopCatalogUpdater) UpdateOnEvent(context.Context, event.Event, uint64) error { return nil }
 
 // JournalEventAppender adapts a SessionJournal (the write side) to the narrow
 // "append one Enduring event" seam the session hub depends on. The hub holds an
@@ -97,19 +97,23 @@ func NewJournalEventAppenderChecked(journal SessionJournal, opts ...AppenderOpti
 // event.MarshalEvent fails closed inside Append, so this path stays fail-secure. The
 // returned sequence is discarded — the hub needs only the success/failure signal.
 //
-// ONLY after the durable append succeeds does it best-effort notify the catalog so the
-// replay-free session index stays current. The catalog update is the soft tail: its
-// error is swallowed inside UpdateOnEvent and cannot change this method's return — the
-// durable append stays strict, the catalog is derivable. On an append failure the
-// catalog is NOT touched (the event did not durably land).
-func (a *JournalEventAppender) AppendEvent(ctx context.Context, ev event.Event) error {
-	if _, err := a.journal.Append(ctx, NewEventRecord(ev)); err != nil {
-		return err
+// It returns the assigned durable journal sequence so the hub can ride it on the LIVE
+// delivery (event.Delivery.JournalSeq) — the sequence NEVER enters the persisted event
+// codec. ONLY after the durable append succeeds does it best-effort notify the catalog
+// (with the same sequence) so the replay-free session index stays current. The catalog
+// update is the soft tail: its error is swallowed inside UpdateOnEvent and cannot change
+// this method's return — the durable append stays strict, the catalog is derivable. On an
+// append failure the catalog is NOT touched (the event did not durably land) and seq 0 is
+// returned alongside the error.
+func (a *JournalEventAppender) AppendEvent(ctx context.Context, ev event.Event) (uint64, error) {
+	seq, err := a.journal.Append(ctx, NewEventRecord(ev))
+	if err != nil {
+		return 0, err
 	}
 	// Best-effort, post-success: UpdateOnEvent never returns a non-nil error by
 	// contract, so the catalog can never fail the append. The return is ignored.
-	_ = a.catalog.UpdateOnEvent(ctx, ev)
-	return nil
+	_ = a.catalog.UpdateOnEvent(ctx, ev, seq)
+	return seq, nil
 }
 
 // JournalCommandAppender adapts a SessionJournal to the narrow "append one command"
