@@ -12,6 +12,7 @@ import (
 	"github.com/looprig/harness/pkg/command"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/foreignloop"
+	"github.com/looprig/harness/pkg/gate"
 	"github.com/looprig/harness/pkg/hub"
 	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/loop"
@@ -272,6 +273,32 @@ type Session struct {
 	// checker reads Current on a loop goroutine while SetSecurityCeiling applies on the
 	// dispatch goroutine.
 	ceiling *ceiling.State
+
+	// gatesMu protects gates and the per-entry state transitions. The gate
+	// directory is session-owned (the session is the source of truth for which
+	// gates are preparing/open/claiming/closed), so all directory mutations
+	// serialize behind this mutex.
+	gatesMu sync.Mutex
+
+	// gates is the authoritative gate directory: gate.ID -> gateEntry. An entry
+	// exists from PrepareGateOpen (state=preparing) through ActivateGate (open)
+	// and RespondGate/CloseGate (claiming -> closed/removed). ListGates returns
+	// only open entries.
+	gates map[gate.ID]gateEntry
+
+	// gateAppender is the STRICT durable append seam for gate prepare/open/resolve.
+	// Unlike the hub's PublishEvent (which faults and returns nil on append
+	// failure), this seam returns the append error so PrepareGateOpen/ActivateGate
+	// can fail closed — a failed prepare installs no directory entry, a failed
+	// activate leaves the gate preparing. The nop default (nopGateAppender) keeps
+	// headless/no-persistence mode unchanged; the composition root wires the real
+	// journal+hub adapter via WithGateAppender.
+	gateAppender gateAppender
+
+	// gateCaps bounds the live gate directory. The cap counts preparing + open +
+	// claiming so failed activations cannot accumulate invisible prepared entries.
+	// Zero (the default) means no cap — the session accepts unlimited gates.
+	gateCaps GateCaps
 }
 
 // eventAppender is the session's narrow view of the hub's REQUIRED durable event tap:
@@ -769,6 +796,10 @@ func newSession(ctx context.Context, cfg loop.Config, newID idGenerator, now eve
 		// Audit-only intent-log appender: nop by default (no-persistence/headless mode).
 		// The composition root (Phase 10) overrides it via WithCommandAppender below.
 		cmdAppender: nopCommandAppender{},
+		// Gate directory: nop appender + empty directory by default; the composition
+		// root wires the real journal+hub adapter via WithGateAppender.
+		gates:        map[gate.ID]gateEntry{},
+		gateAppender: nopGateAppender{},
 	}
 	// Apply optional dependency injections (e.g. WithCommandAppender, WithEventAppender)
 	// before any command can be dispatched or the hub is built, so an injected appender is
