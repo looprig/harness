@@ -288,7 +288,7 @@ func (s *Session) RespondGate(ctx context.Context, response gate.GateResponse) e
 		s.gatesMu.Unlock()
 		return &GateError{GateID: response.GateID, Kind: GateActionInvalid}
 	}
-	cmd, audit, err := s.translateGateResponse(entry, response)
+	translated, err := s.translateGateResponse(entry, response)
 	if err != nil {
 		s.gatesMu.Unlock()
 		return err
@@ -297,7 +297,7 @@ func (s *Session) RespondGate(ctx context.Context, response gate.GateResponse) e
 	s.gates[response.GateID] = entry
 	s.gatesMu.Unlock()
 
-	resolved, err := s.buildGateResolved(entry, response, audit)
+	resolved, err := s.buildGateResolved(entry, response, translated.audit, translated.approvalScope)
 	if err != nil {
 		s.revertClaiming(response.GateID)
 		return err
@@ -311,7 +311,8 @@ func (s *Session) RespondGate(ctx context.Context, response gate.GateResponse) e
 	delete(s.gates, response.GateID)
 	s.gatesMu.Unlock()
 
-	return s.dispatchGateCommand(entry, cmd)
+	_ = s.dispatchGateCommand(entry, translated.cmd)
+	return nil
 }
 
 // revertClaiming reverts a gate from claiming back to open after a failed
@@ -339,10 +340,9 @@ func validateGateAction(g gate.Gate, action string) bool {
 	return false
 }
 
-// buildGateResolved stamps and builds the GateResolved event from the response
-// and the resolved audit. The scope is extracted from response.Values for
-// permission approve responses.
-func (s *Session) buildGateResolved(entry gateEntry, response gate.GateResponse, audit gate.ResponseAudit) (event.GateResolved, error) {
+// buildGateResolved stamps and builds the GateResolved event from the response,
+// resolved audit, and already-validated approval scope.
+func (s *Session) buildGateResolved(entry gateEntry, response gate.GateResponse, audit gate.ResponseAudit, approvalScope *tool.ApprovalScope) (event.GateResolved, error) {
 	stamped, err := s.factory.Stamp(event.Header{Coordinates: entry.coordinates})
 	if err != nil {
 		return event.GateResolved{}, &GateError{GateID: response.GateID, Kind: GateAppendFailed, Cause: err}
@@ -355,10 +355,8 @@ func (s *Session) buildGateResolved(entry gateEntry, response gate.GateResponse,
 		Source: response.Source,
 		Audit:  audit,
 	}
-	if raw, ok := response.Values["scope"]; ok {
-		if err := json.Unmarshal(raw, &resolved.ApprovalScope); err != nil {
-			return event.GateResolved{}, &GateError{GateID: response.GateID, Kind: GateActionInvalid, Cause: err}
-		}
+	if approvalScope != nil {
+		resolved.ApprovalScope = *approvalScope
 	}
 	return resolved, nil
 }
@@ -374,13 +372,20 @@ func (s *Session) dispatchGateCommand(entry gateEntry, cmd command.Command) erro
 	return s.routeGate(s.sessionCtx, entry.route.LoopID, l, cmd)
 }
 
+type translatedGateResponse struct {
+	cmd           command.Command
+	audit         gate.ResponseAudit
+	approvalScope *tool.ApprovalScope
+}
+
 // translateGateResponse validates the payload-specific parts of the response and
-// builds the translated command and the redacted audit. It returns a typed
-// *GateError on validation failure (invalid grants, missing values, unknown kind).
-func (s *Session) translateGateResponse(entry gateEntry, response gate.GateResponse) (command.Command, gate.ResponseAudit, error) {
+// builds the translated command, redacted audit, and validated approval scope. It
+// returns a typed *GateError on validation failure (invalid grants, missing
+// values, unknown kind).
+func (s *Session) translateGateResponse(entry gateEntry, response gate.GateResponse) (translatedGateResponse, error) {
 	cmdID, err := s.newCommandID()
 	if err != nil {
-		return nil, nil, &GateError{GateID: response.GateID, Kind: GateAppendFailed, Cause: err}
+		return translatedGateResponse{}, &GateError{GateID: response.GateID, Kind: GateAppendFailed, Cause: err}
 	}
 	hdr := command.Header{CommandID: cmdID, Agency: identity.AgencyUser, CreatedAt: s.stampNow()}
 	route := command.GateRoute{
@@ -393,48 +398,57 @@ func (s *Session) translateGateResponse(entry gateEntry, response gate.GateRespo
 	case gate.KindAskUser:
 		return s.translateAskUserResponse(hdr, route, response)
 	default:
-		return nil, nil, &GateError{GateID: response.GateID, Kind: GateKindMismatch}
+		return translatedGateResponse{}, &GateError{GateID: response.GateID, Kind: GateKindMismatch}
 	}
 }
 
 // translatePermissionResponse builds an ApproveToolCall or DenyToolCall from a
 // permission gate response. For approve, it extracts scope and accepted_grants
 // from Values and validates the grants against the payload's request.
-func (s *Session) translatePermissionResponse(hdr command.Header, route command.GateRoute, payload gate.Payload, response gate.GateResponse) (command.Command, gate.ResponseAudit, error) {
+func (s *Session) translatePermissionResponse(hdr command.Header, route command.GateRoute, payload gate.Payload, response gate.GateResponse) (translatedGateResponse, error) {
 	switch response.Action {
 	case "approve":
 		scope, grants, audit, err := validatePermissionApprove(payload, response)
 		if err != nil {
-			return nil, nil, err
+			return translatedGateResponse{}, err
 		}
-		return command.ApproveToolCall{Header: hdr, GateRoute: route, Scope: scope, AcceptedGrants: grants}, audit, nil
+		return translatedGateResponse{
+			cmd:           command.ApproveToolCall{Header: hdr, GateRoute: route, Scope: scope, AcceptedGrants: grants},
+			audit:         audit,
+			approvalScope: &scope,
+		}, nil
 	case "deny":
-		return command.DenyToolCall{Header: hdr, GateRoute: route}, nil, nil
+		return translatedGateResponse{cmd: command.DenyToolCall{Header: hdr, GateRoute: route}}, nil
 	default:
-		return nil, nil, &GateError{GateID: response.GateID, Kind: GateActionInvalid}
+		return translatedGateResponse{}, &GateError{GateID: response.GateID, Kind: GateActionInvalid}
 	}
 }
 
 // translateAskUserResponse builds a ProvideUserInput from an ask-user gate
 // response. It extracts the answer from Values["answer"].
-func (s *Session) translateAskUserResponse(hdr command.Header, route command.GateRoute, response gate.GateResponse) (command.Command, gate.ResponseAudit, error) {
+func (s *Session) translateAskUserResponse(hdr command.Header, route command.GateRoute, response gate.GateResponse) (translatedGateResponse, error) {
 	var answer string
 	if raw, ok := response.Values["answer"]; ok {
 		if err := json.Unmarshal(raw, &answer); err != nil {
-			return nil, nil, &GateError{GateID: response.GateID, Kind: GateActionInvalid, Cause: err}
+			return translatedGateResponse{}, &GateError{GateID: response.GateID, Kind: GateActionInvalid, Cause: err}
 		}
 	}
 	preview := answer
 	if len(preview) > 80 {
 		preview = preview[:80]
 	}
-	return command.ProvideUserInput{Header: hdr, GateRoute: route, Answer: answer}, gate.AskUserAudit{AnswerPreview: preview}, nil
+	return translatedGateResponse{
+		cmd:   command.ProvideUserInput{Header: hdr, GateRoute: route, Answer: answer},
+		audit: gate.AskUserAudit{AnswerPreview: preview},
+	}, nil
 }
 
 // validatePermissionApprove extracts scope and accepted_grants from the response
-// Values, validates the grant tokens against the payload's BashRequest.Grants,
-// and builds the PermissionAudit from the accepted grant descriptions (not
-// tokens). An accepted grant not in the request's Grants fails secure.
+// Values, validates the scope against the payload request's AllowedScopes,
+// validates Bash grant tokens against the request's Grants, and builds the
+// PermissionAudit from the accepted grant descriptions (not tokens). A scope the
+// request did not offer or an accepted grant not in the request's Grants fails
+// secure.
 func validatePermissionApprove(payload gate.Payload, response gate.GateResponse) (tool.ApprovalScope, []string, gate.ResponseAudit, error) {
 	scope := tool.ScopeOnce
 	if raw, ok := response.Values["scope"]; ok {
@@ -442,15 +456,19 @@ func validatePermissionApprove(payload gate.Payload, response gate.GateResponse)
 			return 0, nil, nil, &GateError{GateID: response.GateID, Kind: GateActionInvalid, Cause: err}
 		}
 	}
+	permPayload, ok := permissionPayloadFromGatePayload(payload)
+	if !ok || permPayload.Request == nil {
+		return 0, nil, nil, &GateError{GateID: response.GateID, Kind: GateActionInvalid}
+	}
+	if !approvalScopeAllowed(scope, permPayload.Request.AllowedScopes()) {
+		return 0, nil, nil, &GateError{GateID: response.GateID, Kind: GateActionInvalid}
+	}
+
 	var grants []string
 	if raw, ok := response.Values["accepted_grants"]; ok {
 		if err := json.Unmarshal(raw, &grants); err != nil {
 			return 0, nil, nil, &GateError{GateID: response.GateID, Kind: GateActionInvalid, Cause: err}
 		}
-	}
-	permPayload, ok := payload.(gate.PermissionPayload)
-	if !ok {
-		return scope, grants, gate.PermissionAudit{}, nil
 	}
 	bashReq, ok := permPayload.Request.(tool.BashRequest)
 	if !ok {
@@ -469,4 +487,27 @@ func validatePermissionApprove(payload gate.Payload, response gate.GateResponse)
 		descs = append(descs, desc)
 	}
 	return scope, grants, gate.PermissionAudit{AcceptedGrantDescriptions: descs}, nil
+}
+
+func permissionPayloadFromGatePayload(payload gate.Payload) (gate.PermissionPayload, bool) {
+	switch v := payload.(type) {
+	case gate.PermissionPayload:
+		return v, true
+	case *gate.PermissionPayload:
+		if v == nil {
+			return gate.PermissionPayload{}, false
+		}
+		return *v, true
+	default:
+		return gate.PermissionPayload{}, false
+	}
+}
+
+func approvalScopeAllowed(scope tool.ApprovalScope, allowed []tool.ApprovalScope) bool {
+	for _, candidate := range allowed {
+		if scope == candidate {
+			return true
+		}
+	}
+	return false
 }

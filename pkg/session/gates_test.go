@@ -13,6 +13,7 @@ import (
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/gate"
 	"github.com/looprig/harness/pkg/hub"
+	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/journal"
 	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/harness/pkg/tool"
@@ -489,6 +490,9 @@ func TestRespondGateApproveDispatchesCommand(t *testing.T) {
 	if app.resolved[0].Reason != gate.CloseAnswered {
 		t.Errorf("resolved reason = %q, want %q", app.resolved[0].Reason, gate.CloseAnswered)
 	}
+	if app.resolved[0].ApprovalScope != tool.ScopeSession {
+		t.Errorf("resolved approval scope = %d, want %d (ScopeSession)", app.resolved[0].ApprovalScope, tool.ScopeSession)
+	}
 }
 
 // TestRespondGateDenyDispatchesCommand proves a human deny response dispatches a
@@ -604,6 +608,98 @@ func TestRespondGateValidatesAcceptedGrants(t *testing.T) {
 	select {
 	case c := <-cmds:
 		t.Errorf("invalid grants dispatched a command %T, want none", c)
+	default:
+	}
+}
+
+// TestRespondGateRejectsScopeOutsidePermissionRequest proves approve fails
+// secure when the response asks for a scope the PermissionRequest did not offer.
+func TestRespondGateRejectsScopeOutsidePermissionRequest(t *testing.T) {
+	t.Parallel()
+	s, app, loopID, cmds := gateSession(t)
+	payload := gate.PermissionPayload{Request: tool.UnknownRequest{
+		Tool:    "Mystery",
+		Summary: "redacted call",
+	}}
+	gateID := prepareAndActivate(t, s, loopID, payload)
+
+	err := s.RespondGate(context.Background(), gate.GateResponse{
+		GateID: gateID,
+		Action: "approve",
+		Values: map[string]json.RawMessage{
+			"scope": json.RawMessage(`1`),
+		},
+		Source: gate.ResponseSource{Kind: gate.ResponseFromUser},
+	})
+	if err == nil {
+		t.Fatal("RespondGate() error = nil, want scope validation failure")
+	}
+	var ge *GateError
+	if !errors.As(err, &ge) || ge.Kind != GateActionInvalid {
+		t.Fatalf("RespondGate() error = %v, want *GateError{GateActionInvalid}", err)
+	}
+	if len(app.resolved) != 0 {
+		t.Errorf("appender recorded %d resolved events, want 0", len(app.resolved))
+	}
+
+	select {
+	case c := <-cmds:
+		t.Errorf("invalid scope dispatched a command %T, want none", c)
+	default:
+	}
+}
+
+func TestBuildGateResolvedUsesValidatedApprovalScope(t *testing.T) {
+	t.Parallel()
+	s, _, loopID, _ := gateSession(t)
+	entry := gateEntry{
+		coordinates: identity.Coordinates{
+			SessionID: s.SessionID,
+			LoopID:    loopID,
+			TurnID:    mustUUID(),
+			StepID:    mustUUID(),
+		},
+	}
+	gateID := gate.ID(mustUUID())
+	validatedScope := tool.ScopeSession
+
+	resolved, err := s.buildGateResolved(entry, gate.GateResponse{
+		GateID: gateID,
+		Action: "approve",
+		Values: map[string]json.RawMessage{
+			"scope": json.RawMessage(`"invalid raw scope"`),
+		},
+	}, gate.PermissionAudit{}, &validatedScope)
+	if err != nil {
+		t.Fatalf("buildGateResolved() error = %v", err)
+	}
+	if resolved.ApprovalScope != tool.ScopeSession {
+		t.Fatalf("ApprovalScope = %d, want %d (ScopeSession)", resolved.ApprovalScope, tool.ScopeSession)
+	}
+}
+
+// TestRespondGateReturnsNilAfterDurableAppendWhenDispatchFails proves a
+// post-append route lookup failure does not make a durably accepted response look
+// rejected to the caller.
+func TestRespondGateReturnsNilAfterDurableAppendWhenDispatchFails(t *testing.T) {
+	t.Parallel()
+	s, app, loopID, cmds := gateSession(t)
+	gateID := prepareAndActivate(t, s, loopID, gate.PermissionPayload{})
+	delete(s.loops, loopID)
+
+	if err := s.RespondGate(context.Background(), gate.GateResponse{GateID: gateID, Action: "deny"}); err != nil {
+		t.Fatalf("RespondGate() error = %v, want nil after durable append", err)
+	}
+	if len(app.resolved) != 1 {
+		t.Fatalf("appender recorded %d resolved events, want 1", len(app.resolved))
+	}
+	if got := s.ListGates(context.Background()); len(got) != 0 {
+		t.Fatalf("ListGates() returned %d gates after durable append, want 0", len(got))
+	}
+
+	select {
+	case c := <-cmds:
+		t.Errorf("dispatch failure sent command %T, want none", c)
 	default:
 	}
 }

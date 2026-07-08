@@ -13,7 +13,10 @@ const (
 	responseAuditKindAskUser    responseAuditKind = "ask_user"
 )
 
-var errMissingResponseAuditData = errors.New("missing response audit data")
+var (
+	errMissingResponseAuditData = errors.New("missing response audit data")
+	errNullResponseAuditData    = errors.New("null response audit data")
+)
 
 // ResponseAudit is the sealed union of durable, redacted gate response audit records.
 type ResponseAudit interface {
@@ -107,6 +110,9 @@ func UnmarshalResponseAudit(data []byte) (ResponseAudit, error) {
 	}
 	if len(wrapper.Data) == 0 {
 		return nil, &ResponseAuditDecodeError{Kind: string(wrapper.Kind), Cause: errMissingResponseAuditData}
+	}
+	if isExplicitJSONNull(wrapper.Data) {
+		return nil, &ResponseAuditDecodeError{Kind: string(wrapper.Kind), Cause: errNullResponseAuditData}
 	}
 	return unmarshalResponseAuditData(wrapper.Kind, wrapper.Data)
 }

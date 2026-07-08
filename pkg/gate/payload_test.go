@@ -92,6 +92,31 @@ func TestPayloadMalformedFailsClosedWithTypedError(t *testing.T) {
 	}
 }
 
+func TestPayloadExplicitNullDataFailsClosed(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		data string
+	}{
+		{name: "ask user", data: `{"kind":"ask_user","data":null}`},
+		{name: "resume input", data: `{"kind":"resume_input","data":null}`},
+		{name: "open", data: `{"kind":"open","data":null}`},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			_, err := UnmarshalPayload([]byte(tt.data))
+			var decode *PayloadDecodeError
+			if !errors.As(err, &decode) {
+				t.Fatalf("UnmarshalPayload(%q) error = %v, want *PayloadDecodeError", tt.data, err)
+			}
+		})
+	}
+}
+
 func TestPermissionPayloadUsesToolCodec(t *testing.T) {
 	t.Parallel()
 
@@ -199,6 +224,30 @@ func TestResponseAuditMalformedFailsClosedWithTypedError(t *testing.T) {
 		{name: "truncated", data: `{"kind":"ask_user",`},
 		{name: "wrong wrapper shape", data: `[]`},
 		{name: "wrong field type", data: `{"kind":"ask_user","data":{"answer_preview":42}}`},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			_, err := UnmarshalResponseAudit([]byte(tt.data))
+			var decode *ResponseAuditDecodeError
+			if !errors.As(err, &decode) {
+				t.Fatalf("UnmarshalResponseAudit(%q) error = %v, want *ResponseAuditDecodeError", tt.data, err)
+			}
+		})
+	}
+}
+
+func TestResponseAuditExplicitNullDataFailsClosed(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		data string
+	}{
+		{name: "permission", data: `{"kind":"permission","data":null}`},
+		{name: "ask user", data: `{"kind":"ask_user","data":null}`},
 	}
 	for _, tt := range tests {
 		tt := tt
