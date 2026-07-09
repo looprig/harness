@@ -5,11 +5,13 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/looprig/core/content"
 	"github.com/looprig/harness/pkg/event"
 )
 
@@ -113,10 +115,20 @@ func eventsRequest(t *testing.T, ctx context.Context, sid string) *http.Request 
 	return req
 }
 
+// quietConfig builds a config whose SSE heartbeat is far longer than any test's
+// bounded wait, so the keep-alive ticker never races the assertion in tests that are
+// about frame content rather than heartbeats.
+func quietConfig() *config {
+	c := newConfig()
+	c.heartbeat = time.Hour
+	return c
+}
+
 // TestHandleEventsStreamsEnduring proves a single Enduring delivery is written as
-// exactly one SSE `data:` frame whose payload equals MarshalEvent's output, 200 with
-// Content-Type text/event-stream, and that closing the subscription channel ends the
-// handler.
+// exactly one SSE frame of the new wire shape —
+// event: enduring\nid: <JournalSeq>\ndata: {"v":1,"event":<MarshalEvent>}\n\n — 200
+// with Content-Type text/event-stream plus the no-cache/no-buffer headers, and that
+// closing the subscription channel ends the handler and tears down the subscription.
 func TestHandleEventsStreamsEnduring(t *testing.T) {
 	t.Parallel()
 
@@ -129,13 +141,14 @@ func TestHandleEventsStreamsEnduring(t *testing.T) {
 
 	sub := &fakeSubscription{ch: make(chan event.Delivery, 4)}
 	sess := &fakeSession{sub: sub}
-	srv := newServer[*fakeSession](&fakeRunner{}, nil, newConfig())
+	srv := newServer[*fakeSession](&fakeRunner{}, nil, quietConfig())
 	srv.registry.put(sid, sess)
 
 	rec := newFlushRecorder()
 	done := runEvents(srv, rec, eventsRequest(t, context.Background(), eventsSIDStr))
 
-	sub.ch <- event.Delivery{Event: ev, JournalSeq: 1}
+	const seq = 42
+	sub.ch <- event.Delivery{Event: ev, JournalSeq: seq}
 	select {
 	case <-rec.flushes:
 	case <-time.After(streamDeadline):
@@ -145,11 +158,18 @@ func TestHandleEventsStreamsEnduring(t *testing.T) {
 	if ct := rec.Header().Get("Content-Type"); ct != "text/event-stream" {
 		t.Errorf("Content-Type = %q, want text/event-stream", ct)
 	}
+	if cc := rec.Header().Get("Cache-Control"); cc != "no-store" {
+		t.Errorf("Cache-Control = %q, want no-store", cc)
+	}
+	if xb := rec.Header().Get("X-Accel-Buffering"); xb != "no" {
+		t.Errorf("X-Accel-Buffering = %q, want no", xb)
+	}
 	if got := rec.statusCode(); got != http.StatusOK {
 		t.Errorf("status = %d, want %d", got, http.StatusOK)
 	}
-	if got, frame := rec.snapshot(), "data: "+string(want)+"\n\n"; got != frame {
-		t.Errorf("frame = %q, want %q", got, frame)
+	wantFrame := "event: enduring\nid: 42\ndata: {\"v\":1,\"event\":" + string(want) + "}\n\n"
+	if got := rec.snapshot(); got != wantFrame {
+		t.Errorf("frame = %q, want %q", got, wantFrame)
 	}
 
 	close(sub.ch)
@@ -163,14 +183,213 @@ func TestHandleEventsStreamsEnduring(t *testing.T) {
 	}
 }
 
-// TestHandleEventsSkipsEphemeral proves an Ephemeral delivery (which MarshalEvent
-// rejects) is SKIPPED without aborting the loop: a FOLLOWING Enduring delivery is
-// still emitted, and it is the only frame written.
-func TestHandleEventsSkipsEphemeral(t *testing.T) {
+// TestHandleEventsZeroSeqEnduring proves a zero-JournalSeq Enduring delivery still
+// stamps an id: line — "id: 0" — rather than omitting it, so the frame shape is
+// stable (the decided behavior; a real appender never emits seq 0).
+func TestHandleEventsZeroSeqEnduring(t *testing.T) {
 	t.Parallel()
 
 	sid := parseTestUUID(t, eventsSIDStr)
-	eph := event.TokenDelta{TurnIndex: 1}
+	ev := event.TurnDone{TurnIndex: 1}
+	want, err := event.MarshalEvent(ev)
+	if err != nil {
+		t.Fatalf("MarshalEvent(TurnDone) error = %v", err)
+	}
+
+	sub := &fakeSubscription{ch: make(chan event.Delivery, 4)}
+	sess := &fakeSession{sub: sub}
+	srv := newServer[*fakeSession](&fakeRunner{}, nil, quietConfig())
+	srv.registry.put(sid, sess)
+
+	rec := newFlushRecorder()
+	done := runEvents(srv, rec, eventsRequest(t, context.Background(), eventsSIDStr))
+
+	sub.ch <- event.Delivery{Event: ev, JournalSeq: 0}
+	select {
+	case <-rec.flushes:
+	case <-time.After(streamDeadline):
+		t.Fatalf("no frame flushed within %v", streamDeadline)
+	}
+
+	wantFrame := "event: enduring\nid: 0\ndata: {\"v\":1,\"event\":" + string(want) + "}\n\n"
+	if got := rec.snapshot(); got != wantFrame {
+		t.Errorf("frame = %q, want %q", got, wantFrame)
+	}
+
+	close(sub.ch)
+	select {
+	case <-done:
+	case <-time.After(streamDeadline):
+		t.Fatalf("handler did not return within %v after channel close", streamDeadline)
+	}
+}
+
+// TestHandleEventsStreamsEphemeral proves each recognized Ephemeral kind is written
+// as exactly one `event: ephemeral\ndata: {EphemeralFrame}\n\n` frame with the right
+// kind, v:1, tagged delta, and NO id: line — and that a TokenDelta's content.Chunk is
+// mapped to its tagged live DTO, never leaked as a raw Go-struct dump.
+func TestHandleEventsStreamsEphemeral(t *testing.T) {
+	t.Parallel()
+
+	execID := parseTestUUID(t, "55555555-5555-5555-5555-555555555555")
+
+	tests := []struct {
+		name        string
+		ev          event.Event
+		wantKind    string
+		wantInDelta []string // substrings that MUST appear in the delta JSON
+		wantHasDrop bool     // frame carries a "delta" key at all
+	}{
+		{
+			name:        "token_delta text chunk",
+			ev:          event.TokenDelta{TurnIndex: 1, Chunk: &content.TextChunk{Text: "hi"}},
+			wantKind:    "token_delta",
+			wantInDelta: []string{`"chunk_type":"text"`, `"text":"hi"`},
+			wantHasDrop: true,
+		},
+		{
+			name:        "token_delta thinking chunk",
+			ev:          event.TokenDelta{TurnIndex: 1, Chunk: &content.ThinkingChunk{Thinking: "hmm"}},
+			wantKind:    "token_delta",
+			wantInDelta: []string{`"chunk_type":"thinking"`, `"thinking":"hmm"`},
+			wantHasDrop: true,
+		},
+		{
+			name:        "token_delta tool_use chunk",
+			ev:          event.TokenDelta{TurnIndex: 1, Chunk: &content.ToolUseChunk{Index: 2, ID: "tu_1", Name: "Bash", InputJSON: `{"a":1}`}},
+			wantKind:    "token_delta",
+			wantInDelta: []string{`"chunk_type":"tool_use"`, `"index":2`, `"id":"tu_1"`, `"name":"Bash"`, `"input_json":"{\"a\":1}"`},
+			wantHasDrop: true,
+		},
+		{
+			name:        "tool_call_started",
+			ev:          event.ToolCallStarted{ToolExecutionID: execID, ToolName: "Bash", Summary: "ls -la"},
+			wantKind:    "tool_call_started",
+			wantInDelta: []string{`"tool_name":"Bash"`, `"summary":"ls -la"`},
+			wantHasDrop: true,
+		},
+		{
+			name:        "tool_call_completed",
+			ev:          event.ToolCallCompleted{ToolExecutionID: execID, IsError: true, ResultPreview: "boom"},
+			wantKind:    "tool_call_completed",
+			wantInDelta: []string{`"is_error":true`, `"result_preview":"boom"`},
+			wantHasDrop: true,
+		},
+		{
+			name:        "input_queued has no delta",
+			ev:          event.InputQueued{},
+			wantKind:    "input_queued",
+			wantInDelta: nil,
+			wantHasDrop: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			sid := parseTestUUID(t, eventsSIDStr)
+			sub := &fakeSubscription{ch: make(chan event.Delivery, 4)}
+			sess := &fakeSession{sub: sub}
+			srv := newServer[*fakeSession](&fakeRunner{}, nil, quietConfig())
+			srv.registry.put(sid, sess)
+
+			rec := newFlushRecorder()
+			done := runEvents(srv, rec, eventsRequest(t, context.Background(), eventsSIDStr))
+
+			// JournalSeq is 0 for Ephemeral deliveries; the frame must carry NO id:.
+			sub.ch <- event.Delivery{Event: tt.ev}
+			select {
+			case <-rec.flushes:
+			case <-time.After(streamDeadline):
+				t.Fatalf("no frame flushed within %v", streamDeadline)
+			}
+
+			got := rec.snapshot()
+			if !strings.HasPrefix(got, "event: ephemeral\ndata: ") {
+				t.Errorf("frame = %q, want event: ephemeral prefix", got)
+			}
+			if !strings.HasSuffix(got, "\n\n") {
+				t.Errorf("frame = %q, want trailing blank line", got)
+			}
+			if strings.Contains(got, "id:") {
+				t.Errorf("frame = %q must NOT carry an id: line (ephemeral is never sequenced)", got)
+			}
+			if !strings.Contains(got, `"kind":"`+tt.wantKind+`"`) {
+				t.Errorf("frame = %q, want kind %q", got, tt.wantKind)
+			}
+			if !strings.Contains(got, `"v":1`) {
+				t.Errorf("frame = %q, want v:1", got)
+			}
+			for _, want := range tt.wantInDelta {
+				if !strings.Contains(got, want) {
+					t.Errorf("frame = %q, want delta substring %q", got, want)
+				}
+			}
+			if tt.wantHasDrop && !strings.Contains(got, `"delta":`) {
+				t.Errorf("frame = %q, want a delta key", got)
+			}
+			if !tt.wantHasDrop && strings.Contains(got, `"delta":`) {
+				t.Errorf("frame = %q, want NO delta key for %s", got, tt.wantKind)
+			}
+
+			close(sub.ch)
+			select {
+			case <-done:
+			case <-time.After(streamDeadline):
+				t.Fatalf("handler did not return within %v after channel close", streamDeadline)
+			}
+		})
+	}
+}
+
+// TestHandleEventsChunkNoLeak proves a token_delta frame carries the tagged chunk DTO
+// and never leaks content.Chunk's Go-struct field names (e.g. a PascalCase "Text" key
+// from a naive json.Marshal of the sealed type).
+func TestHandleEventsChunkNoLeak(t *testing.T) {
+	t.Parallel()
+
+	sid := parseTestUUID(t, eventsSIDStr)
+	sub := &fakeSubscription{ch: make(chan event.Delivery, 4)}
+	sess := &fakeSession{sub: sub}
+	srv := newServer[*fakeSession](&fakeRunner{}, nil, quietConfig())
+	srv.registry.put(sid, sess)
+
+	rec := newFlushRecorder()
+	done := runEvents(srv, rec, eventsRequest(t, context.Background(), eventsSIDStr))
+
+	sub.ch <- event.Delivery{Event: event.TokenDelta{Chunk: &content.TextChunk{Text: "secret"}}}
+	select {
+	case <-rec.flushes:
+	case <-time.After(streamDeadline):
+		t.Fatalf("no frame flushed within %v", streamDeadline)
+	}
+
+	got := rec.snapshot()
+	if !strings.Contains(got, `"chunk_type":"text"`) {
+		t.Errorf("frame = %q, want tagged chunk_type", got)
+	}
+	if strings.Contains(got, `"Text"`) || strings.Contains(got, `"Chunk"`) {
+		t.Errorf("frame = %q leaks a content.Chunk Go-struct field name", got)
+	}
+
+	close(sub.ch)
+	select {
+	case <-done:
+	case <-time.After(streamDeadline):
+		t.Fatalf("handler did not return within %v after channel close", streamDeadline)
+	}
+}
+
+// TestHandleEventsSkipsUnrecognizedEphemeral proves an Ephemeral event this transport
+// cannot represent (a TokenDelta with a nil chunk — no known variant) is SKIPPED
+// without aborting the loop: a FOLLOWING Enduring delivery is still emitted, and it is
+// the only frame written.
+func TestHandleEventsSkipsUnrecognizedEphemeral(t *testing.T) {
+	t.Parallel()
+
+	sid := parseTestUUID(t, eventsSIDStr)
+	eph := event.TokenDelta{TurnIndex: 1} // nil Chunk => unrepresentable => skipped
 	end := event.TurnDone{TurnIndex: 2}
 	want, err := event.MarshalEvent(end)
 	if err != nil {
@@ -179,7 +398,7 @@ func TestHandleEventsSkipsEphemeral(t *testing.T) {
 
 	sub := &fakeSubscription{ch: make(chan event.Delivery, 4)}
 	sess := &fakeSession{sub: sub}
-	srv := newServer[*fakeSession](&fakeRunner{}, nil, newConfig())
+	srv := newServer[*fakeSession](&fakeRunner{}, nil, quietConfig())
 	srv.registry.put(sid, sess)
 
 	rec := newFlushRecorder()
@@ -193,8 +412,9 @@ func TestHandleEventsSkipsEphemeral(t *testing.T) {
 		t.Fatalf("no frame flushed within %v", streamDeadline)
 	}
 
-	if got, frame := rec.snapshot(), "data: "+string(want)+"\n\n"; got != frame {
-		t.Errorf("frame = %q, want exactly the enduring frame %q (ephemeral not skipped?)", got, frame)
+	wantFrame := "event: enduring\nid: 7\ndata: {\"v\":1,\"event\":" + string(want) + "}\n\n"
+	if got := rec.snapshot(); got != wantFrame {
+		t.Errorf("frame = %q, want exactly the enduring frame %q (ephemeral not skipped?)", got, wantFrame)
 	}
 
 	close(sub.ch)
@@ -202,6 +422,51 @@ func TestHandleEventsSkipsEphemeral(t *testing.T) {
 	case <-done:
 	case <-time.After(streamDeadline):
 		t.Fatalf("handler did not return within %v after channel close", streamDeadline)
+	}
+}
+
+// TestHandleEventsHeartbeat proves an idle stream emits a `: ping` SSE comment on the
+// injected (tiny) heartbeat interval and that the cache/no-buffer headers are set. The
+// wait is bounded by streamDeadline (a backstop), and the assertion is the ping bytes,
+// not a fixed sleep.
+func TestHandleEventsHeartbeat(t *testing.T) {
+	t.Parallel()
+
+	sid := parseTestUUID(t, eventsSIDStr)
+	sub := &fakeSubscription{ch: make(chan event.Delivery)} // never delivers => idle
+	sess := &fakeSession{sub: sub}
+	cfg := newConfig()
+	cfg.heartbeat = 2 * time.Millisecond
+	srv := newServer[*fakeSession](&fakeRunner{}, nil, cfg)
+	srv.registry.put(sid, sess)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	rec := newFlushRecorder()
+	done := runEvents(srv, rec, eventsRequest(t, ctx, eventsSIDStr))
+
+	// Wait for the first heartbeat flush (bounded by the deadline backstop).
+	select {
+	case <-rec.flushes:
+	case <-time.After(streamDeadline):
+		t.Fatalf("no heartbeat flushed within %v", streamDeadline)
+	}
+
+	if cc := rec.Header().Get("Cache-Control"); cc != "no-store" {
+		t.Errorf("Cache-Control = %q, want no-store", cc)
+	}
+	if xb := rec.Header().Get("X-Accel-Buffering"); xb != "no" {
+		t.Errorf("X-Accel-Buffering = %q, want no", xb)
+	}
+	if got := rec.snapshot(); !strings.Contains(got, ": ping\n\n") {
+		t.Errorf("stream = %q, want a : ping comment frame", got)
+	}
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(streamDeadline):
+		t.Fatalf("handler did not return within %v after cancel", streamDeadline)
 	}
 }
 

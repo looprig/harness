@@ -1,6 +1,9 @@
 package serve
 
-import "net/http"
+import (
+	"net/http"
+	"time"
+)
 
 // defaultMaxBodyBytes is the request-body cap applied when WithMaxBodyBytes is not
 // given (or is given a non-positive value): 1 MiB. Session-control request bodies
@@ -10,6 +13,13 @@ import "net/http"
 // bodyCapMiddleware).
 const defaultMaxBodyBytes int64 = 1 << 20
 
+// defaultHeartbeatInterval is the SSE keep-alive cadence applied when the config is
+// built with the secure default: every 20s an idle events stream emits a `: ping`
+// comment so the connection (and any intermediary idle timeout) stays alive. Tests
+// override the (unexported) config.heartbeat field directly with a few-millisecond
+// value for deterministic, sleep-free heartbeat assertions.
+const defaultHeartbeatInterval = 20 * time.Second
+
 // config is serve's assembled server configuration: an optional request
 // authenticator and the request-body cap. It is built once from the secure
 // defaults plus Options (newConfig) at the composition root and is read-only on
@@ -18,6 +28,10 @@ const defaultMaxBodyBytes int64 = 1 << 20
 type config struct {
 	authn        func(*http.Request) error
 	maxBodyBytes int64
+	// heartbeat is the SSE keep-alive interval for the events stream. It is set to
+	// defaultHeartbeatInterval by newConfig and is not exposed via an Option (no
+	// caller need has surfaced); tests set it directly for deterministic assertions.
+	heartbeat time.Duration
 }
 
 // Option mutates a config during construction (the functional-options pattern).
@@ -29,7 +43,7 @@ type Option func(*config)
 // 1 MiB body cap) and applies opts in order. A nil Option in the list is skipped.
 // The returned config is ready for wrap.
 func newConfig(opts ...Option) *config {
-	c := &config{maxBodyBytes: defaultMaxBodyBytes}
+	c := &config{maxBodyBytes: defaultMaxBodyBytes, heartbeat: defaultHeartbeatInterval}
 	for _, opt := range opts {
 		if opt != nil {
 			opt(c)

@@ -2,7 +2,7 @@ package serve
 
 import (
 	"errors"
-	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"time"
@@ -16,6 +16,10 @@ const (
 	// msgSubscribeFailed is the generic, client-safe 500 message when a session's
 	// event subscription cannot be opened; the concrete cause is logged, never sent.
 	msgSubscribeFailed = "could not subscribe to session events"
+	// ssePing is the SSE comment frame emitted on the heartbeat interval to keep an
+	// idle connection (and any intermediary) alive. It begins with ':' so an
+	// EventSource client ignores it — it carries no event.
+	ssePing = ": ping\n\n"
 )
 
 // allEventsFilter is the whole-session subscription the SSE stream opens: both
@@ -58,6 +62,11 @@ func (s *server[S]) handleEvents(w http.ResponseWriter, r *http.Request) {
 	defer func() { _ = sub.Close() }()
 
 	w.Header().Set("Content-Type", contentTypeSSE)
+	// Never cache a live event stream, and disable proxy buffering (nginx's
+	// X-Accel-Buffering) so frames and heartbeats reach the client immediately
+	// rather than being coalesced by an intermediary (spec §8).
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("X-Accel-Buffering", "no")
 	w.WriteHeader(http.StatusOK)
 
 	rc := http.NewResponseController(w)
@@ -68,29 +77,43 @@ func (s *server[S]) handleEvents(w http.ResponseWriter, r *http.Request) {
 		slog.Debug("serve: events set write deadline", "err", err)
 	}
 
-	streamEvents(r, w, rc, sub)
+	streamEvents(r, w, rc, sub, s.cfg.heartbeat)
 }
 
-// streamEvents copies deliveries from sub onto w as SSE `data:` frames until the
-// client disconnects (r.Context cancelled) or the subscription ends (channel
-// closed). An event the marshaler rejects — every Ephemeral event, plus any unknown
-// type — is SKIPPED (never aborting the stream): the durable envelope is the Phase-1
-// SSE payload and Ephemeral deltas are a documented omission. MarshalEvent returns
-// compact single-line JSON, so one `data:` line per event is well-formed.
-func streamEvents(r *http.Request, w http.ResponseWriter, rc *http.ResponseController, sub event.Subscription) {
+// streamEvents copies deliveries from sub onto w as SSE frames until the client
+// disconnects (r.Context cancelled) or the subscription ends (channel closed). Each
+// delivery is rendered by encodeDelivery into either an `event: enduring` frame (with
+// an id: line stamping d.JournalSeq) or an `event: ephemeral` frame (never sequenced);
+// a delivery encodeDelivery rejects — an Enduring event outside the sealed union, or
+// an unrecognized Ephemeral event — is SKIPPED, never aborting the stream.
+//
+// An independent ticker emits a `: ping` SSE comment every heartbeat interval so an
+// idle stream (and any intermediary) stays alive; it fires on a fixed cadence
+// regardless of event activity (simplest correct choice — a client ignores comment
+// frames, so an occasional ping alongside real traffic is harmless).
+func streamEvents(r *http.Request, w http.ResponseWriter, rc *http.ResponseController, sub event.Subscription, heartbeat time.Duration) {
+	ticker := time.NewTicker(heartbeat)
+	defer ticker.Stop()
 	for {
 		select {
 		case <-r.Context().Done():
 			return
+		case <-ticker.C:
+			if _, err := io.WriteString(w, ssePing); err != nil {
+				return
+			}
+			if err := rc.Flush(); err != nil {
+				return
+			}
 		case d, ok := <-sub.Events():
 			if !ok {
 				return
 			}
-			data, err := event.MarshalEvent(d.Event)
-			if err != nil {
+			frame, ok := encodeDelivery(d)
+			if !ok {
 				continue
 			}
-			if _, err := fmt.Fprintf(w, "data: %s\n\n", data); err != nil {
+			if _, err := w.Write(frame); err != nil {
 				return
 			}
 			if err := rc.Flush(); err != nil {
