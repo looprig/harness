@@ -94,40 +94,45 @@ func TestImportAllowed(t *testing.T) {
 
 // TestProductionImportsAreAllowed is the dependency-inversion guard: it parses every
 // non-test .go file in the serve package directory and fails if any import is neither
-// stdlib nor in allowedImports. It is stdlib-only (go/parser + go/ast) so it needs no
-// toolchain subprocess, and it inspects the CURRENT package directory (resolved from
+// stdlib nor in allowedImports. It is stdlib-only (os.ReadDir + go/parser) so it needs
+// no toolchain subprocess, and it inspects the CURRENT package directory (resolved from
 // this test file) so it is independent of the process CWD.
 func TestProductionImportsAreAllowed(t *testing.T) {
 	t.Parallel()
 
 	dir := packageDir(t)
-	fset := token.NewFileSet()
-	pkgs, err := parser.ParseDir(fset, dir, isProductionFile, parser.ImportsOnly)
+	entries, err := os.ReadDir(dir)
 	if err != nil {
-		t.Fatalf("parse serve package dir %q: %v", dir, err)
+		t.Fatalf("read serve package dir %q: %v", dir, err)
 	}
 
-	for pkgName, pkg := range pkgs {
-		for filePath, file := range pkg.Files {
-			for _, imp := range file.Imports {
-				path, uerr := strconv.Unquote(imp.Path.Value)
-				if uerr != nil {
-					t.Fatalf("%s: unquote import %q: %v", filePath, imp.Path.Value, uerr)
-				}
-				if !importAllowed(path) {
-					t.Errorf("package %s file %s imports disallowed path %q; production serve may import only stdlib plus %v",
-						pkgName, filepath.Base(filePath), path, sortedAllowed())
-				}
+	fset := token.NewFileSet()
+	for _, entry := range entries {
+		if entry.IsDir() || !isProductionFile(entry.Name()) {
+			continue
+		}
+		filePath := filepath.Join(dir, entry.Name())
+		file, perr := parser.ParseFile(fset, filePath, nil, parser.ImportsOnly)
+		if perr != nil {
+			t.Fatalf("parse serve file %q: %v", filePath, perr)
+		}
+		for _, imp := range file.Imports {
+			path, uerr := strconv.Unquote(imp.Path.Value)
+			if uerr != nil {
+				t.Fatalf("%s: unquote import %q: %v", filePath, imp.Path.Value, uerr)
+			}
+			if !importAllowed(path) {
+				t.Errorf("file %s imports disallowed path %q; production serve may import only stdlib plus %v",
+					entry.Name(), path, sortedAllowed())
 			}
 		}
 	}
 }
 
-// isProductionFile is the parser.ParseDir filter: include only non-test .go files, so
-// the guard inspects the production package and never the _test.go files (which MAY
-// import pkg/session for the structural-satisfaction proofs above).
-func isProductionFile(info os.FileInfo) bool {
-	name := info.Name()
+// isProductionFile reports whether a directory entry name is a production (non-test)
+// Go source file, so the guard inspects the production package and never the _test.go
+// files (which MAY import pkg/session for the structural-satisfaction proofs above).
+func isProductionFile(name string) bool {
 	return strings.HasSuffix(name, ".go") && !strings.HasSuffix(name, "_test.go")
 }
 

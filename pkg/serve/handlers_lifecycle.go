@@ -89,7 +89,7 @@ func (s *server[S]) handleCreate(w http.ResponseWriter, r *http.Request) {
 		// Submit after attach: the session is already reachable, so any event the
 		// submission produces can be observed on the stream by the correlated id.
 		// A Submit failure leaves the session attached (it exists and is live); the
-		// client may retry Submit or interrupt/delete it — we do not detach here.
+		// client may retry Submit, or interrupt the session — we do not detach here.
 		cmdID, err := sess.Submit(r.Context(), blocks)
 		if err != nil {
 			writeErrorCause(w, http.StatusInternalServerError, codeInternal, msgSubmitFailed, false, err)
