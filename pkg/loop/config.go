@@ -15,6 +15,7 @@ type Engine uint8
 const (
 	EngineNative Engine = iota
 	EngineForeignClaude
+	EngineForeignCodex
 )
 
 type Config struct {
@@ -31,8 +32,8 @@ type Config struct {
 	AgentName identity.AgentName
 
 	// Engine selects the loop backend. Zero = EngineNative (the historical path).
-	// EngineForeignClaude routes construction through the injected foreign Builder
-	// at the session composition root; loop.New itself only ever builds native.
+	// Foreign engines route construction through the injected foreign Builder at
+	// the session composition root; loop.New itself only ever builds native.
 	Engine Engine
 
 	// Tools is the runner's view of the tool subsystem (the consumer surface in

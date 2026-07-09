@@ -7,12 +7,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/looprig/harness/pkg/command"
 	"github.com/looprig/core/content"
+	"github.com/looprig/core/uuid"
+	"github.com/looprig/harness/pkg/command"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/foreignloop"
 	"github.com/looprig/harness/pkg/loop"
-	"github.com/looprig/core/uuid"
 )
 
 // fixedForeignSID is the deterministic session id the fake foreign Builder returns, so
@@ -144,6 +144,12 @@ func TestForeignNewLoop(t *testing.T) {
 			wireBuilder: false,
 			wantErr:     true,
 			wantKind:    SessionForeignBuilderMissing,
+		},
+		{
+			name:     "codex foreign engine without a builder fails closed",
+			engine:   loop.EngineForeignCodex,
+			wantErr:  true,
+			wantKind: SessionForeignBuilderMissing,
 		},
 		{
 			name:        "native engine is unaffected (empty ForeignSID)",

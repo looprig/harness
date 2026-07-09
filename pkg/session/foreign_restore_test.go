@@ -94,6 +94,14 @@ func TestForeignRestore(t *testing.T) {
 			wantKind:    RestoreForeignBuilderMissing,
 		},
 		{
+			name:        "codex foreign restore without a restored builder fails closed",
+			engine:      loop.EngineForeignCodex,
+			foreignSID:  recoveredSID,
+			wireBuilder: false,
+			wantErr:     true,
+			wantKind:    RestoreForeignBuilderMissing,
+		},
+		{
 			name:        "native restore is unaffected",
 			engine:      loop.EngineNative,
 			foreignSID:  "", // irrelevant for native — the branch never reads it
