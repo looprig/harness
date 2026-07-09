@@ -19,17 +19,22 @@ import (
 // stack of each handler invocation.
 type server[S LiveSession] struct {
 	runner   Runner[S]
+	reader   Reader
 	registry *registry
 	cfg      *config
 }
 
-// newServer builds a server over the supplied runner and config, minting a fresh
-// empty registry. runner and cfg are wired at the composition root; a nil cfg is a
-// programming error (the composition root always builds one via newConfig) and is
-// not defended against here.
-func newServer[S LiveSession](runner Runner[S], cfg *config) *server[S] {
+// newServer builds a server over the supplied runner, read-plane reader, and config,
+// minting a fresh empty registry. runner, reader, and cfg are wired at the composition
+// root; a nil cfg is a programming error (the composition root always builds one via
+// newConfig) and is not defended against here. reader is the stateless read plane
+// (list/status/journal); it is independent of the live registry — a read never
+// consults a live session — so a nil reader is tolerated by the control/lifecycle
+// routes that never touch it (the read handlers require it).
+func newServer[S LiveSession](runner Runner[S], reader Reader, cfg *config) *server[S] {
 	return &server[S]{
 		runner:   runner,
+		reader:   reader,
 		registry: newRegistry(),
 		cfg:      cfg,
 	}

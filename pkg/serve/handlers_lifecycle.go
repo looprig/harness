@@ -30,6 +30,7 @@ const (
 	msgSubmitFailed  = "could not submit input"
 	msgRestoreFailed = "could not restore session"
 	msgInvalidSID    = "invalid session id"
+	msgInvalidParam  = "invalid query parameter"
 	msgNotFound      = "session not found"
 
 	msgInterruptFailed = "could not interrupt session"

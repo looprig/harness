@@ -208,7 +208,7 @@ func TestServerHandleCreate(t *testing.T) {
 			cmdID := parseTestUUID(t, cmdIDStr)
 			sess := &fakeSession{submitID: cmdID, submitErr: tt.submitErr}
 			runner := &fakeRunner{runID: runID, runSess: sess, runErr: tt.runErr}
-			srv := newServer[*fakeSession](runner, newConfig())
+			srv := newServer[*fakeSession](runner, nil, newConfig())
 
 			var req *http.Request
 			if tt.hasBody {
@@ -316,7 +316,7 @@ func TestServerHandleRestore(t *testing.T) {
 
 			sess := &fakeSession{}
 			runner := &fakeRunner{restoreSess: sess, restoreErr: tt.restoreErr}
-			srv := newServer[*fakeSession](runner, newConfig())
+			srv := newServer[*fakeSession](runner, nil, newConfig())
 
 			req := httptest.NewRequest(http.MethodPost, "/v1/sessions/"+tt.sid+"/restore", http.NoBody)
 			req.SetPathValue("sid", tt.sid)

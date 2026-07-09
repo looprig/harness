@@ -129,7 +129,7 @@ func TestHandleEventsStreamsEnduring(t *testing.T) {
 
 	sub := &fakeSubscription{ch: make(chan event.Delivery, 4)}
 	sess := &fakeSession{sub: sub}
-	srv := newServer[*fakeSession](&fakeRunner{}, newConfig())
+	srv := newServer[*fakeSession](&fakeRunner{}, nil, newConfig())
 	srv.registry.put(sid, sess)
 
 	rec := newFlushRecorder()
@@ -179,7 +179,7 @@ func TestHandleEventsSkipsEphemeral(t *testing.T) {
 
 	sub := &fakeSubscription{ch: make(chan event.Delivery, 4)}
 	sess := &fakeSession{sub: sub}
-	srv := newServer[*fakeSession](&fakeRunner{}, newConfig())
+	srv := newServer[*fakeSession](&fakeRunner{}, nil, newConfig())
 	srv.registry.put(sid, sess)
 
 	rec := newFlushRecorder()
@@ -213,7 +213,7 @@ func TestHandleEventsClientCancel(t *testing.T) {
 	sid := parseTestUUID(t, eventsSIDStr)
 	sub := &fakeSubscription{ch: make(chan event.Delivery)}
 	sess := &fakeSession{sub: sub}
-	srv := newServer[*fakeSession](&fakeRunner{}, newConfig())
+	srv := newServer[*fakeSession](&fakeRunner{}, nil, newConfig())
 	srv.registry.put(sid, sess)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -275,7 +275,7 @@ func TestHandleEventsErrors(t *testing.T) {
 			t.Parallel()
 
 			sess := &fakeSession{subErr: tt.subErr}
-			srv := newServer[*fakeSession](&fakeRunner{}, newConfig())
+			srv := newServer[*fakeSession](&fakeRunner{}, nil, newConfig())
 			if tt.register {
 				srv.registry.put(parseTestUUID(t, eventsSIDStr), sess)
 			}
