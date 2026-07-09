@@ -46,8 +46,8 @@
 - `golang.org/x/net/html` — HTML tokenizer; required by the `WebSearch` tool's DuckDuckGo HTML-scrape `SearchProvider` (stdlib has no HTML parser)
 - `golang.org/x/net/idna` — IDNA/punycode host normalization (same `golang.org/x/net` module as above); required by the `Fetch` tool's persisted-approval host matching to defeat unicode homographs (stdlib has no IDNA)
 - `github.com/looprig/storage` — leaf storage contracts (`Ledger`/`Leaser`/`KV`/`Blobs`) + in-memory reference backend (`memstore`) + conformance suite (`storetest`); stdlib-only. The NATS deps moved to the `looprig/natsstore` backend module; `fsstore`/`rclonestore` are the other storekit backends.
-- `github.com/yuin/goldmark` — CommonMark markdown → HTML for the transcript export renderer (`pkg/transcript/html`); the stdlib has no markdown renderer, which is why a dep is warranted. Pure-Go, no cgo, CommonMark-compliant, safe HTML output. Rendered with raw-HTML passthrough **disabled** (no `html.WithUnsafe()`) — that is the XSS boundary; the result is placed via `template.HTML` only because goldmark has already escaped it. **Approved by the user on 2026-06-28.**
 - The TUI + CLI presentation layer (and its charm.land stack) now lives in the sibling module github.com/looprig/cli.
+- The transcript reconstruction + HTML-export layer (`pkg/transcript`, `.../html`, `.../journalsource`) was archived out of harness on 2026-07-09 (moved to `../archive/transcript/`) pending relocation into the `github.com/looprig/cli` module — it had no in-harness consumer, only cli imports it. That removal dropped `github.com/yuin/goldmark` (its only user was `pkg/transcript/html`), so harness core no longer carries a CommonMark markdown renderer. See `docs/plans/2026-07-02-looprig-console-extraction-plan.md` (Task 5) for the pending cli-side relocation.
 
 ## Secure Coding Patterns
 
