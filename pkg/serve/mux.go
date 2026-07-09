@@ -12,15 +12,16 @@ import "net/http"
 // and the bare /v1/sessions listing (pure reads over durable history). {sid} and
 // {gid} are wildcard path segments the handlers recover via r.PathValue.
 const (
-	routeCreate    = "POST /v1/sessions"
-	routeList      = "GET /v1/sessions"
-	routeRestore   = "POST /v1/sessions/{sid}/restore"
-	routeInput     = "POST /v1/sessions/{sid}/input"
-	routeInterrupt = "POST /v1/sessions/{sid}/interrupt"
-	routeGate      = "POST /v1/sessions/{sid}/gates/{gid}"
-	routeEvents    = "GET /v1/sessions/{sid}/events"
-	routeStatus    = "GET /v1/sessions/{sid}/status"
-	routeJournal   = "GET /v1/sessions/{sid}/journal"
+	routeCapabilities = "GET /v1/capabilities"
+	routeCreate       = "POST /v1/sessions"
+	routeList         = "GET /v1/sessions"
+	routeRestore      = "POST /v1/sessions/{sid}/restore"
+	routeInput        = "POST /v1/sessions/{sid}/input"
+	routeInterrupt    = "POST /v1/sessions/{sid}/interrupt"
+	routeGate         = "POST /v1/sessions/{sid}/gates/{gid}"
+	routeEvents       = "GET /v1/sessions/{sid}/events"
+	routeStatus       = "GET /v1/sessions/{sid}/status"
+	routeJournal      = "GET /v1/sessions/{sid}/journal"
 )
 
 // authAware is the narrow, unexported view Server uses to learn — WITHOUT
@@ -72,6 +73,7 @@ func Handler[S LiveSession](runner Runner[S], reads Reader, opts ...Option) http
 	srv := newServer(runner, reads, cfg)
 
 	mux := http.NewServeMux()
+	mux.HandleFunc(routeCapabilities, srv.handleCapabilities)
 	mux.HandleFunc(routeCreate, srv.handleCreate)
 	mux.HandleFunc(routeList, srv.handleListSessions)
 	mux.HandleFunc(routeRestore, srv.handleRestore)
