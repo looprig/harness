@@ -259,9 +259,9 @@ form `codex exec resume <thread_id> --json <prompt>` to verify continuation.
 The opt-in CLI contract test parser-probes `--cd`, `--sandbox`,
 `--ask-for-approval`, and `--add-dir` before and after `resume`, using `--help`
 only, and stops before live commands if a flag has no valid placement. On the
-locally tested CLI, `--cd`, `--sandbox`, and `--add-dir` parse only before
-`resume`; `--ask-for-approval` parses in neither placement. This is
-version-dependent:
+locally tested `codex-cli 0.144.0`, `--cd`, `--sandbox`, and `--add-dir` parse
+only before `resume`; `--ask-for-approval` parses in neither placement. This
+observation is version-sensitive:
 deployments needing equivalent settings must use their CLI version's supported
 `-c key=value` override or persist them in the profile/config used by resume.
 Exact config keys are intentionally not specified. Keep the opt-in test as the
