@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -161,6 +162,29 @@ func TestAgentSpawnContextCancelClosesEvents(t *testing.T) {
 	cancel()
 	assertEventsClosePromptly(t, stream)
 	err1 := stream.Close()
+	if err2 := stream.Close(); err2 != err1 {
+		t.Fatalf("second Close() error = %v, want same error %v", err2, err1)
+	}
+}
+
+func TestAgentSpawnCloseClosesEventsWithoutDrain(t *testing.T) {
+	t.Parallel()
+	fake := newFakeCodex(t)
+	stream, err := (&Agent{
+		ExecPath: fake.path,
+		Env:      fake.env("FAKE_MODE=block_on_event"),
+	}).Spawn(context.Background(), foreignloop.ForeignTurn{
+		Cwd:      t.TempDir(),
+		StartNew: true,
+		Input:    []content.Block{&content.TextBlock{Text: "do not drain"}},
+	})
+	if err != nil {
+		t.Fatalf("Spawn() error = %v", err)
+	}
+	waitForBlockedDecoderSend(t)
+
+	err1 := stream.Close()
+	assertEventsAlreadyClosed(t, stream)
 	if err2 := stream.Close(); err2 != err1 {
 		t.Fatalf("second Close() error = %v, want same error %v", err2, err1)
 	}
@@ -322,6 +346,36 @@ func assertEventsClosePromptly(t *testing.T, stream foreignloop.ForeignStream) {
 	}
 }
 
+func assertEventsAlreadyClosed(t *testing.T, stream foreignloop.ForeignStream) {
+	t.Helper()
+	timer := time.NewTimer(500 * time.Millisecond)
+	defer timer.Stop()
+	select {
+	case ev, ok := <-stream.Events():
+		if ok {
+			t.Fatalf("Events() yielded %#v after Close without a drain, want closed channel", ev)
+		}
+	case <-timer.C:
+		t.Fatal("timed out waiting for Events() to close after Close without a drain")
+	}
+}
+
+func waitForBlockedDecoderSend(t *testing.T) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	buf := make([]byte, 1<<20)
+	for time.Now().Before(deadline) {
+		n := runtime.Stack(buf, true)
+		stacks := string(buf[:n])
+		if strings.Contains(stacks, "github.com/looprig/harness/pkg/foreignloop/codex.decodeJSONL.func") &&
+			(strings.Contains(stacks, "[chan send]") || strings.Contains(stacks, "[select]")) {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("timed out waiting for decoder goroutine to block on event send")
+}
+
 type fakeCodex struct {
 	path      string
 	argvFile  string
@@ -360,6 +414,12 @@ case "${FAKE_MODE:-happy}" in
     exit 0
     ;;
   long_running)
+    trap 'exit 0' INT TERM
+    printf '%s\n' '{"type":"thread.started","thread_id":"codex-thread-from-jsonl"}'
+    sleep 60
+    exit 0
+    ;;
+  block_on_event)
     trap 'exit 0' INT TERM
     printf '%s\n' '{"type":"thread.started","thread_id":"codex-thread-from-jsonl"}'
     sleep 60

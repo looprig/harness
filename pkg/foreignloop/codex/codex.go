@@ -41,8 +41,8 @@ func (a *Agent) Spawn(ctx context.Context, t foreignloop.ForeignTurn) (foreignlo
 	if err != nil {
 		return nil, &foreignloop.SpawnError{Cause: err}
 	}
-	events, decErr := decodeJSONL(stdout)
-	s := &stream{events: events, cmd: cmd, decErr: decErr, pgid: cmd.Process.Pid}
+	events, decErr, stopDecode := decodeJSONL(stdout)
+	s := &stream{events: events, cmd: cmd, decErr: decErr, stopDecode: stopDecode, pgid: cmd.Process.Pid}
 	if ctx != nil {
 		s.stopCtx = context.AfterFunc(ctx, func() { _ = s.Close() })
 	}
@@ -90,13 +90,14 @@ func (a *Agent) start(t foreignloop.ForeignTurn) (*exec.Cmd, io.Reader, error) {
 // stream is the live foreign stream for one spawned codex process. Close is
 // idempotent (sync.Once) and tears down the whole process group.
 type stream struct {
-	events   <-chan foreignloop.ForeignEvent
-	cmd      *exec.Cmd
-	decErr   func() error
-	pgid     int
-	stopCtx  func() bool
-	once     sync.Once
-	closeErr error
+	events     <-chan foreignloop.ForeignEvent
+	cmd        *exec.Cmd
+	decErr     func() error
+	stopDecode func()
+	pgid       int
+	stopCtx    func() bool
+	once       sync.Once
+	closeErr   error
 }
 
 func (s *stream) Events() <-chan foreignloop.ForeignEvent { return s.events }
@@ -115,6 +116,7 @@ func (s *stream) Close() error {
 }
 
 func (s *stream) shutdown() error {
+	s.stopDecode()
 	_ = syscall.Kill(-s.pgid, syscall.SIGINT)
 	kill := time.AfterFunc(closeGrace, func() { _ = syscall.Kill(-s.pgid, syscall.SIGKILL) })
 	defer kill.Stop()
@@ -129,11 +131,13 @@ func (s *stream) shutdown() error {
 	return exitErr
 }
 
-func decodeJSONL(r io.Reader) (<-chan foreignloop.ForeignEvent, func() error) {
+func decodeJSONL(r io.Reader) (<-chan foreignloop.ForeignEvent, func() error, func()) {
 	ch := make(chan foreignloop.ForeignEvent)
+	done := make(chan struct{})
 	var (
 		mu       sync.Mutex
 		firstErr error
+		stopOnce sync.Once
 	)
 	setErr := func(err error) {
 		mu.Lock()
@@ -153,18 +157,26 @@ func decodeJSONL(r io.Reader) (<-chan foreignloop.ForeignEvent, func() error) {
 				continue
 			}
 			for _, ev := range evs {
-				ch <- ev
+				select {
+				case ch <- ev:
+				case <-done:
+					return
+				}
 			}
 		}
 		if err := sc.Err(); err != nil {
 			setErr(&foreignloop.DecodeError{Cause: err})
 		}
 	}()
-	return ch, func() error {
+	decodeErr := func() error {
 		mu.Lock()
 		defer mu.Unlock()
 		return firstErr
 	}
+	stop := func() {
+		stopOnce.Do(func() { close(done) })
+	}
+	return ch, decodeErr, stop
 }
 
 // promptText flattens text input blocks into the prompt passed as the final Codex
