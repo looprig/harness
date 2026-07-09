@@ -10,10 +10,10 @@ import (
 	"time"
 
 	"github.com/looprig/core/content"
+	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/foreignloop"
 	"github.com/looprig/harness/pkg/loop"
-	"github.com/looprig/core/uuid"
 )
 
 // This file is the end-to-end proof that the REAL foreign actor (wired through the
@@ -40,6 +40,15 @@ func aiMsg(s string) *content.AIMessage {
 func foreignScript(text string) []foreignloop.ForeignEvent {
 	return []foreignloop.ForeignEvent{
 		{Kind: foreignloop.ForeignInit},
+		{Kind: foreignloop.ForeignTextDelta, Text: text},
+		{Kind: foreignloop.ForeignStepComplete, Message: aiMsg(text)},
+		{Kind: foreignloop.ForeignTerminalOK},
+	}
+}
+
+func foreignLateBoundScript(sid, text string) []foreignloop.ForeignEvent {
+	return []foreignloop.ForeignEvent{
+		{Kind: foreignloop.ForeignInit, SessionID: sid},
 		{Kind: foreignloop.ForeignTextDelta, Text: text},
 		{Kind: foreignloop.ForeignStepComplete, Message: aiMsg(text)},
 		{Kind: foreignloop.ForeignTerminalOK},
@@ -135,6 +144,8 @@ func foreignEventKind(ev event.Event) string {
 	switch ev.(type) {
 	case event.TurnStarted:
 		return "TurnStarted"
+	case event.ForeignSessionBound:
+		return "ForeignSessionBound"
 	case event.StepDone:
 		return "StepDone"
 	case event.TurnDone:
@@ -185,7 +196,7 @@ func drainForeignTurn(t *testing.T, sub interface {
 // events (the sequence under test), excluding session-scoped quiescence transitions.
 func isForeignTurnEvent(ev event.Event) bool {
 	switch ev.(type) {
-	case event.TurnStarted, event.StepDone, event.TurnDone, event.TurnFailed, event.TurnInterrupted:
+	case event.TurnStarted, event.ForeignSessionBound, event.StepDone, event.TurnDone, event.TurnFailed, event.TurnInterrupted:
 		return true
 	default:
 		return false
@@ -225,6 +236,16 @@ func foreignPrimaryCfg() loop.Config {
 // sub-loop (a foreign loop needs only Engine + System).
 func foreignSubCfg() loop.Config {
 	return loop.Config{Engine: loop.EngineForeignClaude, System: "sys"}
+}
+
+func codexForeignPrimaryCfg() loop.Config {
+	c := foreignPrimaryCfg()
+	c.Engine = loop.EngineForeignCodex
+	return c
+}
+
+func codexForeignSubCfg() loop.Config {
+	return loop.Config{Engine: loop.EngineForeignCodex, System: "sys"}
 }
 
 // TestForeignPrimaryE2E runs the REAL foreign actor as the session PRIMARY: New mints a
@@ -303,6 +324,82 @@ func TestForeignPrimaryE2E(t *testing.T) {
 	}
 }
 
+func TestCodexForeignPrimaryLateBoundPublishesBoundAndTurnDone(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	const boundSID = "codex-thread-primary-1"
+	rec := &recordingEventAppender{}
+	agent := &fakeForeignAgent{transcript: missingTranscript(t), script: foreignLateBoundScript(boundSID, "codex result")}
+	spec := foreignloop.Spec{Agent: agent, Cwd: t.TempDir(), SIDMode: foreignloop.SIDLateBound}
+
+	s, err := New(ctx, codexForeignPrimaryCfg(),
+		WithForeignBuilder(foreignloop.BuildWith(spec), foreignloop.BuildRestoredWith(spec)),
+		WithEventAppender(rec))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Shutdown(context.Background()) })
+
+	ls, ok := firstLoopStarted(rec)
+	if !ok {
+		t.Fatal("no LoopStarted captured on the durable tap")
+	}
+	if ls.ForeignSID != "" {
+		t.Fatalf("primary LoopStarted.ForeignSID = %q, want empty for late-bound Codex", ls.ForeignSID)
+	}
+
+	primary := s.PrimaryLoopID()
+	sub, err := s.SubscribeEvents(event.EventFilter{
+		Enduring: event.LoopScope{Loops: map[uuid.UUID]struct{}{primary: {}}},
+	})
+	if err != nil {
+		t.Fatalf("SubscribeEvents: %v", err)
+	}
+	t.Cleanup(func() { _ = sub.Close() })
+
+	submitID, err := s.Submit(ctx, textBlocks("go"))
+	if err != nil {
+		t.Fatalf("Submit: %v", err)
+	}
+
+	evs := drainForeignTurn(t, sub)
+	want := []string{"TurnStarted", "ForeignSessionBound", "StepDone", "TurnDone"}
+	if got := foreignKinds(evs); !equalStrs(got, want) {
+		t.Fatalf("primary enduring sequence = %v, want %v", got, want)
+	}
+	ts, ok := evs[0].(event.TurnStarted)
+	if !ok {
+		t.Fatalf("evs[0] = %T, want TurnStarted", evs[0])
+	}
+	if ts.Cause.CommandID != submitID {
+		t.Errorf("TurnStarted.Cause.CommandID = %v, want submit id %v", ts.Cause.CommandID, submitID)
+	}
+	bound, ok := evs[1].(event.ForeignSessionBound)
+	if !ok {
+		t.Fatalf("evs[1] = %T, want ForeignSessionBound", evs[1])
+	}
+	if bound.ForeignSID != boundSID {
+		t.Errorf("ForeignSessionBound.ForeignSID = %q, want %q", bound.ForeignSID, boundSID)
+	}
+	td, ok := evs[3].(event.TurnDone)
+	if !ok {
+		t.Fatalf("evs[3] = %T, want TurnDone", evs[3])
+	}
+	if got := aiText(td.Message); got != "codex result" {
+		t.Errorf("TurnDone.Message text = %q, want %q", got, "codex result")
+	}
+
+	ft := agent.foreignTurn()
+	if !ft.StartNew {
+		t.Error("ForeignTurn.StartNew = false, want true on the first late-bound Codex turn")
+	}
+	if ft.ForeignSID != "" {
+		t.Errorf("ForeignTurn.ForeignSID = %q, want empty before Codex ForeignInit binds", ft.ForeignSID)
+	}
+}
+
 // TestForeignSubagentE2E runs a foreign loop as a SUBAGENT under a NATIVE primary:
 // RunSubagent creates the foreign sub-loop, drives one turn, and returns the foreign
 // TurnDone.Message text. It also proves lineage — the sub-loop's LoopStarted is caused
@@ -348,6 +445,68 @@ func TestForeignSubagentE2E(t *testing.T) {
 	}
 	if subLS.ForeignSID == "" {
 		t.Error("sub-loop LoopStarted.ForeignSID is empty, want the minted foreign sid")
+	}
+}
+
+func TestCodexForeignSubagentLateBoundReturnsFinalText(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	const boundSID = "codex-thread-subagent-1"
+	rec := &recordingEventAppender{}
+	agent := &fakeForeignAgent{transcript: missingTranscript(t), script: foreignLateBoundScript(boundSID, "codex subagent final")}
+	spec := foreignloop.Spec{Agent: agent, Cwd: t.TempDir(), SIDMode: foreignloop.SIDLateBound}
+
+	s, err := New(ctx, cfg(&stubLLM{chunks: []content.Chunk{textChunk("primary")}}),
+		WithForeignBuilder(foreignloop.BuildWith(spec), foreignloop.BuildRestoredWith(spec)),
+		WithEventAppender(rec))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Shutdown(context.Background()) })
+
+	final, err := s.RunSubagent(ctx, loop.Provenance{LoopID: s.PrimaryLoopID()},
+		codexForeignSubCfg(), textBlocks("hi"), "tool-use-codex")
+	if err != nil {
+		t.Fatalf("RunSubagent: %v", err)
+	}
+	if final != "codex subagent final" {
+		t.Errorf("RunSubagent final text = %q, want %q", final, "codex subagent final")
+	}
+
+	subLS, ok := foreignSubLoopStarted(rec, s.PrimaryLoopID())
+	if !ok {
+		t.Fatal("no LoopStarted captured for the Codex foreign sub-loop")
+	}
+	if subLS.ForeignSID != "" {
+		t.Errorf("sub-loop LoopStarted.ForeignSID = %q, want empty for late-bound Codex", subLS.ForeignSID)
+	}
+	if subLS.ParentToolUseID != "tool-use-codex" {
+		t.Errorf("sub-loop LoopStarted.ParentToolUseID = %q, want %q", subLS.ParentToolUseID, "tool-use-codex")
+	}
+
+	ft := agent.foreignTurn()
+	if !ft.StartNew {
+		t.Error("ForeignTurn.StartNew = false, want true on the first late-bound Codex subagent turn")
+	}
+	if ft.ForeignSID != "" {
+		t.Errorf("ForeignTurn.ForeignSID = %q, want empty before Codex ForeignInit binds", ft.ForeignSID)
+	}
+
+	var gotBound bool
+	for _, ev := range rec.snapshot() {
+		fb, ok := ev.(event.ForeignSessionBound)
+		if !ok {
+			continue
+		}
+		if fb.EventHeader().Coordinates.LoopID == subLS.Coordinates.LoopID && fb.ForeignSID == boundSID {
+			gotBound = true
+			break
+		}
+	}
+	if !gotBound {
+		t.Fatalf("no ForeignSessionBound{%q} captured for the Codex sub-loop", boundSID)
 	}
 }
 

@@ -46,6 +46,106 @@ func TestFindForeignSIDFallsBackToForeignSessionBound(t *testing.T) {
 	}
 }
 
+func TestCodexForeignRestoreRecoversSIDFromForeignSessionBound(t *testing.T) {
+	t.Parallel()
+
+	foldedEvents := []event.Event{
+		event.LoopStarted{},
+		event.TurnStarted{Message: foldUserMsg("hello")},
+		event.ForeignSessionBound{ForeignSID: "codex-thread-restored-1"},
+		foldStepGroup(aiMessage("hi")),
+		event.TurnDone{Message: aiMessage("hi")},
+	}
+	folded := foldPrimaryLoop(foldedEvents)
+	foreignSID := findForeignSID(foldedEvents)
+
+	builder := &fakeForeignBuilder{}
+	fb := newFakeBackend()
+	fb.msgs = folded.Msgs
+	fb.turnIndex = folded.TurnIndex
+	builder.backend = fb
+
+	c := cfg(&stubLLM{chunks: []content.Chunk{textChunk("x")}})
+	c.Engine = loop.EngineForeignCodex
+	c.System = "be helpful"
+
+	sessionID := mustUUID()
+	primaryLoopID := mustUUID()
+	fac := event.NewFactory(uuid.New, time.Now)
+
+	s, err := buildRestoredSession(context.Background(), c, sessionID, primaryLoopID,
+		foreignSID, 0, 0, false, folded, nil, fakeSessionJournal{}, fac, uuid.New, time.Now,
+		WithForeignBuilder(builder.build, builder.buildRestored))
+	if err != nil {
+		t.Fatalf("buildRestoredSession: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Shutdown(context.Background()) })
+
+	builder.mu.Lock()
+	calls := builder.restoreCall
+	seed := builder.restoreSeed
+	calledSID := builder.calledSID
+	calledLID := builder.calledLID
+	builder.mu.Unlock()
+	if calls != 1 {
+		t.Errorf("restored Builder invoked %d times, want exactly 1", calls)
+	}
+	if seed.ForeignSID != "codex-thread-restored-1" {
+		t.Errorf("restored seed.ForeignSID = %q, want %q", seed.ForeignSID, "codex-thread-restored-1")
+	}
+	if seed.TurnIndex != folded.TurnIndex {
+		t.Errorf("restored seed.TurnIndex = %d, want %d", seed.TurnIndex, folded.TurnIndex)
+	}
+	if !reflect.DeepEqual(seed.Msgs, folded.Msgs) {
+		t.Errorf("restored seed.Msgs =\n  %#v\nwant\n  %#v", seed.Msgs, folded.Msgs)
+	}
+	if calledSID != sessionID {
+		t.Errorf("restored Builder sessionID = %v, want %v", calledSID, sessionID)
+	}
+	if calledLID != primaryLoopID {
+		t.Errorf("restored Builder loopID = %v, want %v", calledLID, primaryLoopID)
+	}
+}
+
+func TestCodexForeignRestoreFailsClosedWithoutSIDSource(t *testing.T) {
+	t.Parallel()
+
+	foldedEvents := []event.Event{
+		event.LoopStarted{},
+		event.TurnStarted{Message: foldUserMsg("hello")},
+		foldStepGroup(aiMessage("hi")),
+		event.TurnDone{Message: aiMessage("hi")},
+	}
+	folded := foldPrimaryLoop(foldedEvents)
+	foreignSID := findForeignSID(foldedEvents)
+	if foreignSID != "" {
+		t.Fatalf("findForeignSID = %q, want empty with no Codex SID source", foreignSID)
+	}
+
+	builder := &fakeForeignBuilder{}
+	c := cfg(&stubLLM{chunks: []content.Chunk{textChunk("x")}})
+	c.Engine = loop.EngineForeignCodex
+	c.System = "be helpful"
+
+	s, err := buildRestoredSession(context.Background(), c, mustUUID(), mustUUID(),
+		foreignSID, 0, 0, false, folded, nil, fakeSessionJournal{}, event.NewFactory(uuid.New, time.Now), uuid.New, time.Now,
+		WithForeignBuilder(builder.build, builder.buildRestored))
+	if s != nil {
+		t.Fatalf("buildRestoredSession returned a non-nil Session on a fail-closed Codex restore")
+	}
+	var re *RestoreError
+	if !errors.As(err, &re) || re.Kind != RestoreForeignSIDMissing {
+		t.Fatalf("err = %v, want *RestoreError{%v}", err, RestoreForeignSIDMissing)
+	}
+
+	builder.mu.Lock()
+	calls := builder.restoreCall
+	builder.mu.Unlock()
+	if calls != 0 {
+		t.Errorf("restored Builder invoked %d times, want 0 when Codex SID is missing", calls)
+	}
+}
+
 // TestForeignRestore covers buildRestoredSession's Engine switch: a foreign cfg.Engine
 // reconstructs the primary loop through the wired RestoredBuilder, carrying the recovered
 // foreign sid into the seed; an empty recovered sid (or a missing restored builder) fails
