@@ -646,8 +646,11 @@ Tests should skip unless `LOOPRIG_CODEX_INTEGRATION=1`.
 Contract checks:
 
 - `codex exec --json --sandbox read-only --ask-for-approval never` emits `thread.started`.
-- `codex exec resume <thread_id> --json` resumes the same id or clearly confirms continuation.
-- identify whether resume accepts `--cd`, `--sandbox`, `--ask-for-approval`, and `--add-dir`; if not, document the `-c` fallback in the test failure message.
+- `codex exec resume --json <thread_id>` resumes the same id or clearly confirms continuation.
+- parser-probe `--cd`, `--sandbox`, `--ask-for-approval`, and `--add-dir` before
+  and after `resume` with `--help`; if a flag has no valid placement, stop before
+  live commands and report the version-supported `-c key=value` or persisted
+  profile/config fallback without naming version-specific config keys.
 
 **Step 2: Run normal tests**
 

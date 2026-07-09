@@ -245,20 +245,23 @@ Resume turn:
 codex exec resume
   --json
   --model <model>              # optional
-  [same behavior flags supported by exec resume]
   <foreign_sid>
   <prompt>
 ```
 
-The installed CLI help shows `codex exec resume` supports `--json`, `--model`,
-`--dangerously-bypass-approvals-and-sandbox`, `--ignore-user-config`,
-`--ignore-rules`, `--skip-git-repo-check`, `--ephemeral`,
-`--output-schema`, and `--output-last-message`, but not all first-turn workspace
-flags. The adapter must not assume parity: add an integration/contract spike to
-confirm whether `--cd`, `--sandbox`, `--ask-for-approval`, and `--add-dir` are
-accepted before or after `resume` in the installed CLI. If resume cannot accept
-workspace/permission flags, set them through `-c` config overrides or require the
-same profile/config to be active across resume.
+The adapter invokes resume as `codex exec resume --json <foreign_sid> <prompt>`
+and sets `cmd.Dir` for its working directory. It does not assume first-turn
+workspace or permission flags also work on resume.
+
+The opt-in CLI contract test parser-probes `--cd`, `--sandbox`,
+`--ask-for-approval`, and `--add-dir` before and after `resume`, using `--help`
+only, and stops before live commands if a flag has no valid placement. On the
+locally tested CLI, `--cd` and `--add-dir` parse only before `resume`; `--sandbox`
+and `--ask-for-approval` parse in neither placement. This is version-dependent:
+deployments needing equivalent settings must use their CLI version's supported
+`-c key=value` override or persist them in the profile/config used by resume.
+Exact config keys are intentionally not specified. Keep the opt-in test as the
+compatibility guard.
 
 Do not use `codex exec resume --last` in production code. It is ambiguous if
 multiple Codex loops run concurrently.
@@ -479,9 +482,10 @@ Integration/contract tests, gated behind an environment variable:
 
 - run `codex exec --json --sandbox read-only --ask-for-approval never "..."`.
 - assert `thread.started` contains a stable session id field.
-- assert `codex exec resume <sid> --json "..."` continues the same session.
-- assert argv accepted by resume path for `--cd`/sandbox/approval, or document
-  the required config override fallback.
+- assert `codex exec resume --json <sid> "..."` continues the same session.
+- parser-probe the four first-turn workspace/permission flags before and after
+  `resume`; on no valid placement, report the version-supported `-c key=value`
+  or persisted-profile/config fallback before attempting live commands.
 - assert command/file-change item shapes for a harmless read-only command.
 
 ### 14. Implementation Order
@@ -498,9 +502,6 @@ Integration/contract tests, gated behind an environment variable:
 
 ## Open Questions
 
-- Does `codex exec resume` accept `--cd`, `--sandbox`, `--ask-for-approval`, and
-  `--add-dir` in the installed CLI when flags are placed before or after
-  `resume`? If not, which `-c` overrides are required?
 - Are `item.completed` command/file-change schemas stable enough to map to
   `ToolCallStarted`/`ToolCallCompleted`, or should v1 only commit final assistant
   messages and terminals?
