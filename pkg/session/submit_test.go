@@ -276,8 +276,8 @@ func TestSubmitToLoopTargetsSubLoop(t *testing.T) {
 	t.Cleanup(func() { _ = sub.Close() })
 	rec := &recordingSub{}
 	go func() {
-		for ev := range sub.Events() {
-			rec.record(ev)
+		for d := range sub.Events() {
+			rec.record(d.Event)
 		}
 	}()
 

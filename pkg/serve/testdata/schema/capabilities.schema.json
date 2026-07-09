@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://looprig.dev/serve/v1/capabilities.schema.json",
+  "title": "Capabilities",
+  "description": "GET /v1/capabilities response: static protocol-discovery document.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["protocol", "version", "features"],
+  "properties": {
+    "protocol": { "type": "string", "const": "looprig.serve" },
+    "version": { "type": "integer", "const": 1 },
+    "features": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "enum": ["journal", "live_sse", "ephemeral_sse", "gate_response"]
+      }
+    }
+  }
+}

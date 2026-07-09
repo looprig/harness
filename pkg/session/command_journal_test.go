@@ -15,7 +15,6 @@ import (
 	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/journal"
 	"github.com/looprig/harness/pkg/loop"
-	"github.com/looprig/harness/pkg/tool"
 	"github.com/looprig/core/uuid"
 )
 
@@ -345,34 +344,40 @@ func TestSubagentResultAppendsCommandRecord(t *testing.T) {
 	assertRecord(t, recs[0], s.SessionID, parentLoopID, dispatched, identity.AgencyMachine, ts)
 }
 
-// TestGateRepliesAppendCommandRecord covers Approve/Deny/ProvideUserInput (the
-// routeGate fire-and-route sites): each appends a record for the gate command to the
-// resolved loop, with AgencyUser.
+// TestGateRepliesAppendCommandRecord covers RespondGate's command dispatch (the
+// routeGate fire-and-route site that replaced the Approve/Deny/ProvideUserInput
+// trio): each translated gate command is appended as a record to the owning loop,
+// with AgencyUser. The session is a gate-directory session with its command
+// appender swapped in so the audit-only intent-log append is observable.
 func TestGateRepliesAppendCommandRecord(t *testing.T) {
 	t.Parallel()
 	ts := time.Date(2026, 6, 21, 10, 2, 0, 0, time.UTC)
-	callID := mustUUID()
 	tests := []struct {
 		name    string
-		call    func(s *Session, loopID uuid.UUID) error
+		call    func(t *testing.T, s *Session, loopID uuid.UUID) error
 		wantCmd func(command.Command) bool
 	}{
 		{
-			name: "Approve",
-			call: func(s *Session, loopID uuid.UUID) error {
-				return s.Approve(context.Background(), loopID, callID, tool.ScopeSession)
+			name: "approve",
+			call: func(t *testing.T, s *Session, loopID uuid.UUID) error {
+				gateID := activateOn(t, s, loopID, mustUUID(), permissionGate(), bashPayload())
+				return s.RespondGate(context.Background(), userApprove(gateID, "session"))
 			},
 			wantCmd: func(c command.Command) bool { _, ok := c.(command.ApproveToolCall); return ok },
 		},
 		{
-			name:    "Deny",
-			call:    func(s *Session, loopID uuid.UUID) error { return s.Deny(context.Background(), loopID, callID) },
+			name: "deny",
+			call: func(t *testing.T, s *Session, loopID uuid.UUID) error {
+				gateID := activateOn(t, s, loopID, mustUUID(), permissionGate(), bashPayload())
+				return s.RespondGate(context.Background(), userDeny(gateID))
+			},
 			wantCmd: func(c command.Command) bool { _, ok := c.(command.DenyToolCall); return ok },
 		},
 		{
-			name: "ProvideUserInput",
-			call: func(s *Session, loopID uuid.UUID) error {
-				return s.ProvideUserInput(context.Background(), loopID, callID, "answer")
+			name: "answer",
+			call: func(t *testing.T, s *Session, loopID uuid.UUID) error {
+				gateID := activateOn(t, s, loopID, mustUUID(), askUserGate(), askUserPayload())
+				return s.RespondGate(context.Background(), userAnswer(gateID, "answer"))
 			},
 			wantCmd: func(c command.Command) bool { _, ok := c.(command.ProvideUserInput); return ok },
 		},
@@ -381,18 +386,19 @@ func TestGateRepliesAppendCommandRecord(t *testing.T) {
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
+			s, _, loopID, cmds := gateSession(t)
 			app := &fakeCommandAppender{}
-			lid := mustUUID()
-			s, cmds := fakeAppenderSession(app, ts, lid)
+			s.cmdAppender = app
+			s.now = pinnedClock(ts)
 
 			var (
 				dispatched command.Command
 				wg         sync.WaitGroup
 			)
 			wg.Add(1)
-			go func() { defer wg.Done(); dispatched = recvCommand(t, cmds[lid]) }()
+			go func() { defer wg.Done(); dispatched = recvCommand(t, cmds) }()
 
-			if err := tt.call(s, lid); err != nil {
+			if err := tt.call(t, s, loopID); err != nil {
 				t.Fatalf("gate reply = %v, want nil", err)
 			}
 			wg.Wait()
@@ -404,7 +410,7 @@ func TestGateRepliesAppendCommandRecord(t *testing.T) {
 			if len(recs) != 1 {
 				t.Fatalf("appended %d records, want 1", len(recs))
 			}
-			assertRecord(t, recs[0], s.SessionID, lid, dispatched, identity.AgencyUser, ts)
+			assertRecord(t, recs[0], s.SessionID, loopID, dispatched, identity.AgencyUser, ts)
 		})
 	}
 }
@@ -504,18 +510,26 @@ func TestCommandAppendIsAuditOnly(t *testing.T) {
 	ts := time.Date(2026, 6, 21, 10, 5, 0, 0, time.UTC)
 	tests := []struct {
 		name     string
-		dispatch func(s *Session, loopID uuid.UUID) error
+		setup    func(t *testing.T, app *fakeCommandAppender) (s *Session, cmds chan command.Command, dispatch func() error)
 		wantType func(command.Command) bool
 	}{
 		{
-			name:     "Submit proceeds when append fails",
-			dispatch: func(s *Session, loopID uuid.UUID) error { _, err := s.Submit(context.Background(), nil); return err },
+			name: "Submit proceeds when append fails",
+			setup: func(t *testing.T, app *fakeCommandAppender) (*Session, chan command.Command, func() error) {
+				lid := mustUUID()
+				s, cmds := fakeAppenderSession(app, ts, lid)
+				return s, cmds[lid], func() error { _, err := s.Submit(context.Background(), nil); return err }
+			},
 			wantType: func(c command.Command) bool { _, ok := c.(command.UserInput); return ok },
 		},
 		{
-			name: "Approve proceeds when append fails",
-			dispatch: func(s *Session, loopID uuid.UUID) error {
-				return s.Approve(context.Background(), loopID, mustUUID(), tool.ScopeOnce)
+			name: "RespondGate approve proceeds when append fails",
+			setup: func(t *testing.T, app *fakeCommandAppender) (*Session, chan command.Command, func() error) {
+				s, _, loopID, cmds := gateSession(t)
+				s.cmdAppender = app
+				s.now = pinnedClock(ts)
+				gateID := activateOn(t, s, loopID, mustUUID(), permissionGate(), bashPayload())
+				return s, cmds, func() error { return s.RespondGate(context.Background(), userApprove(gateID, "once")) }
 			},
 			wantType: func(c command.Command) bool { _, ok := c.(command.ApproveToolCall); return ok },
 		},
@@ -525,17 +539,16 @@ func TestCommandAppendIsAuditOnly(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			app := &fakeCommandAppender{err: errors.New("journal unavailable")}
-			lid := mustUUID()
-			s, cmds := fakeAppenderSession(app, ts, lid)
+			_, cmds, dispatch := tt.setup(t, app)
 
 			var (
 				dispatched command.Command
 				wg         sync.WaitGroup
 			)
 			wg.Add(1)
-			go func() { defer wg.Done(); dispatched = recvCommand(t, cmds[lid]) }()
+			go func() { defer wg.Done(); dispatched = recvCommand(t, cmds) }()
 
-			if err := tt.dispatch(s, lid); err != nil {
+			if err := dispatch(); err != nil {
 				t.Fatalf("dispatch returned %v despite append failure, want nil (audit-only)", err)
 			}
 			wg.Wait()

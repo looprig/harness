@@ -1,0 +1,12 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://looprig.dev/serve/v1/input_response.schema.json",
+  "title": "InputResponse",
+  "description": "200 body for POST /v1/sessions/{sid}/input: the command id Submit minted for the queued input.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["command_id"],
+  "properties": {
+    "command_id": { "$ref": "uuid.schema.json" }
+  }
+}

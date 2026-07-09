@@ -64,14 +64,15 @@ type checkpointAppender struct {
 	probe  *checkpointOrderProbe
 }
 
-func (a *checkpointAppender) AppendEvent(_ context.Context, ev event.Event) error {
+func (a *checkpointAppender) AppendEvent(_ context.Context, ev event.Event) (uint64, error) {
 	a.mu.Lock()
 	a.events = append(a.events, ev)
+	n := len(a.events)
 	a.mu.Unlock()
 	if _, ok := ev.(event.WorkspaceCheckpointed); ok {
 		a.probe.appendSeq.Store(a.probe.seq.Add(1))
 	}
-	return nil
+	return uint64(n), nil
 }
 
 // checkpointFixture builds a workspacestore.Store over an in-memory Blobs (wrapped in

@@ -1,0 +1,8 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://looprig.dev/serve/v1/uuid.schema.json",
+  "title": "UUID",
+  "description": "A canonical 8-4-4-4-12 lowercase-or-uppercase hex UUID string.",
+  "type": "string",
+  "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+}

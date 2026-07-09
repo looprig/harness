@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://looprig.dev/serve/v1/session_status.schema.json",
+  "title": "SessionStatus",
+  "description": "GET /v1/sessions/{sid}/status response: one session's projected lifecycle status, read from the catalog projection with no journal replay. active_turn_id / waiting_gate_id are omitted unless a turn is running or a gate is open; last_turn / last_step are the codec-safe summaries of the most recent terminal turn and completed step.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["session_id", "last_journal_seq"],
+  "properties": {
+    "session_id": { "$ref": "uuid.schema.json" },
+    "state": {
+      "type": "string",
+      "enum": ["running", "waiting_on_gate", "idle", "failed", "interrupted", "stopped"]
+    },
+    "last_journal_seq": { "type": "integer", "minimum": 0 },
+    "active_turn_id": { "$ref": "uuid.schema.json" },
+    "waiting_gate_id": { "$ref": "uuid.schema.json" },
+    "last_turn": { "$ref": "status_event.schema.json" },
+    "last_step": { "$ref": "status_event.schema.json" },
+    "updated_at": { "type": "string", "format": "date-time" }
+  }
+}

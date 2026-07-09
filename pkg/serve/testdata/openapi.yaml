@@ -1,0 +1,518 @@
+# OpenAPI 3.1 description of the pkg/serve HTTP session API.
+#
+# This document is a HAND-WRITTEN, reviewed wire contract. It is NOT machine-
+# generated and is NOT machine-validated by the Go tests (that would require an
+# OpenAPI/JSON-Schema dependency, which CLAUDE.md forbids — stdlib only). The Go
+# tests instead pin the exact emitted bytes against the golden fixtures under
+# testdata/fixtures. Keep this document in sync with those fixtures and the DTOs in
+# pkg/serve by hand; a diff here is a wire-contract review signal.
+#
+# The component schemas below intentionally mirror the standalone JSON-Schema
+# documents under testdata/schema/*.json (the same field names, required sets, and
+# enums). Both are hand-authored artifacts of the same contract.
+openapi: 3.1.0
+info:
+  title: looprig serve — HTTP session API
+  version: "1"
+  description: >
+    HTTP surface over a live/durable agent session: lifecycle (create/restore),
+    control (input/interrupt/gate response), reads (list/status/journal), and a
+    Server-Sent-Events live stream. The error body is a nested envelope
+    {"error":{code,message,retryable}}. All routes are under /v1.
+servers:
+  - url: /v1
+tags:
+  - name: discovery
+  - name: lifecycle
+  - name: control
+  - name: read
+  - name: stream
+
+paths:
+  /capabilities:
+    get:
+      tags: [discovery]
+      summary: Static protocol-discovery document.
+      operationId: getCapabilities
+      responses:
+        "200":
+          description: The protocol name, version, and supported feature planes.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Capabilities" }
+
+  /sessions:
+    post:
+      tags: [lifecycle]
+      summary: Create a fresh session; optionally submit initial input.
+      operationId: createSession
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: false
+        description: >
+          Absent/empty body (or empty object) creates an idle session. A body with
+          non-empty "blocks" also submits that input and returns a command_id.
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateRequest" }
+      responses:
+        "201":
+          description: Session created (command_id present only when input was submitted).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CreateResponse" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "409":
+          description: Idempotency-Key reused with a different request body.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+        "500": { $ref: "#/components/responses/Internal" }
+    get:
+      tags: [read]
+      summary: List sessions (stateless, offset-paged read over durable history).
+      operationId: listSessions
+      parameters:
+        - $ref: "#/components/parameters/Skip"
+        - $ref: "#/components/parameters/Limit"
+      responses:
+        "200":
+          description: A page of session summaries plus the paging cursor.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SessionList" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "500": { $ref: "#/components/responses/Internal" }
+
+  /sessions/{sid}/restore:
+    post:
+      tags: [lifecycle]
+      summary: Rebuild a prior session from durable history and reattach it live.
+      operationId: restoreSession
+      parameters:
+        - $ref: "#/components/parameters/Sid"
+      responses:
+        "200":
+          description: Session rebuilt and reattached.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/RestoreResponse" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "500": { $ref: "#/components/responses/Internal" }
+
+  /sessions/{sid}/input:
+    post:
+      tags: [control]
+      summary: Submit human-authored input to a LIVE session (fire-and-forget).
+      operationId: submitInput
+      parameters:
+        - $ref: "#/components/parameters/Sid"
+      requestBody:
+        required: true
+        description: Input blocks are REQUIRED here (unlike create) — an empty submit is 400.
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateRequest" }
+      responses:
+        "200":
+          description: Input queued; command_id correlates it on the event stream.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/InputResponse" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "500": { $ref: "#/components/responses/Internal" }
+
+  /sessions/{sid}/interrupt:
+    post:
+      tags: [control]
+      summary: Cancel every in-flight turn in a LIVE session.
+      operationId: interruptSession
+      parameters:
+        - $ref: "#/components/parameters/Sid"
+      responses:
+        "200":
+          description: Reports whether any running turn was actually cancelled.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/InterruptResponse" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "500": { $ref: "#/components/responses/Internal" }
+
+  /sessions/{sid}/gates/{gid}:
+    post:
+      tags: [control]
+      summary: Deliver a human's answer to an open gate on a LIVE session.
+      operationId: respondGate
+      description: >
+        The server stamps user provenance; any client-supplied source in the body
+        is ignored. Success is 202 (durably accepted, not proven consumption).
+      parameters:
+        - $ref: "#/components/parameters/Sid"
+        - $ref: "#/components/parameters/Gid"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/GateResponseRequest" }
+      responses:
+        "202":
+          description: Response durably accepted (empty object body).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/GateAcceptedResponse" }
+        "400":
+          description: Malformed sid/gid/body, or gate action_invalid / kind_mismatch.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409":
+          description: Gate not ready.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+        "500": { $ref: "#/components/responses/Internal" }
+        "503":
+          description: Gate directory at capacity (transient; retryable=true).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+
+  /sessions/{sid}/status:
+    get:
+      tags: [read]
+      summary: One session's projected lifecycle status (no journal replay).
+      operationId: getSessionStatus
+      parameters:
+        - $ref: "#/components/parameters/Sid"
+      responses:
+        "200":
+          description: The projected status.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SessionStatus" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "500": { $ref: "#/components/responses/Internal" }
+
+  /sessions/{sid}/journal:
+    get:
+      tags: [read]
+      summary: A cursor-paged page of a session's Enduring events.
+      operationId: getSessionJournal
+      parameters:
+        - $ref: "#/components/parameters/Sid"
+        - $ref: "#/components/parameters/FromJournalSeq"
+        - $ref: "#/components/parameters/Limit"
+      responses:
+        "200":
+          description: A page of Enduring events plus the resume cursor.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/EventJournalPage" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "500": { $ref: "#/components/responses/Internal" }
+
+  /sessions/{sid}/events:
+    get:
+      tags: [stream]
+      summary: Live Server-Sent-Events stream of the session's events.
+      operationId: streamSessionEvents
+      description: >
+        A text/event-stream of two frame classes.
+
+        ENDURING frames — `event: enduring\nid: <journal_seq>\ndata: <EnduringFrame>\n\n`
+        — carry a durable, sequenced event; the id: line is the journal sequence
+        (always present; "0" for a would-be zero-seq append) so a client can resume.
+
+        EPHEMERAL frames — `event: ephemeral\ndata: <EphemeralFrame>\n\n` — carry a
+        never-persisted streaming delta (token_delta / tool_call_started /
+        tool_call_completed / input_queued) and have NO id: line.
+
+        Idle streams emit a `: ping` comment on the heartbeat interval. Errors before
+        the stream opens (malformed sid 400, unknown session 404, subscribe failure
+        500) are the normal JSON error envelope with Content-Type application/json,
+        never text/event-stream.
+      parameters:
+        - $ref: "#/components/parameters/Sid"
+      responses:
+        "200":
+          description: The event stream (see the frame-class descriptions above).
+          content:
+            text/event-stream:
+              schema:
+                type: string
+                description: >
+                  An SSE byte stream. Each data: payload is one of EnduringFrame or
+                  EphemeralFrame (see components/schemas). Framed as
+                  `event: <class>\n[id: <seq>\n]data: <json>\n\n`.
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "500": { $ref: "#/components/responses/Internal" }
+
+components:
+  parameters:
+    Sid:
+      name: sid
+      in: path
+      required: true
+      description: Canonical 8-4-4-4-12 UUID session id.
+      schema: { $ref: "#/components/schemas/UUID" }
+    Gid:
+      name: gid
+      in: path
+      required: true
+      description: Canonical UUID gate id.
+      schema: { $ref: "#/components/schemas/UUID" }
+    Skip:
+      name: skip
+      in: query
+      required: false
+      description: Entries to drop from the front of the stable-sorted list. Default 0; must be >= 0.
+      schema: { type: integer, minimum: 0, default: 0 }
+    Limit:
+      name: limit
+      in: query
+      required: false
+      description: Max entries to return. Default 100; valid range [1, 1000] (explicit 0 is rejected).
+      schema: { type: integer, minimum: 1, maximum: 1000, default: 100 }
+    FromJournalSeq:
+      name: from_journal_seq
+      in: query
+      required: false
+      description: Inclusive journal sequence to begin at. 0 or absent means from the beginning.
+      schema: { type: integer, minimum: 0, default: 0 }
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      description: >
+        Opts a create into per-pod idempotent replay. A repeat with a byte-identical
+        body replays the original 201 without re-running; a repeat with a different
+        body is 409. An oversized key is 400.
+      schema: { type: string, maxLength: 255 }
+
+  responses:
+    BadRequest:
+      description: Malformed path/query parameter or request body.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorResponse" }
+    Unauthorized:
+      description: Authentication required or failed (when auth is configured).
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorResponse" }
+    NotFound:
+      description: No such session (or gate).
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorResponse" }
+    Internal:
+      description: An unexpected server-side failure (cause is logged, never in the body).
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorResponse" }
+
+  schemas:
+    UUID:
+      type: string
+      pattern: "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+
+    Capabilities:
+      type: object
+      additionalProperties: false
+      required: [protocol, version, features]
+      properties:
+        protocol: { type: string, const: looprig.serve }
+        version: { type: integer, const: 1 }
+        features:
+          type: array
+          items:
+            type: string
+            enum: [journal, live_sse, ephemeral_sse, gate_response]
+
+    CreateRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        blocks:
+          type: array
+          items: { type: object }
+
+    CreateResponse:
+      type: object
+      additionalProperties: false
+      required: [session_id]
+      properties:
+        session_id: { $ref: "#/components/schemas/UUID" }
+        command_id: { $ref: "#/components/schemas/UUID" }
+
+    RestoreResponse:
+      type: object
+      additionalProperties: false
+      required: [session_id]
+      properties:
+        session_id: { $ref: "#/components/schemas/UUID" }
+
+    InputResponse:
+      type: object
+      additionalProperties: false
+      required: [command_id]
+      properties:
+        command_id: { $ref: "#/components/schemas/UUID" }
+
+    InterruptResponse:
+      type: object
+      additionalProperties: false
+      required: [interrupted]
+      properties:
+        interrupted: { type: boolean }
+
+    GateResponseRequest:
+      type: object
+      additionalProperties: false
+      required: [action]
+      properties:
+        action: { type: string }
+        values: { type: object }
+
+    GateAcceptedResponse:
+      type: object
+      additionalProperties: false
+      properties: {}
+
+    SessionSummary:
+      type: object
+      additionalProperties: false
+      required: [session_id]
+      properties:
+        session_id: { $ref: "#/components/schemas/UUID" }
+        state: { type: string }
+        title: { type: string }
+        created_at: { type: string, format: date-time }
+        last_active_at: { type: string, format: date-time }
+
+    SessionList:
+      type: object
+      additionalProperties: false
+      required: [sessions, skip, limit, next_skip, done]
+      properties:
+        sessions:
+          type: array
+          items: { $ref: "#/components/schemas/SessionSummary" }
+        skip: { type: integer, minimum: 0 }
+        limit: { type: integer, minimum: 1, maximum: 1000 }
+        next_skip: { type: integer, minimum: 0 }
+        done: { type: boolean }
+
+    EventEnvelope:
+      type: object
+      description: The durable event wire envelope (event.MarshalEvent output).
+      required: [type, v]
+      properties:
+        type: { type: string }
+        v: { type: integer, const: 1 }
+        session_id: { $ref: "#/components/schemas/UUID" }
+        loop_id: { $ref: "#/components/schemas/UUID" }
+        turn_id: { $ref: "#/components/schemas/UUID" }
+        step_id: { $ref: "#/components/schemas/UUID" }
+        event_id: { $ref: "#/components/schemas/UUID" }
+        created_at: { type: string, format: date-time }
+
+    StatusEvent:
+      type: object
+      additionalProperties: false
+      required: [journal_seq]
+      properties:
+        journal_seq: { type: integer, minimum: 0 }
+        event: { $ref: "#/components/schemas/EventEnvelope" }
+
+    SessionStatus:
+      type: object
+      additionalProperties: false
+      required: [session_id, last_journal_seq]
+      properties:
+        session_id: { $ref: "#/components/schemas/UUID" }
+        state:
+          type: string
+          enum: [running, waiting_on_gate, idle, failed, interrupted, stopped]
+        last_journal_seq: { type: integer, minimum: 0 }
+        active_turn_id: { $ref: "#/components/schemas/UUID" }
+        waiting_gate_id: { $ref: "#/components/schemas/UUID" }
+        last_turn: { $ref: "#/components/schemas/StatusEvent" }
+        last_step: { $ref: "#/components/schemas/StatusEvent" }
+        updated_at: { type: string, format: date-time }
+
+    EventJournalPage:
+      type: object
+      additionalProperties: false
+      required: [events, next_journal_seq, done]
+      properties:
+        events:
+          type: array
+          items: { $ref: "#/components/schemas/StatusEvent" }
+        next_journal_seq: { type: integer, minimum: 0 }
+        done: { type: boolean }
+
+    EnduringFrame:
+      type: object
+      additionalProperties: false
+      description: The data: payload of an `event: enduring` SSE frame.
+      required: [v, event]
+      properties:
+        v: { type: integer, const: 1 }
+        event: { $ref: "#/components/schemas/EventEnvelope" }
+
+    EphemeralFrame:
+      type: object
+      additionalProperties: false
+      description: The data: payload of an `event: ephemeral` SSE frame (no id: line).
+      required: [v, kind]
+      properties:
+        v: { type: integer, const: 1 }
+        kind:
+          type: string
+          enum: [token_delta, tool_call_started, tool_call_completed, input_queued]
+        header: { $ref: "#/components/schemas/EventEnvelope" }
+        delta: { type: object }
+
+    ErrorResponse:
+      type: object
+      additionalProperties: false
+      required: [error]
+      properties:
+        error:
+          type: object
+          additionalProperties: false
+          required: [code, message, retryable]
+          properties:
+            code:
+              type: string
+              enum:
+                - internal
+                - invalid_body
+                - invalid_parameter
+                - session_not_found
+                - idempotency_conflict
+                - gate_not_found
+                - gate_action_invalid
+                - gate_kind_mismatch
+                - gate_not_ready
+                - gate_capacity
+            message: { type: string }
+            retryable: { type: boolean }

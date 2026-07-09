@@ -53,8 +53,10 @@ type EventSubscription struct {
 	filter event.EventFilter
 
 	// events is the single bounded egress channel. The hub is the sole sender
-	// (non-blocking, via trySend); the subscriber is the sole receiver.
-	events chan event.Event
+	// (non-blocking, via trySend); the subscriber is the sole receiver. It carries
+	// event.Delivery (the event plus its durable journal sequence), so a live SSE
+	// consumer can stamp id:<journal_seq> without the seq ever entering the codec.
+	events chan event.Delivery
 
 	// mu serializes a hub-side send against teardown so a non-blocking send can
 	// never race the close of events (which would panic). It also guards closed
@@ -79,14 +81,14 @@ type EventSubscription struct {
 func newSubscription(filter event.EventFilter, onClose func(*EventSubscription)) *EventSubscription {
 	return &EventSubscription{
 		filter:  filter,
-		events:  make(chan event.Event, defaultEgressBuffer),
+		events:  make(chan event.Delivery, defaultEgressBuffer),
 		onClose: onClose,
 	}
 }
 
 // Events is the receive end of the subscription's egress channel. It is closed on
 // Close, loss, or hub teardown.
-func (s *EventSubscription) Events() <-chan event.Event { return s.events }
+func (s *EventSubscription) Events() <-chan event.Delivery { return s.events }
 
 // Close is the subscriber's intentional teardown. It is idempotent and records no
 // error (Err stays nil). The first terminal — Close or a hub fail — wins, so a
@@ -109,14 +111,14 @@ func (s *EventSubscription) Err() error {
 // returns sendClosed (the hub skips it); if the buffer is full it returns sendFull
 // (the hub applies the overflow policy); otherwise the event is buffered and it
 // returns sendDelivered. Only the hub calls this.
-func (s *EventSubscription) trySend(ev event.Event) sendResult {
+func (s *EventSubscription) trySend(d event.Delivery) sendResult {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed {
 		return sendClosed
 	}
 	select {
-	case s.events <- ev:
+	case s.events <- d:
 		return sendDelivered
 	default:
 		return sendFull

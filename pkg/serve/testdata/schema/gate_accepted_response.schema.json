@@ -1,0 +1,9 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://looprig.dev/serve/v1/gate_accepted_response.schema.json",
+  "title": "GateAcceptedResponse",
+  "description": "202 body for a durably-accepted gate response. Acceptance is durable, not proven consumption, so the body carries no fields — it is the empty object {}.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {}
+}

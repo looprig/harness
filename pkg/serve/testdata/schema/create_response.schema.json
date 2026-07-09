@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://looprig.dev/serve/v1/create_response.schema.json",
+  "title": "CreateResponse",
+  "description": "201 body for POST /v1/sessions. command_id is present only when the create carried input blocks that were submitted; an idle create omits it.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["session_id"],
+  "properties": {
+    "session_id": { "$ref": "uuid.schema.json" },
+    "command_id": { "$ref": "uuid.schema.json" }
+  }
+}

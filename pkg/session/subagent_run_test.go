@@ -167,17 +167,17 @@ func TestRunSubagentPropagatesSessionClosing(t *testing.T) {
 // ParentToolUseID. The session emits a LoopStarted for every NewLoop; the sub-loop is
 // the only non-primary one when this is called right after one RunSubagent.
 func waitLoopStartedNonPrimaryEvent(t *testing.T, sub interface {
-	Events() <-chan event.Event
+	Events() <-chan event.Delivery
 }, primary [16]byte) (event.LoopStarted, bool) {
 	t.Helper()
 	deadline := time.After(2 * time.Second)
 	for {
 		select {
-		case ev, ok := <-sub.Events():
+		case d, ok := <-sub.Events():
 			if !ok {
 				return event.LoopStarted{}, false
 			}
-			if ls, ok := ev.(event.LoopStarted); ok && ls.Coordinates.LoopID != primary {
+			if ls, ok := d.Event.(event.LoopStarted); ok && ls.Coordinates.LoopID != primary {
 				return ls, true
 			}
 		case <-deadline:
@@ -190,17 +190,17 @@ func waitLoopStartedNonPrimaryEvent(t *testing.T, sub interface {
 // equals loopID arrives, returning that whole event so the caller can inspect
 // ParentToolUseID.
 func waitLoopStartedOnLoop(t *testing.T, sub interface {
-	Events() <-chan event.Event
+	Events() <-chan event.Delivery
 }, loopID [16]byte) (event.LoopStarted, bool) {
 	t.Helper()
 	deadline := time.After(2 * time.Second)
 	for {
 		select {
-		case ev, ok := <-sub.Events():
+		case d, ok := <-sub.Events():
 			if !ok {
 				return event.LoopStarted{}, false
 			}
-			if ls, ok := ev.(event.LoopStarted); ok && ls.Coordinates.LoopID == loopID {
+			if ls, ok := d.Event.(event.LoopStarted); ok && ls.Coordinates.LoopID == loopID {
 				return ls, true
 			}
 		case <-deadline:
@@ -212,17 +212,17 @@ func waitLoopStartedOnLoop(t *testing.T, sub interface {
 // waitTurnStartedOnLoop reads the observer until a TurnStarted whose Coordinates.LoopID
 // equals loopID arrives, returning that event so the caller can inspect its Cause.
 func waitTurnStartedOnLoop(t *testing.T, sub interface {
-	Events() <-chan event.Event
+	Events() <-chan event.Delivery
 }, loopID [16]byte) (event.TurnStarted, bool) {
 	t.Helper()
 	deadline := time.After(2 * time.Second)
 	for {
 		select {
-		case ev, ok := <-sub.Events():
+		case d, ok := <-sub.Events():
 			if !ok {
 				return event.TurnStarted{}, false
 			}
-			if ts, ok := ev.(event.TurnStarted); ok && ts.Coordinates.LoopID == loopID {
+			if ts, ok := d.Event.(event.TurnStarted); ok && ts.Coordinates.LoopID == loopID {
 				return ts, true
 			}
 		case <-deadline:

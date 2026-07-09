@@ -49,6 +49,32 @@ const (
 	StatusStopped SessionStatus = "stopped"
 )
 
+// SessionState is the richer, status-fold lifecycle state the catalog projects from the
+// event stream. It is a closed typed enum a status reader (the serve session API) switches
+// on. It SUPERSEDES SessionStatus for callers that need the running/waiting/idle/terminal
+// distinction, but Status is kept for back-compat (see SessionMeta.Status): State is
+// additive, so an old entry decoded without it simply reads as the empty state and is
+// rebuildable via RepairCatalog.
+type SessionState string
+
+const (
+	// StateRunning: a turn is actively executing (set by TurnStarted, restored after a
+	// gate resolves while a turn is active).
+	StateRunning SessionState = "running"
+	// StateWaitingOnGate: a gate is open and blocking progress (set by GateOpened).
+	StateWaitingOnGate SessionState = "waiting_on_gate"
+	// StateIdle: the session is up but no turn is running (set by SessionStarted, TurnDone,
+	// or a gate resolving with no active turn).
+	StateIdle SessionState = "idle"
+	// StateFailed: the last turn ended in a non-cancellation failure (set by TurnFailed).
+	StateFailed SessionState = "failed"
+	// StateInterrupted: the last turn was interrupted/cancelled (set by TurnInterrupted).
+	StateInterrupted SessionState = "interrupted"
+	// StateStopped: the session emitted SessionStopped — the terminal state that wins over
+	// every other (set by SessionStopped).
+	StateStopped SessionState = "stopped"
+)
+
 // SessionMeta is the derived per-session catalog entry: the small, replay-free record the
 // session picker reads to list sessions without opening a single ledger cursor. It is
 // JSON (snake_case) stored one-per-session in storekit.KV, keyed by the session's ledger
@@ -76,6 +102,55 @@ type SessionMeta struct {
 	// ConfigFingerprint is the config identity the session started under, for the picker
 	// to surface a config change on restore.
 	ConfigFingerprint event.ConfigFingerprint `json:"config_fingerprint,omitzero"`
+	// State is the status-fold lifecycle state (running/waiting_on_gate/idle/failed/
+	// interrupted/stopped). It supersedes Status for richer callers; Status is retained
+	// for back-compat. Empty until the fold sees its first state-bearing event.
+	State SessionState `json:"state,omitempty"`
+	// LastJournalSeq is the highest journal sequence folded into this entry (a monotonic
+	// max over the events the projection has consumed): a status reader's resume cursor.
+	LastJournalSeq uint64 `json:"last_journal_seq,omitempty"`
+	// ActiveTurnID is the turn currently running (set by TurnStarted, cleared by TurnDone).
+	// Zero when no turn is active.
+	ActiveTurnID uuid.UUID `json:"active_turn_id,omitzero"`
+	// WaitingGateID is the open gate blocking progress (set by GateOpened, cleared by
+	// GateResolved). Zero when no gate is open.
+	WaitingGateID uuid.UUID `json:"waiting_gate_id,omitzero"`
+	// LastTurn is the codec-safe summary of the most recent terminal turn event
+	// (TurnDone/TurnFailed). Nil until a turn ends.
+	LastTurn *eventSummary `json:"last_turn,omitempty"`
+	// LastStep is the codec-safe summary of the most recent StepDone. Nil until a step
+	// completes.
+	LastStep *eventSummary `json:"last_step,omitempty"`
+}
+
+// eventSummary is the codec-safe projection of a single fold-relevant event (a terminal
+// turn for LastTurn, a StepDone for LastStep) into a SessionMeta. It holds the event's
+// durable journal sequence plus its MARSHALED wire bytes (event.MarshalEvent) as an
+// OPAQUE json.RawMessage — NOT a bare event.Event interface field.
+//
+// Ambiguity A4 is resolved here as the RawMessage form: a bare event.Event field would
+// break json.Marshal (an interface has no stable wire shape) and would defeat the
+// DisallowUnknownFields round-trip decodeSessionMeta performs. Because json.RawMessage is
+// opaque to the decoder, the nested event's own keys ("type"/"v"/header/…) are copied
+// verbatim and are never checked against SessionMeta's field set. The raw bytes let a
+// serve DTO reconstruct a StatusEvent{JournalSeq, Event} losslessly via
+// event.UnmarshalEvent. A shared type backs both LastTurn and LastStep — their shapes are
+// identical, so one codec-safe struct is clearer than two.
+type eventSummary struct {
+	JournalSeq uint64          `json:"journal_seq"`
+	Event      json.RawMessage `json:"event"`
+}
+
+// newEventSummary marshals ev to its durable wire form and pairs it with seq. A marshal
+// failure (effectively unreachable for the enduring turn/step events folded here) is
+// returned so the caller can decide; the fold treats it as best-effort and simply skips
+// recording the summary.
+func newEventSummary(ev event.Event, seq uint64) (*eventSummary, error) {
+	raw, err := event.MarshalEvent(ev)
+	if err != nil {
+		return nil, err
+	}
+	return &eventSummary{JournalSeq: seq, Event: raw}, nil
 }
 
 // CatalogReadError wraps a failure to read or decode a catalog entry (a KV Get/Keys error
@@ -191,14 +266,27 @@ type EventReplayerOpener interface {
 // unit-testable without a KV.
 //
 //   - SessionStarted: stamps SessionID, CreatedAt, ConfigFingerprint, AgentKind (from the
-//     fingerprint — passthrough), Status=active, and counts the primary loop.
-//   - TurnStarted: sets Title from the user message if not already set (first turn wins),
-//     and bumps LastActiveAt.
-//   - StepDone / RestoreDone: bump LastActiveAt.
+//     fingerprint — passthrough), Status=active, State=idle, and counts the primary loop.
+//   - TurnStarted: State=running, sets ActiveTurnID, sets Title from the user message if
+//     not already set (first turn wins), and bumps LastActiveAt.
+//   - GateOpened: State=waiting_on_gate, sets WaitingGateID.
+//   - GateResolved: clears WaitingGateID; State back to running if a turn is active, else
+//     idle.
+//   - TurnDone: State=idle, records LastTurn, clears ActiveTurnID.
+//   - TurnFailed: State=failed, records LastTurn.
+//   - TurnInterrupted: State=interrupted.
+//   - StepDone: records LastStep, bumps LastActiveAt.
+//   - RestoreDone: bump LastActiveAt.
 //   - LoopStarted: increment LoopCount.
-//   - SessionStopped: flip Status to stopped.
+//   - SessionStopped: flip Status to stopped, State=stopped (the terminal state wins).
 //   - anything else: no-op (returns changed=false).
-func applyEvent(meta SessionMeta, ev event.Event, now CatalogClock) (SessionMeta, bool) {
+//
+// Every event that changes the entry also advances LastJournalSeq to max(current, seq) —
+// a monotonic cursor, so a lower seq (an out-of-order or replayed record) never rewinds it.
+// GatePrepared is deliberately absent: it is private and the event replayer filters it, so
+// the fold never sees it.
+func applyEvent(meta SessionMeta, ev event.Event, seq uint64, now CatalogClock) (SessionMeta, bool) {
+	changed := true
 	switch e := ev.(type) {
 	case event.SessionStarted:
 		meta.SessionID = e.SessionID
@@ -206,36 +294,74 @@ func applyEvent(meta SessionMeta, ev event.Event, now CatalogClock) (SessionMeta
 		meta.ConfigFingerprint = e.Config
 		meta.AgentKind = e.Config.AgentKind
 		meta.Status = StatusActive
+		meta.State = StateIdle
 		if meta.LoopCount < 1 {
 			meta.LoopCount = 1
 		}
-		return meta, true
 	case event.TurnStarted:
 		meta.SessionID = e.SessionID
 		if meta.Title == "" {
 			meta.Title = deriveTitle(e.Message)
 		}
 		meta.LastActiveAt = now()
-		return meta, true
+		meta.State = StateRunning
+		meta.ActiveTurnID = e.TurnID
+	case event.GateOpened:
+		meta.SessionID = e.SessionID
+		meta.State = StateWaitingOnGate
+		meta.WaitingGateID = e.Gate.ID
+	case event.GateResolved:
+		meta.SessionID = e.SessionID
+		meta.WaitingGateID = uuid.UUID{}
+		if meta.ActiveTurnID.IsZero() {
+			meta.State = StateIdle
+		} else {
+			meta.State = StateRunning
+		}
+	case event.TurnDone:
+		meta.SessionID = e.SessionID
+		meta.State = StateIdle
+		meta.ActiveTurnID = uuid.UUID{}
+		meta.LastTurn = summarize(ev, seq, meta.LastTurn)
+	case event.TurnFailed:
+		meta.SessionID = e.SessionID
+		meta.State = StateFailed
+		meta.LastTurn = summarize(ev, seq, meta.LastTurn)
+	case event.TurnInterrupted:
+		meta.SessionID = e.SessionID
+		meta.State = StateInterrupted
 	case event.StepDone:
 		meta.SessionID = e.SessionID
 		meta.LastActiveAt = now()
-		return meta, true
+		meta.LastStep = summarize(ev, seq, meta.LastStep)
 	case event.RestoreDone:
 		meta.SessionID = e.SessionID
 		meta.LastActiveAt = now()
-		return meta, true
 	case event.LoopStarted:
 		meta.SessionID = e.SessionID
 		meta.LoopCount++
-		return meta, true
 	case event.SessionStopped:
 		meta.SessionID = e.SessionID
 		meta.Status = StatusStopped
-		return meta, true
+		meta.State = StateStopped
 	default:
-		return meta, false
+		changed = false
 	}
+	if changed && seq > meta.LastJournalSeq {
+		meta.LastJournalSeq = seq
+	}
+	return meta, changed
+}
+
+// summarize builds a codec-safe eventSummary for ev at seq, returning prev unchanged if
+// the marshal fails (best-effort: a summary that cannot be captured is dropped rather than
+// failing the projection — the fold has no error channel and the entry is rebuildable).
+func summarize(ev event.Event, seq uint64, prev *eventSummary) *eventSummary {
+	sum, err := newEventSummary(ev, seq)
+	if err != nil {
+		return prev
+	}
+	return sum
 }
 
 // deriveTitle extracts a short label from the first turn's user message: the first
@@ -372,13 +498,17 @@ func (s *Store) OpenCatalog(opts ...CatalogOption) *Catalog {
 // MUST NEVER fail the underlying append — the catalog is derivable, so a lost update is
 // repaired later, never propagated. The returned error is always nil; the signature keeps a
 // nil-error contract for the appender seam.
-func (c *Catalog) UpdateOnEvent(ctx context.Context, ev event.Event) error {
+//
+// seq is the event's durable journal sequence, folded into the projection: it advances the
+// entry's LastJournalSeq (monotonic max) and stamps the LastTurn/LastStep summaries, so a
+// status reader can resume from it.
+func (c *Catalog) UpdateOnEvent(ctx context.Context, ev event.Event, seq uint64) error {
 	// Decide relevance on a zero meta first so a no-op event never touches the KV.
-	if _, changed := applyEvent(SessionMeta{}, ev, c.now); !changed {
+	if _, changed := applyEvent(SessionMeta{}, ev, seq, c.now); !changed {
 		return nil
 	}
 	sid := ev.EventHeader().SessionID
-	if err := c.upsert(ctx, sid, ev); err != nil {
+	if err := c.upsert(ctx, sid, ev, seq); err != nil {
 		c.log.CatalogUpdateFailed(err)
 	}
 	return nil
@@ -389,13 +519,13 @@ func (c *Catalog) UpdateOnEvent(ctx context.Context, ev event.Event) error {
 // advanced the revision, so re-read and retry. Exhausting the retries returns a typed
 // *CatalogConflictError. A read/decode fault or a non-conflict write fault is terminal and
 // returned as its typed error.
-func (c *Catalog) upsert(ctx context.Context, sid uuid.UUID, ev event.Event) error {
+func (c *Catalog) upsert(ctx context.Context, sid uuid.UUID, ev event.Event, seq uint64) error {
 	for attempt := 0; attempt < catalogMaxCASRetries; attempt++ {
 		current, rev, err := c.load(ctx, sid)
 		if err != nil {
 			return err
 		}
-		updated, _ := applyEvent(current, ev, c.now)
+		updated, _ := applyEvent(current, ev, seq, c.now)
 		serr := c.store(ctx, sid, rev, updated)
 		if serr == nil {
 			return nil
@@ -483,6 +613,23 @@ func (c *Catalog) ListSessions(ctx context.Context) ([]SessionMeta, error) {
 	return metas, nil
 }
 
+// ReadMeta reads one session's projected catalog entry by a SINGLE KV load — NEVER a
+// journal replay. It is the status-read contract: cheap and projection-only (the fold
+// already ran on the append path; a reader just reads the derived record). It returns
+// (meta, true, nil) for a present entry, (zero, false, nil) for an absent one, and a typed
+// *CatalogReadError on a read/decode fault. Absence is distinguished by the load path's
+// revision-0 sentinel (a stored entry always has a committed revision >= 1).
+func (c *Catalog) ReadMeta(ctx context.Context, id uuid.UUID) (SessionMeta, bool, error) {
+	meta, rev, err := c.load(ctx, id)
+	if err != nil {
+		return SessionMeta{}, false, err
+	}
+	if rev == 0 {
+		return SessionMeta{}, false, nil
+	}
+	return meta, true, nil
+}
+
 // RepairCatalog rebuilds a session's catalog entry from the authoritative ledger — the
 // repair path for a missing, stale, or corrupt entry. Since the catalog is derived, repair
 // reconstructs it by folding the session's events (the same applyEvent mapping the inline
@@ -529,7 +676,7 @@ func (c *Catalog) foldSession(ctx context.Context, sessionID uuid.UUID, replayer
 	var meta SessionMeta
 	sawStart := false
 	for {
-		ev, _, nerr := cursor.Next(ctx)
+		ev, seq, nerr := cursor.Next(ctx)
 		if errors.Is(nerr, io.EOF) {
 			break
 		}
@@ -539,7 +686,7 @@ func (c *Catalog) foldSession(ctx context.Context, sessionID uuid.UUID, replayer
 		if _, ok := ev.(event.SessionStarted); ok {
 			sawStart = true
 		}
-		meta, _ = applyEvent(meta, ev, c.now)
+		meta, _ = applyEvent(meta, ev, seq, c.now)
 	}
 	if !sawStart {
 		return SessionMeta{}, &EmptySessionError{SessionID: sessionID}

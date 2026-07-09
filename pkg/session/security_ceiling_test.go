@@ -9,7 +9,6 @@ import (
 
 	"github.com/looprig/harness/pkg/ceiling"
 	"github.com/looprig/harness/pkg/event"
-	"github.com/looprig/harness/pkg/hub"
 	"github.com/looprig/harness/pkg/identity"
 )
 
@@ -34,19 +33,20 @@ type ceilingTapSpy struct {
 	fail  bool
 }
 
-func (r *ceilingTapSpy) AppendEvent(_ context.Context, ev event.Event) error {
+func (r *ceilingTapSpy) AppendEvent(_ context.Context, ev event.Event) (uint64, error) {
 	sc, ok := ev.(event.SecurityCeilingChanged)
 	if !ok {
-		return nil
+		return 0, nil
 	}
 	r.mu.Lock()
 	r.seen = append(r.seen, ceilingEmit{level: sc.Level, currentAtEmit: r.state.Current()})
 	fail := r.fail
+	n := len(r.seen)
 	r.mu.Unlock()
 	if fail {
-		return errors.New("injected durable append failure (security ceiling)")
+		return 0, errors.New("injected durable append failure (security ceiling)")
 	}
-	return nil
+	return uint64(n), nil
 }
 
 func (r *ceilingTapSpy) setFail(v bool) {
@@ -64,17 +64,17 @@ func (r *ceilingTapSpy) emits() []ceilingEmit {
 // collectSecurityCeilingChanged drains sub for up to d, returning every
 // SecurityCeilingChanged it saw (ignoring the other session/loop events that flow). It
 // lets a test assert BOTH the level AND that EXACTLY ONE change event was emitted.
-func collectSecurityCeilingChanged(t *testing.T, sub *hub.EventSubscription, d time.Duration) []event.SecurityCeilingChanged {
+func collectSecurityCeilingChanged(t *testing.T, sub event.Subscription, d time.Duration) []event.SecurityCeilingChanged {
 	t.Helper()
 	var out []event.SecurityCeilingChanged
 	deadline := time.After(d)
 	for {
 		select {
-		case ev, ok := <-sub.Events():
+		case d, ok := <-sub.Events():
 			if !ok {
 				return out
 			}
-			if sc, is := ev.(event.SecurityCeilingChanged); is {
+			if sc, is := d.Event.(event.SecurityCeilingChanged); is {
 				out = append(out, sc)
 			}
 		case <-deadline:

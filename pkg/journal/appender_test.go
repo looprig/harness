@@ -60,7 +60,7 @@ func TestJournalEventAppenderRoutes(t *testing.T) {
 			j := &recordingJournal{}
 			app := NewJournalEventAppender(j)
 
-			if err := app.AppendEvent(context.Background(), tt.ev); err != nil {
+			if _, err := app.AppendEvent(context.Background(), tt.ev); err != nil {
 				t.Fatalf("AppendEvent = %v, want nil", err)
 			}
 			if len(j.records) != 1 {
@@ -76,6 +76,51 @@ func TestJournalEventAppenderRoutes(t *testing.T) {
 			}
 			if er.Event() != tt.ev {
 				t.Errorf("wrapped event = %v, want the appended event", er.Event())
+			}
+		})
+	}
+}
+
+// TestJournalEventAppenderReturnsSeq proves AppendEvent returns the durable sequence the
+// journal assigned (so the hub can ride it on the live delivery), and notifies the catalog
+// with that same (event, seq) pair. recordingJournal returns startSeq+1 on the first
+// append, so a case primes startSeq to pin the returned sequence.
+func TestJournalEventAppenderReturnsSeq(t *testing.T) {
+	t.Parallel()
+	sid := fixedUUID(0x91)
+	ev := event.SessionStarted{Header: event.Header{Coordinates: identity.Coordinates{SessionID: sid}, EventID: fixedUUID(0x92)}}
+
+	tests := []struct {
+		name     string
+		startSeq uint64
+		wantSeq  uint64
+	}{
+		{name: "first append (boundary seq 1)", startSeq: 0, wantSeq: 1},
+		{name: "mid-log append seq 7", startSeq: 6, wantSeq: 7},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			j := &recordingJournal{seq: tt.startSeq}
+			cat := &recordingCatalog{}
+			app := NewJournalEventAppender(j, WithCatalog(cat))
+
+			seq, err := app.AppendEvent(context.Background(), ev)
+			if err != nil {
+				t.Fatalf("AppendEvent = %v, want nil", err)
+			}
+			if seq != tt.wantSeq {
+				t.Errorf("AppendEvent seq = %d, want %d", seq, tt.wantSeq)
+			}
+			if len(cat.events) != 1 || len(cat.seqs) != 1 {
+				t.Fatalf("catalog saw %d events / %d seqs, want 1 / 1", len(cat.events), len(cat.seqs))
+			}
+			if cat.events[0] != ev {
+				t.Errorf("catalog event = %v, want the appended event", cat.events[0])
+			}
+			if cat.seqs[0] != tt.wantSeq {
+				t.Errorf("catalog seq = %d, want %d", cat.seqs[0], tt.wantSeq)
 			}
 		})
 	}
@@ -146,18 +191,26 @@ func TestJournalEventAppenderPropagatesError(t *testing.T) {
 	j := &recordingJournal{err: wantErr}
 	app := NewJournalEventAppender(j)
 
-	err := app.AppendEvent(context.Background(), event.SessionStopped{Header: event.Header{Coordinates: identity.Coordinates{SessionID: sid}, EventID: fixedUUID(0x32)}})
+	seq, err := app.AppendEvent(context.Background(), event.SessionStopped{Header: event.Header{Coordinates: identity.Coordinates{SessionID: sid}, EventID: fixedUUID(0x32)}})
 	if !errors.Is(err, wantErr) {
 		t.Fatalf("AppendEvent error = %v, want %v", err, wantErr)
 	}
+	if seq != 0 {
+		t.Errorf("AppendEvent seq on error = %d, want 0", seq)
+	}
 }
 
-// recordingCatalog records each event the appender hands it after a successful append.
-// It satisfies the catalogUpdater seam and, per that contract, never returns an error.
-type recordingCatalog struct{ events []event.Event }
+// recordingCatalog records each (event, seq) pair the appender hands it after a
+// successful append. It satisfies the catalogUpdater seam and, per that contract, never
+// returns an error.
+type recordingCatalog struct {
+	events []event.Event
+	seqs   []uint64
+}
 
-func (c *recordingCatalog) UpdateOnEvent(_ context.Context, ev event.Event) error {
+func (c *recordingCatalog) UpdateOnEvent(_ context.Context, ev event.Event, seq uint64) error {
 	c.events = append(c.events, ev)
+	c.seqs = append(c.seqs, seq)
 	return nil
 }
 
@@ -174,7 +227,7 @@ func TestJournalEventAppenderCatalogHook(t *testing.T) {
 		j := &recordingJournal{}
 		cat := &recordingCatalog{}
 		app := NewJournalEventAppender(j, WithCatalog(cat))
-		if err := app.AppendEvent(context.Background(), ev); err != nil {
+		if _, err := app.AppendEvent(context.Background(), ev); err != nil {
 			t.Fatalf("AppendEvent = %v, want nil", err)
 		}
 		if len(j.records) != 1 {
@@ -192,7 +245,7 @@ func TestJournalEventAppenderCatalogHook(t *testing.T) {
 		t.Parallel()
 		j := &recordingJournal{}
 		app := NewJournalEventAppender(j, WithCatalog(nil))
-		if err := app.AppendEvent(context.Background(), ev); err != nil {
+		if _, err := app.AppendEvent(context.Background(), ev); err != nil {
 			t.Fatalf("AppendEvent = %v, want nil", err)
 		}
 		if len(j.records) != 1 {
@@ -212,8 +265,12 @@ func TestJournalEventAppenderCatalogSkippedOnFailure(t *testing.T) {
 	app := NewJournalEventAppender(j, WithCatalog(cat))
 
 	ev := event.SessionStarted{Header: event.Header{Coordinates: identity.Coordinates{SessionID: sid}, EventID: fixedUUID(0x72)}}
-	if err := app.AppendEvent(context.Background(), ev); !errors.Is(err, wantErr) {
+	seq, err := app.AppendEvent(context.Background(), ev)
+	if !errors.Is(err, wantErr) {
 		t.Fatalf("AppendEvent error = %v, want %v", err, wantErr)
+	}
+	if seq != 0 {
+		t.Errorf("AppendEvent seq on error = %d, want 0", seq)
 	}
 	if len(cat.events) != 0 {
 		t.Errorf("catalog saw %d events on append failure, want 0", len(cat.events))

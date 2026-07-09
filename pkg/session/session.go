@@ -16,7 +16,6 @@ import (
 	"github.com/looprig/harness/pkg/hub"
 	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/loop"
-	"github.com/looprig/harness/pkg/tool"
 	"github.com/looprig/harness/pkg/workspacestore"
 )
 
@@ -306,15 +305,15 @@ type Session struct {
 }
 
 // eventAppender is the session's narrow view of the hub's REQUIRED durable event tap:
-// append one Enduring event to the durable journal, returning a typed error if it did
-// not commit. The session holds it only to FORWARD it into the hub at construction
-// (hub.WithAppender); the session never calls AppendEvent itself (the hub owns the
-// durable tap). It mirrors the hub's own unexported eventAppender method-set, so the
-// concrete journal.JournalEventAppender satisfies both structurally and the session
-// never imports the journal's appender type. Defined here (where it is consumed) per
-// Dependency Inversion, exactly like commandAppender.
+// append one Enduring event to the durable journal, returning the assigned durable
+// sequence and a typed error if it did not commit. The session holds it only to FORWARD
+// it into the hub at construction (hub.WithAppender); the session never calls AppendEvent
+// itself (the hub owns the durable tap). It mirrors the hub's own unexported eventAppender
+// method-set, so the concrete journal.JournalEventAppender satisfies both structurally and
+// the session never imports the journal's appender type. Defined here (where it is
+// consumed) per Dependency Inversion, exactly like commandAppender.
 type eventAppender interface {
-	AppendEvent(ctx context.Context, ev event.Event) error
+	AppendEvent(ctx context.Context, ev event.Event) (uint64, error)
 }
 
 // loopHandle is the session's registry entry: the loop's channel handle, the
@@ -331,7 +330,7 @@ type loopHandle struct {
 // where it is consumed (the session), per Dependency Inversion. *Session
 // satisfies it by delegating to the hub.
 type eventSubscriber interface {
-	SubscribeEvents(event.EventFilter) (*hub.EventSubscription, error)
+	SubscribeEvents(event.EventFilter) (event.Subscription, error)
 }
 
 // Compile-time proof that *Session is the consumer-facing eventSubscriber.
@@ -390,7 +389,7 @@ func (s *Session) PublishEvent(ctx context.Context, ev event.Event) error {
 // SubscribeEvents attaches a consumer to the session fan-in with the given filter.
 // The returned subscription's Events() channel yields the filtered stream; the
 // caller must Close it when done. It delegates to the hub.
-func (s *Session) SubscribeEvents(filter event.EventFilter) (*hub.EventSubscription, error) {
+func (s *Session) SubscribeEvents(filter event.EventFilter) (event.Subscription, error) {
 	return s.hub.SubscribeEvents(filter)
 }
 
@@ -1289,90 +1288,6 @@ func (s *Session) Shutdown(ctx context.Context) error {
 		return &SessionError{Kind: SessionContextDone, Cause: firstErr}
 	}
 	return nil
-}
-
-// Approve approves the pending tool call identified by toolExecutionID, granting
-// it at the given persistence scope. The reply is dispatched to loopID — the loop
-// that opened the gate — so a subagent loop's gate is never answered by routing to
-// the primary (the latent multi-loop misroute). loopID is resolved against the
-// registry; a zero loopID falls back to the primary loop (single-loop default),
-// and an unknown non-zero loopID fails secure with SessionLoopNotFound. It is
-// fire-and-route: the command carries no Ack, so Approve returns as soon as the
-// actor accepts it (the gate unblocking and the subsequent ToolCallStarted event
-// are the observable effect, not a reply). The select covers ctx.Done() and the
-// loop's Done channel so the unbuffered send can never block forever.
-func (s *Session) Approve(ctx context.Context, loopID, toolExecutionID uuid.UUID, scope tool.ApprovalScope) error {
-	l, route, err := s.resolveGate(loopID, toolExecutionID)
-	if err != nil {
-		return err
-	}
-	id, err := s.newCommandID()
-	if err != nil {
-		return err
-	}
-	// A human approve is a user-origination point (the gate replies): stamp AgencyUser.
-	return s.routeGate(ctx, route.LoopID, l, command.ApproveToolCall{Header: command.Header{CommandID: id, Agency: identity.AgencyUser, CreatedAt: s.stampNow()}, GateRoute: route, Scope: scope})
-}
-
-// Deny denies the pending tool call identified by toolExecutionID, failing it
-// closed (fail-secure). Like Approve it dispatches to loopID (the loop that opened
-// the gate) and is fire-and-route with no Ack and no scope — nothing is ever
-// persisted on a deny. A zero loopID falls back to the primary loop; an unknown
-// non-zero loopID fails secure with SessionLoopNotFound.
-func (s *Session) Deny(ctx context.Context, loopID, toolExecutionID uuid.UUID) error {
-	l, route, err := s.resolveGate(loopID, toolExecutionID)
-	if err != nil {
-		return err
-	}
-	id, err := s.newCommandID()
-	if err != nil {
-		return err
-	}
-	// A human deny is a user-origination point (the gate replies): stamp AgencyUser.
-	return s.routeGate(ctx, route.LoopID, l, command.DenyToolCall{Header: command.Header{CommandID: id, Agency: identity.AgencyUser, CreatedAt: s.stampNow()}, GateRoute: route})
-}
-
-// ProvideUserInput supplies the user's answer to the pending AskUser request
-// identified by toolExecutionID. Like the approve/deny pair it dispatches to
-// loopID (the loop that opened the gate) and is fire-and-route with no Ack: the
-// actor routes it to the parked user-input gate, which delivers answer to the
-// waiting tool. A zero loopID falls back to the primary loop; an unknown non-zero
-// loopID fails secure with SessionLoopNotFound.
-func (s *Session) ProvideUserInput(ctx context.Context, loopID, toolExecutionID uuid.UUID, answer string) error {
-	l, route, err := s.resolveGate(loopID, toolExecutionID)
-	if err != nil {
-		return err
-	}
-	id, err := s.newCommandID()
-	if err != nil {
-		return err
-	}
-	// A human answer is a user-origination point (the gate replies): stamp AgencyUser.
-	return s.routeGate(ctx, route.LoopID, l, command.ProvideUserInput{Header: command.Header{CommandID: id, Agency: identity.AgencyUser, CreatedAt: s.stampNow()}, GateRoute: route, Answer: answer})
-}
-
-// resolveGate selects the target loop for a gate reply and builds the command's
-// GateRoute. A zero loopID is "unspecified at this granularity": it falls back to
-// the primary loop (the single-loop default). A non-zero loopID is looked up in
-// the registry as-is; an unknown one fails secure with SessionLoopNotFound rather
-// than silently falling through to the primary loop — an unroutable approval must
-// never approve a tool call on a loop the caller did not address. The returned
-// GateRoute carries the RESOLVED loop id (the loop actually dispatched to) and the
-// match key (ToolExecutionID), so the route is concrete and self-describing.
-func (s *Session) resolveGate(loopID, toolExecutionID uuid.UUID) (loop.Backend, command.GateRoute, error) {
-	targetLoopID := loopID
-	if targetLoopID.IsZero() {
-		targetLoopID = s.PrimaryLoopID()
-	}
-	l, ok := s.loopFor(targetLoopID)
-	if !ok {
-		return nil, command.GateRoute{}, &SessionError{Kind: SessionLoopNotFound}
-	}
-	route := command.GateRoute{
-		Coordinates:     identity.Coordinates{SessionID: s.SessionID, LoopID: targetLoopID},
-		ToolExecutionID: toolExecutionID,
-	}
-	return l, route, nil
 }
 
 // routeGate sends a fire-and-route gate command to the resolved target loop. These

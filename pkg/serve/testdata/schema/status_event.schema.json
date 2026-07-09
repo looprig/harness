@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://looprig.dev/serve/v1/status_event.schema.json",
+  "title": "StatusEvent",
+  "description": "A durable journal sequence paired with the event recorded at that sequence. event is the durable wire envelope produced by event.MarshalEvent (type-tagged, versioned), NOT a Go-struct dump.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["journal_seq"],
+  "properties": {
+    "journal_seq": { "type": "integer", "minimum": 0 },
+    "event": { "$ref": "event_envelope.schema.json" }
+  }
+}

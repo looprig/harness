@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://looprig.dev/serve/v1/enduring_frame.schema.json",
+  "title": "EnduringFrame",
+  "description": "The JSON body carried in the data: field of an `event: enduring` SSE frame. The frame on the wire is `event: enduring\\nid: <journal_seq>\\ndata: <this-object>\\n\\n`; the id: line stamps the durable journal sequence (always present, \"0\" for a would-be zero-seq append). This schema constrains only the data: payload.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["v", "event"],
+  "properties": {
+    "v": { "type": "integer", "const": 1 },
+    "event": { "$ref": "event_envelope.schema.json" }
+  }
+}

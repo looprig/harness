@@ -49,12 +49,12 @@ func TestHubWiringDeliversSessionEvents(t *testing.T) {
 		t.Fatalf("PublishEvent: %v", err)
 	}
 	select {
-	case ev, ok := <-sub.Events():
+	case d, ok := <-sub.Events():
 		if !ok {
 			t.Fatalf("subscription closed unexpectedly")
 		}
-		if _, isStart := ev.(event.SessionStarted); !isStart {
-			t.Fatalf("got %T, want event.SessionStarted", ev)
+		if _, isStart := d.Event.(event.SessionStarted); !isStart {
+			t.Fatalf("got %T, want event.SessionStarted", d.Event)
 		}
 	case <-time.After(time.Second):
 		t.Fatalf("subscriber did not receive the session event")
@@ -96,12 +96,12 @@ func TestSubscribeSeamDefaultFilterDeliversSessionEvent(t *testing.T) {
 		t.Fatalf("PublishEvent: %v", err)
 	}
 	select {
-	case ev, ok := <-sub.Events():
+	case d, ok := <-sub.Events():
 		if !ok {
 			t.Fatalf("subscription closed unexpectedly")
 		}
-		if _, isIdle := ev.(event.SessionIdle); !isIdle {
-			t.Fatalf("got %T, want event.SessionIdle", ev)
+		if _, isIdle := d.Event.(event.SessionIdle); !isIdle {
+			t.Fatalf("got %T, want event.SessionIdle", d.Event)
 		}
 	case <-time.After(time.Second):
 		t.Fatalf("subscriber did not receive the session-scoped event through the default filter")
@@ -159,11 +159,11 @@ func TestShutdownStopsSessionAndWaitIdle(t *testing.T) {
 	drain := time.After(time.Second)
 	for !sawStopped {
 		select {
-		case ev, ok := <-sub.Events():
+		case d, ok := <-sub.Events():
 			if !ok {
 				t.Fatalf("subscription closed before SessionStopped seen")
 			}
-			if _, ok := ev.(event.SessionStopped); ok {
+			if _, ok := d.Event.(event.SessionStopped); ok {
 				sawStopped = true
 			}
 		case <-drain:
@@ -225,16 +225,16 @@ func TestExpectCancelExpectTurnSessionWiring(t *testing.T) {
 
 // drainFor reads from the subscription until an event of type T arrives or a
 // timeout elapses. It returns true if T was seen.
-func drainFor[T event.Event](t *testing.T, sub *hub.EventSubscription) bool {
+func drainFor[T event.Event](t *testing.T, sub event.Subscription) bool {
 	t.Helper()
 	deadline := time.After(time.Second)
 	for {
 		select {
-		case ev, ok := <-sub.Events():
+		case d, ok := <-sub.Events():
 			if !ok {
 				return false
 			}
-			if _, match := ev.(T); match {
+			if _, match := d.Event.(T); match {
 				return true
 			}
 		case <-deadline:
@@ -247,17 +247,17 @@ func drainFor[T event.Event](t *testing.T, sub *hub.EventSubscription) bool {
 // timeout elapses, returning the matched event and true (zero value, false on
 // miss). Unlike drainFor it hands back the concrete event so a test can inspect
 // its Header/Cause.
-func firstMatching[T event.Event](t *testing.T, sub *hub.EventSubscription) (T, bool) {
+func firstMatching[T event.Event](t *testing.T, sub event.Subscription) (T, bool) {
 	t.Helper()
 	var zero T
 	deadline := time.After(time.Second)
 	for {
 		select {
-		case ev, ok := <-sub.Events():
+		case d, ok := <-sub.Events():
 			if !ok {
 				return zero, false
 			}
-			if got, match := ev.(T); match {
+			if got, match := d.Event.(T); match {
 				return got, true
 			}
 		case <-deadline:

@@ -7,18 +7,20 @@ import (
 )
 
 // eventAppender is the hub's narrow durable-write seam: append one Enduring event to
-// the session's durable journal, returning a typed error if the append did not commit.
-// The hub depends only on this one method (Interface Segregation) — never on the full
-// SessionJournal, its stream management, or the record wrappers. The composition root
-// (Phase 10) wires a real adapter over SessionJournal; the default is the nop appender
-// so existing hub callers and headless/no-persistence mode are unchanged.
+// the session's durable journal, returning the assigned durable journal sequence and a
+// typed error if the append did not commit. The hub depends only on this one method
+// (Interface Segregation) — never on the full SessionJournal, its stream management, or
+// the record wrappers. The composition root (Phase 10) wires a real adapter over
+// SessionJournal; the default is the nop appender so existing hub callers and
+// headless/no-persistence mode are unchanged.
 //
 // AppendEvent must be append-BEFORE-apply: the hub calls it before applying the event
 // to hub state, outside the hub lock (no I/O under the lock), and treats any non-nil
 // error as fail-secure — the live event is not delivered and a SessionPersistenceFault
-// is raised.
+// is raised. The returned sequence rides only the LIVE delivery (event.Delivery.JournalSeq);
+// it never enters the persisted event codec.
 type eventAppender interface {
-	AppendEvent(ctx context.Context, ev event.Event) error
+	AppendEvent(ctx context.Context, ev event.Event) (uint64, error)
 }
 
 // nopEventAppender is the default appender wired into a hub built without an injected
@@ -27,7 +29,7 @@ type eventAppender interface {
 // the durable tap landed. Headless runs and existing tests use this.
 type nopEventAppender struct{}
 
-func (nopEventAppender) AppendEvent(context.Context, event.Event) error { return nil }
+func (nopEventAppender) AppendEvent(context.Context, event.Event) (uint64, error) { return 0, nil }
 
 // Option configures an optional hub dependency at construction. The bare
 // New(sessionID) installs the nop appender, a real-clock/real-uuid Factory, and the

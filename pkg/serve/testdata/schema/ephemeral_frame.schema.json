@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://looprig.dev/serve/v1/ephemeral_frame.schema.json",
+  "title": "EphemeralFrame",
+  "description": "The JSON body carried in the data: field of an `event: ephemeral` SSE frame. The frame on the wire is `event: ephemeral\\ndata: <this-object>\\n\\n` with NO id: line (Ephemeral events are never sequenced or persisted). kind selects how delta decodes; header is the producing event's identity; delta is absent for input_queued.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["v", "kind"],
+  "properties": {
+    "v": { "type": "integer", "const": 1 },
+    "kind": {
+      "type": "string",
+      "enum": ["token_delta", "tool_call_started", "tool_call_completed", "input_queued"]
+    },
+    "header": { "$ref": "event_envelope.schema.json" },
+    "delta": {
+      "type": "object",
+      "description": "Kind-specific payload. For token_delta a tagged chunk DTO ({chunk_type, ...}); for tool_call_started/completed the tool-call delta; absent for input_queued."
+    }
+  }
+}

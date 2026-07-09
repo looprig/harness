@@ -1,0 +1,1 @@
+{"session_id":"00000000-0000-0000-0000-000000000000","state":"running","last_journal_seq":7,"active_turn_id":"00000000-0000-0000-0000-000000000000","last_turn":{"journal_seq":7,"event":{"turn_index":1,"type":"TurnDone","v":1}},"last_step":{"journal_seq":6,"event":{"type":"StepDone","v":1}},"updated_at":"2026-07-08T12:00:00Z"}

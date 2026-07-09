@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://looprig.dev/serve/v1/session_summary.schema.json",
+  "title": "SessionSummary",
+  "description": "One row of a session list: the picker-facing projection of a session's catalog entry.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["session_id"],
+  "properties": {
+    "session_id": { "$ref": "uuid.schema.json" },
+    "state": { "type": "string" },
+    "title": { "type": "string" },
+    "created_at": { "type": "string", "format": "date-time" },
+    "last_active_at": { "type": "string", "format": "date-time" }
+  }
+}

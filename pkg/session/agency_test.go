@@ -9,7 +9,6 @@ import (
 	"github.com/looprig/core/content"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/identity"
-	"github.com/looprig/harness/pkg/tool"
 )
 
 // captureCommand runs call (which sends exactly one command to the fake loop) in a
@@ -42,43 +41,66 @@ func captureCommand(t *testing.T, s *Session, cmds chan command.Command, call fu
 // methods.
 func TestSessionStampsAgency(t *testing.T) {
 	t.Parallel()
-	callID := mustUUID()
 	blocks := []content.Block{&content.TextBlock{Text: "hi"}}
 
+	// The gate-reply rows drive RespondGate (the Approve/Deny/ProvideUserInput trio
+	// it replaced was removed). RespondGate hard-stamps AgencyUser on the translated
+	// command, so the human-origination attribution the trio carried is preserved.
 	tests := []struct {
 		name       string
-		call       func(s *Session)
+		setup      func(t *testing.T) (*Session, chan command.Command, func(s *Session))
 		wantAgency identity.Agency
 	}{
 		{
-			name:       "Submit (interactive, human-typed) -> AgencyUser",
-			call:       func(s *Session) { _, _ = s.Submit(context.Background(), blocks) },
+			name: "Submit (interactive, human-typed) -> AgencyUser",
+			setup: func(t *testing.T) (*Session, chan command.Command, func(s *Session)) {
+				s, cmds, _ := sessionWithFakeLoop()
+				return s, cmds, func(s *Session) { _, _ = s.Submit(context.Background(), blocks) }
+			},
 			wantAgency: identity.AgencyUser,
 		},
 		{
-			name:       "Approve (human gate reply) -> AgencyUser",
-			call:       func(s *Session) { _ = s.Approve(context.Background(), s.primaryLoopID, callID, tool.ScopeSession) },
+			name: "RespondGate approve (human gate reply) -> AgencyUser",
+			setup: func(t *testing.T) (*Session, chan command.Command, func(s *Session)) {
+				s, _, loopID, cmds := gateSession(t)
+				gateID := activateOn(t, s, loopID, mustUUID(), permissionGate(), bashPayload())
+				return s, cmds, func(s *Session) { _ = s.RespondGate(context.Background(), userApprove(gateID, "session")) }
+			},
 			wantAgency: identity.AgencyUser,
 		},
 		{
-			name:       "Deny (human gate reply) -> AgencyUser",
-			call:       func(s *Session) { _ = s.Deny(context.Background(), s.primaryLoopID, callID) },
+			name: "RespondGate deny (human gate reply) -> AgencyUser",
+			setup: func(t *testing.T) (*Session, chan command.Command, func(s *Session)) {
+				s, _, loopID, cmds := gateSession(t)
+				gateID := activateOn(t, s, loopID, mustUUID(), permissionGate(), bashPayload())
+				return s, cmds, func(s *Session) { _ = s.RespondGate(context.Background(), userDeny(gateID)) }
+			},
 			wantAgency: identity.AgencyUser,
 		},
 		{
-			name:       "ProvideUserInput (human answer) -> AgencyUser",
-			call:       func(s *Session) { _ = s.ProvideUserInput(context.Background(), s.primaryLoopID, callID, "ans") },
+			name: "RespondGate answer (human ask-user reply) -> AgencyUser",
+			setup: func(t *testing.T) (*Session, chan command.Command, func(s *Session)) {
+				s, _, loopID, cmds := gateSession(t)
+				gateID := activateOn(t, s, loopID, mustUUID(), askUserGate(), askUserPayload())
+				return s, cmds, func(s *Session) { _ = s.RespondGate(context.Background(), userAnswer(gateID, "ans")) }
+			},
 			wantAgency: identity.AgencyUser,
 		},
 		{
-			name:       "Interrupt (manual) -> AgencyUser",
-			call:       func(s *Session) { _, _ = s.Interrupt(context.Background()) },
+			name: "Interrupt (manual) -> AgencyUser",
+			setup: func(t *testing.T) (*Session, chan command.Command, func(s *Session)) {
+				s, cmds, _ := sessionWithFakeLoop()
+				return s, cmds, func(s *Session) { _, _ = s.Interrupt(context.Background()) }
+			},
 			wantAgency: identity.AgencyUser,
 		},
 		{
 			name: "SubagentResult hand-back -> AgencyMachine",
-			call: func(s *Session) {
-				_ = s.deliverSubagentResult(context.Background(), s.primaryLoopID, mustUUID(), blocks)
+			setup: func(t *testing.T) (*Session, chan command.Command, func(s *Session)) {
+				s, cmds, _ := sessionWithFakeLoop()
+				return s, cmds, func(s *Session) {
+					_ = s.deliverSubagentResult(context.Background(), s.primaryLoopID, mustUUID(), blocks)
+				}
 			},
 			wantAgency: identity.AgencyMachine,
 		},
@@ -88,8 +110,8 @@ func TestSessionStampsAgency(t *testing.T) {
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			s, cmds, _ := sessionWithFakeLoop()
-			cmd := captureCommand(t, s, cmds, tt.call)
+			s, cmds, call := tt.setup(t)
+			cmd := captureCommand(t, s, cmds, call)
 			if got := cmd.CommandHeader().Agency; got != tt.wantAgency {
 				t.Errorf("%T Header.Agency = %v, want %v", cmd, got, tt.wantAgency)
 			}

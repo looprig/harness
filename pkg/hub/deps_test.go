@@ -23,15 +23,15 @@ type fakeAppender struct {
 	calls    int
 }
 
-func (f *fakeAppender) AppendEvent(_ context.Context, ev event.Event) error {
+func (f *fakeAppender) AppendEvent(_ context.Context, ev event.Event) (uint64, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls++
 	if f.failAll || (f.failAt != 0 && f.calls == f.failAt) {
-		return errAppend
+		return 0, errAppend
 	}
 	f.appended = append(f.appended, ev)
-	return nil
+	return uint64(len(f.appended)), nil
 }
 
 func (f *fakeAppender) events() []event.Event {
@@ -71,15 +71,15 @@ func failOnType(evs ...event.Event) *typeFailAppender {
 	return &typeFailAppender{failOn: set}
 }
 
-func (f *typeFailAppender) AppendEvent(_ context.Context, ev event.Event) error {
+func (f *typeFailAppender) AppendEvent(_ context.Context, ev event.Event) (uint64, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls++
 	if _, fail := f.failOn[fmt.Sprintf("%T", ev)]; fail {
-		return errAppend
+		return 0, errAppend
 	}
 	f.appended = append(f.appended, ev)
-	return nil
+	return uint64(len(f.appended)), nil
 }
 
 func (f *typeFailAppender) events() []event.Event {
@@ -120,6 +120,34 @@ func testFactory() *event.Factory {
 		n++
 		return uuid.UUID{n}, nil
 	}, func() time.Time { return ts })
+}
+
+// TestNopAppenderReturnsZeroSeq proves the default (no-persistence) appender commits
+// nothing, never fails, and reports sequence 0 — so a headless hub delivers every
+// Enduring event with JournalSeq 0 (nothing was durably sequenced).
+func TestNopAppenderReturnsZeroSeq(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+		ev   event.Event
+	}{
+		{name: "enduring session event", ev: event.SessionStarted{}},
+		{name: "enduring step event", ev: event.StepDone{}},
+		{name: "zero-value event", ev: event.SessionStopped{}},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			seq, err := nopEventAppender{}.AppendEvent(context.Background(), tt.ev)
+			if err != nil {
+				t.Fatalf("AppendEvent() error = %v, want nil", err)
+			}
+			if seq != 0 {
+				t.Errorf("AppendEvent() seq = %d, want 0", seq)
+			}
+		})
+	}
 }
 
 // TestNewDefaultsAreNop proves the bare New(sessionID) constructor still works and

@@ -582,11 +582,11 @@ func drainSubToTerminal(t *testing.T, sub event.Subscription) {
 	timeout := time.After(10 * time.Second)
 	for {
 		select {
-		case ev, ok := <-sub.Events():
+		case d, ok := <-sub.Events():
 			if !ok {
 				t.Fatal("subscription closed before a terminal")
 			}
-			switch ev.(type) {
+			switch d.Event.(type) {
 			case event.TurnDone, event.TurnFailed, event.TurnInterrupted:
 				return
 			}

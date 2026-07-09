@@ -8,7 +8,6 @@ import (
 
 	"github.com/looprig/core/content"
 	"github.com/looprig/harness/pkg/event"
-	"github.com/looprig/harness/pkg/hub"
 	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/core/uuid"
 )
@@ -109,16 +108,16 @@ func TestNewLoopDepthCapDefault(t *testing.T) {
 // countLoopStarted drains sub for d, returning how many LoopStarted events arrived. It
 // is the no-replay observer: a LoopStarted published for a refused spawn would arrive
 // here; none does.
-func countLoopStarted(sub *hub.EventSubscription, d time.Duration) int {
+func countLoopStarted(sub event.Subscription, d time.Duration) int {
 	deadline := time.After(d)
 	n := 0
 	for {
 		select {
-		case ev, ok := <-sub.Events():
+		case d, ok := <-sub.Events():
 			if !ok {
 				return n
 			}
-			if _, isLS := ev.(event.LoopStarted); isLS {
+			if _, isLS := d.Event.(event.LoopStarted); isLS {
 				n++
 			}
 		case <-deadline:

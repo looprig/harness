@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://looprig.dev/serve/v1/session_list.schema.json",
+  "title": "SessionList",
+  "description": "GET /v1/sessions response: a page of summaries plus the paging cursor. next_skip is the skip to pass for the next page (set only when more may remain); done reports the end of the list was reached.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["sessions", "skip", "limit", "next_skip", "done"],
+  "properties": {
+    "sessions": {
+      "type": "array",
+      "items": { "$ref": "session_summary.schema.json" }
+    },
+    "skip": { "type": "integer", "minimum": 0 },
+    "limit": { "type": "integer", "minimum": 1, "maximum": 1000 },
+    "next_skip": { "type": "integer", "minimum": 0 },
+    "done": { "type": "boolean" }
+  }
+}
