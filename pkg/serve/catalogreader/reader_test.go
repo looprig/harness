@@ -155,7 +155,6 @@ func TestReaderListSessions(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			st, cat, clk := newCatalog(t)
@@ -246,7 +245,6 @@ func TestReaderReadStatus(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			st, cat, _ := newCatalog(t)
@@ -372,7 +370,6 @@ func TestReaderReadJournal(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			var st *sessionstore.Store

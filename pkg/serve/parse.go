@@ -8,12 +8,14 @@ import (
 	"github.com/looprig/core/uuid"
 )
 
-// Read-plane query-parameter bounds (SPEC §6). limit defaults to 100 and is hard
-// capped at 1000; skip and limit must be non-negative. skip has no domain cap of
-// its own, so it is bounded only by the int range (math.MaxInt).
+// Read-plane query-parameter bounds (SPEC §6). limit defaults to 100 and its valid
+// range is [1, 1000] — an absent limit defaults to 100, but an explicit limit=0 is
+// rejected (a zero window makes no forward progress). skip must be non-negative and
+// has no domain cap of its own, so it is bounded only by the int range (math.MaxInt).
 const (
 	defaultLimit = 100
 	maxLimit     = 1000
+	minLimit     = 1
 	minCount     = 0
 )
 
@@ -58,10 +60,11 @@ func parseUUID(param, s string) (uuid.UUID, error) {
 }
 
 // parseLimit reads the read-plane "limit" query parameter: absent/empty yields
-// the default (100); a value above the hard cap (1000), below zero, or
-// non-numeric yields an InvalidParamError.
+// the default (100); the valid explicit range is [1, 1000], so a value above the
+// hard cap (1000), below the minimum (1 — including 0, a non-progressing zero
+// window), or non-numeric yields an InvalidParamError.
 func parseLimit(values url.Values) (int, error) {
-	return parseIntQuery(values, "limit", defaultLimit, minCount, maxLimit)
+	return parseIntQuery(values, "limit", defaultLimit, minLimit, maxLimit)
 }
 
 // parseSkip reads the read-plane "skip" query parameter: absent/empty yields 0;

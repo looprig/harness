@@ -80,6 +80,7 @@ func TestServerHandleListSessions(t *testing.T) {
 		{name: "skip and limit", query: "?skip=10&limit=50", wantStatus: http.StatusOK, wantSkip: 10, wantLimit: 50},
 		{name: "limit at cap ok", query: "?limit=1000", wantStatus: http.StatusOK, wantSkip: 0, wantLimit: 1000},
 		{name: "limit over cap is 400", query: "?limit=1001", wantStatus: http.StatusBadRequest},
+		{name: "limit zero is 400", query: "?limit=0", wantStatus: http.StatusBadRequest},
 		{name: "negative skip is 400", query: "?skip=-1", wantStatus: http.StatusBadRequest},
 		{name: "non-numeric limit is 400", query: "?limit=abc", wantStatus: http.StatusBadRequest},
 		{name: "store read error is 500", query: "", listErr: StoreReadError{Op: "list", Cause: errBoom}, wantStatus: http.StatusInternalServerError},
@@ -237,6 +238,7 @@ func TestServerHandleJournal(t *testing.T) {
 		{name: "negative from is 400", sid: sidStr, query: "?from_journal_seq=-1", wantStatus: http.StatusBadRequest},
 		{name: "non-numeric from is 400", sid: sidStr, query: "?from_journal_seq=x", wantStatus: http.StatusBadRequest},
 		{name: "limit over cap is 400", sid: sidStr, query: "?limit=1001", wantStatus: http.StatusBadRequest},
+		{name: "limit zero is 400", sid: sidStr, query: "?limit=0", wantStatus: http.StatusBadRequest},
 		{name: "store read error is 500", sid: sidStr, query: "", journalErr: StoreReadError{Op: "replay", Cause: errBoom}, wantStatus: http.StatusInternalServerError},
 	}
 
