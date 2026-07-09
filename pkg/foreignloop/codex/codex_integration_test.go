@@ -122,17 +122,13 @@ func TestUnsupportedResumeFlagFailures(t *testing.T) {
 		{flag: "--ask-for-approval", before: true, after: true},
 		{flag: "--add-dir", before: false, after: true},
 	})
-	if len(got) != 3 {
-		t.Fatalf("unsupported resume flag failures = %q, want 3 failures", got)
+	if len(got) != 1 {
+		t.Fatalf("unsupported resume flag failures = %q, want only the placement-agnostic failure", got)
 	}
 
 	for _, want := range []string{
 		"--cd does not parse before or after resume",
 		"working directory",
-		"--sandbox does not parse after resume",
-		"sandbox policy",
-		"--add-dir does not parse before resume",
-		"additional directory",
 	} {
 		found := false
 		for _, failure := range got {
@@ -144,6 +140,41 @@ func TestUnsupportedResumeFlagFailures(t *testing.T) {
 		if !found {
 			t.Errorf("unsupported resume flag failures = %q, missing %q", got, want)
 		}
+	}
+}
+
+func TestResumeFlagProbeGate(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		support   resumeFlagSupport
+		wantBlock bool
+	}{
+		{
+			name:      "before resume parses",
+			support:   resumeFlagSupport{flag: "--cd", before: true, after: false},
+			wantBlock: false,
+		},
+		{
+			name:      "after resume parses",
+			support:   resumeFlagSupport{flag: "--sandbox", before: false, after: true},
+			wantBlock: false,
+		},
+		{
+			name:      "neither placement parses",
+			support:   resumeFlagSupport{flag: "--add-dir", before: false, after: false},
+			wantBlock: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotBlock := !resumeFlagProbesSupported([]resumeFlagSupport{tt.support})
+			if gotBlock != tt.wantBlock {
+				t.Fatalf("live Codex contract blocked = %t, want %t for %+v", gotBlock, tt.wantBlock, tt.support)
+			}
+		})
 	}
 }
 
@@ -160,7 +191,9 @@ func TestIntegrationCodexCLIContract(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 
-	probeResumeFlagSupport(t, ctx, codexPath)
+	if !probeResumeFlagSupport(t, ctx, codexPath) {
+		t.Fatal("codex exec resume parser probes failed; live codex exec start/resume commands were not attempted")
+	}
 
 	start := runCodex(t, ctx, codexPath, []string{
 		"exec",
@@ -186,7 +219,7 @@ func TestIntegrationCodexCLIContract(t *testing.T) {
 
 }
 
-func probeResumeFlagSupport(t *testing.T, parent context.Context, codexPath string) {
+func probeResumeFlagSupport(t *testing.T, parent context.Context, codexPath string) bool {
 	t.Helper()
 
 	support := make([]resumeFlagSupport, 0, len(resumeFlagProbes))
@@ -208,11 +241,13 @@ func probeResumeFlagSupport(t *testing.T, parent context.Context, codexPath stri
 		}
 	}
 
-	if failures := unsupportedResumeFlagFailures(support); len(failures) > 0 {
-		t.Errorf("codex exec resume parser probe results (all probes end in --help and do not create or resume a session):\n%s\nunsupported flag fallbacks:\n%s", strings.Join(results, "\n"), strings.Join(failures, "\n"))
-		return
+	if !resumeFlagProbesSupported(support) {
+		failures := unsupportedResumeFlagFailures(support)
+		t.Logf("codex exec resume parser probe results (all probes end in --help and do not create or resume a session):\n%s\nunsupported flag fallbacks:\n%s", strings.Join(results, "\n"), strings.Join(failures, "\n"))
+		return false
 	}
 	t.Logf("codex exec resume parser probe results:\n%s", strings.Join(results, "\n"))
+	return true
 }
 
 type codexParserProbe struct {
@@ -250,20 +285,16 @@ func resumeFlagProbeArgs(flag, value string, beforeResume bool) []string {
 func unsupportedResumeFlagFailures(support []resumeFlagSupport) []string {
 	var failures []string
 	for _, flag := range support {
-		var placement string
-		switch {
-		case !flag.before && !flag.after:
-			placement = "before or after"
-		case !flag.before:
-			placement = "before"
-		case !flag.after:
-			placement = "after"
-		default:
+		if flag.before || flag.after {
 			continue
 		}
-		failures = append(failures, fmt.Sprintf("%s does not parse %s resume; %s", flag.flag, placement, resumeFlagFallback(flag.flag)))
+		failures = append(failures, fmt.Sprintf("%s does not parse before or after resume; %s", flag.flag, resumeFlagFallback(flag.flag)))
 	}
 	return failures
+}
+
+func resumeFlagProbesSupported(support []resumeFlagSupport) bool {
+	return len(unsupportedResumeFlagFailures(support)) == 0
 }
 
 func resumeFlagFallback(flag string) string {
