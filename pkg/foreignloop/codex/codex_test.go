@@ -129,17 +129,75 @@ func TestAgentSpawnResumeTurnExecJSONL(t *testing.T) {
 		"exec",
 		"resume",
 		"--json",
+		"codex-thread-previous",
 		"--model", "gpt-5",
 		"--ignore-user-config",
 		"--ignore-rules",
 		"--skip-git-repo-check",
-		"codex-thread-previous",
 		wantPrompt,
 	}
 	if got := fake.argv(t); !reflect.DeepEqual(got, wantArgv) {
 		t.Fatalf("argv = %#v, want %#v", got, wantArgv)
 	}
 	assertCodexEvents(t, events)
+}
+
+func TestAgentSpawnContextCancelClosesEvents(t *testing.T) {
+	t.Parallel()
+	fake := newFakeCodex(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	stream, err := (&Agent{
+		ExecPath: fake.path,
+		Env:      fake.env("FAKE_MODE=long_running"),
+	}).Spawn(ctx, foreignloop.ForeignTurn{
+		Cwd:      t.TempDir(),
+		StartNew: true,
+		Input:    []content.Block{&content.TextBlock{Text: "wait"}},
+	})
+	if err != nil {
+		t.Fatalf("Spawn() error = %v", err)
+	}
+
+	cancel()
+	assertEventsClosePromptly(t, stream)
+	err1 := stream.Close()
+	if err2 := stream.Close(); err2 != err1 {
+		t.Fatalf("second Close() error = %v, want same error %v", err2, err1)
+	}
+}
+
+func TestAgentSpawnCloseReturnsDecodeError(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+		mode string
+	}{
+		{name: "malformed json", mode: "malformed_json"},
+		{name: "oversized line", mode: "oversized_line"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			fake := newFakeCodex(t)
+			stream, err := (&Agent{
+				ExecPath: fake.path,
+				Env:      fake.env("FAKE_MODE=" + tt.mode),
+			}).Spawn(context.Background(), foreignloop.ForeignTurn{
+				Cwd:      t.TempDir(),
+				StartNew: true,
+				Input:    []content.Block{&content.TextBlock{Text: "decode"}},
+			})
+			if err != nil {
+				t.Fatalf("Spawn() error = %v", err)
+			}
+			_ = collectEvents(t, stream)
+			err = stream.Close()
+			var de *foreignloop.DecodeError
+			if !errors.As(err, &de) {
+				t.Fatalf("Close() error = %T %[1]v, want *foreignloop.DecodeError", err)
+			}
+		})
+	}
 }
 
 func TestAgentSpawnCloseReturnsForeignExitError(t *testing.T) {
@@ -247,6 +305,23 @@ func collectEvents(t *testing.T, stream foreignloop.ForeignStream) []foreignloop
 	}
 }
 
+func assertEventsClosePromptly(t *testing.T, stream foreignloop.ForeignStream) {
+	t.Helper()
+	timer := time.NewTimer(500 * time.Millisecond)
+	defer timer.Stop()
+	for {
+		select {
+		case _, ok := <-stream.Events():
+			if !ok {
+				return
+			}
+		case <-timer.C:
+			_ = stream.Close()
+			t.Fatal("timed out waiting for events to close after context cancellation")
+		}
+	}
+}
+
 type fakeCodex struct {
 	path      string
 	argvFile  string
@@ -274,6 +349,23 @@ done
 env | sort > "$ENV_FILE"
 pwd > "$CWD_FILE"
 cat > "$STDIN_FILE"
+case "${FAKE_MODE:-happy}" in
+  malformed_json)
+    printf '%s\n' '{"type":"thread.started"'
+    exit 0
+    ;;
+  oversized_line)
+    head -c 1048577 /dev/zero | tr '\000' x
+    printf '\n'
+    exit 0
+    ;;
+  long_running)
+    trap 'exit 0' INT TERM
+    printf '%s\n' '{"type":"thread.started","thread_id":"codex-thread-from-jsonl"}'
+    sleep 60
+    exit 0
+    ;;
+esac
 i=0
 while [ "$i" -lt "${STDERR_LINES:-0}" ]; do
   printf 'stderr line %s abcdefghijklmnopqrstuvwxyz abcdefghijklmnopqrstuvwxyz abcdefghijklmnopqrstuvwxyz\n' "$i" >&2

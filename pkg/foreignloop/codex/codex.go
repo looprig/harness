@@ -33,7 +33,7 @@ func (e *SpawnConfigError) Error() string {
 // Spawn starts the codex CLI for one foreign turn in its own process group and
 // returns the live decoded stream. Codex JSONL is the committed source for v1, so
 // TranscriptPath is intentionally empty.
-func (a *Agent) Spawn(_ context.Context, t foreignloop.ForeignTurn) (foreignloop.ForeignStream, error) {
+func (a *Agent) Spawn(ctx context.Context, t foreignloop.ForeignTurn) (foreignloop.ForeignStream, error) {
 	if a.ExecPath == "" {
 		return nil, &SpawnConfigError{Field: "ExecPath", Reason: "empty"}
 	}
@@ -42,7 +42,11 @@ func (a *Agent) Spawn(_ context.Context, t foreignloop.ForeignTurn) (foreignloop
 		return nil, &foreignloop.SpawnError{Cause: err}
 	}
 	events, decErr := decodeJSONL(stdout)
-	return &stream{events: events, cmd: cmd, decErr: decErr, pgid: cmd.Process.Pid}, nil
+	s := &stream{events: events, cmd: cmd, decErr: decErr, pgid: cmd.Process.Pid}
+	if ctx != nil {
+		s.stopCtx = context.AfterFunc(ctx, func() { _ = s.Close() })
+	}
+	return s, nil
 }
 
 // start builds and starts the child process without a shell. stderr is drained to
@@ -90,6 +94,7 @@ type stream struct {
 	cmd      *exec.Cmd
 	decErr   func() error
 	pgid     int
+	stopCtx  func() bool
 	once     sync.Once
 	closeErr error
 }
@@ -100,7 +105,12 @@ func (s *stream) TranscriptPath() string                  { return "" }
 // Close signals the child's process GROUP (SIGINT, then SIGKILL after a grace
 // period) and reaps it. Repeat calls return the first result.
 func (s *stream) Close() error {
-	s.once.Do(func() { s.closeErr = s.shutdown() })
+	s.once.Do(func() {
+		if s.stopCtx != nil {
+			s.stopCtx()
+		}
+		s.closeErr = s.shutdown()
+	})
 	return s.closeErr
 }
 
@@ -109,10 +119,14 @@ func (s *stream) shutdown() error {
 	kill := time.AfterFunc(closeGrace, func() { _ = syscall.Kill(-s.pgid, syscall.SIGKILL) })
 	defer kill.Stop()
 	waitErr := s.cmd.Wait()
+	exitErr := exitError(waitErr)
 	if derr := s.decErr(); derr != nil {
 		slog.Warn("codex: foreign stream decode error", "error", derr)
+		if exitErr == nil {
+			return derr
+		}
 	}
-	return exitError(waitErr)
+	return exitErr
 }
 
 func decodeJSONL(r io.Reader) (<-chan foreignloop.ForeignEvent, func() error) {

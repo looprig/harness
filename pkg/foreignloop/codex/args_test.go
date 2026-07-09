@@ -66,11 +66,11 @@ func TestBuildResumeArgs(t *testing.T) {
 		"exec",
 		"resume",
 		"--json",
+		"codex-session-123",
 		"--model", "gpt-5",
 		"--ignore-user-config",
 		"--ignore-rules",
 		"--skip-git-repo-check",
-		"codex-session-123",
 		"continue",
 	}
 	if !reflect.DeepEqual(got, want) {

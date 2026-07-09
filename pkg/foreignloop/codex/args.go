@@ -50,6 +50,7 @@ func buildResumeArgs(t foreignloop.ForeignTurn, c runConfig, prompt string) []st
 		"exec",
 		"resume",
 		"--json",
+		t.ForeignSID,
 	}
 	if c.model != "" {
 		args = append(args, "--model", c.model)
@@ -63,7 +64,7 @@ func buildResumeArgs(t foreignloop.ForeignTurn, c runConfig, prompt string) []st
 	if c.skipGitRepoCheck {
 		args = append(args, "--skip-git-repo-check")
 	}
-	return append(args, t.ForeignSID, prompt)
+	return append(args, prompt)
 }
 
 func sandboxString(mode SandboxMode) string {
