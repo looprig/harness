@@ -97,6 +97,21 @@ func (e PublicBindWithoutAuthError) Error() string {
 	return "serve: refusing to bind public address " + e.Addr + " without authentication"
 }
 
+// InvalidAddrError reports that the bind address handed to Server is malformed
+// (e.g. missing port) and could not be parsed by net.SplitHostPort. The bind
+// fails secure and returns nothing. Cause is the underlying parse error, exposed
+// via Unwrap; the message carries ONLY the offending Addr — never a secret.
+type InvalidAddrError struct {
+	Addr  string
+	Cause error
+}
+
+func (e InvalidAddrError) Error() string {
+	return "serve: invalid listen address " + e.Addr + ": " + e.Cause.Error()
+}
+
+func (e InvalidAddrError) Unwrap() error { return e.Cause }
+
 // NOTE (P1-7): the gate.GateError → HTTP status mapping is a SEPARATE later task.
 // It will translate gate-package errors into these envelopes; do NOT add gate
 // mapping here.
