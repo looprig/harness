@@ -23,9 +23,9 @@ const (
 )
 
 // allEventsFilter is the whole-session subscription the SSE stream opens: both
-// classes, every loop. It mirrors pkg/api's allEventsFilter — subscribing broadly is
-// correct because the MARSHALER (event.MarshalEvent), not the filter, is what keeps
-// Ephemeral events out of the Phase-1 durable SSE payload (it fails closed on them).
+// classes, every loop. Subscribing broadly is correct because the stream encodes both
+// classes — Enduring deliveries become "enduring" frames and Ephemeral deliveries
+// become "ephemeral" frames; the frame class, not the filter, decides the encoding.
 func allEventsFilter() event.EventFilter {
 	return event.EventFilter{
 		Ephemeral: event.LoopScope{All: true},

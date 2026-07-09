@@ -13,10 +13,11 @@ import (
 // threads through Run/Restore without serve importing it — the composition root
 // instantiates server[*session.Session] and serve holds only server[S].
 //
-// This holder is intentionally minimal: later tasks extend it (a read-plane Reader
-// field, the wired mux, and the exported Handler constructor). It carries no request
-// state — one server instance serves every request; per-request state lives on the
-// stack of each handler invocation.
+// This holder carries no request state — one server instance serves every request
+// (the mux is built by Handler in mux.go; per-request state lives on the stack of each
+// handler invocation). Its fields are the shared per-pod dependencies: the session
+// runner, the read-plane Reader, the live-session registry, the config, and the
+// idempotency store.
 type server[S LiveSession] struct {
 	runner   Runner[S]
 	reader   Reader

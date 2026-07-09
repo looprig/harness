@@ -112,6 +112,6 @@ func (e InvalidAddrError) Error() string {
 
 func (e InvalidAddrError) Unwrap() error { return e.Cause }
 
-// NOTE (P1-7): the gate.GateError → HTTP status mapping is a SEPARATE later task.
-// It will translate gate-package errors into these envelopes; do NOT add gate
-// mapping here.
+// The gate.GateError → HTTP status mapping lives in handlers_gate.go
+// (writeGateError), which translates gate-package error kinds into these envelopes
+// via a structural interface — keeping gate-error handling out of this leaf file.
