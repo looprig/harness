@@ -1,11 +1,6 @@
 package codex
 
-import (
-	"context"
-	"errors"
-
-	"github.com/looprig/harness/pkg/foreignloop"
-)
+import "github.com/looprig/harness/pkg/foreignloop"
 
 // SandboxMode is the typed Codex CLI sandbox mode.
 type SandboxMode uint8
@@ -48,8 +43,7 @@ type SpecConfig struct {
 	SkipGitRepoCheck bool
 }
 
-// Agent is the Codex CLI adapter configuration. Spawn is intentionally not
-// implemented in this task.
+// Agent is the Codex CLI adapter configuration.
 type Agent struct {
 	ExecPath         string
 	Model            string
@@ -61,12 +55,6 @@ type Agent struct {
 	IgnoreUserConfig bool
 	IgnoreRules      bool
 	SkipGitRepoCheck bool
-}
-
-var errSpawnNotImplemented = errors.New("codex spawn not implemented")
-
-func (a *Agent) Spawn(context.Context, foreignloop.ForeignTurn) (foreignloop.ForeignStream, error) {
-	return nil, &foreignloop.SpawnError{Cause: errSpawnNotImplemented}
 }
 
 // NewSpec resolves a SpecConfig + parent environment into a late-bound Codex spec.
