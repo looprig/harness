@@ -31,6 +31,10 @@ type fakeSession struct {
 	respondGateErr   error
 	respondGateCalls int
 	respondGateResp  gate.GateResponse
+
+	subErr   error
+	sub      *fakeSubscription
+	subCalls int
 }
 
 func (f *fakeSession) Submit(_ context.Context, blocks []content.Block) (uuid.UUID, error) {
@@ -40,7 +44,11 @@ func (f *fakeSession) Submit(_ context.Context, blocks []content.Block) (uuid.UU
 }
 
 func (f *fakeSession) SubscribeEvents(event.EventFilter) (event.Subscription, error) {
-	return nil, nil
+	f.subCalls++
+	if f.subErr != nil {
+		return nil, f.subErr
+	}
+	return f.sub, nil
 }
 
 func (f *fakeSession) RespondGate(_ context.Context, resp gate.GateResponse) error {
