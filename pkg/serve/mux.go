@@ -39,6 +39,14 @@ type authAware interface {
 // fail-secure bind without re-deriving the auth policy from the options (SPEC §10
 // design note). It is deliberately unexported — callers hold it only as an
 // http.Handler; Server recovers the bit through the authAware interface.
+//
+// The embedded http.Handler is an invariant-non-nil field: the sole constructor
+// (Handler) always sets it to cfg.wrap(mux), so it is never nil in practice; a
+// nil embedded handler would panic in the promoted ServeHTTP.
+//
+// NOTE: wrapping this value in further middleware forfeits the authAware has-auth
+// proof, so Server fails secure and refuses a public bind as if unauthenticated
+// (see hasInstalledAuth) — pass the Handler result to Server directly.
 type boundHandler struct {
 	http.Handler
 	hasAuth bool

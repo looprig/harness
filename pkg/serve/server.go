@@ -85,9 +85,15 @@ func Server(addr string, h http.Handler, opts ...ServerOption) (*http.Server, er
 		MaxHeaderBytes:    maxHeaderBytes,
 		// WriteTimeout is deliberately 0 (no server-wide write deadline): GET
 		// /v1/sessions/{sid}/events is a long-lived SSE stream a server-wide
-		// WriteTimeout would truncate. The events handler already clears any
-		// per-connection write deadline; request/response routes stay bounded by
-		// ReadTimeout + ReadHeaderTimeout + the per-request context + the body cap.
+		// WriteTimeout would truncate. The READ/slowloris surface is covered by
+		// ReadHeaderTimeout (header-read budget) + IdleTimeout (keep-alive budget)
+		// + MaxHeaderBytes (header cap); the request body is capped separately by
+		// the body-cap middleware. The consequence, accepted here, is that non-SSE
+		// response WRITES are NOT deadline-bounded — a low-severity, response-side
+		// slowloris — tolerated because these responses are small JSON envelopes.
+		// The future hardening, if that residual risk needs closing, is a
+		// per-request write-deadline middleware that /events would clear (exactly
+		// as it already clears the per-connection deadline via ResponseController).
 		WriteTimeout: 0,
 		// Defensive per CLAUDE.md: TLS termination is the deployment's job, but a
 		// pinned MinVersion is harmless on a plain server and correct if this
@@ -101,6 +107,13 @@ func Server(addr string, h http.Handler, opts ...ServerOption) (*http.Server, er
 // reports an authenticator installed. Any handler that does not satisfy authAware
 // is treated as unauthenticated — the fail-secure default: absent proof of auth,
 // assume none.
+//
+// CONSEQUENCE: wrapping the Handler result in further middleware forfeits the
+// authAware proof (the wrapper is a plain http.Handler), so Server fails secure
+// and refuses a public bind AS IF unauthenticated even when auth is in fact
+// installed. This is by design and only ever errs safe — a wrapper can cause a
+// false-negative refusal, never a false-positive exposure. Pass the Handler
+// result to Server directly, or have the wrapper also implement authAware.
 func hasInstalledAuth(h http.Handler) bool {
 	aware, ok := h.(authAware)
 	return ok && aware.authInstalled()
