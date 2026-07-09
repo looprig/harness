@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://looprig.dev/serve/v1/gate_response_request.schema.json",
+  "title": "GateResponseRequest",
+  "description": "POST /v1/sessions/{sid}/gates/{gid} body: a human's answer to an open gate. The server STAMPS user provenance and ignores any client-supplied source. action semantics (which actions a gate kind accepts) are validated by the authoritative session, not this schema.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["action"],
+  "properties": {
+    "action": { "type": "string" },
+    "values": {
+      "type": "object",
+      "description": "Action-specific values, e.g. {\"scope\":\"session\"} for an approve or {\"text\":\"blue\"} for an answer."
+    }
+  }
+}

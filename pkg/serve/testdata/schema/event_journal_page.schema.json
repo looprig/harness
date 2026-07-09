@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://looprig.dev/serve/v1/event_journal_page.schema.json",
+  "title": "EventJournalPage",
+  "description": "GET /v1/sessions/{sid}/journal response: a page of a session's Enduring events in journal-sequence order plus the resume cursor. next_journal_seq is the sequence to pass as from_journal_seq for the next page; done reports the journal was exhausted. GatePrepared never appears.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["events", "next_journal_seq", "done"],
+  "properties": {
+    "events": {
+      "type": "array",
+      "items": { "$ref": "status_event.schema.json" }
+    },
+    "next_journal_seq": { "type": "integer", "minimum": 0 },
+    "done": { "type": "boolean" }
+  }
+}

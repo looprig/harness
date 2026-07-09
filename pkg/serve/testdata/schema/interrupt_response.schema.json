@@ -1,0 +1,12 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://looprig.dev/serve/v1/interrupt_response.schema.json",
+  "title": "InterruptResponse",
+  "description": "200 body for POST /v1/sessions/{sid}/interrupt: whether any in-flight turn was actually cancelled.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["interrupted"],
+  "properties": {
+    "interrupted": { "type": "boolean" }
+  }
+}

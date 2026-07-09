@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://looprig.dev/serve/v1/create_request.schema.json",
+  "title": "CreateRequest",
+  "description": "Optional POST /v1/sessions body. An idle create sends no body or an empty object; a create-with-input sends {\"blocks\":[...]}. Block semantics are validated by the content block codec, not this schema.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "blocks": {
+      "type": "array",
+      "description": "Tagged content blocks; each carries a \"type\" discriminator decoded by content.UnmarshalBlocks.",
+      "items": { "type": "object" }
+    }
+  }
+}

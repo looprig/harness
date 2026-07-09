@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://looprig.dev/serve/v1/event_envelope.schema.json",
+  "title": "EventEnvelope",
+  "description": "The durable event wire envelope produced by event.MarshalEvent: a \"type\" discriminator (== the classify name), a \"v\" schema version, the embedded producer Header fields, and the type-specific payload. Only the envelope-invariant keys are constrained here; the per-type payload is open.",
+  "type": "object",
+  "required": ["type", "v"],
+  "properties": {
+    "type": { "type": "string" },
+    "v": { "type": "integer", "const": 1 },
+    "session_id": { "$ref": "uuid.schema.json" },
+    "loop_id": { "$ref": "uuid.schema.json" },
+    "turn_id": { "$ref": "uuid.schema.json" },
+    "step_id": { "$ref": "uuid.schema.json" },
+    "event_id": { "$ref": "uuid.schema.json" },
+    "created_at": { "type": "string", "format": "date-time" }
+  }
+}

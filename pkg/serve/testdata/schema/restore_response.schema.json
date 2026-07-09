@@ -1,0 +1,12 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://looprig.dev/serve/v1/restore_response.schema.json",
+  "title": "RestoreResponse",
+  "description": "200 body for POST /v1/sessions/{sid}/restore: the id of the rebuilt-and-reattached session.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["session_id"],
+  "properties": {
+    "session_id": { "$ref": "uuid.schema.json" }
+  }
+}
