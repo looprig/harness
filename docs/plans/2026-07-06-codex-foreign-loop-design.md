@@ -12,7 +12,8 @@ subagent while preserving looprig's session/event/journal model.
 The integration target is the documented non-interactive CLI surface:
 
 - `codex exec --json <prompt>` for the first turn.
-- `codex exec resume <SESSION_ID> --json <prompt>` for follow-up turns.
+- `codex exec resume <SESSION_ID> --json <prompt>` for the live follow-up
+  contract check; the adapter's separately tested argv is described below.
 - `--cd`, `--add-dir`, `--model`, `--profile`, `--sandbox`, and
   `--ask-for-approval` for the process boundary.
 - JSONL events from stdout: `thread.started`, `turn.started`,
@@ -131,7 +132,7 @@ Claude can accept a caller-minted `--session-id <uuid>` on the first turn. The
 current shared actor therefore mints `sid` at loop creation and stores it on
 `LoopStarted.ForeignSID`.
 
-Codex is different. The documented surface exposes:
+Codex is different. The live CLI contract check uses:
 
 - start: `codex exec --json <prompt>`
 - resume: `codex exec resume <SESSION_ID> --json <prompt>`
@@ -244,20 +245,23 @@ Resume turn:
 ```text
 codex exec resume
   --json
-  --model <model>              # optional
   <foreign_sid>
+  --model <model>              # optional
   <prompt>
 ```
 
 The adapter invokes resume as `codex exec resume --json <foreign_sid> <prompt>`
-and sets `cmd.Dir` for its working directory. It does not assume first-turn
-workspace or permission flags also work on resume.
+and its exact argv is covered by a separate unit test. It sets `cmd.Dir` for its
+working directory and does not assume first-turn workspace or permission flags
+also work on resume. The opt-in live contract check intentionally uses the CLI
+form `codex exec resume <thread_id> --json <prompt>` to verify continuation.
 
 The opt-in CLI contract test parser-probes `--cd`, `--sandbox`,
 `--ask-for-approval`, and `--add-dir` before and after `resume`, using `--help`
 only, and stops before live commands if a flag has no valid placement. On the
-locally tested CLI, `--cd` and `--add-dir` parse only before `resume`; `--sandbox`
-and `--ask-for-approval` parse in neither placement. This is version-dependent:
+locally tested CLI, `--cd`, `--sandbox`, and `--add-dir` parse only before
+`resume`; `--ask-for-approval` parses in neither placement. This is
+version-dependent:
 deployments needing equivalent settings must use their CLI version's supported
 `-c key=value` override or persist them in the profile/config used by resume.
 Exact config keys are intentionally not specified. Keep the opt-in test as the
@@ -358,7 +362,7 @@ Recovery order for a foreign root loop:
 For restored Codex loops:
 
 - `hasSpawned = true`.
-- Next turn uses `codex exec resume <sid> --json`.
+- Next turn uses the adapter's `codex exec resume --json <sid>`.
 - Folded looprig messages are retained for `Snapshot`, TUI replay, and restore
   verification, but are not replayed into Codex. Codex resumes from its own
   session store.
@@ -482,7 +486,9 @@ Integration/contract tests, gated behind an environment variable:
 
 - run `codex exec --json --sandbox read-only --ask-for-approval never "..."`.
 - assert `thread.started` contains a stable session id field.
-- assert `codex exec resume --json <sid> "..."` continues the same session.
+- assert the live `codex exec resume <sid> --json <prompt>` check continues the
+  same session; separately unit-test the adapter argv
+  `codex exec resume --json <foreign_sid> <prompt>`.
 - parser-probe the four first-turn workspace/permission flags before and after
   `resume`; on no valid placement, report the version-supported `-c key=value`
   or persisted-profile/config fallback before attempting live commands.

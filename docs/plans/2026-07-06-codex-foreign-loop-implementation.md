@@ -4,7 +4,7 @@
 
 **Goal:** Add Codex CLI as a second foreign-loop backend that can run as a primary loop or subagent, resume by Codex thread id, and publish normalized looprig events.
 
-**Architecture:** Extend the existing `pkg/foreignloop` actor instead of creating a new session model. Add a durable late-bound foreign-session event for adapters like Codex whose session id is learned from JSONL, then add `pkg/foreignloop/codex` as a subprocess adapter over `codex exec --json` and `codex exec resume <id> --json`.
+**Architecture:** Extend the existing `pkg/foreignloop` actor instead of creating a new session model. Add a durable late-bound foreign-session event for adapters like Codex whose session id is learned from JSONL, then add `pkg/foreignloop/codex` as a subprocess adapter over `codex exec --json` and `codex exec resume --json <id>`.
 
 **Tech Stack:** Go stdlib (`os/exec`, `bufio`, `encoding/json`, `context`, `syscall`, `time`), existing looprig packages (`pkg/event`, `pkg/loop`, `pkg/session`, `pkg/foreignloop`, `core/content`, `core/uuid`). No new third-party dependencies.
 
@@ -646,7 +646,9 @@ Tests should skip unless `LOOPRIG_CODEX_INTEGRATION=1`.
 Contract checks:
 
 - `codex exec --json --sandbox read-only --ask-for-approval never` emits `thread.started`.
-- `codex exec resume --json <thread_id>` resumes the same id or clearly confirms continuation.
+- live `codex exec resume <thread_id> --json <prompt>` resumes the same id or
+  clearly confirms continuation; a separate exact argv unit test covers the
+  adapter's `codex exec resume --json <foreign_sid> <prompt>` invocation.
 - parser-probe `--cd`, `--sandbox`, `--ask-for-approval`, and `--add-dir` before
   and after `resume` with `--help`; if a flag has no valid placement, stop before
   live commands and report the version-supported `-c key=value` or persisted
