@@ -43,11 +43,11 @@ type enduringFrame struct {
 	Event json.RawMessage `json:"event"` // event.MarshalEvent(d.Event) raw JSON
 }
 
-// EphemeralFrame is the wire body of an `event: ephemeral` SSE frame. Ephemeral events
+// ephemeralFrame is the wire body of an `event: ephemeral` SSE frame. Ephemeral events
 // are never sequenced or persisted; this is a SEPARATE transport encoder that never
 // touches event.MarshalEvent (which fails closed on Ephemeral, an invariant preserved).
 // Kind selects how Delta decodes; Header is the producing event's identity.
-type EphemeralFrame struct {
+type ephemeralFrame struct {
 	V      int             `json:"v"`               // 1
 	Kind   string          `json:"kind"`            // token_delta|tool_call_started|tool_call_completed|input_queued
 	Header event.Header    `json:"header,omitzero"` // producer identity (omitted when zero)
@@ -130,7 +130,7 @@ func encodeEnduringFrame(d event.Delivery) ([]byte, bool) {
 }
 
 // encodeEphemeralFrame builds the `event: ephemeral` frame (NO id: line — Ephemeral is
-// never sequenced): event: ephemeral\ndata: {EphemeralFrame}\n\n. An unrecognized
+// never sequenced): event: ephemeral\ndata: {ephemeralFrame}\n\n. An unrecognized
 // concrete ephemeral event (or an unknown chunk variant) is SKIPPED with a debug log,
 // never emitted as lossy ad-hoc JSON.
 func encodeEphemeralFrame(ev event.Event) ([]byte, bool) {
@@ -151,44 +151,55 @@ func encodeEphemeralFrame(ev event.Event) ([]byte, bool) {
 // switch over the sealed Ephemeral set (TokenDelta, ToolCallStarted, ToolCallCompleted,
 // InputQueued). ok==false for any unrecognized event or a TokenDelta this transport
 // cannot represent, so the caller skips rather than emit a partial frame.
-func buildEphemeralFrame(ev event.Event) (EphemeralFrame, bool) {
+func buildEphemeralFrame(ev event.Event) (ephemeralFrame, bool) {
 	switch e := ev.(type) {
 	case event.TokenDelta:
 		delta, ok := encodeChunkDelta(e.Chunk)
 		if !ok {
-			return EphemeralFrame{}, false
+			return ephemeralFrame{}, false
 		}
-		return EphemeralFrame{V: frameSchemaVersion, Kind: ephemeralKindTokenDelta, Header: e.EventHeader(), Delta: delta}, true
+		return ephemeralFrame{V: frameSchemaVersion, Kind: ephemeralKindTokenDelta, Header: e.EventHeader(), Delta: delta}, true
 	case event.ToolCallStarted:
 		delta, ok := marshalDelta(toolCallStartedDelta{ToolExecutionID: e.ToolExecutionID, ToolName: e.ToolName, Summary: e.Summary})
 		if !ok {
-			return EphemeralFrame{}, false
+			return ephemeralFrame{}, false
 		}
-		return EphemeralFrame{V: frameSchemaVersion, Kind: ephemeralKindToolCallStarted, Header: e.EventHeader(), Delta: delta}, true
+		return ephemeralFrame{V: frameSchemaVersion, Kind: ephemeralKindToolCallStarted, Header: e.EventHeader(), Delta: delta}, true
 	case event.ToolCallCompleted:
 		delta, ok := marshalDelta(toolCallCompletedDelta{ToolExecutionID: e.ToolExecutionID, IsError: e.IsError, ResultPreview: e.ResultPreview})
 		if !ok {
-			return EphemeralFrame{}, false
+			return ephemeralFrame{}, false
 		}
-		return EphemeralFrame{V: frameSchemaVersion, Kind: ephemeralKindToolCallCompleted, Header: e.EventHeader(), Delta: delta}, true
+		return ephemeralFrame{V: frameSchemaVersion, Kind: ephemeralKindToolCallCompleted, Header: e.EventHeader(), Delta: delta}, true
 	case event.InputQueued:
 		// InputQueued carries no public payload beyond its Header, so it has no Delta.
-		return EphemeralFrame{V: frameSchemaVersion, Kind: ephemeralKindInputQueued, Header: e.EventHeader()}, true
+		return ephemeralFrame{V: frameSchemaVersion, Kind: ephemeralKindInputQueued, Header: e.EventHeader()}, true
 	default:
-		return EphemeralFrame{}, false
+		return ephemeralFrame{}, false
 	}
 }
 
 // encodeChunkDelta maps a content.Chunk (the sealed, codec-less transport interface)
-// to its tagged live DTO bytes. A nil chunk or an unknown variant yields ok==false so
-// the enclosing TokenDelta frame is skipped — content.Chunk itself is NEVER serialized.
+// to its tagged live DTO bytes. A nil chunk, a typed-nil pointer variant (e.g.
+// (*content.TextChunk)(nil)), or an unknown variant yields ok==false so the enclosing
+// TokenDelta frame is skipped — content.Chunk itself is NEVER serialized, and a
+// typed-nil deref never panics deep in the request path (fail closed).
 func encodeChunkDelta(chunk content.Chunk) (json.RawMessage, bool) {
 	switch c := chunk.(type) {
 	case *content.TextChunk:
+		if c == nil {
+			return nil, false
+		}
 		return marshalDelta(textChunkDTO{ChunkType: chunkTypeText, Text: c.Text})
 	case *content.ThinkingChunk:
+		if c == nil {
+			return nil, false
+		}
 		return marshalDelta(thinkingChunkDTO{ChunkType: chunkTypeThinking, Thinking: c.Thinking})
 	case *content.ToolUseChunk:
+		if c == nil {
+			return nil, false
+		}
 		return marshalDelta(toolUseChunkDTO{ChunkType: chunkTypeToolUse, Index: c.Index, ID: c.ID, Name: c.Name, InputJSON: c.InputJSON})
 	default:
 		return nil, false

@@ -49,12 +49,13 @@ func (s *fakeSubscription) isClosed() bool { return s.closed.Load() }
 // be written (no sleeps). It does NOT implement a write-deadline setter, so the
 // handler's SetWriteDeadline exercises the benign ErrNotSupported path.
 type flushRecorder struct {
-	mu      sync.Mutex
-	hdr     http.Header
-	status  int
-	body    bytes.Buffer
-	wrote   bool
-	flushes chan struct{}
+	mu       sync.Mutex
+	hdr      http.Header
+	status   int
+	body     bytes.Buffer
+	wrote    bool
+	writeErr error // when non-nil, Write fails with it (simulates a broken client)
+	flushes  chan struct{}
 }
 
 func newFlushRecorder() *flushRecorder {
@@ -78,6 +79,12 @@ func (f *flushRecorder) Write(b []byte) (int, error) {
 	if !f.wrote {
 		f.status = http.StatusOK
 		f.wrote = true
+	}
+	if f.writeErr != nil {
+		// Simulate a broken client: record the bytes (so a test can see a write was
+		// attempted) but report the error so the stream loop takes its return branch.
+		n, _ := f.body.Write(b)
+		return n, f.writeErr
 	}
 	return f.body.Write(b)
 }
@@ -225,7 +232,7 @@ func TestHandleEventsZeroSeqEnduring(t *testing.T) {
 }
 
 // TestHandleEventsStreamsEphemeral proves each recognized Ephemeral kind is written
-// as exactly one `event: ephemeral\ndata: {EphemeralFrame}\n\n` frame with the right
+// as exactly one `event: ephemeral\ndata: {ephemeralFrame}\n\n` frame with the right
 // kind, v:1, tagged delta, and NO id: line — and that a TokenDelta's content.Chunk is
 // mapped to its tagged live DTO, never leaked as a raw Go-struct dump.
 func TestHandleEventsStreamsEphemeral(t *testing.T) {
@@ -234,53 +241,53 @@ func TestHandleEventsStreamsEphemeral(t *testing.T) {
 	execID := parseTestUUID(t, "55555555-5555-5555-5555-555555555555")
 
 	tests := []struct {
-		name        string
-		ev          event.Event
-		wantKind    string
-		wantInDelta []string // substrings that MUST appear in the delta JSON
-		wantHasDrop bool     // frame carries a "delta" key at all
+		name         string
+		ev           event.Event
+		wantKind     string
+		wantInDelta  []string // substrings that MUST appear in the delta JSON
+		wantHasDelta bool     // frame carries a "delta" key at all
 	}{
 		{
-			name:        "token_delta text chunk",
-			ev:          event.TokenDelta{TurnIndex: 1, Chunk: &content.TextChunk{Text: "hi"}},
-			wantKind:    "token_delta",
-			wantInDelta: []string{`"chunk_type":"text"`, `"text":"hi"`},
-			wantHasDrop: true,
+			name:         "token_delta text chunk",
+			ev:           event.TokenDelta{TurnIndex: 1, Chunk: &content.TextChunk{Text: "hi"}},
+			wantKind:     "token_delta",
+			wantInDelta:  []string{`"chunk_type":"text"`, `"text":"hi"`},
+			wantHasDelta: true,
 		},
 		{
-			name:        "token_delta thinking chunk",
-			ev:          event.TokenDelta{TurnIndex: 1, Chunk: &content.ThinkingChunk{Thinking: "hmm"}},
-			wantKind:    "token_delta",
-			wantInDelta: []string{`"chunk_type":"thinking"`, `"thinking":"hmm"`},
-			wantHasDrop: true,
+			name:         "token_delta thinking chunk",
+			ev:           event.TokenDelta{TurnIndex: 1, Chunk: &content.ThinkingChunk{Thinking: "hmm"}},
+			wantKind:     "token_delta",
+			wantInDelta:  []string{`"chunk_type":"thinking"`, `"thinking":"hmm"`},
+			wantHasDelta: true,
 		},
 		{
-			name:        "token_delta tool_use chunk",
-			ev:          event.TokenDelta{TurnIndex: 1, Chunk: &content.ToolUseChunk{Index: 2, ID: "tu_1", Name: "Bash", InputJSON: `{"a":1}`}},
-			wantKind:    "token_delta",
-			wantInDelta: []string{`"chunk_type":"tool_use"`, `"index":2`, `"id":"tu_1"`, `"name":"Bash"`, `"input_json":"{\"a\":1}"`},
-			wantHasDrop: true,
+			name:         "token_delta tool_use chunk",
+			ev:           event.TokenDelta{TurnIndex: 1, Chunk: &content.ToolUseChunk{Index: 2, ID: "tu_1", Name: "Bash", InputJSON: `{"a":1}`}},
+			wantKind:     "token_delta",
+			wantInDelta:  []string{`"chunk_type":"tool_use"`, `"index":2`, `"id":"tu_1"`, `"name":"Bash"`, `"input_json":"{\"a\":1}"`},
+			wantHasDelta: true,
 		},
 		{
-			name:        "tool_call_started",
-			ev:          event.ToolCallStarted{ToolExecutionID: execID, ToolName: "Bash", Summary: "ls -la"},
-			wantKind:    "tool_call_started",
-			wantInDelta: []string{`"tool_name":"Bash"`, `"summary":"ls -la"`},
-			wantHasDrop: true,
+			name:         "tool_call_started",
+			ev:           event.ToolCallStarted{ToolExecutionID: execID, ToolName: "Bash", Summary: "ls -la"},
+			wantKind:     "tool_call_started",
+			wantInDelta:  []string{`"tool_name":"Bash"`, `"summary":"ls -la"`},
+			wantHasDelta: true,
 		},
 		{
-			name:        "tool_call_completed",
-			ev:          event.ToolCallCompleted{ToolExecutionID: execID, IsError: true, ResultPreview: "boom"},
-			wantKind:    "tool_call_completed",
-			wantInDelta: []string{`"is_error":true`, `"result_preview":"boom"`},
-			wantHasDrop: true,
+			name:         "tool_call_completed",
+			ev:           event.ToolCallCompleted{ToolExecutionID: execID, IsError: true, ResultPreview: "boom"},
+			wantKind:     "tool_call_completed",
+			wantInDelta:  []string{`"is_error":true`, `"result_preview":"boom"`},
+			wantHasDelta: true,
 		},
 		{
-			name:        "input_queued has no delta",
-			ev:          event.InputQueued{},
-			wantKind:    "input_queued",
-			wantInDelta: nil,
-			wantHasDrop: false,
+			name:         "input_queued has no delta",
+			ev:           event.InputQueued{},
+			wantKind:     "input_queued",
+			wantInDelta:  nil,
+			wantHasDelta: false,
 		},
 	}
 
@@ -326,10 +333,10 @@ func TestHandleEventsStreamsEphemeral(t *testing.T) {
 					t.Errorf("frame = %q, want delta substring %q", got, want)
 				}
 			}
-			if tt.wantHasDrop && !strings.Contains(got, `"delta":`) {
+			if tt.wantHasDelta && !strings.Contains(got, `"delta":`) {
 				t.Errorf("frame = %q, want a delta key", got)
 			}
-			if !tt.wantHasDrop && strings.Contains(got, `"delta":`) {
+			if !tt.wantHasDelta && strings.Contains(got, `"delta":`) {
 				t.Errorf("frame = %q, want NO delta key for %s", got, tt.wantKind)
 			}
 
@@ -467,6 +474,34 @@ func TestHandleEventsHeartbeat(t *testing.T) {
 	case <-done:
 	case <-time.After(streamDeadline):
 		t.Fatalf("handler did not return within %v after cancel", streamDeadline)
+	}
+}
+
+// TestHandleEventsWriteError proves a write failure mid-stream (a broken client) ends
+// the handler — it RETURNS rather than spinning — and the subscription is torn down.
+// This exercises the return-on-write-error branch the plain flushRecorder never hits.
+func TestHandleEventsWriteError(t *testing.T) {
+	t.Parallel()
+
+	sid := parseTestUUID(t, eventsSIDStr)
+	sub := &fakeSubscription{ch: make(chan event.Delivery, 4)}
+	sess := &fakeSession{sub: sub}
+	srv := newServer[*fakeSession](&fakeRunner{}, nil, quietConfig())
+	srv.registry.put(sid, sess)
+
+	rec := newFlushRecorder()
+	rec.writeErr = errBoom
+	done := runEvents(srv, rec, eventsRequest(t, context.Background(), eventsSIDStr))
+
+	// A single enduring delivery drives one w.Write, which fails; the loop must return.
+	sub.ch <- event.Delivery{Event: event.TurnDone{TurnIndex: 1}, JournalSeq: 1}
+	select {
+	case <-done:
+	case <-time.After(streamDeadline):
+		t.Fatalf("handler did not return within %v after a write error (spinning?)", streamDeadline)
+	}
+	if !sub.isClosed() {
+		t.Error("sub.Close was not called after a write error")
 	}
 }
 

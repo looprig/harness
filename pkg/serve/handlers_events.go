@@ -37,8 +37,9 @@ func allEventsFilter() event.EventFilter {
 // It resolves {sid} against the live registry (malformed => 400, unknown => 404),
 // opens a whole-session subscription (a Subscribe failure => 500 BEFORE any SSE
 // header is written, so the client gets a normal JSON error, not a half-open
-// stream), then streams each Enduring event as a `data:` frame until the client
-// disconnects or the subscription ends. The subscription is always closed on return.
+// stream), then streams each event — both Enduring and Ephemeral classes — as its
+// SSE frame until the client disconnects or the subscription ends. The subscription
+// is always closed on return.
 func (s *server[S]) handleEvents(w http.ResponseWriter, r *http.Request) {
 	sid, err := parseSessionID(r.PathValue("sid"))
 	if err != nil {
@@ -92,7 +93,15 @@ func (s *server[S]) handleEvents(w http.ResponseWriter, r *http.Request) {
 // regardless of event activity (simplest correct choice — a client ignores comment
 // frames, so an occasional ping alongside real traffic is harmless).
 func streamEvents(r *http.Request, w http.ResponseWriter, rc *http.ResponseController, sub event.Subscription, heartbeat time.Duration) {
-	ticker := time.NewTicker(heartbeat)
+	// Clamp at the point of use: time.NewTicker panics on a non-positive interval, so
+	// a future zero-valued config{} literal (or an Option that zeroed heartbeat) can
+	// never panic deep in the request path — it falls back to the secure default,
+	// matching the fail-safe convention the other options follow.
+	hb := heartbeat
+	if hb <= 0 {
+		hb = defaultHeartbeatInterval
+	}
+	ticker := time.NewTicker(hb)
 	defer ticker.Stop()
 	for {
 		select {
