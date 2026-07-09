@@ -22,6 +22,11 @@ type server[S LiveSession] struct {
 	reader   Reader
 	registry *registry
 	cfg      *config
+	// idem is the per-pod Idempotency-Key store for POST /v1/sessions. It is built
+	// once per server (shared, mutex-guarded) and is never nil; handleCreate only
+	// consults it when a request carries the header. Tests set its ttl/now fields
+	// directly for deterministic expiry (like config.heartbeat).
+	idem *idempotencyStore
 }
 
 // newServer builds a server over the supplied runner, read-plane reader, and config,
@@ -37,6 +42,7 @@ func newServer[S LiveSession](runner Runner[S], reader Reader, cfg *config) *ser
 		reader:   reader,
 		registry: newRegistry(),
 		cfg:      cfg,
+		idem:     newIdempotencyStore(defaultIdempotencyTTL),
 	}
 }
 

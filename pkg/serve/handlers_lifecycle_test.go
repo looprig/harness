@@ -7,7 +7,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/looprig/core/content"
 	"github.com/looprig/core/uuid"
@@ -354,6 +356,305 @@ func TestServerHandleRestore(t *testing.T) {
 				assertErrorEnvelope(t, rec)
 			}
 		})
+	}
+}
+
+// idemRunID / idemCmdID are the fixed ids the fake runner/session mint in the
+// idempotency handler tests.
+const (
+	idemRunID = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+	idemCmdID = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+)
+
+// doCreate drives handleCreate with an optional Idempotency-Key and body ("" body =>
+// no body), returning the recorder for assertions.
+func doCreate(t *testing.T, srv *server[*fakeSession], key, body string) *httptest.ResponseRecorder {
+	t.Helper()
+	var req *http.Request
+	if body == "" {
+		req = httptest.NewRequest(http.MethodPost, "/v1/sessions", http.NoBody)
+	} else {
+		req = httptest.NewRequest(http.MethodPost, "/v1/sessions", strings.NewReader(body))
+	}
+	if key != "" {
+		req.Header.Set(headerIdempotencyKey, key)
+	}
+	rec := httptest.NewRecorder()
+	srv.handleCreate(rec, req)
+	return rec
+}
+
+// decodeCreate201 decodes a 201 create body, failing the test on a non-201 or a bad
+// body.
+func decodeCreate201(t *testing.T, rec *httptest.ResponseRecorder) createResponse {
+	t.Helper()
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 (body %s)", rec.Code, rec.Body.String())
+	}
+	var resp createResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode 201 body: %v", err)
+	}
+	return resp
+}
+
+// newIdemTestServer builds a server whose idempotency clock is controllable via the
+// returned pointer (advance it to cross the TTL), with a 1h TTL.
+func newIdemTestServer(t *testing.T) (*server[*fakeSession], *fakeRunner, *time.Time) {
+	t.Helper()
+	sess := &fakeSession{submitID: parseTestUUID(t, idemCmdID)}
+	runner := &fakeRunner{runID: parseTestUUID(t, idemRunID), runSess: sess}
+	srv := newServer[*fakeSession](runner, nil, newConfig())
+	clock := time.Date(2026, 7, 8, 12, 0, 0, 0, time.UTC)
+	srv.idem.ttl = time.Hour
+	srv.idem.now = func() time.Time { return clock }
+	return srv, runner, &clock
+}
+
+// TestServerHandleCreateNoKeyDoesNotTouchStore proves an absent key is a normal
+// create that never records an idempotency entry.
+func TestServerHandleCreateNoKeyDoesNotTouchStore(t *testing.T) {
+	t.Parallel()
+	srv, runner, _ := newIdemTestServer(t)
+
+	rec := doCreate(t, srv, "", "")
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201", rec.Code)
+	}
+	if runner.runCalls != 1 {
+		t.Errorf("runCalls = %d, want 1", runner.runCalls)
+	}
+	srv.idem.mu.Lock()
+	n := len(srv.idem.entries)
+	srv.idem.mu.Unlock()
+	if n != 0 {
+		t.Errorf("store entries = %d, want 0 (untouched)", n)
+	}
+}
+
+// TestServerHandleCreateIdempotentSequences covers the two-call sequential
+// guarantees: same-key/same-body replay (no re-run), same-key/different-body 409,
+// and expired-key re-create.
+func TestServerHandleCreateIdempotentSequences(t *testing.T) {
+	t.Parallel()
+
+	const key = "client-key-1"
+
+	tests := []struct {
+		name             string
+		firstBody        string
+		secondBody       string
+		advancePastTTL   bool
+		wantSecondStatus int
+		wantRunCalls     int
+		wantReplay       bool // second 201 must replay first's ids
+	}{
+		{
+			name:             "same key same body replays without re-running",
+			firstBody:        validBlocksBody,
+			secondBody:       validBlocksBody,
+			wantSecondStatus: http.StatusCreated,
+			wantRunCalls:     1,
+			wantReplay:       true,
+		},
+		{
+			name:             "same key same idle body replays",
+			firstBody:        "",
+			secondBody:       "",
+			wantSecondStatus: http.StatusCreated,
+			wantRunCalls:     1,
+			wantReplay:       true,
+		},
+		{
+			name:             "same key different body is 409 and does not re-run",
+			firstBody:        `{}`,
+			secondBody:       validBlocksBody,
+			wantSecondStatus: http.StatusConflict,
+			wantRunCalls:     1,
+			wantReplay:       false,
+		},
+		{
+			name:             "expired key mints a fresh create",
+			firstBody:        `{}`,
+			secondBody:       `{}`,
+			advancePastTTL:   true,
+			wantSecondStatus: http.StatusCreated,
+			wantRunCalls:     2,
+			wantReplay:       false,
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			srv, runner, clock := newIdemTestServer(t)
+
+			first := doCreate(t, srv, key, tt.firstBody)
+			firstResp := decodeCreate201(t, first)
+
+			if tt.advancePastTTL {
+				*clock = clock.Add(2 * time.Hour)
+			}
+
+			second := doCreate(t, srv, key, tt.secondBody)
+			if second.Code != tt.wantSecondStatus {
+				t.Fatalf("second status = %d, want %d (body %s)", second.Code, tt.wantSecondStatus, second.Body.String())
+			}
+			if runner.runCalls != tt.wantRunCalls {
+				t.Errorf("runCalls = %d, want %d", runner.runCalls, tt.wantRunCalls)
+			}
+
+			switch tt.wantSecondStatus {
+			case http.StatusCreated:
+				secondResp := decodeCreate201(t, second)
+				if tt.wantReplay {
+					if secondResp.SessionID != firstResp.SessionID {
+						t.Errorf("replay session_id = %v, want %v", secondResp.SessionID, firstResp.SessionID)
+					}
+					if (secondResp.CommandID == nil) != (firstResp.CommandID == nil) {
+						t.Errorf("replay command_id presence mismatch: %v vs %v", secondResp.CommandID, firstResp.CommandID)
+					}
+					if secondResp.CommandID != nil && firstResp.CommandID != nil &&
+						*secondResp.CommandID != *firstResp.CommandID {
+						t.Errorf("replay command_id = %v, want %v", *secondResp.CommandID, *firstResp.CommandID)
+					}
+				}
+			case http.StatusConflict:
+				assertErrorEnvelope(t, second)
+			}
+		})
+	}
+}
+
+// TestServerHandleCreateIdempotentReplayCarriesCommandID proves the create-with-input
+// replay returns the SAME command_id (not just session_id).
+func TestServerHandleCreateIdempotentReplayCarriesCommandID(t *testing.T) {
+	t.Parallel()
+	srv, runner, _ := newIdemTestServer(t)
+
+	first := decodeCreate201(t, doCreate(t, srv, "k", validBlocksBody))
+	second := decodeCreate201(t, doCreate(t, srv, "k", validBlocksBody))
+
+	if runner.runCalls != 1 {
+		t.Fatalf("runCalls = %d, want 1", runner.runCalls)
+	}
+	if first.CommandID == nil {
+		t.Fatal("first command_id absent, want present")
+	}
+	if second.CommandID == nil || *second.CommandID != *first.CommandID {
+		t.Errorf("replay command_id = %v, want %v", second.CommandID, *first.CommandID)
+	}
+	// Submit ran exactly once (the replay did not re-submit).
+	if srv.runner.(*fakeRunner).runSess.submitCalls != 1 {
+		t.Errorf("submitCalls = %d, want 1", srv.runner.(*fakeRunner).runSess.submitCalls)
+	}
+}
+
+// TestServerHandleCreateOversizedKey proves a key over the bound is 400 before the
+// runner or store is touched.
+func TestServerHandleCreateOversizedKey(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name       string
+		keyLen     int
+		wantStatus int
+		wantRun    int
+	}{
+		{name: "max length key is accepted", keyLen: maxIdempotencyKeyLen, wantStatus: http.StatusCreated, wantRun: 1},
+		{name: "one over max is rejected", keyLen: maxIdempotencyKeyLen + 1, wantStatus: http.StatusBadRequest, wantRun: 0},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			srv, runner, _ := newIdemTestServer(t)
+			key := strings.Repeat("a", tt.keyLen)
+
+			rec := doCreate(t, srv, key, "")
+			if rec.Code != tt.wantStatus {
+				t.Fatalf("status = %d, want %d", rec.Code, tt.wantStatus)
+			}
+			if runner.runCalls != tt.wantRun {
+				t.Errorf("runCalls = %d, want %d", runner.runCalls, tt.wantRun)
+			}
+			if tt.wantStatus == http.StatusBadRequest {
+				assertErrorEnvelope(t, rec)
+				srv.idem.mu.Lock()
+				n := len(srv.idem.entries)
+				srv.idem.mu.Unlock()
+				if n != 0 {
+					t.Errorf("store entries = %d, want 0 (untouched on oversized key)", n)
+				}
+			}
+		})
+	}
+}
+
+// concurrentRunner is a race-safe Runner for the concurrency smoke test (the shared
+// fakeRunner increments an unguarded counter, which -race would flag under concurrent
+// Run).
+type concurrentRunner struct {
+	mu    sync.Mutex
+	id    uuid.UUID
+	sess  *fakeSession
+	calls int
+}
+
+func (r *concurrentRunner) Run(context.Context) (uuid.UUID, *fakeSession, error) {
+	r.mu.Lock()
+	r.calls++
+	r.mu.Unlock()
+	return r.id, r.sess, nil
+}
+
+func (r *concurrentRunner) Restore(context.Context, uuid.UUID) (*fakeSession, error) {
+	return r.sess, nil
+}
+
+func (r *concurrentRunner) runCount() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.calls
+}
+
+// TestServerHandleCreateIdempotentConcurrent is the -race smoke test for the per-pod
+// double-run window: concurrent same-key idle creates must be race-free, and a
+// SUBSEQUENT sequential same-key create must replay (not re-run) — the documented
+// sequential guarantee.
+func TestServerHandleCreateIdempotentConcurrent(t *testing.T) {
+	t.Parallel()
+
+	runner := &concurrentRunner{id: parseTestUUID(t, idemRunID), sess: &fakeSession{}}
+	srv := newServer[*fakeSession](runner, nil, newConfig())
+
+	const n = 16
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			rec := doCreate(t, srv, "shared-key", "")
+			if rec.Code != http.StatusCreated {
+				t.Errorf("concurrent create status = %d, want 201", rec.Code)
+			}
+		}()
+	}
+	wg.Wait()
+
+	before := runner.runCount()
+	if before < 1 || before > n {
+		t.Fatalf("concurrent runCalls = %d, want in [1,%d]", before, n)
+	}
+
+	// After the concurrent burst settled, a repeat of the key replays the cached
+	// outcome and does NOT run again — the required sequential guarantee.
+	rec := doCreate(t, srv, "shared-key", "")
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("sequential replay status = %d, want 201", rec.Code)
+	}
+	if after := runner.runCount(); after != before {
+		t.Errorf("sequential replay re-ran: runCalls %d -> %d", before, after)
 	}
 }
 
