@@ -122,13 +122,11 @@ func (s *stream) shutdown() error {
 	defer kill.Stop()
 	waitErr := s.cmd.Wait()
 	exitErr := exitError(waitErr)
-	if derr := s.decErr(); derr != nil {
-		slog.Warn("codex: foreign stream decode error", "error", derr)
-		if exitErr == nil {
-			return derr
-		}
+	decodeErr := s.decErr()
+	if decodeErr != nil {
+		slog.Warn("codex: foreign stream decode error", "error", decodeErr)
 	}
-	return exitErr
+	return errors.Join(decodeErr, exitErr)
 }
 
 func decodeJSONL(r io.Reader) (<-chan foreignloop.ForeignEvent, func() error, func()) {

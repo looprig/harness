@@ -279,6 +279,9 @@ func (l *Loop) drainStream(stream ForeignStream, cur event.TurnIndex, sidBound b
 	for fe := range stream.Events() {
 		switch fe.Kind {
 		case ForeignInit:
+			if out.terminal {
+				continue
+			}
 			if fe.SessionID != "" && !sidBound && out.boundSID == "" {
 				out.boundSID = fe.SessionID
 				expectedSID = fe.SessionID

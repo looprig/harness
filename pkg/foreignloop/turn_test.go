@@ -784,10 +784,10 @@ func TestLateBoundFailureBeforeInitRetriesStartNew(t *testing.T) {
 	}
 }
 
-func TestLateBoundTerminalWithoutInitFailsProtocolAndRetriesStartNew(t *testing.T) {
+func TestLateBoundTerminalOKBeforeInitFailsProtocolAndRetriesStartNew(t *testing.T) {
 	t.Parallel()
 	agent := &scriptedCloseAgent{scripts: []streamScript{
-		{events: []ForeignEvent{{Kind: ForeignTerminalOK}}},
+		{events: []ForeignEvent{{Kind: ForeignTerminalOK}, {Kind: ForeignInit, SessionID: "too-late"}}},
 		{events: []ForeignEvent{{Kind: ForeignInit, SessionID: "codex-thread-2"}, {Kind: ForeignTerminalOK}}},
 	}}
 	pub := &fakePublisher{}
@@ -796,6 +796,9 @@ func TestLateBoundTerminalWithoutInitFailsProtocolAndRetriesStartNew(t *testing.
 	submitUserInput(t, l, "first")
 	waitForKind(t, pub, "TurnFailed")
 	waitLoopIdle(t, l)
+	if got, want := eventKinds(pub.snapshot()), []string{"TurnStarted", "TurnFailed"}; !eqStrs(got, want) {
+		t.Fatalf("first-turn published sequence = %v, want %v", got, want)
+	}
 
 	var protocolErr *ForeignProtocolError
 	if err := findTurnFailed(t, pub).Err; !errors.As(err, &protocolErr) {
@@ -815,10 +818,10 @@ func TestLateBoundTerminalWithoutInitFailsProtocolAndRetriesStartNew(t *testing.
 	shutdown(t, l)
 }
 
-func TestLateBoundTerminalErrorWithoutInitPreservesResultAndProtocolErrors(t *testing.T) {
+func TestLateBoundTerminalErrorBeforeInitPreservesResultAndProtocolErrors(t *testing.T) {
 	t.Parallel()
 	agent := &scriptedCloseAgent{scripts: []streamScript{
-		{events: []ForeignEvent{{Kind: ForeignTerminalError, ErrText: "error_max_turns"}}},
+		{events: []ForeignEvent{{Kind: ForeignTerminalError, ErrText: "error_max_turns"}, {Kind: ForeignInit, SessionID: "too-late"}}},
 		{events: []ForeignEvent{{Kind: ForeignInit, SessionID: "codex-thread-2"}, {Kind: ForeignTerminalOK}}},
 	}}
 	pub := &fakePublisher{}
@@ -827,6 +830,9 @@ func TestLateBoundTerminalErrorWithoutInitPreservesResultAndProtocolErrors(t *te
 	submitUserInput(t, l, "first")
 	waitForKind(t, pub, "TurnFailed")
 	waitLoopIdle(t, l)
+	if got, want := eventKinds(pub.snapshot()), []string{"TurnStarted", "TurnFailed"}; !eqStrs(got, want) {
+		t.Fatalf("first-turn published sequence = %v, want %v", got, want)
+	}
 
 	turnErr := findTurnFailed(t, pub).Err
 	var resultErr *ForeignResultError

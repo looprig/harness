@@ -255,6 +255,39 @@ func TestAgentSpawnCloseReturnsForeignExitError(t *testing.T) {
 	}
 }
 
+func TestAgentSpawnCloseJoinsDecodeAndForeignExitErrors(t *testing.T) {
+	t.Parallel()
+	fake := newFakeCodex(t)
+	stream, err := (&Agent{
+		ExecPath: fake.path,
+		Env:      fake.env("FAKE_MODE=malformed_json", "EXIT_CODE=7"),
+	}).Spawn(context.Background(), foreignloop.ForeignTurn{
+		Cwd:      t.TempDir(),
+		StartNew: true,
+		Input:    []content.Block{&content.TextBlock{Text: "decode then exit"}},
+	})
+	if err != nil {
+		t.Fatalf("Spawn() error = %v", err)
+	}
+	_ = collectEvents(t, stream)
+
+	err = stream.Close()
+	var de *foreignloop.DecodeError
+	if !errors.As(err, &de) {
+		t.Fatalf("Close() error = %T %[1]v, want DecodeError", err)
+	}
+	var ee *foreignloop.ForeignExitError
+	if !errors.As(err, &ee) || ee.Code != 7 {
+		t.Fatalf("Close() error = %T %[1]v, want ForeignExitError code 7", err)
+	}
+	if got, want := err.Error(), de.Error()+"\n"+ee.Error(); got != want {
+		t.Fatalf("Close() error = %q, want deterministic decode-first ordering %q", got, want)
+	}
+	if err2 := stream.Close(); err2 != err {
+		t.Fatalf("second Close() error = %v, want same error %v", err2, err)
+	}
+}
+
 func TestAgentSpawnErrorPaths(t *testing.T) {
 	t.Parallel()
 	t.Run("empty exec path fails closed with config error", func(t *testing.T) {
@@ -406,7 +439,7 @@ cat > "$STDIN_FILE"
 case "${FAKE_MODE:-happy}" in
   malformed_json)
     printf '%s\n' '{"type":"thread.started"'
-    exit 0
+    exit "${EXIT_CODE:-0}"
     ;;
   oversized_line)
     head -c 1048577 /dev/zero | tr '\000' x
