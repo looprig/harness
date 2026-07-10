@@ -19,8 +19,8 @@ import (
 // transcript-derived (or soft-degraded) assistant history to append. success is true
 // for a TurnDone terminal. interrupted means the turn ctx was cancelled and the
 // goroutine published NO terminal (the actor owns TurnInterrupted). spawned is true
-// once Spawn succeeded, which advances hasSpawned so the next turn resumes the
-// foreign session instead of starting a new one. boundSID is the first late-bound
+// once a prebound session spawned or a late-bound session id was learned, which
+// advances hasSpawned so the next turn resumes. boundSID is the first late-bound
 // foreign session id observed by the turn goroutine; the actor applies it.
 type turnOutcome struct {
 	committed   content.AgenticMessages
@@ -38,6 +38,7 @@ type drainedTurn struct {
 	boundSID  string
 	termErr   error
 	bindErr   error
+	terminal  bool
 }
 
 type turnLock interface {
@@ -163,8 +164,8 @@ func (l *Loop) handleTurnCommand(cmd command.Command, cur event.TurnIndex,
 
 // applyOutcome commits a resolved turn into the actor-owned state. On an interrupt it
 // publishes TurnInterrupted and commits nothing. Otherwise it appends the committed
-// assistant history, advances hasSpawned once the agent actually spawned, and (on a
-// successful terminal) advances turnIndex.
+// assistant history, advances hasSpawned once a resumable session is known, and (on
+// a successful terminal) advances turnIndex.
 func (l *Loop) applyOutcome(cur event.TurnIndex, out turnOutcome, pub func(event.Event)) {
 	l.applyBoundSID(out.boundSID)
 	if out.interrupted {
@@ -173,9 +174,8 @@ func (l *Loop) applyOutcome(cur event.TurnIndex, out turnOutcome, pub func(event
 	}
 	l.msgs = append(l.msgs, out.committed...)
 	if out.spawned {
-		// NOTE: hasSpawned tracks "the foreign session exists on disk", so it advances
-		// whenever Spawn succeeded — even on a failed terminal — so the next turn
-		// resumes rather than starting a new (and orphaning the prior) session.
+		// A prebound session is already resumable after Spawn; a late-bound session
+		// becomes resumable only after ForeignInit supplies its id.
 		l.hasSpawned = true
 	}
 	if out.success {
@@ -234,8 +234,6 @@ func (l *Loop) driveTurnWithLocks(turnCtx context.Context, cancel context.Cancel
 		pub(event.TurnFailed{TurnIndex: cur, Err: &SpawnError{Cause: err}})
 		return
 	}
-	defer func() { _ = stream.Close() }()
-
 	bindSID := func(sid string) error {
 		boundLock, err := locks.acquireDurable(sid, l.spec.Cwd)
 		if err != nil {
@@ -246,23 +244,27 @@ func (l *Loop) driveTurnWithLocks(turnCtx context.Context, cancel context.Cancel
 		return nil
 	}
 	drained := l.drainStream(stream, cur, sidBound, ft.ForeignSID, bindSID, pub)
+	closeErr := stream.Close()
+	spawned := sidBound || drained.boundSID != ""
 	if drained.bindErr != nil {
-		pub(event.TurnFailed{TurnIndex: cur, Err: drained.bindErr})
-		outcome = turnOutcome{spawned: true, boundSID: drained.boundSID}
+		pub(event.TurnFailed{TurnIndex: cur, Err: errors.Join(drained.bindErr, closeErr)})
+		outcome = turnOutcome{spawned: spawned, boundSID: drained.boundSID}
 		return
 	}
 	if turnCtx.Err() != nil {
-		outcome = turnOutcome{interrupted: true, spawned: true, boundSID: drained.boundSID}
+		outcome = turnOutcome{interrupted: true, spawned: spawned, boundSID: drained.boundSID}
 		return
 	}
 	committed := l.commitTurn(stream.TranscriptPath(), cur, drained.assistant, pub)
-	if drained.termErr != nil {
-		pub(event.TurnFailed{TurnIndex: cur, Err: drained.termErr})
-		outcome = turnOutcome{committed: committed, spawned: true, boundSID: drained.boundSID}
+	// The stream terminal/protocol error is primary; Join retains any typed Close
+	// cause for errors.As. Cancellation above deliberately preserves interruption.
+	if turnErr := errors.Join(drained.termErr, closeErr); turnErr != nil {
+		pub(event.TurnFailed{TurnIndex: cur, Err: turnErr})
+		outcome = turnOutcome{committed: committed, spawned: spawned, boundSID: drained.boundSID}
 		return
 	}
 	pub(event.TurnDone{TurnIndex: cur, Message: lastOf(drained.assistant)})
-	outcome = turnOutcome{committed: committed, success: true, spawned: true, boundSID: drained.boundSID}
+	outcome = turnOutcome{committed: committed, success: true, spawned: spawned, boundSID: drained.boundSID}
 }
 
 // drainStream consumes the live foreign stream. The mapper translates ONLY the live
@@ -294,13 +296,26 @@ func (l *Loop) drainStream(stream ForeignStream, cur event.TurnIndex, sidBound b
 				out.assistant = append(out.assistant, fe.Message)
 			}
 		case ForeignTerminalOK:
+			out.terminal = true
 			if fe.Message != nil {
 				out.assistant = append(out.assistant, fe.Message)
 			}
 		case ForeignTerminalError:
+			out.terminal = true
 			out.termErr = &ForeignResultError{Detail: fe.ErrText}
 		default:
 			l.publishMapped(m, fe, pub)
+		}
+	}
+	if out.bindErr == nil {
+		switch {
+		case !sidBound && out.boundSID == "":
+			out.termErr = errors.Join(
+				out.termErr,
+				&ForeignProtocolError{Reason: "late-bound stream ended without init event"},
+			)
+		case !out.terminal:
+			out.termErr = &ForeignProtocolError{Reason: "stream ended without terminal event"}
 		}
 	}
 	return out

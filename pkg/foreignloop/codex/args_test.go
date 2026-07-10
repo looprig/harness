@@ -30,7 +30,7 @@ func TestBuildStartArgs(t *testing.T) {
 		"--model", "gpt-5",
 		"--profile", "looprig",
 		"--sandbox", "workspace-write",
-		"--ask-for-approval", "on-request",
+		"-c", "approval_policy=\"on-request\"",
 		"--add-dir", "/deps/one",
 		"--add-dir", "/deps/two",
 		"--ignore-user-config",
@@ -79,7 +79,7 @@ func TestBuildResumeArgs(t *testing.T) {
 	if got[len(got)-1] != "continue" {
 		t.Fatalf("prompt is not last: %v", got)
 	}
-	for _, absent := range []string{"--cd", "--profile", "--sandbox", "--ask-for-approval", "--add-dir"} {
+	for _, absent := range []string{"--cd", "--profile", "--sandbox", "--ask-for-approval", "-c", "--add-dir"} {
 		if containsArg(got, absent) {
 			t.Fatalf("%s present in conservative resume argv: %v", absent, got)
 		}
@@ -101,6 +101,18 @@ func TestEnumMappingsFailClosed(t *testing.T) {
 			wantApproval: "untrusted",
 		},
 		{
+			name:         "known never",
+			cfg:          runConfig{cwd: "/w", sandbox: SandboxWorkspaceWrite, approval: ApprovalNever},
+			wantSandbox:  "workspace-write",
+			wantApproval: "never",
+		},
+		{
+			name:         "known on request",
+			cfg:          runConfig{cwd: "/w", sandbox: SandboxDangerFullAccess, approval: ApprovalOnRequest},
+			wantSandbox:  "danger-full-access",
+			wantApproval: "on-request",
+		},
+		{
 			name:         "unknown values fail closed",
 			cfg:          runConfig{cwd: "/w", sandbox: SandboxMode(99), approval: ApprovalPolicy(99)},
 			wantSandbox:  "read-only",
@@ -114,8 +126,11 @@ func TestEnumMappingsFailClosed(t *testing.T) {
 			if got := nextArg(argv, "--sandbox"); got != tt.wantSandbox {
 				t.Fatalf("--sandbox = %q, want %q in %v", got, tt.wantSandbox, argv)
 			}
-			if got := nextArg(argv, "--ask-for-approval"); got != tt.wantApproval {
-				t.Fatalf("--ask-for-approval = %q, want %q in %v", got, tt.wantApproval, argv)
+			if got := nextArg(argv, "-c"); got != "approval_policy=\""+tt.wantApproval+"\"" {
+				t.Fatalf("-c = %q, want approval_policy override for %q in %v", got, tt.wantApproval, argv)
+			}
+			if containsArg(argv, "--ask-for-approval") {
+				t.Fatalf("unsupported --ask-for-approval present in %v", argv)
 			}
 		})
 	}

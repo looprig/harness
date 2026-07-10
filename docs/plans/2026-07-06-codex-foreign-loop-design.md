@@ -15,7 +15,7 @@ The integration target is the documented non-interactive CLI surface:
 - `codex exec resume <SESSION_ID> --json <prompt>` for the live follow-up
   contract check; the adapter's separately tested argv is described below.
 - `--cd`, `--add-dir`, `--model`, `--profile`, `--sandbox`, and
-  `--ask-for-approval` for the process boundary.
+  `-c approval_policy="<policy>"` for the process boundary.
 - JSONL events from stdout: `thread.started`, `turn.started`,
   `turn.completed`, `turn.failed`, `item.*`, and `error`.
 
@@ -232,7 +232,7 @@ codex exec
   --model <model>              # optional
   --profile <profile>          # optional
   --sandbox <mode>
-  --ask-for-approval <policy>
+  -c approval_policy="<policy>"
   --add-dir <dir> ...          # optional
   [--ignore-user-config]
   [--ignore-rules]
@@ -256,16 +256,18 @@ working directory and does not assume first-turn workspace or permission flags
 also work on resume. The opt-in live contract check intentionally uses the CLI
 form `codex exec resume <thread_id> --json <prompt>` to verify continuation.
 
-The opt-in CLI contract test parser-probes `--cd`, `--sandbox`,
-`--ask-for-approval`, and `--add-dir` before and after `resume`, using `--help`
-only, and stops before live commands if a flag has no valid placement. On the
-locally tested `codex-cli 0.144.0`, `--cd`, `--sandbox`, and `--add-dir` parse
-only before `resume`; `--ask-for-approval` parses in neither placement. This
-observation is version-sensitive:
-deployments needing equivalent settings must use their CLI version's supported
-`-c key=value` override or persist them in the profile/config used by resume.
-Exact config keys are intentionally not specified. Keep the opt-in test as the
-compatibility guard.
+The opt-in CLI contract test parser-probes `--cd`, `--sandbox`, and `--add-dir`
+before and after `resume`, using `--help` only, and stops before live commands if
+a flag has no valid placement. A separate opt-in parser check passes the exact
+production start argv, including `-c approval_policy="never"`, to `codex exec
+--help` under temporary `HOME` and `CODEX_HOME` directories with a minimal,
+sanitized environment. That check exercises parsing only and cannot invoke a
+model or network request.
+
+Historically, the first draft used `--ask-for-approval`; locally tested
+`codex-cli 0.144.0` rejects that legacy flag. Production therefore uses the
+supported `approval_policy` config override. Resume remains conservative and
+does not replay first-turn workspace or permission settings.
 
 Do not use `codex exec resume --last` in production code. It is ambiguous if
 multiple Codex loops run concurrently.
@@ -340,6 +342,15 @@ committed history. Use the JSONL stream as both live and committed source:
 - On `turn.failed` or process failure, emit `TurnFailed`. Commit any completed
   assistant message only if it appeared before the failure and the JSONL contract
   marks it completed.
+- Process exit, decode failure, and premature stream EOF also emit `TurnFailed`,
+  never `TurnDone`. When multiple failures apply, joined errors retain each typed
+  cause for `errors.As`.
+- A late-bound terminal received before a non-empty `ForeignInit` is a protocol
+  failure. `ForeignTerminalError` in that state retains both
+  `ForeignResultError` and `ForeignProtocolError`.
+- A late-bound loop becomes resumable only after its SID is bound. Failure,
+  interruption, or EOF before binding leaves the next turn on `StartNew` with an
+  empty SID; prebound loops and successfully bound late-bound loops resume.
 
 This keeps restore consistent because looprig reconstructs from its own
 `StepDone.Messages`, not from Codex transcript files.
@@ -484,15 +495,21 @@ Session/actor tests with fake Codex `ForeignAgent`:
 
 Integration/contract tests, gated behind an environment variable:
 
-- run `codex exec --json --sandbox read-only --ask-for-approval never "..."`.
+- run `codex exec --json --sandbox read-only -c approval_policy="never" "..."`.
 - assert `thread.started` contains a stable session id field.
 - assert the live `codex exec resume <sid> --json <prompt>` check continues the
   same session; separately unit-test the adapter argv
   `codex exec resume --json <foreign_sid> <prompt>`.
-- parser-probe the four first-turn workspace/permission flags before and after
-  `resume`; on no valid placement, report the version-supported `-c key=value`
-  or persisted-profile/config fallback before attempting live commands.
+- parser-probe `--cd`, `--sandbox`, and `--add-dir` before and after `resume`.
+- independently parser-check the exact production start argv under isolated
+  `HOME`/`CODEX_HOME` and a sanitized environment; require `codex exec --help`
+  output so the check does not use credentials, user config, a model, or network.
 - assert command/file-change item shapes for a harmless read-only command.
+
+Reviewed final verification covered the focused actor/adapter tests, the full
+foreign-loop race suite, vet, and diff checks. The isolated production-start
+parser check ran without credentials. No credentialed live start/resume contract
+run or `make secure` result is claimed by this document update.
 
 ### 14. Implementation Order
 

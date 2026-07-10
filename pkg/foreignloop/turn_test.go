@@ -558,6 +558,314 @@ func TestSpawnFailureTurnFailed(t *testing.T) {
 	shutdown(t, l)
 }
 
+type streamScript struct {
+	events   []ForeignEvent
+	block    bool
+	closeErr error
+}
+
+type scriptedCloseStream struct {
+	*fakeStream
+	closeErr error
+	mu       sync.Mutex
+	closes   int
+}
+
+func (s *scriptedCloseStream) Close() error {
+	s.mu.Lock()
+	s.closes++
+	s.mu.Unlock()
+	_ = s.fakeStream.Close()
+	return s.closeErr
+}
+
+func (s *scriptedCloseStream) closeCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.closes
+}
+
+type scriptedCloseAgent struct {
+	mu      sync.Mutex
+	scripts []streamScript
+	turns   []ForeignTurn
+	streams []*scriptedCloseStream
+}
+
+func (a *scriptedCloseAgent) Spawn(ctx context.Context, turn ForeignTurn) (ForeignStream, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if len(a.turns) >= len(a.scripts) {
+		return nil, errors.New("unexpected spawn")
+	}
+	script := a.scripts[len(a.turns)]
+	stream := &scriptedCloseStream{
+		fakeStream: &fakeStream{
+			events: script.events,
+			block:  script.block,
+			ctx:    ctx,
+			stop:   make(chan struct{}),
+		},
+		closeErr: script.closeErr,
+	}
+	a.turns = append(a.turns, turn)
+	a.streams = append(a.streams, stream)
+	return stream, nil
+}
+
+func (a *scriptedCloseAgent) turn(n int) ForeignTurn {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.turns[n]
+}
+
+func (a *scriptedCloseAgent) stream(n int) *scriptedCloseStream {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.streams[n]
+}
+
+func TestCloseErrorFailsTurn(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name     string
+		closeErr error
+		assert   func(*testing.T, error)
+	}{
+		{
+			name:     "foreign exit",
+			closeErr: &ForeignExitError{Code: 7},
+			assert: func(t *testing.T, err error) {
+				var target *ForeignExitError
+				if !errors.As(err, &target) || target.Code != 7 {
+					t.Fatalf("TurnFailed.Err = %T %v, want ForeignExitError code 7", err, err)
+				}
+			},
+		},
+		{
+			name:     "decode error",
+			closeErr: &DecodeError{Cause: errors.New("bad jsonl")},
+			assert: func(t *testing.T, err error) {
+				var target *DecodeError
+				if !errors.As(err, &target) {
+					t.Fatalf("TurnFailed.Err = %T %v, want DecodeError", err, err)
+				}
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			agent := &scriptedCloseAgent{scripts: []streamScript{{
+				events:   []ForeignEvent{{Kind: ForeignTerminalOK}},
+				closeErr: tt.closeErr,
+			}}}
+			pub := &fakePublisher{}
+			l, _ := newTestLoop(t, Spec{Agent: agent}, pub)
+
+			submitUserInput(t, l, "go")
+			waitForKind(t, pub, "TurnFailed")
+			waitLoopIdle(t, l)
+
+			if got, want := eventKinds(pub.snapshot()), []string{"TurnStarted", "TurnFailed"}; !eqStrs(got, want) {
+				t.Fatalf("published sequence = %v, want %v", got, want)
+			}
+			tt.assert(t, findTurnFailed(t, pub).Err)
+			if got := agent.stream(0).closeCount(); got != 1 {
+				t.Fatalf("Close called %d times, want 1", got)
+			}
+			_, turnIndex, err := l.Snapshot(context.Background())
+			if err != nil || turnIndex != 0 {
+				t.Fatalf("Snapshot turnIndex/error = %d/%v, want 0/nil", turnIndex, err)
+			}
+			shutdown(t, l)
+		})
+	}
+}
+
+func TestTerminalAndCloseErrorsRetainBothTypedCauses(t *testing.T) {
+	t.Parallel()
+	decodeErr := &DecodeError{Cause: errors.New("bad jsonl")}
+	agent := &scriptedCloseAgent{scripts: []streamScript{{
+		events:   []ForeignEvent{{Kind: ForeignTerminalError, ErrText: "error_max_turns"}},
+		closeErr: decodeErr,
+	}}}
+	pub := &fakePublisher{}
+	l, _ := newTestLoop(t, Spec{Agent: agent}, pub)
+
+	submitUserInput(t, l, "go")
+	waitForKind(t, pub, "TurnFailed")
+	waitLoopIdle(t, l)
+
+	err := findTurnFailed(t, pub).Err
+	var resultErr *ForeignResultError
+	if !errors.As(err, &resultErr) {
+		t.Fatalf("TurnFailed.Err = %T %v, want ForeignResultError", err, err)
+	}
+	var gotDecode *DecodeError
+	if !errors.As(err, &gotDecode) {
+		t.Fatalf("TurnFailed.Err = %T %v, want DecodeError", err, err)
+	}
+	if got := agent.stream(0).closeCount(); got != 1 {
+		t.Fatalf("Close called %d times, want 1", got)
+	}
+	shutdown(t, l)
+}
+
+func TestEOFWithoutForeignTerminalFailsTurn(t *testing.T) {
+	t.Parallel()
+	agent := &scriptedCloseAgent{scripts: []streamScript{{events: []ForeignEvent{{Kind: ForeignStepComplete, Message: aiMessage("partial")}}}}}
+	pub := &fakePublisher{}
+	l, _ := newTestLoop(t, Spec{Agent: agent}, pub)
+
+	submitUserInput(t, l, "go")
+	waitForKind(t, pub, "TurnFailed")
+	waitLoopIdle(t, l)
+
+	if got := eventKinds(pub.snapshot()); !eqStrs(got, []string{"TurnStarted", "TurnFailed"}) {
+		t.Fatalf("published sequence = %v, want TurnFailed without TurnDone", got)
+	}
+	var protocolErr *ForeignProtocolError
+	if err := findTurnFailed(t, pub).Err; !errors.As(err, &protocolErr) {
+		t.Fatalf("TurnFailed.Err = %T %v, want typed foreign protocol error", err, err)
+	}
+	if got := agent.stream(0).closeCount(); got != 1 {
+		t.Fatalf("Close called %d times, want 1", got)
+	}
+	_, turnIndex, err := l.Snapshot(context.Background())
+	if err != nil || turnIndex != 0 {
+		t.Fatalf("Snapshot turnIndex/error = %d/%v, want 0/nil", turnIndex, err)
+	}
+	shutdown(t, l)
+}
+
+func TestLateBoundFailureBeforeInitRetriesStartNew(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name      string
+		first     streamScript
+		interrupt bool
+	}{
+		{name: "EOF", first: streamScript{}},
+		{name: "close failure", first: streamScript{events: []ForeignEvent{{Kind: ForeignTerminalOK}}, closeErr: &ForeignExitError{Code: 9}}},
+		{name: "interruption", first: streamScript{block: true}, interrupt: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			agent := &scriptedCloseAgent{scripts: []streamScript{
+				tt.first,
+				{events: []ForeignEvent{{Kind: ForeignInit, SessionID: "codex-thread-2"}, {Kind: ForeignTerminalOK}}},
+			}}
+			pub := &fakePublisher{}
+			l, _ := newTestLoop(t, Spec{Agent: agent, Cwd: t.TempDir(), SIDMode: SIDLateBound}, pub)
+
+			submitUserInput(t, l, "first")
+			if tt.interrupt {
+				waitForKind(t, pub, "TurnStarted")
+				sendInterrupt(t, l)
+				waitForKind(t, pub, "TurnInterrupted")
+			} else {
+				waitForKind(t, pub, "TurnFailed")
+				waitLoopIdle(t, l)
+			}
+
+			submitUserInput(t, l, "second")
+			waitTurnIndex(t, l, 1)
+			second := agent.turn(1)
+			if !second.StartNew || second.ForeignSID != "" {
+				t.Fatalf("second ForeignTurn = {StartNew:%t ForeignSID:%q}, want true/empty", second.StartNew, second.ForeignSID)
+			}
+			if got := agent.stream(0).closeCount(); got != 1 {
+				t.Fatalf("first stream Close called %d times, want 1", got)
+			}
+			shutdown(t, l)
+		})
+	}
+}
+
+func TestLateBoundTerminalWithoutInitFailsProtocolAndRetriesStartNew(t *testing.T) {
+	t.Parallel()
+	agent := &scriptedCloseAgent{scripts: []streamScript{
+		{events: []ForeignEvent{{Kind: ForeignTerminalOK}}},
+		{events: []ForeignEvent{{Kind: ForeignInit, SessionID: "codex-thread-2"}, {Kind: ForeignTerminalOK}}},
+	}}
+	pub := &fakePublisher{}
+	l, _ := newTestLoop(t, Spec{Agent: agent, Cwd: t.TempDir(), SIDMode: SIDLateBound}, pub)
+
+	submitUserInput(t, l, "first")
+	waitForKind(t, pub, "TurnFailed")
+	waitLoopIdle(t, l)
+
+	var protocolErr *ForeignProtocolError
+	if err := findTurnFailed(t, pub).Err; !errors.As(err, &protocolErr) {
+		t.Fatalf("TurnFailed.Err = %T %v, want ForeignProtocolError", err, err)
+	}
+	_, turnIndex, err := l.Snapshot(context.Background())
+	if err != nil || turnIndex != 0 {
+		t.Fatalf("Snapshot turnIndex/error = %d/%v, want 0/nil", turnIndex, err)
+	}
+
+	submitUserInput(t, l, "second")
+	waitTurnIndex(t, l, 1)
+	second := agent.turn(1)
+	if !second.StartNew || second.ForeignSID != "" {
+		t.Fatalf("second ForeignTurn = {StartNew:%t ForeignSID:%q}, want true/empty", second.StartNew, second.ForeignSID)
+	}
+	shutdown(t, l)
+}
+
+func TestLateBoundTerminalErrorWithoutInitPreservesResultAndProtocolErrors(t *testing.T) {
+	t.Parallel()
+	agent := &scriptedCloseAgent{scripts: []streamScript{
+		{events: []ForeignEvent{{Kind: ForeignTerminalError, ErrText: "error_max_turns"}}},
+		{events: []ForeignEvent{{Kind: ForeignInit, SessionID: "codex-thread-2"}, {Kind: ForeignTerminalOK}}},
+	}}
+	pub := &fakePublisher{}
+	l, _ := newTestLoop(t, Spec{Agent: agent, Cwd: t.TempDir(), SIDMode: SIDLateBound}, pub)
+
+	submitUserInput(t, l, "first")
+	waitForKind(t, pub, "TurnFailed")
+	waitLoopIdle(t, l)
+
+	turnErr := findTurnFailed(t, pub).Err
+	var resultErr *ForeignResultError
+	if !errors.As(turnErr, &resultErr) {
+		t.Fatalf("TurnFailed.Err = %T %v, want ForeignResultError", turnErr, turnErr)
+	}
+	var protocolErr *ForeignProtocolError
+	if !errors.As(turnErr, &protocolErr) {
+		t.Fatalf("TurnFailed.Err = %T %v, want ForeignProtocolError", turnErr, turnErr)
+	}
+	_, turnIndex, err := l.Snapshot(context.Background())
+	if err != nil || turnIndex != 0 {
+		t.Fatalf("Snapshot turnIndex/error = %d/%v, want 0/nil", turnIndex, err)
+	}
+
+	submitUserInput(t, l, "second")
+	waitTurnIndex(t, l, 1)
+	second := agent.turn(1)
+	if !second.StartNew || second.ForeignSID != "" {
+		t.Fatalf("second ForeignTurn = {StartNew:%t ForeignSID:%q}, want true/empty", second.StartNew, second.ForeignSID)
+	}
+	shutdown(t, l)
+}
+
+func TestPreboundTerminalWithoutInitSucceeds(t *testing.T) {
+	t.Parallel()
+	agent := &scriptedCloseAgent{scripts: []streamScript{{events: []ForeignEvent{{Kind: ForeignTerminalOK}}}}}
+	pub := &fakePublisher{}
+	l, _ := newTestLoop(t, Spec{Agent: agent}, pub)
+
+	submitUserInput(t, l, "go")
+	waitTurnIndex(t, l, 1)
+
+	if got, want := eventKinds(pub.snapshot()), []string{"TurnStarted", "TurnDone"}; !eqStrs(got, want) {
+		t.Fatalf("published sequence = %v, want %v", got, want)
+	}
+	shutdown(t, l)
+}
+
 func TestTranscriptLossSoftDegrade(t *testing.T) {
 	t.Parallel()
 	missing := filepath.Join(t.TempDir(), "does-not-exist.jsonl")

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -29,7 +30,6 @@ var resumeFlagProbes = []struct {
 }{
 	{flag: "--cd", value: "."},
 	{flag: "--sandbox", value: "read-only"},
-	{flag: "--ask-for-approval", value: "never"},
 	{flag: "--add-dir", value: "."},
 }
 
@@ -56,13 +56,6 @@ func TestResumeFlagProbeArgs(t *testing.T) {
 			value:  "read-only",
 			before: []string{"exec", "--sandbox", "read-only", "resume", "--help"},
 			after:  []string{"exec", "resume", "--sandbox", "read-only", "--help"},
-		},
-		{
-			name:   "approval",
-			flag:   "--ask-for-approval",
-			value:  "never",
-			before: []string{"exec", "--ask-for-approval", "never", "resume", "--help"},
-			after:  []string{"exec", "resume", "--ask-for-approval", "never", "--help"},
 		},
 		{
 			name:   "additional directory",
@@ -119,7 +112,6 @@ func TestUnsupportedResumeFlagFailures(t *testing.T) {
 	got := unsupportedResumeFlagFailures([]resumeFlagSupport{
 		{flag: "--cd", before: false, after: false},
 		{flag: "--sandbox", before: true, after: false},
-		{flag: "--ask-for-approval", before: true, after: true},
 		{flag: "--add-dir", before: false, after: true},
 	})
 	if len(got) != 1 {
@@ -195,13 +187,12 @@ func TestIntegrationCodexCLIContract(t *testing.T) {
 		t.Fatal("codex exec resume parser probes failed; live codex exec start/resume commands were not attempted")
 	}
 
-	start := runCodex(t, ctx, codexPath, []string{
-		"exec",
-		"--json",
-		"--sandbox", "read-only",
-		"--ask-for-approval", "never",
-		"Reply with exactly: ok",
-	})
+	start := runCodex(t, ctx, codexPath, buildStartArgs(foreignloop.ForeignTurn{}, runConfig{
+		cwd:              t.TempDir(),
+		sandbox:          SandboxReadOnly,
+		approval:         ApprovalNever,
+		skipGitRepoCheck: true,
+	}, "Reply with exactly: ok"))
 	if start.threadID == "" {
 		t.Fatalf("codex exec did not emit %s; stdout:\n%s\nstderr:\n%s", eventThreadStarted, start.stdout, start.stderr)
 	}
@@ -219,14 +210,53 @@ func TestIntegrationCodexCLIContract(t *testing.T) {
 
 }
 
+func TestIntegrationCodexProductionStartArgsParse(t *testing.T) {
+	if os.Getenv(codexIntegrationEnv) != "1" {
+		t.Skipf("set %s=1 to run Codex CLI contract tests", codexIntegrationEnv)
+	}
+
+	codexPath, err := exec.LookPath("codex")
+	if err != nil {
+		t.Skip("codex CLI not found on PATH; install Codex CLI or add it to PATH to run this integration test")
+	}
+	cwd := t.TempDir()
+	args := buildStartArgs(foreignloop.ForeignTurn{}, runConfig{
+		cwd:      cwd,
+		sandbox:  SandboxReadOnly,
+		approval: ApprovalNever,
+	}, "--help")
+	want := []string{
+		"exec",
+		"--json",
+		"--cd", cwd,
+		"--sandbox", "read-only",
+		"-c", "approval_policy=\"never\"",
+		"--help",
+	}
+	if !slices.Equal(args, want) {
+		t.Fatalf("production start parser argv = %q, want %q", args, want)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	probe := runCodexParserProbe(ctx, codexPath, args, sanitizedCodexEnv(t, codexPath))
+	if !probe.ok {
+		t.Fatalf("codex parser rejected production start argv %q: %s", args, probe.detail)
+	}
+	if !strings.Contains(probe.detail, "Usage: codex exec") {
+		t.Fatalf("codex parser argv did not take the --help path: %s", probe.detail)
+	}
+}
+
 func probeResumeFlagSupport(t *testing.T, parent context.Context, codexPath string) bool {
 	t.Helper()
 
+	env := sanitizedCodexEnv(t, codexPath)
 	support := make([]resumeFlagSupport, 0, len(resumeFlagProbes))
 	var results []string
 	for _, probe := range resumeFlagProbes {
-		before := runCodexParserProbe(parent, codexPath, resumeFlagProbeArgs(probe.flag, probe.value, true))
-		after := runCodexParserProbe(parent, codexPath, resumeFlagProbeArgs(probe.flag, probe.value, false))
+		before := runCodexParserProbe(parent, codexPath, resumeFlagProbeArgs(probe.flag, probe.value, true), env)
+		after := runCodexParserProbe(parent, codexPath, resumeFlagProbeArgs(probe.flag, probe.value, false), env)
 		support = append(support, resumeFlagSupport{
 			flag:   probe.flag,
 			before: before.ok,
@@ -255,12 +285,12 @@ type codexParserProbe struct {
 	detail string
 }
 
-func runCodexParserProbe(parent context.Context, codexPath string, args []string) codexParserProbe {
+func runCodexParserProbe(parent context.Context, codexPath string, args, env []string) codexParserProbe {
 	ctx, cancel := context.WithTimeout(parent, 5*time.Second)
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, codexPath, args...)
-	cmd.Env = os.Environ()
+	cmd.Env = env
 
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
@@ -272,7 +302,23 @@ func runCodexParserProbe(parent context.Context, codexPath string, args []string
 	if err != nil {
 		return codexParserProbe{detail: fmt.Sprintf("failed: %v; stdout: %s; stderr: %s", err, conciseOutput(stdout.String()), conciseOutput(stderr.String()))}
 	}
-	return codexParserProbe{ok: true}
+	return codexParserProbe{ok: true, detail: conciseOutput(stdout.String() + "\n" + stderr.String())}
+}
+
+func sanitizedCodexEnv(t *testing.T, codexPath string) []string {
+	t.Helper()
+	home := t.TempDir()
+	codexHome := filepath.Join(home, "codex")
+	if err := os.Mkdir(codexHome, 0o700); err != nil {
+		t.Fatalf("create isolated CODEX_HOME: %v", err)
+	}
+	return []string{
+		"HOME=" + home,
+		"CODEX_HOME=" + codexHome,
+		"TMPDIR=" + t.TempDir(),
+		"PATH=" + filepath.Dir(codexPath) + string(os.PathListSeparator) + "/usr/bin:/bin",
+		"NO_COLOR=1",
+	}
 }
 
 func resumeFlagProbeArgs(flag, value string, beforeResume bool) []string {

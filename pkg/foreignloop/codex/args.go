@@ -28,7 +28,7 @@ func buildStartArgs(_ foreignloop.ForeignTurn, c runConfig, prompt string) []str
 	}
 	args = append(args,
 		"--sandbox", sandboxString(c.sandbox),
-		"--ask-for-approval", approvalString(c.approval),
+		"-c", "approval_policy=\""+approvalString(c.approval)+"\"",
 	)
 	for _, dir := range c.additionalDirs {
 		args = append(args, "--add-dir", dir)

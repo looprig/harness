@@ -23,6 +23,13 @@ type ForeignResultError struct{ Detail string }
 
 func (e *ForeignResultError) Error() string { return "foreignloop: foreign result error: " + e.Detail }
 
+// ForeignProtocolError reports a stream that ended without a result terminal.
+type ForeignProtocolError struct{ Reason string }
+
+func (e *ForeignProtocolError) Error() string {
+	return "foreignloop: foreign protocol: " + e.Reason
+}
+
 type TranscriptUnavailableError struct {
 	Path  string
 	Cause error

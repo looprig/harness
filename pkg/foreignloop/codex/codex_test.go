@@ -65,7 +65,7 @@ func TestAgentSpawnFirstTurnExecJSONL(t *testing.T) {
 		"--model", "gpt-5",
 		"--profile", "looprig",
 		"--sandbox", "workspace-write",
-		"--ask-for-approval", "on-request",
+		"-c", "approval_policy=\"on-request\"",
 		"--add-dir", "/deps/one",
 		"--add-dir", "/deps/two",
 		"--ignore-user-config",

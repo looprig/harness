@@ -401,7 +401,8 @@ Test cases:
 - `NewSpec` rejects empty `ExecPath`.
 - `NewSpec` rejects empty `Cwd`.
 - env whitelist includes only allowlisted parent keys plus sorted credentials.
-- first-turn args include `exec`, `--json`, `--cd`, `--sandbox`, `--ask-for-approval`, and prompt.
+- first-turn args include `exec`, `--json`, `--cd`, `--sandbox`, `-c`,
+  `approval_policy="<policy>"`, and prompt.
 - resume args include `exec`, `resume`, `--json`, sid, and prompt.
 - enum mappings fail closed to least privilege (`read-only` / `on-request`) for unknown values.
 
@@ -645,14 +646,22 @@ Tests should skip unless `LOOPRIG_CODEX_INTEGRATION=1`.
 
 Contract checks:
 
-- `codex exec --json --sandbox read-only --ask-for-approval never` emits `thread.started`.
+- `codex exec --json --sandbox read-only -c approval_policy="never"` emits
+  `thread.started` when the credentialed live contract is run.
 - live `codex exec resume <thread_id> --json <prompt>` resumes the same id or
   clearly confirms continuation; a separate exact argv unit test covers the
   adapter's `codex exec resume --json <foreign_sid> <prompt>` invocation.
-- parser-probe `--cd`, `--sandbox`, `--ask-for-approval`, and `--add-dir` before
-  and after `resume` with `--help`; if a flag has no valid placement, stop before
-  live commands and report the version-supported `-c key=value` or persisted
-  profile/config fallback without naming version-specific config keys.
+- parser-probe `--cd`, `--sandbox`, and `--add-dir` before and after `resume`
+  with `--help`; if a flag has no valid placement, stop before live commands.
+- independently pass the exact production start argv, including
+  `-c approval_policy="never"`, to `codex exec --help` under temporary `HOME` and
+  `CODEX_HOME` directories with a minimal sanitized environment. This parser-only
+  check must not inherit credentials or user config and must require help output,
+  guaranteeing no model or network invocation.
+
+Historical note: the original draft used `--ask-for-approval`. Codex CLI 0.144.0
+rejects that legacy flag, so production start argv uses the supported config
+override instead.
 
 **Step 2: Run normal tests**
 
@@ -664,15 +673,24 @@ go test -race ./pkg/foreignloop/codex -run Integration -count=1
 
 Expected: SKIP without env var.
 
-**Step 3: Run opt-in test locally**
+**Step 3: Run opt-in tests locally**
 
-Run only when a Codex login/API key is available:
+The isolated parser check requires the opt-in gate but no login or API key:
+
+```bash
+LOOPRIG_CODEX_INTEGRATION=1 go test -race ./pkg/foreignloop/codex -run '^TestIntegrationCodexProductionStartArgsParse$' -count=1 -v
+```
+
+Run the credentialed live start/resume contract only when a Codex login/API key
+is available:
 
 ```bash
 LOOPRIG_CODEX_INTEGRATION=1 go test -race ./pkg/foreignloop/codex -run Integration -count=1 -v
 ```
 
-Expected: PASS or actionable failure identifying a CLI contract mismatch.
+Expected: the parser-only check passes without model/network access; the
+credentialed live check either passes or reports an actionable CLI contract
+mismatch when explicitly run.
 
 **Step 4: Commit**
 
@@ -690,7 +708,7 @@ make test
 make secure
 ```
 
-Expected: both pass.
+These are the plan's prescribed final commands, not evidence that both were run.
 
 If integration credentials are available, also run:
 
@@ -698,7 +716,24 @@ If integration credentials are available, also run:
 LOOPRIG_CODEX_INTEGRATION=1 go test -race ./pkg/foreignloop/codex -run Integration -count=1 -v
 ```
 
-Expected: PASS.
+Expected when explicitly run with credentials: PASS.
+
+Reviewed implementation verification notes:
+
+- process exit, decode failure, and premature EOF publish `TurnFailed`, never
+  `TurnDone`;
+- a late-bound terminal before non-empty `ForeignInit` publishes `TurnFailed`;
+  terminal-error-before-init retains both typed `ForeignResultError` and
+  `ForeignProtocolError`, and combined close failures retain their typed causes
+  through `errors.As`;
+- late-bound resume begins only after SID binding; failures, interruption, and
+  EOF before binding leave `hasSpawned` false so the next submit uses `StartNew`
+  with an empty SID; prebound and successfully bound loops resume;
+- focused race repetitions, the full foreign-loop race suite, `go vet`, and diff
+  checks were run during review;
+- the isolated exact production-start parser check ran under sanitized temporary
+  config with `--help`; no credentialed live start/resume integration or
+  successful `make secure` run is claimed here.
 
 Then commit any final doc adjustments:
 
