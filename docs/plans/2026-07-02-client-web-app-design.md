@@ -7,6 +7,23 @@ params, and gate ids aligned; `DELETE` dropped (serve ships no v1 destroy); the 
 **mounts `serve`'s reader** instead of reimplementing it; wire-DTO ownership moved to harness
 `pkg/serve`; lossless resume moved up (sequenced live delivery is a harness Phase 0 capability,
 serve §7b). See Decision #15.
+Revised 2026-07-09: reconciled against the **as-built** `pkg/serve` and the 2026-07-09 harness change
+that archived `pkg/transcript` out of harness. Five corrections: (1) the read plane mounts a new
+`serve.ReadHandler(reads)` — a harness Phase 0 prerequisite carving the stateless read routes out of
+the runner-coupled `serve.Handler` (the BFF hosts no agent, so it has no runner to pass); (2) the
+`transcript.html` shortcut and its render-parity oracle are dropped (`pkg/transcript` left harness for
+`looprig/cli`, which the client must not depend on); (3) the wire schema is **generated from
+`pkg/serve`'s Go structs** (`invopop/jsonschema` `go:generate`), not hand-maintained testdata; (4) the
+SDK consumes `GET /v1/capabilities` for feature negotiation; (5) the `/gates` snapshot is explicitly
+BFF-synthesized, not a `serve` route. See Decision #16.
+Revised 2026-07-09 (independent review, Decision #17): read is now a **composition-time seam** —
+mounted `serve.ReadHandler` in-proc (laptop, links a store) OR reverse-proxied to a remote `serve`
+read plane (cloud/thin, links **no** storage backend); TS runtime validation uses **ajv over serve's
+shipped JSON Schema** (no `json-schema-to-zod`, and no ask for serve to adopt `invopop` — serve
+hand-authored its schema to stay stdlib-only, by design); a DNS-rebind/`Host`/`Origin` guard + CSRF
+move to Phase 1a; the `sdk/react` placeholder is dropped and `pkg/bff` kept internal (export
+`pkg/webui` only); `id:`-stamped resume is **already shipped**, so lossless resume lands in 1c;
+`web/` → `app/`.
 **Depends on:** `2026-07-06-serve-http-session-api-design.md` (the wire contract this client
 consumes), `2026-07-02-storekit-sessionstore-design.md` (reads through `pkg/sessionstore`),
 `2026-07-02-workspacestore-design.md` (Phase 2 workspace views)
@@ -37,10 +54,11 @@ whole design:
 
 - **Read plane — history & listing.** List sessions; read a session's journal; reconstruct its
   transcript. This data lives in the **session store** and can be read with **no live agent
-  running** — straight from the store. Locally the backend is `fsstore`; in the cloud it is the
-  shared `natsstore` (or `pgstore`+object store). *This is "read the sessionstore directly" —
-  served by harness `serve.NewReader` mounted in-process, so the BFF's read routes are the same
-  code and wire contract as a remote `pkg/serve` (Decision #15).*
+  running**. The read routes are a **composition-time seam** (Decision #17): either harness
+  `serve.ReadHandler` **mounted in-process** over a locally-wired store (laptop: `fsstore`, no
+  NATS), or a **reverse-proxy to a remote `serve`'s stateless read routes** (cloud/thin client:
+  links **no** storage backend at all). Both speak the identical `serve` wire contract, so the BFF
+  and SDK are blind to which is wired.
 - **Live plane — a running session's tail.** A *currently running* session's transcript-as-it-
   happens plus gate/status. Source: looprig **session events** over `pkg/serve`'s SSE
   `GET /sessions/{sid}/events`. It needs the session's **host** to be up.
@@ -54,24 +72,23 @@ whole design:
         │                                          (same origin; no CORS; token stays    │
         │                                           server-side)                         │
         │                                                                                │
-        │  READ PLANE   ── serve.NewReader over sessionstore, in-process ──┐             │
-        │    local:  fsstore            (no NATS, one binary)              ├─► list       │
-        │    cloud:  natsstore / pgstore+object store                     │   journal     │
-        │    → Catalog().Keys/Get  ·  OpenEventReplayer → cold events     │   transcript  │
-        │                                                                 ┘               │
+        │  READ PLANE   ── composition-time seam (Decision #17) ───────────┐             │
+        │    laptop:  serve.ReadHandler mounted in-proc over fsstore        ├─► list       │
+        │             → Catalog().Keys/Get · OpenEventReplayer (links store)│   journal     │
+        │    cloud:   reverse-proxy to remote serve read routes (no store)  ┘   transcript  │
         │  LIVE + CONTROL ── pkg/serve HTTP client, reverse-proxied ──► session HOST       │
         │    GET /sessions/{sid}/events (SSE tail) · POST input/gates/interrupt/restore    │
         │    host = local swe process  OR  remote sandbox/cloud api                        │
-        │  TS CLIENT CORE ── generated DTO/zod + history/live/control transports         │
+        │  TS CLIENT CORE ── DTO types + ajv(schema) + history/live/control transports    │
         │    framework adapters: Svelte first; React/Vue/Angular/Solid later             │
         └──────────────────────────────────────────────────────────────────────────────────┘
-             depends on: looprig SDK  +  one storekit backend (chosen at composition)
+             depends on: looprig SDK  (+ one storekit backend ONLY when read is mounted in-proc)
              NEVER depends on: swe (no agent runner here — the client hosts nothing)
 ```
 
-- **Read is direct-to-store; control is proxied.** The client is a **backend-for-frontend
-  (BFF)**: it owns the store connection and the remote bearer token, and the SPA only ever
-  speaks to it, same-origin.
+- **Read is mounted-or-proxied; control is always proxied.** The client is a **backend-for-frontend
+  (BFF)**: it owns the store connection (only when read is mounted in-proc) and the remote bearer
+  token, and the SPA only ever speaks to it, same-origin.
 - The client is **backend-agnostic** by Dependency Inversion (per CLAUDE.md): it depends on the
   `sessionstore` *facade*; which storekit backend is wired (`fsstore` vs `natsstore`) is a
   `main`-time decision the client is blind to. "Local without NATS" is just a different backend
@@ -87,11 +104,10 @@ matching the storekit backend-repo convention; final name is the owner's call).
 
 | Depends on | For |
 |---|---|
-| `github.com/looprig/harness` — `pkg/serve` | the mounted read-plane handler (`serve.NewReader`), the wire DTO / error-envelope types, and the protocol schema the SDK generates from |
-| `github.com/looprig/harness` — `pkg/sessionstore` | the store-backed read adapter behind `serve.NewReader` (`Catalog`, `OpenEventReplayer`) |
-| harness `pkg/event`/`pkg/journal` + `github.com/looprig/core` `content`/`uuid` | decode replayed records where the transcript shortcut needs them |
-| harness `pkg/transcript` (optional) | HTML-export shortcut (below) |
-| one storage backend — `github.com/looprig/fsstore` **or** `github.com/looprig/natsstore` | the read-plane store, chosen at composition |
+| `github.com/looprig/harness` — `pkg/serve` | the mounted read-plane handler (`serve.ReadHandler`), the wire DTO / error-envelope types, and the protocol schema the SDK generates from |
+| `github.com/looprig/harness` — `pkg/serve/catalogreader` + `pkg/sessionstore` | **mounted-read mode only** — the store-backed read adapter behind `serve.ReadHandler` (`catalogreader.New` over `Catalog`, `OpenEventReplayer`) |
+| harness `pkg/event`/`pkg/journal` + `github.com/looprig/core` `content`/`uuid` | **mounted-read mode only** — decode replayed records inside the mounted reader |
+| one storage backend — `github.com/looprig/fsstore` **or** `github.com/looprig/natsstore` | **mounted-read mode only** (laptop); the cloud/thin client proxies read and links **no** backend (Decision #17) |
 | stdlib `net/http` | the BFF server + the `pkg/serve` reverse-proxy client |
 
 **Not** depended on: `swe`, any agent implementation, any charm/TUI stack. The module is a
@@ -111,12 +127,12 @@ safety.
 
 | Method + path | Plane | Backed by |
 |---|---|---|
-| `GET /api/v1/sessions?skip=&limit=` | read | mounted `serve` reader: paged `Catalog.ListSessions` → list DTO |
-| `GET /api/v1/sessions/{sid}/status` | read | mounted `serve` reader: catalog status projection (state, last seq, waiting gate) |
-| `GET /api/v1/sessions/{sid}/journal?from_journal_seq=&limit=` | read | mounted `serve` reader: cold Enduring journal page (seq-carrying) |
-| `GET /api/v1/sessions/{sid}/transcript.html` | read | `pkg/transcript` + `html` (server-rendered shortcut; see below) |
+| `GET /api/v1/capabilities` | protocol | **BFF-synthesized** (not proxied verbatim): the BFF's *own* feature set — reflects whether a control host is wired (browse-only advertises `journal` only; no `live_sse`/`gate_response`) |
+| `GET /api/v1/sessions?skip=&limit=` | read | mounted `serve.ReadHandler`: paged `Catalog.ListSessions` → list DTO |
+| `GET /api/v1/sessions/{sid}/status` | read | mounted `serve.ReadHandler`: catalog status projection (state, last seq, waiting gate) |
+| `GET /api/v1/sessions/{sid}/journal?from_journal_seq=&limit=` | read | mounted `serve.ReadHandler`: cold Enduring journal page (seq-carrying) |
 | `GET /api/v1/sessions/{sid}/events` | live | **reverse-proxy** of host `GET /v1/sessions/{sid}/events` (SSE; `enduring` frames carry `id: <journal_seq>`) |
-| `GET /api/v1/sessions/{sid}/gates` | read | open-gate snapshot: catalog `WaitingGateID` / journal fold (`GateOpened` without `GateResolved`; `GatePrepared` never appears) |
+| `GET /api/v1/sessions/{sid}/gates` | read | **BFF-synthesized** (not a `serve` route): the single open gate from status `WaitingGateID`. Serve's status projection carries **one** `WaitingGateID`, so v1 surfaces at most one open gate; multiple concurrent gates (parallel tools/subagents) would need an O(journal) fold or a serve open-gates list — out of scope (Decision #17) |
 | `POST /api/v1/sessions/{sid}/input` | control | reverse-proxy of host `POST …/input` |
 | `POST /api/v1/sessions/{sid}/gates/{gid}` | control | reverse-proxy of host `POST …/gates/{gid}` (opaque gate id) |
 | `POST /api/v1/sessions/{sid}/interrupt` | control | reverse-proxy of host `POST …/interrupt` |
@@ -144,7 +160,7 @@ contract, many framework adapters.
 
 `@looprig/client` provides:
 
-- generated zod schemas and TypeScript types for the `serve` / BFF protocol;
+- TypeScript types + a runtime validator (**ajv over serve's shipped JSON Schema**, Decision #17) for the `serve` / BFF protocol;
 - a `LooprigTransport` interface with two first-party implementations:
   - `BFFTransport` for same-origin browser apps (`/api/...`, token stays server-side);
   - `ServeTransport` for trusted/server-side/custom apps that call `pkg/serve` directly;
@@ -153,8 +169,9 @@ contract, many framework adapters.
   `ephemeral` frames into messages, tool cards, gates, status, and diagnostics;
 - control methods (`createSession`, `restoreSession`, `submit`, `respondGate`, `interrupt`) with
   typed errors and retry metadata from the stable error envelope;
-- lossless resume via the exact sequence join (serve §7b) once serve Phase 2 stamps `id:` on live
-  `enduring` frames; only `ephemeral` frames are best-effort.
+- lossless resume via the exact sequence join (serve §7b) — serve **already** stamps `id:
+  <journal_seq>` on live `enduring` frames, so this ships in Phase 1c; only `ephemeral` frames are
+  best-effort.
 
 Framework adapters are deliberately thin:
 
@@ -167,14 +184,16 @@ Framework adapters are deliberately thin:
 The adapters must not parse raw SSE, know Looprig event internals, or implement their own history
 join. They call the core.
 
-### Why client-side rendering, not just the HTML export
+### Why client-side rendering (no HTML-export shortcut)
 
-The read plane can still expose a server-rendered HTML transcript via `pkg/transcript` +
-`pkg/transcript/html`. That is the **fast shortcut** and a fine Phase-1a milestone. But the target
-is the **event DTO folded by the SDK core and rendered by Svelte**, because the user wants *live*
-streaming into *rich, interactive* chat/tool/code components — which static HTML can't do. The
-state machine that folds the DTO is the client core; the HTML export stays available for a plain
-read-only view and as a rendering-parity oracle in tests.
+Rendering is the **event DTO folded by the SDK core and rendered by Svelte**: the user wants *live*
+streaming into *rich, interactive* chat/tool/code components, which static server-rendered HTML
+can't do. An earlier revision kept a server-rendered `pkg/transcript/html` transcript as a Phase-1a
+shortcut and a render-parity test oracle, but `pkg/transcript` was archived out of harness
+(2026-07-09, headed to `looprig/cli`) and the client must not depend on `looprig/cli` (it drags the
+charm/TUI stack, forbidden above). So there is no HTML shortcut: Phase 1a renders a cold transcript
+by folding the journal DTO through the SDK core, and the contract fixtures (not an HTML oracle)
+guard that folding.
 
 ## Live tail comes from session events, not journal follow
 
@@ -185,13 +204,14 @@ reads as *cold replay from the store up to the tip* (works even if the host is d
 SSE tail* (when a host is reachable). Implementing `EventReplayer.Follow` for a host-independent
 live tail direct from the store is future work, not a v1 blocker.
 
-**Seam integrity — resolved (2026-07-08).** Replay-to-tip-then-attach is exact: harness delivers
-the journal sequence with every live Enduring event (`event.Delivery`, serve §7b — a Phase 0
-harness change), and `serve` stamps live `enduring` SSE frames with `id: <journal_seq>`. The SDK
-core joins losslessly — subscribe and buffer, page `…/journal` to tip `T`, drop buffered frames
-with `journal_seq <= T`, follow live — with no `EventReplayer.Follow` and no server-side fusion
-required. Public SDKs may promise lossless resume once serve Phase 2 (id-stamped frames) lands;
-`ephemeral` frames remain best-effort and self-heal from the next authoritative `enduring` event.
+**Seam integrity — shipped (verified 2026-07-09).** Replay-to-tip-then-attach is exact: harness
+delivers the journal sequence with every live Enduring event (`event.Delivery`, serve §7b), and
+`serve` **already** stamps live `enduring` SSE frames with `id: <journal_seq>` (verified in the
+as-built `pkg/serve/handlers_events.go`). The SDK core joins losslessly — subscribe and buffer,
+page `…/journal` to tip `T`, drop buffered frames with `journal_seq <= T`, follow live — with no
+`EventReplayer.Follow` and no server-side fusion required. Public SDKs can promise lossless resume
+**now** (no pending serve phase); `ephemeral` frames remain best-effort and self-heal from the next
+authoritative `enduring` event.
 
 ## Reference frontend stack
 
@@ -226,11 +246,11 @@ the first-party reference app, not the only supported frontend integration.
 
 ## Deployment modes
 
-| | Read backend | Live/control host | Auth | Binary |
+| | Read plane | Live/control host | Auth | Binary |
 |---|---|---|---|---|
-| **Laptop** | `fsstore` (local dir; no NATS) | local swe on loopback | none (loopback) | one binary, `//go:embed` SPA |
-| **Cloud client** | `natsstore` / `pgstore`+object store (shared) | remote sandbox/cloud `pkg/serve` | bearer + TLS | one binary; BFF holds the token |
-| **Browse-only** | any read backend | — (no host) | read-token only | history + transcripts, no control |
+| **Laptop** | mounted `serve.ReadHandler` over `fsstore` (no NATS) | local swe on loopback | none (loopback) | one binary, `//go:embed` SPA, links `fsstore` |
+| **Cloud client** | **proxied** to remote `serve` read routes (no store linked) | remote sandbox/cloud `pkg/serve` | bearer + TLS | one binary; BFF holds the token; **no storage backend** |
+| **Browse-only** | mounted over a store, or proxied to a runner-less `serve.ReadHandler` | — (no host) | read-token only | history + transcripts, no control |
 
 The client code is identical across all three; only composition-root wiring (backend choice,
 host URL, credentials) differs.
@@ -238,31 +258,44 @@ host URL, credentials) differs.
 - **v1 is single-host.** The BFF proxies live/control to *one* configured host URL. A fleet of
   scale-to-zero sandboxes (one host per session) needs a session→host routing map, which
   nothing owns yet — recorded here as future work, not silently assumed.
-- **Binary composition is honest about deps.** One binary supporting both modes by config
-  links *both* backends — the NATS client rides along unused in local mode. looprig core
-  itself has zero NATS dependency (storekit extraction, in implementation), so if minimal
-  size is a hard goal, build two thin `main`s (or build tags) over the same client package:
-  the laptop binary then links `fsstore` only and contains no NATS at all.
+- **Binary composition is honest about deps.** The read seam (Decision #17) means the cloud/thin
+  binary **proxies** read and links **no** storage backend at all — no NATS "riding along unused,"
+  which the earlier direct-to-store design couldn't avoid. The laptop binary mounts read in-proc and
+  links `fsstore` only (no NATS). A dual-mode convenience binary links whatever backend its mounted
+  mode needs; single-purpose `main`s stay minimal.
 
 ## Auth & security (per CLAUDE.md)
 
 - **Loopback default.** The BFF binds `127.0.0.1` by default; a public bind is opt-in and gated,
   mirroring `pkg/serve`'s public-bind discipline. Fail secure: no host/credentials configured →
   read-only, never a fall-through to control.
+- **Host/Origin validation + anti-DNS-rebinding (Phase 1a).** Loopback binding alone does **not**
+  stop DNS rebinding — a malicious page can rebind a name to `127.0.0.1` and drive the BFF (no CORS
+  preflight fires for simple/same-origin-shaped requests). So the BFF **validates `Host` and
+  `Origin` on every request** — reject any `Host` not in `{127.0.0.1, localhost, [::1]}` (or the
+  configured public host) and any cross-origin `Origin`, before auth — and control POSTs require a
+  per-page-load **CSRF token** the BFF mints into the SPA and checks on submit. This lands with the
+  bind (Phase 1a), not last.
 - **Token stays server-side.** The remote host's bearer token lives only in the BFF process
   (env var / secrets manager — never in code, never shipped to the browser, never logged). The
-  BFF injects it on the proxied leg; the SPA is same-origin and unauthenticated to the host.
+  BFF injects it on the proxied leg; the SPA is same-origin and unauthenticated to the host. The
+  reverse proxy **strips any inbound `Authorization` from the SPA** and injects only the
+  server-side token, so a compromised SPA cannot smuggle credentials upstream.
+- **SSE proxy preserves the resume seam.** The live reverse-proxy **forwards `Last-Event-ID`** on
+  reconnect (and passes the downstream `id:` stamps through) so the client-side lossless join works
+  *through* the BFF exactly as direct-to-serve; it uses a flush loop with an idle deadline, never an
+  unbounded copy.
 - **TLS** to any remote host: `MinVersion: tls.VersionTLS12`, never `InsecureSkipVerify`.
 - **Explicit `http.Server` timeouts** (Read/Write/Idle, `MaxHeaderBytes`) on the BFF; every
-  proxied/store call is `context`-bounded. SSE proxying uses a flush loop with an idle deadline,
-  not an unbounded copy.
-- **Validate at the boundary.** Session IDs are parsed as `uuid.UUID`; `from`/`to` are bounded
-  integers; the reverse proxy forwards only an allowlisted set of paths/methods (never an
-  arbitrary upstream path). Any served file path is `filepath.Clean`'d and confined to the
-  embedded FS.
+  proxied/store call is `context`-bounded.
+- **Validate at the boundary.** Session IDs are parsed as `uuid.UUID`; `from_journal_seq` and
+  `limit` are bounded integers (serve exposes no `to` bound); the reverse proxy forwards only an
+  allowlisted set of paths/methods (never an arbitrary upstream path). Any served file path is
+  `filepath.Clean`'d and confined to the embedded FS.
 - **Typed errors** for every distinct BFF failure (`UpstreamUnavailableError`,
-  `SessionNotFoundError`, `StoreReadError`, …); `errors.As` at call sites; audit auth failures
-  and denied gates without logging payloads/tokens/PII.
+  `SessionNotFoundError`, `StoreReadError`, …); `errors.As` at call sites; audit auth failures and
+  denied gates by **route + sid + decision**, never the body (gate values / input blocks are
+  PII-ish), matching serve's `writeErrorCause` discipline.
 
 ## Repo architecture
 
@@ -271,33 +304,32 @@ github.com/looprig/client
 ├── cmd/
 │   ├── looprig-client/        # dual-mode main (links both backends; convenience)
 │   └── looprig-client-local/  # fsstore-only main — the no-NATS laptop binary
-├── pkg/                       # exported: swe may embed the BFF + SPA (all-in-one dev binary)
-│   ├── bff/                   # BFF library: Handler(cfg, deps) http.Handler / Serve(ctx, …)
-│   │   ├── read/              # mounts harness serve.NewReader + transcript shortcut (no reimplementation)
-│   │   └── proxy/             # live SSE + control reverse-proxy to the host
-│   └── webui/                 # //go:embed of the built SPA + hashed-asset/SPA-fallback handler
-├── internal/                  # app-private helpers (config parsing, logging setup)
+├── pkg/
+│   └── webui/                 # EXPORTED //go:embed of the built SPA + SPA-fallback handler (swe reuse)
+├── internal/                  # app-private (config, logging) — and the BFF itself:
+│   └── bff/                   # read (ReadSource: mounted serve.ReadHandler OR proxy) + live/control proxy
 ├── sdk/                       # npm workspace packages; no Go deps at runtime
-│   ├── core/                  # @looprig/client: DTO/zod, transports, event folding, state machine
-│   ├── svelte/                # @looprig/svelte: Svelte stores/runes over core
-│   └── react/                 # future @looprig/react adapter placeholder / examples
-├── web/                       # SvelteKit app (adapter-static, ssr=false)
+│   ├── core/                  # @looprig/client: DTO types, ajv(schema), transports, folding, state machine
+│   └── svelte/                # @looprig/svelte: Svelte stores/runes over core
+├── app/                       # SvelteKit reference app (adapter-static, ssr=false)
 │   └── src/lib/{routes,transcript,components}/  # imports @looprig/client + @looprig/svelte
-├── contract/                  # serve/BFF protocol schemas + golden DTO/SSE/error fixtures
+├── contract/                  # serve JSON Schema (copied per harness version) + golden DTO/SSE/error fixtures
 ├── docs/plans/ · Makefile · CLAUDE.md · .github/workflows/
 ```
 
-- **`pkg/` is exported deliberately**: the design anticipates swe embedding this SPA for an
-  all-in-one binary; `bff.Handler` + `webui.FS` make that a one-liner, mirroring looprig's
-  `serve.Handler` pattern. Everything without a reuse story stays `internal/`.
+- **`pkg/webui` is the only exported package** (Decision #17): swe's all-in-one binary **is** the
+  host (it has a runner), so it mounts full `serve.Handler` directly and reuses only the **SPA
+  embed** — not the proxying BFF. `webui.FS` is the reuse surface; the BFF (token custody + proxy)
+  stays `internal/bff` until a real second consumer needs it, then it's promoted.
 - **`sdk/core` is the browser/runtime seam.** The Svelte app imports the same core that future
   React/Vue/etc. adapters use; it does not own protocol parsing or history/live folding. This keeps
   framework churn out of the Go BFF and avoids duplicating stream semantics per UI package.
-- **Import discipline (DIP):** only `cmd/` imports a storage backend; the read plane is harness
-  `serve.NewReader` over `serve`'s narrow `Reader` interface (satisfied by the `sessionstore`
-  adapter), and `pkg/bff` adds only its **own** `Host` consumer interface (live SSE +
-  input/resolve/interrupt proxy) satisfied by one `net/http` host client. Interface segregation
-  buys: tests run against memstore-backed adapters + an `httptest` stub host, and
+- **Import discipline (DIP):** only `cmd/` imports a storage backend, and **only** when read is
+  mounted in-proc; the read plane is a `ReadSource` (an `http.Handler`) chosen at composition —
+  either harness `serve.ReadHandler` over the `serve/catalogreader` adapter (mounted) or a reverse
+  proxy to a remote serve (proxied). `internal/bff` adds only its **own** `Host` consumer interface
+  (live SSE + input/resolve/interrupt proxy) satisfied by one `net/http` host client. Interface
+  segregation buys: tests run against memstore-backed adapters + an `httptest` stub host, and
   `Host == nil` ⇒ browse-only mode falls out of the type system (no control routes registered —
   fail secure, not a 403 fall-through).
 - **Config** is a typed struct parsed from env at the composition root only, validated,
@@ -307,44 +339,49 @@ github.com/looprig/client
 
 ### Go↔TS / protocol contract & type generation
 
-Harness `pkg/serve`'s wire types are the **single source of truth** — plain structs, explicit JSON
-tags, a `kind` discriminator, and one typed error envelope; there is no parallel client-side
-`pkg/dto` (Decision #15). Generation never reads harness `pkg/event` directly: that sealed sum
-type evolves with harness, and the serve wire layer is the seam that decouples frontends from it
-(the event→wire mapping is hand-written Go in `pkg/serve` — one `switch` over event types — and
-*is* that seam). Wire types→TypeScript is generated into the framework-neutral SDK core, pinned to
-the imported harness version:
+Harness `pkg/serve` is the **single source of truth** for the wire contract, and it already ships
+that contract as an artifact: a **hand-authored JSON Schema + OpenAPI** under `pkg/serve/testdata/`
+plus **golden JSON/SSE fixtures**, cross-checked in serve's own tests (`schema_test.go`). serve
+authored the schema by hand *deliberately* to stay stdlib-only (CLAUDE.md); the client does **not**
+ask serve to adopt a JSON-Schema generator (Decision #17) — it **consumes serve's shipped schema +
+fixtures**, pinned per harness version:
 
 ```
-harness pkg/serve wire types ──go:generate──► contract/schema/v1.json ──npm run gen──► sdk/core/src/gen.ts
-    (invopop/jsonschema,          (language-neutral                (json-schema-to-zod;
-     reflection, dev tool)         contract artifact)               TS types via z.infer)
+serve testdata/schema/*   ──copy per harness version──► contract/schema/
+serve testdata/fixtures/* ──copy──────────────────────► contract/fixtures/   (shared golden bytes, both repos)
+        │                                          │
+        ├─► TS types:  json-schema-to-ts (type-level FromSchema<…>, no generated file)
+        └─► TS runtime validation:  ajv compiles the schema; the SDK boundary calls validate()
 ```
 
-- zod is the single TS source of truth: runtime **parse** (not cast) at the SDK boundary —
-  validate-at-every-boundary applies to browsers too — with static types inferred.
-- The schema lives beside the **golden fixtures** in `contract/` (one JSON file per event
-  shape, route response, SSE frame, and error envelope). Go tests validate fixtures against the
-  schema; `sdk/core` vitest parses the same fixtures through the generated zod. Drift cannot merge
-  from either direction.
-- CI guard: `make contract` regenerates schema + zod; `git diff --exit-code` fails the build
-  when a harness upgrade changes `pkg/serve` wire types without regeneration. Golden fixtures are
-  sourced from harness `pkg/serve`'s own contract fixtures (serve §7a), so both repos test the
-  same bytes.
-- **Approved deps (2026-07-02):** `github.com/invopop/jsonschema` (Go, dev/tool only) and
-  `json-schema-to-zod` (npm, dev only) — recorded in the client repo's own CLAUDE.md, which
-  inherits looprig's rules and seeds its approved list (looprig, fsstore/natsstore; npm:
-  svelte/vite/shadcn-svelte/AI Elements/virtua/shiki/svelte-exmarkdown/zod). Framework adapter
+- **ajv over the shipped schema — the schema *is* the validator.** Runtime **parse** (not cast) at
+  the SDK boundary — validate-at-every-boundary applies to browsers too — using `ajv` against
+  serve's exact JSON Schema. No `json-schema-to-zod` transpile hop (its `oneOf`/`$ref`/int64-as-
+  string handling is uneven and would need hand-patching); no second hand-written schema. Static
+  types come from `json-schema-to-ts` (`FromSchema<typeof schema>`) — type-level, nothing to rot.
+- **Drift is caught by shared golden fixtures, not a regen guard.** The client copies serve's tagged
+  `testdata/{schema,fixtures}`. Go (in serve) already validates the fixtures against the schema; TS
+  vitest parses the **same** fixture bytes through ajv. A harness wire change breaks a golden fixture
+  → **both** repos fail. This is more robust than a `git diff --exit-code` on generated output, and
+  needs no generator in either repo.
+- **Versioning:** schema + fixtures are pinned to the imported harness version; bumping harness
+  re-copies them and any wire change surfaces as a fixture diff reviewed as a contract change.
+- **Approved deps (client repo):** `ajv` and `json-schema-to-ts` (npm) — recorded in the client
+  repo's own CLAUDE.md, which inherits looprig's rules and seeds its approved list (looprig,
+  fsstore/natsstore; npm: svelte/vite/shadcn-svelte/AI Elements/virtua/shiki/svelte-exmarkdown). No
+  `invopop/jsonschema` (serve owns the schema) and no `json-schema-to-zod`. Framework adapter
   packages add only their framework peer dependency.
 
 ### Build pipeline
 
+- `make contract` → copy serve's tagged `testdata/{schema,fixtures}` into `contract/`; run the
+  fixture-parse conformance (TS ajv + Go). No schema-generation step.
 - `make sdk` → `npm ci && npm run build -w sdk/core -w sdk/svelte` and contract tests.
-- `make web` → `npm ci && vite build` → `pkg/webui/dist/` (**gitignored**; a committed
+- `make app` → `npm ci && vite build` → `pkg/webui/dist/` (**gitignored**; a committed
   one-line placeholder `index.html` keeps `go build`/`vet`/`test` green without Node).
-- `make build` → depends on `sdk web`; `CGO_ENABLED=0 go build -trimpath ./cmd/...`.
+- `make build` → depends on `sdk app`; `CGO_ENABLED=0 go build -trimpath ./cmd/...`.
 - `make secure` → looprig's gauntlet (fmt-check, vet, staticcheck, gosec, govulncheck)
-  **plus** SDK vitest/typecheck, `svelte-check`, and eslint over `web/`.
+  **plus** SDK vitest/typecheck, `svelte-check`, and eslint over `app/`.
 - **Dev loop:** `vite dev` proxying `/api → 127.0.0.1:<bff>`; same-origin in prod, proxied in
   dev — CORS never exists anywhere. Local multi-repo dev via an uncommitted `go.work`.
 - Release tooling (goreleaser vs plain make) is an **open question** — a new tool dep
@@ -355,11 +392,13 @@ harness pkg/serve wire types ──go:generate──► contract/schema/v1.json 
 - Table-driven, `-race` always. The BFF's read handlers test against `storekit/memstore` behind
   `sessionstore` (fast, deterministic, no NATS).
 - Event-DTO codec: a fuzz target (external input → decode) and round-trip tests that the DTO
-  from cold replay and from a live SSE frame are byte-identical for the same event; **parity
-  test** that the DTO renderer and the `pkg/transcript/html` export agree on a corpus.
-- Contract corpus: Go validates `contract/` fixtures against `schema/v1.json`; `sdk/core` vitest
-  parses the same fixtures through the generated zod; CI fails on unregenerated harness
-  `pkg/serve` wire changes (`make contract` + `git diff --exit-code`).
+  from cold replay and from a live SSE frame are byte-identical for the same event. (The former
+  `pkg/transcript/html` render-parity oracle is dropped — that package left harness; the contract
+  fixtures guard the DTO folding instead.)
+- Contract corpus: `sdk/core` vitest parses serve's golden fixtures through **ajv over the shipped
+  schema**; serve's own Go tests already validate those fixtures against the schema. A harness wire
+  change breaks a shared golden fixture → both repos fail (no `git diff --exit-code` regen guard, no
+  generated schema to drift).
 - SDK core: state-machine tests fold cold history pages plus live `enduring` and `ephemeral` frames
   into the same session view regardless of transport. Transport tests cover BFF path prefixes,
   direct `serve` paths, typed error envelopes, aborts, and the exact seam join
@@ -376,30 +415,36 @@ harness pkg/serve wire types ──go:generate──► contract/schema/v1.json 
 
 ## Migration phases (detail in the implementation plan)
 
-- **Phase 0 (prerequisites):** the `pkg/sessionstore` read surface (`Catalog` listing +
-  `OpenEventReplayer`) has **landed**; the remaining hard prerequisites are harness `pkg/serve`
-  Phases 0–2 (the runner-supplied handler, read plane, wire contract, ephemeral frames, and
-  `id`-stamped `enduring` frames per serve §12). The client consumes that contract only —
-  implementation must not start against the legacy `pkg/api`.
+- **Phase 0 (prerequisites):** the `pkg/sessionstore` read surface has **landed**, and harness
+  `pkg/serve` (runner-supplied handler, read plane, wire contract, ephemeral frames, **already**
+  `id`-stamped `enduring` frames, shipped hand-authored schema + golden fixtures) is **built**. The
+  one remaining serve ask is a **`serve.ReadHandler(reads Reader, opts...) http.Handler`** =
+  `newServer[LiveSession](nil, reads, cfg)` registering only `list/status/journal` (plus a reduced
+  `/capabilities` advertising `journal` only) — the existing `serve.Handler[S]` requires a runner
+  the BFF does not have. No schema-generation ask (serve owns the hand-authored schema by design).
+  The client consumes that contract only.
 - **Phase 1 — the client (v1):**
-  - 1a. BFF mounts the serve read plane + transcript shortcut; `contract/` generated from harness
-    serve wire types; `sdk/core` with cold-session listing/history and typed errors.
+  - 1a. BFF binds loopback with the **`Host`/`Origin` + DNS-rebind guard and CSRF from the start**;
+    read plane wired as a `ReadSource` (mounted `serve.ReadHandler` or proxy); `contract/` copied
+    from serve's shipped schema + fixtures; `sdk/core` with cold-session listing/history, ajv
+    validation, and typed errors. (No transcript-HTML shortcut — cold transcript renders via SDK DTO
+    folding.)
   - 1b. Svelte reference shell built on `@looprig/client` + `@looprig/svelte`; lists sessions and
     shows a cold transcript. The Svelte app must not parse raw protocol payloads directly.
-  - 1c. Live plane: SSE reverse-proxy + the SDK's exact history→live seam join; Svelte renders the
-    SDK session state.
-  - 1d. Control plane: input / gates / interrupt / create-restore reverse-proxy; SDK control methods;
-    the interactive chat composer + gate-approval UI.
-  - 1e. Auth + TLS + loopback/public gating; BFF and direct-serve transports; the two deployment
-    modes wired at composition.
+  - 1c. Live plane: SSE reverse-proxy (**forwarding `Last-Event-ID`**) + the SDK's exact history→live
+    seam join over the already-shipped `id:` stamps — **lossless resume ships here**; Svelte renders
+    the SDK session state.
+  - 1d. Control plane: input / gates / interrupt / create-restore reverse-proxy with **token custody
+    (inject server-side token, strip inbound `Authorization`) and fail-secure `Host == nil`
+    browse-only**; TLS to any remote host; SDK control methods; the interactive chat composer +
+    gate-approval UI. The two deployment modes wired at composition.
 - **Phase 2 — workspaces:** once `pkg/workspacestore` exists, add a workspaces/snapshots view
   (list `WorkspaceCheckpointed` refs from the journal; browse snapshot metadata).
 - **Phase 3 — additional framework adapters:** add `@looprig/react` first if demand exists, then
   Vue/Angular/Solid as needed. Each adapter is a small wrapper over `sdk/core`, not a new transport
   implementation.
-- **Phase 4 — retired (2026-07-08):** lossless resume needs no separate phase — the exact sequence
-  join ships with 1c, gated only on serve Phase 2 stamping `id: <journal_seq>` on live `enduring`
-  frames (serve §7b).
+- **Phase 4 — retired:** lossless resume needs no separate phase and no pending serve work — the
+  exact sequence join ships with 1c against the **already-shipped** `id:`-stamped `enduring` frames.
 - **Phase 5 — desktop/mobile:** wrap the *same* static SPA in **Tauri v2** (desktop + iOS/
   Android); it points at a bundled-or-remote BFF. No SPA changes.
 
@@ -420,12 +465,13 @@ harness pkg/serve wire types ──go:generate──► contract/schema/v1.json 
    connection and the remote token; the SPA never holds credentials or hits the host directly.
 6. **Live tail from session events, not `EventReplayer.Follow`** (unimplemented). Cold replay
    for history + SSE for the tail; host-independent store-follow is future work.
-7. **Client-side rich rendering via a versioned event DTO**, with `pkg/transcript` HTML export
-   kept as a shortcut and a rendering-parity oracle.
+7. **Client-side rich rendering via a versioned event DTO.** (The former `pkg/transcript` HTML-export
+   shortcut and its rendering-parity oracle are dropped — that package left harness on 2026-07-09;
+   see Decision #16.)
 8. **Framework-neutral client core, Svelte reference app.** Inspired by Vercel AI SDK's split
    between a stable stream/message protocol and thin framework adapters, Looprig's public frontend
-   boundary is `@looprig/client` (`sdk/core`): generated DTO/zod, transports, event folding, typed
-   errors, and the session state machine. Svelte is still the first-party reference UI because
+   boundary is `@looprig/client` (`sdk/core`): DTO types + ajv validation (Decision #17), transports,
+   event folding, typed errors, and the session state machine. Svelte is still the first-party reference UI because
    shadcn-svelte + Svelte AI Elements give the fastest high-quality dashboard/chat surface, but the
    Svelte app consumes the same core that future React/Vue/Angular/Solid adapters will consume.
    `@ai-sdk/svelte`'s *transport* is **not** adopted — looprig's event stream is its own protocol —
@@ -456,12 +502,14 @@ harness pkg/serve wire types ──go:generate──► contract/schema/v1.json 
     tool), `json-schema-to-zod` (npm dev). zod is the TS source of truth (runtime parse at the SDK
     boundary; types via `z.infer`); golden fixtures + schema validation + CI regen-diff make drift
     unmergeable. *(Superseded in part by #15: the source of truth is harness `pkg/serve` wire
-    types alone — client `pkg/dto` no longer exists.)*
+    types alone — client `pkg/dto` no longer exists. Superseded further by #17: no generator at all —
+    the client consumes serve's shipped hand-authored schema + fixtures and validates with `ajv`;
+    `invopop/jsonschema` and `json-schema-to-zod` are dropped.)*
 15. **Reconciliation to the 2026-07-06 serve contract (2026-07-08).** Paths/params/gate ids
     aligned (`/api/v1/…`, `from_journal_seq`, opaque `{gid}`; the cold read is `…/journal`, the
     live SSE is `…/events`); `GET /api/sessions/{id}` replaced by the serve status projection;
     `DELETE` dropped (serve ships no v1 destroy — UI "stop" = interrupt); the BFF **mounts
-    `serve.NewReader` in-process** instead of reimplementing the read plane (one wire contract,
+    `serve.ReadHandler` in-process** instead of reimplementing the read plane (one wire contract,
     one Go implementation; browse-only mode preserved because the reader runs over the locally
     wired store); client `pkg/dto` deleted — wire-DTO ownership lives in harness `pkg/serve`, and
     `contract/` generates from those types pinned per harness version; the gates snapshot derives
@@ -469,3 +517,57 @@ harness pkg/serve wire types ──go:generate──► contract/schema/v1.json 
     resolved by harness sequenced delivery (serve §7b), so the SDK's history→live join is exact
     and lossless resume ships with serve Phase 2 (client Phase 4 retired); module names corrected
     (`github.com/looprig/fsstore`/`natsstore`, harness/core packages).
+16. **Reconciliation to the as-built `pkg/serve` + transcript archival (2026-07-09).** Five
+    corrections after `pkg/serve` shipped and `pkg/transcript` was archived out of harness:
+    (1) **Read plane needs `serve.ReadHandler`.** As built, `serve.Handler[S](runner Runner[S], reads,
+    …)` welds the read routes onto a mux that *requires* a runner; there is no `serve.NewReader` and
+    no runner-free read handler. The BFF hosts no agent, so it has no runner — it therefore needs a
+    new harness `serve.ReadHandler(reads Reader, opts...) http.Handler` mounting only the stateless
+    read group (list/status/journal). This preserves "one wire contract, one Go implementation" and
+    is honest to serve's own "separate read route group" framing. The concrete read adapter is
+    `serve/catalogreader.New(catalog, store)` behind serve's narrow `Reader` interface.
+    (2) **`transcript.html` shortcut dropped.** `pkg/transcript`/`.../html`/`journalsource` left
+    harness (headed to `looprig/cli`, whose charm/TUI stack the client forbids). The Phase-1a HTML
+    milestone and the render-parity test oracle are removed; cold transcripts render through the
+    SDK's DTO folding, guarded by the contract fixtures.
+    (3) **Schema as code — SUPERSEDED by Decision #17.** (This point had recommended serve
+    `go:generate` its schema with `invopop`. That contradicts serve's deliberate stdlib-only,
+    hand-authored schema; #17 instead consumes serve's shipped schema + fixtures and validates with
+    `ajv` — no generator, no `invopop`, no `json-schema-to-zod`.)
+    (4) **Capabilities negotiation.** The BFF proxies/caches `GET /v1/capabilities`; the SDK reads it
+    to fail fast when the server lacks a feature it requires.
+    (5) **`/gates` is BFF-synthesized.** Serve ships no `/gates` route; the BFF derives the open-gate
+    snapshot from the mounted reader's status `WaitingGateID` + a journal fold — BFF-owned logic on
+    top of `/status` + `/journal`, not a mounted serve route.
+17. **Independent review reconciliation (2026-07-09).** A model-driven review against the as-built
+    `pkg/serve` produced six accepted changes:
+    (1) **Read is a composition-time `ReadSource` seam, not hardcoded direct-to-store.** The read
+    plane is an `http.Handler` chosen at `cmd/`: mounted `serve.ReadHandler` over `catalogreader`
+    (laptop — links a store) **or** a reverse-proxy to a remote serve's stateless read routes
+    (cloud/thin — links **no** storage backend). This structurally deletes the "unused NATS rides
+    along" wart the direct-to-store design couldn't avoid, and makes the cloud client a genuinely
+    thin proxy + SPA host. Browse-only points at a store-backed mounted reader or a runner-less
+    remote `serve.ReadHandler`.
+    (2) **Runtime validation is `ajv` over serve's shipped JSON Schema; drop `json-schema-to-zod`
+    and the "make serve `go:generate`" ask.** serve hand-authored its schema *deliberately* to stay
+    stdlib-only (`schema_test.go` says so) — a consumer must not push it to reverse that. The client
+    consumes serve's shipped `testdata/{schema,fixtures}`, validates with `ajv`, and types via
+    `json-schema-to-ts`. Drift is caught by both repos parsing the same golden fixtures — more robust
+    than a regen `git diff` guard. Supersedes #16(3) and the invopop/zod parts of #14.
+    (3) **Security moves forward.** `Host`/`Origin` validation + DNS-rebind defense + CSRF land in
+    Phase 1a (loopback binding alone does not stop DNS rebinding of a token-holding BFF); token
+    custody + fail-secure browse-only land in 1d; the trailing "1e" is deleted. The SSE proxy
+    forwards `Last-Event-ID` (or resume breaks through the BFF) and strips inbound `Authorization`
+    from the SPA. Audit logs record route + sid + decision, never the body.
+    (4) **De-scope the surface.** Export `pkg/webui` only; keep the BFF `internal/bff` (swe reuses
+    the SPA embed, not the proxy — swe is itself the host). Keep the `sdk/core` ↔ `sdk/svelte` split
+    (it dogfoods the adapter boundary) but drop the empty `sdk/react` placeholder until React is
+    real. `web/` → `app/` (avoid the marketing-site naming collision).
+    (5) **Stale as-built fixes.** `/capabilities` is BFF-**synthesized** (reflects whether a host is
+    wired), not proxied verbatim; `/gates` honestly surfaces the **single** `WaitingGateID` (multiple
+    concurrent gates are out of scope); drop the non-existent `to` journal param; drop all
+    "once serve Phase 2 stamps `id:`" conditional framing — `id:` stamping and the client join are
+    **already shipped**, so lossless resume lands in 1c.
+    (6) **ReadHandler ask stays minimal:** `newServer[LiveSession](nil, reads, cfg)` registering only
+    the three read routes (+ reduced capabilities) — reuses the shipped unexported handlers verbatim,
+    zero new logic, trivially reviewable as a harness PR.
