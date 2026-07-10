@@ -950,6 +950,26 @@ func (s *Session) Submit(ctx context.Context, input []content.Block) (uuid.UUID,
 	return s.submitToLoop(ctx, s.primaryLoopID, input, identity.AgencyUser)
 }
 
+// SubmitToLoop is the loop-targeted counterpart of Submit: it sends human-authored
+// (AgencyUser) input to a SPECIFIC loop's CommandSink rather than the primary. It is the
+// modern viewport's "submit to the FOCUSED loop" primitive — a submit while focused on a
+// subagent runs a NEW turn on THAT loop (accepted: a submit to an idle-but-tracked
+// subagent starts a fresh turn on it), while a submit to the primary loop id behaves
+// exactly like Submit.
+//
+// Like Submit it stamps command.UserInput with Agency=AgencyUser and is FIRE-AND-FORGET:
+// it returns the minted InputID (the Cause.CommandID the resulting Reply events carry on
+// the session fan-in) and a transport error only; the turn outcome —
+// InputQueued / TurnStarted / TurnFoldedInto / TurnRejected / InputCancelled — is observed
+// on the event fan-in, never returned here. The send carries the same escapes as Submit:
+// ctx.Done() → SessionContextDone, the loop's Done → SessionLoopExited, and an unknown
+// loop id → SessionLoopNotFound. On any of those the returned id is the zero UUID, because
+// nothing was sent and there is no correlation to hand back. It delegates to the shared
+// loop-targeted core submitToLoop with AgencyUser, exactly as Submit does for the primary.
+func (s *Session) SubmitToLoop(ctx context.Context, loopID uuid.UUID, blocks []content.Block) (uuid.UUID, error) {
+	return s.submitToLoop(ctx, loopID, blocks, identity.AgencyUser)
+}
+
 // submitToLoop submits a UserInput to a SPECIFIC loop with the given Agency,
 // returning the minted CommandID (correlate Reply events via Cause.CommandID).
 // It is the loop-targeted core of Submit: public Submit is the primary-loop,

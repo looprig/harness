@@ -6,12 +6,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/looprig/harness/pkg/command"
 	"github.com/looprig/core/content"
+	"github.com/looprig/core/uuid"
+	"github.com/looprig/harness/pkg/command"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/loop"
-	"github.com/looprig/core/uuid"
 )
 
 // TestSubmitFireAndForget asserts Submit's fire-and-forget contract end-to-end on
@@ -301,6 +301,99 @@ func TestSubmitToLoopTargetsSubLoop(t *testing.T) {
 	}
 	if ts.Cause.Agency != identity.AgencyMachine {
 		t.Errorf("TurnStarted Cause.Agency = %v, want AgencyMachine", ts.Cause.Agency)
+	}
+}
+
+// TestSubmitToLoop asserts the PUBLIC loop-targeted submit: SubmitToLoop drives a
+// SPECIFIC (non-primary) loop with human (AgencyUser) semantics — the same contract as
+// Submit, but addressed to a caller-chosen loop rather than the primary. A submit to a
+// registered sub-loop lands in THAT loop (the resulting TurnStarted on it carries
+// Cause.CommandID == the returned id and Cause.Agency == AgencyUser); a submit to an
+// unknown loop id fails secure with *SessionError{SessionLoopNotFound} and returns a zero
+// id (nothing sent). It reuses the same real-session scaffolding as
+// TestSubmitToLoopTargetsSubLoop (the internal core's proof).
+func TestSubmitToLoop(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		unknown  bool // target an unregistered loop id instead of the sub-loop
+		wantErr  bool
+		wantKind SessionErrorKind
+	}{
+		{name: "targets the sub-loop with user agency", unknown: false},
+		{name: "unknown loop id returns SessionLoopNotFound", unknown: true, wantErr: true, wantKind: SessionLoopNotFound},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			s, err := New(context.Background(), cfg(&stubLLM{chunks: []content.Chunk{textChunk("hi")}}))
+			if err != nil {
+				t.Fatalf("New: %v", err)
+			}
+			t.Cleanup(func() { _ = s.Shutdown(context.Background()) })
+
+			// A second (non-primary) loop in the same session — the submit target for the
+			// happy path; its parent provenance is the primary loop (a subagent stand-in).
+			subLoopID, err := s.NewLoop(loop.Provenance{LoopID: s.primaryLoopID}, cfg(&stubLLM{chunks: []content.Chunk{textChunk("sub")}}))
+			if err != nil {
+				t.Fatalf("NewLoop: %v", err)
+			}
+
+			if tt.unknown {
+				id, err := s.SubmitToLoop(context.Background(), mustUUID(), []content.Block{&content.TextBlock{Text: "x"}})
+				var se *SessionError
+				if !errors.As(err, &se) || se.Kind != tt.wantKind {
+					t.Fatalf("SubmitToLoop err = %v, want *SessionError{%s}", err, tt.wantKind)
+				}
+				if !id.IsZero() {
+					t.Errorf("SubmitToLoop id = %v on unknown-loop path, want zero (nothing sent)", id)
+				}
+				return
+			}
+
+			// Subscribe to the sub-loop's Enduring events BEFORE submitting, so the resulting
+			// TurnStarted (Enduring, loop-scoped) cannot be missed (the hub has no replay).
+			sub, err := s.SubscribeEvents(event.EventFilter{
+				Enduring: event.LoopScope{Loops: map[uuid.UUID]struct{}{subLoopID: {}}},
+			})
+			if err != nil {
+				t.Fatalf("SubscribeEvents: %v", err)
+			}
+			t.Cleanup(func() { _ = sub.Close() })
+			rec := &recordingSub{}
+			go func() {
+				for d := range sub.Events() {
+					rec.record(d.Event)
+				}
+			}()
+
+			id, err := s.SubmitToLoop(context.Background(), subLoopID, nil)
+			if err != nil {
+				t.Fatalf("SubmitToLoop: %v", err)
+			}
+			if id.IsZero() {
+				t.Fatal("SubmitToLoop returned a zero id, want a fresh non-zero command id")
+			}
+
+			ts, ok := waitTurnStartedOn(rec, subLoopID, 2*time.Second)
+			if !ok {
+				t.Fatal("no TurnStarted observed on the sub-loop via the subscription")
+			}
+			if ts.LoopID != subLoopID {
+				t.Errorf("TurnStarted LoopID = %v, want sub-loop %v", ts.LoopID, subLoopID)
+			}
+			if ts.Cause.CommandID != id {
+				t.Errorf("TurnStarted Cause.CommandID = %v, want returned id %v", ts.Cause.CommandID, id)
+			}
+			// SubmitToLoop is human-authored, so it must stamp AgencyUser — exactly like
+			// Submit, and unlike the AgencyMachine subagent path (submitToLoop core).
+			if ts.Cause.Agency != identity.AgencyUser {
+				t.Errorf("TurnStarted Cause.Agency = %v, want AgencyUser", ts.Cause.Agency)
+			}
+		})
 	}
 }
 
