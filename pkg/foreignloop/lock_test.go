@@ -71,6 +71,32 @@ func TestForeignLockPath(t *testing.T) {
 	}
 }
 
+func TestTemporaryForeignLockNamespaceDoesNotCollideWithDurableSID(t *testing.T) {
+	t.Parallel()
+	const loopID = "00000000-0000-0000-0000-000000000001"
+	cwd := t.TempDir()
+	foreignSID := temporaryForeignLockPrefix + loopID
+
+	temporary, err := acquireTemporaryForeignLock(loopID, cwd)
+	if err != nil {
+		t.Fatalf("acquire temporary lock: %v", err)
+	}
+	t.Cleanup(temporary.release)
+
+	durable, err := acquireForeignLock(foreignSID, cwd)
+	if err != nil {
+		t.Fatalf("acquire durable lock for temporary-looking SID: %v", err)
+	}
+	t.Cleanup(durable.release)
+
+	if temporary.path == durable.path {
+		t.Fatalf("temporary path = durable path = %q, want separate namespaces", temporary.path)
+	}
+	if got, want := durable.path, foreignLockPath(foreignSID, cwd); got != want {
+		t.Fatalf("durable path = %q, want compatible foreignLockPath %q", got, want)
+	}
+}
+
 func TestProcessAlive(t *testing.T) {
 	t.Parallel()
 	dead := deadPID(t)

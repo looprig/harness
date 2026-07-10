@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strconv"
+	"sync"
 	"testing"
 	"time"
 
@@ -135,6 +135,48 @@ func waitForKind(t *testing.T, pub *fakePublisher, kind string) {
 		time.Sleep(2 * time.Millisecond)
 	}
 	t.Fatalf("no %s event published within timeout; got %v", kind, eventKinds(pub.snapshot()))
+}
+
+// waitForKindCount polls until the publisher has recorded want events of kind.
+func waitForKindCount(t *testing.T, pub *fakePublisher, kind string, want int) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		got := 0
+		for _, ev := range pub.snapshot() {
+			if eventKind(ev) == kind {
+				got++
+			}
+		}
+		if got >= want {
+			return
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	t.Fatalf("%s count did not reach %d within timeout; got %v", kind, want, eventKinds(pub.snapshot()))
+}
+
+// waitLoopIdle uses Interrupt's false acknowledgement as the actor-owned idle seam.
+func waitLoopIdle(t *testing.T, l *Loop) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		ack := make(chan bool, 1)
+		select {
+		case l.Commands <- command.Interrupt{Ack: ack}:
+		case <-time.After(2 * time.Second):
+			t.Fatal("timed out probing loop idle state")
+		}
+		select {
+		case active := <-ack:
+			if !active {
+				return
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("idle probe was not acknowledged")
+		}
+	}
+	t.Fatal("loop did not become idle within timeout")
 }
 
 func submitUserInput(t *testing.T, l *Loop, text string) {
@@ -285,44 +327,203 @@ func TestLateBoundSessionPublishesForeignSessionBound(t *testing.T) {
 	shutdown(t, l)
 }
 
-func TestLateBoundFirstTurnUsesCurrentSIDLock(t *testing.T) {
+type orderedLock struct {
+	name  string
+	held  bool
+	trace *[]string
+}
+
+func (l *orderedLock) release() {
+	*l.trace = append(*l.trace, "release "+l.name)
+	l.held = false
+}
+
+type orderedStream struct {
+	events  chan ForeignEvent
+	durable *orderedLock
+	trace   *[]string
+	once    sync.Once
+}
+
+func (s *orderedStream) Events() <-chan ForeignEvent { return s.events }
+func (s *orderedStream) TranscriptPath() string      { return "" }
+func (s *orderedStream) Close() error {
+	s.once.Do(func() {
+		if s.durable.held {
+			*s.trace = append(*s.trace, "close stream while durable held")
+		} else {
+			*s.trace = append(*s.trace, "close stream after durable release")
+		}
+	})
+	return nil
+}
+
+type orderedAgent struct{ stream ForeignStream }
+
+func (a orderedAgent) Spawn(context.Context, ForeignTurn) (ForeignStream, error) {
+	return a.stream, nil
+}
+
+func TestLateBoundTurnLockLifecycleOrder(t *testing.T) {
 	t.Parallel()
-	cwd := t.TempDir()
-	agent := &fakeAgent{
-		transcript: filepath.Join(t.TempDir(), "missing.jsonl"),
-		events: []ForeignEvent{
-			{Kind: ForeignInit, SessionID: "codex-thread-1"},
-			{Kind: ForeignTerminalOK, Message: aiMessage("done")},
+	var trace []string
+	temporary := &orderedLock{name: "temporary", held: true, trace: &trace}
+	durable := &orderedLock{name: "durable", trace: &trace}
+	locks := turnLockOps{
+		acquireTemporary: func(string, string) (turnLock, error) {
+			trace = append(trace, "acquire temporary")
+			return temporary, nil
+		},
+		acquireDurable: func(string, string) (turnLock, error) {
+			trace = append(trace, "acquire durable")
+			durable.held = true
+			return durable, nil
 		},
 	}
-	pub := &fakePublisher{}
-	l, sid := newTestLoop(t, Spec{
-		Agent:   agent,
-		Cwd:     cwd,
-		SIDMode: SIDLateBound,
-	}, pub)
-	if sid != "" {
-		t.Fatalf("initial sid = %q, want empty for late-bound loop", sid)
+	events := make(chan ForeignEvent, 2)
+	events <- ForeignEvent{Kind: ForeignInit, SessionID: "foreign-session"}
+	events <- ForeignEvent{Kind: ForeignTerminalOK}
+	close(events)
+	stream := &orderedStream{events: events, durable: durable, trace: &trace}
+	l := &Loop{spec: Spec{Agent: orderedAgent{stream: stream}, Cwd: t.TempDir()}}
+	result := make(chan turnOutcome, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	pub := func(ev event.Event) {
+		if _, ok := ev.(event.ForeignSessionBound); ok {
+			trace = append(trace, "publish ForeignSessionBound")
+		}
 	}
 
-	preWriteLock(t, sid, cwd, strconv.Itoa(os.Getpid()))
+	go l.driveTurnWithLocks(ctx, cancel, ForeignTurn{}, 1, false, pub, result, locks)
+	select {
+	case <-result:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for turn outcome")
+	}
+	trace = append(trace, "actor receives outcome")
 
-	submitUserInput(t, l, "first")
-	waitForKind(t, pub, "TurnFailed")
+	want := []string{
+		"acquire temporary",
+		"acquire durable",
+		"release temporary",
+		"publish ForeignSessionBound",
+		"close stream while durable held",
+		"release durable",
+		"actor receives outcome",
+	}
+	if !eqStrs(trace, want) {
+		t.Fatalf("lifecycle trace = %v, want %v", trace, want)
+	}
+}
 
-	want := []string{"TurnStarted", "TurnFailed"}
-	if got := eventKinds(pub.snapshot()); !eqStrs(got, want) {
-		t.Fatalf("published sequence = %v, want %v", got, want)
+func TestLateBoundFirstTurnHoldsBoundSIDLock(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+		sid  string
+	}{
+		{name: "bound event implies durable sid is locked", sid: "codex-thread-1"},
 	}
-	tf := findTurnFailed(t, pub)
-	var busy *ForeignSessionBusyError
-	if !errors.As(tf.Err, &busy) {
-		t.Fatalf("TurnFailed.Err = %T %v, want *ForeignSessionBusyError", tf.Err, tf.Err)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			cwd := t.TempDir()
+			agent := &fakeAgent{
+				transcript: filepath.Join(t.TempDir(), "missing.jsonl"),
+				block:      true,
+				events: []ForeignEvent{
+					{Kind: ForeignInit, SessionID: tt.sid},
+				},
+			}
+			pub := &fakePublisher{}
+			l, _ := newTestLoop(t, Spec{Agent: agent, Cwd: cwd, SIDMode: SIDLateBound}, pub)
+
+			submitUserInput(t, l, "first")
+			waitForKind(t, pub, "ForeignSessionBound")
+
+			lk, err := acquireForeignLock(tt.sid, cwd)
+			if lk != nil {
+				lk.release()
+			}
+			var busy *ForeignSessionBusyError
+			if !errors.As(err, &busy) {
+				t.Fatalf("bound sid acquire err = %T %v, want *ForeignSessionBusyError", err, err)
+			}
+			shutdown(t, l)
+		})
 	}
-	if agent.calls() != 0 {
-		t.Fatalf("agent spawned %d times under a busy empty-sid lock, want 0", agent.calls())
+}
+
+func TestLateBoundFirstTurnsUseIndependentTemporaryLocks(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name      string
+		firstSID  string
+		secondSID string
+	}{
+		{name: "same cwd loops bind different sessions concurrently", firstSID: "codex-thread-1", secondSID: "codex-thread-2"},
 	}
-	shutdown(t, l)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			cwd := t.TempDir()
+			firstAgent := &fakeAgent{block: true, events: []ForeignEvent{{Kind: ForeignInit, SessionID: tt.firstSID}}}
+			secondAgent := &fakeAgent{block: true, events: []ForeignEvent{{Kind: ForeignInit, SessionID: tt.secondSID}}}
+			firstPub := &fakePublisher{}
+			secondPub := &fakePublisher{}
+			first, _ := newTestLoop(t, Spec{Agent: firstAgent, Cwd: cwd, SIDMode: SIDLateBound}, firstPub)
+			second, _ := newTestLoop(t, Spec{Agent: secondAgent, Cwd: cwd, SIDMode: SIDLateBound}, secondPub)
+
+			submitUserInput(t, first, "first")
+			waitForKind(t, firstPub, "ForeignSessionBound")
+			submitUserInput(t, second, "second")
+			waitForKind(t, secondPub, "ForeignSessionBound")
+
+			shutdown(t, first)
+			shutdown(t, second)
+		})
+	}
+}
+
+func TestLateBoundLockTransitionFailurePersistsSID(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+		sid  string
+	}{
+		{name: "busy durable sid fails turn after recording learned sid", sid: "codex-thread-busy"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			cwd := t.TempDir()
+			preWriteLock(t, tt.sid, cwd, fmt.Sprint(os.Getpid()))
+			agent := &fakeAgent{block: true, events: []ForeignEvent{{Kind: ForeignInit, SessionID: tt.sid}}}
+			pub := &fakePublisher{}
+			l, _ := newTestLoop(t, Spec{Agent: agent, Cwd: cwd, SIDMode: SIDLateBound}, pub)
+
+			submitUserInput(t, l, "first")
+			waitForKind(t, pub, "TurnFailed")
+
+			want := []string{"TurnStarted", "ForeignSessionBound", "TurnFailed"}
+			if got := eventKinds(pub.snapshot()); !eqStrs(got, want) {
+				t.Fatalf("published sequence = %v, want %v", got, want)
+			}
+			var busy *ForeignSessionBusyError
+			if tf := findTurnFailed(t, pub); !errors.As(tf.Err, &busy) {
+				t.Fatalf("TurnFailed.Err = %T %v, want *ForeignSessionBusyError", tf.Err, tf.Err)
+			}
+
+			waitLoopIdle(t, l)
+			submitUserInput(t, l, "resume")
+			waitForKindCount(t, pub, "TurnFailed", 2)
+			if agent.calls() != 1 {
+				t.Fatalf("agent spawned %d times, want 1 (resume must use learned busy sid before spawn)", agent.calls())
+			}
+			shutdown(t, l)
+		})
+	}
 }
 
 func TestSpawnFailureTurnFailed(t *testing.T) {

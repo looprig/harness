@@ -30,6 +30,36 @@ type turnOutcome struct {
 	boundSID    string
 }
 
+// drainedTurn is the stream drain's hand-back to driveTurn. bindErr is separate from
+// termErr because a failed lock transition must stop before transcript commit, while
+// a foreign terminal error still commits the transcript-derived assistant history.
+type drainedTurn struct {
+	assistant []*content.AIMessage
+	boundSID  string
+	termErr   error
+	bindErr   error
+}
+
+type turnLock interface {
+	release()
+}
+
+type turnLockOps struct {
+	acquireTemporary func(loopID, cwd string) (turnLock, error)
+	acquireDurable   func(sid, cwd string) (turnLock, error)
+}
+
+func productionTurnLockOps() turnLockOps {
+	return turnLockOps{
+		acquireTemporary: func(loopID, cwd string) (turnLock, error) {
+			return acquireTemporaryForeignLock(loopID, cwd)
+		},
+		acquireDurable: func(sid, cwd string) (turnLock, error) {
+			return acquireForeignLock(sid, cwd)
+		},
+	}
+}
+
 // runTurn drives one foreign turn from a UserInput submit. It runs ON the actor
 // goroutine: it mints the turn/step ids, publishes TurnStarted BEFORE Spawn, launches
 // the turn goroutine (driveTurn), and then takes over the actor's select via awaitTurn
@@ -169,8 +199,21 @@ func (l *Loop) applyBoundSID(boundSID string) {
 // touches actor-owned state; pub touches only immutable loop fields.
 func (l *Loop) driveTurn(turnCtx context.Context, cancel context.CancelFunc, ft ForeignTurn,
 	cur event.TurnIndex, sidBound bool, pub func(event.Event), result chan turnOutcome) {
+	l.driveTurnWithLocks(turnCtx, cancel, ft, cur, sidBound, pub, result, productionTurnLockOps())
+}
+
+func (l *Loop) driveTurnWithLocks(turnCtx context.Context, cancel context.CancelFunc, ft ForeignTurn,
+	cur event.TurnIndex, sidBound bool, pub func(event.Event), result chan turnOutcome, locks turnLockOps) {
 	defer cancel()
-	lk, err := acquireForeignLock(ft.ForeignSID, l.spec.Cwd)
+	var (
+		lk  turnLock
+		err error
+	)
+	if sidBound {
+		lk, err = locks.acquireDurable(ft.ForeignSID, l.spec.Cwd)
+	} else {
+		lk, err = locks.acquireTemporary(l.loopID.String(), l.spec.Cwd)
+	}
 	if err != nil {
 		// A live process already drives this (sid,cwd) Claude session (or the lock I/O
 		// failed): refuse to spawn a second driver that would corrupt the transcript.
@@ -180,69 +223,87 @@ func (l *Loop) driveTurn(turnCtx context.Context, cancel context.CancelFunc, ft 
 		result <- turnOutcome{}
 		return
 	}
-	defer lk.release()
+	var outcome turnOutcome
+	defer func() { result <- outcome }()
+	defer func() { lk.release() }()
 	stream, err := l.spec.Agent.Spawn(turnCtx, ft)
 	if err != nil {
 		// Spawn never came up: TurnStarted was already published, so the turn is closed
 		// with TurnFailed. The agent never spawned, so hasSpawned stays false (the next
 		// turn retries StartNew). Nothing is committed.
 		pub(event.TurnFailed{TurnIndex: cur, Err: &SpawnError{Cause: err}})
-		result <- turnOutcome{}
 		return
 	}
 	defer func() { _ = stream.Close() }()
 
-	assistant, boundSID, termErr := l.drainStream(stream, cur, sidBound, ft.ForeignSID, pub)
+	bindSID := func(sid string) error {
+		boundLock, err := locks.acquireDurable(sid, l.spec.Cwd)
+		if err != nil {
+			return err
+		}
+		lk.release()
+		lk = boundLock
+		return nil
+	}
+	drained := l.drainStream(stream, cur, sidBound, ft.ForeignSID, bindSID, pub)
+	if drained.bindErr != nil {
+		pub(event.TurnFailed{TurnIndex: cur, Err: drained.bindErr})
+		outcome = turnOutcome{spawned: true, boundSID: drained.boundSID}
+		return
+	}
 	if turnCtx.Err() != nil {
-		result <- turnOutcome{interrupted: true, spawned: true, boundSID: boundSID}
+		outcome = turnOutcome{interrupted: true, spawned: true, boundSID: drained.boundSID}
 		return
 	}
-	committed := l.commitTurn(stream.TranscriptPath(), cur, assistant, pub)
-	if termErr != nil {
-		pub(event.TurnFailed{TurnIndex: cur, Err: termErr})
-		result <- turnOutcome{committed: committed, spawned: true, boundSID: boundSID}
+	committed := l.commitTurn(stream.TranscriptPath(), cur, drained.assistant, pub)
+	if drained.termErr != nil {
+		pub(event.TurnFailed{TurnIndex: cur, Err: drained.termErr})
+		outcome = turnOutcome{committed: committed, spawned: true, boundSID: drained.boundSID}
 		return
 	}
-	pub(event.TurnDone{TurnIndex: cur, Message: lastOf(assistant)})
-	result <- turnOutcome{committed: committed, success: true, spawned: true, boundSID: boundSID}
+	pub(event.TurnDone{TurnIndex: cur, Message: lastOf(drained.assistant)})
+	outcome = turnOutcome{committed: committed, success: true, spawned: true, boundSID: drained.boundSID}
 }
 
 // drainStream consumes the live foreign stream. The mapper translates ONLY the live
 // Ephemeral events (token/tool deltas), which are published immediately; the
 // authoritative assistant rounds are collected for the commit phase (the transcript
-// is authoritative, so a live StepDone is intentionally NOT published). It returns the
-// collected assistant messages, any newly bound sid, and any terminal-error cause
-// reported on the stream.
-func (l *Loop) drainStream(stream ForeignStream, cur event.TurnIndex, sidBound bool, expectedSID string, pub func(event.Event)) ([]*content.AIMessage, string, error) {
+// is authoritative, so a live StepDone is intentionally NOT published). A newly
+// learned sid is transitioned to its durable lock before its bound event is visible.
+func (l *Loop) drainStream(stream ForeignStream, cur event.TurnIndex, sidBound bool,
+	expectedSID string, bindSID func(string) error, pub func(event.Event)) drainedTurn {
 	m := newMapper(cur, l.idGen)
-	var assistant []*content.AIMessage
-	var boundSID string
-	var termErr error
+	var out drainedTurn
 	for fe := range stream.Events() {
 		switch fe.Kind {
 		case ForeignInit:
-			if fe.SessionID != "" && !sidBound && boundSID == "" {
-				boundSID = fe.SessionID
+			if fe.SessionID != "" && !sidBound && out.boundSID == "" {
+				out.boundSID = fe.SessionID
 				expectedSID = fe.SessionID
+				if err := bindSID(fe.SessionID); err != nil {
+					pub(event.ForeignSessionBound{ForeignSID: fe.SessionID})
+					out.bindErr = err
+					return out
+				}
 				pub(event.ForeignSessionBound{ForeignSID: fe.SessionID})
 			} else if fe.SessionID != "" && fe.SessionID != expectedSID {
 				slog.Warn("foreignloop: foreign session id mismatch", "want", expectedSID, "got", fe.SessionID)
 			}
 		case ForeignStepComplete:
 			if fe.Message != nil {
-				assistant = append(assistant, fe.Message)
+				out.assistant = append(out.assistant, fe.Message)
 			}
 		case ForeignTerminalOK:
 			if fe.Message != nil {
-				assistant = append(assistant, fe.Message)
+				out.assistant = append(out.assistant, fe.Message)
 			}
 		case ForeignTerminalError:
-			termErr = &ForeignResultError{Detail: fe.ErrText}
+			out.termErr = &ForeignResultError{Detail: fe.ErrText}
 		default:
 			l.publishMapped(m, fe, pub)
 		}
 	}
-	return assistant, boundSID, termErr
+	return out
 }
 
 // publishMapped maps one live foreign event to its Ephemeral looprig events and

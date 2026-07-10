@@ -32,6 +32,15 @@ type foreignLock struct {
 	path string
 }
 
+const temporaryForeignLockPrefix = "unbound-"
+
+// temporaryForeignLockPath is the loop-unique lock path used before a late-bound
+// agent reports its durable session id. Its subtree is structurally separate from
+// durable SID locks, so no foreign SID can collide with a temporary lock key.
+func temporaryForeignLockPath(loopID, cwd string) string {
+	return filepath.Join(os.TempDir(), "looprig-foreign", "temporary", hash12(cwd)+"-"+loopID+".lock")
+}
+
 // foreignLockPath is the DETERMINISTIC per-(sid,cwd) lockfile path. The cwd is cleaned
 // and hashed (first 12 hex of sha256) so the path is stable, filesystem-safe, and lives
 // under a dedicated tempdir subtree that never collides with Claude's own session
@@ -55,7 +64,18 @@ func hash12(cwd string) string {
 // loses the race it is treated as busy (fail-secure: never loop, never steal a live
 // holder's lock).
 func acquireForeignLock(sid, cwd string) (*foreignLock, error) {
-	path := foreignLockPath(sid, cwd)
+	return acquireForeignLockPath(foreignLockPath(sid, cwd), sid, cwd)
+}
+
+func acquireTemporaryForeignLock(loopID, cwd string) (*foreignLock, error) {
+	return acquireForeignLockPath(
+		temporaryForeignLockPath(loopID, cwd),
+		temporaryForeignLockPrefix+loopID,
+		cwd,
+	)
+}
+
+func acquireForeignLockPath(path, sid, cwd string) (*foreignLock, error) {
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, &LockError{Op: "mkdir", Path: dir, Cause: err}
