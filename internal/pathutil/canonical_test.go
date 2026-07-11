@@ -14,10 +14,41 @@ func TestCanonicalize(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		name    string
-		setup   func(t *testing.T) (paths []string, want []string)
-		wantErr bool
+		name         string
+		setup        func(t *testing.T) (paths []string, want []string)
+		wantErr      bool
+		wantNotExist bool
 	}{
+		{
+			name: "filesystem root",
+			setup: func(t *testing.T) ([]string, []string) {
+				root := string(os.PathSeparator)
+				want, err := filepath.EvalSymlinks(root)
+				if err != nil {
+					t.Fatalf("EvalSymlinks(%q): %v", root, err)
+				}
+				return []string{root}, []string{want}
+			},
+		},
+		{
+			name: "relative existing input",
+			setup: func(t *testing.T) ([]string, []string) {
+				cwd, err := os.Getwd()
+				if err != nil {
+					t.Fatalf("Getwd(): %v", err)
+				}
+				target := t.TempDir()
+				relative, err := filepath.Rel(cwd, target)
+				if err != nil {
+					t.Fatalf("Rel(%q, %q): %v", cwd, target, err)
+				}
+				want, err := filepath.EvalSymlinks(target)
+				if err != nil {
+					t.Fatalf("EvalSymlinks(%q): %v", target, err)
+				}
+				return []string{relative}, []string{want}
+			},
+		},
 		{
 			name: "existing paths are sorted and deduplicated",
 			setup: func(t *testing.T) ([]string, []string) {
@@ -62,6 +93,18 @@ func TestCanonicalize(t *testing.T) {
 				}
 				return []string{filepath.Join(alias, "tail")}, nil
 			},
+			wantErr:      true,
+			wantNotExist: true,
+		},
+		{
+			name: "regular file ancestor fails closed",
+			setup: func(t *testing.T) ([]string, []string) {
+				file := filepath.Join(t.TempDir(), "file")
+				if err := os.WriteFile(file, []byte("x"), 0o600); err != nil {
+					t.Fatalf("WriteFile(%q): %v", file, err)
+				}
+				return []string{filepath.Join(file, "tail")}, nil
+			},
 			wantErr: true,
 		},
 	}
@@ -80,7 +123,7 @@ func TestCanonicalize(t *testing.T) {
 				if !errors.As(err, &pathErr) {
 					t.Fatalf("Canonicalize() err = %T %v, want *CanonicalPathError", err, err)
 				}
-				if !errors.Is(err, fs.ErrNotExist) {
+				if tt.wantNotExist && !errors.Is(err, fs.ErrNotExist) {
 					t.Errorf("errors.Is(err, fs.ErrNotExist) = false, want true")
 				}
 				return

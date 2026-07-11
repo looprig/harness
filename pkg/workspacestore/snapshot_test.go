@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sync/atomic"
 	"testing"
 
@@ -32,6 +33,25 @@ func (c *countingBlobs) Put(ctx context.Context, key string, r io.Reader) error 
 type failPutBlobs struct {
 	storage.Blobs
 	err error
+}
+
+// spoolRecordingBlobs records the directory of the actual *os.File Snapshot
+// passes to Put, while optionally reporting provider persistence paths.
+type spoolRecordingBlobs struct {
+	storage.Blobs
+	paths  []string
+	putDir string
+}
+
+func (b *spoolRecordingBlobs) Put(ctx context.Context, key string, r io.Reader) error {
+	if file, ok := r.(*os.File); ok {
+		b.putDir = filepath.Dir(file.Name())
+	}
+	return b.Blobs.Put(ctx, key, r)
+}
+
+func (b *spoolRecordingBlobs) StoragePaths() []string {
+	return append([]string(nil), b.paths...)
 }
 
 func (f *failPutBlobs) Put(ctx context.Context, key string, r io.Reader) error {
@@ -87,6 +107,104 @@ func TestOpen(t *testing.T) {
 			}
 			if s == nil {
 				t.Fatal("Open() returned nil Store without error")
+			}
+		})
+	}
+}
+
+func TestSpoolDirFrozenAtOpen(t *testing.T) {
+	tests := []struct {
+		name  string
+		setup func(t *testing.T) (opts []Option, providerPaths []string, mutate func(t *testing.T), want string)
+	}{
+		{
+			name: "relative explicit spool survives chdir",
+			setup: func(t *testing.T) ([]Option, []string, func(*testing.T), string) {
+				original, err := os.Getwd()
+				if err != nil {
+					t.Fatalf("Getwd(): %v", err)
+				}
+				t.Cleanup(func() {
+					if err := os.Chdir(original); err != nil {
+						t.Errorf("restore working directory: %v", err)
+					}
+				})
+
+				openDir := t.TempDir()
+				spool := filepath.Join(openDir, "spool")
+				if err := os.Mkdir(spool, 0o700); err != nil {
+					t.Fatalf("Mkdir(%q): %v", spool, err)
+				}
+				if err := os.Chdir(openDir); err != nil {
+					t.Fatalf("Chdir(%q): %v", openDir, err)
+				}
+
+				afterDir := t.TempDir()
+				if err := os.Mkdir(filepath.Join(afterDir, "spool"), 0o700); err != nil {
+					t.Fatalf("Mkdir(after spool): %v", err)
+				}
+				want, err := filepath.EvalSymlinks(spool)
+				if err != nil {
+					t.Fatalf("EvalSymlinks(%q): %v", spool, err)
+				}
+				return []Option{WithSpoolDir("spool")}, nil, func(t *testing.T) {
+					if err := os.Chdir(afterDir); err != nil {
+						t.Fatalf("Chdir(%q): %v", afterDir, err)
+					}
+				}, want
+			},
+		},
+		{
+			name: "default spool survives TMPDIR change",
+			setup: func(t *testing.T) ([]Option, []string, func(*testing.T), string) {
+				openTemp := t.TempDir()
+				afterTemp := t.TempDir()
+				t.Setenv("TMPDIR", openTemp)
+				want, err := filepath.EvalSymlinks(openTemp)
+				if err != nil {
+					t.Fatalf("EvalSymlinks(%q): %v", openTemp, err)
+				}
+				return nil, nil, func(t *testing.T) {
+					t.Setenv("TMPDIR", afterTemp)
+				}, want
+			},
+		},
+		{
+			name: "explicit spool deduplicates with provider",
+			setup: func(t *testing.T) ([]Option, []string, func(*testing.T), string) {
+				spool := t.TempDir()
+				want, err := filepath.EvalSymlinks(spool)
+				if err != nil {
+					t.Fatalf("EvalSymlinks(%q): %v", spool, err)
+				}
+				return []Option{WithSpoolDir(spool)}, []string{spool}, func(*testing.T) {}, want
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			opts, providerPaths, mutate, want := tt.setup(t)
+			blobs := &spoolRecordingBlobs{Blobs: memstore.New().Blobs, paths: providerPaths}
+			store, err := Open(blobs, opts...)
+			if err != nil {
+				t.Fatalf("Open(): %v", err)
+			}
+			mutate(t)
+
+			paths, err := store.PersistencePaths()
+			if err != nil {
+				t.Fatalf("PersistencePaths(): %v", err)
+			}
+			if !reflect.DeepEqual(paths, []string{want}) {
+				t.Errorf("PersistencePaths() = %v, want [%q]", paths, want)
+			}
+
+			if _, err := store.Snapshot(context.Background(), t.TempDir()); err != nil {
+				t.Errorf("Snapshot(): %v", err)
+			}
+			if blobs.putDir != want {
+				t.Errorf("Snapshot temp dir = %q, want frozen %q", blobs.putDir, want)
 			}
 		})
 	}

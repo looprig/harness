@@ -3,6 +3,7 @@ package workspacestore
 import (
 	"errors"
 	"os"
+	"sort"
 	"strconv"
 
 	"github.com/looprig/harness/internal/pathutil"
@@ -35,8 +36,8 @@ const defaultMaxBytes int64 = 8 << 30
 type Options struct {
 	// SpoolDir is the directory in which Snapshot creates its spool temp file. The
 	// zero value (empty string) selects the operating system's default temp
-	// directory. A large working set is spooled here in full, so point it at a
-	// volume with room for one archive.
+	// directory. Open resolves it once to a canonical absolute path. A large working
+	// set is spooled here in full, so point it at a volume with room for one archive.
 	SpoolDir string
 
 	// MaxEntries caps how many entries Materialize will read from a snapshot
@@ -81,7 +82,8 @@ func WithMaxBytes(n int64) Option {
 // Open returns a Store over the given Blobs backend with opts applied. A nil
 // backend is rejected up front with *NilBlobsError — a Store has nowhere to put
 // snapshot bytes without one, so Open fails closed rather than hand back a Store
-// that panics on first Snapshot.
+// that panics on first Snapshot. The effective spool directory is canonicalized
+// and frozen here; an ambiguous path returns *PersistencePathError.
 func Open(b storage.Blobs, opts ...Option) (*Store, error) {
 	if b == nil {
 		return nil, &NilBlobsError{}
@@ -96,6 +98,15 @@ func Open(b storage.Blobs, opts ...Option) (*Store, error) {
 	if o.MaxBytes <= 0 {
 		o.MaxBytes = defaultMaxBytes
 	}
+	spoolDir := o.SpoolDir
+	if spoolDir == "" {
+		spoolDir = os.TempDir()
+	}
+	spoolPaths, err := pathutil.Canonicalize([]string{spoolDir})
+	if err != nil {
+		return nil, newPersistencePathError(err)
+	}
+	o.SpoolDir = spoolPaths[0]
 	return &Store{blobs: b, opts: o}, nil
 }
 
@@ -109,17 +120,20 @@ func (s *Store) PersistencePaths() ([]string, error) {
 	if ok {
 		reported = append(reported, reporter.StoragePaths()...)
 	}
-	spoolDir := s.opts.SpoolDir
-	if spoolDir == "" {
-		spoolDir = os.TempDir()
-	}
-	reported = append(reported, spoolDir)
-
 	paths, err := pathutil.Canonicalize(reported)
 	if err != nil {
 		return nil, newPersistencePathError(err)
 	}
-	return paths, nil
+	paths = append(paths, s.opts.SpoolDir)
+	sort.Strings(paths)
+
+	result := paths[:0]
+	for _, path := range paths {
+		if len(result) == 0 || result[len(result)-1] != path {
+			result = append(result, path)
+		}
+	}
+	return result, nil
 }
 
 // PersistencePathError reports a local persistence path that could not be

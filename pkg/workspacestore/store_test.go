@@ -199,17 +199,12 @@ func TestPersistencePathsIncludesSpool(t *testing.T) {
 	}
 	missingTail := filepath.Join(alias, "missing", "tail")
 	wantMissingTail := filepath.Join(wantTarget, "missing", "tail")
-	broken := filepath.Join(t.TempDir(), "broken-spool")
-	if err := os.Symlink(filepath.Join(t.TempDir(), "absent"), broken); err != nil {
-		t.Fatalf("Symlink(broken spool): %v", err)
-	}
 
 	tests := []struct {
-		name    string
-		blobs   storage.Blobs
-		opts    []Option
-		want    []string
-		wantErr bool
+		name  string
+		blobs storage.Blobs
+		opts  []Option
+		want  []string
 	}{
 		{
 			name:  "explicit spool",
@@ -243,12 +238,6 @@ func TestPersistencePathsIncludesSpool(t *testing.T) {
 			opts:  []Option{WithSpoolDir(missingTail)},
 			want:  []string{wantMissingTail},
 		},
-		{
-			name:    "broken spool symlink fails closed",
-			blobs:   memstore.New().Blobs,
-			opts:    []Option{WithSpoolDir(filepath.Join(broken, "tail"))},
-			wantErr: true,
-		},
 	}
 
 	for _, tt := range tests {
@@ -260,21 +249,47 @@ func TestPersistencePathsIncludesSpool(t *testing.T) {
 				t.Fatalf("Open() err = %v", err)
 			}
 			got, err := st.PersistencePaths()
-			if (err != nil) != tt.wantErr {
-				t.Fatalf("PersistencePaths() err = %v, wantErr %v", err, tt.wantErr)
-			}
-			if tt.wantErr {
-				var pathErr *PersistencePathError
-				if !errors.As(err, &pathErr) {
-					t.Fatalf("PersistencePaths() err = %T %v, want *PersistencePathError", err, err)
-				}
-				if got != nil {
-					t.Errorf("PersistencePaths() paths = %v on error, want nil", got)
-				}
-				return
+			if err != nil {
+				t.Fatalf("PersistencePaths() err = %v", err)
 			}
 			if !reflect.DeepEqual(got, tt.want) {
 				t.Errorf("PersistencePaths() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestOpenRejectsAmbiguousSpool(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name  string
+		spool func(t *testing.T) string
+	}{
+		{
+			name: "broken spool symlink",
+			spool: func(t *testing.T) string {
+				base := t.TempDir()
+				broken := filepath.Join(base, "broken-spool")
+				if err := os.Symlink(filepath.Join(base, "absent"), broken); err != nil {
+					t.Fatalf("Symlink(broken spool): %v", err)
+				}
+				return filepath.Join(broken, "tail")
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			store, err := Open(memstore.New().Blobs, WithSpoolDir(tt.spool(t)))
+			var pathErr *PersistencePathError
+			if !errors.As(err, &pathErr) {
+				t.Fatalf("Open() err = %T %v, want *PersistencePathError", err, err)
+			}
+			if store != nil {
+				t.Errorf("Open() store = %v on error, want nil", store)
 			}
 		})
 	}
