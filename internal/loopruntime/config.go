@@ -10,14 +10,41 @@ import (
 	"github.com/looprig/inference"
 )
 
-// configFromBound resolves the immutable public contract into actor-private wiring.
+// configFromBound resolves the immutable public contract into actor-private wiring for the
+// CONSTRUCTION default: an EMPTY modeName is remapped to the definition's initial mode,
+// because a freshly-built (or restored-without-a-change) loop starts at its initial mode.
+// The runtime SetMode change path must NOT remap — there "" names the base mode — so it
+// calls configForMode directly (exact resolution).
 func configFromBound(bound loop.BoundDefinition, modeName loop.ModeName) (runtimeConfig, error) {
-	if bound == nil || (reflect.ValueOf(bound).Kind() == reflect.Ptr && reflect.ValueOf(bound).IsNil()) {
-		return runtimeConfig{}, &loop.BindError{Kind: loop.BindInvalidDefinition, Index: -1}
+	if err := requireBound(bound); err != nil {
+		return runtimeConfig{}, err
 	}
 	if modeName == "" {
 		modeName = bound.InitialMode()
 	}
+	// bound is already validated; resolve directly (no redundant re-check via configForMode).
+	return resolveMode(bound, modeName)
+}
+
+// configForMode resolves the actor-private wiring for the mode named EXACTLY modeName, with
+// no ""→initial remap: "" selects the definition's base mode (base system/model/tools), a
+// named mode selects that mode, and an unknown name fails with a typed BindError. It is the
+// runtime SetMode resolver — resolving by exact name is what keeps the selected label, the
+// emitted LoopModeChanged, and the applied effective config mutually consistent (so
+// SetMode("") reaches the reachable base mode rather than silently resolving the initial
+// mode's config under a "" label).
+func configForMode(bound loop.BoundDefinition, modeName loop.ModeName) (runtimeConfig, error) {
+	if err := requireBound(bound); err != nil {
+		return runtimeConfig{}, err
+	}
+	return resolveMode(bound, modeName)
+}
+
+// resolveMode is the shared, already-bound-checked resolver behind configFromBound (after
+// its ""→initial remap) and configForMode (exact). It selects the BoundMode by exact name
+// and builds the actor wiring, composing the SELECTED mode's system via the single exported
+// loop.EffectiveSystem (so live turns and restore folds compose it byte-for-byte identically).
+func resolveMode(bound loop.BoundDefinition, modeName loop.ModeName) (runtimeConfig, error) {
 	mode, ok := bound.Mode(modeName)
 	if !ok {
 		return runtimeConfig{}, &loop.BindError{Kind: loop.BindInvalidDefinition, Name: string(modeName), Index: -1}
@@ -25,10 +52,20 @@ func configFromBound(bound loop.BoundDefinition, modeName loop.ModeName) (runtim
 	model := mode.Model
 	limits := mode.ToolLimits
 	return runtimeConfig{
-		Client: bound.Client(), Model: model, System: bound.EffectiveSystem(), DrainTimeout: bound.DrainTimeout(),
+		Client: bound.Client(), Model: model, System: loop.EffectiveSystem(bound.System(), mode.Instructions), DrainTimeout: bound.DrainTimeout(),
 		AgentName: bound.Name(), Engine: bound.Engine(), RuntimeContext: bound.RuntimeContext(),
 		Tools: ToolSet{Permission: bound.Permission(), Registry: mode.Tools, Middlewares: bound.Middlewares(), MaxToolIterations: limits.Iterations, MaxToolCallsPerTurn: limits.Calls, MaxParallelToolCalls: limits.Parallel},
 	}, nil
+}
+
+// requireBound rejects a nil (or typed-nil) bound definition with a typed BindError. The
+// raw-config test path (newWithConfig) carries no bound, so a SetMode there resolves through
+// this to ChangeInvalidMode — a modeless loop has no predeclared modes to select.
+func requireBound(bound loop.BoundDefinition) error {
+	if bound == nil || (reflect.ValueOf(bound).Kind() == reflect.Ptr && reflect.ValueOf(bound).IsNil()) {
+		return &loop.BindError{Kind: loop.BindInvalidDefinition, Index: -1}
+	}
+	return nil
 }
 
 // runtimeConfig is frozen actor wiring resolved from one BoundDefinition.

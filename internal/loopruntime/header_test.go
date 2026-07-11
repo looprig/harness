@@ -10,7 +10,7 @@ import (
 )
 
 // TestWithLoopHeaderStampsEveryEnduringType is the EXHAUSTIVE guard on
-// withLoopHeader: it runs ONE instance of each of the 11 Enduring loop-scoped
+// withLoopHeader: it runs ONE instance of each of the 13 Enduring loop-scoped
 // event types through withLoopHeader(ev, h) with a known non-zero h and asserts
 // the write-back actually took — EventID + CreatedAt (the minted persistence
 // identity) AND the Coordinates/Cause carried by h all land on the returned
@@ -42,7 +42,7 @@ func TestWithLoopHeaderStampsEveryEnduringType(t *testing.T) {
 	}
 
 	// in is one instance of each Enduring loop-scoped event type. These are exactly
-	// the 11 cases withLoopHeader enumerates (the only events the publish chokepoint
+	// the 13 cases withLoopHeader enumerates (the only events the publish chokepoint
 	// stamps); Ephemeral and session-scoped events never reach withLoopHeader.
 	tests := []struct {
 		name string
@@ -52,6 +52,8 @@ func TestWithLoopHeaderStampsEveryEnduringType(t *testing.T) {
 		{name: "StepDone", in: event.StepDone{}},
 		{name: "TurnFoldedInto", in: event.TurnFoldedInto{}},
 		{name: "InputCancelled", in: event.InputCancelled{}},
+		{name: "LoopModeChanged", in: event.LoopModeChanged{}},
+		{name: "LoopInferenceChanged", in: event.LoopInferenceChanged{}},
 		{name: "TurnRejected", in: event.TurnRejected{}},
 		{name: "LoopIdle", in: event.LoopIdle{}},
 		{name: "TurnDone", in: event.TurnDone{}},
@@ -61,9 +63,9 @@ func TestWithLoopHeaderStampsEveryEnduringType(t *testing.T) {
 		{name: "UserInputRequested", in: event.UserInputRequested{}},
 	}
 
-	// Guard the count so adding a 12th Enduring loop event without extending this
+	// Guard the count so adding a 14th Enduring loop event without extending this
 	// table is itself a failure (the test must enumerate every type).
-	const wantEnduringLoopTypes = 11
+	const wantEnduringLoopTypes = 13
 	if len(tests) != wantEnduringLoopTypes {
 		t.Fatalf("table has %d types, want %d Enduring loop-scoped event types", len(tests), wantEnduringLoopTypes)
 	}

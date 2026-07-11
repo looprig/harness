@@ -356,8 +356,8 @@ func TestEffectiveSystemComposition(t *testing.T) {
 		tc := tt
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			if got := effectiveSystem(tc.system, tc.instructions); got != tc.want {
-				t.Errorf("effectiveSystem(%q, %q) = %q, want %q", tc.system, tc.instructions, got, tc.want)
+			if got := EffectiveSystem(tc.system, tc.instructions); got != tc.want {
+				t.Errorf("EffectiveSystem(%q, %q) = %q, want %q", tc.system, tc.instructions, got, tc.want)
 			}
 		})
 	}

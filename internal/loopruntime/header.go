@@ -55,6 +55,15 @@ func stampLoopHeader(ev event.Event, sessionID, loopID, turnID uuid.UUID) event.
 	case event.InputCancelled:
 		e.Header = fillLoopScoped(e.Header, sessionID, loopID)
 		return e
+	case event.LoopModeChanged:
+		// A mode change is loop-scoped, not turn-scoped: fill only SessionID/LoopID (the
+		// active turn id, if any, is deliberately NOT stamped — the change applies to the
+		// loop, taking effect at the next turn boundary).
+		e.Header = fillLoopScoped(e.Header, sessionID, loopID)
+		return e
+	case event.LoopInferenceChanged:
+		e.Header = fillLoopScoped(e.Header, sessionID, loopID)
+		return e
 	case event.InputQueued:
 		// Loop-scoped reply event: no turn exists yet (the input is only queued), so
 		// fill SessionID/LoopID and PRESERVE the producer-set Cause.CommandID == InputID.
@@ -96,6 +105,12 @@ func withLoopHeader(ev event.Event, h event.Header) event.Event {
 		e.Header = h
 		return e
 	case event.InputCancelled:
+		e.Header = h
+		return e
+	case event.LoopModeChanged:
+		e.Header = h
+		return e
+	case event.LoopInferenceChanged:
 		e.Header = h
 		return e
 	case event.TurnRejected:

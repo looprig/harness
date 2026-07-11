@@ -13,6 +13,7 @@ import (
 	gatedomain "github.com/looprig/harness/pkg/gate"
 	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/loop"
+	"github.com/looprig/inference"
 )
 
 // Loop is the handle to a running agent loop for internal packages.
@@ -119,6 +120,18 @@ type loopConfig struct {
 	// gates is the session-owned durable gate registrar. Loop-only tests that wire
 	// only an eventPublisher use nopGateRegistrar.
 	gates gateRegistrar
+
+	// bound is the immutable loop definition the actor validates a SetLoopMode against
+	// (resolving the target mode's model/effort/tools/instructions). It is nil for the
+	// raw-config test path (newWithConfig): a nil bound has no predeclared modes, so every
+	// SetLoopMode is refused with ChangeInvalidMode (which is correct for a modeless loop).
+	// ChangeLoopInference never consults it (it validates the model/effort values only).
+	bound loop.BoundDefinition
+
+	// faultProbe is the actor's post-emit durable-fault read (nil when no session is wired,
+	// e.g. loop-only tests): after publishing a change event the actor probes it and, on a
+	// non-nil fault, declines to apply the change (fail-secure, no partial apply).
+	faultProbe faultProbe
 }
 
 // idGenerator mints a fresh UUID for the loop's correlation IDs — the per-turn
@@ -134,6 +147,35 @@ type idGenerator func() (uuid.UUID, error)
 // the transport path.
 type eventPublisher interface {
 	PublishEvent(context.Context, event.Event) error
+}
+
+// faultProbe is the actor's narrow read of the session's durable-persistence fault latch.
+// After emitting a mode/inference change event the actor probes it: a non-nil result means
+// the change event's REQUIRED durable append failed (the hub faulted the session inline via
+// ReportFault, synchronously on this same actor goroutine), so the actor MUST NOT apply the
+// change (fail-secure — no live config more permissive than the durable log, and no partial
+// apply). It mirrors SetSecurityCeiling's emit-then-check-fault ordering. The loop depends
+// on this small interface (Dependency Inversion / Interface Segregation), type-asserted from
+// the event publisher exactly like gateRegistrar; a loop-only test wires a publisher that
+// does not satisfy it, so the probe is nil and the actor applies unconditionally (there is
+// no durable tap to fail).
+type faultProbe interface {
+	FaultErr() error
+}
+
+// effectiveConfig is the loop's CURRENT turn-affecting configuration: the mode, model,
+// effort, system prompt, and tool set the NEXT turn will start under. It is actor-owned
+// state (mutated ONLY by the actor, no locks). A running turn captured its OWN copy at
+// startTurn (into turnConfig), so mutating this never affects the turn in flight — a change
+// takes effect only at the next turn boundary. SetLoopMode replaces all five fields;
+// ChangeLoopInference replaces only model+effort. The effort is also baked into
+// model.Sampling.Effort so the request the turn builds carries it.
+type effectiveConfig struct {
+	mode   loop.ModeName
+	model  inference.Model
+	effort inference.Effort
+	system string
+	tools  ToolSet
 }
 
 const defaultDrainTimeout = 5 * time.Second
@@ -161,11 +203,13 @@ func New(loopCtx context.Context, sessionID, loopID uuid.UUID, parent loop.Prove
 	if err != nil {
 		return nil, err
 	}
-	return newLoopWithSeed(loopCtx, sessionID, loopID, parent, events, cfg, nil)
+	return newLoopWithSeed(loopCtx, sessionID, loopID, parent, events, cfg, bound, bound.InitialMode(), nil)
 }
 
 func newWithConfig(loopCtx context.Context, sessionID, loopID uuid.UUID, parent Provenance, events eventPublisher, cfg runtimeConfig) (*Loop, error) {
-	return newLoopWithSeed(loopCtx, sessionID, loopID, parent, events, cfg, nil)
+	// The raw-config test path has no bound definition, so it carries no predeclared modes:
+	// the effective mode is the base ("") and a SetLoopMode is refused (ChangeInvalidMode).
+	return newLoopWithSeed(loopCtx, sessionID, loopID, parent, events, cfg, nil, "", nil)
 }
 
 // newLoopWithSeed is the construction core shared by New (seed nil → an empty loop)
@@ -174,7 +218,7 @@ func newWithConfig(loopCtx context.Context, sessionID, loopID uuid.UUID, parent 
 // goroutine for both; the ONLY difference is whether loopState starts empty or seeded.
 // Keeping it one function means the spawn path and the restore path can never drift in
 // validation, defaulting, or wiring.
-func newLoopWithSeed(loopCtx context.Context, sessionID, loopID uuid.UUID, parent Provenance, events eventPublisher, cfg runtimeConfig, seed *RestoredState) (*Loop, error) {
+func newLoopWithSeed(loopCtx context.Context, sessionID, loopID uuid.UUID, parent Provenance, events eventPublisher, cfg runtimeConfig, bound loop.BoundDefinition, initialMode loop.ModeName, seed *RestoredState) (*Loop, error) {
 	if cfg.Client == nil {
 		return nil, &ConfigError{Kind: ConfigMissingClient}
 	}
@@ -211,6 +255,10 @@ func newLoopWithSeed(loopCtx context.Context, sessionID, loopID uuid.UUID, paren
 	if !ok {
 		gates = nopGateRegistrar{}
 	}
+	// The durable-fault probe is the SAME session (via its exported FaultErr); a loop-only
+	// test publisher does not satisfy it, leaving fp nil (the actor then applies changes
+	// unconditionally — there is no durable tap to fail).
+	fp, _ := events.(faultProbe)
 	commands := make(chan command.Command)
 	done := make(chan struct{})
 	// gateReg is unbuffered: registration is synchronous (the runner blocks on the
@@ -237,8 +285,21 @@ func newLoopWithSeed(loopCtx context.Context, sessionID, loopID uuid.UUID, paren
 		events:       events,
 		eventFactory: cfg.eventFactory,
 		gates:        gates,
+		bound:        bound,
+		faultProbe:   fp,
 	}
 	state := newLoopState(sessionID, loopID, parent)
+	// Seed the current turn-affecting configuration from the resolved runtimeConfig. New
+	// passes the definition's initial mode; NewRestored passes the restore-folded mode (and
+	// cfg already carries any restore-folded inference override). A change command later
+	// replaces these fields, and the next turn captures whatever is current here.
+	state.effective = effectiveConfig{
+		mode:   initialMode,
+		model:  cfg.Model,
+		effort: cfg.Model.Sampling.Effort,
+		system: cfg.System,
+		tools:  cfg.Tools,
+	}
 	if seed != nil {
 		// Restore seed: come up with the folded committed history and turn count. The
 		// status stays loopIdle (newLoopState's zero default), so the resumed loop
@@ -316,6 +377,13 @@ type loopState struct {
 	status      loopStatus
 	cancelTurn  context.CancelFunc
 	msgs        content.AgenticMessages // conversation history across turns
+
+	// effective is the loop's CURRENT turn-affecting configuration (mode/model/effort/
+	// system/tools). startTurn captures a copy of it into the per-turn turnConfig, so a
+	// SetLoopMode/ChangeLoopInference that lands mid-turn never disturbs the running turn —
+	// it takes effect only when the NEXT turn starts. It is seeded at construction from the
+	// resolved runtimeConfig (New) or the restore-folded mode/inference (NewRestored).
+	effective effectiveConfig
 
 	// inbox is the actor-owned pending-input queue for accepted
 	// UserInput/SubagentResult that could not start immediately (a turn was
@@ -617,12 +685,16 @@ func runLoop(cfg loopConfig, state loopState) {
 				return nil, &CommitError{Reason: CommitTurnCancelled, Cause: cctx.Err()}
 			}
 		}
+		// model/system/tools come from the loop's CURRENT effective config (captured here,
+		// at turn start, into this per-turn value), so a change that landed since the last
+		// turn takes effect now while a change that lands DURING this turn does not. The
+		// remaining fields are immutable loop wiring, so they ride the frozen config.
 		return turnConfig{
 			base:           base,
 			runtimeContext: config.RuntimeContext,
-			model:          config.Model,
-			system:         config.System,
-			tools:          config.Tools,
+			model:          state.effective.model,
+			system:         state.effective.system,
+			tools:          state.effective.tools,
 			client:         config.Client,
 			gateReg:        gateReg,
 			idGen:          config.idGen,
@@ -946,6 +1018,89 @@ func runLoop(cfg loopConfig, state loopState) {
 		return false
 	}
 
+	// changeHeader is the loop-scoped Header a change event carries: SessionID + LoopID
+	// only (no TurnID — a change is loop-scoped and takes effect at the next boundary).
+	changeHeader := func() event.Header {
+		return event.Header{Coordinates: identity.Coordinates{SessionID: state.sessionID, LoopID: state.id}}
+	}
+
+	// applySetMode commits a SetLoopMode: it validates the mode name against the bound
+	// definition, emits LoopModeChanged, checks the durable-fault probe, then replaces the
+	// effective config — so the change is atomic and takes effect only at the next turn. A
+	// shutting-down loop, an unknown mode, or a durable-append fault refuses the change with
+	// a typed *loop.ChangeError and applies nothing. state.effective is unchanged on every
+	// refusal (no partial apply). The reply carries the committed mode/model/effort.
+	applySetMode := func(c command.SetLoopMode) {
+		if state.status == loopShuttingDown {
+			c.Ack <- command.LoopChangeResult{Err: &loop.ChangeError{Kind: loop.ChangeLoopShuttingDown}}
+			return
+		}
+		modeName := loop.ModeName(c.Mode)
+		// Resolve by EXACT name (configForMode, not configFromBound): a runtime SetMode("")
+		// selects the reachable base mode, NOT the initial mode — so the committed label, the
+		// emitted LoopModeChanged.Mode, and the applied effective config all agree.
+		resolved, err := configForMode(cfg.bound, modeName)
+		if err != nil {
+			c.Ack <- command.LoopChangeResult{Err: &loop.ChangeError{Kind: loop.ChangeInvalidMode, Mode: modeName, Cause: err}}
+			return
+		}
+		next := effectiveConfig{mode: modeName, model: resolved.Model, effort: resolved.Model.Sampling.Effort, system: resolved.System, tools: resolveToolSetCaps(resolved.Tools)}
+		publish(event.LoopModeChanged{Header: changeHeader(), PreviousMode: string(state.effective.mode), Mode: string(modeName)})
+		if fp := cfg.faultProbe; fp != nil {
+			if ferr := fp.FaultErr(); ferr != nil {
+				c.Ack <- command.LoopChangeResult{Err: &loop.ChangeError{Kind: loop.ChangeDurableAppendFailed, Cause: ferr}}
+				return
+			}
+		}
+		state.effective = next
+		c.Ack <- command.LoopChangeResult{Mode: string(next.mode), Model: next.model, Effort: next.effort}
+	}
+
+	// applyChangeInference commits a ChangeLoopInference: it folds the requested model/effort
+	// over the current effective values, validates the WHOLE batch before touching anything,
+	// emits LoopInferenceChanged, checks the durable-fault probe, then replaces effective
+	// model+effort (never the mode/tools/system). Any refusal — shutting down, no changes,
+	// invalid model/effort, or a durable-append fault — returns a typed *loop.ChangeError and
+	// applies nothing.
+	applyChangeInference := func(c command.ChangeLoopInference) {
+		if state.status == loopShuttingDown {
+			c.Ack <- command.LoopChangeResult{Err: &loop.ChangeError{Kind: loop.ChangeLoopShuttingDown}}
+			return
+		}
+		if !c.SetModel && !c.SetEffort {
+			c.Ack <- command.LoopChangeResult{Err: &loop.ChangeError{Kind: loop.ChangeNoChanges}}
+			return
+		}
+		model := state.effective.model
+		effort := state.effective.effort
+		if c.SetModel {
+			model = c.Model
+			if verr := model.Validate(); verr != nil {
+				c.Ack <- command.LoopChangeResult{Err: &loop.ChangeError{Kind: loop.ChangeInvalidModel, Cause: verr}}
+				return
+			}
+		}
+		if c.SetEffort {
+			effort = c.Effort
+			if !effort.Valid() {
+				c.Ack <- command.LoopChangeResult{Err: &loop.ChangeError{Kind: loop.ChangeInvalidEffort}}
+				return
+			}
+		}
+		model.Sampling = model.Sampling.Clone()
+		model.Sampling.Effort = effort // bake effort into the model the request stamps
+		publish(event.LoopInferenceChanged{Header: changeHeader(), Model: model, Effort: effort})
+		if fp := cfg.faultProbe; fp != nil {
+			if ferr := fp.FaultErr(); ferr != nil {
+				c.Ack <- command.LoopChangeResult{Err: &loop.ChangeError{Kind: loop.ChangeDurableAppendFailed, Cause: ferr}}
+				return
+			}
+		}
+		state.effective.model = model
+		state.effective.effort = effort
+		c.Ack <- command.LoopChangeResult{Mode: string(state.effective.mode), Model: model, Effort: effort}
+	}
+
 	for {
 		select {
 		case cmd, ok := <-commands:
@@ -985,6 +1140,25 @@ func runLoop(cfg loopConfig, state loopState) {
 				// and removes it; otherwise it is a no-op (already started/folded or never
 				// queued). Fire-and-forget — no reply channel.
 				cancelQueued(c)
+
+			case command.SetLoopMode:
+				// Select a predeclared mode for the NEXT turn. Validated against the bound
+				// definition on the actor (the sole owner of effective state); the outcome
+				// (typed error or the committed mode/model/effort) is replied on the buffered
+				// Ack. A nil Ack violates the contract — log and drop rather than wedge.
+				if err := c.Validate(); err != nil {
+					slog.Warn("invalid SetLoopMode command", "error", err)
+					continue
+				}
+				applySetMode(c)
+
+			case command.ChangeLoopInference:
+				// Change only the model/effort for the NEXT turn, validated atomically.
+				if err := c.Validate(); err != nil {
+					slog.Warn("invalid ChangeLoopInference command", "error", err)
+					continue
+				}
+				applyChangeInference(c)
 
 			case command.Interrupt:
 				if err := c.Validate(); err != nil {

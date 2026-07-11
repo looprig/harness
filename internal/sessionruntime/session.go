@@ -237,17 +237,38 @@ type loopHandle struct {
 	backend loop.Backend
 	parent  loop.Provenance
 	cancel  context.CancelFunc
+
+	// liveMu guards the live view (liveMode/liveModel) — the CURRENT selection
+	// Handle.Mode()/Model() report. The loop actor is the authoritative owner of the
+	// effective config; SetMode/Change update this view ONLY from the actor's committed
+	// reply, so the read never runs ahead of the durable/applied change. Reads take the
+	// read lock. It is seeded at construction with the loop's starting selection.
+	liveMu    sync.RWMutex
+	liveMode  loop.ModeName
+	liveModel inference.Model
 }
 
-func (h *loopHandle) ID() uuid.UUID          { return h.id }
-func (h *loopHandle) Mode() loop.ModeName    { return h.bound.InitialMode() }
-func (h *loopHandle) Model() inference.Model { return h.bound.Model() }
-func (*loopHandle) SetMode(context.Context, loop.ModeName) error {
-	return errors.New("session: loop mode changes are not available until the loop controller is active")
+func (h *loopHandle) ID() uuid.UUID { return h.id }
+func (h *loopHandle) Mode() loop.ModeName {
+	h.liveMu.RLock()
+	defer h.liveMu.RUnlock()
+	return h.liveMode
 }
-func (*loopHandle) Change(context.Context, ...loop.Change) error {
-	return errors.New("session: loop inference changes are not available until the loop controller is active")
+func (h *loopHandle) Model() inference.Model {
+	h.liveMu.RLock()
+	defer h.liveMu.RUnlock()
+	return h.liveModel
 }
+
+// setLiveView records the mode/model the loop actor committed, so Handle.Mode()/Model()
+// reflect the current selection after a successful change.
+func (h *loopHandle) setLiveView(mode loop.ModeName, model inference.Model) {
+	h.liveMu.Lock()
+	h.liveMode = mode
+	h.liveModel = model
+	h.liveMu.Unlock()
+}
+
 func (h *loopHandle) Interrupt(context.Context) error { return h.owner.interruptLoopID(h.id) }
 
 type preparedLoop struct {
@@ -305,6 +326,17 @@ func (s *Session) faultIfFaulted() error {
 		return &SessionError{Kind: SessionFaulted, Cause: s.faultErr}
 	}
 	return nil
+}
+
+// FaultErr is the loop actor's post-emit durable-fault probe (loopruntime type-asserts the
+// session for it). It returns the latched persistence fault (a required Enduring append
+// failed) or nil. After emitting a mode/inference change event, the actor calls it: because
+// the hub raises the fault INLINE (synchronously on the same actor goroutine, via
+// ReportFault) when the append fails, a non-nil result here means the change event did not
+// persist, so the actor declines to apply the change (fail-secure, no partial apply). It is
+// the loop-scoped counterpart to SetSecurityCeiling's own post-emit fault check.
+func (s *Session) FaultErr() error {
+	return s.faultIfFaulted()
 }
 
 // PublishEvent is the session's eventPublisher implementation passed to loop.New.
@@ -665,7 +697,7 @@ func (s *Session) newLoop(parent loop.Provenance, cfg loop.Definition, parentToo
 		cancel()
 		return uuid.UUID{}, &SessionError{Kind: SessionClosing}
 	}
-	s.loops[loopID] = &loopHandle{id: loopID, owner: s, bound: bound, backend: b, parent: parent, cancel: cancel}
+	s.loops[loopID] = &loopHandle{id: loopID, owner: s, bound: bound, backend: b, parent: parent, cancel: cancel, liveMode: bound.InitialMode(), liveModel: bound.Model()}
 	s.loopsMu.Unlock()
 
 	// Announce the new loop to subscribers active at creation time. Published AFTER

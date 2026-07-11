@@ -58,13 +58,13 @@ func RestoreTopology(ctx context.Context, topology Topology, sessionID uuid.UUID
 	return restoreTopologySession(ctx, topology, sessionID, store, uuid.New, time.Now, opts...)
 }
 
-func (s *Session) attachRestoredLoop(started event.LoopStarted, parent loop.Provenance, bound loop.BoundDefinition, folded foldResult, foreignSID string) error {
+func (s *Session) attachRestoredLoop(started event.LoopStarted, parent loop.Provenance, bound loop.BoundDefinition, folded foldResult, ri restoredInference, foreignSID string) error {
 	loopCtx, cancel := context.WithCancel(s.sessionCtx)
 	var backend loop.Backend
 	var err error
 	switch bound.Engine() {
 	case loop.EngineNative:
-		backend, err = loopruntime.NewRestored(loopCtx, s.sessionID, started.LoopID, parent, s, bound, loopruntime.RestoredState{Msgs: folded.Msgs, TurnIndex: folded.TurnIndex})
+		backend, err = loopruntime.NewRestored(loopCtx, s.sessionID, started.LoopID, parent, s, bound, restoredStateFrom(folded, ri))
 	default:
 		if foreignSID == "" {
 			cancel()
@@ -80,8 +80,9 @@ func (s *Session) attachRestoredLoop(started event.LoopStarted, parent loop.Prov
 		cancel()
 		return &RestoreError{Kind: RestoreLoopFailed, Cause: err}
 	}
+	liveMode, liveModel := liveViewFor(bound, ri)
 	s.loopsMu.Lock()
-	s.loops[started.LoopID] = &loopHandle{id: started.LoopID, owner: s, bound: bound, backend: backend, parent: parent, cancel: cancel}
+	s.loops[started.LoopID] = &loopHandle{id: started.LoopID, owner: s, bound: bound, backend: backend, parent: parent, cancel: cancel, liveMode: liveMode, liveModel: liveModel}
 	s.loopsMu.Unlock()
 	return nil
 }
@@ -256,6 +257,9 @@ func restoreTopologySession(
 	// Every loop was independently folded from its loop-scoped projection above.
 	primaryEvents := activePlan.events
 	folded := activePlan.folded
+	// Fold the primary loop's mode + direct inference changes so it resumes under the
+	// effective config it crashed under (last write wins, live precedence).
+	activeInference := foldLoopInference(primaryEvents)
 
 	// (6) Crash-seam: an open turn (a TurnStarted with no terminal) is closed durably
 	// with a TurnInterrupted carrying the open turn's id + index, so the resumed loop
@@ -310,7 +314,7 @@ func restoreTopologySession(
 	// stamped it on LoopStarted; late-bound adapters record it with ForeignSessionBound.
 	// buildRestoredSession fails closed on an empty sid for a foreign engine.
 	foreignSID := findForeignSID(primaryEvents)
-	s, err := buildRestoredSession(sessionCtx, sessionCancel, bound, sessionID, primaryLoopID, foreignSID, spawnedCount, ceilingLevel, hasCeiling, folded, restoredGates.open, j, factory, newID, now, leaseOpts...)
+	s, err := buildRestoredSession(sessionCtx, sessionCancel, bound, sessionID, primaryLoopID, foreignSID, spawnedCount, ceilingLevel, hasCeiling, folded, activeInference, restoredGates.open, j, factory, newID, now, leaseOpts...)
 	if err != nil {
 		return recordErrored(err)
 	}
@@ -451,7 +455,7 @@ func attachAndActivate(s *Session, all []event.Event, plans []loopPlan, primaryL
 			continue
 		}
 		parent := loop.Provenance{LoopID: plan.started.Cause.Coordinates.LoopID, TurnID: plan.started.Cause.Coordinates.TurnID, StepID: plan.started.Cause.Coordinates.StepID}
-		if err := s.attachRestoredLoop(plan.started, parent, plan.bound, plan.folded, findForeignSID(plan.events)); err != nil {
+		if err := s.attachRestoredLoop(plan.started, parent, plan.bound, plan.folded, foldLoopInference(plan.events), findForeignSID(plan.events)); err != nil {
 			return err
 		}
 	}
@@ -491,6 +495,7 @@ func buildRestoredSession(
 	ceilingLevel ceiling.Level,
 	hasCeiling bool,
 	folded foldResult,
+	ri restoredInference,
 	restoredGates map[gate.ID]gateEntry,
 	j journal.SessionJournal,
 	factory *event.Factory,
@@ -566,7 +571,7 @@ func buildRestoredSession(
 	switch cfg.Engine() {
 	case loop.EngineNative:
 		l, err = loopruntime.NewRestored(loopCtx, sessionID, primaryLoopID, loop.Provenance{}, s, cfg,
-			loopruntime.RestoredState{Msgs: folded.Msgs, TurnIndex: folded.TurnIndex})
+			restoredStateFrom(folded, ri))
 	default:
 		if foreignSID == "" {
 			cancel()
@@ -584,7 +589,8 @@ func buildRestoredSession(
 		cancel()
 		return nil, &RestoreError{Kind: RestoreLoopFailed, Cause: err}
 	}
-	s.loops[primaryLoopID] = &loopHandle{id: primaryLoopID, owner: s, bound: cfg, backend: l, parent: loop.Provenance{}, cancel: cancel}
+	liveMode, liveModel := liveViewFor(cfg, ri)
+	s.loops[primaryLoopID] = &loopHandle{id: primaryLoopID, owner: s, bound: cfg, backend: l, parent: loop.Provenance{}, cancel: cancel, liveMode: liveMode, liveModel: liveModel}
 	s.primaryLoopID = primaryLoopID
 	return s, nil
 }

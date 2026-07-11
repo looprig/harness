@@ -73,7 +73,7 @@ func TestCodexForeignRestoreRecoversSIDFromForeignSessionBound(t *testing.T) {
 	t.Cleanup(restoreCancel)
 
 	s, err := buildRestoredSession(restoreCtx, restoreCancel, c, sessionID, primaryLoopID,
-		foreignSID, 0, 0, false, folded, nil, fakeSessionJournal{}, fac, uuid.New, time.Now,
+		foreignSID, 0, 0, false, folded, restoredInference{}, nil, fakeSessionJournal{}, fac, uuid.New, time.Now,
 		WithForeignBuilder(builder.build, builder.buildRestored))
 	if err != nil {
 		t.Fatalf("buildRestoredSession: %v", err)
@@ -129,7 +129,7 @@ func TestCodexForeignRestoreFailsClosedWithoutSIDSource(t *testing.T) {
 	t.Cleanup(restoreCancel)
 
 	s, err := buildRestoredSession(restoreCtx, restoreCancel, c, sessionID, primaryLoopID,
-		foreignSID, 0, 0, false, folded, nil, fakeSessionJournal{}, event.NewFactory(uuid.New, time.Now), uuid.New, time.Now,
+		foreignSID, 0, 0, false, folded, restoredInference{}, nil, fakeSessionJournal{}, event.NewFactory(uuid.New, time.Now), uuid.New, time.Now,
 		WithForeignBuilder(builder.build, builder.buildRestored))
 	if s != nil {
 		t.Fatalf("buildRestoredSession returned a non-nil Session on a fail-closed Codex restore")
@@ -240,7 +240,7 @@ func TestForeignRestore(t *testing.T) {
 			}
 
 			s, err := buildRestoredSession(restoreCtx, restoreCancel, c, sessionID, primaryLoopID,
-				tt.foreignSID, 0, 0, false, folded, nil, fakeSessionJournal{}, fac, uuid.New, time.Now, opts...)
+				tt.foreignSID, 0, 0, false, folded, restoredInference{}, nil, fakeSessionJournal{}, fac, uuid.New, time.Now, opts...)
 
 			if tt.wantErr {
 				if s != nil {

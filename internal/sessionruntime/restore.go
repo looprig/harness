@@ -2,9 +2,12 @@ package sessionruntime
 
 import (
 	"github.com/looprig/core/content"
+	"github.com/looprig/harness/internal/loopruntime"
 	"github.com/looprig/harness/pkg/ceiling"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/identity"
+	"github.com/looprig/harness/pkg/loop"
+	"github.com/looprig/inference"
 )
 
 func checkFingerprint(persisted, live event.ConfigFingerprint, allowMismatch bool) error {
@@ -140,6 +143,63 @@ func lastSecurityCeiling(events []event.Event) (ceiling.Level, bool) {
 		}
 	}
 	return level, ok
+}
+
+// restoredInference is the fold of one loop's mode + direct inference changes: the last
+// selected mode and the last direct model/effort override to reapply on resume. It
+// reproduces the LIVE actor precedence — a LoopModeChanged resets model/effort, so only an
+// inference change AFTER the last mode change survives — so a restored loop resumes under
+// the exact effective config it crashed under. It seeds loopruntime.RestoredState.
+type restoredInference struct {
+	Mode         loop.ModeName
+	HasMode      bool
+	Model        inference.Model
+	Effort       inference.Effort
+	HasInference bool
+}
+
+// foldLoopInference folds a loop's ORDERED enduring events into the mode + direct inference
+// change to reapply on restore, last-write-wins per the live precedence: a LoopModeChanged
+// selects a mode and CLEARS any pending inference override (a mode change resets model and
+// effort in the actor); a LoopInferenceChanged records a direct model/effort override. It is
+// loop-scoped (folded from the loop's own event slice), a single-purpose scanner mirroring
+// lastSecurityCeiling so the restore constructor stays a straight-line assembly. Absent both
+// (a loop that never changed) yields a zero restoredInference — resume under the initial
+// mode with no override.
+func foldLoopInference(events []event.Event) restoredInference {
+	var ri restoredInference
+	for _, ev := range events {
+		switch e := ev.(type) {
+		case event.LoopModeChanged:
+			ri.Mode = loop.ModeName(e.Mode)
+			ri.HasMode = true
+			// A mode change resets model+effort, so a prior inference override no longer
+			// applies (only a later LoopInferenceChanged will override the new mode).
+			ri.HasInference = false
+			ri.Model = inference.Model{}
+			ri.Effort = inference.EffortNone
+		case event.LoopInferenceChanged:
+			ri.Model = e.Model
+			ri.Effort = e.Effort
+			ri.HasInference = true
+		}
+	}
+	return ri
+}
+
+// restoredStateFrom builds the loopruntime restore seed from a loop's committed-conversation
+// fold and its mode/inference fold, so a re-created loop comes up with both its history AND
+// the effective config it crashed under.
+func restoredStateFrom(folded foldResult, ri restoredInference) loopruntime.RestoredState {
+	return loopruntime.RestoredState{
+		Msgs:         folded.Msgs,
+		TurnIndex:    folded.TurnIndex,
+		Mode:         ri.Mode,
+		HasMode:      ri.HasMode,
+		Model:        ri.Model,
+		Effort:       ri.Effort,
+		HasInference: ri.HasInference,
+	}
 }
 
 // foldResult is the reconstruction of one loop's committed conversation from its

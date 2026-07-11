@@ -425,7 +425,7 @@ func (b *boundDefinitionState) Middlewares() []tool.ToolMiddleware {
 }
 func (b *boundDefinitionState) System() string { return b.definition.system }
 func (b *boundDefinitionState) EffectiveSystem() string {
-	return effectiveSystem(b.System(), b.Instructions())
+	return EffectiveSystem(b.System(), b.Instructions())
 }
 func (b *boundDefinitionState) Modes() []BoundMode {
 	result := make([]BoundMode, len(b.modes))
@@ -452,7 +452,13 @@ func (b *boundDefinitionState) Instructions() string        { return b.selected(
 func (b *boundDefinitionState) Tools() []tool.InvokableTool { return b.selected().Tools }
 func (b *boundDefinitionState) ToolLimits() ToolLimits      { return b.selected().ToolLimits }
 
-func effectiveSystem(system, instructions string) string {
+// EffectiveSystem combines a base system prompt with a mode's instructions: the base alone
+// when a mode adds no instructions, the instructions alone when there is no base, otherwise
+// the two joined by a blank line. It is exported as the SINGLE source of this rule so the
+// loop actor (which resolves the SELECTED mode's system per turn, in loopruntime) composes
+// it byte-for-byte identically — restore fidelity depends on the live and folded system
+// prompts matching exactly.
+func EffectiveSystem(system, instructions string) string {
 	if system == "" {
 		return instructions
 	}

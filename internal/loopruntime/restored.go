@@ -7,6 +7,7 @@ import (
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/loop"
+	"github.com/looprig/inference"
 )
 
 // RestoredState is the pre-built committed state a restored loop comes up with: the
@@ -24,6 +25,22 @@ import (
 type RestoredState struct {
 	Msgs      content.AgenticMessages
 	TurnIndex event.TurnIndex
+
+	// Mode is the loop's LAST durably-selected mode (folded from LoopModeChanged, last write
+	// wins); HasMode distinguishes "the loop changed mode" (reapply Mode, which may be the
+	// base "") from "the loop never changed mode" (come up under the definition's initial
+	// mode). NewRestored re-resolves the mode's model/effort/tools/instructions from the
+	// fresh bound definition, so only the NAME is carried across restore.
+	Mode    loop.ModeName
+	HasMode bool
+
+	// Model + Effort are the loop's LAST durable direct inference change (folded from
+	// LoopInferenceChanged, last write wins), reapplied ON TOP of the restored mode when
+	// HasInference is set — matching the live precedence (a mode change resets model/effort;
+	// a later inference change overrides them). Model is the complete secret-free descriptor.
+	Model        inference.Model
+	Effort       inference.Effort
+	HasInference bool
 }
 
 // NewRestored constructs a loop SEEDED with pre-built committed state and starts its
@@ -40,15 +57,33 @@ type RestoredState struct {
 // RestoredState (empty Msgs, zero TurnIndex) yields a loop indistinguishable from a
 // freshly New'd one.
 func NewRestored(loopCtx context.Context, sessionID, loopID uuid.UUID, parent loop.Provenance, events eventPublisher, bound loop.BoundDefinition, seed RestoredState) (*Loop, error) {
-	cfg, err := configFromBound(bound, "")
+	// Resolve config at the RESTORED mode (last LoopModeChanged) rather than the definition's
+	// initial mode, so a loop that changed mode before teardown resumes under it. When the
+	// loop never changed mode, "" resolves to the initial mode (the pre-change behavior).
+	modeName := bound.InitialMode()
+	if seed.HasMode {
+		modeName = seed.Mode
+	}
+	// Resolve by EXACT name (configForMode, not configFromBound): modeName is always already
+	// concrete here — the definition's initial mode when the loop never changed, or the exact
+	// folded mode when it did (including "" for a durable SetMode("") to the base mode) — so
+	// the ""→initial remap must NOT fire. Remapping would resolve the initial mode's
+	// system/model/EFFORT/TOOLS under a "" label, diverging from what the loop crashed under
+	// (a security-relevant tool-set mismatch) and from liveViewFor's exact base resolution.
+	cfg, err := configForMode(bound, modeName)
 	if err != nil {
 		return nil, err
 	}
-	return newLoopWithSeed(loopCtx, sessionID, loopID, parent, events, cfg, &seed)
+	// Reapply the last durable direct inference change ON TOP of the restored mode (matching
+	// the live precedence). The folded Model already carries Effort in Sampling.Effort.
+	if seed.HasInference {
+		cfg.Model = seed.Model
+	}
+	return newLoopWithSeed(loopCtx, sessionID, loopID, parent, events, cfg, bound, modeName, &seed)
 }
 
 func newRestoredWithConfig(loopCtx context.Context, sessionID, loopID uuid.UUID, events eventPublisher, cfg runtimeConfig, seed RestoredState) (*Loop, error) {
-	return newLoopWithSeed(loopCtx, sessionID, loopID, Provenance{}, events, cfg, &seed)
+	return newLoopWithSeed(loopCtx, sessionID, loopID, Provenance{}, events, cfg, nil, seed.Mode, &seed)
 }
 
 // snapshotRequest is the actor-served committed-state query handshake. The actor is the
