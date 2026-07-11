@@ -64,6 +64,14 @@ approved design is already linked.
   delegate relationships; define redaction and export interfaces without persisting
   secrets or private reasoning.
 
+## Documentation integration
+
+- [ ] **End-user guides and runnable examples** — after the runtime capabilities above
+  land, document the complete Rig/Session/Loop model; primers, modes, delegates, and
+  controllers; synchronous and managed Subagent communication; snapshots and restore;
+  security boundaries; MCP/hooks/memory/artifacts/tracing; and migration from the legacy
+  APIs. Compile and test example programs in CI to prevent drift.
+
 ## Explicitly deferred
 
 - Token/cost budgets beyond the existing delegation and per-turn tool limits.

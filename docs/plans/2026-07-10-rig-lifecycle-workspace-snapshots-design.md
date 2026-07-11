@@ -219,25 +219,49 @@ Definitions, primers, and delegates are separate sets:
 
 ### Subagent tool mode selection
 
-The model-facing `Subagent` tool accepts an optional initial mode for the delegated loop:
+The model-facing `Subagent` tool is the one parent-to-child communication surface. It
+accepts an optional initial mode for the delegated loop:
 
 ```json
 {
+	"action": "start",
   "agent": "builder",
   "mode": "review",
-  "message": "Review the persistence changes"
+  "message": "Review the persistence changes",
+  "wait": true
 }
 ```
 
-Its typed arguments become:
+The tool uses one flat, strictly validated action envelope:
 
 ```go
 type SubagentArgs struct {
-	Agent   identity.AgentName `json:"agent"`
-	Mode    loop.ModeName      `json:"mode,omitempty"`
-	Message string             `json:"message"`
+	Action     SubagentAction    `json:"action,omitempty"`
+	Agent      identity.AgentName `json:"agent,omitempty"`
+	Mode       loop.ModeName      `json:"mode,omitempty"`
+	DelegateID DelegateID         `json:"delegate_id,omitempty"`
+	RequestID  uuid.UUID          `json:"request_id,omitempty"`
+	Message    string             `json:"message,omitempty"`
+	Wait       *bool              `json:"wait,omitempty"`
+	Timeout    time.Duration      `json:"timeout,omitempty"`
 }
 ```
+
+The actions are:
+
+| Action | Meaning |
+|---|---|
+| `start` | Create a child, submit its initial message, and optionally wait for its final response. |
+| `send` | Enqueue a distinct follow-up turn on an owned child and optionally wait for its answer. |
+| `wait` | Wait for one previously returned request ID without sending another message. |
+| `interrupt` | Interrupt an owned child's current turn without destroying the child loop. |
+| `status` | Return mechanical status for one owned child, or all owned children when `delegate_id` is omitted. |
+
+Missing `action` means `start` and missing `wait` on `start` means `true`, preserving the
+current synchronous Subagent behavior. There is no model-facing event cursor or raw child
+event feed. A parent asks a meaningful progress question by using `send`; `status` reports
+only bounded runtime facts such as running/idle/faulted/interrupted and pending request
+count.
 
 `mode` is a construction parameter on the tool call, not a second tool and not a global
 rig setting. When omitted, the child uses its definition's initial mode. When supplied,
@@ -250,6 +274,92 @@ synthetic `LoopModeChanged`. `LoopStarted` carries the selected initial mode so 
 restore reconstruct the child deterministically. The child's effective tools and
 permissions remain clamped by the parent and session security ceiling regardless of the
 requested mode.
+
+### Synchronous and managed delegation
+
+A loop definition or predeclared mode chooses which Subagent actions its model can see:
+
+```go
+loop.WithDelegation(loop.Delegation{Style: loop.DelegationSyncOnly})
+loop.WithDelegation(loop.Delegation{Style: loop.DelegationManaged})
+```
+
+| Style | Exposed actions |
+|---|---|
+| `DelegationSyncOnly` | `start`, with `wait` fixed to `true` |
+| `DelegationManaged` | `start`, `send`, `wait`, `interrupt`, `status` |
+
+Managed delegation includes synchronous use through `start` with `wait:true`. The rig
+derives the model-facing JSON schema from the active definition/mode. The schema is not a
+security boundary: the parent-scoped controller enforces the same action set if a caller
+crafts unsupported JSON. A loop with no delegates receives no Subagent tool.
+
+The session creates a separate controller bound to each live parent loop and injects it
+into that loop's Subagent tool instance:
+
+```text
+session
+└── parent loop
+    └── Subagent tool
+        └── DelegateController(parentLoopID)
+```
+
+The parent model never receives `SessionController` or `DelegateController` directly. A
+scoped delegate controller can address only children owned by its bound parent; it rejects
+siblings, ancestors, unrelated loop IDs, unavailable actions, and invalid modes. The
+trusted `SessionController` remains able to intervene across the whole session.
+
+### Follow-up request and answer semantics
+
+`send` is a new Subagent tool call, but it uses the same `Subagent` tool with
+`action:"send"`:
+
+```json
+{
+  "action": "send",
+  "delegate_id": "delegate_123",
+  "message": "What have you completed and what remains?",
+  "wait": true
+}
+```
+
+For unambiguous question/answer correlation, delegate `send` does **not** use the normal
+interactive fold-into-active-turn path. It enqueues a distinct child turn:
+
+```text
+child turn 10 is running
+parent sends request 456
+request 456 queues
+child turn 10 finishes
+child turn 11 starts with Cause.CommandID = request 456
+child turn 11 reaches a terminal event
+```
+
+The session needs an internal non-folding enqueue primitive for this path; public
+`Session.SubmitToLoop` retains its existing interactive queue/fold semantics.
+
+With `wait:true`, the parent tool call waits for the exact turn correlated to the minted
+request ID. Intermediate AI/tool `StepDone` messages are progress, not the answer. Only
+that turn's terminal event resolves the request:
+
+- `TurnDone.Message` is the answer returned in the parent's tool result;
+- `TurnFailed` returns a typed failed request result; and
+- `TurnInterrupted` returns a typed interrupted request result.
+
+With `wait:false`, `send` returns immediately:
+
+```json
+{
+  "delegate_id": "delegate_123",
+  "request_id": "request_456",
+  "status": "queued"
+}
+```
+
+The parent later calls `wait` with both IDs. The request ID is required because one child
+may have several queued turns. Child questions and answers become part of the child's own
+committed history; the final answer crosses into the parent's history only as the
+Subagent tool result. Histories are never implicitly merged.
 
 ## Rig definition
 
@@ -729,12 +839,22 @@ All tests are table-driven and run under `-race`.
 
 ### `pkg/tools`
 
-- Subagent JSON schema exposes optional `mode`;
+- sync-only schema exposes only `start` with `wait:true`;
+- managed schema exposes `start`, `send`, `wait`, `interrupt`, and `status`;
+- unsupported actions are rejected by both schema validation and the scoped controller;
+- missing action/wait preserve today's synchronous start behavior;
+- Subagent JSON schema exposes optional start `mode`;
 - omitted mode uses the target definition's initial mode;
 - valid explicit mode constructs the child directly in that mode;
 - unknown/unauthorized mode fails before quota reservation or loop creation;
 - selected mode is carried on `LoopStarted` and restored; and
-- requested mode cannot bypass parent/session permission clamps.
+- requested mode cannot bypass parent/session permission clamps;
+- `send` enqueues a distinct non-folding child turn and returns its request ID;
+- `send(wait:true)` ignores intermediate steps and returns only the correlated
+  `TurnDone.Message`;
+- `send(wait:false)` plus `wait` resolves the same request after restore;
+- `interrupt` affects only the owned child's current turn; and
+- `status` returns bounded mechanical state without exposing an event cursor.
 
 ### `pkg/rig`
 
@@ -764,6 +884,9 @@ All tests are table-driven and run under `-race`.
 - `SubmitToLoop` remains explicitly targeted;
 - active-loop change durability and invalid-target atomicity;
 - dynamically delegated loop can become active;
+- parent-scoped delegate controllers reject sibling, ancestor, and unrelated loop IDs;
+- non-folding delegate enqueue gives each follow-up request its own correlated turn;
+- several queued child requests resolve independently by request ID;
 - multi-root quiescence derives one correct `SessionIdle` edge; and
 - constructor visibility is enforced by dependency tests.
 
@@ -788,6 +911,34 @@ An integration test over an actual filesystem backend proves:
 7. restore into a fresh workspace;
 8. verify files, active loop, loop settings, and conversation state; and
 9. continue work successfully.
+
+## Documentation deliverables
+
+The implementation is not complete when only the APIs and tests pass. Its final task is
+an end-user documentation and example pass that explains the composed system without
+requiring readers to reconstruct it from package references.
+
+Required documentation:
+
+- a concepts page for `Rig → Session → Loop → Turn → Step`;
+- a glossary and diagram for definitions, primers, active loop, modes, delegates, and
+  session/loop controllers;
+- a minimal single-loop rig quickstart;
+- a multi-primer example with active-loop switching and explicit loop routing;
+- a same-history plan/build mode example;
+- synchronous Subagent (`wait:true`) and managed asynchronous Subagent examples covering
+  `start`, `send`, `wait`, `interrupt`, and `status`;
+- session creation, automatic/manual workspace snapshots, shutdown, and restore;
+- capability and security guidance explaining data-plane versus control-plane APIs,
+  delegation attenuation, permission gates, and session ceilings;
+- `serve` integration and lifecycle examples;
+- a breaking migration guide from `loop.Config`, `session.Compile`, and
+  `session.Runner`; and
+- runnable examples compiled in CI so documentation cannot silently drift from the API.
+
+Documentation should lead with common workflows and progressively disclose the lower
+level contracts. Package reference comments remain necessary but do not satisfy this
+deliverable by themselves.
 
 ## Non-goals
 
