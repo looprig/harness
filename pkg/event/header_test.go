@@ -6,9 +6,9 @@ import (
 	"time"
 
 	"github.com/looprig/core/content"
+	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/identity"
-	"github.com/looprig/core/uuid"
 )
 
 // TestEventClass asserts every concrete event reports the Class its lifecycle
@@ -31,6 +31,10 @@ func TestEventClass(t *testing.T) {
 		{"RestoreDone enduring", event.RestoreDone{}, event.Enduring},
 		{"RestoreErrored enduring", event.RestoreErrored{}, event.Enduring},
 		{"WorkspaceCheckpointed enduring", event.WorkspaceCheckpointed{}, event.Enduring},
+		{"WorkspaceRestored enduring", event.WorkspaceRestored{}, event.Enduring},
+		{"ActiveLoopChanged enduring", event.ActiveLoopChanged{}, event.Enduring},
+		{"LoopInferenceChanged enduring", event.LoopInferenceChanged{}, event.Enduring},
+		{"LoopModeChanged enduring", event.LoopModeChanged{}, event.Enduring},
 		{"LoopIdle enduring", event.LoopIdle{}, event.Enduring},
 		{"TurnStarted enduring", event.TurnStarted{}, event.Enduring},
 		{"StepDone enduring", event.StepDone{}, event.Enduring},
@@ -82,6 +86,10 @@ func TestEventEndsTurn(t *testing.T) {
 		{"RestoreDone does not end turn", event.RestoreDone{}, false},
 		{"RestoreErrored does not end turn", event.RestoreErrored{}, false},
 		{"WorkspaceCheckpointed does not end turn", event.WorkspaceCheckpointed{}, false},
+		{"WorkspaceRestored does not end turn", event.WorkspaceRestored{}, false},
+		{"ActiveLoopChanged does not end turn", event.ActiveLoopChanged{}, false},
+		{"LoopInferenceChanged does not end turn", event.LoopInferenceChanged{}, false},
+		{"LoopModeChanged does not end turn", event.LoopModeChanged{}, false},
 		{"PermissionRequested does not end turn", event.PermissionRequested{}, false},
 		{"UserInputRequested does not end turn", event.UserInputRequested{}, false},
 		{"ToolCallStarted does not end turn", event.ToolCallStarted{}, false},
@@ -114,6 +122,10 @@ func TestEventScope(t *testing.T) {
 		{"RestoreDone session-scoped", event.RestoreDone{}, event.ScopeSession},
 		{"RestoreErrored session-scoped", event.RestoreErrored{}, event.ScopeSession},
 		{"WorkspaceCheckpointed session-scoped", event.WorkspaceCheckpointed{}, event.ScopeSession},
+		{"WorkspaceRestored session-scoped", event.WorkspaceRestored{}, event.ScopeSession},
+		{"ActiveLoopChanged session-scoped", event.ActiveLoopChanged{}, event.ScopeSession},
+		{"LoopInferenceChanged loop-scoped", event.LoopInferenceChanged{}, event.ScopeLoop},
+		{"LoopModeChanged loop-scoped", event.LoopModeChanged{}, event.ScopeLoop},
 		{"LoopIdle loop-scoped", event.LoopIdle{}, event.ScopeLoop},
 		{"TokenDelta loop-scoped", event.TokenDelta{}, event.ScopeLoop},
 		{"TurnStarted loop-scoped", event.TurnStarted{}, event.ScopeLoop},

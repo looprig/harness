@@ -247,7 +247,52 @@ type WorkspaceCheckpointed struct {
 	enduring
 	sessionScoped
 	Header
+	Ref         string              `json:"ref"`
+	Consistency SnapshotConsistency `json:"consistency"`
+	Trigger     SnapshotTriggerKind `json:"trigger"`
+}
+
+// SnapshotConsistency describes whether harness-managed workspace mutations could
+// overlap a snapshot walk. Unknown exists only to decode legacy checkpoint events.
+type SnapshotConsistency uint8
+
+const (
+	SnapshotConsistencyUnknown SnapshotConsistency = iota
+	SnapshotQuiescent
+	SnapshotFuzzy
+)
+
+// SnapshotTriggerKind records the policy boundary that requested a snapshot.
+// Unknown exists only to decode legacy checkpoint events.
+type SnapshotTriggerKind uint8
+
+const (
+	SnapshotTriggerKindUnknown SnapshotTriggerKind = iota
+	SnapshotTriggerManual
+	SnapshotTriggerIdle
+	SnapshotTriggerInterrupt
+	SnapshotTriggerTurnDone
+	SnapshotTriggerStepDone
+	SnapshotTriggerSeed
+)
+
+// WorkspaceRestored records that the live workspace was replaced from Ref and
+// that Ref is now the effective durable restore point.
+type WorkspaceRestored struct {
+	enduring
+	sessionScoped
+	Header
 	Ref string `json:"ref"`
+}
+
+// ActiveLoopChanged records the session's selected loop. The new selection is
+// observable only after this session-scoped transition is durable.
+type ActiveLoopChanged struct {
+	enduring
+	sessionScoped
+	Header
+	PreviousLoopID uuid.UUID `json:"previous_loop_id,omitzero"`
+	ActiveLoopID   uuid.UUID `json:"active_loop_id"`
 }
 
 // LoopIdle is emitted when a loop parks with no active turn. Header.SessionID and
@@ -278,6 +323,9 @@ type LoopStarted struct {
 	// so old journal records (and native loops) decode to "". Mirrors
 	// ParentToolUseID: identity metadata carried on the loop's start event.
 	ForeignSID string `json:"foreign_sid,omitzero"`
+	// InitialMode is the validated mode selected when the loop was constructed.
+	// Empty identifies the base mode and preserves legacy records.
+	InitialMode string `json:"initial_mode,omitzero"`
 }
 
 // ForeignSessionBound records the foreign agent session id for adapters that
@@ -298,6 +346,8 @@ func (RestoreStarted) isEvent()        {}
 func (RestoreDone) isEvent()           {}
 func (RestoreErrored) isEvent()        {}
 func (WorkspaceCheckpointed) isEvent() {}
+func (WorkspaceRestored) isEvent()     {}
+func (ActiveLoopChanged) isEvent()     {}
 func (LoopIdle) isEvent()              {}
 func (LoopStarted) isEvent()           {}
 func (ForeignSessionBound) isEvent()   {}

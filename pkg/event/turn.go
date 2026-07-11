@@ -2,7 +2,27 @@ package event
 
 import (
 	"github.com/looprig/core/content"
+	"github.com/looprig/inference"
 )
+
+// LoopInferenceChanged durably selects a complete secret-free model descriptor
+// and effort for this loop at the next turn boundary.
+type LoopInferenceChanged struct {
+	enduring
+	loopScoped
+	Header
+	Model  inference.Model  `json:"model"`
+	Effort inference.Effort `json:"effort,omitzero"`
+}
+
+// LoopModeChanged durably selects one predeclared loop mode.
+type LoopModeChanged struct {
+	enduring
+	loopScoped
+	Header
+	PreviousMode string `json:"previous_mode,omitzero"`
+	Mode         string `json:"mode,omitzero"`
+}
 
 // TurnStarted is emitted when runLoop commits a turn's initial UserMessage. It is
 // the first enduring turn event. Header.Cause.CommandID is the submit command id.
@@ -148,14 +168,16 @@ type TurnInterrupted struct {
 	TurnIndex TurnIndex `json:"turn_index,omitzero"`
 }
 
-func (TurnStarted) isEvent()     {}
-func (StepDone) isEvent()        {}
-func (TurnFoldedInto) isEvent()  {}
-func (InputCancelled) isEvent()  {}
-func (TokenDelta) isEvent()      {}
-func (TurnDone) isEvent()        {}
-func (TurnFailed) isEvent()      {}
-func (TurnInterrupted) isEvent() {}
+func (TurnStarted) isEvent()          {}
+func (StepDone) isEvent()             {}
+func (TurnFoldedInto) isEvent()       {}
+func (InputCancelled) isEvent()       {}
+func (TokenDelta) isEvent()           {}
+func (TurnDone) isEvent()             {}
+func (TurnFailed) isEvent()           {}
+func (TurnInterrupted) isEvent()      {}
+func (LoopInferenceChanged) isEvent() {}
+func (LoopModeChanged) isEvent()      {}
 
 // isReply marks the command-outcome events. Together with InputQueued/TurnRejected
 // (declared above) these are exactly the five Reply events: a command issuer

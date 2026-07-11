@@ -24,6 +24,8 @@ const (
 	// fails fail-secure (the journal/restore caller must reject it rather than guess
 	// an identity contract for it).
 	RuleUnknownType Rule = "is not a known event type"
+	// RuleInvalid: the field contains a value outside its closed domain.
+	RuleInvalid Rule = "is invalid"
 )
 
 // Identity / body field names, named so an InvalidEventError reads precisely.
@@ -34,6 +36,10 @@ const (
 	FieldTurnID          FieldName = "TurnID"
 	FieldStepID          FieldName = "StepID"
 	FieldToolExecutionID FieldName = "ToolExecutionID"
+	FieldConsistency     FieldName = "Consistency"
+	FieldTrigger         FieldName = "Trigger"
+	FieldCause           FieldName = "Cause"
+	FieldActiveLoopID    FieldName = "ActiveLoopID"
 	// FieldType names the whole event (not one coordinate) on the fail-secure
 	// unknown-type path, paired with RuleUnknownType.
 	FieldType FieldName = "Type"
@@ -82,6 +88,13 @@ type idProfile struct {
 // with FieldType/RuleUnknownType — the caller learns the type is unknown, not that
 // some coordinate is missing.
 func ValidateEvent(ev Event) error {
+	if err := validateEventIdentity(ev); err != nil {
+		return err
+	}
+	return validateEventBody(ev)
+}
+
+func validateEventIdentity(ev Event) error {
 	nameStr, prof, ok := classify(ev)
 	name := EventName(nameStr)
 	if !ok {
@@ -92,6 +105,57 @@ func ValidateEvent(ev Event) error {
 		return &InvalidEventError{Event: name, Field: FieldEventID, Rule: RuleRequired}
 	}
 	return checkProfile(name, h.Coordinates, toolExecutionID(ev), prof)
+}
+
+func validateEventBody(ev Event) error {
+	switch e := ev.(type) {
+	case WorkspaceCheckpointed:
+		if e.Consistency != SnapshotQuiescent && e.Consistency != SnapshotFuzzy {
+			return &InvalidEventError{Event: "WorkspaceCheckpointed", Field: FieldConsistency, Rule: RuleInvalid}
+		}
+		if e.Trigger < SnapshotTriggerManual || e.Trigger > SnapshotTriggerSeed {
+			return &InvalidEventError{Event: "WorkspaceCheckpointed", Field: FieldTrigger, Rule: RuleInvalid}
+		}
+		if !validCheckpointCause(e.SessionID, e.Trigger, e.Cause) {
+			return &InvalidEventError{Event: "WorkspaceCheckpointed", Field: FieldCause, Rule: RuleInvalid}
+		}
+	case ActiveLoopChanged:
+		if e.ActiveLoopID.IsZero() {
+			return &InvalidEventError{Event: "ActiveLoopChanged", Field: FieldActiveLoopID, Rule: RuleRequired}
+		}
+	case LoopInferenceChanged:
+		if err := e.Model.Validate(); err != nil {
+			return &InvalidEventError{Event: "LoopInferenceChanged", Field: "Model", Rule: RuleInvalid}
+		}
+		if !e.Effort.Valid() {
+			return &InvalidEventError{Event: "LoopInferenceChanged", Field: "Effort", Rule: RuleInvalid}
+		}
+	}
+	return nil
+}
+
+func validCheckpointCause(sessionID uuid.UUID, trigger SnapshotTriggerKind, cause identity.Cause) bool {
+	zero := identity.Cause{}
+	if trigger == SnapshotTriggerManual || trigger == SnapshotTriggerSeed {
+		return cause == zero
+	}
+	if cause.EventID.IsZero() || !cause.CommandID.IsZero() || !cause.ToolExecutionID.IsZero() || cause.Agency != identity.AgencyMachine {
+		return false
+	}
+	c := cause.Coordinates
+	if c.SessionID != sessionID {
+		return false
+	}
+	switch trigger {
+	case SnapshotTriggerIdle:
+		return !c.SessionID.IsZero() && c.LoopID.IsZero() && c.TurnID.IsZero() && c.StepID.IsZero()
+	case SnapshotTriggerInterrupt, SnapshotTriggerTurnDone:
+		return !c.SessionID.IsZero() && !c.LoopID.IsZero() && !c.TurnID.IsZero() && c.StepID.IsZero()
+	case SnapshotTriggerStepDone:
+		return !c.SessionID.IsZero() && !c.LoopID.IsZero() && !c.TurnID.IsZero() && !c.StepID.IsZero()
+	default:
+		return false
+	}
 }
 
 // checkProfile enforces one event's idProfile against its Coordinates: required
@@ -171,6 +235,10 @@ func classify(ev Event) (name string, profile idProfile, ok bool) {
 		// (same shape as RestoreDone/SessionIdle) — only SessionID set. Ref is an
 		// opaque payload string the validator never constrains.
 		return "WorkspaceCheckpointed", sessionProfile(), true
+	case WorkspaceRestored:
+		return "WorkspaceRestored", sessionProfile(), true
+	case ActiveLoopChanged:
+		return "ActiveLoopChanged", sessionProfile(), true
 	case SecurityCeilingChanged:
 		// Session-scoped: a session-global ceiling clamp appended when the operator
 		// changes it (same shape as WorkspaceCheckpointed) — only SessionID set. Level is
@@ -183,6 +251,10 @@ func classify(ev Event) (name string, profile idProfile, ok bool) {
 		// zero). The spawning loop/turn/step rides in Header.Cause, which the validator
 		// never constrains — same shape as LoopIdle.
 		return "LoopStarted", loopProfile(), true
+	case LoopInferenceChanged:
+		return "LoopInferenceChanged", loopProfile(), true
+	case LoopModeChanged:
+		return "LoopModeChanged", loopProfile(), true
 	case ForeignSessionBound:
 		return "ForeignSessionBound", loopProfile(), true
 	case TokenDelta:

@@ -98,6 +98,14 @@ func MarshalEvent(ev Event) ([]byte, error) {
 	if ev.Class() == Ephemeral {
 		return nil, &EphemeralNotPersistableError{Type: name}
 	}
+	// Unknown checkpoint metadata exists solely as the in-memory projection of a
+	// legacy record. Never emit it into a current journal (nor emit a checkpoint
+	// whose trigger/cause pairing is malformed).
+	if _, checkpoint := ev.(WorkspaceCheckpointed); checkpoint {
+		if err := validateEventBody(ev); err != nil {
+			return nil, err
+		}
+	}
 	payload, err := encodePayload(ev)
 	if err != nil {
 		return nil, err
@@ -122,8 +130,10 @@ func encodePayload(ev Event) ([]byte, error) {
 	case GateResolved:
 		return marshalGateResolved(e)
 	case SessionStarted, SessionActive, SessionIdle, SessionStopped,
-		RestoreStarted, RestoreDone, WorkspaceCheckpointed, SecurityCeilingChanged,
-		LoopIdle, LoopStarted, ForeignSessionBound, TurnRejected,
+		RestoreStarted, RestoreDone, WorkspaceCheckpointed, WorkspaceRestored,
+		ActiveLoopChanged, SecurityCeilingChanged,
+		LoopIdle, LoopStarted, LoopInferenceChanged, LoopModeChanged,
+		ForeignSessionBound, TurnRejected,
 		UserInputRequested, TurnInterrupted,
 		TurnStarted, TurnFoldedInto, InputCancelled, TurnDone,
 		PermissionDecided, GatePrepared, GateOpened:
@@ -308,10 +318,32 @@ func UnmarshalEvent(data []byte) (Event, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := ValidateEvent(ev); err != nil {
+	if err := validateDecodedEvent(ev, data); err != nil {
 		return nil, err
 	}
 	return ev, nil
+}
+
+// validateDecodedEvent preserves the one additive compatibility exception in the
+// event schema: checkpoints written before consistency/trigger existed decode with
+// both enum values unknown. Explicit zero values, partial metadata, and newly
+// constructed unknown-valued checkpoints remain invalid through ValidateEvent.
+func validateDecodedEvent(ev Event, data []byte) error {
+	if err := validateEventIdentity(ev); err != nil {
+		return err
+	}
+	if _, ok := ev.(WorkspaceCheckpointed); ok {
+		var fields map[string]json.RawMessage
+		if err := json.Unmarshal(data, &fields); err != nil {
+			return &EventDecodeError{Type: "WorkspaceCheckpointed", Cause: err}
+		}
+		_, hasConsistency := fields["consistency"]
+		_, hasTrigger := fields["trigger"]
+		if !hasConsistency && !hasTrigger {
+			return nil
+		}
+	}
+	return validateEventBody(ev)
 }
 
 // decodePayload dispatches on the "type" tag to the concrete decoder. An unknown or
@@ -335,12 +367,20 @@ func decodePayload(tag string, data []byte) (Event, error) {
 		return decodeRestoreErrored(data)
 	case "WorkspaceCheckpointed":
 		return decodePlain[WorkspaceCheckpointed](tag, data)
+	case "WorkspaceRestored":
+		return decodePlain[WorkspaceRestored](tag, data)
+	case "ActiveLoopChanged":
+		return decodePlain[ActiveLoopChanged](tag, data)
 	case "SecurityCeilingChanged":
 		return decodePlain[SecurityCeilingChanged](tag, data)
 	case "LoopIdle":
 		return decodePlain[LoopIdle](tag, data)
 	case "LoopStarted":
 		return decodePlain[LoopStarted](tag, data)
+	case "LoopInferenceChanged":
+		return decodePlain[LoopInferenceChanged](tag, data)
+	case "LoopModeChanged":
+		return decodePlain[LoopModeChanged](tag, data)
 	case "ForeignSessionBound":
 		return decodePlain[ForeignSessionBound](tag, data)
 	case "TurnStarted":
