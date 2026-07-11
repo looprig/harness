@@ -312,3 +312,22 @@ func (*nilPermissionGate) Grant(context.Context, string, string, tool.ApprovalSc
 type nilRuntimeContext struct{}
 
 func (*nilRuntimeContext) Blocks(context.Context) []content.Block { return nil }
+
+func TestEffectiveSystemComposition(t *testing.T) {
+	t.Parallel()
+	tests := []struct{ name, system, instructions, want string }{
+		{name: "both empty"},
+		{name: "system only", system: "base", want: "base"},
+		{name: "instructions only", instructions: "mode", want: "mode"},
+		{name: "both", system: "base", instructions: "mode", want: "base\n\nmode"},
+	}
+	for _, tt := range tests {
+		tc := tt
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := effectiveSystem(tc.system, tc.instructions); got != tc.want {
+				t.Errorf("effectiveSystem(%q, %q) = %q, want %q", tc.system, tc.instructions, got, tc.want)
+			}
+		})
+	}
+}

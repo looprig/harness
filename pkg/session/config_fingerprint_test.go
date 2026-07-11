@@ -148,6 +148,21 @@ func TestFingerprintFromDiffers(t *testing.T) {
 	}
 }
 
+func TestFingerprintSystemRevisionIncludesInitialModeInstructions(t *testing.T) {
+	t.Parallel()
+	definition := func(instructions string) loop.Definition {
+		return mustDefine(
+			loop.WithName("agent"), loop.WithInference(&stubLLM{}, validModel("model-x")), loop.WithSystem("base"),
+			loop.WithModes(loop.Mode{Name: "build", Instructions: instructions}), loop.WithInitialMode("build"),
+		)
+	}
+	a := fingerprintFromDefinition(definition("instruction A"))
+	b := fingerprintFromDefinition(definition("instruction B"))
+	if a.SystemPromptRev == b.SystemPromptRev {
+		t.Fatalf("SystemPromptRev did not change with selected mode instructions: %q", a.SystemPromptRev)
+	}
+}
+
 // TestFingerprintFromSwarmFieldsEmpty pins that FingerprintFrom derives ONLY the
 // loop.Config fields: the swarm-level fields (AgentKind, RuntimeSkills, WorkspaceRoot)
 // are NOT on loop.Config, so a bare FingerprintFrom leaves them empty/zero — they are

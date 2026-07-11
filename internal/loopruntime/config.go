@@ -23,15 +23,9 @@ func configFromBound(bound loop.BoundDefinition, modeName loop.ModeName) (runtim
 		return runtimeConfig{}, &loop.BindError{Kind: loop.BindInvalidDefinition, Name: string(modeName), Index: -1}
 	}
 	model := mode.Model
-	system := bound.System()
-	if system == "" {
-		system = mode.Instructions
-	} else if mode.Instructions != "" {
-		system += "\n\n" + mode.Instructions
-	}
 	limits := mode.ToolLimits
 	return runtimeConfig{
-		Client: bound.Client(), Model: model, System: system, DrainTimeout: bound.DrainTimeout(),
+		Client: bound.Client(), Model: model, System: bound.EffectiveSystem(), DrainTimeout: bound.DrainTimeout(),
 		AgentName: bound.Name(), Engine: bound.Engine(), RuntimeContext: bound.RuntimeContext(),
 		Tools: ToolSet{Permission: bound.Permission(), Registry: mode.Tools, Middlewares: bound.Middlewares(), MaxToolIterations: limits.Iterations, MaxToolCallsPerTurn: limits.Calls, MaxParallelToolCalls: limits.Parallel},
 	}, nil

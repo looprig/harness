@@ -299,6 +299,7 @@ type BoundDefinition interface {
 	Model() inference.Model
 	Effort() inference.Effort
 	System() string
+	EffectiveSystem() string
 	Instructions() string
 	Tools() []tool.InvokableTool
 	ToolLimits() ToolLimits
@@ -338,6 +339,9 @@ func (b *boundDefinitionState) Middlewares() []tool.ToolMiddleware {
 	return append([]tool.ToolMiddleware(nil), b.definition.middlewares...)
 }
 func (b *boundDefinitionState) System() string { return b.definition.system }
+func (b *boundDefinitionState) EffectiveSystem() string {
+	return effectiveSystem(b.System(), b.Instructions())
+}
 func (b *boundDefinitionState) Modes() []BoundMode {
 	result := make([]BoundMode, len(b.modes))
 	for index := range b.modes {
@@ -362,6 +366,16 @@ func (b *boundDefinitionState) Effort() inference.Effort    { return b.selected(
 func (b *boundDefinitionState) Instructions() string        { return b.selected().Instructions }
 func (b *boundDefinitionState) Tools() []tool.InvokableTool { return b.selected().Tools }
 func (b *boundDefinitionState) ToolLimits() ToolLimits      { return b.selected().ToolLimits }
+
+func effectiveSystem(system, instructions string) string {
+	if system == "" {
+		return instructions
+	}
+	if instructions == "" {
+		return system
+	}
+	return system + "\n\n" + instructions
+}
 
 func WithName(name identity.AgentName) Option {
 	return func(o *definitionOptions) error {

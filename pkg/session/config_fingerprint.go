@@ -67,7 +67,7 @@ type ConfigFingerprintFields struct {
 func FingerprintFrom(cfg loop.BoundDefinition) event.ConfigFingerprint {
 	return event.ConfigFingerprint{
 		ModelID:         cfg.Model().Name,
-		SystemPromptRev: hexSHA256(cfg.System()),
+		SystemPromptRev: hexSHA256(cfg.EffectiveSystem()),
 		ToolPolicyRev:   toolPolicyRev(cfg.Tools()),
 	}
 }
