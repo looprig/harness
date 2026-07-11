@@ -1,6 +1,9 @@
 package workspacestore
 
 import (
+	"path/filepath"
+	"sort"
+
 	"github.com/looprig/storage"
 )
 
@@ -92,6 +95,41 @@ func Open(b storage.Blobs, opts ...Option) (*Store, error) {
 		o.MaxBytes = defaultMaxBytes
 	}
 	return &Store{blobs: b, opts: o}, nil
+}
+
+// PersistencePaths returns the canonical local roots reported by the configured
+// blob provider. Providers without the optional storage.PathReporter capability
+// contribute no paths.
+func (s *Store) PersistencePaths() []string {
+	reporter, ok := s.blobs.(storage.PathReporter)
+	if !ok {
+		return nil
+	}
+
+	paths := make(map[string]struct{})
+	for _, path := range reporter.StoragePaths() {
+		if path == "" {
+			continue
+		}
+		canonical, err := filepath.Abs(filepath.Clean(path))
+		if err != nil {
+			continue
+		}
+		if resolved, resolveErr := filepath.EvalSymlinks(canonical); resolveErr == nil {
+			canonical = resolved
+		}
+		paths[canonical] = struct{}{}
+	}
+	if len(paths) == 0 {
+		return nil
+	}
+
+	result := make([]string, 0, len(paths))
+	for path := range paths {
+		result = append(result, path)
+	}
+	sort.Strings(result)
+	return result
 }
 
 // NilBlobsError reports that Open was called with a nil Blobs backend. It carries

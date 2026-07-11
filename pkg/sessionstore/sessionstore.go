@@ -1,6 +1,9 @@
 package sessionstore
 
 import (
+	"path/filepath"
+	"sort"
+
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/storage"
 )
@@ -84,6 +87,51 @@ func Open(b *storage.Composite, opts ...Option) (*Store, error) {
 		opt(&resolved)
 	}
 	return &Store{backend: b, opts: resolved}, nil
+}
+
+// PersistencePaths returns the canonical local roots reported by the Store's
+// configured primitives. Providers without the optional storage.PathReporter
+// capability contribute no paths.
+func (s *Store) PersistencePaths() []string {
+	paths := make(map[string]struct{})
+	if reporter, ok := s.backend.Ledger.(storage.PathReporter); ok {
+		collectPersistencePaths(paths, reporter)
+	}
+	if reporter, ok := s.backend.Leaser.(storage.PathReporter); ok {
+		collectPersistencePaths(paths, reporter)
+	}
+	if reporter, ok := s.backend.KV.(storage.PathReporter); ok {
+		collectPersistencePaths(paths, reporter)
+	}
+	if reporter, ok := s.backend.Blobs.(storage.PathReporter); ok {
+		collectPersistencePaths(paths, reporter)
+	}
+	if len(paths) == 0 {
+		return nil
+	}
+
+	result := make([]string, 0, len(paths))
+	for path := range paths {
+		result = append(result, path)
+	}
+	sort.Strings(result)
+	return result
+}
+
+func collectPersistencePaths(paths map[string]struct{}, reporter storage.PathReporter) {
+	for _, path := range reporter.StoragePaths() {
+		if path == "" {
+			continue
+		}
+		canonical, err := filepath.Abs(filepath.Clean(path))
+		if err != nil {
+			continue
+		}
+		if resolved, resolveErr := filepath.EvalSymlinks(canonical); resolveErr == nil {
+			canonical = resolved
+		}
+		paths[canonical] = struct{}{}
+	}
 }
 
 // ledgerName derives the storage ledger name for a session: "sessions/<uuid>". The
