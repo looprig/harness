@@ -52,6 +52,14 @@ approved design is already linked.
   loop mode, model, effort, security ceiling, or other runtime policy; distinguish trusted
   host/user actions from model/tool actions; enforce capability attenuation for delegates;
   and journal every accepted change.
+- [ ] **Park idle delegate loops** — idle children stay in memory for now: their
+  committed history is a reusable asset (a warm `send` beats respawning and re-briefing),
+  `DelegationLimits.Quota` bounds accumulation, and there is deliberately no model-facing
+  `stop` (see the
+  [workspace placement amendments](plans/2026-07-11-workspace-placement-modes-design.md)).
+  When memory profiles demand it, evict an idle delegate's in-memory history and actor
+  state and rehydrate from the session journal on the next `send` — identity, semantics,
+  and events unchanged; a purely internal resource optimization.
 
 ## Safety and observability
 
@@ -66,11 +74,20 @@ approved design is already linked.
 
 ## Documentation integration
 
-- [ ] **End-user guides and runnable examples** — after the runtime capabilities above
-  land, document the complete Rig/Session/Loop model; primers, modes, delegates, and
-  controllers; synchronous and managed Subagent communication; snapshots and restore;
-  security boundaries; MCP/hooks/memory/artifacts/tracing; and migration from the legacy
-  APIs. Compile and test example programs in CI to prevent drift.
+- [ ] **End-user guides and runnable examples** — after the rig lifecycle and workspace
+  implementation lands, document how `rig`, `loop`, `session`, `storage`,
+  `workspacestore`, and `tools` compose; the complete Rig/Session/Loop model; primers,
+  modes, delegates, and controllers; synchronous and managed Subagent communication;
+  workspace placement, snapshots, rewind, and file freshness; security boundaries;
+  and migration from the legacy harness APIs. Compile and test example programs in CI
+  to prevent drift. Extend these guides as MCP/hooks/memory/artifacts/tracing land.
+- [ ] **CLI migration spec and implementation plan** — only after the end-user guides
+  and examples pass CI, design the CLI move to the documented rig/session/workspace
+  lifecycle. Keep it separate from the harness implementation spec.
+- [ ] **SWE migration spec and implementation plan** — only after the CLI migration
+  plan, design SWE primers, delegates, modes, tool construction, workspace policy, and
+  session lifecycle on the documented public surface. Keep it separate from both the
+  harness and CLI migration specs.
 
 ## Explicitly deferred
 

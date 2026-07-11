@@ -2,6 +2,11 @@
 
 **Date:** 2026-07-10  
 **Status:** Approved  
+**Amended by:** `2026-07-11-workspace-placement-modes-design.md` — makes workspace
+support optional; replaces `WithWorkspaceStore` with `WithExclusiveWorkspace`,
+`WithSessionWorkspaces`, and `WithSharedWorkspace`; replaces the "Workspace snapshot
+policy" section and `SnapshotPolicy.Failure`; and adds seeding, trigger ladder,
+snapshot priority, checkpoint cause/consistency, and the small API fixes listed there
 **Supersedes:** the public `session.Compile` / `session.Runner` lifecycle surface  
 **Builds on:** `2026-07-02-workspacestore-design.md` and the implemented
 `pkg/workspacestore`, `pkg/sessionstore`, and `session.CheckpointWorkspace`
@@ -746,10 +751,18 @@ The live `session.Session` and `session.SessionController` contracts remain publ
 concrete implementation, construction, and restore code move behind `pkg/rig`, under
 `internal/sessionruntime`.
 
-SWE and CLI are deliberately not migrated in this harness spec. Once harness lands, a
-separate cross-module migration spec will replace their manual session factory,
-checkpoint watcher, restore/replay attachment, and old naming. Harness tests and
-`pkg/serve` must compile and pass in the breaking harness commit itself.
+SWE and CLI are deliberately not migrated in this harness spec. Harness tests and
+`pkg/serve` must compile and pass in the breaking harness commit itself. After harness
+lands, the end-user documentation and runnable examples below must be completed before
+consumer migration planning begins. Then write separate migration specs in this order:
+
+1. CLI migration: replace its manual session factory, lifecycle calls, workspace
+   wiring, checkpoint watcher, restore attachment, and old naming.
+2. SWE migration: compose its primers, delegates, modes, tools, workspace policy, and
+   session lifecycle on the documented harness surface.
+
+The migration specs may rely on the completed guides rather than repeating the harness
+architecture. Neither consumer migration is folded into the breaking harness change.
 
 ## Error model
 
@@ -921,6 +934,8 @@ requiring readers to reconstruct it from package references.
 Required documentation:
 
 - a concepts page for `Rig → Session → Loop → Turn → Step`;
+- package-oriented guidance showing how `rig`, `loop`, `session`, `storage`,
+  `workspacestore`, and `tools` compose, including which package owns each lifecycle;
 - a glossary and diagram for definitions, primers, active loop, modes, delegates, and
   session/loop controllers;
 - a minimal single-loop rig quickstart;
@@ -938,7 +953,8 @@ Required documentation:
 
 Documentation should lead with common workflows and progressively disclose the lower
 level contracts. Package reference comments remain necessary but do not satisfy this
-deliverable by themselves.
+deliverable by themselves. Only after this documentation passes CI do the separate CLI
+and then SWE migration specs begin.
 
 ## Non-goals
 
