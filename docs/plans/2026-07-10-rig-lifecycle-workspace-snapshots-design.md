@@ -33,8 +33,8 @@ calls `session.Compile(loop.Config, store, CompileOption...)`, receives a
    harness.
 
 The current model also assumes one immutable primary loop. That makes static fan-out,
-plan/build modes, changing the default input target, and changing a live loop's model or
-effort unnecessarily awkward.
+changing the default input target, named plan/build modes, and changing a live loop's
+model or effort unnecessarily awkward.
 
 ## Decision
 
@@ -49,6 +49,7 @@ planner, err := loop.Define(
 	loop.WithInference(client, planningModel),
 	loop.WithSystem(planningPrompt),
 	loop.WithTools(planningTools),
+	loop.WithToolLimits(loop.ToolLimits{Iterations: 25, Calls: 100}),
 	loop.WithDelegates("builder", "reviewer"),
 )
 
@@ -70,7 +71,7 @@ r, err := rig.Define(
 		Failure: rig.SnapshotBestEffort,
 		Timeout: 60 * time.Second,
 	}),
-	rig.WithLimits(limits),
+	rig.WithDelegationLimits(rig.DelegationLimits{Depth: 2, Quota: 64}),
 )
 
 fresh, err := r.NewSession(ctx)
@@ -126,13 +127,16 @@ pkg/rig
     Public definition and session-lifecycle API.
 
 pkg/loop
-    Public immutable Definition and live loop behavior.
+    Public immutable Definition, Mode, ToolLimits, and live Handle contracts.
 
 pkg/session
-    Public live Session operations; no public constructors.
+    Public live Session contract and errors; no public constructors.
+
+internal/loopruntime
+    Concrete loop actor, turn/step machinery, and restoration implementation.
 
 internal/sessionruntime
-    Construction and restoration used only by pkg/rig.
+    Concrete session coordinator, construction, and restoration used by pkg/rig.
 
 pkg/sessionstore
     Durable event ledger, leases, replay, catalog, and offload-blob GC.
@@ -144,14 +148,22 @@ pkg/workspacestore
 Dependency direction is downward:
 
 ```text
-rig → internal/sessionruntime → session → loop
- │             │                │
- ├─────────────┼──────────────→ sessionstore
- └─────────────┴──────────────→ workspacestore
+rig → session (contract) → loop (contract)
+ │          ▲                  ▲
+ │          │                  │
+ ├→ internal/sessionruntime → internal/loopruntime
+ ├──────────────────────────→ sessionstore
+ └──────────────────────────→ workspacestore
 ```
 
 `session` never imports `rig`. `serve` continues depending on narrow local interfaces
 and does not import either concrete package in production.
+
+`loop` and `session` remain public because consumers must define loops, hold loop handles,
+submit work, route input, answer gates, subscribe to events, and shut sessions down. They
+are public **contract packages**, not alternative composition roots. Their live concrete
+implementations and constructors move under `internal`, so an external consumer cannot
+bypass `rig.Define`, `Rig.NewSession`, or `Rig.RestoreSession`.
 
 ## Loop definitions
 
@@ -168,10 +180,13 @@ The initial option set covers the fields currently exposed by `loop.Config`:
 - `WithInference`
 - `WithSystem`
 - `WithTools`
+- `WithToolLimits`
 - `WithEngine`
 - `WithDrainTimeout`
 - `WithRuntimeContext`
 - `WithDelegates`
+- `WithModes`
+- `WithInitialMode`
 
 `loop.Define` validates required dependencies and returns typed definition errors. The
 definition contains no session-specific mutable state. Internal constructors may still
@@ -217,7 +232,20 @@ Initial options:
 | `WithSessionStore(store)` | Supply durable leases, journal, replay, and catalog. |
 | `WithWorkspaceStore(store, root)` | Enable workspace checkpoint and restore capability. |
 | `WithSnapshots(policy)` | Select explicit checkpoint scheduling and failure behavior. |
-| `WithLimits(limits)` | Set session-wide dynamic delegation depth and quota. |
+| `WithDelegationLimits(limits)` | Set session-wide dynamic delegation depth and quota. |
+
+`DelegationLimits.Depth` is the maximum nested delegate chain.
+`DelegationLimits.Quota` is the maximum number of dynamically spawned loops over one
+session's lifetime. Neither field limits model/tool steps.
+
+Per-turn execution limits belong to each loop definition:
+
+```go
+loop.WithToolLimits(loop.ToolLimits{
+	Iterations: 25, // maximum model↔tool round trips in one turn
+	Calls:      100, // maximum total tool executions in one turn
+})
+```
 
 Additional existing construction seams, including foreign-loop builders, gate caps,
 fingerprint fields, config-mismatch policy, and a per-session ceiling factory, move to
@@ -260,7 +288,7 @@ consumer's composition responsibility; a rig receives already-open stores.
 6. Sets the active loop to the loop created from the active primer.
 7. Publishes durable session, loop, and active-loop lifecycle events.
 8. Starts automatic snapshot watching only for `SnapshotOnIdle`.
-9. Returns the live `*session.Session`.
+9. Returns the live `session.Session` contract backed by an internal runtime.
 
 Any failure after lease acquisition releases the lease on a bounded best-effort path.
 The method returns a typed stage error chaining the underlying cause.
@@ -293,10 +321,14 @@ There is no immutable primary loop. Every session has one mutable active loop: t
 default target for `Session.Submit`.
 
 ```go
-func (s *Session) ActiveLoop() loop.Handle
-func (s *Session) SetActiveLoop(ctx context.Context, id uuid.UUID) error
-func (s *Session) Submit(ctx context.Context, blocks []content.Block) (uuid.UUID, error)
-func (s *Session) SubmitToLoop(ctx context.Context, id uuid.UUID, blocks []content.Block) (uuid.UUID, error)
+type Session interface {
+	ActiveLoop() loop.Handle
+	Loop(id uuid.UUID) (loop.Handle, bool)
+	SetActiveLoop(ctx context.Context, id uuid.UUID) error
+	Submit(ctx context.Context, blocks []content.Block) (uuid.UUID, error)
+	SubmitToLoop(ctx context.Context, id uuid.UUID, blocks []content.Block) (uuid.UUID, error)
+	// Existing gate, event, checkpoint, interrupt, and shutdown methods.
+}
 ```
 
 `SetActiveLoop` accepts any live loop, including a dynamically delegated loop. It emits
@@ -305,13 +337,80 @@ Restore folds the last such event. An unknown, exited, or non-live target fails 
 typed error and leaves the prior active loop unchanged.
 
 `SubmitToLoop` remains the explicit routing primitive and keeps its existing loop-ID
-semantics. `Submit` resolves the active loop at dispatch time. This supports plan/build
-modes without conflating loop identity with UI focus or recreating a privileged primary
-role.
+semantics. `Submit` resolves the active loop at dispatch time. Active-loop switching is
+for navigation and routing among **independent loop histories**; it does not merge or
+transfer context. Named plan/build behavior that must retain one conversation uses loop
+modes instead, described below.
+
+## Loop modes
+
+A mode is a named, immutable, definition-time bundle of loop policy that may vary while
+the loop retains its identity and committed message history. It supports plan/build,
+explore/implement, and ordinary/high-effort workflows without pretending two independent
+loops share context.
+
+```go
+operator, err := loop.Define(
+	loop.WithName("operator"),
+	loop.WithInference(client, defaultModel),
+	loop.WithSystem(baseInstructions),
+	loop.WithModes(
+		loop.Mode{
+			Name:         "plan",
+			Model:        planningModel,
+			Effort:       inference.EffortHigh,
+			Tools:        planningTools,
+			Instructions: planningInstructions,
+		},
+		loop.Mode{
+			Name:         "build",
+			Model:        buildingModel,
+			Effort:       inference.EffortMedium,
+			Tools:        buildingTools,
+			Instructions: buildingInstructions,
+		},
+	),
+	loop.WithInitialMode("plan"),
+)
+```
+
+The base definition supplies identity, inference client, base system instructions,
+engine, runtime context, and delegate policy. A mode may select a prevalidated model,
+effort, tool set, tool limits, and additional mode instructions. Arbitrary runtime tools
+or prompt text are never accepted; every selectable mode is fingerprinted as part of the
+immutable definition.
+
+At runtime:
+
+```go
+handle, ok := sess.Loop(loopID)
+err := handle.SetMode(ctx, "build")
+```
+
+`SetMode` validates the name against the loop definition and sends a command through the
+loop actor. It takes effect at the next turn boundary. The current turn finishes entirely
+under the mode captured when it began. A successful change durably appends
+`LoopModeChanged`; restore reapplies the last selected mode before admitting new work.
+
+The loop ID, attribution, turn sequence, and committed history do not change:
+
+```text
+operator loop
+├── shared committed history
+├── turn 1 (plan mode)
+├── LoopModeChanged: plan → build
+└── turn 2 (build mode, same history)
+```
+
+Use separate primer/delegate loops when histories should be isolated, such as independent
+researchers, reviewers, parallel fan-out workers, or focused delegated agents. Use modes
+when one continuing agent changes how it works over the same context.
 
 ## Dynamic loop handle
 
-A session exposes a capability-limited handle for each live loop:
+A session exposes a capability-limited handle for each live loop. Named mode changes are
+the preferred way to change several coordinated properties; direct model/effort changes
+support dynamic model routing that is not a predefined workflow mode:
 
 ```go
 handle, ok := sess.Loop(loopID)
@@ -326,18 +425,21 @@ err := handle.Change(
 `Change` sends a command through the loop actor; it never mutates loop fields from the
 caller goroutine. All changes in one call validate and commit atomically. The first
 version permits changing only the secret-free model descriptor and inference effort.
-Changing the inference client, tools, system prompt, engine, identity, delegates, or
-security posture at runtime is out of scope.
+Changing the inference client, arbitrary tools/prompt text, engine, identity, delegates,
+or security posture at runtime is out of scope. A predeclared mode may change its
+definition-time tool set and mode instructions because those alternatives were validated
+and fingerprinted by `loop.Define`.
 
 Changes take effect at the **next turn boundary**. A running turn, including all of its
 model/tool steps, keeps the model and effort selected when that turn started. This gives
 deterministic request attribution and avoids changing behavior halfway through a tool
 continuation.
 
-A successful change emits an enduring `LoopChanged` event with the loop ID, complete
-secret-free model identity, and effort. Restore folds the latest change per loop before
-accepting input. Invalid models/efforts, exited loops, changes during shutdown, and
-durable-append failures return typed errors and do not partially apply.
+A successful direct change emits an enduring `LoopChanged` event with the loop ID,
+complete secret-free model identity, and effort. A successful named mode change emits
+`LoopModeChanged`. Restore folds the latest changes per loop before accepting input.
+Invalid modes/models/efforts, exited loops, changes during shutdown, and durable-append
+failures return typed errors and do not partially apply.
 
 ## Workspace snapshot policy
 
@@ -445,7 +547,7 @@ type LiveSession interface {
 HTTP routes and wire semantics do not change: create still returns 201 with the minted
 session ID, and restore still addresses the existing ID. Only the injected dependency and
 method names change. Handler tests use a `fakeRig` rather than `fakeRunner`, and the
-dependency guard proves `*rig.Rig` satisfies `serve.Rig[*session.Session]`.
+dependency guard proves `*rig.Rig` satisfies `serve.Rig[session.Session]`.
 
 Because `serve` manages several attached live sessions, its own in-memory attachment map
 remains in `serve`; it is not duplicated in `pkg/rig`.
@@ -462,9 +564,9 @@ The harness change removes rather than deprecates:
 - public `session.New` and `session.Restore`; and
 - `serve.Runner`.
 
-The live `session.Session` type and its control methods remain public. Construction and
-restore code moves behind `pkg/rig`, with shared mechanics under
-`internal/sessionruntime` where needed.
+The live `session.Session` contract and its control methods remain public. Its concrete
+implementation, construction, and restore code move behind `pkg/rig`, under
+`internal/sessionruntime`.
 
 SWE and CLI are deliberately not migrated in this harness spec. Once harness lands, a
 separate cross-module migration spec will replace their manual session factory,
@@ -532,6 +634,9 @@ ActiveLoopChanged
 
 LoopChanged
     session id, loop id, secret-free model descriptor, effort
+
+LoopModeChanged
+    session id, loop id, previous mode, selected mode
 ```
 
 Their codecs, validation profiles, replay folds, catalog implications, and malformed-event
@@ -545,10 +650,14 @@ All tests are table-driven and run under `-race`.
 
 - definition validation and duplicate options;
 - delegate validation deferred to rig graph resolution;
+- named mode validation, unique names, and required initial mode;
+- plan→build mode change preserves loop ID and committed history;
+- mode changes atomically select the declared model, effort, tools, limits, and
+  instructions at the next turn boundary;
 - immutable/deep-copied model and tool metadata;
 - atomic runtime model/effort change;
 - next-turn-only application, including a change requested during an active turn; and
-- restore fold of `LoopChanged`.
+- restore folds of `LoopChanged` and `LoopModeChanged`.
 
 ### `pkg/rig`
 
@@ -556,6 +665,7 @@ All tests are table-driven and run under `-race`.
 - multiple primers created as root loops;
 - active primer selection;
 - definition/delegate graph validation;
+- delegation depth/quota are independent from per-loop tool iteration/call limits;
 - two concurrent sessions share no lease, ceiling, loops, or checkpoint controller;
 - failure at every new-session wiring stage releases the lease;
 - create/shutdown/restore round trip with multiple primers and delegates;
@@ -605,8 +715,8 @@ An integration test over an actual filesystem backend proves:
 - Incremental/per-file snapshots.
 - Treating filesystem watchers as snapshot truth.
 - Automatic workspace snapshot GC.
-- Runtime changes to inference clients, prompts, tools, delegates, engine, identity, or
-  security posture.
+- Arbitrary runtime changes to inference clients, prompts, tools, delegates, engine,
+  identity, or security posture. Predeclared, fingerprinted mode alternatives are allowed.
 - Automatic fan-out or result aggregation semantics. Multiple primers are available and
   explicitly addressable; a higher-level flow may decide how to distribute and combine
   work.
