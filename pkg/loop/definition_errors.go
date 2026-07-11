@@ -6,22 +6,24 @@ import "fmt"
 type DefinitionErrorKind string
 
 const (
-	DefinitionMissingName         DefinitionErrorKind = "missing_name"
-	DefinitionInvalidClient       DefinitionErrorKind = "invalid_client"
-	DefinitionInvalidModel        DefinitionErrorKind = "invalid_model"
-	DefinitionNilOption           DefinitionErrorKind = "nil_option"
-	DefinitionDuplicateOption     DefinitionErrorKind = "duplicate_option"
-	DefinitionInvalidTool         DefinitionErrorKind = "invalid_tool"
-	DefinitionInvalidToolLimits   DefinitionErrorKind = "invalid_tool_limits"
-	DefinitionInvalidDrainTimeout DefinitionErrorKind = "invalid_drain_timeout"
-	DefinitionInvalidMiddleware   DefinitionErrorKind = "invalid_middleware"
-	DefinitionInvalidPermission   DefinitionErrorKind = "invalid_permission_factory"
-	DefinitionInvalidDelegate     DefinitionErrorKind = "invalid_delegate"
-	DefinitionInvalidDelegation   DefinitionErrorKind = "invalid_delegation"
-	DefinitionInvalidMode         DefinitionErrorKind = "invalid_mode"
-	DefinitionDuplicateMode       DefinitionErrorKind = "duplicate_mode"
-	DefinitionMissingInitialMode  DefinitionErrorKind = "missing_initial_mode"
-	DefinitionInvalidInitialMode  DefinitionErrorKind = "invalid_initial_mode"
+	DefinitionMissingName           DefinitionErrorKind = "missing_name"
+	DefinitionInvalidClient         DefinitionErrorKind = "invalid_client"
+	DefinitionInvalidModel          DefinitionErrorKind = "invalid_model"
+	DefinitionNilOption             DefinitionErrorKind = "nil_option"
+	DefinitionDuplicateOption       DefinitionErrorKind = "duplicate_option"
+	DefinitionInvalidTool           DefinitionErrorKind = "invalid_tool"
+	DefinitionInvalidToolLimits     DefinitionErrorKind = "invalid_tool_limits"
+	DefinitionInvalidDrainTimeout   DefinitionErrorKind = "invalid_drain_timeout"
+	DefinitionInvalidMiddleware     DefinitionErrorKind = "invalid_middleware"
+	DefinitionInvalidPermission     DefinitionErrorKind = "invalid_permission_factory"
+	DefinitionInvalidEngine         DefinitionErrorKind = "invalid_engine"
+	DefinitionInvalidRuntimeContext DefinitionErrorKind = "invalid_runtime_context"
+	DefinitionInvalidDelegate       DefinitionErrorKind = "invalid_delegate"
+	DefinitionInvalidDelegation     DefinitionErrorKind = "invalid_delegation"
+	DefinitionInvalidMode           DefinitionErrorKind = "invalid_mode"
+	DefinitionDuplicateMode         DefinitionErrorKind = "duplicate_mode"
+	DefinitionMissingInitialMode    DefinitionErrorKind = "missing_initial_mode"
+	DefinitionInvalidInitialMode    DefinitionErrorKind = "invalid_initial_mode"
 )
 
 // DefinitionError reports an invalid immutable definition.
@@ -58,6 +60,8 @@ const (
 	BindDuplicateToolName       BindErrorKind = "duplicate_tool_name"
 	BindInvalidToolInfo         BindErrorKind = "invalid_tool_info"
 	BindInvalidPermission       BindErrorKind = "invalid_permission"
+	BindInvalidSessionID        BindErrorKind = "invalid_session_id"
+	BindInvalidLoopID           BindErrorKind = "invalid_loop_id"
 )
 
 // BindError reports a failure while creating one loop's runtime collaborators.

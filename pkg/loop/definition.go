@@ -70,6 +70,9 @@ func Define(opts ...Option) (Definition, error) {
 	if err := resolved.model.Validate(); err != nil {
 		return Definition{}, &DefinitionError{Kind: DefinitionInvalidModel, Field: "model", Cause: err}
 	}
+	if !resolved.model.Sampling.Effort.Valid() {
+		return Definition{}, &DefinitionError{Kind: DefinitionInvalidModel, Field: "model.sampling.effort"}
+	}
 	if invalidLimits(resolved.limits) {
 		return Definition{}, &DefinitionError{Kind: DefinitionInvalidToolLimits, Field: "tool_limits"}
 	}
@@ -83,6 +86,12 @@ func Define(opts ...Option) (Definition, error) {
 	}
 	if _, configured := resolved.seen["permission_factory"]; configured && nilLike(resolved.permissionFactory) {
 		return Definition{}, &DefinitionError{Kind: DefinitionInvalidPermission, Field: "permission_factory"}
+	}
+	if resolved.engine != EngineNative && resolved.engine != EngineForeignClaude && resolved.engine != EngineForeignCodex {
+		return Definition{}, &DefinitionError{Kind: DefinitionInvalidEngine, Field: "engine"}
+	}
+	if _, configured := resolved.seen["runtime_context"]; configured && nilLike(resolved.runtimeContext) {
+		return Definition{}, &DefinitionError{Kind: DefinitionInvalidRuntimeContext, Field: "runtime_context"}
 	}
 	if resolved.delegation.Style != DelegationSyncOnly && resolved.delegation.Style != DelegationManaged {
 		return Definition{}, &DefinitionError{Kind: DefinitionInvalidDelegation, Field: "delegation.style"}
@@ -163,6 +172,14 @@ func (d Definition) Bind(ctx context.Context, bindings tool.Bindings) (BoundDefi
 	if ctx == nil {
 		return nil, &BindError{Kind: BindInvalidContext, Index: -1}
 	}
+	if bindings.SessionID.IsZero() {
+		cause := &tool.InvalidBindingsError{Field: "session_id"}
+		return nil, &BindError{Kind: BindInvalidSessionID, Index: -1, Cause: cause}
+	}
+	if bindings.LoopID.IsZero() {
+		cause := &tool.InvalidBindingsError{Field: "loop_id"}
+		return nil, &BindError{Kind: BindInvalidLoopID, Index: -1, Cause: cause}
+	}
 
 	type builtDefinition struct {
 		definition tool.Definition
@@ -230,7 +247,9 @@ func (d Definition) Bind(ctx context.Context, bindings tool.Bindings) (BoundDefi
 	}
 	modes := make([]BoundMode, 0, len(d.state.modes)+1)
 	baseEffort := d.state.model.Sampling.Effort
-	modes = append(modes, BoundMode{Name: "", Model: cloneModel(d.state.model), Effort: baseEffort, Tools: baseTools, ToolLimits: d.state.limits})
+	baseModel := cloneModel(d.state.model)
+	baseModel.Sampling.Effort = baseEffort
+	modes = append(modes, BoundMode{Name: "", Model: baseModel, Effort: baseEffort, Tools: baseTools, ToolLimits: d.state.limits})
 	for _, declared := range d.state.modes {
 		selectedDefinitions := declared.Tools
 		if len(selectedDefinitions) == 0 {
@@ -248,8 +267,10 @@ func (d Definition) Bind(ctx context.Context, bindings tool.Bindings) (BoundDefi
 		if effort == inference.EffortNone {
 			effort = baseEffort
 		}
+		model = cloneModel(model)
+		model.Sampling.Effort = effort
 		modes = append(modes, BoundMode{
-			Name: declared.Name, Model: cloneModel(model), Effort: effort,
+			Name: declared.Name, Model: model, Effort: effort,
 			Tools: instances, ToolLimits: resolveLimits(d.state.limits, declared.ToolLimits),
 			Instructions: declared.Instructions,
 		})
@@ -461,6 +482,9 @@ func validateModes(modes []Mode, initial ModeName) error {
 		if !zeroModel(mode.Model) {
 			if err := mode.Model.Validate(); err != nil {
 				return &DefinitionError{Kind: DefinitionInvalidMode, Field: "mode.model", Value: string(mode.Name), Cause: err}
+			}
+			if !mode.Model.Sampling.Effort.Valid() {
+				return &DefinitionError{Kind: DefinitionInvalidMode, Field: "mode.model.sampling.effort", Value: string(mode.Name)}
 			}
 		}
 		if !mode.Effort.Valid() || invalidLimits(mode.ToolLimits) {

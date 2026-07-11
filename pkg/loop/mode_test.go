@@ -22,6 +22,7 @@ func TestModeValidation(t *testing.T) {
 		{name: "duplicate mode", modes: []Mode{{Name: "plan"}, {Name: "plan"}}, initial: "plan", kind: DefinitionDuplicateMode},
 		{name: "unknown initial", modes: []Mode{{Name: "plan"}}, initial: "build", kind: DefinitionInvalidInitialMode},
 		{name: "invalid effort", modes: []Mode{{Name: "plan", Effort: inference.Effort("huge")}}, initial: "plan", kind: DefinitionInvalidMode},
+		{name: "invalid model sampling effort", modes: []Mode{{Name: "plan", Model: modelWithEffort(inference.Effort("huge"))}}, initial: "plan", kind: DefinitionInvalidMode},
 		{name: "invalid limits", modes: []Mode{{Name: "plan", ToolLimits: ToolLimits{Parallel: -1}}}, initial: "plan", kind: DefinitionInvalidMode},
 		{name: "initial without modes", initial: "plan", kind: DefinitionInvalidInitialMode},
 	}
@@ -39,6 +40,15 @@ func TestModeValidation(t *testing.T) {
 				t.Fatalf("Define error = %T %v, want %q", err, err, tt.kind)
 			}
 		})
+	}
+}
+
+func TestDefinitionRejectsInvalidBaseSamplingEffort(t *testing.T) {
+	t.Parallel()
+	_, err := Define(WithName("agent"), WithInference(&fakeLLM{}, modelWithEffort(inference.Effort("huge"))))
+	var definitionErr *DefinitionError
+	if !errors.As(err, &definitionErr) || definitionErr.Kind != DefinitionInvalidModel {
+		t.Fatalf("Define error = %T %v, want invalid model", err, err)
 	}
 }
 
@@ -63,4 +73,41 @@ func TestModeResolutionAndCopy(t *testing.T) {
 	if mode.ToolLimits != (ToolLimits{Iterations: 3, Calls: 7, Parallel: 2}) {
 		t.Fatalf("resolved limits = %+v", mode.ToolLimits)
 	}
+}
+
+func TestModeEffectiveEffortIsStampedIntoModel(t *testing.T) {
+	t.Parallel()
+	baseModel := modelWithEffort(inference.EffortLow)
+	d, err := Define(
+		WithName("agent"), WithInference(&fakeLLM{}, baseModel),
+		WithModes(
+			Mode{Name: "inherit", Model: modelWithEffort(inference.EffortMax)},
+			Mode{Name: "override", Effort: inference.EffortHigh},
+		),
+		WithInitialMode("inherit"),
+	)
+	if err != nil {
+		t.Fatalf("Define: %v", err)
+	}
+	b, err := d.Bind(context.Background(), validToolBindings(t))
+	if err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+	base, _ := b.Mode("")
+	inherit, _ := b.Mode("inherit")
+	override, _ := b.Mode("override")
+	for name, mode := range map[string]BoundMode{"base": base, "inherit": inherit} {
+		if mode.Effort != inference.EffortLow || mode.Model.Sampling.Effort != inference.EffortLow {
+			t.Errorf("%s effort = %q model effort = %q, want low", name, mode.Effort, mode.Model.Sampling.Effort)
+		}
+	}
+	if override.Effort != inference.EffortHigh || override.Model.Sampling.Effort != inference.EffortHigh {
+		t.Errorf("override effort = %q model effort = %q, want high", override.Effort, override.Model.Sampling.Effort)
+	}
+}
+
+func modelWithEffort(effort inference.Effort) inference.Model {
+	model := testModel()
+	model.Sampling.Effort = effort
+	return model
 }

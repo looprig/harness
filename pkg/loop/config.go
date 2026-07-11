@@ -16,7 +16,6 @@ func configFromBound(bound BoundDefinition, modeName ModeName) (Config, error) {
 		return Config{}, &BindError{Kind: BindInvalidDefinition, Name: string(modeName), Index: -1}
 	}
 	model := cloneModel(mode.Model)
-	model.Sampling.Effort = mode.Effort
 	system := bound.System()
 	if system == "" {
 		system = mode.Instructions

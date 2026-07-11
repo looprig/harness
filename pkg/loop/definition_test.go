@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/looprig/core/content"
-	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/tool"
 	"github.com/looprig/inference"
@@ -31,6 +30,9 @@ func TestDefineValidation(t *testing.T) {
 		{name: "negative drain", opts: []Option{WithName("a"), WithInference(&fakeLLM{}, testModel()), WithDrainTimeout(-time.Second)}, kind: DefinitionInvalidDrainTimeout},
 		{name: "nil middleware", opts: []Option{WithName("a"), WithInference(&fakeLLM{}, testModel()), WithToolMiddlewares(nil)}, kind: DefinitionInvalidMiddleware},
 		{name: "nil permission factory", opts: []Option{WithName("a"), WithInference(&fakeLLM{}, testModel()), WithPermissionFactory(nil)}, kind: DefinitionInvalidPermission},
+		{name: "invalid engine", opts: []Option{WithName("a"), WithInference(&fakeLLM{}, testModel()), WithEngine(Engine(99))}, kind: DefinitionInvalidEngine},
+		{name: "nil runtime context", opts: []Option{WithName("a"), WithInference(&fakeLLM{}, testModel()), WithRuntimeContext(nil)}, kind: DefinitionInvalidRuntimeContext},
+		{name: "typed nil runtime context", opts: []Option{WithName("a"), WithInference(&fakeLLM{}, testModel()), WithRuntimeContext((*nilRuntimeContext)(nil))}, kind: DefinitionInvalidRuntimeContext},
 		{name: "empty delegate", opts: []Option{WithName("a"), WithInference(&fakeLLM{}, testModel()), WithDelegates("")}, kind: DefinitionInvalidDelegate},
 		{name: "invalid delegation", opts: []Option{WithName("a"), WithInference(&fakeLLM{}, testModel()), WithDelegation(Delegation{Style: DelegationStyle(99)})}, kind: DefinitionInvalidDelegation},
 	}
@@ -44,6 +46,48 @@ func TestDefineValidation(t *testing.T) {
 				t.Fatalf("Define() error = %T %v, want *DefinitionError kind %q", err, err, tt.kind)
 			}
 		})
+	}
+}
+
+func TestDefinitionBindValidatesIDsBeforeFactories(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name     string
+		bindings tool.Bindings
+		kind     BindErrorKind
+	}{
+		{name: "missing session ID", bindings: tool.Bindings{LoopID: mustUUID(t)}, kind: BindInvalidSessionID},
+		{name: "missing loop ID", bindings: tool.Bindings{SessionID: mustUUID(t)}, kind: BindInvalidLoopID},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			var permissionCalls atomic.Int32
+			d := mustDefinition(t, WithPermissionFactory(func(context.Context, tool.Bindings) (PermissionGate, error) {
+				permissionCalls.Add(1)
+				return permissionGateStub{}, nil
+			}))
+			_, err := d.Bind(context.Background(), tt.bindings)
+			var bindErr *BindError
+			if !errors.As(err, &bindErr) || bindErr.Kind != tt.kind {
+				t.Fatalf("Bind error = %T %v, want kind %q", err, err, tt.kind)
+			}
+			var bindingsErr *tool.InvalidBindingsError
+			if !errors.As(err, &bindingsErr) {
+				t.Fatalf("Bind error cause = %T %v, want *tool.InvalidBindingsError", err, err)
+			}
+			if permissionCalls.Load() != 0 {
+				t.Fatalf("permission factory called %d times before ID validation", permissionCalls.Load())
+			}
+		})
+	}
+
+	toolFree := mustDefinition(t)
+	_, err := toolFree.Bind(context.Background(), tool.Bindings{})
+	var bindErr *BindError
+	if !errors.As(err, &bindErr) || bindErr.Kind != BindInvalidSessionID {
+		t.Fatalf("tool-free Bind error = %T %v", err, err)
 	}
 }
 
@@ -207,15 +251,7 @@ func mustDefinition(t *testing.T, opts ...Option) Definition {
 
 func validToolBindings(t *testing.T) tool.Bindings {
 	t.Helper()
-	sessionID, err := uuid.New()
-	if err != nil {
-		t.Fatal(err)
-	}
-	loopID, err := uuid.New()
-	if err != nil {
-		t.Fatal(err)
-	}
-	return tool.Bindings{SessionID: sessionID, LoopID: loopID}
+	return tool.Bindings{SessionID: mustUUID(t), LoopID: mustUUID(t)}
 }
 
 func testToolDefinition(name string, builds *atomic.Int32, toolNames []string) tool.Definition {
@@ -272,3 +308,7 @@ func (*nilPermissionGate) Check(context.Context, tool.InvokableTool, string, str
 func (*nilPermissionGate) Grant(context.Context, string, string, tool.ApprovalScope) error {
 	return nil
 }
+
+type nilRuntimeContext struct{}
+
+func (*nilRuntimeContext) Blocks(context.Context) []content.Block { return nil }
