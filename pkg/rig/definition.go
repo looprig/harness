@@ -2,18 +2,20 @@ package rig
 
 import (
 	"github.com/looprig/harness/internal/sessionruntime"
+	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/harness/pkg/sessionstore"
 )
 
 type definitionState struct {
-	loops            []loop.Definition
-	primers          []string
-	activePrimer     string
-	store            *sessionstore.Store
-	storeSet         bool
-	seen             map[string]bool
-	lifecycleOptions []sessionruntime.LifecycleOption
+	loops             []loop.Definition
+	primers           []string
+	activePrimer      string
+	store             *sessionstore.Store
+	storeSet          bool
+	seen              map[string]bool
+	lifecycleOptions  []sessionruntime.LifecycleOption
+	fingerprintFields ConfigFingerprintFields
 }
 
 // Rig is an immutable design-time assembly that creates and restores sessions.
@@ -51,7 +53,13 @@ func Define(options ...Option) (*Rig, error) {
 	if state.activePrimer != "" && state.activePrimer != name {
 		return nil, &DefinitionError{Kind: DefinitionInvalidActivePrimer, Name: state.activePrimer}
 	}
-	lifecycle, err := sessionruntime.NewLifecycle(state.loops[0], state.store, state.lifecycleOptions...)
+	fields := state.fingerprintFields
+	provider := sessionruntime.FingerprintProvider(func(definition loop.BoundDefinition) event.ConfigFingerprint {
+		return fingerprintWith(definition, fields)
+	})
+	lifecycleOptions := append([]sessionruntime.LifecycleOption(nil), state.lifecycleOptions...)
+	lifecycleOptions = append(lifecycleOptions, sessionruntime.WithLifecycleFingerprintProvider(provider))
+	lifecycle, err := sessionruntime.NewLifecycle(state.loops[0], state.store, lifecycleOptions...)
 	if err != nil {
 		return nil, &DefinitionError{Kind: DefinitionInvalidSessionStore, Cause: err}
 	}

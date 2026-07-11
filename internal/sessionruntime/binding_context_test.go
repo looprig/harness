@@ -71,7 +71,7 @@ func assertCapturedBinding(t *testing.T, capture *bindingCapture, sessionID, loo
 
 func TestNewPrimaryBindsOnceWithOwnedSessionContext(t *testing.T) {
 	capture := &bindingCapture{}
-	s, err := New(context.Background(), capturedDefinition(capture, "system", loop.EngineNative))
+	s, err := newTestSession(context.Background(), capturedDefinition(capture, "system", loop.EngineNative))
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -93,7 +93,7 @@ func TestNewPrimaryBindsOnceWithOwnedSessionContext(t *testing.T) {
 
 func TestNewFailureCancelsBoundSessionContext(t *testing.T) {
 	capture := &bindingCapture{}
-	_, err := New(context.Background(), capturedDefinition(capture, "system", loop.EngineForeignClaude))
+	_, err := newTestSession(context.Background(), capturedDefinition(capture, "system", loop.EngineForeignClaude))
 	var sessionErr *SessionError
 	if !errors.As(err, &sessionErr) || sessionErr.Kind != SessionForeignBuilderMissing {
 		t.Fatalf("New error = %v", err)
@@ -108,7 +108,7 @@ func TestNewFailureCancelsBoundSessionContext(t *testing.T) {
 
 func TestNewBindFailureCancelsOwnedSessionContext(t *testing.T) {
 	capture := &bindingCapture{factoryErr: errors.New("bind failed")}
-	_, err := New(context.Background(), capturedDefinition(capture, "system", loop.EngineNative))
+	_, err := newTestSession(context.Background(), capturedDefinition(capture, "system", loop.EngineNative))
 	if err == nil {
 		t.Fatal("New succeeded, want bind failure")
 	}
@@ -127,7 +127,7 @@ func TestRestorePrimaryBindsOnceWithTransferredSessionContext(t *testing.T) {
 	handOver(t, orig.lease)
 
 	capture := &bindingCapture{}
-	s, err := Restore(context.Background(), capturedDefinition(capture, "system", loop.EngineNative), orig.sessionID, store)
+	s, err := restoreTestSession(context.Background(), capturedDefinition(capture, "system", loop.EngineNative), orig.sessionID, store)
 	if err != nil {
 		t.Fatalf("Restore: %v", err)
 	}
@@ -154,7 +154,7 @@ func TestRestoreFailureCancelsBoundSessionContext(t *testing.T) {
 	handOver(t, orig.lease)
 
 	capture := &bindingCapture{}
-	_, err := Restore(context.Background(), capturedDefinition(capture, "different system", loop.EngineNative), orig.sessionID, store)
+	_, err := restoreTestSession(context.Background(), capturedDefinition(capture, "different system", loop.EngineNative), orig.sessionID, store)
 	if err == nil {
 		t.Fatal("Restore succeeded, want fingerprint mismatch")
 	}
@@ -173,7 +173,7 @@ func TestRestoreBindFailureCancelsOwnedSessionContext(t *testing.T) {
 	handOver(t, orig.lease)
 
 	capture := &bindingCapture{factoryErr: errors.New("bind failed")}
-	_, err := Restore(context.Background(), capturedDefinition(capture, "system", loop.EngineNative), orig.sessionID, store)
+	_, err := restoreTestSession(context.Background(), capturedDefinition(capture, "system", loop.EngineNative), orig.sessionID, store)
 	if err == nil {
 		t.Fatal("Restore succeeded, want bind failure")
 	}

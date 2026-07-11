@@ -3,16 +3,17 @@ package rig
 type DefinitionErrorKind string
 
 const (
-	DefinitionNilOption           DefinitionErrorKind = "nil_option"
-	DefinitionMissingLoop         DefinitionErrorKind = "missing_loop"
-	DefinitionInvalidLoop         DefinitionErrorKind = "invalid_loop"
-	DefinitionDuplicateLoop       DefinitionErrorKind = "duplicate_loop"
-	DefinitionMissingPrimer       DefinitionErrorKind = "missing_primer"
-	DefinitionInvalidPrimer       DefinitionErrorKind = "invalid_primer"
-	DefinitionInvalidActivePrimer DefinitionErrorKind = "invalid_active_primer"
-	DefinitionMissingSessionStore DefinitionErrorKind = "missing_session_store"
-	DefinitionInvalidSessionStore DefinitionErrorKind = "invalid_session_store"
-	DefinitionDuplicateOption     DefinitionErrorKind = "duplicate_option"
+	DefinitionNilOption             DefinitionErrorKind = "nil_option"
+	DefinitionMissingLoop           DefinitionErrorKind = "missing_loop"
+	DefinitionInvalidLoop           DefinitionErrorKind = "invalid_loop"
+	DefinitionDuplicateLoop         DefinitionErrorKind = "duplicate_loop"
+	DefinitionMissingPrimer         DefinitionErrorKind = "missing_primer"
+	DefinitionInvalidPrimer         DefinitionErrorKind = "invalid_primer"
+	DefinitionInvalidActivePrimer   DefinitionErrorKind = "invalid_active_primer"
+	DefinitionMissingSessionStore   DefinitionErrorKind = "missing_session_store"
+	DefinitionInvalidSessionStore   DefinitionErrorKind = "invalid_session_store"
+	DefinitionInvalidCeilingFactory DefinitionErrorKind = "invalid_ceiling_factory"
+	DefinitionDuplicateOption       DefinitionErrorKind = "duplicate_option"
 )
 
 type DefinitionError struct {

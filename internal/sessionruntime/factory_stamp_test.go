@@ -36,7 +36,7 @@ func (g *seqGen) gen() (uuid.UUID, error) {
 // The clock and id-gen are pinned so the assertion is deterministic.
 func TestLoopStartedStamped(t *testing.T) {
 	t.Parallel()
-	s, err := New(context.Background(), cfg(&stubLLM{chunks: []content.Chunk{textChunk("x")}}))
+	s, err := newTestSession(context.Background(), cfg(&stubLLM{chunks: []content.Chunk{textChunk("x")}}))
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -90,7 +90,7 @@ func TestSessionStartedStamped(t *testing.T) {
 	t.Parallel()
 	ts := time.Date(2026, 6, 21, 9, 30, 0, 0, time.UTC)
 
-	s, err := New(context.Background(), cfg(&stubLLM{chunks: []content.Chunk{textChunk("x")}}))
+	s, err := newTestSession(context.Background(), cfg(&stubLLM{chunks: []content.Chunk{textChunk("x")}}))
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -157,7 +157,7 @@ func TestNewSessionStartedMintErrorFails(t *testing.T) {
 	// Succeed once (the session id), then fail (the SessionStarted EventID stamp).
 	gen := &failOnCallGen{failAfter: 1, err: genErr}
 
-	s, err := newSession(context.Background(), cfg(&stubLLM{chunks: []content.Chunk{textChunk("x")}}), gen.gen, time.Now)
+	s, err := newSession(context.Background(), cfg(&stubLLM{chunks: []content.Chunk{textChunk("x")}}), gen.gen, time.Now, WithFingerprintProvider(testFingerprintProvider))
 	if s != nil {
 		t.Fatalf("newSession returned a non-nil session on a mint failure; want nil (no half-built session)")
 	}

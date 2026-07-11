@@ -31,7 +31,7 @@ func allFilter() event.EventFilter {
 // session-scoped event after subscribing and seeing it arrive.
 func TestHubWiringDeliversSessionEvents(t *testing.T) {
 	t.Parallel()
-	s, err := New(context.Background(), cfg(&stubLLM{chunks: []content.Chunk{textChunk("x")}}))
+	s, err := newTestSession(context.Background(), cfg(&stubLLM{chunks: []content.Chunk{textChunk("x")}}))
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -69,7 +69,7 @@ func TestHubWiringDeliversSessionEvents(t *testing.T) {
 // contract the TUI depends on.
 func TestSubscribeSeamDefaultFilterDeliversSessionEvent(t *testing.T) {
 	t.Parallel()
-	s, err := New(context.Background(), cfg(&stubLLM{chunks: []content.Chunk{textChunk("x")}}))
+	s, err := newTestSession(context.Background(), cfg(&stubLLM{chunks: []content.Chunk{textChunk("x")}}))
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -115,7 +115,7 @@ func TestSubscribeSeamDefaultFilterDeliversSessionEvent(t *testing.T) {
 // so WaitIdle returns nil immediately.
 func TestWaitIdleFreshSession(t *testing.T) {
 	t.Parallel()
-	s, err := New(context.Background(), cfg(&stubLLM{chunks: []content.Chunk{textChunk("x")}}))
+	s, err := newTestSession(context.Background(), cfg(&stubLLM{chunks: []content.Chunk{textChunk("x")}}))
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -134,7 +134,7 @@ func TestWaitIdleFreshSession(t *testing.T) {
 // not flip the phase back to idle/active (WaitIdle keeps returning ErrSessionStopped).
 func TestShutdownStopsSessionAndWaitIdle(t *testing.T) {
 	t.Parallel()
-	s, err := New(context.Background(), cfg(&stubLLM{chunks: []content.Chunk{textChunk("x")}}))
+	s, err := newTestSession(context.Background(), cfg(&stubLLM{chunks: []content.Chunk{textChunk("x")}}))
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -185,7 +185,7 @@ func TestShutdownStopsSessionAndWaitIdle(t *testing.T) {
 // inert in production (no async subagents yet) but the wiring is exercised here.
 func TestExpectCancelExpectTurnSessionWiring(t *testing.T) {
 	t.Parallel()
-	s, err := New(context.Background(), cfg(&stubLLM{chunks: []content.Chunk{textChunk("x")}}))
+	s, err := newTestSession(context.Background(), cfg(&stubLLM{chunks: []content.Chunk{textChunk("x")}}))
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -273,7 +273,7 @@ func firstMatching[T event.Event](t *testing.T, sub event.Subscription) (T, bool
 // attaches AFTER NewLoop never sees that LoopStarted.
 func TestLoopStartedPublishedOnNewLoop(t *testing.T) {
 	t.Parallel()
-	s, err := New(context.Background(), cfg(&stubLLM{chunks: []content.Chunk{textChunk("x")}}))
+	s, err := newTestSession(context.Background(), cfg(&stubLLM{chunks: []content.Chunk{textChunk("x")}}))
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}

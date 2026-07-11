@@ -123,13 +123,9 @@ type Session struct {
 	// consults it. Default false = fail-secure (a mismatch rejects the restore).
 	allowConfigMismatch bool
 
-	// configFingerprintFields are the swarm-level fingerprint inputs not on loop.Definition
-	// (AgentKind, RuntimeSkills, WorkspaceRoot), injected via WithConfigFingerprintFields.
-	// New merges them onto the loop-derived fingerprint it stamps on SessionStarted;
-	// Restore merges them onto the LIVE fingerprint it compares against the persisted one
-	// (so a different skill-trust mode or workspace can't silently resume). Zero (the
-	// default, no option) leaves them empty — a non-swarm/legacy session is unaffected.
-	configFingerprintFields ConfigFingerprintFields
+	// fingerprint is required composition wiring supplied by rig and is the single
+	// projection used by both new and restored sessions.
+	fingerprint FingerprintProvider
 
 	// injectedSessionID is the externally-minted sessionID the composition root supplies
 	// via WithSessionID, read ONLY by newSession to resolve the journal chicken-and-egg:
@@ -327,6 +323,10 @@ func (s *Session) SubscribeEvents(filter event.EventFilter) (event.Subscription,
 }
 
 func (s *Session) SessionID() uuid.UUID { return s.sessionID }
+
+func (s *Session) projectFingerprint(definition loop.BoundDefinition) event.ConfigFingerprint {
+	return s.fingerprint(definition)
+}
 
 func (s *Session) ActiveLoop() loop.Handle {
 	s.loopsMu.RLock()
@@ -789,6 +789,10 @@ func newSession(ctx context.Context, cfg loop.Definition, newID idGenerator, now
 	for _, opt := range opts {
 		opt(s)
 	}
+	if s.fingerprint == nil {
+		sessionCancel()
+		return nil, &MissingFingerprintProviderError{}
+	}
 	// Default-mint the security-ceiling source when the composition root did not inject
 	// one via WithCeiling, so SetSecurityCeiling/CeilingSource are always safe (never a
 	// nil-deref). A fresh session starts at the fail-secure most-restrictive ordinal (0)
@@ -846,10 +850,9 @@ func newSession(ctx context.Context, cfg loop.Definition, newID idGenerator, now
 	// nobody (a no-op), but it is the session's authoritative session-scoped start.
 	// Config is the fingerprint of the agent configuration this session started
 	// under, stamped here so a durable journal can detect a config change on restore.
-	// It merges the loop-derived fingerprint with the swarm-level fields the composition
-	// root injected (AgentKind/RuntimeSkills/WorkspaceRoot), via the SAME fingerprintWith
-	// the restore comparison uses, so the stamped and compared-against fingerprints match.
-	if err := s.hub.PublishEvent(sessionCtx, event.SessionStarted{Header: startedHeader, Config: fingerprintWith(primaryBound, s.configFingerprintFields)}); err != nil {
+	// Rig supplies the SAME projection the restore comparison uses, so the stamped and
+	// compared-against fingerprints cannot drift.
+	if err := s.hub.PublishEvent(sessionCtx, event.SessionStarted{Header: startedHeader, Config: s.projectFingerprint(primaryBound)}); err != nil {
 		sessionCancel()
 		return nil, &SessionError{Kind: SessionContextDone, Cause: err}
 	}

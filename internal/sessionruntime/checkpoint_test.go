@@ -141,7 +141,7 @@ func TestCheckpointWorkspace(t *testing.T) {
 				ws, root := checkpointFixture(t, nil)
 				opts = append(opts, WithWorkspaceStore(ws, root))
 			}
-			s, err := New(ctx, cfg(&stubLLM{}), opts...)
+			s, err := newTestSession(ctx, cfg(&stubLLM{}), opts...)
 			if err != nil {
 				t.Fatalf("New: %v", err)
 			}
@@ -195,7 +195,7 @@ func TestCheckpointWorkspaceSnapshotBeforeAppend(t *testing.T) {
 	ws, root := checkpointFixture(t, probe)
 	app := &checkpointAppender{probe: probe}
 
-	s, err := New(ctx, cfg(&stubLLM{}), WithEventAppender(app), WithWorkspaceStore(ws, root))
+	s, err := newTestSession(ctx, cfg(&stubLLM{}), WithEventAppender(app), WithWorkspaceStore(ws, root))
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -233,7 +233,7 @@ func TestCheckpointWorkspaceReCheckpointNoOpUpload(t *testing.T) {
 	ws, root := checkpointFixture(t, probe)
 	rec := &recordingEventAppender{}
 
-	s, err := New(ctx, cfg(&stubLLM{}), WithEventAppender(rec), WithWorkspaceStore(ws, root))
+	s, err := newTestSession(ctx, cfg(&stubLLM{}), WithEventAppender(rec), WithWorkspaceStore(ws, root))
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}

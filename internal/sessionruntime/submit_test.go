@@ -252,7 +252,7 @@ func waitTurnStartedOn(r *recordingSub, loopID uuid.UUID, d time.Duration) (even
 // (primary loop, AgencyUser) and the later subagent path both build on.
 func TestSubmitToLoopTargetsSubLoop(t *testing.T) {
 	t.Parallel()
-	s, err := New(context.Background(), cfg(&stubLLM{chunks: []content.Chunk{textChunk("hi")}}))
+	s, err := newTestSession(context.Background(), cfg(&stubLLM{chunks: []content.Chunk{textChunk("hi")}}))
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -329,7 +329,7 @@ func TestSubmitToLoop(t *testing.T) {
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			s, err := New(context.Background(), cfg(&stubLLM{chunks: []content.Chunk{textChunk("hi")}}))
+			s, err := newTestSession(context.Background(), cfg(&stubLLM{chunks: []content.Chunk{textChunk("hi")}}))
 			if err != nil {
 				t.Fatalf("New: %v", err)
 			}

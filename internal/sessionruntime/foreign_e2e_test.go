@@ -256,7 +256,7 @@ func TestForeignPrimaryE2E(t *testing.T) {
 	agent := &fakeForeignAgent{transcript: missingTranscript(t), script: foreignScript("result text")}
 	spec := foreignloop.Spec{Agent: agent, Cwd: t.TempDir()}
 
-	s, err := New(ctx, foreignPrimaryCfg(),
+	s, err := newTestSession(ctx, foreignPrimaryCfg(),
 		WithForeignBuilder(foreignloop.BuildWith(spec), foreignloop.BuildRestoredWith(spec)),
 		WithEventAppender(rec))
 	if err != nil {
@@ -329,7 +329,7 @@ func TestCodexForeignPrimaryLateBoundPublishesBoundAndTurnDone(t *testing.T) {
 	agent := &fakeForeignAgent{transcript: missingTranscript(t), script: foreignLateBoundScript(boundSID, "codex result")}
 	spec := foreignloop.Spec{Agent: agent, Cwd: t.TempDir(), SIDMode: foreignloop.SIDLateBound}
 
-	s, err := New(ctx, codexForeignPrimaryCfg(),
+	s, err := newTestSession(ctx, codexForeignPrimaryCfg(),
 		WithForeignBuilder(foreignloop.BuildWith(spec), foreignloop.BuildRestoredWith(spec)),
 		WithEventAppender(rec))
 	if err != nil {
@@ -410,7 +410,7 @@ func TestForeignSubagentE2E(t *testing.T) {
 	spec := foreignloop.Spec{Agent: agent, Cwd: t.TempDir()}
 
 	// Native primary (Engine zero) with a working native cfg + stub LLM.
-	s, err := New(ctx, cfg(&stubLLM{chunks: []content.Chunk{textChunk("primary")}}),
+	s, err := newTestSession(ctx, cfg(&stubLLM{chunks: []content.Chunk{textChunk("primary")}}),
 		WithForeignBuilder(foreignloop.BuildWith(spec), foreignloop.BuildRestoredWith(spec)),
 		WithEventAppender(rec))
 	if err != nil {
@@ -453,7 +453,7 @@ func TestCodexForeignSubagentLateBoundReturnsFinalText(t *testing.T) {
 	agent := &fakeForeignAgent{transcript: missingTranscript(t), script: foreignLateBoundScript(boundSID, "codex subagent final")}
 	spec := foreignloop.Spec{Agent: agent, Cwd: t.TempDir(), SIDMode: foreignloop.SIDLateBound}
 
-	s, err := New(ctx, cfg(&stubLLM{chunks: []content.Chunk{textChunk("primary")}}),
+	s, err := newTestSession(ctx, cfg(&stubLLM{chunks: []content.Chunk{textChunk("primary")}}),
 		WithForeignBuilder(foreignloop.BuildWith(spec), foreignloop.BuildRestoredWith(spec)),
 		WithEventAppender(rec))
 	if err != nil {
@@ -516,7 +516,7 @@ func TestForeignSubagentQuotaCap(t *testing.T) {
 	agent := &fakeForeignAgent{transcript: missingTranscript(t), script: foreignScript("ok")}
 	spec := foreignloop.Spec{Agent: agent, Cwd: t.TempDir()}
 
-	s, err := New(ctx, cfg(&stubLLM{chunks: []content.Chunk{textChunk("primary")}}),
+	s, err := newTestSession(ctx, cfg(&stubLLM{chunks: []content.Chunk{textChunk("primary")}}),
 		WithForeignBuilder(foreignloop.BuildWith(spec), foreignloop.BuildRestoredWith(spec)),
 		WithLimits(Limits{Quota: 1}))
 	if err != nil {

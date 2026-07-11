@@ -24,7 +24,7 @@ import (
 func TestRunSubagentReturnsFinalText(t *testing.T) {
 	t.Parallel()
 
-	s, err := New(context.Background(), cfg(&stubLLM{chunks: []content.Chunk{textChunk("primary")}}))
+	s, err := newTestSession(context.Background(), cfg(&stubLLM{chunks: []content.Chunk{textChunk("primary")}}))
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -86,7 +86,7 @@ func TestRunSubagentReturnsFinalText(t *testing.T) {
 func TestRunSubagentStampsParentToolUseID(t *testing.T) {
 	t.Parallel()
 
-	s, err := New(context.Background(), cfg(&stubLLM{chunks: []content.Chunk{textChunk("primary")}}))
+	s, err := newTestSession(context.Background(), cfg(&stubLLM{chunks: []content.Chunk{textChunk("primary")}}))
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -139,7 +139,7 @@ func TestRunSubagentStampsParentToolUseID(t *testing.T) {
 func TestRunSubagentPropagatesSessionClosing(t *testing.T) {
 	t.Parallel()
 
-	s, err := New(context.Background(), cfg(&stubLLM{chunks: []content.Chunk{textChunk("x")}}))
+	s, err := newTestSession(context.Background(), cfg(&stubLLM{chunks: []content.Chunk{textChunk("x")}}))
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}

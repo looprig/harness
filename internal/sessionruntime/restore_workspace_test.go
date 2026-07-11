@@ -237,7 +237,7 @@ func TestRestoreMaterializesWorkspace(t *testing.T) {
 			handOver(t, orig.lease)
 
 			freshRoot := t.TempDir() // empty → truth path (extract)
-			s, err := Restore(context.Background(), restoreCfg(&stubLLM{}, "model-x", "be helpful"),
+			s, err := restoreTestSession(context.Background(), restoreCfg(&stubLLM{}, "model-x", "be helpful"),
 				orig.sessionID, store, WithWorkspaceStore(ws, freshRoot))
 			if err != nil {
 				t.Fatalf("Restore: %v", err)
@@ -303,7 +303,7 @@ func TestRestoreMaterializesEffectiveCurrentWorkspace(t *testing.T) {
 	handOver(t, lease)
 
 	freshRoot := t.TempDir()
-	s, err := Restore(context.Background(), restoreCfg(&stubLLM{}, "model-x", "be helpful"),
+	s, err := restoreTestSession(context.Background(), restoreCfg(&stubLLM{}, "model-x", "be helpful"),
 		sessionID, store, WithWorkspaceStore(ws, freshRoot))
 	if err != nil {
 		t.Fatalf("Restore: %v", err)
@@ -363,7 +363,7 @@ func TestRestoreSkipsWorkspaceMaterialize(t *testing.T) {
 			if tt.wireStore {
 				opts = append(opts, WithWorkspaceStore(ws, root))
 			}
-			s, err := Restore(context.Background(), restoreCfg(&stubLLM{}, "model-x", "be helpful"),
+			s, err := restoreTestSession(context.Background(), restoreCfg(&stubLLM{}, "model-x", "be helpful"),
 				orig.sessionID, store, opts...)
 			if err != nil {
 				t.Fatalf("Restore: %v", err)
@@ -410,7 +410,7 @@ func TestRestoreWorkspaceWarmVolumeReuse(t *testing.T) {
 	before := wsSnapshotTree(t, warmRoot)
 	getsBeforeRestore := blobs.gets.Load()
 
-	s, err := Restore(context.Background(), restoreCfg(&stubLLM{}, "model-x", "be helpful"),
+	s, err := restoreTestSession(context.Background(), restoreCfg(&stubLLM{}, "model-x", "be helpful"),
 		orig.sessionID, store, WithWorkspaceStore(ws, warmRoot))
 	if err != nil {
 		t.Fatalf("Restore (warm volume): %v", err)
@@ -508,7 +508,7 @@ func TestRestoreWorkspaceMaterializeFailsClosed(t *testing.T) {
 			orig := stampCheckpoint(t, store, fp, ref)
 			handOver(t, orig.lease)
 
-			s, err := Restore(context.Background(), restoreCfg(&stubLLM{}, "model-x", "be helpful"),
+			s, err := restoreTestSession(context.Background(), restoreCfg(&stubLLM{}, "model-x", "be helpful"),
 				orig.sessionID, store, WithWorkspaceStore(ws, root))
 
 			// (a) No session comes up.

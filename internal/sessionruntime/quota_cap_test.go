@@ -29,7 +29,7 @@ func TestNewLoopQuotaCap(t *testing.T) {
 	const quota = 3
 	// Depth is set high so the quota — not the depth cap — is the limiting factor (every
 	// spawn here is a direct child of the primary, chain length 1).
-	s, err := New(context.Background(),
+	s, err := newTestSession(context.Background(),
 		cfg(&stubLLM{chunks: []content.Chunk{textChunk("primary")}}),
 		WithLimits(Limits{Depth: 10, Quota: quota}))
 	if err != nil {
@@ -76,7 +76,7 @@ func TestNewLoopQuotaConcurrent(t *testing.T) {
 	t.Parallel()
 	const quota = 8
 	const goroutines = 40
-	s, err := New(context.Background(),
+	s, err := newTestSession(context.Background(),
 		cfg(&stubLLM{chunks: []content.Chunk{textChunk("primary")}}),
 		WithLimits(Limits{Depth: 10, Quota: quota}))
 	if err != nil {
@@ -127,7 +127,7 @@ func TestNewLoopQuotaConcurrent(t *testing.T) {
 func TestNewLoopQuotaRollback(t *testing.T) {
 	t.Parallel()
 	const quota = 2
-	s, err := New(context.Background(),
+	s, err := newTestSession(context.Background(),
 		cfg(&stubLLM{chunks: []content.Chunk{textChunk("primary")}}),
 		WithLimits(Limits{Depth: 10, Quota: quota}))
 	if err != nil {

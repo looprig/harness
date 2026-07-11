@@ -9,8 +9,10 @@ import (
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/ceiling"
 	"github.com/looprig/harness/pkg/command"
+	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/foreignloop"
 	"github.com/looprig/harness/pkg/journal"
+	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/harness/pkg/workspacestore"
 )
 
@@ -144,16 +146,15 @@ func WithAllowConfigMismatch() Option {
 	}
 }
 
-// WithConfigFingerprintFields injects the swarm-level config-fingerprint inputs that do
-// NOT live on loop.Definition (AgentKind, RuntimeSkills, WorkspaceRoot). New merges them
-// onto the loop-derived fingerprint it stamps on SessionStarted; Restore merges them
-// onto the LIVE fingerprint it compares against the persisted one, so a session cannot
-// silently resume under a different agent identity, skill-trust mode, or workspace
-// (mismatch → *ConfigMismatchError unless WithAllowConfigMismatch). Without this option
-// the fields stay empty (a non-swarm/legacy session is unaffected — additive evolution).
-func WithConfigFingerprintFields(fields ConfigFingerprintFields) Option {
+// FingerprintProvider projects a bound loop into the immutable behavior fingerprint
+// used for both SessionStarted and restore validation. It must be deterministic and safe
+// for concurrent calls from separate sessions.
+type FingerprintProvider func(loop.BoundDefinition) event.ConfigFingerprint
+
+// WithFingerprintProvider installs the composition root's immutable projection.
+func WithFingerprintProvider(provider FingerprintProvider) Option {
 	return func(s *Session) {
-		s.configFingerprintFields = fields
+		s.fingerprint = provider
 	}
 }
 

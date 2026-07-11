@@ -639,7 +639,7 @@ func TestRestoreRoundTrip(t *testing.T) {
 	handOver(t, orig.lease)
 
 	restoreClient := &stubLLM{chunks: []content.Chunk{textChunk("after restore")}}
-	s, err := Restore(context.Background(), restoreCfg(restoreClient, "model-x", "be helpful"),
+	s, err := restoreTestSession(context.Background(), restoreCfg(restoreClient, "model-x", "be helpful"),
 		orig.sessionID, store)
 	if err != nil {
 		t.Fatalf("Restore: %v", err)
@@ -692,7 +692,7 @@ func TestRestorePrimaryLoopNarrowing(t *testing.T) {
 	orig, _ := buildTwoLoopRun(t, store, fp)
 	handOver(t, orig.lease)
 
-	s, err := Restore(context.Background(),
+	s, err := restoreTestSession(context.Background(),
 		restoreCfg(&stubLLM{chunks: []content.Chunk{textChunk("after restore")}}, "model-x", "be helpful"),
 		orig.sessionID, store)
 	if err != nil {
@@ -740,7 +740,7 @@ func TestRestoreReleasesLeaseOnShutdown(t *testing.T) {
 	handOver(t, orig.lease)
 
 	// First restore acquires + holds the lease.
-	s1, err := Restore(context.Background(), restoreCfg(&stubLLM{}, "model-x", "be helpful"),
+	s1, err := restoreTestSession(context.Background(), restoreCfg(&stubLLM{}, "model-x", "be helpful"),
 		orig.sessionID, store)
 	if err != nil {
 		t.Fatalf("Restore #1: %v", err)
@@ -751,7 +751,7 @@ func TestRestoreReleasesLeaseOnShutdown(t *testing.T) {
 	}
 
 	// Second restore re-acquires immediately (no TTL wait) — proving the lease was released.
-	s2, err := Restore(context.Background(), restoreCfg(&stubLLM{}, "model-x", "be helpful"),
+	s2, err := restoreTestSession(context.Background(), restoreCfg(&stubLLM{}, "model-x", "be helpful"),
 		orig.sessionID, store)
 	if err != nil {
 		t.Fatalf("Restore #2 (lease not released on Shutdown #1?): %v", err)
@@ -770,7 +770,7 @@ func TestRestoreConfigMismatch(t *testing.T) {
 	handOver(t, orig.lease)
 
 	// Mismatch (different model) rejects by default; the session does not come up.
-	_, err := Restore(context.Background(), restoreCfg(&stubLLM{}, "model-DIFFERENT", "be helpful"),
+	_, err := restoreTestSession(context.Background(), restoreCfg(&stubLLM{}, "model-DIFFERENT", "be helpful"),
 		orig.sessionID, store)
 	var cme *ConfigMismatchError
 	if !errors.As(err, &cme) {
@@ -784,7 +784,7 @@ func TestRestoreConfigMismatch(t *testing.T) {
 	}
 
 	// The override proceeds despite the mismatch (the rejected attempt released its lease).
-	s, err := Restore(context.Background(), restoreCfg(&stubLLM{}, "model-DIFFERENT", "be helpful"),
+	s, err := restoreTestSession(context.Background(), restoreCfg(&stubLLM{}, "model-DIFFERENT", "be helpful"),
 		orig.sessionID, store, WithAllowConfigMismatch())
 	if err != nil {
 		t.Fatalf("Restore with WithAllowConfigMismatch: %v", err)
@@ -798,12 +798,12 @@ func TestRestoreConfigMismatch(t *testing.T) {
 // TestRestoreSwarmFingerprintMismatch proves the fail-secure config check end to end for
 // the injected swarm-level fingerprint fields (AgentKind/RuntimeSkills/WorkspaceRoot): a
 // session persisted under one set of these fields rejects a restore that injects a
-// DIFFERENT value via WithConfigFingerprintFields — even when the loop.Config (model,
+// DIFFERENT value via withTestFingerprintFields — even when the loop.Config (model,
 // system, tools) is identical. A mismatch in any one field rejects with
 // *ConfigMismatchError and records a RestoreErrored, unless WithAllowConfigMismatch. This
 // is what stops a session silently resuming under a different skill-trust mode or repo.
 func TestRestoreSwarmFingerprintMismatch(t *testing.T) {
-	persistedFields := ConfigFingerprintFields{
+	persistedFields := testFingerprintFields{
 		AgentKind:                 "swe:orchestrator",
 		RuntimeSkills:             true,
 		WorkspaceRoot:             "/home/user/repo",
@@ -820,7 +820,7 @@ func TestRestoreSwarmFingerprintMismatch(t *testing.T) {
 
 	tests := []struct {
 		name      string
-		liveField ConfigFingerprintFields
+		liveField testFingerprintFields
 	}{
 		{"AgentKind differs", diffKind},
 		{"RuntimeSkills differs", diffSkills},
@@ -834,15 +834,15 @@ func TestRestoreSwarmFingerprintMismatch(t *testing.T) {
 			store := newRestoreStore(t)
 			cfg := restoreCfg(&stubLLM{}, "model-x", "be helpful")
 			// Persist the fingerprint the original ran under: loop-derived + the swarm fields.
-			persistedFP := fingerprintWithDefinition(cfg, persistedFields)
+			persistedFP := testFingerprintFromDefinitionWithFields(cfg, persistedFields)
 
 			orig := buildOriginalRun(t, store, persistedFP,
 				restoreCfg(&stubLLM{chunks: []content.Chunk{textChunk("reply")}}, "model-x", "be helpful"), 1)
 			handOver(t, orig.lease)
 
 			// Restore with the SAME loop.Config but a DIFFERENT injected swarm field → reject.
-			s, err := Restore(context.Background(), cfg, orig.sessionID, store,
-				WithConfigFingerprintFields(tt.liveField))
+			s, err := restoreTestSession(context.Background(), cfg, orig.sessionID, store,
+				withTestFingerprintFields(tt.liveField))
 			if s != nil {
 				t.Fatalf("Restore returned a non-nil Session on a swarm fingerprint mismatch")
 			}
@@ -861,8 +861,8 @@ func TestRestoreSwarmFingerprintMismatch(t *testing.T) {
 			}
 
 			// The override proceeds despite the mismatch (the rejected attempt released its lease).
-			s2, err := Restore(context.Background(), cfg, orig.sessionID, store,
-				WithConfigFingerprintFields(tt.liveField), WithAllowConfigMismatch())
+			s2, err := restoreTestSession(context.Background(), cfg, orig.sessionID, store,
+				withTestFingerprintFields(tt.liveField), WithAllowConfigMismatch())
 			if err != nil {
 				t.Fatalf("Restore with WithAllowConfigMismatch (swarm field) err = %v, want success", err)
 			}
@@ -872,8 +872,8 @@ func TestRestoreSwarmFingerprintMismatch(t *testing.T) {
 			}
 
 			// A MATCHING injected field set restores cleanly (the agreement/compatibility path).
-			s3, err := Restore(context.Background(), cfg, orig.sessionID, store,
-				WithConfigFingerprintFields(persistedFields))
+			s3, err := restoreTestSession(context.Background(), cfg, orig.sessionID, store,
+				withTestFingerprintFields(persistedFields))
 			if err != nil {
 				t.Fatalf("Restore with matching swarm fields err = %v, want success", err)
 			}
@@ -910,7 +910,7 @@ func TestRestoreAgentNameMismatch(t *testing.T) {
 			handOver(t, orig.lease)
 
 			cfg := restoreCfgNamed(&stubLLM{}, "model-x", "be helpful", tt.configuredAgent)
-			s, err := Restore(context.Background(), cfg, orig.sessionID, store)
+			s, err := restoreTestSession(context.Background(), cfg, orig.sessionID, store)
 
 			if !tt.wantMismatch {
 				// Matching name (model/system/tools unchanged): the session comes up.
@@ -944,7 +944,7 @@ func TestRestoreAgentNameMismatch(t *testing.T) {
 			}
 
 			// The override proceeds despite the mismatch (the rejected attempt released its lease).
-			s2, err := Restore(context.Background(), cfg, orig.sessionID, store, WithAllowConfigMismatch())
+			s2, err := restoreTestSession(context.Background(), cfg, orig.sessionID, store, WithAllowConfigMismatch())
 			if err != nil {
 				t.Fatalf("Restore with WithAllowConfigMismatch (agent name) err = %v, want success", err)
 			}
@@ -962,7 +962,7 @@ func TestRestoreCrashMidTurn(t *testing.T) {
 	orig := buildCrashedRun(t, store, fp)
 	handOver(t, orig.lease)
 
-	s, err := Restore(context.Background(), restoreCfg(&stubLLM{chunks: []content.Chunk{textChunk("recovered")}}, "model-x", "be helpful"),
+	s, err := restoreTestSession(context.Background(), restoreCfg(&stubLLM{chunks: []content.Chunk{textChunk("recovered")}}, "model-x", "be helpful"),
 		orig.sessionID, store)
 	if err != nil {
 		t.Fatalf("Restore (crash mid-turn): %v", err)
@@ -1005,7 +1005,7 @@ func TestRestoreComplexShapesRoundTrip(t *testing.T) {
 	orig := buildComplexShapesRun(t, store, fp)
 	handOver(t, orig.lease)
 
-	s, err := Restore(context.Background(), restoreCfg(&stubLLM{chunks: []content.Chunk{textChunk("after restore")}}, "model-x", "be helpful"),
+	s, err := restoreTestSession(context.Background(), restoreCfg(&stubLLM{chunks: []content.Chunk{textChunk("after restore")}}, "model-x", "be helpful"),
 		orig.sessionID, store)
 	if err != nil {
 		t.Fatalf("Restore (complex shapes): %v", err)
@@ -1050,7 +1050,7 @@ func TestRestoreRecountsSpawnQuota(t *testing.T) {
 
 	// Restore with Quota == k+1: the durable recount must set spawned == k, leaving room
 	// for exactly one more spawn.
-	s, err := Restore(context.Background(),
+	s, err := restoreTestSession(context.Background(),
 		restoreCfg(&stubLLM{chunks: []content.Chunk{textChunk("after restore")}}, "model-x", "be helpful"),
 		orig.sessionID, store,
 		WithLimits(Limits{Depth: 10, Quota: k + 1}))

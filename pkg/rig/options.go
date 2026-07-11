@@ -22,6 +22,9 @@ type GateCaps struct {
 	MaxTimeout time.Duration
 }
 
+// CeilingFactory mints a fresh security-ceiling state for each session. A rig may
+// invoke it concurrently for separate sessions, so captured mutable state must be
+// concurrency-safe.
 type CeilingFactory func() *ceiling.State
 
 func WithLoops(definitions ...loop.Definition) Option {
@@ -63,7 +66,7 @@ func WithDelegationLimits(limits DelegationLimits) Option {
 }
 
 func WithConfigFingerprintFields(fields ConfigFingerprintFields) Option {
-	return singletonCompile("config_fingerprint", sessionruntime.WithLifecycleConfigFingerprintFields(fields))
+	return singleton("config_fingerprint", func(state *definitionState) { state.fingerprintFields = fields })
 }
 
 func WithForeignBuilder(builder foreignloop.Builder, restored foreignloop.RestoredBuilder) Option {
@@ -79,7 +82,17 @@ func WithAllowConfigMismatch() Option {
 }
 
 func WithCeilingFactory(factory CeilingFactory) Option {
-	return singletonCompile("ceiling_factory", sessionruntime.WithLifecycleCeilingFactory(sessionruntime.CeilingFactory(factory)))
+	return func(state *definitionState) error {
+		if factory == nil {
+			return &DefinitionError{Kind: DefinitionInvalidCeilingFactory}
+		}
+		if state.seen["ceiling_factory"] {
+			return &DefinitionError{Kind: DefinitionDuplicateOption, Name: "ceiling_factory"}
+		}
+		state.seen["ceiling_factory"] = true
+		state.lifecycleOptions = append(state.lifecycleOptions, sessionruntime.WithLifecycleCeilingFactory(sessionruntime.CeilingFactory(factory)))
+		return nil
+	}
 }
 
 func singleton(name string, apply func(*definitionState)) Option {

@@ -75,6 +75,7 @@ func TestRestoreSessionFailSecureExits(t *testing.T) {
 				restoreCfg(&stubLLM{}, "model-x", "be helpful"),
 				orig.sessionID, store,
 				seam.next, fixedClock,
+				WithFingerprintProvider(testFingerprintProvider),
 			)
 
 			// (a) No Session comes up.

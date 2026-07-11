@@ -179,7 +179,7 @@ func TestNew(t *testing.T) {
 	t.Parallel()
 	t.Run("non-zero SessionID", func(t *testing.T) {
 		t.Parallel()
-		s, err := New(context.Background(), cfg(&stubLLM{chunks: []content.Chunk{textChunk("x")}}))
+		s, err := newTestSession(context.Background(), cfg(&stubLLM{chunks: []content.Chunk{textChunk("x")}}))
 		if err != nil {
 			t.Fatalf("New: %v", err)
 		}
@@ -193,7 +193,7 @@ func TestNew(t *testing.T) {
 		t.Parallel()
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
-		_, err := New(ctx, cfg(&stubLLM{}))
+		_, err := newTestSession(ctx, cfg(&stubLLM{}))
 		var se *SessionError
 		if !errors.As(err, &se) || se.Kind != SessionContextDone {
 			t.Fatalf("err = %v, want *SessionError{SessionContextDone}", err)
@@ -201,7 +201,7 @@ func TestNew(t *testing.T) {
 	})
 	t.Run("exactly one loop indexed by primaryLoopID", func(t *testing.T) {
 		t.Parallel()
-		s, err := New(context.Background(), cfg(&stubLLM{chunks: []content.Chunk{textChunk("x")}}))
+		s, err := newTestSession(context.Background(), cfg(&stubLLM{chunks: []content.Chunk{textChunk("x")}}))
 		if err != nil {
 			t.Fatalf("New: %v", err)
 		}
@@ -252,7 +252,7 @@ func TestNewLoop(t *testing.T) {
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			s, err := New(context.Background(), cfg(&stubLLM{chunks: []content.Chunk{textChunk("x")}}))
+			s, err := newTestSession(context.Background(), cfg(&stubLLM{chunks: []content.Chunk{textChunk("x")}}))
 			if err != nil {
 				t.Fatalf("New: %v", err)
 			}
@@ -331,7 +331,7 @@ func TestNewLoopStampsAgentName(t *testing.T) {
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			s, err := New(context.Background(), cfg(&stubLLM{chunks: []content.Chunk{textChunk("x")}}))
+			s, err := newTestSession(context.Background(), cfg(&stubLLM{chunks: []content.Chunk{textChunk("x")}}))
 			if err != nil {
 				t.Fatalf("New: %v", err)
 			}
@@ -385,7 +385,7 @@ func TestNewLoopIDGenerationFailure(t *testing.T) {
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			s, err := New(context.Background(), cfg(&stubLLM{chunks: []content.Chunk{textChunk("x")}}))
+			s, err := newTestSession(context.Background(), cfg(&stubLLM{chunks: []content.Chunk{textChunk("x")}}))
 			if err != nil {
 				t.Fatalf("New: %v", err)
 			}
@@ -444,7 +444,7 @@ func TestNewLoopClosingRejects(t *testing.T) {
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			s, err := New(context.Background(), cfg(&stubLLM{chunks: []content.Chunk{textChunk("x")}}))
+			s, err := newTestSession(context.Background(), cfg(&stubLLM{chunks: []content.Chunk{textChunk("x")}}))
 			if err != nil {
 				t.Fatalf("New: %v", err)
 			}
@@ -494,7 +494,7 @@ func TestNewLoopClosingRejects(t *testing.T) {
 // misses.
 func TestLoopFor(t *testing.T) {
 	t.Parallel()
-	s, err := New(context.Background(), cfg(&stubLLM{chunks: []content.Chunk{textChunk("x")}}))
+	s, err := newTestSession(context.Background(), cfg(&stubLLM{chunks: []content.Chunk{textChunk("x")}}))
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -735,7 +735,7 @@ func TestStampsCommandHeaderID(t *testing.T) {
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			s, err := New(context.Background(), cfg(&stubLLM{chunks: []content.Chunk{textChunk("hi")}}))
+			s, err := newTestSession(context.Background(), cfg(&stubLLM{chunks: []content.Chunk{textChunk("hi")}}))
 			if err != nil {
 				t.Fatalf("New: %v", err)
 			}
@@ -806,7 +806,7 @@ func TestNewCommandIDGenerationFailure(t *testing.T) {
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			s, err := New(context.Background(), cfg(&stubLLM{chunks: []content.Chunk{textChunk("x")}}))
+			s, err := newTestSession(context.Background(), cfg(&stubLLM{chunks: []content.Chunk{textChunk("x")}}))
 			if err != nil {
 				t.Fatalf("New: %v", err)
 			}
@@ -836,7 +836,7 @@ func TestNewCommandIDGenerationFailure(t *testing.T) {
 // shutdown is the failure this guards against.
 func TestShutdownIDGenFailureStillTearsDownAllLoops(t *testing.T) {
 	t.Parallel()
-	s, err := New(context.Background(), cfg(&stubLLM{chunks: []content.Chunk{textChunk("x")}}))
+	s, err := newTestSession(context.Background(), cfg(&stubLLM{chunks: []content.Chunk{textChunk("x")}}))
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -873,7 +873,7 @@ func TestShutdownIDGenFailureStillTearsDownAllLoops(t *testing.T) {
 
 func TestShutdownThenMethodsExit(t *testing.T) {
 	t.Parallel()
-	s, err := New(context.Background(), cfg(&stubLLM{chunks: []content.Chunk{textChunk("x")}}))
+	s, err := newTestSession(context.Background(), cfg(&stubLLM{chunks: []content.Chunk{textChunk("x")}}))
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -900,7 +900,7 @@ func TestShutdownThenMethodsExit(t *testing.T) {
 // blocking call's return value.
 func TestInterruptDuringRunningTurn(t *testing.T) {
 	t.Parallel()
-	s, err := New(context.Background(), cfg(&stubLLM{blockUntilCancel: true}))
+	s, err := newTestSession(context.Background(), cfg(&stubLLM{blockUntilCancel: true}))
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -1024,7 +1024,7 @@ func TestShutdownCtxCancelledBeforeSend(t *testing.T) {
 func TestShutdownSurfacesLoopTerminatedError(t *testing.T) {
 	t.Parallel()
 	ctx, cancel := context.WithCancel(context.Background())
-	s, err := New(ctx, cfg(&stubLLM{blockUntilCancel: true, ignoreCtx: true}))
+	s, err := newTestSession(ctx, cfg(&stubLLM{blockUntilCancel: true, ignoreCtx: true}))
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -1820,7 +1820,7 @@ func TestInterruptLoopIDUnknownID(t *testing.T) {
 //	    Shutdown latched the closing flag so no loop can register post-shutdown.
 func TestShutdownClosesAllRealLoopsAndLatchesClosing(t *testing.T) {
 	t.Parallel()
-	s, err := New(context.Background(), cfg(&stubLLM{chunks: []content.Chunk{textChunk("x")}}))
+	s, err := newTestSession(context.Background(), cfg(&stubLLM{chunks: []content.Chunk{textChunk("x")}}))
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}

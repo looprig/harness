@@ -20,7 +20,7 @@ var errFault = errors.New("durable append failed")
 // fault, the session must not accept any new work (fail-secure).
 func TestReportFaultRejectsNewWork(t *testing.T) {
 	t.Parallel()
-	s, err := New(context.Background(), cfg(&stubLLM{chunks: []content.Chunk{textChunk("x")}}))
+	s, err := newTestSession(context.Background(), cfg(&stubLLM{chunks: []content.Chunk{textChunk("x")}}))
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -59,7 +59,7 @@ func TestReportFaultWakesWaitIdle(t *testing.T) {
 	// blockUntilCancel (NOT ignoreCtx): the turn stays running — keeping the session
 	// Active so WaitIdle blocks — until the loop's ctx is cancelled, so the cleanup
 	// Shutdown drains cleanly.
-	s, err := New(context.Background(), cfg(&stubLLM{blockUntilCancel: true}))
+	s, err := newTestSession(context.Background(), cfg(&stubLLM{blockUntilCancel: true}))
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}

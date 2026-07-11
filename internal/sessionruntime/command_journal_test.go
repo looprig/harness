@@ -569,7 +569,7 @@ func TestCommandAppendIsAuditOnly(t *testing.T) {
 // nil-derefs on the append path.
 func TestNopCommandAppenderDefault(t *testing.T) {
 	t.Parallel()
-	s, err := New(context.Background(), cfg(&stubLLM{chunks: []content.Chunk{textChunk("hi")}}))
+	s, err := newTestSession(context.Background(), cfg(&stubLLM{chunks: []content.Chunk{textChunk("hi")}}))
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}

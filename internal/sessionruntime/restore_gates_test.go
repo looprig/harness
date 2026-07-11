@@ -173,7 +173,7 @@ func TestRestoreGateOpenedWithoutResolutionClosesUnavailable(t *testing.T) {
 			orig := buildGateRestoreStream(t, store, cfg, tt.prepared, true, false)
 			handOver(t, orig.lease)
 
-			s, err := Restore(context.Background(), cfg, orig.sessionID, store)
+			s, err := restoreTestSession(context.Background(), cfg, orig.sessionID, store)
 			if err != nil {
 				t.Fatalf("Restore: %v", err)
 			}
@@ -202,7 +202,7 @@ func TestRestoreWiresGateAppenderForNewGates(t *testing.T) {
 	orig := buildGateRestoreStream(t, store, cfg, false, false, false)
 	handOver(t, orig.lease)
 
-	s, err := Restore(context.Background(), cfg, orig.sessionID, store)
+	s, err := restoreTestSession(context.Background(), cfg, orig.sessionID, store)
 	if err != nil {
 		t.Fatalf("Restore: %v", err)
 	}
@@ -248,7 +248,7 @@ func TestRestoreGatePreparedWithoutOpenedIsInvisible(t *testing.T) {
 	orig := buildGateRestoreStream(t, store, cfg, true, false, false)
 	handOver(t, orig.lease)
 
-	s, err := Restore(context.Background(), cfg, orig.sessionID, store)
+	s, err := restoreTestSession(context.Background(), cfg, orig.sessionID, store)
 	if err != nil {
 		t.Fatalf("Restore: %v", err)
 	}
@@ -268,7 +268,7 @@ func TestRestoreGateResolvedRemovesCandidate(t *testing.T) {
 	orig := buildGateRestoreStream(t, store, cfg, true, true, true)
 	handOver(t, orig.lease)
 
-	s, err := Restore(context.Background(), cfg, orig.sessionID, store)
+	s, err := restoreTestSession(context.Background(), cfg, orig.sessionID, store)
 	if err != nil {
 		t.Fatalf("Restore: %v", err)
 	}

@@ -94,11 +94,9 @@ func restoreSession(
 		opt(probe)
 	}
 	allowMismatch := probe.allowConfigMismatch
-	// The swarm-level fingerprint fields (AgentKind/RuntimeSkills/WorkspaceRoot) the
-	// composition root injected via WithConfigFingerprintFields are read off the same
-	// probe, so the LIVE fingerprint the restore compares is computed identically to the
-	// one New stamped — a different skill-trust mode or workspace then rejects.
-	fingerprintFields := probe.configFingerprintFields
+	if probe.fingerprint == nil {
+		return nil, &RestoreError{Kind: RestoreLoopFailed, Cause: &MissingFingerprintProviderError{}}
+	}
 
 	// (1) Acquire the single-writer lease, then construct the journal (which writes the
 	// opening LeaseFence as its first append — the handover boundary) and the replayer,
@@ -173,7 +171,7 @@ func restoreSession(
 	if err != nil {
 		return recordErrored(&RestoreError{Kind: RestoreLoopFailed, Cause: err})
 	}
-	if err := checkFingerprint(persisted, fingerprintWith(bound, fingerprintFields), allowMismatch); err != nil {
+	if err := checkFingerprint(persisted, probe.projectFingerprint(bound), allowMismatch); err != nil {
 		return recordErrored(err)
 	}
 	if err := checkAgentName(rootLoop.Header.AgentName, bound.Name(), allowMismatch); err != nil {

@@ -91,7 +91,7 @@ func TestSetSecurityCeilingAppliesAndEmits(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	s, err := New(ctx, cfg(&stubLLM{}))
+	s, err := newTestSession(ctx, cfg(&stubLLM{}))
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -129,7 +129,7 @@ func TestSetSecurityCeilingLastWriteWins(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	s, err := New(ctx, cfg(&stubLLM{}))
+	s, err := newTestSession(ctx, cfg(&stubLLM{}))
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -154,7 +154,7 @@ func TestWithCeilingSharesSource(t *testing.T) {
 	defer cancel()
 
 	shared := ceiling.New()
-	s, err := New(ctx, cfg(&stubLLM{}), WithCeiling(shared))
+	s, err := newTestSession(ctx, cfg(&stubLLM{}), WithCeiling(shared))
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -182,7 +182,7 @@ func TestSetSecurityCeilingDirectionOrdering(t *testing.T) {
 
 	shared := ceiling.New()
 	spy := &ceilingTapSpy{state: shared}
-	s, err := New(ctx, cfg(&stubLLM{}), WithCeiling(shared), WithEventAppender(spy))
+	s, err := newTestSession(ctx, cfg(&stubLLM{}), WithCeiling(shared), WithEventAppender(spy))
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -226,7 +226,7 @@ func TestSetSecurityCeilingLooseningFaultKeepsOld(t *testing.T) {
 
 	shared := ceiling.New() // starts at 0
 	spy := &ceilingTapSpy{state: shared, fail: true}
-	s, err := New(ctx, cfg(&stubLLM{}), WithCeiling(shared), WithEventAppender(spy))
+	s, err := newTestSession(ctx, cfg(&stubLLM{}), WithCeiling(shared), WithEventAppender(spy))
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -259,7 +259,7 @@ func TestSetSecurityCeilingTighteningFaultStillApplies(t *testing.T) {
 
 	shared := ceiling.New()
 	spy := &ceilingTapSpy{state: shared}
-	s, err := New(ctx, cfg(&stubLLM{}), WithCeiling(shared), WithEventAppender(spy))
+	s, err := newTestSession(ctx, cfg(&stubLLM{}), WithCeiling(shared), WithEventAppender(spy))
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -337,7 +337,7 @@ func TestSecurityCeilingRestoreRoundTrip(t *testing.T) {
 	})
 	handOver(t, lease)
 
-	s, err := Restore(context.Background(), restoreCfg(&stubLLM{}, "model-x", "be helpful"), sessionID, store)
+	s, err := restoreTestSession(context.Background(), restoreCfg(&stubLLM{}, "model-x", "be helpful"), sessionID, store)
 	if err != nil {
 		t.Fatalf("Restore: %v", err)
 	}

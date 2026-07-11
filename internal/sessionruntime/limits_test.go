@@ -54,7 +54,7 @@ func TestNewAppliesLimits(t *testing.T) {
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			s, err := New(context.Background(), cfg(&stubLLM{chunks: []content.Chunk{textChunk("x")}}), tt.opts...)
+			s, err := newTestSession(context.Background(), cfg(&stubLLM{chunks: []content.Chunk{textChunk("x")}}), tt.opts...)
 			if err != nil {
 				t.Fatalf("New: %v", err)
 			}
@@ -75,7 +75,7 @@ func TestNewAppliesLimits(t *testing.T) {
 // count toward the quota.
 func TestNewInitialSpawned(t *testing.T) {
 	t.Parallel()
-	s, err := New(context.Background(), cfg(&stubLLM{chunks: []content.Chunk{textChunk("x")}}))
+	s, err := newTestSession(context.Background(), cfg(&stubLLM{chunks: []content.Chunk{textChunk("x")}}))
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}

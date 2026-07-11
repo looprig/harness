@@ -59,7 +59,7 @@ func TestWithSessionID(t *testing.T) {
 			if tt.opt != nil {
 				opts = append(opts, tt.opt)
 			}
-			s, err := New(ctx, cfg(&stubLLM{}), opts...)
+			s, err := newTestSession(ctx, cfg(&stubLLM{}), opts...)
 			if err != nil {
 				t.Fatalf("New: %v", err)
 			}
@@ -97,7 +97,7 @@ func TestWithLeaseRelease(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	s, err := New(ctx, cfg(&stubLLM{}), WithLeaseRelease(release))
+	s, err := newTestSession(ctx, cfg(&stubLLM{}), WithLeaseRelease(release))
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -129,7 +129,7 @@ func TestWithEventAppender(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	s, err := New(ctx, cfg(&stubLLM{}), WithEventAppender(rec))
+	s, err := newTestSession(ctx, cfg(&stubLLM{}), WithEventAppender(rec))
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}

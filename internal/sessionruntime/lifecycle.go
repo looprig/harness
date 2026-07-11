@@ -22,6 +22,13 @@ func (*MissingStoreError) Error() string {
 	return "session: Lifecycle.NewLifecycle requires a non-nil sessionstore.Store"
 }
 
+// MissingFingerprintProviderError reports incomplete composition wiring.
+type MissingFingerprintProviderError struct{}
+
+func (*MissingFingerprintProviderError) Error() string {
+	return "session: fingerprint provider is required"
+}
+
 // NewSessionErrorKind classifies a NewSession failure before the live session exists — the per-session
 // durable wiring the Lifecycle builds itself (lease, journal, checked appenders) or the
 // session construction that consumes them.
@@ -85,7 +92,7 @@ type Lifecycle struct {
 	catalog *sessionstore.Catalog
 
 	// baseOpts are the session.Options captured at NewLifecycle that are IDENTICAL across every
-	// NewSession and RestoreSession: WithLimits, WithConfigFingerprintFields (the fingerprinted one),
+	// NewSession and RestoreSession: limits, fingerprint projection,
 	// WithWorkspaceStore, WithForeignBuilder, WithGateCaps. They are forwarded verbatim to
 	// both NewSession and RestoreSession. The per-session dependencies (session ID,
 	// appenders, lease release, and ceiling) are appended by each lifecycle call.
@@ -108,6 +115,7 @@ type Lifecycle struct {
 	// back to today's behavior — the session default-mints its own internal ceiling state
 	// (whatever cfg carries is untouched).
 	ceilingFactory CeilingFactory
+	fingerprint    FingerprintProvider
 }
 
 // CeilingFactory mints a fresh security-ceiling state. The Lifecycle calls it once per
@@ -129,14 +137,12 @@ func WithLifecycleLimits(l Limits) LifecycleOption {
 	}
 }
 
-// WithLifecycleConfigFingerprintFields captures the swarm-level config-fingerprint inputs
-// (AgentKind/RuntimeSkills/WorkspaceRoot/…) that do not live on loop.Definition. This is THE
-// fingerprinted option: it is stamped on NewSession's SessionStarted and re-merged into the LIVE
-// fingerprint RestoreSession compares, so it MUST be identical between the NewSession that created a
-// session and the RestoreSession that resumes it — hence its capture-once-at-NewLifecycle placement.
-func WithLifecycleConfigFingerprintFields(fields ConfigFingerprintFields) LifecycleOption {
+// WithLifecycleFingerprintProvider captures the deterministic projection used by both
+// NewSession and RestoreSession. The provider may be called concurrently for different
+// sessions and must be concurrency-safe.
+func WithLifecycleFingerprintProvider(provider FingerprintProvider) LifecycleOption {
 	return func(r *Lifecycle) {
-		r.baseOpts = append(r.baseOpts, WithConfigFingerprintFields(fields))
+		r.fingerprint = provider
 	}
 }
 
@@ -204,6 +210,9 @@ func NewLifecycle(cfg loop.Definition, store *sessionstore.Store, opts ...Lifecy
 	for _, opt := range opts {
 		opt(r)
 	}
+	if r.fingerprint == nil {
+		return nil, &MissingFingerprintProviderError{}
+	}
 	// AMBIGUITY A3: build the derived catalog so each session event appender keeps the
 	// replay-free status fold live (journal.WithCatalog below). WithCatalogReplayer(store)
 	// is passed explicitly; OpenCatalog already defaults the replayer to the owning store,
@@ -267,6 +276,7 @@ func (r *Lifecycle) NewSession(ctx context.Context) (*Session, error) {
 	opts := make([]Option, 0, len(r.baseOpts)+6)
 	opts = append(opts, r.baseOpts...)
 	opts = append(opts,
+		WithFingerprintProvider(r.fingerprint),
 		WithSessionID(sid),
 		WithEventAppender(evAp),
 		WithCommandAppender(cmdAp),
@@ -301,6 +311,7 @@ func (r *Lifecycle) NewSession(ctx context.Context) (*Session, error) {
 func (r *Lifecycle) RestoreSession(ctx context.Context, id uuid.UUID) (*Session, error) {
 	opts := make([]Option, 0, len(r.baseOpts)+2)
 	opts = append(opts, r.baseOpts...)
+	opts = append(opts, WithFingerprintProvider(r.fingerprint))
 	if r.allowConfigMismatch {
 		opts = append(opts, WithAllowConfigMismatch())
 	}

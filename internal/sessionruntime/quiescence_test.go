@@ -47,7 +47,7 @@ func drainSub(t *testing.T, sub interface {
 // terminal) is observed on the fan-in, not returned.
 func TestEndToEndQuiescence(t *testing.T) {
 	t.Parallel()
-	s, err := New(context.Background(), cfg(&stubLLM{chunks: []content.Chunk{textChunk("hi")}}))
+	s, err := newTestSession(context.Background(), cfg(&stubLLM{chunks: []content.Chunk{textChunk("hi")}}))
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -232,7 +232,7 @@ func (c *chainStubLLM) Stream(ctx context.Context, _ inference.Request) (*infere
 func TestChainedTurnsEmitNoLoopIdleBetween(t *testing.T) {
 	t.Parallel()
 	client := &chainStubLLM{text: "ok", onCall: map[int]func(){}}
-	s, err := New(context.Background(), cfg(client))
+	s, err := newTestSession(context.Background(), cfg(client))
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}

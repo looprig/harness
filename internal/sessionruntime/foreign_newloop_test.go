@@ -167,7 +167,7 @@ func TestForeignNewLoop(t *testing.T) {
 
 			c := engineCfg(&stubLLM{chunks: []content.Chunk{textChunk("x")}}, tt.engine, "x")
 
-			opts := []Option{WithEventAppender(rec)}
+			opts := []Option{WithFingerprintProvider(testFingerprintProvider), WithEventAppender(rec)}
 			if tt.wireBuilder {
 				opts = append(opts, WithForeignBuilder(builder.build, builder.buildRestored))
 			}

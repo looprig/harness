@@ -119,7 +119,7 @@ func TestLifecycleNewLifecycle(t *testing.T) {
 			if !tt.nilStore {
 				store = newRestoreStore(t)
 			}
-			r, err := NewLifecycle(cfg(&stubLLM{}), store)
+			r, err := newTestLifecycle(cfg(&stubLLM{}), store)
 			if tt.wantErr {
 				var nse *MissingStoreError
 				if !errors.As(err, &nse) {
@@ -137,6 +137,18 @@ func TestLifecycleNewLifecycle(t *testing.T) {
 				t.Fatal("NewLifecycle returned a nil Lifecycle without error")
 			}
 		})
+	}
+}
+
+func TestNewLifecycleRequiresFingerprintProvider(t *testing.T) {
+	t.Parallel()
+	lifecycle, err := NewLifecycle(cfg(&stubLLM{}), newRestoreStore(t))
+	if lifecycle != nil {
+		t.Fatal("NewLifecycle returned a lifecycle without a fingerprint provider")
+	}
+	var target *MissingFingerprintProviderError
+	if !errors.As(err, &target) {
+		t.Fatalf("NewLifecycle error = %T %v, want *MissingFingerprintProviderError", err, err)
 	}
 }
 
@@ -191,7 +203,7 @@ func TestLifecycleRun(t *testing.T) {
 					return ceiling.New()
 				}))
 			}
-			r, err := NewLifecycle(runCfg, store, copts...)
+			r, err := newTestLifecycle(runCfg, store, copts...)
 			if err != nil {
 				t.Fatalf("NewLifecycle: %v", err)
 			}
@@ -256,7 +268,7 @@ func TestLifecycleRun(t *testing.T) {
 // rows resume from.
 func runAndShutdown(t *testing.T, store *sessionstore.Store, c loop.Definition) uuid.UUID {
 	t.Helper()
-	r, err := NewLifecycle(c, store)
+	r, err := newTestLifecycle(c, store)
 	if err != nil {
 		t.Fatalf("NewLifecycle (original run): %v", err)
 	}
@@ -320,7 +332,7 @@ func TestLifecycleRestore(t *testing.T) {
 			if tt.allowMismatch {
 				copts = append(copts, WithLifecycleAllowConfigMismatch())
 			}
-			rr, err := NewLifecycle(restoreCfg(&stubLLM{}, restoreModel, "be helpful"), store, copts...)
+			rr, err := newTestLifecycle(restoreCfg(&stubLLM{}, restoreModel, "be helpful"), store, copts...)
 			if err != nil {
 				t.Fatalf("NewLifecycle (restore): %v", err)
 			}
@@ -372,7 +384,7 @@ func TestLifecycleConcurrentReuse(t *testing.T) {
 
 	store := newRestoreStore(t)
 	c := restoreCfg(&stubLLM{chunks: []content.Chunk{textChunk("reply")}}, "model-x", "be helpful")
-	r, err := NewLifecycle(c, store)
+	r, err := newTestLifecycle(c, store)
 	if err != nil {
 		t.Fatalf("NewLifecycle: %v", err)
 	}

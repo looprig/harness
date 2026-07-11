@@ -36,7 +36,7 @@ func TestNewLoopDepthCap(t *testing.T) {
 	// Depth 2: a new loop whose ancestor chain length reaches 2 is refused. So the
 	// primary may spawn A (chain [primary] = 1, allowed), A may spawn B (chain
 	// [A, primary] = 2, refused).
-	s, err := New(context.Background(),
+	s, err := newTestSession(context.Background(),
 		cfg(&stubLLM{chunks: []content.Chunk{textChunk("primary")}}),
 		WithLimits(Limits{Depth: 2}))
 	if err != nil {
@@ -88,7 +88,7 @@ func TestNewLoopDepthCap(t *testing.T) {
 // child) is refused.
 func TestNewLoopDepthCapDefault(t *testing.T) {
 	t.Parallel()
-	s, err := New(context.Background(), cfg(&stubLLM{chunks: []content.Chunk{textChunk("primary")}}))
+	s, err := newTestSession(context.Background(), cfg(&stubLLM{chunks: []content.Chunk{textChunk("primary")}}))
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}

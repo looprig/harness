@@ -48,7 +48,7 @@ func sessionWithHubAndFakeLoop() (s *Session, cmds chan command.Command, done ch
 // across the handoff — SessionIdle fires only after the parent itself goes idle.
 func TestSubagentHandBackWakeReleaseViaTurnStarted(t *testing.T) {
 	t.Parallel()
-	s, err := New(context.Background(), cfg(&stubLLM{chunks: []content.Chunk{textChunk("x")}}))
+	s, err := newTestSession(context.Background(), cfg(&stubLLM{chunks: []content.Chunk{textChunk("x")}}))
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -130,7 +130,7 @@ func TestSubagentHandBackWakeReleaseViaTurnStarted(t *testing.T) {
 func TestSubagentResultNeverRejectedReleasesWakeViaInputCancelled(t *testing.T) {
 	t.Parallel()
 	// blockUntilCancel keeps the turn running so the SubagentResult queues behind it.
-	s, err := New(context.Background(), cfg(&stubLLM{blockUntilCancel: true}))
+	s, err := newTestSession(context.Background(), cfg(&stubLLM{blockUntilCancel: true}))
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
