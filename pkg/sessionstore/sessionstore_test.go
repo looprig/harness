@@ -169,12 +169,19 @@ func TestPersistencePaths(t *testing.T) {
 	if err != nil {
 		t.Fatalf("EvalSymlinks(%q): %v", second, err)
 	}
+	missingTail := filepath.Join(alias, "missing", "tail")
+	wantMissingTail := filepath.Join(wantFirst, "missing", "tail")
+	broken := filepath.Join(base, "broken")
+	if err := os.Symlink(filepath.Join(base, "absent"), broken); err != nil {
+		t.Fatalf("Symlink(broken): %v", err)
+	}
 
 	local := memstore.New()
 	tests := []struct {
 		name    string
 		backend *storage.Composite
 		want    []string
+		wantErr bool
 	}{
 		{
 			name:    "remote providers report none",
@@ -216,6 +223,32 @@ func TestPersistencePaths(t *testing.T) {
 			},
 			want: []string{wantFirst, wantSecond},
 		},
+		{
+			name: "missing tail below symlink ancestor is canonicalized",
+			backend: &storage.Composite{
+				Ledger: reportingLedger{
+					Ledger:       local.Ledger,
+					pathReporter: pathReporter{paths: []string{missingTail}},
+				},
+				Leaser: local.Leaser,
+				KV:     local.KV,
+				Blobs:  local.Blobs,
+			},
+			want: []string{wantMissingTail},
+		},
+		{
+			name: "broken symlink fails closed",
+			backend: &storage.Composite{
+				Ledger: reportingLedger{
+					Ledger:       local.Ledger,
+					pathReporter: pathReporter{paths: []string{filepath.Join(broken, "tail")}},
+				},
+				Leaser: local.Leaser,
+				KV:     local.KV,
+				Blobs:  local.Blobs,
+			},
+			wantErr: true,
+		},
 	}
 
 	for _, tt := range tests {
@@ -226,7 +259,20 @@ func TestPersistencePaths(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Open() err = %v", err)
 			}
-			got := st.PersistencePaths()
+			got, err := st.PersistencePaths()
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("PersistencePaths() err = %v, wantErr %v", err, tt.wantErr)
+			}
+			if tt.wantErr {
+				var pathErr *PersistencePathError
+				if !errors.As(err, &pathErr) {
+					t.Fatalf("PersistencePaths() err = %T %v, want *PersistencePathError", err, err)
+				}
+				if got != nil {
+					t.Errorf("PersistencePaths() paths = %v on error, want nil", got)
+				}
+				return
+			}
 			if !reflect.DeepEqual(got, tt.want) {
 				t.Fatalf("PersistencePaths() = %v, want %v", got, tt.want)
 			}
@@ -234,7 +280,11 @@ func TestPersistencePaths(t *testing.T) {
 				return
 			}
 			got[0] = filepath.Join(base, "mutated")
-			if next := st.PersistencePaths(); !reflect.DeepEqual(next, tt.want) {
+			next, err := st.PersistencePaths()
+			if err != nil {
+				t.Fatalf("PersistencePaths() after caller mutation err = %v", err)
+			}
+			if !reflect.DeepEqual(next, tt.want) {
 				t.Errorf("PersistencePaths() after caller mutation = %v, want %v", next, tt.want)
 			}
 		})

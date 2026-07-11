@@ -1,9 +1,11 @@
 package workspacestore
 
 import (
-	"path/filepath"
-	"sort"
+	"errors"
+	"os"
+	"strconv"
 
+	"github.com/looprig/harness/internal/pathutil"
 	"github.com/looprig/storage"
 )
 
@@ -97,39 +99,48 @@ func Open(b storage.Blobs, opts ...Option) (*Store, error) {
 	return &Store{blobs: b, opts: o}, nil
 }
 
-// PersistencePaths returns the canonical local roots reported by the configured
-// blob provider. Providers without the optional storage.PathReporter capability
-// contribute no paths.
-func (s *Store) PersistencePaths() []string {
+// PersistencePaths returns the canonical local roots used by the configured blob
+// provider and Snapshot's effective spool directory. A provider without the
+// optional storage.PathReporter capability contributes no path. Resolution fails
+// closed with *PersistencePathError when any path is ambiguous.
+func (s *Store) PersistencePaths() ([]string, error) {
+	var reported []string
 	reporter, ok := s.blobs.(storage.PathReporter)
-	if !ok {
-		return nil
+	if ok {
+		reported = append(reported, reporter.StoragePaths()...)
 	}
+	spoolDir := s.opts.SpoolDir
+	if spoolDir == "" {
+		spoolDir = os.TempDir()
+	}
+	reported = append(reported, spoolDir)
 
-	paths := make(map[string]struct{})
-	for _, path := range reporter.StoragePaths() {
-		if path == "" {
-			continue
-		}
-		canonical, err := filepath.Abs(filepath.Clean(path))
-		if err != nil {
-			continue
-		}
-		if resolved, resolveErr := filepath.EvalSymlinks(canonical); resolveErr == nil {
-			canonical = resolved
-		}
-		paths[canonical] = struct{}{}
+	paths, err := pathutil.Canonicalize(reported)
+	if err != nil {
+		return nil, newPersistencePathError(err)
 	}
-	if len(paths) == 0 {
-		return nil
-	}
+	return paths, nil
+}
 
-	result := make([]string, 0, len(paths))
-	for path := range paths {
-		result = append(result, path)
+// PersistencePathError reports a local persistence path that could not be
+// canonicalized without ambiguity.
+type PersistencePathError struct {
+	Path  string
+	Cause error
+}
+
+func (e *PersistencePathError) Error() string {
+	return "workspacestore: resolve persistence path " + strconv.Quote(e.Path) + ": " + e.Cause.Error()
+}
+
+func (e *PersistencePathError) Unwrap() error { return e.Cause }
+
+func newPersistencePathError(err error) *PersistencePathError {
+	var pathErr *pathutil.CanonicalPathError
+	if errors.As(err, &pathErr) {
+		return &PersistencePathError{Path: pathErr.Path, Cause: err}
 	}
-	sort.Strings(result)
-	return result
+	return &PersistencePathError{Cause: err}
 }
 
 // NilBlobsError reports that Open was called with a nil Blobs backend. It carries

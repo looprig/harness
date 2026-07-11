@@ -1,9 +1,11 @@
 package workspacestore
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"reflect"
+	"sort"
 	"testing"
 
 	"github.com/looprig/storage"
@@ -16,6 +18,11 @@ type reportingBlobs struct {
 }
 
 func (b reportingBlobs) StoragePaths() []string { return b.paths }
+
+func sortedPaths(paths ...string) []string {
+	sort.Strings(paths)
+	return paths
+}
 
 // TestOpenResolvesLimitDefaults guards the wiring the plan called out explicitly:
 // Open must resolve the extraction bounds to their defaults when the caller
@@ -103,6 +110,10 @@ func TestPersistencePaths(t *testing.T) {
 	if err != nil {
 		t.Fatalf("EvalSymlinks(%q): %v", second, err)
 	}
+	wantDefaultSpool, err := filepath.EvalSymlinks(os.TempDir())
+	if err != nil {
+		t.Fatalf("EvalSymlinks(default spool): %v", err)
+	}
 
 	tests := []struct {
 		name  string
@@ -110,14 +121,14 @@ func TestPersistencePaths(t *testing.T) {
 		want  []string
 	}{
 		{
-			name:  "remote provider reports none",
+			name:  "remote provider reports default spool",
 			blobs: memstore.New().Blobs,
-			want:  nil,
+			want:  []string{wantDefaultSpool},
 		},
 		{
-			name:  "empty reporter paths report none",
+			name:  "empty reporter paths report default spool",
 			blobs: reportingBlobs{Blobs: memstore.New().Blobs, paths: []string{""}},
-			want:  nil,
+			want:  []string{wantDefaultSpool},
 		},
 		{
 			name: "reporter paths are canonical sorted and deduplicated",
@@ -131,7 +142,7 @@ func TestPersistencePaths(t *testing.T) {
 					"",
 				},
 			},
-			want: []string{wantFirst, wantSecond},
+			want: sortedPaths(wantFirst, wantSecond, wantDefaultSpool),
 		},
 	}
 
@@ -143,7 +154,10 @@ func TestPersistencePaths(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Open() err = %v", err)
 			}
-			got := st.PersistencePaths()
+			got, err := st.PersistencePaths()
+			if err != nil {
+				t.Fatalf("PersistencePaths() err = %v", err)
+			}
 			if !reflect.DeepEqual(got, tt.want) {
 				t.Fatalf("PersistencePaths() = %v, want %v", got, tt.want)
 			}
@@ -151,8 +165,116 @@ func TestPersistencePaths(t *testing.T) {
 				return
 			}
 			got[0] = filepath.Join(base, "mutated")
-			if next := st.PersistencePaths(); !reflect.DeepEqual(next, tt.want) {
+			next, err := st.PersistencePaths()
+			if err != nil {
+				t.Fatalf("PersistencePaths() after caller mutation err = %v", err)
+			}
+			if !reflect.DeepEqual(next, tt.want) {
 				t.Errorf("PersistencePaths() after caller mutation = %v, want %v", next, tt.want)
+			}
+		})
+	}
+}
+
+func TestPersistencePathsIncludesSpool(t *testing.T) {
+	t.Parallel()
+
+	explicit := t.TempDir()
+	wantExplicit, err := filepath.EvalSymlinks(explicit)
+	if err != nil {
+		t.Fatalf("EvalSymlinks(explicit spool): %v", err)
+	}
+	wantDefault, err := filepath.EvalSymlinks(os.TempDir())
+	if err != nil {
+		t.Fatalf("EvalSymlinks(default spool): %v", err)
+	}
+	target := t.TempDir()
+	wantTarget, err := filepath.EvalSymlinks(target)
+	if err != nil {
+		t.Fatalf("EvalSymlinks(alias target): %v", err)
+	}
+	alias := filepath.Join(t.TempDir(), "spool-alias")
+	if err := os.Symlink(target, alias); err != nil {
+		t.Fatalf("Symlink(%q, %q): %v", target, alias, err)
+	}
+	missingTail := filepath.Join(alias, "missing", "tail")
+	wantMissingTail := filepath.Join(wantTarget, "missing", "tail")
+	broken := filepath.Join(t.TempDir(), "broken-spool")
+	if err := os.Symlink(filepath.Join(t.TempDir(), "absent"), broken); err != nil {
+		t.Fatalf("Symlink(broken spool): %v", err)
+	}
+
+	tests := []struct {
+		name    string
+		blobs   storage.Blobs
+		opts    []Option
+		want    []string
+		wantErr bool
+	}{
+		{
+			name:  "explicit spool",
+			blobs: memstore.New().Blobs,
+			opts:  []Option{WithSpoolDir(explicit)},
+			want:  []string{wantExplicit},
+		},
+		{
+			name:  "default spool",
+			blobs: memstore.New().Blobs,
+			want:  []string{wantDefault},
+		},
+		{
+			name: "spool deduplicates with provider",
+			blobs: reportingBlobs{
+				Blobs: memstore.New().Blobs,
+				paths: []string{explicit},
+			},
+			opts: []Option{WithSpoolDir(explicit)},
+			want: []string{wantExplicit},
+		},
+		{
+			name:  "spool symlink alias resolves to target",
+			blobs: memstore.New().Blobs,
+			opts:  []Option{WithSpoolDir(alias)},
+			want:  []string{wantTarget},
+		},
+		{
+			name:  "missing tail below spool symlink ancestor is canonicalized",
+			blobs: memstore.New().Blobs,
+			opts:  []Option{WithSpoolDir(missingTail)},
+			want:  []string{wantMissingTail},
+		},
+		{
+			name:    "broken spool symlink fails closed",
+			blobs:   memstore.New().Blobs,
+			opts:    []Option{WithSpoolDir(filepath.Join(broken, "tail"))},
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			st, err := Open(tt.blobs, tt.opts...)
+			if err != nil {
+				t.Fatalf("Open() err = %v", err)
+			}
+			got, err := st.PersistencePaths()
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("PersistencePaths() err = %v, wantErr %v", err, tt.wantErr)
+			}
+			if tt.wantErr {
+				var pathErr *PersistencePathError
+				if !errors.As(err, &pathErr) {
+					t.Fatalf("PersistencePaths() err = %T %v, want *PersistencePathError", err, err)
+				}
+				if got != nil {
+					t.Errorf("PersistencePaths() paths = %v on error, want nil", got)
+				}
+				return
+			}
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("PersistencePaths() = %v, want %v", got, tt.want)
 			}
 		})
 	}
