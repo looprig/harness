@@ -217,6 +217,40 @@ Definitions, primers, and delegates are separate sets:
 - an unreferenced definition is rejected because it can never be instantiated; and
 - duplicate definition names fail definition atomically.
 
+### Subagent tool mode selection
+
+The model-facing `Subagent` tool accepts an optional initial mode for the delegated loop:
+
+```json
+{
+  "agent": "builder",
+  "mode": "review",
+  "message": "Review the persistence changes"
+}
+```
+
+Its typed arguments become:
+
+```go
+type SubagentArgs struct {
+	Agent   identity.AgentName `json:"agent"`
+	Mode    loop.ModeName      `json:"mode,omitempty"`
+	Message string             `json:"message"`
+}
+```
+
+`mode` is a construction parameter on the tool call, not a second tool and not a global
+rig setting. When omitted, the child uses its definition's initial mode. When supplied,
+the spawner resolves and validates the mode against the target definition before
+reserving quota or creating a loop. An unknown or unauthorized mode fails without
+spawning anything.
+
+The child starts directly in the selected mode; it does not start in one mode and emit a
+synthetic `LoopModeChanged`. `LoopStarted` carries the selected initial mode so replay and
+restore reconstruct the child deterministically. The child's effective tools and
+permissions remain clamped by the parent and session security ceiling regardless of the
+requested mode.
+
 ## Rig definition
 
 `rig.Define(opts ...Option) (*Rig, error)` is the only public constructor for the
@@ -658,6 +692,15 @@ All tests are table-driven and run under `-race`.
 - atomic runtime model/effort change;
 - next-turn-only application, including a change requested during an active turn; and
 - restore folds of `LoopChanged` and `LoopModeChanged`.
+
+### `pkg/tools`
+
+- Subagent JSON schema exposes optional `mode`;
+- omitted mode uses the target definition's initial mode;
+- valid explicit mode constructs the child directly in that mode;
+- unknown/unauthorized mode fails before quota reservation or loop creation;
+- selected mode is carried on `LoopStarted` and restored; and
+- requested mode cannot bypass parent/session permission clamps.
 
 ### `pkg/rig`
 
