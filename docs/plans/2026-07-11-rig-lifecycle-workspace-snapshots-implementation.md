@@ -132,6 +132,10 @@ git commit -m "feat(storage): expose persistence paths to rig validation"
 - Create: `pkg/tool/definition_test.go`
 - Create: `pkg/tools/definitions.go`
 - Create: `pkg/tools/definitions_test.go`
+- Modify: `pkg/tools/bash.go`
+- Modify: `pkg/tools/bash_test.go`
+- Modify: `pkg/tools/subagent.go`
+- Modify: `pkg/tools/subagent_test.go`
 - Modify: `pkg/tool/deps_test.go`
 
 **Step 1: Write failing tests**
@@ -178,7 +182,17 @@ tools.Bash(opts...)
 tools.Subagent()
 ```
 
-Also provide definition wrappers for existing stateless tools so `loop.WithTools` has one input type. Keep current concrete constructors for package tests/custom low-level tool use, but rig composition accepts definitions only. Every `Build` must return fresh mutable instances.
+Go cannot declare a type and function with the same package name. Rename only the
+existing concrete `Bash` and `Subagent` types to `BashTool` and `SubagentTool`; keep
+`NewBash` and `NewSubagent` as the low-level constructors returning those types. The
+short `Bash` and `Subagent` identifiers then belong to the approved blueprint functions.
+
+Provide one factory-backed definition constructor in `pkg/tool` for custom/stateless
+tools so `loop.WithTools` always receives `tool.Definition`; do not add a second static
+instance path that could reuse mutable tools across sessions. Existing concrete tool
+constructors remain usable in low-level package tests/custom runtimes, but rig
+composition accepts definitions only. Every `Build` invocation must return fresh mutable
+instances.
 
 **Step 4: Verify green**
 
