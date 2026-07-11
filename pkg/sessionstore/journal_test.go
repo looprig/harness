@@ -272,7 +272,7 @@ func TestAppendOverThresholdOffloads(t *testing.T) {
 	t.Parallel()
 	mem := memstore.New()
 	log := &opLog{}
-	comp := &storekit.Composite{
+	comp := &storage.Composite{
 		Ledger: &recordingLedger{inner: mem.Ledger, log: log},
 		Leaser: mem.Leaser,
 		KV:     mem.KV,
@@ -407,7 +407,7 @@ func TestAppendPerAppendDeadline(t *testing.T) {
 	t.Parallel()
 	mem := memstore.New()
 	bl := &blockingLedger{inner: mem.Ledger}
-	comp := &storekit.Composite{Ledger: bl, Leaser: mem.Leaser, KV: mem.KV, Blobs: mem.Blobs}
+	comp := &storage.Composite{Ledger: bl, Leaser: mem.Leaser, KV: mem.KV, Blobs: mem.Blobs}
 	st, err := Open(comp)
 	if err != nil {
 		t.Fatalf("Open() err = %v", err)
@@ -455,9 +455,9 @@ func TestAppendPerAppendDeadline(t *testing.T) {
 
 // TestAppendVerifyErrorMapsToAmbiguous covers the fail-closed classification of an
 // unresolved conflict: when AppendDefinite hits a CAS conflict whose resolving Read
-// fails, it returns a *storekit.AppendVerifyError (outcome genuinely unknown). The
+// fails, it returns a *storage.AppendVerifyError (outcome genuinely unknown). The
 // journal must surface that as a *journal.AmbiguousAckError (the "unresolved, decide
-// fail-or-retry" case), not leak storekit's type, with the verify error still
+// fail-or-retry" case), not leak storage's type, with the verify error still
 // reachable via errors.As/Unwrap.
 func TestAppendVerifyErrorMapsToAmbiguous(t *testing.T) {
 	t.Parallel()
@@ -487,9 +487,9 @@ func TestAppendVerifyErrorMapsToAmbiguous(t *testing.T) {
 	if ambErr.Expected != 5 {
 		t.Errorf("AmbiguousAckError.Expected = %d, want 5 (tracked tip)", ambErr.Expected)
 	}
-	var verifyErr *storekit.AppendVerifyError
+	var verifyErr *storage.AppendVerifyError
 	if !errors.As(err, &verifyErr) {
-		t.Fatalf("err %v does not carry a *storekit.AppendVerifyError", err)
+		t.Fatalf("err %v does not carry a *storage.AppendVerifyError", err)
 	}
 	if !errors.Is(err, errVerifyRead) {
 		t.Errorf("err %v does not unwrap to the underlying verify-read failure", err)
@@ -503,20 +503,20 @@ func TestAppendVerifyErrorMapsToAmbiguous(t *testing.T) {
 // --- test doubles ---------------------------------------------------------
 
 // errVerifyRead is the leaf read failure verifyFailLedger injects so a conflict's
-// resolving Read fails, driving AppendDefinite's *storekit.AppendVerifyError path.
+// resolving Read fails, driving AppendDefinite's *storage.AppendVerifyError path.
 var errVerifyRead = errors.New("verify read boom")
 
 // verifyFailLedger is a Ledger double whose Append always conflicts and whose Read
 // always fails: it drives AppendDefinite into verifyAppend and then a read failure,
-// yielding a *storekit.AppendVerifyError (unresolved outcome).
+// yielding a *storage.AppendVerifyError (unresolved outcome).
 type verifyFailLedger struct {
 	readErr error
 }
 
 func (l *verifyFailLedger) Append(ctx context.Context, name string, expected uint64, payload []byte) error {
-	return &storekit.ConflictError{Name: name, Expected: expected}
+	return &storage.ConflictError{Name: name, Expected: expected}
 }
-func (l *verifyFailLedger) Read(ctx context.Context, name string, from uint64) (storekit.Cursor, error) {
+func (l *verifyFailLedger) Read(ctx context.Context, name string, from uint64) (storage.Cursor, error) {
 	return nil, l.readErr
 }
 func (l *verifyFailLedger) Tip(ctx context.Context, name string) (uint64, error) { return 0, nil }
@@ -571,7 +571,7 @@ func (l *opLog) snapshot() []string {
 
 // recordingLedger records each Append against a shared opLog, then delegates.
 type recordingLedger struct {
-	inner storekit.Ledger
+	inner storage.Ledger
 	log   *opLog
 }
 
@@ -579,7 +579,7 @@ func (l *recordingLedger) Append(ctx context.Context, name string, expected uint
 	l.log.record("append")
 	return l.inner.Append(ctx, name, expected, payload)
 }
-func (l *recordingLedger) Read(ctx context.Context, name string, from uint64) (storekit.Cursor, error) {
+func (l *recordingLedger) Read(ctx context.Context, name string, from uint64) (storage.Cursor, error) {
 	return l.inner.Read(ctx, name, from)
 }
 func (l *recordingLedger) Tip(ctx context.Context, name string) (uint64, error) {
@@ -591,7 +591,7 @@ func (l *recordingLedger) Delete(ctx context.Context, name string) error {
 
 // recordingBlobs records each Put against a shared opLog, then delegates.
 type recordingBlobs struct {
-	inner storekit.Blobs
+	inner storage.Blobs
 	log   *opLog
 }
 
@@ -613,7 +613,7 @@ func (b *recordingBlobs) List(ctx context.Context, prefix string) ([]string, err
 // prove the per-append deadline unblocks the serialized writer. Other methods
 // delegate so the opening fence writes while unblocked.
 type blockingLedger struct {
-	inner storekit.Ledger
+	inner storage.Ledger
 	block atomic.Bool
 }
 
@@ -624,7 +624,7 @@ func (l *blockingLedger) Append(ctx context.Context, name string, expected uint6
 	}
 	return l.inner.Append(ctx, name, expected, payload)
 }
-func (l *blockingLedger) Read(ctx context.Context, name string, from uint64) (storekit.Cursor, error) {
+func (l *blockingLedger) Read(ctx context.Context, name string, from uint64) (storage.Cursor, error) {
 	return l.inner.Read(ctx, name, from)
 }
 func (l *blockingLedger) Tip(ctx context.Context, name string) (uint64, error) {
@@ -634,11 +634,11 @@ func (l *blockingLedger) Delete(ctx context.Context, name string) error {
 	return l.inner.Delete(ctx, name)
 }
 
-// Compile-time proofs that the test doubles honor the storekit contracts they
+// Compile-time proofs that the test doubles honor the storage contracts they
 // stand in for; a drift in the interfaces breaks here rather than at a call site.
 var (
-	_ storekit.Ledger = (*recordingLedger)(nil)
-	_ storekit.Blobs  = (*recordingBlobs)(nil)
-	_ storekit.Ledger = (*blockingLedger)(nil)
-	_ storekit.Ledger = (*verifyFailLedger)(nil)
+	_ storage.Ledger = (*recordingLedger)(nil)
+	_ storage.Blobs  = (*recordingBlobs)(nil)
+	_ storage.Ledger = (*blockingLedger)(nil)
+	_ storage.Ledger = (*verifyFailLedger)(nil)
 )

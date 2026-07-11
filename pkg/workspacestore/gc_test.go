@@ -12,12 +12,12 @@ import (
 	"github.com/looprig/storage/memstore"
 )
 
-// deleteCountingBlobs wraps a storekit.Blobs and counts Delete invocations so a
+// deleteCountingBlobs wraps a storage.Blobs and counts Delete invocations so a
 // test can prove GC issues exactly one Delete per swept snapshot — and none on a
 // re-sweep of an already-clean set or on an already-cancelled run. Put/Get/List
 // are promoted from the embedded interface unchanged.
 type deleteCountingBlobs struct {
-	storekit.Blobs
+	storage.Blobs
 	deletes atomic.Int64
 }
 
@@ -30,7 +30,7 @@ func (d *deleteCountingBlobs) Delete(ctx context.Context, key string) error {
 // enumeration failure surfaces as an unwrap-able *GCError with Op "list".
 // Put/Get/Delete are promoted from the embedded backend.
 type listFailBlobs struct {
-	storekit.Blobs
+	storage.Blobs
 	err error
 }
 
@@ -43,7 +43,7 @@ func (l *listFailBlobs) List(ctx context.Context, prefix string) ([]string, erro
 // and the offending Ref. List/Put/Get are promoted from the embedded backend, so
 // the store can still be seeded and enumerated.
 type deleteFailBlobs struct {
-	storekit.Blobs
+	storage.Blobs
 	err error
 }
 
@@ -73,7 +73,7 @@ func seedSnapshots(t *testing.T, s *Store, n int) []Ref {
 }
 
 // listBlobKeys returns the set of blob keys currently under blobKeyPrefix.
-func listBlobKeys(t *testing.T, b storekit.Blobs) map[string]struct{} {
+func listBlobKeys(t *testing.T, b storage.Blobs) map[string]struct{} {
 	t.Helper()
 	keys, err := b.List(context.Background(), blobKeyPrefix)
 	if err != nil {

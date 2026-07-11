@@ -1,11 +1,11 @@
-package storekit
+package storage
 
 import "strconv"
 
-// maxNameLen is the inclusive upper bound, in bytes, on a storekit name.
+// maxNameLen is the inclusive upper bound, in bytes, on a storage name.
 const maxNameLen = 512
 
-// InvalidNameError reports a name that violates the storekit grammar: one or
+// InvalidNameError reports a name that violates the storage grammar: one or
 // more segments joined by single '/', each segment matching
 // [a-z0-9][a-z0-9_.-]*, no leading/trailing '/', at most 512 bytes total.
 type InvalidNameError struct {
@@ -14,10 +14,10 @@ type InvalidNameError struct {
 }
 
 func (e *InvalidNameError) Error() string {
-	return "storekit: invalid name " + strconv.Quote(e.Name) + ": " + e.Rule
+	return "storage: invalid name " + strconv.Quote(e.Name) + ": " + e.Rule
 }
 
-// ValidateName returns a non-nil *InvalidNameError if name violates the storekit
+// ValidateName returns a non-nil *InvalidNameError if name violates the storage
 // name grammar, or nil if it is valid. The grammar is canonical by construction:
 // empty, ".", and ".." segments are unrepresentable, so no two valid names alias
 // one backend location.

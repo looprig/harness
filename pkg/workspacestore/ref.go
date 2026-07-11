@@ -22,9 +22,9 @@ const refPrefix = "v1:sha256:"
 // this many hex characters, no more and no fewer.
 const refHexLen = 64
 
-// blobKeyPrefix namespaces snapshot archives within a storekit Blobs store. A Ref's
+// blobKeyPrefix namespaces snapshot archives within a storage Blobs store. A Ref's
 // blob key is blobKeyPrefix followed by its 64-character digest hex, which is a
-// valid storekit name (its two segments each match [a-z0-9][a-z0-9_.-]*).
+// valid storage name (its two segments each match [a-z0-9][a-z0-9_.-]*).
 const blobKeyPrefix = "workspaces/"
 
 // Ref names one immutable, content-addressed snapshot in the canonical form
@@ -68,9 +68,9 @@ func (r Ref) hex() string {
 	return rest
 }
 
-// blobKey returns the storekit blob key under which r's snapshot archive is stored:
+// blobKey returns the storage blob key under which r's snapshot archive is stored:
 // blobKeyPrefix joined with r's digest hex. For any Ref obtained from ParseRef this
-// is a valid storekit name.
+// is a valid storage name.
 func (r Ref) blobKey() string {
 	return blobKeyPrefix + r.hex()
 }

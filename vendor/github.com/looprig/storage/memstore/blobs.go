@@ -19,7 +19,7 @@ import (
 //
 // As an in-process oracle it performs no blocking I/O beyond draining the
 // caller's reader and does NOT honor ctx cancellation; each method's ctx
-// parameter exists solely to satisfy the storekit.Blobs contract.
+// parameter exists solely to satisfy the storage.Blobs contract.
 type blobStore struct {
 	mu    sync.RWMutex
 	blobs map[string][]byte
@@ -31,7 +31,7 @@ func newBlobStore() *blobStore {
 }
 
 // Compile-time proof that *blobStore honors the Blobs contract.
-var _ storekit.Blobs = (*blobStore)(nil)
+var _ storage.Blobs = (*blobStore)(nil)
 
 // Put reads r to completion and stores the bytes at key. It validates the key
 // first (*InvalidNameError). If key already holds byte-identical content the Put
@@ -40,7 +40,7 @@ var _ storekit.Blobs = (*blobStore)(nil)
 // drained before the lock is taken, so I/O never blocks other operations; the
 // resulting slice is owned by the store (io.ReadAll allocates it fresh).
 func (s *blobStore) Put(ctx context.Context, key string, r io.Reader) error {
-	if err := storekit.ValidateName(key); err != nil {
+	if err := storage.ValidateName(key); err != nil {
 		return err
 	}
 	data, err := io.ReadAll(r)
@@ -55,7 +55,7 @@ func (s *blobStore) Put(ctx context.Context, key string, r io.Reader) error {
 		if bytes.Equal(existing, data) {
 			return nil // byte-identical: content-addressed no-op
 		}
-		return &storekit.BlobConflictError{Key: key}
+		return &storage.BlobConflictError{Key: key}
 	}
 	s.blobs[key] = data
 	return nil
@@ -67,7 +67,7 @@ func (s *blobStore) Put(ctx context.Context, key string, r io.Reader) error {
 // caller reading, closing, or mutating the bytes cannot affect stored data or
 // any other reader.
 func (s *blobStore) Get(ctx context.Context, key string) (io.ReadCloser, error) {
-	if err := storekit.ValidateName(key); err != nil {
+	if err := storage.ValidateName(key); err != nil {
 		return nil, err
 	}
 	s.mu.RLock()
@@ -75,7 +75,7 @@ func (s *blobStore) Get(ctx context.Context, key string) (io.ReadCloser, error) 
 
 	data, ok := s.blobs[key]
 	if !ok {
-		return nil, &storekit.BlobNotFoundError{Key: key}
+		return nil, &storage.BlobNotFoundError{Key: key}
 	}
 	out := make([]byte, len(data))
 	copy(out, data)
@@ -86,7 +86,7 @@ func (s *blobStore) Get(ctx context.Context, key string) (io.ReadCloser, error) 
 // idempotent, so deleting an absent key succeeds. After Delete the key is free:
 // a fresh Put of any content stores it without a lingering conflict.
 func (s *blobStore) Delete(ctx context.Context, key string) error {
-	if err := storekit.ValidateName(key); err != nil {
+	if err := storage.ValidateName(key); err != nil {
 		return err
 	}
 	s.mu.Lock()

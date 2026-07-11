@@ -39,7 +39,7 @@ func (s *Store) Materialize(ctx context.Context, ref Ref, dest string) error {
 }
 
 // Delete removes ref's snapshot archive from Blobs. It is idempotent: deleting a
-// ref whose blob is already absent succeeds, mirroring the storekit Blobs
+// ref whose blob is already absent succeeds, mirroring the storage Blobs
 // contract, so a resume that has already discarded its checkpoint is not an error.
 func (s *Store) Delete(ctx context.Context, ref Ref) error {
 	return s.blobs.Delete(ctx, ref.blobKey())

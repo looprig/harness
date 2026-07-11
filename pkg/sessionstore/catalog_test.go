@@ -11,11 +11,11 @@ import (
 	"time"
 
 	"github.com/looprig/core/content"
+	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/gate"
 	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/journal"
-	"github.com/looprig/core/uuid"
 	"github.com/looprig/storage"
 	"github.com/looprig/storage/memstore"
 )
@@ -48,14 +48,14 @@ func hdr(sid uuid.UUID) event.Header {
 	return event.Header{Coordinates: identity.Coordinates{SessionID: sid}}
 }
 
-// --- fakeKV: an in-memory storekit.KV double with fault + conflict injection ---
+// --- fakeKV: an in-memory storage.KV double with fault + conflict injection ---
 
 type kvEnt struct {
 	val []byte
 	rev uint64
 }
 
-// fakeKV is a minimal storekit.KV double for unit-testing the catalog without a real
+// fakeKV is a minimal storage.KV double for unit-testing the catalog without a real
 // backend. getErr/putErr force I/O failures (best-effort proof); conflictN forces the
 // first N Puts to return a *ConflictError (rev-CAS retry proof).
 type fakeKV struct {
@@ -70,7 +70,7 @@ type fakeKV struct {
 
 func newFakeKV() *fakeKV { return &fakeKV{entries: map[string]kvEnt{}} }
 
-var _ storekit.KV = (*fakeKV)(nil)
+var _ storage.KV = (*fakeKV)(nil)
 
 func (k *fakeKV) Get(_ context.Context, key string) ([]byte, uint64, error) {
 	k.mu.Lock()
@@ -81,7 +81,7 @@ func (k *fakeKV) Get(_ context.Context, key string) ([]byte, uint64, error) {
 	}
 	e, ok := k.entries[key]
 	if !ok {
-		return nil, 0, &storekit.KeyNotFoundError{Key: key}
+		return nil, 0, &storage.KeyNotFoundError{Key: key}
 	}
 	return append([]byte(nil), e.val...), e.rev, nil
 }
@@ -95,11 +95,11 @@ func (k *fakeKV) Put(_ context.Context, key string, expectedRev uint64, val []by
 	}
 	if k.conflictN > 0 {
 		k.conflictN--
-		return 0, &storekit.ConflictError{Name: key, Expected: expectedRev}
+		return 0, &storage.ConflictError{Name: key, Expected: expectedRev}
 	}
 	cur := k.entries[key].rev
 	if expectedRev != cur {
-		return 0, &storekit.ConflictError{Name: key, Expected: expectedRev}
+		return 0, &storage.ConflictError{Name: key, Expected: expectedRev}
 	}
 	nr := cur + 1
 	k.entries[key] = kvEnt{val: append([]byte(nil), val...), rev: nr}
@@ -892,7 +892,7 @@ func TestCatalogUpdateSemantics(t *testing.T) {
 }
 
 // TestCatalogListOrder proves ListSessions returns entries sorted ascending by session
-// id (the storekit KV.Keys canonical order), independent of insertion order.
+// id (the storage KV.Keys canonical order), independent of insertion order.
 func TestCatalogListOrder(t *testing.T) {
 	t.Parallel()
 	now := time.Date(2026, 6, 21, 12, 0, 0, 0, time.UTC)
@@ -1032,7 +1032,7 @@ func TestCatalogUpdateBestEffort(t *testing.T) {
 }
 
 // TestCatalogUpsertRetriesOnConflict proves the read-modify-write loop retries on a
-// *storekit.ConflictError (a concurrent writer advanced the rev) and eventually lands
+// *storage.ConflictError (a concurrent writer advanced the rev) and eventually lands
 // the update — matching the NATS catalog's last-write-wins "the update lands" semantics.
 func TestCatalogUpsertRetriesOnConflict(t *testing.T) {
 	t.Parallel()

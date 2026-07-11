@@ -11,9 +11,9 @@ import (
 	"time"
 
 	"github.com/looprig/core/content"
+	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/journal"
-	"github.com/looprig/core/uuid"
 	"github.com/looprig/storage"
 )
 
@@ -23,7 +23,7 @@ import (
 const titleMaxLen = 80
 
 // catalogMaxCASRetries bounds the read-modify-write retry loop UpdateOnEvent (and
-// RepairCatalog's store) run when a concurrent writer wins the rev-CAS. storekit.KV has
+// RepairCatalog's store) run when a concurrent writer wins the rev-CAS. storage.KV has
 // NO unconditional Put — every Put is a revision compare-and-swap — so emulating the
 // NATS catalog's last-write-wins "the update lands" guarantee means re-reading the newer
 // revision and retrying. The bound keeps a pathologically contended key from spinning
@@ -77,7 +77,7 @@ const (
 
 // SessionMeta is the derived per-session catalog entry: the small, replay-free record the
 // session picker reads to list sessions without opening a single ledger cursor. It is
-// JSON (snake_case) stored one-per-session in storekit.KV, keyed by the session's ledger
+// JSON (snake_case) stored one-per-session in storage.KV, keyed by the session's ledger
 // name ("sessions/<uuid>"). It is a cache rebuilt from the authoritative ledger when
 // missing or stale (RepairCatalog) — never the source of truth.
 type SessionMeta struct {
@@ -192,9 +192,9 @@ func (e *CatalogEncodeError) Error() string {
 func (e *CatalogEncodeError) Unwrap() error { return e.Cause }
 
 // CatalogConflictError reports that a catalog update could not win the KV revision-CAS
-// within catalogMaxCASRetries attempts: a persistently contended key. It has no storekit
+// within catalogMaxCASRetries attempts: a persistently contended key. It has no storage
 // analog in the NATS catalog (JetStream KV Put was unconditional last-write-wins); it
-// exists because storekit.KV is CAS-only. UpdateOnEvent logs+swallows it (best-effort);
+// exists because storage.KV is CAS-only. UpdateOnEvent logs+swallows it (best-effort);
 // RepairCatalog surfaces it.
 type CatalogConflictError struct {
 	SessionID uuid.UUID
@@ -467,13 +467,13 @@ func WithCatalogReplayer(opener EventReplayerOpener) CatalogOption {
 	}
 }
 
-// Catalog maintains the derived session catalog in storekit.KV: one SessionMeta per
+// Catalog maintains the derived session catalog in storage.KV: one SessionMeta per
 // session, keyed by the session's ledger name. It has one reason to change: how the catalog
 // is indexed. UpdateOnEvent folds a single event into the keyed entry (best-effort,
 // post-append); ListSessions reads the KV only (no ledger cursor); RepairCatalog rebuilds
 // an entry from the authoritative ledger.
 type Catalog struct {
-	kv     storekit.KV
+	kv     storage.KV
 	now    CatalogClock
 	log    CatalogLogger
 	opener EventReplayerOpener // for RepairCatalog's ledger scan (nil => repair disabled)
@@ -515,7 +515,7 @@ func (c *Catalog) UpdateOnEvent(ctx context.Context, ev event.Event, seq uint64)
 }
 
 // upsert performs the bounded read-modify-write: read the current entry (or an empty one),
-// fold ev, and Put under revision-CAS; on a *storekit.ConflictError a concurrent writer
+// fold ev, and Put under revision-CAS; on a *storage.ConflictError a concurrent writer
 // advanced the revision, so re-read and retry. Exhausting the retries returns a typed
 // *CatalogConflictError. A read/decode fault or a non-conflict write fault is terminal and
 // returned as its typed error.
@@ -530,7 +530,7 @@ func (c *Catalog) upsert(ctx context.Context, sid uuid.UUID, ev event.Event, seq
 		if serr == nil {
 			return nil
 		}
-		var conflict *storekit.ConflictError
+		var conflict *storage.ConflictError
 		if !errors.As(serr, &conflict) {
 			return serr
 		}
@@ -549,7 +549,7 @@ func (c *Catalog) load(ctx context.Context, sid uuid.UUID) (SessionMeta, uint64,
 	}
 	val, rev, err := c.kv.Get(ctx, key)
 	if err != nil {
-		var notFound *storekit.KeyNotFoundError
+		var notFound *storage.KeyNotFoundError
 		if errors.As(err, &notFound) {
 			return SessionMeta{}, 0, nil
 		}
@@ -564,7 +564,7 @@ func (c *Catalog) load(ctx context.Context, sid uuid.UUID) (SessionMeta, uint64,
 
 // store encodes and writes meta to the session's keyed entry under revision-CAS on rev
 // (rev 0 requires the key absent). It returns a typed *CatalogWriteError on an encode or KV
-// Put failure; a *storekit.ConflictError is wrapped but still recoverable via errors.As so
+// Put failure; a *storage.ConflictError is wrapped but still recoverable via errors.As so
 // the upsert/repair retry loop can detect the lost CAS.
 func (c *Catalog) store(ctx context.Context, sid uuid.UUID, rev uint64, meta SessionMeta) error {
 	key, err := sessionName(sid)
@@ -583,7 +583,7 @@ func (c *Catalog) store(ctx context.Context, sid uuid.UUID, rev uint64, meta Ses
 
 // ListSessions returns every catalog entry by reading the KV ONLY — keys then values —
 // with ZERO ledger replay and NO cursor. It is the session picker's data source: a
-// replay-free index. Entries come back sorted ascending by session id (the storekit
+// replay-free index. Entries come back sorted ascending by session id (the storage
 // KV.Keys canonical order — a deterministic improvement over the NATS catalog's arbitrary
 // order). An empty catalog returns an empty slice (not an error); a corrupt entry surfaces
 // a typed *CatalogReadError so the caller can repair.
@@ -596,7 +596,7 @@ func (c *Catalog) ListSessions(ctx context.Context) ([]SessionMeta, error) {
 	for _, key := range keys {
 		val, _, gerr := c.kv.Get(ctx, key)
 		if gerr != nil {
-			var notFound *storekit.KeyNotFoundError
+			var notFound *storage.KeyNotFoundError
 			if errors.As(gerr, &notFound) {
 				// Deleted between Keys and Get: skip it (a concurrent delete is not a corrupt
 				// entry).
@@ -709,7 +709,7 @@ func (c *Catalog) storeRetry(ctx context.Context, sid uuid.UUID, meta SessionMet
 		if serr == nil {
 			return nil
 		}
-		var conflict *storekit.ConflictError
+		var conflict *storage.ConflictError
 		if !errors.As(serr, &conflict) {
 			return serr
 		}

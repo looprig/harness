@@ -13,11 +13,11 @@ import (
 	"github.com/looprig/storage/memstore"
 )
 
-// countingBlobs wraps a storekit.Blobs and counts Put invocations so a test can
+// countingBlobs wraps a storage.Blobs and counts Put invocations so a test can
 // prove that a content-addressed re-snapshot of an unchanged tree performs zero
 // uploads. Get/List/Delete are promoted from the embedded interface unchanged.
 type countingBlobs struct {
-	storekit.Blobs
+	storage.Blobs
 	puts atomic.Int64
 }
 
@@ -26,11 +26,11 @@ func (c *countingBlobs) Put(ctx context.Context, key string, r io.Reader) error 
 	return c.Blobs.Put(ctx, key, r)
 }
 
-// failPutBlobs wraps a storekit.Blobs and fails every Put with a fixed error so a
+// failPutBlobs wraps a storage.Blobs and fails every Put with a fixed error so a
 // test can prove a Blobs upload failure surfaces as an unwrap-able *SnapshotError.
 // List (used by the presence check) is promoted from the embedded backend.
 type failPutBlobs struct {
-	storekit.Blobs
+	storage.Blobs
 	err error
 }
 
@@ -39,7 +39,7 @@ func (f *failPutBlobs) Put(ctx context.Context, key string, r io.Reader) error {
 }
 
 // getBlob returns the full bytes stored under key, failing the test on any error.
-func getBlob(t *testing.T, b storekit.Blobs, key string) []byte {
+func getBlob(t *testing.T, b storage.Blobs, key string) []byte {
 	t.Helper()
 	rc, err := b.Get(context.Background(), key)
 	if err != nil {
@@ -58,7 +58,7 @@ func TestOpen(t *testing.T) {
 
 	tests := []struct {
 		name    string
-		blobs   storekit.Blobs
+		blobs   storage.Blobs
 		opts    []Option
 		wantErr bool
 	}{

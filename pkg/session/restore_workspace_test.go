@@ -26,7 +26,7 @@ import (
 // mustWorkspaceStore opens a workspacestore.Store over blobs, failing the test loudly on
 // error. The SAME store (hence the same Blobs backend) is used by the original run's
 // Snapshot AND the restore-side Materialize, so a snapshot blob survives the handover.
-func mustWorkspaceStore(t *testing.T, blobs storekit.Blobs) *workspacestore.Store {
+func mustWorkspaceStore(t *testing.T, blobs storage.Blobs) *workspacestore.Store {
 	t.Helper()
 	ws, err := workspacestore.Open(blobs)
 	if err != nil {
@@ -35,11 +35,11 @@ func mustWorkspaceStore(t *testing.T, blobs storekit.Blobs) *workspacestore.Stor
 	return ws
 }
 
-// getCountingBlobs wraps a storekit.Blobs and counts Get calls, so a workspace-restore
+// getCountingBlobs wraps a storage.Blobs and counts Get calls, so a workspace-restore
 // test can PROVE the verified-reuse path materializes a warm volume without any fetch.
 // Put/List/Delete are promoted from the embedded interface.
 type getCountingBlobs struct {
-	storekit.Blobs
+	storage.Blobs
 	gets atomic.Int64
 }
 
@@ -416,9 +416,9 @@ func TestRestoreWorkspaceMaterializeFailsClosed(t *testing.T) {
 				if !errors.As(err, &me) {
 					t.Fatalf("cause = %v, want *workspacestore.MaterializeError", err)
 				}
-				var bnfe *storekit.BlobNotFoundError
+				var bnfe *storage.BlobNotFoundError
 				if !errors.As(err, &bnfe) {
-					t.Fatalf("cause does not unwrap to *storekit.BlobNotFoundError: %v", err)
+					t.Fatalf("cause does not unwrap to *storage.BlobNotFoundError: %v", err)
 				}
 			},
 		},

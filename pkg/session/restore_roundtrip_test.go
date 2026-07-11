@@ -23,7 +23,7 @@ import (
 
 // --- memstore-backed store + journal test wiring (local to package session) ---------
 
-// newRestoreStore opens a sessionstore.Store over a fresh in-memory storekit backend —
+// newRestoreStore opens a sessionstore.Store over a fresh in-memory storage backend —
 // the whole durable round trip (lease, journal, replay) runs in-process, no NATS server.
 // One store per test; the original run AND Restore share it so the restored session reads
 // the same ledger the original wrote.

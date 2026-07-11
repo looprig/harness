@@ -4,19 +4,19 @@ import (
 	"context"
 	"errors"
 
-	"github.com/looprig/harness/pkg/journal"
 	"github.com/looprig/core/uuid"
+	"github.com/looprig/harness/pkg/journal"
 	"github.com/looprig/storage"
 )
 
-// sessionLease adapts a storekit.Lease to journal.Lease. storekit's lease is
+// sessionLease adapts a storage.Lease to journal.Lease. storage's lease is
 // name-scoped and exposes only Epoch/Lost/Release; the journal contract additionally
 // requires SessionID and a boolean Valid. This adapter carries the session id the
 // lease was acquired for and derives Valid from the wrapped Lost channel, delegating
 // everything else. It never controls the lease lifecycle beyond passing Release
 // through — the holder owns that.
 type sessionLease struct {
-	inner     storekit.Lease
+	inner     storage.Lease
 	sessionID uuid.UUID
 }
 
@@ -29,7 +29,7 @@ func (l *sessionLease) Epoch() uint64 { return l.inner.Epoch() }
 // Lost returns the wrapped lease's loss channel, closed when ownership ends.
 func (l *sessionLease) Lost() <-chan struct{} { return l.inner.Lost() }
 
-// SessionID returns the session this lease was acquired for. storekit's lease has no
+// SessionID returns the session this lease was acquired for. storage's lease has no
 // session identity of its own, so the adapter supplies it.
 func (l *sessionLease) SessionID() uuid.UUID { return l.sessionID }
 
@@ -51,11 +51,11 @@ func (l *sessionLease) Valid() bool {
 
 // AcquireLease acquires single-writer ownership of a session's stream and returns it
 // as a journal.Lease. It derives (and validates) the session's ledger name, acquires
-// the storekit lease over that name, and wraps the result so the journal sees a
-// journal.Lease. A storekit *LeaseHeldError — the expected "someone else owns this
+// the storage lease over that name, and wraps the result so the journal sees a
+// journal.Lease. A storage *LeaseHeldError — the expected "someone else owns this
 // session" outcome — is translated to the journal's own *LeaseHeldError, keyed by
 // session id and the live holder's epoch, so callers classify it at the journal level
-// without depending on storekit's error vocabulary. Any other backend error is
+// without depending on storage's error vocabulary. Any other backend error is
 // surfaced unchanged (fail closed).
 func (s *Store) AcquireLease(ctx context.Context, id uuid.UUID) (journal.Lease, error) {
 	name, err := sessionName(id)
@@ -64,7 +64,7 @@ func (s *Store) AcquireLease(ctx context.Context, id uuid.UUID) (journal.Lease, 
 	}
 	inner, err := s.backend.Leaser.Acquire(ctx, name)
 	if err != nil {
-		var held *storekit.LeaseHeldError
+		var held *storage.LeaseHeldError
 		if errors.As(err, &held) {
 			return nil, &journal.LeaseHeldError{SessionID: id, Epoch: held.HolderEpoch}
 		}

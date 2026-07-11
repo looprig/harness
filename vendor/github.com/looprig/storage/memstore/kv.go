@@ -23,7 +23,7 @@ type kvEntry struct {
 //
 // As an in-process oracle it performs no blocking I/O and does NOT honor ctx
 // cancellation; each method's ctx parameter exists solely to satisfy the
-// storekit.KV contract.
+// storage.KV contract.
 type kvStore struct {
 	mu      sync.RWMutex
 	entries map[string]kvEntry
@@ -35,14 +35,14 @@ func newKVStore() *kvStore {
 }
 
 // Compile-time proof that *kvStore honors the KV contract.
-var _ storekit.KV = (*kvStore)(nil)
+var _ storage.KV = (*kvStore)(nil)
 
 // Get returns a copy of the value at key plus its current revision. It validates
 // the key first (*InvalidNameError); an absent key yields a *KeyNotFoundError.
 // The returned slice is a fresh copy (copy-out), so caller mutation cannot reach
 // stored data.
 func (s *kvStore) Get(ctx context.Context, key string) ([]byte, uint64, error) {
-	if err := storekit.ValidateName(key); err != nil {
+	if err := storage.ValidateName(key); err != nil {
 		return nil, 0, err
 	}
 	s.mu.RLock()
@@ -50,7 +50,7 @@ func (s *kvStore) Get(ctx context.Context, key string) ([]byte, uint64, error) {
 
 	e, ok := s.entries[key]
 	if !ok {
-		return nil, 0, &storekit.KeyNotFoundError{Key: key}
+		return nil, 0, &storage.KeyNotFoundError{Key: key}
 	}
 	out := make([]byte, len(e.val))
 	copy(out, e.val)
@@ -64,7 +64,7 @@ func (s *kvStore) Get(ctx context.Context, key string) ([]byte, uint64, error) {
 // On success it stores a copy of val (copy-in), bumps the revision by one, and
 // returns the new revision.
 func (s *kvStore) Put(ctx context.Context, key string, expectedRev uint64, val []byte) (uint64, error) {
-	if err := storekit.ValidateName(key); err != nil {
+	if err := storage.ValidateName(key); err != nil {
 		return 0, err
 	}
 	s.mu.Lock()
@@ -72,7 +72,7 @@ func (s *kvStore) Put(ctx context.Context, key string, expectedRev uint64, val [
 
 	cur := s.entries[key].rev // 0 when the key is absent
 	if expectedRev != cur {
-		return 0, &storekit.ConflictError{Name: key, Expected: expectedRev}
+		return 0, &storage.ConflictError{Name: key, Expected: expectedRev}
 	}
 
 	stored := make([]byte, len(val))
@@ -104,7 +104,7 @@ func (s *kvStore) Keys(ctx context.Context, prefix string) ([]string, error) {
 // idempotent, so deleting an absent key succeeds. After Delete the key is absent
 // (Get reports *KeyNotFoundError) and its revision counter is forgotten.
 func (s *kvStore) Delete(ctx context.Context, key string) error {
-	if err := storekit.ValidateName(key); err != nil {
+	if err := storage.ValidateName(key); err != nil {
 		return err
 	}
 	s.mu.Lock()

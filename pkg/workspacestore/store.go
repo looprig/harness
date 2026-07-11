@@ -5,11 +5,11 @@ import (
 )
 
 // Store captures and restores a session's workspace tree as immutable,
-// content-addressed snapshots over a storekit.Blobs backend. It holds only that
+// content-addressed snapshots over a storage.Blobs backend. It holds only that
 // backend and its resolved Options; every operation carries its own state, so a
 // Store is as safe for concurrent use as the backend it wraps.
 type Store struct {
-	blobs storekit.Blobs
+	blobs storage.Blobs
 	opts  Options
 }
 
@@ -77,7 +77,7 @@ func WithMaxBytes(n int64) Option {
 // backend is rejected up front with *NilBlobsError — a Store has nowhere to put
 // snapshot bytes without one, so Open fails closed rather than hand back a Store
 // that panics on first Snapshot.
-func Open(b storekit.Blobs, opts ...Option) (*Store, error) {
+func Open(b storage.Blobs, opts ...Option) (*Store, error) {
 	if b == nil {
 		return nil, &NilBlobsError{}
 	}

@@ -1,13 +1,13 @@
-package storekit
+package storage
 
 import "strconv"
 
-// This file defines the storekit-canonical error taxonomy: the concrete error
+// This file defines the storage-canonical error taxonomy: the concrete error
 // types a backend returns for each distinct failure mode. Backends wrap their
-// own cause with fmt.Errorf("...: %w", &storekit.XxxError{...}); callers
+// own cause with fmt.Errorf("...: %w", &storage.XxxError{...}); callers
 // classify by recovering the concrete type with errors.As, never by string.
 //
-// Every Error() is prefixed "storekit: " and names its subject — the Name/Key
+// Every Error() is prefixed "storage: " and names its subject — the Name/Key
 // and any relevant number — with the string subject strconv.Quote'd so an
 // untrusted key cannot inject newlines or control bytes into a log line.
 
@@ -19,7 +19,7 @@ type ConflictError struct {
 }
 
 func (e *ConflictError) Error() string {
-	return "storekit: ledger " + strconv.Quote(e.Name) + " conflict: wrong expected seq " + strconv.FormatUint(e.Expected, 10)
+	return "storage: ledger " + strconv.Quote(e.Name) + " conflict: wrong expected seq " + strconv.FormatUint(e.Expected, 10)
 }
 
 // AmbiguousError reports a ledger append whose acknowledgement was lost or timed
@@ -32,7 +32,7 @@ type AmbiguousError struct {
 }
 
 func (e *AmbiguousError) Error() string {
-	return "storekit: ledger " + strconv.Quote(e.Name) + " append ambiguous at expected seq " + strconv.FormatUint(e.Expected, 10)
+	return "storage: ledger " + strconv.Quote(e.Name) + " append ambiguous at expected seq " + strconv.FormatUint(e.Expected, 10)
 }
 
 // Unwrap returns the underlying cause (possibly nil). AmbiguousError is the only
@@ -48,7 +48,7 @@ type RecordNotFoundError struct {
 }
 
 func (e *RecordNotFoundError) Error() string {
-	return "storekit: ledger " + strconv.Quote(e.Name) + " has no record at seq " + strconv.FormatUint(e.Seq, 10)
+	return "storage: ledger " + strconv.Quote(e.Name) + " has no record at seq " + strconv.FormatUint(e.Seq, 10)
 }
 
 // KeyNotFoundError reports that a KV key is absent.
@@ -57,7 +57,7 @@ type KeyNotFoundError struct {
 }
 
 func (e *KeyNotFoundError) Error() string {
-	return "storekit: kv key " + strconv.Quote(e.Key) + " not found"
+	return "storage: kv key " + strconv.Quote(e.Key) + " not found"
 }
 
 // BlobNotFoundError reports that a blob is absent at Key.
@@ -66,7 +66,7 @@ type BlobNotFoundError struct {
 }
 
 func (e *BlobNotFoundError) Error() string {
-	return "storekit: blob " + strconv.Quote(e.Key) + " not found"
+	return "storage: blob " + strconv.Quote(e.Key) + " not found"
 }
 
 // BlobConflictError reports a blob Put where Key already exists with different
@@ -76,7 +76,7 @@ type BlobConflictError struct {
 }
 
 func (e *BlobConflictError) Error() string {
-	return "storekit: blob " + strconv.Quote(e.Key) + " already exists with different content"
+	return "storage: blob " + strconv.Quote(e.Key) + " already exists with different content"
 }
 
 // LeaseHeldError reports an Acquire that was refused because another holder owns
@@ -87,7 +87,7 @@ type LeaseHeldError struct {
 }
 
 func (e *LeaseHeldError) Error() string {
-	return "storekit: lease " + strconv.Quote(e.Name) + " held by epoch " + strconv.FormatUint(e.HolderEpoch, 10)
+	return "storage: lease " + strconv.Quote(e.Name) + " held by epoch " + strconv.FormatUint(e.HolderEpoch, 10)
 }
 
 // LeaseLostError reports a write attempted after the caller's lease at Epoch was
@@ -98,5 +98,5 @@ type LeaseLostError struct {
 }
 
 func (e *LeaseLostError) Error() string {
-	return "storekit: lease " + strconv.Quote(e.Name) + " lost at epoch " + strconv.FormatUint(e.Epoch, 10)
+	return "storage: lease " + strconv.Quote(e.Name) + " lost at epoch " + strconv.FormatUint(e.Epoch, 10)
 }

@@ -16,11 +16,11 @@ import (
 	"github.com/looprig/storage/memstore"
 )
 
-// countingGetBlobs wraps a storekit.Blobs and counts Get invocations so a test
+// countingGetBlobs wraps a storage.Blobs and counts Get invocations so a test
 // can prove the verified-reuse path materializes a warm volume without any
 // network fetch. Put/List/Delete are promoted from the embedded interface.
 type countingGetBlobs struct {
-	storekit.Blobs
+	storage.Blobs
 	gets atomic.Int64
 }
 
@@ -251,9 +251,9 @@ func TestMaterializeAbsentBlob(t *testing.T) {
 	if !errors.As(err, &me) {
 		t.Fatalf("Materialize of absent blob = %v (%T), want *MaterializeError", err, err)
 	}
-	var bnfe *storekit.BlobNotFoundError
+	var bnfe *storage.BlobNotFoundError
 	if !errors.As(err, &bnfe) {
-		t.Fatalf("Materialize error does not unwrap to *storekit.BlobNotFoundError: %v", err)
+		t.Fatalf("Materialize error does not unwrap to *storage.BlobNotFoundError: %v", err)
 	}
 	if bnfe.Key != ref.blobKey() {
 		t.Errorf("BlobNotFoundError.Key = %q, want %q", bnfe.Key, ref.blobKey())

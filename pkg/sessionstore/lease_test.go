@@ -5,13 +5,13 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/looprig/harness/pkg/journal"
 	"github.com/looprig/core/uuid"
+	"github.com/looprig/harness/pkg/journal"
 	"github.com/looprig/storage"
 	"github.com/looprig/storage/memstore"
 )
 
-// fakeLease is a controllable storekit.Lease for unit-testing the adapter's
+// fakeLease is a controllable storage.Lease for unit-testing the adapter's
 // derived Valid() and its passthroughs in isolation from any backend.
 type fakeLease struct {
 	epoch      uint64
@@ -27,9 +27,9 @@ func (f *fakeLease) Release(context.Context) error {
 	return f.releaseErr
 }
 
-// Compile-time proof that the test double honors the storekit.Lease contract it
-// stands in for; a drift in storekit.Lease breaks here rather than silently.
-var _ storekit.Lease = (*fakeLease)(nil)
+// Compile-time proof that the test double honors the storage.Lease contract it
+// stands in for; a drift in storage.Lease breaks here rather than silently.
+var _ storage.Lease = (*fakeLease)(nil)
 
 // TestSessionLeaseValid covers the Valid() derivation: it is a non-blocking read of
 // the wrapped Lost() channel — true while the channel is open, false once it closes.
@@ -60,8 +60,8 @@ func TestSessionLeaseValid(t *testing.T) {
 }
 
 // TestSessionLeasePassthrough covers the passthroughs: Epoch, Lost, and Release
-// delegate to the wrapped storekit.Lease, and SessionID returns the id the adapter
-// carries (storekit.Lease has no session identity of its own).
+// delegate to the wrapped storage.Lease, and SessionID returns the id the adapter
+// carries (storage.Lease has no session identity of its own).
 func TestSessionLeasePassthrough(t *testing.T) {
 	t.Parallel()
 	id := mustUUID(t, "0123abcd-4567-4890-8abc-def012345678")

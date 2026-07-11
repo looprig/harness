@@ -6,8 +6,8 @@ import (
 	"io"
 	"strconv"
 
-	"github.com/looprig/harness/pkg/journal"
 	"github.com/looprig/core/uuid"
+	"github.com/looprig/harness/pkg/journal"
 	"github.com/looprig/storage"
 )
 
@@ -75,8 +75,8 @@ func (e *GCDeleteError) Error() string {
 func (e *GCDeleteError) Unwrap() error { return e.Cause }
 
 // GCResult summarizes one GC pass. It mirrors pkg/journal's GCResult shape, minus its
-// WithinGrace term: storekit's Blobs.List exposes no per-blob timestamp, so there is
-// no grace window over the storekit contract — GC's safety rests entirely on the
+// WithinGrace term: storage's Blobs.List exposes no per-blob timestamp, so there is
+// no grace window over the storage contract — GC's safety rests entirely on the
 // single-writer lease/idle serialization the caller provides (see ObjectGC). On a
 // fully successful pass Scanned == Referenced + Deleted.
 type GCResult struct {
@@ -106,17 +106,17 @@ type GCResult struct {
 // unreferenced by the scan and wrongly reaped. The caller serializes GC with the writer
 // — typically running it while holding the session lease (as the single writer) or when
 // the session is idle. Unlike pkg/journal's ObjectGC there is no grace window backstop:
-// storekit's Blobs.List surfaces no ModTime, so an in-flight upload cannot be protected
+// storage's Blobs.List surfaces no ModTime, so an in-flight upload cannot be protected
 // by age; the serialization is load-bearing, not advisory.
 //
 // It is the GC analogue of the sessionstore journal (write) and replayers (read), wired
 // at the composition root via Store.OpenObjectGC.
 type ObjectGC struct {
-	id     uuid.UUID       // the session this GC reaps (for the lease guard + error context)
-	lease  journal.Lease   // single-writer ownership token (injected; never acquired or released here)
-	ledger storekit.Ledger // the append-only record log scanned for live pointers
-	blobs  storekit.Blobs  // the content-addressed blob store swept for orphans
-	name   string          // the bound ledger name (ledgerName(id)); also the blob-key prefix root
+	id     uuid.UUID      // the session this GC reaps (for the lease guard + error context)
+	lease  journal.Lease  // single-writer ownership token (injected; never acquired or released here)
+	ledger storage.Ledger // the append-only record log scanned for live pointers
+	blobs  storage.Blobs  // the content-addressed blob store swept for orphans
+	name   string         // the bound ledger name (ledgerName(id)); also the blob-key prefix root
 }
 
 // OpenObjectGC binds an offload-blob GC to session id under the given single-writer
@@ -218,7 +218,7 @@ func (g *ObjectGC) collectLive(ctx context.Context) (map[string]struct{}, error)
 }
 
 // listBlobs enumerates the session's content-addressed blob prefix
-// ("sessions/<id>/blobs/"). storekit's Blobs.List treats an empty prefix as zero
+// ("sessions/<id>/blobs/"). storage's Blobs.List treats an empty prefix as zero
 // blobs (an empty result, never an error), so an empty session needs no special case;
 // any other failure fails closed as a *GCListError.
 func (g *ObjectGC) listBlobs(ctx context.Context) ([]string, error) {

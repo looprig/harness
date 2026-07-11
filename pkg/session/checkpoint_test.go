@@ -28,11 +28,11 @@ type checkpointOrderProbe struct {
 	putCount  atomic.Int64 // number of successful Blobs.Put calls (dedup no-ops don't count)
 }
 
-// countingBlobs wraps a storekit.Blobs, stamping each successful Put with the shared
+// countingBlobs wraps a storage.Blobs, stamping each successful Put with the shared
 // monotonic sequence AFTER the underlying Put returns — i.e. at the instant the blob is
 // durable — so the order test compares that instant against the event append.
 type countingBlobs struct {
-	inner storekit.Blobs
+	inner storage.Blobs
 	probe *checkpointOrderProbe
 }
 
@@ -80,7 +80,7 @@ func (a *checkpointAppender) AppendEvent(_ context.Context, ev event.Event) (uin
 // CheckpointWorkspace has a real, non-empty tree to snapshot.
 func checkpointFixture(t *testing.T, probe *checkpointOrderProbe) (*workspacestore.Store, string) {
 	t.Helper()
-	var blobs storekit.Blobs = memstore.New().Blobs
+	var blobs storage.Blobs = memstore.New().Blobs
 	if probe != nil {
 		blobs = &countingBlobs{inner: blobs, probe: probe}
 	}

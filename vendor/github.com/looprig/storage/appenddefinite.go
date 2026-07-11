@@ -1,4 +1,4 @@
-package storekit
+package storage
 
 import (
 	"bytes"
@@ -20,7 +20,7 @@ type AppendVerifyError struct {
 }
 
 func (e *AppendVerifyError) Error() string {
-	return "storekit: ledger " + strconv.Quote(e.Name) + " append verify failed: cannot read record at seq " + strconv.FormatUint(e.Seq, 10)
+	return "storage: ledger " + strconv.Quote(e.Name) + " append verify failed: cannot read record at seq " + strconv.FormatUint(e.Seq, 10)
 }
 
 // Unwrap returns the underlying read failure so callers can errors.Is/As it.
@@ -29,7 +29,7 @@ func (e *AppendVerifyError) Unwrap() error { return e.Cause }
 // errNilCursor is the leaf cause when a backend's Read returns a nil cursor with
 // a nil error — a contract violation. verifyAppend is the fail-closed fencing
 // core, so it treats this as an unknown outcome rather than panicking.
-var errNilCursor = errors.New("storekit: ledger Read returned nil cursor without error")
+var errNilCursor = errors.New("storage: ledger Read returned nil cursor without error")
 
 // AppendDefinite turns any Append into a definite outcome. On AmbiguousError it
 // retries the identical append once; on conflict (from either attempt) it reads

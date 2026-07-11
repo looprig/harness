@@ -16,7 +16,7 @@ import (
 // a backend uses to de-duplicate a redelivered append). The concrete payload codec
 // is the existing event/command marshaler; a record only carries the typed payload
 // and exposes how to identify it. How a record is routed/stored is the backend's
-// concern (a storekit ledger name, a subject, …), never the record's.
+// concern (a storage ledger name, a subject, …), never the record's.
 //
 // The set is sealed by the unexported isJournalRecord marker: only the wrapper
 // types in this package implement it, so the serializer's switch over the sum is

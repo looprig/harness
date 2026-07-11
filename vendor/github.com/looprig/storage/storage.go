@@ -1,4 +1,4 @@
-// Package storekit defines four neutral storage primitives — Ledger (an
+// Package storage defines four neutral storage primitives — Ledger (an
 // append-only, CAS-sequenced record log), Leaser (a single-writer epoch lease),
 // KV (revision-CAS metadata), and Blobs (content-addressed immutable bytes) —
 // plus a typed error taxonomy, ValidateName, and the AppendDefinite ambiguity
@@ -8,7 +8,7 @@
 // valid names alias one backend location. Every backend must accept ledger
 // payloads and KV values up to 1 MiB; larger payloads are the engine's
 // responsibility to offload to Blobs.
-package storekit
+package storage
 
 import (
 	"context"
@@ -110,7 +110,7 @@ type IncompleteCompositeError struct {
 }
 
 func (e *IncompleteCompositeError) Error() string {
-	return "storekit: incomplete composite: missing [" + strings.Join(e.Missing, " ") + "]"
+	return "storage: incomplete composite: missing [" + strings.Join(e.Missing, " ") + "]"
 }
 
 // NewComposite assembles a Composite, rejecting any nil primitive up front so a

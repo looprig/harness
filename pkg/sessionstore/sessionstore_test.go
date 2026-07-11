@@ -28,7 +28,7 @@ func TestOpen(t *testing.T) {
 	full := memstore.New()
 	tests := []struct {
 		name     string
-		backend  *storekit.Composite
+		backend  *storage.Composite
 		wantErr  bool
 		wantMiss string
 	}{
@@ -36,25 +36,25 @@ func TestOpen(t *testing.T) {
 		{name: "nil composite rejected", backend: nil, wantErr: true, wantMiss: "composite"},
 		{
 			name:     "nil ledger rejected",
-			backend:  &storekit.Composite{Ledger: nil, Leaser: full.Leaser, KV: full.KV, Blobs: full.Blobs},
+			backend:  &storage.Composite{Ledger: nil, Leaser: full.Leaser, KV: full.KV, Blobs: full.Blobs},
 			wantErr:  true,
 			wantMiss: "Ledger",
 		},
 		{
 			name:     "nil leaser rejected",
-			backend:  &storekit.Composite{Ledger: full.Ledger, Leaser: nil, KV: full.KV, Blobs: full.Blobs},
+			backend:  &storage.Composite{Ledger: full.Ledger, Leaser: nil, KV: full.KV, Blobs: full.Blobs},
 			wantErr:  true,
 			wantMiss: "Leaser",
 		},
 		{
 			name:     "nil kv rejected",
-			backend:  &storekit.Composite{Ledger: full.Ledger, Leaser: full.Leaser, KV: nil, Blobs: full.Blobs},
+			backend:  &storage.Composite{Ledger: full.Ledger, Leaser: full.Leaser, KV: nil, Blobs: full.Blobs},
 			wantErr:  true,
 			wantMiss: "KV",
 		},
 		{
 			name:     "nil blobs rejected",
-			backend:  &storekit.Composite{Ledger: full.Ledger, Leaser: full.Leaser, KV: full.KV, Blobs: nil},
+			backend:  &storage.Composite{Ledger: full.Ledger, Leaser: full.Leaser, KV: full.KV, Blobs: nil},
 			wantErr:  true,
 			wantMiss: "Blobs",
 		},
@@ -118,7 +118,7 @@ func TestOpenOptions(t *testing.T) {
 }
 
 // TestSessionName covers the ledger-name derivation: "sessions/<uuid>" for any id
-// (including the zero uuid), and that every derived name passes storekit.ValidateName
+// (including the zero uuid), and that every derived name passes storage.ValidateName
 // so a session can never address an invalid backend location.
 func TestSessionName(t *testing.T) {
 	t.Parallel()
@@ -152,7 +152,7 @@ func TestSessionName(t *testing.T) {
 			if name != tt.want {
 				t.Errorf("sessionName() = %q, want %q", name, tt.want)
 			}
-			if err := storekit.ValidateName(name); err != nil {
+			if err := storage.ValidateName(name); err != nil {
 				t.Errorf("ValidateName(%q) = %v, want nil", name, err)
 			}
 		})

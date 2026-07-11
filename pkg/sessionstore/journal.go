@@ -21,7 +21,7 @@ import (
 // mutex across the whole operation, so an unbounded backend call would wedge every
 // queued Append behind it; this per-append deadline fails one stuck call fast and
 // keeps the serialized writer live. The value matches the journal's historical
-// per-append publish deadline, carried over to the storekit-backed writer.
+// per-append publish deadline, carried over to the storage-backed writer.
 const appendTimeout = 5 * time.Second
 
 // blobsInfix is the name segment separating a session's ledger prefix from its
@@ -41,19 +41,19 @@ func (e *NilLeaseError) Error() string {
 	return "sessionstore: session " + e.SessionID.String() + ": nil lease"
 }
 
-// sessionJournal is the concrete single-writer serializer over a storekit ledger:
+// sessionJournal is the concrete single-writer serializer over a storage ledger:
 // it frames each JournalRecord as a versioned envelope, offloads an over-threshold
 // frame to Blobs before appending a small pointer in its place, and commits under
 // CAS fencing on the tracked tip. It is the sessionstore port of the NATS
-// journal's WRITE semantics onto storekit — storekit.AppendDefinite owns the
+// journal's WRITE semantics onto storage — storage.AppendDefinite owns the
 // ambiguous-ack / conflict resolution the old journal did by hand.
 type sessionJournal struct {
-	id        uuid.UUID       // the session this journal owns (for fence + error context)
-	lease     journal.Lease   // single-writer ownership token (injected; never acquired here)
-	ledger    storekit.Ledger // the append-only record log this journal is the sole writer of
-	blobs     storekit.Blobs  // content-addressed offload store for over-threshold frames
-	name      string          // the bound ledger name (ledgerName(id))
-	threshold int             // frame size (bytes) above which a record is offloaded
+	id        uuid.UUID      // the session this journal owns (for fence + error context)
+	lease     journal.Lease  // single-writer ownership token (injected; never acquired here)
+	ledger    storage.Ledger // the append-only record log this journal is the sole writer of
+	blobs     storage.Blobs  // content-addressed offload store for over-threshold frames
+	name      string         // the bound ledger name (ledgerName(id))
+	threshold int            // frame size (bytes) above which a record is offloaded
 
 	// mu serializes Append and guards ready + trackedTip. The serializer is
 	// single-writer by contract; the mutex makes that safe even if a caller fans
@@ -66,7 +66,7 @@ type sessionJournal struct {
 	// trackedTip is the ledger sequence the next append must fence on: the last
 	// sequence this writer committed (the tip observed at Open, then each append's
 	// new seq). A stale writer whose trackedTip is behind the real tip is rejected
-	// by storekit's CAS on append.
+	// by storage's CAS on append.
 	trackedTip uint64
 }
 
@@ -158,7 +158,7 @@ func (b *sessionJournal) leaseHeld() bool {
 // guard) and OpenJournal (the opening fence, which is what SETS ready). The caller
 // MUST hold mu. It derives a per-append child context, frames rec (offloading an
 // over-threshold frame to Blobs first), commits the resulting bytes under CAS on
-// the tracked tip via storekit.AppendDefinite, and on success advances the tip and
+// the tracked tip via storage.AppendDefinite, and on success advances the tip and
 // returns the new sequence. On any failure the tip is left unadvanced (fail closed).
 func (b *sessionJournal) writeLocked(ctx context.Context, rec journal.JournalRecord) (uint64, error) {
 	childCtx, cancel := context.WithTimeout(ctx, appendTimeout)
@@ -168,7 +168,7 @@ func (b *sessionJournal) writeLocked(ctx context.Context, rec journal.JournalRec
 	if err != nil {
 		return 0, err
 	}
-	if err := storekit.AppendDefinite(childCtx, b.ledger, b.name, b.trackedTip, recordBytes); err != nil {
+	if err := storage.AppendDefinite(childCtx, b.ledger, b.name, b.trackedTip, recordBytes); err != nil {
 		return 0, b.mapAppendErr(rec, err)
 	}
 	b.trackedTip++
@@ -224,26 +224,26 @@ func (b *sessionJournal) offload(ctx context.Context, rec journal.JournalRecord,
 	return encodeEnvelope(envelope{V: envelopeVersion, Kind: string(kindBlobPtr), ID: rec.IdempotencyID(), Body: ptr})
 }
 
-// mapAppendErr translates a storekit append failure into the journal's error
+// mapAppendErr translates a storage append failure into the journal's error
 // vocabulary so callers keep classifying at the journal level: a definite CAS
 // conflict (a stale writer fenced out) becomes *journal.AppendError; a still-
 // ambiguous outcome becomes *journal.AmbiguousAckError; any other error is
 // surfaced unchanged (fail closed). The tip is already left unadvanced by the caller.
 func (b *sessionJournal) mapAppendErr(rec journal.JournalRecord, err error) error {
-	var conflict *storekit.ConflictError
+	var conflict *storage.ConflictError
 	if errors.As(err, &conflict) {
 		return &journal.AppendError{Subject: b.name, MsgID: rec.IdempotencyID(), Expected: b.trackedTip, Cause: err}
 	}
-	var ambiguous *storekit.AmbiguousError
+	var ambiguous *storage.AmbiguousError
 	if errors.As(err, &ambiguous) {
 		return &journal.AmbiguousAckError{Subject: b.name, MsgID: rec.IdempotencyID(), Expected: b.trackedTip, Cause: err}
 	}
 	// AppendDefinite's verifyAppend could not read the contested tip to resolve a
 	// conflict, so the append outcome is genuinely UNKNOWN — the same unresolved,
 	// decide-fail-or-retry case as a lingering ambiguous ack. Map it to the journal's
-	// AmbiguousAckError (carrying the verify error) rather than leaking storekit's
+	// AmbiguousAckError (carrying the verify error) rather than leaking storage's
 	// type through the facade.
-	var verify *storekit.AppendVerifyError
+	var verify *storage.AppendVerifyError
 	if errors.As(err, &verify) {
 		return &journal.AmbiguousAckError{Subject: b.name, MsgID: rec.IdempotencyID(), Expected: b.trackedTip, Cause: err}
 	}

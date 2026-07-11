@@ -2,11 +2,8 @@
 
 **Date:** 2026-07-10  
 **Status:** Approved  
-**Amended by:** `2026-07-11-workspace-placement-modes-design.md` — makes workspace
-support optional; replaces `WithWorkspaceStore` with `WithExclusiveWorkspace`,
-`WithSessionWorkspaces`, and `WithSharedWorkspace`; replaces the "Workspace snapshot
-policy" section and `SnapshotPolicy.Failure`; and adds seeding, trigger ladder,
-snapshot priority, checkpoint cause/consistency, and the small API fixes listed there
+**Consolidates:** `2026-07-11-workspace-placement-modes-design.md`, retained only as
+decision history
 **Supersedes:** the public `session.Compile` / `session.Runner` lifecycle surface  
 **Builds on:** `2026-07-02-workspacestore-design.md` and the implemented
 `pkg/workspacestore`, `pkg/sessionstore`, and `session.CheckpointWorkspace`
@@ -70,11 +67,11 @@ r, err := rig.Define(
 	rig.WithPrimers("planner", "builder"),
 	rig.WithActivePrimer("planner"),
 	rig.WithSessionStore(sessionStore),
-	rig.WithWorkspaceStore(workspaceStore, workspaceRoot),
+	rig.WithSessionWorkspaces(workspaceStore, "/var/agents/workspaces"),
 	rig.WithSnapshots(rig.SnapshotPolicy{
-		Trigger: rig.SnapshotOnIdle,
-		Failure: rig.SnapshotBestEffort,
-		Timeout: 60 * time.Second,
+		Trigger:  rig.SnapshotOnIdle,
+		Priority: rig.SnapshotBestEffort,
+		Timeout:  60 * time.Second,
 	}),
 	rig.WithDelegationLimits(rig.DelegationLimits{Depth: 2, Quota: 64}),
 )
@@ -98,7 +95,7 @@ Rig
 ├── primers
 ├── active primer
 ├── session store and lifecycle policy
-└── workspace store and snapshot policy
+└── optional workspace placement, store, and snapshot policy
 ```
 
 - A **loop definition** is an immutable recipe for constructing a loop.
@@ -245,12 +242,16 @@ type SubagentArgs struct {
 	Agent      identity.AgentName `json:"agent,omitempty"`
 	Mode       loop.ModeName      `json:"mode,omitempty"`
 	DelegateID DelegateID         `json:"delegate_id,omitempty"`
-	RequestID  uuid.UUID          `json:"request_id,omitempty"`
+	RequestID  *uuid.UUID         `json:"request_id,omitempty"`
 	Message    string             `json:"message,omitempty"`
 	Wait       *bool              `json:"wait,omitempty"`
-	Timeout    time.Duration      `json:"timeout,omitempty"`
+	TimeoutSeconds *int           `json:"timeout_seconds,omitempty"`
 }
 ```
+
+`timeout_seconds` is a non-negative integer. Omitting it means an interruptible,
+unbounded wait; a supplied timeout returns a typed timed-out request result. An absent
+`request_id` means not supplied, while a supplied zero UUID is invalid.
 
 The actions are:
 
@@ -379,8 +380,10 @@ Initial options:
 | `WithPrimers(names...)` | Select root loops instantiated with every session. |
 | `WithActivePrimer(name)` | Select the initial default input target. |
 | `WithSessionStore(store)` | Supply durable leases, journal, replay, and catalog. |
-| `WithWorkspaceStore(store, root)` | Enable workspace checkpoint and restore capability. |
-| `WithSnapshots(policy)` | Select explicit checkpoint scheduling and failure behavior. |
+| `WithExclusiveWorkspace(store, root, leaser)` | Use one fixed, exclusively leased workspace root. |
+| `WithSessionWorkspaces(store, baseDir)` | Derive one isolated root per session. |
+| `WithSharedWorkspace(store, root)` | Explicitly allow concurrent writers and fuzzy snapshots in one root. |
+| `WithSnapshots(policy)` | Select explicit checkpoint scheduling and priority. |
 | `WithDelegationLimits(limits)` | Set session-wide dynamic delegation depth and quota. |
 
 `DelegationLimits.Depth` is the maximum nested delegate chain.
@@ -412,12 +415,16 @@ repetition merges or rejects duplicates.
 - at least one valid loop definition exists;
 - at least one primer exists;
 - every primer resolves to a registered definition;
-- exactly one active primer is named and belongs to the primer set;
+- exactly one active primer resolves and belongs to the primer set; a single primer is
+  the default, while multiple primers require `WithActivePrimer`;
 - every delegate resolves to a registered definition;
 - a non-nil session store is supplied;
-- workspace store and snapshot policy are either both absent or both present;
-- the workspace root is canonical, non-empty, and compatible with the loop tool roots;
-- snapshot trigger, failure behavior, and timeout resolve to valid values; and
+- zero or one workspace placement option is supplied;
+- placement and snapshot policy are either both absent or both present;
+- any workspace root/base is canonical, non-empty, disjoint from discoverable
+  persistence paths, and compatible with workspace-requiring tools;
+- exclusive placement has a non-nil `storage.Leaser`;
+- snapshot trigger, priority, and timeout resolve to valid values; and
 - all existing fingerprint, gate, foreign-loop, ceiling, and limits invariants hold.
 
 Validation performs no session I/O. Opening backend implementations remains the
@@ -427,17 +434,22 @@ consumer's composition responsibility; a rig receives already-open stores.
 
 ### `Rig.NewSession`
 
-`NewSession(ctx)`:
+`NewSession(ctx, opts ...NewSessionOption)`:
 
 1. Mints a cryptographically random session ID.
 2. Acquires the session's single-writer lease.
-3. Opens its journal and checked event, command, and gate appenders.
-4. Mints a fresh per-session security-ceiling state.
-5. Constructs every primer as a root loop with zero parent provenance.
-6. Sets the active loop to the loop created from the active primer.
-7. Publishes durable session, loop, and active-loop lifecycle events.
-8. Starts automatic snapshot watching only for `SnapshotOnIdle`.
-9. Returns the live `session.SessionController` contract backed by an internal runtime.
+3. Resolves the optional workspace root and acquires its exclusive lease when required.
+4. Opens its journal and checked event, command, and gate appenders.
+5. Materializes an optional `rig.WithSeedSnapshot(ref)`, then journals it as the first
+   workspace checkpoint after `SessionStarted` and before any `LoopStarted` event.
+6. Creates the session-scoped workspace coordinator and binds fresh tool instances for
+   each loop.
+7. Mints a fresh per-session security-ceiling state and constructs every primer as a
+   root loop with zero parent provenance.
+8. Sets the active loop to the resolved active primer and publishes the durable
+   lifecycle events.
+9. Starts the configured native checkpoint controller when a workspace is present.
+10. Returns the live `session.SessionController` contract backed by an internal runtime.
 
 Any failure after lease acquisition releases the lease on a bounded best-effort path.
 The method returns a typed stage error chaining the underlying cause.
@@ -451,9 +463,11 @@ The method returns a typed stage error chaining the underlying cause.
 3. Checks the rig/loop topology fingerprint according to the configured mismatch policy.
 4. Reconstructs all primer and delegated loops.
 5. Reapplies durable loop changes and the last active-loop selection.
-6. Materializes the latest workspace checkpoint, when configured.
-7. Brings the reconstructed session up idle.
-8. Starts the configured automatic snapshot watcher.
+6. Resolves the effective `CurrentWorkspace` pointer and materializes or attaches to it
+   according to the configured placement mode.
+7. Creates the session workspace coordinator, binds fresh ephemeral tools, and brings
+   the reconstructed session up idle.
+8. Starts the configured native checkpoint controller when a workspace is present.
 9. Returns the live session.
 
 Restore does not create missing primer loops silently. A persisted topology incompatible
@@ -487,6 +501,7 @@ type SessionController interface {
 	LoopController(id uuid.UUID) (loop.Controller, bool)
 	SetSecurityCeiling(context.Context, ceiling.Level) error
 	CheckpointWorkspace(context.Context) (workspacestore.Ref, error)
+	RestoreWorkspace(context.Context, workspacestore.Ref) error
 	Shutdown(context.Context) error
 }
 ```
@@ -615,77 +630,291 @@ model/tool steps, keeps the model and effort selected when that turn started. Th
 deterministic request attribution and avoids changing behavior halfway through a tool
 continuation.
 
-A successful direct change emits an enduring `LoopChanged` event with the loop ID,
+A successful direct change emits an enduring `LoopInferenceChanged` event with the loop ID,
 complete secret-free model identity, and effort. A successful named mode change emits
 `LoopModeChanged`. Restore folds the latest changes per loop before accepting input.
 Invalid modes/models/efforts, exited loops, changes during shutdown, and durable-append
 failures return typed errors and do not partially apply.
 
-## Workspace snapshot policy
+## Optional workspace lifecycle
 
-The existing `workspacestore` snapshot format and `SessionController.CheckpointWorkspace`
-snapshot-before-append ordering do not change. This design adds scheduling and failure
-policy at the rig layer.
+Workspace support is optional. With no placement option, the rig has no managed root,
+snapshot controller, seeding, or rewind. `CheckpointWorkspace` and `RestoreWorkspace`
+remain on the uniform controller but return `WorkspaceUnavailableError`. A
+workspace-requiring tool definition makes a no-workspace rig invalid.
+
+Exactly one of these placement options may accompany `WithSnapshots`:
+
+```go
+rig.WithExclusiveWorkspace(workspaceStore, "/home/user/project", rootLeaser)
+rig.WithSessionWorkspaces(workspaceStore, "/var/agents/workspaces")
+rig.WithSharedWorkspace(workspaceStore, "/home/user/project")
+```
+
+| Placement | Root and exclusion | Automatic restore | Checkpoint consistency |
+|---|---|---|---|
+| Exclusive | One canonical fixed root; one exclusive `storage.Leaser` lease | Materialize only into an empty root; otherwise attach | `quiescent` |
+| Per-session | `baseDir/<sessionID>`; isolated by construction | Always replace with effective durable ref | `quiescent` |
+| Shared | One canonical fixed root; deliberately no root lease | Never; rewind is explicit | `fuzzy` |
+
+The public module and Go package are both `github.com/looprig/storage`, imported as
+`storage`; public errors, comments, examples, and filenames use that name. The workspace
+blob store and root leaser are separate arguments because their scopes/providers may
+differ.
+
+The session journal, catalog, leases, workspace blobs, and checkpoint controller state
+must live outside the workspace root. Discoverable persistence paths equal to or beneath
+the root fail `rig.Define` with a typed overlap error. Appending a boundary or checkpoint
+event therefore cannot mutate the tree being captured.
+
+### Placement details
+
+Exclusive roots are canonicalized with `Abs`, `Clean`, and `EvalSymlinks` when present.
+Their backend lease name is
+`workspace-roots/<sha256(canonical-root)>`, so lexical/symlink aliases contend. Session
+lease acquisition precedes root lease acquisition, which precedes any append,
+materialization, checkpoint controller, or loop construction. Contention releases the
+session lease and returns `WorkspaceRootBusyError`. Root lease loss faults the session,
+closes admission, interrupts live loops, and cancels checkpoints. Before committing a
+structured mutation, tools check that the lease remains healthy; this fences cooperative
+writers, but cannot retroactively fence an external process or shell command that has
+already escaped the harness.
+
+Per-session placement proves the destination is exactly the non-symlinked injective
+`baseDir/<sessionID>` path. Restore materializes into an empty sibling staging directory,
+verifies it, renames the live root to a sibling backup, renames staging to the root, then
+removes the backup. Failure of the second rename restores the backup. Startup removes
+abandoned staging directories and restores an orphaned backup when the root is absent.
+Generic `workspacestore.Materialize` keeps its fail-closed `DestNotEmptyError`; it never
+gains recursive wipe behavior.
+
+Shared placement admits concurrent harness sessions, humans, and external tools. Every
+checkpoint is honestly stamped `fuzzy`; `SnapshotRequired` is invalid. Safety comes from
+file-level optimistic concurrency and explicit fork/merge, not from pretending the tree
+is isolated.
+
+### Seeding
+
+`Rig.NewSession` accepts `rig.WithSeedSnapshot(ref)`. It materializes the ref before
+constructing loops and journals it as the first workspace checkpoint:
+
+```text
+acquire session/root leases
+→ materialize seed
+→ append SessionStarted
+→ append WorkspaceCheckpointed{Ref: seed, Trigger: seed}
+→ construct primers and append LoopStarted events
+→ admit work
+```
+
+Seeding is valid for per-session roots, for an empty exclusive root, and never for a
+shared root. The ref must resolve in the configured workspace store. Because the seed is
+an ordinary checkpoint event, restore and manual GC need no seed-specific path.
+
+### Snapshot triggers and priority
 
 ```go
 type SnapshotPolicy struct {
-	Trigger SnapshotTrigger
-	Failure SnapshotFailure
-	Timeout time.Duration
+	Trigger  SnapshotTrigger
+	Priority SnapshotPriority
+	Timeout  time.Duration
 }
 
 const (
-	SnapshotManual SnapshotTrigger = iota
+	SnapshotTriggerUnset SnapshotTrigger = iota
+	SnapshotManual
 	SnapshotOnIdle
+	SnapshotOnTurnDone
+	SnapshotOnStepDone
 )
 
 const (
-	SnapshotBestEffort SnapshotFailure = iota
-	SnapshotFaultSession
+	SnapshotBestEffort SnapshotPriority = iota
+	SnapshotRequired
 )
 ```
 
-- `WithWorkspaceStore` requires an explicit `WithSnapshots` option.
-- `WithSnapshots` without a workspace store is invalid.
-- `SnapshotManual` is explicit and valid; it installs no watcher.
-- `SnapshotOnIdle` reacts to the session-wide `SessionIdle` edge, after every primer and
-  delegated loop is quiescent.
-- A zero timeout resolves to 60 seconds. Negative timeouts are invalid.
-- A zero failure mode resolves to `SnapshotBestEffort`.
+Unset resolves to `SnapshotOnIdle`; `SnapshotManual` remains explicit. Zero timeout
+resolves to 60 seconds and negative timeout is invalid. Step/turn triggers choose the
+boundary, not snapshot scope: every ref still covers the entire session workspace.
 
-### On-idle flow
+| Trigger | Boundary |
+|---|---|
+| Manual | Explicit idle `CheckpointWorkspace` call |
+| OnIdle | `SessionActive → SessionIdle` |
+| OnTurnDone | `TurnDone`, `TurnFailed`, or `TurnInterrupted` on any loop |
+| OnStepDone | Every `StepDone` |
 
-For every `SessionActive → SessionIdle` transition:
+Best-effort means session progress wins. It permits one active automatic walk plus one
+latest-wins pending trigger; coalesced edges get no checkpoint event. Activation cancels
+an exclusive/per-session walk, while shared fuzzy walks may finish. Errors are observed
+and the next eligible edge retries.
 
-1. The rig's per-session checkpoint controller observes `SessionIdle`.
-2. It serializes against any checkpoint already running for that session.
-3. It creates a timeout context derived from the session lifetime.
-4. It calls `SessionController.CheckpointWorkspace`.
-5. `workspacestore` deterministically archives and hashes the complete tree.
-6. If the content-addressed blob is absent, it uploads it; otherwise upload is a no-op.
-7. The session durably appends `WorkspaceCheckpointed{Ref}`.
+Required means persistence wins. Automatic boundaries are FIFO and never coalesced; the
+triggering actor does not acknowledge its step/turn boundary, and session mutations stay
+blocked, until the checkpoint commits or the session faults. Required idle/manual calls
+close admission. Timeout or error latches a workspace-persistence fault and rejects
+queued/new work. `SessionController.CheckpointWorkspace` remains permitted while this
+specific fault is latched: a successful required checkpoint clears the fault and reopens
+admission; another failure leaves it latched. `Shutdown` is always permitted. Shared
+placement rejects required priority.
 
-The full archive walk and hash remain authoritative. Filesystem watchers or metadata may
-later provide a dirty-check optimization, but never become correctness evidence because
-watch events can be lost. Repeating an unchanged snapshot performs no blob upload. A
-future optimization may also suppress a redundant checkpoint event when its ref equals
-the last durable ref; that optimization is not required by this design.
+Manual calls are never coalesced, require idle, and use the configured priority. Caller
+cancellation removes an unstarted request. Manual requests precede the one pending
+best-effort automatic request.
 
-The watcher is session-owned through the rig lifecycle: it begins before the lifecycle
-method returns, stops on session shutdown, and is joined during teardown. It never leaks
-a goroutine or runs after the workspace/store lifetime ends.
+### Native checkpoint boundary and workspace gate
 
-### Failure behavior
+Checkpoint scheduling is native session/loop control flow, not a public hook or an
+asynchronous event subscriber. One session-scoped `WorkspaceCoordinator` is shared by
+all primer and delegate loops. A loop has at most one active turn/step; parallel
+workspace mutation comes from parallel tool calls and different loops.
 
-`SnapshotBestEffort` records/logs the typed checkpoint failure through the rig's
-observability seam and leaves the session usable. The next idle edge retries.
+| Operation | Coordinator permit |
+|---|---|
+| Structured known-path mutator | Shared mutation permit plus canonical path lock |
+| Bash/unknown-path mutator | Exclusive whole-workspace mutation permit |
+| Checkpoint walk | Exclusive snapshot permit |
+| Restore/root replacement | Exclusive restore permit |
 
-`SnapshotFaultSession` latches a typed workspace-persistence fault on the session, wakes
-idle waiters, and rejects subsequent input or loop creation. It does not destroy the
-session; an operator may shut it down and restore from the previous durable checkpoint.
+For an accepted automatic boundary, the responsible actor performs this deterministic
+sequence before acknowledging the boundary:
 
-Cancellation caused by ordinary session shutdown is not reported as an operational
-snapshot failure.
+```text
+actual step/turn/session work reaches terminal boundary
+→ acquire session exclusive snapshot permit
+→ append triggering StepDone/TurnDone/SessionIdle durably
+→ emit triggering event
+→ snapshot the entire workspace
+→ append WorkspaceCheckpointed durably with Header.Cause = triggering event
+→ emit WorkspaceCheckpointed
+→ release permit
+→ acknowledge boundary and continue queued work
+```
+
+The trigger remains durable even when the snapshot fails; the checkpoint event exists
+only after blob durability. An exclusive permit waits for active managed mutations and
+blocks new ones, so recorded exclusive/per-session refs are quiescent. External writers
+do not participate, which is why shared refs remain fuzzy.
+
+### Checkpoint event and catalog fold
+
+```go
+type WorkspaceCheckpointed struct {
+	enduring
+	sessionScoped
+	Header
+	Ref         string              `json:"ref"`
+	Consistency SnapshotConsistency `json:"consistency"`
+	Trigger     SnapshotTriggerKind `json:"trigger"`
+}
+
+const (
+	SnapshotConsistencyUnknown SnapshotConsistency = iota // legacy decode only
+	SnapshotQuiescent
+	SnapshotFuzzy
+)
+
+const (
+	SnapshotTriggerKindUnknown SnapshotTriggerKind = iota // legacy decode only
+	SnapshotTriggerManual
+	SnapshotTriggerIdle
+	SnapshotTriggerInterrupt
+	SnapshotTriggerTurnDone
+	SnapshotTriggerStepDone
+	SnapshotTriggerSeed
+)
+```
+
+Unknown consistency/trigger values decode old records but are never emitted. The event's
+own coordinates remain session-only. `Header.Cause` identifies the firing edge for
+idle/interrupt/turn/step and is zero for manual/seed; `Trigger` says why it fired.
+`SnapshotQuiescent` means only that no harness-managed mutation overlapped the walk.
+
+The catalog folds two different facts:
+
+```go
+type WorkspacePointer struct {
+	Ref     workspacestore.Ref
+	EventID uuid.UUID
+	Seq     uint64
+	Source  WorkspacePointerSource // checkpoint | restore
+}
+
+type CheckpointSummary struct {
+	Ref         workspacestore.Ref
+	EventID     uuid.UUID
+	Seq         uint64
+	Consistency SnapshotConsistency
+}
+```
+
+`WorkspaceCheckpointed` updates both `LastCheckpoint` and `CurrentWorkspace`;
+`WorkspaceRestored` updates only `CurrentWorkspace`. `CurrentWorkspace` means the
+effective durable restore point, not a claim that the mutable live tree still equals its
+ref. Thus checkpoint A → checkpoint B → restore A restarts from A, while backup/history
+tools can still see B.
+
+### Manual rewind
+
+`RestoreWorkspace(ctx, ref)` is control-plane only and valid while idle. It takes the
+exclusive restore permit, stages and verifies the ref, replaces the target safely, then
+appends `WorkspaceRestored{Ref}` before reopening admission.
+
+For per-session roots it uses the verified whole-root swap above. For fixed exclusive or
+shared roots, it never recursively wipes or renames the configured root itself. Instead
+it builds a manifest from the target ref, stages every replacement file as a contained
+sibling temporary, obtains canonical path locks in sorted order, revalidates containment
+and lease health, then commits file replacements/deletions deterministically. Before
+commit it keeps rollback copies for every affected existing file; failure rolls back in
+reverse order and returns a typed error. In shared mode this deliberately clobbers other
+writers and is documented/authorized as an operator rewind. `WorkspaceRestored` is
+appended only after the filesystem commit succeeds; append failure faults the session
+because the live tree changed without advancing the durable pointer.
+
+### File-tool optimistic concurrency and binding
+
+`loop.Define` stores immutable `tool.Definition` blueprints, not live tool instances.
+At new/restore time rig binds definitions with `SessionID`, `LoopID`, and an optional
+`WorkspaceBinding{Root, Coordinator}`. Each primer/delegate receives fresh concrete
+tools; modes on one loop reuse its bound instances. Restored loops start with fresh
+ephemeral state. Subagent definitions receive only their parent-scoped delegate
+controller, never the session controller.
+
+`tools.Files(readGuard)` builds `ReadFile`, `WriteFile`, and `EditFile` around one private
+per-loop observation map keyed by canonical contained path. A complete successful read
+records raw-content SHA-256. Definitive not-found records absence; truncated, denied,
+escaping, symlink, or ambiguous reads do not authorize mutation. No hash/version is
+exposed to the model.
+
+An existing-file overwrite/edit requires that loop's complete observation and an equal
+current hash while holding the path critical section. Mismatch returns
+`StaleFileError`, invalidates the entry, and asks the model to read again. Successful
+mutation records the new hash. A write with no observation may create a currently absent
+path using a sibling temporary and atomic no-replace publication; if the path exists or
+another writer wins, it fails typed without clobbering. No failed read is required before
+creating a genuinely new file.
+
+Bash and other unknown-path mutators take the whole-workspace permit. When they finish,
+the calling loop's entire file-observation map is invalidated because the harness cannot
+know which paths changed. They do not gain file-level compare-and-swap guarantees;
+approval/sandbox policy and workspace isolation remain the safety boundary for arbitrary
+shell effects.
+
+### Session-wide interrupt ordering
+
+`Session.Interrupt` marks every live loop interrupt-pending before concurrently sending
+commands; `loop.Controller.Interrupt` marks one loop and its delegate subtree; Subagent
+`interrupt` affects only the owned child's current turn. User input remains queued,
+machine-created delegate requests are flushed, and an interrupt admission barrier holds
+until all targets are idle and `SessionIdle` is appended.
+
+Barrier release is policy-specific: required idle holds through its checkpoint; required
+turn/step holds through already accepted required boundaries and `SessionIdle`;
+best-effort idle releases when the idle checkpoint is accepted; best-effort turn/step
+releases after `SessionIdle` while any active/latest coalesced walk proceeds normally;
+manual releases after `SessionIdle`; no-workspace releases immediately after it. An idle
+trigger after an interrupt stamps `Trigger: interrupt`.
 
 ## Workspace garbage collection
 
@@ -771,14 +1000,19 @@ Every package-level failure is typed and unwraps its cause where applicable:
 - loop-definition errors: missing inference, invalid model, duplicate/empty name,
   invalid delegate;
 - rig-definition errors: missing loops/primers/active primer/store, unknown references,
-  duplicate singleton options, invalid workspace/snapshot pairing;
+  duplicate singleton options, multiple/invalid placement, invalid workspace/snapshot
+  pairing, persistence-path overlap, missing root leaser, and shared/required conflict;
 - lifecycle errors: ID, lease, journal, appender, construction, restore, and workspace
   materialization stages;
 - active-loop errors: unknown/exited target and durable active-loop change failure;
 - loop-change errors: invalid change, invalid model/effort, wrong lifecycle phase, and
   durable append failure; and
-- checkpoint errors: timeout, snapshot/store failure, event append fault, and shutdown
-  cancellation classification.
+- root lifecycle errors: busy/lost lease, unsafe destination, staging/root-swap/rollback,
+  and unresolvable or invalid seed;
+- checkpoint errors: unavailable/not idle, timeout, activation cancellation,
+  snapshot/store failure, event append fault, required-fault latch, and shutdown
+  cancellation classification; and
+- tool errors: stale observation, atomic-create conflict, containment, and lease loss.
 
 No validation path silently substitutes a missing required dependency. No partial rig,
 session, topology, active-loop change, or loop model change is returned on failure.
@@ -788,18 +1022,18 @@ session, topology, active-loop change, or loop model change is returned on failu
 - A `Rig` is immutable after `Define` and safe to use concurrently to create or restore
   independent sessions.
 - Every session receives its own lease, journal, appenders, ceiling, active-loop state,
-  loop actors, and checkpoint controller.
+  loop actors, tool bindings, observation maps, workspace coordinator, and checkpoint
+  controller. Only explicit shared placement reuses a workspace root.
 - Loop changes commit through the target actor and begin at the next turn boundary.
 - Active-loop changes serialize through session state and become visible only after their
   enduring event commits.
-- Checkpoints serialize per session and occur only after `SessionIdle`; a subsequent
-  `SessionActive` does not cancel an already-running checkpoint, because the resulting ref
-  names the filesystem observed during the snapshot walk. Tools cannot run while the
-  session is idle, but external filesystem writers remain outside the harness consistency
-  boundary, as they are today.
-- Shutdown stops admission, waits/cancels lifecycle work according to existing session
-  semantics, stops and joins the checkpoint controller, releases the lease, and then
-  returns.
+- The session workspace coordinator orders managed mutation, native trigger append and
+  emission, snapshot blob durability, and checkpoint append/emission. Restore excludes
+  both mutation and checkpoint walks.
+- Required boundaries serialize FIFO and withhold actor acknowledgement/admission;
+  best-effort bounds pressure to one active plus one latest pending automatic trigger.
+- Shutdown stops admission/work and checkpoint activity, releases the optional root
+  lease, then releases the session lease.
 
 ## Fingerprints and durable events
 
@@ -810,7 +1044,7 @@ The rig fingerprint replaces the single-loop configuration fingerprint. It inclu
 - the active primer;
 - delegation edges;
 - tool/security policy revisions;
-- workspace root identity and runtime-skill mode fields already supplied by consumers;
+- workspace placement policy `{mode, canonical root/base}` and runtime-skill mode fields;
   and
 - other existing compatibility fields.
 
@@ -823,11 +1057,17 @@ New enduring events:
 ActiveLoopChanged
     session id, previous loop id, active loop id
 
-LoopChanged
+LoopInferenceChanged
     session id, loop id, secret-free model descriptor, effort
 
 LoopModeChanged
     session id, loop id, previous mode, selected mode
+
+WorkspaceCheckpointed
+    session id, ref, consistency, trigger, Header.Cause
+
+WorkspaceRestored
+    session id, ref
 ```
 
 Their codecs, validation profiles, replay folds, catalog implications, and malformed-event
@@ -848,7 +1088,7 @@ All tests are table-driven and run under `-race`.
 - immutable/deep-copied model and tool metadata;
 - atomic runtime model/effort change;
 - next-turn-only application, including a change requested during an active turn; and
-- restore folds of `LoopChanged` and `LoopModeChanged`.
+- restore folds of `LoopInferenceChanged` and `LoopModeChanged`.
 
 ### `pkg/tools`
 
@@ -867,7 +1107,17 @@ All tests are table-driven and run under `-race`.
   `TurnDone.Message`;
 - `send(wait:false)` plus `wait` resolves the same request after restore;
 - `interrupt` affects only the owned child's current turn; and
-- `status` returns bounded mechanical state without exposing an event cursor.
+- `status` returns bounded mechanical state without exposing an event cursor;
+- each file-tool bundle shares one private observation set, while loops do not share it;
+- complete read/not-found observation, stale hash invalidation, and successful mutation
+  hash refresh;
+- no-observation create succeeds only when atomic no-replace publication wins; an
+  existing destination or concurrent winner returns typed without clobbering;
+- existing-file write/edit without a fresh complete observation fails typed;
+- Bash/unknown-path mutation takes the whole-workspace permit and invalidates that
+  loop's observations; and
+- tool definitions bind fresh instances per primer/delegate/restore while modes reuse
+  one loop's bound instances.
 
 ### `pkg/rig`
 
@@ -876,16 +1126,32 @@ All tests are table-driven and run under `-race`.
 - active primer selection;
 - definition/delegate graph validation;
 - delegation depth/quota are independent from per-loop tool iteration/call limits;
-- two concurrent sessions share no lease, ceiling, loops, or checkpoint controller;
+- no-workspace, exclusive, per-session, and shared placement validation matrices;
+- two concurrent sessions share no session state or coordinator; exclusive aliases
+  contend, per-session roots remain disjoint, and shared roots are explicit/fuzzy;
 - failure at every new-session wiring stage releases the lease;
 - create/shutdown/restore round trip with multiple primers and delegates;
 - restored active loop and model/effort changes;
-- manual policy installs no watcher;
-- on-idle policy checkpoints exactly on session quiescence, not individual loop idle;
+- seed ordering, validity, restore, and live-ref retention;
+- unset trigger defaults to idle while manual remains distinct;
+- idle/turn/step trigger selection, best-effort coalescing, required FIFO boundaries,
+  fault recovery through manual checkpoint, and shared/required rejection;
+- per-session staged swap/rollback/recovery and fixed-root manifest rewind/rollback;
+- current-workspace versus last-checkpoint catalog semantics;
 - unchanged snapshot performs no duplicate blob upload;
-- timeout and both failure policies;
-- shutdown joins the watcher; and
+- timeout and both priority policies;
+- shutdown joins the checkpoint controller; and
 - no automatic workspace GC.
+
+### `pkg/event` / `pkg/sessionstore`
+
+- checkpoint codecs round-trip `Consistency`, `Trigger`, and `Header.Cause`;
+- missing legacy trigger/consistency decode as unknown but producers never emit unknown;
+- cause validation matches manual/seed/idle/interrupt/turn/step shapes while checkpoint
+  coordinates remain session-scoped;
+- checkpoint A, checkpoint B, restore A folds `LastCheckpoint=B` and
+  `CurrentWorkspace=A`; and
+- `WorkspaceRestored` append failures fault rather than misreport the live tree.
 
 ### `pkg/session`
 
@@ -900,7 +1166,14 @@ All tests are table-driven and run under `-race`.
 - parent-scoped delegate controllers reject sibling, ancestor, and unrelated loop IDs;
 - non-folding delegate enqueue gives each follow-up request its own correlated turn;
 - several queued child requests resolve independently by request ID;
-- multi-root quiescence derives one correct `SessionIdle` edge; and
+- multi-root quiescence derives one correct `SessionIdle` edge;
+- one session workspace coordinator excludes mutations from checkpoint/restore walks;
+- native step/turn/idle ordering persists and emits the trigger before snapshot blob and
+  checkpoint durability, then releases the gate and acknowledges the boundary;
+- required failure leaves the trigger durable and faults before boundary acknowledgement;
+- lease loss stops admission and cooperative commits;
+- session/subtree/child interrupt scopes, queue preservation/flush, and policy-specific
+  admission barrier release; and
 - constructor visibility is enforced by dependency tests.
 
 ### `pkg/serve`
@@ -913,7 +1186,7 @@ All tests are table-driven and run under `-race`.
 
 ### Integration
 
-An integration test over an actual filesystem backend proves:
+Integration tests over actual filesystem backends prove:
 
 1. define a two-primer rig;
 2. create a session and submit work to both loops;
@@ -921,9 +1194,15 @@ An integration test over an actual filesystem backend proves:
 4. mutate the workspace;
 5. reach session idle and checkpoint;
 6. shut down;
-7. restore into a fresh workspace;
+7. restore a per-session workspace into a fresh base directory;
 8. verify files, active loop, loop settings, and conversation state; and
-9. continue work successfully.
+9. continue work successfully;
+10. seed two isolated sessions from one ref, diverge, checkpoint, and restore both to
+    their own journal-authoritative trees;
+11. contend for one exclusive root across two rig instances, release it cleanly, then
+    exercise root-lease loss; and
+12. keep filesystem persistence/snapshot blobs out of the workspace archive and reject
+    overlapping persistence paths.
 
 ## Documentation deliverables
 
@@ -943,7 +1222,8 @@ Required documentation:
 - a same-history plan/build mode example;
 - synchronous Subagent (`wait:true`) and managed asynchronous Subagent examples covering
   `start`, `send`, `wait`, `interrupt`, and `status`;
-- session creation, automatic/manual workspace snapshots, shutdown, and restore;
+- session creation, all optional workspace placements, seeding, manual/idle/turn/step
+  snapshots, rewind, shutdown, and restore;
 - capability and security guidance explaining data-plane versus control-plane APIs,
   delegation attenuation, permission gates, and session ceilings;
 - `serve` integration and lifecycle examples;
@@ -983,6 +1263,7 @@ Rig.RestoreSession(id)  → restored live Session
 
 The rig owns topology and lifecycle policy. The session owns runtime loops and durable
 state. The active loop is mutable, primers enable static multi-loop architectures,
-delegates enable least-privilege dynamic spawning, loop handles permit durable model and
-effort changes, and workspace snapshots become an explicit, reusable rig policy instead
-of SWE-specific watcher code.
+delegates enable least-privilege dynamic spawning, and loop handles permit durable model
+and effort changes. Workspace lifecycle is optional; when present, placement, seeding,
+native checkpoint boundaries, optimistic file freshness, rewind, and persistence
+priority are explicit harness policies rather than SWE-specific watcher code.

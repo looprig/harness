@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	storekit "github.com/looprig/storage"
+	storage "github.com/looprig/storage"
 	"github.com/looprig/storage/memstore"
 
 	"github.com/looprig/core/content"
@@ -23,13 +23,13 @@ import (
 // so a Run exercises the RunLeaseFailed branch deterministically.
 var errFakeAcquire = errors.New("recordingLeaser: forced acquire failure")
 
-// recordingLeaser wraps a real storekit.Leaser to (a) optionally force Acquire to fail
+// recordingLeaser wraps a real storage.Leaser to (a) optionally force Acquire to fail
 // (driving RunLeaseFailed) and (b) count SUCCESSFUL acquires and releases, so a test can
 // prove a failed Run releases the lease it acquired (no leak). acquired is bumped only when
 // a real lease is handed out, so a forced-failure acquire never counts — leaving the
 // balance at 0/0 (also leak-free).
 type recordingLeaser struct {
-	inner       storekit.Leaser
+	inner       storage.Leaser
 	failAcquire bool
 
 	mu       sync.Mutex
@@ -37,7 +37,7 @@ type recordingLeaser struct {
 	released int
 }
 
-func (r *recordingLeaser) Acquire(ctx context.Context, name string) (storekit.Lease, error) {
+func (r *recordingLeaser) Acquire(ctx context.Context, name string) (storage.Lease, error) {
 	if r.failAcquire {
 		return nil, errFakeAcquire
 	}
@@ -58,9 +58,9 @@ func (r *recordingLeaser) balanced() bool {
 }
 
 // recordingLease counts every Release call against its owning recordingLeaser and delegates
-// to the wrapped storekit.Lease.
+// to the wrapped storage.Lease.
 type recordingLease struct {
-	inner storekit.Lease
+	inner storage.Lease
 	owner *recordingLeaser
 }
 
@@ -80,7 +80,7 @@ func newRecordingStore(t *testing.T) (*sessionstore.Store, *recordingLeaser) {
 	t.Helper()
 	base := memstore.New()
 	rl := &recordingLeaser{inner: base.Leaser}
-	composite, err := storekit.NewComposite(base.Ledger, rl, base.KV, base.Blobs)
+	composite, err := storage.NewComposite(base.Ledger, rl, base.KV, base.Blobs)
 	if err != nil {
 		t.Fatalf("NewComposite: %v", err)
 	}

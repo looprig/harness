@@ -11,11 +11,11 @@ import (
 // exactly 64 hex characters. Tests build valid Refs by prefixing "v1:sha256:".
 const validHex = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 
-// storekitName mirrors the storekit name grammar (segments matching
+// storageName mirrors the storage name grammar (segments matching
 // [a-z0-9][a-z0-9_.-]* joined by single '/') so blobKey can be asserted valid
-// without importing storekit (A1 is pure types; the storekit dependency lands in
+// without importing storage (A1 is pure types; the storage dependency lands in
 // a later task).
-var storekitName = regexp.MustCompile(`^[a-z0-9][a-z0-9_.-]*(/[a-z0-9][a-z0-9_.-]*)*$`)
+var storageName = regexp.MustCompile(`^[a-z0-9][a-z0-9_.-]*(/[a-z0-9][a-z0-9_.-]*)*$`)
 
 func TestParseRef(t *testing.T) {
 	t.Parallel()
@@ -112,8 +112,8 @@ func TestRefBlobKey(t *testing.T) {
 			if got := ref.hex(); got != tt.hex {
 				t.Errorf("hex() = %q, want %q", got, tt.hex)
 			}
-			if !storekitName.MatchString(ref.blobKey()) {
-				t.Errorf("blobKey() = %q is not a valid storekit name", ref.blobKey())
+			if !storageName.MatchString(ref.blobKey()) {
+				t.Errorf("blobKey() = %q is not a valid storage name", ref.blobKey())
 			}
 		})
 	}

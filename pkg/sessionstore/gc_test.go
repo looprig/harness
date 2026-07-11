@@ -12,8 +12,8 @@ import (
 	"strconv"
 	"testing"
 
-	"github.com/looprig/harness/pkg/journal"
 	"github.com/looprig/core/uuid"
+	"github.com/looprig/harness/pkg/journal"
 	"github.com/looprig/storage"
 	"github.com/looprig/storage/memstore"
 )
@@ -181,11 +181,11 @@ func TestGCFailsClosedOnScanError(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
 		name  string
-		setup func(t *testing.T) (gc *ObjectGC, blobs storekit.Blobs, orphan string)
+		setup func(t *testing.T) (gc *ObjectGC, blobs storage.Blobs, orphan string)
 	}{
 		{
 			name: "corrupt ledger record",
-			setup: func(t *testing.T) (*ObjectGC, storekit.Blobs, string) {
+			setup: func(t *testing.T) (*ObjectGC, storage.Blobs, string) {
 				st, err := Open(memstore.New(), WithOffloadThreshold(64))
 				if err != nil {
 					t.Fatalf("Open() err = %v", err)
@@ -209,9 +209,9 @@ func TestGCFailsClosedOnScanError(t *testing.T) {
 		},
 		{
 			name: "ledger read failure",
-			setup: func(t *testing.T) (*ObjectGC, storekit.Blobs, string) {
+			setup: func(t *testing.T) (*ObjectGC, storage.Blobs, string) {
 				mem := memstore.New()
-				comp := &storekit.Composite{
+				comp := &storage.Composite{
 					Ledger: &readFailLedger{inner: mem.Ledger, readErr: errScanBoom},
 					Leaser: mem.Leaser,
 					KV:     mem.KV,
@@ -369,7 +369,7 @@ func TestGCDeleteFailsClosed(t *testing.T) {
 			t.Parallel()
 			mem := memstore.New()
 			fb := &deleteFailBlobs{inner: mem.Blobs, delErr: tt.delErr}
-			comp := &storekit.Composite{Ledger: mem.Ledger, Leaser: mem.Leaser, KV: mem.KV, Blobs: fb}
+			comp := &storage.Composite{Ledger: mem.Ledger, Leaser: mem.Leaser, KV: mem.KV, Blobs: fb}
 			st, err := Open(comp, WithOffloadThreshold(64))
 			if err != nil {
 				t.Fatalf("Open() err = %v", err)
@@ -488,14 +488,14 @@ var errDeleteBoom = errors.New("delete boom")
 // readFailLedger wraps a Ledger but fails every Read, so a GC scan cannot build a
 // complete live set. Append/Tip/Delete delegate, so OpenJournal's fence still writes.
 type readFailLedger struct {
-	inner   storekit.Ledger
+	inner   storage.Ledger
 	readErr error
 }
 
 func (l *readFailLedger) Append(ctx context.Context, name string, expected uint64, payload []byte) error {
 	return l.inner.Append(ctx, name, expected, payload)
 }
-func (l *readFailLedger) Read(ctx context.Context, name string, from uint64) (storekit.Cursor, error) {
+func (l *readFailLedger) Read(ctx context.Context, name string, from uint64) (storage.Cursor, error) {
 	return nil, l.readErr
 }
 func (l *readFailLedger) Tip(ctx context.Context, name string) (uint64, error) {
@@ -508,7 +508,7 @@ func (l *readFailLedger) Delete(ctx context.Context, name string) error {
 // deleteFailBlobs wraps a Blobs but fails every Delete, driving the reap fail-closed
 // path. Put/Get/List delegate so the orphan can be staged and listed.
 type deleteFailBlobs struct {
-	inner  storekit.Blobs
+	inner  storage.Blobs
 	delErr error
 }
 
@@ -525,8 +525,8 @@ func (b *deleteFailBlobs) List(ctx context.Context, prefix string) ([]string, er
 	return b.inner.List(ctx, prefix)
 }
 
-// Compile-time proofs that the GC test doubles honor the storekit contracts.
+// Compile-time proofs that the GC test doubles honor the storage contracts.
 var (
-	_ storekit.Ledger = (*readFailLedger)(nil)
-	_ storekit.Blobs  = (*deleteFailBlobs)(nil)
+	_ storage.Ledger = (*readFailLedger)(nil)
+	_ storage.Blobs  = (*deleteFailBlobs)(nil)
 )

@@ -199,15 +199,19 @@ These repo-specific facts are the reason several tasks below are not "just `git 
 
 `storekit` is its own repo. Rename means: new module path `github.com/looprig/storage`, then repoint 4 dependents (`harness`, `fsstore`, `natsstore`, `rclonestore`) that import root + `memstore` + `storetest`.
 
-### Task 4.1: Rename the module in place
+### Task 4.1: Rename the module and root Go package in place
 
 **Step 1:** `cd storekit && git mv` is not needed for the module path itself — edit `go.mod` module line to `github.com/looprig/storage`. Decide repo dir: rename `storekit/` → `storage/` (`mv storekit storage`; the `.git` moves with it). Update the umbrella `go.work` path.
 
 **Step 2:** RECIPE-REWRITE `github.com/looprig/storage` `github.com/looprig/storage` `storage` (rewrites intra-module imports in `memstore/*`, `storetest/*`).
 
-**Step 3:** Update `storage/CLAUDE.md`, `README.md` name references. Keep package names (`memstore`, `storetest`) — only the module path changes; the design does **not** rename `storage`'s subpackages.
+**Step 3:** Rename the root Go package declaration and default import identifier from
+`storekit` to `storage`, including error prefixes, root filenames, tests, comments, and
+active consumer aliases. Keep the subpackage names `memstore` and `storetest`.
 
-**Step 4:** RECIPE-GATE `storage`. Commit in the `storage` repo.
+**Step 4:** Update `storage/CLAUDE.md` and `README.md` name references.
+
+**Step 5:** RECIPE-GATE `storage`. Commit in the `storage` repo.
 
 ### Task 4.2: Repoint the three backend stores
 

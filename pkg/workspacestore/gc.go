@@ -12,7 +12,7 @@ import (
 // v1 is LIVE-SET-ONLY: it has no age/last-seen safety net, so it MUST NOT run
 // concurrently with active snapshotting — a Snapshot writing a not-yet-live Ref (e.g.
 // a brand-new checkpoint, or a re-Put of an identical tree) could be deleted mid-flight.
-// Age-based safety would need a Stat/last-modified surface on storekit.Blobs (future work).
+// Age-based safety would need a Stat/last-modified surface on storage.Blobs (future work).
 //
 // GC is FAIL-SECURE: a key under the workspaces/ prefix that does not parse as a valid v1
 // Ref is skipped, never deleted — GC only ever removes blobs it recognizes as its own

@@ -4,8 +4,8 @@ import (
 	"context"
 	"strconv"
 
-	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/core/uuid"
+	"github.com/looprig/harness/pkg/event"
 )
 
 // StartPos is the closed value type naming where a replay begins: the log beginning
@@ -52,7 +52,7 @@ type ReplayRequest struct {
 // EventReplayer is the journal's read side: it opens an ordered cursor over a session's
 // Enduring events. It is the narrow counterpart to SessionJournal (the write side) — a
 // caller that only reads history depends on Open alone. The concrete implementation
-// lives in a backend package (e.g. pkg/sessionstore over storekit).
+// lives in a backend package (e.g. pkg/sessionstore over storage).
 type EventReplayer interface {
 	// Open binds a cursor over the session's events selected by req and positioned at
 	// req.From.

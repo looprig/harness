@@ -19,8 +19,8 @@ import (
 // ReplayRequest positions a sessionstore replay. It carries an exported inclusive
 // start sequence because journal.ReplayRequest hides its start behind a
 // package-private journal.StartPos that an out-of-package replayer cannot read: the
-// storekit replayer's positioning must therefore flow through this request, set when
-// the replayer is opened. Subject/loop narrowing is not part of storekit replay — a
+// storage replayer's positioning must therefore flow through this request, set when
+// the replayer is opened. Subject/loop narrowing is not part of storage replay — a
 // session is one ledger, walked whole and filtered by envelope kind — so this
 // request needs only the start position.
 type ReplayRequest struct {
@@ -50,7 +50,7 @@ func (e *BlobIntegrityError) Error() string {
 
 // BlobUnavailableError reports that an offloaded record's backing blob could not be
 // fetched: a dangling pointer (the blob is absent — Cause is a
-// *storekit.BlobNotFoundError) or any other Blobs.Get / read failure. It fails
+// *storage.BlobNotFoundError) or any other Blobs.Get / read failure. It fails
 // closed — replay surfaces it rather than yielding a zero-valued record — so a
 // missing blob can never be mistaken for a drained backlog. It carries the record's
 // ledger sequence and the blob key, and unwraps to the underlying cause.
@@ -137,12 +137,12 @@ func (s *Store) OpenRecordReplayer(id uuid.UUID, req ReplayRequest) (journal.Rec
 	}, nil
 }
 
-// eventReplayer is the concrete journal.EventReplayer over one session's storekit
+// eventReplayer is the concrete journal.EventReplayer over one session's storage
 // ledger. It holds no per-replay state: every Open builds an independent ledger
 // cursor, so concurrent replays do not interfere.
 type eventReplayer struct {
-	ledger  storekit.Ledger
-	blobs   storekit.Blobs
+	ledger  storage.Ledger
+	blobs   storage.Blobs
 	name    string
 	fromSeq uint64
 }
@@ -173,14 +173,14 @@ func (r *eventReplayer) Open(ctx context.Context, req journal.ReplayRequest) (jo
 	return &eventCursor{loopID: req.LoopID, base: baseCursor{name: r.name, blobs: r.blobs, cur: cur}}, nil
 }
 
-// recordReplayer is the concrete journal.RecordReplayer over one session's storekit
+// recordReplayer is the concrete journal.RecordReplayer over one session's storage
 // ledger. Unlike eventReplayer it carries the session id: a command or fence record
 // does not embed its routing session in the envelope, so the replayer stamps the
 // bound session id onto the reconstructed CommandRecord/FenceRecord.
 type recordReplayer struct {
 	id      uuid.UUID
-	ledger  storekit.Ledger
-	blobs   storekit.Blobs
+	ledger  storage.Ledger
+	blobs   storage.Blobs
 	name    string
 	fromSeq uint64
 }
@@ -209,7 +209,7 @@ type resolved struct {
 }
 
 // baseCursor is the shared read + resolve machinery both cursors wrap. It walks one
-// storekit ledger cursor, decodes each envelope, and resolves a blobptr transparently
+// storage ledger cursor, decodes each envelope, and resolves a blobptr transparently
 // (fetch + sha256-verify + decode the offloaded envelope) so the caller only ever
 // sees a real record kind. A cursor is a single-reader handle — concurrent next calls
 // are not supported.
@@ -217,7 +217,7 @@ type resolved struct {
 // mu guards baseCursor's OWN fields (cur, closed): it makes Close idempotent and
 // guarantees a next after Close observes closed and returns io.EOF rather than racing
 // the field, with no Go-level data race on those fields. It does NOT serialize the
-// UNDERLYING storekit cursor's Next/Close — next reads cur under mu but releases it
+// UNDERLYING storage cursor's Next/Close — next reads cur under mu but releases it
 // before calling cur.Next(ctx), so a Close concurrent with an in-flight next may reach
 // the backend cursor while its Next is running. That is sound for the drained-snapshot
 // backends here (memstore's Close is a no-op); a future networked backend whose Close
@@ -225,10 +225,10 @@ type resolved struct {
 // rely on serialization this layer does not give.
 type baseCursor struct {
 	name  string
-	blobs storekit.Blobs
+	blobs storage.Blobs
 
 	mu     sync.Mutex
-	cur    storekit.Cursor
+	cur    storage.Cursor
 	closed bool
 }
 
@@ -401,7 +401,7 @@ var _ journal.RecordCursor = (*recordCursor)(nil)
 // A CommandRecord is reconstructed with the bound session id and a ZERO dispatch
 // loop id: the envelope frames only {kind, id, payload} and does not persist a
 // command's routing loop id (the NATS journal recovered it from the record's
-// subject; there is no subject in a storekit ledger). The sole consumer
+// subject; there is no subject in a storage ledger). The sole consumer
 // (transcript/journalsource) uses only the wrapped command, so the dropped loop id
 // is immaterial there.
 func (c *recordCursor) Next(ctx context.Context) (journal.JournalRecord, uint64, error) {

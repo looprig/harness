@@ -10,7 +10,7 @@ import "context"
 //
 // The interface is intentionally narrow (one method): a caller that only needs to
 // persist a record must not depend on any log-management surface. The concrete
-// implementation lives in a backend package (e.g. pkg/sessionstore over storekit),
+// implementation lives in a backend package (e.g. pkg/sessionstore over storage),
 // wired at the composition root — this package owns only the contract.
 type SessionJournal interface {
 	// Append serializes rec, persists it under the next expected sequence, and

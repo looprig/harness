@@ -7,7 +7,7 @@ import (
 
 // defaultOffloadThreshold is the payload size, in bytes, above which a record
 // is offloaded to the blob store rather than inlined in the ledger (512 KiB). It sits
-// comfortably under storekit's 1 MiB per-record ceiling, leaving headroom for the
+// comfortably under storage's 1 MiB per-record ceiling, leaving headroom for the
 // envelope framing around the payload.
 const defaultOffloadThreshold = 512 * 1024
 
@@ -50,19 +50,19 @@ func (e *InvalidBackendError) Error() string {
 	return "sessionstore: invalid backend: missing " + e.Missing
 }
 
-// Store is the session-scoped facade over a storekit backend. It holds the assembled
-// *storekit.Composite (whose four primitives it addresses by field — they have
+// Store is the session-scoped facade over a storage backend. It holds the assembled
+// *storage.Composite (whose four primitives it addresses by field — they have
 // colliding method names, so there is no flattened backend interface) plus the
 // resolved Options. Construct it only via Open.
 type Store struct {
-	backend *storekit.Composite
+	backend *storage.Composite
 	opts    Options
 }
 
 // Open validates the backend and returns a Store over it. A nil composite or any nil
 // primitive field is rejected with a typed *InvalidBackendError (fail closed, never a
 // panic). Options are resolved from the 512 KiB default plus any overrides.
-func Open(b *storekit.Composite, opts ...Option) (*Store, error) {
+func Open(b *storage.Composite, opts ...Option) (*Store, error) {
 	if b == nil {
 		return nil, &InvalidBackendError{Missing: "composite"}
 	}
@@ -86,18 +86,18 @@ func Open(b *storekit.Composite, opts ...Option) (*Store, error) {
 	return &Store{backend: b, opts: resolved}, nil
 }
 
-// ledgerName derives the storekit ledger name for a session: "sessions/<uuid>". The
-// uuid renders as lowercase hex with hyphens, which is a canonical storekit name.
+// ledgerName derives the storage ledger name for a session: "sessions/<uuid>". The
+// uuid renders as lowercase hex with hyphens, which is a canonical storage name.
 func ledgerName(id uuid.UUID) string {
 	return sessionsPrefix + id.String()
 }
 
-// sessionName derives the ledger name for id and confirms it is a valid storekit
+// sessionName derives the ledger name for id and confirms it is a valid storage
 // name. A uuid always yields a canonical name, so the error is defensive — returning
 // it keeps the derivation honest rather than silently assuming validity.
 func sessionName(id uuid.UUID) (string, error) {
 	name := ledgerName(id)
-	if err := storekit.ValidateName(name); err != nil {
+	if err := storage.ValidateName(name); err != nil {
 		return "", err
 	}
 	return name, nil

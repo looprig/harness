@@ -15,7 +15,7 @@ import (
 //
 // As an in-process oracle it has no TTL, no takeover, and no cross-process
 // reclaim: a lease's Lost() channel closes only on Release, and each method's
-// ctx parameter exists solely to satisfy the storekit.Leaser contract.
+// ctx parameter exists solely to satisfy the storage.Leaser contract.
 type leaserStore struct {
 	mu      sync.Mutex
 	holders map[string]*memLease // live holder per name, absent when free
@@ -31,22 +31,22 @@ func newLeaserStore() *leaserStore {
 }
 
 // Compile-time proof that *leaserStore honors the Leaser contract.
-var _ storekit.Leaser = (*leaserStore)(nil)
+var _ storage.Leaser = (*leaserStore)(nil)
 
 // Acquire grants exclusive ownership of name. It validates the name first
 // (*InvalidNameError), then refuses with a *LeaseHeldError naming the current
 // holder's epoch if a live holder exists. Otherwise it advances the name's
 // epoch counter (strictly increasing across grants of the same name; independent
 // per name) and returns a fresh lease. Epochs start at 1.
-func (s *leaserStore) Acquire(ctx context.Context, name string) (storekit.Lease, error) {
-	if err := storekit.ValidateName(name); err != nil {
+func (s *leaserStore) Acquire(ctx context.Context, name string) (storage.Lease, error) {
+	if err := storage.ValidateName(name); err != nil {
 		return nil, err
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	if h := s.holders[name]; h != nil {
-		return nil, &storekit.LeaseHeldError{Name: name, HolderEpoch: h.epoch}
+		return nil, &storage.LeaseHeldError{Name: name, HolderEpoch: h.epoch}
 	}
 
 	epoch := s.epochs[name] + 1

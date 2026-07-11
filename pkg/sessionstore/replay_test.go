@@ -44,12 +44,12 @@ type fixture struct {
 // the fixture with want holding every record in stream order — the opening fence at
 // index 0 — so a replay can be compared against it.
 //
-// The command is appended with a ZERO dispatch loop id on purpose: the storekit
+// The command is appended with a ZERO dispatch loop id on purpose: the storage
 // envelope frames only {kind, id, payload} and does not persist a command's
 // dispatch loop id (the NATS journal recovered it from the subject; there is no
 // subject here). The RecordReplayer therefore reconstructs a CommandRecord with a
 // zero loop id, so appending with a zero loop id makes the round-trip exact.
-func buildFixture(t *testing.T, backend *storekit.Composite) fixture {
+func buildFixture(t *testing.T, backend *storage.Composite) fixture {
 	t.Helper()
 	st, err := Open(backend, WithOffloadThreshold(replayThreshold))
 	if err != nil {
@@ -414,25 +414,25 @@ func TestEventReplayerNarrowsByLoop(t *testing.T) {
 // path rehydrates the original event transparently (the reader never sees a
 // blobptr); a corrupted blob (bytes whose sha256 no longer matches the pointer)
 // fails closed with *BlobIntegrityError; a deleted blob fails closed with
-// *BlobUnavailableError wrapping *storekit.BlobNotFoundError. None yields a bogus
+// *BlobUnavailableError wrapping *storage.BlobNotFoundError. None yields a bogus
 // record.
 func TestReplayBlobResolution(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
 		name       string
-		tamper     func(t *testing.T, fx fixture, backend *storekit.Composite)
+		tamper     func(t *testing.T, fx fixture, backend *storage.Composite)
 		wantErrAs  func(err error) bool
 		wantResolv bool // the offloaded record resolves cleanly to its original kind
 	}{
 		{
 			name:       "happy path rehydrates transparently",
-			tamper:     func(t *testing.T, fx fixture, backend *storekit.Composite) {},
+			tamper:     func(t *testing.T, fx fixture, backend *storage.Composite) {},
 			wantResolv: true,
 		},
 		{
 			name: "corrupt blob fails closed with BlobIntegrityError",
-			tamper: func(t *testing.T, fx fixture, backend *storekit.Composite) {
+			tamper: func(t *testing.T, fx fixture, backend *storage.Composite) {
 				// The backend's Blobs is a corruptGetBlobs wrapper; arm it.
 				backend.Blobs.(*corruptGetBlobs).corrupt.Store(true)
 			},
@@ -443,7 +443,7 @@ func TestReplayBlobResolution(t *testing.T) {
 		},
 		{
 			name: "oversized blob fails closed with BlobIntegrityError (Size+1 bound)",
-			tamper: func(t *testing.T, fx fixture, backend *storekit.Composite) {
+			tamper: func(t *testing.T, fx fixture, backend *storage.Composite) {
 				// Get returns MORE bytes than the pointer's Size: the bounded read caps
 				// at Size+1, so len(raw) != ptr.Size trips the guard without an
 				// unbounded read — pinning the anti-OOM bound.
@@ -456,7 +456,7 @@ func TestReplayBlobResolution(t *testing.T) {
 		},
 		{
 			name: "missing blob fails closed with BlobUnavailableError",
-			tamper: func(t *testing.T, fx fixture, backend *storekit.Composite) {
+			tamper: func(t *testing.T, fx fixture, backend *storage.Composite) {
 				keys, err := backend.Blobs.List(context.Background(), sessionsPrefix+fx.id.String()+blobsInfix)
 				if err != nil {
 					t.Fatalf("List() err = %v", err)
@@ -475,7 +475,7 @@ func TestReplayBlobResolution(t *testing.T) {
 				if !errors.As(err, &ue) {
 					return false
 				}
-				var nf *storekit.BlobNotFoundError
+				var nf *storage.BlobNotFoundError
 				return errors.As(err, &nf) // fail-closed cause preserved
 			},
 		},
@@ -484,7 +484,7 @@ func TestReplayBlobResolution(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			mem := memstore.New()
-			backend := &storekit.Composite{
+			backend := &storage.Composite{
 				Ledger: mem.Ledger,
 				Leaser: mem.Leaser,
 				KV:     mem.KV,
@@ -667,7 +667,7 @@ func TestReplayCursorCloseIdempotent(t *testing.T) {
 // oversize appends bytes past the pointer's Size (→ the len(raw) != ptr.Size half,
 // the anti-OOM Size+1 bound).
 type corruptGetBlobs struct {
-	inner    storekit.Blobs
+	inner    storage.Blobs
 	corrupt  atomic.Bool
 	oversize atomic.Bool
 }
@@ -712,7 +712,7 @@ func (b *corruptGetBlobs) List(ctx context.Context, prefix string) ([]string, er
 	return b.inner.List(ctx, prefix)
 }
 
-var _ storekit.Blobs = (*corruptGetBlobs)(nil)
+var _ storage.Blobs = (*corruptGetBlobs)(nil)
 
 // --- gate prepared record replay tests -----------------------------------
 

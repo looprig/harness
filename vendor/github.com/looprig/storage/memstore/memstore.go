@@ -1,10 +1,10 @@
-// Package memstore is the in-memory reference backend for storekit's four
+// Package memstore is the in-memory reference backend for storage's four
 // primitives. It is the conformance oracle other backends are checked against:
 // correct, allocation-simple, and dependency-free. Because the four primitives
 // have colliding method names (Ledger/KV/Blobs all declare Delete; KV and Blobs
 // declare Get/Put with different signatures), no single Go type can satisfy all
 // four — so memstore is built as four separate unexported backing types that are
-// wired into a *storekit.Composite at the composition root.
+// wired into a *storage.Composite at the composition root.
 package memstore
 
 import (
@@ -15,13 +15,13 @@ import (
 	"github.com/looprig/storage"
 )
 
-// New assembles the in-memory reference backend: a *storekit.Composite wiring
+// New assembles the in-memory reference backend: a *storage.Composite wiring
 // one fresh backing store per primitive (ledger, leaser, KV, blobs). All four
 // providers are non-nil, so the underlying NewComposite can never report an
 // incomplete composite — a non-nil error here is impossible and is treated as an
 // unrecoverable programmer error (panic) rather than propagated.
-func New() *storekit.Composite {
-	c, err := storekit.NewComposite(newLedgerStore(), newLeaserStore(), newKVStore(), newBlobStore())
+func New() *storage.Composite {
+	c, err := storage.NewComposite(newLedgerStore(), newLeaserStore(), newKVStore(), newBlobStore())
 	if err != nil {
 		panic(err) // unreachable: every primitive above is non-nil
 	}
@@ -34,7 +34,7 @@ func New() *storekit.Composite {
 //
 // As an in-process oracle it performs no blocking I/O and does NOT honor ctx
 // cancellation or deadlines; each method's ctx parameter exists solely to
-// satisfy the storekit.Ledger contract.
+// satisfy the storage.Ledger contract.
 type ledgerStore struct {
 	mu      sync.RWMutex
 	ledgers map[string][][]byte
@@ -46,7 +46,7 @@ func newLedgerStore() *ledgerStore {
 }
 
 // Compile-time proof that *ledgerStore honors the Ledger contract.
-var _ storekit.Ledger = (*ledgerStore)(nil)
+var _ storage.Ledger = (*ledgerStore)(nil)
 
 // Append commits payload as the record immediately after sequence expected
 // (CAS on the tip). expected must equal the current record count, so expected==0
@@ -55,7 +55,7 @@ var _ storekit.Ledger = (*ledgerStore)(nil)
 // The stored record is a fresh copy of payload (copy-in), so later caller
 // mutation cannot reach committed data. Zero-length payloads are legal.
 func (s *ledgerStore) Append(ctx context.Context, name string, expected uint64, payload []byte) error {
-	if err := storekit.ValidateName(name); err != nil {
+	if err := storage.ValidateName(name); err != nil {
 		return err
 	}
 	s.mu.Lock()
@@ -63,7 +63,7 @@ func (s *ledgerStore) Append(ctx context.Context, name string, expected uint64, 
 
 	records := s.ledgers[name]
 	if uint64(len(records)) != expected {
-		return &storekit.ConflictError{Name: name, Expected: expected}
+		return &storage.ConflictError{Name: name, Expected: expected}
 	}
 
 	stored := make([]byte, len(payload))
@@ -77,8 +77,8 @@ func (s *ledgerStore) Append(ctx context.Context, name string, expected uint64, 
 // (including tip+1) and an absent ledger both yield an immediately-drained
 // cursor. from < 1 is clamped to the first record. Each Next hands back a fresh
 // payload copy (copy-out).
-func (s *ledgerStore) Read(ctx context.Context, name string, from uint64) (storekit.Cursor, error) {
-	if err := storekit.ValidateName(name); err != nil {
+func (s *ledgerStore) Read(ctx context.Context, name string, from uint64) (storage.Cursor, error) {
+	if err := storage.ValidateName(name); err != nil {
 		return nil, err
 	}
 	s.mu.RLock()
@@ -108,7 +108,7 @@ func (s *ledgerStore) Read(ctx context.Context, name string, from uint64) (store
 
 // Tip returns the current record count for name (0 if absent).
 func (s *ledgerStore) Tip(ctx context.Context, name string) (uint64, error) {
-	if err := storekit.ValidateName(name); err != nil {
+	if err := storage.ValidateName(name); err != nil {
 		return 0, err
 	}
 	s.mu.RLock()
@@ -119,7 +119,7 @@ func (s *ledgerStore) Tip(ctx context.Context, name string) (uint64, error) {
 // Delete removes the ledger; it is idempotent, so deleting an absent ledger
 // succeeds. After Delete the ledger is absent == empty (Tip 0, Read drained).
 func (s *ledgerStore) Delete(ctx context.Context, name string) error {
-	if err := storekit.ValidateName(name); err != nil {
+	if err := storage.ValidateName(name); err != nil {
 		return err
 	}
 	s.mu.Lock()
@@ -138,14 +138,14 @@ type ledgerCursor struct {
 
 // Next yields the next record with a freshly copied payload (copy-out), or
 // io.EOF once the snapshot is drained.
-func (c *ledgerCursor) Next(ctx context.Context) (storekit.Record, error) {
+func (c *ledgerCursor) Next(ctx context.Context) (storage.Record, error) {
 	if c.pos >= len(c.records) {
-		return storekit.Record{}, io.EOF
+		return storage.Record{}, io.EOF
 	}
 	src := c.records[c.pos]
 	payload := make([]byte, len(src))
 	copy(payload, src)
-	rec := storekit.Record{Seq: c.base + uint64(c.pos), Payload: payload}
+	rec := storage.Record{Seq: c.base + uint64(c.pos), Payload: payload}
 	c.pos++
 	return rec, nil
 }

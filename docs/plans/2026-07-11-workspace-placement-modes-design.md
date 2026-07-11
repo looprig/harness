@@ -1,8 +1,9 @@
 # Design: workspace placement, seeding, and snapshot policy
 
 **Date:** 2026-07-11
-**Status:** Approved
-**Amends:** `2026-07-10-rig-lifecycle-workspace-snapshots-design.md`
+**Status:** Folded into `2026-07-10-rig-lifecycle-workspace-snapshots-design.md`;
+retained as decision history
+**Amended:** `2026-07-10-rig-lifecycle-workspace-snapshots-design.md`
 **Builds on:** `2026-07-02-workspacestore-design.md`, the implemented
 `pkg/workspacestore`, `pkg/sessionstore`, and
 `session.SessionController.CheckpointWorkspace`
@@ -73,7 +74,8 @@ rig.WithSharedWorkspace(workspaceStore, "/home/user/project")
 ```
 
 Here `leases` implements `storage.Leaser` from `github.com/looprig/storage`. The
-public API and documentation use the package name `storage`, not `storekit`.
+public API, Go package identifier, errors, and documentation consistently use the name
+`storage`.
 `WithExclusiveWorkspace` accepts the leaser explicitly because the workspace blob
 store and the lease backend may have different scopes or providers. The other modes
 take no root lease and therefore take no leaser argument.
@@ -88,11 +90,27 @@ take no root lease and therefore take no leaser argument.
 
 Omitting all three options disables the workspace subsystem rather than selecting an
 implicit mode. Session construction does not resolve a root, materialize a snapshot,
-start a checkpoint watcher, or acquire a root lease. The workspace methods retained on
-the uniform `SessionController` (`CheckpointWorkspace` and `RestoreWorkspace`) return
-a typed `WorkspaceUnavailableError`. This keeps one controller API without
+start a checkpoint controller, or acquire a root lease. The workspace methods retained
+on the uniform `SessionController` (`CheckpointWorkspace` and `RestoreWorkspace`)
+return a typed `WorkspaceUnavailableError`. This keeps one controller API without
 manufacturing a workspace for chat-only, orchestration-only, or externally managed
 rigs.
+
+### Persistence is outside the workspace
+
+The session journal, catalog, leases, and workspace snapshot blobs must not live under
+the snapshotted workspace root. Persisting `StepDone` or `WorkspaceCheckpointed` inside
+that root would itself mutate the tree being checkpointed and make a stable final ref
+impossible. Filesystem-backed providers whose storage locations are discoverable fail
+`rig.Define` with a typed overlap error when a persistence directory is equal to or
+contained by the workspace root. A persistence directory that is an ancestor of the
+workspace is not by itself recursive; only files beneath the workspace are captured.
+Providers without a discoverable local path must document and honor the same
+composition contract.
+
+The persistence backend may use the same disk or host; it must simply be outside the
+workspace tree. Workspace restore and root replacement therefore cannot overwrite the
+session's own journal or snapshot blobs.
 
 There is deliberately **no root-factory closure** (`func(sessionID) string`). A closure
 cannot be validated at `Define`, cannot be fingerprinted, and cannot be reasoned about
@@ -239,38 +257,93 @@ keeping manual-only scheduling explicit.
 |---|---|---|---|
 | `SnapshotManual` | explicit `CheckpointWorkspace` while idle | caller-controlled | `quiescent` in exclusive/per-session; `fuzzy` in shared |
 | `SnapshotOnIdle` *(resolved default)* | `SessionActive → SessionIdle` edge | once per work burst | `quiescent` in exclusive/per-session; `fuzzy` in shared |
-| `SnapshotOnTurnDone` | each turn-terminal event (`TurnDone`/`TurnFailed`/`TurnInterrupted`) on any loop | once per turn | `fuzzy` when sibling loops are mid-turn |
-| `SnapshotOnStepDone` | every `StepDone` | many per turn | usually in-progress; highest automatic rewind density |
+| `SnapshotOnTurnDone` | each turn-terminal event (`TurnDone`/`TurnFailed`/`TurnInterrupted`) on any loop | once per turn | `quiescent` in exclusive/per-session when captured; `fuzzy` in shared |
+| `SnapshotOnStepDone` | every `StepDone` | many per turn | `quiescent` in exclusive/per-session when captured; `fuzzy` in shared |
 
 - Content addressing avoids uploading an identical archive again. Every attempted
   snapshot still pays tree-walk and hashing I/O, and every unique archive consumes
   storage; these costs are the practical limit on `SnapshotOnStepDone` for large trees.
-- Choosing `OnTurnDone`/`OnStepDone` implicitly accepts `fuzzy` refs mid-burst; the
-  consistency stamp records it honestly.
+- Step/turn triggers choose a boundary, not a smaller snapshot scope: the ref still
+  captures the entire session workspace and `Header.Cause` identifies the triggering
+  loop/turn/step.
 - No shutdown trigger: orderly shutdown from idle already has a fresh `OnIdle` ref, and
   an interrupt sweep ends in an idle edge that checkpoints too (see "Session-wide
   interrupt"), so there is no shutdown path left that silently skips a wanted snapshot —
   `Manual` covers anything else.
 - `Manual` remains available on top of any configured trigger.
 
+### Native checkpoint boundary and workspace gate
+
+Checkpointing is native session-runtime control flow, not a public hook and not an
+asynchronous subscriber reacting sometime after an event. Every session with a
+workspace owns one `WorkspaceCoordinator` shared by all primer and delegate loops.
+There is at most one active turn and one active step inside a loop; steps are
+sequential. Parallelism comes from tool calls within a step and from different loops,
+which is why the workspace gate is session-scoped rather than loop-scoped.
+
+The coordinator grants these internal permits:
+
+| Operation | Permit |
+|---|---|
+| `WriteFile` / `EditFile` / known-path mutator | shared workspace-mutation permit plus its path lock |
+| `Bash` / unknown-path mutator | exclusive whole-workspace mutation permit |
+| checkpoint walk | exclusive snapshot permit |
+| workspace restore/root replacement | exclusive restore permit |
+
+An exclusive snapshot permit waits for active managed mutations to finish and blocks
+new managed mutations until the checkpoint boundary completes. Read-only inference and
+event observation do not mutate the workspace; queued work may be accepted, but policy
+decides when its execution or next mutation may proceed. External processes do not
+participate, so shared placement remains `fuzzy`.
+
+For an accepted automatic boundary, the step/turn/session actor executes this sequence
+directly before acknowledging the boundary and allowing subsequent managed mutation:
+
+```text
+actual step/turn/session work reaches its terminal boundary
+→ acquire the session's exclusive snapshot permit
+→ append the triggering StepDone/TurnDone/SessionIdle event durably
+→ emit that triggering event to the session fan-out
+→ snapshot the entire session workspace
+→ append WorkspaceCheckpointed durably with Header.Cause = triggering event
+→ emit WorkspaceCheckpointed
+→ release the snapshot permit
+→ acknowledge the boundary and continue queued work
+```
+
+The trigger event comes before the snapshot commit event because it records an
+execution fact that remains true even if snapshotting fails. `WorkspaceCheckpointed`
+comes only after the snapshot blob is durable. A failure therefore never erases a
+completed step/turn/idle transition, and a checkpoint event never points at a missing
+blob. The journal and blob backends are outside the workspace, so appending either
+event does not perturb the captured tree.
+
+`LoopIdle` remains a native loop event but is not a snapshot trigger in this policy. It
+feeds session quiescence; once every loop is idle, the session performs the same native
+boundary around `SessionIdle`.
+
 ### Trigger backpressure and coalescing
 
-Each session checkpoint controller permits one in-flight checkpoint and one pending
-automatic trigger. When more automatic edges arrive while a walk is running, the
-pending slot is latest-wins: replace it with the newest edge and its `Header.Cause`.
-After the walk finishes or is cancelled, the controller processes that latest pending
-edge if it is still eligible. Skipped or coalesced edges append no checkpoint event.
+Under `SnapshotBestEffort`, each session checkpoint controller permits one in-flight
+checkpoint and one pending automatic trigger. When more automatic edges arrive while a
+walk is running, the pending slot is latest-wins: replace it with the newest edge and
+its `Header.Cause`. After the walk finishes or is cancelled, the controller processes
+that latest pending edge if it remains eligible. Skipped or coalesced edges append no
+checkpoint event. A delayed best-effort snapshot is quiescent while its walk runs, but
+does not claim to reproduce the exact earlier trigger-time tree.
 
-This bounded rule prevents `SnapshotOnStepDone` from creating an unbounded queue. It
-means automatic triggers are scheduling attempts, not a guarantee of one distinct ref
-per edge. Exact per-step persistence would have to backpressure loop execution and is
-not part of this policy.
+Under `SnapshotRequired`, automatic triggers are never coalesced. Each loop can have at
+most one outstanding boundary because its steps and turns are sequential; required
+boundary requests wait FIFO at the session checkpoint controller. The actor does not
+acknowledge its step/turn boundary or advance that loop until its checkpoint commits or
+the session faults. Required `OnStepDone` therefore deliberately trades throughput for
+one durable checkpoint event per step.
 
 Manual `CheckpointWorkspace` calls are never coalesced: each caller is serialized
 through the same controller and receives its own ref or error. Caller context
-cancellation removes a request that has not started. Under `SnapshotRequired` only
-idle/manual scheduling is valid and admission gating prevents overlapping automatic
-work, so the pending slot normally remains empty.
+cancellation removes a request that has not started. Manual callers are serviced before
+the single pending best-effort automatic trigger so sustained step traffic cannot
+starve control-plane work.
 
 ## Snapshot priority
 
@@ -300,19 +373,20 @@ const (
 
 Consequences:
 
-- **The torn-snapshot window disappears under `Required` by construction.** Admission
-  gating means `SessionActive` cannot fire while the walk runs; every exclusive or
-  per-session ref is `quiescent`, and every idle burst is durably captured before the
-  next begins. The bounded cost is a stall of at most the remaining walk time (capped
-  by `Timeout`) when input lands inside the window; an unchanged tree still pays a hash
-  walk but performs no blob upload.
-- Under `BestEffort` in quiescent-ref modes, cancel-and-retry preserves the invariant
-  that exclusive and per-session modes only journal refs without overlapping
-  harness-managed mutation.
-- `SnapshotRequired` is valid only with trigger `SnapshotOnIdle` or `SnapshotManual`.
-  With `OnTurnDone`/`OnStepDone`, other loops are already running when the walk fires,
-  so the quiescence guarantee is unachievable; the combination fails `rig.Define` with
-  a typed error.
+- **The managed torn-snapshot window disappears under `Required` by construction.** At
+  idle/manual boundaries, admission stays closed. At step/turn boundaries, the
+  triggering actor withholds its boundary acknowledgement and every loop's mutating
+  tools wait behind the session workspace gate. Each exclusive/per-session ref is
+  therefore `quiescent` even when sibling loops continue read-only inference or emit
+  non-mutating events.
+- `SnapshotRequired` is valid with `SnapshotManual`, `SnapshotOnIdle`,
+  `SnapshotOnTurnDone`, and `SnapshotOnStepDone`. Required step/turn policies accept
+  potentially high latency: every boundary waits for its serialized snapshot, capped
+  by `Timeout`; failure leaves the trigger event durable and faults the session before
+  that actor advances.
+- Under `BestEffort`, a snapshot is recorded only while the coordinator holds the same
+  exclusive permit, so recorded exclusive/per-session refs remain `quiescent`.
+  Best-effort may cancel, skip, or coalesce a boundary instead of blocking progress.
 - `WithSharedWorkspace` forces `SnapshotBestEffort`; `Required` there is a typed
   `rig.Define` error.
 
@@ -347,6 +421,16 @@ const (
 	SnapshotQuiescent
 	SnapshotFuzzy
 )
+
+const (
+	SnapshotTriggerKindUnknown SnapshotTriggerKind = iota // legacy decode only; never emitted
+	SnapshotTriggerManual
+	SnapshotTriggerIdle
+	SnapshotTriggerInterrupt
+	SnapshotTriggerTurnDone
+	SnapshotTriggerStepDone
+	SnapshotTriggerSeed
+)
 ```
 
 The existing `Header.Cause` is the direct causal edge and already embeds
@@ -377,13 +461,13 @@ coordinates participants using its `storage.Leaser`. Filesystem-wide transaction
 proof would require cooperation the rig does not control.
 
 Consistency is determined mechanically: `WithSharedWorkspace` always stamps `fuzzy`;
-exclusive/per-session idle or manual refs are `quiescent` (cancel-on-active or
-admission gating guarantees it); `OnTurnDone`/`OnStepDone` refs are `quiescent` iff no
-other loop had an active turn and no new turn/step began during the walk, else `fuzzy`.
-An idle edge produced by an interrupt sweep stamps `Trigger: interrupt` — the session
-knows it just killed the work rather than watched it complete — with consistency rules
-identical to `idle`. Tooling can thereby distinguish "state after finished work" from
-"state after a panic stop" without scanning for preceding `TurnInterrupted` events.
+every recorded exclusive/per-session ref is `quiescent` because its walk holds the
+session workspace's exclusive snapshot permit. Sibling loops may remain active, but
+their managed mutations wait behind that permit. An idle edge produced by an interrupt
+sweep stamps `Trigger: interrupt` — the session knows it just killed the work rather
+than watched it complete — with consistency rules identical to `idle`. Tooling can
+thereby distinguish "state after finished work" from "state after a panic stop"
+without scanning for preceding `TurnInterrupted` events.
 
 `Ref` remains content identity, not checkpoint identity: two checkpoints over an
 unchanged tree carry the same `v1:sha256:<hex>` ref. The unique per-checkpoint key is
@@ -497,9 +581,16 @@ last-interrupt-to-idle window.
 
 Barrier release follows snapshot policy:
 
-- `SnapshotRequired`: hold through checkpoint commit or the latched fault;
-- `SnapshotBestEffort`: release once the idle trigger is accepted by the checkpoint
-  controller; later activation may cancel the walk exactly as best-effort specifies;
+- required `OnIdle`: hold through the interrupt-stamped idle checkpoint commit or the
+  latched fault;
+- required `OnTurnDone`: hold until every required `TurnInterrupted` boundary accepted
+  by the sweep commits or faults, and until `SessionIdle` is appended;
+- required `OnStepDone`: hold until already-accepted required step boundaries drain and
+  `SessionIdle` is appended; interruption itself does not manufacture a `StepDone`;
+- best-effort `OnIdle`: release once the idle boundary checkpoint is accepted;
+- best-effort `OnTurnDone`/`OnStepDone`: release after `SessionIdle` is appended; any
+  active or latest coalesced terminal/step snapshot proceeds under normal best-effort
+  rules;
 - `SnapshotManual`: release after `SessionIdle`, with no automatic checkpoint; and
 - no workspace: release immediately after `SessionIdle`.
 
@@ -508,24 +599,28 @@ idle session returns false and creates neither a barrier transition nor an idle 
 
 ### Snapshot on interrupt
 
-The post-interrupt checkpoint needs no new machinery: the sweep ends in quiescence,
-quiescence fires the `SessionActive → SessionIdle` edge, and the configured on-idle
-watcher checkpoints as usual — stamped `Trigger: interrupt` so tooling can tell a
-panic-stop state from completed work. Consequences per policy:
+The post-interrupt checkpoint uses the same native boundaries: the sweep ends in
+quiescence and the session persists and emits `SessionIdle` under its admission
+barrier. Under an idle trigger, the session then checkpoints before releasing that
+barrier and stamps `Trigger: interrupt` so tooling can tell a panic-stop state from
+completed work. Consequences per policy:
 
-- Under `SnapshotRequired`, admission stays gated until the post-interrupt ref
-  commits: a panic stop always yields a durable workspace state before any new work is
-  admitted.
-- Under `SnapshotBestEffort`, the barrier releases after the idle trigger is accepted;
-  preserved input may then activate the session and cancel an exclusive/per-session
-  walk. Shared mode lets the walk finish and stamps `fuzzy`.
+- Under required `OnIdle`, admission stays gated until the post-interrupt ref commits:
+  a panic stop yields a durable workspace state before new work is admitted.
+- Under best-effort `OnIdle`, the barrier releases after the idle checkpoint is
+  accepted; preserved input may then cancel an exclusive/per-session walk. Shared mode
+  lets the walk finish and stamps `fuzzy`.
+- Under `OnTurnDone`, each `TurnInterrupted` is a native terminal boundary and uses
+  `Trigger: turn_done`; required mode waits for every such checkpoint, while
+  best-effort may coalesce them.
+- Under `OnStepDone`, interruption creates no artificial step event or checkpoint; only
+  step boundaries completed before the interruption participate.
 - Under `SnapshotManual`, no automatic snapshot fires — the policy is respected;
   `CheckpointWorkspace` remains available to the composition root.
-- Under `SnapshotOnTurnDone`, `TurnInterrupted` is a turn-terminal event and fires the
-  trigger like `TurnDone`/`TurnFailed`.
 
 The journal stays coherent with the workspace: `TurnInterrupted` events record which
-turns died, and the `interrupt`-stamped checkpoint records the tree they left behind.
+turns died; an idle-triggered interrupt checkpoint records the tree they collectively
+left behind.
 
 ## Tool-level optimistic concurrency (unconditional)
 
@@ -556,10 +651,11 @@ type fileObservation struct {
 }
 ```
 
-`pkg/tools.NewFileTools(root, readGuard)` creates one private observation set and
-injects it into that bundle's `ReadFile`, `WriteFile`, and `EditFile`. Rig loop
-instantiation creates a fresh bundle per loop. The `loop` package still receives an
-ordinary `ToolSet` and knows nothing about workspaces or file observations.
+`pkg/tools.NewFileTools(root string, guard loop.ReadGuard)` creates one private
+observation set and injects it into that bundle's `ReadFile`, `WriteFile`, and
+`EditFile`. Rig loop instantiation creates a fresh bundle per loop. The `loop` package
+still receives an ordinary `ToolSet` and knows nothing about workspaces or file
+observations.
 
 The lifetime follows the model history that could know the file contents:
 
@@ -583,22 +679,29 @@ operation is a direct lookup. Correctness never depends on Go map iteration orde
    nothing.
 3. A truncated read may record `{exists:true, complete:false}` for diagnostics but does
    not authorize a mutation.
-4. Before `WriteFile` or `EditFile` mutates a path, it takes the observation set's
-   per-path critical section, requires a usable observation, and hashes the current raw
-   bytes (or verifies continued absence).
-5. Missing, incomplete, existence-mismatched, or hash-mismatched observations fail with
-   typed `StaleFileError{Path}`. The tool removes the stale observation and returns only
-   a model-safe instruction to read the file again; hashes are never exposed.
-6. On a match, `WriteFile` performs its existing temp-file-plus-atomic-rename write.
+4. Before overwriting or editing an existing path, the tool takes the observation set's
+   per-path critical section, requires a complete present observation, and hashes the
+   current raw bytes.
+5. Missing, incomplete, existence-mismatched, or hash-mismatched observations on an
+   existing path fail with typed `StaleFileError{Path}`. The tool removes the stale
+   observation and returns only a model-safe instruction to read the file again; hashes
+   are never exposed.
+6. A `WriteFile` with no observation may create a path that is currently absent. It
+   prepares the complete sibling temporary file and publishes it with atomic
+   no-replace semantics. If the destination already exists or another writer wins the
+   race, creation fails typed and never clobbers that file. A prior not-found read may
+   still record absence but is not required for creation.
+7. On an overwrite match, `WriteFile` performs its existing
+   temp-file-plus-atomic-rename write.
    `EditFile` additionally requires its exact content anchor to match before performing
    the same atomic write.
-7. A successful mutation replaces the observation with the hash of the new complete
+8. A successful mutation replaces the observation with the hash of the new complete
    contents, which the loop now knows because it produced them. An ambiguous write
    failure invalidates the observation.
 
 An existing-file `WriteFile` therefore cannot overwrite content that this loop has not
-completely observed. Creating a new file is allowed only after the loop observed the
-path as absent and it remains absent at the mutation check.
+completely observed. New-file creation needs no failed `ReadFile` round trip, yet an
+unobserved existing file can never be overwritten.
 
 The per-path critical section makes read/check/write/record deterministic among the
 three file tools sharing one bundle. Existing runner `WriteTarget` serialization
@@ -609,21 +712,60 @@ stale reads and guarantees atomic file replacement, but does not claim transacti
 isolation from arbitrary external writers or cross-file semantic isolation. Those needs
 still route to workspace partitioning or fork/merge.
 
-## Tool-root resolution moves per session
+## Tool definitions bind per session loop
 
-The rig doc's invariant "the workspace root is canonical, non-empty, and compatible
-with the loop tool roots" assumed one static root known at `rig.Define`. Under
-`WithSessionWorkspaces` the root does not exist until `NewSession`, so:
+`loop.Define` cannot store already-running tool instances: workspace roots differ per
+session, file observations belong to one loop, and delegate control is parent-scoped.
+It stores immutable `tool.Definition` blueprints instead:
 
-- loop definitions declare tool roots **relative to the session workspace**;
-- `rig.Define` validates shape only (clean, relative, non-escaping);
-- the session resolves absolute roots when instantiating loops from definitions and
-  performs the containment check (`filepath.Clean`, stays-within-root) at construction;
-- `WithExclusiveWorkspace`/`WithSharedWorkspace` may keep validating absolute paths at
-  `Define`, since the root is static.
+```go
+builder := loop.Define(
+	loop.WithTools(
+		tools.Files(readGuard),
+		tools.Bash(),
+		tools.Subagent(),
+	),
+)
+```
 
-Without this, per-session mode would ship with every session's tools pointing at one
-directory and the isolation would be fiction.
+Conceptually, one definition may build a bundle of concrete tools that share private
+runtime state:
+
+```go
+type Definition interface {
+	Build(context.Context, Bindings) ([]InvokableTool, error)
+}
+
+type Bindings struct {
+	SessionID uuid.UUID
+	LoopID    uuid.UUID
+	Workspace *WorkspaceBinding // nil for a rig without workspace lifecycle
+}
+
+type WorkspaceBinding struct {
+	Root        string
+	Coordinator WorkspaceCoordinator
+}
+```
+
+At `NewSession`/`RestoreSession`, rig resolves the session workspace root and creates
+one session `WorkspaceCoordinator`. For every primer or delegate loop, it binds the
+loop's tool definitions with that loop's IDs and the session workspace binding.
+`tools.Files` then creates fresh `ReadFile`/`WriteFile`/`EditFile` instances sharing one
+new per-loop observation map; all loops share only the session coordinator. Subagent
+definitions receive the separate parent-scoped `DelegateController` capability and do
+not receive `SessionController`.
+
+Modes reuse the bound instances because modes share one loop and history; a mode only
+selects which prebound tool definitions are visible. A new delegate gets fresh tools.
+A restored or rehydrated loop also gets fresh ephemeral tool state and an empty file
+observation map. The loop runtime ultimately receives only the concrete `ToolSet`, so
+`pkg/loop` remains workspace-agnostic.
+
+Definitions declare required bindings. `rig.Define` rejects a workspace-requiring tool
+definition when no workspace placement exists. The resolved root is canonicalized and
+contained when the definition binds, which handles `WithSessionWorkspaces` roots that
+do not exist at rig-definition time without introducing a root-factory closure.
 
 ## Fingerprints
 
@@ -673,12 +815,13 @@ All typed, all unwrapping their cause where applicable, consistent with the rig 
 
 - placement errors: multiple placement options, unknown mode, non-canonical root/base,
   missing/nil `storage.Leaser` for `WithExclusiveWorkspace`, snapshot policy without a
-  placement, seed invalid for mode, seed ref unresolvable in the workspace store;
+  placement, discoverable persistence/workspace path overlap, seed invalid for mode,
+  seed ref unresolvable in the workspace store;
 - lease errors: `WorkspaceRootBusyError{Root, HolderEpoch}` wrapping
   `storage.LeaseHeldError`, and `WorkspaceRootLeaseLostError{Root, Epoch}` wrapping or
   classifying the corresponding `storage` lease-loss cause;
-- policy errors: `Required` with `OnTurnDone`/`OnStepDone`, `Required` with shared
-  mode, unknown trigger/priority, negative timeout;
+- policy errors: `Required` with shared mode, unknown trigger/priority, negative
+  timeout;
 - checkpoint errors: unchanged (timeout, snapshot/store failure, append fault,
   shutdown-cancellation classification), plus not-idle, best-effort activation
   cancellation, and fault-latch rejection under `Required`;
@@ -696,14 +839,19 @@ All typed, all unwrapping their cause where applicable, consistent with the rig 
   lease, then releases the session lease. Failure between acquisitions releases every
   acquired lease best-effort, using the rig doc's staged-construction discipline.
 - `WithSessionWorkspaces` and `WithSharedWorkspace` never call a root leaser.
-- Under `Required`, the admission gate is part of session state: queued input observes
-  the checkpoint commit or the latched fault, never a torn intermediate.
-- Under `BestEffort`, walk cancellation on the active edge is prompt (context
-  cancellation into the archive walk) and automatic retry arms on the next eligible
-  edge; a cancelled walk journals nothing.
-- The checkpoint controller serializes one active walk, one latest-wins pending
-  automatic trigger, and uncoalesced manual callers. No automatic trigger queue grows
-  with the number of turns or steps.
+- The session workspace coordinator orders managed mutation, native boundary event
+  persistence/emission, snapshotting, and checkpoint event persistence/emission.
+  Workspace persistence backends are outside this gate because they are outside the
+  workspace tree.
+- Under `Required`, idle/manual admission stays closed and step/turn actors withhold
+  their boundary acknowledgement. Required automatic boundaries serialize FIFO and do
+  not coalesce; a loop cannot enqueue a second boundary while its first is pending.
+- Under `BestEffort`, walk cancellation is prompt, automatic retry arms on the next
+  eligible edge, and one latest-wins pending trigger bounds pressure. A cancelled or
+  skipped walk journals no `WorkspaceCheckpointed` event.
+- A persisted trigger event is emitted before its checkpoint walk; a successful
+  snapshot blob is durable before `WorkspaceCheckpointed` is persisted and emitted.
+  Snapshot failure never rolls back or hides the trigger event.
 - The interrupt admission barrier orders all targeted loops idle, `SessionIdle`, and
   checkpoint-trigger acceptance before preserved user input can be dispatched.
 - `RestoreWorkspace` serializes with the checkpoint controller: never concurrent with a
@@ -724,7 +872,11 @@ All table-driven, all under `-race`, extending the rig doc's matrix:
   configured; one selects that mode; many fail; snapshot policy or seed without
   placement fails typed;
   no-workspace sessions construct without root resolution, root lease acquisition, or
-  checkpoint watcher, and their workspace methods return `WorkspaceUnavailableError`;
+  checkpoint controller, and their workspace methods return
+  `WorkspaceUnavailableError`;
+- discoverable filesystem journal/catalog/blob directories equal to or below the
+  workspace root fail typed; ancestor and disjoint directories are accepted when their
+  actual persistence files remain outside the workspace tree;
 - `WithExclusiveWorkspace`: missing/nil leaser fails at `Define`; a second session —
   including one created by another rig instance using the same backend — fails typed
   while the first is live; it succeeds after clean shutdown; lexical and symlink
@@ -745,15 +897,17 @@ All table-driven, all under `-race`, extending the rig doc's matrix:
   fixed root and for shared mode; unresolvable seed ref fails before durable session
   state;
 - trigger ladder: `Unset` resolves to `OnIdle`, explicit `Manual` remains distinct,
-  each trigger schedules on its edge and no other; one in-flight plus one latest
-  pending automatic trigger bounds pressure; coalesced edges append nothing; manual
-  calls serialize without coalescing; `OnStepDone` work does not serialize unrelated
-  sessions;
+  each trigger schedules on its edge and no other; best-effort permits one in-flight
+  plus one latest pending trigger and coalesced edges append nothing; required
+  step/turn boundaries serialize FIFO without coalescing and block only their own
+  session; manual calls serialize without coalescing;
 - priority: `BestEffort` cancels an exclusive/per-session walk on activation and
   retries automatic work at the next eligible edge; manual receives a retryable error;
-  shared mode finishes and stamps `fuzzy`; `Required`×trigger validity is enforced,
-  required manual closes admission while idle, timeout/error latches the fault, and
-  shutdown cancellation is classified as neither error nor fault.
+  shared mode finishes and stamps `fuzzy`; `Required` is valid for all four triggers in
+  exclusive/per-session modes and rejected in shared mode; required step/turn blocks
+  boundary acknowledgement, required manual/idle closes admission, timeout/error leaves
+  the trigger event durable and latches the fault, and shutdown cancellation is
+  classified as neither error nor fault.
 
 ### `pkg/event` / `pkg/sessionstore`
 
@@ -777,7 +931,8 @@ All table-driven, all under `-race`, extending the rig doc's matrix:
   usable; truncated, denied, escaping, symlink, and ambiguous failed reads do not
   authorize mutation; definitive not-found records absence;
 - existing-file write without that loop's complete observation fails typed; creation
-  without a prior absence observation fails typed;
+  without an observation succeeds only for a currently absent path via atomic
+  no-replace publication, while an existing path or concurrent winner fails typed;
 - write/edit after external modification fails typed and invalidates the observation;
   re-read records the new state and permits a new decision;
 - successful write/edit updates the observation to the new hash, so a subsequent
@@ -791,6 +946,17 @@ All table-driven, all under `-race`, extending the rig doc's matrix:
 
 ### `pkg/session`
 
+- a loop never has two active steps; parallel tool calls and multiple loops exercise
+  one session workspace coordinator under `-race`;
+- native step/turn/idle boundaries order durable trigger append, trigger emission,
+  snapshot blob durability, durable `WorkspaceCheckpointed` append, checkpoint
+  emission, then gate release;
+- structured mutators hold shared workspace-mutation permits, Bash/unknown-path
+  mutators hold the whole-workspace permit, and snapshot/restore excludes both; a
+  waiting required checkpoint prevents new managed mutations;
+- snapshot failure leaves the already-persisted and emitted trigger event intact;
+  best-effort releases progress without a checkpoint event, while required faults
+  before acknowledging the boundary;
 - `RestoreWorkspace` requires idle, appends `WorkspaceRestored`, serializes against
   the checkpoint controller;
 - `Session.Interrupt` reaches every live loop concurrently, including a delegate whose
@@ -803,8 +969,9 @@ All table-driven, all under `-race`, extending the rig doc's matrix:
   typed interrupted results and their queued turns never start; preserved user input
   remains held until every target is idle and `SessionIdle` is appended;
 - interrupt barrier release occurs after required checkpoint commit, after best-effort
-  trigger acceptance, after the idle event for manual policy, and immediately after the
-  idle event when no workspace exists;
+  idle-trigger acceptance, after `SessionIdle` for best-effort turn/step triggers, after
+  the idle event for manual policy, and immediately after the idle event when no
+  workspace exists;
 - Subagent `interrupt` remains turn-only and leaves the child's queue untouched;
 - interrupt of a fully idle session returns false and journals nothing; and
 - the post-interrupt idle edge produces a checkpoint stamped `Trigger: interrupt`
@@ -817,15 +984,22 @@ Extend the rig doc's filesystem-backend test: seed two per-session roots from on
 run divergent work in both, checkpoint both, restore both on an empty base directory,
 and verify disjoint trees each matching their own journal. A second scenario drives
 `WithExclusiveWorkspace` exclusion across two rig instances, clean release, and lease
-loss end to end.
+loss end to end. A third places filesystem session persistence and snapshot blobs in a
+disjoint sibling directory, verifies they are absent from the workspace archive, and
+proves overlapping persistence/workspace roots are rejected.
 
 ## Documentation consolidation
 
-This amendment is authoritative while design work continues, but implementation must
-not require readers to reconcile two overlapping specifications. Before writing the
-implementation plan, fold its accepted API, invariants, errors, ordering, and tests into
-`2026-07-10-rig-lifecycle-workspace-snapshots-design.md`. Then mark this file as folded
-into that consolidated design and retain it only as decision history.
+The accepted API, invariants, errors, ordering, and tests in this amendment are folded
+into `2026-07-10-rig-lifecycle-workspace-snapshots-design.md`; that consolidated file is
+the implementation authority. This file remains only as the decision trail that led to
+the consolidated result.
+
+The pasted review that prompted the final fold ended with the incomplete fragment
+“The tes…”, and no continuation exists in the repository or conversation record
+available to the spec. The fragment is therefore not treated as a hidden normative
+requirement. Every complete review item was incorporated, and the consolidated testing
+matrix was independently checked against the accepted behavior.
 
 ## Consumer documentation and migration order
 
@@ -869,10 +1043,13 @@ verified root swap, and the catalog distinguishes the newest backup from the eff
 workspace ref so deliberate rewinds survive restart. Seeding is a journaled first
 workspace checkpoint, which makes knowledgebase-seeded cloud sessions and fork/merge
 concurrency fall out of existing restore and GC machinery. Snapshot scheduling is a
-bounded ladder over journal edges with one priority knob deciding who yields; it cannot
-grow an unbounded step queue, eliminates harness-managed torn snapshots under
-`Required`, and labels other captures honestly as `quiescent` or `fuzzy`. Interrupt
-barriers preserve user intent without skipping the idle boundary. The journal now
-answers why a checkpoint fired, what it covers, which ref is effective, and whether
-harness-managed mutation overlapped it — and the patterns Claude Code, Codex, and the
-cloud agents ship implicitly become declared, enforceable configuration.
+native ladder at actor boundaries with one priority knob deciding who yields. A
+session-scoped workspace gate surrounds trigger persistence/emission, blob durability,
+and checkpoint persistence/emission; required step/turn boundaries serialize without
+coalescing, while best-effort pressure stays latest-wins and bounded. Harness-managed
+torn snapshots disappear, persistence remains outside the captured tree, and refs are
+honestly labeled `quiescent` or `fuzzy`. Interrupt barriers preserve user intent without
+skipping the idle boundary. The journal now answers why a checkpoint fired, what it
+covers, which ref is effective, and whether harness-managed mutation overlapped it —
+and the patterns Claude Code, Codex, and the cloud agents ship implicitly become
+declared, enforceable configuration.
