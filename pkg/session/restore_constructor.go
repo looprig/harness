@@ -140,6 +140,16 @@ func restoreSession(
 		return nil, &RestoreError{Kind: RestoreContextDone, Cause: ctx.Err()}
 	default:
 	}
+	// Allocate the one restored-session lifetime up front. Until successful transfer
+	// into Session, every exit below owns cancellation (lease/replay/bind/check/append/
+	// build failures included). Bind and the live Session receive this exact context.
+	sessionCtx, sessionCancel := context.WithCancel(ctx)
+	contextTransferred := false
+	defer func() {
+		if !contextTransferred {
+			sessionCancel()
+		}
+	}()
 
 	// Resolve restore-time options (the allow-mismatch flag) on a probe session so the
 	// fingerprint decision can read it BEFORE the real session is built. The same opts
@@ -224,7 +234,7 @@ func restoreSession(
 		return recordErrored(err)
 	}
 	primaryLoopID := rootLoop.LoopID
-	bound, err := cfg.Bind(ctx, tool.Bindings{SessionID: sessionID, LoopID: primaryLoopID})
+	bound, err := cfg.Bind(sessionCtx, tool.Bindings{SessionID: sessionID, LoopID: primaryLoopID})
 	if err != nil {
 		return recordErrored(&RestoreError{Kind: RestoreLoopFailed, Cause: err})
 	}
@@ -336,10 +346,11 @@ func restoreSession(
 	// stamped it on LoopStarted; late-bound adapters record it with ForeignSessionBound.
 	// buildRestoredSession fails closed on an empty sid for a foreign engine.
 	foreignSID := findForeignSID(primaryEvents)
-	s, err := buildRestoredSession(ctx, bound, sessionID, primaryLoopID, foreignSID, spawnedCount, ceilingLevel, hasCeiling, folded, restoredGates.open, j, factory, newID, now, leaseOpts...)
+	s, err := buildRestoredSession(sessionCtx, sessionCancel, bound, sessionID, primaryLoopID, foreignSID, spawnedCount, ceilingLevel, hasCeiling, folded, restoredGates.open, j, factory, newID, now, leaseOpts...)
 	if err != nil {
 		return recordErrored(err)
 	}
+	contextTransferred = true
 	return s, nil
 }
 
@@ -350,7 +361,8 @@ func restoreSession(
 // publishes NO SessionStarted and spawns NO empty loop — both are the deliberate
 // difference from New.
 func buildRestoredSession(
-	ctx context.Context,
+	sessionCtx context.Context,
+	sessionCancel context.CancelFunc,
 	cfg loop.BoundDefinition,
 	sessionID, primaryLoopID uuid.UUID,
 	foreignSID string,
@@ -365,10 +377,8 @@ func buildRestoredSession(
 	now event.Clock,
 	opts ...Option,
 ) (*Session, error) {
-	sessionCtx, sessionCancel := context.WithCancel(ctx)
 	gateAppender, err := journal.NewJournalGateAppenderChecked(j)
 	if err != nil {
-		sessionCancel()
 		return nil, &RestoreError{Kind: RestoreJournalFailed, Cause: err}
 	}
 	s := &Session{
@@ -417,7 +427,6 @@ func buildRestoredSession(
 	// hub-synthesized session event is stamped from the same seam.
 	appender, err := journal.NewJournalEventAppenderChecked(j)
 	if err != nil {
-		sessionCancel()
 		return nil, &RestoreError{Kind: RestoreJournalFailed, Cause: err}
 	}
 	s.hub = hub.New(sessionID, hub.WithAppender(appender), hub.WithFactory(factory), hub.WithFaultReporter(s))
@@ -440,12 +449,10 @@ func buildRestoredSession(
 	default:
 		if foreignSID == "" {
 			cancel()
-			sessionCancel()
 			return nil, &RestoreError{Kind: RestoreForeignSIDMissing}
 		}
 		if s.foreignBuildRestored == nil {
 			cancel()
-			sessionCancel()
 			return nil, &RestoreError{Kind: RestoreForeignBuilderMissing}
 		}
 		l, err = s.foreignBuildRestored(loopCtx, sessionID, primaryLoopID, loop.Provenance{}, s, cfg,
@@ -454,7 +461,6 @@ func buildRestoredSession(
 	}
 	if err != nil {
 		cancel()
-		sessionCancel()
 		return nil, &RestoreError{Kind: RestoreLoopFailed, Cause: err}
 	}
 	s.loops[primaryLoopID] = &loopHandle{backend: l, parent: loop.Provenance{}, cancel: cancel}

@@ -27,7 +27,15 @@ func (boundTestClient) Stream(context.Context, inference.Request) (*inference.St
 // validCfg is the minimal loop.BoundDefinition a foreign loop accepts: a non-empty system
 // prompt (the only field foreignloop.New validates).
 func validCfg() loop.BoundDefinition {
-	d, err := loop.Define(loop.WithName("agent"), loop.WithInference(boundTestClient{}, inference.Model{Provider: "lmstudio", APIFormat: inference.APIFormatOpenAI, BaseURL: "http://localhost:1234", Name: "m"}), loop.WithSystem("you are a test agent"))
+	return promptCfg("you are a test agent", "")
+}
+
+func promptCfg(system, instructions string) loop.BoundDefinition {
+	opts := []loop.Option{loop.WithName("agent"), loop.WithInference(boundTestClient{}, inference.Model{Provider: "lmstudio", APIFormat: inference.APIFormatOpenAI, BaseURL: "http://localhost:1234", Name: "m"}), loop.WithSystem(system)}
+	if instructions != "" {
+		opts = append(opts, loop.WithModes(loop.Mode{Name: "mode", Instructions: instructions}), loop.WithInitialMode("mode"))
+	}
+	d, err := loop.Define(opts...)
 	if err != nil {
 		panic(err)
 	}
@@ -116,6 +124,13 @@ func TestNewValidation(t *testing.T) {
 			}
 			shutdown(t, l)
 		})
+	}
+}
+
+func TestValidateWiringAcceptsInstructionsOnlyPrompt(t *testing.T) {
+	t.Parallel()
+	if err := validateWiring(promptCfg("", "mode instructions"), Spec{Agent: &fakeAgent{}}, seqIDGen(), workingFac(), &fakePublisher{}); err != nil {
+		t.Fatalf("validateWiring instructions-only: %v", err)
 	}
 }
 

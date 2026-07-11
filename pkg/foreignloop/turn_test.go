@@ -14,6 +14,7 @@ import (
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/command"
 	"github.com/looprig/harness/pkg/event"
+	"github.com/looprig/harness/pkg/loop"
 )
 
 // eventKind names a foreign event for an ordered-sequence assertion.
@@ -93,6 +94,23 @@ func newDrivenLoop(t *testing.T, agent *fakeAgent) (*Loop, *fakePublisher) {
 	pub := &fakePublisher{}
 	l, _ := newTestLoop(t, Spec{Agent: agent}, pub)
 	return l, pub
+}
+
+func TestForeignTurnUsesEffectiveSystemPrompt(t *testing.T) {
+	agent := &fakeAgent{events: []ForeignEvent{{Kind: ForeignInit, SessionID: "sid"}, {Kind: ForeignStepComplete, Message: aiMessage("ok")}, {Kind: ForeignTerminalOK}}}
+	pub := &fakePublisher{}
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	l, _, err := New(ctx, mustID(t), mustID(t), loop.Provenance{}, pub, promptCfg("base", "mode instructions"), Spec{Agent: agent, Cwd: t.TempDir(), SIDMode: SIDPrebound}, seqIDGen(), workingFac())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	submitUserInput(t, l, "hello")
+	waitTurnIndex(t, l, 1)
+	if got := agent.lastForeignTurn().SystemPrompt; got != "base\n\nmode instructions" {
+		t.Fatalf("SystemPrompt = %q", got)
+	}
+	shutdown(t, l)
 }
 
 // waitTurnIndex polls Snapshot until the committed turnIndex reaches want, which

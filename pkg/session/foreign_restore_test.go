@@ -69,8 +69,10 @@ func TestCodexForeignRestoreRecoversSIDFromForeignSessionBound(t *testing.T) {
 	primaryLoopID := mustUUID()
 	c := bindCfg(engineCfg(&stubLLM{chunks: []content.Chunk{textChunk("x")}}, loop.EngineForeignCodex, "be helpful"), sessionID, primaryLoopID)
 	fac := event.NewFactory(uuid.New, time.Now)
+	restoreCtx, restoreCancel := context.WithCancel(context.Background())
+	t.Cleanup(restoreCancel)
 
-	s, err := buildRestoredSession(context.Background(), c, sessionID, primaryLoopID,
+	s, err := buildRestoredSession(restoreCtx, restoreCancel, c, sessionID, primaryLoopID,
 		foreignSID, 0, 0, false, folded, nil, fakeSessionJournal{}, fac, uuid.New, time.Now,
 		WithForeignBuilder(builder.build, builder.buildRestored))
 	if err != nil {
@@ -123,8 +125,10 @@ func TestCodexForeignRestoreFailsClosedWithoutSIDSource(t *testing.T) {
 	sessionID := mustUUID()
 	primaryLoopID := mustUUID()
 	c := bindCfg(engineCfg(&stubLLM{chunks: []content.Chunk{textChunk("x")}}, loop.EngineForeignCodex, "be helpful"), sessionID, primaryLoopID)
+	restoreCtx, restoreCancel := context.WithCancel(context.Background())
+	t.Cleanup(restoreCancel)
 
-	s, err := buildRestoredSession(context.Background(), c, sessionID, primaryLoopID,
+	s, err := buildRestoredSession(restoreCtx, restoreCancel, c, sessionID, primaryLoopID,
 		foreignSID, 0, 0, false, folded, nil, fakeSessionJournal{}, event.NewFactory(uuid.New, time.Now), uuid.New, time.Now,
 		WithForeignBuilder(builder.build, builder.buildRestored))
 	if s != nil {
@@ -227,13 +231,15 @@ func TestForeignRestore(t *testing.T) {
 			primaryLoopID := mustUUID()
 			c := bindCfg(engineCfg(&stubLLM{chunks: []content.Chunk{textChunk("x")}}, tt.engine, "be helpful"), sessionID, primaryLoopID)
 			fac := event.NewFactory(uuid.New, time.Now)
+			restoreCtx, restoreCancel := context.WithCancel(context.Background())
+			t.Cleanup(restoreCancel)
 
 			var opts []Option
 			if tt.wireBuilder {
 				opts = append(opts, WithForeignBuilder(builder.build, builder.buildRestored))
 			}
 
-			s, err := buildRestoredSession(context.Background(), c, sessionID, primaryLoopID,
+			s, err := buildRestoredSession(restoreCtx, restoreCancel, c, sessionID, primaryLoopID,
 				tt.foreignSID, 0, 0, false, folded, nil, fakeSessionJournal{}, fac, uuid.New, time.Now, opts...)
 
 			if tt.wantErr {
