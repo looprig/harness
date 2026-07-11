@@ -27,6 +27,65 @@ func TestDefineRequiresSessionStore(t *testing.T) {
 	}
 }
 
+// TestWithLoopsAndPrimersAccumulateAcrossCalls proves the non-singleton options append
+// rather than replace: two separate WithLoops calls (and two separate WithPrimers calls)
+// leave the definition seeing every loop/primer from BOTH calls, in call order. A
+// replacing (last-write-wins) implementation would drop the first call's contribution and
+// silently narrow the topology.
+func TestWithLoopsAndPrimersAccumulateAcrossCalls(t *testing.T) {
+	t.Parallel()
+	defineLoop := func(name string) loop.Definition {
+		d, err := loop.Define(loop.WithName(identity.AgentName(name)), loop.WithInference(&stubLLM{}, validModel(name)))
+		if err != nil {
+			t.Fatalf("loop.Define(%q): %v", name, err)
+		}
+		return d
+	}
+	planner, builder := defineLoop("planner"), defineLoop("builder")
+
+	state := &definitionState{seen: make(map[singletonKey]bool)}
+	for _, opt := range []Option{
+		WithLoops(planner),
+		WithLoops(builder),
+		WithPrimers("planner"),
+		WithPrimers("builder"),
+	} {
+		if err := opt(state); err != nil {
+			t.Fatalf("option: %v", err)
+		}
+	}
+
+	if len(state.loops) != 2 {
+		t.Fatalf("loops len = %d, want 2 (both WithLoops calls accumulate)", len(state.loops))
+	}
+	if state.loops[0].Name() != "planner" || state.loops[1].Name() != "builder" {
+		t.Fatalf("loops = %q,%q, want planner,builder in call order", state.loops[0].Name(), state.loops[1].Name())
+	}
+	if len(state.primers) != 2 {
+		t.Fatalf("primers len = %d, want 2 (both WithPrimers calls accumulate)", len(state.primers))
+	}
+	if state.primers[0] != "planner" || state.primers[1] != "builder" {
+		t.Fatalf("primers = %v, want [planner builder] in call order", state.primers)
+	}
+
+	// End-to-end: the accumulated loops + primers validate as a real topology, so split
+	// calls are indistinguishable from a single call listing all of them.
+	store, err := sessionstore.Open(memstore.New())
+	if err != nil {
+		t.Fatalf("sessionstore.Open: %v", err)
+	}
+	if _, err := Define(
+		WithLoops(planner),
+		WithLoops(builder),
+		WithPrimers("planner"),
+		WithPrimers("builder"),
+		WithActivePrimer("planner"),
+		WithSessionStore(store),
+	); err != nil {
+		t.Fatalf("Define with split WithLoops/WithPrimers calls: %v", err)
+	}
+}
+
 func TestRigNewShutdownRestore(t *testing.T) {
 	t.Parallel()
 	definition, err := loop.Define(loop.WithName("agent"), loop.WithInference(&stubLLM{}, validModel("model")))

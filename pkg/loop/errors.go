@@ -44,6 +44,22 @@ func (e *IDGenerationError) Error() string {
 }
 func (e *IDGenerationError) Unwrap() error { return e.Cause }
 
+// PolicyRevisionMarshalError is the programmer-error panic value PolicyRevision raises if
+// the fully-owned, total projection it builds cannot be JSON-marshaled. The projection is
+// composed only of marshalable types, so a failure is a code defect (an unmarshalable field
+// was introduced), never a runtime or input condition. PolicyRevision panics with it rather
+// than returning a nil-collapsed digest, because a silent sha256(nil) would defeat the
+// restore config-mismatch drift detection that consumes the digest.
+type PolicyRevisionMarshalError struct{ Cause error }
+
+func (e *PolicyRevisionMarshalError) Error() string {
+	if e.Cause == nil {
+		return "loop: policy-revision projection failed to marshal"
+	}
+	return "loop: policy-revision projection failed to marshal: " + e.Cause.Error()
+}
+func (e *PolicyRevisionMarshalError) Unwrap() error { return e.Cause }
+
 // CommitCancelReason distinguishes why a per-step commit handshake did not reach
 // the actor's commit point.
 type CommitCancelReason string

@@ -123,3 +123,92 @@ func TestRestoreSessionFailSecureExits(t *testing.T) {
 		})
 	}
 }
+
+// TestRestoreCrashSeamAppendFailSecure drives the restore-lifecycle append path to FAIL at
+// the crash-seam TurnInterrupted append and (separately) at the final RestoreDone append,
+// through the SAME injectable id-gen seam the other fail-secure exits use. On a stream
+// ending mid-turn the restore-lifecycle mints are, in order: 1=RestoreStarted,
+// 2=TurnInterrupted (crash seam), 3=RestoreDone. Failing the mint that stamps the
+// TurnInterrupted (the crash seam) or the RestoreDone routes appendRestoreEvent's failure
+// through the single fail-secure recordErrored exit. The documented contract must hold for
+// BOTH: no controller comes up, no RestoreDone is persisted, a best-effort RestoreErrored
+// is recorded, the derived session context is torn down (cleanup), and the single-writer
+// lease is released so a successor can re-acquire. This closes the append-failure gap the
+// clean-stream TestRestoreSessionFailSecureExits does not exercise: the crash seam, and a
+// RestoreDone failure AFTER the live session was already built.
+func TestRestoreCrashSeamAppendFailSecure(t *testing.T) {
+	tests := []struct {
+		name string
+		// failOnCall is the 1-based restore-lifecycle mint that fails. On a CRASHED stream
+		// (exactly one open turn) the mints are 1=RestoreStarted, 2=TurnInterrupted (crash
+		// seam), 3=RestoreDone; recordErrored's own RestoreErrored mint is the next call and
+		// succeeds, so the failure is always durably recorded.
+		failOnCall int
+	}{
+		{name: "TurnInterrupted append fails at the crash seam", failOnCall: 2},
+		{name: "RestoreDone append fails after the session is built", failOnCall: 3},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			store := newRestoreStore(t)
+			fp := fingerprintFromDefinition(restoreCfg(&stubLLM{}, "model-x", "be helpful"))
+
+			// A crashed original run: ends on an OPEN turn, so restore must close it with a
+			// crash-seam TurnInterrupted before it can append RestoreDone.
+			orig := buildCrashedRun(t, store, fp)
+			handOver(t, orig.lease)
+
+			seam := &failingNewID{failOnCall: tt.failOnCall}
+			s, err := restoreSession(
+				context.Background(),
+				restoreCfg(&stubLLM{chunks: []content.Chunk{textChunk("recovered")}}, "model-x", "be helpful"),
+				orig.sessionID, store,
+				seam.next, fixedClock,
+				WithFingerprintProvider(testFingerprintProvider),
+			)
+
+			// (a) No controller comes up.
+			if s != nil {
+				t.Fatalf("restoreSession returned a non-nil Session on a forced append failure")
+			}
+			// (b) A typed *RestoreError classifying the append failure, chaining the mint cause.
+			var re *RestoreError
+			if !errors.As(err, &re) {
+				t.Fatalf("restoreSession err = %v, want *RestoreError", err)
+			}
+			if re.Kind != RestoreAppendFailed {
+				t.Errorf("RestoreError.Kind = %q, want %q", re.Kind, RestoreAppendFailed)
+			}
+			if !errors.Is(err, errMintFailed) {
+				t.Errorf("err does not chain the injected append failure: %v", err)
+			}
+
+			// (c) A best-effort RestoreErrored is recorded, and NO RestoreDone was persisted.
+			tail := restoreEventTail(t, store, orig.sessionID, orig.primaryLoopID)
+			if !lastIs(tail, event.RestoreErrored{}) {
+				t.Errorf("restore-event tail does not end with RestoreErrored: %v", tailTypes(tail))
+			}
+			for _, ev := range tail {
+				if _, ok := ev.(event.RestoreDone); ok {
+					t.Errorf("a RestoreDone was persisted on a failed restore: %v", tailTypes(tail))
+				}
+			}
+
+			// (d) The lease was released (cleanup + fail-secure): a successor can re-acquire
+			// it through the store without waiting out the TTL.
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			successorLease, acqErr := store.AcquireLease(ctx, orig.sessionID)
+			if acqErr != nil {
+				t.Fatalf("successor Acquire after failed restore = %v, want success (lease should have been released)", acqErr)
+			}
+			t.Cleanup(func() {
+				rctx, rcancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer rcancel()
+				_ = successorLease.Release(rctx)
+			})
+		})
+	}
+}

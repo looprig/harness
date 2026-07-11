@@ -926,13 +926,9 @@ func newSessionTopology(ctx context.Context, topology Topology, newID idGenerato
 	// compared-against fingerprints cannot drift.
 	// The rig fingerprint provider returns the same topology projection for every
 	// primer; calling it with the active primer keeps the compatibility contract.
+	// orderedPrimers placed topology.ActivePrimer first (unconditionally) and prepared was
+	// built in that order, so prepared[0] is always the active primer — no rescan needed.
 	activePrepared := prepared[0]
-	for _, candidate := range prepared {
-		if candidate.name == topology.ActivePrimer {
-			activePrepared = candidate
-			break
-		}
-	}
 	if err := s.hub.PublishEvent(sessionCtx, event.SessionStarted{Header: startedHeader, Config: s.projectFingerprint(activePrepared.loop.bound)}); err != nil {
 		sessionCancel()
 		return nil, &SessionError{Kind: SessionContextDone, Cause: err}

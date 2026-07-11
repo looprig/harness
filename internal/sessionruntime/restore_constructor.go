@@ -201,82 +201,18 @@ func restoreTopologySession(
 	if err != nil {
 		return recordErrored(err)
 	}
-	type loopPlan struct {
-		started event.LoopStarted
-		bound   loop.BoundDefinition
-		events  []event.Event
-		folded  foldResult
+	// (4a) Discover every durable root (zero-Cause LoopStarted) and the ordered starts, and
+	// validate that every configured primer maps to a root (single-primer recovery honored
+	// under allowMismatch). (4b) Bind + independently fold every durable loop into a plan
+	// and pick the active primer's plan. Both fail closed through recordErrored.
+	roots, starts, err := discoverRoots(all, topology, allowMismatch)
+	if err != nil {
+		return recordErrored(err)
 	}
-	roots := make(map[identity.AgentName]event.LoopStarted)
-	starts := make([]event.LoopStarted, 0)
-	for _, ev := range all {
-		if started, ok := ev.(event.LoopStarted); ok {
-			starts = append(starts, started)
-			if started.Cause.Coordinates == (identity.Coordinates{}) {
-				if _, duplicate := roots[started.AgentName]; !duplicate {
-					roots[started.AgentName] = started
-				}
-			}
-		}
+	plans, activePlan, err := planLoops(sessionCtx, sessionID, topology, activeDefinition, roots, starts, allRecords, allowMismatch)
+	if err != nil {
+		return recordErrored(err)
 	}
-	if len(topology.Primers) == 1 {
-		for _, started := range starts {
-			if started.Cause.Coordinates == (identity.Coordinates{}) {
-				roots[topology.Primers[0]] = started
-				break
-			}
-		}
-	}
-	if len(starts) == 0 {
-		return recordErrored(&RestoreDiscoveryError{Kind: RestoreNoPrimaryLoop})
-	}
-	for _, primer := range topology.Primers {
-		if _, ok := roots[primer]; !ok {
-			if allowMismatch && len(topology.Primers) == 1 {
-				for _, started := range starts {
-					if started.Cause.Coordinates == (identity.Coordinates{}) {
-						roots[primer] = started
-						break
-					}
-				}
-				if _, recovered := roots[primer]; recovered {
-					continue
-				}
-			}
-			return recordErrored(&RestoreError{Kind: RestoreLoopFailed, Cause: &AgentNameMismatchError{Persisted: "", Configured: primer}})
-		}
-	}
-	plans := make([]loopPlan, 0, len(starts))
-	activeIndex := -1
-	for _, started := range starts {
-		definition, ok := topology.definition(started.AgentName)
-		isConfiguredRoot := started.LoopID == roots[topology.ActivePrimer].LoopID
-		if !ok && isConfiguredRoot && len(topology.Definitions) == 1 {
-			definition, ok = activeDefinition, true
-		}
-		if !ok && !isConfiguredRoot && len(topology.Definitions) == 1 {
-			continue
-		}
-		if !ok {
-			return recordErrored(&RestoreError{Kind: RestoreLoopFailed, Cause: &AgentNameMismatchError{Persisted: started.AgentName}})
-		}
-		bound, bindErr := definition.Bind(sessionCtx, tool.Bindings{SessionID: sessionID, LoopID: started.LoopID})
-		if bindErr != nil {
-			return recordErrored(&RestoreError{Kind: RestoreLoopFailed, Cause: bindErr})
-		}
-		if nameErr := checkAgentName(started.AgentName, bound.Name(), allowMismatch); nameErr != nil {
-			return recordErrored(nameErr)
-		}
-		loopEvents := eventsFromRecords(allRecords, started.LoopID)
-		plans = append(plans, loopPlan{started: started, bound: bound, events: loopEvents, folded: foldPrimaryLoop(loopEvents)})
-		if started.LoopID == roots[topology.ActivePrimer].LoopID {
-			activeIndex = len(plans) - 1
-		}
-	}
-	if activeIndex < 0 {
-		return recordErrored(&RestoreError{Kind: RestoreLoopFailed, Cause: &SessionError{Kind: SessionLoopNotFound}})
-	}
-	activePlan := plans[activeIndex]
 	if err := checkFingerprint(persisted, probe.projectFingerprint(activePlan.bound), allowMismatch); err != nil {
 		return recordErrored(err)
 	}
@@ -378,35 +314,13 @@ func restoreTopologySession(
 	if err != nil {
 		return recordErrored(err)
 	}
-	for _, plan := range plans {
-		if plan.started.LoopID == primaryLoopID {
-			continue
-		}
-		parent := loop.Provenance{LoopID: plan.started.Cause.Coordinates.LoopID, TurnID: plan.started.Cause.Coordinates.TurnID, StepID: plan.started.Cause.Coordinates.StepID}
-		if err := s.attachRestoredLoop(plan.started, parent, plan.bound, plan.folded, findForeignSID(plan.events)); err != nil {
-			sessionCancel()
-			return recordErrored(err)
-		}
-	}
-	activeID := primaryLoopID
-	for _, ev := range all {
-		if changed, ok := ev.(event.ActiveLoopChanged); ok {
-			activeID = changed.ActiveLoopID
-		}
-	}
-	if _, ok := s.Loop(activeID); !ok {
+	// (7) Post-build wiring: register every non-primary restored loop, resolve + validate the
+	// durable active selection, and set it as the session primary. Any failure cancels the
+	// session context (tearing down the seeded loops) before recording a RestoreErrored.
+	if err := attachAndActivate(s, all, plans, primaryLoopID); err != nil {
 		sessionCancel()
-		return recordErrored(&RestoreError{Kind: RestoreLoopFailed, Cause: &SessionError{Kind: SessionLoopNotFound}})
+		return recordErrored(err)
 	}
-	s.loopsMu.Lock()
-	s.primaryLoopID = activeID
-	if s.faulted {
-		fault := s.faultErr
-		s.loopsMu.Unlock()
-		sessionCancel()
-		return recordErrored(&RestoreError{Kind: RestoreAppendFailed, Cause: fault})
-	}
-	s.loopsMu.Unlock()
 	// RestoreDone is the commit point: every loop is bound, crash-closed, built,
 	// attached, and the active selection has been validated before this append.
 	if err := appendRestoreEvent(ctx, j, factory, event.RestoreDone{
@@ -417,6 +331,148 @@ func restoreTopologySession(
 	}
 	contextTransferred = true
 	return s, nil
+}
+
+// loopPlan is a single durable loop staged for restore: its root LoopStarted, its bound
+// definition, its loop-scoped events, and the fold of those events (committed msgs +
+// turnIndex + open-turn flag). planLoops builds one per durable loop; the restore
+// constructor crash-closes, seeds, and attaches from these.
+type loopPlan struct {
+	started event.LoopStarted
+	bound   loop.BoundDefinition
+	events  []event.Event
+	folded  foldResult
+}
+
+// discoverRoots scans the full UNNARROWED replay for every LoopStarted, collecting the
+// ordered `starts` and the root (zero-Cause) LoopStarted per AgentName. For a single-primer
+// topology it maps the sole configured primer onto the first root (name-agnostic
+// compatibility), and — under WithAllowConfigMismatch — recovers a single primer whose name
+// does not match the persisted root. It fails closed if the stream carries no loop
+// (RestoreNoPrimaryLoop) or a configured primer has no matching root in a topology that
+// cannot be recovered, returning a typed error the caller records as a RestoreErrored.
+func discoverRoots(all []event.Event, topology Topology, allowMismatch bool) (map[identity.AgentName]event.LoopStarted, []event.LoopStarted, error) {
+	roots := make(map[identity.AgentName]event.LoopStarted)
+	starts := make([]event.LoopStarted, 0)
+	for _, ev := range all {
+		if started, ok := ev.(event.LoopStarted); ok {
+			starts = append(starts, started)
+			if started.Cause.Coordinates == (identity.Coordinates{}) {
+				if _, duplicate := roots[started.AgentName]; !duplicate {
+					roots[started.AgentName] = started
+				}
+			}
+		}
+	}
+	if len(topology.Primers) == 1 {
+		for _, started := range starts {
+			if started.Cause.Coordinates == (identity.Coordinates{}) {
+				roots[topology.Primers[0]] = started
+				break
+			}
+		}
+	}
+	if len(starts) == 0 {
+		return nil, nil, &RestoreDiscoveryError{Kind: RestoreNoPrimaryLoop}
+	}
+	for _, primer := range topology.Primers {
+		if _, ok := roots[primer]; !ok {
+			if allowMismatch && len(topology.Primers) == 1 {
+				for _, started := range starts {
+					if started.Cause.Coordinates == (identity.Coordinates{}) {
+						roots[primer] = started
+						break
+					}
+				}
+				if _, recovered := roots[primer]; recovered {
+					continue
+				}
+			}
+			return nil, nil, &RestoreError{Kind: RestoreLoopFailed, Cause: &AgentNameMismatchError{Persisted: "", Configured: primer}}
+		}
+	}
+	return roots, starts, nil
+}
+
+// planLoops binds and independently folds every durable loop into a loopPlan (in stream
+// order) and identifies the active primer's plan. For a single-definition topology it maps
+// the configured root onto the sole definition and skips non-root loops whose AgentName is
+// unknown (subagents of a single-definition run). It is the single Bind of each loop,
+// performed inside the restore lease. It returns the ordered plans and the active plan, or a
+// typed error the caller records as a RestoreErrored.
+func planLoops(sessionCtx context.Context, sessionID uuid.UUID, topology Topology, activeDefinition loop.Definition, roots map[identity.AgentName]event.LoopStarted, starts []event.LoopStarted, allRecords []journal.JournalRecord, allowMismatch bool) ([]loopPlan, loopPlan, error) {
+	plans := make([]loopPlan, 0, len(starts))
+	activeIndex := -1
+	for _, started := range starts {
+		definition, ok := topology.definition(started.AgentName)
+		isConfiguredRoot := started.LoopID == roots[topology.ActivePrimer].LoopID
+		if !ok && isConfiguredRoot && len(topology.Definitions) == 1 {
+			definition, ok = activeDefinition, true
+		}
+		if !ok && !isConfiguredRoot && len(topology.Definitions) == 1 {
+			continue
+		}
+		if !ok {
+			// WithAllowConfigMismatch recovery is intentionally single-primer/fail-secure: a
+			// multi-definition topology hard-fails on ANY unknown loop AgentName (allowMismatch
+			// only relaxes the name check for the sole root above via checkAgentName — it never
+			// invents a missing definition here).
+			return nil, loopPlan{}, &RestoreError{Kind: RestoreLoopFailed, Cause: &AgentNameMismatchError{Persisted: started.AgentName}}
+		}
+		bound, bindErr := definition.Bind(sessionCtx, tool.Bindings{SessionID: sessionID, LoopID: started.LoopID})
+		if bindErr != nil {
+			return nil, loopPlan{}, &RestoreError{Kind: RestoreLoopFailed, Cause: bindErr}
+		}
+		if nameErr := checkAgentName(started.AgentName, bound.Name(), allowMismatch); nameErr != nil {
+			return nil, loopPlan{}, nameErr
+		}
+		loopEvents := eventsFromRecords(allRecords, started.LoopID)
+		plans = append(plans, loopPlan{started: started, bound: bound, events: loopEvents, folded: foldPrimaryLoop(loopEvents)})
+		if started.LoopID == roots[topology.ActivePrimer].LoopID {
+			activeIndex = len(plans) - 1
+		}
+	}
+	if activeIndex < 0 {
+		return nil, loopPlan{}, &RestoreError{Kind: RestoreLoopFailed, Cause: &SessionError{Kind: SessionLoopNotFound}}
+	}
+	return plans, plans[activeIndex], nil
+}
+
+// attachAndActivate registers every non-primary restored loop, resolves the durable active
+// selection (the last ActiveLoopChanged, else the primary), validates it is registered, and
+// sets it as the session's primary under loopsMu — the post-build wiring performed after the
+// primary loop is seeded and before RestoreDone. It returns a typed *RestoreError on any
+// failure (an attach failure, an unregistered active target, or a latched persistence
+// fault); the caller cancels the session context and records a RestoreErrored. On success
+// s.primaryLoopID reflects the durable active loop.
+func attachAndActivate(s *Session, all []event.Event, plans []loopPlan, primaryLoopID uuid.UUID) error {
+	for _, plan := range plans {
+		if plan.started.LoopID == primaryLoopID {
+			continue
+		}
+		parent := loop.Provenance{LoopID: plan.started.Cause.Coordinates.LoopID, TurnID: plan.started.Cause.Coordinates.TurnID, StepID: plan.started.Cause.Coordinates.StepID}
+		if err := s.attachRestoredLoop(plan.started, parent, plan.bound, plan.folded, findForeignSID(plan.events)); err != nil {
+			return err
+		}
+	}
+	activeID := primaryLoopID
+	for _, ev := range all {
+		if changed, ok := ev.(event.ActiveLoopChanged); ok {
+			activeID = changed.ActiveLoopID
+		}
+	}
+	if _, ok := s.Loop(activeID); !ok {
+		return &RestoreError{Kind: RestoreLoopFailed, Cause: &SessionError{Kind: SessionLoopNotFound}}
+	}
+	s.loopsMu.Lock()
+	s.primaryLoopID = activeID
+	if s.faulted {
+		fault := s.faultErr
+		s.loopsMu.Unlock()
+		return &RestoreError{Kind: RestoreAppendFailed, Cause: fault}
+	}
+	s.loopsMu.Unlock()
+	return nil
 }
 
 // buildRestoredSession assembles the live Session for a successful restore: the hub

@@ -239,7 +239,14 @@ func (d Definition) PolicyRevision() string {
 		Delegation: d.state.delegation, Modes: modes, InitialMode: d.state.initialMode,
 		PolicyRevision: d.state.policyRevision,
 	}
-	encoded, _ := json.Marshal(projection)
+	encoded, err := json.Marshal(projection)
+	if err != nil {
+		// The projection is a total, fully-owned marshalable type; a failure here is a
+		// programmer error (an unmarshalable field was added), not a runtime/input
+		// condition. Fail loudly rather than return a nil-collapsed sha256(nil) digest that
+		// would silently defeat restore config-mismatch drift detection.
+		panic(&PolicyRevisionMarshalError{Cause: err})
+	}
 	sum := sha256.Sum256(encoded)
 	return hex.EncodeToString(sum[:])
 }

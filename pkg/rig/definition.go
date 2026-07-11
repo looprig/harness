@@ -16,7 +16,7 @@ type definitionState struct {
 	activePrimer      string
 	store             *sessionstore.Store
 	storeSet          bool
-	seen              map[string]bool
+	seen              map[singletonKey]bool
 	lifecycleOptions  []sessionruntime.LifecycleOption
 	fingerprintFields ConfigFingerprintFields
 }
@@ -25,7 +25,7 @@ type definitionState struct {
 type Rig struct{ lifecycle *sessionruntime.Lifecycle }
 
 func Define(options ...Option) (*Rig, error) {
-	state := &definitionState{seen: make(map[string]bool)}
+	state := &definitionState{seen: make(map[singletonKey]bool)}
 	for _, option := range options {
 		if option == nil {
 			return nil, &DefinitionError{Kind: DefinitionNilOption}
@@ -64,7 +64,7 @@ func Define(options ...Option) (*Rig, error) {
 			return nil, &DefinitionError{Kind: DefinitionInvalidPrimer, Name: primer}
 		}
 	}
-	if len(state.primers) == 1 && !state.seen["active_primer"] {
+	if len(state.primers) == 1 && !state.seen[keyActivePrimer] {
 		state.activePrimer = state.primers[0]
 	}
 	if state.activePrimer == "" || !seenPrimers[state.activePrimer] {

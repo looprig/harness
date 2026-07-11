@@ -255,6 +255,31 @@ func mustDefinition(t *testing.T, opts ...Option) Definition {
 	return d
 }
 
+// TestPolicyRevisionDigest asserts PolicyRevision produces a stable, non-empty digest for a
+// normal (total, marshalable) projection — the invariant the panic-on-marshal-failure guard
+// protects. Equal definitions hash equal; a policy-affecting difference (the system prompt)
+// changes the digest, so it can never silently collapse to a constant (e.g. sha256(nil)).
+func TestPolicyRevisionDigest(t *testing.T) {
+	t.Parallel()
+	base := mustDefinition(t, WithSystem("be helpful"))
+	same := mustDefinition(t, WithSystem("be helpful"))
+	different := mustDefinition(t, WithSystem("be terse"))
+
+	got := base.PolicyRevision()
+	if got == "" {
+		t.Fatal("PolicyRevision() = empty, want a non-empty digest")
+	}
+	if got != base.PolicyRevision() {
+		t.Error("PolicyRevision() is not stable across calls on the same definition")
+	}
+	if got != same.PolicyRevision() {
+		t.Error("PolicyRevision() differs for identical definitions, want equal digests")
+	}
+	if got == different.PolicyRevision() {
+		t.Error("PolicyRevision() did not change for a differing system prompt (digest collapsed?)")
+	}
+}
+
 func validToolBindings(t *testing.T) tool.Bindings {
 	t.Helper()
 	return tool.Bindings{SessionID: mustUUID(t), LoopID: mustUUID(t)}

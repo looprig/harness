@@ -397,6 +397,76 @@ func TestSubmitToLoop(t *testing.T) {
 	}
 }
 
+// TestSubmitFollowsActiveLoop proves Submit routes to whatever loop is CURRENTLY active:
+// after SetActiveLoop switches the active selection to a second primer, a subsequent
+// Submit starts its turn on the NEW active loop (not the original primary). The resulting
+// TurnStarted lands on the new active loop carrying the returned InputID with human
+// (AgencyUser) semantics — proving Submit reads the live primaryLoopID SetActiveLoop
+// mutates, not the construction-time primer.
+func TestSubmitFollowsActiveLoop(t *testing.T) {
+	t.Parallel()
+	planner := cfgWithAgent(&stubLLM{chunks: []content.Chunk{textChunk("plan")}}, "planner")
+	builder := cfgWithAgent(&stubLLM{chunks: []content.Chunk{textChunk("build")}}, "builder")
+	s, err := NewTopology(context.Background(), Topology{
+		Definitions:  []loop.Definition{planner, builder},
+		Primers:      []identity.AgentName{"planner", "builder"},
+		ActivePrimer: "planner",
+	}, WithFingerprintProvider(testFingerprintProvider))
+	if err != nil {
+		t.Fatalf("NewTopology: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Shutdown(context.Background()) })
+
+	builderID := s.findLoopIDByName("builder")
+	if builderID.IsZero() {
+		t.Fatal("builder root missing")
+	}
+	if s.PrimaryLoopID() == builderID {
+		t.Fatal("builder was already active before SetActiveLoop (planner should be the initial active primer)")
+	}
+
+	// Subscribe to the builder loop's Enduring events BEFORE switching + submitting, so the
+	// resulting TurnStarted (loop-scoped) cannot be missed (the hub has no replay).
+	sub, err := s.SubscribeEvents(event.EventFilter{
+		Enduring: event.LoopScope{Loops: map[uuid.UUID]struct{}{builderID: {}}},
+	})
+	if err != nil {
+		t.Fatalf("SubscribeEvents: %v", err)
+	}
+	t.Cleanup(func() { _ = sub.Close() })
+	rec := &recordingSub{}
+	go func() {
+		for d := range sub.Events() {
+			rec.record(d.Event)
+		}
+	}()
+
+	if err := s.SetActiveLoop(context.Background(), builderID); err != nil {
+		t.Fatalf("SetActiveLoop: %v", err)
+	}
+	id, err := s.Submit(context.Background(), []content.Block{&content.TextBlock{Text: "go"}})
+	if err != nil {
+		t.Fatalf("Submit: %v", err)
+	}
+	if id.IsZero() {
+		t.Fatal("Submit returned a zero InputID")
+	}
+
+	ts, ok := waitTurnStartedOn(rec, builderID, 2*time.Second)
+	if !ok {
+		t.Fatal("no TurnStarted on the NEW active (builder) loop; Submit did not follow the active selection")
+	}
+	if ts.LoopID != builderID {
+		t.Errorf("TurnStarted LoopID = %v, want new active loop %v", ts.LoopID, builderID)
+	}
+	if ts.Cause.CommandID != id {
+		t.Errorf("TurnStarted Cause.CommandID = %v, want returned InputID %v", ts.Cause.CommandID, id)
+	}
+	if ts.Cause.Agency != identity.AgencyUser {
+		t.Errorf("TurnStarted Cause.Agency = %v, want AgencyUser (Submit is human-authored)", ts.Cause.Agency)
+	}
+}
+
 // TestSubmitToLoopUnknownLoop asserts submitToLoop fails secure with
 // *SessionError{SessionLoopNotFound} (and returns a zero id, nothing sent) when the
 // target loop id resolves to no registry entry.
