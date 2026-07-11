@@ -56,7 +56,7 @@ var (
 
 // bashRunnerText runs Bash with the given command and returns the single text
 // block; it fails the test on a Go error (Bash returns tool-result strings).
-func bashRunnerText(t *testing.T, b *Bash, command string) string {
+func bashRunnerText(t *testing.T, b *BashTool, command string) string {
 	t.Helper()
 	res, err := b.InvokableRun(context.Background(), `{"command":`+strconvQuote(command)+`}`)
 	if err != nil {

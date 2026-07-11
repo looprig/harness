@@ -6,10 +6,10 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/harness/pkg/tool"
-	"github.com/looprig/core/uuid"
 )
 
 // mustUUID generates a fresh non-zero UUID for building a non-root parent
@@ -307,7 +307,8 @@ func TestSubagentErrors(t *testing.T) {
 // a WriteTarget.
 func TestSubagentCapabilities(t *testing.T) {
 	t.Parallel()
-	var s any = NewSubagent(&fakeSpawner{}, testCatalog())
+	var concrete *SubagentTool = NewSubagent(&fakeSpawner{}, testCatalog())
+	var s any = concrete
 	if _, ok := s.(tool.InvokableTool); !ok {
 		t.Error("Subagent is not an InvokableTool")
 	}

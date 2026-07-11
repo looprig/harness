@@ -89,10 +89,10 @@ const subagentSchema = `{
 // catalog is rendered after it so the model knows which agents it may spawn.
 const subagentDescPrefix = "Spawn an in-session subagent by name to handle a sub-task, run it to completion, and return its final response."
 
-// Subagent spawns in-session subagent loops by name. It depends only on the narrow
+// SubagentTool spawns in-session subagent loops by name. It depends only on the narrow
 // Spawner (DIP), so it never imports the concrete session; it carries a static
 // catalog of spawnable agents purely to render its self-description.
-type Subagent struct {
+type SubagentTool struct {
 	spawner Spawner
 	catalog []SubagentCatalogEntry
 }
@@ -102,14 +102,14 @@ type Subagent struct {
 // into Info().Desc as an <available_subagents> listing; it is descriptive only — the
 // authoritative agent set is the Spawner's registry, so an agent absent from the
 // catalog still fails closed at Spawn (unknown agent → tool-result error string).
-func NewSubagent(spawner Spawner, catalog []SubagentCatalogEntry) *Subagent {
-	return &Subagent{spawner: spawner, catalog: catalog}
+func NewSubagent(spawner Spawner, catalog []SubagentCatalogEntry) *SubagentTool {
+	return &SubagentTool{spawner: spawner, catalog: catalog}
 }
 
 // subagentDesc renders the tool description: the static prefix followed by an
 // <available_subagents> block listing each catalog entry (name + description) so the
 // model can pick a valid {agent}. An empty catalog renders just the prefix.
-func (s *Subagent) subagentDesc() string {
+func (s *SubagentTool) subagentDesc() string {
 	if len(s.catalog) == 0 {
 		return subagentDescPrefix
 	}
@@ -131,7 +131,7 @@ func (s *Subagent) subagentDesc() string {
 
 // Info returns Subagent's self-description. Name MUST equal "Subagent"; Desc carries
 // the available-subagents catalog.
-func (s *Subagent) Info(context.Context) (*tool.ToolInfo, error) {
+func (s *SubagentTool) Info(context.Context) (*tool.ToolInfo, error) {
 	return &tool.ToolInfo{
 		Name:   subagentToolName,
 		Desc:   s.subagentDesc(),
@@ -142,14 +142,14 @@ func (s *Subagent) Info(context.Context) (*tool.ToolInfo, error) {
 // AuditSummary returns the constant "Subagent". The agent name and message may carry
 // sensitive context, so neither reaches the audit event — there is no non-sensitive
 // field to surface, so the summary is a fixed label.
-func (s *Subagent) AuditSummary(string) string {
+func (s *SubagentTool) AuditSummary(string) string {
 	return "Subagent"
 }
 
 // InvokableRun reads the tool's own provenance from ctx, asks the Spawner to run the
 // named subagent to completion on the message, and returns its final text. Every
 // failure is a tool-result error STRING; it never returns a Go error.
-func (s *Subagent) InvokableRun(ctx context.Context, argsJSON string) (*tool.ToolResult, error) {
+func (s *SubagentTool) InvokableRun(ctx context.Context, argsJSON string) (*tool.ToolResult, error) {
 	var args subagentArgs
 	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
 		return tool.TextResult("error: invalid arguments: not a JSON object"), nil
@@ -179,9 +179,9 @@ func (s *Subagent) InvokableRun(ctx context.Context, argsJSON string) (*tool.Too
 	return tool.TextResult(finalText), nil
 }
 
-// compile-time assertions: Subagent is an InvokableTool and Auditable. It is
+// compile-time assertions: SubagentTool is an InvokableTool and Auditable. It is
 // deliberately NOT a PermissionPrompter (AutoApprove) and NOT a WriteTarget.
 var (
-	_ tool.InvokableTool = (*Subagent)(nil)
-	_ tool.Auditable     = (*Subagent)(nil)
+	_ tool.InvokableTool = (*SubagentTool)(nil)
+	_ tool.Auditable     = (*SubagentTool)(nil)
 )

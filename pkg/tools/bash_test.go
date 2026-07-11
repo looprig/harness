@@ -45,7 +45,8 @@ func runBash(t *testing.T, root string, args map[string]any) string {
 
 func TestBashInfo(t *testing.T) {
 	t.Parallel()
-	info, err := NewBash(t.TempDir()).Info(context.Background())
+	var bash *BashTool = NewBash(t.TempDir())
+	info, err := bash.Info(context.Background())
 	if err != nil {
 		t.Fatalf("Info() error = %v", err)
 	}

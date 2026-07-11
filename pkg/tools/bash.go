@@ -83,31 +83,31 @@ type bashArgs struct {
 	Grants []string `json:"grants,omitempty"`
 }
 
-// Bash runs a single shell command in a workspace-contained directory. It depends
+// BashTool runs a single shell command in a workspace-contained directory. It depends
 // only on the workspace root (least privilege); the advisory DeniedBashPrefixes
 // gate is the PermissionChecker's concern, not the tool's. runner is the OPTIONAL
 // confined-execution seam (§10.1): nil means direct `sh -c` execution (the
 // bare-harness default), non-nil routes the command through the injected runner
 // (e.g. the sandbox Executor) instead.
-type Bash struct {
+type BashTool struct {
 	root   string
 	runner tool.CommandRunner
 }
 
-// BashOption configures a Bash at construction (functional-options pattern).
-type BashOption func(*Bash)
+// BashOption configures a BashTool at construction (functional-options pattern).
+type BashOption func(*BashTool)
 
 // WithRunner injects a confined command runner. When set, InvokableRun routes the
 // command through r.RunCommand instead of the direct `sh -c` path. A nil runner
 // (the default) preserves the exact bare-harness direct-execution behavior.
 func WithRunner(r tool.CommandRunner) BashOption {
-	return func(b *Bash) { b.runner = r }
+	return func(b *BashTool) { b.runner = r }
 }
 
 // NewBash constructs a Bash tool bound to the workspace root. With no options the
 // runner is nil (direct execution); WithRunner injects a confined runner.
-func NewBash(root string, opts ...BashOption) *Bash {
-	b := &Bash{root: root}
+func NewBash(root string, opts ...BashOption) *BashTool {
+	b := &BashTool{root: root}
 	for _, opt := range opts {
 		opt(b)
 	}
@@ -115,7 +115,7 @@ func NewBash(root string, opts ...BashOption) *Bash {
 }
 
 // Info returns Bash's self-description. Name MUST equal "Bash".
-func (b *Bash) Info(context.Context) (*tool.ToolInfo, error) {
+func (b *BashTool) Info(context.Context) (*tool.ToolInfo, error) {
 	return &tool.ToolInfo{
 		Name:   bashToolName,
 		Desc:   bashDesc,
@@ -127,7 +127,7 @@ func (b *Bash) Info(context.Context) (*tool.ToolInfo, error) {
 // at the gate, so it is the right (and only) redacted summary. No secrets are
 // added beyond the command the user already sees. An unparseable args document
 // yields a generic summary.
-func (b *Bash) AuditSummary(argsJSON string) string {
+func (b *BashTool) AuditSummary(argsJSON string) string {
 	var a bashArgs
 	if err := json.Unmarshal([]byte(argsJSON), &a); err != nil || a.Command == "" {
 		return "Bash (unparsable args)"
@@ -147,7 +147,7 @@ func (b *Bash) AuditSummary(argsJSON string) string {
 // verbatim and consumed separately at InvokableRun. BuildRequest never puts a.Grants
 // on the prompt (a model-supplied token is not executor-verified, so it must not be
 // shown as an authorized grant).
-func (b *Bash) BuildRequest(argsJSON string, _ tool.PreparedArtifact) (tool.PermissionRequest, error) {
+func (b *BashTool) BuildRequest(argsJSON string, _ tool.PreparedArtifact) (tool.PermissionRequest, error) {
 	var a bashArgs
 	if err := json.Unmarshal([]byte(argsJSON), &a); err != nil {
 		return nil, &bashError{reason: "invalid arguments: not a JSON object", cause: err}
@@ -182,7 +182,7 @@ func (b *Bash) BuildRequest(argsJSON string, _ tool.PreparedArtifact) (tool.Perm
 // executor's own PlanGrants→DescribeGrant output. Wiring a.Grants in here would put an
 // unverified model-supplied token on the prompt as if it were authorized — exactly the
 // fail-secure violation this seam exists to prevent.
-func (b *Bash) planGrants(workdir, command string) ([]tool.GrantDisplay, error) {
+func (b *BashTool) planGrants(workdir, command string) ([]tool.GrantDisplay, error) {
 	pg, okPlan := b.runner.(interface {
 		PlanGrants(dir, command string) []string
 	})
@@ -219,7 +219,7 @@ func (b *Bash) planGrants(workdir, command string) ([]tool.GrantDisplay, error) 
 // error), AND the PermissionChecker's grant re-mint seam all derive the spawn dir
 // identically — "grants are planned/minted for the same dir InvokableRun runs in" is a
 // structural guarantee, not a copy-paste coincidence.
-func (b *Bash) resolveDir(workdir string) (string, error) {
+func (b *BashTool) resolveDir(workdir string) (string, error) {
 	return resolveSpawnDir(b.root, workdir)
 }
 
@@ -244,7 +244,7 @@ func resolveSpawnDir(root, workdir string) (string, error) {
 // tool result. A non-zero exit is a normal result; a timeout, an escaping
 // workdir, or an unparseable args document is a tool-result error string. It
 // never returns a Go error.
-func (b *Bash) InvokableRun(ctx context.Context, argsJSON string) (*tool.ToolResult, error) {
+func (b *BashTool) InvokableRun(ctx context.Context, argsJSON string) (*tool.ToolResult, error) {
 	var a bashArgs
 	if err := json.Unmarshal([]byte(argsJSON), &a); err != nil {
 		return tool.TextResult("error: invalid arguments: not a JSON object"), nil
@@ -469,10 +469,10 @@ func (e *bashError) Error() string { return e.reason }
 
 func (e *bashError) Unwrap() error { return e.cause }
 
-// compile-time assertions: Bash is an InvokableTool, a PermissionPrompter (Ask),
+// compile-time assertions: BashTool is an InvokableTool, a PermissionPrompter (Ask),
 // and Auditable. It is NOT a WriteTarget (it is not a path-write tool).
 var (
-	_ tool.InvokableTool      = (*Bash)(nil)
-	_ tool.PermissionPrompter = (*Bash)(nil)
-	_ tool.Auditable          = (*Bash)(nil)
+	_ tool.InvokableTool      = (*BashTool)(nil)
+	_ tool.PermissionPrompter = (*BashTool)(nil)
+	_ tool.Auditable          = (*BashTool)(nil)
 )

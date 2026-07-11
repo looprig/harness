@@ -50,7 +50,7 @@ var (
 
 // runBashCtx invokes Bash with an explicit ctx + args map and returns the single
 // text block; it fails on a Go error (Bash returns tool-result strings).
-func runBashCtx(t *testing.T, ctx context.Context, b *Bash, args map[string]any) string {
+func runBashCtx(t *testing.T, ctx context.Context, b *BashTool, args map[string]any) string {
 	t.Helper()
 	raw, err := json.Marshal(args)
 	if err != nil {
