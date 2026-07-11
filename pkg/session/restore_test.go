@@ -5,9 +5,9 @@ import (
 	"testing"
 
 	"github.com/looprig/core/content"
+	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/identity"
-	"github.com/looprig/core/uuid"
 )
 
 // foldUserMsg builds a *content.UserMessage carrying a single text block, the
@@ -355,5 +355,19 @@ func TestOpenTurnCoordsCoupledToOpenTurnInvariant(t *testing.T) {
 				t.Errorf("openTurnCoords TurnIndex = %d, want %d", gotIdx, tt.wantTurnIdx)
 			}
 		})
+	}
+}
+
+func TestEffectiveCurrentWorkspaceHonorsRestore(t *testing.T) {
+	t.Parallel()
+	events := []event.Event{
+		event.WorkspaceCheckpointed{Ref: "checkpoint-A"},
+		event.WorkspaceCheckpointed{Ref: "checkpoint-B"},
+		event.WorkspaceRestored{Ref: "checkpoint-A"},
+	}
+
+	ref, ok := effectiveCurrentWorkspace(events)
+	if !ok || ref != "checkpoint-A" {
+		t.Fatalf("effectiveCurrentWorkspace() = (%q, %v), want (%q, true)", ref, ok, "checkpoint-A")
 	}
 }

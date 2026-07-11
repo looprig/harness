@@ -237,11 +237,10 @@ func restoreSession(
 	// and a restart would grant a fresh quota (a trivial cap bypass, design §16.3).
 	spawnedCount := countSpawnedLoops(all)
 
-	// The last durable workspace snapshot to materialize on resume (if any). Scanned over
-	// the SAME unnarrowed discovery drain — WorkspaceCheckpointed is session-scoped, so it
-	// is present in `all` — alongside the other discovery facts. Consumed at the pre-Restore
-	// Done seam below; empty/false when the session was never checkpointed.
-	wsRef, hasWSCheckpoint := lastWorkspaceCheckpoint(all)
+	// The effective durable workspace pointer to materialize on resume (if any). Scanned over
+	// the SAME unnarrowed discovery drain; both checkpoint and restore transitions are
+	// session-scoped. Consumed at the pre-RestoreDone seam below.
+	wsRef, hasWSCheckpoint := effectiveCurrentWorkspace(all)
 
 	// The last durable security-ceiling ordinal to re-seed on resume (if the session ever
 	// changed it) — folded from the SAME unnarrowed discovery drain (SecurityCeilingChanged

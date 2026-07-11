@@ -155,8 +155,10 @@ func stampCheckpoint(t *testing.T, store *sessionstore.Store, fp event.ConfigFin
 	defer cancel()
 	for _, ref := range refs {
 		es.stamp(t, ctx, h, event.WorkspaceCheckpointed{
-			Header: event.Header{Coordinates: identity.Coordinates{SessionID: sessionID}},
-			Ref:    ref,
+			Header:      event.Header{Coordinates: identity.Coordinates{SessionID: sessionID}},
+			Ref:         ref,
+			Consistency: event.SnapshotQuiescent,
+			Trigger:     event.SnapshotTriggerManual,
 		})
 	}
 	return persistedStream{sessionID: sessionID, primaryLoopID: primaryLoopID, lease: lease}
@@ -164,10 +166,9 @@ func stampCheckpoint(t *testing.T, store *sessionstore.Store, fp event.ConfigFin
 
 // --- unit: the discovery scanner ----------------------------------------------------
 
-// TestLastWorkspaceCheckpoint proves the scanner returns the Ref of the LAST
-// WorkspaceCheckpointed in the replay (the most recent durable snapshot) and false when the
-// session was never checkpointed.
-func TestLastWorkspaceCheckpoint(t *testing.T) {
+// TestEffectiveCurrentWorkspace proves the scanner returns the Ref selected by the last
+// checkpoint or restore transition, and false when the session has neither.
+func TestEffectiveCurrentWorkspace(t *testing.T) {
 	t.Parallel()
 	wc := func(ref string) event.WorkspaceCheckpointed { return event.WorkspaceCheckpointed{Ref: ref} }
 	refA := "v1:sha256:" + strings.Repeat("a", 64)
@@ -186,12 +187,12 @@ func TestLastWorkspaceCheckpoint(t *testing.T) {
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			ref, ok := lastWorkspaceCheckpoint(tt.events)
+			ref, ok := effectiveCurrentWorkspace(tt.events)
 			if ok != tt.wantOK {
-				t.Fatalf("lastWorkspaceCheckpoint ok = %v, want %v", ok, tt.wantOK)
+				t.Fatalf("effectiveCurrentWorkspace ok = %v, want %v", ok, tt.wantOK)
 			}
 			if ref != tt.wantRef {
-				t.Errorf("lastWorkspaceCheckpoint ref = %q, want %q", ref, tt.wantRef)
+				t.Errorf("effectiveCurrentWorkspace ref = %q, want %q", ref, tt.wantRef)
 			}
 		})
 	}
@@ -252,6 +253,66 @@ func TestRestoreMaterializesWorkspace(t *testing.T) {
 				[]event.Event{event.RestoreStarted{}, event.RestoreDone{}})
 		})
 	}
+}
+
+// TestRestoreMaterializesEffectiveCurrentWorkspace proves restore follows the latest
+// workspace transition, not merely the latest checkpoint. A deliberate rewind from B to A
+// must survive process restart even though B remains the newest checkpoint for history and
+// backup tooling.
+func TestRestoreMaterializesEffectiveCurrentWorkspace(t *testing.T) {
+	t.Parallel()
+	store := newRestoreStore(t)
+	fp := FingerprintFrom(restoreCfg(&stubLLM{}, "model-x", "be helpful"))
+	ws := mustWorkspaceStore(t, memstore.New().Blobs)
+
+	srcA, srcB := t.TempDir(), t.TempDir()
+	wsBuildTree(t, srcA, "alpha")
+	wsBuildTree(t, srcB, "beta")
+	refA, err := ws.Snapshot(context.Background(), srcA)
+	if err != nil {
+		t.Fatalf("Snapshot(A): %v", err)
+	}
+	refB, err := ws.Snapshot(context.Background(), srcB)
+	if err != nil {
+		t.Fatalf("Snapshot(B): %v", err)
+	}
+
+	h, sessionID, primaryLoopID, lease, es := newOriginalHub(t, store, fp)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	for _, ev := range []event.Event{
+		event.WorkspaceCheckpointed{
+			Header:      event.Header{Coordinates: identity.Coordinates{SessionID: sessionID}},
+			Ref:         string(refA),
+			Consistency: event.SnapshotQuiescent,
+			Trigger:     event.SnapshotTriggerManual,
+		},
+		event.WorkspaceCheckpointed{
+			Header:      event.Header{Coordinates: identity.Coordinates{SessionID: sessionID}},
+			Ref:         string(refB),
+			Consistency: event.SnapshotQuiescent,
+			Trigger:     event.SnapshotTriggerManual,
+		},
+		event.WorkspaceRestored{
+			Header: event.Header{Coordinates: identity.Coordinates{SessionID: sessionID}},
+			Ref:    string(refA),
+		},
+	} {
+		es.stamp(t, ctx, h, ev)
+	}
+	handOver(t, lease)
+
+	freshRoot := t.TempDir()
+	s, err := Restore(context.Background(), restoreCfg(&stubLLM{}, "model-x", "be helpful"),
+		sessionID, store, WithWorkspaceStore(ws, freshRoot))
+	if err != nil {
+		t.Fatalf("Restore: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Shutdown(context.Background()) })
+
+	wsAssertTreesEqual(t, srcA, freshRoot)
+	assertTail(t, restoreEventTail(t, store, sessionID, primaryLoopID),
+		[]event.Event{event.RestoreStarted{}, event.RestoreDone{}})
 }
 
 // TestRestoreSkipsWorkspaceMaterialize proves the two skip cases: a session with NO

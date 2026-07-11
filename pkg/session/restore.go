@@ -187,18 +187,18 @@ func countSpawnedLoops(events []event.Event) int {
 	return n
 }
 
-// lastWorkspaceCheckpoint returns the Ref of the LAST WorkspaceCheckpointed event in the
-// replay — the most recent durable workspace snapshot to materialize on resume — and false
-// if the session was never checkpointed. WorkspaceCheckpointed is session-scoped, so it is
-// present in the unnarrowed discovery drain; scanning to the end (the last one wins) picks
-// the newest snapshot, since a re-checkpoint appends a fresh event rather than replacing the
-// prior one. It is a single-purpose discovery scanner, mirroring firstConfigFingerprint /
-// findRootLoopStarted / countSpawnedLoops, so foldPrimaryLoop stays pure.
-func lastWorkspaceCheckpoint(events []event.Event) (string, bool) {
+// effectiveCurrentWorkspace returns the Ref selected by the LAST durable workspace
+// transition, whether checkpoint or restore. It is scanned from the unnarrowed discovery
+// drain because both event types are session-scoped. A restore therefore changes the resume
+// point without erasing the independently projected LastCheckpoint history.
+func effectiveCurrentWorkspace(events []event.Event) (string, bool) {
 	ref, ok := "", false
 	for _, ev := range events {
-		if wc, isWC := ev.(event.WorkspaceCheckpointed); isWC {
-			ref, ok = wc.Ref, true // keep scanning; the LAST one wins
+		switch e := ev.(type) {
+		case event.WorkspaceCheckpointed:
+			ref, ok = e.Ref, true
+		case event.WorkspaceRestored:
+			ref, ok = e.Ref, true
 		}
 	}
 	return ref, ok
@@ -209,7 +209,7 @@ func lastWorkspaceCheckpoint(events []event.Event) (string, bool) {
 // the session never changed its ceiling (it then resumes at the fail-secure most-restrictive
 // default). SecurityCeilingChanged is session-scoped, so it is present in the unnarrowed
 // discovery drain; scanning to the end picks the newest (a change appends a fresh event,
-// never replacing the prior one). It mirrors lastWorkspaceCheckpoint — a single-purpose
+// never replacing the prior one). It mirrors effectiveCurrentWorkspace — a single-purpose
 // discovery scanner — so the restore constructor stays a straight-line assembly and
 // foldPrimaryLoop stays pure.
 func lastSecurityCeiling(events []event.Event) (uint8, bool) {

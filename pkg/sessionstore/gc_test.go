@@ -10,10 +10,14 @@ import (
 	"reflect"
 	"sort"
 	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/looprig/core/uuid"
+	"github.com/looprig/harness/pkg/event"
+	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/journal"
+	"github.com/looprig/harness/pkg/workspacestore"
 	"github.com/looprig/storage"
 	"github.com/looprig/storage/memstore"
 )
@@ -172,6 +176,116 @@ func TestGCReclaim(t *testing.T) {
 			assertReplayResolves(t, st, id)
 		})
 	}
+}
+
+func TestWorkspaceLiveRefsScansEveryRetainedJournal(t *testing.T) {
+	t.Parallel()
+	st, err := Open(memstore.New())
+	if err != nil {
+		t.Fatalf("Open() err = %v", err)
+	}
+	refA := "v1:sha256:" + strings.Repeat("a", 64)
+	refB := "v1:sha256:" + strings.Repeat("b", 64)
+	refC := "v1:sha256:" + strings.Repeat("c", 64)
+	ids := []uuid.UUID{newTestUUID(t), newTestUUID(t)}
+	appendWorkspaceHistory(t, st, ids[0],
+		event.WorkspaceCheckpointed{Ref: refA},
+		event.WorkspaceCheckpointed{Ref: refB},
+		event.WorkspaceRestored{Ref: refA},
+	)
+	appendWorkspaceHistory(t, st, ids[1],
+		event.WorkspaceRestored{Ref: refC},
+		event.WorkspaceCheckpointed{Ref: refB},
+	)
+
+	got, err := st.WorkspaceLiveRefs(context.Background(), ids)
+	if err != nil {
+		t.Fatalf("WorkspaceLiveRefs() err = %v", err)
+	}
+	want := map[workspacestore.Ref]struct{}{workspacestore.Ref(refA): {}, workspacestore.Ref(refB): {}, workspacestore.Ref(refC): {}}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("WorkspaceLiveRefs() = %v, want %v", got, want)
+	}
+}
+
+func TestWorkspaceCheckpointLookupBySeqAndTurnSelectsSameIdentity(t *testing.T) {
+	t.Parallel()
+	st, err := Open(memstore.New())
+	if err != nil {
+		t.Fatalf("Open() err = %v", err)
+	}
+	sid, loopID, turnID := newTestUUID(t), newTestUUID(t), newTestUUID(t)
+	eventID := newTestUUID(t)
+	ref := "v1:sha256:" + strings.Repeat("d", 64)
+	checkpoint := event.WorkspaceCheckpointed{
+		Header: event.Header{
+			Coordinates: identity.Coordinates{SessionID: sid},
+			EventID:     eventID,
+			Cause: identity.Cause{
+				Coordinates: identity.Coordinates{SessionID: sid, LoopID: loopID, TurnID: turnID},
+				EventID:     newTestUUID(t),
+			},
+		},
+		Ref: ref, Consistency: event.SnapshotQuiescent, Trigger: event.SnapshotTriggerTurnDone,
+	}
+	seqs := appendWorkspaceHistory(t, st, sid, checkpoint)
+
+	bySeq, ok, err := st.WorkspaceCheckpointBySeq(context.Background(), sid, seqs[0])
+	if err != nil || !ok {
+		t.Fatalf("WorkspaceCheckpointBySeq() = (%+v, %v, %v), want found", bySeq, ok, err)
+	}
+	byTurn, ok, err := st.WorkspaceCheckpointByTurn(context.Background(), sid, turnID)
+	if err != nil || !ok {
+		t.Fatalf("WorkspaceCheckpointByTurn() = (%+v, %v, %v), want found", byTurn, ok, err)
+	}
+	if bySeq != byTurn {
+		t.Errorf("lookup identity differs: by seq %+v, by turn %+v", bySeq, byTurn)
+	}
+	if bySeq.Seq != seqs[0] || bySeq.EventID != eventID || bySeq.Ref != workspacestore.Ref(ref) {
+		t.Errorf("checkpoint identity = %+v, want seq=%d event=%v ref=%s", bySeq, seqs[0], eventID, ref)
+	}
+}
+
+func appendWorkspaceHistory(t *testing.T, st *Store, sid uuid.UUID, events ...event.Event) []uint64 {
+	t.Helper()
+	lease, _ := leaseFor(1, sid)
+	j, err := st.OpenJournal(context.Background(), sid, lease)
+	if err != nil {
+		t.Fatalf("OpenJournal() err = %v", err)
+	}
+	seqs := make([]uint64, 0, len(events))
+	for _, ev := range events {
+		switch e := ev.(type) {
+		case event.WorkspaceCheckpointed:
+			if e.SessionID.IsZero() {
+				e.Header.Coordinates.SessionID = sid
+			}
+			if e.EventID.IsZero() {
+				e.Header.EventID = newTestUUID(t)
+			}
+			if e.Consistency == event.SnapshotConsistencyUnknown {
+				e.Consistency = event.SnapshotQuiescent
+			}
+			if e.Trigger == event.SnapshotTriggerKindUnknown {
+				e.Trigger = event.SnapshotTriggerManual
+			}
+			ev = e
+		case event.WorkspaceRestored:
+			if e.SessionID.IsZero() {
+				e.Header.Coordinates.SessionID = sid
+			}
+			if e.EventID.IsZero() {
+				e.Header.EventID = newTestUUID(t)
+			}
+			ev = e
+		}
+		seq, err := j.Append(context.Background(), journal.NewEventRecord(ev))
+		if err != nil {
+			t.Fatalf("Append(%T) err = %v", ev, err)
+		}
+		seqs = append(seqs, seq)
+	}
+	return seqs
 }
 
 // TestGCFailsClosedOnScanError pins the fail-closed contract: a read or decode error

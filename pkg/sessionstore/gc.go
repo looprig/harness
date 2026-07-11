@@ -7,7 +7,9 @@ import (
 	"strconv"
 
 	"github.com/looprig/core/uuid"
+	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/journal"
+	"github.com/looprig/harness/pkg/workspacestore"
 	"github.com/looprig/storage"
 )
 
@@ -92,6 +94,108 @@ type GCResult struct {
 	// returns sorted keys and the sweep preserves that order). It lets a caller log
 	// exactly what was reclaimed without re-deriving it.
 	DeletedKeys []string
+}
+
+// WorkspaceJournalScanError reports that a retained session journal could not be scanned
+// completely for workspace references. Manual workspace GC must fail closed on this error:
+// an incomplete live set is unsafe to collect against.
+type WorkspaceJournalScanError struct {
+	SessionID uuid.UUID
+	Cause     error
+}
+
+func (e *WorkspaceJournalScanError) Error() string {
+	return "sessionstore: scan workspace refs for session " + e.SessionID.String() + ": " + e.Cause.Error()
+}
+
+func (e *WorkspaceJournalScanError) Unwrap() error { return e.Cause }
+
+// WorkspaceLiveRefs computes the complete workspace-ref set from the retained
+// session IDs supplied by the operator. It scans every journal and retains history from
+// both checkpoint and restore transitions. This only discovers refs; collection remains
+// an explicit operator action serialized against all snapshot writers.
+func (s *Store) WorkspaceLiveRefs(ctx context.Context, retainedSessionIDs []uuid.UUID) (map[workspacestore.Ref]struct{}, error) {
+	live := make(map[workspacestore.Ref]struct{})
+	for _, id := range retainedSessionIDs {
+		err := s.scanWorkspaceEvents(ctx, id, func(_ uint64, ev event.Event) (bool, error) {
+			var raw string
+			switch e := ev.(type) {
+			case event.WorkspaceCheckpointed:
+				raw = e.Ref
+			case event.WorkspaceRestored:
+				raw = e.Ref
+			default:
+				return true, nil
+			}
+			ref, err := workspacestore.ParseRef(raw)
+			if err != nil {
+				return false, err
+			}
+			live[ref] = struct{}{}
+			return true, nil
+		})
+		if err != nil {
+			return nil, err
+		}
+	}
+	return live, nil
+}
+
+// WorkspaceCheckpointBySeq finds the checkpoint whose durable journal sequence is seq.
+func (s *Store) WorkspaceCheckpointBySeq(ctx context.Context, id uuid.UUID, seq uint64) (CheckpointSummary, bool, error) {
+	var found CheckpointSummary
+	err := s.scanWorkspaceEvents(ctx, id, func(journalSeq uint64, ev event.Event) (bool, error) {
+		if journalSeq != seq {
+			return true, nil
+		}
+		checkpoint, ok := ev.(event.WorkspaceCheckpointed)
+		if ok {
+			found = checkpointSummary(checkpoint, journalSeq)
+		}
+		return false, nil
+	})
+	return found, !found.EventID.IsZero(), err
+}
+
+// WorkspaceCheckpointByTurn finds the latest turn-triggered checkpoint caused by turnID.
+func (s *Store) WorkspaceCheckpointByTurn(ctx context.Context, id, turnID uuid.UUID) (CheckpointSummary, bool, error) {
+	var found CheckpointSummary
+	err := s.scanWorkspaceEvents(ctx, id, func(seq uint64, ev event.Event) (bool, error) {
+		checkpoint, ok := ev.(event.WorkspaceCheckpointed)
+		if ok && checkpoint.Trigger == event.SnapshotTriggerTurnDone && checkpoint.Cause.Coordinates.TurnID == turnID {
+			found = checkpointSummary(checkpoint, seq)
+		}
+		return true, nil
+	})
+	return found, !found.EventID.IsZero(), err
+}
+
+func (s *Store) scanWorkspaceEvents(ctx context.Context, id uuid.UUID, visit func(uint64, event.Event) (bool, error)) error {
+	replayer, err := s.OpenEventReplayer(id, ReplayRequest{FromSeq: 0})
+	if err != nil {
+		return &WorkspaceJournalScanError{SessionID: id, Cause: err}
+	}
+	cursor, err := replayer.Open(ctx, journal.ReplayRequest{SessionID: id, From: journal.Beginning()})
+	if err != nil {
+		return &WorkspaceJournalScanError{SessionID: id, Cause: err}
+	}
+	defer func() { _ = cursor.Close() }()
+	for {
+		ev, seq, err := cursor.Next(ctx)
+		if errors.Is(err, io.EOF) {
+			return nil
+		}
+		if err != nil {
+			return &WorkspaceJournalScanError{SessionID: id, Cause: err}
+		}
+		keepGoing, visitErr := visit(seq, ev)
+		if visitErr != nil {
+			return &WorkspaceJournalScanError{SessionID: id, Cause: visitErr}
+		}
+		if !keepGoing {
+			return nil
+		}
+	}
 }
 
 // ObjectGC reaps orphaned offload blobs from one session's content-addressed blob
