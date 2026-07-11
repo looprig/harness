@@ -3,6 +3,7 @@ package event
 import (
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/identity"
+	"github.com/looprig/inference"
 )
 
 // EventName is the concrete event type name an InvalidEventError points at.
@@ -40,6 +41,8 @@ const (
 	FieldTrigger         FieldName = "Trigger"
 	FieldCause           FieldName = "Cause"
 	FieldActiveLoopID    FieldName = "ActiveLoopID"
+	FieldModel           FieldName = "Model"
+	FieldEffort          FieldName = "Effort"
 	// FieldType names the whole event (not one coordinate) on the fail-secure
 	// unknown-type path, paired with RuleUnknownType.
 	FieldType FieldName = "Type"
@@ -125,10 +128,16 @@ func validateEventBody(ev Event) error {
 		}
 	case LoopInferenceChanged:
 		if err := e.Model.Validate(); err != nil {
-			return &InvalidEventError{Event: "LoopInferenceChanged", Field: "Model", Rule: RuleInvalid}
+			return &InvalidEventError{Event: "LoopInferenceChanged", Field: FieldModel, Rule: RuleInvalid}
+		}
+		if e.Model.Origin != inference.OriginCustom && e.Model.Origin != inference.OriginCatalog {
+			return &InvalidEventError{Event: "LoopInferenceChanged", Field: FieldModel, Rule: RuleInvalid}
+		}
+		if !e.Model.Sampling.Effort.Valid() {
+			return &InvalidEventError{Event: "LoopInferenceChanged", Field: FieldModel, Rule: RuleInvalid}
 		}
 		if !e.Effort.Valid() {
-			return &InvalidEventError{Event: "LoopInferenceChanged", Field: "Effort", Rule: RuleInvalid}
+			return &InvalidEventError{Event: "LoopInferenceChanged", Field: FieldEffort, Rule: RuleInvalid}
 		}
 	}
 	return nil

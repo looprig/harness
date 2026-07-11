@@ -44,6 +44,72 @@ func TestRigEventsRoundTrip(t *testing.T) {
 	}
 }
 
+func TestLoopInferenceChangedValidation(t *testing.T) {
+	t.Parallel()
+	sessionID, loopID := vID(t), vID(t)
+	h := event.Header{Coordinates: identity.Coordinates{SessionID: sessionID, LoopID: loopID}, EventID: vID(t)}
+	validModel := inference.CustomModel("test", "test", "", "model")
+	catalogModel := validModel
+	catalogModel.Origin = inference.OriginCatalog
+	maxSamplingModel := validModel
+	maxSamplingModel.Sampling.Effort = inference.EffortMax
+	tests := []struct {
+		name      string
+		ev        event.LoopInferenceChanged
+		wantField event.FieldName
+	}{
+		{name: "custom origin and unset efforts", ev: event.LoopInferenceChanged{Header: h, Model: validModel, Effort: inference.EffortNone}},
+		{name: "catalog origin", ev: event.LoopInferenceChanged{Header: h, Model: catalogModel, Effort: inference.EffortHigh}},
+		{name: "maximum model sampling and event effort", ev: event.LoopInferenceChanged{Header: h, Model: maxSamplingModel, Effort: inference.EffortMax}},
+		{name: "invalid origin", ev: event.LoopInferenceChanged{Header: h, Model: func() inference.Model { m := validModel; m.Origin = inference.Origin(2); return m }()}, wantField: event.FieldModel},
+		{name: "invalid model sampling effort", ev: event.LoopInferenceChanged{Header: h, Model: func() inference.Model { m := validModel; m.Sampling.Effort = inference.Effort("extreme"); return m }()}, wantField: event.FieldModel},
+		{name: "invalid event effort", ev: event.LoopInferenceChanged{Header: h, Model: validModel, Effort: inference.Effort("extreme")}, wantField: event.FieldEffort},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := event.ValidateEvent(tt.ev)
+			if tt.wantField == "" {
+				if err != nil {
+					t.Fatalf("ValidateEvent error = %v", err)
+				}
+				return
+			}
+			var invalid *event.InvalidEventError
+			if !errors.As(err, &invalid) {
+				t.Fatalf("ValidateEvent error = %T %v, want InvalidEventError", err, err)
+			}
+			if invalid.Event != "LoopInferenceChanged" || invalid.Field != tt.wantField || invalid.Rule != event.RuleInvalid {
+				t.Fatalf("InvalidEventError = %+v, want event=LoopInferenceChanged field=%s rule=%s", invalid, tt.wantField, event.RuleInvalid)
+			}
+		})
+	}
+}
+
+func TestLoopInferenceChangedRejectsMalformedWireDescriptor(t *testing.T) {
+	t.Parallel()
+	sessionID, loopID := vID(t), vID(t)
+	h := event.Header{Coordinates: identity.Coordinates{SessionID: sessionID, LoopID: loopID}, EventID: vID(t)}
+	validModel := inference.CustomModel("test", "test", "", "model")
+	invalidOrigin := validModel
+	invalidOrigin.Origin = inference.Origin(255)
+	invalidSampling := validModel
+	invalidSampling.Sampling.Effort = inference.Effort("invalid")
+	for _, model := range []inference.Model{invalidOrigin, invalidSampling} {
+		data, err := event.MarshalEvent(event.LoopInferenceChanged{Header: h, Model: model})
+		if err != nil {
+			t.Fatalf("MarshalEvent malformed fixture: %v", err)
+		}
+		got, err := event.UnmarshalEvent(data)
+		if got != nil {
+			t.Errorf("UnmarshalEvent returned %#v on error", got)
+		}
+		var invalid *event.InvalidEventError
+		if !errors.As(err, &invalid) || invalid.Field != event.FieldModel || invalid.Rule != event.RuleInvalid {
+			t.Errorf("UnmarshalEvent error = %T %+v, want InvalidEventError Model/is invalid", err, err)
+		}
+	}
+}
+
 func TestWorkspaceCheckpointCauseShapes(t *testing.T) {
 	t.Parallel()
 	sessionID, loopID, turnID, stepID := vID(t), vID(t), vID(t), vID(t)
