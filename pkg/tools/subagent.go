@@ -97,11 +97,9 @@ type SubagentTool struct {
 	catalog []SubagentCatalogEntry
 }
 
-// NewSubagent constructs a Subagent from a Spawner and the catalog of spawnable
-// agents (both wired by the swarm at the composition root). The catalog is rendered
-// into Info().Desc as an <available_subagents> listing; it is descriptive only — the
-// authoritative agent set is the Spawner's registry, so an agent absent from the
-// catalog still fails closed at Spawn (unknown agent → tool-result error string).
+// NewSubagent constructs a SubagentTool from a Spawner and a descriptive catalog
+// of spawnable agents, both wired at the composition root. The Spawner remains
+// authoritative and decides whether a requested agent can be started.
 func NewSubagent(spawner Spawner, catalog []SubagentCatalogEntry) *SubagentTool {
 	return &SubagentTool{spawner: spawner, catalog: catalog}
 }

@@ -3,6 +3,14 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"go/parser"
+	"go/token"
+	"path/filepath"
+	"runtime"
+	"sort"
+	"strings"
+	"sync"
 	"testing"
 
 	"github.com/looprig/core/content"
@@ -160,6 +168,133 @@ func TestDefinitionBashCopiesOptions(t *testing.T) {
 	}
 }
 
+func TestDefinitionBlueprintDependencyValidation(t *testing.T) {
+	t.Parallel()
+
+	var typedNilGuard *fakeReadGuard
+	var typedNilRunner *definitionRunner
+	tests := []struct {
+		name           string
+		definition     tool.Definition
+		wantDefinition string
+		wantDependency string
+	}{
+		{name: "files nil read guard", definition: Files(nil), wantDefinition: "Files", wantDependency: "read_guard"},
+		{name: "files typed nil read guard", definition: Files(typedNilGuard), wantDefinition: "Files", wantDependency: "read_guard"},
+		{name: "bash nil option", definition: Bash(nil), wantDefinition: "Bash", wantDependency: "option"},
+		{name: "bash typed nil runner", definition: Bash(WithRunner(typedNilRunner)), wantDefinition: "Bash", wantDependency: "runner"},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			_, err := tt.definition.Build(context.Background(), blueprintBindings(&recordingDelegate{}))
+			var buildErr *DefinitionBuildError
+			if !errors.As(err, &buildErr) {
+				t.Fatalf("Build() error = %T %v, want *DefinitionBuildError", err, err)
+			}
+			if buildErr.Definition != tt.wantDefinition || buildErr.Dependency != tt.wantDependency {
+				t.Fatalf("DefinitionBuildError = %+v, want definition=%q dependency=%q", buildErr, tt.wantDefinition, tt.wantDependency)
+			}
+		})
+	}
+}
+
+func TestDefinitionBashEagerlyResolvesOptions(t *testing.T) {
+	t.Parallel()
+
+	runner := &definitionRunner{}
+	applications := 0
+	definition := Bash(func(b *BashTool) {
+		applications++
+		b.runner = runner
+	})
+	if applications != 1 {
+		t.Fatalf("option applications after Bash() = %d, want 1", applications)
+	}
+	for range 2 {
+		built, err := definition.Build(context.Background(), blueprintBindings(&recordingDelegate{}))
+		if err != nil {
+			t.Fatalf("Build() error = %v", err)
+		}
+		if built[0].(*BashTool).runner != runner {
+			t.Fatalf("built runner = %T, want %T", built[0].(*BashTool).runner, runner)
+		}
+	}
+	if applications != 1 {
+		t.Fatalf("option applications after Build() = %d, want 1", applications)
+	}
+}
+
+func TestDefinitionConcurrentBuildsAreFresh(t *testing.T) {
+	t.Parallel()
+
+	const builds = 32
+	definitions := []tool.Definition{Files(&fakeReadGuard{maxBytes: 1024}), Bash(WithRunner(&definitionRunner{})), Subagent()}
+	for _, definition := range definitions {
+		definition := definition
+		t.Run(definition.Name(), func(t *testing.T) {
+			t.Parallel()
+			results := make(chan tool.InvokableTool, builds)
+			var wg sync.WaitGroup
+			for range builds {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					built, err := definition.Build(context.Background(), blueprintBindings(&recordingDelegate{}))
+					if err != nil {
+						t.Errorf("Build() error = %v", err)
+						return
+					}
+					results <- built[0]
+				}()
+			}
+			wg.Wait()
+			close(results)
+			seen := make(map[tool.InvokableTool]struct{}, builds)
+			for built := range results {
+				if _, exists := seen[built]; exists {
+					t.Fatal("concurrent Build() reused a tool instance")
+				}
+				seen[built] = struct{}{}
+			}
+			if len(seen) != builds {
+				t.Fatalf("fresh tool instances = %d, want %d", len(seen), builds)
+			}
+		})
+	}
+}
+
+func TestDefinitionsFileAllowedImports(t *testing.T) {
+	t.Parallel()
+
+	_, filename, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller() did not return the test source path")
+	}
+	parsed, err := parser.ParseFile(token.NewFileSet(), filepath.Join(filepath.Dir(filename), "definitions.go"), nil, parser.ImportsOnly)
+	if err != nil {
+		t.Fatalf("parse definitions.go: %v", err)
+	}
+	allowed := map[string]bool{
+		`"context"`: true,
+		`"reflect"`: true,
+		`"github.com/looprig/harness/pkg/identity"`: true,
+		`"github.com/looprig/harness/pkg/loop"`:     true,
+		`"github.com/looprig/harness/pkg/tool"`:     true,
+	}
+	var unexpected []string
+	for _, imported := range parsed.Imports {
+		if !allowed[imported.Path.Value] {
+			unexpected = append(unexpected, imported.Path.Value)
+		}
+	}
+	sort.Strings(unexpected)
+	if len(unexpected) != 0 {
+		t.Fatalf("definitions.go imports outside the explicit dependency boundary: %v", unexpected)
+	}
+}
+
 func TestDefinitionSubagentBindsController(t *testing.T) {
 	t.Parallel()
 
@@ -178,7 +313,11 @@ func TestDefinitionSubagentBindsController(t *testing.T) {
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			controller := &recordingDelegate{result: tool.DelegateResult{Output: "done"}}
+			controller := &recordingDelegate{result: tool.DelegateResult{
+				DelegateID: uuid.MustParse("55555555-5555-4555-8555-555555555555"),
+				Status:     tool.DelegateStatusCompleted,
+				Output:     "done",
+			}}
 			built, err := Subagent().Build(context.Background(), blueprintBindings(controller))
 			if err != nil {
 				t.Fatalf("Build() error = %v", err)
@@ -196,6 +335,49 @@ func TestDefinitionSubagentBindsController(t *testing.T) {
 			}
 			if got := result.Content[0].(*content.TextBlock).Text; got != "done" {
 				t.Fatalf("result text = %q, want done", got)
+			}
+		})
+	}
+}
+
+func TestDelegateSpawnerValidatesSynchronousResult(t *testing.T) {
+	t.Parallel()
+
+	delegateID := uuid.MustParse("55555555-5555-4555-8555-555555555555")
+	tests := []struct {
+		name       string
+		result     tool.DelegateResult
+		wantOutput string
+		wantError  string
+	}{
+		{name: "completed returns output", result: tool.DelegateResult{DelegateID: delegateID, Status: tool.DelegateStatusCompleted, Output: "complete"}, wantOutput: "complete"},
+		{name: "done returns output", result: tool.DelegateResult{DelegateID: delegateID, Status: tool.DelegateStatusDone, Output: "done"}, wantOutput: "done"},
+		{name: "zero delegate id rejected", result: tool.DelegateResult{Status: tool.DelegateStatusCompleted, Output: "must not return"}, wantError: "zero delegate id"},
+		{name: "failed becomes error", result: tool.DelegateResult{DelegateID: delegateID, Status: tool.DelegateStatusFailed, Output: "must not return"}, wantError: "failed"},
+		{name: "interrupted becomes error", result: tool.DelegateResult{DelegateID: delegateID, Status: tool.DelegateStatusInterrupted, Output: "must not return"}, wantError: "interrupted"},
+		{name: "timed out becomes error", result: tool.DelegateResult{DelegateID: delegateID, Status: tool.DelegateStatusTimedOut, Output: "must not return"}, wantError: "timed out"},
+		{name: "queued is invalid for synchronous wait", result: tool.DelegateResult{DelegateID: delegateID, Status: tool.DelegateStatusQueued, Output: "must not return"}, wantError: "invalid synchronous status"},
+		{name: "running is invalid for synchronous wait", result: tool.DelegateResult{DelegateID: delegateID, Status: tool.DelegateStatusRunning, Output: "must not return"}, wantError: "invalid synchronous status"},
+		{name: "unknown is invalid for synchronous wait", result: tool.DelegateResult{DelegateID: delegateID, Status: tool.DelegateStatusUnknown, Output: "must not return"}, wantError: "invalid synchronous status"},
+		{name: "unrecognized is invalid for synchronous wait", result: tool.DelegateResult{DelegateID: delegateID, Status: tool.DelegateStatusValue(255), Output: "must not return"}, wantError: "invalid synchronous status"},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			spawner := delegateSpawner{controller: &recordingDelegate{result: tt.result}}
+			output, err := spawner.Spawn(context.Background(), loop.Provenance{}, "explorer", "map repo", "tool-use")
+			if tt.wantError == "" {
+				if err != nil || output != tt.wantOutput {
+					t.Fatalf("Spawn() = (%q, %v), want (%q, nil)", output, err, tt.wantOutput)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tt.wantError) {
+				t.Fatalf("Spawn() error = %v, want containing %q", err, tt.wantError)
+			}
+			if output != "" {
+				t.Fatalf("Spawn() output = %q on invalid result, want empty", output)
 			}
 		})
 	}

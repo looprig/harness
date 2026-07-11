@@ -2,6 +2,7 @@ package tools
 
 import (
 	"context"
+	"reflect"
 
 	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/loop"
@@ -12,6 +13,9 @@ import (
 // Every Build receives fresh concrete tools for that binding.
 func Files(readGuard loop.ReadGuard) tool.Definition {
 	return tool.NewDefinition("Files", tool.RequiresWorkspace, func(_ context.Context, bindings tool.Bindings) ([]tool.InvokableTool, error) {
+		if nilInterface(readGuard) {
+			return nil, &DefinitionBuildError{Definition: "Files", Dependency: "read_guard"}
+		}
 		root := bindings.Workspace.Root
 		return []tool.InvokableTool{
 			NewReadFile(root, readGuard),
@@ -21,12 +25,16 @@ func Files(readGuard loop.ReadGuard) tool.Definition {
 	})
 }
 
-// Bash defines a workspace-bound Bash tool. The option slice is copied so later
-// caller mutation cannot change the immutable definition.
+// Bash defines a workspace-bound Bash tool. Options are eagerly resolved into
+// sealed values so later caller mutation and option closure state cannot change
+// the immutable definition.
 func Bash(opts ...BashOption) tool.Definition {
-	copiedOpts := append([]BashOption(nil), opts...)
+	config, initErr := resolveBashOptions(opts)
 	return tool.NewDefinition(bashToolName, tool.RequiresWorkspace, func(_ context.Context, bindings tool.Bindings) ([]tool.InvokableTool, error) {
-		return []tool.InvokableTool{NewBash(bindings.Workspace.Root, copiedOpts...)}, nil
+		if initErr != nil {
+			return nil, initErr
+		}
+		return []tool.InvokableTool{newBash(bindings.Workspace.Root, config)}, nil
 	})
 }
 
@@ -57,7 +65,61 @@ func (s delegateSpawner) Spawn(
 	if err != nil {
 		return "", err
 	}
-	return result.Output, nil
+	if result.DelegateID.IsZero() {
+		return "", &delegateResultError{Status: result.Status, reason: "zero delegate id"}
+	}
+	switch result.Status {
+	case tool.DelegateStatusCompleted, tool.DelegateStatusDone:
+		return result.Output, nil
+	case tool.DelegateStatusFailed:
+		return "", &delegateResultError{Status: result.Status, reason: "delegate failed"}
+	case tool.DelegateStatusInterrupted:
+		return "", &delegateResultError{Status: result.Status, reason: "delegate interrupted"}
+	case tool.DelegateStatusTimedOut:
+		return "", &delegateResultError{Status: result.Status, reason: "delegate timed out"}
+	default:
+		return "", &delegateResultError{Status: result.Status, reason: "invalid synchronous status"}
+	}
+}
+
+type delegateResultError struct {
+	Status tool.DelegateStatusValue
+	reason string
+}
+
+func (e *delegateResultError) Error() string {
+	return "tools: invalid delegate result: " + e.reason
 }
 
 var _ Spawner = delegateSpawner{}
+
+func nilInterface(value any) bool {
+	if value == nil {
+		return true
+	}
+	rv := reflect.ValueOf(value)
+	switch rv.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice, reflect.UnsafePointer:
+		return rv.IsNil()
+	default:
+		return false
+	}
+}
+
+// DefinitionBuildError reports an invalid dependency captured by a built-in
+// definition. It is returned from Definition.Build before any tool is exposed.
+type DefinitionBuildError struct {
+	Definition string
+	Dependency string
+	Cause      error
+}
+
+func (e *DefinitionBuildError) Error() string {
+	message := "tools: " + e.Definition + " definition has invalid " + e.Dependency
+	if e.Cause != nil {
+		return message + ": " + e.Cause.Error()
+	}
+	return message
+}
+
+func (e *DefinitionBuildError) Unwrap() error { return e.Cause }

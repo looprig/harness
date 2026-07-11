@@ -83,15 +83,15 @@ type bashArgs struct {
 	Grants []string `json:"grants,omitempty"`
 }
 
-// BashTool runs a single shell command in a workspace-contained directory. It depends
-// only on the workspace root (least privilege); the advisory DeniedBashPrefixes
-// gate is the PermissionChecker's concern, not the tool's. runner is the OPTIONAL
-// confined-execution seam (§10.1): nil means direct `sh -c` execution (the
-// bare-harness default), non-nil routes the command through the injected runner
-// (e.g. the sandbox Executor) instead.
+// BashTool runs a single shell command in a workspace-contained directory. It
+// depends on the workspace root and an optional confined-execution runner;
+// advisory command policy remains the PermissionChecker's concern. A nil runner
+// means direct `sh -c` execution (the bare-harness default), while an invalid
+// option or typed-nil runner fails closed through a model-safe error.
 type BashTool struct {
-	root   string
-	runner tool.CommandRunner
+	root    string
+	runner  tool.CommandRunner
+	initErr error
 }
 
 // BashOption configures a BashTool at construction (functional-options pattern).
@@ -104,14 +104,36 @@ func WithRunner(r tool.CommandRunner) BashOption {
 	return func(b *BashTool) { b.runner = r }
 }
 
-// NewBash constructs a Bash tool bound to the workspace root. With no options the
-// runner is nil (direct execution); WithRunner injects a confined runner.
+// NewBash constructs a BashTool bound to the workspace root. With no options, or
+// WithRunner(nil), the tool uses direct execution. Invalid options and typed-nil
+// runners are retained as initialization errors and fail closed when invoked.
 func NewBash(root string, opts ...BashOption) *BashTool {
-	b := &BashTool{root: root}
-	for _, opt := range opts {
-		opt(b)
-	}
+	config, initErr := resolveBashOptions(opts)
+	b := newBash(root, config)
+	b.initErr = initErr
 	return b
+}
+
+type bashConfig struct {
+	runner tool.CommandRunner
+}
+
+func resolveBashOptions(opts []BashOption) (bashConfig, error) {
+	resolved := &BashTool{}
+	for _, opt := range opts {
+		if opt == nil {
+			return bashConfig{}, &DefinitionBuildError{Definition: bashToolName, Dependency: "option"}
+		}
+		opt(resolved)
+	}
+	if resolved.runner != nil && nilInterface(resolved.runner) {
+		return bashConfig{}, &DefinitionBuildError{Definition: bashToolName, Dependency: "runner"}
+	}
+	return bashConfig{runner: resolved.runner}, nil
+}
+
+func newBash(root string, config bashConfig) *BashTool {
+	return &BashTool{root: root, runner: config.runner}
 }
 
 // Info returns Bash's self-description. Name MUST equal "Bash".
@@ -148,6 +170,9 @@ func (b *BashTool) AuditSummary(argsJSON string) string {
 // on the prompt (a model-supplied token is not executor-verified, so it must not be
 // shown as an authorized grant).
 func (b *BashTool) BuildRequest(argsJSON string, _ tool.PreparedArtifact) (tool.PermissionRequest, error) {
+	if b.initErr != nil {
+		return nil, &bashError{reason: "Bash is unavailable", cause: b.initErr}
+	}
 	var a bashArgs
 	if err := json.Unmarshal([]byte(argsJSON), &a); err != nil {
 		return nil, &bashError{reason: "invalid arguments: not a JSON object", cause: err}
@@ -245,6 +270,9 @@ func resolveSpawnDir(root, workdir string) (string, error) {
 // workdir, or an unparseable args document is a tool-result error string. It
 // never returns a Go error.
 func (b *BashTool) InvokableRun(ctx context.Context, argsJSON string) (*tool.ToolResult, error) {
+	if b.initErr != nil {
+		return tool.TextResult("error: Bash is unavailable: " + b.initErr.Error()), nil
+	}
 	var a bashArgs
 	if err := json.Unmarshal([]byte(argsJSON), &a); err != nil {
 		return tool.TextResult("error: invalid arguments: not a JSON object"), nil

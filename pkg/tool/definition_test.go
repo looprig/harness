@@ -3,11 +3,54 @@ package tool_test
 import (
 	"context"
 	"errors"
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"path/filepath"
+	"runtime"
+	"sync"
 	"testing"
 
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/tool"
 )
+
+func TestDefinitionInterfaceIsSealed(t *testing.T) {
+	t.Parallel()
+
+	_, filename, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller() did not return the test source path")
+	}
+	parsed, err := parser.ParseFile(token.NewFileSet(), filepath.Join(filepath.Dir(filename), "definition.go"), nil, 0)
+	if err != nil {
+		t.Fatalf("parse definition.go: %v", err)
+	}
+
+	var definition *ast.InterfaceType
+	for _, declaration := range parsed.Decls {
+		general, ok := declaration.(*ast.GenDecl)
+		if !ok {
+			continue
+		}
+		for _, spec := range general.Specs {
+			typeSpec, ok := spec.(*ast.TypeSpec)
+			if !ok || typeSpec.Name.Name != "Definition" {
+				continue
+			}
+			definition, _ = typeSpec.Type.(*ast.InterfaceType)
+		}
+	}
+	if definition == nil {
+		t.Fatal("Definition interface declaration not found")
+	}
+	for _, method := range definition.Methods.List {
+		if len(method.Names) == 1 && !method.Names[0].IsExported() {
+			return
+		}
+	}
+	t.Fatal("Definition interface has no unexported sealing method; external packages can implement it")
+}
 
 type definitionTool struct{ marker byte }
 
@@ -196,6 +239,123 @@ func TestBindingsValidation(t *testing.T) {
 				t.Fatalf("InvalidBindingsError.Field = %q, want %q", bindingErr.Field, tt.wantField)
 			}
 		})
+	}
+}
+
+func TestDefinitionRejectsUnknownRequirementsBeforeFactory(t *testing.T) {
+	t.Parallel()
+
+	const unknown tool.Requirements = 1 << 7
+	called := false
+	definition := tool.NewDefinition("custom", unknown, func(context.Context, tool.Bindings) ([]tool.InvokableTool, error) {
+		called = true
+		return []tool.InvokableTool{&definitionTool{}}, nil
+	})
+
+	_, err := definition.Build(context.Background(), validBindings())
+	var requirementsErr *tool.InvalidRequirementsError
+	if !errors.As(err, &requirementsErr) {
+		t.Fatalf("Build() error = %T %v, want *tool.InvalidRequirementsError", err, err)
+	}
+	if requirementsErr.Unknown != unknown {
+		t.Fatalf("InvalidRequirementsError.Unknown = %v, want %v", requirementsErr.Unknown, unknown)
+	}
+	if called {
+		t.Fatal("factory called for unknown requirements")
+	}
+}
+
+func TestDefinitionAttenuatesBindingsBeforeFactory(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name         string
+		requirements tool.Requirements
+		check        func(*testing.T, tool.Bindings)
+	}{
+		{
+			name: "undeclared capabilities are absent",
+			check: func(t *testing.T, got tool.Bindings) {
+				t.Helper()
+				if got.Workspace != nil || got.Delegate != nil {
+					t.Fatalf("factory bindings capabilities = (%v, %v), want both nil", got.Workspace, got.Delegate)
+				}
+			},
+		},
+		{
+			name:         "workspace value is copied and delegate is absent",
+			requirements: tool.RequiresWorkspace,
+			check: func(t *testing.T, got tool.Bindings) {
+				t.Helper()
+				if got.Workspace == nil || got.Delegate != nil {
+					t.Fatalf("factory bindings capabilities = (%v, %v), want copied workspace and nil delegate", got.Workspace, got.Delegate)
+				}
+				got.Workspace.Root = "/mutated"
+			},
+		},
+		{
+			name:         "delegate is present and workspace is absent",
+			requirements: tool.RequiresDelegateController,
+			check: func(t *testing.T, got tool.Bindings) {
+				t.Helper()
+				if got.Workspace != nil || got.Delegate == nil {
+					t.Fatalf("factory bindings capabilities = (%v, %v), want nil workspace and declared delegate", got.Workspace, got.Delegate)
+				}
+			},
+		},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			bindings := validBindings()
+			originalWorkspace := bindings.Workspace
+			definition := tool.NewDefinition("custom", tt.requirements, func(_ context.Context, got tool.Bindings) ([]tool.InvokableTool, error) {
+				tt.check(t, got)
+				return []tool.InvokableTool{&definitionTool{}}, nil
+			})
+			if _, err := definition.Build(context.Background(), bindings); err != nil {
+				t.Fatalf("Build() error = %v", err)
+			}
+			if bindings.Workspace != originalWorkspace || bindings.Workspace.Root != "/workspace" {
+				t.Fatalf("caller workspace mutated: pointer=%p root=%q", bindings.Workspace, bindings.Workspace.Root)
+			}
+		})
+	}
+}
+
+func TestDefinitionConcurrentBuildsAreFresh(t *testing.T) {
+	t.Parallel()
+
+	const builds = 32
+	definition := tool.NewDefinition("custom", 0, func(context.Context, tool.Bindings) ([]tool.InvokableTool, error) {
+		return []tool.InvokableTool{&definitionTool{}}, nil
+	})
+	results := make(chan tool.InvokableTool, builds)
+	var wg sync.WaitGroup
+	for range builds {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			built, err := definition.Build(context.Background(), validBindings())
+			if err != nil {
+				t.Errorf("Build() error = %v", err)
+				return
+			}
+			results <- built[0]
+		}()
+	}
+	wg.Wait()
+	close(results)
+	seen := make(map[tool.InvokableTool]struct{}, builds)
+	for built := range results {
+		if _, exists := seen[built]; exists {
+			t.Fatal("concurrent Build() reused a tool instance")
+		}
+		seen[built] = struct{}{}
+	}
+	if len(seen) != builds {
+		t.Fatalf("fresh tool instances = %d, want %d", len(seen), builds)
 	}
 }
 

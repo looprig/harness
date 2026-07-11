@@ -18,6 +18,7 @@ const (
 	RequiresWorkspace Requirements = 1 << iota
 	// RequiresDelegateController marks definitions that build delegation tools.
 	RequiresDelegateController
+	knownRequirements = RequiresWorkspace | RequiresDelegateController
 )
 
 // WorkspaceOperation identifies the scope of a workspace mutation permit.
@@ -37,7 +38,9 @@ type WorkspacePermit interface {
 }
 
 // WorkspaceCoordinator is the narrow workspace-mutation coordination seam used
-// by runtime-bound tools.
+// by runtime-bound tools. Acquire expects WorkspaceOperationPathMutation with a
+// non-empty canonical workspace-contained path, and
+// WorkspaceOperationWholeMutation with an empty canonicalPath.
 type WorkspaceCoordinator interface {
 	Acquire(ctx context.Context, operation WorkspaceOperation, canonicalPath string) (WorkspacePermit, error)
 	Healthy() error
@@ -63,6 +66,9 @@ const (
 	DelegateStatusCompleted
 	DelegateStatusInterrupted
 	DelegateStatusFailed
+	DelegateStatusDone
+	DelegateStatusTimedOut
+	DelegateStatusQueued
 )
 
 // DelegateRequest is the typed command passed to a parent-scoped delegate
@@ -97,7 +103,8 @@ type WorkspaceBinding struct {
 }
 
 // Bindings contains session-specific runtime capabilities supplied to a
-// Definition. Definitions retain no Bindings between Build calls.
+// Definition. SessionID and LoopID must be non-zero. Definitions retain no
+// Bindings between Build calls.
 type Bindings struct {
 	SessionID uuid.UUID
 	LoopID    uuid.UUID
@@ -111,6 +118,7 @@ type Definition interface {
 	Name() string
 	Requirements() Requirements
 	Build(context.Context, Bindings) ([]InvokableTool, error)
+	definition()
 }
 
 // Factory builds concrete tools for one runtime binding. It is invoked once per
@@ -134,6 +142,8 @@ func (d *factoryDefinition) Name() string { return d.name }
 
 func (d *factoryDefinition) Requirements() Requirements { return d.requirements }
 
+func (*factoryDefinition) definition() {}
+
 // Build validates the definition and its runtime bindings, invokes the factory,
 // rejects nil tools, and returns a defensive copy of the built slice.
 func (d *factoryDefinition) Build(ctx context.Context, bindings Bindings) ([]InvokableTool, error) {
@@ -146,10 +156,13 @@ func (d *factoryDefinition) Build(ctx context.Context, bindings Bindings) ([]Inv
 	if ctx == nil {
 		return nil, &InvalidBindingsError{Field: "context"}
 	}
+	if unknown := d.requirements &^ knownRequirements; unknown != 0 {
+		return nil, &InvalidRequirementsError{Unknown: unknown}
+	}
 	if err := validateBindings(d.requirements, bindings); err != nil {
 		return nil, err
 	}
-	built, err := d.factory(ctx, bindings)
+	built, err := d.factory(ctx, attenuateBindings(d.requirements, bindings))
 	if err != nil {
 		return nil, err
 	}
@@ -164,6 +177,18 @@ func (d *factoryDefinition) Build(ctx context.Context, bindings Bindings) ([]Inv
 	result := make([]InvokableTool, len(built))
 	copy(result, built)
 	return result, nil
+}
+
+func attenuateBindings(requirements Requirements, bindings Bindings) Bindings {
+	attenuated := Bindings{SessionID: bindings.SessionID, LoopID: bindings.LoopID}
+	if requirements&RequiresWorkspace != 0 {
+		workspace := *bindings.Workspace
+		attenuated.Workspace = &workspace
+	}
+	if requirements&RequiresDelegateController != 0 {
+		attenuated.Delegate = bindings.Delegate
+	}
+	return attenuated
 }
 
 func validateBindings(requirements Requirements, bindings Bindings) error {
@@ -207,11 +232,18 @@ func nilDelegateController(value DelegateController) bool {
 
 func nilReflectValue(rv reflect.Value) bool {
 	switch rv.Kind() {
-	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice, reflect.UnsafePointer:
 		return rv.IsNil()
 	default:
 		return false
 	}
+}
+
+// InvalidRequirementsError reports requirement bits unknown to this package.
+type InvalidRequirementsError struct{ Unknown Requirements }
+
+func (e *InvalidRequirementsError) Error() string {
+	return "tool: invalid definition requirements: unknown bits " + strconv.Itoa(int(e.Unknown))
 }
 
 // InvalidDefinitionError reports invalid immutable definition metadata.

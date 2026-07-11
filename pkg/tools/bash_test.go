@@ -59,6 +59,32 @@ func TestBashInfo(t *testing.T) {
 	}
 }
 
+func TestNewBashRejectsInvalidOptionsAtRun(t *testing.T) {
+	t.Parallel()
+
+	var typedNilRunner *definitionRunner
+	tests := []struct {
+		name string
+		tool *BashTool
+	}{
+		{name: "nil option", tool: NewBash(t.TempDir(), nil)},
+		{name: "typed nil runner", tool: NewBash(t.TempDir(), WithRunner(typedNilRunner))},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			result, err := tt.tool.InvokableRun(context.Background(), `{"command":"echo must-not-run"}`)
+			if err != nil {
+				t.Fatalf("InvokableRun() Go error = %v, want model-safe tool result", err)
+			}
+			if got := textOf(t, result); !strings.HasPrefix(got, "error:") {
+				t.Fatalf("InvokableRun() result = %q, want model-safe error", got)
+			}
+		})
+	}
+}
+
 func TestBash(t *testing.T) {
 	t.Parallel()
 	requireSh(t)
