@@ -208,6 +208,80 @@ func TestWorkspaceLiveRefsScansEveryRetainedJournal(t *testing.T) {
 	}
 }
 
+func TestWorkspaceLiveRefsFailsClosed(t *testing.T) {
+	t.Parallel()
+	validRef := "v1:sha256:" + strings.Repeat("a", 64)
+
+	tests := []struct {
+		name     string
+		populate func(*testing.T, *Store, uuid.UUID)
+		wantErr  any
+	}{
+		{
+			name: "corrupt journal record",
+			populate: func(t *testing.T, st *Store, id uuid.UUID) {
+				t.Helper()
+				lease, _ := leaseFor(1, id)
+				if _, err := st.OpenJournal(context.Background(), id, lease); err != nil {
+					t.Fatalf("OpenJournal() err = %v", err)
+				}
+				tip, err := st.backend.Ledger.Tip(context.Background(), ledgerName(id))
+				if err != nil {
+					t.Fatalf("Tip() err = %v", err)
+				}
+				if err := st.backend.Ledger.Append(context.Background(), ledgerName(id), tip, []byte("{ not json")); err != nil {
+					t.Fatalf("corrupt Append() err = %v", err)
+				}
+			},
+			wantErr: new(ReplayDecodeError),
+		},
+		{
+			name: "invalid workspace ref",
+			populate: func(t *testing.T, st *Store, id uuid.UUID) {
+				t.Helper()
+				appendWorkspaceHistory(t, st, id, event.WorkspaceCheckpointed{Ref: "not-a-workspace-ref"})
+			},
+			wantErr: new(workspacestore.InvalidRefError),
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			st, err := Open(memstore.New())
+			if err != nil {
+				t.Fatalf("Open() err = %v", err)
+			}
+			validID, badID := newTestUUID(t), newTestUUID(t)
+			appendWorkspaceHistory(t, st, validID, event.WorkspaceCheckpointed{Ref: validRef})
+			tt.populate(t, st, badID)
+
+			live, err := st.WorkspaceLiveRefs(context.Background(), []uuid.UUID{validID, badID})
+			if live != nil {
+				t.Errorf("WorkspaceLiveRefs() live = %v, want nil on incomplete scan", live)
+			}
+			var scanErr *WorkspaceJournalScanError
+			if !errors.As(err, &scanErr) {
+				t.Fatalf("WorkspaceLiveRefs() err = %T %v, want *WorkspaceJournalScanError", err, err)
+			}
+			if scanErr.SessionID != badID {
+				t.Errorf("scan error session = %v, want %v", scanErr.SessionID, badID)
+			}
+			switch want := tt.wantErr.(type) {
+			case *ReplayDecodeError:
+				if !errors.As(err, &want) {
+					t.Errorf("WorkspaceLiveRefs() err = %T %v, want wrapped *ReplayDecodeError", err, err)
+				}
+			case *workspacestore.InvalidRefError:
+				if !errors.As(err, &want) {
+					t.Errorf("WorkspaceLiveRefs() err = %T %v, want wrapped *workspacestore.InvalidRefError", err, err)
+				}
+			}
+		})
+	}
+}
+
 func TestWorkspaceCheckpointLookupBySeqAndTurnSelectsSameIdentity(t *testing.T) {
 	t.Parallel()
 	st, err := Open(memstore.New())

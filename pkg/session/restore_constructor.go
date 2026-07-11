@@ -53,10 +53,10 @@ const (
 	// RestoredBuilder was wired (WithForeignBuilder). Restore fails closed rather than
 	// silently rebuilding the primary as a native loop.
 	RestoreForeignBuilderMissing RestoreErrorKind = "foreign_builder_missing"
-	// RestoreMaterializeFailed: the checkpointed workspace snapshot could not be
+	// RestoreMaterializeFailed: the effective durable workspace snapshot could not be
 	// materialized into the configured root (a corrupt journal ref, an absent/tampered
 	// blob, or a drifted non-empty root). The restore fails closed rather than come up on
-	// a workspace that does not match the durable checkpoint. The Cause is a concrete
+	// a workspace that does not match the durable workspace pointer. The Cause is a concrete
 	// *workspacestore error (*InvalidRefError / *MaterializeError / *DestNotEmptyError),
 	// errors.As-reachable through RestoreError.Unwrap.
 	RestoreMaterializeFailed RestoreErrorKind = "materialize_failed"
@@ -240,7 +240,7 @@ func restoreSession(
 	// The effective durable workspace pointer to materialize on resume (if any). Scanned over
 	// the SAME unnarrowed discovery drain; both checkpoint and restore transitions are
 	// session-scoped. Consumed at the pre-RestoreDone seam below.
-	wsRef, hasWSCheckpoint := effectiveCurrentWorkspace(all)
+	wsRef, hasWorkspacePointer := effectiveCurrentWorkspace(all)
 
 	// The last durable security-ceiling ordinal to re-seed on resume (if the session ever
 	// changed it) — folded from the SAME unnarrowed discovery drain (SecurityCeilingChanged
@@ -289,17 +289,18 @@ func restoreSession(
 		}
 	}
 
-	// (6b) Materialize the checkpointed workspace BEFORE declaring the restore done, so
+	// (6b) Materialize the workspace ref selected by the latest durable transition BEFORE
+	// declaring the restore done, so
 	// RestoreDone is appended only if the workspace is also restored (fail closed — the
-	// session never comes up on a workspace that does not match the durable checkpoint). It
+	// session never comes up on a workspace that does not match the durable pointer). It
 	// uses probe.ws/probe.wsRoot because the real *Session is not built until AFTER
 	// RestoreDone. Skipped when no workspace store is wired (a conversation-only restore —
-	// the composition root opted out) or the journal carries no checkpoint (a not-yet-
-	// checkpointed session): the root is left untouched in both cases. The journal-sourced
+	// the composition root opted out) or the journal carries no checkpoint or restore
+	// transition: the root is left untouched in both cases. The journal-sourced
 	// ref is validated through ParseRef (a trust boundary — a corrupt log fails closed) and
 	// any Materialize failure routes through the SAME recordErrored exit as every other
 	// restore failure.
-	if probe.ws != nil && hasWSCheckpoint {
+	if probe.ws != nil && hasWorkspacePointer {
 		ref, err := workspacestore.ParseRef(wsRef)
 		if err != nil {
 			return recordErrored(&RestoreError{Kind: RestoreMaterializeFailed, Cause: err})
