@@ -30,7 +30,7 @@ func (e *ConfigMismatchError) Error() string {
 
 // AgentNameMismatchError is the fail-secure rejection a restore returns when the root
 // loop's stamped AgentName (from its LoopStarted) does not match the AgentName of the
-// live primary loop.Config. The AgentName is the loop's immutable attribution identity;
+// live primary loop.Definition. The AgentName is the loop's immutable attribution identity;
 // resuming a session under a different agent name — including resuming a pre-AgentName
 // record (empty Persisted) under a now-named config, which is treated as a mismatch, not
 // silently accepted — would silently re-attribute the conversation, so the restore
@@ -98,7 +98,7 @@ func checkFingerprint(persisted, live event.ConfigFingerprint, allowMismatch boo
 }
 
 // checkAgentName is the restore root-loop AgentName decision: it returns nil when the
-// persisted (root LoopStarted) name and the configured (primary loop.Config) name are
+// persisted (root LoopStarted) name and the configured (primary loop.Definition) name are
 // equal, a typed *AgentNameMismatchError when they differ, and — when allowMismatch is
 // set — nil even on a difference (the operator's explicit opt-in, shared with the
 // fingerprint override). It is fail-secure by default and treats an EMPTY persisted name

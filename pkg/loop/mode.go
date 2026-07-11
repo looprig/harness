@@ -7,6 +7,12 @@ import (
 	"github.com/looprig/inference"
 )
 
+const (
+	defaultMaxToolIterations    = 25
+	defaultMaxToolCallsPerTurn  = 100
+	defaultMaxParallelToolCalls = 8
+)
+
 // ModeName identifies a predeclared loop mode. The empty name identifies the base mode.
 type ModeName string
 

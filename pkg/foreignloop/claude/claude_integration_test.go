@@ -10,8 +10,8 @@ import (
 	"time"
 
 	"github.com/looprig/core/content"
-	"github.com/looprig/harness/pkg/foreignloop"
 	"github.com/looprig/core/uuid"
+	"github.com/looprig/harness/pkg/foreignloop"
 )
 
 // integrationModel is a small, cheap model alias understood by the installed claude

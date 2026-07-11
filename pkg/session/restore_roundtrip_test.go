@@ -10,6 +10,7 @@ import (
 
 	"github.com/looprig/core/content"
 	"github.com/looprig/core/uuid"
+	"github.com/looprig/harness/internal/loopruntime"
 	"github.com/looprig/harness/pkg/command"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/hub"
@@ -17,6 +18,7 @@ import (
 	"github.com/looprig/harness/pkg/journal"
 	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/harness/pkg/sessionstore"
+	"github.com/looprig/harness/pkg/tool"
 	"github.com/looprig/inference"
 	"github.com/looprig/storage/memstore"
 )
@@ -143,21 +145,17 @@ func setHeader(t *testing.T, ev event.Event, hdr event.Header) event.Event {
 
 // restoreCfg is the loop.Config both the original run AND the restore use. A System
 // prompt + model id make the config fingerprint non-empty, so match/mismatch is real.
-func restoreCfg(client inference.Client, model, system string) loop.Config {
-	return loop.Config{
-		Client:       client,
-		Model:        validModel(model),
-		System:       system,
-		DrainTimeout: 200 * time.Millisecond,
-	}
+func restoreCfg(client inference.Client, model, system string) loop.Definition {
+	return mustDefine(loop.WithName("agent"), loop.WithInference(client, validModel(model)), loop.WithSystem(system), loop.WithDrainTimeout(200*time.Millisecond))
 }
 
 // restoreCfgNamed is restoreCfg with an AgentName set, so a restore can validate the
 // configured primary's attribution name against the persisted root loop's stamped name.
-func restoreCfgNamed(client inference.Client, model, system string, agent identity.AgentName) loop.Config {
-	c := restoreCfg(client, model, system)
-	c.AgentName = agent
-	return c
+func restoreCfgNamed(client inference.Client, model, system string, agent identity.AgentName) loop.Definition {
+	if agent == "" {
+		agent = "agent"
+	}
+	return mustDefine(loop.WithName(agent), loop.WithInference(client, validModel(model)), loop.WithSystem(system), loop.WithDrainTimeout(200*time.Millisecond))
 }
 
 // --- original-run builders ---------------------------------------------------------
@@ -177,7 +175,7 @@ type persistedStream struct {
 // loop (the common case). It is newOriginalHubNamed with an empty AgentName.
 func newOriginalHub(t *testing.T, store *sessionstore.Store, fp event.ConfigFingerprint) (*hub.Hub, uuid.UUID, uuid.UUID, journal.Lease, *eventStamper) {
 	t.Helper()
-	return newOriginalHubNamed(t, store, fp, "")
+	return newOriginalHubNamed(t, store, fp, "agent")
 }
 
 // newOriginalHubNamed wires a journal-backed hub for an original run (the durable-tap
@@ -220,16 +218,16 @@ func newOriginalHubNamed(t *testing.T, store *sessionstore.Store, fp event.Confi
 
 // buildOriginalRun drives `turns` complete turns through a REAL loop with an UNNAMED root
 // loop (the common case). It is buildOriginalRunNamed with an empty AgentName.
-func buildOriginalRun(t *testing.T, store *sessionstore.Store, fp event.ConfigFingerprint, cfg loop.Config, turns int) persistedStream {
+func buildOriginalRun(t *testing.T, store *sessionstore.Store, fp event.ConfigFingerprint, cfg loop.Definition, turns int) persistedStream {
 	t.Helper()
-	return buildOriginalRunNamed(t, store, fp, "", cfg, turns)
+	return buildOriginalRunNamed(t, store, fp, "agent", cfg, turns)
 }
 
 // buildOriginalRunNamed drives `turns` COMPLETE turns through a REAL loop whose events
 // persist via the journal-backed hub, stamping the root loop with agentName, then snapshots
 // the committed state and stops the loop. The lease is left held for the caller to release
 // (handover). This is the faithful "drive a few turns" path.
-func buildOriginalRunNamed(t *testing.T, store *sessionstore.Store, fp event.ConfigFingerprint, agentName identity.AgentName, cfg loop.Config, turns int) persistedStream {
+func buildOriginalRunNamed(t *testing.T, store *sessionstore.Store, fp event.ConfigFingerprint, agentName identity.AgentName, cfg loop.Definition, turns int) persistedStream {
 	t.Helper()
 	h, sessionID, primaryLoopID, lease, _ := newOriginalHubNamed(t, store, fp, agentName)
 
@@ -241,7 +239,11 @@ func buildOriginalRunNamed(t *testing.T, store *sessionstore.Store, fp event.Con
 	defer func() { _ = sub.Close() }()
 
 	loopCtx, loopCancel := context.WithCancel(context.Background())
-	l, err := loop.New(loopCtx, sessionID, primaryLoopID, loop.Provenance{}, h, cfg)
+	bound, err := cfg.Bind(loopCtx, tool.Bindings{SessionID: sessionID, LoopID: primaryLoopID})
+	if err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+	l, err := loopruntime.New(loopCtx, sessionID, primaryLoopID, loop.Provenance{}, h, bound)
 	if err != nil {
 		t.Fatalf("loop.New: %v", err)
 	}
@@ -439,7 +441,7 @@ func buildTwoLoopRun(t *testing.T, store *sessionstore.Store, fp event.ConfigFin
 // then snapshots and stops the loop. It models a crashed session that had spawned
 // `subagents` sub-loops over its lifetime — the durable record restore must recount to
 // re-seed the cumulative spawn quota. The lease is left held for the caller to release.
-func buildRunWithSubagents(t *testing.T, store *sessionstore.Store, fp event.ConfigFingerprint, cfg loop.Config, subagents int) persistedStream {
+func buildRunWithSubagents(t *testing.T, store *sessionstore.Store, fp event.ConfigFingerprint, cfg loop.Definition, subagents int) persistedStream {
 	t.Helper()
 	h, sessionID, primaryLoopID, lease, es := newOriginalHub(t, store, fp)
 
@@ -450,7 +452,11 @@ func buildRunWithSubagents(t *testing.T, store *sessionstore.Store, fp event.Con
 	defer func() { _ = sub.Close() }()
 
 	loopCtx, loopCancel := context.WithCancel(context.Background())
-	l, err := loop.New(loopCtx, sessionID, primaryLoopID, loop.Provenance{}, h, cfg)
+	bound, err := cfg.Bind(loopCtx, tool.Bindings{SessionID: sessionID, LoopID: primaryLoopID})
+	if err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+	l, err := loopruntime.New(loopCtx, sessionID, primaryLoopID, loop.Provenance{}, h, bound)
 	if err != nil {
 		t.Fatalf("loop.New: %v", err)
 	}
@@ -627,7 +633,7 @@ func submitAndDrain(t *testing.T, s *Session, input []content.Block) {
 // from the restored turnIndex.
 func TestRestoreRoundTrip(t *testing.T) {
 	store := newRestoreStore(t)
-	fp := FingerprintFrom(restoreCfg(&stubLLM{}, "model-x", "be helpful"))
+	fp := fingerprintFromDefinition(restoreCfg(&stubLLM{}, "model-x", "be helpful"))
 
 	orig := buildOriginalRun(t, store, fp, restoreCfg(&stubLLM{chunks: []content.Chunk{textChunk("reply")}}, "model-x", "be helpful"), 2)
 	handOver(t, orig.lease)
@@ -681,7 +687,7 @@ func TestRestoreRoundTrip(t *testing.T) {
 // and bump turnIndex to 2 — silently corrupting multi-loop session restore.
 func TestRestorePrimaryLoopNarrowing(t *testing.T) {
 	store := newRestoreStore(t)
-	fp := FingerprintFrom(restoreCfg(&stubLLM{}, "model-x", "be helpful"))
+	fp := fingerprintFromDefinition(restoreCfg(&stubLLM{}, "model-x", "be helpful"))
 
 	orig, _ := buildTwoLoopRun(t, store, fp)
 	handOver(t, orig.lease)
@@ -728,7 +734,7 @@ func TestRestorePrimaryLoopNarrowing(t *testing.T) {
 // fail *LeaseHeldError until the lease expired.
 func TestRestoreReleasesLeaseOnShutdown(t *testing.T) {
 	store := newRestoreStore(t)
-	fp := FingerprintFrom(restoreCfg(&stubLLM{}, "model-x", "be helpful"))
+	fp := fingerprintFromDefinition(restoreCfg(&stubLLM{}, "model-x", "be helpful"))
 
 	orig := buildOriginalRun(t, store, fp, restoreCfg(&stubLLM{chunks: []content.Chunk{textChunk("reply")}}, "model-x", "be helpful"), 1)
 	handOver(t, orig.lease)
@@ -758,7 +764,7 @@ func TestRestoreReleasesLeaseOnShutdown(t *testing.T) {
 // unless WithAllowConfigMismatch.
 func TestRestoreConfigMismatch(t *testing.T) {
 	store := newRestoreStore(t)
-	fp := FingerprintFrom(restoreCfg(&stubLLM{}, "model-x", "be helpful"))
+	fp := fingerprintFromDefinition(restoreCfg(&stubLLM{}, "model-x", "be helpful"))
 
 	orig := buildOriginalRun(t, store, fp, restoreCfg(&stubLLM{chunks: []content.Chunk{textChunk("reply")}}, "model-x", "be helpful"), 1)
 	handOver(t, orig.lease)
@@ -828,7 +834,7 @@ func TestRestoreSwarmFingerprintMismatch(t *testing.T) {
 			store := newRestoreStore(t)
 			cfg := restoreCfg(&stubLLM{}, "model-x", "be helpful")
 			// Persist the fingerprint the original ran under: loop-derived + the swarm fields.
-			persistedFP := fingerprintWith(cfg, persistedFields)
+			persistedFP := fingerprintWithDefinition(cfg, persistedFields)
 
 			orig := buildOriginalRun(t, store, persistedFP,
 				restoreCfg(&stubLLM{chunks: []content.Chunk{textChunk("reply")}}, "model-x", "be helpful"), 1)
@@ -897,7 +903,7 @@ func TestRestoreAgentNameMismatch(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			store := newRestoreStore(t)
-			fp := FingerprintFrom(restoreCfg(&stubLLM{}, "model-x", "be helpful"))
+			fp := fingerprintFromDefinition(restoreCfg(&stubLLM{}, "model-x", "be helpful"))
 
 			orig := buildOriginalRunNamed(t, store, fp, tt.persistedAgent,
 				restoreCfgNamed(&stubLLM{chunks: []content.Chunk{textChunk("reply")}}, "model-x", "be helpful", tt.persistedAgent), 1)
@@ -951,7 +957,7 @@ func TestRestoreAgentNameMismatch(t *testing.T) {
 // user + completed steps (no partial), appends a TurnInterrupted, and comes up idle.
 func TestRestoreCrashMidTurn(t *testing.T) {
 	store := newRestoreStore(t)
-	fp := FingerprintFrom(restoreCfg(&stubLLM{}, "model-x", "be helpful"))
+	fp := fingerprintFromDefinition(restoreCfg(&stubLLM{}, "model-x", "be helpful"))
 
 	orig := buildCrashedRun(t, store, fp)
 	handOver(t, orig.lease)
@@ -994,7 +1000,7 @@ func TestRestoreCrashMidTurn(t *testing.T) {
 // merely that the pure foldPrimaryLoop is correct.
 func TestRestoreComplexShapesRoundTrip(t *testing.T) {
 	store := newRestoreStore(t)
-	fp := FingerprintFrom(restoreCfg(&stubLLM{}, "model-x", "be helpful"))
+	fp := fingerprintFromDefinition(restoreCfg(&stubLLM{}, "model-x", "be helpful"))
 
 	orig := buildComplexShapesRun(t, store, fp)
 	handOver(t, orig.lease)
@@ -1036,7 +1042,7 @@ func TestRestoreComplexShapesRoundTrip(t *testing.T) {
 func TestRestoreRecountsSpawnQuota(t *testing.T) {
 	const k = 3
 	store := newRestoreStore(t)
-	fp := FingerprintFrom(restoreCfg(&stubLLM{}, "model-x", "be helpful"))
+	fp := fingerprintFromDefinition(restoreCfg(&stubLLM{}, "model-x", "be helpful"))
 
 	orig := buildRunWithSubagents(t, store, fp,
 		restoreCfg(&stubLLM{chunks: []content.Chunk{textChunk("reply")}}, "model-x", "be helpful"), k)

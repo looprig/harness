@@ -65,12 +65,9 @@ func TestCodexForeignRestoreRecoversSIDFromForeignSessionBound(t *testing.T) {
 	fb.turnIndex = folded.TurnIndex
 	builder.backend = fb
 
-	c := cfg(&stubLLM{chunks: []content.Chunk{textChunk("x")}})
-	c.Engine = loop.EngineForeignCodex
-	c.System = "be helpful"
-
 	sessionID := mustUUID()
 	primaryLoopID := mustUUID()
+	c := bindCfg(engineCfg(&stubLLM{chunks: []content.Chunk{textChunk("x")}}, loop.EngineForeignCodex, "be helpful"), sessionID, primaryLoopID)
 	fac := event.NewFactory(uuid.New, time.Now)
 
 	s, err := buildRestoredSession(context.Background(), c, sessionID, primaryLoopID,
@@ -123,11 +120,11 @@ func TestCodexForeignRestoreFailsClosedWithoutSIDSource(t *testing.T) {
 	}
 
 	builder := &fakeForeignBuilder{}
-	c := cfg(&stubLLM{chunks: []content.Chunk{textChunk("x")}})
-	c.Engine = loop.EngineForeignCodex
-	c.System = "be helpful"
+	sessionID := mustUUID()
+	primaryLoopID := mustUUID()
+	c := bindCfg(engineCfg(&stubLLM{chunks: []content.Chunk{textChunk("x")}}, loop.EngineForeignCodex, "be helpful"), sessionID, primaryLoopID)
 
-	s, err := buildRestoredSession(context.Background(), c, mustUUID(), mustUUID(),
+	s, err := buildRestoredSession(context.Background(), c, sessionID, primaryLoopID,
 		foreignSID, 0, 0, false, folded, nil, fakeSessionJournal{}, event.NewFactory(uuid.New, time.Now), uuid.New, time.Now,
 		WithForeignBuilder(builder.build, builder.buildRestored))
 	if s != nil {
@@ -226,12 +223,9 @@ func TestForeignRestore(t *testing.T) {
 				builder.backend = fb
 			}
 
-			c := cfg(&stubLLM{chunks: []content.Chunk{textChunk("x")}})
-			c.Engine = tt.engine
-			c.System = "be helpful"
-
 			sessionID := mustUUID()
 			primaryLoopID := mustUUID()
+			c := bindCfg(engineCfg(&stubLLM{chunks: []content.Chunk{textChunk("x")}}, tt.engine, "be helpful"), sessionID, primaryLoopID)
 			fac := event.NewFactory(uuid.New, time.Now)
 
 			var opts []Option

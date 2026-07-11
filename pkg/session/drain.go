@@ -5,8 +5,8 @@ import (
 	"strings"
 
 	"github.com/looprig/core/content"
-	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/core/uuid"
+	"github.com/looprig/harness/pkg/event"
 )
 
 // drainFailedError wraps a TurnFailed.Err terminal: the sub-loop's turn ended on

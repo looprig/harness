@@ -139,12 +139,12 @@ func TestNewLoopQuotaRollback(t *testing.T) {
 	// reservation), forcing the rollback path. Repeat MORE than `quota` times: without
 	// rollback the quota would be exhausted by these failures and the valid spawns below
 	// would be wrongly refused.
-	badCfg := loop.Config{Model: validModel("m")} // nil Client
+	badCfg := loop.Definition{}
 	for i := 0; i < quota+2; i++ {
 		_, err := s.NewLoop(loop.Provenance{LoopID: s.PrimaryLoopID()}, badCfg)
-		var ce *loop.ConfigError
-		if !errors.As(err, &ce) || ce.Kind != loop.ConfigMissingClient {
-			t.Fatalf("forced loop.New failure #%d err = %v, want *loop.ConfigError{ConfigMissingClient}", i+1, err)
+		var be *loop.BindError
+		if !errors.As(err, &be) || be.Kind != loop.BindInvalidDefinition {
+			t.Fatalf("forced loop bind failure #%d err = %v, want *loop.BindError{BindInvalidDefinition}", i+1, err)
 		}
 	}
 	// Every failure rolled back, so spawned is back to 0.

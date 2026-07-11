@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/harness/pkg/tool"
@@ -23,17 +24,33 @@ func (t fpTool) InvokableRun(ctx context.Context, argsJSON string) (*tool.ToolRe
 
 // fpConfig builds a loop.Config with the given model, system prompt, and tool
 // names so a test can vary exactly one fingerprint input at a time.
-func fpConfig(model, system string, toolNames ...string) loop.Config {
-	reg := make([]tool.InvokableTool, 0, len(toolNames))
+func fpConfig(model, system string, toolNames ...string) loop.Definition {
+	defs := make([]tool.Definition, 0, len(toolNames))
 	for _, n := range toolNames {
-		reg = append(reg, fpTool{name: n})
+		name := n
+		defs = append(defs, tool.NewDefinition(name, 0, func(context.Context, tool.Bindings) ([]tool.InvokableTool, error) {
+			return []tool.InvokableTool{fpTool{name: name}}, nil
+		}))
 	}
-	return loop.Config{
-		Client: &stubLLM{},
-		Model:  validModel(model),
-		System: system,
-		Tools:  loop.ToolSet{Registry: reg},
+	return mustDefine(loop.WithName("agent"), loop.WithInference(&stubLLM{}, validModel(model)), loop.WithSystem(system), loop.WithTools(defs...), loop.WithDrainTimeout(100*time.Millisecond))
+}
+
+func bindFingerprintDefinition(d loop.Definition) loop.BoundDefinition {
+	sessionID, _ := uuid.New()
+	loopID, _ := uuid.New()
+	bound, err := d.Bind(context.Background(), tool.Bindings{SessionID: sessionID, LoopID: loopID})
+	if err != nil {
+		panic(err)
 	}
+	return bound
+}
+
+func fingerprintFromDefinition(d loop.Definition) event.ConfigFingerprint {
+	return FingerprintFrom(bindFingerprintDefinition(d))
+}
+
+func fingerprintWithDefinition(d loop.Definition, fields ConfigFingerprintFields) event.ConfigFingerprint {
+	return fingerprintWith(bindFingerprintDefinition(d), fields)
 }
 
 // TestFingerprintFromRestoreStable is the RESTORE-STABILITY guard for the
@@ -61,7 +78,7 @@ func TestFingerprintFromRestoreStable(t *testing.T) {
 		// sha256("Read\nWrite") — tool names sorted then newline-joined
 		wantToolPolicyRev = "fb0af83c64ef5c27e469abea2e7b687f23f281f6619218d3ea42a35a2222af25"
 	)
-	fp := FingerprintFrom(fpConfig("gpt-4o-2024", "You are a helpful assistant.", "Read", "Write"))
+	fp := fingerprintFromDefinition(fpConfig("gpt-4o-2024", "You are a helpful assistant.", "Read", "Write"))
 	if fp.ModelID != wantModelID {
 		t.Errorf("ModelID = %q, want %q", fp.ModelID, wantModelID)
 	}
@@ -80,14 +97,14 @@ func TestFingerprintFromRestoreStable(t *testing.T) {
 func TestFingerprintFromDeterministic(t *testing.T) {
 	t.Parallel()
 
-	a := FingerprintFrom(fpConfig("model-x", "you are helpful", "Read", "Write"))
-	b := FingerprintFrom(fpConfig("model-x", "you are helpful", "Read", "Write"))
+	a := fingerprintFromDefinition(fpConfig("model-x", "you are helpful", "Read", "Write"))
+	b := fingerprintFromDefinition(fpConfig("model-x", "you are helpful", "Read", "Write"))
 	if !a.Equal(b) {
 		t.Fatalf("FingerprintFrom not deterministic: %+v != %+v", a, b)
 	}
 
 	// Tool ordering must not change the fingerprint (names are sorted before hashing).
-	reordered := FingerprintFrom(fpConfig("model-x", "you are helpful", "Write", "Read"))
+	reordered := fingerprintFromDefinition(fpConfig("model-x", "you are helpful", "Write", "Read"))
 	if !a.Equal(reordered) {
 		t.Errorf("tool order changed fingerprint: %+v != %+v", a, reordered)
 	}
@@ -108,11 +125,11 @@ func TestFingerprintFromDeterministic(t *testing.T) {
 func TestFingerprintFromDiffers(t *testing.T) {
 	t.Parallel()
 
-	base := FingerprintFrom(fpConfig("model-x", "prompt A", "Read"))
+	base := fingerprintFromDefinition(fpConfig("model-x", "prompt A", "Read"))
 
 	tests := []struct {
 		name string
-		cfg  loop.Config
+		cfg  loop.Definition
 	}{
 		{"different model", fpConfig("model-y", "prompt A", "Read")},
 		{"different system prompt", fpConfig("model-x", "prompt B", "Read")},
@@ -123,7 +140,7 @@ func TestFingerprintFromDiffers(t *testing.T) {
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			got := FingerprintFrom(tt.cfg)
+			got := fingerprintFromDefinition(tt.cfg)
 			if base.Equal(got) {
 				t.Errorf("fingerprint did not change for %s: both %+v", tt.name, got)
 			}
@@ -138,7 +155,7 @@ func TestFingerprintFromDiffers(t *testing.T) {
 // fingerprintWith.
 func TestFingerprintFromSwarmFieldsEmpty(t *testing.T) {
 	t.Parallel()
-	fp := FingerprintFrom(fpConfig("model-x", "prompt", "Read"))
+	fp := fingerprintFromDefinition(fpConfig("model-x", "prompt", "Read"))
 	if fp.AgentKind != "" {
 		t.Errorf("AgentKind = %q, want \"\" (not a loop.Config field)", fp.AgentKind)
 	}
@@ -164,7 +181,7 @@ func TestFingerprintWithMergesSwarmFields(t *testing.T) {
 		RuntimeSkills: true,
 		WorkspaceRoot: "/home/user/repo",
 	}
-	baseFP := fingerprintWith(cfg, base)
+	baseFP := fingerprintWithDefinition(cfg, base)
 
 	// The merged fingerprint carries the injected fields verbatim.
 	if baseFP.AgentKind != base.AgentKind {
@@ -196,7 +213,7 @@ func TestFingerprintWithMergesSwarmFields(t *testing.T) {
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			got := fingerprintWith(cfg, tt.fields)
+			got := fingerprintWithDefinition(cfg, tt.fields)
 			if baseFP.Equal(got) {
 				t.Errorf("fingerprint did not change for %s: both %+v", tt.name, got)
 			}
@@ -225,7 +242,7 @@ func TestFingerprintWithForeignFields(t *testing.T) {
 		Posture:                   "default",
 		NativePermissionPolicyRev: "policyrev-aaa",
 	}
-	baseFP := fingerprintWith(cfg, base)
+	baseFP := fingerprintWithDefinition(cfg, base)
 
 	// The merged fingerprint carries the injected foreign fields verbatim.
 	if baseFP.WorkspaceRoot != base.WorkspaceRoot {
@@ -265,7 +282,7 @@ func TestFingerprintWithForeignFields(t *testing.T) {
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			got := fingerprintWith(cfg, tt.fields)
+			got := fingerprintWithDefinition(cfg, tt.fields)
 			if baseFP.Equal(got) != tt.wantEqual {
 				t.Errorf("Equal = %v, want %v for %s: base=%+v got=%+v",
 					baseFP.Equal(got), tt.wantEqual, tt.name, baseFP, got)
@@ -291,7 +308,7 @@ func TestFingerprintWithExecAndEnvNotInputs(t *testing.T) {
 	// Two calls identical in every fingerprint input. Were exec path or child env an
 	// input, this would be where they would diverge; they are intentionally absent, so
 	// the fingerprints must be Equal.
-	if !fingerprintWith(cfg, fields).Equal(fingerprintWith(cfg, fields)) {
+	if !fingerprintWithDefinition(cfg, fields).Equal(fingerprintWithDefinition(cfg, fields)) {
 		t.Error("fingerprintWith is non-deterministic for identical inputs; exec path / env must not be fingerprinted")
 	}
 }
@@ -303,7 +320,7 @@ func TestFingerprintWithExecAndEnvNotInputs(t *testing.T) {
 func TestFingerprintWithEmptyFieldsMatchesBare(t *testing.T) {
 	t.Parallel()
 	cfg := fpConfig("model-x", "prompt", "Read")
-	if !fingerprintWith(cfg, ConfigFingerprintFields{}).Equal(FingerprintFrom(cfg)) {
+	if !fingerprintWithDefinition(cfg, ConfigFingerprintFields{}).Equal(fingerprintFromDefinition(cfg)) {
 		t.Error("fingerprintWith with empty fields != bare FingerprintFrom; the compatibility path is broken")
 	}
 }
@@ -313,8 +330,8 @@ func TestFingerprintWithEmptyFieldsMatchesBare(t *testing.T) {
 // well-defined and equal across calls).
 func TestFingerprintFromEmptyTools(t *testing.T) {
 	t.Parallel()
-	a := FingerprintFrom(loop.Config{Client: &stubLLM{}})
-	b := FingerprintFrom(loop.Config{Client: &stubLLM{}})
+	a := fingerprintFromDefinition(fpConfig("m", ""))
+	b := fingerprintFromDefinition(fpConfig("m", ""))
 	if !a.Equal(b) {
 		t.Errorf("empty-config fingerprint not deterministic: %+v != %+v", a, b)
 	}
@@ -331,8 +348,7 @@ func TestSessionStartedCarriesConfig(t *testing.T) {
 	t.Parallel()
 
 	cfg := fpConfig("model-x", "you are helpful", "Read", "Write")
-	cfg.DrainTimeout = 100 * time.Millisecond
-	want := FingerprintFrom(cfg)
+	want := fingerprintFromDefinition(cfg)
 	if want.Equal(event.ConfigFingerprint{}) {
 		t.Fatalf("FingerprintFrom(construction cfg) is empty; SessionStarted would carry no config")
 	}

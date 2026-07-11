@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/looprig/core/uuid"
+	"github.com/looprig/harness/internal/loopruntime"
 	"github.com/looprig/harness/pkg/ceiling"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/foreignloop"
@@ -14,6 +15,7 @@ import (
 	"github.com/looprig/harness/pkg/journal"
 	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/harness/pkg/sessionstore"
+	"github.com/looprig/harness/pkg/tool"
 	"github.com/looprig/harness/pkg/workspacestore"
 )
 
@@ -113,7 +115,7 @@ func (e *RestoreError) Unwrap() error { return e.Cause }
 // how the lease is composition-root-owned in the durable-tap path), out of scope here.
 func Restore(
 	ctx context.Context,
-	cfg loop.Config,
+	cfg loop.Definition,
 	sessionID uuid.UUID,
 	store *sessionstore.Store,
 	opts ...Option,
@@ -126,7 +128,7 @@ func Restore(
 // drive a mint failure. Restore calls it with the production defaults.
 func restoreSession(
 	ctx context.Context,
-	cfg loop.Config,
+	cfg loop.Definition,
 	sessionID uuid.UUID,
 	store *sessionstore.Store,
 	newID idGenerator,
@@ -212,10 +214,6 @@ func restoreSession(
 	if err != nil {
 		return recordErrored(err)
 	}
-	if err := checkFingerprint(persisted, fingerprintWith(cfg, fingerprintFields), allowMismatch); err != nil {
-		return recordErrored(err)
-	}
-
 	// The root LoopStarted carries both the primary loop's stable id (restore reuses it)
 	// and its immutable stamped AgentName. Validate the stamped name against the live
 	// primary config's AgentName — an empty (legacy/pre-AgentName) stored name vs a
@@ -225,10 +223,17 @@ func restoreSession(
 	if err != nil {
 		return recordErrored(err)
 	}
-	if err := checkAgentName(rootLoop.Header.AgentName, cfg.AgentName, allowMismatch); err != nil {
+	primaryLoopID := rootLoop.LoopID
+	bound, err := cfg.Bind(ctx, tool.Bindings{SessionID: sessionID, LoopID: primaryLoopID})
+	if err != nil {
+		return recordErrored(&RestoreError{Kind: RestoreLoopFailed, Cause: err})
+	}
+	if err := checkFingerprint(persisted, fingerprintWith(bound, fingerprintFields), allowMismatch); err != nil {
 		return recordErrored(err)
 	}
-	primaryLoopID := rootLoop.LoopID
+	if err := checkAgentName(rootLoop.Header.AgentName, bound.Name(), allowMismatch); err != nil {
+		return recordErrored(err)
+	}
 
 	// Re-seed the cumulative spawn counter from the durable log so the quota SURVIVES the
 	// restart: count the non-root LoopStarted events (subagent spawns). `all` is the
@@ -331,7 +336,7 @@ func restoreSession(
 	// stamped it on LoopStarted; late-bound adapters record it with ForeignSessionBound.
 	// buildRestoredSession fails closed on an empty sid for a foreign engine.
 	foreignSID := findForeignSID(primaryEvents)
-	s, err := buildRestoredSession(ctx, cfg, sessionID, primaryLoopID, foreignSID, spawnedCount, ceilingLevel, hasCeiling, folded, restoredGates.open, j, factory, newID, now, leaseOpts...)
+	s, err := buildRestoredSession(ctx, bound, sessionID, primaryLoopID, foreignSID, spawnedCount, ceilingLevel, hasCeiling, folded, restoredGates.open, j, factory, newID, now, leaseOpts...)
 	if err != nil {
 		return recordErrored(err)
 	}
@@ -346,7 +351,7 @@ func restoreSession(
 // difference from New.
 func buildRestoredSession(
 	ctx context.Context,
-	cfg loop.Config,
+	cfg loop.BoundDefinition,
 	sessionID, primaryLoopID uuid.UUID,
 	foreignSID string,
 	spawnedCount int,
@@ -428,10 +433,10 @@ func buildRestoredSession(
 	// session backstop, exactly like the native path.
 	loopCtx, cancel := context.WithCancel(sessionCtx)
 	var l loop.Backend
-	switch cfg.Engine {
+	switch cfg.Engine() {
 	case loop.EngineNative:
-		l, err = loop.NewRestored(loopCtx, sessionID, primaryLoopID, s, cfg,
-			loop.RestoredState{Msgs: folded.Msgs, TurnIndex: folded.TurnIndex})
+		l, err = loopruntime.NewRestored(loopCtx, sessionID, primaryLoopID, loop.Provenance{}, s, cfg,
+			loopruntime.RestoredState{Msgs: folded.Msgs, TurnIndex: folded.TurnIndex})
 	default:
 		if foreignSID == "" {
 			cancel()

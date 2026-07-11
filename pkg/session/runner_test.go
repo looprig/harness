@@ -94,8 +94,8 @@ func newRecordingStore(t *testing.T) (*sessionstore.Store, *recordingLeaser) {
 // badClientCfg is a loop.Config with a valid model but a nil Client, so session.New fails
 // building the primary loop — the deterministic way to drive the RunSessionFailed branch
 // (the lease has already been acquired, so this also exercises lease-release-on-failure).
-func badClientCfg() loop.Config {
-	return loop.Config{Model: validModel("m")}
+func badClientCfg() loop.Definition {
+	return loop.Definition{}
 }
 
 // TestRunnerCompile proves Compile binds cfg+store into a reusable Runner and fails
@@ -253,7 +253,7 @@ func TestRunnerRun(t *testing.T) {
 // for quiescence, then clean-shutdown (releasing the lease so a later Restore can re-acquire)
 // — and returns the minted session id. It is the durable-history setup the Restore table
 // rows resume from.
-func runAndShutdown(t *testing.T, store *sessionstore.Store, c loop.Config) uuid.UUID {
+func runAndShutdown(t *testing.T, store *sessionstore.Store, c loop.Definition) uuid.UUID {
 	t.Helper()
 	r, err := Compile(c, store)
 	if err != nil {

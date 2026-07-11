@@ -24,7 +24,7 @@ type persistedGateStream struct {
 	gateID        gate.ID
 }
 
-func buildGateRestoreStream(t *testing.T, store *sessionstore.Store, cfg loop.Config, prepared, opened, resolved bool) persistedGateStream {
+func buildGateRestoreStream(t *testing.T, store *sessionstore.Store, cfg loop.Definition, prepared, opened, resolved bool) persistedGateStream {
 	t.Helper()
 	sessionID := mustSessionID(t)
 	primaryLoopID := mustSessionID(t)
@@ -69,10 +69,14 @@ func buildGateRestoreStream(t *testing.T, store *sessionstore.Store, cfg loop.Co
 
 	appendEvent(event.SessionStarted{
 		Header: stamp(identity.Coordinates{SessionID: sessionID}),
-		Config: FingerprintFrom(cfg),
+		Config: fingerprintFromDefinition(cfg),
 	})
 	appendEvent(event.LoopStarted{
-		Header: stamp(identity.Coordinates{SessionID: sessionID, LoopID: primaryLoopID}),
+		Header: func() event.Header {
+			h := stamp(identity.Coordinates{SessionID: sessionID, LoopID: primaryLoopID})
+			h.AgentName = "agent"
+			return h
+		}(),
 	})
 
 	coords := identity.Coordinates{SessionID: sessionID, LoopID: primaryLoopID, TurnID: turnID, StepID: stepID}

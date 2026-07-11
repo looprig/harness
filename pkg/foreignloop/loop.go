@@ -35,7 +35,7 @@ type Loop struct {
 	sid       string // the minted foreign session id (stamped onto LoopStarted by the caller)
 	parent    loop.Provenance
 	pub       EventPublisher
-	cfg       loop.Config
+	cfg       loop.BoundDefinition
 	spec      Spec
 	idGen     func() (uuid.UUID, error)
 	fac       *event.Factory
@@ -56,7 +56,7 @@ var _ loop.Backend = (*Loop)(nil)
 // it onto LoopStarted). loopCtx is the loop's lifetime; cancelling it tears the
 // actor down.
 func New(loopCtx context.Context, sessionID, loopID uuid.UUID, parent loop.Provenance,
-	pub EventPublisher, cfg loop.Config, spec Spec,
+	pub EventPublisher, cfg loop.BoundDefinition, spec Spec,
 	idGen func() (uuid.UUID, error), fac *event.Factory) (*Loop, string, error) {
 	if err := validateWiring(cfg, spec, idGen, fac, pub); err != nil {
 		return nil, "", err
@@ -97,9 +97,9 @@ func New(loopCtx context.Context, sessionID, loopID uuid.UUID, parent loop.Prove
 // validateWiring fail-secure validates the caller-supplied wiring shared by New and
 // NewRestored, returning a typed *ConfigError on the first missing dependency. It does
 // NOT validate the restore seed; that is the restored constructor's own concern.
-func validateWiring(cfg loop.Config, spec Spec, idGen func() (uuid.UUID, error), fac *event.Factory, pub EventPublisher) error {
+func validateWiring(cfg loop.BoundDefinition, spec Spec, idGen func() (uuid.UUID, error), fac *event.Factory, pub EventPublisher) error {
 	switch {
-	case cfg.System == "":
+	case cfg == nil || cfg.System() == "":
 		return &ConfigError{Field: "System", Reason: "required"}
 	case spec.Agent == nil:
 		return &ConfigError{Field: "Spec.Agent", Reason: "required"}
@@ -114,13 +114,13 @@ func validateWiring(cfg loop.Config, spec Spec, idGen func() (uuid.UUID, error),
 }
 
 // BuildWith adapts New to the foreignloop.Builder seam the composition root wires:
-// it closes over the per-agent Spec (resolved at the root, NOT on loop.Config) and
+// it closes over the per-agent Spec (resolved at the root, NOT on loop.BoundDefinition) and
 // returns a Builder that constructs the foreign loop as a loop.Backend. On a
 // construction error it returns a NIL Backend (never a non-nil interface wrapping a
 // nil *Loop), so the caller's nil check behaves.
 func BuildWith(spec Spec) Builder {
 	return func(loopCtx context.Context, sessionID, loopID uuid.UUID,
-		parent loop.Provenance, pub EventPublisher, cfg loop.Config,
+		parent loop.Provenance, pub EventPublisher, cfg loop.BoundDefinition,
 		idGen func() (uuid.UUID, error), fac *event.Factory) (loop.Backend, string, error) {
 		l, sid, err := New(loopCtx, sessionID, loopID, parent, pub, cfg, spec, idGen, fac)
 		if err != nil {

@@ -7,9 +7,9 @@ import (
 	"time"
 
 	"github.com/looprig/core/content"
+	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/loop"
-	"github.com/looprig/core/uuid"
 )
 
 // spawnChild spawns one sub-loop under parentLoopID, returning the new loop id. It

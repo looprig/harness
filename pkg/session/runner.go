@@ -76,7 +76,7 @@ func (e *RunError) Unwrap() error { return e.Cause }
 // wiring (lease, journal, appenders) from the shared store, so two live sessions never
 // share a lease or a journal.
 type Runner struct {
-	cfg   loop.Config
+	cfg   loop.Definition
 	store *sessionstore.Store
 
 	// catalog is the derived session-index the per-run event appender notifies (via
@@ -130,7 +130,7 @@ func WithCompileLimits(l Limits) CompileOption {
 }
 
 // WithCompileConfigFingerprintFields captures the swarm-level config-fingerprint inputs
-// (AgentKind/RuntimeSkills/WorkspaceRoot/…) that do not live on loop.Config. This is THE
+// (AgentKind/RuntimeSkills/WorkspaceRoot/…) that do not live on loop.Definition. This is THE
 // fingerprinted option: it is stamped on New's SessionStarted and re-merged into the LIVE
 // fingerprint Restore compares, so it MUST be identical between the Run that created a
 // session and the Restore that resumes it — hence its capture-once-at-Compile placement.
@@ -196,7 +196,7 @@ func WithCompileCeilingFactory(factory CeilingFactory) CompileOption {
 // facing options once. A nil store is rejected with a typed *NilStoreError (the durable
 // backend is required). It does no session I/O — the derived catalog it opens is cheap and
 // cannot fail — so the returned Runner is ready to Run/Restore.
-func Compile(cfg loop.Config, store *sessionstore.Store, opts ...CompileOption) (*Runner, error) {
+func Compile(cfg loop.Definition, store *sessionstore.Store, opts ...CompileOption) (*Runner, error) {
 	if store == nil {
 		return nil, &NilStoreError{}
 	}

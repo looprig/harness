@@ -5,8 +5,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/core/uuid"
+	"github.com/looprig/harness/pkg/event"
 )
 
 // workingFac builds an event Factory whose EventID mint always succeeds. The

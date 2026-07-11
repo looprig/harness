@@ -15,7 +15,6 @@ import (
 	"github.com/looprig/harness/pkg/hub"
 	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/journal"
-	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/harness/pkg/tool"
 )
 
@@ -103,7 +102,7 @@ func gateSession(t *testing.T) (*Session, *fakeGateAppender, uuid.UUID, chan com
 		gateTimers:    map[gate.ID]*time.Timer{},
 	}
 	s.factory = event.NewFactory(func() (uuid.UUID, error) { return s.newID() }, func() time.Time { return s.now() })
-	s.loops[loopID] = &loopHandle{backend: &loop.Loop{Commands: cmds, Done: make(chan struct{})}}
+	s.loops[loopID] = &loopHandle{backend: &channelBackend{Commands: cmds, Done: make(chan struct{})}}
 	return s, app, loopID, cmds
 }
 
@@ -783,8 +782,8 @@ func gateSessionTwoLoops(t *testing.T) (s *Session, loopA, loopB uuid.UUID, cmds
 		gateTimers:    map[gate.ID]*time.Timer{},
 	}
 	s.factory = event.NewFactory(func() (uuid.UUID, error) { return s.newID() }, func() time.Time { return s.now() })
-	s.loops[loopA] = &loopHandle{backend: &loop.Loop{Commands: cmdsA, Done: make(chan struct{})}}
-	s.loops[loopB] = &loopHandle{backend: &loop.Loop{Commands: cmdsB, Done: make(chan struct{})}}
+	s.loops[loopA] = &loopHandle{backend: &channelBackend{Commands: cmdsA, Done: make(chan struct{})}}
+	s.loops[loopB] = &loopHandle{backend: &channelBackend{Commands: cmdsB, Done: make(chan struct{})}}
 	return s, loopA, loopB, cmdsA, cmdsB
 }
 

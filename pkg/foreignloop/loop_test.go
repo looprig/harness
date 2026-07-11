@@ -6,17 +6,41 @@ import (
 	"testing"
 	"time"
 
+	"github.com/looprig/core/content"
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/command"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/loop"
+	"github.com/looprig/harness/pkg/tool"
+	"github.com/looprig/inference"
 )
 
-// validCfg is the minimal loop.Config a foreign loop accepts: a non-empty system
-// prompt (the only field foreignloop.New validates).
-func validCfg() loop.Config {
-	return loop.Config{System: "you are a test agent"}
+type boundTestClient struct{}
+
+func (boundTestClient) Invoke(context.Context, inference.Request) (*inference.Response, error) {
+	return nil, errors.New("unused")
 }
+func (boundTestClient) Stream(context.Context, inference.Request) (*inference.StreamReader[content.Chunk], error) {
+	return nil, errors.New("unused")
+}
+
+// validCfg is the minimal loop.BoundDefinition a foreign loop accepts: a non-empty system
+// prompt (the only field foreignloop.New validates).
+func validCfg() loop.BoundDefinition {
+	d, err := loop.Define(loop.WithName("agent"), loop.WithInference(boundTestClient{}, inference.Model{Provider: "lmstudio", APIFormat: inference.APIFormatOpenAI, BaseURL: "http://localhost:1234", Name: "m"}), loop.WithSystem("you are a test agent"))
+	if err != nil {
+		panic(err)
+	}
+	bound, err := d.Bind(context.Background(), tool.Bindings{SessionID: mustID(panicT{}), LoopID: mustID(panicT{})})
+	if err != nil {
+		panic(err)
+	}
+	return bound
+}
+
+type panicT struct{}
+
+func (panicT) Fatal(args ...any) { panic(args) }
 
 // newTestLoop wires a foreign loop to a fakePublisher with a deterministic
 // correlation idGen and a working EventID factory, registering ctx cleanup.
@@ -49,7 +73,7 @@ func TestNewValidation(t *testing.T) {
 	good := func() Spec { return Spec{Agent: &fakeAgent{}} }
 	tests := []struct {
 		name    string
-		cfg     loop.Config
+		cfg     loop.BoundDefinition
 		spec    Spec
 		pub     EventPublisher
 		nilGen  bool
@@ -57,7 +81,7 @@ func TestNewValidation(t *testing.T) {
 		wantErr bool
 	}{
 		{name: "happy path", cfg: validCfg(), spec: good(), pub: &fakePublisher{}, wantErr: false},
-		{name: "empty system prompt", cfg: loop.Config{}, spec: good(), pub: &fakePublisher{}, wantErr: true},
+		{name: "empty system prompt", cfg: nil, spec: good(), pub: &fakePublisher{}, wantErr: true},
 		{name: "nil agent", cfg: validCfg(), spec: Spec{}, pub: &fakePublisher{}, wantErr: true},
 		{name: "nil publisher", cfg: validCfg(), spec: good(), pub: nil, wantErr: true},
 		{name: "nil idGen", cfg: validCfg(), spec: good(), pub: &fakePublisher{}, nilGen: true, wantErr: true},

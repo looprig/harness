@@ -9,10 +9,11 @@ import (
 
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/loop"
+	"github.com/looprig/harness/pkg/tool"
 )
 
 // ConfigFingerprintFields are the swarm-level fingerprint inputs that do NOT live on
-// loop.Config and so cannot be derived by FingerprintFrom alone. The composition root
+// loop.Definition and so cannot be derived by FingerprintFrom alone. The composition root
 // (the swarm) injects them via WithConfigFingerprintFields; both the New and Restore
 // construction paths merge them onto the loop-derived fingerprint, so a session cannot
 // silently resume under a different agent identity, skill-trust mode, or workspace.
@@ -45,8 +46,8 @@ type ConfigFingerprintFields struct {
 }
 
 // FingerprintFrom derives the stable config fingerprint a session stamps onto its
-// SessionStarted from the loop.Config it ran under. It lives in the session package
-// because the session is the layer that both owns the loop.Config and constructs
+// SessionStarted from the loop.Definition it ran under. It lives in the session package
+// because the session is the layer that both owns the loop.Definition and constructs
 // SessionStarted (the event package defines only the value + its equality, and must
 // not import loop). The derivation is deterministic — identical config yields an
 // Equal fingerprint — and changes when the model, system prompt, or tool set
@@ -60,14 +61,14 @@ type ConfigFingerprintFields struct {
 //     adding/removing/renaming a tool does.
 //
 // The swarm-level fields (AgentKind, RuntimeSkills, WorkspaceRoot) are NOT on
-// loop.Config and are left zero here; the composition root injects them via
+// loop.Definition and are left zero here; the composition root injects them via
 // WithConfigFingerprintFields, and the construction paths merge them with
 // fingerprintWith. A bare FingerprintFrom (no injection) therefore leaves them empty.
-func FingerprintFrom(cfg loop.Config) event.ConfigFingerprint {
+func FingerprintFrom(cfg loop.BoundDefinition) event.ConfigFingerprint {
 	return event.ConfigFingerprint{
-		ModelID:         cfg.Model.Name,
-		SystemPromptRev: hexSHA256(cfg.System),
-		ToolPolicyRev:   toolPolicyRev(cfg.Tools),
+		ModelID:         cfg.Model().Name,
+		SystemPromptRev: hexSHA256(cfg.System()),
+		ToolPolicyRev:   toolPolicyRev(cfg.Tools()),
 	}
 }
 
@@ -76,7 +77,7 @@ func FingerprintFrom(cfg loop.Config) event.ConfigFingerprint {
 // LIVE fingerprint, so the stamped (New) and compared-against (Restore) fingerprints
 // are derived identically — the restore comparison would spuriously mismatch otherwise.
 // Zero-valued fields leave the corresponding loop-derived/empty value unchanged.
-func fingerprintWith(cfg loop.Config, fields ConfigFingerprintFields) event.ConfigFingerprint {
+func fingerprintWith(cfg loop.BoundDefinition, fields ConfigFingerprintFields) event.ConfigFingerprint {
 	fpr := FingerprintFrom(cfg)
 	fpr.AgentKind = fields.AgentKind
 	fpr.RuntimeSkills = fields.RuntimeSkills
@@ -100,9 +101,9 @@ func hexSHA256(s string) string {
 // the digest; a tool's Info error excludes only that tool (best-effort — the
 // fingerprint is an identity hash for change detection, not a security boundary).
 // The digest covers the empty string when no tool reports a name.
-func toolPolicyRev(ts loop.ToolSet) string {
-	names := make([]string, 0, len(ts.Registry))
-	for _, t := range ts.Registry {
+func toolPolicyRev(tools []tool.InvokableTool) string {
+	names := make([]string, 0, len(tools))
+	for _, t := range tools {
 		info, err := t.Info(context.Background())
 		if err != nil || info == nil {
 			continue

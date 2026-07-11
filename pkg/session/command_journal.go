@@ -145,7 +145,7 @@ func WithAllowConfigMismatch() Option {
 }
 
 // WithConfigFingerprintFields injects the swarm-level config-fingerprint inputs that do
-// NOT live on loop.Config (AgentKind, RuntimeSkills, WorkspaceRoot). New merges them
+// NOT live on loop.Definition (AgentKind, RuntimeSkills, WorkspaceRoot). New merges them
 // onto the loop-derived fingerprint it stamps on SessionStarted; Restore merges them
 // onto the LIVE fingerprint it compares against the persisted one, so a session cannot
 // silently resume under a different agent identity, skill-trust mode, or workspace

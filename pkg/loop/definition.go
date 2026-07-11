@@ -13,6 +13,8 @@ import (
 	"github.com/looprig/inference"
 )
 
+const defaultDrainTimeout = 5 * time.Second
+
 // Option contributes immutable loop-definition data.
 type Option func(*definitionOptions) error
 

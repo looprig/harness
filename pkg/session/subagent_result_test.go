@@ -6,13 +6,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/looprig/harness/pkg/command"
 	"github.com/looprig/core/content"
+	"github.com/looprig/core/uuid"
+	"github.com/looprig/harness/pkg/command"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/hub"
 	"github.com/looprig/harness/pkg/identity"
-	"github.com/looprig/harness/pkg/loop"
-	"github.com/looprig/core/uuid"
 )
 
 // sessionWithHubAndFakeLoop builds a Session with a REAL hub (so quiescence
@@ -33,7 +32,7 @@ func sessionWithHubAndFakeLoop() (s *Session, cmds chan command.Command, done ch
 		sessionCtx:    sessionCtx,
 		sessionCancel: sessionCancel,
 		loops: map[uuid.UUID]*loopHandle{
-			primaryLoopID: {backend: &loop.Loop{Commands: cmds, Done: done}},
+			primaryLoopID: {backend: &channelBackend{Commands: cmds, Done: done}},
 		},
 		primaryLoopID: primaryLoopID,
 		newID:         uuid.New,

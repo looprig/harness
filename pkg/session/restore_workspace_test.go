@@ -217,7 +217,7 @@ func TestRestoreMaterializesWorkspace(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			store := newRestoreStore(t)
-			fp := FingerprintFrom(restoreCfg(&stubLLM{}, "model-x", "be helpful"))
+			fp := fingerprintFromDefinition(restoreCfg(&stubLLM{}, "model-x", "be helpful"))
 			ws := mustWorkspaceStore(t, memstore.New().Blobs)
 
 			var refs []string
@@ -262,7 +262,7 @@ func TestRestoreMaterializesWorkspace(t *testing.T) {
 func TestRestoreMaterializesEffectiveCurrentWorkspace(t *testing.T) {
 	t.Parallel()
 	store := newRestoreStore(t)
-	fp := FingerprintFrom(restoreCfg(&stubLLM{}, "model-x", "be helpful"))
+	fp := fingerprintFromDefinition(restoreCfg(&stubLLM{}, "model-x", "be helpful"))
 	ws := mustWorkspaceStore(t, memstore.New().Blobs)
 
 	srcA, srcB := t.TempDir(), t.TempDir()
@@ -333,7 +333,7 @@ func TestRestoreSkipsWorkspaceMaterialize(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			store := newRestoreStore(t)
-			fp := FingerprintFrom(restoreCfg(&stubLLM{}, "model-x", "be helpful"))
+			fp := fingerprintFromDefinition(restoreCfg(&stubLLM{}, "model-x", "be helpful"))
 			ws := mustWorkspaceStore(t, memstore.New().Blobs)
 
 			var orig persistedStream
@@ -388,7 +388,7 @@ func TestRestoreSkipsWorkspaceMaterialize(t *testing.T) {
 func TestRestoreWorkspaceWarmVolumeReuse(t *testing.T) {
 	t.Parallel()
 	store := newRestoreStore(t)
-	fp := FingerprintFrom(restoreCfg(&stubLLM{}, "model-x", "be helpful"))
+	fp := fingerprintFromDefinition(restoreCfg(&stubLLM{}, "model-x", "be helpful"))
 	blobs := &getCountingBlobs{Blobs: memstore.New().Blobs}
 	ws := mustWorkspaceStore(t, blobs)
 
@@ -501,7 +501,7 @@ func TestRestoreWorkspaceMaterializeFailsClosed(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			store := newRestoreStore(t)
-			fp := FingerprintFrom(restoreCfg(&stubLLM{}, "model-x", "be helpful"))
+			fp := fingerprintFromDefinition(restoreCfg(&stubLLM{}, "model-x", "be helpful"))
 			ws := mustWorkspaceStore(t, memstore.New().Blobs)
 
 			ref, root := tt.setup(t, ws)

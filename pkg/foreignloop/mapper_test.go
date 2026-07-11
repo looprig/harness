@@ -5,8 +5,8 @@ import (
 	"testing"
 
 	"github.com/looprig/core/content"
-	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/core/uuid"
+	"github.com/looprig/harness/pkg/event"
 )
 
 // wantTurn is the turn counter the mapper under test is constructed with; every

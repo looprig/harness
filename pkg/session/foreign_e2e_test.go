@@ -225,27 +225,22 @@ func foreignSubLoopStarted(r *recordingEventAppender, primary uuid.UUID) (event.
 // foreignPrimaryCfg builds a foreign-engine loop.Config for a primary loop. cfg() seeds a
 // usable native cfg; the foreign engine ignores Client, but System is required by
 // the foreign actor's wiring validation.
-func foreignPrimaryCfg() loop.Config {
-	c := cfg(&stubLLM{chunks: []content.Chunk{textChunk("unused")}})
-	c.Engine = loop.EngineForeignClaude
-	c.System = "sys"
-	return c
+func foreignPrimaryCfg() loop.Definition {
+	return engineCfg(&stubLLM{chunks: []content.Chunk{textChunk("unused")}}, loop.EngineForeignClaude, "sys")
 }
 
 // foreignSubCfg builds the FRESH foreign-engine cfg a RunSubagent call passes for its
 // sub-loop (a foreign loop needs only Engine + System).
-func foreignSubCfg() loop.Config {
-	return loop.Config{Engine: loop.EngineForeignClaude, System: "sys"}
+func foreignSubCfg() loop.Definition {
+	return engineCfg(&stubLLM{}, loop.EngineForeignClaude, "sys")
 }
 
-func codexForeignPrimaryCfg() loop.Config {
-	c := foreignPrimaryCfg()
-	c.Engine = loop.EngineForeignCodex
-	return c
+func codexForeignPrimaryCfg() loop.Definition {
+	return engineCfg(&stubLLM{}, loop.EngineForeignCodex, "sys")
 }
 
-func codexForeignSubCfg() loop.Config {
-	return loop.Config{Engine: loop.EngineForeignCodex, System: "sys"}
+func codexForeignSubCfg() loop.Definition {
+	return engineCfg(&stubLLM{}, loop.EngineForeignCodex, "sys")
 }
 
 // TestForeignPrimaryE2E runs the REAL foreign actor as the session PRIMARY: New mints a

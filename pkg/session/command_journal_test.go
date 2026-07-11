@@ -9,13 +9,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/looprig/harness/pkg/command"
 	"github.com/looprig/core/content"
+	"github.com/looprig/core/uuid"
+	"github.com/looprig/harness/pkg/command"
 	"github.com/looprig/harness/pkg/hub"
 	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/journal"
-	"github.com/looprig/harness/pkg/loop"
-	"github.com/looprig/core/uuid"
 )
 
 // capturingHandler records every slog record's level and message so a test can assert the
@@ -188,7 +187,7 @@ func fakeAppenderSession(app *fakeCommandAppender, ts time.Time, loopIDs ...uuid
 	for _, lid := range loopIDs {
 		ch := make(chan command.Command)
 		cmds[lid] = ch
-		loops[lid] = &loopHandle{backend: &loop.Loop{Commands: ch, Done: make(chan struct{})}}
+		loops[lid] = &loopHandle{backend: &channelBackend{Commands: ch, Done: make(chan struct{})}}
 	}
 	s = &Session{
 		SessionID:     id,

@@ -76,7 +76,7 @@ type fakeForeignBuilder struct {
 }
 
 func (b *fakeForeignBuilder) build(_ context.Context, sessionID, loopID uuid.UUID,
-	_ loop.Provenance, _ foreignloop.EventPublisher, _ loop.Config,
+	_ loop.Provenance, _ foreignloop.EventPublisher, _ loop.BoundDefinition,
 	_ func() (uuid.UUID, error), _ *event.Factory) (loop.Backend, string, error) {
 	b.mu.Lock()
 	b.calls++
@@ -90,7 +90,7 @@ func (b *fakeForeignBuilder) build(_ context.Context, sessionID, loopID uuid.UUI
 }
 
 func (b *fakeForeignBuilder) buildRestored(_ context.Context, sessionID, loopID uuid.UUID,
-	_ loop.Provenance, _ foreignloop.EventPublisher, _ loop.Config,
+	_ loop.Provenance, _ foreignloop.EventPublisher, _ loop.BoundDefinition,
 	_ func() (uuid.UUID, error), _ *event.Factory, seed foreignloop.RestoredForeign) (loop.Backend, error) {
 	b.mu.Lock()
 	b.restoreCall++
@@ -165,9 +165,7 @@ func TestForeignNewLoop(t *testing.T) {
 			rec := &recordingEventAppender{}
 			builder := &fakeForeignBuilder{sid: fixedForeignSID, backend: newFakeBackend()}
 
-			c := cfg(&stubLLM{chunks: []content.Chunk{textChunk("x")}})
-			c.Engine = tt.engine
-			c.System = "x"
+			c := engineCfg(&stubLLM{chunks: []content.Chunk{textChunk("x")}}, tt.engine, "x")
 
 			opts := []Option{WithEventAppender(rec)}
 			if tt.wireBuilder {

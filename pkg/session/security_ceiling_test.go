@@ -323,7 +323,7 @@ func TestLastSecurityCeiling(t *testing.T) {
 // ordinal live on its ceiling source — deterministic replay, last write wins.
 func TestSecurityCeilingRestoreRoundTrip(t *testing.T) {
 	store := newRestoreStore(t)
-	fp := FingerprintFrom(restoreCfg(&stubLLM{}, "model-x", "be helpful"))
+	fp := fingerprintFromDefinition(restoreCfg(&stubLLM{}, "model-x", "be helpful"))
 
 	h, sessionID, _, lease, es := newOriginalHub(t, store, fp)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)

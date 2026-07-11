@@ -27,6 +27,17 @@ type stubLLM struct {
 	ignoreCtx        bool // with blockUntilCancel: block forever (provider ignores ctx)
 }
 
+type channelBackend struct {
+	Commands chan command.Command
+	Done     chan struct{}
+}
+
+func (b *channelBackend) CommandSink() chan<- command.Command { return b.Commands }
+func (b *channelBackend) DoneChan() <-chan struct{}           { return b.Done }
+func (b *channelBackend) Snapshot(context.Context) (content.AgenticMessages, event.TurnIndex, error) {
+	return nil, 0, nil
+}
+
 func textChunk(s string) content.Chunk {
 	return &content.TextChunk{Text: s}
 }
@@ -140,8 +151,28 @@ func validModel(name string) inference.Model {
 	}
 }
 
-func cfg(client inference.Client) loop.Config {
-	return loop.Config{Client: client, Model: validModel("m"), DrainTimeout: 100 * time.Millisecond}
+func mustDefine(opts ...loop.Option) loop.Definition {
+	d, err := loop.Define(opts...)
+	if err != nil {
+		panic(err)
+	}
+	return d
+}
+
+func cfg(client inference.Client) loop.Definition {
+	return mustDefine(loop.WithName("agent"), loop.WithInference(client, validModel("m")), loop.WithDrainTimeout(100*time.Millisecond))
+}
+
+func engineCfg(client inference.Client, engine loop.Engine, system string) loop.Definition {
+	return mustDefine(loop.WithName("agent"), loop.WithInference(client, validModel("m")), loop.WithSystem(system), loop.WithEngine(engine), loop.WithDrainTimeout(100*time.Millisecond))
+}
+
+func bindCfg(d loop.Definition, sessionID, loopID uuid.UUID) loop.BoundDefinition {
+	bound, err := d.Bind(context.Background(), tool.Bindings{SessionID: sessionID, LoopID: loopID})
+	if err != nil {
+		panic(err)
+	}
+	return bound
 }
 
 func TestNew(t *testing.T) {
@@ -280,10 +311,8 @@ func TestNewLoop(t *testing.T) {
 
 // cfgWithAgent is cfg with an AgentName set, so a test can assert the loop's
 // configured attribution name is stamped onto its published LoopStarted.
-func cfgWithAgent(client inference.Client, name identity.AgentName) loop.Config {
-	c := cfg(client)
-	c.AgentName = name
-	return c
+func cfgWithAgent(client inference.Client, name identity.AgentName) loop.Definition {
+	return mustDefine(loop.WithName(name), loop.WithInference(client, validModel("m")), loop.WithDrainTimeout(100*time.Millisecond))
 }
 
 // TestNewLoopStampsAgentName proves NewLoop stamps the loop's configured AgentName
@@ -297,7 +326,6 @@ func TestNewLoopStampsAgentName(t *testing.T) {
 		agent identity.AgentName
 	}{
 		{name: "named loop stamps its agent name", agent: "operator"},
-		{name: "unset agent name stamps empty", agent: ""},
 	}
 	for _, tt := range tests {
 		tt := tt
@@ -587,7 +615,7 @@ func TestNewLoopReturnsLoopNewError(t *testing.T) {
 
 	// loop.New rejects a nil Client with *ConfigError{ConfigMissingClient} before
 	// starting any goroutine — the cheapest validation failure to inject.
-	badCfg := loop.Config{Model: validModel("m")}
+	badCfg := loop.Definition{}
 	loopID, err := s.NewLoop(loop.Provenance{}, badCfg)
 
 	// (a) the loop.New error is returned, unwrapped, not remapped to *SessionError.
@@ -597,9 +625,9 @@ func TestNewLoopReturnsLoopNewError(t *testing.T) {
 	if !loopID.IsZero() {
 		t.Errorf("NewLoop returned loop id %v on error, want zero", loopID)
 	}
-	var ce *loop.ConfigError
-	if !errors.As(err, &ce) || ce.Kind != loop.ConfigMissingClient {
-		t.Fatalf("err = %v, want *loop.ConfigError{ConfigMissingClient}", err)
+	var be *loop.BindError
+	if !errors.As(err, &be) || be.Kind != loop.BindInvalidDefinition {
+		t.Fatalf("err = %v, want *loop.BindError{BindInvalidDefinition}", err)
 	}
 	var se *SessionError
 	if errors.As(err, &se) {
@@ -1045,7 +1073,7 @@ func sessionWithFakeLoop() (s *Session, cmds chan command.Command, done chan str
 		sessionCtx:    sessionCtx,
 		sessionCancel: sessionCancel,
 		loops: map[uuid.UUID]*loopHandle{
-			primaryLoopID: {backend: &loop.Loop{Commands: cmds, Done: done}},
+			primaryLoopID: {backend: &channelBackend{Commands: cmds, Done: done}},
 		},
 		primaryLoopID: primaryLoopID,
 		newID:         uuid.New,
@@ -1365,8 +1393,8 @@ func sessionWithTwoFakeLoops() (s *Session, loopA, loopB uuid.UUID, cmdsA, cmdsB
 		sessionCtx:    sessionCtx,
 		sessionCancel: sessionCancel,
 		loops: map[uuid.UUID]*loopHandle{
-			loopA: {backend: &loop.Loop{Commands: cmdsA, Done: doneA}},
-			loopB: {backend: &loop.Loop{Commands: cmdsB, Done: doneB}},
+			loopA: {backend: &channelBackend{Commands: cmdsA, Done: doneA}},
+			loopB: {backend: &channelBackend{Commands: cmdsB, Done: doneB}},
 		},
 		primaryLoopID: loopA,
 		newID:         uuid.New,
@@ -1536,8 +1564,8 @@ func sessionWithTwoFakeLoopsAndDone() (s *Session, cmdsA, cmdsB chan command.Com
 		sessionCtx:    sessionCtx,
 		sessionCancel: sessionCancel,
 		loops: map[uuid.UUID]*loopHandle{
-			loopA: {backend: &loop.Loop{Commands: cmdsA, Done: doneA}, cancel: func() {}},
-			loopB: {backend: &loop.Loop{Commands: cmdsB, Done: doneB}, cancel: func() {}},
+			loopA: {backend: &channelBackend{Commands: cmdsA, Done: doneA}, cancel: func() {}},
+			loopB: {backend: &channelBackend{Commands: cmdsB, Done: doneB}, cancel: func() {}},
 		},
 		primaryLoopID: loopA,
 		newID:         uuid.New,

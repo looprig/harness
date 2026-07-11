@@ -34,7 +34,7 @@ func TestNewRestoredValidation(t *testing.T) {
 	}
 	tests := []struct {
 		name    string
-		cfg     loop.Config
+		cfg     loop.BoundDefinition
 		spec    Spec
 		pub     EventPublisher
 		nilGen  bool
@@ -43,7 +43,7 @@ func TestNewRestoredValidation(t *testing.T) {
 		wantErr bool
 	}{
 		{name: "happy path", cfg: validCfg(), spec: good(), pub: &fakePublisher{}, seed: validSeed(), wantErr: false},
-		{name: "empty system prompt", cfg: loop.Config{}, spec: good(), pub: &fakePublisher{}, seed: validSeed(), wantErr: true},
+		{name: "empty system prompt", cfg: nil, spec: good(), pub: &fakePublisher{}, seed: validSeed(), wantErr: true},
 		{name: "nil agent", cfg: validCfg(), spec: Spec{}, pub: &fakePublisher{}, seed: validSeed(), wantErr: true},
 		{name: "nil publisher", cfg: validCfg(), spec: good(), pub: nil, seed: validSeed(), wantErr: true},
 		{name: "nil idGen", cfg: validCfg(), spec: good(), pub: &fakePublisher{}, nilGen: true, seed: validSeed(), wantErr: true},

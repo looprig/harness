@@ -7,8 +7,8 @@ import (
 	"time"
 
 	"github.com/looprig/core/content"
-	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/core/uuid"
+	"github.com/looprig/harness/pkg/event"
 )
 
 // failingNewID is an idGenerator seam that mints monotonically-distinct UUIDs but
@@ -62,7 +62,7 @@ func TestRestoreSessionFailSecureExits(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			store := newRestoreStore(t)
-			fp := FingerprintFrom(restoreCfg(&stubLLM{}, "model-x", "be helpful"))
+			fp := fingerprintFromDefinition(restoreCfg(&stubLLM{}, "model-x", "be helpful"))
 
 			// A clean original run (ends on TurnDone, no open turn): the restore mints
 			// exactly RestoreStarted, RestoreDone, then RestoreErrored on the failure path.

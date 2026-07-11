@@ -8,6 +8,7 @@ import (
 
 	"github.com/looprig/core/content"
 	"github.com/looprig/core/uuid"
+	"github.com/looprig/harness/internal/loopruntime"
 	"github.com/looprig/harness/pkg/ceiling"
 	"github.com/looprig/harness/pkg/command"
 	"github.com/looprig/harness/pkg/event"
@@ -16,6 +17,7 @@ import (
 	"github.com/looprig/harness/pkg/hub"
 	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/loop"
+	"github.com/looprig/harness/pkg/tool"
 	"github.com/looprig/harness/pkg/workspacestore"
 )
 
@@ -32,7 +34,7 @@ const (
 	SessionFaulted                SessionErrorKind = "session_faulted"
 	SessionLoopDepthExceeded      SessionErrorKind = "loop_depth_exceeded"
 	SessionLoopQuotaExceeded      SessionErrorKind = "loop_quota_exceeded"
-	// SessionForeignBuilderMissing: a loop.Config selected a foreign Engine but no
+	// SessionForeignBuilderMissing: a loop.Definition selected a foreign Engine but no
 	// foreign Builder was wired (WithForeignBuilder). newLoop fails closed rather than
 	// silently falling back to a native loop — a foreign engine must never resolve to a
 	// different backend than the caller asked for.
@@ -209,7 +211,7 @@ type Session struct {
 	// consults it. Default false = fail-secure (a mismatch rejects the restore).
 	allowConfigMismatch bool
 
-	// configFingerprintFields are the swarm-level fingerprint inputs not on loop.Config
+	// configFingerprintFields are the swarm-level fingerprint inputs not on loop.Definition
 	// (AgentKind, RuntimeSkills, WorkspaceRoot), injected via WithConfigFingerprintFields.
 	// New merges them onto the loop-derived fingerprint it stamps on SessionStarted;
 	// Restore merges them onto the LIVE fingerprint it compares against the persisted one
@@ -323,6 +325,11 @@ type loopHandle struct {
 	backend loop.Backend
 	parent  loop.Provenance
 	cancel  context.CancelFunc
+}
+
+type preparedLoop struct {
+	id    uuid.UUID
+	bound loop.BoundDefinition
 }
 
 // eventSubscriber is the consumer-facing half of the session fan-in: a TUI/CLI (or
@@ -493,12 +500,12 @@ func (s *Session) deliverSubagentResult(ctx context.Context, parentLoopID, fromL
 // records it in the registry and passes it to loop.New. The session stores the
 // loop handle and returns only the loop id, because callers route through
 // session methods rather than writing to a loop command channel directly.
-func (s *Session) NewLoop(parent loop.Provenance, cfg loop.Config) (uuid.UUID, error) {
+func (s *Session) NewLoop(parent loop.Provenance, cfg loop.Definition) (uuid.UUID, error) {
 	// A plain NewLoop is never spawned by a Subagent tool call, so it carries no
 	// parent tool-use id; the private newLoop does the real work. RunSubagent is the
 	// only path that threads a non-empty id (its child's LoopStarted correlates back
 	// to the spawning tool call).
-	return s.newLoop(parent, cfg, "")
+	return s.newLoop(parent, cfg, "", nil)
 }
 
 // newLoop is the private loop-creation core behind NewLoop and RunSubagent. It is
@@ -508,7 +515,7 @@ func (s *Session) NewLoop(parent loop.Provenance, cfg loop.Config) (uuid.UUID, e
 // passes ""; RunSubagent passes the provider tool-use id of the spawning call. The id
 // rides as a plain parameter into the LoopStarted build only — it touches no identity /
 // Provenance / Header struct, so it never perturbs the loop tree or the quota/depth math.
-func (s *Session) newLoop(parent loop.Provenance, cfg loop.Config, parentToolUseID string) (uuid.UUID, error) {
+func (s *Session) newLoop(parent loop.Provenance, cfg loop.Definition, parentToolUseID string, prepared *preparedLoop) (uuid.UUID, error) {
 	// Whether this spawn counts toward the cumulative spawn quota. The PRIMARY loop is
 	// built by newSession via NewLoop with ZERO provenance (parent.LoopID zero) and must
 	// NOT consume a quota slot (design §6d: "primary excluded"); every subagent spawn
@@ -568,10 +575,22 @@ func (s *Session) newLoop(parent loop.Provenance, cfg loop.Config, parentToolUse
 		s.loopsMu.Unlock()
 	}
 
-	loopID, err := s.newID()
-	if err != nil {
-		release()
-		return uuid.UUID{}, &SessionError{Kind: SessionLoopIDGenerationFailed, Cause: err}
+	var loopID uuid.UUID
+	var bound loop.BoundDefinition
+	var err error
+	if prepared != nil {
+		loopID, bound = prepared.id, prepared.bound
+	} else {
+		loopID, err = s.newID()
+		if err != nil {
+			release()
+			return uuid.UUID{}, &SessionError{Kind: SessionLoopIDGenerationFailed, Cause: err}
+		}
+		bound, err = cfg.Bind(s.sessionCtx, tool.Bindings{SessionID: s.SessionID, LoopID: loopID})
+		if err != nil {
+			release()
+			return uuid.UUID{}, err
+		}
 	}
 
 	// Stamp the LoopStarted header (minting its EventID + CreatedAt via the Factory)
@@ -586,7 +605,7 @@ func (s *Session) newLoop(parent loop.Provenance, cfg loop.Config, parentToolUse
 		// AgentName is the loop's immutable attribution name, stamped from its Config so
 		// the durable LoopStarted records which agent drove this loop. Empty for a plain
 		// loop; the primary loop carries its configured name through this same path.
-		AgentName: cfg.AgentName,
+		AgentName: bound.Name(),
 		Cause: identity.Cause{
 			Coordinates: identity.Coordinates{LoopID: parent.LoopID, TurnID: parent.TurnID, StepID: parent.StepID},
 			Agency:      identity.AgencyMachine,
@@ -608,16 +627,16 @@ func (s *Session) newLoop(parent loop.Provenance, cfg loop.Config, parentToolUse
 	loopCtx, cancel := context.WithCancel(s.sessionCtx)
 	var b loop.Backend
 	var foreignSID string
-	switch cfg.Engine {
+	switch bound.Engine() {
 	case loop.EngineNative:
-		b, err = loop.New(loopCtx, s.SessionID, loopID, parent, s, cfg)
+		b, err = loopruntime.New(loopCtx, s.SessionID, loopID, parent, s, bound)
 	default:
 		if s.foreignBuild == nil {
 			release()
 			cancel()
 			return uuid.UUID{}, &SessionError{Kind: SessionForeignBuilderMissing}
 		}
-		b, foreignSID, err = s.foreignBuild(loopCtx, s.SessionID, loopID, parent, s, cfg,
+		b, foreignSID, err = s.foreignBuild(loopCtx, s.SessionID, loopID, parent, s, bound,
 			func() (uuid.UUID, error) { return s.newID() }, s.factory)
 	}
 	if err != nil {
@@ -741,7 +760,7 @@ func (s *Session) newCommandID() (uuid.UUID, error) {
 // and the loop never emits one. It is published before any subscriber attaches,
 // so a subscriber that connects later does not observe it; reliable delivery of
 // the session start to late subscribers is a separate future follow-on.
-func New(ctx context.Context, cfg loop.Config, opts ...Option) (*Session, error) {
+func New(ctx context.Context, cfg loop.Definition, opts ...Option) (*Session, error) {
 	// Production seams: crypto/rand id-gen + the wall clock. newSession is the
 	// unexported core that lets a same-package test inject a failing newID (or a
 	// pinned now) that is IN EFFECT during the construction-time SessionStarted
@@ -757,7 +776,7 @@ func New(ctx context.Context, cfg loop.Config, opts ...Option) (*Session, error)
 // mint-error branch (no zero-EventID SessionStarted is ever published; New returns
 // nil + a typed *SessionError). newID also mints the session id itself, so a
 // generator that fails on its FIRST call aborts before any event is stamped.
-func newSession(ctx context.Context, cfg loop.Config, newID idGenerator, now event.Clock, opts ...Option) (*Session, error) {
+func newSession(ctx context.Context, cfg loop.Definition, newID idGenerator, now event.Clock, opts ...Option) (*Session, error) {
 	select {
 	case <-ctx.Done():
 		return nil, &SessionError{Kind: SessionContextDone, Cause: ctx.Err()}
@@ -853,6 +872,16 @@ func newSession(ctx context.Context, cfg loop.Config, newID idGenerator, now eve
 		sessionCancel()
 		return nil, &SessionError{Kind: SessionIDGenerationFailed, Cause: err}
 	}
+	primaryLoopID, err := s.newID()
+	if err != nil {
+		sessionCancel()
+		return nil, &SessionError{Kind: SessionLoopIDGenerationFailed, Cause: err}
+	}
+	primaryBound, err := cfg.Bind(sessionCtx, tool.Bindings{SessionID: id, LoopID: primaryLoopID})
+	if err != nil {
+		sessionCancel()
+		return nil, err
+	}
 
 	// The hub is built before any loop, so a loop publishing through the session's
 	// PublishEvent never sees a nil hub. With no subscribers yet, this delivers to
@@ -862,12 +891,12 @@ func newSession(ctx context.Context, cfg loop.Config, newID idGenerator, now eve
 	// It merges the loop-derived fingerprint with the swarm-level fields the composition
 	// root injected (AgentKind/RuntimeSkills/WorkspaceRoot), via the SAME fingerprintWith
 	// the restore comparison uses, so the stamped and compared-against fingerprints match.
-	if err := s.hub.PublishEvent(sessionCtx, event.SessionStarted{Header: startedHeader, Config: fingerprintWith(cfg, s.configFingerprintFields)}); err != nil {
+	if err := s.hub.PublishEvent(sessionCtx, event.SessionStarted{Header: startedHeader, Config: fingerprintWith(primaryBound, s.configFingerprintFields)}); err != nil {
 		sessionCancel()
 		return nil, &SessionError{Kind: SessionContextDone, Cause: err}
 	}
 
-	primaryLoopID, err := s.NewLoop(loop.Provenance{}, cfg)
+	primaryLoopID, err = s.newLoop(loop.Provenance{}, cfg, "", &preparedLoop{id: primaryLoopID, bound: primaryBound})
 	if err != nil {
 		sessionCancel()
 		return nil, err
@@ -1021,7 +1050,7 @@ func (s *Session) submitToLoop(ctx context.Context, loopID uuid.UUID, blocks []c
 // drainToFinalText + interruptLoopID) so the Subagent tool's injected capability
 // (a later task) has one method to call and the blocks stay package-private.
 //
-// cfg is the sub-loop's loop.Config — the CALLER builds a FRESH cfg per call (its
+// cfg is the sub-loop's loop.Definition — the CALLER builds a FRESH cfg per call (its
 // own ToolSet/PermissionChecker) so each sub-loop has independent approval state;
 // RunSubagent never reuses a shared ToolSet. parent is the spawning loop/turn/step
 // provenance (recorded on the sub-loop's registry entry and stamped on its
@@ -1041,12 +1070,12 @@ func (s *Session) submitToLoop(ctx context.Context, loopID uuid.UUID, blocks []c
 // because submits carry no ctx, a ctx cancel cannot reach the sub-loop's turn — the
 // drain translates it into a single loop-targeted Interrupt (the closure below) and
 // drains to the resulting TurnInterrupted terminal.
-func (s *Session) RunSubagent(ctx context.Context, parent loop.Provenance, cfg loop.Config, blocks []content.Block, parentToolUseID string) (string, error) {
+func (s *Session) RunSubagent(ctx context.Context, parent loop.Provenance, cfg loop.Definition, blocks []content.Block, parentToolUseID string) (string, error) {
 	// newLoop publishes LoopStarted and fails SessionClosing if the session is
 	// shutting down; either way no sub-loop is left behind a returned error.
 	// parentToolUseID is stamped onto that LoopStarted so the sub-loop correlates back
 	// to the spawning Subagent tool call across persist/restore.
-	subLoopID, err := s.newLoop(parent, cfg, parentToolUseID)
+	subLoopID, err := s.newLoop(parent, cfg, parentToolUseID, nil)
 	if err != nil {
 		return "", err
 	}
