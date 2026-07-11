@@ -14,7 +14,7 @@ Harness already implements the mechanisms needed to persist an agent session:
   catalogs, and offload-blob collection;
 - `workspacestore` deterministically archives, hashes, stores, and materializes a
   workspace;
-- `Session.CheckpointWorkspace` stores a snapshot before appending the enduring
+- `SessionController.CheckpointWorkspace` stores a snapshot before appending the enduring
   `WorkspaceCheckpointed` reference; and
 - `session.Restore` reconstructs the session and materializes its latest workspace
   checkpoint.
@@ -74,8 +74,8 @@ r, err := rig.Define(
 	rig.WithDelegationLimits(rig.DelegationLimits{Depth: 2, Quota: 64}),
 )
 
-fresh, err := r.NewSession(ctx)
-restored, err := r.RestoreSession(ctx, sessionID)
+freshController, err := r.NewSession(ctx)
+restoredController, err := r.RestoreSession(ctx, sessionID)
 ```
 
 This is an intentional breaking replacement. Remove `session.Compile`,
@@ -322,7 +322,7 @@ consumer's composition responsibility; a rig receives already-open stores.
 6. Sets the active loop to the loop created from the active primer.
 7. Publishes durable session, loop, and active-loop lifecycle events.
 8. Starts automatic snapshot watching only for `SnapshotOnIdle`.
-9. Returns the live `session.Session` contract backed by an internal runtime.
+9. Returns the live `session.SessionController` contract backed by an internal runtime.
 
 Any failure after lease acquisition releases the lease on a bounded best-effort path.
 The method returns a typed stage error chaining the underlying cause.
@@ -356,14 +356,32 @@ default target for `Session.Submit`.
 
 ```go
 type Session interface {
+	SessionID() uuid.UUID
 	ActiveLoop() loop.Handle
 	Loop(id uuid.UUID) (loop.Handle, bool)
-	SetActiveLoop(ctx context.Context, id uuid.UUID) error
 	Submit(ctx context.Context, blocks []content.Block) (uuid.UUID, error)
 	SubmitToLoop(ctx context.Context, id uuid.UUID, blocks []content.Block) (uuid.UUID, error)
-	// Existing gate, event, checkpoint, interrupt, and shutdown methods.
+	SubscribeEvents(event.EventFilter) (event.Subscription, error)
+	RespondGate(context.Context, gate.GateResponse) error
+	Interrupt(context.Context) (bool, error)
+}
+
+type SessionController interface {
+	Session
+	SetActiveLoop(ctx context.Context, id uuid.UUID) error
+	LoopController(id uuid.UUID) (loop.Controller, bool)
+	SetSecurityCeiling(context.Context, ceiling.Level) error
+	CheckpointWorkspace(context.Context) (workspacestore.Ref, error)
+	Shutdown(context.Context) error
 }
 ```
+
+`Session` is the ordinary data-plane contract for submitting work, observing it, and
+answering gates. `SessionController` embeds it and adds the trusted control-plane
+operations that change runtime policy or lifecycle. `Rig.NewSession` and
+`Rig.RestoreSession` return `SessionController`; consumers pass it as the narrower
+`Session` wherever control is unnecessary. Models receive neither interface directly —
+only explicitly wired tools.
 
 `SetActiveLoop` accepts any live loop, including a dynamically delegated loop. It emits
 an enduring `ActiveLoopChanged` event before the new selection becomes observable.
@@ -417,8 +435,8 @@ immutable definition.
 At runtime:
 
 ```go
-handle, ok := sess.Loop(loopID)
-err := handle.SetMode(ctx, "build")
+controller, ok := sess.LoopController(loopID)
+err := controller.SetMode(ctx, "build")
 ```
 
 `SetMode` validates the name against the loop definition and sends a command through the
@@ -447,9 +465,22 @@ the preferred way to change several coordinated properties; direct model/effort 
 support dynamic model routing that is not a predefined workflow mode:
 
 ```go
-handle, ok := sess.Loop(loopID)
+type Handle interface {
+	ID() uuid.UUID
+	Mode() ModeName
+	Model() inference.Model
+}
 
-err := handle.Change(
+type Controller interface {
+	Handle
+	SetMode(context.Context, ModeName) error
+	Change(context.Context, ...Change) error
+}
+
+handle, ok := sess.Loop(loopID)                    // read-only loop.Handle
+controller, ok := sess.LoopController(loopID)      // trusted loop.Controller
+
+err := controller.Change(
 	ctx,
 	loop.ChangeModel(newModel),
 	loop.ChangeEffort(inference.EffortHigh),
@@ -477,7 +508,7 @@ failures return typed errors and do not partially apply.
 
 ## Workspace snapshot policy
 
-The existing `workspacestore` snapshot format and `Session.CheckpointWorkspace`
+The existing `workspacestore` snapshot format and `SessionController.CheckpointWorkspace`
 snapshot-before-append ordering do not change. This design adds scheduling and failure
 policy at the rig layer.
 
@@ -514,7 +545,7 @@ For every `SessionActive → SessionIdle` transition:
 1. The rig's per-session checkpoint controller observes `SessionIdle`.
 2. It serializes against any checkpoint already running for that session.
 3. It creates a timeout context derived from the session lifetime.
-4. It calls `Session.CheckpointWorkspace`.
+4. It calls `SessionController.CheckpointWorkspace`.
 5. `workspacestore` deterministically archives and hashes the complete tree.
 6. If the content-addressed blob is absent, it uploads it; otherwise upload is a no-op.
 7. The session durably appends `WorkspaceCheckpointed{Ref}`.
@@ -568,7 +599,9 @@ type Rig[S LiveSession] interface {
 }
 ```
 
-The created session exposes its ID, so `NewSession` need not return it separately:
+The created session exposes its ID, so `NewSession` need not return it separately. The
+concrete rig returns `session.SessionController`; `serve` uses only its narrower
+`LiveSession` method set:
 
 ```go
 type LiveSession interface {
@@ -581,7 +614,8 @@ type LiveSession interface {
 HTTP routes and wire semantics do not change: create still returns 201 with the minted
 session ID, and restore still addresses the existing ID. Only the injected dependency and
 method names change. Handler tests use a `fakeRig` rather than `fakeRunner`, and the
-dependency guard proves `*rig.Rig` satisfies `serve.Rig[session.Session]`.
+dependency guard proves `*rig.Rig` satisfies
+`serve.Rig[session.SessionController]`.
 
 Because `serve` manages several attached live sessions, its own in-memory attachment map
 remains in `serve`; it is not duplicated in `pkg/rig`.
@@ -598,8 +632,8 @@ The harness change removes rather than deprecates:
 - public `session.New` and `session.Restore`; and
 - `serve.Runner`.
 
-The live `session.Session` contract and its control methods remain public. Its concrete
-implementation, construction, and restore code move behind `pkg/rig`, under
+The live `session.Session` and `session.SessionController` contracts remain public. Their
+concrete implementation, construction, and restore code move behind `pkg/rig`, under
 `internal/sessionruntime`.
 
 SWE and CLI are deliberately not migrated in this harness spec. Once harness lands, a
@@ -722,6 +756,10 @@ All tests are table-driven and run under `-race`.
 
 ### `pkg/session`
 
+- `SessionController` embeds `Session`, while `Session` exposes no policy-mutating
+  methods;
+- `Session.Loop` returns a read-only `loop.Handle` and
+  `SessionController.LoopController` returns the trusted `loop.Controller`;
 - `Submit` targets the current active loop;
 - `SubmitToLoop` remains explicitly targeted;
 - active-loop change durability and invalid-target atomicity;
