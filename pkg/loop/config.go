@@ -8,6 +8,29 @@ import (
 	"github.com/looprig/inference"
 )
 
+// configFromBound is the temporary compatibility bridge for the current actor.
+// It is deleted when the actor consumes BoundDefinition directly (Task 7).
+func configFromBound(bound BoundDefinition, modeName ModeName) (Config, error) {
+	mode, ok := bound.Mode(modeName)
+	if !ok {
+		return Config{}, &BindError{Kind: BindInvalidDefinition, Name: string(modeName), Index: -1}
+	}
+	model := cloneModel(mode.Model)
+	model.Sampling.Effort = mode.Effort
+	system := bound.System()
+	if system == "" {
+		system = mode.Instructions
+	} else if mode.Instructions != "" {
+		system += "\n\n" + mode.Instructions
+	}
+	limits := mode.ToolLimits
+	return Config{
+		Client: bound.Client(), Model: model, System: system, DrainTimeout: bound.DrainTimeout(),
+		AgentName: bound.Name(), Engine: bound.Engine(), RuntimeContext: bound.RuntimeContext(),
+		Tools: ToolSet{Permission: bound.Permission(), Registry: mode.Tools, Middlewares: bound.Middlewares(), MaxToolIterations: limits.Iterations, MaxToolCallsPerTurn: limits.Calls, MaxParallelToolCalls: limits.Parallel},
+	}, nil
+}
+
 // Engine selects which backend constructs this loop. The zero value is native, so
 // existing Config construction is unchanged.
 type Engine uint8

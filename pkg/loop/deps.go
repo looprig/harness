@@ -8,6 +8,21 @@ import (
 	"github.com/looprig/harness/pkg/tool"
 )
 
+// PermissionFactory creates the permission gate private to one bound loop. It may
+// be called concurrently for separate Bind calls and must synchronize captured state.
+type PermissionFactory func(context.Context, tool.Bindings) (PermissionGate, error)
+
+// DelegationStyle selects the model-facing delegation action set.
+type DelegationStyle uint8
+
+const (
+	DelegationSyncOnly DelegationStyle = iota
+	DelegationManaged
+)
+
+// Delegation is the immutable delegation policy copied into a Definition.
+type Delegation struct{ Style DelegationStyle }
+
 // deps.go is the runner's CONSUMER surface for the tool subsystem (design §3b).
 // The loop depends only on these interfaces and value types; it never imports
 // the concrete `tools/` package. The composition root wires concrete

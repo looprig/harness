@@ -8,9 +8,9 @@ import (
 	"time"
 
 	"github.com/looprig/core/content"
+	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/tool"
-	"github.com/looprig/core/uuid"
 )
 
 // resolveCapTests exercises the per-field runaway-guard resolvers the same way
@@ -202,9 +202,13 @@ var (
 		Registry:    []tool.InvokableTool(nil),
 		Middlewares: []tool.ToolMiddleware(nil),
 	}
-	_                = ToolPolicy{Tool: "x", Effect: EffectAsk, Match: []string{"*"}}
-	_ ReadGuard      = readGuardStub{}
-	_ PermissionGate = permissionGateStub{}
+	_                   = ToolPolicy{Tool: "x", Effect: EffectAsk, Match: []string{"*"}}
+	_ ReadGuard         = readGuardStub{}
+	_ PermissionGate    = permissionGateStub{}
+	_ PermissionFactory = func(context.Context, tool.Bindings) (PermissionGate, error) {
+		return permissionGateStub{}, nil
+	}
+	_ = Delegation{Style: DelegationManaged}
 )
 
 type readGuardStub struct{}
