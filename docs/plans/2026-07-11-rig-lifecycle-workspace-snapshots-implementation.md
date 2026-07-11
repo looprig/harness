@@ -87,7 +87,12 @@ type PathReporter interface {
 }
 ```
 
-The storage test must prove callers receive a defensive copy. The fsstore test must prove its canonical root is reported once. Harness tests must prove `sessionstore.Store.PersistencePaths()` and `workspacestore.Store.PersistencePaths()` collect, canonicalize, sort, and deduplicate reporter paths while remote/non-reporting providers return none.
+The storage test pins the optional interface with a fake reporter. The fsstore test must
+prove its canonical root is reported once and returned as a defensive copy. Harness tests
+must prove `sessionstore.Store.PersistencePaths()` and
+`workspacestore.Store.PersistencePaths()` return defensive copies and collect,
+canonicalize, sort, and deduplicate reporter paths while remote/non-reporting providers
+return none.
 
 **Step 2: Run tests and verify failure**
 
