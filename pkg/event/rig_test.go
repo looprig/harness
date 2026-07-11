@@ -114,6 +114,47 @@ func TestWorkspaceCheckpointRejectsExplicitUnknownMetadataOnDecode(t *testing.T)
 	}
 }
 
+func TestWorkspaceCheckpointMetadataPresenceMatchesJSONFieldNames(t *testing.T) {
+	t.Parallel()
+	h := event.Header{Coordinates: identity.Coordinates{SessionID: vID(t)}, EventID: vID(t)}
+	prefix := `{"type":"WorkspaceCheckpointed","v":1,"session_id":"` + h.SessionID.String() + `","event_id":"` + h.EventID.String() + `","ref":"v1:sha256:x"`
+	tests := []struct {
+		name     string
+		metadata string
+		wantErr  bool
+	}{
+		{name: "canonical current", metadata: `,"consistency":1,"trigger":1`},
+		{name: "Go field casing current", metadata: `,"Consistency":1,"Trigger":1`},
+		{name: "mixed casing current", metadata: `,"ConSiStEnCy":1,"TRIGGER":1`},
+		{name: "Go field casing explicit unknown", metadata: `,"Consistency":0,"Trigger":0`, wantErr: true},
+		{name: "mixed casing explicit unknown", metadata: `,"cOnSiStEnCy":0,"tRiGgEr":0`, wantErr: true},
+		{name: "partial consistency alias", metadata: `,"Consistency":1`, wantErr: true},
+		{name: "partial trigger alias", metadata: `,"Trigger":1`, wantErr: true},
+		{name: "duplicate consistency aliases same", metadata: `,"consistency":1,"Consistency":1,"trigger":1`, wantErr: true},
+		{name: "duplicate consistency aliases conflicting", metadata: `,"consistency":1,"Consistency":2,"trigger":1`, wantErr: true},
+		{name: "duplicate trigger aliases same", metadata: `,"consistency":1,"trigger":1,"Trigger":1`, wantErr: true},
+		{name: "duplicate trigger aliases conflicting", metadata: `,"consistency":1,"trigger":1,"Trigger":2`, wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := event.UnmarshalEvent([]byte(prefix + tt.metadata + `}`))
+			if tt.wantErr {
+				if err == nil || got != nil {
+					t.Fatalf("UnmarshalEvent = (%#v, %v), want nil,error", got, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("UnmarshalEvent error = %v", err)
+			}
+			checkpoint := got.(event.WorkspaceCheckpointed)
+			if checkpoint.Consistency != event.SnapshotQuiescent || checkpoint.Trigger != event.SnapshotTriggerManual {
+				t.Fatalf("metadata = (%v,%v), want quiescent/manual", checkpoint.Consistency, checkpoint.Trigger)
+			}
+		})
+	}
+}
+
 func TestMarshalWorkspaceCheckpointRejectsUnknownMetadata(t *testing.T) {
 	t.Parallel()
 	h := event.Header{Coordinates: identity.Coordinates{SessionID: vID(t)}, EventID: vID(t)}

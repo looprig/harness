@@ -1,9 +1,11 @@
 package event
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/looprig/core/content"
 	"github.com/looprig/core/uuid"
@@ -333,17 +335,63 @@ func validateDecodedEvent(ev Event, data []byte) error {
 		return err
 	}
 	if _, ok := ev.(WorkspaceCheckpointed); ok {
-		var fields map[string]json.RawMessage
-		if err := json.Unmarshal(data, &fields); err != nil {
-			return &EventDecodeError{Type: "WorkspaceCheckpointed", Cause: err}
+		presence, err := inspectCheckpointMetadata(data)
+		if err != nil {
+			return err
 		}
-		_, hasConsistency := fields["consistency"]
-		_, hasTrigger := fields["trigger"]
-		if !hasConsistency && !hasTrigger {
+		if !presence.consistency && !presence.trigger {
 			return nil
 		}
 	}
 	return validateEventBody(ev)
+}
+
+type checkpointMetadataPresence struct {
+	consistency bool
+	trigger     bool
+}
+
+// inspectCheckpointMetadata enumerates top-level member names without first
+// collapsing them into a map. encoding/json matches struct fields case-
+// insensitively, so presence detection must do the same. Enumerating also lets us
+// reject two spellings of one logical field instead of allowing last-value-wins
+// decoding to hide an explicit unknown or conflicting value.
+func inspectCheckpointMetadata(data []byte) (checkpointMetadataPresence, error) {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	if _, err := dec.Token(); err != nil {
+		return checkpointMetadataPresence{}, &EventDecodeError{Type: "WorkspaceCheckpointed", Cause: err}
+	}
+	var presence checkpointMetadataPresence
+	for dec.More() {
+		keyToken, err := dec.Token()
+		if err != nil {
+			return checkpointMetadataPresence{}, &EventDecodeError{Type: "WorkspaceCheckpointed", Cause: err}
+		}
+		key, ok := keyToken.(string)
+		if !ok {
+			return checkpointMetadataPresence{}, &EventDecodeError{Type: "WorkspaceCheckpointed", Cause: fmt.Errorf("non-string object key")}
+		}
+		var value json.RawMessage
+		if err := dec.Decode(&value); err != nil {
+			return checkpointMetadataPresence{}, &EventDecodeError{Type: "WorkspaceCheckpointed", Cause: err}
+		}
+		switch {
+		case strings.EqualFold(key, "consistency"):
+			if presence.consistency {
+				return checkpointMetadataPresence{}, &EventDecodeError{Type: "WorkspaceCheckpointed", Cause: fmt.Errorf("duplicate consistency field")}
+			}
+			presence.consistency = true
+		case strings.EqualFold(key, "trigger"):
+			if presence.trigger {
+				return checkpointMetadataPresence{}, &EventDecodeError{Type: "WorkspaceCheckpointed", Cause: fmt.Errorf("duplicate trigger field")}
+			}
+			presence.trigger = true
+		}
+	}
+	if _, err := dec.Token(); err != nil {
+		return checkpointMetadataPresence{}, &EventDecodeError{Type: "WorkspaceCheckpointed", Cause: err}
+	}
+	return presence, nil
 }
 
 // decodePayload dispatches on the "type" tag to the concrete decoder. An unknown or

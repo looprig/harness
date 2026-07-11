@@ -21,6 +21,8 @@ func FuzzRigEvent(f *testing.F) {
 		}
 	}
 	f.Add([]byte(`{"type":"WorkspaceCheckpointed"}`))
+	f.Add([]byte(`{"type":"WorkspaceCheckpointed","Consistency":0,"Trigger":0}`))
+	f.Add([]byte(`{"type":"WorkspaceCheckpointed","consistency":1,"Consistency":2,"trigger":1}`))
 	f.Fuzz(func(t *testing.T, data []byte) { _, _ = event.UnmarshalEvent(data) })
 }
 
