@@ -98,7 +98,7 @@ type Lifecycle struct {
 	allowConfigMismatch bool
 
 	// ceilingFactory mints a FRESH *ceiling.State per NewSession/RestoreSession. AMBIGUITY A1: reusing one
-	// NewLifecycle-captured cfg across many concurrent Runs would otherwise share ONE mutable
+	// NewLifecycle-captured cfg across many concurrent NewSession calls would otherwise share ONE mutable
 	// ceiling (cfg.Tools.Permission holds the checker that reads it) — wrong for
 	// multi-session, where each session must clamp independently. The Lifecycle therefore mints
 	// a per-session state here and injects it via WithCeiling so the SESSION's ceiling source is
