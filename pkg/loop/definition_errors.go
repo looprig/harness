@@ -24,6 +24,8 @@ const (
 	DefinitionDuplicateMode         DefinitionErrorKind = "duplicate_mode"
 	DefinitionMissingInitialMode    DefinitionErrorKind = "missing_initial_mode"
 	DefinitionInvalidInitialMode    DefinitionErrorKind = "invalid_initial_mode"
+	DefinitionMissingPolicyRevision DefinitionErrorKind = "missing_policy_revision"
+	DefinitionInvalidPolicyRevision DefinitionErrorKind = "invalid_policy_revision"
 )
 
 // DefinitionError reports an invalid immutable definition.

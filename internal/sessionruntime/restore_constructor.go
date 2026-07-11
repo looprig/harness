@@ -2,8 +2,6 @@ package sessionruntime
 
 import (
 	"context"
-	"errors"
-	"io"
 	"time"
 
 	"github.com/looprig/core/uuid"
@@ -21,12 +19,9 @@ import (
 	"github.com/looprig/harness/pkg/workspacestore"
 )
 
-// Restore reconstructs a session's PRIMARY loop from the durable journal and brings it
-// up IDLE, ready to continue — the payoff of the persistence layer. It is the parallel
-// of New: it reuses the SAME hub/loop/factory wiring but SEEDS the primary loop from the
-// folded journal instead of spawning it empty, and it does NOT publish a fresh
-// SessionStarted (the session's start was recorded on the original run). The recovered
-// session keeps its identity: the same sessionID and the same primary loop id.
+// Restore reconstructs the durable loop topology and brings it up idle. The
+// single-loop entry point is a compatibility wrapper around the same leased
+// transaction used by RestoreTopology; neither path publishes SessionStarted.
 //
 // Order (per the design — RestoreStarted is the FIRST restore mutation, after the lease
 // fence the journal writes at construction):
@@ -36,12 +31,10 @@ import (
 //  2. Replay the stream; read the persisted config fingerprint and compare to the live
 //     config. On mismatch → *ConfigMismatchError UNLESS WithAllowConfigMismatch is set.
 //  3. Append RestoreStarted (the first restore mutation).
-//  4. Find the primary loop's original id (the root LoopStarted).
-//  5. Fold the primary loop's Enduring events into committed msgs + turnIndex.
-//  6. Crash-seam: if the fold ends on an open turn, append a TurnInterrupted to close it.
-//  7. Append RestoreDone on success.
-//  8. Build the Session: journal-backed hub appender + command appender, the session as
-//     FaultReporter, and the primary loop SEEDED (NewRestored) under its original id, idle.
+//  4. Validate, bind, and independently fold every durable declared loop.
+//  5. Append checked crash closures for every open turn.
+//  6. Materialize the workspace, build all loops, and validate the active loop.
+//  7. Append RestoreDone as the final commit point and return the controller.
 //
 // On ANY failure in steps 2–7 (a config mismatch, a discovery/replay/decode/object
 // failure, or an append failure) Restore durably records a RestoreErrored and returns a
@@ -60,131 +53,9 @@ func Restore(
 	return restoreSession(ctx, cfg, sessionID, store, uuid.New, time.Now, opts...)
 }
 
-// RestoreTopology reconstructs all durable primer roots and their independent
-// histories. The active primer is restored through the legacy single-root core;
-// remaining roots are attached before the controller is returned.
+// RestoreTopology reconstructs the entire topology in one leased replay transaction.
 func RestoreTopology(ctx context.Context, topology Topology, sessionID uuid.UUID, store *sessionstore.Store, opts ...Option) (*Session, error) {
-	active, ok := topology.definition(topology.ActivePrimer)
-	if !ok {
-		return nil, &RestoreError{Kind: RestoreLoopFailed, Cause: &MissingTopologyError{}}
-	}
-	events, err := replayTopologyEvents(ctx, store, sessionID)
-	if err != nil {
-		return nil, &RestoreError{Kind: RestoreReplayFailed, Cause: err}
-	}
-	hasStarted := false
-	for _, ev := range events {
-		if _, ok := ev.(event.SessionStarted); ok {
-			hasStarted = true
-			break
-		}
-	}
-	if !hasStarted {
-		return Restore(ctx, active, sessionID, store, opts...)
-	}
-	roots := make(map[identity.AgentName]event.LoopStarted)
-	allStarts := make([]event.LoopStarted, 0)
-	for _, ev := range events {
-		if started, isStarted := ev.(event.LoopStarted); isStarted {
-			allStarts = append(allStarts, started)
-			if started.Cause.Coordinates == (identity.Coordinates{}) {
-				if _, exists := roots[started.AgentName]; !exists {
-					roots[started.AgentName] = started
-				}
-			}
-		}
-	}
-	for _, primer := range topology.Primers {
-		if _, exists := roots[primer]; !exists {
-			return nil, &RestoreError{Kind: RestoreLoopFailed, Cause: &AgentNameMismatchError{Persisted: "", Configured: primer}}
-		}
-	}
-	for _, started := range allStarts {
-		if _, exists := topology.definition(started.AgentName); !exists {
-			return nil, &RestoreError{Kind: RestoreLoopFailed, Cause: &AgentNameMismatchError{Persisted: started.AgentName}}
-		}
-	}
-	s, err := Restore(ctx, active, sessionID, store, opts...)
-	if err != nil {
-		return nil, err
-	}
-	for _, started := range allStarts {
-		if _, exists := s.Loop(started.LoopID); exists {
-			continue
-		}
-		definition, _ := topology.definition(started.AgentName)
-		bound, bindErr := definition.Bind(s.sessionCtx, tool.Bindings{SessionID: sessionID, LoopID: started.LoopID})
-		if bindErr != nil {
-			_ = s.Shutdown(context.Background())
-			return nil, &RestoreError{Kind: RestoreLoopFailed, Cause: bindErr}
-		}
-		loopEvents := filterLoopEvents(events, started.LoopID)
-		folded := foldPrimaryLoop(loopEvents)
-		if folded.OpenTurn {
-			turnID, turnIndex := openTurnCoords(loopEvents)
-			header, stampErr := s.factory.Stamp(event.Header{Coordinates: identity.Coordinates{SessionID: sessionID, LoopID: started.LoopID, TurnID: turnID}})
-			if stampErr != nil {
-				_ = s.Shutdown(context.Background())
-				return nil, &RestoreError{Kind: RestoreIDGenerationFailed, Cause: stampErr}
-			}
-			if publishErr := s.PublishEvent(ctx, event.TurnInterrupted{Header: header, TurnIndex: turnIndex}); publishErr != nil {
-				_ = s.Shutdown(context.Background())
-				return nil, &RestoreError{Kind: RestoreAppendFailed, Cause: publishErr}
-			}
-		}
-		parent := loop.Provenance{LoopID: started.Cause.Coordinates.LoopID, TurnID: started.Cause.Coordinates.TurnID, StepID: started.Cause.Coordinates.StepID}
-		if buildErr := s.attachRestoredLoop(started, parent, bound, folded, findForeignSID(loopEvents)); buildErr != nil {
-			_ = s.Shutdown(context.Background())
-			return nil, buildErr
-		}
-	}
-	activeID := roots[topology.ActivePrimer].LoopID
-	for _, ev := range events {
-		if changed, isChanged := ev.(event.ActiveLoopChanged); isChanged {
-			activeID = changed.ActiveLoopID
-		}
-	}
-	if _, exists := s.Loop(activeID); !exists {
-		_ = s.Shutdown(context.Background())
-		return nil, &RestoreError{Kind: RestoreLoopFailed, Cause: &SessionError{Kind: SessionLoopNotFound}}
-	}
-	s.loopsMu.Lock()
-	s.primaryLoopID = activeID
-	s.loopsMu.Unlock()
-	return s, nil
-}
-
-func replayTopologyEvents(ctx context.Context, store *sessionstore.Store, sessionID uuid.UUID) ([]event.Event, error) {
-	replayer, err := store.OpenEventReplayer(sessionID, sessionstore.ReplayRequest{FromSeq: 0})
-	if err != nil {
-		return nil, err
-	}
-	cursor, err := replayer.Open(ctx, journal.ReplayRequest{SessionID: sessionID, From: journal.Beginning()})
-	if err != nil {
-		return nil, err
-	}
-	defer cursor.Close()
-	var events []event.Event
-	for {
-		ev, _, nextErr := cursor.Next(ctx)
-		if errors.Is(nextErr, io.EOF) {
-			return events, nil
-		}
-		if nextErr != nil {
-			return nil, nextErr
-		}
-		events = append(events, ev)
-	}
-}
-
-func filterLoopEvents(events []event.Event, loopID uuid.UUID) []event.Event {
-	filtered := make([]event.Event, 0)
-	for _, ev := range events {
-		if ev.EventHeader().LoopID == loopID || ev.EventHeader().LoopID.IsZero() {
-			filtered = append(filtered, ev)
-		}
-	}
-	return filtered
+	return restoreTopologySession(ctx, topology, sessionID, store, uuid.New, time.Now, opts...)
 }
 
 func (s *Session) attachRestoredLoop(started event.LoopStarted, parent loop.Provenance, bound loop.BoundDefinition, folded foldResult, foreignSID string) error {
@@ -227,6 +98,22 @@ func restoreSession(
 	now event.Clock,
 	opts ...Option,
 ) (*Session, error) {
+	return restoreTopologySession(ctx, Topology{Definitions: []loop.Definition{cfg}, Primers: []identity.AgentName{cfg.Name()}, ActivePrimer: cfg.Name()}, sessionID, store, newID, now, opts...)
+}
+
+func restoreTopologySession(
+	ctx context.Context,
+	topology Topology,
+	sessionID uuid.UUID,
+	store *sessionstore.Store,
+	newID idGenerator,
+	now event.Clock,
+	opts ...Option,
+) (*Session, error) {
+	activeDefinition, topologyOK := topology.definition(topology.ActivePrimer)
+	if !topologyOK {
+		return nil, &RestoreError{Kind: RestoreLoopFailed, Cause: &MissingTopologyError{}}
+	}
 	select {
 	case <-ctx.Done():
 		return nil, &RestoreError{Kind: RestoreContextDone, Cause: ctx.Err()}
@@ -314,26 +201,87 @@ func restoreSession(
 	if err != nil {
 		return recordErrored(err)
 	}
-	// The root LoopStarted carries both the primary loop's stable id (restore reuses it)
-	// and its immutable stamped AgentName. Validate the stamped name against the live
-	// primary config's AgentName — an empty (legacy/pre-AgentName) stored name vs a
-	// configured one is a mismatch, not silently accepted — routing through the same
-	// WithAllowConfigMismatch opt-in the fingerprint check honors.
-	rootLoop, err := findRootLoopStarted(all)
-	if err != nil {
+	type loopPlan struct {
+		started event.LoopStarted
+		bound   loop.BoundDefinition
+		events  []event.Event
+		folded  foldResult
+	}
+	roots := make(map[identity.AgentName]event.LoopStarted)
+	starts := make([]event.LoopStarted, 0)
+	for _, ev := range all {
+		if started, ok := ev.(event.LoopStarted); ok {
+			starts = append(starts, started)
+			if started.Cause.Coordinates == (identity.Coordinates{}) {
+				if _, duplicate := roots[started.AgentName]; !duplicate {
+					roots[started.AgentName] = started
+				}
+			}
+		}
+	}
+	if len(topology.Primers) == 1 {
+		for _, started := range starts {
+			if started.Cause.Coordinates == (identity.Coordinates{}) {
+				roots[topology.Primers[0]] = started
+				break
+			}
+		}
+	}
+	if len(starts) == 0 {
+		return recordErrored(&RestoreDiscoveryError{Kind: RestoreNoPrimaryLoop})
+	}
+	for _, primer := range topology.Primers {
+		if _, ok := roots[primer]; !ok {
+			if allowMismatch && len(topology.Primers) == 1 {
+				for _, started := range starts {
+					if started.Cause.Coordinates == (identity.Coordinates{}) {
+						roots[primer] = started
+						break
+					}
+				}
+				if _, recovered := roots[primer]; recovered {
+					continue
+				}
+			}
+			return recordErrored(&RestoreError{Kind: RestoreLoopFailed, Cause: &AgentNameMismatchError{Persisted: "", Configured: primer}})
+		}
+	}
+	plans := make([]loopPlan, 0, len(starts))
+	activeIndex := -1
+	for _, started := range starts {
+		definition, ok := topology.definition(started.AgentName)
+		isConfiguredRoot := started.LoopID == roots[topology.ActivePrimer].LoopID
+		if !ok && isConfiguredRoot && len(topology.Definitions) == 1 {
+			definition, ok = activeDefinition, true
+		}
+		if !ok && !isConfiguredRoot && len(topology.Definitions) == 1 {
+			continue
+		}
+		if !ok {
+			return recordErrored(&RestoreError{Kind: RestoreLoopFailed, Cause: &AgentNameMismatchError{Persisted: started.AgentName}})
+		}
+		bound, bindErr := definition.Bind(sessionCtx, tool.Bindings{SessionID: sessionID, LoopID: started.LoopID})
+		if bindErr != nil {
+			return recordErrored(&RestoreError{Kind: RestoreLoopFailed, Cause: bindErr})
+		}
+		if nameErr := checkAgentName(started.AgentName, bound.Name(), allowMismatch); nameErr != nil {
+			return recordErrored(nameErr)
+		}
+		loopEvents := eventsFromRecords(allRecords, started.LoopID)
+		plans = append(plans, loopPlan{started: started, bound: bound, events: loopEvents, folded: foldPrimaryLoop(loopEvents)})
+		if started.LoopID == roots[topology.ActivePrimer].LoopID {
+			activeIndex = len(plans) - 1
+		}
+	}
+	if activeIndex < 0 {
+		return recordErrored(&RestoreError{Kind: RestoreLoopFailed, Cause: &SessionError{Kind: SessionLoopNotFound}})
+	}
+	activePlan := plans[activeIndex]
+	if err := checkFingerprint(persisted, probe.projectFingerprint(activePlan.bound), allowMismatch); err != nil {
 		return recordErrored(err)
 	}
-	primaryLoopID := rootLoop.LoopID
-	bound, err := cfg.Bind(sessionCtx, tool.Bindings{SessionID: sessionID, LoopID: primaryLoopID})
-	if err != nil {
-		return recordErrored(&RestoreError{Kind: RestoreLoopFailed, Cause: err})
-	}
-	if err := checkFingerprint(persisted, probe.projectFingerprint(bound), allowMismatch); err != nil {
-		return recordErrored(err)
-	}
-	if err := checkAgentName(rootLoop.Header.AgentName, bound.Name(), allowMismatch); err != nil {
-		return recordErrored(err)
-	}
+	primaryLoopID := activePlan.started.LoopID
+	bound := activePlan.bound
 
 	// Re-seed the cumulative spawn counter from the durable log so the quota SURVIVES the
 	// restart: count the non-root LoopStarted events (subagent spawns). `all` is the
@@ -369,24 +317,21 @@ func restoreSession(
 		return recordErrored(&RestoreError{Kind: RestoreAppendFailed, Cause: err})
 	}
 
-	// (5) Fold the primary loop's Enduring events (a SCOPED replay) into committed msgs +
-	// turnIndex. The primaryLoopID NARROWS the drain to the session-scoped events plus the
-	// primary loop's events, dropping every OTHER loop's events — the SAME narrowing the
-	// NATS EventReplayer's loop-subject filter gave, and load-bearing: an unnarrowed drain
-	// would fold a subagent loop's turns into the primary thread and corrupt it. Re-seeding
-	// the system prompt is implicit: it rides cfg.System (the loop never stores it in
-	// msgs), so the seeded loop carries it via cfg.
-	primaryEvents := eventsFromRecords(allRecords, primaryLoopID)
-	folded := foldPrimaryLoop(primaryEvents)
+	// Every loop was independently folded from its loop-scoped projection above.
+	primaryEvents := activePlan.events
+	folded := activePlan.folded
 
 	// (6) Crash-seam: an open turn (a TurnStarted with no terminal) is closed durably
 	// with a TurnInterrupted carrying the open turn's id + index, so the resumed loop
 	// never observes a half-open turn.
-	if folded.OpenTurn {
-		turnID, turnIdx := openTurnCoords(primaryEvents)
+	for _, plan := range plans {
+		if !plan.folded.OpenTurn {
+			continue
+		}
+		turnID, turnIdx := openTurnCoords(plan.events)
 		if err := appendRestoreEvent(ctx, j, factory, event.TurnInterrupted{
 			Header: event.Header{Coordinates: identity.Coordinates{
-				SessionID: sessionID, LoopID: primaryLoopID, TurnID: turnID,
+				SessionID: sessionID, LoopID: plan.started.LoopID, TurnID: turnID,
 			}},
 			TurnIndex: turnIdx,
 		}); err != nil {
@@ -398,8 +343,8 @@ func restoreSession(
 	// declaring the restore done, so
 	// RestoreDone is appended only if the workspace is also restored (fail closed — the
 	// session never comes up on a workspace that does not match the durable pointer). It
-	// uses probe.ws/probe.wsRoot because the real *Session is not built until AFTER
-	// RestoreDone. Skipped when no workspace store is wired (a conversation-only restore —
+	// uses probe.ws/probe.wsRoot because the live Session is not built yet. Skipped
+	// when no workspace store is wired (a conversation-only restore —
 	// the composition root opted out) or the journal carries no checkpoint or restore
 	// transition: the root is left untouched in both cases. The journal-sourced
 	// ref is validated through ParseRef (a trust boundary — a corrupt log fails closed) and
@@ -415,14 +360,7 @@ func restoreSession(
 		}
 	}
 
-	// (7) RestoreDone — the restore succeeded; the session is about to come up.
-	if err := appendRestoreEvent(ctx, j, factory, event.RestoreDone{
-		Header: event.Header{Coordinates: identity.Coordinates{SessionID: sessionID}},
-	}); err != nil {
-		return recordErrored(&RestoreError{Kind: RestoreAppendFailed, Cause: err})
-	}
-
-	// (8) Build the Session, reusing sessionID + the primary loop id (identity stable).
+	// Build the Session, reusing sessionID + the active primer loop id (identity stable).
 	// It mirrors newSession's wiring EXCEPT: no SessionStarted is published (the start
 	// was recorded on the original run), and the primary loop is SEEDED via NewRestored
 	// rather than spawned empty. The lease Restore acquired is handed to the session as its
@@ -439,6 +377,43 @@ func restoreSession(
 	s, err := buildRestoredSession(sessionCtx, sessionCancel, bound, sessionID, primaryLoopID, foreignSID, spawnedCount, ceilingLevel, hasCeiling, folded, restoredGates.open, j, factory, newID, now, leaseOpts...)
 	if err != nil {
 		return recordErrored(err)
+	}
+	for _, plan := range plans {
+		if plan.started.LoopID == primaryLoopID {
+			continue
+		}
+		parent := loop.Provenance{LoopID: plan.started.Cause.Coordinates.LoopID, TurnID: plan.started.Cause.Coordinates.TurnID, StepID: plan.started.Cause.Coordinates.StepID}
+		if err := s.attachRestoredLoop(plan.started, parent, plan.bound, plan.folded, findForeignSID(plan.events)); err != nil {
+			sessionCancel()
+			return recordErrored(err)
+		}
+	}
+	activeID := primaryLoopID
+	for _, ev := range all {
+		if changed, ok := ev.(event.ActiveLoopChanged); ok {
+			activeID = changed.ActiveLoopID
+		}
+	}
+	if _, ok := s.Loop(activeID); !ok {
+		sessionCancel()
+		return recordErrored(&RestoreError{Kind: RestoreLoopFailed, Cause: &SessionError{Kind: SessionLoopNotFound}})
+	}
+	s.loopsMu.Lock()
+	s.primaryLoopID = activeID
+	if s.faulted {
+		fault := s.faultErr
+		s.loopsMu.Unlock()
+		sessionCancel()
+		return recordErrored(&RestoreError{Kind: RestoreAppendFailed, Cause: fault})
+	}
+	s.loopsMu.Unlock()
+	// RestoreDone is the commit point: every loop is bound, crash-closed, built,
+	// attached, and the active selection has been validated before this append.
+	if err := appendRestoreEvent(ctx, j, factory, event.RestoreDone{
+		Header: event.Header{Coordinates: identity.Coordinates{SessionID: sessionID}},
+	}); err != nil {
+		sessionCancel()
+		return recordErrored(&RestoreError{Kind: RestoreAppendFailed, Cause: err})
 	}
 	contextTransferred = true
 	return s, nil

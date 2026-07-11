@@ -35,6 +35,12 @@ func TestDefineValidation(t *testing.T) {
 		{name: "typed nil runtime context", opts: []Option{WithName("a"), WithInference(&fakeLLM{}, testModel()), WithRuntimeContext((*nilRuntimeContext)(nil))}, kind: DefinitionInvalidRuntimeContext},
 		{name: "empty delegate", opts: []Option{WithName("a"), WithInference(&fakeLLM{}, testModel()), WithDelegates("")}, kind: DefinitionInvalidDelegate},
 		{name: "invalid delegation", opts: []Option{WithName("a"), WithInference(&fakeLLM{}, testModel()), WithDelegation(Delegation{Style: DelegationStyle(99)})}, kind: DefinitionInvalidDelegation},
+		{name: "empty policy revision", opts: []Option{WithName("a"), WithInference(&fakeLLM{}, testModel()), WithPolicyRevision("")}, kind: DefinitionInvalidPolicyRevision},
+		{name: "opaque permission lacks revision", opts: []Option{WithName("a"), WithInference(&fakeLLM{}, testModel()), WithPermissionFactory(func(context.Context, tool.Bindings) (PermissionGate, error) { return permissionGateStub{}, nil })}, kind: DefinitionMissingPolicyRevision},
+		{name: "opaque middleware lacks revision", opts: []Option{WithName("a"), WithInference(&fakeLLM{}, testModel()), WithToolMiddlewares(func(ctx context.Context, inv tool.InvokableTool, args string, next tool.ToolExecuteFunc) (*tool.ToolResult, error) {
+			return next(ctx, args)
+		})}, kind: DefinitionMissingPolicyRevision},
+		{name: "opaque runtime context lacks revision", opts: []Option{WithName("a"), WithInference(&fakeLLM{}, testModel()), WithRuntimeContext(&fakeRuntimeContextProvider{})}, kind: DefinitionMissingPolicyRevision},
 	}
 	for _, tt := range tests {
 		tt := tt
@@ -64,7 +70,7 @@ func TestDefinitionBindValidatesIDsBeforeFactories(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			var permissionCalls atomic.Int32
-			d := mustDefinition(t, WithPermissionFactory(func(context.Context, tool.Bindings) (PermissionGate, error) {
+			d := mustDefinition(t, WithPolicyRevision("test"), WithPermissionFactory(func(context.Context, tool.Bindings) (PermissionGate, error) {
 				permissionCalls.Add(1)
 				return permissionGateStub{}, nil
 			}))
@@ -100,7 +106,7 @@ func TestDefinitionDefaultsAndDefensiveCopies(t *testing.T) {
 	defs := []tool.Definition{testToolDefinition("base", nil, nil)}
 	d, err := Define(
 		WithName("agent"), WithInference(&fakeLLM{}, testModel()), WithSystem("system"),
-		WithTools(defs...), WithToolMiddlewares(middleware), WithDelegates(delegates...),
+		WithTools(defs...), WithPolicyRevision("test"), WithToolMiddlewares(middleware), WithDelegates(delegates...),
 	)
 	if err != nil {
 		t.Fatalf("Define: %v", err)
@@ -216,7 +222,7 @@ func TestDefinitionPermissionFactory(t *testing.T) {
 		}
 		return permissionGateStub{}, nil
 	}
-	d := mustDefinition(t, WithPermissionFactory(factory))
+	d := mustDefinition(t, WithPolicyRevision("test"), WithPermissionFactory(factory))
 	bindings := validToolBindings(t)
 	bindings.Workspace = &tool.WorkspaceBinding{Root: "original"}
 	b, err := d.Bind(context.Background(), bindings)
@@ -231,7 +237,7 @@ func TestDefinitionPermissionFactory(t *testing.T) {
 	}
 
 	nilFactory := func(context.Context, tool.Bindings) (PermissionGate, error) { return (*nilPermissionGate)(nil), nil }
-	d = mustDefinition(t, WithPermissionFactory(nilFactory))
+	d = mustDefinition(t, WithPolicyRevision("test"), WithPermissionFactory(nilFactory))
 	_, err = d.Bind(context.Background(), validToolBindings(t))
 	var bindErr *BindError
 	if !errors.As(err, &bindErr) || bindErr.Kind != BindInvalidPermission {

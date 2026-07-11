@@ -41,6 +41,7 @@ type definitionState struct {
 	delegation        Delegation
 	modes             []Mode
 	initialMode       ModeName
+	policyRevision    string
 }
 
 type definitionOptions struct {
@@ -98,6 +99,14 @@ func Define(opts ...Option) (Definition, error) {
 	}
 	if _, configured := resolved.seen["runtime_context"]; configured && nilLike(resolved.runtimeContext) {
 		return Definition{}, &DefinitionError{Kind: DefinitionInvalidRuntimeContext, Field: "runtime_context"}
+	}
+	if _, configured := resolved.seen["policy_revision"]; configured && strings.TrimSpace(resolved.policyRevision) == "" {
+		return Definition{}, &DefinitionError{Kind: DefinitionInvalidPolicyRevision, Field: "policy_revision"}
+	}
+	_, permissionConfigured := resolved.seen["permission_factory"]
+	_, runtimeConfigured := resolved.seen["runtime_context"]
+	if (permissionConfigured || runtimeConfigured || len(resolved.middlewares) > 0) && strings.TrimSpace(resolved.policyRevision) == "" {
+		return Definition{}, &DefinitionError{Kind: DefinitionMissingPolicyRevision, Field: "policy_revision"}
 	}
 	if resolved.delegation.Style != DelegationSyncOnly && resolved.delegation.Style != DelegationManaged {
 		return Definition{}, &DefinitionError{Kind: DefinitionInvalidDelegation, Field: "delegation.style"}
@@ -171,8 +180,8 @@ func (d Definition) Delegation() Delegation {
 }
 
 // PolicyRevision returns a deterministic, secret-free digest of immutable loop
-// behavior used by a rig topology fingerprint. Function-valued collaborators are
-// represented by the separately configured security-policy revision at rig level.
+// behavior used by a rig topology fingerprint. Opaque function-valued collaborators
+// require WithPolicyRevision, whose caller-supplied identity is included here.
 func (d Definition) PolicyRevision() string {
 	if d.state == nil {
 		return ""
@@ -211,22 +220,24 @@ func (d Definition) PolicyRevision() string {
 	delegates := append([]identity.AgentName(nil), d.state.delegates...)
 	slices.SortFunc(delegates, func(a, b identity.AgentName) int { return strings.Compare(string(a), string(b)) })
 	projection := struct {
-		Name         identity.AgentName
-		Model        inference.Model
-		System       string
-		Tools        []toolPolicy
-		Limits       ToolLimits
-		Engine       Engine
-		DrainTimeout time.Duration
-		Delegates    []identity.AgentName
-		Delegation   Delegation
-		Modes        []modePolicy
-		InitialMode  ModeName
+		Name           identity.AgentName
+		Model          inference.Model
+		System         string
+		Tools          []toolPolicy
+		Limits         ToolLimits
+		Engine         Engine
+		DrainTimeout   time.Duration
+		Delegates      []identity.AgentName
+		Delegation     Delegation
+		Modes          []modePolicy
+		InitialMode    ModeName
+		PolicyRevision string
 	}{
 		Name: d.state.name, Model: cloneModel(d.state.model), System: d.state.system,
 		Tools: tools(d.state.tools), Limits: d.state.limits, Engine: d.state.engine,
 		DrainTimeout: d.state.drainTimeout, Delegates: delegates,
 		Delegation: d.state.delegation, Modes: modes, InitialMode: d.state.initialMode,
+		PolicyRevision: d.state.policyRevision,
 	}
 	encoded, _ := json.Marshal(projection)
 	sum := sha256.Sum256(encoded)
@@ -522,6 +533,17 @@ func WithRuntimeContext(provider RuntimeContextProvider) Option {
 			return err
 		}
 		o.runtimeContext = provider
+		return nil
+	}
+}
+
+// WithPolicyRevision supplies stable loop-scoped identity for opaque policy collaborators.
+func WithPolicyRevision(revision string) Option {
+	return func(options *definitionOptions) error {
+		if err := options.singleton("policy_revision"); err != nil {
+			return err
+		}
+		options.policyRevision = revision
 		return nil
 	}
 }

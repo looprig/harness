@@ -1315,6 +1315,9 @@ type shutdownTarget struct {
 // Calling Shutdown twice is safe: StopSession is idempotent, closing already true
 // is fine, and loops that already exited hit the <-Done cases.
 func (s *Session) Shutdown(ctx context.Context) error {
+	// Serialize the closing latch with SetActiveLoop's durable append→visibility
+	// transaction. Once closing is visible, no active-loop change may start.
+	s.activeMu.Lock()
 	// (1) Latch closing and snapshot the loops atomically under loopsMu — the same
 	// lock NewLoop's registration check re-tests closing under, so no loop can be
 	// registered after this snapshot is taken.
@@ -1325,6 +1328,7 @@ func (s *Session) Shutdown(ctx context.Context) error {
 		snapshot = append(snapshot, loopSnapshot{loopID: lid, handle: h})
 	}
 	s.loopsMu.Unlock()
+	s.activeMu.Unlock()
 
 	// (2) Flip the session phase to stopped after the snapshot, before the sends.
 	s.hub.StopSession(ctx)

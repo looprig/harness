@@ -162,6 +162,7 @@ func TestDefinePrimerTopology(t *testing.T) {
 		{"multiple needs active", []Option{WithLoops(planner, builder), WithPrimers("planner", "builder"), WithSessionStore(store)}, DefinitionInvalidActivePrimer},
 		{"active must be primer", []Option{WithLoops(planner, builder), WithPrimers("planner"), WithActivePrimer("builder"), WithSessionStore(store)}, DefinitionInvalidActivePrimer},
 		{"duplicate primer", []Option{WithLoops(planner), WithPrimers("planner", "planner"), WithActivePrimer("planner"), WithSessionStore(store)}, DefinitionInvalidPrimer},
+		{"explicit empty active", []Option{WithLoops(planner), WithPrimers("planner"), WithActivePrimer(""), WithSessionStore(store)}, DefinitionInvalidActivePrimer},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -176,6 +177,33 @@ func TestDefinePrimerTopology(t *testing.T) {
 	if _, err := Define(WithLoops(planner, builder), WithPrimers("planner", "builder"), WithActivePrimer("builder"), WithSessionStore(store)); err != nil {
 		t.Fatalf("valid topology: %v", err)
 	}
+}
+
+func TestDefineRequiresGraphReachabilityFromPrimers(t *testing.T) {
+	store, _ := sessionstore.Open(memstore.New())
+	makeLoop := func(name string, delegates ...identity.AgentName) loop.Definition {
+		d, err := loop.Define(loop.WithName(identity.AgentName(name)), loop.WithInference(&stubLLM{}, validModel(name)), loop.WithDelegates(delegates...))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return d
+	}
+	t.Run("unreachable cycle", func(t *testing.T) {
+		_, err := Define(WithLoops(makeLoop("root"), makeLoop("a", "b"), makeLoop("b", "a")), WithPrimers("root"), WithSessionStore(store))
+		var target *DefinitionError
+		if !errors.As(err, &target) || target.Kind != DefinitionInvalidLoop {
+			t.Fatalf("error = %v", err)
+		}
+	})
+	t.Run("reachable cycle and diamond", func(t *testing.T) {
+		_, err := Define(
+			WithLoops(makeLoop("root", "a", "b"), makeLoop("a", "c"), makeLoop("b", "c"), makeLoop("c", "a")),
+			WithPrimers("root"), WithSessionStore(store),
+		)
+		if err != nil {
+			t.Fatalf("Define: %v", err)
+		}
+	})
 }
 
 func TestRigPrimersActiveLoopAndRestore(t *testing.T) {

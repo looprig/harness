@@ -198,6 +198,13 @@ func TestTopologyFingerprintIsDeterministicAndPrimerOrderSensitive(t *testing.T)
 	if a.Equal(nonActivePolicyChanged) {
 		t.Fatal("non-active loop policy change did not alter topology fingerprint")
 	}
+	revisedA := mustDefine(loop.WithName("builder"), loop.WithInference(&stubLLM{}, validModel("model")), loop.WithPolicyRevision("policy-a"))
+	revisedB := mustDefine(loop.WithName("builder"), loop.WithInference(&stubLLM{}, validModel("model")), loop.WithPolicyRevision("policy-b"))
+	policyA := fingerprintWithTopology(bound, ConfigFingerprintFields{}, []loop.Definition{planner, revisedA}, []string{"planner", "builder"}, "planner")
+	policyB := fingerprintWithTopology(bound, ConfigFingerprintFields{}, []loop.Definition{planner, revisedB}, []string{"planner", "builder"}, "planner")
+	if policyA.Equal(policyB) {
+		t.Fatal("explicit loop policy revision did not alter topology fingerprint")
+	}
 }
 
 func TestFingerprintSystemRevisionIncludesInitialModeInstructions(t *testing.T) {

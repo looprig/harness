@@ -50,7 +50,7 @@ func (permissionGateStub) Grant(context.Context, string, string, tool.ApprovalSc
 func capturedDefinition(c *bindingCapture, system string, engine loop.Engine) loop.Definition {
 	return mustDefine(
 		loop.WithName("agent"), loop.WithInference(&stubLLM{}, validModel("model-x")),
-		loop.WithSystem(system), loop.WithEngine(engine), loop.WithPermissionFactory(c.factory),
+		loop.WithSystem(system), loop.WithEngine(engine), loop.WithPolicyRevision("test"), loop.WithPermissionFactory(c.factory),
 	)
 }
 

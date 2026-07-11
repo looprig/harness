@@ -41,7 +41,6 @@ func Define(options ...Option) (*Rig, error) {
 		return nil, &DefinitionError{Kind: DefinitionMissingLoop}
 	}
 	byName := make(map[string]loop.Definition, len(state.loops))
-	referenced := make(map[string]bool, len(state.loops))
 	for _, definition := range state.loops {
 		name := string(definition.Name())
 		if strings.TrimSpace(name) == "" {
@@ -64,9 +63,8 @@ func Define(options ...Option) (*Rig, error) {
 		if _, exists := byName[primer]; !exists {
 			return nil, &DefinitionError{Kind: DefinitionInvalidPrimer, Name: primer}
 		}
-		referenced[primer] = true
 	}
-	if len(state.primers) == 1 && state.activePrimer == "" {
+	if len(state.primers) == 1 && !state.seen["active_primer"] {
 		state.activePrimer = state.primers[0]
 	}
 	if state.activePrimer == "" || !seenPrimers[state.activePrimer] {
@@ -78,11 +76,23 @@ func Define(options ...Option) (*Rig, error) {
 			if _, exists := byName[name]; !exists {
 				return nil, &DefinitionError{Kind: DefinitionInvalidLoop, Name: name}
 			}
-			referenced[name] = true
+		}
+	}
+	queue := append([]string(nil), state.primers...)
+	visited := make(map[string]bool, len(byName))
+	for len(queue) > 0 {
+		name := queue[0]
+		queue = queue[1:]
+		if visited[name] {
+			continue
+		}
+		visited[name] = true
+		for _, delegate := range byName[name].Delegates() {
+			queue = append(queue, string(delegate))
 		}
 	}
 	for name := range byName {
-		if !referenced[name] {
+		if !visited[name] {
 			return nil, &DefinitionError{Kind: DefinitionInvalidLoop, Name: name}
 		}
 	}
