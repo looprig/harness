@@ -215,6 +215,7 @@ git commit -m "feat(tool): add immutable runtime-bound definitions"
 - Create: `pkg/loop/controller.go`
 - Create: `pkg/loop/definition_errors.go`
 - Modify: `pkg/loop/config.go` (temporary internal compatibility only)
+- Modify: `pkg/loop/deps.go`
 - Modify: `pkg/loop/deps_test.go`
 
 **Step 1: Write failing definition tests**
@@ -240,7 +241,15 @@ type Mode struct {
 }
 ```
 
-Options include `WithName`, `WithInference`, `WithSystem`, `WithTools`, `WithToolLimits`, `WithEngine`, `WithDrainTimeout`, `WithRuntimeContext`, `WithDelegates`, `WithDelegation`, `WithModes`, and `WithInitialMode`. `Definition.Bind(ctx, tool.Bindings)` returns an immutable read-only `BoundDefinition` used by internal runtimes; no exported mutable config struct is introduced.
+Options include `WithName`, `WithInference`, `WithSystem`, `WithTools`,
+`WithPermissionFactory`, `WithToolMiddlewares`, `WithToolLimits`, `WithEngine`,
+`WithDrainTimeout`, `WithRuntimeContext`, `WithDelegates`, `WithDelegation`,
+`WithModes`, and `WithInitialMode`. `PermissionFactory` receives the same attenuated
+per-loop `tool.Bindings` and must return a fresh/non-nil `PermissionGate`, preventing a
+mutable checker or ceiling source from being accidentally shared across sessions.
+Middlewares are copied immutable collaborators. `Definition.Bind(ctx, tool.Bindings)`
+returns an immutable read-only `BoundDefinition` used by internal runtimes; no exported
+mutable config struct is introduced.
 
 **Step 2: Verify red**
 
@@ -252,7 +261,15 @@ Expected: undefined definition API.
 
 **Step 3: Implement and bridge temporarily**
 
-Implement option resolution with typed errors and defensive copies. Add one temporary internal conversion from `BoundDefinition` to the existing actor `Config`; mark it for deletion in Task 7. Preserve existing foreign-builder, gate, parallel-tool, runtime-context, and fingerprint inputs rather than dropping them during the API rename.
+Implement option resolution with typed errors and defensive copies. Use a concrete
+`Definition` value with unexported state (not an externally implementable interface),
+and a sealed read-only `BoundDefinition` contract for the internal actor. Bind every
+distinct tool definition once per loop, reuse those concrete instances across that
+loop's modes, and reject duplicate definition/built-tool names. Resolve the permission
+factory once per binding and copy middleware slices. Add one temporary internal
+conversion from `BoundDefinition` to the existing actor `Config`; mark it for deletion
+in Task 7. Preserve existing foreign-builder, gate, parallel-tool, runtime-context, and
+fingerprint inputs rather than dropping them during the API rename.
 Binding tests must prove modes on one loop reuse its concrete tool instances and private
 observations, while every primer, delegate, and restored loop receives a fresh build.
 
