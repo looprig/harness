@@ -19,6 +19,8 @@ type fakeLiveSession struct {
 	id int
 }
 
+func (fakeLiveSession) SessionID() uuid.UUID { return uuid.UUID{} }
+
 func (fakeLiveSession) Submit(context.Context, []content.Block) (uuid.UUID, error) {
 	return uuid.UUID{}, nil
 }

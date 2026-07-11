@@ -1,5 +1,7 @@
 package command
 
+import "github.com/looprig/harness/pkg/ceiling"
+
 // SetSecurityCeiling is the journaled, replayable command that clamps the session's
 // SECURITY CEILING — the ordinal upper bound on how permissive auto-approval may be
 // (SPEC §8/§10.2). It is a plain-JSON command (every field round-trips through
@@ -19,7 +21,7 @@ type SetSecurityCeiling struct {
 	// it to any operator-configured maximum on apply; the emitted SecurityCeilingChanged
 	// carries the effective (post-clamp) ordinal. This is the operator's intent as
 	// recorded in the audit intent log.
-	Level uint8 `json:"level"`
+	Level ceiling.Level `json:"level"`
 }
 
 func (SetSecurityCeiling) isCommand() {}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"testing"
 
+	"github.com/looprig/harness/pkg/ceiling"
 	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/harness/pkg/tool"
 )
@@ -46,9 +47,9 @@ func (f *fakeBitsOnlyRunner) RunCommand(context.Context, string, string) ([]byte
 func (f *fakeBitsOnlyRunner) GuaranteeBits() uint64 { return f.bits }
 
 // fakeCeiling is a CeilingSource whose ordinal the test mutates between Checks.
-type fakeCeiling struct{ cur uint8 }
+type fakeCeiling struct{ cur ceiling.Level }
 
-func (f *fakeCeiling) Current() uint8 { return f.cur }
+func (f *fakeCeiling) Current() ceiling.Level { return f.cur }
 
 var (
 	_ tool.CommandRunner = (*fakeGuaranteeRunner)(nil)

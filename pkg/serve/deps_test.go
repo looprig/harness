@@ -10,6 +10,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/looprig/harness/pkg/rig"
 	"github.com/looprig/harness/pkg/serve"
 	"github.com/looprig/harness/pkg/session"
 )
@@ -19,8 +20,8 @@ import (
 // session package. If a real method signature ever drifts from an interface, this
 // file stops compiling — the guardrail that keeps serve's contract honest.
 var (
-	_ serve.LiveSession              = (*session.Session)(nil)
-	_ serve.Runner[*session.Session] = (*session.Runner)(nil)
+	_ serve.LiveSession                    = (session.Session)(nil)
+	_ serve.Rig[session.SessionController] = (*rig.Rig)(nil)
 )
 
 // allowedImports is the EXACT set of import paths the production (non-test) serve

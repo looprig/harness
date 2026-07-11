@@ -1,0 +1,314 @@
+package sessionruntime
+
+import (
+	"context"
+
+	"github.com/looprig/core/uuid"
+	"github.com/looprig/harness/pkg/ceiling"
+	"github.com/looprig/harness/pkg/foreignloop"
+	"github.com/looprig/harness/pkg/journal"
+	"github.com/looprig/harness/pkg/loop"
+	"github.com/looprig/harness/pkg/sessionstore"
+	"github.com/looprig/harness/pkg/workspacestore"
+)
+
+// MissingStoreError reports that NewLifecycle was handed a nil *sessionstore.Store. The durable
+// backend is a required dependency (DIP): the Lifecycle mints per-run leases/journals/
+// appenders from it, so a nil store is rejected at NewLifecycle rather than deferring a
+// nil-deref to the first NewSession/RestoreSession.
+type MissingStoreError struct{}
+
+func (*MissingStoreError) Error() string {
+	return "session: Lifecycle.NewLifecycle requires a non-nil sessionstore.Store"
+}
+
+// NewSessionErrorKind classifies a NewSession failure before the live session exists — the per-run
+// durable wiring the Lifecycle builds itself (lease, journal, checked appenders) or the
+// session construction that consumes them.
+type NewSessionErrorKind string
+
+const (
+	// NewSessionContextDone: the NewSession context was already cancelled.
+	NewSessionContextDone NewSessionErrorKind = "context_done"
+	// NewSessionIDGenerationFailed: a crypto/rand failure minting the fresh session id.
+	NewSessionIDGenerationFailed NewSessionErrorKind = "id_generation_failed"
+	// NewSessionLeaseFailed: the single-writer lease could not be acquired (another owner holds
+	// it, or a backend read failed). The session must not come up.
+	NewSessionLeaseFailed NewSessionErrorKind = "lease_failed"
+	// NewSessionJournalFailed: the SessionJournal could not be opened (its opening fence was
+	// rejected, or stream setup failed).
+	NewSessionJournalFailed NewSessionErrorKind = "journal_failed"
+	// NewSessionAppenderFailed: a checked journal appender (event/command/gate) could not be
+	// constructed over the opened journal.
+	NewSessionAppenderFailed NewSessionErrorKind = "appender_failed"
+	// NewSessionRuntimeFailed: runtime construction refused to build the live session over the wired deps.
+	NewSessionRuntimeFailed NewSessionErrorKind = "session_failed"
+)
+
+// NewSessionError is the typed wrapper for a NewSession failure. Kind classifies the stage; Cause
+// chains the underlying typed error (a *journal.LeaseHeldError, a *SessionError, etc.) so
+// a caller can errors.As both this and the cause. On any failure after the lease is
+// acquired the Lifecycle releases it best-effort before returning, so a failed NewSession never
+// strands single-writer ownership.
+type NewSessionError struct {
+	Kind  NewSessionErrorKind
+	Cause error
+}
+
+func (e *NewSessionError) Error() string {
+	msg := "session: run failed (" + string(e.Kind) + ")"
+	if e.Cause != nil {
+		return msg + ": " + e.Cause.Error()
+	}
+	return msg
+}
+
+func (e *NewSessionError) Unwrap() error { return e.Cause }
+
+// Lifecycle binds a design-time agent definition (cfg) and a durable backend (store) into an
+// immutable, reusable factory for live sessions. NewLifecycle captures the caller-facing
+// options once; NewSession mints a fresh session id and brings up a brand-new session over
+// per-run durable deps; RestoreSession rebuilds a prior session from its journal. It mirrors
+// flow's LifecycleOption/RunOption split: everything the narrow serve.Lifecycle interface needs
+// is fixed at NewLifecycle, so NewSession/RestoreSession take no per-call knobs.
+//
+// A Lifecycle is safe to reuse across many sessions. Each NewSession/RestoreSession builds its OWN durable
+// wiring (lease, journal, appenders) from the shared store, so two live sessions never
+// share a lease or a journal.
+type Lifecycle struct {
+	cfg   loop.Definition
+	store *sessionstore.Store
+
+	// catalog is the derived session-index the per-run event appender notifies (via
+	// journal.WithCatalog) after each durable append, so the replay-free status fold stays
+	// live. Built once in NewLifecycle from the store (cheap, no I/O). See AMBIGUITY A3.
+	catalog *sessionstore.Catalog
+
+	// baseOpts are the session.Options captured at NewLifecycle that are IDENTICAL across every
+	// NewSession and RestoreSession: WithLimits, WithConfigFingerprintFields (the fingerprinted one),
+	// WithWorkspaceStore, WithForeignBuilder, WithGateCaps. They are forwarded verbatim to
+	// both runtime construction and RestoreSession. The per-run deps (session id, appenders, lease-release) and the
+	// per-run ceiling are appended by NewSession/RestoreSession on top of these.
+	baseOpts []Option
+
+	// allowConfigMismatch is the NewLifecycle-time opt-in forwarded to RestoreSession ONLY (as
+	// WithAllowConfigMismatch): a fingerprint mismatch resumes instead of rejecting. runtime construction
+	// never reads it. AMBIGUITY A2: WithAllowConfigMismatch is classified NewLifecycle-time for
+	// serve.Lifecycle interface minimalism, so it is fixed for the Lifecycle's whole lifetime.
+	allowConfigMismatch bool
+
+	// ceilingFactory mints a FRESH *ceiling.State per NewSession/RestoreSession. AMBIGUITY A1: reusing one
+	// NewLifecycle-captured cfg across many concurrent Runs would otherwise share ONE mutable
+	// ceiling (cfg.Tools.Permission holds the checker that reads it) — wrong for
+	// multi-session, where each session must clamp independently. The Lifecycle therefore mints
+	// a per-run state here and injects it via WithCeiling so the SESSION's ceiling source is
+	// per-run. Rebinding the permission CHECKER (in cfg.Tools.Permission) to this same
+	// per-run state is a composition-root (swe) concern the spec DEFERS: the Lifecycle only
+	// mints-per-run; swe wires the checker to it. When the factory is nil the Lifecycle falls
+	// back to today's behavior — the session default-mints its own internal ceiling state
+	// (whatever cfg carries is untouched).
+	ceilingFactory CeilingFactory
+}
+
+// CeilingFactory mints a fresh security-ceiling state. The Lifecycle calls it once per
+// NewSession/RestoreSession so each session gets its own independent clamp (AMBIGUITY A1 on
+// Lifecycle.ceilingFactory). It is a named type per the codebase's prefer-named-types rule.
+type CeilingFactory func() *ceiling.State
+
+// LifecycleOption configures a Lifecycle at NewLifecycle time. Every caller-facing knob is captured
+// here (the runtime NewSession/RestoreSession take none), mirroring flow's LifecycleOption model. A
+// nil/zero argument is ignored (the default is kept), mirroring the session options' own
+// fail-safe convention.
+type LifecycleOption func(*Lifecycle)
+
+// WithLifecycleLimits captures the in-session subagent-spawn safety caps (depth + quota) the
+// session enforces. Forwarded to both runtime construction and RestoreSession as WithLimits.
+func WithLifecycleLimits(l Limits) LifecycleOption {
+	return func(r *Lifecycle) {
+		r.baseOpts = append(r.baseOpts, WithLimits(l))
+	}
+}
+
+// WithLifecycleConfigFingerprintFields captures the swarm-level config-fingerprint inputs
+// (AgentKind/RuntimeSkills/WorkspaceRoot/…) that do not live on loop.Definition. This is THE
+// fingerprinted option: it is stamped on runtime construction's SessionStarted and re-merged into the LIVE
+// fingerprint RestoreSession compares, so it MUST be identical between the NewSession that created a
+// session and the RestoreSession that resumes it — hence its capture-once-at-NewLifecycle placement.
+func WithLifecycleConfigFingerprintFields(fields ConfigFingerprintFields) LifecycleOption {
+	return func(r *Lifecycle) {
+		r.baseOpts = append(r.baseOpts, WithConfigFingerprintFields(fields))
+	}
+}
+
+// WithLifecycleWorkspaceStore captures the workspace snapshot store and root the session
+// checkpoints into (and RestoreSession materializes from). A nil store is ignored. Forwarded to
+// both runtime construction and RestoreSession as WithWorkspaceStore.
+func WithLifecycleWorkspaceStore(ws *workspacestore.Store, root string) LifecycleOption {
+	return func(r *Lifecycle) {
+		if ws != nil {
+			r.baseOpts = append(r.baseOpts, WithWorkspaceStore(ws, root))
+		}
+	}
+}
+
+// WithLifecycleForeignBuilder captures the composition-root seams that construct foreign-
+// engine loops (live + restored). Either seam being nil leaves foreign engines unsupported,
+// so both are captured together. Forwarded to both runtime construction and RestoreSession as WithForeignBuilder.
+func WithLifecycleForeignBuilder(b foreignloop.Builder, rb foreignloop.RestoredBuilder) LifecycleOption {
+	return func(r *Lifecycle) {
+		if b != nil && rb != nil {
+			r.baseOpts = append(r.baseOpts, WithForeignBuilder(b, rb))
+		}
+	}
+}
+
+// WithLifecycleGateCaps captures the live gate-directory bounds. Zero (the default) means no
+// cap. Forwarded to both runtime construction and RestoreSession as WithGateCaps.
+func WithLifecycleGateCaps(caps GateCaps) LifecycleOption {
+	return func(r *Lifecycle) {
+		r.baseOpts = append(r.baseOpts, WithGateCaps(caps))
+	}
+}
+
+// WithLifecycleAllowConfigMismatch captures the restore-only opt-in to resume a session whose
+// persisted config fingerprint no longer matches the live config. AMBIGUITY A2: classified
+// NewLifecycle-time (fixed for the Lifecycle's lifetime) so the narrow serve.Lifecycle interface
+// exposes no per-call knob. runtime construction ignores it; only RestoreSession honors it.
+func WithLifecycleAllowConfigMismatch() LifecycleOption {
+	return func(r *Lifecycle) {
+		r.allowConfigMismatch = true
+	}
+}
+
+// WithLifecycleCeilingFactory captures the factory the Lifecycle calls to mint a FRESH
+// *ceiling.State for each NewSession/RestoreSession. A nil factory is ignored (the session default-mints
+// its own internal state). See AMBIGUITY A1 on Lifecycle.ceilingFactory for why the ceiling
+// must be per-run and what the Lifecycle deliberately leaves to swe.
+func WithLifecycleCeilingFactory(factory CeilingFactory) LifecycleOption {
+	return func(r *Lifecycle) {
+		if factory != nil {
+			r.ceilingFactory = factory
+		}
+	}
+}
+
+// NewLifecycle binds cfg and store into an immutable, reusable Lifecycle, capturing the caller-
+// facing options once. A nil store is rejected with a typed *MissingStoreError (the durable
+// backend is required). It does no session I/O — the derived catalog it opens is cheap and
+// cannot fail — so the returned Lifecycle is ready to NewSession/RestoreSession.
+func NewLifecycle(cfg loop.Definition, store *sessionstore.Store, opts ...LifecycleOption) (*Lifecycle, error) {
+	if store == nil {
+		return nil, &MissingStoreError{}
+	}
+	r := &Lifecycle{cfg: cfg, store: store}
+	for _, opt := range opts {
+		opt(r)
+	}
+	// AMBIGUITY A3: build the derived catalog so each per-run event appender keeps the
+	// replay-free status fold live (journal.WithCatalog below). WithCatalogReplayer(store)
+	// is passed explicitly; OpenCatalog already defaults the replayer to the owning store,
+	// so this is belt-and-suspenders — it names the store as the repair opener rather than
+	// relying on the default. OpenCatalog does no I/O and cannot fail.
+	r.catalog = store.OpenCatalog(sessionstore.WithCatalogReplayer(store))
+	return r, nil
+}
+
+// NewSession mints a fresh session id and brings up a brand-new live session over per-run durable
+// deps built from the Lifecycle's store: a single-writer lease, the session journal, and the
+// three checked appenders (event — carrying the catalog — command, and gate). It returns
+// the minted id, the live session, and a typed *NewSessionError on any failure. On ANY failure
+// after the lease is acquired the lease is released best-effort, so a failed NewSession never
+// strands single-writer ownership.
+func (r *Lifecycle) NewSession(ctx context.Context) (*Session, error) {
+	select {
+	case <-ctx.Done():
+		return nil, &NewSessionError{Kind: NewSessionContextDone, Cause: ctx.Err()}
+	default:
+	}
+
+	sid, err := uuid.New()
+	if err != nil {
+		return nil, &NewSessionError{Kind: NewSessionIDGenerationFailed, Cause: err}
+	}
+
+	// Per-run durable wiring, mirroring the by-hand persistence pattern: acquire the lease,
+	// open the journal fenced on it, then build the three checked appenders over that
+	// journal. The event appender carries the NewLifecycle-built catalog so the status fold stays
+	// live. On any failure past the lease, release it best-effort (releaseLease, shared with
+	// RestoreSession) so a successor can re-acquire without waiting out the TTL.
+	lease, err := r.store.AcquireLease(ctx, sid)
+	if err != nil {
+		return nil, &NewSessionError{Kind: NewSessionLeaseFailed, Cause: err}
+	}
+	j, err := r.store.OpenJournal(ctx, sid, lease)
+	if err != nil {
+		releaseLease(lease)
+		return nil, &NewSessionError{Kind: NewSessionJournalFailed, Cause: err}
+	}
+	evAp, err := journal.NewJournalEventAppenderChecked(j, journal.WithCatalog(r.catalog))
+	if err != nil {
+		releaseLease(lease)
+		return nil, &NewSessionError{Kind: NewSessionAppenderFailed, Cause: err}
+	}
+	cmdAp, err := journal.NewJournalCommandAppenderChecked(j)
+	if err != nil {
+		releaseLease(lease)
+		return nil, &NewSessionError{Kind: NewSessionAppenderFailed, Cause: err}
+	}
+	gateAp, err := journal.NewJournalGateAppenderChecked(j)
+	if err != nil {
+		releaseLease(lease)
+		return nil, &NewSessionError{Kind: NewSessionAppenderFailed, Cause: err}
+	}
+
+	// The captured base options, then the per-run deps. WithSessionID(sid) makes runtime construction adopt
+	// the id the journal was already bound to (the journal chicken-and-egg). WithLeaseRelease
+	// hands the session the lease's release hook for its clean-Shutdown teardown.
+	opts := make([]Option, 0, len(r.baseOpts)+6)
+	opts = append(opts, r.baseOpts...)
+	opts = append(opts,
+		WithSessionID(sid),
+		WithEventAppender(evAp),
+		WithCommandAppender(cmdAp),
+		WithGateAppender(gateAp),
+		WithLeaseRelease(lease.Release),
+	)
+	// AMBIGUITY A1: mint a fresh per-run ceiling state so concurrent sessions never share one
+	// mutable clamp. Nil factory falls back to the session's own internal default-mint.
+	if r.ceilingFactory != nil {
+		opts = append(opts, WithCeiling(r.ceilingFactory()))
+	}
+
+	s, err := New(ctx, r.cfg, opts...)
+	if err != nil {
+		// runtime construction failed, so the session never took ownership of the lease-release hook — release
+		// it here best-effort so ownership is not stranded.
+		releaseLease(lease)
+		return nil, &NewSessionError{Kind: NewSessionRuntimeFailed, Cause: err}
+	}
+	return s, nil
+}
+
+// RestoreSession rebuilds a live session from its durable journal under the id it was created
+// with, delegating to runtime restoration with the Lifecycle's captured cfg, store, and base
+// options. runtime restoration holds the store, so it builds its OWN lease/journal/appenders
+// (and installs the lease-release hook) internally — the Lifecycle supplies only the captured
+// caller options, NOT the per-run appenders NewSession builds. It refuses a config-fingerprint
+// mismatch (typed *ConfigMismatchError) unless WithLifecycleAllowConfigMismatch was compiled
+// in, and surfaces runtime restoration's typed errors unchanged (a *RestoreDiscoveryError for a
+// session with no history, a *RestoreError for a lease/journal/replay failure), never a
+// panic.
+func (r *Lifecycle) RestoreSession(ctx context.Context, id uuid.UUID) (*Session, error) {
+	opts := make([]Option, 0, len(r.baseOpts)+2)
+	opts = append(opts, r.baseOpts...)
+	if r.allowConfigMismatch {
+		opts = append(opts, WithAllowConfigMismatch())
+	}
+	// AMBIGUITY A1: mint a fresh per-run ceiling on restore too (WithCeiling applies to
+	// RestoreSession, which re-seeds the injected state from the folded SecurityCeilingChanged
+	// events), so a restored session gets its own clamp just like a fresh NewSession.
+	if r.ceilingFactory != nil {
+		opts = append(opts, WithCeiling(r.ceilingFactory()))
+	}
+	return Restore(ctx, r.cfg, id, r.store, opts...)
+}

@@ -21,6 +21,7 @@ import (
 // calls and returns configured results / errors. The subscribe/gate methods
 // satisfy the interface but are unused by the lifecycle/control routes.
 type fakeSession struct {
+	id           uuid.UUID
 	submitID     uuid.UUID
 	submitErr    error
 	submitCalls  int
@@ -38,6 +39,8 @@ type fakeSession struct {
 	sub      *fakeSubscription
 	subCalls int
 }
+
+func (f *fakeSession) SessionID() uuid.UUID { return f.id }
 
 func (f *fakeSession) Submit(_ context.Context, blocks []content.Block) (uuid.UUID, error) {
 	f.submitCalls++
@@ -64,10 +67,10 @@ func (f *fakeSession) Interrupt(context.Context) (bool, error) {
 	return f.interruptResult, f.interruptErr
 }
 
-// fakeRunner is a test double for Runner[*fakeSession]: Run/Restore return the
+// fakeRig is a test double for Rig[*fakeSession]: Run/Restore return the
 // configured id/session/error and count their calls, and Restore records the id it
 // was asked to rebuild.
-type fakeRunner struct {
+type fakeRig struct {
 	runID    uuid.UUID
 	runSess  *fakeSession
 	runErr   error
@@ -79,12 +82,15 @@ type fakeRunner struct {
 	restoreGotID uuid.UUID
 }
 
-func (f *fakeRunner) Run(context.Context) (uuid.UUID, *fakeSession, error) {
+func (f *fakeRig) NewSession(context.Context) (*fakeSession, error) {
 	f.runCalls++
-	return f.runID, f.runSess, f.runErr
+	if f.runSess != nil {
+		f.runSess.id = f.runID
+	}
+	return f.runSess, f.runErr
 }
 
-func (f *fakeRunner) Restore(_ context.Context, id uuid.UUID) (*fakeSession, error) {
+func (f *fakeRig) RestoreSession(_ context.Context, id uuid.UUID) (*fakeSession, error) {
 	f.restoreCalls++
 	f.restoreGotID = id
 	return f.restoreSess, f.restoreErr
@@ -103,7 +109,7 @@ func parseTestUUID(t *testing.T, s string) uuid.UUID {
 // validBlocksBody is a well-formed create body carrying a single text block.
 const validBlocksBody = `{"blocks":[{"type":"text","Text":"hello"}]}`
 
-// errBoom is a stand-in runner/session failure cause.
+// errBoom is a stand-in rig/session failure cause.
 var errBoom = errors.New("boom")
 
 func TestServerHandleCreate(t *testing.T) {
@@ -164,7 +170,7 @@ func TestServerHandleCreate(t *testing.T) {
 			wantSubmitCalls: 1,
 		},
 		{
-			name:            "runner run error is 500 nothing attached",
+			name:            "rig run error is 500 nothing attached",
 			hasBody:         false,
 			runErr:          errBoom,
 			wantStatus:      http.StatusInternalServerError,
@@ -209,8 +215,8 @@ func TestServerHandleCreate(t *testing.T) {
 			runID := parseTestUUID(t, runIDStr)
 			cmdID := parseTestUUID(t, cmdIDStr)
 			sess := &fakeSession{submitID: cmdID, submitErr: tt.submitErr}
-			runner := &fakeRunner{runID: runID, runSess: sess, runErr: tt.runErr}
-			srv := newServer[*fakeSession](runner, nil, newConfig())
+			rig := &fakeRig{runID: runID, runSess: sess, runErr: tt.runErr}
+			srv := newServer[*fakeSession](rig, nil, newConfig())
 
 			var req *http.Request
 			if tt.hasBody {
@@ -225,8 +231,8 @@ func TestServerHandleCreate(t *testing.T) {
 			if rec.Code != tt.wantStatus {
 				t.Fatalf("status = %d, want %d (body %s)", rec.Code, tt.wantStatus, rec.Body.String())
 			}
-			if runner.runCalls != tt.wantRunCalls {
-				t.Errorf("runCalls = %d, want %d", runner.runCalls, tt.wantRunCalls)
+			if rig.runCalls != tt.wantRunCalls {
+				t.Errorf("runCalls = %d, want %d", rig.runCalls, tt.wantRunCalls)
 			}
 			if sess.submitCalls != tt.wantSubmitCalls {
 				t.Errorf("submitCalls = %d, want %d", sess.submitCalls, tt.wantSubmitCalls)
@@ -317,8 +323,8 @@ func TestServerHandleRestore(t *testing.T) {
 			t.Parallel()
 
 			sess := &fakeSession{}
-			runner := &fakeRunner{restoreSess: sess, restoreErr: tt.restoreErr}
-			srv := newServer[*fakeSession](runner, nil, newConfig())
+			rig := &fakeRig{restoreSess: sess, restoreErr: tt.restoreErr}
+			srv := newServer[*fakeSession](rig, nil, newConfig())
 
 			req := httptest.NewRequest(http.MethodPost, "/v1/sessions/"+tt.sid+"/restore", http.NoBody)
 			req.SetPathValue("sid", tt.sid)
@@ -329,11 +335,11 @@ func TestServerHandleRestore(t *testing.T) {
 			if rec.Code != tt.wantStatus {
 				t.Fatalf("status = %d, want %d (body %s)", rec.Code, tt.wantStatus, rec.Body.String())
 			}
-			if runner.restoreCalls != tt.wantRestoreCalls {
-				t.Errorf("restoreCalls = %d, want %d", runner.restoreCalls, tt.wantRestoreCalls)
+			if rig.restoreCalls != tt.wantRestoreCalls {
+				t.Errorf("restoreCalls = %d, want %d", rig.restoreCalls, tt.wantRestoreCalls)
 			}
-			if tt.wantRestoreCalls > 0 && runner.restoreGotID != parseTestUUID(t, sidStr) {
-				t.Errorf("restore got id = %v, want %v", runner.restoreGotID, sidStr)
+			if tt.wantRestoreCalls > 0 && rig.restoreGotID != parseTestUUID(t, sidStr) {
+				t.Errorf("restore got id = %v, want %v", rig.restoreGotID, sidStr)
 			}
 
 			sid := parseTestUUID(t, sidStr)
@@ -359,7 +365,7 @@ func TestServerHandleRestore(t *testing.T) {
 	}
 }
 
-// idemRunID / idemCmdID are the fixed ids the fake runner/session mint in the
+// idemRunID / idemCmdID are the fixed ids the fake rig/session mint in the
 // idempotency handler tests.
 const (
 	idemRunID = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
@@ -400,29 +406,29 @@ func decodeCreate201(t *testing.T, rec *httptest.ResponseRecorder) createRespons
 
 // newIdemTestServer builds a server whose idempotency clock is controllable via the
 // returned pointer (advance it to cross the TTL), with a 1h TTL.
-func newIdemTestServer(t *testing.T) (*server[*fakeSession], *fakeRunner, *time.Time) {
+func newIdemTestServer(t *testing.T) (*server[*fakeSession], *fakeRig, *time.Time) {
 	t.Helper()
 	sess := &fakeSession{submitID: parseTestUUID(t, idemCmdID)}
-	runner := &fakeRunner{runID: parseTestUUID(t, idemRunID), runSess: sess}
-	srv := newServer[*fakeSession](runner, nil, newConfig())
+	rig := &fakeRig{runID: parseTestUUID(t, idemRunID), runSess: sess}
+	srv := newServer[*fakeSession](rig, nil, newConfig())
 	clock := time.Date(2026, 7, 8, 12, 0, 0, 0, time.UTC)
 	srv.idem.ttl = time.Hour
 	srv.idem.now = func() time.Time { return clock }
-	return srv, runner, &clock
+	return srv, rig, &clock
 }
 
 // TestServerHandleCreateNoKeyDoesNotTouchStore proves an absent key is a normal
 // create that never records an idempotency entry.
 func TestServerHandleCreateNoKeyDoesNotTouchStore(t *testing.T) {
 	t.Parallel()
-	srv, runner, _ := newIdemTestServer(t)
+	srv, rig, _ := newIdemTestServer(t)
 
 	rec := doCreate(t, srv, "", "")
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("status = %d, want 201", rec.Code)
 	}
-	if runner.runCalls != 1 {
-		t.Errorf("runCalls = %d, want 1", runner.runCalls)
+	if rig.runCalls != 1 {
+		t.Errorf("runCalls = %d, want 1", rig.runCalls)
 	}
 	srv.idem.mu.Lock()
 	n := len(srv.idem.entries)
@@ -488,7 +494,7 @@ func TestServerHandleCreateIdempotentSequences(t *testing.T) {
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			srv, runner, clock := newIdemTestServer(t)
+			srv, rig, clock := newIdemTestServer(t)
 
 			first := doCreate(t, srv, key, tt.firstBody)
 			firstResp := decodeCreate201(t, first)
@@ -501,8 +507,8 @@ func TestServerHandleCreateIdempotentSequences(t *testing.T) {
 			if second.Code != tt.wantSecondStatus {
 				t.Fatalf("second status = %d, want %d (body %s)", second.Code, tt.wantSecondStatus, second.Body.String())
 			}
-			if runner.runCalls != tt.wantRunCalls {
-				t.Errorf("runCalls = %d, want %d", runner.runCalls, tt.wantRunCalls)
+			if rig.runCalls != tt.wantRunCalls {
+				t.Errorf("runCalls = %d, want %d", rig.runCalls, tt.wantRunCalls)
 			}
 
 			switch tt.wantSecondStatus {
@@ -531,13 +537,13 @@ func TestServerHandleCreateIdempotentSequences(t *testing.T) {
 // replay returns the SAME command_id (not just session_id).
 func TestServerHandleCreateIdempotentReplayCarriesCommandID(t *testing.T) {
 	t.Parallel()
-	srv, runner, _ := newIdemTestServer(t)
+	srv, rig, _ := newIdemTestServer(t)
 
 	first := decodeCreate201(t, doCreate(t, srv, "k", validBlocksBody))
 	second := decodeCreate201(t, doCreate(t, srv, "k", validBlocksBody))
 
-	if runner.runCalls != 1 {
-		t.Fatalf("runCalls = %d, want 1", runner.runCalls)
+	if rig.runCalls != 1 {
+		t.Fatalf("runCalls = %d, want 1", rig.runCalls)
 	}
 	if first.CommandID == nil {
 		t.Fatal("first command_id absent, want present")
@@ -546,13 +552,13 @@ func TestServerHandleCreateIdempotentReplayCarriesCommandID(t *testing.T) {
 		t.Errorf("replay command_id = %v, want %v", second.CommandID, *first.CommandID)
 	}
 	// Submit ran exactly once (the replay did not re-submit).
-	if srv.runner.(*fakeRunner).runSess.submitCalls != 1 {
-		t.Errorf("submitCalls = %d, want 1", srv.runner.(*fakeRunner).runSess.submitCalls)
+	if srv.rig.(*fakeRig).runSess.submitCalls != 1 {
+		t.Errorf("submitCalls = %d, want 1", srv.rig.(*fakeRig).runSess.submitCalls)
 	}
 }
 
 // TestServerHandleCreateOversizedKey proves a key over the bound is 400 before the
-// runner or store is touched.
+// rig or store is touched.
 func TestServerHandleCreateOversizedKey(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
@@ -568,15 +574,15 @@ func TestServerHandleCreateOversizedKey(t *testing.T) {
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			srv, runner, _ := newIdemTestServer(t)
+			srv, rig, _ := newIdemTestServer(t)
 			key := strings.Repeat("a", tt.keyLen)
 
 			rec := doCreate(t, srv, key, "")
 			if rec.Code != tt.wantStatus {
 				t.Fatalf("status = %d, want %d", rec.Code, tt.wantStatus)
 			}
-			if runner.runCalls != tt.wantRun {
-				t.Errorf("runCalls = %d, want %d", runner.runCalls, tt.wantRun)
+			if rig.runCalls != tt.wantRun {
+				t.Errorf("runCalls = %d, want %d", rig.runCalls, tt.wantRun)
 			}
 			if tt.wantStatus == http.StatusBadRequest {
 				assertErrorEnvelope(t, rec)
@@ -591,28 +597,28 @@ func TestServerHandleCreateOversizedKey(t *testing.T) {
 	}
 }
 
-// concurrentRunner is a race-safe Runner for the concurrency smoke test (the shared
-// fakeRunner increments an unguarded counter, which -race would flag under concurrent
+// concurrentRig is a race-safe Rig for the concurrency smoke test (the shared
+// fakeRig increments an unguarded counter, which -race would flag under concurrent
 // Run).
-type concurrentRunner struct {
+type concurrentRig struct {
 	mu    sync.Mutex
 	id    uuid.UUID
 	sess  *fakeSession
 	calls int
 }
 
-func (r *concurrentRunner) Run(context.Context) (uuid.UUID, *fakeSession, error) {
+func (r *concurrentRig) NewSession(context.Context) (*fakeSession, error) {
 	r.mu.Lock()
 	r.calls++
 	r.mu.Unlock()
-	return r.id, r.sess, nil
-}
-
-func (r *concurrentRunner) Restore(context.Context, uuid.UUID) (*fakeSession, error) {
 	return r.sess, nil
 }
 
-func (r *concurrentRunner) runCount() int {
+func (r *concurrentRig) RestoreSession(context.Context, uuid.UUID) (*fakeSession, error) {
+	return r.sess, nil
+}
+
+func (r *concurrentRig) runCount() int {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.calls
@@ -625,8 +631,9 @@ func (r *concurrentRunner) runCount() int {
 func TestServerHandleCreateIdempotentConcurrent(t *testing.T) {
 	t.Parallel()
 
-	runner := &concurrentRunner{id: parseTestUUID(t, idemRunID), sess: &fakeSession{}}
-	srv := newServer[*fakeSession](runner, nil, newConfig())
+	id := parseTestUUID(t, idemRunID)
+	rig := &concurrentRig{id: id, sess: &fakeSession{id: id}}
+	srv := newServer[*fakeSession](rig, nil, newConfig())
 
 	const n = 16
 	var wg sync.WaitGroup
@@ -642,7 +649,7 @@ func TestServerHandleCreateIdempotentConcurrent(t *testing.T) {
 	}
 	wg.Wait()
 
-	before := runner.runCount()
+	before := rig.runCount()
 	if before < 1 || before > n {
 		t.Fatalf("concurrent runCalls = %d, want in [1,%d]", before, n)
 	}
@@ -653,7 +660,7 @@ func TestServerHandleCreateIdempotentConcurrent(t *testing.T) {
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("sequential replay status = %d, want 201", rec.Code)
 	}
-	if after := runner.runCount(); after != before {
+	if after := rig.runCount(); after != before {
 		t.Errorf("sequential replay re-ran: runCalls %d -> %d", before, after)
 	}
 }

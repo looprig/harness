@@ -78,7 +78,7 @@ type restoreResponse struct {
 // request carried input, submit it.
 //
 // Ordering is deliberate: the optional body is decoded and validated BEFORE the
-// runner is asked to mint a session, so a malformed body fails with 400 without
+// rig is asked to mint a session, so a malformed body fails with 400 without
 // ever orphaning a freshly-minted-but-unreachable session. Only once the input is
 // known-good does it Run, attach the session to the registry (so subsequent live
 // routes resolve its id), then Submit. A freshly minted id cannot collide with a
@@ -86,7 +86,7 @@ type restoreResponse struct {
 //
 // If the request carries an Idempotency-Key header (SPEC §6, Decision #18), the
 // create is made per-pod idempotent: a repeat of the same key with a byte-identical
-// body replays the original 201 response WITHOUT re-running (the runner is called
+// body replays the original 201 response WITHOUT re-running (the rig is called
 // exactly once across the retries); a repeat with a DIFFERENT body is a 409. The
 // store is per-pod, not distributed, and TTL-bounded (default 24h). An absent/empty
 // key is a normal create that never touches the store.
@@ -145,11 +145,12 @@ func (s *server[S]) handleCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	id, sess, err := s.runner.Run(r.Context())
+	sess, err := s.rig.NewSession(r.Context())
 	if err != nil {
 		writeErrorCause(w, http.StatusInternalServerError, codeInternal, msgCreateFailed, false, err)
 		return
 	}
+	id := sess.SessionID()
 	s.registry.put(id, sess)
 
 	resp := createResponse{SessionID: id}
@@ -227,10 +228,10 @@ func decodeBlocksFromBody(body []byte) ([]content.Block, error) {
 // routes resolve its id again.
 //
 // The {sid} path segment is parsed and validated at the boundary (malformed => 400)
-// before the runner is touched. Restore errors are mapped generically to 500 —
+// before the rig is touched. Restore errors are mapped generically to 500 —
 // serve cannot import the session package's error types, so it has no way to tell a
 // "no journal / not found" rebuild failure from a transient backend failure. The
-// one signal it honors is a serve-level SessionNotFoundError, which a Runner may
+// one signal it honors is a serve-level SessionNotFoundError, which a Rig may
 // choose to surface for a genuine 404; absent that, every Restore failure is a 500.
 func (s *server[S]) handleRestore(w http.ResponseWriter, r *http.Request) {
 	sid, err := parseSessionID(r.PathValue("sid"))
@@ -239,7 +240,7 @@ func (s *server[S]) handleRestore(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	sess, err := s.runner.Restore(r.Context(), sid)
+	sess, err := s.rig.RestoreSession(r.Context(), sid)
 	if err != nil {
 		var notFound SessionNotFoundError
 		if errors.As(err, &notFound) {

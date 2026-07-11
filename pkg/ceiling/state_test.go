@@ -26,20 +26,20 @@ func TestStateSet(t *testing.T) {
 	tests := []struct {
 		name    string
 		clamped bool
-		max     uint8
-		seq     []uint8
-		want    uint8
+		max     Level
+		seq     []Level
+		want    Level
 	}{
-		{name: "single set", seq: []uint8{2}, want: 2},
-		{name: "set to zero", seq: []uint8{0}, want: 0},
-		{name: "last write wins lower", seq: []uint8{1, 2, 0}, want: 0},
-		{name: "last write wins raise", seq: []uint8{0, 3, 1}, want: 1},
-		{name: "no clamp stores as-is", seq: []uint8{200}, want: 200},
-		{name: "clamp above max", clamped: true, max: 2, seq: []uint8{5}, want: 2},
-		{name: "clamp keeps below max", clamped: true, max: 2, seq: []uint8{1}, want: 1},
-		{name: "clamp exact max", clamped: true, max: 2, seq: []uint8{2}, want: 2},
-		{name: "clamp then last wins", clamped: true, max: 3, seq: []uint8{5, 1, 9}, want: 3},
-		{name: "clamp max zero pins restrictive", clamped: true, max: 0, seq: []uint8{9}, want: 0},
+		{name: "single set", seq: []Level{2}, want: 2},
+		{name: "set to zero", seq: []Level{0}, want: 0},
+		{name: "last write wins lower", seq: []Level{1, 2, 0}, want: 0},
+		{name: "last write wins raise", seq: []Level{0, 3, 1}, want: 1},
+		{name: "no clamp stores as-is", seq: []Level{200}, want: 200},
+		{name: "clamp above max", clamped: true, max: 2, seq: []Level{5}, want: 2},
+		{name: "clamp keeps below max", clamped: true, max: 2, seq: []Level{1}, want: 1},
+		{name: "clamp exact max", clamped: true, max: 2, seq: []Level{2}, want: 2},
+		{name: "clamp then last wins", clamped: true, max: 3, seq: []Level{5, 1, 9}, want: 3},
+		{name: "clamp max zero pins restrictive", clamped: true, max: 0, seq: []Level{9}, want: 0},
 	}
 	for _, tt := range tests {
 		tt := tt
@@ -51,11 +51,11 @@ func TestStateSet(t *testing.T) {
 			} else {
 				s = New()
 			}
-			var lastReturned uint8
+			var lastReturned Level
 			for _, lv := range tt.seq {
 				lastReturned = s.Set(lv)
 			}
-			if got := s.Current(); got != tt.want {
+			if got := Level(s.Current()); got != tt.want {
 				t.Errorf("Current() = %d, want %d", got, tt.want)
 			}
 			if lastReturned != tt.want {
@@ -76,7 +76,7 @@ func TestStateClamp(t *testing.T) {
 	}
 	// Capped: reduce above the cap, keep at/below.
 	capped := NewClamped(2)
-	for _, tc := range []struct{ in, want uint8 }{{5, 2}, {2, 2}, {1, 1}, {0, 0}} {
+	for _, tc := range []struct{ in, want Level }{{5, 2}, {2, 2}, {1, 1}, {0, 0}} {
 		if got := capped.Clamp(tc.in); got != tc.want {
 			t.Errorf("NewClamped(2).Clamp(%d) = %d, want %d", tc.in, got, tc.want)
 		}
@@ -95,13 +95,13 @@ func TestStateConcurrent(t *testing.T) {
 	var wg sync.WaitGroup
 	for i := 0; i < 8; i++ {
 		wg.Add(1)
-		go func(v uint8) {
+		go func(v Level) {
 			defer wg.Done()
 			for j := 0; j < 1000; j++ {
 				s.Set(v)
 				_ = s.Current()
 			}
-		}(uint8(i))
+		}(Level(i))
 	}
 	wg.Wait()
 	if got := s.Current(); got > 7 {

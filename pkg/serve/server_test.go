@@ -18,16 +18,16 @@ func (plainHandler) ServeHTTP(http.ResponseWriter, *http.Request) {}
 // authAware and reports auth installed.
 func authedHandler(t *testing.T) http.Handler {
 	t.Helper()
-	runner := &fakeRunner{}
-	return Handler[*fakeSession](runner, &fakeReader{}, WithAuth(func(*http.Request) error { return nil }))
+	rig := &fakeRig{}
+	return Handler[*fakeSession](rig, &fakeReader{}, WithAuth(func(*http.Request) error { return nil }))
 }
 
 // noAuthBoundHandler is built by Handler with NO authenticator: it satisfies
 // authAware but reports no auth installed (the has-auth bit is false).
 func noAuthBoundHandler(t *testing.T) http.Handler {
 	t.Helper()
-	runner := &fakeRunner{}
-	return Handler[*fakeSession](runner, &fakeReader{})
+	rig := &fakeRig{}
+	return Handler[*fakeSession](rig, &fakeReader{})
 }
 
 func TestServer(t *testing.T) {

@@ -83,7 +83,7 @@ func newIdempotencyStore(ttl time.Duration) *idempotencyStore {
 }
 
 // lookup reports what the caller should do for (key, bodyHash) as of now. It never
-// calls the runner or registry — it only consults the guarded map — so it is safe to
+// calls the rig or registry — it only consults the guarded map — so it is safe to
 // hold the lock for its whole (short) duration. An entry whose expiresAt is at or
 // before now is expired: it is lazily evicted and reported as a miss.
 func (s *idempotencyStore) lookup(key string, bodyHash [32]byte, now time.Time) (createResponse, idempotencyStatus) {

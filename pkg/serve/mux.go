@@ -58,19 +58,19 @@ type boundHandler struct {
 func (b *boundHandler) authInstalled() bool { return b.hasAuth }
 
 // Handler builds the complete session HTTP surface: it assembles the config from
-// opts, mints a server over runner and reads, registers every route (SPEC §6) on
+// opts, mints a server over rig and reads, registers every route (SPEC §6) on
 // a single ServeMux using Go 1.22 method+path patterns, and wraps the mux with
 // the request-path middleware (authentication then body-cap). It returns a
 // concrete *boundHandler that carries the has-auth bit so a downstream Server
 // bind can fail secure without re-parsing the options.
 //
-// runner and reads are wired at the composition root: runner drives the live
+// rig and reads are wired at the composition root: rig drives the live
 // plane (create/restore/input/interrupt/gate/events) and reads backs the stateless
 // read plane (list/status/journal). All routes are disjoint, so registration order
 // is irrelevant and no pattern conflicts.
-func Handler[S LiveSession](runner Runner[S], reads Reader, opts ...Option) http.Handler {
+func Handler[S LiveSession](rig Rig[S], reads Reader, opts ...Option) http.Handler {
 	cfg := newConfig(opts...)
-	srv := newServer(runner, reads, cfg)
+	srv := newServer(rig, reads, cfg)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc(routeCapabilities, srv.handleCapabilities)
