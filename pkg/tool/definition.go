@@ -66,9 +66,11 @@ const (
 	DelegateStatusCompleted
 	DelegateStatusInterrupted
 	DelegateStatusFailed
-	DelegateStatusDone
 	DelegateStatusTimedOut
 	DelegateStatusQueued
+	// DelegateStatusDone is a compatibility alias for the canonical completed
+	// state. It deliberately has no distinct wire or persisted value.
+	DelegateStatusDone = DelegateStatusCompleted
 )
 
 // DelegateRequest is the typed command passed to a parent-scoped delegate
@@ -121,8 +123,10 @@ type Definition interface {
 	definition()
 }
 
-// Factory builds concrete tools for one runtime binding. It is invoked once per
-// Build call and must not return nil tools.
+// Factory builds concrete tools for one runtime binding. It may be invoked
+// concurrently by separate Build calls and must synchronize any shared captured
+// state. Per-build mutable state belongs inside each invocation. A Factory must
+// not return nil tools.
 type Factory func(context.Context, Bindings) ([]InvokableTool, error)
 
 type factoryDefinition struct {

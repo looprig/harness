@@ -52,6 +52,14 @@ func TestDefinitionInterfaceIsSealed(t *testing.T) {
 	t.Fatal("Definition interface has no unexported sealing method; external packages can implement it")
 }
 
+func TestDelegateStatusDoneAliasesCompleted(t *testing.T) {
+	t.Parallel()
+
+	if tool.DelegateStatusDone != tool.DelegateStatusCompleted {
+		t.Fatalf("DelegateStatusDone = %d, want alias value %d", tool.DelegateStatusDone, tool.DelegateStatusCompleted)
+	}
+}
+
 type definitionTool struct{ marker byte }
 
 func (*definitionTool) Info(context.Context) (*tool.ToolInfo, error) {

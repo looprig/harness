@@ -351,7 +351,6 @@ func TestDelegateSpawnerValidatesSynchronousResult(t *testing.T) {
 		wantError  string
 	}{
 		{name: "completed returns output", result: tool.DelegateResult{DelegateID: delegateID, Status: tool.DelegateStatusCompleted, Output: "complete"}, wantOutput: "complete"},
-		{name: "done returns output", result: tool.DelegateResult{DelegateID: delegateID, Status: tool.DelegateStatusDone, Output: "done"}, wantOutput: "done"},
 		{name: "zero delegate id rejected", result: tool.DelegateResult{Status: tool.DelegateStatusCompleted, Output: "must not return"}, wantError: "zero delegate id"},
 		{name: "failed becomes error", result: tool.DelegateResult{DelegateID: delegateID, Status: tool.DelegateStatusFailed, Output: "must not return"}, wantError: "failed"},
 		{name: "interrupted becomes error", result: tool.DelegateResult{DelegateID: delegateID, Status: tool.DelegateStatusInterrupted, Output: "must not return"}, wantError: "interrupted"},

@@ -3,6 +3,7 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -65,21 +66,38 @@ func TestNewBashRejectsInvalidOptionsAtRun(t *testing.T) {
 	var typedNilRunner *definitionRunner
 	tests := []struct {
 		name string
-		tool *BashTool
+		make func(string) *BashTool
 	}{
-		{name: "nil option", tool: NewBash(t.TempDir(), nil)},
-		{name: "typed nil runner", tool: NewBash(t.TempDir(), WithRunner(typedNilRunner))},
+		{name: "nil option", make: func(root string) *BashTool { return NewBash(root, nil) }},
+		{name: "typed nil runner", make: func(root string) *BashTool { return NewBash(root, WithRunner(typedNilRunner)) }},
 	}
 	for _, tt := range tests {
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			result, err := tt.tool.InvokableRun(context.Background(), `{"command":"echo must-not-run"}`)
+			marker := filepath.Join(t.TempDir(), "must-not-exist")
+			command := "touch '" + strings.ReplaceAll(marker, "'", "'\"'\"'") + "'"
+			args, err := json.Marshal(map[string]string{"command": command})
+			if err != nil {
+				t.Fatalf("json.Marshal() error = %v", err)
+			}
+			bash := tt.make(t.TempDir())
+
+			_, err = bash.BuildRequest(string(args), nil)
+			var buildErr *bashError
+			if !errors.As(err, &buildErr) {
+				t.Fatalf("BuildRequest() error = %T %v, want *bashError", err, err)
+			}
+
+			result, err := bash.InvokableRun(context.Background(), string(args))
 			if err != nil {
 				t.Fatalf("InvokableRun() Go error = %v, want model-safe tool result", err)
 			}
 			if got := textOf(t, result); !strings.HasPrefix(got, "error:") {
 				t.Fatalf("InvokableRun() result = %q, want model-safe error", got)
+			}
+			if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("marker stat error = %v, want os.ErrNotExist (command must not execute)", err)
 			}
 		})
 	}

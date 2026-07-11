@@ -69,7 +69,7 @@ func (s delegateSpawner) Spawn(
 		return "", &delegateResultError{Status: result.Status, reason: "zero delegate id"}
 	}
 	switch result.Status {
-	case tool.DelegateStatusCompleted, tool.DelegateStatusDone:
+	case tool.DelegateStatusCompleted:
 		return result.Output, nil
 	case tool.DelegateStatusFailed:
 		return "", &delegateResultError{Status: result.Status, reason: "delegate failed"}
