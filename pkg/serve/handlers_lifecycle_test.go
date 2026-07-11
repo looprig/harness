@@ -67,8 +67,8 @@ func (f *fakeSession) Interrupt(context.Context) (bool, error) {
 	return f.interruptResult, f.interruptErr
 }
 
-// fakeRig is a test double for Rig[*fakeSession]: Run/Restore return the
-// configured id/session/error and count their calls, and Restore records the id it
+// fakeRig is a test double for Rig[*fakeSession]: NewSession/RestoreSession return the
+// configured session/error and count their calls, and RestoreSession records the ID it
 // was asked to rebuild.
 type fakeRig struct {
 	runID    uuid.UUID
@@ -599,7 +599,7 @@ func TestServerHandleCreateOversizedKey(t *testing.T) {
 
 // concurrentRig is a race-safe Rig for the concurrency smoke test (the shared
 // fakeRig increments an unguarded counter, which -race would flag under concurrent
-// Run).
+// NewSession).
 type concurrentRig struct {
 	mu    sync.Mutex
 	id    uuid.UUID

@@ -9,7 +9,7 @@ import (
 	"testing"
 )
 
-// muxFixtures builds a Handler over fakes wired for routing tests: Run/Restore
+// muxFixtures builds a Handler over fakes wired for routing tests: NewSession/RestoreSession
 // succeed and the reader returns non-error DTOs, so a request that reaches the
 // intended handler produces a 2xx (proving routing) rather than the handler's
 // own error path.

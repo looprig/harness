@@ -91,7 +91,7 @@ func newRecordingStore(t *testing.T) (*sessionstore.Store, *recordingLeaser) {
 	return store, rl
 }
 
-// badClientCfg is a loop.Config with a valid model but a nil Client, so runtime construction fails
+// badClientCfg is a loop.Definition with a valid model but a nil Client, so NewSession fails
 // building the primary loop — the deterministic way to drive the NewSessionRuntimeFailed branch
 // (the lease has already been acquired, so this also exercises lease-release-on-failure).
 func badClientCfg() loop.Definition {
@@ -149,9 +149,9 @@ func TestLifecycleRun(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
 		name         string
-		badClient    bool                // NewLifecycle with a nil-Client cfg → runtime construction fails
+		badClient    bool                // NewLifecycle with a nil-Client definition → NewSession fails
 		withCeiling  bool                // wire a counting ceiling factory
-		cancelCtx    bool                // pass a pre-cancelled ctx to Run
+		cancelCtx    bool                // pass a pre-cancelled context to NewSession
 		failLease    bool                // the store's Leaser fails Acquire
 		wantKind     NewSessionErrorKind // zero value => success expected
 		wantBalanced bool                // assert the recording leaser released every lease it acquired
@@ -207,11 +207,11 @@ func TestLifecycleRun(t *testing.T) {
 
 			if tt.wantKind != "" {
 				if s != nil {
-					t.Errorf("Run returned a non-nil session on error")
+					t.Errorf("NewSession returned a non-nil session on error")
 				}
 				var re *NewSessionError
 				if !errors.As(err, &re) {
-					t.Fatalf("Run err = %v, want *NewSessionError", err)
+					t.Fatalf("NewSession error = %v, want *NewSessionError", err)
 				}
 				if re.Kind != tt.wantKind {
 					t.Errorf("NewSessionError.Kind = %q, want %q", re.Kind, tt.wantKind)
@@ -223,15 +223,15 @@ func TestLifecycleRun(t *testing.T) {
 			}
 
 			if err != nil {
-				t.Fatalf("Run: %v", err)
+				t.Fatalf("NewSession: %v", err)
 			}
 			sid := s.SessionID()
 			t.Cleanup(func() { _ = s.Shutdown(context.Background()) })
 			if sid.IsZero() {
-				t.Fatal("Run returned a zero session id")
+				t.Fatal("NewSession returned a zero session ID")
 			}
 			if s == nil {
-				t.Fatal("Run returned a nil session")
+				t.Fatal("NewSession returned a nil session")
 			}
 			if s.SessionID() != sid {
 				t.Errorf("session.SessionID = %v, want the returned id %v", s.SessionID(), sid)
@@ -243,7 +243,7 @@ func TestLifecycleRun(t *testing.T) {
 			_ = sub.Close()
 			if tt.withCeiling {
 				if got := atomic.LoadInt64(&mints); got != 1 {
-					t.Errorf("ceiling factory minted %d times, want 1 (once per Run)", got)
+					t.Errorf("ceiling factory minted %d times, want 1 (once per NewSession)", got)
 				}
 			}
 		})
@@ -262,7 +262,7 @@ func runAndShutdown(t *testing.T, store *sessionstore.Store, c loop.Definition) 
 	}
 	s, err := r.NewSession(context.Background())
 	if err != nil {
-		t.Fatalf("Run (original): %v", err)
+		t.Fatalf("NewSession (original): %v", err)
 	}
 	sid := s.SessionID()
 	if _, err := s.Submit(context.Background(), []content.Block{&content.TextBlock{Text: "hi"}}); err != nil {
@@ -330,23 +330,23 @@ func TestLifecycleRestore(t *testing.T) {
 			switch tt.wantErr {
 			case "discovery":
 				if restored != nil {
-					t.Fatalf("Restore returned a non-nil session for an unknown id")
+					t.Fatalf("RestoreSession returned a non-nil session for an unknown ID")
 				}
 				var de *RestoreDiscoveryError
 				if !errors.As(err, &de) {
-					t.Fatalf("Restore err = %v, want *RestoreDiscoveryError", err)
+					t.Fatalf("RestoreSession error = %v, want *RestoreDiscoveryError", err)
 				}
 			case "mismatch":
 				if restored != nil {
-					t.Fatalf("Restore returned a non-nil session on a config mismatch")
+					t.Fatalf("RestoreSession returned a non-nil session on a config mismatch")
 				}
 				var cme *ConfigMismatchError
 				if !errors.As(err, &cme) {
-					t.Fatalf("Restore err = %v, want *ConfigMismatchError", err)
+					t.Fatalf("RestoreSession error = %v, want *ConfigMismatchError", err)
 				}
 			default:
 				if err != nil {
-					t.Fatalf("Restore err = %v, want success", err)
+					t.Fatalf("RestoreSession error = %v, want success", err)
 				}
 				t.Cleanup(func() { _ = restored.Shutdown(context.Background()) })
 				if restored.SessionID() != sid {

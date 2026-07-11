@@ -10,8 +10,8 @@ import (
 // route needs (the session factory, the live-session registry, and the assembled
 // config) so the individual handlers can be methods on it. It is parameterized over
 // the concrete live-session type S (constrained to LiveSession) so the real type
-// threads through Run/Restore without serve importing it — the composition root
-// instantiates server[*session.Session] and serve holds only server[S].
+// threads through NewSession/RestoreSession without serve importing it — the composition
+// root instantiates server[session.SessionController] and serve holds only server[S].
 //
 // This holder carries no request state — one server instance serves every request
 // (the mux is built by Handler in mux.go; per-request state lives on the stack of each

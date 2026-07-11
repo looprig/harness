@@ -80,7 +80,7 @@ type restoreResponse struct {
 // Ordering is deliberate: the optional body is decoded and validated BEFORE the
 // rig is asked to mint a session, so a malformed body fails with 400 without
 // ever orphaning a freshly-minted-but-unreachable session. Only once the input is
-// known-good does it Run, attach the session to the registry (so subsequent live
+// known-good does it call NewSession, attach the session to the registry (so subsequent live
 // routes resolve its id), then Submit. A freshly minted id cannot collide with a
 // live entry, so put (not putIfAbsent) is correct here.
 //
@@ -96,16 +96,16 @@ type restoreResponse struct {
 //  2. if a key is present and OVER maxIdempotencyKeyLen → 400 before touching the
 //     store (bounded key — cannot pin memory);
 //  3. hash the raw body and lookup: a HIT replays the cached 201 (skipping decode +
-//     Run entirely — the original already validated and ran); a CONFLICT is a 409;
+//     NewSession entirely — the original already validated and created it); a CONFLICT is a 409;
 //  4. a MISS falls through to the normal create: decode blocks (400 on malformed),
-//     Run, attach, Submit, and — only on full success — record the outcome so a
+//     NewSession, attach, Submit, and — only on full success — record the outcome so a
 //     later repeat of the key replays it.
 //
-// CONCURRENCY: the store lock is NEVER held across Run/Submit. The guaranteed
+// CONCURRENCY: the store lock is NEVER held across NewSession/Submit. The guaranteed
 // property is the SEQUENTIAL one — a repeat AFTER the first create completes replays
 // the cached ids and does not re-run. Two TRULY-CONCURRENT requests with the same key
-// can each observe a miss before either stores, and so can both Run (minting two
-// sessions); the last store wins the cache. This per-pod double-run window is
+// can each observe a miss before either stores, and so can both call NewSession (minting
+// two sessions); the last store wins the cache. This per-pod duplicate-create window is
 // accepted here rather than closed with a request coalescer; a client that needs
 // strict single-flight serializes its own retries.
 func (s *server[S]) handleCreate(w http.ResponseWriter, r *http.Request) {
@@ -128,7 +128,7 @@ func (s *server[S]) handleCreate(w http.ResponseWriter, r *http.Request) {
 		switch status {
 		case idemHit:
 			// Replay the original outcome verbatim (same 201, same ids); the first
-			// create already ran, so we neither decode nor Run again.
+			// create already completed, so we neither decode nor call NewSession again.
 			writeJSON(w, http.StatusCreated, cached)
 			return
 		case idemConflict:
@@ -180,7 +180,7 @@ func (s *server[S]) handleCreate(w http.ResponseWriter, r *http.Request) {
 // blocks (nil for an idle create: absent body, empty body, or a body with no/empty
 // "blocks"). It validates at the boundary — a read failure (including a body over
 // the cap), malformed JSON envelope, or malformed tagged blocks all return an error
-// the caller maps to 400 — so no invalid input ever reaches Run. It is the one-shot
+// the caller maps to 400 — so no invalid input ever reaches session creation or submit. It is the one-shot
 // read-and-decode used by handleInput; handleCreate splits the two steps
 // (readCreateBody then decodeBlocksFromBody) so it can hash the raw bytes for
 // idempotency before decoding.
@@ -228,11 +228,11 @@ func decodeBlocksFromBody(body []byte) ([]content.Block, error) {
 // routes resolve its id again.
 //
 // The {sid} path segment is parsed and validated at the boundary (malformed => 400)
-// before the rig is touched. Restore errors are mapped generically to 500 —
+// before the rig is touched. RestoreSession errors are mapped generically to 500 —
 // serve cannot import the session package's error types, so it has no way to tell a
 // "no journal / not found" rebuild failure from a transient backend failure. The
 // one signal it honors is a serve-level SessionNotFoundError, which a Rig may
-// choose to surface for a genuine 404; absent that, every Restore failure is a 500.
+// choose to surface for a genuine 404; absent that, every RestoreSession failure is a 500.
 func (s *server[S]) handleRestore(w http.ResponseWriter, r *http.Request) {
 	sid, err := parseSessionID(r.PathValue("sid"))
 	if err != nil {

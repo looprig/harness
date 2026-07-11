@@ -10,8 +10,8 @@
 //
 // LiveSession is the per-session control surface an HTTP handler drives (submit
 // input, subscribe to the event stream, answer a gate, interrupt). Rig is the
-// session factory the handler calls to bring a new session up (Run) or resume a
-// prior one (Restore). Both are satisfied structurally by the real session types
+// session factory the handler calls to bring a new session up (NewSession) or resume a
+// prior one (RestoreSession). Both are satisfied structurally by the real session contracts
 // (proven in the package's dependency-guard test), so serve depends on the
 // behavior without depending on the implementation.
 package serve
@@ -27,8 +27,8 @@ import (
 
 // LiveSession is the narrow, HTTP-facing view of a running session: the exact
 // method set an HTTP handler needs to drive one session and nothing more
-// (Interface Segregation). The concrete *session.Session satisfies it
-// structurally; serve never names that type.
+// (Interface Segregation). session.SessionController satisfies it structurally at the
+// composition root; serve never imports or names that contract in production.
 //
 //   - Submit queues human-authored input to the session's primary loop and returns
 //     the minted input id (fire-and-forget; the outcome is observed on the event
@@ -48,11 +48,11 @@ type LiveSession interface {
 
 // Rig is the narrow session-factory view serve depends on. It is generic over the
 // concrete live-session type S (constrained to LiveSession) so a caller keeps the
-// real type through Run/Restore without serve importing it: the composition root
-// instantiates Rig[*session.Session], and serve holds only Rig[S].
+// real type through NewSession/RestoreSession without serve importing it: the composition
+// root instantiates Rig[session.SessionController], and serve holds only Rig[S].
 //
-//   - Run mints a fresh session id and brings up a brand-new live session.
-//   - Restore rebuilds a prior session from its durable history by id.
+//   - NewSession brings up a brand-new live session that exposes its minted ID.
+//   - RestoreSession rebuilds a prior session from its durable history by id.
 type Rig[S LiveSession] interface {
 	NewSession(ctx context.Context) (S, error)
 	RestoreSession(ctx context.Context, id uuid.UUID) (S, error)
