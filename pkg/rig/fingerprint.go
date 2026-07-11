@@ -46,6 +46,37 @@ func fingerprintWith(definition loop.BoundDefinition, fields ConfigFingerprintFi
 	return fingerprint
 }
 
+func fingerprintWithTopology(definition loop.BoundDefinition, fields ConfigFingerprintFields, definitions []loop.Definition, primers []string, active string) event.ConfigFingerprint {
+	fingerprint := fingerprintWith(definition, fields)
+	var material strings.Builder
+	orderedDefinitions := append([]loop.Definition(nil), definitions...)
+	sort.Slice(orderedDefinitions, func(i, j int) bool { return orderedDefinitions[i].Name() < orderedDefinitions[j].Name() })
+	for _, candidate := range orderedDefinitions {
+		material.WriteString("loop:")
+		material.WriteString(string(candidate.Name()))
+		material.WriteByte('\n')
+		material.WriteString("policy:")
+		material.WriteString(candidate.PolicyRevision())
+		material.WriteByte('\n')
+		delegates := candidate.Delegates()
+		sort.Slice(delegates, func(i, j int) bool { return delegates[i] < delegates[j] })
+		for _, delegate := range delegates {
+			material.WriteString("delegate:")
+			material.WriteString(string(delegate))
+			material.WriteByte('\n')
+		}
+	}
+	for _, primer := range primers {
+		material.WriteString("primer:")
+		material.WriteString(primer)
+		material.WriteByte('\n')
+	}
+	material.WriteString("active:")
+	material.WriteString(active)
+	fingerprint.TopologyRev = hexSHA256(material.String())
+	return fingerprint
+}
+
 func hexSHA256(value string) string {
 	sum := sha256.Sum256([]byte(value))
 	return hex.EncodeToString(sum[:])

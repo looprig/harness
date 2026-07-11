@@ -1,8 +1,11 @@
 package rig
 
 import (
+	"strings"
+
 	"github.com/looprig/harness/internal/sessionruntime"
 	"github.com/looprig/harness/pkg/event"
+	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/harness/pkg/sessionstore"
 )
@@ -37,29 +40,63 @@ func Define(options ...Option) (*Rig, error) {
 	if len(state.loops) == 0 {
 		return nil, &DefinitionError{Kind: DefinitionMissingLoop}
 	}
-	if len(state.loops) != 1 {
-		return nil, &DefinitionError{Kind: DefinitionInvalidLoop, Name: "Task 7 supports exactly one loop"}
-	}
-	name := string(state.loops[0].Name())
-	if name == "" {
-		return nil, &DefinitionError{Kind: DefinitionInvalidLoop}
+	byName := make(map[string]loop.Definition, len(state.loops))
+	referenced := make(map[string]bool, len(state.loops))
+	for _, definition := range state.loops {
+		name := string(definition.Name())
+		if strings.TrimSpace(name) == "" {
+			return nil, &DefinitionError{Kind: DefinitionInvalidLoop}
+		}
+		if _, exists := byName[name]; exists {
+			return nil, &DefinitionError{Kind: DefinitionDuplicateLoop, Name: name}
+		}
+		byName[name] = definition
 	}
 	if len(state.primers) == 0 {
 		return nil, &DefinitionError{Kind: DefinitionMissingPrimer}
 	}
-	if len(state.primers) != 1 || state.primers[0] != name {
-		return nil, &DefinitionError{Kind: DefinitionInvalidPrimer}
+	seenPrimers := make(map[string]bool, len(state.primers))
+	for _, primer := range state.primers {
+		if seenPrimers[primer] {
+			return nil, &DefinitionError{Kind: DefinitionInvalidPrimer, Name: primer}
+		}
+		seenPrimers[primer] = true
+		if _, exists := byName[primer]; !exists {
+			return nil, &DefinitionError{Kind: DefinitionInvalidPrimer, Name: primer}
+		}
+		referenced[primer] = true
 	}
-	if state.activePrimer != "" && state.activePrimer != name {
+	if len(state.primers) == 1 && state.activePrimer == "" {
+		state.activePrimer = state.primers[0]
+	}
+	if state.activePrimer == "" || !seenPrimers[state.activePrimer] {
 		return nil, &DefinitionError{Kind: DefinitionInvalidActivePrimer, Name: state.activePrimer}
+	}
+	for _, definition := range state.loops {
+		for _, delegate := range definition.Delegates() {
+			name := string(delegate)
+			if _, exists := byName[name]; !exists {
+				return nil, &DefinitionError{Kind: DefinitionInvalidLoop, Name: name}
+			}
+			referenced[name] = true
+		}
+	}
+	for name := range byName {
+		if !referenced[name] {
+			return nil, &DefinitionError{Kind: DefinitionInvalidLoop, Name: name}
+		}
 	}
 	fields := state.fingerprintFields
 	provider := sessionruntime.FingerprintProvider(func(definition loop.BoundDefinition) event.ConfigFingerprint {
-		return fingerprintWith(definition, fields)
+		return fingerprintWithTopology(definition, fields, state.loops, state.primers, state.activePrimer)
 	})
 	lifecycleOptions := append([]sessionruntime.LifecycleOption(nil), state.lifecycleOptions...)
 	lifecycleOptions = append(lifecycleOptions, sessionruntime.WithLifecycleFingerprintProvider(provider))
-	lifecycle, err := sessionruntime.NewLifecycle(state.loops[0], state.store, lifecycleOptions...)
+	primerNames := make([]identity.AgentName, len(state.primers))
+	for i, name := range state.primers {
+		primerNames[i] = identity.AgentName(name)
+	}
+	lifecycle, err := sessionruntime.NewTopologyLifecycle(sessionruntime.Topology{Definitions: append([]loop.Definition(nil), state.loops...), Primers: primerNames, ActivePrimer: identity.AgentName(state.activePrimer)}, state.store, lifecycleOptions...)
 	if err != nil {
 		return nil, &DefinitionError{Kind: DefinitionInvalidSessionStore, Cause: err}
 	}

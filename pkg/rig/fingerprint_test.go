@@ -171,6 +171,35 @@ func TestFingerprintFromDiffers(t *testing.T) {
 	}
 }
 
+func TestTopologyFingerprintIsDeterministicAndPrimerOrderSensitive(t *testing.T) {
+	t.Parallel()
+	planner := mustDefine(loop.WithName("planner"), loop.WithInference(&stubLLM{}, validModel("model")))
+	builder := mustDefine(loop.WithName("builder"), loop.WithInference(&stubLLM{}, validModel("model")))
+	bound := bindFingerprintDefinition(planner)
+	a := fingerprintWithTopology(bound, ConfigFingerprintFields{}, []loop.Definition{planner, builder}, []string{"planner", "builder"}, "planner")
+	b := fingerprintWithTopology(bound, ConfigFingerprintFields{}, []loop.Definition{planner, builder}, []string{"planner", "builder"}, "planner")
+	if !a.Equal(b) || a.TopologyRev == "" {
+		t.Fatalf("topology fingerprint is not deterministic: %+v %+v", a, b)
+	}
+	registrationReordered := fingerprintWithTopology(bound, ConfigFingerprintFields{}, []loop.Definition{builder, planner}, []string{"planner", "builder"}, "planner")
+	if !a.Equal(registrationReordered) {
+		t.Fatal("non-semantic loop registration order changed topology fingerprint")
+	}
+	reordered := fingerprintWithTopology(bound, ConfigFingerprintFields{}, []loop.Definition{planner, builder}, []string{"builder", "planner"}, "planner")
+	if a.Equal(reordered) {
+		t.Fatal("ordered primer change did not alter topology fingerprint")
+	}
+	activeChanged := fingerprintWithTopology(bound, ConfigFingerprintFields{}, []loop.Definition{planner, builder}, []string{"planner", "builder"}, "builder")
+	if a.Equal(activeChanged) {
+		t.Fatal("active primer change did not alter topology fingerprint")
+	}
+	changedBuilder := mustDefine(loop.WithName("builder"), loop.WithInference(&stubLLM{}, validModel("other-model")))
+	nonActivePolicyChanged := fingerprintWithTopology(bound, ConfigFingerprintFields{}, []loop.Definition{planner, changedBuilder}, []string{"planner", "builder"}, "planner")
+	if a.Equal(nonActivePolicyChanged) {
+		t.Fatal("non-active loop policy change did not alter topology fingerprint")
+	}
+}
+
 func TestFingerprintSystemRevisionIncludesInitialModeInstructions(t *testing.T) {
 	t.Parallel()
 	definition := func(instructions string) loop.Definition {

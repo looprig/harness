@@ -19,6 +19,9 @@ package event
 // that also leaves it empty — a session persisted before a field was added restores
 // without a spurious mismatch.
 type ConfigFingerprint struct {
+	// TopologyRev is the digest of ordered loop definitions, primer roots, active
+	// primer, and delegation edges owned by the rig.
+	TopologyRev string `json:"topology_rev,omitzero"`
 	// AgentKind names the agent role+swarm this session ran (e.g. "swe:orchestrator").
 	// It is empty for a caller that does not inject a kind (a non-swarm/legacy session).
 	AgentKind string `json:"agent_kind,omitzero"`
@@ -64,7 +67,8 @@ type ConfigFingerprint struct {
 // persisted config still matches the live one. New fields are additive (omitzero), so
 // an old record's empty new field equals a current record that also leaves it empty.
 func (f ConfigFingerprint) Equal(other ConfigFingerprint) bool {
-	return f.AgentKind == other.AgentKind &&
+	return f.TopologyRev == other.TopologyRev &&
+		f.AgentKind == other.AgentKind &&
 		f.ModelID == other.ModelID &&
 		f.SystemPromptRev == other.SystemPromptRev &&
 		f.ToolPolicyRev == other.ToolPolicyRev &&

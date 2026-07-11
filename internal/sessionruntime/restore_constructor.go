@@ -2,6 +2,8 @@ package sessionruntime
 
 import (
 	"context"
+	"errors"
+	"io"
 	"time"
 
 	"github.com/looprig/core/uuid"
@@ -56,6 +58,161 @@ func Restore(
 	opts ...Option,
 ) (*Session, error) {
 	return restoreSession(ctx, cfg, sessionID, store, uuid.New, time.Now, opts...)
+}
+
+// RestoreTopology reconstructs all durable primer roots and their independent
+// histories. The active primer is restored through the legacy single-root core;
+// remaining roots are attached before the controller is returned.
+func RestoreTopology(ctx context.Context, topology Topology, sessionID uuid.UUID, store *sessionstore.Store, opts ...Option) (*Session, error) {
+	active, ok := topology.definition(topology.ActivePrimer)
+	if !ok {
+		return nil, &RestoreError{Kind: RestoreLoopFailed, Cause: &MissingTopologyError{}}
+	}
+	events, err := replayTopologyEvents(ctx, store, sessionID)
+	if err != nil {
+		return nil, &RestoreError{Kind: RestoreReplayFailed, Cause: err}
+	}
+	hasStarted := false
+	for _, ev := range events {
+		if _, ok := ev.(event.SessionStarted); ok {
+			hasStarted = true
+			break
+		}
+	}
+	if !hasStarted {
+		return Restore(ctx, active, sessionID, store, opts...)
+	}
+	roots := make(map[identity.AgentName]event.LoopStarted)
+	allStarts := make([]event.LoopStarted, 0)
+	for _, ev := range events {
+		if started, isStarted := ev.(event.LoopStarted); isStarted {
+			allStarts = append(allStarts, started)
+			if started.Cause.Coordinates == (identity.Coordinates{}) {
+				if _, exists := roots[started.AgentName]; !exists {
+					roots[started.AgentName] = started
+				}
+			}
+		}
+	}
+	for _, primer := range topology.Primers {
+		if _, exists := roots[primer]; !exists {
+			return nil, &RestoreError{Kind: RestoreLoopFailed, Cause: &AgentNameMismatchError{Persisted: "", Configured: primer}}
+		}
+	}
+	for _, started := range allStarts {
+		if _, exists := topology.definition(started.AgentName); !exists {
+			return nil, &RestoreError{Kind: RestoreLoopFailed, Cause: &AgentNameMismatchError{Persisted: started.AgentName}}
+		}
+	}
+	s, err := Restore(ctx, active, sessionID, store, opts...)
+	if err != nil {
+		return nil, err
+	}
+	for _, started := range allStarts {
+		if _, exists := s.Loop(started.LoopID); exists {
+			continue
+		}
+		definition, _ := topology.definition(started.AgentName)
+		bound, bindErr := definition.Bind(s.sessionCtx, tool.Bindings{SessionID: sessionID, LoopID: started.LoopID})
+		if bindErr != nil {
+			_ = s.Shutdown(context.Background())
+			return nil, &RestoreError{Kind: RestoreLoopFailed, Cause: bindErr}
+		}
+		loopEvents := filterLoopEvents(events, started.LoopID)
+		folded := foldPrimaryLoop(loopEvents)
+		if folded.OpenTurn {
+			turnID, turnIndex := openTurnCoords(loopEvents)
+			header, stampErr := s.factory.Stamp(event.Header{Coordinates: identity.Coordinates{SessionID: sessionID, LoopID: started.LoopID, TurnID: turnID}})
+			if stampErr != nil {
+				_ = s.Shutdown(context.Background())
+				return nil, &RestoreError{Kind: RestoreIDGenerationFailed, Cause: stampErr}
+			}
+			if publishErr := s.PublishEvent(ctx, event.TurnInterrupted{Header: header, TurnIndex: turnIndex}); publishErr != nil {
+				_ = s.Shutdown(context.Background())
+				return nil, &RestoreError{Kind: RestoreAppendFailed, Cause: publishErr}
+			}
+		}
+		parent := loop.Provenance{LoopID: started.Cause.Coordinates.LoopID, TurnID: started.Cause.Coordinates.TurnID, StepID: started.Cause.Coordinates.StepID}
+		if buildErr := s.attachRestoredLoop(started, parent, bound, folded, findForeignSID(loopEvents)); buildErr != nil {
+			_ = s.Shutdown(context.Background())
+			return nil, buildErr
+		}
+	}
+	activeID := roots[topology.ActivePrimer].LoopID
+	for _, ev := range events {
+		if changed, isChanged := ev.(event.ActiveLoopChanged); isChanged {
+			activeID = changed.ActiveLoopID
+		}
+	}
+	if _, exists := s.Loop(activeID); !exists {
+		_ = s.Shutdown(context.Background())
+		return nil, &RestoreError{Kind: RestoreLoopFailed, Cause: &SessionError{Kind: SessionLoopNotFound}}
+	}
+	s.loopsMu.Lock()
+	s.primaryLoopID = activeID
+	s.loopsMu.Unlock()
+	return s, nil
+}
+
+func replayTopologyEvents(ctx context.Context, store *sessionstore.Store, sessionID uuid.UUID) ([]event.Event, error) {
+	replayer, err := store.OpenEventReplayer(sessionID, sessionstore.ReplayRequest{FromSeq: 0})
+	if err != nil {
+		return nil, err
+	}
+	cursor, err := replayer.Open(ctx, journal.ReplayRequest{SessionID: sessionID, From: journal.Beginning()})
+	if err != nil {
+		return nil, err
+	}
+	defer cursor.Close()
+	var events []event.Event
+	for {
+		ev, _, nextErr := cursor.Next(ctx)
+		if errors.Is(nextErr, io.EOF) {
+			return events, nil
+		}
+		if nextErr != nil {
+			return nil, nextErr
+		}
+		events = append(events, ev)
+	}
+}
+
+func filterLoopEvents(events []event.Event, loopID uuid.UUID) []event.Event {
+	filtered := make([]event.Event, 0)
+	for _, ev := range events {
+		if ev.EventHeader().LoopID == loopID || ev.EventHeader().LoopID.IsZero() {
+			filtered = append(filtered, ev)
+		}
+	}
+	return filtered
+}
+
+func (s *Session) attachRestoredLoop(started event.LoopStarted, parent loop.Provenance, bound loop.BoundDefinition, folded foldResult, foreignSID string) error {
+	loopCtx, cancel := context.WithCancel(s.sessionCtx)
+	var backend loop.Backend
+	var err error
+	switch bound.Engine() {
+	case loop.EngineNative:
+		backend, err = loopruntime.NewRestored(loopCtx, s.sessionID, started.LoopID, parent, s, bound, loopruntime.RestoredState{Msgs: folded.Msgs, TurnIndex: folded.TurnIndex})
+	default:
+		if foreignSID == "" {
+			cancel()
+			return &RestoreError{Kind: RestoreForeignSIDMissing}
+		}
+		if s.foreignBuildRestored == nil {
+			cancel()
+			return &RestoreError{Kind: RestoreForeignBuilderMissing}
+		}
+		backend, err = s.foreignBuildRestored(loopCtx, s.sessionID, started.LoopID, parent, s, bound, func() (uuid.UUID, error) { return s.newID() }, s.factory, foreignloop.RestoredForeign{ForeignSID: foreignSID, TurnIndex: folded.TurnIndex, Msgs: folded.Msgs})
+	}
+	if err != nil {
+		cancel()
+		return &RestoreError{Kind: RestoreLoopFailed, Cause: err}
+	}
+	s.loopsMu.Lock()
+	s.loops[started.LoopID] = &loopHandle{id: started.LoopID, owner: s, bound: bound, backend: backend, parent: parent, cancel: cancel}
+	s.loopsMu.Unlock()
+	return nil
 }
 
 // restoreSession is the construction core of Restore with the id-gen and clock seams

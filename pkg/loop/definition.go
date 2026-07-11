@@ -2,8 +2,12 @@ package loop
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"reflect"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -164,6 +168,69 @@ func (d Definition) Delegation() Delegation {
 		return Delegation{}
 	}
 	return d.state.delegation
+}
+
+// PolicyRevision returns a deterministic, secret-free digest of immutable loop
+// behavior used by a rig topology fingerprint. Function-valued collaborators are
+// represented by the separately configured security-policy revision at rig level.
+func (d Definition) PolicyRevision() string {
+	if d.state == nil {
+		return ""
+	}
+	type toolPolicy struct {
+		Name         string
+		Requirements tool.Requirements
+	}
+	type modePolicy struct {
+		Name         ModeName
+		Model        inference.Model
+		Effort       inference.Effort
+		Tools        []toolPolicy
+		ToolLimits   ToolLimits
+		Instructions string
+	}
+	tools := func(definitions []tool.Definition) []toolPolicy {
+		out := make([]toolPolicy, 0, len(definitions))
+		for _, definition := range definitions {
+			if nilLike(definition) {
+				out = append(out, toolPolicy{})
+				continue
+			}
+			out = append(out, toolPolicy{Name: definition.Name(), Requirements: definition.Requirements()})
+		}
+		return out
+	}
+	modes := make([]modePolicy, 0, len(d.state.modes))
+	for _, mode := range d.state.modes {
+		modes = append(modes, modePolicy{
+			Name: mode.Name, Model: cloneModel(mode.Model), Effort: mode.Effort,
+			Tools: tools(mode.Tools), ToolLimits: mode.ToolLimits, Instructions: mode.Instructions,
+		})
+	}
+	slices.SortFunc(modes, func(a, b modePolicy) int { return strings.Compare(string(a.Name), string(b.Name)) })
+	delegates := append([]identity.AgentName(nil), d.state.delegates...)
+	slices.SortFunc(delegates, func(a, b identity.AgentName) int { return strings.Compare(string(a), string(b)) })
+	projection := struct {
+		Name         identity.AgentName
+		Model        inference.Model
+		System       string
+		Tools        []toolPolicy
+		Limits       ToolLimits
+		Engine       Engine
+		DrainTimeout time.Duration
+		Delegates    []identity.AgentName
+		Delegation   Delegation
+		Modes        []modePolicy
+		InitialMode  ModeName
+	}{
+		Name: d.state.name, Model: cloneModel(d.state.model), System: d.state.system,
+		Tools: tools(d.state.tools), Limits: d.state.limits, Engine: d.state.engine,
+		DrainTimeout: d.state.drainTimeout, Delegates: delegates,
+		Delegation: d.state.delegation, Modes: modes, InitialMode: d.state.initialMode,
+	}
+	encoded, _ := json.Marshal(projection)
+	sum := sha256.Sum256(encoded)
+	return hex.EncodeToString(sum[:])
 }
 
 // Bind creates fresh session-specific collaborators and resolves every declared mode.

@@ -44,7 +44,8 @@ type Session struct {
 
 	// loopsMu protects loops and primaryLoopID. There is no session goroutine, so
 	// session methods serialize registry access with a normal RWMutex.
-	loopsMu sync.RWMutex
+	loopsMu  sync.RWMutex
+	activeMu sync.Mutex
 
 	// loops are the loop handles in this session, keyed by loop id. Each entry
 	// pairs the loop handle with the provenance of whatever spawned it (zero for
@@ -348,13 +349,50 @@ func (s *Session) LoopController(id uuid.UUID) (loop.Controller, bool) {
 	return h, ok
 }
 
-func (s *Session) SetActiveLoop(_ context.Context, id uuid.UUID) error {
-	s.loopsMu.Lock()
-	defer s.loopsMu.Unlock()
-	if _, ok := s.loops[id]; !ok {
+func (s *Session) SetActiveLoop(ctx context.Context, id uuid.UUID) error {
+	s.activeMu.Lock()
+	defer s.activeMu.Unlock()
+	if err := s.faultIfFaulted(); err != nil {
+		return err
+	}
+	s.loopsMu.RLock()
+	target, ok := s.loops[id]
+	previous := s.primaryLoopID
+	closing := s.closing
+	s.loopsMu.RUnlock()
+	if !ok {
 		return &SessionError{Kind: SessionLoopNotFound}
 	}
+	if closing {
+		return &SessionError{Kind: SessionClosing}
+	}
+	select {
+	case <-target.backend.DoneChan():
+		return &SessionError{Kind: SessionLoopExited}
+	default:
+	}
+	if id == previous {
+		return nil
+	}
+	header, err := s.factory.Stamp(event.Header{Coordinates: identity.Coordinates{SessionID: s.sessionID}})
+	if err != nil {
+		return &SessionError{Kind: SessionIDGenerationFailed, Cause: err}
+	}
+	changed := event.ActiveLoopChanged{Header: header, PreviousLoopID: previous, ActiveLoopID: id}
+	if err := s.PublishEvent(ctx, changed); err != nil {
+		return err
+	}
+	s.loopsMu.Lock()
+	if s.faulted {
+		var persistenceFault *hub.SessionPersistenceFault
+		if errors.As(s.faultErr, &persistenceFault) && persistenceFault.Event.EventHeader().EventID == header.EventID {
+			cause := s.faultErr
+			s.loopsMu.Unlock()
+			return &SessionError{Kind: SessionFaulted, Cause: cause}
+		}
+	}
 	s.primaryLoopID = id
+	s.loopsMu.Unlock()
 	return nil
 }
 
@@ -728,6 +766,11 @@ func New(ctx context.Context, cfg loop.Definition, opts ...Option) (*Session, er
 	return newSession(ctx, cfg, uuid.New, time.Now, opts...)
 }
 
+// NewTopology constructs every configured primer as an independent root loop.
+func NewTopology(ctx context.Context, topology Topology, opts ...Option) (*Session, error) {
+	return newSessionTopology(ctx, topology, uuid.New, time.Now, opts...)
+}
+
 // newSession is the construction core of New with the id-gen and clock seams made
 // explicit. New calls it with the production defaults (uuid.New, time.Now); a
 // same-package test calls it with a failing newID to drive the SessionStarted
@@ -735,6 +778,10 @@ func New(ctx context.Context, cfg loop.Definition, opts ...Option) (*Session, er
 // nil + a typed *SessionError). newID also mints the session id itself, so a
 // generator that fails on its FIRST call aborts before any event is stamped.
 func newSession(ctx context.Context, cfg loop.Definition, newID idGenerator, now event.Clock, opts ...Option) (*Session, error) {
+	return newSessionTopology(ctx, Topology{Definitions: []loop.Definition{cfg}, Primers: []identity.AgentName{cfg.Name()}, ActivePrimer: cfg.Name()}, newID, now, opts...)
+}
+
+func newSessionTopology(ctx context.Context, topology Topology, newID idGenerator, now event.Clock, opts ...Option) (*Session, error) {
 	select {
 	case <-ctx.Done():
 		return nil, &SessionError{Kind: SessionContextDone, Cause: ctx.Err()}
@@ -834,15 +881,40 @@ func newSession(ctx context.Context, cfg loop.Definition, newID idGenerator, now
 		sessionCancel()
 		return nil, &SessionError{Kind: SessionIDGenerationFailed, Cause: err}
 	}
-	primaryLoopID, err := s.newID()
-	if err != nil {
-		sessionCancel()
-		return nil, &SessionError{Kind: SessionLoopIDGenerationFailed, Cause: err}
+	type preparedPrimer struct {
+		name identity.AgentName
+		def  loop.Definition
+		loop preparedLoop
 	}
-	primaryBound, err := cfg.Bind(sessionCtx, tool.Bindings{SessionID: id, LoopID: primaryLoopID})
-	if err != nil {
+	prepared := make([]preparedPrimer, 0, len(topology.Primers))
+	orderedPrimers := make([]identity.AgentName, 0, len(topology.Primers))
+	orderedPrimers = append(orderedPrimers, topology.ActivePrimer)
+	for _, name := range topology.Primers {
+		if name != topology.ActivePrimer {
+			orderedPrimers = append(orderedPrimers, name)
+		}
+	}
+	for _, name := range orderedPrimers {
+		definition, ok := topology.definition(name)
+		if !ok {
+			sessionCancel()
+			return nil, &SessionError{Kind: SessionLoopNotFound}
+		}
+		loopID, mintErr := s.newID()
+		if mintErr != nil {
+			sessionCancel()
+			return nil, &SessionError{Kind: SessionLoopIDGenerationFailed, Cause: mintErr}
+		}
+		bound, bindErr := definition.Bind(sessionCtx, tool.Bindings{SessionID: id, LoopID: loopID})
+		if bindErr != nil {
+			sessionCancel()
+			return nil, bindErr
+		}
+		prepared = append(prepared, preparedPrimer{name: name, def: definition, loop: preparedLoop{id: loopID, bound: bound}})
+	}
+	if len(prepared) == 0 {
 		sessionCancel()
-		return nil, err
+		return nil, &SessionError{Kind: SessionLoopNotFound}
 	}
 
 	// The hub is built before any loop, so a loop publishing through the session's
@@ -852,17 +924,30 @@ func newSession(ctx context.Context, cfg loop.Definition, newID idGenerator, now
 	// under, stamped here so a durable journal can detect a config change on restore.
 	// Rig supplies the SAME projection the restore comparison uses, so the stamped and
 	// compared-against fingerprints cannot drift.
-	if err := s.hub.PublishEvent(sessionCtx, event.SessionStarted{Header: startedHeader, Config: s.projectFingerprint(primaryBound)}); err != nil {
+	// The rig fingerprint provider returns the same topology projection for every
+	// primer; calling it with the active primer keeps the compatibility contract.
+	activePrepared := prepared[0]
+	for _, candidate := range prepared {
+		if candidate.name == topology.ActivePrimer {
+			activePrepared = candidate
+			break
+		}
+	}
+	if err := s.hub.PublishEvent(sessionCtx, event.SessionStarted{Header: startedHeader, Config: s.projectFingerprint(activePrepared.loop.bound)}); err != nil {
 		sessionCancel()
 		return nil, &SessionError{Kind: SessionContextDone, Cause: err}
 	}
 
-	primaryLoopID, err = s.newLoop(loop.Provenance{}, cfg, "", &preparedLoop{id: primaryLoopID, bound: primaryBound})
-	if err != nil {
-		sessionCancel()
-		return nil, err
+	for _, primer := range prepared {
+		loopID, createErr := s.newLoop(loop.Provenance{}, primer.def, "", &primer.loop)
+		if createErr != nil {
+			sessionCancel()
+			return nil, createErr
+		}
+		if primer.name == topology.ActivePrimer {
+			s.primaryLoopID = loopID
+		}
 	}
-	s.primaryLoopID = primaryLoopID
 	return s, nil
 }
 
@@ -937,7 +1022,10 @@ func (s *Session) Submit(ctx context.Context, input []content.Block) (uuid.UUID,
 	// Submit IS the primary-loop, human-authored (AgencyUser) case of submitToLoop:
 	// the interactive submit targets the primary loop and stamps user agency. The
 	// loop-targeted core (a sub-loop, machine agency) is the subagent path.
-	return s.submitToLoop(ctx, s.primaryLoopID, input, identity.AgencyUser)
+	s.loopsMu.RLock()
+	active := s.primaryLoopID
+	s.loopsMu.RUnlock()
+	return s.submitToLoop(ctx, active, input, identity.AgencyUser)
 }
 
 // SubmitToLoop is the loop-targeted counterpart of Submit: it sends human-authored

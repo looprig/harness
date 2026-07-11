@@ -6,6 +6,7 @@ import (
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/ceiling"
 	"github.com/looprig/harness/pkg/foreignloop"
+	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/journal"
 	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/harness/pkg/sessionstore"
@@ -27,6 +28,12 @@ type MissingFingerprintProviderError struct{}
 
 func (*MissingFingerprintProviderError) Error() string {
 	return "session: fingerprint provider is required"
+}
+
+type MissingTopologyError struct{}
+
+func (*MissingTopologyError) Error() string {
+	return "session: lifecycle topology has no active primer"
 }
 
 // NewSessionErrorKind classifies a NewSession failure before the live session exists — the per-session
@@ -83,8 +90,9 @@ func (e *NewSessionError) Unwrap() error { return e.Cause }
 // wiring (lease, journal, appenders) from the shared store, so two live sessions never
 // share a lease or a journal.
 type Lifecycle struct {
-	cfg   loop.Definition
-	store *sessionstore.Store
+	cfg      loop.Definition // compatibility alias for the active primer
+	topology Topology
+	store    *sessionstore.Store
 
 	// catalog is the derived session-index each session's event appender notifies (via
 	// journal.WithCatalog) after each durable append, so the replay-free status fold stays
@@ -203,10 +211,20 @@ func WithLifecycleCeilingFactory(factory CeilingFactory) LifecycleOption {
 // backend is required). It does no session I/O — the derived catalog it opens is cheap and
 // cannot fail — so the returned Lifecycle is ready to NewSession/RestoreSession.
 func NewLifecycle(cfg loop.Definition, store *sessionstore.Store, opts ...LifecycleOption) (*Lifecycle, error) {
+	return NewTopologyLifecycle(Topology{Definitions: []loop.Definition{cfg}, Primers: []identity.AgentName{cfg.Name()}, ActivePrimer: cfg.Name()}, store, opts...)
+}
+
+// NewTopologyLifecycle binds an immutable, validated multi-primer graph to storage.
+func NewTopologyLifecycle(topology Topology, store *sessionstore.Store, opts ...LifecycleOption) (*Lifecycle, error) {
 	if store == nil {
 		return nil, &MissingStoreError{}
 	}
-	r := &Lifecycle{cfg: cfg, store: store}
+	topology = cloneTopology(topology)
+	active, ok := topology.definition(topology.ActivePrimer)
+	if !ok {
+		return nil, &MissingTopologyError{}
+	}
+	r := &Lifecycle{cfg: active, topology: topology, store: store}
 	for _, opt := range opts {
 		opt(r)
 	}
@@ -289,7 +307,7 @@ func (r *Lifecycle) NewSession(ctx context.Context) (*Session, error) {
 		opts = append(opts, WithCeiling(r.ceilingFactory()))
 	}
 
-	s, err := New(ctx, r.cfg, opts...)
+	s, err := NewTopology(ctx, r.topology, opts...)
 	if err != nil {
 		// NewSession failed, so the session never took ownership of the lease-release hook — release
 		// it here best-effort so ownership is not stranded.
@@ -321,5 +339,5 @@ func (r *Lifecycle) RestoreSession(ctx context.Context, id uuid.UUID) (*Session,
 	if r.ceilingFactory != nil {
 		opts = append(opts, WithCeiling(r.ceilingFactory()))
 	}
-	return Restore(ctx, r.cfg, id, r.store, opts...)
+	return RestoreTopology(ctx, r.topology, id, r.store, opts...)
 }
