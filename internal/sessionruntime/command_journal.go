@@ -159,6 +159,30 @@ func WithInterruptReleasePolicy(p InterruptReleasePolicy) Option {
 	}
 }
 
+// withOffloadGCRunner installs the session's offload-blob GC runner (built at the
+// composition root over the session lease + the journal-admission gate). A nil runner is
+// ignored so a wiring slip cannot null the field. The session STARTS it after the hub
+// exists and STOPS it first on Shutdown.
+func withOffloadGCRunner(runner *offloadGCRunner) Option {
+	return func(s *Session) {
+		if runner != nil {
+			s.offloadGC = runner
+		}
+	}
+}
+
+// withOffloadGCPolicy carries the offload-GC cadence into the restore path so
+// restoreTopologySession can build the runner from the lease it acquires. NewSession builds
+// the runner in the Lifecycle and uses withOffloadGCRunner directly. An unconfigured policy
+// is ignored.
+func withOffloadGCPolicy(policy OffloadGCPolicy) Option {
+	return func(s *Session) {
+		if policy.Configured() {
+			s.offloadGCPolicy = policy
+		}
+	}
+}
+
 // FingerprintProvider projects a bound loop into the immutable behavior fingerprint
 // used for both SessionStarted and restore validation. It must be deterministic and safe
 // for concurrent calls from separate sessions.

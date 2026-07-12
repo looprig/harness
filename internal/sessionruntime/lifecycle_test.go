@@ -456,3 +456,64 @@ func TestLifecycleConcurrentReuse(t *testing.T) {
 		t.Errorf("distinct session ids = %d, want %d", len(seen), nRuns+nRestores)
 	}
 }
+
+// TestLifecycleOffloadGCWired proves WithLifecycleOffloadGC arms the session offload-GC
+// runner on BOTH a fresh NewSession and a RestoreSession (the composition root wires the
+// gated journal + runner at both lifecycle seams), and that an unconfigured lifecycle wires
+// no runner.
+func TestLifecycleOffloadGCWired(t *testing.T) {
+	t.Parallel()
+	policy := OffloadGCPolicy{Interval: time.Minute, Timeout: 10 * time.Second}
+
+	t.Run("new session armed", func(t *testing.T) {
+		t.Parallel()
+		store := newRestoreStore(t)
+		r, err := newTestLifecycle(cfg(&stubLLM{chunks: []content.Chunk{textChunk("x")}}), store, WithLifecycleOffloadGC(policy))
+		if err != nil {
+			t.Fatalf("NewTopologyLifecycle: %v", err)
+		}
+		s, err := r.NewSession(context.Background(), "")
+		if err != nil {
+			t.Fatalf("NewSession: %v", err)
+		}
+		t.Cleanup(func() { _ = s.Shutdown(context.Background()) })
+		if s.offloadGC == nil {
+			t.Fatal("NewSession did not arm the offload GC runner")
+		}
+	})
+
+	t.Run("restored session armed", func(t *testing.T) {
+		t.Parallel()
+		store := newRestoreStore(t)
+		sid := runAndShutdown(t, store, restoreCfg(&stubLLM{chunks: []content.Chunk{textChunk("reply")}}, "model-x", "be helpful"))
+		rr, err := newTestLifecycle(restoreCfg(&stubLLM{}, "model-x", "be helpful"), store, WithLifecycleOffloadGC(policy))
+		if err != nil {
+			t.Fatalf("NewTopologyLifecycle (restore): %v", err)
+		}
+		s, err := rr.RestoreSession(context.Background(), sid)
+		if err != nil {
+			t.Fatalf("RestoreSession: %v", err)
+		}
+		t.Cleanup(func() { _ = s.Shutdown(context.Background()) })
+		if s.offloadGC == nil {
+			t.Fatal("RestoreSession did not arm the offload GC runner")
+		}
+	})
+
+	t.Run("unconfigured wires no runner", func(t *testing.T) {
+		t.Parallel()
+		store := newRestoreStore(t)
+		r, err := newTestLifecycle(cfg(&stubLLM{chunks: []content.Chunk{textChunk("x")}}), store)
+		if err != nil {
+			t.Fatalf("NewTopologyLifecycle: %v", err)
+		}
+		s, err := r.NewSession(context.Background(), "")
+		if err != nil {
+			t.Fatalf("NewSession: %v", err)
+		}
+		t.Cleanup(func() { _ = s.Shutdown(context.Background()) })
+		if s.offloadGC != nil {
+			t.Fatal("NewSession armed an offload GC runner without WithLifecycleOffloadGC")
+		}
+	})
+}

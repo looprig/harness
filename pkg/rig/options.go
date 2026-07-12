@@ -27,6 +27,7 @@ const (
 	keyAllowConfigMismatch singletonKey = "allow_config_mismatch"
 	keyCeilingFactory      singletonKey = "ceiling_factory"
 	keySnapshots           singletonKey = "snapshots"
+	keyOffloadGC           singletonKey = "offload_gc"
 )
 
 type DelegationLimits struct {

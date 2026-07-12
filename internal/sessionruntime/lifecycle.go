@@ -134,6 +134,37 @@ type Lifecycle struct {
 	// no managed workspace: no root resolution, no lease, no coordinator — the historical
 	// default. Captured once via WithLifecyclePlacement.
 	placement WorkspacePlacement
+
+	// offloadGC is the OPTIONAL session offload-blob GC cadence (WithLifecycleOffloadGC). The
+	// zero value (unconfigured) wires no gate and no runner — the journal is used undecorated.
+	// When configured, NewSession and RestoreSession install a journal-admission gate + GC
+	// runner that reaps orphaned offload blobs while the session lease is held.
+	offloadGC OffloadGCPolicy
+}
+
+// WithLifecycleOffloadGC captures the session offload-blob GC cadence. An unconfigured
+// (zero) policy is ignored. Forwarded to both NewSession and RestoreSession, which wire the
+// journal-admission gate + GC runner over the session lease.
+func WithLifecycleOffloadGC(policy OffloadGCPolicy) LifecycleOption {
+	return func(r *Lifecycle) {
+		if policy.Configured() {
+			r.offloadGC = policy
+		}
+	}
+}
+
+// buildOffloadGCRunner assembles a session's offload-GC runner from the store, session id,
+// and single-writer lease, driving the shared admission gate's writer. It depends only on
+// the narrow ObjectGC scanner + the gate + the lease-loss signal (Dependency Inversion),
+// with a production time-ticker over the policy interval. The caller wraps the session
+// journal with the SAME gate so every append serializes against a GC pass.
+func buildOffloadGCRunner(store *sessionstore.Store, id uuid.UUID, lease journal.Lease, gate *journalAdmissionGate, policy OffloadGCPolicy) (*offloadGCRunner, error) {
+	objGC, err := store.OpenObjectGC(id, lease)
+	if err != nil {
+		return nil, err
+	}
+	interval := policy.Interval
+	return newOffloadGCRunner(objGC, gate, func() offloadGCTicker { return newTimeTicker(interval) }, lease.Lost(), policy.Timeout), nil
 }
 
 // WithLifecyclePlacement captures the managed-workspace placement the rig declared. The
@@ -302,6 +333,19 @@ func (r *Lifecycle) NewSession(ctx context.Context, seed workspacestore.Ref) (*S
 		releaseLease(lease)
 		return nil, &NewSessionError{Kind: NewSessionJournalFailed, Cause: err}
 	}
+	// Offload GC: wrap the journal with the admission gate BEFORE any appender is built over
+	// it, so every append (event/command/gate/fence) serializes against a GC pass. Build the
+	// runner from the same gate + the session lease. Unconfigured leaves j undecorated.
+	var gcRunner *offloadGCRunner
+	if r.offloadGC.Configured() {
+		gate := newJournalAdmissionGate()
+		gcRunner, err = buildOffloadGCRunner(r.store, sid, lease, gate, r.offloadGC)
+		if err != nil {
+			releaseLease(lease)
+			return nil, &NewSessionError{Kind: NewSessionJournalFailed, Cause: err}
+		}
+		j = newGatedJournal(j, gate)
+	}
 	evAp, err := journal.NewJournalEventAppenderChecked(j, journal.WithCatalog(r.catalog))
 	if err != nil {
 		releaseLease(lease)
@@ -330,6 +374,9 @@ func (r *Lifecycle) NewSession(ctx context.Context, seed workspacestore.Ref) (*S
 		WithGateAppender(gateAp),
 		WithLeaseRelease(lease.Release),
 	)
+	if gcRunner != nil {
+		opts = append(opts, withOffloadGCRunner(gcRunner))
+	}
 	if r.frozenFingerprint != nil {
 		opts = append(opts, WithFingerprint(*r.frozenFingerprint))
 	} else {
@@ -377,16 +424,23 @@ func (r *Lifecycle) NewSession(ctx context.Context, seed workspacestore.Ref) (*S
 	s, err := NewTopology(ctx, r.topology, opts...)
 	if err != nil {
 		// A failure after the Session accepted its hooks is already owned by its
-		// synchronous/background construction cleanup. Earlier failures remain here.
+		// synchronous/background construction cleanup (which stops the runner via
+		// abortConstruction). Earlier failures release here; the runner was never started,
+		// so stopping it only halts its (not-yet-built) ticker.
 		if !constructionCleanupOwned(err) {
+			if gcRunner != nil {
+				gcRunner.Stop()
+			}
 			releaseResolvedRoot(ctx, resolved)
 			releaseLease(lease)
 		}
 		return nil, &NewSessionError{Kind: NewSessionRuntimeFailed, Cause: err}
 	}
 	// The session now owns both leases (via WithLeaseRelease + withResolvedPlacement); start
-	// the exclusive root-lease loss watcher so ownership loss faults the session.
+	// the exclusive root-lease loss watcher so ownership loss faults the session, and arm the
+	// offload-GC runner now the hub exists (bound to hub.IsIdle).
 	s.watchRootLease()
+	s.startOffloadGC()
 	return s, nil
 }
 
@@ -433,6 +487,9 @@ func (r *Lifecycle) RestoreSession(ctx context.Context, id uuid.UUID) (*Session,
 	}
 	if r.placement.Configured() {
 		opts = append(opts, withPlacementSpec(r.placement))
+	}
+	if r.offloadGC.Configured() {
+		opts = append(opts, withOffloadGCPolicy(r.offloadGC))
 	}
 	return RestoreTopology(ctx, r.topology, id, r.store, opts...)
 }

@@ -458,3 +458,61 @@ func TestRigPrimersActiveLoopAndRestore(t *testing.T) {
 		t.Fatal("invalid active-loop target changed selection")
 	}
 }
+
+// TestWithOffloadGCValidatesPolicy proves WithOffloadGC accepts a positive policy and
+// rejects a non-positive interval or timeout with the dedicated typed errors, and that it is
+// an at-most-once singleton.
+func TestWithOffloadGCValidatesPolicy(t *testing.T) {
+	t.Parallel()
+
+	t.Run("rejects non-positive fields", func(t *testing.T) {
+		t.Parallel()
+		tests := []struct {
+			name        string
+			policy      OffloadGCPolicy
+			wantInterva bool
+			wantTimeout bool
+		}{
+			{name: "zero interval", policy: OffloadGCPolicy{Interval: 0, Timeout: time.Second}, wantInterva: true},
+			{name: "negative interval", policy: OffloadGCPolicy{Interval: -time.Second, Timeout: time.Second}, wantInterva: true},
+			{name: "zero timeout", policy: OffloadGCPolicy{Interval: time.Minute, Timeout: 0}, wantTimeout: true},
+			{name: "negative timeout", policy: OffloadGCPolicy{Interval: time.Minute, Timeout: -time.Second}, wantTimeout: true},
+		}
+		for _, tt := range tests {
+			tt := tt
+			t.Run(tt.name, func(t *testing.T) {
+				t.Parallel()
+				err := WithOffloadGC(tt.policy)(&definitionState{seen: make(map[singletonKey]bool)})
+				var iErr *InvalidOffloadGCIntervalError
+				var toErr *InvalidOffloadGCTimeoutError
+				if tt.wantInterva && !errors.As(err, &iErr) {
+					t.Fatalf("WithOffloadGC error = %T %v, want *InvalidOffloadGCIntervalError", err, err)
+				}
+				if tt.wantTimeout && !errors.As(err, &toErr) {
+					t.Fatalf("WithOffloadGC error = %T %v, want *InvalidOffloadGCTimeoutError", err, err)
+				}
+			})
+		}
+	})
+
+	t.Run("accepts a valid policy", func(t *testing.T) {
+		t.Parallel()
+		state := &definitionState{seen: make(map[singletonKey]bool)}
+		if err := WithOffloadGC(OffloadGCPolicy{Interval: time.Minute, Timeout: 10 * time.Second})(state); err != nil {
+			t.Fatalf("WithOffloadGC(valid) error = %v", err)
+		}
+	})
+
+	t.Run("is an at-most-once singleton", func(t *testing.T) {
+		t.Parallel()
+		state := &definitionState{seen: make(map[singletonKey]bool)}
+		opt := WithOffloadGC(OffloadGCPolicy{Interval: time.Minute, Timeout: 10 * time.Second})
+		if err := opt(state); err != nil {
+			t.Fatalf("first WithOffloadGC: %v", err)
+		}
+		var target *DefinitionError
+		if err := opt(state); !errors.As(err, &target) || target.Kind != DefinitionDuplicateOption {
+			t.Fatalf("second WithOffloadGC error = %T %v, want duplicate", err, err)
+		}
+	})
+}

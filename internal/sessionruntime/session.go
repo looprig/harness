@@ -309,6 +309,19 @@ type Session struct {
 	// (SessionIdle durably appended). Workspace-backed sessions bypass this seam and await their
 	// checkpoint controller's generation-specific accepted/committed/faulted outcome. See interrupt.go.
 	interruptRelease InterruptReleasePolicy
+
+	// offloadGCPolicy is the restore-path carrier for the offload-GC cadence (set by
+	// withOffloadGCPolicy, read by restoreTopologySession so it can build the runner from
+	// the lease it acquires). NewSession builds the runner in the Lifecycle instead. Zero
+	// (unconfigured) means no offload GC.
+	offloadGCPolicy OffloadGCPolicy
+
+	// offloadGC is the session's offload-blob GC runner (nil unless WithOffloadGC armed it).
+	// It is installed by the composition root via withOffloadGCRunner, STARTED after the hub
+	// exists (startOffloadGC, bound to hub.IsIdle), and STOPPED+joined at the very start of
+	// Shutdown's teardown — before SessionStopped is appended and before the lease is
+	// released. Its own admission gate serializes every durable append against a GC pass.
+	offloadGC *offloadGCRunner
 }
 
 // constructionCleanupOwnedError marks a construction failure after a Session has
@@ -346,6 +359,9 @@ func (s *Session) abortConstructionAfter(cause error, appendTerminal func(contex
 	}
 	abortCtx, cancelAbort := context.WithTimeout(context.Background(), abortTimeout)
 	defer cancelAbort()
+	// Stop the offload-GC runner (nil/no-op unless it was installed and started). On a
+	// construction abort it is typically unstarted, so this only stops the ticker.
+	s.stopOffloadGC()
 	// Seal durable publication before cancellation can make a backend emit a late
 	// terminal. Already-admitted publishes are the first cleanup phase.
 	var hubDrain <-chan struct{}
@@ -1884,6 +1900,24 @@ func (s *Session) watchRootLease() {
 	}()
 }
 
+// startOffloadGC arms the offload-GC runner (bound to the hub's native-idle probe) once the
+// hub exists. It mirrors watchRootLease: called by the composition root after construction.
+// A no-op unless WithOffloadGC installed a runner.
+func (s *Session) startOffloadGC() {
+	if s.offloadGC != nil {
+		s.offloadGC.start(s.hub.IsIdle)
+	}
+}
+
+// stopOffloadGC stops and joins the offload-GC runner. It is called at the very start of
+// Shutdown's teardown — before SessionStopped is appended and before the lease is released
+// — and on construction abort. Idempotent and nil-safe.
+func (s *Session) stopOffloadGC() {
+	if s.offloadGC != nil {
+		s.offloadGC.Stop()
+	}
+}
+
 // faultWorkspaceInconsistent latches the session's fault state with a workspace-integrity
 // cause (root-lease loss, or a restore whose rollback itself failed) and wakes every
 // blocked WaitIdle waiter — mirroring ReportFault, but for failures the hub's durable tap
@@ -1985,6 +2019,10 @@ func (s *Session) Shutdown(ctx context.Context) error {
 	// through the still-open controller/hub; then automatic activity is canceled/joined,
 	// SessionStopped is appended/emitted, and only afterward do the lease defers run.
 	defer func() {
+		// Stop + join the offload-GC goroutine FIRST — before SessionStopped is appended
+		// (StopSession) and before the lease defers run — so a GC pass can never race the
+		// terminal append or outlive lease ownership.
+		s.stopOffloadGC()
 		if s.checkpoints != nil {
 			s.checkpoints.shutdown()
 		}

@@ -136,6 +136,20 @@ func restoreTopologySession(
 		releaseLease(lease)
 		return nil, &RestoreError{Kind: RestoreJournalFailed, Cause: err}
 	}
+	// Offload GC (symmetric with NewSession): when the restore-forwarded policy is armed,
+	// wrap the journal with the admission gate BEFORE any appender (restore-lifecycle appends
+	// or the rebuilt session's appenders) is built over it, and build the runner from the same
+	// gate + the restore lease. The runner is started only after the session is rebuilt.
+	var gcRunner *offloadGCRunner
+	if probe.offloadGCPolicy.Configured() {
+		gate := newJournalAdmissionGate()
+		gcRunner, err = buildOffloadGCRunner(store, sessionID, lease, gate, probe.offloadGCPolicy)
+		if err != nil {
+			releaseLease(lease)
+			return nil, &RestoreError{Kind: RestoreJournalFailed, Cause: err}
+		}
+		j = newGatedJournal(j, gate)
+	}
 	// The replayer is bound to the stream BEGINNING (FromSeq 0). Restore intentionally
 	// drains RECORDS, not events, so the private GatePreparedRecord is visible while the
 	// normal event-based folds are derived from EventRecord payloads. Opening it is a
@@ -353,6 +367,11 @@ func restoreTopologySession(
 		// tools serialize through the live coordinator.
 		leaseOpts = append(leaseOpts, withResolvedPlacement(resolved))
 	}
+	if gcRunner != nil {
+		// Hand the restored session its offload-GC runner (started after the hub exists,
+		// below) so its Shutdown stops+joins it before SessionStopped and lease release.
+		leaseOpts = append(leaseOpts, withOffloadGCRunner(gcRunner))
+	}
 	// Recover the foreign session id from the primary loop's events. Prebound adapters
 	// stamped it on LoopStarted; late-bound adapters record it with ForeignSessionBound.
 	// buildRestoredSession fails closed on an empty sid for a foreign engine.
@@ -384,8 +403,10 @@ func restoreTopologySession(
 		return abortAccepted(s, &RestoreError{Kind: RestoreAppendFailed, Cause: err})
 	}
 	// Start the exclusive root-lease loss watcher now that the restored session owns the
-	// root lease (via leaseOpts). Nil-safe for per-session/shared/no placement.
+	// root lease (via leaseOpts). Nil-safe for per-session/shared/no placement. Arm the
+	// offload-GC runner now the hub exists (bound to hub.IsIdle).
 	s.watchRootLease()
+	s.startOffloadGC()
 	contextTransferred = true
 	return s, nil
 }
