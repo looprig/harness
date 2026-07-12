@@ -274,7 +274,21 @@ WorkspaceRestored
 WorkspaceCheckpointed // add Consistency and Trigger; keep Ref
 ```
 
-Add `InitialMode` to `LoopStarted`. Define `SnapshotConsistencyUnknown/Quiescent/Fuzzy` and `SnapshotTriggerKindUnknown/Manual/Idle/Interrupt/TurnDone/StepDone/Seed`; unknown is legacy-decode-only and never valid for a newly emitted checkpoint.
+Add `InitialMode`, the initial resolved secret-free model runtime (including context
+limits), and a non-zero `LoopKind` to `LoopStarted`. Define
+`LoopKindUnknown/Primer/Delegate/Hustle`; zero is legacy-decode-only. Existing legacy
+records infer primer versus delegate from root/parent provenance, while current
+producers may never emit unknown. `LoopInferenceChanged` and `LoopModeChanged` carry
+the resolved runtime selected by the change so replay does not consult a mutable model
+catalog.
+
+Reserve event `VisibilityPublic/Internal` independently from class/scope. Zero is
+public for legacy compatibility. This task needs no hustle event yet; it pins the
+structural visibility seam that the downstream hustle/compaction plan will consume.
+
+Define `SnapshotConsistencyUnknown/Quiescent/Fuzzy` and
+`SnapshotTriggerKindUnknown/Manual/Idle/Interrupt/TurnDone/StepDone/Seed`; unknown is
+legacy-decode-only and never valid for a newly emitted checkpoint.
 
 Test exact coordinate/cause shapes: checkpoint/restored events are session-scoped; turn/step/idle/interrupt checkpoint causes identify the direct firing event; manual/seed causes are zero.
 
@@ -383,7 +397,14 @@ Expected: missing internal package and forbidden constructor findings.
 
 **Step 3: Move the actor and adapt construction**
 
-`internal/loopruntime.New` consumes `loop.BoundDefinition`, IDs, provenance, publisher, and restore seed. Move the mutable resolved `ToolSet` and runaway counters into the internal runtime; keep only permission/read-policy contracts in public `pkg/loop`. Keep `loop.Backend` as the common native/foreign runtime contract. Update foreign builders to accept the immutable bound definition instead of `loop.Config`. Delete the temporary compatibility conversion from Task 3.
+`internal/loopruntime.New` consumes `loop.BoundDefinition`, IDs, non-zero loop kind,
+provenance, publisher, and restore seed. Move the mutable resolved `ToolSet` and runaway
+counters into the internal runtime; keep only permission/read-policy contracts in
+public `pkg/loop`. Keep `loop.Backend` as the common native/foreign runtime contract.
+Update foreign builders to accept the immutable bound definition instead of
+`loop.Config`. Delete the temporary compatibility conversion from Task 3. This plan
+constructs only primer/delegate kinds; `LoopKindHustle` construction belongs to the
+downstream hustle implementation plan.
 
 **Step 4: Verify green**
 

@@ -92,6 +92,7 @@ spec after the harness API lands.
 ```text
 Rig
 ├── loop definitions
+├── optional hustle definitions and limits
 ├── primers
 ├── active primer
 ├── session store and lifecycle policy
@@ -103,6 +104,10 @@ Rig
   created. A rig may have one or many primers.
 - The **active primer** is the primer that becomes a new session's initial active loop.
 - A **delegate** is a loop definition one loop is authorized to spawn dynamically.
+- A **hustle** is a registered harness-owned auxiliary task. A loop-backed hustle is
+  neither a primer nor a delegate and is never model-spawnable. The downstream hustle
+  design owns its execution contract; this lifecycle design reserves its loop kind,
+  registry, event visibility, and restore semantics.
 
 ### Runtime
 
@@ -111,7 +116,9 @@ Rig
 └── Session(s)
     ├── active loop
     ├── other primer loops
-    └── dynamically delegated loops
+    ├── dynamically delegated loops
+    ├── transient harness-owned hustle loops (internal visibility; never restored)
+    └── execution within each live loop
         └── Turn
             └── Step
                 ├── model chunks
@@ -134,11 +141,18 @@ pkg/loop
 pkg/session
     Public live Session contract and errors; no public constructors.
 
+pkg/hustle
+    Public immutable auxiliary-work definitions and backend contracts; no public
+    session execution method.
+
 internal/loopruntime
     Concrete loop actor, turn/step machinery, and restoration implementation.
 
 internal/sessionruntime
     Concrete session coordinator, construction, and restoration used by pkg/rig.
+
+internal/hustleruntime
+    Per-session registered auxiliary-work execution and transient loop-backed hustles.
 
 pkg/sessionstore
     Durable event ledger, leases, replay, catalog, and offload-blob GC.
@@ -157,6 +171,16 @@ rig → session (contract) → loop (contract)
  ├──────────────────────────→ sessionstore
  └──────────────────────────→ workspacestore
 ```
+
+The downstream hustle design extends this graph with `rig → hustle` and
+`internal/sessionruntime → internal/hustleruntime → internal/loopruntime`; neither
+`loop` nor `session` imports the hustle runtime.
+
+Every durable `LoopStarted` records a non-zero `LoopKind` (`Primer`, `Delegate`, or
+`Hustle`; zero is legacy/unknown only). Primer/delegate events retain public
+visibility. Hustle loop and hustle lifecycle events use internal visibility: they
+journal for audit but never fan out to public subscribers or enter the normal-loop
+hook dispatcher. This is structural rather than a per-hook opt-out.
 
 `session` never imports `rig`. `serve` continues depending on narrow local interfaces
 and does not import either concrete package in production.
@@ -372,7 +396,8 @@ Subagent tool result. Histories are never implicitly merged.
 `rig.Define(opts ...Option) (*Rig, error)` is the only public constructor for the
 complete runtime assembly.
 
-Initial options:
+Initial lifecycle options plus the downstream hustle extension reserved by the
+2026-07-11 hustle design:
 
 | Option | Meaning |
 |---|---|
@@ -385,6 +410,13 @@ Initial options:
 | `WithSharedWorkspace(store, root)` | Explicitly allow concurrent writers and fuzzy snapshots in one root. |
 | `WithSnapshots(policy)` | Select explicit checkpoint scheduling and priority. |
 | `WithDelegationLimits(limits)` | Set session-wide dynamic delegation depth and quota. |
+| `WithHustles(definitions...)` | Register immutable harness-owned auxiliary tasks. Additive. |
+| `WithHustleLimits(limits)` | Set independent per-session auxiliary concurrency/queue limits. |
+
+The rig lifecycle implementation plan reserves `LoopKind`, visibility, and resolved
+runtime metadata now. The concrete `pkg/hustle`, registry options, and
+`internal/hustleruntime` land in the downstream hustle/compaction implementation plan;
+they are not prerequisites for completing the workspace-lifecycle cutover.
 
 `DelegationLimits.Depth` is the maximum nested delegate chain.
 `DelegationLimits.Quota` is the maximum number of dynamically spawned loops over one
@@ -418,6 +450,9 @@ repetition merges or rejects duplicates.
 - exactly one active primer resolves and belongs to the primer set; a single primer is
   the default, while multiple primers require `WithActivePrimer`;
 - every delegate resolves to a registered definition;
+- hustle names are unique and every referenced hustle resolves to a registered,
+  valid definition;
+- hustle limits are valid and independent of delegation limits;
 - a non-nil session store is supplied;
 - zero or one workspace placement option is supplied;
 - placement and snapshot policy are either both absent or both present;
@@ -461,7 +496,9 @@ The method returns a typed stage error chaining the underlying cause.
 1. Acquires the session lease and opens its journal.
 2. Replays and validates the durable event stream.
 3. Checks the rig/loop topology fingerprint according to the configured mismatch policy.
-4. Reconstructs all primer and delegated loops.
+4. Reconstructs all primer and delegated loops. Retains hustle records for audit but
+   never reconstructs a `LoopKindHustle`; its caller re-evaluates any uncommitted
+   trigger.
 5. Reapplies durable loop changes and the last active-loop selection.
 6. Resolves the effective `CurrentWorkspace` pointer and materializes or attaches to it
    according to the configured placement mode.
@@ -742,8 +779,13 @@ boundary, not snapshot scope: every ref still covers the entire session workspac
 |---|---|
 | Manual | Explicit idle `CheckpointWorkspace` call |
 | OnIdle | `SessionActive → SessionIdle` |
-| OnTurnDone | `TurnDone`, `TurnFailed`, or `TurnInterrupted` on any loop |
-| OnStepDone | Every `StepDone` |
+| OnTurnDone | `TurnDone`, `TurnFailed`, or `TurnInterrupted` on any normal loop |
+| OnStepDone | Every normal-loop `StepDone` |
+
+“Normal loop” means primer or delegate. Hustle loops receive no workspace-boundary
+dispatcher, so their steps and turns cannot trigger checkpoints. They may participate
+in session quiescence according to their registered blocking/background policy, but
+that activity does not opt them into workspace hooks.
 
 Best-effort means session progress wins. It permits one active automatic walk plus one
 latest-wins pending trigger; coalesced edges get no checkpoint event. Activation cancels
@@ -1043,6 +1085,8 @@ The rig fingerprint replaces the single-loop configuration fingerprint. It inclu
 - the ordered primer set;
 - the active primer;
 - delegation edges;
+- registered hustle definition identities, backend/security/limit revisions, and
+  participation modes;
 - tool/security policy revisions;
 - workspace placement policy `{mode, canonical root/base}` and runtime-skill mode fields;
   and
@@ -1054,14 +1098,17 @@ They restore after the base definition passes compatibility checks.
 New enduring events:
 
 ```text
+LoopStarted
+    existing identity/provenance plus non-zero loop kind and initial resolved runtime
+
 ActiveLoopChanged
     session id, previous loop id, active loop id
 
 LoopInferenceChanged
-    session id, loop id, secret-free model descriptor, effort
+    session id, loop id, secret-free resolved model runtime (including context limits), effort
 
 LoopModeChanged
-    session id, loop id, previous mode, selected mode
+    session id, loop id, previous mode, selected mode, resolved model runtime
 
 WorkspaceCheckpointed
     session id, ref, consistency, trigger, Header.Cause
