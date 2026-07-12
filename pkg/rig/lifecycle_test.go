@@ -15,6 +15,7 @@ import (
 
 	"github.com/looprig/core/content"
 	"github.com/looprig/core/uuid"
+	"github.com/looprig/harness/internal/sessionruntime"
 	"github.com/looprig/harness/pkg/ceiling"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/gate"
@@ -538,7 +539,7 @@ func (lifecyclePermissionGate) Grant(context.Context, string, string, tool.Appro
 	return nil
 }
 
-func TestNewSeededSessionCommitsCheckpointBeforeAnyLoopStarts(t *testing.T) {
+func TestNewSessionWithSeedCommitsCheckpointBeforeAnyLoopStarts(t *testing.T) {
 	store, _ := lifecycleStore(t)
 	workspace, err := workspacestore.Open(memstore.New().Blobs)
 	if err != nil {
@@ -556,7 +557,7 @@ func TestNewSeededSessionCommitsCheckpointBeforeAnyLoopStarts(t *testing.T) {
 		WithSessionWorkspaces(workspace, t.TempDir()),
 		WithSnapshots(SnapshotPolicy{Trigger: SnapshotManual}),
 	)
-	s, err := r.NewSeededSession(context.Background(), WithSeedSnapshot(seed))
+	s, err := r.NewSession(context.Background(), WithSeedSnapshot(seed))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -575,6 +576,7 @@ func TestNewSeededSessionCommitsCheckpointBeforeAnyLoopStarts(t *testing.T) {
 	}
 	defer cursor.Close()
 	var ordered []string
+	var persistedConfig event.ConfigFingerprint
 	for {
 		ev, _, nextErr := cursor.Next(context.Background())
 		if errors.Is(nextErr, io.EOF) {
@@ -585,6 +587,7 @@ func TestNewSeededSessionCommitsCheckpointBeforeAnyLoopStarts(t *testing.T) {
 		}
 		switch ev.(type) {
 		case event.SessionStarted:
+			persistedConfig = ev.(event.SessionStarted).Config
 			ordered = append(ordered, "session")
 		case event.WorkspaceCheckpointed:
 			ordered = append(ordered, "seed")
@@ -594,6 +597,9 @@ func TestNewSeededSessionCommitsCheckpointBeforeAnyLoopStarts(t *testing.T) {
 	}
 	if len(ordered) < 3 || ordered[0] != "session" || ordered[1] != "seed" || ordered[2] != "loop" {
 		t.Fatalf("durable construction order = %v, want [session seed loop ...]", ordered)
+	}
+	if persistedConfig.ModelID != "model" || persistedConfig.SystemPromptRev == "" || persistedConfig.ToolPolicyRev == "" || persistedConfig.TopologyRev == "" {
+		t.Fatalf("persisted frozen SessionStarted config = %+v", persistedConfig)
 	}
 }
 
@@ -661,7 +667,7 @@ func TestNewSessionAppendFailuresAbortBeforeLeaseRelease(t *testing.T) {
 				if snapErr != nil {
 					t.Fatal(snapErr)
 				}
-				controller, err = r.NewSeededSession(context.Background(), WithSeedSnapshot(seed))
+				controller, err = r.NewSession(context.Background(), WithSeedSnapshot(seed))
 			} else {
 				controller, err = r.NewSession(context.Background())
 			}
@@ -926,5 +932,142 @@ func TestRestoreDoneAppendFailureAbortsBeforeReverseLeaseRelease(t *testing.T) {
 	}
 	if stopped != 1 || errored != 1 {
 		t.Fatalf("SessionStopped=%d RestoreErrored=%d, want original stop only and one restore error", stopped, errored)
+	}
+}
+
+func TestRestoreAcceptsPreFrozenFullFingerprintFixture(t *testing.T) {
+	store, _ := lifecycleStore(t)
+	read := tool.NewDefinition("Read", 0, func(context.Context, tool.Bindings) ([]tool.InvokableTool, error) {
+		return []tool.InvokableTool{fpTool{name: "Read"}}, nil
+	})
+	definition, err := loop.Define(
+		loop.WithName("agent"), loop.WithInference(&stubLLM{}, validModel("model")),
+		loop.WithSystem("system"), loop.WithTools(read),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldProvider := sessionruntime.FingerprintProvider(func(bound loop.BoundDefinition) event.ConfigFingerprint {
+		return fingerprintWithTopology(bound, ConfigFingerprintFields{}, []loop.Definition{definition}, []string{"agent"}, "agent")
+	})
+	legacy, err := sessionruntime.NewLifecycle(definition, store, sessionruntime.WithLifecycleFingerprintProvider(oldProvider))
+	if err != nil {
+		t.Fatal(err)
+	}
+	original, err := legacy.NewSession(context.Background(), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := original.SessionID()
+	if err := original.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	var persisted event.ConfigFingerprint
+	for _, ev := range replayRigEvents(t, store, id) {
+		if started, ok := ev.(event.SessionStarted); ok {
+			persisted = started.Config
+			break
+		}
+	}
+	if persisted.ModelID == "" || persisted.SystemPromptRev == "" || persisted.ToolPolicyRev == "" || persisted.TopologyRev == "" {
+		t.Fatalf("persisted full fingerprint = %+v", persisted)
+	}
+
+	current, err := Define(WithLoops(definition), WithPrimers("agent"), WithSessionStore(store))
+	if err != nil {
+		t.Fatal(err)
+	}
+	restored, err := current.RestoreSession(context.Background(), id)
+	if err != nil {
+		t.Fatalf("restore pre-frozen full fingerprint fixture: %v", err)
+	}
+	if err := restored.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRestoreReconstructsPrimerAndDelegateInferenceBeforeAdmission(t *testing.T) {
+	store, _ := lifecycleStore(t)
+	define := func(name string, delegates ...identity.AgentName) loop.Definition {
+		definition, err := loop.Define(
+			loop.WithName(identity.AgentName(name)), loop.WithInference(&stubLLM{}, validModel(name+"-base")),
+			loop.WithModes(
+				loop.Mode{Name: "plan", Model: validModel(name + "-plan"), Effort: inference.EffortLow},
+				loop.Mode{Name: "build", Model: validModel(name + "-build"), Effort: inference.EffortMedium},
+			),
+			loop.WithInitialMode("plan"),
+			loop.WithDelegates(delegates...),
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return definition
+	}
+	primer := define("primer", "delegate")
+	delegate := define("delegate")
+	r, err := Define(WithLoops(primer, delegate), WithPrimers("primer"), WithSessionStore(store))
+	if err != nil {
+		t.Fatal(err)
+	}
+	original, err := r.NewSession(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	primerID := original.ActiveLoop().ID()
+	spawner := original.(interface {
+		NewLoop(loop.Provenance, loop.Definition) (uuid.UUID, error)
+	})
+	delegateID, err := spawner.NewLoop(loop.Provenance{LoopID: primerID}, delegate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	primerController, ok := original.LoopController(primerID)
+	if !ok {
+		t.Fatal("missing primer controller")
+	}
+	delegateController, ok := original.LoopController(delegateID)
+	if !ok {
+		t.Fatal("missing delegate controller")
+	}
+	if err := primerController.SetMode(context.Background(), "build"); err != nil {
+		t.Fatal(err)
+	}
+	if err := primerController.Change(context.Background(), loop.ChangeModel(validModel("primer-routed")), loop.ChangeEffort(inference.EffortHigh)); err != nil {
+		t.Fatal(err)
+	}
+	if err := delegateController.SetMode(context.Background(), "build"); err != nil {
+		t.Fatal(err)
+	}
+	if err := delegateController.Change(context.Background(), loop.ChangeModel(validModel("delegate-routed")), loop.ChangeEffort(inference.EffortMax)); err != nil {
+		t.Fatal(err)
+	}
+	if err := original.SetActiveLoop(context.Background(), delegateID); err != nil {
+		t.Fatal(err)
+	}
+	id := original.SessionID()
+	if err := original.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	restored, err := r.RestoreSession(context.Background(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = restored.Shutdown(context.Background()) }()
+	assertInference := func(label string, id uuid.UUID, wantModel string, wantEffort inference.Effort) {
+		t.Helper()
+		handle, ok := restored.Loop(id)
+		if !ok {
+			t.Fatalf("%s loop missing", label)
+		}
+		model := handle.Model()
+		if handle.Mode() != "build" || model.Name != wantModel || model.Sampling.Effort != wantEffort {
+			t.Fatalf("%s restored mode/model/effort = %q/%q/%q", label, handle.Mode(), model.Name, model.Sampling.Effort)
+		}
+	}
+	assertInference("primer", primerID, "primer-routed", inference.EffortHigh)
+	assertInference("delegate", delegateID, "delegate-routed", inference.EffortMax)
+	if restored.ActiveLoop().ID() != delegateID {
+		t.Fatalf("active loop = %v, want delegate %v", restored.ActiveLoop().ID(), delegateID)
 	}
 }

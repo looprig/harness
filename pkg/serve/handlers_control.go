@@ -30,7 +30,7 @@ type interruptResponse struct {
 // empty object, or an empty "blocks" array all decode to no blocks and fail.
 // A malformed body (bad JSON envelope, over the cap, or an unknown block type)
 // is likewise 400; a Submit failure is a generic 500 that leaks no cause.
-func (s *server[S]) handleInput(w http.ResponseWriter, r *http.Request) {
+func (s *server[S, O]) handleInput(w http.ResponseWriter, r *http.Request) {
 	sid, err := parseSessionID(r.PathValue("sid"))
 	if err != nil {
 		writeErrorCause(w, http.StatusBadRequest, codeInvalidParam, msgInvalidSID, false, err)
@@ -72,7 +72,7 @@ func (s *server[S]) handleInput(w http.ResponseWriter, r *http.Request) {
 // {sid} is parsed at the boundary (malformed => 400) and resolved against the live
 // registry (a miss is a generic 404) before Interrupt is called. An Interrupt
 // failure is a generic 500 that leaks no cause.
-func (s *server[S]) handleInterrupt(w http.ResponseWriter, r *http.Request) {
+func (s *server[S, O]) handleInterrupt(w http.ResponseWriter, r *http.Request) {
 	sid, err := parseSessionID(r.PathValue("sid"))
 	if err != nil {
 		writeErrorCause(w, http.StatusBadRequest, codeInvalidParam, msgInvalidSID, false, err)

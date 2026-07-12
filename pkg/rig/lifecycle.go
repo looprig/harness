@@ -10,19 +10,9 @@ import (
 	"github.com/looprig/harness/pkg/workspacestore"
 )
 
-// NewSession brings up a brand-new live session with no seed. Its signature is fixed by
-// the narrow serve.Rig structural contract (NewSession(ctx) (S, error)), so the seeding
-// variant is the separate NewSeededSession below. Both share one implementation.
-func (r *Rig) NewSession(ctx context.Context) (session.SessionController, error) {
-	return r.newSession(ctx, "")
-}
-
-// NewSeededSession brings up a brand-new live session, optionally materializing a seed
-// snapshot as its first workspace checkpoint via WithSeedSnapshot (design §"Seeding").
-// It is the options-accepting entry point; plain NewSession keeps the serve.Rig-compatible
-// arity. Seeding requires a per-session or empty exclusive placement and a resolvable ref;
-// a bad seed fails closed.
-func (r *Rig) NewSeededSession(ctx context.Context, opts ...SessionOption) (session.SessionController, error) {
+// NewSession brings up a brand-new live session. WithSeedSnapshot optionally
+// materializes and commits a seed before any loop starts.
+func (r *Rig) NewSession(ctx context.Context, opts ...SessionOption) (session.SessionController, error) {
 	resolved, err := resolveSessionOptions(opts)
 	if err != nil {
 		return nil, err

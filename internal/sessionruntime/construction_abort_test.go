@@ -72,3 +72,36 @@ func TestAbortConstructionStopsCollaboratorsWithoutSessionStopped(t *testing.T) 
 		}
 	}
 }
+
+func TestAbortConstructionUsesOneOverallDeadline(t *testing.T) {
+	sid, _ := uuid.New()
+	first, _ := uuid.New()
+	second, _ := uuid.New()
+	ctx, cancel := context.WithCancel(context.Background())
+	uncooperative := func() *abortBackend {
+		return &abortBackend{commands: make(chan command.Command), done: make(chan struct{})}
+	}
+	s := &Session{
+		sessionID: sid, sessionCtx: ctx, sessionCancel: cancel, hub: hub.New(sid),
+		checkpointAdmission: newCheckpointAdmissionGate(),
+		loops: map[uuid.UUID]*loopHandle{
+			first:  {id: first, backend: uncooperative(), cancel: func() {}},
+			second: {id: second, backend: uncooperative(), cancel: func() {}},
+		},
+		gates: map[gate.ID]gateEntry{}, gateTimers: map[gate.ID]*time.Timer{},
+	}
+	withConstructionAbortTimeout(25 * time.Millisecond)(s)
+	sub, err := s.hub.SubscribeEvents(event.EventFilter{Enduring: event.LoopScope{All: true}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	started := time.Now()
+	s.abortConstruction(errors.New("failed"))
+	elapsed := time.Since(started)
+	if elapsed < 20*time.Millisecond || elapsed > 55*time.Millisecond {
+		t.Fatalf("abort elapsed = %v, want one shared ~25ms deadline", elapsed)
+	}
+	if _, open := <-sub.Events(); open {
+		t.Fatal("hub cleanup did not continue after abort deadline")
+	}
+}

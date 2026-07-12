@@ -56,9 +56,21 @@ func fingerprintWithTopology(definition loop.BoundDefinition, fields ConfigFinge
 // immutable definitions and scalar rig fields, so restore can compare it immediately
 // after replay without constructing workspace or loop collaborators.
 func frozenFingerprint(fields ConfigFingerprintFields, definitions []loop.Definition, primers []string, active string) event.ConfigFingerprint {
+	initial := loop.InitialFingerprint{}
+	for _, definition := range definitions {
+		if string(definition.Name()) == active {
+			initial = definition.FingerprintInitial()
+			break
+		}
+	}
+	toolNames := append([]string(nil), initial.ToolNames...)
+	sort.Strings(toolNames)
 	return event.ConfigFingerprint{
 		TopologyRev:               topologyRevision(definitions, primers, active),
 		AgentKind:                 fields.AgentKind,
+		ModelID:                   initial.Model.Name,
+		SystemPromptRev:           hexSHA256(initial.EffectiveSystem),
+		ToolPolicyRev:             hexSHA256(strings.Join(toolNames, "\n")),
 		RuntimeSkills:             fields.RuntimeSkills,
 		WorkspaceRoot:             fields.WorkspaceRoot,
 		AgentAdapter:              fields.AdapterID,

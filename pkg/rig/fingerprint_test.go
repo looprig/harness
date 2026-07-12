@@ -2,6 +2,7 @@ package rig
 
 import (
 	"context"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -408,6 +409,39 @@ func TestFingerprintFromEmptyTools(t *testing.T) {
 	b := fingerprintFromDefinition(fpConfig("m", ""))
 	if !a.Equal(b) {
 		t.Errorf("empty-config fingerprint not deterministic: %+v != %+v", a, b)
+	}
+}
+
+func TestFrozenFingerprintRetainsFullInitialFieldsWithoutBinding(t *testing.T) {
+	var binds atomic.Int32
+	definition, err := loop.Define(
+		loop.WithName("agent"), loop.WithInference(&stubLLM{}, validModel("base")), loop.WithSystem("base system"),
+		loop.WithTools(tool.NewDefinition("Read", 0, func(context.Context, tool.Bindings) ([]tool.InvokableTool, error) {
+			return []tool.InvokableTool{fpTool{name: "Read"}}, nil
+		})),
+		loop.WithModes(loop.Mode{Name: "build", Model: validModel("selected"), Instructions: "build instructions"}),
+		loop.WithInitialMode("build"),
+		loop.WithPolicyRevision("policy-v1"),
+		loop.WithPermissionFactory(func(context.Context, tool.Bindings) (loop.PermissionGate, error) {
+			binds.Add(1)
+			return lifecyclePermissionGate{}, nil
+		}),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fingerprint := frozenFingerprint(ConfigFingerprintFields{}, []loop.Definition{definition}, []string{"agent"}, "agent")
+	if binds.Load() != 0 {
+		t.Fatalf("definition-time fingerprint invoked bind factory %d times", binds.Load())
+	}
+	if fingerprint.ModelID != "selected" {
+		t.Fatalf("ModelID = %q, want selected", fingerprint.ModelID)
+	}
+	if want := hexSHA256("base system\n\nbuild instructions"); fingerprint.SystemPromptRev != want {
+		t.Fatalf("SystemPromptRev = %q, want %q", fingerprint.SystemPromptRev, want)
+	}
+	if want := hexSHA256("Read"); fingerprint.ToolPolicyRev != want {
+		t.Fatalf("ToolPolicyRev = %q, want %q", fingerprint.ToolPolicyRev, want)
 	}
 }
 

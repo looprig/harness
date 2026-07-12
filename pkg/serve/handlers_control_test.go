@@ -132,7 +132,7 @@ func TestServerHandleInput(t *testing.T) {
 			cmdID := parseTestUUID(t, cmdIDStr)
 			sess := &fakeSession{submitID: cmdID, submitErr: tt.submitErr}
 			rig := &fakeRig{}
-			srv := newServer[*fakeSession](rig, nil, newConfig())
+			srv := newServer[*fakeSession, fakeSessionOption](rig, nil, newConfig())
 			if tt.attach {
 				srv.registry.put(sid, sess)
 			}
@@ -231,7 +231,7 @@ func TestServerHandleInterrupt(t *testing.T) {
 			sid := parseTestUUID(t, sidStr)
 			sess := &fakeSession{interruptResult: tt.interruptResult, interruptErr: tt.interruptErr}
 			rig := &fakeRig{}
-			srv := newServer[*fakeSession](rig, nil, newConfig())
+			srv := newServer[*fakeSession, fakeSessionOption](rig, nil, newConfig())
 			if tt.attach {
 				srv.registry.put(sid, sess)
 			}

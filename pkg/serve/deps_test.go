@@ -20,8 +20,8 @@ import (
 // session package. If a real method signature ever drifts from an interface, this
 // file stops compiling — the guardrail that keeps serve's contract honest.
 var (
-	_ serve.LiveSession                    = (session.Session)(nil)
-	_ serve.Rig[session.SessionController] = (*rig.Rig)(nil)
+	_ serve.LiveSession                                       = (session.Session)(nil)
+	_ serve.Rig[session.SessionController, rig.SessionOption] = (*rig.Rig)(nil)
 )
 
 // allowedImports is the EXACT set of import paths the production (non-test) serve

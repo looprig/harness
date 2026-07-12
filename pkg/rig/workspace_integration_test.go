@@ -39,7 +39,7 @@ func TestRigSessionWorkspaceSeedAndRewind(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	sess, err := rig.NewSeededSession(ctx, WithSeedSnapshot(seedRef))
+	sess, err := rig.NewSession(ctx, WithSeedSnapshot(seedRef))
 	if err != nil {
 		t.Fatalf("NewSession: %v", err)
 	}

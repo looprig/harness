@@ -108,7 +108,7 @@ type restoreResponse struct {
 // two sessions); the last store wins the cache. This per-pod duplicate-create window is
 // accepted here rather than closed with a request coalescer; a client that needs
 // strict single-flight serializes its own retries.
-func (s *server[S]) handleCreate(w http.ResponseWriter, r *http.Request) {
+func (s *server[S, O]) handleCreate(w http.ResponseWriter, r *http.Request) {
 	body, err := readCreateBody(r, s.cfg.maxBodyBytes)
 	if err != nil {
 		writeErrorCause(w, http.StatusBadRequest, codeInvalidBody, msgInvalidBody, false, err)
@@ -233,7 +233,7 @@ func decodeBlocksFromBody(body []byte) ([]content.Block, error) {
 // "no journal / not found" rebuild failure from a transient backend failure. The
 // one signal it honors is a serve-level SessionNotFoundError, which a Rig may
 // choose to surface for a genuine 404; absent that, every RestoreSession failure is a 500.
-func (s *server[S]) handleRestore(w http.ResponseWriter, r *http.Request) {
+func (s *server[S, O]) handleRestore(w http.ResponseWriter, r *http.Request) {
 	sid, err := parseSessionID(r.PathValue("sid"))
 	if err != nil {
 		writeErrorCause(w, http.StatusBadRequest, codeInvalidParam, msgInvalidSID, false, err)

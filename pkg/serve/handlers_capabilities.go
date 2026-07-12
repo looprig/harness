@@ -30,7 +30,7 @@ type capabilities struct {
 // document (SPEC §6). It reads no request state and touches no server dependency —
 // it always emits the same 200 JSON body naming the protocol, its version, and the
 // supported feature planes in their canonical order.
-func (s *server[S]) handleCapabilities(w http.ResponseWriter, _ *http.Request) {
+func (s *server[S, O]) handleCapabilities(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, capabilities{
 		Protocol: protocolName,
 		Version:  protocolVersion,

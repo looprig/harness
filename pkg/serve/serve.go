@@ -49,11 +49,12 @@ type LiveSession interface {
 // Rig is the narrow session-factory view serve depends on. It is generic over the
 // concrete live-session type S (constrained to LiveSession) so a caller keeps the
 // real type through NewSession/RestoreSession without serve importing it: the composition
-// root instantiates Rig[session.SessionController], and serve holds only Rig[S].
+// root instantiates Rig[session.SessionController, rig.SessionOption], while serve
+// remains independent of both concrete packages.
 //
 //   - NewSession brings up a brand-new live session that exposes its minted ID.
 //   - RestoreSession rebuilds a prior session from its durable history by id.
-type Rig[S LiveSession] interface {
-	NewSession(ctx context.Context) (S, error)
+type Rig[S LiveSession, O any] interface {
+	NewSession(ctx context.Context, opts ...O) (S, error)
 	RestoreSession(ctx context.Context, id uuid.UUID) (S, error)
 }

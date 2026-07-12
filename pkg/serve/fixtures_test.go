@@ -149,7 +149,7 @@ func TestFixtures(t *testing.T) {
 
 func produceCapabilities(t *testing.T) []byte {
 	t.Helper()
-	srv := newServer[*fakeSession](nil, nil, newConfig())
+	srv := newServer[*fakeSession, fakeSessionOption](nil, nil, newConfig())
 	rec := httptest.NewRecorder()
 	srv.handleCapabilities(rec, httptest.NewRequest(http.MethodGet, "/v1/capabilities", http.NoBody))
 	return rec.Body.Bytes()
@@ -158,7 +158,7 @@ func produceCapabilities(t *testing.T) []byte {
 func produceCreateIdle(t *testing.T) []byte {
 	t.Helper()
 	rig := &fakeRig{runID: parseTestUUID(t, fixSessionID), runSess: &fakeSession{}}
-	srv := newServer[*fakeSession](rig, nil, newConfig())
+	srv := newServer[*fakeSession, fakeSessionOption](rig, nil, newConfig())
 	rec := httptest.NewRecorder()
 	srv.handleCreate(rec, httptest.NewRequest(http.MethodPost, "/v1/sessions", http.NoBody))
 	return rec.Body.Bytes()
@@ -168,7 +168,7 @@ func produceCreateWithCommand(t *testing.T) []byte {
 	t.Helper()
 	sess := &fakeSession{submitID: parseTestUUID(t, fixCommandID)}
 	rig := &fakeRig{runID: parseTestUUID(t, fixSessionID), runSess: sess}
-	srv := newServer[*fakeSession](rig, nil, newConfig())
+	srv := newServer[*fakeSession, fakeSessionOption](rig, nil, newConfig())
 	rec := httptest.NewRecorder()
 	srv.handleCreate(rec, httptest.NewRequest(http.MethodPost, "/v1/sessions", strings.NewReader(validBlocksBody)))
 	return rec.Body.Bytes()
@@ -189,7 +189,7 @@ func produceSessionList(t *testing.T) []byte {
 		NextSkip: 0,
 		Done:     true,
 	}}
-	srv := newServer[*fakeSession](&fakeRig{}, reader, newConfig())
+	srv := newServer[*fakeSession, fakeSessionOption](&fakeRig{}, reader, newConfig())
 	rec := httptest.NewRecorder()
 	srv.handleListSessions(rec, readRequest("/v1/sessions", ""))
 	return rec.Body.Bytes()
@@ -198,7 +198,7 @@ func produceSessionList(t *testing.T) []byte {
 func produceRestore(t *testing.T) []byte {
 	t.Helper()
 	rig := &fakeRig{restoreSess: &fakeSession{}}
-	srv := newServer[*fakeSession](rig, nil, newConfig())
+	srv := newServer[*fakeSession, fakeSessionOption](rig, nil, newConfig())
 	req := httptest.NewRequest(http.MethodPost, "/v1/sessions/"+fixSessionID+"/restore", http.NoBody)
 	req.SetPathValue("sid", fixSessionID)
 	rec := httptest.NewRecorder()
@@ -209,7 +209,7 @@ func produceRestore(t *testing.T) []byte {
 func produceInput(t *testing.T) []byte {
 	t.Helper()
 	sess := &fakeSession{submitID: parseTestUUID(t, fixCommandID)}
-	srv := newServer[*fakeSession](&fakeRig{}, nil, newConfig())
+	srv := newServer[*fakeSession, fakeSessionOption](&fakeRig{}, nil, newConfig())
 	srv.registry.put(parseTestUUID(t, fixSessionID), sess)
 	req := httptest.NewRequest(http.MethodPost, "/v1/sessions/"+fixSessionID+"/input", strings.NewReader(validBlocksBody))
 	req.SetPathValue("sid", fixSessionID)
@@ -221,7 +221,7 @@ func produceInput(t *testing.T) []byte {
 func produceInterrupt(t *testing.T) []byte {
 	t.Helper()
 	sess := &fakeSession{interruptResult: true}
-	srv := newServer[*fakeSession](&fakeRig{}, nil, newConfig())
+	srv := newServer[*fakeSession, fakeSessionOption](&fakeRig{}, nil, newConfig())
 	srv.registry.put(parseTestUUID(t, fixSessionID), sess)
 	req := httptest.NewRequest(http.MethodPost, "/v1/sessions/"+fixSessionID+"/interrupt", http.NoBody)
 	req.SetPathValue("sid", fixSessionID)
@@ -233,7 +233,7 @@ func produceInterrupt(t *testing.T) []byte {
 func produceGateAccepted(t *testing.T) []byte {
 	t.Helper()
 	sess := &fakeSession{}
-	srv := newServer[*fakeSession](&fakeRig{}, nil, newConfig())
+	srv := newServer[*fakeSession, fakeSessionOption](&fakeRig{}, nil, newConfig())
 	srv.registry.put(parseTestUUID(t, fixSessionID), sess)
 	rec := httptest.NewRecorder()
 	srv.handleGateResponse(rec, gateRequest(fixSessionID, fixGateID, `{"action":"approve","values":{"scope":"session"}}`, true))
@@ -252,7 +252,7 @@ func produceStatusRunning(t *testing.T) []byte {
 		UpdatedAt:      fixedInstant,
 	}
 	reader := &fakeReader{status: status}
-	srv := newServer[*fakeSession](&fakeRig{}, reader, newConfig())
+	srv := newServer[*fakeSession, fakeSessionOption](&fakeRig{}, reader, newConfig())
 	rec := httptest.NewRecorder()
 	srv.handleStatus(rec, readRequest("/v1/sessions/"+fixSessionID+"/status", fixSessionID))
 	return rec.Body.Bytes()
@@ -266,7 +266,7 @@ func produceJournalPage(t *testing.T) []byte {
 		Done:           false,
 	}
 	reader := &fakeReader{journal: page}
-	srv := newServer[*fakeSession](&fakeRig{}, reader, newConfig())
+	srv := newServer[*fakeSession, fakeSessionOption](&fakeRig{}, reader, newConfig())
 	rec := httptest.NewRecorder()
 	srv.handleJournal(rec, readRequest("/v1/sessions/"+fixSessionID+"/journal", fixSessionID))
 	return rec.Body.Bytes()

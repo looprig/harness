@@ -11,15 +11,16 @@ import (
 // config) so the individual handlers can be methods on it. It is parameterized over
 // the concrete live-session type S (constrained to LiveSession) so the real type
 // threads through NewSession/RestoreSession without serve importing it — the composition
-// root instantiates server[session.SessionController] and serve holds only server[S].
+// root instantiates server with its concrete session and option types while serve keeps
+// both as generic parameters.
 //
 // This holder carries no request state — one server instance serves every request
 // (the mux is built by Handler in mux.go; per-request state lives on the stack of each
 // handler invocation). Its fields are the shared per-pod dependencies: the session
 // rig, the read-plane Reader, the live-session registry, the config, and the
 // idempotency store.
-type server[S LiveSession] struct {
-	rig      Rig[S]
+type server[S LiveSession, O any] struct {
+	rig      Rig[S, O]
 	reader   Reader
 	registry *registry
 	cfg      *config
@@ -37,8 +38,8 @@ type server[S LiveSession] struct {
 // (list/status/journal); it is independent of the live registry — a read never
 // consults a live session — so a nil reader is tolerated by the control/lifecycle
 // routes that never touch it (the read handlers require it).
-func newServer[S LiveSession](rig Rig[S], reader Reader, cfg *config) *server[S] {
-	return &server[S]{
+func newServer[S LiveSession, O any](rig Rig[S, O], reader Reader, cfg *config) *server[S, O] {
+	return &server[S, O]{
 		rig:      rig,
 		reader:   reader,
 		registry: newRegistry(),

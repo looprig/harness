@@ -67,7 +67,7 @@ func (f *fakeSession) Interrupt(context.Context) (bool, error) {
 	return f.interruptResult, f.interruptErr
 }
 
-// fakeRig is a test double for Rig[*fakeSession]: NewSession/RestoreSession return the
+// fakeRig is a test double for Rig[*fakeSession, fakeSessionOption]: NewSession/RestoreSession return the
 // configured session/error and count their calls, and RestoreSession records the ID it
 // was asked to rebuild.
 type fakeRig struct {
@@ -82,7 +82,9 @@ type fakeRig struct {
 	restoreGotID uuid.UUID
 }
 
-func (f *fakeRig) NewSession(context.Context) (*fakeSession, error) {
+type fakeSessionOption struct{}
+
+func (f *fakeRig) NewSession(context.Context, ...fakeSessionOption) (*fakeSession, error) {
 	f.runCalls++
 	if f.runSess != nil {
 		f.runSess.id = f.runID
@@ -216,7 +218,7 @@ func TestServerHandleCreate(t *testing.T) {
 			cmdID := parseTestUUID(t, cmdIDStr)
 			sess := &fakeSession{submitID: cmdID, submitErr: tt.submitErr}
 			rig := &fakeRig{runID: runID, runSess: sess, runErr: tt.runErr}
-			srv := newServer[*fakeSession](rig, nil, newConfig())
+			srv := newServer[*fakeSession, fakeSessionOption](rig, nil, newConfig())
 
 			var req *http.Request
 			if tt.hasBody {
@@ -324,7 +326,7 @@ func TestServerHandleRestore(t *testing.T) {
 
 			sess := &fakeSession{}
 			rig := &fakeRig{restoreSess: sess, restoreErr: tt.restoreErr}
-			srv := newServer[*fakeSession](rig, nil, newConfig())
+			srv := newServer[*fakeSession, fakeSessionOption](rig, nil, newConfig())
 
 			req := httptest.NewRequest(http.MethodPost, "/v1/sessions/"+tt.sid+"/restore", http.NoBody)
 			req.SetPathValue("sid", tt.sid)
@@ -374,7 +376,7 @@ const (
 
 // doCreate drives handleCreate with an optional Idempotency-Key and body ("" body =>
 // no body), returning the recorder for assertions.
-func doCreate(t *testing.T, srv *server[*fakeSession], key, body string) *httptest.ResponseRecorder {
+func doCreate(t *testing.T, srv *server[*fakeSession, fakeSessionOption], key, body string) *httptest.ResponseRecorder {
 	t.Helper()
 	var req *http.Request
 	if body == "" {
@@ -406,11 +408,11 @@ func decodeCreate201(t *testing.T, rec *httptest.ResponseRecorder) createRespons
 
 // newIdemTestServer builds a server whose idempotency clock is controllable via the
 // returned pointer (advance it to cross the TTL), with a 1h TTL.
-func newIdemTestServer(t *testing.T) (*server[*fakeSession], *fakeRig, *time.Time) {
+func newIdemTestServer(t *testing.T) (*server[*fakeSession, fakeSessionOption], *fakeRig, *time.Time) {
 	t.Helper()
 	sess := &fakeSession{submitID: parseTestUUID(t, idemCmdID)}
 	rig := &fakeRig{runID: parseTestUUID(t, idemRunID), runSess: sess}
-	srv := newServer[*fakeSession](rig, nil, newConfig())
+	srv := newServer[*fakeSession, fakeSessionOption](rig, nil, newConfig())
 	clock := time.Date(2026, 7, 8, 12, 0, 0, 0, time.UTC)
 	srv.idem.ttl = time.Hour
 	srv.idem.now = func() time.Time { return clock }
@@ -607,7 +609,7 @@ type concurrentRig struct {
 	calls int
 }
 
-func (r *concurrentRig) NewSession(context.Context) (*fakeSession, error) {
+func (r *concurrentRig) NewSession(context.Context, ...fakeSessionOption) (*fakeSession, error) {
 	r.mu.Lock()
 	r.calls++
 	r.mu.Unlock()
@@ -633,7 +635,7 @@ func TestServerHandleCreateIdempotentConcurrent(t *testing.T) {
 
 	id := parseTestUUID(t, idemRunID)
 	rig := &concurrentRig{id: id, sess: &fakeSession{id: id}}
-	srv := newServer[*fakeSession](rig, nil, newConfig())
+	srv := newServer[*fakeSession, fakeSessionOption](rig, nil, newConfig())
 
 	const n = 16
 	var wg sync.WaitGroup

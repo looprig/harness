@@ -25,6 +25,14 @@ type Option func(*definitionOptions) error
 // Definition is a concrete immutable loop definition. Its zero value is invalid.
 type Definition struct{ state *definitionState }
 
+// InitialFingerprint is the immutable, bind-free view needed by a rig to stamp and
+// compare compatibility before any runtime factories execute.
+type InitialFingerprint struct {
+	Model           inference.Model
+	EffectiveSystem string
+	ToolNames       []string
+}
+
 type definitionState struct {
 	name              identity.AgentName
 	client            inference.Client
@@ -193,6 +201,40 @@ func (d Definition) InitialMode() ModeName {
 		return ""
 	}
 	return d.state.initialMode
+}
+
+// FingerprintInitial resolves the definition's selected initial mode without building
+// tools, permissions, runtime context, or any other session-specific collaborator.
+func (d Definition) FingerprintInitial() InitialFingerprint {
+	if d.state == nil {
+		return InitialFingerprint{}
+	}
+	model := cloneModel(d.state.model)
+	instructions := ""
+	definitions := d.state.tools
+	for _, mode := range d.state.modes {
+		if mode.Name != d.state.initialMode {
+			continue
+		}
+		if !zeroModel(mode.Model) {
+			model = cloneModel(mode.Model)
+		}
+		if mode.Effort != inference.EffortNone {
+			model.Sampling.Effort = mode.Effort
+		}
+		instructions = mode.Instructions
+		if len(mode.Tools) > 0 {
+			definitions = mode.Tools
+		}
+		break
+	}
+	names := make([]string, 0, len(definitions))
+	for _, definition := range definitions {
+		if !nilLike(definition) {
+			names = append(names, definition.Name())
+		}
+	}
+	return InitialFingerprint{Model: model, EffectiveSystem: EffectiveSystem(d.state.system, instructions), ToolNames: names}
 }
 
 // Delegation returns the immutable delegation policy.

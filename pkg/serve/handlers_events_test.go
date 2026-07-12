@@ -106,7 +106,7 @@ func (f *flushRecorder) statusCode() int {
 // runEvents drives handleEvents in a goroutine and returns a channel closed when the
 // handler returns, so a test can assert the stream ended (on cancel or channel close)
 // without racing on the handler's own goroutine.
-func runEvents(srv *server[*fakeSession], w http.ResponseWriter, r *http.Request) <-chan struct{} {
+func runEvents(srv *server[*fakeSession, fakeSessionOption], w http.ResponseWriter, r *http.Request) <-chan struct{} {
 	done := make(chan struct{})
 	go func() {
 		srv.handleEvents(w, r)
@@ -148,7 +148,7 @@ func TestHandleEventsStreamsEnduring(t *testing.T) {
 
 	sub := &fakeSubscription{ch: make(chan event.Delivery, 4)}
 	sess := &fakeSession{sub: sub}
-	srv := newServer[*fakeSession](&fakeRig{}, nil, quietConfig())
+	srv := newServer[*fakeSession, fakeSessionOption](&fakeRig{}, nil, quietConfig())
 	srv.registry.put(sid, sess)
 
 	rec := newFlushRecorder()
@@ -205,7 +205,7 @@ func TestHandleEventsZeroSeqEnduring(t *testing.T) {
 
 	sub := &fakeSubscription{ch: make(chan event.Delivery, 4)}
 	sess := &fakeSession{sub: sub}
-	srv := newServer[*fakeSession](&fakeRig{}, nil, quietConfig())
+	srv := newServer[*fakeSession, fakeSessionOption](&fakeRig{}, nil, quietConfig())
 	srv.registry.put(sid, sess)
 
 	rec := newFlushRecorder()
@@ -298,7 +298,7 @@ func TestHandleEventsStreamsEphemeral(t *testing.T) {
 			sid := parseTestUUID(t, eventsSIDStr)
 			sub := &fakeSubscription{ch: make(chan event.Delivery, 4)}
 			sess := &fakeSession{sub: sub}
-			srv := newServer[*fakeSession](&fakeRig{}, nil, quietConfig())
+			srv := newServer[*fakeSession, fakeSessionOption](&fakeRig{}, nil, quietConfig())
 			srv.registry.put(sid, sess)
 
 			rec := newFlushRecorder()
@@ -359,7 +359,7 @@ func TestHandleEventsChunkNoLeak(t *testing.T) {
 	sid := parseTestUUID(t, eventsSIDStr)
 	sub := &fakeSubscription{ch: make(chan event.Delivery, 4)}
 	sess := &fakeSession{sub: sub}
-	srv := newServer[*fakeSession](&fakeRig{}, nil, quietConfig())
+	srv := newServer[*fakeSession, fakeSessionOption](&fakeRig{}, nil, quietConfig())
 	srv.registry.put(sid, sess)
 
 	rec := newFlushRecorder()
@@ -405,7 +405,7 @@ func TestHandleEventsSkipsUnrecognizedEphemeral(t *testing.T) {
 
 	sub := &fakeSubscription{ch: make(chan event.Delivery, 4)}
 	sess := &fakeSession{sub: sub}
-	srv := newServer[*fakeSession](&fakeRig{}, nil, quietConfig())
+	srv := newServer[*fakeSession, fakeSessionOption](&fakeRig{}, nil, quietConfig())
 	srv.registry.put(sid, sess)
 
 	rec := newFlushRecorder()
@@ -444,7 +444,7 @@ func TestHandleEventsHeartbeat(t *testing.T) {
 	sess := &fakeSession{sub: sub}
 	cfg := newConfig()
 	cfg.heartbeat = 2 * time.Millisecond
-	srv := newServer[*fakeSession](&fakeRig{}, nil, cfg)
+	srv := newServer[*fakeSession, fakeSessionOption](&fakeRig{}, nil, cfg)
 	srv.registry.put(sid, sess)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -486,7 +486,7 @@ func TestHandleEventsWriteError(t *testing.T) {
 	sid := parseTestUUID(t, eventsSIDStr)
 	sub := &fakeSubscription{ch: make(chan event.Delivery, 4)}
 	sess := &fakeSession{sub: sub}
-	srv := newServer[*fakeSession](&fakeRig{}, nil, quietConfig())
+	srv := newServer[*fakeSession, fakeSessionOption](&fakeRig{}, nil, quietConfig())
 	srv.registry.put(sid, sess)
 
 	rec := newFlushRecorder()
@@ -513,7 +513,7 @@ func TestHandleEventsClientCancel(t *testing.T) {
 	sid := parseTestUUID(t, eventsSIDStr)
 	sub := &fakeSubscription{ch: make(chan event.Delivery)}
 	sess := &fakeSession{sub: sub}
-	srv := newServer[*fakeSession](&fakeRig{}, nil, newConfig())
+	srv := newServer[*fakeSession, fakeSessionOption](&fakeRig{}, nil, newConfig())
 	srv.registry.put(sid, sess)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -575,7 +575,7 @@ func TestHandleEventsErrors(t *testing.T) {
 			t.Parallel()
 
 			sess := &fakeSession{subErr: tt.subErr}
-			srv := newServer[*fakeSession](&fakeRig{}, nil, newConfig())
+			srv := newServer[*fakeSession, fakeSessionOption](&fakeRig{}, nil, newConfig())
 			if tt.register {
 				srv.registry.put(parseTestUUID(t, eventsSIDStr), sess)
 			}

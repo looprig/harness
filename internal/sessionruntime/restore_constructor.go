@@ -580,14 +580,15 @@ func buildRestoredSession(
 		return nil, &RestoreError{Kind: RestoreJournalFailed, Cause: err}
 	}
 	s := &Session{
-		sessionID:     sessionID,
-		sessionCtx:    sessionCtx,
-		sessionCancel: sessionCancel,
-		loops:         make(map[uuid.UUID]*loopHandle),
-		newID:         newID,
-		now:           now,
-		cmdAppender:   nopCommandAppender{},
-		factory:       factory,
+		sessionID:                sessionID,
+		sessionCtx:               sessionCtx,
+		sessionCancel:            sessionCancel,
+		constructionAbortTimeout: defaultConstructionAbortTimeout,
+		loops:                    make(map[uuid.UUID]*loopHandle),
+		newID:                    newID,
+		now:                      now,
+		cmdAppender:              nopCommandAppender{},
+		factory:                  factory,
 		// Re-seed the cumulative spawn counter from the durable non-root LoopStarted count
 		// so the quota survives restart (§16.3). Set before the session is reachable, so no
 		// lock is needed yet; once up, NewLoop enforces the quota against this restored base.

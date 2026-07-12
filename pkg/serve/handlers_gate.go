@@ -77,7 +77,7 @@ type gateAcceptedResponse struct{}
 // the session's stable GateError kind string (not_found=>404, action_invalid and
 // kind_mismatch=>400, not_ready=>409, capacity=>503, append_failed=>500); any
 // non-GateError is a generic 500. Every error path leaks no internal cause.
-func (s *server[S]) handleGateResponse(w http.ResponseWriter, r *http.Request) {
+func (s *server[S, O]) handleGateResponse(w http.ResponseWriter, r *http.Request) {
 	sid, err := parseSessionID(r.PathValue("sid"))
 	if err != nil {
 		writeErrorCause(w, http.StatusBadRequest, codeInvalidParam, msgInvalidSID, false, err)

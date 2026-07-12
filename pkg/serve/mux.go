@@ -68,7 +68,7 @@ func (b *boundHandler) authInstalled() bool { return b.hasAuth }
 // plane (create/restore/input/interrupt/gate/events) and reads backs the stateless
 // read plane (list/status/journal). All routes are disjoint, so registration order
 // is irrelevant and no pattern conflicts.
-func Handler[S LiveSession](rig Rig[S], reads Reader, opts ...Option) http.Handler {
+func Handler[S LiveSession, O any](rig Rig[S, O], reads Reader, opts ...Option) http.Handler {
 	cfg := newConfig(opts...)
 	srv := newServer(rig, reads, cfg)
 

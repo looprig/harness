@@ -40,7 +40,7 @@ func allEventsFilter() event.EventFilter {
 // stream), then streams each event — both Enduring and Ephemeral classes — as its
 // SSE frame until the client disconnects or the subscription ends. The subscription
 // is always closed on return.
-func (s *server[S]) handleEvents(w http.ResponseWriter, r *http.Request) {
+func (s *server[S, O]) handleEvents(w http.ResponseWriter, r *http.Request) {
 	sid, err := parseSessionID(r.PathValue("sid"))
 	if err != nil {
 		writeErrorCause(w, http.StatusBadRequest, codeInvalidParam, msgInvalidSID, false, err)

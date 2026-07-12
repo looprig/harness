@@ -26,6 +26,12 @@ import (
 
 type idGenerator func() (uuid.UUID, error)
 
+const defaultConstructionAbortTimeout = 5 * time.Second
+
+func withConstructionAbortTimeout(timeout time.Duration) Option {
+	return func(s *Session) { s.constructionAbortTimeout = timeout }
+}
+
 type Session struct {
 	// SessionID is shared by every loop participating in this session.
 	sessionID uuid.UUID
@@ -40,8 +46,9 @@ type Session struct {
 	// sessionCtx is the shared lifetime root for the session; every loop gets a
 	// loopCtx derived from it. sessionCancel is the final backstop, cancelled by
 	// the construction context (today) or future explicit teardown.
-	sessionCtx    context.Context
-	sessionCancel context.CancelFunc
+	sessionCtx               context.Context
+	sessionCancel            context.CancelFunc
+	constructionAbortTimeout time.Duration
 
 	// loopsMu protects loops and primaryLoopID. There is no session goroutine, so
 	// session methods serialize registry access with a normal RWMutex.
@@ -52,7 +59,8 @@ type Session struct {
 	// pairs the loop handle with the provenance of whatever spawned it (zero for
 	// the primary loop). Today this map holds one entry; multi-agent
 	// orchestration adds subagent loops with a non-zero parent.
-	loops map[uuid.UUID]*loopHandle
+	loops        map[uuid.UUID]*loopHandle
+	constructing bool
 
 	// primaryLoopID is the default target for Submit and the gate-answer methods
 	// (and the loop Interrupt/Shutdown fan out across, starting from).
@@ -332,9 +340,20 @@ func (s *Session) abortConstruction(cause error) {
 			handle.cancel()
 		}
 	}
+	abortTimeout := s.constructionAbortTimeout
+	if abortTimeout <= 0 {
+		abortTimeout = defaultConstructionAbortTimeout
+	}
+	abortCtx, cancelAbort := context.WithTimeout(context.Background(), abortTimeout)
+	defer cancelAbort()
 	for _, handle := range loops {
 		if handle.backend != nil && handle.backend.DoneChan() != nil {
-			<-handle.backend.DoneChan()
+			select {
+			case <-handle.backend.DoneChan():
+			case <-abortCtx.Done():
+				// One shared deadline bounds the whole join. Continue hub cleanup; never
+				// start a goroutine merely to wait on an uncooperative backend.
+			}
 		}
 	}
 	if s.hub != nil {
@@ -1111,16 +1130,15 @@ func (s *Session) newLoopWithAdmission(parent loop.Provenance, cfg loop.Definiti
 	if err := publish(s.sessionCtx, ev); err != nil {
 		// Mirror New's cleanup-on-publish-failure: the loop is already registered and
 		// its loopCtx cancel is live, so a bare return would leak a cancel-orphaned
-		// loop. Unregister it, roll back the quota reservation (release()), run its cancel,
-		// join the canceled backend, then surface the typed checked-append error.
+		// loop. Preserve it in the registry while initial construction is active so the
+		// one bounded abort joins it; dynamic failures unregister it immediately.
 		s.loopsMu.Lock()
-		delete(s.loops, loopID)
+		if !s.constructing {
+			delete(s.loops, loopID)
+		}
 		s.loopsMu.Unlock()
 		release()
 		cancel()
-		if b.DoneChan() != nil {
-			<-b.DoneChan()
-		}
 		if admission != nil {
 			_ = admission.sub.Close()
 		}
@@ -1264,12 +1282,14 @@ func newSessionTopology(ctx context.Context, topology Topology, newID idGenerato
 
 	sessionCtx, sessionCancel := context.WithCancel(ctx)
 	s := &Session{
-		sessionID:     id,
-		sessionCtx:    sessionCtx,
-		sessionCancel: sessionCancel,
-		loops:         make(map[uuid.UUID]*loopHandle),
-		newID:         newID,
-		now:           now,
+		sessionID:                id,
+		sessionCtx:               sessionCtx,
+		sessionCancel:            sessionCancel,
+		constructionAbortTimeout: defaultConstructionAbortTimeout,
+		loops:                    make(map[uuid.UUID]*loopHandle),
+		constructing:             true,
+		newID:                    newID,
+		now:                      now,
 		// Audit-only intent-log appender: nop by default (no-persistence/headless mode).
 		// The composition root (Phase 10) overrides it via WithCommandAppender below.
 		cmdAppender: nopCommandAppender{},
@@ -1414,6 +1434,9 @@ func newSessionTopology(ctx context.Context, topology Topology, newID idGenerato
 			s.primaryLoopID = loopID
 		}
 	}
+	s.loopsMu.Lock()
+	s.constructing = false
+	s.loopsMu.Unlock()
 	return s, nil
 }
 
