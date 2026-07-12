@@ -89,7 +89,7 @@ func findForeignSID(events []event.Event) string {
 // cumulative spawn counter: the live counter increments only on a successful NewLoop spawn
 // (a rejected or rolled-back spawn emits NO LoopStarted, §6d), so counting the durable
 // non-root LoopStarted events reproduces exactly the live `spawned` value at crash time.
-// The ROOT LoopStarted (the primary, Cause zero) is excluded — the primary never counts
+// The root LoopStarted (Cause zero) is excluded — the initial loop never counts
 // toward the quota — using the SAME root/non-root discriminator findRootLoopStarted and the
 // live NewLoop counter use, so the restored quota matches the live one and a restart cannot
 // grant a fresh budget.

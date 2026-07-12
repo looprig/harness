@@ -197,7 +197,7 @@ func restoreTopologySession(
 	// (2) Replay the whole stream once for discovery (the persisted fingerprint + the
 	// root loop id + the subagent spawn count) and gate recovery. A ZERO LoopID leaves
 	// the event projection UNNARROWED — every loop's events — so findRootLoopStarted and
-	// countSpawnedLoops see the subagent LoopStarted events, not just the primary's. Fail
+	// countSpawnedLoops see the subagent LoopStarted events, not just the root's. Fail
 	// closed on any error.
 	allRecords, err := drainRecordReplay(ctx, replayer, journal.ReplayRequest{Follow: false})
 	if err != nil {
@@ -293,11 +293,11 @@ func restoreTopologySession(
 	}
 
 	// Every loop was independently folded from its loop-scoped projection above.
-	primaryEvents := activePlan.events
+	rootEvents := activePlan.events
 	folded := activePlan.folded
 	// Fold the root loop's mode + direct inference changes so it resumes under the
 	// effective config it crashed under (last write wins, live precedence).
-	activeInference := foldLoopInference(primaryEvents)
+	activeInference := foldLoopInference(rootEvents)
 
 	// (6) Crash-seam: an open turn (a TurnStarted with no terminal) is closed durably
 	// with a TurnInterrupted carrying the open turn's id + index, so the resumed loop
@@ -370,7 +370,7 @@ func restoreTopologySession(
 	// Recover the foreign session id from the root loop's events. Prebound adapters
 	// stamped it on LoopStarted; late-bound adapters record it with ForeignSessionBound.
 	// buildRestoredSession fails closed on an empty sid for a foreign engine.
-	foreignSID := findForeignSID(primaryEvents)
+	foreignSID := findForeignSID(rootEvents)
 	s, err := buildRestoredSession(sessionCtx, sessionCancel, bound, sessionID, rootLoopID, foreignSID, spawnedCount, ceilingLevel, hasCeiling, folded, activeInference, restoredGates.open, j, factory, newID, now, leaseOpts...)
 	if err != nil {
 		if constructionCleanupOwned(err) {
@@ -384,8 +384,8 @@ func restoreTopologySession(
 	s.topology = cloneTopology(topology)
 	s.delegation = manager
 	manager.attach(s)
-	// (7) Post-build wiring: register every non-primary restored loop, resolve + validate the
-	// durable active selection, and set it as the session primary. Any failure cancels the
+	// (7) Post-build wiring: register every non-root restored loop, resolve + validate the
+	// durable active selection, and install it as the session's active loop. Any failure cancels the
 	// session context (tearing down the seeded loops) before recording a RestoreErrored.
 	if err := attachAndActivate(s, all, plans, rootLoopID); err != nil {
 		return abortAccepted(s, err)
@@ -538,9 +538,9 @@ func planLoops(sessionCtx context.Context, sessionID uuid.UUID, topology Topolog
 	return plans, plans[activeIndex], nil
 }
 
-// attachAndActivate registers every non-primary restored loop, resolves the durable active
-// selection (the last ActiveLoopChanged, else the primary), validates it is registered, and
-// sets it as the session's primary under loopsMu — the post-build wiring performed after the
+// attachAndActivate registers every non-root restored loop, resolves the durable active
+// selection (the last ActiveLoopChanged, else the initially active root), validates it is
+// registered, and sets it as the session's active loop under loopsMu — the post-build wiring performed after the
 // root loop is seeded and before RestoreDone. It returns a typed *RestoreError on any
 // failure (an attach failure, an unregistered active target, or a latched persistence
 // fault); the caller cancels the session context and records a RestoreErrored. On success
@@ -684,7 +684,7 @@ func buildRestoredSession(
 	// loopruntime.NewRestored; a foreign engine reconstructs through the injected RestoredBuilder,
 	// carrying the recovered foreign session id. It fails CLOSED on an empty recovered sid
 	// (the foreign session could not be --resumed) or a missing builder (never silently
-	// rebuild the primary as a native loop). Every error path cancels the loopCtx and the
+	// rebuild the root as a native loop). Every error path cancels the loopCtx and the
 	// session backstop, exactly like the native path.
 	loopCtx, cancel := context.WithCancel(sessionCtx)
 	var l loop.Backend
@@ -756,8 +756,8 @@ func withRestoreHeader(ev event.Event, hdr event.Header) event.Event {
 	}
 }
 
-// openTurnCoords returns the TurnID + TurnIndex of the LAST TurnStarted in the primary
-// loop's events — the open (unterminated) turn when foldLoop reports OpenTurn.
+// openTurnCoords returns the TurnID + TurnIndex of the last TurnStarted in one loop's
+// events — the open (unterminated) turn when foldLoop reports OpenTurn.
 // The crash-seam TurnInterrupted is stamped with these so it closes the exact turn that
 // crashed. It is only called when the fold detected an open turn, so a last TurnStarted
 // always exists; the zero return is the defensive fall-through.
