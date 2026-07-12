@@ -1453,10 +1453,11 @@ func runLoop(cfg loopConfig, state loopState) {
 				} else if state.status == loopWaitingAdmission && state.cancelAdmission != nil {
 					// This loop is idle with accepted work waiting on session admission.
 					// Keep the existing cancellable waiter: loop-scoped admission rechecks
-					// every interrupt ref generation before returning. A second interrupt
-					// therefore adds a hold without destroying retained human input.
+					// every retained interrupt ref before returning. Ack false because no
+					// current turn was canceled; fan-out keeps this scope's provisional ref
+					// only when another target genuinely acknowledges cancellation.
 					retainUserQueuedInbox(uuid.UUID{})
-					c.Ack <- true
+					c.Ack <- false
 				} else {
 					c.Ack <- false
 				}

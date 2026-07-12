@@ -15,6 +15,8 @@ import (
 	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/harness/pkg/tool"
+	"github.com/looprig/harness/pkg/workspacestore"
+	"github.com/looprig/storage/memstore"
 )
 
 // interrupt_test.go proves the Task 11 hierarchical-interruption + queue-policy
@@ -1011,9 +1013,8 @@ func TestInterruptOverlappingActorBarrierRetainsUserInput(t *testing.T) {
 			}
 			<-aLLM.started
 			<-bLLM.started
-			any, err := s.Interrupt(context.Background())
-			if err != nil || !any {
-				t.Fatalf("first Interrupt = %v, %v", any, err)
+			if err := s.interruptSubtree(context.Background(), aID); err != nil {
+				t.Fatalf("first targeted interrupt: %v", err)
 			}
 			userID, err := s.SubmitToLoop(context.Background(), aID, []content.Block{&content.TextBlock{Text: "retain twice"}})
 			if err != nil {
@@ -1037,8 +1038,20 @@ func TestInterruptOverlappingActorBarrierRetainsUserInput(t *testing.T) {
 				default:
 				}
 			}
-			if err := s.interruptSubtree(context.Background(), aID); err != nil {
-				t.Fatal(err)
+			any, err := s.Interrupt(context.Background())
+			if err != nil || !any {
+				t.Fatalf("second session Interrupt = %v, %v; B must be the genuine active target", any, err)
+			}
+			s.loopsMu.RLock()
+			aRefs := s.interruptPending[aID]
+			s.loopsMu.RUnlock()
+			if aRefs != 2 {
+				t.Fatalf("A interrupt refs before global idle = %d, want targeted+session refs", aRefs)
+			}
+			for _, ev := range recorder.snapshot() {
+				if candidate, ok := ev.(event.TurnStarted); ok && candidate.Cause.CommandID == userID {
+					t.Fatal("retained input started before genuine active target B reached idle")
+				}
 			}
 			close(bLLM.release)
 			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
@@ -1077,6 +1090,108 @@ func TestInterruptOverlappingActorBarrierRetainsUserInput(t *testing.T) {
 			}
 			if starts != 1 || cancels != 0 {
 				t.Fatalf("retained input starts/cancels = %d/%d, want 1/0", starts, cancels)
+			}
+		})
+	}
+}
+
+func TestInterruptWaitingAdmissionWithoutCurrentTurnIsNoop(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+	}{
+		{name: "manual checkpoint writer parks user but interrupt cancels no turn"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			blobs := &blockingBoundaryBlobs{Blobs: memstore.New().Blobs, entered: make(chan struct{}), release: make(chan struct{})}
+			ws, err := workspacestore.Open(blobs)
+			if err != nil {
+				t.Fatal(err)
+			}
+			recorder := &recordingEventAppender{}
+			s, err := newTestSession(context.Background(), cfg(&stubLLM{chunks: []content.Chunk{textChunk("done")}}),
+				WithEventAppender(recorder),
+				withResolvedPlacement(&resolvedPlacement{mode: PlacementSession, store: ws, root: t.TempDir(), coordinator: newWorkspaceCoordinator(nil)}),
+				WithSnapshotPolicy(SnapshotPolicy{Trigger: SnapshotManual, Priority: SnapshotRequired, Timeout: time.Second}),
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = s.Shutdown(context.Background()) })
+			checkpointDone := make(chan error, 1)
+			go func() {
+				_, checkpointErr := s.CheckpointWorkspace(context.Background())
+				checkpointDone <- checkpointErr
+			}()
+			select {
+			case <-blobs.entered:
+			case <-time.After(time.Second):
+				t.Fatal("manual checkpoint did not hold writer admission")
+			}
+			inputID, err := s.Submit(context.Background(), []content.Block{&content.TextBlock{Text: "park"}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			machineID, err := s.submitToLoop(context.Background(), s.PrimaryLoopID(), []content.Block{&content.TextBlock{Text: "flush"}}, identity.AgencyMachine, true)
+			if err != nil {
+				t.Fatal(err)
+			}
+			any, err := s.Interrupt(context.Background())
+			if err != nil || any {
+				t.Fatalf("Interrupt while no turn exists = %v, %v; want false, nil", any, err)
+			}
+			s.loopsMu.RLock()
+			refs := s.interruptPending[s.PrimaryLoopID()]
+			s.loopsMu.RUnlock()
+			s.checkpoints.mu.Lock()
+			sweeps := len(s.checkpoints.interruptSweeps) + len(s.checkpoints.interruptDeferred)
+			s.checkpoints.mu.Unlock()
+			if refs != 0 || sweeps != 0 {
+				t.Fatalf("no-op interrupt leaked refs/sweeps = %d/%d", refs, sweeps)
+			}
+			close(blobs.release)
+			if err := <-checkpointDone; err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			for {
+				started := false
+				for _, ev := range recorder.snapshot() {
+					if candidate, ok := ev.(event.TurnStarted); ok && candidate.Cause.CommandID == inputID {
+						started = true
+					}
+					if candidate, ok := ev.(event.InputCancelled); ok {
+						if candidate.Cause.CommandID == inputID {
+							t.Fatal("parked user input was canceled by no-op interrupt")
+						}
+					}
+				}
+				if started {
+					break
+				}
+				select {
+				case <-ctx.Done():
+					t.Fatal("parked user input did not start after checkpoint release")
+				default:
+				}
+			}
+			if err := s.WaitIdle(ctx); err != nil {
+				t.Fatal(err)
+			}
+			starts, machineCancels := 0, 0
+			for _, ev := range recorder.snapshot() {
+				if candidate, ok := ev.(event.TurnStarted); ok && candidate.Cause.CommandID == inputID {
+					starts++
+				}
+				if candidate, ok := ev.(event.InputCancelled); ok && candidate.Cause.CommandID == machineID {
+					machineCancels++
+				}
+			}
+			if starts != 1 || machineCancels != 1 {
+				t.Fatalf("parked user starts/machine cancels = %d/%d, want 1/1", starts, machineCancels)
 			}
 		})
 	}
