@@ -1351,6 +1351,15 @@ func TestDelegateQueuedRequestRestoresInterruptedWithoutReplay(t *testing.T) {
 	}
 	sid := s.SessionID()
 	s.sessionCancel() // crash: no graceful queue flush or shutdown command
+	// A real crash kills the process, so no predecessor writer survives to race the
+	// successor; graceful Shutdown likewise awaits every loop actor before releasing the
+	// lease. This in-process crash sim must do the same: wait for the cancelled loop actors
+	// to fully unwind (their teardown terminal/InputCancelled appends land under the still-held
+	// lease) BEFORE releasing it and restoring, so no live predecessor append races restore's
+	// opening LeaseFence on the shared stream. Without this barrier the sim models a scenario
+	// (successor restoring while a predecessor actor still writes) that neither a real crash nor
+	// a graceful handoff ever produces.
+	waitLoopsExited(t, s)
 	s.releaseLease(context.Background())
 	_ = obs.Close()
 
@@ -1373,6 +1382,29 @@ func TestDelegateQueuedRequestRestoresInterruptedWithoutReplay(t *testing.T) {
 	}
 	if status.Status != tool.DelegateStatusIdle {
 		t.Fatalf("restored child status = %v, want idle (B not replayed)", status.Status)
+	}
+}
+
+// waitLoopsExited blocks until every registered loop actor of s has fully unwound (its
+// backend DoneChan closed). The loop actor publishes its cancel-path terminal and returns
+// its queued inbox BEFORE close(cfg.done), so once DoneChan is closed no further
+// loop-actor append can land. It is the deterministic (sleep-free) barrier a crash
+// simulation needs so the predecessor's writers are quiesced before a successor restore
+// acquires the shared stream.
+func waitLoopsExited(t *testing.T, s *Session) {
+	t.Helper()
+	s.loopsMu.RLock()
+	dones := make([]<-chan struct{}, 0, len(s.loops))
+	for _, h := range s.loops {
+		dones = append(dones, h.backend.DoneChan())
+	}
+	s.loopsMu.RUnlock()
+	for _, done := range dones {
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Fatal("loop actor did not exit after crash cancel")
+		}
 	}
 }
 

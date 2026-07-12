@@ -1242,6 +1242,19 @@ func (s *Session) interruptLoopID(loopID uuid.UUID) error {
 // managed request. The actor decides queued/active/terminal without a session-side
 // TOCTOU and never affects a different request on the same loop.
 func (s *Session) cancelDelegateRequest(loopID, requestID uuid.UUID) (command.DelegateCancelResult, error) {
+	// Refuse the cancel BEFORE its durable intent-log append once the session context is
+	// cancelled (teardown/crash). A wait:false request's background drain runs on
+	// s.sessionCtx and fires this cancel from drainCorrelated's ctx.Done() branch — i.e.
+	// exactly when the session is going away. At that point there is nothing to cancel (the
+	// loop is being torn down and no waiter will collect the request; restore classifies the
+	// never-terminated request as Interrupted from the durable log without this record), and
+	// appendCommand would otherwise write a late CancelDelegateRequest to a journal whose
+	// single-writer lease is being released — racing a successor's opening LeaseFence and
+	// spuriously failing its append. Fail closed here (SessionContextDone) so the append
+	// never escapes teardown; callers already ignore this cancel's error.
+	if err := s.sessionCtx.Err(); err != nil {
+		return command.DelegateCancelNoop, &SessionError{Kind: SessionContextDone, Cause: err}
+	}
 	l, ok := s.loopFor(loopID)
 	if !ok {
 		return command.DelegateCancelNoop, &SessionError{Kind: SessionLoopNotFound}
