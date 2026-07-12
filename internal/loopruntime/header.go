@@ -34,6 +34,9 @@ func stampLoopHeader(ev event.Event, sessionID, loopID, turnID uuid.UUID) event.
 	case event.PermissionRequested:
 		e.Header = fillTurnScoped(e.Header, sessionID, loopID, turnID)
 		return e
+	case event.PermissionDecided:
+		e.Header = fillTurnScoped(e.Header, sessionID, loopID, turnID)
+		return e
 	case event.UserInputRequested:
 		e.Header = fillTurnScoped(e.Header, sessionID, loopID, turnID)
 		return e
@@ -137,6 +140,9 @@ func withLoopHeader(ev event.Event, h event.Header) event.Event {
 	case event.PermissionRequested:
 		e.Header = h
 		return e
+	case event.PermissionDecided:
+		e.Header = h
+		return e
 	case event.UserInputRequested:
 		e.Header = h
 		return e
@@ -173,6 +179,9 @@ func fillLoopScoped(h event.Header, sessionID, loopID uuid.UUID) event.Header {
 func stampStepID(ev event.Event, stepID uuid.UUID) event.Event {
 	switch e := ev.(type) {
 	case event.PermissionRequested:
+		e.StepID = stepID
+		return e
+	case event.PermissionDecided:
 		e.StepID = stepID
 		return e
 	case event.UserInputRequested:

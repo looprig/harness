@@ -10,7 +10,7 @@ import (
 )
 
 // TestWithLoopHeaderStampsEveryEnduringType is the EXHAUSTIVE guard on
-// withLoopHeader: it runs ONE instance of each of the 13 Enduring loop-scoped
+// withLoopHeader: it runs ONE instance of each Enduring loop-scoped
 // event types through withLoopHeader(ev, h) with a known non-zero h and asserts
 // the write-back actually took — EventID + CreatedAt (the minted persistence
 // identity) AND the Coordinates/Cause carried by h all land on the returned
@@ -60,12 +60,13 @@ func TestWithLoopHeaderStampsEveryEnduringType(t *testing.T) {
 		{name: "TurnFailed", in: event.TurnFailed{}},
 		{name: "TurnInterrupted", in: event.TurnInterrupted{}},
 		{name: "PermissionRequested", in: event.PermissionRequested{}},
+		{name: "PermissionDecided", in: event.PermissionDecided{}},
 		{name: "UserInputRequested", in: event.UserInputRequested{}},
 	}
 
 	// Guard the count so adding a 14th Enduring loop event without extending this
 	// table is itself a failure (the test must enumerate every type).
-	const wantEnduringLoopTypes = 13
+	const wantEnduringLoopTypes = 14
 	if len(tests) != wantEnduringLoopTypes {
 		t.Fatalf("table has %d types, want %d Enduring loop-scoped event types", len(tests), wantEnduringLoopTypes)
 	}
@@ -227,6 +228,11 @@ func TestStampStepID(t *testing.T) {
 		{
 			name:        "PermissionRequested is stamped",
 			in:          event.PermissionRequested{ToolExecutionID: callID},
+			wantStamped: true,
+		},
+		{
+			name:        "PermissionDecided is stamped",
+			in:          event.PermissionDecided{ToolExecutionID: callID},
 			wantStamped: true,
 		},
 		{
