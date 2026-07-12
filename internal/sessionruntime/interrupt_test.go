@@ -878,3 +878,206 @@ func TestInterruptExecutionAdmissionHonorsEveryOverlappingRef(t *testing.T) {
 		})
 	}
 }
+
+func TestInterruptRetainsActiveTargetUserInputAndFlushesMachineInput(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+	}{
+		{name: "post-ack pre-terminal queue keeps user and cancels machine"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			llm := &releasedFailureLLM{started: make(chan struct{}), release: make(chan struct{}), err: context.Canceled}
+			ws, root := checkpointFixture(t, nil)
+			recorder := &recordingEventAppender{}
+			s, err := newTestSession(context.Background(), cfg(llm),
+				WithEventAppender(recorder),
+				withResolvedPlacement(&resolvedPlacement{mode: PlacementSession, store: ws, root: root, coordinator: newWorkspaceCoordinator(nil)}),
+				WithSnapshotPolicy(SnapshotPolicy{Trigger: SnapshotManual, Priority: SnapshotBestEffort, Timeout: time.Second}),
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = s.Shutdown(context.Background()) })
+			if _, err := s.Submit(context.Background(), nil); err != nil {
+				t.Fatal(err)
+			}
+			<-llm.started
+			any, err := s.Interrupt(context.Background())
+			if err != nil || !any {
+				t.Fatalf("Interrupt = %v, %v", any, err)
+			}
+			userID, err := s.Submit(context.Background(), []content.Block{&content.TextBlock{Text: "keep"}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			machineID, err := s.submitToLoop(context.Background(), s.PrimaryLoopID(), []content.Block{&content.TextBlock{Text: "flush"}}, identity.AgencyMachine, true)
+			if err != nil {
+				t.Fatal(err)
+			}
+			close(llm.release)
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			for {
+				started := false
+				for _, ev := range recorder.snapshot() {
+					if candidate, ok := ev.(event.TurnStarted); ok && candidate.Cause.CommandID == userID {
+						started = true
+					}
+				}
+				if started {
+					break
+				}
+				select {
+				case <-ctx.Done():
+					t.Fatal("retained user input did not start after interrupt barrier")
+				default:
+				}
+			}
+			if err := s.WaitIdle(ctx); err != nil {
+				t.Fatal(err)
+			}
+			events := recorder.snapshot()
+			userStarts, userCancels, machineCancels := 0, 0, 0
+			idleAt, userStartAt := -1, -1
+			for i, ev := range events {
+				switch candidate := ev.(type) {
+				case event.SessionIdle:
+					if idleAt < 0 {
+						idleAt = i
+					}
+				case event.TurnStarted:
+					if candidate.Cause.CommandID == userID {
+						userStarts++
+						userStartAt = i
+					}
+				case event.InputCancelled:
+					switch candidate.Cause.CommandID {
+					case userID:
+						userCancels++
+					case machineID:
+						machineCancels++
+					}
+				}
+			}
+			if userStarts != 1 || userCancels != 0 || machineCancels != 1 {
+				t.Fatalf("user starts/cancels, machine cancels = %d/%d, %d; want 1/0, 1", userStarts, userCancels, machineCancels)
+			}
+			if idleAt < 0 || userStartAt <= idleAt {
+				t.Fatalf("SessionIdle/user TurnStarted order = %d/%d", idleAt, userStartAt)
+			}
+		})
+	}
+}
+
+func TestInterruptOverlappingActorBarrierRetainsUserInput(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+	}{
+		{name: "second interrupt while waiting admission preserves inbox until both refs release"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			ws, root := checkpointFixture(t, nil)
+			recorder := &recordingEventAppender{}
+			s, err := newTestSession(context.Background(), cfg(&stubLLM{chunks: []content.Chunk{textChunk("primary")}}),
+				WithEventAppender(recorder),
+				withResolvedPlacement(&resolvedPlacement{mode: PlacementSession, store: ws, root: root, coordinator: newWorkspaceCoordinator(nil)}),
+				WithSnapshotPolicy(SnapshotPolicy{Trigger: SnapshotManual, Priority: SnapshotBestEffort, Timeout: time.Second}),
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = s.Shutdown(context.Background()) })
+			aLLM := &releasedFailureLLM{started: make(chan struct{}), release: make(chan struct{}), err: context.Canceled}
+			bLLM := &releasedFailureLLM{started: make(chan struct{}), release: make(chan struct{}), err: context.Canceled}
+			aID, err := s.NewLoop(loop.Provenance{}, cfg(aLLM))
+			if err != nil {
+				t.Fatal(err)
+			}
+			bID, err := s.NewLoop(loop.Provenance{}, cfg(bLLM))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := s.SubmitToLoop(context.Background(), aID, nil); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := s.SubmitToLoop(context.Background(), bID, nil); err != nil {
+				t.Fatal(err)
+			}
+			<-aLLM.started
+			<-bLLM.started
+			any, err := s.Interrupt(context.Background())
+			if err != nil || !any {
+				t.Fatalf("first Interrupt = %v, %v", any, err)
+			}
+			userID, err := s.SubmitToLoop(context.Background(), aID, []content.Block{&content.TextBlock{Text: "retain twice"}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			close(aLLM.release)
+			deadline := time.After(time.Second)
+			for {
+				idle := false
+				for _, ev := range recorder.snapshot() {
+					if candidate, ok := ev.(event.LoopIdle); ok && candidate.Coordinates.LoopID == aID {
+						idle = true
+					}
+				}
+				if idle {
+					break
+				}
+				select {
+				case <-deadline:
+					t.Fatal("loop A did not reach interrupted idle")
+				default:
+				}
+			}
+			if err := s.interruptSubtree(context.Background(), aID); err != nil {
+				t.Fatal(err)
+			}
+			close(bLLM.release)
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			for {
+				started := false
+				for _, ev := range recorder.snapshot() {
+					if candidate, ok := ev.(event.TurnStarted); ok && candidate.Cause.CommandID == userID {
+						started = true
+					}
+				}
+				if started {
+					break
+				}
+				select {
+				case <-ctx.Done():
+					t.Fatal("twice-retained user input did not start")
+				default:
+				}
+			}
+			if err := s.WaitIdle(ctx); err != nil {
+				t.Fatal(err)
+			}
+			starts, cancels := 0, 0
+			for _, ev := range recorder.snapshot() {
+				switch candidate := ev.(type) {
+				case event.TurnStarted:
+					if candidate.Cause.CommandID == userID {
+						starts++
+					}
+				case event.InputCancelled:
+					if candidate.Cause.CommandID == userID {
+						cancels++
+					}
+				}
+			}
+			if starts != 1 || cancels != 0 {
+				t.Fatalf("retained input starts/cancels = %d/%d, want 1/0", starts, cancels)
+			}
+		})
+	}
+}

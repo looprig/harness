@@ -1016,6 +1016,28 @@ func runLoop(cfg loopConfig, state loopState) {
 		state.inbox = nil
 	}
 
+	// retainUserQueuedInbox is the ordinary-interrupt disposition: human input
+	// remains accepted in FIFO order, while machine-created continuation/delegate
+	// entries are explicitly canceled. Draining entries precede inbox entries because
+	// they were accepted earlier. Shutdown, hard kill, failure, and explicit targeted
+	// cancellation continue to use their existing full disposition paths.
+	retainUserQueuedInbox := func(endedTurnID uuid.UUID) {
+		retained := make([]queuedInput, 0, len(state.draining)+len(state.inbox))
+		partition := func(entries []queuedInput) {
+			for _, qi := range entries {
+				if qi.agency == identity.AgencyUser {
+					retained = append(retained, qi)
+					continue
+				}
+				returnEntry(qi, event.CancelTurnInterrupted, endedTurnID)
+			}
+		}
+		partition(state.draining)
+		partition(state.inbox)
+		state.draining = nil
+		state.inbox = retained
+	}
+
 	// popFront removes and returns the first queued entry, the single place the
 	// inbox-front splice lives. The bool is false when the inbox is empty.
 	//
@@ -1176,8 +1198,8 @@ func runLoop(cfg loopConfig, state loopState) {
 	// ended, and reports whether the actor immediately chained into a new turn
 	// (running -> running). On a normal terminal (TurnDone) it pops the FIRST queued
 	// entry and starts a later turn (no input stranded); the rest stay queued. On an
-	// abnormal terminal (TurnFailed/TurnInterrupted) it returns EVERY queued entry via
-	// InputCancelled and auto-starts nothing — the client decides whether to resend.
+	// TurnFailed returns every queued entry. Ordinary TurnInterrupted is handled below:
+	// human entries remain queued while machine entries are canceled.
 	// endedTurnID is the turn that ended (the cause of any return). chained==true means
 	// the loop stayed running, so the caller must NOT emit LoopIdle between the turns.
 	startNextQueued := func(endedTurnID uuid.UUID) (chained bool) {
@@ -1243,6 +1265,15 @@ func runLoop(cfg loopConfig, state loopState) {
 			if !startNextQueued(endedTurnID) {
 				emitLoopIdle()
 			}
+			return false
+		}
+		if _, interrupted := result.terminal.(event.TurnInterrupted); interrupted {
+			retainUserQueuedInbox(endedTurnID)
+			// Commit the native idle edge before retained work asks for admission.
+			// SessionIdle can therefore resolve the interrupt sweep, after which
+			// requestStartAdmission begins the retained input exactly once.
+			emitLoopIdle()
+			requestStartAdmission()
 			return false
 		}
 		// Running -> idle transition: announce LoopIdle (Enduring, non-terminal) AFTER
@@ -1416,15 +1447,15 @@ func runLoop(cfg loopConfig, state loopState) {
 					// A targeted cancellation already cancelled this exact active turn,
 					// but its terminal has not reached the actor yet. An ordinary interrupt
 					// broadens the disposition: acknowledge it and clear the targeted-only
-					// continuation so the terminal returns/flushed queued input normally.
+					// continuation so the terminal uses the ordinary interrupt queue policy.
 					requestCancelActive = false
 					c.Ack <- true
 				} else if state.status == loopWaitingAdmission && state.cancelAdmission != nil {
-					state.cancelAdmission()
-					state.cancelAdmission = nil
-					state.status = loopIdle
-					returnQueuedInbox(event.CancelTurnInterrupted, uuid.UUID{})
-					emitLoopIdle()
+					// This loop is idle with accepted work waiting on session admission.
+					// Keep the existing cancellable waiter: loop-scoped admission rechecks
+					// every interrupt ref generation before returning. A second interrupt
+					// therefore adds a hold without destroying retained human input.
+					retainUserQueuedInbox(uuid.UUID{})
 					c.Ack <- true
 				} else {
 					c.Ack <- false

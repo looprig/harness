@@ -536,28 +536,43 @@ func (s *Session) SessionActivated() {
 // interrupt admission seam.
 func (s *Session) EnterExecution(ctx context.Context, loopID uuid.UUID) (func(), error) {
 	for {
-		s.loopsMu.Lock()
-		if s.interruptPending[loopID] == 0 {
+		for {
+			s.loopsMu.Lock()
+			if s.interruptPending[loopID] == 0 {
+				s.loopsMu.Unlock()
+				break
+			}
+			if s.interruptChanged == nil {
+				s.interruptChanged = make(chan struct{})
+			}
+			changed := s.interruptChanged
 			s.loopsMu.Unlock()
-			break
+			select {
+			case <-changed:
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-s.sessionCtx.Done():
+				return nil, s.sessionCtx.Err()
+			}
 		}
-		if s.interruptChanged == nil {
-			s.interruptChanged = make(chan struct{})
+		if s.checkpointAdmission == nil {
+			return func() {}, nil
 		}
-		changed := s.interruptChanged
-		s.loopsMu.Unlock()
-		select {
-		case <-changed:
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case <-s.sessionCtx.Done():
-			return nil, s.sessionCtx.Err()
+		release, err := s.checkpointAdmission.enterExecution(ctx)
+		if err != nil {
+			return nil, err
 		}
+		// Close the interrupt mark/checkpoint-acquire race: a sweep may mark
+		// this loop while it waited for the checkpoint reader permit. In that
+		// case release and retry instead of returning an admission that can start.
+		s.loopsMu.RLock()
+		pending := s.interruptPending[loopID] > 0
+		s.loopsMu.RUnlock()
+		if !pending {
+			return release, nil
+		}
+		release()
 	}
-	if s.checkpointAdmission == nil {
-		return func() {}, nil
-	}
-	return s.checkpointAdmission.enterExecution(ctx)
 }
 
 func (s *Session) recordLoopMechanicalState(ev event.Event) {
