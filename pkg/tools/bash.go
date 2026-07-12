@@ -91,6 +91,8 @@ type bashArgs struct {
 type BashTool struct {
 	root    string
 	runner  tool.CommandRunner
+	coord   tool.WorkspaceCoordinator
+	obs     tool.WorkspaceObservations
 	initErr error
 }
 
@@ -102,6 +104,29 @@ type BashOption func(*BashTool)
 // (the default) preserves the exact bare-harness direct-execution behavior.
 func WithRunner(r tool.CommandRunner) BashOption {
 	return func(b *BashTool) { b.runner = r }
+}
+
+// WithWorkspaceCoordinator binds the session workspace coordinator so a command run
+// holds the EXCLUSIVE whole-workspace mutation permit (design §"File-tool optimistic
+// concurrency and binding"). A nil or typed-nil coordinator is ignored (the tool runs
+// coordinator-free — the standalone/bare path).
+func WithWorkspaceCoordinator(coord tool.WorkspaceCoordinator) BashOption {
+	return func(b *BashTool) {
+		if !nilInterface(coord) {
+			b.coord = coord
+		}
+	}
+}
+
+// WithObservations binds the loop's shared file-observation set so a command run
+// invalidates it wholesale afterward (the changed paths are unknowable). A nil or
+// typed-nil set is ignored (no invalidation).
+func WithObservations(obs tool.WorkspaceObservations) BashOption {
+	return func(b *BashTool) {
+		if !nilInterface(obs) {
+			b.obs = obs
+		}
+	}
 }
 
 // NewBash constructs a BashTool bound to the workspace root. With no options, or
@@ -116,6 +141,8 @@ func NewBash(root string, opts ...BashOption) *BashTool {
 
 type bashConfig struct {
 	runner tool.CommandRunner
+	coord  tool.WorkspaceCoordinator
+	obs    tool.WorkspaceObservations
 }
 
 func resolveBashOptions(opts []BashOption) (bashConfig, error) {
@@ -129,11 +156,11 @@ func resolveBashOptions(opts []BashOption) (bashConfig, error) {
 	if resolved.runner != nil && nilInterface(resolved.runner) {
 		return bashConfig{}, &DefinitionBuildError{Definition: bashToolName, Dependency: "runner"}
 	}
-	return bashConfig{runner: resolved.runner}, nil
+	return bashConfig{runner: resolved.runner, coord: resolved.coord, obs: resolved.obs}, nil
 }
 
 func newBash(root string, config bashConfig) *BashTool {
-	return &BashTool{root: root, runner: config.runner}
+	return &BashTool{root: root, runner: config.runner, coord: config.coord, obs: config.obs}
 }
 
 // Info returns Bash's self-description. Name MUST equal "Bash".
@@ -288,6 +315,23 @@ func (b *BashTool) InvokableRun(ctx context.Context, argsJSON string) (*tool.Too
 		return tool.TextResult("error: workdir is outside the workspace: " + a.Workdir), nil
 	}
 
+	// Take the EXCLUSIVE whole-workspace mutation permit for the run: Bash may change
+	// unknowable paths, so while it runs it excludes ALL structured path mutations and
+	// every other whole/checkpoint permit session-wide. Acquire on the OUTER ctx (not
+	// the command-timeout ctx below) so a slow command's timeout can't cancel an
+	// already-held permit; a ctx-canceled acquire returns WITHOUT running. A nil
+	// coordinator (bare path) yields a no-op permit.
+	permit, err := b.acquireWhole(ctx)
+	if err != nil {
+		return tool.TextResult("error: " + err.Error()), nil
+	}
+	defer permit.Release()
+	// Whichever way the run ends (success, non-zero exit, timeout, or start error) the
+	// loop's ENTIRE file-observation set is invalidated, because the changed paths are
+	// unknowable — Bash gains no file-level compare-and-swap. This defer fires only
+	// once the command has been attempted (after a successful acquire).
+	defer b.invalidateObservations()
+
 	// Gather escalation grants from BOTH sources: the tool's own args and any the
 	// runner placed on ctx after a pre-ask approval (union, dedup, order-stable).
 	// The tokens stay OPAQUE — harness only carries them to a GrantedRunner.
@@ -331,6 +375,25 @@ func (b *BashTool) InvokableRun(ctx context.Context, argsJSON string) (*tool.Too
 		return tool.TextResult("error: could not run command: " + runErr.Error()), nil
 	}
 	return tool.TextResult(formatBashResult(out, exitCode)), nil
+}
+
+// acquireWhole takes the exclusive whole-workspace mutation permit for a command run.
+// A nil coordinator (the bare/standalone path) yields a no-op permit so InvokableRun
+// runs the command coordinator-free. ctx is the OUTER per-call ctx; a canceled acquire
+// returns the coordinator's typed error and no permit.
+func (b *BashTool) acquireWhole(ctx context.Context) (tool.WorkspacePermit, error) {
+	if nilInterface(b.coord) {
+		return noPermit{}, nil
+	}
+	return b.coord.Acquire(ctx, tool.WorkspaceOperationWholeMutation, "")
+}
+
+// invalidateObservations drops the loop's entire file-observation set after a Bash
+// run (a no-op when no observation set is bound).
+func (b *BashTool) invalidateObservations() {
+	if !nilInterface(b.obs) {
+		b.obs.InvalidateAll()
+	}
 }
 
 // clampBashTimeout maps a caller-supplied timeout (seconds) into a bounded

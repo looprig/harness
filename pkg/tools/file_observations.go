@@ -3,6 +3,8 @@ package tools
 import (
 	"crypto/sha256"
 	"sync"
+
+	"github.com/looprig/harness/pkg/tool"
 )
 
 // file_observations.go implements the per-loop file-observation map that backs the
@@ -125,6 +127,36 @@ func (o *fileObservations) invalidate(key canonicalObservationKey) {
 	st.mu.Lock()
 	defer st.mu.Unlock()
 	st.clearLocked()
+}
+
+// InvalidateAll drops EVERY recorded observation for the loop. It is the narrow
+// tool.WorkspaceObservations capability the loop's Bash tool calls after an opaque
+// whole-workspace mutation, whose changed paths are unknowable. It snapshots the
+// per-path records under the map mutex, then clears each under that record's own
+// mutex — never holding the map mutex across a per-path lock, so it preserves the
+// package's map-then-path lock ordering and cannot deadlock against a concurrent
+// same-path file mutation (which holds only the path lock). Per the no-eviction
+// policy it clears observations but keeps each record (and its mutex identity).
+func (o *fileObservations) InvalidateAll() {
+	o.mu.Lock()
+	states := make([]*filePathState, 0, len(o.states))
+	for _, st := range o.states {
+		states = append(states, st)
+	}
+	o.mu.Unlock()
+	for _, st := range states {
+		st.mu.Lock()
+		st.clearLocked()
+		st.mu.Unlock()
+	}
+}
+
+// NewObservations builds a fresh loop-scoped observation set for the composition root
+// to inject into every workspace tool bound to one loop (the file toolset and Bash),
+// so they share exactly one set. The concrete map stays private; callers hold it only
+// through the narrow tool.WorkspaceObservations seam.
+func NewObservations() tool.WorkspaceObservations {
+	return newFileObservations()
 }
 
 // StaleFileError reports that an existing-file overwrite or edit was refused

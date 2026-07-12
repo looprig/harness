@@ -69,18 +69,24 @@ type editFileArgs struct {
 
 // EditFile edits a workspace-contained file by exact-string replacement under the
 // loop's optimistic-concurrency policy. It depends only on the workspace root
-// (least privilege) and the loop's shared observation map: an edit requires a
-// complete prior read of this path whose hash still equals the file's current
-// on-disk hash.
+// (least privilege), the loop's shared observation map, and an OPTIONAL session
+// workspace coordinator: an edit requires a complete prior read of this path whose
+// hash still equals the file's current on-disk hash. When a coordinator is bound the
+// commit runs under a SHARED session-mutation + canonical-PATH permit (serializing
+// same-real-file edits across loops, excluded by a Bash/checkpoint permit).
 type EditFile struct {
-	root string
-	obs  *fileObservations
+	root  string
+	obs   *fileObservations
+	coord tool.WorkspaceCoordinator
 }
 
 // NewEditFile constructs an EditFile bound to the workspace root and the loop's
-// shared observation map (supplied by Files, one per loop binding).
-func NewEditFile(root string, obs *fileObservations) *EditFile {
-	return &EditFile{root: root, obs: obs}
+// shared observation map (supplied by Files, one per loop binding). A
+// WithMutationCoordinator option binds the session workspace coordinator; without it
+// the tool runs coordinator-free (the standalone/bare path).
+func NewEditFile(root string, obs *fileObservations, opts ...FileMutatorOption) *EditFile {
+	cfg := resolveFileMutatorConfig(opts)
+	return &EditFile{root: root, obs: obs, coord: cfg.coord}
 }
 
 // Info returns EditFile's self-description. Name MUST equal "EditFile".
@@ -145,7 +151,7 @@ func (e *EditFile) resolveEditPath(argsJSON string) (string, error) {
 // error string for every failure mode (bad args, escape, not-found file, empty
 // 'old', 0 matches, ambiguous matches, read/write failure). Never a Go error,
 // never echoing the full file body.
-func (e *EditFile) InvokableRun(_ context.Context, argsJSON string) (*tool.ToolResult, error) {
+func (e *EditFile) InvokableRun(ctx context.Context, argsJSON string) (*tool.ToolResult, error) {
 	var a editFileArgs
 	if err := json.Unmarshal([]byte(argsJSON), &a); err != nil {
 		return tool.TextResult("error: invalid arguments: not a JSON object"), nil
@@ -165,12 +171,23 @@ func (e *EditFile) InvokableRun(_ context.Context, argsJSON string) (*tool.ToolR
 		return tool.TextResult("error: path is outside the workspace: " + a.Path), nil
 	}
 
-	// Stage 2: commit under the path's optimistic-concurrency critical section. The
+	// Stage 2: take the SHARED session-mutation + canonical-PATH permit (and verify
+	// lease health) BEFORE the commit critical section — the OUTER lock over commit's
+	// per-path st.mu (consistent ordering). A ctx-canceled acquire or an unhealthy
+	// lease returns WITHOUT editing.
+	key := canonicalObservationKey(abs)
+	permit, err := acquirePathMutation(ctx, e.coord, key)
+	if err != nil {
+		return tool.TextResult("error: " + err.Error()), nil
+	}
+	defer permit.Release()
+
+	// Stage 3: commit under the path's optimistic-concurrency critical section. The
 	// read/write below operate on the LEXICAL joined path (NOT the symlink-resolved
 	// form), mirroring ReadFile: the O_NOFOLLOW read rejects a final-component
 	// symlink rather than following it, and the atomic write targets the same
 	// lexical name so it REPLACES a final-component symlink rather than following it.
-	preview, err := e.commit(canonicalObservationKey(abs), joinedUnderRoot(e.root, a.Path), a.Path, a.Old, a.New, a.ReplaceAll)
+	preview, err := e.commit(key, joinedUnderRoot(e.root, a.Path), a.Path, a.Old, a.New, a.ReplaceAll)
 	if err != nil {
 		return tool.TextResult("error: " + err.Error()), nil
 	}

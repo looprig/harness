@@ -82,20 +82,27 @@ type writeFileArgs struct {
 
 // WriteFile writes a workspace-contained file atomically under the loop's
 // optimistic-concurrency policy. It depends only on the workspace root (least
-// privilege — the hard-deny gate is the runner's concern) and the loop's shared
-// observation map: overwriting an EXISTING file requires a complete prior read of
-// this path whose hash still equals the file's current on-disk hash; a genuinely
-// ABSENT path may be created without any prior read via an atomic no-replace
-// publication.
+// privilege — the hard-deny gate is the runner's concern), the loop's shared
+// observation map, and an OPTIONAL session workspace coordinator: overwriting an
+// EXISTING file requires a complete prior read of this path whose hash still equals
+// the file's current on-disk hash; a genuinely ABSENT path may be created without any
+// prior read via an atomic no-replace publication. When a coordinator is bound the
+// commit runs under a SHARED session-mutation + canonical-PATH permit (design
+// §"File-tool optimistic concurrency and binding"), which serializes same-real-file
+// writes ACROSS loops (the private observation map only serializes within one loop).
 type WriteFile struct {
-	root string
-	obs  *fileObservations
+	root  string
+	obs   *fileObservations
+	coord tool.WorkspaceCoordinator
 }
 
 // NewWriteFile constructs a WriteFile bound to the workspace root and the loop's
-// shared observation map (supplied by Files, one per loop binding).
-func NewWriteFile(root string, obs *fileObservations) *WriteFile {
-	return &WriteFile{root: root, obs: obs}
+// shared observation map (supplied by Files, one per loop binding). A
+// WithMutationCoordinator option binds the session workspace coordinator; without it
+// the tool runs coordinator-free (the standalone/bare path).
+func NewWriteFile(root string, obs *fileObservations, opts ...FileMutatorOption) *WriteFile {
+	cfg := resolveFileMutatorConfig(opts)
+	return &WriteFile{root: root, obs: obs, coord: cfg.coord}
 }
 
 // Info returns WriteFile's self-description. Name MUST equal "WriteFile".
@@ -163,7 +170,7 @@ func (w *WriteFile) resolveWritePath(argsJSON string) (string, error) {
 // InvokableRun writes the file atomically. Every failure mode (bad args, escape,
 // mkdir/temp/rename failure) is returned as a tool-result error string — never a
 // Go error and never echoing the content.
-func (w *WriteFile) InvokableRun(_ context.Context, argsJSON string) (*tool.ToolResult, error) {
+func (w *WriteFile) InvokableRun(ctx context.Context, argsJSON string) (*tool.ToolResult, error) {
 	var a writeFileArgs
 	if err := json.Unmarshal([]byte(argsJSON), &a); err != nil {
 		return tool.TextResult("error: invalid arguments: not a JSON object"), nil
@@ -181,11 +188,24 @@ func (w *WriteFile) InvokableRun(_ context.Context, argsJSON string) (*tool.Tool
 		return tool.TextResult("error: path is outside the workspace: " + a.Path), nil
 	}
 
-	// Stage 2: commit under the path's optimistic-concurrency critical section. The
+	// Stage 2: take the SHARED session-mutation + canonical-PATH permit (and verify
+	// lease health) BEFORE the commit critical section, so same-real-file writes
+	// serialize across loops and an unhealthy lease blocks the write. The coordinator
+	// permit is the OUTER lock; commit's per-path st.mu is the INNER lock (consistent
+	// ordering, no inversion). A ctx-canceled acquire or an unhealthy lease returns
+	// WITHOUT writing.
+	key := canonicalObservationKey(abs)
+	permit, err := acquirePathMutation(ctx, w.coord, key)
+	if err != nil {
+		return tool.TextResult("error: " + err.Error()), nil
+	}
+	defer permit.Release()
+
+	// Stage 3: commit under the path's optimistic-concurrency critical section. The
 	// on-disk write targets the LEXICAL joined path (NOT the symlink-resolved form),
 	// mirroring ReadFile/EditFile: an atomic Rename/Link on this lexical name never
 	// follows a final-component symlink.
-	if err := w.commit(canonicalObservationKey(abs), joinedUnderRoot(w.root, a.Path), a.Path, []byte(a.Content)); err != nil {
+	if err := w.commit(key, joinedUnderRoot(w.root, a.Path), a.Path, []byte(a.Content)); err != nil {
 		return tool.TextResult("error: " + err.Error()), nil
 	}
 	return tool.TextResult("wrote " + a.Path + " (" + strconv.Itoa(len(a.Content)) + " bytes)"), nil

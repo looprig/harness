@@ -26,10 +26,21 @@ const (
 type WorkspaceOperation uint8
 
 const (
-	// WorkspaceOperationPathMutation permits mutation of canonicalPath.
+	// WorkspaceOperationPathMutation permits mutation of canonicalPath. It is
+	// SHARED across DIFFERENT canonical paths (many run concurrently) but
+	// EXCLUSIVE on the SAME canonical path (per-path serialization), and is
+	// wholly excluded by a WholeMutation or a Checkpoint permit.
 	WorkspaceOperationPathMutation WorkspaceOperation = iota + 1
-	// WorkspaceOperationWholeMutation permits a whole-workspace mutation.
+	// WorkspaceOperationWholeMutation permits a whole-workspace mutation (Bash and
+	// other unknown-path mutators). It is EXCLUSIVE against every PathMutation and
+	// against other whole/checkpoint permits.
 	WorkspaceOperationWholeMutation
+	// WorkspaceOperationCheckpoint is the exclusive snapshot/restore gate. Like a
+	// WholeMutation it is EXCLUSIVE against every mutation and every other exclusive
+	// permit, and it likewise requires an empty canonicalPath; it is a DISTINCT
+	// operation so a checkpoint/restore actor names its intent (the checkpoint
+	// boundary Task 15 consumes) rather than masquerading as a Bash mutation.
+	WorkspaceOperationCheckpoint
 )
 
 // WorkspacePermit is an acquired workspace mutation permit. Release is
@@ -40,11 +51,23 @@ type WorkspacePermit interface {
 
 // WorkspaceCoordinator is the narrow workspace-mutation coordination seam used
 // by runtime-bound tools. Acquire expects WorkspaceOperationPathMutation with a
-// non-empty canonical workspace-contained path, and
-// WorkspaceOperationWholeMutation with an empty canonicalPath.
+// non-empty canonical workspace-contained path, and WorkspaceOperationWholeMutation
+// or WorkspaceOperationCheckpoint with an empty canonicalPath. Acquire blocks until
+// the permit is granted or ctx is done (a done ctx returns a typed error and removes
+// the waiter). Healthy reports whether the underlying workspace lease is healthy; a
+// structured mutator MUST NOT commit when it returns an error (fail-secure).
 type WorkspaceCoordinator interface {
 	Acquire(ctx context.Context, operation WorkspaceOperation, canonicalPath string) (WorkspacePermit, error)
 	Healthy() error
+}
+
+// WorkspaceObservations is the loop-scoped file-observation set shared between one
+// loop's file tools and its Bash tool. The file tools record/compare per-path hashes
+// through it; Bash calls InvalidateAll after an opaque whole-workspace mutation
+// because the changed paths are unknowable. Its concrete implementation lives in the
+// tools package; the runtime treats it opaquely and only ever needs InvalidateAll.
+type WorkspaceObservations interface {
+	InvalidateAll()
 }
 
 // DelegateOperation identifies an operation on a parent-scoped delegate.
@@ -140,9 +163,17 @@ type DelegateController interface {
 }
 
 // WorkspaceBinding contains the workspace capabilities supplied at build time.
+//
+// Observations is the loop-scoped file-observation set shared by every workspace
+// tool bound to the SAME loop (the file toolset and Bash). It is OPTIONAL: a nil
+// value means "no shared set", in which case the file toolset builds its own private
+// observation map and Bash performs no invalidation (the standalone/bare path). When
+// present it is created once per loop binding so a Bash run can invalidate exactly
+// the observations the loop's file tools recorded.
 type WorkspaceBinding struct {
-	Root        string
-	Coordinator WorkspaceCoordinator
+	Root         string
+	Coordinator  WorkspaceCoordinator
+	Observations WorkspaceObservations
 }
 
 // Bindings contains session-specific runtime capabilities supplied to a
