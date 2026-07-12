@@ -138,17 +138,12 @@ func restoreTopologySession(
 	}
 	// Offload GC (symmetric with NewSession): when the restore-forwarded policy is armed,
 	// wrap the journal with the admission gate BEFORE any appender (restore-lifecycle appends
-	// or the rebuilt session's appenders) is built over it, and build the runner from the same
-	// gate + the restore lease. The runner is started only after the session is rebuilt.
-	var gcRunner *offloadGCRunner
-	if probe.offloadGCPolicy.Configured() {
-		gate := newJournalAdmissionGate()
-		gcRunner, err = buildOffloadGCRunner(store, sessionID, lease, gate, probe.offloadGCPolicy)
-		if err != nil {
-			releaseLease(lease)
-			return nil, &RestoreError{Kind: RestoreJournalFailed, Cause: err}
-		}
-		j = newGatedJournal(j, gate)
+	// or the rebuilt session's appenders) is built over it. The runner is started only after
+	// the session is rebuilt.
+	j, gcRunner, err := wrapJournalWithOffloadGC(store, sessionID, lease, j, probe.offloadGCPolicy)
+	if err != nil {
+		releaseLease(lease)
+		return nil, &RestoreError{Kind: RestoreJournalFailed, Cause: err}
 	}
 	// The replayer is bound to the stream BEGINNING (FromSeq 0). Restore intentionally
 	// drains RECORDS, not events, so the private GatePreparedRecord is visible while the

@@ -468,13 +468,13 @@ func TestWithOffloadGCValidatesPolicy(t *testing.T) {
 	t.Run("rejects non-positive fields", func(t *testing.T) {
 		t.Parallel()
 		tests := []struct {
-			name        string
-			policy      OffloadGCPolicy
-			wantInterva bool
-			wantTimeout bool
+			name         string
+			policy       OffloadGCPolicy
+			wantInterval bool
+			wantTimeout  bool
 		}{
-			{name: "zero interval", policy: OffloadGCPolicy{Interval: 0, Timeout: time.Second}, wantInterva: true},
-			{name: "negative interval", policy: OffloadGCPolicy{Interval: -time.Second, Timeout: time.Second}, wantInterva: true},
+			{name: "zero interval", policy: OffloadGCPolicy{Interval: 0, Timeout: time.Second}, wantInterval: true},
+			{name: "negative interval", policy: OffloadGCPolicy{Interval: -time.Second, Timeout: time.Second}, wantInterval: true},
 			{name: "zero timeout", policy: OffloadGCPolicy{Interval: time.Minute, Timeout: 0}, wantTimeout: true},
 			{name: "negative timeout", policy: OffloadGCPolicy{Interval: time.Minute, Timeout: -time.Second}, wantTimeout: true},
 		}
@@ -485,11 +485,21 @@ func TestWithOffloadGCValidatesPolicy(t *testing.T) {
 				err := WithOffloadGC(tt.policy)(&definitionState{seen: make(map[singletonKey]bool)})
 				var iErr *InvalidOffloadGCIntervalError
 				var toErr *InvalidOffloadGCTimeoutError
-				if tt.wantInterva && !errors.As(err, &iErr) {
-					t.Fatalf("WithOffloadGC error = %T %v, want *InvalidOffloadGCIntervalError", err, err)
-				}
-				if tt.wantTimeout && !errors.As(err, &toErr) {
-					t.Fatalf("WithOffloadGC error = %T %v, want *InvalidOffloadGCTimeoutError", err, err)
+				switch {
+				case tt.wantInterval:
+					if !errors.As(err, &iErr) {
+						t.Fatalf("WithOffloadGC error = %T %v, want *InvalidOffloadGCIntervalError", err, err)
+					}
+					if iErr.Interval != tt.policy.Interval {
+						t.Errorf("InvalidOffloadGCIntervalError.Interval = %v, want %v", iErr.Interval, tt.policy.Interval)
+					}
+				case tt.wantTimeout:
+					if !errors.As(err, &toErr) {
+						t.Fatalf("WithOffloadGC error = %T %v, want *InvalidOffloadGCTimeoutError", err, err)
+					}
+					if toErr.Timeout != tt.policy.Timeout {
+						t.Errorf("InvalidOffloadGCTimeoutError.Timeout = %v, want %v", toErr.Timeout, tt.policy.Timeout)
+					}
 				}
 			})
 		}

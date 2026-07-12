@@ -2,10 +2,12 @@ package sessionruntime
 
 import (
 	"context"
+	"log/slog"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/journal"
 	"github.com/looprig/harness/pkg/sessionstore"
 )
@@ -94,6 +96,7 @@ func (t *timeTicker) Stop()                     { t.t.Stop() }
 // pass); Stop joins it. Every dependency is injected at the composition root, never
 // constructed here.
 type offloadGCRunner struct {
+	sessionID uuid.UUID // owning session, for best-effort pass-failure log context
 	scanner   offloadScanner
 	gate      *journalAdmissionGate
 	newTicker func() offloadGCTicker
@@ -115,11 +118,12 @@ type offloadGCRunner struct {
 	onPass func(sessionstore.GCResult, error)
 }
 
-// newOffloadGCRunner constructs an unstarted runner. newTicker is invoked once at start so
-// an aborted construction that never starts leaks no timer. lost may be nil (headless/no
-// lease-loss signal).
-func newOffloadGCRunner(scanner offloadScanner, gate *journalAdmissionGate, newTicker func() offloadGCTicker, lost <-chan struct{}, timeout time.Duration) *offloadGCRunner {
+// newOffloadGCRunner constructs an unstarted runner. sessionID is carried only for
+// pass-failure log context. newTicker is invoked once at start so an aborted construction
+// that never starts leaks no timer. lost may be nil (headless/no lease-loss signal).
+func newOffloadGCRunner(sessionID uuid.UUID, scanner offloadScanner, gate *journalAdmissionGate, newTicker func() offloadGCTicker, lost <-chan struct{}, timeout time.Duration) *offloadGCRunner {
 	return &offloadGCRunner{
+		sessionID: sessionID,
 		scanner:   scanner,
 		gate:      gate,
 		newTicker: newTicker,
@@ -157,7 +161,15 @@ func (r *offloadGCRunner) run() {
 }
 
 // tickOnce processes one tick: skip unless the session is at native SessionIdle, else take
-// the writer and run one bounded pass.
+// the writer and run one bounded pass. A pass failure (blob store down, ledger read, delete
+// failures) is best-effort — GC retries on the next tick — so it is logged loudly rather than
+// faulting the session, mirroring observeBestEffortCheckpointError.
+//
+// Note: Stop() cannot preempt a tick already blocked on the writer Lock() behind a wedged
+// in-flight append — that wait is bounded only by the append's own per-append ctx, not by
+// Stop. In practice the shutdown ordering makes this safe: Shutdown drains the loops (so no
+// new appends are admitted) before it calls stopOffloadGC, so the writer Lock is uncontended
+// by the time Stop runs.
 func (r *offloadGCRunner) tickOnce() {
 	if r.idle != nil && !r.idle() {
 		if r.onPass != nil {
@@ -168,6 +180,10 @@ func (r *offloadGCRunner) tickOnce() {
 	r.gate.enterGC()
 	ctx, cancel := r.passContext()
 	res, err := r.scanner.GC(ctx)
+	if err != nil {
+		slog.ErrorContext(ctx, "sessionruntime: offload GC pass failed",
+			"session", r.sessionID, "err", err)
+	}
 	cancel()
 	r.gate.exitGC()
 	if r.onPass != nil {

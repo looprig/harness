@@ -164,7 +164,25 @@ func buildOffloadGCRunner(store *sessionstore.Store, id uuid.UUID, lease journal
 		return nil, err
 	}
 	interval := policy.Interval
-	return newOffloadGCRunner(objGC, gate, func() offloadGCTicker { return newTimeTicker(interval) }, lease.Lost(), policy.Timeout), nil
+	return newOffloadGCRunner(id, objGC, gate, func() offloadGCTicker { return newTimeTicker(interval) }, lease.Lost(), policy.Timeout), nil
+}
+
+// wrapJournalWithOffloadGC is the ONE composition-root seam shared by NewSession and the
+// restore constructor: when the policy is armed it mints the admission gate, builds the GC
+// runner over the same gate + session lease, and returns the journal wrapped so every append
+// serializes against a GC pass. An unconfigured policy returns the journal undecorated and a
+// nil runner (unchanged behavior). It never touches the lease lifecycle; the caller releases
+// it on error.
+func wrapJournalWithOffloadGC(store *sessionstore.Store, id uuid.UUID, lease journal.Lease, j journal.SessionJournal, policy OffloadGCPolicy) (journal.SessionJournal, *offloadGCRunner, error) {
+	if !policy.Configured() {
+		return j, nil, nil
+	}
+	admissionGate := newJournalAdmissionGate()
+	runner, err := buildOffloadGCRunner(store, id, lease, admissionGate, policy)
+	if err != nil {
+		return nil, nil, err
+	}
+	return newGatedJournal(j, admissionGate), runner, nil
 }
 
 // WithLifecyclePlacement captures the managed-workspace placement the rig declared. The
@@ -334,17 +352,12 @@ func (r *Lifecycle) NewSession(ctx context.Context, seed workspacestore.Ref) (*S
 		return nil, &NewSessionError{Kind: NewSessionJournalFailed, Cause: err}
 	}
 	// Offload GC: wrap the journal with the admission gate BEFORE any appender is built over
-	// it, so every append (event/command/gate/fence) serializes against a GC pass. Build the
-	// runner from the same gate + the session lease. Unconfigured leaves j undecorated.
-	var gcRunner *offloadGCRunner
-	if r.offloadGC.Configured() {
-		gate := newJournalAdmissionGate()
-		gcRunner, err = buildOffloadGCRunner(r.store, sid, lease, gate, r.offloadGC)
-		if err != nil {
-			releaseLease(lease)
-			return nil, &NewSessionError{Kind: NewSessionJournalFailed, Cause: err}
-		}
-		j = newGatedJournal(j, gate)
+	// it, so every append (event/command/gate/fence) serializes against a GC pass. Unconfigured
+	// leaves j undecorated and gcRunner nil.
+	j, gcRunner, err := wrapJournalWithOffloadGC(r.store, sid, lease, j, r.offloadGC)
+	if err != nil {
+		releaseLease(lease)
+		return nil, &NewSessionError{Kind: NewSessionJournalFailed, Cause: err}
 	}
 	evAp, err := journal.NewJournalEventAppenderChecked(j, journal.WithCatalog(r.catalog))
 	if err != nil {
