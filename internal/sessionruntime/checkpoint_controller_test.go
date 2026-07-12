@@ -395,6 +395,129 @@ func TestInterruptCheckpointSweepAfterShutdownFaultsImmediately(t *testing.T) {
 	}
 }
 
+func TestInterruptBestEffortIdleStartsWhenActiveFinishesDuringPublish(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+	}{
+		{name: "accepted interrupt idle is scheduled after active walk finishes in publish callback"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			ws, err := workspacestore.Open(memstore.New().Blobs)
+			if err != nil {
+				t.Fatal(err)
+			}
+			sid, lid, tid := mustUUID(), mustUUID(), mustUUID()
+			publisher := &boundaryPublisher{order: &checkpointOrder{}, checkpointed: make(chan event.WorkspaceCheckpointed, 1)}
+			c := newCheckpointController(checkpointControllerConfig{
+				SessionID: sid,
+				Policy:    checkpointPolicy{Trigger: checkpointOnIdle, Priority: checkpointBestEffort, Timeout: time.Second},
+				Store:     ws, Root: t.TempDir(), Mode: PlacementSession, Coordinator: newWorkspaceCoordinator(nil),
+				Publisher: publisher, Factory: event.NewFactory(uuid.New, time.Now),
+			})
+			t.Cleanup(c.shutdown)
+			c.mu.Lock()
+			c.active = true // an older best-effort walk exists at the first active check
+			c.mu.Unlock()
+			sweep := c.beginInterruptSweep()
+			terminal := event.TurnInterrupted{Header: event.Header{Coordinates: identity.Coordinates{SessionID: sid, LoopID: lid, TurnID: tid}, EventID: mustUUID()}}
+			if err := c.boundary(context.Background(), terminal); err != nil {
+				t.Fatal(err)
+			}
+			idle := event.SessionIdle{Header: event.Header{Coordinates: identity.Coordinates{SessionID: sid}, EventID: mustUUID()}}
+			if err := c.sessionIdle(context.Background(), idle, func() error {
+				c.finishBestEffort() // deterministically finish the older walk during publish
+				return publisher.PublishEventChecked(context.Background(), idle)
+			}); err != nil {
+				t.Fatal(err)
+			}
+			outcome, err := sweep.await(context.Background())
+			if err != nil || outcome.Disposition != interruptCheckpointAccepted {
+				t.Fatalf("outcome = %+v, err %v", outcome, err)
+			}
+			select {
+			case checkpoint := <-publisher.checkpointed:
+				if checkpoint.Trigger != event.SnapshotTriggerInterrupt {
+					t.Fatalf("trigger = %v, want interrupt", checkpoint.Trigger)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("accepted interrupt checkpoint was left pending with no active runner")
+			}
+		})
+	}
+}
+
+func TestInterruptCheckpointShutdownResolvesLiveAndDeferredSweeps(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name     string
+		deferred bool
+	}{
+		{name: "live sweep", deferred: false},
+		{name: "deferred required sweep", deferred: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			queued := make(chan struct{}, 1)
+			publisher := &boundaryPublisher{order: &checkpointOrder{}}
+			c := newCheckpointController(checkpointControllerConfig{
+				Policy:         checkpointPolicy{Trigger: checkpointOnTurnDone, Priority: checkpointRequired, Timeout: time.Second},
+				Publisher:      publisher,
+				RequiredQueued: func(event.Event) { queued <- struct{}{} },
+			})
+			sweep := c.beginInterruptSweep()
+			requiredDone := make(chan error, 1)
+			if tt.deferred {
+				go func() {
+					_, err := c.runRequired(context.Background(), event.TurnInterrupted{}, func(ctx context.Context) (workspacestore.Ref, error) {
+						<-ctx.Done()
+						return "", ctx.Err()
+					})
+					requiredDone <- err
+				}()
+				<-queued
+				idle := event.SessionIdle{Header: event.Header{EventID: mustUUID()}}
+				if err := c.sessionIdle(context.Background(), idle, func() error {
+					return publisher.PublishEventChecked(context.Background(), idle)
+				}); err != nil {
+					t.Fatal(err)
+				}
+				c.mu.Lock()
+				deferred := len(c.interruptDeferred)
+				c.mu.Unlock()
+				if deferred != 1 {
+					t.Fatalf("deferred sweeps = %d, want 1", deferred)
+				}
+			}
+			shutdownDone := make(chan struct{})
+			go func() { c.shutdown(); close(shutdownDone) }()
+			outcome, err := sweep.await(context.Background())
+			if err != nil || outcome.Disposition != interruptCheckpointFaulted || outcome.Err == nil {
+				t.Fatalf("shutdown outcome = %+v, err %v", outcome, err)
+			}
+			select {
+			case <-shutdownDone:
+			case <-time.After(time.Second):
+				t.Fatal("checkpoint controller shutdown hung")
+			}
+			if tt.deferred {
+				if err := <-requiredDone; err == nil {
+					t.Fatal("required request survived shutdown")
+				}
+			}
+			c.mu.Lock()
+			live, deferred := len(c.interruptSweeps), len(c.interruptDeferred)
+			c.mu.Unlock()
+			if live != 0 || deferred != 0 {
+				t.Fatalf("sweep leaks after shutdown: live=%d deferred=%d", live, deferred)
+			}
+		})
+	}
+}
+
 type boundaryPermit struct{ order *checkpointOrder }
 
 func (p boundaryPermit) Release() { p.order.add("release") }

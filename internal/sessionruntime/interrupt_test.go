@@ -661,3 +661,220 @@ func TestInterruptPreservedInputDispatchesOnlyAfterSessionIdleAppend(t *testing.
 		})
 	}
 }
+
+func TestInterruptQueuesInputOnEarlyIdleLoopUntilEveryTargetIsIdle(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+	}{
+		{name: "session interrupt keeps idle primer input queued while child finishes"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			ws, root := checkpointFixture(t, nil)
+			recorder := &recordingEventAppender{}
+			s, err := newTestSession(context.Background(), cfg(&stubLLM{chunks: []content.Chunk{textChunk("primer")}}),
+				WithEventAppender(recorder),
+				withResolvedPlacement(&resolvedPlacement{mode: PlacementSession, store: ws, root: root, coordinator: newWorkspaceCoordinator(nil)}),
+				WithSnapshotPolicy(SnapshotPolicy{Trigger: SnapshotManual, Priority: SnapshotBestEffort, Timeout: time.Second}),
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = s.Shutdown(context.Background()) })
+			childLLM := &releasedFailureLLM{started: make(chan struct{}), release: make(chan struct{}), err: context.Canceled}
+			childID, err := s.NewLoop(loop.Provenance{}, cfg(childLLM))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := s.SubmitToLoop(context.Background(), childID, nil); err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case <-childLLM.started:
+			case <-time.After(time.Second):
+				t.Fatal("child turn did not start")
+			}
+			any, err := s.Interrupt(context.Background())
+			if err != nil || !any {
+				t.Fatalf("Interrupt = %v, %v", any, err)
+			}
+			inputID, err := s.Submit(context.Background(), []content.Block{&content.TextBlock{Text: "preserve me"}})
+			if err != nil {
+				t.Fatalf("Submit while another target finishes: %v", err)
+			}
+			if inputID.IsZero() {
+				t.Fatal("Submit returned zero id")
+			}
+			for _, ev := range recorder.snapshot() {
+				if started, ok := ev.(event.TurnStarted); ok && started.Cause.CommandID == inputID {
+					t.Fatal("input started on early-idle loop before every interrupt target reached SessionIdle")
+				}
+			}
+
+			close(childLLM.release)
+			deadline := time.After(time.Second)
+			for {
+				for _, ev := range recorder.snapshot() {
+					if started, ok := ev.(event.TurnStarted); ok && started.Cause.CommandID == inputID {
+						var idleBefore bool
+						for _, prior := range recorder.snapshot() {
+							if prior.EventHeader().EventID == started.EventID {
+								break
+							}
+							if _, ok := prior.(event.SessionIdle); ok {
+								idleBefore = true
+							}
+						}
+						if !idleBefore {
+							t.Fatal("preserved input started before durable SessionIdle")
+						}
+						if err := s.WaitIdle(context.Background()); err != nil {
+							t.Fatal(err)
+						}
+						starts := 0
+						for _, recorded := range recorder.snapshot() {
+							if candidate, ok := recorded.(event.TurnStarted); ok && candidate.Cause.CommandID == inputID {
+								starts++
+							}
+						}
+						if starts != 1 {
+							t.Fatalf("preserved input start count = %d, want exactly 1", starts)
+						}
+						return
+					}
+				}
+				select {
+				case <-deadline:
+					t.Fatal("preserved input did not start exactly once after barrier release")
+				default:
+				}
+			}
+		})
+	}
+}
+
+func TestInterruptCheckpointBackedOverlappingScopesReleaseTogether(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+	}{
+		{name: "subtree and session generations share only their native idle edge"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			s, ids, cmds := fakeTreeSession(t, nil,
+				treeLoop{name: "X"}, treeLoop{name: "Y", parent: "X"}, treeLoop{name: "Z"})
+			publisher := &boundaryPublisher{order: &checkpointOrder{}}
+			s.checkpoints = newCheckpointController(checkpointControllerConfig{
+				Policy:    checkpointPolicy{Trigger: checkpointManual, Priority: checkpointBestEffort},
+				Publisher: publisher,
+			})
+			t.Cleanup(s.checkpoints.shutdown)
+			for _, name := range []string{"X", "Y", "Z"} {
+				go func() {
+					for {
+						select {
+						case cmd := <-cmds[name]:
+							cmd.(command.Interrupt).Ack <- true
+						case <-s.sessionCtx.Done():
+							return
+						}
+					}
+				}()
+			}
+			subtreeAny, subtreeDone, err := s.runInterrupt(context.Background(), func() ([]loopSnapshot, bool) {
+				return s.subtreeSnapshotLocked(ids["X"])
+			}, identity.AgencyMachine)
+			if err != nil || !subtreeAny {
+				t.Fatalf("subtree interrupt = %v, %v", subtreeAny, err)
+			}
+			sessionAny, sessionDone, err := s.runInterrupt(context.Background(), func() ([]loopSnapshot, bool) {
+				return s.liveLoopSnapshotLocked(), true
+			}, identity.AgencyUser)
+			if err != nil || !sessionAny {
+				t.Fatalf("session interrupt = %v, %v", sessionAny, err)
+			}
+			s.checkpoints.mu.Lock()
+			live := len(s.checkpoints.interruptSweeps)
+			s.checkpoints.mu.Unlock()
+			if live != 2 {
+				t.Fatalf("checkpoint-backed sweep generations = %d, want 2", live)
+			}
+			s.loopsMu.RLock()
+			xRefs, yRefs, zRefs := s.interruptPending[ids["X"]], s.interruptPending[ids["Y"]], s.interruptPending[ids["Z"]]
+			s.loopsMu.RUnlock()
+			if xRefs != 2 || yRefs != 2 || zRefs != 1 {
+				t.Fatalf("overlapping refcounts = X:%d Y:%d Z:%d", xRefs, yRefs, zRefs)
+			}
+			idle := event.SessionIdle{Header: event.Header{Coordinates: identity.Coordinates{SessionID: s.sessionID}, EventID: mustUUID()}}
+			if err := s.checkpoints.sessionIdle(context.Background(), idle, func() error {
+				return publisher.PublishEventChecked(context.Background(), idle)
+			}); err != nil {
+				t.Fatal(err)
+			}
+			for name, done := range map[string]<-chan struct{}{"subtree": subtreeDone, "session": sessionDone} {
+				select {
+				case <-done:
+				case <-time.After(time.Second):
+					t.Fatalf("%s checkpoint-backed generation did not release", name)
+				}
+			}
+			for _, id := range ids {
+				if s.loopInterruptPending(id) {
+					t.Fatalf("loop %v remains pending after both generation outcomes", id)
+				}
+			}
+		})
+	}
+}
+
+func TestInterruptExecutionAdmissionHonorsEveryOverlappingRef(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+	}{
+		{name: "one scope release cannot open another"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			s, ids, _ := fakeTreeSession(t, blockingRelease{}, treeLoop{name: "A"}, treeLoop{name: "B"})
+			s.loopsMu.Lock()
+			target := []loopSnapshot{{loopID: ids["A"], handle: s.loops[ids["A"]]}}
+			s.markInterruptPendingLocked(target)
+			s.markInterruptPendingLocked(target)
+			s.loopsMu.Unlock()
+			admitted := make(chan error, 1)
+			go func() {
+				release, err := s.EnterExecution(context.Background(), ids["A"])
+				if release != nil {
+					release()
+				}
+				admitted <- err
+			}()
+			unrelatedRelease, err := s.EnterExecution(context.Background(), ids["B"])
+			if err != nil {
+				t.Fatalf("unrelated targeted-scope admission: %v", err)
+			}
+			unrelatedRelease()
+			s.clearInterruptPending([]uuid.UUID{ids["A"]})
+			select {
+			case err := <-admitted:
+				t.Fatalf("one overlapping release admitted execution: %v", err)
+			default:
+			}
+			s.clearInterruptPending([]uuid.UUID{ids["A"]})
+			select {
+			case err := <-admitted:
+				if err != nil {
+					t.Fatal(err)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("execution stayed blocked after final overlapping release")
+			}
+		})
+	}
+}

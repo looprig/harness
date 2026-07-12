@@ -274,9 +274,14 @@ type Session struct {
 	// overlapping interrupt scopes each hold a shared loop independently — the mark clears only
 	// when the last holding barrier releases. It is guarded by loopsMu — the SAME lock that gates
 	// the registry, closing, and faulted — so the mark-before-fanout select-and-mark is atomic
-	// w.r.t. a concurrent NewLoop / Interrupt. Human (AgencyUser) input is never gated by it.
+	// w.r.t. a concurrent NewLoop / Interrupt. Human input is still accepted into the actor
+	// inbox, but its loop-scoped execution admission waits until every applicable ref clears.
 	// Lazily allocated (interrupt.go), so a struct-literal test session is safe. See interrupt.go.
 	interruptPending map[uuid.UUID]int
+	// interruptChanged is closed and replaced whenever an interrupt barrier refcount
+	// changes. Loop-scoped execution admission waits on it while its target remains
+	// pending, preserving accepted user input in the actor inbox without starting a turn.
+	interruptChanged chan struct{}
 
 	// interruptRelease is the pluggable admission-barrier release policy (Dependency Inversion
 	// seam): after an interrupt fan-out cancels a running turn, the session holds the
@@ -527,8 +532,28 @@ func (s *Session) SessionActivated() {
 	}
 }
 
-// EnterExecution is the loop actor's session-wide next-step admission seam.
-func (s *Session) EnterExecution(ctx context.Context) (func(), error) {
+// EnterExecution is the loop actor's session-wide checkpoint and loop-scoped
+// interrupt admission seam.
+func (s *Session) EnterExecution(ctx context.Context, loopID uuid.UUID) (func(), error) {
+	for {
+		s.loopsMu.Lock()
+		if s.interruptPending[loopID] == 0 {
+			s.loopsMu.Unlock()
+			break
+		}
+		if s.interruptChanged == nil {
+			s.interruptChanged = make(chan struct{})
+		}
+		changed := s.interruptChanged
+		s.loopsMu.Unlock()
+		select {
+		case <-changed:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-s.sessionCtx.Done():
+			return nil, s.sessionCtx.Err()
+		}
+	}
 	if s.checkpointAdmission == nil {
 		return func() {}, nil
 	}

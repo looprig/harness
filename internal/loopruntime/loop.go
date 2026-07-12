@@ -163,7 +163,7 @@ type executionBoundary interface {
 }
 
 type executionAdmission interface {
-	EnterExecution(context.Context) (func(), error)
+	EnterExecution(context.Context, uuid.UUID) (func(), error)
 }
 
 // faultProbe is the actor's narrow read of the session's durable-persistence fault latch.
@@ -730,7 +730,9 @@ func runLoop(cfg loopConfig, state loopState) {
 	buildTurnConfig := func(base content.AgenticMessages, firstAdmission func()) turnConfig {
 		admit := func(context.Context) (func(), error) { return func() {}, nil }
 		if admission, ok := cfg.events.(executionAdmission); ok {
-			admit = admission.EnterExecution
+			admit = func(ctx context.Context) (func(), error) {
+				return admission.EnterExecution(ctx, state.id)
+			}
 		}
 		commit := func(cctx context.Context, tc turnCommit) error {
 			ack := make(chan error, 1)
@@ -1052,7 +1054,7 @@ func runLoop(cfg loopConfig, state loopState) {
 		admitCtx, cancel := context.WithCancel(ctx)
 		state.cancelAdmission = cancel
 		go func() {
-			release, err := admission.EnterExecution(admitCtx)
+			release, err := admission.EnterExecution(admitCtx, state.id)
 			select {
 			case admissions <- admissionResult{release: release, err: err}:
 			case <-admitCtx.Done():

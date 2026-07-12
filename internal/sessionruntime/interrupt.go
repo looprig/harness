@@ -19,7 +19,8 @@ import (
 // While a loop is interrupt-pending
 // the delegation admission paths refuse NEW machine-delegate work (start/send) — so a parent whose
 // interrupted delegate wait resolves cannot open a fresh DELEGATE step in the race window — while
-// human (AgencyUser) input is never gated and remains queued.
+// human (AgencyUser) input remains accepted and queued, while loop-scoped execution admission
+// prevents it from starting until every applicable barrier generation releases.
 //
 // SCOPE / RESIDUAL: this gate covers only machine DELEGATE admission (start/send). It does NOT stop
 // a parent from taking one non-delegate step (a plain inference/tool step) before its OWN actor
@@ -89,12 +90,21 @@ func (s *Session) markInterruptPendingLocked(snapshot []loopSnapshot) {
 // after the loops are gone is harmless.
 func (s *Session) clearInterruptPending(ids []uuid.UUID) {
 	s.loopsMu.Lock()
+	changed := false
 	for _, id := range ids {
 		if s.interruptPending[id] <= 1 {
+			if s.interruptPending[id] > 0 {
+				changed = true
+			}
 			delete(s.interruptPending, id)
 			continue
 		}
 		s.interruptPending[id]--
+		changed = true
+	}
+	if changed && s.interruptChanged != nil {
+		close(s.interruptChanged)
+		s.interruptChanged = make(chan struct{})
 	}
 	s.loopsMu.Unlock()
 }

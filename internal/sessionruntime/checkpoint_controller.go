@@ -417,11 +417,21 @@ func (c *checkpointController) bestEffortInterruptIdle(ctx context.Context, caus
 	}
 	req.alreadyPublished = true
 	c.mu.Lock()
-	if !c.closed {
+	if c.closed {
+		c.mu.Unlock()
+		return nil
+	}
+	if c.active || c.manualWaiting > 0 {
 		copyReq := req
 		c.pending = &copyReq
+		c.mu.Unlock()
+		return nil
 	}
+	c.active = true
+	c.pending = nil
+	c.wg.Add(1)
 	c.mu.Unlock()
+	c.runBestEffort(req, nil, nil)
 	return nil
 }
 

@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/looprig/core/content"
+	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/command"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/inference"
@@ -47,7 +48,7 @@ type countingAdmission struct {
 	releases atomic.Int32
 }
 
-func (a *countingAdmission) EnterExecution(context.Context) (func(), error) {
+func (a *countingAdmission) EnterExecution(context.Context, uuid.UUID) (func(), error) {
 	return func() { a.releases.Add(1) }, nil
 }
 
@@ -89,7 +90,7 @@ func (b *failingTerminalBoundary) CommitBoundary(ctx context.Context, ev event.E
 	return nil
 }
 
-func (b *blockingStepAdmission) EnterExecution(ctx context.Context) (func(), error) {
+func (b *blockingStepAdmission) EnterExecution(ctx context.Context, _ uuid.UUID) (func(), error) {
 	close(b.entered)
 	select {
 	case <-b.release:
