@@ -328,7 +328,18 @@ func (d Definition) Bind(ctx context.Context, bindings tool.Bindings) (BoundDefi
 		return selected, nil
 	}
 
-	baseTools, err := build(d.state.tools)
+	// withExtra appends the caller-injected ExtraTools (the derived delegation Subagent
+	// tool) to a mode's tool set, so a delegate-bearing loop exposes it in EVERY mode
+	// without the definition hand-listing it. The same immutable ExtraTools definitions
+	// are appended to base + every mode, so build's by-name cache builds each once and
+	// reuses it (no duplicate-tool-name error). An empty ExtraTools is a no-op.
+	withExtra := func(defs []tool.Definition) []tool.Definition {
+		if len(bindings.ExtraTools) == 0 {
+			return defs
+		}
+		return append(append([]tool.Definition(nil), defs...), bindings.ExtraTools...)
+	}
+	baseTools, err := build(withExtra(d.state.tools))
 	if err != nil {
 		return nil, err
 	}
@@ -342,7 +353,7 @@ func (d Definition) Bind(ctx context.Context, bindings tool.Bindings) (BoundDefi
 		if len(selectedDefinitions) == 0 {
 			selectedDefinitions = d.state.tools
 		}
-		instances, buildErr := build(selectedDefinitions)
+		instances, buildErr := build(withExtra(selectedDefinitions))
 		if buildErr != nil {
 			return nil, buildErr
 		}

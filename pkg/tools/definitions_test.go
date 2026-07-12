@@ -9,7 +9,6 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
-	"strings"
 	"sync"
 	"testing"
 
@@ -96,7 +95,7 @@ func TestDefinitionBlueprints(t *testing.T) {
 		},
 		{
 			name:          "subagent",
-			definition:    Subagent(),
+			definition:    Subagent(loop.DelegationManaged, nil),
 			wantName:      "Subagent",
 			wantReqs:      tool.RequiresDelegateController,
 			wantToolCount: 1,
@@ -230,7 +229,7 @@ func TestDefinitionConcurrentBuildsAreFresh(t *testing.T) {
 	t.Parallel()
 
 	const builds = 32
-	definitions := []tool.Definition{Files(&fakeReadGuard{maxBytes: 1024}), Bash(WithRunner(&definitionRunner{})), Subagent()}
+	definitions := []tool.Definition{Files(&fakeReadGuard{maxBytes: 1024}), Bash(WithRunner(&definitionRunner{})), Subagent(loop.DelegationManaged, nil)}
 	for _, definition := range definitions {
 		definition := definition
 		t.Run(definition.Name(), func(t *testing.T) {
@@ -318,7 +317,7 @@ func TestDefinitionSubagentBindsController(t *testing.T) {
 				Status:     tool.DelegateStatusCompleted,
 				Output:     "done",
 			}}
-			built, err := Subagent().Build(context.Background(), blueprintBindings(controller))
+			built, err := Subagent(loop.DelegationManaged, nil).Build(context.Background(), blueprintBindings(controller))
 			if err != nil {
 				t.Fatalf("Build() error = %v", err)
 			}
@@ -335,48 +334,6 @@ func TestDefinitionSubagentBindsController(t *testing.T) {
 			}
 			if got := result.Content[0].(*content.TextBlock).Text; got != "done" {
 				t.Fatalf("result text = %q, want done", got)
-			}
-		})
-	}
-}
-
-func TestDelegateSpawnerValidatesSynchronousResult(t *testing.T) {
-	t.Parallel()
-
-	delegateID := uuid.MustParse("55555555-5555-4555-8555-555555555555")
-	tests := []struct {
-		name       string
-		result     tool.DelegateResult
-		wantOutput string
-		wantError  string
-	}{
-		{name: "completed returns output", result: tool.DelegateResult{DelegateID: delegateID, Status: tool.DelegateStatusCompleted, Output: "complete"}, wantOutput: "complete"},
-		{name: "zero delegate id rejected", result: tool.DelegateResult{Status: tool.DelegateStatusCompleted, Output: "must not return"}, wantError: "zero delegate id"},
-		{name: "failed becomes error", result: tool.DelegateResult{DelegateID: delegateID, Status: tool.DelegateStatusFailed, Output: "must not return"}, wantError: "failed"},
-		{name: "interrupted becomes error", result: tool.DelegateResult{DelegateID: delegateID, Status: tool.DelegateStatusInterrupted, Output: "must not return"}, wantError: "interrupted"},
-		{name: "timed out becomes error", result: tool.DelegateResult{DelegateID: delegateID, Status: tool.DelegateStatusTimedOut, Output: "must not return"}, wantError: "timed out"},
-		{name: "queued is invalid for synchronous wait", result: tool.DelegateResult{DelegateID: delegateID, Status: tool.DelegateStatusQueued, Output: "must not return"}, wantError: "invalid synchronous status"},
-		{name: "running is invalid for synchronous wait", result: tool.DelegateResult{DelegateID: delegateID, Status: tool.DelegateStatusRunning, Output: "must not return"}, wantError: "invalid synchronous status"},
-		{name: "unknown is invalid for synchronous wait", result: tool.DelegateResult{DelegateID: delegateID, Status: tool.DelegateStatusUnknown, Output: "must not return"}, wantError: "invalid synchronous status"},
-		{name: "unrecognized is invalid for synchronous wait", result: tool.DelegateResult{DelegateID: delegateID, Status: tool.DelegateStatusValue(255), Output: "must not return"}, wantError: "invalid synchronous status"},
-	}
-	for _, tt := range tests {
-		tt := tt
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-			spawner := delegateSpawner{controller: &recordingDelegate{result: tt.result}}
-			output, err := spawner.Spawn(context.Background(), loop.Provenance{}, "explorer", "map repo", "tool-use")
-			if tt.wantError == "" {
-				if err != nil || output != tt.wantOutput {
-					t.Fatalf("Spawn() = (%q, %v), want (%q, nil)", output, err, tt.wantOutput)
-				}
-				return
-			}
-			if err == nil || !strings.Contains(err.Error(), tt.wantError) {
-				t.Fatalf("Spawn() error = %v, want containing %q", err, tt.wantError)
-			}
-			if output != "" {
-				t.Fatalf("Spawn() output = %q on invalid result, want empty", output)
 			}
 		})
 	}

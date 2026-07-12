@@ -17,9 +17,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/identity"
-	"github.com/looprig/core/uuid"
 )
 
 // Hub is the session's event fan-in. It is owned by Session; loops see only
@@ -116,13 +116,28 @@ func (h *Hub) unsubscribe(sub *EventSubscription) {
 // After SessionStopped, the event is still appended+delivered (filtered) but no
 // longer mutates active/phase and never derives SessionIdle/SessionActive.
 func (h *Hub) PublishEvent(ctx context.Context, ev event.Event) error {
+	return h.publishEvent(ctx, ev, false)
+}
+
+// PublishEventChecked is the construction-transaction variant of PublishEvent. It keeps
+// the same durable-first reporting semantics but also returns the persistence fault to a
+// caller that must not make an object reachable unless its creation event committed.
+func (h *Hub) PublishEventChecked(ctx context.Context, ev event.Event) error {
+	return h.publishEvent(ctx, ev, true)
+}
+
+func (h *Hub) publishEvent(ctx context.Context, ev event.Event, checked bool) error {
 	// (1)+(2) Ephemeral: no append, seq stays 0. Enduring: append before apply,
 	// fail-secure; capture the durable sequence to ride the live delivery.
 	var seq uint64
 	if ev.Class() == event.Enduring {
 		s, err := h.appender.AppendEvent(ctx, ev)
 		if err != nil {
-			h.reporter.ReportFault(ctx, &SessionPersistenceFault{Event: ev, Cause: err})
+			fault := &SessionPersistenceFault{Event: ev, Cause: err}
+			h.reporter.ReportFault(ctx, fault)
+			if checked {
+				return fault
+			}
 			return nil
 		}
 		seq = s
@@ -138,13 +153,21 @@ func (h *Hub) PublishEvent(ctx context.Context, ev event.Event) error {
 	if derived != nil {
 		stamped, err := h.factory.Stamp(derived.EventHeader())
 		if err != nil {
-			h.reporter.ReportFault(ctx, &SessionPersistenceFault{Event: derived, Cause: err})
+			fault := &SessionPersistenceFault{Event: derived, Cause: err}
+			h.reporter.ReportFault(ctx, fault)
+			if checked {
+				return fault
+			}
 			return nil
 		}
 		derived = withHeader(derived, stamped)
 		ds, err := h.appender.AppendEvent(ctx, derived)
 		if err != nil {
-			h.reporter.ReportFault(ctx, &SessionPersistenceFault{Event: derived, Cause: err})
+			fault := &SessionPersistenceFault{Event: derived, Cause: err}
+			h.reporter.ReportFault(ctx, fault)
+			if checked {
+				return fault
+			}
 			return nil
 		}
 		derivedSeq = ds

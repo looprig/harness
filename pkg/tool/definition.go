@@ -68,6 +68,9 @@ const (
 	DelegateStatusFailed
 	DelegateStatusTimedOut
 	DelegateStatusQueued
+	// DelegateStatusIdle is the mechanical "warm but not running a turn" state a
+	// status operation reports for an owned child with no in-flight turn.
+	DelegateStatusIdle
 	// DelegateStatusDone is a compatibility alias for the canonical completed
 	// state. It deliberately has no distinct wire or persisted value.
 	DelegateStatusDone = DelegateStatusCompleted
@@ -75,20 +78,57 @@ const (
 
 // DelegateRequest is the typed command passed to a parent-scoped delegate
 // controller. Fields not used by the selected Operation remain zero-valued.
+//
+// Mode is the requested initial mode for a DelegateStart; the empty string means
+// "use the target definition's initial mode". Agent and Mode carry the untrusted
+// model selection as plain strings (this package does not import the loop/identity
+// domain types); the controller resolves and validates them.
+//
+// RequestID is meaningful only for DelegateWait, where it names one previously
+// returned request: nil means "not supplied" (rejected for a wait), a non-nil
+// pointer to the zero UUID means "supplied but invalid" (also rejected). For
+// DelegateStart/DelegateSend the controller MINTS the request id and returns it in
+// the DelegateResult.
+//
+// TimeoutSeconds bounds a waiting operation. nil means an interruptible, unbounded
+// wait (only the parent turn's own cancellation can end it); a non-nil value is a
+// non-negative second count after which the controller returns a typed timed-out
+// result. A negative value is invalid and rejected by the envelope boundary.
 type DelegateRequest struct {
 	Operation       DelegateOperation
 	DelegateID      uuid.UUID
 	Agent           string
+	Mode            string
 	Message         string
 	Wait            bool
+	RequestID       *uuid.UUID
+	TimeoutSeconds  *int
 	ParentToolUseID string
 }
 
+// DelegateChildStatus is the bounded mechanical status of one owned child returned
+// by a DelegateStatus that omitted DelegateID (report every owned child). It never
+// carries a raw event cursor or child transcript.
+type DelegateChildStatus struct {
+	DelegateID      uuid.UUID
+	Status          DelegateStatusValue
+	PendingRequests int
+}
+
 // DelegateResult is the typed result of a delegate-controller operation.
+//
+// RequestID is the minted (DelegateStart/DelegateSend) or echoed (DelegateWait)
+// request id that correlates a follow-up wait to its turn. PendingRequests and
+// Children carry bounded mechanical status only: PendingRequests is the count of
+// unresolved requests for a single addressed child, and Children is the per-child
+// status list for a DelegateStatus that omitted DelegateID.
 type DelegateResult struct {
-	DelegateID uuid.UUID
-	Status     DelegateStatusValue
-	Output     string
+	DelegateID      uuid.UUID
+	RequestID       uuid.UUID
+	Status          DelegateStatusValue
+	Output          string
+	PendingRequests int
+	Children        []DelegateChildStatus
 }
 
 // DelegateController is the only delegation capability exposed to a built tool.
@@ -112,6 +152,12 @@ type Bindings struct {
 	LoopID    uuid.UUID
 	Workspace *WorkspaceBinding
 	Delegate  DelegateController
+	// ExtraTools are additional tool definitions the LOOP appends to every mode's
+	// toolset at Bind, beyond the definition's own WithTools. The composition root uses
+	// it to inject a derived, definition-scoped tool (the delegation Subagent tool) into
+	// a loop WITHOUT mutating the immutable loop definition. Per-tool factories never see
+	// it (attenuateBindings drops it); only loop.Bind consumes it.
+	ExtraTools []Definition
 }
 
 // Definition is immutable tool metadata plus a factory that builds concrete,

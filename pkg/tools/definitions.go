@@ -4,7 +4,6 @@ import (
 	"context"
 	"reflect"
 
-	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/harness/pkg/tool"
 )
@@ -38,60 +37,17 @@ func Bash(opts ...BashOption) tool.Definition {
 	})
 }
 
-// Subagent defines a delegation tool bound only to the parent-scoped controller
-// supplied at Build time.
-func Subagent() tool.Definition {
+// Subagent defines the model-facing delegation tool: one action envelope bound to the
+// parent-scoped controller supplied at Build time. The delegation style and delegate
+// catalog are fixed at the composition root (the rig derives them from the parent
+// definition) and drive the tool's model-facing schema and description; the injected
+// controller re-enforces the action set, ownership, mode, and ceiling.
+func Subagent(style loop.DelegationStyle, catalog []SubagentCatalogEntry) tool.Definition {
+	catalog = cloneSubagentCatalog(catalog)
 	return tool.NewDefinition(subagentToolName, tool.RequiresDelegateController, func(_ context.Context, bindings tool.Bindings) ([]tool.InvokableTool, error) {
-		return []tool.InvokableTool{NewSubagent(delegateSpawner{controller: bindings.Delegate}, nil)}, nil
+		return []tool.InvokableTool{NewSubagent(bindings.Delegate, style, catalog)}, nil
 	})
 }
-
-type delegateSpawner struct{ controller tool.DelegateController }
-
-func (s delegateSpawner) Spawn(
-	ctx context.Context,
-	_ loop.Provenance,
-	agent identity.AgentName,
-	message string,
-	parentToolUseID string,
-) (string, error) {
-	result, err := s.controller.Execute(ctx, tool.DelegateRequest{
-		Operation:       tool.DelegateStart,
-		Agent:           string(agent),
-		Message:         message,
-		Wait:            true,
-		ParentToolUseID: parentToolUseID,
-	})
-	if err != nil {
-		return "", err
-	}
-	if result.DelegateID.IsZero() {
-		return "", &delegateResultError{Status: result.Status, reason: "zero delegate id"}
-	}
-	switch result.Status {
-	case tool.DelegateStatusCompleted:
-		return result.Output, nil
-	case tool.DelegateStatusFailed:
-		return "", &delegateResultError{Status: result.Status, reason: "delegate failed"}
-	case tool.DelegateStatusInterrupted:
-		return "", &delegateResultError{Status: result.Status, reason: "delegate interrupted"}
-	case tool.DelegateStatusTimedOut:
-		return "", &delegateResultError{Status: result.Status, reason: "delegate timed out"}
-	default:
-		return "", &delegateResultError{Status: result.Status, reason: "invalid synchronous status"}
-	}
-}
-
-type delegateResultError struct {
-	Status tool.DelegateStatusValue
-	reason string
-}
-
-func (e *delegateResultError) Error() string {
-	return "tools: invalid delegate result: " + e.reason
-}
-
-var _ Spawner = delegateSpawner{}
 
 func nilInterface(value any) bool {
 	if value == nil {

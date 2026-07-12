@@ -163,6 +163,8 @@ type Session struct {
 	// itself only ever builds native, and the foreign backend is injected here.
 	foreignBuild         foreignloop.Builder
 	foreignBuildRestored foreignloop.RestoredBuilder
+	delegateSubscribe    func(event.EventFilter) (event.Subscription, error)
+	delegateEnqueue      func(context.Context, loop.Backend, command.UserInput) error
 
 	// ws is the workspace snapshot store CheckpointWorkspace archives the session's
 	// working tree into, and wsRoot is the directory it archives. Both are wired
@@ -213,6 +215,19 @@ type Session struct {
 	// gateTimers holds activation-time response-policy timers keyed by GateID.
 	// Protected by gatesMu alongside gates.
 	gateTimers map[gate.ID]*time.Timer
+
+	// topology is the immutable set of loop definitions this session may instantiate,
+	// keyed by agent name. The delegation manager resolves a parent's requested delegate
+	// name to its child definition through it. It is set once at construction (New /
+	// Restore) and never mutated, so it is read without a lock.
+	topology Topology
+
+	// delegation is the parent-to-child delegation mediator: it vends the parent-scoped
+	// tool.DelegateController injected into each loop's Subagent tool, and owns the
+	// in-flight delegate-request map. It is created before the loops (so restore can bind
+	// loop tools against it) and attached to this session once the session exists. Never
+	// nil for a constructed session.
+	delegation *delegationManager
 }
 
 // eventAppender is the session's narrow view of the hub's REQUIRED durable event tap:
@@ -246,6 +261,8 @@ type loopHandle struct {
 	liveMu    sync.RWMutex
 	liveMode  loop.ModeName
 	liveModel inference.Model
+	stateMu   sync.RWMutex
+	state     tool.DelegateStatusValue
 }
 
 func (h *loopHandle) ID() uuid.UUID { return h.id }
@@ -269,11 +286,30 @@ func (h *loopHandle) setLiveView(mode loop.ModeName, model inference.Model) {
 	h.liveMu.Unlock()
 }
 
+func (h *loopHandle) setMechanicalState(status tool.DelegateStatusValue) {
+	h.stateMu.Lock()
+	h.state = status
+	h.stateMu.Unlock()
+}
+
+func (h *loopHandle) mechanicalState() tool.DelegateStatusValue {
+	h.stateMu.RLock()
+	defer h.stateMu.RUnlock()
+	if h.state == tool.DelegateStatusUnknown {
+		return tool.DelegateStatusIdle
+	}
+	return h.state
+}
+
 func (h *loopHandle) Interrupt(context.Context) error { return h.owner.interruptLoopID(h.id) }
 
 type preparedLoop struct {
 	id    uuid.UUID
 	bound loop.BoundDefinition
+}
+
+type loopEventPublisher interface {
+	PublishEvent(context.Context, event.Event) error
 }
 
 // eventSubscriber is the consumer-facing half of the session fan-in: a TUI/CLI (or
@@ -345,7 +381,37 @@ func (s *Session) FaultErr() error {
 // the narrow eventPublisher interface; it never sees the hub, its subscriber set,
 // or its shutdown state (Interface Segregation / least privilege).
 func (s *Session) PublishEvent(ctx context.Context, ev event.Event) error {
-	return s.hub.PublishEvent(ctx, ev)
+	if err := s.hub.PublishEvent(ctx, ev); err != nil {
+		return err
+	}
+	s.recordLoopMechanicalState(ev)
+	return nil
+}
+
+func (s *Session) recordLoopMechanicalState(ev event.Event) {
+	loopID := ev.EventHeader().Coordinates.LoopID
+	if loopID.IsZero() {
+		return
+	}
+	var status tool.DelegateStatusValue
+	switch ev.(type) {
+	case event.TurnStarted:
+		status = tool.DelegateStatusRunning
+	case event.TurnDone, event.LoopIdle:
+		status = tool.DelegateStatusIdle
+	case event.TurnFailed:
+		status = tool.DelegateStatusFailed
+	case event.TurnInterrupted:
+		status = tool.DelegateStatusInterrupted
+	default:
+		return
+	}
+	s.loopsMu.RLock()
+	h := s.loops[loopID]
+	s.loopsMu.RUnlock()
+	if h != nil {
+		h.setMechanicalState(status)
+	}
 }
 
 // SubscribeEvents attaches a consumer to the session fan-in with the given filter.
@@ -533,7 +599,7 @@ func (s *Session) NewLoop(parent loop.Provenance, cfg loop.Definition) (uuid.UUI
 	// parent tool-use id; the private newLoop does the real work. RunSubagent is the
 	// only path that threads a non-empty id (its child's LoopStarted correlates back
 	// to the spawning tool call).
-	return s.newLoop(parent, cfg, "", nil)
+	return s.newLoop(parent, cfg, "", "", nil)
 }
 
 // newLoop is the private loop-creation core behind NewLoop and RunSubagent. It is
@@ -543,7 +609,11 @@ func (s *Session) NewLoop(parent loop.Provenance, cfg loop.Definition) (uuid.UUI
 // passes ""; RunSubagent passes the provider tool-use id of the spawning call. The id
 // rides as a plain parameter into the LoopStarted build only — it touches no identity /
 // Provenance / Header struct, so it never perturbs the loop tree or the quota/depth math.
-func (s *Session) newLoop(parent loop.Provenance, cfg loop.Definition, parentToolUseID string, prepared *preparedLoop) (uuid.UUID, error) {
+func (s *Session) newLoop(parent loop.Provenance, cfg loop.Definition, parentToolUseID string, selectedMode loop.ModeName, prepared *preparedLoop) (uuid.UUID, error) {
+	return s.newLoopWithAdmission(parent, cfg, parentToolUseID, selectedMode, prepared, nil)
+}
+
+func (s *Session) newLoopWithAdmission(parent loop.Provenance, cfg loop.Definition, parentToolUseID string, selectedMode loop.ModeName, prepared *preparedLoop, admission *delegateAdmission) (uuid.UUID, error) {
 	// Whether this spawn counts toward the cumulative spawn quota. The PRIMARY loop is
 	// built by newSession via NewLoop with ZERO provenance (parent.LoopID zero) and must
 	// NOT consume a quota slot (design §6d: "primary excluded"); every subagent spawn
@@ -614,11 +684,48 @@ func (s *Session) newLoop(parent loop.Provenance, cfg loop.Definition, parentToo
 			release()
 			return uuid.UUID{}, &SessionError{Kind: SessionLoopIDGenerationFailed, Cause: err}
 		}
-		bound, err = cfg.Bind(s.sessionCtx, tool.Bindings{SessionID: s.sessionID, LoopID: loopID})
+		bound, err = cfg.Bind(s.sessionCtx, tool.Bindings{SessionID: s.sessionID, LoopID: loopID, Delegate: s.delegation.controllerFor(loopID, cfg), ExtraTools: delegateExtraTools(cfg, s.delegation)})
 		if err != nil {
 			release()
 			return uuid.UUID{}, err
 		}
+	}
+	if counts {
+		s.loopsMu.RLock()
+		parentHandle := s.loops[parent.LoopID]
+		s.loopsMu.RUnlock()
+		var parentPermission loop.PermissionGate
+		if parentHandle != nil && parentHandle.bound != nil {
+			parentPermission = parentHandle.bound.Permission()
+		}
+		bound = loop.AttenuateBoundPermission(bound, parentPermission)
+	}
+	var eventTarget loopEventPublisher = s
+	if admission != nil {
+		admission.sub, err = s.subscribeLoop(loopID)
+		if err != nil {
+			release()
+			return uuid.UUID{}, err
+		}
+		admission.requestID, err = s.newCommandID()
+		if err != nil {
+			_ = admission.sub.Close()
+			release()
+			return uuid.UUID{}, err
+		}
+		admission.command = command.UserInput{Header: command.Header{CommandID: admission.requestID, Agency: identity.AgencyMachine, CreatedAt: s.stampNow()}, Blocks: delegateBlocks(admission.message), NoFold: true}
+		admission.publisher = newDelegateAdmissionPublisher(s)
+		eventTarget = admission.publisher
+	}
+	// Resolve the effective starting mode: a non-empty selectedMode (the delegation
+	// mode-selective spawn) starts the loop directly in that predeclared mode; an empty
+	// selection uses the definition's initial mode. It is recorded on LoopStarted so
+	// replay/restore reconstruct the child deterministically, without a synthetic
+	// LoopModeChanged. A selected mode unknown to the bound definition fails closed below
+	// (loopruntime.NewInMode returns a typed BindError).
+	startedMode := selectedMode
+	if startedMode == "" {
+		startedMode = bound.InitialMode()
 	}
 
 	// Stamp the LoopStarted header (minting its EventID + CreatedAt via the Factory)
@@ -657,20 +764,39 @@ func (s *Session) newLoop(parent loop.Provenance, cfg loop.Definition, parentToo
 	var foreignSID string
 	switch bound.Engine() {
 	case loop.EngineNative:
-		b, err = loopruntime.New(loopCtx, s.sessionID, loopID, parent, s, bound)
+		b, err = loopruntime.NewInMode(loopCtx, s.sessionID, loopID, parent, eventTarget, bound, startedMode)
 	default:
 		if s.foreignBuild == nil {
 			release()
 			cancel()
 			return uuid.UUID{}, &SessionError{Kind: SessionForeignBuilderMissing}
 		}
-		b, foreignSID, err = s.foreignBuild(loopCtx, s.sessionID, loopID, parent, s, bound,
+		selectedBound, selectErr := loop.SelectBoundMode(bound, startedMode)
+		if selectErr != nil {
+			release()
+			cancel()
+			return uuid.UUID{}, selectErr
+		}
+		bound = selectedBound
+		b, foreignSID, err = s.foreignBuild(loopCtx, s.sessionID, loopID, parent, eventTarget, selectedBound,
 			func() (uuid.UUID, error) { return s.newID() }, s.factory)
 	}
 	if err != nil {
 		release()
 		cancel()
+		if admission != nil {
+			_ = admission.sub.Close()
+		}
 		return uuid.UUID{}, err
+	}
+	if admission != nil {
+		s.appendCommand(s.sessionCtx, loopID, admission.command)
+		if err := s.enqueuePreparedDelegate(admission.ctx, b, admission.command); err != nil {
+			release()
+			cancel()
+			_ = admission.sub.Close()
+			return uuid.UUID{}, err
+		}
 	}
 
 	s.loopsMu.Lock()
@@ -697,7 +823,17 @@ func (s *Session) newLoop(parent loop.Provenance, cfg loop.Definition, parentToo
 		cancel()
 		return uuid.UUID{}, &SessionError{Kind: SessionClosing}
 	}
-	s.loops[loopID] = &loopHandle{id: loopID, owner: s, bound: bound, backend: b, parent: parent, cancel: cancel, liveMode: bound.InitialMode(), liveModel: bound.Model()}
+	liveModel := bound.Model()
+	if selected, ok := bound.Mode(startedMode); ok {
+		liveModel = selected.Model
+	}
+	initialState := tool.DelegateStatusIdle
+	if admission != nil {
+		// The initial command has already been accepted behind the publication barrier;
+		// the child is mechanically running even before TurnStarted is released.
+		initialState = tool.DelegateStatusRunning
+	}
+	s.loops[loopID] = &loopHandle{id: loopID, owner: s, bound: bound, backend: b, parent: parent, cancel: cancel, liveMode: startedMode, liveModel: liveModel, state: initialState}
 	s.loopsMu.Unlock()
 
 	// Announce the new loop to subscribers active at creation time. Published AFTER
@@ -710,8 +846,12 @@ func (s *Session) newLoop(parent loop.Provenance, cfg loop.Definition, parentToo
 	// ctx param, so it publishes on the session lifetime (s.sessionCtx). The header
 	// (Coordinates/Cause + minted EventID/CreatedAt) was stamped above before the loop
 	// was built.
-	ev := event.LoopStarted{Header: startedHeader, ParentToolUseID: parentToolUseID, ForeignSID: foreignSID}
-	if err := s.PublishEvent(s.sessionCtx, ev); err != nil {
+	ev := event.LoopStarted{Header: startedHeader, ParentToolUseID: parentToolUseID, ForeignSID: foreignSID, InitialMode: string(startedMode)}
+	publish := s.PublishEvent
+	if admission != nil {
+		publish = s.hub.PublishEventChecked
+	}
+	if err := publish(s.sessionCtx, ev); err != nil {
 		// Mirror New's cleanup-on-publish-failure: the loop is already registered and
 		// its loopCtx cancel is live, so a bare return would leak a cancel-orphaned
 		// loop. Unregister it, roll back the quota reservation (release()), run its cancel,
@@ -723,9 +863,29 @@ func (s *Session) newLoop(parent loop.Provenance, cfg loop.Definition, parentToo
 		s.loopsMu.Unlock()
 		release()
 		cancel()
+		if admission != nil {
+			_ = admission.sub.Close()
+		}
 		return uuid.UUID{}, &SessionError{Kind: SessionContextDone, Cause: err}
 	}
+	if admission != nil {
+		admission.publisher.release()
+	}
 	return loopID, nil
+}
+
+func (s *Session) enqueuePreparedDelegate(ctx context.Context, backend loop.Backend, cmd command.UserInput) error {
+	if s.delegateEnqueue != nil {
+		return s.delegateEnqueue(ctx, backend, cmd)
+	}
+	select {
+	case backend.CommandSink() <- cmd:
+		return nil
+	case <-ctx.Done():
+		return &SessionError{Kind: SessionContextDone, Cause: ctx.Err()}
+	case <-backend.DoneChan():
+		return &SessionError{Kind: SessionLoopExited}
+	}
 }
 
 // depthUnderLock returns the ancestor-chain length a NEW loop spawned under parentLoopID
@@ -883,6 +1043,13 @@ func newSessionTopology(ctx context.Context, topology Topology, newID idGenerato
 	// Limits resolves to positive caps before the first NewLoop — a zero or negative
 	// configured value never silently disables the depth/quota backstop.
 	s.limits = s.limits.withDefaults()
+	// Store the immutable topology and stand up the delegation manager BEFORE any loop is
+	// bound, so each loop's Subagent tool is built against a parent-scoped controller. The
+	// manager is attached to this session so its scoped controllers can spawn + address
+	// children through it.
+	s.topology = cloneTopology(topology)
+	s.delegation = newDelegationManager(s.topology)
+	s.delegation.attach(s)
 	// The Factory mints from closures over the LIVE newID + now fields, so a test
 	// that swaps either after construction pins the stamp too (the same seam the
 	// session's command-id minting uses).
@@ -937,7 +1104,7 @@ func newSessionTopology(ctx context.Context, topology Topology, newID idGenerato
 			sessionCancel()
 			return nil, &SessionError{Kind: SessionLoopIDGenerationFailed, Cause: mintErr}
 		}
-		bound, bindErr := definition.Bind(sessionCtx, tool.Bindings{SessionID: id, LoopID: loopID})
+		bound, bindErr := definition.Bind(sessionCtx, tool.Bindings{SessionID: id, LoopID: loopID, Delegate: s.delegation.controllerFor(loopID, definition), ExtraTools: delegateExtraTools(definition, s.delegation)})
 		if bindErr != nil {
 			sessionCancel()
 			return nil, bindErr
@@ -967,7 +1134,7 @@ func newSessionTopology(ctx context.Context, topology Topology, newID idGenerato
 	}
 
 	for _, primer := range prepared {
-		loopID, createErr := s.newLoop(loop.Provenance{}, primer.def, "", &primer.loop)
+		loopID, createErr := s.newLoop(loop.Provenance{}, primer.def, "", "", &primer.loop)
 		if createErr != nil {
 			sessionCancel()
 			return nil, createErr
@@ -1000,9 +1167,12 @@ func (s *Session) interruptLoop(loopID uuid.UUID, l loop.Backend) {
 	// Intent log (audit-only): append before dispatch; failure is logged and the
 	// best-effort interrupt proceeds.
 	s.appendCommand(s.sessionCtx, loopID, cmd)
+	timer := time.NewTimer(100 * time.Millisecond)
+	defer timer.Stop()
 	select {
 	case l.CommandSink() <- cmd:
 	case <-l.DoneChan():
+	case <-timer.C:
 	}
 }
 
@@ -1053,7 +1223,7 @@ func (s *Session) Submit(ctx context.Context, input []content.Block) (uuid.UUID,
 	s.loopsMu.RLock()
 	active := s.primaryLoopID
 	s.loopsMu.RUnlock()
-	return s.submitToLoop(ctx, active, input, identity.AgencyUser)
+	return s.submitToLoop(ctx, active, input, identity.AgencyUser, false)
 }
 
 // SubmitToLoop is the loop-targeted counterpart of Submit: it sends human-authored
@@ -1073,7 +1243,7 @@ func (s *Session) Submit(ctx context.Context, input []content.Block) (uuid.UUID,
 // nothing was sent and there is no correlation to hand back. It delegates to the shared
 // loop-targeted core submitToLoop with AgencyUser, exactly as Submit does for the primary.
 func (s *Session) SubmitToLoop(ctx context.Context, loopID uuid.UUID, blocks []content.Block) (uuid.UUID, error) {
-	return s.submitToLoop(ctx, loopID, blocks, identity.AgencyUser)
+	return s.submitToLoop(ctx, loopID, blocks, identity.AgencyUser, false)
 }
 
 // submitToLoop submits a UserInput to a SPECIFIC loop with the given Agency,
@@ -1088,7 +1258,7 @@ func (s *Session) SubmitToLoop(ctx context.Context, loopID uuid.UUID, blocks []c
 // SessionContextDone, the loop's Done → SessionLoopExited, and an unknown loop id →
 // SessionLoopNotFound. On any of those the returned id is the zero UUID, because
 // nothing was sent and there is no correlation to hand back.
-func (s *Session) submitToLoop(ctx context.Context, loopID uuid.UUID, blocks []content.Block, agency identity.Agency) (uuid.UUID, error) {
+func (s *Session) submitToLoop(ctx context.Context, loopID uuid.UUID, blocks []content.Block, agency identity.Agency, noFold bool) (uuid.UUID, error) {
 	// Fail-secure: a faulted session (a required durable append failed) admits no new
 	// work. Checked before any loop lookup or id mint so nothing is sent.
 	if err := s.faultIfFaulted(); err != nil {
@@ -1105,8 +1275,9 @@ func (s *Session) submitToLoop(ctx context.Context, loopID uuid.UUID, blocks []c
 	// Queueable submit: Cause.CommandID is zero (root); the outcome is observed on the
 	// session fan-in. Agency is caller-chosen — AgencyUser for the interactive human
 	// Submit, AgencyMachine for the subagent task submit — so a machine path never
-	// claims user agency.
-	cmd := command.UserInput{Header: command.Header{CommandID: id, Agency: agency, CreatedAt: s.stampNow()}, Blocks: blocks}
+	// claims user agency. noFold is true only for the delegate follow-up path, which must
+	// start a distinct correlated turn rather than fold into the child's running turn.
+	cmd := command.UserInput{Header: command.Header{CommandID: id, Agency: agency, CreatedAt: s.stampNow()}, Blocks: blocks, NoFold: noFold}
 	// Intent log (audit-only): append BEFORE dispatch; an append failure is logged and
 	// the submit proceeds (a lost record must never block the user's input).
 	s.appendCommand(ctx, loopID, cmd)
@@ -1152,7 +1323,7 @@ func (s *Session) RunSubagent(ctx context.Context, parent loop.Provenance, cfg l
 	// shutting down; either way no sub-loop is left behind a returned error.
 	// parentToolUseID is stamped onto that LoopStarted so the sub-loop correlates back
 	// to the spawning Subagent tool call across persist/restore.
-	subLoopID, err := s.newLoop(parent, cfg, parentToolUseID, nil)
+	subLoopID, err := s.newLoop(parent, cfg, parentToolUseID, "", nil)
 	if err != nil {
 		return "", err
 	}
@@ -1177,7 +1348,7 @@ func (s *Session) RunSubagent(ctx context.Context, parent loop.Provenance, cfg l
 
 	// Machine-originated submit: a subagent turn is our code's action, so it stamps
 	// AgencyMachine (the submitToLoop core, not the human-only Submit).
-	cmdID, err := s.submitToLoop(ctx, subLoopID, blocks, identity.AgencyMachine)
+	cmdID, err := s.submitToLoop(ctx, subLoopID, blocks, identity.AgencyMachine, false)
 	if err != nil {
 		return "", err
 	}

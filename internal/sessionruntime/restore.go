@@ -170,6 +170,17 @@ func foldLoopInference(events []event.Event) restoredInference {
 	var ri restoredInference
 	for _, ev := range events {
 		switch e := ev.(type) {
+		case event.LoopStarted:
+			// Seed the mode BASELINE from the durable start mode: a mode-selective spawn
+			// records the selected mode on LoopStarted and emits NO LoopModeChanged, so
+			// without this a child spawned in a non-default mode would resume at the
+			// definition's initial mode (wrong model/effort/tools/instructions). An empty
+			// InitialMode means the definition default; a later LoopModeChanged overrides
+			// this baseline (a mode change also resets any inference override, handled below).
+			if e.InitialMode != "" {
+				ri.Mode = loop.ModeName(e.InitialMode)
+				ri.HasMode = true
+			}
 		case event.LoopModeChanged:
 			ri.Mode = loop.ModeName(e.Mode)
 			ri.HasMode = true

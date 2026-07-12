@@ -273,6 +273,51 @@ func TestDrainToFinalText(t *testing.T) {
 	}
 }
 
+func TestDrainDelegateAnswerUsesExactTurnDoneMessage(t *testing.T) {
+	t.Parallel()
+	cmd, turn := drainUUID(0x31), drainUUID(0x32)
+	sub := newFakeSubscription(3)
+	sub.feed(turnStarted(cmd, turn))
+	sub.feed(stepDone(turn, "progress"))
+	sub.feed(turnDone(turn, nil))
+	text, err := drainDelegateAnswer(context.Background(), sub, cmd, func() {})
+	if err != nil {
+		t.Fatalf("drainDelegateAnswer: %v", err)
+	}
+	if text != "" {
+		t.Fatalf("answer = %q, want exact empty TurnDone message", text)
+	}
+}
+
+func TestDrainDelegateAnswerReturnsAtDeadlineWithoutTerminal(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	sub := newFakeSubscription(0)
+	var interrupts atomic.Int32
+	done := make(chan error, 1)
+	go func() {
+		_, err := drainDelegateAnswer(ctx, sub, drainUUID(0x41), func() { interrupts.Add(1) })
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		var interrupted *drainInterruptedError
+		if !errors.As(err, &interrupted) {
+			t.Fatalf("error = %T %v, want drainInterruptedError", err, err)
+		}
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("drain remained blocked after its deadline")
+	}
+	deadline := time.Now().Add(100 * time.Millisecond)
+	for interrupts.Load() != 1 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if got := interrupts.Load(); got != 1 {
+		t.Fatalf("interrupt calls = %d, want 1", got)
+	}
+}
+
 // TestDrainToFinalTextInterruptOnCtxCancel asserts the ctx-cancel fail-safe in
 // isolation (it needs interleaved goroutine timing the table cannot express):
 // after the opening TurnStarted, cancelling ctx calls interrupt() exactly once,

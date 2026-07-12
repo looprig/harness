@@ -68,8 +68,9 @@ func (e *drainLostError) Unwrap() error { return e.Cause }
 // submit was refused and no turn will ever start, so it short-circuits to the
 // package's typed *TurnRejectedError.
 //
-// The final text is taken from the TurnDone.Message terminal, falling back to the
-// latest StepDone's assistant text when Message is nil/empty.
+// This legacy helper takes final text from TurnDone.Message and falls back to the latest
+// StepDone assistant text. Managed delegation uses drainDelegateAnswer below, where
+// StepDone is progress only and the correlated TurnDone.Message is the exact answer.
 //
 // ctx is the calling turn's context and interrupt is the loop-targeted Interrupt
 // bound to the sub-loop. Submits carry no ctx, so cancelling ctx cannot reach the
@@ -85,6 +86,16 @@ func (e *drainLostError) Unwrap() error { return e.Cause }
 // helper would then block until ctx-cancel or subscription loss. The helper does
 // not — and cannot — enforce this ordering; it is the one subtlety the caller owns.
 func drainToFinalText(ctx context.Context, sub event.Subscription, commandID uuid.UUID, interrupt func()) (string, error) {
+	return drainCorrelated(ctx, sub, commandID, interrupt, true)
+}
+
+// drainDelegateAnswer resolves delegation requests from the correlated TurnDone.Message
+// only. StepDone is progress, never a substitute terminal answer.
+func drainDelegateAnswer(ctx context.Context, sub event.Subscription, commandID uuid.UUID, interrupt func()) (string, error) {
+	return drainCorrelated(ctx, sub, commandID, interrupt, false)
+}
+
+func drainCorrelated(ctx context.Context, sub event.Subscription, commandID uuid.UUID, interrupt func(), stepFallback bool) (string, error) {
 	var (
 		turnID    uuid.UUID // captured from the opening TurnStarted (phase-1 -> phase-2 edge)
 		loopID    uuid.UUID // captured alongside turnID; phase-2 cross-checks it (fail-secure)
@@ -103,7 +114,7 @@ func drainToFinalText(ctx context.Context, sub event.Subscription, commandID uui
 			if !ok {
 				return "", &drainLostError{Cause: sub.Err()}
 			}
-			if text, done, err := handleEvent(d.Event, commandID, &turnID, &loopID, &haveTurn, &lastStep); done {
+			if text, done, err := handleCorrelatedEvent(d.Event, commandID, &turnID, &loopID, &haveTurn, &lastStep, stepFallback); done {
 				return text, err
 			}
 			continue
@@ -114,13 +125,21 @@ func drainToFinalText(ctx context.Context, sub event.Subscription, commandID uui
 			if !ok {
 				return "", &drainLostError{Cause: sub.Err()}
 			}
-			if text, done, err := handleEvent(d.Event, commandID, &turnID, &loopID, &haveTurn, &lastStep); done {
+			if text, done, err := handleCorrelatedEvent(d.Event, commandID, &turnID, &loopID, &haveTurn, &lastStep, stepFallback); done {
 				return text, err
 			}
 		case <-ctx.Done():
 			// Boundary cancel: the submit carried no ctx, so translate it into a
 			// single loop-targeted Interrupt and keep draining for the resulting
 			// TurnInterrupted terminal.
+			if !stepFallback {
+				// Managed delegation has a real caller-supplied deadline. Do not turn that
+				// bound into an unbounded terminal drain when a provider ignores cancel.
+				// The session-owned interrupt path is fire-and-forget; the caller closes
+				// its subscription immediately after this typed terminal is returned.
+				go interrupt()
+				return "", &drainInterruptedError{}
+			}
 			ctxClosed = true
 			if !fired {
 				fired = true
@@ -141,6 +160,18 @@ func handleEvent(
 	loopID *uuid.UUID,
 	haveTurn *bool,
 	lastStep *string,
+) (text string, done bool, err error) {
+	return handleCorrelatedEvent(ev, commandID, turnID, loopID, haveTurn, lastStep, true)
+}
+
+func handleCorrelatedEvent(
+	ev event.Event,
+	commandID uuid.UUID,
+	turnID *uuid.UUID,
+	loopID *uuid.UUID,
+	haveTurn *bool,
+	lastStep *string,
+	stepFallback bool,
 ) (text string, done bool, err error) {
 	if !*haveTurn {
 		// Phase 1: await the opening resolution event for our submit.
@@ -172,7 +203,7 @@ func handleEvent(
 	case event.TurnDone:
 		if e.Coordinates.TurnID == *turnID && e.Coordinates.LoopID == *loopID {
 			final := aiText(e.Message)
-			if final == "" {
+			if final == "" && stepFallback {
 				final = *lastStep
 			}
 			return final, true, nil

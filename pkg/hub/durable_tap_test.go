@@ -102,6 +102,18 @@ func TestEnduringAppendErrorNoDelivery(t *testing.T) {
 	}
 }
 
+func TestPublishEventCheckedReturnsPersistenceFault(t *testing.T) {
+	t.Parallel()
+	session := mustID(t)
+	h := New(session, WithAppender(&fakeAppender{failAll: true}))
+	ev := event.LoopStarted{Header: event.Header{Coordinates: identity.Coordinates{SessionID: session, LoopID: mustID(t)}}}
+	err := h.PublishEventChecked(context.Background(), ev)
+	var fault *SessionPersistenceFault
+	if !errors.As(err, &fault) || !errors.Is(err, errAppend) {
+		t.Fatalf("PublishEventChecked error = %T %v, want persistence fault wrapping append error", err, err)
+	}
+}
+
 // TestEphemeralNotAppended proves an Ephemeral event is NEVER appended (it is
 // reconstructable from a later authoritative event) and is delivered normally.
 func TestEphemeralNotAppended(t *testing.T) {

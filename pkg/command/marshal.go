@@ -165,6 +165,7 @@ func marshalPlain(name CommandName, cmd Command) ([]byte, error) {
 type userInputWire struct {
 	Header
 	Blocks json.RawMessage `json:"blocks,omitempty"`
+	NoFold bool            `json:"no_fold,omitzero"`
 }
 
 func marshalUserInput(c UserInput) ([]byte, error) {
@@ -172,7 +173,7 @@ func marshalUserInput(c UserInput) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	out, err := json.Marshal(userInputWire{Header: c.Header, Blocks: blocks})
+	out, err := json.Marshal(userInputWire{Header: c.Header, Blocks: blocks, NoFold: c.NoFold})
 	if err != nil {
 		return nil, &CommandEncodeError{Type: CommandUserInput, Cause: err}
 	}
@@ -316,7 +317,7 @@ func decodeUserInput(data []byte) (Command, error) {
 	if err != nil {
 		return nil, err
 	}
-	return UserInput{Header: w.Header, Blocks: blocks}, nil
+	return UserInput{Header: w.Header, Blocks: blocks, NoFold: w.NoFold}, nil
 }
 
 func decodeSubagentResult(data []byte) (Command, error) {

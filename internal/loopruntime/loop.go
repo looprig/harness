@@ -199,11 +199,24 @@ func resolveDrainTimeout(d time.Duration) time.Duration {
 // (NewRestored) seeds pre-built committed state instead; both funnel through
 // newLoopWithSeed, which is identical save for that seed.
 func New(loopCtx context.Context, sessionID, loopID uuid.UUID, parent loop.Provenance, events eventPublisher, bound loop.BoundDefinition) (*Loop, error) {
-	cfg, err := configFromBound(bound, "")
+	return NewInMode(loopCtx, sessionID, loopID, parent, events, bound, "")
+}
+
+// NewInMode is New with an explicit starting mode: an EMPTY initialMode uses the
+// definition's initial mode (identical to New), while a non-empty name starts the loop
+// directly in that predeclared mode's effective config — the delegation path's
+// mode-selective spawn, so a child begins in the requested mode without a synthetic
+// LoopModeChanged. An unknown mode name fails with the same typed BindError Bind uses.
+func NewInMode(loopCtx context.Context, sessionID, loopID uuid.UUID, parent loop.Provenance, events eventPublisher, bound loop.BoundDefinition, initialMode loop.ModeName) (*Loop, error) {
+	cfg, err := configFromBound(bound, initialMode)
 	if err != nil {
 		return nil, err
 	}
-	return newLoopWithSeed(loopCtx, sessionID, loopID, parent, events, cfg, bound, bound.InitialMode(), nil)
+	resolved := initialMode
+	if resolved == "" {
+		resolved = bound.InitialMode()
+	}
+	return newLoopWithSeed(loopCtx, sessionID, loopID, parent, events, cfg, bound, resolved, nil)
 }
 
 func newWithConfig(loopCtx context.Context, sessionID, loopID uuid.UUID, parent Provenance, events eventPublisher, cfg runtimeConfig) (*Loop, error) {
@@ -351,6 +364,11 @@ type queuedInput struct {
 	// this", AgencyMachine (the zero default) otherwise.
 	agency identity.Agency
 	msg    *content.UserMessage
+	// noFold marks a delegate follow-up that must NEVER fold into a running turn at a
+	// tool-continuation boundary. drainInbox skips it (and everything behind it), so it
+	// stays queued and starts its OWN distinct turn when the current one finishes —
+	// preserving the request-id → TurnStarted correlation delegate `send` relies on.
+	noFold bool
 }
 
 type loopState struct {
@@ -896,15 +914,26 @@ func runLoop(cfg loopConfig, state loopState) {
 	// TurnFoldedInto resolves it) or via returnQueuedInbox (an abnormal terminal), so the
 	// inbox-exit invariant — every removed entry is resolved exactly once — still holds.
 	drainInbox := func() []queuedInput {
-		if len(state.inbox) == 0 {
+		// Fold only the LEADING run of foldable entries; stop at the first non-folding
+		// entry (a delegate follow-up). A noFold entry — and everything queued behind it
+		// — must start its OWN distinct turn rather than fold into the running turn, so it
+		// stays in the inbox (FIFO preserved) and is popped as a separate turn when the
+		// current one finishes. For the interactive path (every entry foldable) this drains
+		// the whole inbox exactly as before; for the delegate path (every entry noFold) it
+		// drains nothing, so each send becomes its own request-correlated turn.
+		foldable := 0
+		for foldable < len(state.inbox) && !state.inbox[foldable].noFold {
+			foldable++
+		}
+		if foldable == 0 {
 			return nil
 		}
-		// The reply gets its OWN backing array (state.inbox is about to be cleared and
-		// later reused): copy out before moving the entries into draining.
-		batch := make([]queuedInput, len(state.inbox))
-		copy(batch, state.inbox)
-		state.draining = append(state.draining, state.inbox...)
-		state.inbox = nil
+		// The reply gets its OWN backing array (the leading entries are about to move into
+		// draining): copy out before moving them.
+		batch := make([]queuedInput, foldable)
+		copy(batch, state.inbox[:foldable])
+		state.draining = append(state.draining, state.inbox[:foldable]...)
+		state.inbox = append([]queuedInput(nil), state.inbox[foldable:]...)
 		return batch
 	}
 
@@ -1115,7 +1144,7 @@ func runLoop(cfg loopConfig, state loopState) {
 				// its own live state — race-free — and PUBLISHES the typed outcome event
 				// (TurnStarted / InputQueued / TurnRejected) onto the session fan-in. A
 				// UserInput may be rejected, so bypassReject is false.
-				qi := queuedInput{inputID: c.CommandHeader().CommandID, agency: c.CommandHeader().Agency, msg: userMessageFromBlocks(c.Blocks)}
+				qi := queuedInput{inputID: c.CommandHeader().CommandID, agency: c.CommandHeader().Agency, msg: userMessageFromBlocks(c.Blocks), noFold: c.NoFold}
 				decideSubmit(qi, false)
 
 			case command.SubagentResult:

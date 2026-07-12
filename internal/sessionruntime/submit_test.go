@@ -281,7 +281,7 @@ func TestSubmitToLoopTargetsSubLoop(t *testing.T) {
 		}
 	}()
 
-	id, err := s.submitToLoop(context.Background(), subLoopID, nil, identity.AgencyMachine)
+	id, err := s.submitToLoop(context.Background(), subLoopID, nil, identity.AgencyMachine, false)
 	if err != nil {
 		t.Fatalf("submitToLoop: %v", err)
 	}
@@ -474,7 +474,7 @@ func TestSubmitToLoopUnknownLoop(t *testing.T) {
 	t.Parallel()
 	s, cmds, _ := sessionWithFakeLoop() // Commands never read: a send would block forever
 
-	id, err := s.submitToLoop(context.Background(), mustUUID(), []content.Block{&content.TextBlock{Text: "x"}}, identity.AgencyMachine)
+	id, err := s.submitToLoop(context.Background(), mustUUID(), []content.Block{&content.TextBlock{Text: "x"}}, identity.AgencyMachine, false)
 	var se *SessionError
 	if !errors.As(err, &se) || se.Kind != SessionLoopNotFound {
 		t.Fatalf("submitToLoop err = %v, want *SessionError{SessionLoopNotFound}", err)

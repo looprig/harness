@@ -245,6 +245,58 @@ func TestDefinitionPermissionFactory(t *testing.T) {
 	}
 }
 
+type fixedPermissionGate struct {
+	effect   Effect
+	grantErr error
+}
+
+func (g *fixedPermissionGate) Check(context.Context, tool.InvokableTool, string, string) Effect {
+	return g.effect
+}
+func (g *fixedPermissionGate) Grant(context.Context, string, string, tool.ApprovalScope) error {
+	return g.grantErr
+}
+
+func TestAttenuateBoundPermissionMostRestrictiveAndLive(t *testing.T) {
+	t.Parallel()
+	child := &fixedPermissionGate{effect: EffectAutoApprove}
+	parent := &fixedPermissionGate{effect: EffectAsk}
+	d := mustDefinition(t, WithPolicyRevision("permissions"), WithPermissionFactory(func(context.Context, tool.Bindings) (PermissionGate, error) {
+		return child, nil
+	}))
+	bound, err := d.Bind(context.Background(), validToolBindings(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	attenuated := AttenuateBoundPermission(bound, parent)
+	if got := attenuated.Permission().Check(context.Background(), nil, "Bash", `{}`); got != EffectAsk {
+		t.Fatalf("AutoApprove child + Ask parent = %v, want Ask", got)
+	}
+	parent.effect = EffectDeny
+	if got := attenuated.Permission().Check(context.Background(), nil, "Bash", `{}`); got != EffectDeny {
+		t.Fatalf("live Deny parent = %v, want Deny", got)
+	}
+	parent.effect = EffectAutoApprove
+	child.effect = EffectAsk
+	if got := attenuated.Permission().Check(context.Background(), nil, "Bash", `{}`); got != EffectAsk {
+		t.Fatalf("Ask child + AutoApprove parent = %v, want Ask", got)
+	}
+	child.effect = Effect(255)
+	if got := attenuated.Permission().Check(context.Background(), nil, "Bash", `{}`); got != EffectDeny {
+		t.Fatalf("invalid child effect = %v, want fail-secure Deny", got)
+	}
+	child.effect = EffectAsk
+
+	sentinel := errors.New("parent grant")
+	parent.grantErr = sentinel
+	if err := attenuated.Permission().Grant(context.Background(), "Bash", `{}`, tool.ScopeSession); !errors.Is(err, sentinel) {
+		t.Fatalf("Grant error = %v, want original parent error", err)
+	}
+	if got := AttenuateBoundPermission(bound, nil).Permission(); got != nil {
+		t.Fatalf("nil parent permission = %T, want fail-secure nil", got)
+	}
+}
+
 func mustDefinition(t *testing.T, opts ...Option) Definition {
 	t.Helper()
 	base := []Option{WithName("agent"), WithInference(&fakeLLM{}, testModel())}

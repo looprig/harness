@@ -265,7 +265,7 @@ func TestSubmitAppendsCommandRecord(t *testing.T) {
 		{
 			name: "machine submitToLoop stamps AgencyMachine",
 			call: func(s *Session, loopID uuid.UUID) (uuid.UUID, error) {
-				return s.submitToLoop(context.Background(), loopID, nil, identity.AgencyMachine)
+				return s.submitToLoop(context.Background(), loopID, nil, identity.AgencyMachine, false)
 			},
 			wantAgency: identity.AgencyMachine,
 		},

@@ -166,7 +166,7 @@ func TestSubmitAgencyReachesTurnStarted(t *testing.T) {
 		{
 			name: "machine submitToLoop -> TurnStarted.Cause.Agency AgencyMachine",
 			call: func(t *testing.T, s *Session) {
-				if _, err := s.submitToLoop(context.Background(), s.primaryLoopID, nil, identity.AgencyMachine); err != nil {
+				if _, err := s.submitToLoop(context.Background(), s.primaryLoopID, nil, identity.AgencyMachine, false); err != nil {
 					t.Fatalf("submitToLoop: %v", err)
 				}
 			},

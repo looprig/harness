@@ -82,7 +82,7 @@ func (s *Session) attachRestoredLoop(started event.LoopStarted, parent loop.Prov
 	}
 	liveMode, liveModel := liveViewFor(bound, ri)
 	s.loopsMu.Lock()
-	s.loops[started.LoopID] = &loopHandle{id: started.LoopID, owner: s, bound: bound, backend: backend, parent: parent, cancel: cancel, liveMode: liveMode, liveModel: liveModel}
+	s.loops[started.LoopID] = &loopHandle{id: started.LoopID, owner: s, bound: bound, backend: backend, parent: parent, cancel: cancel, liveMode: liveMode, liveModel: liveModel, state: tool.DelegateStatusIdle}
 	s.loopsMu.Unlock()
 	return nil
 }
@@ -210,7 +210,13 @@ func restoreTopologySession(
 	if err != nil {
 		return recordErrored(err)
 	}
-	plans, activePlan, err := planLoops(sessionCtx, sessionID, topology, activeDefinition, roots, starts, allRecords, allowMismatch)
+	// Stand up the delegation manager BEFORE binding any loop so each restored loop's
+	// Subagent tool is bound against a parent-scoped controller; it is attached to the
+	// live session once buildRestoredSession creates it. Seed its durable request→terminal
+	// index from the full stream so a wait for a wait:false request submitted before the
+	// restart resolves after restore.
+	manager := newDelegationManager(topology)
+	plans, activePlan, err := planLoops(sessionCtx, sessionID, topology, activeDefinition, roots, starts, allRecords, allowMismatch, manager)
 	if err != nil {
 		return recordErrored(err)
 	}
@@ -264,20 +270,26 @@ func restoreTopologySession(
 	// (6) Crash-seam: an open turn (a TurnStarted with no terminal) is closed durably
 	// with a TurnInterrupted carrying the open turn's id + index, so the resumed loop
 	// never observes a half-open turn.
+	var crashClosures []event.Event
 	for _, plan := range plans {
 		if !plan.folded.OpenTurn {
 			continue
 		}
 		turnID, turnIdx := openTurnCoords(plan.events)
-		if err := appendRestoreEvent(ctx, j, factory, event.TurnInterrupted{
+		closure := event.TurnInterrupted{
 			Header: event.Header{Coordinates: identity.Coordinates{
 				SessionID: sessionID, LoopID: plan.started.LoopID, TurnID: turnID,
 			}},
 			TurnIndex: turnIdx,
-		}); err != nil {
+		}
+		if err := appendRestoreEvent(ctx, j, factory, closure); err != nil {
 			return recordErrored(&RestoreError{Kind: RestoreAppendFailed, Cause: err})
 		}
+		crashClosures = append(crashClosures, closure)
 	}
+	// Correlation is seeded only after every checked crash closure committed, so an open
+	// wait:false request resolves as Interrupted after restore rather than unknown.
+	reseedResolvedAfterCrashClosures(manager, all, crashClosures)
 
 	// (6b) Materialize the workspace ref selected by the latest durable transition BEFORE
 	// declaring the restore done, so
@@ -318,6 +330,12 @@ func restoreTopologySession(
 	if err != nil {
 		return recordErrored(err)
 	}
+	// Attach the delegation manager the loop tools were bound against, so the restored
+	// session's scoped controllers can spawn + address children. Ownership survives
+	// restore through the loop registry's parent links (re-seeded by attachAndActivate).
+	s.topology = cloneTopology(topology)
+	s.delegation = manager
+	manager.attach(s)
 	// (7) Post-build wiring: register every non-primary restored loop, resolve + validate the
 	// durable active selection, and set it as the session primary. Any failure cancels the
 	// session context (tearing down the seeded loops) before recording a RestoreErrored.
@@ -404,8 +422,9 @@ func discoverRoots(all []event.Event, topology Topology, allowMismatch bool) (ma
 // unknown (subagents of a single-definition run). It is the single Bind of each loop,
 // performed inside the restore lease. It returns the ordered plans and the active plan, or a
 // typed error the caller records as a RestoreErrored.
-func planLoops(sessionCtx context.Context, sessionID uuid.UUID, topology Topology, activeDefinition loop.Definition, roots map[identity.AgentName]event.LoopStarted, starts []event.LoopStarted, allRecords []journal.JournalRecord, allowMismatch bool) ([]loopPlan, loopPlan, error) {
+func planLoops(sessionCtx context.Context, sessionID uuid.UUID, topology Topology, activeDefinition loop.Definition, roots map[identity.AgentName]event.LoopStarted, starts []event.LoopStarted, allRecords []journal.JournalRecord, allowMismatch bool, manager *delegationManager) ([]loopPlan, loopPlan, error) {
 	plans := make([]loopPlan, 0, len(starts))
+	boundByLoop := make(map[uuid.UUID]loop.BoundDefinition, len(starts))
 	activeIndex := -1
 	for _, started := range starts {
 		definition, ok := topology.definition(started.AgentName)
@@ -423,13 +442,22 @@ func planLoops(sessionCtx context.Context, sessionID uuid.UUID, topology Topolog
 			// invents a missing definition here).
 			return nil, loopPlan{}, &RestoreError{Kind: RestoreLoopFailed, Cause: &AgentNameMismatchError{Persisted: started.AgentName}}
 		}
-		bound, bindErr := definition.Bind(sessionCtx, tool.Bindings{SessionID: sessionID, LoopID: started.LoopID})
+		bound, bindErr := definition.Bind(sessionCtx, tool.Bindings{SessionID: sessionID, LoopID: started.LoopID, Delegate: manager.controllerFor(started.LoopID, definition), ExtraTools: delegateExtraTools(definition, manager)})
 		if bindErr != nil {
 			return nil, loopPlan{}, &RestoreError{Kind: RestoreLoopFailed, Cause: bindErr}
 		}
 		if nameErr := checkAgentName(started.AgentName, bound.Name(), allowMismatch); nameErr != nil {
 			return nil, loopPlan{}, nameErr
 		}
+		if parentID := started.Cause.Coordinates.LoopID; !parentID.IsZero() {
+			parentBound := boundByLoop[parentID]
+			var parentPermission loop.PermissionGate
+			if parentBound != nil {
+				parentPermission = parentBound.Permission()
+			}
+			bound = loop.AttenuateBoundPermission(bound, parentPermission)
+		}
+		boundByLoop[started.LoopID] = bound
 		loopEvents := eventsFromRecords(allRecords, started.LoopID)
 		plans = append(plans, loopPlan{started: started, bound: bound, events: loopEvents, folded: foldPrimaryLoop(loopEvents)})
 		if started.LoopID == roots[topology.ActivePrimer].LoopID {
@@ -590,7 +618,7 @@ func buildRestoredSession(
 		return nil, &RestoreError{Kind: RestoreLoopFailed, Cause: err}
 	}
 	liveMode, liveModel := liveViewFor(cfg, ri)
-	s.loops[primaryLoopID] = &loopHandle{id: primaryLoopID, owner: s, bound: cfg, backend: l, parent: loop.Provenance{}, cancel: cancel, liveMode: liveMode, liveModel: liveModel}
+	s.loops[primaryLoopID] = &loopHandle{id: primaryLoopID, owner: s, bound: cfg, backend: l, parent: loop.Provenance{}, cancel: cancel, liveMode: liveMode, liveModel: liveModel, state: tool.DelegateStatusIdle}
 	s.primaryLoopID = primaryLoopID
 	return s, nil
 }

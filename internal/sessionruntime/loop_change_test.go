@@ -364,3 +364,48 @@ func TestFoldLoopInferenceLastWriteWins(t *testing.T) {
 		})
 	}
 }
+
+// TestFoldLoopInferenceSeedsInitialMode proves restore honors a mode-selective spawn: the
+// baseline mode is seeded from LoopStarted.InitialMode (the spawn records the selected
+// mode there and emits NO LoopModeChanged), an empty InitialMode means the definition
+// default, and a later LoopModeChanged overrides the baseline. Composed with
+// TestRestoreSeedingAgreesWithLiveView (which proves a restoredInference resolves to the
+// right model/effort/system), this proves a child spawned in a named non-default mode
+// restores under that mode's config.
+func TestFoldLoopInferenceSeedsInitialMode(t *testing.T) {
+	t.Parallel()
+	started := func(mode string) event.Event {
+		return event.LoopStarted{Header: event.Header{Coordinates: identity.Coordinates{LoopID: [16]byte{1}}}, InitialMode: mode}
+	}
+	modeChanged := func(prev, next string) event.Event {
+		return event.LoopModeChanged{Header: event.Header{Coordinates: identity.Coordinates{LoopID: [16]byte{1}}}, PreviousMode: prev, Mode: next}
+	}
+	infChanged := func(name string, eff inference.Effort) event.Event {
+		return event.LoopInferenceChanged{Header: event.Header{Coordinates: identity.Coordinates{LoopID: [16]byte{1}}}, Model: validModel(name), Effort: eff}
+	}
+	tests := []struct {
+		name         string
+		events       []event.Event
+		wantMode     loop.ModeName
+		hasMode      bool
+		hasInference bool
+	}{
+		{name: "selected initial mode seeds baseline", events: []event.Event{started("review")}, wantMode: "review", hasMode: true},
+		{name: "empty initial mode is definition default", events: []event.Event{started("")}, hasMode: false},
+		{name: "later mode change overrides start mode", events: []event.Event{started("review"), modeChanged("review", "build")}, wantMode: "build", hasMode: true},
+		{name: "inference override keeps start mode", events: []event.Event{started("review"), infChanged("routed", inference.EffortHigh)}, wantMode: "review", hasMode: true, hasInference: true},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got := foldLoopInference(tt.events)
+			if got.HasMode != tt.hasMode || got.Mode != tt.wantMode {
+				t.Fatalf("mode = %q (has %v), want %q (has %v)", got.Mode, got.HasMode, tt.wantMode, tt.hasMode)
+			}
+			if got.HasInference != tt.hasInference {
+				t.Fatalf("hasInference = %v, want %v", got.HasInference, tt.hasInference)
+			}
+		})
+	}
+}

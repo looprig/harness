@@ -13,6 +13,7 @@ import (
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/foreignloop"
 	"github.com/looprig/harness/pkg/loop"
+	"github.com/looprig/harness/pkg/tool"
 )
 
 // fixedForeignSID is the deterministic session id the fake foreign Builder returns, so
@@ -73,20 +74,73 @@ type fakeForeignBuilder struct {
 	calledLID   uuid.UUID
 	restoreSeed foreignloop.RestoredForeign
 	restoreCall int
+	calledBound loop.BoundDefinition
 }
 
 func (b *fakeForeignBuilder) build(_ context.Context, sessionID, loopID uuid.UUID,
-	_ loop.Provenance, _ foreignloop.EventPublisher, _ loop.BoundDefinition,
+	_ loop.Provenance, _ foreignloop.EventPublisher, bound loop.BoundDefinition,
 	_ func() (uuid.UUID, error), _ *event.Factory) (loop.Backend, string, error) {
 	b.mu.Lock()
 	b.calls++
 	b.calledSID = sessionID
 	b.calledLID = loopID
+	b.calledBound = bound
 	b.mu.Unlock()
 	if b.err != nil {
 		return nil, "", b.err
 	}
 	return b.backend, b.sid, nil
+}
+
+func TestForeignDelegateBuilderReceivesSelectedEffectiveMode(t *testing.T) {
+	t.Parallel()
+	rec := &recordingEventAppender{}
+	builder := &fakeForeignBuilder{sid: fixedForeignSID, backend: newFakeBackend()}
+	parent := delegateParent(loop.DelegationManaged, "child")
+	child := mustDefine(
+		loop.WithName("child"),
+		loop.WithInference(&stubLLM{}, validModel("base-model")),
+		loop.WithEngine(loop.EngineForeignClaude),
+		loop.WithModes(
+			loop.Mode{Name: "build", Model: validModel("build-model"), Instructions: "build instructions"},
+			loop.Mode{Name: "review", Model: validModel("review-model"), Instructions: "review instructions"},
+		),
+		loop.WithInitialMode("build"),
+	)
+	s := newDelegationSession(t, parent, []Option{WithEventAppender(rec), WithForeignBuilder(builder.build, builder.buildRestored)}, child)
+	ctrl := s.delegation.controllerFor(s.PrimaryLoopID(), parent)
+	queued, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateStart, Agent: "child", Mode: "review", Message: "inspect", Wait: false})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if queued.DelegateID.IsZero() {
+		t.Fatal("missing child id")
+	}
+	builder.mu.Lock()
+	bound := builder.calledBound
+	builder.mu.Unlock()
+	if bound == nil {
+		t.Fatal("builder received nil bound definition")
+	}
+	if bound.InitialMode() != "review" || bound.Model().Name != "review-model" || bound.Instructions() != "review instructions" {
+		t.Fatalf("builder bound = mode %q model %q instructions %q, want selected review mode", bound.InitialMode(), bound.Model().Name, bound.Instructions())
+	}
+	var startedMode string
+	for _, ev := range rec.snapshot() {
+		switch e := ev.(type) {
+		case event.LoopStarted:
+			if e.LoopID == queued.DelegateID {
+				startedMode = e.InitialMode
+			}
+		case event.LoopModeChanged:
+			if e.LoopID == queued.DelegateID {
+				t.Fatal("selected foreign start emitted synthetic LoopModeChanged")
+			}
+		}
+	}
+	if startedMode != "review" {
+		t.Fatalf("LoopStarted.InitialMode = %q, want review", startedMode)
+	}
 }
 
 func (b *fakeForeignBuilder) buildRestored(_ context.Context, sessionID, loopID uuid.UUID,
