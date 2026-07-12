@@ -26,7 +26,10 @@ import (
 
 type idGenerator func() (uuid.UUID, error)
 
-const defaultConstructionAbortTimeout = 5 * time.Second
+const (
+	defaultConstructionAbortTimeout = 5 * time.Second
+	leaseReleaseTimeout             = 5 * time.Second
+)
 
 func withConstructionAbortTimeout(timeout time.Duration) Option {
 	return func(s *Session) { s.constructionAbortTimeout = timeout }
@@ -304,10 +307,31 @@ type Session struct {
 	interruptRelease InterruptReleasePolicy
 }
 
+// constructionCleanupOwnedError marks a construction failure after a Session has
+// accepted the lease hooks and become their sole synchronous/background cleanup owner.
+// It unwraps transparently so public typed error matching is unchanged.
+type constructionCleanupOwnedError struct{ cause error }
+
+func (e *constructionCleanupOwnedError) Error() string { return e.cause.Error() }
+func (e *constructionCleanupOwnedError) Unwrap() error { return e.cause }
+
+func constructionCleanupOwned(err error) bool {
+	var owned *constructionCleanupOwnedError
+	return errors.As(err, &owned)
+}
+
 // abortConstruction unwinds collaborators created by a session that will never become
-// reachable. It deliberately emits no normal SessionStopped event. Lease ownership stays
-// with the lifecycle caller, which releases root then session only after this returns.
+// reachable. It deliberately emits no normal SessionStopped event. Once lease hooks have
+// been accepted, the Session owns root-then-session release synchronously or through one
+// background cleanup owner after every collaborator drains.
 func (s *Session) abortConstruction(cause error) {
+	s.abortConstructionAfter(cause, nil)
+}
+
+// abortConstructionAfter gives a restore failure one bounded opportunity to append
+// RestoreErrored before the hub is sealed. A context-ignoring append becomes another
+// drain owned by the single background lease-cleanup owner.
+func (s *Session) abortConstructionAfter(cause error, beforeSeal func(context.Context)) {
 	if cause == nil {
 		cause = context.Canceled
 	}
@@ -317,6 +341,25 @@ func (s *Session) abortConstruction(cause error) {
 	}
 	abortCtx, cancelAbort := context.WithTimeout(context.Background(), abortTimeout)
 	defer cancelAbort()
+	var drains []<-chan struct{}
+	if beforeSeal != nil {
+		preludeDrained := make(chan struct{})
+		go func() {
+			defer close(preludeDrained)
+			beforeSeal(abortCtx)
+		}()
+		select {
+		case <-preludeDrained:
+		case <-abortCtx.Done():
+		}
+		drains = append(drains, preludeDrained)
+	}
+	// Seal durable publication before cancellation can make a backend emit a late
+	// terminal. Already-admitted publishes may finish; their drain participates in
+	// the same ownership barrier as checkpoints and loop backends below.
+	if s.hub != nil {
+		drains = append(drains, s.hub.AbortSession(cause))
+	}
 	if s.checkpointAdmission != nil {
 		s.checkpointAdmission.latch(cause)
 	}
@@ -330,7 +373,7 @@ func (s *Session) abortConstruction(cause error) {
 	}
 	s.gatesMu.Unlock()
 	if s.checkpoints != nil {
-		s.checkpoints.shutdownUntil(abortCtx)
+		drains = append(drains, s.checkpoints.beginShutdown())
 	}
 	if s.sessionCancel != nil {
 		s.sessionCancel()
@@ -348,17 +391,40 @@ func (s *Session) abortConstruction(cause error) {
 	}
 	for _, handle := range loops {
 		if handle.backend != nil && handle.backend.DoneChan() != nil {
-			select {
-			case <-handle.backend.DoneChan():
-			case <-abortCtx.Done():
-				// One shared deadline bounds the whole join. Continue hub cleanup; never
-				// start a goroutine merely to wait on an uncooperative backend.
-			}
+			drains = append(drains, handle.backend.DoneChan())
 		}
 	}
-	if s.hub != nil {
-		s.hub.AbortSession(cause)
+	drained := waitConstructionDrains(abortCtx, drains)
+	cleanup := func() {
+		if !drained {
+			waitConstructionDrains(context.Background(), drains)
+		}
+		// Lease hooks are accepted by the Session before construction starts. Once
+		// accepted, this is their sole teardown owner: root then session, exactly once.
+		s.releaseRootLease(context.Background())
+		s.releaseLease(context.Background())
 	}
+	if drained {
+		cleanup()
+		return
+	}
+	if s.wsRootRelease != nil || s.leaseRelease != nil {
+		// One intentional owner goroutine retains both leases until every collaborator
+		// is truly drained. A permanently stuck collaborator therefore keeps ownership
+		// fenced rather than releasing storage underneath it.
+		go cleanup()
+	}
+}
+
+func waitConstructionDrains(ctx context.Context, drains []<-chan struct{}) bool {
+	for _, drained := range drains {
+		select {
+		case <-drained:
+		case <-ctx.Done():
+			return false
+		}
+	}
+	return true
 }
 
 // eventAppender is the session's narrow view of the hub's REQUIRED durable event tap:
@@ -1309,7 +1375,7 @@ func newSessionTopology(ctx context.Context, topology Topology, newID idGenerato
 	}
 	abort := func(err error) (*Session, error) {
 		s.abortConstruction(err)
-		return nil, err
+		return nil, &constructionCleanupOwnedError{cause: err}
 	}
 	if s.fingerprint == nil && s.frozenFingerprint == nil {
 		return abort(&MissingFingerprintProviderError{})
@@ -1736,35 +1802,39 @@ func (s *Session) Interrupt(ctx context.Context) (bool, error) {
 	return any, err
 }
 
-// releaseLease invokes the lease-release hook EXACTLY ONCE (releaseOnce) on the bounded
-// ctx, swallowing the error (the bucket TTL is the backstop and Shutdown's own error is
+// releaseLease invokes the lease-release hook EXACTLY ONCE (releaseOnce) on a fresh,
+// bounded background context, swallowing the error (the bucket TTL is the backstop and Shutdown's own error is
 // the caller-facing one). It is nil-safe: a headless session (no WithLeaseRelease, no
 // Restore-installed releaser) has no hook and this is a no-op. Idempotent so a second
 // Shutdown never double-releases.
-func (s *Session) releaseLease(ctx context.Context) {
+func (s *Session) releaseLease(_ context.Context) {
 	s.releaseOnce.Do(func() {
 		if s.leaseRelease == nil {
 			return
 		}
-		if err := s.leaseRelease(ctx); err != nil {
-			slog.WarnContext(ctx, "session: lease release on shutdown failed (TTL is the backstop)",
+		releaseCtx, cancel := context.WithTimeout(context.Background(), leaseReleaseTimeout)
+		defer cancel()
+		if err := s.leaseRelease(releaseCtx); err != nil {
+			slog.WarnContext(releaseCtx, "session: lease release on shutdown failed (TTL is the backstop)",
 				"session", s.sessionID, "err", err)
 		}
 	})
 }
 
 // releaseRootLease releases the EXCLUSIVE workspace root lease EXACTLY ONCE
-// (releaseRootOnce), on the bounded ctx, swallowing the error (the lease TTL is the
+// (releaseRootOnce), on a fresh bounded background context, swallowing the error (the lease TTL is the
 // backstop). Nil-safe: per-session, shared, and no-placement sessions have no root lease.
 // Shutdown calls this BEFORE releaseLease so the root lease is relinquished before the
 // session lease (LIFO teardown), and after work/checkpoints have stopped.
-func (s *Session) releaseRootLease(ctx context.Context) {
+func (s *Session) releaseRootLease(_ context.Context) {
 	s.releaseRootOnce.Do(func() {
 		if s.wsRootRelease == nil {
 			return
 		}
-		if err := s.wsRootRelease(ctx); err != nil {
-			slog.WarnContext(ctx, "session: workspace root lease release on shutdown failed (TTL is the backstop)",
+		releaseCtx, cancel := context.WithTimeout(context.Background(), leaseReleaseTimeout)
+		defer cancel()
+		if err := s.wsRootRelease(releaseCtx); err != nil {
+			slog.WarnContext(releaseCtx, "session: workspace root lease release on shutdown failed (TTL is the backstop)",
 				"session", s.sessionID, "err", err)
 		}
 	})

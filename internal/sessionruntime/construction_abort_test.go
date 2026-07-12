@@ -37,10 +37,6 @@ func TestAbortConstructionStopsCollaboratorsWithoutSessionStopped(t *testing.T) 
 	lid, _ := uuid.New()
 	ctx, cancel := context.WithCancel(context.Background())
 	backend := &abortBackend{commands: make(chan command.Command), done: make(chan struct{})}
-	go func() {
-		<-ctx.Done()
-		close(backend.done)
-	}()
 	appender := &recordingEventAppender{}
 	h := hub.New(sid, hub.WithAppender(appender))
 	sub, err := h.SubscribeEvents(event.EventFilter{Enduring: event.LoopScope{All: true}})
@@ -48,13 +44,33 @@ func TestAbortConstructionStopsCollaboratorsWithoutSessionStopped(t *testing.T) 
 		t.Fatal(err)
 	}
 	var timerFired atomic.Bool
+	var releaseMu sync.Mutex
+	var releases []string
+	release := func(name string) func(context.Context) error {
+		return func(ctx context.Context) error {
+			if err := ctx.Err(); err != nil {
+				t.Fatalf("%s release received canceled context: %v", name, err)
+			}
+			releaseMu.Lock()
+			releases = append(releases, name)
+			releaseMu.Unlock()
+			return nil
+		}
+	}
 	timer := time.AfterFunc(100*time.Millisecond, func() { timerFired.Store(true) })
 	s := &Session{
 		sessionID: sid, sessionCtx: ctx, sessionCancel: cancel, hub: h,
 		checkpointAdmission: newCheckpointAdmissionGate(),
 		loops:               map[uuid.UUID]*loopHandle{lid: {id: lid, backend: backend, cancel: cancel}},
 		gates:               map[gate.ID]gateEntry{}, gateTimers: map[gate.ID]*time.Timer{gate.ID(lid): timer},
+		wsRootRelease: release("root"), leaseRelease: release("session"),
 	}
+	latePublish := make(chan error, 1)
+	go func() {
+		<-ctx.Done()
+		latePublish <- s.PublishEventChecked(context.Background(), event.StepDone{})
+		close(backend.done)
+	}()
 	s.abortConstruction(errors.New("construction failed"))
 
 	select {
@@ -76,6 +92,57 @@ func TestAbortConstructionStopsCollaboratorsWithoutSessionStopped(t *testing.T) 
 		if _, stopped := appended.(event.SessionStopped); stopped {
 			t.Fatal("construction abort appended SessionStopped")
 		}
+	}
+	var aborted *hub.SessionAbortedError
+	if err := <-latePublish; !errors.As(err, &aborted) {
+		t.Fatalf("late backend publish error = %T %v, want *hub.SessionAbortedError", err, err)
+	}
+	if got := len(appender.snapshot()); got != 0 {
+		t.Fatalf("late backend touched appender %d times after abort seal", got)
+	}
+	releaseMu.Lock()
+	defer releaseMu.Unlock()
+	if got := releases; len(got) != 2 || got[0] != "root" || got[1] != "session" {
+		t.Fatalf("cooperative construction releases = %v, want [root session] before return", got)
+	}
+}
+
+func TestAbortConstructionTracksBlockingRestoreErroredPrelude(t *testing.T) {
+	sid, _ := uuid.New()
+	ctx, cancel := context.WithCancel(context.Background())
+	preludeEntered := make(chan struct{})
+	preludeRelease := make(chan struct{})
+	released := make(chan struct{})
+	s := &Session{
+		sessionID: sid, sessionCtx: ctx, sessionCancel: cancel, hub: hub.New(sid),
+		checkpointAdmission: newCheckpointAdmissionGate(), loops: map[uuid.UUID]*loopHandle{},
+		gates: map[gate.ID]gateEntry{}, gateTimers: map[gate.ID]*time.Timer{},
+		leaseRelease: func(context.Context) error { close(released); return nil },
+	}
+	withConstructionAbortTimeout(25 * time.Millisecond)(s)
+	start := time.Now()
+	s.abortConstructionAfter(errors.New("restore failed"), func(context.Context) {
+		close(preludeEntered)
+		<-preludeRelease
+	})
+	if elapsed := time.Since(start); elapsed < 20*time.Millisecond || elapsed > 100*time.Millisecond {
+		t.Fatalf("abort with blocked RestoreErrored elapsed = %v, want one bounded deadline", elapsed)
+	}
+	select {
+	case <-preludeEntered:
+	default:
+		t.Fatal("RestoreErrored prelude never started")
+	}
+	select {
+	case <-released:
+		t.Fatal("session lease released while RestoreErrored append remained in flight")
+	default:
+	}
+	close(preludeRelease)
+	select {
+	case <-released:
+	case <-time.After(time.Second):
+		t.Fatal("cleanup owner did not release after RestoreErrored prelude drained")
 	}
 }
 
@@ -126,6 +193,28 @@ func TestAbortConstructionBoundsContextIgnoringCheckpointWorker(t *testing.T) {
 		checkpointAdmission: newCheckpointAdmissionGate(), loops: map[uuid.UUID]*loopHandle{},
 		gates: map[gate.ID]gateEntry{}, gateTimers: map[gate.ID]*time.Timer{},
 	}
+	var releaseMu sync.Mutex
+	var releases []string
+	released := make(chan struct{})
+	s.wsRootRelease = func(ctx context.Context) error {
+		if err := ctx.Err(); err != nil {
+			t.Errorf("root release context = %v, want live", err)
+		}
+		releaseMu.Lock()
+		releases = append(releases, "root")
+		releaseMu.Unlock()
+		return nil
+	}
+	s.leaseRelease = func(ctx context.Context) error {
+		if err := ctx.Err(); err != nil {
+			t.Errorf("session release context = %v, want live", err)
+		}
+		releaseMu.Lock()
+		releases = append(releases, "session")
+		releaseMu.Unlock()
+		close(released)
+		return nil
+	}
 	withConstructionAbortTimeout(25 * time.Millisecond)(s)
 	s.checkpoints = newCheckpointController(checkpointControllerConfig{
 		SessionID: sid,
@@ -151,8 +240,22 @@ func TestAbortConstructionBoundsContextIgnoringCheckpointWorker(t *testing.T) {
 		close(blobs.release)
 		t.Fatal("construction abort blocked on context-ignoring checkpoint worker")
 	}
+	releaseMu.Lock()
+	if len(releases) != 0 {
+		t.Fatalf("leases released before checkpoint drain: %v", releases)
+	}
+	releaseMu.Unlock()
 	close(blobs.release)
-	s.checkpoints.shutdown()
+	select {
+	case <-released:
+	case <-time.After(time.Second):
+		t.Fatal("background cleanup owner did not release after checkpoint drained")
+	}
+	releaseMu.Lock()
+	defer releaseMu.Unlock()
+	if got := releases; len(got) != 2 || got[0] != "root" || got[1] != "session" {
+		t.Fatalf("background construction releases = %v, want [root session] exactly once", got)
+	}
 }
 
 type ignoringPutBlobs struct {

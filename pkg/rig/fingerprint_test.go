@@ -464,6 +464,19 @@ func TestFrozenFingerprintUsesProducedToolNamesWithoutBinding(t *testing.T) {
 	}
 }
 
+func TestFrozenFingerprintNormalizesProducedToolNames(t *testing.T) {
+	t.Parallel()
+
+	definition := tool.NewBundleDefinition("bundle", []string{" Write ", "Read"}, 0, func(context.Context, tool.Bindings) ([]tool.InvokableTool, error) {
+		return []tool.InvokableTool{fpTool{name: "Read"}, fpTool{name: "Write"}}, nil
+	})
+	agent := mustDefine(loop.WithName("agent"), loop.WithInference(&stubLLM{}, validModel("model")), loop.WithTools(definition))
+	fingerprint := frozenFingerprint(ConfigFingerprintFields{}, []loop.Definition{agent}, []string{"agent"}, "agent")
+	if want := hexSHA256("Read\nWrite"); fingerprint.ToolPolicyRev != want {
+		t.Fatalf("ToolPolicyRev = %q, want normalized digest %q", fingerprint.ToolPolicyRev, want)
+	}
+}
+
 func TestFrozenFingerprintIncludesStructurallyInjectedSubagent(t *testing.T) {
 	t.Parallel()
 
@@ -473,6 +486,51 @@ func TestFrozenFingerprintIncludesStructurallyInjectedSubagent(t *testing.T) {
 
 	if want := hexSHA256("Subagent"); fingerprint.ToolPolicyRev != want {
 		t.Fatalf("ToolPolicyRev = %q, want injected Subagent digest %q", fingerprint.ToolPolicyRev, want)
+	}
+}
+
+func TestTopologyRevisionIncludesDelegateProducedToolMetadata(t *testing.T) {
+	t.Parallel()
+
+	bundle := func(produced string) tool.Definition {
+		return tool.NewBundleDefinition("delegate-tool", []string{produced}, 0, func(context.Context, tool.Bindings) ([]tool.InvokableTool, error) {
+			return []tool.InvokableTool{fpTool{name: produced}}, nil
+		})
+	}
+	primer := mustDefine(loop.WithName("primer"), loop.WithInference(&stubLLM{}, validModel("primer")), loop.WithDelegates("worker"))
+	workerA := mustDefine(loop.WithName("worker"), loop.WithInference(&stubLLM{}, validModel("worker")), loop.WithTools(bundle("Read")))
+	workerB := mustDefine(loop.WithName("worker"), loop.WithInference(&stubLLM{}, validModel("worker")), loop.WithTools(bundle("Inspect")))
+
+	a := frozenFingerprint(ConfigFingerprintFields{}, []loop.Definition{primer, workerA}, []string{"primer"}, "primer")
+	b := frozenFingerprint(ConfigFingerprintFields{}, []loop.Definition{primer, workerB}, []string{"primer"}, "primer")
+	if a.TopologyRev == b.TopologyRev {
+		t.Fatal("TopologyRev ignored delegate definition produced-name drift")
+	}
+}
+
+func TestTopologyRevisionIncludesNoninitialModeProducedToolMetadata(t *testing.T) {
+	t.Parallel()
+
+	bundle := func(produced string) tool.Definition {
+		return tool.NewBundleDefinition("mode-tool", []string{produced}, 0, func(context.Context, tool.Bindings) ([]tool.InvokableTool, error) {
+			return []tool.InvokableTool{fpTool{name: produced}}, nil
+		})
+	}
+	define := func(reviewTool string) loop.Definition {
+		return mustDefine(
+			loop.WithName("primer"),
+			loop.WithInference(&stubLLM{}, validModel("model")),
+			loop.WithModes(
+				loop.Mode{Name: "build"},
+				loop.Mode{Name: "review", Tools: []tool.Definition{bundle(reviewTool)}},
+			),
+			loop.WithInitialMode("build"),
+		)
+	}
+	a := frozenFingerprint(ConfigFingerprintFields{}, []loop.Definition{define("Read")}, []string{"primer"}, "primer")
+	b := frozenFingerprint(ConfigFingerprintFields{}, []loop.Definition{define("Inspect")}, []string{"primer"}, "primer")
+	if a.TopologyRev == b.TopologyRev {
+		t.Fatal("TopologyRev ignored noninitial-mode produced-name drift")
 	}
 }
 

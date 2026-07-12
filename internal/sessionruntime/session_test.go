@@ -892,6 +892,41 @@ func TestShutdownThenMethodsExit(t *testing.T) {
 	}
 }
 
+func TestShutdownLeaseHooksUseFreshContextsAfterCallerCancellation(t *testing.T) {
+	t.Parallel()
+
+	sid, _ := uuid.New()
+	sessionCtx, sessionCancel := context.WithCancel(context.Background())
+	var mu sync.Mutex
+	var releases []string
+	release := func(name string) func(context.Context) error {
+		return func(ctx context.Context) error {
+			if err := ctx.Err(); err != nil {
+				t.Errorf("%s release context = %v, want live background context", name, err)
+			}
+			mu.Lock()
+			releases = append(releases, name)
+			mu.Unlock()
+			return nil
+		}
+	}
+	s := &Session{
+		sessionID: sid, sessionCtx: sessionCtx, sessionCancel: sessionCancel,
+		hub: hub.New(sid), loops: map[uuid.UUID]*loopHandle{}, newID: uuid.New,
+		wsRootRelease: release("root"), leaseRelease: release("session"),
+	}
+	callerCtx, cancelCaller := context.WithCancel(context.Background())
+	cancelCaller()
+	if err := s.Shutdown(callerCtx); err != nil {
+		t.Fatalf("Shutdown() error = %v, want nil for empty session", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(releases) != 2 || releases[0] != "root" || releases[1] != "session" {
+		t.Fatalf("release order = %v, want [root session]", releases)
+	}
+}
+
 // TestInterruptDuringRunningTurn is the session-level integration proof that a human
 // Interrupt against a REAL running primary turn returns (true, nil) AND ends that turn
 // on a TurnInterrupted terminal. The turn is started fire-and-forget via Submit (the

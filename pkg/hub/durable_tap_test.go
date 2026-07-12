@@ -3,12 +3,64 @@ package hub
 import (
 	"context"
 	"errors"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/identity"
 )
+
+type blockingAppender struct {
+	entered chan struct{}
+	release chan struct{}
+	calls   atomic.Int32
+}
+
+func (a *blockingAppender) AppendEvent(context.Context, event.Event) (uint64, error) {
+	if a.calls.Add(1) == 1 {
+		close(a.entered)
+	}
+	<-a.release
+	return 1, nil
+}
+
+func TestAbortSessionSealsPublicationAndReportsInflightDrain(t *testing.T) {
+	t.Parallel()
+
+	app := &blockingAppender{entered: make(chan struct{}), release: make(chan struct{})}
+	h := New(mustID(t), WithAppender(app))
+	inflightDone := make(chan error, 1)
+	go func() {
+		inflightDone <- h.PublishEventChecked(context.Background(), event.StepDone{})
+	}()
+	<-app.entered
+
+	drained := h.AbortSession(errors.New("construction failed"))
+	select {
+	case <-drained:
+		t.Fatal("abort drain closed while an admitted publish still used the appender")
+	default:
+	}
+	err := h.PublishEventChecked(context.Background(), event.StepDone{})
+	var aborted *SessionAbortedError
+	if !errors.As(err, &aborted) {
+		t.Fatalf("late checked publish error = %T %v, want *SessionAbortedError", err, err)
+	}
+	if got := app.calls.Load(); got != 1 {
+		t.Fatalf("appender calls after late publish = %d, want 1", got)
+	}
+
+	close(app.release)
+	if err := <-inflightDone; err != nil {
+		t.Fatalf("admitted PublishEventChecked error = %v", err)
+	}
+	select {
+	case <-drained:
+	case <-time.After(time.Second):
+		t.Fatal("abort drain did not close after admitted publish completed")
+	}
+}
 
 // orderingAppender records, on each AppendEvent call, a snapshot of how many events a
 // watched subscription has already buffered. Because a publish is synchronous on the

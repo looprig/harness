@@ -63,7 +63,7 @@ func TestDelegateStatusDoneAliasesCompleted(t *testing.T) {
 type definitionTool struct{ marker byte }
 
 func (*definitionTool) Info(context.Context) (*tool.ToolInfo, error) {
-	return &tool.ToolInfo{Name: "definition-test"}, nil
+	return &tool.ToolInfo{Name: "custom"}, nil
 }
 
 func (*definitionTool) InvokableRun(context.Context, string) (*tool.ToolResult, error) {
@@ -161,6 +161,87 @@ func TestBundleDefinitionProducedToolNamesAreImmutable(t *testing.T) {
 	first[1] = "mutated-output"
 	if got, want := definition.ProducedToolNames(), []string{"ReadFile", "WriteFile", "EditFile"}; !equalStrings(got, want) {
 		t.Fatalf("ProducedToolNames() after caller mutation = %q, want %q", got, want)
+	}
+}
+
+type reportedNameTool struct {
+	info *tool.ToolInfo
+	err  error
+}
+
+func (t *reportedNameTool) Info(context.Context) (*tool.ToolInfo, error) { return t.info, t.err }
+func (*reportedNameTool) InvokableRun(context.Context, string) (*tool.ToolResult, error) {
+	return tool.TextResult("ok"), nil
+}
+
+func TestDefinitionBuildRejectsInvalidProducedToolMetadata(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		declared []string
+		built    []*reportedNameTool
+		kind     tool.ProducedToolNamesErrorKind
+	}{
+		{name: "no declarations", declared: nil, built: []*reportedNameTool{}, kind: tool.ProducedToolNameEmpty},
+		{name: "empty declaration", declared: []string{" "}, built: []*reportedNameTool{{info: &tool.ToolInfo{Name: "Read"}}}, kind: tool.ProducedToolNameEmpty},
+		{name: "duplicate declaration", declared: []string{"Read", " Read "}, built: []*reportedNameTool{{info: &tool.ToolInfo{Name: "Read"}}}, kind: tool.ProducedToolNameDuplicate},
+		{name: "nil info", declared: []string{"Read"}, built: []*reportedNameTool{{}}, kind: tool.BuiltToolInfoInvalid},
+		{name: "empty actual name", declared: []string{"Read"}, built: []*reportedNameTool{{info: &tool.ToolInfo{Name: " "}}}, kind: tool.BuiltToolNameEmpty},
+		{name: "duplicate actual name", declared: []string{"Read"}, built: []*reportedNameTool{{info: &tool.ToolInfo{Name: "Read"}}, {info: &tool.ToolInfo{Name: " Read "}}}, kind: tool.BuiltToolNameDuplicate},
+		{name: "stale declaration", declared: []string{"Read", "Write"}, built: []*reportedNameTool{{info: &tool.ToolInfo{Name: "Read"}}, {info: &tool.ToolInfo{Name: "Edit"}}}, kind: tool.ProducedToolNamesMismatch},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			definition := tool.NewBundleDefinition("bundle", tt.declared, 0, func(context.Context, tool.Bindings) ([]tool.InvokableTool, error) {
+				built := make([]tool.InvokableTool, len(tt.built))
+				for i := range tt.built {
+					built[i] = tt.built[i]
+				}
+				return built, nil
+			})
+			_, err := definition.Build(context.Background(), validBindings())
+			var namesErr *tool.ProducedToolNamesError
+			if !errors.As(err, &namesErr) {
+				t.Fatalf("Build() error = %T %v, want *tool.ProducedToolNamesError", err, err)
+			}
+			if namesErr.Kind != tt.kind {
+				t.Fatalf("ProducedToolNamesError.Kind = %q, want %q", namesErr.Kind, tt.kind)
+			}
+		})
+	}
+}
+
+func TestDefinitionBuildWrapsToolInfoError(t *testing.T) {
+	t.Parallel()
+
+	infoErr := errors.New("describe failed")
+	definition := tool.NewDefinition("Read", 0, func(context.Context, tool.Bindings) ([]tool.InvokableTool, error) {
+		return []tool.InvokableTool{&reportedNameTool{err: infoErr}}, nil
+	})
+	_, err := definition.Build(context.Background(), validBindings())
+	var namesErr *tool.ProducedToolNamesError
+	if !errors.As(err, &namesErr) || namesErr.Kind != tool.BuiltToolInfoInvalid {
+		t.Fatalf("Build() error = %T %v, want BuiltToolInfoInvalid", err, err)
+	}
+	if !errors.Is(err, infoErr) {
+		t.Fatalf("Build() error does not wrap Info error %v", infoErr)
+	}
+}
+
+func TestDefinitionBuildComparesNormalizedProducedNameSets(t *testing.T) {
+	t.Parallel()
+
+	definition := tool.NewBundleDefinition("bundle", []string{" Write ", "Read"}, 0, func(context.Context, tool.Bindings) ([]tool.InvokableTool, error) {
+		return []tool.InvokableTool{
+			&reportedNameTool{info: &tool.ToolInfo{Name: "Read"}},
+			&reportedNameTool{info: &tool.ToolInfo{Name: " Write "}},
+		}, nil
+	})
+	if _, err := definition.Build(context.Background(), validBindings()); err != nil {
+		t.Fatalf("Build() error = %v, want nil", err)
 	}
 }
 

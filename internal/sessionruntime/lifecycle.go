@@ -390,10 +390,12 @@ func (r *Lifecycle) NewSession(ctx context.Context, seed workspacestore.Ref) (*S
 
 	s, err := NewTopology(ctx, r.topology, opts...)
 	if err != nil {
-		// NewSession failed, so the session never took ownership of the lease-release hook — release
-		// it here best-effort so ownership is not stranded.
-		releaseResolvedRoot(ctx, resolved)
-		releaseLease(lease)
+		// A failure after the Session accepted its hooks is already owned by its
+		// synchronous/background construction cleanup. Earlier failures remain here.
+		if !constructionCleanupOwned(err) {
+			releaseResolvedRoot(ctx, resolved)
+			releaseLease(lease)
+		}
 		return nil, &NewSessionError{Kind: NewSessionRuntimeFailed, Cause: err}
 	}
 	// The session now owns both leases (via WithLeaseRelease + withResolvedPlacement); start
@@ -404,11 +406,13 @@ func (r *Lifecycle) NewSession(ctx context.Context, seed workspacestore.Ref) (*S
 
 // releaseResolvedRoot releases a resolved placement's exclusive root lease best-effort on
 // a NewSession failure path (before the session takes ownership). Nil-safe.
-func releaseResolvedRoot(ctx context.Context, resolved *resolvedPlacement) {
+func releaseResolvedRoot(_ context.Context, resolved *resolvedPlacement) {
 	if resolved == nil || resolved.rootRelease == nil {
 		return
 	}
-	_ = resolved.rootRelease(ctx)
+	releaseCtx, cancel := context.WithTimeout(context.Background(), leaseReleaseTimeout)
+	defer cancel()
+	_ = resolved.rootRelease(releaseCtx)
 }
 
 // RestoreSession rebuilds a live session from its durable journal under the id it was created

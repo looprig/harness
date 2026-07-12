@@ -231,7 +231,10 @@ func (d Definition) FingerprintInitial() InitialFingerprint {
 	names := make([]string, 0, len(definitions))
 	for _, definition := range definitions {
 		if !nilLike(definition) {
-			names = append(names, definition.ProducedToolNames()...)
+			producedNames := definition.ProducedToolNames()
+			for _, name := range producedNames {
+				names = append(names, strings.TrimSpace(name))
+			}
 		}
 	}
 	return InitialFingerprint{Model: model, EffectiveSystem: EffectiveSystem(d.state.system, instructions), ToolNames: names}
@@ -253,8 +256,9 @@ func (d Definition) PolicyRevision() string {
 		return ""
 	}
 	type toolPolicy struct {
-		Name         string
-		Requirements tool.Requirements
+		Name          string
+		ProducedNames []string
+		Requirements  tool.Requirements
 	}
 	type modePolicy struct {
 		Name         ModeName
@@ -271,7 +275,12 @@ func (d Definition) PolicyRevision() string {
 				out = append(out, toolPolicy{})
 				continue
 			}
-			out = append(out, toolPolicy{Name: definition.Name(), Requirements: definition.Requirements()})
+			producedNames := definition.ProducedToolNames()
+			for i := range producedNames {
+				producedNames[i] = strings.TrimSpace(producedNames[i])
+			}
+			slices.Sort(producedNames)
+			out = append(out, toolPolicy{Name: definition.Name(), ProducedNames: producedNames, Requirements: definition.Requirements()})
 		}
 		return out
 	}
@@ -370,6 +379,10 @@ func (d Definition) Bind(ctx context.Context, bindings tool.Bindings) (BoundDefi
 				var nilTool *tool.NilBuiltToolError
 				if errors.As(err, &nilTool) {
 					return nil, &BindError{Kind: BindInvalidToolInfo, Name: name, Index: nilTool.Index, Cause: err}
+				}
+				var producedNames *tool.ProducedToolNamesError
+				if errors.As(err, &producedNames) {
+					return nil, &BindError{Kind: BindInvalidToolInfo, Name: name, Index: producedNames.Index, Cause: err}
 				}
 				return nil, err
 			}

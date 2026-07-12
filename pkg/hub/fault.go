@@ -25,6 +25,19 @@ type SessionPersistenceFault struct {
 	Cause error
 }
 
+// SessionAbortedError reports a publish rejected after construction teardown
+// sealed the unpublished session's durable event tap.
+type SessionAbortedError struct{ Cause error }
+
+func (e *SessionAbortedError) Error() string {
+	if e.Cause == nil {
+		return "hub: session aborted"
+	}
+	return "hub: session aborted: " + e.Cause.Error()
+}
+
+func (e *SessionAbortedError) Unwrap() error { return e.Cause }
+
 func (e *SessionPersistenceFault) Error() string {
 	// Name the dynamic event type so a failed SessionStopped append is distinguishable
 	// from a SessionIdle one in an operator log; never log the event payload itself.

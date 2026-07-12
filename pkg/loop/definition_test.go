@@ -3,6 +3,7 @@ package loop
 import (
 	"context"
 	"errors"
+	"slices"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -363,6 +364,49 @@ func TestPolicyRevisionDigest(t *testing.T) {
 	}
 }
 
+func TestPolicyRevisionIncludesNormalizedProducedToolNames(t *testing.T) {
+	t.Parallel()
+
+	bundle := func(names ...string) tool.Definition {
+		return tool.NewBundleDefinition("bundle", names, 0, func(context.Context, tool.Bindings) ([]tool.InvokableTool, error) {
+			return nil, nil
+		})
+	}
+	baseA := mustDefinition(t, WithTools(bundle("Write", " Read ")))
+	baseSameSet := mustDefinition(t, WithTools(bundle("Read", "Write")))
+	baseDrift := mustDefinition(t, WithTools(bundle("Read", "Edit")))
+	if baseA.PolicyRevision() != baseSameSet.PolicyRevision() {
+		t.Fatal("PolicyRevision() changed for reordered/whitespace-equivalent produced names")
+	}
+	if baseA.PolicyRevision() == baseDrift.PolicyRevision() {
+		t.Fatal("PolicyRevision() ignored base produced-name drift")
+	}
+
+	modeA := mustDefinition(t,
+		WithModes(Mode{Name: "plan"}, Mode{Name: "review", Tools: []tool.Definition{bundle("Read")}}),
+		WithInitialMode("plan"),
+	)
+	modeDrift := mustDefinition(t,
+		WithModes(Mode{Name: "plan"}, Mode{Name: "review", Tools: []tool.Definition{bundle("Inspect")}}),
+		WithInitialMode("plan"),
+	)
+	if modeA.PolicyRevision() == modeDrift.PolicyRevision() {
+		t.Fatal("PolicyRevision() ignored noninitial-mode produced-name drift")
+	}
+}
+
+func TestFingerprintInitialNormalizesProducedToolNames(t *testing.T) {
+	t.Parallel()
+
+	bundle := tool.NewBundleDefinition("bundle", []string{" Write ", "Read"}, 0, func(context.Context, tool.Bindings) ([]tool.InvokableTool, error) {
+		return nil, nil
+	})
+	fingerprint := mustDefinition(t, WithTools(bundle)).FingerprintInitial()
+	if got, want := fingerprint.ToolNames, []string{"Write", "Read"}; !slices.Equal(got, want) {
+		t.Fatalf("FingerprintInitial().ToolNames = %q, want %q", got, want)
+	}
+}
+
 func validToolBindings(t *testing.T) tool.Bindings {
 	t.Helper()
 	return tool.Bindings{SessionID: mustUUID(t), LoopID: mustUUID(t), Ceiling: ceiling.New()}
@@ -372,7 +416,7 @@ func testToolDefinition(name string, builds *atomic.Int32, toolNames []string) t
 	if toolNames == nil {
 		toolNames = []string{name}
 	}
-	return tool.NewDefinition(name, 0, func(context.Context, tool.Bindings) ([]tool.InvokableTool, error) {
+	return tool.NewBundleDefinition(name, toolNames, 0, func(context.Context, tool.Bindings) ([]tool.InvokableTool, error) {
 		if builds != nil {
 			builds.Add(1)
 		}

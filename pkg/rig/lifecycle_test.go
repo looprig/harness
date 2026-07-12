@@ -52,11 +52,13 @@ func (lifecycleLLM) Stream(context.Context, inference.Request) (*inference.Strea
 }
 
 type lifecycleRecordingLeaser struct {
-	inner     storage.Leaser
-	mu        sync.Mutex
-	acquired  int
-	released  int
-	onRelease func()
+	inner           storage.Leaser
+	mu              sync.Mutex
+	acquired        int
+	released        int
+	onRelease       func()
+	rejectCanceled  bool
+	canceledRelease bool
 }
 
 func (l *lifecycleRecordingLeaser) Acquire(ctx context.Context, name string) (storage.Lease, error) {
@@ -83,6 +85,11 @@ type lifecycleRecordingLease struct {
 
 func (l *lifecycleRecordingLease) Release(ctx context.Context) error {
 	l.owner.mu.Lock()
+	if l.owner.rejectCanceled && ctx.Err() != nil {
+		l.owner.canceledRelease = true
+		l.owner.mu.Unlock()
+		return errors.New("release received canceled context")
+	}
 	l.owner.released++
 	if l.owner.onRelease != nil {
 		l.owner.onRelease()
@@ -878,7 +885,7 @@ func TestRestoreDoneAppendFailureAbortsBeforeReverseLeaseRelease(t *testing.T) {
 	recordRelease := func(label string) func() {
 		return func() { orderMu.Lock(); releases = append(releases, label); orderMu.Unlock() }
 	}
-	sessionLeaser := &lifecycleRecordingLeaser{inner: backend.Leaser, onRelease: recordRelease("session")}
+	sessionLeaser := &lifecycleRecordingLeaser{inner: backend.Leaser, onRelease: recordRelease("session"), rejectCanceled: true}
 	composite, err := storage.NewComposite(ledger, sessionLeaser, backend.KV, backend.Blobs)
 	if err != nil {
 		t.Fatal(err)
@@ -888,7 +895,7 @@ func TestRestoreDoneAppendFailureAbortsBeforeReverseLeaseRelease(t *testing.T) {
 		t.Fatal(err)
 	}
 	workspaceBackend := memstore.New()
-	rootLeaser := &lifecycleRecordingLeaser{inner: workspaceBackend.Leaser, onRelease: recordRelease("root")}
+	rootLeaser := &lifecycleRecordingLeaser{inner: workspaceBackend.Leaser, onRelease: recordRelease("root"), rejectCanceled: true}
 	workspace, err := workspacestore.Open(workspaceBackend.Blobs)
 	if err != nil {
 		t.Fatal(err)
@@ -925,6 +932,15 @@ func TestRestoreDoneAppendFailureAbortsBeforeReverseLeaseRelease(t *testing.T) {
 		t.Fatalf("release order = %v, want [root session]", releases)
 	}
 	orderMu.Unlock()
+	sessionLeaser.mu.Lock()
+	sessionCanceled := sessionLeaser.canceledRelease
+	sessionLeaser.mu.Unlock()
+	rootLeaser.mu.Lock()
+	rootCanceled := rootLeaser.canceledRelease
+	rootLeaser.mu.Unlock()
+	if sessionCanceled || rootCanceled {
+		t.Fatal("restore cleanup attempted lease release with canceled context")
+	}
 	events := replayRigEvents(t, store, id)
 	stopped := 0
 	errored := 0

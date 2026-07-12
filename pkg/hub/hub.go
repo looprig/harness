@@ -30,6 +30,15 @@ import (
 type Hub struct {
 	sessionID uuid.UUID
 
+	// publishMu is the construction-abort admission seal for durable publication.
+	// AbortSession closes admission atomically and returns publishDrained so the
+	// session can retain journal ownership until every already-admitted publisher
+	// has left the appender path.
+	publishMu      sync.Mutex
+	publishAborted error
+	publishes      int
+	publishDrained chan struct{}
+
 	// mu guards subs, state, and waiters together. One lock keeps the
 	// subscriber-set snapshot consistent with the active/phase transition.
 	mu      sync.RWMutex
@@ -61,15 +70,18 @@ type Hub struct {
 // composition root (Phase 10) injects the real trio via WithAppender/WithFactory/
 // WithFaultReporter.
 func New(sessionID uuid.UUID, opts ...Option) *Hub {
+	publishDrained := make(chan struct{})
+	close(publishDrained)
 	h := &Hub{
-		sessionID:    sessionID,
-		subs:         make(map[*EventSubscription]struct{}),
-		state:        newSessionState(),
-		waiters:      make(map[chan error]struct{}),
-		appender:     nopEventAppender{},
-		factory:      event.NewFactory(uuid.New, time.Now),
-		reporter:     nopFaultReporter{},
-		idleBoundary: immediateSessionIdleBoundary{},
+		sessionID:      sessionID,
+		subs:           make(map[*EventSubscription]struct{}),
+		state:          newSessionState(),
+		waiters:        make(map[chan error]struct{}),
+		appender:       nopEventAppender{},
+		factory:        event.NewFactory(uuid.New, time.Now),
+		reporter:       nopFaultReporter{},
+		idleBoundary:   immediateSessionIdleBoundary{},
+		publishDrained: publishDrained,
 	}
 	for _, opt := range opts {
 		opt(h)
@@ -137,6 +149,13 @@ func (h *Hub) PublishEventChecked(ctx context.Context, ev event.Event) error {
 }
 
 func (h *Hub) publishEvent(ctx context.Context, ev event.Event, checked bool) error {
+	if err := h.beginPublish(); err != nil {
+		if checked {
+			return err
+		}
+		return nil
+	}
+	defer h.finishPublish()
 	// (1)+(2) Ephemeral: no append, seq stays 0. Enduring: append before apply,
 	// fail-secure; capture the durable sequence to ride the live delivery.
 	var seq uint64
@@ -221,6 +240,28 @@ func (h *Hub) publishEvent(ctx context.Context, ev event.Event, checked bool) er
 		h.signalIdleIfEdge(derived)
 	}
 	return nil
+}
+
+func (h *Hub) beginPublish() error {
+	h.publishMu.Lock()
+	defer h.publishMu.Unlock()
+	if h.publishAborted != nil {
+		return &SessionAbortedError{Cause: h.publishAborted}
+	}
+	if h.publishes == 0 {
+		h.publishDrained = make(chan struct{})
+	}
+	h.publishes++
+	return nil
+}
+
+func (h *Hub) finishPublish() {
+	h.publishMu.Lock()
+	h.publishes--
+	if h.publishes == 0 {
+		close(h.publishDrained)
+	}
+	h.publishMu.Unlock()
 }
 
 // applyAndSnapshot is the locked critical section of a publish: it applies the
@@ -528,7 +569,17 @@ func (h *Hub) StopSession(ctx context.Context) {
 
 // AbortSession tears down an unpublished/failed construction without appending or
 // delivering the normal durable SessionStopped lifecycle event.
-func (h *Hub) AbortSession(cause error) {
+func (h *Hub) AbortSession(cause error) <-chan struct{} {
+	if cause == nil {
+		cause = ErrSessionStopped
+	}
+	h.publishMu.Lock()
+	if h.publishAborted == nil {
+		h.publishAborted = cause
+	}
+	drained := h.publishDrained
+	h.publishMu.Unlock()
+
 	h.mu.Lock()
 	h.state.active = make(map[activityKey]struct{})
 	h.state.phase = SessionStopped
@@ -538,6 +589,7 @@ func (h *Hub) AbortSession(cause error) {
 	for _, sub := range subs {
 		sub.fail(cause)
 	}
+	return drained
 }
 
 // WaitIdle blocks until the session is quiescent (active empty), ctx is done, or

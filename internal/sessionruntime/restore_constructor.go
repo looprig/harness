@@ -138,6 +138,10 @@ func restoreTopologySession(
 	for _, opt := range opts {
 		opt(probe)
 	}
+	constructionAbortTimeout := probe.constructionAbortTimeout
+	if constructionAbortTimeout <= 0 {
+		constructionAbortTimeout = defaultConstructionAbortTimeout
+	}
 	if probe.ceiling == nil {
 		probe.ceiling = ceiling.New()
 	}
@@ -186,12 +190,24 @@ func restoreTopologySession(
 	// session lease (LIFO) so a failed restore never strands root-lease ownership.
 	var resolved *resolvedPlacement
 	recordErrored := func(restoreErr error) (*Session, error) {
-		_ = appendRestoreEvent(ctx, j, factory, event.RestoreErrored{
-			Header: event.Header{Coordinates: identity.Coordinates{SessionID: sessionID}},
-			Err:    restoreErr,
+		runRestoreFailureCleanup(constructionAbortTimeout, func(appendCtx context.Context) {
+			_ = appendRestoreEvent(appendCtx, j, factory, event.RestoreErrored{
+				Header: event.Header{Coordinates: identity.Coordinates{SessionID: sessionID}},
+				Err:    restoreErr,
+			})
+		}, func() {
+			releaseResolvedRoot(context.Background(), resolved)
+			releaseLease(lease)
 		})
-		releaseResolvedRoot(ctx, resolved)
-		releaseLease(lease)
+		return nil, restoreErr
+	}
+	abortAccepted := func(s *Session, restoreErr error) (*Session, error) {
+		s.abortConstructionAfter(restoreErr, func(appendCtx context.Context) {
+			_ = appendRestoreEvent(appendCtx, j, factory, event.RestoreErrored{
+				Header: event.Header{Coordinates: identity.Coordinates{SessionID: sessionID}},
+				Err:    restoreErr,
+			})
+		})
 		return nil, restoreErr
 	}
 
@@ -369,6 +385,9 @@ func restoreTopologySession(
 	foreignSID := findForeignSID(primaryEvents)
 	s, err := buildRestoredSession(sessionCtx, sessionCancel, bound, sessionID, primaryLoopID, foreignSID, spawnedCount, ceilingLevel, hasCeiling, folded, activeInference, restoredGates.open, j, factory, newID, now, leaseOpts...)
 	if err != nil {
+		if constructionCleanupOwned(err) {
+			return nil, err
+		}
 		return recordErrored(err)
 	}
 	// Attach the delegation manager the loop tools were bound against, so the restored
@@ -381,22 +400,37 @@ func restoreTopologySession(
 	// durable active selection, and set it as the session primary. Any failure cancels the
 	// session context (tearing down the seeded loops) before recording a RestoreErrored.
 	if err := attachAndActivate(s, all, plans, primaryLoopID); err != nil {
-		s.abortConstruction(err)
-		return recordErrored(err)
+		return abortAccepted(s, err)
 	}
 	// RestoreDone is the commit point: every loop is bound, crash-closed, built,
 	// attached, and the active selection has been validated before this append.
 	if err := appendRestoreEvent(ctx, j, factory, event.RestoreDone{
 		Header: event.Header{Coordinates: identity.Coordinates{SessionID: sessionID}},
 	}); err != nil {
-		s.abortConstruction(err)
-		return recordErrored(&RestoreError{Kind: RestoreAppendFailed, Cause: err})
+		return abortAccepted(s, &RestoreError{Kind: RestoreAppendFailed, Cause: err})
 	}
 	// Start the exclusive root-lease loss watcher now that the restored session owns the
 	// root lease (via leaseOpts). Nil-safe for per-session/shared/no placement.
 	s.watchRootLease()
 	contextTransferred = true
 	return s, nil
+}
+
+func runRestoreFailureCleanup(timeout time.Duration, appendErrored func(context.Context), release func()) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		defer cancel()
+		appendErrored(ctx)
+		release()
+	}()
+	select {
+	case <-done:
+	case <-ctx.Done():
+		// The sole cleanup owner goroutine retains raw ownership while a
+		// context-ignoring append remains inside the journal.
+	}
 }
 
 // loopPlan is a single durable loop staged for restore: its root LoopStarted, its bound
@@ -575,10 +609,6 @@ func buildRestoredSession(
 	now event.Clock,
 	opts ...Option,
 ) (*Session, error) {
-	gateAppender, err := journal.NewJournalGateAppenderChecked(j)
-	if err != nil {
-		return nil, &RestoreError{Kind: RestoreJournalFailed, Cause: err}
-	}
 	s := &Session{
 		sessionID:                sessionID,
 		sessionCtx:               sessionCtx,
@@ -597,7 +627,7 @@ func buildRestoredSession(
 		// Gate directory: restored sessions own a journal-backed appender by default.
 		// Caller opts may replace it below for same-package tests.
 		gateTimers:          map[gate.ID]*time.Timer{},
-		gateAppender:        gateAppender,
+		gateAppender:        nopGateAppender{},
 		checkpointAdmission: newCheckpointAdmissionGate(),
 	}
 	// Apply the same opts the probe read (WithCommandAppender wires the durable intent
@@ -607,6 +637,20 @@ func buildRestoredSession(
 	for _, opt := range opts {
 		opt(s)
 	}
+	abort := func(restoreErr error) (*Session, error) {
+		s.abortConstructionAfter(restoreErr, func(appendCtx context.Context) {
+			_ = appendRestoreEvent(appendCtx, j, factory, event.RestoreErrored{
+				Header: event.Header{Coordinates: identity.Coordinates{SessionID: sessionID}},
+				Err:    restoreErr,
+			})
+		})
+		return nil, &constructionCleanupOwnedError{cause: restoreErr}
+	}
+	gateAppender, err := journal.NewJournalGateAppenderChecked(j)
+	if err != nil {
+		return abort(&RestoreError{Kind: RestoreJournalFailed, Cause: err})
+	}
+	s.gateAppender = gateAppender
 	// Default-mint the security-ceiling source (unless WithCeiling injected the shared one),
 	// then re-seed it from the folded SecurityCeilingChanged events so the recovered session
 	// — and any checker sharing this source — comes up under the ceiling it crashed at (last
@@ -627,8 +671,7 @@ func buildRestoredSession(
 	// hub-synthesized session event is stamped from the same seam.
 	appender, err := journal.NewJournalEventAppenderChecked(j)
 	if err != nil {
-		s.abortConstruction(err)
-		return nil, &RestoreError{Kind: RestoreJournalFailed, Cause: err}
+		return abort(&RestoreError{Kind: RestoreJournalFailed, Cause: err})
 	}
 	hubOpts := []hub.Option{hub.WithAppender(appender), hub.WithFactory(factory), hub.WithFaultReporter(s)}
 	s.hub = hub.New(sessionID, hubOpts...)
@@ -662,14 +705,12 @@ func buildRestoredSession(
 		if foreignSID == "" {
 			cancel()
 			restoreErr := &RestoreError{Kind: RestoreForeignSIDMissing}
-			s.abortConstruction(restoreErr)
-			return nil, restoreErr
+			return abort(restoreErr)
 		}
 		if s.foreignBuildRestored == nil {
 			cancel()
 			restoreErr := &RestoreError{Kind: RestoreForeignBuilderMissing}
-			s.abortConstruction(restoreErr)
-			return nil, restoreErr
+			return abort(restoreErr)
 		}
 		l, err = s.foreignBuildRestored(loopCtx, sessionID, primaryLoopID, loop.Provenance{}, s, cfg,
 			func() (uuid.UUID, error) { return newID() }, factory,
@@ -678,8 +719,7 @@ func buildRestoredSession(
 	if err != nil {
 		cancel()
 		restoreErr := &RestoreError{Kind: RestoreLoopFailed, Cause: err}
-		s.abortConstruction(restoreErr)
-		return nil, restoreErr
+		return abort(restoreErr)
 	}
 	liveMode, liveModel := liveViewFor(cfg, ri)
 	s.loops[primaryLoopID] = &loopHandle{id: primaryLoopID, owner: s, bound: cfg, backend: l, parent: loop.Provenance{}, cancel: cancel, liveMode: liveMode, liveModel: liveModel, state: tool.DelegateStatusIdle}
@@ -743,7 +783,7 @@ func openTurnCoords(events []event.Event) (uuid.UUID, event.TurnIndex) {
 // the lease must not be held (a successor must be able to re-acquire); a release failure
 // is swallowed (the bucket TTL is the backstop) since the restore is already failing.
 func releaseLease(lease journal.Lease) {
-	rctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	rctx, cancel := context.WithTimeout(context.Background(), leaseReleaseTimeout)
 	defer cancel()
 	_ = lease.Release(rctx)
 }

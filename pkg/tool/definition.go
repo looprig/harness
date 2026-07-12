@@ -3,6 +3,7 @@ package tool
 import (
 	"context"
 	"reflect"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -264,6 +265,10 @@ func (d *factoryDefinition) Build(ctx context.Context, bindings Bindings) ([]Inv
 	if unknown := d.requirements &^ knownRequirements; unknown != 0 {
 		return nil, &InvalidRequirementsError{Unknown: unknown}
 	}
+	declared, err := normalizeDeclaredToolNames(d.producedNames)
+	if err != nil {
+		return nil, err
+	}
 	if err := validateBindings(d.requirements, bindings); err != nil {
 		return nil, err
 	}
@@ -279,9 +284,74 @@ func (d *factoryDefinition) Build(ctx context.Context, bindings Bindings) ([]Inv
 			return nil, &NilBuiltToolError{Index: i}
 		}
 	}
+	actual, err := normalizedBuiltToolNames(ctx, built)
+	if err != nil {
+		return nil, err
+	}
+	if !equalToolNameSets(declared, actual) {
+		return nil, &ProducedToolNamesError{Kind: ProducedToolNamesMismatch, Index: -1, Declared: declared, Actual: actual}
+	}
 	result := make([]InvokableTool, len(built))
 	copy(result, built)
 	return result, nil
+}
+
+func normalizeDeclaredToolNames(names []string) ([]string, error) {
+	if len(names) == 0 {
+		return nil, &ProducedToolNamesError{Kind: ProducedToolNameEmpty, Index: -1}
+	}
+	normalized := make([]string, len(names))
+	seen := make(map[string]struct{}, len(names))
+	for i, name := range names {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			return nil, &ProducedToolNamesError{Kind: ProducedToolNameEmpty, Index: i}
+		}
+		if _, exists := seen[name]; exists {
+			return nil, &ProducedToolNamesError{Kind: ProducedToolNameDuplicate, Index: i, Name: name}
+		}
+		seen[name] = struct{}{}
+		normalized[i] = name
+	}
+	sort.Strings(normalized)
+	return normalized, nil
+}
+
+func normalizedBuiltToolNames(ctx context.Context, built []InvokableTool) ([]string, error) {
+	normalized := make([]string, len(built))
+	seen := make(map[string]struct{}, len(built))
+	for i, builtTool := range built {
+		info, err := builtTool.Info(ctx)
+		if err != nil {
+			return nil, &ProducedToolNamesError{Kind: BuiltToolInfoInvalid, Index: i, Cause: err}
+		}
+		if info == nil {
+			return nil, &ProducedToolNamesError{Kind: BuiltToolInfoInvalid, Index: i}
+		}
+		name := strings.TrimSpace(info.Name)
+		if name == "" {
+			return nil, &ProducedToolNamesError{Kind: BuiltToolNameEmpty, Index: i}
+		}
+		if _, exists := seen[name]; exists {
+			return nil, &ProducedToolNamesError{Kind: BuiltToolNameDuplicate, Index: i, Name: name}
+		}
+		seen[name] = struct{}{}
+		normalized[i] = name
+	}
+	sort.Strings(normalized)
+	return normalized, nil
+}
+
+func equalToolNameSets(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for i := range left {
+		if left[i] != right[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func attenuateBindings(requirements Requirements, bindings Bindings) Bindings {
@@ -400,5 +470,49 @@ func (e *NilBuiltToolError) Error() string {
 	}
 	return "tool: factory returned nil tool at index " + strconv.Itoa(e.Index)
 }
+
+// ProducedToolNamesErrorKind identifies a fail-closed produced-name metadata
+// violation discovered while binding a definition.
+type ProducedToolNamesErrorKind string
+
+const (
+	ProducedToolNameEmpty     ProducedToolNamesErrorKind = "declared_name_empty"
+	ProducedToolNameDuplicate ProducedToolNamesErrorKind = "declared_name_duplicate"
+	BuiltToolInfoInvalid      ProducedToolNamesErrorKind = "built_tool_info_invalid"
+	BuiltToolNameEmpty        ProducedToolNamesErrorKind = "built_tool_name_empty"
+	BuiltToolNameDuplicate    ProducedToolNamesErrorKind = "built_tool_name_duplicate"
+	ProducedToolNamesMismatch ProducedToolNamesErrorKind = "produced_names_mismatch"
+)
+
+// ProducedToolNamesError reports that immutable produced-name metadata is
+// invalid or does not exactly describe the concrete tools returned by Build.
+// Declared and Actual contain normalized, sorted names for a set mismatch.
+type ProducedToolNamesError struct {
+	Kind     ProducedToolNamesErrorKind
+	Index    int
+	Name     string
+	Declared []string
+	Actual   []string
+	Cause    error
+}
+
+func (e *ProducedToolNamesError) Error() string {
+	message := "tool: invalid produced tool names: " + string(e.Kind)
+	if e.Index >= 0 {
+		message += " at index " + strconv.Itoa(e.Index)
+	}
+	if e.Name != "" {
+		message += " (" + e.Name + ")"
+	}
+	if e.Kind == ProducedToolNamesMismatch {
+		message += ": declared [" + strings.Join(e.Declared, ", ") + "] actual [" + strings.Join(e.Actual, ", ") + "]"
+	}
+	if e.Cause != nil {
+		message += ": " + e.Cause.Error()
+	}
+	return message
+}
+
+func (e *ProducedToolNamesError) Unwrap() error { return e.Cause }
 
 var _ Definition = (*factoryDefinition)(nil)

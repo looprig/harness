@@ -21,6 +21,38 @@ type failingNewID struct {
 	failOnCall int
 }
 
+func TestPreSessionRestoreFailureRetainsOwnershipUntilErroredAppendDrains(t *testing.T) {
+	t.Parallel()
+
+	appendEntered := make(chan struct{})
+	appendRelease := make(chan struct{})
+	released := make(chan struct{})
+	start := time.Now()
+	runRestoreFailureCleanup(25*time.Millisecond, func(context.Context) {
+		close(appendEntered)
+		<-appendRelease
+	}, func() { close(released) })
+	if elapsed := time.Since(start); elapsed < 20*time.Millisecond || elapsed > 100*time.Millisecond {
+		t.Fatalf("pre-session restore cleanup elapsed = %v, want bounded return", elapsed)
+	}
+	select {
+	case <-appendEntered:
+	default:
+		t.Fatal("RestoreErrored append did not start")
+	}
+	select {
+	case <-released:
+		t.Fatal("ownership released while RestoreErrored append remained in flight")
+	default:
+	}
+	close(appendRelease)
+	select {
+	case <-released:
+	case <-time.After(time.Second):
+		t.Fatal("cleanup owner did not release after RestoreErrored append drained")
+	}
+}
+
 // errMintFailed is the leaf cause an injected id-mint failure surfaces. A sentinel is
 // permitted: it is a context-free leaf used only by this test seam.
 var errMintFailed = errors.New("restore_constructor_test: injected id-mint failure")
