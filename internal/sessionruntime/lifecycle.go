@@ -449,6 +449,9 @@ func (r *Lifecycle) NewSession(ctx context.Context, seed workspacestore.Ref) (*S
 		}
 		return nil, &NewSessionError{Kind: NewSessionRuntimeFailed, Cause: err}
 	}
+	// Gate prepare records retain their private journal encoding; public open/resolve
+	// transitions use the checked hub path so live subscribers see them as well.
+	s.gateAppender = &liveGateAppender{prepared: gateAp, publisher: s}
 	// The session now owns both leases (via WithLeaseRelease + withResolvedPlacement); start
 	// the exclusive root-lease loss watcher so ownership loss faults the session, and arm the
 	// offload-GC runner now the hub exists (bound to hub.IsIdle).

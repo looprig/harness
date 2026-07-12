@@ -50,6 +50,30 @@ type gateAppender interface {
 	AppendGateResolved(ctx context.Context, ev event.GateResolved) error
 }
 
+// liveGateAppender keeps the private prepared payload on the gate journal seam, while
+// routing public GateOpened/GateResolved events through the session's checked hub path.
+// The latter is essential: public gate transitions must be both durably appended and
+// delivered to live subscribers, and PublishEventChecked preserves durable-first failure
+// semantics without double-appending them.
+type liveGateAppender struct {
+	prepared  gateAppender
+	publisher interface {
+		PublishEventChecked(context.Context, event.Event) error
+	}
+}
+
+func (a *liveGateAppender) AppendGatePrepared(ctx context.Context, rec journal.GatePreparedRecord) error {
+	return a.prepared.AppendGatePrepared(ctx, rec)
+}
+
+func (a *liveGateAppender) AppendGateOpened(ctx context.Context, ev event.GateOpened) error {
+	return a.publisher.PublishEventChecked(ctx, ev)
+}
+
+func (a *liveGateAppender) AppendGateResolved(ctx context.Context, ev event.GateResolved) error {
+	return a.publisher.PublishEventChecked(ctx, ev)
+}
+
 // nopGateAppender is the default gateAppender: all appends succeed without doing
 // anything. It keeps headless/no-persistence mode unchanged.
 type nopGateAppender struct{}
