@@ -22,7 +22,7 @@ const (
 	keyActivePrimer        singletonKey = "active_primer"
 	keyDelegationLimits    singletonKey = "delegation_limits"
 	keyConfigFingerprint   singletonKey = "config_fingerprint"
-	keyForeignBuilder      singletonKey = "foreign_builder"
+	keyForeignBuilder      singletonKey = "foreign_builders"
 	keyGateCaps            singletonKey = "gate_caps"
 	keyAllowConfigMismatch singletonKey = "allow_config_mismatch"
 	keyCeilingFactory      singletonKey = "ceiling_factory"
@@ -79,19 +79,44 @@ func WithSessionStore(store *sessionstore.Store) Option {
 }
 
 func WithDelegationLimits(limits DelegationLimits) Option {
-	return singletonCompile(keyDelegationLimits, sessionruntime.WithLifecycleLimits(sessionruntime.Limits{Depth: limits.Depth, Quota: limits.Quota}))
+	return func(state *definitionState) error {
+		if limits.Depth < 0 || limits.Quota < 0 {
+			return &DefinitionError{Kind: DefinitionInvalidDelegationLimits}
+		}
+		return singletonCompile(keyDelegationLimits, sessionruntime.WithLifecycleLimits(sessionruntime.Limits{Depth: limits.Depth, Quota: limits.Quota}))(state)
+	}
 }
 
-func WithConfigFingerprintFields(fields ConfigFingerprintFields) Option {
+func WithFingerprintFields(fields ConfigFingerprintFields) Option {
 	return singleton(keyConfigFingerprint, func(state *definitionState) { state.fingerprintFields = fields })
 }
 
+// WithConfigFingerprintFields is retained until the compatibility cleanup.
+func WithConfigFingerprintFields(fields ConfigFingerprintFields) Option {
+	return WithFingerprintFields(fields)
+}
+
+func WithForeignBuilders(builder foreignloop.Builder, restored foreignloop.RestoredBuilder) Option {
+	return func(state *definitionState) error {
+		if builder == nil || restored == nil {
+			return &DefinitionError{Kind: DefinitionInvalidForeignBuilders}
+		}
+		return singletonCompile(keyForeignBuilder, sessionruntime.WithLifecycleForeignBuilder(builder, restored))(state)
+	}
+}
+
+// WithForeignBuilder is retained until the compatibility cleanup.
 func WithForeignBuilder(builder foreignloop.Builder, restored foreignloop.RestoredBuilder) Option {
-	return singletonCompile(keyForeignBuilder, sessionruntime.WithLifecycleForeignBuilder(builder, restored))
+	return WithForeignBuilders(builder, restored)
 }
 
 func WithGateCaps(caps GateCaps) Option {
-	return singletonCompile(keyGateCaps, sessionruntime.WithLifecycleGateCaps(sessionruntime.GateCaps{MaxOpen: caps.MaxOpen, MaxTimeout: caps.MaxTimeout}))
+	return func(state *definitionState) error {
+		if caps.MaxOpen < 0 || caps.MaxTimeout < 0 {
+			return &DefinitionError{Kind: DefinitionInvalidGateCaps}
+		}
+		return singletonCompile(keyGateCaps, sessionruntime.WithLifecycleGateCaps(sessionruntime.GateCaps{MaxOpen: caps.MaxOpen, MaxTimeout: caps.MaxTimeout}))(state)
+	}
 }
 
 func WithAllowConfigMismatch() Option {

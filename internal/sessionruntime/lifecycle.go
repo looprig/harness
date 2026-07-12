@@ -55,6 +55,8 @@ const (
 	// NewSessionAppenderFailed: a checked journal appender (event/command/gate) could not be
 	// constructed over the opened journal.
 	NewSessionAppenderFailed NewSessionErrorKind = "appender_failed"
+	// NewSessionCeilingFailed: the configured factory returned no per-session ceiling.
+	NewSessionCeilingFailed NewSessionErrorKind = "ceiling_failed"
 	// NewSessionRuntimeFailed: NewSession refused to build the live session over the wired dependencies.
 	NewSessionRuntimeFailed NewSessionErrorKind = "session_failed"
 )
@@ -78,6 +80,12 @@ func (e *NewSessionError) Error() string {
 }
 
 func (e *NewSessionError) Unwrap() error { return e.Cause }
+
+// NilCeilingError reports a per-session ceiling factory that violated its contract.
+// Silently minting the default would hide broken security-policy wiring.
+type NilCeilingError struct{}
+
+func (*NilCeilingError) Error() string { return "session: ceiling factory returned nil" }
 
 // Lifecycle binds a design-time agent definition (cfg) and a durable backend (store) into an
 // immutable, reusable factory for live sessions. NewLifecycle captures the caller-facing
@@ -328,9 +336,15 @@ func (r *Lifecycle) NewSession(ctx context.Context, seed workspacestore.Ref) (*S
 		WithLeaseRelease(lease.Release),
 	)
 	// AMBIGUITY A1: mint a fresh per-session ceiling state so concurrent sessions never share one
-	// mutable clamp. Nil factory falls back to the session's own internal default-mint.
+	// mutable clamp. A configured factory returning nil fails closed; only an absent factory
+	// selects the session's internal default.
 	if r.ceilingFactory != nil {
-		opts = append(opts, WithCeiling(r.ceilingFactory()))
+		state := r.ceilingFactory()
+		if state == nil {
+			releaseLease(lease)
+			return nil, &NewSessionError{Kind: NewSessionCeilingFailed, Cause: &NilCeilingError{}}
+		}
+		opts = append(opts, WithCeiling(state))
 	}
 
 	// Resolve the managed-workspace placement (design §"Placement details"). The session
@@ -411,7 +425,11 @@ func (r *Lifecycle) RestoreSession(ctx context.Context, id uuid.UUID) (*Session,
 	// RestoreSession, which re-seeds the injected state from the folded SecurityCeilingChanged
 	// events), so a restored session gets its own clamp just like a fresh NewSession.
 	if r.ceilingFactory != nil {
-		opts = append(opts, WithCeiling(r.ceilingFactory()))
+		state := r.ceilingFactory()
+		if state == nil {
+			return nil, &NilCeilingError{}
+		}
+		opts = append(opts, WithCeiling(state))
 	}
 	if r.placement.Configured() {
 		opts = append(opts, withPlacementSpec(r.placement))

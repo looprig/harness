@@ -7,10 +7,12 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/ceiling"
 	"github.com/looprig/harness/pkg/event"
+	"github.com/looprig/harness/pkg/foreignloop"
 	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/journal"
 	"github.com/looprig/harness/pkg/loop"
@@ -100,7 +102,7 @@ func TestRigNewShutdownRestore(t *testing.T) {
 		WithLoops(definition),
 		WithPrimers("agent"),
 		WithSessionStore(store),
-		WithConfigFingerprintFields(ConfigFingerprintFields{AgentKind: "test-agent", RuntimeSkills: true}),
+		WithFingerprintFields(ConfigFingerprintFields{AgentKind: "test-agent", RuntimeSkills: true}),
 	)
 	if err != nil {
 		t.Fatalf("Define: %v", err)
@@ -143,6 +145,109 @@ func TestWithCeilingFactoryRejectsNil(t *testing.T) {
 	var target *DefinitionError
 	if !errors.As(err, &target) || target.Kind != DefinitionInvalidCeilingFactory {
 		t.Fatalf("Define() error = %T %v, want invalid-ceiling-factory DefinitionError", err, err)
+	}
+}
+
+func TestDefineRejectsInvalidFinalLifecycleOptions(t *testing.T) {
+	t.Parallel()
+	goodLive := foreignloop.Builder(func(context.Context, uuid.UUID, uuid.UUID, loop.Provenance, foreignloop.EventPublisher, loop.BoundDefinition, func() (uuid.UUID, error), *event.Factory) (loop.Backend, string, error) {
+		return nil, "", nil
+	})
+	goodRestored := foreignloop.RestoredBuilder(func(context.Context, uuid.UUID, uuid.UUID, loop.Provenance, foreignloop.EventPublisher, loop.BoundDefinition, func() (uuid.UUID, error), *event.Factory, foreignloop.RestoredForeign) (loop.Backend, error) {
+		return nil, nil
+	})
+	tests := []struct {
+		name string
+		opt  Option
+		kind DefinitionErrorKind
+	}{
+		{name: "foreign builders both nil", opt: WithForeignBuilders(nil, nil), kind: DefinitionInvalidForeignBuilders},
+		{name: "foreign live builder missing", opt: WithForeignBuilders(nil, goodRestored), kind: DefinitionInvalidForeignBuilders},
+		{name: "foreign restore builder missing", opt: WithForeignBuilders(goodLive, nil), kind: DefinitionInvalidForeignBuilders},
+		{name: "negative delegation depth", opt: WithDelegationLimits(DelegationLimits{Depth: -1}), kind: DefinitionInvalidDelegationLimits},
+		{name: "negative delegation quota", opt: WithDelegationLimits(DelegationLimits{Quota: -1}), kind: DefinitionInvalidDelegationLimits},
+		{name: "negative gate max open", opt: WithGateCaps(GateCaps{MaxOpen: -1}), kind: DefinitionInvalidGateCaps},
+		{name: "negative gate timeout", opt: WithGateCaps(GateCaps{MaxTimeout: -time.Second}), kind: DefinitionInvalidGateCaps},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := Define(tt.opt)
+			var target *DefinitionError
+			if !errors.As(err, &target) || target.Kind != tt.kind {
+				t.Fatalf("Define error = %T %v, want kind %q", err, err, tt.kind)
+			}
+		})
+	}
+}
+
+func TestDefineRejectsEveryDuplicateSingletonOption(t *testing.T) {
+	t.Parallel()
+	store, err := sessionstore.Open(memstore.New())
+	if err != nil {
+		t.Fatal(err)
+	}
+	foreignLive := foreignloop.Builder(func(context.Context, uuid.UUID, uuid.UUID, loop.Provenance, foreignloop.EventPublisher, loop.BoundDefinition, func() (uuid.UUID, error), *event.Factory) (loop.Backend, string, error) {
+		return nil, "", nil
+	})
+	foreignRestored := foreignloop.RestoredBuilder(func(context.Context, uuid.UUID, uuid.UUID, loop.Provenance, foreignloop.EventPublisher, loop.BoundDefinition, func() (uuid.UUID, error), *event.Factory, foreignloop.RestoredForeign) (loop.Backend, error) {
+		return nil, nil
+	})
+	tests := []struct {
+		name string
+		opt  Option
+	}{
+		{name: "active primer", opt: WithActivePrimer("agent")},
+		{name: "session store", opt: WithSessionStore(store)},
+		{name: "delegation limits", opt: WithDelegationLimits(DelegationLimits{})},
+		{name: "fingerprint fields", opt: WithFingerprintFields(ConfigFingerprintFields{AgentKind: "test"})},
+		{name: "foreign builders", opt: WithForeignBuilders(foreignLive, foreignRestored)},
+		{name: "gate caps", opt: WithGateCaps(GateCaps{})},
+		{name: "allow config mismatch", opt: WithAllowConfigMismatch()},
+		{name: "ceiling factory", opt: WithCeilingFactory(func() *ceiling.State { return ceiling.New() })},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			state := &definitionState{seen: make(map[singletonKey]bool)}
+			if err := tt.opt(state); err != nil {
+				t.Fatalf("first option: %v", err)
+			}
+			err := tt.opt(state)
+			var target *DefinitionError
+			if !errors.As(err, &target) || target.Kind != DefinitionDuplicateOption {
+				t.Fatalf("second option error = %T %v, want duplicate", err, err)
+			}
+		})
+	}
+}
+
+func TestDefineFreezesAdditiveOptionInputs(t *testing.T) {
+	t.Parallel()
+	store, err := sessionstore.Open(memstore.New())
+	if err != nil {
+		t.Fatal(err)
+	}
+	planner, err := loop.Define(loop.WithName("planner"), loop.WithInference(&stubLLM{}, validModel("planner")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	definitions := []loop.Definition{planner}
+	primers := []string{"planner"}
+	loopsOption := WithLoops(definitions...)
+	primersOption := WithPrimers(primers...)
+	definitions[0] = loop.Definition{}
+	primers[0] = "mutated"
+
+	r, err := Define(loopsOption, primersOption, WithSessionStore(store))
+	if err != nil {
+		t.Fatalf("Define observed caller mutation: %v", err)
+	}
+	s, err := r.NewSession(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = s.Shutdown(context.Background()) }()
+	if got := s.ActiveLoop().Model().Name; got != "planner" {
+		t.Fatalf("active model = %q, want frozen planner definition", got)
 	}
 }
 

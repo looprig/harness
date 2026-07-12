@@ -225,7 +225,7 @@ func TestFingerprintSystemRevisionIncludesInitialModeInstructions(t *testing.T) 
 // TestFingerprintFromSwarmFieldsEmpty pins that FingerprintFrom derives ONLY the
 // loop.Config fields: the swarm-level fields (AgentKind, RuntimeSkills, WorkspaceRoot)
 // are NOT on loop.Config, so a bare FingerprintFrom leaves them empty/zero — they are
-// injected by the composition root via WithConfigFingerprintFields and merged with
+// injected by the composition root via WithFingerprintFields and merged with
 // fingerprintWith.
 func TestFingerprintFromSwarmFieldsEmpty(t *testing.T) {
 	t.Parallel()

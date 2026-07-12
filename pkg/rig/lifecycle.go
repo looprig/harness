@@ -41,6 +41,10 @@ func (r *Rig) newSession(ctx context.Context, seed workspacestore.Ref) (session.
 func (r *Rig) RestoreSession(ctx context.Context, id uuid.UUID) (session.SessionController, error) {
 	runtime, err := r.lifecycle.RestoreSession(ctx, id)
 	if err != nil {
+		var nilCeiling *sessionruntime.NilCeilingError
+		if errors.As(err, &nilCeiling) {
+			return nil, &LifecycleError{Kind: LifecycleCeilingFailed, Cause: err}
+		}
 		return nil, err
 	}
 	return runtime, nil
@@ -57,6 +61,7 @@ func mapRunError(err error) error {
 		sessionruntime.NewSessionLeaseFailed:        LifecycleLeaseFailed,
 		sessionruntime.NewSessionJournalFailed:      LifecycleJournalFailed,
 		sessionruntime.NewSessionAppenderFailed:     LifecycleAppenderFailed,
+		sessionruntime.NewSessionCeilingFailed:      LifecycleCeilingFailed,
 		sessionruntime.NewSessionRuntimeFailed:      LifecycleSessionFailed,
 	}
 	return &LifecycleError{Kind: kinds[run.Kind], Cause: run.Cause}

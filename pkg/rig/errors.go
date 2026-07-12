@@ -3,17 +3,20 @@ package rig
 type DefinitionErrorKind string
 
 const (
-	DefinitionNilOption             DefinitionErrorKind = "nil_option"
-	DefinitionMissingLoop           DefinitionErrorKind = "missing_loop"
-	DefinitionInvalidLoop           DefinitionErrorKind = "invalid_loop"
-	DefinitionDuplicateLoop         DefinitionErrorKind = "duplicate_loop"
-	DefinitionMissingPrimer         DefinitionErrorKind = "missing_primer"
-	DefinitionInvalidPrimer         DefinitionErrorKind = "invalid_primer"
-	DefinitionInvalidActivePrimer   DefinitionErrorKind = "invalid_active_primer"
-	DefinitionMissingSessionStore   DefinitionErrorKind = "missing_session_store"
-	DefinitionInvalidSessionStore   DefinitionErrorKind = "invalid_session_store"
-	DefinitionInvalidCeilingFactory DefinitionErrorKind = "invalid_ceiling_factory"
-	DefinitionDuplicateOption       DefinitionErrorKind = "duplicate_option"
+	DefinitionNilOption               DefinitionErrorKind = "nil_option"
+	DefinitionMissingLoop             DefinitionErrorKind = "missing_loop"
+	DefinitionInvalidLoop             DefinitionErrorKind = "invalid_loop"
+	DefinitionDuplicateLoop           DefinitionErrorKind = "duplicate_loop"
+	DefinitionMissingPrimer           DefinitionErrorKind = "missing_primer"
+	DefinitionInvalidPrimer           DefinitionErrorKind = "invalid_primer"
+	DefinitionInvalidActivePrimer     DefinitionErrorKind = "invalid_active_primer"
+	DefinitionMissingSessionStore     DefinitionErrorKind = "missing_session_store"
+	DefinitionInvalidSessionStore     DefinitionErrorKind = "invalid_session_store"
+	DefinitionInvalidDelegationLimits DefinitionErrorKind = "invalid_delegation_limits"
+	DefinitionInvalidForeignBuilders  DefinitionErrorKind = "invalid_foreign_builders"
+	DefinitionInvalidGateCaps         DefinitionErrorKind = "invalid_gate_caps"
+	DefinitionInvalidCeilingFactory   DefinitionErrorKind = "invalid_ceiling_factory"
+	DefinitionDuplicateOption         DefinitionErrorKind = "duplicate_option"
 )
 
 type DefinitionError struct {
@@ -43,6 +46,7 @@ const (
 	LifecycleLeaseFailed        LifecycleErrorKind = "lease_failed"
 	LifecycleJournalFailed      LifecycleErrorKind = "journal_failed"
 	LifecycleAppenderFailed     LifecycleErrorKind = "appender_failed"
+	LifecycleCeilingFailed      LifecycleErrorKind = "ceiling_failed"
 	LifecycleSessionFailed      LifecycleErrorKind = "session_failed"
 )
 
