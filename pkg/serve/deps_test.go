@@ -1,6 +1,7 @@
 package serve_test
 
 import (
+	"go/ast"
 	"go/parser"
 	"go/token"
 	"os"
@@ -14,6 +15,61 @@ import (
 	"github.com/looprig/harness/pkg/serve"
 	"github.com/looprig/harness/pkg/session"
 )
+
+var forbiddenServeSurface = map[string]bool{"Runner": true}
+
+func forbiddenServeNames(file *ast.File) []string {
+	var names []string
+	for _, decl := range file.Decls {
+		switch node := decl.(type) {
+		case *ast.FuncDecl:
+			if node.Recv == nil && forbiddenServeSurface[node.Name.Name] {
+				names = append(names, node.Name.Name)
+			}
+		case *ast.GenDecl:
+			for _, spec := range node.Specs {
+				switch named := spec.(type) {
+				case *ast.TypeSpec:
+					if forbiddenServeSurface[named.Name.Name] {
+						names = append(names, named.Name.Name)
+					}
+				case *ast.ValueSpec:
+					for _, name := range named.Names {
+						if forbiddenServeSurface[name.Name] {
+							names = append(names, name.Name)
+						}
+					}
+				}
+			}
+		}
+	}
+	sort.Strings(names)
+	return names
+}
+
+func forbiddenServeDeclarations(filename, source string) ([]string, error) {
+	file, err := parser.ParseFile(token.NewFileSet(), filename, source, 0)
+	if err != nil {
+		return nil, err
+	}
+	return forbiddenServeNames(file), nil
+}
+
+func TestServeBoundaryGuardRejectsLegacyDeclarations(t *testing.T) {
+	source := `package serve
+type Runner interface{}
+var RunnerAlias = Runner(nil)
+var Runner = func() {}
+`
+	got, err := forbiddenServeDeclarations("fixture.go", source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"Runner", "Runner"}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("forbidden declarations = %v, want %v", got, want)
+	}
+}
 
 // Structural-satisfaction proofs (compile-time): the real, concrete session types
 // must satisfy the narrow interfaces serve declares WITHOUT serve importing the
@@ -127,6 +183,28 @@ func TestProductionImportsAreAllowed(t *testing.T) {
 				t.Errorf("file %s imports disallowed path %q; production serve may import only stdlib plus %v",
 					entry.Name(), path, sortedAllowed())
 			}
+		}
+	}
+}
+
+func TestProductionHasNoLegacyDeclarations(t *testing.T) {
+	t.Parallel()
+	dir := packageDir(t)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("read serve package dir %q: %v", dir, err)
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || !isProductionFile(entry.Name()) {
+			continue
+		}
+		path := filepath.Join(dir, entry.Name())
+		file, err := parser.ParseFile(token.NewFileSet(), path, nil, 0)
+		if err != nil {
+			t.Fatalf("parse %s: %v", path, err)
+		}
+		for _, name := range forbiddenServeNames(file) {
+			t.Errorf("production serve file %s declares removed lifecycle name %s", entry.Name(), name)
 		}
 	}
 }

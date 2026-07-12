@@ -86,8 +86,8 @@ type NilCeilingError struct{}
 
 func (*NilCeilingError) Error() string { return "session: ceiling factory returned nil" }
 
-// Lifecycle binds a design-time agent definition (cfg) and a durable backend (store) into an
-// immutable, reusable factory for live sessions. NewTopologyLifecycle captures the caller-facing
+// Lifecycle binds a design-time loop topology and durable backend into an immutable,
+// reusable factory for live sessions. NewTopologyLifecycle captures the caller-facing
 // options once; NewSession mints a fresh session id and brings up a brand-new session over
 // per-session durable dependencies; RestoreSession rebuilds a prior session from its journal.
 // Everything the narrow serve.Rig interface needs
@@ -118,16 +118,13 @@ type Lifecycle struct {
 	// serve.Rig interface minimalism, so it is fixed for the Lifecycle's whole lifetime.
 	allowConfigMismatch bool
 
-	// ceilingFactory mints a FRESH *ceiling.State per NewSession/RestoreSession. AMBIGUITY A1: reusing one
-	// NewTopologyLifecycle-captured cfg across many concurrent NewSession calls would otherwise share ONE mutable
-	// ceiling (cfg.Tools.Permission holds the checker that reads it) — wrong for
-	// multi-session, where each session must clamp independently. The Lifecycle therefore mints
-	// a per-session state here and injects it via WithCeiling so the SESSION's ceiling source is
-	// session-isolated. Every loop PermissionFactory receives this exact live source through
-	// tool.Bindings, so native permission checkers can select consumer-defined postures on
-	// each Check. When the factory is nil the Lifecycle falls
-	// back to today's behavior — the session default-mints its own internal ceiling state
-	// (whatever cfg carries is untouched).
+	// ceilingFactory mints a FRESH *ceiling.State per NewSession/RestoreSession. Reusing one
+	// Lifecycle across concurrent sessions must never reuse mutable ceiling state. The
+	// Lifecycle therefore mints a per-session state here and injects it via WithCeiling so
+	// the session's ceiling source is isolated. Every loop PermissionFactory receives this
+	// exact live source through tool.Bindings, so native permission checkers can select
+	// postures on each Check. When the factory is nil the Lifecycle falls
+	// back to today's behavior — the session default-mints its own internal ceiling state.
 	ceilingFactory    CeilingFactory
 	fingerprint       FingerprintProvider
 	frozenFingerprint *event.ConfigFingerprint

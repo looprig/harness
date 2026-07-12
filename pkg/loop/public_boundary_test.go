@@ -7,9 +7,51 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"testing"
 )
+
+var forbiddenLoopSurface = map[string]bool{
+	"New": true, "NewRestored": true, "Loop": true, "Config": true, "ToolSet": true,
+}
+
+func forbiddenLoopNames(file *ast.File) []string {
+	var names []string
+	for _, decl := range file.Decls {
+		switch node := decl.(type) {
+		case *ast.FuncDecl:
+			if node.Recv == nil && forbiddenLoopSurface[node.Name.Name] {
+				names = append(names, node.Name.Name)
+			}
+		case *ast.GenDecl:
+			for _, spec := range node.Specs {
+				switch named := spec.(type) {
+				case *ast.TypeSpec:
+					if forbiddenLoopSurface[named.Name.Name] {
+						names = append(names, named.Name.Name)
+					}
+				case *ast.ValueSpec:
+					for _, name := range named.Names {
+						if forbiddenLoopSurface[name.Name] {
+							names = append(names, name.Name)
+						}
+					}
+				}
+			}
+		}
+	}
+	sort.Strings(names)
+	return names
+}
+
+func forbiddenLoopDeclarations(filename, source string) ([]string, error) {
+	file, err := parser.ParseFile(token.NewFileSet(), filename, source, 0)
+	if err != nil {
+		return nil, err
+	}
+	return forbiddenLoopNames(file), nil
+}
 
 func TestPublicLoopPackageHasNoActorConstructionSurface(t *testing.T) {
 	_, file, _, ok := runtime.Caller(0)
@@ -21,24 +63,26 @@ func TestPublicLoopPackageHasNoActorConstructionSurface(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parse pkg/loop: %v", err)
 	}
-	forbidden := map[string]bool{
-		"New": true, "NewRestored": true, "Loop": true, "Config": true, "ToolSet": true,
-	}
 	for _, file := range packages["loop"].Files {
-		for _, decl := range file.Decls {
-			switch declaration := decl.(type) {
-			case *ast.FuncDecl:
-				if declaration.Recv == nil && forbidden[declaration.Name.Name] {
-					t.Errorf("pkg/loop still exports actor constructor %s", declaration.Name.Name)
-				}
-			case *ast.GenDecl:
-				for _, spec := range declaration.Specs {
-					if named, ok := spec.(*ast.TypeSpec); ok && forbidden[named.Name.Name] {
-						t.Errorf("pkg/loop still exports actor type %s", named.Name.Name)
-					}
-				}
-			}
+		for _, name := range forbiddenLoopNames(file) {
+			t.Errorf("pkg/loop still exports forbidden actor surface %s", name)
 		}
+	}
+}
+
+func TestLoopBoundaryGuardRejectsExportedValueAliases(t *testing.T) {
+	source := `package loop
+var New = func() {}
+var NewRestored = New
+var Config, ToolSet any
+`
+	got, err := forbiddenLoopDeclarations("fixture.go", source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"Config", "New", "NewRestored", "ToolSet"}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("forbidden declarations = %v, want %v", got, want)
 	}
 }
 

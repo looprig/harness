@@ -6,7 +6,6 @@ import (
 	"go/token"
 	"os"
 	"path/filepath"
-	"regexp"
 	"runtime"
 	"sort"
 	"strconv"
@@ -15,6 +14,96 @@ import (
 )
 
 const modulePath = "github.com/looprig/harness"
+
+func legacySourceViolations(filename string, source any) ([]string, error) {
+	file, err := parser.ParseFile(token.NewFileSet(), filename, source, 0)
+	if err != nil {
+		return nil, err
+	}
+	aliases := make(map[string]string)
+	violations := make(map[string]bool)
+	for _, imp := range file.Imports {
+		importPath, err := strconv.Unquote(imp.Path.Value)
+		if err != nil {
+			return nil, err
+		}
+		kind := ""
+		switch importPath {
+		case modulePath + "/pkg/loop":
+			kind = "loop"
+		case modulePath + "/pkg/session":
+			kind = "session"
+		case modulePath + "/pkg/serve":
+			kind = "serve"
+		default:
+			for _, segment := range strings.Split(importPath, "/") {
+				if segment == "storekit" {
+					kind = "storekit"
+					violations["import "+importPath] = true
+					break
+				}
+			}
+		}
+		if kind == "" {
+			continue
+		}
+		alias := importPath[strings.LastIndex(importPath, "/")+1:]
+		if imp.Name != nil {
+			alias = imp.Name.Name
+		}
+		if alias == "." {
+			violations["dot import "+importPath] = true
+			continue
+		}
+		if alias != "_" {
+			aliases[alias] = kind
+		}
+	}
+
+	selectorNames := make(map[*ast.Ident]bool)
+	ast.Inspect(file, func(node ast.Node) bool {
+		selector, ok := node.(*ast.SelectorExpr)
+		if !ok {
+			return true
+		}
+		selectorNames[selector.Sel] = true
+		prefix, ok := selector.X.(*ast.Ident)
+		if !ok {
+			return true
+		}
+		kind := aliases[prefix.Name]
+		name := selector.Sel.Name
+		switch {
+		case kind == "loop" && (name == "Config" || name == "New" || name == "NewRestored" || name == "ToolSet"):
+			violations["loop."+name] = true
+		case kind == "session" && (name == "Runner" || name == "New" || name == "Restore" || name == "Compile" || strings.HasPrefix(name, "WithCompile")):
+			violations["session."+name] = true
+		case kind == "serve" && name == "Runner":
+			violations["serve.Runner"] = true
+		case kind == "storekit":
+			violations["storekit."+name] = true
+		}
+		return true
+	})
+	ast.Inspect(file, func(node ast.Node) bool {
+		identifier, ok := node.(*ast.Ident)
+		if !ok || selectorNames[identifier] {
+			return true
+		}
+		if identifier.Name == "WithWorkspaceStore" || identifier.Name == "WithConfigFingerprintFields" ||
+			identifier.Name == "WithForeignBuilder" || strings.HasPrefix(identifier.Name, "WithCompile") {
+			violations[identifier.Name] = true
+		}
+		return true
+	})
+
+	out := make([]string, 0, len(violations))
+	for violation := range violations {
+		out = append(out, violation)
+	}
+	sort.Strings(out)
+	return out, nil
+}
 
 func internalSessionRuntimeImportViolations(root string) ([]string, error) {
 	var violations []string
@@ -146,75 +235,6 @@ func TestInternalSessionRuntimeHasNoSingleLoopCompatibilityConstructors(t *testi
 
 func TestNoLegacyLifecycleNamesInActiveSource(t *testing.T) {
 	root := harnessRoot(t)
-	forbiddenIdentifiers := map[string]bool{
-		"WithWorkspace" + "Store":          true,
-		"With" + "Compile":                 true,
-		"WithConfig" + "FingerprintFields": true,
-		"WithForeign" + "Builder":          true,
-	}
-	forbiddenSelectors := map[string]bool{
-		"session." + "Runner": true,
-		"serve." + "Runner":   true,
-	}
-	err := filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		if entry.IsDir() {
-			name := entry.Name()
-			if name == ".git" || name == "vendor" || name == "docs" || name == "examples" {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-		if !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
-			return nil
-		}
-		file, err := parser.ParseFile(token.NewFileSet(), path, nil, parser.ImportsOnly)
-		if err != nil {
-			return err
-		}
-		for _, imp := range file.Imports {
-			importPath, err := strconv.Unquote(imp.Path.Value)
-			if err != nil {
-				return err
-			}
-			if strings.Contains(importPath, "store"+"kit") {
-				t.Errorf("%s imports a removed storage package path %q", path, importPath)
-			}
-		}
-		file, err = parser.ParseFile(token.NewFileSet(), path, nil, 0)
-		if err != nil {
-			return err
-		}
-		ast.Inspect(file, func(node ast.Node) bool {
-			switch n := node.(type) {
-			case *ast.Ident:
-				if forbiddenIdentifiers[n.Name] {
-					t.Errorf("%s uses legacy identifier %s", path, n.Name)
-				}
-			case *ast.SelectorExpr:
-				if pkg, ok := n.X.(*ast.Ident); ok && forbiddenSelectors[pkg.Name+"."+n.Sel.Name] {
-					t.Errorf("%s uses legacy selector %s.%s", path, pkg.Name, n.Sel.Name)
-				}
-			}
-			return true
-		})
-		return nil
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-}
-
-func TestNoRemovedLoopConstructionVocabularyInGoSource(t *testing.T) {
-	patterns := []*regexp.Regexp{
-		regexp.MustCompile(`\bloop\.` + "Config" + `\b`),
-		regexp.MustCompile(`\bConfig\.` + "Client" + `\b`),
-		regexp.MustCompile(`\bConfig\.` + "Model" + `\b`),
-		regexp.MustCompile(`\bloop\.` + "New" + `(?:Restored)?\b`),
-	}
-	root := harnessRoot(t)
 	err := filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
 		if err != nil {
 			return err
@@ -231,19 +251,61 @@ func TestNoRemovedLoopConstructionVocabularyInGoSource(t *testing.T) {
 		if !strings.HasSuffix(path, ".go") {
 			return nil
 		}
-		contents, err := os.ReadFile(path)
+		violations, err := legacySourceViolations(path, nil)
 		if err != nil {
 			return err
 		}
-		for _, pattern := range patterns {
-			if pattern.Match(contents) {
-				rel, _ := filepath.Rel(root, path)
-				t.Errorf("%s retains removed loop construction vocabulary matching %s", filepath.ToSlash(rel), pattern)
-			}
+		for _, violation := range violations {
+			rel, _ := filepath.Rel(root, path)
+			t.Errorf("%s uses removed lifecycle surface %s", filepath.ToSlash(rel), violation)
 		}
 		return nil
 	})
 	if err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestLegacySourceGuardIgnoresCommentsStringsAndUnrelatedConfig(t *testing.T) {
+	source := `package fixture
+// loop.Config, session.Runner, WithWorkspaceStore
+var message = "loop.New Config.Client Config.Model serve.Runner"
+type Config struct { Client, Model any }
+var local Config
+var _ = local.Client
+`
+	got, err := legacySourceViolations("fixture.go", source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("violations = %v, want none", got)
+	}
+}
+
+func TestLegacySourceGuardResolvesAliasesAndRealUses(t *testing.T) {
+	source := `package fixture
+import (
+    l "github.com/looprig/harness/pkg/loop"
+    sess "github.com/looprig/harness/pkg/session"
+    api "github.com/looprig/harness/pkg/serve"
+    sk "github.com/looprig/storekit"
+)
+var _ l.Config
+var _ sess.Runner
+var _ api.Runner
+var _ = sk.Open
+func f() { WithWorkspaceStore(); WithCompileSession(); sess.WithCompileRestore() }
+`
+	got, err := legacySourceViolations("fixture.go", source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{
+		"WithCompileSession", "WithWorkspaceStore", "import github.com/looprig/storekit",
+		"loop.Config", "serve.Runner", "session.Runner", "session.WithCompileRestore", "storekit.Open",
+	}
+	if strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("violations = %v, want %v", got, want)
 	}
 }
