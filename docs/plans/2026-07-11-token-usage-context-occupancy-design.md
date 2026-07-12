@@ -2,24 +2,8 @@
 
 **Date:** 2026-07-11
 
-**Last revised:** 2026-07-11 (separates cumulative usage from current context;
-adds model-aware counting, request limits, integer percentage thresholds, a
-compaction control lane, CAS-guarded full replacement, and the actor/turn reset
-protocol; folds two review rounds — `ModelKey` definition + owning packages, a
-counter trust boundary, per-waiter compaction replies, full-tuple replacement
-CAS, the terminal-response compaction path, bounded hustle aggregates, a
-self-contained foundation-types unit; then the `ContextCounterFunc` struct
-adapter (a bare func can't satisfy the capability-bearing interface), the
-a crash-consistent compaction outcome with lane-full rejection,
-turn-active-before-return terminal compaction ordering, the corrected
-subtract-margin-last limit formula, and `event.ModelRuntime` carrying resolved
-effort; then round three — one canonical `CompactionCommitted`/`CompactionRejected`
-event that is both product and outcome (folded as the reset) with deterministic
-`waiterReplyID` repair, import-cycle-safe ownership (`pkg/event` owns
-`ContextBasis`/`ContextMeasurement`/`ModelRuntime`/`HustleRunDescriptor`,
-`pkg/hustle` is a leaf), `InferenceCapability` + `CompatibleCounter` with the
-entire `CounterCapability` fingerprinted, and definition-bounded hustle
-aggregates)
+**Last revised:** 2026-07-12 (aligns compaction with one-shot, non-loop hustles;
+terminal-event usage ownership; and bounded model-source catalog buckets)
 
 **Status:** Draft
 
@@ -34,7 +18,7 @@ aggregates)
 - `docs/plans/2026-06-19-event-persistence-checkpoint-design.md` — append-only
   journal, event classes, replay folds, and catalog repair.
 - `docs/plans/2026-07-11-hustle-mechanism-design.md` — compaction summarization
-  runs as a harness-owned loop-backed hustle.
+  runs as a harness-owned one-shot inference hustle.
 
 **Cross-module:** `core/content` owns normalized usage; `inference` owns the
 request-counting contract and streaming result trailer; `llm` implements direct
@@ -108,7 +92,7 @@ needs an explicit actor/turn context-replacement protocol.
 - a model-aware complete-request counting contract;
 - current context measurements with model, revision, quality, and input limit;
 - percentage pressure with integer arithmetic;
-- manual and automatic compaction for native non-hustle loops;
+- manual and automatic compaction for native conversational loops;
 - the actor/turn replacement handshake;
 - durable compaction basis, summary, and post-compaction measurement;
 - replay/catalog behavior; and
@@ -274,8 +258,9 @@ requests.
 
 ## §5 · Cumulative usage is not current context
 
-Each loop owns its own cumulative usage. No primer, delegate, or hustle usage is
-rolled into another loop.
+Each loop owns its own cumulative usage. No primer or delegate usage is rolled
+into another loop. Hustles are not loops; their usage is accounted separately
+from terminal hustle lifecycle events.
 
 ```go
 type LoopTokenState struct {
@@ -290,8 +275,8 @@ type LoopTokenState struct {
   it must not add `TurnDone.Usage` a second time.
 - A successful compaction resets `CurrentContext`, never
   `CumulativeUsage`.
-- A compaction hustle's usage stays on that hustle loop and in its own catalog
-  entry/audit records.
+- A compaction hustle's usage stays on its terminal `HustleCompleted` or
+  `HustleFailed` event and in the bounded hustle catalog aggregate.
 
 ## §6 · Model-aware context counting and limits
 
@@ -869,7 +854,8 @@ event to fall out of sync with it.
 
 `CompactionCommitted.Basis` identifies what was summarized. `PostContext` measures
 the primary loop's summary-based request context; it is not the hustle's usage.
-The hustle's own usage remains on its own `AIMessage`.
+The hustle's own usage remains on its terminal `HustleCompleted` or
+`HustleFailed` event.
 
 If future runtime context is not yet knowable (for example, idle manual
 compaction before a future turn), `PostContext` measures the stable request base
@@ -983,18 +969,15 @@ is the reasoning-effort type owned by `inference`; if the rig-lifecycle design
 already names that type, `ModelRuntime` uses that exact type rather than
 duplicating it.
 
-`SessionMeta` stores a deterministically ordered per-loop projection **for
-primers and delegates only** — the bounded, user-visible loops a picker renders.
-Hustle loops are unbounded over a long session (every compaction, classifier, and
-title run is its own loop), so they must **not** enter `Loops`; putting them
-there would make the projection grow without limit. Their detailed runs live in
-the journal; the catalog exposes only a **bounded aggregate** keyed by hustle
-name/model/status:
+`SessionMeta` stores a deterministically ordered per-loop projection for the
+rig's bounded, user-visible primer/delegate topology. Hustles are not loops and
+therefore never enter `Loops`. Their detailed runs live in the journal; the
+catalog exposes only a bounded aggregate keyed by hustle name/model-source
+bucket/status:
 
 ```go
 type LoopUsageMeta struct {
 	LoopID          uuid.UUID
-	Kind            event.LoopKind // Primer or Delegate only
 	Runtime         ModelRuntime
 	CumulativeUsage content.Usage
 	CurrentContext  ContextMeasurement
@@ -1002,34 +985,33 @@ type LoopUsageMeta struct {
 
 type HustleUsageAggregate struct {
 	Name            hustle.Name
-	Model           ModelRuntime
+	ModelSource      hustle.ModelSource
+	Model            ModelRuntime          // named source only; zero means current-loop/mixed
 	Status          hustle.TerminalStatus // completed / failed, bounded set
 	Runs            uint64                // count folded from lifecycle events
-	CumulativeUsage content.Usage         // summed hustle-loop usage
+	CumulativeUsage content.Usage         // summed terminal-event usage
 }
 
 type SessionMeta struct {
 	// existing fields
 	Loops   []LoopUsageMeta        // primers/delegates, sorted by LoopID bytes
-	Hustles []HustleUsageAggregate // bounded: one row per (name, model, status)
+	Hustles []HustleUsageAggregate // bounded: one row per definition model-source bucket/status
 }
 ```
 
 `SessionMeta` remains a repairable cache, not an authority. Carrying the durable
 runtime/measurement allows the session picker to show pressure and repair without
-importing the current rig/model catalog. The hustle aggregate is folded from the
-internal `HustleStarted`/`HustleCompleted`/`HustleFailed` lifecycle plus each
-hustle loop's own usage; individual hustle runs are recoverable from the journal
-but are never enumerated in `SessionMeta`.
+importing the current rig/model catalog. The hustle aggregate is folded from
+internal `HustleCompleted` and `HustleFailed` events; `HustleStarted` carries no
+usage. Individual hustle runs are recoverable from the journal but are never
+enumerated in `SessionMeta`.
 
-The aggregate key uses the **model key**, not the full runtime, and its
-cardinality is bounded because `ModelStrategy` (§hustle) resolves to a
-**definition-bounded** model set: a hustle either names a fixed model or uses the
-current-loop model, and the loop's model set is itself bounded by the rig
-definition. If a future strategy ever admits an unbounded resolved-model space,
-`Hustles` caps distinct model keys per `(name, status)` and rolls older/rarer keys
-into a single `model: other` bucket, so the projection stays bounded regardless.
-`hustle.TerminalStatus` is a fixed two-value set (completed / failed).
+The aggregate key is `(name, model source, named model key, status)`. A named
+hustle has one fixed model row. Every current-loop resolution folds into one
+row per `(name, current-loop, status)` with zero/mixed `Model`; terminal events
+retain their actual resolved runtime for detailed audit. The fold is bounded and
+replay-order-independent even if `ChangeLoopInference` installs arbitrarily many
+model keys. `hustle.TerminalStatus` is a fixed two-value set (completed/failed).
 
 ## §13 · Configuration
 
@@ -1128,28 +1110,13 @@ earlier safety margins; it never labels the hard admission result as a provider
 fit guarantee. No silent fallback or runtime policy change is allowed. Counter
 policy and estimator revision are fingerprinted and durable.
 
-## §15 · Hustle and loop-kind isolation
+## §15 · Hustle isolation
 
-Every loop start persists a non-zero kind. `LoopKind` has **exactly one owner**,
-`harness/pkg/event`; this design and the hustle design both reference
-`event.LoopKind` and neither redefines it:
-
-```go
-// Package event — the single definition. Referenced as event.LoopKind everywhere.
-type LoopKind uint8
-
-const (
-	LoopKindUnknown LoopKind = iota
-	LoopKindPrimer
-	LoopKindDelegate
-	LoopKindHustle
-)
-```
-
-Hustle loops own their usage but are excluded structurally from context
-measurement/compaction and all workspace hooks. Their internal events journal
-for audit and never fan out to public loop subscribers. See the hustle design
-for visibility, quiescence, lifecycle, and restore-skip details.
+Hustles are one-shot inference operations, not durable loops. They have no
+`LoopStarted`, committed message history, context measurement, compaction
+trigger, workspace boundary, or restoreable actor. Their usage comes only from
+terminal internal hustle lifecycle events. See the hustle design for private
+audit, explicit blocking activity, shutdown drain, and restore behavior.
 
 ## §16 · Testing plan
 
@@ -1198,8 +1165,8 @@ endpoints receive integration tests under the `integration` build tag.
   continues, hard failure blocks, successful summary still-too-large blocks.
 - Restore: multiple compactions, basis validation, raw journal retained,
   resolved runtime restored, catalog deterministic.
-- Hustle loops: usage owned independently; no recursive occupancy/compaction or
-  workspace hooks.
+- Hustles: usage owned independently by terminal lifecycle events; no recursive
+  occupancy/compaction or workspace hooks.
 
 ### Foundation types land first
 
@@ -1212,23 +1179,25 @@ or any consumer — references a resolved model runtime or context limits:
 |---|---|
 | `content.TokenCount` | `core/content` |
 | `inference.ModelKey`, `inference.ContextLimits`, `inference.Effort` | `inference` |
-| `hustle.DefinitionDescriptor`, `hustle.Name`, `hustle.BackendKind` | `harness/pkg/hustle` (leaf; must **not** import `pkg/event`) |
-| `event.LoopKind`, `event.Visibility` (durable wire) | `harness/pkg/event` |
+| `hustle.DefinitionDescriptor`, `hustle.Name`, `hustle.ModelSource`, `hustle.Participation` | `harness/pkg/hustle` (leaf; must **not** import `pkg/event`) |
+| `event.EventVisibility` (durable wire) | `harness/pkg/event` |
 | `event.ModelRuntime` (`{ModelKey, ContextLimits, Effort}`) | `harness/pkg/event` |
 | `event.ContextBasis`, `event.ContextMeasurement` | `harness/pkg/event` |
-| `event.HustleRunDescriptor` (`{hustle.DefinitionDescriptor, event.ModelRuntime}`) | `harness/pkg/event` |
+| `event.HustleRunDescriptor` (`{hustle.DefinitionDescriptor, hustle.RunID, event.ModelRuntime}`) | `harness/pkg/event` |
 
 **Dependency direction is one-way and acyclic:** `pkg/hustle` is a leaf owning
-only definition-time identity (`DefinitionDescriptor`, `Name`, `BackendKind`) and
+only definition-time identity (`DefinitionDescriptor`, `Name`, `ModelSource`,
+`Participation`) and
 imports neither `pkg/event` nor the runtime. `pkg/event` imports `pkg/hustle`
 (for `DefinitionDescriptor`) and `inference`/`content`, and owns every durable
 **event field** — `ContextBasis`, `ContextMeasurement`, `ModelRuntime`, and
 `HustleRunDescriptor` — because the internal runtime imports `pkg/event` and a
-type used in a durable event therefore cannot live in the runtime. The runtime
-imports `pkg/event`; nothing imports the runtime. So the chain is
-`content`/`inference` → `pkg/hustle` → `pkg/event` → runtime, with no back-edges.
-This design provides all of these as its foundation unit, so no consumer has to
-forward-reference, redefine, or invert an import.
+type used in a durable event therefore cannot live in the runtime. The import
+chain is `internal/sessionruntime` → `internal/hustleruntime` → `pkg/event` →
+`pkg/hustle` → `inference`/`content`, with `pkg/event` also importing the leaf
+model/content packages directly. There is no back-edge from a public package to
+either internal runtime. This design provides all foundation types before a
+consumer references them.
 
 ### Release order
 
@@ -1241,7 +1210,7 @@ forward-reference, redefine, or invert an import.
    for gateways; recompile against inference/content.
 4. `harness` — usage stitch, context basis/measurement, pressure, express-lane
    `Compact` + per-waiter replies, actor/turn replacement, events/codecs/folds/
-   catalog, compaction hustle integration, loop kinds.
+   catalog and compaction hustle integration.
 5. `swe` — model limits, counters or explicit missing-counter policy, hustle
    registry, percentage thresholds, `/compact`.
 
@@ -1259,6 +1228,6 @@ current context:  model-specific, revision-specific, replaceable by compaction
 
 Compaction replaces the complete active conversation with a summary, resets the
 in-flight request view as well as durable actor state, and measures the resulting
-primary request independently of the hustle's own usage. Percentage policy stays
-human-readable while integer basis points, exact context bases, typed limits,
-and durable model snapshots make replay deterministic.
+primary request independently of separately accounted hustle usage. Percentage
+policy stays human-readable while integer basis points, exact context bases,
+typed limits, and durable model snapshots make replay deterministic.

@@ -47,10 +47,10 @@ design adds the provider-neutral capability.
 - **Streaming structured output.** Hustles use `Invoke` (non-streaming), so v1 only supports the
   non-streaming encode+decode path. Streaming partial-JSON parsing is a later addition.
 - **Full JSON-Schema validation.** We rely on the provider's own enforcement + typed Go unmarshal +
-  domain checks in the hustle's `Parse` (§3). A real JSON-Schema validator is a dependency decision
+  domain checks in the hustle adapter's validation callback (§3). A real JSON-Schema validator is a dependency decision
   deferred to Open Questions.
-- **Cross-provider schema translation.** v1 requires a lowest-common-denominator schema all three
-  providers accept (§2 caveat); automatic dialect translation is deferred.
+- **General cross-provider schema translation.** v1 implements only the deterministic Gemini
+  projection described in §2; translating broader schema dialects is deferred.
 - **Multi-tool / mixed structured+prose responses.** A structured-output request is single-purpose:
   one schema, one JSON result.
 
@@ -96,6 +96,11 @@ the schema as JSON for tools). Consistent with `Tool`.
 Each codec's `EncodeRequest` already has `req` and `req.Model.Caps` in hand (the Anthropic encoder
 reads `Caps.Thinking` at `encode.go:89`), so it reads `req.Output` with no signature change.
 
+A shared request guard runs before provider mapping. `Request.Output != nil`
+requires `len(Request.Tools) == 0`; output plus any ordinary tool returns
+`StructuredOutputConflictError`. The synthetic Anthropic tool is added only
+after that check, so caller tools cannot collide with its reserved name.
+
 ### Anthropic — forced tool-use (`anthropicapi`)
 
 Anthropic has no `response_format`. The canonical path is a **synthetic single tool + forced
@@ -120,7 +125,8 @@ and the extractor in §3.
 
 **Caveats:** (a) forced tool-use returns a `tool_use` block, **not** natural-language text — fine
 for a classifier; (b) extended thinking conflicts with tool forcing on current models, so a
-structured-output request must not also enable thinking (the classifier hustle runs thinking-off);
+structured-output request with thinking enabled is rejected with a typed
+`StructuredOutputConflictError` rather than silently suppressing configured behavior;
 (c) Anthropic does **not** strictly validate the tool input against `input_schema` — enforcement is
 best-effort (drives §3 validation).
 
@@ -164,16 +170,22 @@ type generationConfig struct {
 }
 ```
 
-When `req.Output != nil`, set `ResponseMimeType:"application/json"` and `ResponseSchema:
-Output.Schema`. The result returns as `candidates[0].content.parts[].text` (the JSON).
+When `req.Output != nil`, set `ResponseMimeType:"application/json"` and
+`ResponseSchema: projectGeminiSchema(Output.Schema)`. The result returns as
+`candidates[0].content.parts[].text` (the JSON).
 
-**Caveat:** Gemini accepts an **OpenAPI-subset** schema (not full JSON Schema; `additionalProperties`
-unsupported, `propertyOrdering` honored). This is the concrete case behind the §Scope
-lowest-common-denominator constraint.
-
-> **Dialect reality:** the three providers accept overlapping-but-different schema dialects. v1
-> requires the caller to author an **LCD object schema** (typed properties, `enum`, `required`,
-> `additionalProperties:false`) that all three accept. Per-provider translation is deferred.
+**Caveat:** Gemini accepts an **OpenAPI-subset** schema and does not accept
+`additionalProperties`. The neutral v1 schema is a strict object subset: typed
+properties, `enum`, `required`, and `additionalProperties:false`, with all other
+keywords rejected unless explicitly listed. Anthropic/OpenAI receive that schema.
+The Gemini encoder validates that `additionalProperties` is exactly `false`,
+removes that keyword, and passes the remaining supported subset. Local
+`DisallowUnknownFields` validation preserves the no-extra-fields invariant after
+decode. This single projection is deterministic. `inference` exposes a
+`StructuredOutputRevision` constant that changes whenever shared validation or
+provider projection changes; hustle definitions fold it into their policy
+revision so restore cannot silently cross request behavior;
+broader dialect translation remains out of scope.
 
 ## §3 · The decode / extraction path
 
@@ -189,9 +201,11 @@ Neutral extractor + typed decode (in `inference`), the **single sanctioned seria
 narrowed immediately:
 
 ```go
-// StructuredResult returns the raw JSON the model emitted for an OutputSchema request,
-// transport-agnostically. Prefer a ToolUseBlock named StructuredToolName (Anthropic);
-// else fall back to concatenated assistant text (OpenAI/Gemini), validated as a JSON value.
+// StructuredResult returns the one unambiguous JSON value emitted for an
+// OutputSchema request. It accepts either exactly one StructuredToolName tool-use
+// block and no other semantic blocks, or a text-only response whose text fragments
+// concatenate to one JSON value. Mixed, duplicate, unmatched-tool, and empty
+// responses fail; there is no representation fallback.
 func StructuredResult(resp *Response) (json.RawMessage, error)
 
 // DecodeOutput extracts then json.Unmarshals into out (a concrete struct). `out any` is the
@@ -204,24 +218,27 @@ func DecodeOutput(resp *Response, out any) error
 **not** strictly guarantee it. We therefore do **not** trust the shape blindly and we do **not** add
 a JSON-Schema validator. Enforcement is layered: (1) the provider constrains generation; (2)
 `DecodeOutput` unmarshals into the concrete Go struct (structural typing; `DisallowUnknownFields`
-rejects stray keys); (3) the hustle's `Parse` applies **domain** validation (is `verdict` one of the
+rejects stray keys); (3) the hustle adapter callback applies **domain** validation (is `verdict` one of the
 known enum values?) and returns a typed error. This covers verdict-style schemas without a new
 dependency.
 
 ## §4 · Hustle consumption & the security framing
 
-This slots directly into the hustle `Hustle[In, Out]` interface (hustle doc §3):
+This slots into an immutable hustle definition plus its concrete typed adapter:
 
-- **`Spec(in)`** sets `Request.Output = &OutputSchema{…}` (and the model, tools, ceiling).
-- **`Parse(final *content.AIMessage)`** calls `inference.DecodeOutput` (or `StructuredResult`) and
-  applies domain validation → the typed `Out` (e.g. a `SafetyVerdict`).
+- the definition's optional output policy sets
+  `Request.Output = &OutputSchema{…}` and fingerprints the schema revision; and
+- after the one-shot inference call, the adapter's runner validation callback
+  calls `inference.DecodeOutput` (or `StructuredResult`), rejects unknown fields,
+  and applies domain validation to produce its concrete result (for example,
+  `SafetyVerdict`) before `HustleCompleted` is appended.
 
 **Security.** For a guardrail hustle over untrusted input, this is the enforcement point of the
-hustle isolation model (hustle doc §4): with **Anthropic forced tool-use** the model *must* emit the
+hustle isolation model (hustle doc §§7–8): with **Anthropic forced tool-use** the model *must* emit the
 one synthetic tool — injected instructions can at most populate the verdict fields, never escape to
-free-form output or another tool. Combined with a no-tools hustle loop and least-privilege ceiling,
+free-form output or another tool. Combined with a tool-less one-shot hustle request and narrow model policy,
 the classifier's blast radius is exactly its schema. (OpenAI/Gemini json-schema constrain the *shape*
-but return text; the domain check in `Parse` closes the gap — prefer forced tool-use where the model
+but return text; the adapter's domain validation closes the gap — prefer forced tool-use where the model
 supports it for the strongest containment.)
 
 ## §5 · Capability gating (fail-closed)
@@ -252,10 +269,18 @@ that silently degrades to unconstrained output is a security regression). Placem
 Concrete, `errors.As`-able structs; no bare `fmt.Errorf` from package APIs:
 
 - `StructuredOutputUnsupportedError{ Model string }` — capability gate (§5).
-- `MalformedStructuredOutputError{ Reason string; Body []byte }` — no `tool_use` block, empty
-  content, or non-JSON text where JSON was demanded (from the extractor).
-- `SchemaValidationError{ Field, Reason string }` — decoded JSON failed domain/structural checks
-  (from `DecodeOutput` `DisallowUnknownFields` or the hustle's `Parse`).
+- `StructuredOutputConflictError{ Feature string }` — an incompatible request,
+  including Anthropic thinking plus forced structured output.
+- `MalformedStructuredOutputError{ ReasonCode, Length, SHA256 }` — no `tool_use`
+  block, empty content, or non-JSON text where JSON was demanded. It never retains
+  raw model output.
+- `SchemaValidationError{ Field string; ReasonCode ValidationReason }` — decoded
+  JSON failed structural checks in `DecodeOutput`. Domain adapters return their
+  own concrete typed errors for invalid enum/value combinations.
+
+All fields are bounded metadata. These errors neither retain nor wrap raw model
+output/provider response bodies; detailed content remains only in the
+size-bounded in-process result until the caller discards it.
 
 All fail-closed for guardrail callers: a hustle whose result can't be produced or parsed returns an
 error, and the call site escalates (hustle doc §5), never auto-allows.
@@ -263,13 +288,19 @@ error, and the call site escalates (hustle doc §5), never auto-allows.
 ## Testing plan (table-driven, `-race`)
 
 - **Encode, per codec** — `Output` set ⇒ correct wire shape: Anthropic synthetic tool + `tool_choice`
-  (and thinking suppressed); OpenAI `response_format.json_schema` with `strict`; Gemini
-  `responseMimeType` + `responseSchema`. `Output` nil ⇒ byte-identical to today (no regression).
+  (thinking conflict rejected); OpenAI `response_format.json_schema` with `strict`; Gemini
+  `responseMimeType` + projected `responseSchema` with only `additionalProperties:false`
+  removed. `Output` nil ⇒ byte-identical to today (no regression).
 - **Extraction/decode** — Anthropic `tool_use.input` extracted; OpenAI/Gemini text-JSON extracted;
   `DecodeOutput` into a concrete struct; malformed (no tool_use / empty / non-JSON) ⇒
   `MalformedStructuredOutputError`; stray key ⇒ `SchemaValidationError` (DisallowUnknownFields).
 - **Capability gate** — `Output` set + `!Caps.StructuredOutput` ⇒ `StructuredOutputUnsupportedError`,
   across all three codecs.
+- **Request conflict** — `Output` plus any ordinary `Tools`, or Anthropic output
+  plus thinking, returns `StructuredOutputConflictError`; no name-collision or
+  silent suppression path exists.
+- **Representation ambiguity** — duplicate structured tools, structured tool +
+  text, unmatched tool, multiple JSON values, and empty content all fail.
 - **Fuzz** — the extractor parses external JSON: `FuzzStructuredResult` on arbitrary bodies.
 - Boundary/edge: empty schema, missing `Name`, `Strict` on a non-strict provider, unicode in
   `reason`, nil `Message`.
@@ -278,7 +309,7 @@ error, and the call site escalates (hustle doc §5), never auto-allows.
 
 - **`inference`** — `OutputSchema` + `Request.Output`; `Capabilities.StructuredOutput` +
   `WithStructuredOutput()`; the `StructuredToolName` constant; `StructuredResult`/`DecodeOutput`
-  extractor; the capability guard; three typed errors; and the three codec encoders
+  extractor; the capability guard; four typed errors; and the three codec encoders
   (`anthropicapi` `ToolChoice` + synthetic tool; `openaiapi` `ResponseFormat`; `geminiapi`
   `responseMimeType`/`responseSchema`).
 - **`core/content`** — **unchanged.** Decode reuses `ToolUseBlock`/`TextBlock`; no new content type.
@@ -286,7 +317,8 @@ error, and the call site escalates (hustle doc §5), never auto-allows.
 - **`llm`** — recompile only; provider clients pass `Request.Output` through the unchanged
   `EncodeRequest`. OpenAI-compatible providers that lack support simply keep
   `Caps.StructuredOutput=false` (gate handles it).
-- **`harness`** — the `Hustle` `Spec`/`Parse` wiring (hustle doc §3); no other structural change.
+- **`harness`** — immutable hustle output policy plus concrete typed adapter
+  decode/validation (hustle doc §7); no generic `Hustle[In, Out]` API.
 - **`swe`** — set `Caps.StructuredOutput` per catalogue row; author classifier verdict schemas.
 
 **Release order:** inference → llm → harness → swe (no `core/content` bump this time). **Vendored-
@@ -298,14 +330,13 @@ change as the `go.mod` bump, or the build silently uses the structured-output-le
 - **Local JSON-Schema validation** — rely on provider enforcement + typed unmarshal + domain checks
   (chosen, no dep), or add a JSON-Schema validator library (new dependency → needs approval)? Matters
   most for Anthropic/Gemini, which don't strictly guarantee conformance.
-- **Schema-dialect translation** — v1 mandates an LCD schema; do we later add per-provider massaging
-  (`additionalProperties` stripping for Gemini, strict-mode rewriting for OpenAI)?
+- **Broader schema-dialect translation** — v1 only removes validated
+  `additionalProperties:false` for Gemini; do we later support more keywords or
+  strict-mode rewriting?
 - **Capability-gate placement** — shared `inference` guard called by each codec (recommended) vs a
   `Request.Validate()` step vs the `llm` client.
 - **`Response.Output` field (Design B)** — instead of the post-hoc extractor, thread request-context
   into decode and populate an explicit `Response.Output json.RawMessage`. Rejected for v1 (would
   change the `Codec.DecodeResponse` signature); revisit if the extractor's transport-sniffing proves
   fragile.
-- **Reserved synthetic-tool name** — the exact `StructuredToolName` value + collision policy if a
-  real tool shares it (structured-output requests should forbid caller tools).
 - **Streaming structured output** — deferred; needed only if a future hustle streams.

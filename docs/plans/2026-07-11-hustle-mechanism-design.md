@@ -1,129 +1,112 @@
-# Hustle — Harness-Owned Auxiliary Work
+# Hustle — Harness-Owned Auxiliary Inference
 
 **Date:** 2026-07-11
 
-**Last revised:** 2026-07-11 (adds the immutable hustle registry, typed adapters
-over a serialized execution boundary, internal event visibility, loop kinds,
-common audit lifecycle, blocking/background participation, near-term use cases,
-and prompt-cache TODO; folds two review rounds — visibility in the durable
-`Header` (`EventVisibility` field / `Visibility()` accessor, no collision) stamped
-by the trusted publisher via a `WithHeader` rewrite contract, runtime-owned
-drain + activity tokens via `RunAndFinalize` (finalizer runs on every terminal
-state) with a deterministic shutdown sequence, `pkg/hustle`-leaf
-`DefinitionDescriptor` vs `pkg/event.HustleRunDescriptor` (acyclic imports; only
-definition-time identity in the rig fingerprint), `Backend.Identity()`,
-finalizer-shaped typed adapters, `sessionScoped` lifecycle events with loop
-correlation and per-backend accounting incl. `HustleFailed.Usage`,
-`ClassificationBasis` subject binding, and separate blocking/background lanes)
+**Last revised:** 2026-07-12
 
 **Status:** Draft
 
 **Depends on:**
 
 - `docs/plans/2026-07-10-rig-lifecycle-workspace-snapshots-design.md`
-  (**Approved**) — rig composition, loop definitions, native lifecycle hooks,
-  quiescence, restore, and workspace snapshots.
+  (**Approved**) — immutable rig composition, bound loop definitions, session
+  ownership, quiescence, shutdown, restore, and workspace boundaries.
 - `docs/plans/2026-06-19-event-persistence-checkpoint-design.md` — durable
-  journal, event classes, replay, and catalog projection.
-- `docs/plans/2026-07-11-token-usage-context-occupancy-design.md` — per-loop
-  usage, loop kinds, and compaction as the first blocking loop-backed hustle.
-- `docs/plans/2026-07-11-structured-output-design.md` — constrained output
-  required by classifier hustles.
+  events, replay, and catalog repair.
+- `docs/plans/2026-07-11-token-usage-context-occupancy-design.md` — normalized
+  usage and compaction, the first hustle consumer.
+- `docs/plans/2026-07-11-structured-output-design.md` — constrained results for
+  later classifier hustles. Compaction does not depend on structured output.
 
-**New dependencies:** none.
+**New external dependencies:** none.
 
 ---
 
-## Motivation
+## Problem
 
-Harness repeatedly needs to accomplish a small sidequest whose result informs a
-larger decision without becoming a turn in the user/agent conversation:
+Harness needs small model calls whose results inform a larger operation without
+becoming conversational turns:
 
-- summarize active context before it exceeds a model window;
-- classify whether a command or gate can be auto-approved;
-- detect prompt injection or malicious instructions in fetched/tool content;
-- derive a short session title;
-- recap a stale session before resuming it; or
-- produce a compact session summary for display/export.
+- summarize context before a model limit is reached;
+- classify a command or gate;
+- scan fetched content for prompt injection;
+- derive a session title; and
+- recap or summarize a session.
 
-These operations share lifecycle, attribution, isolation, model selection,
-timeouts, audit, and resource controls. They do not share one domain input or
-output type. A generic `Hustle[In, Out any]` would introduce untyped generic
-constraints contrary to repository rules and would not itself solve lifecycle
-or audit.
+These calls need common definition, attribution, timeout, cancellation, audit,
+usage, concurrency, and shutdown behavior. Their domain inputs and outputs do
+not belong in one generic business API.
+
+The landed rig architecture makes a loop a durable topology actor. A loop is
+registered by `pkg/rig`, routed by `internal/sessionruntime`, restored from
+`LoopStarted`, participates in workspace boundaries, and remains addressable
+through the session. A hustle has none of those semantics. Modeling each hustle
+run as a loop would require exceptions in topology validation, restore, routing,
+quiescence, hooks, catalog projection, and shutdown.
+
+Therefore a hustle is **not a loop**. Version 1 is a session-owned, one-shot
+inference operation with its own run identity and lifecycle.
 
 ## Decision
 
-Add a small public contract package plus an internal runtime:
+Add:
 
 ```text
 pkg/hustle
-    Immutable definitions, names, execution envelopes, backend contract,
-    typed errors, limits, and result metadata used at composition boundaries.
+    Immutable definition, model-source policy, wire envelopes, result metadata,
+    limits, descriptors, and typed errors.
 
 internal/hustleruntime
-    Per-session registry, invocation lifecycle, loop-backed execution,
-    audit events, timeouts, cancellation, quiescence participation,
-    internal event visibility, concurrency limits, and cleanup.
+    Per-session controller, admission lanes, execution, audit, cancellation,
+    quiescence participation, finalization, and drain.
 ```
 
-The mechanism remains harness-controlled:
+`pkg/rig` registers definitions and includes their immutable policy revisions in
+the rig fingerprint. `internal/sessionruntime` binds definitions to a live
+session, supplies current-loop model resolution, owns the controller, and
+orders it before hub/session teardown.
 
-- consumers may register immutable definitions at `rig.Define`;
-- only trusted harness subsystems invoke a registered hustle;
-- there is no public arbitrary `Session.RunHustle` method in this version; and
-- the caller consumes a typed result and owns the resulting policy/action.
+Version 1 has one execution kind: a tool-less call through the existing
+`inference.Client.Invoke` contract. Function execution, arbitrary HTTP
+backends, tools, multi-turn actors, streaming, and foreign-agent sessions are
+out of scope. They require their own isolation and lifecycle designs rather
+than more branches in this mechanism.
 
-Compaction is implemented now. The other named uses shape validation and
-isolation contracts and are recorded as planned TODOs, not all implemented in
-the first change.
-
-## Vocabulary
-
-- A **hustle definition** is an immutable design-time recipe for one auxiliary
-  task.
-- A **hustle invocation** is one session-scoped execution with a unique run ID
-  and direct cause.
-- A **hustle backend** performs the work. Initial backend kinds are loop, API,
-  and function.
-- A **loop-backed hustle** uses normal model/turn/step machinery but has
-  `LoopKindHustle` and internal-only events.
-- A **typed adapter** exposes a domain interface such as `Compactor` or
-  `GateClassifier`, validates typed input/output, and invokes the generic
-  runtime through its explicit serialization boundary.
-- A **consumer** is the trusted harness subsystem that requested the hustle and
-  decides what to do with its result.
+Compaction is implemented first. Classifiers, titles, recaps, and summaries are
+named follow-ons that reuse the mechanism but still require their own typed
+adapters, prompts, validation, policy, and evaluations.
 
 ## Core invariants
 
-1. **Harness-owned.** Models, primer loops, delegates, and other hustles cannot
-   enumerate, invoke, message, or await hustles.
-2. **Not delegation.** Hustles have no parent-agent relationship, do not appear
-   in `loop.WithDelegates`, and do not consume delegation depth/quota.
-3. **Typed business logic.** Domain callers use focused typed interfaces. Raw
-   bytes exist only at the generic serialization boundary and are immediately
-   narrowed and validated.
-4. **Caller-owned action.** A verdict is evidence, not authority. The caller
-   checks policy/security ceilings before acting.
-5. **Usage ownership.** A loop-backed hustle owns its request usage. No usage is
-   rolled into the loop it assists.
-6. **Internal visibility.** Hustle detail journals for audit but never fans out
-   through the public event stream.
-7. **No session hooks.** Hustle loops are structurally excluded from context
-   measurement/compaction, workspace snapshot triggers, and future normal-loop
-   hooks.
-8. **No partial product.** A caller commits an enduring product event only after
-   successful hustle completion and validation.
-9. **Restore re-runs.** An interrupted hustle is never resumed as a loop. Its
-   caller re-evaluates the trigger.
-10. **Bounded execution.** Every invocation has a timeout, input/output limit,
-    cancellation path, and per-session concurrency accounting.
+1. **Harness-owned.** Only trusted harness subsystems invoke hustles. Models,
+   tools, delegates, and other hustles cannot enumerate or invoke them.
+2. **Not a loop or delegation.** A hustle has no `LoopStarted`, loop handle,
+   inbox, tool set, delegate depth, workspace hook, or restoreable actor.
+3. **Typed business boundaries.** Callers use focused domain interfaces. Raw
+   JSON exists only at the explicit runtime serialization boundary and is
+   immediately narrowed and validated.
+4. **Caller-owned action.** A result is evidence, not authority. The caller
+   alone commits compaction, approves a gate, or changes product state.
+5. **One usage owner.** Hustle usage is recorded on its terminal lifecycle
+   event and is never added to the originating loop's cumulative usage.
+6. **Private audit.** Lifecycle detail is durable but does not enter ordinary
+   live subscriptions or native step/turn/workspace boundaries.
+7. **No partial product.** A successful result has no durable product effect
+   until the caller's finalizer commits its own enduring event.
+8. **Re-run after interruption.** Restore never resumes a hustle. The caller
+   re-evaluates its trigger from durable product state.
+9. **Bounded ownership.** Every run has input/output bounds, a timeout,
+   cancellation, lane admission, and session drain ownership.
+10. **Fail secure.** Unknown definitions, invalid output, audit failures,
+    ambiguous classification, model mismatch, or security mismatch never
+    silently degrade to a more permissive behavior.
 
 ---
 
-## §1 · Immutable definitions and rig registry
+## §1 · Immutable definitions
 
-Near-term uses justify including the registry now rather than deferring it:
+The public package follows the landed `loop.Definition` pattern: construction
+validates and freezes behavior; runtime code consumes a read-only bound view.
 
 ```go
 package hustle
@@ -138,8 +121,21 @@ const (
 	ParticipationBackground
 )
 
+type ModelSource uint8
+
+const (
+	ModelSourceUnknown ModelSource = iota
+	ModelSourceCurrentLoop
+	ModelSourceNamed
+)
+
+type Limits struct {
+	InputBytes  int
+	OutputBytes int
+}
+
 type Definition struct {
-	// fields unexported; built by Define
+	// immutable private state
 }
 
 func Define(opts ...Option) (Definition, error)
@@ -149,81 +145,149 @@ Initial options:
 
 ```text
 WithName(name)
-WithBackend(backend)
-WithTimeout(duration)
-WithMaxInputBytes(bytes)
-WithMaxOutputBytes(bytes)
 WithParticipation(participation)
-WithSecurityProfile(profile)
+WithTimeout(timeout)
+WithLimits(limits)
+WithCurrentLoopModel()
+WithNamedInference(client, model)
+WithSystemPrompt(prompt, promptRevision)
+WithOutputSchema(schema, schemaRevision) // optional; classifiers only
+WithPolicyRevision(revision)             // opaque request/parser behavior
 ```
 
-Definitions are immutable, defensively copied, and secret-free except for the
-already-wired backend capability. Required validation:
+The definition owns the hustle's prompt and inference request policy. The input
+is a versioned JSON document carried as a single data-only user message. A
+classifier definition may additionally require structured output. Tools and
+delegation are not representable in v1.
 
-- non-empty unique name;
-- non-nil backend;
-- positive resolved timeout;
-- positive, bounded input/output limits;
-- known participation mode;
-- a security profile no broader than the rig/session ceiling; and
-- backend-specific validation performed without session I/O.
+`Define` rejects:
 
-The rig registers definitions:
+- a nil option, blank or reserved name, unknown participation, or unknown model
+  source;
+- a missing client/model for `ModelSourceNamed`;
+- a non-positive timeout or non-positive/out-of-range byte limit;
+- a blank prompt revision, schema revision, or required opaque policy revision;
+- an invalid model or output schema;
+- a schema on a named-model definition that does not support structured output
+  (current-loop capability is checked when that model is resolved); and
+- any prompt, schema, or opaque request/parser behavior without a stable
+  revision included in the policy identity.
+
+Secrets never enter descriptors or fingerprints. A definition may retain an
+already-wired `inference.Client`, exactly as `loop.Definition` does, but its
+identity contains only secret-free model and policy data.
+
+### Model sources
+
+`ModelSourceNamed` freezes a client/model pair in the definition.
+
+`ModelSourceCurrentLoop` resolves at each invocation from the originating
+`LoopID`. The landed session registry already retains:
+
+- the loop's bound `inference.Client`; and
+- a synchronized live model view updated only after a mode/model change is
+  durably committed by the actor.
+
+The resolver returns that client and current model. The hustle still uses its
+own system prompt, no tools, and its own output/timeout limits. Resolution fails
+if the cause has no loop, the loop is absent/exited, or the current model cannot
+satisfy the definition's required capabilities. There is no fallback to the
+active primer or a named model.
+
+Binding is explicit and follows `loop.Definition.Bind`:
 
 ```go
-rig.WithHustles(compaction, gateSafety, fetchInjection, sessionTitle)
-rig.WithHustleLimits(rig.HustleLimits{
-	// Blocking lane: compaction, safety/tool classifiers. Guaranteed capacity so a
-	// flood of background work can never starve a hard-limit compaction or a gate
-	// safety check.
-	BlockingConcurrent:   3,
-	BlockingQueued:       16,
-	// Background lane: titles, recaps, summaries. Strictly lower priority; capped
-	// so it cannot consume blocking capacity.
-	BackgroundConcurrent: 1,
-	BackgroundQueued:     16,
-})
+type InferenceBinding struct {
+	Client inference.Client
+	Model  inference.Model
+}
+
+type ModelResolver interface {
+	ResolveHustleModel(context.Context, uuid.UUID) (InferenceBinding, error)
+}
+
+type Bindings struct {
+	Models ModelResolver
+}
+
+type BoundDefinition interface {
+	Name() Name
+	Participation() Participation
+	Timeout() time.Duration
+	Limits() Limits
+	Descriptor() DefinitionDescriptor
+	ResolveInference(context.Context, uuid.UUID) (InferenceBinding, error)
+	SystemPrompt() string
+	OutputSchema() *inference.OutputSchema
+	boundDefinition()
+}
+
+func (d Definition) Bind(context.Context, Bindings) (BoundDefinition, error)
 ```
 
-Blocking and background hustles run in **separate lanes**, not one shared pool.
-The blocking lane has reserved, guaranteed concurrency; the background lane is
-strictly lower priority and cannot borrow blocking capacity. Scheduling within a
-lane is deterministic (FIFO by admission order) so replay and fairness are
-predictable, and a single background `session.title` run can never compete with a
-hard-limit `context.compact` or a `gate.command-safety` classification.
-`WithHustles` is additive and rejects duplicate names atomically. An unreferenced
-definition is allowed because metadata/background consumers may invoke it after
-session creation. Limits are independent of delegation limits.
+`ModelSourceNamed` resolves from its frozen pair. `ModelSourceCurrentLoop`
+requires a non-nil resolver and delegates each invocation to it. Returned
+models and output schemas are defensively copied. Until structured output lands,
+the compaction implementation omits `OutputSchema`; the method is added with
+that prerequisite before the first classifier definition.
 
-The rig fingerprint covers only the **definition-time** identity — a
-`DefinitionDescriptor` (§5) — never invocation-time resolution. It includes the
-stable name, backend kind, **model strategy** and **model selector**,
-**system-prompt revision/hash**, **structured-output schema revision**,
-**backend implementation revision**, and the security/limits revision and
-participation mode. It never includes credentials, raw prompts, or a **resolved**
-model key: `ModelStrategyCurrentLoop` resolves the concrete model at invocation
-and legitimately varies without the rig definition changing, so the resolved key
-belongs to the per-run `event.HustleRunDescriptor`, not the rig fingerprint. A change to any
-definition-time field is an observable definition change; a prompt or schema edit
-that leaves the fingerprint unchanged is a bug in revision bumping, not an
-acceptable silent mutation.
-
-## §2 · Generic execution boundary without `any`
-
-The generic runtime transports versioned JSON at an explicit serialization
-boundary:
+### Stable descriptor and fingerprint
 
 ```go
-package hustle
+type DefinitionDescriptor struct {
+	Name             Name
+	Participation    Participation
+	ModelSource      ModelSource
+	NamedModelKey    inference.ModelKey // empty for CurrentLoop
+	NamedModelPolicyRevision string      // canonical secret-free model/sampling digest
+	PromptRevision   string
+	PromptSHA256     [32]byte
+	SchemaRevision   string
+	SchemaSHA256     [32]byte
+	PolicyRevision   string
+	TimeoutNanos     int64
+	Limits           Limits
+}
+```
 
+`TimeoutNanos` is the exact `time.Duration` nanosecond count. Positive durations
+are not rounded, so any behavior-affecting timeout change changes the canonical
+descriptor and fingerprint.
+
+`Definition.Descriptor()` returns a defensive, secret-free value.
+`Definition.PolicyRevision()` hashes its canonical encoding.
+
+`rig.WithHustles` is additive and copies its arguments. `rig.Define` validates
+all hustle definitions and rejects duplicate names atomically. The rig's
+topology revision includes definitions sorted by `Name`, each definition's
+policy revision, and the lane limits. It does not include clients, credentials,
+raw prompts, raw schemas, or the model resolved by `ModelSourceCurrentLoop`.
+
+Prompt/schema digests are computed from defensive copies during `Define`; raw
+values never enter the fingerprint. The named-model policy revision covers the
+full secret-free model/sampling descriptor, not only its routing key. Changing a
+prompt, schema, model source, named model policy, participation, timeout, limit,
+or parser/request policy therefore changes the resulting definition policy
+revision and is covered by tests.
+
+Structured definitions also fold `inference.StructuredOutputRevision` into
+their policy revision, so provider-projection behavior cannot change across
+restore under an unchanged rig fingerprint.
+
+---
+
+## §2 · Typed adapters and the serialization boundary
+
+The shared runtime transports versioned JSON because hustle domains do not
+share one Go input/output type:
+
+```go
 type RunID uuid.UUID
 
-type Invocation struct {
-	RunID     RunID
-	SessionID uuid.UUID
-	Name      Name
-	Cause     identity.Cause
-	Input     json.RawMessage
+type Request struct {
+	Name  Name
+	Cause identity.Cause
+	Input json.RawMessage
 }
 
 type Result struct {
@@ -231,41 +295,21 @@ type Result struct {
 	Usage  *content.Usage
 }
 
-// A backend both executes and reports its stable identity. Identity is on the
-// interface (not just prose) because definition validation and the rig
-// fingerprint need the backend kind and its immutable implementation revision.
-type BackendIdentity struct {
-	Kind    BackendKind
-	ImplRev BackendImplRevision
-}
-
-type Backend interface {
-	Execute(context.Context, Invocation) (Result, error)
-	Identity() BackendIdentity
+type Outcome struct {
+	Result *Result
+	Err    error
 }
 ```
 
-`Definition` construction reads `backend.Identity()` to populate the
-`DefinitionDescriptor` (§5) — the kind and implementation revision it fingerprints
-come from the backend itself, not a hand-maintained duplicate.
+Exactly one of `Outcome.Result` and `Outcome.Err` is set. These envelopes are
+serialization-layer types, not domain types. Input and output are size-checked
+and must contain one JSON value. Concrete adapters own wire-version checks,
+unknown-field rejection, decoding, and domain validation before business logic
+sees the value.
 
-`Invocation.Input` and `Result.Output` are the only intentionally untyped data.
-They are size-checked before decoding, use a versioned wire shape per hustle,
-reject unknown fields, and are immediately converted into typed domain structs.
-They are never passed deeper into policy/business logic.
-
-Every domain consumer remains focused, and every one is **finalizer-shaped**: it
-does not *return* a typed value (which would release the operation token before
-the caller's policy/product commit, §5), it invokes a caller-supplied finalizer
-**inside** the held-token scope. The finalizer receives a domain outcome that
-carries either a validated value or the terminal error, so the caller can commit a
-product on success **and** durably reject waiters on failure while the token is
-still held:
+Each consumer exposes a focused interface. For example:
 
 ```go
-// One concrete outcome type per domain — NOT a generic Outcome[T any], which the
-// repo's strict-typing rule disallows outside serialization boundaries. Exactly
-// one of Value / Err is set.
 type CompactionOutcome struct {
 	Value *CompactionOutput
 	Err   error
@@ -278,713 +322,659 @@ type Compactor interface {
 		func(context.Context, CompactionOutcome) error,
 	) error
 }
+```
 
-type GateClassifierOutcome struct {
-	Value *GateClassification
-	Err   error
+There is no public `Hustle[In, Out]`, no `map[string]any`, and no arbitrary
+`Session.RunHustle`. The concrete adapter owns:
+
+```text
+validate typed input
+→ marshal versioned wire input
+→ invoke the named runtime definition
+→ in the runner's validation callback, decode with DisallowUnknownFields
+→ validate domain values before terminal lifecycle audit
+→ convert to a concrete domain outcome
+→ call the caller's finalizer
+```
+
+The finalizer shape is required, not optional. A bare returned value could
+escape session ownership before the caller commits or rejects the corresponding
+product. The finalizer receives success or failure while drain ownership—and,
+for blocking work, quiescence activity—is still held.
+
+---
+
+## §3 · Binding and package ownership
+
+`pkg/rig` owns design-time registration. `internal/sessionruntime.Lifecycle`
+captures the frozen definitions and lane limits and passes them to both new and
+restored sessions.
+
+At session construction, `internal/sessionruntime` binds each definition with a
+narrow current-loop model resolver, then creates one
+`internal/hustleruntime.Controller` with the bound definitions and narrow
+collaborators:
+
+```go
+type AuditPublisher interface {
+	PublishInternalEventChecked(context.Context, event.Event) error
 }
 
-type GateClassifier interface {
-	ClassifyAndFinalize(
+type HeaderStamper interface {
+	Stamp(event.Header) (event.Header, error)
+}
+
+type FaultReporter interface {
+	ReportFault(context.Context, error)
+}
+
+type ActivityTracker interface {
+	AcquireHustleActivity(context.Context, hustle.RunID) (ActivityLease, error)
+}
+
+type ActivityLease interface {
+	Release(context.Context) error
+}
+```
+
+The interfaces are defined where consumed. `event.Factory` satisfies
+`HeaderStamper`; the controller uses a small exhaustive switch over the three
+hustle lifecycle types to write the stamped header back. The controller receives
+no session controller, loop registry, workspace coordinator, gate directory,
+tool registry, or security-ceiling mutator.
+
+If acquisition inserts hub activity but its derived `SessionActive` append then
+fails, it returns both a non-nil **partial** lease and the error. The controller
+always defers release for a non-nil lease. The lease remembers whether
+acquisition committed: releasing a partial lease silently removes the in-memory
+entry without deriving/appending `SessionIdle`, because no corresponding active
+edge became durable; the already-latched session fault owns waiter failure.
+
+The session's `hustle.ModelResolver` implementation reads the originating loop
+handle under the existing registry/live-view locks and returns only
+`inference.Client` plus the current `inference.Model`. It does not expose the
+bound loop definition.
+
+Definitions are bound before the session becomes reachable. A bind failure
+aborts construction transactionally, like a loop/tool bind failure. Restore
+uses the current rig definitions after the frozen rig fingerprint check; it does
+not reconstruct old in-flight runs.
+
+The raw `Runner` remains internal. For compaction, the loop actor depends only
+on the focused `Compactor` contract declared with the compaction domain. During
+loop construction, `internal/sessionruntime` injects an adapter bound to that
+loop's ID; the adapter stamps the cause and delegates to the session controller.
+The actor never receives the registry or a runner capable of naming another
+hustle. Background consumers are wired to their own named adapters in
+`internal/sessionruntime` by the same pattern.
+
+---
+
+## §4 · Invocation lifecycle
+
+The controller boundary is:
+
+```go
+type Runner interface {
+	RunAndFinalize(
 		context.Context,
-		GateClassificationInput,
-		func(context.Context, GateClassifierOutcome) error,
+		hustle.Request,
+		func(context.Context, hustle.Result) error,
+		func(context.Context, hustle.Outcome) error,
 	) error
 }
 ```
 
-The finalizer runs for **every** terminal state — success, execution failure,
-output-validation failure, cancellation, and timeout — never only the happy path.
-On failure the finalizer's outcome carries `Err` and no value, and the runtime
-still holds the token, so (for example) compaction durably appends
-`CompactionRejected` for its waiters before the token releases. The adapter owns
-marshal → invoke → unmarshal → validate and then calls the finalizer; callers
-never switch on generic payload maps and never receive a bare return value that
-would escape the token scope.
+The first callback performs concrete output decoding/domain validation. The
+adapter captures the validated concrete value in call-local state; its finalizer
+uses that value only when `Outcome.Err == nil`. This two-callback shape keeps
+the low-level runtime non-generic while ensuring `HustleCompleted` can never
+precede a domain-validation failure.
 
-## §3 · Backend kinds
+The adapter supplies only `Name`, `Cause`, and encoded `Input`. The controller
+owns `SessionID` and mints `RunID` after queue capacity is reserved; neither
+field exists on the caller request, so attribution cannot be spoofed.
 
-```go
-type BackendKind uint8
-
-const (
-	BackendUnknown BackendKind = iota
-	BackendLoop
-	BackendAPI
-	BackendFunc
-)
-```
-
-Every backend implements the same `Backend` contract and reports a stable kind
-for definition validation/audit.
-
-### Loop backend
-
-A loop backend builds a restricted `LoopSpec`, invokes
-`internal/hustleruntime.RunLoop`, and converts its terminal `AIMessage` into the
-generic result. It reuses inference streaming, usage capture, structured output,
-and event codecs.
-
-```go
-type LoopSpec struct {
-	Model           inference.Model
-	System          string
-	Messages        content.AgenticMessages
-	Tools           []inference.Tool
-	Output          *inference.OutputSchema
-	MaxOutputTokens content.TokenCount
-	Security        SecurityProfile
-}
-
-type RunLoop interface {
-	RunLoop(context.Context, LoopInvocation) (LoopResult, error)
-}
-```
-
-The exact public placement of `LoopSpec` follows dependency direction: public
-definition/building types live under `pkg/hustle`; concrete spawn/await state
-lives under `internal/hustleruntime`.
-
-### API backend
-
-An API backend calls an injected narrow client with a bounded context. It does
-not construct HTTP clients or load credentials inside business logic. The
-backend validates response size and narrows wire errors into typed hustle
-errors.
-
-### Function backend
-
-A function backend executes an injected, deterministic function. It still rides
-the same timeout, concurrency, audit, and caller policy path. It receives no
-ambient session/controller capability.
-
-Cancellation is **cooperative**: an in-process function is bounded by the
-`context.Context` it is passed, but a function that ignores that context cannot be
-given a hard timeout — the runtime can stop *waiting* on it and release the
-caller, but it cannot forcibly kill a running goroutine. Function backends must
-therefore honor `ctx.Done()` at their I/O and loop boundaries; the definition
-contract states this, and the timeout is documented as a wait bound, not a
-guaranteed-kill bound. (Loop and API backends cancel real I/O, so their timeout is
-effective.)
-
-## §4 · Loop kind and internal visibility
-
-Every durable loop start records a non-zero kind. `LoopKind` is owned by
-`harness/pkg/event` as its **single definition**; the token-usage design
-references the same `event.LoopKind` and neither redefines it:
-
-```go
-// Package event — the one definition, referenced as event.LoopKind everywhere.
-type LoopKind uint8
-
-const (
-	LoopKindUnknown LoopKind = iota
-	LoopKindPrimer
-	LoopKindDelegate
-	LoopKindHustle
-)
-
-type LoopStarted struct {
-	// existing fields
-	Kind LoopKind
-}
-```
-
-Legacy records infer primer/delegate from root/parent provenance during the
-schema migration; newly emitted `Unknown` is invalid.
-
-Event visibility is independent of persistence class and producer scope:
-
-```go
-type Visibility uint8
-
-const (
-	VisibilityPublic   Visibility = iota // zero value: public, back-compatible default
-	VisibilityInternal
-)
-```
-
-**Where visibility is carried.** Visibility is a field on the durable event
-`Header`, not a property of the event *type*. A type-level marker is
-insufficient: the same shared type — `StepDone`, `TurnDone`, `LoopStarted` — is
-**public** when produced by a primer/delegate loop and **internal** when produced
-by a hustle loop. Only a per-instance field can express that. The field is named
-`EventVisibility` and the accessor `Visibility()` — Go forbids a field and method
-sharing one identifier, so they must differ. The zero value is `VisibilityPublic`
-so every existing event stays public without a migration.
-
-```go
-type Header struct {
-	// existing fields
-	EventVisibility Visibility // zero == public
-}
-
-// Event gains two methods: an accessor (so the fan-out layer never inspects
-// concrete types) and a sealed clone that returns a copy with a replaced Header.
-type Event interface {
-	// existing methods
-	Visibility() Visibility
-	EventHeader() Header       // returns a copy, cannot mutate in place
-	WithHeader(Header) Event   // sealed clone: same concrete type, new Header
-}
-
-func (h Header) Visibility() Visibility { return h.EventVisibility }
-```
-
-**Producers are not trusted to self-classify — and stamping needs a real rewrite
-contract.** `EventHeader()` returns a *copy*, so the publisher cannot mutate
-visibility in place, and a hub type-switch that only knows a few concrete events
-cannot restamp arbitrary shared events (`StepDone`, `TurnDone`, `LoopStarted`).
-`WithHeader` closes this: it is a **sealed clone** every event type implements
-(mechanically, via the embedded `Header` and a generated/boilerplate method), so
-the trusted publisher restamps **generically** — take the event, read its header,
-set `EventVisibility`, and re-emit `event.WithHeader(stamped)` — without a
-per-type switch. A `LoopKindHustle` loop's runtime is constructed with an
-internal-stamping publisher that runs exactly this rewrite on every event it
-emits, forcing `VisibilityInternal` regardless of what the producing code set. A
-hustle loop is never handed a publisher that can emit public events.
-
-(Alternatively the publisher could accept unstamped event *builders* and
-construct the final event itself; this design chooses `WithHeader` because it
-keeps events as plain values and needs no builder type per event.)
-
-Internal visibility means:
+Each session has exactly two shared FIFO lanes: blocking and background. A
+definition selects one through `Participation`; there is no per-definition
+lane. A run has the following state machine:
 
 ```text
-journal append and validation: yes
-replay/audit fold:              yes
-public subscriber fan-out:      no  (centrally suppressed by Visibility(), not per-type)
-normal-loop lifecycle hooks:    no
+rejected (not owned, no RunID/audit/finalizer)
+  → queued-owned (RunID + drain ownership; blocking activity; Started committed)
+  → executing (lane slot + resolved runtime + execution timeout)
+  → finalizing (terminal audit committed; lane slot released)
+  → done (activity/drain released)
 ```
 
-The fan-out and hook dispatchers filter on `event.Visibility()` centrally, so a
-future hook or subscriber cannot accidentally observe an internal event merely
-because its author forgot a `LoopKind` conditional. This is the structural
-mechanism that makes core invariant 6 (internal visibility) enforceable rather
-than aspirational.
+Preflight validates name, cause, JSON shape, and input bounds, then mints a
+candidate `RunID`. Under the chosen lane lock, the controller either rejects a
+full/closed lane or inserts a node at the FIFO tail. That insertion is the
+ownership commit point. It reserves drain ownership immediately. A blocking
+node acquires hub activity next. `HustleStarted` is then appended with the
+definition and a zero unresolved runtime; a node is not scheduler-eligible until
+that append commits. A failure in activity/start audit removes the node and runs
+its finalizer with the typed failure, even if persistence is too faulted to
+record a terminal event.
 
-## §5 · Common invocation lifecycle and audit
+The lane grants execution slots strictly by ownership-commit sequence, skipping
+nodes already canceled. On grant, the controller resolves inference and derives
+an execution-timeout context from session lifetime plus caller context. It then
+issues the request, validates generic output bounds, invokes the adapter's domain
+validation callback, and appends `HustleCompleted` or `HustleFailed` with the
+resolved runtime when available. It releases the lane slot before finalization.
 
-All backends emit the same internal lifecycle. Each carries a **secret-free
-immutable descriptor** that fully identifies *which* recipe ran, so audit and the
-rig fingerprint agree without ever storing prompts or credentials:
+Caller/session cancellation while queued produces
+`HustleFailed{Stage: StageQueue}` and invokes the finalizer exactly once. Thus a
+successfully enqueued request is always an owned run with lifecycle/finalizer;
+only preflight, ID-generation, lane-full, and lane-closed rejection have none.
+Queue time does not consume the definition's execution timeout.
 
-Identity is split so definition-time facts and invocation-time resolution never
-mix (a `ModelStrategyCurrentLoop` hustle resolves a different model per run
-without any definition change), **and the split follows the import boundary**:
-definition-time identity is a `pkg/hustle` leaf type; the per-run wrapper is a
-`pkg/event` type because it embeds `event.ModelRuntime` and rides on
-`pkg/event` lifecycle events. `pkg/hustle` must not import `pkg/event`, so the
-wrapper cannot live in `pkg/hustle`:
+Execution timeout does not govern finalization: a timed-out inference still
+needs a live, separately bounded context with which to commit
+`CompactionRejected` or another failure product. Shutdown keeps the session
+context and hub open while these finalizers drain. Audit and activity failures
+fault/reject the run; inference does not begin after `HustleStarted` fails to
+commit.
+
+The terminal audit event is appended before the finalizer. The finalizer then
+commits the caller-owned product event (`CompactionCommitted`, a gate decision,
+title change, and so on). Thus lifecycle completion means “validated inference
+result exists,” while the product event remains the sole durable statement that
+the result was applied.
+
+The finalizer runs exactly once for every queued-owned run:
+success, model-resolution failure, inference failure, malformed output, domain
+validation failure, timeout, or cancellation. Rejection before ownership returns
+directly because no run exists.
+
+Every validation/finalization callback runs behind a controller recovery
+boundary. A panic is converted to `CallbackPanicError{Stage}` without retaining
+the panic value, reported as a session fault, and releases activity/drain exactly
+once. A validation panic records `HustleFailed` when persistence remains
+available. A finalizer panic occurs after the terminal lifecycle event and is
+reported as a session fault rather than manufacturing a second terminal event.
+No background callback panic can escape a goroutine and terminate the process.
+
+If both execution and finalization fail, the returned typed error retains the
+execution error as the primary run failure and the finalizer error as a separate
+field. Errors are never silently discarded.
+
+---
+
+## §5 · Concurrency, quiescence, and shutdown
+
+Rig configuration supplies separate lanes:
 
 ```go
-// Package hustle (leaf; imports neither pkg/event nor the runtime). Definition-
-// time identity — secret-free, immutable, the ONLY thing in the rig fingerprint
-// (§1). Fields are named types, not bare strings, per the strict-typing rule.
-type ModelSelector string        // named model id or the "current-loop" sentinel — NOT a resolved key
-type PromptRevision string
-type SchemaRevision string
-type SecurityRevision string
-type BackendImplRevision string
-
-type DefinitionDescriptor struct {
-	Name          Name
-	Backend       BackendKind
-	ModelStrategy ModelStrategy
-	ModelSelector ModelSelector
-	PromptRev     PromptRevision
-	SchemaRev     SchemaRevision
-	SecurityRev   SecurityRevision
-	BackendImpl   BackendImplRevision
+type HustleLimits struct {
+	BlockingConcurrent   int
+	BlockingQueued       int
+	BackgroundConcurrent int
+	BackgroundQueued     int
+	AuditTimeout         time.Duration
+	FinalizationTimeout  time.Duration
+	WorkerDrainTimeout   time.Duration
 }
 ```
 
+Both concurrent counts and all operation timeouts must be positive; queue
+counts are non-negative and bounded. Each lane is FIFO by admission sequence.
+Background work cannot borrow blocking capacity, so titles and summaries cannot
+starve compaction or safety classification. Blocking work cannot consume
+background capacity either.
+
+For each lane, `Concurrent + Queued` is the maximum total queued-owned runs,
+including waiting, executing, and finalizing states. The ownership-admission
+token is held through finalization even though the narrower execution slot is
+released first. Slow finalizers therefore cannot accumulate without bound or
+allow an unbounded stream of new inference calls.
+
+Three resources have distinct lifetimes:
+
+- a **lane slot** bounds inference calls and is released before finalization;
+- **drain ownership** covers every queued-owned run through finalization and is what
+  shutdown joins; and
+- a hub **activity entry** covers blocking runs through finalization and prevents
+  a false `SessionIdle`. Background runs never acquire one.
+
+The hub already owns the federated quiescence set. Add a private activity kind
+for hustle `RunID`, using the same edge derivation and durable
+`SessionActive`/`SessionIdle` rules as loop and delegate-wake activity. The
+controller never edits hub state directly.
+
+`Client.Invoke` runs in a capability-free worker that receives only a copied
+client reference, immutable request, and a capacity-one result channel. The
+controller selects between that result and execution-context cancellation. On
+cancellation it gives the worker `WorkerDrainTimeout` to honor the canceled
+context. If the worker still does not return, the controller atomically marks
+itself poisoned, closes both lanes to new admission, disables further scheduler
+grants, and removes/cancels every waiting queued-owned node for failed
+audit/finalization. It then reports a typed session fault before abandoning the
+channel. Only nodes executing at the poison transition can become abandoned
+workers; no waiting or later run can invoke. A broken client therefore cannot
+cause an unbounded goroutine leak. A late worker can only place its
+result in the buffered channel and exit. It has no publisher, activity tracker,
+finalizer, session controller, or lease capability, so it cannot act on a
+stopped session. Usage returned only after abandonment is necessarily
+unavailable to the terminal event and is recorded as nil.
+
+Compaction normally begins while its loop already owns activity, so it does not
+usually create a new public active edge. The separate entry still prevents the
+session from becoming idle if the originating turn finishes while compaction's
+finalizer is pending.
+
+Shutdown order extends the landed session sequence:
+
+```text
+1. latch Session.closing and snapshot loops
+2. close hustle admission
+3. cancel queued and running hustle contexts
+4. gracefully stop loops while the hub and checkpoint controller remain open
+5. wait for hustle terminal audits and finalizers to drain
+6. stop/join checkpoint and other session-owned controllers
+7. append SessionStopped and stop the hub
+8. release workspace and session leases
+9. cancel the session context as the final backstop
+```
+
+Already-owned finalizers may commit before step 5 completes; no new run can
+start after step 2. `SessionStopped` therefore cannot precede an owned
+hustle's terminal audit or race its product finalizer.
+
+Lifecycle appends use a controller-owned context derived from the still-live
+session and bounded by `AuditTimeout`, not the inference execution context. A
+provider timeout/cancellation therefore cannot prevent the runtime from trying
+to record `HustleFailed`. Activity-edge publication uses the hub's existing
+checked/fault-reporting semantics. Finalizers similarly use
+`FinalizationTimeout`.
+
+Activity release runs after finalization with a fresh session-derived context
+bounded by `AuditTimeout`, never the expired caller/execution/finalization
+context. `ActivityLease.Release` is concurrency-safe and idempotent. For a
+committed lease, its first call removes the exact `RunID`, attempts the derived
+activity-edge commit, and caches the result. For a partial lease, it performs
+the silent rollback described in §3 and caches the acquisition error. Later
+calls return the cached result. A commit failure reports the session fault but
+cannot leak or re-add the in-memory activity entry.
+
+Once shutdown latches closing, controller cleanup is non-abandonable: the
+method does not stop the hub, release either lease, cancel the session context,
+or return while a queued-owned run can still audit or finalize. The caller's
+deadline cancels queue/inference work and is reported in the eventual typed
+shutdown error, but it does not authorize unsafe resource release. Shutdown may
+therefore outlive that deadline by the finite internal cleanup bound determined
+by owned-run count plus `WorkerDrainTimeout`/`AuditTimeout`/
+`FinalizationTimeout` and existing checkpoint bounds. Internal audit/finalizer
+implementations are required and tested to honor their contexts; violating that
+trusted contract is a bug, not a detached teardown mode. The session context is
+canceled only after controller drain, hub stop, and lease-release ordering is
+complete.
+
+---
+
+## §6 · Private durable audit
+
+Hustle lifecycle is durable but absent from ordinary event subscriptions.
+
 ```go
-// Package event (imports pkg/hustle and inference; the runtime imports event).
-// Per-run identity — definition plus what invocation actually resolved. Lives on
-// pkg/event lifecycle events, never in the rig fingerprint.
+type EventVisibility uint8
+
+const (
+	VisibilityPublic EventVisibility = iota
+	VisibilityInternal
+)
+
+type Header struct {
+	// existing fields
+	EventVisibility EventVisibility `json:"visibility,omitzero"`
+}
+
+func (h Header) Visibility() EventVisibility
+```
+
+Zero remains public for journal compatibility. Visibility is metadata, not an
+authorization mechanism.
+
+`event.Event` gains `Visibility() EventVisibility`; embedding `Header` satisfies
+it for every concrete event without per-type methods. The differently named
+`EventVisibility` field avoids a field/method collision.
+
+The controller creates lifecycle events with `VisibilityInternal`, stamps them
+with the session event factory, then calls a checked internal publication path.
+That path requires all of the following:
+
+- `VisibilityInternal`;
+- `event.Enduring`;
+- the controller's session ID;
+- a recognized hustle lifecycle type; and
+- valid event coordinates/body.
+
+It appends through the hub's existing durable appender and fault reporter but
+does **not** apply hub activity mutations, run workspace boundaries, or deliver
+to subscribers. Blocking activity is represented only by the explicit activity
+entry in §5.
+
+The ordinary `PublishEvent`/`PublishEventChecked` path rejects internal events,
+and `event.ShouldDeliver` returns false for them as defense in depth. Only the
+recognized checked internal path may append them. Conversely, that path rejects
+public events. Replay-facing product streams apply the same default-deny filter.
+
+No generic `Event.WithHeader` method is added. The landed event producers use
+small exhaustive write-back switches because an embedded `Header` cannot clone
+an arbitrary concrete event. Hustle lifecycle events are constructed and
+stamped directly, so generic restamping is unnecessary.
+
+Ordinary live and replay-facing product APIs exclude internal events before
+delivery. A future privileged audit API must authenticate and authorize before
+reading them and must redact sensitive fields. Raw hustle inputs/outputs,
+prompts, credentials, commands, fetched content, and classifier reasoning are
+never stored in lifecycle events.
+
+### Lifecycle events
+
+`DefinitionDescriptor` stays in leaf package `pkg/hustle`. Run-time audit types
+live in `pkg/event`, which may import `pkg/hustle` without a cycle:
+
+```go
 type HustleRunDescriptor struct {
 	Definition hustle.DefinitionDescriptor
-	Runtime    ModelRuntime // resolved model + limits + effort; zero for BackendFunc
+	RunID      hustle.RunID
+	Runtime    ModelRuntime
 }
-```
 
-All lifecycle events live in `pkg/event`, are `sessionScoped` (the run is a
-session-owned operation, not a loop-scoped event), and carry
-`event.HustleRunDescriptor`:
-
-```go
 type HustleStarted struct {
-	internal // stamps Header.EventVisibility = VisibilityInternal at trusted publish
 	enduring
 	sessionScoped
 	Header
-	RunID  hustle.RunID
-	Run    HustleRunDescriptor
-	LoopID *uuid.UUID // set for BackendLoop: correlates to that loop's LoopStarted
+	Run HustleRunDescriptor
 }
 
 type HustleCompleted struct {
-	internal
 	enduring
 	sessionScoped
 	Header
-	RunID hustle.RunID
-	Run   HustleRunDescriptor
-	// Usage is the AUTHORITATIVE accounting source for BackendAPI, which has no
-	// loop AIMessage. It is nil for BackendLoop (usage lives on its own AIMessage
-	// and hustle-loop totals) and for BackendFunc (no model call). Exactly one
-	// source per backend, no double counting.
-	Usage *content.Usage
+	Run      HustleRunDescriptor
+	Duration time.Duration
+	Usage    *content.Usage
 }
 
 type HustleFailed struct {
-	internal
 	enduring
 	sessionScoped
 	Header
-	RunID hustle.RunID
-	Run   HustleRunDescriptor
-	// Usage may be non-nil for BackendAPI even on failure: an API request can
-	// consume tokens and THEN fail output decode/validation. Recording it here
-	// keeps spend from being lost on the failure path. Nil for loop/func.
-	Usage *content.Usage
-	Error RestoredError
+	Run        HustleRunDescriptor
+	Duration   time.Duration
+	Stage      hustle.Stage
+	ReasonCode hustle.ReasonCode
+	Usage      *content.Usage
 }
 ```
 
-The `internal` embed is the producer-side declaration that the trusted
-hustleruntime publisher honors when stamping `Header.EventVisibility`; these
-events are internal for **every** backend, including API/function backends that
-run no loop. `HustleStarted.LoopID` closes the correlation gap: a loop-backed
-run's `HustleStarted` and the loop's own `LoopStarted{Kind: LoopKindHustle}` are
-joined by `RunID`↔`LoopID`, so audit can walk from a hustle run to its loop
-detail and back.
+`Header.Cause` is the single direct-cause location. `HustleStarted` records the
+owned request before it is scheduler-eligible, so its `Runtime` is always zero.
+The terminal event records the resolved runtime when resolution succeeded; a
+resolution failure retains a zero runtime and uses
+`HustleFailed{Stage: StageModelResolution}`. No model resolution or inference
+begins until the started append commits.
 
-Lifecycle events do not copy raw input, output, credentials, commands, fetched
-content, or PII. The caller's existing intent/event and the loop-backed hustle's
-normal internal journal supply detailed audit where authorized. A successful
-caller may append its own sanitized enduring product event (`CompactionCommitted`,
-title changed, gate decision, and so on).
+Failures store bounded stage/reason enums, not raw provider errors. Detailed
+typed errors return to the in-process caller and normal security-safe logs.
 
-**Three distinct tokens.** Ownership/drain and quiescence are *different*
-concerns and must not be one token — a background hustle is owned by the session
-(shutdown must wait for it) yet must **not** delay `SessionIdle` (§6). So:
+---
 
-- a **concurrency** token bounds how many backends execute at once, released as
-  soon as the backend finishes;
-- an **ownership/drain** token is held by **every** hustle (blocking *and*
-  background) from validation until its finalizer returns; shutdown waits on it so
-  no run is torn down mid-flight; it does **not** gate `SessionIdle`;
-- an **activity/quiescence** token is held by **blocking** hustles only, over the
-  same span; it *does* gate `SessionIdle`, covering the window between "result
-  ready" and "product committed". Background hustles never acquire it.
+## §7 · Inference request and output
 
-Neither the drain nor the activity token is a data struct the caller passes around
-and must remember to release — that leaks the token if a caller forgets. The
-runtime **owns** both across a caller-supplied finalizer, so release is structural
-and exactly-once. The finalizer is the finalizer-shaped typed adapter from §2; it
-runs on **every** terminal state, so failures reach the caller *inside* the held
-scope:
-
-```go
-// The caller-facing runtime boundary. The runtime holds the drain token (always)
-// and the activity token (blocking only) across the WHOLE call — validation,
-// backend execution, AND the finalizer — releasing each exactly once when
-// RunAndFinalize returns, on every path. The caller never sees or releases a
-// token; the finalizer only decides what to commit.
-//
-// finalize receives the terminal Outcome (success OR error) so the caller can
-// commit a product on success AND durably reject/record on failure. It runs for
-// success, execution failure, output-validation failure, cancellation, and
-// timeout — never only the happy path.
-type RunAndFinalize interface {
-	RunAndFinalize(
-		ctx context.Context,
-		invocation Invocation,
-		finalize func(ctx context.Context, outcome Outcome) error,
-	) error
-}
-
-// Outcome is the runtime-boundary (serialization-layer) envelope: exactly one of
-// Result / Err is set. Typed adapters (§2) narrow it to a per-domain outcome
-// (CompactionOutcome, …) before the caller sees it.
-type Outcome struct {
-	Result *Result
-	Err    error
-}
-```
-
-Ordered execution (all driven by the runtime, not the caller):
+Every run issues exactly one non-streaming request:
 
 ```text
-validate registered definition + typed request
-→ enforce size, security, concurrency, and participation policy
-→ mint RunID; acquire drain token (always) + activity token (blocking only) + concurrency token
-→ append HustleStarted (internal)
-→ execute backend with bounded context
-→ validate typed output
-→ append HustleCompleted or HustleFailed (internal)
-→ release the CONCURRENCY token (backend slot free)
-→ invoke finalize(ctx, outcome) — drain (+ activity, if blocking) STILL HELD
-→ finalize commits the product on success, or durably records/rejects on failure
-→ release drain + activity tokens exactly once, on every return/panic/cancel path
-→ return finalize's error (or the execution error) to the caller
+client:       named definition client or originating loop's bound client
+model:        named definition model or originating loop's committed live model
+system:       hustle definition's versioned system prompt
+messages:     one data-only user message containing the versioned JSON input
+tools:        nil
+output:       optional structured schema from the definition
+sampling:     definition/model policy, fingerprinted
 ```
 
-The activity token is what a blocking hustle contributes to quiescence (§6):
-`SessionIdle` cannot fire while it is held, so the result-ready→product-committed
-window is covered by construction — the caller cannot observe the outcome outside
-the token scope. The drain token is what **shutdown** waits on for *every* hustle.
-All three tokens release on exactly one path each, including every error, panic,
-and cancellation path. The finalizer return is authoritative; public pub/sub is
-not used as a result hand-back.
+The backend calls `inference.Client.Invoke`, not loop runtime machinery. It does
+not create committed conversation history, stream tokens, request permissions,
+or execute tools.
 
-## §6 · Quiescence participation
+Free-text definitions require exactly one assistant text result. Structured
+definitions use `inference.DecodeOutput` from the structured-output design.
+Mixed prose/tool output, empty output, unexpected tools, multiple candidate
+values, unknown JSON fields, invalid enums, or an oversized result fail closed.
 
-Participation is definition-time policy, and it maps directly onto which of the
-two session-owned tokens (§5) a run acquires:
+The adapter performs the final domain validation. For compaction, the output is
+one bounded summary string. It is later stored as data-only conversation context
+by `CompactionCommitted`; it cannot introduce a system message, tool call, gate
+decision, or instruction block.
 
-- **Blocking** (compaction, gate/tool classifiers): holds **both** the drain token
-  and the **activity** token. `SessionIdle` cannot fire while the result is
-  required for the current operation.
-- **Background** (session title/recap/summary metadata): holds the **drain** token
-  only, **never** the activity token — so it runs without delaying loop idleness.
-  It is still session-owned, bounded, canceled on shutdown, and must commit its
-  durable product atomically if it completes.
+---
 
-This is exactly the drain-vs-activity split: ownership (shutdown waits) applies to
-every hustle via the drain token; quiescence (idle is delayed) applies to blocking
-hustles only via the activity token. Background does not mean detached/unbounded —
-the session retains cancellation and concurrency ownership until completion.
-Restore never resumes either mode.
+## §8 · Security and caller authority
 
-Compaction's loop-backed hustle runs while the primary turn is already active,
-so its activity token normally does not introduce a new public active/idle edge;
-it prevents premature idleness if other work finishes first.
+A definition's prompt treats supplied content as untrusted data. Classifier
+definitions additionally require constrained output. All definitions have no
+tools and no ambient session/controller capability.
 
-### Shutdown ordering
-
-Shutdown waits on the **drain** token — held by every hustle, blocking or
-background — before it declares the session stopped. The session performs a fixed
-sequence:
-
-```text
-1. close hustle admission (no new invocation accepted)
-2. cancel queued and running hustles (bounded-context cancellation)
-3. prevent new product commits (callers past this point cannot append products)
-4. await every terminal lifecycle record (HustleCompleted/HustleFailed) and
-   drain-token release (activity token too, for blocking runs)
-5. emit SessionStopped
-6. release the session lease
-```
-
-Steps 4→5 guarantee `SessionStopped` never races an in-flight product commit: a
-run still holding its drain token keeps the session out of the stopped state until
-its finalizer has returned (product committed or abandoned). A background run is
-cancelled at step 2 and, if it had not yet committed, is re-evaluated on the next
-start rather than committed during teardown.
-
-## §7 · Model selection and resource posture
-
-Each hustle selects a model independently:
+A classifier returns a verdict bound to the exact subject it judged:
 
 ```go
-type ModelStrategy uint8
-
-const (
-	ModelStrategyUnknown ModelStrategy = iota
-	ModelStrategyCurrentLoop
-	ModelStrategyNamed
-)
-```
-
-- Compaction uses the current loop model or another explicitly configured model
-  whose context window can contain the source conversation. Cache reuse is only
-  an optimization.
-- Classifiers, titles, and short recaps normally use a named small/fast model.
-- A model selection is resolved and validated at invocation; no hustle silently
-  falls back to a broader/more expensive model.
-
-Loop-backed defaults are least privilege:
-
-```text
-tools:             none
-delegation:        none
-normal-loop hooks: none
-fan-out:           none
-security ceiling: explicit narrow profile
-max output:        required
-timeout:           required
-```
-
-A future tool-using hustle must explicitly opt into a named restricted tool set
-and rides the same gate/sandbox policy as normal tool execution.
-
-## §8 · Caller-owned policy and safety authority
-
-`Backend.Execute` and typed adapters return errors; the consumer owns failure
-and action policy.
-
-Typical policies:
-
-- compaction: fail open only below the hard context admission limit;
-- safety classifier: deny or escalate to a human on error/ambiguity;
-- title: deterministic text fallback;
-- recap: resume without recap or surface a non-blocking warning.
-
-A classifier never directly approves a gate. It returns a constrained verdict,
-and the verdict is **bound to the exact subject it judged** so it can never be
-applied to a different or mutated gate/command/policy:
-
-```go
-// Binds a classification to what was classified. Carried on classifier input, on
-// the returned Classification, and on the product event. Every field is an id,
-// digest, or revision — never raw command/content bytes.
 type ClassificationBasis struct {
 	GateID             uuid.UUID
 	ToolExecutionID    uuid.UUID
-	SubjectDigest      [32]byte       // digest of the exact classified subject
+	SubjectDigest      [32]byte
 	PolicyRevision     PolicyRevision
 	ClassifierRevision ClassifierRevision
 }
+```
 
-type Verdict uint8
+The typed output repeats the basis. Immediately before applying an allow result,
+the caller recomputes the subject digest and checks gate ID, tool execution ID,
+policy revision, classifier revision, authorization, gate kind, risk threshold,
+and the live session security ceiling. Any mismatch, unknown value, invalid
+schema, error, or ambiguity denies or escalates; it never auto-allows.
+
+The runtime does not approve gates, mutate loop context, write titles, or choose
+fallback policy. Those are separate caller responsibilities.
+
+---
+
+## §9 · Usage and catalog projection
+
+```go
+type TerminalStatus uint8
 
 const (
-	VerdictUnknown Verdict = iota
-	VerdictAllow
-	VerdictDeny
-	VerdictEscalate
+	TerminalStatusUnknown TerminalStatus = iota
+	TerminalStatusCompleted
+	TerminalStatusFailed
 )
-
-type Classification struct {
-	Basis      ClassificationBasis
-	Verdict    Verdict
-	Risk       RiskLevel
-	ReasonCode ReasonCode
-}
 ```
 
-The gate/policy layer may auto-approve only when all conditions hold:
+The `inference.Response` is the only usage source. On success,
+`HustleCompleted.Usage` carries it. If inference consumed tokens but extraction
+or validation failed, `HustleFailed.Usage` carries it. Pre-inference failures
+have nil usage. The controller validates and defensively copies usage before it
+enters an enduring event; no event retains a provider-owned mutable pointer.
+
+Usage is not copied onto an originating loop message and does not change that
+loop's cumulative usage or current-context measurement.
+
+`SessionMeta` may expose a bounded aggregate keyed by definition identity rather
+than invocation-time resolution:
 
 ```text
-caller is authenticated and authorized
-gate kind is explicitly auto-approvable
-session/rig security ceiling permits machine approval
-classifier output validates and says Allow
-configured risk threshold is satisfied
-no higher-priority deny rule matched
-the Classification.Basis STILL MATCHES the live gate immediately before approval:
-  same GateID + ToolExecutionID, recomputed SubjectDigest equal,
-  PolicyRevision and ClassifierRevision unchanged
+(hustle name, model source, named model key when fixed, terminal status)
 ```
 
-The basis recheck happens **immediately before** auto-approval, closing the
-time-of-check/time-of-use gap: if the command, gate, policy, or classifier
-revision changed between classification and application, the digests/revisions
-disagree and the decision escalates or denies. Any error, unknown field/value,
-invalid schema, disagreement, basis mismatch, non-auto-approvable gate, or
-exceeded ceiling becomes deny/escalate, never allow.
+It folds only terminal lifecycle events. Individual runs remain in the journal
+and are not enumerated in the catalog. A named definition has one fixed model
+bucket. Every current-loop resolution for a definition folds into that
+definition's single `ModelSourceCurrentLoop` bucket; its aggregate runtime is
+zero/mixed while each terminal event retains the actual resolved runtime. This
+is bounded and replay-order-independent even when `ChangeLoopInference`
+installs arbitrarily many model keys.
 
-Structured output constrains syntax but is not proof that the semantic verdict
-is correct. Tests/evaluation and policy limits remain required.
+---
 
-## §9 · Isolation and prompt injection
+## §10 · Restore and crash consistency
 
-Loop-backed guard hustles process untrusted content. Controls:
+Restore folds hustle lifecycle only for audit and aggregate repair:
 
-- dedicated system prompt stating that supplied content is data to analyze, not
-  instructions to follow;
-- versioned delimited input;
-- no tools by default;
-- constrained output schema;
-- maximum input/output sizes;
-- least-privilege model/security profile; and
-- caller-owned deny/escalate behavior.
+- `HustleStarted` without a terminal is an interrupted attempt;
+- no goroutine, queue entry, inference request, or finalizer is reconstructed;
+- terminal lifecycle without a caller product event means the result was not
+  applied; and
+- the caller re-evaluates its durable trigger and may create a new `RunID`.
 
-Compaction is also security-sensitive because its summary re-enters a tool-
-capable loop. Its output is validated as one summary text message, tagged as
-data-only context, and cannot introduce tools, system messages, or gate
-decisions.
-
-The OS sandbox is irrelevant to a tool-less inference call. If a future hustle
-executes tools, the normal tool sandbox/gate controls apply.
-
-## §10 · Usage and observability
-
-Usage has **exactly one accounting source per backend**, so aggregation never
-double-counts and never drops a backend:
-
-| Backend | Authoritative usage source |
-|---|---|
-| `BackendLoop` | the hustle loop's `AIMessage.Usage`, folded into hustle-loop totals; the lifecycle `Usage` fields are nil |
-| `BackendAPI` | `Usage` on the terminal lifecycle event — `HustleCompleted.Usage` on success, **`HustleFailed.Usage`** when the request consumed tokens but output decode/validation then failed |
-| `BackendFunc` | none — no model call, so no usage (lifecycle `Usage` nil) |
-
-Recording API usage on **both** terminal events is what prevents spend from being
-lost: an API hustle can burn tokens and still fail validation, and that spend is
-still real. A loop-backed hustle's usage is never copied to the caller's message
-or usage. The token-usage design's `HustleUsageAggregate` (bounded, keyed by
-name/model/status) folds from these single sources — loop totals for
-`BackendLoop`, the terminal event's `Usage` (completed *or* failed) for
-`BackendAPI` — and from nothing for `BackendFunc`.
-
-Operational views may expose sanitized aggregates by hustle name/model/status,
-but never prompts, fetched content, commands, credentials, or raw classifier
-reasoning.
-
-## §11 · Restore and crash behavior
-
-Hustles re-run; they never resume:
-
-- restore reconstructs primers and delegates;
-- `LoopStarted{Kind: LoopKindHustle}` is retained for audit but no live hustle
-  loop is reconstructed;
-- an unmatched `HustleStarted` is an interrupted attempt, not a product;
-- if the caller's product event never committed, the restored caller state
-  re-evaluates its trigger; and
-- a completed product event (`CompactionCommitted`, title change, gate decision) folds
-  normally and prevents duplicate application according to its own basis/id.
-
-This makes completion atomic from the caller's perspective:
+For compaction:
 
 ```text
-hustle result returned but product event not appended before crash
-→ result is not durable
-→ restore re-evaluates/re-runs
+HustleCompleted committed
+→ crash before CompactionCommitted
+→ restored context remains uncompacted
+→ pressure logic may run a new hustle
 ```
 
-## §12 · Planned hustles and TODOs
+Product events own idempotency through their domain basis/CAS rules. Hustle
+lifecycle never substitutes for a product event.
 
-| Name | Backend | Participation | Output | Caller | Initial status |
-|---|---|---|---|---|---|
-| `context.compact` | loop | blocking | summary | loop context controller | implement now |
-| `gate.command-safety` | loop/API | blocking | classification | gate policy | TODO |
-| `gate.general-safety` | loop/API | blocking | classification | gate policy | TODO |
-| `content.fetch-injection` | loop/API | blocking | verdict + spans/codes | Fetch policy | TODO |
-| `content.tool-safety` | loop/API | blocking | classification | tool boundary | TODO |
-| `session.title` | loop | background | short title | catalog/title controller | TODO |
-| `session.stale-recap` | loop | background or blocking by caller | recap | restore/UI flow | TODO |
-| `session.summary` | loop | background | summary | display/export flow | TODO |
+---
 
-Each TODO requires its own typed input/output, validation, caller policy,
-evaluation corpus, and tests. Adding one must not add fields to unrelated hustle
-types; it composes a new adapter/definition over the stable runtime.
+## §11 · Errors
 
-### Prompt-cache TODO
+All package/runtime failures have concrete typed errors suitable for
+`errors.As`. Distinct kinds cover:
 
-Prompt caching is not currently a guaranteed Looprig capability. Add a separate
-design that:
+- definition and rig registration;
+- binding and current-loop model resolution;
+- input/version/size validation;
+- lane full, cancellation, timeout, session closing, and session fault;
+- internal audit append;
+- inference invoke and capability mismatch;
+- output extraction, size, JSON shape, and domain validation; and
+- finalization, including combined execution/finalization failure.
 
-- represents provider-neutral cache intent and stable prefix identity in
-  `inference`;
-- translates intent into OpenAI/Anthropic/Gemini policy in `llm`;
-- records cache read/write usage without changing context size semantics;
-- defines privacy/retention expectations; and
-- verifies byte-/block-stable prefixes.
+Run-stage errors carry `{Name, RunID, Stage}` when a run exists and unwrap their
+cause. Error strings and durable reason codes never include raw input/output or
+credentials. No error returns a partially validated result.
 
-No hustle correctness or safety decision may depend on a cache hit.
+---
 
-## §13 · Error model
+## §12 · Planned definitions
 
-Package/runtime APIs return typed errors:
+| Name | Participation | Model source | Output | Initial status |
+|---|---|---|---|---|
+| `context.compact` | blocking | current loop or named | bounded text summary | implement first |
+| `gate.command-safety` | blocking | named | structured classification | TODO |
+| `gate.general-safety` | blocking | named | structured classification | TODO |
+| `content.fetch-injection` | blocking | named | structured verdict | TODO |
+| `content.tool-safety` | blocking | named | structured classification | TODO |
+| `session.title` | background | named | bounded text | TODO |
+| `session.stale-recap` | caller-selected definition | named | bounded text | TODO |
+| `session.summary` | background | named | bounded text | TODO |
 
-- definition: missing/duplicate name, backend, limits, timeout,
-  participation, security incompatibility;
-- registry: unknown hustle, duplicate registration, fingerprint mismatch;
-- invocation: invalid session/cause/run ID, input limit, encode/decode,
-  unsupported version;
-- admission: concurrency/queue limit, shutting down, security ceiling;
-- execution: timeout, cancellation, backend kind/stage, loop terminal,
-  API/function failure;
-- output: size, malformed JSON, unknown fields, schema/typed validation; and
-- persistence: lifecycle append/product append faults.
+Participation is definition-time, not selected per invocation. If stale recap
+needs both blocking and background semantics, it is registered as two names or
+two distinct definitions; one invocation cannot widen its definition's policy.
 
-Every stage error includes `{Name, RunID, Stage}` and unwraps its cause. No error
-path returns a partially validated output.
+Each TODO needs a concrete wire type, adapter, validation, caller policy,
+prompt/schema revision, evaluation corpus, and tests. Adding one must not add
+fields to unrelated domain types.
 
-## §14 · Testing
+Prompt caching is a separate inference/provider design. No hustle correctness,
+safety, fingerprint, or timeout behavior may depend on a cache hit.
 
-All tests are table-driven and run with `-race`; network/process crossings have
-integration tests under the `integration` tag; external-input parsers receive
-fuzz targets.
+---
 
-- definition/registry: required fields, duplicate names, defensive copies,
-  limits, fingerprinting covers `DefinitionDescriptor` only (model **selector**,
-  prompt/schema/security/impl revisions) and **excludes** the resolved model key,
-  unknown references;
-- serialization boundary: version, size limits, unknown fields, immediate typed
-  narrowing, malformed input/output fuzzing;
-- visibility: `Header.EventVisibility` zero == public and `Header.Visibility()`
-  reads it (no field/method collision); the trusted publisher restamps generically
-  via `WithHeader` (not a per-type switch); `EventHeader()` returns a copy so it
-  cannot mutate in place; a `LoopKindHustle` loop's publisher forces internal on
-  shared types (`StepDone`, `TurnDone`, `LoopStarted`) while the same type stays
-  public from a primer/delegate; central `Visibility()` filter suppresses fan-out
-  and hooks;
-- lifecycle: exact start/completed/failed order, `sessionScoped`,
-  `event.HustleRunDescriptor` present (definition + resolved runtime),
-  `HustleStarted.LoopID`↔`LoopStarted` correlation, append failures, timeout,
-  cancel, release-on-every-path for all three tokens;
-- tokens via `RunAndFinalize`: drain token held by every hustle (shutdown waits),
-  activity token held by blocking only (gates `SessionIdle`), background never
-  acquires activity; the finalizer runs for success, execution failure,
-  validation failure, cancellation, and timeout; drain + activity release exactly
-  once on every path incl. panic; a caller cannot observe the outcome outside the
-  token scope;
-- shutdown ordering: admission closed → running cancelled → product commits
-  blocked → terminal records + drain-token release awaited → `SessionStopped` →
-  lease released; no `SessionStopped`/product-commit race;
-- concurrency: separate blocking/background lanes, reserved blocking capacity,
-  background cannot starve blocking, deterministic FIFO within a lane, bounded
-  queues, shutdown;
-- loop backend: `LoopKindHustle`, internal visibility, finalizer-delivered
-  outcome (not a bare return), no public fan-out, no restore, own usage;
-- backend identity: `Backend.Identity()` supplies kind + `BackendImplRevision`;
-  `Definition` construction reads it into `DefinitionDescriptor`; a stale impl
-  revision is a definition-fingerprint change;
-- finalizer-shaped adapters: typed `CompactAndFinalize`/`ClassifyAndFinalize`
-  invoke the finalizer for every terminal state and never return a bare value that
-  escapes the token scope;
-- import boundary: `pkg/hustle` (leaf: `DefinitionDescriptor`, `Name`,
-  `BackendKind`) does not import `pkg/event`; `event.HustleRunDescriptor` embeds
-  `hustle.DefinitionDescriptor`; no `event`↔`hustle` cycle;
-- hook isolation: hustle step/turn events cannot trigger snapshots, occupancy,
-  compaction, or future normal-loop dispatcher tests;
-- API/function backends: same lifecycle/audit semantics without loop events; API
-  usage authoritative on the terminal event — `HustleCompleted.Usage` on success
-  **and `HustleFailed.Usage` when tokens were spent before a validation failure**;
-  nil for loop/func; function backend cooperative cancellation (context-ignoring
-  function bounds wait only);
-- caller policy: invalid/unknown/error classifier outputs never auto-allow;
-  `ClassificationBasis` mismatch (changed subject digest, gate id, policy or
-  classifier revision) at the pre-approval recheck escalates/denies;
-- compaction: result commits only through `CompactionCommitted`; crash before product
-  append re-runs; no usage leakage;
-- metadata hustles: deterministic fallback and no unbounded background work; and
-- legacy loop-kind migration.
+## §13 · Testing
 
-## §15 · Module impact
+All tests are table-driven and run with `-race`. External provider/process
+crossings use integration build tags. External JSON parsers receive fuzz tests.
 
-- `core/content` — normalized usage consumed by loop-backed hustle results.
-- `inference` — structured-output and future cache-intent dependencies; no
-  hustle import.
-- `llm` — provider clients/caching implementation only; no harness import.
-- `harness/pkg/hustle` — public immutable contracts and backend boundary.
-- `harness/internal/hustleruntime` — registry/runtime/loop spawn/audit.
-- `harness/pkg/rig` — `WithHustles`, limits, graph validation, fingerprint.
-- `harness/pkg/event` — loop kind, visibility, hustle lifecycle codecs.
-- `harness/internal/sessionruntime` — per-session registry, activity tokens,
-  shutdown, restore-skip, product integration.
-- `swe` — definitions, prompts/models, typed adapters, policy/evaluations for
-  product-specific hustles.
+Required coverage:
+
+- immutable definition validation, defensive copies, duplicate options/names,
+  canonical policy revisions, and secret exclusion;
+- rig fingerprint ordering and changes for every behavior-affecting field;
+- named and current-loop resolution, including committed live model changes,
+  missing/exited loop, missing cause, and capability mismatch;
+- wire version, empty/max/oversized input/output, unknown fields, malformed JSON,
+  and domain validation;
+- tool-less request construction and exact one-call `Invoke` behavior;
+- checked internal audit: only recognized internal enduring lifecycle events,
+  ordinary publish rejects internal visibility, `ShouldDeliver` denies it, no
+  ordinary subscriber delivery, no workspace boundary, and append failure
+  faults the run/session;
+- lifecycle order and sanitized completed/failed events, including usage on
+  post-inference validation failure;
+- blocking/background FIFO lanes, queue bounds, reserved capacity, fairness,
+  cancellation, shared-lane (not per-definition) ordering, ownership commit,
+  and no cross-lane borrowing;
+- activity begins before `HustleStarted`, remains through finalization, and ends
+  exactly once on success/error/panic; background never changes quiescence;
+- finalizer exactly once for every owned terminal path and never for validation
+  or queue rejection before ownership; queued cancellation receives failure
+  audit/finalization;
+- ignored provider cancellation: controller abandons the capability-free worker,
+  records nil late usage, faults/closes admission after `WorkerDrainTimeout`,
+  bounds abandoned workers by existing execution slots, drains safely, and a
+  late result cannot publish or finalize;
+- validation/finalizer panic recovery faults the session, redacts panic values,
+  releases ownership exactly once, and never escapes a background goroutine;
+- shutdown closes admission, cancels, drains terminal audit/finalizers before
+  `SessionStopped`; caller deadline cancels work but cleanup may outlive it and
+  resources remain owned until bounded drain completes;
+- restore treats unmatched starts as interrupted and repairs bounded aggregates
+  from terminal events only;
+- compaction commits only through `CompactionCommitted` and never changes loop
+  usage with hustle usage; and
+- classifier basis mismatch/error/unknown output never auto-allows.
+
+Boundary tests must enforce:
+
+- `pkg/hustle` does not import `pkg/event`, `pkg/rig`, `pkg/session`, or internal
+  runtime packages;
+- `internal/hustleruntime` does not import concrete hub/session implementations;
+- models/tools cannot reach a hustle runner through public session, loop, or tool
+  contracts; and
+- hustle code cannot acquire workspace, gate, tool, or security-ceiling mutation
+  capabilities.
+
+---
+
+## §14 · Module impact and sequence
+
+- `core/content` — normalized usage only; no hustle types.
+- `inference` — structured output as a later classifier prerequisite; no hustle
+  import.
+- `harness/pkg/hustle` — immutable definitions and serialization contracts.
+- `harness/pkg/rig` — definitions, lane limits, validation, fingerprint.
+- `harness/pkg/event` — visibility and three lifecycle events/codecs.
+- `harness/pkg/hub` — checked append-only internal audit path and private hustle
+  activity entries.
+- `harness/internal/hustleruntime` — controller and inference execution.
+- `harness/internal/sessionruntime` — model resolver, binding, lifecycle,
+  shutdown, and restore fold integration.
+- `swe` — product definitions, prompts, adapters, and evaluation corpora.
+
+Implementation sequence:
+
+1. normalized usage prerequisites;
+2. `pkg/hustle` definitions and rig fingerprinting;
+3. event visibility/lifecycle codecs and hub internal audit/activity seams;
+4. per-session controller, binding, lanes, cancellation, and shutdown;
+5. typed compaction adapter and product integration;
+6. bounded catalog aggregate;
+7. structured output; then classifier definitions individually.
 
 ## Result
 
-Hustles become a reusable harness-owned execution mechanism without becoming
-agents, delegates, or an untyped business API. The runtime centralizes audit,
-isolation, limits, model execution, and lifecycle; each consumer keeps a narrow
-typed contract and sole authority over the resulting action. Compaction uses it
-now, and the named classifier/title/recap TODOs can be added by composition
-without redesigning session lifecycle.
+Hustles are a small, reusable, session-owned inference mechanism rather than a
+second class of agent. The design reuses the landed rig's immutable composition,
+live model view, durable hub, quiescence set, and controller shutdown pattern
+without weakening loop topology or adding restore exceptions. Each caller keeps
+a narrow typed contract and sole authority over the result it applies.
