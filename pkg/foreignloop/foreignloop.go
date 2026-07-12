@@ -32,6 +32,7 @@ const (
 // unexported; *session.Session satisfies it via PublishEvent.
 type EventPublisher interface {
 	PublishEvent(context.Context, event.Event) error
+	PublishEventChecked(context.Context, event.Event) error
 }
 
 // ForeignAgent hides everything agent-specific (argv, system-prompt channel,

@@ -11,6 +11,7 @@ import (
 	"github.com/looprig/harness/pkg/command"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/identity"
+	"github.com/looprig/harness/pkg/loop"
 )
 
 // submitUserInput sends a UserInput with the given id and returns the published
@@ -20,6 +21,85 @@ func submitUserInput(t *testing.T, l *Loop, rec *recordingPublisher, id uuid.UUI
 	t.Helper()
 	l.Commands <- command.UserInput{Header: command.Header{CommandID: id}}
 	return awaitReply(t, rec, id)
+}
+
+func TestManagedAcceptancePrecedesNativeQueueAndStart(t *testing.T) {
+	t.Parallel()
+
+	t.Run("idle start", func(t *testing.T) {
+		l, rec, _ := newLoop(t, &fakeLLM{blockUntilCancel: true})
+		id := mustID(t)
+		accepted := make(chan error, 1)
+		l.Commands <- command.UserInput{Header: command.Header{CommandID: id}, NoFold: true, TargetLoopID: mustID(t), Accepted: accepted}
+		if err := <-accepted; err != nil {
+			t.Fatal(err)
+		}
+		assertNativeAcceptanceOrder(t, rec.events(), id, false)
+	})
+
+	t.Run("running queue", func(t *testing.T) {
+		l, rec, _ := newLoop(t, &fakeLLM{blockUntilCancel: true})
+		startTurn(t, l, rec, nil)
+		id := mustID(t)
+		accepted := make(chan error, 1)
+		l.Commands <- command.UserInput{Header: command.Header{CommandID: id}, NoFold: true, TargetLoopID: mustID(t), Accepted: accepted}
+		if err := <-accepted; err != nil {
+			t.Fatal(err)
+		}
+		assertNativeAcceptanceOrder(t, rec.events(), id, true)
+	})
+}
+
+func TestManagedCheckedAcceptanceFailureLeavesNativeQueueUnchanged(t *testing.T) {
+	t.Parallel()
+	l, rec, _ := newLoop(t, &fakeLLM{blockUntilCancel: true})
+	startTurn(t, l, rec, nil)
+	sentinel := errors.New("checked acceptance failed")
+	rec.setCheckedError(sentinel)
+	failedID := mustID(t)
+	failedAck := make(chan error, 1)
+	l.Commands <- command.UserInput{Header: command.Header{CommandID: failedID}, NoFold: true, TargetLoopID: mustID(t), Accepted: failedAck}
+	if got := <-failedAck; got != sentinel {
+		t.Fatalf("failed acceptance = %v, want exact sentinel", got)
+	}
+	rec.setCheckedError(nil)
+	acceptedID := mustID(t)
+	acceptedAck := make(chan error, 1)
+	l.Commands <- command.UserInput{Header: command.Header{CommandID: acceptedID}, NoFold: true, TargetLoopID: mustID(t), Accepted: acceptedAck}
+	if err := <-acceptedAck; err != nil {
+		t.Fatal(err)
+	}
+	for _, ev := range rec.events() {
+		if ev.EventHeader().Cause.CommandID == failedID {
+			t.Fatalf("failed acceptance mutated/published queue state: %T", ev)
+		}
+	}
+	assertNativeAcceptanceOrder(t, rec.events(), acceptedID, true)
+}
+
+func assertNativeAcceptanceOrder(t *testing.T, events []event.Event, id uuid.UUID, queued bool) {
+	t.Helper()
+	acceptedAt, outcomeAt := -1, -1
+	for i, ev := range events {
+		if ev.EventHeader().Cause.CommandID != id {
+			continue
+		}
+		switch ev.(type) {
+		case event.DelegateRequestAccepted:
+			acceptedAt = i
+		case event.InputQueued:
+			if queued {
+				outcomeAt = i
+			}
+		case event.TurnStarted:
+			if !queued {
+				outcomeAt = i
+			}
+		}
+	}
+	if acceptedAt < 0 || outcomeAt < 0 || acceptedAt >= outcomeAt {
+		t.Fatalf("acceptance/outcome positions = %d/%d (queued=%v)", acceptedAt, outcomeAt, queued)
+	}
 }
 
 // textBlocks wraps a string in a one-element block slice.
@@ -249,10 +329,21 @@ func TestInboxFullRejected(t *testing.T) {
 	}
 	// One more: the queue is full.
 	id := mustID(t)
-	ev := submitUserInput(t, l, rec, id)
+	accepted := make(chan error, 1)
+	l.Commands <- command.UserInput{Header: command.Header{CommandID: id}, NoFold: true, TargetLoopID: mustID(t), Accepted: accepted}
+	var rejected *loop.InputRejectedError
+	if err := <-accepted; !errors.As(err, &rejected) || rejected.Reason != event.RejectQueueFull {
+		t.Fatalf("acceptance error = %T %v, want typed queue-full rejection", err, err)
+	}
+	ev := awaitReply(t, rec, id)
 	rej, ok := ev.(event.TurnRejected)
 	if !ok || rej.Reason != event.RejectQueueFull {
 		t.Fatalf("outcome = %+v, want event.TurnRejected{RejectQueueFull}", ev)
+	}
+	for _, ev := range rec.events() {
+		if accepted, ok := ev.(event.DelegateRequestAccepted); ok && accepted.Cause.CommandID == id {
+			t.Fatal("queue-full rejection durably accepted the request")
+		}
 	}
 }
 

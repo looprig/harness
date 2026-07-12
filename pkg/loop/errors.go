@@ -1,5 +1,7 @@
 package loop
 
+import "github.com/looprig/harness/pkg/event"
+
 type ConfigErrorKind string
 
 const (
@@ -43,6 +45,22 @@ func (e *IDGenerationError) Error() string {
 	return "loop: turn id generation failed: " + e.Cause.Error()
 }
 func (e *IDGenerationError) Unwrap() error { return e.Cause }
+
+// InputRejectedError is the actor's point-to-point admission refusal for a managed
+// delegate input. The matching TurnRejected remains the durable/event-stream result;
+// this typed error prevents the synchronous acceptance waiter from returning a handle.
+type InputRejectedError struct {
+	Reason event.RejectReason
+	Cause  error
+}
+
+func (e *InputRejectedError) Error() string {
+	if e.Cause != nil {
+		return "loop: input rejected: " + e.Cause.Error()
+	}
+	return "loop: input rejected"
+}
+func (e *InputRejectedError) Unwrap() error { return e.Cause }
 
 // PolicyRevisionMarshalError is the programmer-error panic value PolicyRevision raises if
 // the fully-owned, total projection it builds cannot be JSON-marshaled. The projection is

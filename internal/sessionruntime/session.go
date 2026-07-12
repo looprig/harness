@@ -310,6 +310,7 @@ type preparedLoop struct {
 
 type loopEventPublisher interface {
 	PublishEvent(context.Context, event.Event) error
+	PublishEventChecked(context.Context, event.Event) error
 }
 
 // eventSubscriber is the consumer-facing half of the session fan-in: a TUI/CLI (or
@@ -382,6 +383,17 @@ func (s *Session) FaultErr() error {
 // or its shutdown state (Interface Segregation / least privilege).
 func (s *Session) PublishEvent(ctx context.Context, ev event.Event) error {
 	if err := s.hub.PublishEvent(ctx, ev); err != nil {
+		return err
+	}
+	s.recordLoopMechanicalState(ev)
+	return nil
+}
+
+// PublishEventChecked is the transactional actor publication path used only for
+// durable delegate acceptance. It returns required-append failures directly so the
+// loop can decline the command before mutating its live queue/turn state.
+func (s *Session) PublishEventChecked(ctx context.Context, ev event.Event) error {
+	if err := s.hub.PublishEventChecked(ctx, ev); err != nil {
 		return err
 	}
 	s.recordLoopMechanicalState(ev)

@@ -68,6 +68,63 @@ func newLoopWithFactory(t *testing.T, client inference.Client, ts time.Time) (*L
 	return l, rec
 }
 
+func TestDelegateAcceptanceMintFailureReturnsExactErrorAndStartsNoWork(t *testing.T) {
+	t.Parallel()
+	sentinel := errors.New("acceptance event id mint failed")
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	rec := &recordingPublisher{}
+	l, err := newWithConfig(ctx, mustID(t), mustID(t), Provenance{}, rec, runtimeConfig{
+		Client:       &fakeLLM{chunks: []content.Chunk{textChunk("must not run")}},
+		Model:        testModel(),
+		DrainTimeout: 200 * time.Millisecond,
+		idGen:        uuid.New,
+		eventFactory: event.NewFactory(func() (uuid.UUID, error) { return uuid.UUID{}, sentinel }, time.Now),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := mustID(t)
+	accepted := make(chan error, 1)
+	l.Commands <- command.UserInput{Header: command.Header{CommandID: id}, NoFold: true, TargetLoopID: mustID(t), Accepted: accepted}
+	if got := <-accepted; got != sentinel {
+		t.Fatalf("acceptance error = %T %v, want exact sentinel", got, got)
+	}
+	for _, ev := range rec.events() {
+		if ev.EventHeader().Cause.CommandID == id {
+			t.Fatalf("failed acceptance published or started work: %T", ev)
+		}
+	}
+}
+
+func TestDelegateAcceptanceAppendFailureReturnsExactErrorAndStartsNoWork(t *testing.T) {
+	t.Parallel()
+	sentinel := errors.New("acceptance durable append failed")
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	rec := &recordingPublisher{checkedErr: sentinel}
+	l, err := newWithConfig(ctx, mustID(t), mustID(t), Provenance{}, rec, runtimeConfig{
+		Client:       &fakeLLM{chunks: []content.Chunk{textChunk("must not run")}},
+		Model:        testModel(),
+		DrainTimeout: 200 * time.Millisecond,
+		eventFactory: workingFactory(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := mustID(t)
+	accepted := make(chan error, 1)
+	l.Commands <- command.UserInput{Header: command.Header{CommandID: id}, NoFold: true, TargetLoopID: mustID(t), Accepted: accepted}
+	if got := <-accepted; got != sentinel {
+		t.Fatalf("acceptance error = %T %v, want exact sentinel", got, got)
+	}
+	for _, ev := range rec.events() {
+		if ev.EventHeader().Cause.CommandID == id {
+			t.Fatalf("failed acceptance published or started work: %T", ev)
+		}
+	}
+}
+
 // TestEnduringLoopEventsStamped drives a full turn through the loop and asserts
 // every Enduring loop event published on the session fan-in carries a non-zero
 // EventID and the factory's CreatedAt, while the Ephemeral TokenDelta is published

@@ -218,6 +218,189 @@ func submitUserInputWithID(t *testing.T, l *Loop, text string, commandID uuid.UU
 	}
 }
 
+type fifoTestStream struct {
+	events chan ForeignEvent
+	done   sync.Once
+}
+
+func (s *fifoTestStream) Events() <-chan ForeignEvent { return s.events }
+func (*fifoTestStream) TranscriptPath() string        { return "/missing/fifo-transcript.jsonl" }
+func (*fifoTestStream) Close() error                  { return nil }
+
+func (s *fifoTestStream) finish(events ...ForeignEvent) {
+	s.done.Do(func() {
+		for _, ev := range events {
+			s.events <- ev
+		}
+		close(s.events)
+	})
+}
+
+type fifoSpawn struct {
+	turn   ForeignTurn
+	stream *fifoTestStream
+}
+
+type fifoTestAgent struct{ spawned chan fifoSpawn }
+
+func (a *fifoTestAgent) Spawn(ctx context.Context, turn ForeignTurn) (ForeignStream, error) {
+	stream := &fifoTestStream{events: make(chan ForeignEvent, 2)}
+	go func() {
+		<-ctx.Done()
+		stream.finish()
+	}()
+	a.spawned <- fifoSpawn{turn: turn, stream: stream}
+	return stream, nil
+}
+
+func sendManagedForeign(t *testing.T, l *Loop, text string) uuid.UUID {
+	t.Helper()
+	id := mustID(t)
+	accepted := make(chan error, 1)
+	l.Commands <- command.UserInput{
+		Header:       command.Header{CommandID: id},
+		Blocks:       []content.Block{&content.TextBlock{Text: text}},
+		NoFold:       true,
+		TargetLoopID: l.loopID,
+		Accepted:     accepted,
+	}
+	select {
+	case err := <-accepted:
+		if err != nil {
+			t.Fatalf("managed %q acceptance: %v", text, err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("managed %q acceptance timed out", text)
+	}
+	return id
+}
+
+func awaitFIFOSpawn(t *testing.T, agent *fifoTestAgent) fifoSpawn {
+	t.Helper()
+	select {
+	case spawn := <-agent.spawned:
+		return spawn
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for foreign spawn")
+		return fifoSpawn{}
+	}
+}
+
+func completeFIFOSpawn(spawn fifoSpawn, answer string) {
+	spawn.stream.finish(ForeignEvent{Kind: ForeignTerminalOK, Message: aiMessage(answer)})
+}
+
+func TestManagedFollowUpsQueueFIFOWhileForeignTurnActive(t *testing.T) {
+	t.Parallel()
+	agent := &fifoTestAgent{spawned: make(chan fifoSpawn, 3)}
+	pub := &fakePublisher{}
+	l, _ := newTestLoop(t, Spec{Agent: agent}, pub)
+
+	aID := mustID(t)
+	submitUserInputWithID(t, l, "A", aID)
+	a := awaitFIFOSpawn(t, agent)
+	bID := sendManagedForeign(t, l, "B")
+	cID := sendManagedForeign(t, l, "C")
+	completeFIFOSpawn(a, "answer A")
+
+	b := awaitFIFOSpawn(t, agent)
+	if got := b.turn.Input[0].(*content.TextBlock).Text; got != "B" {
+		t.Fatalf("second turn input = %q, want B", got)
+	}
+	completeFIFOSpawn(b, "answer B")
+	c := awaitFIFOSpawn(t, agent)
+	if got := c.turn.Input[0].(*content.TextBlock).Text; got != "C" {
+		t.Fatalf("third turn input = %q, want C", got)
+	}
+	completeFIFOSpawn(c, "answer C")
+	waitTurnIndex(t, l, 3)
+
+	events := pub.snapshot()
+	position := func(match func(event.Event) bool) int {
+		for i, ev := range events {
+			if match(ev) {
+				return i
+			}
+		}
+		return -1
+	}
+	for _, id := range []uuid.UUID{bID, cID} {
+		acceptedAt := position(func(ev event.Event) bool {
+			e, ok := ev.(event.DelegateRequestAccepted)
+			return ok && e.Cause.CommandID == id
+		})
+		startedAt := position(func(ev event.Event) bool {
+			e, ok := ev.(event.TurnStarted)
+			return ok && e.Cause.CommandID == id
+		})
+		if acceptedAt < 0 || startedAt < 0 || acceptedAt >= startedAt {
+			t.Fatalf("request %s acceptance/start positions = %d/%d", id, acceptedAt, startedAt)
+		}
+	}
+	shutdown(t, l)
+}
+
+func waitManagedCancellations(t *testing.T, pub *fakePublisher, ids ...uuid.UUID) {
+	t.Helper()
+	deadline := time.After(2 * time.Second)
+	for {
+		seen := make(map[uuid.UUID]bool)
+		for _, ev := range pub.snapshot() {
+			if cancelled, ok := ev.(event.InputCancelled); ok && cancelled.Reason == event.CancelTurnInterrupted {
+				seen[cancelled.Cause.CommandID] = true
+			}
+		}
+		all := true
+		for _, id := range ids {
+			all = all && seen[id]
+		}
+		if all {
+			return
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("queued request cancellations missing: seen=%v want=%v", seen, ids)
+		case <-time.After(time.Millisecond):
+		}
+	}
+}
+
+func TestInterruptFlushesAcceptedForeignFollowUps(t *testing.T) {
+	t.Parallel()
+	agent := &fifoTestAgent{spawned: make(chan fifoSpawn, 3)}
+	pub := &fakePublisher{}
+	l, _ := newTestLoop(t, Spec{Agent: agent}, pub)
+	submitUserInput(t, l, "A")
+	_ = awaitFIFOSpawn(t, agent)
+	bID := sendManagedForeign(t, l, "B")
+	cID := sendManagedForeign(t, l, "C")
+	sendInterrupt(t, l)
+	waitManagedCancellations(t, pub, bID, cID)
+	select {
+	case unexpected := <-agent.spawned:
+		t.Fatalf("interrupted queue spawned %v", unexpected.turn.Input)
+	default:
+	}
+	shutdown(t, l)
+}
+
+func TestShutdownFlushesAcceptedForeignFollowUps(t *testing.T) {
+	t.Parallel()
+	agent := &fifoTestAgent{spawned: make(chan fifoSpawn, 2)}
+	pub := &fakePublisher{}
+	l, _ := newTestLoop(t, Spec{Agent: agent}, pub)
+	submitUserInput(t, l, "A")
+	_ = awaitFIFOSpawn(t, agent)
+	bID := sendManagedForeign(t, l, "B")
+	ack := make(chan error, 1)
+	l.Commands <- command.Shutdown{Ack: ack}
+	if err := <-ack; err != nil {
+		t.Fatalf("shutdown: %v", err)
+	}
+	<-l.Done
+	waitManagedCancellations(t, pub, bID)
+}
+
 func TestUserInputHappyPath(t *testing.T) {
 	t.Parallel()
 	transcript := writeTranscript(t, "committed reply")

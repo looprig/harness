@@ -214,6 +214,57 @@ func TestShutdownClosesDone(t *testing.T) {
 	shutdown(t, l)
 }
 
+func TestManagedAcceptanceMintFailureReturnsExactErrorAndStartsNoForeignWork(t *testing.T) {
+	t.Parallel()
+	sentinel := errors.New("foreign acceptance event id mint failed")
+	agent := &fakeAgent{}
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	pub := &fakePublisher{}
+	l, _, err := New(ctx, mustID(t), mustID(t), loop.Provenance{}, pub, validCfg(), Spec{Agent: agent, Cwd: t.TempDir(), SIDMode: SIDLateBound}, seqIDGen(), event.NewFactory(func() (uuid.UUID, error) {
+		return uuid.UUID{}, sentinel
+	}, time.Now))
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := mustID(t)
+	accepted := make(chan error, 1)
+	l.Commands <- command.UserInput{Header: command.Header{CommandID: id}, NoFold: true, TargetLoopID: l.loopID, Accepted: accepted}
+	if got := <-accepted; got != sentinel {
+		t.Fatalf("acceptance error = %T %v, want exact sentinel", got, got)
+	}
+	if agent.calls() != 0 {
+		t.Fatalf("foreign spawn calls = %d, want 0", agent.calls())
+	}
+	for _, ev := range pub.snapshot() {
+		if ev.EventHeader().Cause.CommandID == id {
+			t.Fatalf("failed acceptance published or started work: %T", ev)
+		}
+	}
+}
+
+func TestManagedAcceptanceAppendFailureReturnsExactErrorAndStartsNoForeignWork(t *testing.T) {
+	t.Parallel()
+	sentinel := errors.New("foreign acceptance durable append failed")
+	agent := &fakeAgent{}
+	pub := &fakePublisher{checkedErr: sentinel}
+	l, _ := newTestLoop(t, Spec{Agent: agent, SIDMode: SIDLateBound}, pub)
+	id := mustID(t)
+	accepted := make(chan error, 1)
+	l.Commands <- command.UserInput{Header: command.Header{CommandID: id}, NoFold: true, TargetLoopID: l.loopID, Accepted: accepted}
+	if got := <-accepted; got != sentinel {
+		t.Fatalf("acceptance error = %T %v, want exact sentinel", got, got)
+	}
+	if agent.calls() != 0 {
+		t.Fatalf("foreign spawn calls = %d, want 0", agent.calls())
+	}
+	for _, ev := range pub.snapshot() {
+		if ev.EventHeader().Cause.CommandID == id {
+			t.Fatalf("failed acceptance published or started work: %T", ev)
+		}
+	}
+}
+
 func TestSnapshotFreshLoop(t *testing.T) {
 	t.Parallel()
 	l, _ := newTestLoop(t, Spec{Agent: &fakeAgent{}}, &fakePublisher{})

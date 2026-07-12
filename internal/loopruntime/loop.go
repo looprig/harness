@@ -147,6 +147,7 @@ type idGenerator func() (uuid.UUID, error)
 // the transport path.
 type eventPublisher interface {
 	PublishEvent(context.Context, event.Event) error
+	PublishEventChecked(context.Context, event.Event) error
 }
 
 // faultProbe is the actor's narrow read of the session's durable-persistence fault latch.
@@ -557,6 +558,18 @@ func runLoop(cfg loopConfig, state loopState) {
 		}
 	}
 
+	// publishAcceptance is the narrow transactional publication path for managed
+	// delegate admission. Unlike ordinary loop emission it returns both EventID mint
+	// and checked durable-append failures to the actor, which must decline the input.
+	publishAcceptance := func(commandID uuid.UUID) error {
+		ev := stampLoopHeader(event.DelegateRequestAccepted{Header: event.Header{Cause: identity.Cause{CommandID: commandID}}}, state.sessionID, state.id, state.turnID)
+		h, err := cfg.eventFactory.Stamp(ev.EventHeader())
+		if err != nil {
+			return err
+		}
+		return cfg.events.PublishEventChecked(ctx, withLoopHeader(ev, h))
+	}
+
 	// emitLoopIdle announces the loop's running->idle transition: an Enduring,
 	// non-terminal LoopIdle carrying only the loop's identity (SessionID + LoopID;
 	// TurnID is zero — it is loop-scoped, not turn-scoped). The session quiescence
@@ -730,11 +743,7 @@ func runLoop(cfg loopConfig, state loopState) {
 	// returns the new TurnID; on an id-gen failure it returns a non-nil error and
 	// starts nothing (the caller decides how to surface it). The actor is the sole
 	// caller, so it always runs with state.status idle.
-	startTurn := func(qi queuedInput) (uuid.UUID, error) {
-		turnID, err := config.idGen()
-		if err != nil {
-			return uuid.UUID{}, &IDGenerationError{Cause: err}
-		}
+	startTurnWithID := func(turnID uuid.UUID, qi queuedInput) uuid.UUID {
 		turnCtx, base := installActiveTurn(turnID, qi)
 		idx := state.turnIndex
 		ts := newTurnState(state.sessionID, state.id, turnID, idx, state.causationID, qi.msg)
@@ -754,7 +763,14 @@ func runLoop(cfg loopConfig, state loopState) {
 			terminal := runTurn(turnCtx, turnCfg, ts)
 			internal <- turnResult{terminal: terminal}
 		}()
-		return turnID, nil
+		return turnID
+	}
+	startTurn := func(qi queuedInput) (uuid.UUID, error) {
+		turnID, err := config.idGen()
+		if err != nil {
+			return uuid.UUID{}, &IDGenerationError{Cause: err}
+		}
+		return startTurnWithID(turnID, qi), nil
 	}
 
 	// userMessageFromBlocks wraps submit blocks into the committed UserMessage form.
@@ -865,6 +881,48 @@ func runLoop(cfg loopConfig, state loopState) {
 			}
 			// startTurn already emitted event.TurnStarted (the Started outcome); there is
 			// no separate Started event to publish here.
+		}
+	}
+
+	// admitDelegate performs every fallible rejection/mint/durable-acceptance check
+	// before mutating actor-owned queue/turn state. Once acceptance commits, queueing
+	// or installing the pre-minted turn is infallible and ordered after the event.
+	admitDelegate := func(c command.UserInput, qi queuedInput) {
+		if err := command.ValidateCommand(c); err != nil {
+			c.Accepted <- err
+			return
+		}
+		reject := func(reason event.RejectReason, cause error) {
+			rejectSubmit(qi, reason)
+			c.Accepted <- &loop.InputRejectedError{Reason: reason, Cause: cause}
+		}
+		switch {
+		case state.status == loopShuttingDown:
+			reject(event.RejectShuttingDown, nil)
+		case len(state.inbox) >= inboxCap:
+			reject(event.RejectQueueFull, nil)
+		case state.status == loopRunning:
+			if err := publishAcceptance(c.CommandID); err != nil {
+				c.Accepted <- err
+				return
+			}
+			state.inbox = append(state.inbox, qi)
+			publish(event.InputQueued{Header: event.Header{Cause: identity.Cause{CommandID: qi.inputID}}})
+			c.Accepted <- nil
+		default:
+			turnID, err := config.idGen()
+			if err != nil {
+				idErr := &IDGenerationError{Cause: err}
+				slog.Error("turn id generation failed; declining delegate submit", "error", idErr)
+				reject(event.RejectInternal, idErr)
+				return
+			}
+			if err := publishAcceptance(c.CommandID); err != nil {
+				c.Accepted <- err
+				return
+			}
+			startTurnWithID(turnID, qi)
+			c.Accepted <- nil
 		}
 	}
 
@@ -1144,17 +1202,11 @@ func runLoop(cfg loopConfig, state loopState) {
 				// its own live state — race-free — and PUBLISHES the typed outcome event
 				// (TurnStarted / InputQueued / TurnRejected) onto the session fan-in. A
 				// UserInput may be rejected, so bypassReject is false.
-				if c.Accepted != nil {
-					publish(event.DelegateRequestAccepted{Header: event.Header{Cause: identity.Cause{CommandID: c.CommandID}}})
-					if fp := cfg.faultProbe; fp != nil {
-						if ferr := fp.FaultErr(); ferr != nil {
-							c.Accepted <- ferr
-							continue
-						}
-					}
-					c.Accepted <- nil
-				}
 				qi := queuedInput{inputID: c.CommandHeader().CommandID, agency: c.CommandHeader().Agency, msg: userMessageFromBlocks(c.Blocks), noFold: c.NoFold}
+				if c.Accepted != nil {
+					admitDelegate(c, qi)
+					continue
+				}
 				decideSubmit(qi, false)
 
 			case command.SubagentResult:

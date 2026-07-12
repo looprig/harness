@@ -9,7 +9,6 @@ import (
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/command"
 	"github.com/looprig/harness/pkg/event"
-	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/loop"
 )
 
@@ -46,6 +45,13 @@ type Loop struct {
 	turnIndex  event.TurnIndex
 	hasSpawned bool
 	sidBound   bool
+	pending    []preparedInput
+}
+
+type preparedInput struct {
+	command command.UserInput
+	turnID  uuid.UUID
+	stepID  uuid.UUID
 }
 
 // compile-time proof the foreign loop satisfies the engine-agnostic Backend.
@@ -144,6 +150,14 @@ func (l *Loop) DoneChan() <-chan struct{} { return l.Done }
 func (l *Loop) run(loopCtx context.Context) {
 	defer close(l.Done)
 	for {
+		if len(l.pending) > 0 {
+			next := l.pending[0]
+			l.pending = l.pending[1:]
+			if l.runTurn(loopCtx, next) {
+				return
+			}
+			continue
+		}
 		select {
 		case <-loopCtx.Done():
 			return
@@ -152,17 +166,14 @@ func (l *Loop) run(loopCtx context.Context) {
 		case cmd := <-l.Commands:
 			switch c := cmd.(type) {
 			case command.UserInput:
+				prepared, ok := l.prepareInput(loopCtx, c)
+				if !ok {
+					continue
+				}
 				if c.Accepted != nil {
-					l.publisher(loopCtx, uuid.UUID{}, uuid.UUID{})(event.DelegateRequestAccepted{Header: event.Header{Cause: identity.Cause{CommandID: c.CommandID}}})
-					if probe, ok := l.pub.(interface{ FaultErr() error }); ok {
-						if err := probe.FaultErr(); err != nil {
-							c.Accepted <- err
-							continue
-						}
-					}
 					c.Accepted <- nil
 				}
-				if l.runTurn(loopCtx, c) {
+				if l.runTurn(loopCtx, prepared) {
 					return // a Shutdown arrived mid-turn; defer closes Done.
 				}
 			case command.Shutdown:
@@ -175,6 +186,40 @@ func (l *Loop) run(loopCtx context.Context) {
 			}
 		}
 	}
+}
+
+func (l *Loop) prepareInput(ctx context.Context, c command.UserInput) (preparedInput, bool) {
+	if err := command.ValidateCommand(c); err != nil {
+		if c.Accepted != nil {
+			c.Accepted <- err
+		}
+		return preparedInput{}, false
+	}
+	turnID, err := l.idGen()
+	if err != nil {
+		if c.Accepted != nil {
+			c.Accepted <- err
+		} else {
+			slog.Error("foreignloop: turn id mint failed; dropping submit (fail-secure)", "error", err)
+		}
+		return preparedInput{}, false
+	}
+	stepID, err := l.idGen()
+	if err != nil {
+		if c.Accepted != nil {
+			c.Accepted <- err
+		} else {
+			slog.Error("foreignloop: step id mint failed; dropping submit (fail-secure)", "error", err)
+		}
+		return preparedInput{}, false
+	}
+	if c.Accepted != nil {
+		if err := l.publishAcceptance(ctx, c.CommandID); err != nil {
+			c.Accepted <- err
+			return preparedInput{}, false
+		}
+	}
+	return preparedInput{command: c, turnID: turnID, stepID: stepID}, true
 }
 
 // cloneMessages returns a copy of the message thread with its OWN backing array so a

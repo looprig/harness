@@ -12,6 +12,7 @@ import (
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/command"
 	"github.com/looprig/harness/pkg/event"
+	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/harness/pkg/tool"
 	"github.com/looprig/inference"
 )
@@ -31,7 +32,8 @@ func mustID(t *testing.T) uuid.UUID {
 // drops the event, which is sufficient to satisfy the New signature.
 type noopPublisher struct{}
 
-func (noopPublisher) PublishEvent(context.Context, event.Event) error { return nil }
+func (noopPublisher) PublishEvent(context.Context, event.Event) error        { return nil }
+func (noopPublisher) PublishEventChecked(context.Context, event.Event) error { return nil }
 
 // recordingPublisher is an eventPublisher that records every published full-
 // fidelity event.Event (no envelope, no redaction — exactly what the production
@@ -39,8 +41,9 @@ func (noopPublisher) PublishEvent(context.Context, event.Event) error { return n
 // mutex. events() returns a copy so a reader never aliases the live slice the
 // actor is appending to.
 type recordingPublisher struct {
-	mu  sync.Mutex
-	got []event.Event
+	mu         sync.Mutex
+	got        []event.Event
+	checkedErr error
 }
 
 func (r *recordingPublisher) PublishEvent(_ context.Context, ev event.Event) error {
@@ -48,6 +51,22 @@ func (r *recordingPublisher) PublishEvent(_ context.Context, ev event.Event) err
 	defer r.mu.Unlock()
 	r.got = append(r.got, ev)
 	return nil
+}
+
+func (r *recordingPublisher) PublishEventChecked(ctx context.Context, ev event.Event) error {
+	r.mu.Lock()
+	err := r.checkedErr
+	r.mu.Unlock()
+	if err != nil {
+		return err
+	}
+	return r.PublishEvent(ctx, ev)
+}
+
+func (r *recordingPublisher) setCheckedError(err error) {
+	r.mu.Lock()
+	r.checkedErr = err
+	r.mu.Unlock()
 }
 
 func (r *recordingPublisher) events() []event.Event {
@@ -499,7 +518,12 @@ func TestTurnIDGenerationFailure(t *testing.T) {
 			l, rec := newLoopWithIDGen(t, &fakeLLM{chunks: []content.Chunk{textChunk("hi")}}, gen.gen)
 
 			id := mustID(t)
-			l.Commands <- command.UserInput{Header: command.Header{CommandID: id}, Blocks: nil}
+			accepted := make(chan error, 1)
+			l.Commands <- command.UserInput{Header: command.Header{CommandID: id}, Blocks: nil, NoFold: true, TargetLoopID: mustID(t), Accepted: accepted}
+			var rejected *loop.InputRejectedError
+			if err := <-accepted; !errors.As(err, &rejected) || rejected.Reason != event.RejectInternal || !errors.Is(err, genErr) {
+				t.Fatalf("acceptance error = %T %v, want typed internal rejection wrapping mint error", err, err)
+			}
 
 			// The id-gen failure is surfaced on the fan-in as TurnRejected{Internal}.
 			reply := awaitReply(t, rec, id)
@@ -509,6 +533,11 @@ func TestTurnIDGenerationFailure(t *testing.T) {
 			}
 			if rej.Reason != event.RejectInternal {
 				t.Fatalf("reject reason = %d, want RejectInternal (transient id-gen failure, not ShuttingDown)", rej.Reason)
+			}
+			for _, ev := range rec.events() {
+				if accepted, ok := ev.(event.DelegateRequestAccepted); ok && accepted.Cause.CommandID == id {
+					t.Fatal("id-mint rejection durably accepted the request")
+				}
 			}
 		})
 	}

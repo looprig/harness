@@ -31,8 +31,9 @@ func mustID(t interface{ Fatal(args ...any) }) uuid.UUID {
 // mutex. Publish is called from both the actor and the turn goroutine across a turn
 // (never concurrently — the mutex only keeps -race happy).
 type fakePublisher struct {
-	mu     sync.Mutex
-	events []event.Event
+	mu         sync.Mutex
+	events     []event.Event
+	checkedErr error
 }
 
 func (p *fakePublisher) PublishEvent(_ context.Context, ev event.Event) error {
@@ -40,6 +41,16 @@ func (p *fakePublisher) PublishEvent(_ context.Context, ev event.Event) error {
 	defer p.mu.Unlock()
 	p.events = append(p.events, ev)
 	return nil
+}
+
+func (p *fakePublisher) PublishEventChecked(ctx context.Context, ev event.Event) error {
+	p.mu.Lock()
+	err := p.checkedErr
+	p.mu.Unlock()
+	if err != nil {
+		return err
+	}
+	return p.PublishEvent(ctx, ev)
 }
 
 // snapshot returns a defensive copy of the events recorded so far.

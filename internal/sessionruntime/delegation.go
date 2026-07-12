@@ -91,6 +91,12 @@ func (p *delegateAdmissionPublisher) PublishEvent(ctx context.Context, ev event.
 	}
 	return p.session.PublishEvent(ctx, ev)
 }
+func (p *delegateAdmissionPublisher) PublishEventChecked(ctx context.Context, ev event.Event) error {
+	if err := p.wait(ctx); err != nil {
+		return err
+	}
+	return p.session.PublishEventChecked(ctx, ev)
+}
 func (p *delegateAdmissionPublisher) FaultErr() error { return p.session.FaultErr() }
 func (p *delegateAdmissionPublisher) PrepareGateOpen(ctx context.Context, loopID uuid.UUID, g gate.Gate, payload gate.Payload) (gate.ID, error) {
 	if err := p.wait(ctx); err != nil {

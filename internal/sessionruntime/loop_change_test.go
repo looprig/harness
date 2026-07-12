@@ -216,7 +216,8 @@ func (r *recordingClient) first() (inference.Request, bool) {
 // observes the request the seeded loop issues, not its events).
 type nopLoopPublisher struct{}
 
-func (nopLoopPublisher) PublishEvent(context.Context, event.Event) error { return nil }
+func (nopLoopPublisher) PublishEvent(context.Context, event.Event) error        { return nil }
+func (nopLoopPublisher) PublishEventChecked(context.Context, event.Event) error { return nil }
 
 func inferModelWithEffort(name string, eff inference.Effort) inference.Model {
 	m := validModel(name)
