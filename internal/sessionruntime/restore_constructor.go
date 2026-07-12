@@ -627,7 +627,8 @@ func buildRestoredSession(
 			Mode: s.wsMode, Coordinator: s.wsCoordinator, Publisher: s, Factory: s.factory,
 			Idle: s.hub.IsIdle, Fault: s.latchWorkspaceCheckpointFault,
 			Recover: s.recoverWorkspaceCheckpointFault, Faulted: s.faultIfFaulted,
-			Admission: s.checkpointAdmission.enterCheckpoint,
+			Admission:    s.checkpointAdmission.enterCheckpoint,
+			ObserveError: s.observeBestEffortCheckpointError,
 		})
 	}
 

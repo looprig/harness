@@ -453,6 +453,13 @@ func (s *Session) recoverWorkspaceCheckpointFault() {
 	s.loopsMu.Unlock()
 }
 
+// observeBestEffortCheckpointError reports an automatic checkpoint failure without
+// latching the session. Best-effort policy explicitly lets execution continue and
+// retries on the next eligible boundary; the failure must still remain observable.
+func (s *Session) observeBestEffortCheckpointError(err error) {
+	slog.ErrorContext(s.sessionCtx, "session: best-effort workspace checkpoint failed", "error", err)
+}
+
 // FaultErr is the loop actor's post-emit durable-fault probe (loopruntime type-asserts the
 // session for it). It returns the latched persistence fault (a required Enduring append
 // failed) or nil. After emitting a mode/inference change event, the actor calls it: because
@@ -1237,8 +1244,9 @@ func newSessionTopology(ctx context.Context, topology Topology, newID idGenerato
 			Mode: s.wsMode, Coordinator: s.wsCoordinator, Publisher: s, Factory: s.factory,
 			Idle:  s.hub.IsIdle,
 			Fault: s.latchWorkspaceCheckpointFault, Recover: s.recoverWorkspaceCheckpointFault,
-			Faulted:   s.faultIfFaulted,
-			Admission: s.checkpointAdmission.enterCheckpoint,
+			Faulted:      s.faultIfFaulted,
+			Admission:    s.checkpointAdmission.enterCheckpoint,
+			ObserveError: s.observeBestEffortCheckpointError,
 		})
 	}
 

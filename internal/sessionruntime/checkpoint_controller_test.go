@@ -57,6 +57,24 @@ type failingPutBlobs struct {
 
 func (b failingPutBlobs) Put(context.Context, string, io.Reader) error { return b.err }
 
+type failFirstPutBlobs struct {
+	storage.Blobs
+	mu     sync.Mutex
+	err    error
+	failed bool
+}
+
+func (b *failFirstPutBlobs) Put(ctx context.Context, key string, r io.Reader) error {
+	b.mu.Lock()
+	if !b.failed {
+		b.failed = true
+		b.mu.Unlock()
+		return b.err
+	}
+	b.mu.Unlock()
+	return b.Blobs.Put(ctx, key, r)
+}
+
 func (b *blockingBoundaryBlobs) Put(ctx context.Context, key string, r io.Reader) error {
 	blocked := false
 	b.once.Do(func() {
@@ -281,6 +299,133 @@ func TestCheckpointCanceledUnstartedManualDoesNotCommit(t *testing.T) {
 	}
 }
 
+func TestRequiredManualNotIdlePreservesExistingFaultLatch(t *testing.T) {
+	t.Parallel()
+	ws, root := checkpointFixture(t, nil)
+	gate := newCheckpointAdmissionGate()
+	latched := errors.New("existing required checkpoint fault")
+	gate.latch(latched)
+	recoveries := 0
+	c := newCheckpointController(checkpointControllerConfig{
+		Policy: checkpointPolicy{Trigger: checkpointManual, Priority: checkpointRequired, Timeout: time.Second},
+		Store:  ws, Root: root, Mode: PlacementSession, Coordinator: newWorkspaceCoordinator(nil),
+		Publisher: &boundaryPublisher{order: &checkpointOrder{}}, Factory: event.NewFactory(uuid.New, time.Now),
+		Idle: func() bool { return false }, Admission: gate.enterCheckpoint,
+		Recover: func() { recoveries++; gate.recover() },
+	})
+	t.Cleanup(c.shutdown)
+
+	_, err := c.manual(context.Background())
+	var notIdle *CheckpointError
+	if !errors.As(err, &notIdle) || notIdle.Kind != CheckpointNotIdle {
+		t.Fatalf("manual = %T %v, want CheckpointNotIdle", err, err)
+	}
+	if recoveries != 0 {
+		t.Fatalf("recoveries = %d, want 0", recoveries)
+	}
+	if _, err := gate.enterExecution(context.Background()); !errors.Is(err, latched) {
+		t.Fatalf("execution admission after failed manual = %v, want existing latch %v", err, latched)
+	}
+}
+
+func TestRequiredManualCanceledBeforePermitPreservesExistingFaultLatch(t *testing.T) {
+	t.Parallel()
+	ws, root := checkpointFixture(t, nil)
+	gate := newCheckpointAdmissionGate()
+	latched := errors.New("existing required checkpoint fault")
+	gate.latch(latched)
+	recoveries := 0
+	c := newCheckpointController(checkpointControllerConfig{
+		Policy: checkpointPolicy{Trigger: checkpointManual, Priority: checkpointRequired, Timeout: time.Second},
+		Store:  ws, Root: root, Mode: PlacementSession, Coordinator: newWorkspaceCoordinator(nil),
+		Publisher: &boundaryPublisher{order: &checkpointOrder{}}, Factory: event.NewFactory(uuid.New, time.Now),
+		Idle: func() bool { return true }, Admission: gate.enterCheckpoint,
+		Recover: func() { recoveries++; gate.recover() },
+	})
+	t.Cleanup(c.shutdown)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err := c.commit(ctx, nil, event.SnapshotTriggerManual, nil, nil)
+	var canceled *CheckpointError
+	if !errors.As(err, &canceled) || canceled.Kind != CheckpointCanceled {
+		t.Fatalf("manual commit = %T %v, want CheckpointCanceled", err, err)
+	}
+	if recoveries != 0 {
+		t.Fatalf("recoveries = %d, want 0", recoveries)
+	}
+	if _, err := gate.enterExecution(context.Background()); !errors.Is(err, latched) {
+		t.Fatalf("execution admission after canceled manual = %v, want existing latch %v", err, latched)
+	}
+}
+
+func TestCheckpointBestEffortObservesAsyncFailureAndRetriesNextEdge(t *testing.T) {
+	t.Parallel()
+	rootCause := errors.New("snapshot write failed")
+	blobs := &failFirstPutBlobs{Blobs: memstore.New().Blobs, err: rootCause}
+	ws, err := workspacestore.Open(blobs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "work.txt"), []byte("work"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sid, _ := uuid.New()
+	lid, _ := uuid.New()
+	tid, _ := uuid.New()
+	publisher := &boundaryPublisher{order: &checkpointOrder{}, checkpointed: make(chan event.WorkspaceCheckpointed, 1)}
+	observed := make(chan error, 2)
+	faulted := make(chan error, 1)
+	c := newCheckpointController(checkpointControllerConfig{
+		SessionID: sid, Policy: checkpointPolicy{Trigger: checkpointOnStepDone, Priority: checkpointBestEffort, Timeout: time.Second},
+		Store: ws, Root: root, Mode: PlacementSession, Coordinator: newWorkspaceCoordinator(nil), Publisher: publisher,
+		Factory: event.NewFactory(uuid.New, time.Now), ObserveError: func(err error) { observed <- err },
+		Fault: func(err error) { faulted <- err },
+	})
+	t.Cleanup(c.shutdown)
+	step := func() event.StepDone {
+		stepID, _ := uuid.New()
+		eid, _ := uuid.New()
+		return event.StepDone{Header: event.Header{Coordinates: identity.Coordinates{SessionID: sid, LoopID: lid, TurnID: tid, StepID: stepID}, EventID: eid}}
+	}
+	first := step()
+	if err := c.boundary(context.Background(), first); err != nil {
+		t.Fatalf("first boundary acceptance: %v", err)
+	}
+	select {
+	case err := <-observed:
+		if !errors.Is(err, rootCause) {
+			t.Fatalf("observed error = %v, want root cause %v", err, rootCause)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("async best-effort snapshot failure was not observed")
+	}
+	select {
+	case err := <-faulted:
+		t.Fatalf("best-effort failure latched execution fault: %v", err)
+	default:
+	}
+
+	second := step()
+	if err := c.boundary(context.Background(), second); err != nil {
+		t.Fatalf("retry boundary acceptance: %v", err)
+	}
+	select {
+	case cp := <-publisher.checkpointed:
+		if cp.Cause.EventID != second.EventID {
+			t.Fatalf("retry checkpoint cause = %v, want %v", cp.Cause.EventID, second.EventID)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("next eligible edge did not retry best-effort checkpoint")
+	}
+	select {
+	case err := <-observed:
+		t.Fatalf("successful retry produced extra observed error: %v", err)
+	default:
+	}
+}
+
 func TestCheckpointBestEffortActivationCancelsQuiescentWalk(t *testing.T) {
 	t.Parallel()
 	blobs := &blockingBoundaryBlobs{Blobs: memstore.New().Blobs, entered: make(chan struct{}), release: make(chan struct{})}
@@ -298,10 +443,11 @@ func TestCheckpointBestEffortActivationCancelsQuiescentWalk(t *testing.T) {
 	stepID, _ := uuid.New()
 	eventID, _ := uuid.New()
 	publisher := &boundaryPublisher{order: &checkpointOrder{}, checkpointed: make(chan event.WorkspaceCheckpointed, 1)}
+	observed := make(chan error, 1)
 	c := newCheckpointController(checkpointControllerConfig{
 		SessionID: sid, Policy: checkpointPolicy{Trigger: checkpointOnStepDone, Priority: checkpointBestEffort, Timeout: time.Second},
 		Store: ws, Root: root, Mode: PlacementSession, Coordinator: newWorkspaceCoordinator(nil), Publisher: publisher,
-		Factory: event.NewFactory(uuid.New, time.Now),
+		Factory: event.NewFactory(uuid.New, time.Now), ObserveError: func(err error) { observed <- err },
 	})
 	t.Cleanup(c.shutdown)
 	trigger := event.StepDone{Header: event.Header{Coordinates: identity.Coordinates{SessionID: sid, LoopID: lid, TurnID: tid, StepID: stepID}, EventID: eventID}}
@@ -314,6 +460,47 @@ func TestCheckpointBestEffortActivationCancelsQuiescentWalk(t *testing.T) {
 	select {
 	case cp := <-publisher.checkpointed:
 		t.Fatalf("activation-canceled walk emitted checkpoint: %+v", cp)
+	default:
+	}
+	select {
+	case err := <-observed:
+		t.Fatalf("expected activation cancellation was reported as checkpoint failure: %v", err)
+	default:
+	}
+}
+
+func TestCheckpointBestEffortShutdownCancellationIsNotObservedAsFailure(t *testing.T) {
+	t.Parallel()
+	blobs := &blockingBoundaryBlobs{Blobs: memstore.New().Blobs, entered: make(chan struct{}), release: make(chan struct{})}
+	ws, err := workspacestore.Open(blobs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "work.txt"), []byte("work"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sid, _ := uuid.New()
+	lid, _ := uuid.New()
+	tid, _ := uuid.New()
+	stepID, _ := uuid.New()
+	eventID, _ := uuid.New()
+	observed := make(chan error, 1)
+	c := newCheckpointController(checkpointControllerConfig{
+		SessionID: sid, Policy: checkpointPolicy{Trigger: checkpointOnStepDone, Priority: checkpointBestEffort, Timeout: time.Second},
+		Store: ws, Root: root, Mode: PlacementSession, Coordinator: newWorkspaceCoordinator(nil),
+		Publisher: &boundaryPublisher{order: &checkpointOrder{}}, Factory: event.NewFactory(uuid.New, time.Now),
+		ObserveError: func(err error) { observed <- err },
+	})
+	trigger := event.StepDone{Header: event.Header{Coordinates: identity.Coordinates{SessionID: sid, LoopID: lid, TurnID: tid, StepID: stepID}, EventID: eventID}}
+	if err := c.boundary(context.Background(), trigger); err != nil {
+		t.Fatal(err)
+	}
+	<-blobs.entered
+	c.shutdown()
+	select {
+	case err := <-observed:
+		t.Fatalf("expected shutdown cancellation was reported as checkpoint failure: %v", err)
 	default:
 	}
 }

@@ -29,6 +29,8 @@ const (
 	checkpointRequired
 )
 
+var errCheckpointActivated = errors.New("sessionruntime: checkpoint canceled by session activation")
+
 type checkpointPolicy struct {
 	Trigger  checkpointTrigger
 	Priority checkpointPriority
@@ -76,6 +78,7 @@ type checkpointControllerConfig struct {
 	Admission      func(context.Context) (func(), error)
 	RequiredQueued func(event.Event)
 	ManualQueued   func()
+	ObserveError   func(error)
 }
 
 type checkpointController struct {
@@ -91,7 +94,7 @@ type checkpointController struct {
 	manualWaiting     int
 	closed            bool
 	wg                sync.WaitGroup
-	activeCancel      context.CancelFunc
+	activeCancel      context.CancelCauseFunc
 	activationPending bool
 	requiredQueue     []*requiredRequest
 	requiredRunner    bool
@@ -286,8 +289,8 @@ func (c *checkpointController) bestEffortBoundaryWithCommit(ctx context.Context,
 func (c *checkpointController) runBestEffort(req checkpointRequest, triggerCommit func() error, accepted chan error) {
 	go func() {
 		defer c.wg.Done()
-		workerCtx, cancel := context.WithCancel(req.ctx)
-		defer cancel()
+		workerCtx, cancel := context.WithCancelCause(req.ctx)
+		defer cancel(context.Canceled)
 		if c.cfg.Mode != PlacementShared {
 			c.mu.Lock()
 			c.activeCancel = cancel
@@ -295,7 +298,7 @@ func (c *checkpointController) runBestEffort(req checkpointRequest, triggerCommi
 			c.activationPending = false
 			c.mu.Unlock()
 			if cancelNow {
-				cancel()
+				cancel(errCheckpointActivated)
 			}
 		}
 		signaled := false
@@ -309,19 +312,27 @@ func (c *checkpointController) runBestEffort(req checkpointRequest, triggerCommi
 		if req.alreadyPublished {
 			commit = func() error { return nil }
 		}
-		_, err := c.commit(workerCtx, req.trigger, checkpointTriggerKind(req.trigger), commit, onAccepted)
+		_, commitErr := c.commit(workerCtx, req.trigger, checkpointTriggerKind(req.trigger), commit, onAccepted)
+		observe := accepted == nil || signaled
 		if accepted != nil && !signaled {
 			// Best-effort progress still requires the execution trigger to survive a
 			// permit/snapshot setup failure. Publish it without a checkpoint and retry
 			// on the next eligible boundary.
+			acceptErr := commitErr
 			if !req.alreadyPublished {
 				if triggerCommit != nil {
-					err = triggerCommit()
+					acceptErr = triggerCommit()
 				} else {
-					err = c.cfg.Publisher.PublishEventChecked(req.ctx, req.trigger)
+					acceptErr = c.cfg.Publisher.PublishEventChecked(req.ctx, req.trigger)
 				}
 			}
-			accepted <- err
+			accepted <- acceptErr
+			// Once the trigger survives, the checkpoint failure is asynchronous from
+			// the caller's perspective and must be observed internally.
+			observe = acceptErr == nil
+		}
+		if observe {
+			c.observeBestEffortError(workerCtx, commitErr)
 		}
 		c.mu.Lock()
 		c.activeCancel = nil
@@ -428,8 +439,20 @@ func (c *checkpointController) activated() {
 	}
 	c.mu.Unlock()
 	if cancel != nil {
-		cancel()
+		cancel(errCheckpointActivated)
 	}
+}
+
+func (c *checkpointController) observeBestEffortError(workerCtx context.Context, err error) {
+	if err == nil || c.cfg.ObserveError == nil {
+		return
+	}
+	// Activation and controller shutdown deliberately abandon a best-effort walk;
+	// they are expected control flow, not operational checkpoint failures.
+	if errors.Is(context.Cause(workerCtx), errCheckpointActivated) || c.ctx.Err() != nil {
+		return
+	}
+	c.cfg.ObserveError(err)
 }
 
 func (c *checkpointController) finishBestEffort() {
@@ -491,7 +514,7 @@ func (c *checkpointController) commit(caller context.Context, trigger event.Even
 		}
 		if err != nil && (trigger != nil || durabilityAttempted) {
 			c.latchRequired(err)
-		} else if kind == event.SnapshotTriggerManual && c.cfg.Recover != nil {
+		} else if err == nil && kind == event.SnapshotTriggerManual && c.cfg.Recover != nil {
 			c.cfg.Recover()
 		}
 	}()
@@ -505,7 +528,7 @@ func (c *checkpointController) commit(caller context.Context, trigger event.Even
 		defer func() {
 			if err != nil && (trigger != nil || durabilityAttempted) {
 				c.latchRequired(err)
-			} else if kind == event.SnapshotTriggerManual && c.cfg.Recover != nil {
+			} else if err == nil && kind == event.SnapshotTriggerManual && c.cfg.Recover != nil {
 				// Recovery clears the workspace fault and admission latch while the
 				// writer is still held; readers wake only after releaseAdmission.
 				c.cfg.Recover()
