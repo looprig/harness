@@ -10,6 +10,7 @@ import (
 	"github.com/looprig/core/content"
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/command"
+	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/hub"
 	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/loop"
@@ -40,6 +41,25 @@ func (c controllableRelease) AwaitRelease(ctx context.Context) error {
 	case <-ctx.Done():
 		return ctx.Err()
 	}
+}
+
+type blockingSessionIdleAppender struct {
+	base    recordingEventAppender
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (a *blockingSessionIdleAppender) AppendEvent(ctx context.Context, ev event.Event) (uint64, error) {
+	if _, ok := ev.(event.SessionIdle); ok {
+		a.once.Do(func() { close(a.entered) })
+		select {
+		case <-a.release:
+		case <-ctx.Done():
+			return 0, ctx.Err()
+		}
+	}
+	return a.base.AppendEvent(ctx, ev)
 }
 
 // treeLoop is one node in a fake loop tree: a name and its parent's name ("" = root).
@@ -472,5 +492,172 @@ func TestInterruptBarrierReleasePolicy(t *testing.T) {
 	}
 	if s.loopInterruptPending(ids["A"]) || s.loopInterruptPending(ids["B"]) {
 		t.Fatal("interrupt-pending marks were not cleared after the barrier released")
+	}
+}
+
+func TestInterruptCheckpointBarrierUsesNativeIdleOutcome(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+	}{
+		{name: "checkpoint sweep holds marks through session idle acceptance"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			s, ids, cmds := fakeTreeSession(t, nil, treeLoop{name: "A"}, treeLoop{name: "B", parent: "A"})
+			publisher := &boundaryPublisher{order: &checkpointOrder{}}
+			s.checkpoints = newCheckpointController(checkpointControllerConfig{
+				SessionID: s.sessionID,
+				Policy:    checkpointPolicy{Trigger: checkpointManual, Priority: checkpointBestEffort, Timeout: time.Second},
+				Publisher: publisher,
+			})
+			t.Cleanup(s.checkpoints.shutdown)
+			go ackInterrupt(t, cmds["A"], true)
+			go ackInterrupt(t, cmds["B"], true)
+
+			any, done, err := s.runInterrupt(context.Background(), func() ([]loopSnapshot, bool) {
+				return s.liveLoopSnapshotLocked(), true
+			}, identity.AgencyUser)
+			if err != nil || !any || done == nil {
+				t.Fatalf("runInterrupt = any %v, done %v, err %v", any, done, err)
+			}
+			s.checkpoints.mu.Lock()
+			registered := len(s.checkpoints.interruptSweeps)
+			s.checkpoints.mu.Unlock()
+			if registered != 1 {
+				t.Fatalf("registered checkpoint sweeps = %d, want 1 before fan-out idle can release", registered)
+			}
+			select {
+			case <-done:
+				t.Fatal("barrier released before checkpoint controller observed SessionIdle")
+			default:
+			}
+			if !s.loopInterruptPending(ids["A"]) || !s.loopInterruptPending(ids["B"]) {
+				t.Fatal("a target interrupt mark cleared before every target was idle and SessionIdle committed")
+			}
+
+			idle := event.SessionIdle{Header: event.Header{Coordinates: identity.Coordinates{SessionID: s.sessionID}, EventID: mustUUID()}}
+			if err := s.checkpoints.sessionIdle(context.Background(), idle, func() error {
+				return publisher.PublishEventChecked(context.Background(), idle)
+			}); err != nil {
+				t.Fatalf("sessionIdle: %v", err)
+			}
+			select {
+			case <-done:
+			case <-time.After(time.Second):
+				t.Fatal("barrier did not release from explicit checkpoint outcome")
+			}
+			if s.loopInterruptPending(ids["A"]) || s.loopInterruptPending(ids["B"]) {
+				t.Fatal("target interrupt marks remain after SessionIdle outcome")
+			}
+		})
+	}
+}
+
+func TestInterruptPreservedInputDispatchesOnlyAfterSessionIdleAppend(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name      string
+		workspace bool
+	}{
+		{name: "manual workspace", workspace: true},
+		{name: "no workspace", workspace: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			appender := &blockingSessionIdleAppender{entered: make(chan struct{}), release: make(chan struct{})}
+			opts := []Option{WithEventAppender(appender)}
+			if tt.workspace {
+				ws, root := checkpointFixture(t, nil)
+				opts = append(opts,
+					withResolvedPlacement(&resolvedPlacement{mode: PlacementSession, store: ws, root: root, coordinator: newWorkspaceCoordinator(nil)}),
+					WithSnapshotPolicy(SnapshotPolicy{Trigger: SnapshotManual, Priority: SnapshotBestEffort, Timeout: time.Second}),
+				)
+			}
+			s, err := newTestSession(context.Background(), cfg(&stubLLM{blockUntilCancel: true}), opts...)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = s.Shutdown(context.Background()) })
+			sub, err := s.SubscribeEvents(allFilter())
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = sub.Close() })
+			if _, err := s.Submit(context.Background(), nil); err != nil {
+				t.Fatal(err)
+			}
+			for {
+				select {
+				case delivery := <-sub.Events():
+					if _, ok := delivery.Event.(event.TurnStarted); ok {
+						goto firstStarted
+					}
+				case <-time.After(time.Second):
+					t.Fatal("first turn did not start")
+				}
+			}
+
+		firstStarted:
+			any, err := s.Interrupt(context.Background())
+			if err != nil || !any {
+				t.Fatalf("Interrupt = %v, %v", any, err)
+			}
+			select {
+			case <-appender.entered:
+			case <-time.After(time.Second):
+				t.Fatal("interrupted terminal did not reach SessionIdle append")
+			}
+			submitDone := make(chan error, 1)
+			go func() {
+				_, submitErr := s.Submit(context.Background(), nil)
+				submitDone <- submitErr
+			}()
+			select {
+			case err := <-submitDone:
+				t.Fatalf("next input dispatched before SessionIdle append completed: %v", err)
+			default:
+			}
+			close(appender.release)
+			select {
+			case err := <-submitDone:
+				if err != nil {
+					t.Fatalf("preserved input after idle: %v", err)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("preserved input did not dispatch after SessionIdle")
+			}
+			for {
+				select {
+				case delivery := <-sub.Events():
+					if _, ok := delivery.Event.(event.TurnStarted); ok {
+						goto secondStarted
+					}
+				case <-time.After(time.Second):
+					t.Fatal("preserved input never started a turn after SessionIdle")
+				}
+			}
+
+		secondStarted:
+			events := appender.base.snapshot()
+			idleAt, secondStartAt := -1, -1
+			starts := 0
+			for i, ev := range events {
+				switch ev.(type) {
+				case event.SessionIdle:
+					idleAt = i
+				case event.TurnStarted:
+					starts++
+					if starts == 2 {
+						secondStartAt = i
+					}
+				}
+			}
+			if idleAt < 0 || secondStartAt < 0 || secondStartAt <= idleAt {
+				t.Fatalf("event order idle=%d second-start=%d events=%T", idleAt, secondStartAt, events)
+			}
+		})
 	}
 }

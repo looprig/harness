@@ -14,8 +14,9 @@ import (
 // target loop ids UNDER THE SESSION LOCK, the whole set is marked interrupt-pending BEFORE any
 // command is sent (mark-before-fanout), then one-hop command.Interrupt commands are delivered
 // to every target CONCURRENTLY. A cancelled turn arms an admission barrier that holds the marks
-// until a PLUGGABLE release policy fires (default: the session next reaching idle, i.e. SessionIdle
-// durably appended); Task 16 injects the workspace-aware release. While a loop is interrupt-pending
+// until the session next reaches idle (SessionIdle durably appended). A configured checkpoint
+// controller refines that edge with a generation-specific accepted/committed/faulted outcome.
+// While a loop is interrupt-pending
 // the delegation admission paths refuse NEW machine-delegate work (start/send) — so a parent whose
 // interrupted delegate wait resolves cannot open a fresh DELEGATE step in the race window — while
 // human (AgencyUser) input is never gated and remains queued.
@@ -30,8 +31,8 @@ import (
 // interrupt-pending mark until AwaitRelease returns, then clears them. The default policy
 // (sessionIdleRelease) releases once the session reaches idle — WaitIdle returns only after the
 // hub has durably appended SessionIdle, so "release after idle" and "release after SessionIdle is
-// appended" are the same edge. Task 16 injects a workspace-aware policy via
-// WithInterruptReleasePolicy that may hold the barrier through a checkpoint before releasing.
+// appended" are the same edge. Workspace-backed sessions use checkpoint-controller sweep
+// outcomes directly; this seam remains for headless/custom session-runtime composition.
 type InterruptReleasePolicy interface {
 	// AwaitRelease blocks until the interrupt admission barrier should release. ctx is the
 	// session lifetime. The returned error is advisory: the marks are cleared once AwaitRelease
@@ -248,6 +249,12 @@ func (s *Session) runInterrupt(ctx context.Context, selectLocked func() ([]loopS
 	if !ok {
 		return false, nil, &SessionError{Kind: SessionLoopNotFound}
 	}
+	var checkpointSweep *interruptCheckpointSweep
+	if s.checkpoints != nil {
+		// Register before fan-out: a fast actor may publish TurnInterrupted and
+		// derive SessionIdle before its interrupt acknowledgement is collected.
+		checkpointSweep = s.checkpoints.beginInterruptSweep()
+	}
 
 	ids := make([]uuid.UUID, len(snapshot))
 	for i, ls := range snapshot {
@@ -256,21 +263,23 @@ func (s *Session) runInterrupt(ctx context.Context, selectLocked func() ([]loopS
 
 	any, err := s.fanoutInterrupt(ctx, snapshot, agency)
 	if err != nil {
+		checkpointSweep.cancel()
 		s.clearInterruptPending(ids) // a cancelled fan-out must not strand the admission barrier
 		return false, nil, err
 	}
 	if !any {
+		checkpointSweep.cancel()
 		s.clearInterruptPending(ids) // fail-quiet: nothing was running, hold no barrier
 		return false, nil, nil
 	}
-	return true, s.armInterruptBarrier(ids), nil
+	return true, s.armInterruptBarrier(ids, checkpointSweep), nil
 }
 
 // armInterruptBarrier holds the interrupt-pending marks for ids until the release policy returns,
 // then clears them. It runs the wait on the SESSION lifetime (not the interrupt caller's ctx, which
 // may be short-lived) so the barrier tracks the session reaching idle. It returns a channel that
 // closes once the marks are cleared.
-func (s *Session) armInterruptBarrier(ids []uuid.UUID) <-chan struct{} {
+func (s *Session) armInterruptBarrier(ids []uuid.UUID, checkpointSweep *interruptCheckpointSweep) <-chan struct{} {
 	policy := s.interruptRelease
 	if policy == nil {
 		policy = sessionIdleRelease{session: s}
@@ -278,7 +287,11 @@ func (s *Session) armInterruptBarrier(ids []uuid.UUID) <-chan struct{} {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		_ = policy.AwaitRelease(s.sessionCtx)
+		if checkpointSweep != nil {
+			_, _ = checkpointSweep.await(s.sessionCtx)
+		} else {
+			_ = policy.AwaitRelease(s.sessionCtx)
+		}
 		s.clearInterruptPending(ids)
 	}()
 	return done

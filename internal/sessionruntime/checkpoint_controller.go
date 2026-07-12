@@ -3,6 +3,7 @@ package sessionruntime
 import (
 	"context"
 	"errors"
+	"slices"
 	"sync"
 	"time"
 
@@ -99,17 +100,74 @@ type checkpointController struct {
 	activationPending bool
 	requiredQueue     []*requiredRequest
 	requiredRunner    bool
+	requiredNext      uint64
+	requiredCompleted uint64
+	requiredFinished  map[uint64]error
+	interruptDeferred map[uint64]*interruptCheckpointSweep
+	interruptNext     uint64
+	interruptSweeps   map[uint64]*interruptCheckpointSweep
 }
 
 type checkpointRequest struct {
 	ctx              context.Context
 	trigger          event.Event
 	alreadyPublished bool
+	kind             event.SnapshotTriggerKind
 }
 
 type checkpointResult struct {
 	ref workspacestore.Ref
 	err error
+}
+
+type interruptCheckpointDisposition uint8
+
+const (
+	interruptCheckpointAccepted interruptCheckpointDisposition = iota + 1
+	interruptCheckpointCommitted
+	interruptCheckpointFaulted
+)
+
+type interruptCheckpointOutcome struct {
+	Disposition interruptCheckpointDisposition
+	Err         error
+}
+
+// interruptCheckpointSweep is one interrupt generation's native checkpoint
+// barrier. Registration happens before command fan-out, so only a later
+// SessionIdle edge can resolve it. The buffered result lets the idle publication
+// path finish without depending on the interrupt caller being scheduled.
+type interruptCheckpointSweep struct {
+	controller     *checkpointController
+	id             uint64
+	result         chan interruptCheckpointOutcome
+	once           sync.Once
+	cause          event.Event
+	requiredAfter  uint64
+	requiredCutoff uint64
+	requiredErr    error
+}
+
+func (s *interruptCheckpointSweep) await(ctx context.Context) (interruptCheckpointOutcome, error) {
+	select {
+	case outcome := <-s.result:
+		return outcome, nil
+	case <-ctx.Done():
+		s.cancel()
+		return interruptCheckpointOutcome{}, ctx.Err()
+	}
+}
+
+func (s *interruptCheckpointSweep) cancel() {
+	if s == nil || s.controller == nil {
+		return
+	}
+	s.once.Do(func() {
+		s.controller.mu.Lock()
+		delete(s.controller.interruptSweeps, s.id)
+		delete(s.controller.interruptDeferred, s.id)
+		s.controller.mu.Unlock()
+	})
 }
 
 type requiredRequest struct {
@@ -118,11 +176,117 @@ type requiredRequest struct {
 	run     func(context.Context) (workspacestore.Ref, error)
 	result  chan checkpointResult
 	started bool
+	seq     uint64
 }
 
 func newCheckpointController(cfg checkpointControllerConfig) *checkpointController {
 	ctx, cancel := context.WithCancel(context.Background())
-	return &checkpointController{cfg: cfg, ctx: ctx, cancel: cancel}
+	return &checkpointController{
+		cfg:               cfg,
+		ctx:               ctx,
+		cancel:            cancel,
+		interruptSweeps:   make(map[uint64]*interruptCheckpointSweep),
+		interruptDeferred: make(map[uint64]*interruptCheckpointSweep),
+		requiredFinished:  make(map[uint64]error),
+	}
+}
+
+func (c *checkpointController) beginInterruptSweep() *interruptCheckpointSweep {
+	c.mu.Lock()
+	c.interruptNext++
+	if c.interruptNext == 0 {
+		c.interruptNext++
+	}
+	sweep := &interruptCheckpointSweep{
+		controller:    c,
+		id:            c.interruptNext,
+		result:        make(chan interruptCheckpointOutcome, 1),
+		requiredAfter: c.requiredNext,
+	}
+	if c.closed {
+		c.mu.Unlock()
+		closedErr := &CheckpointError{Kind: CheckpointCanceled, Cause: context.Canceled}
+		c.resolveInterruptSweeps([]*interruptCheckpointSweep{sweep}, interruptCheckpointOutcome{Disposition: interruptCheckpointFaulted, Err: closedErr})
+		return sweep
+	}
+	c.interruptSweeps[sweep.id] = sweep
+	c.mu.Unlock()
+	return sweep
+}
+
+func (c *checkpointController) observeInterruptCause(trigger event.Event) {
+	if _, ok := trigger.(event.TurnInterrupted); !ok {
+		return
+	}
+	c.mu.Lock()
+	for _, sweep := range c.interruptSweeps {
+		if sweep.cause == nil {
+			sweep.cause = trigger
+		}
+	}
+	c.mu.Unlock()
+}
+
+// takeInterruptSweeps transfers ownership of every generation that was pending
+// before this SessionIdle boundary began. A sweep registered after this method
+// returns belongs to a later idle edge and cannot be released by this one.
+func (c *checkpointController) takeInterruptSweeps() ([]*interruptCheckpointSweep, event.Event) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.interruptSweeps) == 0 {
+		return nil, nil
+	}
+	ids := make([]uint64, 0, len(c.interruptSweeps))
+	for id := range c.interruptSweeps {
+		ids = append(ids, id)
+	}
+	slices.Sort(ids)
+	sweeps := make([]*interruptCheckpointSweep, 0, len(ids))
+	var cause event.Event
+	for _, id := range ids {
+		sweep := c.interruptSweeps[id]
+		delete(c.interruptSweeps, id)
+		sweeps = append(sweeps, sweep)
+		if cause == nil && sweep.cause != nil {
+			cause = sweep.cause
+		}
+	}
+	return sweeps, cause
+}
+
+func (c *checkpointController) resolveInterruptSweeps(sweeps []*interruptCheckpointSweep, outcome interruptCheckpointOutcome) {
+	for _, sweep := range sweeps {
+		resolved := outcome
+		if sweep.requiredErr != nil {
+			resolved = interruptCheckpointOutcome{Disposition: interruptCheckpointFaulted, Err: sweep.requiredErr}
+		}
+		sweep.once.Do(func() { sweep.result <- resolved })
+	}
+}
+
+func (c *checkpointController) deferInterruptSweepsThroughRequired(sweeps []*interruptCheckpointSweep) []*interruptCheckpointSweep {
+	if c.cfg.Policy.Priority != checkpointRequired || c.cfg.Policy.Trigger == checkpointOnIdle || c.cfg.Policy.Trigger == checkpointManual {
+		return sweeps
+	}
+	c.mu.Lock()
+	ready := make([]*interruptCheckpointSweep, 0, len(sweeps))
+	for _, sweep := range sweeps {
+		sweep.requiredCutoff = c.requiredNext
+		if c.requiredCompleted >= sweep.requiredCutoff {
+			ready = append(ready, sweep)
+			continue
+		}
+		c.interruptDeferred[sweep.id] = sweep
+	}
+	c.mu.Unlock()
+	return ready
+}
+
+func (c *checkpointController) interruptSuccessDisposition() interruptCheckpointDisposition {
+	if c.cfg.Policy.Priority == checkpointRequired && c.cfg.Policy.Trigger != checkpointManual {
+		return interruptCheckpointCommitted
+	}
+	return interruptCheckpointAccepted
 }
 
 func (c *checkpointController) shutdown() {
@@ -130,7 +294,18 @@ func (c *checkpointController) shutdown() {
 		c.mu.Lock()
 		c.closed = true
 		c.pending = nil
+		interrupts := make([]*interruptCheckpointSweep, 0, len(c.interruptSweeps))
+		for id, sweep := range c.interruptSweeps {
+			interrupts = append(interrupts, sweep)
+			delete(c.interruptSweeps, id)
+		}
+		for id, sweep := range c.interruptDeferred {
+			interrupts = append(interrupts, sweep)
+			delete(c.interruptDeferred, id)
+		}
 		c.mu.Unlock()
+		shutdownErr := &CheckpointError{Kind: CheckpointCanceled, Cause: context.Canceled}
+		c.resolveInterruptSweeps(interrupts, interruptCheckpointOutcome{Disposition: interruptCheckpointFaulted, Err: shutdownErr})
 		c.cancel()
 		c.wg.Wait()
 	})
@@ -148,6 +323,7 @@ func (c *checkpointController) boundary(ctx context.Context, trigger event.Event
 		// produced by a draining turn still remains durable/live.
 		return c.cfg.Publisher.PublishEventChecked(ctx, trigger)
 	}
+	c.observeInterruptCause(trigger)
 	if !c.matches(trigger) {
 		return c.cfg.Publisher.PublishEventChecked(ctx, trigger)
 	}
@@ -173,28 +349,80 @@ func (c *checkpointController) boundary(ctx context.Context, trigger event.Event
 }
 
 func (c *checkpointController) sessionIdle(ctx context.Context, idle event.SessionIdle, publish func() error) error {
-	if c == nil || !c.matches(idle) {
+	if c == nil {
 		return publish()
 	}
-	if c.cfg.Policy.Priority == checkpointBestEffort {
-		return c.bestEffortBoundaryWithCommit(ctx, idle, publish)
-	}
-	_, err := c.runRequired(ctx, idle, func(runCtx context.Context) (workspacestore.Ref, error) {
-		published := false
-		trackedPublish := func() error {
-			err := publish()
-			if err == nil {
-				published = true
+	sweeps, interruptCause := c.takeInterruptSweeps()
+	sweeps = c.deferInterruptSweepsThroughRequired(sweeps)
+	disposition := c.interruptSuccessDisposition()
+	var err error
+	switch {
+	case !c.matches(idle):
+		err = publish()
+	case c.cfg.Policy.Priority == checkpointBestEffort:
+		if interruptCause != nil {
+			err = c.bestEffortInterruptIdle(ctx, interruptCause, publish)
+		} else {
+			err = c.bestEffortBoundaryWithCommit(ctx, idle, publish)
+		}
+	default:
+		_, err = c.runRequired(ctx, idle, func(runCtx context.Context) (workspacestore.Ref, error) {
+			published := false
+			trackedPublish := func() error {
+				err := publish()
+				if err == nil {
+					published = true
+				}
+				return err
 			}
-			return err
-		}
-		ref, commitErr := c.commit(runCtx, idle, event.SnapshotTriggerIdle, trackedPublish, nil)
-		if commitErr != nil && !published {
-			_ = trackedPublish()
-		}
-		return ref, commitErr
-	})
+			cause := event.Event(idle)
+			kind := event.SnapshotTriggerIdle
+			if interruptCause != nil {
+				cause = interruptCause
+				kind = event.SnapshotTriggerInterrupt
+			}
+			ref, commitErr := c.commit(runCtx, cause, kind, trackedPublish, nil)
+			if commitErr != nil && !published {
+				_ = trackedPublish()
+			}
+			return ref, commitErr
+		})
+	}
+	if err != nil {
+		disposition = interruptCheckpointFaulted
+	}
+	c.resolveInterruptSweeps(sweeps, interruptCheckpointOutcome{Disposition: disposition, Err: err})
 	return err
+}
+
+func (c *checkpointController) bestEffortInterruptIdle(ctx context.Context, cause event.Event, publish func() error) error {
+	req := checkpointRequest{ctx: ctx, trigger: cause, kind: event.SnapshotTriggerInterrupt}
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return publish()
+	}
+	if !c.active {
+		c.active = true
+		c.wg.Add(1)
+		accepted := make(chan error, 1)
+		c.mu.Unlock()
+		c.runBestEffort(req, publish, accepted)
+		return <-accepted
+	}
+	c.mu.Unlock()
+
+	if err := publish(); err != nil {
+		return err
+	}
+	req.alreadyPublished = true
+	c.mu.Lock()
+	if !c.closed {
+		copyReq := req
+		c.pending = &copyReq
+	}
+	c.mu.Unlock()
+	return nil
 }
 
 func (c *checkpointController) manual(ctx context.Context) (workspacestore.Ref, error) {
@@ -313,7 +541,11 @@ func (c *checkpointController) runBestEffort(req checkpointRequest, triggerCommi
 		if req.alreadyPublished {
 			commit = func() error { return nil }
 		}
-		_, commitErr := c.commit(workerCtx, req.trigger, checkpointTriggerKind(req.trigger), commit, onAccepted)
+		kind := req.kind
+		if kind == event.SnapshotTriggerKindUnknown {
+			kind = checkpointTriggerKind(req.trigger)
+		}
+		_, commitErr := c.commit(workerCtx, req.trigger, kind, commit, onAccepted)
 		observe := accepted == nil || signaled
 		if accepted != nil && !signaled {
 			// Best-effort progress still requires the execution trigger to survive a
@@ -354,6 +586,8 @@ func (c *checkpointController) runRequired(
 		return "", &CheckpointError{Kind: CheckpointCanceled, Cause: context.Canceled}
 	}
 	c.wg.Add(1)
+	c.requiredNext++
+	req.seq = c.requiredNext
 	c.requiredQueue = append(c.requiredQueue, req)
 	startRunner := !c.requiredRunner
 	if startRunner {
@@ -383,6 +617,7 @@ func (c *checkpointController) runRequired(
 			}
 			c.mu.Unlock()
 			if removed {
+				c.recordRequiredCompletion(req.seq, &CheckpointError{Kind: CheckpointCanceled, Cause: ctx.Err()})
 				c.wg.Done()
 				return "", &CheckpointError{Kind: CheckpointCanceled, Cause: ctx.Err()}
 			}
@@ -410,9 +645,44 @@ func (c *checkpointController) runRequiredQueue() {
 		c.mu.Unlock()
 
 		ref, err := req.run(c.ctx)
+		c.recordRequiredCompletion(req.seq, err)
 		req.result <- checkpointResult{ref: ref, err: err}
 		c.wg.Done()
 	}
+}
+
+func (c *checkpointController) recordRequiredCompletion(seq uint64, err error) {
+	c.mu.Lock()
+	c.requiredFinished[seq] = err
+	if err != nil {
+		for _, sweep := range c.interruptSweeps {
+			if seq > sweep.requiredAfter {
+				sweep.requiredErr = err
+			}
+		}
+		for _, sweep := range c.interruptDeferred {
+			if seq > sweep.requiredAfter && seq <= sweep.requiredCutoff {
+				sweep.requiredErr = err
+			}
+		}
+	}
+	for {
+		next := c.requiredCompleted + 1
+		if _, ok := c.requiredFinished[next]; !ok {
+			break
+		}
+		delete(c.requiredFinished, next)
+		c.requiredCompleted = next
+	}
+	ready := make([]*interruptCheckpointSweep, 0)
+	for id, sweep := range c.interruptDeferred {
+		if c.requiredCompleted >= sweep.requiredCutoff {
+			delete(c.interruptDeferred, id)
+			ready = append(ready, sweep)
+		}
+	}
+	c.mu.Unlock()
+	c.resolveInterruptSweeps(ready, interruptCheckpointOutcome{Disposition: interruptCheckpointCommitted})
 }
 
 func (c *checkpointController) beginManualOperation() bool {
