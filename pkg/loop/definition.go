@@ -35,6 +35,8 @@ type InitialFingerprint struct {
 
 type definitionState struct {
 	name              identity.AgentName
+	displayName       string
+	description       string
 	client            inference.Client
 	model             inference.Model
 	system            string
@@ -472,6 +474,8 @@ func (d Definition) Bind(ctx context.Context, bindings tool.Bindings) (BoundDefi
 // BoundDefinition is the sealed read-only runtime view of one bound loop.
 type BoundDefinition interface {
 	Name() identity.AgentName
+	DisplayName() string
+	Description() string
 	Engine() Engine
 	Client() inference.Client
 	Model() inference.Model
@@ -501,6 +505,8 @@ type boundDefinitionState struct {
 
 func (*boundDefinitionState) boundDefinition()              {}
 func (b *boundDefinitionState) Name() identity.AgentName    { return b.definition.name }
+func (b *boundDefinitionState) DisplayName() string         { return b.definition.displayName }
+func (b *boundDefinitionState) Description() string         { return b.definition.description }
 func (b *boundDefinitionState) Engine() Engine              { return b.definition.engine }
 func (b *boundDefinitionState) Client() inference.Client    { return b.definition.client }
 func (b *boundDefinitionState) InitialMode() ModeName       { return b.definition.initialMode }
@@ -577,6 +583,32 @@ func WithInference(client inference.Client, model inference.Model) Option {
 			return err
 		}
 		o.client, o.model = client, cloneModel(model)
+		return nil
+	}
+}
+
+// WithDisplayName sets the loop's user-facing presentation label. Purely
+// presentational; empty means "no explicit label" and consumers fall back to the
+// agent name. It is excluded from PolicyRevision so relabeling never breaks restore
+// config-drift detection.
+func WithDisplayName(name string) Option {
+	return func(o *definitionOptions) error {
+		if err := o.singleton("display_name"); err != nil {
+			return err
+		}
+		o.displayName = name
+		return nil
+	}
+}
+
+// WithDescription sets the loop's user-facing description. Purely presentational;
+// excluded from PolicyRevision for the same restore-compat reason as WithDisplayName.
+func WithDescription(desc string) Option {
+	return func(o *definitionOptions) error {
+		if err := o.singleton("description"); err != nil {
+			return err
+		}
+		o.description = desc
 		return nil
 	}
 }

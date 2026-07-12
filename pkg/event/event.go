@@ -329,6 +329,12 @@ type LoopStarted struct {
 	// InitialRequestID proves the prepared delegate's initial command was accepted
 	// before this durable loop-creation commit. Zero for roots/plain loops.
 	InitialRequestID uuid.UUID `json:"initial_request_id,omitzero"`
+	// DisplayName is the loop's user-facing presentation label, empty when the loop
+	// declared none (consumers fall back to Header.AgentName). omitzero so old journal
+	// records decode to "".
+	DisplayName string `json:"display_name,omitzero"`
+	// Description is the loop's user-facing description, empty when none declared.
+	Description string `json:"description,omitzero"`
 }
 
 // DelegateRequestAccepted is the durable actor-side acceptance of a follow-up
