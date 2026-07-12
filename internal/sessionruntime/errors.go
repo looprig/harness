@@ -14,6 +14,8 @@ type RestoreError = sessionapi.RestoreError
 type GateErrorKind = sessionapi.GateErrorKind
 type GateError = sessionapi.GateError
 type WorkspaceNotConfiguredError = sessionapi.WorkspaceNotConfiguredError
+type WorkspaceRootBusyError = sessionapi.WorkspaceRootBusyError
+type WorkspaceRootLeaseLostError = sessionapi.WorkspaceRootLeaseLostError
 
 const (
 	SessionIDGenerationFailed            = sessionapi.SessionIDGenerationFailed

@@ -181,3 +181,30 @@ type WorkspaceNotConfiguredError struct{}
 func (*WorkspaceNotConfiguredError) Error() string {
 	return "session: workspace checkpointing is not configured"
 }
+
+// WorkspaceRootBusyError reports that an exclusive workspace root is already
+// leased by another session. HolderEpoch is copied from the storage refusal so
+// callers never need an internal runtime type to diagnose contention.
+type WorkspaceRootBusyError struct {
+	Root        string
+	HolderEpoch uint64
+	Cause       error
+}
+
+func (e *WorkspaceRootBusyError) Error() string {
+	msg := "session: workspace root busy: " + e.Root
+	if e.Cause != nil {
+		msg += ": " + e.Cause.Error()
+	}
+	return msg
+}
+
+func (e *WorkspaceRootBusyError) Unwrap() error { return e.Cause }
+
+// WorkspaceRootLeaseLostError reports that an exclusive workspace lease ended
+// while its session was live. It is the public leaf chained by SessionFaulted.
+type WorkspaceRootLeaseLostError struct{}
+
+func (*WorkspaceRootLeaseLostError) Error() string {
+	return "session: workspace root lease lost"
+}

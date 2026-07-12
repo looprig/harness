@@ -77,6 +77,10 @@ func TestRecoverSessionRoot(t *testing.T) {
 		wantStaging   bool
 	}{
 		{
+			name:  "brand-new root is created empty",
+			setup: func(*testing.T, string) {},
+		},
+		{
 			name: "abandoned staging is removed",
 			setup: func(t *testing.T, root string) {
 				mustMkdir(t, sessionStagingPath(root))
@@ -116,6 +120,9 @@ func TestRecoverSessionRoot(t *testing.T) {
 			}
 			if pathExists(sessionBackupPath(root)) {
 				t.Fatalf("backup dir not removed")
+			}
+			if !pathExists(root) {
+				t.Fatal("live root was not recovered or created")
 			}
 			for _, want := range tt.wantRootFiles {
 				if !pathExists(filepath.Join(root, want)) {

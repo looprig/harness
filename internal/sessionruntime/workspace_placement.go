@@ -2,6 +2,7 @@ package sessionruntime
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 
@@ -94,7 +95,13 @@ func (p WorkspacePlacement) resolveForNew(ctx context.Context, sid uuid.UUID) (*
 	}
 	lease, err := p.Leaser.Acquire(ctx, p.LeaseName)
 	if err != nil {
-		return nil, &WorkspaceRootBusyError{Root: root, Cause: err}
+		var held *storage.LeaseHeldError
+		_ = errors.As(err, &held)
+		var holderEpoch uint64
+		if held != nil {
+			holderEpoch = held.HolderEpoch
+		}
+		return nil, &WorkspaceRootBusyError{Root: root, HolderEpoch: holderEpoch, Cause: err}
 	}
 	health := &rootLeaseHealth{lost: lease.Lost()}
 	return &resolvedPlacement{
@@ -145,6 +152,13 @@ func recoverSessionRoot(root string) error {
 		if err := os.Rename(backup, root); err != nil {
 			return &WorkspaceRecoveryError{Path: backup, Cause: err}
 		}
+		return nil
+	}
+	// A brand-new per-session placement has neither a live root nor a backup.
+	// Create the empty root now so tools and an automatic idle checkpoint both
+	// operate on a real directory before any seed or turn exists.
+	if err := os.MkdirAll(root, 0o700); err != nil {
+		return &WorkspaceRecoveryError{Path: root, Cause: err}
 	}
 	return nil
 }
@@ -246,33 +260,6 @@ func (h *rootLeaseHealth) Healthy() error {
 	default:
 		return nil
 	}
-}
-
-// WorkspaceRootBusyError reports that the exclusive root lease could not be acquired
-// because another rig instance holds it. Root is the contended canonical root; Cause is
-// the underlying leaser error (e.g. a *storage LeaseHeldError carrying the holder epoch).
-type WorkspaceRootBusyError struct {
-	Root  string
-	Cause error
-}
-
-func (e *WorkspaceRootBusyError) Error() string {
-	msg := "sessionruntime: workspace root busy: " + e.Root
-	if e.Cause != nil {
-		msg += ": " + e.Cause.Error()
-	}
-	return msg
-}
-
-func (e *WorkspaceRootBusyError) Unwrap() error { return e.Cause }
-
-// WorkspaceRootLeaseLostError reports that the exclusive root lease was lost (expiry or
-// takeover) while the session held it. The coordinator's Healthy returns it so cooperative
-// structured mutators fail closed; the session also faults on this signal.
-type WorkspaceRootLeaseLostError struct{}
-
-func (e *WorkspaceRootLeaseLostError) Error() string {
-	return "sessionruntime: workspace root lease lost"
 }
 
 // PlacementResolutionError reports an invalid placement resolution (e.g. a per-session
