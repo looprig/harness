@@ -37,6 +37,9 @@ func (s *Session) CheckpointWorkspace(ctx context.Context) (workspacestore.Ref, 
 	if s.ws == nil {
 		return "", &WorkspaceNotConfiguredError{}
 	}
+	if s.checkpoints != nil {
+		return s.checkpoints.manual(ctx)
+	}
 	// When a placement coordinator is wired, hold the exclusive checkpoint permit around
 	// the snapshot so no managed mutation overlaps the walk — that is what makes the
 	// recorded ref honestly quiescent for exclusive/per-session roots. The bare

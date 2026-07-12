@@ -32,7 +32,7 @@ func TestRigSessionWorkspaceSeedAndRewind(t *testing.T) {
 	}
 
 	baseDir := t.TempDir()
-	rig, err := defineWith(t, sessionStoreT(t), WithSessionWorkspaces(ws, baseDir))
+	rig, err := defineWith(t, sessionStoreT(t), WithSessionWorkspaces(ws, baseDir), WithSnapshots(SnapshotPolicy{Trigger: SnapshotManual}))
 	if err != nil {
 		t.Fatalf("Define: %v", err)
 	}

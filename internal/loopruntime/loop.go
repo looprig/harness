@@ -151,6 +151,17 @@ type eventPublisher interface {
 	PublishEventChecked(context.Context, event.Event) error
 }
 
+// executionBoundary is the optional native checkpoint seam implemented by the owning
+// session. Only already-committed StepDone and turn-terminal events are routed through it;
+// loop-only publishers need not implement it and retain the ordinary publish path.
+type executionBoundary interface {
+	CommitBoundary(context.Context, event.Event) error
+}
+
+type executionAdmission interface {
+	EnterExecution(context.Context) (func(), error)
+}
+
 // faultProbe is the actor's narrow read of the session's durable-persistence fault latch.
 // After emitting a mode/inference change event the actor probes it: a non-nil result means
 // the change event's REQUIRED durable append failed (the hub faulted the session inline via
@@ -468,7 +479,7 @@ func cancelReasonFor(terminal event.Event) event.CancelReason {
 // turn goroutine selects on ack AND turnCtx.Done so an Interrupt/Shutdown frees it.
 type commitRequest struct {
 	commit turnCommit
-	ack    chan<- struct{}
+	ack    chan<- error
 }
 
 // drainRequest is the tool-continuation drain handshake from the turn goroutine to
@@ -533,7 +544,7 @@ func runLoop(cfg loopConfig, state loopState) {
 	// mint failure we FAIL SECURE: log loudly and SKIP publishing that Enduring event
 	// rather than fan out a zero-EventID one (a journal would key on a zero
 	// idempotency key) or silently pretend it published.
-	publish := func(ev event.Event) {
+	stamp := func(ev event.Event) (event.Event, error) {
 		stamped := stampLoopHeader(ev, state.sessionID, state.id, state.turnID)
 		if stamped.Class() == event.Enduring {
 			h, err := cfg.eventFactory.Stamp(stamped.EventHeader())
@@ -544,13 +555,30 @@ func runLoop(cfg loopConfig, state loopState) {
 				// fault for this mint edge is a deferred refinement, not a Phase-7 gap.
 				slog.Error("event id mint failed; dropping Enduring loop event (fail-secure)",
 					"event", fmt.Sprintf("%T", stamped), "error", err)
-				return
+				return nil, err
 			}
 			stamped = withLoopHeader(stamped, h)
+		}
+		return stamped, nil
+	}
+	publish := func(ev event.Event) {
+		stamped, err := stamp(ev)
+		if err != nil {
+			return
 		}
 		if err := cfg.events.PublishEvent(ctx, stamped); err != nil {
 			slog.Error("loop event publish to session fan-in failed", "error", err)
 		}
+	}
+	commitBoundary := func(ev event.Event) error {
+		stamped, err := stamp(ev)
+		if err != nil {
+			return err
+		}
+		if boundary, ok := cfg.events.(executionBoundary); ok {
+			return boundary.CommitBoundary(ctx, stamped)
+		}
+		return cfg.events.PublishEvent(ctx, stamped)
 	}
 
 	// publishAcceptance is the narrow transactional publication path for managed
@@ -681,8 +709,12 @@ func runLoop(cfg loopConfig, state loopState) {
 	//     consumers through the session fan-in). publish never blocks the actor, so the
 	//     turn goroutine cannot be pinned by a slow consumer.
 	buildTurnConfig := func(base content.AgenticMessages) turnConfig {
+		admit := func(context.Context) (func(), error) { return func() {}, nil }
+		if admission, ok := cfg.events.(executionAdmission); ok {
+			admit = admission.EnterExecution
+		}
 		commit := func(cctx context.Context, tc turnCommit) error {
-			ack := make(chan struct{}, 1)
+			ack := make(chan error, 1)
 			req := commitRequest{commit: tc, ack: ack}
 			select {
 			case commits <- req:
@@ -690,8 +722,8 @@ func runLoop(cfg loopConfig, state loopState) {
 				return &CommitError{Reason: CommitTurnCancelled, Cause: cctx.Err()}
 			}
 			select {
-			case <-ack:
-				return nil
+			case err := <-ack:
+				return err
 			case <-cctx.Done():
 				return &CommitError{Reason: CommitTurnCancelled, Cause: cctx.Err()}
 			}
@@ -724,6 +756,7 @@ func runLoop(cfg loopConfig, state loopState) {
 			client:         config.Client,
 			gateReg:        gateReg,
 			idGen:          config.idGen,
+			admit:          admit,
 			commit:         commit,
 			drainPending:   drainPending,
 			emit:           publish,
@@ -1109,7 +1142,9 @@ func runLoop(cfg loopConfig, state loopState) {
 		endedTurnID := state.turnID
 		// The terminal publish must still carry this turn's correlation IDs (stamped by
 		// publish from state.turnID), so clear them only afterward.
-		publish(result.terminal)
+		if err := commitBoundary(result.terminal); err != nil {
+			slog.Error("turn boundary commit failed", "error", err)
+		}
 		state.turnID = uuid.UUID{}
 		state.causationID = uuid.UUID{}
 		// A finished turn must not leave stale gates: the parked runners have already
@@ -1390,14 +1425,19 @@ func runLoop(cfg loopConfig, state loopState) {
 			// StepDone emitted here always follows that step's TokenDeltas on the
 			// fan-in. Ack last so the runner only resumes after the event is published.
 			state.msgs = append(state.msgs, req.commit.Messages...)
-			publish(req.commit.Event)
+			var boundaryErr error
+			if _, ok := req.commit.Event.(event.StepDone); ok {
+				boundaryErr = commitBoundary(req.commit.Event)
+			} else {
+				publish(req.commit.Event)
+			}
 			// A folded user message is now committed: resolve its draining entry (its
 			// TurnFoldedInto was just emitted), so the abnormal-terminal return path
 			// does not also return it. StepDone commits carry no inbox entry.
 			if fi, ok := req.commit.Event.(event.TurnFoldedInto); ok {
 				removeDraining(fi.Cause.CommandID)
 			}
-			req.ack <- struct{}{}
+			req.ack <- boundaryErr
 
 		case result := <-internal:
 			if handleTurnResult(result) {
@@ -1417,7 +1457,9 @@ func runLoop(cfg loopConfig, state loopState) {
 				// wedged there and would never have produced a terminal anyway.
 				select {
 				case result := <-internal:
-					publish(result.terminal)
+					if err := commitBoundary(result.terminal); err != nil {
+						slog.Error("turn boundary commit failed during loop cancellation", "error", err)
+					}
 				case <-time.After(config.DrainTimeout):
 					slog.Error("turn goroutine did not drain after ctx cancel; detaching",
 						"timeout", config.DrainTimeout)

@@ -36,6 +36,11 @@ type Hub struct {
 	subs    map[*EventSubscription]struct{}
 	state   sessionState
 	waiters map[chan error]struct{}
+	// Idle boundary generations close the WaitIdle fast-path window between an
+	// in-memory Active→Idle transition and its native durable completion. A generation
+	// prevents an older overlapping boundary from clearing a newer pending edge.
+	idleBoundaryGeneration uint64
+	idleBoundaryPending    uint64
 
 	// The durable-tap trio (Dependency Inversion: all three are interfaces/seams
 	// injected via Option; the bare New installs nop/real-clock defaults so existing
@@ -43,9 +48,10 @@ type Hub struct {
 	// and read without the lock — appender.AppendEvent is the durable write the hub
 	// runs OUTSIDE mu (no I/O under the lock); factory mints headers for synthesized
 	// session events; reporter is the fail-secure escalation seam.
-	appender eventAppender
-	factory  *event.Factory
-	reporter FaultReporter
+	appender     eventAppender
+	factory      *event.Factory
+	reporter     FaultReporter
+	idleBoundary sessionIdleBoundary
 }
 
 // New builds an idle hub for sessionID. The returned hub has no subscribers and a
@@ -56,16 +62,20 @@ type Hub struct {
 // WithFaultReporter.
 func New(sessionID uuid.UUID, opts ...Option) *Hub {
 	h := &Hub{
-		sessionID: sessionID,
-		subs:      make(map[*EventSubscription]struct{}),
-		state:     newSessionState(),
-		waiters:   make(map[chan error]struct{}),
-		appender:  nopEventAppender{},
-		factory:   event.NewFactory(uuid.New, time.Now),
-		reporter:  nopFaultReporter{},
+		sessionID:    sessionID,
+		subs:         make(map[*EventSubscription]struct{}),
+		state:        newSessionState(),
+		waiters:      make(map[chan error]struct{}),
+		appender:     nopEventAppender{},
+		factory:      event.NewFactory(uuid.New, time.Now),
+		reporter:     nopFaultReporter{},
+		idleBoundary: immediateSessionIdleBoundary{},
 	}
 	for _, opt := range opts {
 		opt(h)
+	}
+	if boundary, ok := h.reporter.(sessionIdleBoundary); ok {
+		h.idleBoundary = boundary
 	}
 	return h
 }
@@ -144,7 +154,12 @@ func (h *Hub) publishEvent(ctx context.Context, ev event.Event, checked bool) er
 	}
 
 	// (3) Apply under the lock; derive the at-most-one session event D; snapshot subs.
-	subs, derived := h.applyAndSnapshot(ev)
+	subs, derived, idleGeneration := h.applyAndSnapshot(ev)
+	if _, active := derived.(event.SessionActive); active {
+		if observer, ok := h.idleBoundary.(sessionActivationObserver); ok {
+			observer.SessionActivated()
+		}
+	}
 
 	// (4) Mint + durably append a derived session event before it (or ev) goes live.
 	// On failure neither ev nor D is delivered, and the fault is raised. D carries its
@@ -161,6 +176,31 @@ func (h *Hub) publishEvent(ctx context.Context, ev event.Event, checked bool) er
 			return nil
 		}
 		derived = withHeader(derived, stamped)
+		// SessionIdle is committed through the narrow native boundary so it can acquire
+		// the workspace permit before this append and finish its accepted snapshot before
+		// WaitIdle acknowledges. The continuation retains hub ownership of append+fanout.
+		if idle, ok := derived.(event.SessionIdle); ok {
+			commit := func() error {
+				ds, appendErr := h.appender.AppendEvent(ctx, idle)
+				if appendErr != nil {
+					fault := &SessionPersistenceFault{Event: idle, Cause: appendErr}
+					h.reporter.ReportFault(ctx, fault)
+					return fault
+				}
+				h.deliver(subs, ev, seq)
+				h.deliver(subs, idle, ds)
+				return nil
+			}
+			err = h.idleBoundary.CommitSessionIdle(ctx, idle, commit)
+			h.completeIdleBoundary(idleGeneration, err == nil)
+			if err != nil {
+				if checked {
+					return err
+				}
+				return nil
+			}
+			return nil
+		}
 		ds, err := h.appender.AppendEvent(ctx, derived)
 		if err != nil {
 			fault := &SessionPersistenceFault{Event: derived, Cause: err}
@@ -188,13 +228,13 @@ func (h *Hub) publishEvent(ctx context.Context, ev event.Event, checked bool) er
 // returns the snapshot and the at-most-one RAW (unstamped) derived event to mint +
 // append + deliver after ev. No I/O happens here — appending the derived event and
 // waking waiters are the caller's job, outside the lock.
-func (h *Hub) applyAndSnapshot(ev event.Event) ([]*EventSubscription, event.Event) {
+func (h *Hub) applyAndSnapshot(ev event.Event) ([]*EventSubscription, event.Event, uint64) {
 	mutate, mutates := activeMutation(ev)
 	if !mutates {
 		// Non-mutating publish: read lock, no applyActivity.
 		h.mu.RLock()
 		defer h.mu.RUnlock()
-		return h.snapshotSubsLocked(), nil
+		return h.snapshotSubsLocked(), nil, 0
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -203,7 +243,11 @@ func (h *Hub) applyAndSnapshot(ev event.Event) ([]*EventSubscription, event.Even
 	// is returned RAW; the caller mints + appends it before delivery (and wakes
 	// WaitIdle waiters only after a SessionIdle edge's durable append succeeds).
 	derived := h.state.applyActivity(h.sessionID, func() { mutate(&h.state) })
-	return h.snapshotSubsLocked(), derived
+	var idleGeneration uint64
+	if _, ok := derived.(event.SessionIdle); ok {
+		idleGeneration = h.markIdleBoundaryLocked()
+	}
+	return h.snapshotSubsLocked(), derived, idleGeneration
 }
 
 // snapshotSubsLocked copies the subscriber set into a slice. The caller must hold
@@ -304,7 +348,12 @@ func (h *Hub) ExpectTurn(ctx context.Context, subagentLoopID uuid.UUID) {
 		func() { h.state.add(activityKey{kind: kindWake, id: subagentLoopID}) })
 	subs := h.snapshotSubsLocked()
 	h.mu.Unlock()
-	h.appendAndDeliverDerived(ctx, subs, derived)
+	if _, active := derived.(event.SessionActive); active {
+		if observer, ok := h.idleBoundary.(sessionActivationObserver); ok {
+			observer.SessionActivated()
+		}
+	}
+	h.appendAndDeliverDerived(ctx, subs, derived, 0)
 }
 
 // CancelExpectTurn releases a {wake, subagentLoopID} token when its hand-back is
@@ -314,9 +363,13 @@ func (h *Hub) CancelExpectTurn(ctx context.Context, subagentLoopID uuid.UUID) {
 	h.mu.Lock()
 	derived := h.state.applyActivity(h.sessionID,
 		func() { h.state.remove(activityKey{kind: kindWake, id: subagentLoopID}) })
+	var idleGeneration uint64
+	if _, ok := derived.(event.SessionIdle); ok {
+		idleGeneration = h.markIdleBoundaryLocked()
+	}
 	subs := h.snapshotSubsLocked()
 	h.mu.Unlock()
-	h.appendAndDeliverDerived(ctx, subs, derived)
+	h.appendAndDeliverDerived(ctx, subs, derived, idleGeneration)
 }
 
 // appendAndDeliverDerived is the create→append→deliver path for a session event
@@ -325,7 +378,7 @@ func (h *Hub) CancelExpectTurn(ctx context.Context, subagentLoopID uuid.UUID) {
 // on a SessionIdle edge wakes WaitIdle waiters only AFTER that append succeeds. Any
 // append/mint failure is fail-secure: deliver nothing, raise a fault. A nil derived
 // (no edge crossed) is a no-op. Called OUTSIDE the hub lock.
-func (h *Hub) appendAndDeliverDerived(ctx context.Context, subs []*EventSubscription, derived event.Event) {
+func (h *Hub) appendAndDeliverDerived(ctx context.Context, subs []*EventSubscription, derived event.Event, idleGeneration uint64) {
 	if derived == nil {
 		return
 	}
@@ -335,6 +388,21 @@ func (h *Hub) appendAndDeliverDerived(ctx context.Context, subs []*EventSubscrip
 		return
 	}
 	derived = withHeader(derived, stamped)
+	if idle, ok := derived.(event.SessionIdle); ok {
+		commit := func() error {
+			seq, appendErr := h.appender.AppendEvent(ctx, idle)
+			if appendErr != nil {
+				fault := &SessionPersistenceFault{Event: idle, Cause: appendErr}
+				h.reporter.ReportFault(ctx, fault)
+				return fault
+			}
+			h.deliver(subs, idle, seq)
+			return nil
+		}
+		err := h.idleBoundary.CommitSessionIdle(ctx, idle, commit)
+		h.completeIdleBoundary(idleGeneration, err == nil)
+		return
+	}
 	seq, err := h.appender.AppendEvent(ctx, derived)
 	if err != nil {
 		h.reporter.ReportFault(ctx, &SessionPersistenceFault{Event: derived, Cause: err})
@@ -342,6 +410,28 @@ func (h *Hub) appendAndDeliverDerived(ctx context.Context, subs []*EventSubscrip
 	}
 	h.deliver(subs, derived, seq)
 	h.signalIdleIfEdge(derived)
+}
+
+func (h *Hub) markIdleBoundaryLocked() uint64 {
+	h.idleBoundaryGeneration++
+	if h.idleBoundaryGeneration == 0 {
+		h.idleBoundaryGeneration++
+	}
+	h.idleBoundaryPending = h.idleBoundaryGeneration
+	return h.idleBoundaryGeneration
+}
+
+func (h *Hub) completeIdleBoundary(generation uint64, success bool) {
+	h.mu.Lock()
+	if generation == 0 || h.idleBoundaryPending != generation {
+		h.mu.Unlock()
+		return
+	}
+	h.idleBoundaryPending = 0
+	if success && h.state.phase == SessionIdle && len(h.state.active) == 0 {
+		h.signalIdleLocked()
+	}
+	h.mu.Unlock()
 }
 
 // signalIdleIfEdge wakes every WaitIdle waiter iff derived is a SessionIdle (the
@@ -453,7 +543,7 @@ func (h *Hub) WaitIdle(ctx context.Context) error {
 	case h.state.phase == SessionStopped:
 		h.mu.Unlock()
 		return ErrSessionStopped
-	case len(h.state.active) == 0:
+	case len(h.state.active) == 0 && h.idleBoundaryPending == 0:
 		h.mu.Unlock()
 		return nil
 	}
@@ -472,6 +562,14 @@ func (h *Hub) WaitIdle(ctx context.Context) error {
 		h.mu.Unlock()
 		return ctx.Err()
 	}
+}
+
+// IsIdle is the non-blocking quiescence probe used by the session's manual
+// checkpoint control plane. It is intentionally narrower than exposing hub state.
+func (h *Hub) IsIdle() bool {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return h.state.phase == SessionIdle && len(h.state.active) == 0 && h.idleBoundaryPending == 0
 }
 
 // FailWaiters wakes every WaitIdle waiter with err and clears the registry. It is

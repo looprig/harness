@@ -586,8 +586,9 @@ func buildRestoredSession(
 		gates:   cloneGateEntries(restoredGates),
 		// Gate directory: restored sessions own a journal-backed appender by default.
 		// Caller opts may replace it below for same-package tests.
-		gateTimers:   map[gate.ID]*time.Timer{},
-		gateAppender: gateAppender,
+		gateTimers:          map[gate.ID]*time.Timer{},
+		gateAppender:        gateAppender,
+		checkpointAdmission: newCheckpointAdmissionGate(),
 	}
 	// Apply the same opts the probe read (WithCommandAppender wires the durable intent
 	// log; WithAllowConfigMismatch is a no-op here — already consumed; WithLimits sets the
@@ -618,7 +619,17 @@ func buildRestoredSession(
 	if err != nil {
 		return nil, &RestoreError{Kind: RestoreJournalFailed, Cause: err}
 	}
-	s.hub = hub.New(sessionID, hub.WithAppender(appender), hub.WithFactory(factory), hub.WithFaultReporter(s))
+	hubOpts := []hub.Option{hub.WithAppender(appender), hub.WithFactory(factory), hub.WithFaultReporter(s)}
+	s.hub = hub.New(sessionID, hubOpts...)
+	if s.snapshotPolicy != nil && s.ws != nil && s.wsCoordinator != nil {
+		s.checkpoints = newCheckpointController(checkpointControllerConfig{
+			SessionID: sessionID, Policy: *s.snapshotPolicy, Store: s.ws, Root: s.wsRoot,
+			Mode: s.wsMode, Coordinator: s.wsCoordinator, Publisher: s, Factory: s.factory,
+			Idle: s.hub.IsIdle, Fault: s.latchWorkspaceCheckpointFault,
+			Recover: s.recoverWorkspaceCheckpointFault, Faulted: s.faultIfFaulted,
+			Admission: s.checkpointAdmission.enterCheckpoint,
+		})
+	}
 
 	// Seed the primary loop under its ORIGINAL id (identity stable), coming up idle with
 	// the folded committed history + turnIndex. No empty loop is spawned and no

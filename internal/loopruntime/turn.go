@@ -89,6 +89,10 @@ type turnConfig struct {
 	client  inference.Client
 	gateReg chan<- gateRegistration
 	idGen   idGenerator
+	// admit acquires the session-wide execution read admission for the next inference
+	// step. Required/manual checkpoints hold the writer side through their full durable
+	// critical sequence, so already-queued work on any loop cannot advance.
+	admit func(context.Context) (func(), error)
 
 	// commit is the durability/event handshake back to the actor. runTurn prepares a
 	// complete step group, but the actor is the only goroutine that mutates
@@ -172,6 +176,9 @@ type turnIdentity struct {
 // The LLM request for each step is built from cfg.base + ts.msgs — never live
 // loopState.msgs — so the already-committed parts are not duplicated.
 func runTurn(ctx context.Context, cfg turnConfig, ts turnState) event.Event {
+	if cfg.admit == nil {
+		cfg.admit = func(context.Context) (func(), error) { return func() {}, nil }
+	}
 	identity := turnIdentity{sessionID: ts.sessionID, loopID: ts.loopID, turnID: ts.id}
 	defs := toolDefs(ctx, cfg.tools.Registry)
 
@@ -206,8 +213,13 @@ func runTurn(ctx context.Context, cfg turnConfig, ts turnState) event.Event {
 		}
 		st := newStepState(identity.sessionID, identity.loopID, identity.turnID, stepID, stepIdx)
 
+		releaseAdmission, admitErr := cfg.admit(ctx)
+		if admitErr != nil {
+			return event.TurnInterrupted{TurnIndex: ts.index}
+		}
 		// runStep owns the LLM cycle: stream → exactly one AIMessage into st.msgs[0].
 		res := runStep(ctx, stepConfig{req: req, client: cfg.client, emit: cfg.emit}, ts.index, st)
+		releaseAdmission()
 		if res.terminal != nil {
 			// The in-flight step never completed: discard it (it was never added to
 			// ts.msgs and never committed) and return the terminal. Committed steps

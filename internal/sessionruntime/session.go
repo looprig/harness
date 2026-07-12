@@ -73,8 +73,10 @@ type Session struct {
 	// the fault that latched it (chained as the refusal's Cause). Both are guarded by
 	// loopsMu — the same lock that gates closing and the NewLoop registration check —
 	// so a fault and a NewLoop can never interleave incorrectly.
-	faulted  bool
-	faultErr error
+	faulted           bool
+	faultErr          error
+	workspaceFaulted  bool
+	workspaceFaultErr error
 
 	// limits are the in-session subagent-spawn safety caps NewLoop enforces (depth +
 	// quota). Defaulted in newSession (withDefaults) so the live values are always
@@ -205,6 +207,12 @@ type Session struct {
 	// (watchRootLease) faults the session and interrupts live loops when it closes, so
 	// admission closes and in-flight loops/checkpoints are torn down on ownership loss.
 	wsLeaseLost <-chan struct{}
+
+	// snapshotPolicy is the validated rig policy captured before construction;
+	// checkpoints is the per-session native boundary controller built after the hub.
+	snapshotPolicy      *checkpointPolicy
+	checkpoints         *checkpointController
+	checkpointAdmission *checkpointAdmissionGate
 
 	// ceiling is the session's live SECURITY-CEILING ordinal source (SPEC §8/§10.2): the
 	// clamp SetSecurityCeiling mutates and CeilingSource exposes. It is default-minted at
@@ -415,7 +423,25 @@ func (s *Session) faultIfFaulted() error {
 	if s.faulted {
 		return &SessionError{Kind: SessionFaulted, Cause: s.faultErr}
 	}
+	if s.workspaceFaulted {
+		return &SessionError{Kind: SessionFaulted, Cause: s.workspaceFaultErr}
+	}
 	return nil
+}
+
+func (s *Session) latchWorkspaceCheckpointFault(err error) {
+	s.loopsMu.Lock()
+	s.workspaceFaulted = true
+	s.workspaceFaultErr = err
+	s.loopsMu.Unlock()
+	s.hub.FailWaiters(err)
+}
+
+func (s *Session) recoverWorkspaceCheckpointFault() {
+	s.loopsMu.Lock()
+	s.workspaceFaulted = false
+	s.workspaceFaultErr = nil
+	s.loopsMu.Unlock()
 }
 
 // FaultErr is the loop actor's post-emit durable-fault probe (loopruntime type-asserts the
@@ -451,6 +477,42 @@ func (s *Session) PublishEventChecked(ctx context.Context, ev event.Event) error
 	}
 	s.recordLoopMechanicalState(ev)
 	return nil
+}
+
+// CommitBoundary is the native loop-actor boundary seam. Without a configured
+// workspace policy it preserves ordinary publication; with one it delegates the
+// already-stamped StepDone/turn terminal to the session checkpoint controller.
+func (s *Session) CommitBoundary(ctx context.Context, ev event.Event) error {
+	if s.checkpoints == nil {
+		return s.PublishEventChecked(ctx, ev)
+	}
+	return s.checkpoints.boundary(ctx, ev)
+}
+
+// CommitSessionIdle is the hub's narrow derived-idle collaborator. The hub retains
+// append/fanout ownership in commit; the controller brackets it with the workspace
+// permit and accepted checkpoint walk when idle is the configured trigger.
+func (s *Session) CommitSessionIdle(ctx context.Context, idle event.SessionIdle, commit func() error) error {
+	if s.checkpoints == nil {
+		return commit()
+	}
+	return s.checkpoints.sessionIdle(ctx, idle, commit)
+}
+
+// SessionActivated lets the hub cancel an active best-effort quiescent walk before
+// newly active work proceeds. Required and shared-fuzzy policies ignore activation.
+func (s *Session) SessionActivated() {
+	if s.checkpoints != nil {
+		s.checkpoints.activated()
+	}
+}
+
+// EnterExecution is the loop actor's session-wide next-step admission seam.
+func (s *Session) EnterExecution(ctx context.Context) (func(), error) {
+	if s.checkpointAdmission == nil {
+		return func() {}, nil
+	}
+	return s.checkpointAdmission.enterExecution(ctx)
 }
 
 func (s *Session) recordLoopMechanicalState(ev event.Event) {
@@ -701,6 +763,11 @@ func (s *Session) newLoopWithAdmission(parent loop.Provenance, cfg loop.Definiti
 	s.loopsMu.Lock()
 	if s.faulted {
 		fe := s.faultErr
+		s.loopsMu.Unlock()
+		return uuid.UUID{}, &SessionError{Kind: SessionFaulted, Cause: fe}
+	}
+	if s.workspaceFaulted {
+		fe := s.workspaceFaultErr
 		s.loopsMu.Unlock()
 		return uuid.UUID{}, &SessionError{Kind: SessionFaulted, Cause: fe}
 	}
@@ -1090,9 +1157,10 @@ func newSessionTopology(ctx context.Context, topology Topology, newID idGenerato
 		cmdAppender: nopCommandAppender{},
 		// Gate directory: nop appender + empty directory by default; the composition
 		// root wires the real journal+hub adapter via WithGateAppender.
-		gates:        map[gate.ID]gateEntry{},
-		gateTimers:   map[gate.ID]*time.Timer{},
-		gateAppender: nopGateAppender{},
+		gates:               map[gate.ID]gateEntry{},
+		gateTimers:          map[gate.ID]*time.Timer{},
+		gateAppender:        nopGateAppender{},
+		checkpointAdmission: newCheckpointAdmissionGate(),
 	}
 	// Apply optional dependency injections (e.g. WithCommandAppender, WithEventAppender)
 	// before any command can be dispatched or the hub is built, so an injected appender is
@@ -1143,6 +1211,16 @@ func newSessionTopology(ctx context.Context, topology Topology, newID idGenerato
 		hubOpts = append(hubOpts, hub.WithAppender(s.injectedEventAppender))
 	}
 	s.hub = hub.New(id, hubOpts...)
+	if s.snapshotPolicy != nil && s.ws != nil && s.wsCoordinator != nil {
+		s.checkpoints = newCheckpointController(checkpointControllerConfig{
+			SessionID: id, Policy: *s.snapshotPolicy, Store: s.ws, Root: s.wsRoot,
+			Mode: s.wsMode, Coordinator: s.wsCoordinator, Publisher: s, Factory: s.factory,
+			Idle:  s.hub.IsIdle,
+			Fault: s.latchWorkspaceCheckpointFault, Recover: s.recoverWorkspaceCheckpointFault,
+			Faulted:   s.faultIfFaulted,
+			Admission: s.checkpointAdmission.enterCheckpoint,
+		})
+	}
 
 	// SessionStarted is an Enduring, session-scoped event: stamp it with a minted
 	// EventID + CreatedAt so the journal sees a stable idempotency key and creation
@@ -1653,6 +1731,12 @@ func (s *Session) Shutdown(ctx context.Context) error {
 	}
 	s.loopsMu.Unlock()
 	s.activeMu.Unlock()
+	// Stop automatic/manual checkpoint activity before any loop drain or lease release.
+	// In-flight operations observe the controller cancellation and release their workspace
+	// permit before the root/session lease defers run below.
+	if s.checkpoints != nil {
+		s.checkpoints.shutdown()
+	}
 
 	// (2) Flip the session phase to stopped after the snapshot, before the sends.
 	s.hub.StopSession(ctx)

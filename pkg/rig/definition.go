@@ -21,7 +21,8 @@ type definitionState struct {
 	fingerprintFields ConfigFingerprintFields
 	// placements accumulates every workspace placement option. Define enforces at most
 	// one; more than one is a typed rejection.
-	placements []pendingPlacement
+	placements     []pendingPlacement
+	snapshotPolicy *SnapshotPolicy
 }
 
 // Rig is an immutable design-time assembly that creates and restores sessions.
@@ -109,6 +110,15 @@ func Define(options ...Option) (*Rig, error) {
 	if !placement.Configured() && requiresWorkspaceTool(state.loops) {
 		return nil, &WorkspacePlacementError{Kind: WorkspaceToolWithoutPlacement}
 	}
+	if placement.Configured() && state.snapshotPolicy == nil {
+		return nil, &SnapshotPolicyError{Kind: SnapshotPolicyRequired}
+	}
+	if !placement.Configured() && state.snapshotPolicy != nil {
+		return nil, &SnapshotPolicyError{Kind: SnapshotPolicyWithoutWorkspace}
+	}
+	if placement.Mode == sessionruntime.PlacementShared && state.snapshotPolicy != nil && state.snapshotPolicy.Priority == SnapshotRequired {
+		return nil, &SnapshotPolicyError{Kind: SnapshotPolicySharedRequired}
+	}
 	if placement.Configured() {
 		if err := checkPersistenceOverlap(state.store, placement, region); err != nil {
 			return nil, err
@@ -127,6 +137,24 @@ func Define(options ...Option) (*Rig, error) {
 	lifecycleOptions := append([]sessionruntime.LifecycleOption(nil), state.lifecycleOptions...)
 	if placement.Configured() {
 		lifecycleOptions = append(lifecycleOptions, sessionruntime.WithLifecyclePlacement(placement))
+		policy := *state.snapshotPolicy
+		internalPolicy := sessionruntime.SnapshotPolicy{Timeout: policy.Timeout}
+		switch policy.Trigger {
+		case SnapshotManual:
+			internalPolicy.Trigger = sessionruntime.SnapshotManual
+		case SnapshotOnIdle:
+			internalPolicy.Trigger = sessionruntime.SnapshotOnIdle
+		case SnapshotOnTurnDone:
+			internalPolicy.Trigger = sessionruntime.SnapshotOnTurnDone
+		case SnapshotOnStepDone:
+			internalPolicy.Trigger = sessionruntime.SnapshotOnStepDone
+		}
+		if policy.Priority == SnapshotRequired {
+			internalPolicy.Priority = sessionruntime.SnapshotRequired
+		} else {
+			internalPolicy.Priority = sessionruntime.SnapshotBestEffort
+		}
+		lifecycleOptions = append(lifecycleOptions, sessionruntime.WithLifecycleSnapshotPolicy(internalPolicy))
 	}
 	lifecycleOptions = append(lifecycleOptions, sessionruntime.WithLifecycleFingerprintProvider(provider))
 	primerNames := make([]identity.AgentName, len(state.primers))

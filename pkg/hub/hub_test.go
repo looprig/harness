@@ -7,9 +7,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/identity"
-	"github.com/looprig/core/uuid"
 )
 
 // allFilter delivers every event from every loop in both classes.
@@ -740,6 +740,111 @@ func TestWaitIdleAlreadyIdle(t *testing.T) {
 	cancel()
 	if err := <-waitErr; !errors.Is(err, context.Canceled) {
 		t.Fatalf("WaitIdle after ctx cancel = %v, want context.Canceled", err)
+	}
+}
+
+type blockingIdleBoundary struct {
+	entered chan event.SessionIdle
+	release chan struct{}
+}
+
+func (b *blockingIdleBoundary) CommitSessionIdle(ctx context.Context, idle event.SessionIdle, publish func() error) error {
+	b.entered <- idle
+	select {
+	case <-b.release:
+		return publish()
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func TestWaitIdleBlocksThroughNativeSnapshotBoundary(t *testing.T) {
+	t.Parallel()
+	session, _ := uuid.New()
+	loopA, _ := uuid.New()
+	boundary := &blockingIdleBoundary{entered: make(chan event.SessionIdle, 1), release: make(chan struct{})}
+	h := New(session, withSessionIdleBoundary(boundary))
+	if err := h.PublishEvent(context.Background(), event.TurnStarted{Header: event.Header{Coordinates: identity.Coordinates{SessionID: session, LoopID: loopA}}}); err != nil {
+		t.Fatal(err)
+	}
+	published := make(chan error, 1)
+	go func() {
+		published <- h.PublishEvent(context.Background(), event.LoopIdle{Header: event.Header{Coordinates: identity.Coordinates{SessionID: session, LoopID: loopA}}})
+	}()
+	select {
+	case <-boundary.entered:
+	case <-time.After(time.Second):
+		t.Fatal("idle boundary not entered")
+	}
+	waited := make(chan error, 1)
+	go func() { waited <- h.WaitIdle(context.Background()) }()
+	select {
+	case err := <-waited:
+		t.Fatalf("WaitIdle returned before idle boundary commit: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(boundary.release)
+	if err := <-published; err != nil {
+		t.Fatalf("PublishEvent(LoopIdle): %v", err)
+	}
+	if err := <-waited; err != nil {
+		t.Fatalf("WaitIdle after boundary: %v", err)
+	}
+}
+
+type sequencedIdleBoundary struct{ entered chan chan struct{} }
+
+func (b *sequencedIdleBoundary) CommitSessionIdle(ctx context.Context, _ event.SessionIdle, publish func() error) error {
+	release := make(chan struct{})
+	b.entered <- release
+	select {
+	case <-release:
+		return publish()
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func TestWaitIdleUsesLatestOverlappingIdleBoundaryGeneration(t *testing.T) {
+	t.Parallel()
+	sid, _ := uuid.New()
+	lid, _ := uuid.New()
+	boundary := &sequencedIdleBoundary{entered: make(chan chan struct{}, 2)}
+	h := New(sid, withSessionIdleBoundary(boundary))
+	start := func() {
+		if err := h.PublishEvent(context.Background(), event.TurnStarted{Header: event.Header{Coordinates: identity.Coordinates{SessionID: sid, LoopID: lid}}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	start()
+	firstDone := make(chan error, 1)
+	go func() {
+		firstDone <- h.PublishEvent(context.Background(), event.LoopIdle{Header: event.Header{Coordinates: identity.Coordinates{SessionID: sid, LoopID: lid}}})
+	}()
+	firstRelease := <-boundary.entered
+	start()
+	secondDone := make(chan error, 1)
+	go func() {
+		secondDone <- h.PublishEvent(context.Background(), event.LoopIdle{Header: event.Header{Coordinates: identity.Coordinates{SessionID: sid, LoopID: lid}}})
+	}()
+	secondRelease := <-boundary.entered
+	waited := make(chan error, 1)
+	go func() { waited <- h.WaitIdle(context.Background()) }()
+	close(firstRelease)
+	if err := <-firstDone; err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-waited:
+		t.Fatalf("WaitIdle returned after stale first boundary while second pending: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(secondRelease)
+	if err := <-secondDone; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-waited; err != nil {
+		t.Fatal(err)
 	}
 }
 

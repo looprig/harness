@@ -182,6 +182,15 @@ func WithLifecycleWorkspaceStore(ws *workspacestore.Store, root string) Lifecycl
 	}
 }
 
+// WithLifecycleSnapshotPolicy captures the validated native checkpoint policy and
+// forwards it to every new/restored session. Rig enforces that it is paired with a
+// managed placement.
+func WithLifecycleSnapshotPolicy(policy SnapshotPolicy) LifecycleOption {
+	return func(r *Lifecycle) {
+		r.baseOpts = append(r.baseOpts, WithSnapshotPolicy(policy))
+	}
+}
+
 // WithLifecycleForeignBuilder captures the composition-root seams that construct foreign-
 // engine loops (live + restored). Either seam being nil leaves foreign engines unsupported,
 // so both are captured together. Forwarded to both NewSession and RestoreSession as WithForeignBuilder.

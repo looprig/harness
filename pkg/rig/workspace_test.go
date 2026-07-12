@@ -86,19 +86,19 @@ func TestDefinePlacementMatrix(t *testing.T) {
 		{
 			name: "single exclusive placement is valid",
 			options: func(t *testing.T, root string) []Option {
-				return []Option{WithExclusiveWorkspace(wsStoreT(t), root, memstore.New())}
+				return []Option{WithExclusiveWorkspace(wsStoreT(t), root, memstore.New()), WithSnapshots(SnapshotPolicy{})}
 			},
 		},
 		{
 			name: "single per-session placement is valid",
 			options: func(t *testing.T, root string) []Option {
-				return []Option{WithSessionWorkspaces(wsStoreT(t), root)}
+				return []Option{WithSessionWorkspaces(wsStoreT(t), root), WithSnapshots(SnapshotPolicy{})}
 			},
 		},
 		{
 			name: "single shared placement is valid",
 			options: func(t *testing.T, root string) []Option {
-				return []Option{WithSharedWorkspace(wsStoreT(t), root)}
+				return []Option{WithSharedWorkspace(wsStoreT(t), root), WithSnapshots(SnapshotPolicy{})}
 			},
 		},
 		{
@@ -182,7 +182,7 @@ func TestDefineWorkspaceToolWithoutPlacement(t *testing.T) {
 		loop.WithInference(&stubLLM{}, validModel("planner")),
 		loop.WithTools(wsRequiringTool()),
 	)
-	if _, err := Define(WithLoops(d2), WithPrimers("planner"), WithSessionStore(store2), WithSharedWorkspace(wsStoreT(t), t.TempDir())); err != nil {
+	if _, err := Define(WithLoops(d2), WithPrimers("planner"), WithSessionStore(store2), WithSharedWorkspace(wsStoreT(t), t.TempDir()), WithSnapshots(SnapshotPolicy{})); err != nil {
 		t.Fatalf("Define() with placement err = %v, want nil", err)
 	}
 }
@@ -207,7 +207,7 @@ func TestDefinePersistenceOverlap(t *testing.T) {
 			parent := t.TempDir()
 			root := filepath.Join(parent, "project")
 			ws := wsStoreT(t, workspacestore.WithSpoolDir(tt.spool(root)))
-			_, err := defineWith(t, sessionStoreT(t), WithSharedWorkspace(ws, root))
+			_, err := defineWith(t, sessionStoreT(t), WithSharedWorkspace(ws, root), WithSnapshots(SnapshotPolicy{}))
 			if (err != nil) != tt.wantErr {
 				t.Fatalf("Define() err = %v, wantErr %v", err, tt.wantErr)
 			}

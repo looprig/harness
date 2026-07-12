@@ -200,6 +200,13 @@ func WithWorkspaceStore(ws *workspacestore.Store, root string) Option {
 	}
 }
 
+// WithSnapshotPolicy carries the already-validated rig policy into one session.
+// It is meaningful only with a managed placement; rig enforces that pairing.
+func WithSnapshotPolicy(policy SnapshotPolicy) Option {
+	resolved := policy.internal()
+	return func(s *Session) { s.snapshotPolicy = &resolved }
+}
+
 // withResolvedPlacement installs a resolved managed-workspace placement: the workspace
 // store + root, the ONE session-scoped mutation coordinator every loop's tools serialize
 // through, the exclusive root-lease release hook (nil for non-leased modes), and the

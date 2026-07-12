@@ -37,6 +37,31 @@ func (nopEventAppender) AppendEvent(context.Context, event.Event) (uint64, error
 // (hub.New(id)) working while the composition root injects the durable trio.
 type Option func(*Hub)
 
+// sessionIdleBoundary is the narrow internal collaborator around a derived idle edge.
+// The hub discovers it structurally from its already-injected FaultReporter, so no public
+// hook/subscriber/watcher API is exposed.
+type sessionIdleBoundary interface {
+	CommitSessionIdle(context.Context, event.SessionIdle, func() error) error
+}
+
+type sessionActivationObserver interface{ SessionActivated() }
+
+type immediateSessionIdleBoundary struct{}
+
+func (immediateSessionIdleBoundary) CommitSessionIdle(_ context.Context, _ event.SessionIdle, commit func() error) error {
+	return commit()
+}
+
+// withSessionIdleBoundary is package-private and exists only for focused hub tests. Live
+// composition discovers the session capability from FaultReporter in New.
+func withSessionIdleBoundary(boundary sessionIdleBoundary) Option {
+	return func(h *Hub) {
+		if boundary != nil {
+			h.idleBoundary = boundary
+		}
+	}
+}
+
 // WithAppender injects the durable event appender (the composition root's adapter over
 // SessionJournal). A nil appender is ignored (the nop default stays installed) so a
 // caller can never accidentally null out the field and skip the nil-safe publish path.
