@@ -17,6 +17,7 @@ import (
 	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/harness/pkg/tool"
 	"github.com/looprig/harness/pkg/workspacestore"
+	"github.com/looprig/inference"
 	"github.com/looprig/storage"
 	"github.com/looprig/storage/memstore"
 )
@@ -62,6 +63,22 @@ type failFirstPutBlobs struct {
 	mu     sync.Mutex
 	err    error
 	failed bool
+}
+
+type panickingRuntimeContext struct{}
+
+func (panickingRuntimeContext) Blocks(context.Context) []content.Block {
+	panic("runtime context panic")
+}
+
+type panickingInference struct{}
+
+func (panickingInference) Invoke(context.Context, inference.Request) (*inference.Response, error) {
+	panic("inference invoke panic")
+}
+
+func (panickingInference) Stream(context.Context, inference.Request) (*inference.StreamReader[content.Chunk], error) {
+	panic("inference stream panic")
 }
 
 func (b *failFirstPutBlobs) Put(ctx context.Context, key string, r io.Reader) error {
@@ -1281,6 +1298,67 @@ func TestRequiredCheckpointFaultRejectsQueuedWorkAcrossLoopsUntilManualRecovery(
 			t.Fatal("post-recovery command did not start")
 		}
 		time.Sleep(time.Millisecond)
+	}
+}
+
+func TestTurnPanicReleasesFirstAdmissionForRequiredManualCheckpoint(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		client  inference.Client
+		runtime loop.RuntimeContextProvider
+	}{
+		{name: "runtime context provider", client: &stubLLM{chunks: []content.Chunk{textChunk("unused")}}, runtime: panickingRuntimeContext{}},
+		{name: "inference client", client: panickingInference{}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			ws, root := checkpointFixture(t, nil)
+			recorder := &recordingEventAppender{}
+			opts := []loop.Option{
+				loop.WithName("panic-agent"),
+				loop.WithInference(tt.client, validModel("panic-model")),
+				loop.WithDrainTimeout(100 * time.Millisecond),
+			}
+			if tt.runtime != nil {
+				opts = append(opts, loop.WithRuntimeContext(tt.runtime), loop.WithPolicyRevision("panic-runtime-context"))
+			}
+			definition := mustDefine(opts...)
+			s, err := newTestSession(context.Background(), definition,
+				WithEventAppender(recorder),
+				withResolvedPlacement(&resolvedPlacement{mode: PlacementSession, store: ws, root: root, coordinator: newWorkspaceCoordinator(nil)}),
+				WithSnapshotPolicy(SnapshotPolicy{Trigger: SnapshotManual, Priority: SnapshotRequired, Timeout: 50 * time.Millisecond}),
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = s.Shutdown(context.Background()) })
+			if _, err := s.Submit(context.Background(), nil); err != nil {
+				t.Fatal(err)
+			}
+
+			deadline := time.Now().Add(time.Second)
+			for {
+				failed := false
+				for _, ev := range recorder.snapshot() {
+					if _, ok := ev.(event.TurnFailed); ok {
+						failed = true
+						break
+					}
+				}
+				if failed {
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Fatal("turn panic did not emit TurnFailed")
+				}
+				time.Sleep(time.Millisecond)
+			}
+
+			checkpointCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			if _, err := s.CheckpointWorkspace(checkpointCtx); err != nil {
+				t.Fatalf("required manual checkpoint after TurnFailed: %v", err)
+			}
+		})
 	}
 }
 

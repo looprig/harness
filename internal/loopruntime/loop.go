@@ -792,6 +792,16 @@ func runLoop(cfg loopConfig, state loopState) {
 	// starts nothing (the caller decides how to surface it). The actor is the sole
 	// caller, so it always runs with state.status idle.
 	startTurnWithIDAndAdmission := func(turnID uuid.UUID, qi queuedInput, firstAdmission func()) uuid.UUID {
+		firstLease := newAdmissionLease(firstAdmission)
+		launched := false
+		defer func() {
+			if !launched {
+				firstLease.Release()
+			}
+		}()
+		if firstLease != nil {
+			firstAdmission = firstLease.Release
+		}
 		turnCtx, base := installActiveTurn(turnID, qi)
 		idx := state.turnIndex
 		ts := newTurnState(state.sessionID, state.id, turnID, idx, state.causationID, qi.msg)
@@ -800,6 +810,10 @@ func runLoop(cfg loopConfig, state loopState) {
 
 		go func() {
 			defer cancel()
+			// Own the transferred first-step permit before any panic-capable turn work.
+			// runStep releases it at inference completion; this is the panic/early-return
+			// backstop, and admissionLease makes the two paths exactly-once.
+			defer firstLease.Release()
 			defer func() {
 				if r := recover(); r != nil {
 					slog.Error("turn goroutine panicked", "panic", r)
@@ -811,6 +825,7 @@ func runLoop(cfg loopConfig, state loopState) {
 			terminal := runTurn(turnCtx, turnCfg, ts)
 			internal <- turnResult{terminal: terminal}
 		}()
+		launched = true
 		return turnID
 	}
 	startTurnWithID := func(turnID uuid.UUID, qi queuedInput) uuid.UUID {

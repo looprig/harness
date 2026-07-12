@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"sync"
 
 	"github.com/looprig/core/content"
 	"github.com/looprig/core/uuid"
@@ -155,6 +156,41 @@ type turnIdentity struct {
 	turnID    uuid.UUID
 }
 
+// admissionLease makes execution-admission ownership explicit and idempotent across
+// the actor-to-turn handoff and panic recovery. Release may be called by both the
+// per-step guard and the turn-goroutine backstop; the underlying permit is released
+// exactly once.
+type admissionLease struct {
+	once    sync.Once
+	release func()
+}
+
+func newAdmissionLease(release func()) *admissionLease {
+	if release == nil {
+		return nil
+	}
+	return &admissionLease{release: release}
+}
+
+func (l *admissionLease) Release() {
+	if l == nil {
+		return
+	}
+	l.once.Do(l.release)
+}
+
+func runStepWithAdmission(
+	ctx context.Context,
+	cfg stepConfig,
+	turnIndex event.TurnIndex,
+	st stepState,
+	release func(),
+) stepResult {
+	lease := newAdmissionLease(release)
+	defer lease.Release()
+	return runStep(ctx, cfg, turnIndex, st)
+}
+
 // runTurn drives the agentic loop for one user turn. It runs one step (one LLM
 // request/response cycle → exactly one AIMessage) per iteration, executes that
 // step's tool batch (appending the ToolResultMessages to the same step), and
@@ -228,8 +264,7 @@ func runTurn(ctx context.Context, cfg turnConfig, ts turnState) event.Event {
 			}
 		}
 		// runStep owns the LLM cycle: stream → exactly one AIMessage into st.msgs[0].
-		res := runStep(ctx, stepConfig{req: req, client: cfg.client, emit: cfg.emit}, ts.index, st)
-		releaseAdmission()
+		res := runStepWithAdmission(ctx, stepConfig{req: req, client: cfg.client, emit: cfg.emit}, ts.index, st, releaseAdmission)
 		if res.terminal != nil {
 			// The in-flight step never completed: discard it (it was never added to
 			// ts.msgs and never committed) and return the terminal. Committed steps

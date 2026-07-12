@@ -32,6 +32,25 @@ type gatedFirstInference struct {
 	calls   atomic.Int32
 }
 
+type panickingBoundaryInference struct{}
+
+func (panickingBoundaryInference) Invoke(context.Context, inference.Request) (*inference.Response, error) {
+	panic("inference invoke panic")
+}
+
+func (panickingBoundaryInference) Stream(context.Context, inference.Request) (*inference.StreamReader[content.Chunk], error) {
+	panic("inference stream panic")
+}
+
+type countingAdmission struct {
+	recordingPublisher
+	releases atomic.Int32
+}
+
+func (a *countingAdmission) EnterExecution(context.Context) (func(), error) {
+	return func() { a.releases.Add(1) }, nil
+}
+
 func (g *gatedFirstInference) Invoke(context.Context, inference.Request) (*inference.Response, error) {
 	return nil, errors.New("Invoke not used")
 }
@@ -136,6 +155,44 @@ func TestNativeCheckpointBoundaryBlocksStepAndTurnAcknowledgement(t *testing.T) 
 		t.Fatalf("second boundary = %T, want TurnDone", terminal)
 	}
 	b.release <- struct{}{}
+}
+
+func TestPanickingInferenceReleasesTransferredAdmissionExactlyOnce(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	admission := &countingAdmission{}
+	l, err := newWithConfig(ctx, mustID(t), mustID(t), Provenance{}, admission, runtimeConfig{
+		Client: panickingBoundaryInference{}, Model: testModel(), DrainTimeout: 200 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case l.Commands <- command.UserInput{Header: command.Header{CommandID: mustID(t), CreatedAt: time.Now()}}:
+	case <-time.After(time.Second):
+		t.Fatal("submit blocked")
+	}
+	deadline := time.Now().Add(time.Second)
+	for {
+		failed := false
+		for _, ev := range admission.events() {
+			if _, ok := ev.(event.TurnFailed); ok {
+				failed = true
+				break
+			}
+		}
+		if failed {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("panic did not emit TurnFailed")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if got := admission.releases.Load(); got != 1 {
+		t.Fatalf("admission releases = %d, want exactly 1", got)
+	}
 }
 
 func TestNativeCheckpointAdmissionBlocksNextInferenceStep(t *testing.T) {
