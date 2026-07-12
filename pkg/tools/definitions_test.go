@@ -71,11 +71,18 @@ func TestDefinitionBlueprints(t *testing.T) {
 				if !ok || read.guard != guard || read.root != "/workspace" {
 					t.Fatalf("first tool = %#v, want workspace-bound *ReadFile", built[0])
 				}
-				if write, ok := built[1].(*WriteFile); !ok || write.root != "/workspace" {
+				write, ok := built[1].(*WriteFile)
+				if !ok || write.root != "/workspace" {
 					t.Fatalf("second tool = %#v, want workspace-bound *WriteFile", built[1])
 				}
-				if edit, ok := built[2].(*EditFile); !ok || edit.root != "/workspace" {
+				edit, ok := built[2].(*EditFile)
+				if !ok || edit.root != "/workspace" {
 					t.Fatalf("third tool = %#v, want workspace-bound *EditFile", built[2])
+				}
+				// All three tools of ONE binding share ONE observation map, so a
+				// ReadFile authorizes the same loop's WriteFile/EditFile.
+				if read.obs == nil || read.obs != write.obs || read.obs != edit.obs {
+					t.Fatalf("Files tools do not share one observation map: read=%p write=%p edit=%p", read.obs, write.obs, edit.obs)
 				}
 			},
 		},

@@ -21,7 +21,7 @@ func runReadFile(t *testing.T, root string, guard loop.ReadGuard, args map[strin
 	if err != nil {
 		t.Fatalf("marshal args: %v", err)
 	}
-	rf := NewReadFile(root, guard)
+	rf := NewReadFile(root, guard, newFileObservations())
 	res, err := rf.InvokableRun(context.Background(), string(b))
 	if err != nil {
 		t.Fatalf("InvokableRun returned a Go error %v; read tools return tool-result strings", err)
@@ -38,7 +38,7 @@ func runReadFile(t *testing.T, root string, guard loop.ReadGuard, args map[strin
 
 func TestReadFileInfo(t *testing.T) {
 	t.Parallel()
-	rf := NewReadFile(t.TempDir(), newFakeReadGuard(1<<20))
+	rf := NewReadFile(t.TempDir(), newFakeReadGuard(1<<20), newFileObservations())
 	info, err := rf.Info(context.Background())
 	if err != nil {
 		t.Fatalf("Info() error = %v", err)
@@ -208,7 +208,7 @@ func TestReadFileHonorsEnvDenyGuard(t *testing.T) {
 
 func TestReadFileAuditSummary(t *testing.T) {
 	t.Parallel()
-	rf := NewReadFile(t.TempDir(), newFakeReadGuard(1<<20))
+	rf := NewReadFile(t.TempDir(), newFakeReadGuard(1<<20), newFileObservations())
 	summary := rf.AuditSummary(`{"path":"sub/dir/file.go"}`)
 	if !strings.Contains(summary, "sub/dir/file.go") {
 		t.Errorf("AuditSummary = %q, want it to name the path", summary)
@@ -219,7 +219,7 @@ func TestReadFileAuditSummary(t *testing.T) {
 // AutoApprove). It MUST implement Auditable.
 func TestReadFileCapabilities(t *testing.T) {
 	t.Parallel()
-	var it tool.InvokableTool = NewReadFile(t.TempDir(), newFakeReadGuard(1<<20))
+	var it tool.InvokableTool = NewReadFile(t.TempDir(), newFakeReadGuard(1<<20), newFileObservations())
 	if _, ok := it.(tool.PermissionPrompter); ok {
 		t.Error("ReadFile must not implement PermissionPrompter (AutoApprove)")
 	}

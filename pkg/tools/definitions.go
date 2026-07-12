@@ -16,10 +16,15 @@ func Files(readGuard loop.ReadGuard) tool.Definition {
 			return nil, &DefinitionBuildError{Definition: "Files", Dependency: "read_guard"}
 		}
 		root := bindings.Workspace.Root
+		// One private observation map per binding (per primer/delegate/restored
+		// loop), shared across this loop's ReadFile/WriteFile/EditFile so a complete
+		// read authorizes a subsequent same-path mutation. A fresh Build gets a fresh
+		// map: two loops never share observations, and a restored loop starts empty.
+		obs := newFileObservations()
 		return []tool.InvokableTool{
-			NewReadFile(root, readGuard),
-			NewWriteFile(root),
-			NewEditFile(root),
+			NewReadFile(root, readGuard, obs),
+			NewWriteFile(root, obs),
+			NewEditFile(root, obs),
 		}, nil
 	})
 }

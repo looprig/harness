@@ -2,6 +2,7 @@ package tools
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"io"
@@ -66,15 +67,20 @@ type editFileArgs struct {
 	ReplaceAll bool   `json:"replace_all"`
 }
 
-// EditFile edits a workspace-contained file by exact-string replacement. It
-// depends only on the workspace root (least privilege).
+// EditFile edits a workspace-contained file by exact-string replacement under the
+// loop's optimistic-concurrency policy. It depends only on the workspace root
+// (least privilege) and the loop's shared observation map: an edit requires a
+// complete prior read of this path whose hash still equals the file's current
+// on-disk hash.
 type EditFile struct {
 	root string
+	obs  *fileObservations
 }
 
-// NewEditFile constructs an EditFile bound to the workspace root.
-func NewEditFile(root string) *EditFile {
-	return &EditFile{root: root}
+// NewEditFile constructs an EditFile bound to the workspace root and the loop's
+// shared observation map (supplied by Files, one per loop binding).
+func NewEditFile(root string, obs *fileObservations) *EditFile {
+	return &EditFile{root: root, obs: obs}
 }
 
 // Info returns EditFile's self-description. Name MUST equal "EditFile".
@@ -153,33 +159,76 @@ func (e *EditFile) InvokableRun(_ context.Context, argsJSON string) (*tool.ToolR
 
 	// Stage 1: containment (symlink-aware). Proves the symlink-RESOLVED target is
 	// inside the workspace; an escape (including an in-workspace symlink pointing
-	// OUT) is rejected here. We discard the resolved path: the actual read/write
-	// below operate on the LEXICAL joined path (see below).
-	if _, err := containedPath(e.root, a.Path); err != nil {
+	// OUT) is rejected here. The resolved path is the CANONICAL observation key.
+	abs, err := containedPath(e.root, a.Path)
+	if err != nil {
 		return tool.TextResult("error: path is outside the workspace: " + a.Path), nil
 	}
 
-	// Stage 2: read and write the LEXICALLY-joined path (NOT the symlink-resolved
-	// form), mirroring ReadFile: the O_NOFOLLOW read below rejects a
-	// final-component symlink rather than following it, and the atomic write
-	// targets the same lexical name so it REPLACES a final-component symlink with
-	// a regular file rather than following it to clobber the symlink's target.
-	lexical := joinedUnderRoot(e.root, a.Path)
-
-	original, err := e.readForEdit(lexical)
+	// Stage 2: commit under the path's optimistic-concurrency critical section. The
+	// read/write below operate on the LEXICAL joined path (NOT the symlink-resolved
+	// form), mirroring ReadFile: the O_NOFOLLOW read rejects a final-component
+	// symlink rather than following it, and the atomic write targets the same
+	// lexical name so it REPLACES a final-component symlink rather than following it.
+	preview, err := e.commit(canonicalObservationKey(abs), joinedUnderRoot(e.root, a.Path), a.Path, a.Old, a.New, a.ReplaceAll)
 	if err != nil {
 		return tool.TextResult("error: " + err.Error()), nil
 	}
+	return tool.TextResult(preview), nil
+}
 
-	updated, errMsg := applyReplacement(original, a.Old, a.New, a.ReplaceAll)
+// commit performs the optimistic-concurrency edit for one path while holding that
+// path's critical section: it reads the current content ONCE (that same read yields
+// both the bytes to edit and the hash to compare), refuses with StaleFileError if
+// this loop lacks a complete observation whose hash equals the current on-disk hash,
+// applies the occurrence-rule replacement (an anchor miss is a DISTINCT
+// editAnchorError, not a freshness conflict), publishes atomically, and records the
+// new content's hash. lexical is the on-disk target; display is the model-supplied
+// path used in messages and the diff header.
+func (e *EditFile) commit(key canonicalObservationKey, lexical, display, old, replacement string, replaceAll bool) (string, error) {
+	st := e.obs.state(key)
+	st.mu.Lock()
+	defer st.mu.Unlock()
+
+	// Cheap classify first (a single Lstat, no content read). An absent target is an
+	// honest "file not found" (there is nothing to edit, and "read again" would
+	// dead-end); a symlink/non-regular target is refused with the DISTINCT
+	// IrregularFileError (re-reading it via ReadFile also fails O_NOFOLLOW, so
+	// "read again" would dead-end there too).
+	switch classifyWriteTarget(lexical) {
+	case writeTargetAbsent:
+		return "", &writeFileError{reason: "file not found"}
+	case writeTargetIrregular:
+		st.clearLocked()
+		return "", &IrregularFileError{Path: display}
+	}
+
+	// writeTargetRegular. Read the file ONCE (that same read yields both the bytes to
+	// edit and the hash to compare); the read is bounded by maxEditFileBytes, and a
+	// read failure (too-large, or a race to symlink/absent since the classify) is
+	// returned as-is — it is not an optimistic-concurrency conflict, so it must not
+	// masquerade as a StaleFileError telling the model to "read again".
+	original, rerr := e.readForEdit(lexical)
+	if rerr != nil {
+		return "", rerr
+	}
+
+	// Freshness: the edit is authorized only if this loop completely observed the
+	// file and its recorded hash still equals the current on-disk content.
+	if curHash := sha256.Sum256([]byte(original)); !st.observed || !st.obs.present || st.obs.hash != curHash {
+		st.clearLocked()
+		return "", &StaleFileError{Path: display}
+	}
+
+	updated, errMsg := applyReplacement(original, old, replacement, replaceAll)
 	if errMsg != "" {
-		return tool.TextResult("error: " + errMsg), nil
+		return "", &editAnchorError{message: errMsg}
 	}
-
 	if err := atomicWriteFile(lexical, []byte(updated)); err != nil {
-		return tool.TextResult("error: " + err.Error()), nil
+		return "", err
 	}
-	return tool.TextResult(diffPreview(a.Path, original, updated)), nil
+	st.setPresentLocked(sha256.Sum256([]byte(updated)))
+	return diffPreview(display, original, updated), nil
 }
 
 // readForEdit opens path O_RDONLY|O_NOFOLLOW (a final-component symlink fails to

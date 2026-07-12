@@ -12,14 +12,17 @@ import (
 	"github.com/looprig/harness/pkg/tool"
 )
 
-// runEditFile invokes EditFile and extracts the single text block.
-func runEditFile(t *testing.T, root string, args map[string]any) string {
+// runEditFile invokes EditFile (bound to the given per-loop observation map) and
+// extracts the single text block. Editing an existing file requires it to have been
+// observed first (observeFile), the faithful read-then-edit optimistic-concurrency
+// path.
+func runEditFile(t *testing.T, root string, obs *fileObservations, args map[string]any) string {
 	t.Helper()
 	b, err := json.Marshal(args)
 	if err != nil {
 		t.Fatalf("marshal args: %v", err)
 	}
-	res, err := NewEditFile(root).InvokableRun(context.Background(), string(b))
+	res, err := NewEditFile(root, obs).InvokableRun(context.Background(), string(b))
 	if err != nil {
 		t.Fatalf("InvokableRun returned a Go error %v; edit tool returns tool-result strings", err)
 	}
@@ -35,7 +38,7 @@ func runEditFile(t *testing.T, root string, args map[string]any) string {
 
 func TestEditFileInfo(t *testing.T) {
 	t.Parallel()
-	info, err := NewEditFile(t.TempDir()).Info(context.Background())
+	info, err := NewEditFile(t.TempDir(), newFileObservations()).Info(context.Background())
 	if err != nil {
 		t.Fatalf("Info() error = %v", err)
 	}
@@ -121,12 +124,15 @@ func TestEditFile(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			root := t.TempDir()
+			obs := newFileObservations()
 			if tt.seed != "" {
 				if err := os.WriteFile(filepath.Join(root, "f.txt"), []byte(tt.seed), 0o600); err != nil {
 					t.Fatalf("seed: %v", err)
 				}
+				// Observe the seeded file so the edit is authorized (read-then-edit).
+				observeFile(t, root, obs, "f.txt")
 			}
-			out := runEditFile(t, root, tt.args)
+			out := runEditFile(t, root, obs, tt.args)
 			gotErr := strings.HasPrefix(out, "error:")
 			if gotErr != tt.wantErr {
 				t.Fatalf("result = %q, wantErr = %v", out, tt.wantErr)
@@ -170,7 +176,7 @@ func TestEditFileSymlinkFinalComponentRejected(t *testing.T) {
 		t.Skipf("symlink unsupported: %v", err)
 	}
 
-	out := runEditFile(t, root, map[string]any{"path": "link.txt", "old": "bravo", "new": "BRAVO"})
+	out := runEditFile(t, root, newFileObservations(), map[string]any{"path": "link.txt", "old": "bravo", "new": "BRAVO"})
 	if !strings.HasPrefix(out, "error:") {
 		t.Fatalf("edit via final-component symlink = %q, want an error", out)
 	}
@@ -192,7 +198,9 @@ func TestEditFileDiffPreview(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(root, "f.txt"), []byte("one\ntwo\nthree\n"), 0o600); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
-	out := runEditFile(t, root, map[string]any{"path": "f.txt", "old": "two", "new": "TWO"})
+	obs := newFileObservations()
+	observeFile(t, root, obs, "f.txt")
+	out := runEditFile(t, root, obs, map[string]any{"path": "f.txt", "old": "two", "new": "TWO"})
 	for _, want := range []string{"--- a/f.txt", "+++ b/f.txt", "- two", "+ TWO"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("diff preview %q missing %q", out, want)
@@ -203,7 +211,7 @@ func TestEditFileDiffPreview(t *testing.T) {
 func TestEditFileWriteTarget(t *testing.T) {
 	t.Parallel()
 	root := t.TempDir()
-	ef := NewEditFile(root)
+	ef := NewEditFile(root, newFileObservations())
 	key, ok, err := ef.WriteTarget(`{"path":"sub/x.txt","old":"a","new":"b"}`)
 	if err != nil || !ok {
 		t.Fatalf("WriteTarget = (%q, %v, %v), want (path, true, nil)", key, ok, err)
@@ -220,7 +228,7 @@ func TestEditFileWriteTarget(t *testing.T) {
 func TestEditFileBuildRequest(t *testing.T) {
 	t.Parallel()
 	root := t.TempDir()
-	req, err := NewEditFile(root).BuildRequest(`{"path":"x.txt","old":"secret-old","new":"secret-new"}`, nil)
+	req, err := NewEditFile(root, newFileObservations()).BuildRequest(`{"path":"x.txt","old":"secret-old","new":"secret-new"}`, nil)
 	if err != nil {
 		t.Fatalf("BuildRequest err = %v", err)
 	}
@@ -238,7 +246,7 @@ func TestEditFileBuildRequest(t *testing.T) {
 
 func TestEditFileAuditSummary(t *testing.T) {
 	t.Parallel()
-	ef := NewEditFile(t.TempDir())
+	ef := NewEditFile(t.TempDir(), newFileObservations())
 	got := ef.AuditSummary(`{"path":"a/b.txt","old":"secret-old","new":"secret-new"}`)
 	if !strings.Contains(got, "a/b.txt") {
 		t.Errorf("AuditSummary = %q, want the path", got)
