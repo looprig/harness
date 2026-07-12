@@ -5,7 +5,21 @@
 **Last revised:** 2026-07-11 (separates cumulative usage from current context;
 adds model-aware counting, request limits, integer percentage thresholds, a
 compaction control lane, CAS-guarded full replacement, and the actor/turn reset
-protocol)
+protocol; folds two review rounds — `ModelKey` definition + owning packages, a
+counter trust boundary, per-waiter compaction replies, full-tuple replacement
+CAS, the terminal-response compaction path, bounded hustle aggregates, a
+self-contained foundation-types unit; then the `ContextCounterFunc` struct
+adapter (a bare func can't satisfy the capability-bearing interface), the
+a crash-consistent compaction outcome with lane-full rejection,
+turn-active-before-return terminal compaction ordering, the corrected
+subtract-margin-last limit formula, and `event.ModelRuntime` carrying resolved
+effort; then round three — one canonical `CompactionCommitted`/`CompactionRejected`
+event that is both product and outcome (folded as the reset) with deterministic
+`waiterReplyID` repair, import-cycle-safe ownership (`pkg/event` owns
+`ContextBasis`/`ContextMeasurement`/`ModelRuntime`/`HustleRunDescriptor`,
+`pkg/hustle` is a leaf), `InferenceCapability` + `CompatibleCounter` with the
+entire `CounterCapability` fingerprinted, and definition-bounded hustle
+aggregates)
 
 **Status:** Draft
 
@@ -69,7 +83,8 @@ needs an explicit actor/turn context-replacement protocol.
   exact context revision.
 - Count a complete `inference.Request`, never an isolated string. Direct
   provider counters live in `llm`; custom/gateway counters use an injected
-  `inference.ContextCountFunc` and declare their quality.
+  `inference.ContextCounterFunc` (bare func + declared `CounterCapability`) and
+  declare their quality and trust posture.
 - Derive the per-loop input limit from the current model's resolved context
   limits, requested output reservation, and safety margin.
 - Expose pressure as a percentage, represented deterministically as integer
@@ -282,6 +297,20 @@ type LoopTokenState struct {
 
 ### Complete-request counter
 
+`inference` owns the model identity used throughout counting and limits. It is a
+single canonical type; all counting, measurement, and limit structures reference
+it and never redefine it:
+
+```go
+// Package inference. Stable, secret-free identity of a resolved model: provider
+// namespace plus the provider's own model id. Not a display name, not a catalog
+// pointer, so replay/catalog repair never depends on a mutable external catalog.
+type ModelKey struct {
+	Provider string
+	Model    string
+}
+```
+
 `inference` defines the narrow optional capability and function adapter:
 
 ```go
@@ -291,7 +320,7 @@ const (
 	CountQualityUnknown CountQuality = iota
 	CountQualityExactProvider
 	CountQualityExactLocal
-	CountQualityConservativeEstimate
+	CountQualityHeuristicEstimate // structural estimate; NOT a proven upper bound
 )
 
 type ContextCount struct {
@@ -302,34 +331,119 @@ type ContextCount struct {
 
 type ContextCounter interface {
 	CountContext(context.Context, Request) (ContextCount, error)
+	// CounterCapability describes the counter's trust posture. It is metadata
+	// only and must not perform I/O. Named CounterCapability (not Capability) so
+	// the func adapter below can carry a Capability field without a
+	// field/method collision.
+	CounterCapability() CounterCapability
 }
 
+// ContextCountFunc is the bare counting function.
 type ContextCountFunc func(context.Context, Request) (ContextCount, error)
 
-func (f ContextCountFunc) CountContext(
+// ContextCounterFunc adapts a bare counting function plus its declared capability
+// into a full ContextCounter. A bare func cannot satisfy the interface because a
+// counter must also declare its trust posture.
+type ContextCounterFunc struct {
+	Count      ContextCountFunc
+	Capability CounterCapability
+}
+
+func (c ContextCounterFunc) CountContext(
 	ctx context.Context,
 	req Request,
 ) (ContextCount, error) {
-	return f(ctx, req)
+	return c.Count(ctx, req)
+}
+
+func (c ContextCounterFunc) CounterCapability() CounterCapability {
+	return c.Capability
 }
 ```
 
 The input is the exact `inference.Request`, including system, messages, tools,
 model, and sampling. A string-only counter is not sufficient.
 
+### Counter trust boundary
+
+A remote counting endpoint receives the complete request — system prompt, tools,
+and full history — in plaintext. If that endpoint is weaker than the loop's own
+inference transport (a separate host, no attestation, a different retention
+policy), an "exact" count leaks the conversation outside the protected path. The
+counter therefore declares its posture, and composition refuses a downgrade:
+
+```go
+type CounterTransport uint8
+
+const (
+	CounterTransportUnknown CounterTransport = iota
+	CounterTransportLocal                    // in-process; no request egress
+	CounterTransportSameEndpoint             // same attested/E2EE path as inference
+	CounterTransportSeparateEndpoint         // distinct host/security identity
+)
+
+type RetentionPosture uint8
+
+const (
+	RetentionUnknown  RetentionPosture = iota // fail-secure: treated as worst case
+	RetentionNone                             // input discarded after counting
+	RetentionEphemeral                        // bounded, provider-declared window
+	RetentionLogged                           // input may be persisted provider-side
+)
+
+type CounterCapability struct {
+	Provider         ProviderID       // owning provider/gateway
+	Transport        CounterTransport // where request bytes travel
+	SecurityIdentity SecurityIdentity // endpoint/attestation identity, or zero for local
+	Retention        RetentionPosture // provider-declared retention of counted input
+	TokenizerRev     TokenizerRevision
+}
+```
+
+The loop's inference path declares a **symmetric** posture, and compatibility is a
+single deterministic function rather than scattered ad-hoc checks:
+
+```go
+type InferenceCapability struct {
+	Provider         ProviderID
+	Transport        InferenceTransport // e.g. plaintext / attested / E2EE
+	SecurityIdentity SecurityIdentity
+	Retention        RetentionPosture
+}
+
+// CompatibleCounter reports why a counter is unacceptable for an inference path,
+// or nil if it is acceptable. Deterministic and I/O-free so rig.Define and replay
+// agree. A counter is compatible only when it egresses no further than inference
+// (transport no weaker), its security identity is acceptable to the inference
+// path, and its retention is no broader than inference's.
+func CompatibleCounter(inf InferenceCapability, counter CounterCapability) error
+```
+
+`rig.Define` rejects a loop whose counter fails `CompatibleCounter`: a
+`CounterTransportSeparateEndpoint` counter is invalid under an attested/E2EE
+inference transport, and a retention posture broader than inference's is rejected.
+For a protected provider a local `CountQualityHeuristicEstimate` may be the
+*safer* choice than a remote "exact" endpoint; the runtime never silently prefers
+exactness over the trust boundary. The **entire** secret-free `CounterCapability`
+— provider, transport, security identity, retention, and tokenizer revision — is
+fingerprinted into the measurement, so any counter swap (including a retention or
+security-identity change) is auditable and invalidates prior measurements.
+
 `llm` implements exact counters for direct providers whose APIs support them.
 OpenAI-compatible gateways that lack a count endpoint may receive an injected
-model-aware `ContextCountFunc`. Such a function must label itself accurately;
-an estimate never masquerades as exact.
+model-aware `ContextCounterFunc` (bare func + declared capability). Such a counter
+must label itself accurately; an estimate never masquerades as exact.
 
 When a client has no provider counter, composition supplies an
-`inference.ContextCountFunc`. The standard fallback is a deterministic
-complete-request conservative estimator in the `inference/contextcount`
+`inference.ContextCounterFunc`. The standard fallback is a deterministic
+complete-request heuristic estimator in the `inference/contextcount`
 subpackage; that package can depend on the root contracts and codec-specific
 request shapes without creating a root-package import cycle. It declares
-`CountQualityConservativeEstimate`. Provider/codec tests calibrate its
-structural allowances. It is useful for early pressure and deterministic policy,
-but it is not described as provider-exact.
+`CountQualityHeuristicEstimate` and `CounterTransportLocal`. Provider/codec tests
+calibrate its structural allowances. Because it is a heuristic and not a proven
+ceiling, the hard-admission path applies the configured `SafetyMargin` on top of
+it; it is useful for early pressure and deterministic policy, but it is not
+described as provider-exact.
 
 ### Resolved model limits
 
@@ -343,20 +457,48 @@ type ContextLimits struct {
 }
 ```
 
-For one candidate request:
+For one candidate request the margin is subtracted **last**, after the minimum,
+so it applies in every branch — including the known-`MaxInputTokens`,
+unknown-window case:
 
 ```text
 reservedOutput = configured output reservation clamped to known MaxOutputTokens
-sharedInputCap = WindowTokens - reservedOutput - SafetyMargin
-inputLimit = minimum(non-zero MaxInputTokens, sharedInputCap)
+rawInputLimit  = min(non-zero MaxInputTokens, WindowTokens - reservedOutput)
+inputLimit     = rawInputLimit - SafetyMargin
 ```
 
-Invalid subtraction or `inputLimit == 0` yields an unknown/unavailable limit;
-the runtime never invents a denominator.
+Resolution rules make each unknown explicit rather than guessed:
+
+- **Unknown window** (`WindowTokens == 0`): the `WindowTokens - reservedOutput`
+  operand drops out of the minimum. If `MaxInputTokens` is known,
+  `rawInputLimit == MaxInputTokens` and the margin is still subtracted
+  (`inputLimit = MaxInputTokens - SafetyMargin`); otherwise the limit is unknown.
+  The runtime never substitutes a default window.
+- **Independent input cap** (`MaxInputTokens != 0`): it always participates in
+  the minimum, even when a window is known, because some models cap input below
+  `WindowTokens - reservedOutput`.
+- **Default output reservation:** when the policy leaves `ReservedOutput` zero,
+  resolution uses `min(MaxOutputTokens, policy default)`; if both are zero the
+  limit is unknown rather than assuming the whole window is available for input.
+- **Safety margin:** `SafetyMargin` is subtracted from `rawInputLimit` in every
+  branch, never only from a shared window. For a `CountQualityHeuristicEstimate`
+  measurement the runtime additionally requires the margin be non-zero (a
+  heuristic count has no proven ceiling).
+
+Invalid subtraction (any operand exceeding the minuend) or `inputLimit == 0`
+yields an unknown/unavailable limit; the runtime never invents a denominator and
+a policy that `RequireExact` cannot admit against an unknown limit fails closed.
 
 ### Context identity and measurement
 
-Every committed conversation mutation advances a loop-local revision:
+`ContextRevision`, `ContextBasis`, and `ContextMeasurement` are owned by
+**`harness/pkg/event`**, not the internal per-loop runtime. They are **fields of
+durable events** (`CompactionCommitted`, `ContextMeasured`), so they must live in
+`pkg/event`: the internal runtime imports `pkg/event`, so `pkg/event` cannot in
+turn import the runtime without a cycle. They reference `inference`'s `ModelKey`
+and `content`'s `TokenCount` (both below `event`) but are never defined in those
+lower layers. Every committed conversation mutation advances a loop-local
+revision:
 
 ```go
 type ContextRevision uint64
@@ -451,31 +593,107 @@ type Compact struct {
 boundary stamps agency after authentication; untrusted callers cannot assert
 machine privileges.
 
-The loop routes `Compact` by concrete command type into a bounded control lane:
+The loop routes `Compact` by concrete command type into a bounded control lane.
+Coalescing shares one *attempt* but never drops a command's reply obligation:
 
 ```go
+type CompactAttemptID uuid.UUID
+
 type PendingCompaction struct {
-	CommandID uuid.UUID
-	Agency    identity.Agency
-	Reason    CompactionReason
+	AttemptID CompactAttemptID // identifies the single shared summarization attempt
+	Waiters   []uuid.UUID      // every coalesced command id, bounded by the lane
+	Reason    CompactionReason // the reason that first opened this attempt
 }
 
 type loopControlState struct {
-	PendingCompaction *PendingCompaction // one coalescing slot
+	PendingCompaction *PendingCompaction // one coalescing slot, many waiters
 }
 ```
 
 Rules:
 
-- machine triggers coalesce to one pending request;
+- machine triggers coalesce to one pending attempt;
 - a user request joins an in-progress/pending compaction and observes its result;
+  its command id is appended to `Waiters`;
 - queue fullness for `UserInput` cannot reject compaction;
 - `Interrupt` and `Shutdown` outrank compaction;
-- no unbounded express queue exists; and
+- no unbounded express queue exists; the waiter slice is bounded by the lane; a
+  command that cannot join a full `Waiters` slice is **immediately rejected** with
+  `CompactWaiterRejected{Reason: CompactRejectControlLaneFull}` rather than dropped
+  or blocked — a journaled command always receives a terminal reply;
+- `Waiters` is kept in a **canonical order** — ascending command-`CreatedAt`, ties
+  broken by command-UUID bytes — and admits each command id **at most once**; the
+  ordering and uniqueness are what make reply regeneration deterministic; and
 - a control request is consumed only at a safe step/turn boundary.
 
-The command is journaled in the existing intent log before dispatch. The
-resulting `Compacted` event carries `Header.Cause.CommandID`.
+### Crash-consistent outcome
+
+The product and the attempt outcome must be **one** durable event, not two.
+Committing the summary product first and an outcome/membership record second is
+not atomic — the journal appends one event at a time, so a crash in between would
+apply the summary yet lose the waiter membership, and repair could never run. The
+canonical event therefore carries the replacement **and** the full membership:
+
+```go
+// Success: the ONE canonical event. It is BOTH the context replacement (folded in
+// §12) and the attempt outcome + waiter membership. There is no separate product
+// event to desync from.
+type CompactionCommitted struct {
+	enduring
+	loopScoped
+	Header
+	AttemptID        CompactAttemptID
+	WaiterCommandIDs []uuid.UUID // full canonical membership
+	Basis            ContextBasis
+	Summary          *content.UserMessage
+	PostContext      ContextMeasurement
+}
+
+// Failure: the canonical negative outcome, likewise carrying full membership.
+type CompactionRejected struct {
+	enduring
+	loopScoped
+	Header
+	AttemptID        CompactAttemptID
+	WaiterCommandIDs []uuid.UUID
+	RejectReason     CompactRejectReason
+}
+```
+
+Exactly one of these is written per attempt. Because it already contains the full
+waiter set, the per-command terminal replies are an **idempotent projection** of
+it — and each reply's event id is **derived deterministically** so replaying the
+repair can never append a duplicate:
+
+```go
+// Deterministic, content-addressed reply id. Regenerating a reply after a crash
+// yields the SAME id, so the append is a no-op if it already exists.
+func waiterReplyID(attempt CompactAttemptID, cmd uuid.UUID, ok bool) uuid.UUID
+
+type CompactWaiterResolved struct {
+	enduring
+	loopScoped
+	Header                        // ID = waiterReplyID(AttemptID, CommandID, true)
+	AttemptID           CompactAttemptID
+	CommittedEventID    uuid.UUID // the CompactionCommitted this waiter observed
+}
+
+type CompactWaiterRejected struct {
+	enduring
+	loopScoped
+	Header                    // ID = waiterReplyID(AttemptID, CommandID, false)
+	AttemptID CompactAttemptID
+	Reason    CompactRejectReason
+}
+```
+
+On restore, each command in the canonical event's `WaiterCommandIDs` with no
+matching reply is regenerated from the outcome (resolved cite the
+`CompactionCommitted` id, rejected cite `RejectReason`). Because reply ids are a
+pure function of `{AttemptID, CommandID, outcome}`, a crash *during* repair cannot
+double-append: the same id is produced and the existing record wins. Every waiter
+ends with exactly one terminal reply, and no command is left owed — even across a
+crash between the canonical event and its replies.
 
 ## §9 · Full replacement and the actor/turn protocol
 
@@ -526,28 +744,41 @@ able to rewrite agent history.
 ```go
 type ContextReplacement struct {
 	Basis   ContextBasis
+	Model   inference.ModelKey // model the summarized measurement was taken under
+	Fprint  [32]byte           // RequestFingerprint of that measurement
 	Summary *content.UserMessage
 }
 ```
 
-The actor applies it as a compare-and-swap:
+The actor applies it as a compare-and-swap over the **full** measurement
+identity, not `Basis` alone. A measurement is valid only for
+`{Basis, Model, RequestFingerprint}` (§6), so a model or request-shape change
+that left `Basis` numerically equal must still invalidate the replacement:
 
 ```go
 func applyContextReplacement(
 	state *loopState,
 	replacement ContextReplacement,
 ) error {
-	if state.contextBasis != replacement.Basis {
+	if state.contextBasis != replacement.Basis ||
+		state.model != replacement.Model ||
+		state.requestFingerprint != replacement.Fprint {
 		return &StaleCompactionError{
 			Expected: replacement.Basis,
 			Actual:   state.contextBasis,
 		}
 	}
 	state.msgs = content.AgenticMessages{replacement.Summary}
-	state.contextBasis = nextBasis(/* Compacted event */)
+	state.contextBasis = nextBasis(/* CompactionCommitted event */)
 	return nil
 }
 ```
+
+Equivalently, the actor may CAS on `Basis` alone and then **recompute
+`PostContext`** against its post-accept state before minting `CompactionCommitted`;
+the
+two are interchangeable, but the design fixes the full-tuple CAS as the default
+because it fails the stale attempt before any durable append.
 
 ### In-flight turn reset
 
@@ -556,7 +787,7 @@ turn goroutine then owns `turnState.msgs`. Therefore a successful actor
 replacement must be acknowledged back to that goroutine:
 
 ```go
-// After the actor has durably appended Compacted and applied the replacement:
+// After the actor has durably appended CompactionCommitted and applied the replacement:
 turnConfig.base = content.AgenticMessages{}
 turnState.msgs = content.AgenticMessages{summary}
 ```
@@ -579,17 +810,51 @@ finalize AIMessage + tool results + usage
 → return a compaction directive to the turn goroutine when required
 → run the compaction hustle while the turn is paused
    (the actor remains responsive to interrupt/shutdown)
-→ validate output and mint the proposed Compacted event/new ContextBasis
+→ validate output and mint the proposed CompactionCommitted/new ContextBasis
 → build and count the proposed summary-based next request
-→ construct Compacted{old Basis, Summary, PostContext at new Basis}
-→ construct ContextReplacement{Basis: old measured basis}
-→ actor CAS-validates the basis
-→ append Compacted durably
+→ construct CompactionCommitted{AttemptID, Waiters, old Basis, Summary, PostContext}
+→ construct ContextReplacement{old Basis, Model, Fprint of the measurement}
+→ actor CAS-validates {Basis, Model, RequestFingerprint}
+→ append CompactionCommitted durably
 → actor replaces loopState.msgs
 → acknowledge replacement to the turn goroutine
 → turn goroutine replaces base + turnState.msgs
-→ continue the same turn
+→ continue the same turn (next model step uses the summary-based context)
 ```
+
+Not every StepDone continues the turn. The trigger point is the same, but the
+boundary sequence forks on whether the step that crossed the threshold is a tool
+continuation or the turn's terminal AI response:
+
+- **Tool continuation** (the AI message requested tools): the turn *will* make at
+  least one more model call. Compact, reset both context views (actor + turn
+  goroutine), and the next step sends the summary-based context — the sequence
+  above.
+- **Terminal AI response** (no tool calls; the turn is ending): there is **no
+  next model call in this turn**, and the original terminal AI response is
+  **preserved and returned unchanged** — compaction never rewrites a reply the
+  user is about to see. But the turn must **not** be returned first: returning or
+  emitting `TurnDone` before compaction opens a race where new input or idleness
+  arrives and makes the compaction basis stale. Compaction runs while the turn is
+  still active, and only then does the turn close:
+
+  ```text
+  commit StepDone (advances ContextBasis)
+  → retain the original terminal AIMessage (never mutated)
+  → perform or decline compaction while the turn is STILL ACTIVE
+  → on success: append CompactionCommitted and apply ContextReplacement to committed state
+  → emit TurnDone carrying the unchanged original AIMessage
+  → return the response
+  ```
+
+  No additional model call is made. There is no in-flight `turnState.msgs` to
+  reset because the turn closes only after compaction; `CompactionCommitted`
+  conditions the *next* turn's request, never this response.
+
+This preserves the invariant that a summary measured for continuation is only
+ever spent on a *future* request, never retroactively on the response already
+produced — and, for the terminal case, that the turn does not become returnable
+until compaction has committed against a basis that cannot have gone stale.
 
 Queued user/subagent input that has not yet committed is not part of the
 compaction basis. It remains queued and folds after the replacement according to
@@ -597,20 +862,14 @@ normal input semantics.
 
 ### Durable event
 
-```go
-type Compacted struct {
-	enduring
-	loopScoped
-	Header
-	Basis       ContextBasis
-	Summary     *content.UserMessage
-	PostContext ContextMeasurement
-}
-```
+The success case is the single `CompactionCommitted` event defined in §8 — it is
+simultaneously the durable product (summary + basis + post-context) **and** the
+attempt outcome (waiter membership). There is deliberately no separate `Compacted`
+event to fall out of sync with it.
 
-`Basis` identifies what was summarized. `PostContext` measures the primary
-loop's summary-based request context; it is not the hustle's usage. The hustle's
-own usage remains on its own `AIMessage`.
+`CompactionCommitted.Basis` identifies what was summarized. `PostContext` measures
+the primary loop's summary-based request context; it is not the hustle's usage.
+The hustle's own usage remains on its own `AIMessage`.
 
 If future runtime context is not yet knowable (for example, idle manual
 compaction before a future turn), `PostContext` measures the stable request base
@@ -663,28 +922,47 @@ runtime returns `SummaryTooLargeError` and does not call the primary model.
 
 ## §12 · Restore and catalog
 
-The per-loop replay fold treats `Compacted` as a complete context reset:
+The per-loop replay fold treats `CompactionCommitted` as a complete context reset
+— the same event that carries the outcome is the one that resets the context, so
+product and outcome can never disagree:
 
 ```go
-case event.Compacted:
+case event.CompactionCommitted:
 	if err := validateBasis(foldedBasis, e.Basis); err != nil {
 		return foldResult{}, err
 	}
 	msgs = content.AgenticMessages{cloneUserMessage(e.Summary)}
-	basis = basisFromCompacted(e)
+	basis = basisFromCommitted(e)
 	contextMeasurement = e.PostContext
 ```
 
 Multiple compactions compose in journal order. Raw superseded messages remain
 in the append-only journal for audit; only the active-context fold resets.
 
-The journal must contain resolved model limits whenever the effective model
-changes:
+Restore also repairs incomplete waiter replies: for each `CompactionCommitted` or
+`CompactionRejected`, any command in `WaiterCommandIDs` lacking a matching
+`CompactWaiterResolved`/`CompactWaiterRejected` is regenerated idempotently from
+the recorded outcome, using the deterministic `waiterReplyID` so a crash during
+repair cannot double-append. This closes the crash-between-outcome-and-replies gap
+(§8) — every waiter deterministically ends with exactly one terminal reply after
+replay.
+
+The journal must contain the resolved runtime whenever the effective model
+changes. `ModelRuntime` is **owned by `harness/pkg/event`** (exact owner
+`event.ModelRuntime`, not the ambiguous "harness") because it is a durable event
+payload, and it is the **single** resolved-runtime shape shared with the
+rig-lifecycle events — so it carries not just the model and its limits but the
+resolved reasoning **effort**, which the lifecycle design's mode resolution
+requires. There is one runtime type, not a limits-only variant here and an
+effort-carrying variant there:
 
 ```go
+// Package event. The single resolved-runtime payload, shared by the token/limits
+// machinery and the rig-lifecycle loop events.
 type ModelRuntime struct {
-	Key    ModelKey
+	Key    inference.ModelKey
 	Limits inference.ContextLimits
+	Effort inference.Effort // resolved reasoning effort (mode resolution result)
 }
 
 type LoopInferenceChanged struct {
@@ -694,33 +972,64 @@ type LoopInferenceChanged struct {
 
 type LoopModeChanged struct {
 	// existing mode fields
-	Runtime ModelRuntime // resolved result of selecting the mode
+	Runtime ModelRuntime // resolved result of selecting the mode (model + limits + effort)
 }
 ```
 
 `LoopStarted` likewise carries the initial resolved runtime. This makes replay
-and catalog repair independent of a mutable external model catalog.
+and catalog repair independent of a mutable external model catalog, and gives the
+rig-lifecycle runtime the effort it needs without a second type. `inference.Effort`
+is the reasoning-effort type owned by `inference`; if the rig-lifecycle design
+already names that type, `ModelRuntime` uses that exact type rather than
+duplicating it.
 
-`SessionMeta` stores a deterministically ordered per-loop projection:
+`SessionMeta` stores a deterministically ordered per-loop projection **for
+primers and delegates only** — the bounded, user-visible loops a picker renders.
+Hustle loops are unbounded over a long session (every compaction, classifier, and
+title run is its own loop), so they must **not** enter `Loops`; putting them
+there would make the projection grow without limit. Their detailed runs live in
+the journal; the catalog exposes only a **bounded aggregate** keyed by hustle
+name/model/status:
 
 ```go
 type LoopUsageMeta struct {
 	LoopID          uuid.UUID
-	Kind            event.LoopKind
+	Kind            event.LoopKind // Primer or Delegate only
 	Runtime         ModelRuntime
 	CumulativeUsage content.Usage
 	CurrentContext  ContextMeasurement
 }
 
+type HustleUsageAggregate struct {
+	Name            hustle.Name
+	Model           ModelRuntime
+	Status          hustle.TerminalStatus // completed / failed, bounded set
+	Runs            uint64                // count folded from lifecycle events
+	CumulativeUsage content.Usage         // summed hustle-loop usage
+}
+
 type SessionMeta struct {
 	// existing fields
-	Loops []LoopUsageMeta // sorted by LoopID bytes
+	Loops   []LoopUsageMeta        // primers/delegates, sorted by LoopID bytes
+	Hustles []HustleUsageAggregate // bounded: one row per (name, model, status)
 }
 ```
 
 `SessionMeta` remains a repairable cache, not an authority. Carrying the durable
-runtime/measurement allows the session picker to show pressure and allows
-repair without importing the current rig/model catalog.
+runtime/measurement allows the session picker to show pressure and repair without
+importing the current rig/model catalog. The hustle aggregate is folded from the
+internal `HustleStarted`/`HustleCompleted`/`HustleFailed` lifecycle plus each
+hustle loop's own usage; individual hustle runs are recoverable from the journal
+but are never enumerated in `SessionMeta`.
+
+The aggregate key uses the **model key**, not the full runtime, and its
+cardinality is bounded because `ModelStrategy` (§hustle) resolves to a
+**definition-bounded** model set: a hustle either names a fixed model or uses the
+current-loop model, and the loop's model set is itself bounded by the rig
+definition. If a future strategy ever admits an unbounded resolved-model space,
+`Hustles` caps distinct model keys per `(name, status)` and rolls older/rarer keys
+into a single `model: other` bucket, so the projection stays bounded regardless.
+`hustle.TerminalStatus` is a fixed two-value set (completed / failed).
 
 ## §13 · Configuration
 
@@ -760,12 +1069,13 @@ Validation requires:
 
 - `0 < RearmBelow < CompactAt < 10_000` when automatic;
 - a non-zero counter policy when automatic;
-- an exact counter for `RequireExact`, or an exact/conservative counter for
+- an exact counter for `RequireExact`, or an exact/heuristic counter for
   `AllowConservative`;
 - non-zero summary/output budgets;
 - positive timeout after default resolution;
 - a registered hustle whose output satisfies the compactor contract; and
-- compatible model limit/counter policy once §14 is resolved.
+- a counter whose `CounterCapability` is compatible with the loop's inference
+  transport per the §6 trust boundary and §14 counter policy.
 
 Threshold percentages/defaults are deliberately left for the follow-up
 soft/rearm example and calibration pass.
@@ -779,11 +1089,14 @@ soft/rearm example and calibration pass.
 | `Compact` | command | intent log | yes | manual or machine compaction request |
 | `ContextPressure` | event | Ephemeral/Public | no | percentage level change |
 | `ContextMeasured` | event | Enduring/Public | yes | authoritative/replayable current measurement |
-| `Compacted` | event | Enduring/Public | yes | basis, summary replacement, post-context |
+| `CompactionCommitted` | event | Enduring/Public | yes | canonical success: context replacement **and** outcome + waiter membership (folded as the reset) |
+| `CompactionRejected` | event | Enduring/Public | yes | canonical failure: reject reason + full waiter membership |
+| `CompactWaiterResolved` | event | Enduring/Public | yes | per-waiter success reply; deterministic id, idempotent projection |
+| `CompactWaiterRejected` | event | Enduring/Public | yes | per-waiter reject reply (failure/cancel/shutdown/stale-basis/lane-full) |
 
 Every successful measurement that changes the current measurement appends
 `ContextMeasured` before policy acts on it. The sole exception is the
-post-replacement measurement embedded in `Compacted`; the runtime does not emit
+post-replacement measurement embedded in `CompactionCommitted`; the runtime does not emit
 a duplicate `ContextMeasured` for the same
 `{Basis, Model, RequestFingerprint}` tuple. Catalog/replay treat measurements as
 latest-value state, never as cumulative usage.
@@ -817,9 +1130,12 @@ policy and estimator revision are fingerprinted and durable.
 
 ## §15 · Hustle and loop-kind isolation
 
-Every loop start persists a non-zero kind:
+Every loop start persists a non-zero kind. `LoopKind` has **exactly one owner**,
+`harness/pkg/event`; this design and the hustle design both reference
+`event.LoopKind` and neither redefines it:
 
 ```go
+// Package event — the single definition. Referenced as event.LoopKind everywhere.
 type LoopKind uint8
 
 const (
@@ -856,9 +1172,27 @@ endpoints receive integration tests under the `integration` build tag.
   request; smaller-window hard rejection.
 - Express lane: queue-full independence, coalescing, user join, interrupt and
   shutdown priority, command type rather than agency.
+- Per-waiter replies: every coalesced waiter gets exactly one terminal
+  `CompactWaiterResolved`/`CompactWaiterRejected`; success replies cite one
+  `CompactionCommitted` id; failure, cancellation, shutdown, and stale basis each
+  reject every waiter; a command that cannot join a full `Waiters` slice is
+  immediately rejected with `CompactRejectControlLaneFull`; `Waiters` is canonical
+  ordered and de-duplicated.
+- Crash consistency: the single `CompactionCommitted`/`CompactionRejected` carries
+  full membership; a crash between it and the per-waiter replies is repaired on
+  restore; reply ids are deterministic (`waiterReplyID`) so repair after a
+  mid-repair crash cannot double-append; every waiter ends with exactly one reply.
+- Counter trust boundary: `CompatibleCounter` rejects a separate-endpoint or
+  broader-retention counter under an attested/E2EE loop; a local heuristic is
+  admitted; the **entire** `CounterCapability` (incl. retention + security
+  identity) is fingerprinted into the measurement.
 - Replacement: actor-only reset is proven insufficient; successful handshake
-  resets both actor and turn state; stale basis cannot overwrite; queued input
-  survives; same turn continues.
+  resets both actor and turn state; stale basis **or model/fingerprint change**
+  cannot overwrite; queued input survives; same turn continues.
+- Compaction step fork: a tool-continuation step resets the turn view and issues
+  a next model call; a terminal AI-response step returns the original response
+  unchanged, commits `CompactionCommitted` before `TurnDone`, and does **not**
+  re-invoke the model.
 - Compaction: summary-only active history, no retained last AI/tool result,
   hustle usage isolated, post-context belongs to primary loop, soft failure
   continues, hard failure blocks, successful summary still-too-large blocks.
@@ -867,17 +1201,47 @@ endpoints receive integration tests under the `integration` build tag.
 - Hustle loops: usage owned independently; no recursive occupancy/compaction or
   workspace hooks.
 
-## §17 · Module impact and release order
+### Foundation types land first
+
+This design's first shippable unit is a small, self-contained **foundation** of
+shared types with unambiguous owners. It has no dependency on any other type
+introduced later in this document and must land before anything — in this design
+or any consumer — references a resolved model runtime or context limits:
+
+| Type | Owning package |
+|---|---|
+| `content.TokenCount` | `core/content` |
+| `inference.ModelKey`, `inference.ContextLimits`, `inference.Effort` | `inference` |
+| `hustle.DefinitionDescriptor`, `hustle.Name`, `hustle.BackendKind` | `harness/pkg/hustle` (leaf; must **not** import `pkg/event`) |
+| `event.LoopKind`, `event.Visibility` (durable wire) | `harness/pkg/event` |
+| `event.ModelRuntime` (`{ModelKey, ContextLimits, Effort}`) | `harness/pkg/event` |
+| `event.ContextBasis`, `event.ContextMeasurement` | `harness/pkg/event` |
+| `event.HustleRunDescriptor` (`{hustle.DefinitionDescriptor, event.ModelRuntime}`) | `harness/pkg/event` |
+
+**Dependency direction is one-way and acyclic:** `pkg/hustle` is a leaf owning
+only definition-time identity (`DefinitionDescriptor`, `Name`, `BackendKind`) and
+imports neither `pkg/event` nor the runtime. `pkg/event` imports `pkg/hustle`
+(for `DefinitionDescriptor`) and `inference`/`content`, and owns every durable
+**event field** — `ContextBasis`, `ContextMeasurement`, `ModelRuntime`, and
+`HustleRunDescriptor` — because the internal runtime imports `pkg/event` and a
+type used in a durable event therefore cannot live in the runtime. The runtime
+imports `pkg/event`; nothing imports the runtime. So the chain is
+`content`/`inference` → `pkg/hustle` → `pkg/event` → runtime, with no back-edges.
+This design provides all of these as its foundation unit, so no consumer has to
+forward-reference, redefine, or invert an import.
+
+### Release order
 
 1. `core/content` — `TokenCount`, normalized `Usage`, explicit `AIMessage` JSON
    codec.
-2. `inference` — `StreamResult`, usage trailer propagation, `ContextCounter`,
-   `ContextCountFunc`, `ContextLimits`, codec normalization.
+2. `inference` — `ModelKey`, `Effort`, `StreamResult`, usage trailer
+   propagation, `ContextCounter`, `CounterCapability`, `ContextCounterFunc`,
+   `ContextLimits`, codec normalization.
 3. `llm` — exact provider counters where supported; typed unsupported behavior
    for gateways; recompile against inference/content.
 4. `harness` — usage stitch, context basis/measurement, pressure, express-lane
-   `Compact`, actor/turn replacement, events/codecs/folds/catalog, compaction
-   hustle integration, loop kinds.
+   `Compact` + per-waiter replies, actor/turn replacement, events/codecs/folds/
+   catalog, compaction hustle integration, loop kinds.
 5. `swe` — model limits, counters or explicit missing-counter policy, hustle
    registry, percentage thresholds, `/compact`.
 
