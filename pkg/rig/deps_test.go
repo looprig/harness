@@ -68,7 +68,7 @@ func legacySourceViolations(filename string, source any) ([]string, error) {
 		}
 		selectorNames[selector.Sel] = true
 		prefix, ok := selector.X.(*ast.Ident)
-		if !ok {
+		if !ok || prefix.Obj != nil {
 			return true
 		}
 		kind := aliases[prefix.Name]
@@ -307,5 +307,35 @@ func f() { WithWorkspaceStore(); WithCompileSession(); sess.WithCompileRestore()
 	}
 	if strings.Join(got, "\n") != strings.Join(want, "\n") {
 		t.Fatalf("violations = %v, want %v", got, want)
+	}
+}
+
+func TestLegacySourceGuardHonorsLexicalImportShadowing(t *testing.T) {
+	source := `package fixture
+import l "github.com/looprig/harness/pkg/loop"
+var _ l.Definition
+func f() {
+    l := struct{ Config int }{}
+    _ = l.Config
+}
+`
+	got, err := legacySourceViolations("fixture.go", source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("shadowed alias violations = %v, want none", got)
+	}
+
+	unshadowed := `package fixture
+import l "github.com/looprig/harness/pkg/loop"
+var _ l.Config
+`
+	got, err = legacySourceViolations("fixture.go", unshadowed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(got, "\n") != "loop.Config" {
+		t.Fatalf("unshadowed alias violations = %v, want [loop.Config]", got)
 	}
 }
