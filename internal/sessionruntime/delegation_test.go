@@ -976,7 +976,7 @@ func TestPermissionCeilingIsSharedOnRestoreAndIsolatedAcrossSessions(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	original, err := lc.NewSession(context.Background())
+	original, err := lc.NewSession(context.Background(), "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1000,7 +1000,7 @@ func TestPermissionCeilingIsSharedOnRestoreAndIsolatedAcrossSessions(t *testing.
 	if len(p) != 2 || len(c) != 2 || p[0] != c[0] || p[1] != c[1] || p[0] == p[1] || p[1] != restored.CeilingSource() || p[1].Current() != 1 {
 		t.Fatalf("sources parent=%v child=%v restored=%p level=%d", p, c, restored.CeilingSource(), restored.CeilingSource().Current())
 	}
-	separate, err := lc.NewSession(context.Background())
+	separate, err := lc.NewSession(context.Background(), "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1270,7 +1270,7 @@ func TestDelegateWaitResolvesAfterRestore(t *testing.T) {
 	}
 
 	ctx := delegateCtx(t)
-	s, err := lc.NewSession(ctx)
+	s, err := lc.NewSession(ctx, "")
 	if err != nil {
 		t.Fatalf("NewSession: %v", err)
 	}
@@ -1326,7 +1326,7 @@ func TestDelegateQueuedRequestRestoresInterruptedWithoutReplay(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	s, err := lc.NewSession(context.Background())
+	s, err := lc.NewSession(context.Background(), "")
 	if err != nil {
 		t.Fatal(err)
 	}

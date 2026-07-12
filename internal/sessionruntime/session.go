@@ -19,6 +19,7 @@ import (
 	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/harness/pkg/tool"
+	"github.com/looprig/harness/pkg/tools"
 	"github.com/looprig/harness/pkg/workspacestore"
 	"github.com/looprig/inference"
 )
@@ -174,6 +175,36 @@ type Session struct {
 	// (Dependency Inversion): it never sees the Blobs backend beneath it.
 	ws     *workspacestore.Store // nil unless WithWorkspaceStore wired it; gates CheckpointWorkspace
 	wsRoot string                // the workspace directory Snapshot archives
+
+	// placementSpec is the UNRESOLVED managed-workspace placement carried into the restore
+	// path (withPlacementSpec); restoreTopologySession resolves it after the session lease.
+	// Zero (PlacementNone) for NewSession (which resolves in the Lifecycle) and no-workspace.
+	placementSpec WorkspacePlacement
+
+	// wsMode records the managed-workspace placement mode (exclusive/per-session/shared)
+	// so RestoreWorkspace can select the whole-root swap (per-session) versus the
+	// manifest reconcile (fixed exclusive/shared). PlacementNone when unmanaged.
+	wsMode WorkspacePlacementMode
+
+	// wsCoordinator is the ONE session-scoped workspace mutation coordinator every
+	// primer/delegate loop's file + Bash tools serialize through (design §"Native
+	// checkpoint boundary and workspace gate"). It is populated by the placement work
+	// via WithWorkspacePlacement; nil means no managed workspace, so the three bind
+	// sites leave tool.Bindings.Workspace nil and workspace-requiring tools are refused
+	// (already guaranteed invalid at rig.Define). Its Healthy() reflects exclusive
+	// root-lease loss, so a structured mutator fails closed after ownership is lost.
+	wsCoordinator tool.WorkspaceCoordinator
+
+	// wsRootRelease releases the EXCLUSIVE root lease. Shutdown calls it (releaseRootOnce)
+	// BEFORE the session lease release (LIFO teardown): work/checkpoints stop, the root
+	// lease is released, then the session lease. Nil for per-session/shared/no placement.
+	wsRootRelease   func(context.Context) error
+	releaseRootOnce sync.Once
+
+	// wsLeaseLost is the exclusive root lease's loss channel. A watcher goroutine
+	// (watchRootLease) faults the session and interrupts live loops when it closes, so
+	// admission closes and in-flight loops/checkpoints are torn down on ownership loss.
+	wsLeaseLost <-chan struct{}
 
 	// ceiling is the session's live SECURITY-CEILING ordinal source (SPEC §8/§10.2): the
 	// clamp SetSecurityCeiling mutates and CeilingSource exposes. It is default-minted at
@@ -718,7 +749,7 @@ func (s *Session) newLoopWithAdmission(parent loop.Provenance, cfg loop.Definiti
 			release()
 			return uuid.UUID{}, &SessionError{Kind: SessionLoopIDGenerationFailed, Cause: err}
 		}
-		bound, err = cfg.Bind(s.sessionCtx, tool.Bindings{SessionID: s.sessionID, LoopID: loopID, Ceiling: s.ceilingState(), Delegate: s.delegation.controllerFor(loopID, cfg), ExtraTools: delegateExtraTools(cfg, s.delegation)})
+		bound, err = cfg.Bind(s.sessionCtx, tool.Bindings{SessionID: s.sessionID, LoopID: loopID, Ceiling: s.ceilingState(), Workspace: s.newWorkspaceBinding(), Delegate: s.delegation.controllerFor(loopID, cfg), ExtraTools: delegateExtraTools(cfg, s.delegation)})
 		if err != nil {
 			release()
 			return uuid.UUID{}, err
@@ -1146,7 +1177,7 @@ func newSessionTopology(ctx context.Context, topology Topology, newID idGenerato
 			sessionCancel()
 			return nil, &SessionError{Kind: SessionLoopIDGenerationFailed, Cause: mintErr}
 		}
-		bound, bindErr := definition.Bind(sessionCtx, tool.Bindings{SessionID: id, LoopID: loopID, Ceiling: s.ceilingState(), Delegate: s.delegation.controllerFor(loopID, definition), ExtraTools: delegateExtraTools(definition, s.delegation)})
+		bound, bindErr := definition.Bind(sessionCtx, tool.Bindings{SessionID: id, LoopID: loopID, Ceiling: s.ceilingState(), Workspace: s.newWorkspaceBinding(), Delegate: s.delegation.controllerFor(loopID, definition), ExtraTools: delegateExtraTools(definition, s.delegation)})
 		if bindErr != nil {
 			sessionCancel()
 			return nil, bindErr
@@ -1501,6 +1532,74 @@ func (s *Session) releaseLease(ctx context.Context) {
 	})
 }
 
+// releaseRootLease releases the EXCLUSIVE workspace root lease EXACTLY ONCE
+// (releaseRootOnce), on the bounded ctx, swallowing the error (the lease TTL is the
+// backstop). Nil-safe: per-session, shared, and no-placement sessions have no root lease.
+// Shutdown calls this BEFORE releaseLease so the root lease is relinquished before the
+// session lease (LIFO teardown), and after work/checkpoints have stopped.
+func (s *Session) releaseRootLease(ctx context.Context) {
+	s.releaseRootOnce.Do(func() {
+		if s.wsRootRelease == nil {
+			return
+		}
+		if err := s.wsRootRelease(ctx); err != nil {
+			slog.WarnContext(ctx, "session: workspace root lease release on shutdown failed (TTL is the backstop)",
+				"session", s.sessionID, "err", err)
+		}
+	})
+}
+
+// watchRootLease starts the exclusive root-lease loss watcher (a no-op unless an exclusive
+// placement wired wsLeaseLost). On loss it FAULTS the session — latches faulted with a
+// typed *WorkspaceRootLeaseLostError so admission closes — and cancels the session context
+// so live loops are interrupted and any session-scoped checkpoint is cancelled. The
+// coordinator's Healthy() independently fences cooperative structured mutators after loss.
+func (s *Session) watchRootLease() {
+	if s.wsLeaseLost == nil {
+		return
+	}
+	go func() {
+		select {
+		case <-s.sessionCtx.Done():
+			return
+		case <-s.wsLeaseLost:
+			// Latch the fault + wake WaitIdle waiters (symmetry with ReportFault), THEN
+			// cancel the session context so live loops are interrupted and any
+			// session-scoped checkpoint is cancelled.
+			s.faultWorkspaceInconsistent(&WorkspaceRootLeaseLostError{})
+			s.sessionCancel()
+		}
+	}()
+}
+
+// faultWorkspaceInconsistent latches the session's fault state with a workspace-integrity
+// cause (root-lease loss, or a restore whose rollback itself failed) and wakes every
+// blocked WaitIdle waiter — mirroring ReportFault, but for failures the hub's durable tap
+// never sees (there is no failed enduring append). It is idempotent: the FIRST fault
+// records the cause. FailWaiters is called OUTSIDE loopsMu (it takes the hub lock, which is
+// never held together with loopsMu).
+func (s *Session) faultWorkspaceInconsistent(cause error) {
+	s.loopsMu.Lock()
+	if !s.faulted {
+		s.faulted = true
+		s.faultErr = cause
+	}
+	s.loopsMu.Unlock()
+	s.hub.FailWaiters(cause)
+}
+
+// newWorkspaceBinding returns the tool.WorkspaceBinding to populate at a loop bind site, or
+// nil when the session has no managed workspace (leaving tool.Bindings.Workspace nil, the
+// no-placement default). Each loop gets a FRESH per-loop observation set so a Bash run
+// invalidates exactly its own loop's file-tool observations, while all loops share the ONE
+// session coordinator (cross-loop mutation serialization).
+func (s *Session) newWorkspaceBinding() *tool.WorkspaceBinding {
+	if s.wsCoordinator == nil {
+		return nil
+	}
+	return &tool.WorkspaceBinding{Root: s.wsRoot, Coordinator: s.wsCoordinator, Observations: tools.NewObservations()}
+}
+
 // shutdownTarget pairs a loop with the Ack channel of the command.Shutdown the
 // session sent it, so the ack-wait phase can drain each loop's reply in turn. It
 // is Shutdown-internal: the send phase records one per loop actually reached, and
@@ -1567,6 +1666,13 @@ func (s *Session) Shutdown(ctx context.Context) error {
 	// (the journal's last append is durable) before ownership is relinquished, and the
 	// release happens before the root context is cancelled. Nil in headless mode (no-op).
 	defer s.releaseLease(ctx)
+
+	// Release the EXCLUSIVE workspace root lease AFTER the session-lease defer above so it
+	// runs BEFORE it (LIFO): work + checkpoints have stopped, the root lease is released,
+	// THEN the session lease. Nil-safe (per-session/shared/no placement). This deferred
+	// ordering realizes the design's teardown: stop work/checkpoints → release root lease
+	// → release session lease.
+	defer s.releaseRootLease(ctx)
 
 	// (4) Send a graceful Shutdown to every loop in the snapshot.
 	targets := make([]shutdownTarget, 0, len(snapshot))

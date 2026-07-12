@@ -5,6 +5,7 @@ import (
 
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/identity"
+	"github.com/looprig/harness/pkg/tool"
 	"github.com/looprig/harness/pkg/workspacestore"
 )
 
@@ -36,6 +37,20 @@ func (s *Session) CheckpointWorkspace(ctx context.Context) (workspacestore.Ref, 
 	if s.ws == nil {
 		return "", &WorkspaceNotConfiguredError{}
 	}
+	// When a placement coordinator is wired, hold the exclusive checkpoint permit around
+	// the snapshot so no managed mutation overlaps the walk — that is what makes the
+	// recorded ref honestly quiescent for exclusive/per-session roots. The bare
+	// WithWorkspaceStore path (no coordinator) skips this.
+	if s.wsCoordinator != nil {
+		permit, err := s.wsCoordinator.Acquire(ctx, tool.WorkspaceOperationCheckpoint, "")
+		if err != nil {
+			return "", err
+		}
+		defer permit.Release()
+		if err := s.wsCoordinator.Healthy(); err != nil {
+			return "", err
+		}
+	}
 	// Snapshot first: on success the archive bytes are durable in Blobs before we append
 	// the event that points at them. Any failure is already a typed *workspacestore
 	// error (e.g. *SnapshotError), returned unwrapped so the caller can errors.As it.
@@ -50,17 +65,44 @@ func (s *Session) CheckpointWorkspace(ctx context.Context) (workspacestore.Ref, 
 	if err != nil {
 		return "", &SessionError{Kind: SessionIDGenerationFailed, Cause: err}
 	}
+	// A manual checkpoint carries Trigger=Manual (zero Cause). Consistency reflects the
+	// placement: shared roots admit external writers, so they are honestly fuzzy; exclusive
+	// and per-session roots (and the bare single-writer store) are quiescent.
+	consistency := event.SnapshotQuiescent
+	if s.wsMode == PlacementShared {
+		consistency = event.SnapshotFuzzy
+	}
 	// Publish on the passed ctx (this method has a real caller ctx, unlike newLoop which
 	// publishes on the session lifetime). The Enduring event takes the hub's durable-tap
 	// branch: appended before fan-out, faulting the session on append failure.
-	if err := s.PublishEvent(ctx, event.WorkspaceCheckpointed{Header: stamped, Ref: string(ref)}); err != nil {
+	if err := s.PublishEvent(ctx, event.WorkspaceCheckpointed{
+		Header:      stamped,
+		Ref:         string(ref),
+		Consistency: consistency,
+		Trigger:     event.SnapshotTriggerManual,
+	}); err != nil {
 		return "", &SessionError{Kind: SessionContextDone, Cause: err}
 	}
 	return ref, nil
 }
 
-// RestoreWorkspace is present on every controller; workspace rewind is wired by the
-// placement work in Task 14 and fails closed until then.
-func (s *Session) RestoreWorkspace(context.Context, workspacestore.Ref) error {
-	return &WorkspaceNotConfiguredError{}
+// recordSeedCheckpoint journals a WorkspaceCheckpointed for the materialized seed ref as
+// the session's FIRST workspace checkpoint (design §"Seeding"). It is Enduring, so it
+// flows through the hub's required durable tap: on append failure the session faults and
+// the caller (Lifecycle.NewSession) shuts the session down. Trigger=Seed carries a zero
+// Cause; Consistency is Quiescent (a seed materializes into an empty, unmutated root).
+func (s *Session) recordSeedCheckpoint(ctx context.Context, ref workspacestore.Ref) error {
+	stamped, err := s.factory.Stamp(event.Header{Coordinates: identity.Coordinates{SessionID: s.sessionID}})
+	if err != nil {
+		return &SessionError{Kind: SessionIDGenerationFailed, Cause: err}
+	}
+	if err := s.PublishEvent(ctx, event.WorkspaceCheckpointed{
+		Header:      stamped,
+		Ref:         string(ref),
+		Consistency: event.SnapshotQuiescent,
+		Trigger:     event.SnapshotTriggerSeed,
+	}); err != nil {
+		return &SessionError{Kind: SessionContextDone, Cause: err}
+	}
+	return nil
 }

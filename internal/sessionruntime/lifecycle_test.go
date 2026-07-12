@@ -215,7 +215,7 @@ func TestLifecycleRun(t *testing.T) {
 				cancel()
 			}
 
-			s, err := r.NewSession(ctx)
+			s, err := r.NewSession(ctx, "")
 
 			if tt.wantKind != "" {
 				if s != nil {
@@ -272,7 +272,7 @@ func runAndShutdown(t *testing.T, store *sessionstore.Store, c loop.Definition) 
 	if err != nil {
 		t.Fatalf("NewLifecycle (original run): %v", err)
 	}
-	s, err := r.NewSession(context.Background())
+	s, err := r.NewSession(context.Background(), "")
 	if err != nil {
 		t.Fatalf("NewSession (original): %v", err)
 	}
@@ -408,7 +408,7 @@ func TestLifecycleConcurrentReuse(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			s, err := r.NewSession(context.Background())
+			s, err := r.NewSession(context.Background(), "")
 			var sid uuid.UUID
 			if s != nil {
 				sid = s.SessionID()

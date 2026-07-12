@@ -124,6 +124,23 @@ type Lifecycle struct {
 	// (whatever cfg carries is untouched).
 	ceilingFactory CeilingFactory
 	fingerprint    FingerprintProvider
+
+	// placement is the OPTIONAL managed-workspace placement (exclusive/per-session/shared)
+	// resolved per session by NewSession/RestoreSession. The zero value (PlacementNone) means
+	// no managed workspace: no root resolution, no lease, no coordinator — the historical
+	// default. Captured once via WithLifecyclePlacement.
+	placement WorkspacePlacement
+}
+
+// WithLifecyclePlacement captures the managed-workspace placement the rig declared. The
+// unconfigured zero value is ignored (no managed workspace). Forwarded to NewSession and
+// RestoreSession, which resolve it per-session after acquiring the session lease.
+func WithLifecyclePlacement(p WorkspacePlacement) LifecycleOption {
+	return func(r *Lifecycle) {
+		if p.Configured() {
+			r.placement = p
+		}
+	}
 }
 
 // CeilingFactory mints a fresh security-ceiling state. The Lifecycle calls it once per
@@ -246,7 +263,7 @@ func NewTopologyLifecycle(topology Topology, store *sessionstore.Store, opts ...
 // the minted id, the live session, and a typed *NewSessionError on any failure. On ANY failure
 // after the lease is acquired the lease is released best-effort, so a failed NewSession never
 // strands single-writer ownership.
-func (r *Lifecycle) NewSession(ctx context.Context) (*Session, error) {
+func (r *Lifecycle) NewSession(ctx context.Context, seed workspacestore.Ref) (*Session, error) {
 	select {
 	case <-ctx.Done():
 		return nil, &NewSessionError{Kind: NewSessionContextDone, Cause: ctx.Err()}
@@ -307,14 +324,62 @@ func (r *Lifecycle) NewSession(ctx context.Context) (*Session, error) {
 		opts = append(opts, WithCeiling(r.ceilingFactory()))
 	}
 
+	// Resolve the managed-workspace placement (design §"Placement details"). The session
+	// lease is already held (above), so the exclusive root lease is acquired AFTER it, as
+	// the design mandates. On root contention the session lease is released and the typed
+	// *WorkspaceRootBusyError surfaces (fail closed). A per-session/shared placement takes
+	// no lease. When there is no placement, resolved stays nil and nothing changes.
+	var resolved *resolvedPlacement
+	if r.placement.Configured() {
+		resolved, err = r.placement.resolveForNew(ctx, sid)
+		if err != nil {
+			releaseLease(lease)
+			return nil, &NewSessionError{Kind: NewSessionLeaseFailed, Cause: err}
+		}
+		opts = append(opts, withResolvedPlacement(resolved))
+	}
+
+	// Seeding (design §"Seeding"): materialize the seed BEFORE constructing the session so
+	// it lands in the (empty) root and becomes the first workspace checkpoint. Valid only
+	// for per-session and an EMPTY exclusive root; never shared; the ref must resolve.
+	if seed != "" {
+		if err := r.placement.materializeSeed(ctx, resolved, seed); err != nil {
+			releaseResolvedRoot(ctx, resolved)
+			releaseLease(lease)
+			return nil, &NewSessionError{Kind: NewSessionRuntimeFailed, Cause: err}
+		}
+	}
+
 	s, err := NewTopology(ctx, r.topology, opts...)
 	if err != nil {
 		// NewSession failed, so the session never took ownership of the lease-release hook — release
 		// it here best-effort so ownership is not stranded.
+		releaseResolvedRoot(ctx, resolved)
 		releaseLease(lease)
 		return nil, &NewSessionError{Kind: NewSessionRuntimeFailed, Cause: err}
 	}
+	// The session now owns both leases (via WithLeaseRelease + withResolvedPlacement); start
+	// the exclusive root-lease loss watcher so ownership loss faults the session.
+	s.watchRootLease()
+	// Journal the seed as the first workspace checkpoint AFTER SessionStarted/LoopStarted.
+	// Failing to record it faults durability, so shut the session down (releasing both
+	// leases) and fail closed.
+	if seed != "" {
+		if err := s.recordSeedCheckpoint(ctx, seed); err != nil {
+			_ = s.Shutdown(ctx)
+			return nil, &NewSessionError{Kind: NewSessionRuntimeFailed, Cause: err}
+		}
+	}
 	return s, nil
+}
+
+// releaseResolvedRoot releases a resolved placement's exclusive root lease best-effort on
+// a NewSession failure path (before the session takes ownership). Nil-safe.
+func releaseResolvedRoot(ctx context.Context, resolved *resolvedPlacement) {
+	if resolved == nil || resolved.rootRelease == nil {
+		return
+	}
+	_ = resolved.rootRelease(ctx)
 }
 
 // RestoreSession rebuilds a live session from its durable journal under the id it was created
@@ -338,6 +403,9 @@ func (r *Lifecycle) RestoreSession(ctx context.Context, id uuid.UUID) (*Session,
 	// events), so a restored session gets its own clamp just like a fresh NewSession.
 	if r.ceilingFactory != nil {
 		opts = append(opts, WithCeiling(r.ceilingFactory()))
+	}
+	if r.placement.Configured() {
+		opts = append(opts, withPlacementSpec(r.placement))
 	}
 	return RestoreTopology(ctx, r.topology, id, r.store, opts...)
 }

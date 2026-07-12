@@ -19,6 +19,9 @@ type definitionState struct {
 	seen              map[singletonKey]bool
 	lifecycleOptions  []sessionruntime.LifecycleOption
 	fingerprintFields ConfigFingerprintFields
+	// placements accumulates every workspace placement option. Define enforces at most
+	// one; more than one is a typed rejection.
+	placements []pendingPlacement
 }
 
 // Rig is an immutable design-time assembly that creates and restores sessions.
@@ -96,11 +99,35 @@ func Define(options ...Option) (*Rig, error) {
 			return nil, &DefinitionError{Kind: DefinitionInvalidLoop, Name: name}
 		}
 	}
+	// Resolve the (at-most-one) workspace placement: canonicalize the root/base, derive the
+	// exclusive root lease name, and enforce non-nil dependencies. A workspace-requiring
+	// tool with NO placement makes the rig invalid.
+	placement, region, err := resolvePlacement(state.placements)
+	if err != nil {
+		return nil, err
+	}
+	if !placement.Configured() && requiresWorkspaceTool(state.loops) {
+		return nil, &WorkspacePlacementError{Kind: WorkspaceToolWithoutPlacement}
+	}
+	if placement.Configured() {
+		if err := checkPersistenceOverlap(state.store, placement, region); err != nil {
+			return nil, err
+		}
+	}
+
 	fields := state.fingerprintFields
+	if placement.Configured() {
+		// Fold the placement mode + canonical region into the workspace-root fingerprint
+		// field so a placement change (mode or path) is a config change.
+		fields.WorkspaceRoot = placementFingerprint(placement, region)
+	}
 	provider := sessionruntime.FingerprintProvider(func(definition loop.BoundDefinition) event.ConfigFingerprint {
 		return fingerprintWithTopology(definition, fields, state.loops, state.primers, state.activePrimer)
 	})
 	lifecycleOptions := append([]sessionruntime.LifecycleOption(nil), state.lifecycleOptions...)
+	if placement.Configured() {
+		lifecycleOptions = append(lifecycleOptions, sessionruntime.WithLifecyclePlacement(placement))
+	}
 	lifecycleOptions = append(lifecycleOptions, sessionruntime.WithLifecycleFingerprintProvider(provider))
 	primerNames := make([]identity.AgentName, len(state.primers))
 	for i, name := range state.primers {

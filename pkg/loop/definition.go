@@ -163,6 +163,30 @@ func (d Definition) Modes() []Mode {
 	return cloneModes(d.state.modes)
 }
 
+// ToolRequirements returns the union of every configured tool's Requirements across the
+// base tool set and all declared modes. rig uses it to reject a workspace-requiring tool
+// definition when no workspace placement is configured (the RequiresWorkspace binding could
+// never be satisfied). It reads immutable design-time state, so it needs no runtime binding.
+func (d Definition) ToolRequirements() tool.Requirements {
+	if d.state == nil {
+		return 0
+	}
+	var req tool.Requirements
+	orAll := func(defs []tool.Definition) {
+		for _, t := range defs {
+			if nilLike(t) {
+				continue
+			}
+			req |= t.Requirements()
+		}
+	}
+	orAll(d.state.tools)
+	for _, mode := range d.state.modes {
+		orAll(mode.Tools)
+	}
+	return req
+}
+
 // InitialMode returns the explicitly selected mode, or empty for the base mode.
 func (d Definition) InitialMode() ModeName {
 	if d.state == nil {

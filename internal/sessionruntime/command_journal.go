@@ -200,6 +200,41 @@ func WithWorkspaceStore(ws *workspacestore.Store, root string) Option {
 	}
 }
 
+// withResolvedPlacement installs a resolved managed-workspace placement: the workspace
+// store + root, the ONE session-scoped mutation coordinator every loop's tools serialize
+// through, the exclusive root-lease release hook (nil for non-leased modes), and the
+// lease-loss channel the session watches to fault on ownership loss. It is the internal
+// composition seam the Lifecycle populates after acquiring the root lease and materializing
+// any seed. A nil argument is ignored (the no-placement default stays). This is the ONLY
+// path that populates the coordinator, so a session without a placement leaves
+// tool.Bindings.Workspace nil at every bind site.
+func withResolvedPlacement(r *resolvedPlacement) Option {
+	return func(s *Session) {
+		if r == nil || r.coordinator == nil {
+			return
+		}
+		s.ws = r.store
+		s.wsRoot = r.root
+		s.wsMode = r.mode
+		s.wsCoordinator = r.coordinator
+		s.wsRootRelease = r.rootRelease
+		s.wsLeaseLost = r.leaseLost
+	}
+}
+
+// withPlacementSpec carries the UNRESOLVED managed-workspace placement into RestoreTopology,
+// which resolves it per-session after acquiring the session lease (so the exclusive root
+// lease is acquired AFTER the session lease on the restore path too). NewSession resolves
+// its placement in the Lifecycle instead (seeding must materialize before construction), so
+// it uses withResolvedPlacement directly. A zero/unconfigured spec is ignored.
+func withPlacementSpec(p WorkspacePlacement) Option {
+	return func(s *Session) {
+		if p.Configured() {
+			s.placementSpec = p
+		}
+	}
+}
+
 // stampNow returns the session clock's current time, defaulting to the wall clock if
 // the clock seam is unset (a struct-literal test session). The session stamps this onto
 // every dispatched command's Header.CreatedAt at the dispatch boundary, so a journaled

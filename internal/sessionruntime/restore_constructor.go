@@ -181,11 +181,16 @@ func restoreTopologySession(
 	// fail-secure exit for every failure after the journal exists: the session never
 	// comes up, and the failure is recorded in the durable log (a best-effort append — a
 	// failure to record the failure never masks the original cause).
+	// resolved holds the per-session managed-workspace placement (exclusive root lease +
+	// coordinator) once resolved below. recordErrored releases the root lease BEFORE the
+	// session lease (LIFO) so a failed restore never strands root-lease ownership.
+	var resolved *resolvedPlacement
 	recordErrored := func(restoreErr error) (*Session, error) {
 		_ = appendRestoreEvent(ctx, j, factory, event.RestoreErrored{
 			Header: event.Header{Coordinates: identity.Coordinates{SessionID: sessionID}},
 			Err:    restoreErr,
 		})
+		releaseResolvedRoot(ctx, resolved)
 		releaseLease(lease)
 		return nil, restoreErr
 	}
@@ -222,8 +227,22 @@ func restoreTopologySession(
 	// live session once buildRestoredSession creates it. Seed its durable request→terminal
 	// index from the full stream so a wait for a wait:false request submitted before the
 	// restart resolves after restore.
+	// Resolve the managed-workspace placement AFTER the session lease (acquired in step 1),
+	// honoring the session-lease-before-root-lease ordering on the restore path. It
+	// populates probe.ws/wsRoot/wsCoordinator so the loop bind below serializes the
+	// restored session's tools through the live coordinator, and re-fences an exclusive
+	// root. A root-lease contention fails the restore closed.
+	if probe.placementSpec.Configured() {
+		r, placeErr := probe.placementSpec.resolveForNew(ctx, sessionID)
+		if placeErr != nil {
+			return recordErrored(&RestoreError{Kind: RestoreLeaseFailed, Cause: placeErr})
+		}
+		resolved = r
+		withResolvedPlacement(resolved)(probe)
+	}
+
 	manager := newDelegationManager(topology)
-	plans, activePlan, err := planLoops(sessionCtx, sessionID, topology, activeDefinition, roots, starts, allRecords, allowMismatch, manager, probe.ceiling)
+	plans, activePlan, err := planLoops(sessionCtx, sessionID, topology, activeDefinition, roots, starts, allRecords, allowMismatch, manager, probe.ceiling, probe.newWorkspaceBinding)
 	if err != nil {
 		return recordErrored(err)
 	}
@@ -329,6 +348,12 @@ func restoreTopologySession(
 	// opts so the restore owns the lease lifecycle (a caller cannot accidentally override
 	// the releaser with a stale one).
 	leaseOpts := append(append([]Option(nil), opts...), WithCeiling(probe.ceiling), WithLeaseRelease(lease.Release))
+	if resolved != nil {
+		// Hand the restored session the coordinator + exclusive root-lease release so its
+		// Shutdown releases the root lease before the session lease (LIFO), and so its loops'
+		// tools serialize through the live coordinator.
+		leaseOpts = append(leaseOpts, withResolvedPlacement(resolved))
+	}
 	// Recover the foreign session id from the primary loop's events. Prebound adapters
 	// stamped it on LoopStarted; late-bound adapters record it with ForeignSessionBound.
 	// buildRestoredSession fails closed on an empty sid for a foreign engine.
@@ -358,6 +383,9 @@ func restoreTopologySession(
 		sessionCancel()
 		return recordErrored(&RestoreError{Kind: RestoreAppendFailed, Cause: err})
 	}
+	// Start the exclusive root-lease loss watcher now that the restored session owns the
+	// root lease (via leaseOpts). Nil-safe for per-session/shared/no placement.
+	s.watchRootLease()
 	contextTransferred = true
 	return s, nil
 }
@@ -429,7 +457,7 @@ func discoverRoots(all []event.Event, topology Topology, allowMismatch bool) (ma
 // unknown (subagents of a single-definition run). It is the single Bind of each loop,
 // performed inside the restore lease. It returns the ordered plans and the active plan, or a
 // typed error the caller records as a RestoreErrored.
-func planLoops(sessionCtx context.Context, sessionID uuid.UUID, topology Topology, activeDefinition loop.Definition, roots map[identity.AgentName]event.LoopStarted, starts []event.LoopStarted, allRecords []journal.JournalRecord, allowMismatch bool, manager *delegationManager, ceilingSource ceiling.Source) ([]loopPlan, loopPlan, error) {
+func planLoops(sessionCtx context.Context, sessionID uuid.UUID, topology Topology, activeDefinition loop.Definition, roots map[identity.AgentName]event.LoopStarted, starts []event.LoopStarted, allRecords []journal.JournalRecord, allowMismatch bool, manager *delegationManager, ceilingSource ceiling.Source, wsBind func() *tool.WorkspaceBinding) ([]loopPlan, loopPlan, error) {
 	plans := make([]loopPlan, 0, len(starts))
 	boundByLoop := make(map[uuid.UUID]loop.BoundDefinition, len(starts))
 	activeIndex := -1
@@ -449,7 +477,7 @@ func planLoops(sessionCtx context.Context, sessionID uuid.UUID, topology Topolog
 			// invents a missing definition here).
 			return nil, loopPlan{}, &RestoreError{Kind: RestoreLoopFailed, Cause: &AgentNameMismatchError{Persisted: started.AgentName}}
 		}
-		bound, bindErr := definition.Bind(sessionCtx, tool.Bindings{SessionID: sessionID, LoopID: started.LoopID, Ceiling: ceilingSource, Delegate: manager.controllerFor(started.LoopID, definition), ExtraTools: delegateExtraTools(definition, manager)})
+		bound, bindErr := definition.Bind(sessionCtx, tool.Bindings{SessionID: sessionID, LoopID: started.LoopID, Ceiling: ceilingSource, Workspace: wsBind(), Delegate: manager.controllerFor(started.LoopID, definition), ExtraTools: delegateExtraTools(definition, manager)})
 		if bindErr != nil {
 			return nil, loopPlan{}, &RestoreError{Kind: RestoreLoopFailed, Cause: bindErr}
 		}

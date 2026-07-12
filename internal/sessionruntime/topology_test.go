@@ -81,7 +81,7 @@ func TestRestoreTopologyMissingPrimerFailsBeforeRestoreDone(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	original, err := lifecycle.NewSession(context.Background())
+	original, err := lifecycle.NewSession(context.Background(), "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -129,7 +129,7 @@ func TestRestoreTopologyAcquiresLeaseBeforeBinding(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	live, err := lifecycle.NewSession(context.Background())
+	live, err := lifecycle.NewSession(context.Background(), "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -173,7 +173,7 @@ func TestRestoreTopologyBindFailureHasNoRestoreDone(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	original, err := lifecycle.NewSession(context.Background())
+	original, err := lifecycle.NewSession(context.Background(), "")
 	if err != nil {
 		t.Fatal(err)
 	}
