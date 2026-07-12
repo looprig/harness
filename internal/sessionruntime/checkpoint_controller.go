@@ -78,6 +78,7 @@ type checkpointControllerConfig struct {
 	Admission      func(context.Context) (func(), error)
 	RequiredQueued func(event.Event)
 	ManualQueued   func()
+	ObservePending func()
 	ObserveError   func(error)
 }
 
@@ -447,9 +448,13 @@ func (c *checkpointController) observeBestEffortError(workerCtx context.Context,
 	if err == nil || c.cfg.ObserveError == nil {
 		return
 	}
+	if c.cfg.ObservePending != nil {
+		c.cfg.ObservePending()
+	}
 	// Activation and controller shutdown deliberately abandon a best-effort walk;
 	// they are expected control flow, not operational checkpoint failures.
-	if errors.Is(context.Cause(workerCtx), errCheckpointActivated) || c.ctx.Err() != nil {
+	if errors.Is(err, context.Canceled) &&
+		(errors.Is(context.Cause(workerCtx), errCheckpointActivated) || c.ctx.Err() != nil) {
 		return
 	}
 	c.cfg.ObserveError(err)

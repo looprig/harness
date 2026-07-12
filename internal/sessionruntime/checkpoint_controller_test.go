@@ -505,6 +505,84 @@ func TestCheckpointBestEffortShutdownCancellationIsNotObservedAsFailure(t *testi
 	}
 }
 
+func TestCheckpointBestEffortGenuineFailureRacingExpectedCancellationIsObserved(t *testing.T) {
+	for _, tt := range []struct {
+		name   string
+		cancel func(*checkpointController, chan struct{})
+	}{
+		{
+			name: "activation after failure",
+			cancel: func(c *checkpointController, done chan struct{}) {
+				c.activated()
+				close(done)
+			},
+		},
+		{
+			name: "shutdown after failure",
+			cancel: func(c *checkpointController, done chan struct{}) {
+				go func() {
+					c.shutdown()
+					close(done)
+				}()
+				<-c.ctx.Done()
+			},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			rootCause := errors.New("genuine snapshot failure")
+			ws, err := workspacestore.Open(failingPutBlobs{Blobs: memstore.New().Blobs, err: rootCause})
+			if err != nil {
+				t.Fatal(err)
+			}
+			root := t.TempDir()
+			if err := os.WriteFile(filepath.Join(root, "work.txt"), []byte("work"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			sid, _ := uuid.New()
+			lid, _ := uuid.New()
+			tid, _ := uuid.New()
+			stepID, _ := uuid.New()
+			eventID, _ := uuid.New()
+			observePending := make(chan struct{})
+			releaseObserve := make(chan struct{})
+			observed := make(chan error, 1)
+			c := newCheckpointController(checkpointControllerConfig{
+				SessionID: sid, Policy: checkpointPolicy{Trigger: checkpointOnStepDone, Priority: checkpointBestEffort, Timeout: time.Second},
+				Store: ws, Root: root, Mode: PlacementSession, Coordinator: newWorkspaceCoordinator(nil),
+				Publisher: &boundaryPublisher{order: &checkpointOrder{}}, Factory: event.NewFactory(uuid.New, time.Now),
+				ObservePending: func() { close(observePending); <-releaseObserve },
+				ObserveError:   func(err error) { observed <- err },
+			})
+			t.Cleanup(c.shutdown)
+			trigger := event.StepDone{Header: event.Header{Coordinates: identity.Coordinates{SessionID: sid, LoopID: lid, TurnID: tid, StepID: stepID}, EventID: eventID}}
+			if err := c.boundary(context.Background(), trigger); err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case <-observePending:
+			case <-time.After(time.Second):
+				t.Fatal("genuine failure did not reach observation barrier")
+			}
+			cancelDone := make(chan struct{})
+			tt.cancel(c, cancelDone)
+			close(releaseObserve)
+			select {
+			case err := <-observed:
+				if !errors.Is(err, rootCause) {
+					t.Fatalf("observed error = %v, want genuine cause %v", err, rootCause)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("genuine failure was suppressed by later cancellation")
+			}
+			select {
+			case <-cancelDone:
+			case <-time.After(time.Second):
+				t.Fatal("cancellation did not finish")
+			}
+		})
+	}
+}
+
 func TestCheckpointRequiredTimeoutLatchesAndManualSuccessRecovers(t *testing.T) {
 	t.Parallel()
 	blobs := &blockingBoundaryBlobs{Blobs: memstore.New().Blobs, entered: make(chan struct{}), release: make(chan struct{})}
