@@ -97,6 +97,8 @@ func classifyCommand(cmd Command) (CommandName, bool) {
 		return CommandSetSecurityCeiling, true
 	case CancelQueuedInput:
 		return CommandCancelQueuedInput, true
+	case CancelDelegateRequest:
+		return CommandCancelDelegateRequest, true
 	case Interrupt:
 		return CommandInterrupt, true
 	case Shutdown:
@@ -137,7 +139,7 @@ func encodePayload(name CommandName, cmd Command) ([]byte, error) {
 		return marshalUserInput(c)
 	case SubagentResult:
 		return marshalSubagentResult(c)
-	case ApproveToolCall, DenyToolCall, ProvideUserInput, CancelQueuedInput,
+	case ApproveToolCall, DenyToolCall, ProvideUserInput, CancelQueuedInput, CancelDelegateRequest,
 		SetSecurityCeiling, Interrupt, Shutdown:
 		// Every field round-trips through encoding/json directly: header + scalars/
 		// strings/ids (uuid.UUID has its own text codec) + embedded Coordinates/
@@ -285,6 +287,8 @@ func decodePayload(tag CommandName, data []byte) (Command, error) {
 		return decodePlain[SetSecurityCeiling](tag, data)
 	case CommandCancelQueuedInput:
 		return decodePlain[CancelQueuedInput](tag, data)
+	case CommandCancelDelegateRequest:
+		return decodePlain[CancelDelegateRequest](tag, data)
 	case CommandInterrupt:
 		return decodePlain[Interrupt](tag, data)
 	case CommandShutdown:

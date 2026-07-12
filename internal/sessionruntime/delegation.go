@@ -187,6 +187,26 @@ func seedResolvedDelegateRecords(m *delegationManager, records []journal.Journal
 			index[requestID] = terminal
 		}
 	}
+	// A queued request may be durably cancelled before TurnStarted, so it has no
+	// turn terminal to fold. Overlay only cancellations for already admitted
+	// intent+acceptance IDs; ordinary/unaccepted cancellations remain invisible.
+	for _, ev := range combined {
+		cancelled, ok := ev.(event.InputCancelled)
+		if !ok || cancelled.Cause.CommandID.IsZero() {
+			continue
+		}
+		admitted, ok := index[cancelled.Cause.CommandID]
+		if !ok {
+			continue
+		}
+		if cancelled.LoopID != admitted.childID {
+			return &journal.CommandRouteMismatchError{RecordLoopID: cancelled.LoopID, TargetLoopID: admitted.childID}
+		}
+		index[cancelled.Cause.CommandID] = resolvedRequest{
+			childID: admitted.childID,
+			status:  delegateStatusFromCancelReason(cancelled.Reason),
+		}
+	}
 	m.mu.Lock()
 	m.resolved = index
 	m.mu.Unlock()
@@ -453,34 +473,42 @@ func (c *scopedController) wait(ctx context.Context, s *Session, req tool.Delega
 	if err := c.ownsChild(s, req.DelegateID); err != nil {
 		return tool.DelegateResult{}, err
 	}
+	requestID := *req.RequestID
 	// Live in-memory handle first: a request registered this process lifetime.
-	if pr, ok := c.manager.getPending(*req.RequestID); ok {
+	if pr, ok := c.manager.getPending(requestID); ok {
 		if pr.childID != req.DelegateID {
-			return tool.DelegateResult{}, &DelegateError{Kind: DelegateUnknownRequest, RequestID: *req.RequestID}
+			return tool.DelegateResult{}, &DelegateError{Kind: DelegateUnknownRequest, RequestID: requestID}
 		}
 		waitCtx, cancel := waitContext(ctx, req.TimeoutSeconds)
 		defer cancel()
 		select {
 		case <-pr.done:
-			c.manager.removePending(*req.RequestID)
+			c.manager.removePending(requestID)
 			text, status := pr.result()
-			return tool.DelegateResult{DelegateID: req.DelegateID, RequestID: *req.RequestID, Status: status, Output: text}, nil
+			return tool.DelegateResult{DelegateID: req.DelegateID, RequestID: requestID, Status: status, Output: text}, nil
 		case <-waitCtx.Done():
-			// The pending request stays registered so a later wait can still collect it.
-			status := timeoutOrInterrupted(req.TimeoutSeconds, waitCtx)
-			if status == tool.DelegateStatusTimedOut {
-				go func() { _ = s.interruptLoopID(req.DelegateID) }()
+			// Recheck before dispatch so an already-observed terminal wins without even
+			// sending control; the actor command remains authoritative for the race after
+			// this check. The pending handle stays collectable either way.
+			select {
+			case <-pr.done:
+				c.manager.removePending(requestID)
+				text, status := pr.result()
+				return tool.DelegateResult{DelegateID: req.DelegateID, RequestID: requestID, Status: status, Output: text}, nil
+			default:
 			}
-			return tool.DelegateResult{DelegateID: req.DelegateID, RequestID: *req.RequestID, Status: status}, nil
+			status := timeoutOrInterrupted(req.TimeoutSeconds, waitCtx)
+			go func() { _, _ = s.cancelDelegateRequest(req.DelegateID, requestID) }()
+			return tool.DelegateResult{DelegateID: req.DelegateID, RequestID: requestID, Status: status}, nil
 		}
 	}
 	// Durable fallback (post-restore): the in-memory handle is gone, but the child's turn
 	// terminal survived in the folded history the restore reconstructed. Ownership is
 	// already enforced above; the resolved entry must name the same owned child.
-	if rr, ok := c.manager.getResolved(*req.RequestID); ok && rr.childID == req.DelegateID {
-		return tool.DelegateResult{DelegateID: req.DelegateID, RequestID: *req.RequestID, Status: rr.status, Output: rr.text}, nil
+	if rr, ok := c.manager.getResolved(requestID); ok && rr.childID == req.DelegateID {
+		return tool.DelegateResult{DelegateID: req.DelegateID, RequestID: requestID, Status: rr.status, Output: rr.text}, nil
 	}
-	return tool.DelegateResult{}, &DelegateError{Kind: DelegateUnknownRequest, RequestID: *req.RequestID}
+	return tool.DelegateResult{}, &DelegateError{Kind: DelegateUnknownRequest, RequestID: requestID}
 }
 
 // interrupt interrupts an owned child's current turn without destroying the loop.
@@ -529,9 +557,7 @@ func (c *scopedController) resolveOrQueue(ctx context.Context, s *Session, child
 		waitCtx, cancel := waitContext(ctx, req.TimeoutSeconds)
 		defer cancel()
 		text, err := drainDelegateAnswer(waitCtx, sub, requestID, func() {
-			if ierr := s.interruptLoopID(childID); ierr != nil {
-				_ = ierr
-			}
+			_, _ = s.cancelDelegateRequest(childID, requestID)
 		})
 		status := statusFromDrain(err)
 		if status == tool.DelegateStatusInterrupted && didTimeout(req.TimeoutSeconds, waitCtx) {
@@ -540,9 +566,7 @@ func (c *scopedController) resolveOrQueue(ctx context.Context, s *Session, child
 		return tool.DelegateResult{DelegateID: childID, RequestID: requestID, Status: status, Output: text}, nil
 	}
 	c.manager.registerPending(requestID, childID, sub, s.sessionCtx, func() {
-		if ierr := s.interruptLoopID(childID); ierr != nil {
-			_ = ierr
-		}
+		_, _ = s.cancelDelegateRequest(childID, requestID)
 	})
 	return tool.DelegateResult{DelegateID: childID, RequestID: requestID, Status: tool.DelegateStatusQueued}, nil
 }
@@ -614,7 +638,25 @@ func statusFromDrain(err error) tool.DelegateStatusValue {
 	if errors.As(err, &interrupted) {
 		return tool.DelegateStatusInterrupted
 	}
+	var cancelled *drainCancelledError
+	if errors.As(err, &cancelled) {
+		return delegateStatusFromCancelReason(cancelled.Reason)
+	}
 	return tool.DelegateStatusFailed
+}
+
+// delegateStatusFromCancelReason is the single live/restore mapping for an admitted
+// queued request that never opened a turn. Client retraction is conservatively
+// Interrupted (cancelled by control action); unknown future reasons fail closed.
+func delegateStatusFromCancelReason(reason event.CancelReason) tool.DelegateStatusValue {
+	switch reason {
+	case event.CancelTurnInterrupted, event.CancelClientRetracted:
+		return tool.DelegateStatusInterrupted
+	case event.CancelTurnFailed:
+		return tool.DelegateStatusFailed
+	default:
+		return tool.DelegateStatusFailed
+	}
 }
 
 // waitContext bounds a waiting operation by an optional non-negative timeout. A nil
@@ -706,7 +748,7 @@ func (s *Session) enqueueDelegateTurn(ctx context.Context, loopID uuid.UUID, blo
 		select {
 		case err := <-accepted:
 			if err != nil {
-				return uuid.UUID{}, &SessionError{Kind: SessionDelegateIntentAppendFailed, Cause: err}
+				return uuid.UUID{}, &SessionError{Kind: SessionDelegateAdmissionCommitFailed, Cause: err}
 			}
 			return id, nil
 		case <-ctx.Done():

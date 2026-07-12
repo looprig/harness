@@ -12,8 +12,10 @@ import (
 
 	"github.com/looprig/core/content"
 	"github.com/looprig/core/uuid"
+	"github.com/looprig/harness/internal/runtimecontract"
 	"github.com/looprig/harness/pkg/command"
 	"github.com/looprig/harness/pkg/event"
+	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/loop"
 )
 
@@ -275,6 +277,26 @@ func sendManagedForeign(t *testing.T, l *Loop, text string) uuid.UUID {
 	return id
 }
 
+func sendManagedForeignResult(t *testing.T, l *Loop, text string) (uuid.UUID, error) {
+	t.Helper()
+	id := mustID(t)
+	accepted := make(chan error, 1)
+	l.Commands <- command.UserInput{
+		Header:       command.Header{CommandID: id},
+		Blocks:       []content.Block{&content.TextBlock{Text: text}},
+		NoFold:       true,
+		TargetLoopID: l.loopID,
+		Accepted:     accepted,
+	}
+	select {
+	case err := <-accepted:
+		return id, err
+	case <-time.After(2 * time.Second):
+		t.Fatalf("managed %q acceptance timed out", text)
+		return uuid.UUID{}, nil
+	}
+}
+
 func awaitFIFOSpawn(t *testing.T, agent *fifoTestAgent) fifoSpawn {
 	t.Helper()
 	select {
@@ -288,6 +310,24 @@ func awaitFIFOSpawn(t *testing.T, agent *fifoTestAgent) fifoSpawn {
 
 func completeFIFOSpawn(spawn fifoSpawn, answer string) {
 	spawn.stream.finish(ForeignEvent{Kind: ForeignTerminalOK, Message: aiMessage(answer)})
+}
+
+func cancelForeignDelegateRequest(t *testing.T, l *Loop, target uuid.UUID) command.DelegateCancelResult {
+	t.Helper()
+	ack := make(chan command.DelegateCancelResult, 1)
+	l.Commands <- command.CancelDelegateRequest{
+		Header:          command.Header{CommandID: mustID(t)},
+		Coordinates:     identity.Coordinates{SessionID: l.sessionID, LoopID: l.loopID},
+		TargetCommandID: target,
+		Ack:             ack,
+	}
+	select {
+	case result := <-ack:
+		return result
+	case <-time.After(2 * time.Second):
+		t.Fatal("foreign targeted cancel was not acknowledged")
+		return command.DelegateCancelNoop
+	}
 }
 
 func TestManagedFollowUpsQueueFIFOWhileForeignTurnActive(t *testing.T) {
@@ -340,13 +380,52 @@ func TestManagedFollowUpsQueueFIFOWhileForeignTurnActive(t *testing.T) {
 	shutdown(t, l)
 }
 
-func waitManagedCancellations(t *testing.T, pub *fakePublisher, ids ...uuid.UUID) {
+func TestCancelDelegateRequestRemovesOnlyQueuedForeignRequest(t *testing.T) {
+	t.Parallel()
+	agent := &fifoTestAgent{spawned: make(chan fifoSpawn, 2)}
+	pub := &fakePublisher{}
+	l, _ := newTestLoop(t, Spec{Agent: agent}, pub)
+	submitUserInput(t, l, "A")
+	_ = awaitFIFOSpawn(t, agent)
+	bID := sendManagedForeign(t, l, "B")
+	if got := cancelForeignDelegateRequest(t, l, bID); got != command.DelegateCancelQueued {
+		t.Fatalf("cancel result = %v, want queued", got)
+	}
+	waitManagedCancellations(t, pub, event.CancelClientRetracted, bID)
+	sendInterrupt(t, l)
+}
+
+func TestCancelDelegateRequestInterruptsActiveForeignRequestButPreservesNext(t *testing.T) {
+	t.Parallel()
+	agent := &fifoTestAgent{spawned: make(chan fifoSpawn, 2)}
+	pub := &fakePublisher{}
+	l, _ := newTestLoop(t, Spec{Agent: agent}, pub)
+	activeID := mustID(t)
+	submitUserInputWithID(t, l, "B", activeID)
+	_ = awaitFIFOSpawn(t, agent)
+	nextID := sendManagedForeign(t, l, "C")
+	if got := cancelForeignDelegateRequest(t, l, activeID); got != command.DelegateCancelActive {
+		t.Fatalf("cancel result = %v, want active", got)
+	}
+	next := awaitFIFOSpawn(t, agent)
+	if got := next.turn.Input[0].(*content.TextBlock).Text; got != "C" {
+		t.Fatalf("next turn = %q, want C", got)
+	}
+	for _, ev := range pub.snapshot() {
+		if cancelled, ok := ev.(event.InputCancelled); ok && cancelled.Cause.CommandID == nextID {
+			t.Fatalf("targeted cancel also cancelled C: %+v", cancelled)
+		}
+	}
+	sendInterrupt(t, l)
+}
+
+func waitManagedCancellations(t *testing.T, pub *fakePublisher, reason event.CancelReason, ids ...uuid.UUID) {
 	t.Helper()
 	deadline := time.After(2 * time.Second)
 	for {
 		seen := make(map[uuid.UUID]bool)
 		for _, ev := range pub.snapshot() {
-			if cancelled, ok := ev.(event.InputCancelled); ok && cancelled.Reason == event.CancelTurnInterrupted {
+			if cancelled, ok := ev.(event.InputCancelled); ok && cancelled.Reason == reason {
 				seen[cancelled.Cause.CommandID] = true
 			}
 		}
@@ -375,7 +454,7 @@ func TestInterruptFlushesAcceptedForeignFollowUps(t *testing.T) {
 	bID := sendManagedForeign(t, l, "B")
 	cID := sendManagedForeign(t, l, "C")
 	sendInterrupt(t, l)
-	waitManagedCancellations(t, pub, bID, cID)
+	waitManagedCancellations(t, pub, event.CancelTurnInterrupted, bID, cID)
 	select {
 	case unexpected := <-agent.spawned:
 		t.Fatalf("interrupted queue spawned %v", unexpected.turn.Input)
@@ -398,7 +477,51 @@ func TestShutdownFlushesAcceptedForeignFollowUps(t *testing.T) {
 		t.Fatalf("shutdown: %v", err)
 	}
 	<-l.Done
-	waitManagedCancellations(t, pub, bID)
+	waitManagedCancellations(t, pub, event.CancelTurnInterrupted, bID)
+}
+
+func TestManagedForeignQueueRejectsEntrySixtyFiveBeforeAcceptance(t *testing.T) {
+	t.Parallel()
+	agent := &fifoTestAgent{spawned: make(chan fifoSpawn, 1)}
+	pub := &fakePublisher{}
+	l, _ := newTestLoop(t, Spec{Agent: agent}, pub)
+	submitUserInput(t, l, "A")
+	_ = awaitFIFOSpawn(t, agent)
+	for i := 0; i < runtimecontract.ManagedInputQueueCapacity; i++ {
+		if _, err := sendManagedForeignResult(t, l, fmt.Sprintf("queued-%d", i)); err != nil {
+			t.Fatalf("queue entry %d: %v", i+1, err)
+		}
+	}
+	rejectedID, err := sendManagedForeignResult(t, l, "queue-full")
+	var rejected *loop.InputRejectedError
+	if !errors.As(err, &rejected) || rejected.Reason != event.RejectQueueFull {
+		t.Fatalf("entry 65 error = %T %v, want queue-full rejection", err, err)
+	}
+	for _, ev := range pub.snapshot() {
+		if accepted, ok := ev.(event.DelegateRequestAccepted); ok && accepted.Cause.CommandID == rejectedID {
+			t.Fatal("entry 65 was durably accepted")
+		}
+	}
+	sendInterrupt(t, l)
+}
+
+func TestForeignProviderFailureFlushesAcceptedQueueFailedWithoutStartingIt(t *testing.T) {
+	t.Parallel()
+	agent := &fifoTestAgent{spawned: make(chan fifoSpawn, 3)}
+	pub := &fakePublisher{}
+	l, _ := newTestLoop(t, Spec{Agent: agent}, pub)
+	submitUserInput(t, l, "A")
+	a := awaitFIFOSpawn(t, agent)
+	bID := sendManagedForeign(t, l, "B")
+	cID := sendManagedForeign(t, l, "C")
+	a.stream.finish(ForeignEvent{Kind: ForeignTerminalError, ErrText: "provider failed"})
+	waitManagedCancellations(t, pub, event.CancelTurnFailed, bID, cID)
+	select {
+	case unexpected := <-agent.spawned:
+		t.Fatalf("failed active turn started queued input %v", unexpected.turn.Input)
+	default:
+	}
+	shutdown(t, l)
 }
 
 func TestUserInputHappyPath(t *testing.T) {

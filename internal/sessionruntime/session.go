@@ -1216,6 +1216,43 @@ func (s *Session) interruptLoopID(loopID uuid.UUID) error {
 	return nil
 }
 
+// cancelDelegateRequest asks one loop actor to atomically cancel exactly one
+// managed request. The actor decides queued/active/terminal without a session-side
+// TOCTOU and never affects a different request on the same loop.
+func (s *Session) cancelDelegateRequest(loopID, requestID uuid.UUID) (command.DelegateCancelResult, error) {
+	l, ok := s.loopFor(loopID)
+	if !ok {
+		return command.DelegateCancelNoop, &SessionError{Kind: SessionLoopNotFound}
+	}
+	id, err := s.newID()
+	if err != nil {
+		return command.DelegateCancelNoop, err
+	}
+	ack := make(chan command.DelegateCancelResult, 1)
+	cmd := command.CancelDelegateRequest{
+		Header:          command.Header{CommandID: id, CreatedAt: s.stampNow()},
+		Coordinates:     identity.Coordinates{SessionID: s.sessionID, LoopID: loopID},
+		TargetCommandID: requestID,
+		Ack:             ack,
+	}
+	s.appendCommand(s.sessionCtx, loopID, cmd)
+	select {
+	case l.CommandSink() <- cmd:
+	case <-s.sessionCtx.Done():
+		return command.DelegateCancelNoop, &SessionError{Kind: SessionContextDone, Cause: s.sessionCtx.Err()}
+	case <-l.DoneChan():
+		return command.DelegateCancelNoop, &SessionError{Kind: SessionLoopExited}
+	}
+	select {
+	case result := <-ack:
+		return result, nil
+	case <-s.sessionCtx.Done():
+		return command.DelegateCancelNoop, &SessionError{Kind: SessionContextDone, Cause: s.sessionCtx.Err()}
+	case <-l.DoneChan():
+		return command.DelegateCancelNoop, &SessionError{Kind: SessionLoopExited}
+	}
+}
+
 // Submit is the HUMAN-ONLY submit entry point: it stamps Agency=AgencyUser (a
 // person authored this input). Programmatic/machine callers go through
 // submitToLoop with Agency=AgencyMachine (the subagent path).

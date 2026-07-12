@@ -8,6 +8,7 @@ import (
 
 	"github.com/looprig/core/content"
 	"github.com/looprig/core/uuid"
+	"github.com/looprig/harness/internal/runtimecontract"
 	"github.com/looprig/harness/pkg/command"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/identity"
@@ -211,7 +212,7 @@ func TestSubagentResultToFullInboxQueues(t *testing.T) {
 	startTurn(t, l, rec, nil) // occupy the loop
 
 	// Fill the inbox to capacity with UserInputs.
-	for i := 0; i < inboxCap; i++ {
+	for i := 0; i < runtimecontract.ManagedInputQueueCapacity; i++ {
 		id := mustID(t)
 		if _, ok := submitUserInput(t, l, rec, id).(event.InputQueued); !ok {
 			t.Fatalf("submit %d: want event.InputQueued", i)
@@ -321,7 +322,7 @@ func TestInboxFullRejected(t *testing.T) {
 	startTurn(t, l, rec, nil) // occupy the loop
 
 	// Fill the inbox to capacity.
-	for i := 0; i < inboxCap; i++ {
+	for i := 0; i < runtimecontract.ManagedInputQueueCapacity; i++ {
 		id := mustID(t)
 		if _, ok := submitUserInput(t, l, rec, id).(event.InputQueued); !ok {
 			t.Fatalf("submit %d: want event.InputQueued", i)

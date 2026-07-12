@@ -181,6 +181,10 @@ func (l *Loop) run(loopCtx context.Context) {
 				return // defer closes Done.
 			case command.Interrupt:
 				c.Ack <- false // idle: nothing to interrupt.
+			case command.CancelDelegateRequest:
+				if c.Ack != nil {
+					c.Ack <- command.DelegateCancelNoop
+				}
 			default:
 				slog.Warn("foreignloop: dropping un-honorable command while idle", "type", fmt.Sprintf("%T", cmd))
 			}

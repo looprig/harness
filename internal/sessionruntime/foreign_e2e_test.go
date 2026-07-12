@@ -14,6 +14,7 @@ import (
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/foreignloop"
 	"github.com/looprig/harness/pkg/loop"
+	"github.com/looprig/harness/pkg/tool"
 )
 
 // This file is the end-to-end proof that the REAL foreign actor (wired through the
@@ -64,6 +65,7 @@ type fakeForeignStream struct {
 	events     []foreignloop.ForeignEvent
 	transcript string
 	ctx        context.Context
+	block      bool
 
 	ch        chan foreignloop.ForeignEvent
 	stop      chan struct{}
@@ -90,6 +92,12 @@ func (s *fakeForeignStream) feed() {
 			return
 		}
 	}
+	if s.block {
+		select {
+		case <-s.stop:
+		case <-s.ctx.Done():
+		}
+	}
 }
 
 func (s *fakeForeignStream) TranscriptPath() string { return s.transcript }
@@ -106,9 +114,56 @@ type fakeForeignAgent struct {
 	mu         sync.Mutex
 	transcript string
 	script     []foreignloop.ForeignEvent
+	block      bool
 
 	spawnCalls int
 	lastTurn   foreignloop.ForeignTurn
+}
+
+type releasedFailureForeignStream struct {
+	ctx    context.Context
+	events chan foreignloop.ForeignEvent
+	once   sync.Once
+}
+
+func (s *releasedFailureForeignStream) Events() <-chan foreignloop.ForeignEvent { return s.events }
+func (*releasedFailureForeignStream) TranscriptPath() string {
+	return "/missing/released-failure.jsonl"
+}
+func (s *releasedFailureForeignStream) Close() error {
+	s.once.Do(func() { close(s.events) })
+	return nil
+}
+func (s *releasedFailureForeignStream) fail() {
+	s.once.Do(func() {
+		s.events <- foreignloop.ForeignEvent{Kind: foreignloop.ForeignTerminalError, ErrText: "injected provider failure"}
+		close(s.events)
+	})
+}
+
+type releasedFailureForeignAgent struct {
+	spawned chan *releasedFailureForeignStream
+	mu      sync.Mutex
+	calls   int
+}
+
+func (a *releasedFailureForeignAgent) Spawn(ctx context.Context, _ foreignloop.ForeignTurn) (foreignloop.ForeignStream, error) {
+	stream := &releasedFailureForeignStream{ctx: ctx, events: make(chan foreignloop.ForeignEvent, 1)}
+	a.mu.Lock()
+	a.calls++
+	a.mu.Unlock()
+	a.spawned <- stream
+	go func() {
+		<-ctx.Done()
+		_ = stream.Close()
+	}()
+	return stream, nil
+}
+
+func (a *releasedFailureForeignAgent) callCount() int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.calls
 }
 
 func (a *fakeForeignAgent) Spawn(ctx context.Context, t foreignloop.ForeignTurn) (foreignloop.ForeignStream, error) {
@@ -120,6 +175,7 @@ func (a *fakeForeignAgent) Spawn(ctx context.Context, t foreignloop.ForeignTurn)
 		events:     a.script,
 		transcript: a.transcript,
 		ctx:        ctx,
+		block:      a.block,
 		stop:       make(chan struct{}),
 	}, nil
 }
@@ -440,6 +496,138 @@ func TestForeignSubagentE2E(t *testing.T) {
 	}
 	if subLS.ForeignSID == "" {
 		t.Error("sub-loop LoopStarted.ForeignSID is empty, want the minted foreign sid")
+	}
+}
+
+func TestForeignQueuedDelegateInterruptResolvesWithoutWaitTimeout(t *testing.T) {
+	t.Parallel()
+	parent := delegateParent(loop.DelegationManaged, "child")
+	child := mustDefine(
+		loop.WithName("child"),
+		loop.WithInference(&stubLLM{}, validModel("child")),
+		loop.WithSystem("sys"),
+		loop.WithEngine(loop.EngineForeignClaude),
+		loop.WithDrainTimeout(100*time.Millisecond),
+	)
+	agent := &fakeForeignAgent{transcript: missingTranscript(t), block: true}
+	spec := foreignloop.Spec{Agent: agent, Cwd: t.TempDir()}
+	s := newDelegationSession(t, parent, []Option{WithForeignBuilder(foreignloop.BuildWith(spec), foreignloop.BuildRestoredWith(spec))}, child)
+	ctrl := s.delegation.controllerFor(s.PrimaryLoopID(), parent)
+	active, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateStart, Agent: "child", Message: "A", Wait: false})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitDelegateMechanicalStatus(t, ctrl, active.DelegateID, tool.DelegateStatusRunning)
+	queued, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateSend, DelegateID: active.DelegateID, Message: "B", Wait: false})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ctrl.Execute(context.Background(), tool.DelegateRequest{Operation: tool.DelegateInterrupt, DelegateID: active.DelegateID}); err != nil {
+		t.Fatal(err)
+	}
+	result := make(chan tool.DelegateResult, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		got, waitErr := ctrl.Execute(context.Background(), tool.DelegateRequest{Operation: tool.DelegateWait, DelegateID: active.DelegateID, RequestID: requestIDPtr(queued.RequestID)})
+		result <- got
+		errCh <- waitErr
+	}()
+	select {
+	case got := <-result:
+		if waitErr := <-errCh; waitErr != nil || got.Status != tool.DelegateStatusInterrupted {
+			t.Fatalf("wait = %+v, %v; want Interrupted", got, waitErr)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("foreign background wait depended on a context timeout after queued cancellation")
+	}
+}
+
+func TestForeignQueuedDelegateTimeoutCancelsOnlyThatRequest(t *testing.T) {
+	t.Parallel()
+	parent := delegateParent(loop.DelegationManaged, "child")
+	child := mustDefine(
+		loop.WithName("child"),
+		loop.WithInference(&stubLLM{}, validModel("child")),
+		loop.WithSystem("sys"),
+		loop.WithEngine(loop.EngineForeignClaude),
+		loop.WithDrainTimeout(100*time.Millisecond),
+	)
+	agent := &fakeForeignAgent{transcript: missingTranscript(t), block: true}
+	spec := foreignloop.Spec{Agent: agent, Cwd: t.TempDir()}
+	s := newDelegationSession(t, parent, []Option{WithForeignBuilder(foreignloop.BuildWith(spec), foreignloop.BuildRestoredWith(spec))}, child)
+	ctrl := s.delegation.controllerFor(s.PrimaryLoopID(), parent)
+	active, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateStart, Agent: "child", Message: "A", Wait: false})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitDelegateMechanicalStatus(t, ctrl, active.DelegateID, tool.DelegateStatusRunning)
+	queued, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateSend, DelegateID: active.DelegateID, Message: "B", Wait: false})
+	if err != nil {
+		t.Fatal(err)
+	}
+	zero := 0
+	timed, err := ctrl.Execute(context.Background(), tool.DelegateRequest{Operation: tool.DelegateWait, DelegateID: active.DelegateID, RequestID: requestIDPtr(queued.RequestID), TimeoutSeconds: &zero})
+	if err != nil || timed.Status != tool.DelegateStatusTimedOut {
+		t.Fatalf("foreign timed wait = %+v, %v; want TimedOut", timed, err)
+	}
+	pending, _ := s.delegation.getPending(queued.RequestID)
+	select {
+	case <-pending.done:
+		_, status := pending.result()
+		if status != tool.DelegateStatusInterrupted {
+			t.Fatalf("foreign queued cancellation = %v, want Interrupted", status)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("foreign targeted queue cancellation did not resolve")
+	}
+	status, _ := ctrl.Execute(context.Background(), tool.DelegateRequest{Operation: tool.DelegateStatus, DelegateID: active.DelegateID})
+	if status.Status != tool.DelegateStatusRunning {
+		t.Fatalf("foreign A status after B timeout = %v, want Running", status.Status)
+	}
+	_, _ = ctrl.Execute(context.Background(), tool.DelegateRequest{Operation: tool.DelegateInterrupt, DelegateID: active.DelegateID})
+}
+
+func TestForeignProviderFailureResolvesQueuedDelegatesFailedLive(t *testing.T) {
+	t.Parallel()
+	parent := delegateParent(loop.DelegationManaged, "child")
+	child := mustDefine(
+		loop.WithName("child"),
+		loop.WithInference(&stubLLM{}, validModel("child")),
+		loop.WithSystem("sys"),
+		loop.WithEngine(loop.EngineForeignClaude),
+		loop.WithDrainTimeout(100*time.Millisecond),
+	)
+	agent := &releasedFailureForeignAgent{spawned: make(chan *releasedFailureForeignStream, 2)}
+	spec := foreignloop.Spec{Agent: agent, Cwd: t.TempDir()}
+	s := newDelegationSession(t, parent, []Option{WithForeignBuilder(foreignloop.BuildWith(spec), foreignloop.BuildRestoredWith(spec))}, child)
+	ctrl := s.delegation.controllerFor(s.PrimaryLoopID(), parent)
+	active, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateStart, Agent: "child", Message: "A", Wait: false})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stream *releasedFailureForeignStream
+	select {
+	case stream = <-agent.spawned:
+	case <-time.After(2 * time.Second):
+		t.Fatal("foreign A never spawned")
+	}
+	b, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateSend, DelegateID: active.DelegateID, Message: "B", Wait: false})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateSend, DelegateID: active.DelegateID, Message: "C", Wait: false})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stream.fail()
+	for _, request := range []tool.DelegateResult{b, c} {
+		resolved, waitErr := ctrl.Execute(context.Background(), tool.DelegateRequest{Operation: tool.DelegateWait, DelegateID: active.DelegateID, RequestID: requestIDPtr(request.RequestID)})
+		if waitErr != nil || resolved.Status != tool.DelegateStatusFailed {
+			t.Fatalf("foreign failed queue wait = %+v, %v", resolved, waitErr)
+		}
+	}
+	if got := agent.callCount(); got != 1 {
+		t.Fatalf("foreign spawn calls = %d, want only active A", got)
 	}
 }
 

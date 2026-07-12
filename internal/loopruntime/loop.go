@@ -8,6 +8,7 @@ import (
 
 	"github.com/looprig/core/content"
 	"github.com/looprig/core/uuid"
+	"github.com/looprig/harness/internal/runtimecontract"
 	"github.com/looprig/harness/pkg/command"
 	"github.com/looprig/harness/pkg/event"
 	gatedomain "github.com/looprig/harness/pkg/gate"
@@ -335,13 +336,6 @@ const (
 	loopShuttingDown
 )
 
-// inboxCap bounds loopState.inbox. A submit that arrives while the queue is full
-// is rejected with TurnRejected{RejectQueueFull} (a length check, never a blocking
-// send), so the actor never blocks on a queue push. WHY a bound at all: it caps the
-// memory held by accepted-but-unresolved submits so a producer that floods the loop
-// cannot grow the inbox without limit. 64 is a generous default, not a tuned value.
-const inboxCap = 64
-
 // queuedInput is an accepted-but-unresolved submit sitting in loopState.inbox,
 // and is also the entry handed back to runTurn at a tool-continuation drain (the
 // drain hands the actor-owned entries straight to runTurn — same provenance, no
@@ -516,6 +510,7 @@ func runLoop(cfg loopConfig, state loopState) {
 	internal := cfg.internal
 	commits := cfg.commits
 	drains := cfg.drains
+	requestCancelActive := false
 
 	// publish sends a FULL-FIDELITY loop event to the session-level event fan-in.
 	// Producer identity is stamped here from loopState/the active turn (the actor IS
@@ -842,7 +837,7 @@ func runLoop(cfg loopConfig, state loopState) {
 		switch {
 		case state.status == loopShuttingDown && !bypassReject:
 			rejectSubmit(qi, event.RejectShuttingDown)
-		case len(state.inbox) >= inboxCap && !bypassReject:
+		case len(state.inbox) >= runtimecontract.ManagedInputQueueCapacity && !bypassReject:
 			rejectSubmit(qi, event.RejectQueueFull)
 		case state.status == loopRunning || (state.status == loopShuttingDown && bypassReject):
 			// Busy (or a never-rejected SubagentResult while shutting down): accept into
@@ -899,7 +894,7 @@ func runLoop(cfg loopConfig, state loopState) {
 		switch {
 		case state.status == loopShuttingDown:
 			reject(event.RejectShuttingDown, nil)
-		case len(state.inbox) >= inboxCap:
+		case len(state.inbox) >= runtimecontract.ManagedInputQueueCapacity:
 			reject(event.RejectQueueFull, nil)
 		case state.status == loopRunning:
 			if err := publishAcceptance(c.CommandID); err != nil {
@@ -1030,6 +1025,34 @@ func runLoop(cfg loopConfig, state loopState) {
 		// observable via the prior TurnStarted/TurnFoldedInto for this InputID.
 	}
 
+	cancelDelegateRequest := func(c command.CancelDelegateRequest) {
+		if err := c.Validate(); err != nil {
+			slog.Warn("invalid CancelDelegateRequest command", "error", err)
+			return
+		}
+		if err := command.ValidateCommand(c); err != nil {
+			c.Ack <- command.DelegateCancelNoop
+			return
+		}
+		for i, qi := range state.inbox {
+			if qi.inputID != c.TargetCommandID {
+				continue
+			}
+			state.inbox = append(state.inbox[:i], state.inbox[i+1:]...)
+			returnEntry(qi, event.CancelClientRetracted, uuid.UUID{})
+			c.Ack <- command.DelegateCancelQueued
+			return
+		}
+		if state.status == loopRunning && state.causationID == c.TargetCommandID && state.cancelTurn != nil {
+			requestCancelActive = true
+			state.cancelTurn()
+			state.cancelTurn = nil
+			c.Ack <- command.DelegateCancelActive
+			return
+		}
+		c.Ack <- command.DelegateCancelNoop
+	}
+
 	// resolveQueueAfterTurn resolves still-queued input once a NON-shutdown turn has
 	// ended, and reports whether the actor immediately chained into a new turn
 	// (running -> running). On a normal terminal (TurnDone) it pops the FIRST queued
@@ -1038,11 +1061,7 @@ func runLoop(cfg loopConfig, state loopState) {
 	// InputCancelled and auto-starts nothing — the client decides whether to resend.
 	// endedTurnID is the turn that ended (the cause of any return). chained==true means
 	// the loop stayed running, so the caller must NOT emit LoopIdle between the turns.
-	resolveQueueAfterTurn := func(result turnResult, endedTurnID uuid.UUID) (chained bool) {
-		if _, normal := result.terminal.(event.TurnDone); !normal {
-			returnQueuedInbox(cancelReasonFor(result.terminal), endedTurnID)
-			return false
-		}
+	startNextQueued := func(endedTurnID uuid.UUID) (chained bool) {
 		next, ok := popFront()
 		if !ok {
 			return false
@@ -1061,6 +1080,13 @@ func runLoop(cfg loopConfig, state loopState) {
 		}
 		return true // running -> running; no LoopIdle between turns
 	}
+	resolveQueueAfterTurn := func(result turnResult, endedTurnID uuid.UUID) (chained bool) {
+		if _, normal := result.terminal.(event.TurnDone); !normal {
+			returnQueuedInbox(cancelReasonFor(result.terminal), endedTurnID)
+			return false
+		}
+		return startNextQueued(endedTurnID)
+	}
 
 	// handleTurnResult is the actor's response to a turn goroutine's terminal
 	// hand-back (the `case result := <-internal` select arm, extracted so the select
@@ -1073,6 +1099,8 @@ func runLoop(cfg loopConfig, state loopState) {
 	// failed/interrupted turn discards only the in-flight incomplete step (which never
 	// committed); committed steps stay.
 	handleTurnResult := func(result turnResult) (exit bool) {
+		targetedCancellation := requestCancelActive
+		requestCancelActive = false
 		state.cancelTurn = nil
 		shuttingDown := state.status == loopShuttingDown
 		if !shuttingDown {
@@ -1095,6 +1123,12 @@ func runLoop(cfg loopConfig, state loopState) {
 			returnQueuedInbox(cancelReasonFor(result.terminal), endedTurnID)
 			ackShutdowns(nil)
 			return true
+		}
+		if targetedCancellation {
+			if !startNextQueued(endedTurnID) {
+				emitLoopIdle()
+			}
+			return false
 		}
 		// Running -> idle transition: announce LoopIdle (Enduring, non-terminal) AFTER
 		// the terminal so the session quiescence model removes this loop's {loop, LoopID}
@@ -1232,6 +1266,9 @@ func runLoop(cfg loopConfig, state loopState) {
 				// queued). Fire-and-forget — no reply channel.
 				cancelQueued(c)
 
+			case command.CancelDelegateRequest:
+				cancelDelegateRequest(c)
+
 			case command.SetLoopMode:
 				// Select a predeclared mode for the NEXT turn. Validated against the bound
 				// definition on the actor (the sole owner of effective state); the outcome
@@ -1259,6 +1296,13 @@ func runLoop(cfg loopConfig, state loopState) {
 				if state.cancelTurn != nil {
 					state.cancelTurn()
 					state.cancelTurn = nil
+					c.Ack <- true
+				} else if requestCancelActive {
+					// A targeted cancellation already cancelled this exact active turn,
+					// but its terminal has not reached the actor yet. An ordinary interrupt
+					// broadens the disposition: acknowledge it and clear the targeted-only
+					// continuation so the terminal returns/flushed queued input normally.
+					requestCancelActive = false
 					c.Ack <- true
 				} else {
 					c.Ack <- false

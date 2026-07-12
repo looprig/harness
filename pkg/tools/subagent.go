@@ -92,6 +92,7 @@ func NewSubagent(controller tool.DelegateController, style loop.DelegationStyle,
 }
 
 func (s *SubagentTool) schema() string {
+	fieldOrder := []string{"action", "agent", "mode", "delegate_id", "request_id", "message", "wait", "timeout_seconds"}
 	properties := map[string]any{
 		"action": map[string]any{"type": "string", "enum": []string{"start", "send", "wait", "interrupt", "status"}},
 		"agent":  map[string]any{"type": "string"}, "mode": map[string]any{"type": "string"},
@@ -117,7 +118,7 @@ func (s *SubagentTool) schema() string {
 			allowedSet[name] = struct{}{}
 		}
 		forbidden := make([]string, 0)
-		for name := range properties {
+		for _, name := range fieldOrder {
 			if _, ok := allowedSet[name]; !ok {
 				forbidden = append(forbidden, name)
 			}

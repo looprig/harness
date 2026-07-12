@@ -7,9 +7,12 @@ import (
 	"log/slog"
 
 	"github.com/looprig/core/content"
+	"github.com/looprig/core/uuid"
+	"github.com/looprig/harness/internal/runtimecontract"
 	"github.com/looprig/harness/pkg/command"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/identity"
+	"github.com/looprig/harness/pkg/loop"
 )
 
 // turnOutcome is the turn goroutine's hand-back to the actor. The turn goroutine
@@ -98,24 +101,27 @@ func (l *Loop) runTurn(loopCtx context.Context, prepared preparedInput) (exit bo
 	turnCtx, cancel := context.WithCancel(loopCtx)
 	result := make(chan turnOutcome, 1)
 	go l.driveTurn(turnCtx, cancel, ft, cur, l.sidBound, pub, result)
-	return l.awaitTurn(loopCtx, cur, cancel, pub, result)
+	return l.awaitTurn(loopCtx, cur, c.CommandID, cancel, pub, result)
 }
 
 // awaitTurn is the actor's INNER select while a turn runs. It serves committed
 // (pre-turn) snapshots, applies the turn outcome when it arrives, honors control
 // commands (D4), and tears down on loop-ctx cancellation. It returns whether the
 // actor must exit.
-func (l *Loop) awaitTurn(loopCtx context.Context, cur event.TurnIndex,
+func (l *Loop) awaitTurn(loopCtx context.Context, cur event.TurnIndex, activeCommandID uuid.UUID,
 	cancel context.CancelFunc, pub func(event.Event), result chan turnOutcome) (exit bool) {
 	for {
 		select {
 		case out := <-result:
 			l.applyOutcome(cur, out, pub)
+			if !out.success && !out.interrupted {
+				l.cancelPending(pub, event.CancelTurnFailed)
+			}
 			return false
 		case req := <-l.snapshots:
 			req.reply <- snapshotResult{msgs: cloneMessages(l.msgs), turnIndex: l.turnIndex}
 		case cmd := <-l.Commands:
-			if done, exit := l.handleTurnCommand(loopCtx, cmd, cur, cancel, pub, result); done {
+			if done, exit := l.handleTurnCommand(loopCtx, cmd, cur, activeCommandID, cancel, pub, result); done {
 				return exit
 			}
 		case <-loopCtx.Done():
@@ -134,10 +140,17 @@ func (l *Loop) awaitTurn(loopCtx context.Context, cur event.TurnIndex,
 // actor. Every other command is an un-honorable mid-turn command — dropped with a
 // warning, never blocking and never publishing. done reports whether the turn is
 // resolved (the actor leaves awaitTurn); exit reports whether the whole actor stops.
-func (l *Loop) handleTurnCommand(loopCtx context.Context, cmd command.Command, cur event.TurnIndex,
+func (l *Loop) handleTurnCommand(loopCtx context.Context, cmd command.Command, cur event.TurnIndex, activeCommandID uuid.UUID,
 	cancel context.CancelFunc, pub func(event.Event), result chan turnOutcome) (done, exit bool) {
 	switch c := cmd.(type) {
 	case command.UserInput:
+		if len(l.pending) >= runtimecontract.ManagedInputQueueCapacity {
+			pub(event.TurnRejected{Header: event.Header{Cause: identity.Cause{CommandID: c.CommandID}}, Reason: event.RejectQueueFull})
+			if c.Accepted != nil {
+				c.Accepted <- &loop.InputRejectedError{Reason: event.RejectQueueFull}
+			}
+			return false, false
+		}
 		prepared, ok := l.prepareInput(loopCtx, c)
 		if !ok {
 			return false, false
@@ -148,6 +161,49 @@ func (l *Loop) handleTurnCommand(loopCtx context.Context, cmd command.Command, c
 			c.Accepted <- nil
 		}
 		return false, false
+	case command.CancelDelegateRequest:
+		if err := c.Validate(); err != nil {
+			slog.Warn("foreignloop: invalid CancelDelegateRequest", "error", err)
+			return false, false
+		}
+		if err := command.ValidateCommand(c); err != nil {
+			c.Ack <- command.DelegateCancelNoop
+			return false, false
+		}
+		for i, pending := range l.pending {
+			if pending.command.CommandID != c.TargetCommandID {
+				continue
+			}
+			l.pending = append(l.pending[:i], l.pending[i+1:]...)
+			queued := pending.command
+			pub(event.InputCancelled{
+				Header:  event.Header{Cause: identity.Cause{CommandID: queued.CommandID, Agency: queued.Agency}},
+				Reason:  event.CancelClientRetracted,
+				Message: &content.UserMessage{Message: content.Message{Role: content.RoleUser, Blocks: queued.Blocks}},
+			})
+			c.Ack <- command.DelegateCancelQueued
+			return false, false
+		}
+		if c.TargetCommandID != activeCommandID {
+			c.Ack <- command.DelegateCancelNoop
+			return false, false
+		}
+		// If the terminal was already actor-observable, it wins the race and the
+		// targeted cancellation is a no-op; no later request is touched.
+		select {
+		case out := <-result:
+			l.applyOutcome(cur, out, pub)
+			if !out.success && !out.interrupted {
+				l.cancelPending(pub, event.CancelTurnFailed)
+			}
+			c.Ack <- command.DelegateCancelNoop
+			return true, false
+		default:
+		}
+		cancel()
+		l.applyOutcome(cur, <-result, pub)
+		c.Ack <- command.DelegateCancelActive
+		return true, false
 	case command.Interrupt:
 		cancel()
 		// applyOutcome publishes TurnInterrupted for the interrupted outcome; if the

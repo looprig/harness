@@ -12,18 +12,19 @@ import (
 type SessionErrorKind string
 
 const (
-	SessionIDGenerationFailed         SessionErrorKind = "id_generation_failed"
-	SessionLoopIDGenerationFailed     SessionErrorKind = "loop_id_generation_failed"
-	SessionLoopExited                 SessionErrorKind = "loop_exited"
-	SessionLoopNotFound               SessionErrorKind = "loop_not_found"
-	SessionEventChannelClosed         SessionErrorKind = "event_channel_closed"
-	SessionContextDone                SessionErrorKind = "context_done"
-	SessionClosing                    SessionErrorKind = "session_closing"
-	SessionFaulted                    SessionErrorKind = "session_faulted"
-	SessionLoopDepthExceeded          SessionErrorKind = "loop_depth_exceeded"
-	SessionLoopQuotaExceeded          SessionErrorKind = "loop_quota_exceeded"
-	SessionForeignBuilderMissing      SessionErrorKind = "foreign_builder_missing"
-	SessionDelegateIntentAppendFailed SessionErrorKind = "delegate_intent_append_failed"
+	SessionIDGenerationFailed            SessionErrorKind = "id_generation_failed"
+	SessionLoopIDGenerationFailed        SessionErrorKind = "loop_id_generation_failed"
+	SessionLoopExited                    SessionErrorKind = "loop_exited"
+	SessionLoopNotFound                  SessionErrorKind = "loop_not_found"
+	SessionEventChannelClosed            SessionErrorKind = "event_channel_closed"
+	SessionContextDone                   SessionErrorKind = "context_done"
+	SessionClosing                       SessionErrorKind = "session_closing"
+	SessionFaulted                       SessionErrorKind = "session_faulted"
+	SessionLoopDepthExceeded             SessionErrorKind = "loop_depth_exceeded"
+	SessionLoopQuotaExceeded             SessionErrorKind = "loop_quota_exceeded"
+	SessionForeignBuilderMissing         SessionErrorKind = "foreign_builder_missing"
+	SessionDelegateIntentAppendFailed    SessionErrorKind = "delegate_intent_append_failed"
+	SessionDelegateAdmissionCommitFailed SessionErrorKind = "delegate_admission_commit_failed"
 )
 
 type SessionError struct {
@@ -38,8 +39,9 @@ func (e *SessionError) Error() string {
 		SessionEventChannelClosed: "session: event channel closed without terminal event", SessionContextDone: "session: context done",
 		SessionClosing: "session: closing", SessionFaulted: "session: faulted (durable persistence failure)",
 		SessionLoopDepthExceeded: "session: loop spawn depth limit exceeded", SessionLoopQuotaExceeded: "session: loop spawn quota exceeded",
-		SessionForeignBuilderMissing:      "session: foreign engine selected but no foreign builder wired",
-		SessionDelegateIntentAppendFailed: "session: required delegate intent append failed",
+		SessionForeignBuilderMissing:         "session: foreign engine selected but no foreign builder wired",
+		SessionDelegateIntentAppendFailed:    "session: required delegate intent append failed",
+		SessionDelegateAdmissionCommitFailed: "session: delegate admission commit failed after durable intent",
 	}
 	msg := messages[e.Kind]
 	if msg == "" {

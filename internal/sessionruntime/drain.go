@@ -33,6 +33,14 @@ type drainInterruptedError struct{}
 
 func (e *drainInterruptedError) Error() string { return "drain: turn interrupted" }
 
+// drainCancelledError reports that an admitted queued delegate request left the
+// child inbox before it ever opened a turn.
+type drainCancelledError struct{ Reason event.CancelReason }
+
+func (e *drainCancelledError) Error() string { return "drain: queued input cancelled" }
+
+// A queued submit cancelled before any turn starts surfaces as
+// *drainCancelledError, correlated by Cause.CommandID exactly like TurnRejected.
 // A submit refused before any turn starts (TurnRejected for the submit's
 // Cause.CommandID) surfaces as the package's existing *TurnRejectedError: its
 // Reason and event.TurnRejected.Reason are the same type (event.RejectReason),
@@ -186,6 +194,10 @@ func handleCorrelatedEvent(
 			if e.Cause.CommandID == commandID {
 				return "", true, &TurnRejectedError{Reason: e.Reason}
 			}
+		case event.InputCancelled:
+			if e.Cause.CommandID == commandID {
+				return "", true, &drainCancelledError{Reason: e.Reason}
+			}
 		}
 		return "", false, nil
 	}
@@ -253,5 +265,6 @@ func stepDoneText(msgs content.AgenticMessages) string {
 var (
 	_ error = (*drainFailedError)(nil)
 	_ error = (*drainInterruptedError)(nil)
+	_ error = (*drainCancelledError)(nil)
 	_ error = (*drainLostError)(nil)
 )

@@ -1810,6 +1810,39 @@ func TestInterruptLoopIDUnknownID(t *testing.T) {
 	}
 }
 
+func TestCancelDelegateRequestTargetsExactLoopAndRequest(t *testing.T) {
+	t.Parallel()
+	loopID, requestID := mustUUID(), mustUUID()
+	app := &fakeCommandAppender{}
+	s, commands := fakeAppenderSession(app, time.Now(), loopID)
+	result := make(chan command.DelegateCancelResult, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		got, err := s.cancelDelegateRequest(loopID, requestID)
+		result <- got
+		errCh <- err
+	}()
+	select {
+	case raw := <-commands[loopID]:
+		cancel, ok := raw.(command.CancelDelegateRequest)
+		if !ok {
+			t.Fatalf("command = %T, want CancelDelegateRequest", raw)
+		}
+		if cancel.TargetCommandID != requestID || cancel.LoopID != loopID || cancel.SessionID != s.sessionID {
+			t.Fatalf("cancel route = %+v, want loop=%v request=%v", cancel, loopID, requestID)
+		}
+		cancel.Ack <- command.DelegateCancelQueued
+	case <-time.After(2 * time.Second):
+		t.Fatal("targeted cancel was not dispatched")
+	}
+	if err := <-errCh; err != nil {
+		t.Fatal(err)
+	}
+	if got := <-result; got != command.DelegateCancelQueued {
+		t.Fatalf("result = %v, want queued", got)
+	}
+}
+
 // TestShutdownClosesAllRealLoopsAndLatchesClosing drives a real two-loop session
 // to shutdown and asserts the whole-session teardown contract:
 //

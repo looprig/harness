@@ -11,6 +11,7 @@ import (
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/identity"
+	"github.com/looprig/harness/pkg/tool"
 )
 
 // drainUUID builds a deterministic non-zero UUID from a seed for correlation
@@ -22,6 +23,8 @@ func drainUUID(seed byte) uuid.UUID {
 	}
 	return u
 }
+
+func cancelReasonPtr(reason event.CancelReason) *event.CancelReason { return &reason }
 
 // fakeSubscription is a test double for event.Subscription: a buffered channel
 // the test scripts events onto, a settable termination error, and a no-op Close.
@@ -144,6 +147,8 @@ func TestDrainToFinalText(t *testing.T) {
 		wantErr          bool
 		wantFailed       bool // *drainFailedError wrapping errProvider
 		wantTurnRejected bool // *TurnRejectedError (the package's existing typed reject)
+		wantCancelled    *event.CancelReason
+		wantStatus       tool.DelegateStatusValue
 		wantLost         bool // *drainLostError
 		wantInterrupts   int32
 	}{
@@ -168,6 +173,30 @@ func TestDrainToFinalText(t *testing.T) {
 			script:           []event.Event{turnRejected(cmd, event.RejectShuttingDown)},
 			wantErr:          true,
 			wantTurnRejected: true,
+		},
+		{
+			name:          "queued interrupt cancellation resolves before TurnStarted",
+			script:        []event.Event{event.LoopIdle{}},
+			closeAfter:    true,
+			wantErr:       true,
+			wantCancelled: cancelReasonPtr(event.CancelTurnInterrupted),
+			wantStatus:    tool.DelegateStatusInterrupted,
+		},
+		{
+			name:          "queued failed-turn cancellation resolves failed",
+			script:        []event.Event{event.LoopIdle{}},
+			closeAfter:    true,
+			wantErr:       true,
+			wantCancelled: cancelReasonPtr(event.CancelTurnFailed),
+			wantStatus:    tool.DelegateStatusFailed,
+		},
+		{
+			name:          "client-retracted cancellation maps fail-securely to interrupted",
+			script:        []event.Event{event.LoopIdle{}},
+			closeAfter:    true,
+			wantErr:       true,
+			wantCancelled: cancelReasonPtr(event.CancelClientRetracted),
+			wantStatus:    tool.DelegateStatusInterrupted,
 		},
 		{
 			name:       "subscription loss before terminal wraps Err()",
@@ -217,6 +246,9 @@ func TestDrainToFinalText(t *testing.T) {
 			sub := newFakeSubscription(len(tt.script) + 1)
 			sub.err = tt.subErr
 			for _, ev := range tt.script {
+				if tt.wantCancelled != nil {
+					ev = event.InputCancelled{Header: event.Header{Cause: identity.Cause{CommandID: cmd}}, Reason: *tt.wantCancelled}
+				}
 				sub.feed(ev)
 			}
 			if tt.closeAfter {
@@ -255,6 +287,15 @@ func TestDrainToFinalText(t *testing.T) {
 				}
 				if re.Reason != event.RejectShuttingDown {
 					t.Errorf("rejected reason = %v, want RejectShuttingDown", re.Reason)
+				}
+			}
+			if tt.wantCancelled != nil {
+				var ce *drainCancelledError
+				if !errors.As(err, &ce) || ce.Reason != *tt.wantCancelled {
+					t.Fatalf("err = %T %v, want drainCancelledError reason %v", err, err, *tt.wantCancelled)
+				}
+				if got := statusFromDrain(err); got != tt.wantStatus {
+					t.Fatalf("statusFromDrain = %v, want %v", got, tt.wantStatus)
 				}
 			}
 			if tt.wantLost {

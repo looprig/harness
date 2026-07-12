@@ -1,6 +1,7 @@
 package tools
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"strings"
@@ -11,6 +12,37 @@ import (
 	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/harness/pkg/tool"
 )
+
+func TestSubagentInfoSchemaBytesDeterministicAcrossConcurrentCalls(t *testing.T) {
+	t.Parallel()
+	s := NewSubagent(&fakeController{}, loop.DelegationManaged, subagentCatalog())
+	baseline, err := s.Info(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	const calls = 256
+	results := make(chan []byte, calls)
+	var wg sync.WaitGroup
+	for i := 0; i < calls; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			info, infoErr := s.Info(context.Background())
+			if infoErr != nil {
+				results <- nil
+				return
+			}
+			results <- append([]byte(nil), info.Schema...)
+		}()
+	}
+	wg.Wait()
+	close(results)
+	for got := range results {
+		if !bytes.Equal(got, baseline.Schema) {
+			t.Fatalf("schema bytes changed:\nbase=%s\n got=%s", baseline.Schema, got)
+		}
+	}
+}
 
 // subagent_test.go exercises the flat action-envelope Subagent tool against a FAKE
 // tool.DelegateController (DIP: the tool never touches the real session). The fake
