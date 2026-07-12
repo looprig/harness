@@ -195,7 +195,7 @@ func fakeAppenderSession(app *fakeCommandAppender, ts time.Time, loopIDs ...uuid
 		sessionCtx:    sessionCtx,
 		sessionCancel: sessionCancel,
 		loops:         loops,
-		primaryLoopID: loopIDs[0],
+		activeLoopID:  loopIDs[0],
 		newID:         uuid.New,
 		now:           pinnedClock(ts),
 		cmdAppender:   app,

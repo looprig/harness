@@ -99,7 +99,7 @@ func TestSessionStampsAgency(t *testing.T) {
 			setup: func(t *testing.T) (*Session, chan command.Command, func(s *Session)) {
 				s, cmds, _ := sessionWithFakeLoop()
 				return s, cmds, func(s *Session) {
-					_ = s.deliverSubagentResult(context.Background(), s.primaryLoopID, mustUUID(), blocks)
+					_ = s.deliverSubagentResult(context.Background(), s.activeLoopID, mustUUID(), blocks)
 				}
 			},
 			wantAgency: identity.AgencyMachine,
@@ -166,7 +166,7 @@ func TestSubmitAgencyReachesTurnStarted(t *testing.T) {
 		{
 			name: "machine submitToLoop -> TurnStarted.Cause.Agency AgencyMachine",
 			call: func(t *testing.T, s *Session) {
-				if _, err := s.submitToLoop(context.Background(), s.primaryLoopID, nil, identity.AgencyMachine, false); err != nil {
+				if _, err := s.submitToLoop(context.Background(), s.activeLoopID, nil, identity.AgencyMachine, false); err != nil {
 					t.Fatalf("submitToLoop: %v", err)
 				}
 			},
@@ -208,8 +208,8 @@ func TestInterruptLoopStaysMachine(t *testing.T) {
 	t.Parallel()
 	s, cmds, _ := sessionWithFakeLoop()
 	cmd := captureCommand(t, s, cmds, func(s *Session) {
-		l, _ := s.loopFor(s.primaryLoopID)
-		s.interruptLoop(s.primaryLoopID, l)
+		l, _ := s.loopFor(s.activeLoopID)
+		s.interruptLoop(s.activeLoopID, l)
 	})
 	ic, ok := cmd.(command.Interrupt)
 	if !ok {

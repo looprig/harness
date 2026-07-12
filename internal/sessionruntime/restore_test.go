@@ -258,15 +258,15 @@ func TestFoldPrimaryLoop(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			got := foldPrimaryLoop(tt.events)
+			got := foldLoop(tt.events)
 			if !reflect.DeepEqual(got.Msgs, tt.wantMsgs) {
-				t.Errorf("foldPrimaryLoop() msgs =\n  %#v\nwant\n  %#v", got.Msgs, tt.wantMsgs)
+				t.Errorf("foldLoop() msgs =\n  %#v\nwant\n  %#v", got.Msgs, tt.wantMsgs)
 			}
 			if got.TurnIndex != tt.wantTurnIdx {
-				t.Errorf("foldPrimaryLoop() turnIndex = %d, want %d", got.TurnIndex, tt.wantTurnIdx)
+				t.Errorf("foldLoop() turnIndex = %d, want %d", got.TurnIndex, tt.wantTurnIdx)
 			}
 			if got.OpenTurn != tt.wantOpenTurn {
-				t.Errorf("foldPrimaryLoop() openTurn = %v, want %v", got.OpenTurn, tt.wantOpenTurn)
+				t.Errorf("foldLoop() openTurn = %v, want %v", got.OpenTurn, tt.wantOpenTurn)
 			}
 		})
 	}
@@ -283,7 +283,7 @@ func turnStartedWithID(turnID uuid.UUID, idx event.TurnIndex, user string) event
 }
 
 // TestOpenTurnCoordsCoupledToOpenTurnInvariant locks the invariant openTurnCoords
-// relies on: whenever foldPrimaryLoop reports OpenTurn (a TurnStarted with no later
+// relies on: whenever foldLoop reports OpenTurn (a TurnStarted with no later
 // terminal), a trailing TurnStarted exists, so openTurnCoords returns that turn's
 // (TurnID, TurnIndex) — never its zero fall-through. The two stay coupled: the restore
 // constructor calls openTurnCoords ONLY under folded.OpenTurn, so the zero return is
@@ -340,7 +340,7 @@ func TestOpenTurnCoordsCoupledToOpenTurnInvariant(t *testing.T) {
 
 			// Precondition: these sequences are exactly the ones openTurnCoords is called
 			// on — the fold reports an open turn.
-			if folded := foldPrimaryLoop(tt.events); !folded.OpenTurn {
+			if folded := foldLoop(tt.events); !folded.OpenTurn {
 				t.Fatalf("test setup: fold did not report OpenTurn for %q", tt.name)
 			}
 

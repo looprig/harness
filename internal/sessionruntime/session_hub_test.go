@@ -78,7 +78,7 @@ func TestSubscribeSeamDefaultFilterDeliversSessionEvent(t *testing.T) {
 	// The single-loop default: live tokens from the primary loop only, finalized
 	// events from every loop. Session-scoped events ignore both scopes.
 	filter := event.EventFilter{
-		Ephemeral: event.LoopScope{Loops: map[uuid.UUID]struct{}{s.PrimaryLoopID(): {}}},
+		Ephemeral: event.LoopScope{Loops: map[uuid.UUID]struct{}{s.ActiveLoopID(): {}}},
 		Enduring:  event.LoopScope{All: true},
 	}
 

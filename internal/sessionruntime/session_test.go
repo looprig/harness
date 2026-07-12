@@ -85,7 +85,7 @@ type recordingSub struct {
 func observe(t *testing.T, s *Session) (*recordingSub, event.Subscription) {
 	t.Helper()
 	sub, err := s.SubscribeEvents(event.EventFilter{
-		Ephemeral: event.LoopScope{Loops: map[uuid.UUID]struct{}{s.primaryLoopID: {}}},
+		Ephemeral: event.LoopScope{Loops: map[uuid.UUID]struct{}{s.activeLoopID: {}}},
 		Enduring:  event.LoopScope{All: true},
 	})
 	if err != nil {
@@ -199,7 +199,7 @@ func TestNew(t *testing.T) {
 			t.Fatalf("err = %v, want *SessionError{SessionContextDone}", err)
 		}
 	})
-	t.Run("exactly one loop indexed by primaryLoopID", func(t *testing.T) {
+	t.Run("exactly one loop indexed by rootLoopID", func(t *testing.T) {
 		t.Parallel()
 		s, err := newTestSession(context.Background(), cfg(&stubLLM{chunks: []content.Chunk{textChunk("x")}}))
 		if err != nil {
@@ -209,17 +209,17 @@ func TestNew(t *testing.T) {
 
 		s.loopsMu.RLock()
 		n := len(s.loops)
-		h, ok := s.loops[s.primaryLoopID]
+		h, ok := s.loops[s.activeLoopID]
 		s.loopsMu.RUnlock()
 
 		if n != 1 {
 			t.Fatalf("len(loops) = %d, want 1", n)
 		}
 		if !ok {
-			t.Fatal("loops has no entry for primaryLoopID")
+			t.Fatal("loops has no entry for rootLoopID")
 		}
-		if s.primaryLoopID.IsZero() {
-			t.Error("primaryLoopID is zero")
+		if s.activeLoopID.IsZero() {
+			t.Error("rootLoopID is zero")
 		}
 		if h.backend == nil {
 			t.Error("primary loopHandle.backend is nil")
@@ -277,7 +277,7 @@ func TestNewLoop(t *testing.T) {
 			if !ok || minted != loopID {
 				t.Fatalf("returned loop id %v was not the first freshly minted id %v", loopID, minted)
 			}
-			if loopID == s.primaryLoopID {
+			if loopID == s.activeLoopID {
 				t.Fatal("NewLoop reused the primary loop id, want a distinct id")
 			}
 
@@ -490,7 +490,7 @@ func TestNewLoopClosingRejects(t *testing.T) {
 	}
 }
 
-// TestLoopFor: loopFor(primaryLoopID) resolves the primary loop; a random id
+// TestLoopFor: loopFor(rootLoopID) resolves the primary loop; a random id
 // misses.
 func TestLoopFor(t *testing.T) {
 	t.Parallel()
@@ -500,8 +500,8 @@ func TestLoopFor(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = s.Shutdown(context.Background()) })
 
-	if l, ok := s.loopFor(s.primaryLoopID); !ok || l == nil {
-		t.Fatalf("loopFor(primaryLoopID) = (%v, %v), want (non-nil, true)", l, ok)
+	if l, ok := s.loopFor(s.activeLoopID); !ok || l == nil {
+		t.Fatalf("loopFor(rootLoopID) = (%v, %v), want (non-nil, true)", l, ok)
 	}
 	if l, ok := s.loopFor(mustUUID()); ok || l != nil {
 		t.Fatalf("loopFor(random) = (%v, %v), want (nil, false)", l, ok)
@@ -544,11 +544,11 @@ func TestRoutingMethodsLoopNotFound(t *testing.T) {
 			t.Parallel()
 			s, cmds, _ := sessionWithFakeLoop() // Commands never read: a send would block forever
 
-			// Force loopFor(primaryLoopID) to miss by deleting the primary entry
-			// while leaving primaryLoopID set. The routing method must short-circuit
+			// Force loopFor(rootLoopID) to miss by deleting the primary entry
+			// while leaving rootLoopID set. The routing method must short-circuit
 			// before ever touching the (unread) Commands channel.
 			s.loopsMu.Lock()
-			delete(s.loops, s.primaryLoopID)
+			delete(s.loops, s.activeLoopID)
 			s.loopsMu.Unlock()
 
 			errCh := make(chan error, 1)
@@ -595,13 +595,13 @@ func TestNewLoopReturnsRuntimeConstructorError(t *testing.T) {
 	t.Parallel()
 	sessionCtx, sessionCancel := context.WithCancel(context.Background())
 	t.Cleanup(sessionCancel)
-	primaryLoopID := mustUUID()
+	rootLoopID := mustUUID()
 	s := &Session{
 		sessionID:     mustUUID(),
 		sessionCtx:    sessionCtx,
 		sessionCancel: sessionCancel,
-		loops:         map[uuid.UUID]*loopHandle{primaryLoopID: {}},
-		primaryLoopID: primaryLoopID,
+		loops:         map[uuid.UUID]*loopHandle{rootLoopID: {}},
+		activeLoopID:  rootLoopID,
 		newID:         uuid.New, // id mint succeeds; only loopruntime.New must fail
 		now:           time.Now,
 	}
@@ -846,7 +846,7 @@ func TestShutdownIDGenFailureStillTearsDownAllLoops(t *testing.T) {
 	}
 
 	s.loopsMu.RLock()
-	primaryDone := s.loops[s.primaryLoopID].backend.DoneChan()
+	primaryDone := s.loops[s.activeLoopID].backend.DoneChan()
 	subDone := s.loops[subID].backend.DoneChan()
 	s.loopsMu.RUnlock()
 
@@ -1102,16 +1102,16 @@ func sessionWithFakeLoop() (s *Session, cmds chan command.Command, done chan str
 	cmds = make(chan command.Command)
 	done = make(chan struct{})
 	sessionCtx, sessionCancel := context.WithCancel(context.Background())
-	primaryLoopID := mustUUID()
+	rootLoopID := mustUUID()
 	s = &Session{
 		sessionID:     mustUUID(),
 		sessionCtx:    sessionCtx,
 		sessionCancel: sessionCancel,
 		loops: map[uuid.UUID]*loopHandle{
-			primaryLoopID: {backend: &channelBackend{Commands: cmds, Done: done}},
+			rootLoopID: {backend: &channelBackend{Commands: cmds, Done: done}},
 		},
-		primaryLoopID: primaryLoopID,
-		newID:         uuid.New,
+		activeLoopID: rootLoopID,
+		newID:        uuid.New,
 	}
 	return s, cmds, done
 }
@@ -1305,7 +1305,7 @@ func TestRouteGateCtxCancelled(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			s, _, _ := sessionWithFakeLoop() // Commands never read: a send would block
-			l, ok := s.loopFor(s.primaryLoopID)
+			l, ok := s.loopFor(s.activeLoopID)
 			if !ok {
 				t.Fatal("primary loop missing from registry")
 			}
@@ -1314,7 +1314,7 @@ func TestRouteGateCtxCancelled(t *testing.T) {
 			cancel()
 
 			errCh := make(chan error, 1)
-			go func() { errCh <- s.routeGate(ctx, s.primaryLoopID, l, tt.cmd) }()
+			go func() { errCh <- s.routeGate(ctx, s.activeLoopID, l, tt.cmd) }()
 
 			select {
 			case err := <-errCh:
@@ -1341,14 +1341,14 @@ func TestRouteGateLoopExited(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			s, _, done := sessionWithFakeLoop() // Commands never read
-			l, ok := s.loopFor(s.primaryLoopID)
+			l, ok := s.loopFor(s.activeLoopID)
 			if !ok {
 				t.Fatal("primary loop missing from registry")
 			}
 			close(done) // loop has exited
 
 			errCh := make(chan error, 1)
-			go func() { errCh <- s.routeGate(context.Background(), s.primaryLoopID, l, tt.cmd) }()
+			go func() { errCh <- s.routeGate(context.Background(), s.activeLoopID, l, tt.cmd) }()
 
 			select {
 			case err := <-errCh:
@@ -1431,8 +1431,8 @@ func sessionWithTwoFakeLoops() (s *Session, loopA, loopB uuid.UUID, cmdsA, cmdsB
 			loopA: {backend: &channelBackend{Commands: cmdsA, Done: doneA}},
 			loopB: {backend: &channelBackend{Commands: cmdsB, Done: doneB}},
 		},
-		primaryLoopID: loopA,
-		newID:         uuid.New,
+		activeLoopID: loopA,
+		newID:        uuid.New,
 	}
 	return s, loopA, loopB, cmdsA, cmdsB
 }
@@ -1602,8 +1602,8 @@ func sessionWithTwoFakeLoopsAndDone() (s *Session, cmdsA, cmdsB chan command.Com
 			loopA: {backend: &channelBackend{Commands: cmdsA, Done: doneA}, cancel: func() {}},
 			loopB: {backend: &channelBackend{Commands: cmdsB, Done: doneB}, cancel: func() {}},
 		},
-		primaryLoopID: loopA,
-		newID:         uuid.New,
+		activeLoopID: loopA,
+		newID:        uuid.New,
 	}
 	return s, cmdsA, cmdsB, doneA, doneB
 }
@@ -1899,7 +1899,7 @@ func TestShutdownClosesAllRealLoopsAndLatchesClosing(t *testing.T) {
 
 	// Capture both actors' Done channels before shutdown.
 	s.loopsMu.RLock()
-	primaryDone := s.loops[s.primaryLoopID].backend.DoneChan()
+	primaryDone := s.loops[s.activeLoopID].backend.DoneChan()
 	subDone := s.loops[subID].backend.DoneChan()
 	s.loopsMu.RUnlock()
 

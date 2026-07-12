@@ -62,7 +62,7 @@ func TestLoopControllerSetModeLiveAndEvent(t *testing.T) {
 	rec, sub := observe(t, s)
 	t.Cleanup(func() { _ = sub.Close() })
 
-	ctrl, ok := s.LoopController(s.PrimaryLoopID())
+	ctrl, ok := s.LoopController(s.ActiveLoopID())
 	if !ok {
 		t.Fatal("LoopController not found")
 	}
@@ -80,7 +80,7 @@ func TestLoopControllerSetModeLiveAndEvent(t *testing.T) {
 	rec.waitFor(t, func(evs []event.Event) bool {
 		for _, e := range evs {
 			if mc, ok := e.(event.LoopModeChanged); ok && mc.PreviousMode == "plan" && mc.Mode == "swap" {
-				return !mc.EventHeader().EventID.IsZero() && mc.LoopID == s.PrimaryLoopID()
+				return !mc.EventHeader().EventID.IsZero() && mc.LoopID == s.ActiveLoopID()
 			}
 		}
 		return false
@@ -97,7 +97,7 @@ func TestLoopControllerChangeLiveAndEvent(t *testing.T) {
 	rec, sub := observe(t, s)
 	t.Cleanup(func() { _ = sub.Close() })
 
-	ctrl, _ := s.LoopController(s.PrimaryLoopID())
+	ctrl, _ := s.LoopController(s.ActiveLoopID())
 	if err := ctrl.Change(context.Background(), loop.ChangeModel(validModel("routed")), loop.ChangeEffort(inference.EffortMax)); err != nil {
 		t.Fatalf("Change: %v", err)
 	}
@@ -125,7 +125,7 @@ func TestLoopControllerRefusals(t *testing.T) {
 		t.Fatalf("New: %v", err)
 	}
 	t.Cleanup(func() { _ = s.Shutdown(context.Background()) })
-	ctrl, _ := s.LoopController(s.PrimaryLoopID())
+	ctrl, _ := s.LoopController(s.ActiveLoopID())
 
 	tests := []struct {
 		name string
@@ -163,7 +163,7 @@ func TestLoopControllerExitedLoopRejected(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	ctrl, _ := s.LoopController(s.PrimaryLoopID())
+	ctrl, _ := s.LoopController(s.ActiveLoopID())
 	// Shut the session (and its loop) down; the loop actor exits, so a change can no longer
 	// be delivered — the controller's send escapes on the loop's Done.
 	if err := s.Shutdown(context.Background()); err != nil {

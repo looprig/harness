@@ -165,7 +165,7 @@ func restoreCfgNamed(client inference.Client, model, system string, agent identi
 // handover), and the committed state the original ended with.
 type persistedStream struct {
 	sessionID     uuid.UUID
-	primaryLoopID uuid.UUID
+	rootLoopID    uuid.UUID
 	lease         journal.Lease
 	committedMsgs content.AgenticMessages
 	committedTurn event.TurnIndex
@@ -187,7 +187,7 @@ func newOriginalHub(t *testing.T, store *sessionstore.Store, fp event.ConfigFing
 func newOriginalHubNamed(t *testing.T, store *sessionstore.Store, fp event.ConfigFingerprint, agentName identity.AgentName) (*hub.Hub, uuid.UUID, uuid.UUID, journal.Lease, *eventStamper) {
 	t.Helper()
 	sessionID := mustSessionID(t)
-	primaryLoopID := mustSessionID(t)
+	rootLoopID := mustSessionID(t)
 	lease := mustAcquireLease(t, store, sessionID)
 
 	openCtx, openCancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -209,11 +209,11 @@ func newOriginalHubNamed(t *testing.T, store *sessionstore.Store, fp event.Confi
 	})
 	es.stamp(t, ctx, h, event.LoopStarted{
 		Header: event.Header{
-			Coordinates: identity.Coordinates{SessionID: sessionID, LoopID: primaryLoopID},
+			Coordinates: identity.Coordinates{SessionID: sessionID, LoopID: rootLoopID},
 			AgentName:   agentName,
 		},
 	})
-	return h, sessionID, primaryLoopID, lease, es
+	return h, sessionID, rootLoopID, lease, es
 }
 
 // buildOriginalRun drives `turns` complete turns through a REAL loop with an UNNAMED root
@@ -229,7 +229,7 @@ func buildOriginalRun(t *testing.T, store *sessionstore.Store, fp event.ConfigFi
 // (handover). This is the faithful "drive a few turns" path.
 func buildOriginalRunNamed(t *testing.T, store *sessionstore.Store, fp event.ConfigFingerprint, agentName identity.AgentName, cfg loop.Definition, turns int) persistedStream {
 	t.Helper()
-	h, sessionID, primaryLoopID, lease, _ := newOriginalHubNamed(t, store, fp, agentName)
+	h, sessionID, rootLoopID, lease, _ := newOriginalHubNamed(t, store, fp, agentName)
 
 	// Subscribe so we can drain each turn to its terminal deterministically.
 	sub, err := h.SubscribeEvents(event.EventFilter{Enduring: event.LoopScope{All: true}})
@@ -239,11 +239,11 @@ func buildOriginalRunNamed(t *testing.T, store *sessionstore.Store, fp event.Con
 	defer func() { _ = sub.Close() }()
 
 	loopCtx, loopCancel := context.WithCancel(context.Background())
-	bound, err := cfg.Bind(loopCtx, tool.Bindings{SessionID: sessionID, LoopID: primaryLoopID})
+	bound, err := cfg.Bind(loopCtx, tool.Bindings{SessionID: sessionID, LoopID: rootLoopID})
 	if err != nil {
 		t.Fatalf("Bind: %v", err)
 	}
-	l, err := loopruntime.New(loopCtx, sessionID, primaryLoopID, loop.Provenance{}, h, bound)
+	l, err := loopruntime.New(loopCtx, sessionID, rootLoopID, loop.Provenance{}, h, bound)
 	if err != nil {
 		t.Fatalf("loopruntime.New: %v", err)
 	}
@@ -269,7 +269,7 @@ func buildOriginalRunNamed(t *testing.T, store *sessionstore.Store, fp event.Con
 
 	return persistedStream{
 		sessionID:     sessionID,
-		primaryLoopID: primaryLoopID,
+		rootLoopID:    rootLoopID,
 		lease:         lease,
 		committedMsgs: msgs,
 		committedTurn: idx,
@@ -283,7 +283,7 @@ func buildOriginalRunNamed(t *testing.T, store *sessionstore.Store, fp event.Con
 // reports are what the fold must reconstruct.
 func buildCrashedRun(t *testing.T, store *sessionstore.Store, fp event.ConfigFingerprint) persistedStream {
 	t.Helper()
-	h, sessionID, primaryLoopID, lease, es := newOriginalHub(t, store, fp)
+	h, sessionID, rootLoopID, lease, es := newOriginalHub(t, store, fp)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
@@ -293,28 +293,28 @@ func buildCrashedRun(t *testing.T, store *sessionstore.Store, fp event.ConfigFin
 	step2 := mustSessionID(t)
 
 	turnCoord := func(turnID uuid.UUID) identity.Coordinates {
-		return identity.Coordinates{SessionID: sessionID, LoopID: primaryLoopID, TurnID: turnID}
+		return identity.Coordinates{SessionID: sessionID, LoopID: rootLoopID, TurnID: turnID}
 	}
 	// StepDone is step-scoped: it requires SessionID+LoopID+TurnID+StepID, exactly as a
 	// real loop's StepDone carries (the replay validates on decode).
 	stepCoord := func(turnID, stepID uuid.UUID) identity.Coordinates {
-		return identity.Coordinates{SessionID: sessionID, LoopID: primaryLoopID, TurnID: turnID, StepID: stepID}
+		return identity.Coordinates{SessionID: sessionID, LoopID: rootLoopID, TurnID: turnID, StepID: stepID}
 	}
 
 	// Turn 1: complete (user + step + terminal).
 	es.stamp(t, ctx, h, event.TurnStarted{Header: event.Header{Coordinates: turnCoord(turn1)}, TurnIndex: 1, Message: foldUserMsg("first")})
 	es.stamp(t, ctx, h, event.StepDone{Header: event.Header{Coordinates: stepCoord(turn1, step1)}, Messages: content.AgenticMessages{aiMessage("answer one")}})
 	es.stamp(t, ctx, h, event.TurnDone{Header: event.Header{Coordinates: turnCoord(turn1)}, TurnIndex: 1, Message: aiMessage("answer one")})
-	es.stamp(t, ctx, h, event.LoopIdle{Header: event.Header{Coordinates: identity.Coordinates{SessionID: sessionID, LoopID: primaryLoopID}}})
+	es.stamp(t, ctx, h, event.LoopIdle{Header: event.Header{Coordinates: identity.Coordinates{SessionID: sessionID, LoopID: rootLoopID}}})
 
 	// Turn 2: OPEN — committed TurnStarted + one StepDone, then a "crash" (no terminal).
 	es.stamp(t, ctx, h, event.TurnStarted{Header: event.Header{Coordinates: turnCoord(openTurn)}, TurnIndex: 2, Message: foldUserMsg("crashed mid-turn")})
 	es.stamp(t, ctx, h, event.StepDone{Header: event.Header{Coordinates: stepCoord(openTurn, step2)}, Messages: content.AgenticMessages{aiMessage("calling tool")}})
 
 	return persistedStream{
-		sessionID:     sessionID,
-		primaryLoopID: primaryLoopID,
-		lease:         lease,
+		sessionID:  sessionID,
+		rootLoopID: rootLoopID,
+		lease:      lease,
 		committedMsgs: content.AgenticMessages{
 			foldUserMsg("first"),
 			aiMessage("answer one"),
@@ -330,7 +330,7 @@ func buildCrashedRun(t *testing.T, store *sessionstore.Store, fp event.ConfigFin
 // turn (so the restore tail is the plain RestoreStarted -> RestoreDone, no interrupt):
 //
 //   - a multi-message StepDone group: an AIMessage carrying a tool-use reply FOLLOWED
-//     by two ToolResultMessages (the exact shape foldPrimaryLoop's unit test asserts),
+//     by two ToolResultMessages (the exact shape foldLoop's unit test asserts),
 //     committed as a single StepDone.Messages slice, then
 //   - a TurnFoldedInto user message landing MID-TURN (after that step), then
 //   - a second single-AIMessage StepDone, then the TurnDone terminal.
@@ -342,7 +342,7 @@ func buildCrashedRun(t *testing.T, store *sessionstore.Store, fp event.ConfigFin
 // the identical AgenticMessages, not merely that the pure fold is correct.
 func buildComplexShapesRun(t *testing.T, store *sessionstore.Store, fp event.ConfigFingerprint) persistedStream {
 	t.Helper()
-	h, sessionID, primaryLoopID, lease, es := newOriginalHub(t, store, fp)
+	h, sessionID, rootLoopID, lease, es := newOriginalHub(t, store, fp)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
@@ -352,9 +352,9 @@ func buildComplexShapesRun(t *testing.T, store *sessionstore.Store, fp event.Con
 
 	// TurnFoldedInto is turn-scoped (SessionID+LoopID+TurnID, no StepID); StepDone is
 	// step-scoped (adds StepID). Stamp each with the coordinates the replay validates.
-	turnCoord := identity.Coordinates{SessionID: sessionID, LoopID: primaryLoopID, TurnID: turn1}
+	turnCoord := identity.Coordinates{SessionID: sessionID, LoopID: rootLoopID, TurnID: turn1}
 	stepCoord := func(stepID uuid.UUID) identity.Coordinates {
-		return identity.Coordinates{SessionID: sessionID, LoopID: primaryLoopID, TurnID: turn1, StepID: stepID}
+		return identity.Coordinates{SessionID: sessionID, LoopID: rootLoopID, TurnID: turn1, StepID: stepID}
 	}
 
 	// One turn: user -> (AI tool-use + two tool results) -> folded user -> AI -> TurnDone.
@@ -369,9 +369,9 @@ func buildComplexShapesRun(t *testing.T, store *sessionstore.Store, fp event.Con
 	es.stamp(t, ctx, h, event.TurnDone{Header: event.Header{Coordinates: turnCoord}, TurnIndex: 1, Message: aiMessage("final answer")})
 
 	return persistedStream{
-		sessionID:     sessionID,
-		primaryLoopID: primaryLoopID,
-		lease:         lease,
+		sessionID:  sessionID,
+		rootLoopID: rootLoopID,
+		lease:      lease,
 		committedMsgs: content.AgenticMessages{
 			foldUserMsg("use a tool"),
 			aiMessage("calling tool"),
@@ -388,12 +388,12 @@ func buildComplexShapesRun(t *testing.T, store *sessionstore.Store, fp event.Con
 // PRIMARY loop's one complete turn AND a SUBAGENT loop's one complete turn (a non-root
 // LoopStarted plus its own TurnStarted/StepDone/TurnDone). It is the fixture proving
 // restore's primary-loop narrowing: the discovery drain (UNNARROWED) must COUNT the
-// subagent LoopStarted, while the fold drain (NARROWED to primaryLoopID) must EXCLUDE the
+// subagent LoopStarted, while the fold drain (NARROWED to rootLoopID) must EXCLUDE the
 // subagent loop's turn events from the folded primary thread. committedMsgs is the PRIMARY
 // thread ONLY — what the narrowed fold must reconstruct. It returns the subagent loop id.
 func buildTwoLoopRun(t *testing.T, store *sessionstore.Store, fp event.ConfigFingerprint) (persistedStream, uuid.UUID) {
 	t.Helper()
-	h, sessionID, primaryLoopID, lease, es := newOriginalHub(t, store, fp)
+	h, sessionID, rootLoopID, lease, es := newOriginalHub(t, store, fp)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
@@ -403,8 +403,8 @@ func buildTwoLoopRun(t *testing.T, store *sessionstore.Store, fp event.ConfigFin
 	subTurn := mustSessionID(t)
 	subStep := mustSessionID(t)
 
-	pTurnCoord := identity.Coordinates{SessionID: sessionID, LoopID: primaryLoopID, TurnID: primaryTurn}
-	pStepCoord := identity.Coordinates{SessionID: sessionID, LoopID: primaryLoopID, TurnID: primaryTurn, StepID: primaryStep}
+	pTurnCoord := identity.Coordinates{SessionID: sessionID, LoopID: rootLoopID, TurnID: primaryTurn}
+	pStepCoord := identity.Coordinates{SessionID: sessionID, LoopID: rootLoopID, TurnID: primaryTurn, StepID: primaryStep}
 	sTurnCoord := identity.Coordinates{SessionID: sessionID, LoopID: subLoopID, TurnID: subTurn}
 	sStepCoord := identity.Coordinates{SessionID: sessionID, LoopID: subLoopID, TurnID: subTurn, StepID: subStep}
 
@@ -418,16 +418,16 @@ func buildTwoLoopRun(t *testing.T, store *sessionstore.Store, fp event.ConfigFin
 	// the narrowing the fold drain's LoopID enforces.
 	es.stamp(t, ctx, h, event.LoopStarted{Header: event.Header{
 		Coordinates: identity.Coordinates{SessionID: sessionID, LoopID: subLoopID},
-		Cause:       identity.Cause{Coordinates: identity.Coordinates{LoopID: primaryLoopID}, Agency: identity.AgencyMachine},
+		Cause:       identity.Cause{Coordinates: identity.Coordinates{LoopID: rootLoopID}, Agency: identity.AgencyMachine},
 	}})
 	es.stamp(t, ctx, h, event.TurnStarted{Header: event.Header{Coordinates: sTurnCoord}, TurnIndex: 1, Message: foldUserMsg("SUBAGENT user")})
 	es.stamp(t, ctx, h, event.StepDone{Header: event.Header{Coordinates: sStepCoord}, Messages: content.AgenticMessages{aiMessage("SUBAGENT reply")}})
 	es.stamp(t, ctx, h, event.TurnDone{Header: event.Header{Coordinates: sTurnCoord}, TurnIndex: 1, Message: aiMessage("SUBAGENT reply")})
 
 	return persistedStream{
-		sessionID:     sessionID,
-		primaryLoopID: primaryLoopID,
-		lease:         lease,
+		sessionID:  sessionID,
+		rootLoopID: rootLoopID,
+		lease:      lease,
 		committedMsgs: content.AgenticMessages{
 			foldUserMsg("primary user"),
 			aiMessage("primary reply"),
@@ -443,7 +443,7 @@ func buildTwoLoopRun(t *testing.T, store *sessionstore.Store, fp event.ConfigFin
 // re-seed the cumulative spawn quota. The lease is left held for the caller to release.
 func buildRunWithSubagents(t *testing.T, store *sessionstore.Store, fp event.ConfigFingerprint, cfg loop.Definition, subagents int) persistedStream {
 	t.Helper()
-	h, sessionID, primaryLoopID, lease, es := newOriginalHub(t, store, fp)
+	h, sessionID, rootLoopID, lease, es := newOriginalHub(t, store, fp)
 
 	sub, err := h.SubscribeEvents(event.EventFilter{Enduring: event.LoopScope{All: true}})
 	if err != nil {
@@ -452,11 +452,11 @@ func buildRunWithSubagents(t *testing.T, store *sessionstore.Store, fp event.Con
 	defer func() { _ = sub.Close() }()
 
 	loopCtx, loopCancel := context.WithCancel(context.Background())
-	bound, err := cfg.Bind(loopCtx, tool.Bindings{SessionID: sessionID, LoopID: primaryLoopID})
+	bound, err := cfg.Bind(loopCtx, tool.Bindings{SessionID: sessionID, LoopID: rootLoopID})
 	if err != nil {
 		t.Fatalf("Bind: %v", err)
 	}
-	l, err := loopruntime.New(loopCtx, sessionID, primaryLoopID, loop.Provenance{}, h, bound)
+	l, err := loopruntime.New(loopCtx, sessionID, rootLoopID, loop.Provenance{}, h, bound)
 	if err != nil {
 		t.Fatalf("loopruntime.New: %v", err)
 	}
@@ -475,7 +475,7 @@ func buildRunWithSubagents(t *testing.T, store *sessionstore.Store, fp event.Con
 		subLoopID := mustSessionID(t)
 		es.stamp(t, ctx, h, event.LoopStarted{Header: event.Header{
 			Coordinates: identity.Coordinates{SessionID: sessionID, LoopID: subLoopID},
-			Cause:       identity.Cause{Coordinates: identity.Coordinates{LoopID: primaryLoopID}, Agency: identity.AgencyMachine},
+			Cause:       identity.Cause{Coordinates: identity.Coordinates{LoopID: rootLoopID}, Agency: identity.AgencyMachine},
 		}})
 	}
 
@@ -493,7 +493,7 @@ func buildRunWithSubagents(t *testing.T, store *sessionstore.Store, fp event.Con
 
 	return persistedStream{
 		sessionID:     sessionID,
-		primaryLoopID: primaryLoopID,
+		rootLoopID:    rootLoopID,
 		lease:         lease,
 		committedMsgs: msgs,
 		committedTurn: idx,
@@ -507,7 +507,7 @@ func buildRunWithSubagents(t *testing.T, store *sessionstore.Store, fp event.Con
 // races the actor.
 func restoredSnapshot(t *testing.T, s *Session) (content.AgenticMessages, event.TurnIndex) {
 	t.Helper()
-	l, ok := s.loopFor(s.PrimaryLoopID())
+	l, ok := s.loopFor(s.ActiveLoopID())
 	if !ok {
 		t.Fatal("restored session has no primary loop registered")
 	}
@@ -525,7 +525,7 @@ func restoredSnapshot(t *testing.T, s *Session) (content.AgenticMessages, event.
 // (RestoreStarted/RestoreDone/RestoreErrored and any TurnInterrupted that closed an open
 // turn) — the tail the assertions check. It goes through the SAME facade Restore uses:
 // FromSeq 0 on the replayer, the primary LoopID narrowing carried on the Open request.
-func restoreEventTail(t *testing.T, store *sessionstore.Store, sessionID, primaryLoopID uuid.UUID) []event.Event {
+func restoreEventTail(t *testing.T, store *sessionstore.Store, sessionID, rootLoopID uuid.UUID) []event.Event {
 	t.Helper()
 	r, err := store.OpenEventReplayer(sessionID, sessionstore.ReplayRequest{FromSeq: 0})
 	if err != nil {
@@ -533,7 +533,7 @@ func restoreEventTail(t *testing.T, store *sessionstore.Store, sessionID, primar
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	cursor, err := r.Open(ctx, journal.ReplayRequest{LoopID: primaryLoopID, Follow: false})
+	cursor, err := r.Open(ctx, journal.ReplayRequest{LoopID: rootLoopID, Follow: false})
 	if err != nil {
 		t.Fatalf("replay Open: %v", err)
 	}
@@ -650,8 +650,8 @@ func TestRestoreRoundTrip(t *testing.T) {
 	if s.SessionID() != orig.sessionID {
 		t.Errorf("restored SessionID = %v, want %v", s.SessionID(), orig.sessionID)
 	}
-	if s.PrimaryLoopID() != orig.primaryLoopID {
-		t.Errorf("restored primaryLoopID = %v, want %v", s.PrimaryLoopID(), orig.primaryLoopID)
+	if s.ActiveLoopID() != orig.rootLoopID {
+		t.Errorf("restored rootLoopID = %v, want %v", s.ActiveLoopID(), orig.rootLoopID)
 	}
 
 	// Restored committed state deep-equals the original (byte-for-byte msgs + turnIndex).
@@ -664,7 +664,7 @@ func TestRestoreRoundTrip(t *testing.T) {
 	}
 
 	// The restore-event tail (no open turn): RestoreStarted → RestoreDone.
-	assertTail(t, restoreEventTail(t, store, orig.sessionID, orig.primaryLoopID),
+	assertTail(t, restoreEventTail(t, store, orig.sessionID, orig.rootLoopID),
 		[]event.Event{event.RestoreStarted{}, event.RestoreDone{}})
 
 	// A new Submit is accepted; the next turn numbers from the restored turnIndex.
@@ -723,7 +723,7 @@ func TestRestorePrimaryLoopNarrowing(t *testing.T) {
 	}
 
 	// The tail is a clean RestoreStarted → RestoreDone (no open turn).
-	assertTail(t, restoreEventTail(t, store, orig.sessionID, orig.primaryLoopID),
+	assertTail(t, restoreEventTail(t, store, orig.sessionID, orig.rootLoopID),
 		[]event.Event{event.RestoreStarted{}, event.RestoreDone{}})
 }
 
@@ -778,7 +778,7 @@ func TestRestoreConfigMismatch(t *testing.T) {
 	}
 
 	// A RestoreErrored is recorded (no RestoreDone followed).
-	tail := restoreEventTail(t, store, orig.sessionID, orig.primaryLoopID)
+	tail := restoreEventTail(t, store, orig.sessionID, orig.rootLoopID)
 	if !lastIs(tail, event.RestoreErrored{}) {
 		t.Errorf("restore-event tail does not end with RestoreErrored: %v", tailTypes(tail))
 	}
@@ -855,7 +855,7 @@ func TestRestoreSwarmFingerprintMismatch(t *testing.T) {
 			}
 
 			// A RestoreErrored is recorded — fail-secure (no RestoreDone followed).
-			tail := restoreEventTail(t, store, orig.sessionID, orig.primaryLoopID)
+			tail := restoreEventTail(t, store, orig.sessionID, orig.rootLoopID)
 			if !lastIs(tail, event.RestoreErrored{}) {
 				t.Errorf("restore-event tail does not end with RestoreErrored: %v", tailTypes(tail))
 			}
@@ -938,7 +938,7 @@ func TestRestoreAgentNameMismatch(t *testing.T) {
 			}
 
 			// A RestoreErrored is recorded (no RestoreDone followed) — fail-secure.
-			tail := restoreEventTail(t, store, orig.sessionID, orig.primaryLoopID)
+			tail := restoreEventTail(t, store, orig.sessionID, orig.rootLoopID)
 			if !lastIs(tail, event.RestoreErrored{}) {
 				t.Errorf("restore-event tail does not end with RestoreErrored: %v", tailTypes(tail))
 			}
@@ -979,7 +979,7 @@ func TestRestoreCrashMidTurn(t *testing.T) {
 	}
 
 	// A TurnInterrupted closed the open turn: tail is RestoreStarted → TurnInterrupted → RestoreDone.
-	assertTail(t, restoreEventTail(t, store, orig.sessionID, orig.primaryLoopID),
+	assertTail(t, restoreEventTail(t, store, orig.sessionID, orig.rootLoopID),
 		[]event.Event{event.RestoreStarted{}, event.TurnInterrupted{}, event.RestoreDone{}})
 
 	// Comes up idle: a new Submit numbers from the restored index.
@@ -997,7 +997,7 @@ func TestRestoreCrashMidTurn(t *testing.T) {
 // the restored loop's actor-served Snapshot is asserted to deep-equal the independently-
 // built expected AgenticMessages (and turnIndex). This proves the journaled BYTES of a
 // multi-message StepDone group and a TurnFoldedInto fold into the IDENTICAL slice — not
-// merely that the pure foldPrimaryLoop is correct.
+// merely that the pure foldLoop is correct.
 func TestRestoreComplexShapesRoundTrip(t *testing.T) {
 	store := newRestoreStore(t)
 	fp := fingerprintFromDefinition(restoreCfg(&stubLLM{}, "model-x", "be helpful"))
@@ -1024,7 +1024,7 @@ func TestRestoreComplexShapesRoundTrip(t *testing.T) {
 	}
 
 	// The turn closed cleanly (TurnDone), so no interrupt: tail is RestoreStarted -> RestoreDone.
-	assertTail(t, restoreEventTail(t, store, orig.sessionID, orig.primaryLoopID),
+	assertTail(t, restoreEventTail(t, store, orig.sessionID, orig.rootLoopID),
 		[]event.Event{event.RestoreStarted{}, event.RestoreDone{}})
 
 	// Comes up idle: a new Submit numbers from the restored index.
@@ -1068,12 +1068,12 @@ func TestRestoreRecountsSpawnQuota(t *testing.T) {
 	}
 
 	// Exactly one more spawn fits within Quota == k+1.
-	if _, err := s.NewLoop(loop.Provenance{LoopID: s.PrimaryLoopID()}, cfg(&stubLLM{chunks: []content.Chunk{textChunk("ok")}})); err != nil {
+	if _, err := s.NewLoop(loop.Provenance{LoopID: s.ActiveLoopID()}, cfg(&stubLLM{chunks: []content.Chunk{textChunk("ok")}})); err != nil {
 		t.Fatalf("spawn within restored quota (k+1) err = %v, want success", err)
 	}
 
 	// The NEXT spawn exceeds Quota-k (== 1 post-restore) and is refused.
-	_, err = s.NewLoop(loop.Provenance{LoopID: s.PrimaryLoopID()}, cfg(&stubLLM{chunks: []content.Chunk{textChunk("over")}}))
+	_, err = s.NewLoop(loop.Provenance{LoopID: s.ActiveLoopID()}, cfg(&stubLLM{chunks: []content.Chunk{textChunk("over")}}))
 	var se *SessionError
 	if !errors.As(err, &se) || se.Kind != SessionLoopQuotaExceeded {
 		t.Fatalf("spawn past restored quota err = %v, want *SessionError{SessionLoopQuotaExceeded}", err)

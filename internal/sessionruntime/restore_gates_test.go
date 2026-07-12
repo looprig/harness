@@ -18,16 +18,16 @@ import (
 )
 
 type persistedGateStream struct {
-	sessionID     uuid.UUID
-	primaryLoopID uuid.UUID
-	lease         journal.Lease
-	gateID        gate.ID
+	sessionID  uuid.UUID
+	rootLoopID uuid.UUID
+	lease      journal.Lease
+	gateID     gate.ID
 }
 
 func buildGateRestoreStream(t *testing.T, store *sessionstore.Store, cfg loop.Definition, prepared, opened, resolved bool) persistedGateStream {
 	t.Helper()
 	sessionID := mustSessionID(t)
-	primaryLoopID := mustSessionID(t)
+	rootLoopID := mustSessionID(t)
 	turnID := mustSessionID(t)
 	stepID := mustSessionID(t)
 	gateID := gate.ID(mustSessionID(t))
@@ -73,13 +73,13 @@ func buildGateRestoreStream(t *testing.T, store *sessionstore.Store, cfg loop.De
 	})
 	appendEvent(event.LoopStarted{
 		Header: func() event.Header {
-			h := stamp(identity.Coordinates{SessionID: sessionID, LoopID: primaryLoopID})
+			h := stamp(identity.Coordinates{SessionID: sessionID, LoopID: rootLoopID})
 			h.AgentName = "agent"
 			return h
 		}(),
 	})
 
-	coords := identity.Coordinates{SessionID: sessionID, LoopID: primaryLoopID, TurnID: turnID, StepID: stepID}
+	coords := identity.Coordinates{SessionID: sessionID, LoopID: rootLoopID, TurnID: turnID, StepID: stepID}
 	g := gate.Gate{
 		ID:          gateID,
 		Kind:        gate.KindPermission,
@@ -115,7 +115,7 @@ func buildGateRestoreStream(t *testing.T, store *sessionstore.Store, cfg loop.De
 		appendEvent(event.GateResolved{Header: stamp(coords), GateID: gateID, Reason: gate.CloseAnswered})
 	}
 
-	return persistedGateStream{sessionID: sessionID, primaryLoopID: primaryLoopID, lease: lease, gateID: gateID}
+	return persistedGateStream{sessionID: sessionID, rootLoopID: rootLoopID, lease: lease, gateID: gateID}
 }
 
 func restoredGateResolvedEvents(t *testing.T, store *sessionstore.Store, sessionID uuid.UUID) []event.GateResolved {
@@ -208,11 +208,11 @@ func TestRestoreWiresGateAppenderForNewGates(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = s.Shutdown(context.Background()) })
 
-	gateID, err := s.PrepareGateOpen(context.Background(), orig.primaryLoopID, permissionGate(), gate.PermissionPayload{Request: tool.BashRequest{Command: "echo ok"}})
+	gateID, err := s.PrepareGateOpen(context.Background(), orig.rootLoopID, permissionGate(), gate.PermissionPayload{Request: tool.BashRequest{Command: "echo ok"}})
 	if err != nil {
 		t.Fatalf("PrepareGateOpen: %v", err)
 	}
-	if err := s.ActivateGate(context.Background(), gateID, gate.Route{GateID: gateID, LoopID: orig.primaryLoopID}); err != nil {
+	if err := s.ActivateGate(context.Background(), gateID, gate.Route{GateID: gateID, LoopID: orig.rootLoopID}); err != nil {
 		t.Fatalf("ActivateGate: %v", err)
 	}
 

@@ -65,7 +65,7 @@ func (e *InvalidEventError) Error() string {
 
 // idProfile is one event type's STATIC identity contract from the fill matrix:
 // which Coordinates fields must be set, which must be zero, whether a
-// ToolExecutionID is required (the four tool/gate events), and whether TurnID is
+// ToolExecutionID is required (the five tool-interaction events), and whether TurnID is
 // OPTIONAL (only InputCancelled, whose TurnID is the returned turn for an abnormal
 // return but zero for a pure client retract). A field that is neither required nor
 // forbidden is unconstrained. It holds no per-instance value, so every event type's
@@ -87,7 +87,7 @@ type idProfile struct {
 // ValidateEvent checks ev against the ID fill matrix and returns a typed
 // *InvalidEventError on the first violation, nil when ev satisfies every invariant.
 // EventID is required on every event; the per-type profile then pins the required
-// and must-be-zero coordinates (and ToolExecutionID for the four tool/gate events).
+// and must-be-zero coordinates (and ToolExecutionID for the five tool-interaction events).
 // Fail-secure: an event whose concrete type is not in the sealed union is invalid
 // with FieldType/RuleUnknownType — the caller learns the type is unknown, not that
 // some coordinate is missing.
@@ -202,7 +202,7 @@ func checkProfile(name EventName, c identity.Coordinates, toolID uuid.UUID, p id
 	return nil
 }
 
-// toolExecutionID returns the body ToolExecutionID for the four tool/gate events
+// toolExecutionID returns the body ToolExecutionID for the five tool-interaction events
 // (the only events whose profile sets requireTool) and the zero UUID for every
 // other type — checkProfile ignores it unless requireTool is set.
 func toolExecutionID(ev Event) uuid.UUID {
@@ -342,7 +342,7 @@ func stepProfile() idProfile {
 	return idProfile{requireSession: true, requireLoop: true, requireTurn: true, requireStep: true}
 }
 
-// toolProfile: the four tool/gate events — full quartet set plus a required
+// toolProfile: the five tool-interaction events — full quartet set plus a required
 // ToolExecutionID (read from the event body by ValidateEvent, not stored here).
 func toolProfile() idProfile {
 	return idProfile{

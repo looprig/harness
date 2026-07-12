@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"reflect"
 	"sync"
 	"testing"
 	"time"
@@ -30,6 +31,122 @@ type fakeGateAppender struct {
 	prepErr    error
 	openErr    error
 	resolveErr error
+}
+
+type gateTransitionAppender struct {
+	events       []event.Event
+	err          error
+	beforeReturn func()
+}
+
+func (a *gateTransitionAppender) AppendEvent(_ context.Context, ev event.Event) (uint64, error) {
+	a.events = append(a.events, ev)
+	if a.beforeReturn != nil {
+		a.beforeReturn()
+	}
+	if a.err != nil {
+		return 0, a.err
+	}
+	return uint64(len(a.events)), nil
+}
+
+// TestLiveGateAppenderCheckedFanout pins the common new/restored adapter contract:
+// public gate transitions use the checked hub path, so the durable append finishes
+// before live delivery and an append failure produces no live delivery. The prepared
+// appender is deliberately different in the two construction cases to prove public
+// GateOpened/GateResolved routing is independent of that constructor-specific seam.
+func TestLiveGateAppenderCheckedFanout(t *testing.T) {
+	t.Parallel()
+
+	appendFailure := errors.New("durable gate transition failed")
+	constructions := []struct {
+		name     string
+		prepared gateAppender
+	}{
+		{name: "new session", prepared: nopGateAppender{}},
+		{name: "restored session", prepared: &fakeGateAppender{}},
+	}
+	transitions := []struct {
+		name   string
+		event  event.Event
+		append func(*liveGateAppender, context.Context, event.Event) error
+	}{
+		{
+			name:  "GateOpened",
+			event: event.GateOpened{},
+			append: func(a *liveGateAppender, ctx context.Context, ev event.Event) error {
+				return a.AppendGateOpened(ctx, ev.(event.GateOpened))
+			},
+		},
+		{
+			name:  "GateResolved",
+			event: event.GateResolved{},
+			append: func(a *liveGateAppender, ctx context.Context, ev event.Event) error {
+				return a.AppendGateResolved(ctx, ev.(event.GateResolved))
+			},
+		},
+	}
+
+	for _, construction := range constructions {
+		construction := construction
+		for _, transition := range transitions {
+			transition := transition
+			for _, fail := range []bool{false, true} {
+				fail := fail
+				name := construction.name + "/" + transition.name
+				if fail {
+					name += "/append failure"
+				} else {
+					name += "/append success"
+				}
+				t.Run(name, func(t *testing.T) {
+					t.Parallel()
+					sessionID := mustUUID()
+					appender := &gateTransitionAppender{}
+					if fail {
+						appender.err = appendFailure
+					}
+					h := hub.New(sessionID, hub.WithAppender(appender))
+					sub, err := h.SubscribeEvents(event.EventFilter{Enduring: event.LoopScope{All: true}})
+					if err != nil {
+						t.Fatal(err)
+					}
+					defer func() { _ = sub.Close() }()
+					appender.beforeReturn = func() {
+						select {
+						case delivery := <-sub.Events():
+							t.Errorf("live %T delivered before durable append returned", delivery.Event)
+						default:
+						}
+					}
+					adapter := &liveGateAppender{prepared: construction.prepared, publisher: h}
+					err = transition.append(adapter, context.Background(), transition.event)
+					if fail {
+						if !errors.Is(err, appendFailure) {
+							t.Fatalf("append error = %v, want durable failure", err)
+						}
+						select {
+						case delivery := <-sub.Events():
+							t.Fatalf("durable failure fanned out %T", delivery.Event)
+						case <-time.After(50 * time.Millisecond):
+						}
+						return
+					}
+					if err != nil {
+						t.Fatalf("append: %v", err)
+					}
+					select {
+					case delivery := <-sub.Events():
+						if reflect.TypeOf(delivery.Event) != reflect.TypeOf(transition.event) {
+							t.Fatalf("live event = %T, want %T", delivery.Event, transition.event)
+						}
+					case <-time.After(time.Second):
+						t.Fatal("durable gate transition was not fanned out")
+					}
+				})
+			}
+		}
+	}
 }
 
 func (f *fakeGateAppender) AppendGatePrepared(_ context.Context, rec journal.GatePreparedRecord) error {

@@ -25,17 +25,17 @@ func sessionWithHubAndFakeLoop() (s *Session, cmds chan command.Command, done ch
 	done = make(chan struct{})
 	sessionCtx, sessionCancel := context.WithCancel(context.Background())
 	id := mustUUID()
-	primaryLoopID := mustUUID()
+	rootLoopID := mustUUID()
 	s = &Session{
 		sessionID:     id,
 		hub:           hub.New(id),
 		sessionCtx:    sessionCtx,
 		sessionCancel: sessionCancel,
 		loops: map[uuid.UUID]*loopHandle{
-			primaryLoopID: {backend: &channelBackend{Commands: cmds, Done: done}},
+			rootLoopID: {backend: &channelBackend{Commands: cmds, Done: done}},
 		},
-		primaryLoopID: primaryLoopID,
-		newID:         uuid.New,
+		activeLoopID: rootLoopID,
+		newID:        uuid.New,
 	}
 	return s, cmds, done
 }
@@ -61,7 +61,7 @@ func TestSubagentHandBackWakeReleaseViaTurnStarted(t *testing.T) {
 	t.Cleanup(func() { _ = sub.Close() })
 
 	subagentLoopID := mustUUID()
-	parentLoopID := s.primaryLoopID
+	parentLoopID := s.activeLoopID
 
 	// Spawn-time guard: take the {wake} token. The session was idle, so this crosses
 	// the Idle->Active edge and derives SessionActive.
@@ -160,7 +160,7 @@ func TestSubagentResultNeverRejectedReleasesWakeViaInputCancelled(t *testing.T) 
 
 	// Deliver the SubagentResult: the loop is busy, so it QUEUES (never rejected). Its
 	// {wake} token is NOT released yet — it rides the eventual resolution event.
-	if err := s.deliverSubagentResult(context.Background(), s.primaryLoopID, subagentLoopID, textBlocks("subagent output")); err != nil {
+	if err := s.deliverSubagentResult(context.Background(), s.activeLoopID, subagentLoopID, textBlocks("subagent output")); err != nil {
 		t.Fatalf("deliverSubagentResult: %v", err)
 	}
 
@@ -211,7 +211,7 @@ func TestSubagentResultQueuedDoesNotReleaseOffPublishPath(t *testing.T) {
 
 	// Fake parent loop: just receive the routed SubagentResult (fire-and-forget; no
 	// reply). Confirm it carried the CHILD via Cause.LoopID == subagentLoopID and the
-	// PARENT delivery target via the embedded Coordinates.LoopID == primaryLoopID.
+	// PARENT delivery target via the embedded Coordinates.LoopID == rootLoopID.
 	routed := make(chan command.SubagentResult, 1)
 	go func() {
 		if sr, ok := (<-cmds).(command.SubagentResult); ok {
@@ -219,7 +219,7 @@ func TestSubagentResultQueuedDoesNotReleaseOffPublishPath(t *testing.T) {
 		}
 	}()
 
-	if err := s.deliverSubagentResult(context.Background(), s.primaryLoopID, subagentLoopID, textBlocks("output")); err != nil {
+	if err := s.deliverSubagentResult(context.Background(), s.activeLoopID, subagentLoopID, textBlocks("output")); err != nil {
 		t.Fatalf("deliverSubagentResult: %v", err)
 	}
 	select {
@@ -227,8 +227,8 @@ func TestSubagentResultQueuedDoesNotReleaseOffPublishPath(t *testing.T) {
 		if sr.Cause.LoopID != subagentLoopID {
 			t.Errorf("routed SubagentResult.Cause.LoopID = %v, want %v (the CHILD)", sr.Cause.LoopID, subagentLoopID)
 		}
-		if sr.LoopID != s.primaryLoopID {
-			t.Errorf("routed SubagentResult.LoopID = %v, want %v (the PARENT delivery target)", sr.LoopID, s.primaryLoopID)
+		if sr.LoopID != s.activeLoopID {
+			t.Errorf("routed SubagentResult.LoopID = %v, want %v (the PARENT delivery target)", sr.LoopID, s.activeLoopID)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("SubagentResult was not routed to the parent loop")
@@ -248,7 +248,7 @@ func TestSubagentResultQueuedDoesNotReleaseOffPublishPath(t *testing.T) {
 		Header: event.Header{
 			Coordinates: identity.Coordinates{
 				SessionID: s.SessionID(),
-				LoopID:    s.primaryLoopID,
+				LoopID:    s.activeLoopID,
 				TurnID:    mustUUID(),
 			},
 			Cause: identity.Cause{Coordinates: identity.Coordinates{LoopID: subagentLoopID}},
@@ -257,7 +257,7 @@ func TestSubagentResultQueuedDoesNotReleaseOffPublishPath(t *testing.T) {
 		t.Fatalf("PublishEvent(TurnStarted): %v", err)
 	}
 	if err := s.PublishEvent(context.Background(), event.LoopIdle{
-		Header: event.Header{Coordinates: identity.Coordinates{SessionID: s.SessionID(), LoopID: s.primaryLoopID}},
+		Header: event.Header{Coordinates: identity.Coordinates{SessionID: s.SessionID(), LoopID: s.activeLoopID}},
 	}); err != nil {
 		t.Fatalf("PublishEvent(LoopIdle): %v", err)
 	}

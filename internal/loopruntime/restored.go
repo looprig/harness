@@ -13,7 +13,7 @@ import (
 // RestoredState is the pre-built committed state a restored loop comes up with: the
 // folded message history and the turn count from the durable journal. It is the loop
 // half of the Restore constructor's payoff — the session folds a loop's Enduring
-// events (foldPrimaryLoop) into these two values and seeds a fresh actor with them so
+// events (foldLoop) into these two values and seeds a fresh actor with them so
 // the resumed loop's history is byte-for-byte what it committed before teardown.
 //
 // Msgs is the committed conversation ONLY — it does NOT carry a SystemMessage. The
@@ -52,7 +52,7 @@ type RestoredState struct {
 // ONLY difference is the seeded initial state.
 //
 // loopCtx, sessionID, loopID, events, and cfg mean exactly what they do in New. loopID
-// MUST be the loop's ORIGINAL id (the session passes the primary loop's recovered id)
+// MUST be the loop's ORIGINAL id (the session passes the root loop's recovered id)
 // so identity is stable across restore. seed is the folded committed state; a zero
 // RestoredState (empty Msgs, zero TurnIndex) yields a loop indistinguishable from a
 // freshly New'd one.

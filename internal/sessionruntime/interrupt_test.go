@@ -106,7 +106,7 @@ func fakeTreeSession(t *testing.T, policy InterruptReleasePolicy, loops ...treeL
 		sessionCtx:       ctx,
 		sessionCancel:    cancel,
 		loops:            registry,
-		primaryLoopID:    primary,
+		activeLoopID:     primary,
 		newID:            uuid.New,
 		now:              time.Now,
 		hub:              hub.New(mustUUID()),
@@ -303,7 +303,7 @@ func TestInterruptQueuePolicy(t *testing.T) {
 	t.Parallel()
 	parentDef := delegateParent(loop.DelegationManaged, "child")
 	s := newDelegationSession(t, parentDef, nil, delegateChild("child", "final"))
-	ctrl := s.delegation.controllerFor(s.PrimaryLoopID(), parentDef)
+	ctrl := s.delegation.controllerFor(s.ActiveLoopID(), parentDef)
 
 	// Start one owned child while NOT pending, so `send` has a real target below.
 	res, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateStart, Agent: "child", Message: "go", Wait: true})
@@ -313,7 +313,7 @@ func TestInterruptQueuePolicy(t *testing.T) {
 	childID := res.DelegateID
 
 	// Mark the parent (primary) loop interrupt-pending, as a fan-out would.
-	primary := s.PrimaryLoopID()
+	primary := s.ActiveLoopID()
 	s.loopsMu.Lock()
 	s.markInterruptPendingLocked([]loopSnapshot{{loopID: primary, handle: s.loops[primary]}})
 	s.loopsMu.Unlock()
@@ -915,7 +915,7 @@ func TestInterruptRetainsActiveTargetUserInputAndFlushesMachineInput(t *testing.
 			if err != nil {
 				t.Fatal(err)
 			}
-			machineID, err := s.submitToLoop(context.Background(), s.PrimaryLoopID(), []content.Block{&content.TextBlock{Text: "flush"}}, identity.AgencyMachine, true)
+			machineID, err := s.submitToLoop(context.Background(), s.ActiveLoopID(), []content.Block{&content.TextBlock{Text: "flush"}}, identity.AgencyMachine, true)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -1134,7 +1134,7 @@ func TestInterruptWaitingAdmissionWithoutCurrentTurnIsNoop(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			machineID, err := s.submitToLoop(context.Background(), s.PrimaryLoopID(), []content.Block{&content.TextBlock{Text: "flush"}}, identity.AgencyMachine, true)
+			machineID, err := s.submitToLoop(context.Background(), s.ActiveLoopID(), []content.Block{&content.TextBlock{Text: "flush"}}, identity.AgencyMachine, true)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -1143,7 +1143,7 @@ func TestInterruptWaitingAdmissionWithoutCurrentTurnIsNoop(t *testing.T) {
 				t.Fatalf("Interrupt while no turn exists = %v, %v; want false, nil", any, err)
 			}
 			s.loopsMu.RLock()
-			refs := s.interruptPending[s.PrimaryLoopID()]
+			refs := s.interruptPending[s.ActiveLoopID()]
 			s.loopsMu.RUnlock()
 			s.checkpoints.mu.Lock()
 			sweeps := len(s.checkpoints.interruptSweeps) + len(s.checkpoints.interruptDeferred)

@@ -179,7 +179,7 @@ func requestIDPtr(id uuid.UUID) *uuid.UUID { return &id }
 func TestDelegateStartSyncReturnsChildText(t *testing.T) {
 	t.Parallel()
 	s := newDelegationSession(t, delegateParent(loop.DelegationManaged, "child"), nil, delegateChild("child", "child final"))
-	ctrl := s.delegation.controllerFor(s.PrimaryLoopID(), delegateParent(loop.DelegationManaged, "child"))
+	ctrl := s.delegation.controllerFor(s.ActiveLoopID(), delegateParent(loop.DelegationManaged, "child"))
 
 	res, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateStart, Agent: "child", Message: "go", Wait: true})
 	if err != nil {
@@ -197,8 +197,8 @@ func TestDelegateStartSyncReturnsChildText(t *testing.T) {
 	s.loopsMu.RLock()
 	handle, ok := s.loops[res.DelegateID]
 	s.loopsMu.RUnlock()
-	if !ok || handle.parent.LoopID != s.PrimaryLoopID() {
-		t.Errorf("child not registered as owned by parent %v", s.PrimaryLoopID())
+	if !ok || handle.parent.LoopID != s.ActiveLoopID() {
+		t.Errorf("child not registered as owned by parent %v", s.ActiveLoopID())
 	}
 }
 
@@ -222,7 +222,7 @@ func TestDelegateStartValidation(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			s := newDelegationSession(t, parent, nil, delegateChild("child", "final"))
-			ctrl := s.delegation.controllerFor(s.PrimaryLoopID(), parent)
+			ctrl := s.delegation.controllerFor(s.ActiveLoopID(), parent)
 			before := s.spawnedCount()
 			_, err := ctrl.Execute(delegateCtx(t), tt.req)
 			var de *DelegateError
@@ -246,7 +246,7 @@ func TestDelegateActionSetEnforcement(t *testing.T) {
 	managedOnly := []tool.DelegateOperation{tool.DelegateSend, tool.DelegateWait, tool.DelegateInterrupt, tool.DelegateStatus}
 	for _, op := range managedOnly {
 		op := op
-		syncCtrl := s.delegation.controllerFor(s.PrimaryLoopID(), delegateParent(loop.DelegationSyncOnly, "child"))
+		syncCtrl := s.delegation.controllerFor(s.ActiveLoopID(), delegateParent(loop.DelegationSyncOnly, "child"))
 		_, err := syncCtrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: op, DelegateID: *del, RequestID: del})
 		var de *DelegateError
 		if !errors.As(err, &de) || de.Kind != DelegateActionUnavailable {
@@ -254,7 +254,7 @@ func TestDelegateActionSetEnforcement(t *testing.T) {
 		}
 	}
 
-	syncCtrl := s.delegation.controllerFor(s.PrimaryLoopID(), delegateParent(loop.DelegationSyncOnly, "child"))
+	syncCtrl := s.delegation.controllerFor(s.ActiveLoopID(), delegateParent(loop.DelegationSyncOnly, "child"))
 	_, err := syncCtrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateStart, Agent: "child", Message: "m", Wait: false})
 	var de *DelegateError
 	if !errors.As(err, &de) || de.Kind != DelegateActionUnavailable {
@@ -269,7 +269,7 @@ func TestDelegateOwnershipRejection(t *testing.T) {
 	t.Parallel()
 	parent := delegateParent(loop.DelegationManaged, "child")
 	s := newDelegationSession(t, parent, nil, delegateChild("child", "final"))
-	owner := s.delegation.controllerFor(s.PrimaryLoopID(), parent)
+	owner := s.delegation.controllerFor(s.ActiveLoopID(), parent)
 
 	res, err := owner.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateStart, Agent: "child", Message: "go", Wait: true})
 	if err != nil {
@@ -312,7 +312,7 @@ func TestDelegateModeSelectiveStart(t *testing.T) {
 	t.Parallel()
 	parent := delegateParent(loop.DelegationManaged, "child")
 	s := newDelegationSession(t, parent, nil, delegateChildWithModes("child", "final"))
-	ctrl := s.delegation.controllerFor(s.PrimaryLoopID(), parent)
+	ctrl := s.delegation.controllerFor(s.ActiveLoopID(), parent)
 
 	res, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateStart, Agent: "child", Mode: "review", Message: "go", Wait: true})
 	if err != nil {
@@ -483,7 +483,7 @@ func TestDelegateWaitFalseThenWaitResolves(t *testing.T) {
 	t.Parallel()
 	parent := delegateParent(loop.DelegationManaged, "child")
 	s := newDelegationSession(t, parent, nil, delegateChild("child", "async final"))
-	ctrl := s.delegation.controllerFor(s.PrimaryLoopID(), parent)
+	ctrl := s.delegation.controllerFor(s.ActiveLoopID(), parent)
 
 	queued, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateStart, Agent: "child", Message: "go", Wait: false})
 	if err != nil {
@@ -539,7 +539,7 @@ func TestDelegateWaitTimeoutInterruptsRunningChild(t *testing.T) {
 	t.Parallel()
 	parent := delegateParent(loop.DelegationManaged, "child")
 	s := newDelegationSession(t, parent, nil, delegateBlockingChild("child"))
-	ctrl := s.delegation.controllerFor(s.PrimaryLoopID(), parent)
+	ctrl := s.delegation.controllerFor(s.ActiveLoopID(), parent)
 	queued, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateStart, Agent: "child", Message: "go", Wait: false})
 	if err != nil {
 		t.Fatal(err)
@@ -568,7 +568,7 @@ func TestDelegateQueuedRequestTimeoutCancelsOnlyThatRequest(t *testing.T) {
 	t.Parallel()
 	parent := delegateParent(loop.DelegationManaged, "child")
 	s := newDelegationSession(t, parent, nil, delegateBlockingChild("child"))
-	ctrl := s.delegation.controllerFor(s.PrimaryLoopID(), parent)
+	ctrl := s.delegation.controllerFor(s.ActiveLoopID(), parent)
 	active, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateStart, Agent: "child", Message: "A", Wait: false})
 	if err != nil {
 		t.Fatal(err)
@@ -607,7 +607,7 @@ func TestDelegateQueuedRequestCallerCancellationTargetsOnlyThatRequest(t *testin
 	t.Parallel()
 	parent := delegateParent(loop.DelegationManaged, "child")
 	s := newDelegationSession(t, parent, nil, delegateBlockingChild("child"))
-	ctrl := s.delegation.controllerFor(s.PrimaryLoopID(), parent)
+	ctrl := s.delegation.controllerFor(s.ActiveLoopID(), parent)
 	active, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateStart, Agent: "child", Message: "A", Wait: false})
 	if err != nil {
 		t.Fatal(err)
@@ -640,7 +640,7 @@ func TestDelegateRunningRequestTimeoutStartsNextWithoutCancellingIt(t *testing.T
 	t.Parallel()
 	parent := delegateParent(loop.DelegationManaged, "child")
 	s := newDelegationSession(t, parent, nil, delegateBlockingChild("child"))
-	ctrl := s.delegation.controllerFor(s.PrimaryLoopID(), parent)
+	ctrl := s.delegation.controllerFor(s.ActiveLoopID(), parent)
 	running, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateStart, Agent: "child", Message: "B", Wait: false})
 	if err != nil {
 		t.Fatal(err)
@@ -682,7 +682,7 @@ func TestDelegateTerminalWinsCancelledWaitBeforeControlDispatch(t *testing.T) {
 	t.Parallel()
 	parent := delegateParent(loop.DelegationManaged, "child")
 	s := newDelegationSession(t, parent, nil, delegateChild("child", "B done"))
-	ctrl := s.delegation.controllerFor(s.PrimaryLoopID(), parent)
+	ctrl := s.delegation.controllerFor(s.ActiveLoopID(), parent)
 	request, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateStart, Agent: "child", Message: "B", Wait: false})
 	if err != nil {
 		t.Fatal(err)
@@ -709,7 +709,7 @@ func TestNativeQueuedDelegateInterruptResolvesWithoutWaitTimeout(t *testing.T) {
 	t.Parallel()
 	parent := delegateParent(loop.DelegationManaged, "child")
 	s := newDelegationSession(t, parent, nil, delegateBlockingChild("child"))
-	ctrl := s.delegation.controllerFor(s.PrimaryLoopID(), parent)
+	ctrl := s.delegation.controllerFor(s.ActiveLoopID(), parent)
 	active, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateStart, Agent: "child", Message: "A", Wait: false})
 	if err != nil {
 		t.Fatal(err)
@@ -752,7 +752,7 @@ func TestNativeQueuedDelegateFailedTurnResolvesFailedLiveAndRestore(t *testing.T
 	events := &recordingEventAppender{}
 	commands := &fakeCommandAppender{}
 	s := newDelegationSession(t, parent, []Option{WithEventAppender(events), WithCommandAppender(commands)}, child)
-	ctrl := s.delegation.controllerFor(s.PrimaryLoopID(), parent)
+	ctrl := s.delegation.controllerFor(s.ActiveLoopID(), parent)
 	active, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateStart, Agent: "child", Message: "A", Wait: false})
 	if err != nil {
 		t.Fatal(err)
@@ -813,7 +813,7 @@ func TestDelegateStatusReportsMechanicalState(t *testing.T) {
 	t.Parallel()
 	parent := delegateParent(loop.DelegationManaged, "child")
 	s := newDelegationSession(t, parent, nil, delegateChild("child", "final"))
-	ctrl := s.delegation.controllerFor(s.PrimaryLoopID(), parent)
+	ctrl := s.delegation.controllerFor(s.ActiveLoopID(), parent)
 
 	res, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateStart, Agent: "child", Message: "go", Wait: true})
 	if err != nil {
@@ -844,7 +844,7 @@ func TestDelegateStatusReportsWaitTrueChildRunning(t *testing.T) {
 	t.Parallel()
 	parent := delegateParent(loop.DelegationManaged, "child")
 	s := newDelegationSession(t, parent, nil, delegateBlockingChild("child"))
-	ctrl := s.delegation.controllerFor(s.PrimaryLoopID(), parent)
+	ctrl := s.delegation.controllerFor(s.ActiveLoopID(), parent)
 	startCtx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	done := make(chan struct{})
@@ -892,7 +892,7 @@ func TestDelegateChildPermissionIsAttenuatedByLiveParent(t *testing.T) {
 		loop.WithPermissionFactory(func(context.Context, tool.Bindings) (loop.PermissionGate, error) { return childGate, nil }),
 	)
 	s := newDelegationSession(t, parent, nil, child)
-	ctrl := s.delegation.controllerFor(s.PrimaryLoopID(), parent)
+	ctrl := s.delegation.controllerFor(s.ActiveLoopID(), parent)
 	res, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateStart, Agent: "child", Message: "go", Wait: true})
 	if err != nil {
 		t.Fatal(err)
@@ -930,7 +930,7 @@ func TestDelegatePermissionFactoriesShareLiveSessionCeiling(t *testing.T) {
 		}),
 	)
 	s := newDelegationSession(t, parent, nil, child)
-	ctrl := s.delegation.controllerFor(s.PrimaryLoopID(), parent)
+	ctrl := s.delegation.controllerFor(s.ActiveLoopID(), parent)
 	res, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateStart, Agent: "child", Message: "go", Wait: true})
 	if err != nil {
 		t.Fatal(err)
@@ -980,7 +980,7 @@ func TestPermissionCeilingIsSharedOnRestoreAndIsolatedAcrossSessions(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	ctrl := original.delegation.controllerFor(original.PrimaryLoopID(), parent)
+	ctrl := original.delegation.controllerFor(original.ActiveLoopID(), parent)
 	if _, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateStart, Agent: "child", Message: "go", Wait: true}); err != nil {
 		t.Fatal(err)
 	}
@@ -1034,7 +1034,7 @@ func TestDelegateStartSetupFailuresLeaveNoChildQuotaOrDurablePhantom(t *testing.
 			s := newDelegationSession(t, parent, []Option{WithEventAppender(rec)}, delegateChild("child", "answer"))
 			tt.inject(s)
 			beforeQuota := s.spawnedCount()
-			ctrl := s.delegation.controllerFor(s.PrimaryLoopID(), parent).(*scopedController)
+			ctrl := s.delegation.controllerFor(s.ActiveLoopID(), parent).(*scopedController)
 			beforeLoops := len(ctrl.ownedChildren(s))
 			_, err := ctrl.Execute(context.Background(), tool.DelegateRequest{Operation: tool.DelegateStart, Agent: "child", Message: "go", Wait: false})
 			if !errors.Is(err, sentinel) {
@@ -1047,7 +1047,7 @@ func TestDelegateStartSetupFailuresLeaveNoChildQuotaOrDurablePhantom(t *testing.
 				t.Fatalf("owned children = %d, want %d", got, beforeLoops)
 			}
 			for _, ev := range rec.snapshot() {
-				if started, ok := ev.(event.LoopStarted); ok && started.Cause.Coordinates.LoopID == s.PrimaryLoopID() {
+				if started, ok := ev.(event.LoopStarted); ok && started.Cause.Coordinates.LoopID == s.ActiveLoopID() {
 					t.Fatalf("failed spawn durably published child LoopStarted: %+v", started)
 				}
 			}
@@ -1060,7 +1060,7 @@ func TestDelegateStartCommitsLoopStartedBeforeTurnEvents(t *testing.T) {
 	rec := &recordingEventAppender{}
 	parent := delegateParent(loop.DelegationManaged, "child")
 	s := newDelegationSession(t, parent, []Option{WithEventAppender(rec)}, delegateChild("child", "answer"))
-	ctrl := s.delegation.controllerFor(s.PrimaryLoopID(), parent)
+	ctrl := s.delegation.controllerFor(s.ActiveLoopID(), parent)
 	queued, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateStart, Agent: "child", Message: "go", Wait: false})
 	if err != nil {
 		t.Fatal(err)
@@ -1101,7 +1101,7 @@ func TestDelegateStartAppendFailureRollsBackPreparedChild(t *testing.T) {
 	// The root LoopStarted has already committed. Fail exactly the next child creation
 	// commit without replacing the live session hub beneath running loop publishers.
 	appender.enabled.Store(true)
-	ctrl := s.delegation.controllerFor(s.PrimaryLoopID(), parent).(*scopedController)
+	ctrl := s.delegation.controllerFor(s.ActiveLoopID(), parent).(*scopedController)
 	beforeQuota := s.spawnedCount()
 	_, err := ctrl.Execute(context.Background(), tool.DelegateRequest{Operation: tool.DelegateStart, Agent: "child", Message: "go", Wait: false})
 	if !errors.Is(err, sentinel) {
@@ -1117,7 +1117,7 @@ func TestDelegateRequiredIntentAppendFailureDoesNotDispatch(t *testing.T) {
 	sentinel := errors.New("delegate intent append failed")
 	parent := delegateParent(loop.DelegationManaged, "child")
 	s := newDelegationSession(t, parent, nil, delegateChild("child", "answer"))
-	ctrl := s.delegation.controllerFor(s.PrimaryLoopID(), parent).(*scopedController)
+	ctrl := s.delegation.controllerFor(s.ActiveLoopID(), parent).(*scopedController)
 	failing := &fakeCommandAppender{err: sentinel}
 	s.cmdAppender = failing
 	before := s.spawnedCount()
@@ -1151,7 +1151,7 @@ func TestDelegateAcceptanceAppendFailureReturnsNoHandle(t *testing.T) {
 	parent := delegateParent(loop.DelegationManaged, "child")
 	appender := &failDelegateAcceptanceAppender{err: sentinel}
 	s := newDelegationSession(t, parent, []Option{WithEventAppender(appender)}, delegateChild("child", "answer"))
-	ctrl := s.delegation.controllerFor(s.PrimaryLoopID(), parent)
+	ctrl := s.delegation.controllerFor(s.ActiveLoopID(), parent)
 	started, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateStart, Agent: "child", Message: "A", Wait: true})
 	if err != nil {
 		t.Fatal(err)
@@ -1174,7 +1174,7 @@ func TestDelegateQuotaReservedBeforeConstruction(t *testing.T) {
 	t.Parallel()
 	parent := delegateParent(loop.DelegationManaged, "child")
 	s := newDelegationSession(t, parent, []Option{WithLimits(Limits{Depth: 3, Quota: 1})}, delegateChildWithModes("child", "final"))
-	ctrl := s.delegation.controllerFor(s.PrimaryLoopID(), parent)
+	ctrl := s.delegation.controllerFor(s.ActiveLoopID(), parent)
 
 	// An invalid mode is refused BEFORE reserving quota.
 	if _, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateStart, Agent: "child", Mode: "ghost", Message: "m", Wait: true}); err == nil {
@@ -1230,7 +1230,7 @@ func TestDelegateSendResolvesDistinctTurns(t *testing.T) {
 	t.Parallel()
 	parent := delegateParent(loop.DelegationManaged, "child")
 	s := newDelegationSession(t, parent, nil, delegateChild("child", "answer"))
-	ctrl := s.delegation.controllerFor(s.PrimaryLoopID(), parent)
+	ctrl := s.delegation.controllerFor(s.ActiveLoopID(), parent)
 
 	start, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateStart, Agent: "child", Message: "go", Wait: true})
 	if err != nil {
@@ -1282,7 +1282,7 @@ func TestDelegateWaitResolvesAfterRestore(t *testing.T) {
 	}
 	defer func() { _ = obs.Close() }()
 
-	ctrl := s.delegation.controllerFor(s.PrimaryLoopID(), parent)
+	ctrl := s.delegation.controllerFor(s.ActiveLoopID(), parent)
 	queued, err := ctrl.Execute(ctx, tool.DelegateRequest{Operation: tool.DelegateStart, Agent: "child", Message: "go", Wait: false})
 	if err != nil {
 		t.Fatalf("start wait:false: %v", err)
@@ -1306,7 +1306,7 @@ func TestDelegateWaitResolvesAfterRestore(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = r.Shutdown(context.Background()) })
 
-	rctrl := r.delegation.controllerFor(r.PrimaryLoopID(), parent)
+	rctrl := r.delegation.controllerFor(r.ActiveLoopID(), parent)
 	res, err := rctrl.Execute(context.Background(), tool.DelegateRequest{Operation: tool.DelegateWait, DelegateID: childID, RequestID: requestIDPtr(reqID)})
 	if err != nil {
 		t.Fatalf("wait after restore: %v", err)
@@ -1334,7 +1334,7 @@ func TestDelegateQueuedRequestRestoresInterruptedWithoutReplay(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ctrl := s.delegation.controllerFor(s.PrimaryLoopID(), parent)
+	ctrl := s.delegation.controllerFor(s.ActiveLoopID(), parent)
 	a, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateStart, Agent: "child", Message: "A", Wait: false})
 	if err != nil {
 		t.Fatal(err)
@@ -1368,7 +1368,7 @@ func TestDelegateQueuedRequestRestoresInterruptedWithoutReplay(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = restored.Shutdown(context.Background()) })
-	restoredCtrl := restored.delegation.controllerFor(restored.PrimaryLoopID(), parent)
+	restoredCtrl := restored.delegation.controllerFor(restored.ActiveLoopID(), parent)
 	result, err := restoredCtrl.Execute(context.Background(), tool.DelegateRequest{Operation: tool.DelegateWait, DelegateID: a.DelegateID, RequestID: requestIDPtr(b.RequestID)})
 	if err != nil {
 		t.Fatal(err)

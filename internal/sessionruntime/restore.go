@@ -21,7 +21,7 @@ func checkFingerprint(persisted, live event.ConfigFingerprint, allowMismatch boo
 }
 
 // checkAgentName is the restore root-loop AgentName decision: it returns nil when the
-// persisted (root LoopStarted) name and the configured (primary loop.Definition) name are
+// persisted (root LoopStarted) name and the configured (root loop.Definition) name are
 // equal, a typed *AgentNameMismatchError when they differ, and — when allowMismatch is
 // set — nil even on a difference (the operator's explicit opt-in, shared with the
 // fingerprint override). It is fail-secure by default and treats an EMPTY persisted name
@@ -52,7 +52,7 @@ func firstConfigFingerprint(events []event.Event) (event.ConfigFingerprint, erro
 
 // findRootLoopStarted locates the session's root LoopStarted: the one whose
 // Cause.Coordinates is zero (a root loop has no spawning loop/turn/step). Restore reads
-// two facts off it — the primary loop's stable id (the recovered loop comes up under THIS
+// two facts off it — the root loop's stable id (the recovered loop comes up under THIS
 // id, keeping session identity stable) and its immutable stamped AgentName — so the "what
 // is the root loop" rule lives in one place. A stream with no root LoopStarted fails closed
 // with a typed *RestoreDiscoveryError.
@@ -134,7 +134,7 @@ func effectiveCurrentWorkspace(events []event.Event) (string, bool) {
 // discovery drain; scanning to the end picks the newest (a change appends a fresh event,
 // never replacing the prior one). It mirrors effectiveCurrentWorkspace — a single-purpose
 // discovery scanner — so the restore constructor stays a straight-line assembly and
-// foldPrimaryLoop stays pure.
+// foldLoop stays pure.
 func lastSecurityCeiling(events []event.Event) (ceiling.Level, bool) {
 	level, ok := ceiling.Level(0), false
 	for _, ev := range events {
@@ -237,7 +237,7 @@ type foldResult struct {
 	OpenTurn  bool
 }
 
-// foldPrimaryLoop reconstructs a loop's committed msgs + turnIndex from an ordered
+// foldLoop reconstructs a loop's committed msgs + turnIndex from an ordered
 // slice of its Enduring events, mirroring runLoop's commit arm EXACTLY so a fold
 // reproduces loopState.msgs byte-for-byte:
 //
@@ -272,7 +272,7 @@ type foldResult struct {
 // committed UserMessage + those completed step groups and NO partial assistant step
 // (the in-flight step never emitted a StepDone, so it never entered the slice); a
 // turn that crashed before its first step yields just the committed UserMessage.
-func foldPrimaryLoop(events []event.Event) foldResult {
+func foldLoop(events []event.Event) foldResult {
 	// Start non-nil so an empty sequence reconstructs as an empty (not nil) thread,
 	// matching content.AgenticMessages' documented empty zero value and the loop's
 	// own freshly-seeded msgs.

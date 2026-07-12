@@ -42,7 +42,7 @@ func TestWithLoopHeaderStampsEveryEnduringType(t *testing.T) {
 	}
 
 	// in is one instance of each Enduring loop-scoped event type. These are exactly
-	// the 13 cases withLoopHeader enumerates (the only events the publish chokepoint
+	// the 14 cases withLoopHeader enumerates (the only events the publish chokepoint
 	// stamps); Ephemeral and session-scoped events never reach withLoopHeader.
 	tests := []struct {
 		name string
@@ -206,7 +206,7 @@ func TestStampLoopHeaderReplyEvents(t *testing.T) {
 	}
 }
 
-// TestStampStepID proves stampStepID sets Coordinates.StepID on the four tool/gate
+// TestStampStepID proves stampStepID sets Coordinates.StepID on the five tool/gate
 // events ONLY, and leaves every other event (including events whose StepID must
 // stay zero, and TokenDelta) untouched. The stamped StepID survives a subsequent
 // stampLoopHeader (which fills only zero header fields), which is the property the

@@ -129,7 +129,7 @@ func TestRestoreSessionFailSecureExits(t *testing.T) {
 
 			// (c) A RestoreErrored is durably recorded (the failure is in the log, and no
 			// RestoreDone followed it — the restore did not silently half-succeed).
-			tail := restoreEventTail(t, store, orig.sessionID, orig.primaryLoopID)
+			tail := restoreEventTail(t, store, orig.sessionID, orig.rootLoopID)
 			if !lastIs(tail, event.RestoreErrored{}) {
 				t.Errorf("restore-event tail does not end with RestoreErrored: %v", tailTypes(tail))
 			}
@@ -218,7 +218,7 @@ func TestRestoreCrashSeamAppendFailSecure(t *testing.T) {
 			}
 
 			// (c) A best-effort RestoreErrored is recorded, and NO RestoreDone was persisted.
-			tail := restoreEventTail(t, store, orig.sessionID, orig.primaryLoopID)
+			tail := restoreEventTail(t, store, orig.sessionID, orig.rootLoopID)
 			if !lastIs(tail, event.RestoreErrored{}) {
 				t.Errorf("restore-event tail does not end with RestoreErrored: %v", tailTypes(tail))
 			}

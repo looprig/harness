@@ -365,7 +365,7 @@ func TestLifecycleRestore(t *testing.T) {
 				if restored.SessionID() != sid {
 					t.Errorf("restored SessionID = %v, want %v", restored.SessionID(), sid)
 				}
-				if restored.PrimaryLoopID().IsZero() {
+				if restored.ActiveLoopID().IsZero() {
 					t.Error("restored session has a zero primary loop id")
 				}
 			}

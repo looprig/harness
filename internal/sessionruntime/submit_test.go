@@ -134,13 +134,13 @@ func TestSubmitFireAndForget(t *testing.T) {
 // TestSubmitLoopNotFound asserts Submit fails secure with
 // *SessionError{SessionLoopNotFound} when the primary loop id resolves to no
 // registry entry, and sends no command. The miss is forced by deleting the primary
-// entry while leaving primaryLoopID set — the exact state the loopFor guard covers.
+// entry while leaving rootLoopID set — the exact state the loopFor guard covers.
 func TestSubmitLoopNotFound(t *testing.T) {
 	t.Parallel()
 	s, cmds, _ := sessionWithFakeLoop() // Commands never read: a send would block forever
 
 	s.loopsMu.Lock()
-	delete(s.loops, s.primaryLoopID)
+	delete(s.loops, s.activeLoopID)
 	s.loopsMu.Unlock()
 
 	id, err := s.Submit(context.Background(), []content.Block{&content.TextBlock{Text: "x"}})
@@ -260,7 +260,7 @@ func TestSubmitToLoopTargetsSubLoop(t *testing.T) {
 
 	// A second loop in the same session — the submit target. Its parent provenance is
 	// the primary loop (a stand-in for the real subagent spawn).
-	subLoopID, err := s.NewLoop(loop.Provenance{LoopID: s.primaryLoopID}, cfg(&stubLLM{chunks: []content.Chunk{textChunk("sub")}}))
+	subLoopID, err := s.NewLoop(loop.Provenance{LoopID: s.activeLoopID}, cfg(&stubLLM{chunks: []content.Chunk{textChunk("sub")}}))
 	if err != nil {
 		t.Fatalf("NewLoop: %v", err)
 	}
@@ -337,7 +337,7 @@ func TestSubmitToLoop(t *testing.T) {
 
 			// A second (non-primary) loop in the same session — the submit target for the
 			// happy path; its parent provenance is the primary loop (a subagent stand-in).
-			subLoopID, err := s.NewLoop(loop.Provenance{LoopID: s.primaryLoopID}, cfg(&stubLLM{chunks: []content.Chunk{textChunk("sub")}}))
+			subLoopID, err := s.NewLoop(loop.Provenance{LoopID: s.activeLoopID}, cfg(&stubLLM{chunks: []content.Chunk{textChunk("sub")}}))
 			if err != nil {
 				t.Fatalf("NewLoop: %v", err)
 			}
@@ -401,7 +401,7 @@ func TestSubmitToLoop(t *testing.T) {
 // after SetActiveLoop switches the active selection to a second primer, a subsequent
 // Submit starts its turn on the NEW active loop (not the original primary). The resulting
 // TurnStarted lands on the new active loop carrying the returned InputID with human
-// (AgencyUser) semantics — proving Submit reads the live primaryLoopID SetActiveLoop
+// (AgencyUser) semantics — proving Submit reads the live rootLoopID SetActiveLoop
 // mutates, not the construction-time primer.
 func TestSubmitFollowsActiveLoop(t *testing.T) {
 	t.Parallel()
@@ -421,7 +421,7 @@ func TestSubmitFollowsActiveLoop(t *testing.T) {
 	if builderID.IsZero() {
 		t.Fatal("builder root missing")
 	}
-	if s.PrimaryLoopID() == builderID {
+	if s.ActiveLoopID() == builderID {
 		t.Fatal("builder was already active before SetActiveLoop (planner should be the initial active primer)")
 	}
 

@@ -195,7 +195,7 @@ func restoreTopologySession(
 	}
 
 	// (2) Replay the whole stream once for discovery (the persisted fingerprint + the
-	// primary loop id + the subagent spawn count) and gate recovery. A ZERO LoopID leaves
+	// root loop id + the subagent spawn count) and gate recovery. A ZERO LoopID leaves
 	// the event projection UNNARROWED — every loop's events — so findRootLoopStarted and
 	// countSpawnedLoops see the subagent LoopStarted events, not just the primary's. Fail
 	// closed on any error.
@@ -257,7 +257,7 @@ func restoreTopologySession(
 			return recordErrored(err)
 		}
 	}
-	primaryLoopID := activePlan.started.LoopID
+	rootLoopID := activePlan.started.LoopID
 	bound := activePlan.bound
 
 	// Re-seed the cumulative spawn counter from the durable log so the quota SURVIVES the
@@ -295,7 +295,7 @@ func restoreTopologySession(
 	// Every loop was independently folded from its loop-scoped projection above.
 	primaryEvents := activePlan.events
 	folded := activePlan.folded
-	// Fold the primary loop's mode + direct inference changes so it resumes under the
+	// Fold the root loop's mode + direct inference changes so it resumes under the
 	// effective config it crashed under (last write wins, live precedence).
 	activeInference := foldLoopInference(primaryEvents)
 
@@ -348,7 +348,7 @@ func restoreTopologySession(
 
 	// Build the Session, reusing sessionID + the active primer loop id (identity stable).
 	// It mirrors newSession's wiring EXCEPT: no SessionStarted is published (the start
-	// was recorded on the original run), and the primary loop is SEEDED via NewRestored
+	// was recorded on the original run), and the root loop is SEEDED via NewRestored
 	// rather than spawned empty. The lease Restore acquired is handed to the session as its
 	// release-on-Shutdown hook (the Phase-10 composition wiring): the journal holds the
 	// lease for the live lifetime, and a clean Shutdown releases it so a successor can
@@ -367,11 +367,11 @@ func restoreTopologySession(
 		// below) so its Shutdown stops+joins it before SessionStopped and lease release.
 		leaseOpts = append(leaseOpts, withOffloadGCRunner(gcRunner))
 	}
-	// Recover the foreign session id from the primary loop's events. Prebound adapters
+	// Recover the foreign session id from the root loop's events. Prebound adapters
 	// stamped it on LoopStarted; late-bound adapters record it with ForeignSessionBound.
 	// buildRestoredSession fails closed on an empty sid for a foreign engine.
 	foreignSID := findForeignSID(primaryEvents)
-	s, err := buildRestoredSession(sessionCtx, sessionCancel, bound, sessionID, primaryLoopID, foreignSID, spawnedCount, ceilingLevel, hasCeiling, folded, activeInference, restoredGates.open, j, factory, newID, now, leaseOpts...)
+	s, err := buildRestoredSession(sessionCtx, sessionCancel, bound, sessionID, rootLoopID, foreignSID, spawnedCount, ceilingLevel, hasCeiling, folded, activeInference, restoredGates.open, j, factory, newID, now, leaseOpts...)
 	if err != nil {
 		if constructionCleanupOwned(err) {
 			return nil, err
@@ -387,7 +387,7 @@ func restoreTopologySession(
 	// (7) Post-build wiring: register every non-primary restored loop, resolve + validate the
 	// durable active selection, and set it as the session primary. Any failure cancels the
 	// session context (tearing down the seeded loops) before recording a RestoreErrored.
-	if err := attachAndActivate(s, all, plans, primaryLoopID); err != nil {
+	if err := attachAndActivate(s, all, plans, rootLoopID); err != nil {
 		return abortAccepted(s, err)
 	}
 	// RestoreDone is the commit point: every loop is bound, crash-closed, built,
@@ -527,7 +527,7 @@ func planLoops(sessionCtx context.Context, sessionID uuid.UUID, topology Topolog
 		}
 		boundByLoop[started.LoopID] = bound
 		loopEvents := eventsFromRecords(allRecords, started.LoopID)
-		plans = append(plans, loopPlan{started: started, bound: bound, events: loopEvents, folded: foldPrimaryLoop(loopEvents)})
+		plans = append(plans, loopPlan{started: started, bound: bound, events: loopEvents, folded: foldLoop(loopEvents)})
 		if started.LoopID == roots[topology.ActivePrimer].LoopID {
 			activeIndex = len(plans) - 1
 		}
@@ -541,13 +541,13 @@ func planLoops(sessionCtx context.Context, sessionID uuid.UUID, topology Topolog
 // attachAndActivate registers every non-primary restored loop, resolves the durable active
 // selection (the last ActiveLoopChanged, else the primary), validates it is registered, and
 // sets it as the session's primary under loopsMu — the post-build wiring performed after the
-// primary loop is seeded and before RestoreDone. It returns a typed *RestoreError on any
+// root loop is seeded and before RestoreDone. It returns a typed *RestoreError on any
 // failure (an attach failure, an unregistered active target, or a latched persistence
 // fault); the caller cancels the session context and records a RestoreErrored. On success
-// s.primaryLoopID reflects the durable active loop.
-func attachAndActivate(s *Session, all []event.Event, plans []loopPlan, primaryLoopID uuid.UUID) error {
+// s.activeLoopID reflects the durable active loop.
+func attachAndActivate(s *Session, all []event.Event, plans []loopPlan, rootLoopID uuid.UUID) error {
 	for _, plan := range plans {
-		if plan.started.LoopID == primaryLoopID {
+		if plan.started.LoopID == rootLoopID {
 			continue
 		}
 		parent := loop.Provenance{LoopID: plan.started.Cause.Coordinates.LoopID, TurnID: plan.started.Cause.Coordinates.TurnID, StepID: plan.started.Cause.Coordinates.StepID}
@@ -555,7 +555,7 @@ func attachAndActivate(s *Session, all []event.Event, plans []loopPlan, primaryL
 			return err
 		}
 	}
-	activeID := primaryLoopID
+	activeID := rootLoopID
 	for _, ev := range all {
 		if changed, ok := ev.(event.ActiveLoopChanged); ok {
 			activeID = changed.ActiveLoopID
@@ -565,7 +565,7 @@ func attachAndActivate(s *Session, all []event.Event, plans []loopPlan, primaryL
 		return &RestoreError{Kind: RestoreLoopFailed, Cause: &SessionError{Kind: SessionLoopNotFound}}
 	}
 	s.loopsMu.Lock()
-	s.primaryLoopID = activeID
+	s.activeLoopID = activeID
 	if s.faulted {
 		fault := s.faultErr
 		s.loopsMu.Unlock()
@@ -577,7 +577,7 @@ func attachAndActivate(s *Session, all []event.Event, plans []loopPlan, primaryL
 
 // buildRestoredSession assembles the live Session for a successful restore: the hub
 // wired with the journal-backed event appender, the shared Factory, and the session as
-// the hub's FaultReporter; the journal-backed command appender; and the primary loop
+// the hub's FaultReporter; the journal-backed command appender; and the root loop
 // seeded (NewRestored) with the folded committed state under its ORIGINAL id, idle. It
 // publishes NO SessionStarted and spawns NO empty loop — both are the deliberate
 // difference from New.
@@ -585,7 +585,7 @@ func buildRestoredSession(
 	sessionCtx context.Context,
 	sessionCancel context.CancelFunc,
 	cfg loop.BoundDefinition,
-	sessionID, primaryLoopID uuid.UUID,
+	sessionID, rootLoopID uuid.UUID,
 	foreignSID string,
 	spawnedCount int,
 	ceilingLevel ceiling.Level,
@@ -677,7 +677,7 @@ func buildRestoredSession(
 		})
 	}
 
-	// Seed the primary loop under its ORIGINAL id (identity stable), coming up idle with
+	// Seed the root loop under its ORIGINAL id (identity stable), coming up idle with
 	// the folded committed history + turnIndex. No empty loop is spawned and no
 	// LoopStarted is published — the loop already exists in the durable record. The Engine
 	// switch mirrors newLoop's: a native bound definition seeds through
@@ -690,7 +690,7 @@ func buildRestoredSession(
 	var l loop.Backend
 	switch cfg.Engine() {
 	case loop.EngineNative:
-		l, err = loopruntime.NewRestored(loopCtx, sessionID, primaryLoopID, loop.Provenance{}, s, cfg,
+		l, err = loopruntime.NewRestored(loopCtx, sessionID, rootLoopID, loop.Provenance{}, s, cfg,
 			restoredStateFrom(folded, ri))
 	default:
 		if foreignSID == "" {
@@ -703,7 +703,7 @@ func buildRestoredSession(
 			restoreErr := &RestoreError{Kind: RestoreForeignBuilderMissing}
 			return abort(restoreErr)
 		}
-		l, err = s.foreignBuildRestored(loopCtx, sessionID, primaryLoopID, loop.Provenance{}, s, cfg,
+		l, err = s.foreignBuildRestored(loopCtx, sessionID, rootLoopID, loop.Provenance{}, s, cfg,
 			func() (uuid.UUID, error) { return newID() }, factory,
 			foreignloop.RestoredForeign{ForeignSID: foreignSID, TurnIndex: folded.TurnIndex, Msgs: folded.Msgs})
 	}
@@ -713,8 +713,8 @@ func buildRestoredSession(
 		return abort(restoreErr)
 	}
 	liveMode, liveModel := liveViewFor(cfg, ri)
-	s.loops[primaryLoopID] = &loopHandle{id: primaryLoopID, owner: s, bound: cfg, backend: l, parent: loop.Provenance{}, cancel: cancel, liveMode: liveMode, liveModel: liveModel, state: tool.DelegateStatusIdle}
-	s.primaryLoopID = primaryLoopID
+	s.loops[rootLoopID] = &loopHandle{id: rootLoopID, owner: s, bound: cfg, backend: l, parent: loop.Provenance{}, cancel: cancel, liveMode: liveMode, liveModel: liveModel, state: tool.DelegateStatusIdle}
+	s.activeLoopID = rootLoopID
 	return s, nil
 }
 
@@ -757,7 +757,7 @@ func withRestoreHeader(ev event.Event, hdr event.Header) event.Event {
 }
 
 // openTurnCoords returns the TurnID + TurnIndex of the LAST TurnStarted in the primary
-// loop's events — the open (unterminated) turn when foldPrimaryLoop reports OpenTurn.
+// loop's events — the open (unterminated) turn when foldLoop reports OpenTurn.
 // The crash-seam TurnInterrupted is stamped with these so it closes the exact turn that
 // crashed. It is only called when the fold detected an open turn, so a last TurnStarted
 // always exists; the zero return is the defensive fall-through.

@@ -85,7 +85,7 @@ func TestRestoreTopologyMissingPrimerFailsBeforeRestoreDone(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	sessionID, primaryID := original.SessionID(), original.PrimaryLoopID()
+	sessionID, primaryID := original.SessionID(), original.ActiveLoopID()
 	if err := original.Shutdown(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -177,7 +177,7 @@ func TestRestoreTopologyBindFailureHasNoRestoreDone(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	sessionID, primaryID := original.SessionID(), original.PrimaryLoopID()
+	sessionID, primaryID := original.SessionID(), original.ActiveLoopID()
 	if err := original.Shutdown(context.Background()); err != nil {
 		t.Fatal(err)
 	}

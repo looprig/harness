@@ -150,7 +150,7 @@ func wsAssertTreesEqual(t *testing.T, want, got string) {
 // caller to release (handover).
 func stampCheckpoint(t *testing.T, store *sessionstore.Store, fp event.ConfigFingerprint, refs ...string) persistedStream {
 	t.Helper()
-	h, sessionID, primaryLoopID, lease, es := newOriginalHub(t, store, fp)
+	h, sessionID, rootLoopID, lease, es := newOriginalHub(t, store, fp)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	for _, ref := range refs {
@@ -161,7 +161,7 @@ func stampCheckpoint(t *testing.T, store *sessionstore.Store, fp event.ConfigFin
 			Trigger:     event.SnapshotTriggerManual,
 		})
 	}
-	return persistedStream{sessionID: sessionID, primaryLoopID: primaryLoopID, lease: lease}
+	return persistedStream{sessionID: sessionID, rootLoopID: rootLoopID, lease: lease}
 }
 
 // --- unit: the discovery scanner ----------------------------------------------------
@@ -249,7 +249,7 @@ func TestRestoreMaterializesWorkspace(t *testing.T) {
 
 			// A clean tail: RestoreStarted → RestoreDone (the workspace restored, so the restore
 			// was allowed to declare done).
-			assertTail(t, restoreEventTail(t, store, orig.sessionID, orig.primaryLoopID),
+			assertTail(t, restoreEventTail(t, store, orig.sessionID, orig.rootLoopID),
 				[]event.Event{event.RestoreStarted{}, event.RestoreDone{}})
 		})
 	}
@@ -277,7 +277,7 @@ func TestRestoreMaterializesEffectiveCurrentWorkspace(t *testing.T) {
 		t.Fatalf("Snapshot(B): %v", err)
 	}
 
-	h, sessionID, primaryLoopID, lease, es := newOriginalHub(t, store, fp)
+	h, sessionID, rootLoopID, lease, es := newOriginalHub(t, store, fp)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	for _, ev := range []event.Event{
@@ -311,7 +311,7 @@ func TestRestoreMaterializesEffectiveCurrentWorkspace(t *testing.T) {
 	t.Cleanup(func() { _ = s.Shutdown(context.Background()) })
 
 	wsAssertTreesEqual(t, srcA, freshRoot)
-	assertTail(t, restoreEventTail(t, store, sessionID, primaryLoopID),
+	assertTail(t, restoreEventTail(t, store, sessionID, rootLoopID),
 		[]event.Event{event.RestoreStarted{}, event.RestoreDone{}})
 }
 
@@ -375,7 +375,7 @@ func TestRestoreSkipsWorkspaceMaterialize(t *testing.T) {
 				t.Errorf("workspace root modified on a skipped materialize:\n before %v\n after %v", before, after)
 			}
 			// The restore completed: RestoreDone present (no RestoreErrored).
-			if tail := restoreEventTail(t, store, orig.sessionID, orig.primaryLoopID); !lastIs(tail, event.RestoreDone{}) {
+			if tail := restoreEventTail(t, store, orig.sessionID, orig.rootLoopID); !lastIs(tail, event.RestoreDone{}) {
 				t.Errorf("restore tail does not end with RestoreDone: %v", tailTypes(tail))
 			}
 		})
@@ -426,7 +426,7 @@ func TestRestoreWorkspaceWarmVolumeReuse(t *testing.T) {
 		t.Errorf("warm-volume restore modified the root:\n before %v\n after %v", before, after)
 	}
 	// The restore completed end to end: clean tail.
-	assertTail(t, restoreEventTail(t, store, orig.sessionID, orig.primaryLoopID),
+	assertTail(t, restoreEventTail(t, store, orig.sessionID, orig.rootLoopID),
 		[]event.Event{event.RestoreStarted{}, event.RestoreDone{}})
 }
 
@@ -526,7 +526,7 @@ func TestRestoreWorkspaceMaterializeFailsClosed(t *testing.T) {
 			// (c) The concrete workspacestore cause is reachable through Unwrap.
 			tt.assertCause(t, err)
 			// (d) A RestoreErrored is durably recorded and NO RestoreDone followed.
-			tail := restoreEventTail(t, store, orig.sessionID, orig.primaryLoopID)
+			tail := restoreEventTail(t, store, orig.sessionID, orig.rootLoopID)
 			if !lastIs(tail, event.RestoreErrored{}) {
 				t.Errorf("restore tail does not end with RestoreErrored: %v", tailTypes(tail))
 			}

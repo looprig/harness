@@ -44,7 +44,7 @@ func TestNewLoopQuotaCap(t *testing.T) {
 	t.Cleanup(func() { _ = sub.Close() })
 
 	for i := 0; i < quota; i++ {
-		if _, err := s.NewLoop(loop.Provenance{LoopID: s.PrimaryLoopID()}, cfg(&stubLLM{chunks: []content.Chunk{textChunk("ok")}})); err != nil {
+		if _, err := s.NewLoop(loop.Provenance{LoopID: s.ActiveLoopID()}, cfg(&stubLLM{chunks: []content.Chunk{textChunk("ok")}})); err != nil {
 			t.Fatalf("NewLoop #%d within quota: %v", i+1, err)
 		}
 	}
@@ -53,7 +53,7 @@ func TestNewLoopQuotaCap(t *testing.T) {
 	}
 
 	// The (quota+1)th spawn is refused.
-	_, err = s.NewLoop(loop.Provenance{LoopID: s.PrimaryLoopID()}, cfg(&stubLLM{chunks: []content.Chunk{textChunk("over")}}))
+	_, err = s.NewLoop(loop.Provenance{LoopID: s.ActiveLoopID()}, cfg(&stubLLM{chunks: []content.Chunk{textChunk("over")}}))
 	var se *SessionError
 	if !errors.As(err, &se) || se.Kind != SessionLoopQuotaExceeded {
 		t.Fatalf("over-quota NewLoop err = %v, want *SessionError{SessionLoopQuotaExceeded}", err)
@@ -92,7 +92,7 @@ func TestNewLoopQuotaConcurrent(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			<-start // release all at once to maximize contention
-			_, err := s.NewLoop(loop.Provenance{LoopID: s.PrimaryLoopID()}, cfg(&stubLLM{chunks: []content.Chunk{textChunk("ok")}}))
+			_, err := s.NewLoop(loop.Provenance{LoopID: s.ActiveLoopID()}, cfg(&stubLLM{chunks: []content.Chunk{textChunk("ok")}}))
 			switch {
 			case err == nil:
 				success.Add(1)
@@ -141,7 +141,7 @@ func TestNewLoopQuotaRollback(t *testing.T) {
 	// would be wrongly refused.
 	badCfg := loop.Definition{}
 	for i := 0; i < quota+2; i++ {
-		_, err := s.NewLoop(loop.Provenance{LoopID: s.PrimaryLoopID()}, badCfg)
+		_, err := s.NewLoop(loop.Provenance{LoopID: s.ActiveLoopID()}, badCfg)
 		var be *loop.BindError
 		if !errors.As(err, &be) || be.Kind != loop.BindInvalidDefinition {
 			t.Fatalf("forced loop bind failure #%d err = %v, want *loop.BindError{BindInvalidDefinition}", i+1, err)
@@ -154,7 +154,7 @@ func TestNewLoopQuotaRollback(t *testing.T) {
 
 	// A full quota of valid spawns now succeeds — proving the slots were released.
 	for i := 0; i < quota; i++ {
-		if _, err := s.NewLoop(loop.Provenance{LoopID: s.PrimaryLoopID()}, cfg(&stubLLM{chunks: []content.Chunk{textChunk("ok")}})); err != nil {
+		if _, err := s.NewLoop(loop.Provenance{LoopID: s.ActiveLoopID()}, cfg(&stubLLM{chunks: []content.Chunk{textChunk("ok")}})); err != nil {
 			t.Fatalf("valid spawn #%d after rollbacks: %v, want success", i+1, err)
 		}
 	}

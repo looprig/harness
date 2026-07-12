@@ -55,9 +55,9 @@ func (s *Session) SetSecurityCeiling(ctx context.Context, level ceiling.Level) e
 	}
 	// Intent log (audit-only): append BEFORE apply/emit; a failure is logged and the change
 	// proceeds (a lost record must never block an operator's security action). The ceiling
-	// is session-global, so the record is anchored to the primary loop purely as audit
+	// is session-global, so the record is anchored to the active loop purely as audit
 	// metadata — replay reconstructs the ceiling from the emitted events, not this record.
-	s.appendCommand(ctx, s.PrimaryLoopID(), cmd)
+	s.appendCommand(ctx, s.ActiveLoopID(), cmd)
 
 	// Compute the EFFECTIVE (post-clamp) target and the current ordinal WITHOUT mutating
 	// state yet, so the direction decides the apply/emit order. Set(effective) below is a

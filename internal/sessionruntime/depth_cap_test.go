@@ -54,7 +54,7 @@ func TestNewLoopDepthCap(t *testing.T) {
 	t.Cleanup(func() { _ = sub.Close() })
 
 	// Chain: primary -> A (chain length 1, allowed).
-	loopA := spawnChild(t, s, s.PrimaryLoopID())
+	loopA := spawnChild(t, s, s.ActiveLoopID())
 
 	s.loopsMu.RLock()
 	loopsBeforeReject := len(s.loops)
@@ -94,8 +94,8 @@ func TestNewLoopDepthCapDefault(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = s.Shutdown(context.Background()) })
 
-	loopA := spawnChild(t, s, s.PrimaryLoopID()) // chain 1, allowed
-	loopB := spawnChild(t, s, loopA)             // chain 2, allowed
+	loopA := spawnChild(t, s, s.ActiveLoopID()) // chain 1, allowed
+	loopB := spawnChild(t, s, loopA)            // chain 2, allowed
 
 	// B's child would be chain length 3 == default Depth → refused.
 	_, err = s.NewLoop(loop.Provenance{LoopID: loopB}, cfg(&stubLLM{chunks: []content.Chunk{textChunk("never")}}))

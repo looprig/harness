@@ -44,7 +44,7 @@ func TestRunSubagentReturnsFinalText(t *testing.T) {
 
 	// Parent provenance is the spawning loop (the primary, here) — non-zero LoopID so
 	// the spawn is attributed to a real parent.
-	parent := loop.Provenance{LoopID: s.PrimaryLoopID()}
+	parent := loop.Provenance{LoopID: s.ActiveLoopID()}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -59,7 +59,7 @@ func TestRunSubagentReturnsFinalText(t *testing.T) {
 
 	// On the observer: find the sub-loop's LoopStarted (a non-primary loop id) and the
 	// TurnStarted attributed to that SAME loop id with machine agency.
-	subLS, ok := waitLoopStartedNonPrimaryEvent(t, obs, s.PrimaryLoopID())
+	subLS, ok := waitLoopStartedNonPrimaryEvent(t, obs, s.ActiveLoopID())
 	if !ok {
 		t.Fatal("never observed a LoopStarted for a fresh (non-primary) sub-loop")
 	}
@@ -101,7 +101,7 @@ func TestRunSubagentStampsParentToolUseID(t *testing.T) {
 	t.Cleanup(func() { _ = obs.Close() })
 
 	subCfg := cfg(&stubLLM{chunks: []content.Chunk{textChunk("subagent final")}})
-	parent := loop.Provenance{LoopID: s.PrimaryLoopID()}
+	parent := loop.Provenance{LoopID: s.ActiveLoopID()}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -111,7 +111,7 @@ func TestRunSubagentStampsParentToolUseID(t *testing.T) {
 	}
 
 	// The sub-loop's LoopStarted carries the supplied tool-use id.
-	subLS, ok := waitLoopStartedNonPrimaryEvent(t, obs, s.PrimaryLoopID())
+	subLS, ok := waitLoopStartedNonPrimaryEvent(t, obs, s.ActiveLoopID())
 	if !ok {
 		t.Fatal("never observed a LoopStarted for a fresh (non-primary) sub-loop")
 	}
@@ -120,7 +120,7 @@ func TestRunSubagentStampsParentToolUseID(t *testing.T) {
 	}
 
 	// A plain NewLoop (the primary, not spawned by a tool call) carries the empty id.
-	primLoopID, err := s.NewLoop(loop.Provenance{LoopID: s.PrimaryLoopID()}, cfg(&stubLLM{chunks: []content.Chunk{textChunk("child")}}))
+	primLoopID, err := s.NewLoop(loop.Provenance{LoopID: s.ActiveLoopID()}, cfg(&stubLLM{chunks: []content.Chunk{textChunk("child")}}))
 	if err != nil {
 		t.Fatalf("NewLoop: %v", err)
 	}
@@ -152,7 +152,7 @@ func TestRunSubagentPropagatesSessionClosing(t *testing.T) {
 	s.loopsMu.Unlock()
 
 	subCfg := cfg(&stubLLM{chunks: []content.Chunk{textChunk("never runs")}})
-	got, err := s.RunSubagent(context.Background(), loop.Provenance{LoopID: s.PrimaryLoopID()}, subCfg, textBlocks("go"), "")
+	got, err := s.RunSubagent(context.Background(), loop.Provenance{LoopID: s.ActiveLoopID()}, subCfg, textBlocks("go"), "")
 	if got != "" {
 		t.Errorf("RunSubagent text = %q, want empty on closing", got)
 	}

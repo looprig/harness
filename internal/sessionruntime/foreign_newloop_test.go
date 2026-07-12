@@ -108,7 +108,7 @@ func TestForeignDelegateBuilderReceivesSelectedEffectiveMode(t *testing.T) {
 		loop.WithInitialMode("build"),
 	)
 	s := newDelegationSession(t, parent, []Option{WithEventAppender(rec), WithForeignBuilders(builder.build, builder.buildRestored)}, child)
-	ctrl := s.delegation.controllerFor(s.PrimaryLoopID(), parent)
+	ctrl := s.delegation.controllerFor(s.ActiveLoopID(), parent)
 	queued, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateStart, Agent: "child", Mode: "review", Message: "inspect", Wait: false})
 	if err != nil {
 		t.Fatal(err)
@@ -262,8 +262,8 @@ func TestForeignNewLoop(t *testing.T) {
 				if calledSID != s.SessionID() {
 					t.Errorf("Builder sessionID = %v, want %v", calledSID, s.SessionID())
 				}
-				if calledLID != s.primaryLoopID {
-					t.Errorf("Builder loopID = %v, want primaryLoopID %v", calledLID, s.primaryLoopID)
+				if calledLID != s.activeLoopID {
+					t.Errorf("Builder loopID = %v, want rootLoopID %v", calledLID, s.activeLoopID)
 				}
 			}
 		})

@@ -75,7 +75,7 @@ func TestNewPrimaryBindsOnceWithOwnedSessionContext(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	boundCtx := assertCapturedBinding(t, capture, s.SessionID(), s.PrimaryLoopID())
+	boundCtx := assertCapturedBinding(t, capture, s.SessionID(), s.ActiveLoopID())
 	select {
 	case <-boundCtx.Done():
 		t.Fatal("bind context cancelled before shutdown")
@@ -131,7 +131,7 @@ func TestRestorePrimaryBindsOnceWithTransferredSessionContext(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Restore: %v", err)
 	}
-	boundCtx := assertCapturedBinding(t, capture, orig.sessionID, orig.primaryLoopID)
+	boundCtx := assertCapturedBinding(t, capture, orig.sessionID, orig.rootLoopID)
 	select {
 	case <-boundCtx.Done():
 		t.Fatal("bind context cancelled before shutdown")

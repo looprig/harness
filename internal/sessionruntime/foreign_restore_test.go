@@ -56,7 +56,7 @@ func TestCodexForeignRestoreRecoversSIDFromForeignSessionBound(t *testing.T) {
 		foldStepGroup(aiMessage("hi")),
 		event.TurnDone{Message: aiMessage("hi")},
 	}
-	folded := foldPrimaryLoop(foldedEvents)
+	folded := foldLoop(foldedEvents)
 	foreignSID := findForeignSID(foldedEvents)
 
 	builder := &fakeForeignBuilder{}
@@ -66,13 +66,13 @@ func TestCodexForeignRestoreRecoversSIDFromForeignSessionBound(t *testing.T) {
 	builder.backend = fb
 
 	sessionID := mustUUID()
-	primaryLoopID := mustUUID()
-	c := bindCfg(engineCfg(&stubLLM{chunks: []content.Chunk{textChunk("x")}}, loop.EngineForeignCodex, "be helpful"), sessionID, primaryLoopID)
+	rootLoopID := mustUUID()
+	c := bindCfg(engineCfg(&stubLLM{chunks: []content.Chunk{textChunk("x")}}, loop.EngineForeignCodex, "be helpful"), sessionID, rootLoopID)
 	fac := event.NewFactory(uuid.New, time.Now)
 	restoreCtx, restoreCancel := context.WithCancel(context.Background())
 	t.Cleanup(restoreCancel)
 
-	s, err := buildRestoredSession(restoreCtx, restoreCancel, c, sessionID, primaryLoopID,
+	s, err := buildRestoredSession(restoreCtx, restoreCancel, c, sessionID, rootLoopID,
 		foreignSID, 0, 0, false, folded, restoredInference{}, nil, fakeSessionJournal{}, fac, uuid.New, time.Now,
 		WithForeignBuilders(builder.build, builder.buildRestored))
 	if err != nil {
@@ -101,8 +101,8 @@ func TestCodexForeignRestoreRecoversSIDFromForeignSessionBound(t *testing.T) {
 	if calledSID != sessionID {
 		t.Errorf("restored Builder sessionID = %v, want %v", calledSID, sessionID)
 	}
-	if calledLID != primaryLoopID {
-		t.Errorf("restored Builder loopID = %v, want %v", calledLID, primaryLoopID)
+	if calledLID != rootLoopID {
+		t.Errorf("restored Builder loopID = %v, want %v", calledLID, rootLoopID)
 	}
 }
 
@@ -115,7 +115,7 @@ func TestCodexForeignRestoreFailsClosedWithoutSIDSource(t *testing.T) {
 		foldStepGroup(aiMessage("hi")),
 		event.TurnDone{Message: aiMessage("hi")},
 	}
-	folded := foldPrimaryLoop(foldedEvents)
+	folded := foldLoop(foldedEvents)
 	foreignSID := findForeignSID(foldedEvents)
 	if foreignSID != "" {
 		t.Fatalf("findForeignSID = %q, want empty with no Codex SID source", foreignSID)
@@ -123,12 +123,12 @@ func TestCodexForeignRestoreFailsClosedWithoutSIDSource(t *testing.T) {
 
 	builder := &fakeForeignBuilder{}
 	sessionID := mustUUID()
-	primaryLoopID := mustUUID()
-	c := bindCfg(engineCfg(&stubLLM{chunks: []content.Chunk{textChunk("x")}}, loop.EngineForeignCodex, "be helpful"), sessionID, primaryLoopID)
+	rootLoopID := mustUUID()
+	c := bindCfg(engineCfg(&stubLLM{chunks: []content.Chunk{textChunk("x")}}, loop.EngineForeignCodex, "be helpful"), sessionID, rootLoopID)
 	restoreCtx, restoreCancel := context.WithCancel(context.Background())
 	t.Cleanup(restoreCancel)
 
-	s, err := buildRestoredSession(restoreCtx, restoreCancel, c, sessionID, primaryLoopID,
+	s, err := buildRestoredSession(restoreCtx, restoreCancel, c, sessionID, rootLoopID,
 		foreignSID, 0, 0, false, folded, restoredInference{}, nil, fakeSessionJournal{}, event.NewFactory(uuid.New, time.Now), uuid.New, time.Now,
 		WithForeignBuilders(builder.build, builder.buildRestored))
 	if s != nil {
@@ -214,7 +214,7 @@ func TestForeignRestore(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			folded := foldPrimaryLoop(foldedEvents)
+			folded := foldLoop(foldedEvents)
 
 			builder := &fakeForeignBuilder{}
 			// Only the happy foreign path actually invokes the restored builder, so only it
@@ -228,8 +228,8 @@ func TestForeignRestore(t *testing.T) {
 			}
 
 			sessionID := mustUUID()
-			primaryLoopID := mustUUID()
-			c := bindCfg(engineCfg(&stubLLM{chunks: []content.Chunk{textChunk("x")}}, tt.engine, "be helpful"), sessionID, primaryLoopID)
+			rootLoopID := mustUUID()
+			c := bindCfg(engineCfg(&stubLLM{chunks: []content.Chunk{textChunk("x")}}, tt.engine, "be helpful"), sessionID, rootLoopID)
 			fac := event.NewFactory(uuid.New, time.Now)
 			restoreCtx, restoreCancel := context.WithCancel(context.Background())
 			t.Cleanup(restoreCancel)
@@ -239,7 +239,7 @@ func TestForeignRestore(t *testing.T) {
 				opts = append(opts, WithForeignBuilders(builder.build, builder.buildRestored))
 			}
 
-			s, err := buildRestoredSession(restoreCtx, restoreCancel, c, sessionID, primaryLoopID,
+			s, err := buildRestoredSession(restoreCtx, restoreCancel, c, sessionID, rootLoopID,
 				tt.foreignSID, 0, 0, false, folded, restoredInference{}, nil, fakeSessionJournal{}, fac, uuid.New, time.Now, opts...)
 
 			if tt.wantErr {
@@ -262,13 +262,13 @@ func TestForeignRestore(t *testing.T) {
 			if s.SessionID() != sessionID {
 				t.Errorf("restored SessionID = %v, want %v", s.SessionID(), sessionID)
 			}
-			if s.PrimaryLoopID() != primaryLoopID {
-				t.Errorf("restored primaryLoopID = %v, want %v", s.PrimaryLoopID(), primaryLoopID)
+			if s.ActiveLoopID() != rootLoopID {
+				t.Errorf("restored rootLoopID = %v, want %v", s.ActiveLoopID(), rootLoopID)
 			}
 
 			// The primary loop comes up registered (idle) and its Snapshot returns the folded
 			// committed thread at the recovered turn index.
-			l, ok := s.loopFor(primaryLoopID)
+			l, ok := s.loopFor(rootLoopID)
 			if !ok {
 				t.Fatal("restored session has no primary loop registered")
 			}
@@ -309,8 +309,8 @@ func TestForeignRestore(t *testing.T) {
 				if calledSID != sessionID {
 					t.Errorf("restored Builder sessionID = %v, want %v", calledSID, sessionID)
 				}
-				if calledLID != primaryLoopID {
-					t.Errorf("restored Builder loopID = %v, want %v", calledLID, primaryLoopID)
+				if calledLID != rootLoopID {
+					t.Errorf("restored Builder loopID = %v, want %v", calledLID, rootLoopID)
 				}
 			}
 		})

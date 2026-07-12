@@ -330,7 +330,7 @@ func TestForeignPrimaryE2E(t *testing.T) {
 	}
 
 	// Subscribe (Enduring, primary-scoped) BEFORE Submit — the hub has no replay.
-	primary := s.PrimaryLoopID()
+	primary := s.ActiveLoopID()
 	sub, err := s.SubscribeEvents(event.EventFilter{
 		Enduring: event.LoopScope{Loops: map[uuid.UUID]struct{}{primary: {}}},
 	})
@@ -401,7 +401,7 @@ func TestCodexForeignPrimaryLateBoundPublishesBoundAndTurnDone(t *testing.T) {
 		t.Fatalf("primary LoopStarted.ForeignSID = %q, want empty for late-bound Codex", ls.ForeignSID)
 	}
 
-	primary := s.PrimaryLoopID()
+	primary := s.ActiveLoopID()
 	sub, err := s.SubscribeEvents(event.EventFilter{
 		Enduring: event.LoopScope{Loops: map[uuid.UUID]struct{}{primary: {}}},
 	})
@@ -474,7 +474,7 @@ func TestForeignSubagentE2E(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = s.Shutdown(context.Background()) })
 
-	final, err := s.RunSubagent(ctx, loop.Provenance{LoopID: s.PrimaryLoopID()},
+	final, err := s.RunSubagent(ctx, loop.Provenance{LoopID: s.ActiveLoopID()},
 		foreignSubCfg(), textBlocks("hi"), "tool-use-1")
 	if err != nil {
 		t.Fatalf("RunSubagent: %v", err)
@@ -484,12 +484,12 @@ func TestForeignSubagentE2E(t *testing.T) {
 	}
 
 	// Lineage/provenance on the sub-loop's LoopStarted.
-	subLS, ok := foreignSubLoopStarted(rec, s.PrimaryLoopID())
+	subLS, ok := foreignSubLoopStarted(rec, s.ActiveLoopID())
 	if !ok {
 		t.Fatal("no LoopStarted captured for the foreign sub-loop")
 	}
-	if subLS.Cause.LoopID != s.PrimaryLoopID() {
-		t.Errorf("sub-loop LoopStarted.Cause.LoopID = %v, want parent (primary) %v", subLS.Cause.LoopID, s.PrimaryLoopID())
+	if subLS.Cause.LoopID != s.ActiveLoopID() {
+		t.Errorf("sub-loop LoopStarted.Cause.LoopID = %v, want parent (primary) %v", subLS.Cause.LoopID, s.ActiveLoopID())
 	}
 	if subLS.ParentToolUseID != "tool-use-1" {
 		t.Errorf("sub-loop LoopStarted.ParentToolUseID = %q, want %q", subLS.ParentToolUseID, "tool-use-1")
@@ -512,7 +512,7 @@ func TestForeignQueuedDelegateInterruptResolvesWithoutWaitTimeout(t *testing.T) 
 	agent := &fakeForeignAgent{transcript: missingTranscript(t), block: true}
 	spec := foreignloop.Spec{Agent: agent, Cwd: t.TempDir()}
 	s := newDelegationSession(t, parent, []Option{WithForeignBuilders(foreignloop.BuildWith(spec), foreignloop.BuildRestoredWith(spec))}, child)
-	ctrl := s.delegation.controllerFor(s.PrimaryLoopID(), parent)
+	ctrl := s.delegation.controllerFor(s.ActiveLoopID(), parent)
 	active, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateStart, Agent: "child", Message: "A", Wait: false})
 	if err != nil {
 		t.Fatal(err)
@@ -555,7 +555,7 @@ func TestForeignQueuedDelegateTimeoutCancelsOnlyThatRequest(t *testing.T) {
 	agent := &fakeForeignAgent{transcript: missingTranscript(t), block: true}
 	spec := foreignloop.Spec{Agent: agent, Cwd: t.TempDir()}
 	s := newDelegationSession(t, parent, []Option{WithForeignBuilders(foreignloop.BuildWith(spec), foreignloop.BuildRestoredWith(spec))}, child)
-	ctrl := s.delegation.controllerFor(s.PrimaryLoopID(), parent)
+	ctrl := s.delegation.controllerFor(s.ActiveLoopID(), parent)
 	active, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateStart, Agent: "child", Message: "A", Wait: false})
 	if err != nil {
 		t.Fatal(err)
@@ -600,7 +600,7 @@ func TestForeignProviderFailureResolvesQueuedDelegatesFailedLive(t *testing.T) {
 	agent := &releasedFailureForeignAgent{spawned: make(chan *releasedFailureForeignStream, 2)}
 	spec := foreignloop.Spec{Agent: agent, Cwd: t.TempDir()}
 	s := newDelegationSession(t, parent, []Option{WithForeignBuilders(foreignloop.BuildWith(spec), foreignloop.BuildRestoredWith(spec))}, child)
-	ctrl := s.delegation.controllerFor(s.PrimaryLoopID(), parent)
+	ctrl := s.delegation.controllerFor(s.ActiveLoopID(), parent)
 	active, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateStart, Agent: "child", Message: "A", Wait: false})
 	if err != nil {
 		t.Fatal(err)
@@ -649,7 +649,7 @@ func TestCodexForeignSubagentLateBoundReturnsFinalText(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = s.Shutdown(context.Background()) })
 
-	final, err := s.RunSubagent(ctx, loop.Provenance{LoopID: s.PrimaryLoopID()},
+	final, err := s.RunSubagent(ctx, loop.Provenance{LoopID: s.ActiveLoopID()},
 		codexForeignSubCfg(), textBlocks("hi"), "tool-use-codex")
 	if err != nil {
 		t.Fatalf("RunSubagent: %v", err)
@@ -658,7 +658,7 @@ func TestCodexForeignSubagentLateBoundReturnsFinalText(t *testing.T) {
 		t.Errorf("RunSubagent final text = %q, want %q", final, "codex subagent final")
 	}
 
-	subLS, ok := foreignSubLoopStarted(rec, s.PrimaryLoopID())
+	subLS, ok := foreignSubLoopStarted(rec, s.ActiveLoopID())
 	if !ok {
 		t.Fatal("no LoopStarted captured for the Codex foreign sub-loop")
 	}
@@ -712,7 +712,7 @@ func TestForeignSubagentQuotaCap(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = s.Shutdown(context.Background()) })
 
-	parent := loop.Provenance{LoopID: s.PrimaryLoopID()}
+	parent := loop.Provenance{LoopID: s.ActiveLoopID()}
 
 	// First foreign subagent fits the quota of one leaf loop.
 	if _, err := s.RunSubagent(ctx, parent, foreignSubCfg(), textBlocks("first"), "tu-1"); err != nil {

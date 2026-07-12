@@ -53,7 +53,7 @@ type Session struct {
 	sessionCancel            context.CancelFunc
 	constructionAbortTimeout time.Duration
 
-	// loopsMu protects loops and primaryLoopID. There is no session goroutine, so
+	// loopsMu protects loops and activeLoopID. There is no session goroutine, so
 	// session methods serialize registry access with a normal RWMutex.
 	loopsMu  sync.RWMutex
 	activeMu sync.Mutex
@@ -65,9 +65,8 @@ type Session struct {
 	loops        map[uuid.UUID]*loopHandle
 	constructing bool
 
-	// primaryLoopID is the default target for Submit and the gate-answer methods
-	// (and the loop Interrupt/Shutdown fan out across, starting from).
-	primaryLoopID uuid.UUID
+	// activeLoopID is the mutable default target for Submit.
+	activeLoopID uuid.UUID
 
 	// closing is the fail-secure latch: once set, NewLoop refuses to create or
 	// register any further loop. It is guarded by loopsMu — set by Shutdown
@@ -665,9 +664,10 @@ func (s *Session) PublishEvent(ctx context.Context, ev event.Event) error {
 	return nil
 }
 
-// PublishEventChecked is the transactional actor publication path used only for
-// durable delegate acceptance. It returns required-append failures directly so the
-// loop can decline the command before mutating its live queue/turn state.
+// PublishEventChecked is the transactional publication path for state transitions
+// whose caller must not mutate live state unless the required append commits. Delegate
+// acceptance, public gate open/resolve transitions, and native checkpoint boundaries
+// use it to receive append failures directly while retaining durable-first fan-out.
 func (s *Session) PublishEventChecked(ctx context.Context, ev event.Event) error {
 	if err := s.hub.PublishEventChecked(ctx, ev); err != nil {
 		return err
@@ -792,7 +792,7 @@ func (s *Session) projectFingerprint(definition loop.BoundDefinition) event.Conf
 func (s *Session) ActiveLoop() loop.Handle {
 	s.loopsMu.RLock()
 	defer s.loopsMu.RUnlock()
-	return s.loops[s.primaryLoopID]
+	return s.loops[s.activeLoopID]
 }
 
 func (s *Session) Loop(id uuid.UUID) (loop.Handle, bool) {
@@ -817,7 +817,7 @@ func (s *Session) SetActiveLoop(ctx context.Context, id uuid.UUID) error {
 	}
 	s.loopsMu.RLock()
 	target, ok := s.loops[id]
-	previous := s.primaryLoopID
+	previous := s.activeLoopID
 	closing := s.closing
 	s.loopsMu.RUnlock()
 	if !ok {
@@ -851,19 +851,17 @@ func (s *Session) SetActiveLoop(ctx context.Context, id uuid.UUID) error {
 			return &SessionError{Kind: SessionFaulted, Cause: cause}
 		}
 	}
-	s.primaryLoopID = id
+	s.activeLoopID = id
 	s.loopsMu.Unlock()
 	return nil
 }
 
-// PrimaryLoopID returns the session's primary loop id — the default target for
-// Submit and the loop whose live Ephemeral tokens a single-loop TUI streams.
-// A whole-session subscriber builds its EventFilter from it (primary-only Ephemeral
-// + all-loop Enduring). It is read-only identity, safe to call concurrently.
-func (s *Session) PrimaryLoopID() uuid.UUID {
+// ActiveLoopID returns the session's mutable active loop id, the default target for
+// Submit. It is safe to call concurrently.
+func (s *Session) ActiveLoopID() uuid.UUID {
 	s.loopsMu.RLock()
 	defer s.loopsMu.RUnlock()
-	return s.primaryLoopID
+	return s.activeLoopID
 }
 
 // WaitIdle blocks until the session is quiescent, ctx is done, or the session has
@@ -1534,7 +1532,7 @@ func newSessionTopology(ctx context.Context, topology Topology, newID idGenerato
 			return abort(createErr)
 		}
 		if primer.name == topology.ActivePrimer {
-			s.primaryLoopID = loopID
+			s.activeLoopID = loopID
 		}
 	}
 	s.loopsMu.Lock()
@@ -1647,7 +1645,7 @@ func (s *Session) cancelDelegateRequest(loopID, requestID uuid.UUID) (command.De
 // person authored this input). Programmatic/machine callers go through
 // submitToLoop with Agency=AgencyMachine (the subagent path).
 //
-// Submit sends input as a queueable UserInput to the primary loop,
+// Submit sends input as a queueable UserInput to the active loop,
 // FIRE-AND-FORGET: it returns the InputID (the submit command's id, == the
 // Cause.CommandID on the resulting Reply events) and a transport error only if the
 // command could not be handed to the loop. The outcome — InputQueued /
@@ -1660,24 +1658,24 @@ func (s *Session) cancelDelegateRequest(loopID, requestID uuid.UUID) (command.De
 // is accepted by the loop.
 //
 // The send carries the standard escapes: ctx.Done() →
-// SessionContextDone, the loop's Done → SessionLoopExited, and a missing primary
+// SessionContextDone, the loop's Done → SessionLoopExited, and a missing active
 // loop → SessionLoopNotFound. On any of those the returned id is the zero UUID,
 // because nothing was sent and there is no correlation to hand back.
 func (s *Session) Submit(ctx context.Context, input []content.Block) (uuid.UUID, error) {
-	// Submit IS the primary-loop, human-authored (AgencyUser) case of submitToLoop:
-	// the interactive submit targets the primary loop and stamps user agency. The
+	// Submit is the active-loop, human-authored (AgencyUser) case of submitToLoop:
+	// the interactive submit targets the active loop and stamps user agency. The
 	// loop-targeted core (a sub-loop, machine agency) is the subagent path.
 	s.loopsMu.RLock()
-	active := s.primaryLoopID
+	active := s.activeLoopID
 	s.loopsMu.RUnlock()
 	return s.submitToLoop(ctx, active, input, identity.AgencyUser, false)
 }
 
 // SubmitToLoop is the loop-targeted counterpart of Submit: it sends human-authored
-// (AgencyUser) input to a SPECIFIC loop's CommandSink rather than the primary. It is the
+// (AgencyUser) input to a SPECIFIC loop's CommandSink rather than the active selection. It is the
 // modern viewport's "submit to the FOCUSED loop" primitive — a submit while focused on a
 // subagent runs a NEW turn on THAT loop (accepted: a submit to an idle-but-tracked
-// subagent starts a fresh turn on it), while a submit to the primary loop id behaves
+// subagent starts a fresh turn on it), while a submit to the active loop id behaves
 // exactly like Submit.
 //
 // Like Submit it stamps command.UserInput with Agency=AgencyUser and is FIRE-AND-FORGET:
@@ -1688,14 +1686,14 @@ func (s *Session) Submit(ctx context.Context, input []content.Block) (uuid.UUID,
 // ctx.Done() → SessionContextDone, the loop's Done → SessionLoopExited, and an unknown
 // loop id → SessionLoopNotFound. On any of those the returned id is the zero UUID, because
 // nothing was sent and there is no correlation to hand back. It delegates to the shared
-// loop-targeted core submitToLoop with AgencyUser, exactly as Submit does for the primary.
+// loop-targeted core submitToLoop with AgencyUser, exactly as Submit does for the active loop.
 func (s *Session) SubmitToLoop(ctx context.Context, loopID uuid.UUID, blocks []content.Block) (uuid.UUID, error) {
 	return s.submitToLoop(ctx, loopID, blocks, identity.AgencyUser, false)
 }
 
 // submitToLoop submits a UserInput to a SPECIFIC loop with the given Agency,
 // returning the minted CommandID (correlate Reply events via Cause.CommandID).
-// It is the loop-targeted core of Submit: public Submit is the primary-loop,
+// It is the loop-targeted core of Submit: public Submit is the active-loop,
 // AgencyUser case; the subagent path targets a sub-loop with AgencyMachine.
 //
 // Like Submit it is FIRE-AND-FORGET: the outcome —

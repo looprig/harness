@@ -249,7 +249,7 @@ func TestChainedTurnsEmitNoLoopIdleBetween(t *testing.T) {
 	// running, so it is accepted into the inbox; on the normal terminal the actor
 	// chains directly into turn 2 from it (running->running, no LoopIdle).
 	client.onCall[0] = func() {
-		l, _ := s.loopFor(s.primaryLoopID)
+		l, _ := s.loopFor(s.activeLoopID)
 		// The unbuffered send completes only once the actor has RECEIVED the command,
 		// so when this returns the queued input is guaranteed in the actor's hands
 		// (appended to the inbox) before turn 1's terminal — no ack needed now that the
