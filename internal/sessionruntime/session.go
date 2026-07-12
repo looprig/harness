@@ -287,8 +287,8 @@ type Session struct {
 	// seam): after an interrupt fan-out cancels a running turn, the session holds the
 	// interrupt-pending marks until this policy's AwaitRelease returns, then clears them. Nil
 	// (the default) resolves to sessionIdleRelease — release once the session next reaches idle
-	// (SessionIdle durably appended). Task 16 injects a workspace-aware policy via
-	// WithInterruptReleasePolicy. See interrupt.go.
+	// (SessionIdle durably appended). Workspace-backed sessions bypass this seam and await their
+	// checkpoint controller's generation-specific accepted/committed/faulted outcome. See interrupt.go.
 	interruptRelease InterruptReleasePolicy
 }
 

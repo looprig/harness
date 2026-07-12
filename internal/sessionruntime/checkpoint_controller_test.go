@@ -518,6 +518,76 @@ func TestInterruptCheckpointShutdownResolvesLiveAndDeferredSweeps(t *testing.T) 
 	}
 }
 
+func TestInterruptRequiredHandoffCapturesFailureAndExactCutoff(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+	}{
+		{name: "completion during handoff faults sweep and later request cannot delay it"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			queued := make(chan struct{}, 2)
+			firstRelease := make(chan struct{})
+			secondRelease := make(chan struct{})
+			firstDone := make(chan error, 1)
+			secondDone := make(chan error, 1)
+			publisher := &boundaryPublisher{order: &checkpointOrder{}}
+			var c *checkpointController
+			cfg := checkpointControllerConfig{
+				Policy:         checkpointPolicy{Trigger: checkpointOnTurnDone, Priority: checkpointRequired, Timeout: time.Second},
+				Publisher:      publisher,
+				RequiredQueued: func(event.Event) { queued <- struct{}{} },
+			}
+			c = newCheckpointController(cfg)
+			c.interruptTransferred = func() {
+				close(firstRelease)
+				if err := <-firstDone; err == nil {
+					t.Error("first required request error = nil")
+				}
+				go func() {
+					_, err := c.runRequired(context.Background(), event.TurnDone{}, func(context.Context) (workspacestore.Ref, error) {
+						<-secondRelease
+						return "", nil
+					})
+					secondDone <- err
+				}()
+				<-queued
+			}
+			t.Cleanup(c.shutdown)
+			sweep := c.beginInterruptSweep()
+			go func() {
+				_, err := c.runRequired(context.Background(), event.TurnInterrupted{}, func(context.Context) (workspacestore.Ref, error) {
+					<-firstRelease
+					return "", errors.New("first required failed")
+				})
+				firstDone <- err
+			}()
+			<-queued
+			idle := event.SessionIdle{Header: event.Header{EventID: mustUUID()}}
+			if err := c.sessionIdle(context.Background(), idle, func() error {
+				return publisher.PublishEventChecked(context.Background(), idle)
+			}); err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+			outcome, err := sweep.await(ctx)
+			cancel()
+			close(secondRelease)
+			if secondErr := <-secondDone; secondErr != nil {
+				t.Fatalf("later required request: %v", secondErr)
+			}
+			if err != nil {
+				t.Fatalf("sweep was delayed by request queued after handoff: %v", err)
+			}
+			if outcome.Disposition != interruptCheckpointFaulted || outcome.Err == nil {
+				t.Fatalf("outcome = %+v, want first required failure", outcome)
+			}
+		})
+	}
+}
+
 type boundaryPermit struct{ order *checkpointOrder }
 
 func (p boundaryPermit) Release() { p.order.add("release") }

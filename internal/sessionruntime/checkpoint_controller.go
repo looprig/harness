@@ -106,6 +106,9 @@ type checkpointController struct {
 	interruptDeferred map[uint64]*interruptCheckpointSweep
 	interruptNext     uint64
 	interruptSweeps   map[uint64]*interruptCheckpointSweep
+	// interruptTransferred is a deterministic package-test seam invoked after
+	// the atomic live-to-ready/deferred handoff. Production leaves it nil.
+	interruptTransferred func()
 }
 
 type checkpointRequest struct {
@@ -146,6 +149,8 @@ type interruptCheckpointSweep struct {
 	requiredAfter  uint64
 	requiredCutoff uint64
 	requiredErr    error
+	idleSeen       bool
+	idleOutcome    interruptCheckpointOutcome
 }
 
 func (s *interruptCheckpointSweep) await(ctx context.Context) (interruptCheckpointOutcome, error) {
@@ -227,31 +232,43 @@ func (c *checkpointController) observeInterruptCause(trigger event.Event) {
 	c.mu.Unlock()
 }
 
-// takeInterruptSweeps transfers ownership of every generation that was pending
-// before this SessionIdle boundary began. A sweep registered after this method
-// returns belongs to a later idle edge and cannot be released by this one.
-func (c *checkpointController) takeInterruptSweeps() ([]*interruptCheckpointSweep, event.Event) {
+// transferInterruptSweeps atomically removes every generation owned by this
+// SessionIdle edge, captures the exact required-request cutoff, and places each
+// generation in either the ready result or the deferred map. A required completion
+// therefore always observes the sweep in one map or the other, while a request queued
+// after this handoff is strictly beyond the captured cutoff.
+func (c *checkpointController) transferInterruptSweeps() (ready, deferred []*interruptCheckpointSweep, cause event.Event) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if len(c.interruptSweeps) == 0 {
-		return nil, nil
+		return nil, nil, nil
 	}
 	ids := make([]uint64, 0, len(c.interruptSweeps))
 	for id := range c.interruptSweeps {
 		ids = append(ids, id)
 	}
 	slices.Sort(ids)
-	sweeps := make([]*interruptCheckpointSweep, 0, len(ids))
-	var cause event.Event
+	ready = make([]*interruptCheckpointSweep, 0, len(ids))
+	deferRequired := c.cfg.Policy.Priority == checkpointRequired &&
+		c.cfg.Policy.Trigger != checkpointOnIdle && c.cfg.Policy.Trigger != checkpointManual
+	cutoff := c.requiredNext
 	for _, id := range ids {
 		sweep := c.interruptSweeps[id]
 		delete(c.interruptSweeps, id)
-		sweeps = append(sweeps, sweep)
 		if cause == nil && sweep.cause != nil {
 			cause = sweep.cause
 		}
+		if deferRequired {
+			sweep.requiredCutoff = cutoff
+			if c.requiredCompleted < cutoff {
+				c.interruptDeferred[id] = sweep
+				deferred = append(deferred, sweep)
+				continue
+			}
+		}
+		ready = append(ready, sweep)
 	}
-	return sweeps, cause
+	return ready, deferred, cause
 }
 
 func (c *checkpointController) resolveInterruptSweeps(sweeps []*interruptCheckpointSweep, outcome interruptCheckpointOutcome) {
@@ -264,22 +281,19 @@ func (c *checkpointController) resolveInterruptSweeps(sweeps []*interruptCheckpo
 	}
 }
 
-func (c *checkpointController) deferInterruptSweepsThroughRequired(sweeps []*interruptCheckpointSweep) []*interruptCheckpointSweep {
-	if c.cfg.Policy.Priority != checkpointRequired || c.cfg.Policy.Trigger == checkpointOnIdle || c.cfg.Policy.Trigger == checkpointManual {
-		return sweeps
-	}
+func (c *checkpointController) completeDeferredInterruptIdle(sweeps []*interruptCheckpointSweep, outcome interruptCheckpointOutcome) {
 	c.mu.Lock()
 	ready := make([]*interruptCheckpointSweep, 0, len(sweeps))
 	for _, sweep := range sweeps {
-		sweep.requiredCutoff = c.requiredNext
+		sweep.idleSeen = true
+		sweep.idleOutcome = outcome
 		if c.requiredCompleted >= sweep.requiredCutoff {
+			delete(c.interruptDeferred, sweep.id)
 			ready = append(ready, sweep)
-			continue
 		}
-		c.interruptDeferred[sweep.id] = sweep
 	}
 	c.mu.Unlock()
-	return ready
+	c.resolveInterruptSweeps(ready, outcome)
 }
 
 func (c *checkpointController) interruptSuccessDisposition() interruptCheckpointDisposition {
@@ -352,8 +366,10 @@ func (c *checkpointController) sessionIdle(ctx context.Context, idle event.Sessi
 	if c == nil {
 		return publish()
 	}
-	sweeps, interruptCause := c.takeInterruptSweeps()
-	sweeps = c.deferInterruptSweepsThroughRequired(sweeps)
+	sweeps, deferredSweeps, interruptCause := c.transferInterruptSweeps()
+	if c.interruptTransferred != nil {
+		c.interruptTransferred()
+	}
 	disposition := c.interruptSuccessDisposition()
 	var err error
 	switch {
@@ -392,6 +408,7 @@ func (c *checkpointController) sessionIdle(ctx context.Context, idle event.Sessi
 		disposition = interruptCheckpointFaulted
 	}
 	c.resolveInterruptSweeps(sweeps, interruptCheckpointOutcome{Disposition: disposition, Err: err})
+	c.completeDeferredInterruptIdle(deferredSweeps, interruptCheckpointOutcome{Disposition: disposition, Err: err})
 	return err
 }
 
@@ -686,13 +703,15 @@ func (c *checkpointController) recordRequiredCompletion(seq uint64, err error) {
 	}
 	ready := make([]*interruptCheckpointSweep, 0)
 	for id, sweep := range c.interruptDeferred {
-		if c.requiredCompleted >= sweep.requiredCutoff {
+		if sweep.idleSeen && c.requiredCompleted >= sweep.requiredCutoff {
 			delete(c.interruptDeferred, id)
 			ready = append(ready, sweep)
 		}
 	}
 	c.mu.Unlock()
-	c.resolveInterruptSweeps(ready, interruptCheckpointOutcome{Disposition: interruptCheckpointCommitted})
+	for _, sweep := range ready {
+		c.resolveInterruptSweeps([]*interruptCheckpointSweep{sweep}, sweep.idleOutcome)
+	}
 }
 
 func (c *checkpointController) beginManualOperation() bool {

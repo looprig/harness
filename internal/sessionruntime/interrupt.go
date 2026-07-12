@@ -22,10 +22,10 @@ import (
 // human (AgencyUser) input remains accepted and queued, while loop-scoped execution admission
 // prevents it from starting until every applicable barrier generation releases.
 //
-// SCOPE / RESIDUAL: this gate covers only machine DELEGATE admission (start/send). It does NOT stop
-// a parent from taking one non-delegate step (a plain inference/tool step) before its OWN actor
-// interrupt lands — that bounded residual belongs to a step-boundary guard in internal/loopruntime
-// (the loop actor's interrupt handling), out of Task 11's session-layer scope.
+// SCOPE / RESIDUAL: the marks gate both machine delegate admission and loop-scoped execution
+// admission. A step admitted before mark-before-fanout may continue only until its actor receives
+// the interrupt and cancels the turn; accepted work queued afterward cannot emit TurnStarted until
+// every applicable barrier generation releases.
 
 // InterruptReleasePolicy is the pluggable admission-barrier release seam (Dependency Inversion).
 // After an interrupt fan-out cancels at least one running turn, the session holds every target's
