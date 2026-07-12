@@ -23,10 +23,11 @@ const (
 // Delegation is the immutable delegation policy copied into a Definition.
 type Delegation struct{ Style DelegationStyle }
 
-// deps.go is the runner's CONSUMER surface for the tool subsystem (design §3b).
+// deps.go is the loop runtime's consumer surface for the tool subsystem (design §3b).
 // The loop depends only on these interfaces and value types; it never imports
 // the concrete `tools/` package. The composition root wires concrete
-// implementations (e.g. *tools.PermissionChecker) into a ToolSet on loop.Config.
+// implementations (for example, a tools permission checker) while binding an immutable
+// Definition for the private actor runtime.
 
 // Effect is the permission outcome the PermissionGate yields for a tool call.
 //

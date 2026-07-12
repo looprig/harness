@@ -173,7 +173,7 @@ type Session struct {
 
 	// foreignBuild and foreignBuildRestored are the composition-root seams newLoop and
 	// the restore path use to construct a foreign-engine loop (live + restored). They are
-	// wired via WithForeignBuilder; nil (the default) means foreign engines are not
+	// wired via WithForeignBuilders; nil (the default) means foreign engines are not
 	// supported, so a foreign cfg.Engine fails closed (SessionForeignBuilderMissing /
 	// RestoreForeignBuilderMissing). The session depends only on these narrow function
 	// seams, never on the foreignloop concrete loop (Dependency Inversion): loop.New
@@ -185,11 +185,11 @@ type Session struct {
 
 	// ws is the workspace snapshot store CheckpointWorkspace archives the session's
 	// working tree into, and wsRoot is the directory it archives. Both are wired
-	// together by WithWorkspaceStore; nil ws (the default, no option) leaves the
+	// together by WithWorkspaceCheckpointing; nil ws (the default, no option) leaves the
 	// capability unconfigured, so CheckpointWorkspace fails closed with a typed
 	// *WorkspaceNotConfiguredError. The session depends only on the narrow *Store
 	// (Dependency Inversion): it never sees the Blobs backend beneath it.
-	ws                         *workspacestore.Store // nil unless WithWorkspaceStore wired it; gates CheckpointWorkspace
+	ws                         *workspacestore.Store // nil unless WithWorkspaceCheckpointing wired it; gates CheckpointWorkspace
 	wsRoot                     string                // the workspace directory Snapshot archives
 	initialWorkspaceCheckpoint workspacestore.Ref
 

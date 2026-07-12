@@ -180,27 +180,27 @@ func WithFingerprint(fingerprint event.ConfigFingerprint) Option {
 	}
 }
 
-// WithForeignBuilder wires the composition-root seam that constructs foreign-engine
+// WithForeignBuilders wires the composition-root seam that constructs foreign-engine
 // loops (live + restored). Without it, a foreign cfg.Engine fails closed at newLoop
 // (SessionForeignBuilderMissing) and at restore (RestoreForeignBuilderMissing) — a
 // foreign engine never silently resolves to a native loop. The two seams travel
 // together (a live build and a restored build of the same agent), so they are wired as
 // one option; either being nil leaves foreign engines unsupported for that path.
-func WithForeignBuilder(b foreignloop.Builder, rb foreignloop.RestoredBuilder) Option {
+func WithForeignBuilders(b foreignloop.Builder, rb foreignloop.RestoredBuilder) Option {
 	return func(s *Session) {
 		s.foreignBuild = b
 		s.foreignBuildRestored = rb
 	}
 }
 
-// WithWorkspaceStore wires the workspace snapshot store and the workspace root this
+// WithWorkspaceCheckpointing wires the workspace snapshot store and the workspace root this
 // session checkpoints. Both are required for CheckpointWorkspace; without this option the
 // capability is unconfigured and CheckpointWorkspace fails closed with a typed
 // *WorkspaceNotConfiguredError. The composition root decides WHEN to checkpoint (a
 // quiescence point); looprig only exposes the capability. A nil store is ignored (the
 // default unconfigured state stays), so a wiring slip can never install a store the
 // capability would nil-deref on.
-func WithWorkspaceStore(ws *workspacestore.Store, root string) Option {
+func WithWorkspaceCheckpointing(ws *workspacestore.Store, root string) Option {
 	return func(s *Session) {
 		if ws != nil {
 			s.ws = ws

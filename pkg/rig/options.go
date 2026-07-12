@@ -91,23 +91,13 @@ func WithFingerprintFields(fields ConfigFingerprintFields) Option {
 	return singleton(keyConfigFingerprint, func(state *definitionState) { state.fingerprintFields = fields })
 }
 
-// WithConfigFingerprintFields is retained until the compatibility cleanup.
-func WithConfigFingerprintFields(fields ConfigFingerprintFields) Option {
-	return WithFingerprintFields(fields)
-}
-
 func WithForeignBuilders(builder foreignloop.Builder, restored foreignloop.RestoredBuilder) Option {
 	return func(state *definitionState) error {
 		if builder == nil || restored == nil {
 			return &DefinitionError{Kind: DefinitionInvalidForeignBuilders}
 		}
-		return singletonCompile(keyForeignBuilder, sessionruntime.WithLifecycleForeignBuilder(builder, restored))(state)
+		return singletonCompile(keyForeignBuilder, sessionruntime.WithLifecycleForeignBuilders(builder, restored))(state)
 	}
-}
-
-// WithForeignBuilder is retained until the compatibility cleanup.
-func WithForeignBuilder(builder foreignloop.Builder, restored foreignloop.RestoredBuilder) Option {
-	return WithForeignBuilders(builder, restored)
 }
 
 func WithGateCaps(caps GateCaps) Option {

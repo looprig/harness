@@ -77,7 +77,7 @@ func TestRestoreTopologyMissingPrimerFailsBeforeRestoreDone(t *testing.T) {
 	store := newRestoreStore(t)
 	planner := cfgWithAgent(&stubLLM{}, "planner")
 	builder := cfgWithAgent(&stubLLM{}, "builder")
-	lifecycle, err := NewLifecycle(planner, store, WithLifecycleFingerprintProvider(testFingerprintProvider))
+	lifecycle, err := NewTopologyLifecycle(singleDefinitionTopology(planner), store, WithLifecycleFingerprintProvider(testFingerprintProvider))
 	if err != nil {
 		t.Fatal(err)
 	}

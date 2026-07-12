@@ -69,7 +69,7 @@ func (f *failingNewID) next() (uuid.UUID, error) {
 // fixedClock is a deterministic event.Clock for the restore-lifecycle stamps.
 func fixedClock() time.Time { return time.Date(2026, 6, 21, 12, 0, 0, 0, time.UTC) }
 
-// TestRestoreSessionFailSecureExits drives restoreSession's post-journal failure exits
+// TestRestoreSessionFailSecureExits drives restoreTopologySession's post-journal failure exits
 // directly through the injectable id-gen seam and asserts the fail-secure contract for
 // each: a RestoreErrored is durably recorded AND the single-writer lease is released
 // (a successor can re-acquire) AND (nil, *RestoreError{RestoreAppendFailed}) is
@@ -102,9 +102,9 @@ func TestRestoreSessionFailSecureExits(t *testing.T) {
 			handOver(t, orig.lease)
 
 			seam := &failingNewID{failOnCall: tt.failOnCall}
-			s, err := restoreSession(
+			s, err := restoreTopologySession(
 				context.Background(),
-				restoreCfg(&stubLLM{}, "model-x", "be helpful"),
+				singleDefinitionTopology(restoreCfg(&stubLLM{}, "model-x", "be helpful")),
 				orig.sessionID, store,
 				seam.next, fixedClock,
 				WithFingerprintProvider(testFingerprintProvider),
@@ -112,12 +112,12 @@ func TestRestoreSessionFailSecureExits(t *testing.T) {
 
 			// (a) No Session comes up.
 			if s != nil {
-				t.Fatalf("restoreSession returned a non-nil Session on a forced failure")
+				t.Fatalf("restoreTopologySession returned a non-nil Session on a forced failure")
 			}
 			// (b) A typed *RestoreError classifying the append/mint failure is returned.
 			var re *RestoreError
 			if !errors.As(err, &re) {
-				t.Fatalf("restoreSession err = %v, want *RestoreError", err)
+				t.Fatalf("restoreTopologySession err = %v, want *RestoreError", err)
 			}
 			if re.Kind != RestoreAppendFailed {
 				t.Errorf("RestoreError.Kind = %q, want %q", re.Kind, RestoreAppendFailed)
@@ -193,9 +193,9 @@ func TestRestoreCrashSeamAppendFailSecure(t *testing.T) {
 			handOver(t, orig.lease)
 
 			seam := &failingNewID{failOnCall: tt.failOnCall}
-			s, err := restoreSession(
+			s, err := restoreTopologySession(
 				context.Background(),
-				restoreCfg(&stubLLM{chunks: []content.Chunk{textChunk("recovered")}}, "model-x", "be helpful"),
+				singleDefinitionTopology(restoreCfg(&stubLLM{chunks: []content.Chunk{textChunk("recovered")}}, "model-x", "be helpful")),
 				orig.sessionID, store,
 				seam.next, fixedClock,
 				WithFingerprintProvider(testFingerprintProvider),
@@ -203,12 +203,12 @@ func TestRestoreCrashSeamAppendFailSecure(t *testing.T) {
 
 			// (a) No controller comes up.
 			if s != nil {
-				t.Fatalf("restoreSession returned a non-nil Session on a forced append failure")
+				t.Fatalf("restoreTopologySession returned a non-nil Session on a forced append failure")
 			}
 			// (b) A typed *RestoreError classifying the append failure, chaining the mint cause.
 			var re *RestoreError
 			if !errors.As(err, &re) {
-				t.Fatalf("restoreSession err = %v, want *RestoreError", err)
+				t.Fatalf("restoreTopologySession err = %v, want *RestoreError", err)
 			}
 			if re.Kind != RestoreAppendFailed {
 				t.Errorf("RestoreError.Kind = %q, want %q", re.Kind, RestoreAppendFailed)

@@ -118,7 +118,7 @@ func lastCheckpointed(events []event.Event) (event.WorkspaceCheckpointed, bool) 
 }
 
 // TestCheckpointWorkspace proves the end-to-end capability: a session wired
-// WithWorkspaceStore snapshots its configured root and records a WorkspaceCheckpointed
+// WithWorkspaceCheckpointing snapshots its configured root and records a WorkspaceCheckpointed
 // (Ref == the returned ref) through the durable tap; an unconfigured session fails closed
 // with *WorkspaceNotConfiguredError and records nothing.
 func TestCheckpointWorkspace(t *testing.T) {
@@ -139,7 +139,7 @@ func TestCheckpointWorkspace(t *testing.T) {
 			opts := []Option{WithEventAppender(rec)}
 			if tt.configured {
 				ws, root := checkpointFixture(t, nil)
-				opts = append(opts, WithWorkspaceStore(ws, root))
+				opts = append(opts, WithWorkspaceCheckpointing(ws, root))
 			}
 			s, err := newTestSession(ctx, cfg(&stubLLM{}), opts...)
 			if err != nil {
@@ -195,7 +195,7 @@ func TestCheckpointWorkspaceSnapshotBeforeAppend(t *testing.T) {
 	ws, root := checkpointFixture(t, probe)
 	app := &checkpointAppender{probe: probe}
 
-	s, err := newTestSession(ctx, cfg(&stubLLM{}), WithEventAppender(app), WithWorkspaceStore(ws, root))
+	s, err := newTestSession(ctx, cfg(&stubLLM{}), WithEventAppender(app), WithWorkspaceCheckpointing(ws, root))
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -233,7 +233,7 @@ func TestCheckpointWorkspaceReCheckpointNoOpUpload(t *testing.T) {
 	ws, root := checkpointFixture(t, probe)
 	rec := &recordingEventAppender{}
 
-	s, err := newTestSession(ctx, cfg(&stubLLM{}), WithEventAppender(rec), WithWorkspaceStore(ws, root))
+	s, err := newTestSession(ctx, cfg(&stubLLM{}), WithEventAppender(rec), WithWorkspaceCheckpointing(ws, root))
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}

@@ -313,7 +313,7 @@ func TestForeignPrimaryE2E(t *testing.T) {
 	spec := foreignloop.Spec{Agent: agent, Cwd: t.TempDir()}
 
 	s, err := newTestSession(ctx, foreignPrimaryCfg(),
-		WithForeignBuilder(foreignloop.BuildWith(spec), foreignloop.BuildRestoredWith(spec)),
+		WithForeignBuilders(foreignloop.BuildWith(spec), foreignloop.BuildRestoredWith(spec)),
 		WithEventAppender(rec))
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -386,7 +386,7 @@ func TestCodexForeignPrimaryLateBoundPublishesBoundAndTurnDone(t *testing.T) {
 	spec := foreignloop.Spec{Agent: agent, Cwd: t.TempDir(), SIDMode: foreignloop.SIDLateBound}
 
 	s, err := newTestSession(ctx, codexForeignPrimaryCfg(),
-		WithForeignBuilder(foreignloop.BuildWith(spec), foreignloop.BuildRestoredWith(spec)),
+		WithForeignBuilders(foreignloop.BuildWith(spec), foreignloop.BuildRestoredWith(spec)),
 		WithEventAppender(rec))
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -467,7 +467,7 @@ func TestForeignSubagentE2E(t *testing.T) {
 
 	// Native primary (Engine zero) with a working native cfg + stub LLM.
 	s, err := newTestSession(ctx, cfg(&stubLLM{chunks: []content.Chunk{textChunk("primary")}}),
-		WithForeignBuilder(foreignloop.BuildWith(spec), foreignloop.BuildRestoredWith(spec)),
+		WithForeignBuilders(foreignloop.BuildWith(spec), foreignloop.BuildRestoredWith(spec)),
 		WithEventAppender(rec))
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -511,7 +511,7 @@ func TestForeignQueuedDelegateInterruptResolvesWithoutWaitTimeout(t *testing.T) 
 	)
 	agent := &fakeForeignAgent{transcript: missingTranscript(t), block: true}
 	spec := foreignloop.Spec{Agent: agent, Cwd: t.TempDir()}
-	s := newDelegationSession(t, parent, []Option{WithForeignBuilder(foreignloop.BuildWith(spec), foreignloop.BuildRestoredWith(spec))}, child)
+	s := newDelegationSession(t, parent, []Option{WithForeignBuilders(foreignloop.BuildWith(spec), foreignloop.BuildRestoredWith(spec))}, child)
 	ctrl := s.delegation.controllerFor(s.PrimaryLoopID(), parent)
 	active, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateStart, Agent: "child", Message: "A", Wait: false})
 	if err != nil {
@@ -554,7 +554,7 @@ func TestForeignQueuedDelegateTimeoutCancelsOnlyThatRequest(t *testing.T) {
 	)
 	agent := &fakeForeignAgent{transcript: missingTranscript(t), block: true}
 	spec := foreignloop.Spec{Agent: agent, Cwd: t.TempDir()}
-	s := newDelegationSession(t, parent, []Option{WithForeignBuilder(foreignloop.BuildWith(spec), foreignloop.BuildRestoredWith(spec))}, child)
+	s := newDelegationSession(t, parent, []Option{WithForeignBuilders(foreignloop.BuildWith(spec), foreignloop.BuildRestoredWith(spec))}, child)
 	ctrl := s.delegation.controllerFor(s.PrimaryLoopID(), parent)
 	active, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateStart, Agent: "child", Message: "A", Wait: false})
 	if err != nil {
@@ -599,7 +599,7 @@ func TestForeignProviderFailureResolvesQueuedDelegatesFailedLive(t *testing.T) {
 	)
 	agent := &releasedFailureForeignAgent{spawned: make(chan *releasedFailureForeignStream, 2)}
 	spec := foreignloop.Spec{Agent: agent, Cwd: t.TempDir()}
-	s := newDelegationSession(t, parent, []Option{WithForeignBuilder(foreignloop.BuildWith(spec), foreignloop.BuildRestoredWith(spec))}, child)
+	s := newDelegationSession(t, parent, []Option{WithForeignBuilders(foreignloop.BuildWith(spec), foreignloop.BuildRestoredWith(spec))}, child)
 	ctrl := s.delegation.controllerFor(s.PrimaryLoopID(), parent)
 	active, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateStart, Agent: "child", Message: "A", Wait: false})
 	if err != nil {
@@ -642,7 +642,7 @@ func TestCodexForeignSubagentLateBoundReturnsFinalText(t *testing.T) {
 	spec := foreignloop.Spec{Agent: agent, Cwd: t.TempDir(), SIDMode: foreignloop.SIDLateBound}
 
 	s, err := newTestSession(ctx, cfg(&stubLLM{chunks: []content.Chunk{textChunk("primary")}}),
-		WithForeignBuilder(foreignloop.BuildWith(spec), foreignloop.BuildRestoredWith(spec)),
+		WithForeignBuilders(foreignloop.BuildWith(spec), foreignloop.BuildRestoredWith(spec)),
 		WithEventAppender(rec))
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -705,7 +705,7 @@ func TestForeignSubagentQuotaCap(t *testing.T) {
 	spec := foreignloop.Spec{Agent: agent, Cwd: t.TempDir()}
 
 	s, err := newTestSession(ctx, cfg(&stubLLM{chunks: []content.Chunk{textChunk("primary")}}),
-		WithForeignBuilder(foreignloop.BuildWith(spec), foreignloop.BuildRestoredWith(spec)),
+		WithForeignBuilders(foreignloop.BuildWith(spec), foreignloop.BuildRestoredWith(spec)),
 		WithLimits(Limits{Quota: 1}))
 	if err != nil {
 		t.Fatalf("New: %v", err)

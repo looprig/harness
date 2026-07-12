@@ -42,6 +42,39 @@ func TestPublicLoopPackageHasNoActorConstructionSurface(t *testing.T) {
 	}
 }
 
+func TestPublicLoopPackageExportsFinalContracts(t *testing.T) {
+	_, file, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller failed")
+	}
+	packages, err := parser.ParseDir(token.NewFileSet(), filepath.Dir(file), nil, 0)
+	if err != nil {
+		t.Fatalf("parse pkg/loop: %v", err)
+	}
+	exports := map[string]bool{}
+	for _, file := range packages["loop"].Files {
+		for _, decl := range file.Decls {
+			switch declaration := decl.(type) {
+			case *ast.FuncDecl:
+				if declaration.Recv == nil && ast.IsExported(declaration.Name.Name) {
+					exports[declaration.Name.Name] = true
+				}
+			case *ast.GenDecl:
+				for _, spec := range declaration.Specs {
+					if named, ok := spec.(*ast.TypeSpec); ok && ast.IsExported(named.Name.Name) {
+						exports[named.Name.Name] = true
+					}
+				}
+			}
+		}
+	}
+	for _, name := range []string{"Define", "Definition", "Mode", "Handle", "Controller"} {
+		if !exports[name] {
+			t.Errorf("pkg/loop does not export final contract %s", name)
+		}
+	}
+}
+
 func TestLoopRuntimeDependencyPointsTowardPublicContracts(t *testing.T) {
 	_, file, _, ok := runtime.Caller(0)
 	if !ok {

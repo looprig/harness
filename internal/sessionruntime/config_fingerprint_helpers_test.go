@@ -9,6 +9,7 @@ import (
 
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/event"
+	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/harness/pkg/sessionstore"
 	"github.com/looprig/harness/pkg/tool"
@@ -23,13 +24,17 @@ func newTestSession(ctx context.Context, definition loop.Definition, options ...
 func restoreTestSession(ctx context.Context, definition loop.Definition, id uuid.UUID, store *sessionstore.Store, options ...Option) (*Session, error) {
 	resolved := []Option{WithFingerprintProvider(testFingerprintProvider)}
 	resolved = append(resolved, options...)
-	return Restore(ctx, definition, id, store, resolved...)
+	return RestoreTopology(ctx, singleDefinitionTopology(definition), id, store, resolved...)
 }
 
 func newTestLifecycle(definition loop.Definition, store *sessionstore.Store, options ...LifecycleOption) (*Lifecycle, error) {
 	resolved := []LifecycleOption{WithLifecycleFingerprintProvider(testFingerprintProvider)}
 	resolved = append(resolved, options...)
-	return NewLifecycle(definition, store, resolved...)
+	return NewTopologyLifecycle(singleDefinitionTopology(definition), store, resolved...)
+}
+
+func singleDefinitionTopology(definition loop.Definition) Topology {
+	return Topology{Definitions: []loop.Definition{definition}, Primers: []identity.AgentName{definition.Name()}, ActivePrimer: definition.Name()}
 }
 
 type testFingerprintFields struct {

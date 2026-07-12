@@ -37,10 +37,10 @@ type SpecConfig struct {
 //
 //   - Foreign-engine selection is gated behind the root's OWN flag (default native/off).
 //     Once selected, the root wires the seam via
-//     session.WithForeignBuilder(foreignloop.BuildWith(spec), foreignloop.BuildRestoredWith(spec)).
-//   - The cwd is fingerprinted via the session's ConfigFingerprintFields.WorkspaceRoot,
+//     rig.WithForeignBuilders(foreignloop.BuildWith(spec), foreignloop.BuildRestoredWith(spec)).
+//   - The cwd is fingerprinted via the rig's ConfigFingerprintFields.WorkspaceRoot,
 //     and the adapter/posture via AdapterID/Posture, so the root must ALSO inject
-//     session.WithConfigFingerprintFields{WorkspaceRoot: cfg.Cwd, AdapterID: "claude",
+//     rig.WithFingerprintFields(rig.ConfigFingerprintFields{WorkspaceRoot: cfg.Cwd, AdapterID: "claude",
 //     Posture: <posture string>}.
 //   - ExecPath and Env are intentionally NOT fingerprinted: the binary location and the
 //     non-secret environment are permitted to drift across runs without re-keying state.

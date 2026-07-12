@@ -972,7 +972,9 @@ func TestRestoreAcceptsPreFrozenFullFingerprintFixture(t *testing.T) {
 	oldProvider := sessionruntime.FingerprintProvider(func(bound loop.BoundDefinition) event.ConfigFingerprint {
 		return fingerprintWithTopology(bound, ConfigFingerprintFields{}, []loop.Definition{definition}, []string{"agent"}, "agent")
 	})
-	legacy, err := sessionruntime.NewLifecycle(definition, store, sessionruntime.WithLifecycleFingerprintProvider(oldProvider))
+	legacy, err := sessionruntime.NewTopologyLifecycle(sessionruntime.Topology{
+		Definitions: []loop.Definition{definition}, Primers: []identity.AgentName{definition.Name()}, ActivePrimer: definition.Name(),
+	}, store, sessionruntime.WithLifecycleFingerprintProvider(oldProvider))
 	if err != nil {
 		t.Fatal(err)
 	}

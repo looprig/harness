@@ -179,5 +179,5 @@ func (e *GateError) GateErrorKind() string { return string(e.Kind) }
 type WorkspaceNotConfiguredError struct{}
 
 func (*WorkspaceNotConfiguredError) Error() string {
-	return "session: workspace store not configured (WithWorkspaceStore); cannot checkpoint"
+	return "session: workspace checkpointing is not configured"
 }

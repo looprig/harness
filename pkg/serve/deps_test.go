@@ -77,6 +77,7 @@ func TestImportAllowed(t *testing.T) {
 		{name: "allowed content", path: "github.com/looprig/core/content", want: true},
 		{name: "allowed uuid", path: "github.com/looprig/core/uuid", want: true},
 		{name: "forbidden session", path: "github.com/looprig/harness/pkg/session", want: false},
+		{name: "forbidden rig", path: "github.com/looprig/harness/pkg/rig", want: false},
 		{name: "forbidden llm", path: "github.com/looprig/harness/pkg/llm", want: false},
 		{name: "forbidden store", path: "github.com/looprig/harness/pkg/sessionstore", want: false},
 		{name: "forbidden third-party", path: "github.com/looprig/storage", want: false},

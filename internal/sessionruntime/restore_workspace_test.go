@@ -238,7 +238,7 @@ func TestRestoreMaterializesWorkspace(t *testing.T) {
 
 			freshRoot := t.TempDir() // empty → truth path (extract)
 			s, err := restoreTestSession(context.Background(), restoreCfg(&stubLLM{}, "model-x", "be helpful"),
-				orig.sessionID, store, WithWorkspaceStore(ws, freshRoot))
+				orig.sessionID, store, WithWorkspaceCheckpointing(ws, freshRoot))
 			if err != nil {
 				t.Fatalf("Restore: %v", err)
 			}
@@ -304,7 +304,7 @@ func TestRestoreMaterializesEffectiveCurrentWorkspace(t *testing.T) {
 
 	freshRoot := t.TempDir()
 	s, err := restoreTestSession(context.Background(), restoreCfg(&stubLLM{}, "model-x", "be helpful"),
-		sessionID, store, WithWorkspaceStore(ws, freshRoot))
+		sessionID, store, WithWorkspaceCheckpointing(ws, freshRoot))
 	if err != nil {
 		t.Fatalf("Restore: %v", err)
 	}
@@ -317,13 +317,13 @@ func TestRestoreMaterializesEffectiveCurrentWorkspace(t *testing.T) {
 
 // TestRestoreSkipsWorkspaceMaterialize proves the two skip cases: a session with NO
 // WorkspaceCheckpointed in its journal restores with the wired root untouched, and a session
-// that DOES carry a checkpoint but is restored WITHOUT WithWorkspaceStore (a conversation-only
+// that DOES carry a checkpoint but is restored WITHOUT WithWorkspaceCheckpointing (a conversation-only
 // restore where the composition root opted out) skips materialize and comes up clean.
 func TestRestoreSkipsWorkspaceMaterialize(t *testing.T) {
 	tests := []struct {
 		name       string
 		checkpoint bool // does the journal carry a WorkspaceCheckpointed?
-		wireStore  bool // does Restore pass WithWorkspaceStore?
+		wireStore  bool // does Restore pass WithWorkspaceCheckpointing?
 	}{
 		{name: "no checkpoint in journal leaves wired root untouched", checkpoint: false, wireStore: true},
 		{name: "checkpoint present but no store wired (conversation-only) skips", checkpoint: true, wireStore: false},
@@ -361,7 +361,7 @@ func TestRestoreSkipsWorkspaceMaterialize(t *testing.T) {
 
 			var opts []Option
 			if tt.wireStore {
-				opts = append(opts, WithWorkspaceStore(ws, root))
+				opts = append(opts, WithWorkspaceCheckpointing(ws, root))
 			}
 			s, err := restoreTestSession(context.Background(), restoreCfg(&stubLLM{}, "model-x", "be helpful"),
 				orig.sessionID, store, opts...)
@@ -411,7 +411,7 @@ func TestRestoreWorkspaceWarmVolumeReuse(t *testing.T) {
 	getsBeforeRestore := blobs.gets.Load()
 
 	s, err := restoreTestSession(context.Background(), restoreCfg(&stubLLM{}, "model-x", "be helpful"),
-		orig.sessionID, store, WithWorkspaceStore(ws, warmRoot))
+		orig.sessionID, store, WithWorkspaceCheckpointing(ws, warmRoot))
 	if err != nil {
 		t.Fatalf("Restore (warm volume): %v", err)
 	}
@@ -509,7 +509,7 @@ func TestRestoreWorkspaceMaterializeFailsClosed(t *testing.T) {
 			handOver(t, orig.lease)
 
 			s, err := restoreTestSession(context.Background(), restoreCfg(&stubLLM{}, "model-x", "be helpful"),
-				orig.sessionID, store, WithWorkspaceStore(ws, root))
+				orig.sessionID, store, WithWorkspaceCheckpointing(ws, root))
 
 			// (a) No session comes up.
 			if s != nil {

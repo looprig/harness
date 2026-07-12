@@ -30,7 +30,7 @@ import (
 // WHEN to call this — a quiescence point (a turn done, a user question, about to suspend)
 // — is the composition root's decision, consistent with looprig-as-SDK and the
 // foreign-loop quiescence model; the session only exposes the capability. Without
-// WithWorkspaceStore the capability is unconfigured and this fails closed with a typed
+// WithWorkspaceCheckpointing the capability is unconfigured and this fails closed with a typed
 // *WorkspaceNotConfiguredError, having touched nothing. ctx bounds the snapshot I/O and
 // the durable append.
 func (s *Session) CheckpointWorkspace(ctx context.Context) (workspacestore.Ref, error) {
@@ -43,7 +43,7 @@ func (s *Session) CheckpointWorkspace(ctx context.Context) (workspacestore.Ref, 
 	// When a placement coordinator is wired, hold the exclusive checkpoint permit around
 	// the snapshot so no managed mutation overlaps the walk — that is what makes the
 	// recorded ref honestly quiescent for exclusive/per-session roots. The bare
-	// WithWorkspaceStore path (no coordinator) skips this.
+	// WithWorkspaceCheckpointing path (no coordinator) skips this.
 	if s.wsCoordinator != nil {
 		permit, err := s.wsCoordinator.Acquire(ctx, tool.WorkspaceOperationCheckpoint, "")
 		if err != nil {

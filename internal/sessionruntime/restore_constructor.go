@@ -19,9 +19,8 @@ import (
 	"github.com/looprig/harness/pkg/workspacestore"
 )
 
-// Restore reconstructs the durable loop topology and brings it up idle. The
-// single-loop entry point is a compatibility wrapper around the same leased
-// transaction used by RestoreTopology; neither path publishes SessionStarted.
+// RestoreTopology reconstructs the durable loop topology and brings it up idle. It does
+// not publish SessionStarted.
 //
 // Order (per the design — RestoreStarted is the FIRST restore mutation, after the lease
 // fence the journal writes at construction):
@@ -43,16 +42,6 @@ import (
 // re-acquire). On SUCCESS the journal HOLDS the lease for the live session's lifetime;
 // releasing it at session teardown is the Phase-10 composition root's wiring (mirroring
 // how the lease is composition-root-owned in the durable-tap path), out of scope here.
-func Restore(
-	ctx context.Context,
-	cfg loop.Definition,
-	sessionID uuid.UUID,
-	store *sessionstore.Store,
-	opts ...Option,
-) (*Session, error) {
-	return restoreSession(ctx, cfg, sessionID, store, uuid.New, time.Now, opts...)
-}
-
 // RestoreTopology reconstructs the entire topology in one leased replay transaction.
 func RestoreTopology(ctx context.Context, topology Topology, sessionID uuid.UUID, store *sessionstore.Store, opts ...Option) (*Session, error) {
 	return restoreTopologySession(ctx, topology, sessionID, store, uuid.New, time.Now, opts...)
@@ -85,21 +74,6 @@ func (s *Session) attachRestoredLoop(started event.LoopStarted, parent loop.Prov
 	s.loops[started.LoopID] = &loopHandle{id: started.LoopID, owner: s, bound: bound, backend: backend, parent: parent, cancel: cancel, liveMode: liveMode, liveModel: liveModel, state: tool.DelegateStatusIdle}
 	s.loopsMu.Unlock()
 	return nil
-}
-
-// restoreSession is the construction core of Restore with the id-gen and clock seams
-// made explicit (mirroring newSession), so a same-package test can pin the stamp or
-// drive a mint failure. Restore calls it with the production defaults.
-func restoreSession(
-	ctx context.Context,
-	cfg loop.Definition,
-	sessionID uuid.UUID,
-	store *sessionstore.Store,
-	newID idGenerator,
-	now event.Clock,
-	opts ...Option,
-) (*Session, error) {
-	return restoreTopologySession(ctx, Topology{Definitions: []loop.Definition{cfg}, Primers: []identity.AgentName{cfg.Name()}, ActivePrimer: cfg.Name()}, sessionID, store, newID, now, opts...)
 }
 
 func restoreTopologySession(

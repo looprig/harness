@@ -107,7 +107,7 @@ func TestForeignDelegateBuilderReceivesSelectedEffectiveMode(t *testing.T) {
 		),
 		loop.WithInitialMode("build"),
 	)
-	s := newDelegationSession(t, parent, []Option{WithEventAppender(rec), WithForeignBuilder(builder.build, builder.buildRestored)}, child)
+	s := newDelegationSession(t, parent, []Option{WithEventAppender(rec), WithForeignBuilders(builder.build, builder.buildRestored)}, child)
 	ctrl := s.delegation.controllerFor(s.PrimaryLoopID(), parent)
 	queued, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateStart, Agent: "child", Mode: "review", Message: "inspect", Wait: false})
 	if err != nil {
@@ -223,7 +223,7 @@ func TestForeignNewLoop(t *testing.T) {
 
 			opts := []Option{WithFingerprintProvider(testFingerprintProvider), WithEventAppender(rec)}
 			if tt.wireBuilder {
-				opts = append(opts, WithForeignBuilder(builder.build, builder.buildRestored))
+				opts = append(opts, WithForeignBuilders(builder.build, builder.buildRestored))
 			}
 
 			s, err := newSession(context.Background(), c, uuid.New, time.Now, opts...)

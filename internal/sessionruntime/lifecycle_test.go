@@ -98,10 +98,10 @@ func badClientCfg() loop.Definition {
 	return loop.Definition{}
 }
 
-// TestLifecycleNewLifecycle proves NewLifecycle binds cfg+store into a reusable Lifecycle and fails
+// TestLifecycleNewTopologyLifecycle proves topology+store bind into a reusable Lifecycle and fail
 // closed with a typed *MissingStoreError when handed a nil store (the durable backend is a
 // required dependency).
-func TestLifecycleNewLifecycle(t *testing.T) {
+func TestLifecycleNewTopologyLifecycle(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
 		name     string
@@ -123,32 +123,33 @@ func TestLifecycleNewLifecycle(t *testing.T) {
 			if tt.wantErr {
 				var nse *MissingStoreError
 				if !errors.As(err, &nse) {
-					t.Fatalf("NewLifecycle err = %v, want *MissingStoreError", err)
+					t.Fatalf("NewTopologyLifecycle err = %v, want *MissingStoreError", err)
 				}
 				if r != nil {
-					t.Fatalf("NewLifecycle returned a non-nil Lifecycle on error")
+					t.Fatalf("NewTopologyLifecycle returned a non-nil Lifecycle on error")
 				}
 				return
 			}
 			if err != nil {
-				t.Fatalf("NewLifecycle: %v", err)
+				t.Fatalf("NewTopologyLifecycle: %v", err)
 			}
 			if r == nil {
-				t.Fatal("NewLifecycle returned a nil Lifecycle without error")
+				t.Fatal("NewTopologyLifecycle returned a nil Lifecycle without error")
 			}
 		})
 	}
 }
 
-func TestNewLifecycleRequiresFingerprintProvider(t *testing.T) {
+func TestNewTopologyLifecycleRequiresFingerprintProvider(t *testing.T) {
 	t.Parallel()
-	lifecycle, err := NewLifecycle(cfg(&stubLLM{}), newRestoreStore(t))
+	definition := cfg(&stubLLM{})
+	lifecycle, err := NewTopologyLifecycle(singleDefinitionTopology(definition), newRestoreStore(t))
 	if lifecycle != nil {
-		t.Fatal("NewLifecycle returned a lifecycle without a fingerprint provider")
+		t.Fatal("NewTopologyLifecycle returned a lifecycle without a fingerprint provider")
 	}
 	var target *MissingFingerprintProviderError
 	if !errors.As(err, &target) {
-		t.Fatalf("NewLifecycle error = %T %v, want *MissingFingerprintProviderError", err, err)
+		t.Fatalf("NewTopologyLifecycle error = %T %v, want *MissingFingerprintProviderError", err, err)
 	}
 }
 
@@ -161,7 +162,7 @@ func TestLifecycleRun(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
 		name         string
-		badClient    bool                // NewLifecycle with a nil-Client definition → NewSession fails
+		badClient    bool                // NewTopologyLifecycle with a nil-Client definition → NewSession fails
 		withCeiling  bool                // wire a counting ceiling factory
 		cancelCtx    bool                // pass a pre-cancelled context to NewSession
 		failLease    bool                // the store's Leaser fails Acquire
@@ -205,7 +206,7 @@ func TestLifecycleRun(t *testing.T) {
 			}
 			r, err := newTestLifecycle(runCfg, store, copts...)
 			if err != nil {
-				t.Fatalf("NewLifecycle: %v", err)
+				t.Fatalf("NewTopologyLifecycle: %v", err)
 			}
 
 			ctx := context.Background()
@@ -270,7 +271,7 @@ func runAndShutdown(t *testing.T, store *sessionstore.Store, c loop.Definition) 
 	t.Helper()
 	r, err := newTestLifecycle(c, store)
 	if err != nil {
-		t.Fatalf("NewLifecycle (original run): %v", err)
+		t.Fatalf("NewTopologyLifecycle (original run): %v", err)
 	}
 	s, err := r.NewSession(context.Background(), "")
 	if err != nil {
@@ -293,7 +294,7 @@ func runAndShutdown(t *testing.T, store *sessionstore.Store, c loop.Definition) 
 
 // TestLifecycleRestore covers RestoreSession in table form: the happy round trip (NewSession → persist →
 // RestoreSession), an unknown/never-run id (typed *RestoreDiscoveryError, no panic), and the
-// NewLifecycle-captured config-fingerprint guard — rejecting a mismatch with *ConfigMismatchError
+// NewTopologyLifecycle-captured config-fingerprint guard — rejecting a mismatch with *ConfigMismatchError
 // unless WithLifecycleAllowConfigMismatch was compiled in.
 func TestLifecycleRestore(t *testing.T) {
 	t.Parallel()
@@ -334,7 +335,7 @@ func TestLifecycleRestore(t *testing.T) {
 			}
 			rr, err := newTestLifecycle(restoreCfg(&stubLLM{}, restoreModel, "be helpful"), store, copts...)
 			if err != nil {
-				t.Fatalf("NewLifecycle (restore): %v", err)
+				t.Fatalf("NewTopologyLifecycle (restore): %v", err)
 			}
 
 			restored, err := rr.RestoreSession(context.Background(), sid)
@@ -386,7 +387,7 @@ func TestLifecycleConcurrentReuse(t *testing.T) {
 	c := restoreCfg(&stubLLM{chunks: []content.Chunk{textChunk("reply")}}, "model-x", "be helpful")
 	r, err := newTestLifecycle(c, store)
 	if err != nil {
-		t.Fatalf("NewLifecycle: %v", err)
+		t.Fatalf("NewTopologyLifecycle: %v", err)
 	}
 
 	// Pre-persist the sessions the concurrent Restores will resume (each cleanly shut down so

@@ -10,8 +10,8 @@
 // main: there is no composition root (no cmd/ main, nothing constructs a session)
 // here, so there is no flag to gate foreign-engine selection on yet. That flag/gate
 // lives on the composition-root branch. The full builder wiring this resolver feeds is
-// already proven by pkg/session/foreign_e2e_test.go, which constructs
-// WithForeignBuilder(foreignloop.BuildWith(spec), foreignloop.BuildRestoredWith(spec))
+// already proven by the internal session runtime's foreign-engine tests, which bind
+// rig.WithForeignBuilders(foreignloop.BuildWith(spec), foreignloop.BuildRestoredWith(spec))
 // exactly as a composition root would.
 //
 // # The three lines a composition root performs
@@ -23,9 +23,9 @@
 //		ExecPath: p, Home: h, Model: m, Cwd: w,
 //		Posture: postureFromFlag(...), EnvAllow: allow, Credential: cred,
 //	})
-//	opts := []session.Option{
-//		session.WithForeignBuilder(foreignloop.BuildWith(spec), foreignloop.BuildRestoredWith(spec)),
-//		session.WithConfigFingerprintFields(session.ConfigFingerprintFields{
+//	opts := []rig.Option{
+//		rig.WithForeignBuilders(foreignloop.BuildWith(spec), foreignloop.BuildRestoredWith(spec)),
+//		rig.WithFingerprintFields(rig.ConfigFingerprintFields{
 //			WorkspaceRoot: w, AdapterID: "claude", Posture: "default",
 //		}),
 //	}
