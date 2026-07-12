@@ -141,7 +141,7 @@ func (r *recordingSub) waitTurnCausationID(d time.Duration) (uuid.UUID, bool) {
 
 // validModel returns a minimal but VALID inference.Model (passes inference.Model.Validate): a
 // known provider speaking a supported dialect at a loopback endpoint. It replaces the
-// retired ModelSpec in session tests that construct a loop.Config.
+// retired ModelSpec in session tests that construct a loop.Definition.
 func validModel(name string) inference.Model {
 	return inference.Model{
 		Provider:  inference.ProviderName("lmstudio"),
@@ -576,22 +576,22 @@ func TestRoutingMethodsLoopNotFound(t *testing.T) {
 	}
 }
 
-// TestNewLoopReturnsLoopNewError covers NewLoop's loop.New error path: when
-// loop.New fails its own Config validation, NewLoop must (a) return that error
+// TestNewLoopReturnsRuntimeConstructorError covers NewLoop's internal constructor error path: when
+// loopruntime.New fails its own runtime binding validation, NewLoop must (a) return that error
 // unwrapped (a *loop.ConfigError, NOT a *SessionError — the id generation
 // already succeeded), (b) leave the registry unmutated (no handle stored), and
 // (c) cancel the derived loopCtx so the session leaks no context.
 //
-// The cheapest loop.New validation failure is a nil Client, which short-circuits
+// The cheapest loopruntime.New validation failure is a nil Client, which short-circuits
 // to *loop.ConfigError{ConfigMissingClient} synchronously, before any goroutine
 // or LLM is involved. Cancellation of the derived loopCtx is asserted
-// structurally: NewLoop derives loopCtx from s.sessionCtx and, on the loop.New
+// structurally: NewLoop derives loopCtx from s.sessionCtx and, on the loopruntime.New
 // error, sessionCtx must still be live (NewLoop must cancel only the child, never
 // the session). The child loopCtx is local to NewLoop and cannot be captured
 // without changing production code, so the cancel-observation here is
 // structural-only (the cancel() call sits on the asserted error path); the
 // positive guard is that sessionCtx itself was NOT cancelled.
-func TestNewLoopReturnsLoopNewError(t *testing.T) {
+func TestNewLoopReturnsRuntimeConstructorError(t *testing.T) {
 	t.Parallel()
 	sessionCtx, sessionCancel := context.WithCancel(context.Background())
 	t.Cleanup(sessionCancel)
@@ -602,10 +602,10 @@ func TestNewLoopReturnsLoopNewError(t *testing.T) {
 		sessionCancel: sessionCancel,
 		loops:         map[uuid.UUID]*loopHandle{primaryLoopID: {}},
 		primaryLoopID: primaryLoopID,
-		newID:         uuid.New, // id mint succeeds; only loop.New must fail
+		newID:         uuid.New, // id mint succeeds; only loopruntime.New must fail
 		now:           time.Now,
 	}
-	// NewLoop stamps the LoopStarted header via the Factory before loop.New, so a
+	// NewLoop stamps the LoopStarted header via the Factory before loopruntime.New, so a
 	// manually-built Session must wire one (New does this; this test bypasses New).
 	s.factory = event.NewFactory(func() (uuid.UUID, error) { return s.newID() }, func() time.Time { return s.now() })
 
@@ -613,14 +613,14 @@ func TestNewLoopReturnsLoopNewError(t *testing.T) {
 	before := len(s.loops)
 	s.loopsMu.RUnlock()
 
-	// loop.New rejects a nil Client with *ConfigError{ConfigMissingClient} before
+	// loopruntime.New rejects a nil Client with *ConfigError{ConfigMissingClient} before
 	// starting any goroutine — the cheapest validation failure to inject.
 	badCfg := loop.Definition{}
 	loopID, err := s.NewLoop(loop.Provenance{}, badCfg)
 
-	// (a) the loop.New error is returned, unwrapped, not remapped to *SessionError.
+	// (a) the loopruntime.New error is returned, unwrapped, not remapped to *SessionError.
 	if err == nil {
-		t.Fatal("NewLoop returned nil error, want loop.New's ConfigError")
+		t.Fatal("NewLoop returned nil error, want loopruntime.New's ConfigError")
 	}
 	if !loopID.IsZero() {
 		t.Errorf("NewLoop returned loop id %v on error, want zero", loopID)
@@ -631,7 +631,7 @@ func TestNewLoopReturnsLoopNewError(t *testing.T) {
 	}
 	var se *SessionError
 	if errors.As(err, &se) {
-		t.Fatalf("err = %v, want the raw loop.New error, not a *SessionError", err)
+		t.Fatalf("err = %v, want the raw loopruntime.New error, not a *SessionError", err)
 	}
 
 	// (b) the registry must be unchanged: no handle stored for the failed loop.
@@ -639,14 +639,14 @@ func TestNewLoopReturnsLoopNewError(t *testing.T) {
 	after := len(s.loops)
 	s.loopsMu.RUnlock()
 	if after != before {
-		t.Fatalf("registry size changed from %d to %d on loop.New failure, want unchanged", before, after)
+		t.Fatalf("registry size changed from %d to %d on loopruntime.New failure, want unchanged", before, after)
 	}
 
 	// (c) structural cancel guard: NewLoop must cancel ONLY the derived loopCtx,
 	// never the session backstop. sessionCtx must still be live after the error.
 	select {
 	case <-sessionCtx.Done():
-		t.Fatal("NewLoop cancelled sessionCtx on the loop.New error path, want only the derived loopCtx cancelled")
+		t.Fatal("NewLoop cancelled sessionCtx on the loopruntime.New error path, want only the derived loopCtx cancelled")
 	default:
 	}
 }

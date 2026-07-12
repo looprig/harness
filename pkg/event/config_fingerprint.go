@@ -8,11 +8,9 @@ package event
 // a verbatim identifier (AgentKind, ModelID, WorkspaceRoot, AgentAdapter,
 // PermissionPosture), a content digest (SystemPromptRev, ToolPolicyRev), or a mode flag
 // (RuntimeSkills) — never the raw prompt text or tool definitions — so it is safe to
-// persist and compare without leaking config internals. The derivation from a
-// loop.Config lives in the session package (FingerprintFrom), which is the layer that
-// owns the config; the fields not on loop.Config (AgentKind, RuntimeSkills,
-// WorkspaceRoot, AgentAdapter, PermissionPosture) are injected at the composition root.
-// This package only defines the value and its equality.
+// persist and compare without leaking definition internals. Package rig freezes the
+// fingerprint from its registered loop definitions, topology, and composition fields;
+// this package only defines the durable value and its equality.
 //
 // The fields evolve ADDITIVELY: every field is omitzero, so an old journal record
 // that predates a field decodes it as the zero value and compares Equal to a record

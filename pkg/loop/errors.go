@@ -10,7 +10,9 @@ const (
 	ConfigMissingPublisher ConfigErrorKind = "missing_publisher"
 )
 
-// ConfigError is returned by New when the supplied Config is invalid.
+// ConfigError reports an invalid resolved definition or missing actor-runtime
+// collaborator discovered during internal binding. Public callers normally encounter
+// DefinitionError from Define or BindError from Definition.Bind before this seam.
 type ConfigError struct {
 	Kind  ConfigErrorKind
 	Cause error
@@ -19,13 +21,13 @@ type ConfigError struct {
 func (e *ConfigError) Error() string {
 	switch e.Kind {
 	case ConfigMissingClient:
-		return "loop: config error: Config.Client is required"
+		return "loop: runtime binding error: inference client is required"
 	case ConfigInvalidModel:
-		return "loop: config error: Config.Model invalid"
+		return "loop: runtime binding error: model is invalid"
 	case ConfigMissingPublisher:
-		return "loop: config error: event publisher is required"
+		return "loop: runtime binding error: event publisher is required"
 	default:
-		return "loop: config error"
+		return "loop: runtime binding error"
 	}
 }
 func (e *ConfigError) Unwrap() error { return e.Cause }

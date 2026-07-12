@@ -3,7 +3,7 @@ package tools
 import "github.com/looprig/harness/pkg/loop"
 
 // Intent is the composition-root selector for how autonomous tool approval is.
-// It is NOT session state — neither loop.Config nor Session stores it; the
+// It is NOT session state — neither loop.Definition nor Session stores it; the
 // composition root reads it to decide the permission wiring and then discards it.
 // Zero value is Interactive (fail-secure: a human answers gates by default).
 type Intent uint8

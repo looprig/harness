@@ -6,13 +6,60 @@ import (
 	"go/token"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
 )
 
 const modulePath = "github.com/looprig/harness"
+
+func internalSessionRuntimeImportViolations(root string) ([]string, error) {
+	var violations []string
+	err := filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if entry.IsDir() {
+			switch entry.Name() {
+			case ".git", "vendor", "docs", "examples", "testdata":
+				if path != root {
+					return filepath.SkipDir
+				}
+			}
+			return nil
+		}
+		if !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
+			return nil
+		}
+		file, err := parser.ParseFile(token.NewFileSet(), path, nil, parser.ImportsOnly)
+		if err != nil {
+			return err
+		}
+		for _, imp := range file.Imports {
+			importPath, err := strconv.Unquote(imp.Path.Value)
+			if err != nil {
+				return err
+			}
+			if importPath != modulePath+"/internal/sessionruntime" {
+				continue
+			}
+			rel, err := filepath.Rel(root, path)
+			if err != nil {
+				return err
+			}
+			rel = filepath.ToSlash(rel)
+			if !strings.HasPrefix(rel, "pkg/rig/") {
+				violations = append(violations, rel)
+			}
+		}
+		return nil
+	})
+	sort.Strings(violations)
+	return violations, err
+}
 
 func harnessRoot(t *testing.T) string {
 	t.Helper()
@@ -25,33 +72,33 @@ func harnessRoot(t *testing.T) string {
 
 func TestOnlyRigImportsInternalSessionRuntime(t *testing.T) {
 	root := harnessRoot(t)
-	err := filepath.WalkDir(filepath.Join(root, "pkg"), func(path string, entry os.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		if entry.IsDir() || !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
-			return nil
-		}
-		file, err := parser.ParseFile(token.NewFileSet(), path, nil, parser.ImportsOnly)
-		if err != nil {
-			return err
-		}
-		for _, imp := range file.Imports {
-			importPath, err := strconv.Unquote(imp.Path.Value)
-			if err != nil {
-				return err
-			}
-			if importPath == modulePath+"/internal/sessionruntime" {
-				rel, _ := filepath.Rel(root, path)
-				if !strings.HasPrefix(filepath.ToSlash(rel), "pkg/rig/") {
-					t.Errorf("%s imports internal/sessionruntime; only pkg/rig may compose it", rel)
-				}
-			}
-		}
-		return nil
-	})
+	violations, err := internalSessionRuntimeImportViolations(root)
 	if err != nil {
 		t.Fatal(err)
+	}
+	for _, violation := range violations {
+		t.Errorf("%s imports internal/sessionruntime; only pkg/rig may compose it", violation)
+	}
+}
+
+func TestInternalSessionRuntimeImportGuardCoversWholeModule(t *testing.T) {
+	root := t.TempDir()
+	for _, rel := range []string{"internal/leak/leak.go", "cmd/leak/main.go", "pkg/rig/allowed.go", "testdata/ignored.go"} {
+		path := filepath.Join(root, filepath.FromSlash(rel))
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte("package leak\nimport _ \""+modulePath+"/internal/sessionruntime\"\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	violations, err := internalSessionRuntimeImportViolations(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"cmd/leak/main.go", "internal/leak/leak.go"}
+	if strings.Join(violations, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("violations = %v, want %v", violations, want)
 	}
 }
 
@@ -133,7 +180,7 @@ func TestNoLegacyLifecycleNamesInActiveSource(t *testing.T) {
 				return err
 			}
 			if strings.Contains(importPath, "store"+"kit") {
-					t.Errorf("%s imports a removed storage package path %q", path, importPath)
+				t.Errorf("%s imports a removed storage package path %q", path, importPath)
 			}
 		}
 		file, err = parser.ParseFile(token.NewFileSet(), path, nil, 0)
@@ -153,6 +200,47 @@ func TestNoLegacyLifecycleNamesInActiveSource(t *testing.T) {
 			}
 			return true
 		})
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestNoRemovedLoopConstructionVocabularyInGoSource(t *testing.T) {
+	patterns := []*regexp.Regexp{
+		regexp.MustCompile(`\bloop\.` + "Config" + `\b`),
+		regexp.MustCompile(`\bConfig\.` + "Client" + `\b`),
+		regexp.MustCompile(`\bConfig\.` + "Model" + `\b`),
+		regexp.MustCompile(`\bloop\.` + "New" + `(?:Restored)?\b`),
+	}
+	root := harnessRoot(t)
+	err := filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if entry.IsDir() {
+			switch entry.Name() {
+			case ".git", "vendor", "docs", "examples", "testdata":
+				if path != root {
+					return filepath.SkipDir
+				}
+			}
+			return nil
+		}
+		if !strings.HasSuffix(path, ".go") {
+			return nil
+		}
+		contents, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		for _, pattern := range patterns {
+			if pattern.Match(contents) {
+				rel, _ := filepath.Rel(root, path)
+				t.Errorf("%s retains removed loop construction vocabulary matching %s", filepath.ToSlash(rel), pattern)
+			}
+		}
 		return nil
 	})
 	if err != nil {

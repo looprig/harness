@@ -95,7 +95,7 @@ type SessionMeta struct {
 	// Status is the session's lifecycle phase (active until SessionStopped -> stopped).
 	Status SessionStatus `json:"status,omitempty"`
 	// AgentKind names the agent role (from SessionStarted's ConfigFingerprint). It is
-	// passthrough: empty until the agent threads its kind through loop.Config.
+	// passthrough: empty until the agent threads its kind through loop.Definition.
 	AgentKind string `json:"agent_kind,omitempty"`
 	// LoopCount is the number of loops registered in the session: the primary plus one
 	// per LoopStarted.

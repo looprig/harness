@@ -143,7 +143,7 @@ func setHeader(t *testing.T, ev event.Event, hdr event.Header) event.Event {
 	}
 }
 
-// restoreCfg is the loop.Config both the original run AND the restore use. A System
+// restoreCfg is the loop.Definition both the original run AND the restore use. A System
 // prompt + model id make the config fingerprint non-empty, so match/mismatch is real.
 func restoreCfg(client inference.Client, model, system string) loop.Definition {
 	return mustDefine(loop.WithName("agent"), loop.WithInference(client, validModel(model)), loop.WithSystem(system), loop.WithDrainTimeout(200*time.Millisecond))
@@ -245,7 +245,7 @@ func buildOriginalRunNamed(t *testing.T, store *sessionstore.Store, fp event.Con
 	}
 	l, err := loopruntime.New(loopCtx, sessionID, primaryLoopID, loop.Provenance{}, h, bound)
 	if err != nil {
-		t.Fatalf("loop.New: %v", err)
+		t.Fatalf("loopruntime.New: %v", err)
 	}
 
 	var want content.AgenticMessages
@@ -458,7 +458,7 @@ func buildRunWithSubagents(t *testing.T, store *sessionstore.Store, fp event.Con
 	}
 	l, err := loopruntime.New(loopCtx, sessionID, primaryLoopID, loop.Provenance{}, h, bound)
 	if err != nil {
-		t.Fatalf("loop.New: %v", err)
+		t.Fatalf("loopruntime.New: %v", err)
 	}
 
 	// One complete primary turn so the stream is a realistic run.
@@ -798,7 +798,7 @@ func TestRestoreConfigMismatch(t *testing.T) {
 // TestRestoreSwarmFingerprintMismatch proves the fail-secure config check end to end for
 // the injected swarm-level fingerprint fields (AgentKind/RuntimeSkills/WorkspaceRoot): a
 // session persisted under one set of these fields rejects a restore that injects a
-// DIFFERENT value via withTestFingerprintFields — even when the loop.Config (model,
+// DIFFERENT value via withTestFingerprintFields — even when the loop.Definition (model,
 // system, tools) is identical. A mismatch in any one field rejects with
 // *ConfigMismatchError and records a RestoreErrored, unless WithAllowConfigMismatch. This
 // is what stops a session silently resuming under a different skill-trust mode or repo.
@@ -840,7 +840,7 @@ func TestRestoreSwarmFingerprintMismatch(t *testing.T) {
 				restoreCfg(&stubLLM{chunks: []content.Chunk{textChunk("reply")}}, "model-x", "be helpful"), 1)
 			handOver(t, orig.lease)
 
-			// Restore with the SAME loop.Config but a DIFFERENT injected swarm field → reject.
+			// Restore with the SAME loop.Definition but a DIFFERENT injected swarm field → reject.
 			s, err := restoreTestSession(context.Background(), cfg, orig.sessionID, store,
 				withTestFingerprintFields(tt.liveField))
 			if s != nil {

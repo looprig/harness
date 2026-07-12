@@ -147,10 +147,10 @@ func TestCodexForeignRestoreFailsClosedWithoutSIDSource(t *testing.T) {
 	}
 }
 
-// TestForeignRestore covers buildRestoredSession's Engine switch: a foreign cfg.Engine
+// TestForeignRestore covers buildRestoredSession's Engine switch: a foreign definition
 // reconstructs the primary loop through the wired RestoredBuilder, carrying the recovered
 // foreign sid into the seed; an empty recovered sid (or a missing restored builder) fails
-// closed; a native cfg restores through loop.NewRestored unchanged.
+// closed; a native definition restores through loopruntime.NewRestored unchanged.
 func TestForeignRestore(t *testing.T) {
 	t.Parallel()
 

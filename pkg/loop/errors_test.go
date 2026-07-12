@@ -12,8 +12,8 @@ func TestConfigError(t *testing.T) {
 		err  error
 		want string
 	}{
-		{"missing client", &ConfigError{Kind: ConfigMissingClient}, "loop: config error: Config.Client is required"},
-		{"invalid model", &ConfigError{Kind: ConfigInvalidModel}, "loop: config error: Config.Model invalid"},
+		{"missing client", &ConfigError{Kind: ConfigMissingClient}, "loop: runtime binding error: inference client is required"},
+		{"invalid model", &ConfigError{Kind: ConfigInvalidModel}, "loop: runtime binding error: model is invalid"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

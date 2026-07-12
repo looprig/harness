@@ -29,7 +29,11 @@
 //			WorkspaceRoot: w, AdapterID: "claude", Posture: "default",
 //		}),
 //	}
-//	// then cfg.Engine = loop.EngineForeignClaude for the agents that should run foreign.
+//	definition, _ := loop.Define(
+//		loop.WithName("claude"),
+//		loop.WithEngine(loop.EngineForeignClaude),
+//		// inference, system, tools, and other definition options...
+//	)
 //
 // The cwd (WorkspaceRoot), adapter id, and posture are fingerprinted so foreign and
 // native runs key distinct state; the exec path and the (non-secret) env are

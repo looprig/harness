@@ -172,10 +172,10 @@ func firstLoopStarted(r *recordingEventAppender) (event.LoopStarted, bool) {
 	return event.LoopStarted{}, false
 }
 
-// TestForeignNewLoop covers the newLoop Engine switch: a foreign cfg.Engine routes
+// TestForeignNewLoop covers the newLoop Engine switch: a foreign definition routes
 // construction through the wired Builder and stamps its sid onto the published
-// LoopStarted; a foreign cfg.Engine with NO wired Builder fails closed; a native cfg is
-// unaffected (built by loop.New, LoopStarted.ForeignSID empty).
+// LoopStarted; a foreign definition with NO wired Builder fails closed; a native definition is
+// unaffected (built by loopruntime.New, LoopStarted.ForeignSID empty).
 func TestForeignNewLoop(t *testing.T) {
 	t.Parallel()
 	tests := []struct {

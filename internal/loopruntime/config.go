@@ -84,7 +84,7 @@ type runtimeConfig struct {
 
 	// Engine selects the loop backend. Zero = EngineNative (the historical path).
 	// Foreign engines route construction through the injected foreign Builder at
-	// the session composition root; loop.New itself only ever builds native.
+	// the session composition root; New itself only ever builds native.
 	Engine loop.Engine
 
 	// Tools is the runner's view of the tool subsystem (the consumer surface in

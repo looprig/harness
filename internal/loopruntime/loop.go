@@ -280,7 +280,7 @@ func newLoopWithSeed(loopCtx context.Context, sessionID, loopID uuid.UUID, paren
 		// so a post-construction swap is honored), the loop intentionally FREEZES its
 		// id-gen + clock into the Factory here at construction: cfg.idGen/cfg.now are
 		// captured by value, so a later mutation of cfg is NOT honored. A test pins the
-		// stamp by injecting idGen/now (or a whole eventFactory) BEFORE loop.New.
+		// stamp by injecting idGen/now (or a whole eventFactory) BEFORE New.
 		// idGenerator and event.IDGen are the same underlying func type but distinct
 		// named types, so the conversion is explicit.
 		cfg.eventFactory = event.NewFactory(event.IDGen(cfg.idGen), cfg.now)

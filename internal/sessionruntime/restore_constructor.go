@@ -663,8 +663,8 @@ func buildRestoredSession(
 	// Seed the primary loop under its ORIGINAL id (identity stable), coming up idle with
 	// the folded committed history + turnIndex. No empty loop is spawned and no
 	// LoopStarted is published — the loop already exists in the durable record. The Engine
-	// switch mirrors newLoop's: a native cfg.Engine seeds through loop.NewRestored exactly
-	// as before; a foreign cfg.Engine reconstructs through the injected RestoredBuilder,
+	// switch mirrors newLoop's: a native bound definition seeds through
+	// loopruntime.NewRestored; a foreign engine reconstructs through the injected RestoredBuilder,
 	// carrying the recovered foreign session id. It fails CLOSED on an empty recovered sid
 	// (the foreign session could not be --resumed) or a missing builder (never silently
 	// rebuild the primary as a native loop). Every error path cancels the loopCtx and the

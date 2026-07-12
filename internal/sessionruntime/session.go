@@ -101,7 +101,7 @@ type Session struct {
 	// quota-counted NewLoop path (the primary loop, built by New, does NOT count). It is
 	// the quota's reservation counter: NewLoop reserves a slot (spawned++) under loopsMu
 	// once the depth + quota + closing/faulted checks pass, and ROLLS BACK (spawned--)
-	// under the same lock on every later failure (id-mint, loop.New, the registration-time
+	// under the same lock on every later failure (id-mint, loopruntime.New, the registration-time
 	// closing re-check, publish failure). Restore re-seeds it by counting the durable
 	// non-root LoopStarted events, so the quota survives a restart. Guarded by loopsMu.
 	spawned int
@@ -174,9 +174,9 @@ type Session struct {
 	// foreignBuild and foreignBuildRestored are the composition-root seams newLoop and
 	// the restore path use to construct a foreign-engine loop (live + restored). They are
 	// wired via WithForeignBuilders; nil (the default) means foreign engines are not
-	// supported, so a foreign cfg.Engine fails closed (SessionForeignBuilderMissing /
+	// supported, so a foreign-engine definition fails closed (SessionForeignBuilderMissing /
 	// RestoreForeignBuilderMissing). The session depends only on these narrow function
-	// seams, never on the foreignloop concrete loop (Dependency Inversion): loop.New
+	// seams, never on the foreignloop concrete loop (Dependency Inversion): loopruntime.New
 	// itself only ever builds native, and the foreign backend is injected here.
 	foreignBuild         foreignloop.Builder
 	foreignBuildRestored foreignloop.RestoredBuilder
@@ -534,7 +534,7 @@ type eventSubscriber interface {
 }
 
 // Compile-time proof that *Session is the consumer-facing eventSubscriber.
-// Its publisher half (PublishEvent) is asserted by loop.New accepting s as its
+// Its publisher half (PublishEvent) is asserted by loopruntime.New accepting s as its
 // eventPublisher at the NewLoop call site.
 var _ eventSubscriber = (*Session)(nil)
 
@@ -626,7 +626,7 @@ func (s *Session) FaultErr() error {
 // Session submit check→send race without changing the narrower change-event FaultErr seam.
 func (s *Session) AdmissionFaultErr() error { return s.faultIfFaulted() }
 
-// PublishEvent is the session's eventPublisher implementation passed to loop.New.
+// PublishEvent is the session's eventPublisher implementation passed to loopruntime.New.
 // It delegates to the hub, which fans the event out to matching subscribers and
 // applies any quiescence transition the event implies. The loop depends only on
 // the narrow eventPublisher interface; it never sees the hub, its subscriber set,
@@ -927,7 +927,7 @@ func (s *Session) deliverSubagentResult(ctx context.Context, parentLoopID, fromL
 // NewLoop creates another loop inside this session. The new loop shares
 // SessionID but receives its own loop id and loop goroutine. parent is the
 // provenance of the spawning turn/step (zero for the primary loop); the session
-// records it in the registry and passes it to loop.New. The session stores the
+// records it in the registry and passes it to loopruntime.New. The session stores the
 // loop handle and returns only the loop id, because callers route through
 // session methods rather than writing to a loop command channel directly.
 func (s *Session) NewLoop(parent loop.Provenance, cfg loop.Definition) (uuid.UUID, error) {
@@ -999,7 +999,7 @@ func (s *Session) newLoopWithAdmission(parent loop.Provenance, cfg loop.Definiti
 	s.loopsMu.Unlock()
 
 	// release rolls back the quota reservation made above. It is called on EVERY failure
-	// path after the reservation (id mint, loop.New, the registration-time closing/faulted
+	// path after the reservation (id mint, loopruntime.New, the registration-time closing/faulted
 	// re-check, and publish failure) ALONGSIDE the loop's cancel(), so a spawn that does
 	// not complete never permanently consumes a slot. It is a no-op when this spawn did not
 	// reserve (the primary / a zero-parent spawn). A SUCCESSFUL spawn never calls it, so
@@ -1078,7 +1078,7 @@ func (s *Session) newLoopWithAdmission(parent loop.Provenance, cfg loop.Definiti
 	// preserves; only EventID + CreatedAt are added.
 	startedHeader, err := s.factory.Stamp(event.Header{
 		Coordinates: identity.Coordinates{SessionID: s.sessionID, LoopID: loopID},
-		// AgentName is the loop's immutable attribution name, stamped from its Config so
+		// AgentName is the loop's immutable attribution name, stamped from its definition so
 		// the durable LoopStarted records which agent drove this loop. Empty for a plain
 		// loop; the primary loop carries its configured name through this same path.
 		AgentName: bound.Name(),
@@ -1093,9 +1093,9 @@ func (s *Session) newLoopWithAdmission(parent loop.Provenance, cfg loop.Definiti
 	}
 
 	// Engine switch — the single loop-construction chokepoint for BOTH the primary loop
-	// (built via newSession → NewLoop with zero provenance) and every subagent. A native
-	// cfg.Engine (the zero value) builds through loop.New exactly as before. A foreign
-	// cfg.Engine routes to the injected foreign Builder seam and fails CLOSED if none is
+	// (built via newSession → NewLoop with zero provenance) and every subagent. A
+	// definition bound to EngineNative builds through loopruntime.New. A foreign engine
+	// routes to the injected foreign Builder seam and fails CLOSED if none is
 	// wired (a foreign engine must never silently resolve to a native loop). The minted
 	// foreign sid the builder returns is stamped onto the published LoopStarted below;
 	// it is "" for native (omitzero drops it). Every failure path rolls back the quota
@@ -1306,7 +1306,7 @@ func New(ctx context.Context, cfg loop.Definition, opts ...Option) (*Session, er
 	// unexported core that lets a same-package test inject a failing newID (or a
 	// pinned now) that is IN EFFECT during the construction-time SessionStarted
 	// stamp — the only way to exercise New's mint-error failure branch — mirroring
-	// how the loop injects idGen/now via Config before loop.New. opts are the optional
+	// how the loop injects idGen/now into its private runtime state before construction. opts are the optional
 	// dependency injections (e.g. WithCommandAppender) the composition root supplies.
 	return newSession(ctx, cfg, uuid.New, time.Now, opts...)
 }

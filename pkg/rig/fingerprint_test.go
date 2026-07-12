@@ -46,7 +46,7 @@ func (t fpTool) InvokableRun(ctx context.Context, argsJSON string) (*tool.ToolRe
 	return tool.TextResult(""), nil
 }
 
-// fpConfig builds a loop.Config with the given model, system prompt, and tool
+// fpConfig builds a loop.Definition with the given model, system prompt, and tool
 // names so a test can vary exactly one fingerprint input at a time.
 func fpConfig(model, system string, toolNames ...string) loop.Definition {
 	defs := make([]tool.Definition, 0, len(toolNames))
@@ -83,10 +83,10 @@ func fingerprintWithDefinition(d loop.Definition, fields ConfigFingerprintFields
 // with (a change would make every existing session fail its restore comparison). The
 // three golden strings are computed INDEPENDENTLY of this package's code, exactly as
 // the pre-refactor derivation did:
-//   - ModelID is the model id verbatim (old cfg.Model.Model, now cfg.Model.Name — the
-//     SAME string), so it stays "gpt-4o-2024".
-//   - SystemPromptRev is sha256hex of the system prompt (old cfg.Model.System, now
-//     cfg.System — the SAME string): sha256("You are a helpful assistant.").
+//   - ModelID is the selected bound model's Name verbatim, so it stays
+//     "gpt-4o-2024".
+//   - SystemPromptRev is sha256hex of the bound definition's effective system prompt:
+//     sha256("You are a helpful assistant.").
 //   - ToolPolicyRev is sha256hex of the sorted tool names joined by "\n":
 //     sha256("Read\nWrite") (unchanged by this refactor).
 //
@@ -224,27 +224,27 @@ func TestFingerprintSystemRevisionIncludesInitialModeInstructions(t *testing.T) 
 }
 
 // TestFingerprintFromSwarmFieldsEmpty pins that FingerprintFrom derives ONLY the
-// loop.Config fields: the swarm-level fields (AgentKind, RuntimeSkills, WorkspaceRoot)
-// are NOT on loop.Config, so a bare FingerprintFrom leaves them empty/zero — they are
+// loop.Definition fields: the swarm-level fields (AgentKind, RuntimeSkills, WorkspaceRoot)
+// are NOT on loop.Definition, so a bare FingerprintFrom leaves them empty/zero — they are
 // injected by the composition root via WithFingerprintFields and merged with
 // fingerprintWith.
 func TestFingerprintFromSwarmFieldsEmpty(t *testing.T) {
 	t.Parallel()
 	fp := fingerprintFromDefinition(fpConfig("model-x", "prompt", "Read"))
 	if fp.AgentKind != "" {
-		t.Errorf("AgentKind = %q, want \"\" (not a loop.Config field)", fp.AgentKind)
+		t.Errorf("AgentKind = %q, want \"\" (not a loop.Definition field)", fp.AgentKind)
 	}
 	if fp.RuntimeSkills {
-		t.Error("RuntimeSkills = true, want false (not a loop.Config field)")
+		t.Error("RuntimeSkills = true, want false (not a loop.Definition field)")
 	}
 	if fp.WorkspaceRoot != "" {
-		t.Errorf("WorkspaceRoot = %q, want \"\" (not a loop.Config field)", fp.WorkspaceRoot)
+		t.Errorf("WorkspaceRoot = %q, want \"\" (not a loop.Definition field)", fp.WorkspaceRoot)
 	}
 }
 
 // TestFingerprintWithMergesSwarmFields asserts fingerprintWith applies the injected
 // swarm-level fields onto the loop-derived fingerprint, and that a difference in ANY
-// one of them (AgentKind, RuntimeSkills, WorkspaceRoot) alone — same loop.Config —
+// one of them (AgentKind, RuntimeSkills, WorkspaceRoot) alone — same loop.Definition —
 // yields an unequal fingerprint. This is what makes a restore reject a session resuming
 // under a different agent identity, skill-trust mode, or workspace.
 func TestFingerprintWithMergesSwarmFields(t *testing.T) {
@@ -299,7 +299,7 @@ func TestFingerprintWithMergesSwarmFields(t *testing.T) {
 // TestFingerprintWithForeignFields asserts a foreign loop's fingerprint dimensions —
 // cwd (folded into WorkspaceRoot), adapter identity (AdapterID), and permission posture
 // (Posture) — are all inputs to fingerprintWith: same fields yield an Equal fingerprint,
-// and a change in ANY one alone (same loop.Config) yields an unequal one. This is what
+// and a change in ANY one alone (same loop.Definition) yields an unequal one. This is what
 // makes a restore reject a foreign session resuming under a different working directory,
 // adapter, or permission posture.
 //
@@ -368,7 +368,7 @@ func TestFingerprintWithForeignFields(t *testing.T) {
 
 // TestFingerprintWithExecAndEnvNotInputs pins that the foreign loop's exec path and
 // child env are NOT fingerprinted (they are permitted to drift across a restore and are
-// log-only). fingerprintWith's only inputs are the loop.Config and ConfigFingerprintFields;
+// log-only). fingerprintWith's only inputs are the loop.Definition and ConfigFingerprintFields;
 // there is no exec-path or env field, so two fingerprints over the same cfg + same fields
 // are Equal regardless of any exec-path/env change that happened out of band.
 func TestFingerprintWithExecAndEnvNotInputs(t *testing.T) {
@@ -536,7 +536,7 @@ func TestTopologyRevisionIncludesNoninitialModeProducedToolMetadata(t *testing.T
 
 // TestSessionStartedCarriesConfig is the end-to-end proof that the construction-time
 // SessionStarted the session publishes carries a non-empty Config derived from the
-// loop.Config. The construction-time event is unobservable by a late subscriber (the
+// loop.Definition. The construction-time event is unobservable by a late subscriber (the
 // hub has no replay), so this asserts the wiring two ways: (1) FingerprintFrom over
 // the construction cfg is non-empty, and (2) a SessionStarted published through the
 // session's own hub with that Config is delivered to a subscriber carrying the

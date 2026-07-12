@@ -278,14 +278,14 @@ func foreignSubLoopStarted(r *recordingEventAppender, primary uuid.UUID) (event.
 	return event.LoopStarted{}, false
 }
 
-// foreignPrimaryCfg builds a foreign-engine loop.Config for a primary loop. cfg() seeds a
-// usable native cfg; the foreign engine ignores Client, but System is required by
+// foreignPrimaryCfg builds a foreign-engine loop.Definition for a primary loop. The helper seeds
+// a usable native definition; the foreign engine ignores inference, but a system prompt is required by
 // the foreign actor's wiring validation.
 func foreignPrimaryCfg() loop.Definition {
 	return engineCfg(&stubLLM{chunks: []content.Chunk{textChunk("unused")}}, loop.EngineForeignClaude, "sys")
 }
 
-// foreignSubCfg builds the FRESH foreign-engine cfg a RunSubagent call passes for its
+// foreignSubCfg builds the fresh foreign-engine definition a RunSubagent call passes for its
 // sub-loop (a foreign loop needs only Engine + System).
 func foreignSubCfg() loop.Definition {
 	return engineCfg(&stubLLM{}, loop.EngineForeignClaude, "sys")

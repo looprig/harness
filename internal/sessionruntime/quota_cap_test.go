@@ -121,7 +121,7 @@ func TestNewLoopQuotaConcurrent(t *testing.T) {
 }
 
 // TestNewLoopQuotaRollback proves a rolled-back spawn releases its quota reservation: a
-// forced loop.New failure (a nil-Client cfg fails loop.New's validation AFTER the
+// forced loopruntime.New failure (a nil-Client cfg fails loopruntime.New's validation AFTER the
 // reservation) decrements spawned, so a later valid spawn still succeeds within the
 // quota. Without rollback, the failed spawn would permanently consume a slot.
 func TestNewLoopQuotaRollback(t *testing.T) {
@@ -135,7 +135,7 @@ func TestNewLoopQuotaRollback(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = s.Shutdown(context.Background()) })
 
-	// A nil-Client cfg fails loop.New's Config validation synchronously (after the
+	// A nil-Client cfg fails loopruntime.New's runtime binding validation synchronously (after the
 	// reservation), forcing the rollback path. Repeat MORE than `quota` times: without
 	// rollback the quota would be exhausted by these failures and the valid spawns below
 	// would be wrongly refused.

@@ -181,7 +181,7 @@ func WithFingerprint(fingerprint event.ConfigFingerprint) Option {
 }
 
 // WithForeignBuilders wires the composition-root seam that constructs foreign-engine
-// loops (live + restored). Without it, a foreign cfg.Engine fails closed at newLoop
+// loops (live + restored). Without it, a foreign-engine definition fails closed at newLoop
 // (SessionForeignBuilderMissing) and at restore (RestoreForeignBuilderMissing) — a
 // foreign engine never silently resolves to a native loop. The two seams travel
 // together (a live build and a restored build of the same agent), so they are wired as
