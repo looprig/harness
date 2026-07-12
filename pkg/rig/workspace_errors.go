@@ -6,6 +6,7 @@ import "github.com/looprig/harness/pkg/session"
 // rig composition surface while remaining canonical session lifecycle errors.
 type WorkspaceRootBusyError = session.WorkspaceRootBusyError
 type WorkspaceRootLeaseLostError = session.WorkspaceRootLeaseLostError
+type WorkspaceRecoveryError = session.WorkspaceRecoveryError
 
 // workspace_errors.go defines the typed failures the placement options and their
 // Define-time validation raise (design §"Optional workspace lifecycle"). Every failure is

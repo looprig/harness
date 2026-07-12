@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/workspacestore"
@@ -136,29 +137,123 @@ func (p WorkspacePlacement) rootFor(sid uuid.UUID) (string, error) {
 // backup left by a crash between the two renames of a prior swap. It never touches the
 // root when the root already exists (the common warm-start path).
 func recoverSessionRoot(root string) error {
+	parent := filepath.Dir(root)
+	if err := establishCanonicalDirectory(parent); err != nil {
+		return err
+	}
 	staging := sessionStagingPath(root)
 	backup := sessionBackupPath(root)
 	if err := removeIfExists(staging); err != nil {
-		return &WorkspaceRecoveryError{Path: staging, Cause: err}
+		return &WorkspaceRecoveryError{Path: staging, Reason: "remove abandoned staging", Cause: err}
 	}
-	if pathExists(root) {
+	rootInfo, rootErr := os.Lstat(root)
+	switch {
+	case rootErr == nil:
+		if err := requireRealDirectory(root, rootInfo); err != nil {
+			return err
+		}
 		// Root present: a leftover backup is stale history; remove it.
-		if err := removeIfExists(backup); err != nil {
-			return &WorkspaceRecoveryError{Path: backup, Cause: err}
+		backupInfo, err := os.Lstat(backup)
+		if err == nil {
+			if err := requireRealDirectory(backup, backupInfo); err != nil {
+				return err
+			}
+			if err := os.RemoveAll(backup); err != nil {
+				return &WorkspaceRecoveryError{Path: backup, Reason: "remove stale backup", Cause: err}
+			}
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return &WorkspaceRecoveryError{Path: backup, Reason: "inspect stale backup", Cause: err}
 		}
 		return nil
+	case !errors.Is(rootErr, os.ErrNotExist):
+		return &WorkspaceRecoveryError{Path: root, Reason: "inspect live root", Cause: rootErr}
 	}
-	if pathExists(backup) {
+
+	backupInfo, backupErr := os.Lstat(backup)
+	switch {
+	case backupErr == nil:
+		if err := requireRealDirectory(backup, backupInfo); err != nil {
+			return err
+		}
+		if err := establishCanonicalDirectory(parent); err != nil {
+			return err
+		}
 		if err := os.Rename(backup, root); err != nil {
-			return &WorkspaceRecoveryError{Path: backup, Cause: err}
+			return &WorkspaceRecoveryError{Path: backup, Reason: "restore orphaned backup", Cause: err}
 		}
-		return nil
+		return revalidateRealDirectory(root)
+	case !errors.Is(backupErr, os.ErrNotExist):
+		return &WorkspaceRecoveryError{Path: backup, Reason: "inspect orphaned backup", Cause: backupErr}
 	}
+
 	// A brand-new per-session placement has neither a live root nor a backup.
-	// Create the empty root now so tools and an automatic idle checkpoint both
-	// operate on a real directory before any seed or turn exists.
-	if err := os.MkdirAll(root, 0o700); err != nil {
-		return &WorkspaceRecoveryError{Path: root, Cause: err}
+	// The canonical parent is established above; create ONLY the final UUID
+	// component exclusively so an attacker cannot substitute a destination.
+	if err := establishCanonicalDirectory(parent); err != nil {
+		return err
+	}
+	if err := os.Mkdir(root, 0o700); err != nil && !errors.Is(err, os.ErrExist) {
+		return &WorkspaceRecoveryError{Path: root, Reason: "create live root", Cause: err}
+	}
+	return revalidateRealDirectory(root)
+}
+
+func requireRealDirectory(path string, info os.FileInfo) error {
+	if info.Mode()&os.ModeSymlink != 0 {
+		return &WorkspaceRecoveryError{Path: path, Reason: "symlink is not an allowed workspace directory"}
+	}
+	if !info.IsDir() {
+		return &WorkspaceRecoveryError{Path: path, Reason: "path is not a directory"}
+	}
+	return nil
+}
+
+func revalidateRealDirectory(path string) error {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return &WorkspaceRecoveryError{Path: path, Reason: "revalidate directory", Cause: err}
+	}
+	return requireRealDirectory(path, info)
+}
+
+// establishCanonicalDirectory creates missing components one at a time and
+// rejects every symlink/non-directory component. The final EvalSymlinks equality
+// check detects stable parent substitution relative to the canonical path frozen
+// by rig.Define.
+func establishCanonicalDirectory(path string) error {
+	clean := filepath.Clean(path)
+	volume := filepath.VolumeName(clean)
+	remainder := strings.TrimPrefix(clean, volume)
+	separator := string(os.PathSeparator)
+	if !strings.HasPrefix(remainder, separator) {
+		return &WorkspaceRecoveryError{Path: path, Reason: "base parent is not absolute"}
+	}
+	current := volume + separator
+	for _, component := range strings.Split(strings.TrimPrefix(remainder, separator), separator) {
+		if component == "" {
+			continue
+		}
+		current = filepath.Join(current, component)
+		info, err := os.Lstat(current)
+		if errors.Is(err, os.ErrNotExist) {
+			if err := os.Mkdir(current, 0o700); err != nil && !errors.Is(err, os.ErrExist) {
+				return &WorkspaceRecoveryError{Path: current, Reason: "establish canonical base parent", Cause: err}
+			}
+			info, err = os.Lstat(current)
+		}
+		if err != nil {
+			return &WorkspaceRecoveryError{Path: current, Reason: "inspect canonical base parent", Cause: err}
+		}
+		if err := requireRealDirectory(current, info); err != nil {
+			return err
+		}
+	}
+	resolved, err := filepath.EvalSymlinks(clean)
+	if err != nil {
+		return &WorkspaceRecoveryError{Path: clean, Reason: "resolve canonical base parent", Cause: err}
+	}
+	if resolved != clean {
+		return &WorkspaceRecoveryError{Path: clean, Reason: "base parent no longer matches its canonical definition"}
 	}
 	return nil
 }
@@ -271,20 +366,3 @@ type PlacementResolutionError struct {
 func (e *PlacementResolutionError) Error() string {
 	return "sessionruntime: invalid workspace placement: " + e.Reason
 }
-
-// WorkspaceRecoveryError reports that per-session startup recovery could not remove an
-// abandoned staging directory or restore an orphaned backup. Path is the offending path.
-type WorkspaceRecoveryError struct {
-	Path  string
-	Cause error
-}
-
-func (e *WorkspaceRecoveryError) Error() string {
-	msg := "sessionruntime: workspace recovery failed: " + e.Path
-	if e.Cause != nil {
-		msg += ": " + e.Cause.Error()
-	}
-	return msg
-}
-
-func (e *WorkspaceRecoveryError) Unwrap() error { return e.Cause }

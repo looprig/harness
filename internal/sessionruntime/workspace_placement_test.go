@@ -109,7 +109,7 @@ func TestRecoverSessionRoot(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			base := t.TempDir()
+			base := realTempDir(t)
 			root := filepath.Join(base, "ws")
 			tt.setup(t, root)
 			if err := recoverSessionRoot(root); err != nil {
@@ -131,6 +131,131 @@ func TestRecoverSessionRoot(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestRecoverSessionRootCreatesFinalDirectoryExclusively(t *testing.T) {
+	base := realTempDir(t)
+	root := filepath.Join(base, "session-id")
+	if err := recoverSessionRoot(root); err != nil {
+		t.Fatalf("recoverSessionRoot: %v", err)
+	}
+	info, err := os.Lstat(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm() != 0o700 {
+		t.Fatalf("created root mode = %v, want real directory 0700", info.Mode())
+	}
+}
+
+func TestRecoverSessionRootRejectsUnsafeDestinationsWithoutOutsideMutation(t *testing.T) {
+	tests := []struct {
+		name  string
+		setup func(t *testing.T) (root, protected string)
+	}{
+		{
+			name: "existing root symlink",
+			setup: func(t *testing.T) (string, string) {
+				base, outside := realTempDir(t), realTempDir(t)
+				protected := filepath.Join(outside, "sentinel")
+				mustWriteFile(t, protected, "outside")
+				root := filepath.Join(base, "session-id")
+				if err := os.Symlink(outside, root); err != nil {
+					t.Fatal(err)
+				}
+				return root, protected
+			},
+		},
+		{
+			name: "existing root regular file",
+			setup: func(t *testing.T) (string, string) {
+				root := filepath.Join(realTempDir(t), "session-id")
+				mustWriteFile(t, root, "do not replace")
+				return root, root
+			},
+		},
+		{
+			name: "orphan backup symlink",
+			setup: func(t *testing.T) (string, string) {
+				base, outside := realTempDir(t), realTempDir(t)
+				protected := filepath.Join(outside, "sentinel")
+				mustWriteFile(t, protected, "outside")
+				root := filepath.Join(base, "session-id")
+				if err := os.Symlink(outside, sessionBackupPath(root)); err != nil {
+					t.Fatal(err)
+				}
+				return root, protected
+			},
+		},
+		{
+			name: "orphan backup regular file",
+			setup: func(t *testing.T) (string, string) {
+				root := filepath.Join(realTempDir(t), "session-id")
+				backup := sessionBackupPath(root)
+				mustWriteFile(t, backup, "do not rename")
+				return root, backup
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			root, protected := tt.setup(t)
+			err := recoverSessionRoot(root)
+			var recovery *WorkspaceRecoveryError
+			if !errors.As(err, &recovery) || recovery.Path == "" || recovery.Reason == "" {
+				t.Fatalf("recover error = %T %v, want typed unsafe recovery error", err, err)
+			}
+			if _, err := os.Lstat(protected); err != nil {
+				t.Fatalf("protected outside/path mutated: %v", err)
+			}
+		})
+	}
+}
+
+func TestRecoverSessionRootRejectsBaseParentSymlinkSubstitution(t *testing.T) {
+	holder, outside := realTempDir(t), realTempDir(t)
+	base := filepath.Join(holder, "base")
+	if err := os.Symlink(outside, base); err != nil {
+		t.Fatal(err)
+	}
+	root := filepath.Join(base, "session-id")
+	err := recoverSessionRoot(root)
+	var recovery *WorkspaceRecoveryError
+	if !errors.As(err, &recovery) || recovery.Path != base || recovery.Reason == "" {
+		t.Fatalf("recover error = %T %v, want parent substitution refusal", err, err)
+	}
+	if _, err := os.Lstat(filepath.Join(outside, "session-id")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("outside session path was created: %v", err)
+	}
+}
+
+func TestRecoverSessionRootRemovesStagingSymlinkOnly(t *testing.T) {
+	base, outside := realTempDir(t), realTempDir(t)
+	root := filepath.Join(base, "session-id")
+	mustMkdir(t, root)
+	protected := filepath.Join(outside, "sentinel")
+	mustWriteFile(t, protected, "outside")
+	if err := os.Symlink(outside, sessionStagingPath(root)); err != nil {
+		t.Fatal(err)
+	}
+	if err := recoverSessionRoot(root); err != nil {
+		t.Fatalf("recoverSessionRoot: %v", err)
+	}
+	if pathExists(sessionStagingPath(root)) {
+		t.Fatal("staging symlink survived recovery")
+	}
+	if _, err := os.Lstat(protected); err != nil {
+		t.Fatalf("staging symlink target mutated: %v", err)
+	}
+}
+
+func realTempDir(t *testing.T) string {
+	t.Helper()
+	resolved, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return resolved
 }
 
 func TestRootIsEmpty(t *testing.T) {

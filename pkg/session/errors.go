@@ -208,3 +208,25 @@ type WorkspaceRootLeaseLostError struct{}
 func (*WorkspaceRootLeaseLostError) Error() string {
 	return "session: workspace root lease lost"
 }
+
+// WorkspaceRecoveryError reports that a per-session workspace destination could
+// not be established or recovered safely. Path identifies the refused filesystem
+// object, Reason is a stable diagnostic, and Cause preserves any syscall failure.
+type WorkspaceRecoveryError struct {
+	Path   string
+	Reason string
+	Cause  error
+}
+
+func (e *WorkspaceRecoveryError) Error() string {
+	msg := "session: unsafe workspace recovery destination: " + e.Path
+	if e.Reason != "" {
+		msg += ": " + e.Reason
+	}
+	if e.Cause != nil {
+		msg += ": " + e.Cause.Error()
+	}
+	return msg
+}
+
+func (e *WorkspaceRecoveryError) Unwrap() error { return e.Cause }
