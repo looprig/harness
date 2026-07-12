@@ -526,6 +526,20 @@ func (h *Hub) StopSession(ctx context.Context) {
 	h.deliver(subs, ev, seq)
 }
 
+// AbortSession tears down an unpublished/failed construction without appending or
+// delivering the normal durable SessionStopped lifecycle event.
+func (h *Hub) AbortSession(cause error) {
+	h.mu.Lock()
+	h.state.active = make(map[activityKey]struct{})
+	h.state.phase = SessionStopped
+	h.wakeWaitersLocked(cause)
+	subs := h.snapshotSubsLocked()
+	h.mu.Unlock()
+	for _, sub := range subs {
+		sub.fail(cause)
+	}
+}
+
 // WaitIdle blocks until the session is quiescent (active empty), ctx is done, or
 // the session stops. It returns nil on idle, ctx.Err() on cancellation, and
 // ErrSessionStopped if the session is or becomes stopped. With no session

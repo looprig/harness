@@ -48,6 +48,26 @@ func fingerprintWith(definition loop.BoundDefinition, fields ConfigFingerprintFi
 
 func fingerprintWithTopology(definition loop.BoundDefinition, fields ConfigFingerprintFields, definitions []loop.Definition, primers []string, active string) event.ConfigFingerprint {
 	fingerprint := fingerprintWith(definition, fields)
+	fingerprint.TopologyRev = topologyRevision(definitions, primers, active)
+	return fingerprint
+}
+
+// frozenFingerprint is the rig-time compatibility projection. It depends only on
+// immutable definitions and scalar rig fields, so restore can compare it immediately
+// after replay without constructing workspace or loop collaborators.
+func frozenFingerprint(fields ConfigFingerprintFields, definitions []loop.Definition, primers []string, active string) event.ConfigFingerprint {
+	return event.ConfigFingerprint{
+		TopologyRev:               topologyRevision(definitions, primers, active),
+		AgentKind:                 fields.AgentKind,
+		RuntimeSkills:             fields.RuntimeSkills,
+		WorkspaceRoot:             fields.WorkspaceRoot,
+		AgentAdapter:              fields.AdapterID,
+		PermissionPosture:         fields.Posture,
+		NativePermissionPolicyRev: fields.NativePermissionPolicyRev,
+	}
+}
+
+func topologyRevision(definitions []loop.Definition, primers []string, active string) string {
 	var material strings.Builder
 	orderedDefinitions := append([]loop.Definition(nil), definitions...)
 	sort.Slice(orderedDefinitions, func(i, j int) bool { return orderedDefinitions[i].Name() < orderedDefinitions[j].Name() })
@@ -73,8 +93,7 @@ func fingerprintWithTopology(definition loop.BoundDefinition, fields ConfigFinge
 	}
 	material.WriteString("active:")
 	material.WriteString(active)
-	fingerprint.TopologyRev = hexSHA256(material.String())
-	return fingerprint
+	return hexSHA256(material.String())
 }
 
 func hexSHA256(value string) string {

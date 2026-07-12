@@ -91,15 +91,15 @@ func (s *Session) CheckpointWorkspace(ctx context.Context) (workspacestore.Ref, 
 
 // recordSeedCheckpoint journals a WorkspaceCheckpointed for the materialized seed ref as
 // the session's FIRST workspace checkpoint (design §"Seeding"). It is Enduring, so it
-// flows through the hub's required durable tap: on append failure the session faults and
-// the caller (Lifecycle.NewSession) shuts the session down. Trigger=Seed carries a zero
-// Cause; Consistency is Quiescent (a seed materializes into an empty, unmutated root).
+// flows through the hub's checked durable tap: on append failure the construction
+// transaction aborts before any LoopStarted. Trigger=Seed carries a zero Cause;
+// Consistency is Quiescent (a seed materializes into an empty, unmutated root).
 func (s *Session) recordSeedCheckpoint(ctx context.Context, ref workspacestore.Ref) error {
 	stamped, err := s.factory.Stamp(event.Header{Coordinates: identity.Coordinates{SessionID: s.sessionID}})
 	if err != nil {
 		return &SessionError{Kind: SessionIDGenerationFailed, Cause: err}
 	}
-	if err := s.PublishEvent(ctx, event.WorkspaceCheckpointed{
+	if err := s.PublishEventChecked(ctx, event.WorkspaceCheckpointed{
 		Header:      stamped,
 		Ref:         string(ref),
 		Consistency: event.SnapshotQuiescent,
@@ -108,4 +108,8 @@ func (s *Session) recordSeedCheckpoint(ctx context.Context, ref workspacestore.R
 		return &SessionError{Kind: SessionContextDone, Cause: err}
 	}
 	return nil
+}
+
+func withInitialWorkspaceCheckpoint(ref workspacestore.Ref) Option {
+	return func(s *Session) { s.initialWorkspaceCheckpoint = ref }
 }

@@ -142,7 +142,7 @@ func restoreTopologySession(
 		probe.ceiling = ceiling.New()
 	}
 	allowMismatch := probe.allowConfigMismatch
-	if probe.fingerprint == nil {
+	if probe.fingerprint == nil && probe.frozenFingerprint == nil {
 		return nil, &RestoreError{Kind: RestoreLoopFailed, Cause: &MissingFingerprintProviderError{}}
 	}
 
@@ -214,6 +214,13 @@ func restoreTopologySession(
 	if err != nil {
 		return recordErrored(err)
 	}
+	// A rig supplies a frozen fingerprint, allowing the mismatch decision to happen
+	// immediately after replay and before root acquisition, binding, or reconstruction.
+	if probe.frozenFingerprint != nil {
+		if err := checkFingerprint(persisted, *probe.frozenFingerprint, allowMismatch); err != nil {
+			return recordErrored(err)
+		}
+	}
 	// (4a) Discover every durable root (zero-Cause LoopStarted) and the ordered starts, and
 	// validate that every configured primer maps to a root (single-primer recovery honored
 	// under allowMismatch). (4b) Bind + independently fold every durable loop into a plan
@@ -246,8 +253,10 @@ func restoreTopologySession(
 	if err != nil {
 		return recordErrored(err)
 	}
-	if err := checkFingerprint(persisted, probe.projectFingerprint(activePlan.bound), allowMismatch); err != nil {
-		return recordErrored(err)
+	if probe.frozenFingerprint == nil {
+		if err := checkFingerprint(persisted, probe.projectFingerprint(activePlan.bound), allowMismatch); err != nil {
+			return recordErrored(err)
+		}
 	}
 	primaryLoopID := activePlan.started.LoopID
 	bound := activePlan.bound
@@ -372,7 +381,7 @@ func restoreTopologySession(
 	// durable active selection, and set it as the session primary. Any failure cancels the
 	// session context (tearing down the seeded loops) before recording a RestoreErrored.
 	if err := attachAndActivate(s, all, plans, primaryLoopID); err != nil {
-		sessionCancel()
+		s.abortConstruction(err)
 		return recordErrored(err)
 	}
 	// RestoreDone is the commit point: every loop is bound, crash-closed, built,
@@ -380,7 +389,7 @@ func restoreTopologySession(
 	if err := appendRestoreEvent(ctx, j, factory, event.RestoreDone{
 		Header: event.Header{Coordinates: identity.Coordinates{SessionID: sessionID}},
 	}); err != nil {
-		sessionCancel()
+		s.abortConstruction(err)
 		return recordErrored(&RestoreError{Kind: RestoreAppendFailed, Cause: err})
 	}
 	// Start the exclusive root-lease loss watcher now that the restored session owns the
@@ -617,6 +626,7 @@ func buildRestoredSession(
 	// hub-synthesized session event is stamped from the same seam.
 	appender, err := journal.NewJournalEventAppenderChecked(j)
 	if err != nil {
+		s.abortConstruction(err)
 		return nil, &RestoreError{Kind: RestoreJournalFailed, Cause: err}
 	}
 	hubOpts := []hub.Option{hub.WithAppender(appender), hub.WithFactory(factory), hub.WithFaultReporter(s)}
@@ -650,11 +660,15 @@ func buildRestoredSession(
 	default:
 		if foreignSID == "" {
 			cancel()
-			return nil, &RestoreError{Kind: RestoreForeignSIDMissing}
+			restoreErr := &RestoreError{Kind: RestoreForeignSIDMissing}
+			s.abortConstruction(restoreErr)
+			return nil, restoreErr
 		}
 		if s.foreignBuildRestored == nil {
 			cancel()
-			return nil, &RestoreError{Kind: RestoreForeignBuilderMissing}
+			restoreErr := &RestoreError{Kind: RestoreForeignBuilderMissing}
+			s.abortConstruction(restoreErr)
+			return nil, restoreErr
 		}
 		l, err = s.foreignBuildRestored(loopCtx, sessionID, primaryLoopID, loop.Provenance{}, s, cfg,
 			func() (uuid.UUID, error) { return newID() }, factory,
@@ -662,7 +676,9 @@ func buildRestoredSession(
 	}
 	if err != nil {
 		cancel()
-		return nil, &RestoreError{Kind: RestoreLoopFailed, Cause: err}
+		restoreErr := &RestoreError{Kind: RestoreLoopFailed, Cause: err}
+		s.abortConstruction(restoreErr)
+		return nil, restoreErr
 	}
 	liveMode, liveModel := liveViewFor(cfg, ri)
 	s.loops[primaryLoopID] = &loopHandle{id: primaryLoopID, owner: s, bound: cfg, backend: l, parent: loop.Provenance{}, cancel: cancel, liveMode: liveMode, liveModel: liveModel, state: tool.DelegateStatusIdle}

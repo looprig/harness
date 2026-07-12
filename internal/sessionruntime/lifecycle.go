@@ -5,6 +5,7 @@ import (
 
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/ceiling"
+	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/foreignloop"
 	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/journal"
@@ -130,8 +131,9 @@ type Lifecycle struct {
 	// each Check. When the factory is nil the Lifecycle falls
 	// back to today's behavior — the session default-mints its own internal ceiling state
 	// (whatever cfg carries is untouched).
-	ceilingFactory CeilingFactory
-	fingerprint    FingerprintProvider
+	ceilingFactory    CeilingFactory
+	fingerprint       FingerprintProvider
+	frozenFingerprint *event.ConfigFingerprint
 
 	// placement is the OPTIONAL managed-workspace placement (exclusive/per-session/shared)
 	// resolved per session by NewSession/RestoreSession. The zero value (PlacementNone) means
@@ -176,6 +178,14 @@ func WithLifecycleLimits(l Limits) LifecycleOption {
 func WithLifecycleFingerprintProvider(provider FingerprintProvider) LifecycleOption {
 	return func(r *Lifecycle) {
 		r.fingerprint = provider
+	}
+}
+
+// WithLifecycleFingerprint captures a rig-time frozen compatibility fingerprint.
+func WithLifecycleFingerprint(fingerprint event.ConfigFingerprint) LifecycleOption {
+	return func(r *Lifecycle) {
+		copy := fingerprint
+		r.frozenFingerprint = &copy
 	}
 }
 
@@ -262,7 +272,7 @@ func NewTopologyLifecycle(topology Topology, store *sessionstore.Store, opts ...
 	for _, opt := range opts {
 		opt(r)
 	}
-	if r.fingerprint == nil {
+	if r.fingerprint == nil && r.frozenFingerprint == nil {
 		return nil, &MissingFingerprintProviderError{}
 	}
 	// AMBIGUITY A3: build the derived catalog so each session event appender keeps the
@@ -328,13 +338,17 @@ func (r *Lifecycle) NewSession(ctx context.Context, seed workspacestore.Ref) (*S
 	opts := make([]Option, 0, len(r.baseOpts)+6)
 	opts = append(opts, r.baseOpts...)
 	opts = append(opts,
-		WithFingerprintProvider(r.fingerprint),
 		WithSessionID(sid),
 		WithEventAppender(evAp),
 		WithCommandAppender(cmdAp),
 		WithGateAppender(gateAp),
 		WithLeaseRelease(lease.Release),
 	)
+	if r.frozenFingerprint != nil {
+		opts = append(opts, WithFingerprint(*r.frozenFingerprint))
+	} else {
+		opts = append(opts, WithFingerprintProvider(r.fingerprint))
+	}
 	// AMBIGUITY A1: mint a fresh per-session ceiling state so concurrent sessions never share one
 	// mutable clamp. A configured factory returning nil fails closed; only an absent factory
 	// selects the session's internal default.
@@ -371,6 +385,7 @@ func (r *Lifecycle) NewSession(ctx context.Context, seed workspacestore.Ref) (*S
 			releaseLease(lease)
 			return nil, &NewSessionError{Kind: NewSessionRuntimeFailed, Cause: err}
 		}
+		opts = append(opts, withInitialWorkspaceCheckpoint(seed))
 	}
 
 	s, err := NewTopology(ctx, r.topology, opts...)
@@ -384,15 +399,6 @@ func (r *Lifecycle) NewSession(ctx context.Context, seed workspacestore.Ref) (*S
 	// The session now owns both leases (via WithLeaseRelease + withResolvedPlacement); start
 	// the exclusive root-lease loss watcher so ownership loss faults the session.
 	s.watchRootLease()
-	// Journal the seed as the first workspace checkpoint AFTER SessionStarted/LoopStarted.
-	// Failing to record it faults durability, so shut the session down (releasing both
-	// leases) and fail closed.
-	if seed != "" {
-		if err := s.recordSeedCheckpoint(ctx, seed); err != nil {
-			_ = s.Shutdown(ctx)
-			return nil, &NewSessionError{Kind: NewSessionRuntimeFailed, Cause: err}
-		}
-	}
 	return s, nil
 }
 
@@ -417,7 +423,11 @@ func releaseResolvedRoot(ctx context.Context, resolved *resolvedPlacement) {
 func (r *Lifecycle) RestoreSession(ctx context.Context, id uuid.UUID) (*Session, error) {
 	opts := make([]Option, 0, len(r.baseOpts)+2)
 	opts = append(opts, r.baseOpts...)
-	opts = append(opts, WithFingerprintProvider(r.fingerprint))
+	if r.frozenFingerprint != nil {
+		opts = append(opts, WithFingerprint(*r.frozenFingerprint))
+	} else {
+		opts = append(opts, WithFingerprintProvider(r.fingerprint))
+	}
 	if r.allowConfigMismatch {
 		opts = append(opts, WithAllowConfigMismatch())
 	}

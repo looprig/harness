@@ -4,7 +4,6 @@ import (
 	"strings"
 
 	"github.com/looprig/harness/internal/sessionruntime"
-	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/harness/pkg/sessionstore"
@@ -131,9 +130,7 @@ func Define(options ...Option) (*Rig, error) {
 		// field so a placement change (mode or path) is a config change.
 		fields.WorkspaceRoot = placementFingerprint(placement, region)
 	}
-	provider := sessionruntime.FingerprintProvider(func(definition loop.BoundDefinition) event.ConfigFingerprint {
-		return fingerprintWithTopology(definition, fields, state.loops, state.primers, state.activePrimer)
-	})
+	fingerprint := frozenFingerprint(fields, state.loops, state.primers, state.activePrimer)
 	lifecycleOptions := append([]sessionruntime.LifecycleOption(nil), state.lifecycleOptions...)
 	if placement.Configured() {
 		lifecycleOptions = append(lifecycleOptions, sessionruntime.WithLifecyclePlacement(placement))
@@ -156,7 +153,7 @@ func Define(options ...Option) (*Rig, error) {
 		}
 		lifecycleOptions = append(lifecycleOptions, sessionruntime.WithLifecycleSnapshotPolicy(internalPolicy))
 	}
-	lifecycleOptions = append(lifecycleOptions, sessionruntime.WithLifecycleFingerprintProvider(provider))
+	lifecycleOptions = append(lifecycleOptions, sessionruntime.WithLifecycleFingerprint(fingerprint))
 	primerNames := make([]identity.AgentName, len(state.primers))
 	for i, name := range state.primers {
 		primerNames[i] = identity.AgentName(name)

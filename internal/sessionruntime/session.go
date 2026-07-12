@@ -130,6 +130,9 @@ type Session struct {
 	// fingerprint is required composition wiring supplied by rig and is the single
 	// projection used by both new and restored sessions.
 	fingerprint FingerprintProvider
+	// frozenFingerprint is the rig-resolved compatibility identity used before any
+	// restore-time workspace resolution or loop/tool binding.
+	frozenFingerprint *event.ConfigFingerprint
 
 	// injectedSessionID is the externally-minted sessionID the composition root supplies
 	// via WithSessionID, read ONLY by newSession to resolve the journal chicken-and-egg:
@@ -175,8 +178,9 @@ type Session struct {
 	// capability unconfigured, so CheckpointWorkspace fails closed with a typed
 	// *WorkspaceNotConfiguredError. The session depends only on the narrow *Store
 	// (Dependency Inversion): it never sees the Blobs backend beneath it.
-	ws     *workspacestore.Store // nil unless WithWorkspaceStore wired it; gates CheckpointWorkspace
-	wsRoot string                // the workspace directory Snapshot archives
+	ws                         *workspacestore.Store // nil unless WithWorkspaceStore wired it; gates CheckpointWorkspace
+	wsRoot                     string                // the workspace directory Snapshot archives
+	initialWorkspaceCheckpoint workspacestore.Ref
 
 	// placementSpec is the UNRESOLVED managed-workspace placement carried into the restore
 	// path (withPlacementSpec); restoreTopologySession resolves it after the session lease.
@@ -290,6 +294,52 @@ type Session struct {
 	// (SessionIdle durably appended). Workspace-backed sessions bypass this seam and await their
 	// checkpoint controller's generation-specific accepted/committed/faulted outcome. See interrupt.go.
 	interruptRelease InterruptReleasePolicy
+}
+
+// abortConstruction unwinds collaborators created by a session that will never become
+// reachable. It deliberately emits no normal SessionStopped event. Lease ownership stays
+// with the lifecycle caller, which releases root then session only after this returns.
+func (s *Session) abortConstruction(cause error) {
+	if cause == nil {
+		cause = context.Canceled
+	}
+	if s.checkpointAdmission != nil {
+		s.checkpointAdmission.latch(cause)
+	}
+	s.gatesMu.Lock()
+	for id, timer := range s.gateTimers {
+		timer.Stop()
+		delete(s.gateTimers, id)
+	}
+	for id := range s.gates {
+		delete(s.gates, id)
+	}
+	s.gatesMu.Unlock()
+	if s.checkpoints != nil {
+		s.checkpoints.shutdown()
+	}
+	if s.sessionCancel != nil {
+		s.sessionCancel()
+	}
+	s.loopsMu.RLock()
+	loops := make([]*loopHandle, 0, len(s.loops))
+	for _, handle := range s.loops {
+		loops = append(loops, handle)
+	}
+	s.loopsMu.RUnlock()
+	for _, handle := range loops {
+		if handle.cancel != nil {
+			handle.cancel()
+		}
+	}
+	for _, handle := range loops {
+		if handle.backend != nil && handle.backend.DoneChan() != nil {
+			<-handle.backend.DoneChan()
+		}
+	}
+	if s.hub != nil {
+		s.hub.AbortSession(cause)
+	}
 }
 
 // eventAppender is the session's narrow view of the hub's REQUIRED durable event tap:
@@ -611,6 +661,9 @@ func (s *Session) SubscribeEvents(filter event.EventFilter) (event.Subscription,
 func (s *Session) SessionID() uuid.UUID { return s.sessionID }
 
 func (s *Session) projectFingerprint(definition loop.BoundDefinition) event.ConfigFingerprint {
+	if s.frozenFingerprint != nil {
+		return *s.frozenFingerprint
+	}
 	return s.fingerprint(definition)
 }
 
@@ -1054,22 +1107,20 @@ func (s *Session) newLoopWithAdmission(parent loop.Provenance, cfg loop.Definiti
 	if admission != nil {
 		ev.InitialRequestID = admission.requestID
 	}
-	publish := s.PublishEvent
-	if admission != nil {
-		publish = s.hub.PublishEventChecked
-	}
+	publish := s.PublishEventChecked
 	if err := publish(s.sessionCtx, ev); err != nil {
 		// Mirror New's cleanup-on-publish-failure: the loop is already registered and
 		// its loopCtx cancel is live, so a bare return would leak a cancel-orphaned
 		// loop. Unregister it, roll back the quota reservation (release()), run its cancel,
-		// then surface the typed error. (hub PublishEvent returns nil today, so this path is
-		// presently unreachable — but it is correct-and-safe rather than dead-and-unsafe if
-		// that ever changes.)
+		// join the canceled backend, then surface the typed checked-append error.
 		s.loopsMu.Lock()
 		delete(s.loops, loopID)
 		s.loopsMu.Unlock()
 		release()
 		cancel()
+		if b.DoneChan() != nil {
+			<-b.DoneChan()
+		}
 		if admission != nil {
 			_ = admission.sub.Close()
 		}
@@ -1236,9 +1287,12 @@ func newSessionTopology(ctx context.Context, topology Topology, newID idGenerato
 	for _, opt := range opts {
 		opt(s)
 	}
-	if s.fingerprint == nil {
-		sessionCancel()
-		return nil, &MissingFingerprintProviderError{}
+	abort := func(err error) (*Session, error) {
+		s.abortConstruction(err)
+		return nil, err
+	}
+	if s.fingerprint == nil && s.frozenFingerprint == nil {
+		return abort(&MissingFingerprintProviderError{})
 	}
 	// Default-mint the security-ceiling source when the composition root did not inject
 	// one via WithCeiling, so SetSecurityCeiling/CeilingSource are always safe (never a
@@ -1296,8 +1350,7 @@ func newSessionTopology(ctx context.Context, topology Topology, newID idGenerato
 	// publishing a zero-EventID SessionStarted.
 	startedHeader, err := s.factory.Stamp(event.Header{Coordinates: identity.Coordinates{SessionID: id}})
 	if err != nil {
-		sessionCancel()
-		return nil, &SessionError{Kind: SessionIDGenerationFailed, Cause: err}
+		return abort(&SessionError{Kind: SessionIDGenerationFailed, Cause: err})
 	}
 	type preparedPrimer struct {
 		name identity.AgentName
@@ -1315,24 +1368,20 @@ func newSessionTopology(ctx context.Context, topology Topology, newID idGenerato
 	for _, name := range orderedPrimers {
 		definition, ok := topology.definition(name)
 		if !ok {
-			sessionCancel()
-			return nil, &SessionError{Kind: SessionLoopNotFound}
+			return abort(&SessionError{Kind: SessionLoopNotFound})
 		}
 		loopID, mintErr := s.newID()
 		if mintErr != nil {
-			sessionCancel()
-			return nil, &SessionError{Kind: SessionLoopIDGenerationFailed, Cause: mintErr}
+			return abort(&SessionError{Kind: SessionLoopIDGenerationFailed, Cause: mintErr})
 		}
 		bound, bindErr := definition.Bind(sessionCtx, tool.Bindings{SessionID: id, LoopID: loopID, Ceiling: s.ceilingState(), Workspace: s.newWorkspaceBinding(), Delegate: s.delegation.controllerFor(loopID, definition), ExtraTools: delegateExtraTools(definition, s.delegation)})
 		if bindErr != nil {
-			sessionCancel()
-			return nil, bindErr
+			return abort(bindErr)
 		}
 		prepared = append(prepared, preparedPrimer{name: name, def: definition, loop: preparedLoop{id: loopID, bound: bound}})
 	}
 	if len(prepared) == 0 {
-		sessionCancel()
-		return nil, &SessionError{Kind: SessionLoopNotFound}
+		return abort(&SessionError{Kind: SessionLoopNotFound})
 	}
 
 	// The hub is built before any loop, so a loop publishing through the session's
@@ -1347,16 +1396,19 @@ func newSessionTopology(ctx context.Context, topology Topology, newID idGenerato
 	// orderedPrimers placed topology.ActivePrimer first (unconditionally) and prepared was
 	// built in that order, so prepared[0] is always the active primer — no rescan needed.
 	activePrepared := prepared[0]
-	if err := s.hub.PublishEvent(sessionCtx, event.SessionStarted{Header: startedHeader, Config: s.projectFingerprint(activePrepared.loop.bound)}); err != nil {
-		sessionCancel()
-		return nil, &SessionError{Kind: SessionContextDone, Cause: err}
+	if err := s.hub.PublishEventChecked(sessionCtx, event.SessionStarted{Header: startedHeader, Config: s.projectFingerprint(activePrepared.loop.bound)}); err != nil {
+		return abort(&SessionError{Kind: SessionContextDone, Cause: err})
+	}
+	if s.initialWorkspaceCheckpoint != "" {
+		if err := s.recordSeedCheckpoint(sessionCtx, s.initialWorkspaceCheckpoint); err != nil {
+			return abort(err)
+		}
 	}
 
 	for _, primer := range prepared {
 		loopID, createErr := s.newLoop(loop.Provenance{}, primer.def, "", "", &primer.loop)
 		if createErr != nil {
-			sessionCancel()
-			return nil, createErr
+			return abort(createErr)
 		}
 		if primer.name == topology.ActivePrimer {
 			s.primaryLoopID = loopID

@@ -171,6 +171,15 @@ func WithFingerprintProvider(provider FingerprintProvider) Option {
 	}
 }
 
+// WithFingerprint installs a definition-time frozen compatibility fingerprint. Unlike
+// a provider, it is available before any loop definition is bound during restore.
+func WithFingerprint(fingerprint event.ConfigFingerprint) Option {
+	return func(s *Session) {
+		copy := fingerprint
+		s.frozenFingerprint = &copy
+	}
+}
+
 // WithForeignBuilder wires the composition-root seam that constructs foreign-engine
 // loops (live + restored). Without it, a foreign cfg.Engine fails closed at newLoop
 // (SessionForeignBuilderMissing) and at restore (RestoreForeignBuilderMissing) — a
