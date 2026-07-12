@@ -163,18 +163,18 @@ func fillLoopScoped(h event.Header, sessionID, loopID uuid.UUID) event.Header {
 	return h
 }
 
-// stampStepID returns ev with Coordinates.StepID set to stepID for the four
-// tool/gate events ONLY (PermissionRequested/UserInputRequested/ToolCallStarted/
-// ToolCallCompleted). Those events are emitted by the runner with a header that
+// stampStepID returns ev with Coordinates.StepID set to stepID for the five
+// tool/gate events ONLY (PermissionRequested/PermissionDecided/UserInputRequested/
+// ToolCallStarted/ToolCallCompleted). Those events are emitted by the runner with a header that
 // stampLoopHeader later completes from the loop/turn identity; stampLoopHeader's
 // fillTurnScoped fills only ZERO fields, so it never repairs StepID. Stamping it
 // here at emit time — where the active step's id is known — is what lets the
 // "ToolExecutionID requires StepID" invariant hold for these events.
 //
-// It stamps ONLY the four tool/gate events: any other event (TokenDelta, the turn
+// It stamps ONLY the five tool/gate events: any other event (TokenDelta, the turn
 // terminals, the submit-resolution events, …) is returned unchanged, so an event
 // that must keep StepID zero is never touched. StepID is set unconditionally on the
-// four (the runner emits them with a zero header), which is correct: the step is the
+// five (the runner emits them with a zero header), which is correct: the step is the
 // authoritative producer of its own tool/gate events.
 func stampStepID(ev event.Event, stepID uuid.UUID) event.Event {
 	switch e := ev.(type) {
@@ -199,7 +199,7 @@ func stampStepID(ev event.Event, stepID uuid.UUID) event.Event {
 }
 
 // stepStampingEmit wraps an emit sink so every event it carries is first passed
-// through stampStepID(_, stepID): the four tool/gate events get this step's StepID,
+// through stampStepID(_, stepID): the five tool/gate events get this step's StepID,
 // every other event passes through untouched. runTurn builds it per step (around
 // RunBatch) so the runner — which has no step identity — emits StepID-stamped
 // tool/gate events without ever depending on the step.

@@ -308,7 +308,7 @@ func runTurn(ctx context.Context, cfg turnConfig, ts turnState) event.Event {
 		}
 
 		// Wrap the per-turn emit so every tool/gate event RunBatch (and the gates it
-		// opens) emits carries this step's StepID. stampStepID touches ONLY the four
+		// opens) emits carries this step's StepID. stampStepID touches ONLY the five
 		// tool/gate events; stampLoopHeader later fills the remaining zero header fields
 		// without disturbing the StepID set here. This is the seam where the active
 		// step's id is known (st.id), keeping the runner ignorant of step identity.
