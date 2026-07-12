@@ -3,6 +3,7 @@ package sessionruntime
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"sync"
 	"sync/atomic"
@@ -107,7 +108,7 @@ func TestAbortConstructionStopsCollaboratorsWithoutSessionStopped(t *testing.T) 
 	}
 }
 
-func TestAbortConstructionTracksBlockingRestoreErroredPrelude(t *testing.T) {
+func TestAbortConstructionTracksBlockingRestoreErroredTerminalAppend(t *testing.T) {
 	sid, _ := uuid.New()
 	ctx, cancel := context.WithCancel(context.Background())
 	preludeEntered := make(chan struct{})
@@ -144,6 +145,146 @@ func TestAbortConstructionTracksBlockingRestoreErroredPrelude(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("cleanup owner did not release after RestoreErrored prelude drained")
 	}
+}
+
+func TestRestoreAbortWritesTerminalErrorAfterAdmittedPublishDrains(t *testing.T) {
+	t.Parallel()
+
+	sid, _ := uuid.New()
+	lid, _ := uuid.New()
+	ctx, cancel := context.WithCancel(context.Background())
+	app := &abortOrderingAppender{
+		firstEntered:    make(chan struct{}),
+		firstRelease:    make(chan struct{}),
+		firstCompleted:  make(chan struct{}),
+		terminalEntered: make(chan struct{}),
+	}
+	h := hub.New(sid, hub.WithAppender(app))
+	backend := &abortBackend{commands: make(chan command.Command), done: make(chan struct{})}
+	var releaseMu sync.Mutex
+	var releases []string
+	released := make(chan struct{})
+	s := &Session{
+		sessionID: sid, sessionCtx: ctx, sessionCancel: cancel, hub: h,
+		checkpointAdmission: newCheckpointAdmissionGate(),
+		loops:               map[uuid.UUID]*loopHandle{lid: {id: lid, backend: backend, cancel: cancel}},
+		gates:               map[gate.ID]gateEntry{}, gateTimers: map[gate.ID]*time.Timer{},
+		wsRootRelease: func(context.Context) error {
+			releaseMu.Lock()
+			releases = append(releases, "root")
+			releaseMu.Unlock()
+			return nil
+		},
+		leaseRelease: func(context.Context) error {
+			releaseMu.Lock()
+			releases = append(releases, "session")
+			releaseMu.Unlock()
+			close(released)
+			return nil
+		},
+	}
+	withConstructionAbortTimeout(25 * time.Millisecond)(s)
+	firstDone := make(chan error, 1)
+	go func() { firstDone <- s.PublishEventChecked(context.Background(), event.StepDone{}) }()
+	<-app.firstEntered
+	latePublish := make(chan error, 1)
+	go func() {
+		<-ctx.Done()
+		latePublish <- s.PublishEventChecked(context.Background(), event.StepDone{})
+		close(backend.done)
+	}()
+
+	abortDone := make(chan struct{})
+	go func() {
+		s.abortConstructionAfter(errors.New("restore failed"), func(appendCtx context.Context) {
+			_, _ = app.AppendEvent(appendCtx, event.RestoreErrored{})
+		})
+		close(abortDone)
+	}()
+	select {
+	case <-abortDone:
+	case <-time.After(100 * time.Millisecond):
+		close(app.firstRelease)
+		t.Fatal("restore abort did not return within construction deadline")
+	}
+	select {
+	case <-app.terminalEntered:
+		close(app.firstRelease)
+		t.Fatal("RestoreErrored append started before admitted hub publish completed")
+	default:
+	}
+	var aborted *hub.SessionAbortedError
+	if err := <-latePublish; !errors.As(err, &aborted) {
+		close(app.firstRelease)
+		t.Fatalf("late publish error = %T %v, want *hub.SessionAbortedError", err, err)
+	}
+	select {
+	case <-released:
+		close(app.firstRelease)
+		t.Fatal("leases released before admitted publication drained")
+	default:
+	}
+
+	close(app.firstRelease)
+	if err := <-firstDone; err != nil {
+		t.Fatalf("admitted publish error = %v", err)
+	}
+	select {
+	case <-app.firstCompleted:
+	case <-time.After(time.Second):
+		t.Fatal("admitted publish did not complete")
+	}
+	select {
+	case <-app.terminalEntered:
+	case <-time.After(time.Second):
+		t.Fatal("terminal RestoreErrored was not appended after hub drain")
+	}
+	select {
+	case <-released:
+	case <-time.After(time.Second):
+		t.Fatal("leases were not released after terminal append and loop drain")
+	}
+	if got := app.types(); len(got) != 2 || got[0] != "event.StepDone" || got[1] != "event.RestoreErrored" {
+		t.Fatalf("appended event order = %v, want [event.StepDone event.RestoreErrored]", got)
+	}
+	releaseMu.Lock()
+	defer releaseMu.Unlock()
+	if len(releases) != 2 || releases[0] != "root" || releases[1] != "session" {
+		t.Fatalf("lease release order = %v, want [root session]", releases)
+	}
+}
+
+type abortOrderingAppender struct {
+	mu              sync.Mutex
+	calls           int
+	events          []string
+	firstEntered    chan struct{}
+	firstRelease    chan struct{}
+	firstCompleted  chan struct{}
+	terminalEntered chan struct{}
+}
+
+func (a *abortOrderingAppender) AppendEvent(_ context.Context, ev event.Event) (uint64, error) {
+	a.mu.Lock()
+	a.calls++
+	call := a.calls
+	a.events = append(a.events, fmt.Sprintf("%T", ev))
+	a.mu.Unlock()
+	if call == 1 {
+		close(a.firstEntered)
+		<-a.firstRelease
+		close(a.firstCompleted)
+	}
+	if _, ok := ev.(event.RestoreErrored); ok {
+		close(a.terminalEntered)
+	}
+	return uint64(call), nil
+}
+
+func (a *abortOrderingAppender) types() []string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return append([]string(nil), a.events...)
 }
 
 func TestAbortConstructionUsesOneOverallDeadline(t *testing.T) {

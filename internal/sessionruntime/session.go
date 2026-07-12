@@ -328,10 +328,11 @@ func (s *Session) abortConstruction(cause error) {
 	s.abortConstructionAfter(cause, nil)
 }
 
-// abortConstructionAfter gives a restore failure one bounded opportunity to append
-// RestoreErrored before the hub is sealed. A context-ignoring append becomes another
-// drain owned by the single background lease-cleanup owner.
-func (s *Session) abortConstructionAfter(cause error, beforeSeal func(context.Context)) {
+// abortConstructionAfter seals hub admission first, cancels every collaborator, and
+// gives a restore failure one terminal direct-journal append after all already-admitted
+// hub publishes drain. One cleanup owner preserves that ordering beyond the caller's
+// deadline and retains both leases until checkpoints and loops also drain.
+func (s *Session) abortConstructionAfter(cause error, appendTerminal func(context.Context)) {
 	if cause == nil {
 		cause = context.Canceled
 	}
@@ -341,24 +342,11 @@ func (s *Session) abortConstructionAfter(cause error, beforeSeal func(context.Co
 	}
 	abortCtx, cancelAbort := context.WithTimeout(context.Background(), abortTimeout)
 	defer cancelAbort()
-	var drains []<-chan struct{}
-	if beforeSeal != nil {
-		preludeDrained := make(chan struct{})
-		go func() {
-			defer close(preludeDrained)
-			beforeSeal(abortCtx)
-		}()
-		select {
-		case <-preludeDrained:
-		case <-abortCtx.Done():
-		}
-		drains = append(drains, preludeDrained)
-	}
 	// Seal durable publication before cancellation can make a backend emit a late
-	// terminal. Already-admitted publishes may finish; their drain participates in
-	// the same ownership barrier as checkpoints and loop backends below.
+	// terminal. Already-admitted publishes are the first cleanup phase.
+	var hubDrain <-chan struct{}
 	if s.hub != nil {
-		drains = append(drains, s.hub.AbortSession(cause))
+		hubDrain = s.hub.AbortSession(cause)
 	}
 	if s.checkpointAdmission != nil {
 		s.checkpointAdmission.latch(cause)
@@ -372,8 +360,9 @@ func (s *Session) abortConstructionAfter(cause error, beforeSeal func(context.Co
 		delete(s.gates, id)
 	}
 	s.gatesMu.Unlock()
+	var checkpointDrain <-chan struct{}
 	if s.checkpoints != nil {
-		drains = append(drains, s.checkpoints.beginShutdown())
+		checkpointDrain = s.checkpoints.beginShutdown()
 	}
 	if s.sessionCancel != nil {
 		s.sessionCancel()
@@ -389,31 +378,53 @@ func (s *Session) abortConstructionAfter(cause error, beforeSeal func(context.Co
 			handle.cancel()
 		}
 	}
+	loopDrains := make([]<-chan struct{}, 0, len(loops))
 	for _, handle := range loops {
 		if handle.backend != nil && handle.backend.DoneChan() != nil {
-			drains = append(drains, handle.backend.DoneChan())
+			loopDrains = append(loopDrains, handle.backend.DoneChan())
 		}
 	}
-	drained := waitConstructionDrains(abortCtx, drains)
+	needsOwner := appendTerminal != nil || s.wsRootRelease != nil || s.leaseRelease != nil
+	if !needsOwner {
+		waitConstructionPhases(abortCtx, hubDrain, checkpointDrain, loopDrains)
+		return
+	}
+	cleanupDone := make(chan struct{})
 	cleanup := func() {
-		if !drained {
-			waitConstructionDrains(context.Background(), drains)
+		defer close(cleanupDone)
+		if hubDrain != nil {
+			<-hubDrain
 		}
+		if appendTerminal != nil {
+			terminalCtx, cancelTerminal := context.WithTimeout(context.Background(), abortTimeout)
+			appendTerminal(terminalCtx)
+			cancelTerminal()
+		}
+		if checkpointDrain != nil {
+			<-checkpointDrain
+		}
+		waitConstructionDrains(context.Background(), loopDrains)
 		// Lease hooks are accepted by the Session before construction starts. Once
 		// accepted, this is their sole teardown owner: root then session, exactly once.
 		s.releaseRootLease(context.Background())
 		s.releaseLease(context.Background())
 	}
-	if drained {
-		cleanup()
-		return
+	go cleanup()
+	select {
+	case <-cleanupDone:
+	case <-abortCtx.Done():
+		// The one owner continues the exact phase order and retains both leases.
 	}
-	if s.wsRootRelease != nil || s.leaseRelease != nil {
-		// One intentional owner goroutine retains both leases until every collaborator
-		// is truly drained. A permanently stuck collaborator therefore keeps ownership
-		// fenced rather than releasing storage underneath it.
-		go cleanup()
+}
+
+func waitConstructionPhases(ctx context.Context, hubDrain, checkpointDrain <-chan struct{}, loopDrains []<-chan struct{}) bool {
+	if hubDrain != nil && !waitConstructionDrains(ctx, []<-chan struct{}{hubDrain}) {
+		return false
 	}
+	if checkpointDrain != nil && !waitConstructionDrains(ctx, []<-chan struct{}{checkpointDrain}) {
+		return false
+	}
+	return waitConstructionDrains(ctx, loopDrains)
 }
 
 func waitConstructionDrains(ctx context.Context, drains []<-chan struct{}) bool {
