@@ -25,6 +25,7 @@ import (
 	"github.com/looprig/harness/pkg/session"
 	"github.com/looprig/harness/pkg/sessionstore"
 	"github.com/looprig/harness/pkg/tool"
+	harnesstools "github.com/looprig/harness/pkg/tools"
 	"github.com/looprig/harness/pkg/workspacestore"
 	"github.com/looprig/inference"
 	storage "github.com/looprig/storage"
@@ -539,6 +540,11 @@ func (lifecyclePermissionGate) Grant(context.Context, string, string, tool.Appro
 	return nil
 }
 
+type lifecycleReadGuard struct{}
+
+func (lifecycleReadGuard) DeniedRead(string) bool { return false }
+func (lifecycleReadGuard) MaxReadBytes() int64    { return 1 << 20 }
+
 func TestNewSessionWithSeedCommitsCheckpointBeforeAnyLoopStarts(t *testing.T) {
 	store, _ := lifecycleStore(t)
 	workspace, err := workspacestore.Open(memstore.New().Blobs)
@@ -980,6 +986,87 @@ func TestRestoreAcceptsPreFrozenFullFingerprintFixture(t *testing.T) {
 	restored, err := current.RestoreSession(context.Background(), id)
 	if err != nil {
 		t.Fatalf("restore pre-frozen full fingerprint fixture: %v", err)
+	}
+	if err := restored.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRestoreAcceptsLegacyBoundFingerprintForFilesAndInjectedSubagent(t *testing.T) {
+	store, _ := lifecycleStore(t)
+	workspace, err := workspacestore.Open(memstore.New().Blobs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root, err := canonicalPath(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	placement := sessionruntime.WorkspacePlacement{Mode: sessionruntime.PlacementShared, Store: workspace, Root: root}
+	fields := ConfigFingerprintFields{WorkspaceRoot: placementFingerprint(placement, root)}
+
+	var permissionBinds atomic.Int32
+	primer, err := loop.Define(
+		loop.WithName("primer"), loop.WithInference(&stubLLM{}, validModel("model")),
+		loop.WithTools(harnesstools.Files(lifecycleReadGuard{})),
+		loop.WithDelegates("delegate"),
+		loop.WithPolicyRevision("legacy-files-delegate"),
+		loop.WithPermissionFactory(func(context.Context, tool.Bindings) (loop.PermissionGate, error) {
+			permissionBinds.Add(1)
+			return lifecyclePermissionGate{}, nil
+		}),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	delegate, err := loop.Define(loop.WithName("delegate"), loop.WithInference(&stubLLM{}, validModel("delegate-model")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	definitions := []loop.Definition{primer, delegate}
+	primers := []string{"primer"}
+	frozen := frozenFingerprint(fields, definitions, primers, "primer")
+	if permissionBinds.Load() != 0 {
+		t.Fatalf("frozen fingerprint invoked permission factory %d times, want 0", permissionBinds.Load())
+	}
+
+	var legacyBound event.ConfigFingerprint
+	legacyProvider := sessionruntime.FingerprintProvider(func(bound loop.BoundDefinition) event.ConfigFingerprint {
+		legacyBound = fingerprintWithTopology(bound, fields, definitions, primers, "primer")
+		return legacyBound
+	})
+	legacy, err := sessionruntime.NewTopologyLifecycle(
+		sessionruntime.Topology{Definitions: definitions, Primers: []identity.AgentName{"primer"}, ActivePrimer: "primer"},
+		store,
+		sessionruntime.WithLifecycleFingerprintProvider(legacyProvider),
+		sessionruntime.WithLifecyclePlacement(placement),
+		sessionruntime.WithLifecycleSnapshotPolicy(sessionruntime.SnapshotPolicy{Trigger: sessionruntime.SnapshotManual}),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	original, err := legacy.NewSession(context.Background(), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := original.SessionID()
+	if err := original.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if !legacyBound.Equal(frozen) {
+		t.Fatalf("legacy bound fingerprint = %+v, frozen = %+v", legacyBound, frozen)
+	}
+
+	current, err := Define(
+		WithLoops(definitions...), WithPrimers("primer"), WithSessionStore(store),
+		WithSharedWorkspace(workspace, root), WithSnapshots(SnapshotPolicy{Trigger: SnapshotManual}),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	restored, err := current.RestoreSession(context.Background(), id)
+	if err != nil {
+		t.Fatalf("restore legacy Files/delegate fixture: %v", err)
 	}
 	if err := restored.Shutdown(context.Background()); err != nil {
 		t.Fatal(err)

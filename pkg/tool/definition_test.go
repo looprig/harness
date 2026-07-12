@@ -117,6 +117,9 @@ func TestDefinitionMetadataAndFreshBuilds(t *testing.T) {
 			if got := definition.Requirements(); got != tt.requirements {
 				t.Fatalf("Requirements() = %v, want %v", got, tt.requirements)
 			}
+			if got := definition.ProducedToolNames(); len(got) != 1 || got[0] != "custom" {
+				t.Fatalf("ProducedToolNames() = %q, want [custom]", got)
+			}
 
 			bindings := validBindings()
 			first, err := definition.Build(context.Background(), bindings)
@@ -140,6 +143,37 @@ func TestDefinitionMetadataAndFreshBuilds(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestBundleDefinitionProducedToolNamesAreImmutable(t *testing.T) {
+	t.Parallel()
+
+	names := []string{"ReadFile", "WriteFile", "EditFile"}
+	definition := tool.NewBundleDefinition("Files", names, tool.RequiresWorkspace, func(context.Context, tool.Bindings) ([]tool.InvokableTool, error) {
+		return []tool.InvokableTool{&definitionTool{}}, nil
+	})
+	names[0] = "mutated-input"
+
+	first := definition.ProducedToolNames()
+	if got, want := first, []string{"ReadFile", "WriteFile", "EditFile"}; !equalStrings(got, want) {
+		t.Fatalf("ProducedToolNames() = %q, want %q", got, want)
+	}
+	first[1] = "mutated-output"
+	if got, want := definition.ProducedToolNames(), []string{"ReadFile", "WriteFile", "EditFile"}; !equalStrings(got, want) {
+		t.Fatalf("ProducedToolNames() after caller mutation = %q, want %q", got, want)
+	}
+}
+
+func equalStrings(got, want []string) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	for i := range got {
+		if got[i] != want[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func TestDefinitionValidation(t *testing.T) {

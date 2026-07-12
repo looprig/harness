@@ -64,6 +64,15 @@ func frozenFingerprint(fields ConfigFingerprintFields, definitions []loop.Defini
 		}
 	}
 	toolNames := append([]string(nil), initial.ToolNames...)
+	for _, definition := range definitions {
+		if string(definition.Name()) == active && len(definition.Delegates()) > 0 {
+			// Delegate-capable loops receive this built-in structurally at Bind.
+			// Include its stable model-facing name without constructing the tool or
+			// its permission/controller collaborators.
+			toolNames = append(toolNames, "Subagent")
+			break
+		}
+	}
 	sort.Strings(toolNames)
 	return event.ConfigFingerprint{
 		TopologyRev:               topologyRevision(definitions, primers, active),

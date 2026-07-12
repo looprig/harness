@@ -311,6 +311,12 @@ func (s *Session) abortConstruction(cause error) {
 	if cause == nil {
 		cause = context.Canceled
 	}
+	abortTimeout := s.constructionAbortTimeout
+	if abortTimeout <= 0 {
+		abortTimeout = defaultConstructionAbortTimeout
+	}
+	abortCtx, cancelAbort := context.WithTimeout(context.Background(), abortTimeout)
+	defer cancelAbort()
 	if s.checkpointAdmission != nil {
 		s.checkpointAdmission.latch(cause)
 	}
@@ -324,7 +330,7 @@ func (s *Session) abortConstruction(cause error) {
 	}
 	s.gatesMu.Unlock()
 	if s.checkpoints != nil {
-		s.checkpoints.shutdown()
+		s.checkpoints.shutdownUntil(abortCtx)
 	}
 	if s.sessionCancel != nil {
 		s.sessionCancel()
@@ -340,12 +346,6 @@ func (s *Session) abortConstruction(cause error) {
 			handle.cancel()
 		}
 	}
-	abortTimeout := s.constructionAbortTimeout
-	if abortTimeout <= 0 {
-		abortTimeout = defaultConstructionAbortTimeout
-	}
-	abortCtx, cancelAbort := context.WithTimeout(context.Background(), abortTimeout)
-	defer cancelAbort()
 	for _, handle := range loops {
 		if handle.backend != nil && handle.backend.DoneChan() != nil {
 			select {

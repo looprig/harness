@@ -3,6 +3,8 @@ package sessionruntime
 import (
 	"context"
 	"errors"
+	"io"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -13,6 +15,10 @@ import (
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/gate"
 	"github.com/looprig/harness/pkg/hub"
+	"github.com/looprig/harness/pkg/identity"
+	"github.com/looprig/harness/pkg/workspacestore"
+	"github.com/looprig/storage"
+	"github.com/looprig/storage/memstore"
 )
 
 type abortBackend struct {
@@ -104,4 +110,66 @@ func TestAbortConstructionUsesOneOverallDeadline(t *testing.T) {
 	if _, open := <-sub.Events(); open {
 		t.Fatal("hub cleanup did not continue after abort deadline")
 	}
+}
+
+func TestAbortConstructionBoundsContextIgnoringCheckpointWorker(t *testing.T) {
+	blobs := &ignoringPutBlobs{Blobs: memstore.New().Blobs, entered: make(chan struct{}), release: make(chan struct{})}
+	workspace, err := workspacestore.Open(blobs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := t.TempDir()
+	sid, _ := uuid.New()
+	ctx, cancel := context.WithCancel(context.Background())
+	s := &Session{
+		sessionID: sid, sessionCtx: ctx, sessionCancel: cancel, hub: hub.New(sid),
+		checkpointAdmission: newCheckpointAdmissionGate(), loops: map[uuid.UUID]*loopHandle{},
+		gates: map[gate.ID]gateEntry{}, gateTimers: map[gate.ID]*time.Timer{},
+	}
+	withConstructionAbortTimeout(25 * time.Millisecond)(s)
+	s.checkpoints = newCheckpointController(checkpointControllerConfig{
+		SessionID: sid,
+		Policy:    checkpointPolicy{Trigger: checkpointOnStepDone, Priority: checkpointBestEffort, Timeout: time.Second},
+		Store:     workspace, Root: root, Mode: PlacementSession, Coordinator: newWorkspaceCoordinator(nil),
+		Publisher: checkedPublisherFunc(func(context.Context, event.Event) error { return nil }),
+		Factory:   event.NewFactory(uuid.New, time.Now), Idle: func() bool { return true },
+	})
+	triggerID, _ := uuid.New()
+	trigger := event.StepDone{Header: event.Header{EventID: triggerID, Coordinates: identity.Coordinates{SessionID: sid}}}
+	if err := s.checkpoints.bestEffortBoundary(context.Background(), trigger); err != nil {
+		t.Fatal(err)
+	}
+	<-blobs.entered
+	aborted := make(chan struct{})
+	go func() {
+		s.abortConstruction(errors.New("construction failed"))
+		close(aborted)
+	}()
+	select {
+	case <-aborted:
+	case <-time.After(100 * time.Millisecond):
+		close(blobs.release)
+		t.Fatal("construction abort blocked on context-ignoring checkpoint worker")
+	}
+	close(blobs.release)
+	s.checkpoints.shutdown()
+}
+
+type ignoringPutBlobs struct {
+	storage.Blobs
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (b *ignoringPutBlobs) Put(_ context.Context, key string, r io.Reader) error {
+	b.once.Do(func() { close(b.entered) })
+	<-b.release
+	return b.Blobs.Put(context.Background(), key, r)
+}
+
+type checkedPublisherFunc func(context.Context, event.Event) error
+
+func (f checkedPublisherFunc) PublishEventChecked(ctx context.Context, ev event.Event) error {
+	return f(ctx, ev)
 }

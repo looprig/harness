@@ -55,6 +55,7 @@ func TestDefinitionBlueprints(t *testing.T) {
 		name          string
 		definition    tool.Definition
 		wantName      string
+		wantToolNames []string
 		wantReqs      tool.Requirements
 		wantToolCount int
 		check         func(*testing.T, []tool.InvokableTool)
@@ -63,6 +64,7 @@ func TestDefinitionBlueprints(t *testing.T) {
 			name:          "files",
 			definition:    Files(guard),
 			wantName:      "Files",
+			wantToolNames: []string{"ReadFile", "WriteFile", "EditFile"},
 			wantReqs:      tool.RequiresWorkspace,
 			wantToolCount: 3,
 			check: func(t *testing.T, built []tool.InvokableTool) {
@@ -90,6 +92,7 @@ func TestDefinitionBlueprints(t *testing.T) {
 			name:          "bash",
 			definition:    Bash(WithRunner(runner)),
 			wantName:      "Bash",
+			wantToolNames: []string{"Bash"},
 			wantReqs:      tool.RequiresWorkspace,
 			wantToolCount: 1,
 			check: func(t *testing.T, built []tool.InvokableTool) {
@@ -104,6 +107,7 @@ func TestDefinitionBlueprints(t *testing.T) {
 			name:          "subagent",
 			definition:    Subagent(loop.DelegationManaged, nil),
 			wantName:      "Subagent",
+			wantToolNames: []string{"Subagent"},
 			wantReqs:      tool.RequiresDelegateController,
 			wantToolCount: 1,
 			check: func(t *testing.T, built []tool.InvokableTool) {
@@ -124,6 +128,9 @@ func TestDefinitionBlueprints(t *testing.T) {
 			if got := tt.definition.Requirements(); got != tt.wantReqs {
 				t.Fatalf("Requirements() = %v, want %v", got, tt.wantReqs)
 			}
+			if got := tt.definition.ProducedToolNames(); !equalToolNames(got, tt.wantToolNames) {
+				t.Fatalf("ProducedToolNames() = %q, want %q", got, tt.wantToolNames)
+			}
 			first, err := tt.definition.Build(context.Background(), blueprintBindings(&recordingDelegate{}))
 			if err != nil {
 				t.Fatalf("first Build() error = %v", err)
@@ -143,6 +150,18 @@ func TestDefinitionBlueprints(t *testing.T) {
 			tt.check(t, first)
 		})
 	}
+}
+
+func equalToolNames(got, want []string) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	for i := range got {
+		if got[i] != want[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func TestDefinitionBashCopiesOptions(t *testing.T) {

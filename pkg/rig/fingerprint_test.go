@@ -445,6 +445,37 @@ func TestFrozenFingerprintRetainsFullInitialFieldsWithoutBinding(t *testing.T) {
 	}
 }
 
+func TestFrozenFingerprintUsesProducedToolNamesWithoutBinding(t *testing.T) {
+	t.Parallel()
+
+	builds := 0
+	files := tool.NewBundleDefinition("Files", []string{"ReadFile", "WriteFile", "EditFile"}, 0, func(context.Context, tool.Bindings) ([]tool.InvokableTool, error) {
+		builds++
+		return []tool.InvokableTool{fpTool{name: "unexpected"}}, nil
+	})
+	definition := mustDefine(loop.WithName("agent"), loop.WithInference(&stubLLM{}, validModel("model")), loop.WithTools(files))
+
+	fingerprint := frozenFingerprint(ConfigFingerprintFields{}, []loop.Definition{definition}, []string{"agent"}, "agent")
+	if builds != 0 {
+		t.Fatalf("tool factory builds = %d, want 0", builds)
+	}
+	if want := hexSHA256("EditFile\nReadFile\nWriteFile"); fingerprint.ToolPolicyRev != want {
+		t.Fatalf("ToolPolicyRev = %q, want %q", fingerprint.ToolPolicyRev, want)
+	}
+}
+
+func TestFrozenFingerprintIncludesStructurallyInjectedSubagent(t *testing.T) {
+	t.Parallel()
+
+	primer := mustDefine(loop.WithName("primer"), loop.WithInference(&stubLLM{}, validModel("model")), loop.WithDelegates("delegate"))
+	delegate := mustDefine(loop.WithName("delegate"), loop.WithInference(&stubLLM{}, validModel("delegate-model")))
+	fingerprint := frozenFingerprint(ConfigFingerprintFields{}, []loop.Definition{primer, delegate}, []string{"primer"}, "primer")
+
+	if want := hexSHA256("Subagent"); fingerprint.ToolPolicyRev != want {
+		t.Fatalf("ToolPolicyRev = %q, want injected Subagent digest %q", fingerprint.ToolPolicyRev, want)
+	}
+}
+
 // TestSessionStartedCarriesConfig is the end-to-end proof that the construction-time
 // SessionStarted the session publishes carries a non-empty Config derived from the
 // loop.Config. The construction-time event is unobservable by a late subscriber (the

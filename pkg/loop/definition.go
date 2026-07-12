@@ -231,7 +231,7 @@ func (d Definition) FingerprintInitial() InitialFingerprint {
 	names := make([]string, 0, len(definitions))
 	for _, definition := range definitions {
 		if !nilLike(definition) {
-			names = append(names, definition.Name())
+			names = append(names, definition.ProducedToolNames()...)
 		}
 	}
 	return InitialFingerprint{Model: model, EffectiveSystem: EffectiveSystem(d.state.system, instructions), ToolNames: names}

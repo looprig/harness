@@ -967,7 +967,7 @@ func TestCheckpointBestEffortActivationCancelsQuiescentWalk(t *testing.T) {
 	}
 	<-blobs.entered
 	c.activated()
-	c.wg.Wait()
+	c.waitDrained()
 	select {
 	case cp := <-publisher.checkpointed:
 		t.Fatalf("activation-canceled walk emitted checkpoint: %+v", cp)

@@ -95,7 +95,9 @@ type checkpointController struct {
 	pending           *checkpointRequest
 	manualWaiting     int
 	closed            bool
-	wg                sync.WaitGroup
+	workers           int
+	drained           chan struct{}
+	drainedOpen       bool
 	activeCancel      context.CancelCauseFunc
 	activationPending bool
 	requiredQueue     []*requiredRequest
@@ -186,6 +188,8 @@ type requiredRequest struct {
 
 func newCheckpointController(cfg checkpointControllerConfig) *checkpointController {
 	ctx, cancel := context.WithCancel(context.Background())
+	drained := make(chan struct{})
+	close(drained)
 	return &checkpointController{
 		cfg:               cfg,
 		ctx:               ctx,
@@ -193,6 +197,7 @@ func newCheckpointController(cfg checkpointControllerConfig) *checkpointControll
 		interruptSweeps:   make(map[uint64]*interruptCheckpointSweep),
 		interruptDeferred: make(map[uint64]*interruptCheckpointSweep),
 		requiredFinished:  make(map[uint64]error),
+		drained:           drained,
 	}
 }
 
@@ -303,7 +308,7 @@ func (c *checkpointController) interruptSuccessDisposition() interruptCheckpoint
 	return interruptCheckpointAccepted
 }
 
-func (c *checkpointController) shutdown() {
+func (c *checkpointController) beginShutdown() <-chan struct{} {
 	c.once.Do(func() {
 		c.mu.Lock()
 		c.closed = true
@@ -321,8 +326,48 @@ func (c *checkpointController) shutdown() {
 		shutdownErr := &CheckpointError{Kind: CheckpointCanceled, Cause: context.Canceled}
 		c.resolveInterruptSweeps(interrupts, interruptCheckpointOutcome{Disposition: interruptCheckpointFaulted, Err: shutdownErr})
 		c.cancel()
-		c.wg.Wait()
 	})
+	c.mu.Lock()
+	drained := c.drained
+	c.mu.Unlock()
+	return drained
+}
+
+func (c *checkpointController) shutdown() {
+	<-c.beginShutdown()
+}
+
+func (c *checkpointController) shutdownUntil(ctx context.Context) {
+	select {
+	case <-c.beginShutdown():
+	case <-ctx.Done():
+	}
+}
+
+// workerAddLocked reserves one controller-owned worker while c.mu is held.
+func (c *checkpointController) workerAddLocked() {
+	if c.workers == 0 {
+		c.drained = make(chan struct{})
+		c.drainedOpen = true
+	}
+	c.workers++
+}
+
+func (c *checkpointController) workerDone() {
+	c.mu.Lock()
+	c.workers--
+	if c.workers == 0 && c.drainedOpen {
+		close(c.drained)
+		c.drainedOpen = false
+	}
+	c.mu.Unlock()
+}
+
+func (c *checkpointController) waitDrained() {
+	c.mu.Lock()
+	drained := c.drained
+	c.mu.Unlock()
+	<-drained
 }
 
 func (c *checkpointController) boundary(ctx context.Context, trigger event.Event) error {
@@ -421,7 +466,7 @@ func (c *checkpointController) bestEffortInterruptIdle(ctx context.Context, caus
 	}
 	if !c.active {
 		c.active = true
-		c.wg.Add(1)
+		c.workerAddLocked()
 		accepted := make(chan error, 1)
 		c.mu.Unlock()
 		c.runBestEffort(req, publish, accepted)
@@ -446,7 +491,7 @@ func (c *checkpointController) bestEffortInterruptIdle(ctx context.Context, caus
 	}
 	c.active = true
 	c.pending = nil
-	c.wg.Add(1)
+	c.workerAddLocked()
 	c.mu.Unlock()
 	c.runBestEffort(req, nil, nil)
 	return nil
@@ -470,13 +515,13 @@ func (c *checkpointController) manual(ctx context.Context) (workspacestore.Ref, 
 	if c.cfg.ManualQueued != nil {
 		c.cfg.ManualQueued()
 	}
-	defer c.wg.Done()
+	defer c.workerDone()
 	ref, err := c.commit(ctx, nil, event.SnapshotTriggerManual, nil, nil)
 	c.mu.Lock()
 	c.manualWaiting--
 	start := c.takePendingLocked()
 	if start != nil {
-		c.wg.Add(1)
+		c.workerAddLocked()
 	}
 	c.mu.Unlock()
 	if start != nil {
@@ -501,7 +546,7 @@ func (c *checkpointController) bestEffortBoundaryWithCommit(ctx context.Context,
 	}
 	if !c.active {
 		c.active = true
-		c.wg.Add(1)
+		c.workerAddLocked()
 		accepted := make(chan error, 1)
 		c.mu.Unlock()
 		c.runBestEffort(req, triggerCommit, accepted)
@@ -534,7 +579,7 @@ func (c *checkpointController) bestEffortBoundaryWithCommit(ctx context.Context,
 	}
 	c.active = true
 	c.pending = nil
-	c.wg.Add(1)
+	c.workerAddLocked()
 	c.mu.Unlock()
 	c.runBestEffort(req, nil, nil)
 	return nil
@@ -544,7 +589,7 @@ func (c *checkpointController) bestEffortBoundaryWithCommit(ctx context.Context,
 // Reserving before unlock prevents Shutdown's closed→Wait transition from missing it.
 func (c *checkpointController) runBestEffort(req checkpointRequest, triggerCommit func() error, accepted chan error) {
 	go func() {
-		defer c.wg.Done()
+		defer c.workerDone()
 		workerCtx, cancel := context.WithCancelCause(req.ctx)
 		defer cancel(context.Canceled)
 		if c.cfg.Mode != PlacementShared {
@@ -612,7 +657,7 @@ func (c *checkpointController) runRequired(
 		c.mu.Unlock()
 		return "", &CheckpointError{Kind: CheckpointCanceled, Cause: context.Canceled}
 	}
-	c.wg.Add(1)
+	c.workerAddLocked()
 	c.requiredNext++
 	req.seq = c.requiredNext
 	c.requiredQueue = append(c.requiredQueue, req)
@@ -645,7 +690,7 @@ func (c *checkpointController) runRequired(
 			c.mu.Unlock()
 			if removed {
 				c.recordRequiredCompletion(req.seq, &CheckpointError{Kind: CheckpointCanceled, Cause: ctx.Err()})
-				c.wg.Done()
+				c.workerDone()
 				return "", &CheckpointError{Kind: CheckpointCanceled, Cause: ctx.Err()}
 			}
 		} else {
@@ -674,7 +719,7 @@ func (c *checkpointController) runRequiredQueue() {
 		ref, err := req.run(c.ctx)
 		c.recordRequiredCompletion(req.seq, err)
 		req.result <- checkpointResult{ref: ref, err: err}
-		c.wg.Done()
+		c.workerDone()
 	}
 }
 
@@ -720,7 +765,7 @@ func (c *checkpointController) beginManualOperation() bool {
 	if c.closed {
 		return false
 	}
-	c.wg.Add(1)
+	c.workerAddLocked()
 	c.manualWaiting++
 	return true
 }
@@ -765,7 +810,7 @@ func (c *checkpointController) finishBestEffort() {
 	c.activationPending = false
 	start := c.takePendingLocked()
 	if start != nil {
-		c.wg.Add(1)
+		c.workerAddLocked()
 	}
 	c.mu.Unlock()
 	if start != nil {

@@ -199,6 +199,7 @@ type Bindings struct {
 // session-bound tool instances.
 type Definition interface {
 	Name() string
+	ProducedToolNames() []string
 	Requirements() Requirements
 	Build(context.Context, Bindings) ([]InvokableTool, error)
 	definition()
@@ -211,19 +212,38 @@ type Definition interface {
 type Factory func(context.Context, Bindings) ([]InvokableTool, error)
 
 type factoryDefinition struct {
-	name         string
-	requirements Requirements
-	factory      Factory
+	name          string
+	producedNames []string
+	requirements  Requirements
+	factory       Factory
 }
 
 // NewDefinition returns an immutable, factory-backed definition. Validation is
 // performed by Build so the constructor remains composable in declarative rig
 // configuration while still returning typed failures at the runtime boundary.
 func NewDefinition(name string, requirements Requirements, factory Factory) Definition {
-	return &factoryDefinition{name: name, requirements: requirements, factory: factory}
+	return NewBundleDefinition(name, []string{name}, requirements, factory)
+}
+
+// NewBundleDefinition returns an immutable factory-backed definition whose one
+// build produces the declared concrete model-facing tool names. The metadata lets
+// composition fingerprint a bundle without invoking its runtime-bound factory.
+func NewBundleDefinition(name string, producedToolNames []string, requirements Requirements, factory Factory) Definition {
+	return &factoryDefinition{
+		name:          name,
+		producedNames: append([]string(nil), producedToolNames...),
+		requirements:  requirements,
+		factory:       factory,
+	}
 }
 
 func (d *factoryDefinition) Name() string { return d.name }
+
+// ProducedToolNames returns a defensive copy of the stable concrete tool names
+// this definition's factory produces.
+func (d *factoryDefinition) ProducedToolNames() []string {
+	return append([]string(nil), d.producedNames...)
+}
 
 func (d *factoryDefinition) Requirements() Requirements { return d.requirements }
 

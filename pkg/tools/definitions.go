@@ -11,7 +11,7 @@ import (
 // Files defines the workspace-bound ReadFile, WriteFile, and EditFile bundle.
 // Every Build receives fresh concrete tools for that binding.
 func Files(readGuard loop.ReadGuard) tool.Definition {
-	return tool.NewDefinition("Files", tool.RequiresWorkspace, func(_ context.Context, bindings tool.Bindings) ([]tool.InvokableTool, error) {
+	return tool.NewBundleDefinition("Files", []string{readFileToolName, writeFileToolName, editFileToolName}, tool.RequiresWorkspace, func(_ context.Context, bindings tool.Bindings) ([]tool.InvokableTool, error) {
 		if nilInterface(readGuard) {
 			return nil, &DefinitionBuildError{Definition: "Files", Dependency: "read_guard"}
 		}
