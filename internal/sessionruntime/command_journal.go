@@ -144,6 +144,21 @@ func WithAllowConfigMismatch() Option {
 	}
 }
 
+// WithInterruptReleasePolicy installs the pluggable admission-barrier release policy (the
+// Dependency-Inversion seam of the interrupt machinery). After an interrupt cancels a running
+// turn, the session holds the interrupt-pending marks until the policy's AwaitRelease returns,
+// then clears them. Without this option the session uses the default (sessionIdleRelease):
+// release once the session next reaches idle (SessionIdle durably appended). Task 16 injects a
+// workspace-aware policy that may hold the barrier through a checkpoint. A nil policy is ignored
+// (the default stays installed). See interrupt.go.
+func WithInterruptReleasePolicy(p InterruptReleasePolicy) Option {
+	return func(s *Session) {
+		if p != nil {
+			s.interruptRelease = p
+		}
+	}
+}
+
 // FingerprintProvider projects a bound loop into the immutable behavior fingerprint
 // used for both SessionStarted and restore validation. It must be deterministic and safe
 // for concurrent calls from separate sessions.

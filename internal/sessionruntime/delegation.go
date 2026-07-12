@@ -437,6 +437,17 @@ func (c *scopedController) start(ctx context.Context, s *Session, req tool.Deleg
 	if err := validateDelegateMode(childDef, mode); err != nil {
 		return tool.DelegateResult{}, err
 	}
+	// Interrupt admission gate: a parent under an interrupt barrier admits no NEW machine
+	// delegate work (the machine side of the interrupt queue policy), so a parent whose
+	// interrupted delegate wait resolves cannot open a fresh delegate step.
+	//
+	// TODO(loopruntime interrupt): this gate closes only the DELEGATE-admission race. A parent
+	// can still take one bounded NON-delegate step (a plain inference/tool step) before its own
+	// actor interrupt lands; closing that residual needs a step-boundary guard in the loop actor
+	// (internal/loopruntime), which is out of Task 11's session-layer scope.
+	if s.loopInterruptPending(c.parentLoopID) {
+		return tool.DelegateResult{}, &DelegateError{Kind: DelegateInterruptPending, DelegateID: c.parentLoopID}
+	}
 	parent := loop.Provenance{LoopID: c.parentLoopID}
 	childID, requestID, sub, err := s.startDelegate(ctx, parent, childDef, mode, req.Message, req.ParentToolUseID)
 	if err != nil {
@@ -453,6 +464,13 @@ func (c *scopedController) send(ctx context.Context, s *Session, req tool.Delega
 	}
 	if err := c.ownsChild(s, req.DelegateID); err != nil {
 		return tool.DelegateResult{}, err
+	}
+	// Interrupt admission gate: same machine-side flush as start — a parent under an interrupt
+	// barrier cannot enqueue a fresh follow-up turn on its child until the barrier releases.
+	// TODO(loopruntime interrupt): as in start, this closes only the delegate-admission race; the
+	// bounded non-delegate-step residual needs a loop-actor step-boundary guard (out of scope).
+	if s.loopInterruptPending(c.parentLoopID) {
+		return tool.DelegateResult{}, &DelegateError{Kind: DelegateInterruptPending, DelegateID: c.parentLoopID}
 	}
 	requestID, sub, err := s.sendDelegate(ctx, req.DelegateID, req.Message)
 	if err != nil {
@@ -782,6 +800,11 @@ const (
 	DelegateMissingDelegateID
 	DelegateMissingRequestID
 	DelegateUnknownOperation
+	// DelegateInterruptPending: the parent loop is under an interrupt admission barrier, so a
+	// NEW machine-delegate request (start/send) is flushed (refused) until the barrier releases.
+	// This is the machine-side of the interrupt queue policy: user input stays queued, but a
+	// parent whose interrupted delegate wait resolves cannot open a fresh delegate step.
+	DelegateInterruptPending
 )
 
 // DelegateError is the typed delegation refusal. Callers errors.As to inspect Kind and
@@ -816,6 +839,8 @@ func (e *DelegateError) Error() string {
 		return "delegation: a request_id is required"
 	case DelegateUnknownOperation:
 		return "delegation: unknown operation"
+	case DelegateInterruptPending:
+		return "delegation: loop is interrupt-pending; new delegate work is not admitted until the interrupt barrier releases"
 	default:
 		return "delegation: refused"
 	}

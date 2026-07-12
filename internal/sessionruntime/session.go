@@ -228,6 +228,24 @@ type Session struct {
 	// loop tools against it) and attached to this session once the session exists. Never
 	// nil for a constructed session.
 	delegation *delegationManager
+
+	// interruptPending REFCOUNTS the loop ids currently under an interrupt admission barrier:
+	// a marked loop's current turn was interrupted and its NEW machine-delegate admission
+	// (Subagent start/send) is refused while the count is positive. The count (not a set) lets
+	// overlapping interrupt scopes each hold a shared loop independently — the mark clears only
+	// when the last holding barrier releases. It is guarded by loopsMu — the SAME lock that gates
+	// the registry, closing, and faulted — so the mark-before-fanout select-and-mark is atomic
+	// w.r.t. a concurrent NewLoop / Interrupt. Human (AgencyUser) input is never gated by it.
+	// Lazily allocated (interrupt.go), so a struct-literal test session is safe. See interrupt.go.
+	interruptPending map[uuid.UUID]int
+
+	// interruptRelease is the pluggable admission-barrier release policy (Dependency Inversion
+	// seam): after an interrupt fan-out cancels a running turn, the session holds the
+	// interrupt-pending marks until this policy's AwaitRelease returns, then clears them. Nil
+	// (the default) resolves to sessionIdleRelease — release once the session next reaches idle
+	// (SessionIdle durably appended). Task 16 injects a workspace-aware policy via
+	// WithInterruptReleasePolicy. See interrupt.go.
+	interruptRelease InterruptReleasePolicy
 }
 
 // eventAppender is the session's narrow view of the hub's REQUIRED durable event tap:
@@ -301,7 +319,11 @@ func (h *loopHandle) mechanicalState() tool.DelegateStatusValue {
 	return h.state
 }
 
-func (h *loopHandle) Interrupt(context.Context) error { return h.owner.interruptLoopID(h.id) }
+// Interrupt is the loop.Controller interrupt: it cancels this loop's current turn AND every
+// loop below it in the delegate subtree (design: "loop.Controller.Interrupt marks one loop and
+// its delegate subtree"), marking the whole subtree interrupt-pending before fan-out. It is the
+// trusted controller mutation surface; the subtree selection + barrier live in interrupt.go.
+func (h *loopHandle) Interrupt(ctx context.Context) error { return h.owner.interruptSubtree(ctx, h.id) }
 
 type preparedLoop struct {
 	id    uuid.UUID
@@ -1431,88 +1453,22 @@ type loopSnapshot struct {
 	handle *loopHandle
 }
 
-// interruptTarget pairs a loop with the Ack channel of the command.Interrupt the
-// session sent it, so the ack-wait phase can drain each loop's reply in turn. It
-// is Interrupt-internal: the send phase records one per loop actually reached, and
-// the wait phase reads them back. The Ack is chan bool (cancelled?), distinct from
-// shutdownTarget's chan error (graceful-exit error).
-type interruptTarget struct {
-	loop loop.Backend
-	ack  chan bool
-}
-
-// Interrupt is the human "stop everything": it cancels the running turn of EVERY
-// loop in the session — the primary AND every sub-loop — not just the primary.
-// Sub-loops each run their own actor and turn, so a single human interrupt must
-// fan out to all of them. Idle loops (or loops already shutting down) ack false
-// and are harmless; Interrupt returns true iff ANY loop reported it cancelled a
-// running turn. ctx bounds the whole fan-out so a slow actor cannot wedge it.
+// Interrupt is the human "stop everything": it cancels the running turn of EVERY live loop
+// in the session — the primary AND every sub-loop — marking every one interrupt-pending BEFORE
+// fanning the command.Interrupt out to all of them CONCURRENTLY (design: "Session.Interrupt marks
+// every live loop interrupt-pending before concurrently sending commands"). Idle loops ack false
+// and are harmless; Interrupt returns true iff ANY loop reported it cancelled a running turn. A
+// fully-idle interrupt is fail-quiet: it returns false and appends no events. ctx bounds the
+// fan-out so a slow actor cannot wedge it.
 //
-// Unlike Shutdown, Interrupt does NOT latch closing and does NOT tear loops down:
-// it only cancels in-flight turns. A loop created concurrently with an Interrupt
-// is simply not in the snapshot and so is not interrupted — acceptable, because a
-// brand-new loop has no turn to cancel.
-//
-// The structure mirrors Shutdown's: snapshot the loops under loopsMu, send one
-// Interrupt per loop recording each reached loop's (loop, ack), then wait every
-// recorded ack and aggregate. Per-loop id-gen failure SKIPS that loop (best-effort,
-// consistent with Shutdown — one loop's failure never aborts the whole Interrupt).
+// Unlike Shutdown, Interrupt does NOT latch closing and does NOT tear loops down. It stamps
+// Agency=AgencyUser (a human pressed interrupt). Selection + marking + concurrent delivery +
+// the admission barrier live in interrupt.go (runInterrupt); this is the session-wide scope.
 func (s *Session) Interrupt(ctx context.Context) (bool, error) {
-	// Snapshot the loops under loopsMu (no closing latch — Interrupt does not tear
-	// loops down). The snapshot is the set we fan the Interrupt out to; it carries the
-	// loop id so the per-loop intent-log append can target each loop's command subject.
-	s.loopsMu.RLock()
-	snapshot := make([]loopSnapshot, 0, len(s.loops))
-	for lid, h := range s.loops {
-		snapshot = append(snapshot, loopSnapshot{loopID: lid, handle: h})
-	}
-	s.loopsMu.RUnlock()
-
-	// Send an Interrupt to every loop in the snapshot, recording each reached loop's
-	// (loop, ack) pair.
-	targets := make([]interruptTarget, 0, len(snapshot))
-	for _, ls := range snapshot {
-		id, err := s.newCommandID()
-		if err != nil {
-			// id-gen failure for ONE loop must not abort the whole Interrupt: skip its
-			// interrupt rather than failing the human's "stop everything". The worst
-			// case is that loop's turn runs to its natural terminal.
-			continue
-		}
-		// A manual Interrupt is a human-origination point (the human pressed interrupt),
-		// so it stamps Agency=AgencyUser. The programmatic per-loop interrupt
-		// (interruptLoop, the subagent drain's ctx-cancel fail-safe) is a SEPARATE method
-		// and stays machine — we never falsely attribute that machine action to a user.
-		ack := make(chan bool, 1)
-		cmd := command.Interrupt{Header: command.Header{CommandID: id, Agency: identity.AgencyUser, CreatedAt: s.stampNow()}, Ack: ack}
-		// Intent log (audit-only): one record per loop (the command is per-loop), appended
-		// BEFORE this loop's send; an append failure is logged and the fan-out proceeds.
-		s.appendCommand(ctx, ls.loopID, cmd)
-		select {
-		case ls.handle.backend.CommandSink() <- cmd:
-			targets = append(targets, interruptTarget{loop: ls.handle.backend, ack: ack})
-		case <-ls.handle.backend.DoneChan():
-			// Loop already exited; nothing to cancel.
-		case <-ctx.Done():
-			return false, &SessionError{Kind: SessionContextDone, Cause: ctx.Err()}
-		}
-	}
-
-	// Wait for each reached loop's ack, aggregating: Interrupt returns true iff ANY
-	// loop reported it cancelled a running turn.
-	var any bool
-	for _, t := range targets {
-		select {
-		case cancelled := <-t.ack:
-			any = any || cancelled
-		case <-t.loop.DoneChan():
-			// Actor exited without (or before we read) an ack; nothing was cancelled
-			// by us — leave any unchanged.
-		case <-ctx.Done():
-			return false, &SessionError{Kind: SessionContextDone, Cause: ctx.Err()}
-		}
-	}
-	return any, nil
+	any, _, err := s.runInterrupt(ctx, func() ([]loopSnapshot, bool) {
+		return s.liveLoopSnapshotLocked(), true
+	}, identity.AgencyUser)
+	return any, err
 }
 
 // releaseLease invokes the lease-release hook EXACTLY ONCE (releaseOnce) on the bounded
