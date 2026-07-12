@@ -1144,6 +1144,16 @@ func runLoop(cfg loopConfig, state loopState) {
 				// its own live state — race-free — and PUBLISHES the typed outcome event
 				// (TurnStarted / InputQueued / TurnRejected) onto the session fan-in. A
 				// UserInput may be rejected, so bypassReject is false.
+				if c.Accepted != nil {
+					publish(event.DelegateRequestAccepted{Header: event.Header{Cause: identity.Cause{CommandID: c.CommandID}}})
+					if fp := cfg.faultProbe; fp != nil {
+						if ferr := fp.FaultErr(); ferr != nil {
+							c.Accepted <- ferr
+							continue
+						}
+					}
+					c.Accepted <- nil
+				}
 				qi := queuedInput{inputID: c.CommandHeader().CommandID, agency: c.CommandHeader().Agency, msg: userMessageFromBlocks(c.Blocks), noFold: c.NoFold}
 				decideSubmit(qi, false)
 

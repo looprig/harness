@@ -394,6 +394,7 @@ func TestMarshalEventRoundTripEnduring(t *testing.T) {
 		{"LoopStarted with ParentToolUseID", LoopStarted{Header: fullHeaderLoop(), ParentToolUseID: "toolu_abc123"}},
 		{"LoopStarted with ForeignSID", LoopStarted{Header: fullHeaderLoop(), ForeignSID: "11111111-1111-1111-1111-111111111111"}},
 		{"LoopStarted with InitialMode", LoopStarted{Header: fullHeaderLoop(), InitialMode: "plan"}},
+		{"DelegateRequestAccepted", DelegateRequestAccepted{Header: eventHeaderWithCommand(fullHeaderLoop(), seededUUID(0x66))}},
 		{"LoopInferenceChanged", LoopInferenceChanged{Header: fullHeaderLoop(), Model: inference.CustomModel("openai", "responses", "https://api.openai.com", "gpt-5"), Effort: inference.EffortHigh}},
 		{"LoopModeChanged", LoopModeChanged{Header: fullHeaderLoop(), PreviousMode: "plan", Mode: "build"}},
 		{"ForeignSessionBound", ForeignSessionBound{Header: fullHeaderLoop(), ForeignSID: "sid"}},
@@ -674,7 +675,7 @@ func TestMarshalEventPermissionRequestedFullRequest(t *testing.T) {
 // without codec coverage changes the live count derived from classify+Class() and
 // fails TestMarshalEventCoversEveryEnduringType. A missed Enduring type is an
 // unpersistable event = silent restore data loss, which this guard forbids.
-const wantEnduringTypes = 27
+const wantEnduringTypes = 28
 
 // unionInstances is one instance of EVERY type in the sealed union (Enduring and
 // Ephemeral alike), mirroring TestClassifyExhaustive. The drift guard partitions
@@ -685,7 +686,7 @@ func unionInstances() []Event {
 		SessionStarted{}, SessionActive{}, SessionIdle{}, SessionStopped{},
 		RestoreStarted{}, RestoreDone{}, RestoreErrored{}, WorkspaceCheckpointed{}, WorkspaceRestored{}, ActiveLoopChanged{},
 		SecurityCeilingChanged{},
-		LoopIdle{}, LoopStarted{}, LoopInferenceChanged{}, LoopModeChanged{}, ForeignSessionBound{},
+		LoopIdle{}, LoopStarted{}, DelegateRequestAccepted{}, LoopInferenceChanged{}, LoopModeChanged{}, ForeignSessionBound{},
 		TokenDelta{}, TurnStarted{}, StepDone{}, TurnFoldedInto{}, InputCancelled{},
 		InputQueued{}, TurnRejected{}, TurnDone{}, TurnFailed{}, TurnInterrupted{},
 		PermissionRequested{}, PermissionDecided{}, UserInputRequested{}, ToolCallStarted{}, ToolCallCompleted{},
@@ -907,6 +908,11 @@ func fullHeaderLoop() Header {
 	h := fullHeader()
 	h.TurnID, h.StepID = uuid.UUID{}, uuid.UUID{}
 	return h
+}
+
+func eventHeaderWithCommand(header Header, commandID uuid.UUID) Header {
+	header.Cause.CommandID = commandID
+	return header
 }
 
 func fullHeaderTurn() Header {

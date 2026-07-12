@@ -30,6 +30,9 @@ type UserInput struct {
 	// TargetLoopID durably carries the dispatch target for machine NoFold delegate
 	// requests because storage replay cannot recover CommandRecord's transport-only loop.
 	TargetLoopID uuid.UUID `json:"target_loop_id,omitzero"`
+	// Accepted is the transient durable-acceptance ack used only by managed delegate
+	// sends. It is never serialized; prepared starts use LoopStarted.InitialRequestID.
+	Accepted chan error `json:"-"`
 }
 
 // SubagentResult delivers a finished subagent's output to its parent loop (the

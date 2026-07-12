@@ -306,6 +306,22 @@ func TestSubmitAppendsCommandRecord(t *testing.T) {
 	}
 }
 
+func TestAppendDelegateCommandRejectsRouteMismatchBeforeJournal(t *testing.T) {
+	t.Parallel()
+	recordLoop, targetLoop := mustUUID(), mustUUID()
+	app := &fakeCommandAppender{}
+	s, _ := fakeAppenderSession(app, time.Now(), recordLoop)
+	cmd := command.UserInput{Header: command.Header{CommandID: mustUUID(), Agency: identity.AgencyMachine}, NoFold: true, TargetLoopID: targetLoop}
+	err := s.appendDelegateCommand(context.Background(), recordLoop, cmd)
+	var mismatch *journal.CommandRouteMismatchError
+	if !errors.As(err, &mismatch) || mismatch.RecordLoopID != recordLoop || mismatch.TargetLoopID != targetLoop {
+		t.Fatalf("error = %T %+v, want route mismatch identity", err, err)
+	}
+	if got := len(app.snapshot()); got != 0 {
+		t.Fatalf("appender calls = %d, want 0", got)
+	}
+}
+
 // TestSubagentResultAppendsCommandRecord covers the spawner hand-back
 // (deliverSubagentResult → command.SubagentResult): the record targets the PARENT loop
 // and carries machine agency.

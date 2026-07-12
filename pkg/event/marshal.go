@@ -108,6 +108,11 @@ func MarshalEvent(ev Event) ([]byte, error) {
 			return nil, err
 		}
 	}
+	if _, accepted := ev.(DelegateRequestAccepted); accepted {
+		if err := validateEventBody(ev); err != nil {
+			return nil, err
+		}
+	}
 	payload, err := encodePayload(ev)
 	if err != nil {
 		return nil, err
@@ -134,7 +139,7 @@ func encodePayload(ev Event) ([]byte, error) {
 	case SessionStarted, SessionActive, SessionIdle, SessionStopped,
 		RestoreStarted, RestoreDone, WorkspaceCheckpointed, WorkspaceRestored,
 		ActiveLoopChanged, SecurityCeilingChanged,
-		LoopIdle, LoopStarted, LoopInferenceChanged, LoopModeChanged,
+		LoopIdle, LoopStarted, DelegateRequestAccepted, LoopInferenceChanged, LoopModeChanged,
 		ForeignSessionBound, TurnRejected,
 		UserInputRequested, TurnInterrupted,
 		TurnStarted, TurnFoldedInto, InputCancelled, TurnDone,
@@ -425,6 +430,8 @@ func decodePayload(tag string, data []byte) (Event, error) {
 		return decodePlain[LoopIdle](tag, data)
 	case "LoopStarted":
 		return decodePlain[LoopStarted](tag, data)
+	case "DelegateRequestAccepted":
+		return decodePlain[DelegateRequestAccepted](tag, data)
 	case "LoopInferenceChanged":
 		return decodePlain[LoopInferenceChanged](tag, data)
 	case "LoopModeChanged":

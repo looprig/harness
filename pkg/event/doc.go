@@ -34,6 +34,7 @@ var (
 	// Loop-scoped events.
 	_ Event = LoopIdle{}
 	_ Event = LoopStarted{}
+	_ Event = DelegateRequestAccepted{}
 	_ Event = LoopInferenceChanged{}
 	_ Event = LoopModeChanged{}
 	_ Event = ForeignSessionBound{}

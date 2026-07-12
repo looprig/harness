@@ -14,7 +14,6 @@ import (
 	"github.com/looprig/harness/pkg/ceiling"
 	"github.com/looprig/harness/pkg/command"
 	"github.com/looprig/harness/pkg/event"
-	"github.com/looprig/harness/pkg/hub"
 	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/journal"
 	"github.com/looprig/harness/pkg/loop"
@@ -53,12 +52,24 @@ func (ceilingPermissionGate) Grant(context.Context, string, string, tool.Approva
 }
 
 type failChildStartAppender struct {
-	parent uuid.UUID
-	err    error
+	enabled atomic.Bool
+	err     error
+}
+
+type failDelegateAcceptanceAppender struct {
+	enabled atomic.Bool
+	err     error
+}
+
+func (a *failDelegateAcceptanceAppender) AppendEvent(_ context.Context, ev event.Event) (uint64, error) {
+	if _, ok := ev.(event.DelegateRequestAccepted); ok && a.enabled.Load() {
+		return 0, a.err
+	}
+	return 1, nil
 }
 
 func (a *failChildStartAppender) AppendEvent(_ context.Context, ev event.Event) (uint64, error) {
-	if started, ok := ev.(event.LoopStarted); ok && started.Cause.Coordinates.LoopID == a.parent {
+	if _, ok := ev.(event.LoopStarted); ok && a.enabled.Load() {
 		return 0, a.err
 	}
 	return 1, nil
@@ -345,26 +356,60 @@ func TestCrashClosureReseedsInterruptedDelegateRequest(t *testing.T) {
 	t.Parallel()
 	requestID, turnID, childID := mustUUID(), mustUUID(), mustUUID()
 	original := []event.Event{
+		event.LoopStarted{Header: event.Header{Coordinates: identity.Coordinates{LoopID: childID}}, InitialRequestID: requestID},
 		event.TurnStarted{Header: event.Header{Coordinates: identity.Coordinates{LoopID: childID, TurnID: turnID}, Cause: identity.Cause{CommandID: requestID}}},
 	}
 	closure := event.TurnInterrupted{Header: event.Header{Coordinates: identity.Coordinates{LoopID: childID, TurnID: turnID}}}
 	manager := newDelegationManager(Topology{})
-	seedResolvedDelegateRecords(manager, nil, original, []event.Event{closure})
+	cmd := command.UserInput{Header: command.Header{CommandID: requestID, Agency: identity.AgencyMachine}, NoFold: true, TargetLoopID: childID}
+	if err := seedResolvedDelegateRecords(manager, []journal.JournalRecord{journal.NewCommandRecord(mustUUID(), childID, cmd)}, original, []event.Event{closure}); err != nil {
+		t.Fatal(err)
+	}
 	got, ok := manager.getResolved(requestID)
 	if !ok || got.childID != childID || got.status != tool.DelegateStatusInterrupted {
 		t.Fatalf("resolved = %+v, %v; want interrupted child %v", got, ok, childID)
 	}
 }
 
-func TestRestoreSeedsQueuedDelegateIntentAsInterrupted(t *testing.T) {
+func TestRestoreIgnoresUnacceptedDelegateIntent(t *testing.T) {
 	t.Parallel()
 	requestID, childID := mustUUID(), mustUUID()
 	cmd := command.UserInput{Header: command.Header{CommandID: requestID, Agency: identity.AgencyMachine}, NoFold: true, TargetLoopID: childID}
 	manager := newDelegationManager(Topology{})
-	seedResolvedDelegateRecords(manager, []journal.JournalRecord{journal.NewCommandRecord(mustUUID(), uuid.UUID{}, cmd)}, nil, nil)
-	got, ok := manager.getResolved(requestID)
-	if !ok || got.childID != childID || got.status != tool.DelegateStatusInterrupted {
-		t.Fatalf("queued durable intent = %+v, %v; want Interrupted child %v", got, ok, childID)
+	if err := seedResolvedDelegateRecords(manager, []journal.JournalRecord{journal.NewCommandRecord(mustUUID(), uuid.UUID{}, cmd)}, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if got, ok := manager.getResolved(requestID); ok {
+		t.Fatalf("unaccepted intent admitted: %+v", got)
+	}
+}
+
+func TestRestoreDoesNotAdmitOrdinaryTurnTerminalAsDelegateRequest(t *testing.T) {
+	t.Parallel()
+	requestID, turnID, childID := mustUUID(), mustUUID(), mustUUID()
+	ordinary := command.UserInput{Header: command.Header{CommandID: requestID, Agency: identity.AgencyUser}}
+	events := []event.Event{
+		event.TurnStarted{Header: event.Header{Coordinates: identity.Coordinates{LoopID: childID, TurnID: turnID}, Cause: identity.Cause{CommandID: requestID}}},
+		event.TurnDone{Header: event.Header{Coordinates: identity.Coordinates{LoopID: childID, TurnID: turnID}}, Message: aiMessage("ordinary answer")},
+	}
+	manager := newDelegationManager(Topology{})
+	if err := seedResolvedDelegateRecords(manager, []journal.JournalRecord{journal.NewCommandRecord(mustUUID(), childID, ordinary)}, events, nil); err != nil {
+		t.Fatal(err)
+	}
+	if got, ok := manager.getResolved(requestID); ok {
+		t.Fatalf("ordinary user request was admitted as delegate result: %+v", got)
+	}
+}
+
+func TestRestoreRejectsDelegateIntentRouteMismatch(t *testing.T) {
+	t.Parallel()
+	requestID, target, wrong := mustUUID(), mustUUID(), mustUUID()
+	cmd := command.UserInput{Header: command.Header{CommandID: requestID, Agency: identity.AgencyMachine}, NoFold: true, TargetLoopID: target}
+	manager := newDelegationManager(Topology{})
+	err := seedResolvedDelegateRecords(manager, []journal.JournalRecord{journal.NewCommandRecord(mustUUID(), wrong, cmd)}, nil, nil)
+	var mismatch *journal.CommandRouteMismatchError
+	if !errors.As(err, &mismatch) || mismatch.RecordLoopID != wrong || mismatch.TargetLoopID != target {
+		t.Fatalf("error = %T %+v, want typed route mismatch", err, err)
 	}
 }
 
@@ -745,10 +790,11 @@ func TestDelegateStartAppendFailureRollsBackPreparedChild(t *testing.T) {
 	t.Parallel()
 	sentinel := errors.New("child LoopStarted append failed")
 	parent := delegateParent(loop.DelegationManaged, "child")
-	s := newDelegationSession(t, parent, nil, delegateChild("child", "answer"))
-	// Replace the headless appender only after the root exists; fail exactly the child
-	// creation commit through the checked hub path.
-	s.hub = hub.New(s.SessionID(), hub.WithAppender(&failChildStartAppender{parent: s.PrimaryLoopID(), err: sentinel}), hub.WithFactory(s.factory), hub.WithFaultReporter(s))
+	appender := &failChildStartAppender{err: sentinel}
+	s := newDelegationSession(t, parent, []Option{WithEventAppender(appender)}, delegateChild("child", "answer"))
+	// The root LoopStarted has already committed. Fail exactly the next child creation
+	// commit without replacing the live session hub beneath running loop publishers.
+	appender.enabled.Store(true)
 	ctrl := s.delegation.controllerFor(s.PrimaryLoopID(), parent).(*scopedController)
 	beforeQuota := s.spawnedCount()
 	_, err := ctrl.Execute(context.Background(), tool.DelegateRequest{Operation: tool.DelegateStart, Agent: "child", Message: "go", Wait: false})
@@ -790,6 +836,27 @@ func TestDelegateRequiredIntentAppendFailureDoesNotDispatch(t *testing.T) {
 	}
 	if got := s.delegation.pendingCount(started.DelegateID); got != 0 {
 		t.Fatalf("failed send pending count = %d, want 0", got)
+	}
+}
+
+func TestDelegateAcceptanceAppendFailureReturnsNoHandle(t *testing.T) {
+	t.Parallel()
+	sentinel := errors.New("delegate acceptance append failed")
+	parent := delegateParent(loop.DelegationManaged, "child")
+	appender := &failDelegateAcceptanceAppender{err: sentinel}
+	s := newDelegationSession(t, parent, []Option{WithEventAppender(appender)}, delegateChild("child", "answer"))
+	ctrl := s.delegation.controllerFor(s.PrimaryLoopID(), parent)
+	started, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateStart, Agent: "child", Message: "A", Wait: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	appender.enabled.Store(true)
+	result, err := ctrl.Execute(context.Background(), tool.DelegateRequest{Operation: tool.DelegateSend, DelegateID: started.DelegateID, Message: "B", Wait: false})
+	if err == nil || !result.RequestID.IsZero() || !errors.Is(err, sentinel) {
+		t.Fatalf("send = %+v, %v; want no handle and acceptance failure", result, err)
+	}
+	if got := s.delegation.pendingCount(started.DelegateID); got != 0 {
+		t.Fatalf("pending=%d, want 0", got)
 	}
 }
 
@@ -1023,14 +1090,18 @@ func waitTurnStartedRequest(t *testing.T, sub interface{ Events() <-chan event.D
 func waitInputQueuedRequest(t *testing.T, sub interface{ Events() <-chan event.Delivery }, requestID uuid.UUID) bool {
 	t.Helper()
 	deadline := time.After(5 * time.Second)
+	accepted := false
 	for {
 		select {
 		case delivery, ok := <-sub.Events():
 			if !ok {
 				return false
 			}
+			if eventAccepted, ok := delivery.Event.(event.DelegateRequestAccepted); ok && eventAccepted.Cause.CommandID == requestID {
+				accepted = true
+			}
 			if queued, ok := delivery.Event.(event.InputQueued); ok && queued.Cause.CommandID == requestID {
-				return true
+				return accepted
 			}
 		case <-deadline:
 			return false

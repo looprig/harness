@@ -9,6 +9,7 @@ import (
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/command"
 	"github.com/looprig/harness/pkg/event"
+	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/loop"
 )
 
@@ -151,6 +152,16 @@ func (l *Loop) run(loopCtx context.Context) {
 		case cmd := <-l.Commands:
 			switch c := cmd.(type) {
 			case command.UserInput:
+				if c.Accepted != nil {
+					l.publisher(loopCtx, uuid.UUID{}, uuid.UUID{})(event.DelegateRequestAccepted{Header: event.Header{Cause: identity.Cause{CommandID: c.CommandID}}})
+					if probe, ok := l.pub.(interface{ FaultErr() error }); ok {
+						if err := probe.FaultErr(); err != nil {
+							c.Accepted <- err
+							continue
+						}
+					}
+					c.Accepted <- nil
+				}
 				if l.runTurn(loopCtx, c) {
 					return // a Shutdown arrived mid-turn; defer closes Done.
 				}

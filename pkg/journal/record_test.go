@@ -90,6 +90,37 @@ func TestCommandRecordIDAndTarget(t *testing.T) {
 	var _ JournalRecord = rec // CommandRecord satisfies the sealed sum.
 }
 
+func TestValidateCommandRecordRoute(t *testing.T) {
+	t.Parallel()
+	target, other := fixedUUID(0x61), fixedUUID(0x62)
+	cmd := command.UserInput{Header: command.Header{CommandID: fixedUUID(0x63), Agency: identity.AgencyMachine}, NoFold: true, TargetLoopID: target}
+	for _, tt := range []struct {
+		name    string
+		loopID  uuid.UUID
+		wantErr bool
+	}{
+		{name: "matching live route", loopID: target},
+		{name: "zero replay route unavailable", loopID: uuid.UUID{}},
+		{name: "mismatched route", loopID: other, wantErr: true},
+	} {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			record := NewCommandRecord(fixedUUID(0x64), tt.loopID, cmd)
+			err := ValidateCommandRecordRoute(record)
+			if !tt.wantErr {
+				if err != nil {
+					t.Fatalf("ValidateCommandRecordRoute: %v", err)
+				}
+				return
+			}
+			var mismatch *CommandRouteMismatchError
+			if !errors.As(err, &mismatch) || mismatch.RecordLoopID != other || mismatch.TargetLoopID != target {
+				t.Fatalf("error = %T %+v, want typed route mismatch", err, err)
+			}
+		})
+	}
+}
+
 // TestJournalRecordSumIsSealed asserts each record variant satisfies the sealed
 // JournalRecord marker (so a serializer's switch over the sum stays exhaustive) and
 // exposes a non-empty idempotency id.

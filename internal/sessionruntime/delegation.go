@@ -134,28 +134,57 @@ func newDelegationManager(topology Topology) *delegationManager {
 
 // seedResolvedDelegateRecords reconstructs durable delegate correlation from required
 // machine NoFold intents, then overlays exact started-turn terminals and crash closures.
-func seedResolvedDelegateRecords(m *delegationManager, records []journal.JournalRecord, replayed, closures []event.Event) {
-	index := make(map[uuid.UUID]resolvedRequest)
+func seedResolvedDelegateRecords(m *delegationManager, records []journal.JournalRecord, replayed, closures []event.Event) error {
+	intents := make(map[uuid.UUID]uuid.UUID)
 	for _, record := range records {
 		commandRecord, ok := record.(journal.CommandRecord)
 		if !ok {
 			continue
 		}
+		if err := journal.ValidateCommandRecordRoute(commandRecord); err != nil {
+			return err
+		}
 		input, ok := commandRecord.Command().(command.UserInput)
 		if !ok || !input.NoFold || input.Agency != identity.AgencyMachine || input.TargetLoopID.IsZero() || input.CommandID.IsZero() {
 			continue
 		}
-		index[input.CommandID] = resolvedRequest{childID: input.TargetLoopID, status: tool.DelegateStatusInterrupted}
+		intents[input.CommandID] = input.TargetLoopID
 	}
 	combined := make([]event.Event, 0, len(replayed)+len(closures))
 	combined = append(combined, replayed...)
 	combined = append(combined, closures...)
+	index := make(map[uuid.UUID]resolvedRequest)
+	for _, ev := range combined {
+		var requestID, childID uuid.UUID
+		switch accepted := ev.(type) {
+		case event.LoopStarted:
+			requestID, childID = accepted.InitialRequestID, accepted.LoopID
+		case event.DelegateRequestAccepted:
+			requestID, childID = accepted.Cause.CommandID, accepted.LoopID
+		default:
+			continue
+		}
+		if requestID.IsZero() {
+			continue
+		}
+		target, admitted := intents[requestID]
+		if !admitted {
+			continue
+		}
+		if childID != target {
+			return &journal.CommandRouteMismatchError{RecordLoopID: childID, TargetLoopID: target}
+		}
+		index[requestID] = resolvedRequest{childID: target, status: tool.DelegateStatusInterrupted}
+	}
 	for requestID, terminal := range foldDelegateTerminals(combined) {
-		index[requestID] = terminal
+		if _, admitted := index[requestID]; admitted {
+			index[requestID] = terminal
+		}
 	}
 	m.mu.Lock()
 	m.resolved = index
 	m.mu.Unlock()
+	return nil
 }
 
 func (m *delegationManager) getResolved(requestID uuid.UUID) (resolvedRequest, bool) {
@@ -661,13 +690,24 @@ func (s *Session) enqueueDelegateTurn(ctx context.Context, loopID uuid.UUID, blo
 	if err != nil {
 		return uuid.UUID{}, err
 	}
-	cmd := command.UserInput{Header: command.Header{CommandID: id, Agency: identity.AgencyMachine, CreatedAt: s.stampNow()}, Blocks: blocks, NoFold: true, TargetLoopID: loopID}
+	accepted := make(chan error, 1)
+	cmd := command.UserInput{Header: command.Header{CommandID: id, Agency: identity.AgencyMachine, CreatedAt: s.stampNow()}, Blocks: blocks, NoFold: true, TargetLoopID: loopID, Accepted: accepted}
 	if err := s.appendDelegateCommand(ctx, loopID, cmd); err != nil {
 		return uuid.UUID{}, err
 	}
 	select {
 	case backend.CommandSink() <- cmd:
-		return id, nil
+		select {
+		case err := <-accepted:
+			if err != nil {
+				return uuid.UUID{}, &SessionError{Kind: SessionDelegateIntentAppendFailed, Cause: err}
+			}
+			return id, nil
+		case <-ctx.Done():
+			return uuid.UUID{}, &SessionError{Kind: SessionContextDone, Cause: ctx.Err()}
+		case <-backend.DoneChan():
+			return uuid.UUID{}, &SessionError{Kind: SessionLoopExited}
+		}
 	case <-ctx.Done():
 		return uuid.UUID{}, &SessionError{Kind: SessionContextDone, Cause: ctx.Err()}
 	case <-backend.DoneChan():

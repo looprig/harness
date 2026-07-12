@@ -294,7 +294,9 @@ func restoreTopologySession(
 	}
 	// Correlation is seeded only after every checked crash closure committed, so an open
 	// wait:false request resolves as Interrupted after restore rather than unknown.
-	seedResolvedDelegateRecords(manager, allRecords, all, crashClosures)
+	if err := seedResolvedDelegateRecords(manager, allRecords, all, crashClosures); err != nil {
+		return recordErrored(&RestoreError{Kind: RestoreReplayFailed, Cause: err})
+	}
 
 	// (6b) Materialize the workspace ref selected by the latest durable transition BEFORE
 	// declaring the restore done, so

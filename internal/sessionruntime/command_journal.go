@@ -218,7 +218,11 @@ func (s *Session) appendDelegateCommand(ctx context.Context, loopID uuid.UUID, c
 	if s.cmdAppender == nil {
 		return nil
 	}
-	if err := s.cmdAppender.AppendCommand(ctx, journal.NewCommandRecord(s.sessionID, loopID, cmd)); err != nil {
+	record := journal.NewCommandRecord(s.sessionID, loopID, cmd)
+	if err := journal.ValidateCommandRecordRoute(record); err != nil {
+		return &SessionError{Kind: SessionDelegateIntentAppendFailed, Cause: err}
+	}
+	if err := s.cmdAppender.AppendCommand(ctx, record); err != nil {
 		return &SessionError{Kind: SessionDelegateIntentAppendFailed, Cause: err}
 	}
 	return nil

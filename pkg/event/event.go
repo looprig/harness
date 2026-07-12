@@ -326,6 +326,17 @@ type LoopStarted struct {
 	// InitialMode is the validated mode selected when the loop was constructed.
 	// Empty identifies the base mode and preserves legacy records.
 	InitialMode string `json:"initial_mode,omitzero"`
+	// InitialRequestID proves the prepared delegate's initial command was accepted
+	// before this durable loop-creation commit. Zero for roots/plain loops.
+	InitialRequestID uuid.UUID `json:"initial_request_id,omitzero"`
+}
+
+// DelegateRequestAccepted is the durable actor-side acceptance of a follow-up
+// machine NoFold request, emitted before it can queue or start.
+type DelegateRequestAccepted struct {
+	enduring
+	loopScoped
+	Header // Cause.CommandID=request, Coordinates.LoopID=target child
 }
 
 // ForeignSessionBound records the foreign agent session id for adapters that
@@ -338,16 +349,17 @@ type ForeignSessionBound struct {
 	ForeignSID string `json:"foreign_sid"`
 }
 
-func (SessionStarted) isEvent()        {}
-func (SessionActive) isEvent()         {}
-func (SessionIdle) isEvent()           {}
-func (SessionStopped) isEvent()        {}
-func (RestoreStarted) isEvent()        {}
-func (RestoreDone) isEvent()           {}
-func (RestoreErrored) isEvent()        {}
-func (WorkspaceCheckpointed) isEvent() {}
-func (WorkspaceRestored) isEvent()     {}
-func (ActiveLoopChanged) isEvent()     {}
-func (LoopIdle) isEvent()              {}
-func (LoopStarted) isEvent()           {}
-func (ForeignSessionBound) isEvent()   {}
+func (SessionStarted) isEvent()          {}
+func (SessionActive) isEvent()           {}
+func (SessionIdle) isEvent()             {}
+func (SessionStopped) isEvent()          {}
+func (RestoreStarted) isEvent()          {}
+func (RestoreDone) isEvent()             {}
+func (RestoreErrored) isEvent()          {}
+func (WorkspaceCheckpointed) isEvent()   {}
+func (WorkspaceRestored) isEvent()       {}
+func (ActiveLoopChanged) isEvent()       {}
+func (LoopIdle) isEvent()                {}
+func (LoopStarted) isEvent()             {}
+func (DelegateRequestAccepted) isEvent() {}
+func (ForeignSessionBound) isEvent()     {}

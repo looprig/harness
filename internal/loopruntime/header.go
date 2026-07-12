@@ -46,6 +46,9 @@ func stampLoopHeader(ev event.Event, sessionID, loopID, turnID uuid.UUID) event.
 	case event.TurnStarted:
 		e.Header = fillLoopScoped(e.Header, sessionID, loopID)
 		return e
+	case event.DelegateRequestAccepted:
+		e.Header = fillLoopScoped(e.Header, sessionID, loopID)
+		return e
 	case event.StepDone:
 		e.Header = fillLoopScoped(e.Header, sessionID, loopID)
 		return e
@@ -96,6 +99,9 @@ func stampLoopHeader(ev event.Event, sessionID, loopID, turnID uuid.UUID) event.
 func withLoopHeader(ev event.Event, h event.Header) event.Event {
 	switch e := ev.(type) {
 	case event.TurnStarted:
+		e.Header = h
+		return e
+	case event.DelegateRequestAccepted:
 		e.Header = h
 		return e
 	case event.StepDone:

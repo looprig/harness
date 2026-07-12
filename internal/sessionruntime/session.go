@@ -852,6 +852,9 @@ func (s *Session) newLoopWithAdmission(parent loop.Provenance, cfg loop.Definiti
 	// (Coordinates/Cause + minted EventID/CreatedAt) was stamped above before the loop
 	// was built.
 	ev := event.LoopStarted{Header: startedHeader, ParentToolUseID: parentToolUseID, ForeignSID: foreignSID, InitialMode: string(startedMode)}
+	if admission != nil {
+		ev.InitialRequestID = admission.requestID
+	}
 	publish := s.PublishEvent
 	if admission != nil {
 		publish = s.hub.PublishEventChecked

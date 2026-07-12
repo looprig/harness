@@ -40,6 +40,7 @@ const (
 	FieldConsistency     FieldName = "Consistency"
 	FieldTrigger         FieldName = "Trigger"
 	FieldCause           FieldName = "Cause"
+	FieldCommandID       FieldName = "CommandID"
 	FieldActiveLoopID    FieldName = "ActiveLoopID"
 	FieldModel           FieldName = "Model"
 	FieldEffort          FieldName = "Effort"
@@ -125,6 +126,10 @@ func validateEventBody(ev Event) error {
 	case ActiveLoopChanged:
 		if e.ActiveLoopID.IsZero() {
 			return &InvalidEventError{Event: "ActiveLoopChanged", Field: FieldActiveLoopID, Rule: RuleRequired}
+		}
+	case DelegateRequestAccepted:
+		if e.Cause.CommandID.IsZero() {
+			return &InvalidEventError{Event: "DelegateRequestAccepted", Field: FieldCommandID, Rule: RuleRequired}
 		}
 	case LoopInferenceChanged:
 		if err := e.Model.Validate(); err != nil {
@@ -260,6 +265,8 @@ func classify(ev Event) (name string, profile idProfile, ok bool) {
 		// zero). The spawning loop/turn/step rides in Header.Cause, which the validator
 		// never constrains — same shape as LoopIdle.
 		return "LoopStarted", loopProfile(), true
+	case DelegateRequestAccepted:
+		return "DelegateRequestAccepted", loopProfile(), true
 	case LoopInferenceChanged:
 		return "LoopInferenceChanged", loopProfile(), true
 	case LoopModeChanged:

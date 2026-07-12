@@ -175,10 +175,6 @@ github.com/openai/openai-go/v3/responses
 github.com/openai/openai-go/v3/shared
 github.com/openai/openai-go/v3/shared/constant
 github.com/openai/openai-go/v3/webhooks
-# github.com/santhosh-tekuri/jsonschema/v6 v6.0.2
-## explicit; go 1.21
-github.com/santhosh-tekuri/jsonschema/v6
-github.com/santhosh-tekuri/jsonschema/v6/kind
 # github.com/securego/gosec/v2 v2.27.1
 ## explicit; go 1.25.0
 github.com/securego/gosec/v2
@@ -309,18 +305,6 @@ golang.org/x/telemetry/internal/telemetry
 golang.org/x/telemetry/internal/upload
 # golang.org/x/text v0.37.0
 ## explicit; go 1.25.0
-golang.org/x/text/feature/plural
-golang.org/x/text/internal
-golang.org/x/text/internal/catmsg
-golang.org/x/text/internal/format
-golang.org/x/text/internal/language
-golang.org/x/text/internal/language/compact
-golang.org/x/text/internal/number
-golang.org/x/text/internal/stringset
-golang.org/x/text/internal/tag
-golang.org/x/text/language
-golang.org/x/text/message
-golang.org/x/text/message/catalog
 golang.org/x/text/secure/bidirule
 golang.org/x/text/transform
 golang.org/x/text/unicode/bidi

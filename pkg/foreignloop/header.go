@@ -25,6 +25,9 @@ func fillForeignHeader(ev event.Event, sessionID, loopID, turnID, stepID uuid.UU
 	case event.ForeignSessionBound:
 		e.Header.SessionID, e.Header.LoopID = sessionID, loopID
 		return e
+	case event.DelegateRequestAccepted:
+		e.Header.SessionID, e.Header.LoopID = sessionID, loopID
+		return e
 	case event.TurnDone:
 		e.Header.SessionID, e.Header.LoopID, e.Header.TurnID = sessionID, loopID, turnID
 		return e
@@ -61,6 +64,9 @@ func withForeignHeader(ev event.Event, h event.Header) event.Event {
 		e.Header = h
 		return e
 	case event.ForeignSessionBound:
+		e.Header = h
+		return e
+	case event.DelegateRequestAccepted:
 		e.Header = h
 		return e
 	case event.StepDone:

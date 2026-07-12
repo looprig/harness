@@ -1,13 +1,26 @@
 package journal
 
 import (
+	"fmt"
 	"strconv"
 
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/command"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/gate"
+	"github.com/looprig/harness/pkg/identity"
 )
+
+// CommandRouteMismatchError reports disagreement between a durable delegate
+// command's embedded target and the live CommandRecord dispatch route.
+type CommandRouteMismatchError struct {
+	RecordLoopID uuid.UUID
+	TargetLoopID uuid.UUID
+}
+
+func (e *CommandRouteMismatchError) Error() string {
+	return fmt.Sprintf("journal: delegate command route mismatch: record loop %s != target loop %s", e.RecordLoopID, e.TargetLoopID)
+}
 
 // JournalRecord is the sealed sum a session's serialized writer persists: an
 // Enduring event, a command (the intent log), or an internal LeaseFence. It is a
@@ -66,6 +79,23 @@ type CommandRecord struct {
 // the command itself may not carry it.
 func NewCommandRecord(sessionID, loopID uuid.UUID, cmd command.Command) CommandRecord {
 	return CommandRecord{sessionID: sessionID, loopID: loopID, cmd: cmd}
+}
+
+// ValidateCommandRecordRoute validates the command's own identity contract, then
+// cross-checks the duplicated live dispatch route for machine NoFold delegate input.
+// A zero record LoopID is accepted only because storage replay cannot reconstruct it.
+func ValidateCommandRecordRoute(record CommandRecord) error {
+	if err := command.ValidateCommand(record.cmd); err != nil {
+		return err
+	}
+	input, ok := record.cmd.(command.UserInput)
+	if !ok || !input.NoFold || input.Agency != identity.AgencyMachine {
+		return nil
+	}
+	if record.loopID.IsZero() || record.loopID == input.TargetLoopID {
+		return nil
+	}
+	return &CommandRouteMismatchError{RecordLoopID: record.loopID, TargetLoopID: input.TargetLoopID}
 }
 
 // Command returns the wrapped command for the serializer to marshal.

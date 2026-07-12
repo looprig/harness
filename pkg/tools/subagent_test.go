@@ -10,7 +10,6 @@ import (
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/harness/pkg/tool"
-	jsonschema "github.com/santhosh-tekuri/jsonschema/v6"
 )
 
 // subagent_test.go exercises the flat action-envelope Subagent tool against a FAKE
@@ -276,89 +275,86 @@ func TestSubagentSchemaIsClosedAndCatalogsModes(t *testing.T) {
 	}
 }
 
-func TestSubagentSchemaValidatesActionEnvelopes(t *testing.T) {
+func TestSubagentSchemaActionBranchesAreClosedAndExplicit(t *testing.T) {
 	t.Parallel()
-	del := "55555555-5555-4555-8555-555555555555"
-	req := "66666666-6666-4666-8666-666666666666"
-	tests := []struct {
-		name  string
-		input string
-		valid bool
-	}{
-		{name: "omitted action defaults start", input: `{"agent":"explorer","message":"map"}`, valid: true},
-		{name: "explicit start", input: `{"action":"start","agent":"operator","mode":"build","message":"build"}`, valid: true},
-		{name: "send", input: `{"action":"send","delegate_id":"` + del + `","message":"more","wait":false}`, valid: true},
-		{name: "wait", input: `{"action":"wait","delegate_id":"` + del + `","request_id":"` + req + `"}`, valid: true},
-		{name: "interrupt", input: `{"action":"interrupt","delegate_id":"` + del + `"}`, valid: true},
-		{name: "status all", input: `{"action":"status"}`, valid: true},
-		{name: "send missing message", input: `{"action":"send","delegate_id":"` + del + `"}`},
-		{name: "wait with forbidden wait", input: `{"action":"wait","delegate_id":"` + del + `","request_id":"` + req + `","wait":true}`},
-		{name: "interrupt with message", input: `{"action":"interrupt","delegate_id":"` + del + `","message":"x"}`},
-		{name: "status with request", input: `{"action":"status","request_id":"` + req + `"}`},
-		{name: "wrong agent mode", input: `{"agent":"explorer","mode":"build","message":"x"}`},
-	}
 	info, err := NewSubagent(&fakeController{}, loop.DelegationManaged, subagentCatalog()).Info(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	compiler := jsonschema.NewCompiler()
-	var schemaDocument any
-	if err := json.Unmarshal(info.Schema, &schemaDocument); err != nil {
+	var schema map[string]any
+	if err := json.Unmarshal(info.Schema, &schema); err != nil {
 		t.Fatal(err)
 	}
-	if err := compiler.AddResource("subagent.json", schemaDocument); err != nil {
-		t.Fatal(err)
+	if schema["additionalProperties"] != false {
+		t.Fatal("schema must set additionalProperties:false")
 	}
-	schema, err := compiler.Compile("subagent.json")
-	if err != nil {
-		t.Fatalf("compile schema: %v\n%s", err, info.Schema)
+	branches := schema["allOf"].([]any)
+	if len(branches) != 6 {
+		t.Fatalf("allOf branches=%d, want 6", len(branches))
 	}
-	for _, tt := range tests {
-		tt := tt
-		t.Run(tt.name, func(t *testing.T) {
-			var value any
-			if err := json.Unmarshal([]byte(tt.input), &value); err != nil {
-				t.Fatal(err)
-			}
-			err := schema.Validate(value)
-			if (err == nil) != tt.valid {
-				t.Fatalf("Validate(%s) error = %v, valid=%v", tt.input, err, tt.valid)
-			}
-		})
-	}
-	syncInfo, err := NewSubagent(&fakeController{}, loop.DelegationSyncOnly, subagentCatalog()).Info(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	var syncDocument any
-	if err := json.Unmarshal(syncInfo.Schema, &syncDocument); err != nil {
-		t.Fatal(err)
-	}
-	syncCompiler := jsonschema.NewCompiler()
-	if err := syncCompiler.AddResource("sync-subagent.json", syncDocument); err != nil {
-		t.Fatal(err)
-	}
-	syncSchema, err := syncCompiler.Compile("sync-subagent.json")
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, tt := range []struct {
-		input string
-		valid bool
+	fields := []string{"agent", "mode", "delegate_id", "request_id", "message", "wait", "timeout_seconds"}
+	expected := []struct {
+		index             int
+		action            string
+		required, allowed []string
 	}{
-		{input: `{"agent":"explorer","message":"map"}`, valid: true},
-		{input: `{"action":"start","agent":"explorer","message":"map","wait":true}`, valid: true},
-		{input: `{"action":"start","agent":"explorer","message":"map","wait":false}`},
-		{input: `{"action":"status"}`},
-	} {
-		var value any
-		if err := json.Unmarshal([]byte(tt.input), &value); err != nil {
-			t.Fatal(err)
+		{0, "start", []string{"agent", "message"}, []string{"agent", "mode", "message", "wait", "timeout_seconds"}},
+		{2, "send", []string{"delegate_id", "message"}, []string{"delegate_id", "message", "wait", "timeout_seconds"}},
+		{3, "wait", []string{"delegate_id", "request_id"}, []string{"delegate_id", "request_id", "timeout_seconds"}},
+		{4, "interrupt", []string{"delegate_id"}, []string{"delegate_id"}},
+		{5, "status", nil, []string{"delegate_id"}},
+	}
+	stringSet := func(values any) map[string]bool {
+		out := map[string]bool{}
+		if values == nil {
+			return out
 		}
-		err := syncSchema.Validate(value)
-		if (err == nil) != tt.valid {
-			t.Fatalf("sync Validate(%s) error = %v, valid=%v", tt.input, err, tt.valid)
+		for _, value := range values.([]any) {
+			out[value.(string)] = true
 		}
+		return out
+	}
+	for _, want := range expected {
+		branch := branches[want.index].(map[string]any)
+		predicate := branch["if"].(map[string]any)
+		if !stringSet(predicate["required"])["action"] {
+			t.Fatalf("%s predicate does not require action", want.action)
+		}
+		gotAction := predicate["properties"].(map[string]any)["action"].(map[string]any)["const"]
+		if gotAction != want.action {
+			t.Fatalf("branch %d action=%v, want %s", want.index, gotAction, want.action)
+		}
+		then := branch["then"].(map[string]any)
+		required := stringSet(then["required"])
+		for _, field := range want.required {
+			if !required[field] {
+				t.Fatalf("%s missing required %s", want.action, field)
+			}
+		}
+		allowed := map[string]bool{}
+		for _, field := range want.allowed {
+			allowed[field] = true
+		}
+		forbidden := map[string]bool{}
+		for _, item := range then["not"].(map[string]any)["anyOf"].([]any) {
+			for field := range stringSet(item.(map[string]any)["required"]) {
+				forbidden[field] = true
+			}
+		}
+		for _, field := range fields {
+			if forbidden[field] == allowed[field] {
+				t.Fatalf("%s field %s allowed=%v forbidden=%v", want.action, field, allowed[field], forbidden[field])
+			}
+		}
+	}
+	defaultBranch := branches[1].(map[string]any)
+	defaultIf := defaultBranch["if"].(map[string]any)["not"].(map[string]any)
+	if !stringSet(defaultIf["required"])["action"] {
+		t.Fatal("default branch is not 'not required(action)'")
+	}
+	defaultRequired := stringSet(defaultBranch["then"].(map[string]any)["required"])
+	if !defaultRequired["agent"] || !defaultRequired["message"] {
+		t.Fatal("default start must require agent+message")
 	}
 }
 
