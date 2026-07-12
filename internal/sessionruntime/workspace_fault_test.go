@@ -48,4 +48,21 @@ func TestWatchRootLeaseFaultsSession(t *testing.T) {
 	if !errors.As(err, &lease) {
 		t.Fatalf("faultIfFaulted() = %v, want cause *WorkspaceRootLeaseLostError", err)
 	}
+	if err := s.WaitIdle(context.Background()); !errors.As(err, &lease) {
+		t.Fatalf("WaitIdle after known-latched lease loss = %v, want public root-lost error", err)
+	}
+}
+
+func TestManualCheckpointRecoveryCannotClearNewerTerminalWaiterFault(t *testing.T) {
+	id := mustUUID()
+	s := &Session{sessionID: id, hub: hub.New(id), loops: map[uuid.UUID]*loopHandle{}}
+	recoverable := errors.New("required checkpoint fault")
+	s.latchWorkspaceCheckpointFault(recoverable)
+	terminalCause := errors.New("newer terminal persistence fault")
+	terminal := &hub.SessionPersistenceFault{Cause: terminalCause}
+	s.ReportFault(context.Background(), terminal)
+	s.recoverWorkspaceCheckpointFault()
+	if err := s.WaitIdle(context.Background()); !errors.Is(err, terminalCause) {
+		t.Fatalf("WaitIdle after older recovery = %v, want newer terminal fault", err)
+	}
 }

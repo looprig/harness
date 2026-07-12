@@ -1741,6 +1741,9 @@ func TestRequiredCheckpointFaultRejectsQueuedWorkAcrossLoopsUntilManualRecovery(
 	fault := errors.New("required checkpoint failed")
 	s.latchWorkspaceCheckpointFault(fault)
 	releaseWriter()
+	if err := s.WaitIdle(context.Background()); !errors.Is(err, fault) {
+		t.Fatalf("WaitIdle after required checkpoint fault = %v, want fault", err)
+	}
 
 	deadline := time.Now().Add(time.Second)
 	for {
@@ -1769,6 +1772,9 @@ func TestRequiredCheckpointFaultRejectsQueuedWorkAcrossLoopsUntilManualRecovery(
 	}
 	if _, err := s.CheckpointWorkspace(context.Background()); err != nil {
 		t.Fatalf("manual recovery checkpoint: %v", err)
+	}
+	if err := s.WaitIdle(context.Background()); err != nil {
+		t.Fatalf("WaitIdle after successful manual recovery = %v, want nil", err)
 	}
 	recoveredCommand, err := s.SubmitToLoop(context.Background(), childID, nil)
 	if err != nil {

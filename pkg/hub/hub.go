@@ -45,6 +45,12 @@ type Hub struct {
 	subs    map[*EventSubscription]struct{}
 	state   sessionState
 	waiters map[chan error]struct{}
+	// waiterFailure is a sticky fault observed by every WaitIdle caller until the
+	// owning recoverable operation clears its exact generation token. Later faults
+	// overwrite both value and token, so stale recovery cannot erase them.
+	waiterFailure           error
+	waiterFailureToken      uint64
+	waiterFailureGeneration uint64
 	// Idle boundary generations close the WaitIdle fast-path window between an
 	// in-memory Active→Idle transition and its native durable completion. A generation
 	// prevents an older overlapping boundary from clearing a newer pending edge.
@@ -597,18 +603,19 @@ func (h *Hub) AbortSession(cause error) <-chan struct{} {
 // ErrSessionStopped if the session is or becomes stopped. With no session
 // goroutine, waiters are woken by applyActivity (Active->Idle) and StopSession.
 //
-// Invariant for concurrent callers: the immediate "already idle" fast-return reflects
-// in-memory quiescence state only, which a concurrent derived-append failure may be
-// about to fault (the in-memory Active->Idle edge crossed, but its durable SessionIdle
-// append has not yet committed). A caller consulting WaitIdle concurrently with
-// publishes must therefore treat a subsequent SessionFaulted as authoritative over a
-// nil/idle result observed in that window.
+// Sticky waiter failures are checked under the same lock before the idle fast path or
+// waiter registration, closing the fault-before-registration race. Stopped takes
+// precedence so every post-stop call returns ErrSessionStopped.
 func (h *Hub) WaitIdle(ctx context.Context) error {
 	h.mu.Lock()
 	switch {
 	case h.state.phase == SessionStopped:
 		h.mu.Unlock()
 		return ErrSessionStopped
+	case h.waiterFailure != nil:
+		err := h.waiterFailure
+		h.mu.Unlock()
+		return err
 	case len(h.state.active) == 0 && h.idleBoundaryPending == 0:
 		h.mu.Unlock()
 		return nil
@@ -638,17 +645,41 @@ func (h *Hub) IsIdle() bool {
 	return h.state.phase == SessionIdle && len(h.state.active) == 0 && h.idleBoundaryPending == 0
 }
 
-// FailWaiters wakes every WaitIdle waiter with err and clears the registry. It is
-// the session's escalation lever on a SessionPersistenceFault: a faulted session is
-// neither idle nor cleanly stopped, so its blocked WaitIdle callers must be released
-// with the fault rather than left hanging or falsely told "idle". Exported for the
+// FailWaiters latches err as the current sticky waiter failure, returns its
+// monotonically increasing generation token, wakes every WaitIdle waiter, and clears
+// the registry. It is the session's escalation lever on a SessionPersistenceFault:
+// a faulted session is neither idle nor cleanly stopped, so its blocked WaitIdle
+// callers must be released with the fault rather than left hanging or falsely told
+// "idle". Exported for the
 // session only (its FaultReporter implementation); loops never see it. It takes the
-// lock itself (called outside it). A waiter that registers AFTER this point will, on
-// a fresh WaitIdle, still block — the session's reject-new-work latch is the broader
-// backstop; this only releases the waiters outstanding at fault time.
-func (h *Hub) FailWaiters(err error) {
+// lock itself (called outside it). A waiter that arrives after this point observes the
+// same sticky error before consulting idle state or registering.
+func (h *Hub) FailWaiters(err error) uint64 {
 	h.mu.Lock()
+	h.waiterFailureGeneration++
+	if h.waiterFailureGeneration == 0 {
+		h.waiterFailureGeneration++
+	}
+	token := h.waiterFailureGeneration
+	h.waiterFailure = err
+	h.waiterFailureToken = token
 	h.wakeWaitersLocked(err)
+	h.mu.Unlock()
+	return token
+}
+
+// ClearWaiterFailure clears the sticky waiter failure only when token still owns the
+// current generation. A stale recovery token is a no-op, preserving any newer
+// persistence or root-lease fault.
+func (h *Hub) ClearWaiterFailure(token uint64) {
+	if token == 0 {
+		return
+	}
+	h.mu.Lock()
+	if h.waiterFailureToken == token {
+		h.waiterFailure = nil
+		h.waiterFailureToken = 0
+	}
 	h.mu.Unlock()
 }
 

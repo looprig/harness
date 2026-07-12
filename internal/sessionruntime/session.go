@@ -88,6 +88,10 @@ type Session struct {
 	faultErr          error
 	workspaceFaulted  bool
 	workspaceFaultErr error
+	// workspaceWaiterFailureToken is the sticky Hub waiter-failure generation
+	// owned by the recoverable required-checkpoint latch. Manual recovery may clear
+	// only this token; a newer terminal fault has a different generation.
+	workspaceWaiterFailureToken uint64
 
 	// limits are the in-session subagent-spawn safety caps NewLoop enforces (depth +
 	// quota). Defaulted in newSession (withDefaults) so the live values are always
@@ -588,7 +592,10 @@ func (s *Session) latchWorkspaceCheckpointFault(err error) {
 	if s.checkpointAdmission != nil {
 		s.checkpointAdmission.latch(err)
 	}
-	s.hub.FailWaiters(err)
+	token := s.hub.FailWaiters(err)
+	s.loopsMu.Lock()
+	s.workspaceWaiterFailureToken = token
+	s.loopsMu.Unlock()
 }
 
 func (s *Session) recoverWorkspaceCheckpointFault() {
@@ -599,9 +606,12 @@ func (s *Session) recoverWorkspaceCheckpointFault() {
 		s.checkpointAdmission.recover()
 	}
 	s.loopsMu.Lock()
+	token := s.workspaceWaiterFailureToken
 	s.workspaceFaulted = false
 	s.workspaceFaultErr = nil
+	s.workspaceWaiterFailureToken = 0
 	s.loopsMu.Unlock()
+	s.hub.ClearWaiterFailure(token)
 }
 
 // observeBestEffortCheckpointError reports an automatic checkpoint failure without

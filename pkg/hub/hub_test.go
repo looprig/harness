@@ -743,6 +743,46 @@ func TestWaitIdleAlreadyIdle(t *testing.T) {
 	}
 }
 
+func TestFailWaitersBeforeWaitIdleReturnsStickyFault(t *testing.T) {
+	h := New(mustID(t))
+	fault := errors.New("sticky waiter fault")
+	token := h.FailWaiters(fault)
+	if token == 0 {
+		t.Fatal("FailWaiters token = 0")
+	}
+	if err := h.WaitIdle(context.Background()); err != fault {
+		t.Fatalf("WaitIdle = %v, want exact sticky fault %v", err, fault)
+	}
+}
+
+func TestFailWaitersRacesWaitIdleRegistration(t *testing.T) {
+	for i := 0; i < 1000; i++ {
+		h := New(mustID(t))
+		h.ExpectTurn(context.Background(), mustID(t))
+		fault := errors.New("registration race fault")
+		started := make(chan struct{})
+		result := make(chan error, 1)
+		go func() {
+			close(started)
+			result <- h.WaitIdle(context.Background())
+		}()
+		<-started
+		h.FailWaiters(fault)
+		if err := <-result; err != fault {
+			t.Fatalf("iteration %d WaitIdle = %v, want exact fault", i, err)
+		}
+	}
+}
+
+func TestWaitIdleStoppedPrecedesStickyFailure(t *testing.T) {
+	h := New(mustID(t))
+	h.FailWaiters(errors.New("sticky fault"))
+	h.StopSession(context.Background())
+	if err := h.WaitIdle(context.Background()); !errors.Is(err, ErrSessionStopped) {
+		t.Fatalf("WaitIdle after stop = %v, want ErrSessionStopped precedence", err)
+	}
+}
+
 type blockingIdleBoundary struct {
 	entered chan event.SessionIdle
 	release chan struct{}
