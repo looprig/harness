@@ -101,6 +101,10 @@ type loopConfig struct {
 	// loopState.draining and replies the queued inputs. Unbuffered (synchronous).
 	drains chan drainRequest
 
+	// admissions returns asynchronous session-wide first-step admission results to
+	// the actor, keeping Interrupt/Shutdown responsive while a checkpoint writer waits.
+	admissions chan admissionResult
+
 	// done is closed by runLoop when the actor has fully exited (the public
 	// Loop.Done is its receive side).
 	done chan struct{}
@@ -174,6 +178,10 @@ type executionAdmission interface {
 // no durable tap to fail).
 type faultProbe interface {
 	FaultErr() error
+}
+
+type admissionFaultProbe interface {
+	AdmissionFaultErr() error
 }
 
 // effectiveConfig is the loop's CURRENT turn-affecting configuration: the mode, model,
@@ -307,6 +315,7 @@ func newLoopWithSeed(loopCtx context.Context, sessionID, loopID uuid.UUID, paren
 		internal:     make(chan turnResult, 1),
 		commits:      make(chan commitRequest),
 		drains:       make(chan drainRequest),
+		admissions:   make(chan admissionResult),
 		done:         done,
 		events:       events,
 		eventFactory: cfg.eventFactory,
@@ -344,6 +353,7 @@ type loopStatus int
 const (
 	loopIdle loopStatus = iota
 	loopRunning
+	loopWaitingAdmission
 	loopShuttingDown
 )
 
@@ -374,7 +384,9 @@ type queuedInput struct {
 	// tool-continuation boundary. drainInbox skips it (and everything behind it), so it
 	// stays queued and starts its OWN distinct turn when the current one finishes —
 	// preserving the request-id → TurnStarted correlation delegate `send` relies on.
-	noFold bool
+	noFold               bool
+	reservedTurnID       uuid.UUID
+	rejectOnStartFailure bool
 }
 
 type loopState struct {
@@ -395,12 +407,13 @@ type loopState struct {
 	// state — the things the actor mutates.
 	parent Provenance
 
-	turnIndex   event.TurnIndex
-	turnID      uuid.UUID // entity id for the active turn; zero when idle
-	causationID uuid.UUID // active submit command's Header.ID; zero when idle
-	status      loopStatus
-	cancelTurn  context.CancelFunc
-	msgs        content.AgenticMessages // conversation history across turns
+	turnIndex       event.TurnIndex
+	turnID          uuid.UUID // entity id for the active turn; zero when idle
+	causationID     uuid.UUID // active submit command's Header.ID; zero when idle
+	status          loopStatus
+	cancelTurn      context.CancelFunc
+	cancelAdmission context.CancelFunc
+	msgs            content.AgenticMessages // conversation history across turns
 
 	// effective is the loop's CURRENT turn-affecting configuration (mode/model/effort/
 	// system/tools). startTurn captures a copy of it into the per-turn turnConfig, so a
@@ -494,6 +507,11 @@ type drainRequest struct {
 	reply chan<- []queuedInput
 }
 
+type admissionResult struct {
+	release func()
+	err     error
+}
+
 // runLoop is the loop goroutine started by New. It is the only goroutine that
 // mutates loopState, installs or clears the active turn, commits or discards turn
 // messages, emits TurnStarted/StepDone/TurnFoldedInto at the same points it mutates
@@ -521,6 +539,7 @@ func runLoop(cfg loopConfig, state loopState) {
 	internal := cfg.internal
 	commits := cfg.commits
 	drains := cfg.drains
+	admissions := cfg.admissions
 	requestCancelActive := false
 
 	// publish sends a FULL-FIDELITY loop event to the session-level event fan-in.
@@ -708,7 +727,7 @@ func runLoop(cfg loopConfig, state loopState) {
 	//   - emit: the turn goroutine's event emit, publish-only (every loop event reaches
 	//     consumers through the session fan-in). publish never blocks the actor, so the
 	//     turn goroutine cannot be pinned by a slow consumer.
-	buildTurnConfig := func(base content.AgenticMessages) turnConfig {
+	buildTurnConfig := func(base content.AgenticMessages, firstAdmission func()) turnConfig {
 		admit := func(context.Context) (func(), error) { return func() {}, nil }
 		if admission, ok := cfg.events.(executionAdmission); ok {
 			admit = admission.EnterExecution
@@ -757,6 +776,7 @@ func runLoop(cfg loopConfig, state loopState) {
 			gateReg:        gateReg,
 			idGen:          config.idGen,
 			admit:          admit,
+			firstAdmission: firstAdmission,
 			commit:         commit,
 			drainPending:   drainPending,
 			emit:           publish,
@@ -771,11 +791,11 @@ func runLoop(cfg loopConfig, state loopState) {
 	// returns the new TurnID; on an id-gen failure it returns a non-nil error and
 	// starts nothing (the caller decides how to surface it). The actor is the sole
 	// caller, so it always runs with state.status idle.
-	startTurnWithID := func(turnID uuid.UUID, qi queuedInput) uuid.UUID {
+	startTurnWithIDAndAdmission := func(turnID uuid.UUID, qi queuedInput, firstAdmission func()) uuid.UUID {
 		turnCtx, base := installActiveTurn(turnID, qi)
 		idx := state.turnIndex
 		ts := newTurnState(state.sessionID, state.id, turnID, idx, state.causationID, qi.msg)
-		turnCfg := buildTurnConfig(base)
+		turnCfg := buildTurnConfig(base, firstAdmission)
 		cancel := state.cancelTurn
 
 		go func() {
@@ -792,6 +812,9 @@ func runLoop(cfg loopConfig, state loopState) {
 			internal <- turnResult{terminal: terminal}
 		}()
 		return turnID
+	}
+	startTurnWithID := func(turnID uuid.UUID, qi queuedInput) uuid.UUID {
+		return startTurnWithIDAndAdmission(turnID, qi, nil)
 	}
 	startTurn := func(qi queuedInput) (uuid.UUID, error) {
 		turnID, err := config.idGen()
@@ -852,6 +875,8 @@ func runLoop(cfg loopConfig, state loopState) {
 		})
 	}
 
+	var requestStartAdmission func() bool
+
 	// decideSubmit resolves a UserInput/SubagentResult against the actor's OWN live
 	// state (race-free), PUBLISHING the typed outcome event rather than replying a
 	// command.Disposition. Every submit may queue behind a running turn: a busy loop
@@ -867,12 +892,22 @@ func runLoop(cfg loopConfig, state loopState) {
 	// (the loop is healthy and the caller MAY retry — distinct from RejectShuttingDown,
 	// which says the loop is going away).
 	decideSubmit := func(qi queuedInput, bypassReject bool) {
+		if probe, ok := cfg.events.(admissionFaultProbe); ok {
+			if err := probe.AdmissionFaultErr(); err != nil {
+				if bypassReject {
+					returnEntry(qi, event.CancelTurnFailed, uuid.UUID{})
+				} else {
+					rejectSubmit(qi, event.RejectInternal)
+				}
+				return
+			}
+		}
 		switch {
 		case state.status == loopShuttingDown && !bypassReject:
 			rejectSubmit(qi, event.RejectShuttingDown)
 		case len(state.inbox) >= runtimecontract.ManagedInputQueueCapacity && !bypassReject:
 			rejectSubmit(qi, event.RejectQueueFull)
-		case state.status == loopRunning || (state.status == loopShuttingDown && bypassReject):
+		case state.status == loopRunning || state.status == loopWaitingAdmission || (state.status == loopShuttingDown && bypassReject):
 			// Busy (or a never-rejected SubagentResult while shutting down): accept into
 			// the inbox (ordered) and publish InputQueued (Ephemeral). The submit resolves
 			// on the fan-in. A SubagentResult queued during shutdown is later returned via
@@ -887,28 +922,10 @@ func runLoop(cfg loopConfig, state loopState) {
 					},
 				},
 			})
-		default: // idle: start a turn from the submit.
-			if _, err := startTurn(qi); err != nil {
-				slog.Error("turn id generation failed; declining submit", "error", err)
-				if bypassReject {
-					// A SubagentResult is NEVER rejected — even an idle-time id-gen
-					// failure must release its {wake} quiescence token on the PUBLISH
-					// path (it produces no off-publish release anymore). TurnRejected does
-					// NOT release {wake}; InputCancelled (carrying Cause.LoopID) does,
-					// so an internal failure to start a SubagentResult is surfaced as an
-					// InputCancelled (the input never committed) rather than a reject.
-					returnEntry(qi, event.CancelTurnFailed, uuid.UUID{})
-					return
-				}
-				// Fail-secure for a UserInput: cannot mint a TurnID. Publish a rejection
-				// so any issuer unblocks. The loop is healthy (only id-gen failed), so this
-				// is RejectInternal — a transient failure the caller MAY retry, NOT
-				// RejectShuttingDown.
-				rejectSubmit(qi, event.RejectInternal)
-				return
-			}
-			// startTurn already emitted event.TurnStarted (the Started outcome); there is
-			// no separate Started event to publish here.
+		default: // idle: reserve session execution admission before TurnStarted.
+			qi.rejectOnStartFailure = !bypassReject
+			state.inbox = append(state.inbox, qi)
+			requestStartAdmission()
 		}
 	}
 
@@ -920,6 +937,12 @@ func runLoop(cfg loopConfig, state loopState) {
 			c.Accepted <- err
 			return
 		}
+		if probe, ok := cfg.events.(admissionFaultProbe); ok {
+			if err := probe.AdmissionFaultErr(); err != nil {
+				c.Accepted <- err
+				return
+			}
+		}
 		reject := func(reason event.RejectReason, cause error) {
 			rejectSubmit(qi, reason)
 			c.Accepted <- &loop.InputRejectedError{Reason: reason, Cause: cause}
@@ -929,7 +952,7 @@ func runLoop(cfg loopConfig, state loopState) {
 			reject(event.RejectShuttingDown, nil)
 		case len(state.inbox) >= runtimecontract.ManagedInputQueueCapacity:
 			reject(event.RejectQueueFull, nil)
-		case state.status == loopRunning:
+		case state.status == loopRunning || state.status == loopWaitingAdmission:
 			if err := publishAcceptance(c.CommandID); err != nil {
 				c.Accepted <- err
 				return
@@ -941,7 +964,6 @@ func runLoop(cfg loopConfig, state loopState) {
 			turnID, err := config.idGen()
 			if err != nil {
 				idErr := &IDGenerationError{Cause: err}
-				slog.Error("turn id generation failed; declining delegate submit", "error", idErr)
 				reject(event.RejectInternal, idErr)
 				return
 			}
@@ -949,7 +971,9 @@ func runLoop(cfg loopConfig, state loopState) {
 				c.Accepted <- err
 				return
 			}
-			startTurnWithID(turnID, qi)
+			qi.reservedTurnID = turnID
+			state.inbox = append(state.inbox, qi)
+			requestStartAdmission()
 			c.Accepted <- nil
 		}
 	}
@@ -990,6 +1014,39 @@ func runLoop(cfg loopConfig, state loopState) {
 		qi := state.inbox[0]
 		state.inbox = state.inbox[1:]
 		return qi, true
+	}
+
+	requestStartAdmission = func() bool {
+		if len(state.inbox) == 0 || state.status == loopShuttingDown || state.status == loopWaitingAdmission {
+			return false
+		}
+		admission, ok := cfg.events.(executionAdmission)
+		if !ok {
+			next, _ := popFront()
+			if _, err := startTurn(next); err != nil {
+				if next.rejectOnStartFailure {
+					rejectSubmit(next, event.RejectInternal)
+				} else {
+					returnEntry(next, event.CancelTurnFailed, uuid.UUID{})
+				}
+				return false
+			}
+			return true
+		}
+		state.status = loopWaitingAdmission
+		admitCtx, cancel := context.WithCancel(ctx)
+		state.cancelAdmission = cancel
+		go func() {
+			release, err := admission.EnterExecution(admitCtx)
+			select {
+			case admissions <- admissionResult{release: release, err: err}:
+			case <-admitCtx.Done():
+				if release != nil {
+					release()
+				}
+			}
+		}()
+		return true
 	}
 
 	// drainInbox is the tool-continuation drain: it pops + clears the ENTIRE inbox in
@@ -1052,6 +1109,12 @@ func runLoop(cfg loopConfig, state loopState) {
 			// Removed from the inbox by a retract: resolve it via returnEntry (the one
 			// return-emit point). TurnID is zero — a pure retract outside any turn.
 			returnEntry(qi, event.CancelClientRetracted, uuid.UUID{})
+			if state.status == loopWaitingAdmission && len(state.inbox) == 0 && state.cancelAdmission != nil {
+				state.cancelAdmission()
+				state.cancelAdmission = nil
+				state.status = loopIdle
+				emitLoopIdle()
+			}
 			return
 		}
 		// Not queued: already started/folded or never queued. No-op — the outcome is
@@ -1073,6 +1136,12 @@ func runLoop(cfg loopConfig, state loopState) {
 			}
 			state.inbox = append(state.inbox[:i], state.inbox[i+1:]...)
 			returnEntry(qi, event.CancelClientRetracted, uuid.UUID{})
+			if state.status == loopWaitingAdmission && len(state.inbox) == 0 && state.cancelAdmission != nil {
+				state.cancelAdmission()
+				state.cancelAdmission = nil
+				state.status = loopIdle
+				emitLoopIdle()
+			}
 			c.Ack <- command.DelegateCancelQueued
 			return
 		}
@@ -1095,23 +1164,8 @@ func runLoop(cfg loopConfig, state loopState) {
 	// endedTurnID is the turn that ended (the cause of any return). chained==true means
 	// the loop stayed running, so the caller must NOT emit LoopIdle between the turns.
 	startNextQueued := func(endedTurnID uuid.UUID) (chained bool) {
-		next, ok := popFront()
-		if !ok {
-			return false
-		}
-		// Inbox-exit invariant: next is now REMOVED from the inbox, so it MUST reach
-		// either startTurn-success or returnEntry — never neither (that would silently
-		// strand it).
-		if _, err := startTurn(next); err != nil {
-			// Could not mint a TurnID for the popped entry: resolve THAT entry as
-			// returned (returnQueuedInbox would not — next is no longer in the inbox),
-			// then return any remaining entries too.
-			slog.Error("turn id generation failed starting queued input; returning it", "error", err)
-			returnEntry(next, event.CancelTurnFailed, endedTurnID)
-			returnQueuedInbox(event.CancelTurnFailed, endedTurnID)
-			return false
-		}
-		return true // running -> running; no LoopIdle between turns
+		_ = endedTurnID
+		return requestStartAdmission()
 	}
 	resolveQueueAfterTurn := func(result turnResult, endedTurnID uuid.UUID) (chained bool) {
 		if _, normal := result.terminal.(event.TurnDone); !normal {
@@ -1142,8 +1196,9 @@ func runLoop(cfg loopConfig, state loopState) {
 		endedTurnID := state.turnID
 		// The terminal publish must still carry this turn's correlation IDs (stamped by
 		// publish from state.turnID), so clear them only afterward.
-		if err := commitBoundary(result.terminal); err != nil {
-			slog.Error("turn boundary commit failed", "error", err)
+		boundaryErr := commitBoundary(result.terminal)
+		if boundaryErr != nil {
+			slog.Error("turn boundary commit failed", "error", boundaryErr)
 		}
 		state.turnID = uuid.UUID{}
 		state.causationID = uuid.UUID{}
@@ -1158,6 +1213,14 @@ func runLoop(cfg loopConfig, state loopState) {
 			returnQueuedInbox(cancelReasonFor(result.terminal), endedTurnID)
 			ackShutdowns(nil)
 			return true
+		}
+		if boundaryErr != nil {
+			// The completed terminal is already durable, but its required checkpoint
+			// failed. Do not chain accepted input across the persistence fault: resolve
+			// every queued entry exactly once and park idle for manual recovery.
+			returnQueuedInbox(event.CancelTurnFailed, endedTurnID)
+			emitLoopIdle()
+			return false
 		}
 		if targetedCancellation {
 			if !startNextQueued(endedTurnID) {
@@ -1339,6 +1402,13 @@ func runLoop(cfg loopConfig, state loopState) {
 					// continuation so the terminal returns/flushed queued input normally.
 					requestCancelActive = false
 					c.Ack <- true
+				} else if state.status == loopWaitingAdmission && state.cancelAdmission != nil {
+					state.cancelAdmission()
+					state.cancelAdmission = nil
+					state.status = loopIdle
+					returnQueuedInbox(event.CancelTurnInterrupted, uuid.UUID{})
+					emitLoopIdle()
+					c.Ack <- true
 				} else {
 					c.Ack <- false
 				}
@@ -1353,10 +1423,18 @@ func runLoop(cfg loopConfig, state loopState) {
 					continue
 				}
 				wasRunning := state.status == loopRunning
+				wasWaitingAdmission := state.status == loopWaitingAdmission
 				state.status = loopShuttingDown
 				if state.cancelTurn != nil {
 					state.cancelTurn()
 					state.cancelTurn = nil
+				}
+				if wasWaitingAdmission && state.cancelAdmission != nil {
+					state.cancelAdmission()
+					state.cancelAdmission = nil
+					returnQueuedInbox(event.CancelTurnInterrupted, uuid.UUID{})
+					ackShutdowns(nil)
+					return
 				}
 				if !wasRunning {
 					// Idle shutdown: no turn is running. Return any still-queued input
@@ -1406,6 +1484,54 @@ func runLoop(cfg loopConfig, state loopState) {
 			// the actor keeps appending to. reply is buffered(1); the send never blocks.
 			req.reply <- loopSnapshot{msgs: cloneMessages(state.msgs), turnIndex: state.turnIndex}
 
+		case result := <-admissions:
+			state.cancelAdmission = nil
+			if state.status == loopShuttingDown {
+				if result.release != nil {
+					result.release()
+				}
+				returnQueuedInbox(event.CancelTurnInterrupted, uuid.UUID{})
+				ackShutdowns(nil)
+				return
+			}
+			if state.status != loopWaitingAdmission {
+				if result.release != nil {
+					result.release()
+				}
+				continue
+			}
+			if result.err != nil {
+				state.status = loopIdle
+				returnQueuedInbox(event.CancelTurnFailed, uuid.UUID{})
+				emitLoopIdle()
+				continue
+			}
+			next, ok := popFront()
+			if !ok {
+				result.release()
+				state.status = loopIdle
+				emitLoopIdle()
+				continue
+			}
+			turnID := next.reservedTurnID
+			var err error
+			if turnID.IsZero() {
+				turnID, err = config.idGen()
+			}
+			if err != nil {
+				result.release()
+				state.status = loopIdle
+				if next.rejectOnStartFailure {
+					rejectSubmit(next, event.RejectInternal)
+				} else {
+					returnEntry(next, event.CancelTurnFailed, uuid.UUID{})
+				}
+				returnQueuedInbox(event.CancelTurnFailed, uuid.UUID{})
+				emitLoopIdle()
+				continue
+			}
+			startTurnWithIDAndAdmission(turnID, next, result.release)
+
 		case req := <-drains:
 			// Tool-continuation drain: pop + clear the inbox into draining and reply the
 			// queued inputs. The actor is the sole owner of inbox/draining, and the turn
@@ -1445,6 +1571,10 @@ func runLoop(cfg loopConfig, state loopState) {
 			}
 
 		case <-ctx.Done():
+			if state.cancelAdmission != nil {
+				state.cancelAdmission()
+				state.cancelAdmission = nil
+			}
 			if state.cancelTurn != nil {
 				state.cancelTurn()
 				state.cancelTurn = nil

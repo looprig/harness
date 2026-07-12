@@ -61,19 +61,21 @@ type checkedCheckpointPublisher interface {
 }
 
 type checkpointControllerConfig struct {
-	SessionID   uuid.UUID
-	Policy      checkpointPolicy
-	Store       *workspacestore.Store
-	Root        string
-	Mode        WorkspacePlacementMode
-	Coordinator tool.WorkspaceCoordinator
-	Publisher   checkedCheckpointPublisher
-	Factory     *event.Factory
-	Idle        func() bool
-	Fault       func(error)
-	Faulted     func() error
-	Recover     func()
-	Admission   func(context.Context) (func(), error)
+	SessionID      uuid.UUID
+	Policy         checkpointPolicy
+	Store          *workspacestore.Store
+	Root           string
+	Mode           WorkspacePlacementMode
+	Coordinator    tool.WorkspaceCoordinator
+	Publisher      checkedCheckpointPublisher
+	Factory        *event.Factory
+	Idle           func() bool
+	Fault          func(error)
+	Faulted        func() error
+	Recover        func()
+	Admission      func(context.Context) (func(), error)
+	RequiredQueued func(event.Event)
+	ManualQueued   func()
 }
 
 type checkpointController struct {
@@ -91,12 +93,27 @@ type checkpointController struct {
 	wg                sync.WaitGroup
 	activeCancel      context.CancelFunc
 	activationPending bool
+	requiredQueue     []*requiredRequest
+	requiredRunner    bool
 }
 
 type checkpointRequest struct {
 	ctx              context.Context
 	trigger          event.Event
 	alreadyPublished bool
+}
+
+type checkpointResult struct {
+	ref workspacestore.Ref
+	err error
+}
+
+type requiredRequest struct {
+	ctx     context.Context
+	trigger event.Event
+	run     func(context.Context) (workspacestore.Ref, error)
+	result  chan checkpointResult
+	started bool
 }
 
 func newCheckpointController(cfg checkpointControllerConfig) *checkpointController {
@@ -133,33 +150,21 @@ func (c *checkpointController) boundary(ctx context.Context, trigger event.Event
 	if c.cfg.Policy.Priority == checkpointBestEffort {
 		return c.bestEffortBoundary(ctx, trigger)
 	}
-	if c.cfg.Faulted != nil {
-		if fault := c.cfg.Faulted(); fault != nil {
-			_ = c.cfg.Publisher.PublishEventChecked(ctx, trigger)
-			return &CheckpointError{Kind: CheckpointFaulted, Cause: fault}
+	_, err := c.runRequired(ctx, trigger, func(runCtx context.Context) (workspacestore.Ref, error) {
+		published := false
+		publish := func() error {
+			err := c.cfg.Publisher.PublishEventChecked(runCtx, trigger)
+			if err == nil {
+				published = true
+			}
+			return err
 		}
-	}
-	if !c.beginOperation() {
-		return c.cfg.Publisher.PublishEventChecked(ctx, trigger)
-	}
-	defer c.wg.Done()
-	published := false
-	publish := func() error {
-		err := c.cfg.Publisher.PublishEventChecked(ctx, trigger)
-		if err == nil {
-			published = true
+		ref, commitErr := c.commit(runCtx, trigger, checkpointTriggerKind(trigger), publish, nil)
+		if commitErr != nil && !published {
+			_ = publish()
 		}
-		return err
-	}
-	_, err := c.commit(ctx, trigger, checkpointTriggerKind(trigger), publish, nil)
-	if err != nil && !published {
-		// An admission/permit failure precedes the normal trigger position. Preserve
-		// the already-completed execution edge even though no checkpoint can commit.
-		_ = publish()
-	}
-	if err != nil && c.cfg.Fault != nil {
-		c.cfg.Fault(err)
-	}
+		return ref, commitErr
+	})
 	return err
 }
 
@@ -170,31 +175,21 @@ func (c *checkpointController) sessionIdle(ctx context.Context, idle event.Sessi
 	if c.cfg.Policy.Priority == checkpointBestEffort {
 		return c.bestEffortBoundaryWithCommit(ctx, idle, publish)
 	}
-	if c.cfg.Faulted != nil {
-		if fault := c.cfg.Faulted(); fault != nil {
-			_ = publish()
-			return &CheckpointError{Kind: CheckpointFaulted, Cause: fault}
+	_, err := c.runRequired(ctx, idle, func(runCtx context.Context) (workspacestore.Ref, error) {
+		published := false
+		trackedPublish := func() error {
+			err := publish()
+			if err == nil {
+				published = true
+			}
+			return err
 		}
-	}
-	if !c.beginOperation() {
-		return publish()
-	}
-	defer c.wg.Done()
-	published := false
-	trackedPublish := func() error {
-		err := publish()
-		if err == nil {
-			published = true
+		ref, commitErr := c.commit(runCtx, idle, event.SnapshotTriggerIdle, trackedPublish, nil)
+		if commitErr != nil && !published {
+			_ = trackedPublish()
 		}
-		return err
-	}
-	_, err := c.commit(ctx, idle, event.SnapshotTriggerIdle, trackedPublish, nil)
-	if err != nil && !published {
-		_ = trackedPublish()
-	}
-	if err != nil && c.cfg.Fault != nil {
-		c.cfg.Fault(err)
-	}
+		return ref, commitErr
+	})
 	return err
 }
 
@@ -202,17 +197,22 @@ func (c *checkpointController) manual(ctx context.Context) (workspacestore.Ref, 
 	if c == nil {
 		return "", &CheckpointError{Kind: CheckpointUnavailable}
 	}
+	if c.cfg.Policy.Priority == checkpointRequired {
+		if c.cfg.ManualQueued != nil {
+			c.cfg.ManualQueued()
+		}
+		return c.runRequired(ctx, nil, func(runCtx context.Context) (workspacestore.Ref, error) {
+			return c.commit(runCtx, nil, event.SnapshotTriggerManual, nil, nil)
+		})
+	}
 	if !c.beginManualOperation() {
 		return "", &CheckpointError{Kind: CheckpointCanceled, Cause: context.Canceled}
 	}
+	if c.cfg.ManualQueued != nil {
+		c.cfg.ManualQueued()
+	}
 	defer c.wg.Done()
 	ref, err := c.commit(ctx, nil, event.SnapshotTriggerManual, nil, nil)
-	if err != nil && c.cfg.Policy.Priority == checkpointRequired && c.cfg.Fault != nil {
-		c.cfg.Fault(err)
-	}
-	if err == nil && c.cfg.Recover != nil {
-		c.cfg.Recover()
-	}
 	c.mu.Lock()
 	c.manualWaiting--
 	start := c.takePendingLocked()
@@ -330,14 +330,77 @@ func (c *checkpointController) runBestEffort(req checkpointRequest, triggerCommi
 	}()
 }
 
-func (c *checkpointController) beginOperation() bool {
+func (c *checkpointController) runRequired(
+	ctx context.Context,
+	trigger event.Event,
+	run func(context.Context) (workspacestore.Ref, error),
+) (workspacestore.Ref, error) {
+	req := &requiredRequest{ctx: ctx, trigger: trigger, run: run, result: make(chan checkpointResult, 1)}
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	if c.closed {
-		return false
+		c.mu.Unlock()
+		return "", &CheckpointError{Kind: CheckpointCanceled, Cause: context.Canceled}
 	}
 	c.wg.Add(1)
-	return true
+	c.requiredQueue = append(c.requiredQueue, req)
+	startRunner := !c.requiredRunner
+	if startRunner {
+		c.requiredRunner = true
+	}
+	c.mu.Unlock()
+	if c.cfg.RequiredQueued != nil {
+		c.cfg.RequiredQueued(trigger)
+	}
+	if startRunner {
+		go c.runRequiredQueue()
+	}
+
+	select {
+	case result := <-req.result:
+		return result.ref, result.err
+	case <-ctx.Done():
+		c.mu.Lock()
+		if !req.started {
+			removed := false
+			for i, queued := range c.requiredQueue {
+				if queued == req {
+					c.requiredQueue = append(c.requiredQueue[:i], c.requiredQueue[i+1:]...)
+					removed = true
+					break
+				}
+			}
+			c.mu.Unlock()
+			if removed {
+				c.wg.Done()
+				return "", &CheckpointError{Kind: CheckpointCanceled, Cause: ctx.Err()}
+			}
+		} else {
+			c.mu.Unlock()
+		}
+		// Once selected by the FIFO runner, a request owns completion; caller
+		// cancellation cannot let a successor overtake its durable transaction.
+		result := <-req.result
+		return result.ref, result.err
+	}
+}
+
+func (c *checkpointController) runRequiredQueue() {
+	for {
+		c.mu.Lock()
+		if len(c.requiredQueue) == 0 {
+			c.requiredRunner = false
+			c.mu.Unlock()
+			return
+		}
+		req := c.requiredQueue[0]
+		c.requiredQueue = c.requiredQueue[1:]
+		req.started = true
+		c.mu.Unlock()
+
+		ref, err := req.run(c.ctx)
+		req.result <- checkpointResult{ref: ref, err: err}
+		c.wg.Done()
+	}
 }
 
 func (c *checkpointController) beginManualOperation() bool {
@@ -410,22 +473,62 @@ func (c *checkpointController) matches(trigger event.Event) bool {
 	return false
 }
 
-func (c *checkpointController) commit(caller context.Context, trigger event.Event, kind event.SnapshotTriggerKind, triggerCommit func() error, accepted func()) (workspacestore.Ref, error) {
+func (c *checkpointController) commit(caller context.Context, trigger event.Event, kind event.SnapshotTriggerKind, triggerCommit func() error, accepted func()) (ref workspacestore.Ref, err error) {
 	if c.cfg.Store == nil || c.cfg.Coordinator == nil || c.cfg.Factory == nil {
-		return "", &CheckpointError{Kind: CheckpointUnavailable}
+		err = &CheckpointError{Kind: CheckpointUnavailable}
+		if trigger != nil {
+			c.latchRequired(err)
+		}
+		return "", err
 	}
 	ctx, cancel := c.operationContext(caller)
 	defer cancel()
-	if c.cfg.Admission != nil && (c.cfg.Policy.Priority == checkpointRequired || kind == event.SnapshotTriggerManual) {
-		releaseAdmission, err := c.cfg.Admission(ctx)
-		if err != nil {
-			return "", c.classifyError(err)
+	admissionHeld := false
+	durabilityAttempted := false
+	defer func() {
+		if admissionHeld {
+			return
 		}
-		defer releaseAdmission()
+		if err != nil && (trigger != nil || durabilityAttempted) {
+			c.latchRequired(err)
+		} else if kind == event.SnapshotTriggerManual && c.cfg.Recover != nil {
+			c.cfg.Recover()
+		}
+	}()
+	if c.cfg.Admission != nil && (c.cfg.Policy.Priority == checkpointRequired || kind == event.SnapshotTriggerManual) {
+		releaseAdmission, admissionErr := c.cfg.Admission(ctx)
+		if admissionErr != nil {
+			err = c.classifyError(admissionErr)
+			return "", err
+		}
+		admissionHeld = true
+		defer func() {
+			if err != nil && (trigger != nil || durabilityAttempted) {
+				c.latchRequired(err)
+			} else if kind == event.SnapshotTriggerManual && c.cfg.Recover != nil {
+				// Recovery clears the workspace fault and admission latch while the
+				// writer is still held; readers wake only after releaseAdmission.
+				c.cfg.Recover()
+			}
+			releaseAdmission()
+		}()
+	}
+	if trigger != nil && c.cfg.Policy.Priority == checkpointRequired && c.cfg.Faulted != nil {
+		if fault := c.cfg.Faulted(); fault != nil {
+			publish := triggerCommit
+			if publish == nil {
+				publish = func() error { return c.cfg.Publisher.PublishEventChecked(ctx, trigger) }
+			}
+			if publishErr := publish(); publishErr != nil {
+				return "", &CheckpointError{Kind: CheckpointTriggerAppendFailed, Cause: publishErr}
+			}
+			return "", &CheckpointError{Kind: CheckpointFaulted, Cause: fault}
+		}
 	}
 	if kind == event.SnapshotTriggerManual && (c.cfg.Idle == nil || !c.cfg.Idle()) {
 		return "", &CheckpointError{Kind: CheckpointNotIdle}
 	}
+	durabilityAttempted = true
 	permit, err := c.cfg.Coordinator.Acquire(ctx, tool.WorkspaceOperationCheckpoint, "")
 	if err != nil {
 		return "", c.classifyError(err)
@@ -446,7 +549,7 @@ func (c *checkpointController) commit(caller context.Context, trigger event.Even
 	if accepted != nil {
 		accepted()
 	}
-	ref, err := c.cfg.Store.Snapshot(ctx, c.cfg.Root)
+	ref, err = c.cfg.Store.Snapshot(ctx, c.cfg.Root)
 	if err != nil {
 		return "", c.classifyError(err)
 	}
@@ -463,6 +566,12 @@ func (c *checkpointController) commit(caller context.Context, trigger event.Even
 		return "", &CheckpointError{Kind: CheckpointAppendFailed, Cause: err}
 	}
 	return ref, nil
+}
+
+func (c *checkpointController) latchRequired(err error) {
+	if err != nil && c.cfg.Policy.Priority == checkpointRequired && c.cfg.Fault != nil {
+		c.cfg.Fault(err)
+	}
 }
 
 func (c *checkpointController) operationContext(caller context.Context) (context.Context, context.CancelFunc) {

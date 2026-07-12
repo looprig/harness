@@ -47,3 +47,26 @@ func TestCheckpointAdmissionWriterBlocksNewExecutionAcrossLoops(t *testing.T) {
 		release()
 	}
 }
+
+func TestCheckpointAdmissionFaultLatchSurvivesWriterReleaseUntilRecovery(t *testing.T) {
+	t.Parallel()
+	gate := newCheckpointAdmissionGate()
+	latched := errors.New("checkpoint fault")
+	release, err := gate.enterCheckpoint(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	gate.latch(latched)
+	release()
+
+	if _, err := gate.enterExecution(context.Background()); !errors.Is(err, latched) {
+		t.Fatalf("execution after failed writer release = %v, want latched fault", err)
+	}
+
+	gate.recover()
+	if releaseExecution, err := gate.enterExecution(context.Background()); err != nil {
+		t.Fatalf("execution after recovery = %v", err)
+	} else {
+		releaseExecution()
+	}
+}

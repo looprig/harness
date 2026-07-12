@@ -434,10 +434,19 @@ func (s *Session) latchWorkspaceCheckpointFault(err error) {
 	s.workspaceFaulted = true
 	s.workspaceFaultErr = err
 	s.loopsMu.Unlock()
+	if s.checkpointAdmission != nil {
+		s.checkpointAdmission.latch(err)
+	}
 	s.hub.FailWaiters(err)
 }
 
 func (s *Session) recoverWorkspaceCheckpointFault() {
+	// The manual checkpoint still holds the writer admission here. Clear the gate
+	// latch first (readers remain blocked by the writer), then clear the public
+	// workspace-fault rejection, and only afterward does the controller release writer.
+	if s.checkpointAdmission != nil {
+		s.checkpointAdmission.recover()
+	}
 	s.loopsMu.Lock()
 	s.workspaceFaulted = false
 	s.workspaceFaultErr = nil
@@ -454,6 +463,10 @@ func (s *Session) recoverWorkspaceCheckpointFault() {
 func (s *Session) FaultErr() error {
 	return s.faultIfFaulted()
 }
+
+// AdmissionFaultErr is the loop actor's last-moment admission probe, closing the
+// Session submit check→send race without changing the narrower change-event FaultErr seam.
+func (s *Session) AdmissionFaultErr() error { return s.faultIfFaulted() }
 
 // PublishEvent is the session's eventPublisher implementation passed to loop.New.
 // It delegates to the hub, which fans the event out to matching subscribers and
@@ -949,6 +962,13 @@ func (s *Session) newLoopWithAdmission(parent loop.Provenance, cfg loop.Definiti
 	// mutex is not reentrant).
 	if s.faulted {
 		fe := s.faultErr
+		s.loopsMu.Unlock()
+		release()
+		cancel()
+		return uuid.UUID{}, &SessionError{Kind: SessionFaulted, Cause: fe}
+	}
+	if s.workspaceFaulted {
+		fe := s.workspaceFaultErr
 		s.loopsMu.Unlock()
 		release()
 		cancel()
@@ -1696,11 +1716,8 @@ type shutdownTarget struct {
 //     is the atomicity NewLoop's registration check pairs with (it re-tests
 //     closing under the same lock): a loop is either already in this snapshot or
 //     refused by NewLoop — never registered after the snapshot is taken.
-//  2. THEN hub.StopSession — flip the session phase to SessionStopped, wake every
-//     WaitIdle waiter with ErrSessionStopped, and deliver SessionStopped to
-//     subscribers. After the snapshot, before the sends, so shutdown-induced loop
-//     terminals are published but no longer mutate quiescence (post-stop publishes
-//     never derive SessionIdle).
+//  2. Keep the checkpoint controller and hub open while graceful loop shutdown drains,
+//     so genuine terminals produced by active turns cross their configured boundary.
 //  3. defer sessionCancel as the FINAL backstop on ALL paths (graceful waits, an
 //     id-gen-skipped loop, or a ctx timeout) — it releases every loopCtx derived
 //     from sessionCtx. It is deferred (not called before the graceful waits) so it
@@ -1710,7 +1727,9 @@ type shutdownTarget struct {
 //     that loop's graceful shutdown (the deferred sessionCancel hard-cancels it)
 //     rather than aborting the whole Shutdown. The send keeps Done/ctx escapes so
 //     an unbuffered send can never wedge; a loop already exited (Done) is skipped.
-//  5. Wait for every recorded ack, aggregating the first non-nil error (a loop's
+//  5. Wait for every recorded ack, then cancel/join checkpoints, stop the hub, and
+//     release root/session leases in that order.
+//  6. Aggregate the first non-nil error (a loop's
 //     root ctx cancelled before cleanup finished), bounded by ctx and each loop's
 //     Done.
 //
@@ -1731,16 +1750,6 @@ func (s *Session) Shutdown(ctx context.Context) error {
 	}
 	s.loopsMu.Unlock()
 	s.activeMu.Unlock()
-	// Stop automatic/manual checkpoint activity before any loop drain or lease release.
-	// In-flight operations observe the controller cancellation and release their workspace
-	// permit before the root/session lease defers run below.
-	if s.checkpoints != nil {
-		s.checkpoints.shutdown()
-	}
-
-	// (2) Flip the session phase to stopped after the snapshot, before the sends.
-	s.hub.StopSession(ctx)
-
 	// (3) Final backstop on every path: released last, after the graceful waits or
 	// on a ctx timeout. Deferred so it never hard-cancels loops mid-shutdown.
 	defer s.sessionCancel()
@@ -1757,6 +1766,16 @@ func (s *Session) Shutdown(ctx context.Context) error {
 	// ordering realizes the design's teardown: stop work/checkpoints → release root lease
 	// → release session lease.
 	defer s.releaseRootLease(ctx)
+
+	// Registered last so it runs first on every return: genuine loop terminals drain
+	// through the still-open controller/hub; then automatic activity is canceled/joined,
+	// SessionStopped is appended/emitted, and only afterward do the lease defers run.
+	defer func() {
+		if s.checkpoints != nil {
+			s.checkpoints.shutdown()
+		}
+		s.hub.StopSession(ctx)
+	}()
 
 	// (4) Send a graceful Shutdown to every loop in the snapshot.
 	targets := make([]shutdownTarget, 0, len(snapshot))

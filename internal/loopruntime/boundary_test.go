@@ -2,11 +2,16 @@ package loopruntime
 
 import (
 	"context"
+	"errors"
+	"io"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/looprig/core/content"
+	"github.com/looprig/harness/pkg/command"
 	"github.com/looprig/harness/pkg/event"
+	"github.com/looprig/inference"
 )
 
 type blockingExecutionBoundary struct {
@@ -19,6 +24,50 @@ type blockingStepAdmission struct {
 	recordingPublisher
 	entered chan struct{}
 	release chan struct{}
+}
+
+type gatedFirstInference struct {
+	entered chan struct{}
+	release chan struct{}
+	calls   atomic.Int32
+}
+
+func (g *gatedFirstInference) Invoke(context.Context, inference.Request) (*inference.Response, error) {
+	return nil, errors.New("Invoke not used")
+}
+
+func (g *gatedFirstInference) Stream(ctx context.Context, _ inference.Request) (*inference.StreamReader[content.Chunk], error) {
+	if g.calls.Add(1) == 1 {
+		close(g.entered)
+		select {
+		case <-g.release:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	i := 0
+	return inference.NewStreamReader(func() (content.Chunk, error) {
+		if i == 0 {
+			i++
+			return textChunk("done"), nil
+		}
+		return nil, io.EOF
+	}, nil), nil
+}
+
+type failingTerminalBoundary struct {
+	recordingPublisher
+	err error
+}
+
+func (b *failingTerminalBoundary) CommitBoundary(ctx context.Context, ev event.Event) error {
+	if err := b.PublishEventChecked(ctx, ev); err != nil {
+		return err
+	}
+	if ev.EndsTurn() {
+		return b.err
+	}
+	return nil
 }
 
 func (b *blockingStepAdmission) EnterExecution(ctx context.Context) (func(), error) {
@@ -54,7 +103,12 @@ func TestNativeCheckpointBoundaryBlocksStepAndTurnAcknowledgement(t *testing.T) 
 	if err != nil {
 		t.Fatalf("newWithConfig: %v", err)
 	}
-	startTurn(t, l, &b.recordingPublisher, nil)
+	inputID := mustID(t)
+	select {
+	case l.Commands <- command.UserInput{Header: command.Header{CommandID: inputID, CreatedAt: time.Now()}}:
+	case <-time.After(time.Second):
+		t.Fatal("submit blocked")
+	}
 
 	var step event.Event
 	select {
@@ -93,19 +147,120 @@ func TestNativeCheckpointAdmissionBlocksNextInferenceStep(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	startTurn(t, l, &b.recordingPublisher, nil)
+	inputID := mustID(t)
+	select {
+	case l.Commands <- command.UserInput{Header: command.Header{CommandID: inputID, CreatedAt: time.Now()}}:
+	case <-time.After(time.Second):
+		t.Fatal("submit blocked")
+	}
 	select {
 	case <-b.entered:
 	case <-time.After(time.Second):
 		t.Fatal("loop did not consult session execution admission")
 	}
 	for _, ev := range b.events() {
-		if _, ok := ev.(event.StepDone); ok {
-			t.Fatal("StepDone published while inference admission blocked")
+		if _, ok := ev.(event.TurnStarted); ok {
+			t.Fatal("TurnStarted published while first-step admission blocked")
 		}
 	}
 	close(b.release)
 	if _, ok := drainToTerminal(t, &b.recordingPublisher).(event.TurnDone); !ok {
 		t.Fatal("turn did not complete after admission release")
+	}
+}
+
+func TestFailedRequiredTurnBoundaryDoesNotChainQueuedInput(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	client := &gatedFirstInference{entered: make(chan struct{}), release: make(chan struct{})}
+	boundaryErr := errors.New("required checkpoint failed")
+	b := &failingTerminalBoundary{err: boundaryErr}
+	l, err := newWithConfig(ctx, mustID(t), mustID(t), Provenance{}, b, runtimeConfig{Client: client, Model: testModel(), DrainTimeout: 200 * time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	startTurn(t, l, &b.recordingPublisher, nil)
+	<-client.entered
+	queuedID := mustID(t)
+	queued := command.UserInput{Header: command.Header{CommandID: queuedID, CreatedAt: time.Now()}}
+	select {
+	case l.Commands <- queued:
+	case <-time.After(time.Second):
+		t.Fatal("queue submit blocked")
+	}
+	blockUntilEvents(t, &b.recordingPublisher, func(events []event.Event) bool {
+		for _, ev := range events {
+			if q, ok := ev.(event.InputQueued); ok && q.Cause.CommandID == queuedID {
+				return true
+			}
+		}
+		return false
+	})
+	close(client.release)
+	blockUntilEvents(t, &b.recordingPublisher, func(events []event.Event) bool {
+		for _, ev := range events {
+			if _, ok := ev.(event.LoopIdle); ok {
+				return true
+			}
+		}
+		return false
+	})
+	turnStarts := 0
+	queuedCanceled := 0
+	terminals := 0
+	for _, ev := range b.events() {
+		switch e := ev.(type) {
+		case event.TurnStarted:
+			turnStarts++
+		case event.InputCancelled:
+			if e.Cause.CommandID == queuedID {
+				queuedCanceled++
+			}
+		}
+		if ev.EndsTurn() {
+			terminals++
+		}
+	}
+	if turnStarts != 1 || queuedCanceled != 1 || terminals != 1 {
+		t.Fatalf("starts=%d queuedCanceled=%d terminals=%d, want 1/1/1", turnStarts, queuedCanceled, terminals)
+	}
+}
+
+func TestShutdownCancelsParkedFirstStepAdmissionWithoutTurnStarted(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	b := &blockingStepAdmission{entered: make(chan struct{}), release: make(chan struct{})}
+	l, err := newWithConfig(ctx, mustID(t), mustID(t), Provenance{}, b, runtimeConfig{Client: &fakeLLM{chunks: []content.Chunk{textChunk("unused")}}, Model: testModel(), DrainTimeout: 200 * time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	inputID := mustID(t)
+	l.Commands <- command.UserInput{Header: command.Header{CommandID: inputID, CreatedAt: time.Now()}}
+	<-b.entered
+	ack := make(chan error, 1)
+	l.Commands <- command.Shutdown{Header: command.Header{CommandID: mustID(t), CreatedAt: time.Now()}, Ack: ack}
+	if err := <-ack; err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-l.Done:
+	case <-time.After(time.Second):
+		t.Fatal("loop did not exit after canceling parked admission")
+	}
+	starts, canceled := 0, 0
+	for _, ev := range b.events() {
+		switch e := ev.(type) {
+		case event.TurnStarted:
+			starts++
+		case event.InputCancelled:
+			if e.Cause.CommandID == inputID {
+				canceled++
+			}
+		}
+	}
+	if starts != 0 || canceled != 1 {
+		t.Fatalf("TurnStarted=%d InputCancelled=%d, want 0/1", starts, canceled)
 	}
 }

@@ -13,6 +13,7 @@ type checkpointAdmissionGate struct {
 	readers int
 	writer  bool
 	waiting int
+	fault   error
 	changed chan struct{}
 }
 
@@ -26,6 +27,11 @@ func (g *checkpointAdmissionGate) enterExecution(ctx context.Context) (func(), e
 			return nil, err
 		}
 		g.mu.Lock()
+		if g.fault != nil {
+			err := g.fault
+			g.mu.Unlock()
+			return nil, err
+		}
 		if !g.writer && g.waiting == 0 {
 			g.readers++
 			g.mu.Unlock()
@@ -40,6 +46,20 @@ func (g *checkpointAdmissionGate) enterExecution(ctx context.Context) (func(), e
 			return nil, ctx.Err()
 		}
 	}
+}
+
+func (g *checkpointAdmissionGate) latch(err error) {
+	g.mu.Lock()
+	g.fault = err
+	g.notifyLocked()
+	g.mu.Unlock()
+}
+
+func (g *checkpointAdmissionGate) recover() {
+	g.mu.Lock()
+	g.fault = nil
+	g.notifyLocked()
+	g.mu.Unlock()
 }
 
 func (g *checkpointAdmissionGate) leaveExecution() {

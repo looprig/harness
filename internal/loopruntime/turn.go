@@ -3,6 +3,7 @@ package loopruntime
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 
 	"github.com/looprig/core/content"
@@ -92,7 +93,8 @@ type turnConfig struct {
 	// admit acquires the session-wide execution read admission for the next inference
 	// step. Required/manual checkpoints hold the writer side through their full durable
 	// critical sequence, so already-queued work on any loop cannot advance.
-	admit func(context.Context) (func(), error)
+	admit          func(context.Context) (func(), error)
+	firstAdmission func()
 
 	// commit is the durability/event handshake back to the actor. runTurn prepares a
 	// complete step group, but the actor is the only goroutine that mutates
@@ -213,9 +215,17 @@ func runTurn(ctx context.Context, cfg turnConfig, ts turnState) event.Event {
 		}
 		st := newStepState(identity.sessionID, identity.loopID, identity.turnID, stepID, stepIdx)
 
-		releaseAdmission, admitErr := cfg.admit(ctx)
-		if admitErr != nil {
-			return event.TurnInterrupted{TurnIndex: ts.index}
+		releaseAdmission := cfg.firstAdmission
+		cfg.firstAdmission = nil
+		if releaseAdmission == nil {
+			var admitErr error
+			releaseAdmission, admitErr = cfg.admit(ctx)
+			if admitErr != nil {
+				if !errors.Is(admitErr, context.Canceled) && !errors.Is(admitErr, context.DeadlineExceeded) {
+					return event.TurnFailed{TurnIndex: ts.index, Err: admitErr}
+				}
+				return event.TurnInterrupted{TurnIndex: ts.index}
+			}
 		}
 		// runStep owns the LLM cycle: stream → exactly one AIMessage into st.msgs[0].
 		res := runStep(ctx, stepConfig{req: req, client: cfg.client, emit: cfg.emit}, ts.index, st)
