@@ -110,12 +110,12 @@ type Session struct {
 	// this Factory is only for the session's own creation sites.
 	factory *event.Factory
 
-	// cmdAppender is the AUDIT-ONLY intent-log seam: every command the session
+	// cmdAppender is the intent-log seam: every command the session
 	// dispatches to a loop is appended here BEFORE the send (appendCommand). It defaults
 	// to the nop appender (no-persistence/headless mode); the composition root (Phase 10)
 	// injects the real journal.JournalCommandAppender via WithCommandAppender. Unlike the
-	// hub's required durable tap, an append failure here is logged-and-swallowed — the
-	// dispatch always proceeds (a lost command record must never block the user).
+	// hub's required durable tap, ordinary command failures are logged-and-swallowed;
+	// machine NoFold delegate intent is required and refuses dispatch on failure.
 	cmdAppender commandAppender
 
 	// allowConfigMismatch is the restore-only opt-in (set by WithAllowConfigMismatch)
@@ -684,7 +684,7 @@ func (s *Session) newLoopWithAdmission(parent loop.Provenance, cfg loop.Definiti
 			release()
 			return uuid.UUID{}, &SessionError{Kind: SessionLoopIDGenerationFailed, Cause: err}
 		}
-		bound, err = cfg.Bind(s.sessionCtx, tool.Bindings{SessionID: s.sessionID, LoopID: loopID, Delegate: s.delegation.controllerFor(loopID, cfg), ExtraTools: delegateExtraTools(cfg, s.delegation)})
+		bound, err = cfg.Bind(s.sessionCtx, tool.Bindings{SessionID: s.sessionID, LoopID: loopID, Ceiling: s.ceilingState(), Delegate: s.delegation.controllerFor(loopID, cfg), ExtraTools: delegateExtraTools(cfg, s.delegation)})
 		if err != nil {
 			release()
 			return uuid.UUID{}, err
@@ -713,7 +713,7 @@ func (s *Session) newLoopWithAdmission(parent loop.Provenance, cfg loop.Definiti
 			release()
 			return uuid.UUID{}, err
 		}
-		admission.command = command.UserInput{Header: command.Header{CommandID: admission.requestID, Agency: identity.AgencyMachine, CreatedAt: s.stampNow()}, Blocks: delegateBlocks(admission.message), NoFold: true}
+		admission.command = command.UserInput{Header: command.Header{CommandID: admission.requestID, Agency: identity.AgencyMachine, CreatedAt: s.stampNow()}, Blocks: delegateBlocks(admission.message), NoFold: true, TargetLoopID: loopID}
 		admission.publisher = newDelegateAdmissionPublisher(s)
 		eventTarget = admission.publisher
 	}
@@ -790,7 +790,12 @@ func (s *Session) newLoopWithAdmission(parent loop.Provenance, cfg loop.Definiti
 		return uuid.UUID{}, err
 	}
 	if admission != nil {
-		s.appendCommand(s.sessionCtx, loopID, admission.command)
+		if err := s.appendDelegateCommand(admission.ctx, loopID, admission.command); err != nil {
+			release()
+			cancel()
+			_ = admission.sub.Close()
+			return uuid.UUID{}, err
+		}
 		if err := s.enqueuePreparedDelegate(admission.ctx, b, admission.command); err != nil {
 			release()
 			cancel()
@@ -1104,7 +1109,7 @@ func newSessionTopology(ctx context.Context, topology Topology, newID idGenerato
 			sessionCancel()
 			return nil, &SessionError{Kind: SessionLoopIDGenerationFailed, Cause: mintErr}
 		}
-		bound, bindErr := definition.Bind(sessionCtx, tool.Bindings{SessionID: id, LoopID: loopID, Delegate: s.delegation.controllerFor(loopID, definition), ExtraTools: delegateExtraTools(definition, s.delegation)})
+		bound, bindErr := definition.Bind(sessionCtx, tool.Bindings{SessionID: id, LoopID: loopID, Ceiling: s.ceilingState(), Delegate: s.delegation.controllerFor(loopID, definition), ExtraTools: delegateExtraTools(definition, s.delegation)})
 		if bindErr != nil {
 			sessionCancel()
 			return nil, bindErr

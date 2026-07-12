@@ -61,7 +61,7 @@ func TestMarshalCommandRoundTrip(t *testing.T) {
 		name string
 		cmd  Command
 	}{
-		{"UserInput", UserInput{Header: fullHeader(), Blocks: sampleBlocks("hello")}},
+		{"UserInput delegate route", UserInput{Header: fullHeader(), Blocks: sampleBlocks("hello"), NoFold: true, TargetLoopID: seededUUID(0x44)}},
 		{"UserInput nil blocks", UserInput{Header: fullHeader()}},
 		{"SubagentResult", SubagentResult{
 			Header:      fullHeader(),

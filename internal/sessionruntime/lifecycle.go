@@ -117,9 +117,9 @@ type Lifecycle struct {
 	// ceiling (cfg.Tools.Permission holds the checker that reads it) — wrong for
 	// multi-session, where each session must clamp independently. The Lifecycle therefore mints
 	// a per-session state here and injects it via WithCeiling so the SESSION's ceiling source is
-	// session-isolated. Rebinding the permission CHECKER (in cfg.Tools.Permission) to this same
-	// state is a composition-root (swe) concern the spec DEFERS: the Lifecycle only
-	// mints it; swe wires the checker to it. When the factory is nil the Lifecycle falls
+	// session-isolated. Every loop PermissionFactory receives this exact live source through
+	// tool.Bindings, so native permission checkers can select consumer-defined postures on
+	// each Check. When the factory is nil the Lifecycle falls
 	// back to today's behavior — the session default-mints its own internal ceiling state
 	// (whatever cfg carries is untouched).
 	ceilingFactory CeilingFactory

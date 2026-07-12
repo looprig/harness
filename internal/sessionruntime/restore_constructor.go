@@ -138,6 +138,9 @@ func restoreTopologySession(
 	for _, opt := range opts {
 		opt(probe)
 	}
+	if probe.ceiling == nil {
+		probe.ceiling = ceiling.New()
+	}
 	allowMismatch := probe.allowConfigMismatch
 	if probe.fingerprint == nil {
 		return nil, &RestoreError{Kind: RestoreLoopFailed, Cause: &MissingFingerprintProviderError{}}
@@ -197,6 +200,10 @@ func restoreTopologySession(
 		return recordErrored(&RestoreError{Kind: RestoreReplayFailed, Cause: err})
 	}
 	all := eventsFromRecords(allRecords, uuid.UUID{})
+	ceilingLevel, hasCeiling := lastSecurityCeiling(all)
+	if hasCeiling {
+		probe.ceiling.Set(ceilingLevel)
+	}
 
 	persisted, err := firstConfigFingerprint(all)
 	if err != nil {
@@ -216,7 +223,7 @@ func restoreTopologySession(
 	// index from the full stream so a wait for a wait:false request submitted before the
 	// restart resolves after restore.
 	manager := newDelegationManager(topology)
-	plans, activePlan, err := planLoops(sessionCtx, sessionID, topology, activeDefinition, roots, starts, allRecords, allowMismatch, manager)
+	plans, activePlan, err := planLoops(sessionCtx, sessionID, topology, activeDefinition, roots, starts, allRecords, allowMismatch, manager, probe.ceiling)
 	if err != nil {
 		return recordErrored(err)
 	}
@@ -242,8 +249,6 @@ func restoreTopologySession(
 	// changed it) — folded from the SAME unnarrowed discovery drain (SecurityCeilingChanged
 	// is session-scoped), last write wins. Absent means the session resumes at the fail-
 	// secure most-restrictive default. Seeded into the restored session below.
-	ceilingLevel, hasCeiling := lastSecurityCeiling(all)
-
 	// Gate recovery folds the same record replay so private GatePreparedRecord payloads are
 	// visible. Unsupported or payload-less open gates are durably closed below, after
 	// RestoreStarted, before RestoreDone makes the restored session reachable.
@@ -289,7 +294,7 @@ func restoreTopologySession(
 	}
 	// Correlation is seeded only after every checked crash closure committed, so an open
 	// wait:false request resolves as Interrupted after restore rather than unknown.
-	reseedResolvedAfterCrashClosures(manager, all, crashClosures)
+	seedResolvedDelegateRecords(manager, allRecords, all, crashClosures)
 
 	// (6b) Materialize the workspace ref selected by the latest durable transition BEFORE
 	// declaring the restore done, so
@@ -321,7 +326,7 @@ func restoreTopologySession(
 	// re-acquire without waiting out the TTL. We append WithLeaseRelease AFTER the caller's
 	// opts so the restore owns the lease lifecycle (a caller cannot accidentally override
 	// the releaser with a stale one).
-	leaseOpts := append(append([]Option(nil), opts...), WithLeaseRelease(lease.Release))
+	leaseOpts := append(append([]Option(nil), opts...), WithCeiling(probe.ceiling), WithLeaseRelease(lease.Release))
 	// Recover the foreign session id from the primary loop's events. Prebound adapters
 	// stamped it on LoopStarted; late-bound adapters record it with ForeignSessionBound.
 	// buildRestoredSession fails closed on an empty sid for a foreign engine.
@@ -422,7 +427,7 @@ func discoverRoots(all []event.Event, topology Topology, allowMismatch bool) (ma
 // unknown (subagents of a single-definition run). It is the single Bind of each loop,
 // performed inside the restore lease. It returns the ordered plans and the active plan, or a
 // typed error the caller records as a RestoreErrored.
-func planLoops(sessionCtx context.Context, sessionID uuid.UUID, topology Topology, activeDefinition loop.Definition, roots map[identity.AgentName]event.LoopStarted, starts []event.LoopStarted, allRecords []journal.JournalRecord, allowMismatch bool, manager *delegationManager) ([]loopPlan, loopPlan, error) {
+func planLoops(sessionCtx context.Context, sessionID uuid.UUID, topology Topology, activeDefinition loop.Definition, roots map[identity.AgentName]event.LoopStarted, starts []event.LoopStarted, allRecords []journal.JournalRecord, allowMismatch bool, manager *delegationManager, ceilingSource ceiling.Source) ([]loopPlan, loopPlan, error) {
 	plans := make([]loopPlan, 0, len(starts))
 	boundByLoop := make(map[uuid.UUID]loop.BoundDefinition, len(starts))
 	activeIndex := -1
@@ -442,7 +447,7 @@ func planLoops(sessionCtx context.Context, sessionID uuid.UUID, topology Topolog
 			// invents a missing definition here).
 			return nil, loopPlan{}, &RestoreError{Kind: RestoreLoopFailed, Cause: &AgentNameMismatchError{Persisted: started.AgentName}}
 		}
-		bound, bindErr := definition.Bind(sessionCtx, tool.Bindings{SessionID: sessionID, LoopID: started.LoopID, Delegate: manager.controllerFor(started.LoopID, definition), ExtraTools: delegateExtraTools(definition, manager)})
+		bound, bindErr := definition.Bind(sessionCtx, tool.Bindings{SessionID: sessionID, LoopID: started.LoopID, Ceiling: ceilingSource, Delegate: manager.controllerFor(started.LoopID, definition), ExtraTools: delegateExtraTools(definition, manager)})
 		if bindErr != nil {
 			return nil, loopPlan{}, &RestoreError{Kind: RestoreLoopFailed, Cause: bindErr}
 		}

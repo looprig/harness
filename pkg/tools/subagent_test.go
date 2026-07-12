@@ -10,6 +10,7 @@ import (
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/harness/pkg/tool"
+	jsonschema "github.com/santhosh-tekuri/jsonschema/v6"
 )
 
 // subagent_test.go exercises the flat action-envelope Subagent tool against a FAKE
@@ -271,6 +272,92 @@ func TestSubagentSchemaIsClosedAndCatalogsModes(t *testing.T) {
 			if !strings.Contains(schema, want) {
 				t.Errorf("style %v schema missing %s: %s", style, want, schema)
 			}
+		}
+	}
+}
+
+func TestSubagentSchemaValidatesActionEnvelopes(t *testing.T) {
+	t.Parallel()
+	del := "55555555-5555-4555-8555-555555555555"
+	req := "66666666-6666-4666-8666-666666666666"
+	tests := []struct {
+		name  string
+		input string
+		valid bool
+	}{
+		{name: "omitted action defaults start", input: `{"agent":"explorer","message":"map"}`, valid: true},
+		{name: "explicit start", input: `{"action":"start","agent":"operator","mode":"build","message":"build"}`, valid: true},
+		{name: "send", input: `{"action":"send","delegate_id":"` + del + `","message":"more","wait":false}`, valid: true},
+		{name: "wait", input: `{"action":"wait","delegate_id":"` + del + `","request_id":"` + req + `"}`, valid: true},
+		{name: "interrupt", input: `{"action":"interrupt","delegate_id":"` + del + `"}`, valid: true},
+		{name: "status all", input: `{"action":"status"}`, valid: true},
+		{name: "send missing message", input: `{"action":"send","delegate_id":"` + del + `"}`},
+		{name: "wait with forbidden wait", input: `{"action":"wait","delegate_id":"` + del + `","request_id":"` + req + `","wait":true}`},
+		{name: "interrupt with message", input: `{"action":"interrupt","delegate_id":"` + del + `","message":"x"}`},
+		{name: "status with request", input: `{"action":"status","request_id":"` + req + `"}`},
+		{name: "wrong agent mode", input: `{"agent":"explorer","mode":"build","message":"x"}`},
+	}
+	info, err := NewSubagent(&fakeController{}, loop.DelegationManaged, subagentCatalog()).Info(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	compiler := jsonschema.NewCompiler()
+	var schemaDocument any
+	if err := json.Unmarshal(info.Schema, &schemaDocument); err != nil {
+		t.Fatal(err)
+	}
+	if err := compiler.AddResource("subagent.json", schemaDocument); err != nil {
+		t.Fatal(err)
+	}
+	schema, err := compiler.Compile("subagent.json")
+	if err != nil {
+		t.Fatalf("compile schema: %v\n%s", err, info.Schema)
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			var value any
+			if err := json.Unmarshal([]byte(tt.input), &value); err != nil {
+				t.Fatal(err)
+			}
+			err := schema.Validate(value)
+			if (err == nil) != tt.valid {
+				t.Fatalf("Validate(%s) error = %v, valid=%v", tt.input, err, tt.valid)
+			}
+		})
+	}
+	syncInfo, err := NewSubagent(&fakeController{}, loop.DelegationSyncOnly, subagentCatalog()).Info(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var syncDocument any
+	if err := json.Unmarshal(syncInfo.Schema, &syncDocument); err != nil {
+		t.Fatal(err)
+	}
+	syncCompiler := jsonschema.NewCompiler()
+	if err := syncCompiler.AddResource("sync-subagent.json", syncDocument); err != nil {
+		t.Fatal(err)
+	}
+	syncSchema, err := syncCompiler.Compile("sync-subagent.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tt := range []struct {
+		input string
+		valid bool
+	}{
+		{input: `{"agent":"explorer","message":"map"}`, valid: true},
+		{input: `{"action":"start","agent":"explorer","message":"map","wait":true}`, valid: true},
+		{input: `{"action":"start","agent":"explorer","message":"map","wait":false}`},
+		{input: `{"action":"status"}`},
+	} {
+		var value any
+		if err := json.Unmarshal([]byte(tt.input), &value); err != nil {
+			t.Fatal(err)
+		}
+		err := syncSchema.Validate(value)
+		if (err == nil) != tt.valid {
+			t.Fatalf("sync Validate(%s) error = %v, valid=%v", tt.input, err, tt.valid)
 		}
 	}
 }

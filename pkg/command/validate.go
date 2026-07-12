@@ -1,5 +1,7 @@
 package command
 
+import "github.com/looprig/harness/pkg/identity"
+
 // Rule is the human-readable invariant a CommandValidationError records, so the
 // caller learns WHY a field is wrong, not just which.
 type Rule string
@@ -25,6 +27,7 @@ const (
 	FieldSessionID       CommandField = "SessionID"
 	FieldLoopID          CommandField = "LoopID"
 	FieldTargetCommandID CommandField = "TargetCommandID"
+	FieldTargetLoopID    CommandField = "TargetLoopID"
 	FieldToolExecutionID CommandField = "ToolExecutionID"
 )
 
@@ -58,6 +61,11 @@ func ValidateCommand(cmd Command) error {
 		return &CommandValidationError{Command: commandName(cmd), Field: FieldCommandID, Rule: RuleRequired}
 	}
 	switch c := cmd.(type) {
+	case UserInput:
+		if c.NoFold && c.Agency == identity.AgencyMachine && c.TargetLoopID.IsZero() {
+			return &CommandValidationError{Command: CommandUserInput, Field: FieldTargetLoopID, Rule: RuleRequired}
+		}
+		return nil
 	case SubagentResult:
 		return validateSubagentResult(c)
 	case CancelQueuedInput:

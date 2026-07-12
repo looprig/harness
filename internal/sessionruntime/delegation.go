@@ -14,6 +14,7 @@ import (
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/gate"
 	"github.com/looprig/harness/pkg/identity"
+	"github.com/looprig/harness/pkg/journal"
 	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/harness/pkg/tool"
 	"github.com/looprig/harness/pkg/tools"
@@ -30,8 +31,9 @@ import (
 // OWNERSHIP survives restore because it is derived from the loop registry's parent
 // links (attachRestoredLoop re-seeds each loop's parent), not a separate map. The
 // cumulative spawn quota also survives restore (countSpawnedLoops re-seeds it). The
-// in-flight wait:false request map is process-local: the child's committed history is
-// durable, but a pending unresolved request handle does not cross a restart.
+// Live pending handles are process-local. Durable machine NoFold intent records plus
+// correlated turn terminals reconstruct request resolution across restore; queued work
+// that never started is classified Interrupted and is never replayed.
 
 // delegationManager mediates parent-to-child delegation for one session. It is created
 // before the session's loops are bound (so restore can bind loop tools against it) and
@@ -130,22 +132,30 @@ func newDelegationManager(topology Topology) *delegationManager {
 	}
 }
 
-// seedResolved reconstructs the durable request→terminal index from the full restored
-// event stream, so a wait for a wait:false request submitted before a restart resolves
-// after restore. It correlates each turn's opening Cause.CommandID (the request id) to
-// that turn's terminal.
-func (m *delegationManager) seedResolved(events []event.Event) {
-	index := foldDelegateTerminals(events)
-	m.mu.Lock()
-	m.resolved = index
-	m.mu.Unlock()
-}
-
-func reseedResolvedAfterCrashClosures(m *delegationManager, replayed, closures []event.Event) {
+// seedResolvedDelegateRecords reconstructs durable delegate correlation from required
+// machine NoFold intents, then overlays exact started-turn terminals and crash closures.
+func seedResolvedDelegateRecords(m *delegationManager, records []journal.JournalRecord, replayed, closures []event.Event) {
+	index := make(map[uuid.UUID]resolvedRequest)
+	for _, record := range records {
+		commandRecord, ok := record.(journal.CommandRecord)
+		if !ok {
+			continue
+		}
+		input, ok := commandRecord.Command().(command.UserInput)
+		if !ok || !input.NoFold || input.Agency != identity.AgencyMachine || input.TargetLoopID.IsZero() || input.CommandID.IsZero() {
+			continue
+		}
+		index[input.CommandID] = resolvedRequest{childID: input.TargetLoopID, status: tool.DelegateStatusInterrupted}
+	}
 	combined := make([]event.Event, 0, len(replayed)+len(closures))
 	combined = append(combined, replayed...)
 	combined = append(combined, closures...)
-	m.seedResolved(combined)
+	for requestID, terminal := range foldDelegateTerminals(combined) {
+		index[requestID] = terminal
+	}
+	m.mu.Lock()
+	m.resolved = index
+	m.mu.Unlock()
 }
 
 func (m *delegationManager) getResolved(requestID uuid.UUID) (resolvedRequest, bool) {
@@ -640,7 +650,29 @@ func (s *Session) subscribeLoop(loopID uuid.UUID) (event.Subscription, error) {
 // the running turn and starts its OWN distinct turn when that finishes. The public
 // Session.SubmitToLoop keeps its interactive queue/fold semantics (NoFold=false).
 func (s *Session) enqueueDelegateTurn(ctx context.Context, loopID uuid.UUID, blocks []content.Block) (uuid.UUID, error) {
-	return s.submitToLoop(ctx, loopID, blocks, identity.AgencyMachine, true)
+	if err := s.faultIfFaulted(); err != nil {
+		return uuid.UUID{}, err
+	}
+	backend, ok := s.loopFor(loopID)
+	if !ok {
+		return uuid.UUID{}, &SessionError{Kind: SessionLoopNotFound}
+	}
+	id, err := s.newCommandID()
+	if err != nil {
+		return uuid.UUID{}, err
+	}
+	cmd := command.UserInput{Header: command.Header{CommandID: id, Agency: identity.AgencyMachine, CreatedAt: s.stampNow()}, Blocks: blocks, NoFold: true, TargetLoopID: loopID}
+	if err := s.appendDelegateCommand(ctx, loopID, cmd); err != nil {
+		return uuid.UUID{}, err
+	}
+	select {
+	case backend.CommandSink() <- cmd:
+		return id, nil
+	case <-ctx.Done():
+		return uuid.UUID{}, &SessionError{Kind: SessionContextDone, Cause: ctx.Err()}
+	case <-backend.DoneChan():
+		return uuid.UUID{}, &SessionError{Kind: SessionLoopExited}
+	}
 }
 
 func delegateBlocks(message string) []content.Block {

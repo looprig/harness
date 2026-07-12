@@ -24,12 +24,10 @@ import (
 // (journal.JournalCommandAppender); the default is the nop appender so existing tests
 // and headless/no-persistence mode are unchanged.
 //
-// Unlike the hub's eventAppender (a REQUIRED durable tap that faults the session on
-// failure), this seam is AUDIT-ONLY: the session calls AppendCommand BEFORE dispatch
-// and, on a non-nil error, LOGS LOUDLY and PROCEEDS with the dispatch. Losing a command
-// record must never block the user's action or corrupt restore — it is the ONE
-// deliberate non-fatal persistence path in the session. AppendCommand therefore returns
-// its error for the caller to log; the session never propagates it.
+// Ordinary interactive/control commands use this seam as AUDIT-ONLY: append errors are
+// logged and dispatch proceeds. Machine NoFold delegate requests are the deliberate
+// exception: their intent record is restore state, so append failure is propagated and
+// dispatch is refused. The same narrow seam supports both policies at their call sites.
 type commandAppender interface {
 	AppendCommand(ctx context.Context, rec journal.CommandRecord) error
 }
@@ -48,7 +46,7 @@ func (nopCommandAppender) AppendCommand(context.Context, journal.CommandRecord) 
 // appender (Phase 10) without New growing a positional parameter.
 type Option func(*Session)
 
-// WithCommandAppender injects the audit-only intent-log appender (the composition
+// WithCommandAppender injects the intent-log appender (the composition
 // root's adapter over SessionJournal). A nil appender is ignored (the nop default stays
 // installed) so a caller can never accidentally null out the field and nil-deref the
 // dispatch path.
@@ -211,6 +209,19 @@ func (s *Session) stampNow() time.Time {
 // is a safe no-op in no-persistence mode.
 func (s *Session) appendCommand(ctx context.Context, loopID uuid.UUID, cmd command.Command) {
 	s.appendCommandWithPolicy(ctx, loopID, cmd, false)
+}
+
+// appendDelegateCommand is the load-bearing delegate request intent append. Unlike
+// ordinary interactive audit records, failure prevents dispatch so restore can classify
+// every accepted machine NoFold request deterministically.
+func (s *Session) appendDelegateCommand(ctx context.Context, loopID uuid.UUID, cmd command.UserInput) error {
+	if s.cmdAppender == nil {
+		return nil
+	}
+	if err := s.cmdAppender.AppendCommand(ctx, journal.NewCommandRecord(s.sessionID, loopID, cmd)); err != nil {
+		return &SessionError{Kind: SessionDelegateIntentAppendFailed, Cause: err}
+	}
+	return nil
 }
 
 // appendShutdownCommand is the shutdown-path intent-log write. It is identical to

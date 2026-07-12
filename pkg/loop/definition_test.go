@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/looprig/core/content"
+	"github.com/looprig/harness/pkg/ceiling"
 	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/tool"
 	"github.com/looprig/inference"
@@ -245,6 +246,36 @@ func TestDefinitionPermissionFactory(t *testing.T) {
 	}
 }
 
+func TestDefinitionPermissionFactoryRequiresAndReceivesCeiling(t *testing.T) {
+	t.Parallel()
+	source := ceiling.New()
+	var received ceiling.Source
+	d := mustDefinition(t, WithPolicyRevision("ceiling"), WithPermissionFactory(func(_ context.Context, bindings tool.Bindings) (PermissionGate, error) {
+		received = bindings.Ceiling
+		return permissionGateStub{}, nil
+	}))
+	bindings := validToolBindings(t)
+	bindings.Ceiling = source
+	if _, err := d.Bind(context.Background(), bindings); err != nil {
+		t.Fatal(err)
+	}
+	if received != source {
+		t.Fatalf("factory ceiling = %p, want exact source %p", received, source)
+	}
+	bindings.Ceiling = nil
+	_, err := d.Bind(context.Background(), bindings)
+	var bindErr *BindError
+	if !errors.As(err, &bindErr) || bindErr.Kind != BindInvalidCeiling {
+		t.Fatalf("missing ceiling error = %v, want BindInvalidCeiling", err)
+	}
+	var typedNil *ceiling.State
+	bindings.Ceiling = typedNil
+	_, err = d.Bind(context.Background(), bindings)
+	if !errors.As(err, &bindErr) || bindErr.Kind != BindInvalidCeiling {
+		t.Fatalf("typed-nil ceiling error = %v, want BindInvalidCeiling", err)
+	}
+}
+
 type fixedPermissionGate struct {
 	effect   Effect
 	grantErr error
@@ -334,7 +365,7 @@ func TestPolicyRevisionDigest(t *testing.T) {
 
 func validToolBindings(t *testing.T) tool.Bindings {
 	t.Helper()
-	return tool.Bindings{SessionID: mustUUID(t), LoopID: mustUUID(t)}
+	return tool.Bindings{SessionID: mustUUID(t), LoopID: mustUUID(t), Ceiling: ceiling.New()}
 }
 
 func testToolDefinition(name string, builds *atomic.Int32, toolNames []string) tool.Definition {

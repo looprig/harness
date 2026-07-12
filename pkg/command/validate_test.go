@@ -77,6 +77,13 @@ func TestValidateCommandInvalid(t *testing.T) {
 			wantRule:  command.RuleRequired,
 		},
 		{
+			name:      "machine NoFold UserInput missing durable target",
+			cmd:       command.UserInput{Header: command.Header{CommandID: cmdID, Agency: identity.AgencyMachine}, NoFold: true},
+			wantCmd:   command.CommandUserInput,
+			wantField: command.FieldTargetLoopID,
+			wantRule:  command.RuleRequired,
+		},
+		{
 			name:      "SubagentResult missing parent LoopID",
 			cmd:       command.SubagentResult{Header: hdr},
 			wantCmd:   command.CommandSubagentResult,

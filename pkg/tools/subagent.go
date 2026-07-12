@@ -122,9 +122,13 @@ func (s *SubagentTool) schema() string {
 				forbidden = append(forbidden, name)
 			}
 		}
+		then := map[string]any{"not": map[string]any{"anyOf": requiredProperties(forbidden)}}
+		if len(required) > 0 {
+			then["required"] = required
+		}
 		return map[string]any{
-			"if":   map[string]any{"properties": map[string]any{"action": map[string]any{"const": action}}},
-			"then": map[string]any{"required": required, "not": map[string]any{"anyOf": requiredProperties(forbidden)}},
+			"if":   map[string]any{"required": []string{"action"}, "properties": map[string]any{"action": map[string]any{"const": action}}},
+			"then": then,
 		}
 	}
 	startAllowed := []string{"agent", "mode", "message", "wait", "timeout_seconds"}
@@ -132,8 +136,13 @@ func (s *SubagentTool) schema() string {
 	if len(startVariants) > 0 {
 		startBranch["then"].(map[string]any)["oneOf"] = startVariants
 	}
+	defaultStartBranch := map[string]any{
+		"if":   map[string]any{"not": map[string]any{"required": []string{"action"}}},
+		"then": startBranch["then"],
+	}
 	branches := []any{
 		startBranch,
+		defaultStartBranch,
 		actionBranch("send", []string{"delegate_id", "message"}, []string{"delegate_id", "message", "wait", "timeout_seconds"}),
 		actionBranch("wait", []string{"delegate_id", "request_id"}, []string{"delegate_id", "request_id", "timeout_seconds"}),
 		actionBranch("interrupt", []string{"delegate_id"}, []string{"delegate_id"}),
@@ -142,7 +151,7 @@ func (s *SubagentTool) schema() string {
 	if s.style == loop.DelegationSyncOnly {
 		properties["action"] = map[string]any{"type": "string", "enum": []string{"start"}}
 		properties["wait"] = map[string]any{"const": true}
-		branches = branches[:1]
+		branches = branches[:2]
 	}
 	schema := map[string]any{"type": "object", "additionalProperties": false, "properties": properties, "allOf": branches}
 	encoded, _ := json.Marshal(schema)

@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/looprig/core/uuid"
+	"github.com/looprig/harness/pkg/ceiling"
 )
 
 // Requirements is the set of runtime capabilities a Definition needs before it
@@ -150,6 +151,9 @@ type WorkspaceBinding struct {
 type Bindings struct {
 	SessionID uuid.UUID
 	LoopID    uuid.UUID
+	// Ceiling is the exact live session-scoped ordinal source. Permission factories
+	// read it on every check through consumer-defined posture tables.
+	Ceiling   ceiling.Source
 	Workspace *WorkspaceBinding
 	Delegate  DelegateController
 	// ExtraTools are additional tool definitions the LOOP appends to every mode's

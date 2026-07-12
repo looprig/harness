@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	"github.com/looprig/core/content"
+	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/identity"
 )
 
@@ -164,8 +165,9 @@ func marshalPlain(name CommandName, cmd Command) ([]byte, error) {
 // codec, so it cannot ride as a plain field).
 type userInputWire struct {
 	Header
-	Blocks json.RawMessage `json:"blocks,omitempty"`
-	NoFold bool            `json:"no_fold,omitzero"`
+	Blocks       json.RawMessage `json:"blocks,omitempty"`
+	NoFold       bool            `json:"no_fold,omitzero"`
+	TargetLoopID uuid.UUID       `json:"target_loop_id,omitzero"`
 }
 
 func marshalUserInput(c UserInput) ([]byte, error) {
@@ -173,7 +175,7 @@ func marshalUserInput(c UserInput) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	out, err := json.Marshal(userInputWire{Header: c.Header, Blocks: blocks, NoFold: c.NoFold})
+	out, err := json.Marshal(userInputWire{Header: c.Header, Blocks: blocks, NoFold: c.NoFold, TargetLoopID: c.TargetLoopID})
 	if err != nil {
 		return nil, &CommandEncodeError{Type: CommandUserInput, Cause: err}
 	}
@@ -317,7 +319,7 @@ func decodeUserInput(data []byte) (Command, error) {
 	if err != nil {
 		return nil, err
 	}
-	return UserInput{Header: w.Header, Blocks: blocks, NoFold: w.NoFold}, nil
+	return UserInput{Header: w.Header, Blocks: blocks, NoFold: w.NoFold, TargetLoopID: w.TargetLoopID}, nil
 }
 
 func decodeSubagentResult(data []byte) (Command, error) {

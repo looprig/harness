@@ -4,22 +4,53 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/looprig/core/content"
 	"github.com/looprig/core/uuid"
+	"github.com/looprig/harness/pkg/ceiling"
 	"github.com/looprig/harness/pkg/command"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/hub"
 	"github.com/looprig/harness/pkg/identity"
+	"github.com/looprig/harness/pkg/journal"
 	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/harness/pkg/tool"
 	"github.com/looprig/inference"
 )
 
 type livePermissionGate struct{ effect atomic.Uint32 }
+
+type ceilingPermissionGate struct{ source ceiling.Source }
+
+type ceilingCapture struct {
+	mu      sync.Mutex
+	sources []ceiling.Source
+}
+
+func (c *ceilingCapture) add(source ceiling.Source) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.sources = append(c.sources, source)
+}
+func (c *ceilingCapture) snapshot() []ceiling.Source {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]ceiling.Source(nil), c.sources...)
+}
+
+func (g ceilingPermissionGate) Check(context.Context, tool.InvokableTool, string, string) loop.Effect {
+	if g.source.Current() == 1 {
+		return loop.EffectAutoApprove
+	}
+	return loop.EffectAsk
+}
+func (ceilingPermissionGate) Grant(context.Context, string, string, tool.ApprovalScope) error {
+	return nil
+}
 
 type failChildStartAppender struct {
 	parent uuid.UUID
@@ -318,10 +349,22 @@ func TestCrashClosureReseedsInterruptedDelegateRequest(t *testing.T) {
 	}
 	closure := event.TurnInterrupted{Header: event.Header{Coordinates: identity.Coordinates{LoopID: childID, TurnID: turnID}}}
 	manager := newDelegationManager(Topology{})
-	reseedResolvedAfterCrashClosures(manager, original, []event.Event{closure})
+	seedResolvedDelegateRecords(manager, nil, original, []event.Event{closure})
 	got, ok := manager.getResolved(requestID)
 	if !ok || got.childID != childID || got.status != tool.DelegateStatusInterrupted {
 		t.Fatalf("resolved = %+v, %v; want interrupted child %v", got, ok, childID)
+	}
+}
+
+func TestRestoreSeedsQueuedDelegateIntentAsInterrupted(t *testing.T) {
+	t.Parallel()
+	requestID, childID := mustUUID(), mustUUID()
+	cmd := command.UserInput{Header: command.Header{CommandID: requestID, Agency: identity.AgencyMachine}, NoFold: true, TargetLoopID: childID}
+	manager := newDelegationManager(Topology{})
+	seedResolvedDelegateRecords(manager, []journal.JournalRecord{journal.NewCommandRecord(mustUUID(), uuid.UUID{}, cmd)}, nil, nil)
+	got, ok := manager.getResolved(requestID)
+	if !ok || got.childID != childID || got.status != tool.DelegateStatusInterrupted {
+		t.Fatalf("queued durable intent = %+v, %v; want Interrupted child %v", got, ok, childID)
 	}
 }
 
@@ -515,6 +558,108 @@ func TestDelegateChildPermissionIsAttenuatedByLiveParent(t *testing.T) {
 	}
 }
 
+func TestDelegatePermissionFactoriesShareLiveSessionCeiling(t *testing.T) {
+	t.Parallel()
+	var parentSource, childSource ceiling.Source
+	parent := mustDefine(
+		loop.WithName("parent"), loop.WithInference(&stubLLM{}, validModel("parent")),
+		loop.WithDelegates("child"), loop.WithDelegation(loop.Delegation{Style: loop.DelegationManaged}),
+		loop.WithPolicyRevision("parent-ceiling"),
+		loop.WithPermissionFactory(func(_ context.Context, bindings tool.Bindings) (loop.PermissionGate, error) {
+			parentSource = bindings.Ceiling
+			return ceilingPermissionGate{source: bindings.Ceiling}, nil
+		}),
+	)
+	child := mustDefine(
+		loop.WithName("child"), loop.WithInference(&stubLLM{chunks: []content.Chunk{textChunk("done")}}, validModel("child")),
+		loop.WithPolicyRevision("child-ceiling"),
+		loop.WithPermissionFactory(func(_ context.Context, bindings tool.Bindings) (loop.PermissionGate, error) {
+			childSource = bindings.Ceiling
+			return ceilingPermissionGate{source: bindings.Ceiling}, nil
+		}),
+	)
+	s := newDelegationSession(t, parent, nil, child)
+	ctrl := s.delegation.controllerFor(s.PrimaryLoopID(), parent)
+	res, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateStart, Agent: "child", Message: "go", Wait: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if parentSource == nil || parentSource != childSource || parentSource != s.CeilingSource() {
+		t.Fatalf("ceiling sources parent=%p child=%p session=%p, want exact same source", parentSource, childSource, s.CeilingSource())
+	}
+	s.loopsMu.RLock()
+	permission := s.loops[res.DelegateID].bound.Permission()
+	s.loopsMu.RUnlock()
+	if got := permission.Check(context.Background(), nil, "Bash", `{}`); got != loop.EffectAsk {
+		t.Fatalf("level0 = %v, want Ask", got)
+	}
+	if err := s.SetSecurityCeiling(context.Background(), 1); err != nil {
+		t.Fatal(err)
+	}
+	if got := permission.Check(context.Background(), nil, "Bash", `{}`); got != loop.EffectAutoApprove {
+		t.Fatalf("level1 = %v, want AutoApprove", got)
+	}
+}
+
+func TestPermissionCeilingIsSharedOnRestoreAndIsolatedAcrossSessions(t *testing.T) {
+	t.Parallel()
+	parents, children := &ceilingCapture{}, &ceilingCapture{}
+	parent := mustDefine(
+		loop.WithName("parent"), loop.WithInference(&stubLLM{}, validModel("parent")), loop.WithDelegates("child"),
+		loop.WithDelegation(loop.Delegation{Style: loop.DelegationManaged}), loop.WithPolicyRevision("p-ceiling"),
+		loop.WithPermissionFactory(func(_ context.Context, b tool.Bindings) (loop.PermissionGate, error) {
+			parents.add(b.Ceiling)
+			return ceilingPermissionGate{b.Ceiling}, nil
+		}),
+	)
+	child := mustDefine(
+		loop.WithName("child"), loop.WithInference(&stubLLM{chunks: []content.Chunk{textChunk("done")}}, validModel("child")), loop.WithPolicyRevision("c-ceiling"),
+		loop.WithPermissionFactory(func(_ context.Context, b tool.Bindings) (loop.PermissionGate, error) {
+			children.add(b.Ceiling)
+			return ceilingPermissionGate{b.Ceiling}, nil
+		}),
+	)
+	store := newRestoreStore(t)
+	topo := Topology{Definitions: []loop.Definition{parent, child}, Primers: []identity.AgentName{"parent"}, ActivePrimer: "parent"}
+	lc, err := NewTopologyLifecycle(topo, store, WithLifecycleFingerprintProvider(testFingerprintProvider))
+	if err != nil {
+		t.Fatal(err)
+	}
+	original, err := lc.NewSession(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctrl := original.delegation.controllerFor(original.PrimaryLoopID(), parent)
+	if _, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateStart, Agent: "child", Message: "go", Wait: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := original.SetSecurityCeiling(context.Background(), 1); err != nil {
+		t.Fatal(err)
+	}
+	sid := original.SessionID()
+	if err := original.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	restored, err := lc.RestoreSession(context.Background(), sid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = restored.Shutdown(context.Background()) }()
+	p, c := parents.snapshot(), children.snapshot()
+	if len(p) != 2 || len(c) != 2 || p[0] != c[0] || p[1] != c[1] || p[0] == p[1] || p[1] != restored.CeilingSource() || p[1].Current() != 1 {
+		t.Fatalf("sources parent=%v child=%v restored=%p level=%d", p, c, restored.CeilingSource(), restored.CeilingSource().Current())
+	}
+	separate, err := lc.NewSession(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = separate.Shutdown(context.Background()) }()
+	p = parents.snapshot()
+	if len(p) != 3 || p[2] == p[0] || p[2] == p[1] || p[2] != separate.CeilingSource() {
+		t.Fatalf("separate session reused ceiling: %v", p)
+	}
+}
+
 func TestDelegateStartSetupFailuresLeaveNoChildQuotaOrDurablePhantom(t *testing.T) {
 	t.Parallel()
 	sentinel := errors.New("injected delegate setup failure")
@@ -612,6 +757,39 @@ func TestDelegateStartAppendFailureRollsBackPreparedChild(t *testing.T) {
 	}
 	if s.spawnedCount() != beforeQuota || len(ctrl.ownedChildren(s)) != 0 {
 		t.Fatalf("failed durable commit left quota=%d children=%d", s.spawnedCount(), len(ctrl.ownedChildren(s)))
+	}
+}
+
+func TestDelegateRequiredIntentAppendFailureDoesNotDispatch(t *testing.T) {
+	t.Parallel()
+	sentinel := errors.New("delegate intent append failed")
+	parent := delegateParent(loop.DelegationManaged, "child")
+	s := newDelegationSession(t, parent, nil, delegateChild("child", "answer"))
+	ctrl := s.delegation.controllerFor(s.PrimaryLoopID(), parent).(*scopedController)
+	failing := &fakeCommandAppender{err: sentinel}
+	s.cmdAppender = failing
+	before := s.spawnedCount()
+	_, err := ctrl.Execute(context.Background(), tool.DelegateRequest{Operation: tool.DelegateStart, Agent: "child", Message: "go", Wait: false})
+	var sessionErr *SessionError
+	if !errors.As(err, &sessionErr) || sessionErr.Kind != SessionDelegateIntentAppendFailed || !errors.Is(err, sentinel) {
+		t.Fatalf("start error = %T %v, want typed required-intent failure", err, err)
+	}
+	if s.spawnedCount() != before || len(ctrl.ownedChildren(s)) != 0 {
+		t.Fatalf("failed start left quota=%d children=%d", s.spawnedCount(), len(ctrl.ownedChildren(s)))
+	}
+
+	s.cmdAppender = &fakeCommandAppender{}
+	started, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateStart, Agent: "child", Message: "go", Wait: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.cmdAppender = failing
+	_, err = ctrl.Execute(context.Background(), tool.DelegateRequest{Operation: tool.DelegateSend, DelegateID: started.DelegateID, Message: "queued", Wait: false})
+	if !errors.As(err, &sessionErr) || sessionErr.Kind != SessionDelegateIntentAppendFailed || !errors.Is(err, sentinel) {
+		t.Fatalf("send error = %T %v, want typed required-intent failure", err, err)
+	}
+	if got := s.delegation.pendingCount(started.DelegateID); got != 0 {
+		t.Fatalf("failed send pending count = %d, want 0", got)
 	}
 }
 
@@ -761,5 +939,101 @@ func TestDelegateWaitResolvesAfterRestore(t *testing.T) {
 	}
 	if res.Status != tool.DelegateStatusCompleted || res.Output != "durable answer" {
 		t.Fatalf("post-restore wait = %v/%q, want Completed/durable answer", res.Status, res.Output)
+	}
+}
+
+func TestDelegateQueuedRequestRestoresInterruptedWithoutReplay(t *testing.T) {
+	t.Parallel()
+	store := newRestoreStore(t)
+	parent := delegateParent(loop.DelegationManaged, "child")
+	child := delegateBlockingChild("child")
+	topo := Topology{Definitions: []loop.Definition{parent, child}, Primers: []identity.AgentName{parent.Name()}, ActivePrimer: parent.Name()}
+	lc, err := NewTopologyLifecycle(topo, store, WithLifecycleFingerprintProvider(testFingerprintProvider))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, err := lc.NewSession(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	obs, err := s.SubscribeEvents(allFilter())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctrl := s.delegation.controllerFor(s.PrimaryLoopID(), parent)
+	a, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateStart, Agent: "child", Message: "A", Wait: false})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !waitTurnStartedRequest(t, obs, a.RequestID) {
+		t.Fatal("turn A never started")
+	}
+	b, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateSend, DelegateID: a.DelegateID, Message: "B", Wait: false})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !waitInputQueuedRequest(t, obs, b.RequestID) {
+		t.Fatal("request B never durably queued")
+	}
+	sid := s.SessionID()
+	s.sessionCancel() // crash: no graceful queue flush or shutdown command
+	s.releaseLease(context.Background())
+	_ = obs.Close()
+
+	restored, err := lc.RestoreSession(context.Background(), sid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = restored.Shutdown(context.Background()) })
+	restoredCtrl := restored.delegation.controllerFor(restored.PrimaryLoopID(), parent)
+	result, err := restoredCtrl.Execute(context.Background(), tool.DelegateRequest{Operation: tool.DelegateWait, DelegateID: a.DelegateID, RequestID: requestIDPtr(b.RequestID)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Status != tool.DelegateStatusInterrupted {
+		t.Fatalf("restored queued request B status = %v, want Interrupted", result.Status)
+	}
+	status, err := restoredCtrl.Execute(context.Background(), tool.DelegateRequest{Operation: tool.DelegateStatus, DelegateID: a.DelegateID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status.Status != tool.DelegateStatusIdle {
+		t.Fatalf("restored child status = %v, want idle (B not replayed)", status.Status)
+	}
+}
+
+func waitTurnStartedRequest(t *testing.T, sub interface{ Events() <-chan event.Delivery }, requestID uuid.UUID) bool {
+	t.Helper()
+	deadline := time.After(5 * time.Second)
+	for {
+		select {
+		case delivery, ok := <-sub.Events():
+			if !ok {
+				return false
+			}
+			if started, ok := delivery.Event.(event.TurnStarted); ok && started.Cause.CommandID == requestID {
+				return true
+			}
+		case <-deadline:
+			return false
+		}
+	}
+}
+
+func waitInputQueuedRequest(t *testing.T, sub interface{ Events() <-chan event.Delivery }, requestID uuid.UUID) bool {
+	t.Helper()
+	deadline := time.After(5 * time.Second)
+	for {
+		select {
+		case delivery, ok := <-sub.Events():
+			if !ok {
+				return false
+			}
+			if queued, ok := delivery.Event.(event.InputQueued); ok && queued.Cause.CommandID == requestID {
+				return true
+			}
+		case <-deadline:
+			return false
+		}
 	}
 }

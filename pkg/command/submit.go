@@ -2,6 +2,7 @@ package command
 
 import (
 	"github.com/looprig/core/content"
+	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/identity"
 )
 
@@ -26,6 +27,9 @@ type UserInput struct {
 	// question/answer correlated by command id; the interactive submit path leaves it
 	// false so ordinary input keeps its fold-into-turn semantics.
 	NoFold bool `json:"no_fold,omitzero"`
+	// TargetLoopID durably carries the dispatch target for machine NoFold delegate
+	// requests because storage replay cannot recover CommandRecord's transport-only loop.
+	TargetLoopID uuid.UUID `json:"target_loop_id,omitzero"`
 }
 
 // SubagentResult delivers a finished subagent's output to its parent loop (the
