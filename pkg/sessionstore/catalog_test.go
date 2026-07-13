@@ -170,7 +170,7 @@ type fakeOpener struct {
 	openErr error
 }
 
-func (o *fakeOpener) OpenEventReplayer(_ uuid.UUID, _ ReplayRequest) (journal.EventReplayer, error) {
+func (o *fakeOpener) OpenInternalEventReplayer(_ uuid.UUID, _ ReplayRequest) (journal.EventReplayer, error) {
 	if o.openErr != nil {
 		return nil, o.openErr
 	}
@@ -205,7 +205,7 @@ type repairSnapshotOpener struct {
 	opens      int
 }
 
-func (o *repairSnapshotOpener) OpenEventReplayer(_ uuid.UUID, _ ReplayRequest) (journal.EventReplayer, error) {
+func (o *repairSnapshotOpener) OpenInternalEventReplayer(_ uuid.UUID, _ ReplayRequest) (journal.EventReplayer, error) {
 	index := o.opens
 	if index >= len(o.snapshots) {
 		index = len(o.snapshots) - 1

@@ -395,11 +395,11 @@ type nopCatalogLogger struct{}
 func (nopCatalogLogger) CatalogUpdateFailed(error) {}
 
 // EventReplayerOpener is the narrow seam RepairCatalog folds a session's ledger through: it
-// opens a read-side event replayer for one session. *Store satisfies it via
-// OpenEventReplayer (Dependency Inversion — the catalog depends on this method alone, not
+// opens a privileged read-side event replayer for one session. *Store satisfies it via
+// OpenInternalEventReplayer (Dependency Inversion — the catalog depends on this method alone, not
 // the whole Store). A nil opener disables repair (RepairCatalog fails with a typed error).
 type EventReplayerOpener interface {
-	OpenEventReplayer(id uuid.UUID, req ReplayRequest) (journal.EventReplayer, error)
+	OpenInternalEventReplayer(id uuid.UUID, req ReplayRequest) (journal.EventReplayer, error)
 }
 
 // applyEvent folds one catalog-relevant event into a SessionMeta and reports whether the
@@ -1062,7 +1062,7 @@ func (c *Catalog) RepairCatalog(ctx context.Context, sessionID uuid.UUID) (Sessi
 	defer cancel()
 
 	for attempt := 0; attempt < catalogMaxCASRetries; attempt++ {
-		replayer, err := c.opener.OpenEventReplayer(sessionID, ReplayRequest{FromSeq: 0})
+		replayer, err := c.opener.OpenInternalEventReplayer(sessionID, ReplayRequest{FromSeq: 0})
 		if err != nil {
 			return SessionMeta{}, &CatalogReadError{SessionID: sessionID, Cause: err}
 		}

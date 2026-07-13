@@ -16,6 +16,7 @@ import (
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/gate"
+	"github.com/looprig/harness/pkg/hustle"
 	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/journal"
 	"github.com/looprig/harness/pkg/serve"
@@ -101,6 +102,30 @@ func sessionStopped(sid uuid.UUID) event.SessionStopped {
 		Coordinates: identity.Coordinates{SessionID: sid},
 		EventID:     fixedUUID(0xA5),
 	}}
+}
+
+func hustleStarted(t *testing.T, sid uuid.UUID) event.HustleStarted {
+	t.Helper()
+	definition, err := hustle.Define(
+		hustle.WithName("private.journal"),
+		hustle.WithParticipation(hustle.ParticipationBackground),
+		hustle.WithTimeout(time.Second),
+		hustle.WithLimits(hustle.Limits{InputBytes: 1, OutputBytes: 1}),
+		hustle.WithCurrentLoopModel(),
+		hustle.WithSystemPrompt("private", "prompt-v1"),
+		hustle.WithPolicyRevision("policy-v1"),
+	)
+	if err != nil {
+		t.Fatalf("hustle.Define() error = %v", err)
+	}
+	return event.HustleStarted{
+		Header: event.Header{
+			Coordinates:     identity.Coordinates{SessionID: sid},
+			EventID:         fixedUUID(0xB0),
+			EventVisibility: event.Internal,
+		},
+		Run: event.HustleRunDescriptor{Definition: definition.Descriptor(), RunID: hustle.RunID(fixedUUID(0xB1))},
+	}
 }
 
 // newCatalog opens a memstore Store + Catalog with a mutable clock.
@@ -342,8 +367,9 @@ func TestReaderReadJournal(t *testing.T) {
 		recs := []journal.JournalRecord{
 			journal.NewEventRecord(sessionStarted(sid)),                  // seq 2 (after opening fence at 1)
 			journal.NewGatePreparedRecord(prepared, openPayload),         // seq 3 (filtered)
-			journal.NewEventRecord(turnDone(sid, loop, fixedUUID(0x74))), // seq 4
-			journal.NewEventRecord(turnDone(sid, loop, fixedUUID(0x75))), // seq 5
+			journal.NewEventRecord(hustleStarted(t, sid)),                // seq 4 (internal, filtered)
+			journal.NewEventRecord(turnDone(sid, loop, fixedUUID(0x74))), // seq 5
+			journal.NewEventRecord(turnDone(sid, loop, fixedUUID(0x75))), // seq 6
 		}
 		for _, rec := range recs {
 			if _, err := j.Append(context.Background(), rec); err != nil {
@@ -365,8 +391,8 @@ func TestReaderReadJournal(t *testing.T) {
 	}{
 		{name: "absent session yields empty done", absent: true, page: serve.JournalPage{From: 0, Limit: 100}, wantCount: 0, wantNext: 0, wantDone: true},
 		{name: "from beginning yields all events done", page: serve.JournalPage{From: 0, Limit: 100}, wantCount: 3, wantFirstSeq: 2, wantNext: 0, wantDone: true, wantNoGate: true},
-		{name: "limit under total not done", page: serve.JournalPage{From: 0, Limit: 2}, wantCount: 2, wantFirstSeq: 2, wantNext: 5, wantDone: false},
-		{name: "from interior sequence", page: serve.JournalPage{From: 4, Limit: 100}, wantCount: 2, wantFirstSeq: 4, wantNext: 0, wantDone: true},
+		{name: "limit under total not done", page: serve.JournalPage{From: 0, Limit: 2}, wantCount: 2, wantFirstSeq: 2, wantNext: 6, wantDone: false},
+		{name: "from interior sequence", page: serve.JournalPage{From: 4, Limit: 100}, wantCount: 2, wantFirstSeq: 5, wantNext: 0, wantDone: true},
 	}
 
 	for _, tt := range tests {
@@ -400,8 +426,9 @@ func TestReaderReadJournal(t *testing.T) {
 			}
 			if tt.wantNoGate {
 				for _, se := range page.Events {
-					if _, ok := se.Event.(event.GatePrepared); ok {
-						t.Errorf("GatePrepared leaked into journal page at seq %d", se.JournalSeq)
+					switch se.Event.(type) {
+					case event.GatePrepared, event.HustleStarted, event.HustleCompleted, event.HustleFailed:
+						t.Errorf("private event %T leaked into journal page at seq %d", se.Event, se.JournalSeq)
 					}
 				}
 			}

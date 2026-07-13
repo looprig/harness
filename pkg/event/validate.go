@@ -1,9 +1,14 @@
 package event
 
 import (
+	"crypto/sha256"
+	"strings"
+
 	"github.com/looprig/core/content"
 	"github.com/looprig/core/uuid"
+	"github.com/looprig/harness/pkg/hustle"
 	"github.com/looprig/harness/pkg/identity"
+	"github.com/looprig/inference"
 )
 
 // EventName is the concrete event type name an InvalidEventError points at.
@@ -48,6 +53,13 @@ const (
 	FieldEffort          FieldName = "Effort"
 	FieldUsage           FieldName = "Usage"
 	FieldMessages        FieldName = "Messages"
+	FieldVisibility      FieldName = "Visibility"
+	FieldDefinition      FieldName = "Definition"
+	FieldRunID           FieldName = "RunID"
+	FieldRuntime         FieldName = "Runtime"
+	FieldDuration        FieldName = "Duration"
+	FieldStage           FieldName = "Stage"
+	FieldReasonCode      FieldName = "ReasonCode"
 	// FieldType names the whole event (not one coordinate) on the fail-secure
 	// unknown-type path, paired with RuleUnknownType.
 	FieldType FieldName = "Type"
@@ -109,6 +121,9 @@ func validateEventIdentity(ev Event) error {
 		return &InvalidEventError{Event: name, Field: FieldType, Rule: RuleUnknownType}
 	}
 	h := ev.EventHeader()
+	if !h.EventVisibility.Valid() {
+		return &InvalidEventError{Event: name, Field: FieldVisibility, Rule: RuleInvalid}
+	}
 	if h.EventID.IsZero() {
 		return &InvalidEventError{Event: name, Field: FieldEventID, Rule: RuleRequired}
 	}
@@ -141,6 +156,34 @@ func validateEventBody(ev Event) error {
 		return validateModelRuntime("LoopModeChanged", e.Runtime)
 	case LoopStarted:
 		return validateModelRuntime("LoopStarted", e.Runtime)
+	case HustleStarted:
+		if e.Visibility() != Internal {
+			return invalidHustle("HustleStarted", FieldVisibility)
+		}
+		if err := validateHustleRun("HustleStarted", e.Run); err != nil {
+			return err
+		}
+		if !zeroModelRuntime(e.Run.Runtime) {
+			return invalidHustle("HustleStarted", FieldRuntime)
+		}
+	case HustleCompleted:
+		if e.Visibility() != Internal {
+			return invalidHustle("HustleCompleted", FieldVisibility)
+		}
+		if err := validateHustleRun("HustleCompleted", e.Run); err != nil {
+			return err
+		}
+		if e.Duration < 0 {
+			return invalidHustle("HustleCompleted", FieldDuration)
+		}
+		if err := validateModelRuntime("HustleCompleted", e.Run.Runtime); err != nil {
+			return invalidHustle("HustleCompleted", FieldRuntime)
+		}
+		if err := validateOptionalUsage("HustleCompleted", e.Usage); err != nil {
+			return err
+		}
+	case HustleFailed:
+		return validateHustleFailed(e)
 	case StepDone:
 		return validateStepDoneMessages(e.Messages)
 	case TurnDone:
@@ -149,6 +192,79 @@ func validateEventBody(ev Event) error {
 		}
 	}
 	return nil
+}
+
+func invalidHustle(name EventName, field FieldName) *InvalidEventError {
+	return &InvalidEventError{Event: name, Field: field, Rule: RuleInvalid}
+}
+
+func validateHustleRun(name EventName, run HustleRunDescriptor) error {
+	descriptor := run.Definition
+	if strings.TrimSpace(string(descriptor.Name)) == "" || strings.TrimSpace(descriptor.PolicyRevision) == "" ||
+		descriptor.PromptSHA256 == ([sha256.Size]byte{}) || strings.TrimSpace(descriptor.PromptRevision) == "" ||
+		descriptor.TimeoutNanos <= 0 || descriptor.Limits.InputBytes <= 0 || descriptor.Limits.OutputBytes <= 0 ||
+		(descriptor.Participation != hustle.ParticipationBlocking && descriptor.Participation != hustle.ParticipationBackground) ||
+		(descriptor.ModelSource != hustle.ModelSourceCurrentLoop && descriptor.ModelSource != hustle.ModelSourceNamed) {
+		return invalidHustle(name, FieldDefinition)
+	}
+	if descriptor.ModelSource == hustle.ModelSourceNamed {
+		if err := descriptor.NamedModelKey.Validate(); err != nil || strings.TrimSpace(descriptor.NamedModelPolicyRevision) == "" {
+			return invalidHustle(name, FieldDefinition)
+		}
+	}
+	if uuid.UUID(run.RunID).IsZero() {
+		return invalidHustle(name, FieldRunID)
+	}
+	return nil
+}
+
+func validateHustleFailed(e HustleFailed) error {
+	const name EventName = "HustleFailed"
+	if e.Visibility() != Internal {
+		return invalidHustle(name, FieldVisibility)
+	}
+	if err := validateHustleRun(name, e.Run); err != nil {
+		return err
+	}
+	if e.Duration < 0 {
+		return invalidHustle(name, FieldDuration)
+	}
+	if !e.Stage.Valid() {
+		return invalidHustle(name, FieldStage)
+	}
+	if !e.ReasonCode.Valid() {
+		return invalidHustle(name, FieldReasonCode)
+	}
+	preResolution := e.Stage == hustle.StageQueue || e.Stage == hustle.StageModelResolution
+	if preResolution {
+		if e.Usage != nil {
+			return invalidHustle(name, FieldUsage)
+		}
+		if !zeroModelRuntime(e.Run.Runtime) {
+			if err := validateModelRuntime(name, e.Run.Runtime); err != nil {
+				return invalidHustle(name, FieldRuntime)
+			}
+		}
+		return nil
+	}
+	if err := validateModelRuntime(name, e.Run.Runtime); err != nil {
+		return invalidHustle(name, FieldRuntime)
+	}
+	return validateOptionalUsage(name, e.Usage)
+}
+
+func validateOptionalUsage(name EventName, usage *content.Usage) error {
+	if usage == nil {
+		return nil
+	}
+	if err := usage.Validate(); err != nil {
+		return invalidHustle(name, FieldUsage)
+	}
+	return nil
+}
+
+func zeroModelRuntime(runtime ModelRuntime) bool {
+	return runtime.Key == (inference.ModelKey{}) && runtime.Limits == (inference.ContextLimits{}) && runtime.Effort == inference.Effort("")
 }
 
 func validateStepDoneMessages(messages content.AgenticMessages) error {
@@ -291,6 +407,12 @@ func classify(ev Event) (name string, profile idProfile, ok bool) {
 		// changes it (same shape as WorkspaceCheckpointed) — only SessionID set. Level is
 		// an opaque ordinal the validator never constrains.
 		return "SecurityCeilingChanged", sessionProfile(), true
+	case HustleStarted:
+		return "HustleStarted", sessionProfile(), true
+	case HustleCompleted:
+		return "HustleCompleted", sessionProfile(), true
+	case HustleFailed:
+		return "HustleFailed", sessionProfile(), true
 	case LoopIdle:
 		return "LoopIdle", loopProfile(), true
 	case LoopStarted:

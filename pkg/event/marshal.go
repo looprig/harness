@@ -154,6 +154,7 @@ func encodePayload(ev Event) ([]byte, error) {
 	case SessionStarted, SessionActive, SessionIdle, SessionStopped,
 		RestoreStarted, RestoreDone, WorkspaceCheckpointed, WorkspaceRestored,
 		ActiveLoopChanged, SecurityCeilingChanged,
+		HustleStarted, HustleCompleted, HustleFailed,
 		LoopIdle, LoopStarted, DelegateRequestAccepted, LoopInferenceChanged, LoopModeChanged,
 		ForeignSessionBound, TurnRejected,
 		UserInputRequested, TurnInterrupted,
@@ -330,6 +331,9 @@ func UnmarshalEvent(data []byte) (Event, error) {
 	if len(data) > maxEventBytes {
 		return nil, &EventLimitError{Got: len(data), Max: maxEventBytes}
 	}
+	if err := rejectDuplicateJSONKeys(data); err != nil {
+		return nil, &EventDecodeError{Cause: err}
+	}
 	var probe struct {
 		Type string `json:"type"`
 	}
@@ -344,6 +348,64 @@ func UnmarshalEvent(data []byte) (Event, error) {
 		return nil, err
 	}
 	return ev, nil
+}
+
+func rejectDuplicateJSONKeys(data []byte) error {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	token, err := decoder.Token()
+	if err != nil {
+		return err
+	}
+	return inspectJSONValue(decoder, token)
+}
+
+func inspectJSONValue(decoder *json.Decoder, token json.Token) error {
+	delim, ok := token.(json.Delim)
+	if !ok {
+		return nil
+	}
+	switch delim {
+	case '{':
+		seen := make(map[string]struct{})
+		for decoder.More() {
+			keyToken, err := decoder.Token()
+			if err != nil {
+				return err
+			}
+			key, ok := keyToken.(string)
+			if !ok {
+				return fmt.Errorf("non-string object key")
+			}
+			canonical := strings.ToLower(key)
+			if _, exists := seen[canonical]; exists {
+				return fmt.Errorf("duplicate field %q", key)
+			}
+			seen[canonical] = struct{}{}
+			valueToken, err := decoder.Token()
+			if err != nil {
+				return err
+			}
+			if err := inspectJSONValue(decoder, valueToken); err != nil {
+				return err
+			}
+		}
+		_, err := decoder.Token()
+		return err
+	case '[':
+		for decoder.More() {
+			valueToken, err := decoder.Token()
+			if err != nil {
+				return err
+			}
+			if err := inspectJSONValue(decoder, valueToken); err != nil {
+				return err
+			}
+		}
+		_, err := decoder.Token()
+		return err
+	default:
+		return fmt.Errorf("unexpected delimiter %q", delim)
+	}
 }
 
 // validateDecodedEvent preserves the one additive compatibility exception in the
@@ -497,6 +559,12 @@ func decodePayload(tag string, data []byte) (Event, error) {
 		return decodePlain[ActiveLoopChanged](tag, data)
 	case "SecurityCeilingChanged":
 		return decodePlain[SecurityCeilingChanged](tag, data)
+	case "HustleStarted":
+		return decodePlain[HustleStarted](tag, data)
+	case "HustleCompleted":
+		return decodePlain[HustleCompleted](tag, data)
+	case "HustleFailed":
+		return decodePlain[HustleFailed](tag, data)
 	case "LoopIdle":
 		return decodePlain[LoopIdle](tag, data)
 	case "LoopStarted":

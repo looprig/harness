@@ -34,6 +34,12 @@ type Reader struct {
 	store   *sessionstore.Store
 }
 
+// PrivateEventError reports an internal event encountered at a public serve
+// reconstruction boundary. It contains no event payload.
+type PrivateEventError struct{ Visibility event.EventVisibility }
+
+func (e *PrivateEventError) Error() string { return "catalogreader: non-public event refused" }
+
 // compile-time proof the adapter satisfies the serve read plane.
 var _ serve.Reader = (*Reader)(nil)
 
@@ -154,6 +160,9 @@ func reconstruct(seq uint64, raw json.RawMessage) (*serve.StatusEvent, error) {
 	if err != nil {
 		return nil, err
 	}
+	if ev.Visibility() != event.Public {
+		return nil, &PrivateEventError{Visibility: ev.Visibility()}
+	}
 	return &serve.StatusEvent{JournalSeq: seq, Event: ev}, nil
 }
 
@@ -185,6 +194,12 @@ func (r *Reader) ReadJournal(ctx context.Context, id uuid.UUID, page serve.Journ
 		}
 		if nerr != nil {
 			return serve.EventJournalPage{}, serve.StoreReadError{Op: "replay", Cause: nerr}
+		}
+		if !ev.Visibility().Valid() {
+			return serve.EventJournalPage{}, serve.StoreReadError{Op: "replay", Cause: &event.InvalidEventError{Event: "Event", Field: event.FieldVisibility, Rule: event.RuleInvalid}}
+		}
+		if ev.Visibility() != event.Public {
+			continue
 		}
 		events = append(events, serve.StatusEvent{JournalSeq: seq, Event: ev})
 		lastSeq = seq
