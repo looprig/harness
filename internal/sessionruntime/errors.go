@@ -33,7 +33,7 @@ const (
 	SessionDelegateIntentAppendFailed    = sessionapi.SessionDelegateIntentAppendFailed
 	SessionDelegateAdmissionCommitFailed = sessionapi.SessionDelegateAdmissionCommitFailed
 	RestoreNoSessionStarted              = sessionapi.RestoreNoSessionStarted
-	RestoreNoPrimaryLoop                 = sessionapi.RestoreNoPrimaryLoop
+	RestoreNoPrimerLoop                  = sessionapi.RestoreNoPrimerLoop
 	RestoreLeaseFailed                   = sessionapi.RestoreLeaseFailed
 	RestoreJournalFailed                 = sessionapi.RestoreJournalFailed
 	RestoreReplayFailed                  = sessionapi.RestoreReplayFailed

@@ -66,7 +66,7 @@ func findRootLoopStarted(events []event.Event) (event.LoopStarted, error) {
 			return ls, nil
 		}
 	}
-	return event.LoopStarted{}, &RestoreDiscoveryError{Kind: RestoreNoPrimaryLoop}
+	return event.LoopStarted{}, &RestoreDiscoveryError{Kind: RestoreNoPrimerLoop}
 }
 
 func findForeignSID(events []event.Event) string {

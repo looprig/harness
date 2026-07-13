@@ -62,6 +62,13 @@ func TestPublicSessionContractsAreInterfaces(t *testing.T) {
 	var _ session.Session = (session.SessionController)(nil)
 }
 
+func TestRestoreNoPrimerLoopWireValue(t *testing.T) {
+	t.Parallel()
+	if got, want := string(session.RestoreNoPrimerLoop), "no_primer_loop"; got != want {
+		t.Fatalf("RestoreNoPrimerLoop = %q, want %q", got, want)
+	}
+}
+
 func TestSessionBoundaryGuardRejectsExportedValueAliases(t *testing.T) {
 	source := `package session
 var New = func() {}

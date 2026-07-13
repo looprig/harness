@@ -439,7 +439,7 @@ type loopPlan struct {
 // topology it maps the sole configured primer onto the first root (name-agnostic
 // compatibility), and — under WithAllowConfigMismatch — recovers a single primer whose name
 // does not match the persisted root. It fails closed if the stream carries no loop
-// (RestoreNoPrimaryLoop) or a configured primer has no matching root in a topology that
+// (RestoreNoPrimerLoop) or a configured primer has no matching root in a topology that
 // cannot be recovered, returning a typed error the caller records as a RestoreErrored.
 func discoverRoots(all []event.Event, topology Topology, allowMismatch bool) (map[identity.AgentName]event.LoopStarted, []event.LoopStarted, error) {
 	roots := make(map[identity.AgentName]event.LoopStarted)
@@ -463,7 +463,7 @@ func discoverRoots(all []event.Event, topology Topology, allowMismatch bool) (ma
 		}
 	}
 	if len(starts) == 0 {
-		return nil, nil, &RestoreDiscoveryError{Kind: RestoreNoPrimaryLoop}
+		return nil, nil, &RestoreDiscoveryError{Kind: RestoreNoPrimerLoop}
 	}
 	for _, primer := range topology.Primers {
 		if _, ok := roots[primer]; !ok {

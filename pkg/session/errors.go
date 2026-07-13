@@ -85,7 +85,7 @@ type RestoreDiscoveryErrorKind string
 
 const (
 	RestoreNoSessionStarted RestoreDiscoveryErrorKind = "no_session_started"
-	RestoreNoPrimaryLoop    RestoreDiscoveryErrorKind = "no_primary_loop"
+	RestoreNoPrimerLoop     RestoreDiscoveryErrorKind = "no_primer_loop"
 )
 
 type RestoreDiscoveryError struct {
@@ -97,7 +97,7 @@ func (e *RestoreDiscoveryError) Error() string {
 	if e.Kind == RestoreNoSessionStarted {
 		return "session: restore: no SessionStarted in stream for " + e.SessionID.String()
 	}
-	if e.Kind == RestoreNoPrimaryLoop {
+	if e.Kind == RestoreNoPrimerLoop {
 		return "session: restore: no root LoopStarted in stream for " + e.SessionID.String()
 	}
 	return "session: restore: discovery failed for " + e.SessionID.String()
