@@ -415,6 +415,11 @@ git commit -m "feat(session): own hustle lifecycle and teardown"
 
 **Files:**
 
+- Modify: `pkg/event/event.go`
+- Modify: `pkg/event/marshal.go`
+- Modify: `pkg/event/validate.go`
+- Modify: `pkg/event/event_test.go`
+- Modify: `pkg/event/marshal_test.go`
 - Create: `pkg/loop/compaction.go`
 - Modify: `pkg/loop/definition.go`
 - Create: `pkg/loop/compaction_test.go`
@@ -430,11 +435,22 @@ git commit -m "feat(session): own hustle lifecycle and teardown"
 Follow `2026-07-11-token-usage-context-occupancy-design.md`. Cover concrete
 versioned `CompactionInput`/`CompactionOutput`, unknown fields, empty/oversized
 summary, exact basis, `DisallowUnknownFields`, validator-before-completed audit,
-failure finalization, and no generic runner exposure to the actor.
+failure finalization, and no generic runner exposure to the actor. Also cover
+one public ephemeral `CompactionStarted` per accepted attempt, no duplicate for
+coalesced waiters, ordering before invocation/terminal, no persistence or replay,
+`{LoopID, AttemptID}` correlation, and non-negative terminal `Duration` on both
+success and rejection. Enumerate interrupt, shutdown, stale-basis/CAS rejection,
+preflight failure, ID-generation failure, lane-full, lane-closed, and progress
+event construction/validation/publication failure. Assert that every successful
+start has exactly one canonical terminal, a progress-publication failure invokes
+no compactor, and a direct pre-ownership return is converted to
+`CompactionRejected` plus all waiter replies. Add panic-before-terminal-append
+and panic-after-terminal-append cases proving the actor's idempotent attempt
+transition neither strands the start nor appends a second outcome.
 
 **Step 2: Run focused tests and confirm RED**
 
-Run: `GOWORK=off go test -race ./pkg/loop ./internal/loopruntime ./internal/sessionruntime -run 'Test.*Compact'`
+Run: `GOWORK=off go test -race ./pkg/event ./pkg/loop ./internal/loopruntime ./internal/sessionruntime -run 'Test.*Compact'`
 
 Expected: FAIL because the compaction adapter/path is absent.
 
@@ -444,22 +460,105 @@ Declare `Compactor` with `CompactAndFinalize` in the compaction domain. Build a
 session adapter bound to one loop ID and fixed `context.compact` name. Inject it
 through bound loop runtime config. The adapter owns input marshal, output decode,
 domain validation, and call-local capture of validated output; the actor owns
-the `CompactionCommitted`/`CompactionRejected` finalizer and CAS policy.
+the `CompactionStarted` emission, private monotonic start time, terminal duration,
+`CompactionCommitted`/`CompactionRejected` finalizer, and CAS policy. Emit the
+start only after the basis is frozen and the attempt is accepted, immediately
+before invoking the compactor. Add one actor-owned
+`finalizeCompaction(AttemptID, outcome)` transition used by both the adapter
+callback and direct-error fallback. It checks actor state, durably appends at
+most one canonical terminal, records the terminal only after append success,
+and returns the existing terminal to later requests. If start publication fails,
+do not invoke the adapter and reject through this transition. If
+`CompactAndFinalize` returns a typed pre-ownership error or its callback is
+recovered before a terminal commits, map the error and submit a rejection; a
+terminal already committed makes that fallback idempotently return without a
+second append. Compute successful duration after CAS validation and immediately
+before terminal event construction; compute rejected duration after selecting
+the reject reason.
 
 **Step 4: Run compaction suites**
 
-Run: `GOWORK=off go test -race ./pkg/loop ./internal/loopruntime ./internal/sessionruntime`
+Run: `GOWORK=off go test -race ./pkg/event ./pkg/loop ./internal/loopruntime ./internal/sessionruntime`
 
 Expected: PASS; hustle usage must not change loop cumulative usage.
 
 **Step 5: Commit**
 
 ```bash
-git add pkg/loop internal/loopruntime internal/sessionruntime
+git add pkg/event pkg/loop internal/loopruntime internal/sessionruntime
 git commit -m "feat(compaction): use typed hustle adapter"
 ```
 
-### Task 9: Replay and bounded catalog aggregate
+### Task 9: CLI compaction progress and completion presentation
+
+This task lands in the sibling `github.com/looprig/cli` module after Task 8's
+harness event contract is available. Keep it as a separate CLI commit.
+
+**Files:**
+
+- Modify: `../cli/tui/statusline.go`
+- Modify: `../cli/tui/statusline_test.go`
+- Modify: `../cli/tui/screen.go`
+- Modify: `../cli/tui/screen_test.go`
+
+**Step 1: Write failing reducer and presentation tests**
+
+Add table-driven cases proving:
+
+- focused-loop `CompactionStarted` changes the status label to
+  `compacting conversation…` both during an active turn and during idle manual
+  compaction;
+- another loop's compaction does not change the focused loop's status;
+- a matching `CompactionCommitted` or `CompactionRejected` clears the activity;
+- a mismatched or stale `AttemptID` cannot clear a newer activity;
+- replay or a terminal without an observed ephemeral start does not leave the
+  status busy; and
+- `CompactionCommitted{Duration: 25 * time.Second}` appends
+  `○ conversation compacted in 25s` through `CommitHarnessFor`, reusing
+  `formatElapsed`, while rejection appends no success row. Restore reconstructs
+  one such row per committed terminal, and duplicate delivery or live/replay
+  overlap cannot append it twice because completion presentation is keyed by
+  terminal `Header.EventID`.
+
+**Step 2: Run focused CLI tests and confirm RED**
+
+Run from `../cli`:
+`GOWORK=off go test -race ./tui -run 'Test.*Compaction|TestStatusLabel'`
+
+Expected: FAIL because the screen has no compaction activity projection.
+
+**Step 3: Implement the focused-loop activity projection**
+
+Track the active compaction attempt per loop, keyed by
+`{LoopID, AttemptID}`. Fold `CompactionStarted` into that projection and clear
+only on a matching canonical terminal. Add `compacting` to `statusInputs`; give
+it precedence over idle, waiting/thinking/streaming, and prompt substates, while
+session-global interrupting/clearing still win. Treat that derived label as
+active for the filled dot and animated gradient even when the turn-lifecycle
+`Status` is idle. On `CompactionCommitted`, append the loop-scoped faint harness
+row with its authoritative `Duration`, deduplicated by terminal event ID. Do not
+use local arrival timestamps or reconstruct ephemeral activity on restore;
+enduring committed terminals do reconstruct their deduplicated historical rows.
+
+**Step 4: Run the CLI suites**
+
+Run from `../cli`: `GOWORK=off go test -race ./...`
+
+Run from `../cli`: `CGO_ENABLED=0 GOWORK=off go build -trimpath ./...`
+
+Run from `../cli`: `GOWORK=off make secure`
+
+Expected: all three commands PASS.
+
+**Step 5: Commit in the CLI module**
+
+```bash
+cd ../cli
+git add tui/statusline.go tui/statusline_test.go tui/screen.go tui/screen_test.go
+git commit -m "feat(tui): show conversation compaction progress"
+```
+
+### Task 10: Replay and bounded catalog aggregate
 
 **Files:**
 
@@ -503,7 +602,7 @@ git add pkg/sessionstore internal/sessionruntime
 git commit -m "feat(sessionstore): fold bounded hustle usage"
 ```
 
-### Task 10: Full verification and documentation reconciliation
+### Task 11: Full verification and documentation reconciliation
 
 **Files:**
 

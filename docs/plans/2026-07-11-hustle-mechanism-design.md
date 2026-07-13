@@ -483,6 +483,25 @@ title change, and so on). Thus lifecycle completion means “validated inference
 result exists,” while the product event remains the sole durable statement that
 the result was applied.
 
+A domain consumer may emit its own public ephemeral progress event before
+invocation when live presentation needs it. Compaction emits
+`CompactionStarted` after accepting and freezing one attempt, then correlates it
+with the caller-owned `CompactionCommitted` or `CompactionRejected` terminal.
+This does not expose the generic internal `HustleStarted` audit or make hustle
+lifecycle events subscriber-visible.
+
+Because `RunAndFinalize` returns pre-ownership rejection without invoking the
+finalizer, compaction uses one actor-owned idempotent terminal transition keyed
+by `AttemptID`. The adapter finalizer submits its success/failure proposal to
+that transition; after a direct return, the caller submits a rejection proposal
+to the same transition. The actor durably appends at most one canonical terminal
+and records it before acknowledging the request. A recovered callback panic
+before the actor commits leaves no terminal and the fallback rejection may
+commit; a panic/error after the actor commits finds the existing terminal and
+is a no-op rather than a second outcome. If publishing the progress event itself
+fails, compaction inference is never invoked and the actor rejects the attempt
+through that same transition.
+
 The finalizer runs exactly once for every queued-owned run:
 success, model-resolution failure, inference failure, malformed output, domain
 validation failure, timeout, or cancellation. Rejection before ownership returns

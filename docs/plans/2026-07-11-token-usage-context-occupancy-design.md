@@ -3,7 +3,8 @@
 **Date:** 2026-07-11
 
 **Last revised:** 2026-07-12 (aligns compaction with one-shot, non-loop hustles;
-terminal-event usage ownership; and bounded model-source catalog buckets)
+terminal-event usage ownership; bounded model-source catalog buckets; and live
+compaction progress presentation)
 
 **Status:** Draft
 
@@ -611,6 +612,42 @@ Rules:
   ordering and uniqueness are what make reply regeneration deterministic; and
 - a control request is consumed only at a safe step/turn boundary.
 
+Once the actor freezes the basis and accepts the shared attempt, it emits one
+public live-progress event before invoking the compactor:
+
+```go
+type CompactionStarted struct {
+	ephemeral
+	loopScoped
+	Header
+	AttemptID CompactAttemptID
+	Reason    CompactionReason
+	Basis     ContextBasis
+}
+```
+
+`CompactionStarted` is deliberately ephemeral. It exists to drive live clients,
+not restore state: a client that reconnects after a crash does not reconstruct a
+spinner. Coalesced waiters do not emit additional starts; one accepted
+`AttemptID` produces at most one start. The event contains no transcript,
+system prompt, model request, or summary.
+
+The actor invokes no compactor unless construction, validation, and publication
+of `CompactionStarted` succeed. A start-publication failure leaves history
+unchanged and produces the canonical `CompactionRejected` plus waiter replies
+with a typed progress-publication reject reason. Once a start has published,
+**every** return path must end in exactly one canonical terminal: if the hustle
+adapter returns a pre-ownership error without invoking its finalizer (preflight,
+ID generation, lane full, or lane closed), the actor maps that typed error to a
+`CompactRejectReason` and asks the actor to finalize rejection. The finalizer and
+the direct-error fallback use the same actor-owned, idempotent
+`finalizeCompaction(AttemptID, outcome)` transition. The actor records a terminal
+for an attempt only after its durable append succeeds and returns the existing
+terminal on every later request. Therefore a recovered callback panic before
+append permits fallback rejection, while a panic/error after a successful append
+cannot manufacture a second outcome. As elsewhere, a failed durable append
+faults the session and is not misreported as a successfully journaled terminal.
+
 ### Crash-consistent outcome
 
 The product and the attempt outcome must be **one** durable event, not two.
@@ -632,6 +669,7 @@ type CompactionCommitted struct {
 	Basis            ContextBasis
 	Summary          *content.UserMessage
 	PostContext      ContextMeasurement
+	Duration         time.Duration
 }
 
 // Failure: the canonical negative outcome, likewise carrying full membership.
@@ -642,6 +680,7 @@ type CompactionRejected struct {
 	AttemptID        CompactAttemptID
 	WaiterCommandIDs []uuid.UUID
 	RejectReason     CompactRejectReason
+	Duration         time.Duration
 }
 ```
 
@@ -658,7 +697,7 @@ func waiterReplyID(attempt CompactAttemptID, cmd uuid.UUID, ok bool) uuid.UUID
 type CompactWaiterResolved struct {
 	enduring
 	loopScoped
-	Header                        // ID = waiterReplyID(AttemptID, CommandID, true)
+	Header                        // EventID = waiterReplyID(AttemptID, CommandID, true)
 	AttemptID           CompactAttemptID
 	CommittedEventID    uuid.UUID // the CompactionCommitted this waiter observed
 }
@@ -666,7 +705,7 @@ type CompactWaiterResolved struct {
 type CompactWaiterRejected struct {
 	enduring
 	loopScoped
-	Header                    // ID = waiterReplyID(AttemptID, CommandID, false)
+	Header                    // EventID = waiterReplyID(AttemptID, CommandID, false)
 	AttemptID CompactAttemptID
 	Reason    CompactRejectReason
 }
@@ -679,6 +718,18 @@ pure function of `{AttemptID, CommandID, outcome}`, a crash *during* repair cann
 double-append: the same id is produced and the existing record wins. Every waiter
 ends with exactly one terminal reply, and no command is left owed — even across a
 crash between the canonical event and its replies.
+
+`Duration` is the non-negative elapsed span from accepting the attempt (the same
+point that emits `CompactionStarted`) until immediately before construction of
+its canonical terminal outcome. On success this is measured only after actor CAS
+validation, so it includes hustle queueing, inference, domain validation,
+post-summary counting, and CAS work, but necessarily excludes the terminal
+event's own durable append. On rejection it is measured after the terminal
+reject reason is known and before constructing `CompactionRejected`. The actor
+records the start with a private monotonic clock; clients never infer duration
+from the ephemeral event's delivery time. Keeping the duration on both enduring
+terminal events makes completion telemetry replayable even though live progress
+is not.
 
 ## §9 · Full replacement and the actor/turn protocol
 
@@ -793,13 +844,16 @@ finalize AIMessage + tool results + usage
 → count it and append ContextMeasured when the measurement changed
 → evaluate pressure from that durable measurement
 → return a compaction directive to the turn goroutine when required
+→ freeze the basis, accept the attempt, and emit CompactionStarted
 → run the compaction hustle while the turn is paused
    (the actor remains responsive to interrupt/shutdown)
-→ validate output and mint the proposed CompactionCommitted/new ContextBasis
+→ if the adapter returns without its finalizer: map the direct error and reject canonically
+→ otherwise validate output and prepare the proposed summary replacement
 → build and count the proposed summary-based next request
-→ construct CompactionCommitted{AttemptID, Waiters, old Basis, Summary, PostContext}
 → construct ContextReplacement{old Basis, Model, Fprint of the measurement}
 → actor CAS-validates {Basis, Model, RequestFingerprint}
+→ measure Duration and mint CompactionCommitted/new ContextBasis
+→ construct CompactionCommitted{AttemptID, Waiters, old Basis, Summary, PostContext, Duration}
 → append CompactionCommitted durably
 → actor replaces loopState.msgs
 → acknowledge replacement to the turn goroutine
@@ -851,6 +905,26 @@ The success case is the single `CompactionCommitted` event defined in §8 — it
 simultaneously the durable product (summary + basis + post-context) **and** the
 attempt outcome (waiter membership). There is deliberately no separate `Compacted`
 event to fall out of sync with it.
+
+Live clients correlate `CompactionStarted` with either canonical terminal by
+`{LoopID, AttemptID}`. The CLI shows `compacting conversation…` as an active
+state in the focused loop's status bar until the matching terminal arrives,
+including for manual compaction while no turn is running. A matching
+`CompactionCommitted` clears that activity and appends the same faint,
+loop-scoped harness row used for turn timing:
+
+```text
+○ conversation compacted in 25s
+```
+
+The row uses `CompactionCommitted.Duration`, not local receipt timestamps.
+Restore rebuilds one historical completion row for each enduring committed
+event, but never reconstructs active progress. Live/replay overlap and duplicate
+delivery are deduplicated by the terminal event's `Header.EventID`, so one commit can
+append at most one row. A terminal received without its ephemeral start is still
+applied safely: it clears matching local activity if present and renders its
+single deduplicated completion row. `CompactionRejected` clears the activity and
+follows the CLI's existing failure presentation; it never emits a success row.
 
 `CompactionCommitted.Basis` identifies what was summarized. `PostContext` measures
 the primary loop's summary-based request context; it is not the hustle's usage.
@@ -1071,8 +1145,9 @@ soft/rearm example and calibration pass.
 | `Compact` | command | intent log | yes | manual or machine compaction request |
 | `ContextPressure` | event | Ephemeral/Public | no | percentage level change |
 | `ContextMeasured` | event | Enduring/Public | yes | authoritative/replayable current measurement |
-| `CompactionCommitted` | event | Enduring/Public | yes | canonical success: context replacement **and** outcome + waiter membership (folded as the reset) |
-| `CompactionRejected` | event | Enduring/Public | yes | canonical failure: reject reason + full waiter membership |
+| `CompactionStarted` | event | Ephemeral/Public | no | one live activity signal per accepted attempt; drives focused-loop status |
+| `CompactionCommitted` | event | Enduring/Public | yes | canonical success: context replacement, outcome + waiter membership, and elapsed duration (folded as the reset) |
+| `CompactionRejected` | event | Enduring/Public | yes | canonical failure: reject reason, full waiter membership, and elapsed duration |
 | `CompactWaiterResolved` | event | Enduring/Public | yes | per-waiter success reply; deterministic id, idempotent projection |
 | `CompactWaiterRejected` | event | Enduring/Public | yes | per-waiter reject reply (failure/cancel/shutdown/stale-basis/lane-full) |
 
@@ -1139,6 +1214,13 @@ endpoints receive integration tests under the `integration` build tag.
   request; smaller-window hard rejection.
 - Express lane: queue-full independence, coalescing, user join, interrupt and
   shutdown priority, command type rather than agency.
+- Live compaction progress: exactly one public ephemeral `CompactionStarted` per
+  accepted attempt, ordered before its hustle invocation and canonical terminal;
+  coalesced waiters do not duplicate it; it is neither journaled nor restored;
+  terminal durations are non-negative and measured by the actor rather than a
+  subscriber clock; progress publication failure invokes no compactor and
+  rejects canonically; every direct pre-ownership adapter rejection after a
+  successful start also produces exactly one canonical rejection.
 - Per-waiter replies: every coalesced waiter gets exactly one terminal
   `CompactWaiterResolved`/`CompactWaiterRejected`; success replies cite one
   `CompactionCommitted` id; failure, cancellation, shutdown, and stale basis each
