@@ -60,6 +60,9 @@ func (l *lane) grantLocked() {
 	}
 	for l.executing < l.concurrent && len(l.queue) > 0 {
 		run := l.queue[0]
+		if !run.eligible {
+			return
+		}
 		l.queue = l.queue[1:]
 		if run.state != runQueued {
 			continue
@@ -68,6 +71,17 @@ func (l *lane) grantLocked() {
 		l.executing++
 		close(run.granted)
 	}
+}
+
+func (l *lane) makeEligible(run *ownedRun) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.closed || run.state != runQueued || run.callerCtx.Err() != nil || run.controller.sessionCtx.Err() != nil {
+		return false
+	}
+	run.eligible = true
+	l.grantLocked()
+	return true
 }
 
 func (l *lane) cancelQueued(run *ownedRun) bool {
@@ -83,6 +97,7 @@ func (l *lane) cancelQueued(run *ownedRun) bool {
 		}
 	}
 	run.state = runFinalizing
+	l.grantLocked()
 	return true
 }
 

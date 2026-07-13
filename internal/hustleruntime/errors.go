@@ -8,10 +8,14 @@ import (
 type ConfigErrorReason string
 
 const (
-	ConfigInvalidContext    ConfigErrorReason = "invalid_context"
-	ConfigInvalidConcurrent ConfigErrorReason = "invalid_concurrent"
-	ConfigInvalidQueued     ConfigErrorReason = "invalid_queued"
-	ConfigCapacityOverflow  ConfigErrorReason = "capacity_overflow"
+	ConfigInvalidContext      ConfigErrorReason = "invalid_context"
+	ConfigInvalidConcurrent   ConfigErrorReason = "invalid_concurrent"
+	ConfigInvalidQueued       ConfigErrorReason = "invalid_queued"
+	ConfigCapacityOverflow    ConfigErrorReason = "capacity_overflow"
+	ConfigInvalidSessionID    ConfigErrorReason = "invalid_session_id"
+	ConfigInvalidDefinitions  ConfigErrorReason = "invalid_definitions"
+	ConfigInvalidTimeout      ConfigErrorReason = "invalid_timeout"
+	ConfigMissingCollaborator ConfigErrorReason = "missing_collaborator"
 )
 
 // ConfigError reports invalid scheduler limits without retaining collaborators.
@@ -38,6 +42,7 @@ const (
 	AdmissionRunID                AdmissionErrorReason = "run_id"
 	AdmissionFull                 AdmissionErrorReason = "full"
 	AdmissionClosed               AdmissionErrorReason = "closed"
+	AdmissionPoisoned             AdmissionErrorReason = "poisoned"
 )
 
 // AdmissionError has no RunID because admission failures are pre-ownership.
@@ -53,13 +58,39 @@ func (e *AdmissionError) Error() string {
 
 func (e *AdmissionError) Unwrap() error { return e.Cause }
 
+// RequestErrorReason identifies a pre-ownership runtime request rejection.
+type RequestErrorReason string
+
+const (
+	RequestInvalidContext     RequestErrorReason = "invalid_context"
+	RequestRuntimeUnavailable RequestErrorReason = "runtime_unavailable"
+	RequestUnknownDefinition  RequestErrorReason = "unknown_definition"
+	RequestInvalidCause       RequestErrorReason = "invalid_cause"
+	RequestInvalidInput       RequestErrorReason = "invalid_input"
+	RequestInputTooLarge      RequestErrorReason = "input_too_large"
+	RequestNilValidator       RequestErrorReason = "nil_validator"
+)
+
+// RequestError reports a rejection before a run owns capacity or a RunID.
+type RequestError struct {
+	Reason RequestErrorReason
+	Name   hustle.Name
+	Cause  error
+}
+
+func (e *RequestError) Error() string { return "hustleruntime: request rejected: " + string(e.Reason) }
+
+func (e *RequestError) Unwrap() error { return e.Cause }
+
 // QueueFailureReason classifies a terminal failure while an owned node waits for
 // an execution slot.
 type QueueFailureReason string
 
 const (
 	QueueFailureCanceled QueueFailureReason = "canceled"
+	QueueFailureTimeout  QueueFailureReason = "timeout"
 	QueueFailureClosed   QueueFailureReason = "closed"
+	QueueFailurePoisoned QueueFailureReason = "poisoned"
 )
 
 // QueueFailureError is both the returned owned-run failure and the exact error
@@ -71,6 +102,8 @@ type QueueFailureError struct {
 	Reason        QueueFailureReason
 	Cause         error
 	FinalizerErr  *FinalizerError
+	TerminalErr   error
+	CleanupErr    error
 }
 
 func (e *QueueFailureError) Error() string {
@@ -78,25 +111,155 @@ func (e *QueueFailureError) Error() string {
 }
 
 func (e *QueueFailureError) Unwrap() []error {
-	errors := make([]error, 0, 2)
+	errors := make([]error, 0, 4)
 	if e.Cause != nil {
 		errors = append(errors, e.Cause)
 	}
 	if e.FinalizerErr != nil {
 		errors = append(errors, e.FinalizerErr)
 	}
+	if e.TerminalErr != nil {
+		errors = append(errors, e.TerminalErr)
+	}
+	if e.CleanupErr != nil {
+		errors = append(errors, e.CleanupErr)
+	}
 	return errors
 }
 
-// FinalizerError preserves a consumer callback failure with owned-run identity.
-type FinalizerError struct {
+// RunError is the primary typed failure of an owned run after admission.
+type RunError struct {
+	Name         hustle.Name
+	RunID        hustle.RunID
+	Stage        hustle.Stage
+	ReasonCode   hustle.ReasonCode
+	Cause        error
+	TerminalErr  error
+	FinalizerErr *FinalizerError
+	CleanupErr   error
+}
+
+func (e *RunError) Error() string { return "hustleruntime: owned run failed" }
+
+func (e *RunError) Unwrap() []error {
+	errors := make([]error, 0, 4)
+	if e.Cause != nil {
+		errors = append(errors, e.Cause)
+	}
+	if e.TerminalErr != nil {
+		errors = append(errors, e.TerminalErr)
+	}
+	if e.FinalizerErr != nil {
+		errors = append(errors, e.FinalizerErr)
+	}
+	if e.CleanupErr != nil {
+		errors = append(errors, e.CleanupErr)
+	}
+	return errors
+}
+
+// OutputError reports an invalid provider response or consumer validation
+// result without retaining response content.
+type OutputError struct {
+	Cause error
+}
+
+func (e *OutputError) Error() string { return "hustleruntime: invalid hustle output" }
+
+func (e *OutputError) Unwrap() error { return e.Cause }
+
+// CallbackPanicError is the redacted recovery product for a consumer callback.
+// It deliberately retains no panic value.
+type CallbackPanicError struct {
+	Stage hustle.Stage
+}
+
+func (e *CallbackPanicError) Error() string { return "hustleruntime: consumer callback panicked" }
+
+// WorkerPoisonError reports that an inference worker ignored cancellation long
+// enough to disable both lanes. It retains no provider response or request.
+type WorkerPoisonError struct {
 	RunID hustle.RunID
 	Cause error
 }
 
+func (e *WorkerPoisonError) Error() string {
+	return "hustleruntime: inference worker poisoned controller"
+}
+
+func (e *WorkerPoisonError) Unwrap() error { return e.Cause }
+
+// WorkerPanicError is the redacted recovery product for an inference client
+// panic. It deliberately retains no panic value.
+type WorkerPanicError struct {
+	RunID hustle.RunID
+}
+
+func (e *WorkerPanicError) Error() string { return "hustleruntime: inference client panicked" }
+
+// AuditOperation identifies the checked lifecycle publication step which
+// failed.
+type AuditOperation string
+
+const (
+	AuditStamp   AuditOperation = "stamp"
+	AuditPublish AuditOperation = "publish"
+)
+
+// AuditError reports one bounded internal lifecycle publication failure.
+type AuditError struct {
+	Operation  AuditOperation
+	Stage      hustle.Stage
+	ReasonCode hustle.ReasonCode
+	Cause      error
+}
+
+func (e *AuditError) Error() string {
+	return "hustleruntime: lifecycle audit failed: " + string(e.Operation)
+}
+
+func (e *AuditError) Unwrap() error { return e.Cause }
+
+// ActivityOperation identifies the activity edge which failed.
+type ActivityOperation string
+
+const (
+	ActivityAcquire ActivityOperation = "acquire"
+	ActivityRelease ActivityOperation = "release"
+)
+
+// ActivityError reports blocking-activity acquisition or release failure.
+type ActivityError struct {
+	RunID     hustle.RunID
+	Operation ActivityOperation
+	Cause     error
+}
+
+func (e *ActivityError) Error() string {
+	return "hustleruntime: activity operation failed: " + string(e.Operation)
+}
+
+func (e *ActivityError) Unwrap() error { return e.Cause }
+
+// FinalizerError preserves a consumer callback failure with owned-run identity.
+type FinalizerError struct {
+	RunID      hustle.RunID
+	Cause      error
+	CleanupErr error
+}
+
 func (e *FinalizerError) Error() string { return "hustleruntime: run finalizer failed" }
 
-func (e *FinalizerError) Unwrap() error { return e.Cause }
+func (e *FinalizerError) Unwrap() []error {
+	errors := make([]error, 0, 2)
+	if e.Cause != nil {
+		errors = append(errors, e.Cause)
+	}
+	if e.CleanupErr != nil {
+		errors = append(errors, e.CleanupErr)
+	}
+	return errors
+}
 
 // RunStateError reports misuse of the internal ownership seam without silently
 // corrupting lane accounting.

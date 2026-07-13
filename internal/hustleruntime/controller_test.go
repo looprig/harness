@@ -33,6 +33,7 @@ func TestNewControllerValidatesLaneLimits(t *testing.T) {
 	}{
 		{name: "minimum valid including zero queues", ctx: context.Background(), config: Config{Blocking: LaneLimits{Concurrent: 1}, Background: LaneLimits{Concurrent: 1}}},
 		{name: "nil session context", config: valid, wantReason: ConfigInvalidContext, wantField: "context"},
+		{name: "canceled session context", ctx: func() context.Context { ctx, cancel := context.WithCancel(context.Background()); cancel(); return ctx }(), config: valid, wantReason: ConfigInvalidContext, wantField: "context"},
 		{name: "zero blocking concurrency", ctx: context.Background(), config: func() Config { value := valid; value.Blocking.Concurrent = 0; return value }(), wantReason: ConfigInvalidConcurrent, wantField: "blocking.concurrent"},
 		{name: "negative blocking queue", ctx: context.Background(), config: func() Config { value := valid; value.Blocking.Queued = -1; return value }(), wantReason: ConfigInvalidQueued, wantField: "blocking.queued"},
 		{name: "blocking queue above bound", ctx: context.Background(), config: func() Config { value := valid; value.Blocking.Queued = maxLaneQueued + 1; return value }(), wantReason: ConfigInvalidQueued, wantField: "blocking.queued"},
