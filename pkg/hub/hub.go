@@ -286,7 +286,9 @@ func validatePublicPublication(ev event.Event) error {
 		}
 	}
 	switch ev.(type) {
-	case event.HustleStarted, event.HustleCompleted, event.HustleFailed:
+	case event.HustleStarted, *event.HustleStarted,
+		event.HustleCompleted, *event.HustleCompleted,
+		event.HustleFailed, *event.HustleFailed:
 		return &PublishBoundaryError{
 			Reason:    PublishBoundaryType,
 			EventType: fmt.Sprintf("%T", ev),
