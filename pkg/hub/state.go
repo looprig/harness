@@ -3,9 +3,9 @@ package hub
 import (
 	"errors"
 
+	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/identity"
-	"github.com/looprig/core/uuid"
 )
 
 // SessionPhase is the coarse quiescence phase of the whole session. SessionIdle is

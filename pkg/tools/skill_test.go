@@ -6,9 +6,9 @@ import (
 	"testing"
 	"testing/fstest"
 
+	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/tool"
-	"github.com/looprig/core/uuid"
 )
 
 // skillToolBody is the markdown body of the well-formed fixture skill, returned

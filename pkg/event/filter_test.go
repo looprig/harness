@@ -3,9 +3,9 @@ package event_test
 import (
 	"testing"
 
+	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/identity"
-	"github.com/looprig/core/uuid"
 )
 
 // mustID mints a non-zero UUID for tests or fails fast.

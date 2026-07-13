@@ -1,8 +1,8 @@
 package command
 
 import (
-	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/core/uuid"
+	"github.com/looprig/harness/pkg/identity"
 )
 
 // CancelQueuedInput retracts a still-queued submit (a UserInput/SubagentResult

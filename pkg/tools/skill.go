@@ -5,10 +5,10 @@ import (
 	"encoding/json"
 	"strings"
 
+	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/harness/pkg/tool"
-	"github.com/looprig/core/uuid"
 )
 
 // skill.go implements the Skill tool: an on-demand reader of a single curated,

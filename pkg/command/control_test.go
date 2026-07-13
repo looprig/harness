@@ -3,9 +3,9 @@ package command_test
 import (
 	"testing"
 
+	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/command"
 	"github.com/looprig/harness/pkg/tool"
-	"github.com/looprig/core/uuid"
 )
 
 // gateRouter is the narrow accessor runLoop uses to route a control command to
