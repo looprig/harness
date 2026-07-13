@@ -14,11 +14,14 @@ package hub
 
 import (
 	"context"
+	"fmt"
+	"reflect"
 	"sync"
 	"time"
 
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/event"
+	"github.com/looprig/harness/pkg/hustle"
 	"github.com/looprig/harness/pkg/identity"
 )
 
@@ -155,6 +158,9 @@ func (h *Hub) PublishEventChecked(ctx context.Context, ev event.Event) error {
 }
 
 func (h *Hub) publishEvent(ctx context.Context, ev event.Event, checked bool) error {
+	if err := validatePublicPublication(ev); err != nil {
+		return err
+	}
 	if err := h.beginPublish(); err != nil {
 		if checked {
 			return err
@@ -246,6 +252,73 @@ func (h *Hub) publishEvent(ctx context.Context, ev event.Event, checked bool) er
 		h.signalIdleIfEdge(derived)
 	}
 	return nil
+}
+
+// PublishInternalEventChecked durably appends one recognized private hustle
+// lifecycle event. It deliberately bypasses quiescence mutation, workspace idle
+// boundaries, and subscriber delivery: the separate hustle activity lease owns the
+// blocking state, while this method owns only the private audit record.
+func (h *Hub) PublishInternalEventChecked(ctx context.Context, ev event.Event) error {
+	if err := h.validateInternalPublication(ev); err != nil {
+		return err
+	}
+	if err := h.beginPublish(); err != nil {
+		return err
+	}
+	defer h.finishPublish()
+
+	if _, err := h.appender.AppendEvent(ctx, ev); err != nil {
+		fault := &SessionPersistenceFault{Event: ev, Cause: err}
+		h.reporter.ReportFault(ctx, fault)
+		return fault
+	}
+	return nil
+}
+
+func validatePublicPublication(ev event.Event) error {
+	if nilEvent(ev) {
+		return &PublishBoundaryError{Reason: PublishBoundaryNilEvent}
+	}
+	if ev.Visibility() != event.Public {
+		return &PublishBoundaryError{
+			Reason:    PublishBoundaryVisibility,
+			EventType: fmt.Sprintf("%T", ev),
+		}
+	}
+	return nil
+}
+
+func (h *Hub) validateInternalPublication(ev event.Event) error {
+	if nilEvent(ev) {
+		return &PublishBoundaryError{Reason: PublishBoundaryNilEvent}
+	}
+	eventType := fmt.Sprintf("%T", ev)
+	if ev.Visibility() != event.Internal {
+		return &PublishBoundaryError{Reason: PublishBoundaryVisibility, EventType: eventType}
+	}
+	if ev.Class() != event.Enduring {
+		return &PublishBoundaryError{Reason: PublishBoundaryClass, EventType: eventType}
+	}
+	if ev.EventHeader().SessionID != h.sessionID {
+		return &PublishBoundaryError{Reason: PublishBoundarySession, EventType: eventType}
+	}
+	switch ev.(type) {
+	case event.HustleStarted, event.HustleCompleted, event.HustleFailed:
+	default:
+		return &PublishBoundaryError{Reason: PublishBoundaryType, EventType: eventType}
+	}
+	if err := event.ValidateEvent(ev); err != nil {
+		return &PublishBoundaryError{Reason: PublishBoundaryInvalid, EventType: eventType, Cause: err}
+	}
+	return nil
+}
+
+func nilEvent(ev event.Event) bool {
+	if ev == nil {
+		return true
+	}
+	value := reflect.ValueOf(ev)
+	return value.Kind() == reflect.Pointer && value.IsNil()
 }
 
 func (h *Hub) beginPublish() error {
@@ -419,6 +492,115 @@ func (h *Hub) CancelExpectTurn(ctx context.Context, subagentLoopID uuid.UUID) {
 	h.appendAndDeliverDerived(ctx, subs, derived, idleGeneration)
 }
 
+// HustleActivityLease owns one blocking hustle entry in the hub's quiescence set.
+// Its concrete return type is intentional: sessionruntime adapts it to the narrow
+// controller-owned lease interface without weakening Go's invariant return types.
+type HustleActivityLease struct {
+	hub            *Hub
+	key            activityKey
+	partial        bool
+	acquisitionErr error
+	releaseOnce    sync.Once
+	releaseErr     error
+}
+
+type hustleActivityInsertion struct {
+	key     activityKey
+	subs    []*EventSubscription
+	derived event.Event
+}
+
+// AcquireHustleActivity inserts runID as blocking session work. The returned lease
+// removes exactly that entry. If the Idle->Active edge cannot be durably committed,
+// a non-nil partial lease is returned with the fault so the caller can silently
+// roll back the in-memory insertion.
+func (h *Hub) AcquireHustleActivity(ctx context.Context, runID hustle.RunID) (*HustleActivityLease, error) {
+	id := uuid.UUID(runID)
+	if id.IsZero() {
+		return nil, &HustleActivityError{Reason: HustleActivityInvalidRunID, RunID: runID}
+	}
+	if err := h.beginPublish(); err != nil {
+		return nil, err
+	}
+	defer h.finishPublish()
+
+	insertion, err := h.insertHustleActivity(runID, id)
+	if err != nil {
+		return nil, err
+	}
+	lease := &HustleActivityLease{hub: h, key: insertion.key}
+	if _, active := insertion.derived.(event.SessionActive); active {
+		if observer, ok := h.idleBoundary.(sessionActivationObserver); ok {
+			observer.SessionActivated()
+		}
+	}
+	if err := h.appendAndDeliverDerivedChecked(ctx, insertion.subs, insertion.derived, 0); err != nil {
+		lease.partial = true
+		lease.acquisitionErr = err
+		return lease, err
+	}
+	return lease, nil
+}
+
+func (h *Hub) insertHustleActivity(runID hustle.RunID, id uuid.UUID) (hustleActivityInsertion, error) {
+	key := activityKey{kind: kindHustle, id: id}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.state.phase == SessionStopped {
+		return hustleActivityInsertion{}, &HustleActivityError{Reason: HustleActivityStopped, RunID: runID}
+	}
+	if _, exists := h.state.active[key]; exists {
+		return hustleActivityInsertion{}, &HustleActivityError{Reason: HustleActivityDuplicate, RunID: runID}
+	}
+	derived := h.state.applyActivity(h.sessionID, func() { h.state.add(key) })
+	return hustleActivityInsertion{key: key, subs: h.snapshotSubsLocked(), derived: derived}, nil
+}
+
+// Release removes this lease's exact run activity at most once. A partial lease
+// performs an in-memory rollback only and returns the cached acquisition fault; a
+// committed lease persists any resulting Active->Idle edge through the native idle
+// boundary and caches that result for later calls.
+func (l *HustleActivityLease) Release(ctx context.Context) error {
+	if l == nil {
+		return nil
+	}
+	l.releaseOnce.Do(func() {
+		if l.partial {
+			l.rollbackPartial()
+			l.releaseErr = l.acquisitionErr
+			return
+		}
+		l.releaseErr = l.releaseCommitted(ctx)
+	})
+	return l.releaseErr
+}
+
+func (l *HustleActivityLease) rollbackPartial() {
+	l.hub.mu.Lock()
+	l.hub.state.remove(l.key)
+	if len(l.hub.state.active) == 0 && l.hub.state.phase == SessionActive {
+		l.hub.state.phase = SessionIdle
+	}
+	l.hub.mu.Unlock()
+}
+
+func (l *HustleActivityLease) releaseCommitted(ctx context.Context) error {
+	if err := l.hub.beginPublish(); err != nil {
+		return err
+	}
+	defer l.hub.finishPublish()
+
+	l.hub.mu.Lock()
+	derived := l.hub.state.applyActivity(l.hub.sessionID, func() { l.hub.state.remove(l.key) })
+	var idleGeneration uint64
+	if _, idle := derived.(event.SessionIdle); idle {
+		idleGeneration = l.hub.markIdleBoundaryLocked()
+	}
+	subs := l.hub.snapshotSubsLocked()
+	l.hub.mu.Unlock()
+	return l.hub.appendAndDeliverDerivedChecked(ctx, subs, derived, idleGeneration)
+}
+
 // appendAndDeliverDerived is the create→append→deliver path for a session event
 // derived by ExpectTurn/CancelExpectTurn (which have no triggering event of their
 // own). It mints the derived event's header, durably appends it before delivery, and
@@ -426,13 +608,18 @@ func (h *Hub) CancelExpectTurn(ctx context.Context, subagentLoopID uuid.UUID) {
 // append/mint failure is fail-secure: deliver nothing, raise a fault. A nil derived
 // (no edge crossed) is a no-op. Called OUTSIDE the hub lock.
 func (h *Hub) appendAndDeliverDerived(ctx context.Context, subs []*EventSubscription, derived event.Event, idleGeneration uint64) {
+	_ = h.appendAndDeliverDerivedChecked(ctx, subs, derived, idleGeneration)
+}
+
+func (h *Hub) appendAndDeliverDerivedChecked(ctx context.Context, subs []*EventSubscription, derived event.Event, idleGeneration uint64) error {
 	if derived == nil {
-		return
+		return nil
 	}
 	stamped, err := h.factory.Stamp(derived.EventHeader())
 	if err != nil {
-		h.reporter.ReportFault(ctx, &SessionPersistenceFault{Event: derived, Cause: err})
-		return
+		fault := &SessionPersistenceFault{Event: derived, Cause: err}
+		h.reporter.ReportFault(ctx, fault)
+		return fault
 	}
 	derived = withHeader(derived, stamped)
 	if idle, ok := derived.(event.SessionIdle); ok {
@@ -448,15 +635,17 @@ func (h *Hub) appendAndDeliverDerived(ctx context.Context, subs []*EventSubscrip
 		}
 		err := h.idleBoundary.CommitSessionIdle(ctx, idle, commit)
 		h.completeIdleBoundary(idleGeneration, err == nil)
-		return
+		return err
 	}
 	seq, err := h.appender.AppendEvent(ctx, derived)
 	if err != nil {
-		h.reporter.ReportFault(ctx, &SessionPersistenceFault{Event: derived, Cause: err})
-		return
+		fault := &SessionPersistenceFault{Event: derived, Cause: err}
+		h.reporter.ReportFault(ctx, fault)
+		return fault
 	}
 	h.deliver(subs, derived, seq)
 	h.signalIdleIfEdge(derived)
+	return nil
 }
 
 func (h *Hub) markIdleBoundaryLocked() uint64 {
