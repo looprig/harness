@@ -247,6 +247,63 @@ func TestOrdinaryPublicationRejectsNonPublic(t *testing.T) {
 	}
 }
 
+func TestOrdinaryPublicationRejectsPublicHustleLifecycle(t *testing.T) {
+	t.Parallel()
+	sessionID := mustID(t)
+	started := testHustleStarted(t, sessionID, testRunID(t))
+	started.EventVisibility = event.Public
+	completed := event.HustleCompleted{Header: started.Header, Run: started.Run}
+	completed.EventID = mustID(t)
+	completed.Run.Runtime = event.ModelRuntime{Key: inference.ModelKey{Provider: "test", Model: "model"}}
+	failed := event.HustleFailed{
+		Header:     started.Header,
+		Run:        started.Run,
+		Stage:      hustle.StageQueue,
+		ReasonCode: hustle.ReasonCanceled,
+	}
+	failed.EventID = mustID(t)
+	tests := []struct {
+		name    string
+		ev      event.Event
+		publish func(*Hub, context.Context, event.Event) error
+	}{
+		{name: "unchecked rejects public started", ev: started, publish: (*Hub).PublishEvent},
+		{name: "checked rejects public started", ev: started, publish: (*Hub).PublishEventChecked},
+		{name: "unchecked rejects public completed", ev: completed, publish: (*Hub).PublishEvent},
+		{name: "checked rejects public completed", ev: completed, publish: (*Hub).PublishEventChecked},
+		{name: "unchecked rejects public failed", ev: failed, publish: (*Hub).PublishEvent},
+		{name: "checked rejects public failed", ev: failed, publish: (*Hub).PublishEventChecked},
+	}
+	for _, tt := range tests {
+		testCase := tt
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+			appender := &fakeAppender{}
+			h := New(sessionID, WithAppender(appender))
+			sub, err := h.SubscribeEvents(allFilter())
+			if err != nil {
+				t.Fatalf("SubscribeEvents() error = %v", err)
+			}
+
+			err = testCase.publish(h, context.Background(), testCase.ev)
+			var boundary *PublishBoundaryError
+			if !errors.As(err, &boundary) || boundary.Reason != PublishBoundaryType {
+				t.Fatalf("error = %T %v, want type PublishBoundaryError", err, err)
+			}
+			if appender.callCount() != 0 {
+				t.Fatalf("append calls = %d, want 0", appender.callCount())
+			}
+			h.mu.RLock()
+			phase, active := h.state.phase, len(h.state.active)
+			h.mu.RUnlock()
+			if phase != SessionIdle || active != 0 {
+				t.Fatalf("state after denied lifecycle = (%v,%d), want idle/0", phase, active)
+			}
+			expectNone(t, sub)
+		})
+	}
+}
+
 func TestAcquireHustleActivityLifecycle(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
