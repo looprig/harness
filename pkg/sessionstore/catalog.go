@@ -140,7 +140,11 @@ type LoopUsageMeta struct {
 	// A legacy event without Runtime advances this watermark while preserving the
 	// last known value. One bounded scalar per loop prevents delayed lifecycle
 	// notifications from regressing selection without an unbounded event set.
-	RuntimeSeq      uint64        `json:"runtime_seq,omitempty"`
+	RuntimeSeq uint64 `json:"runtime_seq,omitempty"`
+	// RuntimeValueSeq is the sequence that supplied Runtime. It can trail
+	// RuntimeSeq when a newer legacy event carries no resolved runtime, allowing
+	// delayed known values to converge to the highest known sequence boundedly.
+	RuntimeValueSeq uint64        `json:"runtime_value_seq,omitempty"`
 	CumulativeUsage content.Usage `json:"cumulative_usage,omitzero"`
 }
 
@@ -513,11 +517,20 @@ func putLoopRuntime(loops []LoopUsageMeta, loopID uuid.UUID, runtime event.Model
 			return updated
 		}
 	} else if updated[index].RuntimeSeq != 0 && seq <= updated[index].RuntimeSeq {
+		// A newer legacy lifecycle notification can establish the watermark
+		// before older known runtimes arrive. Ordered journal repair retains the
+		// highest-sequence known value below that watermark, so mirror it without
+		// retaining an event set.
+		if runtime != (event.ModelRuntime{}) && seq > updated[index].RuntimeValueSeq {
+			updated[index].Runtime = runtime
+			updated[index].RuntimeValueSeq = seq
+		}
 		return updated
 	}
 	updated[index].RuntimeSeq = seq
 	if runtime != (event.ModelRuntime{}) {
 		updated[index].Runtime = runtime
+		updated[index].RuntimeValueSeq = seq
 	}
 	return updated
 }
