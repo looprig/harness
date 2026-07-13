@@ -72,6 +72,8 @@ const (
 	TurnStartReservationInvalidLoop TurnStartReservationReason = "invalid_loop_id"
 	TurnStartReservationStopped     TurnStartReservationReason = "session_stopped"
 	TurnStartReservationMismatch    TurnStartReservationReason = "publication_mismatch"
+	TurnStartReservationReleased    TurnStartReservationReason = "released"
+	TurnStartReservationReused      TurnStartReservationReason = "reused"
 )
 
 // TurnStartReservationError reports a denied or mismatched one-shot turn-start

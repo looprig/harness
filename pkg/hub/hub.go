@@ -46,12 +46,9 @@ type Hub struct {
 	// lock alone. A failed Hustle Idle→Active acquisition transfers ownership to
 	// its partial lease until Release rolls back the uncommitted insertion. A native
 	// loop may reserve it before acquiring its first-step checkpoint reader; the
-	// matching TurnStarted consumes that one-shot reservation without re-locking.
+	// reservation's opaque publisher commits the matching TurnStarted without
+	// re-locking. Generic publication never discovers or consumes reservations.
 	activityMu sync.Mutex
-	// turnStartMu guards only the pointer to the one possible turn-start reservation.
-	// The reservation itself owns activityMu, so a second reservation cannot coexist.
-	turnStartMu          sync.Mutex
-	turnStartReservation *TurnStartReservation
 
 	// mu guards subs, state, and waiters together. One lock keeps the
 	// subscriber-set snapshot consistent with the active/phase transition.
@@ -171,6 +168,10 @@ func (h *Hub) PublishEventChecked(ctx context.Context, ev event.Event) error {
 }
 
 func (h *Hub) publishEvent(ctx context.Context, ev event.Event, checked bool) error {
+	return h.publishEventWithActivity(ctx, ev, checked, false)
+}
+
+func (h *Hub) publishEventWithActivity(ctx context.Context, ev event.Event, checked, activityReserved bool) error {
 	if err := validatePublicPublication(ev); err != nil {
 		return err
 	}
@@ -181,17 +182,9 @@ func (h *Hub) publishEvent(ctx context.Context, ev event.Event, checked bool) er
 		return nil
 	}
 	defer h.finishPublish()
-	if _, mutatesActivity := activeMutation(ev); mutatesActivity {
-		reservation, reservationErr := h.claimTurnStartReservation(ev)
-		if reservationErr != nil {
-			return reservationErr
-		}
-		if reservation != nil {
-			defer reservation.finish()
-		} else {
-			h.activityMu.Lock()
-			defer h.activityMu.Unlock()
-		}
+	if _, mutatesActivity := activeMutation(ev); mutatesActivity && !activityReserved {
+		h.activityMu.Lock()
+		defer h.activityMu.Unlock()
 	}
 	// (1)+(2) Ephemeral: no append, seq stays 0. Enduring: append before apply,
 	// fail-secure; capture the durable sequence to ride the live delivery.

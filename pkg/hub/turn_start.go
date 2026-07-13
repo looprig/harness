@@ -1,6 +1,7 @@
 package hub
 
 import (
+	"context"
 	"sync"
 
 	"github.com/looprig/core/uuid"
@@ -11,13 +12,14 @@ type turnStartReservationState uint8
 
 const (
 	turnStartReservationPending turnStartReservationState = iota
-	turnStartReservationClaimed
+	turnStartReservationPublishing
+	turnStartReservationPublished
 	turnStartReservationReleased
 )
 
-// TurnStartReservation owns the Hub activity-transition lock from immediately
-// before a loop acquires its first checkpoint reader until that loop publishes its
-// matching TurnStarted. Release cancels an unused reservation and is idempotent.
+// TurnStartReservation is an opaque one-shot publisher that owns the Hub activity
+// transition from immediately before a loop acquires its first checkpoint reader
+// through publication of that loop's exact opening TurnStarted.
 type TurnStartReservation struct {
 	hub    *Hub
 	loopID uuid.UUID
@@ -27,7 +29,7 @@ type TurnStartReservation struct {
 }
 
 // ReserveTurnStart establishes the global activity-before-checkpoint lock order for
-// one loop's opening TurnStarted. The returned reservation must be released on every
+// one loop's opening TurnStarted. The returned capability must be released on every
 // path that does not publish that exact event.
 func (h *Hub) ReserveTurnStart(loopID uuid.UUID) (*TurnStartReservation, error) {
 	if loopID.IsZero() {
@@ -41,16 +43,11 @@ func (h *Hub) ReserveTurnStart(loopID uuid.UUID) (*TurnStartReservation, error) 
 		h.activityMu.Unlock()
 		return nil, &TurnStartReservationError{Reason: TurnStartReservationStopped, LoopID: loopID}
 	}
-
-	reservation := &TurnStartReservation{hub: h, loopID: loopID}
-	h.turnStartMu.Lock()
-	h.turnStartReservation = reservation
-	h.turnStartMu.Unlock()
-	return reservation, nil
+	return &TurnStartReservation{hub: h, loopID: loopID}, nil
 }
 
-// Release cancels an unused reservation. Once the Hub has claimed it for the
-// matching TurnStarted, the publication path owns the final release instead.
+// Release cancels an unused capability. A publication already in progress owns the
+// activity release; a published or previously released capability is a no-op.
 func (r *TurnStartReservation) Release() {
 	if r == nil {
 		return
@@ -62,58 +59,31 @@ func (r *TurnStartReservation) Release() {
 	}
 	r.state = turnStartReservationReleased
 	r.mu.Unlock()
-	r.releaseActivity()
-}
-
-func (r *TurnStartReservation) claim() bool {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if r.state != turnStartReservationPending {
-		return false
-	}
-	r.state = turnStartReservationClaimed
-	return true
-}
-
-func (r *TurnStartReservation) finish() {
-	r.mu.Lock()
-	if r.state != turnStartReservationClaimed {
-		r.mu.Unlock()
-		return
-	}
-	r.state = turnStartReservationReleased
-	r.mu.Unlock()
-	r.releaseActivity()
-}
-
-func (r *TurnStartReservation) releaseActivity() {
-	r.hub.turnStartMu.Lock()
-	if r.hub.turnStartReservation == r {
-		r.hub.turnStartReservation = nil
-	}
-	r.hub.turnStartMu.Unlock()
 	r.hub.activityMu.Unlock()
 }
 
-func (h *Hub) claimTurnStartReservation(ev event.Event) (*TurnStartReservation, error) {
-	started, isTurnStarted := ev.(event.TurnStarted)
-	h.turnStartMu.Lock()
-	reservation := h.turnStartReservation
-	if reservation == nil || !isTurnStarted {
-		h.turnStartMu.Unlock()
-		return nil, nil
+// PublishTurnStarted consumes this capability for exactly one matching value event.
+// Generic Hub publication cannot discover or claim it from event coordinates.
+func (r *TurnStartReservation) PublishTurnStarted(ctx context.Context, started event.TurnStarted) error {
+	if started.SessionID != r.hub.sessionID || started.LoopID != r.loopID {
+		return &TurnStartReservationError{Reason: TurnStartReservationMismatch, LoopID: started.LoopID}
 	}
-	if started.SessionID != h.sessionID || started.LoopID != reservation.loopID {
-		h.turnStartMu.Unlock()
-		return nil, &TurnStartReservationError{
-			Reason: TurnStartReservationMismatch,
-			LoopID: started.LoopID,
-		}
+	r.mu.Lock()
+	switch r.state {
+	case turnStartReservationReleased:
+		r.mu.Unlock()
+		return &TurnStartReservationError{Reason: TurnStartReservationReleased, LoopID: r.loopID}
+	case turnStartReservationPublishing, turnStartReservationPublished:
+		r.mu.Unlock()
+		return &TurnStartReservationError{Reason: TurnStartReservationReused, LoopID: r.loopID}
 	}
-	claimed := reservation.claim()
-	h.turnStartMu.Unlock()
-	if !claimed {
-		return nil, nil
-	}
-	return reservation, nil
+	r.state = turnStartReservationPublishing
+	r.mu.Unlock()
+	defer func() {
+		r.mu.Lock()
+		r.state = turnStartReservationPublished
+		r.mu.Unlock()
+		r.hub.activityMu.Unlock()
+	}()
+	return r.hub.publishEventWithActivity(ctx, started, false, true)
 }

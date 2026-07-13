@@ -87,9 +87,19 @@ func (p *pausedExecutionSession) EnterExecution(ctx context.Context, loopID uuid
 	return p.pause(ctx, release, err)
 }
 
-func (p *pausedExecutionSession) EnterTurnStart(ctx context.Context, loopID uuid.UUID) (func(), error) {
-	release, err := p.Session.EnterTurnStart(ctx, loopID)
-	return p.pause(ctx, release, err)
+func (p *pausedExecutionSession) EnterTurnStart(ctx context.Context, loopID uuid.UUID) (loopruntime.TurnStartCapability, error) {
+	capability, err := p.Session.EnterTurnStart(ctx, loopID)
+	if err != nil {
+		return nil, err
+	}
+	p.once.Do(func() { close(p.acquired) })
+	select {
+	case <-p.resume:
+		return capability, nil
+	case <-ctx.Done():
+		capability.Release()
+		return nil, ctx.Err()
+	}
 }
 
 func (p *pausedExecutionSession) pause(ctx context.Context, release func(), err error) (func(), error) {
@@ -1610,6 +1620,23 @@ func TestTurnStartReservationOrdersHubBeforeExecutionAdmission(t *testing.T) {
 			case <-time.After(time.Second):
 				t.Fatal("loop did not acquire execution admission")
 			}
+			nonOwnerHeader, err := s.factory.Stamp(event.Header{Coordinates: identity.Coordinates{
+				SessionID: s.sessionID,
+				LoopID:    loopID,
+				TurnID:    mustUUID(),
+			}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			nonOwnerResult := make(chan error, 1)
+			go func() {
+				nonOwnerResult <- s.PublishEventChecked(context.Background(), event.TurnStarted{Header: nonOwnerHeader})
+			}()
+			select {
+			case err := <-nonOwnerResult:
+				t.Fatalf("generic same-loop publisher stole in-flight turn-start reservation: %v", err)
+			case <-time.After(20 * time.Millisecond):
+			}
 
 			idleHeader, err := s.factory.Stamp(event.Header{Coordinates: identity.Coordinates{
 				SessionID: s.sessionID,
@@ -1656,6 +1683,14 @@ func TestTurnStartReservationOrdersHubBeforeExecutionAdmission(t *testing.T) {
 				default:
 					time.Sleep(time.Millisecond)
 				}
+			}
+			select {
+			case err := <-nonOwnerResult:
+				if err != nil {
+					t.Fatal(err)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("generic same-loop publisher did not continue after owned TurnStarted")
 			}
 			select {
 			case err := <-idleResult:

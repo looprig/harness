@@ -166,8 +166,15 @@ type executionAdmission interface {
 	EnterExecution(context.Context, uuid.UUID) (func(), error)
 }
 
+// TurnStartCapability is the actor's opaque, one-shot authority to publish one
+// admitted turn's exact opening TurnStarted and later release its first-step reader.
+type TurnStartCapability interface {
+	PublishTurnStarted(context.Context, event.TurnStarted) error
+	Release()
+}
+
 type turnStartAdmission interface {
-	EnterTurnStart(context.Context, uuid.UUID) (func(), error)
+	EnterTurnStart(context.Context, uuid.UUID) (TurnStartCapability, error)
 }
 
 // faultProbe is the actor's narrow read of the session's durable-persistence fault latch.
@@ -520,6 +527,7 @@ type drainRequest struct {
 
 type admissionResult struct {
 	release func()
+	start   TurnStartCapability
 	err     error
 }
 
@@ -598,6 +606,15 @@ func runLoop(cfg loopConfig, state loopState) {
 		}
 		if err := cfg.events.PublishEvent(ctx, stamped); err != nil {
 			slog.Error("loop event publish to session fan-in failed", "error", err)
+		}
+	}
+	publishTurnStarted := func(ev event.TurnStarted, capability TurnStartCapability) {
+		if capability == nil {
+			publish(ev)
+			return
+		}
+		if err := capability.PublishTurnStarted(ctx, ev); err != nil {
+			slog.Error("reserved TurnStarted publish to session fan-in failed", "error", err)
 		}
 	}
 	commitBoundary := func(ev event.Event) error {
@@ -686,7 +703,7 @@ func runLoop(cfg loopConfig, state loopState) {
 	// derived turn ctx and the defensive base clone the per-turn goroutine reads.
 	// This is the COMMIT-AND-ANNOUNCE half of starting a turn (distinct from
 	// assembling the per-turn turnConfig).
-	installActiveTurn := func(turnID uuid.UUID, qi queuedInput) (context.Context, content.AgenticMessages) {
+	installActiveTurn := func(turnID uuid.UUID, qi queuedInput, started event.TurnStarted, capability TurnStartCapability) (context.Context, content.AgenticMessages) {
 		state.turnIndex++
 		state.turnID = turnID
 		state.causationID = qi.inputID
@@ -703,22 +720,7 @@ func runLoop(cfg loopConfig, state loopState) {
 		// TurnStarted (Message + Cause.CommandID = inputID + InputID = inputID) at the
 		// SAME actor-owned point, BEFORE runTurn starts.
 		state.msgs = append(state.msgs, qi.msg)
-		publish(event.TurnStarted{
-			Header: event.Header{
-				Coordinates: identity.Coordinates{
-					SessionID: state.sessionID,
-					LoopID:    state.id,
-					TurnID:    state.turnID,
-				},
-				Cause: identity.Cause{
-					CommandID:   state.causationID,
-					Coordinates: identity.Coordinates{LoopID: qi.triggeredBy},
-					Agency:      qi.agency,
-				},
-			},
-			TurnIndex: state.turnIndex,
-			Message:   cloneUserMessage(qi.msg),
-		})
+		publishTurnStarted(started, capability)
 		return turnCtx, base
 	}
 
@@ -801,10 +803,10 @@ func runLoop(cfg loopConfig, state loopState) {
 	// commit-then-start path shared by an idle submit and the on-idle inbox pop. It
 	// mints the TurnID, installs+commits+announces the turn (installActiveTurn),
 	// assembles the per-turn config (buildTurnConfig), then launches runTurn. It
-	// returns the new TurnID; on an id-gen failure it returns a non-nil error and
-	// starts nothing (the caller decides how to surface it). The actor is the sole
-	// caller, so it always runs with state.status idle.
-	startTurnWithIDAndAdmission := func(turnID uuid.UUID, qi queuedInput, firstAdmission func()) uuid.UUID {
+	// returns the new TurnID; when capability-backed opening-event preparation fails,
+	// it returns a non-nil error and starts nothing (the caller decides how to surface
+	// it). The actor is the sole caller, so it always runs with state.status idle.
+	startTurnWithIDAndAdmission := func(turnID uuid.UUID, qi queuedInput, firstAdmission func(), capability TurnStartCapability) (uuid.UUID, error) {
 		firstLease := newAdmissionLease(firstAdmission)
 		launched := false
 		defer func() {
@@ -815,7 +817,26 @@ func runLoop(cfg loopConfig, state loopState) {
 		if firstLease != nil {
 			firstAdmission = firstLease.Release
 		}
-		turnCtx, base := installActiveTurn(turnID, qi)
+		started := event.TurnStarted{
+			Header: event.Header{
+				Coordinates: identity.Coordinates{SessionID: state.sessionID, LoopID: state.id, TurnID: turnID},
+				Cause: identity.Cause{
+					CommandID:   qi.inputID,
+					Coordinates: identity.Coordinates{LoopID: qi.triggeredBy},
+					Agency:      qi.agency,
+				},
+			},
+			TurnIndex: state.turnIndex + 1,
+			Message:   cloneUserMessage(qi.msg),
+		}
+		if capability != nil {
+			stamped, err := stamp(started)
+			if err != nil {
+				return uuid.UUID{}, err
+			}
+			started = stamped.(event.TurnStarted)
+		}
+		turnCtx, base := installActiveTurn(turnID, qi, started, capability)
 		idx := state.turnIndex
 		ts := newTurnState(state.sessionID, state.id, turnID, idx, state.causationID, qi.msg)
 		turnCfg := buildTurnConfig(base, firstAdmission)
@@ -839,17 +860,17 @@ func runLoop(cfg loopConfig, state loopState) {
 			internal <- turnResult{terminal: terminal}
 		}()
 		launched = true
-		return turnID
+		return turnID, nil
 	}
-	startTurnWithID := func(turnID uuid.UUID, qi queuedInput) uuid.UUID {
-		return startTurnWithIDAndAdmission(turnID, qi, nil)
+	startTurnWithID := func(turnID uuid.UUID, qi queuedInput) (uuid.UUID, error) {
+		return startTurnWithIDAndAdmission(turnID, qi, nil, nil)
 	}
 	startTurn := func(qi queuedInput) (uuid.UUID, error) {
 		turnID, err := config.idGen()
 		if err != nil {
 			return uuid.UUID{}, &IDGenerationError{Cause: err}
 		}
-		return startTurnWithID(turnID, qi), nil
+		return startTurnWithID(turnID, qi)
 	}
 
 	// userMessageFromBlocks wraps an owned clone of submit blocks into the committed
@@ -1088,16 +1109,20 @@ func runLoop(cfg loopConfig, state loopState) {
 		admitCtx, cancel := context.WithCancel(ctx)
 		state.cancelAdmission = cancel
 		go func() {
-			enter := admission.EnterExecution
+			var result admissionResult
 			if startAdmission, supportsTurnStart := cfg.events.(turnStartAdmission); supportsTurnStart {
-				enter = startAdmission.EnterTurnStart
+				result.start, result.err = startAdmission.EnterTurnStart(admitCtx, state.id)
+				if result.start != nil {
+					result.release = result.start.Release
+				}
+			} else {
+				result.release, result.err = admission.EnterExecution(admitCtx, state.id)
 			}
-			release, err := enter(admitCtx, state.id)
 			select {
-			case admissions <- admissionResult{release: release, err: err}:
+			case admissions <- result:
 			case <-admitCtx.Done():
-				if release != nil {
-					release()
+				if result.release != nil {
+					result.release()
 				}
 			}
 		}()
@@ -1599,7 +1624,16 @@ func runLoop(cfg loopConfig, state loopState) {
 				emitLoopIdle()
 				continue
 			}
-			startTurnWithIDAndAdmission(turnID, next, result.release)
+			if _, err := startTurnWithIDAndAdmission(turnID, next, result.release, result.start); err != nil {
+				state.status = loopIdle
+				if next.rejectOnStartFailure {
+					rejectSubmit(next, event.RejectInternal)
+				} else {
+					returnEntry(next, event.CancelTurnFailed, uuid.UUID{})
+				}
+				returnQueuedInbox(event.CancelTurnFailed, uuid.UUID{})
+				emitLoopIdle()
+			}
 
 		case req := <-drains:
 			// Tool-continuation drain: pop + clear the inbox into draining and reply the

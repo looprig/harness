@@ -3,7 +3,9 @@ package loopruntime
 import (
 	"context"
 	"errors"
+	"io"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -11,8 +13,74 @@ import (
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/command"
 	"github.com/looprig/harness/pkg/event"
+	"github.com/looprig/harness/pkg/hub"
+	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/inference"
 )
+
+type countingNoRunLLM struct{ calls atomic.Int32 }
+
+func (c *countingNoRunLLM) Invoke(context.Context, inference.Request) (*inference.Response, error) {
+	return nil, errors.New("countingNoRunLLM.Invoke not used")
+}
+
+func (c *countingNoRunLLM) Stream(context.Context, inference.Request) (*inference.StreamReader[content.Chunk], error) {
+	c.calls.Add(1)
+	return inference.NewStreamReader(func() (content.Chunk, error) { return nil, io.EOF }, nil), nil
+}
+
+type observedTurnStartCapability struct {
+	reservation *hub.TurnStartReservation
+	released    chan struct{}
+	releaseOnce sync.Once
+	publishes   atomic.Int32
+}
+
+func (c *observedTurnStartCapability) PublishTurnStarted(ctx context.Context, started event.TurnStarted) error {
+	c.publishes.Add(1)
+	return c.reservation.PublishTurnStarted(ctx, started)
+}
+
+func (c *observedTurnStartCapability) Release() {
+	c.releaseOnce.Do(func() {
+		close(c.released)
+		c.reservation.Release()
+	})
+}
+
+type capabilityHubPublisher struct {
+	hub             *hub.Hub
+	record          recordingPublisher
+	capabilityReady chan *observedTurnStartCapability
+}
+
+func (p *capabilityHubPublisher) PublishEvent(ctx context.Context, ev event.Event) error {
+	if err := p.hub.PublishEvent(ctx, ev); err != nil {
+		return err
+	}
+	return p.record.PublishEvent(ctx, ev)
+}
+
+func (p *capabilityHubPublisher) PublishEventChecked(ctx context.Context, ev event.Event) error {
+	if err := p.hub.PublishEventChecked(ctx, ev); err != nil {
+		return err
+	}
+	return p.record.PublishEventChecked(ctx, ev)
+}
+
+func (p *capabilityHubPublisher) EnterExecution(context.Context, uuid.UUID) (func(), error) {
+	return func() {}, nil
+}
+
+func (p *capabilityHubPublisher) EnterTurnStart(_ context.Context, loopID uuid.UUID) (TurnStartCapability, error) {
+	reservation, err := p.hub.ReserveTurnStart(loopID)
+	if err != nil {
+		return nil, err
+	}
+	capability := &observedTurnStartCapability{reservation: reservation, released: make(chan struct{})}
+	p.capabilityReady <- capability
+	return capability, nil
+}
 
 // fixedClock returns a constant instant so a test can assert CreatedAt
 // deterministically.
@@ -177,6 +245,103 @@ func TestEnduringLoopEventsStamped(t *testing.T) {
 	}
 	if !sawEphemeral {
 		t.Fatal("no Ephemeral event captured (expected at least one TokenDelta)")
+	}
+}
+
+func TestTurnStartedMintFailureCancelsCapabilityBeforeInference(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+	}{
+		{name: "opening stamp failure rejects input and releases reserved activity"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			ctx, cancel := context.WithCancel(context.Background())
+			t.Cleanup(cancel)
+			sessionID := mustID(t)
+			loopID := mustID(t)
+			h := hub.New(sessionID)
+			publisher := &capabilityHubPublisher{hub: h, capabilityReady: make(chan *observedTurnStartCapability, 1)}
+			client := &countingNoRunLLM{}
+			mintErr := errors.New("TurnStarted event id mint failed")
+			var mintCalls atomic.Int32
+			factory := event.NewFactory(func() (uuid.UUID, error) {
+				if mintCalls.Add(1) == 1 {
+					return uuid.UUID{}, mintErr
+				}
+				return uuid.New()
+			}, time.Now)
+			l, err := newWithConfig(ctx, sessionID, loopID, Provenance{}, publisher, runtimeConfig{
+				Client:       client,
+				Model:        testModel(),
+				DrainTimeout: 200 * time.Millisecond,
+				idGen:        uuid.New,
+				eventFactory: factory,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			inputID := mustID(t)
+			l.Commands <- command.UserInput{Header: command.Header{CommandID: inputID, CreatedAt: time.Now()}}
+			var capability *observedTurnStartCapability
+			select {
+			case capability = <-publisher.capabilityReady:
+			case <-time.After(time.Second):
+				t.Fatal("turn-start capability was not acquired")
+			}
+
+			deadline := time.Now().Add(200 * time.Millisecond)
+			var rejected event.TurnRejected
+			for rejected.Cause.CommandID != inputID {
+				for _, ev := range publisher.record.events() {
+					candidate, ok := ev.(event.TurnRejected)
+					if ok && candidate.Cause.CommandID == inputID {
+						rejected = candidate
+						break
+					}
+				}
+				if rejected.Cause.CommandID == inputID {
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Fatal("TurnStarted stamp failure did not resolve input as TurnRejected")
+				}
+				time.Sleep(time.Millisecond)
+			}
+			if rejected.Reason != event.RejectInternal {
+				t.Fatalf("TurnRejected reason = %v, want RejectInternal", rejected.Reason)
+			}
+			if client.calls.Load() != 0 {
+				t.Fatalf("inference calls = %d, want 0 after TurnStarted stamp failure", client.calls.Load())
+			}
+			if capability.publishes.Load() != 0 {
+				t.Fatalf("capability publish calls = %d, want 0 when stamping failed", capability.publishes.Load())
+			}
+			select {
+			case <-capability.released:
+			case <-time.After(100 * time.Millisecond):
+				t.Fatal("failed turn-start capability was not released promptly")
+			}
+
+			later := make(chan error, 1)
+			laterLoopID := mustID(t)
+			go func() {
+				later <- h.PublishEventChecked(context.Background(), event.TurnStarted{Header: event.Header{Coordinates: identity.Coordinates{
+					SessionID: sessionID,
+					LoopID:    laterLoopID,
+				}}})
+			}()
+			select {
+			case err := <-later:
+				if err != nil {
+					t.Fatal(err)
+				}
+			case <-time.After(100 * time.Millisecond):
+				t.Fatal("later Hub activity blocked behind failed turn-start capability")
+			}
+		})
 	}
 }
 

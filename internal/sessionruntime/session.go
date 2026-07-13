@@ -708,25 +708,50 @@ func (s *Session) SessionActivated() {
 	}
 }
 
-type executionReservation interface{ Release() }
+type sessionTurnStartCapability struct {
+	session          *Session
+	reservation      *hub.TurnStartReservation
+	releaseExecution func()
+	releaseOnce      sync.Once
+}
+
+func (c *sessionTurnStartCapability) PublishTurnStarted(ctx context.Context, started event.TurnStarted) error {
+	if err := c.reservation.PublishTurnStarted(ctx, started); err != nil {
+		return err
+	}
+	c.session.recordLoopMechanicalState(started)
+	return nil
+}
+
+func (c *sessionTurnStartCapability) Release() {
+	if c == nil {
+		return
+	}
+	c.releaseOnce.Do(func() {
+		c.releaseExecution()
+		c.reservation.Release()
+	})
+}
 
 // EnterExecution is the inference-step session-wide checkpoint and loop-scoped
 // interrupt admission seam.
 func (s *Session) EnterExecution(ctx context.Context, loopID uuid.UUID) (func(), error) {
-	return s.enterExecution(ctx, loopID, nil)
+	release, _, err := s.enterExecution(ctx, loopID, false)
+	return release, err
 }
 
 // EnterTurnStart reserves the Hub activity transition before acquiring the first
-// checkpoint reader. Its returned release cancels an unused reservation or, after
-// the matching TurnStarted consumes it, releases only the reader at inference end.
-func (s *Session) EnterTurnStart(ctx context.Context, loopID uuid.UUID) (func(), error) {
-	reserve := func() (executionReservation, error) {
-		return s.hub.ReserveTurnStart(loopID)
+// checkpoint reader. Its returned capability publishes the exact opening event and
+// releases the checkpoint reader when the first inference step ends.
+func (s *Session) EnterTurnStart(ctx context.Context, loopID uuid.UUID) (loopruntime.TurnStartCapability, error) {
+	release, reservation, err := s.enterExecution(ctx, loopID, true)
+	if err != nil {
+		return nil, err
 	}
-	return s.enterExecution(ctx, loopID, reserve)
+	return &sessionTurnStartCapability{session: s, reservation: reservation, releaseExecution: release}, nil
 }
 
-func (s *Session) enterExecution(ctx context.Context, loopID uuid.UUID, reserve func() (executionReservation, error)) (func(), error) {
+func (s *Session) enterExecution(ctx context.Context, loopID uuid.UUID, reserve bool) (func(), *hub.TurnStartReservation, error) {
 	for {
 		for {
 			s.loopsMu.Lock()
@@ -742,31 +767,28 @@ func (s *Session) enterExecution(ctx context.Context, loopID uuid.UUID, reserve 
 			select {
 			case <-changed:
 			case <-ctx.Done():
-				return nil, ctx.Err()
+				return nil, nil, ctx.Err()
 			case <-s.sessionCtx.Done():
-				return nil, s.sessionCtx.Err()
+				return nil, nil, s.sessionCtx.Err()
 			}
 		}
-		var reservation executionReservation
-		if reserve != nil {
+		var reservation *hub.TurnStartReservation
+		if reserve {
 			var err error
-			reservation, err = reserve()
+			reservation, err = s.hub.ReserveTurnStart(loopID)
 			if err != nil {
-				return nil, err
+				return nil, nil, err
 			}
 		}
 		if s.checkpointAdmission == nil {
-			if reservation != nil {
-				return reservation.Release, nil
-			}
-			return func() {}, nil
+			return func() {}, reservation, nil
 		}
 		release, err := s.checkpointAdmission.enterExecution(ctx)
 		if err != nil {
 			if reservation != nil {
 				reservation.Release()
 			}
-			return nil, err
+			return nil, nil, err
 		}
 		// Close the interrupt mark/checkpoint-acquire race: a sweep may mark
 		// this loop while it waited for the checkpoint reader permit. In that
@@ -775,13 +797,7 @@ func (s *Session) enterExecution(ctx context.Context, loopID uuid.UUID, reserve 
 		pending := s.interruptPending[loopID] > 0
 		s.loopsMu.RUnlock()
 		if !pending {
-			if reservation != nil {
-				return func() {
-					release()
-					reservation.Release()
-				}, nil
-			}
-			return release, nil
+			return release, reservation, nil
 		}
 		release()
 		if reservation != nil {
