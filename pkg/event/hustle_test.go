@@ -113,6 +113,35 @@ func TestEventVisibilityWireAndFilter(t *testing.T) {
 	}
 }
 
+func TestMarshalEventVisibilityBoundary(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name       string
+		visibility EventVisibility
+		wantErr    bool
+	}{
+		{name: "public zero valid", visibility: Public},
+		{name: "internal valid", visibility: Internal},
+		{name: "unknown invalid", visibility: EventVisibility(99), wantErr: true},
+	}
+	for _, tt := range tests {
+		testCase := tt
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+			_, err := MarshalEvent(SessionStarted{Header: Header{EventVisibility: testCase.visibility}})
+			if (err != nil) != testCase.wantErr {
+				t.Fatalf("MarshalEvent() error = %v, wantErr %v", err, testCase.wantErr)
+			}
+			if testCase.wantErr {
+				var invalid *InvalidEventError
+				if !errors.As(err, &invalid) || invalid.Field != FieldVisibility || invalid.Rule != RuleInvalid {
+					t.Fatalf("error = %T %v, want visibility InvalidEventError", err, err)
+				}
+			}
+		})
+	}
+}
+
 func TestHustleLifecycleRoundTripAndPrivacy(t *testing.T) {
 	t.Parallel()
 	usage := &content.Usage{InputTokens: 4, OutputTokens: 3, ReasoningTokens: 1}
@@ -163,6 +192,12 @@ func TestHustleLifecycleValidation(t *testing.T) {
 	currentWithNamedKey.Definition.NamedModelKey = inference.ModelKey{Provider: "forbidden", Model: "named"}
 	currentWithNamedRevision := validRun
 	currentWithNamedRevision.Definition.NamedModelPolicyRevision = "forbidden-named-policy"
+	reservedDefinition := validRun
+	reservedDefinition.Definition.Name = "_looprig.forged"
+	overLimitDefinition := validRun
+	overLimitDefinition.Definition.Limits.InputBytes = 16*1024*1024 + 1
+	zeroPromptHashDefinition := validRun
+	zeroPromptHashDefinition.Definition.PromptSHA256 = [32]byte{}
 	invalidUsage := &content.Usage{OutputTokens: 1, ReasoningTokens: 2}
 	tests := []struct {
 		name    string
@@ -190,6 +225,9 @@ func TestHustleLifecycleValidation(t *testing.T) {
 		{name: "failed current loop rejects named key", ev: HustleFailed{Header: validHustleHeader(Internal), Run: currentWithNamedKey, Stage: hustle.StageInference, ReasonCode: hustle.ReasonInference}, wantErr: true},
 		{name: "completed current loop rejects named policy revision", ev: HustleCompleted{Header: validHustleHeader(Internal), Run: currentWithNamedRevision}, wantErr: true},
 		{name: "failed current loop rejects named policy revision", ev: HustleFailed{Header: validHustleHeader(Internal), Run: currentWithNamedRevision, Stage: hustle.StageInference, ReasonCode: hustle.ReasonInference}, wantErr: true},
+		{name: "forged reserved definition", ev: HustleCompleted{Header: validHustleHeader(Internal), Run: reservedDefinition}, wantErr: true},
+		{name: "forged definition over payload limit", ev: HustleCompleted{Header: validHustleHeader(Internal), Run: overLimitDefinition}, wantErr: true},
+		{name: "forged definition zero prompt hash", ev: HustleCompleted{Header: validHustleHeader(Internal), Run: zeroPromptHashDefinition}, wantErr: true},
 		{name: "public lifecycle invalid", ev: HustleStarted{Header: validHustleHeader(Public), Run: zeroRuntimeRun}, wantErr: true},
 	}
 	for _, tt := range tests {
@@ -203,6 +241,58 @@ func TestHustleLifecycleValidation(t *testing.T) {
 			_, marshalErr := MarshalEvent(testCase.ev)
 			if (marshalErr != nil) != testCase.wantErr {
 				t.Fatalf("MarshalEvent() error = %v, wantErr %v", marshalErr, testCase.wantErr)
+			}
+		})
+	}
+}
+
+func TestHustleFailedStageReasonCompatibility(t *testing.T) {
+	t.Parallel()
+	allowed := map[hustle.Stage]map[hustle.ReasonCode]bool{
+		hustle.StageQueue:           {hustle.ReasonRejected: true, hustle.ReasonCanceled: true, hustle.ReasonTimeout: true, hustle.ReasonInternal: true},
+		hustle.StageModelResolution: {hustle.ReasonCanceled: true, hustle.ReasonTimeout: true, hustle.ReasonModelResolution: true, hustle.ReasonInternal: true},
+		hustle.StageInference:       {hustle.ReasonCanceled: true, hustle.ReasonTimeout: true, hustle.ReasonInference: true, hustle.ReasonInternal: true},
+		hustle.StageOutput:          {hustle.ReasonCanceled: true, hustle.ReasonTimeout: true, hustle.ReasonInvalidOutput: true, hustle.ReasonInternal: true},
+		hustle.StageTerminal:        {hustle.ReasonTimeout: true, hustle.ReasonTerminal: true, hustle.ReasonInternal: true},
+		hustle.StageFinalization:    {hustle.ReasonTimeout: true, hustle.ReasonFinalization: true, hustle.ReasonInternal: true},
+	}
+	tests := make([]struct {
+		name   string
+		stage  hustle.Stage
+		reason hustle.ReasonCode
+		want   bool
+	}, 0, int(hustle.StageFinalization)*int(hustle.ReasonInternal))
+	for stage := hustle.StageQueue; stage <= hustle.StageFinalization; stage++ {
+		for reason := hustle.ReasonRejected; reason <= hustle.ReasonInternal; reason++ {
+			tests = append(tests, struct {
+				name   string
+				stage  hustle.Stage
+				reason hustle.ReasonCode
+				want   bool
+			}{name: "pair", stage: stage, reason: reason, want: allowed[stage][reason]})
+		}
+	}
+	for _, tt := range tests {
+		testCase := tt
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+			runtime := validHustleRuntime()
+			if testCase.stage == hustle.StageQueue || testCase.stage == hustle.StageModelResolution {
+				runtime = ModelRuntime{}
+			}
+			ev := HustleFailed{
+				Header: validHustleHeader(Internal), Run: validHustleRun(t, runtime),
+				Stage: testCase.stage, ReasonCode: testCase.reason,
+			}
+			err := ValidateEvent(ev)
+			if (err == nil) != testCase.want {
+				t.Fatalf("ValidateEvent(stage=%d reason=%d) error = %v, wantAllowed %v", testCase.stage, testCase.reason, err, testCase.want)
+			}
+			if !testCase.want {
+				var invalid *InvalidEventError
+				if !errors.As(err, &invalid) || invalid.Field != FieldReasonCode || invalid.Rule != RuleInvalid {
+					t.Fatalf("error = %T %v, want reason-code InvalidEventError", err, err)
+				}
 			}
 		})
 	}

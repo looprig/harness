@@ -112,6 +112,9 @@ func MarshalEvent(ev Event) ([]byte, error) {
 	if !ok {
 		return nil, &UnknownEventTypeError{Type: name}
 	}
+	if !ev.Visibility().Valid() {
+		return nil, &InvalidEventError{Event: EventName(name), Field: FieldVisibility, Rule: RuleInvalid}
+	}
 	if ev.Class() == Ephemeral {
 		return nil, &EphemeralNotPersistableError{Type: name}
 	}

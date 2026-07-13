@@ -241,3 +241,53 @@ func TestEventReplayRejectsUnknownVisibility(t *testing.T) {
 		})
 	}
 }
+
+func TestJournalRejectsInvalidEventVisibility(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name       string
+		visibility event.EventVisibility
+		wantErr    bool
+		wantTip    uint64
+	}{
+		{name: "public appends", visibility: event.Public, wantTip: 2},
+		{name: "internal appends", visibility: event.Internal, wantTip: 2},
+		{name: "unknown cannot poison journal", visibility: event.EventVisibility(99), wantErr: true, wantTip: 1},
+	}
+	for _, tt := range tests {
+		testCase := tt
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+			store, err := Open(memstore.New())
+			if err != nil {
+				t.Fatalf("Open() error = %v", err)
+			}
+			sid := newTestUUID(t)
+			lease, err := store.AcquireLease(context.Background(), sid)
+			if err != nil {
+				t.Fatalf("AcquireLease() error = %v", err)
+			}
+			journalStore, err := store.OpenJournal(context.Background(), sid, lease)
+			if err != nil {
+				t.Fatalf("OpenJournal() error = %v", err)
+			}
+			ev := event.SessionStarted{Header: event.Header{
+				Coordinates: identity.Coordinates{SessionID: sid}, EventID: newTestUUID(t), EventVisibility: testCase.visibility,
+			}}
+			_, appendErr := journalStore.Append(context.Background(), journal.NewEventRecord(ev))
+			if (appendErr != nil) != testCase.wantErr {
+				t.Fatalf("Append() error = %v, wantErr %v", appendErr, testCase.wantErr)
+			}
+			if testCase.wantErr {
+				var invalid *event.InvalidEventError
+				if !errors.As(appendErr, &invalid) || invalid.Field != event.FieldVisibility {
+					t.Fatalf("Append() error = %T %v, want visibility InvalidEventError", appendErr, appendErr)
+				}
+			}
+			tip, err := store.backend.Ledger.Tip(context.Background(), ledgerName(sid))
+			if err != nil || tip != testCase.wantTip {
+				t.Fatalf("Tip() = (%d,%v), want (%d,nil)", tip, err, testCase.wantTip)
+			}
+		})
+	}
+}

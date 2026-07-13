@@ -1,9 +1,6 @@
 package event
 
 import (
-	"crypto/sha256"
-	"strings"
-
 	"github.com/looprig/core/content"
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/hustle"
@@ -199,19 +196,7 @@ func invalidHustle(name EventName, field FieldName) *InvalidEventError {
 }
 
 func validateHustleRun(name EventName, run HustleRunDescriptor) error {
-	descriptor := run.Definition
-	if strings.TrimSpace(string(descriptor.Name)) == "" || strings.TrimSpace(descriptor.PolicyRevision) == "" ||
-		descriptor.PromptSHA256 == ([sha256.Size]byte{}) || strings.TrimSpace(descriptor.PromptRevision) == "" ||
-		descriptor.TimeoutNanos <= 0 || descriptor.Limits.InputBytes <= 0 || descriptor.Limits.OutputBytes <= 0 ||
-		(descriptor.Participation != hustle.ParticipationBlocking && descriptor.Participation != hustle.ParticipationBackground) ||
-		(descriptor.ModelSource != hustle.ModelSourceCurrentLoop && descriptor.ModelSource != hustle.ModelSourceNamed) {
-		return invalidHustle(name, FieldDefinition)
-	}
-	if descriptor.ModelSource == hustle.ModelSourceNamed {
-		if err := descriptor.NamedModelKey.Validate(); err != nil || strings.TrimSpace(descriptor.NamedModelPolicyRevision) == "" {
-			return invalidHustle(name, FieldDefinition)
-		}
-	} else if descriptor.NamedModelKey != (inference.ModelKey{}) || descriptor.NamedModelPolicyRevision != "" {
+	if err := run.Definition.Validate(); err != nil {
 		return invalidHustle(name, FieldDefinition)
 	}
 	if uuid.UUID(run.RunID).IsZero() {
@@ -235,6 +220,9 @@ func validateHustleFailed(e HustleFailed) error {
 		return invalidHustle(name, FieldStage)
 	}
 	if !e.ReasonCode.Valid() {
+		return invalidHustle(name, FieldReasonCode)
+	}
+	if !hustle.ReasonAllowed(e.Stage, e.ReasonCode) {
 		return invalidHustle(name, FieldReasonCode)
 	}
 	preResolution := e.Stage == hustle.StageQueue || e.Stage == hustle.StageModelResolution

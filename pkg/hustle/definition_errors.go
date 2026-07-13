@@ -9,6 +9,7 @@ const (
 	DefinitionNilOption             DefinitionErrorKind = "nil_option"
 	DefinitionDuplicateOption       DefinitionErrorKind = "duplicate_option"
 	DefinitionInvalidParticipation  DefinitionErrorKind = "invalid_participation"
+	DefinitionInvalidModelSource    DefinitionErrorKind = "invalid_model_source"
 	DefinitionMissingModelSource    DefinitionErrorKind = "missing_model_source"
 	DefinitionInvalidClient         DefinitionErrorKind = "invalid_client"
 	DefinitionInvalidModel          DefinitionErrorKind = "invalid_model"

@@ -46,6 +46,27 @@ const (
 // Valid reports whether the reason is recognized for durable audit.
 func (r ReasonCode) Valid() bool { return r >= ReasonRejected && r <= ReasonInternal }
 
+// ReasonAllowed reports whether reason is a valid durable classification for
+// stage. The closed matrix prevents impossible stage/reason audit records.
+func ReasonAllowed(stage Stage, reason ReasonCode) bool {
+	switch stage {
+	case StageQueue:
+		return reason == ReasonRejected || reason == ReasonCanceled || reason == ReasonTimeout || reason == ReasonInternal
+	case StageModelResolution:
+		return reason == ReasonCanceled || reason == ReasonTimeout || reason == ReasonModelResolution || reason == ReasonInternal
+	case StageInference:
+		return reason == ReasonCanceled || reason == ReasonTimeout || reason == ReasonInference || reason == ReasonInternal
+	case StageOutput:
+		return reason == ReasonCanceled || reason == ReasonTimeout || reason == ReasonInvalidOutput || reason == ReasonInternal
+	case StageTerminal:
+		return reason == ReasonTimeout || reason == ReasonTerminal || reason == ReasonInternal
+	case StageFinalization:
+		return reason == ReasonTimeout || reason == ReasonFinalization || reason == ReasonInternal
+	default:
+		return false
+	}
+}
+
 // Request is the shared runtime's data-only serialization envelope.
 type Request struct {
 	Name  Name

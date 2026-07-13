@@ -78,6 +78,52 @@ type DefinitionDescriptor struct {
 	Limits                   Limits
 }
 
+// Validate checks the complete descriptor-only constructor domain without
+// requiring the raw system prompt or an inference client.
+func (d DefinitionDescriptor) Validate() error {
+	trimmedName := strings.TrimSpace(string(d.Name))
+	if trimmedName == "" {
+		return &DefinitionError{Kind: DefinitionMissingName, Field: "name"}
+	}
+	if strings.HasPrefix(trimmedName, reservedNamePrefix) {
+		return &DefinitionError{Kind: DefinitionReservedName, Field: "name"}
+	}
+	if d.Participation != ParticipationBlocking && d.Participation != ParticipationBackground {
+		return &DefinitionError{Kind: DefinitionInvalidParticipation, Field: "participation"}
+	}
+	if d.ModelSource != ModelSourceCurrentLoop && d.ModelSource != ModelSourceNamed {
+		return &DefinitionError{Kind: DefinitionInvalidModelSource, Field: "model_source"}
+	}
+	if d.TimeoutNanos <= 0 {
+		return &DefinitionError{Kind: DefinitionInvalidTimeout, Field: "timeout"}
+	}
+	if invalidLimits(d.Limits) {
+		return &DefinitionError{Kind: DefinitionInvalidLimits, Field: "limits"}
+	}
+	if strings.TrimSpace(d.PromptRevision) == "" {
+		return &DefinitionError{Kind: DefinitionInvalidPromptRevision, Field: "prompt_revision"}
+	}
+	if d.PromptSHA256 == ([sha256.Size]byte{}) {
+		return &DefinitionError{Kind: DefinitionInvalidSystemPrompt, Field: "prompt_sha256"}
+	}
+	if strings.TrimSpace(d.PolicyRevision) == "" {
+		return &DefinitionError{Kind: DefinitionInvalidPolicyRevision, Field: "policy_revision"}
+	}
+	if d.ModelSource == ModelSourceNamed {
+		if err := d.NamedModelKey.Validate(); err != nil {
+			return &DefinitionError{Kind: DefinitionInvalidModel, Field: "named_model_key", Cause: err}
+		}
+		if strings.TrimSpace(d.NamedModelPolicyRevision) == "" {
+			return &DefinitionError{Kind: DefinitionInvalidModel, Field: "named_model_policy_revision"}
+		}
+		return nil
+	}
+	if d.NamedModelKey != (inference.ModelKey{}) || d.NamedModelPolicyRevision != "" {
+		return &DefinitionError{Kind: DefinitionInvalidModel, Field: "current_loop_model"}
+	}
+	return nil
+}
+
 // Option contributes one immutable definition property.
 type Option func(*definitionOptions) error
 
@@ -324,6 +370,9 @@ func freezeDefinition(options *definitionOptions) (Definition, error) {
 	if options.modelSource == ModelSourceNamed {
 		descriptor.NamedModelKey = named.Model.Key()
 		descriptor.NamedModelPolicyRevision = namedRevision
+	}
+	if err := descriptor.Validate(); err != nil {
+		return Definition{}, err
 	}
 	policyDigest, err := digestDescriptorPolicy(descriptor)
 	if err != nil {
