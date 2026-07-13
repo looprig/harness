@@ -134,9 +134,14 @@ type SessionMeta struct {
 // CumulativeUsage folds authoritative StepDone request usage only; TurnDone's
 // convenience projection is deliberately excluded.
 type LoopUsageMeta struct {
-	LoopID          uuid.UUID          `json:"loop_id"`
-	Runtime         event.ModelRuntime `json:"runtime,omitzero"`
-	CumulativeUsage content.Usage      `json:"cumulative_usage,omitzero"`
+	LoopID  uuid.UUID          `json:"loop_id"`
+	Runtime event.ModelRuntime `json:"runtime,omitzero"`
+	// RuntimeSeq is the latest lifecycle sequence observed for runtime selection.
+	// A legacy event without Runtime advances this watermark while preserving the
+	// last known value. One bounded scalar per loop prevents delayed lifecycle
+	// notifications from regressing selection without an unbounded event set.
+	RuntimeSeq      uint64        `json:"runtime_seq,omitempty"`
+	CumulativeUsage content.Usage `json:"cumulative_usage,omitzero"`
 }
 
 // WorkspacePointerSource identifies the transition that selected CurrentWorkspace.
@@ -260,6 +265,21 @@ func (e *CatalogUsageError) Error() string {
 
 func (e *CatalogUsageError) Unwrap() error { return e.Cause }
 
+// CatalogOrderingError marks an online delivery whose sequence is behind the
+// catalog cursor and whose additive effect therefore cannot be classified as a
+// duplicate or a delayed unique record from bounded metadata alone. The online
+// updater repairs from the authoritative journal instead of guessing.
+type CatalogOrderingError struct {
+	EventType string
+	Sequence  uint64
+	Last      uint64
+}
+
+func (e *CatalogOrderingError) Error() string {
+	return "sessionstore: ambiguous " + e.EventType + " sequence " + strconv.FormatUint(e.Sequence, 10) +
+		" behind catalog sequence " + strconv.FormatUint(e.Last, 10)
+}
+
 func (e *CatalogConflictError) Error() string {
 	return "sessionstore: catalog entry for session " + e.SessionID.String() +
 		" lost the revision-CAS after " + strconv.Itoa(e.Attempts) + " attempts"
@@ -346,7 +366,6 @@ type EventReplayerOpener interface {
 // the fold never sees it.
 func applyEvent(meta SessionMeta, ev event.Event, seq uint64, now CatalogClock) (SessionMeta, bool, error) {
 	changed := true
-	newSequence := seq == 0 || seq > meta.LastJournalSeq
 	switch e := ev.(type) {
 	case event.SessionStarted:
 		meta.SessionID = e.SessionID
@@ -393,27 +412,36 @@ func applyEvent(meta SessionMeta, ev event.Event, seq uint64, now CatalogClock) 
 	case event.StepDone:
 		meta.SessionID = e.SessionID
 		meta.LastActiveAt = now()
+		priorStep := meta.LastStep
 		meta.LastStep = summarize(ev, seq, meta.LastStep)
-		if newSequence {
-			updated, err := accumulateStepUsage(meta.Loops, e.LoopID, e.Messages)
-			if err != nil {
-				return meta, false, err
+		if seq != 0 && seq <= meta.LastJournalSeq {
+			// The immediately summarized StepDone is an exact repeat when its
+			// sequence matches the prior step summary. Any other older additive
+			// delivery is ambiguous and must be rebuilt from the journal.
+			if priorStep == nil || priorStep.JournalSeq != seq {
+				meta.LastStep = priorStep
+				return meta, false, &CatalogOrderingError{EventType: "StepDone", Sequence: seq, Last: meta.LastJournalSeq}
 			}
-			meta.Loops = updated
+			break
 		}
+		updated, err := accumulateStepUsage(meta.Loops, e.LoopID, e.Messages)
+		if err != nil {
+			return meta, false, err
+		}
+		meta.Loops = updated
 	case event.RestoreDone:
 		meta.SessionID = e.SessionID
 		meta.LastActiveAt = now()
 	case event.LoopStarted:
 		meta.SessionID = e.SessionID
 		meta.LoopCount++
-		meta.Loops = putLoopRuntime(meta.Loops, e.LoopID, e.Runtime)
+		meta.Loops = putLoopRuntime(meta.Loops, e.LoopID, e.Runtime, seq)
 	case event.LoopInferenceChanged:
 		meta.SessionID = e.SessionID
-		meta.Loops = putLoopRuntime(meta.Loops, e.LoopID, e.Runtime)
+		meta.Loops = putLoopRuntime(meta.Loops, e.LoopID, e.Runtime, seq)
 	case event.LoopModeChanged:
 		meta.SessionID = e.SessionID
-		meta.Loops = putLoopRuntime(meta.Loops, e.LoopID, e.Runtime)
+		meta.Loops = putLoopRuntime(meta.Loops, e.LoopID, e.Runtime, seq)
 	case event.SessionStopped:
 		meta.SessionID = e.SessionID
 		meta.Status = StatusStopped
@@ -474,13 +502,23 @@ func usageFromStep(messages content.AgenticMessages) (content.Usage, error) {
 	return total, nil
 }
 
-func putLoopRuntime(loops []LoopUsageMeta, loopID uuid.UUID, runtime event.ModelRuntime) []LoopUsageMeta {
+func putLoopRuntime(loops []LoopUsageMeta, loopID uuid.UUID, runtime event.ModelRuntime, seq uint64) []LoopUsageMeta {
 	updated := cloneLoopUsage(loops)
 	index, found := loopUsageIndex(updated, loopID)
 	if !found {
-		return insertLoopUsage(updated, index, LoopUsageMeta{LoopID: loopID, Runtime: runtime})
+		updated = insertLoopUsage(updated, index, LoopUsageMeta{LoopID: loopID})
 	}
-	updated[index].Runtime = runtime
+	if seq == 0 {
+		if updated[index].RuntimeSeq != 0 {
+			return updated
+		}
+	} else if updated[index].RuntimeSeq != 0 && seq <= updated[index].RuntimeSeq {
+		return updated
+	}
+	updated[index].RuntimeSeq = seq
+	if runtime != (event.ModelRuntime{}) {
+		updated[index].Runtime = runtime
+	}
 	return updated
 }
 
@@ -674,6 +712,13 @@ func (c *Catalog) UpdateOnEvent(ctx context.Context, ev event.Event, seq uint64)
 	}
 	sid := ev.EventHeader().SessionID
 	if err := c.upsert(ctx, sid, ev, seq); err != nil {
+		var ordering *CatalogOrderingError
+		if errors.As(err, &ordering) {
+			if _, repairErr := c.RepairCatalog(ctx, sid); repairErr != nil {
+				c.log.CatalogUpdateFailed(repairErr)
+			}
+			return nil
+		}
 		c.log.CatalogUpdateFailed(err)
 	}
 	return nil

@@ -431,6 +431,7 @@ func TestApplyEventStatusFold(t *testing.T) {
 		ev          event.Event
 		seq         uint64
 		wantChanged bool
+		wantOrder   bool
 		check       func(*testing.T, SessionMeta)
 	}{
 		{
@@ -604,11 +605,12 @@ func TestApplyEventStatusFold(t *testing.T) {
 			},
 		},
 		{
-			name:        "lower seq does not lower LastJournalSeq (monotonic max)",
+			name:        "lower additive seq requests authoritative repair",
 			start:       SessionMeta{SessionID: sid, State: StateIdle, LastJournalSeq: 100},
 			ev:          event.StepDone{Header: hdr(sid)},
 			seq:         5,
-			wantChanged: true,
+			wantChanged: false,
+			wantOrder:   true,
 			check: func(t *testing.T, m SessionMeta) {
 				if m.LastJournalSeq != 100 {
 					t.Errorf("LastJournalSeq = %d, want 100 (max wins)", m.LastJournalSeq)
@@ -620,7 +622,15 @@ func TestApplyEventStatusFold(t *testing.T) {
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			got, changed := mustApplyEvent(t, tt.start, tt.ev, tt.seq, fixedClock(clock))
+			got, changed, err := applyEvent(tt.start, tt.ev, tt.seq, fixedClock(clock))
+			var ordering *CatalogOrderingError
+			if tt.wantOrder {
+				if !errors.As(err, &ordering) {
+					t.Fatalf("applyEvent error = %T %v, want *CatalogOrderingError", err, err)
+				}
+			} else if err != nil {
+				t.Fatalf("applyEvent error = %v", err)
+			}
 			if changed != tt.wantChanged {
 				t.Fatalf("applyEvent changed = %v, want %v", changed, tt.wantChanged)
 			}

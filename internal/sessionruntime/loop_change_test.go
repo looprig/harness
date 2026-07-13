@@ -412,3 +412,62 @@ func TestFoldLoopInferenceSeedsInitialMode(t *testing.T) {
 		})
 	}
 }
+
+func TestFoldLoopInferenceUsesLegacyFallbacks(t *testing.T) {
+	t.Parallel()
+	sessionID := uuid.UUID{1}
+	loopID := uuid.UUID{2}
+	eventID := uuid.UUID{3}
+	prefix := `,"v":1,"session_id":"` + sessionID.String() + `","loop_id":"` + loopID.String() + `","event_id":"` + eventID.String() + `"`
+	currentRuntime := runtimeForModel(inferModelWithEffort("current", inference.EffortMedium))
+	tests := []struct {
+		name       string
+		wire       string
+		before     []event.Event
+		wantMode   loop.ModeName
+		hasMode    bool
+		wantModel  string
+		hasRuntime bool
+	}{
+		{
+			name:     "old loop start selects mode but falls back to its bound runtime",
+			wire:     `{"type":"LoopStarted"` + prefix + `,"initial_mode":"review"}`,
+			wantMode: "review",
+			hasMode:  true,
+		},
+		{
+			name:       "old mode change clears a prior override and falls back to selected mode",
+			wire:       `{"type":"LoopModeChanged"` + prefix + `,"previous_mode":"plan","mode":"build"}`,
+			before:     []event.Event{event.LoopInferenceChanged{Runtime: currentRuntime}},
+			wantMode:   "build",
+			hasMode:    true,
+			hasRuntime: false,
+		},
+		{
+			name:       "old inference change restores its migrated runtime",
+			wire:       `{"type":"LoopInferenceChanged"` + prefix + `,"model":{"Provider":"legacy","Name":"legacy-model","Caps":{"MaxContext":64000}},"effort":"low"}`,
+			wantModel:  "legacy-model",
+			hasRuntime: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			decoded, err := event.UnmarshalEvent([]byte(tt.wire))
+			if err != nil {
+				t.Fatalf("UnmarshalEvent() error = %v", err)
+			}
+			events := append(append([]event.Event(nil), tt.before...), decoded)
+			got := foldLoopInference(events)
+			if got.Mode != tt.wantMode || got.HasMode != tt.hasMode {
+				t.Errorf("mode = %q (has %v), want %q (has %v)", got.Mode, got.HasMode, tt.wantMode, tt.hasMode)
+			}
+			if got.HasRuntime != tt.hasRuntime {
+				t.Fatalf("hasRuntime = %v, want %v (runtime %+v)", got.HasRuntime, tt.hasRuntime, got.Runtime)
+			}
+			if tt.wantModel != "" && got.Runtime.Key.Model != tt.wantModel {
+				t.Errorf("runtime model = %q, want %q", got.Runtime.Key.Model, tt.wantModel)
+			}
+		})
+	}
+}

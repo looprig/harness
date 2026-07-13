@@ -145,28 +145,85 @@ func TestModelRuntimeValidation(t *testing.T) {
 	}
 }
 
-func TestLifecycleDecodeAcceptsLegacyMissingRuntime(t *testing.T) {
+func TestLifecycleDecodeMigratesLegacyRuntime(t *testing.T) {
 	t.Parallel()
 	sessionID, loopID, eventID := vID(t), vID(t), vID(t)
-	prefix := `,"v":1,"session_id":"` + sessionID.String() + `","loop_id":"` + loopID.String() + `","event_id":"` + eventID.String() + `"}`
+	prefix := `,"v":1,"session_id":"` + sessionID.String() + `","loop_id":"` + loopID.String() + `","event_id":"` + eventID.String() + `"`
+	legacyModel := `,"model":{"Provider":"openai","APIFormat":"responses","BaseURL":"https://api.openai.com","Name":"gpt-legacy","Origin":0,"Caps":{"AcceptsImages":false,"MaxContext":128000,"Tools":true,"Thinking":true},"Sampling":{}},"effort":"high"`
+	wantMigrated := event.ModelRuntime{
+		Key:    inference.ModelKey{Provider: "openai", Model: "gpt-legacy"},
+		Limits: inference.ContextLimits{WindowTokens: 128_000},
+		Effort: inference.EffortHigh,
+	}
 	tests := []struct {
-		name     string
-		typeName string
-		check    func(event.Event) event.ModelRuntime
+		name        string
+		wire        string
+		wantRuntime event.ModelRuntime
+		wantErr     bool
+		wantLegacy  bool
 	}{
-		{name: "loop started", typeName: "LoopStarted", check: func(ev event.Event) event.ModelRuntime { return ev.(event.LoopStarted).Runtime }},
-		{name: "inference changed", typeName: "LoopInferenceChanged", check: func(ev event.Event) event.ModelRuntime { return ev.(event.LoopInferenceChanged).Runtime }},
-		{name: "mode changed", typeName: "LoopModeChanged", check: func(ev event.Event) event.ModelRuntime { return ev.(event.LoopModeChanged).Runtime }},
+		{
+			name:        "old inference model and effort migrate to runtime",
+			wire:        `{"type":"LoopInferenceChanged"` + prefix + legacyModel + `}`,
+			wantRuntime: wantMigrated,
+		},
+		{
+			name: "old loop started remains an explicit definition fallback",
+			wire: `{"type":"LoopStarted"` + prefix + `}`,
+		},
+		{
+			name: "old mode change remains an explicit selected-mode fallback",
+			wire: `{"type":"LoopModeChanged"` + prefix + `,"previous_mode":"plan","mode":"build"}`,
+		},
+		{
+			name:       "inference change missing both old model and current runtime is rejected",
+			wire:       `{"type":"LoopInferenceChanged"` + prefix + `}`,
+			wantErr:    true,
+			wantLegacy: true,
+		},
+		{
+			name:       "negative legacy max context is rejected without unsigned wrap",
+			wire:       `{"type":"LoopInferenceChanged"` + prefix + `,"model":{"Provider":"legacy","Name":"model","Caps":{"MaxContext":-1}}}`,
+			wantErr:    true,
+			wantLegacy: true,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			got, err := event.UnmarshalEvent([]byte(`{"type":"` + tt.typeName + `"` + prefix))
-			if err != nil {
-				t.Fatalf("UnmarshalEvent() error = %v", err)
+			got, err := event.UnmarshalEvent([]byte(tt.wire))
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("UnmarshalEvent() error = %v, wantErr %v", err, tt.wantErr)
 			}
-			if runtime := tt.check(got); runtime != (event.ModelRuntime{}) {
-				t.Errorf("legacy runtime = %+v, want zero fallback", runtime)
+			if tt.wantErr {
+				var legacy *event.LegacyRuntimeMigrationError
+				if tt.wantLegacy && !errors.As(err, &legacy) {
+					t.Errorf("UnmarshalEvent() error = %T %v, want *LegacyRuntimeMigrationError", err, err)
+				}
+				return
+			}
+			var runtime event.ModelRuntime
+			switch e := got.(type) {
+			case event.LoopStarted:
+				runtime = e.Runtime
+			case event.LoopInferenceChanged:
+				runtime = e.Runtime
+			case event.LoopModeChanged:
+				runtime = e.Runtime
+			default:
+				t.Fatalf("UnmarshalEvent() = %T, want lifecycle event", got)
+			}
+			if runtime != tt.wantRuntime {
+				t.Errorf("legacy runtime = %+v, want %+v", runtime, tt.wantRuntime)
+			}
+			if _, ok := got.(event.LoopInferenceChanged); ok {
+				encoded, marshalErr := event.MarshalEvent(got)
+				if marshalErr != nil {
+					t.Fatalf("MarshalEvent(migrated) error = %v", marshalErr)
+				}
+				if bytes.Contains(encoded, []byte(`"model"`)) {
+					t.Errorf("MarshalEvent(migrated) retained legacy model field: %s", encoded)
+				}
 			}
 		})
 	}

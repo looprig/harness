@@ -180,11 +180,14 @@ func foldLoopInference(events []event.Event) restoredInference {
 		case event.LoopModeChanged:
 			ri.Mode = loop.ModeName(e.Mode)
 			ri.HasMode = true
+			// A pre-runtime mode change still authoritatively selects its named
+			// mode, but its model must be re-resolved from the bound definition.
+			// Clearing a prior direct inference override is therefore intentional.
 			ri.Runtime = e.Runtime
-			ri.HasRuntime = true
+			ri.HasRuntime = e.Runtime != (event.ModelRuntime{})
 		case event.LoopInferenceChanged:
 			ri.Runtime = e.Runtime
-			ri.HasRuntime = true
+			ri.HasRuntime = e.Runtime != (event.ModelRuntime{})
 		}
 	}
 	return ri

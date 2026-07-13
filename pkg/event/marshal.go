@@ -11,6 +11,7 @@ import (
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/gate"
 	"github.com/looprig/harness/pkg/tool"
+	"github.com/looprig/inference"
 )
 
 // schemaVersion is the current wire-envelope schema version stamped into every
@@ -73,6 +74,20 @@ func (e *EventDecodeError) Error() string {
 	return fmt.Sprintf("event: decode %s: %v", e.Type, e.Cause)
 }
 func (e *EventDecodeError) Unwrap() error { return e.Cause }
+
+// LegacyRuntimeMigrationError reports a v1 lifecycle payload that cannot be
+// migrated to the current ModelRuntime representation without guessing. Valid
+// pre-runtime LoopInferenceChanged records always carry model; accepting a
+// record with neither model nor runtime would silently erase the selected model.
+type LegacyRuntimeMigrationError struct {
+	Type   string
+	Field  string
+	Reason string
+}
+
+func (e *LegacyRuntimeMigrationError) Error() string {
+	return "event: cannot migrate legacy " + e.Type + " field " + e.Field + ": " + e.Reason
+}
 
 // EventLimitError is returned when serialized input exceeds the envelope byte cap.
 type EventLimitError struct {
@@ -357,15 +372,15 @@ func validateDecodedEvent(ev Event, data []byte) error {
 }
 
 // missingLegacyRuntime preserves replay compatibility for lifecycle records
-// written before ModelRuntime was added. An explicitly present zero/invalid
-// runtime is current malformed input and continues through strict validation.
+// that never carried a resolved runtime. Legacy LoopInferenceChanged is not an
+// absence-only case: decodeLoopInferenceChanged migrates its model+effort payload
+// before validation. An explicitly present zero/invalid runtime continues
+// through strict validation.
 func missingLegacyRuntime(ev Event, data []byte) (bool, error) {
 	name := ""
 	switch ev.(type) {
 	case LoopStarted:
 		name = "LoopStarted"
-	case LoopInferenceChanged:
-		name = "LoopInferenceChanged"
 	case LoopModeChanged:
 		name = "LoopModeChanged"
 	default:
@@ -489,7 +504,7 @@ func decodePayload(tag string, data []byte) (Event, error) {
 	case "DelegateRequestAccepted":
 		return decodePlain[DelegateRequestAccepted](tag, data)
 	case "LoopInferenceChanged":
-		return decodePlain[LoopInferenceChanged](tag, data)
+		return decodeLoopInferenceChanged(data)
 	case "LoopModeChanged":
 		return decodePlain[LoopModeChanged](tag, data)
 	case "ForeignSessionBound":
@@ -525,6 +540,72 @@ func decodePayload(tag string, data []byte) (Event, error) {
 	default:
 		return nil, &UnknownEventTypeError{Type: tag}
 	}
+}
+
+type legacyModelCapsWire struct {
+	MaxContext int64
+}
+
+type legacyModelWire struct {
+	Provider inference.ProviderName
+	Name     string
+	Caps     legacyModelCapsWire
+}
+
+type legacyLoopInferenceChangedWire struct {
+	Header
+	Model  legacyModelWire  `json:"model"`
+	Effort inference.Effort `json:"effort,omitzero"`
+}
+
+// decodeLoopInferenceChanged accepts both v1 shapes. Current records carry the
+// resolved runtime directly. Pre-runtime v1 records carry a secret-free Model
+// plus effort; only the stable provider/name identity and MaxContext are durable
+// in the replacement shape, so endpoint, API dialect, capabilities, sampling,
+// and provenance are intentionally discarded.
+func decodeLoopInferenceChanged(data []byte) (Event, error) {
+	runtimePresent, err := inspectTopLevelField(data, "LoopInferenceChanged", "runtime")
+	if err != nil {
+		return nil, err
+	}
+	modelPresent, err := inspectTopLevelField(data, "LoopInferenceChanged", "model")
+	if err != nil {
+		return nil, err
+	}
+	if runtimePresent && modelPresent {
+		return nil, &EventDecodeError{Type: "LoopInferenceChanged", Cause: &LegacyRuntimeMigrationError{
+			Type: "LoopInferenceChanged", Field: "model/runtime", Reason: "both legacy and current payloads are present",
+		}}
+	}
+	if runtimePresent {
+		return decodePlain[LoopInferenceChanged]("LoopInferenceChanged", data)
+	}
+	if !modelPresent {
+		return nil, &EventDecodeError{Type: "LoopInferenceChanged", Cause: &LegacyRuntimeMigrationError{
+			Type: "LoopInferenceChanged", Field: "model", Reason: "missing model and runtime",
+		}}
+	}
+
+	var wire legacyLoopInferenceChangedWire
+	if err := json.Unmarshal(data, &wire); err != nil {
+		return nil, &EventDecodeError{Type: "LoopInferenceChanged", Cause: err}
+	}
+	if wire.Model.Caps.MaxContext < 0 {
+		return nil, &EventDecodeError{Type: "LoopInferenceChanged", Cause: &LegacyRuntimeMigrationError{
+			Type: "LoopInferenceChanged", Field: "model.Caps.MaxContext", Reason: "must not be negative",
+		}}
+	}
+	return LoopInferenceChanged{
+		Header: wire.Header,
+		Runtime: ModelRuntime{
+			Key: inference.ModelKey{
+				Provider: wire.Model.Provider,
+				Model:    wire.Model.Name,
+			},
+			Limits: inference.ContextLimits{WindowTokens: content.TokenCount(wire.Model.Caps.MaxContext)},
+			Effort: wire.Effort,
+		},
+	}, nil
 }
 
 // decodePlain decodes an event whose fields all round-trip through encoding/json
