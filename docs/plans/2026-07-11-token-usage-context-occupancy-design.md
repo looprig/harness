@@ -186,6 +186,23 @@ ContextTokens == provider's effective total prompt size
 ReasoningTokens <= OutputTokens
 ```
 
+Provider count scalars are presence-aware at the JSON boundary. An absent field
+uses that provider field's documented zero/default semantics, while an explicit
+JSON `null`, fractional value, negative value, or out-of-range integer is
+malformed and fails with a typed normalization error. This keeps a present empty
+usage object distinct from invalid scalar data.
+
+When Gemini reports `totalTokenCount`, the decoder validates it against
+`promptTokenCount + candidatesTokenCount + thoughtsTokenCount` with checked
+arithmetic. An absent total remains compatible with partial/gateway responses;
+an explicit zero is authoritative and must match the components. Provider totals
+are consistency checks only and are not stored as a sixth cumulative category.
+
+Normalization wraps the exact typed `content.UsageValidationError`. Known core
+field/reason pairs may receive a more specific normalization reason; an unknown
+future core invariant uses a non-lying generic validation reason and preserves
+the original field/reason through the cause chain.
+
 `inference.Usage` becomes an alias of `content.Usage`.
 
 ## §2 · Streaming result trailer (`inference`)

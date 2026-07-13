@@ -209,7 +209,9 @@ Commit: `feat(inference): add deterministic request estimator`.
 
 **RED:** Test negative wire values, impossible cached totals, cache reads/writes,
 reasoning subsets, present-zero usage, response/message defensive copies, and
-request encoders excluding historical usage.
+request encoders excluding historical usage. Explicit JSON `null`, fractional,
+and out-of-range count scalars fail typed; an optional Gemini total is
+presence-aware and must equal the checked component sum when reported.
 
 Run:
 
@@ -219,8 +221,9 @@ GOWORK=off go test -race ./codec/openaiapi ./codec/anthropicapi ./codec/geminiap
 ```
 
 **GREEN:** Alias `inference.Usage` to `content.Usage`; normalize disjoint provider
-fields with checked conversions; attach cloned usage to both `Response.Usage`
-and `Response.Message.Usage`.
+fields with checked conversions in an internal helper; preserve exact typed core
+validation causes without mislabeling future invariants; attach cloned usage to
+both `Response.Usage` and `Response.Message.Usage`.
 
 Commit: `feat(inference): normalize provider token usage`.
 
