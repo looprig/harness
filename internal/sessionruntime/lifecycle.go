@@ -2,11 +2,13 @@ package sessionruntime
 
 import (
 	"context"
+	"time"
 
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/ceiling"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/foreignloop"
+	"github.com/looprig/harness/pkg/hustle"
 	"github.com/looprig/harness/pkg/journal"
 	"github.com/looprig/harness/pkg/sessionstore"
 	"github.com/looprig/harness/pkg/workspacestore"
@@ -140,6 +142,34 @@ type Lifecycle struct {
 	// When configured, NewSession and RestoreSession install a journal-admission gate + GC
 	// runner that reaps orphaned offload blobs while the session lease is held.
 	offloadGC OffloadGCPolicy
+
+	// hustles and hustleLimits are immutable design-time inputs captured for the
+	// hustle controller added later. This task deliberately stores them without
+	// binding, executing, or changing session behavior.
+	hustles      []hustle.Definition
+	hustleLimits HustleLimits
+}
+
+// HustleLimits is sessionruntime's narrow, rig-independent copy of the hustle
+// lane and cleanup bounds.
+type HustleLimits struct {
+	BlockingConcurrent   int
+	BlockingQueued       int
+	BackgroundConcurrent int
+	BackgroundQueued     int
+	AuditTimeout         time.Duration
+	FinalizationTimeout  time.Duration
+	WorkerDrainTimeout   time.Duration
+}
+
+// WithLifecycleHustles captures immutable hustle registrations for both future
+// NewSession and RestoreSession composition. It has no runtime effect yet.
+func WithLifecycleHustles(definitions []hustle.Definition, limits HustleLimits) LifecycleOption {
+	captured := append([]hustle.Definition(nil), definitions...)
+	return func(r *Lifecycle) {
+		r.hustles = append([]hustle.Definition(nil), captured...)
+		r.hustleLimits = limits
+	}
 }
 
 // WithLifecycleOffloadGC captures the session offload-blob GC cadence. An unconfigured

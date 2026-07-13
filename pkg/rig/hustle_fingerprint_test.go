@@ -1,0 +1,158 @@
+package rig
+
+import (
+	"context"
+	"testing"
+	"time"
+
+	"github.com/looprig/core/content"
+	"github.com/looprig/harness/pkg/hustle"
+	"github.com/looprig/harness/pkg/loop"
+	"github.com/looprig/inference"
+)
+
+type credentialedHustleClient struct{ credential string }
+
+func (*credentialedHustleClient) Invoke(context.Context, inference.Request) (*inference.Response, error) {
+	return nil, nil
+}
+
+func (*credentialedHustleClient) Stream(context.Context, inference.Request) (*inference.StreamReader[content.Chunk], error) {
+	return nil, nil
+}
+
+type rigHustleSpec struct {
+	name          hustle.Name
+	participation hustle.Participation
+	modelSource   hustle.ModelSource
+	client        inference.Client
+	model         inference.Model
+	prompt        string
+	promptRev     string
+	policyRev     string
+	timeout       time.Duration
+	limits        hustle.Limits
+}
+
+func defaultRigHustleSpec() rigHustleSpec {
+	return rigHustleSpec{
+		name: "compact", participation: hustle.ParticipationBlocking,
+		modelSource: hustle.ModelSourceCurrentLoop,
+		client:      &credentialedHustleClient{credential: "credential-a"}, model: validModel("named-model"),
+		prompt: "raw prompt alpha", promptRev: "prompt-v1", policyRev: "policy-v1",
+		timeout: time.Second, limits: hustle.Limits{InputBytes: 1024, OutputBytes: 512},
+	}
+}
+
+func defineRigHustle(t *testing.T, spec rigHustleSpec) hustle.Definition {
+	t.Helper()
+	options := []hustle.Option{
+		hustle.WithName(spec.name), hustle.WithParticipation(spec.participation),
+		hustle.WithTimeout(spec.timeout), hustle.WithLimits(spec.limits),
+		hustle.WithSystemPrompt(spec.prompt, spec.promptRev), hustle.WithPolicyRevision(spec.policyRev),
+	}
+	if spec.modelSource == hustle.ModelSourceNamed {
+		options = append(options, hustle.WithNamedInference(spec.client, spec.model))
+	} else {
+		options = append(options, hustle.WithCurrentLoopModel())
+	}
+	definition, err := hustle.Define(options...)
+	if err != nil {
+		t.Fatalf("hustle.Define: %v", err)
+	}
+	return definition
+}
+
+func TestHustleTopologyFingerprintDeterministic(t *testing.T) {
+	t.Parallel()
+	loopDefinition := mustDefine(loop.WithName("agent"), loop.WithInference(&stubLLM{}, validModel("loop-model")))
+	firstSpec := defaultRigHustleSpec()
+	firstSpec.name = "alpha"
+	secondSpec := defaultRigHustleSpec()
+	secondSpec.name = "zulu"
+	first, second := defineRigHustle(t, firstSpec), defineRigHustle(t, secondSpec)
+	limits := validHustleLimits()
+	tests := []struct {
+		name  string
+		left  []hustle.Definition
+		right []hustle.Definition
+	}{
+		{name: "same order", left: []hustle.Definition{first, second}, right: []hustle.Definition{first, second}},
+		{name: "registration order independent", left: []hustle.Definition{first, second}, right: []hustle.Definition{second, first}},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			left := topologyRevisionWithHustles([]loop.Definition{loopDefinition}, []string{"agent"}, "agent", tt.left, limits)
+			right := topologyRevisionWithHustles([]loop.Definition{loopDefinition}, []string{"agent"}, "agent", tt.right, limits)
+			if left != right {
+				t.Fatalf("topology revisions differ: %q != %q", left, right)
+			}
+		})
+	}
+}
+
+func TestHustleTopologyFingerprintSensitivityAndExclusions(t *testing.T) {
+	t.Parallel()
+	loopDefinition := mustDefine(loop.WithName("agent"), loop.WithInference(&stubLLM{}, validModel("loop-model")))
+	baseSpec := defaultRigHustleSpec()
+	baseDefinition := defineRigHustle(t, baseSpec)
+	baseLimits := validHustleLimits()
+	revision := func(definition hustle.Definition, limits HustleLimits) string {
+		return topologyRevisionWithHustles([]loop.Definition{loopDefinition}, []string{"agent"}, "agent", []hustle.Definition{definition}, limits)
+	}
+	base := revision(baseDefinition, baseLimits)
+
+	namedSource := baseSpec
+	namedSource.modelSource = hustle.ModelSourceNamed
+	namedSourceDefinition := defineRigHustle(t, namedSource)
+	tests := []struct {
+		name       string
+		definition hustle.Definition
+		limits     HustleLimits
+		wantEqual  bool
+	}{
+		{name: "name", definition: defineRigHustle(t, func() rigHustleSpec { value := baseSpec; value.name = "other"; return value }()), limits: baseLimits},
+		{name: "participation", definition: defineRigHustle(t, func() rigHustleSpec {
+			value := baseSpec
+			value.participation = hustle.ParticipationBackground
+			return value
+		}()), limits: baseLimits},
+		{name: "model source", definition: namedSourceDefinition, limits: baseLimits},
+		{name: "named model policy", definition: defineRigHustle(t, func() rigHustleSpec { value := namedSource; value.model = validModel("other-model"); return value }()), limits: baseLimits},
+		{name: "prompt revision", definition: defineRigHustle(t, func() rigHustleSpec { value := baseSpec; value.promptRev = "prompt-v2"; return value }()), limits: baseLimits},
+		{name: "raw prompt behavior digest", definition: defineRigHustle(t, func() rigHustleSpec { value := baseSpec; value.prompt = "raw prompt beta"; return value }()), limits: baseLimits},
+		{name: "policy revision", definition: defineRigHustle(t, func() rigHustleSpec { value := baseSpec; value.policyRev = "policy-v2"; return value }()), limits: baseLimits},
+		{name: "timeout", definition: defineRigHustle(t, func() rigHustleSpec { value := baseSpec; value.timeout++; return value }()), limits: baseLimits},
+		{name: "input bytes", definition: defineRigHustle(t, func() rigHustleSpec { value := baseSpec; value.limits.InputBytes++; return value }()), limits: baseLimits},
+		{name: "output bytes", definition: defineRigHustle(t, func() rigHustleSpec { value := baseSpec; value.limits.OutputBytes++; return value }()), limits: baseLimits},
+		{name: "blocking concurrent", definition: baseDefinition, limits: func() HustleLimits { value := baseLimits; value.BlockingConcurrent++; return value }()},
+		{name: "blocking queued", definition: baseDefinition, limits: func() HustleLimits { value := baseLimits; value.BlockingQueued++; return value }()},
+		{name: "background concurrent", definition: baseDefinition, limits: func() HustleLimits { value := baseLimits; value.BackgroundConcurrent++; return value }()},
+		{name: "background queued", definition: baseDefinition, limits: func() HustleLimits { value := baseLimits; value.BackgroundQueued++; return value }()},
+		{name: "audit timeout", definition: baseDefinition, limits: func() HustleLimits { value := baseLimits; value.AuditTimeout++; return value }()},
+		{name: "finalization timeout", definition: baseDefinition, limits: func() HustleLimits { value := baseLimits; value.FinalizationTimeout++; return value }()},
+		{name: "worker drain timeout", definition: baseDefinition, limits: func() HustleLimits { value := baseLimits; value.WorkerDrainTimeout++; return value }()},
+		{name: "named client identity and credentials excluded", definition: defineRigHustle(t, func() rigHustleSpec {
+			value := namedSource
+			value.client = &credentialedHustleClient{credential: "different-secret"}
+			return value
+		}()), limits: baseLimits, wantEqual: true},
+		{name: "current-loop resolved live model excluded", definition: defineRigHustle(t, func() rigHustleSpec { value := baseSpec; value.model = validModel("changed-live-model"); return value }()), limits: baseLimits, wantEqual: true},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			gotBase := base
+			if tt.name == "named client identity and credentials excluded" {
+				gotBase = revision(namedSourceDefinition, baseLimits)
+			}
+			got := revision(tt.definition, tt.limits)
+			if (got == gotBase) != tt.wantEqual {
+				t.Fatalf("revision equality = %v, want %v", got == gotBase, tt.wantEqual)
+			}
+		})
+	}
+}

@@ -5,9 +5,11 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/looprig/harness/pkg/event"
+	"github.com/looprig/harness/pkg/hustle"
 	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/harness/pkg/tool"
 )
@@ -86,6 +88,46 @@ func frozenFingerprint(fields ConfigFingerprintFields, definitions []loop.Defini
 		PermissionPosture:         fields.Posture,
 		NativePermissionPolicyRev: fields.NativePermissionPolicyRev,
 	}
+}
+
+func frozenFingerprintWithHustles(fields ConfigFingerprintFields, definitions []loop.Definition, primers []string, active string, hustles []hustle.Definition, limits HustleLimits) event.ConfigFingerprint {
+	fingerprint := frozenFingerprint(fields, definitions, primers, active)
+	if len(hustles) > 0 {
+		fingerprint.TopologyRev = topologyRevisionWithHustles(definitions, primers, active, hustles, limits)
+	}
+	return fingerprint
+}
+
+func topologyRevisionWithHustles(definitions []loop.Definition, primers []string, active string, hustles []hustle.Definition, limits HustleLimits) string {
+	var material strings.Builder
+	material.WriteString("topology:")
+	material.WriteString(topologyRevision(definitions, primers, active))
+	material.WriteByte('\n')
+	ordered := append([]hustle.Definition(nil), hustles...)
+	sort.Slice(ordered, func(i, j int) bool { return ordered[i].Name() < ordered[j].Name() })
+	for _, definition := range ordered {
+		material.WriteString("hustle:")
+		material.WriteString(string(definition.Name()))
+		material.WriteByte('\n')
+		material.WriteString("policy:")
+		material.WriteString(definition.PolicyRevision())
+		material.WriteByte('\n')
+	}
+	writeHustleLimit(&material, "blocking_concurrent", int64(limits.BlockingConcurrent))
+	writeHustleLimit(&material, "blocking_queued", int64(limits.BlockingQueued))
+	writeHustleLimit(&material, "background_concurrent", int64(limits.BackgroundConcurrent))
+	writeHustleLimit(&material, "background_queued", int64(limits.BackgroundQueued))
+	writeHustleLimit(&material, "audit_timeout", int64(limits.AuditTimeout))
+	writeHustleLimit(&material, "finalization_timeout", int64(limits.FinalizationTimeout))
+	writeHustleLimit(&material, "worker_drain_timeout", int64(limits.WorkerDrainTimeout))
+	return hexSHA256(material.String())
+}
+
+func writeHustleLimit(material *strings.Builder, name string, value int64) {
+	material.WriteString(name)
+	material.WriteByte(':')
+	material.WriteString(strconv.FormatInt(value, 10))
+	material.WriteByte('\n')
 }
 
 func topologyRevision(definitions []loop.Definition, primers []string, active string) string {

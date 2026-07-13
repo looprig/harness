@@ -6,6 +6,7 @@ import (
 	"github.com/looprig/harness/internal/sessionruntime"
 	"github.com/looprig/harness/pkg/ceiling"
 	"github.com/looprig/harness/pkg/foreignloop"
+	"github.com/looprig/harness/pkg/hustle"
 	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/harness/pkg/sessionstore"
 )
@@ -28,7 +29,12 @@ const (
 	keyCeilingFactory      singletonKey = "ceiling_factory"
 	keySnapshots           singletonKey = "snapshots"
 	keyOffloadGC           singletonKey = "offload_gc"
+	keyHustleLimits        singletonKey = "hustle_limits"
 )
+
+// MaxHustleQueued is the largest configured waiting capacity for either hustle
+// lane. The execution controller may allocate no queue larger than this bound.
+const MaxHustleQueued = 10_000
 
 type DelegationLimits struct {
 	Depth int
@@ -38,6 +44,18 @@ type DelegationLimits struct {
 type GateCaps struct {
 	MaxOpen    int
 	MaxTimeout time.Duration
+}
+
+// HustleLimits bounds the two independent execution lanes and their audit,
+// finalization, and worker-drain operations.
+type HustleLimits struct {
+	BlockingConcurrent   int
+	BlockingQueued       int
+	BackgroundConcurrent int
+	BackgroundQueued     int
+	AuditTimeout         time.Duration
+	FinalizationTimeout  time.Duration
+	WorkerDrainTimeout   time.Duration
 }
 
 // CeilingFactory mints a fresh security-ceiling state for each session. A rig may
@@ -51,6 +69,33 @@ func WithLoops(definitions ...loop.Definition) Option {
 		state.loops = append(state.loops, copyOf...)
 		return nil
 	}
+}
+
+// WithHustles adds immutable hustle definitions to the rig.
+func WithHustles(definitions ...hustle.Definition) Option {
+	copyOf := append([]hustle.Definition(nil), definitions...)
+	return func(state *definitionState) error {
+		state.hustles = append(state.hustles, copyOf...)
+		return nil
+	}
+}
+
+// WithHustleLimits configures the required singleton lane bounds.
+func WithHustleLimits(limits HustleLimits) Option {
+	return func(state *definitionState) error {
+		if invalidHustleLimits(limits) {
+			return &DefinitionError{Kind: DefinitionInvalidHustleLimits}
+		}
+		return singleton(keyHustleLimits, func(state *definitionState) { state.hustleLimits = limits })(state)
+	}
+}
+
+func invalidHustleLimits(limits HustleLimits) bool {
+	return limits.BlockingConcurrent <= 0 ||
+		limits.BlockingQueued < 0 || limits.BlockingQueued > MaxHustleQueued ||
+		limits.BackgroundConcurrent <= 0 ||
+		limits.BackgroundQueued < 0 || limits.BackgroundQueued > MaxHustleQueued ||
+		limits.AuditTimeout <= 0 || limits.FinalizationTimeout <= 0 || limits.WorkerDrainTimeout <= 0
 }
 
 func WithPrimers(names ...string) Option {

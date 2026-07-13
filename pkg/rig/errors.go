@@ -17,6 +17,11 @@ const (
 	DefinitionInvalidGateCaps         DefinitionErrorKind = "invalid_gate_caps"
 	DefinitionInvalidCeilingFactory   DefinitionErrorKind = "invalid_ceiling_factory"
 	DefinitionDuplicateOption         DefinitionErrorKind = "duplicate_option"
+	DefinitionInvalidHustle           DefinitionErrorKind = "invalid_hustle"
+	DefinitionDuplicateHustle         DefinitionErrorKind = "duplicate_hustle"
+	DefinitionMissingHustleLimits     DefinitionErrorKind = "missing_hustle_limits"
+	DefinitionUnusedHustleLimits      DefinitionErrorKind = "unused_hustle_limits"
+	DefinitionInvalidHustleLimits     DefinitionErrorKind = "invalid_hustle_limits"
 )
 
 type DefinitionError struct {
