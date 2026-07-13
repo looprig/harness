@@ -321,9 +321,11 @@ error, and the call site escalates (hustle doc §5), never auto-allows.
   decode/validation (hustle doc §7); no generic `Hustle[In, Out]` API.
 - **`swe`** — set `Caps.StructuredOutput` per catalogue row; author classifier verdict schemas.
 
-**Release order:** inference → llm → harness → swe (no `core/content` bump this time). **Vendored-
-`replace`/offline gotcha:** bump the vendored `inference` copy under `harness/vendor` in the same
-change as the `go.mod` bump, or the build silently uses the structured-output-less types.
+**Release order:** inference → llm → harness → swe (no `core/content` bump this time). During
+sibling development, adjacent worktrees preserve the repositories' `replace ../inference`
+layout. Harness currently has no vendored inference tree. Repositories that do commit vendor
+trees refresh them after pinning the released inference/harness versions; do not describe a
+nonexistent `harness/vendor` copy as authoritative.
 
 ## Open questions
 

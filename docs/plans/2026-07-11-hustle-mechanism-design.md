@@ -4,7 +4,7 @@
 
 **Last revised:** 2026-07-12
 
-**Status:** Draft
+**Status:** Approved
 
 **Depends on:**
 
@@ -377,6 +377,13 @@ type ActivityLease interface {
 }
 ```
 
+`*hub.Hub` is not expected to satisfy `ActivityTracker` directly: Go return
+types are invariant even when two lease values expose the same methods.
+`internal/sessionruntime` owns a small adapter that calls the concrete hub
+activity method and wraps its returned lease as the runtime's `ActivityLease`.
+This keeps `internal/hustleruntime` dependent on its consumer-owned interfaces
+without moving hub types into a leaf package or creating a cycle.
+
 The interfaces are defined where consumed. `event.Factory` satisfies
 `HeaderStamper`; the controller uses a small exhaustive switch over the three
 hustle lifecycle types to write the stamped header back. The controller receives
@@ -690,6 +697,11 @@ reading them and must redact sensitive fields. Raw hustle inputs/outputs,
 prompts, credentials, commands, fetched content, and classifier reasoning are
 never stored in lifecycle events.
 
+Restore itself uses an unfiltered internal replay seam because it must repair
+hustle aggregates. Public journal readers, serve catalog readers, and consumer
+backlogs use a separate visibility-filtered replay seam. They fail closed on an
+unknown visibility value and never depend on callers remembering to filter.
+
 ### Lifecycle events
 
 `DefinitionDescriptor` stays in leaf package `pkg/hustle`. Run-time audit types
@@ -983,7 +995,8 @@ Boundary tests must enforce:
 Implementation sequence:
 
 1. normalized usage prerequisites;
-2. `pkg/hustle` definitions and rig fingerprinting;
+2. text-only `pkg/hustle` definitions and rig fingerprinting (no output schema
+   field until the structured-output prerequisite lands);
 3. event visibility/lifecycle codecs and hub internal audit/activity seams;
 4. per-session controller, binding, lanes, cancellation, and shutdown;
 5. typed compaction adapter and product integration;
