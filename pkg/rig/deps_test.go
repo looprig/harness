@@ -113,7 +113,7 @@ func internalSessionRuntimeImportViolations(root string) ([]string, error) {
 		}
 		if entry.IsDir() {
 			switch entry.Name() {
-			case ".git", "vendor", "docs", "examples", "testdata":
+			case ".git", ".worktrees", "vendor", "docs", "examples", "testdata":
 				if path != root {
 					return filepath.SkipDir
 				}
@@ -172,7 +172,7 @@ func TestOnlyRigImportsInternalSessionRuntime(t *testing.T) {
 
 func TestInternalSessionRuntimeImportGuardCoversWholeModule(t *testing.T) {
 	root := t.TempDir()
-	for _, rel := range []string{"internal/leak/leak.go", "cmd/leak/main.go", "pkg/rig/allowed.go", "testdata/ignored.go"} {
+	for _, rel := range []string{"internal/leak/leak.go", "cmd/leak/main.go", "pkg/rig/allowed.go", "testdata/ignored.go", ".worktrees/ignored/leak.go"} {
 		path := filepath.Join(root, filepath.FromSlash(rel))
 		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 			t.Fatal(err)
@@ -241,7 +241,7 @@ func TestNoLegacyLifecycleNamesInActiveSource(t *testing.T) {
 		}
 		if entry.IsDir() {
 			switch entry.Name() {
-			case ".git", "vendor", "docs", "examples", "testdata":
+			case ".git", ".worktrees", "vendor", "docs", "examples", "testdata":
 				if path != root {
 					return filepath.SkipDir
 				}
