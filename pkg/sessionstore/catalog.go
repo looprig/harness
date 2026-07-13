@@ -748,6 +748,13 @@ func scanCatalogJSONValue(dec *json.Decoder, path string) error {
 				return &CatalogDuplicateFieldError{Path: path, Field: first + "/" + field}
 			}
 			seen[folded] = field
+			if opaqueCatalogJSONField(path, field) {
+				var opaque json.RawMessage
+				if err := dec.Decode(&opaque); err != nil {
+					return err
+				}
+				continue
+			}
 			if err := scanCatalogJSONValue(dec, path+"."+field); err != nil {
 				return err
 			}
@@ -767,6 +774,16 @@ func scanCatalogJSONValue(dec *json.Decoder, path string) error {
 	default:
 		return nil
 	}
+}
+
+// opaqueCatalogJSONField identifies raw event envelopes embedded in a catalog
+// summary. Their schemas and tool-input JSON belong to event/content codecs, not
+// SessionMeta; catalog duplicate checks stop at this serialization boundary.
+func opaqueCatalogJSONField(path, field string) bool {
+	if !strings.EqualFold(field, "event") {
+		return false
+	}
+	return strings.EqualFold(path, "$.last_step") || strings.EqualFold(path, "$.last_turn")
 }
 
 func validateSessionMeta(meta SessionMeta) error {

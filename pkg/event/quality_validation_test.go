@@ -16,7 +16,10 @@ func TestStepDoneMessageGroupValidation(t *testing.T) {
 	var nilAI *content.AIMessage
 	var nilTool *content.ToolResultMessage
 	ai := aiMsg("answer")
+	wrongRoleAI := aiMsg("answer")
+	wrongRoleAI.Role = content.RoleUser
 	toolResult := &content.ToolResultMessage{Message: content.Message{Role: content.RoleTool}, ToolUseID: "call-1"}
+	wrongRoleTool := &content.ToolResultMessage{Message: content.Message{Role: content.RoleAssistant}, ToolUseID: "call-1"}
 	system := &content.SystemMessage{Message: content.Message{Role: content.RoleSystem}}
 	tests := []struct {
 		name         string
@@ -29,6 +32,7 @@ func TestStepDoneMessageGroupValidation(t *testing.T) {
 		{name: "empty group", messages: content.AgenticMessages{}, wantErr: true},
 		{name: "nil first message", messages: content.AgenticMessages{nil}, wantErr: true},
 		{name: "typed nil AI first", messages: content.AgenticMessages{nilAI}, wantErr: true},
+		{name: "AI type with user role", messages: content.AgenticMessages{wrongRoleAI}, wantErr: true},
 		{name: "tool first", messages: content.AgenticMessages{toolResult}, wantErr: true},
 		{name: "user first", messages: content.AgenticMessages{userMsg("question")}, wantErr: true},
 		{name: "second AI", messages: content.AgenticMessages{ai, aiMsg("again")}, wantErr: true},
@@ -36,6 +40,7 @@ func TestStepDoneMessageGroupValidation(t *testing.T) {
 		{name: "second system", messages: content.AgenticMessages{ai, system}, wantErr: true},
 		{name: "nil tool", messages: content.AgenticMessages{ai, nil}, wantErr: true},
 		{name: "typed nil tool", messages: content.AgenticMessages{ai, nilTool}, wantErr: true},
+		{name: "tool type with assistant role", messages: content.AgenticMessages{ai, wrongRoleTool}, wantErr: true},
 		{name: "AI only", messages: content.AgenticMessages{ai}},
 		{name: "AI followed by tools", messages: content.AgenticMessages{ai, toolResult, toolResult}},
 	}

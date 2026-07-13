@@ -91,6 +91,63 @@ func TestSessionMetaRejectsDuplicateJSONFields(t *testing.T) {
 	}
 }
 
+func TestCatalogReadAllowsOpaqueEventJSONFields(t *testing.T) {
+	t.Parallel()
+	sessionID, loopID := fixedUUID(0x34), fixedUUID(0x35)
+	tests := []struct {
+		name  string
+		input json.RawMessage
+	}{
+		{name: "case distinct tool input keys remain opaque", input: json.RawMessage(`{"foo":1,"FOO":2}`)},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			step := event.StepDone{
+				Header: event.Header{Coordinates: identity.Coordinates{
+					SessionID: sessionID,
+					LoopID:    loopID,
+					TurnID:    fixedUUID(0x36),
+					StepID:    fixedUUID(0x37),
+				}, EventID: fixedUUID(0x38)},
+				Messages: content.AgenticMessages{&content.AIMessage{Message: content.Message{
+					Role: content.RoleAssistant,
+					Blocks: []content.Block{&content.ToolUseBlock{
+						ID: "call-1", Name: "tool", Input: tt.input,
+					}},
+				}}},
+			}
+			summary, err := newEventSummary(step, 2)
+			if err != nil {
+				t.Fatalf("newEventSummary() error = %v", err)
+			}
+			meta := SessionMeta{SessionID: sessionID, LastJournalSeq: 2, LastStep: summary}
+			encoded, err := encodeSessionMeta(meta)
+			if err != nil {
+				t.Fatalf("encodeSessionMeta() error = %v", err)
+			}
+			store, err := Open(memstore.New())
+			if err != nil {
+				t.Fatalf("Open() error = %v", err)
+			}
+			key, err := sessionName(sessionID)
+			if err != nil {
+				t.Fatalf("sessionName() error = %v", err)
+			}
+			if _, err := store.backend.KV.Put(context.Background(), key, 0, encoded); err != nil {
+				t.Fatalf("KV.Put() error = %v", err)
+			}
+			got, found, err := store.OpenCatalog().ReadMeta(context.Background(), sessionID)
+			if err != nil {
+				t.Fatalf("ReadMeta() error = %v", err)
+			}
+			if !found || got.LastStep == nil {
+				t.Fatalf("ReadMeta() found=%v LastStep=%#v, want stored opaque event", found, got.LastStep)
+			}
+		})
+	}
+}
+
 func TestCatalogRepairReplacesInvalidCachedProjection(t *testing.T) {
 	t.Parallel()
 	sessionID, loopID := fixedUUID(0x44), fixedUUID(0x45)

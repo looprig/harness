@@ -156,12 +156,12 @@ func validateStepDoneMessages(messages content.AgenticMessages) error {
 		return &InvalidEventError{Event: "StepDone", Field: FieldMessages, Rule: RuleInvalid}
 	}
 	first, ok := messages[0].(*content.AIMessage)
-	if !ok || first == nil {
+	if !ok || first == nil || first.Role != content.RoleAssistant {
 		return &InvalidEventError{Event: "StepDone", Field: FieldMessages, Rule: RuleInvalid}
 	}
 	for _, message := range messages[1:] {
 		toolResult, toolResultOK := message.(*content.ToolResultMessage)
-		if !toolResultOK || toolResult == nil {
+		if !toolResultOK || toolResult == nil || toolResult.Role != content.RoleTool {
 			return &InvalidEventError{Event: "StepDone", Field: FieldMessages, Rule: RuleInvalid}
 		}
 	}
