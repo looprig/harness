@@ -36,23 +36,19 @@ func TestLaneGrantsExecutionInOwnershipFIFOOrder(t *testing.T) {
 			if err := runs[0].awaitExecution(); err != nil {
 				t.Fatal(err)
 			}
-			second := make(chan error, 1)
-			third := make(chan error, 1)
-			go func() { second <- runs[1].awaitExecution() }()
-			go func() { third <- runs[2].awaitExecution() }()
-			assertNoResult(t, second, "second grant while first executes")
-			assertNoResult(t, third, "third grant while first executes")
+			assertNotGranted(t, runs[1], "second grant while first executes")
+			assertNotGranted(t, runs[2], "third grant while first executes")
 			if err := runs[0].finalize(context.Background(), hustle.Outcome{}); err != nil {
 				t.Fatal(err)
 			}
-			if err := <-second; err != nil {
+			if err := runs[1].awaitExecution(); err != nil {
 				t.Fatal(err)
 			}
-			assertNoResult(t, third, "third grant before second releases")
+			assertNotGranted(t, runs[2], "third grant before second releases")
 			if err := runs[1].finalize(context.Background(), hustle.Outcome{}); err != nil {
 				t.Fatal(err)
 			}
-			if err := <-third; err != nil {
+			if err := runs[2].awaitExecution(); err != nil {
 				t.Fatal(err)
 			}
 			if err := runs[2].finalize(context.Background(), hustle.Outcome{}); err != nil {
@@ -157,9 +153,7 @@ func TestLanesDoNotBorrowCapacity(t *testing.T) {
 			if err := active.awaitExecution(); err != nil {
 				t.Fatal(err)
 			}
-			queuedGrant := make(chan error, 1)
-			go func() { queuedGrant <- queued.awaitExecution() }()
-			assertNoResult(t, queuedGrant, "constrained lane borrowed spare execution")
+			assertNotGranted(t, queued, "constrained lane borrowed spare execution")
 			spare, err := controller.own(context.Background(), testCase.spare, noOpFinalizer)
 			if err != nil {
 				t.Fatal(err)
@@ -170,7 +164,7 @@ func TestLanesDoNotBorrowCapacity(t *testing.T) {
 			if err := active.finalize(context.Background(), hustle.Outcome{}); err != nil {
 				t.Fatal(err)
 			}
-			if err := <-queuedGrant; err != nil {
+			if err := queued.awaitExecution(); err != nil {
 				t.Fatal(err)
 			}
 			for _, run := range []*ownedRun{queued, spare} {
@@ -182,11 +176,11 @@ func TestLanesDoNotBorrowCapacity(t *testing.T) {
 	}
 }
 
-func assertNoResult(t *testing.T, results <-chan error, description string) {
+func assertNotGranted(t *testing.T, run *ownedRun, description string) {
 	t.Helper()
 	select {
-	case err := <-results:
-		t.Fatalf("%s: %v", description, err)
+	case <-run.granted:
+		t.Fatal(description)
 	default:
 	}
 }
@@ -223,13 +217,12 @@ func TestConcurrentCapacityGrantsExactLimit(t *testing.T) {
 					t.Fatalf("run[%d] grant error = %v", index, err)
 				}
 			}
-			last := make(chan error, 1)
-			go func() { last <- runs[len(runs)-1].awaitExecution() }()
-			assertNoResult(t, last, "queued run granted above concurrent limit")
+			last := runs[len(runs)-1]
+			assertNotGranted(t, last, "queued run granted above concurrent limit")
 			if err := runs[0].finalize(context.Background(), hustle.Outcome{}); err != nil {
 				t.Fatal(err)
 			}
-			if err := <-last; err != nil {
+			if err := last.awaitExecution(); err != nil {
 				t.Fatal(err)
 			}
 			var group sync.WaitGroup
