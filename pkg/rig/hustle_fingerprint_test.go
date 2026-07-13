@@ -156,3 +156,87 @@ func TestHustleTopologyFingerprintSensitivityAndExclusions(t *testing.T) {
 		})
 	}
 }
+
+func TestHustleBoundAndFrozenTopologyFingerprintEquivalent(t *testing.T) {
+	t.Parallel()
+	loopDefinition := mustDefine(loop.WithName("agent"), loop.WithInference(&stubLLM{}, validModel("loop-model")))
+	bound := bindFingerprintDefinition(loopDefinition)
+	definition := defineRigHustle(t, defaultRigHustleSpec())
+	limits := validHustleLimits()
+	tests := []struct {
+		name string
+	}{
+		{name: "registered hustle and limits"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			boundFingerprint := fingerprintWithTopologyAndHustles(
+				bound, ConfigFingerprintFields{}, []loop.Definition{loopDefinition},
+				[]string{"agent"}, "agent", []hustle.Definition{definition}, limits,
+			)
+			frozenFingerprint := frozenFingerprintWithHustles(
+				ConfigFingerprintFields{}, []loop.Definition{loopDefinition},
+				[]string{"agent"}, "agent", []hustle.Definition{definition}, limits,
+			)
+			if boundFingerprint.TopologyRev != frozenFingerprint.TopologyRev {
+				t.Fatalf("bound TopologyRev = %q, frozen = %q", boundFingerprint.TopologyRev, frozenFingerprint.TopologyRev)
+			}
+		})
+	}
+}
+
+func TestHustleBoundTopologyFingerprintSensitivity(t *testing.T) {
+	t.Parallel()
+	loopDefinition := mustDefine(loop.WithName("agent"), loop.WithInference(&stubLLM{}, validModel("loop-model")))
+	bound := bindFingerprintDefinition(loopDefinition)
+	baseSpec := defaultRigHustleSpec()
+	baseDefinition := defineRigHustle(t, baseSpec)
+	baseLimits := validHustleLimits()
+	revision := func(definition hustle.Definition, limits HustleLimits) string {
+		return fingerprintWithTopologyAndHustles(
+			bound, ConfigFingerprintFields{}, []loop.Definition{loopDefinition},
+			[]string{"agent"}, "agent", []hustle.Definition{definition}, limits,
+		).TopologyRev
+	}
+	baseRevision := revision(baseDefinition, baseLimits)
+	tests := []struct {
+		name       string
+		definition hustle.Definition
+		limits     HustleLimits
+	}{
+		{name: "hustle policy", definition: defineRigHustle(t, func() rigHustleSpec { value := baseSpec; value.policyRev = "policy-v2"; return value }()), limits: baseLimits},
+		{name: "lane limit", definition: baseDefinition, limits: func() HustleLimits { value := baseLimits; value.BackgroundQueued++; return value }()},
+		{name: "cleanup limit", definition: baseDefinition, limits: func() HustleLimits { value := baseLimits; value.WorkerDrainTimeout++; return value }()},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := revision(tt.definition, tt.limits); got == baseRevision {
+				t.Fatalf("bound topology revision unchanged: %q", got)
+			}
+		})
+	}
+}
+
+func TestNoHustleTopologyFingerprintPreservesLegacyMaterial(t *testing.T) {
+	t.Parallel()
+	definition := mustDefine(loop.WithName("agent"), loop.WithInference(&stubLLM{}, validModel("loop-model")))
+	tests := []struct {
+		name       string
+		definition loop.Definition
+		primers    []string
+		active     string
+	}{
+		{name: "single active primer", definition: definition, primers: []string{"agent"}, active: "agent"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			legacyMaterial := "loop:" + string(tt.definition.Name()) + "\npolicy:" + tt.definition.PolicyRevision() + "\nprimer:agent\nactive:agent"
+			want := hexSHA256(legacyMaterial)
+			if got := topologyRevision([]loop.Definition{tt.definition}, tt.primers, tt.active); got != want {
+				t.Fatalf("topologyRevision() = %q, want legacy %q", got, want)
+			}
+		})
+	}
+}

@@ -54,6 +54,12 @@ func fingerprintWithTopology(definition loop.BoundDefinition, fields ConfigFinge
 	return fingerprint
 }
 
+func fingerprintWithTopologyAndHustles(definition loop.BoundDefinition, fields ConfigFingerprintFields, definitions []loop.Definition, primers []string, active string, hustles []hustle.Definition, limits HustleLimits) event.ConfigFingerprint {
+	fingerprint := fingerprintWith(definition, fields)
+	fingerprint.TopologyRev = topologyRevisionWithHustles(definitions, primers, active, hustles, limits)
+	return fingerprint
+}
+
 // frozenFingerprint is the rig-time compatibility projection. It depends only on
 // immutable definitions and scalar rig fields, so restore can compare it immediately
 // after replay without constructing workspace or loop collaborators.
@@ -99,11 +105,36 @@ func frozenFingerprintWithHustles(fields ConfigFingerprintFields, definitions []
 }
 
 func topologyRevisionWithHustles(definitions []loop.Definition, primers []string, active string, hustles []hustle.Definition, limits HustleLimits) string {
+	copyOfLimits := limits
+	return canonicalTopologyRevision(topologyRevisionInput{
+		definitions: definitions,
+		primers:     primers,
+		active:      active,
+		hustles:     hustles,
+		limits:      &copyOfLimits,
+	})
+}
+
+type topologyRevisionInput struct {
+	definitions []loop.Definition
+	primers     []string
+	active      string
+	hustles     []hustle.Definition
+	limits      *HustleLimits
+}
+
+func canonicalTopologyRevision(input topologyRevisionInput) string {
 	var material strings.Builder
-	material.WriteString("topology:")
-	material.WriteString(topologyRevision(definitions, primers, active))
-	material.WriteByte('\n')
-	ordered := append([]hustle.Definition(nil), hustles...)
+	writeLoopTopology(&material, input.definitions, input.primers, input.active)
+	if input.limits != nil {
+		material.WriteByte('\n')
+		writeHustleTopology(&material, input.hustles, *input.limits)
+	}
+	return hexSHA256(material.String())
+}
+
+func writeHustleTopology(material *strings.Builder, definitions []hustle.Definition, limits HustleLimits) {
+	ordered := append([]hustle.Definition(nil), definitions...)
 	sort.Slice(ordered, func(i, j int) bool { return ordered[i].Name() < ordered[j].Name() })
 	for _, definition := range ordered {
 		material.WriteString("hustle:")
@@ -113,14 +144,13 @@ func topologyRevisionWithHustles(definitions []loop.Definition, primers []string
 		material.WriteString(definition.PolicyRevision())
 		material.WriteByte('\n')
 	}
-	writeHustleLimit(&material, "blocking_concurrent", int64(limits.BlockingConcurrent))
-	writeHustleLimit(&material, "blocking_queued", int64(limits.BlockingQueued))
-	writeHustleLimit(&material, "background_concurrent", int64(limits.BackgroundConcurrent))
-	writeHustleLimit(&material, "background_queued", int64(limits.BackgroundQueued))
-	writeHustleLimit(&material, "audit_timeout", int64(limits.AuditTimeout))
-	writeHustleLimit(&material, "finalization_timeout", int64(limits.FinalizationTimeout))
-	writeHustleLimit(&material, "worker_drain_timeout", int64(limits.WorkerDrainTimeout))
-	return hexSHA256(material.String())
+	writeHustleLimit(material, "blocking_concurrent", int64(limits.BlockingConcurrent))
+	writeHustleLimit(material, "blocking_queued", int64(limits.BlockingQueued))
+	writeHustleLimit(material, "background_concurrent", int64(limits.BackgroundConcurrent))
+	writeHustleLimit(material, "background_queued", int64(limits.BackgroundQueued))
+	writeHustleLimit(material, "audit_timeout", int64(limits.AuditTimeout))
+	writeHustleLimit(material, "finalization_timeout", int64(limits.FinalizationTimeout))
+	writeHustleLimit(material, "worker_drain_timeout", int64(limits.WorkerDrainTimeout))
 }
 
 func writeHustleLimit(material *strings.Builder, name string, value int64) {
@@ -131,7 +161,14 @@ func writeHustleLimit(material *strings.Builder, name string, value int64) {
 }
 
 func topologyRevision(definitions []loop.Definition, primers []string, active string) string {
-	var material strings.Builder
+	return canonicalTopologyRevision(topologyRevisionInput{
+		definitions: definitions,
+		primers:     primers,
+		active:      active,
+	})
+}
+
+func writeLoopTopology(material *strings.Builder, definitions []loop.Definition, primers []string, active string) {
 	orderedDefinitions := append([]loop.Definition(nil), definitions...)
 	sort.Slice(orderedDefinitions, func(i, j int) bool { return orderedDefinitions[i].Name() < orderedDefinitions[j].Name() })
 	for _, candidate := range orderedDefinitions {
@@ -156,7 +193,6 @@ func topologyRevision(definitions []loop.Definition, primers []string, active st
 	}
 	material.WriteString("active:")
 	material.WriteString(active)
-	return hexSHA256(material.String())
 }
 
 func hexSHA256(value string) string {
