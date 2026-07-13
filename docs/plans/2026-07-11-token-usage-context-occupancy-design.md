@@ -431,6 +431,7 @@ type CounterCapability struct {
 	SecurityIdentity SecurityIdentity // endpoint/attestation identity, or zero for local
 	Retention        RetentionPosture // provider-declared retention of counted input
 	TokenizerRev     TokenizerRevision
+	Quality          CountQuality     // declared without I/O for definition validation
 }
 
 type InferenceTransport uint8
@@ -463,7 +464,11 @@ type InferenceCapability struct {
 func CompatibleCounter(inf InferenceCapability, counter CounterCapability) error
 ```
 
-All values are secret-free and structurally validated. `SecurityIdentity` is a
+All values are secret-free and structurally validated. `Quality` is mandatory:
+provider counters declare `CountQualityExactProvider`, exact in-process
+tokenizers declare `CountQualityExactLocal`, and the standard estimator declares
+`CountQualityHeuristicEstimate`. This lets `rig.Define` validate
+`CounterPolicy` without performing I/O. `SecurityIdentity` is a
 SHA-256 digest of canonical provider/endpoint/attestation-policy identity, never
 the endpoint credentials or attestation document. `InferenceTransportUnknown`
 and unknown counter retention fail closed. Unknown inference retention is
