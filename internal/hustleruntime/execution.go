@@ -109,11 +109,15 @@ func (c *Controller) RunAndFinalize(ctx context.Context, request hustle.Request,
 		activityCtx, cancel := c.runtime.newAuditContext()
 		lease, err = c.runtime.activity.AcquireHustleActivity(activityCtx, run.id)
 		cancel()
+		acquisitionErr := err
 		if lease != nil && !nilRuntimeValue(reflect.ValueOf(lease)) {
 			cleanup = func() error {
 				releaseCtx, releaseCancel := c.runtime.newAuditContext()
 				defer releaseCancel()
 				if releaseErr := lease.Release(releaseCtx); releaseErr != nil {
+					if sameErrorValue(releaseErr, acquisitionErr) {
+						return nil
+					}
 					return &ActivityError{RunID: run.id, Operation: ActivityRelease, Cause: releaseErr}
 				}
 				return nil
@@ -127,6 +131,7 @@ func (c *Controller) RunAndFinalize(ctx context.Context, request hustle.Request,
 			if !ok {
 				activityErr = &ActivityError{RunID: run.id, Operation: ActivityAcquire, Cause: err}
 			}
+			c.runtime.reportFault(activityErr)
 			runErr := &RunError{Name: request.Name, RunID: run.id, Stage: hustle.StageQueue, ReasonCode: hustle.ReasonInternal, Cause: activityErr}
 			run.completeSetup(runErr, cleanup, nil)
 			run.lane.cancelQueued(run)
@@ -169,6 +174,15 @@ func (c *Controller) RunAndFinalize(ctx context.Context, request hustle.Request,
 		outcome = hustle.Outcome{Err: err}
 	}
 	return run.finalize(context.Background(), outcome)
+}
+
+func sameErrorValue(left, right error) bool {
+	if left == nil || right == nil {
+		return false
+	}
+	leftType := reflect.TypeOf(left)
+	rightType := reflect.TypeOf(right)
+	return leftType.Comparable() && rightType.Comparable() && left == right
 }
 
 func (c *Controller) preflight(ctx context.Context, request hustle.Request, validate ValidateResult, finalizer Finalizer) (hustle.BoundDefinition, json.RawMessage, error) {
