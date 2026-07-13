@@ -3,7 +3,6 @@ package event
 import (
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/identity"
-	"github.com/looprig/inference"
 )
 
 // EventName is the concrete event type name an InvalidEventError points at.
@@ -43,7 +42,10 @@ const (
 	FieldCommandID       FieldName = "CommandID"
 	FieldActiveLoopID    FieldName = "ActiveLoopID"
 	FieldModel           FieldName = "Model"
+	FieldModelKey        FieldName = "ModelKey"
+	FieldContextLimits   FieldName = "ContextLimits"
 	FieldEffort          FieldName = "Effort"
+	FieldUsage           FieldName = "Usage"
 	// FieldType names the whole event (not one coordinate) on the fail-secure
 	// unknown-type path, paired with RuleUnknownType.
 	FieldType FieldName = "Type"
@@ -132,18 +134,28 @@ func validateEventBody(ev Event) error {
 			return &InvalidEventError{Event: "DelegateRequestAccepted", Field: FieldCommandID, Rule: RuleRequired}
 		}
 	case LoopInferenceChanged:
-		if err := e.Model.Validate(); err != nil {
-			return &InvalidEventError{Event: "LoopInferenceChanged", Field: FieldModel, Rule: RuleInvalid}
+		return validateModelRuntime("LoopInferenceChanged", e.Runtime)
+	case LoopModeChanged:
+		return validateModelRuntime("LoopModeChanged", e.Runtime)
+	case LoopStarted:
+		return validateModelRuntime("LoopStarted", e.Runtime)
+	case TurnDone:
+		if err := e.Usage.Validate(); err != nil {
+			return &InvalidEventError{Event: "TurnDone", Field: FieldUsage, Rule: RuleInvalid}
 		}
-		if e.Model.Origin != inference.OriginCustom && e.Model.Origin != inference.OriginCatalog {
-			return &InvalidEventError{Event: "LoopInferenceChanged", Field: FieldModel, Rule: RuleInvalid}
-		}
-		if !e.Model.Sampling.Effort.Valid() {
-			return &InvalidEventError{Event: "LoopInferenceChanged", Field: FieldModel, Rule: RuleInvalid}
-		}
-		if !e.Effort.Valid() {
-			return &InvalidEventError{Event: "LoopInferenceChanged", Field: FieldEffort, Rule: RuleInvalid}
-		}
+	}
+	return nil
+}
+
+func validateModelRuntime(name EventName, runtime ModelRuntime) error {
+	if err := runtime.Key.Validate(); err != nil {
+		return &InvalidEventError{Event: name, Field: FieldModelKey, Rule: RuleInvalid}
+	}
+	if err := runtime.Limits.Validate(); err != nil {
+		return &InvalidEventError{Event: name, Field: FieldContextLimits, Rule: RuleInvalid}
+	}
+	if !runtime.Effort.Valid() {
+		return &InvalidEventError{Event: name, Field: FieldEffort, Rule: RuleInvalid}
 	}
 	return nil
 }

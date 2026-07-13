@@ -558,8 +558,10 @@ func TestNewRestoredSeedsModeAndInference(t *testing.T) {
 			wantEffort: inference.EffortHigh,
 		},
 		{
-			name:       "restored mode plus inference override",
-			seed:       RestoredState{HasMode: true, Mode: "plan", HasInference: true, Model: swapTestModel("routed"), Effort: inference.EffortMax},
+			name: "restored mode plus inference override",
+			seed: RestoredState{HasMode: true, Mode: "plan", HasRuntime: true, Runtime: event.ModelRuntime{
+				Key: swapTestModel("routed").Key(), Effort: inference.EffortMax,
+			}},
 			wantSystem: "base\n\nplan-i",
 			wantModel:  "routed",
 			wantEffort: inference.EffortMax,
@@ -581,12 +583,7 @@ func TestNewRestoredSeedsModeAndInference(t *testing.T) {
 			ctx, cancel := context.WithCancel(context.Background())
 			t.Cleanup(cancel)
 			rec := &recordingPublisher{}
-			seed := tt.seed
-			if seed.HasInference {
-				// The fold bakes effort into the model's Sampling.Effort, mirroring the actor.
-				seed.Model.Sampling.Effort = seed.Effort
-			}
-			l, err := NewRestored(ctx, mustID(t), mustID(t), Provenance{}, rec, bound, seed)
+			l, err := NewRestored(ctx, mustID(t), mustID(t), Provenance{}, rec, bound, tt.seed)
 			if err != nil {
 				t.Fatalf("NewRestored: %v", err)
 			}

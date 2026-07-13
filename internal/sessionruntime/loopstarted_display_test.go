@@ -8,6 +8,7 @@ import (
 	"github.com/looprig/core/content"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/loop"
+	"github.com/looprig/inference"
 )
 
 // TestLoopStartedCarriesDisplayMetadata is the end-to-end proof that a newly started
@@ -54,9 +55,12 @@ func TestLoopStartedCarriesDisplayMetadata(t *testing.T) {
 			}
 			t.Cleanup(func() { _ = sub.Close() })
 
+			model := validModel("m")
+			model.Limits = inference.ContextLimits{WindowTokens: 64_000, MaxOutputTokens: 8_000}
+			model.Sampling.Effort = inference.EffortHigh
 			opts := append([]loop.Option{
 				loop.WithName("agent"),
-				loop.WithInference(&stubLLM{chunks: []content.Chunk{textChunk("y")}}, validModel("m")),
+				loop.WithInference(&stubLLM{chunks: []content.Chunk{textChunk("y")}}, model),
 				loop.WithDrainTimeout(100 * time.Millisecond),
 			}, tt.extra...)
 			child := mustDefine(opts...)
@@ -74,6 +78,10 @@ func TestLoopStartedCarriesDisplayMetadata(t *testing.T) {
 			}
 			if ls.Description != tt.wantDescription {
 				t.Errorf("LoopStarted.Description = %q, want %q", ls.Description, tt.wantDescription)
+			}
+			wantRuntime := runtimeForModel(model)
+			if ls.Runtime != wantRuntime {
+				t.Errorf("LoopStarted.Runtime = %+v, want %+v", ls.Runtime, wantRuntime)
 			}
 		})
 	}

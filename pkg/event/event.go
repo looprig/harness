@@ -311,6 +311,9 @@ type LoopStarted struct {
 	enduring
 	loopScoped
 	Header
+	// Runtime is the initial resolved model identity, limits, and effort. It is
+	// durable so restore and catalog repair never consult a mutable catalog.
+	Runtime ModelRuntime `json:"runtime,omitzero"`
 	// ParentToolUseID is the durable provider tool-use id of the Subagent tool call
 	// that spawned this loop (content.ToolUseBlock.ID), empty for loops not spawned by
 	// a tool call (e.g. the primary/root). It is the durable carrier that correlates a

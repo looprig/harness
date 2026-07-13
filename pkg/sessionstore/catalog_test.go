@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"reflect"
 	"sort"
 	"strings"
 	"sync"
@@ -47,6 +48,15 @@ func userMsg(text string) *content.UserMessage {
 // session-scoped catalog event needs.
 func hdr(sid uuid.UUID) event.Header {
 	return event.Header{Coordinates: identity.Coordinates{SessionID: sid}}
+}
+
+func mustApplyEvent(t *testing.T, meta SessionMeta, ev event.Event, seq uint64, now CatalogClock) (SessionMeta, bool) {
+	t.Helper()
+	updated, changed, err := applyEvent(meta, ev, seq, now)
+	if err != nil {
+		t.Fatalf("applyEvent(%T) error = %v", ev, err)
+	}
+	return updated, changed
 }
 
 // --- fakeKV: an in-memory storage.KV double with fault + conflict injection ---
@@ -193,19 +203,19 @@ func TestWorkspacePointersFoldCheckpointAndRestoreIndependently(t *testing.T) {
 	refB := workspacestore.Ref("v1:sha256:" + strings.Repeat("b", 64))
 	meta := SessionMeta{}
 
-	meta, _ = applyEvent(meta, event.WorkspaceCheckpointed{
+	meta, _ = mustApplyEvent(t, meta, event.WorkspaceCheckpointed{
 		Header:      event.Header{Coordinates: identity.Coordinates{SessionID: sid}, EventID: eventA},
 		Ref:         string(refA),
 		Consistency: event.SnapshotQuiescent,
 		Trigger:     event.SnapshotTriggerManual,
 	}, 11, fixedClock(time.Time{}))
-	meta, _ = applyEvent(meta, event.WorkspaceCheckpointed{
+	meta, _ = mustApplyEvent(t, meta, event.WorkspaceCheckpointed{
 		Header:      event.Header{Coordinates: identity.Coordinates{SessionID: sid}, EventID: eventB},
 		Ref:         string(refB),
 		Consistency: event.SnapshotFuzzy,
 		Trigger:     event.SnapshotTriggerIdle,
 	}, 17, fixedClock(time.Time{}))
-	meta, _ = applyEvent(meta, event.WorkspaceRestored{
+	meta, _ = mustApplyEvent(t, meta, event.WorkspaceRestored{
 		Header: event.Header{Coordinates: identity.Coordinates{SessionID: sid}, EventID: restoreA},
 		Ref:    string(refA),
 	}, 23, fixedClock(time.Time{}))
@@ -221,7 +231,7 @@ func TestWorkspacePointersFoldCheckpointAndRestoreIndependently(t *testing.T) {
 
 	// A delayed catalog upsert may fold an older durable event after a newer one. Journal
 	// sequence, not arrival order or content identity, decides the pointer.
-	meta, _ = applyEvent(meta, event.WorkspaceCheckpointed{
+	meta, _ = mustApplyEvent(t, meta, event.WorkspaceCheckpointed{
 		Header:      event.Header{Coordinates: identity.Coordinates{SessionID: sid}, EventID: fixedUUID(0x70)},
 		Ref:         string(refA),
 		Consistency: event.SnapshotQuiescent,
@@ -389,7 +399,7 @@ func TestApplyEvent(t *testing.T) {
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			got, changed := applyEvent(tt.start, tt.ev, 0, fixedClock(active))
+			got, changed := mustApplyEvent(t, tt.start, tt.ev, 0, fixedClock(active))
 			if changed != tt.wantChanged {
 				t.Fatalf("applyEvent changed = %v, want %v", changed, tt.wantChanged)
 			}
@@ -610,7 +620,7 @@ func TestApplyEventStatusFold(t *testing.T) {
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			got, changed := applyEvent(tt.start, tt.ev, tt.seq, fixedClock(clock))
+			got, changed := mustApplyEvent(t, tt.start, tt.ev, tt.seq, fixedClock(clock))
 			if changed != tt.wantChanged {
 				t.Fatalf("applyEvent changed = %v, want %v", changed, tt.wantChanged)
 			}
@@ -1027,7 +1037,7 @@ func TestCatalogGetAbsent(t *testing.T) {
 	if rev != 0 {
 		t.Errorf("rev = %d, want 0 for absent", rev)
 	}
-	if meta != (SessionMeta{}) {
+	if !reflect.DeepEqual(meta, SessionMeta{}) {
 		t.Errorf("meta = %+v, want zero for absent", meta)
 	}
 }

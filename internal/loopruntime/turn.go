@@ -39,6 +39,10 @@ type turnState struct {
 	// LLM request; committed history (loopState.msgs) grows group-by-group via
 	// turnConfig.commit. It is NOT the LLM request base — that is turnConfig.base.
 	msgs content.AgenticMessages
+	// usage is the checked sum of authoritative per-request usage for completed
+	// steps in this turn. It is projected onto TurnDone but never used for loop
+	// accumulation, which folds StepDone directly.
+	usage content.Usage
 
 	toolIterations int
 	toolCalls      int
@@ -273,6 +277,11 @@ func runTurn(ctx context.Context, cfg turnConfig, ts turnState) event.Event {
 		}
 		st = res.state
 		aiMsg := st.msgs[0].(*content.AIMessage)
+		turnUsage, usageErr := addTurnUsage(ts.usage, aiMsg.Usage)
+		if usageErr != nil {
+			return event.TurnFailed{TurnIndex: ts.index, Err: usageErr}
+		}
+		ts.usage = turnUsage
 
 		// Raw executable tool-use view (unsanitized Input) for this step.
 		toolUses := st.blocks.ToolUses()
@@ -287,7 +296,7 @@ func runTurn(ctx context.Context, cfg turnConfig, ts turnState) event.Event {
 				// actor committed/emitted this final step: treat as interrupt.
 				return event.TurnInterrupted{TurnIndex: ts.index}
 			}
-			return event.TurnDone{TurnIndex: ts.index, Message: aiMsg}
+			return event.TurnDone{TurnIndex: ts.index, Message: aiMsg, Usage: ts.usage}
 		}
 
 		ts.toolIterations++
@@ -360,6 +369,13 @@ func runTurn(ctx context.Context, cfg turnConfig, ts turnState) event.Event {
 		// Loop: the next stream lets the model react to the tool results (and any
 		// folded user messages).
 	}
+}
+
+func addTurnUsage(total content.Usage, request *content.Usage) (content.Usage, error) {
+	if request == nil {
+		return total, nil
+	}
+	return total.Add(*request)
 }
 
 // foldPending drains the actor's inbox at a tool-continuation boundary and folds the

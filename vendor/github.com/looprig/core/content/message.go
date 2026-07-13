@@ -1,6 +1,9 @@
 package content
 
-import "encoding/json"
+import (
+	"encoding/json"
+	"reflect"
+)
 
 // Role identifies the author of a message in a conversation thread.
 type Role string
@@ -24,7 +27,10 @@ type Message struct {
 type UserMessage struct{ Message }
 
 // AIMessage is a turn authored by the AI model.
-type AIMessage struct{ Message }
+type AIMessage struct {
+	Message
+	Usage *Usage
+}
 
 // SystemMessage carries a system prompt that shapes model behavior.
 type SystemMessage struct{ Message }
@@ -85,6 +91,83 @@ func (m *Message) UnmarshalJSON(data []byte) error {
 			return err
 		}
 		m.Blocks = blocks
+	}
+	return nil
+}
+
+// aiMessageJSON is the wire form of AIMessage. AIMessage defines its own codec
+// pair so the promoted Message methods do not silently drop Usage.
+type aiMessageJSON struct {
+	Role   Role            `json:"role"`
+	Blocks json.RawMessage `json:"blocks,omitempty"`
+	Usage  *usageJSON      `json:"usage,omitempty"`
+}
+
+// usageJSON keeps the package's existing exported-field wire names while
+// omitting zero values. A non-nil zero Usage therefore remains distinguishable
+// from nil by encoding as an empty object.
+type usageJSON struct {
+	InputTokens         TokenCount `json:",omitempty"`
+	OutputTokens        TokenCount `json:",omitempty"`
+	CacheReadTokens     TokenCount `json:",omitempty"`
+	CacheCreationTokens TokenCount `json:",omitempty"`
+	ReasoningTokens     TokenCount `json:",omitempty"`
+}
+
+func (m AIMessage) MarshalJSON() ([]byte, error) {
+	var blocks json.RawMessage
+	if len(m.Blocks) > 0 {
+		b, err := MarshalBlocks(m.Blocks)
+		if err != nil {
+			return nil, err
+		}
+		blocks = b
+	}
+
+	var usage *usageJSON
+	if m.Usage != nil {
+		if err := m.Usage.Validate(); err != nil {
+			return nil, err
+		}
+		u := usageJSON(*m.Usage)
+		usage = &u
+	}
+
+	return json.Marshal(aiMessageJSON{Role: m.Role, Blocks: blocks, Usage: usage})
+}
+
+func (m *AIMessage) UnmarshalJSON(data []byte) error {
+	if m == nil {
+		return &json.InvalidUnmarshalError{Type: reflect.TypeOf(m)}
+	}
+	*m = AIMessage{}
+
+	var j aiMessageJSON
+	if err := json.Unmarshal(data, &j); err != nil {
+		return err
+	}
+
+	var blocks []Block
+	if len(j.Blocks) > 0 {
+		decoded, err := UnmarshalBlocks(j.Blocks)
+		if err != nil {
+			return err
+		}
+		blocks = decoded
+	}
+
+	var usage *Usage
+	if j.Usage != nil {
+		u := Usage(*j.Usage)
+		if err := u.Validate(); err != nil {
+			return err
+		}
+		usage = &u
+	}
+
+	*m = AIMessage{
+		Message: Message{Role: j.Role, Blocks: blocks},
+		Usage:   usage,
 	}
 	return nil
 }

@@ -139,12 +139,14 @@ func runStep(ctx context.Context, cfg stepConfig, turnIndex event.TurnIndex, st 
 		}
 		proc.process(chunk, turnIndex)
 	}
+	usage := terminalUsage(sr)
 
 	// Materialize the single assistant message (thinking?, text?, then tool_use
 	// blocks in ascending Index order) and the raw executable tool-use view. The
 	// AIMessage's tool-use blocks are a DISTINCT allocation from rawCalls, so
 	// sanitizing the stored message never mutates the raw executable Input.
 	aiMsg := st.blocks.AIMessage()
+	aiMsg.Usage = usage
 	rawCalls := st.blocks.ToolUses()
 
 	// A successful stream with no usable content at all (no non-empty text, no
@@ -163,4 +165,16 @@ func runStep(ctx context.Context, cfg stepConfig, turnIndex event.TurnIndex, st 
 	st.msgs = content.AgenticMessages{aiMsg}
 	st.status = stepDone
 	return stepResult{state: st, terminal: nil}
+}
+
+// terminalUsage clones the authoritative provider usage captured at clean EOF.
+// A stream without terminal metadata remains unknown (nil), including a result
+// that reports other metadata but no usage.
+func terminalUsage(sr *inference.StreamReader[content.Chunk]) *content.Usage {
+	result, ok := sr.Result()
+	if !ok || result.Usage == nil {
+		return nil
+	}
+	usage := *result.Usage
+	return &usage
 }

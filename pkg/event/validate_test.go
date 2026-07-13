@@ -37,6 +37,7 @@ func TestValidateEventValid(t *testing.T) {
 	loopH := event.Header{Coordinates: identity.Coordinates{SessionID: sess, LoopID: loop}, EventID: evID}
 	turnH := event.Header{Coordinates: identity.Coordinates{SessionID: sess, LoopID: loop, TurnID: turn}, EventID: evID}
 	stepH := event.Header{Coordinates: identity.Coordinates{SessionID: sess, LoopID: loop, TurnID: turn, StepID: step}, EventID: evID}
+	runtime := event.ModelRuntime{Key: inference.ModelKey{Provider: "test", Model: "model"}}
 
 	tests := []struct {
 		name string
@@ -54,8 +55,8 @@ func TestValidateEventValid(t *testing.T) {
 		{"WorkspaceRestored", event.WorkspaceRestored{Header: sessionH, Ref: "v1:sha256:aabb"}},
 		{"ActiveLoopChanged", event.ActiveLoopChanged{Header: sessionH, PreviousLoopID: loop, ActiveLoopID: vID(t)}},
 		{"LoopIdle", event.LoopIdle{Header: loopH}},
-		{"LoopInferenceChanged", event.LoopInferenceChanged{Header: loopH, Model: inference.CustomModel("test", "test", "", "model")}},
-		{"LoopModeChanged", event.LoopModeChanged{Header: loopH}},
+		{"LoopInferenceChanged", event.LoopInferenceChanged{Header: loopH, Runtime: runtime}},
+		{"LoopModeChanged", event.LoopModeChanged{Header: loopH, Runtime: runtime}},
 		// LoopStarted: NEW loop in Header.Coordinates (SessionID+LoopID, Turn/Step zero);
 		// the spawning loop/turn/step rides in Header.Cause and is unconstrained by the
 		// profile (the validator never checks Cause).
@@ -66,7 +67,7 @@ func TestValidateEventValid(t *testing.T) {
 				Coordinates: identity.Coordinates{LoopID: loop, TurnID: turn, StepID: step},
 				Agency:      identity.AgencyMachine,
 			},
-		}}},
+		}, Runtime: runtime}},
 		{"InputQueued", event.InputQueued{Header: loopH}},
 		{"TurnRejected", event.TurnRejected{Header: loopH}},
 		{"TurnStarted", event.TurnStarted{Header: turnH}},

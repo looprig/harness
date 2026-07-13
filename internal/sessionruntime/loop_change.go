@@ -4,6 +4,7 @@ import (
 	"context"
 
 	"github.com/looprig/harness/pkg/command"
+	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/inference"
 )
@@ -121,11 +122,17 @@ func liveViewFor(bound loop.BoundDefinition, ri restoredInference) (loop.ModeNam
 	if bm, ok := bound.Mode(mode); ok {
 		model = bm.Model
 	}
-	if ri.HasInference {
-		m := ri.Model
-		m.Sampling = m.Sampling.Clone()
-		m.Sampling.Effort = ri.Effort
-		model = m
+	if ri.HasRuntime {
+		model = applyModelRuntime(model, ri.Runtime)
 	}
 	return mode, model
+}
+
+func applyModelRuntime(model inference.Model, runtime event.ModelRuntime) inference.Model {
+	model.Provider = runtime.Key.Provider
+	model.Name = runtime.Key.Model
+	model.Limits = runtime.Limits
+	model.Sampling = model.Sampling.Clone()
+	model.Sampling.Effort = runtime.Effort
+	return model
 }

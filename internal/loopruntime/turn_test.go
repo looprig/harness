@@ -169,6 +169,7 @@ func committedHistory(base content.AgenticMessages, user *content.UserMessage, r
 type scriptedLLM struct {
 	mu        sync.Mutex
 	scripts   [][]content.Chunk
+	results   []*inference.StreamResult
 	reqs      []inference.Request
 	calls     int
 	onStreamN map[int]func()
@@ -211,7 +212,13 @@ func (s *scriptedLLM) Stream(ctx context.Context, req inference.Request) (*infer
 		}
 		return nil, io.EOF
 	}
-	return inference.NewStreamReader(next, nil), nil
+	if n >= len(s.results) || s.results[n] == nil {
+		return inference.NewStreamReader(next, nil), nil
+	}
+	result := *s.results[n]
+	return inference.NewStreamReaderWithResult(next, nil, func() (inference.StreamResult, bool, error) {
+		return result, true, nil
+	}), nil
 }
 
 func (s *scriptedLLM) requests() []inference.Request {

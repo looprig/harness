@@ -5,14 +5,22 @@ import (
 	"github.com/looprig/inference"
 )
 
-// LoopInferenceChanged durably selects a complete secret-free model descriptor
-// and effort for this loop at the next turn boundary.
+// ModelRuntime is the single durable, secret-free description of the model
+// runtime selected for a loop. It deliberately excludes endpoint and catalog
+// data so journal replay and catalog repair do not depend on mutable config.
+type ModelRuntime struct {
+	Key    inference.ModelKey      `json:"key"`
+	Limits inference.ContextLimits `json:"limits"`
+	Effort inference.Effort        `json:"effort,omitzero"`
+}
+
+// LoopInferenceChanged durably selects the resolved secret-free runtime for
+// this loop at the next turn boundary.
 type LoopInferenceChanged struct {
 	enduring
 	loopScoped
 	Header
-	Model  inference.Model  `json:"model"`
-	Effort inference.Effort `json:"effort,omitzero"`
+	Runtime ModelRuntime `json:"runtime,omitzero"`
 }
 
 // LoopModeChanged durably selects one predeclared loop mode.
@@ -20,8 +28,9 @@ type LoopModeChanged struct {
 	enduring
 	loopScoped
 	Header
-	PreviousMode string `json:"previous_mode,omitzero"`
-	Mode         string `json:"mode,omitzero"`
+	PreviousMode string       `json:"previous_mode,omitzero"`
+	Mode         string       `json:"mode,omitzero"`
+	Runtime      ModelRuntime `json:"runtime,omitzero"`
 }
 
 // TurnStarted is emitted when runLoop commits a turn's initial UserMessage. It is
@@ -144,6 +153,10 @@ type TurnDone struct {
 	TurnIndex TurnIndex `json:"turn_index,omitzero"`
 	// Message is the complete AI response.
 	Message *content.AIMessage `json:"message,omitzero"`
+	// Usage is the checked sum of every completed request in this turn. Loop
+	// cumulative accounting folds StepDone only, so this projection is never
+	// added a second time.
+	Usage content.Usage `json:"usage,omitzero"`
 }
 
 // TurnFailed is the terminal event for non-cancellation LLM/provider errors. Err

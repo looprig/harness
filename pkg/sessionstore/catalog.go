@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -124,6 +125,18 @@ type SessionMeta struct {
 	LastStep         *eventSummary     `json:"last_step,omitempty"`
 	LastCheckpoint   CheckpointSummary `json:"last_checkpoint,omitzero"`
 	CurrentWorkspace WorkspacePointer  `json:"current_workspace,omitzero"`
+	// Loops is the deterministic, per-loop usage/runtime projection. It is sorted
+	// by LoopID bytes and rebuilt from lifecycle + StepDone events.
+	Loops []LoopUsageMeta `json:"loops,omitempty"`
+}
+
+// LoopUsageMeta is the catalog's bounded projection for one durable loop.
+// CumulativeUsage folds authoritative StepDone request usage only; TurnDone's
+// convenience projection is deliberately excluded.
+type LoopUsageMeta struct {
+	LoopID          uuid.UUID          `json:"loop_id"`
+	Runtime         event.ModelRuntime `json:"runtime,omitzero"`
+	CumulativeUsage content.Usage      `json:"cumulative_usage,omitzero"`
 }
 
 // WorkspacePointerSource identifies the transition that selected CurrentWorkspace.
@@ -231,6 +244,22 @@ type CatalogConflictError struct {
 	Attempts  int
 }
 
+// CatalogUsageError reports invalid or overflowing usage encountered while
+// building the repairable catalog projection.
+type CatalogUsageError struct {
+	LoopID uuid.UUID
+	Cause  error
+}
+
+func (e *CatalogUsageError) Error() string {
+	if e.Cause == nil {
+		return "sessionstore: catalog loop usage failed for " + e.LoopID.String()
+	}
+	return "sessionstore: catalog loop usage failed for " + e.LoopID.String() + ": " + e.Cause.Error()
+}
+
+func (e *CatalogUsageError) Unwrap() error { return e.Cause }
+
 func (e *CatalogConflictError) Error() string {
 	return "sessionstore: catalog entry for session " + e.SessionID.String() +
 		" lost the revision-CAS after " + strconv.Itoa(e.Attempts) + " attempts"
@@ -315,8 +344,9 @@ type EventReplayerOpener interface {
 // a monotonic cursor, so a lower seq (an out-of-order or replayed record) never rewinds it.
 // GatePrepared is deliberately absent: it is private and the event replayer filters it, so
 // the fold never sees it.
-func applyEvent(meta SessionMeta, ev event.Event, seq uint64, now CatalogClock) (SessionMeta, bool) {
+func applyEvent(meta SessionMeta, ev event.Event, seq uint64, now CatalogClock) (SessionMeta, bool, error) {
 	changed := true
+	newSequence := seq == 0 || seq > meta.LastJournalSeq
 	switch e := ev.(type) {
 	case event.SessionStarted:
 		meta.SessionID = e.SessionID
@@ -364,12 +394,26 @@ func applyEvent(meta SessionMeta, ev event.Event, seq uint64, now CatalogClock) 
 		meta.SessionID = e.SessionID
 		meta.LastActiveAt = now()
 		meta.LastStep = summarize(ev, seq, meta.LastStep)
+		if newSequence {
+			updated, err := accumulateStepUsage(meta.Loops, e.LoopID, e.Messages)
+			if err != nil {
+				return meta, false, err
+			}
+			meta.Loops = updated
+		}
 	case event.RestoreDone:
 		meta.SessionID = e.SessionID
 		meta.LastActiveAt = now()
 	case event.LoopStarted:
 		meta.SessionID = e.SessionID
 		meta.LoopCount++
+		meta.Loops = putLoopRuntime(meta.Loops, e.LoopID, e.Runtime)
+	case event.LoopInferenceChanged:
+		meta.SessionID = e.SessionID
+		meta.Loops = putLoopRuntime(meta.Loops, e.LoopID, e.Runtime)
+	case event.LoopModeChanged:
+		meta.SessionID = e.SessionID
+		meta.Loops = putLoopRuntime(meta.Loops, e.LoopID, e.Runtime)
 	case event.SessionStopped:
 		meta.SessionID = e.SessionID
 		meta.Status = StatusStopped
@@ -393,7 +437,69 @@ func applyEvent(meta SessionMeta, ev event.Event, seq uint64, now CatalogClock) 
 	if changed && seq > meta.LastJournalSeq {
 		meta.LastJournalSeq = seq
 	}
-	return meta, changed
+	return meta, changed, nil
+}
+
+func accumulateStepUsage(loops []LoopUsageMeta, loopID uuid.UUID, messages content.AgenticMessages) ([]LoopUsageMeta, error) {
+	requestUsage, err := usageFromStep(messages)
+	if err != nil {
+		return loops, &CatalogUsageError{LoopID: loopID, Cause: err}
+	}
+	updated := cloneLoopUsage(loops)
+	index, found := loopUsageIndex(updated, loopID)
+	if !found {
+		updated = insertLoopUsage(updated, index, LoopUsageMeta{LoopID: loopID})
+	}
+	total, err := updated[index].CumulativeUsage.Add(requestUsage)
+	if err != nil {
+		return loops, &CatalogUsageError{LoopID: loopID, Cause: err}
+	}
+	updated[index].CumulativeUsage = total
+	return updated, nil
+}
+
+func usageFromStep(messages content.AgenticMessages) (content.Usage, error) {
+	var total content.Usage
+	for _, message := range messages {
+		ai, ok := message.(*content.AIMessage)
+		if !ok || ai.Usage == nil {
+			continue
+		}
+		var err error
+		total, err = total.Add(*ai.Usage)
+		if err != nil {
+			return content.Usage{}, err
+		}
+	}
+	return total, nil
+}
+
+func putLoopRuntime(loops []LoopUsageMeta, loopID uuid.UUID, runtime event.ModelRuntime) []LoopUsageMeta {
+	updated := cloneLoopUsage(loops)
+	index, found := loopUsageIndex(updated, loopID)
+	if !found {
+		return insertLoopUsage(updated, index, LoopUsageMeta{LoopID: loopID, Runtime: runtime})
+	}
+	updated[index].Runtime = runtime
+	return updated
+}
+
+func cloneLoopUsage(loops []LoopUsageMeta) []LoopUsageMeta {
+	return append([]LoopUsageMeta(nil), loops...)
+}
+
+func loopUsageIndex(loops []LoopUsageMeta, loopID uuid.UUID) (int, bool) {
+	index := sort.Search(len(loops), func(i int) bool {
+		return bytes.Compare(loops[i].LoopID[:], loopID[:]) >= 0
+	})
+	return index, index < len(loops) && loops[index].LoopID == loopID
+}
+
+func insertLoopUsage(loops []LoopUsageMeta, index int, value LoopUsageMeta) []LoopUsageMeta {
+	loops = append(loops, LoopUsageMeta{})
+	copy(loops[index+1:], loops[index:])
+	loops[index] = value
+	return loops
 }
 
 func checkpointSummary(e event.WorkspaceCheckpointed, seq uint64) CheckpointSummary {
@@ -560,7 +666,10 @@ func (s *Store) OpenCatalog(opts ...CatalogOption) *Catalog {
 // status reader can resume from it.
 func (c *Catalog) UpdateOnEvent(ctx context.Context, ev event.Event, seq uint64) error {
 	// Decide relevance on a zero meta first so a no-op event never touches the KV.
-	if _, changed := applyEvent(SessionMeta{}, ev, seq, c.now); !changed {
+	if _, changed, err := applyEvent(SessionMeta{}, ev, seq, c.now); err != nil {
+		c.log.CatalogUpdateFailed(err)
+		return nil
+	} else if !changed {
 		return nil
 	}
 	sid := ev.EventHeader().SessionID
@@ -581,7 +690,10 @@ func (c *Catalog) upsert(ctx context.Context, sid uuid.UUID, ev event.Event, seq
 		if err != nil {
 			return err
 		}
-		updated, _ := applyEvent(current, ev, seq, c.now)
+		updated, _, foldErr := applyEvent(current, ev, seq, c.now)
+		if foldErr != nil {
+			return foldErr
+		}
 		serr := c.store(ctx, sid, rev, updated)
 		if serr == nil {
 			return nil
@@ -742,7 +854,10 @@ func (c *Catalog) foldSession(ctx context.Context, sessionID uuid.UUID, replayer
 		if _, ok := ev.(event.SessionStarted); ok {
 			sawStart = true
 		}
-		meta, _ = applyEvent(meta, ev, seq, c.now)
+		meta, _, err = applyEvent(meta, ev, seq, c.now)
+		if err != nil {
+			return SessionMeta{}, err
+		}
 	}
 	if !sawStart {
 		return SessionMeta{}, &EmptySessionError{SessionID: sessionID}

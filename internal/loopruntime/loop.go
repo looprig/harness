@@ -199,6 +199,10 @@ type effectiveConfig struct {
 	tools  ToolSet
 }
 
+func modelRuntime(model inference.Model, effort inference.Effort) event.ModelRuntime {
+	return event.ModelRuntime{Key: model.Key(), Limits: model.Limits, Effort: effort}
+}
+
 const defaultDrainTimeout = 5 * time.Second
 
 // resolveDrainTimeout applies the default when the caller leaves DrainTimeout unset.
@@ -1312,7 +1316,7 @@ func runLoop(cfg loopConfig, state loopState) {
 			return
 		}
 		next := effectiveConfig{mode: modeName, model: resolved.Model, effort: resolved.Model.Sampling.Effort, system: resolved.System, tools: resolveToolSetCaps(resolved.Tools)}
-		publish(event.LoopModeChanged{Header: changeHeader(), PreviousMode: string(state.effective.mode), Mode: string(modeName)})
+		publish(event.LoopModeChanged{Header: changeHeader(), PreviousMode: string(state.effective.mode), Mode: string(modeName), Runtime: modelRuntime(next.model, next.effort)})
 		if fp := cfg.faultProbe; fp != nil {
 			if ferr := fp.FaultErr(); ferr != nil {
 				c.Ack <- command.LoopChangeResult{Err: &loop.ChangeError{Kind: loop.ChangeDurableAppendFailed, Cause: ferr}}
@@ -1356,7 +1360,7 @@ func runLoop(cfg loopConfig, state loopState) {
 		}
 		model.Sampling = model.Sampling.Clone()
 		model.Sampling.Effort = effort // bake effort into the model the request stamps
-		publish(event.LoopInferenceChanged{Header: changeHeader(), Model: model, Effort: effort})
+		publish(event.LoopInferenceChanged{Header: changeHeader(), Runtime: modelRuntime(model, effort)})
 		if fp := cfg.faultProbe; fp != nil {
 			if ferr := fp.FaultErr(); ferr != nil {
 				c.Ack <- command.LoopChangeResult{Err: &loop.ChangeError{Kind: loop.ChangeDurableAppendFailed, Cause: ferr}}

@@ -492,6 +492,10 @@ type loopHandle struct {
 	state     tool.DelegateStatusValue
 }
 
+func runtimeForModel(model inference.Model) event.ModelRuntime {
+	return event.ModelRuntime{Key: model.Key(), Limits: model.Limits, Effort: model.Sampling.Effort}
+}
+
 func (h *loopHandle) ID() uuid.UUID { return h.id }
 func (h *loopHandle) Mode() loop.ModeName {
 	h.liveMu.RLock()
@@ -1223,7 +1227,7 @@ func (s *Session) newLoopWithAdmission(parent loop.Provenance, cfg loop.Definiti
 	// ctx param, so it publishes on the session lifetime (s.sessionCtx). The header
 	// (Coordinates/Cause + minted EventID/CreatedAt) was stamped above before the loop
 	// was built.
-	ev := event.LoopStarted{Header: startedHeader, ParentToolUseID: parentToolUseID, ForeignSID: foreignSID, InitialMode: string(startedMode), DisplayName: bound.DisplayName(), Description: bound.Description()}
+	ev := event.LoopStarted{Header: startedHeader, Runtime: runtimeForModel(liveModel), ParentToolUseID: parentToolUseID, ForeignSID: foreignSID, InitialMode: string(startedMode), DisplayName: bound.DisplayName(), Description: bound.Description()}
 	if admission != nil {
 		ev.InitialRequestID = admission.requestID
 	}

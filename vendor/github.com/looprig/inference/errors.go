@@ -1,6 +1,174 @@
 package inference
 
-import "fmt"
+import (
+	"errors"
+	"fmt"
+	"strconv"
+
+	"github.com/looprig/core/content"
+)
+
+// Leaf causes used by ContextCountError when no lower-level error exists.
+var (
+	ErrContextCountFunctionMissing           = errors.New("context count function is missing")
+	ErrContextCountQualityInvalid            = errors.New("context count quality is invalid")
+	ErrContextCountModelMismatch             = errors.New("context count model does not match request model")
+	ErrContextCountCapabilityQualityMismatch = errors.New("context count quality does not match declared capability")
+)
+
+// UsageNormalizationField identifies a normalized usage field.
+type UsageNormalizationField string
+
+const (
+	UsageNormalizationFieldInputTokens         UsageNormalizationField = "InputTokens"
+	UsageNormalizationFieldOutputTokens        UsageNormalizationField = "OutputTokens"
+	UsageNormalizationFieldCacheReadTokens     UsageNormalizationField = "CacheReadTokens"
+	UsageNormalizationFieldCacheCreationTokens UsageNormalizationField = "CacheCreationTokens"
+	UsageNormalizationFieldReasoningTokens     UsageNormalizationField = "ReasoningTokens"
+	UsageNormalizationFieldContextTokens       UsageNormalizationField = "ContextTokens"
+	UsageNormalizationFieldTotalTokens         UsageNormalizationField = "TotalTokens"
+)
+
+// UsageNormalizationReason identifies why provider usage cannot be normalized.
+type UsageNormalizationReason string
+
+const (
+	UsageNormalizationReasonNegative               UsageNormalizationReason = "negative"
+	UsageNormalizationReasonComponentsExceedTotal  UsageNormalizationReason = "components exceed total"
+	UsageNormalizationReasonOverflow               UsageNormalizationReason = "overflow"
+	UsageNormalizationReasonReasoningExceedsOutput UsageNormalizationReason = "reasoning exceeds output"
+	UsageNormalizationReasonNull                   UsageNormalizationReason = "null"
+	UsageNormalizationReasonFractional             UsageNormalizationReason = "fractional"
+	UsageNormalizationReasonOutOfRange             UsageNormalizationReason = "out of range"
+	UsageNormalizationReasonInvalidType            UsageNormalizationReason = "invalid type"
+	UsageNormalizationReasonInvalidField           UsageNormalizationReason = "invalid field"
+	UsageNormalizationReasonTotalMismatch          UsageNormalizationReason = "total mismatch"
+	UsageNormalizationReasonDomainValidation       UsageNormalizationReason = "domain validation"
+)
+
+// UsageNormalizationError reports provider usage that cannot be represented by
+// the normalized usage domain.
+type UsageNormalizationError struct {
+	Field  UsageNormalizationField
+	Reason UsageNormalizationReason
+	Value  int64
+	// Left and Right are inspection-only operands for arithmetic and
+	// relationship failures; callers should branch on Field and Reason.
+	Left  content.TokenCount
+	Right content.TokenCount
+	Cause error
+}
+
+func (e *UsageNormalizationError) Error() string {
+	message := "inference: cannot normalize usage field " + string(e.Field) + ": " + string(e.Reason)
+	switch e.Reason {
+	case UsageNormalizationReasonNegative:
+		message += " (" + strconv.FormatInt(e.Value, 10) + ")"
+	case UsageNormalizationReasonComponentsExceedTotal, UsageNormalizationReasonOverflow,
+		UsageNormalizationReasonTotalMismatch:
+		message += " (left=" + strconv.FormatUint(uint64(e.Left), 10) +
+			", right=" + strconv.FormatUint(uint64(e.Right), 10) + ")"
+	case UsageNormalizationReasonReasoningExceedsOutput:
+		if e.Left != 0 || e.Right != 0 {
+			message += " (left=" + strconv.FormatUint(uint64(e.Left), 10) +
+				", right=" + strconv.FormatUint(uint64(e.Right), 10) + ")"
+		}
+	}
+	if e.Cause != nil {
+		message += ": " + e.Cause.Error()
+	}
+	return message
+}
+
+func (e *UsageNormalizationError) Unwrap() error { return e.Cause }
+
+// ContextCountError reports a structurally invalid count result or adapter.
+type ContextCountError struct {
+	Model   ModelKey
+	Quality CountQuality
+	Cause   error
+}
+
+func (e *ContextCountError) Error() string {
+	cause := "unknown cause"
+	if e.Cause != nil {
+		cause = e.Cause.Error()
+	}
+	return fmt.Sprintf("inference: context count for model %q/%q with quality %d failed: %s", e.Model.Provider, e.Model.Model, e.Quality, cause)
+}
+
+func (e *ContextCountError) Unwrap() error { return e.Cause }
+
+// CapabilityKind identifies which trust posture failed validation.
+type CapabilityKind string
+
+const (
+	CapabilityKindCounter   CapabilityKind = "counter"
+	CapabilityKindInference CapabilityKind = "inference"
+)
+
+// CapabilityField identifies a structurally invalid capability field.
+type CapabilityField string
+
+const (
+	CapabilityFieldProvider          CapabilityField = "Provider"
+	CapabilityFieldTransport         CapabilityField = "Transport"
+	CapabilityFieldSecurityIdentity  CapabilityField = "SecurityIdentity"
+	CapabilityFieldRetention         CapabilityField = "Retention"
+	CapabilityFieldTokenizerRevision CapabilityField = "TokenizerRev"
+	CapabilityFieldQuality           CapabilityField = "Quality"
+)
+
+// CapabilityValidationReason identifies why capability metadata is invalid.
+type CapabilityValidationReason string
+
+const (
+	CapabilityValidationReasonUnknown    CapabilityValidationReason = "unknown"
+	CapabilityValidationReasonOutOfRange CapabilityValidationReason = "out of range"
+	CapabilityValidationReasonEmpty      CapabilityValidationReason = "must not be empty"
+	CapabilityValidationReasonMustBeZero CapabilityValidationReason = "must be zero"
+)
+
+// CapabilityValidationError reports invalid counter or inference metadata.
+type CapabilityValidationError struct {
+	Capability CapabilityKind
+	Field      CapabilityField
+	Reason     CapabilityValidationReason
+}
+
+func (e *CapabilityValidationError) Error() string {
+	return fmt.Sprintf("inference: invalid %s capability field %s: %s", e.Capability, e.Field, e.Reason)
+}
+
+// CounterCompatibilityReason identifies why a counter would weaken inference.
+type CounterCompatibilityReason string
+
+const (
+	CounterCompatibilityInvalidInference   CounterCompatibilityReason = "invalid inference capability"
+	CounterCompatibilityInvalidCounter     CounterCompatibilityReason = "invalid counter capability"
+	CounterCompatibilityProviderMismatch   CounterCompatibilityReason = "provider mismatch"
+	CounterCompatibilityIdentityMismatch   CounterCompatibilityReason = "security identity mismatch"
+	CounterCompatibilityTransportDowngrade CounterCompatibilityReason = "transport downgrade"
+	CounterCompatibilityRetentionDowngrade CounterCompatibilityReason = "retention downgrade"
+)
+
+// CounterCompatibilityError reports why a counter is unacceptable for an
+// inference path and preserves both inputs for deterministic inspection.
+type CounterCompatibilityError struct {
+	Inference InferenceCapability
+	Counter   CounterCapability
+	Reason    CounterCompatibilityReason
+	Cause     error
+}
+
+func (e *CounterCompatibilityError) Error() string {
+	if e.Cause != nil {
+		return fmt.Sprintf("inference: incompatible counter: %s: %v", e.Reason, e.Cause)
+	}
+	return "inference: incompatible counter: " + string(e.Reason)
+}
+
+func (e *CounterCompatibilityError) Unwrap() error { return e.Cause }
 
 // NetworkError wraps a transport-level failure (DNS, TCP, TLS).
 // Err must not be nil; a nil Err will panic on Error() — callers are responsible for providing a cause.

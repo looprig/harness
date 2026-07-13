@@ -339,6 +339,11 @@ func validateDecodedEvent(ev Event, data []byte) error {
 	if err := validateEventIdentity(ev); err != nil {
 		return err
 	}
+	if legacy, err := missingLegacyRuntime(ev, data); err != nil {
+		return err
+	} else if legacy {
+		return nil
+	}
 	if _, ok := ev.(WorkspaceCheckpointed); ok {
 		presence, err := inspectCheckpointMetadata(data)
 		if err != nil {
@@ -349,6 +354,57 @@ func validateDecodedEvent(ev Event, data []byte) error {
 		}
 	}
 	return validateEventBody(ev)
+}
+
+// missingLegacyRuntime preserves replay compatibility for lifecycle records
+// written before ModelRuntime was added. An explicitly present zero/invalid
+// runtime is current malformed input and continues through strict validation.
+func missingLegacyRuntime(ev Event, data []byte) (bool, error) {
+	name := ""
+	switch ev.(type) {
+	case LoopStarted:
+		name = "LoopStarted"
+	case LoopInferenceChanged:
+		name = "LoopInferenceChanged"
+	case LoopModeChanged:
+		name = "LoopModeChanged"
+	default:
+		return false, nil
+	}
+	present, err := inspectTopLevelField(data, name, "runtime")
+	return !present, err
+}
+
+func inspectTopLevelField(data []byte, typeName, fieldName string) (bool, error) {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	if _, err := dec.Token(); err != nil {
+		return false, &EventDecodeError{Type: typeName, Cause: err}
+	}
+	present := false
+	for dec.More() {
+		keyToken, err := dec.Token()
+		if err != nil {
+			return false, &EventDecodeError{Type: typeName, Cause: err}
+		}
+		key, ok := keyToken.(string)
+		if !ok {
+			return false, &EventDecodeError{Type: typeName, Cause: fmt.Errorf("non-string object key")}
+		}
+		var value json.RawMessage
+		if err := dec.Decode(&value); err != nil {
+			return false, &EventDecodeError{Type: typeName, Cause: err}
+		}
+		if strings.EqualFold(key, fieldName) {
+			if present {
+				return false, &EventDecodeError{Type: typeName, Cause: fmt.Errorf("duplicate %s field", fieldName)}
+			}
+			present = true
+		}
+	}
+	if _, err := dec.Token(); err != nil {
+		return false, &EventDecodeError{Type: typeName, Cause: err}
+	}
+	return present, nil
 }
 
 type checkpointMetadataPresence struct {

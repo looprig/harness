@@ -80,7 +80,8 @@ func TestLoopControllerSetModeLiveAndEvent(t *testing.T) {
 	rec.waitFor(t, func(evs []event.Event) bool {
 		for _, e := range evs {
 			if mc, ok := e.(event.LoopModeChanged); ok && mc.PreviousMode == "plan" && mc.Mode == "swap" {
-				return !mc.EventHeader().EventID.IsZero() && mc.LoopID == s.ActiveLoopID()
+				return !mc.EventHeader().EventID.IsZero() && mc.LoopID == s.ActiveLoopID() &&
+					mc.Runtime.Key == validModel("swapped").Key() && mc.Runtime.Effort == inference.EffortNone
 			}
 		}
 		return false
@@ -111,7 +112,8 @@ func TestLoopControllerChangeLiveAndEvent(t *testing.T) {
 	rec.waitFor(t, func(evs []event.Event) bool {
 		for _, e := range evs {
 			if ic, ok := e.(event.LoopInferenceChanged); ok {
-				return ic.Model.Name == "routed" && ic.Effort == inference.EffortMax && !ic.EventHeader().EventID.IsZero()
+				return ic.Runtime.Key == (inference.ModelKey{Provider: validModel("routed").Provider, Model: "routed"}) &&
+					ic.Runtime.Effort == inference.EffortMax && !ic.EventHeader().EventID.IsZero()
 			}
 		}
 		return false
@@ -243,7 +245,7 @@ func TestRestoreSeedingAgreesWithLiveView(t *testing.T) {
 		{name: "swap mode distinct model", ri: restoredInference{HasMode: true, Mode: "swap"}},
 		{
 			name: "inference override on a mode",
-			ri:   restoredInference{HasMode: true, Mode: "plan", HasInference: true, Model: inferModelWithEffort("routed", inference.EffortHigh), Effort: inference.EffortHigh},
+			ri:   restoredInference{HasMode: true, Mode: "plan", HasRuntime: true, Runtime: runtimeForModel(inferModelWithEffort("routed", inference.EffortHigh))},
 		},
 	}
 	for _, tt := range tests {
@@ -302,50 +304,50 @@ func TestRestoreSeedingAgreesWithLiveView(t *testing.T) {
 func TestFoldLoopInferenceLastWriteWins(t *testing.T) {
 	t.Parallel()
 	modeChanged := func(prev, next string) event.Event {
-		return event.LoopModeChanged{Header: event.Header{Coordinates: identity.Coordinates{LoopID: [16]byte{1}}}, PreviousMode: prev, Mode: next}
+		return event.LoopModeChanged{Header: event.Header{Coordinates: identity.Coordinates{LoopID: [16]byte{1}}}, PreviousMode: prev, Mode: next, Runtime: runtimeForModel(inferModelWithEffort(next+"-model", inference.EffortLow))}
 	}
 	infChanged := func(name string, eff inference.Effort) event.Event {
-		return event.LoopInferenceChanged{Header: event.Header{Coordinates: identity.Coordinates{LoopID: [16]byte{1}}}, Model: validModel(name), Effort: eff}
+		return event.LoopInferenceChanged{Header: event.Header{Coordinates: identity.Coordinates{LoopID: [16]byte{1}}}, Runtime: runtimeForModel(inferModelWithEffort(name, eff))}
 	}
 
 	tests := []struct {
-		name         string
-		events       []event.Event
-		wantMode     loop.ModeName
-		hasMode      bool
-		wantModel    string
-		wantEffort   inference.Effort
-		hasInference bool
+		name       string
+		events     []event.Event
+		wantMode   loop.ModeName
+		hasMode    bool
+		wantModel  string
+		wantEffort inference.Effort
+		hasRuntime bool
 	}{
-		{name: "no changes", events: nil, hasMode: false, hasInference: false},
+		{name: "no changes", events: nil, hasMode: false, hasRuntime: false},
 		{
 			name:     "last mode wins",
 			events:   []event.Event{modeChanged("", "plan"), modeChanged("plan", "build")},
-			wantMode: "build", hasMode: true, hasInference: false,
+			wantMode: "build", hasMode: true, hasRuntime: true,
 		},
 		{
-			name:         "inference after mode overrides",
-			events:       []event.Event{modeChanged("", "build"), infChanged("routed", inference.EffortHigh)},
-			wantMode:     "build",
-			hasMode:      true,
-			wantModel:    "routed",
-			wantEffort:   inference.EffortHigh,
-			hasInference: true,
+			name:       "inference after mode overrides",
+			events:     []event.Event{modeChanged("", "build"), infChanged("routed", inference.EffortHigh)},
+			wantMode:   "build",
+			hasMode:    true,
+			wantModel:  "routed",
+			wantEffort: inference.EffortHigh,
+			hasRuntime: true,
 		},
 		{
-			name:         "mode after inference resets inference",
-			events:       []event.Event{infChanged("routed", inference.EffortHigh), modeChanged("", "plan")},
-			wantMode:     "plan",
-			hasMode:      true,
-			hasInference: false,
+			name:       "mode after inference resets inference",
+			events:     []event.Event{infChanged("routed", inference.EffortHigh), modeChanged("", "plan")},
+			wantMode:   "plan",
+			hasMode:    true,
+			hasRuntime: true,
 		},
 		{
-			name:         "inference only, no mode change",
-			events:       []event.Event{infChanged("routed", inference.EffortMax)},
-			hasMode:      false,
-			wantModel:    "routed",
-			wantEffort:   inference.EffortMax,
-			hasInference: true,
+			name:       "inference only, no mode change",
+			events:     []event.Event{infChanged("routed", inference.EffortMax)},
+			hasMode:    false,
+			wantModel:  "routed",
+			wantEffort: inference.EffortMax,
+			hasRuntime: true,
 		},
 	}
 	for _, tt := range tests {
@@ -356,11 +358,11 @@ func TestFoldLoopInferenceLastWriteWins(t *testing.T) {
 			if got.HasMode != tt.hasMode || got.Mode != tt.wantMode {
 				t.Fatalf("mode = %q (has %v), want %q (has %v)", got.Mode, got.HasMode, tt.wantMode, tt.hasMode)
 			}
-			if got.HasInference != tt.hasInference {
-				t.Fatalf("hasInference = %v, want %v", got.HasInference, tt.hasInference)
+			if got.HasRuntime != tt.hasRuntime {
+				t.Fatalf("hasRuntime = %v, want %v", got.HasRuntime, tt.hasRuntime)
 			}
-			if tt.hasInference && (got.Model.Name != tt.wantModel || got.Effort != tt.wantEffort) {
-				t.Fatalf("inference = %q/%q, want %q/%q", got.Model.Name, got.Effort, tt.wantModel, tt.wantEffort)
+			if tt.wantModel != "" && (got.Runtime.Key.Model != tt.wantModel || got.Runtime.Effort != tt.wantEffort) {
+				t.Fatalf("runtime = %q/%q, want %q/%q", got.Runtime.Key.Model, got.Runtime.Effort, tt.wantModel, tt.wantEffort)
 			}
 		})
 	}
@@ -376,25 +378,25 @@ func TestFoldLoopInferenceLastWriteWins(t *testing.T) {
 func TestFoldLoopInferenceSeedsInitialMode(t *testing.T) {
 	t.Parallel()
 	started := func(mode string) event.Event {
-		return event.LoopStarted{Header: event.Header{Coordinates: identity.Coordinates{LoopID: [16]byte{1}}}, InitialMode: mode}
+		return event.LoopStarted{Header: event.Header{Coordinates: identity.Coordinates{LoopID: [16]byte{1}}}, InitialMode: mode, Runtime: runtimeForModel(validModel("start-model"))}
 	}
 	modeChanged := func(prev, next string) event.Event {
-		return event.LoopModeChanged{Header: event.Header{Coordinates: identity.Coordinates{LoopID: [16]byte{1}}}, PreviousMode: prev, Mode: next}
+		return event.LoopModeChanged{Header: event.Header{Coordinates: identity.Coordinates{LoopID: [16]byte{1}}}, PreviousMode: prev, Mode: next, Runtime: runtimeForModel(validModel("mode-model"))}
 	}
 	infChanged := func(name string, eff inference.Effort) event.Event {
-		return event.LoopInferenceChanged{Header: event.Header{Coordinates: identity.Coordinates{LoopID: [16]byte{1}}}, Model: validModel(name), Effort: eff}
+		return event.LoopInferenceChanged{Header: event.Header{Coordinates: identity.Coordinates{LoopID: [16]byte{1}}}, Runtime: runtimeForModel(inferModelWithEffort(name, eff))}
 	}
 	tests := []struct {
-		name         string
-		events       []event.Event
-		wantMode     loop.ModeName
-		hasMode      bool
-		hasInference bool
+		name       string
+		events     []event.Event
+		wantMode   loop.ModeName
+		hasMode    bool
+		hasRuntime bool
 	}{
-		{name: "selected initial mode seeds baseline", events: []event.Event{started("review")}, wantMode: "review", hasMode: true},
-		{name: "empty initial mode is definition default", events: []event.Event{started("")}, hasMode: false},
-		{name: "later mode change overrides start mode", events: []event.Event{started("review"), modeChanged("review", "build")}, wantMode: "build", hasMode: true},
-		{name: "inference override keeps start mode", events: []event.Event{started("review"), infChanged("routed", inference.EffortHigh)}, wantMode: "review", hasMode: true, hasInference: true},
+		{name: "selected initial mode seeds baseline", events: []event.Event{started("review")}, wantMode: "review", hasMode: true, hasRuntime: true},
+		{name: "empty initial mode is definition default", events: []event.Event{started("")}, hasMode: false, hasRuntime: true},
+		{name: "later mode change overrides start mode", events: []event.Event{started("review"), modeChanged("review", "build")}, wantMode: "build", hasMode: true, hasRuntime: true},
+		{name: "inference override keeps start mode", events: []event.Event{started("review"), infChanged("routed", inference.EffortHigh)}, wantMode: "review", hasMode: true, hasRuntime: true},
 	}
 	for _, tt := range tests {
 		tt := tt
@@ -404,8 +406,8 @@ func TestFoldLoopInferenceSeedsInitialMode(t *testing.T) {
 			if got.HasMode != tt.hasMode || got.Mode != tt.wantMode {
 				t.Fatalf("mode = %q (has %v), want %q (has %v)", got.Mode, got.HasMode, tt.wantMode, tt.hasMode)
 			}
-			if got.HasInference != tt.hasInference {
-				t.Fatalf("hasInference = %v, want %v", got.HasInference, tt.hasInference)
+			if got.HasRuntime != tt.hasRuntime {
+				t.Fatalf("hasRuntime = %v, want %v", got.HasRuntime, tt.hasRuntime)
 			}
 		})
 	}

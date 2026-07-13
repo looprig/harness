@@ -1,8 +1,8 @@
-.PHONY: test fmt fmt-check lint vuln verify secure fuzz
+.PHONY: test fmt fmt-check vendor vendor-scrub vendor-check lint vuln verify secure fuzz
 
 # Module's own package dirs, excluding vendor/ and the nested .worktrees/ modules
 # (go list ./... stops at nested module boundaries and skips vendor).
-GO_DIRS := $(shell go list -f '{{.Dir}}' ./...)
+GO_DIRS = $(shell go list -f '{{.Dir}}' ./...)
 
 # Build from the vendored dependency tree: offline, reproducible, and auditable
 # (every dependency's source lives in vendor/ and shows up in review diffs). Go
@@ -10,6 +10,12 @@ GO_DIRS := $(shell go list -f '{{.Dir}}' ./...)
 # stray global GOFLAGS (e.g. -mod=mod) can't silently switch the build off the
 # vendored tree. Do NOT use -mod=readonly here — it ignores vendor/ entirely.
 export GOFLAGS := -mod=vendor
+
+VENDOR_DIR ?= vendor
+LOCAL_REPLACE_VENDOR_DIRS := \
+	$(VENDOR_DIR)/github.com/looprig/core \
+	$(VENDOR_DIR)/github.com/looprig/inference \
+	$(VENDOR_DIR)/github.com/looprig/storage
 
 test:
 	go test -race ./...
@@ -25,7 +31,24 @@ fmt-check:
 		echo "gofmt needed (run 'make fmt'):"; echo "$$unformatted"; exit 1; \
 	fi
 
-lint: fmt-check
+# Refresh the auditable dependency tree, then remove only VCS metadata donated
+# by the three declared local replace targets. A final whole-tree check catches
+# metadata from any other source instead of broadening the scrub silently.
+vendor:
+	go mod vendor
+	$(MAKE) vendor-scrub
+	$(MAKE) vendor-check
+
+vendor-scrub:
+	rm -rf $(addsuffix /.git,$(LOCAL_REPLACE_VENDOR_DIRS))
+
+vendor-check:
+	@metadata=$$(find "$(VENDOR_DIR)" -name .git -print); \
+	if [ -n "$$metadata" ]; then \
+		echo "forbidden VCS metadata in $(VENDOR_DIR):"; echo "$$metadata"; exit 1; \
+	fi
+
+lint: fmt-check vendor-check
 	go vet ./...
 	go tool staticcheck ./...
 	# gosec is NOT module-aware: its ./... is a filesystem walk that descends into

@@ -134,12 +134,12 @@ github.com/gorilla/websocket
 # github.com/invopop/jsonschema v0.13.0
 ## explicit; go 1.18
 github.com/invopop/jsonschema
-# github.com/looprig/core v0.1.0 => ../core
+# github.com/looprig/core v0.2.0 => ../core
 ## explicit; go 1.25.0
 github.com/looprig/core/content
 github.com/looprig/core/content/streamaccumulator
 github.com/looprig/core/uuid
-# github.com/looprig/inference v0.1.0 => ../inference
+# github.com/looprig/inference v0.2.0 => ../inference
 ## explicit; go 1.26.4
 github.com/looprig/inference
 # github.com/looprig/storage v0.2.0 => ../storage

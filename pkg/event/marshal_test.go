@@ -183,14 +183,14 @@ func TestEventBodyJSONKeysAreStableSnakeCase(t *testing.T) {
 			wantKeys: []string{"previous_loop_id", "active_loop_id"},
 		},
 		{
-			name:     "LoopInferenceChanged carries model and effort",
-			event:    LoopInferenceChanged{Header: hdr, Model: inference.CustomModel("test", "test", "", "model"), Effort: inference.EffortHigh},
-			wantKeys: []string{"model", "effort"},
+			name:     "LoopInferenceChanged carries resolved runtime",
+			event:    LoopInferenceChanged{Header: hdr, Runtime: sampleRuntime()},
+			wantKeys: []string{"runtime"},
 		},
 		{
 			name:     "LoopModeChanged carries previous and selected modes",
-			event:    LoopModeChanged{Header: hdr, PreviousMode: "plan", Mode: "build"},
-			wantKeys: []string{"previous_mode", "mode"},
+			event:    LoopModeChanged{Header: hdr, PreviousMode: "plan", Mode: "build", Runtime: sampleRuntime()},
+			wantKeys: []string{"previous_mode", "mode", "runtime"},
 		},
 		{
 			name:     "WorkspaceCheckpointed carries snapshot metadata",
@@ -204,8 +204,8 @@ func TestEventBodyJSONKeysAreStableSnakeCase(t *testing.T) {
 		},
 		{
 			name:     "LoopStarted carries initial mode",
-			event:    LoopStarted{Header: hdr, InitialMode: "plan"},
-			wantKeys: []string{"initial_mode"},
+			event:    LoopStarted{Header: hdr, InitialMode: "plan", Runtime: sampleRuntime()},
+			wantKeys: []string{"initial_mode", "runtime"},
 		},
 	}
 
@@ -351,6 +351,14 @@ func sampleMessages() content.AgenticMessages {
 	}
 }
 
+func sampleRuntime() ModelRuntime {
+	return ModelRuntime{
+		Key:    inference.ModelKey{Provider: "openai", Model: "gpt-5"},
+		Limits: inference.ContextLimits{WindowTokens: 128_000, MaxOutputTokens: 16_384},
+		Effort: inference.EffortHigh,
+	}
+}
+
 // TestMarshalEventRoundTripEnduring is the exhaustive fidelity table: one instance
 // of every Enduring event type round-trips through MarshalEvent/UnmarshalEvent
 // deep-equal to the original. TurnFailed.Err and RestoreErrored.Err are compared
@@ -389,14 +397,14 @@ func TestMarshalEventRoundTripEnduring(t *testing.T) {
 		{"SecurityCeilingChanged zero", SecurityCeilingChanged{Header: fullHeaderSession()}},
 		// RestoreErrored.Err handled in the dedicated err-projection test below.
 		{"LoopIdle", LoopIdle{Header: fullHeaderLoop()}},
-		{"LoopStarted", LoopStarted{Header: fullHeaderLoop()}},
-		{"LoopStarted with AgentName", LoopStarted{Header: loopHeaderWithAgent("operator")}},
-		{"LoopStarted with ParentToolUseID", LoopStarted{Header: fullHeaderLoop(), ParentToolUseID: "toolu_abc123"}},
-		{"LoopStarted with ForeignSID", LoopStarted{Header: fullHeaderLoop(), ForeignSID: "11111111-1111-1111-1111-111111111111"}},
-		{"LoopStarted with InitialMode", LoopStarted{Header: fullHeaderLoop(), InitialMode: "plan"}},
+		{"LoopStarted", LoopStarted{Header: fullHeaderLoop(), Runtime: sampleRuntime()}},
+		{"LoopStarted with AgentName", LoopStarted{Header: loopHeaderWithAgent("operator"), Runtime: sampleRuntime()}},
+		{"LoopStarted with ParentToolUseID", LoopStarted{Header: fullHeaderLoop(), ParentToolUseID: "toolu_abc123", Runtime: sampleRuntime()}},
+		{"LoopStarted with ForeignSID", LoopStarted{Header: fullHeaderLoop(), ForeignSID: "11111111-1111-1111-1111-111111111111", Runtime: sampleRuntime()}},
+		{"LoopStarted with InitialMode", LoopStarted{Header: fullHeaderLoop(), InitialMode: "plan", Runtime: sampleRuntime()}},
 		{"DelegateRequestAccepted", DelegateRequestAccepted{Header: eventHeaderWithCommand(fullHeaderLoop(), seededUUID(0x66))}},
-		{"LoopInferenceChanged", LoopInferenceChanged{Header: fullHeaderLoop(), Model: inference.CustomModel("openai", "responses", "https://api.openai.com", "gpt-5"), Effort: inference.EffortHigh}},
-		{"LoopModeChanged", LoopModeChanged{Header: fullHeaderLoop(), PreviousMode: "plan", Mode: "build"}},
+		{"LoopInferenceChanged", LoopInferenceChanged{Header: fullHeaderLoop(), Runtime: sampleRuntime()}},
+		{"LoopModeChanged", LoopModeChanged{Header: fullHeaderLoop(), PreviousMode: "plan", Mode: "build", Runtime: sampleRuntime()}},
 		{"ForeignSessionBound", ForeignSessionBound{Header: fullHeaderLoop(), ForeignSID: "sid"}},
 		{"TurnStarted", TurnStarted{Header: fullHeaderTurn(), TurnIndex: 7, Message: userMsg("hi")}},
 		{"StepDone", StepDone{Header: fullHeader(), Messages: sampleMessages()}},
@@ -815,10 +823,10 @@ func TestUnmarshalEventRejectsMalformed(t *testing.T) {
 func FuzzDecodeEvent(f *testing.F) {
 	seedEvents := []Event{
 		SessionStarted{Header: fullHeaderSession(), Config: ConfigFingerprint{ModelID: "m"}},
-		LoopStarted{Header: fullHeaderLoop()},
+		LoopStarted{Header: fullHeaderLoop(), Runtime: sampleRuntime()},
 		ActiveLoopChanged{Header: fullHeaderSession(), ActiveLoopID: seededUUID(0x76)},
-		LoopInferenceChanged{Header: fullHeaderLoop(), Model: inference.CustomModel("test", "test", "", "model")},
-		LoopModeChanged{Header: fullHeaderLoop(), PreviousMode: "plan", Mode: "build"},
+		LoopInferenceChanged{Header: fullHeaderLoop(), Runtime: sampleRuntime()},
+		LoopModeChanged{Header: fullHeaderLoop(), PreviousMode: "plan", Mode: "build", Runtime: sampleRuntime()},
 		WorkspaceCheckpointed{Header: checkpointHeader(), Ref: "v1:sha256:x", Consistency: SnapshotFuzzy, Trigger: SnapshotTriggerManual},
 		WorkspaceRestored{Header: fullHeaderSession(), Ref: "v1:sha256:x"},
 		TurnStarted{Header: fullHeaderTurn(), TurnIndex: 1, Message: userMsg("hi")},
