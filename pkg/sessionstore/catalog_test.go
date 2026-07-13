@@ -44,6 +44,10 @@ func userMsg(text string) *content.UserMessage {
 	}}
 }
 
+func validStepMessages() content.AgenticMessages {
+	return content.AgenticMessages{&content.AIMessage{Message: content.Message{Role: content.RoleAssistant}}}
+}
+
 // hdr builds an event.Header carrying only the session id — the coordinates a
 // session-scoped catalog event needs.
 func hdr(sid uuid.UUID) event.Header {
@@ -392,7 +396,7 @@ func TestApplyEvent(t *testing.T) {
 		{
 			name:        "StepDone bumps LastActiveAt",
 			start:       SessionMeta{SessionID: sid},
-			ev:          event.StepDone{Header: hdr(sid)},
+			ev:          event.StepDone{Header: hdr(sid), Messages: validStepMessages()},
 			wantChanged: true,
 			check: func(t *testing.T, m SessionMeta) {
 				if !m.LastActiveAt.Equal(active) {
@@ -627,7 +631,7 @@ func TestApplyEventStatusFold(t *testing.T) {
 		{
 			name:        "StepDone records LastStep and bumps LastJournalSeq",
 			start:       SessionMeta{SessionID: sid, LastJournalSeq: 3},
-			ev:          event.StepDone{Header: hdr(sid)},
+			ev:          event.StepDone{Header: hdr(sid), Messages: validStepMessages()},
 			seq:         20,
 			wantChanged: true,
 			check: func(t *testing.T, m SessionMeta) {
@@ -711,7 +715,7 @@ func TestSessionMetaStatusRoundTrip(t *testing.T) {
 	stepEv := event.StepDone{Header: event.Header{
 		Coordinates: identity.Coordinates{SessionID: sid, LoopID: lid, TurnID: tid, StepID: fixedUUID(0x27)},
 		EventID:     fixedUUID(0x28),
-	}}
+	}, Messages: validStepMessages()}
 	turnSum, err := newEventSummary(turnEv, 10)
 	if err != nil {
 		t.Fatalf("newEventSummary(TurnDone) = %v", err)

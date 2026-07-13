@@ -77,6 +77,7 @@ func buildGateRestoreStream(t *testing.T, store *sessionstore.Store, cfg loop.De
 			h.AgentName = "agent"
 			return h
 		}(),
+		Runtime: runtimeFromFingerprint(fingerprintFromDefinition(cfg)),
 	})
 
 	coords := identity.Coordinates{SessionID: sessionID, LoopID: rootLoopID, TurnID: turnID, StepID: stepID}

@@ -178,6 +178,14 @@ func newOriginalHub(t *testing.T, store *sessionstore.Store, fp event.ConfigFing
 	return newOriginalHubNamed(t, store, fp, "agent")
 }
 
+func runtimeFromFingerprint(fp event.ConfigFingerprint) event.ModelRuntime {
+	modelID := fp.ModelID
+	if modelID == "" {
+		modelID = "test-model"
+	}
+	return event.ModelRuntime{Key: inference.ModelKey{Provider: "lmstudio", Model: modelID}}
+}
+
 // newOriginalHubNamed wires a journal-backed hub for an original run (the durable-tap
 // wiring): a real SessionJournal over a freshly-acquired lease, a JournalEventAppender as
 // the hub's required durable tap, and a deterministic Factory. It stamps the root
@@ -212,6 +220,7 @@ func newOriginalHubNamed(t *testing.T, store *sessionstore.Store, fp event.Confi
 			Coordinates: identity.Coordinates{SessionID: sessionID, LoopID: rootLoopID},
 			AgentName:   agentName,
 		},
+		Runtime: runtimeFromFingerprint(fp),
 	})
 	return h, sessionID, rootLoopID, lease, es
 }
@@ -419,7 +428,7 @@ func buildTwoLoopRun(t *testing.T, store *sessionstore.Store, fp event.ConfigFin
 	es.stamp(t, ctx, h, event.LoopStarted{Header: event.Header{
 		Coordinates: identity.Coordinates{SessionID: sessionID, LoopID: subLoopID},
 		Cause:       identity.Cause{Coordinates: identity.Coordinates{LoopID: rootLoopID}, Agency: identity.AgencyMachine},
-	}})
+	}, Runtime: runtimeFromFingerprint(fp)})
 	es.stamp(t, ctx, h, event.TurnStarted{Header: event.Header{Coordinates: sTurnCoord}, TurnIndex: 1, Message: foldUserMsg("SUBAGENT user")})
 	es.stamp(t, ctx, h, event.StepDone{Header: event.Header{Coordinates: sStepCoord}, Messages: content.AgenticMessages{aiMessage("SUBAGENT reply")}})
 	es.stamp(t, ctx, h, event.TurnDone{Header: event.Header{Coordinates: sTurnCoord}, TurnIndex: 1, Message: aiMessage("SUBAGENT reply")})
@@ -476,7 +485,7 @@ func buildRunWithSubagents(t *testing.T, store *sessionstore.Store, fp event.Con
 		es.stamp(t, ctx, h, event.LoopStarted{Header: event.Header{
 			Coordinates: identity.Coordinates{SessionID: sessionID, LoopID: subLoopID},
 			Cause:       identity.Cause{Coordinates: identity.Coordinates{LoopID: rootLoopID}, Agency: identity.AgencyMachine},
-		}})
+		}, Runtime: runtimeFromFingerprint(fp)})
 	}
 
 	snapCtx, snapCancel := context.WithTimeout(context.Background(), 10*time.Second)
