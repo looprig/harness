@@ -15,12 +15,8 @@ import (
 )
 
 const (
-	maxNameBytes         = 128
-	maxSystemPromptBytes = 256 * 1024
-	maxRevisionBytes     = 256
-	maxPayloadBytes      = 16 * 1024 * 1024
-	maxTimeout           = 24 * time.Hour
-	reservedNamePrefix   = "_looprig."
+	maxPayloadBytes    = 16 * 1024 * 1024
+	reservedNamePrefix = "_looprig."
 )
 
 // Name is the stable registration name of one hustle definition.
@@ -231,9 +227,6 @@ func validateDefinitionOptions(options *definitionOptions) error {
 	if strings.HasPrefix(trimmedName, reservedNamePrefix) {
 		return &DefinitionError{Kind: DefinitionReservedName, Field: "name"}
 	}
-	if len(options.name) > maxNameBytes {
-		return &DefinitionError{Kind: DefinitionInvalidName, Field: "name"}
-	}
 	if options.participation != ParticipationBlocking && options.participation != ParticipationBackground {
 		return &DefinitionError{Kind: DefinitionInvalidParticipation, Field: "participation"}
 	}
@@ -245,22 +238,22 @@ func validateDefinitionOptions(options *definitionOptions) error {
 			return err
 		}
 	}
-	if options.timeout <= 0 || options.timeout > maxTimeout {
+	if options.timeout <= 0 {
 		return &DefinitionError{Kind: DefinitionInvalidTimeout, Field: "timeout"}
 	}
 	if invalidLimits(options.limits) {
 		return &DefinitionError{Kind: DefinitionInvalidLimits, Field: "limits"}
 	}
-	if strings.TrimSpace(options.systemPrompt) == "" || len(options.systemPrompt) > maxSystemPromptBytes {
+	if strings.TrimSpace(options.systemPrompt) == "" {
 		return &DefinitionError{Kind: DefinitionInvalidSystemPrompt, Field: "system_prompt"}
 	}
-	if strings.TrimSpace(options.promptRevision) == "" || len(options.promptRevision) > maxRevisionBytes {
+	if strings.TrimSpace(options.promptRevision) == "" {
 		return &DefinitionError{Kind: DefinitionInvalidPromptRevision, Field: "prompt_revision"}
 	}
 	if _, exists := options.seen["policy_revision"]; !exists {
 		return &DefinitionError{Kind: DefinitionMissingPolicyRevision, Field: "policy_revision"}
 	}
-	if strings.TrimSpace(options.policyRevision) == "" || len(options.policyRevision) > maxRevisionBytes {
+	if strings.TrimSpace(options.policyRevision) == "" {
 		return &DefinitionError{Kind: DefinitionInvalidPolicyRevision, Field: "policy_revision"}
 	}
 	return nil
@@ -275,6 +268,9 @@ func validateInferenceBinding(binding InferenceBinding) error {
 	}
 	if err := binding.Model.Key().Validate(); err != nil {
 		return &DefinitionError{Kind: DefinitionInvalidModel, Field: "model_key", Cause: err}
+	}
+	if !binding.Model.Sampling.Effort.Valid() {
+		return &DefinitionError{Kind: DefinitionInvalidModel, Field: "model.sampling.effort"}
 	}
 	return nil
 }
@@ -450,6 +446,9 @@ func validateResolvedBinding(binding InferenceBinding) error {
 	}
 	if err := binding.Model.Key().Validate(); err != nil {
 		return &ResolveError{Kind: ResolveInvalidBinding, Cause: err}
+	}
+	if !binding.Model.Sampling.Effort.Valid() {
+		return &ResolveError{Kind: ResolveInvalidBinding}
 	}
 	return nil
 }

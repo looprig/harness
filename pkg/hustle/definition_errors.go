@@ -6,7 +6,6 @@ type DefinitionErrorKind string
 const (
 	DefinitionMissingName           DefinitionErrorKind = "missing_name"
 	DefinitionReservedName          DefinitionErrorKind = "reserved_name"
-	DefinitionInvalidName           DefinitionErrorKind = "invalid_name"
 	DefinitionNilOption             DefinitionErrorKind = "nil_option"
 	DefinitionDuplicateOption       DefinitionErrorKind = "duplicate_option"
 	DefinitionInvalidParticipation  DefinitionErrorKind = "invalid_participation"

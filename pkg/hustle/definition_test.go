@@ -159,7 +159,7 @@ func TestDefineValidation(t *testing.T) {
 		{name: "duplicate policy revision", opts: append(validNamedOptions(client, model), WithPolicyRevision("other")), kind: DefinitionDuplicateOption},
 		{name: "blank name", opts: replaceOption(validNamedOptions(client, model), 0, WithName(" \t")), kind: DefinitionMissingName},
 		{name: "reserved name", opts: replaceOption(validNamedOptions(client, model), 0, WithName("_looprig.internal")), kind: DefinitionReservedName},
-		{name: "long name", opts: replaceOption(validNamedOptions(client, model), 0, WithName(Name(strings.Repeat("n", maxNameBytes+1)))), kind: DefinitionInvalidName},
+		{name: "long name accepted", opts: replaceOption(validNamedOptions(client, model), 0, WithName(Name(strings.Repeat("n", 129))))},
 		{name: "missing participation", opts: withoutOption(validNamedOptions(client, model), 1), kind: DefinitionInvalidParticipation},
 		{name: "unknown participation", opts: replaceOption(validNamedOptions(client, model), 1, WithParticipation(Participation(99))), kind: DefinitionInvalidParticipation},
 		{name: "missing model source", opts: withoutOption(validNamedOptions(client, model), 4), kind: DefinitionMissingModelSource},
@@ -167,22 +167,23 @@ func TestDefineValidation(t *testing.T) {
 		{name: "typed nil named client", opts: replaceOption(validNamedOptions(client, model), 4, WithNamedInference(typedNilClient, model)), kind: DefinitionInvalidClient},
 		{name: "invalid named model", opts: replaceOption(validNamedOptions(client, model), 4, WithNamedInference(client, inference.Model{})), kind: DefinitionInvalidModel},
 		{name: "model missing durable provider", opts: replaceOption(validNamedOptions(client, model), 4, WithNamedInference(client, modelWithoutProvider(model))), kind: DefinitionInvalidModel},
+		{name: "invalid named model effort", opts: replaceOption(validNamedOptions(client, model), 4, WithNamedInference(client, modelWithEffort(model, inference.Effort("bogus")))), kind: DefinitionInvalidModel},
 		{name: "zero timeout", opts: replaceOption(validNamedOptions(client, model), 2, WithTimeout(0)), kind: DefinitionInvalidTimeout},
 		{name: "negative timeout", opts: replaceOption(validNamedOptions(client, model), 2, WithTimeout(-time.Nanosecond)), kind: DefinitionInvalidTimeout},
-		{name: "excessive timeout", opts: replaceOption(validNamedOptions(client, model), 2, WithTimeout(maxTimeout+time.Nanosecond)), kind: DefinitionInvalidTimeout},
+		{name: "long timeout accepted", opts: replaceOption(validNamedOptions(client, model), 2, WithTimeout(24*time.Hour+time.Nanosecond))},
 		{name: "zero input limit", opts: replaceOption(validNamedOptions(client, model), 3, WithLimits(Limits{InputBytes: 0, OutputBytes: 1})), kind: DefinitionInvalidLimits},
 		{name: "negative output limit", opts: replaceOption(validNamedOptions(client, model), 3, WithLimits(Limits{InputBytes: 1, OutputBytes: -1})), kind: DefinitionInvalidLimits},
 		{name: "excessive input limit", opts: replaceOption(validNamedOptions(client, model), 3, WithLimits(Limits{InputBytes: maxPayloadBytes + 1, OutputBytes: 1})), kind: DefinitionInvalidLimits},
 		{name: "excessive output limit", opts: replaceOption(validNamedOptions(client, model), 3, WithLimits(Limits{InputBytes: 1, OutputBytes: maxPayloadBytes + 1})), kind: DefinitionInvalidLimits},
 		{name: "blank system prompt", opts: replaceOption(validNamedOptions(client, model), 5, WithSystemPrompt(" \n", "prompt-v1")), kind: DefinitionInvalidSystemPrompt},
-		{name: "excessive system prompt", opts: replaceOption(validNamedOptions(client, model), 5, WithSystemPrompt(strings.Repeat("p", maxSystemPromptBytes+1), "prompt-v1")), kind: DefinitionInvalidSystemPrompt},
+		{name: "long system prompt accepted", opts: replaceOption(validNamedOptions(client, model), 5, WithSystemPrompt(strings.Repeat("p", 256*1024+1), "prompt-v1"))},
 		{name: "blank prompt revision", opts: replaceOption(validNamedOptions(client, model), 5, WithSystemPrompt("prompt", " \t")), kind: DefinitionInvalidPromptRevision},
-		{name: "excessive prompt revision", opts: replaceOption(validNamedOptions(client, model), 5, WithSystemPrompt("prompt", strings.Repeat("r", maxRevisionBytes+1))), kind: DefinitionInvalidPromptRevision},
+		{name: "long prompt revision accepted", opts: replaceOption(validNamedOptions(client, model), 5, WithSystemPrompt("prompt", strings.Repeat("r", 257)))},
 		{name: "missing policy revision", opts: withoutOption(validNamedOptions(client, model), 6), kind: DefinitionMissingPolicyRevision},
 		{name: "blank policy revision", opts: replaceOption(validNamedOptions(client, model), 6, WithPolicyRevision("")), kind: DefinitionInvalidPolicyRevision},
-		{name: "excessive policy revision", opts: replaceOption(validNamedOptions(client, model), 6, WithPolicyRevision(strings.Repeat("r", maxRevisionBytes+1))), kind: DefinitionInvalidPolicyRevision},
+		{name: "long policy revision accepted", opts: replaceOption(validNamedOptions(client, model), 6, WithPolicyRevision(strings.Repeat("r", 257)))},
 		{name: "minimum boundaries", opts: []Option{WithName("n"), WithParticipation(ParticipationBlocking), WithTimeout(time.Nanosecond), WithLimits(Limits{InputBytes: 1, OutputBytes: 1}), WithNamedInference(client, model), WithSystemPrompt("p", "r"), WithPolicyRevision("r")}},
-		{name: "maximum boundaries", opts: []Option{WithName(Name(strings.Repeat("n", maxNameBytes))), WithParticipation(ParticipationBackground), WithTimeout(maxTimeout), WithLimits(Limits{InputBytes: maxPayloadBytes, OutputBytes: maxPayloadBytes}), WithCurrentLoopModel(), WithSystemPrompt(strings.Repeat("p", maxSystemPromptBytes), strings.Repeat("r", maxRevisionBytes)), WithPolicyRevision(strings.Repeat("r", maxRevisionBytes))}},
+		{name: "maximum payload boundaries", opts: []Option{WithName("payload-boundary"), WithParticipation(ParticipationBackground), WithTimeout(time.Second), WithLimits(Limits{InputBytes: maxPayloadBytes, OutputBytes: maxPayloadBytes}), WithCurrentLoopModel(), WithSystemPrompt("p", "r"), WithPolicyRevision("r")}},
 	}
 	for _, tt := range tests {
 		tt := tt
@@ -401,6 +402,7 @@ func TestResolveInference(t *testing.T) {
 		{name: "resolver failure preserved", resolver: &testResolver{wantID: loopID, err: resolverCause}, ctx: context.Background(), loopID: loopID, kind: ResolveModelFailed, wantErr: true, wantCause: resolverCause},
 		{name: "nil resolved client", resolver: &testResolver{wantID: loopID, binding: InferenceBinding{Model: validModel("live")}}, ctx: context.Background(), loopID: loopID, kind: ResolveInvalidBinding, wantErr: true},
 		{name: "invalid resolved model", resolver: &testResolver{wantID: loopID, binding: InferenceBinding{Client: client}}, ctx: context.Background(), loopID: loopID, kind: ResolveInvalidBinding, wantErr: true},
+		{name: "invalid resolved model effort", resolver: &testResolver{wantID: loopID, binding: InferenceBinding{Client: client, Model: modelWithEffort(validModel("live"), inference.Effort("bogus"))}}, ctx: context.Background(), loopID: loopID, kind: ResolveInvalidBinding, wantErr: true},
 	}
 	for _, tt := range tests {
 		tt := tt
@@ -495,6 +497,11 @@ func modelWithoutProvider(model inference.Model) inference.Model {
 
 func modelWithTemperature(model inference.Model, value float64) inference.Model {
 	model.Sampling.Temperature = &value
+	return model
+}
+
+func modelWithEffort(model inference.Model, effort inference.Effort) inference.Model {
+	model.Sampling.Effort = effort
 	return model
 }
 
