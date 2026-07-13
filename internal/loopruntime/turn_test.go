@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"reflect"
 	"sync"
 	"testing"
 
@@ -463,8 +464,8 @@ func TestRunTurnAgentic(t *testing.T) {
 		if len(sds[1].Messages) != 1 {
 			t.Fatalf("StepDone[1].Messages len = %d, want 1 (final AIMessage only)", len(sds[1].Messages))
 		}
-		if sds[1].Messages[0] != done.Message {
-			t.Errorf("StepDone[1].Messages[0] must be the final assistant message (== TurnDone.Message)")
+		if !reflect.DeepEqual(sds[1].Messages[0], done.Message) {
+			t.Errorf("StepDone[1].Messages[0] differs from the final assistant message")
 		}
 
 		// committed history: user, assistant(tool_use), tool message, assistant(text).
@@ -495,8 +496,8 @@ func TestRunTurnAgentic(t *testing.T) {
 		if _, ok := msgs[3].(*content.AIMessage); !ok {
 			t.Errorf("msgs[3] = %T, want *AIMessage", msgs[3])
 		}
-		if done.Message != msgs[3] {
-			t.Errorf("TurnDone.Message must be the final assistant message")
+		if !reflect.DeepEqual(done.Message, msgs[3]) {
+			t.Errorf("TurnDone.Message differs from committed final assistant message")
 		}
 		tu, tmCount := countToolUseInHistory(msgs)
 		if tu != tmCount {
@@ -714,8 +715,8 @@ func TestRunTurnAgentic(t *testing.T) {
 		if len(msgs) != 1+1+6 {
 			t.Fatalf("committed history len = %d, want 8 (pre, user, 3×(tool_use+tool))", len(msgs))
 		}
-		if msgs[0] != pre[0] {
-			t.Errorf("committed history must preserve pre-turn history exactly")
+		if !reflect.DeepEqual(msgs[0], pre[0]) {
+			t.Errorf("committed history must preserve pre-turn history by value")
 		}
 		// Each committed tool_use is paired with its tool result — the in-flight 4th
 		// tool_use was never committed, so no unpaired tool_use survives.
@@ -938,10 +939,10 @@ func TestRunTurnAgentic(t *testing.T) {
 		}
 		// The first two messages of every request are the committed pre-history,
 		// exactly once (not duplicated).
-		if reqs[0].Messages[0] != pre[0] || reqs[0].Messages[1] != pre[1] {
+		if !reflect.DeepEqual(reqs[0].Messages[0], pre[0]) || !reflect.DeepEqual(reqs[0].Messages[1], pre[1]) {
 			t.Errorf("request 0 did not start with the base pre-history")
 		}
-		if reqs[1].Messages[0] != pre[0] || reqs[1].Messages[1] != pre[1] {
+		if !reflect.DeepEqual(reqs[1].Messages[0], pre[0]) || !reflect.DeepEqual(reqs[1].Messages[1], pre[1]) {
 			t.Errorf("request 1 did not start with the base pre-history")
 		}
 	})
@@ -1076,8 +1077,8 @@ func TestRunTurn(t *testing.T) {
 		if len(sds[0].Messages) != 1 {
 			t.Fatalf("StepDone.Messages len = %d, want 1 (AIMessage only)", len(sds[0].Messages))
 		}
-		if sds[0].Messages[0] != done.Message {
-			t.Errorf("StepDone.Messages[0] must be the assistant message (== TurnDone.Message)")
+		if !reflect.DeepEqual(sds[0].Messages[0], done.Message) {
+			t.Errorf("StepDone.Messages[0] differs from the final assistant message")
 		}
 		if sds[0].SessionID != st.sessionID || sds[0].LoopID != st.loopID || sds[0].TurnID != st.id || sds[0].StepID.IsZero() {
 			t.Errorf("StepDone Header ids not stamped from identity: %+v", sds[0].Header)

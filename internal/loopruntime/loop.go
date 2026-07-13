@@ -687,8 +687,8 @@ func runLoop(cfg loopConfig, state loopState) {
 		turnCtx, cancel := context.WithCancel(ctx)
 		state.cancelTurn = cancel
 
-		// base is a defensive CLONE of pre-turn history with its OWN backing array,
-		// taken BEFORE the initial UserMessage is committed (runTurn reads it
+		// base is a defensive deep clone of pre-turn history, taken BEFORE the
+		// initial UserMessage is committed (runTurn reads it
 		// concurrently while the actor keeps appending committed step groups).
 		base := cloneMessages(state.msgs)
 
@@ -710,7 +710,7 @@ func runLoop(cfg loopConfig, state loopState) {
 				},
 			},
 			TurnIndex: state.turnIndex,
-			Message:   qi.msg,
+			Message:   cloneUserMessage(qi.msg),
 		})
 		return turnCtx, base
 	}
@@ -845,9 +845,10 @@ func runLoop(cfg loopConfig, state loopState) {
 		return startTurnWithID(turnID, qi), nil
 	}
 
-	// userMessageFromBlocks wraps submit blocks into the committed UserMessage form.
+	// userMessageFromBlocks wraps an owned clone of submit blocks into the committed
+	// UserMessage form. Command callers retain ownership of their input graph.
 	userMessageFromBlocks := func(blocks []content.Block) *content.UserMessage {
-		return &content.UserMessage{Message: content.Message{Role: content.RoleUser, Blocks: blocks}}
+		return &content.UserMessage{Message: content.Message{Role: content.RoleUser, Blocks: cloneBlocks(blocks)}}
 	}
 
 	// returnEntry resolves ONE removed-from-inbox entry as returned: it emits the
@@ -874,7 +875,7 @@ func runLoop(cfg loopConfig, state loopState) {
 				},
 			},
 			Reason:  reason,
-			Message: qi.msg,
+			Message: cloneUserMessage(qi.msg),
 		})
 	}
 
@@ -1532,9 +1533,9 @@ func runLoop(cfg loopConfig, state loopState) {
 
 		case req := <-snapshots:
 			// Committed-state query: the actor is the SOLE owner of loopState.msgs +
-			// turnIndex, so a consistent read is served from here. Reply a DEFENSIVE clone
-			// (its own backing array) so the caller can never alias or race the live slice
-			// the actor keeps appending to. reply is buffered(1); the send never blocks.
+			// turnIndex, so a consistent read is served from here. Reply a DEFENSIVE deep
+			// clone so the caller can never alias or race the live history the actor keeps
+			// appending to. reply is buffered(1); the send never blocks.
 			req.reply <- loopSnapshot{msgs: cloneMessages(state.msgs), turnIndex: state.turnIndex}
 
 		case result := <-admissions:
