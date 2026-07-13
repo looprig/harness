@@ -20,6 +20,103 @@ type recordingHustleIdleBoundary struct {
 	commits     int
 }
 
+type transitionGateAppender struct {
+	mu sync.Mutex
+
+	appended []event.Event
+
+	activeCalls       int
+	blockActiveCall   int
+	failBlockedActive bool
+	activeEntered     chan struct{}
+	activeRelease     chan struct{}
+
+	idleCalls     int
+	blockIdleCall int
+	idleEntered   chan struct{}
+	idleRelease   chan struct{}
+}
+
+func (a *transitionGateAppender) AppendEvent(_ context.Context, ev event.Event) (uint64, error) {
+	var entered chan struct{}
+	var release chan struct{}
+	var fail bool
+	a.mu.Lock()
+	switch ev.(type) {
+	case event.SessionActive:
+		a.activeCalls++
+		if a.activeCalls == a.blockActiveCall {
+			entered, release, fail = a.activeEntered, a.activeRelease, a.failBlockedActive
+		}
+	case event.SessionIdle:
+		a.idleCalls++
+		if a.idleCalls == a.blockIdleCall {
+			entered, release = a.idleEntered, a.idleRelease
+		}
+	}
+	if entered != nil {
+		close(entered)
+	}
+	a.mu.Unlock()
+
+	if release != nil {
+		<-release
+	}
+	if fail {
+		return 0, errAppend
+	}
+	a.mu.Lock()
+	a.appended = append(a.appended, ev)
+	seq := uint64(len(a.appended))
+	a.mu.Unlock()
+	return seq, nil
+}
+
+func (a *transitionGateAppender) events() []event.Event {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	result := make([]event.Event, len(a.appended))
+	copy(result, a.appended)
+	return result
+}
+
+type activityOperationResult struct {
+	lease *HustleActivityLease
+	err   error
+}
+
+func expectActivityOperationBlocked(t *testing.T, result <-chan activityOperationResult, operation string) {
+	t.Helper()
+	select {
+	case got := <-result:
+		t.Fatalf("%s returned before the earlier activity transition completed: lease=%v error=%v", operation, got.lease, got.err)
+	case <-time.After(50 * time.Millisecond):
+	}
+}
+
+func receiveActivityOperation(t *testing.T, result <-chan activityOperationResult, operation string) activityOperationResult {
+	t.Helper()
+	select {
+	case got := <-result:
+		return got
+	case <-time.After(time.Second):
+		t.Fatalf("timed out waiting for %s", operation)
+		return activityOperationResult{}
+	}
+}
+
+func requireEventTypes(t *testing.T, got []event.Event, want ...event.Event) {
+	t.Helper()
+	if len(got) != len(want) {
+		t.Fatalf("appended count = %d, want %d: %#v", len(got), len(want), got)
+	}
+	for index := range want {
+		if eventTypeName(got[index]) != eventTypeName(want[index]) {
+			t.Fatalf("appended[%d] = %T, want %T", index, got[index], want[index])
+		}
+	}
+}
+
 func (b *recordingHustleIdleBoundary) SessionActivated() {
 	b.mu.Lock()
 	b.activations++
@@ -678,6 +775,241 @@ func TestHustleActivityCoexistsWithOtherActivity(t *testing.T) {
 			h.mu.RUnlock()
 			if phase != SessionActive || active != 1 {
 				t.Fatalf("state = (%v,%d), want active loop retained", phase, active)
+			}
+		})
+	}
+}
+
+func TestFailedHustleActiveEdgeSerializesNextAcquireUntilPartialRelease(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+	}{
+		{name: "next acquire cannot inherit uncommitted active phase"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			firstRunID, secondRunID := testRunID(t), testRunID(t)
+			appender := &transitionGateAppender{
+				blockActiveCall:   1,
+				failBlockedActive: true,
+				activeEntered:     make(chan struct{}),
+				activeRelease:     make(chan struct{}),
+			}
+			h := New(mustID(t), WithAppender(appender), WithFaultReporter(&recordingReporter{}))
+			firstResult := make(chan activityOperationResult, 1)
+			go func() {
+				lease, err := h.AcquireHustleActivity(context.Background(), firstRunID)
+				firstResult <- activityOperationResult{lease: lease, err: err}
+			}()
+			<-appender.activeEntered
+
+			secondResult := make(chan activityOperationResult, 1)
+			go func() {
+				lease, err := h.AcquireHustleActivity(context.Background(), secondRunID)
+				secondResult <- activityOperationResult{lease: lease, err: err}
+			}()
+			expectActivityOperationBlocked(t, secondResult, "second AcquireHustleActivity")
+
+			close(appender.activeRelease)
+			first := receiveActivityOperation(t, firstResult, "first AcquireHustleActivity")
+			var fault *SessionPersistenceFault
+			if first.lease == nil || !errors.As(first.err, &fault) {
+				t.Fatalf("first acquire = (%v,%T %v), want partial lease and persistence fault", first.lease, first.err, first.err)
+			}
+			expectActivityOperationBlocked(t, secondResult, "second AcquireHustleActivity before partial release")
+			if err := first.lease.Release(context.Background()); !errors.Is(err, first.err) {
+				t.Fatalf("partial Release() error = %v, want %v", err, first.err)
+			}
+
+			second := receiveActivityOperation(t, secondResult, "second AcquireHustleActivity after partial release")
+			if second.err != nil || second.lease == nil {
+				t.Fatalf("second acquire = (%v,%v), want committed lease", second.lease, second.err)
+			}
+			if err := second.lease.Release(context.Background()); err != nil {
+				t.Fatalf("second Release() error = %v", err)
+			}
+			requireEventTypes(t, appender.events(), event.SessionActive{}, event.SessionIdle{})
+		})
+	}
+}
+
+func TestHustleReleaseSerializesFollowingAcquireEdge(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+	}{
+		{name: "new active edge cannot commit ahead of older idle edge"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			firstRunID, secondRunID := testRunID(t), testRunID(t)
+			appender := &transitionGateAppender{
+				blockIdleCall: 1,
+				idleEntered:   make(chan struct{}),
+				idleRelease:   make(chan struct{}),
+			}
+			h := New(mustID(t), WithAppender(appender))
+			firstLease, err := h.AcquireHustleActivity(context.Background(), firstRunID)
+			if err != nil {
+				t.Fatalf("first AcquireHustleActivity() error = %v", err)
+			}
+			releaseResult := make(chan activityOperationResult, 1)
+			go func() {
+				releaseResult <- activityOperationResult{err: firstLease.Release(context.Background())}
+			}()
+			<-appender.idleEntered
+
+			secondResult := make(chan activityOperationResult, 1)
+			go func() {
+				lease, acquireErr := h.AcquireHustleActivity(context.Background(), secondRunID)
+				secondResult <- activityOperationResult{lease: lease, err: acquireErr}
+			}()
+			expectActivityOperationBlocked(t, secondResult, "AcquireHustleActivity behind SessionIdle")
+
+			close(appender.idleRelease)
+			if released := receiveActivityOperation(t, releaseResult, "first Release"); released.err != nil {
+				t.Fatalf("first Release() error = %v", released.err)
+			}
+			second := receiveActivityOperation(t, secondResult, "second AcquireHustleActivity")
+			if second.err != nil || second.lease == nil {
+				t.Fatalf("second acquire = (%v,%v), want committed lease", second.lease, second.err)
+			}
+			if err := second.lease.Release(context.Background()); err != nil {
+				t.Fatalf("second Release() error = %v", err)
+			}
+			requireEventTypes(t, appender.events(),
+				event.SessionActive{}, event.SessionIdle{}, event.SessionActive{}, event.SessionIdle{})
+		})
+	}
+}
+
+func TestFailedHustleActiveEdgeSerializesLoopAndWakeActivity(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name       string
+		competitor string
+	}{
+		{name: "loop activity waits for partial cleanup", competitor: "loop"},
+		{name: "wake activity waits for partial cleanup", competitor: "wake"},
+	}
+	for _, tt := range tests {
+		testCase := tt
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+			sessionID, competitorID, hustleRunID := mustID(t), mustID(t), testRunID(t)
+			appender := &transitionGateAppender{
+				blockActiveCall:   1,
+				failBlockedActive: true,
+				activeEntered:     make(chan struct{}),
+				activeRelease:     make(chan struct{}),
+			}
+			h := New(sessionID, WithAppender(appender), WithFaultReporter(&recordingReporter{}))
+			firstResult := make(chan activityOperationResult, 1)
+			go func() {
+				lease, err := h.AcquireHustleActivity(context.Background(), hustleRunID)
+				firstResult <- activityOperationResult{lease: lease, err: err}
+			}()
+			<-appender.activeEntered
+
+			competitorResult := make(chan activityOperationResult, 1)
+			go func() {
+				switch testCase.competitor {
+				case "loop":
+					err := h.PublishEvent(context.Background(), event.TurnStarted{Header: event.Header{Coordinates: identity.Coordinates{SessionID: sessionID, LoopID: competitorID}}})
+					competitorResult <- activityOperationResult{err: err}
+				case "wake":
+					h.ExpectTurn(context.Background(), competitorID)
+					competitorResult <- activityOperationResult{}
+				}
+			}()
+			expectActivityOperationBlocked(t, competitorResult, testCase.competitor+" activity")
+
+			close(appender.activeRelease)
+			first := receiveActivityOperation(t, firstResult, "failed hustle acquire")
+			if first.lease == nil || first.err == nil {
+				t.Fatalf("first acquire = (%v,%v), want partial lease and error", first.lease, first.err)
+			}
+			expectActivityOperationBlocked(t, competitorResult, testCase.competitor+" activity before partial release")
+			if err := first.lease.Release(context.Background()); !errors.Is(err, first.err) {
+				t.Fatalf("partial Release() error = %v, want %v", err, first.err)
+			}
+			if competed := receiveActivityOperation(t, competitorResult, testCase.competitor+" activity after cleanup"); competed.err != nil {
+				t.Fatalf("competitor error = %v", competed.err)
+			}
+
+			switch testCase.competitor {
+			case "loop":
+				if err := h.PublishEvent(context.Background(), event.LoopIdle{Header: event.Header{Coordinates: identity.Coordinates{SessionID: sessionID, LoopID: competitorID}}}); err != nil {
+					t.Fatalf("PublishEvent(LoopIdle) error = %v", err)
+				}
+				requireEventTypes(t, appender.events(),
+					event.TurnStarted{}, event.SessionActive{}, event.LoopIdle{}, event.SessionIdle{})
+			case "wake":
+				h.CancelExpectTurn(context.Background(), competitorID)
+				requireEventTypes(t, appender.events(), event.SessionActive{}, event.SessionIdle{})
+			}
+		})
+	}
+}
+
+func TestStopBoundaryWaitsForHustleActivityTransition(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+		stop string
+	}{
+		{name: "graceful stop follows active edge", stop: "graceful"},
+		{name: "construction abort follows active edge", stop: "abort"},
+	}
+	for _, tt := range tests {
+		testCase := tt
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+			runID := testRunID(t)
+			appender := &transitionGateAppender{
+				blockActiveCall: 1,
+				activeEntered:   make(chan struct{}),
+				activeRelease:   make(chan struct{}),
+			}
+			h := New(mustID(t), WithAppender(appender))
+			acquireResult := make(chan activityOperationResult, 1)
+			go func() {
+				lease, err := h.AcquireHustleActivity(context.Background(), runID)
+				acquireResult <- activityOperationResult{lease: lease, err: err}
+			}()
+			<-appender.activeEntered
+
+			stopResult := make(chan activityOperationResult, 1)
+			go func() {
+				switch testCase.stop {
+				case "graceful":
+					h.StopSession(context.Background())
+				case "abort":
+					h.AbortSession(errors.New("construction failed"))
+				}
+				stopResult <- activityOperationResult{}
+			}()
+			expectActivityOperationBlocked(t, stopResult, testCase.stop+" stop")
+
+			close(appender.activeRelease)
+			acquired := receiveActivityOperation(t, acquireResult, "AcquireHustleActivity")
+			if acquired.err != nil || acquired.lease == nil {
+				t.Fatalf("acquire = (%v,%v), want committed lease", acquired.lease, acquired.err)
+			}
+			receiveActivityOperation(t, stopResult, testCase.stop+" stop after active edge")
+			h.mu.RLock()
+			phase, active := h.state.phase, len(h.state.active)
+			h.mu.RUnlock()
+			if phase != SessionStopped || active != 0 {
+				t.Fatalf("state after stop = (%v,%d), want stopped/0", phase, active)
+			}
+			if testCase.stop == "graceful" {
+				requireEventTypes(t, appender.events(), event.SessionActive{}, event.SessionStopped{})
+			} else {
+				requireEventTypes(t, appender.events(), event.SessionActive{})
 			}
 		})
 	}

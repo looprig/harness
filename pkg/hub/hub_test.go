@@ -845,46 +845,62 @@ func (b *sequencedIdleBoundary) CommitSessionIdle(ctx context.Context, _ event.S
 	}
 }
 
-func TestWaitIdleUsesLatestOverlappingIdleBoundaryGeneration(t *testing.T) {
+func TestActivityTransitionWaitsForNativeIdleBoundary(t *testing.T) {
 	t.Parallel()
-	sid, _ := uuid.New()
-	lid, _ := uuid.New()
-	boundary := &sequencedIdleBoundary{entered: make(chan chan struct{}, 2)}
-	h := New(sid, withSessionIdleBoundary(boundary))
-	start := func() {
-		if err := h.PublishEvent(context.Background(), event.TurnStarted{Header: event.Header{Coordinates: identity.Coordinates{SessionID: sid, LoopID: lid}}}); err != nil {
-			t.Fatal(err)
-		}
+	tests := []struct {
+		name string
+	}{
+		{name: "reactivation waits for prior idle commit"},
 	}
-	start()
-	firstDone := make(chan error, 1)
-	go func() {
-		firstDone <- h.PublishEvent(context.Background(), event.LoopIdle{Header: event.Header{Coordinates: identity.Coordinates{SessionID: sid, LoopID: lid}}})
-	}()
-	firstRelease := <-boundary.entered
-	start()
-	secondDone := make(chan error, 1)
-	go func() {
-		secondDone <- h.PublishEvent(context.Background(), event.LoopIdle{Header: event.Header{Coordinates: identity.Coordinates{SessionID: sid, LoopID: lid}}})
-	}()
-	secondRelease := <-boundary.entered
-	waited := make(chan error, 1)
-	go func() { waited <- h.WaitIdle(context.Background()) }()
-	close(firstRelease)
-	if err := <-firstDone; err != nil {
-		t.Fatal(err)
-	}
-	select {
-	case err := <-waited:
-		t.Fatalf("WaitIdle returned after stale first boundary while second pending: %v", err)
-	case <-time.After(20 * time.Millisecond):
-	}
-	close(secondRelease)
-	if err := <-secondDone; err != nil {
-		t.Fatal(err)
-	}
-	if err := <-waited; err != nil {
-		t.Fatal(err)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			sid, _ := uuid.New()
+			lid, _ := uuid.New()
+			boundary := &sequencedIdleBoundary{entered: make(chan chan struct{}, 2)}
+			h := New(sid, withSessionIdleBoundary(boundary))
+			start := func() error {
+				return h.PublishEvent(context.Background(), event.TurnStarted{Header: event.Header{Coordinates: identity.Coordinates{SessionID: sid, LoopID: lid}}})
+			}
+			if err := start(); err != nil {
+				t.Fatal(err)
+			}
+			firstDone := make(chan error, 1)
+			go func() {
+				firstDone <- h.PublishEvent(context.Background(), event.LoopIdle{Header: event.Header{Coordinates: identity.Coordinates{SessionID: sid, LoopID: lid}}})
+			}()
+			firstRelease := <-boundary.entered
+
+			reactivated := make(chan error, 1)
+			go func() { reactivated <- start() }()
+			select {
+			case err := <-reactivated:
+				t.Fatalf("reactivation returned before prior idle boundary committed: %v", err)
+			case <-time.After(20 * time.Millisecond):
+			}
+			close(firstRelease)
+			if err := <-firstDone; err != nil {
+				t.Fatal(err)
+			}
+			if err := <-reactivated; err != nil {
+				t.Fatal(err)
+			}
+
+			secondDone := make(chan error, 1)
+			go func() {
+				secondDone <- h.PublishEvent(context.Background(), event.LoopIdle{Header: event.Header{Coordinates: identity.Coordinates{SessionID: sid, LoopID: lid}}})
+			}()
+			secondRelease := <-boundary.entered
+			waited := make(chan error, 1)
+			go func() { waited <- h.WaitIdle(context.Background()) }()
+			close(secondRelease)
+			if err := <-secondDone; err != nil {
+				t.Fatal(err)
+			}
+			if err := <-waited; err != nil {
+				t.Fatal(err)
+			}
+		})
 	}
 }
 

@@ -4,12 +4,11 @@
 // subscribe with an EventFilter. The hub aggregates loop activity into a single
 // sessionState so a headless run can WaitIdle without any session goroutine.
 //
-// Concurrency contract: ONE sync.RWMutex guards the subscriber set, the
-// sessionState (active/phase), and the WaitIdle waiter registry. Active/phase
-// mutations take the write lock; non-mutating publishes take the read lock. In
-// every case the critical section only applies the state change (if any) and
-// copies the subscriber slice — delivery happens OUTSIDE the lock, so a slow
-// consumer can never stall SubscribeEvents, another publisher, or teardown.
+// Concurrency contract: mu guards the subscriber set, sessionState
+// (active/phase), and WaitIdle waiter registry. activityMu serializes each
+// active-set mutation with its derived durable edge but never guards state itself.
+// The critical section under mu only applies state and copies subscribers; mu is
+// always released before durable I/O, workspace boundaries, reporting, or delivery.
 package hub
 
 import (
@@ -41,6 +40,12 @@ type Hub struct {
 	publishAborted error
 	publishes      int
 	publishDrained chan struct{}
+
+	// activityMu orders every active-set mutation with its derived durable edge.
+	// It may be held across I/O, unlike mu; no state is read or written under this
+	// lock alone. A failed Hustle Idle→Active acquisition transfers ownership to
+	// its partial lease until Release rolls back the uncommitted insertion.
+	activityMu sync.Mutex
 
 	// mu guards subs, state, and waiters together. One lock keeps the
 	// subscriber-set snapshot consistent with the active/phase transition.
@@ -140,9 +145,11 @@ func (h *Hub) unsubscribe(sub *EventSubscription) {
 //     a SessionIdle (the Active->Idle edge), wake WaitIdle waiters AFTER its durable
 //     append — never before (a failed append must not falsely report idle).
 //
-// It never blocks a publisher: delivery is a non-blocking send into each
-// subscription's bounded egress channel. It returns nil even with no subscribers
-// (the headless case) — the sessionState transition still runs.
+// Subscriber delivery never blocks a publisher: each send into the bounded egress
+// channel is non-blocking. Activity-affecting publishers do serialize with other
+// activity transitions until their derived durable edge completes. It returns nil
+// even with no subscribers (the headless case) — the sessionState transition still
+// runs.
 //
 // After SessionStopped, the event is still appended+delivered (filtered) but no
 // longer mutates active/phase and never derives SessionIdle/SessionActive.
@@ -168,6 +175,10 @@ func (h *Hub) publishEvent(ctx context.Context, ev event.Event, checked bool) er
 		return nil
 	}
 	defer h.finishPublish()
+	if _, mutatesActivity := activeMutation(ev); mutatesActivity {
+		h.activityMu.Lock()
+		defer h.activityMu.Unlock()
+	}
 	// (1)+(2) Ephemeral: no append, seq stays 0. Enduring: append before apply,
 	// fail-secure; capture the durable sequence to ride the live delivery.
 	var seq uint64
@@ -472,6 +483,8 @@ func (h *Hub) deliver(subs []*EventSubscription, ev event.Event, seq uint64) {
 // derived session event is durable: it is minted + appended OUTSIDE the lock before
 // delivery, fail-secure (a failed append delivers nothing and raises a fault).
 func (h *Hub) ExpectTurn(ctx context.Context, subagentLoopID uuid.UUID) {
+	h.activityMu.Lock()
+	defer h.activityMu.Unlock()
 	h.mu.Lock()
 	derived := h.state.applyActivity(h.sessionID,
 		func() { h.state.add(activityKey{kind: kindWake, id: subagentLoopID}) })
@@ -489,6 +502,8 @@ func (h *Hub) ExpectTurn(ctx context.Context, subagentLoopID uuid.UUID) {
 // rejected or explicitly discarded. It derives SessionIdle if this emptied active.
 // Exported for the session only (see ExpectTurn).
 func (h *Hub) CancelExpectTurn(ctx context.Context, subagentLoopID uuid.UUID) {
+	h.activityMu.Lock()
+	defer h.activityMu.Unlock()
 	h.mu.Lock()
 	derived := h.state.applyActivity(h.sessionID,
 		func() { h.state.remove(activityKey{kind: kindWake, id: subagentLoopID}) })
@@ -505,12 +520,13 @@ func (h *Hub) CancelExpectTurn(ctx context.Context, subagentLoopID uuid.UUID) {
 // Its concrete return type is intentional: sessionruntime adapts it to the narrow
 // controller-owned lease interface without weakening Go's invariant return types.
 type HustleActivityLease struct {
-	hub            *Hub
-	key            activityKey
-	partial        bool
-	acquisitionErr error
-	releaseOnce    sync.Once
-	releaseErr     error
+	hub                     *Hub
+	key                     activityKey
+	partial                 bool
+	holdsActivityTransition bool
+	acquisitionErr          error
+	releaseOnce             sync.Once
+	releaseErr              error
 }
 
 type hustleActivityInsertion struct {
@@ -533,8 +549,10 @@ func (h *Hub) AcquireHustleActivity(ctx context.Context, runID hustle.RunID) (*H
 	}
 	defer h.finishPublish()
 
+	h.activityMu.Lock()
 	insertion, err := h.insertHustleActivity(runID, id)
 	if err != nil {
+		h.activityMu.Unlock()
 		return nil, err
 	}
 	lease := &HustleActivityLease{hub: h, key: insertion.key}
@@ -545,9 +563,11 @@ func (h *Hub) AcquireHustleActivity(ctx context.Context, runID hustle.RunID) (*H
 	}
 	if err := h.appendAndDeliverDerivedChecked(ctx, insertion.subs, insertion.derived, 0); err != nil {
 		lease.partial = true
+		lease.holdsActivityTransition = true
 		lease.acquisitionErr = err
 		return lease, err
 	}
+	h.activityMu.Unlock()
 	return lease, nil
 }
 
@@ -591,6 +611,10 @@ func (l *HustleActivityLease) rollbackPartial() {
 		l.hub.state.phase = SessionIdle
 	}
 	l.hub.mu.Unlock()
+	if l.holdsActivityTransition {
+		l.holdsActivityTransition = false
+		l.hub.activityMu.Unlock()
+	}
 }
 
 func (l *HustleActivityLease) releaseCommitted(ctx context.Context) error {
@@ -598,6 +622,8 @@ func (l *HustleActivityLease) releaseCommitted(ctx context.Context) error {
 		return err
 	}
 	defer l.hub.finishPublish()
+	l.hub.activityMu.Lock()
+	defer l.hub.activityMu.Unlock()
 
 	l.hub.mu.Lock()
 	derived := l.hub.state.applyActivity(l.hub.sessionID, func() { l.hub.state.remove(l.key) })
@@ -729,6 +755,8 @@ func withHeader(ev event.Event, hdr event.Header) event.Event {
 //
 // Exported for the session only (see ExpectTurn).
 func (h *Hub) StopSession(ctx context.Context) {
+	h.activityMu.Lock()
+	defer h.activityMu.Unlock()
 	// Idempotency pre-check: if already stopped, do nothing (and no second append).
 	h.mu.RLock()
 	already := h.state.phase == SessionStopped
@@ -784,6 +812,8 @@ func (h *Hub) AbortSession(cause error) <-chan struct{} {
 	drained := h.publishDrained
 	h.publishMu.Unlock()
 
+	h.activityMu.Lock()
+	defer h.activityMu.Unlock()
 	h.mu.Lock()
 	h.state.active = make(map[activityKey]struct{})
 	h.state.phase = SessionStopped
