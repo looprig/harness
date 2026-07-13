@@ -263,6 +263,9 @@ func newLoopWithSeed(loopCtx context.Context, sessionID, loopID uuid.UUID, paren
 	if err := cfg.Model.Validate(); err != nil {
 		return nil, &ConfigError{Kind: ConfigInvalidModel, Cause: err}
 	}
+	if err := cfg.Model.Key().Validate(); err != nil {
+		return nil, &ConfigError{Kind: ConfigInvalidModel, Cause: err}
+	}
 	if events == nil {
 		return nil, &ConfigError{Kind: ConfigMissingPublisher}
 	}
@@ -1348,6 +1351,10 @@ func runLoop(cfg loopConfig, state loopState) {
 		if c.SetModel {
 			model = c.Model
 			if verr := model.Validate(); verr != nil {
+				c.Ack <- command.LoopChangeResult{Err: &loop.ChangeError{Kind: loop.ChangeInvalidModel, Cause: verr}}
+				return
+			}
+			if verr := model.Key().Validate(); verr != nil {
 				c.Ack <- command.LoopChangeResult{Err: &loop.ChangeError{Kind: loop.ChangeInvalidModel, Cause: verr}}
 				return
 			}

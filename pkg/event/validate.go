@@ -1,6 +1,7 @@
 package event
 
 import (
+	"github.com/looprig/core/content"
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/identity"
 )
@@ -46,6 +47,7 @@ const (
 	FieldContextLimits   FieldName = "ContextLimits"
 	FieldEffort          FieldName = "Effort"
 	FieldUsage           FieldName = "Usage"
+	FieldMessages        FieldName = "Messages"
 	// FieldType names the whole event (not one coordinate) on the fail-secure
 	// unknown-type path, paired with RuleUnknownType.
 	FieldType FieldName = "Type"
@@ -139,9 +141,28 @@ func validateEventBody(ev Event) error {
 		return validateModelRuntime("LoopModeChanged", e.Runtime)
 	case LoopStarted:
 		return validateModelRuntime("LoopStarted", e.Runtime)
+	case StepDone:
+		return validateStepDoneMessages(e.Messages)
 	case TurnDone:
 		if err := e.Usage.Validate(); err != nil {
 			return &InvalidEventError{Event: "TurnDone", Field: FieldUsage, Rule: RuleInvalid}
+		}
+	}
+	return nil
+}
+
+func validateStepDoneMessages(messages content.AgenticMessages) error {
+	if len(messages) == 0 {
+		return &InvalidEventError{Event: "StepDone", Field: FieldMessages, Rule: RuleInvalid}
+	}
+	first, ok := messages[0].(*content.AIMessage)
+	if !ok || first == nil {
+		return &InvalidEventError{Event: "StepDone", Field: FieldMessages, Rule: RuleInvalid}
+	}
+	for _, message := range messages[1:] {
+		toolResult, toolResultOK := message.(*content.ToolResultMessage)
+		if !toolResultOK || toolResult == nil {
+			return &InvalidEventError{Event: "StepDone", Field: FieldMessages, Rule: RuleInvalid}
 		}
 	}
 	return nil

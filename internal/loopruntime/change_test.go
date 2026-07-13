@@ -456,14 +456,23 @@ func TestChangeInferenceValidation(t *testing.T) {
 	llm := &recordingLLM{chunks: []content.Chunk{textChunk("ok")}}
 
 	tests := []struct {
-		name string
-		cmd  command.ChangeLoopInference
-		kind loop.ChangeErrorKind
+		name           string
+		cmd            command.ChangeLoopInference
+		kind           loop.ChangeErrorKind
+		wantKeyFailure bool
 	}{
 		{
 			name: "empty model name is invalid",
 			cmd:  command.ChangeLoopInference{Model: inference.Model{Name: ""}, SetModel: true},
 			kind: loop.ChangeInvalidModel,
+		},
+		{
+			name: "empty model provider is invalid",
+			cmd: command.ChangeLoopInference{Model: inference.Model{
+				APIFormat: inference.APIFormatOpenAI, BaseURL: "http://localhost:1234", Name: "routed",
+			}, SetModel: true},
+			kind:           loop.ChangeInvalidModel,
+			wantKeyFailure: true,
 		},
 		{
 			name: "unknown effort is invalid",
@@ -486,6 +495,12 @@ func TestChangeInferenceValidation(t *testing.T) {
 			var ce *loop.ChangeError
 			if !errors.As(res.Err, &ce) || ce.Kind != tt.kind {
 				t.Fatalf("err = %v, want %s", res.Err, tt.kind)
+			}
+			if tt.wantKeyFailure {
+				var keyErr *inference.ModelKeyValidationError
+				if !errors.As(res.Err, &keyErr) || keyErr.Field != inference.ModelKeyFieldProvider {
+					t.Fatalf("err cause = %T %v, want *ModelKeyValidationError for Provider", res.Err, res.Err)
+				}
 			}
 			runOneTurn(t, l, rec, "turn1")
 			if countInferenceChanged(rec.events()) != 0 {

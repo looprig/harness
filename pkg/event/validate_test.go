@@ -4,6 +4,7 @@ import (
 	"errors"
 	"testing"
 
+	"github.com/looprig/core/content"
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/gate"
@@ -79,7 +80,7 @@ func TestValidateEventValid(t *testing.T) {
 		{"InputCancelled client retract (no turn)", event.InputCancelled{Header: loopH}},
 		{"InputCancelled abnormal return (with turn)", event.InputCancelled{Header: turnH}},
 		{"TokenDelta", event.TokenDelta{Header: stepH}},
-		{"StepDone", event.StepDone{Header: stepH}},
+		{"StepDone", event.StepDone{Header: stepH, Messages: content.AgenticMessages{&content.AIMessage{Message: content.Message{Role: content.RoleAssistant}}}}},
 		{"PermissionRequested", event.PermissionRequested{Header: stepH, ToolExecutionID: toolID}},
 		{"PermissionDecided", event.PermissionDecided{Header: stepH, ToolExecutionID: toolID, Effect: event.PermissionEffectApprove}},
 		{"UserInputRequested", event.UserInputRequested{Header: stepH, ToolExecutionID: toolID}},

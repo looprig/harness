@@ -87,6 +87,9 @@ func Define(opts ...Option) (Definition, error) {
 	if err := resolved.model.Validate(); err != nil {
 		return Definition{}, &DefinitionError{Kind: DefinitionInvalidModel, Field: "model", Cause: err}
 	}
+	if err := resolved.model.Key().Validate(); err != nil {
+		return Definition{}, &DefinitionError{Kind: DefinitionInvalidModel, Field: "model", Cause: err}
+	}
 	if !resolved.model.Sampling.Effort.Valid() {
 		return Definition{}, &DefinitionError{Kind: DefinitionInvalidModel, Field: "model.sampling.effort"}
 	}
@@ -724,6 +727,9 @@ func validateModes(modes []Mode, initial ModeName) error {
 		seen[mode.Name] = struct{}{}
 		if !zeroModel(mode.Model) {
 			if err := mode.Model.Validate(); err != nil {
+				return &DefinitionError{Kind: DefinitionInvalidMode, Field: "mode.model", Value: string(mode.Name), Cause: err}
+			}
+			if err := mode.Model.Key().Validate(); err != nil {
 				return &DefinitionError{Kind: DefinitionInvalidMode, Field: "mode.model", Value: string(mode.Name), Cause: err}
 			}
 			if !mode.Model.Sampling.Effort.Valid() {

@@ -268,6 +268,35 @@ func TestNew_Validation(t *testing.T) {
 	})
 }
 
+func TestNewRequiresDurableModelKey(t *testing.T) {
+	t.Parallel()
+	modelWithoutProvider := testModel()
+	modelWithoutProvider.Provider = ""
+	tests := []struct {
+		name  string
+		model inference.Model
+	}{
+		{name: "empty provider", model: modelWithoutProvider},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			_, err := newWithConfig(context.Background(), mustID(t), mustID(t), Provenance{}, noopPublisher{}, runtimeConfig{
+				Client: &fakeLLM{}, Model: tt.model,
+			})
+			var configErr *ConfigError
+			if !errors.As(err, &configErr) || configErr.Kind != ConfigInvalidModel {
+				t.Fatalf("newWithConfig error = %T %v, want *ConfigError kind %q", err, err, ConfigInvalidModel)
+			}
+			var keyErr *inference.ModelKeyValidationError
+			if !errors.As(err, &keyErr) || keyErr.Field != inference.ModelKeyFieldProvider {
+				t.Fatalf("newWithConfig cause = %T %v, want *ModelKeyValidationError for Provider", err, err)
+			}
+		})
+	}
+}
+
 // TestNewLoopState asserts the constructor carries the loop identity (sessionID,
 // loopID, parent provenance) and the event publisher onto loopState, and always
 // initializes pendingGates so the actor never panics on a nil map.

@@ -21,8 +21,8 @@ import (
 // contract.
 const schemaVersion = 1
 
-// maxEventBytes caps the serialized size UnmarshalEvent accepts at the untrusted
-// restore boundary. An event's payload is small (header ids + capped strings) plus
+// maxEventBytes caps the serialized size MarshalEvent emits and UnmarshalEvent
+// accepts at durable boundaries. An event's payload is small (header ids + capped strings) plus
 // at most a committed step group, which is bounded by the block codec's own caps;
 // this envelope cap fails closed on absurd top-level input before any delegated
 // decode runs. Conservative starting value; tune to real history sizes later.
@@ -89,14 +89,14 @@ func (e *LegacyRuntimeMigrationError) Error() string {
 	return "event: cannot migrate legacy " + e.Type + " field " + e.Field + ": " + e.Reason
 }
 
-// EventLimitError is returned when serialized input exceeds the envelope byte cap.
+// EventLimitError is returned when an event codec input or output exceeds its cap.
 type EventLimitError struct {
 	Got int
 	Max int
 }
 
 func (e *EventLimitError) Error() string {
-	return fmt.Sprintf("event: input exceeds byte cap (%d > %d)", e.Got, e.Max)
+	return fmt.Sprintf("event: codec limit exceeded (%d > %d)", e.Got, e.Max)
 }
 
 // MarshalEvent encodes an Enduring event into the durable wire envelope: a JSON
@@ -115,24 +115,24 @@ func MarshalEvent(ev Event) ([]byte, error) {
 	if ev.Class() == Ephemeral {
 		return nil, &EphemeralNotPersistableError{Type: name}
 	}
-	// Unknown checkpoint metadata exists solely as the in-memory projection of a
-	// legacy record. Never emit it into a current journal (nor emit a checkpoint
-	// whose trigger/cause pairing is malformed).
-	if _, checkpoint := ev.(WorkspaceCheckpointed); checkpoint {
-		if err := validateEventBody(ev); err != nil {
-			return nil, err
-		}
-	}
-	if _, accepted := ev.(DelegateRequestAccepted); accepted {
-		if err := validateEventBody(ev); err != nil {
-			return nil, err
-		}
+	// Body validation is required at the durable write boundary. Identity is
+	// stamped by the publishing hub, but malformed lifecycle/runtime and committed
+	// step bodies must never be encoded into a journal record.
+	if err := validateEventBody(ev); err != nil {
+		return nil, err
 	}
 	payload, err := encodePayload(ev)
 	if err != nil {
 		return nil, err
 	}
-	return mergeEnvelope(name, payload)
+	out, err := mergeEnvelope(name, payload)
+	if err != nil {
+		return nil, err
+	}
+	if len(out) > maxEventBytes {
+		return nil, &EventLimitError{Got: len(out), Max: maxEventBytes}
+	}
+	return out, nil
 }
 
 // encodePayload marshals the concrete event's wire form (header + type-specific
@@ -793,6 +793,10 @@ func unmarshalMessages(data []byte) (content.AgenticMessages, error) {
 	}
 	msgs := make(content.AgenticMessages, 0, len(raws))
 	for _, r := range raws {
+		if bytes.Equal(bytes.TrimSpace(r), []byte("null")) {
+			msgs = append(msgs, nil)
+			continue
+		}
 		m, err := unmarshalMessage(r)
 		if err != nil {
 			return nil, err
