@@ -243,6 +243,67 @@ func (e *CatalogEncodeError) Error() string {
 }
 func (e *CatalogEncodeError) Unwrap() error { return e.Cause }
 
+// CatalogDecodeError identifies a malformed or semantically invalid catalog
+// value. CatalogReadError wraps it with the affected session identity.
+type CatalogDecodeError struct{ Cause error }
+
+func (e *CatalogDecodeError) Error() string {
+	return "sessionstore: decode session meta: " + e.Cause.Error()
+}
+func (e *CatalogDecodeError) Unwrap() error { return e.Cause }
+
+// CatalogDuplicateFieldError reports duplicate JSON object members, including
+// case aliases that encoding/json would otherwise accept with last-value wins.
+type CatalogDuplicateFieldError struct {
+	Path  string
+	Field string
+}
+
+func (e *CatalogDuplicateFieldError) Error() string {
+	return "sessionstore: duplicate catalog field " + e.Field + " at " + e.Path
+}
+
+// CatalogMetaField identifies one semantic SessionMeta projection field.
+type CatalogMetaField string
+
+const (
+	CatalogMetaFieldLoopID          CatalogMetaField = "Loops.LoopID"
+	CatalogMetaFieldLoopOrder       CatalogMetaField = "Loops"
+	CatalogMetaFieldRuntime         CatalogMetaField = "Loops.Runtime"
+	CatalogMetaFieldRuntimeSeq      CatalogMetaField = "Loops.RuntimeValueSeq"
+	CatalogMetaFieldCumulativeUsage CatalogMetaField = "Loops.CumulativeUsage"
+)
+
+// CatalogMetaRule identifies a semantic catalog invariant.
+type CatalogMetaRule string
+
+const (
+	CatalogMetaRuleRequired       CatalogMetaRule = "must be set"
+	CatalogMetaRuleSortedUnique   CatalogMetaRule = "must be sorted and unique"
+	CatalogMetaRuleInvalid        CatalogMetaRule = "is invalid"
+	CatalogMetaRuleExceedsRuntime CatalogMetaRule = "must not exceed RuntimeSeq"
+	CatalogMetaRuleLegacyValue    CatalogMetaRule = "must be zero when Runtime is absent"
+)
+
+// CatalogMetaValidationError reports an invalid bounded loop projection. The
+// index makes corrupt records diagnosable without parsing an error string.
+type CatalogMetaValidationError struct {
+	LoopIndex int
+	Field     CatalogMetaField
+	Rule      CatalogMetaRule
+	Cause     error
+}
+
+func (e *CatalogMetaValidationError) Error() string {
+	message := "sessionstore: invalid catalog loop " + strconv.Itoa(e.LoopIndex) + ": " +
+		string(e.Field) + " " + string(e.Rule)
+	if e.Cause != nil {
+		return message + ": " + e.Cause.Error()
+	}
+	return message
+}
+func (e *CatalogMetaValidationError) Unwrap() error { return e.Cause }
+
 // CatalogConflictError reports that a catalog update could not win the KV revision-CAS
 // within catalogMaxCASRetries attempts: a persistently contended key. It has no storage
 // analog in the NATS catalog (JetStream KV Put was unconditional last-write-wins); it
@@ -615,6 +676,9 @@ func truncateRunes(s string, max int) string {
 
 // encodeSessionMeta marshals a SessionMeta to its JSON KV value.
 func encodeSessionMeta(meta SessionMeta) ([]byte, error) {
+	if err := validateSessionMeta(meta); err != nil {
+		return nil, &CatalogEncodeError{Cause: err}
+	}
 	data, err := json.Marshal(meta)
 	if err != nil {
 		return nil, &CatalogEncodeError{Cause: err}
@@ -626,16 +690,122 @@ func encodeSessionMeta(meta SessionMeta) ([]byte, error) {
 // JSON, an unknown field, or trailing bytes — an ambiguous entry is a corrupt cache entry,
 // surfaced as an error so the caller can repair rather than silently mis-list.
 func decodeSessionMeta(data []byte) (SessionMeta, error) {
+	if err := rejectDuplicateCatalogFields(data); err != nil {
+		return SessionMeta{}, &CatalogDecodeError{Cause: err}
+	}
 	dec := json.NewDecoder(bytes.NewReader(data))
 	dec.DisallowUnknownFields()
 	var meta SessionMeta
 	if err := dec.Decode(&meta); err != nil {
-		return SessionMeta{}, err
+		return SessionMeta{}, &CatalogDecodeError{Cause: err}
 	}
 	if _, err := dec.Token(); err != io.EOF {
-		return SessionMeta{}, errTrailingCatalogData
+		return SessionMeta{}, &CatalogDecodeError{Cause: errTrailingCatalogData}
+	}
+	if err := validateSessionMeta(meta); err != nil {
+		return SessionMeta{}, &CatalogDecodeError{Cause: err}
 	}
 	return meta, nil
+}
+
+// rejectDuplicateCatalogFields walks the JSON token stream before decoding into
+// structs. encoding/json otherwise permits duplicate and case-aliased members,
+// which would make a corrupt cache depend on member order.
+func rejectDuplicateCatalogFields(data []byte) error {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	if err := scanCatalogJSONValue(dec, "$"); err != nil {
+		return err
+	}
+	if _, err := dec.Token(); err != io.EOF {
+		return errTrailingCatalogData
+	}
+	return nil
+}
+
+func scanCatalogJSONValue(dec *json.Decoder, path string) error {
+	token, err := dec.Token()
+	if err != nil {
+		return err
+	}
+	delim, ok := token.(json.Delim)
+	if !ok {
+		return nil
+	}
+	switch delim {
+	case '{':
+		seen := make(map[string]string)
+		for dec.More() {
+			fieldToken, err := dec.Token()
+			if err != nil {
+				return err
+			}
+			field, ok := fieldToken.(string)
+			if !ok {
+				return &CatalogDuplicateFieldError{Path: path, Field: "<non-string>"}
+			}
+			folded := strings.ToLower(field)
+			if first, exists := seen[folded]; exists {
+				return &CatalogDuplicateFieldError{Path: path, Field: first + "/" + field}
+			}
+			seen[folded] = field
+			if err := scanCatalogJSONValue(dec, path+"."+field); err != nil {
+				return err
+			}
+		}
+		_, err = dec.Token()
+		return err
+	case '[':
+		index := 0
+		for dec.More() {
+			if err := scanCatalogJSONValue(dec, path+"["+strconv.Itoa(index)+"]"); err != nil {
+				return err
+			}
+			index++
+		}
+		_, err = dec.Token()
+		return err
+	default:
+		return nil
+	}
+}
+
+func validateSessionMeta(meta SessionMeta) error {
+	zeroRuntime := event.ModelRuntime{}
+	for i, loop := range meta.Loops {
+		if loop.LoopID.IsZero() {
+			return &CatalogMetaValidationError{LoopIndex: i, Field: CatalogMetaFieldLoopID, Rule: CatalogMetaRuleRequired}
+		}
+		if i > 0 && bytes.Compare(meta.Loops[i-1].LoopID[:], loop.LoopID[:]) >= 0 {
+			return &CatalogMetaValidationError{LoopIndex: i, Field: CatalogMetaFieldLoopOrder, Rule: CatalogMetaRuleSortedUnique}
+		}
+		if loop.RuntimeValueSeq > loop.RuntimeSeq {
+			return &CatalogMetaValidationError{LoopIndex: i, Field: CatalogMetaFieldRuntimeSeq, Rule: CatalogMetaRuleExceedsRuntime}
+		}
+		if loop.Runtime == zeroRuntime {
+			if loop.RuntimeValueSeq != 0 {
+				return &CatalogMetaValidationError{LoopIndex: i, Field: CatalogMetaFieldRuntimeSeq, Rule: CatalogMetaRuleLegacyValue}
+			}
+		} else if err := validateCatalogRuntime(loop.Runtime); err != nil {
+			return &CatalogMetaValidationError{LoopIndex: i, Field: CatalogMetaFieldRuntime, Rule: CatalogMetaRuleInvalid, Cause: err}
+		}
+		if err := loop.CumulativeUsage.Validate(); err != nil {
+			return &CatalogMetaValidationError{LoopIndex: i, Field: CatalogMetaFieldCumulativeUsage, Rule: CatalogMetaRuleInvalid, Cause: err}
+		}
+	}
+	return nil
+}
+
+func validateCatalogRuntime(runtime event.ModelRuntime) error {
+	if err := runtime.Key.Validate(); err != nil {
+		return err
+	}
+	if err := runtime.Limits.Validate(); err != nil {
+		return err
+	}
+	if !runtime.Effort.Valid() {
+		return &event.InvalidEventError{Event: "SessionMeta", Field: event.FieldEffort, Rule: event.RuleInvalid}
+	}
+	return nil
 }
 
 // catalogOptions is the resolved knob set OpenCatalog applies its CatalogOptions over.
@@ -859,7 +1029,9 @@ func (c *Catalog) ReadMeta(ctx context.Context, id uuid.UUID) (SessionMeta, bool
 // RepairCatalog rebuilds a session's catalog entry from the authoritative ledger — the
 // repair path for a missing, stale, or corrupt entry. Since the catalog is derived, repair
 // reconstructs it by folding the session's events (the same applyEvent mapping the inline
-// update uses) over an ordered cold replay, then writing the result once under revision-CAS.
+// update uses) over an ordered cold replay, then writing under revision-CAS. A lost CAS or
+// a newer decodable catalog high-water forces a fresh scan so repair cannot overwrite an
+// event appended after an earlier replay snapshot.
 // It scans events ONLY (the event replayer never surfaces command/fence records). A session
 // whose ledger carries no SessionStarted yields a typed *EmptySessionError (nothing to
 // index). Unlike UpdateOnEvent, repair is NOT best-effort: a read/write failure is surfaced
@@ -869,24 +1041,66 @@ func (c *Catalog) RepairCatalog(ctx context.Context, sessionID uuid.UUID) (Sessi
 	if c.opener == nil {
 		return SessionMeta{}, &CatalogReadError{SessionID: sessionID, Cause: errNoReplayer}
 	}
-	replayer, err := c.opener.OpenEventReplayer(sessionID, ReplayRequest{FromSeq: 0})
-	if err != nil {
-		return SessionMeta{}, &CatalogReadError{SessionID: sessionID, Cause: err}
-	}
 	scanCtx, cancel := context.WithTimeout(ctx, catalogScanTimeout)
 	defer cancel()
 
-	meta, err := c.foldSession(scanCtx, sessionID, replayer)
+	for attempt := 0; attempt < catalogMaxCASRetries; attempt++ {
+		replayer, err := c.opener.OpenEventReplayer(sessionID, ReplayRequest{FromSeq: 0})
+		if err != nil {
+			return SessionMeta{}, &CatalogReadError{SessionID: sessionID, Cause: err}
+		}
+		meta, err := c.foldSession(scanCtx, sessionID, replayer)
+		if err != nil {
+			return SessionMeta{}, err
+		}
+		// Ensure the entry is keyed by the requested session even if no event carried it
+		// (defensive; SessionStarted always sets it).
+		meta.SessionID = sessionID
+
+		current, rev, decodable, err := c.loadRepairState(ctx, sessionID)
+		if err != nil {
+			return SessionMeta{}, err
+		}
+		if decodable && current.LastJournalSeq > meta.LastJournalSeq {
+			// The append path projected an event beyond this replay snapshot.
+			// Rescan rather than writing a stale authoritative view.
+			continue
+		}
+		serr := c.store(ctx, sessionID, rev, meta)
+		if serr == nil {
+			return meta, nil
+		}
+		var conflict *storage.ConflictError
+		if !errors.As(serr, &conflict) {
+			return SessionMeta{}, serr
+		}
+		// A projection changed after the scan/revision read. A fresh scan is
+		// required; retrying the same folded value could clobber newer state.
+	}
+	return SessionMeta{}, &CatalogConflictError{SessionID: sessionID, Attempts: catalogMaxCASRetries}
+}
+
+// loadRepairState reads the current revision and, when possible, its high-water
+// mark. A malformed catalog value remains replaceable: repair is specifically the
+// path that reconstructs corrupt derived state from the authoritative journal.
+func (c *Catalog) loadRepairState(ctx context.Context, sid uuid.UUID) (SessionMeta, uint64, bool, error) {
+	key, err := sessionName(sid)
 	if err != nil {
-		return SessionMeta{}, err
+		return SessionMeta{}, 0, false, &CatalogReadError{SessionID: sid, Cause: err}
 	}
-	// Ensure the entry is keyed by the requested session even if no event carried it
-	// (defensive; SessionStarted always sets it).
-	meta.SessionID = sessionID
-	if err := c.storeRetry(ctx, sessionID, meta); err != nil {
-		return SessionMeta{}, err
+	val, rev, err := c.kv.Get(ctx, key)
+	if err != nil {
+		var notFound *storage.KeyNotFoundError
+		if errors.As(err, &notFound) {
+			return SessionMeta{}, 0, true, nil
+		}
+		return SessionMeta{}, 0, false, &CatalogReadError{SessionID: sid, Cause: err}
 	}
-	return meta, nil
+	meta, err := decodeSessionMeta(val)
+	if err != nil {
+		return SessionMeta{}, rev, false, nil
+	}
+	return meta, rev, true, nil
 }
 
 // foldSession replays session sessionID's events through replayer and folds them into a
@@ -921,27 +1135,4 @@ func (c *Catalog) foldSession(ctx context.Context, sessionID uuid.UUID, replayer
 		return SessionMeta{}, &EmptySessionError{SessionID: sessionID}
 	}
 	return meta, nil
-}
-
-// storeRetry writes an already-folded meta under the bounded revision-CAS retry loop: it
-// re-reads the current revision each attempt (the rebuilt meta is authoritative, so the
-// prior value is discarded) and Puts, retrying on a lost CAS. Exhausting the retries
-// returns a typed *CatalogConflictError. It is repair's non-best-effort counterpart to
-// upsert (which folds an event per attempt).
-func (c *Catalog) storeRetry(ctx context.Context, sid uuid.UUID, meta SessionMeta) error {
-	for attempt := 0; attempt < catalogMaxCASRetries; attempt++ {
-		_, rev, err := c.load(ctx, sid)
-		if err != nil {
-			return err
-		}
-		serr := c.store(ctx, sid, rev, meta)
-		if serr == nil {
-			return nil
-		}
-		var conflict *storage.ConflictError
-		if !errors.As(serr, &conflict) {
-			return serr
-		}
-	}
-	return &CatalogConflictError{SessionID: sid, Attempts: catalogMaxCASRetries}
 }
