@@ -60,7 +60,7 @@ type Session struct {
 
 	// loops are the loop handles in this session, keyed by loop id. Each entry
 	// pairs the loop handle with the provenance of whatever spawned it (zero for
-	// the primary loop). Today this map holds one entry; multi-agent
+	// a root loop). Today this map holds one entry; multi-agent
 	// orchestration adds subagent loops with a non-zero parent.
 	loops        map[uuid.UUID]*loopHandle
 	constructing bool
@@ -101,7 +101,7 @@ type Session struct {
 	limits Limits
 
 	// spawned is the running count of sub-loops this session has spawned via the
-	// quota-counted NewLoop path (the primary loop, built by New, does NOT count). It is
+	// quota-counted NewLoop path (the zero-parent loop built by New does not count). It is
 	// the quota's reservation counter: NewLoop reserves a slot (spawned++) under loopsMu
 	// once the depth + quota + closing/faulted checks pass, and ROLLS BACK (spawned--)
 	// under the same lock on every later failure (id-mint, loopruntime.New, the registration-time
@@ -470,7 +470,7 @@ type eventAppender interface {
 }
 
 // loopHandle is the session's registry entry: the loop's channel handle, the
-// provenance of the turn/step that spawned it (zero for the primary loop), and
+// provenance of the turn/step that spawned it (zero for a root loop), and
 // the cancel for this loop's loopCtx (a session-owned backstop).
 type loopHandle struct {
 	id      uuid.UUID
@@ -950,7 +950,7 @@ func (s *Session) deliverSubagentResult(ctx context.Context, parentLoopID, fromL
 
 // NewLoop creates another loop inside this session. The new loop shares
 // SessionID but receives its own loop id and loop goroutine. parent is the
-// provenance of the spawning turn/step (zero for the primary loop); the session
+// provenance of the spawning turn/step (zero for a root loop); the session
 // records it in the registry and passes it to loopruntime.New. The session stores the
 // loop handle and returns only the loop id, because callers route through
 // session methods rather than writing to a loop command channel directly.
@@ -974,9 +974,9 @@ func (s *Session) newLoop(parent loop.Provenance, cfg loop.Definition, parentToo
 }
 
 func (s *Session) newLoopWithAdmission(parent loop.Provenance, cfg loop.Definition, parentToolUseID string, selectedMode loop.ModeName, prepared *preparedLoop, admission *delegateAdmission) (uuid.UUID, error) {
-	// Whether this spawn counts toward the cumulative spawn quota. The PRIMARY loop is
-	// built by newSession via NewLoop with ZERO provenance (parent.LoopID zero) and must
-	// NOT consume a quota slot (design §6d: "primary excluded"); every subagent spawn
+	// Whether this spawn counts toward the cumulative spawn quota. The initial root loop is
+	// built by newSession via NewLoop with zero provenance and must not consume a quota slot;
+	// every subagent spawn
 	// carries a non-zero parent.LoopID. This is the SAME root/non-root discriminator the
 	// durable recount uses on restore (a non-root LoopStarted has a non-zero Header.Cause),
 	// so the live counter and the restored counter count exactly the same set.
@@ -1026,7 +1026,7 @@ func (s *Session) newLoopWithAdmission(parent loop.Provenance, cfg loop.Definiti
 	// path after the reservation (id mint, loopruntime.New, the registration-time closing/faulted
 	// re-check, and publish failure) ALONGSIDE the loop's cancel(), so a spawn that does
 	// not complete never permanently consumes a slot. It is a no-op when this spawn did not
-	// reserve (the primary / a zero-parent spawn). A SUCCESSFUL spawn never calls it, so
+	// reserve (a zero-parent spawn). A SUCCESSFUL spawn never calls it, so
 	// the reservation stands permanently (loops are retained — the cumulative budget never
 	// decrements on idle, only on a rolled-back spawn).
 	release := func() {
@@ -1104,7 +1104,7 @@ func (s *Session) newLoopWithAdmission(parent loop.Provenance, cfg loop.Definiti
 		Coordinates: identity.Coordinates{SessionID: s.sessionID, LoopID: loopID},
 		// AgentName is the loop's immutable attribution name, stamped from its definition so
 		// the durable LoopStarted records which agent drove this loop. Empty for a plain
-		// loop; the primary loop carries its configured name through this same path.
+		// loop; the zero-parent root carries its configured name through this same path.
 		AgentName: bound.Name(),
 		Cause: identity.Cause{
 			Coordinates: identity.Coordinates{LoopID: parent.LoopID, TurnID: parent.TurnID, StepID: parent.StepID},
@@ -1116,8 +1116,8 @@ func (s *Session) newLoopWithAdmission(parent loop.Provenance, cfg loop.Definiti
 		return uuid.UUID{}, &SessionError{Kind: SessionIDGenerationFailed, Cause: err}
 	}
 
-	// Engine switch — the single loop-construction chokepoint for BOTH the primary loop
-	// (built via newSession → NewLoop with zero provenance) and every subagent. A
+	// Engine switch — the single loop-construction chokepoint for both the zero-parent root
+	// (built via newSession → NewLoop) and every descendant. A
 	// definition bound to EngineNative builds through loopruntime.New. A foreign engine
 	// routes to the injected foreign Builder seam and fails CLOSED if none is
 	// wired (a foreign engine must never silently resolve to a native loop). The minted
@@ -1219,7 +1219,7 @@ func (s *Session) newLoopWithAdmission(parent loop.Provenance, cfg loop.Definiti
 	// is not one of the active-mutating events (TurnStarted/LoopIdle/TurnFoldedInto/
 	// InputCancelled), so it never perturbs session quiescence. Header.Coordinates is
 	// the NEW loop (SessionID+LoopID; Turn/Step zero); Header.Cause is the spawning
-	// loop/turn/step (zero for the primary = root), machine-originated. There is no
+	// loop/turn/step (zero for a root), machine-originated. There is no
 	// ctx param, so it publishes on the session lifetime (s.sessionCtx). The header
 	// (Coordinates/Cause + minted EventID/CreatedAt) was stamped above before the loop
 	// was built.
@@ -1267,8 +1267,8 @@ func (s *Session) enqueuePreparedDelegate(ctx context.Context, backend loop.Back
 
 // depthUnderLock returns the ancestor-chain length a NEW loop spawned under parentLoopID
 // would have: it walks parentLoopID up the registry's parent links (loopHandle.parent.LoopID)
-// and counts each registered ancestor. A zero parentLoopID (a root spawn — the primary,
-// built by New) has no ancestors and returns 0; a child of the primary returns 1, its child
+// and counts each registered ancestor. A zero parentLoopID (the root built by New) has no
+// ancestors and returns 0; a child of that root returns 1, its child
 // 2, and so on. NewLoop rejects when this count >= limits.Depth, so the deepest spawnable
 // loop has an ancestor chain of limits.Depth-1.
 //
@@ -1316,7 +1316,7 @@ func (s *Session) newCommandID() (uuid.UUID, error) {
 	return id, nil
 }
 
-// New constructs a Session and starts its primary loop's actor
+// New constructs a Session and starts its zero-parent root loop's actor
 // goroutine. It owns the session fan-in hub and emits the session-scoped
 // SessionStarted through it.
 //
@@ -1820,7 +1820,7 @@ type loopSnapshot struct {
 }
 
 // Interrupt is the human "stop everything": it cancels the running turn of EVERY live loop
-// in the session — the primary AND every sub-loop — marking every one interrupt-pending BEFORE
+// in the session — every registered loop — marking each interrupt-pending before
 // fanning the command.Interrupt out to all of them CONCURRENTLY (design: "Session.Interrupt marks
 // every live loop interrupt-pending before concurrently sending commands"). Idle loops ack false
 // and are harmless; Interrupt returns true iff ANY loop reported it cancelled a running turn. A
@@ -1955,7 +1955,7 @@ type shutdownTarget struct {
 
 // Shutdown drives the WHOLE session to its stopped phase and blocks until every
 // loop's actor exits. Sub-loops are retained (each runs its own goroutine and
-// loopCtx), so Shutdown must reach EVERY loop, not just the primary. The order is
+// loopCtx), so Shutdown must reach every loop. The order is
 // deliberate:
 //
 //  1. Latch closing AND snapshot the loops in ONE loopsMu critical section. This
