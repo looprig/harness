@@ -166,6 +166,10 @@ type executionAdmission interface {
 	EnterExecution(context.Context, uuid.UUID) (func(), error)
 }
 
+type turnStartAdmission interface {
+	EnterTurnStart(context.Context, uuid.UUID) (func(), error)
+}
+
 // faultProbe is the actor's narrow read of the session's durable-persistence fault latch.
 // After emitting a mode/inference change event the actor probes it: a non-nil result means
 // the change event's REQUIRED durable append failed (the hub faulted the session inline via
@@ -1084,7 +1088,11 @@ func runLoop(cfg loopConfig, state loopState) {
 		admitCtx, cancel := context.WithCancel(ctx)
 		state.cancelAdmission = cancel
 		go func() {
-			release, err := admission.EnterExecution(admitCtx, state.id)
+			enter := admission.EnterExecution
+			if startAdmission, supportsTurnStart := cfg.events.(turnStartAdmission); supportsTurnStart {
+				enter = startAdmission.EnterTurnStart
+			}
+			release, err := enter(admitCtx, state.id)
 			select {
 			case admissions <- admissionResult{release: release, err: err}:
 			case <-admitCtx.Done():

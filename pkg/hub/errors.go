@@ -3,6 +3,7 @@ package hub
 import (
 	"fmt"
 
+	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/hustle"
 )
 
@@ -61,4 +62,25 @@ type HustleActivityError struct {
 
 func (e *HustleActivityError) Error() string {
 	return fmt.Sprintf("hub: hustle activity denied: %s", e.Reason)
+}
+
+// TurnStartReservationReason identifies why a loop could not reserve the Hub's
+// activity transition for its opening TurnStarted publication.
+type TurnStartReservationReason string
+
+const (
+	TurnStartReservationInvalidLoop TurnStartReservationReason = "invalid_loop_id"
+	TurnStartReservationStopped     TurnStartReservationReason = "session_stopped"
+	TurnStartReservationMismatch    TurnStartReservationReason = "publication_mismatch"
+)
+
+// TurnStartReservationError reports a denied or mismatched one-shot turn-start
+// activity reservation.
+type TurnStartReservationError struct {
+	Reason TurnStartReservationReason
+	LoopID uuid.UUID
+}
+
+func (e *TurnStartReservationError) Error() string {
+	return fmt.Sprintf("hub: turn-start activity reservation denied: %s", e.Reason)
 }
