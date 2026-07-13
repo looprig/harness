@@ -140,7 +140,8 @@ GOWORK=off GOCACHE=/private/tmp/inference-hustle-gocache \
   go test -race . -run 'TestModelKey|TestContextLimits|TestModel'
 ```
 
-**GREEN:** Add canonical `Model.Limits`; migrate and remove
+**GREEN:** Add canonical `Model.Limits`; use the existing typed `ProviderName`
+for `ModelKey.Provider`; migrate and remove
 `Capabilities.MaxContext`/`WithMaxContext`; add `WithContextLimits`. Key identity
 uses provider namespace plus provider model id only. Zero limit fields remain
 explicitly unknown.

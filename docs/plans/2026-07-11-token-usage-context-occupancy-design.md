@@ -295,7 +295,7 @@ it and never redefine it:
 // namespace plus the provider's own model id. Not a display name, not a catalog
 // pointer, so replay/catalog repair never depends on a mutable external catalog.
 type ModelKey struct {
-	Provider string
+	Provider ProviderName
 	Model    string
 }
 ```
