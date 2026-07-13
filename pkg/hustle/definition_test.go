@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"math"
 	"reflect"
 	"strings"
 	"testing"
@@ -49,6 +50,7 @@ func (e *testResolveCause) Error() string { return e.message }
 
 func validModel(name string) inference.Model {
 	temperature := 0.25
+	topP := 0.9
 	maxTokens := 321
 	return inference.Model{
 		Provider:  "test-provider",
@@ -57,6 +59,7 @@ func validModel(name string) inference.Model {
 		Name:      name,
 		Sampling: inference.Sampling{
 			Temperature: &temperature,
+			TopP:        &topP,
 			MaxTokens:   &maxTokens,
 			Stop:        []string{"END"},
 			Effort:      inference.EffortMedium,
@@ -143,9 +146,10 @@ func TestDefineValidation(t *testing.T) {
 	model := validModel("model")
 	typedNilClient := (*testClient)(nil)
 	tests := []struct {
-		name string
-		opts []Option
-		kind DefinitionErrorKind
+		name  string
+		opts  []Option
+		kind  DefinitionErrorKind
+		field string
 	}{
 		{name: "no options", opts: nil, kind: DefinitionMissingName},
 		{name: "nil option", opts: append(validNamedOptions(client, model), nil), kind: DefinitionNilOption},
@@ -168,6 +172,12 @@ func TestDefineValidation(t *testing.T) {
 		{name: "invalid named model", opts: replaceOption(validNamedOptions(client, model), 4, WithNamedInference(client, inference.Model{})), kind: DefinitionInvalidModel},
 		{name: "model missing durable provider", opts: replaceOption(validNamedOptions(client, model), 4, WithNamedInference(client, modelWithoutProvider(model))), kind: DefinitionInvalidModel},
 		{name: "invalid named model effort", opts: replaceOption(validNamedOptions(client, model), 4, WithNamedInference(client, modelWithEffort(model, inference.Effort("bogus")))), kind: DefinitionInvalidModel},
+		{name: "named nan temperature", opts: replaceOption(validNamedOptions(client, model), 4, WithNamedInference(client, modelWithTemperature(model, math.NaN()))), kind: DefinitionInvalidModel, field: "model.sampling.temperature"},
+		{name: "named positive infinity temperature", opts: replaceOption(validNamedOptions(client, model), 4, WithNamedInference(client, modelWithTemperature(model, math.Inf(1)))), kind: DefinitionInvalidModel, field: "model.sampling.temperature"},
+		{name: "named negative infinity temperature", opts: replaceOption(validNamedOptions(client, model), 4, WithNamedInference(client, modelWithTemperature(model, math.Inf(-1)))), kind: DefinitionInvalidModel, field: "model.sampling.temperature"},
+		{name: "named nan top p", opts: replaceOption(validNamedOptions(client, model), 4, WithNamedInference(client, modelWithTopP(model, math.NaN()))), kind: DefinitionInvalidModel, field: "model.sampling.top_p"},
+		{name: "named positive infinity top p", opts: replaceOption(validNamedOptions(client, model), 4, WithNamedInference(client, modelWithTopP(model, math.Inf(1)))), kind: DefinitionInvalidModel, field: "model.sampling.top_p"},
+		{name: "named negative infinity top p", opts: replaceOption(validNamedOptions(client, model), 4, WithNamedInference(client, modelWithTopP(model, math.Inf(-1)))), kind: DefinitionInvalidModel, field: "model.sampling.top_p"},
 		{name: "zero timeout", opts: replaceOption(validNamedOptions(client, model), 2, WithTimeout(0)), kind: DefinitionInvalidTimeout},
 		{name: "negative timeout", opts: replaceOption(validNamedOptions(client, model), 2, WithTimeout(-time.Nanosecond)), kind: DefinitionInvalidTimeout},
 		{name: "long timeout accepted", opts: replaceOption(validNamedOptions(client, model), 2, WithTimeout(24*time.Hour+time.Nanosecond))},
@@ -199,6 +209,9 @@ func TestDefineValidation(t *testing.T) {
 			var definitionErr *DefinitionError
 			if !errors.As(err, &definitionErr) || definitionErr.Kind != tt.kind {
 				t.Fatalf("Define() error = %T %v, want *DefinitionError kind %q", err, err, tt.kind)
+			}
+			if tt.field != "" && (definitionErr.Field != tt.field || definitionErr.Cause != nil) {
+				t.Fatalf("Define() error field/cause = (%q,%v), want (%q,nil)", definitionErr.Field, definitionErr.Cause, tt.field)
 			}
 		})
 	}
@@ -259,7 +272,12 @@ func TestDefinitionDescriptorIdentity(t *testing.T) {
 		{name: "client identity excluded", opts: validNamedOptions(&testClient{identity: "other-secret"}, validModel("model")), same: true},
 		{name: "model source", opts: replaceOption(validNamedOptions(client, baseModel), 4, WithCurrentLoopModel())},
 		{name: "model name", opts: validNamedOptions(client, validModel("other-model"))},
-		{name: "model sampling", opts: validNamedOptions(client, modelWithTemperature(baseModel, 0.75))},
+		{name: "model base URL", opts: validNamedOptions(client, modelWithBaseURL(baseModel, "https://other.example.invalid"))},
+		{name: "model temperature", opts: validNamedOptions(client, modelWithTemperature(baseModel, 0.75))},
+		{name: "model top p", opts: validNamedOptions(client, modelWithTopP(baseModel, 0.75))},
+		{name: "model max tokens", opts: validNamedOptions(client, modelWithMaxTokens(baseModel, 654))},
+		{name: "model stop", opts: validNamedOptions(client, modelWithStop(baseModel, []string{"STOP"}))},
+		{name: "model effort", opts: validNamedOptions(client, modelWithEffort(baseModel, inference.EffortLow))},
 		{name: "prompt bytes", opts: replaceOption(baseOptions, 5, WithSystemPrompt("Different prompt.", "prompt-v1"))},
 		{name: "prompt revision", opts: replaceOption(baseOptions, 5, WithSystemPrompt("Summarize the conversation.", "prompt-v2"))},
 		{name: "participation", opts: replaceOption(baseOptions, 1, WithParticipation(ParticipationBackground))},
@@ -298,12 +316,16 @@ func TestDefinitionDefensiveCopies(t *testing.T) {
 	client := &testClient{}
 	model := validModel("frozen")
 	originalTemperature := *model.Sampling.Temperature
+	originalTopP := *model.Sampling.TopP
+	originalMaxTokens := *model.Sampling.MaxTokens
 	originalStop := model.Sampling.Stop[0]
 	definition, err := Define(validNamedOptions(client, model)...)
 	if err != nil {
 		t.Fatalf("Define() error = %v", err)
 	}
 	*model.Sampling.Temperature = 0.99
+	*model.Sampling.TopP = 0.01
+	*model.Sampling.MaxTokens = 999
 	model.Sampling.Stop[0] = "MUTATED"
 	bound, err := definition.Bind(context.Background(), Bindings{})
 	if err != nil {
@@ -313,8 +335,10 @@ func TestDefinitionDefensiveCopies(t *testing.T) {
 		name   string
 		mutate func(InferenceBinding)
 	}{
-		{name: "sampling pointers", mutate: func(binding InferenceBinding) { *binding.Model.Sampling.Temperature = 0.88 }},
-		{name: "sampling slices", mutate: func(binding InferenceBinding) { binding.Model.Sampling.Stop[0] = "CHANGED" }},
+		{name: "temperature pointer", mutate: func(binding InferenceBinding) { *binding.Model.Sampling.Temperature = 0.88 }},
+		{name: "top p pointer", mutate: func(binding InferenceBinding) { *binding.Model.Sampling.TopP = 0.88 }},
+		{name: "max tokens pointer", mutate: func(binding InferenceBinding) { *binding.Model.Sampling.MaxTokens = 777 }},
+		{name: "stop slice", mutate: func(binding InferenceBinding) { binding.Model.Sampling.Stop[0] = "CHANGED" }},
 	}
 	for _, tt := range tests {
 		tt := tt
@@ -329,8 +353,9 @@ func TestDefinitionDefensiveCopies(t *testing.T) {
 			if resolveErr != nil {
 				t.Fatalf("ResolveInference(second) error = %v", resolveErr)
 			}
-			if *second.Model.Sampling.Temperature != originalTemperature || second.Model.Sampling.Stop[0] != originalStop {
-				t.Fatalf("resolved model mutated: temperature=%v stop=%q", *second.Model.Sampling.Temperature, second.Model.Sampling.Stop[0])
+			if *second.Model.Sampling.Temperature != originalTemperature || *second.Model.Sampling.TopP != originalTopP ||
+				*second.Model.Sampling.MaxTokens != originalMaxTokens || second.Model.Sampling.Stop[0] != originalStop {
+				t.Fatalf("resolved model mutated: temperature=%v top_p=%v max_tokens=%v stop=%q", *second.Model.Sampling.Temperature, *second.Model.Sampling.TopP, *second.Model.Sampling.MaxTokens, second.Model.Sampling.Stop[0])
 			}
 		})
 	}
@@ -395,6 +420,7 @@ func TestResolveInference(t *testing.T) {
 		kind      ResolveErrorKind
 		wantErr   bool
 		wantCause error
+		noCause   bool
 	}{
 		{name: "exact loop id delegated", resolver: &testResolver{wantID: loopID, binding: InferenceBinding{Client: client, Model: validModel("live")}}, ctx: context.Background(), loopID: loopID},
 		{name: "nil context", resolver: &testResolver{wantID: loopID}, loopID: loopID, kind: ResolveInvalidContext, wantErr: true},
@@ -403,6 +429,12 @@ func TestResolveInference(t *testing.T) {
 		{name: "nil resolved client", resolver: &testResolver{wantID: loopID, binding: InferenceBinding{Model: validModel("live")}}, ctx: context.Background(), loopID: loopID, kind: ResolveInvalidBinding, wantErr: true},
 		{name: "invalid resolved model", resolver: &testResolver{wantID: loopID, binding: InferenceBinding{Client: client}}, ctx: context.Background(), loopID: loopID, kind: ResolveInvalidBinding, wantErr: true},
 		{name: "invalid resolved model effort", resolver: &testResolver{wantID: loopID, binding: InferenceBinding{Client: client, Model: modelWithEffort(validModel("live"), inference.Effort("bogus"))}}, ctx: context.Background(), loopID: loopID, kind: ResolveInvalidBinding, wantErr: true},
+		{name: "current nan temperature", resolver: &testResolver{wantID: loopID, binding: InferenceBinding{Client: client, Model: modelWithTemperature(validModel("live"), math.NaN())}}, ctx: context.Background(), loopID: loopID, kind: ResolveInvalidBinding, wantErr: true, noCause: true},
+		{name: "current positive infinity temperature", resolver: &testResolver{wantID: loopID, binding: InferenceBinding{Client: client, Model: modelWithTemperature(validModel("live"), math.Inf(1))}}, ctx: context.Background(), loopID: loopID, kind: ResolveInvalidBinding, wantErr: true, noCause: true},
+		{name: "current negative infinity temperature", resolver: &testResolver{wantID: loopID, binding: InferenceBinding{Client: client, Model: modelWithTemperature(validModel("live"), math.Inf(-1))}}, ctx: context.Background(), loopID: loopID, kind: ResolveInvalidBinding, wantErr: true, noCause: true},
+		{name: "current nan top p", resolver: &testResolver{wantID: loopID, binding: InferenceBinding{Client: client, Model: modelWithTopP(validModel("live"), math.NaN())}}, ctx: context.Background(), loopID: loopID, kind: ResolveInvalidBinding, wantErr: true, noCause: true},
+		{name: "current positive infinity top p", resolver: &testResolver{wantID: loopID, binding: InferenceBinding{Client: client, Model: modelWithTopP(validModel("live"), math.Inf(1))}}, ctx: context.Background(), loopID: loopID, kind: ResolveInvalidBinding, wantErr: true, noCause: true},
+		{name: "current negative infinity top p", resolver: &testResolver{wantID: loopID, binding: InferenceBinding{Client: client, Model: modelWithTopP(validModel("live"), math.Inf(-1))}}, ctx: context.Background(), loopID: loopID, kind: ResolveInvalidBinding, wantErr: true, noCause: true},
 	}
 	for _, tt := range tests {
 		tt := tt
@@ -429,6 +461,9 @@ func TestResolveInference(t *testing.T) {
 			}
 			if tt.wantCause != nil && !errors.Is(resolveErr, tt.wantCause) {
 				t.Fatalf("ResolveInference() error = %v, want wrapped cause %v", resolveErr, tt.wantCause)
+			}
+			if tt.noCause && typed.Cause != nil {
+				t.Fatalf("ResolveInference() cause = %v, want nil", typed.Cause)
 			}
 		})
 	}
@@ -497,6 +532,26 @@ func modelWithoutProvider(model inference.Model) inference.Model {
 
 func modelWithTemperature(model inference.Model, value float64) inference.Model {
 	model.Sampling.Temperature = &value
+	return model
+}
+
+func modelWithBaseURL(model inference.Model, value string) inference.Model {
+	model.BaseURL = value
+	return model
+}
+
+func modelWithTopP(model inference.Model, value float64) inference.Model {
+	model.Sampling.TopP = &value
+	return model
+}
+
+func modelWithMaxTokens(model inference.Model, value int) inference.Model {
+	model.Sampling.MaxTokens = &value
+	return model
+}
+
+func modelWithStop(model inference.Model, value []string) inference.Model {
+	model.Sampling.Stop = value
 	return model
 }
 

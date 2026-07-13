@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"math"
 	"reflect"
 	"strconv"
 	"strings"
@@ -269,10 +270,35 @@ func validateInferenceBinding(binding InferenceBinding) error {
 	if err := binding.Model.Key().Validate(); err != nil {
 		return &DefinitionError{Kind: DefinitionInvalidModel, Field: "model_key", Cause: err}
 	}
-	if !binding.Model.Sampling.Effort.Valid() {
-		return &DefinitionError{Kind: DefinitionInvalidModel, Field: "model.sampling.effort"}
+	if field := invalidSamplingField(binding.Model.Sampling); field != "" {
+		return &DefinitionError{Kind: DefinitionInvalidModel, Field: string(field)}
 	}
 	return nil
+}
+
+type samplingField string
+
+const (
+	samplingTemperatureField samplingField = "model.sampling.temperature"
+	samplingTopPField        samplingField = "model.sampling.top_p"
+	samplingEffortField      samplingField = "model.sampling.effort"
+)
+
+func invalidSamplingField(sampling inference.Sampling) samplingField {
+	if nonFinite(sampling.Temperature) {
+		return samplingTemperatureField
+	}
+	if nonFinite(sampling.TopP) {
+		return samplingTopPField
+	}
+	if !sampling.Effort.Valid() {
+		return samplingEffortField
+	}
+	return ""
+}
+
+func nonFinite(value *float64) bool {
+	return value != nil && (math.IsNaN(*value) || math.IsInf(*value, 0))
 }
 
 func invalidLimits(limits Limits) bool {
@@ -447,7 +473,7 @@ func validateResolvedBinding(binding InferenceBinding) error {
 	if err := binding.Model.Key().Validate(); err != nil {
 		return &ResolveError{Kind: ResolveInvalidBinding, Cause: err}
 	}
-	if !binding.Model.Sampling.Effort.Valid() {
+	if invalidSamplingField(binding.Model.Sampling) != "" {
 		return &ResolveError{Kind: ResolveInvalidBinding}
 	}
 	return nil
