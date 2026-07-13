@@ -240,3 +240,58 @@ func TestNoHustleTopologyFingerprintPreservesLegacyMaterial(t *testing.T) {
 		})
 	}
 }
+
+func TestHustleTopologyCanonicalEncodingIsInjective(t *testing.T) {
+	t.Parallel()
+	limits := validHustleLimits()
+	tests := []struct {
+		name  string
+		left  []hustleTopologyRow
+		right []hustleTopologyRow
+	}{
+		{
+			name:  "newline policy tag cannot move from name to policy",
+			left:  []hustleTopologyRow{{Name: "alpha\npolicy:beta", PolicyRevision: "gamma"}},
+			right: []hustleTopologyRow{{Name: "alpha", PolicyRevision: "beta\npolicy:gamma"}},
+		},
+		{
+			name:  "embedded row tags cannot manufacture another definition",
+			left:  []hustleTopologyRow{{Name: "alpha", PolicyRevision: "beta\nhustle:charlie\npolicy:delta"}},
+			right: []hustleTopologyRow{{Name: "alpha", PolicyRevision: "beta"}, {Name: "charlie", PolicyRevision: "delta"}},
+		},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			left := canonicalHustleTopologyMaterial("legacy-topology-hash", tt.left, limits)
+			right := canonicalHustleTopologyMaterial("legacy-topology-hash", tt.right, limits)
+			if string(left) == string(right) {
+				t.Fatalf("distinct hustle rows encoded identically: %q", left)
+			}
+		})
+	}
+}
+
+func TestHustleTopologyCanonicalEncodingDeterministic(t *testing.T) {
+	t.Parallel()
+	limits := validHustleLimits()
+	first := hustleTopologyRow{Name: "alpha\npolicy:embedded", PolicyRevision: "first"}
+	second := hustleTopologyRow{Name: "zulu", PolicyRevision: "second"}
+	tests := []struct {
+		name  string
+		left  []hustleTopologyRow
+		right []hustleTopologyRow
+	}{
+		{name: "row order independent", left: []hustleTopologyRow{first, second}, right: []hustleTopologyRow{second, first}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			left := canonicalHustleTopologyMaterial("legacy-topology-hash", tt.left, limits)
+			right := canonicalHustleTopologyMaterial("legacy-topology-hash", tt.right, limits)
+			if string(left) != string(right) {
+				t.Fatalf("canonical encodings differ: %q != %q", left, right)
+			}
+		})
+	}
+}

@@ -160,20 +160,26 @@ func TestDefineHustleLimitsBoundaries(t *testing.T) {
 
 func TestDefineHustleLimitsAreSingleton(t *testing.T) {
 	t.Parallel()
+	valid := validHustleLimits()
+	invalid := valid
+	invalid.BlockingConcurrent = 0
 	tests := []struct {
-		name string
+		name   string
+		first  HustleLimits
+		second HustleLimits
 	}{
-		{name: "second limits option rejected"},
+		{name: "valid second occurrence rejected", first: valid, second: valid},
+		{name: "invalid second occurrence is still duplicate", first: valid, second: invalid},
 	}
 	for _, tt := range tests {
+		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			state := &definitionState{seen: make(map[singletonKey]bool)}
-			option := WithHustleLimits(validHustleLimits())
-			if err := option(state); err != nil {
+			if err := WithHustleLimits(tt.first)(state); err != nil {
 				t.Fatalf("first option error = %v", err)
 			}
 			var target *DefinitionError
-			if err := option(state); !errors.As(err, &target) || target.Kind != DefinitionDuplicateOption {
+			if err := WithHustleLimits(tt.second)(state); !errors.As(err, &target) || target.Kind != DefinitionDuplicateOption {
 				t.Fatalf("second option error = %T %v, want duplicate option", err, err)
 			}
 		})

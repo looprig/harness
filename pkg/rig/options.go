@@ -83,6 +83,9 @@ func WithHustles(definitions ...hustle.Definition) Option {
 // WithHustleLimits configures the required singleton lane bounds.
 func WithHustleLimits(limits HustleLimits) Option {
 	return func(state *definitionState) error {
+		if state.seen[keyHustleLimits] {
+			return &DefinitionError{Kind: DefinitionDuplicateOption, Name: string(keyHustleLimits)}
+		}
 		if invalidHustleLimits(limits) {
 			return &DefinitionError{Kind: DefinitionInvalidHustleLimits}
 		}

@@ -3,9 +3,9 @@ package rig
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"sort"
-	"strconv"
 	"strings"
 
 	"github.com/looprig/harness/pkg/event"
@@ -126,38 +126,54 @@ type topologyRevisionInput struct {
 func canonicalTopologyRevision(input topologyRevisionInput) string {
 	var material strings.Builder
 	writeLoopTopology(&material, input.definitions, input.primers, input.active)
-	if input.limits != nil {
-		material.WriteByte('\n')
-		writeHustleTopology(&material, input.hustles, *input.limits)
+	legacyRevision := hexSHA256(material.String())
+	if input.limits == nil {
+		return legacyRevision
 	}
-	return hexSHA256(material.String())
+	rows := make([]hustleTopologyRow, len(input.hustles))
+	for index, definition := range input.hustles {
+		rows[index] = hustleTopologyRow{Name: definition.Name(), PolicyRevision: definition.PolicyRevision()}
+	}
+	return hexSHA256Bytes(canonicalHustleTopologyMaterial(legacyRevision, rows, *input.limits))
 }
 
-func writeHustleTopology(material *strings.Builder, definitions []hustle.Definition, limits HustleLimits) {
-	ordered := append([]hustle.Definition(nil), definitions...)
-	sort.Slice(ordered, func(i, j int) bool { return ordered[i].Name() < ordered[j].Name() })
-	for _, definition := range ordered {
-		material.WriteString("hustle:")
-		material.WriteString(string(definition.Name()))
-		material.WriteByte('\n')
-		material.WriteString("policy:")
-		material.WriteString(definition.PolicyRevision())
-		material.WriteByte('\n')
-	}
-	writeHustleLimit(material, "blocking_concurrent", int64(limits.BlockingConcurrent))
-	writeHustleLimit(material, "blocking_queued", int64(limits.BlockingQueued))
-	writeHustleLimit(material, "background_concurrent", int64(limits.BackgroundConcurrent))
-	writeHustleLimit(material, "background_queued", int64(limits.BackgroundQueued))
-	writeHustleLimit(material, "audit_timeout", int64(limits.AuditTimeout))
-	writeHustleLimit(material, "finalization_timeout", int64(limits.FinalizationTimeout))
-	writeHustleLimit(material, "worker_drain_timeout", int64(limits.WorkerDrainTimeout))
+type hustleTopologyRow struct {
+	Name           hustle.Name
+	PolicyRevision string
 }
 
-func writeHustleLimit(material *strings.Builder, name string, value int64) {
-	material.WriteString(name)
-	material.WriteByte(':')
-	material.WriteString(strconv.FormatInt(value, 10))
-	material.WriteByte('\n')
+func canonicalHustleTopologyMaterial(legacyRevision string, rows []hustleTopologyRow, limits HustleLimits) []byte {
+	const encodingDomain string = "looprig/rig/hustle-topology/v1"
+	ordered := append([]hustleTopologyRow(nil), rows...)
+	sort.Slice(ordered, func(i, j int) bool {
+		if ordered[i].Name == ordered[j].Name {
+			return ordered[i].PolicyRevision < ordered[j].PolicyRevision
+		}
+		return ordered[i].Name < ordered[j].Name
+	})
+	material := appendCanonicalString(nil, encodingDomain)
+	material = appendCanonicalString(material, legacyRevision)
+	material = binary.BigEndian.AppendUint64(material, uint64(len(ordered)))
+	for _, row := range ordered {
+		material = appendCanonicalString(material, string(row.Name))
+		material = appendCanonicalString(material, row.PolicyRevision)
+	}
+	material = appendCanonicalInt64(material, int64(limits.BlockingConcurrent))
+	material = appendCanonicalInt64(material, int64(limits.BlockingQueued))
+	material = appendCanonicalInt64(material, int64(limits.BackgroundConcurrent))
+	material = appendCanonicalInt64(material, int64(limits.BackgroundQueued))
+	material = appendCanonicalInt64(material, int64(limits.AuditTimeout))
+	material = appendCanonicalInt64(material, int64(limits.FinalizationTimeout))
+	return appendCanonicalInt64(material, int64(limits.WorkerDrainTimeout))
+}
+
+func appendCanonicalString(material []byte, value string) []byte {
+	material = binary.BigEndian.AppendUint64(material, uint64(len(value)))
+	return append(material, value...)
+}
+
+func appendCanonicalInt64(material []byte, value int64) []byte {
+	return binary.BigEndian.AppendUint64(material, uint64(value))
 }
 
 func topologyRevision(definitions []loop.Definition, primers []string, active string) string {
@@ -196,7 +212,11 @@ func writeLoopTopology(material *strings.Builder, definitions []loop.Definition,
 }
 
 func hexSHA256(value string) string {
-	sum := sha256.Sum256([]byte(value))
+	return hexSHA256Bytes([]byte(value))
+}
+
+func hexSHA256Bytes(value []byte) string {
+	sum := sha256.Sum256(value)
 	return hex.EncodeToString(sum[:])
 }
 
