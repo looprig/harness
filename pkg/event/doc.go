@@ -23,6 +23,9 @@ var (
 	_ Event = SessionActive{}
 	_ Event = SessionIdle{}
 	_ Event = SessionStopped{}
+	_ Event = HustleStarted{}
+	_ Event = HustleCompleted{}
+	_ Event = HustleFailed{}
 	_ Event = RestoreStarted{}
 	_ Event = RestoreDone{}
 	_ Event = RestoreErrored{}

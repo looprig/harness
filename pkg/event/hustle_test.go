@@ -159,6 +159,10 @@ func TestHustleLifecycleValidation(t *testing.T) {
 	validRuntime := validHustleRuntime()
 	validRun := validHustleRun(t, validRuntime)
 	zeroRuntimeRun := validHustleRun(t, ModelRuntime{})
+	currentWithNamedKey := validRun
+	currentWithNamedKey.Definition.NamedModelKey = inference.ModelKey{Provider: "forbidden", Model: "named"}
+	currentWithNamedRevision := validRun
+	currentWithNamedRevision.Definition.NamedModelPolicyRevision = "forbidden-named-policy"
 	invalidUsage := &content.Usage{OutputTokens: 1, ReasoningTokens: 2}
 	tests := []struct {
 		name    string
@@ -173,6 +177,8 @@ func TestHustleLifecycleValidation(t *testing.T) {
 		{name: "completed invalid usage", ev: HustleCompleted{Header: validHustleHeader(Internal), Run: validRun, Usage: invalidUsage}, wantErr: true},
 		{name: "failed queue without runtime", ev: HustleFailed{Header: validHustleHeader(Internal), Run: zeroRuntimeRun, Stage: hustle.StageQueue, ReasonCode: hustle.ReasonCanceled}},
 		{name: "failed resolution without runtime", ev: HustleFailed{Header: validHustleHeader(Internal), Run: zeroRuntimeRun, Stage: hustle.StageModelResolution, ReasonCode: hustle.ReasonModelResolution}},
+		{name: "failed queue rejects resolved runtime", ev: HustleFailed{Header: validHustleHeader(Internal), Run: validRun, Stage: hustle.StageQueue, ReasonCode: hustle.ReasonCanceled}, wantErr: true},
+		{name: "failed resolution rejects resolved runtime", ev: HustleFailed{Header: validHustleHeader(Internal), Run: validRun, Stage: hustle.StageModelResolution, ReasonCode: hustle.ReasonModelResolution}, wantErr: true},
 		{name: "failed inference missing runtime", ev: HustleFailed{Header: validHustleHeader(Internal), Run: zeroRuntimeRun, Stage: hustle.StageInference, ReasonCode: hustle.ReasonInference}, wantErr: true},
 		{name: "failed pre-resolution usage invalid", ev: HustleFailed{Header: validHustleHeader(Internal), Run: zeroRuntimeRun, Stage: hustle.StageQueue, ReasonCode: hustle.ReasonCanceled, Usage: &content.Usage{}}, wantErr: true},
 		{name: "failed unknown stage", ev: HustleFailed{Header: validHustleHeader(Internal), Run: validRun, Stage: hustle.StageUnknown, ReasonCode: hustle.ReasonInference}, wantErr: true},
@@ -180,6 +186,10 @@ func TestHustleLifecycleValidation(t *testing.T) {
 		{name: "failed negative duration", ev: HustleFailed{Header: validHustleHeader(Internal), Run: validRun, Duration: -1, Stage: hustle.StageInference, ReasonCode: hustle.ReasonInference}, wantErr: true},
 		{name: "zero run id", ev: HustleCompleted{Header: validHustleHeader(Internal), Run: HustleRunDescriptor{Definition: validRun.Definition, Runtime: validRuntime}}, wantErr: true},
 		{name: "zero definition", ev: HustleCompleted{Header: validHustleHeader(Internal), Run: HustleRunDescriptor{RunID: validRun.RunID, Runtime: validRuntime}}, wantErr: true},
+		{name: "completed current loop rejects named key", ev: HustleCompleted{Header: validHustleHeader(Internal), Run: currentWithNamedKey}, wantErr: true},
+		{name: "failed current loop rejects named key", ev: HustleFailed{Header: validHustleHeader(Internal), Run: currentWithNamedKey, Stage: hustle.StageInference, ReasonCode: hustle.ReasonInference}, wantErr: true},
+		{name: "completed current loop rejects named policy revision", ev: HustleCompleted{Header: validHustleHeader(Internal), Run: currentWithNamedRevision}, wantErr: true},
+		{name: "failed current loop rejects named policy revision", ev: HustleFailed{Header: validHustleHeader(Internal), Run: currentWithNamedRevision, Stage: hustle.StageInference, ReasonCode: hustle.ReasonInference}, wantErr: true},
 		{name: "public lifecycle invalid", ev: HustleStarted{Header: validHustleHeader(Public), Run: zeroRuntimeRun}, wantErr: true},
 	}
 	for _, tt := range tests {

@@ -211,6 +211,8 @@ func validateHustleRun(name EventName, run HustleRunDescriptor) error {
 		if err := descriptor.NamedModelKey.Validate(); err != nil || strings.TrimSpace(descriptor.NamedModelPolicyRevision) == "" {
 			return invalidHustle(name, FieldDefinition)
 		}
+	} else if descriptor.NamedModelKey != (inference.ModelKey{}) || descriptor.NamedModelPolicyRevision != "" {
+		return invalidHustle(name, FieldDefinition)
 	}
 	if uuid.UUID(run.RunID).IsZero() {
 		return invalidHustle(name, FieldRunID)
@@ -241,9 +243,7 @@ func validateHustleFailed(e HustleFailed) error {
 			return invalidHustle(name, FieldUsage)
 		}
 		if !zeroModelRuntime(e.Run.Runtime) {
-			if err := validateModelRuntime(name, e.Run.Runtime); err != nil {
-				return invalidHustle(name, FieldRuntime)
-			}
+			return invalidHustle(name, FieldRuntime)
 		}
 		return nil
 	}

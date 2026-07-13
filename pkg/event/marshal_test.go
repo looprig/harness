@@ -9,6 +9,7 @@ import (
 
 	"github.com/looprig/core/content"
 	"github.com/looprig/core/uuid"
+	"github.com/looprig/harness/pkg/hustle"
 	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/tool"
 	"github.com/looprig/inference"
@@ -359,6 +360,27 @@ func sampleRuntime() ModelRuntime {
 	}
 }
 
+func exhaustiveHustleDescriptor() hustle.DefinitionDescriptor {
+	var promptSHA [32]byte
+	promptSHA[0] = 1
+	return hustle.DefinitionDescriptor{
+		Name: "exhaustive", Participation: hustle.ParticipationBlocking,
+		ModelSource: hustle.ModelSourceCurrentLoop, PromptRevision: "prompt-v1",
+		PromptSHA256: promptSHA, PolicyRevision: "policy-v1", TimeoutNanos: int64(time.Second),
+		Limits: hustle.Limits{InputBytes: 1, OutputBytes: 1},
+	}
+}
+
+func exhaustiveHustleHeader() Header {
+	header := fullHeaderSession()
+	header.EventVisibility = Internal
+	return header
+}
+
+func exhaustiveHustleRun(runtime ModelRuntime) HustleRunDescriptor {
+	return HustleRunDescriptor{Definition: exhaustiveHustleDescriptor(), RunID: hustle.RunID(seededUUID(0x92)), Runtime: runtime}
+}
+
 // TestMarshalEventRoundTripEnduring is the exhaustive fidelity table: one instance
 // of every Enduring event type round-trips through MarshalEvent/UnmarshalEvent
 // deep-equal to the original. TurnFailed.Err and RestoreErrored.Err are compared
@@ -380,6 +402,9 @@ func TestMarshalEventRoundTripEnduring(t *testing.T) {
 		{"SessionActive", SessionActive{Header: fullHeaderSession()}},
 		{"SessionIdle", SessionIdle{Header: fullHeaderSession()}},
 		{"SessionStopped", SessionStopped{Header: fullHeaderSession()}},
+		{"HustleStarted", HustleStarted{Header: exhaustiveHustleHeader(), Run: exhaustiveHustleRun(ModelRuntime{})}},
+		{"HustleCompleted", HustleCompleted{Header: exhaustiveHustleHeader(), Run: exhaustiveHustleRun(sampleRuntime()), Duration: time.Second, Usage: &content.Usage{InputTokens: 2, OutputTokens: 1}}},
+		{"HustleFailed", HustleFailed{Header: exhaustiveHustleHeader(), Run: exhaustiveHustleRun(sampleRuntime()), Duration: time.Second, Stage: hustle.StageInference, ReasonCode: hustle.ReasonInference, Usage: &content.Usage{InputTokens: 2, OutputTokens: 1}}},
 		{"RestoreStarted", RestoreStarted{Header: fullHeaderSession()}},
 		{"RestoreDone", RestoreDone{Header: fullHeaderSession()}},
 		{"WorkspaceCheckpointed", WorkspaceCheckpointed{
@@ -683,7 +708,7 @@ func TestMarshalEventPermissionRequestedFullRequest(t *testing.T) {
 // without codec coverage changes the live count derived from classify+Class() and
 // fails TestMarshalEventCoversEveryEnduringType. A missed Enduring type is an
 // unpersistable event = silent restore data loss, which this guard forbids.
-const wantEnduringTypes = 28
+const wantEnduringTypes = 31
 
 // unionInstances is one instance of EVERY type in the sealed union (Enduring and
 // Ephemeral alike), mirroring TestClassifyExhaustive. The drift guard partitions
@@ -692,6 +717,9 @@ const wantEnduringTypes = 28
 func unionInstances() []Event {
 	return []Event{
 		SessionStarted{}, SessionActive{}, SessionIdle{}, SessionStopped{},
+		HustleStarted{Header: exhaustiveHustleHeader(), Run: exhaustiveHustleRun(ModelRuntime{})},
+		HustleCompleted{Header: exhaustiveHustleHeader(), Run: exhaustiveHustleRun(sampleRuntime())},
+		HustleFailed{Header: exhaustiveHustleHeader(), Run: exhaustiveHustleRun(sampleRuntime()), Stage: hustle.StageInference, ReasonCode: hustle.ReasonInference},
 		RestoreStarted{}, RestoreDone{}, RestoreErrored{}, WorkspaceCheckpointed{}, WorkspaceRestored{}, ActiveLoopChanged{},
 		SecurityCeilingChanged{},
 		LoopIdle{}, LoopStarted{}, DelegateRequestAccepted{}, LoopInferenceChanged{}, LoopModeChanged{}, ForeignSessionBound{},
