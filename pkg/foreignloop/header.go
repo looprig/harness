@@ -7,6 +7,7 @@ import (
 
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/event"
+	"github.com/looprig/harness/pkg/identity"
 )
 
 // fillForeignHeader stamps the producer COORDINATES onto a foreign event from the
@@ -24,6 +25,15 @@ func fillForeignHeader(ev event.Event, sessionID, loopID, turnID, stepID uuid.UU
 		return e
 	case event.ForeignSessionBound:
 		e.Header.SessionID, e.Header.LoopID = sessionID, loopID
+		return e
+	case event.DelegateRequestAccepted:
+		e.Header.SessionID, e.Header.LoopID = sessionID, loopID
+		return e
+	case event.InputQueued:
+		e.Header.SessionID, e.Header.LoopID = sessionID, loopID
+		return e
+	case event.InputCancelled:
+		e.Header.SessionID, e.Header.LoopID, e.Header.TurnID = sessionID, loopID, turnID
 		return e
 	case event.TurnDone:
 		e.Header.SessionID, e.Header.LoopID, e.Header.TurnID = sessionID, loopID, turnID
@@ -61,6 +71,12 @@ func withForeignHeader(ev event.Event, h event.Header) event.Event {
 		e.Header = h
 		return e
 	case event.ForeignSessionBound:
+		e.Header = h
+		return e
+	case event.DelegateRequestAccepted:
+		e.Header = h
+		return e
+	case event.InputCancelled:
 		e.Header = h
 		return e
 	case event.StepDone:
@@ -104,4 +120,15 @@ func (l *Loop) publisher(ctx context.Context, turnID, stepID uuid.UUID) func(eve
 			slog.Error("foreignloop: event publish to session fan-in failed", "error", err)
 		}
 	}
+}
+
+// publishAcceptance is the checked transactional path for a managed follow-up.
+// It returns EventID mint and required durable-append failures to the actor.
+func (l *Loop) publishAcceptance(ctx context.Context, commandID uuid.UUID) error {
+	ev := fillForeignHeader(event.DelegateRequestAccepted{Header: event.Header{Cause: identity.Cause{CommandID: commandID}}}, l.sessionID, l.loopID, uuid.UUID{}, uuid.UUID{})
+	h, err := l.fac.Stamp(ev.EventHeader())
+	if err != nil {
+		return err
+	}
+	return l.pub.PublishEventChecked(ctx, withForeignHeader(ev, h))
 }

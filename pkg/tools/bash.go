@@ -83,39 +83,88 @@ type bashArgs struct {
 	Grants []string `json:"grants,omitempty"`
 }
 
-// Bash runs a single shell command in a workspace-contained directory. It depends
-// only on the workspace root (least privilege); the advisory DeniedBashPrefixes
-// gate is the PermissionChecker's concern, not the tool's. runner is the OPTIONAL
-// confined-execution seam (§10.1): nil means direct `sh -c` execution (the
-// bare-harness default), non-nil routes the command through the injected runner
-// (e.g. the sandbox Executor) instead.
-type Bash struct {
-	root   string
-	runner tool.CommandRunner
+// BashTool runs a single shell command in a workspace-contained directory. It
+// depends on the workspace root and an optional confined-execution runner;
+// advisory command policy remains the PermissionChecker's concern. A nil runner
+// means direct `sh -c` execution (the bare-harness default), while an invalid
+// option or typed-nil runner fails closed through a model-safe error.
+type BashTool struct {
+	root    string
+	runner  tool.CommandRunner
+	coord   tool.WorkspaceCoordinator
+	obs     tool.WorkspaceObservations
+	initErr error
 }
 
-// BashOption configures a Bash at construction (functional-options pattern).
-type BashOption func(*Bash)
+// BashOption configures a BashTool at construction (functional-options pattern).
+type BashOption func(*BashTool)
 
 // WithRunner injects a confined command runner. When set, InvokableRun routes the
 // command through r.RunCommand instead of the direct `sh -c` path. A nil runner
 // (the default) preserves the exact bare-harness direct-execution behavior.
 func WithRunner(r tool.CommandRunner) BashOption {
-	return func(b *Bash) { b.runner = r }
+	return func(b *BashTool) { b.runner = r }
 }
 
-// NewBash constructs a Bash tool bound to the workspace root. With no options the
-// runner is nil (direct execution); WithRunner injects a confined runner.
-func NewBash(root string, opts ...BashOption) *Bash {
-	b := &Bash{root: root}
-	for _, opt := range opts {
-		opt(b)
+// WithWorkspaceCoordinator binds the session workspace coordinator so a command run
+// holds the EXCLUSIVE whole-workspace mutation permit (design §"File-tool optimistic
+// concurrency and binding"). A nil or typed-nil coordinator is ignored (the tool runs
+// coordinator-free — the standalone/bare path).
+func WithWorkspaceCoordinator(coord tool.WorkspaceCoordinator) BashOption {
+	return func(b *BashTool) {
+		if !nilInterface(coord) {
+			b.coord = coord
+		}
 	}
+}
+
+// WithObservations binds the loop's shared file-observation set so a command run
+// invalidates it wholesale afterward (the changed paths are unknowable). A nil or
+// typed-nil set is ignored (no invalidation).
+func WithObservations(obs tool.WorkspaceObservations) BashOption {
+	return func(b *BashTool) {
+		if !nilInterface(obs) {
+			b.obs = obs
+		}
+	}
+}
+
+// NewBash constructs a BashTool bound to the workspace root. With no options, or
+// WithRunner(nil), the tool uses direct execution. Invalid options and typed-nil
+// runners are retained as initialization errors and fail closed when invoked.
+func NewBash(root string, opts ...BashOption) *BashTool {
+	config, initErr := resolveBashOptions(opts)
+	b := newBash(root, config)
+	b.initErr = initErr
 	return b
 }
 
+type bashConfig struct {
+	runner tool.CommandRunner
+	coord  tool.WorkspaceCoordinator
+	obs    tool.WorkspaceObservations
+}
+
+func resolveBashOptions(opts []BashOption) (bashConfig, error) {
+	resolved := &BashTool{}
+	for _, opt := range opts {
+		if opt == nil {
+			return bashConfig{}, &DefinitionBuildError{Definition: bashToolName, Dependency: "option"}
+		}
+		opt(resolved)
+	}
+	if resolved.runner != nil && nilInterface(resolved.runner) {
+		return bashConfig{}, &DefinitionBuildError{Definition: bashToolName, Dependency: "runner"}
+	}
+	return bashConfig{runner: resolved.runner, coord: resolved.coord, obs: resolved.obs}, nil
+}
+
+func newBash(root string, config bashConfig) *BashTool {
+	return &BashTool{root: root, runner: config.runner, coord: config.coord, obs: config.obs}
+}
+
 // Info returns Bash's self-description. Name MUST equal "Bash".
-func (b *Bash) Info(context.Context) (*tool.ToolInfo, error) {
+func (b *BashTool) Info(context.Context) (*tool.ToolInfo, error) {
 	return &tool.ToolInfo{
 		Name:   bashToolName,
 		Desc:   bashDesc,
@@ -127,7 +176,7 @@ func (b *Bash) Info(context.Context) (*tool.ToolInfo, error) {
 // at the gate, so it is the right (and only) redacted summary. No secrets are
 // added beyond the command the user already sees. An unparseable args document
 // yields a generic summary.
-func (b *Bash) AuditSummary(argsJSON string) string {
+func (b *BashTool) AuditSummary(argsJSON string) string {
 	var a bashArgs
 	if err := json.Unmarshal([]byte(argsJSON), &a); err != nil || a.Command == "" {
 		return "Bash (unparsable args)"
@@ -147,7 +196,10 @@ func (b *Bash) AuditSummary(argsJSON string) string {
 // verbatim and consumed separately at InvokableRun. BuildRequest never puts a.Grants
 // on the prompt (a model-supplied token is not executor-verified, so it must not be
 // shown as an authorized grant).
-func (b *Bash) BuildRequest(argsJSON string, _ tool.PreparedArtifact) (tool.PermissionRequest, error) {
+func (b *BashTool) BuildRequest(argsJSON string, _ tool.PreparedArtifact) (tool.PermissionRequest, error) {
+	if b.initErr != nil {
+		return nil, &bashError{reason: "Bash is unavailable", cause: b.initErr}
+	}
 	var a bashArgs
 	if err := json.Unmarshal([]byte(argsJSON), &a); err != nil {
 		return nil, &bashError{reason: "invalid arguments: not a JSON object", cause: err}
@@ -182,7 +234,7 @@ func (b *Bash) BuildRequest(argsJSON string, _ tool.PreparedArtifact) (tool.Perm
 // executor's own PlanGrants→DescribeGrant output. Wiring a.Grants in here would put an
 // unverified model-supplied token on the prompt as if it were authorized — exactly the
 // fail-secure violation this seam exists to prevent.
-func (b *Bash) planGrants(workdir, command string) ([]tool.GrantDisplay, error) {
+func (b *BashTool) planGrants(workdir, command string) ([]tool.GrantDisplay, error) {
 	pg, okPlan := b.runner.(interface {
 		PlanGrants(dir, command string) []string
 	})
@@ -219,7 +271,7 @@ func (b *Bash) planGrants(workdir, command string) ([]tool.GrantDisplay, error) 
 // error), AND the PermissionChecker's grant re-mint seam all derive the spawn dir
 // identically — "grants are planned/minted for the same dir InvokableRun runs in" is a
 // structural guarantee, not a copy-paste coincidence.
-func (b *Bash) resolveDir(workdir string) (string, error) {
+func (b *BashTool) resolveDir(workdir string) (string, error) {
 	return resolveSpawnDir(b.root, workdir)
 }
 
@@ -244,7 +296,10 @@ func resolveSpawnDir(root, workdir string) (string, error) {
 // tool result. A non-zero exit is a normal result; a timeout, an escaping
 // workdir, or an unparseable args document is a tool-result error string. It
 // never returns a Go error.
-func (b *Bash) InvokableRun(ctx context.Context, argsJSON string) (*tool.ToolResult, error) {
+func (b *BashTool) InvokableRun(ctx context.Context, argsJSON string) (*tool.ToolResult, error) {
+	if b.initErr != nil {
+		return tool.TextResult("error: Bash is unavailable: " + b.initErr.Error()), nil
+	}
 	var a bashArgs
 	if err := json.Unmarshal([]byte(argsJSON), &a); err != nil {
 		return tool.TextResult("error: invalid arguments: not a JSON object"), nil
@@ -259,6 +314,23 @@ func (b *Bash) InvokableRun(ctx context.Context, argsJSON string) (*tool.ToolRes
 	if err != nil {
 		return tool.TextResult("error: workdir is outside the workspace: " + a.Workdir), nil
 	}
+
+	// Take the EXCLUSIVE whole-workspace mutation permit for the run: Bash may change
+	// unknowable paths, so while it runs it excludes ALL structured path mutations and
+	// every other whole/checkpoint permit session-wide. Acquire on the OUTER ctx (not
+	// the command-timeout ctx below) so a slow command's timeout can't cancel an
+	// already-held permit; a ctx-canceled acquire returns WITHOUT running. A nil
+	// coordinator (bare path) yields a no-op permit.
+	permit, err := b.acquireWhole(ctx)
+	if err != nil {
+		return tool.TextResult("error: " + err.Error()), nil
+	}
+	defer permit.Release()
+	// Whichever way the run ends (success, non-zero exit, timeout, or start error) the
+	// loop's ENTIRE file-observation set is invalidated, because the changed paths are
+	// unknowable — Bash gains no file-level compare-and-swap. This defer fires only
+	// once the command has been attempted (after a successful acquire).
+	defer b.invalidateObservations()
 
 	// Gather escalation grants from BOTH sources: the tool's own args and any the
 	// runner placed on ctx after a pre-ask approval (union, dedup, order-stable).
@@ -303,6 +375,25 @@ func (b *Bash) InvokableRun(ctx context.Context, argsJSON string) (*tool.ToolRes
 		return tool.TextResult("error: could not run command: " + runErr.Error()), nil
 	}
 	return tool.TextResult(formatBashResult(out, exitCode)), nil
+}
+
+// acquireWhole takes the exclusive whole-workspace mutation permit for a command run.
+// A nil coordinator (the bare/standalone path) yields a no-op permit so InvokableRun
+// runs the command coordinator-free. ctx is the OUTER per-call ctx; a canceled acquire
+// returns the coordinator's typed error and no permit.
+func (b *BashTool) acquireWhole(ctx context.Context) (tool.WorkspacePermit, error) {
+	if nilInterface(b.coord) {
+		return noPermit{}, nil
+	}
+	return b.coord.Acquire(ctx, tool.WorkspaceOperationWholeMutation, "")
+}
+
+// invalidateObservations drops the loop's entire file-observation set after a Bash
+// run (a no-op when no observation set is bound).
+func (b *BashTool) invalidateObservations() {
+	if !nilInterface(b.obs) {
+		b.obs.InvalidateAll()
+	}
 }
 
 // clampBashTimeout maps a caller-supplied timeout (seconds) into a bounded
@@ -469,10 +560,10 @@ func (e *bashError) Error() string { return e.reason }
 
 func (e *bashError) Unwrap() error { return e.cause }
 
-// compile-time assertions: Bash is an InvokableTool, a PermissionPrompter (Ask),
+// compile-time assertions: BashTool is an InvokableTool, a PermissionPrompter (Ask),
 // and Auditable. It is NOT a WriteTarget (it is not a path-write tool).
 var (
-	_ tool.InvokableTool      = (*Bash)(nil)
-	_ tool.PermissionPrompter = (*Bash)(nil)
-	_ tool.Auditable          = (*Bash)(nil)
+	_ tool.InvokableTool      = (*BashTool)(nil)
+	_ tool.PermissionPrompter = (*BashTool)(nil)
+	_ tool.Auditable          = (*BashTool)(nil)
 )

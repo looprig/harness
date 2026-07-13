@@ -35,7 +35,7 @@ type Loop struct {
 	sid       string // the minted foreign session id (stamped onto LoopStarted by the caller)
 	parent    loop.Provenance
 	pub       EventPublisher
-	cfg       loop.Config
+	cfg       loop.BoundDefinition
 	spec      Spec
 	idGen     func() (uuid.UUID, error)
 	fac       *event.Factory
@@ -45,6 +45,13 @@ type Loop struct {
 	turnIndex  event.TurnIndex
 	hasSpawned bool
 	sidBound   bool
+	pending    []preparedInput
+}
+
+type preparedInput struct {
+	command command.UserInput
+	turnID  uuid.UUID
+	stepID  uuid.UUID
 }
 
 // compile-time proof the foreign loop satisfies the engine-agnostic Backend.
@@ -56,7 +63,7 @@ var _ loop.Backend = (*Loop)(nil)
 // it onto LoopStarted). loopCtx is the loop's lifetime; cancelling it tears the
 // actor down.
 func New(loopCtx context.Context, sessionID, loopID uuid.UUID, parent loop.Provenance,
-	pub EventPublisher, cfg loop.Config, spec Spec,
+	pub EventPublisher, cfg loop.BoundDefinition, spec Spec,
 	idGen func() (uuid.UUID, error), fac *event.Factory) (*Loop, string, error) {
 	if err := validateWiring(cfg, spec, idGen, fac, pub); err != nil {
 		return nil, "", err
@@ -97,9 +104,9 @@ func New(loopCtx context.Context, sessionID, loopID uuid.UUID, parent loop.Prove
 // validateWiring fail-secure validates the caller-supplied wiring shared by New and
 // NewRestored, returning a typed *ConfigError on the first missing dependency. It does
 // NOT validate the restore seed; that is the restored constructor's own concern.
-func validateWiring(cfg loop.Config, spec Spec, idGen func() (uuid.UUID, error), fac *event.Factory, pub EventPublisher) error {
+func validateWiring(cfg loop.BoundDefinition, spec Spec, idGen func() (uuid.UUID, error), fac *event.Factory, pub EventPublisher) error {
 	switch {
-	case cfg.System == "":
+	case cfg == nil || cfg.EffectiveSystem() == "":
 		return &ConfigError{Field: "System", Reason: "required"}
 	case spec.Agent == nil:
 		return &ConfigError{Field: "Spec.Agent", Reason: "required"}
@@ -114,13 +121,13 @@ func validateWiring(cfg loop.Config, spec Spec, idGen func() (uuid.UUID, error),
 }
 
 // BuildWith adapts New to the foreignloop.Builder seam the composition root wires:
-// it closes over the per-agent Spec (resolved at the root, NOT on loop.Config) and
+// it closes over the per-agent Spec (resolved at the root, NOT on loop.BoundDefinition) and
 // returns a Builder that constructs the foreign loop as a loop.Backend. On a
 // construction error it returns a NIL Backend (never a non-nil interface wrapping a
 // nil *Loop), so the caller's nil check behaves.
 func BuildWith(spec Spec) Builder {
 	return func(loopCtx context.Context, sessionID, loopID uuid.UUID,
-		parent loop.Provenance, pub EventPublisher, cfg loop.Config,
+		parent loop.Provenance, pub EventPublisher, cfg loop.BoundDefinition,
 		idGen func() (uuid.UUID, error), fac *event.Factory) (loop.Backend, string, error) {
 		l, sid, err := New(loopCtx, sessionID, loopID, parent, pub, cfg, spec, idGen, fac)
 		if err != nil {
@@ -143,6 +150,14 @@ func (l *Loop) DoneChan() <-chan struct{} { return l.Done }
 func (l *Loop) run(loopCtx context.Context) {
 	defer close(l.Done)
 	for {
+		if len(l.pending) > 0 {
+			next := l.pending[0]
+			l.pending = l.pending[1:]
+			if l.runTurn(loopCtx, next) {
+				return
+			}
+			continue
+		}
 		select {
 		case <-loopCtx.Done():
 			return
@@ -151,7 +166,14 @@ func (l *Loop) run(loopCtx context.Context) {
 		case cmd := <-l.Commands:
 			switch c := cmd.(type) {
 			case command.UserInput:
-				if l.runTurn(loopCtx, c) {
+				prepared, ok := l.prepareInput(loopCtx, c)
+				if !ok {
+					continue
+				}
+				if c.Accepted != nil {
+					c.Accepted <- nil
+				}
+				if l.runTurn(loopCtx, prepared) {
 					return // a Shutdown arrived mid-turn; defer closes Done.
 				}
 			case command.Shutdown:
@@ -159,11 +181,49 @@ func (l *Loop) run(loopCtx context.Context) {
 				return // defer closes Done.
 			case command.Interrupt:
 				c.Ack <- false // idle: nothing to interrupt.
+			case command.CancelDelegateRequest:
+				if c.Ack != nil {
+					c.Ack <- command.DelegateCancelNoop
+				}
 			default:
 				slog.Warn("foreignloop: dropping un-honorable command while idle", "type", fmt.Sprintf("%T", cmd))
 			}
 		}
 	}
+}
+
+func (l *Loop) prepareInput(ctx context.Context, c command.UserInput) (preparedInput, bool) {
+	if err := command.ValidateCommand(c); err != nil {
+		if c.Accepted != nil {
+			c.Accepted <- err
+		}
+		return preparedInput{}, false
+	}
+	turnID, err := l.idGen()
+	if err != nil {
+		if c.Accepted != nil {
+			c.Accepted <- err
+		} else {
+			slog.Error("foreignloop: turn id mint failed; dropping submit (fail-secure)", "error", err)
+		}
+		return preparedInput{}, false
+	}
+	stepID, err := l.idGen()
+	if err != nil {
+		if c.Accepted != nil {
+			c.Accepted <- err
+		} else {
+			slog.Error("foreignloop: step id mint failed; dropping submit (fail-secure)", "error", err)
+		}
+		return preparedInput{}, false
+	}
+	if c.Accepted != nil {
+		if err := l.publishAcceptance(ctx, c.CommandID); err != nil {
+			c.Accepted <- err
+			return preparedInput{}, false
+		}
+	}
+	return preparedInput{command: c, turnID: turnID, stepID: stepID}, true
 }
 
 // cloneMessages returns a copy of the message thread with its OWN backing array so a

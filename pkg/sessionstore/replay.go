@@ -157,8 +157,8 @@ var _ journal.EventReplayer = (*eventReplayer)(nil)
 // req.LoopID, when non-zero, narrows the replay to that loop exactly as pkg/journal's
 // subject-filtered EventReplayer does: it keeps the session-scoped events (which the
 // NATS filter captures via the session-event subject) PLUS that loop's events, and
-// drops every OTHER loop's events. This is load-bearing for restore's foldPrimaryLoop,
-// which must not fold a subagent loop's events into the primary loop's thread. A zero
+// drops every OTHER loop's events. This is load-bearing for restore's foldLoop,
+// which must not fold one loop's events into the requested root loop's thread. A zero
 // LoopID replays all loops' events (unnarrowed). The session and start are bound at
 // OpenEventReplayer time; positioning is not re-read from req (journal.StartPos is
 // package-private), but LoopID and Follow are exported and honored here.

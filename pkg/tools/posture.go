@@ -3,6 +3,7 @@ package tools
 import (
 	"encoding/json"
 
+	"github.com/looprig/harness/pkg/ceiling"
 	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/harness/pkg/tool"
 )
@@ -94,11 +95,10 @@ type Posture struct {
 // tokens (SPEC §10.7 item 1). Its mere non-empty presence forces human review.
 const fieldGrants = "grants"
 
-// CeilingSource is the stdlib-only ORDINAL source the dynamic posture option reads
+// CeilingSource is the named ORDINAL source the dynamic posture option reads
 // per Check (§8). harness treats the ceiling as an ordinal ONLY (0 = most
 // restrictive); the consumer maps ordinal -> Posture via the registered table.
-// This mirrors the sandbox ModeSource's shape without any shared type: a session
-// ceiling change (journaled command -> event) simply moves Current().
+// A session ceiling change (journaled command -> event) simply moves Current().
 type CeilingSource interface {
 	// Current returns the live ceiling ordinal (0 = most restrictive). It is read
 	// on every Check, so a downgrade takes effect on the very next decision.
@@ -107,7 +107,7 @@ type CeilingSource interface {
 	// during Check — it must be cheap and MUST NOT call back into Check (the mutex
 	// is non-reentrant → re-entry deadlocks; mirrors the Stage-3 EffectChecker
 	// contract).
-	Current() uint8
+	Current() ceiling.Level
 }
 
 // postureSelector produces the Posture in force for a single Check. A nil selector
@@ -144,7 +144,7 @@ func (cp ceilingPostures) current() Posture {
 		// clamp UP to table[len-1] — that would be the most permissive entry.
 		return cp.table[0]
 	}
-	return cp.table[ord]
+	return cp.table[int(ord)]
 }
 
 // WithPosture configures a FIXED-mode posture and the ONE confined runner the

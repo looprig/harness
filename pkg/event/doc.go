@@ -1,4 +1,6 @@
-// Package event defines the sealed union of loop-machine events.
+// Package event defines the sealed union of rig, session, loop, turn, step, and
+// tool events. Enduring rig-control and workspace transitions are durable replay
+// inputs; ephemeral streaming events are never persisted.
 //
 // Every concrete event embeds a Header (producer identity), exactly one lifecycle
 // mixin (ephemeral, enduring, or terminal — supplying Class()/EndsTurn()), and
@@ -25,11 +27,16 @@ var (
 	_ Event = RestoreDone{}
 	_ Event = RestoreErrored{}
 	_ Event = WorkspaceCheckpointed{}
+	_ Event = WorkspaceRestored{}
+	_ Event = ActiveLoopChanged{}
 	_ Event = SecurityCeilingChanged{}
 
 	// Loop-scoped events.
 	_ Event = LoopIdle{}
 	_ Event = LoopStarted{}
+	_ Event = DelegateRequestAccepted{}
+	_ Event = LoopInferenceChanged{}
+	_ Event = LoopModeChanged{}
 	_ Event = ForeignSessionBound{}
 
 	// Turn/step-scoped events.

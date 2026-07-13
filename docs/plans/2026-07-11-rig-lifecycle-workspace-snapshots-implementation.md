@@ -87,7 +87,12 @@ type PathReporter interface {
 }
 ```
 
-The storage test must prove callers receive a defensive copy. The fsstore test must prove its canonical root is reported once. Harness tests must prove `sessionstore.Store.PersistencePaths()` and `workspacestore.Store.PersistencePaths()` collect, canonicalize, sort, and deduplicate reporter paths while remote/non-reporting providers return none.
+The storage test pins the optional interface with a fake reporter. The fsstore test must
+prove its canonical root is reported once and returned as a defensive copy. Harness tests
+must prove `sessionstore.Store.PersistencePaths()` and
+`workspacestore.Store.PersistencePaths()` return defensive copies and collect,
+canonicalize, sort, and deduplicate reporter paths while remote/non-reporting providers
+return none.
 
 **Step 2: Run tests and verify failure**
 
@@ -127,6 +132,10 @@ git commit -m "feat(storage): expose persistence paths to rig validation"
 - Create: `pkg/tool/definition_test.go`
 - Create: `pkg/tools/definitions.go`
 - Create: `pkg/tools/definitions_test.go`
+- Modify: `pkg/tools/bash.go`
+- Modify: `pkg/tools/bash_test.go`
+- Modify: `pkg/tools/subagent.go`
+- Modify: `pkg/tools/subagent_test.go`
 - Modify: `pkg/tool/deps_test.go`
 
 **Step 1: Write failing tests**
@@ -173,7 +182,17 @@ tools.Bash(opts...)
 tools.Subagent()
 ```
 
-Also provide definition wrappers for existing stateless tools so `loop.WithTools` has one input type. Keep current concrete constructors for package tests/custom low-level tool use, but rig composition accepts definitions only. Every `Build` must return fresh mutable instances.
+Go cannot declare a type and function with the same package name. Rename only the
+existing concrete `Bash` and `Subagent` types to `BashTool` and `SubagentTool`; keep
+`NewBash` and `NewSubagent` as the low-level constructors returning those types. The
+short `Bash` and `Subagent` identifiers then belong to the approved blueprint functions.
+
+Provide one factory-backed definition constructor in `pkg/tool` for custom/stateless
+tools so `loop.WithTools` always receives `tool.Definition`; do not add a second static
+instance path that could reuse mutable tools across sessions. Existing concrete tool
+constructors remain usable in low-level package tests/custom runtimes, but rig
+composition accepts definitions only. Every `Build` invocation must return fresh mutable
+instances.
 
 **Step 4: Verify green**
 
@@ -196,6 +215,7 @@ git commit -m "feat(tool): add immutable runtime-bound definitions"
 - Create: `pkg/loop/controller.go`
 - Create: `pkg/loop/definition_errors.go`
 - Modify: `pkg/loop/config.go` (temporary internal compatibility only)
+- Modify: `pkg/loop/deps.go`
 - Modify: `pkg/loop/deps_test.go`
 
 **Step 1: Write failing definition tests**
@@ -221,7 +241,15 @@ type Mode struct {
 }
 ```
 
-Options include `WithName`, `WithInference`, `WithSystem`, `WithTools`, `WithToolLimits`, `WithEngine`, `WithDrainTimeout`, `WithRuntimeContext`, `WithDelegates`, `WithDelegation`, `WithModes`, and `WithInitialMode`. `Definition.Bind(ctx, tool.Bindings)` returns an immutable read-only `BoundDefinition` used by internal runtimes; no exported mutable config struct is introduced.
+Options include `WithName`, `WithInference`, `WithSystem`, `WithTools`,
+`WithPermissionFactory`, `WithToolMiddlewares`, `WithToolLimits`, `WithEngine`,
+`WithDrainTimeout`, `WithRuntimeContext`, `WithDelegates`, `WithDelegation`,
+`WithModes`, and `WithInitialMode`. `PermissionFactory` receives the same attenuated
+per-loop `tool.Bindings` and must return a fresh/non-nil `PermissionGate`, preventing a
+mutable checker or ceiling source from being accidentally shared across sessions.
+Middlewares are copied immutable collaborators. `Definition.Bind(ctx, tool.Bindings)`
+returns an immutable read-only `BoundDefinition` used by internal runtimes; no exported
+mutable config struct is introduced.
 
 **Step 2: Verify red**
 
@@ -233,7 +261,15 @@ Expected: undefined definition API.
 
 **Step 3: Implement and bridge temporarily**
 
-Implement option resolution with typed errors and defensive copies. Add one temporary internal conversion from `BoundDefinition` to the existing actor `Config`; mark it for deletion in Task 7. Preserve existing foreign-builder, gate, parallel-tool, runtime-context, and fingerprint inputs rather than dropping them during the API rename.
+Implement option resolution with typed errors and defensive copies. Use a concrete
+`Definition` value with unexported state (not an externally implementable interface),
+and a sealed read-only `BoundDefinition` contract for the internal actor. Bind every
+distinct tool definition once per loop, reuse those concrete instances across that
+loop's modes, and reject duplicate definition/built-tool names. Resolve the permission
+factory once per binding and copy middleware slices. Add one temporary internal
+conversion from `BoundDefinition` to the existing actor `Config`; mark it for deletion
+in Task 7. Preserve existing foreign-builder, gate, parallel-tool, runtime-context, and
+fingerprint inputs rather than dropping them during the API rename.
 Binding tests must prove modes on one loop reuse its concrete tool instances and private
 observations, while every primer, delegate, and restored loop receives a fresh build.
 

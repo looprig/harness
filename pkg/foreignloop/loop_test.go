@@ -6,17 +6,49 @@ import (
 	"testing"
 	"time"
 
+	"github.com/looprig/core/content"
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/command"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/loop"
+	"github.com/looprig/harness/pkg/tool"
+	"github.com/looprig/inference"
 )
 
-// validCfg is the minimal loop.Config a foreign loop accepts: a non-empty system
-// prompt (the only field foreignloop.New validates).
-func validCfg() loop.Config {
-	return loop.Config{System: "you are a test agent"}
+type boundTestClient struct{}
+
+func (boundTestClient) Invoke(context.Context, inference.Request) (*inference.Response, error) {
+	return nil, errors.New("unused")
 }
+func (boundTestClient) Stream(context.Context, inference.Request) (*inference.StreamReader[content.Chunk], error) {
+	return nil, errors.New("unused")
+}
+
+// validCfg is the minimal loop.BoundDefinition a foreign loop accepts: a non-empty system
+// prompt (the only field foreignloop.New validates).
+func validCfg() loop.BoundDefinition {
+	return promptCfg("you are a test agent", "")
+}
+
+func promptCfg(system, instructions string) loop.BoundDefinition {
+	opts := []loop.Option{loop.WithName("agent"), loop.WithInference(boundTestClient{}, inference.Model{Provider: "lmstudio", APIFormat: inference.APIFormatOpenAI, BaseURL: "http://localhost:1234", Name: "m"}), loop.WithSystem(system)}
+	if instructions != "" {
+		opts = append(opts, loop.WithModes(loop.Mode{Name: "mode", Instructions: instructions}), loop.WithInitialMode("mode"))
+	}
+	d, err := loop.Define(opts...)
+	if err != nil {
+		panic(err)
+	}
+	bound, err := d.Bind(context.Background(), tool.Bindings{SessionID: mustID(panicT{}), LoopID: mustID(panicT{})})
+	if err != nil {
+		panic(err)
+	}
+	return bound
+}
+
+type panicT struct{}
+
+func (panicT) Fatal(args ...any) { panic(args) }
 
 // newTestLoop wires a foreign loop to a fakePublisher with a deterministic
 // correlation idGen and a working EventID factory, registering ctx cleanup.
@@ -49,7 +81,7 @@ func TestNewValidation(t *testing.T) {
 	good := func() Spec { return Spec{Agent: &fakeAgent{}} }
 	tests := []struct {
 		name    string
-		cfg     loop.Config
+		cfg     loop.BoundDefinition
 		spec    Spec
 		pub     EventPublisher
 		nilGen  bool
@@ -57,7 +89,7 @@ func TestNewValidation(t *testing.T) {
 		wantErr bool
 	}{
 		{name: "happy path", cfg: validCfg(), spec: good(), pub: &fakePublisher{}, wantErr: false},
-		{name: "empty system prompt", cfg: loop.Config{}, spec: good(), pub: &fakePublisher{}, wantErr: true},
+		{name: "empty system prompt", cfg: nil, spec: good(), pub: &fakePublisher{}, wantErr: true},
 		{name: "nil agent", cfg: validCfg(), spec: Spec{}, pub: &fakePublisher{}, wantErr: true},
 		{name: "nil publisher", cfg: validCfg(), spec: good(), pub: nil, wantErr: true},
 		{name: "nil idGen", cfg: validCfg(), spec: good(), pub: &fakePublisher{}, nilGen: true, wantErr: true},
@@ -92,6 +124,13 @@ func TestNewValidation(t *testing.T) {
 			}
 			shutdown(t, l)
 		})
+	}
+}
+
+func TestValidateWiringAcceptsInstructionsOnlyPrompt(t *testing.T) {
+	t.Parallel()
+	if err := validateWiring(promptCfg("", "mode instructions"), Spec{Agent: &fakeAgent{}}, seqIDGen(), workingFac(), &fakePublisher{}); err != nil {
+		t.Fatalf("validateWiring instructions-only: %v", err)
 	}
 }
 
@@ -173,6 +212,57 @@ func TestShutdownClosesDone(t *testing.T) {
 	t.Parallel()
 	l, _ := newTestLoop(t, Spec{Agent: &fakeAgent{}}, &fakePublisher{})
 	shutdown(t, l)
+}
+
+func TestManagedAcceptanceMintFailureReturnsExactErrorAndStartsNoForeignWork(t *testing.T) {
+	t.Parallel()
+	sentinel := errors.New("foreign acceptance event id mint failed")
+	agent := &fakeAgent{}
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	pub := &fakePublisher{}
+	l, _, err := New(ctx, mustID(t), mustID(t), loop.Provenance{}, pub, validCfg(), Spec{Agent: agent, Cwd: t.TempDir(), SIDMode: SIDLateBound}, seqIDGen(), event.NewFactory(func() (uuid.UUID, error) {
+		return uuid.UUID{}, sentinel
+	}, time.Now))
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := mustID(t)
+	accepted := make(chan error, 1)
+	l.Commands <- command.UserInput{Header: command.Header{CommandID: id}, NoFold: true, TargetLoopID: l.loopID, Accepted: accepted}
+	if got := <-accepted; got != sentinel {
+		t.Fatalf("acceptance error = %T %v, want exact sentinel", got, got)
+	}
+	if agent.calls() != 0 {
+		t.Fatalf("foreign spawn calls = %d, want 0", agent.calls())
+	}
+	for _, ev := range pub.snapshot() {
+		if ev.EventHeader().Cause.CommandID == id {
+			t.Fatalf("failed acceptance published or started work: %T", ev)
+		}
+	}
+}
+
+func TestManagedAcceptanceAppendFailureReturnsExactErrorAndStartsNoForeignWork(t *testing.T) {
+	t.Parallel()
+	sentinel := errors.New("foreign acceptance durable append failed")
+	agent := &fakeAgent{}
+	pub := &fakePublisher{checkedErr: sentinel}
+	l, _ := newTestLoop(t, Spec{Agent: agent, SIDMode: SIDLateBound}, pub)
+	id := mustID(t)
+	accepted := make(chan error, 1)
+	l.Commands <- command.UserInput{Header: command.Header{CommandID: id}, NoFold: true, TargetLoopID: l.loopID, Accepted: accepted}
+	if got := <-accepted; got != sentinel {
+		t.Fatalf("acceptance error = %T %v, want exact sentinel", got, got)
+	}
+	if agent.calls() != 0 {
+		t.Fatalf("foreign spawn calls = %d, want 0", agent.calls())
+	}
+	for _, ev := range pub.snapshot() {
+		if ev.EventHeader().Cause.CommandID == id {
+			t.Fatalf("failed acceptance published or started work: %T", ev)
+		}
+	}
 }
 
 func TestSnapshotFreshLoop(t *testing.T) {

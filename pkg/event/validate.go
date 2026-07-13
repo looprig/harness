@@ -3,6 +3,7 @@ package event
 import (
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/identity"
+	"github.com/looprig/inference"
 )
 
 // EventName is the concrete event type name an InvalidEventError points at.
@@ -24,6 +25,8 @@ const (
 	// fails fail-secure (the journal/restore caller must reject it rather than guess
 	// an identity contract for it).
 	RuleUnknownType Rule = "is not a known event type"
+	// RuleInvalid: the field contains a value outside its closed domain.
+	RuleInvalid Rule = "is invalid"
 )
 
 // Identity / body field names, named so an InvalidEventError reads precisely.
@@ -34,6 +37,13 @@ const (
 	FieldTurnID          FieldName = "TurnID"
 	FieldStepID          FieldName = "StepID"
 	FieldToolExecutionID FieldName = "ToolExecutionID"
+	FieldConsistency     FieldName = "Consistency"
+	FieldTrigger         FieldName = "Trigger"
+	FieldCause           FieldName = "Cause"
+	FieldCommandID       FieldName = "CommandID"
+	FieldActiveLoopID    FieldName = "ActiveLoopID"
+	FieldModel           FieldName = "Model"
+	FieldEffort          FieldName = "Effort"
 	// FieldType names the whole event (not one coordinate) on the fail-secure
 	// unknown-type path, paired with RuleUnknownType.
 	FieldType FieldName = "Type"
@@ -55,7 +65,7 @@ func (e *InvalidEventError) Error() string {
 
 // idProfile is one event type's STATIC identity contract from the fill matrix:
 // which Coordinates fields must be set, which must be zero, whether a
-// ToolExecutionID is required (the four tool/gate events), and whether TurnID is
+// ToolExecutionID is required (the five tool-interaction events), and whether TurnID is
 // OPTIONAL (only InputCancelled, whose TurnID is the returned turn for an abnormal
 // return but zero for a pure client retract). A field that is neither required nor
 // forbidden is unconstrained. It holds no per-instance value, so every event type's
@@ -77,11 +87,18 @@ type idProfile struct {
 // ValidateEvent checks ev against the ID fill matrix and returns a typed
 // *InvalidEventError on the first violation, nil when ev satisfies every invariant.
 // EventID is required on every event; the per-type profile then pins the required
-// and must-be-zero coordinates (and ToolExecutionID for the four tool/gate events).
+// and must-be-zero coordinates (and ToolExecutionID for the five tool-interaction events).
 // Fail-secure: an event whose concrete type is not in the sealed union is invalid
 // with FieldType/RuleUnknownType — the caller learns the type is unknown, not that
 // some coordinate is missing.
 func ValidateEvent(ev Event) error {
+	if err := validateEventIdentity(ev); err != nil {
+		return err
+	}
+	return validateEventBody(ev)
+}
+
+func validateEventIdentity(ev Event) error {
 	nameStr, prof, ok := classify(ev)
 	name := EventName(nameStr)
 	if !ok {
@@ -92,6 +109,67 @@ func ValidateEvent(ev Event) error {
 		return &InvalidEventError{Event: name, Field: FieldEventID, Rule: RuleRequired}
 	}
 	return checkProfile(name, h.Coordinates, toolExecutionID(ev), prof)
+}
+
+func validateEventBody(ev Event) error {
+	switch e := ev.(type) {
+	case WorkspaceCheckpointed:
+		if e.Consistency != SnapshotQuiescent && e.Consistency != SnapshotFuzzy {
+			return &InvalidEventError{Event: "WorkspaceCheckpointed", Field: FieldConsistency, Rule: RuleInvalid}
+		}
+		if e.Trigger < SnapshotTriggerManual || e.Trigger > SnapshotTriggerSeed {
+			return &InvalidEventError{Event: "WorkspaceCheckpointed", Field: FieldTrigger, Rule: RuleInvalid}
+		}
+		if !validCheckpointCause(e.SessionID, e.Trigger, e.Cause) {
+			return &InvalidEventError{Event: "WorkspaceCheckpointed", Field: FieldCause, Rule: RuleInvalid}
+		}
+	case ActiveLoopChanged:
+		if e.ActiveLoopID.IsZero() {
+			return &InvalidEventError{Event: "ActiveLoopChanged", Field: FieldActiveLoopID, Rule: RuleRequired}
+		}
+	case DelegateRequestAccepted:
+		if e.Cause.CommandID.IsZero() {
+			return &InvalidEventError{Event: "DelegateRequestAccepted", Field: FieldCommandID, Rule: RuleRequired}
+		}
+	case LoopInferenceChanged:
+		if err := e.Model.Validate(); err != nil {
+			return &InvalidEventError{Event: "LoopInferenceChanged", Field: FieldModel, Rule: RuleInvalid}
+		}
+		if e.Model.Origin != inference.OriginCustom && e.Model.Origin != inference.OriginCatalog {
+			return &InvalidEventError{Event: "LoopInferenceChanged", Field: FieldModel, Rule: RuleInvalid}
+		}
+		if !e.Model.Sampling.Effort.Valid() {
+			return &InvalidEventError{Event: "LoopInferenceChanged", Field: FieldModel, Rule: RuleInvalid}
+		}
+		if !e.Effort.Valid() {
+			return &InvalidEventError{Event: "LoopInferenceChanged", Field: FieldEffort, Rule: RuleInvalid}
+		}
+	}
+	return nil
+}
+
+func validCheckpointCause(sessionID uuid.UUID, trigger SnapshotTriggerKind, cause identity.Cause) bool {
+	zero := identity.Cause{}
+	if trigger == SnapshotTriggerManual || trigger == SnapshotTriggerSeed {
+		return cause == zero
+	}
+	if cause.EventID.IsZero() || !cause.CommandID.IsZero() || !cause.ToolExecutionID.IsZero() || cause.Agency != identity.AgencyMachine {
+		return false
+	}
+	c := cause.Coordinates
+	if c.SessionID != sessionID {
+		return false
+	}
+	switch trigger {
+	case SnapshotTriggerIdle:
+		return !c.SessionID.IsZero() && c.LoopID.IsZero() && c.TurnID.IsZero() && c.StepID.IsZero()
+	case SnapshotTriggerInterrupt, SnapshotTriggerTurnDone:
+		return !c.SessionID.IsZero() && !c.LoopID.IsZero() && !c.TurnID.IsZero() && c.StepID.IsZero()
+	case SnapshotTriggerStepDone:
+		return !c.SessionID.IsZero() && !c.LoopID.IsZero() && !c.TurnID.IsZero() && !c.StepID.IsZero()
+	default:
+		return false
+	}
 }
 
 // checkProfile enforces one event's idProfile against its Coordinates: required
@@ -124,7 +202,7 @@ func checkProfile(name EventName, c identity.Coordinates, toolID uuid.UUID, p id
 	return nil
 }
 
-// toolExecutionID returns the body ToolExecutionID for the four tool/gate events
+// toolExecutionID returns the body ToolExecutionID for the five tool-interaction events
 // (the only events whose profile sets requireTool) and the zero UUID for every
 // other type — checkProfile ignores it unless requireTool is set.
 func toolExecutionID(ev Event) uuid.UUID {
@@ -171,6 +249,10 @@ func classify(ev Event) (name string, profile idProfile, ok bool) {
 		// (same shape as RestoreDone/SessionIdle) — only SessionID set. Ref is an
 		// opaque payload string the validator never constrains.
 		return "WorkspaceCheckpointed", sessionProfile(), true
+	case WorkspaceRestored:
+		return "WorkspaceRestored", sessionProfile(), true
+	case ActiveLoopChanged:
+		return "ActiveLoopChanged", sessionProfile(), true
 	case SecurityCeilingChanged:
 		// Session-scoped: a session-global ceiling clamp appended when the operator
 		// changes it (same shape as WorkspaceCheckpointed) — only SessionID set. Level is
@@ -183,6 +265,12 @@ func classify(ev Event) (name string, profile idProfile, ok bool) {
 		// zero). The spawning loop/turn/step rides in Header.Cause, which the validator
 		// never constrains — same shape as LoopIdle.
 		return "LoopStarted", loopProfile(), true
+	case DelegateRequestAccepted:
+		return "DelegateRequestAccepted", loopProfile(), true
+	case LoopInferenceChanged:
+		return "LoopInferenceChanged", loopProfile(), true
+	case LoopModeChanged:
+		return "LoopModeChanged", loopProfile(), true
 	case ForeignSessionBound:
 		return "ForeignSessionBound", loopProfile(), true
 	case TokenDelta:
@@ -254,7 +342,7 @@ func stepProfile() idProfile {
 	return idProfile{requireSession: true, requireLoop: true, requireTurn: true, requireStep: true}
 }
 
-// toolProfile: the four tool/gate events — full quartet set plus a required
+// toolProfile: the five tool-interaction events — full quartet set plus a required
 // ToolExecutionID (read from the event body by ValidateEvent, not stored here).
 func toolProfile() idProfile {
 	return idProfile{

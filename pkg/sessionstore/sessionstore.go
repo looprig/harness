@@ -1,7 +1,11 @@
 package sessionstore
 
 import (
+	"errors"
+	"strconv"
+
 	"github.com/looprig/core/uuid"
+	"github.com/looprig/harness/internal/pathutil"
 	"github.com/looprig/storage"
 )
 
@@ -84,6 +88,52 @@ func Open(b *storage.Composite, opts ...Option) (*Store, error) {
 		opt(&resolved)
 	}
 	return &Store{backend: b, opts: resolved}, nil
+}
+
+// PersistencePaths returns the canonical local roots reported by the Store's
+// configured primitives. Providers without the optional storage.PathReporter
+// capability contribute no paths. It fails closed with *PersistencePathError
+// when a reported path cannot be resolved without ambiguity.
+func (s *Store) PersistencePaths() ([]string, error) {
+	var reported []string
+	if reporter, ok := s.backend.Ledger.(storage.PathReporter); ok {
+		reported = append(reported, reporter.StoragePaths()...)
+	}
+	if reporter, ok := s.backend.Leaser.(storage.PathReporter); ok {
+		reported = append(reported, reporter.StoragePaths()...)
+	}
+	if reporter, ok := s.backend.KV.(storage.PathReporter); ok {
+		reported = append(reported, reporter.StoragePaths()...)
+	}
+	if reporter, ok := s.backend.Blobs.(storage.PathReporter); ok {
+		reported = append(reported, reporter.StoragePaths()...)
+	}
+	paths, err := pathutil.Canonicalize(reported)
+	if err != nil {
+		return nil, newPersistencePathError(err)
+	}
+	return paths, nil
+}
+
+// PersistencePathError reports a local persistence path that could not be
+// canonicalized without ambiguity.
+type PersistencePathError struct {
+	Path  string
+	Cause error
+}
+
+func (e *PersistencePathError) Error() string {
+	return "sessionstore: resolve persistence path " + strconv.Quote(e.Path) + ": " + e.Cause.Error()
+}
+
+func (e *PersistencePathError) Unwrap() error { return e.Cause }
+
+func newPersistencePathError(err error) *PersistencePathError {
+	var pathErr *pathutil.CanonicalPathError
+	if errors.As(err, &pathErr) {
+		return &PersistencePathError{Path: pathErr.Path, Cause: err}
+	}
+	return &PersistencePathError{Cause: err}
 }
 
 // ledgerName derives the storage ledger name for a session: "sessions/<uuid>". The

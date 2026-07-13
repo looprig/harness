@@ -91,7 +91,7 @@ func TestServerHandleListSessions(t *testing.T) {
 			t.Parallel()
 
 			reader := &fakeReader{list: sample, listErr: tt.listErr}
-			srv := newServer[*fakeSession](&fakeRunner{}, reader, newConfig())
+			srv := newServer[*fakeSession, fakeSessionOption](&fakeRig{}, reader, newConfig())
 
 			req := readRequest("/v1/sessions"+tt.query, "")
 			rec := httptest.NewRecorder()
@@ -162,7 +162,7 @@ func TestServerHandleStatus(t *testing.T) {
 
 			reader := &fakeReader{status: tt.status, statusErr: tt.statusErr}
 			// NO live session in the registry: a read must succeed without one.
-			srv := newServer[*fakeSession](&fakeRunner{}, reader, newConfig())
+			srv := newServer[*fakeSession, fakeSessionOption](&fakeRig{}, reader, newConfig())
 
 			req := readRequest("/v1/sessions/"+tt.sid+"/status", tt.sid)
 			rec := httptest.NewRecorder()
@@ -248,7 +248,7 @@ func TestServerHandleJournal(t *testing.T) {
 
 			reader := &fakeReader{journal: sample, journalErr: tt.journalErr}
 			// NO live session in the registry: a journal read must succeed without one.
-			srv := newServer[*fakeSession](&fakeRunner{}, reader, newConfig())
+			srv := newServer[*fakeSession, fakeSessionOption](&fakeRig{}, reader, newConfig())
 
 			req := readRequest("/v1/sessions/"+tt.sid+"/journal"+tt.query, tt.sid)
 			rec := httptest.NewRecorder()

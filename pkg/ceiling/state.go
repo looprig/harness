@@ -15,14 +15,17 @@ package ceiling
 
 import "sync/atomic"
 
+// Level is the session security-ceiling ordinal. Its uint8 representation is stable on
+// the wire; the name prevents policy APIs from accepting unrelated integers.
+type Level uint8
+
 // Source is the READ side of the ceiling: the live ordinal, read once per Check. It
-// mirrors tools.CeilingSource STRUCTURALLY (both are exactly `Current() uint8`) with no
-// shared type, so *State satisfies both and harness never couples the permission checker
-// to this package — the checker holds only the structural interface (SPEC §8).
+// is shared by the session controller and permission posture selector, so callers cannot
+// accidentally pass an unrelated integer as a policy ordinal.
 type Source interface {
 	// Current returns the live ceiling ordinal (0 = most restrictive). It is read on
 	// every Check, so a Set is visible on the very next decision.
-	Current() uint8
+	Current() Level
 }
 
 // State is the session-scoped security-ceiling ordinal — the mutable holder the session
@@ -38,7 +41,7 @@ type State struct {
 	// never stores a value above it — a journaled command can LOWER the ceiling or raise
 	// it only up to this cap, never past it (fail-secure). hasMax distinguishes "no cap"
 	// (store as-is) from a cap whose value happens to be 0 (pin to most restrictive).
-	max    uint8
+	max    Level
 	hasMax bool
 }
 
@@ -51,19 +54,19 @@ func New() *State { return &State{} }
 // requested ordinal to max — the operator's upper bound on permissiveness. A journaled
 // command can then never raise the ceiling above max (a compromised or replayed command
 // cannot exceed the operator's cap), only up to it or below.
-func NewClamped(max uint8) *State { return &State{max: max, hasMax: true} }
+func NewClamped(max Level) *State { return &State{max: max, hasMax: true} }
 
 // Current returns the live ceiling ordinal (0 = most restrictive). It is safe to call
 // concurrently with Set and is the read the permission checker performs on every Check,
 // so a Set is visible on the very next Check (the clamp takes effect immediately, §8).
-func (s *State) Current() uint8 { return uint8(s.current.Load()) }
+func (s *State) Current() Level { return Level(s.current.Load()) }
 
 // Clamp returns level reduced to the configured cap (when one is set), WITHOUT storing
 // it — the PURE projection Set applies. The applier uses it to learn the EFFECTIVE
 // ordinal (and compare it to Current to decide tighten vs loosen) BEFORE committing the
 // change, so the apply/emit order can be chosen by direction. It is safe to call
 // concurrently.
-func (s *State) Clamp(level uint8) uint8 {
+func (s *State) Clamp(level Level) Level {
 	if s.hasMax && level > s.max {
 		return s.max
 	}
@@ -76,7 +79,7 @@ func (s *State) Clamp(level uint8) uint8 {
 // folding the emitted events on replay reproduces the exact live ordinal — LAST WRITE
 // WINS (a later Set overwrites an earlier one). It is safe to call concurrently with
 // Current.
-func (s *State) Set(level uint8) uint8 {
+func (s *State) Set(level Level) Level {
 	eff := s.Clamp(level)
 	s.current.Store(uint32(eff))
 	return eff

@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	"github.com/looprig/core/content"
+	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/identity"
 )
 
@@ -96,6 +97,8 @@ func classifyCommand(cmd Command) (CommandName, bool) {
 		return CommandSetSecurityCeiling, true
 	case CancelQueuedInput:
 		return CommandCancelQueuedInput, true
+	case CancelDelegateRequest:
+		return CommandCancelDelegateRequest, true
 	case Interrupt:
 		return CommandInterrupt, true
 	case Shutdown:
@@ -136,7 +139,7 @@ func encodePayload(name CommandName, cmd Command) ([]byte, error) {
 		return marshalUserInput(c)
 	case SubagentResult:
 		return marshalSubagentResult(c)
-	case ApproveToolCall, DenyToolCall, ProvideUserInput, CancelQueuedInput,
+	case ApproveToolCall, DenyToolCall, ProvideUserInput, CancelQueuedInput, CancelDelegateRequest,
 		SetSecurityCeiling, Interrupt, Shutdown:
 		// Every field round-trips through encoding/json directly: header + scalars/
 		// strings/ids (uuid.UUID has its own text codec) + embedded Coordinates/
@@ -164,7 +167,9 @@ func marshalPlain(name CommandName, cmd Command) ([]byte, error) {
 // codec, so it cannot ride as a plain field).
 type userInputWire struct {
 	Header
-	Blocks json.RawMessage `json:"blocks,omitempty"`
+	Blocks       json.RawMessage `json:"blocks,omitempty"`
+	NoFold       bool            `json:"no_fold,omitzero"`
+	TargetLoopID uuid.UUID       `json:"target_loop_id,omitzero"`
 }
 
 func marshalUserInput(c UserInput) ([]byte, error) {
@@ -172,7 +177,7 @@ func marshalUserInput(c UserInput) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	out, err := json.Marshal(userInputWire{Header: c.Header, Blocks: blocks})
+	out, err := json.Marshal(userInputWire{Header: c.Header, Blocks: blocks, NoFold: c.NoFold, TargetLoopID: c.TargetLoopID})
 	if err != nil {
 		return nil, &CommandEncodeError{Type: CommandUserInput, Cause: err}
 	}
@@ -282,6 +287,8 @@ func decodePayload(tag CommandName, data []byte) (Command, error) {
 		return decodePlain[SetSecurityCeiling](tag, data)
 	case CommandCancelQueuedInput:
 		return decodePlain[CancelQueuedInput](tag, data)
+	case CommandCancelDelegateRequest:
+		return decodePlain[CancelDelegateRequest](tag, data)
 	case CommandInterrupt:
 		return decodePlain[Interrupt](tag, data)
 	case CommandShutdown:
@@ -316,7 +323,7 @@ func decodeUserInput(data []byte) (Command, error) {
 	if err != nil {
 		return nil, err
 	}
-	return UserInput{Header: w.Header, Blocks: blocks}, nil
+	return UserInput{Header: w.Header, Blocks: blocks, NoFold: w.NoFold, TargetLoopID: w.TargetLoopID}, nil
 }
 
 func decodeSubagentResult(data []byte) (Command, error) {

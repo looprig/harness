@@ -37,7 +37,7 @@ func TestHandleCapabilities(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			srv := newServer[*fakeSession](nil, nil, newConfig())
+			srv := newServer[*fakeSession, fakeSessionOption](nil, nil, newConfig())
 			req := httptest.NewRequest(http.MethodGet, "/v1/capabilities", http.NoBody)
 			rec := httptest.NewRecorder()
 
@@ -72,7 +72,7 @@ func TestHandleCapabilities(t *testing.T) {
 func TestHandleCapabilitiesExactJSON(t *testing.T) {
 	t.Parallel()
 
-	srv := newServer[*fakeSession](nil, nil, newConfig())
+	srv := newServer[*fakeSession, fakeSessionOption](nil, nil, newConfig())
 	req := httptest.NewRequest(http.MethodGet, "/v1/capabilities", http.NoBody)
 	rec := httptest.NewRecorder()
 

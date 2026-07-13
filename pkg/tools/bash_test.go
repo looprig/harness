@@ -3,6 +3,7 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -45,7 +46,8 @@ func runBash(t *testing.T, root string, args map[string]any) string {
 
 func TestBashInfo(t *testing.T) {
 	t.Parallel()
-	info, err := NewBash(t.TempDir()).Info(context.Background())
+	var bash *BashTool = NewBash(t.TempDir())
+	info, err := bash.Info(context.Background())
 	if err != nil {
 		t.Fatalf("Info() error = %v", err)
 	}
@@ -55,6 +57,49 @@ func TestBashInfo(t *testing.T) {
 	var schema map[string]json.RawMessage
 	if err := json.Unmarshal(info.Schema, &schema); err != nil {
 		t.Fatalf("Schema is not a JSON object: %v", err)
+	}
+}
+
+func TestNewBashRejectsInvalidOptionsAtRun(t *testing.T) {
+	t.Parallel()
+
+	var typedNilRunner *definitionRunner
+	tests := []struct {
+		name string
+		make func(string) *BashTool
+	}{
+		{name: "nil option", make: func(root string) *BashTool { return NewBash(root, nil) }},
+		{name: "typed nil runner", make: func(root string) *BashTool { return NewBash(root, WithRunner(typedNilRunner)) }},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			marker := filepath.Join(t.TempDir(), "must-not-exist")
+			command := "touch '" + strings.ReplaceAll(marker, "'", "'\"'\"'") + "'"
+			args, err := json.Marshal(map[string]string{"command": command})
+			if err != nil {
+				t.Fatalf("json.Marshal() error = %v", err)
+			}
+			bash := tt.make(t.TempDir())
+
+			_, err = bash.BuildRequest(string(args), nil)
+			var buildErr *bashError
+			if !errors.As(err, &buildErr) {
+				t.Fatalf("BuildRequest() error = %T %v, want *bashError", err, err)
+			}
+
+			result, err := bash.InvokableRun(context.Background(), string(args))
+			if err != nil {
+				t.Fatalf("InvokableRun() Go error = %v, want model-safe tool result", err)
+			}
+			if got := textOf(t, result); !strings.HasPrefix(got, "error:") {
+				t.Fatalf("InvokableRun() result = %q, want model-safe error", got)
+			}
+			if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("marker stat error = %v, want os.ErrNotExist (command must not execute)", err)
+			}
+		})
 	}
 }
 

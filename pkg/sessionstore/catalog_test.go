@@ -16,6 +16,7 @@ import (
 	"github.com/looprig/harness/pkg/gate"
 	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/journal"
+	"github.com/looprig/harness/pkg/workspacestore"
 	"github.com/looprig/storage"
 	"github.com/looprig/storage/memstore"
 )
@@ -183,6 +184,71 @@ func (c *fakeEventCursor) Next(_ context.Context) (event.Event, uint64, error) {
 }
 
 func (c *fakeEventCursor) Close() error { return nil }
+
+func TestWorkspacePointersFoldCheckpointAndRestoreIndependently(t *testing.T) {
+	t.Parallel()
+	sid := fixedUUID(0x71)
+	eventA, eventB, restoreA := fixedUUID(0x72), fixedUUID(0x73), fixedUUID(0x74)
+	refA := workspacestore.Ref("v1:sha256:" + strings.Repeat("a", 64))
+	refB := workspacestore.Ref("v1:sha256:" + strings.Repeat("b", 64))
+	meta := SessionMeta{}
+
+	meta, _ = applyEvent(meta, event.WorkspaceCheckpointed{
+		Header:      event.Header{Coordinates: identity.Coordinates{SessionID: sid}, EventID: eventA},
+		Ref:         string(refA),
+		Consistency: event.SnapshotQuiescent,
+		Trigger:     event.SnapshotTriggerManual,
+	}, 11, fixedClock(time.Time{}))
+	meta, _ = applyEvent(meta, event.WorkspaceCheckpointed{
+		Header:      event.Header{Coordinates: identity.Coordinates{SessionID: sid}, EventID: eventB},
+		Ref:         string(refB),
+		Consistency: event.SnapshotFuzzy,
+		Trigger:     event.SnapshotTriggerIdle,
+	}, 17, fixedClock(time.Time{}))
+	meta, _ = applyEvent(meta, event.WorkspaceRestored{
+		Header: event.Header{Coordinates: identity.Coordinates{SessionID: sid}, EventID: restoreA},
+		Ref:    string(refA),
+	}, 23, fixedClock(time.Time{}))
+
+	wantLast := CheckpointSummary{Ref: refB, EventID: eventB, Seq: 17, Consistency: event.SnapshotFuzzy}
+	if meta.LastCheckpoint != wantLast {
+		t.Errorf("LastCheckpoint = %+v, want %+v", meta.LastCheckpoint, wantLast)
+	}
+	wantCurrent := WorkspacePointer{Ref: refA, EventID: restoreA, Seq: 23, Source: WorkspacePointerSourceRestore}
+	if meta.CurrentWorkspace != wantCurrent {
+		t.Errorf("CurrentWorkspace = %+v, want %+v", meta.CurrentWorkspace, wantCurrent)
+	}
+
+	// A delayed catalog upsert may fold an older durable event after a newer one. Journal
+	// sequence, not arrival order or content identity, decides the pointer.
+	meta, _ = applyEvent(meta, event.WorkspaceCheckpointed{
+		Header:      event.Header{Coordinates: identity.Coordinates{SessionID: sid}, EventID: fixedUUID(0x70)},
+		Ref:         string(refA),
+		Consistency: event.SnapshotQuiescent,
+		Trigger:     event.SnapshotTriggerManual,
+	}, 5, fixedClock(time.Time{}))
+	if meta.LastCheckpoint != wantLast || meta.CurrentWorkspace != wantCurrent {
+		t.Errorf("older event rewound pointers: last=%+v current=%+v", meta.LastCheckpoint, meta.CurrentWorkspace)
+	}
+}
+
+func TestWorkspacePointerLegacyMetadataDecodesUnknown(t *testing.T) {
+	t.Parallel()
+	sid, eid := fixedUUID(0x75), fixedUUID(0x76)
+	ref := "v1:sha256:" + strings.Repeat("c", 64)
+	data := []byte(`{"session_id":"` + sid.String() + `","last_checkpoint":{"ref":"` + ref + `","event_id":"` + eid.String() + `","seq":9},"current_workspace":{"ref":"` + ref + `","event_id":"` + eid.String() + `","seq":9}}`)
+
+	meta, err := decodeSessionMeta(data)
+	if err != nil {
+		t.Fatalf("decodeSessionMeta() err = %v", err)
+	}
+	if meta.LastCheckpoint.Consistency != event.SnapshotConsistencyUnknown {
+		t.Errorf("legacy consistency = %v, want unknown", meta.LastCheckpoint.Consistency)
+	}
+	if meta.CurrentWorkspace.Source != WorkspacePointerSourceUnknown {
+		t.Errorf("legacy source = %v, want unknown", meta.CurrentWorkspace.Source)
+	}
+}
 
 // TestApplyEvent covers the catalog-relevant event->field mapping: the single source of
 // truth applyEvent both the inline update and repair share. It is pure (clock injected),

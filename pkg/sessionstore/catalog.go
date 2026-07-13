@@ -14,6 +14,7 @@ import (
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/journal"
+	"github.com/looprig/harness/pkg/workspacestore"
 	"github.com/looprig/storage"
 )
 
@@ -94,7 +95,7 @@ type SessionMeta struct {
 	// Status is the session's lifecycle phase (active until SessionStopped -> stopped).
 	Status SessionStatus `json:"status,omitempty"`
 	// AgentKind names the agent role (from SessionStarted's ConfigFingerprint). It is
-	// passthrough: empty until the agent threads its kind through loop.Config.
+	// passthrough: empty until the agent threads its kind through loop.Definition.
 	AgentKind string `json:"agent_kind,omitempty"`
 	// LoopCount is the number of loops registered in the session: the primary plus one
 	// per LoopStarted.
@@ -120,7 +121,36 @@ type SessionMeta struct {
 	LastTurn *eventSummary `json:"last_turn,omitempty"`
 	// LastStep is the codec-safe summary of the most recent StepDone. Nil until a step
 	// completes.
-	LastStep *eventSummary `json:"last_step,omitempty"`
+	LastStep         *eventSummary     `json:"last_step,omitempty"`
+	LastCheckpoint   CheckpointSummary `json:"last_checkpoint,omitzero"`
+	CurrentWorkspace WorkspacePointer  `json:"current_workspace,omitzero"`
+}
+
+// WorkspacePointerSource identifies the transition that selected CurrentWorkspace.
+// Unknown decodes catalog records written before this discriminator existed.
+type WorkspacePointerSource string
+
+const (
+	WorkspacePointerSourceUnknown    WorkspacePointerSource = ""
+	WorkspacePointerSourceCheckpoint WorkspacePointerSource = "checkpoint"
+	WorkspacePointerSourceRestore    WorkspacePointerSource = "restore"
+)
+
+// WorkspacePointer identifies one durable workspace transition. Ref is content identity;
+// Seq and EventID are the journal transition identity.
+type WorkspacePointer struct {
+	Ref     workspacestore.Ref     `json:"ref"`
+	EventID uuid.UUID              `json:"event_id"`
+	Seq     uint64                 `json:"seq"`
+	Source  WorkspacePointerSource `json:"source,omitempty"`
+}
+
+// CheckpointSummary identifies the newest checkpoint independently from later rewinds.
+type CheckpointSummary struct {
+	Ref         workspacestore.Ref        `json:"ref"`
+	EventID     uuid.UUID                 `json:"event_id"`
+	Seq         uint64                    `json:"seq"`
+	Consistency event.SnapshotConsistency `json:"consistency,omitempty"`
 }
 
 // eventSummary is the codec-safe projection of a single fold-relevant event (a terminal
@@ -344,6 +374,19 @@ func applyEvent(meta SessionMeta, ev event.Event, seq uint64, now CatalogClock) 
 		meta.SessionID = e.SessionID
 		meta.Status = StatusStopped
 		meta.State = StateStopped
+	case event.WorkspaceCheckpointed:
+		meta.SessionID = e.SessionID
+		if meta.LastCheckpoint.EventID.IsZero() || seq > meta.LastCheckpoint.Seq {
+			meta.LastCheckpoint = checkpointSummary(e, seq)
+		}
+		if meta.CurrentWorkspace.EventID.IsZero() || seq > meta.CurrentWorkspace.Seq {
+			meta.CurrentWorkspace = workspacePointer(e.Ref, e.EventID, seq, WorkspacePointerSourceCheckpoint)
+		}
+	case event.WorkspaceRestored:
+		meta.SessionID = e.SessionID
+		if meta.CurrentWorkspace.EventID.IsZero() || seq > meta.CurrentWorkspace.Seq {
+			meta.CurrentWorkspace = workspacePointer(e.Ref, e.EventID, seq, WorkspacePointerSourceRestore)
+		}
 	default:
 		changed = false
 	}
@@ -351,6 +394,19 @@ func applyEvent(meta SessionMeta, ev event.Event, seq uint64, now CatalogClock) 
 		meta.LastJournalSeq = seq
 	}
 	return meta, changed
+}
+
+func checkpointSummary(e event.WorkspaceCheckpointed, seq uint64) CheckpointSummary {
+	return CheckpointSummary{
+		Ref:         workspacestore.Ref(e.Ref),
+		EventID:     e.EventID,
+		Seq:         seq,
+		Consistency: e.Consistency,
+	}
+}
+
+func workspacePointer(ref string, eventID uuid.UUID, seq uint64, source WorkspacePointerSource) WorkspacePointer {
+	return WorkspacePointer{Ref: workspacestore.Ref(ref), EventID: eventID, Seq: seq, Source: source}
 }
 
 // summarize builds a codec-safe eventSummary for ev at seq, returning prev unchanged if

@@ -32,6 +32,7 @@ const (
 // unexported; *session.Session satisfies it via PublishEvent.
 type EventPublisher interface {
 	PublishEvent(context.Context, event.Event) error
+	PublishEventChecked(context.Context, event.Event) error
 }
 
 // ForeignAgent hides everything agent-specific (argv, system-prompt channel,
@@ -90,11 +91,11 @@ type ForeignEvent struct {
 // EventPublisher is foreignloop.EventPublisher; returns the Backend and the minted
 // ForeignSID (stamped onto LoopStarted by the caller).
 type Builder func(loopCtx context.Context, sessionID, loopID uuid.UUID,
-	parent loop.Provenance, pub EventPublisher, cfg loop.Config,
+	parent loop.Provenance, pub EventPublisher, cfg loop.BoundDefinition,
 	idGen func() (uuid.UUID, error), fac *event.Factory) (loop.Backend, string, error)
 
 // Spec is the per-agent foreign wiring resolved at the composition root. It is NOT
-// on loop.Config (that would invert the package dependency).
+// on loop.BoundDefinition (that would invert the package dependency).
 type Spec struct {
 	Agent    ForeignAgent
 	ExecPath string

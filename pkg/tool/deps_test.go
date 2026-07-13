@@ -19,6 +19,8 @@ const forbiddenModule = "github.com/looprig/sandbox"
 // the module root. Kept as a named constant so the resolution target is explicit.
 const harnessModulePath = "github.com/looprig/harness"
 
+const toolPackagePath = harnessModulePath + "/pkg/tool"
+
 // TestNoSandboxImport is the dependency-direction guard: it shells `go list -deps
 // ./...` over the whole harness module and FAILS if any package in the transitive
 // dependency closure is the sandbox module or one of its subpackages. It is a real
@@ -134,6 +136,41 @@ func TestSandboxViolations(t *testing.T) {
 			for i := range got {
 				if got[i] != tt.want[i] {
 					t.Errorf("sandboxViolations[%d] = %q, want %q", i, got[i], tt.want[i])
+				}
+			}
+		})
+	}
+}
+
+// TestToolPackageDependencies keeps Definition and Bindings in the low-level
+// contract package: pkg/tool must not grow imports on either the loop runtime or
+// the concrete tools package.
+func TestToolPackageDependencies(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name      string
+		forbidden string
+	}{
+		{name: "does not import loop runtime", forbidden: harnessModulePath + "/pkg/loop"},
+		{name: "does not import concrete tools", forbidden: harnessModulePath + "/pkg/tools"},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			goBin, err := exec.LookPath("go")
+			if err != nil {
+				t.Skipf("go toolchain not found on PATH (%v); cannot inspect imports", err)
+			}
+			cmd := exec.Command(goBin, "list", "-f", "{{join .Imports \"\\n\"}}", toolPackagePath)
+			cmd.Dir = harnessModuleRoot(t, goBin)
+			out, err := cmd.Output()
+			if err != nil {
+				t.Fatalf("go list imports for %s failed: %v\n%s", toolPackagePath, err, stderrOf(err))
+			}
+			for _, imported := range strings.Fields(string(out)) {
+				if imported == tt.forbidden {
+					t.Fatalf("%s imports forbidden package %s", toolPackagePath, tt.forbidden)
 				}
 			}
 		})

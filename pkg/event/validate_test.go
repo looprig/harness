@@ -8,6 +8,7 @@ import (
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/gate"
 	"github.com/looprig/harness/pkg/identity"
+	"github.com/looprig/inference"
 )
 
 // vID mints a non-zero UUID for validation tests or fails.
@@ -48,8 +49,13 @@ func TestValidateEventValid(t *testing.T) {
 		{"RestoreStarted", event.RestoreStarted{Header: sessionH}},
 		{"RestoreDone", event.RestoreDone{Header: sessionH}},
 		{"RestoreErrored", event.RestoreErrored{Header: sessionH}},
-		{"WorkspaceCheckpointed", event.WorkspaceCheckpointed{Header: sessionH, Ref: "v1:sha256:aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899"}},
+		{"WorkspaceCheckpointed", event.WorkspaceCheckpointed{Header: sessionH, Ref: "v1:sha256:aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899", Consistency: event.SnapshotQuiescent, Trigger: event.SnapshotTriggerManual}},
+		{"WorkspaceCheckpointed quiescent manual", event.WorkspaceCheckpointed{Header: sessionH, Ref: "v1:sha256:aabb", Consistency: event.SnapshotQuiescent, Trigger: event.SnapshotTriggerManual}},
+		{"WorkspaceRestored", event.WorkspaceRestored{Header: sessionH, Ref: "v1:sha256:aabb"}},
+		{"ActiveLoopChanged", event.ActiveLoopChanged{Header: sessionH, PreviousLoopID: loop, ActiveLoopID: vID(t)}},
 		{"LoopIdle", event.LoopIdle{Header: loopH}},
+		{"LoopInferenceChanged", event.LoopInferenceChanged{Header: loopH, Model: inference.CustomModel("test", "test", "", "model")}},
+		{"LoopModeChanged", event.LoopModeChanged{Header: loopH}},
 		// LoopStarted: NEW loop in Header.Coordinates (SessionID+LoopID, Turn/Step zero);
 		// the spawning loop/turn/step rides in Header.Cause and is unconstrained by the
 		// profile (the validator never checks Cause).

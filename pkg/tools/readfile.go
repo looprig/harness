@@ -3,6 +3,7 @@ package tools
 import (
 	"bufio"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -54,16 +55,21 @@ type readFileArgs struct {
 }
 
 // ReadFile reads a workspace-contained text file. It depends only on the
-// workspace root and a narrow loop.ReadGuard (least privilege / interface
-// segregation): it never sees the full permission gate.
+// workspace root, a narrow loop.ReadGuard (least privilege / interface
+// segregation), and the loop's shared observation map: it never sees the full
+// permission gate.
 type ReadFile struct {
 	root  string
 	guard loop.ReadGuard
+	obs   *fileObservations
 }
 
-// NewReadFile constructs a ReadFile bound to the workspace root and read guard.
-func NewReadFile(root string, guard loop.ReadGuard) *ReadFile {
-	return &ReadFile{root: root, guard: guard}
+// NewReadFile constructs a ReadFile bound to the workspace root, read guard, and
+// the loop's shared observation map. A complete read records the raw-content hash
+// into obs so a subsequent same-loop WriteFile/EditFile of the same path is
+// authorized; obs is supplied by Files (one per loop binding).
+func NewReadFile(root string, guard loop.ReadGuard, obs *fileObservations) *ReadFile {
+	return &ReadFile{root: root, guard: guard, obs: obs}
 }
 
 // Info returns ReadFile's self-description. Name MUST equal "ReadFile".
@@ -103,15 +109,17 @@ func (r *ReadFile) InvokableRun(ctx context.Context, argsJSON string) (*tool.Too
 
 	// Stage 1: containment (symlink-aware). Resolves symlinks and proves the
 	// target is inside the workspace; an escape (including an in-workspace symlink
-	// pointing OUT) is rejected here. On escape, echo only the requested path.
+	// pointing OUT) is rejected here. On escape, echo only the requested path. An
+	// escaping read authorizes no mutation: we record nothing.
 	abs, err := containedPath(r.root, a.Path)
 	if err != nil {
 		return tool.TextResult("error: path is outside the workspace: " + a.Path), nil
 	}
+	key := canonicalObservationKey(abs)
 
 	// Stage 2: denied-path enforcement (secrets). DeniedRead's contract wants the
 	// containedPath-resolved ABSOLUTE path. Echo the requested path only, never
-	// the file body.
+	// the file body. A denied read authorizes no mutation: we record nothing.
 	if r.guard.DeniedRead(abs) {
 		return tool.TextResult("error: read denied: " + a.Path), nil
 	}
@@ -123,7 +131,29 @@ func (r *ReadFile) InvokableRun(ctx context.Context, argsJSON string) (*tool.Too
 	// is inside the workspace; the fd stat below confirms a regular file.
 	body, truncated, err := r.readCapped(joinedUnderRoot(r.root, a.Path))
 	if err != nil {
+		// A DEFINITIVE not-found records absence (authorizing a later create of a
+		// genuinely new file). Every other failure — symlink (ELOOP), not-regular,
+		// or a read error — is ambiguous and records NO usable observation.
+		if errors.Is(err, os.ErrNotExist) {
+			r.obs.recordAbsent(key)
+		}
 		return tool.TextResult("error: " + err.Error()), nil
+	}
+
+	// A COMPLETE (non-truncated) read records the raw-content SHA-256 so a later
+	// same-loop overwrite/edit of this path is authorized. `body` is the FULL raw
+	// file content here — a start_line/end_line range only narrows the DISPLAYED
+	// lines (numberLines below), it does not change the bytes read or hashed. So the
+	// observation means "this loop knows the file's CURRENT on-disk bytes" (the token
+	// for external-change detection), NOT "the model saw every line". That is the
+	// correct optimistic-concurrency contract: the compare-and-swap only needs the
+	// hash to reflect current on-disk state. It is a DIFFERENT concern from the
+	// truncation guard below — truncation is about hash CORRECTNESS: a truncated read
+	// saw only a prefix, so its hash would not cover the whole file and MUST NOT be
+	// recorded (else a partial read could authorize clobbering the unseen remainder).
+	// The hash is private — it never reaches the model.
+	if !truncated {
+		r.obs.recordPresent(key, sha256.Sum256([]byte(body)))
 	}
 
 	out := numberLines(body, a.StartLine, a.EndLine)

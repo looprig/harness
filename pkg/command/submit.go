@@ -2,6 +2,7 @@ package command
 
 import (
 	"github.com/looprig/core/content"
+	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/identity"
 )
 
@@ -19,6 +20,19 @@ import (
 type UserInput struct {
 	Header
 	Blocks []content.Block `json:"blocks,omitempty"`
+	// NoFold requests a DISTINCT non-folding turn: the input still queues behind a
+	// running turn, but it NEVER folds into that turn at a tool-continuation boundary —
+	// it starts its OWN turn (Cause.CommandID = this command's id) when the running turn
+	// finishes. It is the delegation follow-up path, where each request is an independent
+	// question/answer correlated by command id; the interactive submit path leaves it
+	// false so ordinary input keeps its fold-into-turn semantics.
+	NoFold bool `json:"no_fold,omitzero"`
+	// TargetLoopID durably carries the dispatch target for machine NoFold delegate
+	// requests because storage replay cannot recover CommandRecord's transport-only loop.
+	TargetLoopID uuid.UUID `json:"target_loop_id,omitzero"`
+	// Accepted is the transient durable-acceptance ack used only by managed delegate
+	// sends. It is never serialized; prepared starts use LoopStarted.InitialRequestID.
+	Accepted chan error `json:"-"`
 }
 
 // SubagentResult delivers a finished subagent's output to its parent loop (the

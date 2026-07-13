@@ -3,6 +3,8 @@ package event
 import (
 	"encoding/json"
 	"testing"
+
+	"github.com/looprig/harness/pkg/ceiling"
 )
 
 // TestSecurityCeilingChangedRoundTrip proves the SecurityCeilingChanged event round-trips
@@ -12,7 +14,7 @@ func TestSecurityCeilingChangedRoundTrip(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
 		name  string
-		level uint8
+		level ceiling.Level
 	}{
 		{"most restrictive", 0},
 		{"mid", 2},

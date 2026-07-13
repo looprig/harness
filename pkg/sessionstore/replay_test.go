@@ -317,7 +317,7 @@ func TestEventReplayerYieldsEventsOnly(t *testing.T) {
 }
 
 // TestEventReplayerNarrowsByLoop covers the loop-narrowing filter that makes the
-// EventReplayer a faithful drop-in for restore's foldPrimaryLoop: a session holding
+// EventReplayer a faithful drop-in for restore's foldLoop: a session holding
 // events from a PRIMARY loop and a SUBAGENT loop (plus a session-scoped event) is
 // replayed with req.LoopID = primary and yields ONLY the primary loop's events plus
 // the session-scoped event (matching pkg/journal's session-event + this-loop subject

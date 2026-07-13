@@ -8,10 +8,26 @@ import (
 	"github.com/looprig/harness/pkg/tool"
 )
 
-// deps.go is the runner's CONSUMER surface for the tool subsystem (design §3b).
+// PermissionFactory creates the permission gate private to one bound loop. It may
+// be called concurrently for separate Bind calls and must synchronize captured state.
+type PermissionFactory func(context.Context, tool.Bindings) (PermissionGate, error)
+
+// DelegationStyle selects the model-facing delegation action set.
+type DelegationStyle uint8
+
+const (
+	DelegationSyncOnly DelegationStyle = iota
+	DelegationManaged
+)
+
+// Delegation is the immutable delegation policy copied into a Definition.
+type Delegation struct{ Style DelegationStyle }
+
+// deps.go is the loop runtime's consumer surface for the tool subsystem (design §3b).
 // The loop depends only on these interfaces and value types; it never imports
 // the concrete `tools/` package. The composition root wires concrete
-// implementations (e.g. *tools.PermissionChecker) into a ToolSet on loop.Config.
+// implementations (for example, a tools permission checker) while binding an immutable
+// Definition for the private actor runtime.
 
 // Effect is the permission outcome the PermissionGate yields for a tool call.
 //
@@ -176,60 +192,4 @@ type ReadGuard interface {
 	// MaxReadBytes is the per-file read cap (bytes) ReadFile/Grep apply via
 	// io.LimitReader.
 	MaxReadBytes() int64
-}
-
-// ToolSet is the RUNNER's view of the tool subsystem — the only thing
-// loop.Config carries. Tools never see it: they are not handed
-// Permission/Registry/Middlewares (they do not call them). nil
-// Permission/Registry/Middlewares are valid; the composition root sets them.
-type ToolSet struct {
-	Permission  PermissionGate
-	Registry    []tool.InvokableTool // runner looks up by Info().Name
-	Middlewares []tool.ToolMiddleware
-
-	// Runaway guards. loop.New applies the defaults below when a field is zero
-	// (or negative — treated as unset), mirroring how it defaults DrainTimeout.
-	MaxToolIterations    int // max LLM<->tool round-trips per turn (default 25)
-	MaxToolCallsPerTurn  int // max total tool executions per turn (default 100)
-	MaxParallelToolCalls int // semaphore width for the parallel batch (default 8)
-}
-
-const (
-	defaultMaxToolIterations    = 25
-	defaultMaxToolCallsPerTurn  = 100
-	defaultMaxParallelToolCalls = 8
-)
-
-// resolveMaxToolIterations applies the default when the caller leaves the field
-// unset (zero or negative), mirroring resolveDrainTimeout.
-func resolveMaxToolIterations(n int) int {
-	if n <= 0 {
-		return defaultMaxToolIterations
-	}
-	return n
-}
-
-// resolveMaxToolCallsPerTurn applies the default when unset (zero or negative).
-func resolveMaxToolCallsPerTurn(n int) int {
-	if n <= 0 {
-		return defaultMaxToolCallsPerTurn
-	}
-	return n
-}
-
-// resolveMaxParallelToolCalls applies the default when unset (zero or negative).
-func resolveMaxParallelToolCalls(n int) int {
-	if n <= 0 {
-		return defaultMaxParallelToolCalls
-	}
-	return n
-}
-
-// resolveToolSetCaps returns ts with each zero (or negative) runaway-guard field
-// replaced by its default. Permission/Registry/Middlewares are left untouched.
-func resolveToolSetCaps(ts ToolSet) ToolSet {
-	ts.MaxToolIterations = resolveMaxToolIterations(ts.MaxToolIterations)
-	ts.MaxToolCallsPerTurn = resolveMaxToolCallsPerTurn(ts.MaxToolCallsPerTurn)
-	ts.MaxParallelToolCalls = resolveMaxParallelToolCalls(ts.MaxParallelToolCalls)
-	return ts
 }

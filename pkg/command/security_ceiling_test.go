@@ -3,6 +3,8 @@ package command
 import (
 	"encoding/json"
 	"testing"
+
+	"github.com/looprig/harness/pkg/ceiling"
 )
 
 // TestSetSecurityCeilingRoundTrip proves the journaled SetSecurityCeiling command
@@ -12,7 +14,7 @@ func TestSetSecurityCeilingRoundTrip(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
 		name  string
-		level uint8
+		level ceiling.Level
 	}{
 		{"most restrictive", 0},
 		{"mid", 2},

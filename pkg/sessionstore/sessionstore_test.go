@@ -2,12 +2,41 @@ package sessionstore
 
 import (
 	"errors"
+	"os"
+	"path/filepath"
+	"reflect"
 	"testing"
 
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/storage"
 	"github.com/looprig/storage/memstore"
 )
+
+type pathReporter struct {
+	paths []string
+}
+
+func (r pathReporter) StoragePaths() []string { return r.paths }
+
+type reportingLedger struct {
+	storage.Ledger
+	pathReporter
+}
+
+type reportingLeaser struct {
+	storage.Leaser
+	pathReporter
+}
+
+type reportingKV struct {
+	storage.KV
+	pathReporter
+}
+
+type reportingBlobs struct {
+	storage.Blobs
+	pathReporter
+}
 
 // mustUUID parses the canonical 8-4-4-4-12 form or fails the test. It gives the
 // name-derivation tests a fixed, readable id instead of a random one.
@@ -112,6 +141,151 @@ func TestOpenOptions(t *testing.T) {
 			}
 			if st.opts.OffloadThreshold != tt.want {
 				t.Errorf("OffloadThreshold = %d, want %d", st.opts.OffloadThreshold, tt.want)
+			}
+		})
+	}
+}
+
+func TestPersistencePaths(t *testing.T) {
+	t.Parallel()
+
+	base := t.TempDir()
+	first := filepath.Join(base, "a")
+	second := filepath.Join(base, "b")
+	for _, path := range []string{first, second} {
+		if err := os.Mkdir(path, 0o700); err != nil {
+			t.Fatalf("Mkdir(%q): %v", path, err)
+		}
+	}
+	alias := filepath.Join(base, "alias")
+	if err := os.Symlink(first, alias); err != nil {
+		t.Fatalf("Symlink(%q, %q): %v", first, alias, err)
+	}
+	wantFirst, err := filepath.EvalSymlinks(first)
+	if err != nil {
+		t.Fatalf("EvalSymlinks(%q): %v", first, err)
+	}
+	wantSecond, err := filepath.EvalSymlinks(second)
+	if err != nil {
+		t.Fatalf("EvalSymlinks(%q): %v", second, err)
+	}
+	missingTail := filepath.Join(alias, "missing", "tail")
+	wantMissingTail := filepath.Join(wantFirst, "missing", "tail")
+	broken := filepath.Join(base, "broken")
+	if err := os.Symlink(filepath.Join(base, "absent"), broken); err != nil {
+		t.Fatalf("Symlink(broken): %v", err)
+	}
+
+	local := memstore.New()
+	tests := []struct {
+		name    string
+		backend *storage.Composite
+		want    []string
+		wantErr bool
+	}{
+		{
+			name:    "remote providers report none",
+			backend: memstore.New(),
+			want:    nil,
+		},
+		{
+			name: "empty reporter paths report none",
+			backend: &storage.Composite{
+				Ledger: reportingLedger{
+					Ledger:       local.Ledger,
+					pathReporter: pathReporter{paths: []string{""}},
+				},
+				Leaser: local.Leaser,
+				KV:     local.KV,
+				Blobs:  local.Blobs,
+			},
+			want: nil,
+		},
+		{
+			name: "reporter paths are canonical sorted and deduplicated",
+			backend: &storage.Composite{
+				Ledger: reportingLedger{
+					Ledger:       local.Ledger,
+					pathReporter: pathReporter{paths: []string{second, alias}},
+				},
+				Leaser: reportingLeaser{
+					Leaser:       local.Leaser,
+					pathReporter: pathReporter{paths: []string{filepath.Join(first, "."), second}},
+				},
+				KV: reportingKV{
+					KV:           local.KV,
+					pathReporter: pathReporter{paths: []string{filepath.Join(base, "a", "..", "b")}},
+				},
+				Blobs: reportingBlobs{
+					Blobs:        local.Blobs,
+					pathReporter: pathReporter{paths: []string{""}},
+				},
+			},
+			want: []string{wantFirst, wantSecond},
+		},
+		{
+			name: "missing tail below symlink ancestor is canonicalized",
+			backend: &storage.Composite{
+				Ledger: reportingLedger{
+					Ledger:       local.Ledger,
+					pathReporter: pathReporter{paths: []string{missingTail}},
+				},
+				Leaser: local.Leaser,
+				KV:     local.KV,
+				Blobs:  local.Blobs,
+			},
+			want: []string{wantMissingTail},
+		},
+		{
+			name: "broken symlink fails closed",
+			backend: &storage.Composite{
+				Ledger: reportingLedger{
+					Ledger:       local.Ledger,
+					pathReporter: pathReporter{paths: []string{filepath.Join(broken, "tail")}},
+				},
+				Leaser: local.Leaser,
+				KV:     local.KV,
+				Blobs:  local.Blobs,
+			},
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			st, err := Open(tt.backend)
+			if err != nil {
+				t.Fatalf("Open() err = %v", err)
+			}
+			got, err := st.PersistencePaths()
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("PersistencePaths() err = %v, wantErr %v", err, tt.wantErr)
+			}
+			if tt.wantErr {
+				var pathErr *PersistencePathError
+				if !errors.As(err, &pathErr) {
+					t.Fatalf("PersistencePaths() err = %T %v, want *PersistencePathError", err, err)
+				}
+				if got != nil {
+					t.Errorf("PersistencePaths() paths = %v on error, want nil", got)
+				}
+				return
+			}
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Fatalf("PersistencePaths() = %v, want %v", got, tt.want)
+			}
+			if len(got) == 0 {
+				return
+			}
+			got[0] = filepath.Join(base, "mutated")
+			next, err := st.PersistencePaths()
+			if err != nil {
+				t.Fatalf("PersistencePaths() after caller mutation err = %v", err)
+			}
+			if !reflect.DeepEqual(next, tt.want) {
+				t.Errorf("PersistencePaths() after caller mutation = %v, want %v", next, tt.want)
 			}
 		})
 	}

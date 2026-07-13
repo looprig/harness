@@ -9,7 +9,7 @@ import (
 	"testing"
 )
 
-// muxFixtures builds a Handler over fakes wired for routing tests: Run/Restore
+// muxFixtures builds a Handler over fakes wired for routing tests: NewSession/RestoreSession
 // succeed and the reader returns non-error DTOs, so a request that reaches the
 // intended handler produces a 2xx (proving routing) rather than the handler's
 // own error path.
@@ -17,9 +17,9 @@ func muxFixtures(t *testing.T, opts ...Option) http.Handler {
 	t.Helper()
 	runID := parseTestUUID(t, "11111111-1111-1111-1111-111111111111")
 	sess := &fakeSession{submitID: parseTestUUID(t, "22222222-2222-2222-2222-222222222222")}
-	runner := &fakeRunner{runID: runID, runSess: sess, restoreSess: sess}
+	rig := &fakeRig{runID: runID, runSess: sess, restoreSess: sess}
 	reader := &fakeReader{}
-	return Handler[*fakeSession](runner, reader, opts...)
+	return Handler[*fakeSession](rig, reader, opts...)
 }
 
 // TestHandlerRouting drives requests through the assembled mux and asserts each of

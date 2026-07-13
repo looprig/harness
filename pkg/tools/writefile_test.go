@@ -12,16 +12,18 @@ import (
 	"github.com/looprig/harness/pkg/tool"
 )
 
-// runWriteFile invokes WriteFile and extracts the single text block, failing on
-// any structural surprise (including a Go error — write tools return tool-result
-// strings).
-func runWriteFile(t *testing.T, root string, args map[string]any) string {
+// runWriteFile invokes WriteFile (bound to the given per-loop observation map) and
+// extracts the single text block, failing on any structural surprise (including a
+// Go error — write tools return tool-result strings). The shared obs lets a test
+// observe a file (via observeFile) before overwriting it, exercising the read-then-
+// write optimistic-concurrency path.
+func runWriteFile(t *testing.T, root string, obs *fileObservations, args map[string]any) string {
 	t.Helper()
 	b, err := json.Marshal(args)
 	if err != nil {
 		t.Fatalf("marshal args: %v", err)
 	}
-	res, err := NewWriteFile(root).InvokableRun(context.Background(), string(b))
+	res, err := NewWriteFile(root, obs).InvokableRun(context.Background(), string(b))
 	if err != nil {
 		t.Fatalf("InvokableRun returned a Go error %v; write tools return tool-result strings", err)
 	}
@@ -35,9 +37,27 @@ func runWriteFile(t *testing.T, root string, args map[string]any) string {
 	return tb.Text
 }
 
+// observeFile runs a real ReadFile bound to obs so a subsequent WriteFile/EditFile
+// on the same loop is authorized to overwrite/edit the path — the faithful read-
+// then-write workflow. It fails if the read did not succeed.
+func observeFile(t *testing.T, root string, obs *fileObservations, rel string) {
+	t.Helper()
+	b, err := json.Marshal(map[string]any{"path": rel})
+	if err != nil {
+		t.Fatalf("marshal args: %v", err)
+	}
+	res, err := NewReadFile(root, newFakeReadGuard(1<<20), obs).InvokableRun(context.Background(), string(b))
+	if err != nil {
+		t.Fatalf("observe read Go error: %v", err)
+	}
+	if got := res.Content[0].(*content.TextBlock).Text; strings.HasPrefix(got, "error:") {
+		t.Fatalf("observe read of %q failed: %q", rel, got)
+	}
+}
+
 func TestWriteFileInfo(t *testing.T) {
 	t.Parallel()
-	info, err := NewWriteFile(t.TempDir()).Info(context.Background())
+	info, err := NewWriteFile(t.TempDir(), newFileObservations()).Info(context.Background())
 	if err != nil {
 		t.Fatalf("Info() error = %v", err)
 	}
@@ -60,6 +80,7 @@ func TestWriteFile(t *testing.T) {
 		name       string
 		args       map[string]any
 		setup      func(t *testing.T, root string)
+		observeRel string // if set, ReadFile this path first so an overwrite is authorized
 		wantErr    bool   // result string begins with "error:"
 		wantOnDisk string // relative path that should exist with wantBody
 		wantBody   string
@@ -77,15 +98,28 @@ func TestWriteFile(t *testing.T) {
 			wantBody:   "deep",
 		},
 		{
-			name: "existing file is overwritten",
+			name: "observed existing file is overwritten",
 			args: map[string]any{"path": "exists.txt", "content": "new"},
 			setup: func(t *testing.T, root string) {
 				if err := os.WriteFile(filepath.Join(root, "exists.txt"), []byte("old contents here"), 0o600); err != nil {
 					t.Fatalf("seed: %v", err)
 				}
 			},
+			observeRel: "exists.txt",
 			wantOnDisk: "exists.txt",
 			wantBody:   "new",
+		},
+		{
+			name: "unobserved existing file is rejected without clobbering",
+			args: map[string]any{"path": "exists.txt", "content": "new"},
+			setup: func(t *testing.T, root string) {
+				if err := os.WriteFile(filepath.Join(root, "exists.txt"), []byte("old contents here"), 0o600); err != nil {
+					t.Fatalf("seed: %v", err)
+				}
+			},
+			wantErr:    true,
+			wantOnDisk: "exists.txt",
+			wantBody:   "old contents here", // unchanged: no observation, no clobber
 		},
 		{
 			name:       "empty content writes an empty file",
@@ -120,17 +154,20 @@ func TestWriteFile(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			root := t.TempDir()
+			obs := newFileObservations()
 			if tt.setup != nil {
 				tt.setup(t, root)
 			}
-			out := runWriteFile(t, root, tt.args)
+			if tt.observeRel != "" {
+				observeFile(t, root, obs, tt.observeRel)
+			}
+			out := runWriteFile(t, root, obs, tt.args)
 			gotErr := strings.HasPrefix(out, "error:")
 			if gotErr != tt.wantErr {
 				t.Fatalf("result = %q, wantErr = %v", out, tt.wantErr)
 			}
-			if tt.wantErr {
-				return
-			}
+			// The on-disk body is checked even on the expected-error rows so a
+			// rejected write is proven NOT to have clobbered the existing bytes.
 			if tt.wantOnDisk != "" {
 				got, err := os.ReadFile(filepath.Join(root, tt.wantOnDisk))
 				if err != nil {
@@ -156,7 +193,7 @@ func TestWriteFileSymlinkNotFollowed(t *testing.T) {
 	if err := os.Symlink(outside, link); err != nil {
 		t.Skipf("symlink unsupported: %v", err)
 	}
-	out := runWriteFile(t, root, map[string]any{"path": "link/evil.txt", "content": "x"})
+	out := runWriteFile(t, root, newFileObservations(), map[string]any{"path": "link/evil.txt", "content": "x"})
 	if !strings.HasPrefix(out, "error:") {
 		t.Fatalf("write via escaping symlink = %q, want an error", out)
 	}
@@ -165,14 +202,14 @@ func TestWriteFileSymlinkNotFollowed(t *testing.T) {
 	}
 }
 
-// TestWriteFileInWorkspaceSymlinkReplaced asserts that writing to a path whose
-// final component is an EXISTING in-workspace symlink (pointing to another
-// in-workspace regular file) REPLACES the symlink with the new regular file
-// rather than following it to clobber the symlink's target. This is the
-// "don't silently follow a final-component symlink" alignment with ReadFile:
-// the atomic Rename targets the LEXICAL joined path, so it replaces the link
-// node itself.
-func TestWriteFileInWorkspaceSymlinkReplaced(t *testing.T) {
+// TestWriteFileUnobservedSymlinkRejected asserts that a write to a path whose
+// final component is an EXISTING in-workspace symlink is REFUSED under the
+// optimistic-concurrency policy: a final-component symlink cannot be observed (a
+// ReadFile of it fails O_NOFOLLOW with ELOOP and records no observation), so it is
+// an existing-but-unverifiable path and any mutation is denied fail-secure. Neither
+// the symlink node nor its target is touched — a strict hardening of the previous
+// "replace the symlink" behavior.
+func TestWriteFileUnobservedSymlinkRejected(t *testing.T) {
 	t.Parallel()
 	root := t.TempDir()
 	const targetBody = "ORIGINAL TARGET BODY"
@@ -185,31 +222,21 @@ func TestWriteFileInWorkspaceSymlinkReplaced(t *testing.T) {
 		t.Skipf("symlink unsupported: %v", err)
 	}
 
-	out := runWriteFile(t, root, map[string]any{"path": "link.txt", "content": "NEW"})
-	if strings.HasPrefix(out, "error:") {
-		t.Fatalf("write to in-workspace symlink path = %q, want success", out)
+	out := runWriteFile(t, root, newFileObservations(), map[string]any{"path": "link.txt", "content": "NEW"})
+	if !strings.HasPrefix(out, "error:") {
+		t.Fatalf("write to unobserved symlink path = %q, want a fail-secure rejection", out)
 	}
 
-	// The link path now holds the new content as a REGULAR file (the symlink was
-	// replaced, not followed).
+	// The symlink node is intact (not replaced) and still points at its target.
 	fi, err := os.Lstat(link)
 	if err != nil {
 		t.Fatalf("lstat link: %v", err)
 	}
-	if fi.Mode()&os.ModeSymlink != 0 {
-		t.Fatalf("link.txt is still a symlink; the write followed it instead of replacing it")
+	if fi.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("link.txt is no longer a symlink; the rejected write mutated it")
 	}
-	if !fi.Mode().IsRegular() {
-		t.Fatalf("link.txt mode = %v, want a regular file", fi.Mode())
-	}
-	gotLink, err := os.ReadFile(link)
-	if err != nil {
-		t.Fatalf("read link: %v", err)
-	}
-	if string(gotLink) != "NEW" {
-		t.Fatalf("link.txt body = %q, want %q", gotLink, "NEW")
-	}
-	// The symlink's former target must be UNTOUCHED (the write did not follow it).
+	// The symlink's target must be UNTOUCHED (the write neither followed nor
+	// clobbered it).
 	gotTarget, err := os.ReadFile(target)
 	if err != nil {
 		t.Fatalf("read target: %v", err)
@@ -222,7 +249,7 @@ func TestWriteFileInWorkspaceSymlinkReplaced(t *testing.T) {
 func TestWriteFileWriteTarget(t *testing.T) {
 	t.Parallel()
 	root := t.TempDir()
-	wf := NewWriteFile(root)
+	wf := NewWriteFile(root, newFileObservations())
 
 	// Valid args -> resolved path, ok=true.
 	key, ok, err := wf.WriteTarget(`{"path":"sub/x.txt","content":"y"}`)
@@ -250,7 +277,7 @@ func TestWriteFileWriteTarget(t *testing.T) {
 func TestWriteFileBuildRequest(t *testing.T) {
 	t.Parallel()
 	root := t.TempDir()
-	wf := NewWriteFile(root)
+	wf := NewWriteFile(root, newFileObservations())
 
 	req, err := wf.BuildRequest(`{"path":"sub/x.txt","content":"secret-content-here"}`, nil)
 	if err != nil {
@@ -275,7 +302,7 @@ func TestWriteFileBuildRequest(t *testing.T) {
 
 func TestWriteFileAuditSummary(t *testing.T) {
 	t.Parallel()
-	wf := NewWriteFile(t.TempDir())
+	wf := NewWriteFile(t.TempDir(), newFileObservations())
 	got := wf.AuditSummary(`{"path":"a/b.txt","content":"super secret payload"}`)
 	if !strings.Contains(got, "a/b.txt") {
 		t.Errorf("AuditSummary = %q, want it to contain the path", got)

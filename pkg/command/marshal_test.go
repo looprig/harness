@@ -61,7 +61,7 @@ func TestMarshalCommandRoundTrip(t *testing.T) {
 		name string
 		cmd  Command
 	}{
-		{"UserInput", UserInput{Header: fullHeader(), Blocks: sampleBlocks("hello")}},
+		{"UserInput delegate route", UserInput{Header: fullHeader(), Blocks: sampleBlocks("hello"), NoFold: true, TargetLoopID: seededUUID(0x44)}},
 		{"UserInput nil blocks", UserInput{Header: fullHeader()}},
 		{"SubagentResult", SubagentResult{
 			Header:      fullHeader(),
@@ -83,6 +83,11 @@ func TestMarshalCommandRoundTrip(t *testing.T) {
 			Answer:    "the answer",
 		}},
 		{"CancelQueuedInput", CancelQueuedInput{
+			Header:          fullHeader(),
+			Coordinates:     identity.Coordinates{SessionID: seededUUID(0x22), LoopID: seededUUID(0x33)},
+			TargetCommandID: seededUUID(0x88),
+		}},
+		{"CancelDelegateRequest", CancelDelegateRequest{
 			Header:          fullHeader(),
 			Coordinates:     identity.Coordinates{SessionID: seededUUID(0x22), LoopID: seededUUID(0x33)},
 			TargetCommandID: seededUUID(0x88),
@@ -121,6 +126,7 @@ func TestMarshalCommandTransientChannelsNotSerialized(t *testing.T) {
 
 	interruptAck := make(chan bool, 1)
 	shutdownAck := make(chan error, 1)
+	cancelAck := make(chan DelegateCancelResult, 1)
 
 	tests := []struct {
 		name string
@@ -128,6 +134,7 @@ func TestMarshalCommandTransientChannelsNotSerialized(t *testing.T) {
 	}{
 		{"Interrupt with live ack", Interrupt{Header: fullHeader(), Ack: interruptAck}},
 		{"Shutdown with live ack", Shutdown{Header: fullHeader(), Ack: shutdownAck}},
+		{"CancelDelegateRequest with live ack", CancelDelegateRequest{Header: fullHeader(), Coordinates: identity.Coordinates{SessionID: seededUUID(0x22), LoopID: seededUUID(0x33)}, TargetCommandID: seededUUID(0x88), Ack: cancelAck}},
 	}
 
 	for _, tt := range tests {
@@ -160,6 +167,10 @@ func TestMarshalCommandTransientChannelsNotSerialized(t *testing.T) {
 				if c.Ack != nil {
 					t.Errorf("restored Shutdown.Ack = %v, want nil", c.Ack)
 				}
+			case CancelDelegateRequest:
+				if c.Ack != nil {
+					t.Errorf("restored CancelDelegateRequest.Ack = %v, want nil", c.Ack)
+				}
 			default:
 				t.Fatalf("restored %T, want Interrupt or Shutdown", got)
 			}
@@ -185,6 +196,7 @@ func TestMarshalCommandEnvelopeKeys(t *testing.T) {
 		{"DenyToolCall", DenyToolCall{Header: fullHeader()}, CommandDenyToolCall},
 		{"ProvideUserInput", ProvideUserInput{Header: fullHeader()}, CommandProvideUserInput},
 		{"CancelQueuedInput", CancelQueuedInput{Header: fullHeader()}, CommandCancelQueuedInput},
+		{"CancelDelegateRequest", CancelDelegateRequest{Header: fullHeader()}, CommandCancelDelegateRequest},
 		{"Interrupt", Interrupt{Header: fullHeader()}, CommandInterrupt},
 		{"Shutdown", Shutdown{Header: fullHeader()}, CommandShutdown},
 		{"SetSecurityCeiling", SetSecurityCeiling{Header: fullHeader()}, CommandSetSecurityCeiling},
@@ -221,7 +233,7 @@ func TestMarshalCommandEnvelopeKeys(t *testing.T) {
 // fails TestMarshalCommandCoversEveryType. A missed command type is an
 // unpersistable intent-log record = silent restore data loss, which this guard
 // forbids.
-const wantCommandTypes = 9
+const wantCommandTypes = 10
 
 // unionInstances is one zero-valued instance of EVERY concrete command type. The
 // drift guard asserts the codec handles each, so a new union member is forced
@@ -230,7 +242,7 @@ func unionInstances() []Command {
 	return []Command{
 		UserInput{}, SubagentResult{},
 		ApproveToolCall{}, DenyToolCall{}, ProvideUserInput{},
-		CancelQueuedInput{}, Interrupt{}, Shutdown{},
+		CancelQueuedInput{}, CancelDelegateRequest{}, Interrupt{}, Shutdown{},
 		SetSecurityCeiling{},
 	}
 }

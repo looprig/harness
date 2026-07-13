@@ -28,7 +28,7 @@ type RestoredForeign struct {
 // requires a non-empty seed sid (a restored foreign loop must know its session). There
 // is no sid return value — the caller already holds it in the seed.
 func NewRestored(loopCtx context.Context, sessionID, loopID uuid.UUID, parent loop.Provenance,
-	pub EventPublisher, cfg loop.Config, spec Spec, idGen func() (uuid.UUID, error),
+	pub EventPublisher, cfg loop.BoundDefinition, spec Spec, idGen func() (uuid.UUID, error),
 	fac *event.Factory, seed RestoredForeign) (*Loop, error) {
 	if err := validateWiring(cfg, spec, idGen, fac, pub); err != nil {
 		return nil, err
@@ -62,7 +62,7 @@ func NewRestored(loopCtx context.Context, sessionID, loopID uuid.UUID, parent lo
 // loop from journal-recovered state. It mirrors Builder but carries the RestoredForeign
 // seed and returns no sid (the seed already holds it).
 type RestoredBuilder func(loopCtx context.Context, sessionID, loopID uuid.UUID, parent loop.Provenance,
-	pub EventPublisher, cfg loop.Config, idGen func() (uuid.UUID, error), fac *event.Factory,
+	pub EventPublisher, cfg loop.BoundDefinition, idGen func() (uuid.UUID, error), fac *event.Factory,
 	seed RestoredForeign) (loop.Backend, error)
 
 // BuildRestoredWith adapts NewRestored to the RestoredBuilder seam: it closes over the
@@ -71,7 +71,7 @@ type RestoredBuilder func(loopCtx context.Context, sessionID, loopID uuid.UUID, 
 // (never a non-nil interface wrapping a nil *Loop) so the caller's nil check behaves.
 func BuildRestoredWith(spec Spec) RestoredBuilder {
 	return func(loopCtx context.Context, sessionID, loopID uuid.UUID, parent loop.Provenance,
-		pub EventPublisher, cfg loop.Config, idGen func() (uuid.UUID, error), fac *event.Factory,
+		pub EventPublisher, cfg loop.BoundDefinition, idGen func() (uuid.UUID, error), fac *event.Factory,
 		seed RestoredForeign) (loop.Backend, error) {
 		l, err := NewRestored(loopCtx, sessionID, loopID, parent, pub, cfg, spec, idGen, fac, seed)
 		if err != nil {

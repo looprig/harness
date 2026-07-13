@@ -1,9 +1,11 @@
 package event
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/looprig/core/content"
 	"github.com/looprig/core/uuid"
@@ -98,6 +100,19 @@ func MarshalEvent(ev Event) ([]byte, error) {
 	if ev.Class() == Ephemeral {
 		return nil, &EphemeralNotPersistableError{Type: name}
 	}
+	// Unknown checkpoint metadata exists solely as the in-memory projection of a
+	// legacy record. Never emit it into a current journal (nor emit a checkpoint
+	// whose trigger/cause pairing is malformed).
+	if _, checkpoint := ev.(WorkspaceCheckpointed); checkpoint {
+		if err := validateEventBody(ev); err != nil {
+			return nil, err
+		}
+	}
+	if _, accepted := ev.(DelegateRequestAccepted); accepted {
+		if err := validateEventBody(ev); err != nil {
+			return nil, err
+		}
+	}
 	payload, err := encodePayload(ev)
 	if err != nil {
 		return nil, err
@@ -122,8 +137,10 @@ func encodePayload(ev Event) ([]byte, error) {
 	case GateResolved:
 		return marshalGateResolved(e)
 	case SessionStarted, SessionActive, SessionIdle, SessionStopped,
-		RestoreStarted, RestoreDone, WorkspaceCheckpointed, SecurityCeilingChanged,
-		LoopIdle, LoopStarted, ForeignSessionBound, TurnRejected,
+		RestoreStarted, RestoreDone, WorkspaceCheckpointed, WorkspaceRestored,
+		ActiveLoopChanged, SecurityCeilingChanged,
+		LoopIdle, LoopStarted, DelegateRequestAccepted, LoopInferenceChanged, LoopModeChanged,
+		ForeignSessionBound, TurnRejected,
 		UserInputRequested, TurnInterrupted,
 		TurnStarted, TurnFoldedInto, InputCancelled, TurnDone,
 		PermissionDecided, GatePrepared, GateOpened:
@@ -308,10 +325,78 @@ func UnmarshalEvent(data []byte) (Event, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := ValidateEvent(ev); err != nil {
+	if err := validateDecodedEvent(ev, data); err != nil {
 		return nil, err
 	}
 	return ev, nil
+}
+
+// validateDecodedEvent preserves the one additive compatibility exception in the
+// event schema: checkpoints written before consistency/trigger existed decode with
+// both enum values unknown. Explicit zero values, partial metadata, and newly
+// constructed unknown-valued checkpoints remain invalid through ValidateEvent.
+func validateDecodedEvent(ev Event, data []byte) error {
+	if err := validateEventIdentity(ev); err != nil {
+		return err
+	}
+	if _, ok := ev.(WorkspaceCheckpointed); ok {
+		presence, err := inspectCheckpointMetadata(data)
+		if err != nil {
+			return err
+		}
+		if !presence.consistency && !presence.trigger {
+			return nil
+		}
+	}
+	return validateEventBody(ev)
+}
+
+type checkpointMetadataPresence struct {
+	consistency bool
+	trigger     bool
+}
+
+// inspectCheckpointMetadata enumerates top-level member names without first
+// collapsing them into a map. encoding/json matches struct fields case-
+// insensitively, so presence detection must do the same. Enumerating also lets us
+// reject two spellings of one logical field instead of allowing last-value-wins
+// decoding to hide an explicit unknown or conflicting value.
+func inspectCheckpointMetadata(data []byte) (checkpointMetadataPresence, error) {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	if _, err := dec.Token(); err != nil {
+		return checkpointMetadataPresence{}, &EventDecodeError{Type: "WorkspaceCheckpointed", Cause: err}
+	}
+	var presence checkpointMetadataPresence
+	for dec.More() {
+		keyToken, err := dec.Token()
+		if err != nil {
+			return checkpointMetadataPresence{}, &EventDecodeError{Type: "WorkspaceCheckpointed", Cause: err}
+		}
+		key, ok := keyToken.(string)
+		if !ok {
+			return checkpointMetadataPresence{}, &EventDecodeError{Type: "WorkspaceCheckpointed", Cause: fmt.Errorf("non-string object key")}
+		}
+		var value json.RawMessage
+		if err := dec.Decode(&value); err != nil {
+			return checkpointMetadataPresence{}, &EventDecodeError{Type: "WorkspaceCheckpointed", Cause: err}
+		}
+		switch {
+		case strings.EqualFold(key, "consistency"):
+			if presence.consistency {
+				return checkpointMetadataPresence{}, &EventDecodeError{Type: "WorkspaceCheckpointed", Cause: fmt.Errorf("duplicate consistency field")}
+			}
+			presence.consistency = true
+		case strings.EqualFold(key, "trigger"):
+			if presence.trigger {
+				return checkpointMetadataPresence{}, &EventDecodeError{Type: "WorkspaceCheckpointed", Cause: fmt.Errorf("duplicate trigger field")}
+			}
+			presence.trigger = true
+		}
+	}
+	if _, err := dec.Token(); err != nil {
+		return checkpointMetadataPresence{}, &EventDecodeError{Type: "WorkspaceCheckpointed", Cause: err}
+	}
+	return presence, nil
 }
 
 // decodePayload dispatches on the "type" tag to the concrete decoder. An unknown or
@@ -335,12 +420,22 @@ func decodePayload(tag string, data []byte) (Event, error) {
 		return decodeRestoreErrored(data)
 	case "WorkspaceCheckpointed":
 		return decodePlain[WorkspaceCheckpointed](tag, data)
+	case "WorkspaceRestored":
+		return decodePlain[WorkspaceRestored](tag, data)
+	case "ActiveLoopChanged":
+		return decodePlain[ActiveLoopChanged](tag, data)
 	case "SecurityCeilingChanged":
 		return decodePlain[SecurityCeilingChanged](tag, data)
 	case "LoopIdle":
 		return decodePlain[LoopIdle](tag, data)
 	case "LoopStarted":
 		return decodePlain[LoopStarted](tag, data)
+	case "DelegateRequestAccepted":
+		return decodePlain[DelegateRequestAccepted](tag, data)
+	case "LoopInferenceChanged":
+		return decodePlain[LoopInferenceChanged](tag, data)
+	case "LoopModeChanged":
+		return decodePlain[LoopModeChanged](tag, data)
 	case "ForeignSessionBound":
 		return decodePlain[ForeignSessionBound](tag, data)
 	case "TurnStarted":

@@ -1,6 +1,12 @@
 package workspacestore
 
 import (
+	"errors"
+	"os"
+	"sort"
+	"strconv"
+
+	"github.com/looprig/harness/internal/pathutil"
 	"github.com/looprig/storage"
 )
 
@@ -30,8 +36,8 @@ const defaultMaxBytes int64 = 8 << 30
 type Options struct {
 	// SpoolDir is the directory in which Snapshot creates its spool temp file. The
 	// zero value (empty string) selects the operating system's default temp
-	// directory. A large working set is spooled here in full, so point it at a
-	// volume with room for one archive.
+	// directory. Open resolves it once to a canonical absolute path. A large working
+	// set is spooled here in full, so point it at a volume with room for one archive.
 	SpoolDir string
 
 	// MaxEntries caps how many entries Materialize will read from a snapshot
@@ -76,7 +82,8 @@ func WithMaxBytes(n int64) Option {
 // Open returns a Store over the given Blobs backend with opts applied. A nil
 // backend is rejected up front with *NilBlobsError — a Store has nowhere to put
 // snapshot bytes without one, so Open fails closed rather than hand back a Store
-// that panics on first Snapshot.
+// that panics on first Snapshot. The effective spool directory is canonicalized
+// and frozen here; an ambiguous path returns *PersistencePathError.
 func Open(b storage.Blobs, opts ...Option) (*Store, error) {
 	if b == nil {
 		return nil, &NilBlobsError{}
@@ -91,7 +98,63 @@ func Open(b storage.Blobs, opts ...Option) (*Store, error) {
 	if o.MaxBytes <= 0 {
 		o.MaxBytes = defaultMaxBytes
 	}
+	spoolDir := o.SpoolDir
+	if spoolDir == "" {
+		spoolDir = os.TempDir()
+	}
+	spoolPaths, err := pathutil.Canonicalize([]string{spoolDir})
+	if err != nil {
+		return nil, newPersistencePathError(err)
+	}
+	o.SpoolDir = spoolPaths[0]
 	return &Store{blobs: b, opts: o}, nil
+}
+
+// PersistencePaths returns the canonical local roots used by the configured blob
+// provider and Snapshot's effective spool directory. A provider without the
+// optional storage.PathReporter capability contributes no path. Resolution fails
+// closed with *PersistencePathError when any path is ambiguous.
+func (s *Store) PersistencePaths() ([]string, error) {
+	var reported []string
+	reporter, ok := s.blobs.(storage.PathReporter)
+	if ok {
+		reported = append(reported, reporter.StoragePaths()...)
+	}
+	paths, err := pathutil.Canonicalize(reported)
+	if err != nil {
+		return nil, newPersistencePathError(err)
+	}
+	paths = append(paths, s.opts.SpoolDir)
+	sort.Strings(paths)
+
+	result := paths[:0]
+	for _, path := range paths {
+		if len(result) == 0 || result[len(result)-1] != path {
+			result = append(result, path)
+		}
+	}
+	return result, nil
+}
+
+// PersistencePathError reports a local persistence path that could not be
+// canonicalized without ambiguity.
+type PersistencePathError struct {
+	Path  string
+	Cause error
+}
+
+func (e *PersistencePathError) Error() string {
+	return "workspacestore: resolve persistence path " + strconv.Quote(e.Path) + ": " + e.Cause.Error()
+}
+
+func (e *PersistencePathError) Unwrap() error { return e.Cause }
+
+func newPersistencePathError(err error) *PersistencePathError {
+	var pathErr *pathutil.CanonicalPathError
+	if errors.As(err, &pathErr) {
+		return &PersistencePathError{Path: pathErr.Path, Cause: err}
+	}
+	return &PersistencePathError{Cause: err}
 }
 
 // NilBlobsError reports that Open was called with a nil Blobs backend. It carries

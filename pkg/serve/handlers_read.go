@@ -21,7 +21,7 @@ const (
 // and passes the Page straight through to the injected Reader, which owns the stable
 // sort + slice + NextSkip/Done. It NEVER consults the live registry: a list is a pure
 // read over persisted history, so it succeeds on any pod with no live session.
-func (s *server[S]) handleListSessions(w http.ResponseWriter, r *http.Request) {
+func (s *server[S, O]) handleListSessions(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	skip, err := parseSkip(q)
 	if err != nil {
@@ -49,7 +49,7 @@ func (s *server[S]) handleListSessions(w http.ResponseWriter, r *http.Request) {
 // catalog entry) maps to 404; any other error is a generic 500. Like every read, it
 // NEVER consults the live registry — the status is projected from durable history, so
 // it resolves for a session that is not live on this pod.
-func (s *server[S]) handleStatus(w http.ResponseWriter, r *http.Request) {
+func (s *server[S, O]) handleStatus(w http.ResponseWriter, r *http.Request) {
 	sid, err := parseSessionID(r.PathValue("sid"))
 	if err != nil {
 		writeErrorCause(w, http.StatusBadRequest, codeInvalidParam, msgInvalidSID, false, err)
@@ -77,7 +77,7 @@ func (s *server[S]) handleStatus(w http.ResponseWriter, r *http.Request) {
 // the boundary, then reads the Reader-backed journal page (which owns the
 // replayer-backed read and the NextJournalSeq/Done cursor). GatePrepared never appears
 // (the replayer filters it). Like every read it NEVER consults the live registry.
-func (s *server[S]) handleJournal(w http.ResponseWriter, r *http.Request) {
+func (s *server[S, O]) handleJournal(w http.ResponseWriter, r *http.Request) {
 	sid, err := parseSessionID(r.PathValue("sid"))
 	if err != nil {
 		writeErrorCause(w, http.StatusBadRequest, codeInvalidParam, msgInvalidSID, false, err)

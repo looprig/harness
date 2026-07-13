@@ -7,9 +7,12 @@ import (
 	"log/slog"
 
 	"github.com/looprig/core/content"
+	"github.com/looprig/core/uuid"
+	"github.com/looprig/harness/internal/runtimecontract"
 	"github.com/looprig/harness/pkg/command"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/identity"
+	"github.com/looprig/harness/pkg/loop"
 )
 
 // turnOutcome is the turn goroutine's hand-back to the actor. The turn goroutine
@@ -61,23 +64,15 @@ func productionTurnLockOps() turnLockOps {
 	}
 }
 
-// runTurn drives one foreign turn from a UserInput submit. It runs ON the actor
-// goroutine: it mints the turn/step ids, publishes TurnStarted BEFORE Spawn, launches
+// runTurn drives one pre-admitted foreign turn. It runs ON the actor goroutine:
+// prepareInput has already minted the turn/step ids (and, for managed input, durably
+// committed acceptance); runTurn publishes TurnStarted BEFORE Spawn, launches
 // the turn goroutine (driveTurn), and then takes over the actor's select via awaitTurn
 // until the turn resolves. It returns whether the actor must EXIT (a Shutdown that
-// arrived mid-turn). On an id-mint failure it fails secure: log and drop the submit
-// (no partial turn, no zero-id events).
-func (l *Loop) runTurn(loopCtx context.Context, c command.UserInput) (exit bool) {
-	turnID, err := l.idGen()
-	if err != nil {
-		slog.Error("foreignloop: turn id mint failed; dropping submit (fail-secure)", "error", err)
-		return false
-	}
-	stepID, err := l.idGen()
-	if err != nil {
-		slog.Error("foreignloop: step id mint failed; dropping submit (fail-secure)", "error", err)
-		return false
-	}
+// arrived mid-turn).
+func (l *Loop) runTurn(loopCtx context.Context, prepared preparedInput) (exit bool) {
+	c := prepared.command
+	turnID, stepID := prepared.turnID, prepared.stepID
 	cur := l.turnIndex + 1
 	pub := l.publisher(loopCtx, turnID, stepID)
 
@@ -95,7 +90,7 @@ func (l *Loop) runTurn(loopCtx context.Context, c command.UserInput) (exit bool)
 	})
 
 	ft := ForeignTurn{
-		SystemPrompt: l.cfg.System,
+		SystemPrompt: l.cfg.EffectiveSystem(),
 		ForeignSID:   l.sid,
 		StartNew:     !l.hasSpawned,
 		Input:        c.Blocks,
@@ -106,24 +101,27 @@ func (l *Loop) runTurn(loopCtx context.Context, c command.UserInput) (exit bool)
 	turnCtx, cancel := context.WithCancel(loopCtx)
 	result := make(chan turnOutcome, 1)
 	go l.driveTurn(turnCtx, cancel, ft, cur, l.sidBound, pub, result)
-	return l.awaitTurn(loopCtx, cur, cancel, pub, result)
+	return l.awaitTurn(loopCtx, cur, c.CommandID, cancel, pub, result)
 }
 
 // awaitTurn is the actor's INNER select while a turn runs. It serves committed
 // (pre-turn) snapshots, applies the turn outcome when it arrives, honors control
 // commands (D4), and tears down on loop-ctx cancellation. It returns whether the
 // actor must exit.
-func (l *Loop) awaitTurn(loopCtx context.Context, cur event.TurnIndex,
+func (l *Loop) awaitTurn(loopCtx context.Context, cur event.TurnIndex, activeCommandID uuid.UUID,
 	cancel context.CancelFunc, pub func(event.Event), result chan turnOutcome) (exit bool) {
 	for {
 		select {
 		case out := <-result:
 			l.applyOutcome(cur, out, pub)
+			if !out.success && !out.interrupted {
+				l.cancelPending(pub, event.CancelTurnFailed)
+			}
 			return false
 		case req := <-l.snapshots:
 			req.reply <- snapshotResult{msgs: cloneMessages(l.msgs), turnIndex: l.turnIndex}
 		case cmd := <-l.Commands:
-			if done, exit := l.handleTurnCommand(cmd, cur, cancel, pub, result); done {
+			if done, exit := l.handleTurnCommand(loopCtx, cmd, cur, activeCommandID, cancel, pub, result); done {
 				return exit
 			}
 		case <-loopCtx.Done():
@@ -134,32 +132,109 @@ func (l *Loop) awaitTurn(loopCtx context.Context, cur event.TurnIndex,
 	}
 }
 
-// handleTurnCommand routes a command that arrives WHILE a turn runs. Interrupt
+// handleTurnCommand routes a command that arrives WHILE a turn runs. UserInput is
+// preflighted, checked-accepted when managed, and appended to the actor-owned FIFO.
+// Interrupt
 // cancels the turn ctx, waits for the goroutine to drain, and publishes
 // TurnInterrupted (via applyOutcome). Shutdown cancels, drains, acks, and exits the
 // actor. Every other command is an un-honorable mid-turn command — dropped with a
 // warning, never blocking and never publishing. done reports whether the turn is
 // resolved (the actor leaves awaitTurn); exit reports whether the whole actor stops.
-func (l *Loop) handleTurnCommand(cmd command.Command, cur event.TurnIndex,
+func (l *Loop) handleTurnCommand(loopCtx context.Context, cmd command.Command, cur event.TurnIndex, activeCommandID uuid.UUID,
 	cancel context.CancelFunc, pub func(event.Event), result chan turnOutcome) (done, exit bool) {
 	switch c := cmd.(type) {
+	case command.UserInput:
+		if len(l.pending) >= runtimecontract.ManagedInputQueueCapacity {
+			pub(event.TurnRejected{Header: event.Header{Cause: identity.Cause{CommandID: c.CommandID}}, Reason: event.RejectQueueFull})
+			if c.Accepted != nil {
+				c.Accepted <- &loop.InputRejectedError{Reason: event.RejectQueueFull}
+			}
+			return false, false
+		}
+		prepared, ok := l.prepareInput(loopCtx, c)
+		if !ok {
+			return false, false
+		}
+		l.pending = append(l.pending, prepared)
+		pub(event.InputQueued{Header: event.Header{Cause: identity.Cause{CommandID: c.CommandID}}})
+		if c.Accepted != nil {
+			c.Accepted <- nil
+		}
+		return false, false
+	case command.CancelDelegateRequest:
+		if err := c.Validate(); err != nil {
+			slog.Warn("foreignloop: invalid CancelDelegateRequest", "error", err)
+			return false, false
+		}
+		if err := command.ValidateCommand(c); err != nil {
+			c.Ack <- command.DelegateCancelNoop
+			return false, false
+		}
+		for i, pending := range l.pending {
+			if pending.command.CommandID != c.TargetCommandID {
+				continue
+			}
+			l.pending = append(l.pending[:i], l.pending[i+1:]...)
+			queued := pending.command
+			pub(event.InputCancelled{
+				Header:  event.Header{Cause: identity.Cause{CommandID: queued.CommandID, Agency: queued.Agency}},
+				Reason:  event.CancelClientRetracted,
+				Message: &content.UserMessage{Message: content.Message{Role: content.RoleUser, Blocks: queued.Blocks}},
+			})
+			c.Ack <- command.DelegateCancelQueued
+			return false, false
+		}
+		if c.TargetCommandID != activeCommandID {
+			c.Ack <- command.DelegateCancelNoop
+			return false, false
+		}
+		// If the terminal was already actor-observable, it wins the race and the
+		// targeted cancellation is a no-op; no later request is touched.
+		select {
+		case out := <-result:
+			l.applyOutcome(cur, out, pub)
+			if !out.success && !out.interrupted {
+				l.cancelPending(pub, event.CancelTurnFailed)
+			}
+			c.Ack <- command.DelegateCancelNoop
+			return true, false
+		default:
+		}
+		cancel()
+		l.applyOutcome(cur, <-result, pub)
+		c.Ack <- command.DelegateCancelActive
+		return true, false
 	case command.Interrupt:
 		cancel()
 		// applyOutcome publishes TurnInterrupted for the interrupted outcome; if the
 		// turn raced to completion before cancel landed, it commits that outcome instead
 		// (no double terminal — the goroutine already published its own).
 		l.applyOutcome(cur, <-result, pub)
+		l.cancelPending(pub, event.CancelTurnInterrupted)
 		c.Ack <- true
 		return true, false
 	case command.Shutdown:
 		cancel()
 		<-result // drain the cancelled turn goroutine before exiting.
+		l.cancelPending(pub, event.CancelTurnInterrupted)
 		c.Ack <- nil
 		return true, true
 	default:
 		slog.Warn("foreignloop: dropping un-honorable command during turn", "type", fmt.Sprintf("%T", cmd))
 		return false, false
 	}
+}
+
+func (l *Loop) cancelPending(pub func(event.Event), reason event.CancelReason) {
+	for _, pending := range l.pending {
+		c := pending.command
+		pub(event.InputCancelled{
+			Header:  event.Header{Cause: identity.Cause{CommandID: c.CommandID, Agency: c.Agency}},
+			Reason:  reason,
+			Message: &content.UserMessage{Message: content.Message{Role: content.RoleUser, Blocks: c.Blocks}},
+		})
+	}
+	l.pending = nil
 }
 
 // applyOutcome commits a resolved turn into the actor-owned state. On an interrupt it

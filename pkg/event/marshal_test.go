@@ -11,6 +11,7 @@ import (
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/tool"
+	"github.com/looprig/inference"
 )
 
 // seededUUID builds a deterministic non-zero uuid from a single seed byte so the
@@ -175,6 +176,36 @@ func TestEventBodyJSONKeysAreStableSnakeCase(t *testing.T) {
 			},
 			wantKeys:   []string{"event_id", "turn_index"},
 			absentKeys: []string{"cause"}, // zero Cause is omitzero
+		},
+		{
+			name:     "ActiveLoopChanged carries previous and active loop ids",
+			event:    ActiveLoopChanged{Header: hdr, PreviousLoopID: seededUUID(0x70), ActiveLoopID: seededUUID(0x71)},
+			wantKeys: []string{"previous_loop_id", "active_loop_id"},
+		},
+		{
+			name:     "LoopInferenceChanged carries model and effort",
+			event:    LoopInferenceChanged{Header: hdr, Model: inference.CustomModel("test", "test", "", "model"), Effort: inference.EffortHigh},
+			wantKeys: []string{"model", "effort"},
+		},
+		{
+			name:     "LoopModeChanged carries previous and selected modes",
+			event:    LoopModeChanged{Header: hdr, PreviousMode: "plan", Mode: "build"},
+			wantKeys: []string{"previous_mode", "mode"},
+		},
+		{
+			name:     "WorkspaceCheckpointed carries snapshot metadata",
+			event:    WorkspaceCheckpointed{Header: hdr, Ref: "v1:sha256:x", Consistency: SnapshotQuiescent, Trigger: SnapshotTriggerStepDone},
+			wantKeys: []string{"ref", "consistency", "trigger"},
+		},
+		{
+			name:     "WorkspaceRestored carries ref",
+			event:    WorkspaceRestored{Header: hdr, Ref: "v1:sha256:x"},
+			wantKeys: []string{"ref"},
+		},
+		{
+			name:     "LoopStarted carries initial mode",
+			event:    LoopStarted{Header: hdr, InitialMode: "plan"},
+			wantKeys: []string{"initial_mode"},
 		},
 	}
 
@@ -344,12 +375,16 @@ func TestMarshalEventRoundTripEnduring(t *testing.T) {
 		{"RestoreStarted", RestoreStarted{Header: fullHeaderSession()}},
 		{"RestoreDone", RestoreDone{Header: fullHeaderSession()}},
 		{"WorkspaceCheckpointed", WorkspaceCheckpointed{
-			Header: fullHeaderSession(),
-			Ref:    "v1:sha256:aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899",
+			Header:      checkpointHeader(),
+			Ref:         "v1:sha256:aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899",
+			Consistency: SnapshotQuiescent,
+			Trigger:     SnapshotTriggerManual,
 		}},
 		// Empty Ref is a legal string at the event layer (codec fidelity, not Ref
 		// grammar validity): it must round-trip back to "".
-		{"WorkspaceCheckpointed empty ref", WorkspaceCheckpointed{Header: fullHeaderSession()}},
+		{"WorkspaceCheckpointed empty ref", WorkspaceCheckpointed{Header: checkpointHeader(), Consistency: SnapshotQuiescent, Trigger: SnapshotTriggerManual}},
+		{"WorkspaceRestored", WorkspaceRestored{Header: fullHeaderSession(), Ref: "v1:sha256:restored"}},
+		{"ActiveLoopChanged", ActiveLoopChanged{Header: fullHeaderSession(), PreviousLoopID: seededUUID(0x20), ActiveLoopID: seededUUID(0x21)}},
 		{"SecurityCeilingChanged", SecurityCeilingChanged{Header: fullHeaderSession(), Level: 2}},
 		{"SecurityCeilingChanged zero", SecurityCeilingChanged{Header: fullHeaderSession()}},
 		// RestoreErrored.Err handled in the dedicated err-projection test below.
@@ -358,6 +393,10 @@ func TestMarshalEventRoundTripEnduring(t *testing.T) {
 		{"LoopStarted with AgentName", LoopStarted{Header: loopHeaderWithAgent("operator")}},
 		{"LoopStarted with ParentToolUseID", LoopStarted{Header: fullHeaderLoop(), ParentToolUseID: "toolu_abc123"}},
 		{"LoopStarted with ForeignSID", LoopStarted{Header: fullHeaderLoop(), ForeignSID: "11111111-1111-1111-1111-111111111111"}},
+		{"LoopStarted with InitialMode", LoopStarted{Header: fullHeaderLoop(), InitialMode: "plan"}},
+		{"DelegateRequestAccepted", DelegateRequestAccepted{Header: eventHeaderWithCommand(fullHeaderLoop(), seededUUID(0x66))}},
+		{"LoopInferenceChanged", LoopInferenceChanged{Header: fullHeaderLoop(), Model: inference.CustomModel("openai", "responses", "https://api.openai.com", "gpt-5"), Effort: inference.EffortHigh}},
+		{"LoopModeChanged", LoopModeChanged{Header: fullHeaderLoop(), PreviousMode: "plan", Mode: "build"}},
 		{"ForeignSessionBound", ForeignSessionBound{Header: fullHeaderLoop(), ForeignSID: "sid"}},
 		{"TurnStarted", TurnStarted{Header: fullHeaderTurn(), TurnIndex: 7, Message: userMsg("hi")}},
 		{"StepDone", StepDone{Header: fullHeader(), Messages: sampleMessages()}},
@@ -396,7 +435,7 @@ func TestMarshalWorkspaceCheckpointedWire(t *testing.T) {
 	t.Parallel()
 
 	const ref = "v1:sha256:aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899"
-	data, err := MarshalEvent(WorkspaceCheckpointed{Header: fullHeaderSession(), Ref: ref})
+	data, err := MarshalEvent(WorkspaceCheckpointed{Header: checkpointHeader(), Ref: ref, Consistency: SnapshotQuiescent, Trigger: SnapshotTriggerManual})
 	if err != nil {
 		t.Fatalf("MarshalEvent(WorkspaceCheckpointed) error = %v", err)
 	}
@@ -416,6 +455,20 @@ func TestMarshalWorkspaceCheckpointedWire(t *testing.T) {
 	}
 	if gotRef != ref {
 		t.Errorf("wire ref = %q, want %q\nraw: %s", gotRef, ref, data)
+	}
+	var gotConsistency SnapshotConsistency
+	if err := json.Unmarshal(keys["consistency"], &gotConsistency); err != nil {
+		t.Fatalf("unmarshal consistency key: %v", err)
+	}
+	if gotConsistency != SnapshotQuiescent {
+		t.Errorf("wire consistency = %v, want %v", gotConsistency, SnapshotQuiescent)
+	}
+	var gotTrigger SnapshotTriggerKind
+	if err := json.Unmarshal(keys["trigger"], &gotTrigger); err != nil {
+		t.Fatalf("unmarshal trigger key: %v", err)
+	}
+	if gotTrigger != SnapshotTriggerManual {
+		t.Errorf("wire trigger = %v, want %v", gotTrigger, SnapshotTriggerManual)
 	}
 }
 
@@ -622,7 +675,7 @@ func TestMarshalEventPermissionRequestedFullRequest(t *testing.T) {
 // without codec coverage changes the live count derived from classify+Class() and
 // fails TestMarshalEventCoversEveryEnduringType. A missed Enduring type is an
 // unpersistable event = silent restore data loss, which this guard forbids.
-const wantEnduringTypes = 23
+const wantEnduringTypes = 28
 
 // unionInstances is one instance of EVERY type in the sealed union (Enduring and
 // Ephemeral alike), mirroring TestClassifyExhaustive. The drift guard partitions
@@ -631,9 +684,9 @@ const wantEnduringTypes = 23
 func unionInstances() []Event {
 	return []Event{
 		SessionStarted{}, SessionActive{}, SessionIdle{}, SessionStopped{},
-		RestoreStarted{}, RestoreDone{}, RestoreErrored{}, WorkspaceCheckpointed{},
+		RestoreStarted{}, RestoreDone{}, RestoreErrored{}, WorkspaceCheckpointed{}, WorkspaceRestored{}, ActiveLoopChanged{},
 		SecurityCeilingChanged{},
-		LoopIdle{}, LoopStarted{}, ForeignSessionBound{},
+		LoopIdle{}, LoopStarted{}, DelegateRequestAccepted{}, LoopInferenceChanged{}, LoopModeChanged{}, ForeignSessionBound{},
 		TokenDelta{}, TurnStarted{}, StepDone{}, TurnFoldedInto{}, InputCancelled{},
 		InputQueued{}, TurnRejected{}, TurnDone{}, TurnFailed{}, TurnInterrupted{},
 		PermissionRequested{}, PermissionDecided{}, UserInputRequested{}, ToolCallStarted{}, ToolCallCompleted{},
@@ -763,6 +816,11 @@ func FuzzDecodeEvent(f *testing.F) {
 	seedEvents := []Event{
 		SessionStarted{Header: fullHeaderSession(), Config: ConfigFingerprint{ModelID: "m"}},
 		LoopStarted{Header: fullHeaderLoop()},
+		ActiveLoopChanged{Header: fullHeaderSession(), ActiveLoopID: seededUUID(0x76)},
+		LoopInferenceChanged{Header: fullHeaderLoop(), Model: inference.CustomModel("test", "test", "", "model")},
+		LoopModeChanged{Header: fullHeaderLoop(), PreviousMode: "plan", Mode: "build"},
+		WorkspaceCheckpointed{Header: checkpointHeader(), Ref: "v1:sha256:x", Consistency: SnapshotFuzzy, Trigger: SnapshotTriggerManual},
+		WorkspaceRestored{Header: fullHeaderSession(), Ref: "v1:sha256:x"},
 		TurnStarted{Header: fullHeaderTurn(), TurnIndex: 1, Message: userMsg("hi")},
 		StepDone{Header: fullHeader(), Messages: sampleMessages()},
 		TurnDone{Header: fullHeaderTurn(), Message: aiMsg("done")},
@@ -840,10 +898,21 @@ func fullHeaderSession() Header {
 	return h
 }
 
+func checkpointHeader() Header {
+	h := fullHeaderSession()
+	h.Cause = identity.Cause{}
+	return h
+}
+
 func fullHeaderLoop() Header {
 	h := fullHeader()
 	h.TurnID, h.StepID = uuid.UUID{}, uuid.UUID{}
 	return h
+}
+
+func eventHeaderWithCommand(header Header, commandID uuid.UUID) Header {
+	header.Cause.CommandID = commandID
+	return header
 }
 
 func fullHeaderTurn() Header {

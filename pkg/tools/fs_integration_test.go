@@ -5,7 +5,6 @@ package tools
 import (
 	"context"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -90,13 +89,6 @@ func assertNoSecret(t *testing.T, label, s string) {
 	}
 }
 
-// rgOnPath reports whether ripgrep is resolvable (so a test can note which Grep
-// backend it exercised). Both backends MUST keep the secret out regardless.
-func rgOnPath() bool {
-	_, err := exec.LookPath(rgBinary)
-	return err == nil
-}
-
 // TestFSEnvExcludedFromGlobGrepReadFile is the headline §5e case: a real `.env`
 // holding theSecret, alongside normal files, must be invisible to Glob and Grep
 // and unreadable by ReadFile — and the secret must never appear in any output or
@@ -117,7 +109,7 @@ func TestFSEnvExcludedFromGlobGrepReadFile(t *testing.T) {
 
 	glob := NewGlob(root, pc)
 	grep := NewGrep(root, pc)
-	read := NewReadFile(root, pc)
+	read := NewReadFile(root, pc, newFileObservations())
 	ctx := context.Background()
 
 	// Glob("**") must list the normal files but NEVER the .env files.
@@ -227,11 +219,12 @@ func TestFSContainmentSymlinkRejected(t *testing.T) {
 	// A normal in-workspace file so the tools have something legitimate present.
 	fsWrite(t, root, "keep.txt", "hello\n")
 
-	read := NewReadFile(root, pc)
+	obs := newFileObservations()
+	read := NewReadFile(root, pc, obs)
 	glob := NewGlob(root, pc)
 	grep := NewGrep(root, pc)
-	write := NewWriteFile(root)
-	edit := NewEditFile(root)
+	write := NewWriteFile(root, obs)
+	edit := NewEditFile(root, obs)
 	bash := NewBash(root)
 	ctx := context.Background()
 
@@ -330,7 +323,7 @@ func TestFSMaxReadBytesCaps(t *testing.T) {
 		{name: "one over the cap", size: readCap + 1, wantTrunc: true},
 		{name: "far over the cap", size: readCap * 4, wantTrunc: true},
 	}
-	read := NewReadFile(root, pc)
+	read := NewReadFile(root, pc, newFileObservations())
 	for _, tt := range tests {
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
@@ -371,8 +364,11 @@ func TestFSMaxReadBytesCaps(t *testing.T) {
 // owner-only 0600 mode, and leave NO temp litter (.looprig-write-*) behind.
 func TestFSAtomicWrite(t *testing.T) {
 	root := fsWorkspace(t)
-	write := NewWriteFile(root)
-	edit := NewEditFile(root)
+	obs := newFileObservations()
+	pc := fsChecker(t, root, 0)
+	read := NewReadFile(root, pc, obs)
+	write := NewWriteFile(root, obs)
+	edit := NewEditFile(root, obs)
 	ctx := context.Background()
 
 	// WriteFile a brand-new file under nested dirs.
@@ -408,6 +404,10 @@ func TestFSAtomicWrite(t *testing.T) {
 	t.Run("EditFile replaces content atomically", func(t *testing.T) {
 		rel := "edit/target.txt"
 		fsWrite(t, root, rel, "alpha BETA gamma\n")
+		// Observe the file first (read-then-edit) so the edit is authorized.
+		if _, err := read.InvokableRun(ctx, `{"path":"`+rel+`"}`); err != nil {
+			t.Fatalf("observe read Go error = %v", err)
+		}
 		res, err := edit.InvokableRun(ctx, `{"path":"`+rel+`","old":"BETA","new":"DELTA"}`)
 		if err != nil {
 			t.Fatalf("EditFile InvokableRun() Go error = %v", err)
@@ -431,6 +431,10 @@ func TestFSAtomicWrite(t *testing.T) {
 	t.Run("WriteFile overwrites existing file", func(t *testing.T) {
 		rel := "over.txt"
 		fsWrite(t, root, rel, "old body\n")
+		// Observe the file first (read-then-write) so the overwrite is authorized.
+		if _, err := read.InvokableRun(ctx, `{"path":"`+rel+`"}`); err != nil {
+			t.Fatalf("observe read Go error = %v", err)
+		}
 		res, err := write.InvokableRun(ctx, `{"path":"`+rel+`","content":"new body\n"}`)
 		if err != nil {
 			t.Fatalf("WriteFile InvokableRun() Go error = %v", err)

@@ -229,7 +229,7 @@ func TestServerHandleGateResponse(t *testing.T) {
 			sid := parseTestUUID(t, sidStr)
 			gid := parseTestUUID(t, gidStr)
 			sess := &fakeSession{respondGateErr: tt.gateErr}
-			srv := newServer[*fakeSession](&fakeRunner{}, nil, newConfig())
+			srv := newServer[*fakeSession, fakeSessionOption](&fakeRig{}, nil, newConfig())
 			if tt.attach {
 				srv.registry.put(sid, sess)
 			}
@@ -282,7 +282,7 @@ func TestServerHandleGateResponseNoCauseLeak(t *testing.T) {
 
 	sid := parseTestUUID(t, sidStr)
 	sess := &fakeSession{respondGateErr: &session.GateError{Kind: session.GateAppendFailed, Cause: errBoom}}
-	srv := newServer[*fakeSession](&fakeRunner{}, nil, newConfig())
+	srv := newServer[*fakeSession, fakeSessionOption](&fakeRig{}, nil, newConfig())
 	srv.registry.put(sid, sess)
 
 	req := gateRequest(sidStr, gidStr, `{"action":"approve"}`, true)
