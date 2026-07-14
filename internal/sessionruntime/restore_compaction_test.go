@@ -156,12 +156,14 @@ func TestPlanCompactWaiterRepairs(t *testing.T) {
 		},
 		AttemptID: orphanAttempt, CommittedEventID: uuid.UUID{0xd3},
 	}
-	orphanRejected := event.CompactWaiterRejected{
-		Header: event.Header{
-			EventID:     event.CompactWaiterReplyID(orphanAttempt, uuid.UUID{0xd4}, false),
-			Coordinates: committed.Coordinates, Cause: identity.Cause{CommandID: uuid.UUID{0xd4}},
-		},
-		AttemptID: orphanAttempt, Reason: event.CompactRejectShuttingDown,
+	orphanRejected := func(commandID uuid.UUID, reason event.CompactRejectReason) event.CompactWaiterRejected {
+		return event.CompactWaiterRejected{
+			Header: event.Header{
+				EventID:     event.CompactWaiterReplyID(orphanAttempt, commandID, false),
+				Coordinates: committed.Coordinates, Cause: identity.Cause{CommandID: commandID},
+			},
+			AttemptID: orphanAttempt, Reason: reason,
+		}
 	}
 	tests := []struct {
 		name     string
@@ -239,9 +241,36 @@ func TestPlanCompactWaiterRepairs(t *testing.T) {
 			}()},
 			wantKind: restoredCompactionWaiterMismatch,
 		},
+		{name: "orphan interrupted rejection is valid", events: []event.Event{
+			orphanRejected(uuid.UUID{0xd4}, event.CompactRejectInterrupted),
+		}},
+		{name: "orphan shutting-down rejection is valid", events: []event.Event{
+			orphanRejected(uuid.UUID{0xd5}, event.CompactRejectShuttingDown),
+		}},
+		{name: "orphan lane-full rejection is valid", events: []event.Event{
+			orphanRejected(uuid.UUID{0xd6}, event.CompactRejectControlLaneFull),
+		}},
+		{name: "orphan lane-full and pre-start rejections on distinct commands are valid", events: []event.Event{
+			orphanRejected(uuid.UUID{0xd7}, event.CompactRejectControlLaneFull),
+			orphanRejected(uuid.UUID{0xd8}, event.CompactRejectInterrupted),
+		}},
 		{
-			name:   "waiter-only attempt without terminal remains valid",
-			events: []event.Event{orphanResolved, orphanRejected},
+			name:     "orphan resolved outcome is corrupt",
+			events:   []event.Event{orphanResolved},
+			wantKind: restoredCompactionWaiterMismatch,
+		},
+		{
+			name: "orphan resolved and rejected ownership for one command is corrupt",
+			events: []event.Event{
+				orphanResolved,
+				orphanRejected(orphanResolved.Cause.CommandID, event.CompactRejectInterrupted),
+			},
+			wantKind: restoredCompactionWaiterMismatch,
+		},
+		{
+			name:     "orphan rejection with terminal-only reason is corrupt",
+			events:   []event.Event{orphanRejected(uuid.UUID{0xd9}, event.CompactRejectExecutionFailed)},
+			wantKind: restoredCompactionWaiterMismatch,
 		},
 		{
 			name: "member resolved outcome with foreign coordinates is corrupt",
@@ -302,6 +331,69 @@ func TestPlanCompactWaiterRepairs(t *testing.T) {
 				t.Fatal("repair planning mutated the raw replay")
 			}
 		})
+	}
+}
+
+func TestRestoreRejectsCorruptOrphanCompactWaiterBeforeStart(t *testing.T) {
+	t.Parallel()
+	tests := []struct{ name string }{{name: "orphan resolved outcome fails replay before restore lifecycle starts"}}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			runRestoreRejectsCorruptOrphanCompactWaiterBeforeStart(t)
+		})
+	}
+}
+
+func runRestoreRejectsCorruptOrphanCompactWaiterBeforeStart(t *testing.T) {
+	t.Helper()
+	store := newRestoreStore(t)
+	definition := restoreCfg(&stubLLM{}, "model-x", "be helpful")
+	h, sessionID, loopID, lease, _ := newOriginalHub(t, store, fingerprintFromDefinition(definition))
+	attemptID := event.CompactAttemptID(uuid.UUID{0xe1})
+	commandID := uuid.UUID{0xe2}
+	orphan := event.CompactWaiterResolved{
+		Header: event.Header{
+			EventID: event.CompactWaiterReplyID(attemptID, commandID, true), CreatedAt: fixedClock(),
+			Coordinates: identity.Coordinates{SessionID: sessionID, LoopID: loopID},
+			Cause:       identity.Cause{CommandID: commandID},
+		},
+		AttemptID: attemptID, CommittedEventID: uuid.UUID{0xe3},
+	}
+	if err := event.ValidateEvent(orphan); err != nil {
+		t.Fatalf("orphan fixture is not structurally valid: %v", err)
+	}
+	if err := h.PublishEvent(context.Background(), orphan); err != nil {
+		t.Fatal(err)
+	}
+	handOver(t, lease)
+
+	restored, err := restoreTestSession(context.Background(), definition, sessionID, store)
+	if restored != nil {
+		t.Fatal("corrupt replay returned a live session")
+	}
+	var restoreErr *RestoreError
+	var compactionErr *restoredCompactionError
+	if !errors.As(err, &restoreErr) || restoreErr.Kind != RestoreReplayFailed ||
+		!errors.As(err, &compactionErr) || compactionErr.Kind != restoredCompactionWaiterMismatch {
+		t.Fatalf("error = %T %v, want RestoreReplayFailed wrapping waiter mismatch", err, err)
+	}
+	var sawStarted, sawDone, sawErrored bool
+	waiterCount := 0
+	for _, ev := range replayAllSessionEvents(t, store, sessionID) {
+		switch ev.(type) {
+		case event.RestoreStarted:
+			sawStarted = true
+		case event.RestoreDone:
+			sawDone = true
+		case event.RestoreErrored:
+			sawErrored = true
+		case event.CompactWaiterResolved, event.CompactWaiterRejected:
+			waiterCount++
+		}
+	}
+	if sawStarted || sawDone || !sawErrored || waiterCount != 1 {
+		t.Fatalf("restore events started=%v done=%v errored=%v waiterCount=%d, want false/false/true/1", sawStarted, sawDone, sawErrored, waiterCount)
 	}
 }
 

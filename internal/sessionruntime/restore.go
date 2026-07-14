@@ -495,7 +495,15 @@ func planCompactWaiterRepairs(events []event.Event) ([]event.Event, error) {
 	for _, outcome := range outcomeOrder {
 		key := outcome.key
 		terminal, hasTerminal := terminals[key.attempt]
-		if !hasTerminal || restoredCompactionHasWaiter(terminal.waiters, key.command) {
+		if !hasTerminal {
+			if !restoredCompactionOrphanAllowed(outcome.event) {
+				return nil, &restoredCompactionError{
+					Kind: restoredCompactionWaiterMismatch, AttemptID: key.attempt, CommandID: key.command,
+				}
+			}
+			continue
+		}
+		if restoredCompactionHasWaiter(terminal.waiters, key.command) {
 			continue
 		}
 		if !restoredCompactionOverflowMatches(terminal, key.command, outcome.event) {
@@ -505,6 +513,19 @@ func planCompactWaiterRepairs(events []event.Event) ([]event.Event, error) {
 		}
 	}
 	return repairs, nil
+}
+
+func restoredCompactionOrphanAllowed(outcome event.Event) bool {
+	rejected, ok := outcome.(event.CompactWaiterRejected)
+	if !ok {
+		return false
+	}
+	switch rejected.Reason {
+	case event.CompactRejectInterrupted, event.CompactRejectShuttingDown, event.CompactRejectControlLaneFull:
+		return true
+	default:
+		return false
+	}
 }
 
 func restoredCompactionHasWaiter(waiters []uuid.UUID, commandID uuid.UUID) bool {
