@@ -18,6 +18,7 @@ type CompactionFinalizationErrorKind string
 const (
 	CompactionFinalizationProposal       CompactionFinalizationErrorKind = "proposal"
 	CompactionFinalizationTerminalMint   CompactionFinalizationErrorKind = "terminal_mint"
+	CompactionFinalizationTerminalClone  CompactionFinalizationErrorKind = "terminal_clone"
 	CompactionFinalizationTerminalAppend CompactionFinalizationErrorKind = "terminal_append"
 	CompactionFinalizationWaiterMint     CompactionFinalizationErrorKind = "waiter_mint"
 	CompactionFinalizationWaiterAppend   CompactionFinalizationErrorKind = "waiter_append"
@@ -39,6 +40,8 @@ func (e *CompactionFinalizationError) Error() string {
 		message = "loopruntime: invalid compaction finalization proposal"
 	case CompactionFinalizationTerminalMint:
 		message = "loopruntime: compaction terminal construction failed"
+	case CompactionFinalizationTerminalClone:
+		message = "loopruntime: compaction terminal ownership copy failed"
 	case CompactionFinalizationTerminalAppend:
 		message = "loopruntime: compaction terminal append failed"
 	case CompactionFinalizationWaiterMint:
@@ -121,7 +124,7 @@ func (f *compactionFinalizer) Finalize(
 	proposal compactionFinalizationProposal,
 ) (event.Event, error) {
 	if record, ok := f.records[attempt.AttemptID]; ok {
-		return record.event, nil
+		return cloneCompactionTerminal(record.event, attempt.AttemptID)
 	}
 	if err := proposal.validate(); err != nil {
 		return nil, finalizationError(err, attempt.AttemptID)
@@ -134,16 +137,24 @@ func (f *compactionFinalizer) Finalize(
 	if err != nil {
 		return nil, err
 	}
-	if err := f.config.Publisher.PublishEventChecked(ctx, terminal); err != nil {
+	published, err := cloneCompactionTerminal(terminal, attempt.AttemptID)
+	if err != nil {
+		return nil, err
+	}
+	if err := f.config.Publisher.PublishEventChecked(ctx, published); err != nil {
 		return nil, &CompactionFinalizationError{
 			Kind: CompactionFinalizationTerminalAppend, AttemptID: attempt.AttemptID, Cause: err,
 		}
 	}
 	f.records[attempt.AttemptID] = compactionTerminalRecord{event: terminal}
 	if err := f.publishWaiterOutcomes(ctx, attempt, terminal); err != nil {
-		return terminal, err
+		returned, cloneErr := cloneCompactionTerminal(terminal, attempt.AttemptID)
+		if cloneErr != nil {
+			return nil, cloneErr
+		}
+		return returned, err
 	}
-	return terminal, nil
+	return cloneCompactionTerminal(terminal, attempt.AttemptID)
 }
 
 func (f *compactionFinalizer) buildTerminal(

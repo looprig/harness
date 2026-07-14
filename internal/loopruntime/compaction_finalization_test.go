@@ -1,7 +1,9 @@
 package loopruntime
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"sync"
 	"testing"
@@ -244,6 +246,94 @@ func TestCompactionFinalizerDoesNotRecordFailedCanonicalAppend(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestCompactionFinalizerSeparatesPublishedCachedAndReturnedOwnership(t *testing.T) {
+	tests := []struct {
+		name     string
+		proposal compactionFinalizationProposal
+		mutate   func(*testing.T, event.Event)
+	}{
+		{
+			name: "committed summary and waiters",
+			proposal: compactionFinalizationProposal{Success: &compactionPreparedSuccess{
+				Summary: validFinalizationSummary(), PostContext: validFinalizationMeasurement(9),
+			}},
+			mutate: func(t *testing.T, terminal event.Event) {
+				t.Helper()
+				committed, ok := terminal.(event.CompactionCommitted)
+				if !ok {
+					t.Fatalf("terminal = %T, want CompactionCommitted", terminal)
+				}
+				committed.WaiterCommandIDs[0] = uuid.UUID{0xee}
+				text, ok := committed.Summary.Blocks[0].(*content.TextBlock)
+				if !ok || text == nil {
+					t.Fatalf("summary block = %T, want non-nil TextBlock", committed.Summary.Blocks[0])
+				}
+				text.Text = "mutated"
+			},
+		},
+		{
+			name:     "rejected waiters",
+			proposal: compactionFinalizationProposal{RejectReason: event.CompactRejectExecutionFailed},
+			mutate: func(t *testing.T, terminal event.Event) {
+				t.Helper()
+				rejected, ok := terminal.(event.CompactionRejected)
+				if !ok {
+					t.Fatalf("terminal = %T, want CompactionRejected", terminal)
+				}
+				rejected.WaiterCommandIDs[0] = uuid.UUID{0xee}
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			publisher := &compactionFinalizationPublisher{}
+			attempt := validFinalizationAttempt()
+			finalizer := newCompactionFinalizer(compactionFinalizerConfig{
+				Publisher: publisher, Factory: finalizationFactory(), SessionID: uuid.UUID{61}, LoopID: uuid.UUID{62},
+				Now: func() time.Time { return attempt.StartedAt.Add(time.Second) },
+			})
+
+			first, err := finalizer.Finalize(context.Background(), attempt, tt.proposal)
+			if err != nil {
+				t.Fatalf("first Finalize() error = %v", err)
+			}
+			delivered := publisher.snapshot()[0]
+			canonical := mustMarshalFinalizationEvent(t, delivered)
+
+			tt.mutate(t, first)
+			if got := mustMarshalFinalizationEvent(t, publisher.snapshot()[0]); !bytes.Equal(got, canonical) {
+				t.Fatalf("published terminal changed through first-return alias\n got: %s\nwant: %s", got, canonical)
+			}
+			tt.mutate(t, delivered)
+			retry, err := finalizer.Finalize(context.Background(), attempt, compactionFinalizationProposal{RejectReason: event.CompactRejectInternal})
+			if err != nil {
+				t.Fatalf("retry Finalize() error = %v", err)
+			}
+			if got := mustMarshalFinalizationEvent(t, retry); !bytes.Equal(got, canonical) {
+				t.Fatalf("retry terminal changed through caller/publisher alias\n got: %s\nwant: %s", got, canonical)
+			}
+
+			tt.mutate(t, retry)
+			secondRetry, err := finalizer.Finalize(context.Background(), attempt, compactionFinalizationProposal{RejectReason: event.CompactRejectInternal})
+			if err != nil {
+				t.Fatalf("second retry Finalize() error = %v", err)
+			}
+			if got := mustMarshalFinalizationEvent(t, secondRetry); !bytes.Equal(got, canonical) {
+				t.Fatalf("later retry terminal changed through earlier retry alias\n got: %s\nwant: %s", got, canonical)
+			}
+		})
+	}
+}
+
+func mustMarshalFinalizationEvent(t *testing.T, value event.Event) []byte {
+	t.Helper()
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		t.Fatalf("json.Marshal(%T) error = %v", value, err)
+	}
+	return encoded
 }
 
 func validFinalizationAttempt() compactionAttempt {
