@@ -3,6 +3,7 @@ package sessionruntime
 import (
 	"context"
 
+	"github.com/looprig/harness/internal/hustleruntime"
 	"github.com/looprig/harness/pkg/hub"
 	"github.com/looprig/harness/pkg/hustle"
 )
@@ -10,16 +11,12 @@ import (
 // hustleActivityLease is the narrow return contract the hustle controller will
 // consume. It is intentionally an interface here rather than the hub's concrete
 // lease type.
-type hustleActivityLease interface {
-	Release(context.Context) error
-}
+type hustleActivityLease = hustleruntime.ActivityLease
 
-// hustleActivityTracker is the future controller-facing acquisition contract.
+// hustleActivityTracker is the controller-facing acquisition contract.
 // Go return types are invariant, so *hub.Hub does not and should not satisfy it
 // directly even though *hub.HustleActivityLease satisfies hustleActivityLease.
-type hustleActivityTracker interface {
-	AcquireHustleActivity(context.Context, hustle.RunID) (hustleActivityLease, error)
-}
+type hustleActivityTracker = hustleruntime.ActivityTracker
 
 type hubHustleActivityTracker struct{ hub *hub.Hub }
 

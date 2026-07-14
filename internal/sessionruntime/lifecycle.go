@@ -144,8 +144,7 @@ type Lifecycle struct {
 	offloadGC OffloadGCPolicy
 
 	// hustles and hustleLimits are immutable design-time inputs captured for the
-	// hustle controller added later. This task deliberately stores them without
-	// binding, executing, or changing session behavior.
+	// session's private hustle controller.
 	hustles      []hustle.Definition
 	hustleLimits HustleLimits
 }
@@ -162,8 +161,8 @@ type HustleLimits struct {
 	WorkerDrainTimeout   time.Duration
 }
 
-// WithLifecycleHustles captures immutable hustle registrations for both future
-// NewSession and RestoreSession composition. It has no runtime effect yet.
+// WithLifecycleHustles captures immutable hustle registrations for both
+// NewSession and RestoreSession composition.
 func WithLifecycleHustles(definitions []hustle.Definition, limits HustleLimits) LifecycleOption {
 	captured := append([]hustle.Definition(nil), definitions...)
 	return func(r *Lifecycle) {
@@ -410,6 +409,7 @@ func (r *Lifecycle) NewSession(ctx context.Context, seed workspacestore.Ref) (*S
 	// hands the session the lease's release hook for its clean-Shutdown teardown.
 	opts := make([]Option, 0, len(r.baseOpts)+6)
 	opts = append(opts, r.baseOpts...)
+	opts = append(opts, withSessionHustles(r.hustles, r.hustleLimits))
 	opts = append(opts,
 		WithSessionID(sid),
 		WithEventAppender(evAp),
@@ -513,6 +513,7 @@ func releaseResolvedRoot(_ context.Context, resolved *resolvedPlacement) {
 func (r *Lifecycle) RestoreSession(ctx context.Context, id uuid.UUID) (*Session, error) {
 	opts := make([]Option, 0, len(r.baseOpts)+2)
 	opts = append(opts, r.baseOpts...)
+	opts = append(opts, withSessionHustles(r.hustles, r.hustleLimits))
 	if r.frozenFingerprint != nil {
 		opts = append(opts, WithFingerprint(*r.frozenFingerprint))
 	} else {

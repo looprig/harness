@@ -666,6 +666,9 @@ func buildRestoredSession(
 	hubOpts := []hub.Option{hub.WithAppender(appender), hub.WithFactory(factory), hub.WithFaultReporter(s)}
 	s.hub = hub.New(sessionID, hubOpts...)
 	s.gateAppender = &liveGateAppender{prepared: gateAppender, publisher: s}
+	if err := s.bindSessionHustles(); err != nil {
+		return abort(&RestoreError{Kind: RestoreLoopFailed, Cause: err})
+	}
 	if s.snapshotPolicy != nil && s.ws != nil && s.wsCoordinator != nil {
 		s.checkpoints = newCheckpointController(checkpointControllerConfig{
 			SessionID: sessionID, Policy: *s.snapshotPolicy, Store: s.ws, Root: s.wsRoot,

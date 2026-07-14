@@ -9,6 +9,7 @@ import (
 
 	"github.com/looprig/core/content"
 	"github.com/looprig/core/uuid"
+	"github.com/looprig/harness/internal/hustleruntime"
 	"github.com/looprig/harness/internal/loopruntime"
 	"github.com/looprig/harness/pkg/ceiling"
 	"github.com/looprig/harness/pkg/command"
@@ -16,6 +17,7 @@ import (
 	"github.com/looprig/harness/pkg/foreignloop"
 	"github.com/looprig/harness/pkg/gate"
 	"github.com/looprig/harness/pkg/hub"
+	"github.com/looprig/harness/pkg/hustle"
 	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/harness/pkg/tool"
@@ -76,8 +78,8 @@ type Session struct {
 	// registered after Shutdown's snapshot has been taken.
 	closing bool
 
-	// faulted is the persistence fail-secure latch: set by ReportFault when the hub
-	// raises a SessionPersistenceFault (a required durable append failed). Once set,
+	// faulted is the terminal fail-secure latch: set by ReportFault when the hub
+	// raises a SessionPersistenceFault, or by an internal hustle/workspace fault. Once set,
 	// every new Submit/NewLoop is refused with SessionFaulted, so no further work is
 	// admitted to a session whose durable log is no longer trustworthy. faultErr is
 	// the fault that latched it (chained as the refusal's Cause). Both are guarded by
@@ -91,6 +93,13 @@ type Session struct {
 	// owned by the recoverable required-checkpoint latch. Manual recovery may clear
 	// only this token; a newer terminal fault has a different generation.
 	workspaceWaiterFailureToken uint64
+
+	// hustleDefinitions and hustleLimits are immutable construction inputs. The
+	// single controller is bound before the session or any loop is reachable.
+	hustleDefinitions []hustle.Definition
+	hustleLimits      HustleLimits
+	hustleController  *hustleruntime.Controller
+	hustlesBound      bool
 
 	// limits are the in-session subagent-spawn safety caps NewLoop enforces (depth +
 	// quota). Defaulted in newSession (withDefaults) so the live values are always
@@ -575,6 +584,10 @@ var _ hub.FaultReporter = (*Session)(nil)
 // operator action owns recovery; this only stops admitting new work and unblocks
 // callers stuck waiting on a session that can no longer reach idle durably.
 func (s *Session) ReportFault(_ context.Context, fault *hub.SessionPersistenceFault) {
+	s.latchSessionFault(fault)
+}
+
+func (s *Session) latchSessionFault(fault error) {
 	s.loopsMu.Lock()
 	if !s.faulted {
 		s.faulted = true
@@ -1512,6 +1525,9 @@ func newSessionTopology(ctx context.Context, topology Topology, newID idGenerato
 		hubOpts = append(hubOpts, hub.WithAppender(s.injectedEventAppender))
 	}
 	s.hub = hub.New(id, hubOpts...)
+	if err := s.bindSessionHustles(); err != nil {
+		return abort(err)
+	}
 	if s.snapshotPolicy != nil && s.ws != nil && s.wsCoordinator != nil {
 		s.checkpoints = newCheckpointController(checkpointControllerConfig{
 			SessionID: id, Policy: *s.snapshotPolicy, Store: s.ws, Root: s.wsRoot,
@@ -1982,13 +1998,7 @@ func (s *Session) stopOffloadGC() {
 // records the cause. FailWaiters is called OUTSIDE loopsMu (it takes the hub lock, which is
 // never held together with loopsMu).
 func (s *Session) faultWorkspaceInconsistent(cause error) {
-	s.loopsMu.Lock()
-	if !s.faulted {
-		s.faulted = true
-		s.faultErr = cause
-	}
-	s.loopsMu.Unlock()
-	s.hub.FailWaiters(cause)
+	s.latchSessionFault(cause)
 }
 
 // newWorkspaceBinding returns the tool.WorkspaceBinding to populate at a loop bind site, or

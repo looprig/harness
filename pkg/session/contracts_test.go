@@ -6,6 +6,7 @@ import (
 	"go/token"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"sort"
 	"strings"
@@ -147,5 +148,28 @@ func TestOldLifecycleSurfaceIsAbsent(t *testing.T) {
 		for _, name := range forbiddenSessionNames(file) {
 			t.Errorf("old public lifecycle declaration %s remains in %s", name, entry.Name())
 		}
+	}
+}
+
+func TestSessionContractsDoNotExposeGenericHustleExecution(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name       string
+		contract   reflect.Type
+		methodName string
+	}{
+		{name: "data plane has no generic runner", contract: reflect.TypeOf((*session.Session)(nil)).Elem(), methodName: "RunHustle"},
+		{name: "controller has no generic runner", contract: reflect.TypeOf((*session.SessionController)(nil)).Elem(), methodName: "RunHustle"},
+		{name: "data plane has no generic invoke", contract: reflect.TypeOf((*session.Session)(nil)).Elem(), methodName: "InvokeHustle"},
+		{name: "controller has no generic invoke", contract: reflect.TypeOf((*session.SessionController)(nil)).Elem(), methodName: "InvokeHustle"},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if _, exists := tt.contract.MethodByName(tt.methodName); exists {
+				t.Fatalf("%s exposes forbidden generic hustle method %s", tt.contract.Name(), tt.methodName)
+			}
+		})
 	}
 }
