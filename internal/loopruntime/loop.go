@@ -2,6 +2,7 @@ package loopruntime
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
@@ -973,14 +974,20 @@ func runLoop(cfg loopConfig, state loopState) {
 					if disposition.retry {
 						continue
 					}
-					switch outcome.Disposition {
+					switch disposition.disposition {
 					case contextCompactionAwaitRejected:
 						if measured.measurement.InputTokens >= measured.measurement.InputLimit {
 							return &loop.ContextLimitError{Measurement: measured.measurement}
 						}
 						return nil
 					case contextCompactionAwaitCommitted:
-						return &contextReplacementRequiredError{AttemptID: measured.attemptID}
+						if disposition.replacement == nil {
+							return &contextCompactionOutcomeError{AttemptID: measured.attemptID}
+						}
+						return &contextReplacementDirective{
+							AttemptID:   measured.attemptID,
+							Replacement: turnContextReplacement{Summary: cloneUserMessage(disposition.replacement.Summary)},
+						}
 					default:
 						return &contextCompactionAwaitError{AttemptID: measured.attemptID}
 					}
@@ -992,21 +999,22 @@ func runLoop(cfg loopConfig, state loopState) {
 		// turn takes effect now while a change that lands DURING this turn does not. The
 		// remaining fields are immutable loop wiring, so they ride the frozen config.
 		return turnConfig{
-			base:           base,
-			runtimeContext: config.RuntimeContext,
-			model:          state.effective.model,
-			system:         state.effective.system,
-			tools:          state.effective.tools,
-			client:         config.Client,
-			gateReg:        gateReg,
-			idGen:          config.idGen,
-			admit:          admit,
-			firstAdmission: firstAdmission,
-			measure:        measure,
-			commit:         commit,
-			drainPending:   drainPending,
-			emit:           publish,
-			afterDrain:     config.afterDrain,
+			base:                    base,
+			runtimeContext:          config.RuntimeContext,
+			model:                   state.effective.model,
+			system:                  state.effective.system,
+			tools:                   state.effective.tools,
+			client:                  config.Client,
+			gateReg:                 gateReg,
+			idGen:                   config.idGen,
+			admit:                   admit,
+			firstAdmission:          firstAdmission,
+			measure:                 measure,
+			commit:                  commit,
+			drainPending:            drainPending,
+			emit:                    publish,
+			afterDrain:              config.afterDrain,
+			afterContextReplacement: config.afterContextReplacement,
 		}
 	}
 
@@ -2046,20 +2054,48 @@ func runLoop(cfg loopConfig, state loopState) {
 				outcome.reply <- contextCompactionOutcomeReply{err: validationErr}
 				continue
 			}
-			terminal, finalizationErr := compactionFinalizations.Finalize(ctx, *attempt, outcome.result.Proposal)
+			settings, configured := contextSettings(config)
+			proposal := outcome.result.Proposal
+			disposition := outcome.result.Disposition
+			var replacementPlan *actorContextReplacement
+			if proposal.Success != nil {
+				plan, replacementErr := prepareActorContextReplacement(state, *attempt, proposal.Success, settings)
+				if replacementErr != nil {
+					var stale *StaleCompactionError
+					rejectReason := event.CompactRejectInternal
+					if errors.As(replacementErr, &stale) {
+						rejectReason = event.CompactRejectStaleBasis
+					}
+					proposal = compactionFinalizationProposal{RejectReason: rejectReason}
+					disposition = contextCompactionAwaitRejected
+				} else {
+					replacementPlan = &plan
+				}
+			}
+			terminal, finalizationErr := compactionFinalizations.Finalize(ctx, *attempt, proposal)
 			if finalizationErr != nil {
 				reportCompactionFailure(attempt.WaiterCommandIDs, finalizationErr)
 				outcome.reply <- contextCompactionOutcomeReply{err: finalizationErr}
 				continue
+			}
+			var turnReplacement *turnContextReplacement
+			if committed, ok := terminal.(event.CompactionCommitted); ok {
+				if replacementPlan == nil {
+					outcome.reply <- contextCompactionOutcomeReply{err: &contextCompactionOutcomeError{AttemptID: outcome.attemptID}}
+					continue
+				}
+				replacementPlan.apply(&state, committed)
+				turnReplacement = &turnContextReplacement{Summary: cloneUserMessage(committed.Summary)}
 			}
 			compactions.complete(outcome.attemptID)
 			rejection, rejected := terminal.(event.CompactionRejected)
 			if rejected && rejection.Reason == event.CompactionReasonAutomatic {
 				state.contextTracker.exhaustAutomatic(rejection.Basis, rejection.Reason, true)
 			}
-			settings, configured := contextSettings(config)
 			retry := configured && settings.Automatic && rejected && rejection.Reason == event.CompactionReasonManual && rejection.Basis == state.contextTracker.currentBasis()
-			outcome.reply <- contextCompactionOutcomeReply{retry: retry}
+			outcome.reply <- contextCompactionOutcomeReply{
+				disposition: disposition, replacement: turnReplacement, retry: retry,
+			}
 
 		case result := <-admissions:
 			state.cancelAdmission = nil

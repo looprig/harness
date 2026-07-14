@@ -134,6 +134,9 @@ type turnConfig struct {
 	// drainPending returns the batch but before the first TurnFoldedInto commit. See
 	// runtimeConfig.afterDrain for the rationale.
 	afterDrain func()
+
+	// afterContextReplacement is the test-only peer of runtimeConfig's seam.
+	afterContextReplacement func()
 }
 
 // turnCommit is one commit request: the finalized step group to append to
@@ -242,6 +245,13 @@ func runTurn(ctx context.Context, cfg turnConfig, ts turnState) event.Event {
 		}
 		if cfg.measure != nil {
 			if err := cfg.measure(ctx, req, runtimeRevision); err != nil {
+				var directive *contextReplacementDirective
+				if errors.As(err, &directive) {
+					applyTurnContextReplacement(&cfg, &ts, directive.Replacement)
+					if cfg.afterContextReplacement != nil {
+						cfg.afterContextReplacement()
+					}
+				}
 				return event.TurnFailed{TurnIndex: ts.index, Err: err}
 			}
 		}

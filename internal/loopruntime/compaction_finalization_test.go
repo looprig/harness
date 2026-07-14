@@ -67,11 +67,8 @@ func TestCompactionFinalizerOwnsCanonicalTerminalAndWaiterProjection(t *testing.
 		wantReplyType event.EventName
 	}{
 		{
-			name: "prepared success commits then resolves every waiter",
-			proposal: compactionFinalizationProposal{Success: &compactionPreparedSuccess{
-				Summary:     validFinalizationSummary(),
-				PostContext: validFinalizationMeasurement(9),
-			}},
+			name:          "prepared success commits then resolves every waiter",
+			proposal:      compactionFinalizationProposal{Success: validPreparedFinalizationSuccess(9)},
 			wantTerminal:  "CompactionCommitted",
 			wantReplyType: "CompactWaiterResolved",
 		},
@@ -146,9 +143,7 @@ func TestCompactionFinalizerIsIdempotentAcrossCallbackPanics(t *testing.T) {
 				if tt.panicBefore {
 					panic("before finalizer ownership")
 				}
-				_, err := finalizer.Finalize(context.Background(), attempt, compactionFinalizationProposal{Success: &compactionPreparedSuccess{
-					Summary: validFinalizationSummary(), PostContext: validFinalizationMeasurement(7),
-				}})
+				_, err := finalizer.Finalize(context.Background(), attempt, compactionFinalizationProposal{Success: validPreparedFinalizationSuccess(7)})
 				if err != nil {
 					t.Fatalf("initial Finalize() error = %v", err)
 				}
@@ -174,7 +169,7 @@ func TestCompactionFinalizerMeasuresBeforeTerminalAppend(t *testing.T) {
 		name     string
 		proposal compactionFinalizationProposal
 	}{
-		{name: "commit", proposal: compactionFinalizationProposal{Success: &compactionPreparedSuccess{Summary: validFinalizationSummary(), PostContext: validFinalizationMeasurement(8)}}},
+		{name: "commit", proposal: compactionFinalizationProposal{Success: validPreparedFinalizationSuccess(8)}},
 		{name: "reject", proposal: compactionFinalizationProposal{RejectReason: event.CompactRejectInvalidSummary}},
 	}
 	for _, tt := range tests {
@@ -213,7 +208,7 @@ func TestCompactionFinalizerDoesNotRecordFailedCanonicalAppend(t *testing.T) {
 		proposal compactionFinalizationProposal
 		failType event.EventName
 	}{
-		{name: "commit append failure", proposal: compactionFinalizationProposal{Success: &compactionPreparedSuccess{Summary: validFinalizationSummary(), PostContext: validFinalizationMeasurement(6)}}, failType: "CompactionCommitted"},
+		{name: "commit append failure", proposal: compactionFinalizationProposal{Success: validPreparedFinalizationSuccess(6)}, failType: "CompactionCommitted"},
 		{name: "rejection append failure", proposal: compactionFinalizationProposal{RejectReason: event.CompactRejectExecutionFailed}, failType: "CompactionRejected"},
 	}
 	for _, tt := range tests {
@@ -248,6 +243,56 @@ func TestCompactionFinalizerDoesNotRecordFailedCanonicalAppend(t *testing.T) {
 	}
 }
 
+func TestCompactionFinalizerCanonicalizesCommittedPostContextBasis(t *testing.T) {
+	tests := []struct {
+		name        string
+		basis       event.ContextBasis
+		wantErrKind CompactionFinalizationErrorKind
+	}{
+		{name: "post context advances from attempted basis to committed event", basis: event.ContextBasis{Revision: 4, ThroughEventID: uuid.UUID{5}}},
+		{name: "revision overflow fails before append", basis: event.ContextBasis{Revision: ^event.ContextRevision(0), ThroughEventID: uuid.UUID{5}}, wantErrKind: CompactionFinalizationTerminalMint},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			publisher := &compactionFinalizationPublisher{}
+			attempt := validFinalizationAttempt()
+			attempt.Basis = tt.basis
+			finalizer := newCompactionFinalizer(compactionFinalizerConfig{
+				Publisher: publisher, Factory: finalizationFactory(), SessionID: uuid.UUID{71}, LoopID: uuid.UUID{72},
+				Now: func() time.Time { return attempt.StartedAt.Add(time.Second) },
+			})
+			success := &compactionPreparedSuccess{
+				Model: inference.ModelKey{Provider: "test", Model: "compactor"}, RequestFingerprint: [32]byte{1},
+				Summary: validFinalizationSummary(), PostContext: validFinalizationMeasurement(14),
+			}
+			success.PostContext.Basis = event.ContextBasis{}
+
+			terminal, err := finalizer.Finalize(context.Background(), attempt, compactionFinalizationProposal{Success: success})
+			if tt.wantErrKind != "" {
+				var typed *CompactionFinalizationError
+				if !errors.As(err, &typed) || typed.Kind != tt.wantErrKind {
+					t.Fatalf("Finalize() error = %T %v, want kind %q", err, err, tt.wantErrKind)
+				}
+				if len(publisher.snapshot()) != 0 {
+					t.Fatal("revision overflow published a terminal")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Finalize() error = %v", err)
+			}
+			committed, ok := terminal.(event.CompactionCommitted)
+			if !ok {
+				t.Fatalf("terminal = %T, want CompactionCommitted", terminal)
+			}
+			want := event.ContextBasis{Revision: tt.basis.Revision + 1, ThroughEventID: committed.EventID}
+			if committed.PostContext.Basis != want {
+				t.Fatalf("PostContext basis = %+v, want %+v", committed.PostContext.Basis, want)
+			}
+		})
+	}
+}
+
 func TestCompactionFinalizerSeparatesPublishedCachedAndReturnedOwnership(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -255,10 +300,8 @@ func TestCompactionFinalizerSeparatesPublishedCachedAndReturnedOwnership(t *test
 		mutate   func(*testing.T, event.Event)
 	}{
 		{
-			name: "committed summary and waiters",
-			proposal: compactionFinalizationProposal{Success: &compactionPreparedSuccess{
-				Summary: validFinalizationSummary(), PostContext: validFinalizationMeasurement(9),
-			}},
+			name:     "committed summary and waiters",
+			proposal: compactionFinalizationProposal{Success: validPreparedFinalizationSuccess(9)},
 			mutate: func(t *testing.T, terminal event.Event) {
 				t.Helper()
 				committed, ok := terminal.(event.CompactionCommitted)
@@ -360,6 +403,14 @@ func validFinalizationMeasurement(seed byte) event.ContextMeasurement {
 		InputTokens:        content.TokenCount(seed),
 		InputLimit:         100,
 		Quality:            inference.CountQualityExactLocal,
+	}
+}
+
+func validPreparedFinalizationSuccess(seed byte) *compactionPreparedSuccess {
+	measurement := validFinalizationMeasurement(seed)
+	return &compactionPreparedSuccess{
+		Model: measurement.Model, RequestFingerprint: [32]byte{0xf1},
+		Summary: validFinalizationSummary(), PostContext: measurement,
 	}
 }
 

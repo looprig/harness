@@ -8,6 +8,7 @@ import (
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/identity"
+	"github.com/looprig/inference"
 )
 
 // CompactionFinalizationErrorKind identifies the actor-owned transition that
@@ -61,8 +62,10 @@ func (e *CompactionFinalizationError) Unwrap() error { return e.Cause }
 // the actor is asked to own the terminal transition. Applying it to live
 // conversation state remains the responsibility of the replacement handshake.
 type compactionPreparedSuccess struct {
-	Summary     *content.UserMessage
-	PostContext event.ContextMeasurement
+	Model              inference.ModelKey
+	RequestFingerprint [32]byte
+	Summary            *content.UserMessage
+	PostContext        event.ContextMeasurement
 }
 
 // compactionFinalizationProposal carries exactly one terminal disposition.
@@ -77,10 +80,15 @@ func (p compactionFinalizationProposal) validate() error {
 		return &CompactionFinalizationError{Kind: CompactionFinalizationProposal}
 	}
 	if p.Success != nil {
-		if p.Success.Summary == nil {
+		if err := p.Success.Model.Validate(); err != nil {
+			return &CompactionFinalizationError{Kind: CompactionFinalizationProposal, Cause: err}
+		}
+		if p.Success.RequestFingerprint == ([32]byte{}) || p.Success.Summary == nil || p.Success.PostContext.Model != p.Success.Model {
 			return &CompactionFinalizationError{Kind: CompactionFinalizationProposal}
 		}
-		if err := p.Success.PostContext.Validate(); err != nil {
+		postContext := p.Success.PostContext
+		postContext.Basis = event.ContextBasis{Revision: 1, ThroughEventID: uuid.UUID{1}}
+		if err := postContext.Validate(); err != nil {
 			return &CompactionFinalizationError{Kind: CompactionFinalizationProposal, Cause: err}
 		}
 		return nil
@@ -178,6 +186,17 @@ func (f *compactionFinalizer) buildTerminal(
 	stamped, err := stampLoopEvent(terminal, f.config.Factory, f.config.SessionID, f.config.LoopID, uuid.UUID{})
 	if err != nil {
 		return nil, &CompactionFinalizationError{Kind: CompactionFinalizationTerminalMint, AttemptID: attempt.AttemptID, Cause: err}
+	}
+	if committed, ok := stamped.(event.CompactionCommitted); ok {
+		if attempt.Basis.Revision == ^event.ContextRevision(0) {
+			return nil, &CompactionFinalizationError{
+				Kind: CompactionFinalizationTerminalMint, AttemptID: attempt.AttemptID, Cause: &contextRevisionOverflowError{},
+			}
+		}
+		committed.PostContext.Basis = event.ContextBasis{
+			Revision: attempt.Basis.Revision + 1, ThroughEventID: committed.EventID,
+		}
+		stamped = committed
 	}
 	if err := event.ValidateEvent(stamped); err != nil {
 		return nil, &CompactionFinalizationError{Kind: CompactionFinalizationTerminalMint, AttemptID: attempt.AttemptID, Cause: err}

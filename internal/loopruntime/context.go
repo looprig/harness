@@ -34,10 +34,13 @@ type contextCompactionAwaiter interface {
 	AwaitCompaction(context.Context, event.CompactAttemptID) (contextCompactionAwaitResult, error)
 }
 
-type contextReplacementRequiredError struct{ AttemptID event.CompactAttemptID }
+type contextReplacementDirective struct {
+	AttemptID   event.CompactAttemptID
+	Replacement turnContextReplacement
+}
 
-func (e *contextReplacementRequiredError) Error() string {
-	return "loopruntime: compacted context replacement requires actor handoff"
+func (e *contextReplacementDirective) Error() string {
+	return "loopruntime: compacted context replacement is ready for continuation"
 }
 
 type contextCompactionAwaitError struct {
@@ -175,8 +178,10 @@ type contextCompactionOutcomeRequest struct {
 }
 
 type contextCompactionOutcomeReply struct {
-	retry bool
-	err   error
+	disposition contextCompactionAwaitDisposition
+	replacement *turnContextReplacement
+	retry       bool
+	err         error
 }
 
 type contextAdmissionSettings struct {

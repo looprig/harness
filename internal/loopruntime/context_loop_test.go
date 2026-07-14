@@ -95,16 +95,19 @@ type contextOrderClient struct {
 	recorder     *recordingPublisher
 	calls        int
 	eventsAtCall []event.Event
+	requests     []inference.Request
 }
 
 func (*contextOrderClient) Invoke(context.Context, inference.Request) (*inference.Response, error) {
 	return nil, errors.New("contextOrderClient.Invoke not used")
 }
 
-func (c *contextOrderClient) Stream(context.Context, inference.Request) (*inference.StreamReader[content.Chunk], error) {
+func (c *contextOrderClient) Stream(_ context.Context, request inference.Request) (*inference.StreamReader[content.Chunk], error) {
 	c.mu.Lock()
 	c.calls++
 	c.eventsAtCall = c.recorder.events()
+	request.Messages = cloneMessages(request.Messages)
+	c.requests = append(c.requests, request)
 	c.mu.Unlock()
 	emitted := false
 	return inference.NewStreamReader(func() (content.Chunk, error) {
@@ -114,6 +117,16 @@ func (c *contextOrderClient) Stream(context.Context, inference.Request) (*infere
 		}
 		return nil, io.EOF
 	}, nil), nil
+}
+
+func (c *contextOrderClient) requestSnapshot() []inference.Request {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	requests := append([]inference.Request(nil), c.requests...)
+	for index := range requests {
+		requests[index].Messages = cloneMessages(requests[index].Messages)
+	}
+	return requests
 }
 
 func (c *contextOrderClient) snapshot() (int, []event.Event) {

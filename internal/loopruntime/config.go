@@ -163,6 +163,11 @@ type runtimeConfig struct {
 	// to exercise the draining-buffer abnormal-return sweep.
 	afterDrain func()
 
+	// afterContextReplacement is a test-only turn-goroutine seam invoked after
+	// the replacement directive resets private request history. Production leaves
+	// it nil; tests pause the turn while the actor proves its durable projection.
+	afterContextReplacement func()
+
 	// beforeCompactionBoundary is a test-only synchronization seam invoked by the
 	// actor after selecting a safe boundary but before priority arbitration. It lets
 	// tests make both bounded command lanes ready without timing sleeps.

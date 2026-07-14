@@ -354,7 +354,7 @@ func TestValidateContextCompactionProposal(t *testing.T) {
 		AttemptID: attemptID, WaiterCommandIDs: []uuid.UUID{{2}}, Reason: event.CompactionReasonAutomatic,
 		Basis: basis, StartedAt: time.Now(),
 	}
-	success := &compactionPreparedSuccess{Summary: validFinalizationSummary(), PostContext: validFinalizationMeasurement(8)}
+	success := validPreparedFinalizationSuccess(8)
 	tests := []struct {
 		name    string
 		attempt *compactionAttempt
