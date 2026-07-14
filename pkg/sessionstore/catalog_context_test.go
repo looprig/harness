@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/looprig/core/content"
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/identity"
@@ -85,6 +86,101 @@ func TestCatalogFoldsLatestContextMeasurement(t *testing.T) {
 			}
 			if len(meta.Loops) != 1 || meta.Loops[0].CurrentContext != tt.want || meta.Loops[0].ContextSeq != tt.wantSeq || meta.Loops[0].ContextValueSeq != tt.wantValueSeq {
 				t.Fatalf("loops = %#v", meta.Loops)
+			}
+		})
+	}
+}
+
+func catalogCompactionCommitted(seed byte, sessionID, loopID uuid.UUID) event.CompactionCommitted {
+	measurement := catalogContextMeasurement(seed + 1)
+	return event.CompactionCommitted{
+		Header:    event.Header{EventID: uuid.UUID{seed}, Coordinates: identity.Coordinates{SessionID: sessionID, LoopID: loopID}},
+		AttemptID: event.CompactAttemptID(uuid.UUID{seed}), WaiterCommandIDs: []uuid.UUID{{seed + 2}},
+		Reason: event.CompactionReasonManual, Basis: catalogContextMeasurement(seed).Basis,
+		Summary:     &content.UserMessage{Message: content.Message{Role: content.RoleUser, Blocks: []content.Block{&content.TextBlock{Text: "summary"}}}},
+		PostContext: measurement,
+	}
+}
+
+func TestCatalogProjectsCommittedPostContext(t *testing.T) {
+	t.Parallel()
+	sessionID, loopID := uuid.UUID{0x71}, uuid.UUID{0x72}
+	committed := catalogCompactionCommitted(10, sessionID, loopID)
+	tests := []struct {
+		name    string
+		act     func(*testing.T) SessionMeta
+		wantSeq uint64
+	}{
+		{
+			name: "live fold", wantSeq: 7,
+			act: func(t *testing.T) SessionMeta {
+				meta, changed, err := applyEvent(SessionMeta{}, committed, 7, func() time.Time { return time.Time{} })
+				if err != nil || !changed {
+					t.Fatalf("applyEvent() changed=%v error=%v", changed, err)
+				}
+				return meta
+			},
+		},
+		{
+			name: "journal repair fold", wantSeq: 2,
+			act: func(t *testing.T) SessionMeta {
+				events := []event.Event{
+					event.SessionStarted{Header: event.Header{Coordinates: identity.Coordinates{SessionID: sessionID}}},
+					committed,
+				}
+				store, err := Open(memstore.New())
+				if err != nil {
+					t.Fatal(err)
+				}
+				meta, err := store.OpenCatalog(WithCatalogReplayer(&fakeOpener{events: events})).RepairCatalog(context.Background(), sessionID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				return meta
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			meta := tt.act(t)
+			if len(meta.Loops) != 1 || meta.Loops[0].LoopID != loopID || meta.Loops[0].CurrentContext != committed.PostContext || meta.Loops[0].ContextSeq != tt.wantSeq || meta.Loops[0].ContextValueSeq != tt.wantSeq {
+				t.Fatalf("loops = %#v, want committed PostContext at seq %d", meta.Loops, tt.wantSeq)
+			}
+		})
+	}
+}
+
+func TestCatalogRepairRejectsDuplicateCompactionTerminal(t *testing.T) {
+	t.Parallel()
+	sessionID, loopID := uuid.UUID{0x81}, uuid.UUID{0x82}
+	committed := catalogCompactionCommitted(20, sessionID, loopID)
+	tests := []struct {
+		name   string
+		second event.Event
+	}{
+		{name: "duplicate committed terminal", second: committed},
+		{name: "conflicting rejected terminal", second: event.CompactionRejected{
+			Header:    event.Header{EventID: uuid.UUID{0x91}, Coordinates: committed.Coordinates},
+			AttemptID: committed.AttemptID, WaiterCommandIDs: committed.WaiterCommandIDs,
+			Reason: event.CompactionReasonManual, Basis: committed.Basis, RejectReason: event.CompactRejectExecutionFailed,
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			store, err := Open(memstore.New())
+			if err != nil {
+				t.Fatal(err)
+			}
+			events := []event.Event{
+				event.SessionStarted{Header: event.Header{Coordinates: identity.Coordinates{SessionID: sessionID}}},
+				committed, tt.second,
+			}
+			_, err = store.OpenCatalog(WithCatalogReplayer(&fakeOpener{events: events})).RepairCatalog(context.Background(), sessionID)
+			var compactionErr *CatalogCompactionError
+			if !errors.As(err, &compactionErr) || compactionErr.Kind != CatalogCompactionDuplicateTerminal {
+				t.Fatalf("error = %T %v, want *CatalogCompactionError{%q}", err, err, CatalogCompactionDuplicateTerminal)
 			}
 		})
 	}

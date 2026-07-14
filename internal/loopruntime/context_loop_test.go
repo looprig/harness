@@ -3,7 +3,9 @@ package loopruntime
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
+	"reflect"
 	"sync"
 	"testing"
 	"time"
@@ -481,6 +483,107 @@ func TestRestoredLoopAdvancesBasisWithoutCurrentMeasurement(t *testing.T) {
 			if measured == nil || measured.Measurement.Basis.Revision != restoredBasis.Revision+2 ||
 				measured.Measurement.Basis.ThroughEventID != committedStep.EventID {
 				t.Fatalf("restored measurement = %+v, want revision %d through terminal StepDone %s", measured, restoredBasis.Revision+2, committedStep.EventID)
+			}
+		})
+	}
+}
+
+func TestRestoredLoopFirstRequestUsesCompactedContextState(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+	}{
+		{name: "restored pressure and exhausted basis rearm after first history mutation"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			ctx, cancel := context.WithCancel(context.Background())
+			t.Cleanup(cancel)
+			recorder := &recordingPublisher{}
+			client := &contextOrderClient{recorder: recorder}
+			capability := contextTestCapability(inference.CountQualityExactLocal)
+			counter := &loopContextCounter{capability: capability, counts: []content.TokenCount{40, 20}}
+			model := testModel()
+			model.Limits = inference.ContextLimits{WindowTokens: 100, MaxInputTokens: 80, MaxOutputTokens: 20}
+			sink := newContextAwaitSink()
+			basis := event.ContextBasis{Revision: 10, ThroughEventID: uuid.UUID{0xd0}}
+			measurement := event.ContextMeasurement{
+				Basis: basis, Model: model.Key(), RequestFingerprint: [32]byte{0xd1},
+				InputTokens: 40, InputLimit: 60, Quality: inference.CountQualityExactLocal,
+			}
+			summary := seededUser("restored summary")
+			restoredHistory := content.AgenticMessages{summary, seededAI("later committed answer")}
+			actor, err := newRestoredWithConfig(ctx, uuid.UUID{0xd2}, uuid.UUID{0xd3}, recorder, runtimeConfig{
+				Client: client, Model: model, System: "system", DrainTimeout: 200 * time.Millisecond,
+				ContextCounter: counter, CounterCapability: capability, InferenceCapability: contextTestInferenceCapability(),
+				Compaction: &loop.CompactionPolicy{
+					Automatic: true, CounterPolicy: loop.CounterPolicyRequireExact,
+					CompactAt: 5_000, RearmBelow: 4_000, ReservedOutput: 20,
+					MaxSummaryTokens: 10, CountTimeout: time.Second, Hustle: "context.compact",
+				},
+				compactionSink: sink,
+			}, RestoredState{
+				Msgs: restoredHistory, TurnIndex: 3,
+				Basis: basis, HasBasis: true, Context: measurement, HasContext: true,
+				AutomaticBasis: basis, HasAutomaticBasis: true,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			startTurn(t, actor, recorder, []content.Block{&content.TextBlock{Text: "new input"}})
+			var disposition compactionDisposition
+			select {
+			case disposition = <-sink.started:
+			case <-time.After(2 * time.Second):
+				t.Fatal("restored exhausted basis did not rearm after the new TurnStarted basis")
+			}
+			if disposition.Attempt == nil || disposition.Attempt.Reason != event.CompactionReasonAutomatic || disposition.Attempt.Basis.Revision != basis.Revision+1 {
+				t.Fatalf("automatic disposition = %+v, want rearmed revision %d", disposition, basis.Revision+1)
+			}
+			measured, _ := contextEvents(recorder.events())
+			if measured == nil || measured.Measurement.Basis != disposition.Attempt.Basis || measured.Measurement.Model != model.Key() || measured.Measurement.RequestFingerprint == ([32]byte{}) {
+				t.Fatalf("first measurement = %+v, want attempt basis, restored model, and derived fingerprint", measured)
+			}
+			for _, published := range recorder.events() {
+				if pressure, ok := published.(event.ContextPressure); ok {
+					t.Fatalf("first same-pressure count emitted %+v; restored current measurement pressure was not seeded", pressure)
+				}
+			}
+			sink.release <- contextCompactionAwaitResult{
+				Disposition: contextCompactionAwaitRejected,
+				Proposal:    compactionFinalizationProposal{RejectReason: event.CompactRejectExecutionFailed},
+			}
+			deadline := time.Now().Add(2 * time.Second)
+			foundTerminal := false
+			for !foundTerminal && time.Now().Before(deadline) {
+				for _, published := range recorder.events() {
+					switch published.(type) {
+					case event.TurnDone, event.TurnFailed, event.TurnInterrupted:
+						foundTerminal = true
+					}
+				}
+				if !foundTerminal {
+					time.Sleep(2 * time.Millisecond)
+				}
+			}
+			if !foundTerminal {
+				events := recorder.events()
+				types := make([]string, len(events))
+				for index, published := range events {
+					types[index] = fmt.Sprintf("%T", published)
+				}
+				t.Fatalf("first restored turn produced no terminal; events=%v", types)
+			}
+			counter.mu.Lock()
+			counted := append([]inference.Request(nil), counter.requests...)
+			counter.mu.Unlock()
+			if len(counted) == 0 || len(counted[0].Messages) != 3 || !reflect.DeepEqual(content.AgenticMessages(counted[0].Messages[:2]), restoredHistory) {
+				t.Fatalf("first counted request messages = %#v, want restored summary plus later history then new user", counted)
+			}
+			primary := client.requestSnapshot()
+			if len(primary) != 1 || len(primary[0].Messages) != 3 || !reflect.DeepEqual(content.AgenticMessages(primary[0].Messages[:2]), restoredHistory) {
+				t.Fatalf("first primary request messages = %#v, want restored summary plus later history then new user", primary)
 			}
 		})
 	}

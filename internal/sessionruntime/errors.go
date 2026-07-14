@@ -30,6 +30,7 @@ const (
 	SessionLoopDepthExceeded             = sessionapi.SessionLoopDepthExceeded
 	SessionLoopQuotaExceeded             = sessionapi.SessionLoopQuotaExceeded
 	SessionForeignBuilderMissing         = sessionapi.SessionForeignBuilderMissing
+	SessionCompactionUnsupported         = sessionapi.SessionCompactionUnsupported
 	SessionDelegateIntentAppendFailed    = sessionapi.SessionDelegateIntentAppendFailed
 	SessionDelegateAdmissionCommitFailed = sessionapi.SessionDelegateAdmissionCommitFailed
 	RestoreNoSessionStarted              = sessionapi.RestoreNoSessionStarted

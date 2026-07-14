@@ -217,6 +217,10 @@ func restoreTopologySession(
 	if _, auditErr := foldRestoredHustleAudit(all); auditErr != nil {
 		return recordErrored(&RestoreError{Kind: RestoreReplayFailed, Cause: auditErr})
 	}
+	compactWaiterRepairs, repairErr := planCompactWaiterRepairs(all)
+	if repairErr != nil {
+		return recordErrored(&RestoreError{Kind: RestoreReplayFailed, Cause: repairErr})
+	}
 	ceilingLevel, hasCeiling := lastSecurityCeiling(all)
 	if hasCeiling {
 		probe.ceiling.Set(ceilingLevel)
@@ -301,6 +305,9 @@ func restoreTopologySession(
 	if err := appendRestoreEvent(ctx, j, factory, event.RestoreStarted{
 		Header: event.Header{Coordinates: identity.Coordinates{SessionID: sessionID}},
 	}); err != nil {
+		return recordErrored(&RestoreError{Kind: RestoreAppendFailed, Cause: err})
+	}
+	if err := appendCompactWaiterRepairs(ctx, j, factory, compactWaiterRepairs); err != nil {
 		return recordErrored(&RestoreError{Kind: RestoreAppendFailed, Cause: err})
 	}
 
@@ -765,6 +772,40 @@ func appendRestoreEvent(ctx context.Context, j journal.SessionJournal, factory *
 	}
 	if _, err := j.Append(ctx, journal.NewEventRecord(withRestoreHeader(ev, stamped))); err != nil {
 		return err
+	}
+	return nil
+}
+
+// appendCompactWaiterRepairs durably fills terminal membership replies without
+// minting new identities. The content-addressed EventID is retained; only
+// CreatedAt is stamped at the trusted restore boundary.
+func appendCompactWaiterRepairs(ctx context.Context, j journal.SessionJournal, factory *event.Factory, repairs []event.Event) error {
+	for _, repair := range repairs {
+		var stamped event.Event
+		switch typed := repair.(type) {
+		case event.CompactWaiterResolved:
+			header, err := factory.StampCompactWaiterResolved(typed)
+			if err != nil {
+				return err
+			}
+			typed.Header = header
+			stamped = typed
+		case event.CompactWaiterRejected:
+			header, err := factory.StampCompactWaiterRejected(typed)
+			if err != nil {
+				return err
+			}
+			typed.Header = header
+			stamped = typed
+		default:
+			return &restoredCompactionError{Kind: restoredCompactionWaiterMismatch}
+		}
+		if err := event.ValidateEvent(stamped); err != nil {
+			return err
+		}
+		if _, err := j.Append(ctx, journal.NewEventRecord(stamped)); err != nil {
+			return err
+		}
 	}
 	return nil
 }

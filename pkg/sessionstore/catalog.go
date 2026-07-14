@@ -410,6 +410,23 @@ func (e *CatalogHustleMetaValidationError) Error() string {
 
 func (e *CatalogHustleMetaValidationError) Unwrap() error { return e.Cause }
 
+type CatalogCompactionErrorKind string
+
+const (
+	CatalogCompactionDuplicateTerminal CatalogCompactionErrorKind = "duplicate_terminal"
+)
+
+// CatalogCompactionError reports contradictory canonical compaction history
+// encountered while rebuilding the derived catalog from the durable journal.
+type CatalogCompactionError struct {
+	Kind      CatalogCompactionErrorKind
+	AttemptID event.CompactAttemptID
+}
+
+func (e *CatalogCompactionError) Error() string {
+	return "sessionstore: invalid compaction history: " + string(e.Kind)
+}
+
 // CatalogOrderingError marks an online delivery whose sequence is behind the
 // catalog cursor and whose additive effect therefore cannot be classified as a
 // duplicate or a delayed unique record from bounded metadata alone. The online
@@ -599,6 +616,9 @@ func applyEvent(meta SessionMeta, ev event.Event, seq uint64, now CatalogClock) 
 			break
 		}
 		meta.Loops = putLoopContext(meta.Loops, e.LoopID, e.Measurement, seq)
+	case event.CompactionCommitted:
+		meta.SessionID = e.SessionID
+		meta.Loops = putLoopContext(meta.Loops, e.LoopID, e.PostContext, seq)
 	case event.SessionStopped:
 		meta.SessionID = e.SessionID
 		meta.Status = StatusStopped
@@ -1625,6 +1645,7 @@ func (c *Catalog) foldSession(ctx context.Context, sessionID uuid.UUID, replayer
 
 	var meta SessionMeta
 	hustleEvents := make([]event.Event, 0)
+	compactionTerminals := make(map[event.CompactAttemptID]struct{})
 	sawStart := false
 	for {
 		ev, seq, nerr := cursor.Next(ctx)
@@ -1636,6 +1657,18 @@ func (c *Catalog) foldSession(ctx context.Context, sessionID uuid.UUID, replayer
 		}
 		if _, ok := ev.(event.SessionStarted); ok {
 			sawStart = true
+		}
+		switch terminal := ev.(type) {
+		case event.CompactionCommitted:
+			if _, exists := compactionTerminals[terminal.AttemptID]; exists {
+				return SessionMeta{}, &CatalogCompactionError{Kind: CatalogCompactionDuplicateTerminal, AttemptID: terminal.AttemptID}
+			}
+			compactionTerminals[terminal.AttemptID] = struct{}{}
+		case event.CompactionRejected:
+			if _, exists := compactionTerminals[terminal.AttemptID]; exists {
+				return SessionMeta{}, &CatalogCompactionError{Kind: CatalogCompactionDuplicateTerminal, AttemptID: terminal.AttemptID}
+			}
+			compactionTerminals[terminal.AttemptID] = struct{}{}
 		}
 		if isHustleLifecycle(ev) {
 			hustleEvents = append(hustleEvents, ev)

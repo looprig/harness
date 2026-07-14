@@ -1793,6 +1793,58 @@ func (s *Session) SubmitToLoop(ctx context.Context, loopID uuid.UUID, blocks []c
 	return s.submitToLoop(ctx, loopID, blocks, identity.AgencyUser, false)
 }
 
+// Compact requests manual compaction of the currently active loop. The active
+// id is sampled once, then routed through the exact-target implementation.
+func (s *Session) Compact(ctx context.Context) (uuid.UUID, error) {
+	s.loopsMu.RLock()
+	active := s.activeLoopID
+	s.loopsMu.RUnlock()
+	return s.CompactToLoop(ctx, active)
+}
+
+// CompactToLoop requests manual compaction of one exact live native loop. The
+// trusted session boundary owns user agency and command coordinates; callers
+// receive only the correlation id used by durable waiter outcomes.
+func (s *Session) CompactToLoop(ctx context.Context, loopID uuid.UUID) (uuid.UUID, error) {
+	if err := s.faultIfFaulted(); err != nil {
+		return uuid.UUID{}, err
+	}
+	s.loopsMu.RLock()
+	h, ok := s.loops[loopID]
+	s.loopsMu.RUnlock()
+	if !ok {
+		return uuid.UUID{}, &SessionError{Kind: SessionLoopNotFound}
+	}
+	if h.bound.Engine() != loop.EngineNative {
+		return uuid.UUID{}, &SessionError{Kind: SessionCompactionUnsupported}
+	}
+	if _, configured := h.bound.CompactionPolicy(); !configured {
+		return uuid.UUID{}, &SessionError{Kind: SessionCompactionUnsupported}
+	}
+	select {
+	case <-h.backend.DoneChan():
+		return uuid.UUID{}, &SessionError{Kind: SessionLoopExited}
+	default:
+	}
+	id, err := s.newCommandID()
+	if err != nil {
+		return uuid.UUID{}, err
+	}
+	cmd := command.Compact{
+		Header:      command.Header{CommandID: id, Agency: identity.AgencyUser, CreatedAt: s.stampNow()},
+		Coordinates: identity.Coordinates{SessionID: s.sessionID, LoopID: loopID},
+	}
+	s.appendCommand(ctx, loopID, cmd)
+	select {
+	case h.backend.CommandSink() <- cmd:
+		return id, nil
+	case <-ctx.Done():
+		return uuid.UUID{}, &SessionError{Kind: SessionContextDone, Cause: ctx.Err()}
+	case <-h.backend.DoneChan():
+		return uuid.UUID{}, &SessionError{Kind: SessionLoopExited}
+	}
+}
+
 // submitToLoop submits a UserInput to a SPECIFIC loop with the given Agency,
 // returning the minted CommandID (correlate Reply events via Cause.CommandID).
 // It is the loop-targeted core of Submit: public Submit is the active-loop,

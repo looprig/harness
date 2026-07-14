@@ -173,3 +173,33 @@ func TestSessionContractsDoNotExposeGenericHustleExecution(t *testing.T) {
 		})
 	}
 }
+
+func TestSessionContractsExposeOnlyFocusedCompaction(t *testing.T) {
+	t.Parallel()
+	dataPlane := reflect.TypeOf((*session.Session)(nil)).Elem()
+	controller := reflect.TypeOf((*session.SessionController)(nil)).Elem()
+	tests := []struct {
+		name       string
+		contract   reflect.Type
+		methodName string
+		want       bool
+	}{
+		{name: "session exposes active convenience", contract: dataPlane, methodName: "Compact", want: true},
+		{name: "session exposes exact target", contract: dataPlane, methodName: "CompactToLoop", want: true},
+		{name: "controller inherits active convenience", contract: controller, methodName: "Compact", want: true},
+		{name: "controller inherits exact target", contract: controller, methodName: "CompactToLoop", want: true},
+		{name: "session has no arbitrary rewrite", contract: dataPlane, methodName: "RewriteContext"},
+		{name: "controller has no arbitrary rewrite", contract: controller, methodName: "RewriteContext"},
+		{name: "session has no supplied summary", contract: dataPlane, methodName: "CompactWithSummary"},
+		{name: "controller has no generic compaction runner", contract: controller, methodName: "RunCompaction"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			_, exists := tt.contract.MethodByName(tt.methodName)
+			if exists != tt.want {
+				t.Fatalf("%s method %s exists=%v, want %v", tt.contract.Name(), tt.methodName, exists, tt.want)
+			}
+		})
+	}
+}

@@ -399,6 +399,127 @@ func (*restoredContextRevisionOverflowError) Error() string {
 	return "sessionruntime: restored context revision overflow"
 }
 
+type restoredCompactionErrorKind string
+
+const (
+	restoredCompactionDuplicateTerminal restoredCompactionErrorKind = "duplicate_terminal"
+	restoredCompactionWaiterMismatch    restoredCompactionErrorKind = "waiter_mismatch"
+)
+
+// restoredCompactionError reports contradictory durable compaction membership.
+// Restore wraps it as RestoreReplayFailed before any repaired outcome is appended.
+type restoredCompactionError struct {
+	Kind      restoredCompactionErrorKind
+	AttemptID event.CompactAttemptID
+	CommandID uuid.UUID
+}
+
+func (e *restoredCompactionError) Error() string {
+	return "sessionruntime: invalid restored compaction: " + string(e.Kind)
+}
+
+type restoredCompactionTerminal struct {
+	event    event.Event
+	attempt  event.CompactAttemptID
+	waiters  []uuid.UUID
+	resolved bool
+}
+
+type restoredCompactionWaiterKey struct {
+	attempt event.CompactAttemptID
+	command uuid.UUID
+}
+
+// planCompactWaiterRepairs validates canonical terminal uniqueness and returns
+// only terminal members whose exact durable reply is absent. It is a pure fold:
+// the authoritative replay remains untouched and in its original order.
+func planCompactWaiterRepairs(events []event.Event) ([]event.Event, error) {
+	terminals := make(map[event.CompactAttemptID]struct{})
+	ordered := make([]restoredCompactionTerminal, 0)
+	outcomes := make(map[restoredCompactionWaiterKey][]event.Event)
+	for _, ev := range events {
+		switch typed := ev.(type) {
+		case event.CompactionCommitted:
+			if _, exists := terminals[typed.AttemptID]; exists {
+				return nil, &restoredCompactionError{Kind: restoredCompactionDuplicateTerminal, AttemptID: typed.AttemptID}
+			}
+			terminals[typed.AttemptID] = struct{}{}
+			ordered = append(ordered, restoredCompactionTerminal{
+				event: typed, attempt: typed.AttemptID, waiters: typed.WaiterCommandIDs, resolved: true,
+			})
+		case event.CompactionRejected:
+			if _, exists := terminals[typed.AttemptID]; exists {
+				return nil, &restoredCompactionError{Kind: restoredCompactionDuplicateTerminal, AttemptID: typed.AttemptID}
+			}
+			terminals[typed.AttemptID] = struct{}{}
+			ordered = append(ordered, restoredCompactionTerminal{
+				event: typed, attempt: typed.AttemptID, waiters: typed.WaiterCommandIDs,
+			})
+		case event.CompactWaiterResolved:
+			key := restoredCompactionWaiterKey{attempt: typed.AttemptID, command: typed.Cause.CommandID}
+			outcomes[key] = append(outcomes[key], typed)
+		case event.CompactWaiterRejected:
+			key := restoredCompactionWaiterKey{attempt: typed.AttemptID, command: typed.Cause.CommandID}
+			outcomes[key] = append(outcomes[key], typed)
+		}
+	}
+
+	var repairs []event.Event
+	for _, terminal := range ordered {
+		for _, commandID := range terminal.waiters {
+			key := restoredCompactionWaiterKey{attempt: terminal.attempt, command: commandID}
+			existing := outcomes[key]
+			if len(existing) == 0 {
+				repairs = append(repairs, restoredCompactionRepair(terminal, commandID))
+				continue
+			}
+			for _, outcome := range existing {
+				if !restoredCompactionOutcomeMatches(terminal, commandID, outcome) {
+					return nil, &restoredCompactionError{
+						Kind: restoredCompactionWaiterMismatch, AttemptID: terminal.attempt, CommandID: commandID,
+					}
+				}
+			}
+		}
+	}
+	return repairs, nil
+}
+
+func restoredCompactionRepair(terminal restoredCompactionTerminal, commandID uuid.UUID) event.Event {
+	header := event.Header{
+		Coordinates: terminal.event.EventHeader().Coordinates,
+		Cause:       identity.Cause{CommandID: commandID},
+		EventID:     event.CompactWaiterReplyID(terminal.attempt, commandID, terminal.resolved),
+	}
+	if terminal.resolved {
+		committed := terminal.event.(event.CompactionCommitted)
+		return event.CompactWaiterResolved{
+			Header: header, AttemptID: terminal.attempt, CommittedEventID: committed.EventID,
+		}
+	}
+	rejected := terminal.event.(event.CompactionRejected)
+	return event.CompactWaiterRejected{
+		Header: header, AttemptID: terminal.attempt, Reason: rejected.RejectReason,
+	}
+}
+
+func restoredCompactionOutcomeMatches(terminal restoredCompactionTerminal, commandID uuid.UUID, outcome event.Event) bool {
+	header := outcome.EventHeader()
+	if header.Coordinates != terminal.event.EventHeader().Coordinates || header.Cause.CommandID != commandID {
+		return false
+	}
+	if terminal.resolved {
+		resolved, ok := outcome.(event.CompactWaiterResolved)
+		committed := terminal.event.(event.CompactionCommitted)
+		return ok && resolved.AttemptID == terminal.attempt && resolved.CommittedEventID == committed.EventID &&
+			resolved.EventID == event.CompactWaiterReplyID(terminal.attempt, commandID, true)
+	}
+	rejectedOutcome, ok := outcome.(event.CompactWaiterRejected)
+	rejectedTerminal := terminal.event.(event.CompactionRejected)
+	return ok && rejectedOutcome.AttemptID == terminal.attempt && rejectedOutcome.Reason == rejectedTerminal.RejectReason &&
+		rejectedOutcome.EventID == event.CompactWaiterReplyID(terminal.attempt, commandID, false)
+}
+
 func advanceFoldedContextBasis(current event.ContextBasis, hasCurrent bool, eventID uuid.UUID) (event.ContextBasis, bool, error) {
 	if eventID.IsZero() {
 		return current, hasCurrent, nil
