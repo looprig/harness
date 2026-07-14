@@ -158,13 +158,45 @@ func (e *RunError) Unwrap() []error {
 	return errors
 }
 
-// OutputError reports an invalid provider response or consumer validation
-// result without retaining response content.
-type OutputError struct {
-	Cause error
+// OutputFailureReason is the closed, security-safe generic extraction failure.
+type OutputFailureReason string
+
+const (
+	OutputFailureInvalidShape OutputFailureReason = "invalid_shape"
+	OutputFailureEmptyText    OutputFailureReason = "empty_text"
+	OutputFailureTooLarge     OutputFailureReason = "too_large"
+	OutputFailureInvalidJSON  OutputFailureReason = "invalid_json"
+)
+
+// Valid reports whether the reason is a recognized extraction failure.
+func (r OutputFailureReason) Valid() bool {
+	return r == OutputFailureInvalidShape || r == OutputFailureEmptyText ||
+		r == OutputFailureTooLarge || r == OutputFailureInvalidJSON
 }
 
-func (e *OutputError) Error() string { return "hustleruntime: invalid hustle output" }
+// OutputError reports an invalid provider response or consumer validation
+// result without retaining response content. Reason is populated for generic
+// extraction failures; callback failures retain their typed Cause instead.
+type OutputError struct {
+	Reason OutputFailureReason
+	Cause  error
+}
+
+// Valid reports whether exactly one bounded failure classification or wrapped
+// validation cause is present.
+func (e *OutputError) Valid() bool {
+	if e == nil {
+		return false
+	}
+	return (e.Reason.Valid() && e.Cause == nil) || (e.Reason == "" && e.Cause != nil)
+}
+
+func (e *OutputError) Error() string {
+	if e.Reason.Valid() {
+		return "hustleruntime: invalid hustle output (" + string(e.Reason) + ")"
+	}
+	return "hustleruntime: invalid hustle output"
+}
 
 func (e *OutputError) Unwrap() error { return e.Cause }
 

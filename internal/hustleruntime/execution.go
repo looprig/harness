@@ -329,11 +329,20 @@ func (r *runtimeController) invoke(ctx context.Context, runID hustle.RunID, bind
 
 func extractResult(response *inference.Response, usage *content.Usage, outputLimit int) (hustle.Result, error) {
 	if response == nil || response.Message == nil || response.Message.Role != content.RoleAssistant || len(response.Message.Blocks) != 1 {
-		return hustle.Result{}, &OutputError{}
+		return hustle.Result{}, &OutputError{Reason: OutputFailureInvalidShape}
 	}
 	block, ok := response.Message.Blocks[0].(*content.TextBlock)
-	if !ok || block == nil || len(block.Text) == 0 || len(block.Text) > outputLimit || !json.Valid([]byte(block.Text)) {
-		return hustle.Result{}, &OutputError{}
+	if !ok || block == nil {
+		return hustle.Result{}, &OutputError{Reason: OutputFailureInvalidShape}
+	}
+	if len(block.Text) == 0 {
+		return hustle.Result{}, &OutputError{Reason: OutputFailureEmptyText}
+	}
+	if len(block.Text) > outputLimit {
+		return hustle.Result{}, &OutputError{Reason: OutputFailureTooLarge}
+	}
+	if !json.Valid([]byte(block.Text)) {
+		return hustle.Result{}, &OutputError{Reason: OutputFailureInvalidJSON}
 	}
 	return hustle.Result{Output: append(json.RawMessage(nil), block.Text...), Usage: usage}, nil
 }

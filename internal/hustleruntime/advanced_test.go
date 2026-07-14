@@ -95,29 +95,30 @@ func TestRunAndFinalizeRejectsNonCanonicalOutputShapes(t *testing.T) {
 		limit  int
 		makeAI func() *content.AIMessage
 		usage  *content.Usage
+		reason OutputFailureReason
 	}{
-		{name: "nil response message", limit: len(valid)},
+		{name: "nil response message", limit: len(valid), reason: OutputFailureInvalidShape},
 		{name: "wrong role", limit: len(valid), makeAI: func() *content.AIMessage {
 			return &content.AIMessage{Message: content.Message{Role: content.RoleUser, Blocks: []content.Block{&content.TextBlock{Text: valid}}}}
-		}},
+		}, reason: OutputFailureInvalidShape},
 		{name: "empty blocks", limit: len(valid), makeAI: func() *content.AIMessage {
 			return &content.AIMessage{Message: content.Message{Role: content.RoleAssistant}}
-		}},
+		}, reason: OutputFailureInvalidShape},
 		{name: "multiple blocks", limit: len(valid), makeAI: func() *content.AIMessage {
 			return &content.AIMessage{Message: content.Message{Role: content.RoleAssistant, Blocks: []content.Block{&content.TextBlock{Text: valid}, &content.TextBlock{Text: valid}}}}
-		}},
+		}, reason: OutputFailureInvalidShape},
 		{name: "tool block", limit: len(valid), makeAI: func() *content.AIMessage {
 			return &content.AIMessage{Message: content.Message{Role: content.RoleAssistant, Blocks: []content.Block{&content.ToolUseBlock{ID: "tool", Name: "unsafe"}}}}
-		}},
+		}, reason: OutputFailureInvalidShape},
 		{name: "empty text", limit: len(valid), makeAI: func() *content.AIMessage {
 			return &content.AIMessage{Message: content.Message{Role: content.RoleAssistant, Blocks: []content.Block{&content.TextBlock{}}}}
-		}},
+		}, reason: OutputFailureEmptyText},
 		{name: "malformed json", limit: len(valid), makeAI: func() *content.AIMessage {
 			return &content.AIMessage{Message: content.Message{Role: content.RoleAssistant, Blocks: []content.Block{&content.TextBlock{Text: `{"x"`}}}}
-		}},
+		}, reason: OutputFailureInvalidJSON},
 		{name: "over output bound", limit: len(valid) - 1, makeAI: func() *content.AIMessage {
 			return &content.AIMessage{Message: content.Message{Role: content.RoleAssistant, Blocks: []content.Block{&content.TextBlock{Text: valid}}}}
-		}},
+		}, reason: OutputFailureTooLarge},
 		{name: "invalid usage", limit: len(valid), usage: &content.Usage{OutputTokens: 1, ReasoningTokens: 2}, makeAI: func() *content.AIMessage {
 			return &content.AIMessage{Message: content.Message{Role: content.RoleAssistant, Blocks: []content.Block{&content.TextBlock{Text: valid}}}}
 		}},
@@ -148,6 +149,10 @@ func TestRunAndFinalizeRejectsNonCanonicalOutputShapes(t *testing.T) {
 			}
 			if validations.Load() != 0 {
 				t.Fatalf("validation calls = %d, want 0", validations.Load())
+			}
+			var outputErr *OutputError
+			if !errors.As(err, &outputErr) || !outputErr.Valid() || outputErr.Reason != testCase.reason {
+				t.Fatalf("output error = %#v, want valid reason %q", outputErr, testCase.reason)
 			}
 			events := audit.snapshot()
 			failed, ok := events[len(events)-1].(event.HustleFailed)

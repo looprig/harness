@@ -15,7 +15,9 @@ import (
 // consumer adapter lands. Registering one is an architecture change: its package
 // must expose only the focused product capability, and its own contract test must
 // prove that the adapter neither receives nor stores Session/Shutdown capability.
-var focusedFinalizerAdapterFiles = map[string]struct{}{}
+var focusedFinalizerAdapterFiles = map[string]struct{}{
+	"internal/sessionruntime/compaction_adapter.go": {},
+}
 
 func TestProductionRunAndFinalizeConsumersAreFocusedAdapters(t *testing.T) {
 	t.Parallel()
