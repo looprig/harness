@@ -42,7 +42,7 @@ SWE=$ROOT/swe
   reviewer. The same implementer fixes findings and each reviewer re-reviews.
 - Do not tag or push releases during implementation. Planned pins are
   `core v0.2.0`, `inference v0.2.0`, `llm v0.2.0`, `harness v0.11.0`, and
-  `cli v0.5.0`; local replaces make them build before tags exist. Final release
+  `cli v0.6.0`; local replaces make them build before tags exist. Final release
   actions require the finishing workflow and user choice.
 
 ## Phase A — Core and inference foundations
@@ -874,7 +874,7 @@ animated; elapsed suffix rules.
 
 Commit: `feat(tui): show conversation compaction progress`.
 
-### Task 33: CLI full verification and planned v0.5.0 reconciliation
+### Task 33: CLI full verification and planned v0.6.0 reconciliation
 
 Run formatting, default/integration race tests, trimpath build, secure gate,
 vendor reproducibility (`go mod vendor` then no diff), and clean status. Commit
