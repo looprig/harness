@@ -1224,7 +1224,11 @@ func (s *Session) newLoopWithAdmission(parent loop.Provenance, cfg loop.Definiti
 	var foreignSID string
 	switch bound.Engine() {
 	case loop.EngineNative:
-		b, err = loopruntime.NewInMode(loopCtx, s.sessionID, loopID, parent, eventTarget, bound, startedMode)
+		var compactor loopruntime.Compactor
+		compactor, err = s.compactorFor(bound, loopID)
+		if err == nil {
+			b, err = loopruntime.NewInModeWithCompactor(loopCtx, s.sessionID, loopID, parent, eventTarget, bound, startedMode, compactor)
+		}
 	default:
 		if s.foreignBuild == nil {
 			release()

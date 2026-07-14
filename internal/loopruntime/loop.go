@@ -256,8 +256,27 @@ func New(loopCtx context.Context, sessionID, loopID uuid.UUID, parent loop.Prove
 // mode-selective spawn, so a child begins in the requested mode without a synthetic
 // LoopModeChanged. An unknown mode name fails with the same typed BindError Bind uses.
 func NewInMode(loopCtx context.Context, sessionID, loopID uuid.UUID, parent loop.Provenance, events eventPublisher, bound loop.BoundDefinition, initialMode loop.ModeName) (*Loop, error) {
+	return NewInModeWithCompactor(loopCtx, sessionID, loopID, parent, events, bound, initialMode, nil)
+}
+
+// NewInModeWithCompactor is the focused native composition seam for a loop whose
+// definition installs compaction. The caller supplies only the summary capability;
+// loopruntime derives the executor from the bound loop's own counter, capabilities,
+// and policy. Generic hustle selection and coordination remain private.
+func NewInModeWithCompactor(
+	loopCtx context.Context,
+	sessionID, loopID uuid.UUID,
+	parent loop.Provenance,
+	events eventPublisher,
+	bound loop.BoundDefinition,
+	initialMode loop.ModeName,
+	compactor Compactor,
+) (*Loop, error) {
 	cfg, err := configFromBound(bound, initialMode)
 	if err != nil {
+		return nil, err
+	}
+	if err := installCompactionExecutor(loopCtx, &cfg, compactor); err != nil {
 		return nil, err
 	}
 	resolved := initialMode

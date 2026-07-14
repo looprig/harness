@@ -63,6 +63,39 @@ func newCompactionAdapter(runner compactionHustleRunner, descriptor hustle.Defin
 	}, nil
 }
 
+func (s *Session) compactorFor(bound loop.BoundDefinition, loopID uuid.UUID) (loopruntime.Compactor, error) {
+	policy, configured := bound.CompactionPolicy()
+	if !configured {
+		return nil, nil
+	}
+	if s.hustleController == nil {
+		return nil, &HustleConstructionError{
+			Reason: HustleConstructionMissingCollaborator, Name: policy.Hustle, Field: "compaction_hustle_controller",
+		}
+	}
+	for _, definition := range s.hustleDefinitions {
+		descriptor := definition.Descriptor()
+		if descriptor.Name != policy.Hustle {
+			continue
+		}
+		if descriptor.ModelSource != hustle.ModelSourceCurrentLoop {
+			return nil, &HustleConstructionError{
+				Reason: HustleConstructionBindFailed, Name: policy.Hustle, Field: "compaction_hustle_model_source",
+			}
+		}
+		adapter, err := newCompactionAdapter(s.hustleController, descriptor, loopID)
+		if err != nil {
+			return nil, &HustleConstructionError{
+				Reason: HustleConstructionRuntimeFailed, Name: policy.Hustle, Field: "compaction_adapter", Cause: err,
+			}
+		}
+		return adapter, nil
+	}
+	return nil, &HustleConstructionError{
+		Reason: HustleConstructionMissingCollaborator, Name: policy.Hustle, Field: "compaction_hustle_definition",
+	}
+}
+
 func nilInterfaceValue(value compactionHustleRunner) bool {
 	if value == nil {
 		return true

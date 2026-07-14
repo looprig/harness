@@ -73,6 +73,25 @@ func newCompactionExecutor(ctx context.Context, config compactionExecutorConfig)
 	return &compactionExecutor{ctx: ctx, config: config, runs: make(map[event.CompactAttemptID]compactionExecutionRun)}, nil
 }
 
+func installCompactionExecutor(ctx context.Context, config *runtimeConfig, compactor Compactor) error {
+	if compactor == nil {
+		return nil
+	}
+	if config == nil || config.Compaction == nil {
+		return &compactionExecutorError{Field: "policy"}
+	}
+	executor, err := newCompactionExecutor(ctx, compactionExecutorConfig{
+		Compactor: compactor, Counter: config.ContextCounter,
+		CounterCapability: config.CounterCapability, InferenceCapability: config.InferenceCapability,
+		Settings: compactionAdmissionSettings(*config.Compaction), MaxSummaryTokens: config.Compaction.MaxSummaryTokens,
+	})
+	if err != nil {
+		return err
+	}
+	config.compactionSink = executor
+	return nil
+}
+
 func (e *compactionExecutor) CoordinateCompaction(context.Context, compactionDisposition) error {
 	return &compactionExecutorError{Field: "candidate"}
 }

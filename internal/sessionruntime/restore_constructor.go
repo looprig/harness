@@ -53,7 +53,13 @@ func (s *Session) attachRestoredLoop(started event.LoopStarted, parent loop.Prov
 	var err error
 	switch bound.Engine() {
 	case loop.EngineNative:
-		backend, err = loopruntime.NewRestored(loopCtx, s.sessionID, started.LoopID, parent, s, bound, restoredStateFrom(folded, ri))
+		var compactor loopruntime.Compactor
+		compactor, err = s.compactorFor(bound, started.LoopID)
+		if err == nil {
+			backend, err = loopruntime.NewRestoredWithCompactor(
+				loopCtx, s.sessionID, started.LoopID, parent, s, bound, restoredStateFrom(folded, ri), compactor,
+			)
+		}
 	default:
 		if foreignSID == "" {
 			cancel()
@@ -714,8 +720,13 @@ func buildRestoredSession(
 	var l loop.Backend
 	switch cfg.Engine() {
 	case loop.EngineNative:
-		l, err = loopruntime.NewRestored(loopCtx, sessionID, rootLoopID, loop.Provenance{}, s, cfg,
-			restoredStateFrom(folded, ri))
+		var compactor loopruntime.Compactor
+		compactor, err = s.compactorFor(cfg, rootLoopID)
+		if err == nil {
+			l, err = loopruntime.NewRestoredWithCompactor(
+				loopCtx, sessionID, rootLoopID, loop.Provenance{}, s, cfg, restoredStateFrom(folded, ri), compactor,
+			)
+		}
 	default:
 		if foreignSID == "" {
 			cancel()
