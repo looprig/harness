@@ -8,7 +8,6 @@ import (
 
 	"github.com/looprig/core/content"
 	"github.com/looprig/harness/pkg/command"
-	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/harness/pkg/tool"
 	"github.com/looprig/inference"
@@ -69,20 +68,28 @@ func TestConfigFromBoundCopiesContextConfiguration(t *testing.T) {
 
 func TestChangeInferenceRejectsContextTransportSwap(t *testing.T) {
 	t.Parallel()
-	llm := &recordingLLM{chunks: []content.Chunk{textChunk("ok")}}
-	bound := contextBoundDefinition(t, llm)
-	l, rec := newBoundLoop(t, llm, bound)
-	candidate := testModel()
-	candidate.Provider = "other"
-	res := sendChange(t, l, command.ChangeLoopInference{Model: candidate, SetModel: true})
-	var changeErr *loop.ChangeError
-	var bindingErr *loop.ContextTransportBindingError
-	if !errors.As(res.Err, &changeErr) || changeErr.Kind != loop.ChangeInvalidModel || !errors.As(res.Err, &bindingErr) {
-		t.Fatalf("error = %T %v", res.Err, res.Err)
+	tests := []struct {
+		name   string
+		mutate func(*inference.Model)
+	}{
+		{name: "provider", mutate: func(model *inference.Model) { model.Provider = "other" }},
 	}
-	if countInferenceChanged(rec.events()) != 0 {
-		t.Fatal("rejected transport swap emitted lifecycle event")
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			llm := &recordingLLM{chunks: []content.Chunk{textChunk("ok")}}
+			bound := contextBoundDefinition(t, llm)
+			l, rec := newBoundLoop(t, llm, bound)
+			candidate := testModel()
+			tt.mutate(&candidate)
+			res := sendChange(t, l, command.ChangeLoopInference{Model: candidate, SetModel: true})
+			var changeErr *loop.ChangeError
+			var bindingErr *loop.ContextTransportBindingError
+			if !errors.As(res.Err, &changeErr) || changeErr.Kind != loop.ChangeInvalidModel || !errors.As(res.Err, &bindingErr) {
+				t.Fatalf("error = %T %v", res.Err, res.Err)
+			}
+			if countInferenceChanged(rec.events()) != 0 {
+				t.Fatal("rejected transport swap emitted lifecycle event")
+			}
+		})
 	}
 }
-
-var _ event.Event

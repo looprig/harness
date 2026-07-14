@@ -370,6 +370,18 @@ type foldResult struct {
 	HasRuntime bool
 	Context    event.ContextMeasurement
 	HasContext bool
+	Err        error
+}
+
+// RestoredContextModelMismatchError reports a replay projection that would
+// seed a current measurement under a different restored runtime model.
+type RestoredContextModelMismatchError struct {
+	Runtime     inference.ModelKey
+	Measurement inference.ModelKey
+}
+
+func (e *RestoredContextModelMismatchError) Error() string {
+	return "sessionruntime: restored context measurement model does not match runtime"
 }
 
 // foldLoop reconstructs a loop's committed msgs + turnIndex from an ordered
@@ -391,12 +403,12 @@ type foldResult struct {
 //     committed via its StepDone, and lifecycle/queue events never
 //     mutate loopState.msgs.
 //
-// It is a PURE function: no I/O, no error. The events are already-typed, journaled
+// It is a PURE function: no I/O. The events are already-typed, journaled
 // payloads (each TurnStarted/StepDone/TurnFoldedInto carries its committed
 // message[s] verbatim), so there is no malformed-group failure mode to surface — a
 // nil Message or empty Messages folds to the same nil/empty the loop itself
-// committed. The constructor (Task 8.3) wires the EventReplayer that feeds the
-// slice; this function only folds it.
+// committed. Cross-event runtime/context consistency is reported through Err so
+// the restore constructor can reject the replay before seeding a loop.
 //
 // Open-turn (crash-seam) detection rides the same single pass: a TurnStarted opens
 // the turn (openTurn = true) and a terminal closes it (openTurn = false). After the
@@ -468,9 +480,23 @@ func foldLoop(events []event.Event) foldResult {
 		}
 	}
 
+	var foldErr error
+	if hasContext && hasRuntime && contextMeasurement.Model != runtime.Key {
+		foldErr = &RestoredContextModelMismatchError{Runtime: runtime.Key, Measurement: contextMeasurement.Model}
+		contextMeasurement = event.ContextMeasurement{}
+		hasContext = false
+	}
 	return foldResult{
 		Msgs: msgs, TurnIndex: turnIndex, OpenTurn: openTurn,
 		Runtime: runtime, HasRuntime: hasRuntime,
-		Context: contextMeasurement, HasContext: hasContext,
+		Context: contextMeasurement, HasContext: hasContext, Err: foldErr,
 	}
+}
+
+func foldLoopForRestore(events []event.Event) (foldResult, error) {
+	folded := foldLoop(events)
+	if folded.Err != nil {
+		return foldResult{}, &RestoreError{Kind: RestoreReplayFailed, Cause: folded.Err}
+	}
+	return folded, nil
 }

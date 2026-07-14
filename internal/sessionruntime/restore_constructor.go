@@ -534,7 +534,11 @@ func planLoops(sessionCtx context.Context, sessionID uuid.UUID, topology Topolog
 		}
 		boundByLoop[started.LoopID] = bound
 		loopEvents := eventsFromRecords(allRecords, started.LoopID)
-		plans = append(plans, loopPlan{started: started, bound: bound, events: loopEvents, folded: foldLoop(loopEvents)})
+		folded, foldErr := foldLoopForRestore(loopEvents)
+		if foldErr != nil {
+			return nil, loopPlan{}, foldErr
+		}
+		plans = append(plans, loopPlan{started: started, bound: bound, events: loopEvents, folded: folded})
 		if started.LoopID == roots[topology.ActivePrimer].LoopID {
 			activeIndex = len(plans) - 1
 		}
