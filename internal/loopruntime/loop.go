@@ -1001,6 +1001,10 @@ func runLoop(cfg loopConfig, state loopState) {
 					switch disposition.disposition {
 					case contextCompactionAwaitRejected:
 						if !continuation {
+							switch disposition.rejectReason {
+							case event.CompactRejectInterrupted, event.CompactRejectShuttingDown, event.CompactRejectCanceled:
+								return &terminalCompactionCancellationError{Reason: disposition.rejectReason}
+							}
 							return nil
 						}
 						if disposition.continuationError != nil {
@@ -2163,7 +2167,7 @@ func runLoop(cfg loopConfig, state loopState) {
 			retry := configured && settings.Automatic && rejected && rejection.Reason == event.CompactionReasonManual && rejection.Basis == state.contextTracker.currentBasis()
 			outcome.reply <- contextCompactionOutcomeReply{
 				disposition: disposition, replacement: turnReplacement,
-				continuationError: outcome.result.ContinuationError, retry: retry,
+				continuationError: outcome.result.ContinuationError, rejectReason: rejection.RejectReason, retry: retry,
 			}
 
 		case result := <-admissions:

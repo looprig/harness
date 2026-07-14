@@ -423,6 +423,10 @@ func measureTurnCandidate(
 }
 
 func measureTurnFailure(ctx context.Context, turnIndex event.TurnIndex, err error) event.Event {
+	var cancellation *terminalCompactionCancellationError
+	if errors.As(err, &cancellation) {
+		return event.TurnInterrupted{TurnIndex: turnIndex}
+	}
 	if ctx.Err() != nil {
 		return event.TurnInterrupted{TurnIndex: turnIndex}
 	}

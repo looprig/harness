@@ -740,6 +740,121 @@ func TestLoopTerminalResponseWaitsForCompactionAndRemainsUnchanged(t *testing.T)
 	}
 }
 
+func TestLoopTerminalCompactionCancellationPreemptsProducedResponse(t *testing.T) {
+	tests := []struct {
+		name       string
+		cancel     string
+		wantReason event.CompactRejectReason
+	}{
+		{name: "interrupt", cancel: "interrupt", wantReason: event.CompactRejectInterrupted},
+		{name: "shutdown", cancel: "shutdown", wantReason: event.CompactRejectShuttingDown},
+		{name: "parent request cancel", cancel: "parent", wantReason: event.CompactRejectCanceled},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			t.Cleanup(cancel)
+			recorder := &recordingPublisher{}
+			client := &scriptedLLM{scripts: [][]content.Chunk{{textChunk("produced but canceled")}}}
+			counter := &loopContextCounter{
+				capability: contextTestCapability(inference.CountQualityExactLocal), counts: []content.TokenCount{40, 65},
+			}
+			model := testModel()
+			model.Limits = inference.ContextLimits{WindowTokens: 100, MaxInputTokens: 80, MaxOutputTokens: 20}
+			settings := contextAdmissionSettings{
+				ReservedOutput: 20, CompactAt: 8_000, RearmBelow: 6_000, CountTimeout: time.Second, Automatic: true,
+			}
+			compactor := &lateSuccessExecutorCompactor{
+				summary: validFinalizationSummary(), started: make(chan struct{}), release: make(chan struct{}), finished: make(chan struct{}),
+			}
+			executor, err := newCompactionExecutor(ctx, compactionExecutorConfig{
+				Compactor: compactor, Counter: counter, CounterCapability: counter.capability,
+				InferenceCapability: contextTestInferenceCapability(), Settings: settings, MaxSummaryTokens: 10,
+			})
+			if err != nil {
+				t.Fatalf("newCompactionExecutor() error = %v", err)
+			}
+			sessionID, loopID := uuid.UUID{151}, uuid.UUID{152}
+			actor, err := newWithConfig(ctx, sessionID, loopID, Provenance{}, recorder, runtimeConfig{
+				Client: client, Model: model, DrainTimeout: 200 * time.Millisecond,
+				ContextCounter: counter, CounterCapability: counter.capability, InferenceCapability: contextTestInferenceCapability(),
+				Compaction: &loop.CompactionPolicy{
+					Automatic: true, CounterPolicy: loop.CounterPolicyRequireExact, CompactAt: 8_000, RearmBelow: 6_000,
+					ReservedOutput: 20, MaxSummaryTokens: 10, CountTimeout: time.Second, Hustle: "context.compact",
+				},
+				compactionSink: executor,
+			})
+			if err != nil {
+				t.Fatalf("newWithConfig() error = %v", err)
+			}
+			inputID, _ := startTurn(t, actor, recorder, textBlocks("start"))
+			select {
+			case <-compactor.started:
+			case <-time.After(2 * time.Second):
+				t.Fatal("terminal compaction did not start")
+			}
+			var shutdownAck <-chan error
+			switch tt.cancel {
+			case "interrupt":
+				ack := make(chan bool, 1)
+				actor.Commands <- command.Interrupt{Header: command.Header{CommandID: uuid.UUID{153}}, Ack: ack}
+				if !<-ack {
+					t.Fatal("Interrupt did not cancel terminal compaction wait")
+				}
+			case "shutdown":
+				ack := make(chan error, 1)
+				shutdownAck = ack
+				actor.Commands <- command.Shutdown{Header: command.Header{CommandID: uuid.UUID{153}}, Ack: ack}
+			case "parent":
+				if got := cancelDelegateRequest(t, actor, inputID); got != command.DelegateCancelActive {
+					t.Fatalf("parent cancellation = %v, want active", got)
+				}
+			}
+			terminal := drainToTerminal(t, recorder)
+			if _, ok := terminal.(event.TurnInterrupted); !ok {
+				t.Fatalf("terminal = %T %+v, want TurnInterrupted", terminal, terminal)
+			}
+			if shutdownAck != nil {
+				if err := <-shutdownAck; err != nil {
+					t.Fatalf("Shutdown error = %v", err)
+				}
+			}
+			var rejected *event.CompactionRejected
+			waiterRejected := false
+			for _, published := range recorder.events() {
+				switch value := published.(type) {
+				case event.CompactionRejected:
+					copyOfValue := value
+					rejected = &copyOfValue
+				case event.CompactWaiterRejected:
+					if value.Reason == tt.wantReason {
+						waiterRejected = true
+					}
+				case event.TurnDone:
+					t.Fatal("canceled terminal response published TurnDone")
+				}
+			}
+			if rejected == nil || rejected.RejectReason != tt.wantReason || !waiterRejected {
+				t.Fatalf("cancellation outcome = rejection %+v waiter=%v, want %v", rejected, waiterRejected, tt.wantReason)
+			}
+			if got := len(client.requests()); got != 1 {
+				t.Fatalf("primary calls = %d, want no inference after cancellation", got)
+			}
+			close(compactor.release)
+			select {
+			case <-compactor.finished:
+			case <-time.After(2 * time.Second):
+				t.Fatal("late compactor did not finish")
+			}
+			for _, published := range recorder.events() {
+				if _, committed := published.(event.CompactionCommitted); committed {
+					t.Fatal("late success committed after cancellation")
+				}
+			}
+		})
+	}
+}
+
 func TestLoopStartedCompactionCancellationIsActorOwned(t *testing.T) {
 	tests := []struct {
 		name       string

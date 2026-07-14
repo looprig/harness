@@ -42,6 +42,14 @@ type contextReplacementDirective struct {
 	Replacement turnContextReplacement
 }
 
+type terminalCompactionCancellationError struct {
+	Reason event.CompactRejectReason
+}
+
+func (e *terminalCompactionCancellationError) Error() string {
+	return "loopruntime: terminal compaction wait canceled"
+}
+
 func (e *contextReplacementDirective) Error() string {
 	return "loopruntime: compacted context replacement is ready for continuation"
 }
@@ -185,6 +193,7 @@ type contextCompactionOutcomeReply struct {
 	disposition       contextCompactionAwaitDisposition
 	replacement       *turnContextReplacement
 	continuationError error
+	rejectReason      event.CompactRejectReason
 	retry             bool
 	err               error
 }
