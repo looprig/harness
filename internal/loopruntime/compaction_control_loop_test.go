@@ -18,10 +18,11 @@ import (
 )
 
 type recordingCompactionSink struct {
-	mu           sync.Mutex
-	dispositions []compactionDisposition
-	failures     []compactionFailure
-	notify       chan struct{}
+	mu            sync.Mutex
+	dispositions  []compactionDisposition
+	failures      []compactionFailure
+	notify        chan struct{}
+	coordinateErr error
 }
 
 func newRecordingCompactionSink() *recordingCompactionSink {
@@ -31,9 +32,11 @@ func newRecordingCompactionSink() *recordingCompactionSink {
 func (s *recordingCompactionSink) CoordinateCompaction(_ context.Context, disposition compactionDisposition) error {
 	s.mu.Lock()
 	s.dispositions = append(s.dispositions, disposition)
+	err := s.coordinateErr
+	s.coordinateErr = nil
 	s.mu.Unlock()
 	s.notify <- struct{}{}
-	return nil
+	return err
 }
 
 func (s *recordingCompactionSink) ReportCompactionFailure(_ context.Context, failure compactionFailure) {
@@ -201,7 +204,7 @@ func TestLoopCompactionLaneFullOutcome(t *testing.T) {
 			}
 			if tt.wantFatal {
 				var coordinationErr *CompactionCoordinationError
-				if failures[0].CommandID != overflowID || !errors.As(failures[0].Err, &coordinationErr) || coordinationErr.Kind != CompactionCoordinationOutcome || !errors.Is(failures[0].Err, errChecked) {
+				if !equalUUIDs(failures[0].WaiterCommandIDs, []uuid.UUID{overflowID}) || !errors.As(failures[0].Err, &coordinationErr) || coordinationErr.Kind != CompactionCoordinationOutcome || !errors.Is(failures[0].Err, errChecked) {
 					t.Fatalf("failure = %+v, want typed outcome failure for overflow command", failures[0])
 				}
 			}
@@ -243,7 +246,7 @@ func TestLoopCompactionAttemptIDFailure(t *testing.T) {
 				t.Fatalf("dispositions/failures = %v/%v, want 0/1", dispositions, failures)
 			}
 			var coordinationErr *CompactionCoordinationError
-			if !errors.As(failures[0].Err, &coordinationErr) || coordinationErr.Kind != CompactionCoordinationAttemptID || !errors.Is(failures[0].Err, tt.err) {
+			if !equalUUIDs(failures[0].WaiterCommandIDs, []uuid.UUID{{1}}) || !errors.As(failures[0].Err, &coordinationErr) || coordinationErr.Kind != CompactionCoordinationAttemptID || !errors.Is(failures[0].Err, tt.err) {
 				t.Fatalf("failure = %+v, want typed attempt id failure", failures[0])
 			}
 			for _, published := range rec.events() {
@@ -251,6 +254,73 @@ func TestLoopCompactionAttemptIDFailure(t *testing.T) {
 				case event.CompactionRejected, event.CompactWaiterRejected:
 					t.Fatalf("published false durable outcome %T", published)
 				}
+			}
+		})
+	}
+}
+
+func TestLoopCompactionSinkFailureNotifiesAllWaitersAndClearsAttempt(t *testing.T) {
+	t.Parallel()
+	errSink := errors.New("compaction sink unavailable")
+	tests := []struct {
+		name        string
+		requests    []command.Compact
+		wantWaiters []uuid.UUID
+	}{
+		{
+			name: "canonical full waiter set is failed once and next attempt can start",
+			requests: []command.Compact{
+				compactCommand(uuid.UUID{3}, time.Date(2026, 7, 14, 12, 0, 2, 0, time.UTC), identity.AgencyMachine),
+				compactCommand(uuid.UUID{1}, time.Date(2026, 7, 14, 12, 0, 0, 0, time.UTC), identity.AgencyUser),
+				compactCommand(uuid.UUID{2}, time.Date(2026, 7, 14, 12, 0, 1, 0, time.UTC), identity.AgencyMachine),
+			},
+			wantWaiters: []uuid.UUID{{1}, {2}, {3}},
+		},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			blocking := newBlockingTool()
+			tools := agenticToolSet([]tool.InvokableTool{blocking}, 25, 100)
+			client := &scriptedLLM{scripts: [][]content.Chunk{
+				{toolUseChunk(0, "id-1", "Block", `{}`)},
+				{textChunk("done")},
+			}}
+			l, rec, sink, _, _ := newCompactionTestLoopWithTools(t, client, tools)
+			sink.coordinateErr = errSink
+			startTurn(t, l, rec, textBlocks("run"))
+			<-blocking.started
+			for _, request := range tt.requests {
+				l.Commands <- request
+			}
+			syncLoopActor(t, l)
+			close(blocking.release)
+			failure := awaitCompactionFailure(t, sink)
+			if !equalUUIDs(failure.WaiterCommandIDs, tt.wantWaiters) {
+				t.Fatalf("failure waiters = %v, want %v", failure.WaiterCommandIDs, tt.wantWaiters)
+			}
+			var coordinationErr *CompactionCoordinationError
+			if !errors.As(failure.Err, &coordinationErr) || coordinationErr.Kind != CompactionCoordinationOutcome || !errors.Is(failure.Err, errSink) {
+				t.Fatalf("failure = %T %v, want typed sink infrastructure failure", failure.Err, failure.Err)
+			}
+			_, failures := sink.snapshot()
+			if len(failures) != 1 {
+				t.Fatalf("failure notifications = %d, want exactly one", len(failures))
+			}
+			for _, published := range rec.events() {
+				switch published.(type) {
+				case event.CompactionCommitted, event.CompactionRejected, event.CompactWaiterResolved, event.CompactWaiterRejected:
+					t.Fatalf("published false durable outcome %T", published)
+				}
+			}
+			if _, ok := drainToTerminal(t, rec).(event.TurnDone); !ok {
+				t.Fatal("turn terminal != TurnDone")
+			}
+			sendCompact(t, l, tt.requests[0].SessionID, tt.requests[0].LoopID, uuid.UUID{4}, identity.AgencyUser)
+			got := awaitCompactionDispositionCount(t, sink, 2)
+			if got.Kind != compactionDispositionStart || got.Attempt == nil || !equalUUIDs(got.Attempt.WaiterCommandIDs, []uuid.UUID{{4}}) {
+				t.Fatalf("subsequent disposition = %+v, want fresh one-waiter start", got)
 			}
 		})
 	}
@@ -307,4 +377,50 @@ func awaitCompactionDisposition(t *testing.T, sink *recordingCompactionSink) com
 		t.Fatal("timed out waiting for compaction disposition")
 		return compactionDisposition{}
 	}
+}
+
+func awaitCompactionDispositionCount(t *testing.T, sink *recordingCompactionSink, count int) compactionDisposition {
+	t.Helper()
+	deadline := time.After(2 * time.Second)
+	for {
+		dispositions, _ := sink.snapshot()
+		if len(dispositions) >= count {
+			return dispositions[count-1]
+		}
+		select {
+		case <-sink.notify:
+		case <-deadline:
+			t.Fatalf("timed out waiting for %d compaction dispositions", count)
+			return compactionDisposition{}
+		}
+	}
+}
+
+func awaitCompactionFailure(t *testing.T, sink *recordingCompactionSink) compactionFailure {
+	t.Helper()
+	deadline := time.After(2 * time.Second)
+	for {
+		_, failures := sink.snapshot()
+		if len(failures) > 0 {
+			return failures[0]
+		}
+		select {
+		case <-sink.notify:
+		case <-deadline:
+			t.Fatal("timed out waiting for compaction failure")
+			return compactionFailure{}
+		}
+	}
+}
+
+func equalUUIDs(left, right []uuid.UUID) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for i := range left {
+		if left[i] != right[i] {
+			return false
+		}
+	}
+	return true
 }

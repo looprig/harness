@@ -113,6 +113,59 @@ func TestCompactionControlAdmit(t *testing.T) {
 	}
 }
 
+func TestArbitrateCompactionBoundaryPrioritizesReadyControl(t *testing.T) {
+	t.Parallel()
+	createdAt := time.Date(2026, 7, 14, 12, 0, 0, 0, time.UTC)
+	tests := []struct {
+		name       string
+		command    command.Command
+		wantReject event.CompactRejectReason
+	}{
+		{
+			name:       "interrupt ready with boundary",
+			command:    command.Interrupt{Header: command.Header{CommandID: uuid.UUID{2}}, Ack: make(chan bool, 1)},
+			wantReject: event.CompactRejectInterrupted,
+		},
+		{
+			name:       "shutdown ready with boundary",
+			command:    command.Shutdown{Header: command.Header{CommandID: uuid.UUID{3}}, Ack: make(chan error, 1)},
+			wantReject: event.CompactRejectShuttingDown,
+		},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			control := newCompactionControl(4)
+			if _, err := control.admit(compactCommand(uuid.UUID{1}, createdAt, identity.AgencyUser), fixedCompactionID); err != nil {
+				t.Fatalf("admit: %v", err)
+			}
+			commands := make(chan command.Command, 1)
+			commands <- tt.command
+			var got compactionDisposition
+			exit := arbitrateCompactionBoundary(
+				commands,
+				func(cmd command.Command) bool {
+					switch cmd.(type) {
+					case command.Interrupt:
+						control.interrupt()
+					case command.Shutdown:
+						control.shutdown()
+					}
+					return false
+				},
+				func() { got = control.atBoundary(compactionBoundaryStep) },
+			)
+			if exit {
+				t.Fatal("arbitration unexpectedly requested actor exit")
+			}
+			if got.Kind != compactionDispositionReject || got.RejectReason != tt.wantReject {
+				t.Errorf("boundary disposition = %+v, want rejection %v", got, tt.wantReject)
+			}
+		})
+	}
+}
+
 func TestCompactionControlCanonicalWaiters(t *testing.T) {
 	t.Parallel()
 	base := time.Date(2026, 7, 14, 12, 0, 0, 0, time.UTC)

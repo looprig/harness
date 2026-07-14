@@ -96,12 +96,30 @@ type compactionDispositionSink interface {
 // compactionFailure is the narrow typed result seam that later public waiters can
 // bind to. It never claims a durable rejection was written.
 type compactionFailure struct {
-	CommandID uuid.UUID
-	Err       error
+	WaiterCommandIDs []uuid.UUID
+	Err              error
 }
 
 type compactionFailureSink interface {
 	ReportCompactionFailure(context.Context, compactionFailure)
+}
+
+type actorCommandHandler func(command.Command) bool
+
+// arbitrateCompactionBoundary gives a command that is already ready one bounded
+// opportunity to mutate actor control state before compaction is consumed at the
+// simultaneous safe boundary. The ordinary actor select resumes immediately
+// afterward, so a sustained command stream cannot starve step/turn progress.
+func arbitrateCompactionBoundary(commands <-chan command.Command, handle actorCommandHandler, dispatch func()) bool {
+	select {
+	case cmd, ok := <-commands:
+		if !ok || handle(cmd) {
+			return true
+		}
+	default:
+	}
+	dispatch()
+	return false
 }
 
 type compactionPhase uint8
@@ -198,6 +216,10 @@ func (c *compactionControl) interrupt() {
 
 func (c *compactionControl) shutdown() { c.shuttingDown = true }
 
+func (c *compactionControl) pendingAtBoundary() bool {
+	return c.pending != nil && c.pending.phase == compactionPhasePending
+}
+
 // atBoundary is the only transition that consumes a pending request. Shutdown
 // and interrupt dispositions are checked first, so a control signal observed by
 // the actor always outranks starting compaction at the next safe boundary.
@@ -223,6 +245,19 @@ func (c *compactionControl) reject(reason event.CompactRejectReason) compactionD
 	c.pending = nil
 	c.interrupting = false
 	return compactionDisposition{Kind: compactionDispositionReject, Attempt: attempt, RejectReason: reason}
+}
+
+// abort releases an attempt whose execution sink declined ownership. The actor
+// retains no in-progress tombstone: every waiter is returned through the typed
+// infrastructure-failure seam, and a later command may open a fresh attempt.
+func (c *compactionControl) abort(attemptID event.CompactAttemptID) *compactionAttempt {
+	if c.pending == nil || c.pending.attemptID != attemptID {
+		return nil
+	}
+	attempt := c.pendingAttempt()
+	c.pending = nil
+	c.interrupting = false
+	return attempt
 }
 
 func (c *compactionControl) pendingAttempt() *compactionAttempt {

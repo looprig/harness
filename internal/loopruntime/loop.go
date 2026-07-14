@@ -644,13 +644,14 @@ func runLoop(cfg loopConfig, state loopState) {
 		return cfg.events.PublishEventChecked(ctx, withLoopHeader(ev, h))
 	}
 
-	reportCompactionFailure := func(commandID uuid.UUID, err error) {
-		failure := compactionFailure{CommandID: commandID, Err: err}
+	reportCompactionFailure := func(waiterCommandIDs []uuid.UUID, err error) {
+		waiters := append([]uuid.UUID(nil), waiterCommandIDs...)
+		failure := compactionFailure{WaiterCommandIDs: waiters, Err: err}
 		if sink, ok := config.compactionSink.(compactionFailureSink); ok {
 			sink.ReportCompactionFailure(ctx, failure)
 			return
 		}
-		slog.Error("compaction coordination failed", "command_id", commandID, "error", err)
+		slog.Error("compaction coordination failed", "waiter_count", len(waiters), "error", err)
 	}
 
 	publishLaneFull := func(request command.Compact, attemptID event.CompactAttemptID) error {
@@ -685,11 +686,17 @@ func runLoop(cfg loopConfig, state loopState) {
 			return
 		}
 		if err := config.compactionSink.CoordinateCompaction(ctx, disposition); err != nil {
-			commandID := uuid.UUID{}
-			if disposition.Attempt != nil && len(disposition.Attempt.WaiterCommandIDs) > 0 {
-				commandID = disposition.Attempt.WaiterCommandIDs[0]
+			attempt := disposition.Attempt
+			if attempt != nil {
+				if aborted := compactions.abort(attempt.AttemptID); aborted != nil {
+					attempt = aborted
+				}
 			}
-			reportCompactionFailure(commandID, &CompactionCoordinationError{Kind: CompactionCoordinationOutcome, Cause: err})
+			waiters := []uuid.UUID(nil)
+			if attempt != nil {
+				waiters = attempt.WaiterCommandIDs
+			}
+			reportCompactionFailure(waiters, &CompactionCoordinationError{Kind: CompactionCoordinationOutcome, Cause: err})
 		}
 	}
 
@@ -1480,173 +1487,176 @@ func runLoop(cfg loopConfig, state loopState) {
 		c.Ack <- command.LoopChangeResult{Mode: string(state.effective.mode), Model: model, Effort: effort}
 	}
 
-	for {
-		select {
-		case cmd, ok := <-commands:
-			if !ok {
-				return
+	handleCommand := func(cmd command.Command) bool {
+		switch c := cmd.(type) {
+
+		case command.UserInput:
+			// Interactive input may queue behind a running turn (it later folds into a
+			// tool-continuation request or starts a later turn). The actor decides on
+			// its own live state — race-free — and PUBLISHES the typed outcome event
+			// (TurnStarted / InputQueued / TurnRejected) onto the session fan-in. A
+			// UserInput may be rejected, so bypassReject is false.
+			qi := queuedInput{inputID: c.CommandHeader().CommandID, agency: c.CommandHeader().Agency, msg: userMessageFromBlocks(c.Blocks), noFold: c.NoFold}
+			if c.Accepted != nil {
+				admitDelegate(c, qi)
+				return false
 			}
-			switch c := cmd.(type) {
+			decideSubmit(qi, false)
 
-			case command.UserInput:
-				// Interactive input may queue behind a running turn (it later folds into a
-				// tool-continuation request or starts a later turn). The actor decides on
-				// its own live state — race-free — and PUBLISHES the typed outcome event
-				// (TurnStarted / InputQueued / TurnRejected) onto the session fan-in. A
-				// UserInput may be rejected, so bypassReject is false.
-				qi := queuedInput{inputID: c.CommandHeader().CommandID, agency: c.CommandHeader().Agency, msg: userMessageFromBlocks(c.Blocks), noFold: c.NoFold}
-				if c.Accepted != nil {
-					admitDelegate(c, qi)
-					continue
-				}
-				decideSubmit(qi, false)
+		case command.SubagentResult:
+			// A hand-back from a finished subagent loop. triggeredBy is the producing
+			// CHILD loop id (Cause.LoopID), stamped on the resulting events — the
+			// command's embedded Coordinates.LoopID is the PARENT (this loop, the
+			// delivery target), NOT the wake token. bypassReject is true: a
+			// SubagentResult is NEVER rejected — it always starts (idle) or queues
+			// (running/shutting-down), so its quiescence {wake} token is always released
+			// by a resulting Enduring event, never off the publish path.
+			qi := queuedInput{
+				inputID:     c.CommandHeader().CommandID,
+				triggeredBy: c.Cause.LoopID,           // the CHILD loop (wake token)
+				agency:      c.CommandHeader().Agency, // a hand-back is machine; copy verbatim
+				msg:         userMessageFromBlocks(c.Blocks),
+			}
+			decideSubmit(qi, true)
 
-			case command.SubagentResult:
-				// A hand-back from a finished subagent loop. triggeredBy is the producing
-				// CHILD loop id (Cause.LoopID), stamped on the resulting events — the
-				// command's embedded Coordinates.LoopID is the PARENT (this loop, the
-				// delivery target), NOT the wake token. bypassReject is true: a
-				// SubagentResult is NEVER rejected — it always starts (idle) or queues
-				// (running/shutting-down), so its quiescence {wake} token is always released
-				// by a resulting Enduring event, never off the publish path.
-				qi := queuedInput{
-					inputID:     c.CommandHeader().CommandID,
-					triggeredBy: c.Cause.LoopID,           // the CHILD loop (wake token)
-					agency:      c.CommandHeader().Agency, // a hand-back is machine; copy verbatim
-					msg:         userMessageFromBlocks(c.Blocks),
-				}
-				decideSubmit(qi, true)
+		case command.CancelQueuedInput:
+			// Retract a still-queued submit. Resolved by the actor against its own
+			// inbox: if still queued it emits event.InputCancelled{CancelClientRetracted}
+			// and removes it; otherwise it is a no-op (already started/folded or never
+			// queued). Fire-and-forget — no reply channel.
+			cancelQueued(c)
 
-			case command.CancelQueuedInput:
-				// Retract a still-queued submit. Resolved by the actor against its own
-				// inbox: if still queued it emits event.InputCancelled{CancelClientRetracted}
-				// and removes it; otherwise it is a no-op (already started/folded or never
-				// queued). Fire-and-forget — no reply channel.
-				cancelQueued(c)
+		case command.CancelDelegateRequest:
+			cancelDelegateRequest(c)
 
-			case command.CancelDelegateRequest:
-				cancelDelegateRequest(c)
+		case command.SetLoopMode:
+			// Select a predeclared mode for the NEXT turn. Validated against the bound
+			// definition on the actor (the sole owner of effective state); the outcome
+			// (typed error or the committed mode/model/effort) is replied on the buffered
+			// Ack. A nil Ack violates the contract — log and drop rather than wedge.
+			if err := c.Validate(); err != nil {
+				slog.Warn("invalid SetLoopMode command", "error", err)
+				return false
+			}
+			applySetMode(c)
 
-			case command.SetLoopMode:
-				// Select a predeclared mode for the NEXT turn. Validated against the bound
-				// definition on the actor (the sole owner of effective state); the outcome
-				// (typed error or the committed mode/model/effort) is replied on the buffered
-				// Ack. A nil Ack violates the contract — log and drop rather than wedge.
-				if err := c.Validate(); err != nil {
-					slog.Warn("invalid SetLoopMode command", "error", err)
-					continue
-				}
-				applySetMode(c)
+		case command.ChangeLoopInference:
+			// Change only the model/effort for the NEXT turn, validated atomically.
+			if err := c.Validate(); err != nil {
+				slog.Warn("invalid ChangeLoopInference command", "error", err)
+				return false
+			}
+			applyChangeInference(c)
 
-			case command.ChangeLoopInference:
-				// Change only the model/effort for the NEXT turn, validated atomically.
-				if err := c.Validate(); err != nil {
-					slog.Warn("invalid ChangeLoopInference command", "error", err)
-					continue
+		case command.Compact:
+			admission, err := compactions.admit(c, config.idGen)
+			if err != nil {
+				reportCompactionFailure([]uuid.UUID{c.CommandHeader().CommandID}, err)
+				return false
+			}
+			if admission.Kind == compactionAdmissionLaneFull {
+				if err := publishLaneFull(c, admission.AttemptID); err != nil {
+					reportCompactionFailure([]uuid.UUID{c.CommandHeader().CommandID}, err)
 				}
-				applyChangeInference(c)
+				return false
+			}
+			// Idle is itself a safe turn boundary. A configured sink takes ownership
+			// immediately; while a turn is live, the request remains actor-owned until
+			// the next step/turn boundary below.
+			if state.status == loopIdle {
+				dispatchCompactionBoundary(compactionBoundaryTurn)
+			}
 
-			case command.Compact:
-				admission, err := compactions.admit(c, config.idGen)
-				if err != nil {
-					reportCompactionFailure(c.CommandHeader().CommandID, err)
-					continue
-				}
-				if admission.Kind == compactionAdmissionLaneFull {
-					if err := publishLaneFull(c, admission.AttemptID); err != nil {
-						reportCompactionFailure(c.CommandHeader().CommandID, err)
-					}
-					continue
-				}
-				// Idle is itself a safe turn boundary. A configured sink takes ownership
-				// immediately; while a turn is live, the request remains actor-owned until
-				// the next step/turn boundary below.
-				if state.status == loopIdle {
-					dispatchCompactionBoundary(compactionBoundaryTurn)
-				}
+		case command.Interrupt:
+			if err := c.Validate(); err != nil {
+				slog.Warn("invalid Interrupt command", "error", err)
+				return false
+			}
+			compactions.interrupt()
+			if state.cancelTurn != nil {
+				state.cancelTurn()
+				state.cancelTurn = nil
+				c.Ack <- true
+			} else if requestCancelActive {
+				// A targeted cancellation already cancelled this exact active turn,
+				// but its terminal has not reached the actor yet. An ordinary interrupt
+				// broadens the disposition: acknowledge it and clear the targeted-only
+				// continuation so the terminal uses the ordinary interrupt queue policy.
+				requestCancelActive = false
+				c.Ack <- true
+			} else if state.status == loopWaitingAdmission && state.cancelAdmission != nil {
+				// This loop is idle with accepted work waiting on session admission.
+				// Keep the existing cancellable waiter: loop-scoped admission rechecks
+				// every retained interrupt ref before returning. Ack false because no
+				// current turn was canceled; fan-out keeps this scope's provisional ref
+				// only when another target genuinely acknowledges cancellation.
+				retainUserQueuedInbox(uuid.UUID{})
+				c.Ack <- false
+			} else {
+				c.Ack <- false
+			}
+			if state.status == loopIdle {
+				dispatchCompactionBoundary(compactionBoundaryTurn)
+			}
 
-			case command.Interrupt:
-				if err := c.Validate(); err != nil {
-					slog.Warn("invalid Interrupt command", "error", err)
-					continue
-				}
-				compactions.interrupt()
-				if state.cancelTurn != nil {
-					state.cancelTurn()
-					state.cancelTurn = nil
-					c.Ack <- true
-				} else if requestCancelActive {
-					// A targeted cancellation already cancelled this exact active turn,
-					// but its terminal has not reached the actor yet. An ordinary interrupt
-					// broadens the disposition: acknowledge it and clear the targeted-only
-					// continuation so the terminal uses the ordinary interrupt queue policy.
-					requestCancelActive = false
-					c.Ack <- true
-				} else if state.status == loopWaitingAdmission && state.cancelAdmission != nil {
-					// This loop is idle with accepted work waiting on session admission.
-					// Keep the existing cancellable waiter: loop-scoped admission rechecks
-					// every retained interrupt ref before returning. Ack false because no
-					// current turn was canceled; fan-out keeps this scope's provisional ref
-					// only when another target genuinely acknowledges cancellation.
-					retainUserQueuedInbox(uuid.UUID{})
-					c.Ack <- false
-				} else {
-					c.Ack <- false
-				}
-				if state.status == loopIdle {
-					dispatchCompactionBoundary(compactionBoundaryTurn)
-				}
-
-			case command.Shutdown:
-				if err := c.Validate(); err != nil {
-					slog.Warn("invalid Shutdown command", "error", err)
-				} else {
-					state.shutdownAcks = append(state.shutdownAcks, c.Ack)
-				}
-				compactions.shutdown()
-				if state.status == loopShuttingDown {
-					continue
-				}
-				wasRunning := state.status == loopRunning
-				wasWaitingAdmission := state.status == loopWaitingAdmission
-				state.status = loopShuttingDown
-				if state.cancelTurn != nil {
-					state.cancelTurn()
-					state.cancelTurn = nil
-				}
-				if wasWaitingAdmission && state.cancelAdmission != nil {
-					state.cancelAdmission()
-					state.cancelAdmission = nil
-					returnQueuedInbox(event.CancelTurnInterrupted, uuid.UUID{})
-					dispatchCompactionBoundary(compactionBoundaryTurn)
-					ackShutdowns(nil)
-					return
-				}
-				if !wasRunning {
-					// Idle shutdown: no turn is running. Return any still-queued input
-					// (it will never start) before stopping; in practice the inbox is
-					// empty when idle, but this guarantees nothing is silently dropped.
-					returnQueuedInbox(event.CancelTurnInterrupted, uuid.UUID{})
-					dispatchCompactionBoundary(compactionBoundaryTurn)
-					ackShutdowns(nil)
-					return
-				}
+		case command.Shutdown:
+			if err := c.Validate(); err != nil {
+				slog.Warn("invalid Shutdown command", "error", err)
+			} else {
+				state.shutdownAcks = append(state.shutdownAcks, c.Ack)
+			}
+			compactions.shutdown()
+			if state.status == loopShuttingDown {
+				return false
+			}
+			wasRunning := state.status == loopRunning
+			wasWaitingAdmission := state.status == loopWaitingAdmission
+			state.status = loopShuttingDown
+			if state.cancelTurn != nil {
+				state.cancelTurn()
+				state.cancelTurn = nil
+			}
+			if wasWaitingAdmission && state.cancelAdmission != nil {
+				state.cancelAdmission()
+				state.cancelAdmission = nil
+				returnQueuedInbox(event.CancelTurnInterrupted, uuid.UUID{})
+				dispatchCompactionBoundary(compactionBoundaryTurn)
+				ackShutdowns(nil)
+				return true
+			}
+			if !wasRunning {
+				// Idle shutdown: no turn is running. Return any still-queued input
+				// (it will never start) before stopping; in practice the inbox is
+				// empty when idle, but this guarantees nothing is silently dropped.
+				returnQueuedInbox(event.CancelTurnInterrupted, uuid.UUID{})
+				dispatchCompactionBoundary(compactionBoundaryTurn)
+				ackShutdowns(nil)
+				return true
+			}
 			// Turn goroutine is winding down; wait for internal below.
 
 			// Control commands are fire-and-route: no Validate, no Ack. routeControl
 			// delivers to the parked runner blocked on this ToolExecutionID iff a gate is open
 			// AND its kind accepts this command; any miss (unknown/stale ToolExecutionID, kind
 			// mismatch, duplicate after delivery) is silently dropped (fail-safe).
-			case command.ApproveToolCall:
-				routeControl(c, c.GateRoute)
+		case command.ApproveToolCall:
+			routeControl(c, c.GateRoute)
 
-			case command.DenyToolCall:
-				routeControl(c, c.GateRoute)
+		case command.DenyToolCall:
+			routeControl(c, c.GateRoute)
 
-			case command.ProvideUserInput:
-				routeControl(c, c.GateRoute)
+		case command.ProvideUserInput:
+			routeControl(c, c.GateRoute)
+		}
+		return false
+	}
+
+	for {
+		select {
+		case cmd, ok := <-commands:
+			if !ok || handleCommand(cmd) {
+				return
 			}
-
 		case reg := <-gateReg:
 			callID := reg.toolExecutionID()
 			gateID, err := cfg.gates.PrepareGateOpen(ctx, state.id, reg.gate, reg.payload)
@@ -1736,7 +1746,14 @@ func runLoop(cfg loopConfig, state loopState) {
 			// drained entries are now in draining and are resolved either by their
 			// TurnFoldedInto commit (below) or by returnQueuedInbox on an abnormal
 			// terminal — never silently lost.
-			dispatchCompactionBoundary(compactionBoundaryStep)
+			dispatch := func() { dispatchCompactionBoundary(compactionBoundaryStep) }
+			if compactions.pendingAtBoundary() {
+				if arbitrateCompactionBoundary(commands, handleCommand, dispatch) {
+					return
+				}
+			} else {
+				dispatch()
+			}
 			req.reply <- drainInbox()
 
 		case req := <-commits:
@@ -1765,7 +1782,14 @@ func runLoop(cfg loopConfig, state loopState) {
 			req.ack <- boundaryErr
 
 		case result := <-internal:
-			dispatchCompactionBoundary(compactionBoundaryTurn)
+			dispatch := func() { dispatchCompactionBoundary(compactionBoundaryTurn) }
+			if compactions.pendingAtBoundary() {
+				if arbitrateCompactionBoundary(commands, handleCommand, dispatch) {
+					return
+				}
+			} else {
+				dispatch()
+			}
 			if handleTurnResult(result) {
 				return
 			}
