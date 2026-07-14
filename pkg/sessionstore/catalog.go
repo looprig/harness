@@ -315,6 +315,7 @@ const (
 	CatalogMetaRuleExceedsContext  CatalogMetaRule = "must not exceed ContextSeq"
 	CatalogMetaRuleNotAfterRuntime CatalogMetaRule = "must be newer than RuntimeSeq"
 	CatalogMetaRuleContextAbsent   CatalogMetaRule = "must be zero when CurrentContext is absent"
+	CatalogMetaRuleContextCurrent  CatalogMetaRule = "must equal ContextSeq when CurrentContext is set"
 )
 
 // CatalogMetaValidationError reports an invalid bounded loop projection. The
@@ -1162,6 +1163,9 @@ func validateSessionMeta(meta SessionMeta) error {
 		} else {
 			if loop.ContextValueSeq == 0 {
 				return &CatalogMetaValidationError{LoopIndex: i, Field: CatalogMetaFieldContextValueSeq, Rule: CatalogMetaRuleRequired}
+			}
+			if loop.ContextValueSeq != loop.ContextSeq {
+				return &CatalogMetaValidationError{LoopIndex: i, Field: CatalogMetaFieldContextValueSeq, Rule: CatalogMetaRuleContextCurrent}
 			}
 			if loop.ContextValueSeq <= loop.RuntimeSeq {
 				return &CatalogMetaValidationError{LoopIndex: i, Field: CatalogMetaFieldContextValueSeq, Rule: CatalogMetaRuleNotAfterRuntime}
