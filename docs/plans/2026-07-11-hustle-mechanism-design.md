@@ -857,12 +857,18 @@ const (
 
 type OutputError struct {
 	Reason OutputFailureReason
+	Cause  error
 }
+
+func (e *OutputError) Unwrap() error { return e.Cause }
 ```
 
 The closed validation order is shape (nil response/message, wrong role, block
 count, or non-text block), empty text, full-envelope byte cap, then JSON
-validity. `OutputError` never includes raw model output. A focused adapter maps
+validity. Extraction failures set one valid `Reason` and a nil `Cause`;
+normalized-usage and adapter validation-callback failures set the zero/unknown
+reason and one non-nil typed `Cause`. Both-set and both-empty values are invalid.
+`OutputError` never includes raw model output. A focused adapter maps
 `invalid_shape` and `empty_text` to compaction `output_shape`, `too_large` to
 `byte_limit`, and `invalid_json` to `wire` before product finalization. A valid
 JSON result proceeds to the adapter validation callback, whose typed domain

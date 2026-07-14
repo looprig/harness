@@ -719,6 +719,9 @@ empty text maps independently, the registered descriptor `OutputBytes` bounds
 the full JSON envelope, and invalid JSON remains distinct. The adapter maps
 shape/empty to summary `output_shape`, too-large to `byte_limit`, and invalid JSON
 to `wire` from the typed run outcome before caller product finalization.
+`OutputError{Reason,Cause}` is exclusive: extraction sets one valid reason and nil
+cause; normalized-usage or adapter-callback failure sets zero reason and one typed
+cause; reject both-set and both-empty values and never retain raw output.
 
 Before any `HustleCompleted` or product finalizer success, require normalized
 non-nil usage with non-zero `OutputTokens`, conservatively enforce the whole JSON
