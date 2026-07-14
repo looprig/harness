@@ -611,6 +611,14 @@ EventID mint failure, structurally impossible canonical terminals, and fatal
 hub/session/persistence failures fault/stop and complete in-process waiters with
 typed infrastructure errors; none is journaled as a false rejection.
 
+Both canonical terminal events durably carry the attempt identity:
+`CompactionCommitted` and `CompactionRejected` require a non-zero valid
+`CompactionReason` plus the exact valid attempted `ContextBasis` (committed keeps
+its existing basis; rejected gains one). Codecs and validators reject zero or
+unknown reasons and invalid bases. Immediate pre-attempt/control-lane-full
+`CompactWaiterRejected` remains per-command and does not fabricate a canonical
+basis.
+
 Commit: `feat(compaction): add commands and event contracts`.
 
 ### Task 23: Control-lane coalescing and waiter outcomes
@@ -657,7 +665,11 @@ fabricates a compaction attempt or rejection. Pin the public observation fields
 `DefinitionMissingContextPolicy`; existing missing-counter and duplicate-option
 kinds remain canonical. Soft compaction failure below a known hard limit and
 compact-reject count/unknown mappings remain Task 26 behavior once a real attempt
-exists.
+exists. Restore RED additionally pins basis independent from measurement through
+TurnStarted/StepDone/TurnFoldedInto/model/mode invalidation, stale in-flight count
+CAS across mode/inference request-shape changes, and the bounded durable automatic
+latch: restored automatic rejection suppresses only the unchanged basis, manual
+rejection does not, and a later basis mutation re-enables automatic admission.
 
 Commit: `feat(loopruntime): measure and admit request context`.
 

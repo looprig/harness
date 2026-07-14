@@ -862,6 +862,7 @@ type CompactionCommitted struct {
 	Header
 	AttemptID        CompactAttemptID
 	WaiterCommandIDs []uuid.UUID // full canonical membership
+	Reason           CompactionReason
 	Basis            ContextBasis
 	Summary          *content.UserMessage
 	PostContext      ContextMeasurement
@@ -875,12 +876,18 @@ type CompactionRejected struct {
 	Header
 	AttemptID        CompactAttemptID
 	WaiterCommandIDs []uuid.UUID
+	Reason           CompactionReason
+	Basis            ContextBasis
 	RejectReason     CompactRejectReason
 	Duration         time.Duration
 }
 ```
 
-Exactly one of these is written per attempt. Because it already contains the full
+`Reason` and `Basis` are required durable identity on both canonical outcomes:
+the fixed numeric `CompactionReason` enum records manual versus automatic origin,
+and `Basis` records the exact active context the attempt targeted. Zero/unknown
+reasons and invalid bases are rejected by validation/codecs. Exactly one of these
+is written per attempt. Because it already contains the full
 waiter set, the per-command terminal replies are an **idempotent projection** of
 it — and each reply's event id is **derived deterministically** so replaying the
 repair can never append a duplicate:
@@ -1060,7 +1067,7 @@ finalize AIMessage + tool results + usage
 → construct ContextReplacement{old Basis, Model, Fprint of the measurement}
 → actor CAS-validates {Basis, Model, RequestFingerprint}
 → measure Duration and mint CompactionCommitted/new ContextBasis
-→ construct CompactionCommitted{AttemptID, Waiters, old Basis, Summary, PostContext, Duration}
+→ construct CompactionCommitted{AttemptID, Waiters, Reason, old Basis, Summary, PostContext, Duration}
 → append CompactionCommitted durably
 → actor replaces loopState.msgs
 → acknowledge replacement to the turn goroutine
@@ -1243,10 +1250,13 @@ rejects/fails without replacement while the unchanged measurement remains at or
 above the limit. Task 26 owns the post-attempt replacement/rejection continuation;
 a successful replacement is recounted before inference.
 
-A failed automatic attempt is recorded against the current `ContextBasis`.
-There is at most one automatic attempt per unchanged basis. A later context
-mutation may retry; failure does not disarm automatic compaction forever.
-Manual `/compact` may explicitly retry the same basis.
+A failed automatic attempt is durably recorded as
+`CompactionRejected{Reason: CompactionReasonAutomatic, Basis: currentBasis}`.
+There is at most one automatic attempt per unchanged basis, including across
+restore. A manual rejection at that same basis does not consume the automatic
+latch. A later context mutation advances the basis and makes the old latch
+irrelevant; failure does not disarm automatic compaction forever. Manual
+`/compact` may explicitly retry the same basis.
 
 After a successful replacement, the summary-based request is counted. If fixed
 system/tool/runtime context plus the summary still exceeds the hard limit, the
@@ -1316,6 +1326,16 @@ type LoopModeChanged struct {
 	Runtime ModelRuntime // resolved result of selecting the mode (model + limits + effort)
 }
 ```
+
+The replay fold carries the latest `ContextBasis` independently from the latest
+`ContextMeasurement`. Every durable context mutation advances the basis even
+when it invalidates/clears the current measurement, and restore seeds that basis
+when `CurrentContext` is absent. Revisions therefore never restart at one after a
+restart, model change, or mode change. The fold also keeps only the latest
+automatic-attempt latch: a canonical
+`CompactionRejected{Reason: CompactionReasonAutomatic}` records its `Basis` as
+exhausted; a manual rejection does not. Any later basis advance makes that latch
+irrelevant. This is bounded latest-value state, not an unbounded attempt history.
 
 `LoopStarted` likewise carries the initial resolved runtime. This makes replay
 and catalog repair independent of a mutable external model catalog, and gives the
@@ -1475,8 +1495,8 @@ remote counting endpoint for Chutes, Phala, or LM Studio.
 | `ContextPressure` | event | Ephemeral/Public | no | percentage level change |
 | `ContextMeasured` | event | Enduring/Public | yes | authoritative/replayable current measurement |
 | `CompactionStarted` | event | Ephemeral/Public | no | one live activity signal per accepted attempt; drives focused-loop status |
-| `CompactionCommitted` | event | Enduring/Public | yes | canonical success: context replacement, outcome + waiter membership, and elapsed duration (folded as the reset) |
-| `CompactionRejected` | event | Enduring/Public | yes | canonical failure: reject reason, full waiter membership, and elapsed duration |
+| `CompactionCommitted` | event | Enduring/Public | yes | canonical success: durable manual/automatic reason + attempted basis, context replacement, outcome + waiter membership, and elapsed duration (folded as the reset) |
+| `CompactionRejected` | event | Enduring/Public | yes | canonical failure: durable manual/automatic reason + attempted basis, reject reason, full waiter membership, and elapsed duration |
 | `CompactWaiterResolved` | event | Enduring/Public | yes | per-waiter success reply; deterministic id, idempotent projection |
 | `CompactWaiterRejected` | event | Enduring/Public | yes | per-waiter reject reply (failure/cancel/shutdown/stale-basis/lane-full) |
 
@@ -1514,6 +1534,8 @@ have no compaction `AttemptID`, so they never fabricate
 `CompactionRejected`. `CompactRejectContextCountFailed` and
 `CompactRejectContextLimitUnknown` apply only after a real compaction attempt
 exists, including post-summary counting in the compaction finalization work.
+Immediate pre-attempt or control-lane-full `CompactWaiterRejected` remains a
+per-command reply and does not fabricate a canonical attempted basis.
 
 ### Missing exact provider counters
 
