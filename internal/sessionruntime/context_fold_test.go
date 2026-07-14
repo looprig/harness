@@ -60,21 +60,60 @@ func TestFoldLoopTracksAndInvalidatesContextMeasurement(t *testing.T) {
 
 func TestFoldLoopForRestoreRejectsContextModelMismatch(t *testing.T) {
 	t.Parallel()
-	runtime := event.ModelRuntime{Key: inference.ModelKey{Provider: "provider", Model: "model"}, Limits: inference.ContextLimits{WindowTokens: 100}}
-	measurement := foldContextMeasurement(1)
-	mismatched := measurement
-	mismatched.Model = inference.ModelKey{Provider: "other", Model: "model"}
+	bound := bindCfg(modeCfg(&stubLLM{}), uuid.UUID{1}, uuid.UUID{2})
+	measurementFor := func(model inference.Model) event.ContextMeasurement {
+		measurement := foldContextMeasurement(1)
+		measurement.Model = model.Key()
+		return measurement
+	}
+	base := validModel("base")
+	swapped := validModel("swapped")
+	routed := validModel("routed")
 	tests := []struct {
 		name    string
 		events  []event.Event
 		wantErr bool
 	}{
-		{name: "matching", events: []event.Event{event.LoopStarted{Runtime: runtime}, event.ContextMeasured{Measurement: measurement}}},
-		{name: "mismatched", events: []event.Event{event.LoopStarted{Runtime: runtime}, event.ContextMeasured{Measurement: mismatched}}, wantErr: true},
+		{
+			name:   "absent runtime matches initial mode fallback",
+			events: []event.Event{event.LoopStarted{}, event.ContextMeasured{Measurement: measurementFor(base)}},
+		},
+		{
+			name:    "absent runtime mismatches initial mode fallback",
+			events:  []event.Event{event.LoopStarted{}, event.ContextMeasured{Measurement: measurementFor(routed)}},
+			wantErr: true,
+		},
+		{
+			name:   "absent runtime matches selected mode fallback",
+			events: []event.Event{event.LoopStarted{InitialMode: "swap"}, event.ContextMeasured{Measurement: measurementFor(swapped)}},
+		},
+		{
+			name:    "absent runtime mismatches selected mode fallback",
+			events:  []event.Event{event.LoopStarted{InitialMode: "swap"}, event.ContextMeasured{Measurement: measurementFor(base)}},
+			wantErr: true,
+		},
+		{
+			name:   "absent runtime matches changed mode fallback",
+			events: []event.Event{event.LoopModeChanged{Mode: "swap"}, event.ContextMeasured{Measurement: measurementFor(swapped)}},
+		},
+		{
+			name:    "absent runtime mismatches changed mode fallback",
+			events:  []event.Event{event.LoopModeChanged{Mode: "swap"}, event.ContextMeasured{Measurement: measurementFor(base)}},
+			wantErr: true,
+		},
+		{
+			name:   "durable runtime matches measurement",
+			events: []event.Event{event.LoopStarted{Runtime: runtimeForModel(routed)}, event.ContextMeasured{Measurement: measurementFor(routed)}},
+		},
+		{
+			name:    "durable runtime mismatches measurement",
+			events:  []event.Event{event.LoopStarted{Runtime: runtimeForModel(routed)}, event.ContextMeasured{Measurement: measurementFor(base)}},
+			wantErr: true,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			_, err := foldLoopForRestore(tt.events)
+			_, err := foldLoopForRestore(bound, tt.events)
 			if !tt.wantErr {
 				if err != nil {
 					t.Fatal(err)

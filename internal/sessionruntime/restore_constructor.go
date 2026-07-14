@@ -534,7 +534,7 @@ func planLoops(sessionCtx context.Context, sessionID uuid.UUID, topology Topolog
 		}
 		boundByLoop[started.LoopID] = bound
 		loopEvents := eventsFromRecords(allRecords, started.LoopID)
-		folded, foldErr := foldLoopForRestore(loopEvents)
+		folded, foldErr := foldLoopForRestore(bound, loopEvents)
 		if foldErr != nil {
 			return nil, loopPlan{}, foldErr
 		}

@@ -493,8 +493,16 @@ func foldLoop(events []event.Event) foldResult {
 	}
 }
 
-func foldLoopForRestore(events []event.Event) (foldResult, error) {
+func foldLoopForRestore(bound loop.BoundDefinition, events []event.Event) (foldResult, error) {
 	folded := foldLoop(events)
+	if folded.Err == nil && folded.HasContext {
+		_, effectiveModel := liveViewFor(bound, foldLoopInference(events))
+		if folded.Context.Model != effectiveModel.Key() {
+			folded.Err = &RestoredContextModelMismatchError{
+				Runtime: effectiveModel.Key(), Measurement: folded.Context.Model,
+			}
+		}
+	}
 	if folded.Err != nil {
 		return foldResult{}, &RestoreError{Kind: RestoreReplayFailed, Cause: folded.Err}
 	}
