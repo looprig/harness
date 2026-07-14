@@ -1,6 +1,7 @@
 package event
 
 import (
+	"encoding/json"
 	"errors"
 	"reflect"
 	"testing"
@@ -61,6 +62,175 @@ func TestCompactionReasonDomains(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			if got := tt.reason.Valid(); got != tt.valid {
 				t.Errorf("Valid() = %v, want %v", got, tt.valid)
+			}
+		})
+	}
+}
+
+func TestCompactionReasonWireValues(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name     string
+		reason   CompactionReason
+		want     uint8
+		wantJSON string
+		valid    bool
+	}{
+		{name: "unspecified sentinel is zero", reason: CompactionReasonUnspecified, want: 0, wantJSON: "0"},
+		{name: "manual is one", reason: CompactionReasonManual, want: 1, wantJSON: "1", valid: true},
+		{name: "automatic is two", reason: CompactionReasonAutomatic, want: 2, wantJSON: "2", valid: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := uint8(tt.reason); got != tt.want {
+				t.Errorf("numeric value = %d, want %d", got, tt.want)
+			}
+			if got := tt.reason.Valid(); got != tt.valid {
+				t.Errorf("Valid() = %v, want %v", got, tt.valid)
+			}
+			raw, err := json.Marshal(CompactionStarted{Reason: tt.reason})
+			if err != nil {
+				t.Fatalf("json.Marshal: %v", err)
+			}
+			var fields map[string]json.RawMessage
+			if err := json.Unmarshal(raw, &fields); err != nil {
+				t.Fatalf("json.Unmarshal fields: %v", err)
+			}
+			if got := string(fields["reason"]); got != tt.wantJSON {
+				t.Errorf("reason JSON = %s, want numeric %s", got, tt.wantJSON)
+			}
+		})
+	}
+}
+
+func TestCompactRejectReasonWireValues(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name     string
+		reason   CompactRejectReason
+		want     uint8
+		wantJSON string
+		valid    bool
+	}{
+		{name: "unspecified sentinel is zero", reason: CompactRejectUnspecified, want: 0, wantJSON: "0"},
+		{name: "control lane full is one", reason: CompactRejectControlLaneFull, want: 1, wantJSON: "1", valid: true},
+		{name: "shutting down is two", reason: CompactRejectShuttingDown, want: 2, wantJSON: "2", valid: true},
+		{name: "interrupted is three", reason: CompactRejectInterrupted, want: 3, wantJSON: "3", valid: true},
+		{name: "canceled is four", reason: CompactRejectCanceled, want: 4, wantJSON: "4", valid: true},
+		{name: "stale basis is five", reason: CompactRejectStaleBasis, want: 5, wantJSON: "5", valid: true},
+		{name: "progress publication is six", reason: CompactRejectProgressPublication, want: 6, wantJSON: "6", valid: true},
+		{name: "unavailable is seven", reason: CompactRejectUnavailable, want: 7, wantJSON: "7", valid: true},
+		{name: "execution failed is eight", reason: CompactRejectExecutionFailed, want: 8, wantJSON: "8", valid: true},
+		{name: "invalid summary is nine", reason: CompactRejectInvalidSummary, want: 9, wantJSON: "9", valid: true},
+		{name: "context count failed is ten", reason: CompactRejectContextCountFailed, want: 10, wantJSON: "10", valid: true},
+		{name: "summary too large is eleven", reason: CompactRejectSummaryTooLarge, want: 11, wantJSON: "11", valid: true},
+		{name: "internal is twelve", reason: CompactRejectInternal, want: 12, wantJSON: "12", valid: true},
+		{name: "context limit unknown is thirteen", reason: CompactRejectContextLimitUnknown, want: 13, wantJSON: "13", valid: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := uint8(tt.reason); got != tt.want {
+				t.Errorf("numeric value = %d, want %d", got, tt.want)
+			}
+			if got := tt.reason.Valid(); got != tt.valid {
+				t.Errorf("Valid() = %v, want %v", got, tt.valid)
+			}
+			testCases := []struct {
+				name  string
+				event Event
+				field string
+			}{
+				{name: "canonical rejection field", event: CompactionRejected{RejectReason: tt.reason}, field: "reject_reason"},
+				{name: "waiter rejection field", event: CompactWaiterRejected{Reason: tt.reason}, field: "reason"},
+			}
+			for _, tc := range testCases {
+				raw, err := json.Marshal(tc.event)
+				if err != nil {
+					t.Fatalf("json.Marshal %s: %v", tc.name, err)
+				}
+				var fields map[string]json.RawMessage
+				if err := json.Unmarshal(raw, &fields); err != nil {
+					t.Fatalf("json.Unmarshal %s fields: %v", tc.name, err)
+				}
+				if got := string(fields[tc.field]); got != tt.wantJSON {
+					t.Errorf("%s JSON = %s, want numeric %s", tc.field, got, tt.wantJSON)
+				}
+			}
+		})
+	}
+}
+
+func TestCompactionReasonRawDecodeRejectsOutOfDomain(t *testing.T) {
+	t.Parallel()
+	base := CompactionStarted{Header: fullHeaderLoop(), AttemptID: CompactAttemptID(uuid.UUID{0x81}), Reason: CompactionReasonManual, Basis: validCompactionMeasurement(1).Basis}
+	tests := []struct {
+		name string
+		raw  string
+	}{
+		{name: "zero sentinel", raw: `{"reason":0}`},
+		{name: "unknown value", raw: `{"reason":3}`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			decoded := base
+			if err := json.Unmarshal([]byte(tt.raw), &decoded); err != nil {
+				t.Fatalf("json.Unmarshal: %v", err)
+			}
+			var invalid *InvalidEventError
+			if err := ValidateEvent(decoded); !errors.As(err, &invalid) {
+				t.Fatalf("ValidateEvent error = %T %v, want *InvalidEventError", err, err)
+			}
+			if invalid.Field != FieldReason {
+				t.Errorf("invalid field = %q, want %q", invalid.Field, FieldReason)
+			}
+		})
+	}
+}
+
+func TestCompactRejectReasonDurableDecodeRejectsOutOfDomain(t *testing.T) {
+	t.Parallel()
+	valid := CompactionRejected{
+		Header:           fullHeaderLoop(),
+		AttemptID:        CompactAttemptID(uuid.UUID{0x82}),
+		WaiterCommandIDs: []uuid.UUID{{0x83}},
+		RejectReason:     CompactRejectExecutionFailed,
+	}
+	wire, err := MarshalEvent(valid)
+	if err != nil {
+		t.Fatalf("MarshalEvent: %v", err)
+	}
+	tests := []struct {
+		name string
+		raw  string
+	}{
+		{name: "zero sentinel", raw: "0"},
+		{name: "unknown value", raw: "14"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			var fields map[string]json.RawMessage
+			if err := json.Unmarshal(wire, &fields); err != nil {
+				t.Fatalf("json.Unmarshal envelope: %v", err)
+			}
+			fields["reject_reason"] = json.RawMessage(tt.raw)
+			mutated, err := json.Marshal(fields)
+			if err != nil {
+				t.Fatalf("json.Marshal envelope: %v", err)
+			}
+			got, err := UnmarshalEvent(mutated)
+			if got != nil {
+				t.Errorf("UnmarshalEvent event = %#v, want nil", got)
+			}
+			var invalid *InvalidEventError
+			if !errors.As(err, &invalid) {
+				t.Fatalf("UnmarshalEvent error = %T %v, want *InvalidEventError", err, err)
+			}
+			if invalid.Field != FieldRejectReason {
+				t.Errorf("invalid field = %q, want %q", invalid.Field, FieldRejectReason)
 			}
 		})
 	}
