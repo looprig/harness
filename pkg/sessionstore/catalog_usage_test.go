@@ -51,8 +51,8 @@ func TestCatalogFoldsLoopUsageExactlyOnce(t *testing.T) {
 			},
 			sequences: []uint64{1, 2, 3, 4, 5, 6, 7},
 			want: []LoopUsageMeta{
-				{LoopID: loopLow, Runtime: runtimeB, RuntimeSeq: 3, RuntimeValueSeq: 3},
-				{LoopID: loopHigh, Runtime: runtimeB, RuntimeSeq: 7, RuntimeValueSeq: 7, CumulativeUsage: content.Usage{InputTokens: 30, OutputTokens: 6, CacheReadTokens: 5}},
+				{LoopID: loopLow, Runtime: runtimeB, RuntimeSeq: 3, RuntimeValueSeq: 3, ContextSeq: 3},
+				{LoopID: loopHigh, Runtime: runtimeB, RuntimeSeq: 7, RuntimeValueSeq: 7, CumulativeUsage: content.Usage{InputTokens: 30, OutputTokens: 6, CacheReadTokens: 5}, ContextSeq: 7},
 			},
 		},
 		{
@@ -63,7 +63,7 @@ func TestCatalogFoldsLoopUsageExactlyOnce(t *testing.T) {
 				step(loopHigh, usageA),
 			},
 			sequences: []uint64{1, 2, 2},
-			want:      []LoopUsageMeta{{LoopID: loopHigh, Runtime: runtimeA, RuntimeSeq: 1, RuntimeValueSeq: 1, CumulativeUsage: usageA}},
+			want:      []LoopUsageMeta{{LoopID: loopHigh, Runtime: runtimeA, RuntimeSeq: 1, RuntimeValueSeq: 1, CumulativeUsage: usageA, ContextSeq: 2}},
 		},
 		{
 			name: "delayed older lifecycle cannot regress a newer runtime",
@@ -72,7 +72,7 @@ func TestCatalogFoldsLoopUsageExactlyOnce(t *testing.T) {
 				event.LoopInferenceChanged{Header: event.Header{Coordinates: identity.Coordinates{SessionID: sessionID, LoopID: loopHigh}}, Runtime: runtimeA},
 			},
 			sequences: []uint64{10, 5},
-			want:      []LoopUsageMeta{{LoopID: loopHigh, Runtime: runtimeB, RuntimeSeq: 10, RuntimeValueSeq: 10}},
+			want:      []LoopUsageMeta{{LoopID: loopHigh, Runtime: runtimeB, RuntimeSeq: 10, RuntimeValueSeq: 10, ContextSeq: 10}},
 		},
 		{
 			name: "legacy missing runtime cannot blank a known runtime",
@@ -81,7 +81,7 @@ func TestCatalogFoldsLoopUsageExactlyOnce(t *testing.T) {
 				event.LoopModeChanged{Header: event.Header{Coordinates: identity.Coordinates{SessionID: sessionID, LoopID: loopHigh}}, Mode: "legacy-build"},
 			},
 			sequences: []uint64{1, 2},
-			want:      []LoopUsageMeta{{LoopID: loopHigh, Runtime: runtimeA, RuntimeSeq: 2, RuntimeValueSeq: 1}},
+			want:      []LoopUsageMeta{{LoopID: loopHigh, Runtime: runtimeA, RuntimeSeq: 2, RuntimeValueSeq: 1, ContextSeq: 2}},
 		},
 		{
 			name: "legacy lifecycle watermark accepts a newer delayed known inference",
@@ -91,7 +91,7 @@ func TestCatalogFoldsLoopUsageExactlyOnce(t *testing.T) {
 				event.LoopInferenceChanged{Header: event.Header{Coordinates: identity.Coordinates{SessionID: sessionID, LoopID: loopHigh}}, Runtime: runtimeB},
 			},
 			sequences: []uint64{1, 10, 5},
-			want:      []LoopUsageMeta{{LoopID: loopHigh, Runtime: runtimeB, RuntimeSeq: 10, RuntimeValueSeq: 5}},
+			want:      []LoopUsageMeta{{LoopID: loopHigh, Runtime: runtimeB, RuntimeSeq: 10, RuntimeValueSeq: 5, ContextSeq: 10}},
 		},
 		{
 			name: "newer legacy watermark retains the newest delayed known runtime",
@@ -101,7 +101,7 @@ func TestCatalogFoldsLoopUsageExactlyOnce(t *testing.T) {
 				event.LoopInferenceChanged{Header: event.Header{Coordinates: identity.Coordinates{SessionID: sessionID, LoopID: loopHigh}}, Runtime: runtimeB},
 			},
 			sequences: []uint64{10, 5, 8},
-			want:      []LoopUsageMeta{{LoopID: loopHigh, Runtime: runtimeB, RuntimeSeq: 10, RuntimeValueSeq: 8}},
+			want:      []LoopUsageMeta{{LoopID: loopHigh, Runtime: runtimeB, RuntimeSeq: 10, RuntimeValueSeq: 8, ContextSeq: 10}},
 		},
 		{
 			name: "older delayed known runtime cannot replace a newer backfill",
@@ -111,7 +111,7 @@ func TestCatalogFoldsLoopUsageExactlyOnce(t *testing.T) {
 				event.LoopInferenceChanged{Header: event.Header{Coordinates: identity.Coordinates{SessionID: sessionID, LoopID: loopHigh}}, Runtime: runtimeA},
 			},
 			sequences: []uint64{10, 8, 5},
-			want:      []LoopUsageMeta{{LoopID: loopHigh, Runtime: runtimeB, RuntimeSeq: 10, RuntimeValueSeq: 8}},
+			want:      []LoopUsageMeta{{LoopID: loopHigh, Runtime: runtimeB, RuntimeSeq: 10, RuntimeValueSeq: 8, ContextSeq: 10}},
 		},
 		{
 			name: "overflow is typed and does not corrupt the prior total",
@@ -121,7 +121,7 @@ func TestCatalogFoldsLoopUsageExactlyOnce(t *testing.T) {
 				step(loopHigh, content.Usage{InputTokens: 1}),
 			},
 			sequences: []uint64{1, 2, 3},
-			want:      []LoopUsageMeta{{LoopID: loopHigh, Runtime: runtimeA, RuntimeSeq: 1, RuntimeValueSeq: 1, CumulativeUsage: content.Usage{InputTokens: content.TokenCount(^uint64(0))}}},
+			want:      []LoopUsageMeta{{LoopID: loopHigh, Runtime: runtimeA, RuntimeSeq: 1, RuntimeValueSeq: 1, CumulativeUsage: content.Usage{InputTokens: content.TokenCount(^uint64(0))}, ContextSeq: 2}},
 			wantErrAs: &content.UsageOverflowError{},
 		},
 	}
@@ -264,7 +264,7 @@ func TestCatalogRepairRestoresLoopUsageMetadata(t *testing.T) {
 			if err != nil {
 				t.Fatalf("RepairCatalog() error = %v", err)
 			}
-			want := []LoopUsageMeta{{LoopID: loopID, Runtime: runtime, RuntimeSeq: 2, RuntimeValueSeq: 2, CumulativeUsage: usage}}
+			want := []LoopUsageMeta{{LoopID: loopID, Runtime: runtime, RuntimeSeq: 2, RuntimeValueSeq: 2, CumulativeUsage: usage, ContextSeq: 3}}
 			if !reflect.DeepEqual(meta.Loops, want) {
 				t.Fatalf("repaired Loops = %#v, want %#v", meta.Loops, want)
 			}
@@ -300,13 +300,13 @@ func TestCatalogRepairFoldsLegacyLifecycleWire(t *testing.T) {
 			name:       "old inference wire migrates into repaired runtime metadata",
 			seed:       event.LoopStarted{Header: event.Header{Coordinates: identity.Coordinates{SessionID: sessionID, LoopID: loopID}}},
 			legacyWire: `{"type":"LoopInferenceChanged"` + prefix + `,"model":{"Provider":"legacy","Name":"legacy-model","Caps":{"MaxContext":64000}},"effort":"low"}`,
-			want:       LoopUsageMeta{LoopID: loopID, Runtime: migrated, RuntimeSeq: 3, RuntimeValueSeq: 3},
+			want:       LoopUsageMeta{LoopID: loopID, Runtime: migrated, RuntimeSeq: 3, RuntimeValueSeq: 3, ContextSeq: 3},
 		},
 		{
 			name:       "old mode wire preserves known runtime while advancing ordering",
 			seed:       event.LoopStarted{Header: event.Header{Coordinates: identity.Coordinates{SessionID: sessionID, LoopID: loopID}}, Runtime: current},
 			legacyWire: `{"type":"LoopModeChanged"` + prefix + `,"previous_mode":"plan","mode":"build"}`,
-			want:       LoopUsageMeta{LoopID: loopID, Runtime: current, RuntimeSeq: 3, RuntimeValueSeq: 2},
+			want:       LoopUsageMeta{LoopID: loopID, Runtime: current, RuntimeSeq: 3, RuntimeValueSeq: 2, ContextSeq: 3},
 		},
 	}
 	for _, tt := range tests {

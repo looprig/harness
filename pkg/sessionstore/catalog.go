@@ -165,11 +165,13 @@ type LoopUsageMeta struct {
 	// delayed known values to converge to the highest known sequence boundedly.
 	RuntimeValueSeq uint64        `json:"runtime_value_seq,omitempty"`
 	CumulativeUsage content.Usage `json:"cumulative_usage,omitzero"`
-	// ContextSeq is the sequence that supplied CurrentContext. Invalidation clears
-	// both fields; existing lifecycle/step sequence state rejects delayed older
-	// measurements without materializing context metadata in legacy projections.
-	ContextSeq     uint64                   `json:"context_seq,omitempty"`
-	CurrentContext event.ContextMeasurement `json:"current_context,omitzero"`
+	// ContextSeq is the highest context-relevant lifecycle, mutation, or
+	// measurement sequence observed for this loop. ContextValueSeq identifies the
+	// event supplying CurrentContext. Invalidation preserves the former watermark
+	// while clearing only the value sequence and measurement.
+	ContextSeq      uint64                   `json:"context_seq,omitempty"`
+	ContextValueSeq uint64                   `json:"context_value_seq,omitempty"`
+	CurrentContext  event.ContextMeasurement `json:"current_context,omitzero"`
 }
 
 // WorkspacePointerSource identifies the transition that selected CurrentWorkspace.
@@ -298,17 +300,21 @@ const (
 	CatalogMetaFieldCumulativeUsage CatalogMetaField = "Loops.CumulativeUsage"
 	CatalogMetaFieldCurrentContext  CatalogMetaField = "Loops.CurrentContext"
 	CatalogMetaFieldContextSeq      CatalogMetaField = "Loops.ContextSeq"
+	CatalogMetaFieldContextValueSeq CatalogMetaField = "Loops.ContextValueSeq"
 )
 
 // CatalogMetaRule identifies a semantic catalog invariant.
 type CatalogMetaRule string
 
 const (
-	CatalogMetaRuleRequired       CatalogMetaRule = "must be set"
-	CatalogMetaRuleSortedUnique   CatalogMetaRule = "must be sorted and unique"
-	CatalogMetaRuleInvalid        CatalogMetaRule = "is invalid"
-	CatalogMetaRuleExceedsRuntime CatalogMetaRule = "must not exceed RuntimeSeq"
-	CatalogMetaRuleLegacyValue    CatalogMetaRule = "must be zero when Runtime is absent"
+	CatalogMetaRuleRequired        CatalogMetaRule = "must be set"
+	CatalogMetaRuleSortedUnique    CatalogMetaRule = "must be sorted and unique"
+	CatalogMetaRuleInvalid         CatalogMetaRule = "is invalid"
+	CatalogMetaRuleExceedsRuntime  CatalogMetaRule = "must not exceed RuntimeSeq"
+	CatalogMetaRuleLegacyValue     CatalogMetaRule = "must be zero when Runtime is absent"
+	CatalogMetaRuleExceedsContext  CatalogMetaRule = "must not exceed ContextSeq"
+	CatalogMetaRuleNotAfterRuntime CatalogMetaRule = "must be newer than RuntimeSeq"
+	CatalogMetaRuleContextAbsent   CatalogMetaRule = "must be zero when CurrentContext is absent"
 )
 
 // CatalogMetaValidationError reports an invalid bounded loop projection. The
@@ -587,7 +593,7 @@ func applyEvent(meta SessionMeta, ev event.Event, seq uint64, now CatalogClock) 
 		meta.Loops = putLoopRuntime(meta.Loops, e.LoopID, e.Runtime, seq)
 	case event.ContextMeasured:
 		meta.SessionID = e.SessionID
-		if seq != 0 && contextMeasurementObsolete(meta, e.LoopID, seq) {
+		if contextMeasurementObsolete(meta.Loops, e.LoopID, seq) {
 			changed = false
 			break
 		}
@@ -665,6 +671,7 @@ func putLoopRuntime(loops []LoopUsageMeta, loopID uuid.UUID, runtime event.Model
 	}
 	if seq == 0 {
 		if updated[index].RuntimeSeq != 0 {
+			invalidateLoopContext(&updated[index], seq)
 			return updated
 		}
 	} else if updated[index].RuntimeSeq != 0 && seq <= updated[index].RuntimeSeq {
@@ -676,13 +683,11 @@ func putLoopRuntime(loops []LoopUsageMeta, loopID uuid.UUID, runtime event.Model
 			updated[index].Runtime = runtime
 			updated[index].RuntimeValueSeq = seq
 		}
+		invalidateLoopContext(&updated[index], seq)
 		return updated
 	}
 	updated[index].RuntimeSeq = seq
-	if updated[index].CurrentContext != (event.ContextMeasurement{}) && (seq == 0 || seq > updated[index].ContextSeq) {
-		updated[index].CurrentContext = event.ContextMeasurement{}
-		updated[index].ContextSeq = 0
-	}
+	invalidateLoopContext(&updated[index], seq)
 	if runtime != (event.ModelRuntime{}) {
 		updated[index].Runtime = runtime
 		updated[index].RuntimeValueSeq = seq
@@ -700,40 +705,48 @@ func putLoopContext(loops []LoopUsageMeta, loopID uuid.UUID, measurement event.C
 		updated = insertLoopUsage(updated, index, LoopUsageMeta{LoopID: loopID})
 	}
 	if measurement == (event.ContextMeasurement{}) {
-		if seq == 0 || updated[index].ContextSeq == 0 || seq > updated[index].ContextSeq {
-			updated[index].CurrentContext = event.ContextMeasurement{}
-			updated[index].ContextSeq = 0
-		}
+		invalidateLoopContext(&updated[index], seq)
 		return updated
 	}
 	if seq == 0 {
-		if updated[index].ContextSeq != 0 {
+		if updated[index].ContextSeq != 0 || updated[index].ContextValueSeq != 0 {
 			return updated
 		}
-	} else if updated[index].ContextSeq != 0 && seq <= updated[index].ContextSeq {
+	} else if (updated[index].ContextSeq != 0 && seq <= updated[index].ContextSeq) ||
+		(updated[index].ContextValueSeq != 0 && seq <= updated[index].ContextValueSeq) {
 		return updated
 	}
 	updated[index].CurrentContext = measurement
 	updated[index].ContextSeq = seq
+	updated[index].ContextValueSeq = seq
 	return updated
 }
 
-func contextMeasurementObsolete(meta SessionMeta, loopID uuid.UUID, seq uint64) bool {
-	index, found := loopUsageIndex(meta.Loops, loopID)
+func invalidateLoopContext(loop *LoopUsageMeta, seq uint64) {
+	if seq == 0 {
+		if loop.ContextSeq != 0 {
+			return
+		}
+	} else if loop.ContextSeq != 0 && seq <= loop.ContextSeq {
+		return
+	}
+	loop.ContextSeq = seq
+	loop.ContextValueSeq = 0
+	loop.CurrentContext = event.ContextMeasurement{}
+}
+
+func contextMeasurementObsolete(loops []LoopUsageMeta, loopID uuid.UUID, seq uint64) bool {
+	if seq == 0 {
+		return true
+	}
+	index, found := loopUsageIndex(loops, loopID)
 	if !found {
 		return false
 	}
-	loop := meta.Loops[index]
-	if loop.ContextSeq != 0 && seq <= loop.ContextSeq {
-		return true
-	}
-	if loop.RuntimeSeq != 0 && seq <= loop.RuntimeSeq {
-		return true
-	}
-	if meta.LastStep != nil && meta.LastStep.JournalSeq >= seq {
-		return true
-	}
-	return false
+	loop := loops[index]
+	return (loop.ContextSeq != 0 && seq <= loop.ContextSeq) ||
+		(loop.ContextValueSeq != 0 && seq <= loop.ContextValueSeq) ||
+		(loop.RuntimeSeq != 0 && seq <= loop.RuntimeSeq)
 }
 
 func cloneLoopUsage(loops []LoopUsageMeta) []LoopUsageMeta {
@@ -1139,13 +1152,19 @@ func validateSessionMeta(meta SessionMeta) error {
 		if err := loop.CumulativeUsage.Validate(); err != nil {
 			return &CatalogMetaValidationError{LoopIndex: i, Field: CatalogMetaFieldCumulativeUsage, Rule: CatalogMetaRuleInvalid, Cause: err}
 		}
+		if loop.ContextValueSeq > loop.ContextSeq {
+			return &CatalogMetaValidationError{LoopIndex: i, Field: CatalogMetaFieldContextValueSeq, Rule: CatalogMetaRuleExceedsContext}
+		}
 		if loop.CurrentContext == (event.ContextMeasurement{}) {
-			if loop.ContextSeq != 0 {
-				return &CatalogMetaValidationError{LoopIndex: i, Field: CatalogMetaFieldContextSeq, Rule: CatalogMetaRuleLegacyValue}
+			if loop.ContextValueSeq != 0 {
+				return &CatalogMetaValidationError{LoopIndex: i, Field: CatalogMetaFieldContextValueSeq, Rule: CatalogMetaRuleContextAbsent}
 			}
 		} else {
-			if loop.ContextSeq == 0 {
-				return &CatalogMetaValidationError{LoopIndex: i, Field: CatalogMetaFieldContextSeq, Rule: CatalogMetaRuleRequired}
+			if loop.ContextValueSeq == 0 {
+				return &CatalogMetaValidationError{LoopIndex: i, Field: CatalogMetaFieldContextValueSeq, Rule: CatalogMetaRuleRequired}
+			}
+			if loop.ContextValueSeq <= loop.RuntimeSeq {
+				return &CatalogMetaValidationError{LoopIndex: i, Field: CatalogMetaFieldContextValueSeq, Rule: CatalogMetaRuleNotAfterRuntime}
 			}
 			if err := loop.CurrentContext.Validate(); err != nil {
 				return &CatalogMetaValidationError{LoopIndex: i, Field: CatalogMetaFieldCurrentContext, Rule: CatalogMetaRuleInvalid, Cause: err}
