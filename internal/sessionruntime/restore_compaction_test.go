@@ -254,6 +254,54 @@ func TestPlanCompactWaiterRepairs(t *testing.T) {
 			orphanRejected(uuid.UUID{0xd7}, event.CompactRejectControlLaneFull),
 			orphanRejected(uuid.UUID{0xd8}, event.CompactRejectInterrupted),
 		}},
+		{name: "multiple orphan lane-full rejections on distinct commands are valid", events: []event.Event{
+			orphanRejected(uuid.UUID{0xda}, event.CompactRejectControlLaneFull),
+			orphanRejected(uuid.UUID{0xdb}, event.CompactRejectControlLaneFull),
+		}},
+		{name: "multiple orphan interrupted rejections are one valid disposition", events: []event.Event{
+			orphanRejected(uuid.UUID{0xdc}, event.CompactRejectInterrupted),
+			orphanRejected(uuid.UUID{0xdd}, event.CompactRejectInterrupted),
+		}},
+		{name: "multiple orphan shutting-down rejections are one valid disposition", events: []event.Event{
+			orphanRejected(uuid.UUID{0xde}, event.CompactRejectShuttingDown),
+			orphanRejected(uuid.UUID{0xdf}, event.CompactRejectShuttingDown),
+		}},
+		{name: "orphan lane-full may coexist with shutting-down disposition", events: []event.Event{
+			orphanRejected(uuid.UUID{0xe0}, event.CompactRejectControlLaneFull),
+			orphanRejected(uuid.UUID{0xe1}, event.CompactRejectShuttingDown),
+		}},
+		{
+			name: "orphan attempt spanning loop ownership is corrupt",
+			events: []event.Event{
+				orphanRejected(uuid.UUID{0xe2}, event.CompactRejectControlLaneFull),
+				func() event.Event {
+					value := orphanRejected(uuid.UUID{0xe3}, event.CompactRejectInterrupted)
+					value.Coordinates.LoopID = uuid.UUID{0xf1}
+					return value
+				}(),
+			},
+			wantKind: restoredCompactionWaiterMismatch,
+		},
+		{
+			name: "orphan attempt spanning session ownership is corrupt",
+			events: []event.Event{
+				orphanRejected(uuid.UUID{0xe4}, event.CompactRejectInterrupted),
+				func() event.Event {
+					value := orphanRejected(uuid.UUID{0xe5}, event.CompactRejectInterrupted)
+					value.Coordinates.SessionID = uuid.UUID{0xf2}
+					return value
+				}(),
+			},
+			wantKind: restoredCompactionWaiterMismatch,
+		},
+		{
+			name: "orphan attempt with interrupted and shutting-down dispositions is corrupt",
+			events: []event.Event{
+				orphanRejected(uuid.UUID{0xe6}, event.CompactRejectInterrupted),
+				orphanRejected(uuid.UUID{0xe7}, event.CompactRejectShuttingDown),
+			},
+			wantKind: restoredCompactionWaiterMismatch,
+		},
 		{
 			name:     "orphan resolved outcome is corrupt",
 			events:   []event.Event{orphanResolved},

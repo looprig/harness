@@ -435,6 +435,12 @@ type restoredCompactionOutcome struct {
 	event event.Event
 }
 
+type restoredCompactionOrphanOwnership struct {
+	sessionID   uuid.UUID
+	loopID      uuid.UUID
+	disposition event.CompactRejectReason
+}
+
 // planCompactWaiterRepairs validates canonical terminal uniqueness and returns
 // only terminal members whose exact durable reply is absent. It is a pure fold:
 // the authoritative replay remains untouched and in its original order.
@@ -443,6 +449,7 @@ func planCompactWaiterRepairs(events []event.Event) ([]event.Event, error) {
 	ordered := make([]restoredCompactionTerminal, 0)
 	outcomes := make(map[restoredCompactionWaiterKey][]event.Event)
 	outcomeOrder := make([]restoredCompactionOutcome, 0)
+	orphanOwnership := make(map[event.CompactAttemptID]restoredCompactionOrphanOwnership)
 	for _, ev := range events {
 		switch typed := ev.(type) {
 		case event.CompactionCommitted:
@@ -496,11 +503,14 @@ func planCompactWaiterRepairs(events []event.Event) ([]event.Event, error) {
 		key := outcome.key
 		terminal, hasTerminal := terminals[key.attempt]
 		if !hasTerminal {
-			if !restoredCompactionOrphanAllowed(outcome.event) {
+			current, seen := orphanOwnership[key.attempt]
+			next, allowed := advanceRestoredCompactionOrphanOwnership(current, seen, outcome.event)
+			if !allowed {
 				return nil, &restoredCompactionError{
 					Kind: restoredCompactionWaiterMismatch, AttemptID: key.attempt, CommandID: key.command,
 				}
 			}
+			orphanOwnership[key.attempt] = next
 			continue
 		}
 		if restoredCompactionHasWaiter(terminal.waiters, key.command) {
@@ -515,17 +525,34 @@ func planCompactWaiterRepairs(events []event.Event) ([]event.Event, error) {
 	return repairs, nil
 }
 
-func restoredCompactionOrphanAllowed(outcome event.Event) bool {
+func advanceRestoredCompactionOrphanOwnership(
+	current restoredCompactionOrphanOwnership,
+	hasCurrent bool,
+	outcome event.Event,
+) (restoredCompactionOrphanOwnership, bool) {
 	rejected, ok := outcome.(event.CompactWaiterRejected)
 	if !ok {
-		return false
+		return current, false
 	}
 	switch rejected.Reason {
 	case event.CompactRejectInterrupted, event.CompactRejectShuttingDown, event.CompactRejectControlLaneFull:
-		return true
 	default:
-		return false
+		return current, false
 	}
+	if !hasCurrent {
+		current.sessionID = rejected.SessionID
+		current.loopID = rejected.LoopID
+	} else if current.sessionID != rejected.SessionID || current.loopID != rejected.LoopID {
+		return current, false
+	}
+	if rejected.Reason == event.CompactRejectControlLaneFull {
+		return current, true
+	}
+	if current.disposition != event.CompactRejectUnspecified && current.disposition != rejected.Reason {
+		return current, false
+	}
+	current.disposition = rejected.Reason
+	return current, true
 }
 
 func restoredCompactionHasWaiter(waiters []uuid.UUID, commandID uuid.UUID) bool {
