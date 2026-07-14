@@ -2053,9 +2053,10 @@ type shutdownTarget struct {
 //     and blocking activity release through Controller.Drained.
 //  5. Stop/join checkpoints and offload GC, append SessionStopped/stop the hub,
 //     release root/session leases, and cancel sessionCtx last.
-//  6. Every owned phase has a private deadline derived from validated component
-//     bounds; a phase timeout is typed, hard-cancels loops where applicable, and
-//     cannot suppress later teardown. Caller cancellation is diagnostic only.
+//  6. Loop/checkpoint/hub phases have private deadlines derived from validated
+//     component bounds. Hustle audit, finalization, and worker drain use their own
+//     trusted inner bounds and are always joined; an outer deadline never detaches
+//     owned cleanup. Caller cancellation is diagnostic only.
 //
 // Concurrent and repeated calls join one teardown owner and receive the same cleanup
 // result, augmented with each caller's own context error after cleanup completes.
@@ -2109,11 +2110,11 @@ func (s *Session) shutdown() error {
 	s.activeMu.Unlock()
 	timeouts := s.resolveShutdownTimeouts(snapshot)
 	failures := make([]error, 0, 6)
-	failures = append(failures, s.closeHustles(shutdownRoot, timeouts.hustleClose))
+	failures = append(failures, s.closeHustles(shutdownRoot, timeouts.hustle))
 	targets, sendErr := s.sendLoopShutdowns(shutdownRoot, snapshot, timeouts.loopSend)
 	failures = append(failures, sendErr)
 	failures = append(failures, s.waitLoopShutdowns(shutdownRoot, snapshot, targets, timeouts.loopDrain))
-	failures = append(failures, s.waitHustlesDrained(shutdownRoot, timeouts.hustleDrain))
+	s.waitHustlesDrained()
 
 	// From here onward every phase gets a fresh private deadline. A timeout in one
 	// component therefore cannot suppress checkpoint, durable-stop, or lease cleanup.

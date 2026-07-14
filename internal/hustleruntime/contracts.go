@@ -72,9 +72,9 @@ type ActivityLease interface {
 	Release(context.Context) error
 }
 
-// FinalizerContextDecorator adds consumer-owned, non-capability metadata to the
-// trusted finalizer context. The runtime never receives the consumer object that
-// interprets the marker.
+// FinalizerContextDecorator adds consumer-owned, non-capability metadata while
+// preserving the supplied trusted context's values and deadline. The runtime
+// never receives the consumer object that interprets the marker.
 type FinalizerContextDecorator interface {
 	DecorateFinalizerContext(context.Context) context.Context
 }
@@ -84,5 +84,8 @@ type FinalizerContextDecorator interface {
 type ValidateResult func(context.Context, hustle.Result) error
 
 // Finalizer is the consumer-owned product commit callback. Every owned run calls
-// it exactly once; a pre-ownership rejection never calls it.
+// it exactly once; a pre-ownership rejection never calls it. Trusted production
+// adapters must preserve and honor the supplied context when delegating. They are
+// built from focused product capability and must never capture a Session,
+// Shutdown function, or other generic session-control capability.
 type Finalizer func(context.Context, hustle.Outcome) error

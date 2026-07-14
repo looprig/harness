@@ -23,6 +23,40 @@ func testHustleLimits() HustleLimits {
 	}
 }
 
+func TestSessionHustleFinalizerContextPreservesTrustedContext(t *testing.T) {
+	t.Parallel()
+	type contextValueKey struct{}
+	tests := []struct {
+		name string
+	}{
+		{name: "deadline cancellation values and owner marker survive decoration"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			session := &Session{}
+			deadline := time.Now().Add(time.Minute)
+			root := context.WithValue(context.Background(), contextValueKey{}, "preserved")
+			ctx, cancel := context.WithDeadline(root, deadline)
+			decorated := (sessionHustleFinalizerContext{session: session}).DecorateFinalizerContext(ctx)
+			gotDeadline, ok := decorated.Deadline()
+			if !ok || !gotDeadline.Equal(deadline) {
+				t.Fatalf("decorated deadline = (%v,%t), want %v,true", gotDeadline, ok, deadline)
+			}
+			if got := decorated.Value(contextValueKey{}); got != "preserved" {
+				t.Fatalf("decorated value = %v, want preserved", got)
+			}
+			if !hustleFinalizerOwnsSession(decorated, session) {
+				t.Fatal("decorated context lacks exact session owner marker")
+			}
+			cancel()
+			if !errors.Is(decorated.Err(), context.Canceled) {
+				t.Fatalf("decorated context error = %v, want cancellation", decorated.Err())
+			}
+		})
+	}
+}
+
 func testHustleDefinition(t *testing.T, name hustle.Name) hustle.Definition {
 	t.Helper()
 	definition, err := hustle.Define(

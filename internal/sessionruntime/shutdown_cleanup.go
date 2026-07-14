@@ -12,10 +12,8 @@ import (
 type ShutdownCleanupPhase string
 
 const (
-	ShutdownCleanupHustleClose     ShutdownCleanupPhase = "hustle_close"
 	ShutdownCleanupLoopSend        ShutdownCleanupPhase = "loop_send"
 	ShutdownCleanupLoopDrain       ShutdownCleanupPhase = "loop_drain"
-	ShutdownCleanupHustleDrain     ShutdownCleanupPhase = "hustle_drain"
 	ShutdownCleanupCheckpointDrain ShutdownCleanupPhase = "checkpoint_drain"
 	ShutdownCleanupHubStop         ShutdownCleanupPhase = "hub_stop"
 )
@@ -35,12 +33,11 @@ func (e *ShutdownCleanupTimeoutError) Error() string {
 func (e *ShutdownCleanupTimeoutError) Unwrap() error { return e.Cause }
 
 type shutdownCleanupTimeouts struct {
-	hustleClose time.Duration
-	loopSend    time.Duration
-	loopDrain   time.Duration
-	hustleDrain time.Duration
-	checkpoint  time.Duration
-	hub         time.Duration
+	hustle     time.Duration
+	loopSend   time.Duration
+	loopDrain  time.Duration
+	checkpoint time.Duration
+	hub        time.Duration
 }
 
 func (s *Session) resolveShutdownTimeouts(snapshot []loopSnapshot) shutdownCleanupTimeouts {
@@ -55,20 +52,19 @@ func (s *Session) resolveShutdownTimeouts(snapshot []loopSnapshot) shutdownClean
 		checkpointTimeout = durationAdd(base, s.snapshotPolicy.Timeout)
 	}
 	derived := shutdownCleanupTimeouts{
-		hustleClose: hustleTimeout, loopSend: loopTimeout, loopDrain: loopTimeout,
-		hustleDrain: hustleTimeout, checkpoint: checkpointTimeout, hub: base,
+		hustle: hustleTimeout, loopSend: loopTimeout, loopDrain: loopTimeout,
+		checkpoint: checkpointTimeout, hub: base,
 	}
 	return derived.withOverrides(s.shutdownTimeouts)
 }
 
 func (t shutdownCleanupTimeouts) withOverrides(overrides shutdownCleanupTimeouts) shutdownCleanupTimeouts {
 	return shutdownCleanupTimeouts{
-		hustleClose: timeoutOverride(t.hustleClose, overrides.hustleClose),
-		loopSend:    timeoutOverride(t.loopSend, overrides.loopSend),
-		loopDrain:   timeoutOverride(t.loopDrain, overrides.loopDrain),
-		hustleDrain: timeoutOverride(t.hustleDrain, overrides.hustleDrain),
-		checkpoint:  timeoutOverride(t.checkpoint, overrides.checkpoint),
-		hub:         timeoutOverride(t.hub, overrides.hub),
+		hustle:     timeoutOverride(t.hustle, overrides.hustle),
+		loopSend:   timeoutOverride(t.loopSend, overrides.loopSend),
+		loopDrain:  timeoutOverride(t.loopDrain, overrides.loopDrain),
+		checkpoint: timeoutOverride(t.checkpoint, overrides.checkpoint),
+		hub:        timeoutOverride(t.hub, overrides.hub),
 	}
 }
 
@@ -91,7 +87,7 @@ func maxLoopDrainTimeout(snapshot []loopSnapshot) time.Duration {
 
 func (s *Session) hustleCleanupTimeout() time.Duration {
 	perRun := durationAdd(s.hustleLimits.WorkerDrainTimeout, s.hustleLimits.FinalizationTimeout)
-	perRun = durationAdd(perRun, durationMultiply(s.hustleLimits.AuditTimeout, 2))
+	perRun = durationAdd(perRun, durationMultiply(s.hustleLimits.AuditTimeout, 4))
 	var timeout time.Duration
 	for _, capacity := range []int{
 		s.hustleLimits.BlockingConcurrent, s.hustleLimits.BlockingQueued,
@@ -144,14 +140,10 @@ func (s *Session) closeHustles(root context.Context, timeout time.Duration) erro
 	}
 	ctx, cancel := cleanupContext(root, timeout)
 	defer cancel()
-	result := make(chan error, 1)
-	go func() { result <- s.hustleController.Close(ctx) }()
-	select {
-	case err := <-result:
-		return err
-	case <-ctx.Done():
-		return cleanupTimeoutError(ShutdownCleanupHustleClose, timeout, ctx.Err())
-	}
+	// Close may synchronously finalize queued ownership. Its trusted callbacks
+	// carry their own audit/finalization deadlines; this outer context is input,
+	// never authorization to detach the session from owned cleanup.
+	return s.hustleController.Close(ctx)
 }
 
 func (s *Session) sendLoopShutdowns(root context.Context, snapshot []loopSnapshot, timeout time.Duration) ([]shutdownTarget, error) {
@@ -216,18 +208,11 @@ func (s *Session) cancelLoopSnapshot(snapshot []loopSnapshot) {
 	}
 }
 
-func (s *Session) waitHustlesDrained(root context.Context, timeout time.Duration) error {
+func (s *Session) waitHustlesDrained() {
 	if s.hustleController == nil {
-		return nil
+		return
 	}
-	ctx, cancel := cleanupContext(root, timeout)
-	defer cancel()
-	select {
-	case <-s.hustleController.Drained():
-		return nil
-	case <-ctx.Done():
-		return cleanupTimeoutError(ShutdownCleanupHustleDrain, timeout, ctx.Err())
-	}
+	<-s.hustleController.Drained()
 }
 
 func (s *Session) stopCheckpoints(root context.Context, timeout time.Duration) error {

@@ -152,10 +152,12 @@ func (d sessionHustleFinalizerContext) DecorateFinalizerContext(ctx context.Cont
 }
 
 // HustleShutdownReentryError refuses the structurally circular operation in
-// which a session-owned finalizer synchronously waits for the shutdown that is
-// itself waiting for that finalizer. Domain adapters receive focused product
-// capabilities, never a generic Session; the private marker is defense in depth
-// at the trusted callback boundary.
+// which a session-owned finalizer passes its supplied trusted context to the
+// shutdown that is itself waiting for that finalizer. The private marker is
+// exact-context defense in depth, not goroutine identity: a callback that drops
+// the context cannot be detected. Production adapters therefore receive focused
+// product capability only, never Session/Shutdown, and must preserve the callback
+// context just as they must honor its deadline.
 type HustleShutdownReentryError struct{}
 
 func (*HustleShutdownReentryError) Error() string {

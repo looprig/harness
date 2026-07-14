@@ -863,6 +863,146 @@ func TestShutdownHubStopUsesFiniteSessionOwnedDeadline(t *testing.T) {
 	}
 }
 
+func TestShutdownNeverDetachesOwnedHustleCleanupAtOuterBudget(t *testing.T) {
+	tests := []struct {
+		name   string
+		queued bool
+	}{
+		{name: "executing finalizer remains owned"},
+		{name: "queued finalizer remains owned", queued: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			order := &shutdownOrderRecorder{added: make(chan struct{}, 32)}
+			client := &shutdownHustleClient{invoked: make(chan struct{})}
+			s := newShutdownHustleSession(t, client, order)
+			// Shrink only Shutdown's computed outer budget. The already-bound
+			// controller retains its trusted one-second callback bounds.
+			s.constructionAbortTimeout = 15 * time.Millisecond
+			s.hustleLimits = HustleLimits{}
+			finalizerEntered := make(chan struct{})
+			releaseFinalizer := make(chan struct{})
+			defer closeIfOpen(releaseFinalizer)
+
+			run := func(finalizer hustleruntime.Finalizer) <-chan error {
+				result := make(chan error, 1)
+				go func() {
+					result <- s.hustleController.RunAndFinalize(
+						context.Background(),
+						hustle.Request{
+							Name:  "shutdown-order",
+							Cause: identity.Cause{Coordinates: identity.Coordinates{LoopID: mustUUID()}},
+							Input: []byte(`{"version":1}`),
+						},
+						func(context.Context, hustle.Result) error { return nil },
+						finalizer,
+					)
+				}()
+				return result
+			}
+			ownedFinalizer := func(context.Context, hustle.Outcome) error {
+				order.add("owned-finalizer-entered")
+				close(finalizerEntered)
+				<-releaseFinalizer
+				order.add("owned-finalizer-released")
+				return nil
+			}
+			var activeDone <-chan error
+			var ownedDone <-chan error
+			if tt.queued {
+				activeDone = run(func(context.Context, hustle.Outcome) error { return nil })
+				<-client.invoked
+				ownedDone = run(ownedFinalizer)
+				waitForShutdownSteps(t, order, "hustle-started", 2)
+			} else {
+				ownedDone = run(ownedFinalizer)
+				<-client.invoked
+			}
+
+			shutdownDone := make(chan error, 1)
+			go func() { shutdownDone <- s.Shutdown(context.Background()) }()
+			select {
+			case <-finalizerEntered:
+			case err := <-shutdownDone:
+				t.Fatalf("Shutdown returned %v before owned finalizer entered", err)
+			}
+			select {
+			case err := <-shutdownDone:
+				t.Fatalf("Shutdown detached owned finalizer after outer budget: %v", err)
+			case <-time.After(60 * time.Millisecond):
+			}
+			for _, step := range order.snapshot() {
+				if step == "session-stopped" || step == "root-lease-release" || step == "session-lease-release" {
+					t.Fatalf("terminal teardown %q preceded owned finalizer release: %v", step, order.snapshot())
+				}
+			}
+
+			close(releaseFinalizer)
+			if err := <-ownedDone; err == nil {
+				t.Fatal("owned run returned nil after shutdown cancellation")
+			}
+			if activeDone != nil {
+				if err := <-activeDone; err == nil || !errors.Is(err, context.Canceled) {
+					t.Fatalf("active run error = %v, want cancellation", err)
+				}
+			}
+			if err := <-shutdownDone; err != nil {
+				t.Fatalf("Shutdown: %v", err)
+			}
+			steps := order.snapshot()
+			if indexShutdownStep(steps, "owned-finalizer-released") >= indexShutdownStep(steps, "session-idle") ||
+				indexShutdownStep(steps, "session-idle") >= indexShutdownStep(steps, "session-stopped") ||
+				indexShutdownStep(steps, "session-stopped") >= indexShutdownStep(steps, "root-lease-release") ||
+				indexShutdownStep(steps, "root-lease-release") >= indexShutdownStep(steps, "session-lease-release") {
+				t.Fatalf("unsafe owned-cleanup teardown order: %v", steps)
+			}
+		})
+	}
+}
+
+func closeIfOpen(ch chan struct{}) {
+	select {
+	case <-ch:
+	default:
+		close(ch)
+	}
+}
+
+func TestHustleCleanupTimeoutCoversEveryOwnedBlockingPhase(t *testing.T) {
+	const maximumDuration = time.Duration(1<<63 - 1)
+	tests := []struct {
+		name   string
+		limits HustleLimits
+		want   time.Duration
+	}{
+		{
+			name: "four audit phases plus finalization and worker drain per ownership slot",
+			limits: HustleLimits{
+				BlockingConcurrent: 2, BlockingQueued: 3, BackgroundConcurrent: 5, BackgroundQueued: 7,
+				AuditTimeout: 2 * time.Millisecond, FinalizationTimeout: 3 * time.Millisecond, WorkerDrainTimeout: 5 * time.Millisecond,
+			},
+			want: 272 * time.Millisecond,
+		},
+		{name: "zero and negative bounds contribute nothing", limits: HustleLimits{BlockingConcurrent: -1}, want: 0},
+		{
+			name: "duration overflow saturates",
+			limits: HustleLimits{
+				BlockingConcurrent: 2,
+				AuditTimeout:       maximumDuration, FinalizationTimeout: maximumDuration, WorkerDrainTimeout: maximumDuration,
+			},
+			want: maximumDuration,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := &Session{hustleLimits: tt.limits}
+			if got := s.hustleCleanupTimeout(); got != tt.want {
+				t.Fatalf("hustleCleanupTimeout() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
 func waitForShutdownSteps(t *testing.T, order *shutdownOrderRecorder, target string, count int) {
 	t.Helper()
 	for {

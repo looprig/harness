@@ -342,6 +342,18 @@ escape session ownership before the caller commits or rejects the corresponding
 product. The finalizer receives success or failure while drain ownership—and,
 for blocking work, quiescence activity—is still held.
 
+A production finalizer adapter is constructed only from that focused product
+capability. It must not receive, store, or capture `Session`, `Shutdown`, a
+shutdown function, or another generic session-control capability. It must also
+honor and preserve the supplied callback context when delegating; replacing it
+with `context.Background()` violates the same trusted internal contract as
+ignoring its deadline. Session runtime may attach a private context marker that
+refuses exact-context shutdown reentry, but that check is defense in depth—not
+goroutine identity—and cannot detect a callback that deliberately drops the
+context. The type/dependency guard rejects unregistered production
+`RunAndFinalize` consumers; each future registered adapter requires its own
+focused-capability assertion.
+
 ---
 
 ## §3 · Binding and package ownership
@@ -636,6 +648,14 @@ implementations are required and tested to honor their contexts; violating that
 trusted contract is a bug, not a detached teardown mode. The session context is
 canceled only after controller drain, hub stop, and lease-release ordering is
 complete.
+
+The session may derive an outer cleanup budget from the maximum owned-run count
+and the inner bounds (including blocking acquisition, `HustleStarted`, terminal,
+and activity-release audit attempts). That budget bounds the context passed into
+close; expiry never authorizes a detached `Close` goroutine or a timed select on
+`Drained`. Shutdown invokes close synchronously and joins `Drained`
+unconditionally. The finite guarantee comes from the trusted inner
+`AuditTimeout`, `FinalizationTimeout`, and `WorkerDrainTimeout` contracts.
 
 ---
 
