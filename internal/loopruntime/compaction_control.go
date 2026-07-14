@@ -14,6 +14,8 @@ import (
 
 const compactionControlWaiterCapacity = 64
 
+const compactionPriorityCommandCapacity = 8
+
 // CompactionCoordinationErrorKind identifies infrastructure failures that prevent
 // the control actor from creating or durably resolving a compaction obligation.
 type CompactionCoordinationErrorKind string
@@ -106,13 +108,12 @@ type compactionFailureSink interface {
 
 type actorCommandHandler func(command.Command) bool
 
-// arbitrateCompactionBoundary gives a command that is already ready one bounded
-// opportunity to mutate actor control state before compaction is consumed at the
-// simultaneous safe boundary. The ordinary actor select resumes immediately
-// afterward, so a sustained command stream cannot starve step/turn progress.
-func arbitrateCompactionBoundary(commands <-chan command.Command, handle actorCommandHandler, dispatch func()) bool {
+// arbitrateCompactionBoundary gives a priority control that is already ready one
+// bounded opportunity to mutate actor state before compaction is consumed at the
+// simultaneous safe boundary. It never drains or reorders the ordinary FIFO lane.
+func arbitrateCompactionBoundary(priorityCommands <-chan command.Command, handle actorCommandHandler, dispatch func()) bool {
 	select {
-	case cmd, ok := <-commands:
+	case cmd, ok := <-priorityCommands:
 		if !ok || handle(cmd) {
 			return true
 		}

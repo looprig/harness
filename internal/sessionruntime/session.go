@@ -1023,7 +1023,7 @@ func (s *Session) deliverSubagentResult(ctx context.Context, parentLoopID, fromL
 	// the hand-back proceeds. Targets the PARENT loop (the command's delivery target).
 	s.appendCommand(ctx, parentLoopID, cmd)
 	select {
-	case l.CommandSink() <- cmd:
+	case commandSinkFor(l, cmd) <- cmd:
 		return nil
 	case <-l.DoneChan():
 		return &SessionError{Kind: SessionLoopExited}

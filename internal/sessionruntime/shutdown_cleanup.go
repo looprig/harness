@@ -172,7 +172,7 @@ func (s *Session) sendLoopShutdown(ctx context.Context, item loopSnapshot) (shut
 	cmd := command.Shutdown{Header: command.Header{CommandID: id, CreatedAt: s.stampNow()}, Ack: ack}
 	s.appendShutdownCommand(ctx, item.loopID, cmd)
 	select {
-	case item.handle.backend.CommandSink() <- cmd:
+	case commandSinkFor(item.handle.backend, cmd) <- cmd:
 		return shutdownTarget{loop: item.handle.backend, ack: ack}, true, nil
 	case <-item.handle.backend.DoneChan():
 		return shutdownTarget{}, false, nil

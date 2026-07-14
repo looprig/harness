@@ -224,7 +224,7 @@ func (s *Session) fanoutInterrupt(ctx context.Context, snapshot []loopSnapshot, 
 func (s *Session) deliverInterrupt(ctx context.Context, t preparedInterrupt) interruptOutcome {
 	backend := t.handle.backend
 	select {
-	case backend.CommandSink() <- t.cmd:
+	case commandSinkFor(backend, t.cmd) <- t.cmd:
 	case <-backend.DoneChan():
 		return interruptOutcome{}
 	case <-ctx.Done():

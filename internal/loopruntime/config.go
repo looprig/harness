@@ -152,4 +152,9 @@ type runtimeConfig struct {
 	// test can cancel the loop deterministically in the post-drain/pre-commit window
 	// to exercise the draining-buffer abnormal-return sweep.
 	afterDrain func()
+
+	// beforeCompactionBoundary is a test-only synchronization seam invoked by the
+	// actor after selecting a safe boundary but before priority arbitration. It lets
+	// tests make both bounded command lanes ready without timing sleeps.
+	beforeCompactionBoundary func(compactionBoundaryKind)
 }

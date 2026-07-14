@@ -154,6 +154,116 @@ func TestLoopCompactionControlBoundaries(t *testing.T) {
 	}
 }
 
+func TestLoopActorPriorityLaneOutranksOrdinaryContentionAtBoundary(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name       string
+		priority   func(uuid.UUID) command.Command
+		wantReject event.CompactRejectReason
+	}{
+		{
+			name: "interrupt priority lane",
+			priority: func(id uuid.UUID) command.Command {
+				return command.Interrupt{Header: command.Header{CommandID: id}, Ack: make(chan bool, 1)}
+			},
+			wantReject: event.CompactRejectInterrupted,
+		},
+		{
+			name: "shutdown priority lane",
+			priority: func(id uuid.UUID) command.Command {
+				return command.Shutdown{Header: command.Header{CommandID: id}, Ack: make(chan error, 1)}
+			},
+			wantReject: event.CompactRejectShuttingDown,
+		},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			ctx, cancel := context.WithCancel(context.Background())
+			t.Cleanup(cancel)
+			normal := make(chan command.Command, 2)
+			priority := make(chan command.Command, 1)
+			drains := make(chan drainRequest, 1)
+			boundaryEntered := make(chan struct{})
+			boundaryRelease := make(chan struct{})
+			minted := make(chan struct{})
+			var mintOnce sync.Once
+			gen := func() (uuid.UUID, error) {
+				mintOnce.Do(func() { close(minted) })
+				return uuid.UUID{0xa0}, nil
+			}
+			rec := &recordingPublisher{}
+			sink := newRecordingCompactionSink()
+			done := make(chan struct{})
+			internal := make(chan turnResult, 1)
+			cfg := loopConfig{
+				loopCtx:          ctx,
+				cfg:              runtimeConfig{Client: &fakeLLM{}, Model: testModel(), DrainTimeout: 20 * time.Millisecond, idGen: gen, eventFactory: workingFactory(), compactionSink: sink, beforeCompactionBoundary: func(compactionBoundaryKind) { close(boundaryEntered); <-boundaryRelease }},
+				commands:         normal,
+				priorityCommands: priority,
+				gateReg:          make(chan gateRegistration),
+				snapshots:        make(chan snapshotRequest),
+				internal:         internal,
+				commits:          make(chan commitRequest),
+				drains:           drains,
+				admissions:       make(chan admissionResult),
+				done:             done,
+				events:           rec,
+				eventFactory:     workingFactory(),
+				gates:            nopGateRegistrar{},
+			}
+			state := newLoopState(uuid.UUID{0x10}, uuid.UUID{0x20}, Provenance{})
+			state.status = loopRunning
+			state.turnID = uuid.UUID{0x30}
+			state.cancelTurn = func() {}
+			go runLoop(cfg, state)
+
+			normal <- compactCommand(uuid.UUID{1}, time.Date(2026, 7, 14, 12, 0, 0, 0, time.UTC), identity.AgencyUser)
+			<-minted
+			drainReply := make(chan []queuedInput, 1)
+			drains <- drainRequest{reply: drainReply}
+			<-boundaryEntered
+			ordinaryID := uuid.UUID{2}
+			normal <- command.UserInput{Header: command.Header{CommandID: ordinaryID}}
+			priority <- tt.priority(uuid.UUID{3})
+			close(boundaryRelease)
+
+			got := awaitCompactionDisposition(t, sink)
+			if got.Kind != compactionDispositionReject || got.RejectReason != tt.wantReject {
+				t.Fatalf("priority disposition = %+v, want rejection %v", got, tt.wantReject)
+			}
+			if _, ok := <-drainReply; !ok {
+				t.Fatal("drain reply channel closed")
+			}
+			ordinaryReply := awaitReply(t, rec, ordinaryID)
+			switch tt.wantReject {
+			case event.CompactRejectInterrupted:
+				if _, ok := ordinaryReply.(event.InputQueued); !ok {
+					t.Fatalf("ordinary reply = %T, want InputQueued", ordinaryReply)
+				}
+			case event.CompactRejectShuttingDown:
+				if rejected, ok := ordinaryReply.(event.TurnRejected); !ok || rejected.Reason != event.RejectShuttingDown {
+					t.Fatalf("ordinary reply = %+v, want shutting-down TurnRejected", ordinaryReply)
+				}
+			}
+			dispositions, _ := sink.snapshot()
+			if len(dispositions) != 1 {
+				t.Fatalf("dispositions = %v, want one rejection and no start", dispositions)
+			}
+			internal <- turnResult{terminal: event.TurnInterrupted{}}
+			if tt.wantReject == event.CompactRejectInterrupted {
+				cancel()
+			}
+			select {
+			case <-done:
+			case <-time.After(2 * time.Second):
+				t.Fatal("loop actor did not stop")
+			}
+		})
+	}
+}
+
 func TestLoopCompactionLaneFullOutcome(t *testing.T) {
 	t.Parallel()
 	errChecked := errors.New("checked publication failed")

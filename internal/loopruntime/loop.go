@@ -32,6 +32,11 @@ type Loop struct {
 	Commands chan<- command.Command
 	Done     <-chan struct{}
 
+	// priorityCommands is the separately bounded Interrupt/Shutdown lane. Trusted
+	// session dispatch selects it through PriorityCommandSink; ordinary commands
+	// continue to use Commands and retain their existing FIFO channel semantics.
+	priorityCommands chan<- command.Command
+
 	// gateReg is the actor's gate-registration seam. A parked runner (or
 	// RequestUserInput on its behalf) sends a gateRegistration here and waits for
 	// the ack; runLoop installs the gate in loopState.pendingGates before closing
@@ -49,6 +54,14 @@ type Loop struct {
 
 // CommandSink returns the actor's command input.
 func (l *Loop) CommandSink() chan<- command.Command { return l.Commands }
+
+// PriorityCommandSink returns the bounded native Interrupt/Shutdown lane.
+func (l *Loop) PriorityCommandSink() chan<- command.Command {
+	if l.priorityCommands == nil {
+		return l.Commands
+	}
+	return l.priorityCommands
+}
 
 // DoneChan closes when the actor exits.
 func (l *Loop) DoneChan() <-chan struct{} { return l.Done }
@@ -74,6 +87,10 @@ type loopConfig struct {
 	// commands is the actor's inbound command channel (the send side is the public
 	// Loop.Commands). Closing it is a contract violation; stop via Shutdown.
 	commands <-chan command.Command
+
+	// priorityCommands is distinct from commands so emergency control is
+	// identifiable without consuming/reordering an ordinary command at a boundary.
+	priorityCommands <-chan command.Command
 
 	// gateReg is the gate-registration channel. The actor is its sole reader; the
 	// per-turn goroutine hands the SEND side to runTurn so a parked tool can register
@@ -312,6 +329,7 @@ func newLoopWithSeed(loopCtx context.Context, sessionID, loopID uuid.UUID, paren
 	// unconditionally — there is no durable tap to fail).
 	fp, _ := events.(faultProbe)
 	commands := make(chan command.Command)
+	priorityCommands := make(chan command.Command, compactionPriorityCommandCapacity)
 	done := make(chan struct{})
 	// gateReg is unbuffered: registration is synchronous (the runner blocks on the
 	// ack), and the actor is the sole reader, selecting on it alongside commands.
@@ -325,21 +343,22 @@ func newLoopWithSeed(loopCtx context.Context, sessionID, loopID uuid.UUID, paren
 	//   - commits/drains: per-step commit and tool-continuation drain handshakes;
 	//     unbuffered because each is a synchronous request/reply the actor serializes.
 	lc := loopConfig{
-		loopCtx:      loopCtx,
-		cfg:          cfg,
-		commands:     commands,
-		gateReg:      gateReg,
-		snapshots:    snapshots,
-		internal:     make(chan turnResult, 1),
-		commits:      make(chan commitRequest),
-		drains:       make(chan drainRequest),
-		admissions:   make(chan admissionResult),
-		done:         done,
-		events:       events,
-		eventFactory: cfg.eventFactory,
-		gates:        gates,
-		bound:        bound,
-		faultProbe:   fp,
+		loopCtx:          loopCtx,
+		cfg:              cfg,
+		commands:         commands,
+		priorityCommands: priorityCommands,
+		gateReg:          gateReg,
+		snapshots:        snapshots,
+		internal:         make(chan turnResult, 1),
+		commits:          make(chan commitRequest),
+		drains:           make(chan drainRequest),
+		admissions:       make(chan admissionResult),
+		done:             done,
+		events:           events,
+		eventFactory:     cfg.eventFactory,
+		gates:            gates,
+		bound:            bound,
+		faultProbe:       fp,
 	}
 	state := newLoopState(sessionID, loopID, parent)
 	// Seed the current turn-affecting configuration from the resolved runtimeConfig. New
@@ -369,7 +388,7 @@ func newLoopWithSeed(loopCtx context.Context, sessionID, loopID uuid.UUID, paren
 		state.hasContext = seed.HasContext
 	}
 	go runLoop(lc, state)
-	return &Loop{Commands: commands, Done: done, gateReg: gateReg, snapshots: snapshots}, nil
+	return &Loop{Commands: commands, Done: done, priorityCommands: priorityCommands, gateReg: gateReg, snapshots: snapshots}, nil
 }
 
 type loopStatus int
@@ -562,6 +581,7 @@ func runLoop(cfg loopConfig, state loopState) {
 	ctx := cfg.loopCtx
 	config := cfg.cfg
 	commands := cfg.commands
+	priorityCommands := cfg.priorityCommands
 	gateReg := cfg.gateReg
 	snapshots := cfg.snapshots
 	internal := cfg.internal
@@ -1652,7 +1672,21 @@ func runLoop(cfg loopConfig, state loopState) {
 	}
 
 	for {
+		// One bounded priority poll precedes the ordinary select. The actor still
+		// enters the ordinary select every iteration, so an empty priority lane has
+		// zero effect and a sustained control stream cannot exclude ordinary work.
 		select {
+		case cmd, ok := <-priorityCommands:
+			if !ok || handleCommand(cmd) {
+				return
+			}
+		default:
+		}
+		select {
+		case cmd, ok := <-priorityCommands:
+			if !ok || handleCommand(cmd) {
+				return
+			}
 		case cmd, ok := <-commands:
 			if !ok || handleCommand(cmd) {
 				return
@@ -1748,7 +1782,10 @@ func runLoop(cfg loopConfig, state loopState) {
 			// terminal — never silently lost.
 			dispatch := func() { dispatchCompactionBoundary(compactionBoundaryStep) }
 			if compactions.pendingAtBoundary() {
-				if arbitrateCompactionBoundary(commands, handleCommand, dispatch) {
+				if config.beforeCompactionBoundary != nil {
+					config.beforeCompactionBoundary(compactionBoundaryStep)
+				}
+				if arbitrateCompactionBoundary(priorityCommands, handleCommand, dispatch) {
 					return
 				}
 			} else {
@@ -1784,7 +1821,10 @@ func runLoop(cfg loopConfig, state loopState) {
 		case result := <-internal:
 			dispatch := func() { dispatchCompactionBoundary(compactionBoundaryTurn) }
 			if compactions.pendingAtBoundary() {
-				if arbitrateCompactionBoundary(commands, handleCommand, dispatch) {
+				if config.beforeCompactionBoundary != nil {
+					config.beforeCompactionBoundary(compactionBoundaryTurn)
+				}
+				if arbitrateCompactionBoundary(priorityCommands, handleCommand, dispatch) {
 					return
 				}
 			} else {
