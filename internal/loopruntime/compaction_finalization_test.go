@@ -263,9 +263,8 @@ func TestCompactionFinalizerCanonicalizesCommittedPostContextBasis(t *testing.T)
 			})
 			success := &compactionPreparedSuccess{
 				Model: inference.ModelKey{Provider: "test", Model: "compactor"}, RequestFingerprint: [32]byte{1},
-				Summary: validFinalizationSummary(), PostContext: validFinalizationMeasurement(14),
+				Summary: validFinalizationSummary(), PostCount: testCompactionPostCount(validFinalizationMeasurement(14)),
 			}
-			success.PostContext.Basis = event.ContextBasis{}
 
 			terminal, err := finalizer.Finalize(context.Background(), attempt, compactionFinalizationProposal{Success: success})
 			if tt.wantErrKind != "" {
@@ -288,6 +287,70 @@ func TestCompactionFinalizerCanonicalizesCommittedPostContextBasis(t *testing.T)
 			want := event.ContextBasis{Revision: tt.basis.Revision + 1, ThroughEventID: committed.EventID}
 			if committed.PostContext.Basis != want {
 				t.Fatalf("PostContext basis = %+v, want %+v", committed.PostContext.Basis, want)
+			}
+		})
+	}
+}
+
+func TestCompactionFinalizerDerivesPostContextFromSecretFreeTemplate(t *testing.T) {
+	tests := []struct {
+		name string
+	}{
+		{name: "minted terminal identity exclusively determines post context basis and fingerprint"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			publisher := &compactionFinalizationPublisher{}
+			factory := finalizationFactory()
+			request := inference.Request{
+				Model: testModel(), System: "system content must not enter terminal",
+				Messages: content.AgenticMessages{replacementTestMessage("request content must not enter terminal")},
+				Tools:    []inference.Tool{{Name: "secret-tool-shape", Description: "not terminal content", Schema: json.RawMessage(`{"type":"object"}`)}},
+			}
+			counterCapability := contextTestCapability(inference.CountQualityExactLocal)
+			inferenceCapability := contextTestInferenceCapability()
+			template, err := contextFingerprintTemplateForRequest(request, "runtime-revision", counterCapability, inferenceCapability)
+			if err != nil {
+				t.Fatalf("contextFingerprintTemplateForRequest() error = %v", err)
+			}
+			attempt := validFinalizationAttempt()
+			success := &compactionPreparedSuccess{
+				Model: request.Model.Key(), RequestFingerprint: [32]byte{1}, Summary: validFinalizationSummary(),
+				PostCount: compactionPostCount{
+					Model: request.Model.Key(), InputTokens: 17, InputLimit: 80,
+					Quality: inference.CountQualityExactLocal, Fingerprint: template,
+				},
+			}
+			finalizer := newCompactionFinalizer(compactionFinalizerConfig{
+				Publisher: publisher, Factory: factory, SessionID: uuid.UUID{1}, LoopID: uuid.UUID{2},
+				Now: func() time.Time { return attempt.StartedAt.Add(time.Second) },
+			})
+
+			terminal, err := finalizer.Finalize(context.Background(), attempt, compactionFinalizationProposal{Success: success})
+			if err != nil {
+				t.Fatalf("Finalize() error = %v", err)
+			}
+			committed, ok := terminal.(event.CompactionCommitted)
+			if !ok {
+				t.Fatalf("terminal = %T, want CompactionCommitted", terminal)
+			}
+			wantBasis := event.ContextBasis{Revision: attempt.Basis.Revision + 1, ThroughEventID: committed.EventID}
+			wantFingerprint, err := template.Fingerprint(wantBasis)
+			if err != nil {
+				t.Fatalf("Fingerprint() error = %v", err)
+			}
+			if committed.PostContext.Basis != wantBasis || committed.PostContext.RequestFingerprint != wantFingerprint ||
+				committed.PostContext.Model != request.Model.Key() || committed.PostContext.InputTokens != 17 || committed.PostContext.InputLimit != 80 {
+				t.Fatalf("PostContext = %+v, want actor-derived basis/fingerprint and counted fields", committed.PostContext)
+			}
+			encoded, err := json.Marshal(committed)
+			if err != nil {
+				t.Fatalf("json.Marshal(terminal) error = %v", err)
+			}
+			for _, forbidden := range [][]byte{[]byte(request.System), []byte("request content must not enter terminal"), []byte("secret-tool-shape"), []byte("not terminal content")} {
+				if bytes.Contains(encoded, forbidden) {
+					t.Fatalf("terminal contains forbidden request content %q: %s", forbidden, encoded)
+				}
 			}
 		})
 	}
@@ -410,7 +473,24 @@ func validPreparedFinalizationSuccess(seed byte) *compactionPreparedSuccess {
 	measurement := validFinalizationMeasurement(seed)
 	return &compactionPreparedSuccess{
 		Model: measurement.Model, RequestFingerprint: [32]byte{0xf1},
-		Summary: validFinalizationSummary(), PostContext: measurement,
+		Summary: validFinalizationSummary(), PostCount: testCompactionPostCount(measurement),
+	}
+}
+
+func testCompactionPostCount(measurement event.ContextMeasurement) compactionPostCount {
+	model := inference.Model{Provider: measurement.Model.Provider, Name: measurement.Model.Model}
+	template, err := contextFingerprintTemplateForRequest(
+		inference.Request{Model: model, System: "test compaction system"},
+		revisionDigest(nil),
+		contextTestCapability(measurement.Quality),
+		contextTestInferenceCapability(),
+	)
+	if err != nil {
+		panic(err)
+	}
+	return compactionPostCount{
+		Model: measurement.Model, InputTokens: measurement.InputTokens, InputLimit: measurement.InputLimit,
+		Quality: measurement.Quality, Fingerprint: template,
 	}
 }
 

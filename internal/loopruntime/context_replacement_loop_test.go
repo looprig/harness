@@ -57,7 +57,7 @@ func TestLoopCompactionOutcomeAppliesReplacementAfterDurableCommit(t *testing.T)
 		wantSummaryActive bool
 		observeProjection bool
 	}{
-		{name: "success resets actor and turn before continuation directive", wantCommitted: true, wantSummaryActive: true, observeProjection: true},
+		{name: "success resets actor and turn before continuation", wantCommitted: true, wantPrimaryCalls: 1, wantSummaryActive: true, observeProjection: true},
 		{name: "failed fingerprint CAS rejects stale without mutation", mutateSuccess: func(success *compactionPreparedSuccess) {
 			success.RequestFingerprint = [32]byte{0xee}
 		}, wantReject: event.CompactRejectStaleBasis, wantPrimaryCalls: 1},
@@ -71,7 +71,7 @@ func TestLoopCompactionOutcomeAppliesReplacementAfterDurableCommit(t *testing.T)
 			publisher := &compactionTerminalFailurePublisher{recordingPublisher: recorder, err: errors.New("commit append failed")}
 			client := &contextOrderClient{recorder: recorder}
 			counter := &loopContextCounter{
-				capability: contextTestCapability(inference.CountQualityExactLocal), counts: []content.TokenCount{65},
+				capability: contextTestCapability(inference.CountQualityExactLocal), counts: []content.TokenCount{65, 20},
 			}
 			model := testModel()
 			model.Limits = inference.ContextLimits{WindowTokens: 100, MaxInputTokens: 80, MaxOutputTokens: 20}
@@ -109,13 +109,12 @@ func TestLoopCompactionOutcomeAppliesReplacementAfterDurableCommit(t *testing.T)
 			}
 			success := &compactionPreparedSuccess{
 				Model: measured.Measurement.Model, RequestFingerprint: measured.Measurement.RequestFingerprint,
-				Summary: validFinalizationSummary(), PostContext: validFinalizationMeasurement(83),
+				Summary: validFinalizationSummary(), PostCount: testCompactionPostCount(validFinalizationMeasurement(83)),
 			}
-			success.PostContext.Model = measured.Measurement.Model
-			success.PostContext.Basis = event.ContextBasis{}
+			success.PostCount.Model = measured.Measurement.Model
 			if tt.mutateSuccess != nil {
 				tt.mutateSuccess(success)
-				success.PostContext.Model = success.Model
+				success.PostCount.Model = success.Model
 			}
 			if tt.failCommit {
 				publisher.enable()
@@ -146,15 +145,22 @@ func TestLoopCompactionOutcomeAppliesReplacementAfterDurableCommit(t *testing.T)
 				if len(projected) != 1 || !reflect.DeepEqual(projected[0], success.Summary) {
 					t.Fatalf("next actor dispatch observed messages %#v, want only committed summary", projected)
 				}
+				actor.Commands <- command.CancelQueuedInput{Header: command.Header{CommandID: uuid.UUID{85}}, TargetCommandID: queuedID}
+				blockUntilEvents(t, recorder, func(events []event.Event) bool {
+					for _, published := range events {
+						if canceled, ok := published.(event.InputCancelled); ok && canceled.Cause.CommandID == queuedID {
+							return true
+						}
+					}
+					return false
+				})
 				close(replacementRelease)
 			}
 
 			terminal := drainToTerminal(t, recorder)
 			if tt.wantSummaryActive {
-				failed, ok := terminal.(event.TurnFailed)
-				var directive *contextReplacementDirective
-				if !ok || !errors.As(failed.Err, &directive) || directive.AttemptID != disposition.Attempt.AttemptID {
-					t.Fatalf("terminal = %T %+v, want typed replacement continuation directive", terminal, terminal)
+				if _, ok := terminal.(event.TurnDone); !ok {
+					t.Fatalf("terminal = %T %+v, want TurnDone after replacement continuation", terminal, terminal)
 				}
 			}
 			if tt.failCommit {
@@ -237,7 +243,7 @@ func TestLoopMalformedStartedCompactionFinalizesInternalRejection(t *testing.T) 
 		{
 			name: "post context model differs from success model",
 			mutate: func(result contextCompactionAwaitResult) contextCompactionAwaitResult {
-				result.Proposal.Success.PostContext.Model = inference.ModelKey{Provider: "test", Model: "different"}
+				result.Proposal.Success.PostCount.Model = inference.ModelKey{Provider: "test", Model: "different"}
 				return result
 			},
 		},
@@ -290,7 +296,7 @@ func TestLoopMalformedStartedCompactionFinalizesInternalRejection(t *testing.T) 
 			}
 			client := &contextOrderClient{recorder: recorder}
 			counter := &loopContextCounter{
-				capability: contextTestCapability(inference.CountQualityExactLocal), counts: []content.TokenCount{65},
+				capability: contextTestCapability(inference.CountQualityExactLocal), counts: []content.TokenCount{65, 20},
 			}
 			model := testModel()
 			model.Limits = inference.ContextLimits{WindowTokens: 100, MaxInputTokens: 80, MaxOutputTokens: 20}
@@ -321,9 +327,9 @@ func TestLoopMalformedStartedCompactionFinalizesInternalRejection(t *testing.T) 
 			}
 			success := &compactionPreparedSuccess{
 				Model: measured.Measurement.Model, RequestFingerprint: measured.Measurement.RequestFingerprint,
-				Summary: replacementTestMessage("malformed summary must not activate"), PostContext: validFinalizationMeasurement(93),
+				Summary: replacementTestMessage("malformed summary must not activate"), PostCount: testCompactionPostCount(validFinalizationMeasurement(93)),
 			}
-			success.PostContext.Model = success.Model
+			success.PostCount.Model = success.Model
 			result := tt.mutate(contextCompactionAwaitResult{
 				Disposition: contextCompactionAwaitCommitted,
 				Proposal:    compactionFinalizationProposal{Success: success},

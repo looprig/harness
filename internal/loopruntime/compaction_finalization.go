@@ -65,7 +65,33 @@ type compactionPreparedSuccess struct {
 	Model              inference.ModelKey
 	RequestFingerprint [32]byte
 	Summary            *content.UserMessage
-	PostContext        event.ContextMeasurement
+	PostCount          compactionPostCount
+}
+
+// compactionPostCount carries only the counted summary-candidate facts and the
+// secret-free request-shape template. The canonical basis and fingerprint do
+// not exist until the actor mints CompactionCommitted.
+type compactionPostCount struct {
+	Model       inference.ModelKey
+	InputTokens content.TokenCount
+	InputLimit  content.TokenCount
+	Quality     inference.CountQuality
+	Fingerprint contextFingerprintTemplate
+}
+
+func (c compactionPostCount) measurement(basis event.ContextBasis) (event.ContextMeasurement, error) {
+	fingerprint, err := c.Fingerprint.Fingerprint(basis)
+	if err != nil {
+		return event.ContextMeasurement{}, err
+	}
+	measurement := event.ContextMeasurement{
+		Basis: basis, Model: c.Model, RequestFingerprint: fingerprint,
+		InputTokens: c.InputTokens, InputLimit: c.InputLimit, Quality: c.Quality,
+	}
+	if err := measurement.Validate(); err != nil {
+		return event.ContextMeasurement{}, err
+	}
+	return measurement, nil
 }
 
 // compactionFinalizationProposal carries exactly one terminal disposition.
@@ -83,12 +109,10 @@ func (p compactionFinalizationProposal) validate() error {
 		if err := p.Success.Model.Validate(); err != nil {
 			return &CompactionFinalizationError{Kind: CompactionFinalizationProposal, Cause: err}
 		}
-		if p.Success.RequestFingerprint == ([32]byte{}) || p.Success.Summary == nil || p.Success.PostContext.Model != p.Success.Model {
+		if p.Success.RequestFingerprint == ([32]byte{}) || p.Success.Summary == nil || p.Success.PostCount.Model != p.Success.Model {
 			return &CompactionFinalizationError{Kind: CompactionFinalizationProposal}
 		}
-		postContext := p.Success.PostContext
-		postContext.Basis = event.ContextBasis{Revision: 1, ThroughEventID: uuid.UUID{1}}
-		if err := postContext.Validate(); err != nil {
+		if _, err := p.Success.PostCount.measurement(event.ContextBasis{Revision: 1, ThroughEventID: uuid.UUID{1}}); err != nil {
 			return &CompactionFinalizationError{Kind: CompactionFinalizationProposal, Cause: err}
 		}
 		return nil
@@ -175,7 +199,7 @@ func (f *compactionFinalizer) buildTerminal(
 		terminal = event.CompactionCommitted{
 			AttemptID: attempt.AttemptID, WaiterCommandIDs: append([]uuid.UUID(nil), attempt.WaiterCommandIDs...),
 			Reason: attempt.Reason, Basis: attempt.Basis, Summary: cloneUserMessage(proposal.Success.Summary),
-			PostContext: proposal.Success.PostContext, Duration: duration,
+			Duration: duration,
 		}
 	} else {
 		terminal = event.CompactionRejected{
@@ -193,9 +217,16 @@ func (f *compactionFinalizer) buildTerminal(
 				Kind: CompactionFinalizationTerminalMint, AttemptID: attempt.AttemptID, Cause: &contextRevisionOverflowError{},
 			}
 		}
-		committed.PostContext.Basis = event.ContextBasis{
+		postBasis := event.ContextBasis{
 			Revision: attempt.Basis.Revision + 1, ThroughEventID: committed.EventID,
 		}
+		postContext, postErr := proposal.Success.PostCount.measurement(postBasis)
+		if postErr != nil {
+			return nil, &CompactionFinalizationError{
+				Kind: CompactionFinalizationTerminalMint, AttemptID: attempt.AttemptID, Cause: postErr,
+			}
+		}
+		committed.PostContext = postContext
 		stamped = committed
 	}
 	if err := event.ValidateEvent(stamped); err != nil {

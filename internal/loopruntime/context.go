@@ -28,6 +28,9 @@ type contextCompactionAwaitResult struct {
 	// Proposal is prepared outside the actor but has no durable authority. The
 	// actor validates it and owns the one canonical terminal append.
 	Proposal compactionFinalizationProposal
+	// ContinuationError is private in-memory evidence for deciding whether a
+	// future primary request may proceed after the canonical rejection.
+	ContinuationError error
 }
 
 type contextCompactionAwaiter interface {
@@ -153,6 +156,7 @@ func (*staleContextMeasurementError) Error() string {
 type contextMeasureRequest struct {
 	ctx                    context.Context
 	request                inference.Request
+	runtimeTail            *content.UserMessage
 	runtimeContextRevision string
 	reply                  chan<- contextMeasureReply
 }
@@ -178,10 +182,11 @@ type contextCompactionOutcomeRequest struct {
 }
 
 type contextCompactionOutcomeReply struct {
-	disposition contextCompactionAwaitDisposition
-	replacement *turnContextReplacement
-	retry       bool
-	err         error
+	disposition       contextCompactionAwaitDisposition
+	replacement       *turnContextReplacement
+	continuationError error
+	retry             bool
+	err               error
 }
 
 type contextAdmissionSettings struct {
@@ -261,17 +266,55 @@ func contextRequestFingerprint(
 	counterCapability inference.CounterCapability,
 	inferenceCapability inference.InferenceCapability,
 ) ([32]byte, error) {
+	template, err := contextFingerprintTemplateForRequest(request, runtimeContextRevision, counterCapability, inferenceCapability)
+	if err != nil {
+		return [32]byte{}, err
+	}
+	return template.Fingerprint(basis)
+}
+
+// contextFingerprintTemplate is the least-privilege request-shape projection
+// safe to carry across compaction finalization. It contains only irreversible
+// revisions and public model/capability descriptors; Basis is supplied only
+// after the actor mints the canonical CompactionCommitted EventID.
+type contextFingerprintTemplate struct {
+	SystemRevision         string
+	ToolPolicyRevision     string
+	Model                  inference.Model
+	RuntimeContextRevision string
+	CounterCapability      inference.CounterCapability
+	InferenceCapability    inference.InferenceCapability
+}
+
+func contextFingerprintTemplateForRequest(
+	request inference.Request,
+	runtimeContextRevision string,
+	counterCapability inference.CounterCapability,
+	inferenceCapability inference.InferenceCapability,
+) (contextFingerprintTemplate, error) {
 	toolShape, err := json.Marshal(struct {
 		Tools    []inference.Tool
 		Override *inference.Sampling
 	}{Tools: request.Tools, Override: request.Override})
 	if err != nil {
-		return [32]byte{}, &loop.RequestFingerprintError{Field: "ToolPolicyRevision", Cause: err}
+		return contextFingerprintTemplate{}, &loop.RequestFingerprintError{Field: "ToolPolicyRevision", Cause: err}
 	}
-	return loop.RequestFingerprint(loop.RequestFingerprintInput{
+	template := contextFingerprintTemplate{
 		SystemRevision: revisionDigest([]byte(request.System)), ToolPolicyRevision: revisionDigest(toolShape),
-		Model: request.Model, Basis: basis, RuntimeContextRevision: runtimeContextRevision,
+		Model: request.Model.Clone(), RuntimeContextRevision: runtimeContextRevision,
 		CounterCapability: counterCapability, InferenceCapability: inferenceCapability,
+	}
+	if _, err := template.Fingerprint(event.ContextBasis{Revision: 1, ThroughEventID: uuid.UUID{1}}); err != nil {
+		return contextFingerprintTemplate{}, err
+	}
+	return template, nil
+}
+
+func (t contextFingerprintTemplate) Fingerprint(basis event.ContextBasis) ([32]byte, error) {
+	return loop.RequestFingerprint(loop.RequestFingerprintInput{
+		SystemRevision: t.SystemRevision, ToolPolicyRevision: t.ToolPolicyRevision,
+		Model: t.Model, Basis: basis, RuntimeContextRevision: t.RuntimeContextRevision,
+		CounterCapability: t.CounterCapability, InferenceCapability: t.InferenceCapability,
 	})
 }
 

@@ -729,7 +729,7 @@ func runLoop(cfg loopConfig, state loopState) {
 		return nil
 	}
 
-	dispatchCompactionBoundary := func(boundary compactionBoundaryKind) bool {
+	dispatchCompactionBoundary := func(boundary compactionBoundaryKind, candidate *compactionExecutionCandidate) bool {
 		if config.compactionSink == nil {
 			return false
 		}
@@ -764,6 +764,11 @@ func runLoop(cfg loopConfig, state loopState) {
 			event.CompactionStarted{AttemptID: attempt.AttemptID, Reason: attempt.Reason, Basis: attempt.Basis},
 			func(inferCtx context.Context) error {
 				invoked = true
+				if candidate != nil {
+					if candidateSink, ok := config.compactionSink.(compactionCandidateSink); ok {
+						return candidateSink.CoordinateCompactionCandidate(inferCtx, disposition, *candidate)
+					}
+				}
 				return config.compactionSink.CoordinateCompaction(inferCtx, disposition)
 			},
 		)
@@ -928,12 +933,12 @@ func runLoop(cfg loopConfig, state loopState) {
 				return nil, &CommitError{Reason: CommitTurnCancelled, Cause: cctx.Err()}
 			}
 		}
-		var measure func(context.Context, inference.Request, string) error
+		var measure func(context.Context, inference.Request, string, *content.UserMessage, bool) error
 		if _, configured := contextSettings(config); configured && config.ContextCounter != nil {
-			measure = func(cctx context.Context, request inference.Request, runtimeRevision string) error {
+			measure = func(cctx context.Context, request inference.Request, runtimeRevision string, runtimeTail *content.UserMessage, continuation bool) error {
 				for {
 					reply := make(chan contextMeasureReply, 1)
-					req := contextMeasureRequest{ctx: cctx, request: request, runtimeContextRevision: runtimeRevision, reply: reply}
+					req := contextMeasureRequest{ctx: cctx, request: request, runtimeTail: cloneUserMessage(runtimeTail), runtimeContextRevision: runtimeRevision, reply: reply}
 					select {
 					case cfg.contextRequests <- req:
 					case <-cctx.Done():
@@ -959,14 +964,14 @@ func runLoop(cfg loopConfig, state loopState) {
 					outcomeRequest := contextCompactionOutcomeRequest{attemptID: measured.attemptID, result: outcome, reply: outcomeReply}
 					select {
 					case cfg.contextOutcomes <- outcomeRequest:
-					case <-cctx.Done():
-						return normalizeContextCountError(request.Model.Key(), config.CounterCapability.Quality, cctx.Err())
+					case <-ctx.Done():
+						return &CompactionCoordinationError{Kind: CompactionCoordinationOutcome, Cause: ctx.Err()}
 					}
 					var disposition contextCompactionOutcomeReply
 					select {
 					case disposition = <-outcomeReply:
-					case <-cctx.Done():
-						return normalizeContextCountError(request.Model.Key(), config.CounterCapability.Quality, cctx.Err())
+					case <-ctx.Done():
+						return &CompactionCoordinationError{Kind: CompactionCoordinationOutcome, Cause: ctx.Err()}
 					}
 					if disposition.err != nil {
 						return disposition.err
@@ -976,6 +981,16 @@ func runLoop(cfg loopConfig, state loopState) {
 					}
 					switch disposition.disposition {
 					case contextCompactionAwaitRejected:
+						if !continuation {
+							return nil
+						}
+						if disposition.continuationError != nil {
+							var summaryTooLarge *loop.SummaryTooLargeError
+							var unknownLimit *loop.ContextLimitUnknownError
+							if errors.As(disposition.continuationError, &summaryTooLarge) || errors.As(disposition.continuationError, &unknownLimit) {
+								return disposition.continuationError
+							}
+						}
 						if measured.measurement.InputTokens >= measured.measurement.InputLimit {
 							return &loop.ContextLimitError{Measurement: measured.measurement}
 						}
@@ -1756,7 +1771,7 @@ func runLoop(cfg loopConfig, state loopState) {
 			// immediately; while a turn is live, the request remains actor-owned until
 			// the next step/turn boundary below.
 			if state.status == loopIdle {
-				dispatchCompactionBoundary(compactionBoundaryTurn)
+				dispatchCompactionBoundary(compactionBoundaryTurn, nil)
 			}
 
 		case command.Interrupt:
@@ -1788,7 +1803,7 @@ func runLoop(cfg loopConfig, state loopState) {
 				c.Ack <- false
 			}
 			if state.status == loopIdle {
-				dispatchCompactionBoundary(compactionBoundaryTurn)
+				dispatchCompactionBoundary(compactionBoundaryTurn, nil)
 			}
 
 		case command.Shutdown:
@@ -1812,7 +1827,7 @@ func runLoop(cfg loopConfig, state loopState) {
 				state.cancelAdmission()
 				state.cancelAdmission = nil
 				returnQueuedInbox(event.CancelTurnInterrupted, uuid.UUID{})
-				dispatchCompactionBoundary(compactionBoundaryTurn)
+				dispatchCompactionBoundary(compactionBoundaryTurn, nil)
 				ackShutdowns(nil)
 				return true
 			}
@@ -1821,7 +1836,7 @@ func runLoop(cfg loopConfig, state loopState) {
 				// (it will never start) before stopping; in practice the inbox is
 				// empty when idle, but this guarantees nothing is silently dropped.
 				returnQueuedInbox(event.CancelTurnInterrupted, uuid.UUID{})
-				dispatchCompactionBoundary(compactionBoundaryTurn)
+				dispatchCompactionBoundary(compactionBoundaryTurn, nil)
 				ackShutdowns(nil)
 				return true
 			}
@@ -1964,6 +1979,37 @@ func runLoop(cfg loopConfig, state loopState) {
 					Current:     tracking.Current,
 				})
 			}
+			executionCandidate := compactionExecutionCandidate{
+				Measurement: result.measurement, Request: result.request.request,
+				RuntimeTail: result.request.runtimeTail, RuntimeRevision: result.request.runtimeContextRevision,
+				Transcript: cloneMessages(state.msgs),
+			}
+			if compactions.pendingAtBoundary() {
+				pending := compactions.pendingAttempt()
+				awaiter, canAwait := config.compactionSink.(contextCompactionAwaiter)
+				if pending == nil || !canAwait {
+					reply(contextMeasureReply{measurement: result.measurement, err: tracking.AdmissionError})
+					continue
+				}
+				if pending.Basis == (event.ContextBasis{}) {
+					if freezeErr := compactions.freezeBasis(pending.AttemptID, result.measurement.Basis); freezeErr != nil {
+						reply(contextMeasureReply{measurement: result.measurement, err: freezeErr})
+						continue
+					}
+				}
+				coordinated := false
+				dispatch := func() { coordinated = dispatchCompactionBoundary(compactionBoundaryStep, &executionCandidate) }
+				if config.beforeCompactionBoundary != nil {
+					config.beforeCompactionBoundary(compactionBoundaryStep)
+				}
+				if arbitrateCompactionBoundary(priorityCommands, handleCommand, dispatch) {
+					return
+				}
+				if coordinated {
+					reply(contextMeasureReply{measurement: result.measurement, attemptID: pending.AttemptID, awaiter: awaiter})
+					continue
+				}
+			}
 			if tracking.AdmissionError != nil {
 				reply(contextMeasureReply{measurement: result.measurement, err: tracking.AdmissionError})
 				continue
@@ -2027,7 +2073,7 @@ func runLoop(cfg loopConfig, state loopState) {
 				continue
 			}
 			coordinated := false
-			dispatch := func() { coordinated = dispatchCompactionBoundary(compactionBoundaryStep) }
+			dispatch := func() { coordinated = dispatchCompactionBoundary(compactionBoundaryStep, &executionCandidate) }
 			if config.beforeCompactionBoundary != nil {
 				config.beforeCompactionBoundary(compactionBoundaryStep)
 			}
@@ -2049,6 +2095,9 @@ func runLoop(cfg loopConfig, state loopState) {
 			if attempt == nil || attempt.AttemptID != outcome.attemptID {
 				outcome.reply <- contextCompactionOutcomeReply{err: &contextCompactionOutcomeError{AttemptID: outcome.attemptID}}
 				continue
+			}
+			if reason := compactions.cancellationRejectReason(); reason != event.CompactRejectUnspecified {
+				outcome.result = rejectedCompactionResult(reason)
 			}
 			settings, configured := contextSettings(config)
 			proposal := outcome.result.Proposal
@@ -2094,7 +2143,8 @@ func runLoop(cfg loopConfig, state loopState) {
 			}
 			retry := configured && settings.Automatic && rejected && rejection.Reason == event.CompactionReasonManual && rejection.Basis == state.contextTracker.currentBasis()
 			outcome.reply <- contextCompactionOutcomeReply{
-				disposition: disposition, replacement: turnReplacement, retry: retry,
+				disposition: disposition, replacement: turnReplacement,
+				continuationError: outcome.result.ContinuationError, retry: retry,
 			}
 
 		case result := <-admissions:
@@ -2162,7 +2212,7 @@ func runLoop(cfg loopConfig, state loopState) {
 			// drained entries are now in draining and are resolved either by their
 			// TurnFoldedInto commit (below) or by returnQueuedInbox on an abnormal
 			// terminal — never silently lost.
-			dispatch := func() { dispatchCompactionBoundary(compactionBoundaryStep) }
+			dispatch := func() { dispatchCompactionBoundary(compactionBoundaryStep, nil) }
 			if compactions.pendingAtBoundary() {
 				if config.beforeCompactionBoundary != nil {
 					config.beforeCompactionBoundary(compactionBoundaryStep)
@@ -2208,7 +2258,7 @@ func runLoop(cfg loopConfig, state loopState) {
 			req.ack <- boundaryErr
 
 		case result := <-internal:
-			dispatch := func() { dispatchCompactionBoundary(compactionBoundaryTurn) }
+			dispatch := func() { dispatchCompactionBoundary(compactionBoundaryTurn, nil) }
 			if compactions.pendingAtBoundary() {
 				if config.beforeCompactionBoundary != nil {
 					config.beforeCompactionBoundary(compactionBoundaryTurn)

@@ -28,6 +28,7 @@ type loopContextCounter struct {
 
 type gatedLoopContextCounter struct {
 	capability inference.CounterCapability
+	counts     []content.TokenCount
 	started    chan inference.Request
 	release    chan struct{}
 	mu         sync.Mutex
@@ -47,7 +48,15 @@ func (c *gatedLoopContextCounter) CountContext(ctx context.Context, request infe
 			return inference.ContextCount{}, ctx.Err()
 		}
 	}
-	return inference.ContextCount{Model: request.Model.Key(), InputTokens: 40, Quality: c.capability.Quality}, nil
+	count := content.TokenCount(40)
+	if len(c.counts) > 0 {
+		index := call
+		if index >= len(c.counts) {
+			index = len(c.counts) - 1
+		}
+		count = c.counts[index]
+	}
+	return inference.ContextCount{Model: request.Model.Key(), InputTokens: count, Quality: c.capability.Quality}, nil
 }
 
 func (c *gatedLoopContextCounter) CounterCapability() inference.CounterCapability {
@@ -222,7 +231,11 @@ func TestLoopContextAdmissionBeforePrimaryInference(t *testing.T) {
 			t.Cleanup(cancel)
 			recorder := &recordingPublisher{}
 			client := &contextOrderClient{recorder: recorder}
-			counter := &loopContextCounter{capability: contextTestCapability(inference.CountQualityExactLocal), counts: []content.TokenCount{tt.count}, err: tt.countErr}
+			counts := []content.TokenCount{tt.count}
+			if tt.name == "automatic soft rejection continues" {
+				counts = append(counts, 40)
+			}
+			counter := &loopContextCounter{capability: contextTestCapability(inference.CountQualityExactLocal), counts: counts, err: tt.countErr}
 			model := testModel()
 			model.Limits = inference.ContextLimits{WindowTokens: 100, MaxInputTokens: 80, MaxOutputTokens: 20}
 			config := runtimeConfig{
@@ -271,7 +284,7 @@ func TestLoopContextAdmissionBeforePrimaryInference(t *testing.T) {
 			if (measured != nil) != tt.wantMeasured {
 				t.Fatalf("ContextMeasured present = %v, want %v", measured != nil, tt.wantMeasured)
 			}
-			if tt.wantPressure != event.PressureUnknown && (pressure == nil || pressure.Current != tt.wantPressure) {
+			if tt.wantPressure != event.PressureUnknown && !hasContextPressure(recorder.events(), tt.wantPressure) {
 				t.Fatalf("ContextPressure = %+v, want current %v", pressure, tt.wantPressure)
 			}
 			if calls > 0 {
@@ -336,8 +349,8 @@ func TestLoopContextAdmissionRecountsAfterSmallerModelChange(t *testing.T) {
 				t.Fatalf("primary inference calls = %d, want only first turn", calls)
 			}
 			models := counter.requestModels()
-			if len(models) != 2 || models[0] != large.Key() || models[1] != smaller.Key() {
-				t.Fatalf("counted models = %+v, want [%+v %+v]", models, large.Key(), smaller.Key())
+			if len(models) != 3 || models[0] != large.Key() || models[1] != large.Key() || models[2] != smaller.Key() {
+				t.Fatalf("counted models = %+v, want [%+v %+v %+v]", models, large.Key(), large.Key(), smaller.Key())
 			}
 		})
 	}
@@ -420,8 +433,8 @@ func TestLoopContextAdmissionRejectsStaleCountAcrossRuntimeChange(t *testing.T) 
 				t.Fatal("second turn produced no terminal")
 			}
 			models := counter.models()
-			if len(models) != 2 || models[0] != base.Key() || models[1] != changed.Key() {
-				t.Fatalf("counted models = %+v, want [%+v %+v]", models, base.Key(), changed.Key())
+			if len(models) != 3 || models[0] != base.Key() || models[1] != changed.Key() || models[2] != changed.Key() {
+				t.Fatalf("counted models = %+v, want [%+v %+v %+v]", models, base.Key(), changed.Key(), changed.Key())
 			}
 		})
 	}
@@ -459,8 +472,15 @@ func TestRestoredLoopAdvancesBasisWithoutCurrentMeasurement(t *testing.T) {
 				t.Fatal("restored turn produced no terminal")
 			}
 			measured, _ := contextEvents(recorder.events())
-			if measured == nil || measured.Measurement.Basis.Revision != restoredBasis.Revision+1 || measured.Measurement.Basis.ThroughEventID == restoredBasis.ThroughEventID {
-				t.Fatalf("restored measurement = %+v, want revision %d through new TurnStarted", measured, restoredBasis.Revision+1)
+			var committedStep event.StepDone
+			for _, value := range recorder.events() {
+				if step, ok := value.(event.StepDone); ok {
+					committedStep = step
+				}
+			}
+			if measured == nil || measured.Measurement.Basis.Revision != restoredBasis.Revision+2 ||
+				measured.Measurement.Basis.ThroughEventID != committedStep.EventID {
+				t.Fatalf("restored measurement = %+v, want revision %d through terminal StepDone %s", measured, restoredBasis.Revision+2, committedStep.EventID)
 			}
 		})
 	}
@@ -481,7 +501,10 @@ func TestLoopAutomaticCompactionRetriesAfterManualOpenedRejection(t *testing.T) 
 			recorder := &recordingPublisher{}
 			client := &contextOrderClient{recorder: recorder}
 			capability := contextTestCapability(inference.CountQualityExactLocal)
-			counter := &gatedLoopContextCounter{capability: capability, started: make(chan inference.Request, 1), release: make(chan struct{})}
+			counter := &gatedLoopContextCounter{
+				capability: capability, counts: []content.TokenCount{40, 40, 20},
+				started: make(chan inference.Request, 1), release: make(chan struct{}),
+			}
 			model := testModel()
 			model.Limits = inference.ContextLimits{WindowTokens: 100, MaxInputTokens: 80, MaxOutputTokens: 20}
 			sink := newContextAwaitSink()
@@ -564,4 +587,13 @@ func contextEvents(events []event.Event) (*event.ContextMeasured, *event.Context
 		}
 	}
 	return measured, pressure
+}
+
+func hasContextPressure(events []event.Event, want event.PressureLevel) bool {
+	for _, value := range events {
+		if pressure, ok := value.(event.ContextPressure); ok && pressure.Current == want {
+			return true
+		}
+	}
+	return false
 }

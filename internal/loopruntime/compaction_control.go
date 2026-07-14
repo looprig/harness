@@ -99,6 +99,10 @@ type compactionDispositionSink interface {
 	CoordinateCompaction(context.Context, compactionDisposition) error
 }
 
+type compactionCandidateSink interface {
+	CoordinateCompactionCandidate(context.Context, compactionDisposition, compactionExecutionCandidate) error
+}
+
 // compactionFailure is the narrow typed result seam that later public waiters can
 // bind to. It never claims a durable rejection was written.
 type compactionFailure struct {
@@ -267,12 +271,22 @@ func (c *compactionControl) markStarted(attemptID event.CompactAttemptID, starte
 }
 
 func (c *compactionControl) interrupt() {
-	if c.pending != nil && c.pending.phase == compactionPhasePending {
+	if c.pending != nil {
 		c.interrupting = true
 	}
 }
 
 func (c *compactionControl) shutdown() { c.shuttingDown = true }
+
+func (c *compactionControl) cancellationRejectReason() event.CompactRejectReason {
+	if c.shuttingDown {
+		return event.CompactRejectShuttingDown
+	}
+	if c.interrupting {
+		return event.CompactRejectInterrupted
+	}
+	return event.CompactRejectUnspecified
+}
 
 func (c *compactionControl) pendingAtBoundary() bool {
 	return c.pending != nil && c.pending.phase == compactionPhasePending

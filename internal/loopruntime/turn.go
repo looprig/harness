@@ -100,7 +100,7 @@ type turnConfig struct {
 	// critical sequence, so already-queued work on any loop cannot advance.
 	admit          func(context.Context) (func(), error)
 	firstAdmission func()
-	measure        func(context.Context, inference.Request, string) error
+	measure        func(context.Context, inference.Request, string, *content.UserMessage, bool) error
 
 	// commit is the durability/event handshake back to the actor. runTurn prepares a
 	// complete step group, but the actor is the only goroutine that mutates
@@ -231,28 +231,25 @@ func runTurn(ctx context.Context, cfg turnConfig, ts turnState) event.Event {
 		return event.TurnFailed{TurnIndex: ts.index, Err: err}
 	}
 
+	candidateMeasured := false
 	for stepIdx := StepIndex(0); ; stepIdx++ {
 		// Request base is the committed history clone + this turn's staged messages,
 		// plus the volatile runtime-context tail (when configured) appended LAST so the
 		// model sees fresh date/cwd/git at the very end of the input every step. The
 		// tail is transient: it is part of the REQUEST only, never of ts.msgs/base, so
 		// committed history never grows with it and the cached System prompt is untouched.
-		req := inference.Request{
-			Model:    cfg.model,
-			System:   cfg.system,
-			Messages: requestMessages(cfg.base, ts.msgs, runtimeTail),
-			Tools:    defs,
-		}
-		if cfg.measure != nil {
-			if err := cfg.measure(ctx, req, runtimeRevision); err != nil {
-				var directive *contextReplacementDirective
-				if errors.As(err, &directive) {
-					applyTurnContextReplacement(&cfg, &ts, directive.Replacement)
-					if cfg.afterContextReplacement != nil {
-						cfg.afterContextReplacement()
-					}
+		req := turnInferenceRequest(cfg, ts, runtimeTail, defs)
+		if candidateMeasured {
+			candidateMeasured = false
+		} else {
+			if directive, measureErr := measureTurnCandidate(ctx, cfg, req, runtimeRevision, runtimeTail, true); measureErr != nil {
+				return measureTurnFailure(ctx, ts.index, measureErr)
+			} else if directive != nil {
+				applyTurnContextReplacement(&cfg, &ts, directive.Replacement)
+				if cfg.afterContextReplacement != nil {
+					cfg.afterContextReplacement()
 				}
-				return event.TurnFailed{TurnIndex: ts.index, Err: err}
+				req = turnInferenceRequest(cfg, ts, runtimeTail, defs)
 			}
 		}
 
@@ -306,6 +303,10 @@ func runTurn(ctx context.Context, cfg turnConfig, ts turnState) event.Event {
 				// The commit handshake was cancelled (Interrupt/Shutdown) before the
 				// actor committed/emitted this final step: treat as interrupt.
 				return event.TurnInterrupted{TurnIndex: ts.index}
+			}
+			candidate := turnInferenceRequest(cfg, ts, runtimeTail, defs)
+			if _, measureErr := measureTurnCandidate(ctx, cfg, candidate, runtimeRevision, runtimeTail, false); measureErr != nil {
+				return measureTurnFailure(ctx, ts.index, measureErr)
 			}
 			return event.TurnDone{TurnIndex: ts.index, Message: cloneAIMessage(aiMsg), Usage: ts.usage}
 		}
@@ -363,6 +364,17 @@ func runTurn(ctx context.Context, cfg turnConfig, ts turnState) event.Event {
 			// already committed stay in loopState.msgs.
 			return event.TurnInterrupted{TurnIndex: ts.index}
 		}
+		candidate := turnInferenceRequest(cfg, ts, runtimeTail, defs)
+		directive, measureErr := measureTurnCandidate(ctx, cfg, candidate, runtimeRevision, runtimeTail, true)
+		if measureErr != nil {
+			return measureTurnFailure(ctx, ts.index, measureErr)
+		}
+		if directive != nil {
+			applyTurnContextReplacement(&cfg, &ts, directive.Replacement)
+			if cfg.afterContextReplacement != nil {
+				cfg.afterContextReplacement()
+			}
+		}
 
 		// Tool-continuation boundary: another LLM request is already required to send
 		// the tool results, so this is the ONLY point where queued input may fold. Pull
@@ -370,6 +382,7 @@ func runTurn(ctx context.Context, cfg turnConfig, ts turnState) event.Event {
 		// AFTER the tool results, and commit a TurnFoldedInto for it. A no-tool final
 		// answer (handled above) never reaches here, so folding cannot extend a turn
 		// past the model's final answer.
+		stagedBeforeFold := len(ts.msgs)
 		if ferr := foldPending(ctx, cfg, &ts); ferr != nil {
 			// The drain or a fold commit was cancelled (Interrupt/Shutdown) before it
 			// completed: treat as interrupt. Committed steps + any already-committed
@@ -377,9 +390,43 @@ func runTurn(ctx context.Context, cfg turnConfig, ts turnState) event.Event {
 			// the draining buffer via InputCancelled.
 			return event.TurnInterrupted{TurnIndex: ts.index}
 		}
+		candidateMeasured = len(ts.msgs) == stagedBeforeFold
 		// Loop: the next stream lets the model react to the tool results (and any
 		// folded user messages).
 	}
+}
+
+func turnInferenceRequest(cfg turnConfig, state turnState, runtimeTail *content.UserMessage, definitions []inference.Tool) inference.Request {
+	return inference.Request{
+		Model: cfg.model, System: cfg.system,
+		Messages: requestMessages(cfg.base, state.msgs, runtimeTail), Tools: definitions,
+	}
+}
+
+func measureTurnCandidate(
+	ctx context.Context,
+	config turnConfig,
+	request inference.Request,
+	runtimeRevision string,
+	runtimeTail *content.UserMessage,
+	continuation bool,
+) (*contextReplacementDirective, error) {
+	if config.measure == nil {
+		return nil, nil
+	}
+	err := config.measure(ctx, request, runtimeRevision, runtimeTail, continuation)
+	var directive *contextReplacementDirective
+	if errors.As(err, &directive) {
+		return directive, nil
+	}
+	return nil, err
+}
+
+func measureTurnFailure(ctx context.Context, turnIndex event.TurnIndex, err error) event.Event {
+	if ctx.Err() != nil {
+		return event.TurnInterrupted{TurnIndex: turnIndex}
+	}
+	return event.TurnFailed{TurnIndex: turnIndex, Err: err}
 }
 
 func addTurnUsage(total content.Usage, request *content.Usage) (content.Usage, error) {

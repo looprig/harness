@@ -165,7 +165,7 @@ func validActorReplacementFixture(t *testing.T) (loopState, compactionAttempt, *
 	state.inbox = []queuedInput{{inputID: uuid.UUID{12}, msg: replacementTestMessage("queued")}}
 	success := &compactionPreparedSuccess{
 		Model: measurement.Model, RequestFingerprint: measurement.RequestFingerprint,
-		Summary: validFinalizationSummary(), PostContext: validFinalizationMeasurement(13),
+		Summary: validFinalizationSummary(), PostCount: testCompactionPostCount(validFinalizationMeasurement(13)),
 	}
 	return state, attempt, success, settings
 }

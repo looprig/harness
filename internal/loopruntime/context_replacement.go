@@ -52,8 +52,10 @@ func prepareActorContextReplacement(
 		}
 	}
 	tracker := contextTracker{}
-	postContext := success.PostContext
-	postContext.Basis = attempt.Basis
+	postContext, err := success.PostCount.measurement(attempt.Basis)
+	if err != nil {
+		return actorContextReplacement{}, err
+	}
 	if err := tracker.restore(attempt.Basis, true, postContext, true, event.ContextBasis{}, false, settings); err != nil {
 		return actorContextReplacement{}, err
 	}
