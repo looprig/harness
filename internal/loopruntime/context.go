@@ -176,6 +176,25 @@ type contextCountResult struct {
 	err         error
 }
 
+// idleCompactionPreparation freezes the stable committed request inputs while an
+// idle manual attempt is counted off-actor. Tool definitions are resolved from
+// the frozen registry by the worker because Tool.Info may block.
+type idleCompactionPreparation struct {
+	attemptID  event.CompactAttemptID
+	basis      event.ContextBasis
+	generation uint64
+	cancel     context.CancelFunc
+	request    inference.Request
+	tools      ToolSet
+	transcript content.AgenticMessages
+}
+
+type idleCompactionCountResult struct {
+	preparation idleCompactionPreparation
+	candidate   compactionExecutionCandidate
+	err         error
+}
+
 type contextMeasureReply struct {
 	measurement event.ContextMeasurement
 	attemptID   event.CompactAttemptID

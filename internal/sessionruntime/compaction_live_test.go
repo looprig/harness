@@ -122,16 +122,18 @@ func TestNativeSessionCompactionReachesRegisteredFocusedHustle(t *testing.T) {
 		name      string
 		automatic bool
 		restore   bool
+		idle      bool
 		counts    []content.TokenCount
 	}{
 		{name: "manual command during active turn", counts: []content.TokenCount{40, 40, 20}},
+		{name: "manual command while idle", idle: true, counts: []content.TokenCount{40, 40, 20}},
 		{name: "automatic threshold", automatic: true, counts: []content.TokenCount{65, 20, 20}},
 		{name: "restored automatic threshold", automatic: true, restore: true, counts: []content.TokenCount{65, 20, 20}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			client := &liveCompactionClient{invoked: make(chan struct{}, 1)}
-			if !tt.automatic {
+			if !tt.automatic && !tt.idle {
 				client.streamStarted = make(chan struct{})
 				client.streamRelease = make(chan struct{})
 			}
@@ -182,10 +184,35 @@ func TestNativeSessionCompactionReachesRegisteredFocusedHustle(t *testing.T) {
 				t.Fatalf("Submit() error = %v", err)
 			}
 			if !tt.automatic {
-				select {
-				case <-client.streamStarted:
-				case <-time.After(2 * time.Second):
-					t.Fatal("primary inference did not start")
+				if tt.idle {
+					idleCtx, idleCancel := context.WithTimeout(context.Background(), 5*time.Second)
+					defer idleCancel()
+					if err := session.WaitIdle(idleCtx); err != nil {
+						t.Fatalf("initial WaitIdle() error = %v", err)
+					}
+					// Restore the committed seed so the command is guaranteed to reach an
+					// actor constructed idle, rather than racing the live turn's terminal.
+					sessionID := session.SessionID()
+					if err := session.Shutdown(context.Background()); err != nil {
+						t.Fatalf("seed Shutdown() error = %v", err)
+					}
+					session, err = lifecycle.RestoreSession(context.Background(), sessionID)
+					if err != nil {
+						t.Fatalf("seed RestoreSession() error = %v", err)
+					}
+					if err := session.WaitIdle(idleCtx); err != nil {
+						t.Fatalf("restored WaitIdle() error = %v", err)
+					}
+					handle := session.loops[session.ActiveLoopID()]
+					if _, _, err := handle.backend.Snapshot(idleCtx); err != nil {
+						t.Fatalf("idle Snapshot() barrier error = %v", err)
+					}
+				} else {
+					select {
+					case <-client.streamStarted:
+					case <-time.After(2 * time.Second):
+						t.Fatal("primary inference did not start")
+					}
 				}
 				commandID, err := uuid.New()
 				if err != nil {
@@ -201,7 +228,9 @@ func TestNativeSessionCompactionReachesRegisteredFocusedHustle(t *testing.T) {
 				case <-time.After(2 * time.Second):
 					t.Fatal("manual Compact was not admitted")
 				}
-				close(client.streamRelease)
+				if !tt.idle {
+					close(client.streamRelease)
+				}
 			}
 			select {
 			case <-client.invoked:

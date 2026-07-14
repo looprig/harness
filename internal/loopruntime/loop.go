@@ -15,6 +15,7 @@ import (
 	gatedomain "github.com/looprig/harness/pkg/gate"
 	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/loop"
+	"github.com/looprig/harness/pkg/tool"
 	"github.com/looprig/inference"
 )
 
@@ -617,6 +618,7 @@ func runLoop(cfg loopConfig, state loopState) {
 	contextRequests := cfg.contextRequests
 	contextResults := cfg.contextResults
 	contextOutcomes := cfg.contextOutcomes
+	idleCompactionResults := make(chan idleCompactionCountResult, 1)
 	gateReg := cfg.gateReg
 	snapshots := cfg.snapshots
 	internal := cfg.internal
@@ -625,6 +627,7 @@ func runLoop(cfg loopConfig, state loopState) {
 	admissions := cfg.admissions
 	requestCancelActive := false
 	compactions := newCompactionControl(compactionControlWaiterCapacity)
+	var idleCompaction *idleCompactionPreparation
 	compactionFinalizations := newCompactionFinalizer(compactionFinalizerConfig{
 		Publisher: cfg.events, Factory: cfg.eventFactory, SessionID: state.sessionID, LoopID: state.id,
 		Now: config.compactionNow,
@@ -753,6 +756,12 @@ func runLoop(cfg loopConfig, state loopState) {
 			return false
 		}
 		pending := compactions.pendingAttempt()
+		if idleCompaction != nil && pending != nil && pending.AttemptID == idleCompaction.attemptID &&
+			compactions.cancellationRejectReason() == event.CompactRejectUnspecified {
+			// This attempt owns an exact idle snapshot. A turn or drain that lands while
+			// its count is in flight must not replace it with a newer candidate.
+			return true
+		}
 		if pending != nil && pending.Basis == (event.ContextBasis{}) {
 			basis := state.contextTracker.currentBasis()
 			if candidate != nil {
@@ -828,6 +837,109 @@ func runLoop(cfg loopConfig, state loopState) {
 		}
 		compactions.complete(attempt.AttemptID)
 		return false
+	}
+
+	startIdleCompactionPreparation := func(attemptID event.CompactAttemptID) bool {
+		if _, candidateAware := config.compactionSink.(compactionCandidateSink); !candidateAware {
+			return false
+		}
+		if _, awaitable := config.compactionSink.(contextCompactionAwaiter); !awaitable {
+			return false
+		}
+		settings, configured := contextSettings(config)
+		basis := state.contextTracker.currentBasis()
+		if !configured || config.ContextCounter == nil || basis.Revision == 0 || basis.ThroughEventID.IsZero() {
+			return false
+		}
+		transcript := cloneMessages(state.msgs)
+		tools := state.effective.tools
+		tools.Registry = append([]tool.InvokableTool(nil), tools.Registry...)
+		preparationCtx, cancelPreparation := context.WithCancel(ctx)
+		preparation := idleCompactionPreparation{
+			attemptID: attemptID, basis: basis, generation: state.contextGeneration,
+			cancel: cancelPreparation,
+			request: inference.Request{
+				Model: state.effective.model.Clone(), System: state.effective.system,
+				Messages: cloneMessages(transcript),
+			},
+			tools: tools, transcript: transcript,
+		}
+		idleCompaction = &preparation
+		go func(preparationCtx context.Context, prepared idleCompactionPreparation, admission contextAdmissionSettings) {
+			request := prepared.request
+			request.Tools = toolDefs(ctx, prepared.tools.Registry)
+			runtimeRevision := revisionDigest(nil)
+			measurement, err := measureRequestContext(
+				preparationCtx, config.ContextCounter, config.CounterCapability, config.InferenceCapability,
+				admission, prepared.basis, request, runtimeRevision,
+			)
+			result := idleCompactionCountResult{
+				preparation: prepared,
+				candidate: compactionExecutionCandidate{
+					Measurement: measurement, Request: request, RuntimeRevision: runtimeRevision,
+					Transcript: cloneMessages(prepared.transcript),
+				},
+				err: err,
+			}
+			select {
+			case idleCompactionResults <- result:
+			case <-ctx.Done():
+			}
+		}(preparationCtx, preparation, settings)
+		return true
+	}
+
+	finalizeIdleCompactionRejection := func(preparation idleCompactionPreparation, reason event.CompactRejectReason) {
+		pending := compactions.pendingAttempt()
+		if pending == nil || pending.AttemptID != preparation.attemptID {
+			return
+		}
+		if err := compactions.freezeBasis(preparation.attemptID, preparation.basis); err != nil {
+			reportCompactionFailure(pending.WaiterCommandIDs, err)
+			return
+		}
+		attempt := compactions.pendingAttempt()
+		if attempt == nil {
+			return
+		}
+		attempt.StartedAt = config.compactionNow()
+		terminal, err := compactionFinalizations.Finalize(ctx, *attempt, compactionFinalizationProposal{RejectReason: reason})
+		if err != nil {
+			reportCompactionFailure(attempt.WaiterCommandIDs, err)
+			compactions.abort(attempt.AttemptID)
+			return
+		}
+		compactions.complete(attempt.AttemptID)
+		if rejected, ok := terminal.(event.CompactionRejected); ok && rejected.Reason == event.CompactionReasonAutomatic {
+			state.contextTracker.exhaustAutomatic(rejected.Basis, rejected.Reason, true)
+		}
+	}
+
+	awaitIdleCompaction := func(attemptID event.CompactAttemptID) {
+		awaiter, ok := config.compactionSink.(contextCompactionAwaiter)
+		if !ok {
+			return
+		}
+		go func() {
+			outcome, err := awaiter.AwaitCompaction(ctx, attemptID)
+			if err != nil {
+				reportCompactionFailure(nil, &contextCompactionAwaitError{AttemptID: attemptID, Cause: err})
+				return
+			}
+			reply := make(chan contextCompactionOutcomeReply, 1)
+			select {
+			case contextOutcomes <- contextCompactionOutcomeRequest{attemptID: attemptID, result: outcome, reply: reply}:
+			case <-ctx.Done():
+				return
+			}
+			select {
+			case response := <-reply:
+				if response.err != nil {
+					reportCompactionFailure(nil, response.err)
+				}
+			case <-ctx.Done():
+			}
+		}()
 	}
 
 	// emitLoopIdle announces the loop's running->idle transition: an Enduring,
@@ -1797,19 +1909,13 @@ func runLoop(cfg loopConfig, state loopState) {
 				}
 				return false
 			}
-			if admission.Kind == compactionAdmissionOpened && state.status == loopIdle {
-				basis := state.contextTracker.currentBasis()
-				if basis.Revision != 0 && !basis.ThroughEventID.IsZero() {
-					if err := compactions.freezeBasis(admission.AttemptID, basis); err != nil {
-						reportCompactionFailure([]uuid.UUID{c.CommandHeader().CommandID}, err)
-						return false
-					}
-				}
-			}
 			// Idle is itself a safe turn boundary. A configured sink takes ownership
 			// immediately; while a turn is live, the request remains actor-owned until
 			// the next step/turn boundary below.
 			if state.status == loopIdle {
+				if admission.Kind == compactionAdmissionOpened && startIdleCompactionPreparation(admission.AttemptID) {
+					return false
+				}
 				dispatchCompactionBoundary(compactionBoundaryTurn, nil)
 			}
 
@@ -1819,6 +1925,9 @@ func runLoop(cfg loopConfig, state loopState) {
 				return false
 			}
 			compactions.interrupt()
+			if idleCompaction != nil {
+				idleCompaction.cancel()
+			}
 			if state.cancelTurn != nil {
 				state.cancelTurn()
 				state.cancelTurn = nil
@@ -1852,6 +1961,9 @@ func runLoop(cfg loopConfig, state loopState) {
 				state.shutdownAcks = append(state.shutdownAcks, c.Ack)
 			}
 			compactions.shutdown()
+			if idleCompaction != nil {
+				idleCompaction.cancel()
+			}
 			if state.status == loopShuttingDown {
 				return false
 			}
@@ -1967,6 +2079,78 @@ func runLoop(cfg loopConfig, state loopState) {
 				case <-ctx.Done():
 				}
 			}(req, settings, basis, generation)
+
+		case result := <-idleCompactionResults:
+			preparing := idleCompaction
+			if preparing == nil || preparing.attemptID != result.preparation.attemptID ||
+				preparing.basis != result.preparation.basis || preparing.generation != result.preparation.generation {
+				continue
+			}
+			preparing.cancel()
+			idleCompaction = nil
+			pending := compactions.pendingAttempt()
+			if pending == nil || pending.AttemptID != result.preparation.attemptID {
+				// A pre-start interrupt/shutdown already resolved the transient slot.
+				continue
+			}
+			if reason := compactions.cancellationRejectReason(); reason != event.CompactRejectUnspecified {
+				dispatchCompactionBoundary(compactionBoundaryTurn, nil)
+				continue
+			}
+			currentBasis := state.contextTracker.currentBasis()
+			if currentBasis != result.preparation.basis || state.contextGeneration != result.preparation.generation {
+				finalizeIdleCompactionRejection(result.preparation, event.CompactRejectStaleBasis)
+				continue
+			}
+			if result.err != nil {
+				finalizeIdleCompactionRejection(result.preparation, compactionRejectReason(result.err))
+				continue
+			}
+			settings, configured := contextSettings(config)
+			if !configured {
+				finalizeIdleCompactionRejection(result.preparation, event.CompactRejectInternal)
+				continue
+			}
+			nextTracker := state.contextTracker
+			tracking, err := nextTracker.apply(result.candidate.Measurement, settings)
+			if err != nil {
+				finalizeIdleCompactionRejection(result.preparation, event.CompactRejectInternal)
+				continue
+			}
+			if tracking.MeasurementChanged {
+				measured, stampErr := stamp(event.ContextMeasured{Measurement: result.candidate.Measurement})
+				if stampErr != nil {
+					reportCompactionFailure(pending.WaiterCommandIDs, stampErr)
+					compactions.abort(pending.AttemptID)
+					continue
+				}
+				if validateErr := event.ValidateEvent(measured); validateErr != nil {
+					reportCompactionFailure(pending.WaiterCommandIDs, validateErr)
+					compactions.abort(pending.AttemptID)
+					continue
+				}
+				if publishErr := cfg.events.PublishEventChecked(ctx, measured); publishErr != nil {
+					reportCompactionFailure(pending.WaiterCommandIDs, publishErr)
+					compactions.abort(pending.AttemptID)
+					continue
+				}
+			}
+			state.contextTracker = nextTracker
+			state.context = result.candidate.Measurement
+			state.hasContext = true
+			if tracking.PressureChanged {
+				publish(event.ContextPressure{
+					Measurement: result.candidate.Measurement, Occupancy: tracking.Occupancy,
+					Previous: tracking.Previous, Current: tracking.Current,
+				})
+			}
+			if err := compactions.freezeBasis(pending.AttemptID, result.preparation.basis); err != nil {
+				reportCompactionFailure(pending.WaiterCommandIDs, err)
+				continue
+			}
+			if dispatchCompactionBoundary(compactionBoundaryTurn, &result.candidate) {
+				awaitIdleCompaction(pending.AttemptID)
+			}
 
 		case result := <-contextResults:
 			reply := func(response contextMeasureReply) {

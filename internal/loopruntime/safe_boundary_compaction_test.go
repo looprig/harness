@@ -39,10 +39,12 @@ type echoExecutorCompactor struct {
 	mu      sync.Mutex
 	summary *content.UserMessage
 	input   loop.CompactionInput
+	calls   int
 }
 
 func (c *echoExecutorCompactor) CompactAndFinalize(ctx context.Context, input loop.CompactionInput, finalizer func(context.Context, CompactionOutcome) error) error {
 	c.mu.Lock()
+	c.calls++
 	c.input = input
 	c.input.Transcript = cloneMessages(input.Transcript)
 	c.mu.Unlock()
@@ -50,6 +52,12 @@ func (c *echoExecutorCompactor) CompactAndFinalize(ctx context.Context, input lo
 		Basis: input.Basis, Model: input.Model, RequestFingerprint: input.RequestFingerprint,
 		Summary: cloneUserMessage(c.summary),
 	}})
+}
+
+func (c *echoExecutorCompactor) callCount() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.calls
 }
 
 func (c *echoExecutorCompactor) capturedInput() loop.CompactionInput {
@@ -67,16 +75,18 @@ type gatedExecutorCompactor struct {
 }
 
 type lateSuccessExecutorCompactor struct {
-	summary  *content.UserMessage
-	started  chan struct{}
-	release  chan struct{}
-	finished chan struct{}
+	summary   *content.UserMessage
+	started   chan struct{}
+	release   chan struct{}
+	finished  chan struct{}
+	startOne  sync.Once
+	finishOne sync.Once
 }
 
 func (c *lateSuccessExecutorCompactor) CompactAndFinalize(ctx context.Context, input loop.CompactionInput, finalizer func(context.Context, CompactionOutcome) error) error {
-	close(c.started)
+	c.startOne.Do(func() { close(c.started) })
 	<-c.release
-	defer close(c.finished)
+	defer c.finishOne.Do(func() { close(c.finished) })
 	return finalizer(ctx, CompactionOutcome{Value: &loop.CompactionOutput{
 		Basis: input.Basis, Model: input.Model, RequestFingerprint: input.RequestFingerprint,
 		Summary: cloneUserMessage(c.summary),
@@ -116,6 +126,54 @@ type sequenceContextCounter struct {
 	counts     []content.TokenCount
 	errs       []error
 	requests   []inference.Request
+}
+
+type gatedIdleContextCounter struct {
+	capability inference.CounterCapability
+	started    chan struct{}
+	release    chan struct{}
+	err        error
+	once       sync.Once
+}
+
+type idleCandidateRecordingSink struct {
+	*recordingCompactionSink
+	mu             sync.Mutex
+	candidateCalls int
+}
+
+func (s *idleCandidateRecordingSink) CoordinateCompactionCandidate(_ context.Context, disposition compactionDisposition, _ compactionExecutionCandidate) error {
+	s.mu.Lock()
+	s.candidateCalls++
+	s.mu.Unlock()
+	return s.CoordinateCompaction(context.Background(), disposition)
+}
+
+func (*idleCandidateRecordingSink) AwaitCompaction(context.Context, event.CompactAttemptID) (contextCompactionAwaitResult, error) {
+	return contextCompactionAwaitResult{}, errors.New("unexpected idle candidate await")
+}
+
+func (s *idleCandidateRecordingSink) candidateCallCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.candidateCalls
+}
+
+func (c *gatedIdleContextCounter) CountContext(ctx context.Context, request inference.Request) (inference.ContextCount, error) {
+	c.once.Do(func() { close(c.started) })
+	select {
+	case <-c.release:
+	case <-ctx.Done():
+		return inference.ContextCount{}, ctx.Err()
+	}
+	if c.err != nil {
+		return inference.ContextCount{}, c.err
+	}
+	return inference.ContextCount{Model: request.Model.Key(), InputTokens: 40, Quality: c.capability.Quality}, nil
+}
+
+func (c *gatedIdleContextCounter) CounterCapability() inference.CounterCapability {
+	return c.capability
 }
 
 func (c *sequenceContextCounter) CountContext(_ context.Context, request inference.Request) (inference.ContextCount, error) {
@@ -217,6 +275,331 @@ func TestFocusedCompactionConstructorsRejectTypedNilCompactor(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestIdleManualCompactionBuildsStableBaseCandidate(t *testing.T) {
+	tests := []struct {
+		name string
+	}{
+		{name: "restored idle history is counted and compacted without primary inference"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			t.Cleanup(cancel)
+			recorder := &recordingPublisher{}
+			counter := &sequenceContextCounter{
+				capability: contextTestCapability(inference.CountQualityExactLocal),
+				counts:     []content.TokenCount{40, 20},
+			}
+			compactor := &echoExecutorCompactor{summary: validFinalizationSummary()}
+			countsSeenBeforeStream := make(chan int, 1)
+			client := &scriptedLLM{
+				scripts: [][]content.Chunk{{textChunk("next response")}},
+				onStreamN: map[int]func(){0: func() {
+					counter.mu.Lock()
+					defer counter.mu.Unlock()
+					countsSeenBeforeStream <- len(counter.requests)
+				}},
+			}
+			settings := contextAdmissionSettings{ReservedOutput: 20, CountTimeout: time.Second}
+			executor, err := newCompactionExecutor(ctx, compactionExecutorConfig{
+				Compactor: compactor, Counter: counter, CounterCapability: counter.capability,
+				InferenceCapability: contextTestInferenceCapability(), Settings: settings, MaxSummaryTokens: 10,
+			})
+			if err != nil {
+				t.Fatalf("newCompactionExecutor() error = %v", err)
+			}
+			model := testModel()
+			model.Limits = inference.ContextLimits{WindowTokens: 100, MaxInputTokens: 80, MaxOutputTokens: 20}
+			basis := event.ContextBasis{Revision: 3, ThroughEventID: uuid.UUID{0x81}}
+			transcript := content.AgenticMessages{replacementTestMessage("committed history")}
+			actor, err := newRestoredWithConfig(ctx, uuid.UUID{0x82}, uuid.UUID{0x83}, recorder, runtimeConfig{
+				Client: client, Model: model, System: "stable system", DrainTimeout: 200 * time.Millisecond,
+				ContextCounter: counter, CounterCapability: counter.capability, InferenceCapability: contextTestInferenceCapability(),
+				Compaction: &loop.CompactionPolicy{
+					CounterPolicy: loop.CounterPolicyRequireExact, ReservedOutput: 20,
+					MaxSummaryTokens: 10, CountTimeout: time.Second, Hustle: "context.compact",
+				},
+				compactionSink: executor,
+			}, RestoredState{Msgs: transcript, TurnIndex: 1, Basis: basis, HasBasis: true})
+			if err != nil {
+				t.Fatalf("newRestoredWithConfig() error = %v", err)
+			}
+			commandID := uuid.UUID{0x84}
+			actor.Commands <- command.Compact{
+				Header:      command.Header{CommandID: commandID, Agency: identity.AgencyUser, CreatedAt: time.Now()},
+				Coordinates: identity.Coordinates{SessionID: uuid.UUID{0x82}, LoopID: uuid.UUID{0x83}},
+			}
+			blockUntilEvents(t, recorder, func(events []event.Event) bool {
+				for _, published := range events {
+					if _, ok := published.(event.CompactWaiterResolved); ok {
+						return true
+					}
+				}
+				return false
+			})
+			var committed *event.CompactionCommitted
+			startedIndex, committedIndex, waiterIndex := -1, -1, -1
+			for index, published := range recorder.events() {
+				switch value := published.(type) {
+				case event.CompactionStarted:
+					startedIndex = index
+				case event.CompactionCommitted:
+					copyOfValue := value
+					committed = &copyOfValue
+					committedIndex = index
+				case event.CompactWaiterResolved:
+					waiterIndex = index
+				}
+			}
+			if committed == nil {
+				t.Fatalf("events = %#v, want CompactionCommitted", recorder.events())
+			}
+			if startedIndex < 0 || !(startedIndex < committedIndex && committedIndex < waiterIndex) {
+				t.Fatalf("event order indices = started:%d committed:%d waiter:%d", startedIndex, committedIndex, waiterIndex)
+			}
+			if committed.PostContext.Basis.Revision != basis.Revision+1 ||
+				committed.PostContext.Basis.ThroughEventID != committed.EventID || committed.PostContext.InputTokens != 20 {
+				t.Fatalf("PostContext = %+v, want committed-derived basis and 20 tokens", committed.PostContext)
+			}
+			if input := compactor.capturedInput(); input.Basis != basis || !reflect.DeepEqual(input.Transcript, transcript) {
+				t.Fatalf("compactor input = %#v, want stable basis/transcript", input)
+			}
+			counter.mu.Lock()
+			requests := append([]inference.Request(nil), counter.requests...)
+			counter.mu.Unlock()
+			if len(requests) != 2 || requests[0].System != "stable system" || !reflect.DeepEqual(requests[0].Messages, transcript) {
+				t.Fatalf("count requests = %#v, want stable pre/post requests", requests)
+			}
+			snapshotCtx, snapshotCancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer snapshotCancel()
+			messages, _, err := actor.Snapshot(snapshotCtx)
+			if err != nil {
+				t.Fatalf("Snapshot() error = %v", err)
+			}
+			if len(messages) != 1 || !reflect.DeepEqual(messages[0], validFinalizationSummary()) {
+				t.Fatalf("snapshot messages = %#v, want summary-only replacement", messages)
+			}
+			startTurn(t, actor, recorder, textBlocks("after compaction"))
+			if _, ok := drainToTerminal(t, recorder).(event.TurnDone); !ok {
+				t.Fatal("next turn terminal != TurnDone")
+			}
+			select {
+			case count := <-countsSeenBeforeStream:
+				if count != 3 {
+					t.Fatalf("counts before next primary inference = %d, want 3", count)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("next primary inference did not start")
+			}
+			primaryRequests := client.requests()
+			if len(primaryRequests) != 1 || len(primaryRequests[0].Messages) < 1 ||
+				!reflect.DeepEqual(primaryRequests[0].Messages[0], validFinalizationSummary()) {
+				t.Fatalf("next primary requests = %#v, want remeasured summary context", primaryRequests)
+			}
+		})
+	}
+}
+
+func TestIdleManualCompactionPreCountFailureRejectsWithoutStarting(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+	}{
+		{name: "counter failure", err: errors.New("idle count failed")},
+		{name: "counter timeout", err: context.DeadlineExceeded},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			counter := &sequenceContextCounter{
+				capability: contextTestCapability(inference.CountQualityExactLocal), errs: []error{tt.err},
+			}
+			compactor := &echoExecutorCompactor{summary: validFinalizationSummary()}
+			actor, recorder, _ := newRestoredIdleCompactionActor(t, counter, counter.capability, compactor)
+			sendCompact(t, actor, uuid.UUID{0x91}, uuid.UUID{0x92}, uuid.UUID{0x93}, identity.AgencyUser)
+			blockUntilEvents(t, recorder, func(events []event.Event) bool {
+				for _, published := range events {
+					if _, ok := published.(event.CompactionRejected); ok {
+						return true
+					}
+				}
+				return false
+			})
+			var rejection *event.CompactionRejected
+			waiters := 0
+			for _, published := range recorder.events() {
+				switch value := published.(type) {
+				case event.CompactionStarted:
+					t.Fatal("pre-count failure published CompactionStarted")
+				case event.CompactionRejected:
+					copyOfValue := value
+					rejection = &copyOfValue
+				case event.CompactWaiterRejected:
+					waiters++
+				}
+			}
+			if rejection == nil || rejection.RejectReason != event.CompactRejectContextCountFailed || waiters != 1 {
+				t.Fatalf("rejection/waiters = %+v/%d, want ContextCountFailed and one waiter", rejection, waiters)
+			}
+			if got := compactor.callCount(); got != 0 {
+				t.Fatalf("compactor calls = %d, want 0", got)
+			}
+		})
+	}
+}
+
+func TestIdleManualCompactionStalePreCountRejectsWithoutStarting(t *testing.T) {
+	tests := []struct{ name string }{{name: "request-shape generation changes while count is in flight"}}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			counter := &gatedIdleContextCounter{
+				capability: contextTestCapability(inference.CountQualityExactLocal),
+				started:    make(chan struct{}), release: make(chan struct{}),
+			}
+			compactor := &echoExecutorCompactor{summary: validFinalizationSummary()}
+			actor, recorder, model := newRestoredIdleCompactionActor(t, counter, counter.capability, compactor)
+			sendCompact(t, actor, uuid.UUID{0x91}, uuid.UUID{0x92}, uuid.UUID{0x94}, identity.AgencyUser)
+			select {
+			case <-counter.started:
+			case <-time.After(2 * time.Second):
+				t.Fatal("idle pre-count did not start")
+			}
+			model.Name = "changed-while-counting"
+			ack := make(chan command.LoopChangeResult, 1)
+			actor.Commands <- command.ChangeLoopInference{
+				Header: command.Header{CommandID: uuid.UUID{0x95}}, Model: model, SetModel: true, Ack: ack,
+			}
+			select {
+			case result := <-ack:
+				if result.Err != nil {
+					t.Fatalf("ChangeLoopInference() error = %v", result.Err)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("actor blocked behind idle pre-count")
+			}
+			close(counter.release)
+			blockUntilEvents(t, recorder, func(events []event.Event) bool {
+				for _, published := range events {
+					if _, ok := published.(event.CompactionRejected); ok {
+						return true
+					}
+				}
+				return false
+			})
+			var rejection *event.CompactionRejected
+			for _, published := range recorder.events() {
+				switch value := published.(type) {
+				case event.CompactionStarted:
+					t.Fatal("stale pre-count published CompactionStarted")
+				case event.CompactionRejected:
+					copyOfValue := value
+					rejection = &copyOfValue
+				}
+			}
+			if rejection == nil || rejection.RejectReason != event.CompactRejectStaleBasis {
+				t.Fatalf("rejection = %+v, want StaleBasis", rejection)
+			}
+			if got := compactor.callCount(); got != 0 {
+				t.Fatalf("compactor calls = %d, want 0", got)
+			}
+		})
+	}
+}
+
+func TestIdleManualCompactionInterruptsPreCountWithoutStarting(t *testing.T) {
+	tests := []struct{ name string }{{name: "interrupt preserves pre-start waiter-only rejection"}}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			t.Cleanup(cancel)
+			capability := contextTestCapability(inference.CountQualityExactLocal)
+			counter := &gatedIdleContextCounter{capability: capability, started: make(chan struct{}), release: make(chan struct{})}
+			sink := &idleCandidateRecordingSink{recordingCompactionSink: newRecordingCompactionSink()}
+			recorder := &recordingPublisher{}
+			model := testModel()
+			model.Limits = inference.ContextLimits{WindowTokens: 100, MaxInputTokens: 80, MaxOutputTokens: 20}
+			actor, err := newRestoredWithConfig(ctx, uuid.UUID{0xa1}, uuid.UUID{0xa2}, recorder, runtimeConfig{
+				Client: &scriptedLLM{}, Model: model, ContextCounter: counter, CounterCapability: capability,
+				InferenceCapability: contextTestInferenceCapability(), DrainTimeout: 200 * time.Millisecond,
+				Compaction: &loop.CompactionPolicy{
+					CounterPolicy: loop.CounterPolicyRequireExact, ReservedOutput: 20,
+					MaxSummaryTokens: 10, CountTimeout: 2 * time.Second, Hustle: "context.compact",
+				},
+				compactionSink: sink,
+			}, RestoredState{
+				Msgs: content.AgenticMessages{replacementTestMessage("committed history")}, TurnIndex: 1,
+				Basis: event.ContextBasis{Revision: 3, ThroughEventID: uuid.UUID{0xa0}}, HasBasis: true,
+			})
+			if err != nil {
+				t.Fatalf("newRestoredWithConfig() error = %v", err)
+			}
+			sendCompact(t, actor, uuid.UUID{0xa1}, uuid.UUID{0xa2}, uuid.UUID{0xa3}, identity.AgencyUser)
+			select {
+			case <-counter.started:
+			case <-time.After(2 * time.Second):
+				t.Fatal("idle pre-count did not start")
+			}
+			ack := make(chan bool, 1)
+			actor.Commands <- command.Interrupt{Header: command.Header{CommandID: uuid.UUID{0xa4}}, Ack: ack}
+			if <-ack {
+				t.Fatal("idle Interrupt acknowledged a nonexistent active turn")
+			}
+			disposition := awaitCompactionDisposition(t, sink.recordingCompactionSink)
+			if disposition.Kind != compactionDispositionReject || disposition.RejectReason != event.CompactRejectInterrupted {
+				t.Fatalf("disposition = %+v, want pre-start Interrupted rejection", disposition)
+			}
+			close(counter.release)
+			syncLoopActor(t, actor)
+			if got := sink.candidateCallCount(); got != 0 {
+				t.Fatalf("candidate calls = %d, want 0", got)
+			}
+			for _, published := range recorder.events() {
+				switch published.(type) {
+				case event.CompactionStarted, event.CompactionRejected:
+					t.Fatalf("pre-start interrupt published canonical event %T", published)
+				}
+			}
+		})
+	}
+}
+
+func newRestoredIdleCompactionActor(
+	t *testing.T,
+	counter inference.ContextCounter,
+	capability inference.CounterCapability,
+	compactor Compactor,
+) (*Loop, *recordingPublisher, inference.Model) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	recorder := &recordingPublisher{}
+	settings := contextAdmissionSettings{ReservedOutput: 20, CountTimeout: 2 * time.Second}
+	executor, err := newCompactionExecutor(ctx, compactionExecutorConfig{
+		Compactor: compactor, Counter: counter, CounterCapability: capability,
+		InferenceCapability: contextTestInferenceCapability(), Settings: settings, MaxSummaryTokens: 10,
+	})
+	if err != nil {
+		t.Fatalf("newCompactionExecutor() error = %v", err)
+	}
+	model := testModel()
+	model.Limits = inference.ContextLimits{WindowTokens: 100, MaxInputTokens: 80, MaxOutputTokens: 20}
+	actor, err := newRestoredWithConfig(ctx, uuid.UUID{0x91}, uuid.UUID{0x92}, recorder, runtimeConfig{
+		Client: &scriptedLLM{}, Model: model, System: "stable system", DrainTimeout: 200 * time.Millisecond,
+		ContextCounter: counter, CounterCapability: capability, InferenceCapability: contextTestInferenceCapability(),
+		Compaction: &loop.CompactionPolicy{
+			CounterPolicy: loop.CounterPolicyRequireExact, ReservedOutput: 20,
+			MaxSummaryTokens: 10, CountTimeout: 2 * time.Second, Hustle: "context.compact",
+		},
+		compactionSink: executor,
+	}, RestoredState{
+		Msgs: content.AgenticMessages{replacementTestMessage("committed history")}, TurnIndex: 1,
+		Basis: event.ContextBasis{Revision: 3, ThroughEventID: uuid.UUID{0x90}}, HasBasis: true,
+	})
+	if err != nil {
+		t.Fatalf("newRestoredWithConfig() error = %v", err)
+	}
+	return actor, recorder, model
 }
 
 func TestRunTurnConsumesCompactionDirectiveAtSafeBoundary(t *testing.T) {
