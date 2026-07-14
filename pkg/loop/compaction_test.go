@@ -29,6 +29,7 @@ func TestCompactionInputValidate(t *testing.T) {
 		name      string
 		mutate    func(*CompactionInput)
 		wantField CompactionInputField
+		wantBlock bool
 	}{
 		{name: "valid"},
 		{name: "zero revision", mutate: func(v *CompactionInput) { v.Basis.Revision = 0 }, wantField: CompactionInputFieldBasis},
@@ -39,6 +40,37 @@ func TestCompactionInputValidate(t *testing.T) {
 		{name: "nil transcript message", mutate: func(v *CompactionInput) { v.Transcript = content.AgenticMessages{nil} }, wantField: CompactionInputFieldTranscript},
 		{name: "typed nil transcript message", mutate: func(v *CompactionInput) { v.Transcript = content.AgenticMessages{typedNil} }, wantField: CompactionInputFieldTranscript},
 		{name: "wrong concrete role", mutate: func(v *CompactionInput) { v.Transcript[0].(*content.UserMessage).Role = content.RoleAssistant }, wantField: CompactionInputFieldTranscript},
+		{name: "typed nil text block", mutate: func(v *CompactionInput) {
+			v.Transcript[0].(*content.UserMessage).Blocks = []content.Block{(*content.TextBlock)(nil)}
+		}, wantField: CompactionInputFieldTranscript, wantBlock: true},
+		{name: "typed nil image block", mutate: func(v *CompactionInput) {
+			v.Transcript[0].(*content.UserMessage).Blocks = []content.Block{(*content.ImageBlock)(nil)}
+		}, wantField: CompactionInputFieldTranscript, wantBlock: true},
+		{name: "typed nil audio block", mutate: func(v *CompactionInput) {
+			v.Transcript[0].(*content.UserMessage).Blocks = []content.Block{(*content.AudioBlock)(nil)}
+		}, wantField: CompactionInputFieldTranscript, wantBlock: true},
+		{name: "typed nil document block", mutate: func(v *CompactionInput) {
+			v.Transcript[0].(*content.UserMessage).Blocks = []content.Block{(*content.DocumentBlock)(nil)}
+		}, wantField: CompactionInputFieldTranscript, wantBlock: true},
+		{name: "typed nil thinking block", mutate: func(v *CompactionInput) {
+			v.Transcript[0].(*content.UserMessage).Blocks = []content.Block{(*content.ThinkingBlock)(nil)}
+		}, wantField: CompactionInputFieldTranscript, wantBlock: true},
+		{name: "typed nil tool use block", mutate: func(v *CompactionInput) {
+			v.Transcript[0].(*content.UserMessage).Blocks = []content.Block{(*content.ToolUseBlock)(nil)}
+		}, wantField: CompactionInputFieldTranscript, wantBlock: true},
+		{name: "typed nil tool result block", mutate: func(v *CompactionInput) {
+			v.Transcript[0].(*content.UserMessage).Blocks = []content.Block{(*content.ToolResultBlock)(nil)}
+		}, wantField: CompactionInputFieldTranscript, wantBlock: true},
+		{name: "nested typed nil tool result content", mutate: func(v *CompactionInput) {
+			v.Transcript[0].(*content.UserMessage).Blocks = []content.Block{&content.ToolResultBlock{Content: []content.Block{(*content.TextBlock)(nil)}}}
+		}, wantField: CompactionInputFieldTranscript, wantBlock: true},
+		{name: "excessive tool result nesting", mutate: func(v *CompactionInput) {
+			var nested content.Block = &content.TextBlock{Text: "leaf"}
+			for range maxCompactionBlockDepth + 2 {
+				nested = &content.ToolResultBlock{Content: []content.Block{nested}}
+			}
+			v.Transcript[0].(*content.UserMessage).Blocks = []content.Block{nested}
+		}, wantField: CompactionInputFieldTranscript, wantBlock: true},
 		{name: "zero summary budget", mutate: func(v *CompactionInput) { v.MaxSummaryTokens = 0 }, wantField: CompactionInputFieldMaxSummaryTokens},
 	}
 	for _, tt := range tests {
@@ -57,6 +89,10 @@ func TestCompactionInputValidate(t *testing.T) {
 			var inputErr *CompactionInputError
 			if !errors.As(err, &inputErr) || inputErr.Field != tt.wantField {
 				t.Fatalf("Validate() error = %T %v, want field %q", err, err, tt.wantField)
+			}
+			var blockErr *compactionTranscriptBlockError
+			if got := errors.As(err, &blockErr); got != tt.wantBlock {
+				t.Fatalf("Validate() block cause = %v, want %v", got, tt.wantBlock)
 			}
 		})
 	}

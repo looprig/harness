@@ -86,8 +86,12 @@ func validateCompactionTranscript(transcript content.AgenticMessages) error {
 		return &compactionTranscriptError{}
 	}
 	for _, message := range transcript {
-		if !validCompactionMessage(message) {
+		blocks, ok := compactionMessageBlocks(message)
+		if !ok {
 			return &compactionTranscriptError{}
+		}
+		if err := validateCompactionBlocks(blocks, 0); err != nil {
+			return &compactionTranscriptError{Cause: err}
 		}
 		if _, err := json.Marshal(message); err != nil {
 			return &compactionTranscriptError{Cause: err}
@@ -101,19 +105,79 @@ type compactionTranscriptError struct{ Cause error }
 func (*compactionTranscriptError) Error() string   { return "loop: invalid compaction transcript" }
 func (e *compactionTranscriptError) Unwrap() error { return e.Cause }
 
-func validCompactionMessage(message content.Conversation) bool {
+func compactionMessageBlocks(message content.Conversation) ([]content.Block, bool) {
 	switch typed := message.(type) {
 	case *content.UserMessage:
-		return typed != nil && typed.Role == content.RoleUser
+		if typed == nil || typed.Role != content.RoleUser {
+			return nil, false
+		}
+		return typed.Blocks, true
 	case *content.AIMessage:
-		return typed != nil && typed.Role == content.RoleAssistant
+		if typed == nil || typed.Role != content.RoleAssistant {
+			return nil, false
+		}
+		return typed.Blocks, true
 	case *content.SystemMessage:
-		return typed != nil && typed.Role == content.RoleSystem
+		if typed == nil || typed.Role != content.RoleSystem {
+			return nil, false
+		}
+		return typed.Blocks, true
 	case *content.ToolResultMessage:
-		return typed != nil && typed.Role == content.RoleTool
+		if typed == nil || typed.Role != content.RoleTool {
+			return nil, false
+		}
+		return typed.Blocks, true
+	default:
+		return nil, false
+	}
+}
+
+const maxCompactionBlockDepth = 128
+
+func validateCompactionBlocks(blocks []content.Block, depth int) error {
+	if depth > maxCompactionBlockDepth {
+		return &compactionTranscriptBlockError{}
+	}
+	for _, block := range blocks {
+		if typed, ok := block.(*content.ToolResultBlock); ok {
+			if typed == nil {
+				return &compactionTranscriptBlockError{}
+			}
+			if err := validateCompactionBlocks(typed.Content, depth+1); err != nil {
+				return err
+			}
+			continue
+		}
+		if !validCompactionLeafBlock(block) {
+			return &compactionTranscriptBlockError{}
+		}
+	}
+	return nil
+}
+
+func validCompactionLeafBlock(block content.Block) bool {
+	switch typed := block.(type) {
+	case *content.TextBlock:
+		return typed != nil
+	case *content.ImageBlock:
+		return typed != nil
+	case *content.AudioBlock:
+		return typed != nil
+	case *content.DocumentBlock:
+		return typed != nil
+	case *content.ThinkingBlock:
+		return typed != nil
+	case *content.ToolUseBlock:
+		return typed != nil
 	default:
 		return false
 	}
+}
+
+type compactionTranscriptBlockError struct{}
+
+func (*compactionTranscriptBlockError) Error() string {
+	return "loop: invalid compaction transcript block"
 }
 
 // Validate checks the output's identity and single-user-text replacement shape.

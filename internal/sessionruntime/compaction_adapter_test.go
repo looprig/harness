@@ -90,6 +90,28 @@ func TestCompactionInputWireRejectsMalformedValues(t *testing.T) {
 	}
 }
 
+func TestMarshalCompactionInputRejectsTypedNilBlocksBeforeEncoding(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name  string
+		block content.Block
+	}{
+		{name: "top level typed nil", block: (*content.TextBlock)(nil)},
+		{name: "nested typed nil", block: &content.ToolResultBlock{Content: []content.Block{(*content.TextBlock)(nil)}}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			input := validCompactionInput(t)
+			input.Transcript[0].(*content.UserMessage).Blocks = []content.Block{tt.block}
+			raw, err := marshalCompactionInput(input)
+			var inputErr *loop.CompactionInputError
+			if raw != nil || !errors.As(err, &inputErr) || inputErr.Field != loop.CompactionInputFieldTranscript {
+				t.Fatalf("marshalCompactionInput() = %s, %T %v, want pre-encoding transcript error", raw, err, err)
+			}
+		})
+	}
+}
+
 func TestCompactionTranscriptWireRoundTrip(t *testing.T) {
 	t.Parallel()
 	tests := []struct{ name string }{{name: "all messages and blocks use strict lower snake wire"}}
