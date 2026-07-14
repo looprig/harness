@@ -499,13 +499,25 @@ func TestLoopAutomaticCompactionRetriesAfterManualOpenedRejection(t *testing.T) 
 			if measured == nil {
 				t.Fatal("missing measured basis before manual attempt")
 			}
-			sink.release <- contextCompactionAwaitResult{Disposition: contextCompactionAwaitRejected, Canonical: true, Reason: event.CompactionReasonManual, Basis: measured.Measurement.Basis}
+			if first.Attempt.Basis != measured.Measurement.Basis {
+				t.Fatalf("first attempted basis = %+v, want %+v", first.Attempt.Basis, measured.Measurement.Basis)
+			}
+			sink.release <- contextCompactionAwaitResult{
+				Disposition:        contextCompactionAwaitRejected,
+				CanonicalRejection: canonicalContextRejection(first, measured.Measurement.Basis),
+			}
 			select {
 			case second := <-sink.started:
 				if second.Kind != compactionDispositionStart || second.Attempt == nil || second.Attempt.Reason != event.CompactionReasonAutomatic || second.Attempt.AttemptID == first.Attempt.AttemptID {
 					t.Fatalf("second disposition = %+v, want distinct Automatic opener", second)
 				}
-				sink.release <- contextCompactionAwaitResult{Disposition: contextCompactionAwaitRejected, Canonical: true, Reason: event.CompactionReasonAutomatic, Basis: measured.Measurement.Basis}
+				if second.Attempt.Basis != measured.Measurement.Basis {
+					t.Fatalf("second attempted basis = %+v, want %+v", second.Attempt.Basis, measured.Measurement.Basis)
+				}
+				sink.release <- contextCompactionAwaitResult{
+					Disposition:        contextCompactionAwaitRejected,
+					CanonicalRejection: canonicalContextRejection(second, measured.Measurement.Basis),
+				}
 			case <-time.After(2 * time.Second):
 				t.Fatal("automatic attempt did not open after manual rejection")
 			}
@@ -516,6 +528,17 @@ func TestLoopAutomaticCompactionRetriesAfterManualOpenedRejection(t *testing.T) 
 				t.Fatalf("primary inference calls = %d, want 1 after both soft rejections", calls)
 			}
 		})
+	}
+}
+
+func canonicalContextRejection(disposition compactionDisposition, basis event.ContextBasis) *event.CompactionRejected {
+	return &event.CompactionRejected{
+		Header:           event.Header{EventID: uuid.UUID{31}, Coordinates: identity.Coordinates{SessionID: uuid.UUID{21}, LoopID: uuid.UUID{22}}},
+		AttemptID:        disposition.Attempt.AttemptID,
+		WaiterCommandIDs: append([]uuid.UUID(nil), disposition.Attempt.WaiterCommandIDs...),
+		Reason:           disposition.Attempt.Reason,
+		Basis:            basis,
+		RejectReason:     event.CompactRejectExecutionFailed,
 	}
 }
 

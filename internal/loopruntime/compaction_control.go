@@ -23,6 +23,7 @@ type CompactionCoordinationErrorKind string
 const (
 	CompactionCoordinationAttemptID CompactionCoordinationErrorKind = "attempt_id"
 	CompactionCoordinationOutcome   CompactionCoordinationErrorKind = "outcome"
+	CompactionCoordinationBasis     CompactionCoordinationErrorKind = "basis"
 )
 
 // CompactionCoordinationError is the typed internal hand-off used by later
@@ -40,6 +41,8 @@ func (e *CompactionCoordinationError) Error() string {
 		message = "loopruntime: compaction attempt id generation failed"
 	case CompactionCoordinationOutcome:
 		message = "loopruntime: compaction outcome publication failed"
+	case CompactionCoordinationBasis:
+		message = "loopruntime: compaction attempted basis mismatch"
 	default:
 		message = "loopruntime: compaction coordination failed"
 	}
@@ -162,12 +165,14 @@ type compactionAttempt struct {
 	AttemptID        event.CompactAttemptID
 	WaiterCommandIDs []uuid.UUID
 	Reason           event.CompactionReason
+	Basis            event.ContextBasis
 }
 
 type pendingCompaction struct {
 	attemptID event.CompactAttemptID
 	waiters   []compactionWaiter
 	reason    event.CompactionReason
+	basis     event.ContextBasis
 	phase     compactionPhase
 }
 
@@ -228,6 +233,17 @@ func (c *compactionControl) join(request command.Compact) compactionAdmission {
 		return bytes.Compare(left.commandID[:], right.commandID[:]) < 0
 	})
 	return compactionAdmission{Kind: compactionAdmissionJoined, AttemptID: c.pending.attemptID}
+}
+
+func (c *compactionControl) freezeBasis(attemptID event.CompactAttemptID, basis event.ContextBasis) error {
+	if c.pending == nil || c.pending.attemptID != attemptID || basis.Revision == 0 || basis.ThroughEventID.IsZero() {
+		return &CompactionCoordinationError{Kind: CompactionCoordinationBasis}
+	}
+	if c.pending.basis != (event.ContextBasis{}) && c.pending.basis != basis {
+		return &CompactionCoordinationError{Kind: CompactionCoordinationBasis}
+	}
+	c.pending.basis = basis
+	return nil
 }
 
 func (c *compactionControl) interrupt() {
@@ -294,7 +310,7 @@ func (c *compactionControl) pendingAttempt() *compactionAttempt {
 	for i, waiter := range c.pending.waiters {
 		waiters[i] = waiter.commandID
 	}
-	return &compactionAttempt{AttemptID: c.pending.attemptID, WaiterCommandIDs: waiters, Reason: c.pending.reason}
+	return &compactionAttempt{AttemptID: c.pending.attemptID, WaiterCommandIDs: waiters, Reason: c.pending.reason, Basis: c.pending.basis}
 }
 
 func waiterFromCompact(request command.Compact) compactionWaiter {

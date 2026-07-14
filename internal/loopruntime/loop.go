@@ -1952,6 +1952,15 @@ func runLoop(cfg loopConfig, state loopState) {
 				}
 				continue
 			}
+			if freezeErr := compactions.freezeBasis(admission.AttemptID, result.measurement.Basis); freezeErr != nil {
+				reportCompactionFailure([]uuid.UUID{commandID}, freezeErr)
+				if tracking.Current == event.PressureHardLimit {
+					reply(contextMeasureReply{measurement: result.measurement, err: &loop.ContextLimitError{Measurement: result.measurement}})
+				} else {
+					reply(contextMeasureReply{measurement: result.measurement})
+				}
+				continue
+			}
 			coordinated := false
 			dispatch := func() { coordinated = dispatchCompactionBoundary(compactionBoundaryStep) }
 			if config.beforeCompactionBoundary != nil {
@@ -1972,17 +1981,20 @@ func runLoop(cfg loopConfig, state loopState) {
 
 		case outcome := <-contextOutcomes:
 			attempt := compactions.complete(outcome.attemptID)
-			if outcome.result.Canonical {
-				if attempt == nil || !outcome.result.Reason.Valid() || outcome.result.Basis.Revision == 0 || outcome.result.Basis.ThroughEventID.IsZero() || attempt.Reason != outcome.result.Reason {
-					outcome.reply <- contextCompactionOutcomeReply{err: &contextCompactionOutcomeError{AttemptID: outcome.attemptID}}
-					continue
-				}
+			rejection, exhaust, validationErr := validateCanonicalCompactionRejection(attempt, outcome.result.CanonicalRejection)
+			if validationErr != nil {
+				outcome.reply <- contextCompactionOutcomeReply{err: validationErr}
+				continue
 			}
-			if outcome.result.Disposition == contextCompactionAwaitRejected {
-				state.contextTracker.exhaustAutomatic(outcome.result.Basis, outcome.result.Reason, outcome.result.Canonical)
+			if rejection != nil && outcome.result.Disposition != contextCompactionAwaitRejected {
+				outcome.reply <- contextCompactionOutcomeReply{err: &contextCompactionOutcomeError{AttemptID: outcome.attemptID}}
+				continue
+			}
+			if exhaust {
+				state.contextTracker.exhaustAutomatic(rejection.Basis, rejection.Reason, true)
 			}
 			settings, configured := contextSettings(config)
-			retry := configured && settings.Automatic && outcome.result.Canonical && outcome.result.Disposition == contextCompactionAwaitRejected && outcome.result.Reason == event.CompactionReasonManual && outcome.result.Basis == state.contextTracker.currentBasis()
+			retry := configured && settings.Automatic && rejection != nil && outcome.result.Disposition == contextCompactionAwaitRejected && rejection.Reason == event.CompactionReasonManual && rejection.Basis == state.contextTracker.currentBasis()
 			outcome.reply <- contextCompactionOutcomeReply{retry: retry}
 
 		case result := <-admissions:

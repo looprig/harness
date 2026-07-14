@@ -345,3 +345,72 @@ func TestContextTrackerRestoreSuppressesOnlyRecordedAutomaticBasis(t *testing.T)
 		})
 	}
 }
+
+func TestValidateCanonicalCompactionRejectionIdentity(t *testing.T) {
+	t.Parallel()
+	attemptID := event.CompactAttemptID(uuid.UUID{1})
+	basis := event.ContextBasis{Revision: 3, ThroughEventID: uuid.UUID{3}}
+	valid := event.CompactionRejected{
+		Header: event.Header{
+			EventID:     uuid.UUID{9},
+			Coordinates: identity.Coordinates{SessionID: uuid.UUID{7}, LoopID: uuid.UUID{8}},
+		},
+		AttemptID:        attemptID,
+		WaiterCommandIDs: []uuid.UUID{{2}},
+		Reason:           event.CompactionReasonAutomatic,
+		Basis:            basis,
+		RejectReason:     event.CompactRejectExecutionFailed,
+	}
+	automatic := &compactionAttempt{AttemptID: attemptID, Reason: event.CompactionReasonAutomatic, Basis: basis}
+	manual := &compactionAttempt{AttemptID: attemptID, Reason: event.CompactionReasonManual, Basis: basis}
+	tests := []struct {
+		name        string
+		attempt     *compactionAttempt
+		rejection   *event.CompactionRejected
+		wantPresent bool
+		wantExhaust bool
+		wantErr     bool
+	}{
+		{name: "valid automatic canonical rejection", attempt: automatic, rejection: &valid, wantPresent: true, wantExhaust: true},
+		{name: "zero terminal event id", attempt: automatic, rejection: func() *event.CompactionRejected { value := valid; value.EventID = uuid.UUID{}; return &value }(), wantErr: true},
+		{name: "mismatched attempt id", attempt: automatic, rejection: func() *event.CompactionRejected {
+			value := valid
+			value.AttemptID = event.CompactAttemptID(uuid.UUID{4})
+			return &value
+		}(), wantErr: true},
+		{name: "mismatched opener reason", attempt: automatic, rejection: func() *event.CompactionRejected {
+			value := valid
+			value.Reason = event.CompactionReasonManual
+			return &value
+		}(), wantErr: true},
+		{name: "mismatched attempted basis", attempt: automatic, rejection: func() *event.CompactionRejected {
+			value := valid
+			value.Basis = event.ContextBasis{Revision: 4, ThroughEventID: uuid.UUID{4}}
+			return &value
+		}(), wantErr: true},
+		{name: "manual canonical validates without exhausting", attempt: manual, rejection: func() *event.CompactionRejected {
+			value := valid
+			value.Reason = event.CompactionReasonManual
+			return &value
+		}(), wantPresent: true},
+		{name: "pre-start outcome has no canonical terminal", wantPresent: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, exhaust, err := validateCanonicalCompactionRejection(tt.attempt, tt.rejection)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("validateCanonicalCompactionRejection() error = %T %v, wantErr=%v", err, err, tt.wantErr)
+			}
+			if tt.wantErr {
+				var typed *contextCompactionOutcomeError
+				if !errors.As(err, &typed) {
+					t.Fatalf("error = %T %v, want *contextCompactionOutcomeError", err, err)
+				}
+				return
+			}
+			if (got != nil) != tt.wantPresent || exhaust != tt.wantExhaust {
+				t.Fatalf("result present=%v exhaust=%v, want present=%v exhaust=%v", got != nil, exhaust, tt.wantPresent, tt.wantExhaust)
+			}
+		})
+	}
+}

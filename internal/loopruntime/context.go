@@ -25,9 +25,9 @@ const (
 
 type contextCompactionAwaitResult struct {
 	Disposition contextCompactionAwaitDisposition
-	Canonical   bool
-	Reason      event.CompactionReason
-	Basis       event.ContextBasis
+	// CanonicalRejection is non-nil only when the awaiter observed the exact
+	// durably appended terminal event for this attempt.
+	CanonicalRejection *event.CompactionRejected
 }
 
 type contextCompactionAwaiter interface {
@@ -54,10 +54,32 @@ func (e *contextCompactionAwaitError) Error() string {
 
 func (e *contextCompactionAwaitError) Unwrap() error { return e.Cause }
 
-type contextCompactionOutcomeError struct{ AttemptID event.CompactAttemptID }
+type contextCompactionOutcomeError struct {
+	AttemptID event.CompactAttemptID
+	Cause     error
+}
 
 func (*contextCompactionOutcomeError) Error() string {
 	return "loopruntime: invalid canonical compaction outcome identity"
+}
+
+func (e *contextCompactionOutcomeError) Unwrap() error { return e.Cause }
+
+func validateCanonicalCompactionRejection(attempt *compactionAttempt, rejected *event.CompactionRejected) (*event.CompactionRejected, bool, error) {
+	if rejected == nil {
+		return nil, false, nil
+	}
+	if attempt == nil {
+		return nil, false, &contextCompactionOutcomeError{AttemptID: rejected.AttemptID}
+	}
+	if err := event.ValidateEvent(*rejected); err != nil {
+		return nil, false, &contextCompactionOutcomeError{AttemptID: attempt.AttemptID, Cause: err}
+	}
+	if rejected.AttemptID != attempt.AttemptID || rejected.Reason != attempt.Reason || rejected.Basis != attempt.Basis {
+		return nil, false, &contextCompactionOutcomeError{AttemptID: attempt.AttemptID}
+	}
+	copyOfRejection := *rejected
+	return &copyOfRejection, rejected.Reason == event.CompactionReasonAutomatic, nil
 }
 
 type contextRevisionOverflowError struct{}
