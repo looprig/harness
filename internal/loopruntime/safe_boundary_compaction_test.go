@@ -25,13 +25,29 @@ type executorTestCompactor struct {
 	input   loop.CompactionInput
 }
 
-type echoExecutorCompactor struct{ summary *content.UserMessage }
+type echoExecutorCompactor struct {
+	mu      sync.Mutex
+	summary *content.UserMessage
+	input   loop.CompactionInput
+}
 
 func (c *echoExecutorCompactor) CompactAndFinalize(ctx context.Context, input loop.CompactionInput, finalizer func(context.Context, CompactionOutcome) error) error {
+	c.mu.Lock()
+	c.input = input
+	c.input.Transcript = cloneMessages(input.Transcript)
+	c.mu.Unlock()
 	return finalizer(ctx, CompactionOutcome{Value: &loop.CompactionOutput{
 		Basis: input.Basis, Model: input.Model, RequestFingerprint: input.RequestFingerprint,
 		Summary: cloneUserMessage(c.summary),
 	}})
+}
+
+func (c *echoExecutorCompactor) capturedInput() loop.CompactionInput {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	input := c.input
+	input.Transcript = cloneMessages(input.Transcript)
+	return input
 }
 
 type gatedExecutorCompactor struct {
@@ -445,6 +461,118 @@ func TestLoopCompactsToolContinuationAtPostStepBoundary(t *testing.T) {
 			wantOrder := []string{"StepDone", "CompactionStarted", "CompactionCommitted", "CompactWaiterResolved", "StepDone"}
 			if !reflect.DeepEqual(names, wantOrder) {
 				t.Fatalf("boundary event order = %v, want %v", names, wantOrder)
+			}
+		})
+	}
+}
+
+func TestLoopManualCompactionFreezesPostStepCandidate(t *testing.T) {
+	tests := []struct{ name string }{{name: "command during inference freezes actual tool continuation boundary"}}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			t.Cleanup(cancel)
+			recorder := &recordingPublisher{}
+			streamStarted := make(chan struct{})
+			streamRelease := make(chan struct{})
+			client := &scriptedLLM{
+				scripts: [][]content.Chunk{
+					{toolUseChunk(0, "tool-1", "Echo", `{"value":1}`)},
+					{textChunk("continued from summary")},
+				},
+				onStreamN: map[int]func(){0: func() { close(streamStarted); <-streamRelease }},
+			}
+			counter := &loopContextCounter{
+				capability: contextTestCapability(inference.CountQualityExactLocal), counts: []content.TokenCount{40, 65, 20, 25},
+			}
+			model := testModel()
+			model.Limits = inference.ContextLimits{WindowTokens: 100, MaxInputTokens: 80, MaxOutputTokens: 20}
+			settings := contextAdmissionSettings{ReservedOutput: 20, CountTimeout: time.Second}
+			compactor := &echoExecutorCompactor{summary: validFinalizationSummary()}
+			executor, err := newCompactionExecutor(ctx, compactionExecutorConfig{
+				Compactor: compactor, Counter: counter, CounterCapability: counter.capability,
+				InferenceCapability: contextTestInferenceCapability(), Settings: settings, MaxSummaryTokens: 10,
+			})
+			if err != nil {
+				t.Fatalf("newCompactionExecutor() error = %v", err)
+			}
+			sessionID, loopID := uuid.UUID{161}, uuid.UUID{162}
+			actor, err := newWithConfig(ctx, sessionID, loopID, Provenance{}, recorder, runtimeConfig{
+				Client: client, Model: model, DrainTimeout: 200 * time.Millisecond,
+				Tools:          agenticToolSet([]tool.InvokableTool{&echoTool{name: "Echo", output: "tool output"}}, 25, 100),
+				ContextCounter: counter, CounterCapability: counter.capability, InferenceCapability: contextTestInferenceCapability(),
+				Compaction: &loop.CompactionPolicy{
+					CounterPolicy: loop.CounterPolicyRequireExact, ReservedOutput: 20,
+					MaxSummaryTokens: 10, CountTimeout: time.Second, Hustle: "context.compact",
+				},
+				compactionSink: executor,
+			})
+			if err != nil {
+				t.Fatalf("newWithConfig() error = %v", err)
+			}
+			startTurn(t, actor, recorder, textBlocks("start"))
+			select {
+			case <-streamStarted:
+			case <-time.After(2 * time.Second):
+				t.Fatal("first inference did not start")
+			}
+			firstWaiterID := uuid.UUID{163}
+			secondWaiterID := uuid.UUID{164}
+			sendCompact(t, actor, sessionID, loopID, firstWaiterID, identity.AgencyUser)
+			syncLoopActor(t, actor)
+			sendCompact(t, actor, sessionID, loopID, secondWaiterID, identity.AgencyMachine)
+			syncLoopActor(t, actor)
+			close(streamRelease)
+			if terminal := drainToTerminal(t, recorder); reflect.TypeOf(terminal) != reflect.TypeOf(event.TurnDone{}) {
+				t.Fatalf("terminal = %T %+v, want TurnDone", terminal, terminal)
+			}
+			var measurements []event.ContextMeasurement
+			var steps []event.StepDone
+			var started *event.CompactionStarted
+			var committed *event.CompactionCommitted
+			for _, published := range recorder.events() {
+				switch value := published.(type) {
+				case event.ContextMeasured:
+					measurements = append(measurements, value.Measurement)
+				case event.StepDone:
+					steps = append(steps, value)
+				case event.CompactionStarted:
+					copyOfValue := value
+					started = &copyOfValue
+				case event.CompactionCommitted:
+					copyOfValue := value
+					committed = &copyOfValue
+				}
+			}
+			if len(measurements) < 2 || len(steps) != 2 || started == nil || committed == nil {
+				t.Fatalf("boundary evidence: measurements=%d steps=%d started=%+v committed=%+v", len(measurements), len(steps), started, committed)
+			}
+			postStep := measurements[1]
+			if postStep.Basis.ThroughEventID != steps[0].EventID || started.Basis != postStep.Basis || committed.Basis != postStep.Basis {
+				t.Fatalf("attempt basis: postStep=%+v started=%+v committed=%+v firstStep=%s", postStep.Basis, started.Basis, committed.Basis, steps[0].EventID)
+			}
+			if !equalUUIDs(committed.WaiterCommandIDs, []uuid.UUID{firstWaiterID, secondWaiterID}) {
+				t.Fatalf("committed waiters = %v, want both pre-freeze joiners", committed.WaiterCommandIDs)
+			}
+			resolved := make(map[uuid.UUID]int)
+			for _, published := range recorder.events() {
+				if waiter, ok := published.(event.CompactWaiterResolved); ok {
+					resolved[waiter.Cause.CommandID]++
+				}
+			}
+			if resolved[firstWaiterID] != 1 || resolved[secondWaiterID] != 1 || len(resolved) != 2 {
+				t.Fatalf("waiter resolutions = %v, want exactly one per pre-freeze joiner", resolved)
+			}
+			input := compactor.capturedInput()
+			if input.Basis != postStep.Basis || input.RequestFingerprint != postStep.RequestFingerprint {
+				t.Fatalf("compactor candidate identity = basis %+v fingerprint %x, want %+v %x", input.Basis, input.RequestFingerprint, postStep.Basis, postStep.RequestFingerprint)
+			}
+			if len(input.Transcript) != 3 || !reflect.DeepEqual(input.Transcript[1:], steps[0].Messages) {
+				t.Fatalf("compactor transcript = %#v, want committed user plus first StepDone messages %#v", input.Transcript, steps[0].Messages)
+			}
+			requests := client.requests()
+			if len(requests) != 2 || len(requests[1].Messages) != 1 || !reflect.DeepEqual(requests[1].Messages[0], validFinalizationSummary()) {
+				t.Fatalf("continuation request = %#v, want summary only", requests)
 			}
 		})
 	}

@@ -752,6 +752,22 @@ func runLoop(cfg loopConfig, state loopState) {
 		if config.compactionSink == nil {
 			return false
 		}
+		pending := compactions.pendingAttempt()
+		if pending != nil && pending.Basis == (event.ContextBasis{}) {
+			basis := state.contextTracker.currentBasis()
+			if candidate != nil {
+				basis = candidate.Measurement.Basis
+			}
+			if basis == (event.ContextBasis{}) && compactions.cancellationRejectReason() == event.CompactRejectUnspecified {
+				return false
+			}
+			if basis != (event.ContextBasis{}) {
+				if err := compactions.freezeBasis(pending.AttemptID, basis); err != nil {
+					reportCompactionFailure(pending.WaiterCommandIDs, err)
+					return false
+				}
+			}
+		}
 		disposition := compactions.atBoundary(boundary)
 		if disposition.Kind == compactionDispositionNone {
 			return true
@@ -1781,7 +1797,7 @@ func runLoop(cfg loopConfig, state loopState) {
 				}
 				return false
 			}
-			if admission.Kind == compactionAdmissionOpened {
+			if admission.Kind == compactionAdmissionOpened && state.status == loopIdle {
 				basis := state.contextTracker.currentBasis()
 				if basis.Revision != 0 && !basis.ThroughEventID.IsZero() {
 					if err := compactions.freezeBasis(admission.AttemptID, basis); err != nil {
