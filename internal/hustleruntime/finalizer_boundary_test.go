@@ -28,30 +28,32 @@ func TestProductionRunAndFinalizeConsumersAreFocusedAdapters(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			calls, err := productionRunAndFinalizeCalls(tt.root)
+			uses, err := productionRunAndFinalizeUses(tt.root)
 			if err != nil {
 				t.Fatalf("scan production consumers: %v", err)
 			}
-			for _, call := range calls {
-				if _, allowed := focusedFinalizerAdapterFiles[call.file]; !allowed {
-					t.Errorf("%s calls RunAndFinalize outside a registered focused adapter", call.location())
+			for _, use := range uses {
+				if _, allowed := focusedFinalizerAdapterFiles[use.file]; !allowed {
+					t.Errorf("%s selects RunAndFinalize outside a registered focused adapter", use.location())
 				}
 			}
 		})
 	}
 }
 
-func TestRunAndFinalizeCallDetection(t *testing.T) {
+func TestRunAndFinalizeSelectorDetection(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
 		name string
 		src  string
 		want int
 	}{
-		{name: "production call", src: `package adapter; func run(c C) { c.RunAndFinalize() }`, want: 1},
-		{name: "method declaration is not a call", src: `package adapter; type C struct{}; func (C) RunAndFinalize() {}`, want: 0},
-		{name: "method value is not a call", src: `package adapter; func keep(c C) { _ = c.RunAndFinalize }`, want: 0},
-		{name: "unrelated call", src: `package adapter; func stop(c C) { c.Close() }`, want: 0},
+		{name: "direct call", src: `package adapter; func run(c C) { c.RunAndFinalize() }`, want: 1},
+		{name: "method declaration is not a selector", src: `package adapter; type C struct{}; func (C) RunAndFinalize() {}`, want: 0},
+		{name: "method value", src: `package adapter; func keep(c C) { _ = c.RunAndFinalize }`, want: 1},
+		{name: "pass through argument", src: `package adapter; func pass(c C) { consume(c.RunAndFinalize) }`, want: 1},
+		{name: "returned method value", src: `package adapter; func pass(c C) F { return c.RunAndFinalize }`, want: 1},
+		{name: "unrelated selector", src: `package adapter; func stop(c C) { c.Close() }`, want: 0},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -61,22 +63,22 @@ func TestRunAndFinalizeCallDetection(t *testing.T) {
 			if err != nil {
 				t.Fatalf("parse fixture: %v", err)
 			}
-			if got := len(runAndFinalizeCallLines(fileSet, file)); got != tt.want {
-				t.Fatalf("RunAndFinalize calls = %d, want %d", got, tt.want)
+			if got := len(runAndFinalizeSelectorLines(fileSet, file)); got != tt.want {
+				t.Fatalf("RunAndFinalize selector uses = %d, want %d", got, tt.want)
 			}
 		})
 	}
 }
 
-type productionFinalizerCall struct {
+type productionFinalizerUse struct {
 	file string
 	line int
 }
 
-func (c productionFinalizerCall) location() string { return fmt.Sprintf("%s:%d", c.file, c.line) }
+func (u productionFinalizerUse) location() string { return fmt.Sprintf("%s:%d", u.file, u.line) }
 
-func productionRunAndFinalizeCalls(root string) ([]productionFinalizerCall, error) {
-	var calls []productionFinalizerCall
+func productionRunAndFinalizeUses(root string) ([]productionFinalizerUse, error) {
+	var uses []productionFinalizerUse
 	err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
@@ -99,12 +101,12 @@ func productionRunAndFinalizeCalls(root string) ([]productionFinalizerCall, erro
 		if err != nil {
 			return err
 		}
-		for _, line := range runAndFinalizeCallLines(fileSet, file) {
-			calls = append(calls, productionFinalizerCall{file: filepath.ToSlash(relative), line: line})
+		for _, line := range runAndFinalizeSelectorLines(fileSet, file) {
+			uses = append(uses, productionFinalizerUse{file: filepath.ToSlash(relative), line: line})
 		}
 		return nil
 	})
-	return calls, err
+	return uses, err
 }
 
 func productionScanExcludedDirectory(relative string) bool {
@@ -112,21 +114,17 @@ func productionScanExcludedDirectory(relative string) bool {
 		return false
 	}
 	base := filepath.Base(relative)
-	if base == "vendor" || base == ".git" || base == ".worktrees" {
-		return true
-	}
-	return filepath.ToSlash(relative) == "internal/hustleruntime"
+	return base == "vendor" || base == ".git" || base == ".worktrees"
 }
 
-func runAndFinalizeCallLines(fileSet *token.FileSet, file *ast.File) []int {
+func runAndFinalizeSelectorLines(fileSet *token.FileSet, file *ast.File) []int {
 	var lines []int
 	ast.Inspect(file, func(node ast.Node) bool {
-		call, ok := node.(*ast.CallExpr)
+		selector, ok := node.(*ast.SelectorExpr)
 		if !ok {
 			return true
 		}
-		selector, ok := call.Fun.(*ast.SelectorExpr)
-		if ok && selector.Sel.Name == "RunAndFinalize" {
+		if selector.Sel.Name == "RunAndFinalize" {
 			lines = append(lines, fileSet.Position(selector.Sel.Pos()).Line)
 		}
 		return true
