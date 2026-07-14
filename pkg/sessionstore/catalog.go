@@ -1389,7 +1389,7 @@ func (s *Store) OpenCatalog(opts ...CatalogOption) *Catalog {
 // entry's LastJournalSeq (monotonic max) and stamps the LastTurn/LastStep summaries, so a
 // status reader can resume from it.
 func (c *Catalog) UpdateOnEvent(ctx context.Context, ev event.Event, seq uint64) error {
-	if isHustleTerminal(ev) {
+	if isHustleTerminal(ev) || isCompactionTerminal(ev) {
 		if _, err := c.RepairCatalog(ctx, ev.EventHeader().SessionID); err != nil {
 			c.log.CatalogUpdateFailed(err)
 		}
@@ -1417,6 +1417,15 @@ func (c *Catalog) UpdateOnEvent(ctx context.Context, ev event.Event, seq uint64)
 		c.log.CatalogUpdateFailed(err)
 	}
 	return nil
+}
+
+func isCompactionTerminal(ev event.Event) bool {
+	switch ev.(type) {
+	case event.CompactionCommitted, event.CompactionRejected:
+		return true
+	default:
+		return false
+	}
 }
 
 func isHustleTerminal(ev event.Event) bool {

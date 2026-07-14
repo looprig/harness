@@ -430,37 +430,47 @@ type restoredCompactionWaiterKey struct {
 	command uuid.UUID
 }
 
+type restoredCompactionOutcome struct {
+	key   restoredCompactionWaiterKey
+	event event.Event
+}
+
 // planCompactWaiterRepairs validates canonical terminal uniqueness and returns
 // only terminal members whose exact durable reply is absent. It is a pure fold:
 // the authoritative replay remains untouched and in its original order.
 func planCompactWaiterRepairs(events []event.Event) ([]event.Event, error) {
-	terminals := make(map[event.CompactAttemptID]struct{})
+	terminals := make(map[event.CompactAttemptID]restoredCompactionTerminal)
 	ordered := make([]restoredCompactionTerminal, 0)
 	outcomes := make(map[restoredCompactionWaiterKey][]event.Event)
+	outcomeOrder := make([]restoredCompactionOutcome, 0)
 	for _, ev := range events {
 		switch typed := ev.(type) {
 		case event.CompactionCommitted:
 			if _, exists := terminals[typed.AttemptID]; exists {
 				return nil, &restoredCompactionError{Kind: restoredCompactionDuplicateTerminal, AttemptID: typed.AttemptID}
 			}
-			terminals[typed.AttemptID] = struct{}{}
-			ordered = append(ordered, restoredCompactionTerminal{
+			terminal := restoredCompactionTerminal{
 				event: typed, attempt: typed.AttemptID, waiters: typed.WaiterCommandIDs, resolved: true,
-			})
+			}
+			terminals[typed.AttemptID] = terminal
+			ordered = append(ordered, terminal)
 		case event.CompactionRejected:
 			if _, exists := terminals[typed.AttemptID]; exists {
 				return nil, &restoredCompactionError{Kind: restoredCompactionDuplicateTerminal, AttemptID: typed.AttemptID}
 			}
-			terminals[typed.AttemptID] = struct{}{}
-			ordered = append(ordered, restoredCompactionTerminal{
+			terminal := restoredCompactionTerminal{
 				event: typed, attempt: typed.AttemptID, waiters: typed.WaiterCommandIDs,
-			})
+			}
+			terminals[typed.AttemptID] = terminal
+			ordered = append(ordered, terminal)
 		case event.CompactWaiterResolved:
 			key := restoredCompactionWaiterKey{attempt: typed.AttemptID, command: typed.Cause.CommandID}
 			outcomes[key] = append(outcomes[key], typed)
+			outcomeOrder = append(outcomeOrder, restoredCompactionOutcome{key: key, event: typed})
 		case event.CompactWaiterRejected:
 			key := restoredCompactionWaiterKey{attempt: typed.AttemptID, command: typed.Cause.CommandID}
 			outcomes[key] = append(outcomes[key], typed)
+			outcomeOrder = append(outcomeOrder, restoredCompactionOutcome{key: key, event: typed})
 		}
 	}
 
@@ -482,7 +492,39 @@ func planCompactWaiterRepairs(events []event.Event) ([]event.Event, error) {
 			}
 		}
 	}
+	for _, outcome := range outcomeOrder {
+		key := outcome.key
+		terminal, hasTerminal := terminals[key.attempt]
+		if !hasTerminal || restoredCompactionHasWaiter(terminal.waiters, key.command) {
+			continue
+		}
+		if !restoredCompactionOverflowMatches(terminal, key.command, outcome.event) {
+			return nil, &restoredCompactionError{
+				Kind: restoredCompactionWaiterMismatch, AttemptID: key.attempt, CommandID: key.command,
+			}
+		}
+	}
 	return repairs, nil
+}
+
+func restoredCompactionHasWaiter(waiters []uuid.UUID, commandID uuid.UUID) bool {
+	for _, waiter := range waiters {
+		if waiter == commandID {
+			return true
+		}
+	}
+	return false
+}
+
+func restoredCompactionOverflowMatches(terminal restoredCompactionTerminal, commandID uuid.UUID, outcome event.Event) bool {
+	rejected, ok := outcome.(event.CompactWaiterRejected)
+	if !ok {
+		return false
+	}
+	return rejected.AttemptID == terminal.attempt && rejected.Cause.CommandID == commandID &&
+		rejected.Coordinates == terminal.event.EventHeader().Coordinates &&
+		rejected.Reason == event.CompactRejectControlLaneFull &&
+		rejected.EventID == event.CompactWaiterReplyID(terminal.attempt, commandID, false)
 }
 
 func restoredCompactionRepair(terminal restoredCompactionTerminal, commandID uuid.UUID) event.Event {

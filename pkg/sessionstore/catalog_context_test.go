@@ -186,6 +186,65 @@ func TestCatalogRepairRejectsDuplicateCompactionTerminal(t *testing.T) {
 	}
 }
 
+func TestCatalogLiveCompactionConflictPreservesProjectedContext(t *testing.T) {
+	t.Parallel()
+	sessionID, loopID := uuid.UUID{0x91}, uuid.UUID{0x92}
+	started := event.SessionStarted{Header: event.Header{
+		EventID: uuid.UUID{0x90}, Coordinates: identity.Coordinates{SessionID: sessionID},
+	}}
+	first := catalogCompactionCommitted(30, sessionID, loopID)
+	first.PostContext.Basis.ThroughEventID = first.EventID
+	secondCommitted := catalogCompactionCommitted(40, sessionID, loopID)
+	secondCommitted.AttemptID = first.AttemptID
+	secondCommitted.PostContext.Basis.ThroughEventID = secondCommitted.EventID
+	secondRejected := event.CompactionRejected{
+		Header:    event.Header{EventID: uuid.UUID{0x51}, Coordinates: first.Coordinates},
+		AttemptID: first.AttemptID, WaiterCommandIDs: append([]uuid.UUID(nil), first.WaiterCommandIDs...),
+		Reason: event.CompactionReasonManual, Basis: first.Basis, RejectReason: event.CompactRejectExecutionFailed,
+	}
+	tests := []struct {
+		name   string
+		second event.Event
+	}{
+		{name: "committed then distinct committed", second: secondCommitted},
+		{name: "committed then rejected", second: secondRejected},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			store, err := Open(memstore.New())
+			if err != nil {
+				t.Fatal(err)
+			}
+			opener := &fakeOpener{events: []event.Event{started, first}}
+			log := &recordingLogger{}
+			catalog := store.OpenCatalog(WithCatalogReplayer(opener), WithCatalogLogger(log))
+			if err := catalog.UpdateOnEvent(context.Background(), first, 2); err != nil {
+				t.Fatalf("first UpdateOnEvent() error = %v", err)
+			}
+			opener.events = []event.Event{started, first, tt.second}
+			if err := catalog.UpdateOnEvent(context.Background(), tt.second, 3); err != nil {
+				t.Fatalf("second UpdateOnEvent() error = %v, want nil best-effort", err)
+			}
+			if log.count() != 1 {
+				t.Fatalf("logged errors = %d, want 1", log.count())
+			}
+			var compactionErr *CatalogCompactionError
+			if !errors.As(log.errs[0], &compactionErr) || compactionErr.Kind != CatalogCompactionDuplicateTerminal {
+				t.Fatalf("logged error = %T %v, want *CatalogCompactionError{%q}", log.errs[0], log.errs[0], CatalogCompactionDuplicateTerminal)
+			}
+			meta, found, err := catalog.ReadMeta(context.Background(), sessionID)
+			if err != nil || !found {
+				t.Fatalf("ReadMeta() = %#v, %v, %v", meta, found, err)
+			}
+			index, found := loopUsageIndex(meta.Loops, loopID)
+			if !found || meta.Loops[index].CurrentContext != first.PostContext || meta.Loops[index].ContextSeq != 2 {
+				t.Fatalf("projected context = %#v, want first committed context at seq 2", meta.Loops)
+			}
+		})
+	}
+}
+
 func TestCatalogContextOrderingIsPerLoop(t *testing.T) {
 	t.Parallel()
 	sessionID := uuid.UUID{7}

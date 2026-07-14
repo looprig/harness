@@ -131,6 +131,38 @@ func TestPlanCompactWaiterRepairs(t *testing.T) {
 		},
 		AttemptID: rejected.AttemptID, Reason: rejected.RejectReason,
 	}
+	nonMemberCommand := uuid.UUID{0xc3}
+	nonMemberResolved := event.CompactWaiterResolved{
+		Header: event.Header{
+			EventID:     event.CompactWaiterReplyID(committed.AttemptID, nonMemberCommand, true),
+			Coordinates: committed.Coordinates, Cause: identity.Cause{CommandID: nonMemberCommand},
+		},
+		AttemptID: committed.AttemptID, CommittedEventID: committed.EventID,
+	}
+	nonMemberRejected := event.CompactWaiterRejected{
+		Header: event.Header{
+			EventID:     event.CompactWaiterReplyID(committed.AttemptID, nonMemberCommand, false),
+			Coordinates: committed.Coordinates, Cause: identity.Cause{CommandID: nonMemberCommand},
+		},
+		AttemptID: committed.AttemptID, Reason: event.CompactRejectCanceled,
+	}
+	laneFull := nonMemberRejected
+	laneFull.Reason = event.CompactRejectControlLaneFull
+	orphanAttempt := event.CompactAttemptID(uuid.UUID{0xd1})
+	orphanResolved := event.CompactWaiterResolved{
+		Header: event.Header{
+			EventID:     event.CompactWaiterReplyID(orphanAttempt, uuid.UUID{0xd2}, true),
+			Coordinates: committed.Coordinates, Cause: identity.Cause{CommandID: uuid.UUID{0xd2}},
+		},
+		AttemptID: orphanAttempt, CommittedEventID: uuid.UUID{0xd3},
+	}
+	orphanRejected := event.CompactWaiterRejected{
+		Header: event.Header{
+			EventID:     event.CompactWaiterReplyID(orphanAttempt, uuid.UUID{0xd4}, false),
+			Coordinates: committed.Coordinates, Cause: identity.Cause{CommandID: uuid.UUID{0xd4}},
+		},
+		AttemptID: orphanAttempt, Reason: event.CompactRejectShuttingDown,
+	}
 	tests := []struct {
 		name     string
 		events   []event.Event
@@ -181,6 +213,66 @@ func TestPlanCompactWaiterRepairs(t *testing.T) {
 			wantKind: restoredCompactionWaiterMismatch,
 		},
 		{
+			name:     "resolved outcome for non-member is corrupt",
+			events:   []event.Event{committed, nonMemberResolved},
+			wantKind: restoredCompactionWaiterMismatch,
+		},
+		{
+			name:     "non-lane-full rejection for non-member is corrupt",
+			events:   []event.Event{committed, nonMemberRejected},
+			wantKind: restoredCompactionWaiterMismatch,
+		},
+		{
+			name: "lane-full rejection for overflow non-member is valid",
+			events: []event.Event{func() event.Event {
+				value := committed
+				value.WaiterCommandIDs = []uuid.UUID{w1}
+				return value
+			}(), matchingResolved, laneFull},
+		},
+		{
+			name: "lane-full rejection with foreign coordinates is corrupt",
+			events: []event.Event{committed, func() event.Event {
+				value := laneFull
+				value.Coordinates.LoopID = uuid.UUID{0xee}
+				return value
+			}()},
+			wantKind: restoredCompactionWaiterMismatch,
+		},
+		{
+			name:   "waiter-only attempt without terminal remains valid",
+			events: []event.Event{orphanResolved, orphanRejected},
+		},
+		{
+			name: "member resolved outcome with foreign coordinates is corrupt",
+			events: []event.Event{committed, func() event.Event {
+				value := matchingResolved
+				value.Coordinates.LoopID = uuid.UUID{0xee}
+				return value
+			}()},
+			wantKind: restoredCompactionWaiterMismatch,
+		},
+		{
+			name: "member rejected outcome with contradictory reason is corrupt",
+			events: []event.Event{rejected, func() event.Event {
+				value := matchingRejected
+				value.Reason = event.CompactRejectCanceled
+				return value
+			}()},
+			wantKind: restoredCompactionWaiterMismatch,
+		},
+		{
+			name: "resolved outcome contradicts rejected terminal type",
+			events: []event.Event{rejected, event.CompactWaiterResolved{
+				Header: event.Header{
+					EventID:     event.CompactWaiterReplyID(rejected.AttemptID, w1, true),
+					Coordinates: rejected.Coordinates, Cause: identity.Cause{CommandID: w1},
+				},
+				AttemptID: rejected.AttemptID, CommittedEventID: uuid.UUID{0xef},
+			}},
+			wantKind: restoredCompactionWaiterMismatch,
+		},
+		{
 			name:     "duplicate terminal attempt is corrupt",
 			events:   []event.Event{committed, committed},
 			wantKind: restoredCompactionDuplicateTerminal,
@@ -189,6 +281,11 @@ func TestPlanCompactWaiterRepairs(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
+			for _, ev := range tt.events {
+				if err := event.ValidateEvent(ev); err != nil {
+					t.Fatalf("test fixture %T is not structurally valid: %v", ev, err)
+				}
+			}
 			before := append([]event.Event(nil), tt.events...)
 			got, err := planCompactWaiterRepairs(tt.events)
 			var repairErr *restoredCompactionError
