@@ -158,7 +158,7 @@ func encodePayload(ev Event) ([]byte, error) {
 		RestoreStarted, RestoreDone, WorkspaceCheckpointed, WorkspaceRestored,
 		ActiveLoopChanged, SecurityCeilingChanged,
 		HustleStarted, HustleCompleted, HustleFailed,
-		LoopIdle, LoopStarted, DelegateRequestAccepted, LoopInferenceChanged, LoopModeChanged,
+		LoopIdle, LoopStarted, DelegateRequestAccepted, LoopInferenceChanged, LoopModeChanged, ContextMeasured,
 		ForeignSessionBound, TurnRejected,
 		UserInputRequested, TurnInterrupted,
 		TurnStarted, TurnFoldedInto, InputCancelled, TurnDone,
@@ -578,6 +578,8 @@ func decodePayload(tag string, data []byte) (Event, error) {
 		return decodeLoopInferenceChanged(data)
 	case "LoopModeChanged":
 		return decodePlain[LoopModeChanged](tag, data)
+	case "ContextMeasured":
+		return decodePlain[ContextMeasured](tag, data)
 	case "ForeignSessionBound":
 		return decodePlain[ForeignSessionBound](tag, data)
 	case "TurnStarted":

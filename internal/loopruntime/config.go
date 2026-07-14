@@ -51,11 +51,21 @@ func resolveMode(bound loop.BoundDefinition, modeName loop.ModeName) (runtimeCon
 	}
 	model := mode.Model
 	limits := mode.ToolLimits
-	return runtimeConfig{
+	resolved := runtimeConfig{
 		Client: bound.Client(), Model: model, System: loop.EffectiveSystem(bound.System(), mode.Instructions), DrainTimeout: bound.DrainTimeout(),
 		AgentName: bound.Name(), Engine: bound.Engine(), RuntimeContext: bound.RuntimeContext(),
 		Tools: ToolSet{Permission: bound.Permission(), Registry: mode.Tools, Middlewares: bound.Middlewares(), MaxToolIterations: limits.Iterations, MaxToolCallsPerTurn: limits.Calls, MaxParallelToolCalls: limits.Parallel},
-	}, nil
+	}
+	if capability, configured := bound.CounterCapability(); configured {
+		resolved.ContextCounter = bound.ContextCounter()
+		resolved.CounterCapability = capability
+		resolved.InferenceCapability, _ = bound.InferenceCapability()
+	}
+	if policy, configured := bound.CompactionPolicy(); configured {
+		copyOfPolicy := policy
+		resolved.Compaction = &copyOfPolicy
+	}
+	return resolved, nil
 }
 
 // requireBound rejects a nil (or typed-nil) bound definition with a typed BindError. The
@@ -102,6 +112,11 @@ type runtimeConfig struct {
 	// assembled exactly as it was before — no extra blocks. The interface keeps the
 	// loop free of os/exec; the concrete provider is wired at the composition root.
 	RuntimeContext RuntimeContextProvider
+
+	ContextCounter      inference.ContextCounter
+	CounterCapability   inference.CounterCapability
+	InferenceCapability inference.InferenceCapability
+	Compaction          *loop.CompactionPolicy
 
 	// idGen mints the loop's correlation IDs: the per-turn TurnID, each StepID,
 	// and each tool-call ToolExecutionID. It is unexported, so the composition root cannot

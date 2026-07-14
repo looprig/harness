@@ -38,6 +38,9 @@ type RestoredState struct {
 	// transport fields while this durable payload restores identity, limits, and effort.
 	Runtime    event.ModelRuntime
 	HasRuntime bool
+
+	Context    event.ContextMeasurement
+	HasContext bool
 }
 
 // NewRestored constructs a loop SEEDED with pre-built committed state and starts its

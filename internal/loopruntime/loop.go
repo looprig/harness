@@ -353,6 +353,7 @@ func newLoopWithSeed(loopCtx context.Context, sessionID, loopID uuid.UUID, paren
 		system: cfg.System,
 		tools:  cfg.Tools,
 	}
+	state.runtime = modelRuntime(cfg.Model, cfg.Model.Sampling.Effort)
 	if seed != nil {
 		// Restore seed: come up with the folded committed history and turn count. The
 		// status stays loopIdle (newLoopState's zero default), so the resumed loop
@@ -361,6 +362,11 @@ func newLoopWithSeed(loopCtx context.Context, sessionID, loopID uuid.UUID, paren
 		// — so seeding msgs alone reproduces loopState exactly as it was committed.
 		state.msgs = cloneMessages(seed.Msgs)
 		state.turnIndex = seed.TurnIndex
+		if seed.HasRuntime {
+			state.runtime = seed.Runtime
+		}
+		state.context = seed.Context
+		state.hasContext = seed.HasContext
 	}
 	go runLoop(lc, state)
 	return &Loop{Commands: commands, Done: done, gateReg: gateReg, snapshots: snapshots}, nil
@@ -432,6 +438,9 @@ type loopState struct {
 	cancelTurn      context.CancelFunc
 	cancelAdmission context.CancelFunc
 	msgs            content.AgenticMessages // conversation history across turns
+	runtime         event.ModelRuntime
+	context         event.ContextMeasurement
+	hasContext      bool
 
 	// effective is the loop's CURRENT turn-affecting configuration (mode/model/effort/
 	// system/tools). startTurn captures a copy of it into the per-turn turnConfig, so a
@@ -720,6 +729,8 @@ func runLoop(cfg loopConfig, state loopState) {
 		// TurnStarted (Message + Cause.CommandID = inputID + InputID = inputID) at the
 		// SAME actor-owned point, BEFORE runTurn starts.
 		state.msgs = append(state.msgs, qi.msg)
+		state.context = event.ContextMeasurement{}
+		state.hasContext = false
 		publishTurnStarted(started, capability)
 		return turnCtx, base
 	}
@@ -1361,6 +1372,9 @@ func runLoop(cfg loopConfig, state loopState) {
 			}
 		}
 		state.effective = next
+		state.runtime = modelRuntime(next.model, next.effort)
+		state.context = event.ContextMeasurement{}
+		state.hasContext = false
 		c.Ack <- command.LoopChangeResult{Mode: string(next.mode), Model: next.model, Effort: next.effort}
 	}
 
@@ -1391,6 +1405,12 @@ func runLoop(cfg loopConfig, state loopState) {
 				c.Ack <- command.LoopChangeResult{Err: &loop.ChangeError{Kind: loop.ChangeInvalidModel, Cause: verr}}
 				return
 			}
+			if cfg.bound != nil {
+				if verr := cfg.bound.ValidateContextModel(model); verr != nil {
+					c.Ack <- command.LoopChangeResult{Err: &loop.ChangeError{Kind: loop.ChangeInvalidModel, Cause: verr}}
+					return
+				}
+			}
 		}
 		if c.SetEffort {
 			effort = c.Effort
@@ -1410,6 +1430,9 @@ func runLoop(cfg loopConfig, state loopState) {
 		}
 		state.effective.model = model
 		state.effective.effort = effort
+		state.runtime = modelRuntime(model, effort)
+		state.context = event.ContextMeasurement{}
+		state.hasContext = false
 		c.Ack <- command.LoopChangeResult{Mode: string(state.effective.mode), Model: model, Effort: effort}
 	}
 
@@ -1654,6 +1677,8 @@ func runLoop(cfg loopConfig, state loopState) {
 			// StepDone emitted here always follows that step's TokenDeltas on the
 			// fan-in. Ack last so the runner only resumes after the event is published.
 			state.msgs = append(state.msgs, req.commit.Messages...)
+			state.context = event.ContextMeasurement{}
+			state.hasContext = false
 			var boundaryErr error
 			if _, ok := req.commit.Event.(event.StepDone); ok {
 				boundaryErr = commitBoundary(req.commit.Event)

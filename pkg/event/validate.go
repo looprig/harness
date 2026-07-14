@@ -153,6 +153,16 @@ func validateEventBody(ev Event) error {
 		return validateModelRuntime("LoopModeChanged", e.Runtime)
 	case LoopStarted:
 		return validateModelRuntime("LoopStarted", e.Runtime)
+	case ContextMeasured:
+		if e.Visibility() != Public {
+			return &InvalidEventError{Event: "ContextMeasured", Field: FieldVisibility, Rule: RuleInvalid}
+		}
+		return e.Measurement.Validate()
+	case ContextPressure:
+		if e.Visibility() != Public {
+			return &InvalidEventError{Event: "ContextPressure", Field: FieldVisibility, Rule: RuleInvalid}
+		}
+		return validateContextPressure(e)
 	case HustleStarted:
 		if e.Visibility() != Internal {
 			return invalidHustle("HustleStarted", FieldVisibility)
@@ -414,6 +424,10 @@ func classify(ev Event) (name string, profile idProfile, ok bool) {
 		return "LoopInferenceChanged", loopProfile(), true
 	case LoopModeChanged:
 		return "LoopModeChanged", loopProfile(), true
+	case ContextMeasured:
+		return "ContextMeasured", loopProfile(), true
+	case ContextPressure:
+		return "ContextPressure", loopProfile(), true
 	case ForeignSessionBound:
 		return "ForeignSessionBound", loopProfile(), true
 	case TokenDelta:

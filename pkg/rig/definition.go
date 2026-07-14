@@ -105,6 +105,9 @@ func Define(options ...Option) (*Rig, error) {
 	if err := validateHustleRegistration(state); err != nil {
 		return nil, err
 	}
+	if err := validateCompactionHustles(state.loops, state.hustles); err != nil {
+		return nil, err
+	}
 	// Resolve the (at-most-one) workspace placement: canonicalize the root/base, derive the
 	// exclusive root lease name, and enforce non-nil dependencies. A workspace-requiring
 	// tool with NO placement makes the rig invalid.
@@ -209,6 +212,35 @@ func validateHustleRegistration(state *definitionState) error {
 			return &DefinitionError{Kind: DefinitionDuplicateHustle, Name: string(name)}
 		}
 		seen[name] = struct{}{}
+	}
+	return nil
+}
+
+// validateCompactionHustles runs only after loop and hustle registration have
+// both been frozen and checked. Task 21 can enforce the definition-time lane and
+// model-source contract; Task 25's focused adapter owns concrete XML/output
+// validation and deliberately does not widen the generic hustle descriptor here.
+func validateCompactionHustles(loops []loop.Definition, definitions []hustle.Definition) error {
+	byName := make(map[hustle.Name]hustle.Definition, len(definitions))
+	for _, definition := range definitions {
+		byName[definition.Name()] = definition
+	}
+	for _, loopDefinition := range loops {
+		policy, configured := loopDefinition.CompactionPolicy()
+		if !configured {
+			continue
+		}
+		definition, exists := byName[policy.Hustle]
+		if !exists {
+			return &DefinitionError{Kind: DefinitionMissingCompactionHustle, Name: string(policy.Hustle)}
+		}
+		descriptor := definition.Descriptor()
+		if err := descriptor.Validate(); err != nil {
+			return &DefinitionError{Kind: DefinitionIncompatibleCompactionHustle, Name: string(policy.Hustle), Cause: err}
+		}
+		if descriptor.Participation != hustle.ParticipationBlocking || descriptor.ModelSource != hustle.ModelSourceCurrentLoop {
+			return &DefinitionError{Kind: DefinitionIncompatibleCompactionHustle, Name: string(policy.Hustle)}
+		}
 	}
 	return nil
 }

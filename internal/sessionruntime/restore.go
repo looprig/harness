@@ -339,6 +339,8 @@ func restoredStateFrom(folded foldResult, ri restoredInference) loopruntime.Rest
 		HasMode:    ri.HasMode,
 		Runtime:    ri.Runtime,
 		HasRuntime: ri.HasRuntime,
+		Context:    folded.Context,
+		HasContext: folded.HasContext,
 	}
 }
 
@@ -361,9 +363,13 @@ func restoredStateFrom(folded foldResult, ri restoredInference) loopruntime.Rest
 // The Task 8.3 constructor closes such a turn by synthesizing a TurnInterrupted
 // before resuming, so a resumed loop never observes a half-open turn.
 type foldResult struct {
-	Msgs      content.AgenticMessages
-	TurnIndex event.TurnIndex
-	OpenTurn  bool
+	Msgs       content.AgenticMessages
+	TurnIndex  event.TurnIndex
+	OpenTurn   bool
+	Runtime    event.ModelRuntime
+	HasRuntime bool
+	Context    event.ContextMeasurement
+	HasContext bool
 }
 
 // foldLoop reconstructs a loop's committed msgs + turnIndex from an ordered
@@ -408,6 +414,10 @@ func foldLoop(events []event.Event) foldResult {
 	msgs := content.AgenticMessages{}
 	var turnIndex event.TurnIndex
 	openTurn := false
+	var runtime event.ModelRuntime
+	hasRuntime := false
+	var contextMeasurement event.ContextMeasurement
+	hasContext := false
 
 	for _, ev := range events {
 		switch e := ev.(type) {
@@ -417,12 +427,36 @@ func foldLoop(events []event.Event) foldResult {
 			turnIndex++
 			msgs = append(msgs, e.Message)
 			openTurn = true
+			contextMeasurement = event.ContextMeasurement{}
+			hasContext = false
 		case event.StepDone:
 			// The loop appends the finalized step group (AIMessage + ToolResultMessages).
 			msgs = append(msgs, e.Messages...)
+			contextMeasurement = event.ContextMeasurement{}
+			hasContext = false
 		case event.TurnFoldedInto:
 			// The loop commits the folded user message at the tool-continuation point.
 			msgs = append(msgs, e.Message)
+			contextMeasurement = event.ContextMeasurement{}
+			hasContext = false
+		case event.LoopStarted:
+			runtime = e.Runtime
+			hasRuntime = e.Runtime != (event.ModelRuntime{})
+			contextMeasurement = event.ContextMeasurement{}
+			hasContext = false
+		case event.LoopInferenceChanged:
+			runtime = e.Runtime
+			hasRuntime = e.Runtime != (event.ModelRuntime{})
+			contextMeasurement = event.ContextMeasurement{}
+			hasContext = false
+		case event.LoopModeChanged:
+			runtime = e.Runtime
+			hasRuntime = e.Runtime != (event.ModelRuntime{})
+			contextMeasurement = event.ContextMeasurement{}
+			hasContext = false
+		case event.ContextMeasured:
+			contextMeasurement = e.Measurement
+			hasContext = true
 		case event.TurnDone, event.TurnFailed, event.TurnInterrupted:
 			// A terminal closes the open turn. Its AIMessage (for TurnDone) was already
 			// committed via that step's StepDone, so the terminal adds nothing to msgs.
@@ -434,5 +468,9 @@ func foldLoop(events []event.Event) foldResult {
 		}
 	}
 
-	return foldResult{Msgs: msgs, TurnIndex: turnIndex, OpenTurn: openTurn}
+	return foldResult{
+		Msgs: msgs, TurnIndex: turnIndex, OpenTurn: openTurn,
+		Runtime: runtime, HasRuntime: hasRuntime,
+		Context: contextMeasurement, HasContext: hasContext,
+	}
 }

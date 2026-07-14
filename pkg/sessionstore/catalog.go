@@ -165,6 +165,11 @@ type LoopUsageMeta struct {
 	// delayed known values to converge to the highest known sequence boundedly.
 	RuntimeValueSeq uint64        `json:"runtime_value_seq,omitempty"`
 	CumulativeUsage content.Usage `json:"cumulative_usage,omitzero"`
+	// ContextSeq is the sequence that supplied CurrentContext. Invalidation clears
+	// both fields; existing lifecycle/step sequence state rejects delayed older
+	// measurements without materializing context metadata in legacy projections.
+	ContextSeq     uint64                   `json:"context_seq,omitempty"`
+	CurrentContext event.ContextMeasurement `json:"current_context,omitzero"`
 }
 
 // WorkspacePointerSource identifies the transition that selected CurrentWorkspace.
@@ -291,6 +296,8 @@ const (
 	CatalogMetaFieldRuntime         CatalogMetaField = "Loops.Runtime"
 	CatalogMetaFieldRuntimeSeq      CatalogMetaField = "Loops.RuntimeValueSeq"
 	CatalogMetaFieldCumulativeUsage CatalogMetaField = "Loops.CumulativeUsage"
+	CatalogMetaFieldCurrentContext  CatalogMetaField = "Loops.CurrentContext"
+	CatalogMetaFieldContextSeq      CatalogMetaField = "Loops.ContextSeq"
 )
 
 // CatalogMetaRule identifies a semantic catalog invariant.
@@ -516,6 +523,10 @@ func applyEvent(meta SessionMeta, ev event.Event, seq uint64, now CatalogClock) 
 		meta.LastActiveAt = now()
 		meta.State = StateRunning
 		meta.ActiveTurnID = e.TurnID
+		meta.Loops = putLoopContext(meta.Loops, e.LoopID, event.ContextMeasurement{}, seq)
+	case event.TurnFoldedInto:
+		meta.SessionID = e.SessionID
+		meta.Loops = putLoopContext(meta.Loops, e.LoopID, event.ContextMeasurement{}, seq)
 	case event.GateOpened:
 		meta.SessionID = e.SessionID
 		meta.State = StateWaitingOnGate
@@ -560,6 +571,7 @@ func applyEvent(meta SessionMeta, ev event.Event, seq uint64, now CatalogClock) 
 			return meta, false, err
 		}
 		meta.Loops = updated
+		meta.Loops = putLoopContext(meta.Loops, e.LoopID, event.ContextMeasurement{}, seq)
 	case event.RestoreDone:
 		meta.SessionID = e.SessionID
 		meta.LastActiveAt = now()
@@ -573,6 +585,13 @@ func applyEvent(meta SessionMeta, ev event.Event, seq uint64, now CatalogClock) 
 	case event.LoopModeChanged:
 		meta.SessionID = e.SessionID
 		meta.Loops = putLoopRuntime(meta.Loops, e.LoopID, e.Runtime, seq)
+	case event.ContextMeasured:
+		meta.SessionID = e.SessionID
+		if seq != 0 && contextMeasurementObsolete(meta, e.LoopID, seq) {
+			changed = false
+			break
+		}
+		meta.Loops = putLoopContext(meta.Loops, e.LoopID, e.Measurement, seq)
 	case event.SessionStopped:
 		meta.SessionID = e.SessionID
 		meta.Status = StatusStopped
@@ -660,11 +679,61 @@ func putLoopRuntime(loops []LoopUsageMeta, loopID uuid.UUID, runtime event.Model
 		return updated
 	}
 	updated[index].RuntimeSeq = seq
+	if updated[index].CurrentContext != (event.ContextMeasurement{}) && (seq == 0 || seq > updated[index].ContextSeq) {
+		updated[index].CurrentContext = event.ContextMeasurement{}
+		updated[index].ContextSeq = 0
+	}
 	if runtime != (event.ModelRuntime{}) {
 		updated[index].Runtime = runtime
 		updated[index].RuntimeValueSeq = seq
 	}
 	return updated
+}
+
+func putLoopContext(loops []LoopUsageMeta, loopID uuid.UUID, measurement event.ContextMeasurement, seq uint64) []LoopUsageMeta {
+	if loopID.IsZero() {
+		return loops
+	}
+	updated := cloneLoopUsage(loops)
+	index, found := loopUsageIndex(updated, loopID)
+	if !found {
+		updated = insertLoopUsage(updated, index, LoopUsageMeta{LoopID: loopID})
+	}
+	if measurement == (event.ContextMeasurement{}) {
+		if seq == 0 || updated[index].ContextSeq == 0 || seq > updated[index].ContextSeq {
+			updated[index].CurrentContext = event.ContextMeasurement{}
+			updated[index].ContextSeq = 0
+		}
+		return updated
+	}
+	if seq == 0 {
+		if updated[index].ContextSeq != 0 {
+			return updated
+		}
+	} else if updated[index].ContextSeq != 0 && seq <= updated[index].ContextSeq {
+		return updated
+	}
+	updated[index].CurrentContext = measurement
+	updated[index].ContextSeq = seq
+	return updated
+}
+
+func contextMeasurementObsolete(meta SessionMeta, loopID uuid.UUID, seq uint64) bool {
+	index, found := loopUsageIndex(meta.Loops, loopID)
+	if !found {
+		return false
+	}
+	loop := meta.Loops[index]
+	if loop.ContextSeq != 0 && seq <= loop.ContextSeq {
+		return true
+	}
+	if loop.RuntimeSeq != 0 && seq <= loop.RuntimeSeq {
+		return true
+	}
+	if meta.LastStep != nil && meta.LastStep.JournalSeq >= seq {
+		return true
+	}
+	return false
 }
 
 func cloneLoopUsage(loops []LoopUsageMeta) []LoopUsageMeta {
@@ -1069,6 +1138,21 @@ func validateSessionMeta(meta SessionMeta) error {
 		}
 		if err := loop.CumulativeUsage.Validate(); err != nil {
 			return &CatalogMetaValidationError{LoopIndex: i, Field: CatalogMetaFieldCumulativeUsage, Rule: CatalogMetaRuleInvalid, Cause: err}
+		}
+		if loop.CurrentContext == (event.ContextMeasurement{}) {
+			if loop.ContextSeq != 0 {
+				return &CatalogMetaValidationError{LoopIndex: i, Field: CatalogMetaFieldContextSeq, Rule: CatalogMetaRuleLegacyValue}
+			}
+		} else {
+			if loop.ContextSeq == 0 {
+				return &CatalogMetaValidationError{LoopIndex: i, Field: CatalogMetaFieldContextSeq, Rule: CatalogMetaRuleRequired}
+			}
+			if err := loop.CurrentContext.Validate(); err != nil {
+				return &CatalogMetaValidationError{LoopIndex: i, Field: CatalogMetaFieldCurrentContext, Rule: CatalogMetaRuleInvalid, Cause: err}
+			}
+			if loop.Runtime != zeroRuntime && loop.CurrentContext.Model != loop.Runtime.Key {
+				return &CatalogMetaValidationError{LoopIndex: i, Field: CatalogMetaFieldCurrentContext, Rule: CatalogMetaRuleInvalid}
+			}
 		}
 	}
 	for i, aggregate := range meta.Hustles {
