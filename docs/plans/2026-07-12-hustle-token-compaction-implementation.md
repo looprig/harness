@@ -615,9 +615,11 @@ Both canonical terminal events durably carry the attempt identity:
 `CompactionCommitted` and `CompactionRejected` require a non-zero valid
 `CompactionReason` plus the exact valid attempted `ContextBasis` (committed keeps
 its existing basis; rejected gains one). Codecs and validators reject zero or
-unknown reasons and invalid bases. Immediate pre-attempt/control-lane-full
-`CompactWaiterRejected` remains per-command and does not fabricate a canonical
-basis.
+unknown reasons and invalid bases. Immediate pre-start/control-lane-full
+`CompactWaiterRejected` remains per-command after a valid coordination AttemptID
+exists, lane-full cites the existing pending AttemptID, and neither fabricates a
+canonical basis. Failure before any AttemptID is minted emits no durable waiter
+reply and returns only the typed infrastructure failure.
 
 Commit: `feat(compaction): add commands and event contracts`.
 
@@ -628,7 +630,8 @@ Commit: `feat(compaction): add commands and event contracts`.
 **Files:** create/modify `internal/loopruntime/compaction_control.go`, loop/runner contracts and tests.
 
 **RED:** safe boundary consumption, one attempt/many canonical waiters,
-dedup/order, lane-full immediate reply, user join, machine coalescing,
+dedup/order, lane-full immediate reply using the existing pending AttemptID, user
+join, machine coalescing, immutable first-opener reason across mixed-origin joins,
 interrupt/shutdown priority, and journal-writable versus fatal-infrastructure
 outcomes.
 
@@ -670,6 +673,10 @@ TurnStarted/StepDone/TurnFoldedInto/model/mode invalidation, stale in-flight cou
 CAS across mode/inference request-shape changes, and the bounded durable automatic
 latch: restored automatic rejection suppresses only the unchanged basis, manual
 rejection does not, and a later basis mutation re-enables automatic admission.
+Live and restore mixed-origin RED pins opener semantics: a machine join of a
+manual-opened attempt does not consume the latch and may open one later automatic
+attempt at the same basis, while a manual join of an automatic-opened attempt
+leaves its canonical reason Automatic and consumes the latch.
 
 Commit: `feat(loopruntime): measure and admit request context`.
 

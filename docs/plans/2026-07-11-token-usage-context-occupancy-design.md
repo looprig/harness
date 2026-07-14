@@ -666,8 +666,10 @@ Harness defines no implicit threshold defaults. Consumers supply explicit
 values. SWE's calibrated values are fixed in §13: compact at 80%, rearm below
 60%. After an automatic attempt at one `ContextBasis`, another automatic attempt
 is suppressed until either the basis changes or successful compaction brings
-pressure below the rearm threshold. Manual requests are never suppressed by the
-automatic rearm latch.
+pressure below the rearm threshold. The latch is consumed only when the machine
+trigger opens a distinct canonical attempt whose opener reason is Automatic;
+joining a manual-opened attempt does not consume it. Manual requests are never
+suppressed by the automatic rearm latch.
 
 ## §8 · `Compact` command and control lane
 
@@ -785,16 +787,28 @@ Rules:
 - machine triggers coalesce to one pending attempt;
 - a user request joins an in-progress/pending compaction and observes its result;
   its command id is appended to `Waiters`;
+- `PendingCompaction.Reason` is immutable opener provenance and every canonical
+  terminal copies it: an automatic command joining a manual-opened attempt does
+  not change Manual to Automatic, while a manual command joining an
+  automatic-opened attempt observes that Automatic attempt;
 - queue fullness for `UserInput` cannot reject compaction;
 - `Interrupt` and `Shutdown` outrank compaction;
 - no unbounded express queue exists; the waiter slice is bounded by the lane; a
   command that cannot join a full `Waiters` slice is **immediately rejected** with
   `CompactWaiterRejected{Reason: CompactRejectControlLaneFull}` rather than dropped
-  or blocked — a journaled command always receives a terminal reply;
+  or blocked, using the existing pending `AttemptID` — a journaled command always
+  receives a terminal reply;
 - `Waiters` is kept in a **canonical order** — ascending command-`CreatedAt`, ties
   broken by command-UUID bytes — and admits each command id **at most once**; the
   ordering and uniqueness are what make reply regeneration deterministic; and
 - a control request is consumed only at a safe step/turn boundary.
+
+Only an opened canonical attempt has a canonical reason/basis outcome. A machine
+trigger that merely joins a manual-opened attempt has not spent the unchanged
+basis's automatic-attempt allowance. After that shared manual attempt terminates,
+policy may open one Automatic attempt at the same basis. Conversely, rejection
+of an Automatic-opened attempt remains Automatic even if manual waiters joined,
+and consumes the latch for that basis.
 
 Once the actor freezes the basis and accepts the shared attempt, it emits one
 public live-progress event before invoking the compactor:
@@ -833,8 +847,8 @@ promised: the runtime faults/stops the session and completes in-process waiters
 with the typed infrastructure failure without claiming that a rejection was
 journaled. Once a start has published,
 **every** return path must end in exactly one canonical terminal: if the hustle
-adapter returns a pre-ownership error without invoking its finalizer (preflight,
-ID generation, lane full, or lane closed), the actor maps that typed error to a
+adapter returns a pre-ownership error without invoking its finalizer (preflight
+or lane closure after a valid coordination `AttemptID` exists), the actor maps that typed error to a
 `CompactRejectReason` and asks the actor to finalize rejection. The finalizer and
 the direct-error fallback use the same actor-owned, idempotent
 `finalizeCompaction(AttemptID, outcome)` transition. The actor records a terminal
@@ -843,6 +857,12 @@ terminal on every later request. Therefore a recovered callback panic before
 append permits fallback rejection, while a panic/error after a successful append
 cannot manufacture a second outcome. As elsewhere, a failed durable append
 faults the session and is not misreported as a successfully journaled terminal.
+
+Here “pre-attempt” waiter rejection means pre-*start* after coordination already
+minted a valid `AttemptID`; lane-full rejection cites the existing pending
+`AttemptID`. Failure before any `AttemptID` can be minted produces no durable
+`CompactWaiterRejected` and completes only through the typed in-process/routing
+infrastructure failure, consistent with the no-false-rejection rule above.
 
 ### Crash-consistent outcome
 
@@ -1253,9 +1273,15 @@ a successful replacement is recounted before inference.
 A failed automatic attempt is durably recorded as
 `CompactionRejected{Reason: CompactionReasonAutomatic, Basis: currentBasis}`.
 There is at most one automatic attempt per unchanged basis, including across
-restore. A manual rejection at that same basis does not consume the automatic
-latch. A later context mutation advances the basis and makes the old latch
-irrelevant; failure does not disarm automatic compaction forever. Manual
+restore. The live latch is written only after coordination confirms that the
+machine trigger opened the canonical attempt with `ReasonAutomatic`; coalescing
+into a manual-opened attempt does not consume it. A manual-opened rejection at
+that same basis remains `ReasonManual` and leaves automatic policy eligible to
+open its one attempt after the shared attempt ends. A manual trigger joining an
+automatic-opened attempt observes it, while its canonical rejection remains
+`ReasonAutomatic` and consumes the latch. A later context mutation advances the
+basis and makes the old latch irrelevant; failure does not disarm automatic
+compaction forever. Manual
 `/compact` may explicitly retry the same basis.
 
 After a successful replacement, the summary-based request is counted. If fixed
@@ -1334,8 +1360,12 @@ when `CurrentContext` is absent. Revisions therefore never restart at one after 
 restart, model change, or mode change. The fold also keeps only the latest
 automatic-attempt latch: a canonical
 `CompactionRejected{Reason: CompactionReasonAutomatic}` records its `Basis` as
-exhausted; a manual rejection does not. Any later basis advance makes that latch
-irrelevant. This is bounded latest-value state, not an unbounded attempt history.
+exhausted because only an Automatic opener can produce that reason; a machine
+waiter coalesced into a Manual opener does not change the terminal reason, and a
+manual waiter coalesced into an Automatic opener does not change it either. A
+manual rejection therefore does not consume the latch. Any later basis advance
+makes that latch irrelevant. This is bounded latest-value state, not an unbounded
+attempt history.
 
 `LoopStarted` likewise carries the initial resolved runtime. This makes replay
 and catalog repair independent of a mutable external model catalog, and gives the
@@ -1534,8 +1564,11 @@ have no compaction `AttemptID`, so they never fabricate
 `CompactionRejected`. `CompactRejectContextCountFailed` and
 `CompactRejectContextLimitUnknown` apply only after a real compaction attempt
 exists, including post-summary counting in the compaction finalization work.
-Immediate pre-attempt or control-lane-full `CompactWaiterRejected` remains a
-per-command reply and does not fabricate a canonical attempted basis.
+Immediate pre-start or control-lane-full `CompactWaiterRejected` remains a
+per-command reply after a valid coordination `AttemptID` exists and does not
+fabricate a canonical attempted basis; lane-full cites the existing pending
+attempt. Failure before any AttemptID is minted produces no durable waiter reply,
+only the typed in-process/routing infrastructure failure.
 
 ### Missing exact provider counters
 
