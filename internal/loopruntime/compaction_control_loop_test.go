@@ -149,25 +149,19 @@ func TestLoopCompactionControlBoundaries(t *testing.T) {
 				if !<-ack {
 					t.Fatal("Interrupt did not cancel active turn")
 				}
-				got := awaitCompactionDisposition(t, sink)
-				if got.Kind != compactionDispositionReject || got.RejectReason != event.CompactRejectInterrupted {
-					t.Fatalf("disposition = %+v, want interrupted rejection", got)
-				}
+				awaitCompactionWaiterRejection(t, rec, uuid.UUID{1}, event.CompactRejectInterrupted)
 			},
 		},
 		{
 			name: "shutdown outranks pending running request",
 			run: func(t *testing.T) {
-				l, rec, sink, sessionID, loopID := newCompactionTestLoop(t, &fakeLLM{blockUntilCancel: true})
+				l, rec, _, sessionID, loopID := newCompactionTestLoop(t, &fakeLLM{blockUntilCancel: true})
 				startTurn(t, l, rec, textBlocks("run"))
 				sendCompact(t, l, sessionID, loopID, uuid.UUID{1}, identity.AgencyUser)
 				syncLoopActor(t, l)
 				ack := make(chan error, 1)
 				l.Commands <- command.Shutdown{Header: command.Header{CommandID: uuid.UUID{3}}, Ack: ack}
-				got := awaitCompactionDisposition(t, sink)
-				if got.Kind != compactionDispositionReject || got.RejectReason != event.CompactRejectShuttingDown {
-					t.Fatalf("disposition = %+v, want shutdown rejection", got)
-				}
+				awaitCompactionWaiterRejection(t, rec, uuid.UUID{1}, event.CompactRejectShuttingDown)
 				if err := <-ack; err != nil {
 					t.Fatalf("Shutdown error = %v", err)
 				}
@@ -179,6 +173,101 @@ func TestLoopCompactionControlBoundaries(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			tt.run(t)
+		})
+	}
+}
+
+func TestLoopPreStartRejectionPublishesCanonicalWaiterOrder(t *testing.T) {
+	tests := []struct{ name string }{{name: "coalesced waiters retain canonical order and deterministic ids"}}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			l, rec, sink, sessionID, loopID := newCompactionTestLoop(t, &fakeLLM{blockUntilCancel: true})
+			startTurn(t, l, rec, textBlocks("run"))
+			base := time.Date(2026, 7, 14, 12, 0, 0, 0, time.UTC)
+			requests := []command.Compact{
+				compactCommand(uuid.UUID{3}, base.Add(2*time.Second), identity.AgencyUser),
+				compactCommand(uuid.UUID{1}, base, identity.AgencyUser),
+				compactCommand(uuid.UUID{2}, base.Add(time.Second), identity.AgencyUser),
+			}
+			for i := range requests {
+				requests[i].Coordinates = identity.Coordinates{SessionID: sessionID, LoopID: loopID}
+				l.Commands <- requests[i]
+			}
+			syncLoopActor(t, l)
+			ack := make(chan bool, 1)
+			l.Commands <- command.Interrupt{Header: command.Header{CommandID: uuid.UUID{4}}, Ack: ack}
+			if !<-ack {
+				t.Fatal("Interrupt did not cancel active turn")
+			}
+			blockUntilEvents(t, rec, func(events []event.Event) bool {
+				count := 0
+				for _, published := range events {
+					if _, ok := published.(event.CompactWaiterRejected); ok {
+						count++
+					}
+				}
+				return count == len(requests)
+			})
+			var waiters []event.CompactWaiterRejected
+			for _, published := range rec.events() {
+				if waiter, ok := published.(event.CompactWaiterRejected); ok {
+					waiters = append(waiters, waiter)
+				}
+			}
+			wantOrder := []uuid.UUID{{1}, {2}, {3}}
+			if len(waiters) != len(wantOrder) {
+				t.Fatalf("waiters = %d, want %d", len(waiters), len(wantOrder))
+			}
+			attemptID := waiters[0].AttemptID
+			for index, waiter := range waiters {
+				if waiter.Cause.CommandID != wantOrder[index] || waiter.AttemptID != attemptID || waiter.Reason != event.CompactRejectInterrupted {
+					t.Fatalf("waiter[%d] = %+v, want command %v shared Interrupted attempt", index, waiter, wantOrder[index])
+				}
+				if waiter.EventID != event.CompactWaiterReplyID(attemptID, wantOrder[index], false) {
+					t.Fatalf("waiter[%d] EventID = %v, want deterministic reply id", index, waiter.EventID)
+				}
+			}
+			if dispositions, _ := sink.snapshot(); len(dispositions) != 0 {
+				t.Fatalf("sink dispositions = %v, want actor-owned projection", dispositions)
+			}
+		})
+	}
+}
+
+func TestLoopPreStartRejectionCheckedFailureReportsInfrastructure(t *testing.T) {
+	tests := []struct{ name string }{{name: "failed waiter append reports without false outcome"}}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			l, rec, sink, sessionID, loopID := newCompactionTestLoop(t, &fakeLLM{blockUntilCancel: true})
+			startTurn(t, l, rec, textBlocks("run"))
+			sendCompact(t, l, sessionID, loopID, uuid.UUID{1}, identity.AgencyUser)
+			syncLoopActor(t, l)
+			appendErr := errors.New("waiter append failed")
+			rec.setCheckedError(appendErr)
+			ack := make(chan bool, 1)
+			l.Commands <- command.Interrupt{Header: command.Header{CommandID: uuid.UUID{2}}, Ack: ack}
+			if !<-ack {
+				t.Fatal("Interrupt did not cancel active turn")
+			}
+			select {
+			case <-sink.notify:
+			case <-time.After(2 * time.Second):
+				t.Fatal("waiter append failure was not reported")
+			}
+			_, failures := sink.snapshot()
+			if len(failures) != 1 || !equalUUIDs(failures[0].WaiterCommandIDs, []uuid.UUID{{1}}) {
+				t.Fatalf("failures = %+v, want exact waiter ownership", failures)
+			}
+			var coordinationErr *CompactionCoordinationError
+			if !errors.As(failures[0].Err, &coordinationErr) || coordinationErr.Kind != CompactionCoordinationOutcome || !errors.Is(failures[0].Err, appendErr) {
+				t.Fatalf("failure = %T %v, want typed outcome wrapping append error", failures[0].Err, failures[0].Err)
+			}
+			for _, published := range rec.events() {
+				switch published.(type) {
+				case event.CompactWaiterRejected, event.CompactionRejected:
+					t.Fatalf("failed append published false outcome %T", published)
+				}
+			}
 		})
 	}
 }
@@ -283,10 +372,7 @@ func TestLoopActorPriorityLaneOutranksOrdinaryContentionAtBoundary(t *testing.T)
 			}
 			close(boundaryRelease)
 
-			got := awaitCompactionDisposition(t, sink)
-			if got.Kind != compactionDispositionReject || got.RejectReason != tt.wantReject {
-				t.Fatalf("priority disposition = %+v, want rejection %v", got, tt.wantReject)
-			}
+			awaitCompactionWaiterRejection(t, rec, uuid.UUID{1}, tt.wantReject)
 			if _, ok := <-drainReply; !ok {
 				t.Fatal("drain reply channel closed")
 			}
@@ -302,8 +388,8 @@ func TestLoopActorPriorityLaneOutranksOrdinaryContentionAtBoundary(t *testing.T)
 				}
 			}
 			dispositions, _ := sink.snapshot()
-			if len(dispositions) != 1 {
-				t.Fatalf("dispositions = %v, want one rejection and no start", dispositions)
+			if len(dispositions) != 0 {
+				t.Fatalf("dispositions = %v, want actor-owned waiter rejection and no sink call", dispositions)
 			}
 			internal <- turnResult{terminal: event.TurnInterrupted{}}
 			if tt.wantReject == event.CompactRejectInterrupted {
@@ -649,6 +735,27 @@ func awaitCompactionDisposition(t *testing.T, sink *recordingCompactionSink) com
 		t.Fatal("timed out waiting for compaction disposition")
 		return compactionDisposition{}
 	}
+}
+
+func awaitCompactionWaiterRejection(
+	t *testing.T,
+	recorder *recordingPublisher,
+	commandID uuid.UUID,
+	reason event.CompactRejectReason,
+) event.CompactWaiterRejected {
+	t.Helper()
+	var got event.CompactWaiterRejected
+	blockUntilEvents(t, recorder, func(events []event.Event) bool {
+		for _, published := range events {
+			waiter, ok := published.(event.CompactWaiterRejected)
+			if ok && waiter.Cause.CommandID == commandID && waiter.Reason == reason {
+				got = waiter
+				return true
+			}
+		}
+		return false
+	})
+	return got
 }
 
 func awaitCompactionDispositionCount(t *testing.T, sink *recordingCompactionSink, count int) compactionDisposition {

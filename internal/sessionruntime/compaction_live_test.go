@@ -27,6 +27,43 @@ type liveCompactionCounter struct {
 	calls      int
 }
 
+type preStartCancellationCounter struct {
+	mu         sync.Mutex
+	capability inference.CounterCapability
+	gate       *preStartCountGate
+}
+
+type preStartCountGate struct {
+	started chan struct{}
+	exited  chan struct{}
+}
+
+func (c *preStartCancellationCounter) arm() *preStartCountGate {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	gate := &preStartCountGate{started: make(chan struct{}), exited: make(chan struct{})}
+	c.gate = gate
+	return gate
+}
+
+func (c *preStartCancellationCounter) CountContext(ctx context.Context, request inference.Request) (inference.ContextCount, error) {
+	c.mu.Lock()
+	gate := c.gate
+	c.gate = nil
+	c.mu.Unlock()
+	if gate != nil {
+		close(gate.started)
+		<-ctx.Done()
+		close(gate.exited)
+		return inference.ContextCount{}, ctx.Err()
+	}
+	return inference.ContextCount{Model: request.Model.Key(), InputTokens: 40, Quality: c.capability.Quality}, nil
+}
+
+func (c *preStartCancellationCounter) CounterCapability() inference.CounterCapability {
+	return c.capability
+}
+
 func (c *liveCompactionCounter) CountContext(_ context.Context, request inference.Request) (inference.ContextCount, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -244,6 +281,147 @@ func TestNativeSessionCompactionReachesRegisteredFocusedHustle(t *testing.T) {
 			}
 			if got := client.invokeCount(); got != 1 {
 				t.Fatalf("registered focused hustle invocations = %d, want 1", got)
+			}
+		})
+	}
+}
+
+func TestNativeSessionIdlePreStartCancellationPublishesWaiterOnly(t *testing.T) {
+	tests := []struct {
+		name     string
+		restore  bool
+		shutdown bool
+		want     event.CompactRejectReason
+	}{
+		{name: "new interrupt", want: event.CompactRejectInterrupted},
+		{name: "restored interrupt", restore: true, want: event.CompactRejectInterrupted},
+		{name: "new shutdown", shutdown: true, want: event.CompactRejectShuttingDown},
+		{name: "restored shutdown", restore: true, shutdown: true, want: event.CompactRejectShuttingDown},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client := &liveCompactionClient{invoked: make(chan struct{}, 1)}
+			capability := inference.CounterCapability{Transport: inference.CounterTransportLocal, Retention: inference.RetentionNone, TokenizerRev: "cancel-v1", Quality: inference.CountQualityExactLocal}
+			counter := &preStartCancellationCounter{capability: capability}
+			model := validModel("pre-start-cancel")
+			model.Limits = inference.ContextLimits{WindowTokens: 100, MaxInputTokens: 80, MaxOutputTokens: 20}
+			definition := mustDefine(
+				loop.WithName("agent"), loop.WithInference(client, model), loop.WithDrainTimeout(200*time.Millisecond),
+				loop.WithContextCounter(counter),
+				loop.WithInferenceCapability(inference.InferenceCapability{Transport: inference.InferenceTransportLocal, Retention: inference.RetentionNone}),
+				loop.WithCompaction(loop.CompactionPolicy{CounterPolicy: loop.CounterPolicyRequireExact, ReservedOutput: 20, MaxSummaryTokens: 10, CountTimeout: 2 * time.Second, Hustle: "context.compact"}),
+			)
+			lifecycle, err := newTestLifecycle(definition, newRestoreStore(t), WithLifecycleHustles([]hustle.Definition{testHustleDefinition(t, "context.compact")}, testHustleLimits()))
+			if err != nil {
+				t.Fatalf("newTestLifecycle() error = %v", err)
+			}
+			session, err := lifecycle.NewSession(context.Background(), "")
+			if err != nil {
+				t.Fatalf("NewSession() error = %v", err)
+			}
+			shutdown := false
+			t.Cleanup(func() {
+				if !shutdown {
+					_ = session.Shutdown(context.Background())
+				}
+			})
+			seedSub, err := session.SubscribeEvents(allFilter())
+			if err != nil {
+				t.Fatalf("seed SubscribeEvents() error = %v", err)
+			}
+			if _, err := session.Submit(context.Background(), []content.Block{&content.TextBlock{Text: "seed"}}); err != nil {
+				t.Fatalf("Submit() error = %v", err)
+			}
+			if _, ok := firstMatching[event.TurnDone](t, seedSub); !ok {
+				t.Fatal("seed turn did not finish")
+			}
+			if _, ok := firstMatching[event.LoopIdle](t, seedSub); !ok {
+				t.Fatal("seed loop did not become idle")
+			}
+			_ = seedSub.Close()
+			idleCtx, idleCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer idleCancel()
+			if err := session.WaitIdle(idleCtx); err != nil {
+				t.Fatalf("WaitIdle() error = %v", err)
+			}
+			if tt.restore {
+				sessionID := session.SessionID()
+				if err := session.Shutdown(context.Background()); err != nil {
+					t.Fatalf("seed Shutdown() error = %v", err)
+				}
+				session, err = lifecycle.RestoreSession(context.Background(), sessionID)
+				if err != nil {
+					t.Fatalf("RestoreSession() error = %v", err)
+				}
+			}
+			sub, err := session.SubscribeEvents(allFilter())
+			if err != nil {
+				t.Fatalf("SubscribeEvents() error = %v", err)
+			}
+			defer sub.Close()
+			gate := counter.arm()
+			commandID := uuid.UUID{0xd1}
+			compact := command.Compact{Header: command.Header{CommandID: commandID, Agency: identity.AgencyUser, CreatedAt: time.Now()}, Coordinates: identity.Coordinates{SessionID: session.SessionID(), LoopID: session.ActiveLoopID()}}
+			handle := session.loops[session.ActiveLoopID()]
+			handle.backend.CommandSink() <- compact
+			select {
+			case <-gate.started:
+			case <-time.After(2 * time.Second):
+				t.Fatal("idle pre-count did not start")
+			}
+			if tt.shutdown {
+				if err := session.Shutdown(context.Background()); err != nil {
+					t.Fatalf("Shutdown() error = %v", err)
+				}
+				shutdown = true
+			} else {
+				if interrupted, err := session.Interrupt(context.Background()); err != nil || interrupted {
+					t.Fatalf("Interrupt() = %v, %v, want idle false/nil", interrupted, err)
+				}
+			}
+			select {
+			case <-gate.exited:
+			case <-time.After(2 * time.Second):
+				t.Fatal("pre-count did not exit")
+			}
+			var waiter *event.CompactWaiterRejected
+			deadline := time.After(500 * time.Millisecond)
+		collect:
+			for waiter == nil {
+				select {
+				case delivery, ok := <-sub.Events():
+					if !ok {
+						break collect
+					}
+					switch value := delivery.Event.(type) {
+					case event.CompactWaiterRejected:
+						copyOfValue := value
+						waiter = &copyOfValue
+					case event.CompactionStarted, event.CompactionRejected:
+						t.Fatalf("pre-start cancellation published %T", value)
+					}
+				case <-deadline:
+					break collect
+				}
+			}
+			if waiter == nil || waiter.Cause.CommandID != commandID || waiter.Reason != tt.want || waiter.AttemptID == (event.CompactAttemptID{}) {
+				t.Fatalf("waiter = %+v, want command/reason/attempt", waiter)
+			}
+			if got := client.invokeCount(); got != 0 {
+				t.Fatalf("hustle invokes = %d, want 0", got)
+			}
+			if !tt.shutdown {
+				nextID := uuid.UUID{0xd2}
+				next := command.Compact{Header: command.Header{CommandID: nextID, Agency: identity.AgencyUser, CreatedAt: time.Now()}, Coordinates: compact.Coordinates}
+				handle.backend.CommandSink() <- next
+				select {
+				case <-client.invoked:
+				case <-time.After(2 * time.Second):
+					t.Fatal("fresh compaction did not reuse cleared lane")
+				}
+				if got := client.invokeCount(); got != 1 {
+					t.Fatalf("fresh hustle invokes = %d, want 1", got)
+				}
 			}
 		})
 	}

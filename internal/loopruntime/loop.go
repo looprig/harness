@@ -751,6 +751,33 @@ func runLoop(cfg loopConfig, state loopState) {
 		return nil
 	}
 
+	publishPreStartRejection := func(disposition compactionDisposition) error {
+		if disposition.Kind != compactionDispositionReject || disposition.Attempt == nil || !disposition.RejectReason.Valid() {
+			return &CompactionCoordinationError{Kind: CompactionCoordinationOutcome}
+		}
+		for _, commandID := range disposition.Attempt.WaiterCommandIDs {
+			rejected := event.CompactWaiterRejected{
+				Header: event.Header{
+					EventID: event.CompactWaiterReplyID(disposition.Attempt.AttemptID, commandID, false),
+					Cause:   identity.Cause{CommandID: commandID},
+				},
+				AttemptID: disposition.Attempt.AttemptID,
+				Reason:    disposition.RejectReason,
+			}
+			stamped, err := stamp(rejected)
+			if err != nil {
+				return &CompactionCoordinationError{Kind: CompactionCoordinationOutcome, Cause: err}
+			}
+			if err := event.ValidateEvent(stamped); err != nil {
+				return &CompactionCoordinationError{Kind: CompactionCoordinationOutcome, Cause: err}
+			}
+			if err := cfg.events.PublishEventChecked(ctx, stamped); err != nil {
+				return &CompactionCoordinationError{Kind: CompactionCoordinationOutcome, Cause: err}
+			}
+		}
+		return nil
+	}
+
 	dispatchCompactionBoundary := func(boundary compactionBoundaryKind, candidate *compactionExecutionCandidate) bool {
 		if config.compactionSink == nil {
 			return false
@@ -782,12 +809,12 @@ func runLoop(cfg loopConfig, state loopState) {
 			return true
 		}
 		if disposition.Kind == compactionDispositionReject {
-			if err := config.compactionSink.CoordinateCompaction(ctx, disposition); err != nil {
+			if err := publishPreStartRejection(disposition); err != nil {
 				waiters := []uuid.UUID(nil)
 				if disposition.Attempt != nil {
 					waiters = disposition.Attempt.WaiterCommandIDs
 				}
-				reportCompactionFailure(waiters, &CompactionCoordinationError{Kind: CompactionCoordinationOutcome, Cause: err})
+				reportCompactionFailure(waiters, err)
 				return false
 			}
 			return true
@@ -867,7 +894,7 @@ func runLoop(cfg loopConfig, state loopState) {
 		idleCompaction = &preparation
 		go func(preparationCtx context.Context, prepared idleCompactionPreparation, admission contextAdmissionSettings) {
 			request := prepared.request
-			request.Tools = toolDefs(ctx, prepared.tools.Registry)
+			request.Tools = toolDefs(preparationCtx, prepared.tools.Registry)
 			runtimeRevision := revisionDigest(nil)
 			measurement, err := measureRequestContext(
 				preparationCtx, config.ContextCounter, config.CounterCapability, config.InferenceCapability,
@@ -1231,6 +1258,12 @@ func runLoop(cfg loopConfig, state loopState) {
 			return uuid.UUID{}, publishErr
 		}
 		mutation.commit(&state.contextTracker, &state.contextGeneration)
+		if idleCompaction != nil {
+			preparation := *idleCompaction
+			preparation.cancel()
+			idleCompaction = nil
+			finalizeIdleCompactionRejection(preparation, event.CompactRejectStaleBasis)
+		}
 		turnCtx, base := installActiveTurn(turnID, qi)
 		idx := state.turnIndex
 		cancel := state.cancelTurn
