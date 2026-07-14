@@ -3,6 +3,7 @@ package loopruntime
 import (
 	"context"
 	"errors"
+	"reflect"
 	"sync"
 
 	"github.com/looprig/core/content"
@@ -55,10 +56,10 @@ func newCompactionExecutor(ctx context.Context, config compactionExecutorConfig)
 	if ctx == nil {
 		return nil, &compactionExecutorError{Field: "context"}
 	}
-	if config.Compactor == nil {
+	if nilCompactor(config.Compactor) {
 		return nil, &compactionExecutorError{Field: "compactor"}
 	}
-	if config.Counter == nil {
+	if nilContextCounter(config.Counter) {
 		return nil, &compactionExecutorError{Field: "counter"}
 	}
 	if config.Settings.CountTimeout <= 0 || config.MaxSummaryTokens == 0 {
@@ -77,6 +78,9 @@ func installCompactionExecutor(ctx context.Context, config *runtimeConfig, compa
 	if compactor == nil {
 		return nil
 	}
+	if nilCompactor(compactor) {
+		return &compactionExecutorError{Field: "compactor"}
+	}
 	if config == nil || config.Compaction == nil {
 		return &compactionExecutorError{Field: "policy"}
 	}
@@ -90,6 +94,26 @@ func installCompactionExecutor(ctx context.Context, config *runtimeConfig, compa
 	}
 	config.compactionSink = executor
 	return nil
+}
+
+// Interface equality detects an untyped nil but not a typed nil pointer stored in
+// an interface. Keep reflection at this construction boundary so the executor never
+// starts with a collaborator that will panic on first use.
+func nilCompactor(compactor Compactor) bool {
+	return compactor == nil || nilInterfaceImplementation(reflect.ValueOf(compactor))
+}
+
+func nilContextCounter(counter inference.ContextCounter) bool {
+	return counter == nil || nilInterfaceImplementation(reflect.ValueOf(counter))
+}
+
+func nilInterfaceImplementation(value reflect.Value) bool {
+	switch value.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
+		return value.IsNil()
+	default:
+		return false
+	}
 }
 
 func (e *compactionExecutor) CoordinateCompaction(context.Context, compactionDisposition) error {

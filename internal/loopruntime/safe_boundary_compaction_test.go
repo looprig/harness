@@ -25,6 +25,16 @@ type executorTestCompactor struct {
 	input   loop.CompactionInput
 }
 
+type typedNilExecutorCounter struct{}
+
+func (*typedNilExecutorCounter) CountContext(context.Context, inference.Request) (inference.ContextCount, error) {
+	panic("typed nil counter must not be called")
+}
+
+func (*typedNilExecutorCounter) CounterCapability() inference.CounterCapability {
+	panic("typed nil counter must not be called")
+}
+
 type echoExecutorCompactor struct {
 	mu      sync.Mutex
 	summary *content.UserMessage
@@ -140,6 +150,73 @@ func (c *executorDeadlineCounter) CountContext(ctx context.Context, request infe
 
 func (c *executorDeadlineCounter) CounterCapability() inference.CounterCapability {
 	return c.capability
+}
+
+func TestNewCompactionExecutorRejectsTypedNilCollaborators(t *testing.T) {
+	t.Parallel()
+	validCounter := &loopContextCounter{capability: contextTestCapability(inference.CountQualityExactLocal)}
+	validCompactor := &executorTestCompactor{}
+	var nilCompactor *executorTestCompactor
+	var nilCounter *typedNilExecutorCounter
+	tests := []struct {
+		name      string
+		compactor Compactor
+		counter   inference.ContextCounter
+		wantField string
+	}{
+		{name: "typed nil compactor", compactor: nilCompactor, counter: validCounter, wantField: "compactor"},
+		{name: "typed nil counter", compactor: validCompactor, counter: nilCounter, wantField: "counter"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			executor, err := newCompactionExecutor(context.Background(), compactionExecutorConfig{
+				Compactor: tt.compactor, Counter: tt.counter,
+				CounterCapability: validCounter.capability, InferenceCapability: contextTestInferenceCapability(),
+				Settings: contextAdmissionSettings{ReservedOutput: 20, CountTimeout: time.Second}, MaxSummaryTokens: 10,
+			})
+			var configErr *compactionExecutorError
+			if executor != nil || !errors.As(err, &configErr) || configErr.Field != tt.wantField {
+				t.Fatalf("newCompactionExecutor() = (%#v, %T %v), want nil typed error field %q", executor, err, err, tt.wantField)
+			}
+		})
+	}
+}
+
+func TestFocusedCompactionConstructorsRejectTypedNilCompactor(t *testing.T) {
+	t.Parallel()
+	type constructor func(context.Context, uuid.UUID, uuid.UUID, Provenance, eventPublisher, loop.BoundDefinition, Compactor) (*Loop, error)
+	constructors := []struct {
+		name string
+		call constructor
+	}{
+		{
+			name: "new in mode",
+			call: func(ctx context.Context, sessionID, loopID uuid.UUID, parent Provenance, publisher eventPublisher, bound loop.BoundDefinition, compactor Compactor) (*Loop, error) {
+				return NewInModeWithCompactor(ctx, sessionID, loopID, parent, publisher, bound, "", compactor)
+			},
+		},
+		{
+			name: "new restored",
+			call: func(ctx context.Context, sessionID, loopID uuid.UUID, parent Provenance, publisher eventPublisher, bound loop.BoundDefinition, compactor Compactor) (*Loop, error) {
+				return NewRestoredWithCompactor(ctx, sessionID, loopID, parent, publisher, bound, RestoredState{}, compactor)
+			},
+		},
+	}
+	for _, tt := range constructors {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			var compactor *executorTestCompactor
+			actor, err := tt.call(
+				context.Background(), mustID(t), mustID(t), Provenance{}, &recordingPublisher{},
+				contextBoundDefinition(t, &fakeLLM{}), compactor,
+			)
+			var configErr *compactionExecutorError
+			if actor != nil || !errors.As(err, &configErr) || configErr.Field != "compactor" {
+				t.Fatalf("constructor() = (%#v, %T %v), want nil typed error field compactor", actor, err, err)
+			}
+		})
+	}
 }
 
 func TestRunTurnConsumesCompactionDirectiveAtSafeBoundary(t *testing.T) {
