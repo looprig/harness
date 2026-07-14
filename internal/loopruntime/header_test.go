@@ -1,6 +1,7 @@
 package loopruntime
 
 import (
+	"errors"
 	"testing"
 	"time"
 
@@ -127,6 +128,201 @@ func TestStampLoopHeaderCompactionEvents(t *testing.T) {
 			}
 			if !got.TurnID.IsZero() {
 				t.Errorf("TurnID = %v, want zero for loop-scoped compaction event", got.TurnID)
+			}
+		})
+	}
+}
+
+func TestStampLoopEventPreservesCompactWaiterReplyID(t *testing.T) {
+	t.Parallel()
+
+	createdAt := time.Date(2026, 7, 14, 9, 0, 0, 123, time.UTC)
+	sessionID := uuid.UUID{0xa1}
+	loopID := uuid.UUID{0xa2}
+	commandID := uuid.UUID{0xa3}
+	attemptID := event.CompactAttemptID(uuid.UUID{0xa4})
+	committedID := uuid.UUID{0xa5}
+	freshID := uuid.UUID{0xff}
+	cause := identity.Cause{CommandID: commandID, Agency: identity.AgencyUser}
+	tests := []struct {
+		name string
+		ev   event.Event
+		want uuid.UUID
+	}{
+		{
+			name: "resolved preserves deterministic id",
+			ev: event.CompactWaiterResolved{
+				Header:           event.Header{EventID: event.CompactWaiterReplyID(attemptID, commandID, true), Cause: cause},
+				AttemptID:        attemptID,
+				CommittedEventID: committedID,
+			},
+			want: event.CompactWaiterReplyID(attemptID, commandID, true),
+		},
+		{
+			name: "rejected preserves deterministic id",
+			ev: event.CompactWaiterRejected{
+				Header:    event.Header{EventID: event.CompactWaiterReplyID(attemptID, commandID, false), Cause: cause},
+				AttemptID: attemptID,
+				Reason:    event.CompactRejectCanceled,
+			},
+			want: event.CompactWaiterReplyID(attemptID, commandID, false),
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			mintCalls := 0
+			factory := event.NewFactory(func() (uuid.UUID, error) {
+				mintCalls++
+				return freshID, nil
+			}, func() time.Time { return createdAt })
+			got, err := stampLoopEvent(tt.ev, factory, sessionID, loopID, uuid.UUID{})
+			if err != nil {
+				t.Fatalf("stampLoopEvent: %v", err)
+			}
+			header := got.EventHeader()
+			if header.EventID != tt.want {
+				t.Errorf("EventID = %v, want deterministic %v", header.EventID, tt.want)
+			}
+			if !header.CreatedAt.Equal(createdAt) {
+				t.Errorf("CreatedAt = %v, want %v", header.CreatedAt, createdAt)
+			}
+			if header.SessionID != sessionID || header.LoopID != loopID || !header.TurnID.IsZero() || !header.StepID.IsZero() {
+				t.Errorf("Coordinates = %+v, want loop-scoped %v/%v", header.Coordinates, sessionID, loopID)
+			}
+			if header.Cause != cause {
+				t.Errorf("Cause = %+v, want preserved %+v", header.Cause, cause)
+			}
+			if mintCalls != 0 {
+				t.Errorf("fresh ID generator calls = %d, want 0 for deterministic reply", mintCalls)
+			}
+			if err := event.ValidateEvent(got); err != nil {
+				t.Errorf("ValidateEvent: %v", err)
+			}
+		})
+	}
+}
+
+func TestStampLoopEventRejectsMalformedCompactWaiterReplyID(t *testing.T) {
+	t.Parallel()
+
+	commandID := uuid.UUID{0xb1}
+	attemptID := event.CompactAttemptID(uuid.UUID{0xb2})
+	deterministicResolved := event.CompactWaiterReplyID(attemptID, commandID, true)
+	deterministicRejected := event.CompactWaiterReplyID(attemptID, commandID, false)
+	tests := []struct {
+		name     string
+		ev       event.Event
+		wantRule event.Rule
+	}{
+		{
+			name: "resolved zero id",
+			ev: event.CompactWaiterResolved{
+				Header:           event.Header{Cause: identity.Cause{CommandID: commandID}},
+				AttemptID:        attemptID,
+				CommittedEventID: uuid.UUID{0xb3},
+			},
+			wantRule: event.RuleRequired,
+		},
+		{
+			name: "resolved wrong id",
+			ev: event.CompactWaiterResolved{
+				Header:           event.Header{EventID: deterministicRejected, Cause: identity.Cause{CommandID: commandID}},
+				AttemptID:        attemptID,
+				CommittedEventID: uuid.UUID{0xb3},
+			},
+			wantRule: event.RuleInvalid,
+		},
+		{
+			name: "rejected zero id",
+			ev: event.CompactWaiterRejected{
+				Header:    event.Header{Cause: identity.Cause{CommandID: commandID}},
+				AttemptID: attemptID,
+				Reason:    event.CompactRejectCanceled,
+			},
+			wantRule: event.RuleRequired,
+		},
+		{
+			name: "rejected wrong id",
+			ev: event.CompactWaiterRejected{
+				Header:    event.Header{EventID: deterministicResolved, Cause: identity.Cause{CommandID: commandID}},
+				AttemptID: attemptID,
+				Reason:    event.CompactRejectCanceled,
+			},
+			wantRule: event.RuleInvalid,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			factory := event.NewFactory(func() (uuid.UUID, error) { return uuid.UUID{0xfe}, nil }, time.Now)
+			got, err := stampLoopEvent(tt.ev, factory, uuid.UUID{0xb4}, uuid.UUID{0xb5}, uuid.UUID{})
+			if got != nil {
+				t.Errorf("stampLoopEvent event = %#v, want nil", got)
+			}
+			var invalid *event.InvalidEventError
+			if !errors.As(err, &invalid) {
+				t.Fatalf("stampLoopEvent error = %T %v, want *event.InvalidEventError", err, err)
+			}
+			if invalid.Field != event.FieldEventID || invalid.Rule != tt.wantRule {
+				t.Errorf("validation = %+v, want field=%q rule=%q", invalid, event.FieldEventID, tt.wantRule)
+			}
+		})
+	}
+}
+
+func TestStampLoopEventOrdinaryEventsUseFreshID(t *testing.T) {
+	t.Parallel()
+
+	createdAt := time.Date(2026, 7, 14, 10, 0, 0, 456, time.UTC)
+	freshID := uuid.UUID{0xc1}
+	sessionID := uuid.UUID{0xc2}
+	loopID := uuid.UUID{0xc3}
+	cause := identity.Cause{CommandID: uuid.UUID{0xc4}, Agency: identity.AgencyMachine}
+	tests := []struct {
+		name       string
+		previousID uuid.UUID
+	}{
+		{name: "zero id is freshly minted"},
+		{name: "preassigned id is replaced", previousID: uuid.UUID{0xc5}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			mintCalls := 0
+			factory := event.NewFactory(func() (uuid.UUID, error) {
+				mintCalls++
+				return freshID, nil
+			}, func() time.Time { return createdAt })
+			got, err := stampLoopEvent(
+				event.LoopIdle{Header: event.Header{
+					Coordinates: identity.Coordinates{SessionID: sessionID, LoopID: loopID},
+					EventID:     tt.previousID,
+					Cause:       cause,
+				}},
+				factory,
+				sessionID,
+				loopID,
+				uuid.UUID{},
+			)
+			if err != nil {
+				t.Fatalf("stampLoopEvent: %v", err)
+			}
+			header := got.EventHeader()
+			if header.EventID != freshID {
+				t.Errorf("EventID = %v, want fresh %v", header.EventID, freshID)
+			}
+			if !header.CreatedAt.Equal(createdAt) {
+				t.Errorf("CreatedAt = %v, want %v", header.CreatedAt, createdAt)
+			}
+			if header.SessionID != sessionID || header.LoopID != loopID || header.Cause != cause {
+				t.Errorf("header identity = %+v, want coordinates %v/%v and cause %+v", header, sessionID, loopID, cause)
+			}
+			if mintCalls != 1 {
+				t.Errorf("fresh ID generator calls = %d, want 1", mintCalls)
+			}
+			if err := event.ValidateEvent(got); err != nil {
+				t.Errorf("ValidateEvent: %v", err)
 			}
 		})
 	}

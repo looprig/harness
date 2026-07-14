@@ -40,6 +40,36 @@ func (f *Factory) Stamp(h Header) (Header, error) {
 	return h, nil
 }
 
+// StampCompactWaiterResolved stamps CreatedAt while preserving and verifying a
+// resolved waiter's deterministic EventID. It cannot inject an arbitrary ID.
+func (f *Factory) StampCompactWaiterResolved(ev CompactWaiterResolved) (Header, error) {
+	return f.stampCompactWaiterReply(ev.Header, ev.AttemptID, true, "CompactWaiterResolved")
+}
+
+// StampCompactWaiterRejected stamps CreatedAt while preserving and verifying a
+// rejected waiter's deterministic EventID. It cannot inject an arbitrary ID.
+func (f *Factory) StampCompactWaiterRejected(ev CompactWaiterRejected) (Header, error) {
+	return f.stampCompactWaiterReply(ev.Header, ev.AttemptID, false, "CompactWaiterRejected")
+}
+
+func (f *Factory) stampCompactWaiterReply(h Header, attempt CompactAttemptID, resolved bool, name EventName) (Header, error) {
+	if attempt.IsZero() {
+		return Header{}, &InvalidEventError{Event: name, Field: FieldAttemptID, Rule: RuleInvalid}
+	}
+	if h.Cause.CommandID.IsZero() {
+		return Header{}, &InvalidEventError{Event: name, Field: FieldCommandID, Rule: RuleInvalid}
+	}
+	if h.EventID.IsZero() {
+		return Header{}, &InvalidEventError{Event: name, Field: FieldEventID, Rule: RuleRequired}
+	}
+	want := CompactWaiterReplyID(attempt, h.Cause.CommandID, resolved)
+	if h.EventID != want {
+		return Header{}, &InvalidEventError{Event: name, Field: FieldEventID, Rule: RuleInvalid}
+	}
+	h.CreatedAt = f.now()
+	return h, nil
+}
+
 // NewHeader mints a fresh EventID + CreatedAt onto an empty Header. Callers fill
 // Coordinates/Cause. It is Stamp of the zero Header.
 func (f *Factory) NewHeader() (Header, error) { return f.Stamp(Header{}) }

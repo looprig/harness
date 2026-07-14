@@ -185,7 +185,16 @@ func stampLoopEvent(ev event.Event, factory *event.Factory, sessionID, loopID, t
 			return stamped, nil
 		}
 	}
-	h, err := factory.Stamp(stamped.EventHeader())
+	var h event.Header
+	var err error
+	switch value := stamped.(type) {
+	case event.CompactWaiterResolved:
+		h, err = factory.StampCompactWaiterResolved(value)
+	case event.CompactWaiterRejected:
+		h, err = factory.StampCompactWaiterRejected(value)
+	default:
+		h, err = factory.Stamp(stamped.EventHeader())
+	}
 	if err != nil {
 		return nil, err
 	}
