@@ -60,12 +60,11 @@ func TestFoldCatalogHustlesIsBoundedAndDeterministic(t *testing.T) {
 	namedStart, namedDone := catalogHustlePair(sid, named, 0x77, namedRuntime, nil, false)
 	namedFailedStart, _ := catalogHustlePair(sid, named, 0x79, namedRuntime, nil, false)
 	namedFailed := event.HustleFailed{Header: namedFailedStart.Header, Run: namedFailedStart.Run, Stage: hustle.StageQueue, ReasonCode: hustle.ReasonCanceled}
-	namedResolvedFailedStart, namedResolvedFailed := catalogHustlePair(sid, named, 0x7d, namedRuntime, nil, true)
 	interrupted, _ := catalogHustlePair(sid, current, 0x7b, runtimeA, &usageA, false)
 
 	want := []HustleUsageAggregate{
 		{Name: "a-named", ModelSource: hustle.ModelSourceNamed, NamedModelKey: namedKey, Runtime: namedRuntime, Status: hustle.TerminalStatusCompleted, Runs: 1},
-		{Name: "a-named", ModelSource: hustle.ModelSourceNamed, NamedModelKey: namedKey, Runtime: namedRuntime, Status: hustle.TerminalStatusFailed, Runs: 2},
+		{Name: "a-named", ModelSource: hustle.ModelSourceNamed, NamedModelKey: namedKey, Runtime: namedRuntime, Status: hustle.TerminalStatusFailed, Runs: 1},
 		{Name: "z-current", ModelSource: hustle.ModelSourceCurrentLoop, Status: hustle.TerminalStatusCompleted, Runs: 2, CumulativeUsage: content.Usage{InputTokens: 30, OutputTokens: 6, CacheReadTokens: 3}},
 		{Name: "z-current", ModelSource: hustle.ModelSourceCurrentLoop, Status: hustle.TerminalStatusFailed, Runs: 1, CumulativeUsage: usageA},
 	}
@@ -73,8 +72,8 @@ func TestFoldCatalogHustlesIsBoundedAndDeterministic(t *testing.T) {
 		name   string
 		events []event.Event
 	}{
-		{name: "one order", events: []event.Event{currentStartA, currentDoneA, namedStart, namedDone, namedFailedStart, namedFailed, namedResolvedFailedStart, namedResolvedFailed, currentStartFailed, currentFailed, currentStartB, currentDoneB, interrupted}},
-		{name: "different run order", events: []event.Event{interrupted, currentStartB, currentDoneB, currentStartFailed, currentFailed, namedResolvedFailedStart, namedResolvedFailed, namedFailedStart, namedFailed, namedStart, namedDone, currentStartA, currentDoneA}},
+		{name: "resolved completion precedes pre-resolution failure", events: []event.Event{currentStartA, currentDoneA, namedStart, namedDone, namedFailedStart, namedFailed, currentStartFailed, currentFailed, currentStartB, currentDoneB, interrupted}},
+		{name: "pre-resolution failure precedes resolved completion", events: []event.Event{interrupted, currentStartB, currentDoneB, currentStartFailed, currentFailed, namedFailedStart, namedFailed, namedStart, namedDone, currentStartA, currentDoneA}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -174,6 +173,43 @@ func TestFoldCatalogHustleTerminalRejectsRunCountOverflow(t *testing.T) {
 	}
 }
 
+func TestReconcileNamedHustleRuntimesPropagatesAcrossStatuses(t *testing.T) {
+	t.Parallel()
+	key := inference.ModelKey{Provider: "provider", Model: "fixed"}
+	runtime := event.ModelRuntime{Key: key, Limits: inference.ContextLimits{WindowTokens: 100}}
+	completed := HustleUsageAggregate{Name: "named", ModelSource: hustle.ModelSourceNamed, NamedModelKey: key, Status: hustle.TerminalStatusCompleted, Runs: 1}
+	failed := HustleUsageAggregate{Name: "named", ModelSource: hustle.ModelSourceNamed, NamedModelKey: key, Status: hustle.TerminalStatusFailed, Runs: 1}
+	tests := []struct {
+		name    string
+		input   []HustleUsageAggregate
+		want    []HustleUsageAggregate
+		wantErr bool
+	}{
+		{name: "completed supplies failed", input: []HustleUsageAggregate{func() HustleUsageAggregate { value := completed; value.Runtime = runtime; return value }(), failed}, want: []HustleUsageAggregate{func() HustleUsageAggregate { value := completed; value.Runtime = runtime; return value }(), func() HustleUsageAggregate { value := failed; value.Runtime = runtime; return value }()}},
+		{name: "failed supplies completed", input: []HustleUsageAggregate{completed, func() HustleUsageAggregate { value := failed; value.Runtime = runtime; return value }()}, want: []HustleUsageAggregate{func() HustleUsageAggregate { value := completed; value.Runtime = runtime; return value }(), func() HustleUsageAggregate { value := failed; value.Runtime = runtime; return value }()}},
+		{name: "conflicting resolved runtimes fail", input: []HustleUsageAggregate{func() HustleUsageAggregate { value := completed; value.Runtime = runtime; return value }(), func() HustleUsageAggregate {
+			value := failed
+			value.Runtime = runtime
+			value.Runtime.Limits.WindowTokens = 200
+			return value
+		}()}, wantErr: true},
+		{name: "current-loop runtime stays zero", input: []HustleUsageAggregate{{Name: "current", ModelSource: hustle.ModelSourceCurrentLoop, Status: hustle.TerminalStatusCompleted, Runs: 1}}, want: []HustleUsageAggregate{{Name: "current", ModelSource: hustle.ModelSourceCurrentLoop, Status: hustle.TerminalStatusCompleted, Runs: 1}}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got := append([]HustleUsageAggregate(nil), tt.input...)
+			err := reconcileNamedHustleRuntimes(got)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("reconcileNamedHustleRuntimes() error = %v, wantErr %v", err, tt.wantErr)
+			}
+			if !tt.wantErr && !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("reconcileNamedHustleRuntimes() = %#v, want %#v", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestHustleUsageAggregateCodecValidation(t *testing.T) {
 	t.Parallel()
 	key := inference.ModelKey{Provider: "provider", Model: "model"}
@@ -228,6 +264,12 @@ func TestHustleUsageAggregateCodecValidation(t *testing.T) {
 			value := valid
 			value.Status = hustle.TerminalStatusFailed
 			value.Runtime.Limits.WindowTokens = 200
+			return value
+		}()}}, wantErr: true},
+		{name: "same named identity leaves a sibling runtime unresolved", meta: SessionMeta{Hustles: []HustleUsageAggregate{valid, func() HustleUsageAggregate {
+			value := valid
+			value.Status = hustle.TerminalStatusFailed
+			value.Runtime = event.ModelRuntime{}
 			return value
 		}()}}, wantErr: true},
 	}

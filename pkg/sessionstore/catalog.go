@@ -735,7 +735,7 @@ func foldCatalogHustles(events []event.Event) ([]HustleUsageAggregate, error) {
 		result = append(result, aggregate)
 	}
 	sort.Slice(result, func(i, j int) bool { return compareHustleAggregate(result[i], result[j]) < 0 })
-	if _, err := validateNamedHustleRuntimeConsistency(result); err != nil {
+	if err := reconcileNamedHustleRuntimes(result); err != nil {
 		return nil, err
 	}
 	return result, nil
@@ -1122,6 +1122,41 @@ type namedHustleRuntimeKey struct {
 }
 
 func validateNamedHustleRuntimeConsistency(aggregates []HustleUsageAggregate) (int, error) {
+	runtimes, conflictIndex, err := resolvedNamedHustleRuntimes(aggregates)
+	if err != nil {
+		return conflictIndex, err
+	}
+	for index, aggregate := range aggregates {
+		if aggregate.ModelSource != hustle.ModelSourceNamed || aggregate.Runtime != (event.ModelRuntime{}) {
+			continue
+		}
+		key := namedHustleRuntimeKey{name: aggregate.Name, modelSource: aggregate.ModelSource, namedModelKey: aggregate.NamedModelKey}
+		if _, resolved := runtimes[key]; resolved {
+			return index, &CatalogHustleError{Kind: CatalogHustleRuntimeMismatch}
+		}
+	}
+	return -1, nil
+}
+
+func reconcileNamedHustleRuntimes(aggregates []HustleUsageAggregate) error {
+	runtimes, _, err := resolvedNamedHustleRuntimes(aggregates)
+	if err != nil {
+		return err
+	}
+	for index := range aggregates {
+		aggregate := &aggregates[index]
+		if aggregate.ModelSource != hustle.ModelSourceNamed || aggregate.Runtime != (event.ModelRuntime{}) {
+			continue
+		}
+		key := namedHustleRuntimeKey{name: aggregate.Name, modelSource: aggregate.ModelSource, namedModelKey: aggregate.NamedModelKey}
+		if runtime, resolved := runtimes[key]; resolved {
+			aggregate.Runtime = runtime
+		}
+	}
+	return nil
+}
+
+func resolvedNamedHustleRuntimes(aggregates []HustleUsageAggregate) (map[namedHustleRuntimeKey]event.ModelRuntime, int, error) {
 	runtimes := make(map[namedHustleRuntimeKey]event.ModelRuntime)
 	for index, aggregate := range aggregates {
 		if aggregate.ModelSource != hustle.ModelSourceNamed || aggregate.Runtime == (event.ModelRuntime{}) {
@@ -1129,11 +1164,11 @@ func validateNamedHustleRuntimeConsistency(aggregates []HustleUsageAggregate) (i
 		}
 		key := namedHustleRuntimeKey{name: aggregate.Name, modelSource: aggregate.ModelSource, namedModelKey: aggregate.NamedModelKey}
 		if runtime, exists := runtimes[key]; exists && runtime != aggregate.Runtime {
-			return index, &CatalogHustleError{Kind: CatalogHustleRuntimeMismatch}
+			return nil, index, &CatalogHustleError{Kind: CatalogHustleRuntimeMismatch}
 		}
 		runtimes[key] = aggregate.Runtime
 	}
-	return -1, nil
+	return runtimes, -1, nil
 }
 
 func validateCatalogRuntime(runtime event.ModelRuntime) error {
