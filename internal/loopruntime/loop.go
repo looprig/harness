@@ -2050,13 +2050,13 @@ func runLoop(cfg loopConfig, state loopState) {
 				outcome.reply <- contextCompactionOutcomeReply{err: &contextCompactionOutcomeError{AttemptID: outcome.attemptID}}
 				continue
 			}
-			if validationErr := validateContextCompactionProposal(attempt, outcome.result); validationErr != nil {
-				outcome.reply <- contextCompactionOutcomeReply{err: validationErr}
-				continue
-			}
 			settings, configured := contextSettings(config)
 			proposal := outcome.result.Proposal
 			disposition := outcome.result.Disposition
+			if validationErr := validateContextCompactionProposal(attempt, outcome.result); validationErr != nil {
+				proposal = compactionFinalizationProposal{RejectReason: event.CompactRejectInternal}
+				disposition = contextCompactionAwaitRejected
+			}
 			var replacementPlan *actorContextReplacement
 			if proposal.Success != nil {
 				plan, replacementErr := prepareActorContextReplacement(state, *attempt, proposal.Success, settings)
