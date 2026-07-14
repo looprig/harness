@@ -690,6 +690,7 @@ const (
 	CompactRejectContextCountFailed
 	CompactRejectSummaryTooLarge
 	CompactRejectInternal
+	CompactRejectContextLimitUnknown
 )
 ```
 
@@ -705,10 +706,22 @@ to `CompactRejectUnavailable`; hustle queue/pre-ownership execution failure and
 adapter/inference failure to `CompactRejectExecutionFailed`; strict
 summary/domain validation to `CompactRejectInvalidSummary`; post-summary/request
 count failure or timeout to `CompactRejectContextCountFailed`; a valid summary
-still over the hard input limit to `CompactRejectSummaryTooLarge`; and ID
-generation or an otherwise unclassified internal fault to
-`CompactRejectInternal`. A fatal hub, session, or persistence failure is never
-falsely journaled as `CompactionRejected`.
+still over the hard input limit to `CompactRejectSummaryTooLarge`; a successful,
+usable count with no resolved positive input limit/denominator
+(`ContextLimitUnknownError`) to `CompactRejectContextLimitUnknown`; and an
+otherwise unclassified recoverable internal failure after a valid `AttemptID`
+exists, while a structurally valid durable terminal can still be constructed and
+journaled, to `CompactRejectInternal`.
+
+`CompactionStarted` construction, validation, checked-publication, or ephemeral
+EventID mint/stamp failure maps to `CompactRejectProgressPublication` only while
+a valid canonical durable rejection can still be constructed and appended.
+Failure to mint a required `AttemptID` or durable terminal EventID, or any failure
+that makes a structurally valid canonical terminal impossible, is fatal
+infrastructure: fault/stop the session and complete in-process waiters with the
+typed infrastructure error, but never claim or journal `CompactionRejected`.
+The same no-false-rejection rule applies to fatal hub, session, and persistence
+failure.
 
 Manual and automatic compaction use one command:
 

@@ -601,8 +601,15 @@ exactly `Unspecified(0)`, `ControlLaneFull(1)`, `ShuttingDown(2)`,
 `Interrupted(3)`, `Canceled(4)`, `StaleBasis(5)`,
 `ProgressPublication(6)`, `Unavailable(7)`, `ExecutionFailed(8)`,
 `InvalidSummary(9)`, `ContextCountFailed(10)`, `SummaryTooLarge(11)`, and
-`Internal(12)`. Use the canonical mapping documented in the token design §8;
-fatal hub/session/persistence failure is not journaled as a false rejection.
+`Internal(12)`, and `ContextLimitUnknown(13)`. Use the canonical mapping
+documented in the token design §8. `ProgressPublication` applies to start
+construction/validation/checked-publication/EventID-stamp failure only when a
+valid durable rejection remains constructible and appendable. `Internal` is
+only a recoverable unclassified failure after a valid AttemptID exists and a
+valid terminal remains constructible/journalable. AttemptID or durable-terminal
+EventID mint failure, structurally impossible canonical terminals, and fatal
+hub/session/persistence failures fault/stop and complete in-process waiters with
+typed infrastructure errors; none is journaled as a false rejection.
 
 Commit: `feat(compaction): add commands and event contracts`.
 
