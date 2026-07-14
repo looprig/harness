@@ -8,6 +8,7 @@ import (
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/command"
 	"github.com/looprig/harness/pkg/event"
+	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/loop"
 )
 
@@ -93,6 +94,67 @@ func TestCommandSinkForRoutesOnlyNativePriorityControls(t *testing.T) {
 			}
 			if got := len(channels.ordinary) == 1; got == tt.wantPriority {
 				t.Errorf("ordinary delivery = %v, want %v", got, !tt.wantPriority)
+			}
+		})
+	}
+}
+
+func TestInterruptLoopRoutesNativePriorityAndForeignFallback(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name         string
+		backend      func() (*priorityTestBackend, loop.Backend)
+		wantPriority bool
+	}{
+		{
+			name: "native loop uses priority lane",
+			backend: func() (*priorityTestBackend, loop.Backend) {
+				value := newPriorityTestBackend()
+				return value, value
+			},
+			wantPriority: true,
+		},
+		{
+			name: "foreign loop retains ordinary lane",
+			backend: func() (*priorityTestBackend, loop.Backend) {
+				value := newPriorityTestBackend()
+				return value, &ordinaryTestBackend{ordinary: value.ordinary, done: value.done}
+			},
+		},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			channels, backend := tt.backend()
+			s := &Session{
+				sessionID:  uuid.UUID{0x10},
+				sessionCtx: context.Background(),
+				newID: func() (uuid.UUID, error) {
+					return uuid.UUID{0x30}, nil
+				},
+			}
+			s.interruptLoop(uuid.UUID{0x20}, backend)
+
+			selected := channels.ordinary
+			other := channels.priority
+			if tt.wantPriority {
+				selected, other = channels.priority, channels.ordinary
+			}
+			select {
+			case got := <-selected:
+				interrupt, ok := got.(command.Interrupt)
+				if !ok {
+					t.Fatalf("interruptLoop command = %T, want command.Interrupt", got)
+				}
+				if interrupt.Header.Agency != identity.AgencyMachine {
+					t.Errorf("interruptLoop agency = %v, want AgencyMachine", interrupt.Header.Agency)
+				}
+			default:
+				t.Fatalf("interruptLoop did not use expected priority=%v lane", tt.wantPriority)
+			}
+			if len(other) != 0 {
+				t.Fatalf("interruptLoop also delivered to the other lane: len = %d", len(other))
 			}
 		})
 	}

@@ -108,16 +108,37 @@ type compactionFailureSink interface {
 
 type actorCommandHandler func(command.Command) bool
 
-// arbitrateCompactionBoundary gives a priority control that is already ready one
-// bounded opportunity to mutate actor state before compaction is consumed at the
-// simultaneous safe boundary. It never drains or reorders the ordinary FIFO lane.
+// arbitrateCompactionBoundary applies the bounded snapshot of priority controls
+// already queued at a safe boundary before compaction is consumed. The production
+// lane is capped at compactionPriorityCommandCapacity, so this preserves command
+// order without an unbounded drain or touching the ordinary FIFO lane.
 func arbitrateCompactionBoundary(priorityCommands <-chan command.Command, handle actorCommandHandler, dispatch func()) bool {
-	select {
-	case cmd, ok := <-priorityCommands:
+	snapshotSize := len(priorityCommands)
+	if snapshotSize > compactionPriorityCommandCapacity {
+		snapshotSize = compactionPriorityCommandCapacity
+	}
+	handled := 0
+	if snapshotSize == 0 {
+		select {
+		case cmd, ok := <-priorityCommands:
+			if !ok || handle(cmd) {
+				return true
+			}
+			handled = 1
+		default:
+			dispatch()
+			return false
+		}
+		snapshotSize = handled + len(priorityCommands)
+		if snapshotSize > compactionPriorityCommandCapacity {
+			snapshotSize = compactionPriorityCommandCapacity
+		}
+	}
+	for i := handled; i < snapshotSize; i++ {
+		cmd, ok := <-priorityCommands
 		if !ok || handle(cmd) {
 			return true
 		}
-	default:
 	}
 	dispatch()
 	return false

@@ -166,6 +166,50 @@ func TestArbitrateCompactionBoundaryPrioritizesReadyControl(t *testing.T) {
 	}
 }
 
+func TestArbitrateCompactionBoundaryBoundsReadySnapshot(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name          string
+		queued        int
+		wantHandled   int
+		wantRemaining int
+	}{
+		{name: "empty lane dispatches", queued: 0, wantHandled: 0, wantRemaining: 0},
+		{name: "ready controls preserve fifo", queued: 2, wantHandled: 2, wantRemaining: 0},
+		{name: "snapshot is capped", queued: compactionPriorityCommandCapacity + 2, wantHandled: compactionPriorityCommandCapacity, wantRemaining: 2},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			priority := make(chan command.Command, compactionPriorityCommandCapacity+2)
+			for i := 0; i < tt.queued; i++ {
+				priority <- command.Interrupt{Header: command.Header{CommandID: uuid.UUID{byte(i + 1)}}, Ack: make(chan bool, 1)}
+			}
+			var handled []uuid.UUID
+			dispatched := 0
+			exit := arbitrateCompactionBoundary(priority, func(cmd command.Command) bool {
+				handled = append(handled, cmd.CommandHeader().CommandID)
+				return false
+			}, func() { dispatched++ })
+			if exit {
+				t.Fatal("arbitration unexpectedly requested actor exit")
+			}
+			if len(handled) != tt.wantHandled || len(priority) != tt.wantRemaining {
+				t.Fatalf("handled = %d remaining = %d, want %d and %d", len(handled), len(priority), tt.wantHandled, tt.wantRemaining)
+			}
+			if dispatched != 1 {
+				t.Fatalf("dispatch count = %d, want 1", dispatched)
+			}
+			for i, id := range handled {
+				if want := (uuid.UUID{byte(i + 1)}); id != want {
+					t.Fatalf("handled[%d] = %v, want FIFO id %v", i, id, want)
+				}
+			}
+		})
+	}
+}
+
 func TestCompactionControlCanonicalWaiters(t *testing.T) {
 	t.Parallel()
 	base := time.Date(2026, 7, 14, 12, 0, 0, 0, time.UTC)

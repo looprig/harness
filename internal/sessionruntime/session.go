@@ -1652,7 +1652,7 @@ func (s *Session) interruptLoop(loopID uuid.UUID, l loop.Backend) {
 	timer := time.NewTimer(100 * time.Millisecond)
 	defer timer.Stop()
 	select {
-	case l.CommandSink() <- cmd:
+	case commandSinkFor(l, cmd) <- cmd:
 	case <-l.DoneChan():
 	case <-timer.C:
 	}

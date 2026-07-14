@@ -156,23 +156,37 @@ func TestLoopCompactionControlBoundaries(t *testing.T) {
 
 func TestLoopActorPriorityLaneOutranksOrdinaryContentionAtBoundary(t *testing.T) {
 	t.Parallel()
+	type priorityControl uint8
+	const (
+		priorityInterrupt priorityControl = iota
+		priorityShutdown
+	)
 	tests := []struct {
-		name       string
-		priority   func(uuid.UUID) command.Command
-		wantReject event.CompactRejectReason
+		name             string
+		controls         []priorityControl
+		wantReject       event.CompactRejectReason
+		wantInterruptAck bool
 	}{
 		{
-			name: "interrupt priority lane",
-			priority: func(id uuid.UUID) command.Command {
-				return command.Interrupt{Header: command.Header{CommandID: id}, Ack: make(chan bool, 1)}
-			},
-			wantReject: event.CompactRejectInterrupted,
+			name:             "interrupt priority lane",
+			controls:         []priorityControl{priorityInterrupt},
+			wantReject:       event.CompactRejectInterrupted,
+			wantInterruptAck: true,
 		},
 		{
-			name: "shutdown priority lane",
-			priority: func(id uuid.UUID) command.Command {
-				return command.Shutdown{Header: command.Header{CommandID: id}, Ack: make(chan error, 1)}
-			},
+			name:       "shutdown priority lane",
+			controls:   []priorityControl{priorityShutdown},
+			wantReject: event.CompactRejectShuttingDown,
+		},
+		{
+			name:             "interrupt then shutdown gives shutdown precedence",
+			controls:         []priorityControl{priorityInterrupt, priorityShutdown},
+			wantReject:       event.CompactRejectShuttingDown,
+			wantInterruptAck: true,
+		},
+		{
+			name:       "shutdown then interrupt preserves order and shutdown precedence",
+			controls:   []priorityControl{priorityShutdown, priorityInterrupt},
 			wantReject: event.CompactRejectShuttingDown,
 		},
 	}
@@ -183,7 +197,7 @@ func TestLoopActorPriorityLaneOutranksOrdinaryContentionAtBoundary(t *testing.T)
 			ctx, cancel := context.WithCancel(context.Background())
 			t.Cleanup(cancel)
 			normal := make(chan command.Command, 2)
-			priority := make(chan command.Command, 1)
+			priority := make(chan command.Command, compactionPriorityCommandCapacity)
 			drains := make(chan drainRequest, 1)
 			boundaryEntered := make(chan struct{})
 			boundaryRelease := make(chan struct{})
@@ -226,7 +240,18 @@ func TestLoopActorPriorityLaneOutranksOrdinaryContentionAtBoundary(t *testing.T)
 			<-boundaryEntered
 			ordinaryID := uuid.UUID{2}
 			normal <- command.UserInput{Header: command.Header{CommandID: ordinaryID}}
-			priority <- tt.priority(uuid.UUID{3})
+			var interruptAck chan bool
+			var shutdownAck chan error
+			for i, control := range tt.controls {
+				switch control {
+				case priorityInterrupt:
+					interruptAck = make(chan bool, 1)
+					priority <- command.Interrupt{Header: command.Header{CommandID: uuid.UUID{byte(i + 3)}}, Ack: interruptAck}
+				case priorityShutdown:
+					shutdownAck = make(chan error, 1)
+					priority <- command.Shutdown{Header: command.Header{CommandID: uuid.UUID{byte(i + 3)}}, Ack: shutdownAck}
+				}
+			}
 			close(boundaryRelease)
 
 			got := awaitCompactionDisposition(t, sink)
@@ -259,6 +284,32 @@ func TestLoopActorPriorityLaneOutranksOrdinaryContentionAtBoundary(t *testing.T)
 			case <-done:
 			case <-time.After(2 * time.Second):
 				t.Fatal("loop actor did not stop")
+			}
+			if interruptAck != nil {
+				select {
+				case got := <-interruptAck:
+					if got != tt.wantInterruptAck {
+						t.Errorf("interrupt ack = %v, want %v (control order not preserved)", got, tt.wantInterruptAck)
+					}
+				default:
+					t.Fatal("priority interrupt was not processed")
+				}
+				if len(interruptAck) != 0 {
+					t.Fatalf("interrupt processed more than once: %d extra acks", len(interruptAck))
+				}
+			}
+			if shutdownAck != nil {
+				select {
+				case err := <-shutdownAck:
+					if err != nil {
+						t.Errorf("shutdown ack = %v, want nil", err)
+					}
+				default:
+					t.Fatal("priority shutdown was not processed")
+				}
+				if len(shutdownAck) != 0 {
+					t.Fatalf("shutdown processed more than once: %d extra acks", len(shutdownAck))
+				}
 			}
 		})
 	}
