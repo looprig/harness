@@ -661,6 +661,55 @@ automatic rearm latch.
 
 ## §8 · `Compact` command and control lane
 
+Compaction reasons are named `uint8` enums encoded as ordinary JSON numbers,
+matching the existing durable `pkg/event` enum convention. Zero is reserved and
+invalid; validators and codecs reject values outside the closed domains:
+
+```go
+type CompactionReason uint8
+
+const (
+	CompactionReasonUnspecified CompactionReason = iota
+	CompactionReasonManual
+	CompactionReasonAutomatic
+)
+
+type CompactRejectReason uint8
+
+const (
+	CompactRejectUnspecified CompactRejectReason = iota
+	CompactRejectControlLaneFull
+	CompactRejectShuttingDown
+	CompactRejectInterrupted
+	CompactRejectCanceled
+	CompactRejectStaleBasis
+	CompactRejectProgressPublication
+	CompactRejectUnavailable
+	CompactRejectExecutionFailed
+	CompactRejectInvalidSummary
+	CompactRejectContextCountFailed
+	CompactRejectSummaryTooLarge
+	CompactRejectInternal
+)
+```
+
+The canonical rejection mapping is fixed: full control waiters map to
+`CompactRejectControlLaneFull`; loop/control or hustle-lane closure during
+shutdown to `CompactRejectShuttingDown`; interrupt to
+`CompactRejectInterrupted`; caller/session cancellation to
+`CompactRejectCanceled`; actor basis/model/request-fingerprint CAS mismatch to
+`CompactRejectStaleBasis`; checked `CompactionStarted` validation/publication
+failure while the durable journal remains writable to
+`CompactRejectProgressPublication`; no configured/registered usable compactor
+to `CompactRejectUnavailable`; hustle queue/pre-ownership execution failure and
+adapter/inference failure to `CompactRejectExecutionFailed`; strict
+summary/domain validation to `CompactRejectInvalidSummary`; post-summary/request
+count failure or timeout to `CompactRejectContextCountFailed`; a valid summary
+still over the hard input limit to `CompactRejectSummaryTooLarge`; and ID
+generation or an otherwise unclassified internal fault to
+`CompactRejectInternal`. A fatal hub, session, or persistence failure is never
+falsely journaled as `CompactionRejected`.
+
 Manual and automatic compaction use one command:
 
 ```go

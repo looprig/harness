@@ -594,6 +594,16 @@ enduring terminal fidelity/duration, ephemeral persistence rejection, serve
 delivery, waiter deterministic IDs, checked stamped publication, publication
 failure preventing inference, and malformed input fuzzing.
 
+The public/durable reason fields use named `uint8` enums encoded as ordinary JSON
+numbers. Zero and unknown values are invalid. `CompactionReason` is exactly
+`Unspecified(0)`, `Manual(1)`, and `Automatic(2)`. `CompactRejectReason` is
+exactly `Unspecified(0)`, `ControlLaneFull(1)`, `ShuttingDown(2)`,
+`Interrupted(3)`, `Canceled(4)`, `StaleBasis(5)`,
+`ProgressPublication(6)`, `Unavailable(7)`, `ExecutionFailed(8)`,
+`InvalidSummary(9)`, `ContextCountFailed(10)`, `SummaryTooLarge(11)`, and
+`Internal(12)`. Use the canonical mapping documented in the token design §8;
+fatal hub/session/persistence failure is not journaled as a false rejection.
+
 Commit: `feat(compaction): add commands and event contracts`.
 
 ### Task 23: Control-lane coalescing and waiter outcomes
