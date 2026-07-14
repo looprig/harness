@@ -232,3 +232,43 @@ func TestTurnStartReservationRejectsInvalidUse(t *testing.T) {
 		})
 	}
 }
+
+func TestTurnStartReservationCheckedPublication(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name    string
+		fail    bool
+		wantErr bool
+	}{
+		{name: "successful checked publication consumes reservation"},
+		{name: "append failure is returned and releases reservation", fail: true, wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			sessionID := mustID(t)
+			loopID := mustID(t)
+			h := New(sessionID, WithAppender(&fakeAppender{failAll: tt.fail}))
+			reservation, err := h.ReserveTurnStart(loopID)
+			if err != nil {
+				t.Fatalf("ReserveTurnStart() error = %v", err)
+			}
+			started := event.TurnStarted{Header: event.Header{Coordinates: identity.Coordinates{SessionID: sessionID, LoopID: loopID}}}
+			err = reservation.PublishTurnStartedChecked(context.Background(), started)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("PublishTurnStartedChecked() error = %T %v, wantErr %v", err, err, tt.wantErr)
+			}
+			if tt.wantErr {
+				var fault *SessionPersistenceFault
+				if !errors.As(err, &fault) {
+					t.Fatalf("error = %T %v, want *SessionPersistenceFault", err, err)
+				}
+			}
+			next, nextErr := h.ReserveTurnStart(mustID(t))
+			if nextErr != nil {
+				t.Fatalf("next ReserveTurnStart() error = %v", nextErr)
+			}
+			next.Release()
+		})
+	}
+}

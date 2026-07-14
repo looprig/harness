@@ -17,6 +17,13 @@ const (
 	turnStartReservationReleased
 )
 
+type turnStartPublicationMode uint8
+
+const (
+	turnStartPublicationUnchecked turnStartPublicationMode = iota
+	turnStartPublicationChecked
+)
+
 // TurnStartReservation is an opaque one-shot publisher that owns the Hub activity
 // transition from immediately before a loop acquires its first checkpoint reader
 // through publication of that loop's exact opening TurnStarted.
@@ -63,8 +70,20 @@ func (r *TurnStartReservation) Release() {
 }
 
 // PublishTurnStarted consumes this capability for exactly one matching value event.
-// Generic Hub publication cannot discover or claim it from event coordinates.
+// Generic Hub publication cannot discover or claim it from event coordinates. This
+// legacy form preserves unchecked Hub reporting semantics; construction paths that
+// must not install live state without the event use PublishTurnStartedChecked.
 func (r *TurnStartReservation) PublishTurnStarted(ctx context.Context, started event.TurnStarted) error {
+	return r.publishTurnStarted(ctx, started, turnStartPublicationUnchecked)
+}
+
+// PublishTurnStartedChecked consumes the reservation with checked durable
+// publication, returning any append fault to the actor before it installs the turn.
+func (r *TurnStartReservation) PublishTurnStartedChecked(ctx context.Context, started event.TurnStarted) error {
+	return r.publishTurnStarted(ctx, started, turnStartPublicationChecked)
+}
+
+func (r *TurnStartReservation) publishTurnStarted(ctx context.Context, started event.TurnStarted, mode turnStartPublicationMode) error {
 	if started.SessionID != r.hub.sessionID || started.LoopID != r.loopID {
 		return &TurnStartReservationError{Reason: TurnStartReservationMismatch, LoopID: started.LoopID}
 	}
@@ -85,5 +104,5 @@ func (r *TurnStartReservation) PublishTurnStarted(ctx context.Context, started e
 		r.mu.Unlock()
 		r.hub.activityMu.Unlock()
 	}()
-	return r.hub.publishEventWithActivity(ctx, started, false, true)
+	return r.hub.publishEventWithActivity(ctx, started, mode == turnStartPublicationChecked, true)
 }

@@ -752,7 +752,7 @@ type sessionTurnStartCapability struct {
 }
 
 func (c *sessionTurnStartCapability) PublishTurnStarted(ctx context.Context, started event.TurnStarted) error {
-	if err := c.reservation.PublishTurnStarted(ctx, started); err != nil {
+	if err := c.reservation.PublishTurnStartedChecked(ctx, started); err != nil {
 		return err
 	}
 	c.session.recordLoopMechanicalState(started)
