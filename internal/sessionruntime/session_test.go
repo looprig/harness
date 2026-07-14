@@ -917,8 +917,8 @@ func TestShutdownLeaseHooksUseFreshContextsAfterCallerCancellation(t *testing.T)
 	}
 	callerCtx, cancelCaller := context.WithCancel(context.Background())
 	cancelCaller()
-	if err := s.Shutdown(callerCtx); err != nil {
-		t.Fatalf("Shutdown() error = %v, want nil for empty session", err)
+	if err := s.Shutdown(callerCtx); err == nil || !errors.Is(err, context.Canceled) {
+		t.Fatalf("Shutdown() error = %v, want caller cancellation after cleanup", err)
 	}
 	mu.Lock()
 	defer mu.Unlock()
@@ -1016,20 +1016,12 @@ func TestInterruptCtxCancelledBeforeSend(t *testing.T) {
 	}
 }
 
-// TestShutdownCtxCancelledBeforeSend: a cancelled ctx makes Shutdown return
-// *SessionError{SessionContextDone} before any command is sent.
-//
-// As with Interrupt, determinism comes from a FAKE loop whose unbuffered Commands
-// channel NOTHING receives from and whose Done is never closed: Shutdown's
-// per-loop send select has only its ctx.Done() arm ready, so a pre-cancelled ctx
-// wins on the very first per-loop send. Shutdown first latches closing, snapshots
-// the loops, and calls hub.StopSession before the sends — all harmless here; the
-// send still blocks and the cancelled ctx still wins. sessionWithTwoFakeLoopsAndDone
-// (not sessionWithFakeLoop) is used because Shutdown dereferences s.hub, which that
-// helper populates. No time.Sleep is needed (or correct) here.
+// TestShutdownCtxCancelledBeforeSend proves caller cancellation is diagnostic,
+// not teardown authority. Shutdown still gracefully reaches and joins every loop,
+// then reports the caller cancellation only after safe terminal cleanup.
 func TestShutdownCtxCancelledBeforeSend(t *testing.T) {
 	t.Parallel()
-	s, _, _, _, _ := sessionWithTwoFakeLoopsAndDone() // Commands never read + Done never closed
+	s, cmdsA, cmdsB, _, _ := sessionWithTwoFakeLoopsAndDone()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -1037,14 +1029,34 @@ func TestShutdownCtxCancelledBeforeSend(t *testing.T) {
 	errCh := make(chan error, 1)
 	go func() { errCh <- s.Shutdown(ctx) }()
 
-	select {
-	case err := <-errCh:
-		var se *SessionError
-		if !errors.As(err, &se) || se.Kind != SessionContextDone {
-			t.Fatalf("err = %v, want *SessionError{SessionContextDone}", err)
+	var acks []chan<- error
+	for len(acks) < 2 {
+		select {
+		case raw := <-cmdsA:
+			shutdown, ok := raw.(command.Shutdown)
+			if !ok {
+				t.Fatalf("loop A command = %T, want command.Shutdown", raw)
+			}
+			acks = append(acks, shutdown.Ack)
+		case raw := <-cmdsB:
+			shutdown, ok := raw.(command.Shutdown)
+			if !ok {
+				t.Fatalf("loop B command = %T, want command.Shutdown", raw)
+			}
+			acks = append(acks, shutdown.Ack)
+		case err := <-errCh:
+			t.Fatalf("Shutdown returned %v before reaching every loop", err)
+		case <-time.After(2 * time.Second):
+			t.Fatal("Shutdown did not reach every loop after caller cancellation")
 		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("Shutdown blocked on a cancelled ctx (no ctx.Done() escape in the send select)")
+	}
+	for _, ack := range acks {
+		ack <- nil
+	}
+	err := <-errCh
+	var se *SessionError
+	if !errors.As(err, &se) || se.Kind != SessionContextDone || !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want *SessionError{SessionContextDone} wrapping cancellation", err)
 	}
 }
 
