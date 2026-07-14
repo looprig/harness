@@ -505,13 +505,15 @@ func foldLoop(events []event.Event) foldResult {
 
 func foldLoopForRestore(bound loop.BoundDefinition, events []event.Event, discardContext bool) (foldResult, error) {
 	folded := foldLoop(events)
+	if folded.Err != nil {
+		return foldResult{}, &RestoreError{Kind: RestoreReplayFailed, Cause: folded.Err}
+	}
 	if discardContext {
 		folded.Context = event.ContextMeasurement{}
 		folded.HasContext = false
-		folded.Err = nil
 		return folded, nil
 	}
-	if folded.Err == nil && folded.HasContext {
+	if folded.HasContext {
 		_, effectiveModel := liveViewFor(bound, foldLoopInference(events))
 		if folded.Context.Model != effectiveModel.Key() {
 			folded.Err = &RestoredContextModelMismatchError{

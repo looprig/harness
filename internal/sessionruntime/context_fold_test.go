@@ -141,13 +141,14 @@ func TestRestoredContextConfigMismatchDisposition(t *testing.T) {
 	legacy := validModel("legacy")
 	matching := event.ConfigFingerprint{ModelID: "base", SystemPromptRev: "same"}
 	tests := []struct {
-		name          string
-		persisted     event.ConfigFingerprint
-		live          event.ConfigFingerprint
-		allowMismatch bool
-		events        []event.Event
-		wantContext   bool
-		wantConfigErr bool
+		name           string
+		persisted      event.ConfigFingerprint
+		live           event.ConfigFingerprint
+		allowMismatch  bool
+		events         []event.Event
+		wantContext    bool
+		wantConfigErr  bool
+		wantRestoreErr bool
 	}{
 		{
 			name:          "overridden changed model discards legacy fallback context",
@@ -162,6 +163,14 @@ func TestRestoredContextConfigMismatchDisposition(t *testing.T) {
 			live:          event.ConfigFingerprint{ModelID: "base", SystemPromptRev: "new"},
 			allowMismatch: true,
 			events:        []event.Event{event.LoopStarted{}, event.ContextMeasured{Measurement: measurementFor(base)}},
+		},
+		{
+			name:           "override does not suppress corrupt durable runtime context",
+			persisted:      event.ConfigFingerprint{ModelID: "legacy"},
+			live:           event.ConfigFingerprint{ModelID: "base"},
+			allowMismatch:  true,
+			events:         []event.Event{event.LoopStarted{Runtime: runtimeForModel(legacy)}, event.ContextMeasured{Measurement: measurementFor(base)}},
+			wantRestoreErr: true,
 		},
 		{
 			name:          "actual mismatch without override rejects",
@@ -190,8 +199,14 @@ func TestRestoredContextConfigMismatchDisposition(t *testing.T) {
 				return
 			}
 			folded, err := foldLoopForRestore(bound, tt.events, discardContext)
-			if err != nil {
-				t.Fatal(err)
+			var restoreErr *RestoreError
+			var mismatchErr *RestoredContextModelMismatchError
+			gotRestoreErr := errors.As(err, &restoreErr) && restoreErr.Kind == RestoreReplayFailed && errors.As(err, &mismatchErr)
+			if gotRestoreErr != tt.wantRestoreErr {
+				t.Fatalf("restore error = %T %v, wantRestoreErr=%v", err, err, tt.wantRestoreErr)
+			}
+			if tt.wantRestoreErr {
+				return
 			}
 			if folded.HasContext != tt.wantContext {
 				t.Fatalf("HasContext = %v, want %v", folded.HasContext, tt.wantContext)
