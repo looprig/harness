@@ -630,12 +630,24 @@ Commit: `feat(loopruntime): coordinate compaction attempts`.
 
 **Repository:** `$HARNESS`
 
-**Files:** create `internal/loopruntime/context.go`, `context_test.go`; modify step/turn/model-change paths and tests.
+**Files:** create `internal/loopruntime/context.go`, `context_test.go`; add the
+public `pkg/loop.ContextObservationPolicy`, `WithContextObservation`, and
+`ContextLimitError`; modify definition/fingerprint, step/turn/model-change paths,
+and tests.
 
 **RED:** complete candidate request counting before inference; changed-only
 `ContextMeasured`; pressure state changes; 80/60 policy supplied by consumer;
-one auto-attempt per basis; manual bypass; smaller-model recount; soft failure
-continues below limit; hard limit blocks; timeout and cancellation.
+one auto-attempt per basis; manual bypass; smaller-model recount; hard limit
+blocks; timeout and cancellation. A counter must have exactly one explicit
+observation or compaction policy. Observation validates a non-zero reservation,
+positive exactly-preserved timeout, and heuristic margin; it is mutually exclusive
+with compaction, fingerprinted, emits only Normal/HardLimit pressure transitions,
+and never schedules compaction. Pre-primary count failure never reuses an older
+measurement and ends the turn with typed `inference.ContextCountError`; unknown
+limit uses `ContextLimitUnknownError`; measured hard admission uses
+`ContextLimitError`. None fabricates a compaction attempt or rejection. Soft
+compaction failure below a known hard limit and compact-reject count/unknown
+mappings remain Task 26 behavior once a real attempt exists.
 
 Commit: `feat(loopruntime): measure and admit request context`.
 

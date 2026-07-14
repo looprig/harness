@@ -378,6 +378,7 @@ The dependencies enter a loop explicitly:
 loop.WithInference(client, model)
 loop.WithContextCounter(counter)
 loop.WithInferenceCapability(capability)
+loop.WithContextObservation(observationPolicy)
 loop.WithCompaction(policy)
 ```
 
@@ -395,8 +396,11 @@ identity—enter the loop policy revision and rig fingerprint: complete
 `CounterCapability`, estimator revision, complete `InferenceCapability`, and
 model limits. `WithCompaction` requires both options for manual and automatic
 compaction because success must count `PostContext`; automatic policy additionally
-validates its `CounterPolicy` quality requirement. A counter may be configured
-without compaction for observe-only measurement.
+validates its `CounterPolicy` quality requirement. A configured counter must own
+exactly one explicit admission policy: `WithContextObservation` for observe-only
+measurement or `WithCompaction` for compacting loops. The two policies are mutually
+exclusive so reservation, safety margin, and count timeout have one owner. There is
+no counter-only timeout default.
 
 The counter and inference capability are fixed collaborators of one bound loop;
 live model/mode changes do not replace them. The binding records the original
@@ -651,6 +655,12 @@ const (
 measurement, percentage, previous level, and new level. It fires on a level
 change rather than on every step. Current state is queryable from the loop/session
 view and reconstructable from enduring measurements/events.
+
+An observe-only loop has no automatic compaction thresholds. Its pressure state
+therefore transitions only between `PressureNormal` and `PressureHardLimit`; it
+never emits `PressureCompact` and never schedules compaction. It still publishes
+changed authoritative measurements and pressure transitions using its explicit
+observation policy.
 
 Harness defines no implicit threshold defaults. Consumers supply explicit
 values. SWE's calibrated values are fixed in §13: compact at 80%, rearm below
@@ -1216,7 +1226,11 @@ Compaction has two different decisions:
 
 If the compaction hustle fails below the hard limit, history is unchanged and
 the turn may continue. If it fails at/above the hard limit, the next model call
-is rejected with a typed context-limit error.
+is rejected with a typed context-limit error. This soft-failure rule applies only
+to a real compaction attempt with a valid current measurement. A failed count
+never authorizes a changed candidate request from an older measurement: count
+failure, timeout, or cancellation before primary inference ends the turn with a
+typed `inference.ContextCountError` and no fabricated compaction attempt.
 
 A failed automatic attempt is recorded against the current `ContextBasis`.
 There is at most one automatic attempt per unchanged basis. A later context
@@ -1345,6 +1359,24 @@ model keys. `hustle.TerminalStatus` is a fixed two-value set (completed/failed).
 
 ## §13 · Configuration
 
+Observe-only counting has its own explicit policy:
+
+```go
+type ContextObservationPolicy struct {
+	ReservedOutput content.TokenCount
+	SafetyMargin   content.TokenCount
+	CountTimeout   time.Duration
+}
+
+loop.WithContextObservation(policy)
+```
+
+`ReservedOutput` is non-zero, `CountTimeout` is positive and preserved exactly,
+and a heuristic counter requires a non-zero `SafetyMargin`. The policy requires
+both `WithContextCounter` and `WithInferenceCapability`, is mutually exclusive
+with `WithCompaction`, uses the same checked `ResolveContextLimits`, and enters
+the definition/rig policy fingerprint. Harness supplies no defaults.
+
 The presence of `WithCompaction` installs manual compaction. Automatic behavior
 is explicit:
 
@@ -1448,6 +1480,17 @@ latest-value state, never as cumulative usage.
 - command validation/routing errors for missing coordinates or invalid agency.
 
 All errors unwrap their cause when applicable.
+
+Before every primary inference the runtime counts the complete candidate request
+under the configured exact timeout. Count failure, timeout, or cancellation ends
+the turn as `TurnFailed` carrying or wrapping `inference.ContextCountError`;
+unknown or unresolvable limits end it with `ContextLimitUnknownError`; and a
+successful measurement with `InputTokens >= InputLimit` ends it with
+`ContextLimitError{Measurement}`. None calls primary inference. These pre-request
+failures have no compaction `AttemptID`, so they never fabricate
+`CompactionRejected`. `CompactRejectContextCountFailed` and
+`CompactRejectContextLimitUnknown` apply only after a real compaction attempt
+exists, including post-summary counting in the compaction finalization work.
 
 ### Missing exact provider counters
 
