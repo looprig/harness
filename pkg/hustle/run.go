@@ -46,6 +46,21 @@ const (
 // Valid reports whether the reason is recognized for durable audit.
 func (r ReasonCode) Valid() bool { return r >= ReasonRejected && r <= ReasonInternal }
 
+// TerminalStatus is the bounded outcome dimension used by durable usage
+// aggregates. Interrupted attempts are deliberately not terminal.
+type TerminalStatus uint8
+
+const (
+	TerminalStatusUnknown TerminalStatus = iota
+	TerminalStatusCompleted
+	TerminalStatusFailed
+)
+
+// Valid reports whether the value is a durable terminal outcome.
+func (s TerminalStatus) Valid() bool {
+	return s == TerminalStatusCompleted || s == TerminalStatusFailed
+}
+
 // ReasonAllowed reports whether reason is a valid durable classification for
 // stage. The closed matrix prevents impossible stage/reason audit records.
 func ReasonAllowed(stage Stage, reason ReasonCode) bool {

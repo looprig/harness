@@ -1,13 +1,148 @@
 package sessionruntime
 
 import (
+	"sort"
+
 	"github.com/looprig/core/content"
+	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/internal/loopruntime"
 	"github.com/looprig/harness/pkg/ceiling"
 	"github.com/looprig/harness/pkg/event"
+	"github.com/looprig/harness/pkg/hustle"
 	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/loop"
+	"github.com/looprig/inference"
 )
+
+type restoredHustleAuditErrorKind string
+
+const (
+	restoredHustleAuditDuplicateStart       restoredHustleAuditErrorKind = "duplicate_start"
+	restoredHustleAuditTerminalWithoutStart restoredHustleAuditErrorKind = "terminal_without_start"
+	restoredHustleAuditAttributionMismatch  restoredHustleAuditErrorKind = "attribution_mismatch"
+	restoredHustleAuditInvalidStart         restoredHustleAuditErrorKind = "invalid_start"
+	restoredHustleAuditCountOverflow        restoredHustleAuditErrorKind = "count_overflow"
+)
+
+type restoredHustleAuditError struct {
+	Kind  restoredHustleAuditErrorKind
+	RunID hustle.RunID
+}
+
+func (e *restoredHustleAuditError) Error() string {
+	return "sessionruntime: invalid restored hustle audit: " + string(e.Kind)
+}
+
+// restoredHustleInterrupted is a bounded diagnostic classification. The
+// unmatched HustleStarted remains the durable audit record; restore neither
+// appends a synthetic terminal nor reconstructs runtime work.
+type restoredHustleInterrupted struct {
+	Name          hustle.Name
+	ModelSource   hustle.ModelSource
+	NamedModelKey inference.ModelKey
+	Runs          uint64
+}
+
+type restoredHustleAudit struct {
+	Interrupted []restoredHustleInterrupted
+}
+
+type restoredHustleStart struct {
+	descriptor hustle.DefinitionDescriptor
+	sessionID  uuid.UUID
+	cause      identity.Cause
+}
+
+// foldRestoredHustleAudit validates exact one-start/one-terminal lifecycle
+// attribution by RunID. Only unmatched starts survive as canonically sorted
+// counts keyed by immutable definition identity; no per-run restore state is
+// returned.
+func foldRestoredHustleAudit(events []event.Event) (restoredHustleAudit, error) {
+	starts := make(map[hustle.RunID]restoredHustleStart)
+	seen := make(map[hustle.RunID]struct{})
+	for _, ev := range events {
+		switch typed := ev.(type) {
+		case event.HustleStarted:
+			if typed.Visibility() != event.Internal || typed.SessionID.IsZero() || uuid.UUID(typed.Run.RunID).IsZero() || typed.Run.Runtime != (event.ModelRuntime{}) || typed.Run.Definition.Validate() != nil {
+				return restoredHustleAudit{}, &restoredHustleAuditError{Kind: restoredHustleAuditInvalidStart, RunID: typed.Run.RunID}
+			}
+			if _, exists := seen[typed.Run.RunID]; exists {
+				return restoredHustleAudit{}, &restoredHustleAuditError{Kind: restoredHustleAuditDuplicateStart, RunID: typed.Run.RunID}
+			}
+			seen[typed.Run.RunID] = struct{}{}
+			starts[typed.Run.RunID] = restoredHustleStart{descriptor: typed.Run.Definition, sessionID: typed.SessionID, cause: typed.Cause}
+		case event.HustleCompleted:
+			if err := consumeRestoredHustleTerminal(starts, typed.Run, typed.SessionID, typed.Cause); err != nil {
+				return restoredHustleAudit{}, err
+			}
+		case event.HustleFailed:
+			if err := consumeRestoredHustleTerminal(starts, typed.Run, typed.SessionID, typed.Cause); err != nil {
+				return restoredHustleAudit{}, err
+			}
+		}
+	}
+	return projectRestoredHustleInterruptions(starts)
+}
+
+func projectRestoredHustleInterruptions(starts map[hustle.RunID]restoredHustleStart) (restoredHustleAudit, error) {
+	type interruptedKey struct {
+		name          hustle.Name
+		modelSource   hustle.ModelSource
+		namedModelKey inference.ModelKey
+	}
+	counts := make(map[interruptedKey]uint64)
+	for _, start := range starts {
+		key := interruptedKey{name: start.descriptor.Name, modelSource: start.descriptor.ModelSource}
+		if start.descriptor.ModelSource == hustle.ModelSourceNamed {
+			key.namedModelKey = start.descriptor.NamedModelKey
+		}
+		var err error
+		counts[key], err = incrementRestoredHustleCount(counts[key])
+		if err != nil {
+			return restoredHustleAudit{}, err
+		}
+	}
+	interrupted := make([]restoredHustleInterrupted, 0, len(counts))
+	for key, runs := range counts {
+		interrupted = append(interrupted, restoredHustleInterrupted{Name: key.name, ModelSource: key.modelSource, NamedModelKey: key.namedModelKey, Runs: runs})
+	}
+	sort.Slice(interrupted, func(i, j int) bool {
+		left, right := interrupted[i], interrupted[j]
+		if left.Name != right.Name {
+			return left.Name < right.Name
+		}
+		if left.ModelSource != right.ModelSource {
+			return left.ModelSource < right.ModelSource
+		}
+		if left.NamedModelKey.Provider != right.NamedModelKey.Provider {
+			return left.NamedModelKey.Provider < right.NamedModelKey.Provider
+		}
+		return left.NamedModelKey.Model < right.NamedModelKey.Model
+	})
+	return restoredHustleAudit{Interrupted: interrupted}, nil
+}
+
+func incrementRestoredHustleCount(value uint64) (uint64, error) {
+	if value == ^uint64(0) {
+		return 0, &restoredHustleAuditError{Kind: restoredHustleAuditCountOverflow}
+	}
+	return value + 1, nil
+}
+
+func consumeRestoredHustleTerminal(starts map[hustle.RunID]restoredHustleStart, run event.HustleRunDescriptor, sessionID uuid.UUID, cause identity.Cause) error {
+	start, exists := starts[run.RunID]
+	if !exists {
+		return &restoredHustleAuditError{Kind: restoredHustleAuditTerminalWithoutStart, RunID: run.RunID}
+	}
+	if start.descriptor != run.Definition || start.sessionID != sessionID || start.cause != cause {
+		return &restoredHustleAuditError{Kind: restoredHustleAuditAttributionMismatch, RunID: run.RunID}
+	}
+	if run.Definition.ModelSource == hustle.ModelSourceNamed && run.Runtime != (event.ModelRuntime{}) && run.Runtime.Key != run.Definition.NamedModelKey {
+		return &restoredHustleAuditError{Kind: restoredHustleAuditAttributionMismatch, RunID: run.RunID}
+	}
+	delete(starts, run.RunID)
+	return nil
+}
 
 func checkFingerprint(persisted, live event.ConfigFingerprint, allowMismatch bool) error {
 	if persisted.Equal(live) {

@@ -33,6 +33,28 @@ func TestStageAndReasonCodeValidity(t *testing.T) {
 	}
 }
 
+func TestTerminalStatusValidity(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name   string
+		status TerminalStatus
+		want   bool
+	}{
+		{name: "unknown is invalid", status: TerminalStatusUnknown},
+		{name: "completed is valid", status: TerminalStatusCompleted, want: true},
+		{name: "failed is valid", status: TerminalStatusFailed, want: true},
+		{name: "above maximum is invalid", status: TerminalStatusFailed + 1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := tt.status.Valid(); got != tt.want {
+				t.Errorf("TerminalStatus.Valid() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestReasonAllowedExhaustive(t *testing.T) {
 	t.Parallel()
 	allowed := map[Stage]map[ReasonCode]bool{

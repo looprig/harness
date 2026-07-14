@@ -204,6 +204,13 @@ func restoreTopologySession(
 		return recordErrored(&RestoreError{Kind: RestoreReplayFailed, Cause: err})
 	}
 	all := eventsFromRecords(allRecords, uuid.UUID{})
+	// Privileged lifecycle records are interpreted only for crash-consistency
+	// validation. Unmatched starts remain in the journal as interrupted audit
+	// evidence; no queue, worker, request, finalizer, activity, or synthetic
+	// terminal is reconstructed.
+	if _, auditErr := foldRestoredHustleAudit(all); auditErr != nil {
+		return recordErrored(&RestoreError{Kind: RestoreReplayFailed, Cause: auditErr})
+	}
 	ceilingLevel, hasCeiling := lastSecurityCeiling(all)
 	if hasCeiling {
 		probe.ceiling.Set(ceilingLevel)

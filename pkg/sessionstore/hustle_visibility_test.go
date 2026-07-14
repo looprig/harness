@@ -11,6 +11,7 @@ import (
 	"github.com/looprig/harness/pkg/hustle"
 	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/journal"
+	"github.com/looprig/inference"
 	"github.com/looprig/storage/memstore"
 )
 
@@ -62,9 +63,18 @@ func TestEventReplayVisibilityAndPrivilegedSeam(t *testing.T) {
 		t.Fatalf("OpenJournal() error = %v", err)
 	}
 	publicBefore := event.SessionStarted{Header: event.Header{Coordinates: identity.Coordinates{SessionID: sid}, EventID: newTestUUID(t)}}
-	private := replayHustleStarted(t, sid)
+	completedStart := replayHustleStarted(t, sid)
+	completedRun := completedStart.Run
+	completedRun.Runtime = event.ModelRuntime{Key: inference.ModelKey{Provider: "provider", Model: "model"}, Limits: inference.ContextLimits{WindowTokens: 100}}
+	completedHeader := completedStart.Header
+	completedHeader.EventID = newTestUUID(t)
+	completed := event.HustleCompleted{Header: completedHeader, Run: completedRun}
+	failedStart := replayHustleStarted(t, sid)
+	failedHeader := failedStart.Header
+	failedHeader.EventID = newTestUUID(t)
+	failed := event.HustleFailed{Header: failedHeader, Run: failedStart.Run, Stage: hustle.StageQueue, ReasonCode: hustle.ReasonCanceled}
 	publicAfter := event.SessionStopped{Header: event.Header{Coordinates: identity.Coordinates{SessionID: sid}, EventID: newTestUUID(t)}}
-	for _, ev := range []event.Event{publicBefore, private, publicAfter} {
+	for _, ev := range []event.Event{publicBefore, completedStart, completed, failedStart, failed, publicAfter} {
 		if _, err := j.Append(context.Background(), journal.NewEventRecord(ev)); err != nil {
 			t.Fatalf("Append(%T) error = %v", ev, err)
 		}
@@ -82,15 +92,15 @@ func TestEventReplayVisibilityAndPrivilegedSeam(t *testing.T) {
 				return store.OpenEventReplayer(sid, ReplayRequest{FromSeq: 1})
 			},
 			wantType: []string{"SessionStarted", "SessionStopped"},
-			wantSeq:  []uint64{2, 4},
+			wantSeq:  []uint64{2, 7},
 		},
 		{
 			name: "privileged retains internal",
 			open: func() (journal.EventReplayer, error) {
 				return store.OpenInternalEventReplayer(sid, ReplayRequest{FromSeq: 1})
 			},
-			wantType: []string{"SessionStarted", "HustleStarted", "SessionStopped"},
-			wantSeq:  []uint64{2, 3, 4},
+			wantType: []string{"SessionStarted", "HustleStarted", "HustleCompleted", "HustleStarted", "HustleFailed", "SessionStopped"},
+			wantSeq:  []uint64{2, 3, 4, 5, 6, 7},
 		},
 	}
 	for _, tt := range tests {
@@ -119,8 +129,8 @@ func TestEventReplayVisibilityAndPrivilegedSeam(t *testing.T) {
 		t.Fatalf("OpenRecordReplayer() error = %v", err)
 	}
 	records, _ := drainRecords(t, recordReplayer, journal.ReplayRequest{})
-	if len(records) != 4 {
-		t.Fatalf("raw records = %d, want fence plus all three events", len(records))
+	if len(records) != 7 {
+		t.Fatalf("raw records = %d, want fence plus all six events", len(records))
 	}
 }
 
@@ -130,6 +140,10 @@ func eventTypeName(ev event.Event) string {
 		return "SessionStarted"
 	case event.HustleStarted:
 		return "HustleStarted"
+	case event.HustleCompleted:
+		return "HustleCompleted"
+	case event.HustleFailed:
+		return "HustleFailed"
 	case event.SessionStopped:
 		return "SessionStopped"
 	default:

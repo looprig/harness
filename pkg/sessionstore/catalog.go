@@ -14,8 +14,11 @@ import (
 	"github.com/looprig/core/content"
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/event"
+	"github.com/looprig/harness/pkg/hustle"
+	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/journal"
 	"github.com/looprig/harness/pkg/workspacestore"
+	"github.com/looprig/inference"
 	"github.com/looprig/storage"
 )
 
@@ -128,6 +131,21 @@ type SessionMeta struct {
 	// Loops is the deterministic, per-loop usage/runtime projection. It is sorted
 	// by LoopID bytes and rebuilt from lifecycle + StepDone events.
 	Loops []LoopUsageMeta `json:"loops,omitempty"`
+	// Hustles is a bounded terminal-only aggregate. Detailed runs and unmatched
+	// starts remain exclusively in the privileged journal.
+	Hustles []HustleUsageAggregate `json:"hustles,omitempty"`
+}
+
+// HustleUsageAggregate is one canonical terminal bucket. Current-loop work has
+// a zero NamedModelKey so arbitrarily many resolved runtime keys cannot grow the
+// catalog; named work uses the immutable key from its definition descriptor.
+type HustleUsageAggregate struct {
+	Name            hustle.Name           `json:"name"`
+	ModelSource     hustle.ModelSource    `json:"model_source"`
+	NamedModelKey   inference.ModelKey    `json:"named_model_key,omitzero"`
+	Status          hustle.TerminalStatus `json:"status"`
+	Runs            uint64                `json:"runs"`
+	CumulativeUsage content.Usage         `json:"cumulative_usage,omitzero"`
 }
 
 // LoopUsageMeta is the catalog's bounded projection for one durable loop.
@@ -330,6 +348,52 @@ func (e *CatalogUsageError) Error() string {
 
 func (e *CatalogUsageError) Unwrap() error { return e.Cause }
 
+type CatalogHustleErrorKind string
+
+const (
+	CatalogHustleDuplicateStart       CatalogHustleErrorKind = "duplicate_start"
+	CatalogHustleTerminalWithoutStart CatalogHustleErrorKind = "terminal_without_start"
+	CatalogHustleAttributionMismatch  CatalogHustleErrorKind = "attribution_mismatch"
+	CatalogHustleInvalidLifecycle     CatalogHustleErrorKind = "invalid_lifecycle"
+	CatalogHustleUsageOverflow        CatalogHustleErrorKind = "usage_overflow"
+	CatalogHustleRunCountOverflow     CatalogHustleErrorKind = "run_count_overflow"
+)
+
+// CatalogHustleError reports a malformed or overflowing privileged lifecycle
+// fold. RunID identifies the offending durable run without exposing its input or
+// output.
+type CatalogHustleError struct {
+	Kind  CatalogHustleErrorKind
+	RunID hustle.RunID
+	Cause error
+}
+
+func (e *CatalogHustleError) Error() string {
+	message := "sessionstore: hustle catalog fold " + string(e.Kind)
+	if e.Cause != nil {
+		return message + ": " + e.Cause.Error()
+	}
+	return message
+}
+
+func (e *CatalogHustleError) Unwrap() error { return e.Cause }
+
+type CatalogHustleMetaValidationError struct {
+	Index int
+	Rule  CatalogMetaRule
+	Cause error
+}
+
+func (e *CatalogHustleMetaValidationError) Error() string {
+	message := "sessionstore: invalid catalog hustle " + strconv.Itoa(e.Index) + ": " + string(e.Rule)
+	if e.Cause != nil {
+		return message + ": " + e.Cause.Error()
+	}
+	return message
+}
+
+func (e *CatalogHustleMetaValidationError) Unwrap() error { return e.Cause }
+
 // CatalogOrderingError marks an online delivery whose sequence is behind the
 // catalog cursor and whose additive effect therefore cannot be classified as a
 // duplicate or a delayed unique record from bounded metadata alone. The online
@@ -524,6 +588,11 @@ func applyEvent(meta SessionMeta, ev event.Event, seq uint64, now CatalogClock) 
 		if meta.CurrentWorkspace.EventID.IsZero() || seq > meta.CurrentWorkspace.Seq {
 			meta.CurrentWorkspace = workspacePointer(e.Ref, e.EventID, seq, WorkspacePointerSourceRestore)
 		}
+	case event.HustleStarted, event.HustleCompleted, event.HustleFailed:
+		// Lifecycle pairing requires the privileged ordered journal. UpdateOnEvent
+		// routes these events through RepairCatalog; foldSession installs the
+		// resulting terminal-only aggregate after its complete scan.
+		changed = false
 	default:
 		changed = false
 	}
@@ -612,6 +681,188 @@ func insertLoopUsage(loops []LoopUsageMeta, index int, value LoopUsageMeta) []Lo
 	copy(loops[index+1:], loops[index:])
 	loops[index] = value
 	return loops
+}
+
+type catalogHustleStart struct {
+	descriptor hustle.DefinitionDescriptor
+	sessionID  uuid.UUID
+	cause      identity.Cause
+}
+
+type catalogHustleKey struct {
+	name          hustle.Name
+	modelSource   hustle.ModelSource
+	namedModelKey inference.ModelKey
+	status        hustle.TerminalStatus
+}
+
+// foldCatalogHustles pairs privileged lifecycle records by RunID and produces
+// only terminal aggregates. Unmatched starts are valid crash evidence and do
+// not enter SessionMeta; a terminal without its exact start fails closed.
+func foldCatalogHustles(events []event.Event) ([]HustleUsageAggregate, error) {
+	starts := make(map[hustle.RunID]catalogHustleStart)
+	seen := make(map[hustle.RunID]struct{})
+	aggregates := make(map[catalogHustleKey]HustleUsageAggregate)
+	for _, ev := range events {
+		switch typed := ev.(type) {
+		case event.HustleStarted:
+			if err := validateCatalogHustleStart(typed); err != nil {
+				return nil, err
+			}
+			if _, exists := seen[typed.Run.RunID]; exists {
+				return nil, &CatalogHustleError{Kind: CatalogHustleDuplicateStart, RunID: typed.Run.RunID}
+			}
+			seen[typed.Run.RunID] = struct{}{}
+			starts[typed.Run.RunID] = catalogHustleStart{descriptor: typed.Run.Definition, sessionID: typed.SessionID, cause: typed.Cause}
+		case event.HustleCompleted:
+			if err := foldCatalogHustleTerminal(starts, aggregates, typed.Run, typed.SessionID, typed.Cause, typed.Usage, hustle.TerminalStatusCompleted, validateCatalogHustleCompleted(typed)); err != nil {
+				return nil, err
+			}
+		case event.HustleFailed:
+			if err := foldCatalogHustleTerminal(starts, aggregates, typed.Run, typed.SessionID, typed.Cause, typed.Usage, hustle.TerminalStatusFailed, validateCatalogHustleFailed(typed)); err != nil {
+				return nil, err
+			}
+		}
+	}
+
+	var result []HustleUsageAggregate
+	if len(aggregates) > 0 {
+		result = make([]HustleUsageAggregate, 0, len(aggregates))
+	}
+	for _, aggregate := range aggregates {
+		result = append(result, aggregate)
+	}
+	sort.Slice(result, func(i, j int) bool { return compareHustleAggregate(result[i], result[j]) < 0 })
+	return result, nil
+}
+
+func validateCatalogHustleStart(start event.HustleStarted) error {
+	if start.Visibility() != event.Internal || start.SessionID.IsZero() || uuid.UUID(start.Run.RunID).IsZero() || start.Run.Runtime != (event.ModelRuntime{}) {
+		return &CatalogHustleError{Kind: CatalogHustleInvalidLifecycle, RunID: start.Run.RunID}
+	}
+	if err := start.Run.Definition.Validate(); err != nil {
+		return &CatalogHustleError{Kind: CatalogHustleInvalidLifecycle, RunID: start.Run.RunID, Cause: err}
+	}
+	return nil
+}
+
+func validateCatalogHustleCompleted(terminal event.HustleCompleted) error {
+	if terminal.Visibility() != event.Internal || terminal.Duration < 0 {
+		return &CatalogHustleError{Kind: CatalogHustleInvalidLifecycle, RunID: terminal.Run.RunID}
+	}
+	if err := validateCatalogRuntime(terminal.Run.Runtime); err != nil {
+		return &CatalogHustleError{Kind: CatalogHustleInvalidLifecycle, RunID: terminal.Run.RunID, Cause: err}
+	}
+	return validateCatalogHustleUsage(terminal.Run.RunID, terminal.Usage)
+}
+
+func validateCatalogHustleFailed(terminal event.HustleFailed) error {
+	if terminal.Visibility() != event.Internal || terminal.Duration < 0 || !terminal.Stage.Valid() || !terminal.ReasonCode.Valid() || !hustle.ReasonAllowed(terminal.Stage, terminal.ReasonCode) {
+		return &CatalogHustleError{Kind: CatalogHustleInvalidLifecycle, RunID: terminal.Run.RunID}
+	}
+	preResolution := terminal.Stage == hustle.StageQueue || terminal.Stage == hustle.StageModelResolution
+	if preResolution {
+		if terminal.Run.Runtime != (event.ModelRuntime{}) || terminal.Usage != nil {
+			return &CatalogHustleError{Kind: CatalogHustleInvalidLifecycle, RunID: terminal.Run.RunID}
+		}
+		return nil
+	}
+	if err := validateCatalogRuntime(terminal.Run.Runtime); err != nil {
+		return &CatalogHustleError{Kind: CatalogHustleInvalidLifecycle, RunID: terminal.Run.RunID, Cause: err}
+	}
+	return validateCatalogHustleUsage(terminal.Run.RunID, terminal.Usage)
+}
+
+func validateCatalogHustleUsage(runID hustle.RunID, usage *content.Usage) error {
+	if usage == nil {
+		return nil
+	}
+	if err := usage.Validate(); err != nil {
+		return &CatalogHustleError{Kind: CatalogHustleInvalidLifecycle, RunID: runID, Cause: err}
+	}
+	return nil
+}
+
+func foldCatalogHustleTerminal(
+	starts map[hustle.RunID]catalogHustleStart,
+	aggregates map[catalogHustleKey]HustleUsageAggregate,
+	run event.HustleRunDescriptor,
+	sessionID uuid.UUID,
+	cause identity.Cause,
+	usage *content.Usage,
+	status hustle.TerminalStatus,
+	validationErr error,
+) error {
+	if validationErr != nil {
+		return validationErr
+	}
+	start, exists := starts[run.RunID]
+	if !exists {
+		return &CatalogHustleError{Kind: CatalogHustleTerminalWithoutStart, RunID: run.RunID}
+	}
+	if start.descriptor != run.Definition || start.sessionID != sessionID || start.cause != cause {
+		return &CatalogHustleError{Kind: CatalogHustleAttributionMismatch, RunID: run.RunID}
+	}
+	if run.Definition.ModelSource == hustle.ModelSourceNamed && run.Runtime != (event.ModelRuntime{}) && run.Runtime.Key != run.Definition.NamedModelKey {
+		return &CatalogHustleError{Kind: CatalogHustleAttributionMismatch, RunID: run.RunID}
+	}
+	key := catalogHustleKey{name: run.Definition.Name, modelSource: run.Definition.ModelSource, status: status}
+	if run.Definition.ModelSource == hustle.ModelSourceNamed {
+		key.namedModelKey = run.Definition.NamedModelKey
+	}
+	aggregate := aggregates[key]
+	aggregate.Name = key.name
+	aggregate.ModelSource = key.modelSource
+	aggregate.NamedModelKey = key.namedModelKey
+	aggregate.Status = key.status
+	if aggregate.Runs == ^uint64(0) {
+		return &CatalogHustleError{Kind: CatalogHustleRunCountOverflow, RunID: run.RunID}
+	}
+	aggregate.Runs++
+	if usage != nil {
+		total, err := aggregate.CumulativeUsage.Add(*usage)
+		if err != nil {
+			return &CatalogHustleError{Kind: CatalogHustleUsageOverflow, RunID: run.RunID, Cause: err}
+		}
+		aggregate.CumulativeUsage = total
+	}
+	aggregates[key] = aggregate
+	delete(starts, run.RunID)
+	return nil
+}
+
+func compareHustleAggregate(left, right HustleUsageAggregate) int {
+	if left.Name < right.Name {
+		return -1
+	}
+	if left.Name > right.Name {
+		return 1
+	}
+	if left.ModelSource < right.ModelSource {
+		return -1
+	}
+	if left.ModelSource > right.ModelSource {
+		return 1
+	}
+	if left.NamedModelKey.Provider < right.NamedModelKey.Provider {
+		return -1
+	}
+	if left.NamedModelKey.Provider > right.NamedModelKey.Provider {
+		return 1
+	}
+	if left.NamedModelKey.Model < right.NamedModelKey.Model {
+		return -1
+	}
+	if left.NamedModelKey.Model > right.NamedModelKey.Model {
+		return 1
+	}
+	if left.Status < right.Status {
+		return -1
+	}
+	if left.Status > right.Status {
+		return 1
+	}
+	return 0
 }
 
 func checkpointSummary(e event.WorkspaceCheckpointed, seq uint64) CheckpointSummary {
@@ -809,7 +1060,35 @@ func validateSessionMeta(meta SessionMeta) error {
 			return &CatalogMetaValidationError{LoopIndex: i, Field: CatalogMetaFieldCumulativeUsage, Rule: CatalogMetaRuleInvalid, Cause: err}
 		}
 	}
+	for i, aggregate := range meta.Hustles {
+		if err := validateHustleUsageAggregate(aggregate); err != nil {
+			return &CatalogHustleMetaValidationError{Index: i, Rule: CatalogMetaRuleInvalid, Cause: err}
+		}
+		if i > 0 && compareHustleAggregate(meta.Hustles[i-1], aggregate) >= 0 {
+			return &CatalogHustleMetaValidationError{Index: i, Rule: CatalogMetaRuleSortedUnique}
+		}
+	}
 	return nil
+}
+
+func validateHustleUsageAggregate(aggregate HustleUsageAggregate) error {
+	if strings.TrimSpace(string(aggregate.Name)) == "" || strings.TrimSpace(string(aggregate.Name)) != string(aggregate.Name) {
+		return &CatalogHustleError{Kind: CatalogHustleInvalidLifecycle}
+	}
+	if aggregate.ModelSource != hustle.ModelSourceCurrentLoop && aggregate.ModelSource != hustle.ModelSourceNamed {
+		return &CatalogHustleError{Kind: CatalogHustleInvalidLifecycle}
+	}
+	if !aggregate.Status.Valid() || aggregate.Runs == 0 {
+		return &CatalogHustleError{Kind: CatalogHustleInvalidLifecycle}
+	}
+	if aggregate.ModelSource == hustle.ModelSourceNamed {
+		if err := aggregate.NamedModelKey.Validate(); err != nil {
+			return err
+		}
+	} else if aggregate.NamedModelKey != (inference.ModelKey{}) {
+		return &CatalogHustleError{Kind: CatalogHustleInvalidLifecycle}
+	}
+	return aggregate.CumulativeUsage.Validate()
 }
 
 func validateCatalogRuntime(runtime event.ModelRuntime) error {
@@ -903,6 +1182,15 @@ func (s *Store) OpenCatalog(opts ...CatalogOption) *Catalog {
 // entry's LastJournalSeq (monotonic max) and stamps the LastTurn/LastStep summaries, so a
 // status reader can resume from it.
 func (c *Catalog) UpdateOnEvent(ctx context.Context, ev event.Event, seq uint64) error {
+	if isHustleTerminal(ev) {
+		if _, err := c.RepairCatalog(ctx, ev.EventHeader().SessionID); err != nil {
+			c.log.CatalogUpdateFailed(err)
+		}
+		return nil
+	}
+	if _, started := ev.(event.HustleStarted); started {
+		return nil
+	}
 	// Decide relevance on a zero meta first so a no-op event never touches the KV.
 	if _, changed, err := applyEvent(SessionMeta{}, ev, seq, c.now); err != nil {
 		c.log.CatalogUpdateFailed(err)
@@ -922,6 +1210,24 @@ func (c *Catalog) UpdateOnEvent(ctx context.Context, ev event.Event, seq uint64)
 		c.log.CatalogUpdateFailed(err)
 	}
 	return nil
+}
+
+func isHustleTerminal(ev event.Event) bool {
+	switch ev.(type) {
+	case event.HustleCompleted, event.HustleFailed:
+		return true
+	default:
+		return false
+	}
+}
+
+func isHustleLifecycle(ev event.Event) bool {
+	switch ev.(type) {
+	case event.HustleStarted, event.HustleCompleted, event.HustleFailed:
+		return true
+	default:
+		return false
+	}
 }
 
 // upsert performs the bounded read-modify-write: read the current entry (or an empty one),
@@ -1131,6 +1437,7 @@ func (c *Catalog) foldSession(ctx context.Context, sessionID uuid.UUID, replayer
 	defer func() { _ = cursor.Close() }()
 
 	var meta SessionMeta
+	hustleEvents := make([]event.Event, 0)
 	sawStart := false
 	for {
 		ev, seq, nerr := cursor.Next(ctx)
@@ -1143,6 +1450,15 @@ func (c *Catalog) foldSession(ctx context.Context, sessionID uuid.UUID, replayer
 		if _, ok := ev.(event.SessionStarted); ok {
 			sawStart = true
 		}
+		if isHustleLifecycle(ev) {
+			hustleEvents = append(hustleEvents, ev)
+			if _, terminal := ev.(event.HustleCompleted); terminal && seq > meta.LastJournalSeq {
+				meta.LastJournalSeq = seq
+			}
+			if _, terminal := ev.(event.HustleFailed); terminal && seq > meta.LastJournalSeq {
+				meta.LastJournalSeq = seq
+			}
+		}
 		meta, _, err = applyEvent(meta, ev, seq, c.now)
 		if err != nil {
 			return SessionMeta{}, err
@@ -1150,6 +1466,10 @@ func (c *Catalog) foldSession(ctx context.Context, sessionID uuid.UUID, replayer
 	}
 	if !sawStart {
 		return SessionMeta{}, &EmptySessionError{SessionID: sessionID}
+	}
+	meta.Hustles, err = foldCatalogHustles(hustleEvents)
+	if err != nil {
+		return SessionMeta{}, err
 	}
 	return meta, nil
 }
