@@ -196,6 +196,8 @@ func TestCompactRejectReasonDurableDecodeRejectsOutOfDomain(t *testing.T) {
 		Header:           fullHeaderLoop(),
 		AttemptID:        CompactAttemptID(uuid.UUID{0x82}),
 		WaiterCommandIDs: []uuid.UUID{{0x83}},
+		Reason:           CompactionReasonAutomatic,
+		Basis:            validCompactionMeasurement(1).Basis,
 		RejectReason:     CompactRejectExecutionFailed,
 	}
 	wire, err := MarshalEvent(valid)
@@ -243,8 +245,8 @@ func TestCompactionEventsValidate(t *testing.T) {
 	committedID := uuid.UUID{0x93}
 	waiters := []uuid.UUID{commandID, uuid.UUID{0x94}}
 	started := CompactionStarted{Header: fullHeaderLoop(), AttemptID: attempt, Reason: CompactionReasonManual, Basis: validCompactionMeasurement(1).Basis}
-	committed := CompactionCommitted{Header: fullHeaderLoop(), AttemptID: attempt, WaiterCommandIDs: waiters, Basis: validCompactionMeasurement(1).Basis, Summary: compactionSummaryFixture(), PostContext: validCompactionMeasurement(2), Duration: 1500 * time.Millisecond}
-	rejected := CompactionRejected{Header: fullHeaderLoop(), AttemptID: attempt, WaiterCommandIDs: waiters, RejectReason: CompactRejectExecutionFailed, Duration: time.Second}
+	committed := CompactionCommitted{Header: fullHeaderLoop(), AttemptID: attempt, WaiterCommandIDs: waiters, Reason: CompactionReasonManual, Basis: validCompactionMeasurement(1).Basis, Summary: compactionSummaryFixture(), PostContext: validCompactionMeasurement(2), Duration: 1500 * time.Millisecond}
+	rejected := CompactionRejected{Header: fullHeaderLoop(), AttemptID: attempt, WaiterCommandIDs: waiters, Reason: CompactionReasonAutomatic, Basis: validCompactionMeasurement(1).Basis, RejectReason: CompactRejectExecutionFailed, Duration: time.Second}
 	resolvedHeader := compactionHeader(commandID)
 	resolvedHeader.EventID = CompactWaiterReplyID(attempt, commandID, true)
 	resolved := CompactWaiterResolved{Header: resolvedHeader, AttemptID: attempt, CommittedEventID: committedID}
@@ -262,6 +264,8 @@ func TestCompactionEventsValidate(t *testing.T) {
 		{name: "waiter resolved", event: resolved},
 		{name: "waiter rejected", event: waiterRejected},
 		{name: "started unspecified reason", event: func() Event { value := started; value.Reason = CompactionReasonUnspecified; return value }(), wantErr: true},
+		{name: "committed unspecified reason", event: func() Event { value := committed; value.Reason = CompactionReasonUnspecified; return value }(), wantErr: true},
+		{name: "committed unknown reason", event: func() Event { value := committed; value.Reason = CompactionReason(3); return value }(), wantErr: true},
 		{name: "committed negative duration", event: func() Event { value := committed; value.Duration = -1; return value }(), wantErr: true},
 		{name: "committed nil summary", event: func() Event { value := committed; value.Summary = nil; return value }(), wantErr: true},
 		{name: "committed duplicate waiter", event: func() Event {
@@ -269,6 +273,8 @@ func TestCompactionEventsValidate(t *testing.T) {
 			value.WaiterCommandIDs = []uuid.UUID{commandID, commandID}
 			return value
 		}(), wantErr: true},
+		{name: "rejected unspecified reason", event: func() Event { value := rejected; value.Reason = CompactionReasonUnspecified; return value }(), wantErr: true},
+		{name: "rejected invalid basis", event: func() Event { value := rejected; value.Basis = ContextBasis{}; return value }(), wantErr: true},
 		{name: "rejected unknown reason", event: func() Event { value := rejected; value.RejectReason = CompactRejectReason(14); return value }(), wantErr: true},
 		{name: "resolved nondeterministic event id", event: func() Event { value := resolved; value.EventID = uuid.UUID{0xff}; return value }(), wantErr: true},
 		{name: "rejected waiter missing command cause", event: func() Event { value := waiterRejected; value.Cause.CommandID = uuid.UUID{}; return value }(), wantErr: true},
@@ -296,8 +302,8 @@ func TestCompactionEnduringRoundTrip(t *testing.T) {
 		name  string
 		event Event
 	}{
-		{name: "committed exact duration and product", event: CompactionCommitted{Header: fullHeaderLoop(), AttemptID: attempt, WaiterCommandIDs: waiters, Basis: validCompactionMeasurement(1).Basis, Summary: compactionSummaryFixture(), PostContext: validCompactionMeasurement(2), Duration: 1500000001 * time.Nanosecond}},
-		{name: "rejected exact duration", event: CompactionRejected{Header: fullHeaderLoop(), AttemptID: attempt, WaiterCommandIDs: waiters, RejectReason: CompactRejectInternal, Duration: 2500000001 * time.Nanosecond}},
+		{name: "committed exact duration product reason and basis", event: CompactionCommitted{Header: fullHeaderLoop(), AttemptID: attempt, WaiterCommandIDs: waiters, Reason: CompactionReasonManual, Basis: validCompactionMeasurement(1).Basis, Summary: compactionSummaryFixture(), PostContext: validCompactionMeasurement(2), Duration: 1500000001 * time.Nanosecond}},
+		{name: "rejected exact duration reason and basis", event: CompactionRejected{Header: fullHeaderLoop(), AttemptID: attempt, WaiterCommandIDs: waiters, Reason: CompactionReasonAutomatic, Basis: validCompactionMeasurement(1).Basis, RejectReason: CompactRejectInternal, Duration: 2500000001 * time.Nanosecond}},
 		{name: "waiter resolved", event: CompactWaiterResolved{Header: resolvedHeader, AttemptID: attempt, CommittedEventID: uuid.UUID{0xa4}}},
 		{name: "waiter rejected", event: CompactWaiterRejected{Header: rejectedHeader, AttemptID: attempt, Reason: CompactRejectContextLimitUnknown}},
 	}

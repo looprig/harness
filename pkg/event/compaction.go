@@ -76,6 +76,7 @@ type CompactionCommitted struct {
 	Header
 	AttemptID        CompactAttemptID     `json:"attempt_id"`
 	WaiterCommandIDs []uuid.UUID          `json:"waiter_command_ids"`
+	Reason           CompactionReason     `json:"reason"`
 	Basis            ContextBasis         `json:"basis"`
 	Summary          *content.UserMessage `json:"summary"`
 	PostContext      ContextMeasurement   `json:"post_context"`
@@ -88,6 +89,8 @@ type CompactionRejected struct {
 	Header
 	AttemptID        CompactAttemptID    `json:"attempt_id"`
 	WaiterCommandIDs []uuid.UUID         `json:"waiter_command_ids"`
+	Reason           CompactionReason    `json:"reason"`
+	Basis            ContextBasis        `json:"basis"`
 	RejectReason     CompactRejectReason `json:"reject_reason"`
 	Duration         time.Duration       `json:"duration,omitzero"`
 }
@@ -161,6 +164,9 @@ func validateCompactionCommitted(value CompactionCommitted) error {
 	if err := validateCompactionWaiters(name, value.WaiterCommandIDs); err != nil {
 		return err
 	}
+	if !value.Reason.Valid() {
+		return invalidCompaction(name, FieldReason)
+	}
 	if err := validateCompactionBasis(name, value.Basis); err != nil {
 		return err
 	}
@@ -185,6 +191,12 @@ func validateCompactionRejected(value CompactionRejected) error {
 		return invalidCompaction(name, FieldAttemptID)
 	}
 	if err := validateCompactionWaiters(name, value.WaiterCommandIDs); err != nil {
+		return err
+	}
+	if !value.Reason.Valid() {
+		return invalidCompaction(name, FieldReason)
+	}
+	if err := validateCompactionBasis(name, value.Basis); err != nil {
 		return err
 	}
 	if !value.RejectReason.Valid() {
