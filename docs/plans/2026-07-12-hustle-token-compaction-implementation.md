@@ -645,9 +645,19 @@ with compaction, fingerprinted, emits only Normal/HardLimit pressure transitions
 and never schedules compaction. Pre-primary count failure never reuses an older
 measurement and ends the turn with typed `inference.ContextCountError`; unknown
 limit uses `ContextLimitUnknownError`; measured hard admission uses
-`ContextLimitError`. None fabricates a compaction attempt or rejection. Soft
-compaction failure below a known hard limit and compact-reject count/unknown
-mappings remain Task 26 behavior once a real attempt exists.
+`ContextLimitError`. Measurement/pressure publication precedes policy; an eligible
+automatic basis schedules/coalesces one real machine `Compact` and pauses primary
+inference before hard-limit failure, including at/above the limit. A narrow await
+disposition seam may land now; Task 26 owns execution/final replacement. No
+`ContextLimitError` is emitted while that attempt is pending/in progress. None
+fabricates a compaction attempt or rejection. Pin the public observation fields
+`ReservedOutput`, `SafetyMargin`, and `CountTimeout`; typed
+`ContextObservationPolicyError{Field}`; definition kinds
+`DefinitionInvalidContextObservation`, `DefinitionConflictingContextPolicy`, and
+`DefinitionMissingContextPolicy`; existing missing-counter and duplicate-option
+kinds remain canonical. Soft compaction failure below a known hard limit and
+compact-reject count/unknown mappings remain Task 26 behavior once a real attempt
+exists.
 
 Commit: `feat(loopruntime): measure and admit request context`.
 

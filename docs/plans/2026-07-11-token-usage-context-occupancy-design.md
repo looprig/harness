@@ -1232,6 +1232,17 @@ never authorizes a changed candidate request from an older measurement: count
 failure, timeout, or cancellation before primary inference ends the turn with a
 typed `inference.ContextCountError` and no fabricated compaction attempt.
 
+Measurement and pressure publication precede policy. On an automatic loop, an
+eligible current basis consumes its one real machine compaction attempt and pauses
+primary inference at the safe boundary even when the measurement is already at or
+above the hard limit. The runtime does not emit `ContextLimitError` while that
+attempt is pending or in progress. Hard admission fails only when the loop is
+observe-only/manual-only, that basis already exhausted its automatic attempt,
+attempt admission cannot produce a real attempt, or the real attempt later
+rejects/fails without replacement while the unchanged measurement remains at or
+above the limit. Task 26 owns the post-attempt replacement/rejection continuation;
+a successful replacement is recounted before inference.
+
 A failed automatic attempt is recorded against the current `ContextBasis`.
 There is at most one automatic attempt per unchanged basis. A later context
 mutation may retry; failure does not disarm automatic compaction forever.
@@ -1377,6 +1388,15 @@ both `WithContextCounter` and `WithInferenceCapability`, is mutually exclusive
 with `WithCompaction`, uses the same checked `ResolveContextLimits`, and enters
 the definition/rig policy fingerprint. Harness supplies no defaults.
 
+The public validation identities are fixed: `ContextObservationPolicyField` is
+the closed set `ReservedOutput`, `SafetyMargin`, and `CountTimeout`, and
+`ContextObservationPolicyError{Field}` reports policy validation. Definition
+validation wraps an invalid policy as `DefinitionInvalidContextObservation`,
+observation plus compaction as `DefinitionConflictingContextPolicy`, and a
+counter with neither policy as `DefinitionMissingContextPolicy`. Observation
+without a counter uses the existing `DefinitionMissingContextCounter`; a duplicate
+`WithContextObservation` uses the existing `DefinitionDuplicateOption`.
+
 The presence of `WithCompaction` installs manual compaction. Automatic behavior
 is explicit:
 
@@ -1486,8 +1506,11 @@ under the configured exact timeout. Count failure, timeout, or cancellation ends
 the turn as `TurnFailed` carrying or wrapping `inference.ContextCountError`;
 unknown or unresolvable limits end it with `ContextLimitUnknownError`; and a
 successful measurement with `InputTokens >= InputLimit` ends it with
-`ContextLimitError{Measurement}`. None calls primary inference. These pre-request
-failures have no compaction `AttemptID`, so they never fabricate
+`ContextLimitError{Measurement}` unless an eligible automatic policy first owns a
+real compaction attempt for that basis. Measurement/pressure publish before that
+attempt, and primary inference pauses while it is pending/in progress. None of the
+terminal admission failures calls primary inference. Pre-request count failures
+have no compaction `AttemptID`, so they never fabricate
 `CompactionRejected`. `CompactRejectContextCountFailed` and
 `CompactRejectContextLimitUnknown` apply only after a real compaction attempt
 exists, including post-summary counting in the compaction finalization work.
