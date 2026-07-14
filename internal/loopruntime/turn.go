@@ -104,8 +104,8 @@ type turnConfig struct {
 
 	// commit is the durability/event handshake back to the actor. runTurn prepares a
 	// complete step group, but the actor is the only goroutine that mutates
-	// loopState.msgs; it appends commit.Messages and emits commit.Event (the
-	// StepDone) at the SAME actor-owned point, then acks. commit MUST be
+	// loopState.msgs; it durably publishes commit.Event (the StepDone), applies
+	// commit.Messages to live history iff publication committed, then acks. commit MUST be
 	// ctx-cancellable so Interrupt/Shutdown frees a parked runTurn instead of
 	// wedging it.
 	commit func(context.Context, turnCommit) error
@@ -383,8 +383,8 @@ func addTurnUsage(total content.Usage, request *content.Usage) (content.Usage, e
 // returned messages into the staged turn. For each drained entry it appends the
 // message to ts.msgs (after the just-committed tool results) and commits a
 // TurnFoldedInto for it through the ctx-cancellable cfg.commit handshake (the actor
-// appends it to loopState.msgs, emits TurnFoldedInto, and clears it from the draining
-// buffer at the same point). A cancellation (drain or commit) returns an error so
+// publishes TurnFoldedInto, then appends it to loopState.msgs and clears it from the
+// draining buffer iff publication committed). A cancellation (drain or commit) returns an error so
 // runTurn stops; nothing is folded twice and the actor still owns returning the
 // not-yet-committed entries.
 func foldPending(ctx context.Context, cfg turnConfig, ts *turnState) error {

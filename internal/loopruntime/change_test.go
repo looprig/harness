@@ -510,18 +510,23 @@ func TestChangeInferenceValidation(t *testing.T) {
 	}
 }
 
-// faultingPublisher is a recording publisher that ALSO satisfies faultProbe, so the actor
-// probes it after emitting a change event. FaultErr returns a fixed fault, simulating a
-// required-durable-append failure (which the hub raises inline via ReportFault).
+// faultingPublisher rejects checked change publication without recording the event.
 type faultingPublisher struct {
 	*recordingPublisher
 	fault error
 }
 
-func (f *faultingPublisher) FaultErr() error { return f.fault }
+func (f *faultingPublisher) PublishEventChecked(ctx context.Context, value event.Event) error {
+	switch value.(type) {
+	case event.LoopModeChanged, event.LoopInferenceChanged:
+		return f.fault
+	default:
+		return f.recordingPublisher.PublishEventChecked(ctx, value)
+	}
+}
 
-// TestChangeNotAppliedOnDurableFault proves the fail-secure post-emit fault check: when the
-// change event's durable append faulted the session, the actor replies
+// TestChangeNotAppliedOnDurableFault proves the fail-secure checked append path: when the
+// change event's durable append fails, the actor replies
 // ChangeDurableAppendFailed and does NOT apply the change (the next turn keeps the old
 // effort).
 func TestChangeNotAppliedOnDurableFault(t *testing.T) {
@@ -538,6 +543,9 @@ func TestChangeNotAppliedOnDurableFault(t *testing.T) {
 	var ce *loop.ChangeError
 	if !errors.As(res.Err, &ce) || ce.Kind != loop.ChangeDurableAppendFailed {
 		t.Fatalf("err = %v, want ChangeDurableAppendFailed", res.Err)
+	}
+	if got := countInferenceChanged(fp.events()); got != 0 {
+		t.Fatalf("LoopInferenceChanged events after checked publication failure = %d, want 0", got)
 	}
 	// The change was NOT applied: the next turn runs under the ORIGINAL (unset) effort.
 	runOneTurn(t, l, fp.recordingPublisher, "turn1")

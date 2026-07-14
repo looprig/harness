@@ -153,11 +153,6 @@ type loopConfig struct {
 	// SetLoopMode is refused with ChangeInvalidMode (which is correct for a modeless loop).
 	// ChangeLoopInference never consults it (it validates the model/effort values only).
 	bound loop.BoundDefinition
-
-	// faultProbe is the actor's post-emit durable-fault read (nil when no session is wired,
-	// e.g. loop-only tests): after publishing a change event the actor probes it and, on a
-	// non-nil fault, declines to apply the change (fail-secure, no partial apply).
-	faultProbe faultProbe
 }
 
 // idGenerator mints a fresh UUID for the loop's correlation IDs — the per-turn
@@ -177,10 +172,17 @@ type eventPublisher interface {
 }
 
 // executionBoundary is the optional native checkpoint seam implemented by the owning
-// session. Only already-committed StepDone and turn-terminal events are routed through it;
-// loop-only publishers need not implement it and retain the ordinary publish path.
+// session. Turn terminals are routed through it; context-mutating StepDone and
+// TurnFoldedInto use the committed-result refinement below.
 type executionBoundary interface {
 	CommitBoundary(context.Context, event.Event) error
+}
+
+// contextExecutionBoundary reports whether a context-mutating boundary event was
+// durably committed even when a later checkpoint step failed. This lets the actor
+// keep live history exactly aligned with the durable restore source.
+type contextExecutionBoundary interface {
+	CommitContextBoundary(context.Context, event.Event) (bool, error)
 }
 
 type executionAdmission interface {
@@ -196,20 +198,6 @@ type TurnStartCapability interface {
 
 type turnStartAdmission interface {
 	EnterTurnStart(context.Context, uuid.UUID) (TurnStartCapability, error)
-}
-
-// faultProbe is the actor's narrow read of the session's durable-persistence fault latch.
-// After emitting a mode/inference change event the actor probes it: a non-nil result means
-// the change event's REQUIRED durable append failed (the hub faulted the session inline via
-// ReportFault, synchronously on this same actor goroutine), so the actor MUST NOT apply the
-// change (fail-secure — no live config more permissive than the durable log, and no partial
-// apply). It mirrors SetSecurityCeiling's emit-then-check-fault ordering. The loop depends
-// on this small interface (Dependency Inversion / Interface Segregation), type-asserted from
-// the event publisher exactly like gateRegistrar; a loop-only test wires a publisher that
-// does not satisfy it, so the probe is nil and the actor applies unconditionally (there is
-// no durable tap to fail).
-type faultProbe interface {
-	FaultErr() error
 }
 
 type admissionFaultProbe interface {
@@ -328,10 +316,6 @@ func newLoopWithSeed(loopCtx context.Context, sessionID, loopID uuid.UUID, paren
 	if !ok {
 		gates = nopGateRegistrar{}
 	}
-	// The durable-fault probe is the SAME session (via its exported FaultErr); a loop-only
-	// test publisher does not satisfy it, leaving fp nil (the actor then applies changes
-	// unconditionally — there is no durable tap to fail).
-	fp, _ := events.(faultProbe)
 	commands := make(chan command.Command)
 	priorityCommands := make(chan command.Command, compactionPriorityCommandCapacity)
 	contextRequests := make(chan contextMeasureRequest)
@@ -368,7 +352,6 @@ func newLoopWithSeed(loopCtx context.Context, sessionID, loopID uuid.UUID, paren
 		eventFactory:     cfg.eventFactory,
 		gates:            gates,
 		bound:            bound,
-		faultProbe:       fp,
 	}
 	state := newLoopState(sessionID, loopID, parent)
 	// Seed the current turn-affecting configuration from the resolved runtimeConfig. New
@@ -661,22 +644,36 @@ func runLoop(cfg loopConfig, state loopState) {
 	}
 	publishTurnStarted := func(ev event.TurnStarted, capability TurnStartCapability) error {
 		if capability == nil {
-			return cfg.events.PublishEvent(ctx, ev)
+			return cfg.events.PublishEventChecked(ctx, ev)
 		}
 		if err := capability.PublishTurnStarted(ctx, ev); err != nil {
 			return err
 		}
 		return nil
 	}
+	commitStampedBoundary := func(stamped event.Event) error {
+		if boundary, ok := cfg.events.(executionBoundary); ok {
+			return boundary.CommitBoundary(ctx, stamped)
+		}
+		return cfg.events.PublishEventChecked(ctx, stamped)
+	}
+	commitStampedContextBoundary := func(stamped event.Event) (bool, error) {
+		if boundary, ok := cfg.events.(contextExecutionBoundary); ok {
+			return boundary.CommitContextBoundary(ctx, stamped)
+		}
+		if boundary, ok := cfg.events.(executionBoundary); ok {
+			err := boundary.CommitBoundary(ctx, stamped)
+			return err == nil, err
+		}
+		err := cfg.events.PublishEventChecked(ctx, stamped)
+		return err == nil, err
+	}
 	commitBoundary := func(ev event.Event) (event.Event, error) {
 		stamped, err := stamp(ev)
 		if err != nil {
 			return nil, err
 		}
-		if boundary, ok := cfg.events.(executionBoundary); ok {
-			return stamped, boundary.CommitBoundary(ctx, stamped)
-		}
-		return stamped, cfg.events.PublishEvent(ctx, stamped)
+		return stamped, commitStampedBoundary(stamped)
 	}
 
 	// publishAcceptance is the narrow transactional publication path for managed
@@ -803,14 +800,14 @@ func runLoop(cfg loopConfig, state loopState) {
 		}
 	}
 
-	// installActiveTurn installs the active-turn fields on loopState and derives the
+	// installActiveTurn installs the active-turn fields on loopState after the opening
+	// event is durable, and derives the
 	// turn ctx from the loop ctx (submit commands carry no context, so a turn's
 	// lifetime is bounded by the loop's, not by any caller's API-call ctx). It then
-	// commits the initial UserMessage into loopState.msgs and emits
-	// event.TurnStarted at the SAME actor-owned point (Cause.LoopID carries
+	// commits the initial UserMessage into loopState.msgs. TurnStarted's Cause.LoopID carries
 	// qi.triggeredBy: set for a SubagentResult, zero for a UserInput). It returns the
 	// derived turn ctx and the defensive base clone the per-turn goroutine reads.
-	// This is the COMMIT-AND-ANNOUNCE half of starting a turn (distinct from
+	// This is the live-commit half of starting a turn (distinct from
 	// assembling the per-turn turnConfig).
 	installActiveTurn := func(turnID uuid.UUID, qi queuedInput) (context.Context, content.AgenticMessages) {
 		state.turnIndex++
@@ -972,7 +969,8 @@ func runLoop(cfg loopConfig, state loopState) {
 
 	// startTurn begins a turn FROM an accepted submit (qi). It is the single
 	// commit-then-start path shared by an idle submit and the on-idle inbox pop. It
-	// mints the TurnID, installs+commits+announces the turn (installActiveTurn),
+	// mints the TurnID, stamps and preflights the context mutation, durably publishes
+	// TurnStarted, then installs the corresponding live turn state,
 	// assembles the per-turn config (buildTurnConfig), then launches runTurn. It
 	// returns the new TurnID; when capability-backed opening-event preparation fails,
 	// it returns a non-nil error and starts nothing (the caller decides how to surface
@@ -1005,12 +1003,14 @@ func runLoop(cfg loopConfig, state loopState) {
 			return uuid.UUID{}, err
 		}
 		started = stamped.(event.TurnStarted)
+		mutation, err := preflightContextMutation(state.contextTracker, state.contextGeneration, started.EventID, contextMutationHistory)
+		if err != nil {
+			return uuid.UUID{}, err
+		}
 		if err := publishTurnStarted(started, capability); err != nil {
 			return uuid.UUID{}, err
 		}
-		if err := state.contextTracker.advance(started.EventID); err != nil {
-			return uuid.UUID{}, err
-		}
+		mutation.commit(&state.contextTracker, &state.contextGeneration)
 		turnCtx, base := installActiveTurn(turnID, qi)
 		idx := state.turnIndex
 		ts := newTurnState(state.sessionID, state.id, turnID, idx, state.causationID, qi.msg)
@@ -1511,21 +1511,14 @@ func runLoop(cfg loopConfig, state loopState) {
 		if err != nil {
 			return err
 		}
-		if err := cfg.events.PublishEvent(ctx, stamped); err != nil {
+		mutation, err := preflightContextMutation(state.contextTracker, state.contextGeneration, stamped.EventHeader().EventID, contextMutationRequestShape)
+		if err != nil {
 			return err
 		}
-		if fp := cfg.faultProbe; fp != nil {
-			if err := fp.FaultErr(); err != nil {
-				return err
-			}
-		}
-		if state.contextGeneration == ^uint64(0) {
-			return &contextGenerationOverflowError{}
-		}
-		if err := state.contextTracker.advance(stamped.EventHeader().EventID); err != nil {
+		if err := cfg.events.PublishEventChecked(ctx, stamped); err != nil {
 			return err
 		}
-		state.contextGeneration++
+		mutation.commit(&state.contextTracker, &state.contextGeneration)
 		state.context = event.ContextMeasurement{}
 		state.hasContext = false
 		return nil
@@ -2077,32 +2070,32 @@ func runLoop(cfg loopConfig, state loopState) {
 
 		case req := <-commits:
 			// Loop-owned incremental commit: the actor is the SOLE mutator of
-			// loopState.msgs. It appends the completed step group AND emits the
-			// Enduring StepDone (or TurnFoldedInto, for a fold) at the SAME point, so
-			// the event is never a lie (it always reflects already-committed history).
+			// loopState.msgs. It stamps and preflights the context mutation, durably
+			// commits StepDone (or TurnFoldedInto), then applies the matching live
+			// history/basis mutation. A later checkpoint error still reports whether
+			// the trigger committed, preserving live/restore equivalence.
 			// The turn goroutine is parked in cfg.commit while this runs, so the
 			// StepDone emitted here always follows that step's TokenDeltas on the
 			// fan-in. Ack last so the runner only resumes after the event is published.
-			state.msgs = append(state.msgs, req.commit.Messages...)
-			var boundaryErr error
-			var stampedBoundary event.Event
-			if _, ok := req.commit.Event.(event.StepDone); ok {
-				stampedBoundary, boundaryErr = commitBoundary(req.commit.Event)
-			} else {
-				stampedBoundary, boundaryErr = commitBoundary(req.commit.Event)
-			}
+			stampedBoundary, boundaryErr := stamp(req.commit.Event)
+			var mutation contextMutation
 			if boundaryErr == nil {
-				if err := state.contextTracker.advance(stampedBoundary.EventHeader().EventID); err != nil {
-					boundaryErr = err
-				} else {
-					state.context = event.ContextMeasurement{}
-					state.hasContext = false
-				}
+				mutation, boundaryErr = preflightContextMutation(state.contextTracker, state.contextGeneration, stampedBoundary.EventHeader().EventID, contextMutationHistory)
+			}
+			committed := false
+			if boundaryErr == nil {
+				committed, boundaryErr = commitStampedContextBoundary(stampedBoundary)
+			}
+			if committed {
+				state.msgs = append(state.msgs, req.commit.Messages...)
+				mutation.commit(&state.contextTracker, &state.contextGeneration)
+				state.context = event.ContextMeasurement{}
+				state.hasContext = false
 			}
 			// A folded user message is now committed: resolve its draining entry (its
 			// TurnFoldedInto was just emitted), so the abnormal-terminal return path
 			// does not also return it. StepDone commits carry no inbox entry.
-			if fi, ok := req.commit.Event.(event.TurnFoldedInto); ok {
+			if fi, ok := req.commit.Event.(event.TurnFoldedInto); ok && committed {
 				removeDraining(fi.Cause.CommandID)
 			}
 			req.ack <- boundaryErr

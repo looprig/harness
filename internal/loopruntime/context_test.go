@@ -414,3 +414,49 @@ func TestValidateCanonicalCompactionRejectionIdentity(t *testing.T) {
 		})
 	}
 }
+
+func TestPreflightContextMutationRejectsOverflowWithoutMutation(t *testing.T) {
+	t.Parallel()
+	maxRevision := ^event.ContextRevision(0)
+	maxGeneration := ^uint64(0)
+	tests := []struct {
+		name              string
+		basis             event.ContextBasis
+		generation        uint64
+		kind              contextMutationKind
+		wantRevisionError bool
+		wantGenerationErr bool
+	}{
+		{name: "TurnStarted revision overflow", basis: event.ContextBasis{Revision: maxRevision, ThroughEventID: uuid.UUID{1}}},
+		{name: "StepDone revision overflow", basis: event.ContextBasis{Revision: maxRevision, ThroughEventID: uuid.UUID{1}}},
+		{name: "TurnFoldedInto revision overflow", basis: event.ContextBasis{Revision: maxRevision, ThroughEventID: uuid.UUID{1}}},
+		{name: "LoopModeChanged revision overflow", basis: event.ContextBasis{Revision: maxRevision, ThroughEventID: uuid.UUID{1}}, kind: contextMutationRequestShape},
+		{name: "LoopInferenceChanged revision overflow", basis: event.ContextBasis{Revision: maxRevision, ThroughEventID: uuid.UUID{1}}, kind: contextMutationRequestShape},
+		{name: "LoopModeChanged generation overflow", basis: event.ContextBasis{Revision: 1, ThroughEventID: uuid.UUID{1}}, generation: maxGeneration, kind: contextMutationRequestShape, wantGenerationErr: true},
+		{name: "LoopInferenceChanged generation overflow", basis: event.ContextBasis{Revision: 1, ThroughEventID: uuid.UUID{1}}, generation: maxGeneration, kind: contextMutationRequestShape, wantGenerationErr: true},
+	}
+	for index := range tests {
+		tests[index].wantRevisionError = tests[index].basis.Revision == maxRevision
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tracker := contextTracker{basis: tt.basis}
+			before := tracker
+			_, err := preflightContextMutation(tracker, tt.generation, uuid.UUID{2}, tt.kind)
+			if err == nil {
+				t.Fatal("preflightContextMutation() error = nil, want overflow")
+			}
+			var revisionErr *contextRevisionOverflowError
+			var generationErr *contextGenerationOverflowError
+			if errors.As(err, &revisionErr) != tt.wantRevisionError {
+				t.Fatalf("revision error = %v, want %v: %T %v", errors.As(err, &revisionErr), tt.wantRevisionError, err, err)
+			}
+			if errors.As(err, &generationErr) != tt.wantGenerationErr {
+				t.Fatalf("generation error = %v, want %v: %T %v", errors.As(err, &generationErr), tt.wantGenerationErr, err, err)
+			}
+			if tracker != before {
+				t.Fatalf("tracker mutated on overflow: got %+v want %+v", tracker, before)
+			}
+		})
+	}
+}

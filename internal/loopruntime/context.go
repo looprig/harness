@@ -92,6 +92,41 @@ func (*contextGenerationOverflowError) Error() string {
 	return "loopruntime: request configuration generation overflow"
 }
 
+type contextMutationKind uint8
+
+const (
+	contextMutationHistory contextMutationKind = iota
+	contextMutationRequestShape
+)
+
+type contextMutation struct {
+	basis      event.ContextBasis
+	generation uint64
+	kind       contextMutationKind
+}
+
+func preflightContextMutation(tracker contextTracker, generation uint64, eventID uuid.UUID, kind contextMutationKind) (contextMutation, error) {
+	basis, err := tracker.nextBasis(eventID)
+	if err != nil {
+		return contextMutation{}, err
+	}
+	nextGeneration := generation
+	if kind == contextMutationRequestShape {
+		if generation == ^uint64(0) {
+			return contextMutation{}, &contextGenerationOverflowError{}
+		}
+		nextGeneration++
+	}
+	return contextMutation{basis: basis, generation: nextGeneration, kind: kind}, nil
+}
+
+func (m contextMutation) commit(tracker *contextTracker, generation *uint64) {
+	tracker.basis = m.basis
+	if m.kind == contextMutationRequestShape {
+		*generation = m.generation
+	}
+}
+
 type staleContextMeasurementError struct {
 	Measured event.ContextBasis
 	Current  event.ContextBasis
@@ -323,16 +358,16 @@ func (t *contextTracker) restore(
 	return nil
 }
 
-func (t *contextTracker) advance(eventID uuid.UUID) error {
+func (t contextTracker) nextBasis(eventID uuid.UUID) (event.ContextBasis, error) {
 	if eventID.IsZero() {
-		return &event.ContextValidationError{Field: event.ContextFieldThroughEventID}
+		return event.ContextBasis{}, &event.ContextValidationError{Field: event.ContextFieldThroughEventID}
 	}
 	if t.basis.Revision == ^event.ContextRevision(0) {
-		return &contextRevisionOverflowError{}
+		return event.ContextBasis{}, &contextRevisionOverflowError{}
 	}
 	t.basis.Revision++
 	t.basis.ThroughEventID = eventID
-	return nil
+	return t.basis, nil
 }
 
 func (t *contextTracker) currentBasis() event.ContextBasis { return t.basis }

@@ -715,6 +715,17 @@ func (s *Session) CommitBoundary(ctx context.Context, ev event.Event) error {
 	return s.checkpoints.boundary(ctx, ev)
 }
 
+// CommitContextBoundary is the context-mutating boundary seam. The committed
+// result distinguishes an event append failure from a later checkpoint failure,
+// so the loop actor can keep live history aligned with durable restore state.
+func (s *Session) CommitContextBoundary(ctx context.Context, ev event.Event) (bool, error) {
+	if s.checkpoints == nil {
+		err := s.PublishEventChecked(ctx, ev)
+		return err == nil, err
+	}
+	return s.checkpoints.boundaryResult(ctx, ev)
+}
+
 // CommitSessionIdle is the hub's narrow derived-idle collaborator. The hub retains
 // append/fanout ownership in commit; the controller brackets it with the workspace
 // permit and accepted checkpoint walk when idle is the configured trigger.

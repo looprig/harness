@@ -1232,10 +1232,13 @@ func TestCheckpointRequiredFaultLatchPreservesTriggerAndRejectsAutomaticWalk(t *
 	})
 	t.Cleanup(c.shutdown)
 	trigger := event.StepDone{Header: event.Header{Coordinates: identity.Coordinates{SessionID: sid, LoopID: lid, TurnID: tid, StepID: stepID}, EventID: eid}}
-	err := c.boundary(context.Background(), trigger)
+	committed, err := c.boundaryResult(context.Background(), trigger)
 	var faulted *CheckpointError
 	if !errors.As(err, &faulted) || faulted.Kind != CheckpointFaulted {
 		t.Fatalf("boundary = %T %v, want CheckpointFaulted", err, err)
+	}
+	if !committed {
+		t.Fatal("boundary committed = false, want true for durable trigger before checkpoint fault")
 	}
 	publisher.mu.Lock()
 	defer publisher.mu.Unlock()
@@ -1359,8 +1362,12 @@ func TestCheckpointSnapshotFailureLeavesDurableTriggerWithoutDanglingRef(t *test
 	c := newCheckpointController(checkpointControllerConfig{SessionID: sid, Policy: checkpointPolicy{Trigger: checkpointOnStepDone, Priority: checkpointRequired, Timeout: time.Second}, Store: ws, Root: root, Mode: PlacementSession, Coordinator: newWorkspaceCoordinator(nil), Publisher: publisher, Factory: event.NewFactory(uuid.New, time.Now)})
 	t.Cleanup(c.shutdown)
 	trigger := event.StepDone{Header: event.Header{Coordinates: identity.Coordinates{SessionID: sid, LoopID: lid, TurnID: tid, StepID: stepID}, EventID: eid}}
-	if err := c.boundary(context.Background(), trigger); err == nil {
+	committed, boundaryErr := c.boundaryResult(context.Background(), trigger)
+	if boundaryErr == nil {
 		t.Fatal("snapshot failure = nil")
+	}
+	if !committed {
+		t.Fatal("boundary committed = false, want true for durable trigger before snapshot failure")
 	}
 	publisher.mu.Lock()
 	defer publisher.mu.Unlock()
