@@ -1,0 +1,249 @@
+package loopruntime
+
+import (
+	"bytes"
+	"context"
+	"sort"
+	"time"
+
+	"github.com/looprig/core/uuid"
+	"github.com/looprig/harness/pkg/command"
+	"github.com/looprig/harness/pkg/event"
+	"github.com/looprig/harness/pkg/identity"
+)
+
+const compactionControlWaiterCapacity = 64
+
+// CompactionCoordinationErrorKind identifies infrastructure failures that prevent
+// the control actor from creating or durably resolving a compaction obligation.
+type CompactionCoordinationErrorKind string
+
+const (
+	CompactionCoordinationAttemptID CompactionCoordinationErrorKind = "attempt_id"
+	CompactionCoordinationOutcome   CompactionCoordinationErrorKind = "outcome"
+)
+
+// CompactionCoordinationError is the typed internal hand-off used by later
+// controller/finalizer tasks. Infrastructure failures are never converted into a
+// false CompactionRejected or CompactWaiterRejected event.
+type CompactionCoordinationError struct {
+	Kind  CompactionCoordinationErrorKind
+	Cause error
+}
+
+func (e *CompactionCoordinationError) Error() string {
+	var message string
+	switch e.Kind {
+	case CompactionCoordinationAttemptID:
+		message = "loopruntime: compaction attempt id generation failed"
+	case CompactionCoordinationOutcome:
+		message = "loopruntime: compaction outcome publication failed"
+	default:
+		message = "loopruntime: compaction coordination failed"
+	}
+	if e.Cause != nil {
+		return message + ": " + e.Cause.Error()
+	}
+	return message
+}
+
+func (e *CompactionCoordinationError) Unwrap() error { return e.Cause }
+
+type compactionAdmissionKind uint8
+
+const (
+	compactionAdmissionUnspecified compactionAdmissionKind = iota
+	compactionAdmissionOpened
+	compactionAdmissionJoined
+	compactionAdmissionDuplicate
+	compactionAdmissionLaneFull
+)
+
+type compactionAdmission struct {
+	Kind      compactionAdmissionKind
+	AttemptID event.CompactAttemptID
+}
+
+type compactionBoundaryKind uint8
+
+const (
+	compactionBoundaryUnspecified compactionBoundaryKind = iota
+	compactionBoundaryStep
+	compactionBoundaryTurn
+)
+
+type compactionDispositionKind uint8
+
+const (
+	compactionDispositionNone compactionDispositionKind = iota
+	compactionDispositionStart
+	compactionDispositionReject
+)
+
+type compactionDisposition struct {
+	Kind         compactionDispositionKind
+	Attempt      *compactionAttempt
+	RejectReason event.CompactRejectReason
+}
+
+// compactionDispositionSink accepts ownership of a start/reject decision made at
+// a safe actor boundary. Implementations must return promptly; the concrete
+// hustle adapter and actor-owned finalizer are wired by later tasks.
+type compactionDispositionSink interface {
+	CoordinateCompaction(context.Context, compactionDisposition) error
+}
+
+// compactionFailure is the narrow typed result seam that later public waiters can
+// bind to. It never claims a durable rejection was written.
+type compactionFailure struct {
+	CommandID uuid.UUID
+	Err       error
+}
+
+type compactionFailureSink interface {
+	ReportCompactionFailure(context.Context, compactionFailure)
+}
+
+type compactionPhase uint8
+
+const (
+	compactionPhasePending compactionPhase = iota
+	compactionPhaseInProgress
+)
+
+type compactionWaiter struct {
+	commandID uuid.UUID
+	createdAt time.Time
+}
+
+// compactionAttempt is the actor-owned shared obligation. WaiterCommandIDs is
+// always a defensive, canonical projection: CreatedAt ascending, then UUID bytes.
+type compactionAttempt struct {
+	AttemptID        event.CompactAttemptID
+	WaiterCommandIDs []uuid.UUID
+	Reason           event.CompactionReason
+}
+
+type pendingCompaction struct {
+	attemptID event.CompactAttemptID
+	waiters   []compactionWaiter
+	reason    event.CompactionReason
+	phase     compactionPhase
+}
+
+// compactionControl owns one coalescing slot and a bounded waiter slice. It is
+// mutated only by the loop actor, so it needs no locks and cannot grow without
+// bound. User-input queue state is intentionally absent from this type.
+type compactionControl struct {
+	waiterCapacity int
+	pending        *pendingCompaction
+	interrupting   bool
+	shuttingDown   bool
+}
+
+func newCompactionControl(waiterCapacity int) *compactionControl {
+	if waiterCapacity <= 0 {
+		waiterCapacity = compactionControlWaiterCapacity
+	}
+	return &compactionControl{waiterCapacity: waiterCapacity}
+}
+
+func (c *compactionControl) admit(request command.Compact, idGen idGenerator) (compactionAdmission, error) {
+	if err := command.ValidateCommand(request); err != nil {
+		return compactionAdmission{}, err
+	}
+	if c.pending != nil {
+		return c.join(request), nil
+	}
+	id, err := idGen()
+	if err != nil || id.IsZero() {
+		return compactionAdmission{}, &CompactionCoordinationError{Kind: CompactionCoordinationAttemptID, Cause: err}
+	}
+	attemptID := event.CompactAttemptID(id)
+	c.pending = &pendingCompaction{
+		attemptID: attemptID,
+		waiters:   []compactionWaiter{waiterFromCompact(request)},
+		reason:    compactionReason(request.Agency),
+		phase:     compactionPhasePending,
+	}
+	return compactionAdmission{Kind: compactionAdmissionOpened, AttemptID: attemptID}, nil
+}
+
+func (c *compactionControl) join(request command.Compact) compactionAdmission {
+	commandID := request.CommandHeader().CommandID
+	for _, waiter := range c.pending.waiters {
+		if waiter.commandID == commandID {
+			return compactionAdmission{Kind: compactionAdmissionDuplicate, AttemptID: c.pending.attemptID}
+		}
+	}
+	if len(c.pending.waiters) >= c.waiterCapacity {
+		return compactionAdmission{Kind: compactionAdmissionLaneFull, AttemptID: c.pending.attemptID}
+	}
+	c.pending.waiters = append(c.pending.waiters, waiterFromCompact(request))
+	sort.Slice(c.pending.waiters, func(i, j int) bool {
+		left, right := c.pending.waiters[i], c.pending.waiters[j]
+		if !left.createdAt.Equal(right.createdAt) {
+			return left.createdAt.Before(right.createdAt)
+		}
+		return bytes.Compare(left.commandID[:], right.commandID[:]) < 0
+	})
+	return compactionAdmission{Kind: compactionAdmissionJoined, AttemptID: c.pending.attemptID}
+}
+
+func (c *compactionControl) interrupt() {
+	if c.pending != nil && c.pending.phase == compactionPhasePending {
+		c.interrupting = true
+	}
+}
+
+func (c *compactionControl) shutdown() { c.shuttingDown = true }
+
+// atBoundary is the only transition that consumes a pending request. Shutdown
+// and interrupt dispositions are checked first, so a control signal observed by
+// the actor always outranks starting compaction at the next safe boundary.
+func (c *compactionControl) atBoundary(boundary compactionBoundaryKind) compactionDisposition {
+	if c.pending == nil || (boundary != compactionBoundaryStep && boundary != compactionBoundaryTurn) {
+		return compactionDisposition{}
+	}
+	if c.pending.phase == compactionPhaseInProgress {
+		return compactionDisposition{}
+	}
+	if c.shuttingDown {
+		return c.reject(event.CompactRejectShuttingDown)
+	}
+	if c.interrupting {
+		return c.reject(event.CompactRejectInterrupted)
+	}
+	c.pending.phase = compactionPhaseInProgress
+	return compactionDisposition{Kind: compactionDispositionStart, Attempt: c.pendingAttempt()}
+}
+
+func (c *compactionControl) reject(reason event.CompactRejectReason) compactionDisposition {
+	attempt := c.pendingAttempt()
+	c.pending = nil
+	c.interrupting = false
+	return compactionDisposition{Kind: compactionDispositionReject, Attempt: attempt, RejectReason: reason}
+}
+
+func (c *compactionControl) pendingAttempt() *compactionAttempt {
+	if c.pending == nil {
+		return nil
+	}
+	waiters := make([]uuid.UUID, len(c.pending.waiters))
+	for i, waiter := range c.pending.waiters {
+		waiters[i] = waiter.commandID
+	}
+	return &compactionAttempt{AttemptID: c.pending.attemptID, WaiterCommandIDs: waiters, Reason: c.pending.reason}
+}
+
+func waiterFromCompact(request command.Compact) compactionWaiter {
+	header := request.CommandHeader()
+	return compactionWaiter{commandID: header.CommandID, createdAt: header.CreatedAt}
+}
+
+func compactionReason(agency identity.Agency) event.CompactionReason {
+	if agency == identity.AgencyUser {
+		return event.CompactionReasonManual
+	}
+	return event.CompactionReasonAutomatic
+}

@@ -118,6 +118,13 @@ type runtimeConfig struct {
 	InferenceCapability inference.InferenceCapability
 	Compaction          *loop.CompactionPolicy
 
+	// compactionSink is the internal ownership-transfer seam between the loop actor's
+	// bounded control coordinator and the typed compaction executor/finalizer wired by
+	// later implementation tasks. Nil leaves a request pending; it never consumes or
+	// drops the obligation. The field is unexported so consumers cannot inject an
+	// arbitrary runner through the public loop definition.
+	compactionSink compactionDispositionSink
+
 	// idGen mints the loop's correlation IDs: the per-turn TurnID, each StepID,
 	// and each tool-call ToolExecutionID. It is unexported, so the composition root cannot
 	// set it: New defaults it to uuid.New. It exists only as a test seam for

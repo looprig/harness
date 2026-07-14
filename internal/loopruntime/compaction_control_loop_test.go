@@ -1,0 +1,310 @@
+package loopruntime
+
+import (
+	"context"
+	"errors"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/looprig/core/content"
+	"github.com/looprig/core/uuid"
+	"github.com/looprig/harness/internal/runtimecontract"
+	"github.com/looprig/harness/pkg/command"
+	"github.com/looprig/harness/pkg/event"
+	"github.com/looprig/harness/pkg/identity"
+	"github.com/looprig/harness/pkg/tool"
+	"github.com/looprig/inference"
+)
+
+type recordingCompactionSink struct {
+	mu           sync.Mutex
+	dispositions []compactionDisposition
+	failures     []compactionFailure
+	notify       chan struct{}
+}
+
+func newRecordingCompactionSink() *recordingCompactionSink {
+	return &recordingCompactionSink{notify: make(chan struct{}, compactionControlWaiterCapacity+8)}
+}
+
+func (s *recordingCompactionSink) CoordinateCompaction(_ context.Context, disposition compactionDisposition) error {
+	s.mu.Lock()
+	s.dispositions = append(s.dispositions, disposition)
+	s.mu.Unlock()
+	s.notify <- struct{}{}
+	return nil
+}
+
+func (s *recordingCompactionSink) ReportCompactionFailure(_ context.Context, failure compactionFailure) {
+	s.mu.Lock()
+	s.failures = append(s.failures, failure)
+	s.mu.Unlock()
+	s.notify <- struct{}{}
+}
+
+func (s *recordingCompactionSink) snapshot() ([]compactionDisposition, []compactionFailure) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]compactionDisposition(nil), s.dispositions...), append([]compactionFailure(nil), s.failures...)
+}
+
+func TestLoopCompactionControlBoundaries(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+		run  func(*testing.T)
+	}{
+		{
+			name: "idle turn boundary starts once",
+			run: func(t *testing.T) {
+				l, _, sink, sessionID, loopID := newCompactionTestLoop(t, &fakeLLM{})
+				sendCompact(t, l, sessionID, loopID, uuid.UUID{1}, identity.AgencyMachine)
+				got := awaitCompactionDisposition(t, sink)
+				if got.Kind != compactionDispositionStart || got.Attempt == nil || got.Attempt.Reason != event.CompactionReasonAutomatic {
+					t.Fatalf("disposition = %+v, want automatic start", got)
+				}
+				sendCompact(t, l, sessionID, loopID, uuid.UUID{2}, identity.AgencyUser)
+				syncLoopActor(t, l)
+				dispositions, _ := sink.snapshot()
+				if len(dispositions) != 1 {
+					t.Fatalf("dispositions = %d, want one shared start", len(dispositions))
+				}
+			},
+		},
+		{
+			name: "tool continuation consumes at safe step boundary",
+			run: func(t *testing.T) {
+				blocking := newBlockingTool()
+				tools := agenticToolSet([]tool.InvokableTool{blocking}, 25, 100)
+				client := &scriptedLLM{scripts: [][]content.Chunk{
+					{toolUseChunk(0, "id-1", "Block", `{}`)},
+					{textChunk("done")},
+				}}
+				l, rec, sink, sessionID, loopID := newCompactionTestLoopWithTools(t, client, tools)
+				startTurn(t, l, rec, textBlocks("run"))
+				<-blocking.started
+				sendCompact(t, l, sessionID, loopID, uuid.UUID{1}, identity.AgencyUser)
+				syncLoopActor(t, l)
+				if dispositions, _ := sink.snapshot(); len(dispositions) != 0 {
+					t.Fatalf("pre-boundary dispositions = %v, want none", dispositions)
+				}
+				close(blocking.release)
+				got := awaitCompactionDisposition(t, sink)
+				if got.Kind != compactionDispositionStart || got.Attempt == nil {
+					t.Fatalf("disposition = %+v, want step-boundary start", got)
+				}
+			},
+		},
+		{
+			name: "interrupt outranks pending running request",
+			run: func(t *testing.T) {
+				l, rec, sink, sessionID, loopID := newCompactionTestLoop(t, &fakeLLM{blockUntilCancel: true})
+				startTurn(t, l, rec, textBlocks("run"))
+				// Fill the ordinary input queue to its independent capacity. Compact still
+				// enters the control slot; the later interrupted disposition proves it was
+				// not refused by UserInput fullness.
+				for i := 0; i < runtimecontract.ManagedInputQueueCapacity; i++ {
+					l.Commands <- command.UserInput{Header: command.Header{CommandID: uuid.UUID{byte(i + 10)}}}
+				}
+				sendCompact(t, l, sessionID, loopID, uuid.UUID{1}, identity.AgencyUser)
+				syncLoopActor(t, l)
+				if dispositions, _ := sink.snapshot(); len(dispositions) != 0 {
+					t.Fatalf("pre-boundary dispositions = %v, want none", dispositions)
+				}
+				ack := make(chan bool, 1)
+				l.Commands <- command.Interrupt{Header: command.Header{CommandID: uuid.UUID{3}}, Ack: ack}
+				if !<-ack {
+					t.Fatal("Interrupt did not cancel active turn")
+				}
+				got := awaitCompactionDisposition(t, sink)
+				if got.Kind != compactionDispositionReject || got.RejectReason != event.CompactRejectInterrupted {
+					t.Fatalf("disposition = %+v, want interrupted rejection", got)
+				}
+			},
+		},
+		{
+			name: "shutdown outranks pending running request",
+			run: func(t *testing.T) {
+				l, rec, sink, sessionID, loopID := newCompactionTestLoop(t, &fakeLLM{blockUntilCancel: true})
+				startTurn(t, l, rec, textBlocks("run"))
+				sendCompact(t, l, sessionID, loopID, uuid.UUID{1}, identity.AgencyUser)
+				syncLoopActor(t, l)
+				ack := make(chan error, 1)
+				l.Commands <- command.Shutdown{Header: command.Header{CommandID: uuid.UUID{3}}, Ack: ack}
+				got := awaitCompactionDisposition(t, sink)
+				if got.Kind != compactionDispositionReject || got.RejectReason != event.CompactRejectShuttingDown {
+					t.Fatalf("disposition = %+v, want shutdown rejection", got)
+				}
+				if err := <-ack; err != nil {
+					t.Fatalf("Shutdown error = %v", err)
+				}
+			},
+		},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			tt.run(t)
+		})
+	}
+}
+
+func TestLoopCompactionLaneFullOutcome(t *testing.T) {
+	t.Parallel()
+	errChecked := errors.New("checked publication failed")
+	tests := []struct {
+		name       string
+		checkedErr error
+		wantEvent  bool
+		wantFatal  bool
+	}{
+		{name: "writable journal emits immediate durable waiter rejection", wantEvent: true},
+		{name: "checked publication failure propagates without false event", checkedErr: errChecked, wantFatal: true},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			l, rec, sink, sessionID, loopID := newCompactionTestLoop(t, &fakeLLM{})
+			rec.setCheckedError(tt.checkedErr)
+			for i := 0; i < compactionControlWaiterCapacity; i++ {
+				sendCompact(t, l, sessionID, loopID, uuid.UUID{byte(i + 1)}, identity.AgencyMachine)
+			}
+			disposition := awaitCompactionDisposition(t, sink)
+			overflowID := uuid.UUID{0xff}
+			sendCompact(t, l, sessionID, loopID, overflowID, identity.AgencyUser)
+			syncLoopActor(t, l)
+
+			var got *event.CompactWaiterRejected
+			for _, published := range rec.events() {
+				if value, ok := published.(event.CompactWaiterRejected); ok && value.Cause.CommandID == overflowID {
+					copyOfValue := value
+					got = &copyOfValue
+				}
+			}
+			if (got != nil) != tt.wantEvent {
+				t.Fatalf("lane-full event = %+v, wantEvent %v", got, tt.wantEvent)
+			}
+			if got != nil {
+				if got.AttemptID != disposition.Attempt.AttemptID || got.Reason != event.CompactRejectControlLaneFull {
+					t.Errorf("lane-full event = %+v, want attempt %v reason ControlLaneFull", got, disposition.Attempt.AttemptID)
+				}
+				if got.EventID != event.CompactWaiterReplyID(got.AttemptID, overflowID, false) || got.CreatedAt.IsZero() {
+					t.Errorf("lane-full event identity = %v/%v, want deterministic id and stamped time", got.EventID, got.CreatedAt)
+				}
+			}
+			_, failures := sink.snapshot()
+			if (len(failures) == 1) != tt.wantFatal {
+				t.Fatalf("failures = %+v, wantFatal %v", failures, tt.wantFatal)
+			}
+			if tt.wantFatal {
+				var coordinationErr *CompactionCoordinationError
+				if failures[0].CommandID != overflowID || !errors.As(failures[0].Err, &coordinationErr) || coordinationErr.Kind != CompactionCoordinationOutcome || !errors.Is(failures[0].Err, errChecked) {
+					t.Fatalf("failure = %+v, want typed outcome failure for overflow command", failures[0])
+				}
+			}
+		})
+	}
+}
+
+func TestLoopCompactionAttemptIDFailure(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+		err  error
+	}{
+		{name: "fatal mint failure has no false durable outcome", err: errCompactionAttemptID},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			ctx, cancel := context.WithCancel(context.Background())
+			t.Cleanup(cancel)
+			sessionID, loopID := mustID(t), mustID(t)
+			rec := &recordingPublisher{}
+			sink := newRecordingCompactionSink()
+			l, err := newWithConfig(ctx, sessionID, loopID, Provenance{}, rec, runtimeConfig{
+				Client:         &fakeLLM{},
+				Model:          testModel(),
+				idGen:          func() (uuid.UUID, error) { return uuid.UUID{}, tt.err },
+				eventFactory:   workingFactory(),
+				compactionSink: sink,
+			})
+			if err != nil {
+				t.Fatalf("newWithConfig: %v", err)
+			}
+			sendCompact(t, l, sessionID, loopID, uuid.UUID{1}, identity.AgencyUser)
+			syncLoopActor(t, l)
+			dispositions, failures := sink.snapshot()
+			if len(dispositions) != 0 || len(failures) != 1 {
+				t.Fatalf("dispositions/failures = %v/%v, want 0/1", dispositions, failures)
+			}
+			var coordinationErr *CompactionCoordinationError
+			if !errors.As(failures[0].Err, &coordinationErr) || coordinationErr.Kind != CompactionCoordinationAttemptID || !errors.Is(failures[0].Err, tt.err) {
+				t.Fatalf("failure = %+v, want typed attempt id failure", failures[0])
+			}
+			for _, published := range rec.events() {
+				switch published.(type) {
+				case event.CompactionRejected, event.CompactWaiterRejected:
+					t.Fatalf("published false durable outcome %T", published)
+				}
+			}
+		})
+	}
+}
+
+func newCompactionTestLoop(t *testing.T, client inference.Client) (*Loop, *recordingPublisher, *recordingCompactionSink, uuid.UUID, uuid.UUID) {
+	t.Helper()
+	return newCompactionTestLoopWithTools(t, client, ToolSet{})
+}
+
+func newCompactionTestLoopWithTools(t *testing.T, client inference.Client, tools ToolSet) (*Loop, *recordingPublisher, *recordingCompactionSink, uuid.UUID, uuid.UUID) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	sessionID, loopID := mustID(t), mustID(t)
+	rec := &recordingPublisher{}
+	sink := newRecordingCompactionSink()
+	l, err := newWithConfig(ctx, sessionID, loopID, Provenance{}, rec, runtimeConfig{
+		Client: client, Model: testModel(), Tools: tools, DrainTimeout: 200 * time.Millisecond, compactionSink: sink,
+	})
+	if err != nil {
+		t.Fatalf("newWithConfig: %v", err)
+	}
+	return l, rec, sink, sessionID, loopID
+}
+
+func sendCompact(t *testing.T, l *Loop, sessionID, loopID, commandID uuid.UUID, agency identity.Agency) {
+	t.Helper()
+	l.Commands <- command.Compact{
+		Header:      command.Header{CommandID: commandID, CreatedAt: time.Now(), Agency: agency},
+		Coordinates: identity.Coordinates{SessionID: sessionID, LoopID: loopID},
+	}
+}
+
+func syncLoopActor(t *testing.T, l *Loop) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if _, _, err := l.Snapshot(ctx); err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+}
+
+func awaitCompactionDisposition(t *testing.T, sink *recordingCompactionSink) compactionDisposition {
+	t.Helper()
+	select {
+	case <-sink.notify:
+		dispositions, _ := sink.snapshot()
+		if len(dispositions) == 0 {
+			t.Fatal("notification carried no compaction disposition")
+		}
+		return dispositions[len(dispositions)-1]
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for compaction disposition")
+		return compactionDisposition{}
+	}
+}

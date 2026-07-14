@@ -569,6 +569,7 @@ func runLoop(cfg loopConfig, state loopState) {
 	drains := cfg.drains
 	admissions := cfg.admissions
 	requestCancelActive := false
+	compactions := newCompactionControl(compactionControlWaiterCapacity)
 
 	// publish sends a FULL-FIDELITY loop event to the session-level event fan-in.
 	// Producer identity is stamped here from loopState/the active turn (the actor IS
@@ -641,6 +642,55 @@ func runLoop(cfg loopConfig, state loopState) {
 			return err
 		}
 		return cfg.events.PublishEventChecked(ctx, withLoopHeader(ev, h))
+	}
+
+	reportCompactionFailure := func(commandID uuid.UUID, err error) {
+		failure := compactionFailure{CommandID: commandID, Err: err}
+		if sink, ok := config.compactionSink.(compactionFailureSink); ok {
+			sink.ReportCompactionFailure(ctx, failure)
+			return
+		}
+		slog.Error("compaction coordination failed", "command_id", commandID, "error", err)
+	}
+
+	publishLaneFull := func(request command.Compact, attemptID event.CompactAttemptID) error {
+		commandID := request.CommandHeader().CommandID
+		rejected := event.CompactWaiterRejected{
+			Header: event.Header{
+				EventID: event.CompactWaiterReplyID(attemptID, commandID, false),
+				Cause:   identity.Cause{CommandID: commandID, Agency: request.CommandHeader().Agency},
+			},
+			AttemptID: attemptID,
+			Reason:    event.CompactRejectControlLaneFull,
+		}
+		stamped, err := stamp(rejected)
+		if err != nil {
+			return &CompactionCoordinationError{Kind: CompactionCoordinationOutcome, Cause: err}
+		}
+		if err := event.ValidateEvent(stamped); err != nil {
+			return &CompactionCoordinationError{Kind: CompactionCoordinationOutcome, Cause: err}
+		}
+		if err := cfg.events.PublishEventChecked(ctx, stamped); err != nil {
+			return &CompactionCoordinationError{Kind: CompactionCoordinationOutcome, Cause: err}
+		}
+		return nil
+	}
+
+	dispatchCompactionBoundary := func(boundary compactionBoundaryKind) {
+		if config.compactionSink == nil {
+			return
+		}
+		disposition := compactions.atBoundary(boundary)
+		if disposition.Kind == compactionDispositionNone {
+			return
+		}
+		if err := config.compactionSink.CoordinateCompaction(ctx, disposition); err != nil {
+			commandID := uuid.UUID{}
+			if disposition.Attempt != nil && len(disposition.Attempt.WaiterCommandIDs) > 0 {
+				commandID = disposition.Attempt.WaiterCommandIDs[0]
+			}
+			reportCompactionFailure(commandID, &CompactionCoordinationError{Kind: CompactionCoordinationOutcome, Cause: err})
+		}
 	}
 
 	// emitLoopIdle announces the loop's running->idle transition: an Enduring,
@@ -1496,11 +1546,31 @@ func runLoop(cfg loopConfig, state loopState) {
 				}
 				applyChangeInference(c)
 
+			case command.Compact:
+				admission, err := compactions.admit(c, config.idGen)
+				if err != nil {
+					reportCompactionFailure(c.CommandHeader().CommandID, err)
+					continue
+				}
+				if admission.Kind == compactionAdmissionLaneFull {
+					if err := publishLaneFull(c, admission.AttemptID); err != nil {
+						reportCompactionFailure(c.CommandHeader().CommandID, err)
+					}
+					continue
+				}
+				// Idle is itself a safe turn boundary. A configured sink takes ownership
+				// immediately; while a turn is live, the request remains actor-owned until
+				// the next step/turn boundary below.
+				if state.status == loopIdle {
+					dispatchCompactionBoundary(compactionBoundaryTurn)
+				}
+
 			case command.Interrupt:
 				if err := c.Validate(); err != nil {
 					slog.Warn("invalid Interrupt command", "error", err)
 					continue
 				}
+				compactions.interrupt()
 				if state.cancelTurn != nil {
 					state.cancelTurn()
 					state.cancelTurn = nil
@@ -1523,6 +1593,9 @@ func runLoop(cfg loopConfig, state loopState) {
 				} else {
 					c.Ack <- false
 				}
+				if state.status == loopIdle {
+					dispatchCompactionBoundary(compactionBoundaryTurn)
+				}
 
 			case command.Shutdown:
 				if err := c.Validate(); err != nil {
@@ -1530,6 +1603,7 @@ func runLoop(cfg loopConfig, state loopState) {
 				} else {
 					state.shutdownAcks = append(state.shutdownAcks, c.Ack)
 				}
+				compactions.shutdown()
 				if state.status == loopShuttingDown {
 					continue
 				}
@@ -1544,6 +1618,7 @@ func runLoop(cfg loopConfig, state loopState) {
 					state.cancelAdmission()
 					state.cancelAdmission = nil
 					returnQueuedInbox(event.CancelTurnInterrupted, uuid.UUID{})
+					dispatchCompactionBoundary(compactionBoundaryTurn)
 					ackShutdowns(nil)
 					return
 				}
@@ -1552,6 +1627,7 @@ func runLoop(cfg loopConfig, state loopState) {
 					// (it will never start) before stopping; in practice the inbox is
 					// empty when idle, but this guarantees nothing is silently dropped.
 					returnQueuedInbox(event.CancelTurnInterrupted, uuid.UUID{})
+					dispatchCompactionBoundary(compactionBoundaryTurn)
 					ackShutdowns(nil)
 					return
 				}
@@ -1660,6 +1736,7 @@ func runLoop(cfg loopConfig, state loopState) {
 			// drained entries are now in draining and are resolved either by their
 			// TurnFoldedInto commit (below) or by returnQueuedInbox on an abnormal
 			// terminal — never silently lost.
+			dispatchCompactionBoundary(compactionBoundaryStep)
 			req.reply <- drainInbox()
 
 		case req := <-commits:
@@ -1688,6 +1765,7 @@ func runLoop(cfg loopConfig, state loopState) {
 			req.ack <- boundaryErr
 
 		case result := <-internal:
+			dispatchCompactionBoundary(compactionBoundaryTurn)
 			if handleTurnResult(result) {
 				return
 			}
