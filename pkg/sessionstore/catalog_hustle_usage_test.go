@@ -60,11 +60,12 @@ func TestFoldCatalogHustlesIsBoundedAndDeterministic(t *testing.T) {
 	namedStart, namedDone := catalogHustlePair(sid, named, 0x77, namedRuntime, nil, false)
 	namedFailedStart, _ := catalogHustlePair(sid, named, 0x79, namedRuntime, nil, false)
 	namedFailed := event.HustleFailed{Header: namedFailedStart.Header, Run: namedFailedStart.Run, Stage: hustle.StageQueue, ReasonCode: hustle.ReasonCanceled}
+	namedResolvedFailedStart, namedResolvedFailed := catalogHustlePair(sid, named, 0x7d, namedRuntime, nil, true)
 	interrupted, _ := catalogHustlePair(sid, current, 0x7b, runtimeA, &usageA, false)
 
 	want := []HustleUsageAggregate{
-		{Name: "a-named", ModelSource: hustle.ModelSourceNamed, NamedModelKey: namedKey, Status: hustle.TerminalStatusCompleted, Runs: 1},
-		{Name: "a-named", ModelSource: hustle.ModelSourceNamed, NamedModelKey: namedKey, Status: hustle.TerminalStatusFailed, Runs: 1},
+		{Name: "a-named", ModelSource: hustle.ModelSourceNamed, NamedModelKey: namedKey, Runtime: namedRuntime, Status: hustle.TerminalStatusCompleted, Runs: 1},
+		{Name: "a-named", ModelSource: hustle.ModelSourceNamed, NamedModelKey: namedKey, Runtime: namedRuntime, Status: hustle.TerminalStatusFailed, Runs: 2},
 		{Name: "z-current", ModelSource: hustle.ModelSourceCurrentLoop, Status: hustle.TerminalStatusCompleted, Runs: 2, CumulativeUsage: content.Usage{InputTokens: 30, OutputTokens: 6, CacheReadTokens: 3}},
 		{Name: "z-current", ModelSource: hustle.ModelSourceCurrentLoop, Status: hustle.TerminalStatusFailed, Runs: 1, CumulativeUsage: usageA},
 	}
@@ -72,8 +73,8 @@ func TestFoldCatalogHustlesIsBoundedAndDeterministic(t *testing.T) {
 		name   string
 		events []event.Event
 	}{
-		{name: "one order", events: []event.Event{currentStartA, currentDoneA, namedStart, namedDone, namedFailedStart, namedFailed, currentStartFailed, currentFailed, currentStartB, currentDoneB, interrupted}},
-		{name: "different run order", events: []event.Event{interrupted, currentStartB, currentDoneB, currentStartFailed, currentFailed, namedFailedStart, namedFailed, namedStart, namedDone, currentStartA, currentDoneA}},
+		{name: "one order", events: []event.Event{currentStartA, currentDoneA, namedStart, namedDone, namedFailedStart, namedFailed, namedResolvedFailedStart, namedResolvedFailed, currentStartFailed, currentFailed, currentStartB, currentDoneB, interrupted}},
+		{name: "different run order", events: []event.Event{interrupted, currentStartB, currentDoneB, currentStartFailed, currentFailed, namedResolvedFailedStart, namedResolvedFailed, namedFailedStart, namedFailed, namedStart, namedDone, currentStartA, currentDoneA}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -123,6 +124,14 @@ func TestFoldCatalogHustlesFailsClosed(t *testing.T) {
 			value.Run.Runtime.Key.Model = "other"
 			return value
 		}()}},
+		{name: "named runtime metadata differs for one fixed identity", events: func() []event.Event {
+			secondStart, secondTerminal := catalogHustlePair(sid, descriptor, 0x87, event.ModelRuntime{Key: namedKey, Limits: inference.ContextLimits{WindowTokens: 200}}, nil, false)
+			return []event.Event{start, terminal, secondStart, secondTerminal}
+		}()},
+		{name: "named runtime metadata differs across terminal statuses", events: func() []event.Event {
+			failedStart, failedTerminal := catalogHustlePair(sid, descriptor, 0x89, event.ModelRuntime{Key: namedKey, Limits: inference.ContextLimits{WindowTokens: 200}}, nil, true)
+			return []event.Event{start, terminal, failedStart, failedTerminal}
+		}()},
 		{name: "usage overflow", events: []event.Event{startMax, terminalMax, startOne, terminalOne}},
 	}
 	for _, tt := range tests {
@@ -168,7 +177,8 @@ func TestFoldCatalogHustleTerminalRejectsRunCountOverflow(t *testing.T) {
 func TestHustleUsageAggregateCodecValidation(t *testing.T) {
 	t.Parallel()
 	key := inference.ModelKey{Provider: "provider", Model: "model"}
-	valid := HustleUsageAggregate{Name: "named", ModelSource: hustle.ModelSourceNamed, NamedModelKey: key, Status: hustle.TerminalStatusCompleted, Runs: 1, CumulativeUsage: content.Usage{InputTokens: 2, OutputTokens: 1}}
+	runtime := event.ModelRuntime{Key: key, Limits: inference.ContextLimits{WindowTokens: 100}}
+	valid := HustleUsageAggregate{Name: "  named  ", ModelSource: hustle.ModelSourceNamed, NamedModelKey: key, Runtime: runtime, Status: hustle.TerminalStatusCompleted, Runs: 1, CumulativeUsage: content.Usage{InputTokens: 2, OutputTokens: 1}}
 	tests := []struct {
 		name    string
 		meta    SessionMeta
@@ -176,6 +186,12 @@ func TestHustleUsageAggregateCodecValidation(t *testing.T) {
 	}{
 		{name: "absent field is backward compatible", meta: SessionMeta{}},
 		{name: "valid aggregate", meta: SessionMeta{Hustles: []HustleUsageAggregate{valid}}},
+		{name: "named pre-resolution aggregate may have zero runtime", meta: SessionMeta{Hustles: []HustleUsageAggregate{func() HustleUsageAggregate {
+			value := valid
+			value.Runtime = event.ModelRuntime{}
+			value.Status = hustle.TerminalStatusFailed
+			return value
+		}()}}},
 		{name: "unknown source", meta: SessionMeta{Hustles: []HustleUsageAggregate{func() HustleUsageAggregate {
 			value := valid
 			value.ModelSource = hustle.ModelSourceUnknown
@@ -188,14 +204,32 @@ func TestHustleUsageAggregateCodecValidation(t *testing.T) {
 			value.ModelSource = hustle.ModelSourceCurrentLoop
 			return value
 		}()}}, wantErr: true},
+		{name: "current source carries runtime", meta: SessionMeta{Hustles: []HustleUsageAggregate{func() HustleUsageAggregate {
+			value := valid
+			value.Name = "current"
+			value.ModelSource = hustle.ModelSourceCurrentLoop
+			value.NamedModelKey = inference.ModelKey{}
+			return value
+		}()}}, wantErr: true},
 		{name: "named source missing key", meta: SessionMeta{Hustles: []HustleUsageAggregate{func() HustleUsageAggregate { value := valid; value.NamedModelKey = inference.ModelKey{}; return value }()}}, wantErr: true},
+		{name: "named runtime key mismatch", meta: SessionMeta{Hustles: []HustleUsageAggregate{func() HustleUsageAggregate {
+			value := valid
+			value.Runtime.Key.Model = "other"
+			return value
+		}()}}, wantErr: true},
 		{name: "invalid usage", meta: SessionMeta{Hustles: []HustleUsageAggregate{func() HustleUsageAggregate {
 			value := valid
 			value.CumulativeUsage = content.Usage{OutputTokens: 1, ReasoningTokens: 2}
 			return value
 		}()}}, wantErr: true},
-		{name: "unsorted", meta: SessionMeta{Hustles: []HustleUsageAggregate{valid, func() HustleUsageAggregate { value := valid; value.Name = "alpha"; return value }()}}, wantErr: true},
+		{name: "unsorted", meta: SessionMeta{Hustles: []HustleUsageAggregate{valid, func() HustleUsageAggregate { value := valid; value.Name = "  alpha  "; return value }()}}, wantErr: true},
 		{name: "duplicate", meta: SessionMeta{Hustles: []HustleUsageAggregate{valid, valid}}, wantErr: true},
+		{name: "same named identity has conflicting runtimes across statuses", meta: SessionMeta{Hustles: []HustleUsageAggregate{valid, func() HustleUsageAggregate {
+			value := valid
+			value.Status = hustle.TerminalStatusFailed
+			value.Runtime.Limits.WindowTokens = 200
+			return value
+		}()}}, wantErr: true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -243,7 +277,7 @@ func TestDecodeSessionMetaRejectsMalformedHustleJSON(t *testing.T) {
 func TestCatalogLiveAndRepairShareHustleAggregate(t *testing.T) {
 	t.Parallel()
 	sid := fixedUUID(0x90)
-	descriptor := catalogHustleDescriptor(t, "current", hustle.ModelSourceCurrentLoop, inference.ModelKey{})
+	descriptor := catalogHustleDescriptor(t, "  current  ", hustle.ModelSourceCurrentLoop, inference.ModelKey{})
 	runtime := event.ModelRuntime{Key: inference.ModelKey{Provider: "provider", Model: "model"}, Limits: inference.ContextLimits{WindowTokens: 100}}
 	usage := content.Usage{InputTokens: 8, OutputTokens: 2}
 	started, terminal := catalogHustlePair(sid, descriptor, 0x91, runtime, &usage, false)
@@ -274,7 +308,7 @@ func TestCatalogLiveAndRepairShareHustleAggregate(t *testing.T) {
 			if err != nil {
 				t.Fatalf("act() error = %v", err)
 			}
-			want := []HustleUsageAggregate{{Name: "current", ModelSource: hustle.ModelSourceCurrentLoop, Status: hustle.TerminalStatusCompleted, Runs: 1, CumulativeUsage: usage}}
+			want := []HustleUsageAggregate{{Name: "  current  ", ModelSource: hustle.ModelSourceCurrentLoop, Status: hustle.TerminalStatusCompleted, Runs: 1, CumulativeUsage: usage}}
 			if !reflect.DeepEqual(meta.Hustles, want) {
 				t.Errorf("Hustles = %#v, want %#v", meta.Hustles, want)
 			}

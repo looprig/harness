@@ -143,6 +143,7 @@ type HustleUsageAggregate struct {
 	Name            hustle.Name           `json:"name"`
 	ModelSource     hustle.ModelSource    `json:"model_source"`
 	NamedModelKey   inference.ModelKey    `json:"named_model_key,omitzero"`
+	Runtime         event.ModelRuntime    `json:"runtime,omitzero"`
 	Status          hustle.TerminalStatus `json:"status"`
 	Runs            uint64                `json:"runs"`
 	CumulativeUsage content.Usage         `json:"cumulative_usage,omitzero"`
@@ -355,6 +356,7 @@ const (
 	CatalogHustleTerminalWithoutStart CatalogHustleErrorKind = "terminal_without_start"
 	CatalogHustleAttributionMismatch  CatalogHustleErrorKind = "attribution_mismatch"
 	CatalogHustleInvalidLifecycle     CatalogHustleErrorKind = "invalid_lifecycle"
+	CatalogHustleRuntimeMismatch      CatalogHustleErrorKind = "runtime_mismatch"
 	CatalogHustleUsageOverflow        CatalogHustleErrorKind = "usage_overflow"
 	CatalogHustleRunCountOverflow     CatalogHustleErrorKind = "run_count_overflow"
 )
@@ -733,6 +735,9 @@ func foldCatalogHustles(events []event.Event) ([]HustleUsageAggregate, error) {
 		result = append(result, aggregate)
 	}
 	sort.Slice(result, func(i, j int) bool { return compareHustleAggregate(result[i], result[j]) < 0 })
+	if _, err := validateNamedHustleRuntimeConsistency(result); err != nil {
+		return nil, err
+	}
 	return result, nil
 }
 
@@ -815,6 +820,12 @@ func foldCatalogHustleTerminal(
 	aggregate.ModelSource = key.modelSource
 	aggregate.NamedModelKey = key.namedModelKey
 	aggregate.Status = key.status
+	if run.Definition.ModelSource == hustle.ModelSourceNamed && run.Runtime != (event.ModelRuntime{}) {
+		if aggregate.Runtime != (event.ModelRuntime{}) && aggregate.Runtime != run.Runtime {
+			return &CatalogHustleError{Kind: CatalogHustleRuntimeMismatch, RunID: run.RunID}
+		}
+		aggregate.Runtime = run.Runtime
+	}
 	if aggregate.Runs == ^uint64(0) {
 		return &CatalogHustleError{Kind: CatalogHustleRunCountOverflow, RunID: run.RunID}
 	}
@@ -1068,12 +1079,15 @@ func validateSessionMeta(meta SessionMeta) error {
 			return &CatalogHustleMetaValidationError{Index: i, Rule: CatalogMetaRuleSortedUnique}
 		}
 	}
+	if index, err := validateNamedHustleRuntimeConsistency(meta.Hustles); err != nil {
+		return &CatalogHustleMetaValidationError{Index: index, Rule: CatalogMetaRuleInvalid, Cause: err}
+	}
 	return nil
 }
 
 func validateHustleUsageAggregate(aggregate HustleUsageAggregate) error {
-	if strings.TrimSpace(string(aggregate.Name)) == "" || strings.TrimSpace(string(aggregate.Name)) != string(aggregate.Name) {
-		return &CatalogHustleError{Kind: CatalogHustleInvalidLifecycle}
+	if err := aggregate.Name.Validate(); err != nil {
+		return err
 	}
 	if aggregate.ModelSource != hustle.ModelSourceCurrentLoop && aggregate.ModelSource != hustle.ModelSourceNamed {
 		return &CatalogHustleError{Kind: CatalogHustleInvalidLifecycle}
@@ -1085,10 +1099,41 @@ func validateHustleUsageAggregate(aggregate HustleUsageAggregate) error {
 		if err := aggregate.NamedModelKey.Validate(); err != nil {
 			return err
 		}
+		if aggregate.Runtime != (event.ModelRuntime{}) {
+			if err := validateCatalogRuntime(aggregate.Runtime); err != nil {
+				return err
+			}
+			if aggregate.Runtime.Key != aggregate.NamedModelKey {
+				return &CatalogHustleError{Kind: CatalogHustleRuntimeMismatch}
+			}
+		}
 	} else if aggregate.NamedModelKey != (inference.ModelKey{}) {
 		return &CatalogHustleError{Kind: CatalogHustleInvalidLifecycle}
+	} else if aggregate.Runtime != (event.ModelRuntime{}) {
+		return &CatalogHustleError{Kind: CatalogHustleRuntimeMismatch}
 	}
 	return aggregate.CumulativeUsage.Validate()
+}
+
+type namedHustleRuntimeKey struct {
+	name          hustle.Name
+	modelSource   hustle.ModelSource
+	namedModelKey inference.ModelKey
+}
+
+func validateNamedHustleRuntimeConsistency(aggregates []HustleUsageAggregate) (int, error) {
+	runtimes := make(map[namedHustleRuntimeKey]event.ModelRuntime)
+	for index, aggregate := range aggregates {
+		if aggregate.ModelSource != hustle.ModelSourceNamed || aggregate.Runtime == (event.ModelRuntime{}) {
+			continue
+		}
+		key := namedHustleRuntimeKey{name: aggregate.Name, modelSource: aggregate.ModelSource, namedModelKey: aggregate.NamedModelKey}
+		if runtime, exists := runtimes[key]; exists && runtime != aggregate.Runtime {
+			return index, &CatalogHustleError{Kind: CatalogHustleRuntimeMismatch}
+		}
+		runtimes[key] = aggregate.Runtime
+	}
+	return -1, nil
 }
 
 func validateCatalogRuntime(runtime event.ModelRuntime) error {

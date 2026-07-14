@@ -23,6 +23,20 @@ const (
 // Name is the stable registration name of one hustle definition.
 type Name string
 
+// Validate applies the stable hustle-name contract while preserving the
+// caller's exact spelling. Whitespace is used only to detect empty or reserved
+// names; it is not canonicalized away.
+func (n Name) Validate() error {
+	trimmed := strings.TrimSpace(string(n))
+	if trimmed == "" {
+		return &DefinitionError{Kind: DefinitionMissingName, Field: "name"}
+	}
+	if strings.HasPrefix(trimmed, reservedNamePrefix) {
+		return &DefinitionError{Kind: DefinitionReservedName, Field: "name"}
+	}
+	return nil
+}
+
 // Participation selects the session-global execution lane.
 type Participation uint8
 
@@ -81,12 +95,8 @@ type DefinitionDescriptor struct {
 // Validate checks the complete descriptor-only constructor domain without
 // requiring the raw system prompt or an inference client.
 func (d DefinitionDescriptor) Validate() error {
-	trimmedName := strings.TrimSpace(string(d.Name))
-	if trimmedName == "" {
-		return &DefinitionError{Kind: DefinitionMissingName, Field: "name"}
-	}
-	if strings.HasPrefix(trimmedName, reservedNamePrefix) {
-		return &DefinitionError{Kind: DefinitionReservedName, Field: "name"}
+	if err := d.Name.Validate(); err != nil {
+		return err
 	}
 	if d.Participation != ParticipationBlocking && d.Participation != ParticipationBackground {
 		return &DefinitionError{Kind: DefinitionInvalidParticipation, Field: "participation"}
@@ -267,12 +277,8 @@ func Define(opts ...Option) (Definition, error) {
 }
 
 func validateDefinitionOptions(options *definitionOptions) error {
-	trimmedName := strings.TrimSpace(string(options.name))
-	if trimmedName == "" {
-		return &DefinitionError{Kind: DefinitionMissingName, Field: "name"}
-	}
-	if strings.HasPrefix(trimmedName, reservedNamePrefix) {
-		return &DefinitionError{Kind: DefinitionReservedName, Field: "name"}
+	if err := options.name.Validate(); err != nil {
+		return err
 	}
 	if options.participation != ParticipationBlocking && options.participation != ParticipationBackground {
 		return &DefinitionError{Kind: DefinitionInvalidParticipation, Field: "participation"}

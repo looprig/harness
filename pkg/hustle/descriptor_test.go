@@ -85,6 +85,29 @@ func TestDefinitionDescriptorValidate(t *testing.T) {
 	}
 }
 
+func TestNameValidateMatchesDefinitionContract(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name    string
+		value   Name
+		wantErr bool
+	}{
+		{name: "plain name", value: "compact"},
+		{name: "surrounding whitespace is preserved and valid", value: "  compact  "},
+		{name: "empty", value: "", wantErr: true},
+		{name: "whitespace only", value: "   ", wantErr: true},
+		{name: "reserved after trimming", value: "  _looprig.private", wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if err := tt.value.Validate(); (err != nil) != tt.wantErr {
+				t.Errorf("Name.Validate() error = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
 func withDescriptorName(value DefinitionDescriptor, name Name) DefinitionDescriptor {
 	value.Name = name
 	return value
