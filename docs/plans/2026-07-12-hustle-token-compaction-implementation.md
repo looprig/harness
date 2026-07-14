@@ -618,8 +618,10 @@ its existing basis; rejected gains one). Codecs and validators reject zero or
 unknown reasons and invalid bases. Immediate pre-start/control-lane-full
 `CompactWaiterRejected` remains per-command after a valid coordination AttemptID
 exists, lane-full cites the existing pending AttemptID, and neither fabricates a
-canonical basis. Failure before any AttemptID is minted emits no durable waiter
-reply and returns only the typed infrastructure failure.
+canonical basis. Lane-full overflow rejects only the joining command and leaves
+the existing owning slot plus accepted waiters untouched. Failure before any
+AttemptID is minted emits no durable waiter reply and returns only the typed
+infrastructure failure.
 
 Commit: `feat(compaction): add commands and event contracts`.
 
@@ -631,7 +633,8 @@ Commit: `feat(compaction): add commands and event contracts`.
 
 **RED:** safe boundary consumption, one attempt/many canonical waiters,
 dedup/order, lane-full immediate reply using the existing pending AttemptID, user
-join, machine coalescing, immutable first-opener reason across mixed-origin joins,
+join with overflow leaving the owning slot and accepted waiters untouched,
+machine coalescing, immutable first-opener reason across mixed-origin joins,
 interrupt/shutdown priority, transient pending-slot suppression without durable
 exhaustion, pre-start interrupt/shutdown clearing the slot without a canonical
 automatic rejection, and journal-writable versus fatal-infrastructure outcomes.
@@ -681,7 +684,8 @@ leaves its canonical reason Automatic and consumes the latch.
 Task24's await/result seam marks exhausted `automaticBasis` only after receiving
 the identity of a successfully appended canonical Automatic rejection. Mere
 admission/open/start and per-waiter-only pre-start interrupt/shutdown/control
-rejection use/clear only Task23's transient slot. RED covers Automatic-opened
+owner rejection use/clear only Task23's transient slot; a lane-full overflow
+joiner is rejected without clearing that slot. RED covers Automatic-opened
 pre-start Interrupt and Shutdown both live and after equivalent restore: the
 unchanged basis remains eligible. Fatal no-terminal infrastructure creates no
 durable latch; committed replacement advances basis instead.

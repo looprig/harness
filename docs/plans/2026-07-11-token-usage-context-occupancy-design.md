@@ -868,11 +868,14 @@ minted a valid `AttemptID`; lane-full rejection cites the existing pending
 `AttemptID`. Failure before any `AttemptID` can be minted produces no durable
 `CompactWaiterRejected` and completes only through the typed in-process/routing
 infrastructure failure, consistent with the no-false-rejection rule above.
-Pre-start interrupt, shutdown, lane, or control rejection that produces only
-`CompactWaiterRejected` ends/clears the transient slot and does not exhaust the
-basis. Fatal infrastructure without a canonical terminal likewise records no
-durable exhaustion; the session stops, and restore may retry because the journal
-contains no authoritative failed automatic attempt.
+Pre-start interrupt/shutdown or owner lane/control closure that rejects the
+owning pending attempt ends/clears its transient slot and does not exhaust the
+basis. A lane-full overflow *joining command* is different: its
+`CompactWaiterRejected` cites the existing pending `AttemptID` but leaves that
+pending/in-progress slot and all already-accepted waiters untouched; it does not
+exhaust the automatic basis. Fatal infrastructure without a canonical terminal
+likewise records no durable exhaustion; the session stops, and restore may retry
+because the journal contains no authoritative failed automatic attempt.
 
 ### Crash-consistent outcome
 
@@ -1295,8 +1298,10 @@ basis and makes the old latch irrelevant; failure does not disarm automatic
 compaction forever. Manual
 `/compact` may explicitly retry the same basis.
 
-Pre-start interrupt/shutdown/control rejection clears the transient slot without
-setting `automaticBasis`, so the unchanged live basis remains eligible. Fatal
+Pre-start interrupt/shutdown or owner lane/control closure clears the owning
+transient slot without setting `automaticBasis`, so the unchanged live basis
+remains eligible. Lane-full rejection of an overflow joiner preserves the owning
+slot and accepted waiters and likewise does not exhaust the basis. Fatal
 infrastructure with no canonical terminal stops the session but also creates no
 durable exhausted latch. `CompactionCommitted` advances the basis, making any old
 basis latch unnecessary.
@@ -1591,7 +1596,8 @@ exists, including post-summary counting in the compaction finalization work.
 Immediate pre-start or control-lane-full `CompactWaiterRejected` remains a
 per-command reply after a valid coordination `AttemptID` exists and does not
 fabricate a canonical attempted basis; lane-full cites the existing pending
-attempt. Failure before any AttemptID is minted produces no durable waiter reply,
+attempt without clearing or modifying that owning attempt or its accepted
+waiters. Failure before any AttemptID is minted produces no durable waiter reply,
 only the typed in-process/routing infrastructure failure.
 
 ### Missing exact provider counters
