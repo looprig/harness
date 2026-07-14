@@ -31,6 +31,9 @@ const (
 	DefinitionMissingInferenceCapability DefinitionErrorKind = "missing_inference_capability"
 	DefinitionInvalidInferenceCapability DefinitionErrorKind = "invalid_inference_capability"
 	DefinitionIncompatibleContextCounter DefinitionErrorKind = "incompatible_context_counter"
+	DefinitionMissingContextPolicy       DefinitionErrorKind = "missing_context_policy"
+	DefinitionConflictingContextPolicy   DefinitionErrorKind = "conflicting_context_policy"
+	DefinitionInvalidContextObservation  DefinitionErrorKind = "invalid_context_observation"
 	DefinitionInvalidCompaction          DefinitionErrorKind = "invalid_compaction"
 	DefinitionInvalidModeBinding         DefinitionErrorKind = "invalid_mode_binding"
 )

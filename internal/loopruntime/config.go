@@ -65,6 +65,10 @@ func resolveMode(bound loop.BoundDefinition, modeName loop.ModeName) (runtimeCon
 		copyOfPolicy := policy
 		resolved.Compaction = &copyOfPolicy
 	}
+	if policy, configured := bound.ContextObservationPolicy(); configured {
+		copyOfPolicy := policy
+		resolved.ContextObservation = &copyOfPolicy
+	}
 	return resolved, nil
 }
 
@@ -116,6 +120,7 @@ type runtimeConfig struct {
 	ContextCounter      inference.ContextCounter
 	CounterCapability   inference.CounterCapability
 	InferenceCapability inference.InferenceCapability
+	ContextObservation  *loop.ContextObservationPolicy
 	Compaction          *loop.CompactionPolicy
 
 	// compactionSink is the internal ownership-transfer seam between the loop actor's

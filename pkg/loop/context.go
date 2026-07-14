@@ -34,6 +34,16 @@ func (e *ContextLimitUnknownError) Error() string {
 
 func (e *ContextLimitUnknownError) Unwrap() error { return e.Cause }
 
+// ContextLimitError reports that an authoritative candidate-request measurement
+// reached or exceeded its resolved hard input limit.
+type ContextLimitError struct {
+	Measurement event.ContextMeasurement
+}
+
+func (e *ContextLimitError) Error() string {
+	return "loop: candidate request reached the context input limit"
+}
+
 // OccupancyError reports an invalid zero denominator.
 type OccupancyError struct{ Limit content.TokenCount }
 

@@ -70,6 +70,12 @@ func stampLoopHeader(ev event.Event, sessionID, loopID, turnID uuid.UUID) event.
 	case event.LoopInferenceChanged:
 		e.Header = fillLoopScoped(e.Header, sessionID, loopID)
 		return e
+	case event.ContextMeasured:
+		e.Header = fillLoopScoped(e.Header, sessionID, loopID)
+		return e
+	case event.ContextPressure:
+		e.Header = fillLoopScoped(e.Header, sessionID, loopID)
+		return e
 	case event.CompactionStarted:
 		e.Header = fillLoopScoped(e.Header, sessionID, loopID)
 		return e
@@ -132,6 +138,9 @@ func withLoopHeader(ev event.Event, h event.Header) event.Event {
 		e.Header = h
 		return e
 	case event.LoopInferenceChanged:
+		e.Header = h
+		return e
+	case event.ContextMeasured:
 		e.Header = h
 		return e
 	case event.TurnRejected:

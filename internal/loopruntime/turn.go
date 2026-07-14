@@ -100,6 +100,7 @@ type turnConfig struct {
 	// critical sequence, so already-queued work on any loop cannot advance.
 	admit          func(context.Context) (func(), error)
 	firstAdmission func()
+	measure        func(context.Context, inference.Request, string) error
 
 	// commit is the durability/event handshake back to the actor. runTurn prepares a
 	// complete step group, but the actor is the only goroutine that mutates
@@ -222,6 +223,10 @@ func runTurn(ctx context.Context, cfg turnConfig, ts turnState) event.Event {
 	// provider is configured (or it yielded no blocks): the request is then assembled
 	// exactly as before.
 	runtimeTail := runtimeContextTail(ctx, cfg.runtimeContext)
+	runtimeRevision, err := runtimeContextRevision(runtimeTail)
+	if err != nil {
+		return event.TurnFailed{TurnIndex: ts.index, Err: err}
+	}
 
 	for stepIdx := StepIndex(0); ; stepIdx++ {
 		// Request base is the committed history clone + this turn's staged messages,
@@ -234,6 +239,11 @@ func runTurn(ctx context.Context, cfg turnConfig, ts turnState) event.Event {
 			System:   cfg.system,
 			Messages: requestMessages(cfg.base, ts.msgs, runtimeTail),
 			Tools:    defs,
+		}
+		if cfg.measure != nil {
+			if err := cfg.measure(ctx, req, runtimeRevision); err != nil {
+				return event.TurnFailed{TurnIndex: ts.index, Err: err}
+			}
 		}
 
 		// Mint this step's id BEFORE streaming so StepDone can be stamped from the

@@ -55,6 +55,7 @@ type definitionState struct {
 	contextCounter      inference.ContextCounter
 	counterCapability   inference.CounterCapability
 	inferenceCapability inference.InferenceCapability
+	contextObservation  ContextObservationPolicy
 	compaction          CompactionPolicy
 }
 
@@ -159,8 +160,12 @@ func Define(opts ...Option) (Definition, error) {
 func validateContextDefinition(resolved *definitionOptions) error {
 	_, hasCounter := resolved.seen["context_counter"]
 	_, hasCapability := resolved.seen["inference_capability"]
+	_, hasObservation := resolved.seen["context_observation"]
 	_, hasCompaction := resolved.seen["compaction"]
-	if (hasCapability || hasCompaction) && !hasCounter {
+	if hasObservation && hasCompaction {
+		return &DefinitionError{Kind: DefinitionConflictingContextPolicy, Field: "context_policy"}
+	}
+	if (hasCapability || hasObservation || hasCompaction) && !hasCounter {
 		return &DefinitionError{Kind: DefinitionMissingContextCounter, Field: "context_counter"}
 	}
 	if hasCounter && !hasCapability {
@@ -168,6 +173,9 @@ func validateContextDefinition(resolved *definitionOptions) error {
 	}
 	if !hasCounter {
 		return nil
+	}
+	if !hasObservation && !hasCompaction {
+		return &DefinitionError{Kind: DefinitionMissingContextPolicy, Field: "context_policy"}
 	}
 	if nilLike(resolved.contextCounter) {
 		return &DefinitionError{Kind: DefinitionInvalidContextCounter, Field: "context_counter"}
@@ -185,6 +193,11 @@ func validateContextDefinition(resolved *definitionOptions) error {
 	if hasCompaction {
 		if err := resolved.compaction.Validate(capability); err != nil {
 			return &DefinitionError{Kind: DefinitionInvalidCompaction, Field: "compaction", Cause: err}
+		}
+	}
+	if hasObservation {
+		if err := resolved.contextObservation.Validate(capability); err != nil {
+			return &DefinitionError{Kind: DefinitionInvalidContextObservation, Field: "context_observation", Cause: err}
 		}
 	}
 	for _, mode := range resolved.modes {
@@ -364,6 +377,7 @@ func (d Definition) PolicyRevision() string {
 		PolicyRevision      string
 		CounterCapability   *inference.CounterCapability
 		InferenceCapability *inference.InferenceCapability
+		ContextObservation  *ContextObservationPolicy
 		Compaction          *CompactionPolicy
 	}{
 		Name: d.state.name, Model: cloneModel(d.state.model), System: d.state.system,
@@ -381,6 +395,10 @@ func (d Definition) PolicyRevision() string {
 	if d.state.compaction.CountTimeout != 0 {
 		policy := d.state.compaction
 		projection.Compaction = &policy
+	}
+	if d.state.contextObservation.CountTimeout != 0 {
+		policy := d.state.contextObservation
+		projection.ContextObservation = &policy
 	}
 	encoded, err := json.Marshal(projection)
 	if err != nil {
@@ -561,6 +579,7 @@ type BoundDefinition interface {
 	ContextCounter() inference.ContextCounter
 	CounterCapability() (inference.CounterCapability, bool)
 	InferenceCapability() (inference.InferenceCapability, bool)
+	ContextObservationPolicy() (ContextObservationPolicy, bool)
 	CompactionPolicy() (CompactionPolicy, bool)
 	ValidateContextModel(inference.Model) error
 	Delegation() Delegation
@@ -594,6 +613,9 @@ func (b *boundDefinitionState) CounterCapability() (inference.CounterCapability,
 }
 func (b *boundDefinitionState) InferenceCapability() (inference.InferenceCapability, bool) {
 	return b.definition.inferenceCapability, b.definition.contextCounter != nil
+}
+func (b *boundDefinitionState) ContextObservationPolicy() (ContextObservationPolicy, bool) {
+	return b.definition.contextObservation, b.definition.contextObservation.CountTimeout != 0
 }
 func (b *boundDefinitionState) CompactionPolicy() (CompactionPolicy, bool) {
 	return b.definition.compaction, b.definition.compaction.CountTimeout != 0
@@ -695,6 +717,18 @@ func WithInferenceCapability(capability inference.InferenceCapability) Option {
 	}
 }
 
+// WithContextObservation installs explicit hard-admission policy without
+// enabling conversation compaction.
+func WithContextObservation(policy ContextObservationPolicy) Option {
+	return func(o *definitionOptions) error {
+		if err := o.singleton("context_observation"); err != nil {
+			return err
+		}
+		o.contextObservation = policy
+		return nil
+	}
+}
+
 // WithCompaction installs explicit manual and optional automatic policy.
 func WithCompaction(policy CompactionPolicy) Option {
 	return func(o *definitionOptions) error {
@@ -712,6 +746,14 @@ func (d Definition) CompactionPolicy() (CompactionPolicy, bool) {
 		return CompactionPolicy{}, false
 	}
 	return d.state.compaction, true
+}
+
+// ContextObservationPolicy returns the frozen observe-only policy when configured.
+func (d Definition) ContextObservationPolicy() (ContextObservationPolicy, bool) {
+	if d.state == nil || d.state.contextObservation.CountTimeout == 0 {
+		return ContextObservationPolicy{}, false
+	}
+	return d.state.contextObservation, true
 }
 
 // ValidateContextModel checks structural validity and the fixed transport binding.

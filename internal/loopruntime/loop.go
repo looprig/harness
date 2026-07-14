@@ -92,6 +92,9 @@ type loopConfig struct {
 	// identifiable without consuming/reordering an ordinary command at a boundary.
 	priorityCommands <-chan command.Command
 
+	contextRequests chan contextMeasureRequest
+	contextResults  chan contextCountResult
+
 	// gateReg is the gate-registration channel. The actor is its sole reader; the
 	// per-turn goroutine hands the SEND side to runTurn so a parked tool can register
 	// a gate. Bidirectional here because a receive-only handle could not be narrowed
@@ -330,6 +333,8 @@ func newLoopWithSeed(loopCtx context.Context, sessionID, loopID uuid.UUID, paren
 	fp, _ := events.(faultProbe)
 	commands := make(chan command.Command)
 	priorityCommands := make(chan command.Command, compactionPriorityCommandCapacity)
+	contextRequests := make(chan contextMeasureRequest)
+	contextResults := make(chan contextCountResult, 1)
 	done := make(chan struct{})
 	// gateReg is unbuffered: registration is synchronous (the runner blocks on the
 	// ack), and the actor is the sole reader, selecting on it alongside commands.
@@ -347,6 +352,8 @@ func newLoopWithSeed(loopCtx context.Context, sessionID, loopID uuid.UUID, paren
 		cfg:              cfg,
 		commands:         commands,
 		priorityCommands: priorityCommands,
+		contextRequests:  contextRequests,
+		contextResults:   contextResults,
 		gateReg:          gateReg,
 		snapshots:        snapshots,
 		internal:         make(chan turnResult, 1),
@@ -386,6 +393,9 @@ func newLoopWithSeed(loopCtx context.Context, sessionID, loopID uuid.UUID, paren
 		}
 		state.context = seed.Context
 		state.hasContext = seed.HasContext
+		if seed.HasContext {
+			state.contextTracker.restore(seed.Context)
+		}
 	}
 	go runLoop(lc, state)
 	return &Loop{Commands: commands, Done: done, priorityCommands: priorityCommands, gateReg: gateReg, snapshots: snapshots}, nil
@@ -460,6 +470,7 @@ type loopState struct {
 	runtime         event.ModelRuntime
 	context         event.ContextMeasurement
 	hasContext      bool
+	contextTracker  contextTracker
 
 	// effective is the loop's CURRENT turn-affecting configuration (mode/model/effort/
 	// system/tools). startTurn captures a copy of it into the per-turn turnConfig, so a
@@ -582,6 +593,8 @@ func runLoop(cfg loopConfig, state loopState) {
 	config := cfg.cfg
 	commands := cfg.commands
 	priorityCommands := cfg.priorityCommands
+	contextRequests := cfg.contextRequests
+	contextResults := cfg.contextResults
 	gateReg := cfg.gateReg
 	snapshots := cfg.snapshots
 	internal := cfg.internal
@@ -632,24 +645,24 @@ func runLoop(cfg loopConfig, state loopState) {
 			slog.Error("loop event publish to session fan-in failed", "error", err)
 		}
 	}
-	publishTurnStarted := func(ev event.TurnStarted, capability TurnStartCapability) {
+	publishTurnStarted := func(ev event.TurnStarted, capability TurnStartCapability) error {
 		if capability == nil {
-			publish(ev)
-			return
+			return cfg.events.PublishEvent(ctx, ev)
 		}
 		if err := capability.PublishTurnStarted(ctx, ev); err != nil {
-			slog.Error("reserved TurnStarted publish to session fan-in failed", "error", err)
-		}
-	}
-	commitBoundary := func(ev event.Event) error {
-		stamped, err := stamp(ev)
-		if err != nil {
 			return err
 		}
-		if boundary, ok := cfg.events.(executionBoundary); ok {
-			return boundary.CommitBoundary(ctx, stamped)
+		return nil
+	}
+	commitBoundary := func(ev event.Event) (event.Event, error) {
+		stamped, err := stamp(ev)
+		if err != nil {
+			return nil, err
 		}
-		return cfg.events.PublishEvent(ctx, stamped)
+		if boundary, ok := cfg.events.(executionBoundary); ok {
+			return stamped, boundary.CommitBoundary(ctx, stamped)
+		}
+		return stamped, cfg.events.PublishEvent(ctx, stamped)
 	}
 
 	// publishAcceptance is the narrow transactional publication path for managed
@@ -697,13 +710,13 @@ func runLoop(cfg loopConfig, state loopState) {
 		return nil
 	}
 
-	dispatchCompactionBoundary := func(boundary compactionBoundaryKind) {
+	dispatchCompactionBoundary := func(boundary compactionBoundaryKind) bool {
 		if config.compactionSink == nil {
-			return
+			return false
 		}
 		disposition := compactions.atBoundary(boundary)
 		if disposition.Kind == compactionDispositionNone {
-			return
+			return true
 		}
 		if err := config.compactionSink.CoordinateCompaction(ctx, disposition); err != nil {
 			attempt := disposition.Attempt
@@ -717,7 +730,9 @@ func runLoop(cfg loopConfig, state loopState) {
 				waiters = attempt.WaiterCommandIDs
 			}
 			reportCompactionFailure(waiters, &CompactionCoordinationError{Kind: CompactionCoordinationOutcome, Cause: err})
+			return false
 		}
+		return true
 	}
 
 	// emitLoopIdle announces the loop's running->idle transition: an Enduring,
@@ -783,7 +798,7 @@ func runLoop(cfg loopConfig, state loopState) {
 	// derived turn ctx and the defensive base clone the per-turn goroutine reads.
 	// This is the COMMIT-AND-ANNOUNCE half of starting a turn (distinct from
 	// assembling the per-turn turnConfig).
-	installActiveTurn := func(turnID uuid.UUID, qi queuedInput, started event.TurnStarted, capability TurnStartCapability) (context.Context, content.AgenticMessages) {
+	installActiveTurn := func(turnID uuid.UUID, qi queuedInput) (context.Context, content.AgenticMessages) {
 		state.turnIndex++
 		state.turnID = turnID
 		state.causationID = qi.inputID
@@ -797,12 +812,11 @@ func runLoop(cfg loopConfig, state loopState) {
 		base := cloneMessages(state.msgs)
 
 		// Loop-owned incremental commit: commit the initial UserMessage and emit
-		// TurnStarted (Message + Cause.CommandID = inputID + InputID = inputID) at the
-		// SAME actor-owned point, BEFORE runTurn starts.
+		// TurnStarted (Message + Cause.CommandID = inputID + InputID = inputID) was
+		// durably published immediately before this actor-owned mutation.
 		state.msgs = append(state.msgs, qi.msg)
 		state.context = event.ContextMeasurement{}
 		state.hasContext = false
-		publishTurnStarted(started, capability)
 		return turnCtx, base
 	}
 
@@ -859,6 +873,45 @@ func runLoop(cfg loopConfig, state loopState) {
 				return nil, &CommitError{Reason: CommitTurnCancelled, Cause: cctx.Err()}
 			}
 		}
+		var measure func(context.Context, inference.Request, string) error
+		if _, configured := contextSettings(config); configured && config.ContextCounter != nil {
+			measure = func(cctx context.Context, request inference.Request, runtimeRevision string) error {
+				reply := make(chan contextMeasureReply, 1)
+				req := contextMeasureRequest{ctx: cctx, request: request, runtimeContextRevision: runtimeRevision, reply: reply}
+				select {
+				case cfg.contextRequests <- req:
+				case <-cctx.Done():
+					return normalizeContextCountError(request.Model.Key(), config.CounterCapability.Quality, cctx.Err())
+				}
+				var measured contextMeasureReply
+				select {
+				case measured = <-reply:
+				case <-cctx.Done():
+					return normalizeContextCountError(request.Model.Key(), config.CounterCapability.Quality, cctx.Err())
+				}
+				if measured.err != nil {
+					return measured.err
+				}
+				if measured.awaiter == nil {
+					return nil
+				}
+				outcome, err := measured.awaiter.AwaitCompaction(cctx, measured.attemptID)
+				if err != nil {
+					return &contextCompactionAwaitError{AttemptID: measured.attemptID, Cause: err}
+				}
+				switch outcome {
+				case contextCompactionAwaitRejected:
+					if measured.measurement.InputTokens >= measured.measurement.InputLimit {
+						return &loop.ContextLimitError{Measurement: measured.measurement}
+					}
+					return nil
+				case contextCompactionAwaitCommitted:
+					return &contextReplacementRequiredError{AttemptID: measured.attemptID}
+				default:
+					return &contextCompactionAwaitError{AttemptID: measured.attemptID}
+				}
+			}
+		}
 		// model/system/tools come from the loop's CURRENT effective config (captured here,
 		// at turn start, into this per-turn value), so a change that landed since the last
 		// turn takes effect now while a change that lands DURING this turn does not. The
@@ -874,6 +927,7 @@ func runLoop(cfg loopConfig, state loopState) {
 			idGen:          config.idGen,
 			admit:          admit,
 			firstAdmission: firstAdmission,
+			measure:        measure,
 			commit:         commit,
 			drainPending:   drainPending,
 			emit:           publish,
@@ -911,14 +965,18 @@ func runLoop(cfg loopConfig, state loopState) {
 			TurnIndex: state.turnIndex + 1,
 			Message:   cloneUserMessage(qi.msg),
 		}
-		if capability != nil {
-			stamped, err := stamp(started)
-			if err != nil {
-				return uuid.UUID{}, err
-			}
-			started = stamped.(event.TurnStarted)
+		stamped, err := stamp(started)
+		if err != nil {
+			return uuid.UUID{}, err
 		}
-		turnCtx, base := installActiveTurn(turnID, qi, started, capability)
+		started = stamped.(event.TurnStarted)
+		if err := publishTurnStarted(started, capability); err != nil {
+			return uuid.UUID{}, err
+		}
+		if err := state.contextTracker.advance(started.EventID); err != nil {
+			return uuid.UUID{}, err
+		}
+		turnCtx, base := installActiveTurn(turnID, qi)
 		idx := state.turnIndex
 		ts := newTurnState(state.sessionID, state.id, turnID, idx, state.causationID, qi.msg)
 		turnCfg := buildTurnConfig(base, firstAdmission)
@@ -1358,7 +1416,7 @@ func runLoop(cfg loopConfig, state loopState) {
 		endedTurnID := state.turnID
 		// The terminal publish must still carry this turn's correlation IDs (stamped by
 		// publish from state.turnID), so clear them only afterward.
-		boundaryErr := commitBoundary(result.terminal)
+		_, boundaryErr := commitBoundary(result.terminal)
 		if boundaryErr != nil {
 			slog.Error("turn boundary commit failed", "error", boundaryErr)
 		}
@@ -1715,6 +1773,153 @@ func runLoop(cfg loopConfig, state loopState) {
 			// appending to. reply is buffered(1); the send never blocks.
 			req.reply <- loopSnapshot{msgs: cloneMessages(state.msgs), turnIndex: state.turnIndex}
 
+		case req := <-contextRequests:
+			settings, configured := contextSettings(config)
+			if !configured || config.ContextCounter == nil {
+				req.reply <- contextMeasureReply{err: &contextConfigurationStateError{Detail: "counter or policy missing"}}
+				continue
+			}
+			basis := state.contextTracker.currentBasis()
+			go func(request contextMeasureRequest, admission contextAdmissionSettings, measuredBasis event.ContextBasis) {
+				measurement, err := measureRequestContext(
+					request.ctx,
+					config.ContextCounter,
+					config.CounterCapability,
+					config.InferenceCapability,
+					admission,
+					measuredBasis,
+					request.request,
+					request.runtimeContextRevision,
+				)
+				result := contextCountResult{request: request, measurement: measurement, err: err}
+				select {
+				case contextResults <- result:
+				case <-request.ctx.Done():
+				case <-ctx.Done():
+				}
+			}(req, settings, basis)
+
+		case result := <-contextResults:
+			reply := func(response contextMeasureReply) {
+				result.request.reply <- response
+			}
+			if result.err != nil {
+				reply(contextMeasureReply{err: result.err})
+				continue
+			}
+			currentBasis := state.contextTracker.currentBasis()
+			if result.measurement.Basis != currentBasis {
+				reply(contextMeasureReply{err: &staleContextMeasurementError{Measured: result.measurement.Basis, Current: currentBasis}})
+				continue
+			}
+			settings, configured := contextSettings(config)
+			if !configured {
+				reply(contextMeasureReply{err: &contextConfigurationStateError{Detail: "policy removed while counting"}})
+				continue
+			}
+			nextTracker := state.contextTracker
+			tracking, err := nextTracker.apply(result.measurement, settings)
+			if err != nil {
+				reply(contextMeasureReply{err: err})
+				continue
+			}
+			if tracking.MeasurementChanged {
+				measured, stampErr := stamp(event.ContextMeasured{Measurement: result.measurement})
+				if stampErr != nil {
+					reply(contextMeasureReply{err: stampErr})
+					continue
+				}
+				if validateErr := event.ValidateEvent(measured); validateErr != nil {
+					reply(contextMeasureReply{err: validateErr})
+					continue
+				}
+				if publishErr := cfg.events.PublishEventChecked(ctx, measured); publishErr != nil {
+					reply(contextMeasureReply{err: publishErr})
+					continue
+				}
+			}
+			state.contextTracker = nextTracker
+			state.context = result.measurement
+			state.hasContext = true
+			if tracking.PressureChanged {
+				publish(event.ContextPressure{
+					Measurement: result.measurement,
+					Occupancy:   tracking.Occupancy,
+					Previous:    tracking.Previous,
+					Current:     tracking.Current,
+				})
+			}
+			if tracking.AdmissionError != nil {
+				reply(contextMeasureReply{measurement: result.measurement, err: tracking.AdmissionError})
+				continue
+			}
+			if !tracking.TriggerAutomatic {
+				reply(contextMeasureReply{measurement: result.measurement})
+				continue
+			}
+			awaiter, canAwait := config.compactionSink.(contextCompactionAwaiter)
+			if !canAwait {
+				if tracking.Current == event.PressureHardLimit {
+					reply(contextMeasureReply{measurement: result.measurement, err: &loop.ContextLimitError{Measurement: result.measurement}})
+				} else {
+					reply(contextMeasureReply{measurement: result.measurement})
+				}
+				continue
+			}
+			commandID, idErr := config.idGen()
+			if idErr != nil || commandID.IsZero() {
+				coordinationErr := &CompactionCoordinationError{Kind: CompactionCoordinationAttemptID, Cause: idErr}
+				reportCompactionFailure(nil, coordinationErr)
+				if tracking.Current == event.PressureHardLimit {
+					reply(contextMeasureReply{measurement: result.measurement, err: &loop.ContextLimitError{Measurement: result.measurement}})
+				} else {
+					reply(contextMeasureReply{measurement: result.measurement})
+				}
+				continue
+			}
+			automatic := command.Compact{
+				Header:      command.Header{CommandID: commandID, Agency: identity.AgencyMachine, CreatedAt: config.now()},
+				Coordinates: identity.Coordinates{SessionID: state.sessionID, LoopID: state.id},
+			}
+			admission, admissionErr := compactions.admit(automatic, config.idGen)
+			if admissionErr != nil {
+				reportCompactionFailure([]uuid.UUID{commandID}, admissionErr)
+				if tracking.Current == event.PressureHardLimit {
+					reply(contextMeasureReply{measurement: result.measurement, err: &loop.ContextLimitError{Measurement: result.measurement}})
+				} else {
+					reply(contextMeasureReply{measurement: result.measurement})
+				}
+				continue
+			}
+			if admission.Kind == compactionAdmissionLaneFull {
+				if laneErr := publishLaneFull(automatic, admission.AttemptID); laneErr != nil {
+					reportCompactionFailure([]uuid.UUID{commandID}, laneErr)
+				}
+				if tracking.Current == event.PressureHardLimit {
+					reply(contextMeasureReply{measurement: result.measurement, err: &loop.ContextLimitError{Measurement: result.measurement}})
+				} else {
+					reply(contextMeasureReply{measurement: result.measurement})
+				}
+				continue
+			}
+			coordinated := false
+			dispatch := func() { coordinated = dispatchCompactionBoundary(compactionBoundaryStep) }
+			if config.beforeCompactionBoundary != nil {
+				config.beforeCompactionBoundary(compactionBoundaryStep)
+			}
+			if arbitrateCompactionBoundary(priorityCommands, handleCommand, dispatch) {
+				return
+			}
+			if !coordinated {
+				if tracking.Current == event.PressureHardLimit {
+					reply(contextMeasureReply{measurement: result.measurement, err: &loop.ContextLimitError{Measurement: result.measurement}})
+				} else {
+					reply(contextMeasureReply{measurement: result.measurement})
+				}
+				continue
+			}
+			reply(contextMeasureReply{measurement: result.measurement, attemptID: admission.AttemptID, awaiter: awaiter})
+
 		case result := <-admissions:
 			state.cancelAdmission = nil
 			if state.status == loopShuttingDown {
@@ -1802,13 +2007,20 @@ func runLoop(cfg loopConfig, state loopState) {
 			// StepDone emitted here always follows that step's TokenDeltas on the
 			// fan-in. Ack last so the runner only resumes after the event is published.
 			state.msgs = append(state.msgs, req.commit.Messages...)
-			state.context = event.ContextMeasurement{}
-			state.hasContext = false
 			var boundaryErr error
+			var stampedBoundary event.Event
 			if _, ok := req.commit.Event.(event.StepDone); ok {
-				boundaryErr = commitBoundary(req.commit.Event)
+				stampedBoundary, boundaryErr = commitBoundary(req.commit.Event)
 			} else {
-				publish(req.commit.Event)
+				stampedBoundary, boundaryErr = commitBoundary(req.commit.Event)
+			}
+			if boundaryErr == nil {
+				if err := state.contextTracker.advance(stampedBoundary.EventHeader().EventID); err != nil {
+					boundaryErr = err
+				} else {
+					state.context = event.ContextMeasurement{}
+					state.hasContext = false
+				}
 			}
 			// A folded user message is now committed: resolve its draining entry (its
 			// TurnFoldedInto was just emitted), so the abnormal-terminal return path
@@ -1851,7 +2063,7 @@ func runLoop(cfg loopConfig, state loopState) {
 				// wedged there and would never have produced a terminal anyway.
 				select {
 				case result := <-internal:
-					if err := commitBoundary(result.terminal); err != nil {
+					if _, err := commitBoundary(result.terminal); err != nil {
 						slog.Error("turn boundary commit failed during loop cancellation", "error", err)
 					}
 				case <-time.After(config.DrainTimeout):

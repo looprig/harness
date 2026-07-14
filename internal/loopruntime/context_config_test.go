@@ -66,6 +66,49 @@ func TestConfigFromBoundCopiesContextConfiguration(t *testing.T) {
 	}
 }
 
+func TestConfigFromBoundCopiesObservationConfiguration(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+	}{
+		{name: "exact observation timeout and independent policy copy"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			counter := &runtimeContextCounter{capability: inference.CounterCapability{Transport: inference.CounterTransportLocal, Retention: inference.RetentionNone, TokenizerRev: "v1", Quality: inference.CountQualityExactLocal}}
+			policy := loop.ContextObservationPolicy{ReservedOutput: 10, CountTimeout: 41*time.Millisecond + time.Nanosecond}
+			definition, err := loop.Define(
+				loop.WithName("agent"), loop.WithInference(&fakeLLM{}, testModel()), loop.WithContextCounter(counter),
+				loop.WithInferenceCapability(inference.InferenceCapability{Transport: inference.InferenceTransportLocal, Retention: inference.RetentionNone}),
+				loop.WithContextObservation(policy),
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			bound, err := definition.Bind(context.Background(), tool.Bindings{SessionID: mustID(t), LoopID: mustID(t)})
+			if err != nil {
+				t.Fatal(err)
+			}
+			first, err := configFromBound(bound, "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if first.ContextObservation == nil || *first.ContextObservation != policy || first.Compaction != nil {
+				t.Fatalf("observation config = %#v, want exact policy and no compaction", first.ContextObservation)
+			}
+			first.ContextObservation.ReservedOutput = 99
+			second, err := configFromBound(bound, "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if second.ContextObservation == nil || *second.ContextObservation != policy {
+				t.Fatalf("observation policy aliased prior config: %#v", second.ContextObservation)
+			}
+		})
+	}
+}
+
 func TestChangeInferenceRejectsContextTransportSwap(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
