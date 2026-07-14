@@ -299,6 +299,9 @@ func newLoopWithSeed(loopCtx context.Context, sessionID, loopID uuid.UUID, paren
 	if cfg.now == nil {
 		cfg.now = time.Now
 	}
+	if cfg.compactionNow == nil {
+		cfg.compactionNow = time.Now
+	}
 	// The loop mints its own Enduring-event EventID + CreatedAt from the SAME id
 	// generator that mints its correlation ids (idGen) and its clock (now), so a
 	// test that pins those pins the stamp too. Default it here unless a test
@@ -602,6 +605,10 @@ func runLoop(cfg loopConfig, state loopState) {
 	admissions := cfg.admissions
 	requestCancelActive := false
 	compactions := newCompactionControl(compactionControlWaiterCapacity)
+	compactionFinalizations := newCompactionFinalizer(compactionFinalizerConfig{
+		Publisher: cfg.events, Factory: cfg.eventFactory, SessionID: state.sessionID, LoopID: state.id,
+		Now: config.compactionNow,
+	})
 
 	// publish sends a FULL-FIDELITY loop event to the session-level event fan-in.
 	// Producer identity is stamped here from loopState/the active turn (the actor IS
@@ -729,21 +736,57 @@ func runLoop(cfg loopConfig, state loopState) {
 		if disposition.Kind == compactionDispositionNone {
 			return true
 		}
-		if err := config.compactionSink.CoordinateCompaction(ctx, disposition); err != nil {
-			attempt := disposition.Attempt
-			if attempt != nil {
-				if aborted := compactions.abort(attempt.AttemptID); aborted != nil {
-					attempt = aborted
+		if disposition.Kind == compactionDispositionReject {
+			if err := config.compactionSink.CoordinateCompaction(ctx, disposition); err != nil {
+				waiters := []uuid.UUID(nil)
+				if disposition.Attempt != nil {
+					waiters = disposition.Attempt.WaiterCommandIDs
 				}
+				reportCompactionFailure(waiters, &CompactionCoordinationError{Kind: CompactionCoordinationOutcome, Cause: err})
+				return false
 			}
-			waiters := []uuid.UUID(nil)
-			if attempt != nil {
-				waiters = attempt.WaiterCommandIDs
-			}
-			reportCompactionFailure(waiters, &CompactionCoordinationError{Kind: CompactionCoordinationOutcome, Cause: err})
+			return true
+		}
+		attempt := disposition.Attempt
+		if attempt == nil {
 			return false
 		}
-		return true
+		attempt = compactions.markStarted(attempt.AttemptID, config.compactionNow())
+		if attempt == nil {
+			reportCompactionFailure(nil, &CompactionCoordinationError{Kind: CompactionCoordinationOutcome})
+			return false
+		}
+		disposition.Attempt = attempt
+		invoked := false
+		coordinateErr := publishCompactionStartedBeforeInference(
+			ctx, cfg.events, cfg.eventFactory, state.sessionID, state.id,
+			event.CompactionStarted{AttemptID: attempt.AttemptID, Reason: attempt.Reason, Basis: attempt.Basis},
+			func(inferCtx context.Context) error {
+				invoked = true
+				return config.compactionSink.CoordinateCompaction(inferCtx, disposition)
+			},
+		)
+		if coordinateErr == nil {
+			return true
+		}
+		if !invoked && isFatalPublication(coordinateErr) {
+			compactions.abort(attempt.AttemptID)
+			reportCompactionFailure(attempt.WaiterCommandIDs, &CompactionCoordinationError{
+				Kind: CompactionCoordinationOutcome, Cause: coordinateErr,
+			})
+			return false
+		}
+		rejectReason := event.CompactRejectProgressPublication
+		if invoked {
+			rejectReason = event.CompactRejectExecutionFailed
+		}
+		_, finalizationErr := compactionFinalizations.Finalize(ctx, *attempt, compactionFinalizationProposal{RejectReason: rejectReason})
+		if finalizationErr != nil {
+			reportCompactionFailure(attempt.WaiterCommandIDs, finalizationErr)
+			return false
+		}
+		compactions.complete(attempt.AttemptID)
+		return false
 	}
 
 	// emitLoopIdle announces the loop's running->idle transition: an Enduring,
@@ -1692,6 +1735,15 @@ func runLoop(cfg loopConfig, state loopState) {
 				}
 				return false
 			}
+			if admission.Kind == compactionAdmissionOpened {
+				basis := state.contextTracker.currentBasis()
+				if basis.Revision != 0 && !basis.ThroughEventID.IsZero() {
+					if err := compactions.freezeBasis(admission.AttemptID, basis); err != nil {
+						reportCompactionFailure([]uuid.UUID{c.CommandHeader().CommandID}, err)
+						return false
+					}
+				}
+			}
 			// Idle is itself a safe turn boundary. A configured sink takes ownership
 			// immediately; while a turn is live, the request remains actor-owned until
 			// the next step/turn boundary below.
@@ -1985,21 +2037,28 @@ func runLoop(cfg loopConfig, state loopState) {
 			reply(contextMeasureReply{measurement: result.measurement, attemptID: admission.AttemptID, awaiter: awaiter})
 
 		case outcome := <-contextOutcomes:
-			attempt := compactions.complete(outcome.attemptID)
-			rejection, exhaust, validationErr := validateCanonicalCompactionRejection(attempt, outcome.result.CanonicalRejection)
-			if validationErr != nil {
-				outcome.reply <- contextCompactionOutcomeReply{err: validationErr}
-				continue
-			}
-			if rejection != nil && outcome.result.Disposition != contextCompactionAwaitRejected {
+			attempt := compactions.pendingAttempt()
+			if attempt == nil || attempt.AttemptID != outcome.attemptID {
 				outcome.reply <- contextCompactionOutcomeReply{err: &contextCompactionOutcomeError{AttemptID: outcome.attemptID}}
 				continue
 			}
-			if exhaust {
+			if validationErr := validateContextCompactionProposal(attempt, outcome.result); validationErr != nil {
+				outcome.reply <- contextCompactionOutcomeReply{err: validationErr}
+				continue
+			}
+			terminal, finalizationErr := compactionFinalizations.Finalize(ctx, *attempt, outcome.result.Proposal)
+			if finalizationErr != nil {
+				reportCompactionFailure(attempt.WaiterCommandIDs, finalizationErr)
+				outcome.reply <- contextCompactionOutcomeReply{err: finalizationErr}
+				continue
+			}
+			compactions.complete(outcome.attemptID)
+			rejection, rejected := terminal.(event.CompactionRejected)
+			if rejected && rejection.Reason == event.CompactionReasonAutomatic {
 				state.contextTracker.exhaustAutomatic(rejection.Basis, rejection.Reason, true)
 			}
 			settings, configured := contextSettings(config)
-			retry := configured && settings.Automatic && rejection != nil && outcome.result.Disposition == contextCompactionAwaitRejected && rejection.Reason == event.CompactionReasonManual && rejection.Basis == state.contextTracker.currentBasis()
+			retry := configured && settings.Automatic && rejected && rejection.Reason == event.CompactionReasonManual && rejection.Basis == state.contextTracker.currentBasis()
 			outcome.reply <- contextCompactionOutcomeReply{retry: retry}
 
 		case result := <-admissions:

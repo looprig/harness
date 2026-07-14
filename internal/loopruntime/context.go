@@ -25,9 +25,9 @@ const (
 
 type contextCompactionAwaitResult struct {
 	Disposition contextCompactionAwaitDisposition
-	// CanonicalRejection is non-nil only when the awaiter observed the exact
-	// durably appended terminal event for this attempt.
-	CanonicalRejection *event.CompactionRejected
+	// Proposal is prepared outside the actor but has no durable authority. The
+	// actor validates it and owns the one canonical terminal append.
+	Proposal compactionFinalizationProposal
 }
 
 type contextCompactionAwaiter interface {
@@ -65,21 +65,26 @@ func (*contextCompactionOutcomeError) Error() string {
 
 func (e *contextCompactionOutcomeError) Unwrap() error { return e.Cause }
 
-func validateCanonicalCompactionRejection(attempt *compactionAttempt, rejected *event.CompactionRejected) (*event.CompactionRejected, bool, error) {
-	if rejected == nil {
-		return nil, false, nil
-	}
+func validateContextCompactionProposal(attempt *compactionAttempt, result contextCompactionAwaitResult) error {
 	if attempt == nil {
-		return nil, false, &contextCompactionOutcomeError{AttemptID: rejected.AttemptID}
+		return &contextCompactionOutcomeError{}
 	}
-	if err := event.ValidateEvent(*rejected); err != nil {
-		return nil, false, &contextCompactionOutcomeError{AttemptID: attempt.AttemptID, Cause: err}
+	if err := result.Proposal.validate(); err != nil {
+		return &contextCompactionOutcomeError{AttemptID: attempt.AttemptID, Cause: err}
 	}
-	if rejected.AttemptID != attempt.AttemptID || rejected.Reason != attempt.Reason || rejected.Basis != attempt.Basis {
-		return nil, false, &contextCompactionOutcomeError{AttemptID: attempt.AttemptID}
+	switch result.Disposition {
+	case contextCompactionAwaitRejected:
+		if result.Proposal.Success != nil {
+			return &contextCompactionOutcomeError{AttemptID: attempt.AttemptID}
+		}
+	case contextCompactionAwaitCommitted:
+		if result.Proposal.Success == nil {
+			return &contextCompactionOutcomeError{AttemptID: attempt.AttemptID}
+		}
+	default:
+		return &contextCompactionOutcomeError{AttemptID: attempt.AttemptID}
 	}
-	copyOfRejection := *rejected
-	return &copyOfRejection, rejected.Reason == event.CompactionReasonAutomatic, nil
+	return nil
 }
 
 type contextRevisionOverflowError struct{}

@@ -3,6 +3,7 @@ package loopruntime
 import (
 	"bytes"
 	"context"
+	"errors"
 	"sort"
 	"time"
 
@@ -109,6 +110,15 @@ type compactionFailureSink interface {
 	ReportCompactionFailure(context.Context, compactionFailure)
 }
 
+type fatalPublicationError interface {
+	FatalPublication() bool
+}
+
+func isFatalPublication(err error) bool {
+	var fatal fatalPublicationError
+	return errors.As(err, &fatal) && fatal.FatalPublication()
+}
+
 type actorCommandHandler func(command.Command) bool
 
 // arbitrateCompactionBoundary applies the bounded snapshot of priority controls
@@ -166,6 +176,7 @@ type compactionAttempt struct {
 	WaiterCommandIDs []uuid.UUID
 	Reason           event.CompactionReason
 	Basis            event.ContextBasis
+	StartedAt        time.Time
 }
 
 type pendingCompaction struct {
@@ -173,6 +184,7 @@ type pendingCompaction struct {
 	waiters   []compactionWaiter
 	reason    event.CompactionReason
 	basis     event.ContextBasis
+	startedAt time.Time
 	phase     compactionPhase
 }
 
@@ -246,6 +258,14 @@ func (c *compactionControl) freezeBasis(attemptID event.CompactAttemptID, basis 
 	return nil
 }
 
+func (c *compactionControl) markStarted(attemptID event.CompactAttemptID, startedAt time.Time) *compactionAttempt {
+	if c.pending == nil || c.pending.attemptID != attemptID || c.pending.phase != compactionPhaseInProgress || startedAt.IsZero() {
+		return nil
+	}
+	c.pending.startedAt = startedAt
+	return c.pendingAttempt()
+}
+
 func (c *compactionControl) interrupt() {
 	if c.pending != nil && c.pending.phase == compactionPhasePending {
 		c.interrupting = true
@@ -310,7 +330,10 @@ func (c *compactionControl) pendingAttempt() *compactionAttempt {
 	for i, waiter := range c.pending.waiters {
 		waiters[i] = waiter.commandID
 	}
-	return &compactionAttempt{AttemptID: c.pending.attemptID, WaiterCommandIDs: waiters, Reason: c.pending.reason, Basis: c.pending.basis}
+	return &compactionAttempt{
+		AttemptID: c.pending.attemptID, WaiterCommandIDs: waiters, Reason: c.pending.reason,
+		Basis: c.pending.basis, StartedAt: c.pending.startedAt,
+	}
 }
 
 func waiterFromCompact(request command.Compact) compactionWaiter {

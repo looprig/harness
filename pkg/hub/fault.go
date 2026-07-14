@@ -50,6 +50,10 @@ func (e *SessionPersistenceFault) Error() string {
 
 func (e *SessionPersistenceFault) Unwrap() error { return e.Cause }
 
+// FatalPublication marks a required-journal failure for dependency-inverted
+// producers. Callers can fail closed without importing hub's concrete type.
+func (*SessionPersistenceFault) FatalPublication() bool { return true }
+
 // FaultReporter is the hub's escalation seam for a required-durable-append failure.
 // The hub depends only on this narrow interface (Dependency Inversion): it never sees
 // the Session's closing latch or its WaitIdle registry, and the Session (which

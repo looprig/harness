@@ -179,13 +179,19 @@ func TestLoopContextAdmissionBeforePrimaryInference(t *testing.T) {
 		{
 			name: "automatic soft rejection continues", count: 65,
 			compaction:  &loop.CompactionPolicy{Automatic: true, CounterPolicy: loop.CounterPolicyRequireExact, CompactAt: 8_000, RearmBelow: 6_000, ReservedOutput: 20, MaxSummaryTokens: 10, CountTimeout: 31 * time.Millisecond, Hustle: "context.compact"},
-			withAwaiter: true, release: contextCompactionAwaitResult{Disposition: contextCompactionAwaitRejected},
+			withAwaiter: true, release: contextCompactionAwaitResult{
+				Disposition: contextCompactionAwaitRejected,
+				Proposal:    compactionFinalizationProposal{RejectReason: event.CompactRejectExecutionFailed},
+			},
 			wantInference: 1, wantMeasured: true, wantPressure: event.PressureCompact,
 		},
 		{
 			name: "automatic hard rejection blocks after real attempt", count: 80,
 			compaction:  &loop.CompactionPolicy{Automatic: true, CounterPolicy: loop.CounterPolicyRequireExact, CompactAt: 8_000, RearmBelow: 6_000, ReservedOutput: 20, MaxSummaryTokens: 10, CountTimeout: 31 * time.Millisecond, Hustle: "context.compact"},
-			withAwaiter: true, release: contextCompactionAwaitResult{Disposition: contextCompactionAwaitRejected},
+			withAwaiter: true, release: contextCompactionAwaitResult{
+				Disposition: contextCompactionAwaitRejected,
+				Proposal:    compactionFinalizationProposal{RejectReason: event.CompactRejectExecutionFailed},
+			},
 			wantMeasured: true, wantPressure: event.PressureHardLimit,
 			wantTerminalErr: func(err error) bool { var target *loop.ContextLimitError; return errors.As(err, &target) },
 		},
@@ -503,8 +509,8 @@ func TestLoopAutomaticCompactionRetriesAfterManualOpenedRejection(t *testing.T) 
 				t.Fatalf("first attempted basis = %+v, want %+v", first.Attempt.Basis, measured.Measurement.Basis)
 			}
 			sink.release <- contextCompactionAwaitResult{
-				Disposition:        contextCompactionAwaitRejected,
-				CanonicalRejection: canonicalContextRejection(first, measured.Measurement.Basis),
+				Disposition: contextCompactionAwaitRejected,
+				Proposal:    compactionFinalizationProposal{RejectReason: event.CompactRejectExecutionFailed},
 			}
 			select {
 			case second := <-sink.started:
@@ -515,8 +521,8 @@ func TestLoopAutomaticCompactionRetriesAfterManualOpenedRejection(t *testing.T) 
 					t.Fatalf("second attempted basis = %+v, want %+v", second.Attempt.Basis, measured.Measurement.Basis)
 				}
 				sink.release <- contextCompactionAwaitResult{
-					Disposition:        contextCompactionAwaitRejected,
-					CanonicalRejection: canonicalContextRejection(second, measured.Measurement.Basis),
+					Disposition: contextCompactionAwaitRejected,
+					Proposal:    compactionFinalizationProposal{RejectReason: event.CompactRejectExecutionFailed},
 				}
 			case <-time.After(2 * time.Second):
 				t.Fatal("automatic attempt did not open after manual rejection")
@@ -528,17 +534,6 @@ func TestLoopAutomaticCompactionRetriesAfterManualOpenedRejection(t *testing.T) 
 				t.Fatalf("primary inference calls = %d, want 1 after both soft rejections", calls)
 			}
 		})
-	}
-}
-
-func canonicalContextRejection(disposition compactionDisposition, basis event.ContextBasis) *event.CompactionRejected {
-	return &event.CompactionRejected{
-		Header:           event.Header{EventID: uuid.UUID{31}, Coordinates: identity.Coordinates{SessionID: uuid.UUID{21}, LoopID: uuid.UUID{22}}},
-		AttemptID:        disposition.Attempt.AttemptID,
-		WaiterCommandIDs: append([]uuid.UUID(nil), disposition.Attempt.WaiterCommandIDs...),
-		Reason:           disposition.Attempt.Reason,
-		Basis:            basis,
-		RejectReason:     event.CompactRejectExecutionFailed,
 	}
 }
 

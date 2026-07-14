@@ -346,70 +346,40 @@ func TestContextTrackerRestoreSuppressesOnlyRecordedAutomaticBasis(t *testing.T)
 	}
 }
 
-func TestValidateCanonicalCompactionRejectionIdentity(t *testing.T) {
+func TestValidateContextCompactionProposal(t *testing.T) {
 	t.Parallel()
 	attemptID := event.CompactAttemptID(uuid.UUID{1})
 	basis := event.ContextBasis{Revision: 3, ThroughEventID: uuid.UUID{3}}
-	valid := event.CompactionRejected{
-		Header: event.Header{
-			EventID:     uuid.UUID{9},
-			Coordinates: identity.Coordinates{SessionID: uuid.UUID{7}, LoopID: uuid.UUID{8}},
-		},
-		AttemptID:        attemptID,
-		WaiterCommandIDs: []uuid.UUID{{2}},
-		Reason:           event.CompactionReasonAutomatic,
-		Basis:            basis,
-		RejectReason:     event.CompactRejectExecutionFailed,
+	automatic := &compactionAttempt{
+		AttemptID: attemptID, WaiterCommandIDs: []uuid.UUID{{2}}, Reason: event.CompactionReasonAutomatic,
+		Basis: basis, StartedAt: time.Now(),
 	}
-	automatic := &compactionAttempt{AttemptID: attemptID, Reason: event.CompactionReasonAutomatic, Basis: basis}
-	manual := &compactionAttempt{AttemptID: attemptID, Reason: event.CompactionReasonManual, Basis: basis}
+	success := &compactionPreparedSuccess{Summary: validFinalizationSummary(), PostContext: validFinalizationMeasurement(8)}
 	tests := []struct {
-		name        string
-		attempt     *compactionAttempt
-		rejection   *event.CompactionRejected
-		wantPresent bool
-		wantExhaust bool
-		wantErr     bool
+		name    string
+		attempt *compactionAttempt
+		result  contextCompactionAwaitResult
+		wantErr bool
 	}{
-		{name: "valid automatic canonical rejection", attempt: automatic, rejection: &valid, wantPresent: true, wantExhaust: true},
-		{name: "zero terminal event id", attempt: automatic, rejection: func() *event.CompactionRejected { value := valid; value.EventID = uuid.UUID{}; return &value }(), wantErr: true},
-		{name: "mismatched attempt id", attempt: automatic, rejection: func() *event.CompactionRejected {
-			value := valid
-			value.AttemptID = event.CompactAttemptID(uuid.UUID{4})
-			return &value
-		}(), wantErr: true},
-		{name: "mismatched opener reason", attempt: automatic, rejection: func() *event.CompactionRejected {
-			value := valid
-			value.Reason = event.CompactionReasonManual
-			return &value
-		}(), wantErr: true},
-		{name: "mismatched attempted basis", attempt: automatic, rejection: func() *event.CompactionRejected {
-			value := valid
-			value.Basis = event.ContextBasis{Revision: 4, ThroughEventID: uuid.UUID{4}}
-			return &value
-		}(), wantErr: true},
-		{name: "manual canonical validates without exhausting", attempt: manual, rejection: func() *event.CompactionRejected {
-			value := valid
-			value.Reason = event.CompactionReasonManual
-			return &value
-		}(), wantPresent: true},
-		{name: "pre-start outcome has no canonical terminal", wantPresent: false},
+		{name: "valid rejection proposal", attempt: automatic, result: contextCompactionAwaitResult{Disposition: contextCompactionAwaitRejected, Proposal: compactionFinalizationProposal{RejectReason: event.CompactRejectExecutionFailed}}},
+		{name: "valid prepared success proposal", attempt: automatic, result: contextCompactionAwaitResult{Disposition: contextCompactionAwaitCommitted, Proposal: compactionFinalizationProposal{Success: success}}},
+		{name: "missing actor attempt", result: contextCompactionAwaitResult{Disposition: contextCompactionAwaitRejected, Proposal: compactionFinalizationProposal{RejectReason: event.CompactRejectExecutionFailed}}, wantErr: true},
+		{name: "unknown disposition", attempt: automatic, result: contextCompactionAwaitResult{Proposal: compactionFinalizationProposal{RejectReason: event.CompactRejectExecutionFailed}}, wantErr: true},
+		{name: "rejected disposition cannot carry success", attempt: automatic, result: contextCompactionAwaitResult{Disposition: contextCompactionAwaitRejected, Proposal: compactionFinalizationProposal{Success: success}}, wantErr: true},
+		{name: "committed disposition cannot carry rejection", attempt: automatic, result: contextCompactionAwaitResult{Disposition: contextCompactionAwaitCommitted, Proposal: compactionFinalizationProposal{RejectReason: event.CompactRejectExecutionFailed}}, wantErr: true},
+		{name: "proposal must carry exactly one outcome", attempt: automatic, result: contextCompactionAwaitResult{Disposition: contextCompactionAwaitRejected}, wantErr: true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, exhaust, err := validateCanonicalCompactionRejection(tt.attempt, tt.rejection)
+			err := validateContextCompactionProposal(tt.attempt, tt.result)
 			if (err != nil) != tt.wantErr {
-				t.Fatalf("validateCanonicalCompactionRejection() error = %T %v, wantErr=%v", err, err, tt.wantErr)
+				t.Fatalf("validateContextCompactionProposal() error = %T %v, wantErr=%v", err, err, tt.wantErr)
 			}
 			if tt.wantErr {
 				var typed *contextCompactionOutcomeError
 				if !errors.As(err, &typed) {
 					t.Fatalf("error = %T %v, want *contextCompactionOutcomeError", err, err)
 				}
-				return
-			}
-			if (got != nil) != tt.wantPresent || exhaust != tt.wantExhaust {
-				t.Fatalf("result present=%v exhaust=%v, want present=%v exhaust=%v", got != nil, exhaust, tt.wantPresent, tt.wantExhaust)
 			}
 		})
 	}

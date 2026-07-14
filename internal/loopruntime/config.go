@@ -136,6 +136,11 @@ type runtimeConfig struct {
 	// exercising the crypto/rand failure branches.
 	idGen idGenerator
 
+	// compactionNow is the actor-private monotonic duration clock. It is separate
+	// from the event Factory's wall clock so EventID/CreatedAt minting and journal
+	// latency cannot move the canonical compaction duration cut point.
+	compactionNow event.Clock
+
 	// now is the clock the loop's event Factory mints CreatedAt from. It is
 	// unexported, so the composition root cannot set it: New defaults it to
 	// time.Now. It exists only as a test seam so a test can pin CreatedAt

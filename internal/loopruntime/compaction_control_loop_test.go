@@ -25,6 +25,35 @@ type recordingCompactionSink struct {
 	coordinateErr error
 }
 
+type oneShotCompactionStartFailurePublisher struct {
+	*recordingPublisher
+	mu     sync.Mutex
+	err    error
+	failed bool
+}
+
+func (p *oneShotCompactionStartFailurePublisher) PublishEventChecked(ctx context.Context, value event.Event) error {
+	p.mu.Lock()
+	if _, started := value.(event.CompactionStarted); started && !p.failed {
+		p.failed = true
+		err := p.err
+		p.mu.Unlock()
+		return err
+	}
+	p.mu.Unlock()
+	return p.recordingPublisher.PublishEventChecked(ctx, value)
+}
+
+type fatalCompactionPublicationError struct{ cause error }
+
+func (e *fatalCompactionPublicationError) Error() string {
+	return "test: fatal publication: " + e.cause.Error()
+}
+func (e *fatalCompactionPublicationError) Unwrap() error { return e.cause }
+func (*fatalCompactionPublicationError) FatalPublication() bool {
+	return true
+}
+
 func newRecordingCompactionSink() *recordingCompactionSink {
 	return &recordingCompactionSink{notify: make(chan struct{}, compactionControlWaiterCapacity+8)}
 }
@@ -332,11 +361,11 @@ func TestLoopCompactionLaneFullOutcome(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			l, rec, sink, sessionID, loopID := newCompactionTestLoop(t, &fakeLLM{})
-			rec.setCheckedError(tt.checkedErr)
 			for i := 0; i < compactionControlWaiterCapacity; i++ {
 				sendCompact(t, l, sessionID, loopID, uuid.UUID{byte(i + 1)}, identity.AgencyMachine)
 			}
 			disposition := awaitCompactionDisposition(t, sink)
+			rec.setCheckedError(tt.checkedErr)
 			overflowID := uuid.UUID{0xff}
 			sendCompact(t, l, sessionID, loopID, overflowID, identity.AgencyUser)
 			syncLoopActor(t, l)
@@ -368,6 +397,76 @@ func TestLoopCompactionLaneFullOutcome(t *testing.T) {
 				if !equalUUIDs(failures[0].WaiterCommandIDs, []uuid.UUID{overflowID}) || !errors.As(failures[0].Err, &coordinationErr) || coordinationErr.Kind != CompactionCoordinationOutcome || !errors.Is(failures[0].Err, errChecked) {
 					t.Fatalf("failure = %+v, want typed outcome failure for overflow command", failures[0])
 				}
+			}
+		})
+	}
+}
+
+func TestLoopCompactionStartPublicationFailureDoesNotInvokeExecutor(t *testing.T) {
+	t.Parallel()
+	startErr := errors.New("start publication failed")
+	tests := []struct {
+		name           string
+		publicationErr error
+		wantTerminal   bool
+		wantFailure    bool
+	}{
+		{name: "recoverable progress failure finalizes canonical rejection", publicationErr: startErr, wantTerminal: true},
+		{name: "fatal journal failure reports infrastructure without false terminal", publicationErr: &fatalCompactionPublicationError{cause: startErr}, wantFailure: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			t.Cleanup(cancel)
+			sessionID, loopID := mustID(t), mustID(t)
+			recorder := &recordingPublisher{}
+			publisher := &oneShotCompactionStartFailurePublisher{recordingPublisher: recorder, err: tt.publicationErr}
+			sink := newRecordingCompactionSink()
+			basis := event.ContextBasis{Revision: 1, ThroughEventID: uuid.UUID{0xc1}}
+			actor, err := newLoopWithSeed(ctx, sessionID, loopID, Provenance{}, publisher, runtimeConfig{
+				Client: &fakeLLM{}, Model: testModel(), DrainTimeout: 200 * time.Millisecond, compactionSink: sink,
+			}, nil, "", &RestoredState{Basis: basis, HasBasis: true})
+			if err != nil {
+				t.Fatalf("newLoopWithSeed() error = %v", err)
+			}
+
+			commandID := uuid.UUID{1}
+			sendCompact(t, actor, sessionID, loopID, commandID, identity.AgencyUser)
+			syncLoopActor(t, actor)
+
+			dispositions, failures := sink.snapshot()
+			if len(dispositions) != 0 {
+				t.Fatalf("executor invocations = %d, want zero before successful CompactionStarted", len(dispositions))
+			}
+			if (len(failures) == 1) != tt.wantFailure {
+				t.Fatalf("infrastructure failures = %d, wantFailure %v", len(failures), tt.wantFailure)
+			}
+			if tt.wantFailure {
+				var coordinationErr *CompactionCoordinationError
+				if !errors.As(failures[0].Err, &coordinationErr) || coordinationErr.Kind != CompactionCoordinationOutcome || !errors.Is(failures[0].Err, startErr) {
+					t.Fatalf("failure = %T %v, want typed coordination failure wrapping start error", failures[0].Err, failures[0].Err)
+				}
+			}
+			var terminalCount, waiterCount int
+			for _, published := range recorder.events() {
+				switch value := published.(type) {
+				case event.CompactionStarted:
+					t.Fatal("failed CompactionStarted was falsely published")
+				case event.CompactionRejected:
+					terminalCount++
+					if value.RejectReason != event.CompactRejectProgressPublication {
+						t.Errorf("reject reason = %v, want ProgressPublication", value.RejectReason)
+					}
+				case event.CompactWaiterRejected:
+					waiterCount++
+				}
+			}
+			if tt.wantTerminal {
+				if terminalCount != 1 || waiterCount != 1 {
+					t.Fatalf("terminal/waiter counts = %d/%d, want exactly 1/1", terminalCount, waiterCount)
+				}
+			} else if terminalCount != 0 || waiterCount != 0 {
+				t.Fatalf("false terminal/waiter counts = %d/%d", terminalCount, waiterCount)
 			}
 		})
 	}
@@ -420,7 +519,7 @@ func TestLoopCompactionAttemptIDFailure(t *testing.T) {
 	}
 }
 
-func TestLoopCompactionSinkFailureNotifiesAllWaitersAndClearsAttempt(t *testing.T) {
+func TestLoopCompactionDirectErrorFinalizesAllWaitersAndClearsAttempt(t *testing.T) {
 	t.Parallel()
 	errSink := errors.New("compaction sink unavailable")
 	tests := []struct {
@@ -457,23 +556,34 @@ func TestLoopCompactionSinkFailureNotifiesAllWaitersAndClearsAttempt(t *testing.
 			}
 			syncLoopActor(t, l)
 			close(blocking.release)
-			failure := awaitCompactionFailure(t, sink)
-			if !equalUUIDs(failure.WaiterCommandIDs, tt.wantWaiters) {
-				t.Fatalf("failure waiters = %v, want %v", failure.WaiterCommandIDs, tt.wantWaiters)
-			}
-			var coordinationErr *CompactionCoordinationError
-			if !errors.As(failure.Err, &coordinationErr) || coordinationErr.Kind != CompactionCoordinationOutcome || !errors.Is(failure.Err, errSink) {
-				t.Fatalf("failure = %T %v, want typed sink infrastructure failure", failure.Err, failure.Err)
-			}
-			_, failures := sink.snapshot()
-			if len(failures) != 1 {
-				t.Fatalf("failure notifications = %d, want exactly one", len(failures))
-			}
-			for _, published := range rec.events() {
-				switch published.(type) {
-				case event.CompactionCommitted, event.CompactionRejected, event.CompactWaiterResolved, event.CompactWaiterRejected:
-					t.Fatalf("published false durable outcome %T", published)
+			blockUntilEvents(t, rec, func(events []event.Event) bool {
+				for _, published := range events {
+					if _, ok := published.(event.CompactionRejected); ok {
+						return true
+					}
 				}
+				return false
+			})
+			_, failures := sink.snapshot()
+			if len(failures) != 0 {
+				t.Fatalf("failure notifications = %d, want canonical rejection instead", len(failures))
+			}
+			var rejection *event.CompactionRejected
+			var waiterRejects int
+			for _, published := range rec.events() {
+				switch value := published.(type) {
+				case event.CompactionRejected:
+					copyOfValue := value
+					rejection = &copyOfValue
+				case event.CompactWaiterRejected:
+					waiterRejects++
+				}
+			}
+			if rejection == nil || rejection.RejectReason != event.CompactRejectExecutionFailed || !equalUUIDs(rejection.WaiterCommandIDs, tt.wantWaiters) {
+				t.Fatalf("rejection = %+v, want execution-failed canonical waiter set %v", rejection, tt.wantWaiters)
+			}
+			if waiterRejects != len(tt.wantWaiters) {
+				t.Fatalf("waiter rejections = %d, want %d", waiterRejects, len(tt.wantWaiters))
 			}
 			if _, ok := drainToTerminal(t, rec).(event.TurnDone); !ok {
 				t.Fatal("turn terminal != TurnDone")
@@ -499,11 +609,12 @@ func newCompactionTestLoopWithTools(t *testing.T, client inference.Client, tools
 	sessionID, loopID := mustID(t), mustID(t)
 	rec := &recordingPublisher{}
 	sink := newRecordingCompactionSink()
-	l, err := newWithConfig(ctx, sessionID, loopID, Provenance{}, rec, runtimeConfig{
+	basis := event.ContextBasis{Revision: 1, ThroughEventID: uuid.UUID{0xb1}}
+	l, err := newLoopWithSeed(ctx, sessionID, loopID, Provenance{}, rec, runtimeConfig{
 		Client: client, Model: testModel(), Tools: tools, DrainTimeout: 200 * time.Millisecond, compactionSink: sink,
-	})
+	}, nil, "", &RestoredState{Basis: basis, HasBasis: true})
 	if err != nil {
-		t.Fatalf("newWithConfig: %v", err)
+		t.Fatalf("newLoopWithSeed: %v", err)
 	}
 	return l, rec, sink, sessionID, loopID
 }
@@ -553,23 +664,6 @@ func awaitCompactionDispositionCount(t *testing.T, sink *recordingCompactionSink
 		case <-deadline:
 			t.Fatalf("timed out waiting for %d compaction dispositions", count)
 			return compactionDisposition{}
-		}
-	}
-}
-
-func awaitCompactionFailure(t *testing.T, sink *recordingCompactionSink) compactionFailure {
-	t.Helper()
-	deadline := time.After(2 * time.Second)
-	for {
-		_, failures := sink.snapshot()
-		if len(failures) > 0 {
-			return failures[0]
-		}
-		select {
-		case <-sink.notify:
-		case <-deadline:
-			t.Fatal("timed out waiting for compaction failure")
-			return compactionFailure{}
 		}
 	}
 }
