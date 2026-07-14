@@ -702,10 +702,31 @@ Commit: `feat(loopruntime): measure and admit request context`.
 - Create: `internal/sessionruntime/compaction_adapter.go`, tests
 - Create: `internal/loopruntime/compaction.go`, tests
 
-**RED:** versioned input/output JSON, unknown fields, exact basis, one text
-result, strict XML root/order/children, attributes/comments/directives/wrappers/
-trailing/nested/empty/oversize rejection, validator before completed audit, and
-no generic runner exposure.
+**RED:** Define public `CompactionInput`/`CompactionOutput`, typed input fields and
+errors, `CompactionWireVersion` with only v1, and the closed
+`InvalidSummaryReason`/error set from the token design. The strict adapter-owned
+lower-snake JSON input carries basis, model, canonical lowercase-hex request
+fingerprint, typed transcript, and summary budget; output echoes the exact
+identity and carries XML in `summary`. Reject unknown/missing/wrongly typed
+fields, wrong version, noncanonical fingerprints, trailing JSON, invalid input
+domain values, and output identity drift.
+
+Prove the hustle produces exactly one non-empty assistant text block before the
+adapter callback. Before any `HustleCompleted` or product finalizer success, check
+the registered descriptor `OutputBytes`, require normalized non-nil usage with
+non-zero `OutputTokens`, conservatively enforce the whole JSON envelope against
+`MaxSummaryTokens`, then validate the strict XML root/order/children grammar.
+Reject attributes/comments/directives/wrappers/trailing/nested/empty required
+sections and every duplicate/unknown/missing/out-of-order child with the bounded
+reason mapping. Preserve escaped character data. Define
+`SummaryTooLargeError{Measurement}` now but reserve it for Task 26's
+post-replacement complete-request count. Expose only a typed compactor to
+loopruntime; no generic runner or public arbitrary hustle execution surface.
+
+Fuzz both external JSON and XML parsers for 30 seconds. Validator/domain checks
+must precede completed audit and product commit. The adapter preserves the
+current-loop hustle inference boundary and exact attempt basis/model/fingerprint
+identity; Task 26 owns actor finalization and context replacement.
 
 Commit: `feat(compaction): add typed hustle adapter`.
 

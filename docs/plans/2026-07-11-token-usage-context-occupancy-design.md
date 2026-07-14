@@ -1219,14 +1219,31 @@ test results, and workspace state; unresolved questions; and concrete next actio
 Do not invent facts. Omit credentials, API keys, access tokens, private keys,
 authentication material, and unnecessary personal data.
 
-Return only one XML value with this exact structure and order, with no attributes,
-comments, code fence, preamble, or trailing text:
-<conversation_summary><goal>...</goal><constraints>...</constraints><decisions>...</decisions><state>...</state><open_items>...</open_items></conversation_summary>
+Return only one JSON object with exactly these fields, no markdown, preamble, or
+trailing JSON. Copy version, basis, model, and request_fingerprint exactly from
+the input, and place the summary XML in the JSON summary string:
+{"version":1,"basis":<exact input basis>,"model":<exact input model>,"request_fingerprint":"<exact input fingerprint>","summary":"<conversation_summary><goal>...</goal><constraints>...</constraints><decisions>...</decisions><state>...</state><open_items>...</open_items></conversation_summary>"}
 
 Escape XML metacharacters inside section text. Keep goal and state non-empty. Use
 an empty allowed section when there are no facts for that section. Stay within the
 supplied summary budget.
 ```
+
+The v1 adapter accepts only the named `uint8` wire version value 1 and strict
+lower-snake input/output objects. The input carries exact
+`{Basis,Model,RequestFingerprint}`, the complete typed transcript, and
+`MaxSummaryTokens`; the output must echo that identity byte-for-byte in canonical
+form before its XML is considered. Fingerprints are exactly 64 lowercase hex
+characters. Both directions reject unknown/missing/wrongly typed fields and
+trailing JSON values.
+
+The raw response byte cap comes from the bound hustle descriptor's `OutputBytes`
+and is checked before JSON or XML parsing. The summary generation budget uses
+normalized `hustle.Result.Usage.OutputTokens`: usage must be present and the
+output count non-zero, and the entire JSON envelope is conservatively charged
+against `MaxSummaryTokens`. This is distinct from Task 26's post-replacement
+complete-request count; only that later check returns
+`SummaryTooLargeError{Measurement}`.
 
 `PromptRevision` changes when these instructions change; `ParserRevision`
 changes when the accepted XML grammar or rendering changes. Both enter the
@@ -1579,6 +1596,17 @@ latest-value state, never as cumulative usage.
 - command validation/routing errors for missing coordinates or invalid agency.
 
 All errors unwrap their cause when applicable.
+
+`InvalidSummaryReason` is a closed string set: `wire`, `identity`,
+`output_shape`, `byte_limit`, `token_usage`, `token_limit`, `xml_syntax`,
+`xml_root`, `xml_structure`, and `xml_content`; zero and unknown values are
+invalid. `InvalidSummaryError` never includes raw output or transcript data.
+Root-name failures map to `xml_root`; attributes, comments, directives, wrapper
+or trailing values, missing/duplicate/unknown/out-of-order children, and nested
+elements map to `xml_structure` (malformed XML maps to `xml_syntax`); empty
+trimmed goal or state maps to `xml_content`. `SummaryTooLargeError` is defined
+with the domain now but reserved for the Task 26 complete-request hard-limit
+check, not the isolated hustle output-token budget.
 
 Before every primary inference the runtime counts the complete candidate request
 under the configured exact timeout. Count failure, timeout, or cancellation ends

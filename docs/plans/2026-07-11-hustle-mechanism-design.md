@@ -324,6 +324,50 @@ type Compactor interface {
 }
 ```
 
+The compaction domain contract is public data, while its transport remains owned
+by the focused session adapter:
+
+```go
+type CompactionInput struct {
+	Basis              event.ContextBasis
+	Model              inference.ModelKey
+	RequestFingerprint [32]byte
+	Transcript         content.AgenticMessages
+	MaxSummaryTokens   content.TokenCount
+}
+
+type CompactionOutput struct {
+	Basis              event.ContextBasis
+	Model              inference.ModelKey
+	RequestFingerprint [32]byte
+	Summary            *content.UserMessage
+}
+```
+
+The adapter's only accepted wire version is the named `uint8` value
+`CompactionWireV1(1)`. Its strict lower-snake JSON forms are:
+
+```json
+{"version":1,"basis":{},"model":{"provider":"...","model":"..."},"request_fingerprint":"<64 lowercase hex>","transcript":[],"max_summary_tokens":4096}
+{"version":1,"basis":{},"model":{"provider":"...","model":"..."},"request_fingerprint":"<64 lowercase hex>","summary":"<conversation_summary>...</conversation_summary>"}
+```
+
+Both codecs use `DisallowUnknownFields`, require exactly one JSON value, reject
+missing or wrongly typed fields, and accept only canonical lowercase fingerprint
+hex. The output must echo the exact input basis, model, and request fingerprint
+before summary parsing. Input domain validation requires a valid non-zero basis,
+valid model and fingerprint, a non-empty structurally marshalable transcript,
+and non-zero summary budget; failures are typed
+`CompactionInputError{Field,Cause}`.
+
+The generic runtime already requires exactly one non-empty assistant text block.
+The compaction adapter additionally checks its registered descriptor's raw
+`OutputBytes` before JSON/XML parsing. It requires normalized non-nil usage with
+non-zero `OutputTokens`, and conservatively charges the entire JSON response
+envelope against `MaxSummaryTokens`; a larger value fails before success audit.
+It does not expose the runner, reuse `ContextCounter`, or invent an isolated
+tokenizer contract.
+
 There is no public `Hustle[In, Out]`, no `map[string]any`, and no arbitrary
 `Session.RunHustle`. The concrete adapter owns:
 
