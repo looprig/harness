@@ -1238,11 +1238,13 @@ characters. Both directions reject unknown/missing/wrongly typed fields and
 trailing JSON values.
 
 The raw response byte cap comes from the bound hustle descriptor's `OutputBytes`
-and is checked before JSON or XML parsing. The summary generation budget uses
-normalized `hustle.Result.Usage.OutputTokens`: usage must be present and the
-output count non-zero, and the entire JSON envelope is conservatively charged
-against `MaxSummaryTokens`. This is distinct from Task 26's post-replacement
-complete-request count; only that later check returns
+and bounds the full JSON output envelope, whose `summary` string contains XML.
+The generic runtime checks it before the adapter receives output; the adapter
+may defensively recheck already-valid bytes before JSON or XML parsing. The
+summary generation budget uses normalized `hustle.Result.Usage.OutputTokens`:
+usage must be present and the output count non-zero, and the entire JSON envelope
+is conservatively charged against `MaxSummaryTokens`. This is distinct from Task
+26's post-replacement complete-request count; only that later check returns
 `SummaryTooLargeError{Measurement}`.
 
 `PromptRevision` changes when these instructions change; `ParserRevision`
@@ -1553,7 +1555,7 @@ deterministic complete-request estimator, and these explicit values:
 | `CountTimeout` | `2s` | deadline for building/counting the complete next request |
 | hustle timeout | `90s` | separate deadline for the one LLM compaction call |
 | hustle input limit | `2 MiB` | bounds versioned transcript JSON |
-| hustle output limit | `64 KiB` | bounds XML before parsing/token validation |
+| hustle output limit | `64 KiB` | bounds the full JSON output envelope before adapter parsing/token validation |
 
 The two-second count timeout is not an inference timeout. SWE's estimator is
 in-process and normally completes in milliseconds; the deadline prevents a
@@ -1607,6 +1609,14 @@ elements map to `xml_structure` (malformed XML maps to `xml_syntax`); empty
 trimmed goal or state maps to `xml_content`. `SummaryTooLargeError` is defined
 with the domain now but reserved for the Task 26 complete-request hard-limit
 check, not the isolated hustle output-token budget.
+
+Generic hustle free-text extraction reports a bounded `OutputFailureReason` in
+the fixed order shape → empty text → full-envelope byte cap → JSON validity.
+`invalid_shape`/`empty_text` map to summary `output_shape`, `too_large` maps to
+`byte_limit`, and `invalid_json` maps to `wire`. These failures occur before the
+adapter validation callback, so the adapter maps them from the typed run outcome
+before caller product finalization; neither raw invalid output nor a generic
+runner reaches loopruntime.
 
 Before every primary inference the runtime counts the complete candidate request
 under the configured exact timeout. Count failure, timeout, or cancellation ends

@@ -701,6 +701,7 @@ Commit: `feat(loopruntime): measure and admit request context`.
 - Create: `pkg/loop/compaction.go`, tests
 - Create: `internal/sessionruntime/compaction_adapter.go`, tests
 - Create: `internal/loopruntime/compaction.go`, tests
+- Modify: `internal/hustleruntime/errors.go`, `execution.go`, and focused tests
 
 **RED:** Define public `CompactionInput`/`CompactionOutput`, typed input fields and
 errors, `CompactionWireVersion` with only v1, and the closed
@@ -711,17 +712,27 @@ identity and carries XML in `summary`. Reject unknown/missing/wrongly typed
 fields, wrong version, noncanonical fingerprints, trailing JSON, invalid input
 domain values, and output identity drift.
 
-Prove the hustle produces exactly one non-empty assistant text block before the
-adapter callback. Before any `HustleCompleted` or product finalizer success, check
-the registered descriptor `OutputBytes`, require normalized non-nil usage with
-non-zero `OutputTokens`, conservatively enforce the whole JSON envelope against
-`MaxSummaryTokens`, then validate the strict XML root/order/children grammar.
+First pin the generic runtime's closed `OutputFailureReason`: `invalid_shape`,
+`empty_text`, `too_large`, and `invalid_json`, evaluated in that order and never
+carrying raw output. Prove zero/multiple/non-text/wrong-role results map to shape,
+empty text maps independently, the registered descriptor `OutputBytes` bounds
+the full JSON envelope, and invalid JSON remains distinct. The adapter maps
+shape/empty to summary `output_shape`, too-large to `byte_limit`, and invalid JSON
+to `wire` from the typed run outcome before caller product finalization.
+
+Before any `HustleCompleted` or product finalizer success, require normalized
+non-nil usage with non-zero `OutputTokens`, conservatively enforce the whole JSON
+envelope against `MaxSummaryTokens`, then validate the strict XML
+root/order/children grammar.
 Reject attributes/comments/directives/wrappers/trailing/nested/empty required
 sections and every duplicate/unknown/missing/out-of-order child with the bounded
 reason mapping. Preserve escaped character data. Define
 `SummaryTooLargeError{Measurement}` now but reserve it for Task 26's
 post-replacement complete-request count. Expose only a typed compactor to
 loopruntime; no generic runner or public arbitrary hustle execution surface.
+The adapter callback only receives generically valid bounded JSON; a descriptor
+byte-cap check there is defensive and must not imply oversized raw output crosses
+the runtime boundary.
 
 Fuzz both external JSON and XML parsers for 30 seconds. Validator/domain checks
 must precede completed audit and product commit. The adapter preserves the

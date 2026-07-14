@@ -348,8 +348,8 @@ The adapter's only accepted wire version is the named `uint8` value
 `CompactionWireV1(1)`. Its strict lower-snake JSON forms are:
 
 ```json
-{"version":1,"basis":{},"model":{"provider":"...","model":"..."},"request_fingerprint":"<64 lowercase hex>","transcript":[],"max_summary_tokens":4096}
-{"version":1,"basis":{},"model":{"provider":"...","model":"..."},"request_fingerprint":"<64 lowercase hex>","summary":"<conversation_summary>...</conversation_summary>"}
+{"version":1,"basis":{"revision":1,"through_event_id":"00000000-0000-0000-0000-000000000001"},"model":{"provider":"openai","model":"gpt-5"},"request_fingerprint":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","transcript":[{"role":"user","blocks":[{"type":"text","text":"continue the task"}]}],"max_summary_tokens":4096}
+{"version":1,"basis":{"revision":1,"through_event_id":"00000000-0000-0000-0000-000000000001"},"model":{"provider":"openai","model":"gpt-5"},"request_fingerprint":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","summary":"<conversation_summary><goal>continue the task</goal><constraints></constraints><decisions></decisions><state>implementation pending</state><open_items></open_items></conversation_summary>"}
 ```
 
 Both codecs use `DisallowUnknownFields`, require exactly one JSON value, reject
@@ -360,11 +360,13 @@ valid model and fingerprint, a non-empty structurally marshalable transcript,
 and non-zero summary budget; failures are typed
 `CompactionInputError{Field,Cause}`.
 
-The generic runtime already requires exactly one non-empty assistant text block.
-The compaction adapter additionally checks its registered descriptor's raw
-`OutputBytes` before JSON/XML parsing. It requires normalized non-nil usage with
-non-zero `OutputTokens`, and conservatively charges the entire JSON response
-envelope against `MaxSummaryTokens`; a larger value fails before success audit.
+The generic runtime already requires exactly one non-empty assistant text block
+and rejects an oversized full JSON envelope before the adapter callback. The
+compaction adapter may defensively recheck its registered descriptor's raw
+`OutputBytes` for already-valid output before JSON/XML parsing. It requires
+normalized non-nil usage with non-zero `OutputTokens`, and conservatively charges
+the entire JSON response envelope against `MaxSummaryTokens`; a larger value
+fails before success audit.
 It does not expose the runner, reuse `ContextCounter`, or invent an isolated
 tokenizer contract.
 
@@ -840,6 +842,32 @@ Free-text definitions require exactly one assistant text result. Structured
 definitions use `inference.DecodeOutput` from the structured-output design.
 Mixed prose/tool output, empty output, unexpected tools, multiple candidate
 values, unknown JSON fields, invalid enums, or an oversized result fail closed.
+
+Generic free-text extraction exposes only a bounded typed reason:
+
+```go
+type OutputFailureReason string
+
+const (
+	OutputFailureInvalidShape OutputFailureReason = "invalid_shape"
+	OutputFailureEmptyText    OutputFailureReason = "empty_text"
+	OutputFailureTooLarge     OutputFailureReason = "too_large"
+	OutputFailureInvalidJSON  OutputFailureReason = "invalid_json"
+)
+
+type OutputError struct {
+	Reason OutputFailureReason
+}
+```
+
+The closed validation order is shape (nil response/message, wrong role, block
+count, or non-text block), empty text, full-envelope byte cap, then JSON
+validity. `OutputError` never includes raw model output. A focused adapter maps
+`invalid_shape` and `empty_text` to compaction `output_shape`, `too_large` to
+`byte_limit`, and `invalid_json` to `wire` before product finalization. A valid
+JSON result proceeds to the adapter validation callback, whose typed domain
+error remains the cause of the failed run; no raw runner capability or invalid
+output bytes cross that boundary.
 
 The adapter performs the final domain validation. For compaction, the output is
 one bounded summary string. It is later stored as data-only conversation context
