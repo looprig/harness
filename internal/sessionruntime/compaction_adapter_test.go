@@ -175,6 +175,7 @@ func TestCompactionOutputWireRejectsMalformedValues(t *testing.T) {
 	input := validCompactionInput(t)
 	valid := validCompactionOutputJSON(t, input, validCompactionXML)
 	upper := strings.ToUpper(hex.EncodeToString(input.RequestFingerprint[:]))
+	uppercaseEventID := strings.ToUpper(input.Basis.ThroughEventID.String())
 	tests := []struct {
 		name       string
 		raw        string
@@ -186,6 +187,7 @@ func TestCompactionOutputWireRejectsMalformedValues(t *testing.T) {
 		{name: "version wrong type", raw: replaceCompactionJSON(t, valid, "version", json.RawMessage(`"1"`)), wantReason: loop.InvalidSummaryWire},
 		{name: "missing basis", raw: removeCompactionJSON(t, valid, "basis"), wantReason: loop.InvalidSummaryWire},
 		{name: "basis unknown field", raw: replaceCompactionJSON(t, valid, "basis", json.RawMessage(`{"revision":3,"through_event_id":"00000000-0000-4000-8000-000000000001","extra":true}`)), wantReason: loop.InvalidSummaryWire},
+		{name: "uppercase through event id", raw: replaceCompactionJSON(t, valid, "basis", compactionBasisJSON(t, input.Basis.Revision, uppercaseEventID)), wantReason: loop.InvalidSummaryWire},
 		{name: "missing model", raw: removeCompactionJSON(t, valid, "model"), wantReason: loop.InvalidSummaryWire},
 		{name: "model unknown field", raw: replaceCompactionJSON(t, valid, "model", json.RawMessage(`{"provider":"provider","model":"model","extra":true}`)), wantReason: loop.InvalidSummaryWire},
 		{name: "missing fingerprint", raw: removeCompactionJSON(t, valid, "request_fingerprint"), wantReason: loop.InvalidSummaryWire},
@@ -206,6 +208,19 @@ func TestCompactionOutputWireRejectsMalformedValues(t *testing.T) {
 			}
 		})
 	}
+}
+
+func compactionBasisJSON(t *testing.T, revision event.ContextRevision, throughEventID string) json.RawMessage {
+	t.Helper()
+	wire := struct {
+		Revision       event.ContextRevision `json:"revision"`
+		ThroughEventID string                `json:"through_event_id"`
+	}{Revision: revision, ThroughEventID: throughEventID}
+	raw, err := json.Marshal(wire)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return raw
 }
 
 func TestNewCompactionAdapterRejectsInvalidConfiguration(t *testing.T) {

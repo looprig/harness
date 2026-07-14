@@ -42,6 +42,9 @@ type Compactor interface {
 // ParseCompactionSummaryXML validates and wraps the exact replacement grammar.
 // It preserves the original escaped XML bytes in the returned user text block.
 func ParseCompactionSummaryXML(raw []byte) (*content.UserMessage, error) {
+	if bytes.Contains(raw, []byte("<![CDATA[")) {
+		return nil, invalidCompactionXML(loop.InvalidSummaryXMLStructure, nil)
+	}
 	parser := compactionXMLParser{decoder: xml.NewDecoder(bytes.NewReader(raw))}
 	if err := parser.parse(); err != nil {
 		return nil, err

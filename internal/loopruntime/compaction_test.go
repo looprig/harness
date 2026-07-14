@@ -29,6 +29,7 @@ func TestParseCompactionSummaryXML(t *testing.T) {
 		{name: "comment in root", raw: `<conversation_summary><!--x--><goal>x</goal><constraints/><decisions/><state>y</state><open_items/></conversation_summary>`, wantReason: loop.InvalidSummaryXMLStructure},
 		{name: "directive", raw: `<!DOCTYPE conversation_summary>` + valid, wantReason: loop.InvalidSummaryXMLStructure},
 		{name: "processing instruction", raw: `<?xml version="1.0"?>` + valid, wantReason: loop.InvalidSummaryXMLStructure},
+		{name: "cdata", raw: `<conversation_summary><goal><![CDATA[ship safely]]></goal><constraints/><decisions/><state>ready</state><open_items/></conversation_summary>`, wantReason: loop.InvalidSummaryXMLStructure},
 		{name: "missing child", raw: `<conversation_summary><goal>x</goal><constraints/><decisions/><state>y</state></conversation_summary>`, wantReason: loop.InvalidSummaryXMLStructure},
 		{name: "duplicate child", raw: `<conversation_summary><goal>x</goal><constraints/><decisions/><state>y</state><state>again</state><open_items/></conversation_summary>`, wantReason: loop.InvalidSummaryXMLStructure},
 		{name: "unknown child", raw: `<conversation_summary><goal>x</goal><constraints/><unknown/><state>y</state><open_items/></conversation_summary>`, wantReason: loop.InvalidSummaryXMLStructure},

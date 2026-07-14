@@ -156,7 +156,7 @@ type compactionInputDecodeWire struct {
 
 type compactionBasisDecodeWire struct {
 	Revision       *event.ContextRevision `json:"revision"`
-	ThroughEventID *uuid.UUID             `json:"through_event_id"`
+	ThroughEventID *string                `json:"through_event_id"`
 }
 
 type compactionModelDecodeWire struct {
@@ -205,8 +205,12 @@ func unmarshalCompactionInput(raw []byte) (loop.CompactionInput, error) {
 	if err != nil {
 		return loop.CompactionInput{}, &loop.CompactionInputError{Field: loop.CompactionInputFieldTranscript, Cause: err}
 	}
+	throughEventID, err := decodeCompactionUUID(*wire.Basis.ThroughEventID)
+	if err != nil {
+		return loop.CompactionInput{}, &loop.CompactionInputError{Field: loop.CompactionInputFieldBasis, Cause: err}
+	}
 	input := loop.CompactionInput{
-		Basis:              event.ContextBasis{Revision: *wire.Basis.Revision, ThroughEventID: *wire.Basis.ThroughEventID},
+		Basis:              event.ContextBasis{Revision: *wire.Basis.Revision, ThroughEventID: throughEventID},
 		Model:              inference.ModelKey{Provider: *wire.Model.Provider, Model: *wire.Model.Model},
 		RequestFingerprint: fingerprint, Transcript: transcript, MaxSummaryTokens: *wire.MaxSummaryTokens,
 	}
@@ -238,11 +242,11 @@ func validateCompactionResult(result hustle.Result, input loop.CompactionInput, 
 	if err := validateCompactionUsage(result.Usage, input.MaxSummaryTokens); err != nil {
 		return nil, err
 	}
-	wire, fingerprint, err := decodeCompactionOutput(result.Output)
+	wire, throughEventID, fingerprint, err := decodeCompactionOutput(result.Output)
 	if err != nil {
 		return nil, err
 	}
-	if err := validateCompactionOutputIdentity(wire, fingerprint, input); err != nil {
+	if err := validateCompactionOutputIdentity(wire, throughEventID, fingerprint, input); err != nil {
 		return nil, err
 	}
 	summary, err := loopruntime.ParseCompactionSummaryXML([]byte(*wire.Summary))
@@ -269,29 +273,47 @@ func validateCompactionUsage(usage *content.Usage, maximum content.TokenCount) e
 	return nil
 }
 
-func decodeCompactionOutput(raw json.RawMessage) (compactionOutputDecodeWire, [32]byte, error) {
+func decodeCompactionOutput(raw json.RawMessage) (compactionOutputDecodeWire, uuid.UUID, [32]byte, error) {
 	var wire compactionOutputDecodeWire
 	if err := decodeStrictJSON(raw, &wire); err != nil {
-		return wire, [32]byte{}, &loop.InvalidSummaryError{Reason: loop.InvalidSummaryWire, Cause: err}
+		return wire, uuid.UUID{}, [32]byte{}, &loop.InvalidSummaryError{Reason: loop.InvalidSummaryWire, Cause: err}
 	}
 	if wire.Version == nil || *wire.Version != loop.CompactionWireV1 || wire.Basis == nil || wire.Model == nil ||
 		wire.RequestFingerprint == nil || wire.Summary == nil || wire.Basis.Revision == nil ||
 		wire.Basis.ThroughEventID == nil || wire.Model.Provider == nil || wire.Model.Model == nil {
-		return wire, [32]byte{}, &loop.InvalidSummaryError{Reason: loop.InvalidSummaryWire}
+		return wire, uuid.UUID{}, [32]byte{}, &loop.InvalidSummaryError{Reason: loop.InvalidSummaryWire}
+	}
+	throughEventID, err := decodeCompactionUUID(*wire.Basis.ThroughEventID)
+	if err != nil {
+		return wire, uuid.UUID{}, [32]byte{}, &loop.InvalidSummaryError{Reason: loop.InvalidSummaryWire, Cause: err}
 	}
 	fingerprint, err := decodeCompactionFingerprint(*wire.RequestFingerprint)
 	if err != nil {
-		return wire, [32]byte{}, &loop.InvalidSummaryError{Reason: loop.InvalidSummaryWire, Cause: err}
+		return wire, uuid.UUID{}, [32]byte{}, &loop.InvalidSummaryError{Reason: loop.InvalidSummaryWire, Cause: err}
 	}
-	return wire, fingerprint, nil
+	return wire, throughEventID, fingerprint, nil
 }
 
-func validateCompactionOutputIdentity(wire compactionOutputDecodeWire, fingerprint [32]byte, input loop.CompactionInput) error {
-	if *wire.Basis.Revision != input.Basis.Revision || *wire.Basis.ThroughEventID != input.Basis.ThroughEventID ||
+func validateCompactionOutputIdentity(wire compactionOutputDecodeWire, throughEventID uuid.UUID, fingerprint [32]byte, input loop.CompactionInput) error {
+	if *wire.Basis.Revision != input.Basis.Revision || throughEventID != input.Basis.ThroughEventID ||
 		*wire.Model.Provider != input.Model.Provider || *wire.Model.Model != input.Model.Model || fingerprint != input.RequestFingerprint {
 		return &loop.InvalidSummaryError{Reason: loop.InvalidSummaryIdentity}
 	}
 	return nil
+}
+
+func decodeCompactionUUID(encoded string) (uuid.UUID, error) {
+	decoded, err := uuid.Parse(encoded)
+	if err != nil || decoded.String() != encoded {
+		return uuid.UUID{}, &compactionUUIDError{}
+	}
+	return decoded, nil
+}
+
+type compactionUUIDError struct{}
+
+func (*compactionUUIDError) Error() string {
+	return "sessionruntime: noncanonical compaction UUID"
 }
 
 func decodeStrictJSON(raw []byte, destination interface{}) error {
