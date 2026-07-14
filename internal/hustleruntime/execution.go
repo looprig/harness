@@ -28,6 +28,7 @@ type runtimeController struct {
 	audit               AuditPublisher
 	faults              FaultReporter
 	activity            ActivityTracker
+	finalizerContext    FinalizerContextDecorator
 	after               func(time.Duration) <-chan time.Time
 	newExecutionContext func(context.Context, time.Duration) (context.Context, context.CancelFunc)
 }
@@ -60,6 +61,9 @@ func newRuntimeController(sessionCtx context.Context, config RuntimeConfig) (*ru
 	if config.Activity == nil || nilRuntimeValue(reflect.ValueOf(config.Activity)) {
 		return nil, &ConfigError{Reason: ConfigMissingCollaborator, Field: "runtime.activity"}
 	}
+	if config.FinalizerContext != nil && nilRuntimeValue(reflect.ValueOf(config.FinalizerContext)) {
+		return nil, &ConfigError{Reason: ConfigMissingCollaborator, Field: "runtime.finalizer_context"}
+	}
 	definitions := make(map[hustle.Name]hustle.BoundDefinition, len(config.Definitions))
 	for _, definition := range config.Definitions {
 		if definition == nil || nilRuntimeValue(reflect.ValueOf(definition)) || definition.Name() == "" {
@@ -76,7 +80,8 @@ func newRuntimeController(sessionCtx context.Context, config RuntimeConfig) (*ru
 		executionCtx: executionCtx, cancelExecutions: cancelExecutions,
 		auditTimeout: config.AuditTimeout, finalizationTimeout: config.FinalizationTimeout,
 		workerDrainTimeout: config.WorkerDrainTimeout, stamper: config.Stamper,
-		audit: config.Audit, faults: config.Faults, activity: config.Activity, after: time.After,
+		audit: config.Audit, faults: config.Faults, activity: config.Activity,
+		finalizerContext: config.FinalizerContext, after: time.After,
 	}
 	runtime.newExecutionContext = runtime.executionContextWithTimeout
 	return runtime, nil
@@ -357,7 +362,11 @@ func (r *runtimeController) newAuditContext() (context.Context, context.CancelFu
 }
 
 func (r *runtimeController) newFinalizationContext() (context.Context, context.CancelFunc) {
-	return context.WithTimeout(context.WithoutCancel(r.sessionCtx), r.finalizationTimeout)
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.sessionCtx), r.finalizationTimeout)
+	if r.finalizerContext != nil {
+		ctx = r.finalizerContext.DecorateFinalizerContext(ctx)
+	}
+	return ctx, cancel
 }
 
 func (r *runtimeController) executionContextWithTimeout(caller context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {

@@ -44,6 +44,7 @@ type RuntimeConfig struct {
 	Audit               AuditPublisher
 	Faults              FaultReporter
 	Activity            ActivityTracker
+	FinalizerContext    FinalizerContextDecorator
 }
 
 // HeaderStamper mints the identity fields of one internal lifecycle event.
@@ -69,6 +70,13 @@ type ActivityTracker interface {
 // ActivityLease retains blocking activity through finalization.
 type ActivityLease interface {
 	Release(context.Context) error
+}
+
+// FinalizerContextDecorator adds consumer-owned, non-capability metadata to the
+// trusted finalizer context. The runtime never receives the consumer object that
+// interprets the marker.
+type FinalizerContextDecorator interface {
+	DecorateFinalizerContext(context.Context) context.Context
 }
 
 // ValidateResult performs consumer-owned decoding and domain validation before

@@ -29,6 +29,12 @@ func validRuntimeConfig(t *testing.T, definition hustle.BoundDefinition) Runtime
 	}
 }
 
+type runtimeTestFinalizerContext struct{}
+
+func (*runtimeTestFinalizerContext) DecorateFinalizerContext(ctx context.Context) context.Context {
+	return ctx
+}
+
 func TestNewValidatesRuntimeConfig(t *testing.T) {
 	t.Parallel()
 	client := successfulRuntimeClient(nil)
@@ -55,6 +61,7 @@ func TestNewValidatesRuntimeConfig(t *testing.T) {
 		{name: "typed nil faults", mutate: func(config *RuntimeConfig) { config.Faults = (*runtimeTestFaults)(nil) }, wantReason: ConfigMissingCollaborator, wantField: "runtime.faults"},
 		{name: "nil activity", mutate: func(config *RuntimeConfig) { config.Activity = nil }, wantReason: ConfigMissingCollaborator, wantField: "runtime.activity"},
 		{name: "typed nil activity", mutate: func(config *RuntimeConfig) { config.Activity = (*runtimeTestActivity)(nil) }, wantReason: ConfigMissingCollaborator, wantField: "runtime.activity"},
+		{name: "typed nil finalizer context", mutate: func(config *RuntimeConfig) { config.FinalizerContext = (*runtimeTestFinalizerContext)(nil) }, wantReason: ConfigMissingCollaborator, wantField: "runtime.finalizer_context"},
 	}
 	for _, tt := range tests {
 		testCase := tt

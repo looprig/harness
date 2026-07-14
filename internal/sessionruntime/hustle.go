@@ -143,6 +143,33 @@ func (r sessionHustleFaultReporter) ReportFault(_ context.Context, cause error) 
 	r.session.latchSessionFault(cause)
 }
 
+type hustleFinalizerContextKey struct{}
+
+type sessionHustleFinalizerContext struct{ session *Session }
+
+func (d sessionHustleFinalizerContext) DecorateFinalizerContext(ctx context.Context) context.Context {
+	return context.WithValue(ctx, hustleFinalizerContextKey{}, d.session)
+}
+
+// HustleShutdownReentryError refuses the structurally circular operation in
+// which a session-owned finalizer synchronously waits for the shutdown that is
+// itself waiting for that finalizer. Domain adapters receive focused product
+// capabilities, never a generic Session; the private marker is defense in depth
+// at the trusted callback boundary.
+type HustleShutdownReentryError struct{}
+
+func (*HustleShutdownReentryError) Error() string {
+	return "session: hustle finalizer cannot synchronously shut down its owning session"
+}
+
+func hustleFinalizerOwnsSession(ctx context.Context, session *Session) bool {
+	if ctx == nil || session == nil {
+		return false
+	}
+	owner, ok := ctx.Value(hustleFinalizerContextKey{}).(*Session)
+	return ok && owner == session
+}
+
 func withSessionHustles(definitions []hustle.Definition, limits HustleLimits) Option {
 	captured := append([]hustle.Definition(nil), definitions...)
 	return func(s *Session) {
@@ -208,7 +235,8 @@ func (s *Session) newHustleController(bound []hustle.BoundDefinition) (*hustleru
 			AuditTimeout: s.hustleLimits.AuditTimeout, FinalizationTimeout: s.hustleLimits.FinalizationTimeout,
 			WorkerDrainTimeout: s.hustleLimits.WorkerDrainTimeout,
 			Stamper:            s.factory, Audit: s.hub, Faults: sessionHustleFaultReporter{session: s},
-			Activity: newHubHustleActivityTracker(s.hub),
+			Activity:         newHubHustleActivityTracker(s.hub),
+			FinalizerContext: sessionHustleFinalizerContext{session: s},
 		},
 	})
 }

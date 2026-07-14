@@ -80,11 +80,15 @@ type Session struct {
 
 	// shutdownMu makes teardown single-owner. Every concurrent or repeated caller
 	// joins shutdownDone and observes the same cleanup result; its own context error
-	// is added only after the shared, non-abandonable teardown has completed.
+	// is added only after the shared, session-bounded teardown has completed.
 	shutdownMu      sync.Mutex
 	shutdownStarted bool
 	shutdownDone    chan struct{}
 	shutdownErr     error
+	// shutdownTimeouts is a package-private test seam. Production leaves it zero
+	// and derives every phase budget from the session's already-validated loop,
+	// hustle, checkpoint, and durable-I/O bounds.
+	shutdownTimeouts shutdownCleanupTimeouts
 
 	// faulted is the terminal fail-secure latch: set by ReportFault when the hub
 	// raises a SessionPersistenceFault, or by an internal hustle/workspace fault. Once set,
@@ -2043,20 +2047,24 @@ type shutdownTarget struct {
 //     checkpoint controller, hub, and session context open for owned cleanup.
 //  3. Send command.Shutdown to EVERY loop in the snapshot, recording each reached
 //     loop's (loop, ack) pair. Per loop: mint a CommandID; on id-gen failure SKIP
-//     that loop's graceful shutdown (the deferred sessionCancel hard-cancels it)
+//     that loop's graceful shutdown (the final sessionCancel hard-cancels it)
 //     rather than aborting the whole Shutdown. A loop already exited is skipped.
 //  4. Wait for every recorded ack, then join hustle terminal audit, finalizers,
 //     and blocking activity release through Controller.Drained.
 //  5. Stop/join checkpoints and offload GC, append SessionStopped/stop the hub,
 //     release root/session leases, and cancel sessionCtx last.
-//  6. Caller cancellation never abandons steps 2-5. It is combined with controller
-//     and loop cleanup failures in the eventual typed SessionContextDone error.
+//  6. Every owned phase has a private deadline derived from validated component
+//     bounds; a phase timeout is typed, hard-cancels loops where applicable, and
+//     cannot suppress later teardown. Caller cancellation is diagnostic only.
 //
 // Concurrent and repeated calls join one teardown owner and receive the same cleanup
 // result, augmented with each caller's own context error after cleanup completes.
 func (s *Session) Shutdown(ctx context.Context) error {
 	if ctx == nil {
 		ctx = context.Background()
+	}
+	if hustleFinalizerOwnsSession(ctx, s) {
+		return &HustleShutdownReentryError{}
 	}
 	s.shutdownMu.Lock()
 	if s.shutdownStarted {
@@ -2081,9 +2089,9 @@ func (s *Session) Shutdown(ctx context.Context) error {
 }
 
 func (s *Session) shutdown() error {
-	shutdownCtx := context.Background()
+	shutdownRoot := context.Background()
 	if s.sessionCtx != nil {
-		shutdownCtx = context.WithoutCancel(s.sessionCtx)
+		shutdownRoot = context.WithoutCancel(s.sessionCtx)
 	}
 	// Serialize the closing latch with SetActiveLoop's durable append→visibility
 	// transaction. Once closing is visible, no active-loop change may start.
@@ -2099,90 +2107,25 @@ func (s *Session) shutdown() error {
 	}
 	s.loopsMu.Unlock()
 	s.activeMu.Unlock()
-	var hustleCloseErr error
-	if s.hustleController != nil {
-		// Closing controller admission also cancels queued and executing inference.
-		// Its lifecycle/finalizer contexts are derived from the still-live session
-		// context, so caller cancellation cannot suppress required cleanup.
-		hustleCloseErr = s.hustleController.Close(shutdownCtx)
+	timeouts := s.resolveShutdownTimeouts(snapshot)
+	failures := make([]error, 0, 6)
+	failures = append(failures, s.closeHustles(shutdownRoot, timeouts.hustleClose))
+	targets, sendErr := s.sendLoopShutdowns(shutdownRoot, snapshot, timeouts.loopSend)
+	failures = append(failures, sendErr)
+	failures = append(failures, s.waitLoopShutdowns(shutdownRoot, snapshot, targets, timeouts.loopDrain))
+	failures = append(failures, s.waitHustlesDrained(shutdownRoot, timeouts.hustleDrain))
+
+	// From here onward every phase gets a fresh private deadline. A timeout in one
+	// component therefore cannot suppress checkpoint, durable-stop, or lease cleanup.
+	s.stopOffloadGC()
+	failures = append(failures, s.stopCheckpoints(shutdownRoot, timeouts.checkpoint))
+	failures = append(failures, s.stopHub(shutdownRoot, timeouts.hub))
+	s.releaseRootLease(shutdownRoot)
+	s.releaseLease(shutdownRoot)
+	if s.sessionCancel != nil {
+		s.sessionCancel()
 	}
-	// Final backstop on every path: released last, after all graceful cleanup.
-	defer s.sessionCancel()
-
-	// Release the single-writer lease on every Shutdown return path, ONCE — deferred
-	// AFTER sessionCancel so it runs BEFORE it (LIFO): the graceful waits have completed
-	// (the journal's last append is durable) before ownership is relinquished, and the
-	// release happens before the root context is cancelled. Nil in headless mode (no-op).
-	defer s.releaseLease(shutdownCtx)
-
-	// Release the EXCLUSIVE workspace root lease AFTER the session-lease defer above so it
-	// runs BEFORE it (LIFO): work + checkpoints have stopped, the root lease is released,
-	// THEN the session lease. Nil-safe (per-session/shared/no placement). This deferred
-	// ordering realizes the design's teardown: stop work/checkpoints → release root lease
-	// → release session lease.
-	defer s.releaseRootLease(shutdownCtx)
-
-	// Registered last so it runs first on every return: genuine loop terminals drain
-	// through the still-open controller/hub; then automatic activity is canceled/joined,
-	// SessionStopped is appended/emitted, and only afterward do the lease defers run.
-	defer func() {
-		// Stop + join the offload-GC goroutine FIRST — before SessionStopped is appended
-		// (StopSession) and before the lease defers run — so a GC pass can never race the
-		// terminal append or outlive lease ownership.
-		s.stopOffloadGC()
-		if s.checkpoints != nil {
-			s.checkpoints.shutdown()
-		}
-		s.hub.StopSession(shutdownCtx)
-	}()
-
-	// Send a graceful Shutdown to every loop in the snapshot.
-	targets := make([]shutdownTarget, 0, len(snapshot))
-	for _, ls := range snapshot {
-		id, err := s.newCommandID()
-		if err != nil {
-			// id-gen failure for ONE loop must not abort the whole Shutdown: skip
-			// its graceful shutdown; the deferred sessionCancel hard-cancels it.
-			continue
-		}
-		ack := make(chan error, 1)
-		cmd := command.Shutdown{Header: command.Header{CommandID: id, CreatedAt: s.stampNow()}, Ack: ack}
-		// Intent log (audit-only): one record per loop (the command is per-loop), appended
-		// BEFORE this loop's send; an append failure is logged and the fan-out proceeds. This
-		// is the shutdown-aware append: a typed lease-lost failure here is expected (ownership
-		// is relinquished during teardown) and logged below error, not as a false alarm.
-		s.appendShutdownCommand(shutdownCtx, ls.loopID, cmd)
-		select {
-		case ls.handle.backend.CommandSink() <- cmd:
-			targets = append(targets, shutdownTarget{loop: ls.handle.backend, ack: ack})
-		case <-ls.handle.backend.DoneChan():
-			// Loop already exited; nothing to wait for.
-		case <-shutdownCtx.Done():
-			return shutdownCtx.Err()
-		}
-	}
-
-	// Wait for each reached loop's ack, retaining the first non-nil loop error.
-	var firstErr error
-	for _, t := range targets {
-		select {
-		case e := <-t.ack:
-			// e is non-nil when that loop's root ctx was cancelled before the actor
-			// finished cleanup. Keep the first such error to report.
-			if e != nil && firstErr == nil {
-				firstErr = e
-			}
-		case <-t.loop.DoneChan():
-			// Actor exited without (or before we read) an ack; nothing to wait for.
-		case <-shutdownCtx.Done():
-			return shutdownCtx.Err()
-		}
-	}
-	if s.hustleController != nil {
-		<-s.hustleController.Drained()
-	}
-
-	return combineShutdownErrors(firstErr, hustleCloseErr)
+	return combineShutdownErrors(failures...)
 }
 
 type shutdownErrorSet struct{ Causes []error }

@@ -68,12 +68,16 @@ func (*gatedShutdownHustleClient) Stream(context.Context, inference.Request) (*i
 type shutdownOrderRecorder struct {
 	mu    sync.Mutex
 	steps []string
+	added chan struct{}
 }
 
 func (r *shutdownOrderRecorder) add(step string) {
 	r.mu.Lock()
 	r.steps = append(r.steps, step)
 	r.mu.Unlock()
+	if r.added != nil {
+		r.added <- struct{}{}
+	}
 }
 
 func (r *shutdownOrderRecorder) snapshot() []string {
@@ -96,6 +100,28 @@ func (a shutdownOrderingAppender) AppendEvent(_ context.Context, ev event.Event)
 		a.order.add("session-stopped")
 	}
 	return 1, nil
+}
+
+type shutdownPhaseAppender struct {
+	stopped chan error
+}
+
+func (a shutdownPhaseAppender) AppendEvent(ctx context.Context, ev event.Event) (uint64, error) {
+	if _, ok := ev.(event.SessionStopped); ok {
+		a.stopped <- ctx.Err()
+	}
+	return 1, nil
+}
+
+type shutdownBlockingAppender struct{ started chan struct{} }
+
+func (a shutdownBlockingAppender) AppendEvent(ctx context.Context, ev event.Event) (uint64, error) {
+	if _, ok := ev.(event.SessionStopped); !ok {
+		return 1, nil
+	}
+	close(a.started)
+	<-ctx.Done()
+	return 0, ctx.Err()
 }
 
 func newShutdownHustleSession(t *testing.T, client inference.Client, order *shutdownOrderRecorder) *Session {
@@ -553,6 +579,307 @@ func TestShutdownDrainsPoisonedHustleOwnershipBeforeAbandonedWorkerTeardown(t *t
 				t.Fatalf("SessionStopped preceded poisoned ownership finalizer: %v", steps)
 			}
 		})
+	}
+}
+
+func TestHustleFinalizerShutdownReentryIsRefusedWithoutBlockingOwner(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name   string
+		queued bool
+	}{
+		{name: "executing finalizer reentry"},
+		{name: "queued finalizer reentry", queued: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			order := &shutdownOrderRecorder{added: make(chan struct{}, 16)}
+			client := &gatedShutdownHustleClient{invoked: make(chan struct{}), release: make(chan struct{})}
+			s := newShutdownHustleSession(t, client, order)
+			reentrant := make(chan error, 1)
+			run := func(finalizer func(context.Context, hustle.Outcome) error) <-chan error {
+				result := make(chan error, 1)
+				go func() {
+					result <- s.hustleController.RunAndFinalize(
+						context.Background(),
+						hustle.Request{
+							Name:  "shutdown-order",
+							Cause: identity.Cause{Coordinates: identity.Coordinates{LoopID: mustUUID()}},
+							Input: []byte(`{"version":1}`),
+						},
+						func(context.Context, hustle.Result) error { return nil },
+						finalizer,
+					)
+				}()
+				return result
+			}
+			reentrantFinalizer := func(ctx context.Context, _ hustle.Outcome) error {
+				err := s.Shutdown(ctx)
+				reentrant <- err
+				return err
+			}
+			var activeDone <-chan error
+			var reentrantDone <-chan error
+			if tt.queued {
+				activeDone = run(func(context.Context, hustle.Outcome) error { return nil })
+				<-client.invoked
+				reentrantDone = run(reentrantFinalizer)
+				waitForShutdownSteps(t, order, "hustle-started", 2)
+			} else {
+				reentrantDone = run(reentrantFinalizer)
+				<-client.invoked
+			}
+			shutdownDone := make(chan error, 1)
+			go func() { shutdownDone <- s.Shutdown(context.Background()) }()
+			close(client.release)
+			select {
+			case err := <-reentrant:
+				var reentry *HustleShutdownReentryError
+				if !errors.As(err, &reentry) {
+					t.Fatalf("reentrant Shutdown error = %T %v, want HustleShutdownReentryError", err, err)
+				}
+			case <-time.After(500 * time.Millisecond):
+				t.Fatal("reentrant Shutdown deadlocked with its owning finalizer")
+			}
+			if err := <-reentrantDone; err == nil {
+				t.Fatal("reentrant finalizer run returned nil, want refusal")
+			}
+			if activeDone != nil {
+				if err := <-activeDone; err == nil || !errors.Is(err, context.Canceled) {
+					t.Fatalf("active RunAndFinalize error = %v, want cancellation", err)
+				}
+			}
+			outerErr := <-shutdownDone
+			if tt.queued {
+				var closeErr *hustleruntime.CloseError
+				var reentry *HustleShutdownReentryError
+				if !errors.As(outerErr, &closeErr) || !errors.As(outerErr, &reentry) {
+					t.Fatalf("outer Shutdown error = %T %v, want queued CloseError retaining reentry refusal", outerErr, outerErr)
+				}
+			} else if outerErr != nil {
+				t.Fatalf("outer Shutdown: %v", outerErr)
+			}
+		})
+	}
+}
+
+func TestShutdownInternalCleanupTimeoutEscapesWedgedLoopSend(t *testing.T) {
+	tests := []struct{ name string }{{name: "session-owned deadline hard-cancels wedged loop send"}}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sessionID := mustUUID()
+			loopID := mustUUID()
+			commands := make(chan command.Command)
+			done := make(chan struct{})
+			loopCanceled := make(chan struct{})
+			leaseReleased := make(chan struct{})
+			sessionCtx, sessionCancel := context.WithCancel(context.Background())
+			s := &Session{
+				sessionID: sessionID, sessionCtx: sessionCtx, sessionCancel: sessionCancel,
+				constructionAbortTimeout: 20 * time.Millisecond,
+				hub:                      hub.New(sessionID), newID: uuid.New, now: time.Now,
+				loops: map[uuid.UUID]*loopHandle{
+					loopID: {
+						backend: &channelBackend{Commands: commands, Done: done},
+						cancel:  func() { close(loopCanceled) },
+					},
+				},
+				activeLoopID: loopID,
+				leaseRelease: func(context.Context) error {
+					close(leaseReleased)
+					return nil
+				},
+			}
+			result := make(chan error, 1)
+			go func() { result <- s.Shutdown(context.Background()) }()
+			select {
+			case err := <-result:
+				var timeoutErr *ShutdownCleanupTimeoutError
+				if !errors.As(err, &timeoutErr) || timeoutErr.Phase != ShutdownCleanupLoopSend ||
+					!errors.Is(timeoutErr, context.DeadlineExceeded) {
+					t.Fatalf("Shutdown error = %T %v, want typed loop-send deadline", err, err)
+				}
+			case <-time.After(500 * time.Millisecond):
+				t.Fatal("Shutdown remained blocked on wedged loop send past internal cleanup bound")
+			}
+			select {
+			case <-loopCanceled:
+			default:
+				t.Fatal("internal cleanup timeout did not hard-cancel wedged loop")
+			}
+			select {
+			case <-leaseReleased:
+			default:
+				t.Fatal("internal cleanup timeout did not continue safe lease teardown")
+			}
+		})
+	}
+}
+
+func TestShutdownLoopDrainTimeoutHardCancelsAndContinuesFreshCleanup(t *testing.T) {
+	tests := []struct{ name string }{{name: "ack deadline cancels loop then stops hub and releases lease"}}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sessionID := mustUUID()
+			loopID := mustUUID()
+			commands := make(chan command.Command, 1)
+			done := make(chan struct{})
+			loopCanceled := make(chan struct{})
+			leaseReleased := make(chan struct{})
+			hubStopped := make(chan error, 1)
+			sessionCtx, sessionCancel := context.WithCancel(context.Background())
+			s := &Session{
+				sessionID: sessionID, sessionCtx: sessionCtx, sessionCancel: sessionCancel,
+				constructionAbortTimeout: 20 * time.Millisecond,
+				hub:                      hub.New(sessionID, hub.WithAppender(shutdownPhaseAppender{stopped: hubStopped})),
+				newID:                    uuid.New, now: time.Now,
+				loops: map[uuid.UUID]*loopHandle{
+					loopID: {
+						backend: &channelBackend{Commands: commands, Done: done},
+						cancel:  func() { close(loopCanceled) },
+					},
+				},
+				activeLoopID: loopID,
+				leaseRelease: func(context.Context) error {
+					close(leaseReleased)
+					return nil
+				},
+			}
+			err := s.Shutdown(context.Background())
+			var timeoutErr *ShutdownCleanupTimeoutError
+			if !errors.As(err, &timeoutErr) || timeoutErr.Phase != ShutdownCleanupLoopDrain ||
+				!errors.Is(timeoutErr, context.DeadlineExceeded) {
+				t.Fatalf("Shutdown error = %T %v, want typed loop-drain deadline", err, err)
+			}
+			select {
+			case <-loopCanceled:
+			default:
+				t.Fatal("loop-drain timeout did not hard-cancel unresponsive loop")
+			}
+			select {
+			case ctxErr := <-hubStopped:
+				if ctxErr != nil {
+					t.Fatalf("SessionStopped context error = %v, want fresh live cleanup context", ctxErr)
+				}
+			default:
+				t.Fatal("loop-drain timeout skipped hub stop")
+			}
+			select {
+			case <-leaseReleased:
+			default:
+				t.Fatal("loop-drain timeout skipped lease release")
+			}
+		})
+	}
+}
+
+func TestShutdownCheckpointTimeoutContinuesFreshHubAndLeaseCleanup(t *testing.T) {
+	tests := []struct{ name string }{{name: "checkpoint drain deadline cannot suppress later teardown"}}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sessionID := mustUUID()
+			hubStopped := make(chan error, 1)
+			leaseReleased := make(chan struct{})
+			sessionCtx, sessionCancel := context.WithCancel(context.Background())
+			checkpointCtx, checkpointCancel := context.WithCancel(context.Background())
+			s := &Session{
+				sessionID: sessionID, sessionCtx: sessionCtx, sessionCancel: sessionCancel,
+				constructionAbortTimeout: 20 * time.Millisecond,
+				hub:                      hub.New(sessionID, hub.WithAppender(shutdownPhaseAppender{stopped: hubStopped})),
+				newID:                    uuid.New, now: time.Now, loops: map[uuid.UUID]*loopHandle{},
+				checkpoints: &checkpointController{ctx: checkpointCtx, cancel: checkpointCancel, drained: make(chan struct{})},
+				leaseRelease: func(context.Context) error {
+					close(leaseReleased)
+					return nil
+				},
+			}
+			err := s.Shutdown(context.Background())
+			var timeoutErr *ShutdownCleanupTimeoutError
+			if !errors.As(err, &timeoutErr) || timeoutErr.Phase != ShutdownCleanupCheckpointDrain ||
+				!errors.Is(timeoutErr, context.DeadlineExceeded) {
+				t.Fatalf("Shutdown error = %T %v, want typed checkpoint-drain deadline", err, err)
+			}
+			if !errors.Is(checkpointCtx.Err(), context.Canceled) {
+				t.Fatalf("checkpoint context error = %v, want cancellation", checkpointCtx.Err())
+			}
+			select {
+			case ctxErr := <-hubStopped:
+				if ctxErr != nil {
+					t.Fatalf("SessionStopped context error = %v, want fresh live cleanup context", ctxErr)
+				}
+			default:
+				t.Fatal("checkpoint timeout skipped hub stop")
+			}
+			select {
+			case <-leaseReleased:
+			default:
+				t.Fatal("checkpoint timeout skipped lease release")
+			}
+		})
+	}
+}
+
+func TestShutdownHubStopUsesFiniteSessionOwnedDeadline(t *testing.T) {
+	tests := []struct{ name string }{{name: "blocked durable stop returns typed timeout before lease release"}}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sessionID := mustUUID()
+			appendStarted := make(chan struct{})
+			leaseReleased := make(chan struct{})
+			sessionCtx, sessionCancel := context.WithCancel(context.Background())
+			s := &Session{
+				sessionID: sessionID, sessionCtx: sessionCtx, sessionCancel: sessionCancel,
+				constructionAbortTimeout: 20 * time.Millisecond,
+				hub:                      hub.New(sessionID, hub.WithAppender(shutdownBlockingAppender{started: appendStarted})),
+				newID:                    uuid.New, now: time.Now, loops: map[uuid.UUID]*loopHandle{},
+				leaseRelease: func(context.Context) error {
+					close(leaseReleased)
+					return nil
+				},
+			}
+			result := make(chan error, 1)
+			go func() { result <- s.Shutdown(context.Background()) }()
+			select {
+			case <-appendStarted:
+			case <-time.After(500 * time.Millisecond):
+				t.Fatal("SessionStopped append did not begin")
+			}
+			select {
+			case err := <-result:
+				var timeoutErr *ShutdownCleanupTimeoutError
+				if !errors.As(err, &timeoutErr) || timeoutErr.Phase != ShutdownCleanupHubStop ||
+					!errors.Is(timeoutErr, context.DeadlineExceeded) {
+					t.Fatalf("Shutdown error = %T %v, want typed hub-stop deadline", err, err)
+				}
+			case <-time.After(500 * time.Millisecond):
+				t.Fatal("Shutdown remained blocked past hub-stop deadline")
+			}
+			select {
+			case <-leaseReleased:
+			default:
+				t.Fatal("hub-stop timeout skipped lease release")
+			}
+		})
+	}
+}
+
+func waitForShutdownSteps(t *testing.T, order *shutdownOrderRecorder, target string, count int) {
+	t.Helper()
+	for {
+		seen := 0
+		for _, step := range order.snapshot() {
+			if step == target {
+				seen++
+			}
+		}
+		if seen >= count {
+			return
+		}
+		select {
+		case <-order.added:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("observed %d %q steps, want %d: %v", seen, target, count, order.snapshot())
+		}
 	}
 }
 
