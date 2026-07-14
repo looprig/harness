@@ -173,6 +173,7 @@ func appendCanonicalString(material []byte, value string) []byte {
 }
 
 func appendCanonicalInt64(material []byte, value int64) []byte {
+	// #nosec G115 -- canonical encoding preserves the signed value's two's-complement bit pattern.
 	return binary.BigEndian.AppendUint64(material, uint64(value))
 }
 
