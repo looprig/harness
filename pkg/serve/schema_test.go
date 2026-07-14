@@ -39,6 +39,31 @@ func TestOpenAPIExists(t *testing.T) {
 	}
 }
 
+func TestCompactionStartedDocumented(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		path string
+		want string
+	}{
+		{name: "JSON Schema kind", path: filepath.Join(schemaDir, "ephemeral_frame.schema.json"), want: `"compaction_started"`},
+		{name: "OpenAPI kind", path: openapiFile, want: "compaction_started"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			raw, err := os.ReadFile(tt.path)
+			if err != nil {
+				t.Fatalf("read %s: %v", tt.path, err)
+			}
+			if !strings.Contains(string(raw), tt.want) {
+				t.Errorf("%s does not document %q", tt.path, tt.want)
+			}
+		})
+	}
+}
+
 // TestSchemaFilesParse proves every schema/*.json document parses as valid JSON, so
 // a malformed hand-edit (a trailing comma, an unbalanced brace) fails fast rather
 // than silently rotting the contract.

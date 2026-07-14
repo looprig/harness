@@ -240,7 +240,7 @@ paths:
 
         EPHEMERAL frames — `event: ephemeral\ndata: <EphemeralFrame>\n\n` — carry a
         never-persisted streaming delta (token_delta / tool_call_started /
-        tool_call_completed / input_queued) and have NO id: line.
+        tool_call_completed / input_queued / compaction_started) and have NO id: line.
 
         Idle streams emit a `: ping` comment on the heartbeat interval. Errors before
         the stream opens (malformed sid 400, unknown session 404, subscribe failure
@@ -487,7 +487,7 @@ components:
         v: { type: integer, const: 1 }
         kind:
           type: string
-          enum: [token_delta, tool_call_started, tool_call_completed, input_queued]
+          enum: [token_delta, tool_call_started, tool_call_completed, input_queued, compaction_started]
         header: { $ref: "#/components/schemas/EventEnvelope" }
         delta: { type: object }
 

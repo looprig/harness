@@ -28,8 +28,8 @@ const schemaVersion = 1
 // decode runs. Conservative starting value; tune to real history sizes later.
 const maxEventBytes = 16 << 20 // 16 MiB
 
-// EphemeralNotPersistableError is returned by MarshalEvent when handed an
-// Ephemeral event (TokenDelta, ToolCallStarted, ToolCallCompleted, InputQueued).
+// EphemeralNotPersistableError is returned by MarshalEvent when handed any
+// Ephemeral event.
 // The Ephemeral set is never persisted — it self-heals from a later authoritative
 // event and TokenDelta.Chunk has no durable codec — so the marshaler fails closed
 // rather than emit a lossy record. Type is the classify name of the rejected event
@@ -159,6 +159,7 @@ func encodePayload(ev Event) ([]byte, error) {
 		ActiveLoopChanged, SecurityCeilingChanged,
 		HustleStarted, HustleCompleted, HustleFailed,
 		LoopIdle, LoopStarted, DelegateRequestAccepted, LoopInferenceChanged, LoopModeChanged, ContextMeasured,
+		CompactionCommitted, CompactionRejected, CompactWaiterResolved, CompactWaiterRejected,
 		ForeignSessionBound, TurnRejected,
 		UserInputRequested, TurnInterrupted,
 		TurnStarted, TurnFoldedInto, InputCancelled, TurnDone,
@@ -580,6 +581,14 @@ func decodePayload(tag string, data []byte) (Event, error) {
 		return decodePlain[LoopModeChanged](tag, data)
 	case "ContextMeasured":
 		return decodePlain[ContextMeasured](tag, data)
+	case "CompactionCommitted":
+		return decodePlain[CompactionCommitted](tag, data)
+	case "CompactionRejected":
+		return decodePlain[CompactionRejected](tag, data)
+	case "CompactWaiterResolved":
+		return decodePlain[CompactWaiterResolved](tag, data)
+	case "CompactWaiterRejected":
+		return decodePlain[CompactWaiterRejected](tag, data)
 	case "ForeignSessionBound":
 		return decodePlain[ForeignSessionBound](tag, data)
 	case "TurnStarted":

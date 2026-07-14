@@ -33,30 +33,37 @@ const (
 
 // Identity / body field names, named so an InvalidEventError reads precisely.
 const (
-	FieldEventID         FieldName = "EventID"
-	FieldSessionID       FieldName = "SessionID"
-	FieldLoopID          FieldName = "LoopID"
-	FieldTurnID          FieldName = "TurnID"
-	FieldStepID          FieldName = "StepID"
-	FieldToolExecutionID FieldName = "ToolExecutionID"
-	FieldConsistency     FieldName = "Consistency"
-	FieldTrigger         FieldName = "Trigger"
-	FieldCause           FieldName = "Cause"
-	FieldCommandID       FieldName = "CommandID"
-	FieldActiveLoopID    FieldName = "ActiveLoopID"
-	FieldModel           FieldName = "Model"
-	FieldModelKey        FieldName = "ModelKey"
-	FieldContextLimits   FieldName = "ContextLimits"
-	FieldEffort          FieldName = "Effort"
-	FieldUsage           FieldName = "Usage"
-	FieldMessages        FieldName = "Messages"
-	FieldVisibility      FieldName = "Visibility"
-	FieldDefinition      FieldName = "Definition"
-	FieldRunID           FieldName = "RunID"
-	FieldRuntime         FieldName = "Runtime"
-	FieldDuration        FieldName = "Duration"
-	FieldStage           FieldName = "Stage"
-	FieldReasonCode      FieldName = "ReasonCode"
+	FieldEventID          FieldName = "EventID"
+	FieldSessionID        FieldName = "SessionID"
+	FieldLoopID           FieldName = "LoopID"
+	FieldTurnID           FieldName = "TurnID"
+	FieldStepID           FieldName = "StepID"
+	FieldToolExecutionID  FieldName = "ToolExecutionID"
+	FieldConsistency      FieldName = "Consistency"
+	FieldTrigger          FieldName = "Trigger"
+	FieldCause            FieldName = "Cause"
+	FieldCommandID        FieldName = "CommandID"
+	FieldActiveLoopID     FieldName = "ActiveLoopID"
+	FieldModel            FieldName = "Model"
+	FieldModelKey         FieldName = "ModelKey"
+	FieldContextLimits    FieldName = "ContextLimits"
+	FieldEffort           FieldName = "Effort"
+	FieldUsage            FieldName = "Usage"
+	FieldMessages         FieldName = "Messages"
+	FieldVisibility       FieldName = "Visibility"
+	FieldDefinition       FieldName = "Definition"
+	FieldRunID            FieldName = "RunID"
+	FieldRuntime          FieldName = "Runtime"
+	FieldDuration         FieldName = "Duration"
+	FieldStage            FieldName = "Stage"
+	FieldReasonCode       FieldName = "ReasonCode"
+	FieldAttemptID        FieldName = "AttemptID"
+	FieldReason           FieldName = "Reason"
+	FieldRejectReason     FieldName = "RejectReason"
+	FieldWaiterCommandIDs FieldName = "WaiterCommandIDs"
+	FieldSummary          FieldName = "Summary"
+	FieldPostContext      FieldName = "PostContext"
+	FieldCommittedEventID FieldName = "CommittedEventID"
 	// FieldType names the whole event (not one coordinate) on the fail-secure
 	// unknown-type path, paired with RuleUnknownType.
 	FieldType FieldName = "Type"
@@ -163,6 +170,16 @@ func validateEventBody(ev Event) error {
 			return &InvalidEventError{Event: "ContextPressure", Field: FieldVisibility, Rule: RuleInvalid}
 		}
 		return validateContextPressure(e)
+	case CompactionStarted:
+		return validateCompactionStarted(e)
+	case CompactionCommitted:
+		return validateCompactionCommitted(e)
+	case CompactionRejected:
+		return validateCompactionRejected(e)
+	case CompactWaiterResolved:
+		return validateCompactWaiterResolved(e)
+	case CompactWaiterRejected:
+		return validateCompactWaiterRejected(e)
 	case HustleStarted:
 		if e.Visibility() != Internal {
 			return invalidHustle("HustleStarted", FieldVisibility)
@@ -428,6 +445,16 @@ func classify(ev Event) (name string, profile idProfile, ok bool) {
 		return "ContextMeasured", loopProfile(), true
 	case ContextPressure:
 		return "ContextPressure", loopProfile(), true
+	case CompactionStarted:
+		return "CompactionStarted", loopProfile(), true
+	case CompactionCommitted:
+		return "CompactionCommitted", loopProfile(), true
+	case CompactionRejected:
+		return "CompactionRejected", loopProfile(), true
+	case CompactWaiterResolved:
+		return "CompactWaiterResolved", loopProfile(), true
+	case CompactWaiterRejected:
+		return "CompactWaiterRejected", loopProfile(), true
 	case ForeignSessionBound:
 		return "ForeignSessionBound", loopProfile(), true
 	case TokenDelta:

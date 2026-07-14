@@ -41,6 +41,11 @@ var (
 	_ Event = LoopInferenceChanged{}
 	_ Event = LoopModeChanged{}
 	_ Event = ForeignSessionBound{}
+	_ Event = CompactionStarted{}
+	_ Event = CompactionCommitted{}
+	_ Event = CompactionRejected{}
+	_ Event = CompactWaiterResolved{}
+	_ Event = CompactWaiterRejected{}
 
 	// Turn/step-scoped events.
 	_ Event = TokenDelta{}

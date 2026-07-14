@@ -103,6 +103,8 @@ func classifyCommand(cmd Command) (CommandName, bool) {
 		return CommandInterrupt, true
 	case Shutdown:
 		return CommandShutdown, true
+	case Compact:
+		return CommandCompact, true
 	default:
 		return CommandUnknown, false
 	}
@@ -140,7 +142,7 @@ func encodePayload(name CommandName, cmd Command) ([]byte, error) {
 	case SubagentResult:
 		return marshalSubagentResult(c)
 	case ApproveToolCall, DenyToolCall, ProvideUserInput, CancelQueuedInput, CancelDelegateRequest,
-		SetSecurityCeiling, Interrupt, Shutdown:
+		SetSecurityCeiling, Interrupt, Shutdown, Compact:
 		// Every field round-trips through encoding/json directly: header + scalars/
 		// strings/ids (uuid.UUID has its own text codec) + embedded Coordinates/
 		// GateRoute. The two block-bearing commands (UserInput/SubagentResult) are
@@ -293,6 +295,8 @@ func decodePayload(tag CommandName, data []byte) (Command, error) {
 		return decodePlain[Interrupt](tag, data)
 	case CommandShutdown:
 		return decodePlain[Shutdown](tag, data)
+	case CommandCompact:
+		return decodePlain[Compact](tag, data)
 	default:
 		return nil, &UnknownCommandTypeError{Type: tag}
 	}

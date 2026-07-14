@@ -23,6 +23,7 @@ const (
 	ephemeralKindToolCallStarted   = "tool_call_started"
 	ephemeralKindToolCallCompleted = "tool_call_completed"
 	ephemeralKindInputQueued       = "input_queued"
+	ephemeralKindCompactionStarted = "compaction_started"
 )
 
 // content.Chunk has NO wire codec (it is a sealed transport-only interface); these
@@ -49,7 +50,7 @@ type enduringFrame struct {
 // Kind selects how Delta decodes; Header is the producing event's identity.
 type ephemeralFrame struct {
 	V      int             `json:"v"`               // 1
-	Kind   string          `json:"kind"`            // token_delta|tool_call_started|tool_call_completed|input_queued
+	Kind   string          `json:"kind"`            // token_delta|tool_call_started|tool_call_completed|input_queued|compaction_started
 	Header event.Header    `json:"header,omitzero"` // producer identity (omitted when zero)
 	Delta  json.RawMessage `json:"delta,omitempty"` // kind-specific payload (absent for input_queued)
 }
@@ -88,6 +89,13 @@ type toolCallCompletedDelta struct {
 	ToolExecutionID uuid.UUID `json:"tool_execution_id,omitzero"`
 	IsError         bool      `json:"is_error,omitzero"`
 	ResultPreview   string    `json:"result_preview,omitempty"`
+}
+
+// compactionStartedDelta is the public progress payload for a running compaction.
+type compactionStartedDelta struct {
+	AttemptID event.CompactAttemptID `json:"attempt_id"`
+	Reason    event.CompactionReason `json:"reason"`
+	Basis     event.ContextBasis     `json:"basis"`
 }
 
 // encodeDelivery renders one fan-in delivery as a complete SSE frame (through the
@@ -149,7 +157,7 @@ func encodeEphemeralFrame(ev event.Event) ([]byte, bool) {
 
 // buildEphemeralFrame maps a concrete Ephemeral event to its wire frame via a type
 // switch over the sealed Ephemeral set (TokenDelta, ToolCallStarted, ToolCallCompleted,
-// InputQueued). ok==false for any unrecognized event or a TokenDelta this transport
+// InputQueued, CompactionStarted). ok==false for any unrecognized event or a TokenDelta this transport
 // cannot represent, so the caller skips rather than emit a partial frame.
 func buildEphemeralFrame(ev event.Event) (ephemeralFrame, bool) {
 	switch e := ev.(type) {
@@ -174,6 +182,12 @@ func buildEphemeralFrame(ev event.Event) (ephemeralFrame, bool) {
 	case event.InputQueued:
 		// InputQueued carries no public payload beyond its Header, so it has no Delta.
 		return ephemeralFrame{V: frameSchemaVersion, Kind: ephemeralKindInputQueued, Header: e.EventHeader()}, true
+	case event.CompactionStarted:
+		delta, ok := marshalDelta(compactionStartedDelta{AttemptID: e.AttemptID, Reason: e.Reason, Basis: e.Basis})
+		if !ok {
+			return ephemeralFrame{}, false
+		}
+		return ephemeralFrame{V: frameSchemaVersion, Kind: ephemeralKindCompactionStarted, Header: e.EventHeader(), Delta: delta}, true
 	default:
 		return ephemeralFrame{}, false
 	}

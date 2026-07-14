@@ -42,13 +42,14 @@ func TestWithLoopHeaderStampsEveryEnduringType(t *testing.T) {
 	}
 
 	// in is one instance of each Enduring loop-scoped event type. These are exactly
-	// the 14 cases withLoopHeader enumerates (the only events the publish chokepoint
+	// the 19 cases withLoopHeader enumerates (the only enduring events the publish chokepoint
 	// stamps); Ephemeral and session-scoped events never reach withLoopHeader.
 	tests := []struct {
 		name string
 		in   event.Event
 	}{
 		{name: "TurnStarted", in: event.TurnStarted{}},
+		{name: "DelegateRequestAccepted", in: event.DelegateRequestAccepted{}},
 		{name: "StepDone", in: event.StepDone{}},
 		{name: "TurnFoldedInto", in: event.TurnFoldedInto{}},
 		{name: "InputCancelled", in: event.InputCancelled{}},
@@ -62,11 +63,15 @@ func TestWithLoopHeaderStampsEveryEnduringType(t *testing.T) {
 		{name: "PermissionRequested", in: event.PermissionRequested{}},
 		{name: "PermissionDecided", in: event.PermissionDecided{}},
 		{name: "UserInputRequested", in: event.UserInputRequested{}},
+		{name: "CompactionCommitted", in: event.CompactionCommitted{}},
+		{name: "CompactionRejected", in: event.CompactionRejected{}},
+		{name: "CompactWaiterResolved", in: event.CompactWaiterResolved{}},
+		{name: "CompactWaiterRejected", in: event.CompactWaiterRejected{}},
 	}
 
-	// Guard the count so adding a 14th Enduring loop event without extending this
+	// Guard the count so adding an Enduring loop event without extending this
 	// table is itself a failure (the test must enumerate every type).
-	const wantEnduringLoopTypes = 14
+	const wantEnduringLoopTypes = 19
 	if len(tests) != wantEnduringLoopTypes {
 		t.Fatalf("table has %d types, want %d Enduring loop-scoped event types", len(tests), wantEnduringLoopTypes)
 	}
@@ -92,6 +97,36 @@ func TestWithLoopHeaderStampsEveryEnduringType(t *testing.T) {
 			}
 			if gh.Cause != h.Cause {
 				t.Errorf("Cause = %+v, want %+v (header write-back lost cause)", gh.Cause, h.Cause)
+			}
+		})
+	}
+}
+
+func TestStampLoopHeaderCompactionEvents(t *testing.T) {
+	t.Parallel()
+
+	sessionID := mustID(t)
+	loopID := mustID(t)
+	turnID := mustID(t)
+	tests := []struct {
+		name string
+		ev   event.Event
+	}{
+		{name: "started", ev: event.CompactionStarted{}},
+		{name: "committed", ev: event.CompactionCommitted{}},
+		{name: "rejected", ev: event.CompactionRejected{}},
+		{name: "waiter resolved", ev: event.CompactWaiterResolved{}},
+		{name: "waiter rejected", ev: event.CompactWaiterRejected{}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got := stampLoopHeader(tt.ev, sessionID, loopID, turnID).EventHeader()
+			if got.SessionID != sessionID || got.LoopID != loopID {
+				t.Errorf("session/loop = %v/%v, want %v/%v", got.SessionID, got.LoopID, sessionID, loopID)
+			}
+			if !got.TurnID.IsZero() {
+				t.Errorf("TurnID = %v, want zero for loop-scoped compaction event", got.TurnID)
 			}
 		})
 	}

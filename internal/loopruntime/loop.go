@@ -586,25 +586,19 @@ func runLoop(cfg loopConfig, state loopState) {
 	// This is also the single point that mints the persistence identity (EventID +
 	// CreatedAt) for every ENDURING event: stampLoopHeader fills the producer
 	// COORDINATES, then the Factory stamps EventID + CreatedAt for the Enduring class
-	// only — Ephemeral events (TokenDelta/ToolCall*/InputQueued) are never persisted,
-	// so they are published unstamped (which also avoids per-token crypto/rand). On a
-	// mint failure we FAIL SECURE: log loudly and SKIP publishing that Enduring event
+	// plus the low-volume CompactionStarted progress event. Other Ephemeral events
+	// (TokenDelta/ToolCall*/InputQueued) remain unstamped, avoiding per-token crypto/rand.
+	// On a mint failure we FAIL SECURE: log loudly and SKIP publishing the event
 	// rather than fan out a zero-EventID one (a journal would key on a zero
 	// idempotency key) or silently pretend it published.
 	stamp := func(ev event.Event) (event.Event, error) {
-		stamped := stampLoopHeader(ev, state.sessionID, state.id, state.turnID)
-		if stamped.Class() == event.Enduring {
-			h, err := cfg.eventFactory.Stamp(stamped.EventHeader())
-			if err != nil {
-				// A crypto/rand mint failure is catastrophic and astronomically rare; drop
-				// this Enduring event fail-secure (never publish a zero-EventID record). The
-				// hub raises SessionPersistenceFault for durable-append failures; a loop-side
-				// fault for this mint edge is a deferred refinement, not a Phase-7 gap.
-				slog.Error("event id mint failed; dropping Enduring loop event (fail-secure)",
-					"event", fmt.Sprintf("%T", stamped), "error", err)
-				return nil, err
-			}
-			stamped = withLoopHeader(stamped, h)
+		stamped, err := stampLoopEvent(ev, cfg.eventFactory, state.sessionID, state.id, state.turnID)
+		if err != nil {
+			// A crypto/rand mint failure is catastrophic and astronomically rare; drop
+			// the event fail-secure rather than publish a required zero EventID.
+			slog.Error("event id mint failed; dropping loop event (fail-secure)",
+				"event", fmt.Sprintf("%T", ev), "error", err)
+			return nil, err
 		}
 		return stamped, nil
 	}
