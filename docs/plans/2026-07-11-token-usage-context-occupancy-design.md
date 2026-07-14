@@ -666,10 +666,13 @@ Harness defines no implicit threshold defaults. Consumers supply explicit
 values. SWE's calibrated values are fixed in §13: compact at 80%, rearm below
 60%. After an automatic attempt at one `ContextBasis`, another automatic attempt
 is suppressed until either the basis changes or successful compaction brings
-pressure below the rearm threshold. The latch is consumed only when the machine
-trigger opens a distinct canonical attempt whose opener reason is Automatic;
-joining a manual-opened attempt does not consume it. Manual requests are never
-suppressed by the automatic rearm latch.
+pressure below the rearm threshold. Two states enforce that rule: Task 23's one
+pending/in-progress coordination slot transiently suppresses duplicate triggers
+while it exists, whereas the durable exhausted `automaticBasis` latch is set only
+after successful append of canonical
+`CompactionRejected{Reason: Automatic, Basis: B}`. Opening/admitting an Automatic
+attempt does not itself exhaust B. Manual requests are never suppressed by the
+automatic rearm latch.
 
 ## §8 · `Compact` command and control lane
 
@@ -803,12 +806,14 @@ Rules:
   ordering and uniqueness are what make reply regeneration deterministic; and
 - a control request is consumed only at a safe step/turn boundary.
 
-Only an opened canonical attempt has a canonical reason/basis outcome. A machine
-trigger that merely joins a manual-opened attempt has not spent the unchanged
-basis's automatic-attempt allowance. After that shared manual attempt terminates,
-policy may open one Automatic attempt at the same basis. Conversely, rejection
-of an Automatic-opened attempt remains Automatic even if manual waiters joined,
-and consumes the latch for that basis.
+Only an opened canonical attempt can eventually have a canonical reason/basis
+outcome. Its admitted/minted `AttemptID` occupies the transient coordination slot
+and suppresses duplicates while pending/in progress, but does not set durable
+exhaustion. A machine trigger that merely joins a manual-opened attempt has not
+spent the unchanged basis's automatic-attempt allowance. After that shared manual
+attempt terminates, policy may open one Automatic attempt at the same basis.
+Conversely, a durably appended rejection of an Automatic-opened attempt remains
+Automatic even if manual waiters joined, and only then exhausts that basis.
 
 Once the actor freezes the basis and accepts the shared attempt, it emits one
 public live-progress event before invoking the compactor:
@@ -863,6 +868,11 @@ minted a valid `AttemptID`; lane-full rejection cites the existing pending
 `AttemptID`. Failure before any `AttemptID` can be minted produces no durable
 `CompactWaiterRejected` and completes only through the typed in-process/routing
 infrastructure failure, consistent with the no-false-rejection rule above.
+Pre-start interrupt, shutdown, lane, or control rejection that produces only
+`CompactWaiterRejected` ends/clears the transient slot and does not exhaust the
+basis. Fatal infrastructure without a canonical terminal likewise records no
+durable exhaustion; the session stops, and restore may retry because the journal
+contains no authoritative failed automatic attempt.
 
 ### Crash-consistent outcome
 
@@ -1272,10 +1282,11 @@ a successful replacement is recounted before inference.
 
 A failed automatic attempt is durably recorded as
 `CompactionRejected{Reason: CompactionReasonAutomatic, Basis: currentBasis}`.
-There is at most one automatic attempt per unchanged basis, including across
-restore. The live latch is written only after coordination confirms that the
-machine trigger opened the canonical attempt with `ReasonAutomatic`; coalescing
-into a manual-opened attempt does not consume it. A manual-opened rejection at
+There is at most one durably rejected automatic attempt per unchanged basis,
+including across restore. Admission/open/start only occupies Task 23's transient
+slot; the live exhausted latch is written only after observing a successfully
+appended canonical rejection with `ReasonAutomatic` and the exact basis.
+Coalescing into a manual-opened attempt does not consume it. A manual-opened rejection at
 that same basis remains `ReasonManual` and leaves automatic policy eligible to
 open its one attempt after the shared attempt ends. A manual trigger joining an
 automatic-opened attempt observes it, while its canonical rejection remains
@@ -1283,6 +1294,12 @@ automatic-opened attempt observes it, while its canonical rejection remains
 basis and makes the old latch irrelevant; failure does not disarm automatic
 compaction forever. Manual
 `/compact` may explicitly retry the same basis.
+
+Pre-start interrupt/shutdown/control rejection clears the transient slot without
+setting `automaticBasis`, so the unchanged live basis remains eligible. Fatal
+infrastructure with no canonical terminal stops the session but also creates no
+durable exhausted latch. `CompactionCommitted` advances the basis, making any old
+basis latch unnecessary.
 
 After a successful replacement, the summary-based request is counted. If fixed
 system/tool/runtime context plus the summary still exceeds the hard limit, the
@@ -1360,12 +1377,19 @@ when `CurrentContext` is absent. Revisions therefore never restart at one after 
 restart, model change, or mode change. The fold also keeps only the latest
 automatic-attempt latch: a canonical
 `CompactionRejected{Reason: CompactionReasonAutomatic}` records its `Basis` as
-exhausted because only an Automatic opener can produce that reason; a machine
+exhausted only after that canonical event was durably appended. Pending/opened/
+started attempts and per-waiter-only pre-start rejection do not restore as
+exhaustion. Because only an Automatic opener can produce that reason, a machine
 waiter coalesced into a Manual opener does not change the terminal reason, and a
 manual waiter coalesced into an Automatic opener does not change it either. A
 manual rejection therefore does not consume the latch. Any later basis advance
 makes that latch irrelevant. This is bounded latest-value state, not an unbounded
 attempt history.
+
+`CompactionCommitted` advances the active basis and needs no exhausted latch for
+the superseded basis. Fatal infrastructure with no canonical terminal contributes
+no latch on replay; restore remains eligible to retry because the durable history
+contains no authoritative failed attempt.
 
 `LoopStarted` likewise carries the initial resolved runtime. This makes replay
 and catalog repair independent of a mutable external model catalog, and gives the

@@ -632,8 +632,9 @@ Commit: `feat(compaction): add commands and event contracts`.
 **RED:** safe boundary consumption, one attempt/many canonical waiters,
 dedup/order, lane-full immediate reply using the existing pending AttemptID, user
 join, machine coalescing, immutable first-opener reason across mixed-origin joins,
-interrupt/shutdown priority, and journal-writable versus fatal-infrastructure
-outcomes.
+interrupt/shutdown priority, transient pending-slot suppression without durable
+exhaustion, pre-start interrupt/shutdown clearing the slot without a canonical
+automatic rejection, and journal-writable versus fatal-infrastructure outcomes.
 
 Commit: `feat(loopruntime): coordinate compaction attempts`.
 
@@ -677,6 +678,13 @@ Live and restore mixed-origin RED pins opener semantics: a machine join of a
 manual-opened attempt does not consume the latch and may open one later automatic
 attempt at the same basis, while a manual join of an automatic-opened attempt
 leaves its canonical reason Automatic and consumes the latch.
+Task24's await/result seam marks exhausted `automaticBasis` only after receiving
+the identity of a successfully appended canonical Automatic rejection. Mere
+admission/open/start and per-waiter-only pre-start interrupt/shutdown/control
+rejection use/clear only Task23's transient slot. RED covers Automatic-opened
+pre-start Interrupt and Shutdown both live and after equivalent restore: the
+unchanged basis remains eligible. Fatal no-terminal infrastructure creates no
+durable latch; committed replacement advances basis instead.
 
 Commit: `feat(loopruntime): measure and admit request context`.
 
