@@ -222,8 +222,10 @@ func restoreTopologySession(
 	}
 	// A rig supplies a frozen fingerprint, allowing the mismatch decision to happen
 	// immediately after replay and before root acquisition, binding, or reconstruction.
+	var frozenContextStale bool
 	if probe.frozenFingerprint != nil {
-		if err := checkFingerprint(persisted, *probe.frozenFingerprint, allowMismatch); err != nil {
+		frozenContextStale, err = restoredContextDisposition(persisted, *probe.frozenFingerprint, allowMismatch)
+		if err != nil {
 			return recordErrored(err)
 		}
 	}
@@ -255,14 +257,15 @@ func restoreTopologySession(
 	}
 
 	manager := newDelegationManager(topology)
-	plans, activePlan, err := planLoops(sessionCtx, sessionID, topology, activeDefinition, roots, starts, allRecords, allowMismatch, manager, probe.ceiling, probe.newWorkspaceBinding)
+	contextDisposition := func(bound loop.BoundDefinition) (bool, error) {
+		if probe.frozenFingerprint != nil {
+			return frozenContextStale, nil
+		}
+		return restoredContextDisposition(persisted, probe.projectFingerprint(bound), allowMismatch)
+	}
+	plans, activePlan, err := planLoops(sessionCtx, sessionID, topology, activeDefinition, roots, starts, allRecords, allowMismatch, contextDisposition, manager, probe.ceiling, probe.newWorkspaceBinding)
 	if err != nil {
 		return recordErrored(err)
-	}
-	if probe.frozenFingerprint == nil {
-		if err := checkFingerprint(persisted, probe.projectFingerprint(activePlan.bound), allowMismatch); err != nil {
-			return recordErrored(err)
-		}
 	}
 	rootLoopID := activePlan.started.LoopID
 	bound := activePlan.bound
@@ -497,7 +500,7 @@ func discoverRoots(all []event.Event, topology Topology, allowMismatch bool) (ma
 // unknown (subagents of a single-definition run). It is the single Bind of each loop,
 // performed inside the restore lease. It returns the ordered plans and the active plan, or a
 // typed error the caller records as a RestoreErrored.
-func planLoops(sessionCtx context.Context, sessionID uuid.UUID, topology Topology, activeDefinition loop.Definition, roots map[identity.AgentName]event.LoopStarted, starts []event.LoopStarted, allRecords []journal.JournalRecord, allowMismatch bool, manager *delegationManager, ceilingSource ceiling.Source, wsBind func() *tool.WorkspaceBinding) ([]loopPlan, loopPlan, error) {
+func planLoops(sessionCtx context.Context, sessionID uuid.UUID, topology Topology, activeDefinition loop.Definition, roots map[identity.AgentName]event.LoopStarted, starts []event.LoopStarted, allRecords []journal.JournalRecord, allowMismatch bool, contextDisposition func(loop.BoundDefinition) (bool, error), manager *delegationManager, ceilingSource ceiling.Source, wsBind func() *tool.WorkspaceBinding) ([]loopPlan, loopPlan, error) {
 	plans := make([]loopPlan, 0, len(starts))
 	boundByLoop := make(map[uuid.UUID]loop.BoundDefinition, len(starts))
 	activeIndex := -1
@@ -534,17 +537,24 @@ func planLoops(sessionCtx context.Context, sessionID uuid.UUID, topology Topolog
 		}
 		boundByLoop[started.LoopID] = bound
 		loopEvents := eventsFromRecords(allRecords, started.LoopID)
-		folded, foldErr := foldLoopForRestore(bound, loopEvents)
-		if foldErr != nil {
-			return nil, loopPlan{}, foldErr
-		}
-		plans = append(plans, loopPlan{started: started, bound: bound, events: loopEvents, folded: folded})
+		plans = append(plans, loopPlan{started: started, bound: bound, events: loopEvents})
 		if started.LoopID == roots[topology.ActivePrimer].LoopID {
 			activeIndex = len(plans) - 1
 		}
 	}
 	if activeIndex < 0 {
 		return nil, loopPlan{}, &RestoreError{Kind: RestoreLoopFailed, Cause: &SessionError{Kind: SessionLoopNotFound}}
+	}
+	discardContext, dispositionErr := contextDisposition(plans[activeIndex].bound)
+	if dispositionErr != nil {
+		return nil, loopPlan{}, dispositionErr
+	}
+	for i := range plans {
+		folded, foldErr := foldLoopForRestore(plans[i].bound, plans[i].events, discardContext)
+		if foldErr != nil {
+			return nil, loopPlan{}, foldErr
+		}
+		plans[i].folded = folded
 	}
 	return plans, plans[activeIndex], nil
 }

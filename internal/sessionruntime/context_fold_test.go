@@ -113,7 +113,7 @@ func TestFoldLoopForRestoreRejectsContextModelMismatch(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			_, err := foldLoopForRestore(bound, tt.events)
+			_, err := foldLoopForRestore(bound, tt.events, false)
 			if !tt.wantErr {
 				if err != nil {
 					t.Fatal(err)
@@ -124,6 +124,77 @@ func TestFoldLoopForRestoreRejectsContextModelMismatch(t *testing.T) {
 			var mismatchErr *RestoredContextModelMismatchError
 			if !errors.As(err, &restoreErr) || restoreErr.Kind != RestoreReplayFailed || !errors.As(err, &mismatchErr) {
 				t.Fatalf("error = %T %v", err, err)
+			}
+		})
+	}
+}
+
+func TestRestoredContextConfigMismatchDisposition(t *testing.T) {
+	t.Parallel()
+	bound := bindCfg(modeCfg(&stubLLM{}), uuid.UUID{3}, uuid.UUID{4})
+	measurementFor := func(model inference.Model) event.ContextMeasurement {
+		measurement := foldContextMeasurement(3)
+		measurement.Model = model.Key()
+		return measurement
+	}
+	base := validModel("base")
+	legacy := validModel("legacy")
+	matching := event.ConfigFingerprint{ModelID: "base", SystemPromptRev: "same"}
+	tests := []struct {
+		name          string
+		persisted     event.ConfigFingerprint
+		live          event.ConfigFingerprint
+		allowMismatch bool
+		events        []event.Event
+		wantContext   bool
+		wantConfigErr bool
+	}{
+		{
+			name:          "overridden changed model discards legacy fallback context",
+			persisted:     event.ConfigFingerprint{ModelID: "legacy"},
+			live:          event.ConfigFingerprint{ModelID: "base"},
+			allowMismatch: true,
+			events:        []event.Event{event.LoopStarted{}, event.ContextMeasured{Measurement: measurementFor(legacy)}},
+		},
+		{
+			name:          "overridden request shape change discards same model context",
+			persisted:     event.ConfigFingerprint{ModelID: "base", SystemPromptRev: "old"},
+			live:          event.ConfigFingerprint{ModelID: "base", SystemPromptRev: "new"},
+			allowMismatch: true,
+			events:        []event.Event{event.LoopStarted{}, event.ContextMeasured{Measurement: measurementFor(base)}},
+		},
+		{
+			name:          "actual mismatch without override rejects",
+			persisted:     event.ConfigFingerprint{ModelID: "legacy"},
+			live:          event.ConfigFingerprint{ModelID: "base"},
+			events:        []event.Event{event.LoopStarted{}, event.ContextMeasured{Measurement: measurementFor(legacy)}},
+			wantConfigErr: true,
+		},
+		{
+			name:          "override with no actual mismatch preserves valid context",
+			persisted:     matching,
+			live:          matching,
+			allowMismatch: true,
+			events:        []event.Event{event.LoopStarted{}, event.ContextMeasured{Measurement: measurementFor(base)}},
+			wantContext:   true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			discardContext, err := restoredContextDisposition(tt.persisted, tt.live, tt.allowMismatch)
+			var configErr *ConfigMismatchError
+			if errors.As(err, &configErr) != tt.wantConfigErr {
+				t.Fatalf("disposition error = %T %v, wantConfigErr=%v", err, err, tt.wantConfigErr)
+			}
+			if tt.wantConfigErr {
+				return
+			}
+			folded, err := foldLoopForRestore(bound, tt.events, discardContext)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if folded.HasContext != tt.wantContext {
+				t.Fatalf("HasContext = %v, want %v", folded.HasContext, tt.wantContext)
 			}
 		})
 	}

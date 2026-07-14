@@ -154,6 +154,16 @@ func checkFingerprint(persisted, live event.ConfigFingerprint, allowMismatch boo
 	return &ConfigMismatchError{Persisted: persisted, Live: live}
 }
 
+// restoredContextDisposition validates restore compatibility and reports whether
+// an explicitly overridden, actual config mismatch makes a durable context
+// measurement stale. Merely enabling the override does not discard matching state.
+func restoredContextDisposition(persisted, live event.ConfigFingerprint, allowMismatch bool) (bool, error) {
+	if err := checkFingerprint(persisted, live, allowMismatch); err != nil {
+		return false, err
+	}
+	return !persisted.Equal(live), nil
+}
+
 // checkAgentName is the restore root-loop AgentName decision: it returns nil when the
 // persisted (root LoopStarted) name and the configured (root loop.Definition) name are
 // equal, a typed *AgentNameMismatchError when they differ, and — when allowMismatch is
@@ -493,8 +503,14 @@ func foldLoop(events []event.Event) foldResult {
 	}
 }
 
-func foldLoopForRestore(bound loop.BoundDefinition, events []event.Event) (foldResult, error) {
+func foldLoopForRestore(bound loop.BoundDefinition, events []event.Event, discardContext bool) (foldResult, error) {
 	folded := foldLoop(events)
+	if discardContext {
+		folded.Context = event.ContextMeasurement{}
+		folded.HasContext = false
+		folded.Err = nil
+		return folded, nil
+	}
 	if folded.Err == nil && folded.HasContext {
 		_, effectiveModel := liveViewFor(bound, foldLoopInference(events))
 		if folded.Context.Model != effectiveModel.Key() {
