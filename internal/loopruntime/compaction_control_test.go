@@ -109,6 +109,11 @@ func TestCompactionControlAdmit(t *testing.T) {
 			if got.Kind != tt.wantKind || got.AttemptID != tt.wantAttempt {
 				t.Errorf("admit = %+v, want kind %v attempt %v", got, tt.wantKind, tt.wantAttempt)
 			}
+			if got.Kind == compactionAdmissionLaneFull {
+				if control.pending == nil || control.pending.attemptID != attemptID || len(control.pending.waiters) != 1 || control.pending.waiters[0].commandID != tt.seed[0].CommandID {
+					t.Fatalf("lane-full mutated owning attempt: %+v", control.pending)
+				}
+			}
 		})
 	}
 }

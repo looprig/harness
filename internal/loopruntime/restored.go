@@ -41,6 +41,12 @@ type RestoredState struct {
 
 	Context    event.ContextMeasurement
 	HasContext bool
+
+	Basis    event.ContextBasis
+	HasBasis bool
+
+	AutomaticBasis    event.ContextBasis
+	HasAutomaticBasis bool
 }
 
 // NewRestored constructs a loop SEEDED with pre-built committed state and starts its

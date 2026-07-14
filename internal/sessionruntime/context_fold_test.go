@@ -58,6 +58,69 @@ func TestFoldLoopTracksAndInvalidatesContextMeasurement(t *testing.T) {
 	}
 }
 
+func TestFoldLoopCarriesContextBasisWithoutMeasurement(t *testing.T) {
+	t.Parallel()
+	measurement := foldContextMeasurement(10)
+	runtime := event.ModelRuntime{Key: measurement.Model, Limits: inference.ContextLimits{WindowTokens: 100}}
+	mutationID := uuid.UUID{11}
+	tests := []struct {
+		name     string
+		mutation event.Event
+	}{
+		{name: "turn start", mutation: event.TurnStarted{Header: event.Header{EventID: mutationID}}},
+		{name: "step done", mutation: event.StepDone{Header: event.Header{EventID: mutationID}}},
+		{name: "folded input", mutation: event.TurnFoldedInto{Header: event.Header{EventID: mutationID}}},
+		{name: "inference change", mutation: event.LoopInferenceChanged{Header: event.Header{EventID: mutationID}, Runtime: runtime}},
+		{name: "mode change", mutation: event.LoopModeChanged{Header: event.Header{EventID: mutationID}, Runtime: runtime}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			folded := foldLoop([]event.Event{event.ContextMeasured{Measurement: measurement}, tt.mutation})
+			wantBasis := event.ContextBasis{Revision: 11, ThroughEventID: mutationID}
+			if folded.HasContext || !folded.HasBasis || folded.Basis != wantBasis {
+				t.Fatalf("folded context=%v basis=%+v hasBasis=%v, want absent context and %+v", folded.HasContext, folded.Basis, folded.HasBasis, wantBasis)
+			}
+			seed := restoredStateFrom(folded, restoredInference{})
+			if !seed.HasBasis || seed.Basis != wantBasis {
+				t.Fatalf("restored basis=%+v has=%v, want %+v true", seed.Basis, seed.HasBasis, wantBasis)
+			}
+		})
+	}
+}
+
+func TestFoldLoopRestoresOnlyAutomaticAttemptLatch(t *testing.T) {
+	t.Parallel()
+	basis := foldContextMeasurement(7).Basis
+	mutationID := uuid.UUID{8}
+	canonical := func(reason event.CompactionReason) event.CompactionRejected {
+		return event.CompactionRejected{Reason: reason, Basis: basis}
+	}
+	tests := []struct {
+		name          string
+		events        []event.Event
+		wantAutomatic bool
+		wantBasis     event.ContextBasis
+	}{
+		{name: "automatic rejection consumes unchanged basis", events: []event.Event{canonical(event.CompactionReasonAutomatic)}, wantAutomatic: true, wantBasis: basis},
+		{name: "manual rejection does not consume latch", events: []event.Event{canonical(event.CompactionReasonManual)}},
+		{name: "pre-start interrupt waiter rejection does not consume latch", events: []event.Event{event.ContextMeasured{Measurement: foldContextMeasurement(7)}, event.CompactWaiterRejected{Reason: event.CompactRejectInterrupted}}},
+		{name: "pre-start shutdown waiter rejection does not consume latch", events: []event.Event{event.ContextMeasured{Measurement: foldContextMeasurement(7)}, event.CompactWaiterRejected{Reason: event.CompactRejectShuttingDown}}},
+		{name: "later mutation retains only bounded old latch", events: []event.Event{canonical(event.CompactionReasonAutomatic), event.TurnStarted{Header: event.Header{EventID: mutationID}}}, wantAutomatic: true, wantBasis: basis},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			folded := foldLoop(tt.events)
+			if folded.HasAutomaticBasis != tt.wantAutomatic || folded.AutomaticBasis != tt.wantBasis {
+				t.Fatalf("automatic basis=%+v has=%v, want %+v has=%v", folded.AutomaticBasis, folded.HasAutomaticBasis, tt.wantBasis, tt.wantAutomatic)
+			}
+			seed := restoredStateFrom(folded, restoredInference{})
+			if seed.HasAutomaticBasis != tt.wantAutomatic || seed.AutomaticBasis != tt.wantBasis {
+				t.Fatalf("seed automatic basis=%+v has=%v, want %+v has=%v", seed.AutomaticBasis, seed.HasAutomaticBasis, tt.wantBasis, tt.wantAutomatic)
+			}
+		})
+	}
+}
+
 func TestFoldLoopForRestoreRejectsContextModelMismatch(t *testing.T) {
 	t.Parallel()
 	bound := bindCfg(modeCfg(&stubLLM{}), uuid.UUID{1}, uuid.UUID{2})

@@ -351,6 +351,11 @@ func restoredStateFrom(folded foldResult, ri restoredInference) loopruntime.Rest
 		HasRuntime: ri.HasRuntime,
 		Context:    folded.Context,
 		HasContext: folded.HasContext,
+		Basis:      folded.Basis,
+		HasBasis:   folded.HasBasis,
+
+		AutomaticBasis:    folded.AutomaticBasis,
+		HasAutomaticBasis: folded.HasAutomaticBasis,
 	}
 }
 
@@ -380,7 +385,32 @@ type foldResult struct {
 	HasRuntime bool
 	Context    event.ContextMeasurement
 	HasContext bool
-	Err        error
+	Basis      event.ContextBasis
+	HasBasis   bool
+
+	AutomaticBasis    event.ContextBasis
+	HasAutomaticBasis bool
+	Err               error
+}
+
+type restoredContextRevisionOverflowError struct{}
+
+func (*restoredContextRevisionOverflowError) Error() string {
+	return "sessionruntime: restored context revision overflow"
+}
+
+func advanceFoldedContextBasis(current event.ContextBasis, hasCurrent bool, eventID uuid.UUID) (event.ContextBasis, bool, error) {
+	if eventID.IsZero() {
+		return current, hasCurrent, nil
+	}
+	if hasCurrent && current.Revision == ^event.ContextRevision(0) {
+		return event.ContextBasis{}, false, &restoredContextRevisionOverflowError{}
+	}
+	revision := event.ContextRevision(1)
+	if hasCurrent {
+		revision = current.Revision + 1
+	}
+	return event.ContextBasis{Revision: revision, ThroughEventID: eventID}, true, nil
 }
 
 // RestoredContextModelMismatchError reports a replay projection that would
@@ -440,6 +470,17 @@ func foldLoop(events []event.Event) foldResult {
 	hasRuntime := false
 	var contextMeasurement event.ContextMeasurement
 	hasContext := false
+	var basis event.ContextBasis
+	hasBasis := false
+	var automaticBasis event.ContextBasis
+	hasAutomaticBasis := false
+	var foldErr error
+	advanceBasis := func(header event.Header) {
+		if foldErr != nil {
+			return
+		}
+		basis, hasBasis, foldErr = advanceFoldedContextBasis(basis, hasBasis, header.EventID)
+	}
 
 	for _, ev := range events {
 		switch e := ev.(type) {
@@ -451,16 +492,19 @@ func foldLoop(events []event.Event) foldResult {
 			openTurn = true
 			contextMeasurement = event.ContextMeasurement{}
 			hasContext = false
+			advanceBasis(e.Header)
 		case event.StepDone:
 			// The loop appends the finalized step group (AIMessage + ToolResultMessages).
 			msgs = append(msgs, e.Messages...)
 			contextMeasurement = event.ContextMeasurement{}
 			hasContext = false
+			advanceBasis(e.Header)
 		case event.TurnFoldedInto:
 			// The loop commits the folded user message at the tool-continuation point.
 			msgs = append(msgs, e.Message)
 			contextMeasurement = event.ContextMeasurement{}
 			hasContext = false
+			advanceBasis(e.Header)
 		case event.LoopStarted:
 			runtime = e.Runtime
 			hasRuntime = e.Runtime != (event.ModelRuntime{})
@@ -471,14 +515,33 @@ func foldLoop(events []event.Event) foldResult {
 			hasRuntime = e.Runtime != (event.ModelRuntime{})
 			contextMeasurement = event.ContextMeasurement{}
 			hasContext = false
+			advanceBasis(e.Header)
 		case event.LoopModeChanged:
 			runtime = e.Runtime
 			hasRuntime = e.Runtime != (event.ModelRuntime{})
 			contextMeasurement = event.ContextMeasurement{}
 			hasContext = false
+			advanceBasis(e.Header)
 		case event.ContextMeasured:
 			contextMeasurement = e.Measurement
 			hasContext = true
+			basis = e.Measurement.Basis
+			hasBasis = true
+		case event.CompactionRejected:
+			if !hasBasis {
+				basis = e.Basis
+				hasBasis = true
+			}
+			if e.Reason == event.CompactionReasonAutomatic {
+				automaticBasis = e.Basis
+				hasAutomaticBasis = true
+			}
+		case event.CompactionCommitted:
+			msgs = content.AgenticMessages{e.Summary}
+			contextMeasurement = e.PostContext
+			hasContext = true
+			basis = e.PostContext.Basis
+			hasBasis = true
 		case event.TurnDone, event.TurnFailed, event.TurnInterrupted:
 			// A terminal closes the open turn. Its AIMessage (for TurnDone) was already
 			// committed via that step's StepDone, so the terminal adds nothing to msgs.
@@ -490,8 +553,7 @@ func foldLoop(events []event.Event) foldResult {
 		}
 	}
 
-	var foldErr error
-	if hasContext && hasRuntime && contextMeasurement.Model != runtime.Key {
+	if foldErr == nil && hasContext && hasRuntime && contextMeasurement.Model != runtime.Key {
 		foldErr = &RestoredContextModelMismatchError{Runtime: runtime.Key, Measurement: contextMeasurement.Model}
 		contextMeasurement = event.ContextMeasurement{}
 		hasContext = false
@@ -500,6 +562,8 @@ func foldLoop(events []event.Event) foldResult {
 		Msgs: msgs, TurnIndex: turnIndex, OpenTurn: openTurn,
 		Runtime: runtime, HasRuntime: hasRuntime,
 		Context: contextMeasurement, HasContext: hasContext, Err: foldErr,
+		Basis: basis, HasBasis: hasBasis,
+		AutomaticBasis: automaticBasis, HasAutomaticBasis: hasAutomaticBasis,
 	}
 }
 

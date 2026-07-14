@@ -10,6 +10,7 @@ import (
 	"github.com/looprig/core/content"
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/event"
+	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/inference"
 )
@@ -195,7 +196,7 @@ func TestContextTrackerPressureRearmAndAutomaticLatch(t *testing.T) {
 			samples: []sample{
 				{basis: 1, used: 79, wantLevel: event.PressureNormal, wantChanged: true},
 				{basis: 2, used: 80, wantLevel: event.PressureCompact, wantChanged: true, wantAuto: true},
-				{basis: 2, used: 80, wantLevel: event.PressureCompact},
+				{basis: 2, used: 80, wantLevel: event.PressureCompact, wantAuto: true},
 				{basis: 3, used: 70, wantLevel: event.PressureCompact, wantChanged: true, wantAuto: true},
 				{basis: 4, used: 59, wantLevel: event.PressureNormal, wantChanged: true},
 				{basis: 5, used: 100, wantLevel: event.PressureHardLimit, wantChanged: true, wantAuto: true},
@@ -227,6 +228,119 @@ func TestContextTrackerPressureRearmAndAutomaticLatch(t *testing.T) {
 				} else if result.AdmissionError != nil {
 					t.Fatalf("sample %d admission error = %v", i, result.AdmissionError)
 				}
+			}
+		})
+	}
+}
+
+func TestContextTrackerExhaustsOnlyDurableAutomaticRejection(t *testing.T) {
+	t.Parallel()
+	basis := event.ContextBasis{Revision: 5, ThroughEventID: uuid.UUID{5}}
+	measurement := event.ContextMeasurement{
+		Basis: basis, Model: inference.ModelKey{Provider: "test", Model: "primary"},
+		RequestFingerprint: [32]byte{5}, InputTokens: 80, InputLimit: 100, Quality: inference.CountQualityExactLocal,
+	}
+	settings := contextAdmissionSettings{Automatic: true, CompactAt: 8_000, RearmBelow: 6_000}
+	tests := []struct {
+		name      string
+		configure func(*contextTracker)
+		wantAuto  bool
+	}{
+		{name: "pending opener alone remains eligible", wantAuto: true},
+		{name: "manual canonical rejection remains eligible", configure: func(tracker *contextTracker) { tracker.exhaustAutomatic(basis, event.CompactionReasonManual, true) }, wantAuto: true},
+		{name: "pre-start automatic waiter rejection remains eligible", configure: func(tracker *contextTracker) { tracker.exhaustAutomatic(basis, event.CompactionReasonAutomatic, false) }, wantAuto: true},
+		{name: "durable automatic canonical rejection exhausts basis", configure: func(tracker *contextTracker) { tracker.exhaustAutomatic(basis, event.CompactionReasonAutomatic, true) }},
+		{name: "later basis remains eligible", configure: func(tracker *contextTracker) {
+			tracker.exhaustAutomatic(event.ContextBasis{Revision: 4, ThroughEventID: uuid.UUID{4}}, event.CompactionReasonAutomatic, true)
+		}, wantAuto: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tracker := contextTracker{}
+			if tt.configure != nil {
+				tt.configure(&tracker)
+			}
+			result, err := tracker.apply(measurement, settings)
+			if err != nil {
+				t.Fatalf("apply() error = %v", err)
+			}
+			if result.TriggerAutomatic != tt.wantAuto {
+				t.Fatalf("TriggerAutomatic = %v, want %v", result.TriggerAutomatic, tt.wantAuto)
+			}
+		})
+	}
+}
+
+func TestLiveAutomaticPreStartControlRejectionLeavesBasisEligible(t *testing.T) {
+	t.Parallel()
+	basis := event.ContextBasis{Revision: 5, ThroughEventID: uuid.UUID{5}}
+	measurement := event.ContextMeasurement{
+		Basis: basis, Model: inference.ModelKey{Provider: "test", Model: "primary"},
+		RequestFingerprint: [32]byte{5}, InputTokens: 80, InputLimit: 100, Quality: inference.CountQualityExactLocal,
+	}
+	settings := contextAdmissionSettings{Automatic: true, CompactAt: 8_000, RearmBelow: 6_000}
+	tests := []struct {
+		name   string
+		cancel func(*compactionControl)
+		reason event.CompactRejectReason
+	}{
+		{name: "interrupt", cancel: func(control *compactionControl) { control.interrupt() }, reason: event.CompactRejectInterrupted},
+		{name: "shutdown", cancel: func(control *compactionControl) { control.shutdown() }, reason: event.CompactRejectShuttingDown},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tracker := contextTracker{}
+			first, err := tracker.apply(measurement, settings)
+			if err != nil || !first.TriggerAutomatic {
+				t.Fatalf("first apply = %+v, %v; want automatic trigger", first, err)
+			}
+			control := newCompactionControl(2)
+			if _, err := control.admit(compactCommand(uuid.UUID{1}, time.Now(), identity.AgencyMachine), fixedCompactionID); err != nil {
+				t.Fatalf("admit() error = %v", err)
+			}
+			tt.cancel(control)
+			disposition := control.atBoundary(compactionBoundaryStep)
+			if disposition.Kind != compactionDispositionReject || disposition.RejectReason != tt.reason || control.pending != nil {
+				t.Fatalf("control disposition = %+v pending=%+v, want rejection and cleared slot", disposition, control.pending)
+			}
+			second, err := tracker.apply(measurement, settings)
+			if err != nil || !second.TriggerAutomatic {
+				t.Fatalf("second apply = %+v, %v; unchanged basis should remain eligible", second, err)
+			}
+		})
+	}
+}
+
+func TestContextTrackerRestoreSuppressesOnlyRecordedAutomaticBasis(t *testing.T) {
+	t.Parallel()
+	settings := contextAdmissionSettings{Automatic: true, CompactAt: 8_000, RearmBelow: 6_000}
+	basis := event.ContextBasis{Revision: 5, ThroughEventID: uuid.UUID{5}}
+	measurement := event.ContextMeasurement{
+		Basis: basis, Model: inference.ModelKey{Provider: "test", Model: "primary"},
+		RequestFingerprint: [32]byte{5}, InputTokens: 80, InputLimit: 100, Quality: inference.CountQualityExactLocal,
+	}
+	tests := []struct {
+		name         string
+		automatic    event.ContextBasis
+		hasAutomatic bool
+		wantTrigger  bool
+	}{
+		{name: "same durable automatic rejection suppresses", automatic: basis, hasAutomatic: true},
+		{name: "manual or absent rejection remains eligible", wantTrigger: true},
+		{name: "older automatic basis remains eligible", automatic: event.ContextBasis{Revision: 4, ThroughEventID: uuid.UUID{4}}, hasAutomatic: true, wantTrigger: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tracker := contextTracker{}
+			if err := tracker.restore(basis, true, event.ContextMeasurement{}, false, tt.automatic, tt.hasAutomatic, settings); err != nil {
+				t.Fatalf("restore() error = %v", err)
+			}
+			result, err := tracker.apply(measurement, settings)
+			if err != nil {
+				t.Fatalf("apply() error = %v", err)
+			}
+			if result.TriggerAutomatic != tt.wantTrigger {
+				t.Fatalf("TriggerAutomatic = %v, want %v", result.TriggerAutomatic, tt.wantTrigger)
 			}
 		})
 	}

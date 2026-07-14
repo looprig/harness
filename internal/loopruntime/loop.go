@@ -94,6 +94,7 @@ type loopConfig struct {
 
 	contextRequests chan contextMeasureRequest
 	contextResults  chan contextCountResult
+	contextOutcomes chan contextCompactionOutcomeRequest
 
 	// gateReg is the gate-registration channel. The actor is its sole reader; the
 	// per-turn goroutine hands the SEND side to runTurn so a parked tool can register
@@ -335,6 +336,7 @@ func newLoopWithSeed(loopCtx context.Context, sessionID, loopID uuid.UUID, paren
 	priorityCommands := make(chan command.Command, compactionPriorityCommandCapacity)
 	contextRequests := make(chan contextMeasureRequest)
 	contextResults := make(chan contextCountResult, 1)
+	contextOutcomes := make(chan contextCompactionOutcomeRequest)
 	done := make(chan struct{})
 	// gateReg is unbuffered: registration is synchronous (the runner blocks on the
 	// ack), and the actor is the sole reader, selecting on it alongside commands.
@@ -354,6 +356,7 @@ func newLoopWithSeed(loopCtx context.Context, sessionID, loopID uuid.UUID, paren
 		priorityCommands: priorityCommands,
 		contextRequests:  contextRequests,
 		contextResults:   contextResults,
+		contextOutcomes:  contextOutcomes,
 		gateReg:          gateReg,
 		snapshots:        snapshots,
 		internal:         make(chan turnResult, 1),
@@ -393,8 +396,17 @@ func newLoopWithSeed(loopCtx context.Context, sessionID, loopID uuid.UUID, paren
 		}
 		state.context = seed.Context
 		state.hasContext = seed.HasContext
-		if seed.HasContext {
-			state.contextTracker.restore(seed.Context)
+		settings, _ := contextSettings(cfg)
+		if err := state.contextTracker.restore(
+			seed.Basis,
+			seed.HasBasis,
+			seed.Context,
+			seed.HasContext,
+			seed.AutomaticBasis,
+			seed.HasAutomaticBasis,
+			settings,
+		); err != nil {
+			return nil, err
 		}
 	}
 	go runLoop(lc, state)
@@ -460,17 +472,18 @@ type loopState struct {
 	// state — the things the actor mutates.
 	parent Provenance
 
-	turnIndex       event.TurnIndex
-	turnID          uuid.UUID // entity id for the active turn; zero when idle
-	causationID     uuid.UUID // active submit command's Header.ID; zero when idle
-	status          loopStatus
-	cancelTurn      context.CancelFunc
-	cancelAdmission context.CancelFunc
-	msgs            content.AgenticMessages // conversation history across turns
-	runtime         event.ModelRuntime
-	context         event.ContextMeasurement
-	hasContext      bool
-	contextTracker  contextTracker
+	turnIndex         event.TurnIndex
+	turnID            uuid.UUID // entity id for the active turn; zero when idle
+	causationID       uuid.UUID // active submit command's Header.ID; zero when idle
+	status            loopStatus
+	cancelTurn        context.CancelFunc
+	cancelAdmission   context.CancelFunc
+	msgs              content.AgenticMessages // conversation history across turns
+	runtime           event.ModelRuntime
+	context           event.ContextMeasurement
+	hasContext        bool
+	contextTracker    contextTracker
+	contextGeneration uint64
 
 	// effective is the loop's CURRENT turn-affecting configuration (mode/model/effort/
 	// system/tools). startTurn captures a copy of it into the per-turn turnConfig, so a
@@ -595,6 +608,7 @@ func runLoop(cfg loopConfig, state loopState) {
 	priorityCommands := cfg.priorityCommands
 	contextRequests := cfg.contextRequests
 	contextResults := cfg.contextResults
+	contextOutcomes := cfg.contextOutcomes
 	gateReg := cfg.gateReg
 	snapshots := cfg.snapshots
 	internal := cfg.internal
@@ -876,39 +890,60 @@ func runLoop(cfg loopConfig, state loopState) {
 		var measure func(context.Context, inference.Request, string) error
 		if _, configured := contextSettings(config); configured && config.ContextCounter != nil {
 			measure = func(cctx context.Context, request inference.Request, runtimeRevision string) error {
-				reply := make(chan contextMeasureReply, 1)
-				req := contextMeasureRequest{ctx: cctx, request: request, runtimeContextRevision: runtimeRevision, reply: reply}
-				select {
-				case cfg.contextRequests <- req:
-				case <-cctx.Done():
-					return normalizeContextCountError(request.Model.Key(), config.CounterCapability.Quality, cctx.Err())
-				}
-				var measured contextMeasureReply
-				select {
-				case measured = <-reply:
-				case <-cctx.Done():
-					return normalizeContextCountError(request.Model.Key(), config.CounterCapability.Quality, cctx.Err())
-				}
-				if measured.err != nil {
-					return measured.err
-				}
-				if measured.awaiter == nil {
-					return nil
-				}
-				outcome, err := measured.awaiter.AwaitCompaction(cctx, measured.attemptID)
-				if err != nil {
-					return &contextCompactionAwaitError{AttemptID: measured.attemptID, Cause: err}
-				}
-				switch outcome {
-				case contextCompactionAwaitRejected:
-					if measured.measurement.InputTokens >= measured.measurement.InputLimit {
-						return &loop.ContextLimitError{Measurement: measured.measurement}
+				for {
+					reply := make(chan contextMeasureReply, 1)
+					req := contextMeasureRequest{ctx: cctx, request: request, runtimeContextRevision: runtimeRevision, reply: reply}
+					select {
+					case cfg.contextRequests <- req:
+					case <-cctx.Done():
+						return normalizeContextCountError(request.Model.Key(), config.CounterCapability.Quality, cctx.Err())
 					}
-					return nil
-				case contextCompactionAwaitCommitted:
-					return &contextReplacementRequiredError{AttemptID: measured.attemptID}
-				default:
-					return &contextCompactionAwaitError{AttemptID: measured.attemptID}
+					var measured contextMeasureReply
+					select {
+					case measured = <-reply:
+					case <-cctx.Done():
+						return normalizeContextCountError(request.Model.Key(), config.CounterCapability.Quality, cctx.Err())
+					}
+					if measured.err != nil {
+						return measured.err
+					}
+					if measured.awaiter == nil {
+						return nil
+					}
+					outcome, err := measured.awaiter.AwaitCompaction(cctx, measured.attemptID)
+					if err != nil {
+						return &contextCompactionAwaitError{AttemptID: measured.attemptID, Cause: err}
+					}
+					outcomeReply := make(chan contextCompactionOutcomeReply, 1)
+					outcomeRequest := contextCompactionOutcomeRequest{attemptID: measured.attemptID, result: outcome, reply: outcomeReply}
+					select {
+					case cfg.contextOutcomes <- outcomeRequest:
+					case <-cctx.Done():
+						return normalizeContextCountError(request.Model.Key(), config.CounterCapability.Quality, cctx.Err())
+					}
+					var disposition contextCompactionOutcomeReply
+					select {
+					case disposition = <-outcomeReply:
+					case <-cctx.Done():
+						return normalizeContextCountError(request.Model.Key(), config.CounterCapability.Quality, cctx.Err())
+					}
+					if disposition.err != nil {
+						return disposition.err
+					}
+					if disposition.retry {
+						continue
+					}
+					switch outcome.Disposition {
+					case contextCompactionAwaitRejected:
+						if measured.measurement.InputTokens >= measured.measurement.InputLimit {
+							return &loop.ContextLimitError{Measurement: measured.measurement}
+						}
+						return nil
+					case contextCompactionAwaitCommitted:
+						return &contextReplacementRequiredError{AttemptID: measured.attemptID}
+					default:
+						return &contextCompactionAwaitError{AttemptID: measured.attemptID}
+					}
 				}
 			}
 		}
@@ -1471,6 +1506,30 @@ func runLoop(cfg loopConfig, state loopState) {
 	changeHeader := func() event.Header {
 		return event.Header{Coordinates: identity.Coordinates{SessionID: state.sessionID, LoopID: state.id}}
 	}
+	commitContextConfigurationChange := func(change event.Event) error {
+		stamped, err := stamp(change)
+		if err != nil {
+			return err
+		}
+		if err := cfg.events.PublishEvent(ctx, stamped); err != nil {
+			return err
+		}
+		if fp := cfg.faultProbe; fp != nil {
+			if err := fp.FaultErr(); err != nil {
+				return err
+			}
+		}
+		if state.contextGeneration == ^uint64(0) {
+			return &contextGenerationOverflowError{}
+		}
+		if err := state.contextTracker.advance(stamped.EventHeader().EventID); err != nil {
+			return err
+		}
+		state.contextGeneration++
+		state.context = event.ContextMeasurement{}
+		state.hasContext = false
+		return nil
+	}
 
 	// applySetMode commits a SetLoopMode: it validates the mode name against the bound
 	// definition, emits LoopModeChanged, checks the durable-fault probe, then replaces the
@@ -1493,17 +1552,12 @@ func runLoop(cfg loopConfig, state loopState) {
 			return
 		}
 		next := effectiveConfig{mode: modeName, model: resolved.Model, effort: resolved.Model.Sampling.Effort, system: resolved.System, tools: resolveToolSetCaps(resolved.Tools)}
-		publish(event.LoopModeChanged{Header: changeHeader(), PreviousMode: string(state.effective.mode), Mode: string(modeName), Runtime: modelRuntime(next.model, next.effort)})
-		if fp := cfg.faultProbe; fp != nil {
-			if ferr := fp.FaultErr(); ferr != nil {
-				c.Ack <- command.LoopChangeResult{Err: &loop.ChangeError{Kind: loop.ChangeDurableAppendFailed, Cause: ferr}}
-				return
-			}
+		if err := commitContextConfigurationChange(event.LoopModeChanged{Header: changeHeader(), PreviousMode: string(state.effective.mode), Mode: string(modeName), Runtime: modelRuntime(next.model, next.effort)}); err != nil {
+			c.Ack <- command.LoopChangeResult{Err: &loop.ChangeError{Kind: loop.ChangeDurableAppendFailed, Cause: err}}
+			return
 		}
 		state.effective = next
 		state.runtime = modelRuntime(next.model, next.effort)
-		state.context = event.ContextMeasurement{}
-		state.hasContext = false
 		c.Ack <- command.LoopChangeResult{Mode: string(next.mode), Model: next.model, Effort: next.effort}
 	}
 
@@ -1550,18 +1604,13 @@ func runLoop(cfg loopConfig, state loopState) {
 		}
 		model.Sampling = model.Sampling.Clone()
 		model.Sampling.Effort = effort // bake effort into the model the request stamps
-		publish(event.LoopInferenceChanged{Header: changeHeader(), Runtime: modelRuntime(model, effort)})
-		if fp := cfg.faultProbe; fp != nil {
-			if ferr := fp.FaultErr(); ferr != nil {
-				c.Ack <- command.LoopChangeResult{Err: &loop.ChangeError{Kind: loop.ChangeDurableAppendFailed, Cause: ferr}}
-				return
-			}
+		if err := commitContextConfigurationChange(event.LoopInferenceChanged{Header: changeHeader(), Runtime: modelRuntime(model, effort)}); err != nil {
+			c.Ack <- command.LoopChangeResult{Err: &loop.ChangeError{Kind: loop.ChangeDurableAppendFailed, Cause: err}}
+			return
 		}
 		state.effective.model = model
 		state.effective.effort = effort
 		state.runtime = modelRuntime(model, effort)
-		state.context = event.ContextMeasurement{}
-		state.hasContext = false
 		c.Ack <- command.LoopChangeResult{Mode: string(state.effective.mode), Model: model, Effort: effort}
 	}
 
@@ -1780,7 +1829,8 @@ func runLoop(cfg loopConfig, state loopState) {
 				continue
 			}
 			basis := state.contextTracker.currentBasis()
-			go func(request contextMeasureRequest, admission contextAdmissionSettings, measuredBasis event.ContextBasis) {
+			generation := state.contextGeneration
+			go func(request contextMeasureRequest, admission contextAdmissionSettings, measuredBasis event.ContextBasis, measuredGeneration uint64) {
 				measurement, err := measureRequestContext(
 					request.ctx,
 					config.ContextCounter,
@@ -1791,13 +1841,13 @@ func runLoop(cfg loopConfig, state loopState) {
 					request.request,
 					request.runtimeContextRevision,
 				)
-				result := contextCountResult{request: request, measurement: measurement, err: err}
+				result := contextCountResult{request: request, measurement: measurement, generation: measuredGeneration, err: err}
 				select {
 				case contextResults <- result:
 				case <-request.ctx.Done():
 				case <-ctx.Done():
 				}
-			}(req, settings, basis)
+			}(req, settings, basis, generation)
 
 		case result := <-contextResults:
 			reply := func(response contextMeasureReply) {
@@ -1808,7 +1858,7 @@ func runLoop(cfg loopConfig, state loopState) {
 				continue
 			}
 			currentBasis := state.contextTracker.currentBasis()
-			if result.measurement.Basis != currentBasis {
+			if result.measurement.Basis != currentBasis || result.generation != state.contextGeneration {
 				reply(contextMeasureReply{err: &staleContextMeasurementError{Measured: result.measurement.Basis, Current: currentBasis}})
 				continue
 			}
@@ -1919,6 +1969,21 @@ func runLoop(cfg loopConfig, state loopState) {
 				continue
 			}
 			reply(contextMeasureReply{measurement: result.measurement, attemptID: admission.AttemptID, awaiter: awaiter})
+
+		case outcome := <-contextOutcomes:
+			attempt := compactions.complete(outcome.attemptID)
+			if outcome.result.Canonical {
+				if attempt == nil || !outcome.result.Reason.Valid() || outcome.result.Basis.Revision == 0 || outcome.result.Basis.ThroughEventID.IsZero() || attempt.Reason != outcome.result.Reason {
+					outcome.reply <- contextCompactionOutcomeReply{err: &contextCompactionOutcomeError{AttemptID: outcome.attemptID}}
+					continue
+				}
+			}
+			if outcome.result.Disposition == contextCompactionAwaitRejected {
+				state.contextTracker.exhaustAutomatic(outcome.result.Basis, outcome.result.Reason, outcome.result.Canonical)
+			}
+			settings, configured := contextSettings(config)
+			retry := configured && settings.Automatic && outcome.result.Canonical && outcome.result.Disposition == contextCompactionAwaitRejected && outcome.result.Reason == event.CompactionReasonManual && outcome.result.Basis == state.contextTracker.currentBasis()
+			outcome.reply <- contextCompactionOutcomeReply{retry: retry}
 
 		case result := <-admissions:
 			state.cancelAdmission = nil

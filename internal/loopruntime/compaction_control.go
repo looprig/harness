@@ -282,6 +282,10 @@ func (c *compactionControl) abort(attemptID event.CompactAttemptID) *compactionA
 	return attempt
 }
 
+func (c *compactionControl) complete(attemptID event.CompactAttemptID) *compactionAttempt {
+	return c.abort(attemptID)
+}
+
 func (c *compactionControl) pendingAttempt() *compactionAttempt {
 	if c.pending == nil {
 		return nil

@@ -15,13 +15,20 @@ import (
 	"github.com/looprig/inference"
 )
 
-type contextCompactionAwaitResult uint8
+type contextCompactionAwaitDisposition uint8
 
 const (
-	contextCompactionAwaitUnknown contextCompactionAwaitResult = iota
+	contextCompactionAwaitUnknown contextCompactionAwaitDisposition = iota
 	contextCompactionAwaitRejected
 	contextCompactionAwaitCommitted
 )
+
+type contextCompactionAwaitResult struct {
+	Disposition contextCompactionAwaitDisposition
+	Canonical   bool
+	Reason      event.CompactionReason
+	Basis       event.ContextBasis
+}
 
 type contextCompactionAwaiter interface {
 	AwaitCompaction(context.Context, event.CompactAttemptID) (contextCompactionAwaitResult, error)
@@ -47,9 +54,21 @@ func (e *contextCompactionAwaitError) Error() string {
 
 func (e *contextCompactionAwaitError) Unwrap() error { return e.Cause }
 
+type contextCompactionOutcomeError struct{ AttemptID event.CompactAttemptID }
+
+func (*contextCompactionOutcomeError) Error() string {
+	return "loopruntime: invalid canonical compaction outcome identity"
+}
+
 type contextRevisionOverflowError struct{}
 
 func (*contextRevisionOverflowError) Error() string { return "loopruntime: context revision overflow" }
+
+type contextGenerationOverflowError struct{}
+
+func (*contextGenerationOverflowError) Error() string {
+	return "loopruntime: request configuration generation overflow"
+}
 
 type staleContextMeasurementError struct {
 	Measured event.ContextBasis
@@ -76,6 +95,7 @@ type contextMeasureRequest struct {
 type contextCountResult struct {
 	request     contextMeasureRequest
 	measurement event.ContextMeasurement
+	generation  uint64
 	err         error
 }
 
@@ -84,6 +104,17 @@ type contextMeasureReply struct {
 	attemptID   event.CompactAttemptID
 	awaiter     contextCompactionAwaiter
 	err         error
+}
+
+type contextCompactionOutcomeRequest struct {
+	attemptID event.CompactAttemptID
+	result    contextCompactionAwaitResult
+	reply     chan<- contextCompactionOutcomeReply
+}
+
+type contextCompactionOutcomeReply struct {
+	retry bool
+	err   error
 }
 
 type contextAdmissionSettings struct {
@@ -236,10 +267,38 @@ type contextTracker struct {
 	hasAutomatic   bool
 }
 
-func (t *contextTracker) restore(measurement event.ContextMeasurement) {
-	t.basis = measurement.Basis
-	t.measurement = measurement
-	t.hasMeasurement = true
+func (t *contextTracker) restore(
+	basis event.ContextBasis,
+	hasBasis bool,
+	measurement event.ContextMeasurement,
+	hasMeasurement bool,
+	automaticBasis event.ContextBasis,
+	hasAutomatic bool,
+	settings contextAdmissionSettings,
+) error {
+	if hasBasis {
+		t.basis = basis
+	}
+	if hasMeasurement {
+		if err := measurement.Validate(); err != nil {
+			return err
+		}
+		if !hasBasis {
+			t.basis = measurement.Basis
+		}
+		occupancy, err := loop.OccupancyBasisPoints(measurement.InputTokens, measurement.InputLimit)
+		if err != nil {
+			return err
+		}
+		t.measurement = measurement
+		t.hasMeasurement = true
+		t.pressure = t.pressureLevel(occupancy, settings)
+	}
+	if hasAutomatic {
+		t.automaticBasis = automaticBasis
+		t.hasAutomatic = true
+	}
+	return nil
 }
 
 func (t *contextTracker) advance(eventID uuid.UUID) error {
@@ -272,8 +331,6 @@ func (t *contextTracker) apply(measurement event.ContextMeasurement, settings co
 	}
 	if settings.Automatic && (level == event.PressureCompact || level == event.PressureHardLimit) && (!t.hasAutomatic || t.automaticBasis != measurement.Basis) {
 		result.TriggerAutomatic = true
-		t.automaticBasis = measurement.Basis
-		t.hasAutomatic = true
 	}
 	if level == event.PressureHardLimit && !result.TriggerAutomatic {
 		result.AdmissionError = &loop.ContextLimitError{Measurement: measurement}
@@ -282,6 +339,14 @@ func (t *contextTracker) apply(measurement event.ContextMeasurement, settings co
 	t.hasMeasurement = true
 	t.pressure = level
 	return result, nil
+}
+
+func (t *contextTracker) exhaustAutomatic(basis event.ContextBasis, reason event.CompactionReason, durable bool) {
+	if !durable || reason != event.CompactionReasonAutomatic {
+		return
+	}
+	t.automaticBasis = basis
+	t.hasAutomatic = true
 }
 
 func (t *contextTracker) pressureLevel(occupancy event.BasisPoints, settings contextAdmissionSettings) event.PressureLevel {

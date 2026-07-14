@@ -12,7 +12,9 @@ import (
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/command"
 	"github.com/looprig/harness/pkg/event"
+	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/loop"
+	"github.com/looprig/harness/pkg/tool"
 	"github.com/looprig/inference"
 )
 
@@ -22,6 +24,44 @@ type loopContextCounter struct {
 	counts     []content.TokenCount
 	err        error
 	requests   []inference.Request
+}
+
+type gatedLoopContextCounter struct {
+	capability inference.CounterCapability
+	started    chan inference.Request
+	release    chan struct{}
+	mu         sync.Mutex
+	requests   []inference.Request
+}
+
+func (c *gatedLoopContextCounter) CountContext(ctx context.Context, request inference.Request) (inference.ContextCount, error) {
+	c.mu.Lock()
+	call := len(c.requests)
+	c.requests = append(c.requests, request)
+	c.mu.Unlock()
+	if call == 0 {
+		c.started <- request
+		select {
+		case <-c.release:
+		case <-ctx.Done():
+			return inference.ContextCount{}, ctx.Err()
+		}
+	}
+	return inference.ContextCount{Model: request.Model.Key(), InputTokens: 40, Quality: c.capability.Quality}, nil
+}
+
+func (c *gatedLoopContextCounter) CounterCapability() inference.CounterCapability {
+	return c.capability
+}
+
+func (c *gatedLoopContextCounter) models() []inference.ModelKey {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	models := make([]inference.ModelKey, len(c.requests))
+	for index, request := range c.requests {
+		models[index] = request.Model.Key()
+	}
+	return models
 }
 
 func (c *loopContextCounter) CountContext(_ context.Context, request inference.Request) (inference.ContextCount, error) {
@@ -101,7 +141,7 @@ func (s *contextAwaitSink) AwaitCompaction(ctx context.Context, _ event.CompactA
 	case result := <-s.release:
 		return result, nil
 	case <-ctx.Done():
-		return contextCompactionAwaitUnknown, ctx.Err()
+		return contextCompactionAwaitResult{Disposition: contextCompactionAwaitUnknown}, ctx.Err()
 	}
 }
 
@@ -139,13 +179,13 @@ func TestLoopContextAdmissionBeforePrimaryInference(t *testing.T) {
 		{
 			name: "automatic soft rejection continues", count: 65,
 			compaction:  &loop.CompactionPolicy{Automatic: true, CounterPolicy: loop.CounterPolicyRequireExact, CompactAt: 8_000, RearmBelow: 6_000, ReservedOutput: 20, MaxSummaryTokens: 10, CountTimeout: 31 * time.Millisecond, Hustle: "context.compact"},
-			withAwaiter: true, release: contextCompactionAwaitRejected,
+			withAwaiter: true, release: contextCompactionAwaitResult{Disposition: contextCompactionAwaitRejected},
 			wantInference: 1, wantMeasured: true, wantPressure: event.PressureCompact,
 		},
 		{
 			name: "automatic hard rejection blocks after real attempt", count: 80,
 			compaction:  &loop.CompactionPolicy{Automatic: true, CounterPolicy: loop.CounterPolicyRequireExact, CompactAt: 8_000, RearmBelow: 6_000, ReservedOutput: 20, MaxSummaryTokens: 10, CountTimeout: 31 * time.Millisecond, Hustle: "context.compact"},
-			withAwaiter: true, release: contextCompactionAwaitRejected,
+			withAwaiter: true, release: contextCompactionAwaitResult{Disposition: contextCompactionAwaitRejected},
 			wantMeasured: true, wantPressure: event.PressureHardLimit,
 			wantTerminalErr: func(err error) bool { var target *loop.ContextLimitError; return errors.As(err, &target) },
 		},
@@ -279,6 +319,201 @@ func TestLoopContextAdmissionRecountsAfterSmallerModelChange(t *testing.T) {
 			models := counter.requestModels()
 			if len(models) != 2 || models[0] != large.Key() || models[1] != smaller.Key() {
 				t.Fatalf("counted models = %+v, want [%+v %+v]", models, large.Key(), smaller.Key())
+			}
+		})
+	}
+}
+
+func TestLoopContextAdmissionRejectsStaleCountAcrossRuntimeChange(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name  string
+		apply func(*testing.T, *Loop, inference.Model) error
+	}{
+		{
+			name: "inference change",
+			apply: func(t *testing.T, actor *Loop, changed inference.Model) error {
+				t.Helper()
+				return sendChange(t, actor, command.ChangeLoopInference{Model: changed, SetModel: true}).Err
+			},
+		},
+		{
+			name: "mode change",
+			apply: func(t *testing.T, actor *Loop, _ inference.Model) error {
+				t.Helper()
+				return sendSetMode(t, actor, "changed").Err
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			capability := contextTestCapability(inference.CountQualityExactLocal)
+			counter := &gatedLoopContextCounter{capability: capability, started: make(chan inference.Request, 1), release: make(chan struct{})}
+			client := &contextOrderClient{}
+			base := testModel()
+			base.Name = "base"
+			base.Limits = inference.ContextLimits{WindowTokens: 100, MaxInputTokens: 80, MaxOutputTokens: 20}
+			changed := base
+			changed.Name = "changed"
+			definition, err := loop.Define(
+				loop.WithName("agent"), loop.WithInference(client, base),
+				loop.WithModes(loop.Mode{Name: "base"}, loop.Mode{Name: "changed", Model: changed}),
+				loop.WithInitialMode("base"),
+				loop.WithContextCounter(counter),
+				loop.WithInferenceCapability(contextTestInferenceCapability()),
+				loop.WithContextObservation(loop.ContextObservationPolicy{ReservedOutput: 20, CountTimeout: time.Second}),
+			)
+			if err != nil {
+				t.Fatalf("Define() error = %v", err)
+			}
+			bound, err := definition.Bind(context.Background(), tool.Bindings{SessionID: mustID(t), LoopID: mustID(t)})
+			if err != nil {
+				t.Fatalf("Bind() error = %v", err)
+			}
+			actor, recorder := newBoundLoop(t, client, bound)
+			client.recorder = recorder
+			startTurn(t, actor, recorder, []content.Block{&content.TextBlock{Text: "first"}})
+			select {
+			case request := <-counter.started:
+				if request.Model.Key() != base.Key() {
+					t.Fatalf("first counted model = %+v, want %+v", request.Model.Key(), base.Key())
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("first count did not start")
+			}
+			if err := tt.apply(t, actor, changed); err != nil {
+				t.Fatalf("runtime change error = %v", err)
+			}
+			close(counter.release)
+			terminal := drainToTerminal(t, recorder)
+			if _, ok := terminal.(event.TurnFailed); !ok {
+				t.Fatalf("stale-count terminal = %T, want TurnFailed", terminal)
+			}
+			for _, value := range recorder.events() {
+				if measured, ok := value.(event.ContextMeasured); ok && measured.Measurement.Model == base.Key() {
+					t.Fatal("old-model ContextMeasured published after runtime change")
+				}
+			}
+			from := len(recorder.events())
+			startTurn(t, actor, recorder, []content.Block{&content.TextBlock{Text: "second"}})
+			if terminal := awaitTerminalAfter(t, recorder, from); terminal == nil {
+				t.Fatal("second turn produced no terminal")
+			}
+			models := counter.models()
+			if len(models) != 2 || models[0] != base.Key() || models[1] != changed.Key() {
+				t.Fatalf("counted models = %+v, want [%+v %+v]", models, base.Key(), changed.Key())
+			}
+		})
+	}
+}
+
+func TestRestoredLoopAdvancesBasisWithoutCurrentMeasurement(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+	}{
+		{name: "next live turn advances restored independent basis"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			ctx, cancel := context.WithCancel(context.Background())
+			t.Cleanup(cancel)
+			recorder := &recordingPublisher{}
+			client := &contextOrderClient{recorder: recorder}
+			counter := &loopContextCounter{capability: contextTestCapability(inference.CountQualityExactLocal), counts: []content.TokenCount{40}}
+			model := testModel()
+			model.Limits = inference.ContextLimits{WindowTokens: 100, MaxInputTokens: 80, MaxOutputTokens: 20}
+			config := runtimeConfig{
+				Client: client, Model: model, System: "system", DrainTimeout: 200 * time.Millisecond,
+				ContextCounter: counter, CounterCapability: counter.capability, InferenceCapability: contextTestInferenceCapability(),
+				ContextObservation: &loop.ContextObservationPolicy{ReservedOutput: 20, CountTimeout: time.Second},
+			}
+			restoredBasis := event.ContextBasis{Revision: 10, ThroughEventID: uuid.UUID{10}}
+			actor, err := newRestoredWithConfig(ctx, uuid.UUID{5}, uuid.UUID{6}, recorder, config, RestoredState{Basis: restoredBasis, HasBasis: true})
+			if err != nil {
+				t.Fatalf("newRestoredWithConfig() error = %v", err)
+			}
+			startTurn(t, actor, recorder, []content.Block{&content.TextBlock{Text: "resume"}})
+			if terminal := drainToTerminal(t, recorder); terminal == nil {
+				t.Fatal("restored turn produced no terminal")
+			}
+			measured, _ := contextEvents(recorder.events())
+			if measured == nil || measured.Measurement.Basis.Revision != restoredBasis.Revision+1 || measured.Measurement.Basis.ThroughEventID == restoredBasis.ThroughEventID {
+				t.Fatalf("restored measurement = %+v, want revision %d through new TurnStarted", measured, restoredBasis.Revision+1)
+			}
+		})
+	}
+}
+
+func TestLoopAutomaticCompactionRetriesAfterManualOpenedRejection(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+	}{
+		{name: "machine join preserves manual opener then opens automatic attempt"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			ctx, cancel := context.WithCancel(context.Background())
+			t.Cleanup(cancel)
+			recorder := &recordingPublisher{}
+			client := &contextOrderClient{recorder: recorder}
+			capability := contextTestCapability(inference.CountQualityExactLocal)
+			counter := &gatedLoopContextCounter{capability: capability, started: make(chan inference.Request, 1), release: make(chan struct{})}
+			model := testModel()
+			model.Limits = inference.ContextLimits{WindowTokens: 100, MaxInputTokens: 80, MaxOutputTokens: 20}
+			sink := newContextAwaitSink()
+			config := runtimeConfig{
+				Client: client, Model: model, System: "system", DrainTimeout: 200 * time.Millisecond,
+				ContextCounter: counter, CounterCapability: capability, InferenceCapability: contextTestInferenceCapability(),
+				Compaction:     &loop.CompactionPolicy{Automatic: true, CounterPolicy: loop.CounterPolicyRequireExact, CompactAt: 5_000, RearmBelow: 4_000, ReservedOutput: 20, MaxSummaryTokens: 10, CountTimeout: 5 * time.Second, Hustle: "context.compact"},
+				compactionSink: sink,
+			}
+			sessionID, loopID := uuid.UUID{21}, uuid.UUID{22}
+			actor, err := newWithConfig(ctx, sessionID, loopID, Provenance{}, recorder, config)
+			if err != nil {
+				t.Fatalf("newWithConfig() error = %v", err)
+			}
+			startTurn(t, actor, recorder, []content.Block{&content.TextBlock{Text: "mixed"}})
+			select {
+			case <-counter.started:
+			case <-time.After(2 * time.Second):
+				t.Fatal("count did not start")
+			}
+			manual := command.Compact{
+				Header:      command.Header{CommandID: mustID(t), Agency: identity.AgencyUser, CreatedAt: time.Now()},
+				Coordinates: identity.Coordinates{SessionID: sessionID, LoopID: loopID},
+			}
+			if !sendCmd(t, actor, manual) {
+				t.Fatal("manual Compact did not land")
+			}
+			close(counter.release)
+			first := <-sink.started
+			if first.Kind != compactionDispositionStart || first.Attempt == nil || first.Attempt.Reason != event.CompactionReasonManual {
+				t.Fatalf("first disposition = %+v, want Manual opener", first)
+			}
+			measured, _ := contextEvents(recorder.events())
+			if measured == nil {
+				t.Fatal("missing measured basis before manual attempt")
+			}
+			sink.release <- contextCompactionAwaitResult{Disposition: contextCompactionAwaitRejected, Canonical: true, Reason: event.CompactionReasonManual, Basis: measured.Measurement.Basis}
+			select {
+			case second := <-sink.started:
+				if second.Kind != compactionDispositionStart || second.Attempt == nil || second.Attempt.Reason != event.CompactionReasonAutomatic || second.Attempt.AttemptID == first.Attempt.AttemptID {
+					t.Fatalf("second disposition = %+v, want distinct Automatic opener", second)
+				}
+				sink.release <- contextCompactionAwaitResult{Disposition: contextCompactionAwaitRejected, Canonical: true, Reason: event.CompactionReasonAutomatic, Basis: measured.Measurement.Basis}
+			case <-time.After(2 * time.Second):
+				t.Fatal("automatic attempt did not open after manual rejection")
+			}
+			if terminal := drainToTerminal(t, recorder); terminal == nil {
+				t.Fatal("mixed-origin turn produced no terminal")
+			}
+			if calls, _ := client.snapshot(); calls != 1 {
+				t.Fatalf("primary inference calls = %d, want 1 after both soft rejections", calls)
 			}
 		})
 	}
