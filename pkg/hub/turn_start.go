@@ -74,27 +74,29 @@ func (r *TurnStartReservation) Release() {
 // legacy form preserves unchecked Hub reporting semantics; construction paths that
 // must not install live state without the event use PublishTurnStartedChecked.
 func (r *TurnStartReservation) PublishTurnStarted(ctx context.Context, started event.TurnStarted) error {
-	return r.publishTurnStarted(ctx, started, turnStartPublicationUnchecked)
+	_, err := r.publishTurnStarted(ctx, started, turnStartPublicationUnchecked)
+	return err
 }
 
 // PublishTurnStartedChecked consumes the reservation with checked durable
-// publication, returning any append fault to the actor before it installs the turn.
-func (r *TurnStartReservation) PublishTurnStartedChecked(ctx context.Context, started event.TurnStarted) error {
+// publication. Committed distinguishes failure of the primary TurnStarted append
+// from a later failure while publishing its derived session activity transition.
+func (r *TurnStartReservation) PublishTurnStartedChecked(ctx context.Context, started event.TurnStarted) (committed bool, err error) {
 	return r.publishTurnStarted(ctx, started, turnStartPublicationChecked)
 }
 
-func (r *TurnStartReservation) publishTurnStarted(ctx context.Context, started event.TurnStarted, mode turnStartPublicationMode) error {
+func (r *TurnStartReservation) publishTurnStarted(ctx context.Context, started event.TurnStarted, mode turnStartPublicationMode) (bool, error) {
 	if started.SessionID != r.hub.sessionID || started.LoopID != r.loopID {
-		return &TurnStartReservationError{Reason: TurnStartReservationMismatch, LoopID: started.LoopID}
+		return false, &TurnStartReservationError{Reason: TurnStartReservationMismatch, LoopID: started.LoopID}
 	}
 	r.mu.Lock()
 	switch r.state {
 	case turnStartReservationReleased:
 		r.mu.Unlock()
-		return &TurnStartReservationError{Reason: TurnStartReservationReleased, LoopID: r.loopID}
+		return false, &TurnStartReservationError{Reason: TurnStartReservationReleased, LoopID: r.loopID}
 	case turnStartReservationPublishing, turnStartReservationPublished:
 		r.mu.Unlock()
-		return &TurnStartReservationError{Reason: TurnStartReservationReused, LoopID: r.loopID}
+		return false, &TurnStartReservationError{Reason: TurnStartReservationReused, LoopID: r.loopID}
 	}
 	r.state = turnStartReservationPublishing
 	r.mu.Unlock()
@@ -104,5 +106,5 @@ func (r *TurnStartReservation) publishTurnStarted(ctx context.Context, started e
 		r.mu.Unlock()
 		r.hub.activityMu.Unlock()
 	}()
-	return r.hub.publishEventWithActivity(ctx, started, mode == turnStartPublicationChecked, true)
+	return r.hub.publishEventWithActivityResult(ctx, started, mode == turnStartPublicationChecked, true)
 }

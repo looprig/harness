@@ -236,25 +236,30 @@ func TestTurnStartReservationRejectsInvalidUse(t *testing.T) {
 func TestTurnStartReservationCheckedPublication(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
-		name    string
-		fail    bool
-		wantErr bool
+		name          string
+		failAt        int
+		wantCommitted bool
+		wantErr       bool
 	}{
-		{name: "successful checked publication consumes reservation"},
-		{name: "append failure is returned and releases reservation", fail: true, wantErr: true},
+		{name: "successful checked publication consumes reservation", wantCommitted: true},
+		{name: "primary append failure is uncommitted and releases reservation", failAt: 1, wantErr: true},
+		{name: "derived append failure reports committed primary and releases reservation", failAt: 2, wantCommitted: true, wantErr: true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			sessionID := mustID(t)
 			loopID := mustID(t)
-			h := New(sessionID, WithAppender(&fakeAppender{failAll: tt.fail}))
+			h := New(sessionID, WithAppender(&fakeAppender{failAt: tt.failAt}))
 			reservation, err := h.ReserveTurnStart(loopID)
 			if err != nil {
 				t.Fatalf("ReserveTurnStart() error = %v", err)
 			}
 			started := event.TurnStarted{Header: event.Header{Coordinates: identity.Coordinates{SessionID: sessionID, LoopID: loopID}}}
-			err = reservation.PublishTurnStartedChecked(context.Background(), started)
+			committed, err := reservation.PublishTurnStartedChecked(context.Background(), started)
+			if committed != tt.wantCommitted {
+				t.Fatalf("PublishTurnStartedChecked() committed = %v, want %v", committed, tt.wantCommitted)
+			}
 			if (err != nil) != tt.wantErr {
 				t.Fatalf("PublishTurnStartedChecked() error = %T %v, wantErr %v", err, err, tt.wantErr)
 			}

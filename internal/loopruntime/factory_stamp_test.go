@@ -36,9 +36,9 @@ type observedTurnStartCapability struct {
 	publishes   atomic.Int32
 }
 
-func (c *observedTurnStartCapability) PublishTurnStarted(ctx context.Context, started event.TurnStarted) error {
+func (c *observedTurnStartCapability) PublishTurnStarted(ctx context.Context, started event.TurnStarted) (bool, error) {
 	c.publishes.Add(1)
-	return c.reservation.PublishTurnStarted(ctx, started)
+	return c.reservation.PublishTurnStartedChecked(ctx, started)
 }
 
 func (c *observedTurnStartCapability) Release() {

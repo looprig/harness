@@ -172,14 +172,22 @@ func (h *Hub) publishEvent(ctx context.Context, ev event.Event, checked bool) er
 }
 
 func (h *Hub) publishEventWithActivity(ctx context.Context, ev event.Event, checked, activityReserved bool) error {
+	_, err := h.publishEventWithActivityResult(ctx, ev, checked, activityReserved)
+	return err
+}
+
+// publishEventWithActivityResult reports whether the primary event reached its
+// durable append independently from any later failure stamping or appending the
+// derived session activity edge.
+func (h *Hub) publishEventWithActivityResult(ctx context.Context, ev event.Event, checked, activityReserved bool) (bool, error) {
 	if err := validatePublicPublication(ev); err != nil {
-		return err
+		return false, err
 	}
 	if err := h.beginPublish(); err != nil {
 		if checked {
-			return err
+			return false, err
 		}
-		return nil
+		return false, nil
 	}
 	defer h.finishPublish()
 	if _, mutatesActivity := activeMutation(ev); mutatesActivity && !activityReserved {
@@ -195,12 +203,13 @@ func (h *Hub) publishEventWithActivity(ctx context.Context, ev event.Event, chec
 			fault := &SessionPersistenceFault{Event: ev, Cause: err}
 			h.reporter.ReportFault(ctx, fault)
 			if checked {
-				return fault
+				return false, fault
 			}
-			return nil
+			return false, nil
 		}
 		seq = s
 	}
+	committed := true
 
 	// (3) Apply under the lock; derive the at-most-one session event D; snapshot subs.
 	subs, derived, idleGeneration := h.applyAndSnapshot(ev)
@@ -220,9 +229,9 @@ func (h *Hub) publishEventWithActivity(ctx context.Context, ev event.Event, chec
 			fault := &SessionPersistenceFault{Event: derived, Cause: err}
 			h.reporter.ReportFault(ctx, fault)
 			if checked {
-				return fault
+				return committed, fault
 			}
-			return nil
+			return committed, nil
 		}
 		derived = withHeader(derived, stamped)
 		// SessionIdle is committed through the narrow native boundary so it can acquire
@@ -244,20 +253,20 @@ func (h *Hub) publishEventWithActivity(ctx context.Context, ev event.Event, chec
 			h.completeIdleBoundary(idleGeneration, err == nil)
 			if err != nil {
 				if checked {
-					return err
+					return committed, err
 				}
-				return nil
+				return committed, nil
 			}
-			return nil
+			return committed, nil
 		}
 		ds, err := h.appender.AppendEvent(ctx, derived)
 		if err != nil {
 			fault := &SessionPersistenceFault{Event: derived, Cause: err}
 			h.reporter.ReportFault(ctx, fault)
 			if checked {
-				return fault
+				return committed, fault
 			}
-			return nil
+			return committed, nil
 		}
 		derivedSeq = ds
 	}
@@ -269,7 +278,7 @@ func (h *Hub) publishEventWithActivity(ctx context.Context, ev event.Event, chec
 		h.deliver(subs, derived, derivedSeq)
 		h.signalIdleIfEdge(derived)
 	}
-	return nil
+	return committed, nil
 }
 
 // PublishInternalEventChecked durably appends one recognized private hustle

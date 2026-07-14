@@ -191,8 +191,10 @@ type executionAdmission interface {
 
 // TurnStartCapability is the actor's opaque, one-shot authority to publish one
 // admitted turn's exact opening TurnStarted and later release its first-step reader.
+// Its committed result names the primary TurnStarted append; a later derived-session
+// transition may therefore return committed=true with a non-nil error.
 type TurnStartCapability interface {
-	PublishTurnStarted(context.Context, event.TurnStarted) error
+	PublishTurnStarted(context.Context, event.TurnStarted) (committed bool, err error)
 	Release()
 }
 
@@ -642,14 +644,12 @@ func runLoop(cfg loopConfig, state loopState) {
 			slog.Error("loop event publish to session fan-in failed", "error", err)
 		}
 	}
-	publishTurnStarted := func(ev event.TurnStarted, capability TurnStartCapability) error {
+	publishTurnStarted := func(ev event.TurnStarted, capability TurnStartCapability) (bool, error) {
 		if capability == nil {
-			return cfg.events.PublishEventChecked(ctx, ev)
+			err := cfg.events.PublishEventChecked(ctx, ev)
+			return err == nil, err
 		}
-		if err := capability.PublishTurnStarted(ctx, ev); err != nil {
-			return err
-		}
-		return nil
+		return capability.PublishTurnStarted(ctx, ev)
 	}
 	commitStampedBoundary := func(stamped event.Event) error {
 		if boundary, ok := cfg.events.(executionBoundary); ok {
@@ -973,8 +973,10 @@ func runLoop(cfg loopConfig, state loopState) {
 	// TurnStarted, then installs the corresponding live turn state,
 	// assembles the per-turn config (buildTurnConfig), then launches runTurn. It
 	// returns the new TurnID; when capability-backed opening-event preparation fails,
-	// it returns a non-nil error and starts nothing (the caller decides how to surface
-	// it). The actor is the sole caller, so it always runs with state.status idle.
+	// it returns a non-nil error and starts nothing. When the opening event committed
+	// but its derived activity transition failed, it installs the matching live start
+	// and immediately terminates it as failed without entering inference. The actor is
+	// the sole caller, so it always runs with state.status idle.
 	startTurnWithIDAndAdmission := func(turnID uuid.UUID, qi queuedInput, firstAdmission func(), capability TurnStartCapability) (uuid.UUID, error) {
 		firstLease := newAdmissionLease(firstAdmission)
 		launched := false
@@ -1007,15 +1009,25 @@ func runLoop(cfg loopConfig, state loopState) {
 		if err != nil {
 			return uuid.UUID{}, err
 		}
-		if err := publishTurnStarted(started, capability); err != nil {
-			return uuid.UUID{}, err
+		committed, publishErr := publishTurnStarted(started, capability)
+		if !committed {
+			return uuid.UUID{}, publishErr
 		}
 		mutation.commit(&state.contextTracker, &state.contextGeneration)
 		turnCtx, base := installActiveTurn(turnID, qi)
 		idx := state.turnIndex
+		cancel := state.cancelTurn
+		if publishErr != nil {
+			go func() {
+				defer cancel()
+				defer firstLease.Release()
+				internal <- turnResult{terminal: event.TurnFailed{TurnIndex: idx, Err: publishErr}}
+			}()
+			launched = true
+			return turnID, nil
+		}
 		ts := newTurnState(state.sessionID, state.id, turnID, idx, state.causationID, qi.msg)
 		turnCfg := buildTurnConfig(base, firstAdmission)
-		cancel := state.cancelTurn
 
 		go func() {
 			defer cancel()
