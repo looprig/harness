@@ -66,6 +66,10 @@ func (s *server[S, O]) handleStatus(w http.ResponseWriter, r *http.Request) {
 		writeErrorCause(w, http.StatusInternalServerError, codeInternal, msgStatusFailed, false, err)
 		return
 	}
+	if err := validateSessionStatus(status); err != nil {
+		writeErrorCause(w, http.StatusInternalServerError, codeInternal, msgStatusFailed, false, err)
+		return
+	}
 	writeJSON(w, http.StatusOK, status)
 }
 
@@ -97,6 +101,10 @@ func (s *server[S, O]) handleJournal(w http.ResponseWriter, r *http.Request) {
 
 	page, err := s.reader.ReadJournal(r.Context(), sid, JournalPage{From: from, Limit: limit})
 	if err != nil {
+		writeErrorCause(w, http.StatusInternalServerError, codeInternal, msgJournalFailed, false, err)
+		return
+	}
+	if err := validateEventJournalPage(page); err != nil {
 		writeErrorCause(w, http.StatusInternalServerError, codeInternal, msgJournalFailed, false, err)
 		return
 	}

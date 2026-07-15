@@ -2,11 +2,39 @@ package serve
 
 import (
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 
 	"github.com/looprig/harness/pkg/event"
 )
+
+func TestNonPublicEventErrorIdentity(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name       string
+		visibility event.EventVisibility
+	}{
+		{name: "internal visibility", visibility: event.Internal},
+		{name: "unknown visibility", visibility: event.EventVisibility(99)},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			original := &NonPublicEventError{Visibility: tt.visibility}
+			var got *NonPublicEventError
+			if !errors.As(original, &got) {
+				t.Fatalf("errors.As(%T) = false, want true", original)
+			}
+			if got.Visibility != tt.visibility {
+				t.Errorf("Visibility = %d, want %d", got.Visibility, tt.visibility)
+			}
+			if got.Error() != "serve: event is not public" {
+				t.Errorf("Error() = %q, want generic visibility message", got.Error())
+			}
+		})
+	}
+}
 
 // TestStatusEventMarshalJSON pins the custom serialization of a StatusEvent: the
 // codec-safe {journal_seq, event} shape where "event" is the durable envelope

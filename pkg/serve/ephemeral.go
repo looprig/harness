@@ -104,6 +104,9 @@ type compactionStartedDelta struct {
 // unrecognized Ephemeral event (an unknown future kind, or a TokenDelta whose chunk
 // variant this transport does not know). The caller writes nothing on a skip.
 func encodeDelivery(d event.Delivery) ([]byte, bool) {
+	if !isPublicEvent(d.Event) {
+		return nil, false
+	}
 	switch d.Event.Class() {
 	case event.Enduring:
 		return encodeEnduringFrame(d)
