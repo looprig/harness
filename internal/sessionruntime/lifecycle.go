@@ -5,11 +5,11 @@ import (
 	"time"
 
 	"github.com/looprig/core/uuid"
-	"github.com/looprig/harness/pkg/ceiling"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/foreignloop"
 	"github.com/looprig/harness/pkg/hustle"
 	"github.com/looprig/harness/pkg/journal"
+	"github.com/looprig/harness/pkg/security"
 	"github.com/looprig/harness/pkg/sessionstore"
 	"github.com/looprig/harness/pkg/workspacestore"
 )
@@ -56,8 +56,8 @@ const (
 	// NewSessionAppenderFailed: a checked journal appender (event/command/gate) could not be
 	// constructed over the opened journal.
 	NewSessionAppenderFailed NewSessionErrorKind = "appender_failed"
-	// NewSessionCeilingFailed: the configured factory returned no per-session ceiling.
-	NewSessionCeilingFailed NewSessionErrorKind = "ceiling_failed"
+	// NewSessionSecurityLimitFailed: the configured factory returned no per-session security.
+	NewSessionSecurityLimitFailed NewSessionErrorKind = "ceiling_failed"
 	// NewSessionRuntimeFailed: NewSession refused to build the live session over the wired dependencies.
 	NewSessionRuntimeFailed NewSessionErrorKind = "session_failed"
 )
@@ -82,11 +82,11 @@ func (e *NewSessionError) Error() string {
 
 func (e *NewSessionError) Unwrap() error { return e.Cause }
 
-// NilCeilingError reports a per-session ceiling factory that violated its contract.
+// NilSecurityLimitError reports a per-session security limit factory that violated its contract.
 // Silently minting the default would hide broken security-policy wiring.
-type NilCeilingError struct{}
+type NilSecurityLimitError struct{}
 
-func (*NilCeilingError) Error() string { return "session: ceiling factory returned nil" }
+func (*NilSecurityLimitError) Error() string { return "session: security limit factory returned nil" }
 
 // Lifecycle binds a design-time loop topology and durable backend into an immutable,
 // reusable factory for live sessions. NewTopologyLifecycle captures the caller-facing
@@ -111,7 +111,7 @@ type Lifecycle struct {
 	// NewSession and RestoreSession: limits, fingerprint projection,
 	// WithWorkspaceCheckpointing, WithForeignBuilders, WithGateCaps. They are forwarded verbatim to
 	// both NewSession and RestoreSession. The per-session dependencies (session ID,
-	// appenders, lease release, and ceiling) are appended by each lifecycle call.
+	// appenders, lease release, and security limit) are appended by each lifecycle call.
 	baseOpts []Option
 
 	// allowConfigMismatch is the NewTopologyLifecycle-time opt-in forwarded to RestoreSession ONLY (as
@@ -120,16 +120,16 @@ type Lifecycle struct {
 	// serve.Rig interface minimalism, so it is fixed for the Lifecycle's whole lifetime.
 	allowConfigMismatch bool
 
-	// ceilingFactory mints a FRESH *ceiling.State per NewSession/RestoreSession. Reusing one
-	// Lifecycle across concurrent sessions must never reuse mutable ceiling state. The
-	// Lifecycle therefore mints a per-session state here and injects it via WithCeiling so
-	// the session's ceiling source is isolated. Every loop PermissionFactory receives this
+	// security limitFactory mints a FRESH *security.Limit per NewSession/RestoreSession. Reusing one
+	// Lifecycle across concurrent sessions must never reuse mutable security limit state. The
+	// Lifecycle therefore mints a per-session state here and injects it via WithSecurityLimit so
+	// the session's security limit source is isolated. Every loop PermissionFactory receives this
 	// exact live source through tool.Bindings, so native permission checkers can select
 	// postures on each Check. When the factory is nil the Lifecycle falls
-	// back to today's behavior — the session default-mints its own internal ceiling state.
-	ceilingFactory    CeilingFactory
-	fingerprint       FingerprintProvider
-	frozenFingerprint *event.ConfigFingerprint
+	// back to today's behavior — the session default-mints its own internal security limit state.
+	securityLimitFactory SecurityLimitFactory
+	fingerprint          FingerprintProvider
+	frozenFingerprint    *event.ConfigFingerprint
 
 	// placement is the OPTIONAL managed-workspace placement (exclusive/per-session/shared)
 	// resolved per session by NewSession/RestoreSession. The zero value (PlacementNone) means
@@ -225,10 +225,10 @@ func WithLifecyclePlacement(p WorkspacePlacement) LifecycleOption {
 	}
 }
 
-// CeilingFactory mints a fresh security-ceiling state. The Lifecycle calls it once per
+// SecurityLimitFactory mints a fresh security limit state. The Lifecycle calls it once per
 // NewSession/RestoreSession so each session gets its own independent clamp (AMBIGUITY A1 on
-// Lifecycle.ceilingFactory). It is a named type per the codebase's prefer-named-types rule.
-type CeilingFactory func() *ceiling.State
+// Lifecycle.security limitFactory). It is a named type per the codebase's prefer-named-types rule.
+type SecurityLimitFactory func() *security.Limit
 
 // LifecycleOption configures a Lifecycle at NewTopologyLifecycle time. Every caller-facing knob is captured
 // here (the runtime NewSession/RestoreSession take none), mirroring flow's LifecycleOption model. A
@@ -310,14 +310,14 @@ func WithLifecycleAllowConfigMismatch() LifecycleOption {
 	}
 }
 
-// WithLifecycleCeilingFactory captures the factory the Lifecycle calls to mint a FRESH
-// *ceiling.State for each NewSession/RestoreSession. A nil factory is ignored (the session default-mints
-// its own internal state). See AMBIGUITY A1 on Lifecycle.ceilingFactory for why the ceiling
-// must be per-session and what the Lifecycle deliberately leaves to swe.
-func WithLifecycleCeilingFactory(factory CeilingFactory) LifecycleOption {
+// WithLifecycleSecurityLimitFactory captures the factory the Lifecycle calls to mint a FRESH
+// *security.Limit for each NewSession/RestoreSession. A nil factory is ignored (the session default-mints
+// its own internal state). See AMBIGUITY A1 on Lifecycle.security limitFactory for why the security limit
+// must be per-session and what the Lifecycle deliberately leaves to the composition root.
+func WithLifecycleSecurityLimitFactory(factory SecurityLimitFactory) LifecycleOption {
 	return func(r *Lifecycle) {
 		if factory != nil {
-			r.ceilingFactory = factory
+			r.securityLimitFactory = factory
 		}
 	}
 }
@@ -425,16 +425,16 @@ func (r *Lifecycle) NewSession(ctx context.Context, seed workspacestore.Ref) (*S
 	} else {
 		opts = append(opts, WithFingerprintProvider(r.fingerprint))
 	}
-	// AMBIGUITY A1: mint a fresh per-session ceiling state so concurrent sessions never share one
+	// AMBIGUITY A1: mint a fresh per-session security limit state so concurrent sessions never share one
 	// mutable clamp. A configured factory returning nil fails closed; only an absent factory
 	// selects the session's internal default.
-	if r.ceilingFactory != nil {
-		state := r.ceilingFactory()
+	if r.securityLimitFactory != nil {
+		state := r.securityLimitFactory()
 		if state == nil {
 			releaseLease(lease)
-			return nil, &NewSessionError{Kind: NewSessionCeilingFailed, Cause: &NilCeilingError{}}
+			return nil, &NewSessionError{Kind: NewSessionSecurityLimitFailed, Cause: &NilSecurityLimitError{}}
 		}
-		opts = append(opts, WithCeiling(state))
+		opts = append(opts, WithSecurityLimit(state))
 	}
 
 	// Resolve the managed-workspace placement (design §"Placement details"). The session
@@ -522,15 +522,15 @@ func (r *Lifecycle) RestoreSession(ctx context.Context, id uuid.UUID) (*Session,
 	if r.allowConfigMismatch {
 		opts = append(opts, WithAllowConfigMismatch())
 	}
-	// AMBIGUITY A1: mint a fresh per-session ceiling on restore too (WithCeiling applies to
-	// RestoreSession, which re-seeds the injected state from the folded SecurityCeilingChanged
+	// AMBIGUITY A1: mint a fresh per-session security limit on restore too (WithSecurityLimit applies to
+	// RestoreSession, which re-seeds the injected state from the folded SecurityLimitChanged
 	// events), so a restored session gets its own clamp just like a fresh NewSession.
-	if r.ceilingFactory != nil {
-		state := r.ceilingFactory()
+	if r.securityLimitFactory != nil {
+		state := r.securityLimitFactory()
 		if state == nil {
-			return nil, &NilCeilingError{}
+			return nil, &NilSecurityLimitError{}
 		}
-		opts = append(opts, WithCeiling(state))
+		opts = append(opts, WithSecurityLimit(state))
 	}
 	if r.placement.Configured() {
 		opts = append(opts, withPlacementSpec(r.placement))

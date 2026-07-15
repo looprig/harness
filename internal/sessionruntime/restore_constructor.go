@@ -6,7 +6,6 @@ import (
 
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/internal/loopruntime"
-	"github.com/looprig/harness/pkg/ceiling"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/foreignloop"
 	"github.com/looprig/harness/pkg/gate"
@@ -14,6 +13,7 @@ import (
 	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/journal"
 	"github.com/looprig/harness/pkg/loop"
+	"github.com/looprig/harness/pkg/security"
 	"github.com/looprig/harness/pkg/sessionstore"
 	"github.com/looprig/harness/pkg/tool"
 	"github.com/looprig/harness/pkg/workspacestore"
@@ -122,8 +122,8 @@ func restoreTopologySession(
 	if constructionAbortTimeout <= 0 {
 		constructionAbortTimeout = defaultConstructionAbortTimeout
 	}
-	if probe.ceiling == nil {
-		probe.ceiling = ceiling.New()
+	if probe.securityLimit == nil {
+		probe.securityLimit = security.New()
 	}
 	allowMismatch := probe.allowConfigMismatch
 	if probe.fingerprint == nil && probe.frozenFingerprint == nil {
@@ -221,9 +221,9 @@ func restoreTopologySession(
 	if repairErr != nil {
 		return recordErrored(&RestoreError{Kind: RestoreReplayFailed, Cause: repairErr})
 	}
-	ceilingLevel, hasCeiling := lastSecurityCeiling(all)
-	if hasCeiling {
-		probe.ceiling.Set(ceilingLevel)
+	securityLevel, hasSecurityLimit := lastSecurityLimit(all)
+	if hasSecurityLimit {
+		probe.securityLimit.Set(securityLevel)
 	}
 
 	persisted, err := firstConfigFingerprint(all)
@@ -273,7 +273,7 @@ func restoreTopologySession(
 		}
 		return restoredContextDisposition(persisted, probe.projectFingerprint(bound), allowMismatch)
 	}
-	plans, activePlan, err := planLoops(sessionCtx, sessionID, topology, activeDefinition, roots, starts, allRecords, allowMismatch, contextDisposition, manager, probe.ceiling, probe.newWorkspaceBinding)
+	plans, activePlan, err := planLoops(sessionCtx, sessionID, topology, activeDefinition, roots, starts, allRecords, allowMismatch, contextDisposition, manager, probe.securityLimit, probe.newWorkspaceBinding)
 	if err != nil {
 		return recordErrored(err)
 	}
@@ -292,8 +292,8 @@ func restoreTopologySession(
 	// session-scoped. Consumed at the pre-RestoreDone seam below.
 	wsRef, hasWorkspacePointer := effectiveCurrentWorkspace(all)
 
-	// The last durable security-ceiling ordinal to re-seed on resume (if the session ever
-	// changed it) — folded from the SAME unnarrowed discovery drain (SecurityCeilingChanged
+	// The last durable security limit ordinal to re-seed on resume (if the session ever
+	// changed it) — folded from the SAME unnarrowed discovery drain (SecurityLimitChanged
 	// is session-scoped), last write wins. Absent means the session resumes at the fail-
 	// secure most-restrictive default. Seeded into the restored session below.
 	// Gate recovery folds the same record replay so private GatePreparedRecord payloads are
@@ -378,7 +378,7 @@ func restoreTopologySession(
 	// re-acquire without waiting out the TTL. We append WithLeaseRelease AFTER the caller's
 	// opts so the restore owns the lease lifecycle (a caller cannot accidentally override
 	// the releaser with a stale one).
-	leaseOpts := append(append([]Option(nil), opts...), WithCeiling(probe.ceiling), WithLeaseRelease(lease.Release))
+	leaseOpts := append(append([]Option(nil), opts...), WithSecurityLimit(probe.securityLimit), WithLeaseRelease(lease.Release))
 	if resolved != nil {
 		// Hand the restored session the coordinator + exclusive root-lease release so its
 		// Shutdown releases the root lease before the session lease (LIFO), and so its loops'
@@ -394,7 +394,7 @@ func restoreTopologySession(
 	// stamped it on LoopStarted; late-bound adapters record it with ForeignSessionBound.
 	// buildRestoredSession fails closed on an empty sid for a foreign engine.
 	foreignSID := findForeignSID(rootEvents)
-	s, err := buildRestoredSession(sessionCtx, sessionCancel, bound, sessionID, rootLoopID, foreignSID, spawnedCount, ceilingLevel, hasCeiling, folded, activeInference, restoredGates.open, j, factory, newID, now, leaseOpts...)
+	s, err := buildRestoredSession(sessionCtx, sessionCancel, bound, sessionID, rootLoopID, foreignSID, spawnedCount, securityLevel, hasSecurityLimit, folded, activeInference, restoredGates.open, j, factory, newID, now, leaseOpts...)
 	if err != nil {
 		if constructionCleanupOwned(err) {
 			return nil, err
@@ -513,7 +513,7 @@ func discoverRoots(all []event.Event, topology Topology, allowMismatch bool) (ma
 // unknown (subagents of a single-definition run). It is the single Bind of each loop,
 // performed inside the restore lease. It returns the ordered plans and the active plan, or a
 // typed error the caller records as a RestoreErrored.
-func planLoops(sessionCtx context.Context, sessionID uuid.UUID, topology Topology, activeDefinition loop.Definition, roots map[identity.AgentName]event.LoopStarted, starts []event.LoopStarted, allRecords []journal.JournalRecord, allowMismatch bool, contextDisposition func(loop.BoundDefinition) (bool, error), manager *delegationManager, ceilingSource ceiling.Source, wsBind func() *tool.WorkspaceBinding) ([]loopPlan, loopPlan, error) {
+func planLoops(sessionCtx context.Context, sessionID uuid.UUID, topology Topology, activeDefinition loop.Definition, roots map[identity.AgentName]event.LoopStarted, starts []event.LoopStarted, allRecords []journal.JournalRecord, allowMismatch bool, contextDisposition func(loop.BoundDefinition) (bool, error), manager *delegationManager, securityLimitSource security.LimitSource, wsBind func() *tool.WorkspaceBinding) ([]loopPlan, loopPlan, error) {
 	plans := make([]loopPlan, 0, len(starts))
 	boundByLoop := make(map[uuid.UUID]loop.BoundDefinition, len(starts))
 	activeIndex := -1
@@ -533,7 +533,7 @@ func planLoops(sessionCtx context.Context, sessionID uuid.UUID, topology Topolog
 			// invents a missing definition here).
 			return nil, loopPlan{}, &RestoreError{Kind: RestoreLoopFailed, Cause: &AgentNameMismatchError{Persisted: started.AgentName}}
 		}
-		bound, bindErr := definition.Bind(sessionCtx, tool.Bindings{SessionID: sessionID, LoopID: started.LoopID, Ceiling: ceilingSource, Workspace: wsBind(), Delegate: manager.controllerFor(started.LoopID, definition), ExtraTools: delegateExtraTools(definition, manager)})
+		bound, bindErr := definition.Bind(sessionCtx, tool.Bindings{SessionID: sessionID, LoopID: started.LoopID, SecurityLimit: securityLimitSource, Workspace: wsBind(), Delegate: manager.controllerFor(started.LoopID, definition), ExtraTools: delegateExtraTools(definition, manager)})
 		if bindErr != nil {
 			return nil, loopPlan{}, &RestoreError{Kind: RestoreLoopFailed, Cause: bindErr}
 		}
@@ -622,8 +622,8 @@ func buildRestoredSession(
 	sessionID, rootLoopID uuid.UUID,
 	foreignSID string,
 	spawnedCount int,
-	ceilingLevel ceiling.Level,
-	hasCeiling bool,
+	securityLevel security.Level,
+	hasSecurityLimit bool,
 	folded foldResult,
 	ri restoredInference,
 	restoredGates map[gate.ID]gateEntry,
@@ -675,16 +675,16 @@ func buildRestoredSession(
 		return abort(&RestoreError{Kind: RestoreJournalFailed, Cause: err})
 	}
 	s.gateAppender = gateAppender
-	// Default-mint the security-ceiling source (unless WithCeiling injected the shared one),
-	// then re-seed it from the folded SecurityCeilingChanged events so the recovered session
-	// — and any checker sharing this source — comes up under the ceiling it crashed at (last
-	// write wins). No lock is needed: the session is not yet reachable. An absent ceiling
+	// Default-mint the security limit source (unless WithSecurityLimit injected the shared one),
+	// then re-seed it from the folded SecurityLimitChanged events so the recovered session
+	// — and any checker sharing this source — comes up under the security limit it crashed at (last
+	// write wins). No lock is needed: the session is not yet reachable. An absent security limit
 	// (never changed) leaves the fail-secure most-restrictive default.
-	if s.ceiling == nil {
-		s.ceiling = ceiling.New()
+	if s.securityLimit == nil {
+		s.securityLimit = security.New()
 	}
-	if hasCeiling {
-		s.ceiling.Set(ceilingLevel)
+	if hasSecurityLimit {
+		s.securityLimit.Set(securityLevel)
 	}
 	// Resolve the spawn-cap defaults AFTER the options, mirroring newSession, so a restore
 	// (with or without WithLimits) has positive depth/quota caps from the first NewLoop.

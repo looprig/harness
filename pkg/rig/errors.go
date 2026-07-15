@@ -15,7 +15,7 @@ const (
 	DefinitionInvalidDelegationLimits      DefinitionErrorKind = "invalid_delegation_limits"
 	DefinitionInvalidForeignBuilders       DefinitionErrorKind = "invalid_foreign_builders"
 	DefinitionInvalidGateCaps              DefinitionErrorKind = "invalid_gate_caps"
-	DefinitionInvalidCeilingFactory        DefinitionErrorKind = "invalid_ceiling_factory"
+	DefinitionInvalidSecurityLimitFactory  DefinitionErrorKind = "invalid_ceiling_factory"
 	DefinitionDuplicateOption              DefinitionErrorKind = "duplicate_option"
 	DefinitionInvalidHustle                DefinitionErrorKind = "invalid_hustle"
 	DefinitionDuplicateHustle              DefinitionErrorKind = "duplicate_hustle"
@@ -48,13 +48,13 @@ func (e *DefinitionError) Unwrap() error { return e.Cause }
 type LifecycleErrorKind string
 
 const (
-	LifecycleContextDone        LifecycleErrorKind = "context_done"
-	LifecycleIDGenerationFailed LifecycleErrorKind = "id_generation_failed"
-	LifecycleLeaseFailed        LifecycleErrorKind = "lease_failed"
-	LifecycleJournalFailed      LifecycleErrorKind = "journal_failed"
-	LifecycleAppenderFailed     LifecycleErrorKind = "appender_failed"
-	LifecycleCeilingFailed      LifecycleErrorKind = "ceiling_failed"
-	LifecycleSessionFailed      LifecycleErrorKind = "session_failed"
+	LifecycleContextDone         LifecycleErrorKind = "context_done"
+	LifecycleIDGenerationFailed  LifecycleErrorKind = "id_generation_failed"
+	LifecycleLeaseFailed         LifecycleErrorKind = "lease_failed"
+	LifecycleJournalFailed       LifecycleErrorKind = "journal_failed"
+	LifecycleAppenderFailed      LifecycleErrorKind = "appender_failed"
+	LifecycleSecurityLimitFailed LifecycleErrorKind = "ceiling_failed"
+	LifecycleSessionFailed       LifecycleErrorKind = "session_failed"
 )
 
 type LifecycleError struct {

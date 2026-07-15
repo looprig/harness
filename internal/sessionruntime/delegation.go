@@ -10,6 +10,7 @@ import (
 
 	"github.com/looprig/core/content"
 	"github.com/looprig/core/uuid"
+	"github.com/looprig/harness/internal/delegationtool"
 	"github.com/looprig/harness/pkg/command"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/gate"
@@ -17,7 +18,6 @@ import (
 	"github.com/looprig/harness/pkg/journal"
 	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/harness/pkg/tool"
-	"github.com/looprig/harness/pkg/tools"
 )
 
 // delegation.go is the session-runtime delegation manager (design §"Synchronous and
@@ -281,9 +281,9 @@ func delegateExtraTools(def loop.Definition, manager *delegationManager) []tool.
 	if len(delegates) == 0 {
 		return nil
 	}
-	catalog := make([]tools.SubagentCatalogEntry, len(delegates))
+	catalog := make([]delegationtool.SubagentCatalogEntry, len(delegates))
 	for i, name := range delegates {
-		entry := tools.SubagentCatalogEntry{Name: name}
+		entry := delegationtool.SubagentCatalogEntry{Name: name}
 		if manager != nil {
 			if target, ok := manager.byName[name]; ok {
 				entry.Modes = []loop.ModeName{""}
@@ -294,7 +294,7 @@ func delegateExtraTools(def loop.Definition, manager *delegationManager) []tool.
 		}
 		catalog[i] = entry
 	}
-	return []tool.Definition{tools.Subagent(def.Delegation().Style, catalog)}
+	return []tool.Definition{delegationtool.Definition(def.Delegation().Style, catalog)}
 }
 
 // controllerFor builds the parent-scoped controller injected into one loop's Subagent

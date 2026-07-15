@@ -9,8 +9,8 @@ import (
 	"time"
 
 	"github.com/looprig/core/content"
-	"github.com/looprig/harness/pkg/ceiling"
 	"github.com/looprig/harness/pkg/identity"
+	"github.com/looprig/harness/pkg/security"
 	"github.com/looprig/harness/pkg/tool"
 	"github.com/looprig/inference"
 )
@@ -294,33 +294,33 @@ func TestDefinitionPermissionFactory(t *testing.T) {
 	}
 }
 
-func TestDefinitionPermissionFactoryRequiresAndReceivesCeiling(t *testing.T) {
+func TestDefinitionPermissionFactoryRequiresAndReceivesSecurityLimit(t *testing.T) {
 	t.Parallel()
-	source := ceiling.New()
-	var received ceiling.Source
-	d := mustDefinition(t, WithPolicyRevision("ceiling"), WithPermissionFactory(func(_ context.Context, bindings tool.Bindings) (PermissionGate, error) {
-		received = bindings.Ceiling
+	source := security.New()
+	var received security.LimitSource
+	d := mustDefinition(t, WithPolicyRevision("securityLimit"), WithPermissionFactory(func(_ context.Context, bindings tool.Bindings) (PermissionGate, error) {
+		received = bindings.SecurityLimit
 		return permissionGateStub{}, nil
 	}))
 	bindings := validToolBindings(t)
-	bindings.Ceiling = source
+	bindings.SecurityLimit = source
 	if _, err := d.Bind(context.Background(), bindings); err != nil {
 		t.Fatal(err)
 	}
 	if received != source {
-		t.Fatalf("factory ceiling = %p, want exact source %p", received, source)
+		t.Fatalf("factory securityLimit = %p, want exact source %p", received, source)
 	}
-	bindings.Ceiling = nil
+	bindings.SecurityLimit = nil
 	_, err := d.Bind(context.Background(), bindings)
 	var bindErr *BindError
-	if !errors.As(err, &bindErr) || bindErr.Kind != BindInvalidCeiling {
-		t.Fatalf("missing ceiling error = %v, want BindInvalidCeiling", err)
+	if !errors.As(err, &bindErr) || bindErr.Kind != BindInvalidSecurityLimit {
+		t.Fatalf("missing securityLimit error = %v, want BindInvalidSecurityLimit", err)
 	}
-	var typedNil *ceiling.State
-	bindings.Ceiling = typedNil
+	var typedNil *security.Limit
+	bindings.SecurityLimit = typedNil
 	_, err = d.Bind(context.Background(), bindings)
-	if !errors.As(err, &bindErr) || bindErr.Kind != BindInvalidCeiling {
-		t.Fatalf("typed-nil ceiling error = %v, want BindInvalidCeiling", err)
+	if !errors.As(err, &bindErr) || bindErr.Kind != BindInvalidSecurityLimit {
+		t.Fatalf("typed-nil securityLimit error = %v, want BindInvalidSecurityLimit", err)
 	}
 }
 
@@ -456,7 +456,7 @@ func TestFingerprintInitialNormalizesProducedToolNames(t *testing.T) {
 
 func validToolBindings(t *testing.T) tool.Bindings {
 	t.Helper()
-	return tool.Bindings{SessionID: mustUUID(t), LoopID: mustUUID(t), Ceiling: ceiling.New()}
+	return tool.Bindings{SessionID: mustUUID(t), LoopID: mustUUID(t), SecurityLimit: security.New()}
 }
 
 func testToolDefinition(name string, builds *atomic.Int32, toolNames []string) tool.Definition {

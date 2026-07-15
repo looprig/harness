@@ -11,43 +11,43 @@ import (
 
 	"github.com/looprig/core/content"
 	"github.com/looprig/core/uuid"
-	"github.com/looprig/harness/pkg/ceiling"
 	"github.com/looprig/harness/pkg/command"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/journal"
 	"github.com/looprig/harness/pkg/loop"
+	"github.com/looprig/harness/pkg/security"
 	"github.com/looprig/harness/pkg/tool"
 	"github.com/looprig/inference"
 )
 
 type livePermissionGate struct{ effect atomic.Uint32 }
 
-type ceilingPermissionGate struct{ source ceiling.Source }
+type securityLimitPermissionGate struct{ source security.LimitSource }
 
-type ceilingCapture struct {
+type securityLimitCapture struct {
 	mu      sync.Mutex
-	sources []ceiling.Source
+	sources []security.LimitSource
 }
 
-func (c *ceilingCapture) add(source ceiling.Source) {
+func (c *securityLimitCapture) add(source security.LimitSource) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.sources = append(c.sources, source)
 }
-func (c *ceilingCapture) snapshot() []ceiling.Source {
+func (c *securityLimitCapture) snapshot() []security.LimitSource {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return append([]ceiling.Source(nil), c.sources...)
+	return append([]security.LimitSource(nil), c.sources...)
 }
 
-func (g ceilingPermissionGate) Check(context.Context, tool.InvokableTool, string, string) loop.Effect {
+func (g securityLimitPermissionGate) Check(context.Context, tool.InvokableTool, string, string) loop.Effect {
 	if g.source.Current() == 1 {
 		return loop.EffectAutoApprove
 	}
 	return loop.EffectAsk
 }
-func (ceilingPermissionGate) Grant(context.Context, string, string, tool.ApprovalScope) error {
+func (securityLimitPermissionGate) Grant(context.Context, string, string, tool.ApprovalScope) error {
 	return nil
 }
 
@@ -909,24 +909,24 @@ func TestDelegateChildPermissionIsAttenuatedByLiveParent(t *testing.T) {
 	}
 }
 
-func TestDelegatePermissionFactoriesShareLiveSessionCeiling(t *testing.T) {
+func TestDelegatePermissionFactoriesShareLiveSessionSecurityLimit(t *testing.T) {
 	t.Parallel()
-	var parentSource, childSource ceiling.Source
+	var parentSource, childSource security.LimitSource
 	parent := mustDefine(
 		loop.WithName("parent"), loop.WithInference(&stubLLM{}, validModel("parent")),
 		loop.WithDelegates("child"), loop.WithDelegation(loop.Delegation{Style: loop.DelegationManaged}),
-		loop.WithPolicyRevision("parent-ceiling"),
+		loop.WithPolicyRevision("parent-securityLimit"),
 		loop.WithPermissionFactory(func(_ context.Context, bindings tool.Bindings) (loop.PermissionGate, error) {
-			parentSource = bindings.Ceiling
-			return ceilingPermissionGate{source: bindings.Ceiling}, nil
+			parentSource = bindings.SecurityLimit
+			return securityLimitPermissionGate{source: bindings.SecurityLimit}, nil
 		}),
 	)
 	child := mustDefine(
 		loop.WithName("child"), loop.WithInference(&stubLLM{chunks: []content.Chunk{textChunk("done")}}, validModel("child")),
-		loop.WithPolicyRevision("child-ceiling"),
+		loop.WithPolicyRevision("child-securityLimit"),
 		loop.WithPermissionFactory(func(_ context.Context, bindings tool.Bindings) (loop.PermissionGate, error) {
-			childSource = bindings.Ceiling
-			return ceilingPermissionGate{source: bindings.Ceiling}, nil
+			childSource = bindings.SecurityLimit
+			return securityLimitPermissionGate{source: bindings.SecurityLimit}, nil
 		}),
 	)
 	s := newDelegationSession(t, parent, nil, child)
@@ -935,8 +935,8 @@ func TestDelegatePermissionFactoriesShareLiveSessionCeiling(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if parentSource == nil || parentSource != childSource || parentSource != s.CeilingSource() {
-		t.Fatalf("ceiling sources parent=%p child=%p session=%p, want exact same source", parentSource, childSource, s.CeilingSource())
+	if parentSource == nil || parentSource != childSource || parentSource != s.SecurityLimitSource() {
+		t.Fatalf("security limit sources parent=%p child=%p session=%p, want exact same source", parentSource, childSource, s.SecurityLimitSource())
 	}
 	s.loopsMu.RLock()
 	permission := s.loops[res.DelegateID].bound.Permission()
@@ -944,7 +944,7 @@ func TestDelegatePermissionFactoriesShareLiveSessionCeiling(t *testing.T) {
 	if got := permission.Check(context.Background(), nil, "Bash", `{}`); got != loop.EffectAsk {
 		t.Fatalf("level0 = %v, want Ask", got)
 	}
-	if err := s.SetSecurityCeiling(context.Background(), 1); err != nil {
+	if err := s.SetSecurityLimit(context.Background(), 1); err != nil {
 		t.Fatal(err)
 	}
 	if got := permission.Check(context.Background(), nil, "Bash", `{}`); got != loop.EffectAutoApprove {
@@ -952,22 +952,22 @@ func TestDelegatePermissionFactoriesShareLiveSessionCeiling(t *testing.T) {
 	}
 }
 
-func TestPermissionCeilingIsSharedOnRestoreAndIsolatedAcrossSessions(t *testing.T) {
+func TestPermissionSecurityLimitIsSharedOnRestoreAndIsolatedAcrossSessions(t *testing.T) {
 	t.Parallel()
-	parents, children := &ceilingCapture{}, &ceilingCapture{}
+	parents, children := &securityLimitCapture{}, &securityLimitCapture{}
 	parent := mustDefine(
 		loop.WithName("parent"), loop.WithInference(&stubLLM{}, validModel("parent")), loop.WithDelegates("child"),
-		loop.WithDelegation(loop.Delegation{Style: loop.DelegationManaged}), loop.WithPolicyRevision("p-ceiling"),
+		loop.WithDelegation(loop.Delegation{Style: loop.DelegationManaged}), loop.WithPolicyRevision("p-securityLimit"),
 		loop.WithPermissionFactory(func(_ context.Context, b tool.Bindings) (loop.PermissionGate, error) {
-			parents.add(b.Ceiling)
-			return ceilingPermissionGate{b.Ceiling}, nil
+			parents.add(b.SecurityLimit)
+			return securityLimitPermissionGate{b.SecurityLimit}, nil
 		}),
 	)
 	child := mustDefine(
-		loop.WithName("child"), loop.WithInference(&stubLLM{chunks: []content.Chunk{textChunk("done")}}, validModel("child")), loop.WithPolicyRevision("c-ceiling"),
+		loop.WithName("child"), loop.WithInference(&stubLLM{chunks: []content.Chunk{textChunk("done")}}, validModel("child")), loop.WithPolicyRevision("c-securityLimit"),
 		loop.WithPermissionFactory(func(_ context.Context, b tool.Bindings) (loop.PermissionGate, error) {
-			children.add(b.Ceiling)
-			return ceilingPermissionGate{b.Ceiling}, nil
+			children.add(b.SecurityLimit)
+			return securityLimitPermissionGate{b.SecurityLimit}, nil
 		}),
 	)
 	store := newRestoreStore(t)
@@ -984,7 +984,7 @@ func TestPermissionCeilingIsSharedOnRestoreAndIsolatedAcrossSessions(t *testing.
 	if _, err := ctrl.Execute(delegateCtx(t), tool.DelegateRequest{Operation: tool.DelegateStart, Agent: "child", Message: "go", Wait: true}); err != nil {
 		t.Fatal(err)
 	}
-	if err := original.SetSecurityCeiling(context.Background(), 1); err != nil {
+	if err := original.SetSecurityLimit(context.Background(), 1); err != nil {
 		t.Fatal(err)
 	}
 	sid := original.SessionID()
@@ -997,8 +997,8 @@ func TestPermissionCeilingIsSharedOnRestoreAndIsolatedAcrossSessions(t *testing.
 	}
 	defer func() { _ = restored.Shutdown(context.Background()) }()
 	p, c := parents.snapshot(), children.snapshot()
-	if len(p) != 2 || len(c) != 2 || p[0] != c[0] || p[1] != c[1] || p[0] == p[1] || p[1] != restored.CeilingSource() || p[1].Current() != 1 {
-		t.Fatalf("sources parent=%v child=%v restored=%p level=%d", p, c, restored.CeilingSource(), restored.CeilingSource().Current())
+	if len(p) != 2 || len(c) != 2 || p[0] != c[0] || p[1] != c[1] || p[0] == p[1] || p[1] != restored.SecurityLimitSource() || p[1].Current() != 1 {
+		t.Fatalf("sources parent=%v child=%v restored=%p level=%d", p, c, restored.SecurityLimitSource(), restored.SecurityLimitSource().Current())
 	}
 	separate, err := lc.NewSession(context.Background(), "")
 	if err != nil {
@@ -1006,8 +1006,8 @@ func TestPermissionCeilingIsSharedOnRestoreAndIsolatedAcrossSessions(t *testing.
 	}
 	defer func() { _ = separate.Shutdown(context.Background()) }()
 	p = parents.snapshot()
-	if len(p) != 3 || p[2] == p[0] || p[2] == p[1] || p[2] != separate.CeilingSource() {
-		t.Fatalf("separate session reused ceiling: %v", p)
+	if len(p) != 3 || p[2] == p[0] || p[2] == p[1] || p[2] != separate.SecurityLimitSource() {
+		t.Fatalf("separate session reused securityLimit: %v", p)
 	}
 }
 

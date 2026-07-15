@@ -4,10 +4,10 @@ import (
 	"time"
 
 	"github.com/looprig/harness/internal/sessionruntime"
-	"github.com/looprig/harness/pkg/ceiling"
 	"github.com/looprig/harness/pkg/foreignloop"
 	"github.com/looprig/harness/pkg/hustle"
 	"github.com/looprig/harness/pkg/loop"
+	"github.com/looprig/harness/pkg/security"
 	"github.com/looprig/harness/pkg/sessionstore"
 )
 
@@ -20,16 +20,16 @@ type Option func(*definitionState) error
 type singletonKey string
 
 const (
-	keyActivePrimer        singletonKey = "active_primer"
-	keyDelegationLimits    singletonKey = "delegation_limits"
-	keyConfigFingerprint   singletonKey = "config_fingerprint"
-	keyForeignBuilder      singletonKey = "foreign_builders"
-	keyGateCaps            singletonKey = "gate_caps"
-	keyAllowConfigMismatch singletonKey = "allow_config_mismatch"
-	keyCeilingFactory      singletonKey = "ceiling_factory"
-	keySnapshots           singletonKey = "snapshots"
-	keyOffloadGC           singletonKey = "offload_gc"
-	keyHustleLimits        singletonKey = "hustle_limits"
+	keyActivePrimer         singletonKey = "active_primer"
+	keyDelegationLimits     singletonKey = "delegation_limits"
+	keyConfigFingerprint    singletonKey = "config_fingerprint"
+	keyForeignBuilder       singletonKey = "foreign_builders"
+	keyGateCaps             singletonKey = "gate_caps"
+	keyAllowConfigMismatch  singletonKey = "allow_config_mismatch"
+	keySecurityLimitFactory singletonKey = "ceiling_factory"
+	keySnapshots            singletonKey = "snapshots"
+	keyOffloadGC            singletonKey = "offload_gc"
+	keyHustleLimits         singletonKey = "hustle_limits"
 )
 
 // MaxHustleQueued is the largest configured waiting capacity for either hustle
@@ -58,10 +58,10 @@ type HustleLimits struct {
 	WorkerDrainTimeout   time.Duration
 }
 
-// CeilingFactory mints a fresh security-ceiling state for each session. A rig may
+// SecurityLimitFactory mints a fresh security limit state for each session. A rig may
 // invoke it concurrently for separate sessions, so captured mutable state must be
 // concurrency-safe.
-type CeilingFactory func() *ceiling.State
+type SecurityLimitFactory func() *security.Limit
 
 func WithLoops(definitions ...loop.Definition) Option {
 	copyOf := append([]loop.Definition(nil), definitions...)
@@ -162,16 +162,16 @@ func WithAllowConfigMismatch() Option {
 	return singletonCompile(keyAllowConfigMismatch, sessionruntime.WithLifecycleAllowConfigMismatch())
 }
 
-func WithCeilingFactory(factory CeilingFactory) Option {
+func WithSecurityLimitFactory(factory SecurityLimitFactory) Option {
 	return func(state *definitionState) error {
 		if factory == nil {
-			return &DefinitionError{Kind: DefinitionInvalidCeilingFactory}
+			return &DefinitionError{Kind: DefinitionInvalidSecurityLimitFactory}
 		}
-		if state.seen[keyCeilingFactory] {
-			return &DefinitionError{Kind: DefinitionDuplicateOption, Name: string(keyCeilingFactory)}
+		if state.seen[keySecurityLimitFactory] {
+			return &DefinitionError{Kind: DefinitionDuplicateOption, Name: string(keySecurityLimitFactory)}
 		}
-		state.seen[keyCeilingFactory] = true
-		state.lifecycleOptions = append(state.lifecycleOptions, sessionruntime.WithLifecycleCeilingFactory(sessionruntime.CeilingFactory(factory)))
+		state.seen[keySecurityLimitFactory] = true
+		state.lifecycleOptions = append(state.lifecycleOptions, sessionruntime.WithLifecycleSecurityLimitFactory(sessionruntime.SecurityLimitFactory(factory)))
 		return nil
 	}
 }

@@ -156,7 +156,7 @@ func encodePayload(ev Event) ([]byte, error) {
 		return marshalGateResolved(e)
 	case SessionStarted, SessionActive, SessionIdle, SessionStopped,
 		RestoreStarted, RestoreDone, WorkspaceCheckpointed, WorkspaceRestored,
-		ActiveLoopChanged, SecurityCeilingChanged,
+		ActiveLoopChanged, SecurityLimitChanged,
 		HustleStarted, HustleCompleted, HustleFailed,
 		LoopIdle, LoopStarted, DelegateRequestAccepted, LoopInferenceChanged, LoopModeChanged, ContextMeasured,
 		CompactionCommitted, CompactionRejected, CompactWaiterResolved, CompactWaiterRejected,
@@ -561,8 +561,10 @@ func decodePayload(tag string, data []byte) (Event, error) {
 		return decodePlain[WorkspaceRestored](tag, data)
 	case "ActiveLoopChanged":
 		return decodePlain[ActiveLoopChanged](tag, data)
+	case "SecurityLimitChanged":
+		return decodePlain[SecurityLimitChanged](tag, data)
 	case "SecurityCeilingChanged":
-		return decodePlain[SecurityCeilingChanged](tag, data)
+		return decodePlain[SecurityLimitChanged](tag, data)
 	case "HustleStarted":
 		return decodePlain[HustleStarted](tag, data)
 	case "HustleCompleted":

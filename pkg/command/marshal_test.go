@@ -94,8 +94,8 @@ func TestMarshalCommandRoundTrip(t *testing.T) {
 		}},
 		{"Interrupt", Interrupt{Header: fullHeader()}},
 		{"Shutdown", Shutdown{Header: fullHeader()}},
-		{"SetSecurityCeiling", SetSecurityCeiling{Header: fullHeader(), Level: 2}},
-		{"SetSecurityCeiling zero", SetSecurityCeiling{Header: fullHeader()}},
+		{"SetSecurityLimit", SetSecurityLimit{Header: fullHeader(), Level: 2}},
+		{"SetSecurityLimit zero", SetSecurityLimit{Header: fullHeader()}},
 		{"Compact", Compact{Header: fullHeader(), Coordinates: identity.Coordinates{SessionID: seededUUID(0x22), LoopID: seededUUID(0x33)}}},
 	}
 
@@ -200,7 +200,7 @@ func TestMarshalCommandEnvelopeKeys(t *testing.T) {
 		{"CancelDelegateRequest", CancelDelegateRequest{Header: fullHeader()}, CommandCancelDelegateRequest},
 		{"Interrupt", Interrupt{Header: fullHeader()}, CommandInterrupt},
 		{"Shutdown", Shutdown{Header: fullHeader()}, CommandShutdown},
-		{"SetSecurityCeiling", SetSecurityCeiling{Header: fullHeader()}, CommandSetSecurityCeiling},
+		{"SetSecurityLimit", SetSecurityLimit{Header: fullHeader()}, CommandSetSecurityLimit},
 		{"Compact", Compact{Header: fullHeader(), Coordinates: identity.Coordinates{SessionID: seededUUID(0x22), LoopID: seededUUID(0x33)}}, CommandCompact},
 	}
 
@@ -245,7 +245,7 @@ func unionInstances() []Command {
 		UserInput{}, SubagentResult{},
 		ApproveToolCall{}, DenyToolCall{}, ProvideUserInput{},
 		CancelQueuedInput{}, CancelDelegateRequest{}, Interrupt{}, Shutdown{},
-		SetSecurityCeiling{},
+		SetSecurityLimit{},
 		Compact{},
 	}
 }

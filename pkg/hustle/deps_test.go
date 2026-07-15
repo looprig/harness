@@ -20,6 +20,7 @@ func TestDependencyBoundaries(t *testing.T) {
 		"github.com/looprig/harness/pkg/session",
 		"github.com/looprig/harness/pkg/tool",
 		"github.com/looprig/harness/pkg/tools",
+		"github.com/looprig/tools",
 		"github.com/looprig/llm",
 	}
 	tests := []struct {

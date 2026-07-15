@@ -7,12 +7,12 @@ import (
 	"time"
 
 	"github.com/looprig/core/uuid"
-	"github.com/looprig/harness/pkg/ceiling"
 	"github.com/looprig/harness/pkg/command"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/foreignloop"
 	"github.com/looprig/harness/pkg/journal"
 	"github.com/looprig/harness/pkg/loop"
+	"github.com/looprig/harness/pkg/security"
 	"github.com/looprig/harness/pkg/workspacestore"
 )
 
@@ -58,19 +58,19 @@ func WithCommandAppender(a commandAppender) Option {
 	}
 }
 
-// WithCeiling injects the session's SECURITY-CEILING source — the SAME *ceiling.State the
-// composition root wires into the permission checker via tools.WithCeilingPostures.
-// Sharing ONE state is what makes SetSecurityCeiling's clamp visible to the checker on the
+// WithSecurityLimit injects the session's SECURITY LIMIT source — the SAME *security.Limit the
+// composition root wires into the permission checker via tools.WithSecurityLimitPostures.
+// Sharing ONE state is what makes SetSecurityLimit's clamp visible to the checker on the
 // next Check (SPEC §8). Without this option the session mints its own internal state
-// (SetSecurityCeiling still journals/applies/emits, but no checker observes it). A nil
+// (SetSecurityLimit still journals/applies/emits, but no checker observes it). A nil
 // state is ignored (the default internal state stays), so a wiring slip can never null the
 // field. It applies to both New and Restore — Restore re-seeds the injected state from the
-// folded SecurityCeilingChanged events, so the checker sees the recovered ceiling on
+// folded SecurityLimitChanged events, so the checker sees the recovered security limit on
 // resume.
-func WithCeiling(cs *ceiling.State) Option {
+func WithSecurityLimit(cs *security.Limit) Option {
 	return func(s *Session) {
 		if cs != nil {
-			s.ceiling = cs
+			s.securityLimit = cs
 		}
 	}
 }

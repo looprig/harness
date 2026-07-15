@@ -32,7 +32,7 @@ var (
 	_ Event = WorkspaceCheckpointed{}
 	_ Event = WorkspaceRestored{}
 	_ Event = ActiveLoopChanged{}
-	_ Event = SecurityCeilingChanged{}
+	_ Event = SecurityLimitChanged{}
 
 	// Loop-scoped events.
 	_ Event = LoopIdle{}

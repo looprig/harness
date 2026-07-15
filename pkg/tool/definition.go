@@ -8,7 +8,7 @@ import (
 	"strings"
 
 	"github.com/looprig/core/uuid"
-	"github.com/looprig/harness/pkg/ceiling"
+	"github.com/looprig/harness/pkg/security"
 )
 
 // Requirements is the set of runtime capabilities a Definition needs before it
@@ -62,12 +62,20 @@ type WorkspaceCoordinator interface {
 	Healthy() error
 }
 
+// FileObservation is the private concurrency token standard file tools keep for one
+// canonical path. It never appears in model output, events, or audit summaries.
+type FileObservation struct {
+	Observed bool
+	Present  bool
+	Hash     [32]byte
+}
+
 // WorkspaceObservations is the loop-scoped file-observation set shared between one
-// loop's file tools and its Bash tool. The file tools record/compare per-path hashes
-// through it; Bash calls InvalidateAll after an opaque whole-workspace mutation
-// because the changed paths are unknowable. Its concrete implementation lives in the
-// tools package; the runtime treats it opaquely and only ever needs InvalidateAll.
+// loop's file tools and opaque workspace mutators such as Bash. WithPath holds the
+// path's critical section for the callback, allowing a tool to compare filesystem
+// state and commit atomically relative to other operations in the same Loop.
 type WorkspaceObservations interface {
+	WithPath(canonicalPath string, fn func(*FileObservation) error) error
 	InvalidateAll()
 }
 
@@ -169,8 +177,8 @@ type DelegateController interface {
 // tool bound to the SAME loop (the file toolset and Bash). It is OPTIONAL: a nil
 // value means "no shared set", in which case the file toolset builds its own private
 // observation map and Bash performs no invalidation (the standalone/bare path). When
-// present it is created once per loop binding so a Bash run can invalidate exactly
-// the observations the loop's file tools recorded.
+// present it is created once per loop binding so independent file definitions and
+// Bash share exactly the same state.
 type WorkspaceBinding struct {
 	Root         string
 	Coordinator  WorkspaceCoordinator
@@ -183,11 +191,11 @@ type WorkspaceBinding struct {
 type Bindings struct {
 	SessionID uuid.UUID
 	LoopID    uuid.UUID
-	// Ceiling is the exact live session-scoped ordinal source. Permission factories
+	// SecurityLimit is the exact live session-scoped ordinal source. Permission factories
 	// read it on every check through consumer-defined posture tables.
-	Ceiling   ceiling.Source
-	Workspace *WorkspaceBinding
-	Delegate  DelegateController
+	SecurityLimit security.LimitSource
+	Workspace     *WorkspaceBinding
+	Delegate      DelegateController
 	// ExtraTools are additional tool definitions the LOOP appends to every mode's
 	// toolset at Bind, beyond the definition's own WithTools. The composition root uses
 	// it to inject a derived, definition-scoped tool (the delegation Subagent tool) into

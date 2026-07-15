@@ -81,14 +81,6 @@ approved design is already linked.
   workspace placement, snapshots, rewind, and file freshness; security boundaries;
   and migration from the legacy harness APIs. Compile and test example programs in CI
   to prevent drift. Extend these guides as MCP/hooks/memory/artifacts/tracing land.
-- [ ] **CLI migration spec and implementation plan** — only after the end-user guides
-  and examples pass CI, design the CLI move to the documented rig/session/workspace
-  lifecycle. Keep it separate from the harness implementation spec.
-- [ ] **SWE migration spec and implementation plan** — only after the CLI migration
-  plan, design SWE primers, delegates, modes, tool construction, workspace policy, and
-  session lifecycle on the documented public surface. Keep it separate from both the
-  harness and CLI migration specs.
-
 ## Explicitly deferred
 
 - Token/cost budgets beyond the existing delegation and per-turn tool limits.

@@ -1,16 +1,16 @@
 # CLAUDE.md — Development Guidelines
 
-## SOLID Principles (strictly enforced)
+## Design guidance
 
-**Single Responsibility** — Every struct, function, and package has exactly one reason to change. If you can't describe what it does in one sentence without "and", split it.
+Keep packages and types cohesive. Split code when responsibilities have different owners, invariants, or reasons to change, not because a description contains a particular word.
 
-**Open/Closed** — Extend behavior via interfaces and composition. Never modify a working type to add new behavior; add a new type or wrap it.
+Prefer simple changes to existing types when the behavior belongs there. Use composition when capabilities are genuinely independent.
 
 **Liskov Substitution** — Every implementation of an interface must honor the full contract. If a concrete type can't satisfy a method without panicking, returning errors the caller doesn't expect, or silently doing less, redesign the interface.
 
 **Interface Segregation** — Interfaces are small and focused. A caller should never be forced to depend on methods it doesn't use. Prefer many small interfaces over one large one.
 
-**Dependency Inversion** — Depend on interfaces, not concrete types. High-level packages must not import low-level packages directly. Wire dependencies at the composition root (main or a factory), never inside business logic.
+Define small interfaces at the package that consumes them when substitution, testing, or a stable boundary requires one. Concrete dependencies are fine when they are the intended abstraction.
 
 ## Security — First-Class, Not an Afterthought
 
@@ -43,11 +43,9 @@
 - `github.com/google/go-tdx-guest` — Intel TDX quote parsing and verification; required by internal/llm/tee for phala and chutes TEE attestation
 - `golang.org/x/crypto` — ChaCha20-Poly1305 AEAD; required by internal/llm/e2e for ML-KEM E2E envelope (stdlib has no chacha20poly1305). Also provides `x/crypto/sha3` (Keccak-256) needed by `pkg/llm/aci` for eth-address derivation + KMS-custody digest, and `x/crypto/hkdf` (HMAC-based HKDF) for the E2EE v2 key-derivation (KDF).
 - `github.com/decred/dcrd/dcrec/secp256k1/v4` (+`/ecdsa`) — secp256k1 ECDSA verify (64-byte) and public-key recovery (65-byte r‖s‖v), required by `pkg/llm/aci` to verify Dstack `aci/1` receipt signatures, keyset endorsements, and the KMS-custody chain (the gateway signs with `ecdsa-secp256k1`; stdlib has no secp256k1). **Approved 2026-06-24.** Chosen over `go-ethereum/crypto` for a far smaller dependency surface; same curve math. Note: secp256k1 is classical (protocol-mandated, verify-only) — not a quantum-safety choice.
-- `golang.org/x/net/html` — HTML tokenizer; required by the `WebSearch` tool's DuckDuckGo HTML-scrape `SearchProvider` (stdlib has no HTML parser)
-- `golang.org/x/net/idna` — IDNA/punycode host normalization (same `golang.org/x/net` module as above); required by the `Fetch` tool's persisted-approval host matching to defeat unicode homographs (stdlib has no IDNA)
 - `github.com/looprig/storage` — leaf storage contracts (`Ledger`/`Leaser`/`KV`/`Blobs`) + in-memory reference backend (`memstore`) + conformance suite (`storetest`); stdlib-only. The NATS deps moved to the `looprig/natsstore` backend module; `fsstore`/`rclonestore` are the other storage backends.
-- The TUI + CLI presentation layer (and its charm.land stack) now lives in the sibling module github.com/looprig/cli.
-- The transcript reconstruction + HTML-export layer (`pkg/transcript`, `.../html`, `.../journalsource`) was archived out of harness on 2026-07-09 (moved to `../archive/transcript/`) pending relocation into the `github.com/looprig/cli` module — it had no in-harness consumer, only cli imports it. That removal dropped `github.com/yuin/goldmark` (its only user was `pkg/transcript/html`), so harness core no longer carries a CommonMark markdown renderer. See `docs/plans/2026-07-02-looprig-console-extraction-plan.md` (Task 5) for the pending cli-side relocation.
+- The interactive terminal presentation layer and its charm.land stack live in the sibling module github.com/looprig/tui.
+- The transcript reconstruction and HTML-export layer was archived out of Harness on 2026-07-09. Harness core does not carry a CommonMark renderer.
 
 ## Secure Coding Patterns
 
@@ -71,7 +69,7 @@ srv := &http.Server{
 
 **Shell commands** — Never pass user input to `exec.Command` as a shell string. Always pass args as separate parameters.
 
-> **Documented exception — the `Bash` tool (`tools/bash.go`).** `Bash` runs a single command via `sh -c <command>` — a deliberate violation of the rule above, because a coding agent genuinely needs shell features (pipes, globs, `&&`, redirects) an argv list can't express. The security boundary is the **permission gate**, not the argv shape: `Bash` defaults to **Ask**, so a human reads and approves each command before it runs. `DeniedBashPrefixes` is **advisory** defense-in-depth only (trivially bypassable — `/usr/bin/sudo`, `env sudo`, …) and must never be relied on as a boundary. The real hard boundary — OS-level sandboxing (seccomp/landlock/nsjail) — is **realized** in the sibling leaf module `github.com/looprig/sandbox` (v0.1.0): Seatbelt on macOS; a namespaces + Landlock + seccomp + nftables + cgroup ladder on Linux. It is the prerequisite that makes broad `Bash` auto-approval safe, and harness couples to it **structurally** (stdlib-typed runner/guarantee interfaces — harness never imports it, verified by `pkg/tool/deps_test.go`). Auto-approval is gated on the executor's per-property `GuaranteeBits()` (§10.3): `Bash` stays **human-gated** until the wired sandbox actually enforces the required guarantees for the posture, and falls back to Ask when it does not (fail-closed). The exec call carries a `// #nosec G204` with this rationale.
+Harness defines runner and permission contracts but does not implement a shell tool. The optional `github.com/looprig/tools` module owns Bash, and `github.com/looprig/confinement` owns its reusable sandbox wiring.
 
 **File paths** — Always call `filepath.Clean` and verify the result stays within the expected root before opening files from user-supplied paths.
 
@@ -83,7 +81,7 @@ srv := &http.Server{
 
 **Tests** — Always run with `-race`: `go test -race ./...`. A test that passes without `-race` but not with it is not passing.
 
-**Table-driven tests (mandatory).** Every test function uses a `[]struct{ name string; ... }` table. Each table must cover:
+Use table-driven tests when several cases share the same setup and assertion shape. Use a focused test when one scenario is clearer. Across the relevant test suite, cover:
 - Happy path (valid, expected input → expected output)
 - Boundary values (zero, empty, max, minimum valid)
 - Error cases (invalid input, missing required fields, wrong types)
@@ -127,7 +125,7 @@ func TestFoo(t *testing.T) {
 - **Strict typing everywhere.** Never use `any` or `interface{}` except at explicit serialization boundaries (JSON unmarshal, plugin APIs). Immediately narrow to a concrete type; never pass `any` deeper into business logic. No untyped magic numbers or strings — use named constants or typed enums. Prefer named types (`type UserID string`) over bare primitives when the value has domain meaning.
 - All domain concepts are typed structs — no `map[string]interface{}` for domain data.
 - Return errors explicitly; never swallow them with `_`.
-- **All errors must be typed.** Define a concrete error struct for every distinct failure mode. Never return `errors.New("...")` or `fmt.Errorf("...")` from package-level APIs — those lose type identity at the call site. Callers must be able to `errors.As` to the concrete type to inspect cause and context. Sentinel errors (`var ErrFoo = errors.New(...)`) are permitted only for leaf errors with no additional context fields.
+- Use typed or sentinel errors for public failures that callers need to classify, recover from, or inspect. Use wrapped ordinary errors for contextual failures that callers only report.
 - Keep packages shallow and cohesive; avoid circular imports.
-- Write the interface first, then the implementation.
-- If a function exceeds ~30 lines, ask whether it violates SRP before adding more.
+- Introduce interfaces when a consumer boundary or multiple implementations justify them.
+- Split long functions when doing so clarifies ownership, invariants, or control flow. Do not optimize for an arbitrary line count.

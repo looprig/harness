@@ -153,6 +153,7 @@ func TestToolPackageDependencies(t *testing.T) {
 	}{
 		{name: "does not import loop runtime", forbidden: harnessModulePath + "/pkg/loop"},
 		{name: "does not import concrete tools", forbidden: harnessModulePath + "/pkg/tools"},
+		{name: "does not import optional tools module", forbidden: "github.com/looprig/tools"},
 	}
 	for _, tt := range tests {
 		tt := tt

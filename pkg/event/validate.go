@@ -417,11 +417,11 @@ func classify(ev Event) (name string, profile idProfile, ok bool) {
 		return "WorkspaceRestored", sessionProfile(), true
 	case ActiveLoopChanged:
 		return "ActiveLoopChanged", sessionProfile(), true
-	case SecurityCeilingChanged:
+	case SecurityLimitChanged:
 		// Session-scoped: a session-global ceiling clamp appended when the operator
 		// changes it (same shape as WorkspaceCheckpointed) — only SessionID set. Level is
 		// an opaque ordinal the validator never constrains.
-		return "SecurityCeilingChanged", sessionProfile(), true
+		return "SecurityLimitChanged", sessionProfile(), true
 	case HustleStarted:
 		return "HustleStarted", sessionProfile(), true
 	case HustleCompleted:

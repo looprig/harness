@@ -134,7 +134,7 @@ func setHeader(t *testing.T, ev event.Event, hdr event.Header) event.Event {
 	case event.WorkspaceRestored:
 		e.Header = hdr
 		return e
-	case event.SecurityCeilingChanged:
+	case event.SecurityLimitChanged:
 		e.Header = hdr
 		return e
 	default:
@@ -813,13 +813,13 @@ func TestRestoreConfigMismatch(t *testing.T) {
 // is what stops a session silently resuming under a different skill-trust mode or repo.
 func TestRestoreSwarmFingerprintMismatch(t *testing.T) {
 	persistedFields := testFingerprintFields{
-		AgentKind:                 "swe:orchestrator",
+		AgentKind:                 "coderig:operator",
 		RuntimeSkills:             true,
 		WorkspaceRoot:             "/home/user/repo",
 		NativePermissionPolicyRev: "policyrev-aaa",
 	}
 	diffKind := persistedFields
-	diffKind.AgentKind = "swe:operator"
+	diffKind.AgentKind = "coderig:reviewer"
 	diffSkills := persistedFields
 	diffSkills.RuntimeSkills = false
 	diffRoot := persistedFields

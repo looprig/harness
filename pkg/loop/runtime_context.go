@@ -13,7 +13,7 @@ import (
 //
 // The interface lives in the engine-generic loop package so the loop can depend on
 // it without importing any concrete provider; a default implementation is wired at
-// the composition root (e.g. swarms/swe), keeping this package free of os/exec.
+// the product composition root, keeping this package free of os/exec.
 type RuntimeContextProvider interface {
 	Blocks(ctx context.Context) []content.Block
 }

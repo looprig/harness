@@ -428,8 +428,8 @@ func (d Definition) Bind(ctx context.Context, bindings tool.Bindings) (BoundDefi
 		cause := &tool.InvalidBindingsError{Field: "loop_id"}
 		return nil, &BindError{Kind: BindInvalidLoopID, Index: -1, Cause: cause}
 	}
-	if d.state.permissionFactory != nil && nilLike(bindings.Ceiling) {
-		return nil, &BindError{Kind: BindInvalidCeiling, Index: -1}
+	if d.state.permissionFactory != nil && nilLike(bindings.SecurityLimit) {
+		return nil, &BindError{Kind: BindInvalidSecurityLimit, Index: -1}
 	}
 
 	type builtDefinition struct {

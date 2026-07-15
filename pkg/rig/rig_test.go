@@ -10,12 +10,12 @@ import (
 	"time"
 
 	"github.com/looprig/core/uuid"
-	"github.com/looprig/harness/pkg/ceiling"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/foreignloop"
 	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/journal"
 	"github.com/looprig/harness/pkg/loop"
+	"github.com/looprig/harness/pkg/security"
 	"github.com/looprig/harness/pkg/sessionstore"
 	"github.com/looprig/storage/memstore"
 )
@@ -139,12 +139,12 @@ func TestWithSessionStoreRejectsTypedNil(t *testing.T) {
 	}
 }
 
-func TestWithCeilingFactoryRejectsNil(t *testing.T) {
+func TestWithSecurityLimitFactoryRejectsNil(t *testing.T) {
 	t.Parallel()
-	_, err := Define(WithCeilingFactory(nil))
+	_, err := Define(WithSecurityLimitFactory(nil))
 	var target *DefinitionError
-	if !errors.As(err, &target) || target.Kind != DefinitionInvalidCeilingFactory {
-		t.Fatalf("Define() error = %T %v, want invalid-ceiling-factory DefinitionError", err, err)
+	if !errors.As(err, &target) || target.Kind != DefinitionInvalidSecurityLimitFactory {
+		t.Fatalf("Define() error = %T %v, want invalid-securityLimit-factory DefinitionError", err, err)
 	}
 }
 
@@ -203,7 +203,7 @@ func TestDefineRejectsEveryDuplicateSingletonOption(t *testing.T) {
 		{name: "foreign builders", opt: WithForeignBuilders(foreignLive, foreignRestored)},
 		{name: "gate caps", opt: WithGateCaps(GateCaps{})},
 		{name: "allow config mismatch", opt: WithAllowConfigMismatch()},
-		{name: "ceiling factory", opt: WithCeilingFactory(func() *ceiling.State { return ceiling.New() })},
+		{name: "security limit factory", opt: WithSecurityLimitFactory(func() *security.Limit { return security.New() })},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -251,7 +251,7 @@ func TestDefineFreezesAdditiveOptionInputs(t *testing.T) {
 	}
 }
 
-func TestCeilingFactoryInvokedPerConcurrentSession(t *testing.T) {
+func TestSecurityLimitFactoryInvokedPerConcurrentSession(t *testing.T) {
 	t.Parallel()
 	definition, err := loop.Define(loop.WithName("agent"), loop.WithInference(&stubLLM{}, validModel("model")))
 	if err != nil {
@@ -266,9 +266,9 @@ func TestCeilingFactoryInvokedPerConcurrentSession(t *testing.T) {
 		WithLoops(definition),
 		WithPrimers("agent"),
 		WithSessionStore(store),
-		WithCeilingFactory(func() *ceiling.State {
+		WithSecurityLimitFactory(func() *security.Limit {
 			calls.Add(1)
-			return ceiling.New()
+			return security.New()
 		}),
 	)
 	if err != nil {
@@ -296,7 +296,7 @@ func TestCeilingFactoryInvokedPerConcurrentSession(t *testing.T) {
 		}
 	}
 	if got := calls.Load(); got != sessions {
-		t.Fatalf("ceiling factory calls = %d, want %d", got, sessions)
+		t.Fatalf("security limit factory calls = %d, want %d", got, sessions)
 	}
 }
 

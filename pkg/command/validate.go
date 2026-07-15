@@ -15,15 +15,15 @@ const (
 // Command/field names for CommandValidationError. The CommandName/CommandField
 // types are reused from command.go (the existing InvalidCommandError vocabulary).
 const (
-	CommandUserInput          CommandName = "UserInput"
-	CommandSubagentResult     CommandName = "SubagentResult"
-	CommandCancelQueuedInput  CommandName = "CancelQueuedInput"
-	CommandApproveToolCall    CommandName = "ApproveToolCall"
-	CommandDenyToolCall       CommandName = "DenyToolCall"
-	CommandProvideUserInput   CommandName = "ProvideUserInput"
-	CommandSetSecurityCeiling CommandName = "SetSecurityCeiling"
-	CommandCompact            CommandName = "Compact"
-	CommandUnknown            CommandName = "Command"
+	CommandUserInput         CommandName = "UserInput"
+	CommandSubagentResult    CommandName = "SubagentResult"
+	CommandCancelQueuedInput CommandName = "CancelQueuedInput"
+	CommandApproveToolCall   CommandName = "ApproveToolCall"
+	CommandDenyToolCall      CommandName = "DenyToolCall"
+	CommandProvideUserInput  CommandName = "ProvideUserInput"
+	CommandSetSecurityLimit  CommandName = "SetSecurityLimit"
+	CommandCompact           CommandName = "Compact"
+	CommandUnknown           CommandName = "Command"
 
 	FieldCommandID       CommandField = "CommandID"
 	FieldSessionID       CommandField = "SessionID"
@@ -169,8 +169,8 @@ func commandName(cmd Command) CommandName {
 		return CommandDenyToolCall
 	case ProvideUserInput:
 		return CommandProvideUserInput
-	case SetSecurityCeiling:
-		return CommandSetSecurityCeiling
+	case SetSecurityLimit:
+		return CommandSetSecurityLimit
 	case Compact:
 		return CommandCompact
 	case Interrupt:

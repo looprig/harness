@@ -7,10 +7,10 @@ import (
 
 	"github.com/looprig/core/content"
 	"github.com/looprig/core/uuid"
-	"github.com/looprig/harness/pkg/ceiling"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/gate"
 	"github.com/looprig/harness/pkg/loop"
+	"github.com/looprig/harness/pkg/security"
 	"github.com/looprig/harness/pkg/workspacestore"
 )
 
@@ -33,7 +33,7 @@ type SessionController interface {
 	Session
 	SetActiveLoop(context.Context, uuid.UUID) error
 	LoopController(uuid.UUID) (loop.Controller, bool)
-	SetSecurityCeiling(context.Context, ceiling.Level) error
+	SetSecurityLimit(context.Context, security.Level) error
 	CheckpointWorkspace(context.Context) (workspacestore.Ref, error)
 	RestoreWorkspace(context.Context, workspacestore.Ref) error
 	Shutdown(context.Context) error

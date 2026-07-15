@@ -165,13 +165,13 @@ type PermissionGate interface {
 // MaxReadBytes is the per-file cap ReadFile/Grep apply via io.LimitReader.
 //
 // This is the §10.5 read-adaptation SEAM: it is deliberately stdlib-typed (no
-// import of any sandbox package) so a sandbox consumer (swe) can build ONE
+// import of any sandbox package) so a confinement consumer can build one
 // ReadGuard from the sandbox Policy's read rules and bind the native ReadFile/
 // Grep/Glob tools IDENTICALLY to a sandboxed `sh -c cat` — a single source of
 // truth, with no drift between the in-process guards and OS enforcement. The
 // concrete PermissionChecker already satisfies ReadGuard (via DeniedRead/
 // MaxReadBytes), so the bare harness and a sandboxed harness share one read-deny
-// contract; the swe adapter simply wraps the sandbox resolver's Resolve behind the
+// contract; the confinement adapter wraps the sandbox resolver's Resolve behind the
 // same two methods.
 type ReadGuard interface {
 	// DeniedRead reports whether reading absPath is denied by policy (e.g. the
@@ -186,7 +186,7 @@ type ReadGuard interface {
 	// or a case variant that resolves to the denied file. The native read tools
 	// honour this — ReadFile passes the containedPath-resolved abs, Grep/Glob pass
 	// the EvalSymlinks'd path via denyFilteredRel. This mirrors the sandbox Resolve
-	// contract, so the swe adapter and the native tools MUST both feed canonical
+	// contract, so the confinement adapter and the native tools must both feed canonical
 	// paths or a deny is trivially evaded.
 	DeniedRead(absPath string) bool
 	// MaxReadBytes is the per-file read cap (bytes) ReadFile/Grep apply via

@@ -20,7 +20,7 @@ type ConfigFingerprint struct {
 	// TopologyRev is the digest of ordered loop definitions, primer roots, active
 	// primer, and delegation edges owned by the rig.
 	TopologyRev string `json:"topology_rev,omitzero"`
-	// AgentKind names the agent role+swarm this session ran (e.g. "swe:orchestrator").
+	// AgentKind names the application and Loop role this session ran (e.g. "coderig:operator").
 	// It is empty for a caller that does not inject a kind (a non-swarm/legacy session).
 	AgentKind string `json:"agent_kind,omitzero"`
 	// ModelID is the model identifier the session ran against (the llm.Model.Name).

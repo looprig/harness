@@ -11,7 +11,6 @@ import (
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/internal/hustleruntime"
 	"github.com/looprig/harness/internal/loopruntime"
-	"github.com/looprig/harness/pkg/ceiling"
 	"github.com/looprig/harness/pkg/command"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/foreignloop"
@@ -20,8 +19,8 @@ import (
 	"github.com/looprig/harness/pkg/hustle"
 	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/loop"
+	"github.com/looprig/harness/pkg/security"
 	"github.com/looprig/harness/pkg/tool"
-	"github.com/looprig/harness/pkg/tools"
 	"github.com/looprig/harness/pkg/workspacestore"
 	"github.com/looprig/inference"
 )
@@ -253,16 +252,16 @@ type Session struct {
 	checkpoints         *checkpointController
 	checkpointAdmission *checkpointAdmissionGate
 
-	// ceiling is the session's live SECURITY-CEILING ordinal source (SPEC §8/§10.2): the
-	// clamp SetSecurityCeiling mutates and CeilingSource exposes. It is default-minted at
+	// security limit is the session's live SECURITY LIMIT ordinal source (SPEC §8/§10.2): the
+	// clamp SetSecurityLimit mutates and SecurityLimitSource exposes. It is default-minted at
 	// construction (New/Restore) so it is NEVER nil for a constructed session; the
-	// composition root overrides it via WithCeiling with the SAME *ceiling.State it wires
-	// into the permission checker (tools.WithCeilingPostures), so a ceiling change is
+	// composition root overrides it via WithSecurityLimit with the SAME *security.Limit it wires
+	// into the permission checker (tools.WithSecurityLimitPostures), so a security limit change is
 	// visible to the checker on the next Check. On restore it is re-seeded from the folded
-	// SecurityCeilingChanged events (last write wins). Concurrency-safe (atomic) — a
-	// checker reads Current on a loop goroutine while SetSecurityCeiling applies on the
+	// SecurityLimitChanged events (last write wins). Concurrency-safe (atomic) — a
+	// checker reads Current on a loop goroutine while SetSecurityLimit applies on the
 	// dispatch goroutine.
-	ceiling *ceiling.State
+	securityLimit *security.Limit
 
 	// gatesMu protects gates and the per-entry state transitions. The gate
 	// directory is session-owned (the session is the source of truth for which
@@ -671,7 +670,7 @@ func (s *Session) observeBestEffortCheckpointError(err error) {
 // the hub raises the fault INLINE (synchronously on the same actor goroutine, via
 // ReportFault) when the append fails, a non-nil result here means the change event did not
 // persist, so the actor declines to apply the change (fail-secure, no partial apply). It is
-// the loop-scoped counterpart to SetSecurityCeiling's own post-emit fault check.
+// the loop-scoped counterpart to SetSecurityLimit's own post-emit fault check.
 func (s *Session) FaultErr() error {
 	return s.faultIfFaulted()
 }
@@ -1144,7 +1143,7 @@ func (s *Session) newLoopWithAdmission(parent loop.Provenance, cfg loop.Definiti
 			release()
 			return uuid.UUID{}, &SessionError{Kind: SessionLoopIDGenerationFailed, Cause: err}
 		}
-		bound, err = cfg.Bind(s.sessionCtx, tool.Bindings{SessionID: s.sessionID, LoopID: loopID, Ceiling: s.ceilingState(), Workspace: s.newWorkspaceBinding(), Delegate: s.delegation.controllerFor(loopID, cfg), ExtraTools: delegateExtraTools(cfg, s.delegation)})
+		bound, err = cfg.Bind(s.sessionCtx, tool.Bindings{SessionID: s.sessionID, LoopID: loopID, SecurityLimit: s.securityLimitState(), Workspace: s.newWorkspaceBinding(), Delegate: s.delegation.controllerFor(loopID, cfg), ExtraTools: delegateExtraTools(cfg, s.delegation)})
 		if err != nil {
 			release()
 			return uuid.UUID{}, err
@@ -1514,12 +1513,12 @@ func newSessionTopology(ctx context.Context, topology Topology, newID idGenerato
 	if s.fingerprint == nil && s.frozenFingerprint == nil {
 		return abort(&MissingFingerprintProviderError{})
 	}
-	// Default-mint the security-ceiling source when the composition root did not inject
-	// one via WithCeiling, so SetSecurityCeiling/CeilingSource are always safe (never a
+	// Default-mint the security limit source when the composition root did not inject
+	// one via WithSecurityLimit, so SetSecurityLimit/SecurityLimitSource are always safe (never a
 	// nil-deref). A fresh session starts at the fail-secure most-restrictive ordinal (0)
-	// until a SetSecurityCeiling command changes it.
-	if s.ceiling == nil {
-		s.ceiling = ceiling.New()
+	// until a SetSecurityLimit command changes it.
+	if s.securityLimit == nil {
+		s.securityLimit = security.New()
 	}
 	// Apply the spawn-cap defaults AFTER the options so an unset (or WithLimits-supplied)
 	// Limits resolves to positive caps before the first NewLoop — a zero or negative
@@ -1597,7 +1596,7 @@ func newSessionTopology(ctx context.Context, topology Topology, newID idGenerato
 		if mintErr != nil {
 			return abort(&SessionError{Kind: SessionLoopIDGenerationFailed, Cause: mintErr})
 		}
-		bound, bindErr := definition.Bind(sessionCtx, tool.Bindings{SessionID: id, LoopID: loopID, Ceiling: s.ceilingState(), Workspace: s.newWorkspaceBinding(), Delegate: s.delegation.controllerFor(loopID, definition), ExtraTools: delegateExtraTools(definition, s.delegation)})
+		bound, bindErr := definition.Bind(sessionCtx, tool.Bindings{SessionID: id, LoopID: loopID, SecurityLimit: s.securityLimitState(), Workspace: s.newWorkspaceBinding(), Delegate: s.delegation.controllerFor(loopID, definition), ExtraTools: delegateExtraTools(definition, s.delegation)})
 		if bindErr != nil {
 			return abort(bindErr)
 		}
@@ -2089,7 +2088,7 @@ func (s *Session) newWorkspaceBinding() *tool.WorkspaceBinding {
 	if s.wsCoordinator == nil {
 		return nil
 	}
-	return &tool.WorkspaceBinding{Root: s.wsRoot, Coordinator: s.wsCoordinator, Observations: tools.NewObservations()}
+	return &tool.WorkspaceBinding{Root: s.wsRoot, Coordinator: s.wsCoordinator, Observations: tool.NewWorkspaceObservations()}
 }
 
 // shutdownTarget pairs a loop with the Ack channel of the command.Shutdown the

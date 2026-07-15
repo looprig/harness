@@ -16,16 +16,15 @@ import (
 	"github.com/looprig/core/content"
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/internal/sessionruntime"
-	"github.com/looprig/harness/pkg/ceiling"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/gate"
 	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/journal"
 	"github.com/looprig/harness/pkg/loop"
+	"github.com/looprig/harness/pkg/security"
 	"github.com/looprig/harness/pkg/session"
 	"github.com/looprig/harness/pkg/sessionstore"
 	"github.com/looprig/harness/pkg/tool"
-	harnesstools "github.com/looprig/harness/pkg/tools"
 	"github.com/looprig/harness/pkg/workspacestore"
 	"github.com/looprig/inference"
 	storage "github.com/looprig/storage"
@@ -142,7 +141,7 @@ func lifecycleStore(t *testing.T) (*sessionstore.Store, *lifecycleRecordingLease
 	return store, leaser
 }
 
-func TestNewSessionRejectsNilCeilingFromFactoryAndCleansUp(t *testing.T) {
+func TestNewSessionRejectsNilSecurityLimitFromFactoryAndCleansUp(t *testing.T) {
 	store, leases := lifecycleStore(t)
 	rootBackend := memstore.New()
 	rootLeases := &lifecycleRecordingLeaser{inner: rootBackend.Leaser}
@@ -158,7 +157,7 @@ func TestNewSessionRejectsNilCeilingFromFactoryAndCleansUp(t *testing.T) {
 		WithLoops(definition),
 		WithPrimers("agent"),
 		WithSessionStore(store),
-		WithCeilingFactory(func() *ceiling.State { return nil }),
+		WithSecurityLimitFactory(func() *security.Limit { return nil }),
 		WithExclusiveWorkspace(workspace, t.TempDir(), rootLeases),
 		WithSnapshots(SnapshotPolicy{Trigger: SnapshotManual}),
 	)
@@ -170,18 +169,18 @@ func TestNewSessionRejectsNilCeilingFromFactoryAndCleansUp(t *testing.T) {
 		t.Fatal("NewSession returned partial session")
 	}
 	var target *LifecycleError
-	if !errors.As(err, &target) || target.Kind != LifecycleCeilingFailed {
-		t.Fatalf("NewSession error = %T %v, want ceiling stage", err, err)
+	if !errors.As(err, &target) || target.Kind != LifecycleSecurityLimitFailed {
+		t.Fatalf("NewSession error = %T %v, want securityLimit stage", err, err)
 	}
 	if !leases.balanced() {
 		t.Fatalf("lease counts = acquired %d released %d", leases.acquired, leases.released)
 	}
 	if rootLeases.acquired != 0 {
-		t.Fatalf("root lease acquisitions = %d, want 0 after ceiling-stage failure", rootLeases.acquired)
+		t.Fatalf("root lease acquisitions = %d, want 0 after securityLimit-stage failure", rootLeases.acquired)
 	}
 }
 
-func TestRestoreSessionRejectsNilCeilingFromFactoryBeforeAdmission(t *testing.T) {
+func TestRestoreSessionRejectsNilSecurityLimitFromFactoryBeforeAdmission(t *testing.T) {
 	store, leases := lifecycleStore(t)
 	original := lifecycleRig(t, store)
 	s, err := original.NewSession(context.Background())
@@ -199,7 +198,7 @@ func TestRestoreSessionRejectsNilCeilingFromFactoryBeforeAdmission(t *testing.T)
 	}
 	restoring, err := Define(
 		WithLoops(restoringDefinition), WithPrimers("agent"), WithSessionStore(store),
-		WithCeilingFactory(func() *ceiling.State { return nil }),
+		WithSecurityLimitFactory(func() *security.Limit { return nil }),
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -210,8 +209,8 @@ func TestRestoreSessionRejectsNilCeilingFromFactoryBeforeAdmission(t *testing.T)
 		t.Fatal("RestoreSession returned partial session")
 	}
 	var target *LifecycleError
-	if !errors.As(err, &target) || target.Kind != LifecycleCeilingFailed {
-		t.Fatalf("RestoreSession error = %T %v, want ceiling stage", err, err)
+	if !errors.As(err, &target) || target.Kind != LifecycleSecurityLimitFailed {
+		t.Fatalf("RestoreSession error = %T %v, want securityLimit stage", err, err)
 	}
 	if !leases.balanced() {
 		t.Fatalf("lease counts = acquired %d released %d", leases.acquired, leases.released)
@@ -546,11 +545,6 @@ func (lifecyclePermissionGate) Check(context.Context, tool.InvokableTool, string
 func (lifecyclePermissionGate) Grant(context.Context, string, string, tool.ApprovalScope) error {
 	return nil
 }
-
-type lifecycleReadGuard struct{}
-
-func (lifecycleReadGuard) DeniedRead(string) bool { return false }
-func (lifecycleReadGuard) MaxReadBytes() int64    { return 1 << 20 }
 
 func TestNewSessionWithSeedCommitsCheckpointBeforeAnyLoopStarts(t *testing.T) {
 	store, _ := lifecycleStore(t)
@@ -1024,9 +1018,16 @@ func TestRestoreAcceptsLegacyBoundFingerprintForFilesAndInjectedSubagent(t *test
 	fields := ConfigFingerprintFields{WorkspaceRoot: placementFingerprint(placement, root)}
 
 	var permissionBinds atomic.Int32
+	fileDefinitions := make([]tool.Definition, 0, 3)
+	for _, name := range []string{"ReadFile", "WriteFile", "EditFile"} {
+		name := name
+		fileDefinitions = append(fileDefinitions, tool.NewDefinition(name, tool.RequiresWorkspace, func(context.Context, tool.Bindings) ([]tool.InvokableTool, error) {
+			return []tool.InvokableTool{fpTool{name: name}}, nil
+		}))
+	}
 	primer, err := loop.Define(
 		loop.WithName("primer"), loop.WithInference(&stubLLM{}, validModel("model")),
-		loop.WithTools(harnesstools.Files(lifecycleReadGuard{})),
+		loop.WithTools(fileDefinitions...),
 		loop.WithDelegates("delegate"),
 		loop.WithPolicyRevision("legacy-files-delegate"),
 		loop.WithPermissionFactory(func(context.Context, tool.Bindings) (loop.PermissionGate, error) {

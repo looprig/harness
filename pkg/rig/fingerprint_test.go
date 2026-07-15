@@ -252,7 +252,7 @@ func TestFingerprintWithMergesSwarmFields(t *testing.T) {
 
 	cfg := fpConfig("model-x", "prompt", "Read")
 	base := ConfigFingerprintFields{
-		AgentKind:     "swe:orchestrator",
+		AgentKind:     "coderig:operator",
 		RuntimeSkills: true,
 		WorkspaceRoot: "/home/user/repo",
 	}
@@ -270,7 +270,7 @@ func TestFingerprintWithMergesSwarmFields(t *testing.T) {
 	}
 
 	diffKind := base
-	diffKind.AgentKind = "swe:operator"
+	diffKind.AgentKind = "coderig:reviewer"
 	diffSkills := base
 	diffSkills.RuntimeSkills = false
 	diffRoot := base

@@ -117,7 +117,7 @@ type GrantDisplay struct {
 // the persisted exact-command Match is unchanged): they are durably journaled here
 // and rendered by the cli TUI, which type-asserts tool.BashRequest and reads .Grants
 // directly (the same way it renders richer file-diff detail). A maintainer should not
-// read Grants as wired through Description() — the rendering lives in the cli module.
+// read Grants as wired through Description() — the rendering lives in the TUI module.
 type BashRequest struct {
 	Command string
 	Grants  []GrantDisplay `json:"grants,omitempty"`
