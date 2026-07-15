@@ -96,6 +96,7 @@ func TestMarshalCommandRoundTrip(t *testing.T) {
 		{"Shutdown", Shutdown{Header: fullHeader()}},
 		{"SetSecurityCeiling", SetSecurityCeiling{Header: fullHeader(), Level: 2}},
 		{"SetSecurityCeiling zero", SetSecurityCeiling{Header: fullHeader()}},
+		{"Compact", Compact{Header: fullHeader(), Coordinates: identity.Coordinates{SessionID: seededUUID(0x22), LoopID: seededUUID(0x33)}}},
 	}
 
 	for _, tt := range tests {
@@ -200,6 +201,7 @@ func TestMarshalCommandEnvelopeKeys(t *testing.T) {
 		{"Interrupt", Interrupt{Header: fullHeader()}, CommandInterrupt},
 		{"Shutdown", Shutdown{Header: fullHeader()}, CommandShutdown},
 		{"SetSecurityCeiling", SetSecurityCeiling{Header: fullHeader()}, CommandSetSecurityCeiling},
+		{"Compact", Compact{Header: fullHeader(), Coordinates: identity.Coordinates{SessionID: seededUUID(0x22), LoopID: seededUUID(0x33)}}, CommandCompact},
 	}
 
 	for _, tt := range tests {
@@ -233,7 +235,7 @@ func TestMarshalCommandEnvelopeKeys(t *testing.T) {
 // fails TestMarshalCommandCoversEveryType. A missed command type is an
 // unpersistable intent-log record = silent restore data loss, which this guard
 // forbids.
-const wantCommandTypes = 10
+const wantCommandTypes = 11
 
 // unionInstances is one zero-valued instance of EVERY concrete command type. The
 // drift guard asserts the codec handles each, so a new union member is forced
@@ -244,6 +246,7 @@ func unionInstances() []Command {
 		ApproveToolCall{}, DenyToolCall{}, ProvideUserInput{},
 		CancelQueuedInput{}, CancelDelegateRequest{}, Interrupt{}, Shutdown{},
 		SetSecurityCeiling{},
+		Compact{},
 	}
 }
 
@@ -393,6 +396,7 @@ func FuzzDecodeCommand(f *testing.F) {
 		CancelQueuedInput{Header: fullHeader(), Coordinates: identity.Coordinates{SessionID: seededUUID(0x22), LoopID: seededUUID(0x33)}, TargetCommandID: seededUUID(0x88)},
 		Interrupt{Header: fullHeader()},
 		Shutdown{Header: fullHeader()},
+		Compact{Header: fullHeader(), Coordinates: identity.Coordinates{SessionID: seededUUID(0x22), LoopID: seededUUID(0x33)}},
 	}
 	for _, c := range seeds {
 		if data, err := MarshalCommand(c); err == nil {

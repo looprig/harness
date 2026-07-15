@@ -8,8 +8,8 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/looprig/harness/pkg/tool"
 	"github.com/looprig/core/uuid"
+	"github.com/looprig/harness/pkg/tool"
 )
 
 // todo.go implements the Todo tool (design §4b, row Todo; impl plan row 6.10).

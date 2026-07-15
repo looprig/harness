@@ -53,7 +53,13 @@ func (s *Session) attachRestoredLoop(started event.LoopStarted, parent loop.Prov
 	var err error
 	switch bound.Engine() {
 	case loop.EngineNative:
-		backend, err = loopruntime.NewRestored(loopCtx, s.sessionID, started.LoopID, parent, s, bound, restoredStateFrom(folded, ri))
+		var compactor loopruntime.Compactor
+		compactor, err = s.compactorFor(bound, started.LoopID)
+		if err == nil {
+			backend, err = loopruntime.NewRestoredWithCompactor(
+				loopCtx, s.sessionID, started.LoopID, parent, s, bound, restoredStateFrom(folded, ri), compactor,
+			)
+		}
 	default:
 		if foreignSID == "" {
 			cancel()
@@ -151,7 +157,7 @@ func restoreTopologySession(
 	// step-1 setup step (parallel to the journal): a failure releases the lease and
 	// returns without a RestoreErrored, exactly like the journal-setup failure above (the
 	// first restore MUTATION, RestoreStarted, has not been written yet).
-	replayer, err := store.OpenRecordReplayer(sessionID, sessionstore.ReplayRequest{FromSeq: 0})
+	replayer, err := store.OpenInternalRecordReplayer(sessionID, sessionstore.ReplayRequest{FromSeq: 0})
 	if err != nil {
 		releaseLease(lease)
 		return nil, &RestoreError{Kind: RestoreReplayFailed, Cause: err}
@@ -204,6 +210,17 @@ func restoreTopologySession(
 		return recordErrored(&RestoreError{Kind: RestoreReplayFailed, Cause: err})
 	}
 	all := eventsFromRecords(allRecords, uuid.UUID{})
+	// Privileged lifecycle records are interpreted only for crash-consistency
+	// validation. Unmatched starts remain in the journal as interrupted audit
+	// evidence; no queue, worker, request, finalizer, activity, or synthetic
+	// terminal is reconstructed.
+	if _, auditErr := foldRestoredHustleAudit(all); auditErr != nil {
+		return recordErrored(&RestoreError{Kind: RestoreReplayFailed, Cause: auditErr})
+	}
+	compactWaiterRepairs, repairErr := planCompactWaiterRepairs(all)
+	if repairErr != nil {
+		return recordErrored(&RestoreError{Kind: RestoreReplayFailed, Cause: repairErr})
+	}
 	ceilingLevel, hasCeiling := lastSecurityCeiling(all)
 	if hasCeiling {
 		probe.ceiling.Set(ceilingLevel)
@@ -215,8 +232,10 @@ func restoreTopologySession(
 	}
 	// A rig supplies a frozen fingerprint, allowing the mismatch decision to happen
 	// immediately after replay and before root acquisition, binding, or reconstruction.
+	var frozenContextStale bool
 	if probe.frozenFingerprint != nil {
-		if err := checkFingerprint(persisted, *probe.frozenFingerprint, allowMismatch); err != nil {
+		frozenContextStale, err = restoredContextDisposition(persisted, *probe.frozenFingerprint, allowMismatch)
+		if err != nil {
 			return recordErrored(err)
 		}
 	}
@@ -248,14 +267,15 @@ func restoreTopologySession(
 	}
 
 	manager := newDelegationManager(topology)
-	plans, activePlan, err := planLoops(sessionCtx, sessionID, topology, activeDefinition, roots, starts, allRecords, allowMismatch, manager, probe.ceiling, probe.newWorkspaceBinding)
+	contextDisposition := func(bound loop.BoundDefinition) (bool, error) {
+		if probe.frozenFingerprint != nil {
+			return frozenContextStale, nil
+		}
+		return restoredContextDisposition(persisted, probe.projectFingerprint(bound), allowMismatch)
+	}
+	plans, activePlan, err := planLoops(sessionCtx, sessionID, topology, activeDefinition, roots, starts, allRecords, allowMismatch, contextDisposition, manager, probe.ceiling, probe.newWorkspaceBinding)
 	if err != nil {
 		return recordErrored(err)
-	}
-	if probe.frozenFingerprint == nil {
-		if err := checkFingerprint(persisted, probe.projectFingerprint(activePlan.bound), allowMismatch); err != nil {
-			return recordErrored(err)
-		}
 	}
 	rootLoopID := activePlan.started.LoopID
 	bound := activePlan.bound
@@ -285,6 +305,9 @@ func restoreTopologySession(
 	if err := appendRestoreEvent(ctx, j, factory, event.RestoreStarted{
 		Header: event.Header{Coordinates: identity.Coordinates{SessionID: sessionID}},
 	}); err != nil {
+		return recordErrored(&RestoreError{Kind: RestoreAppendFailed, Cause: err})
+	}
+	if err := appendCompactWaiterRepairs(ctx, j, factory, compactWaiterRepairs); err != nil {
 		return recordErrored(&RestoreError{Kind: RestoreAppendFailed, Cause: err})
 	}
 
@@ -490,7 +513,7 @@ func discoverRoots(all []event.Event, topology Topology, allowMismatch bool) (ma
 // unknown (subagents of a single-definition run). It is the single Bind of each loop,
 // performed inside the restore lease. It returns the ordered plans and the active plan, or a
 // typed error the caller records as a RestoreErrored.
-func planLoops(sessionCtx context.Context, sessionID uuid.UUID, topology Topology, activeDefinition loop.Definition, roots map[identity.AgentName]event.LoopStarted, starts []event.LoopStarted, allRecords []journal.JournalRecord, allowMismatch bool, manager *delegationManager, ceilingSource ceiling.Source, wsBind func() *tool.WorkspaceBinding) ([]loopPlan, loopPlan, error) {
+func planLoops(sessionCtx context.Context, sessionID uuid.UUID, topology Topology, activeDefinition loop.Definition, roots map[identity.AgentName]event.LoopStarted, starts []event.LoopStarted, allRecords []journal.JournalRecord, allowMismatch bool, contextDisposition func(loop.BoundDefinition) (bool, error), manager *delegationManager, ceilingSource ceiling.Source, wsBind func() *tool.WorkspaceBinding) ([]loopPlan, loopPlan, error) {
 	plans := make([]loopPlan, 0, len(starts))
 	boundByLoop := make(map[uuid.UUID]loop.BoundDefinition, len(starts))
 	activeIndex := -1
@@ -527,13 +550,24 @@ func planLoops(sessionCtx context.Context, sessionID uuid.UUID, topology Topolog
 		}
 		boundByLoop[started.LoopID] = bound
 		loopEvents := eventsFromRecords(allRecords, started.LoopID)
-		plans = append(plans, loopPlan{started: started, bound: bound, events: loopEvents, folded: foldLoop(loopEvents)})
+		plans = append(plans, loopPlan{started: started, bound: bound, events: loopEvents})
 		if started.LoopID == roots[topology.ActivePrimer].LoopID {
 			activeIndex = len(plans) - 1
 		}
 	}
 	if activeIndex < 0 {
 		return nil, loopPlan{}, &RestoreError{Kind: RestoreLoopFailed, Cause: &SessionError{Kind: SessionLoopNotFound}}
+	}
+	discardContext, dispositionErr := contextDisposition(plans[activeIndex].bound)
+	if dispositionErr != nil {
+		return nil, loopPlan{}, dispositionErr
+	}
+	for i := range plans {
+		folded, foldErr := foldLoopForRestore(plans[i].bound, plans[i].events, discardContext)
+		if foldErr != nil {
+			return nil, loopPlan{}, foldErr
+		}
+		plans[i].folded = folded
 	}
 	return plans, plans[activeIndex], nil
 }
@@ -666,6 +700,9 @@ func buildRestoredSession(
 	hubOpts := []hub.Option{hub.WithAppender(appender), hub.WithFactory(factory), hub.WithFaultReporter(s)}
 	s.hub = hub.New(sessionID, hubOpts...)
 	s.gateAppender = &liveGateAppender{prepared: gateAppender, publisher: s}
+	if err := s.bindSessionHustles(); err != nil {
+		return abort(&RestoreError{Kind: RestoreLoopFailed, Cause: err})
+	}
 	if s.snapshotPolicy != nil && s.ws != nil && s.wsCoordinator != nil {
 		s.checkpoints = newCheckpointController(checkpointControllerConfig{
 			SessionID: sessionID, Policy: *s.snapshotPolicy, Store: s.ws, Root: s.wsRoot,
@@ -690,8 +727,13 @@ func buildRestoredSession(
 	var l loop.Backend
 	switch cfg.Engine() {
 	case loop.EngineNative:
-		l, err = loopruntime.NewRestored(loopCtx, sessionID, rootLoopID, loop.Provenance{}, s, cfg,
-			restoredStateFrom(folded, ri))
+		var compactor loopruntime.Compactor
+		compactor, err = s.compactorFor(cfg, rootLoopID)
+		if err == nil {
+			l, err = loopruntime.NewRestoredWithCompactor(
+				loopCtx, sessionID, rootLoopID, loop.Provenance{}, s, cfg, restoredStateFrom(folded, ri), compactor,
+			)
+		}
 	default:
 		if foreignSID == "" {
 			cancel()
@@ -730,6 +772,40 @@ func appendRestoreEvent(ctx context.Context, j journal.SessionJournal, factory *
 	}
 	if _, err := j.Append(ctx, journal.NewEventRecord(withRestoreHeader(ev, stamped))); err != nil {
 		return err
+	}
+	return nil
+}
+
+// appendCompactWaiterRepairs durably fills terminal membership replies without
+// minting new identities. The content-addressed EventID is retained; only
+// CreatedAt is stamped at the trusted restore boundary.
+func appendCompactWaiterRepairs(ctx context.Context, j journal.SessionJournal, factory *event.Factory, repairs []event.Event) error {
+	for _, repair := range repairs {
+		var stamped event.Event
+		switch typed := repair.(type) {
+		case event.CompactWaiterResolved:
+			header, err := factory.StampCompactWaiterResolved(typed)
+			if err != nil {
+				return err
+			}
+			typed.Header = header
+			stamped = typed
+		case event.CompactWaiterRejected:
+			header, err := factory.StampCompactWaiterRejected(typed)
+			if err != nil {
+				return err
+			}
+			typed.Header = header
+			stamped = typed
+		default:
+			return &restoredCompactionError{Kind: restoredCompactionWaiterMismatch}
+		}
+		if err := event.ValidateEvent(stamped); err != nil {
+			return err
+		}
+		if _, err := j.Append(ctx, journal.NewEventRecord(stamped)); err != nil {
+			return err
+		}
 	}
 	return nil
 }

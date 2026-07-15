@@ -18,6 +18,7 @@ import (
 	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/journal"
 	"github.com/looprig/harness/pkg/tool"
+	"github.com/looprig/inference"
 	"github.com/looprig/storage"
 	"github.com/looprig/storage/memstore"
 )
@@ -82,6 +83,7 @@ func buildFixture(t *testing.T, backend *storage.Composite) fixture {
 			Coordinates: identity.Coordinates{SessionID: id, LoopID: loopID},
 			EventID:     newTestUUID(t),
 		},
+		Runtime: event.ModelRuntime{Key: inference.ModelKey{Provider: "test", Model: "model"}},
 	}
 	interrupt := command.Interrupt{Header: command.Header{CommandID: newTestUUID(t)}}
 	// > replayThreshold once marshaled: forced down the offload path on append.
@@ -226,7 +228,7 @@ func TestRecordReplayerReplaysAppended(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			rr, err := fx.store.OpenRecordReplayer(fx.id, ReplayRequest{FromSeq: tt.fromSeq})
+			rr, err := fx.store.OpenInternalRecordReplayer(fx.id, ReplayRequest{FromSeq: tt.fromSeq})
 			if err != nil {
 				t.Fatalf("OpenRecordReplayer() err = %v", err)
 			}
@@ -266,7 +268,7 @@ func TestRecordReplayerReplaysAppended(t *testing.T) {
 func TestRecordReplayerSurfacesFence(t *testing.T) {
 	t.Parallel()
 	fx := buildFixture(t, memstore.New())
-	rr, err := fx.store.OpenRecordReplayer(fx.id, ReplayRequest{FromSeq: 1})
+	rr, err := fx.store.OpenInternalRecordReplayer(fx.id, ReplayRequest{FromSeq: 1})
 	if err != nil {
 		t.Fatalf("OpenRecordReplayer() err = %v", err)
 	}
@@ -354,10 +356,12 @@ func TestEventReplayerNarrowsByLoop(t *testing.T) {
 		Header: event.Header{Coordinates: identity.Coordinates{SessionID: id}, EventID: newTestUUID(t)},
 	}
 	pLoop := event.LoopStarted{
-		Header: event.Header{Coordinates: identity.Coordinates{SessionID: id, LoopID: primary}, EventID: newTestUUID(t)},
+		Header:  event.Header{Coordinates: identity.Coordinates{SessionID: id, LoopID: primary}, EventID: newTestUUID(t)},
+		Runtime: event.ModelRuntime{Key: inference.ModelKey{Provider: "test", Model: "primary"}},
 	}
 	sLoop := event.LoopStarted{
-		Header: event.Header{Coordinates: identity.Coordinates{SessionID: id, LoopID: subagent}, EventID: newTestUUID(t)},
+		Header:  event.Header{Coordinates: identity.Coordinates{SessionID: id, LoopID: subagent}, EventID: newTestUUID(t)},
+		Runtime: event.ModelRuntime{Key: inference.ModelKey{Provider: "test", Model: "subagent"}},
 	}
 	pTurnDone := event.TurnDone{
 		Header:    event.Header{Coordinates: identity.Coordinates{SessionID: id, LoopID: primary, TurnID: pTurn}, EventID: newTestUUID(t)},
@@ -493,7 +497,7 @@ func TestReplayBlobResolution(t *testing.T) {
 			fx := buildFixture(t, backend)
 			tt.tamper(t, fx, backend)
 
-			rr, err := fx.store.OpenRecordReplayer(fx.id, ReplayRequest{FromSeq: fx.offloadSeq})
+			rr, err := fx.store.OpenInternalRecordReplayer(fx.id, ReplayRequest{FromSeq: fx.offloadSeq})
 			if err != nil {
 				t.Fatalf("OpenRecordReplayer() err = %v", err)
 			}
@@ -537,7 +541,7 @@ func TestReplayEmptySession(t *testing.T) {
 	}
 	id := newTestUUID(t)
 
-	rr, err := st.OpenRecordReplayer(id, ReplayRequest{FromSeq: 1})
+	rr, err := st.OpenInternalRecordReplayer(id, ReplayRequest{FromSeq: 1})
 	if err != nil {
 		t.Fatalf("OpenRecordReplayer() err = %v", err)
 	}
@@ -565,7 +569,7 @@ func TestReplayFollowUnsupported(t *testing.T) {
 
 	t.Run("record replayer", func(t *testing.T) {
 		t.Parallel()
-		rr, err := fx.store.OpenRecordReplayer(fx.id, ReplayRequest{FromSeq: 1})
+		rr, err := fx.store.OpenInternalRecordReplayer(fx.id, ReplayRequest{FromSeq: 1})
 		if err != nil {
 			t.Fatalf("OpenRecordReplayer() err = %v", err)
 		}
@@ -627,7 +631,7 @@ func TestReplayCursorCloseIdempotent(t *testing.T) {
 
 	t.Run("record cursor", func(t *testing.T) {
 		t.Parallel()
-		rr, err := fx.store.OpenRecordReplayer(fx.id, ReplayRequest{FromSeq: 1})
+		rr, err := fx.store.OpenInternalRecordReplayer(fx.id, ReplayRequest{FromSeq: 1})
 		if err != nil {
 			t.Fatalf("OpenRecordReplayer() err = %v", err)
 		}
@@ -794,7 +798,7 @@ func buildGateFixture(t *testing.T) fixture {
 func TestRecordReplayerReplaysGatePrepared(t *testing.T) {
 	t.Parallel()
 	fx := buildGateFixture(t)
-	rr, err := fx.store.OpenRecordReplayer(fx.id, ReplayRequest{FromSeq: 1})
+	rr, err := fx.store.OpenInternalRecordReplayer(fx.id, ReplayRequest{FromSeq: 1})
 	if err != nil {
 		t.Fatalf("OpenRecordReplayer() err = %v", err)
 	}

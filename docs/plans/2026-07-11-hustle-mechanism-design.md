@@ -324,6 +324,52 @@ type Compactor interface {
 }
 ```
 
+The compaction domain contract is public data, while its transport remains owned
+by the focused session adapter:
+
+```go
+type CompactionInput struct {
+	Basis              event.ContextBasis
+	Model              inference.ModelKey
+	RequestFingerprint [32]byte
+	Transcript         content.AgenticMessages
+	MaxSummaryTokens   content.TokenCount
+}
+
+type CompactionOutput struct {
+	Basis              event.ContextBasis
+	Model              inference.ModelKey
+	RequestFingerprint [32]byte
+	Summary            *content.UserMessage
+}
+```
+
+The adapter's only accepted wire version is the named `uint8` value
+`CompactionWireV1(1)`. Its strict lower-snake JSON forms are:
+
+```json
+{"version":1,"basis":{"revision":1,"through_event_id":"00000000-0000-0000-0000-000000000001"},"model":{"provider":"openai","model":"gpt-5"},"request_fingerprint":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","transcript":[{"role":"user","blocks":[{"type":"text","text":"continue the task"}]}],"max_summary_tokens":4096}
+{"version":1,"basis":{"revision":1,"through_event_id":"00000000-0000-0000-0000-000000000001"},"model":{"provider":"openai","model":"gpt-5"},"request_fingerprint":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","summary":"<conversation_summary><goal>continue the task</goal><constraints></constraints><decisions></decisions><state>implementation pending</state><open_items></open_items></conversation_summary>"}
+```
+
+Both codecs use `DisallowUnknownFields`, require exactly one JSON value, reject
+missing or wrongly typed fields, and accept only canonical lowercase fingerprint
+hex. The output must echo the exact input basis, model, and request fingerprint
+before summary parsing. Input domain validation requires a valid non-zero basis,
+valid model and fingerprint, a non-empty structurally marshalable transcript,
+and non-zero summary budget; failures are typed
+`CompactionInputError{Field,Cause}`.
+
+The generic runtime already requires exactly one non-empty assistant text block
+and rejects an oversized full JSON envelope before the adapter callback. The
+compaction adapter may defensively recheck its registered descriptor's raw
+`OutputBytes` for already-valid output before JSON/XML parsing. It requires
+normalized non-nil usage with non-zero `OutputTokens`, and conservatively charges
+the entire JSON response envelope against `MaxSummaryTokens`; a larger value
+fails before success audit.
+It does not expose the runner, reuse `ContextCounter`, or invent an isolated
+tokenizer contract.
+
 There is no public `Hustle[In, Out]`, no `map[string]any`, and no arbitrary
 `Session.RunHustle`. The concrete adapter owns:
 
@@ -341,6 +387,18 @@ The finalizer shape is required, not optional. A bare returned value could
 escape session ownership before the caller commits or rejects the corresponding
 product. The finalizer receives success or failure while drain ownership—and,
 for blocking work, quiescence activity—is still held.
+
+A production finalizer adapter is constructed only from that focused product
+capability. It must not receive, store, or capture `Session`, `Shutdown`, a
+shutdown function, or another generic session-control capability. It must also
+honor and preserve the supplied callback context when delegating; replacing it
+with `context.Background()` violates the same trusted internal contract as
+ignoring its deadline. Session runtime may attach a private context marker that
+refuses exact-context shutdown reentry, but that check is defense in depth—not
+goroutine identity—and cannot detect a callback that deliberately drops the
+context. The type/dependency guard rejects unregistered production
+`RunAndFinalize` consumers; each future registered adapter requires its own
+focused-capability assertion.
 
 ---
 
@@ -637,6 +695,14 @@ trusted contract is a bug, not a detached teardown mode. The session context is
 canceled only after controller drain, hub stop, and lease-release ordering is
 complete.
 
+The session may derive an outer cleanup budget from the maximum owned-run count
+and the inner bounds (including blocking acquisition, `HustleStarted`, terminal,
+and activity-release audit attempts). That budget bounds the context passed into
+close; expiry never authorizes a detached `Close` goroutine or a timed select on
+`Drained`. Shutdown invokes close synchronously and joins `Drained`
+unconditionally. The finite guarantee comes from the trusted inner
+`AuditTimeout`, `FinalizationTimeout`, and `WorkerDrainTimeout` contracts.
+
 ---
 
 ## §6 · Private durable audit
@@ -776,6 +842,38 @@ Free-text definitions require exactly one assistant text result. Structured
 definitions use `inference.DecodeOutput` from the structured-output design.
 Mixed prose/tool output, empty output, unexpected tools, multiple candidate
 values, unknown JSON fields, invalid enums, or an oversized result fail closed.
+
+Generic free-text extraction exposes only a bounded typed reason:
+
+```go
+type OutputFailureReason string
+
+const (
+	OutputFailureInvalidShape OutputFailureReason = "invalid_shape"
+	OutputFailureEmptyText    OutputFailureReason = "empty_text"
+	OutputFailureTooLarge     OutputFailureReason = "too_large"
+	OutputFailureInvalidJSON  OutputFailureReason = "invalid_json"
+)
+
+type OutputError struct {
+	Reason OutputFailureReason
+	Cause  error
+}
+
+func (e *OutputError) Unwrap() error { return e.Cause }
+```
+
+The closed validation order is shape (nil response/message, wrong role, block
+count, or non-text block), empty text, full-envelope byte cap, then JSON
+validity. Extraction failures set one valid `Reason` and a nil `Cause`;
+normalized-usage and adapter validation-callback failures set the zero/unknown
+reason and one non-nil typed `Cause`. Both-set and both-empty values are invalid.
+`OutputError` never includes raw model output. A focused adapter maps
+`invalid_shape` and `empty_text` to compaction `output_shape`, `too_large` to
+`byte_limit`, and `invalid_json` to `wire` before product finalization. A valid
+JSON result proceeds to the adapter validation callback, whose typed domain
+error remains the cause of the failed run; no raw runner capability or invalid
+output bytes cross that boundary.
 
 The adapter performs the final domain validation. For compaction, the output is
 one bounded summary string. It is later stored as data-only conversation context

@@ -3,9 +3,9 @@ package event_test
 import (
 	"testing"
 
+	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/tool"
-	"github.com/looprig/core/uuid"
 )
 
 // newID mints a UUID or fails the test.

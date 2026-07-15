@@ -9,6 +9,7 @@ type Rule string
 const (
 	// RuleRequired: the field must be non-zero for this command.
 	RuleRequired Rule = "must be set"
+	RuleInvalid  Rule = "is invalid"
 )
 
 // Command/field names for CommandValidationError. The CommandName/CommandField
@@ -21,6 +22,7 @@ const (
 	CommandDenyToolCall       CommandName = "DenyToolCall"
 	CommandProvideUserInput   CommandName = "ProvideUserInput"
 	CommandSetSecurityCeiling CommandName = "SetSecurityCeiling"
+	CommandCompact            CommandName = "Compact"
 	CommandUnknown            CommandName = "Command"
 
 	FieldCommandID       CommandField = "CommandID"
@@ -29,6 +31,7 @@ const (
 	FieldTargetCommandID CommandField = "TargetCommandID"
 	FieldTargetLoopID    CommandField = "TargetLoopID"
 	FieldToolExecutionID CommandField = "ToolExecutionID"
+	FieldAgency          CommandField = "Agency"
 )
 
 // CommandValidationError reports that a command violates the ID fill matrix: Field
@@ -72,6 +75,8 @@ func ValidateCommand(cmd Command) error {
 		return validateCancelQueuedInput(c)
 	case CancelDelegateRequest:
 		return validateCancelDelegateRequest(c)
+	case Compact:
+		return validateCompact(c)
 	case ApproveToolCall:
 		return validateGateRoute(CommandApproveToolCall, c.GateRoute)
 	case DenyToolCall:
@@ -83,6 +88,19 @@ func ValidateCommand(cmd Command) error {
 		// required (already checked above).
 		return nil
 	}
+}
+
+func validateCompact(c Compact) error {
+	if c.SessionID.IsZero() {
+		return &CommandValidationError{Command: CommandCompact, Field: FieldSessionID, Rule: RuleRequired}
+	}
+	if c.LoopID.IsZero() {
+		return &CommandValidationError{Command: CommandCompact, Field: FieldLoopID, Rule: RuleRequired}
+	}
+	if c.Agency != identity.AgencyMachine && c.Agency != identity.AgencyUser {
+		return &CommandValidationError{Command: CommandCompact, Field: FieldAgency, Rule: RuleInvalid}
+	}
+	return nil
 }
 
 // validateSubagentResult requires the embedded Coordinates.LoopID — the PARENT loop
@@ -153,6 +171,8 @@ func commandName(cmd Command) CommandName {
 		return CommandProvideUserInput
 	case SetSecurityCeiling:
 		return CommandSetSecurityCeiling
+	case Compact:
+		return CommandCompact
 	case Interrupt:
 		return CommandInterrupt
 	case Shutdown:

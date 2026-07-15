@@ -110,20 +110,32 @@ func (s *Store) OpenEventReplayer(id uuid.UUID, req ReplayRequest) (journal.Even
 		return nil, err
 	}
 	return &eventReplayer{
-		ledger:  s.backend.Ledger,
-		blobs:   s.backend.Blobs,
-		name:    name,
-		fromSeq: req.FromSeq,
+		ledger:     s.backend.Ledger,
+		blobs:      s.backend.Blobs,
+		name:       name,
+		fromSeq:    req.FromSeq,
+		publicOnly: true,
 	}, nil
 }
 
-// OpenRecordReplayer returns a read-side replayer over session id's ledger that
-// surfaces EVERY record — events, commands, AND fences — in ledger-sequence order,
-// the merged stream the transcript export consumes. Positioning comes from
-// req.FromSeq (inclusive). The returned value satisfies the unchanged
-// journal.RecordReplayer interface; its Open binds the ledger cursor. Construction
-// does no I/O, so it takes no context.
-func (s *Store) OpenRecordReplayer(id uuid.UUID, req ReplayRequest) (journal.RecordReplayer, error) {
+// OpenInternalEventReplayer returns the privileged event stream used by restore
+// and catalog repair. Product-facing readers use OpenEventReplayer instead.
+func (s *Store) OpenInternalEventReplayer(id uuid.UUID, req ReplayRequest) (journal.EventReplayer, error) {
+	name, err := sessionName(id)
+	if err != nil {
+		return nil, err
+	}
+	return &eventReplayer{ledger: s.backend.Ledger, blobs: s.backend.Blobs, name: name, fromSeq: req.FromSeq}, nil
+}
+
+// OpenInternalRecordReplayer returns the privileged full read side used by restore
+// and storage maintenance. It surfaces EVERY record — public and internal events,
+// commands, and fences — in ledger-sequence order. Product-facing readers must use
+// OpenEventReplayer, which filters non-public event visibility. Positioning comes
+// from req.FromSeq (inclusive). The returned value satisfies journal.RecordReplayer's
+// full-stream contract; its Open binds the ledger cursor. Construction does no I/O,
+// so it takes no context.
+func (s *Store) OpenInternalRecordReplayer(id uuid.UUID, req ReplayRequest) (journal.RecordReplayer, error) {
 	name, err := sessionName(id)
 	if err != nil {
 		return nil, err
@@ -141,10 +153,11 @@ func (s *Store) OpenRecordReplayer(id uuid.UUID, req ReplayRequest) (journal.Rec
 // ledger. It holds no per-replay state: every Open builds an independent ledger
 // cursor, so concurrent replays do not interfere.
 type eventReplayer struct {
-	ledger  storage.Ledger
-	blobs   storage.Blobs
-	name    string
-	fromSeq uint64
+	ledger     storage.Ledger
+	blobs      storage.Blobs
+	name       string
+	fromSeq    uint64
+	publicOnly bool
 }
 
 var _ journal.EventReplayer = (*eventReplayer)(nil)
@@ -170,7 +183,7 @@ func (r *eventReplayer) Open(ctx context.Context, req journal.ReplayRequest) (jo
 	if err != nil {
 		return nil, &ReplayReadError{Name: r.name, Cause: err}
 	}
-	return &eventCursor{loopID: req.LoopID, base: baseCursor{name: r.name, blobs: r.blobs, cur: cur}}, nil
+	return &eventCursor{loopID: req.LoopID, publicOnly: r.publicOnly, base: baseCursor{name: r.name, blobs: r.blobs, cur: cur}}, nil
 }
 
 // recordReplayer is the concrete journal.RecordReplayer over one session's storage
@@ -333,8 +346,9 @@ type eventCursor struct {
 	// events; a zero value delivers all loops' events. It mirrors the loop-narrowed
 	// subject filter of pkg/journal's EventReplayer (session-event + this loop's event
 	// subject).
-	loopID uuid.UUID
-	base   baseCursor
+	loopID     uuid.UUID
+	publicOnly bool
+	base       baseCursor
 }
 
 var _ journal.EventCursor = (*eventCursor)(nil)
@@ -371,6 +385,9 @@ func (c *eventCursor) Next(ctx context.Context) (event.Event, uint64, error) {
 // events and events of its own loop, and drops every other loop's events — routing on
 // the event's Scope()/LoopID, the same routing the journal's event records carry.
 func (c *eventCursor) deliver(ev event.Event) bool {
+	if c.publicOnly && ev.Visibility() != event.Public {
+		return false
+	}
 	if c.loopID.IsZero() {
 		return true
 	}

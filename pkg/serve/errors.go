@@ -6,6 +6,7 @@ import (
 	"net/http"
 
 	"github.com/looprig/core/uuid"
+	"github.com/looprig/harness/pkg/event"
 )
 
 // contentTypeJSON is the media type of every serve response body.
@@ -84,6 +85,15 @@ func (e StoreReadError) Error() string {
 }
 
 func (e StoreReadError) Unwrap() error { return e.Cause }
+
+// NonPublicEventError reports that an event reached an outward serialization
+// boundary without public visibility. Visibility is retained for errors.As-based
+// audit handling; Error deliberately omits event type and payload details.
+type NonPublicEventError struct {
+	Visibility event.EventVisibility
+}
+
+func (e *NonPublicEventError) Error() string { return "serve: event is not public" }
 
 // PublicBindWithoutAuthError reports a fail-secure refusal to bind a
 // non-loopback address without authentication configured (used by P1-10's bind

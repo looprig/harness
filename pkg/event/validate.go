@@ -1,7 +1,9 @@
 package event
 
 import (
+	"github.com/looprig/core/content"
 	"github.com/looprig/core/uuid"
+	"github.com/looprig/harness/pkg/hustle"
 	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/inference"
 )
@@ -31,19 +33,37 @@ const (
 
 // Identity / body field names, named so an InvalidEventError reads precisely.
 const (
-	FieldEventID         FieldName = "EventID"
-	FieldSessionID       FieldName = "SessionID"
-	FieldLoopID          FieldName = "LoopID"
-	FieldTurnID          FieldName = "TurnID"
-	FieldStepID          FieldName = "StepID"
-	FieldToolExecutionID FieldName = "ToolExecutionID"
-	FieldConsistency     FieldName = "Consistency"
-	FieldTrigger         FieldName = "Trigger"
-	FieldCause           FieldName = "Cause"
-	FieldCommandID       FieldName = "CommandID"
-	FieldActiveLoopID    FieldName = "ActiveLoopID"
-	FieldModel           FieldName = "Model"
-	FieldEffort          FieldName = "Effort"
+	FieldEventID          FieldName = "EventID"
+	FieldSessionID        FieldName = "SessionID"
+	FieldLoopID           FieldName = "LoopID"
+	FieldTurnID           FieldName = "TurnID"
+	FieldStepID           FieldName = "StepID"
+	FieldToolExecutionID  FieldName = "ToolExecutionID"
+	FieldConsistency      FieldName = "Consistency"
+	FieldTrigger          FieldName = "Trigger"
+	FieldCause            FieldName = "Cause"
+	FieldCommandID        FieldName = "CommandID"
+	FieldActiveLoopID     FieldName = "ActiveLoopID"
+	FieldModel            FieldName = "Model"
+	FieldModelKey         FieldName = "ModelKey"
+	FieldContextLimits    FieldName = "ContextLimits"
+	FieldEffort           FieldName = "Effort"
+	FieldUsage            FieldName = "Usage"
+	FieldMessages         FieldName = "Messages"
+	FieldVisibility       FieldName = "Visibility"
+	FieldDefinition       FieldName = "Definition"
+	FieldRunID            FieldName = "RunID"
+	FieldRuntime          FieldName = "Runtime"
+	FieldDuration         FieldName = "Duration"
+	FieldStage            FieldName = "Stage"
+	FieldReasonCode       FieldName = "ReasonCode"
+	FieldAttemptID        FieldName = "AttemptID"
+	FieldReason           FieldName = "Reason"
+	FieldRejectReason     FieldName = "RejectReason"
+	FieldWaiterCommandIDs FieldName = "WaiterCommandIDs"
+	FieldSummary          FieldName = "Summary"
+	FieldPostContext      FieldName = "PostContext"
+	FieldCommittedEventID FieldName = "CommittedEventID"
 	// FieldType names the whole event (not one coordinate) on the fail-secure
 	// unknown-type path, paired with RuleUnknownType.
 	FieldType FieldName = "Type"
@@ -105,6 +125,9 @@ func validateEventIdentity(ev Event) error {
 		return &InvalidEventError{Event: name, Field: FieldType, Rule: RuleUnknownType}
 	}
 	h := ev.EventHeader()
+	if !h.EventVisibility.Valid() {
+		return &InvalidEventError{Event: name, Field: FieldVisibility, Rule: RuleInvalid}
+	}
 	if h.EventID.IsZero() {
 		return &InvalidEventError{Event: name, Field: FieldEventID, Rule: RuleRequired}
 	}
@@ -132,18 +155,159 @@ func validateEventBody(ev Event) error {
 			return &InvalidEventError{Event: "DelegateRequestAccepted", Field: FieldCommandID, Rule: RuleRequired}
 		}
 	case LoopInferenceChanged:
-		if err := e.Model.Validate(); err != nil {
-			return &InvalidEventError{Event: "LoopInferenceChanged", Field: FieldModel, Rule: RuleInvalid}
+		return validateModelRuntime("LoopInferenceChanged", e.Runtime)
+	case LoopModeChanged:
+		return validateModelRuntime("LoopModeChanged", e.Runtime)
+	case LoopStarted:
+		return validateModelRuntime("LoopStarted", e.Runtime)
+	case ContextMeasured:
+		if e.Visibility() != Public {
+			return &InvalidEventError{Event: "ContextMeasured", Field: FieldVisibility, Rule: RuleInvalid}
 		}
-		if e.Model.Origin != inference.OriginCustom && e.Model.Origin != inference.OriginCatalog {
-			return &InvalidEventError{Event: "LoopInferenceChanged", Field: FieldModel, Rule: RuleInvalid}
+		return e.Measurement.Validate()
+	case ContextPressure:
+		if e.Visibility() != Public {
+			return &InvalidEventError{Event: "ContextPressure", Field: FieldVisibility, Rule: RuleInvalid}
 		}
-		if !e.Model.Sampling.Effort.Valid() {
-			return &InvalidEventError{Event: "LoopInferenceChanged", Field: FieldModel, Rule: RuleInvalid}
+		return validateContextPressure(e)
+	case CompactionStarted:
+		return validateCompactionStarted(e)
+	case CompactionCommitted:
+		return validateCompactionCommitted(e)
+	case CompactionRejected:
+		return validateCompactionRejected(e)
+	case CompactWaiterResolved:
+		return validateCompactWaiterResolved(e)
+	case CompactWaiterRejected:
+		return validateCompactWaiterRejected(e)
+	case HustleStarted:
+		if e.Visibility() != Internal {
+			return invalidHustle("HustleStarted", FieldVisibility)
 		}
-		if !e.Effort.Valid() {
-			return &InvalidEventError{Event: "LoopInferenceChanged", Field: FieldEffort, Rule: RuleInvalid}
+		if err := validateHustleRun("HustleStarted", e.Run); err != nil {
+			return err
 		}
+		if !zeroModelRuntime(e.Run.Runtime) {
+			return invalidHustle("HustleStarted", FieldRuntime)
+		}
+	case HustleCompleted:
+		if e.Visibility() != Internal {
+			return invalidHustle("HustleCompleted", FieldVisibility)
+		}
+		if err := validateHustleRun("HustleCompleted", e.Run); err != nil {
+			return err
+		}
+		if e.Duration < 0 {
+			return invalidHustle("HustleCompleted", FieldDuration)
+		}
+		if err := validateModelRuntime("HustleCompleted", e.Run.Runtime); err != nil {
+			return invalidHustle("HustleCompleted", FieldRuntime)
+		}
+		if err := validateOptionalUsage("HustleCompleted", e.Usage); err != nil {
+			return err
+		}
+	case HustleFailed:
+		return validateHustleFailed(e)
+	case StepDone:
+		return validateStepDoneMessages(e.Messages)
+	case TurnDone:
+		if err := e.Usage.Validate(); err != nil {
+			return &InvalidEventError{Event: "TurnDone", Field: FieldUsage, Rule: RuleInvalid}
+		}
+	}
+	return nil
+}
+
+func invalidHustle(name EventName, field FieldName) *InvalidEventError {
+	return &InvalidEventError{Event: name, Field: field, Rule: RuleInvalid}
+}
+
+func validateHustleRun(name EventName, run HustleRunDescriptor) error {
+	if err := run.Definition.Validate(); err != nil {
+		return invalidHustle(name, FieldDefinition)
+	}
+	if uuid.UUID(run.RunID).IsZero() {
+		return invalidHustle(name, FieldRunID)
+	}
+	return nil
+}
+
+func validateHustleFailed(e HustleFailed) error {
+	const name EventName = "HustleFailed"
+	if e.Visibility() != Internal {
+		return invalidHustle(name, FieldVisibility)
+	}
+	if err := validateHustleRun(name, e.Run); err != nil {
+		return err
+	}
+	if e.Duration < 0 {
+		return invalidHustle(name, FieldDuration)
+	}
+	if !e.Stage.Valid() {
+		return invalidHustle(name, FieldStage)
+	}
+	if !e.ReasonCode.Valid() {
+		return invalidHustle(name, FieldReasonCode)
+	}
+	if !hustle.ReasonAllowed(e.Stage, e.ReasonCode) {
+		return invalidHustle(name, FieldReasonCode)
+	}
+	preResolution := e.Stage == hustle.StageQueue || e.Stage == hustle.StageModelResolution
+	if preResolution {
+		if e.Usage != nil {
+			return invalidHustle(name, FieldUsage)
+		}
+		if !zeroModelRuntime(e.Run.Runtime) {
+			return invalidHustle(name, FieldRuntime)
+		}
+		return nil
+	}
+	if err := validateModelRuntime(name, e.Run.Runtime); err != nil {
+		return invalidHustle(name, FieldRuntime)
+	}
+	return validateOptionalUsage(name, e.Usage)
+}
+
+func validateOptionalUsage(name EventName, usage *content.Usage) error {
+	if usage == nil {
+		return nil
+	}
+	if err := usage.Validate(); err != nil {
+		return invalidHustle(name, FieldUsage)
+	}
+	return nil
+}
+
+func zeroModelRuntime(runtime ModelRuntime) bool {
+	return runtime.Key == (inference.ModelKey{}) && runtime.Limits == (inference.ContextLimits{}) && runtime.Effort == inference.Effort("")
+}
+
+func validateStepDoneMessages(messages content.AgenticMessages) error {
+	if len(messages) == 0 {
+		return &InvalidEventError{Event: "StepDone", Field: FieldMessages, Rule: RuleInvalid}
+	}
+	first, ok := messages[0].(*content.AIMessage)
+	if !ok || first == nil || first.Role != content.RoleAssistant {
+		return &InvalidEventError{Event: "StepDone", Field: FieldMessages, Rule: RuleInvalid}
+	}
+	for _, message := range messages[1:] {
+		toolResult, toolResultOK := message.(*content.ToolResultMessage)
+		if !toolResultOK || toolResult == nil || toolResult.Role != content.RoleTool {
+			return &InvalidEventError{Event: "StepDone", Field: FieldMessages, Rule: RuleInvalid}
+		}
+	}
+	return nil
+}
+
+func validateModelRuntime(name EventName, runtime ModelRuntime) error {
+	if err := runtime.Key.Validate(); err != nil {
+		return &InvalidEventError{Event: name, Field: FieldModelKey, Rule: RuleInvalid}
+	}
+	if err := runtime.Limits.Validate(); err != nil {
+		return &InvalidEventError{Event: name, Field: FieldContextLimits, Rule: RuleInvalid}
+	}
+	if !runtime.Effort.Valid() {
+		return &InvalidEventError{Event: name, Field: FieldEffort, Rule: RuleInvalid}
 	}
 	return nil
 }
@@ -258,6 +422,12 @@ func classify(ev Event) (name string, profile idProfile, ok bool) {
 		// changes it (same shape as WorkspaceCheckpointed) — only SessionID set. Level is
 		// an opaque ordinal the validator never constrains.
 		return "SecurityCeilingChanged", sessionProfile(), true
+	case HustleStarted:
+		return "HustleStarted", sessionProfile(), true
+	case HustleCompleted:
+		return "HustleCompleted", sessionProfile(), true
+	case HustleFailed:
+		return "HustleFailed", sessionProfile(), true
 	case LoopIdle:
 		return "LoopIdle", loopProfile(), true
 	case LoopStarted:
@@ -271,6 +441,20 @@ func classify(ev Event) (name string, profile idProfile, ok bool) {
 		return "LoopInferenceChanged", loopProfile(), true
 	case LoopModeChanged:
 		return "LoopModeChanged", loopProfile(), true
+	case ContextMeasured:
+		return "ContextMeasured", loopProfile(), true
+	case ContextPressure:
+		return "ContextPressure", loopProfile(), true
+	case CompactionStarted:
+		return "CompactionStarted", loopProfile(), true
+	case CompactionCommitted:
+		return "CompactionCommitted", loopProfile(), true
+	case CompactionRejected:
+		return "CompactionRejected", loopProfile(), true
+	case CompactWaiterResolved:
+		return "CompactWaiterResolved", loopProfile(), true
+	case CompactWaiterRejected:
+		return "CompactWaiterRejected", loopProfile(), true
 	case ForeignSessionBound:
 		return "ForeignSessionBound", loopProfile(), true
 	case TokenDelta:

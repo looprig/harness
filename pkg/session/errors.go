@@ -23,6 +23,7 @@ const (
 	SessionLoopDepthExceeded             SessionErrorKind = "loop_depth_exceeded"
 	SessionLoopQuotaExceeded             SessionErrorKind = "loop_quota_exceeded"
 	SessionForeignBuilderMissing         SessionErrorKind = "foreign_builder_missing"
+	SessionCompactionUnsupported         SessionErrorKind = "compaction_unsupported"
 	SessionDelegateIntentAppendFailed    SessionErrorKind = "delegate_intent_append_failed"
 	SessionDelegateAdmissionCommitFailed SessionErrorKind = "delegate_admission_commit_failed"
 )
@@ -40,6 +41,7 @@ func (e *SessionError) Error() string {
 		SessionClosing: "session: closing", SessionFaulted: "session: faulted (durable persistence failure)",
 		SessionLoopDepthExceeded: "session: loop spawn depth limit exceeded", SessionLoopQuotaExceeded: "session: loop spawn quota exceeded",
 		SessionForeignBuilderMissing:         "session: foreign engine selected but no foreign builder wired",
+		SessionCompactionUnsupported:         "session: loop does not support native conversation compaction",
 		SessionDelegateIntentAppendFailed:    "session: required delegate intent append failed",
 		SessionDelegateAdmissionCommitFailed: "session: delegate admission commit failed after durable intent",
 	}

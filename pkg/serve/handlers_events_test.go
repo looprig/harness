@@ -239,6 +239,9 @@ func TestHandleEventsStreamsEphemeral(t *testing.T) {
 	t.Parallel()
 
 	execID := parseTestUUID(t, "55555555-5555-5555-5555-555555555555")
+	attemptID := event.CompactAttemptID(parseTestUUID(t, "66666666-6666-6666-6666-666666666666"))
+	throughEventID := parseTestUUID(t, "77777777-7777-7777-7777-777777777777")
+	progressEventID := parseTestUUID(t, "88888888-8888-8888-8888-888888888888")
 
 	tests := []struct {
 		name         string
@@ -288,6 +291,24 @@ func TestHandleEventsStreamsEphemeral(t *testing.T) {
 			wantKind:     "input_queued",
 			wantInDelta:  nil,
 			wantHasDelta: false,
+		},
+		{
+			name: "compaction_started carries public progress identity",
+			ev: event.CompactionStarted{
+				Header:    event.Header{EventID: progressEventID},
+				AttemptID: attemptID,
+				Reason:    event.CompactionReasonManual,
+				Basis:     event.ContextBasis{Revision: 3, ThroughEventID: throughEventID},
+			},
+			wantKind: "compaction_started",
+			wantInDelta: []string{
+				`"attempt_id":"66666666-6666-6666-6666-666666666666"`,
+				`"reason":1`,
+				`"revision":3`,
+				`"through_event_id":"77777777-7777-7777-7777-777777777777"`,
+				`"header":{"event_id":"88888888-8888-8888-8888-888888888888"}`,
+			},
+			wantHasDelta: true,
 		},
 	}
 

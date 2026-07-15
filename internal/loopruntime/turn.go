@@ -39,6 +39,10 @@ type turnState struct {
 	// LLM request; committed history (loopState.msgs) grows group-by-group via
 	// turnConfig.commit. It is NOT the LLM request base — that is turnConfig.base.
 	msgs content.AgenticMessages
+	// usage is the checked sum of authoritative per-request usage for completed
+	// steps in this turn. It is projected onto TurnDone but never used for loop
+	// accumulation, which folds StepDone directly.
+	usage content.Usage
 
 	toolIterations int
 	toolCalls      int
@@ -68,10 +72,10 @@ func newTurnState(
 // (commit + emit). Dependencies stay at this boundary; turnState owns one turn's
 // staged messages and counters.
 type turnConfig struct {
-	// base is a defensive CLONE of the pre-turn loopState.msgs with its OWN backing
-	// array. The LLM request for each step is base + turnState.msgs. base MUST NOT
-	// alias loopState.msgs: the actor keeps appending committed step groups to
-	// loopState.msgs while runTurn reads base concurrently.
+	// base is a defensive deep clone of the pre-turn loopState.msgs. The LLM request
+	// for each step is base + turnState.msgs. base MUST NOT alias loopState.msgs: the
+	// actor keeps appending committed step groups to loopState.msgs while runTurn
+	// reads base concurrently.
 	base content.AgenticMessages
 
 	// runtimeContext, when non-nil, yields the volatile runtime-context blocks the turn
@@ -96,11 +100,12 @@ type turnConfig struct {
 	// critical sequence, so already-queued work on any loop cannot advance.
 	admit          func(context.Context) (func(), error)
 	firstAdmission func()
+	measure        func(context.Context, inference.Request, string, *content.UserMessage, bool) error
 
 	// commit is the durability/event handshake back to the actor. runTurn prepares a
 	// complete step group, but the actor is the only goroutine that mutates
-	// loopState.msgs; it appends commit.Messages and emits commit.Event (the
-	// StepDone) at the SAME actor-owned point, then acks. commit MUST be
+	// loopState.msgs; it durably publishes commit.Event (the StepDone), applies
+	// commit.Messages to live history iff publication committed, then acks. commit MUST be
 	// ctx-cancellable so Interrupt/Shutdown frees a parked runTurn instead of
 	// wedging it.
 	commit func(context.Context, turnCommit) error
@@ -129,6 +134,9 @@ type turnConfig struct {
 	// drainPending returns the batch but before the first TurnFoldedInto commit. See
 	// runtimeConfig.afterDrain for the rationale.
 	afterDrain func()
+
+	// afterContextReplacement is the test-only peer of runtimeConfig's seam.
+	afterContextReplacement func()
 }
 
 // turnCommit is one commit request: the finalized step group to append to
@@ -136,15 +144,6 @@ type turnConfig struct {
 type turnCommit struct {
 	Messages content.AgenticMessages
 	Event    event.Event
-}
-
-// cloneMessages returns a copy of msgs with its OWN backing array (a fresh slice
-// of the same element pointers). Appends to the source never reach the clone. A
-// nil/empty source yields an empty (non-shared) slice.
-func cloneMessages(msgs content.AgenticMessages) content.AgenticMessages {
-	out := make(content.AgenticMessages, len(msgs))
-	copy(out, msgs)
-	return out
 }
 
 // turnIdentity is the (session, loop, turn) identity a turn stamps onto the steps
@@ -227,18 +226,31 @@ func runTurn(ctx context.Context, cfg turnConfig, ts turnState) event.Event {
 	// provider is configured (or it yielded no blocks): the request is then assembled
 	// exactly as before.
 	runtimeTail := runtimeContextTail(ctx, cfg.runtimeContext)
+	runtimeRevision, err := runtimeContextRevision(runtimeTail)
+	if err != nil {
+		return event.TurnFailed{TurnIndex: ts.index, Err: err}
+	}
 
+	candidateMeasured := false
 	for stepIdx := StepIndex(0); ; stepIdx++ {
 		// Request base is the committed history clone + this turn's staged messages,
 		// plus the volatile runtime-context tail (when configured) appended LAST so the
 		// model sees fresh date/cwd/git at the very end of the input every step. The
 		// tail is transient: it is part of the REQUEST only, never of ts.msgs/base, so
 		// committed history never grows with it and the cached System prompt is untouched.
-		req := inference.Request{
-			Model:    cfg.model,
-			System:   cfg.system,
-			Messages: requestMessages(cfg.base, ts.msgs, runtimeTail),
-			Tools:    defs,
+		req := turnInferenceRequest(cfg, ts, runtimeTail, defs)
+		if candidateMeasured {
+			candidateMeasured = false
+		} else {
+			if directive, measureErr := measureTurnCandidate(ctx, cfg, req, runtimeRevision, runtimeTail, true); measureErr != nil {
+				return measureTurnFailure(ctx, ts.index, measureErr)
+			} else if directive != nil {
+				applyTurnContextReplacement(&cfg, &ts, directive.Replacement)
+				if cfg.afterContextReplacement != nil {
+					cfg.afterContextReplacement()
+				}
+				req = turnInferenceRequest(cfg, ts, runtimeTail, defs)
+			}
 		}
 
 		// Mint this step's id BEFORE streaming so StepDone can be stamped from the
@@ -273,6 +285,11 @@ func runTurn(ctx context.Context, cfg turnConfig, ts turnState) event.Event {
 		}
 		st = res.state
 		aiMsg := st.msgs[0].(*content.AIMessage)
+		turnUsage, usageErr := addTurnUsage(ts.usage, aiMsg.Usage)
+		if usageErr != nil {
+			return event.TurnFailed{TurnIndex: ts.index, Err: usageErr}
+		}
+		ts.usage = turnUsage
 
 		// Raw executable tool-use view (unsanitized Input) for this step.
 		toolUses := st.blocks.ToolUses()
@@ -287,7 +304,11 @@ func runTurn(ctx context.Context, cfg turnConfig, ts turnState) event.Event {
 				// actor committed/emitted this final step: treat as interrupt.
 				return event.TurnInterrupted{TurnIndex: ts.index}
 			}
-			return event.TurnDone{TurnIndex: ts.index, Message: aiMsg}
+			candidate := turnInferenceRequest(cfg, ts, runtimeTail, defs)
+			if _, measureErr := measureTurnCandidate(ctx, cfg, candidate, runtimeRevision, runtimeTail, false); measureErr != nil {
+				return measureTurnFailure(ctx, ts.index, measureErr)
+			}
+			return event.TurnDone{TurnIndex: ts.index, Message: cloneAIMessage(aiMsg), Usage: ts.usage}
 		}
 
 		ts.toolIterations++
@@ -343,6 +364,17 @@ func runTurn(ctx context.Context, cfg turnConfig, ts turnState) event.Event {
 			// already committed stay in loopState.msgs.
 			return event.TurnInterrupted{TurnIndex: ts.index}
 		}
+		candidate := turnInferenceRequest(cfg, ts, runtimeTail, defs)
+		directive, measureErr := measureTurnCandidate(ctx, cfg, candidate, runtimeRevision, runtimeTail, true)
+		if measureErr != nil {
+			return measureTurnFailure(ctx, ts.index, measureErr)
+		}
+		if directive != nil {
+			applyTurnContextReplacement(&cfg, &ts, directive.Replacement)
+			if cfg.afterContextReplacement != nil {
+				cfg.afterContextReplacement()
+			}
+		}
 
 		// Tool-continuation boundary: another LLM request is already required to send
 		// the tool results, so this is the ONLY point where queued input may fold. Pull
@@ -350,6 +382,7 @@ func runTurn(ctx context.Context, cfg turnConfig, ts turnState) event.Event {
 		// AFTER the tool results, and commit a TurnFoldedInto for it. A no-tool final
 		// answer (handled above) never reaches here, so folding cannot extend a turn
 		// past the model's final answer.
+		stagedBeforeFold := len(ts.msgs)
 		if ferr := foldPending(ctx, cfg, &ts); ferr != nil {
 			// The drain or a fold commit was cancelled (Interrupt/Shutdown) before it
 			// completed: treat as interrupt. Committed steps + any already-committed
@@ -357,17 +390,62 @@ func runTurn(ctx context.Context, cfg turnConfig, ts turnState) event.Event {
 			// the draining buffer via InputCancelled.
 			return event.TurnInterrupted{TurnIndex: ts.index}
 		}
+		candidateMeasured = len(ts.msgs) == stagedBeforeFold
 		// Loop: the next stream lets the model react to the tool results (and any
 		// folded user messages).
 	}
+}
+
+func turnInferenceRequest(cfg turnConfig, state turnState, runtimeTail *content.UserMessage, definitions []inference.Tool) inference.Request {
+	return inference.Request{
+		Model: cfg.model, System: cfg.system,
+		Messages: requestMessages(cfg.base, state.msgs, runtimeTail), Tools: definitions,
+	}
+}
+
+func measureTurnCandidate(
+	ctx context.Context,
+	config turnConfig,
+	request inference.Request,
+	runtimeRevision string,
+	runtimeTail *content.UserMessage,
+	continuation bool,
+) (*contextReplacementDirective, error) {
+	if config.measure == nil {
+		return nil, nil
+	}
+	err := config.measure(ctx, request, runtimeRevision, runtimeTail, continuation)
+	var directive *contextReplacementDirective
+	if errors.As(err, &directive) {
+		return directive, nil
+	}
+	return nil, err
+}
+
+func measureTurnFailure(ctx context.Context, turnIndex event.TurnIndex, err error) event.Event {
+	var cancellation *terminalCompactionCancellationError
+	if errors.As(err, &cancellation) {
+		return event.TurnInterrupted{TurnIndex: turnIndex}
+	}
+	if ctx.Err() != nil {
+		return event.TurnInterrupted{TurnIndex: turnIndex}
+	}
+	return event.TurnFailed{TurnIndex: turnIndex, Err: err}
+}
+
+func addTurnUsage(total content.Usage, request *content.Usage) (content.Usage, error) {
+	if request == nil {
+		return total, nil
+	}
+	return total.Add(*request)
 }
 
 // foldPending drains the actor's inbox at a tool-continuation boundary and folds the
 // returned messages into the staged turn. For each drained entry it appends the
 // message to ts.msgs (after the just-committed tool results) and commits a
 // TurnFoldedInto for it through the ctx-cancellable cfg.commit handshake (the actor
-// appends it to loopState.msgs, emits TurnFoldedInto, and clears it from the draining
-// buffer at the same point). A cancellation (drain or commit) returns an error so
+// publishes TurnFoldedInto, then appends it to loopState.msgs and clears it from the
+// draining buffer iff publication committed). A cancellation (drain or commit) returns an error so
 // runTurn stops; nothing is folded twice and the actor still owns returning the
 // not-yet-committed entries.
 func foldPending(ctx context.Context, cfg turnConfig, ts *turnState) error {
@@ -384,7 +462,7 @@ func foldPending(ctx context.Context, cfg turnConfig, ts *turnState) error {
 	for _, qi := range batch {
 		ts.msgs = append(ts.msgs, qi.msg)
 		fold := turnCommit{
-			Messages: content.AgenticMessages{qi.msg},
+			Messages: cloneMessages(content.AgenticMessages{qi.msg}),
 			Event: event.TurnFoldedInto{
 				Header: event.Header{
 					Coordinates: identity.Coordinates{
@@ -399,7 +477,7 @@ func foldPending(ctx context.Context, cfg turnConfig, ts *turnState) error {
 					},
 				},
 				TurnIndex: ts.index,
-				Message:   qi.msg,
+				Message:   cloneUserMessage(qi.msg),
 			},
 		}
 		if cerr := cfg.commit(ctx, fold); cerr != nil {
@@ -429,19 +507,20 @@ func runtimeContextTail(ctx context.Context, rc RuntimeContextProvider) *content
 // requestMessages builds the LLM request message slice from the committed base
 // clone followed by the turn's staged messages, then (when non-nil) the volatile
 // runtimeTail at the very END — the turn-tail volatile context. The result is a
-// fresh slice so the request never aliases any input's backing array, and the tail
-// is appended ONLY here (the request), never to base or staged, so it stays
-// transient. A nil tail appends nothing (the pre-runtime-context behavior).
+// fresh message graph so the inference client cannot mutate base, staged history,
+// or the runtime tail. The tail is appended ONLY here (the request), never to base
+// or staged, so it stays transient. A nil tail appends nothing (the
+// pre-runtime-context behavior).
 func requestMessages(base, staged content.AgenticMessages, runtimeTail *content.UserMessage) content.AgenticMessages {
 	n := len(base) + len(staged)
 	if runtimeTail != nil {
 		n++
 	}
 	out := make(content.AgenticMessages, 0, n)
-	out = append(out, base...)
-	out = append(out, staged...)
+	out = append(out, cloneMessages(base)...)
+	out = append(out, cloneMessages(staged)...)
 	if runtimeTail != nil {
-		out = append(out, runtimeTail)
+		out = append(out, cloneUserMessage(runtimeTail))
 	}
 	return out
 }
@@ -451,10 +530,10 @@ func requestMessages(base, staged content.AgenticMessages, runtimeTail *content.
 // loopState.msgs and emits the StepDone at the same point. On a cancellation error
 // the turn goroutine stops; committed steps stay committed.
 func commitStep(ctx context.Context, cfg turnConfig, st stepState) error {
-	// The step group is cloned TWICE on purpose: Messages (appended to
+	// The step group is deep-cloned TWICE on purpose: Messages (appended to
 	// loopState.msgs as committed history) and the StepDone payload inside
 	// stepDoneEvent (the consumer-held event). These two clones are DELIBERATELY
-	// independent — the committed-history slice and the consumer-held event payload
+	// independent — the committed-history graph and the consumer-held event payload
 	// must not alias each other or st.msgs. Do NOT merge into one shared slice
 	// (would reintroduce aliasing).
 	return cfg.commit(ctx, turnCommit{
@@ -466,7 +545,7 @@ func commitStep(ctx context.Context, cfg turnConfig, st stepState) error {
 // stepDoneEvent builds the Enduring StepDone for one COMPLETED step: its Header is
 // stamped from the step's identity (SessionID/LoopID/TurnID/StepID), and Messages
 // is the finalized step group (the single AIMessage followed by its
-// ToolResultMessages). The Messages slice is a fresh copy so a consumer cannot
+// ToolResultMessages). The Messages graph is a deep copy so a consumer cannot
 // mutate the turn's live history through the event.
 func stepDoneEvent(st stepState) event.StepDone {
 	group := cloneMessages(st.msgs)

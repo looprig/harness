@@ -37,6 +37,7 @@ func FuzzEphemeralFrameDecode(f *testing.F) {
 	// read from the .sse goldens so the corpus stays in lockstep with the encoder.
 	f.Add(fixtureDataPayload(f, "enduring_frame.sse"))
 	f.Add(fixtureDataPayload(f, "ephemeral_token_delta.sse"))
+	f.Add([]byte(`{"v":1,"kind":"compaction_started","header":{"event_id":"88888888-8888-8888-8888-888888888888"},"delta":{"attempt_id":"66666666-6666-6666-6666-666666666666","reason":1,"basis":{"revision":3,"through_event_id":"77777777-7777-7777-7777-777777777777"}}}`))
 
 	// A real durable envelope (event.MarshalEvent of an Enduring TurnDone): the exact
 	// bytes that ride in an enduringFrame's inner "event" field.

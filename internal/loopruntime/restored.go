@@ -7,7 +7,6 @@ import (
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/loop"
-	"github.com/looprig/inference"
 )
 
 // RestoredState is the pre-built committed state a restored loop comes up with: the
@@ -34,13 +33,20 @@ type RestoredState struct {
 	Mode    loop.ModeName
 	HasMode bool
 
-	// Model + Effort are the loop's LAST durable direct inference change (folded from
-	// LoopInferenceChanged, last write wins), reapplied ON TOP of the restored mode when
-	// HasInference is set — matching the live precedence (a mode change resets model/effort;
-	// a later inference change overrides them). Model is the complete secret-free descriptor.
-	Model        inference.Model
-	Effort       inference.Effort
-	HasInference bool
+	// Runtime is the latest durable resolved runtime, whether selected by start,
+	// mode change, or direct inference change. The live bound model supplies the
+	// transport fields while this durable payload restores identity, limits, and effort.
+	Runtime    event.ModelRuntime
+	HasRuntime bool
+
+	Context    event.ContextMeasurement
+	HasContext bool
+
+	Basis    event.ContextBasis
+	HasBasis bool
+
+	AutomaticBasis    event.ContextBasis
+	HasAutomaticBasis bool
 }
 
 // NewRestored constructs a loop SEEDED with pre-built committed state and starts its
@@ -57,6 +63,21 @@ type RestoredState struct {
 // RestoredState (empty Msgs, zero TurnIndex) yields a loop indistinguishable from a
 // freshly New'd one.
 func NewRestored(loopCtx context.Context, sessionID, loopID uuid.UUID, parent loop.Provenance, events eventPublisher, bound loop.BoundDefinition, seed RestoredState) (*Loop, error) {
+	return NewRestoredWithCompactor(loopCtx, sessionID, loopID, parent, events, bound, seed, nil)
+}
+
+// NewRestoredWithCompactor is the restored counterpart to
+// NewInModeWithCompactor. It installs the focused executor while preserving the
+// restore-folded mode and inference runtime.
+func NewRestoredWithCompactor(
+	loopCtx context.Context,
+	sessionID, loopID uuid.UUID,
+	parent loop.Provenance,
+	events eventPublisher,
+	bound loop.BoundDefinition,
+	seed RestoredState,
+	compactor Compactor,
+) (*Loop, error) {
 	// Resolve config at the RESTORED mode (last LoopModeChanged) rather than the definition's
 	// initial mode, so a loop that changed mode before teardown resumes under it. When the
 	// loop never changed mode, "" resolves to the initial mode (the pre-change behavior).
@@ -74,10 +95,15 @@ func NewRestored(loopCtx context.Context, sessionID, loopID uuid.UUID, parent lo
 	if err != nil {
 		return nil, err
 	}
-	// Reapply the last durable direct inference change ON TOP of the restored mode (matching
-	// the live precedence). The folded Model already carries Effort in Sampling.Effort.
-	if seed.HasInference {
-		cfg.Model = seed.Model
+	if seed.HasRuntime {
+		cfg.Model.Provider = seed.Runtime.Key.Provider
+		cfg.Model.Name = seed.Runtime.Key.Model
+		cfg.Model.Limits = seed.Runtime.Limits
+		cfg.Model.Sampling = cfg.Model.Sampling.Clone()
+		cfg.Model.Sampling.Effort = seed.Runtime.Effort
+	}
+	if err := installCompactionExecutor(loopCtx, &cfg, compactor); err != nil {
+		return nil, err
 	}
 	return newLoopWithSeed(loopCtx, sessionID, loopID, parent, events, cfg, bound, modeName, &seed)
 }

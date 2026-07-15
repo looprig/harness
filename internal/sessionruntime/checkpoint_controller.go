@@ -371,8 +371,13 @@ func (c *checkpointController) waitDrained() {
 }
 
 func (c *checkpointController) boundary(ctx context.Context, trigger event.Event) error {
+	_, err := c.boundaryResult(ctx, trigger)
+	return err
+}
+
+func (c *checkpointController) boundaryResult(ctx context.Context, trigger event.Event) (bool, error) {
 	if c == nil || c.cfg.Publisher == nil {
-		return &CheckpointError{Kind: CheckpointUnavailable}
+		return false, &CheckpointError{Kind: CheckpointUnavailable}
 	}
 	c.mu.Lock()
 	closed := c.closed
@@ -380,17 +385,20 @@ func (c *checkpointController) boundary(ctx context.Context, trigger event.Event
 	if closed {
 		// Shutdown never manufactures a snapshot trigger. A real terminal already
 		// produced by a draining turn still remains durable/live.
-		return c.cfg.Publisher.PublishEventChecked(ctx, trigger)
+		err := c.cfg.Publisher.PublishEventChecked(ctx, trigger)
+		return err == nil, err
 	}
 	c.observeInterruptCause(trigger)
 	if !c.matches(trigger) {
-		return c.cfg.Publisher.PublishEventChecked(ctx, trigger)
+		err := c.cfg.Publisher.PublishEventChecked(ctx, trigger)
+		return err == nil, err
 	}
 	if c.cfg.Policy.Priority == checkpointBestEffort {
-		return c.bestEffortBoundary(ctx, trigger)
+		err := c.bestEffortBoundary(ctx, trigger)
+		return err == nil, err
 	}
+	published := false
 	_, err := c.runRequired(ctx, trigger, func(runCtx context.Context) (workspacestore.Ref, error) {
-		published := false
 		publish := func() error {
 			err := c.cfg.Publisher.PublishEventChecked(runCtx, trigger)
 			if err == nil {
@@ -404,7 +412,7 @@ func (c *checkpointController) boundary(ctx context.Context, trigger event.Event
 		}
 		return ref, commitErr
 	})
-	return err
+	return published, err
 }
 
 func (c *checkpointController) sessionIdle(ctx context.Context, idle event.SessionIdle, publish func() error) error {

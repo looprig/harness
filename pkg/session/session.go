@@ -21,6 +21,8 @@ type Session interface {
 	Loop(uuid.UUID) (loop.Handle, bool)
 	Submit(context.Context, []content.Block) (uuid.UUID, error)
 	SubmitToLoop(context.Context, uuid.UUID, []content.Block) (uuid.UUID, error)
+	Compact(context.Context) (uuid.UUID, error)
+	CompactToLoop(context.Context, uuid.UUID) (uuid.UUID, error)
 	SubscribeEvents(event.EventFilter) (event.Subscription, error)
 	RespondGate(context.Context, gate.GateResponse) error
 	Interrupt(context.Context) (bool, error)

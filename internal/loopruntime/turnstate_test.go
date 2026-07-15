@@ -1,6 +1,7 @@
 package loopruntime
 
 import (
+	"reflect"
 	"testing"
 
 	"github.com/looprig/core/content"
@@ -83,10 +84,9 @@ func TestNewTurnState(t *testing.T) {
 	}
 }
 
-// TestCloneMessages proves the base clone has its own backing array: mutating
-// (appending to) the SOURCE after cloning does not change the clone. This is the
-// safety property turnConfig.base relies on — runLoop keeps appending committed
-// step groups to loopState.msgs while runTurn reads base concurrently.
+// TestCloneMessages proves the base clone has its own message graph: source
+// appends cannot change its slice and every cloned message remains value-equal
+// without sharing its message pointer.
 func TestCloneMessages(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
@@ -109,8 +109,11 @@ func TestCloneMessages(t *testing.T) {
 				t.Fatalf("clone len = %d, want %d", len(clone), len(tt.src))
 			}
 			for i := range tt.src {
-				if clone[i] != tt.src[i] {
-					t.Errorf("clone[%d] != src[%d] (element pointers must match)", i, i)
+				if !reflect.DeepEqual(clone[i], tt.src[i]) {
+					t.Errorf("clone[%d] != src[%d] by value", i, i)
+				}
+				if clone[i] == tt.src[i] {
+					t.Errorf("clone[%d] aliases src[%d] message pointer", i, i)
 				}
 			}
 			// Mutate the SOURCE: append many to force a possible cap-preserving write,
@@ -123,8 +126,8 @@ func TestCloneMessages(t *testing.T) {
 				t.Errorf("after appending to source, clone len = %d, want %d (own backing array)", len(clone), len(tt.src))
 			}
 			for i := range tt.src {
-				if clone[i] != tt.src[i] {
-					t.Errorf("after appending to source, clone[%d] changed", i)
+				if !reflect.DeepEqual(clone[i], tt.src[i]) {
+					t.Errorf("after appending to source, clone[%d] changed by value", i)
 				}
 			}
 		})

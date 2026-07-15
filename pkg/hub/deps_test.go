@@ -7,9 +7,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/identity"
-	"github.com/looprig/core/uuid"
 )
 
 // fakeAppender is a controllable eventAppender for hub unit tests. It records every

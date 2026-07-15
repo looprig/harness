@@ -3,10 +3,10 @@ package command_test
 import (
 	"testing"
 
-	"github.com/looprig/harness/pkg/command"
 	"github.com/looprig/core/content"
-	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/core/uuid"
+	"github.com/looprig/harness/pkg/command"
+	"github.com/looprig/harness/pkg/identity"
 )
 
 func newID(t *testing.T) uuid.UUID {

@@ -77,6 +77,7 @@ func buildGateRestoreStream(t *testing.T, store *sessionstore.Store, cfg loop.De
 			h.AgentName = "agent"
 			return h
 		}(),
+		Runtime: runtimeFromFingerprint(fingerprintFromDefinition(cfg)),
 	})
 
 	coords := identity.Coordinates{SessionID: sessionID, LoopID: rootLoopID, TurnID: turnID, StepID: stepID}
@@ -216,9 +217,9 @@ func TestRestoreWiresGateAppenderForNewGates(t *testing.T) {
 		t.Fatalf("ActivateGate: %v", err)
 	}
 
-	replayer, err := store.OpenRecordReplayer(orig.sessionID, sessionstore.ReplayRequest{FromSeq: 0})
+	replayer, err := store.OpenInternalRecordReplayer(orig.sessionID, sessionstore.ReplayRequest{FromSeq: 0})
 	if err != nil {
-		t.Fatalf("OpenRecordReplayer: %v", err)
+		t.Fatalf("OpenInternalRecordReplayer: %v", err)
 	}
 	records, err := drainRecordReplay(context.Background(), replayer, journal.ReplayRequest{From: journal.Beginning()})
 	if err != nil {

@@ -10,12 +10,12 @@
     "v": { "type": "integer", "const": 1 },
     "kind": {
       "type": "string",
-      "enum": ["token_delta", "tool_call_started", "tool_call_completed", "input_queued"]
+      "enum": ["token_delta", "tool_call_started", "tool_call_completed", "input_queued", "compaction_started"]
     },
     "header": { "$ref": "event_envelope.schema.json" },
     "delta": {
       "type": "object",
-      "description": "Kind-specific payload. For token_delta a tagged chunk DTO ({chunk_type, ...}); for tool_call_started/completed the tool-call delta; absent for input_queued."
+      "description": "Kind-specific payload. For token_delta a tagged chunk DTO ({chunk_type, ...}); for tool_call_started/completed the tool-call delta; for compaction_started the attempt id, reason, and basis; absent for input_queued."
     }
   }
 }

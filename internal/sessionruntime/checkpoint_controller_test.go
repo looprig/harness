@@ -12,6 +12,8 @@ import (
 
 	"github.com/looprig/core/content"
 	"github.com/looprig/core/uuid"
+	"github.com/looprig/harness/internal/loopruntime"
+	"github.com/looprig/harness/pkg/command"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/loop"
@@ -72,6 +74,47 @@ func (panickingRuntimeContext) Blocks(context.Context) []content.Block {
 }
 
 type panickingInference struct{}
+
+type pausedExecutionSession struct {
+	*Session
+	acquired chan struct{}
+	resume   chan struct{}
+	once     sync.Once
+}
+
+func (p *pausedExecutionSession) EnterExecution(ctx context.Context, loopID uuid.UUID) (func(), error) {
+	release, err := p.Session.EnterExecution(ctx, loopID)
+	return p.pause(ctx, release, err)
+}
+
+func (p *pausedExecutionSession) EnterTurnStart(ctx context.Context, loopID uuid.UUID) (loopruntime.TurnStartCapability, error) {
+	capability, err := p.Session.EnterTurnStart(ctx, loopID)
+	if err != nil {
+		return nil, err
+	}
+	p.once.Do(func() { close(p.acquired) })
+	select {
+	case <-p.resume:
+		return capability, nil
+	case <-ctx.Done():
+		capability.Release()
+		return nil, ctx.Err()
+	}
+}
+
+func (p *pausedExecutionSession) pause(ctx context.Context, release func(), err error) (func(), error) {
+	if err != nil {
+		return nil, err
+	}
+	p.once.Do(func() { close(p.acquired) })
+	select {
+	case <-p.resume:
+		return release, nil
+	case <-ctx.Done():
+		release()
+		return nil, ctx.Err()
+	}
+}
 
 func (panickingInference) Invoke(context.Context, inference.Request) (*inference.Response, error) {
 	panic("inference invoke panic")
@@ -1189,10 +1232,13 @@ func TestCheckpointRequiredFaultLatchPreservesTriggerAndRejectsAutomaticWalk(t *
 	})
 	t.Cleanup(c.shutdown)
 	trigger := event.StepDone{Header: event.Header{Coordinates: identity.Coordinates{SessionID: sid, LoopID: lid, TurnID: tid, StepID: stepID}, EventID: eid}}
-	err := c.boundary(context.Background(), trigger)
+	committed, err := c.boundaryResult(context.Background(), trigger)
 	var faulted *CheckpointError
 	if !errors.As(err, &faulted) || faulted.Kind != CheckpointFaulted {
 		t.Fatalf("boundary = %T %v, want CheckpointFaulted", err, err)
+	}
+	if !committed {
+		t.Fatal("boundary committed = false, want true for durable trigger before checkpoint fault")
 	}
 	publisher.mu.Lock()
 	defer publisher.mu.Unlock()
@@ -1316,8 +1362,12 @@ func TestCheckpointSnapshotFailureLeavesDurableTriggerWithoutDanglingRef(t *test
 	c := newCheckpointController(checkpointControllerConfig{SessionID: sid, Policy: checkpointPolicy{Trigger: checkpointOnStepDone, Priority: checkpointRequired, Timeout: time.Second}, Store: ws, Root: root, Mode: PlacementSession, Coordinator: newWorkspaceCoordinator(nil), Publisher: publisher, Factory: event.NewFactory(uuid.New, time.Now)})
 	t.Cleanup(c.shutdown)
 	trigger := event.StepDone{Header: event.Header{Coordinates: identity.Coordinates{SessionID: sid, LoopID: lid, TurnID: tid, StepID: stepID}, EventID: eid}}
-	if err := c.boundary(context.Background(), trigger); err == nil {
+	committed, boundaryErr := c.boundaryResult(context.Background(), trigger)
+	if boundaryErr == nil {
 		t.Fatal("snapshot failure = nil")
+	}
+	if !committed {
+		t.Fatal("boundary committed = false, want true for durable trigger before snapshot failure")
 	}
 	publisher.mu.Lock()
 	defer publisher.mu.Unlock()
@@ -1510,6 +1560,325 @@ func TestRequiredIdleCheckpointBlocksWaitIdleThroughBlobCommit(t *testing.T) {
 	}
 	if idle.EventID.IsZero() || cp.Cause.EventID != idle.EventID || cp.Trigger != event.SnapshotTriggerIdle {
 		t.Fatalf("idle/cp cause mismatch: idle=%+v checkpoint=%+v", idle.Header, cp)
+	}
+}
+
+func TestTurnStartReservationOrdersHubBeforeExecutionAdmission(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+	}{
+		{name: "turn-start winner retains reader and publishes before idle transition"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			ws, root := checkpointFixture(t, nil)
+			recorder := &recordingEventAppender{}
+			s, err := newTestSession(context.Background(), cfg(&stubLLM{}),
+				WithEventAppender(recorder),
+				withResolvedPlacement(&resolvedPlacement{mode: PlacementSession, store: ws, root: root, coordinator: newWorkspaceCoordinator(nil)}),
+				WithSnapshotPolicy(SnapshotPolicy{Trigger: SnapshotOnIdle, Priority: SnapshotRequired, Timeout: 400 * time.Millisecond}),
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = s.Shutdown(context.Background()) })
+
+			syntheticLoopID := mustUUID()
+			startedHeader, err := s.factory.Stamp(event.Header{Coordinates: identity.Coordinates{
+				SessionID: s.sessionID,
+				LoopID:    syntheticLoopID,
+				TurnID:    mustUUID(),
+			}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := s.PublishEventChecked(context.Background(), event.TurnStarted{Header: startedHeader}); err != nil {
+				t.Fatal(err)
+			}
+
+			loopID := mustUUID()
+			paused := &pausedExecutionSession{
+				Session:  s,
+				acquired: make(chan struct{}),
+				resume:   make(chan struct{}),
+			}
+			inferenceRelease := make(chan struct{})
+			var inferenceReleaseOnce sync.Once
+			releaseInference := func() { inferenceReleaseOnce.Do(func() { close(inferenceRelease) }) }
+			t.Cleanup(releaseInference)
+			llm := &releasedFailureLLM{started: make(chan struct{}), release: inferenceRelease, err: context.Canceled}
+			loopCtx, cancelLoop := context.WithCancel(context.Background())
+			t.Cleanup(cancelLoop)
+			bound := bindCfg(cfg(llm), s.sessionID, loopID)
+			l, err := loopruntime.New(loopCtx, s.sessionID, loopID, loop.Provenance{}, paused, bound)
+			if err != nil {
+				t.Fatal(err)
+			}
+			inputID := mustUUID()
+			select {
+			case l.Commands <- command.UserInput{Header: command.Header{CommandID: inputID, CreatedAt: time.Now()}}:
+			case <-time.After(time.Second):
+				t.Fatal("loop submit blocked")
+			}
+			select {
+			case <-paused.acquired:
+			case <-time.After(time.Second):
+				t.Fatal("loop did not acquire execution admission")
+			}
+			nonOwnerHeader, err := s.factory.Stamp(event.Header{Coordinates: identity.Coordinates{
+				SessionID: s.sessionID,
+				LoopID:    loopID,
+				TurnID:    mustUUID(),
+			}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			nonOwnerResult := make(chan error, 1)
+			go func() {
+				nonOwnerResult <- s.PublishEventChecked(context.Background(), event.TurnStarted{Header: nonOwnerHeader})
+			}()
+			select {
+			case err := <-nonOwnerResult:
+				t.Fatalf("generic same-loop publisher stole in-flight turn-start reservation: %v", err)
+			case <-time.After(20 * time.Millisecond):
+			}
+
+			idleHeader, err := s.factory.Stamp(event.Header{Coordinates: identity.Coordinates{
+				SessionID: s.sessionID,
+				LoopID:    syntheticLoopID,
+			}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			idleResult := make(chan error, 1)
+			go func() {
+				idleResult <- s.PublishEventChecked(context.Background(), event.LoopIdle{Header: idleHeader})
+			}()
+
+			select {
+			case err := <-idleResult:
+				t.Fatalf("idle transition passed an admitted turn-start reservation: %v", err)
+			case <-time.After(20 * time.Millisecond):
+			}
+			s.checkpointAdmission.mu.Lock()
+			readers := s.checkpointAdmission.readers
+			waiting := s.checkpointAdmission.waiting
+			s.checkpointAdmission.mu.Unlock()
+			if readers != 1 || waiting != 0 {
+				t.Fatalf("checkpoint admission readers/writers = %d/%d, want 1/0 before TurnStarted", readers, waiting)
+			}
+			close(paused.resume)
+
+			turnStarted := false
+			deadline := time.After(100 * time.Millisecond)
+			for !turnStarted {
+				for _, ev := range recorder.snapshot() {
+					started, ok := ev.(event.TurnStarted)
+					if ok && started.LoopID == loopID && started.Cause.CommandID == inputID {
+						turnStarted = true
+						break
+					}
+				}
+				if turnStarted {
+					break
+				}
+				select {
+				case <-deadline:
+					t.Fatal("reserved TurnStarted did not publish while retaining its execution reader")
+				default:
+					time.Sleep(time.Millisecond)
+				}
+			}
+			select {
+			case err := <-nonOwnerResult:
+				if err != nil {
+					t.Fatal(err)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("generic same-loop publisher did not continue after owned TurnStarted")
+			}
+			select {
+			case err := <-idleResult:
+				if err != nil {
+					t.Fatalf("ordered idle transition: %v", err)
+				}
+			case <-time.After(100 * time.Millisecond):
+				t.Fatal("idle transition did not continue after TurnStarted released its reservation")
+			}
+			select {
+			case <-llm.started:
+			case <-time.After(time.Second):
+				t.Fatal("first inference did not start after TurnStarted")
+			}
+			writerResult := make(chan struct {
+				release func()
+				err     error
+			}, 1)
+			go func() {
+				release, err := s.checkpointAdmission.enterCheckpoint(context.Background())
+				writerResult <- struct {
+					release func()
+					err     error
+				}{release: release, err: err}
+			}()
+			writerDeadline := time.Now().Add(time.Second)
+			for {
+				s.checkpointAdmission.mu.Lock()
+				readers = s.checkpointAdmission.readers
+				waiting = s.checkpointAdmission.waiting
+				s.checkpointAdmission.mu.Unlock()
+				if readers == 1 && waiting == 1 {
+					break
+				}
+				if time.Now().After(writerDeadline) {
+					t.Fatalf("checkpoint writer did not wait behind first inference reader: readers/waiting=%d/%d", readers, waiting)
+				}
+				time.Sleep(time.Millisecond)
+			}
+			select {
+			case result := <-writerResult:
+				if result.release != nil {
+					result.release()
+				}
+				t.Fatalf("checkpoint writer entered between TurnStarted and first inference completion: %v", result.err)
+			default:
+			}
+			releaseInference()
+			select {
+			case result := <-writerResult:
+				if result.err != nil {
+					t.Fatal(result.err)
+				}
+				result.release()
+			case <-time.After(time.Second):
+				t.Fatal("checkpoint writer did not enter after first inference released its reader")
+			}
+		})
+	}
+}
+
+func TestRequiredIdleCheckpointWinsBeforeTurnStartReader(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+	}{
+		{name: "idle winner commits before turn-start reservation admits a reader"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			blobs := &blockingBoundaryBlobs{Blobs: memstore.New().Blobs, entered: make(chan struct{}), release: make(chan struct{})}
+			ws, err := workspacestore.Open(blobs)
+			if err != nil {
+				t.Fatal(err)
+			}
+			root := t.TempDir()
+			if err := os.WriteFile(filepath.Join(root, "work.txt"), []byte("work"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			recorder := &recordingEventAppender{}
+			s, err := newTestSession(context.Background(), cfg(&stubLLM{}),
+				WithEventAppender(recorder),
+				withResolvedPlacement(&resolvedPlacement{mode: PlacementSession, store: ws, root: root, coordinator: newWorkspaceCoordinator(nil)}),
+				WithSnapshotPolicy(SnapshotPolicy{Trigger: SnapshotOnIdle, Priority: SnapshotRequired, Timeout: time.Second}),
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = s.Shutdown(context.Background()) })
+
+			syntheticLoopID := mustUUID()
+			startedHeader, err := s.factory.Stamp(event.Header{Coordinates: identity.Coordinates{
+				SessionID: s.sessionID,
+				LoopID:    syntheticLoopID,
+				TurnID:    mustUUID(),
+			}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := s.PublishEventChecked(context.Background(), event.TurnStarted{Header: startedHeader}); err != nil {
+				t.Fatal(err)
+			}
+			idleHeader, err := s.factory.Stamp(event.Header{Coordinates: identity.Coordinates{
+				SessionID: s.sessionID,
+				LoopID:    syntheticLoopID,
+			}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			idleResult := make(chan error, 1)
+			go func() {
+				idleResult <- s.PublishEventChecked(context.Background(), event.LoopIdle{Header: idleHeader})
+			}()
+			select {
+			case <-blobs.entered:
+			case <-time.After(time.Second):
+				t.Fatal("required idle checkpoint did not acquire its writer and start snapshot")
+			}
+
+			loopID := mustUUID()
+			paused := &pausedExecutionSession{
+				Session:  s,
+				acquired: make(chan struct{}),
+				resume:   make(chan struct{}),
+			}
+			loopCtx, cancelLoop := context.WithCancel(context.Background())
+			t.Cleanup(cancelLoop)
+			bound := bindCfg(cfg(&stubLLM{chunks: []content.Chunk{textChunk("done")}}), s.sessionID, loopID)
+			l, err := loopruntime.New(loopCtx, s.sessionID, loopID, loop.Provenance{}, paused, bound)
+			if err != nil {
+				t.Fatal(err)
+			}
+			inputID := mustUUID()
+			select {
+			case l.Commands <- command.UserInput{Header: command.Header{CommandID: inputID, CreatedAt: time.Now()}}:
+			case <-time.After(time.Second):
+				t.Fatal("loop submit blocked")
+			}
+			select {
+			case <-paused.acquired:
+				t.Fatal("turn-start reader admitted before prior idle checkpoint completed")
+			case <-time.After(20 * time.Millisecond):
+			}
+			s.checkpointAdmission.mu.Lock()
+			readers := s.checkpointAdmission.readers
+			writer := s.checkpointAdmission.writer
+			s.checkpointAdmission.mu.Unlock()
+			if readers != 0 || !writer {
+				t.Fatalf("checkpoint admission readers/writer = %d/%v, want 0/true", readers, writer)
+			}
+
+			close(blobs.release)
+			if err := <-idleResult; err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case <-paused.acquired:
+			case <-time.After(time.Second):
+				t.Fatal("turn-start reader was not admitted after idle checkpoint completed")
+			}
+			close(paused.resume)
+			deadline := time.Now().Add(time.Second)
+			for {
+				published := false
+				for _, ev := range recorder.snapshot() {
+					started, ok := ev.(event.TurnStarted)
+					if ok && started.LoopID == loopID && started.Cause.CommandID == inputID {
+						published = true
+						break
+					}
+				}
+				if published {
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Fatal("TurnStarted did not publish after idle winner released")
+				}
+				time.Sleep(time.Millisecond)
+			}
+		})
 	}
 }
 

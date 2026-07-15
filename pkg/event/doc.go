@@ -23,6 +23,9 @@ var (
 	_ Event = SessionActive{}
 	_ Event = SessionIdle{}
 	_ Event = SessionStopped{}
+	_ Event = HustleStarted{}
+	_ Event = HustleCompleted{}
+	_ Event = HustleFailed{}
 	_ Event = RestoreStarted{}
 	_ Event = RestoreDone{}
 	_ Event = RestoreErrored{}
@@ -38,6 +41,11 @@ var (
 	_ Event = LoopInferenceChanged{}
 	_ Event = LoopModeChanged{}
 	_ Event = ForeignSessionBound{}
+	_ Event = CompactionStarted{}
+	_ Event = CompactionCommitted{}
+	_ Event = CompactionRejected{}
+	_ Event = CompactWaiterResolved{}
+	_ Event = CompactWaiterRejected{}
 
 	// Turn/step-scoped events.
 	_ Event = TokenDelta{}

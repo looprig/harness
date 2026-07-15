@@ -9,6 +9,7 @@ import (
 
 	"github.com/looprig/core/content"
 	"github.com/looprig/core/uuid"
+	"github.com/looprig/harness/internal/hustleruntime"
 	"github.com/looprig/harness/internal/loopruntime"
 	"github.com/looprig/harness/pkg/ceiling"
 	"github.com/looprig/harness/pkg/command"
@@ -16,6 +17,7 @@ import (
 	"github.com/looprig/harness/pkg/foreignloop"
 	"github.com/looprig/harness/pkg/gate"
 	"github.com/looprig/harness/pkg/hub"
+	"github.com/looprig/harness/pkg/hustle"
 	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/harness/pkg/tool"
@@ -76,8 +78,20 @@ type Session struct {
 	// registered after Shutdown's snapshot has been taken.
 	closing bool
 
-	// faulted is the persistence fail-secure latch: set by ReportFault when the hub
-	// raises a SessionPersistenceFault (a required durable append failed). Once set,
+	// shutdownMu makes teardown single-owner. Every concurrent or repeated caller
+	// joins shutdownDone and observes the same cleanup result; its own context error
+	// is added only after the shared, session-bounded teardown has completed.
+	shutdownMu      sync.Mutex
+	shutdownStarted bool
+	shutdownDone    chan struct{}
+	shutdownErr     error
+	// shutdownTimeouts is a package-private test seam. Production leaves it zero
+	// and derives every phase budget from the session's already-validated loop,
+	// hustle, checkpoint, and durable-I/O bounds.
+	shutdownTimeouts shutdownCleanupTimeouts
+
+	// faulted is the terminal fail-secure latch: set by ReportFault when the hub
+	// raises a SessionPersistenceFault, or by an internal hustle/workspace fault. Once set,
 	// every new Submit/NewLoop is refused with SessionFaulted, so no further work is
 	// admitted to a session whose durable log is no longer trustworthy. faultErr is
 	// the fault that latched it (chained as the refusal's Cause). Both are guarded by
@@ -91,6 +105,13 @@ type Session struct {
 	// owned by the recoverable required-checkpoint latch. Manual recovery may clear
 	// only this token; a newer terminal fault has a different generation.
 	workspaceWaiterFailureToken uint64
+
+	// hustleDefinitions and hustleLimits are immutable construction inputs. The
+	// single controller is bound before the session or any loop is reachable.
+	hustleDefinitions []hustle.Definition
+	hustleLimits      HustleLimits
+	hustleController  *hustleruntime.Controller
+	hustlesBound      bool
 
 	// limits are the in-session subagent-spawn safety caps NewLoop enforces (depth +
 	// quota). Defaulted in newSession (withDefaults) so the live values are always
@@ -492,6 +513,10 @@ type loopHandle struct {
 	state     tool.DelegateStatusValue
 }
 
+func runtimeForModel(model inference.Model) event.ModelRuntime {
+	return event.ModelRuntime{Key: model.Key(), Limits: model.Limits, Effort: model.Sampling.Effort}
+}
+
 func (h *loopHandle) ID() uuid.UUID { return h.id }
 func (h *loopHandle) Mode() loop.ModeName {
 	h.liveMu.RLock()
@@ -571,6 +596,10 @@ var _ hub.FaultReporter = (*Session)(nil)
 // operator action owns recovery; this only stops admitting new work and unblocks
 // callers stuck waiting on a session that can no longer reach idle durably.
 func (s *Session) ReportFault(_ context.Context, fault *hub.SessionPersistenceFault) {
+	s.latchSessionFault(fault)
+}
+
+func (s *Session) latchSessionFault(fault error) {
 	s.loopsMu.Lock()
 	if !s.faulted {
 		s.faulted = true
@@ -686,6 +715,17 @@ func (s *Session) CommitBoundary(ctx context.Context, ev event.Event) error {
 	return s.checkpoints.boundary(ctx, ev)
 }
 
+// CommitContextBoundary is the context-mutating boundary seam. The committed
+// result distinguishes an event append failure from a later checkpoint failure,
+// so the loop actor can keep live history aligned with durable restore state.
+func (s *Session) CommitContextBoundary(ctx context.Context, ev event.Event) (bool, error) {
+	if s.checkpoints == nil {
+		err := s.PublishEventChecked(ctx, ev)
+		return err == nil, err
+	}
+	return s.checkpoints.boundaryResult(ctx, ev)
+}
+
 // CommitSessionIdle is the hub's narrow derived-idle collaborator. The hub retains
 // append/fanout ownership in commit; the controller brackets it with the workspace
 // permit and accepted checkpoint walk when idle is the configured trigger.
@@ -704,9 +744,50 @@ func (s *Session) SessionActivated() {
 	}
 }
 
-// EnterExecution is the loop actor's session-wide checkpoint and loop-scoped
+type sessionTurnStartCapability struct {
+	session          *Session
+	reservation      *hub.TurnStartReservation
+	releaseExecution func()
+	releaseOnce      sync.Once
+}
+
+func (c *sessionTurnStartCapability) PublishTurnStarted(ctx context.Context, started event.TurnStarted) (bool, error) {
+	committed, err := c.reservation.PublishTurnStartedChecked(ctx, started)
+	if committed {
+		c.session.recordLoopMechanicalState(started)
+	}
+	return committed, err
+}
+
+func (c *sessionTurnStartCapability) Release() {
+	if c == nil {
+		return
+	}
+	c.releaseOnce.Do(func() {
+		c.releaseExecution()
+		c.reservation.Release()
+	})
+}
+
+// EnterExecution is the inference-step session-wide checkpoint and loop-scoped
 // interrupt admission seam.
 func (s *Session) EnterExecution(ctx context.Context, loopID uuid.UUID) (func(), error) {
+	release, _, err := s.enterExecution(ctx, loopID, false)
+	return release, err
+}
+
+// EnterTurnStart reserves the Hub activity transition before acquiring the first
+// checkpoint reader. Its returned capability publishes the exact opening event and
+// releases the checkpoint reader when the first inference step ends.
+func (s *Session) EnterTurnStart(ctx context.Context, loopID uuid.UUID) (loopruntime.TurnStartCapability, error) {
+	release, reservation, err := s.enterExecution(ctx, loopID, true)
+	if err != nil {
+		return nil, err
+	}
+	return &sessionTurnStartCapability{session: s, reservation: reservation, releaseExecution: release}, nil
+}
+
+func (s *Session) enterExecution(ctx context.Context, loopID uuid.UUID, reserve bool) (func(), *hub.TurnStartReservation, error) {
 	for {
 		for {
 			s.loopsMu.Lock()
@@ -722,17 +803,28 @@ func (s *Session) EnterExecution(ctx context.Context, loopID uuid.UUID) (func(),
 			select {
 			case <-changed:
 			case <-ctx.Done():
-				return nil, ctx.Err()
+				return nil, nil, ctx.Err()
 			case <-s.sessionCtx.Done():
-				return nil, s.sessionCtx.Err()
+				return nil, nil, s.sessionCtx.Err()
+			}
+		}
+		var reservation *hub.TurnStartReservation
+		if reserve {
+			var err error
+			reservation, err = s.hub.ReserveTurnStart(loopID)
+			if err != nil {
+				return nil, nil, err
 			}
 		}
 		if s.checkpointAdmission == nil {
-			return func() {}, nil
+			return func() {}, reservation, nil
 		}
 		release, err := s.checkpointAdmission.enterExecution(ctx)
 		if err != nil {
-			return nil, err
+			if reservation != nil {
+				reservation.Release()
+			}
+			return nil, nil, err
 		}
 		// Close the interrupt mark/checkpoint-acquire race: a sweep may mark
 		// this loop while it waited for the checkpoint reader permit. In that
@@ -741,9 +833,12 @@ func (s *Session) EnterExecution(ctx context.Context, loopID uuid.UUID) (func(),
 		pending := s.interruptPending[loopID] > 0
 		s.loopsMu.RUnlock()
 		if !pending {
-			return release, nil
+			return release, reservation, nil
 		}
 		release()
+		if reservation != nil {
+			reservation.Release()
+		}
 	}
 }
 
@@ -939,7 +1034,7 @@ func (s *Session) deliverSubagentResult(ctx context.Context, parentLoopID, fromL
 	// the hand-back proceeds. Targets the PARENT loop (the command's delivery target).
 	s.appendCommand(ctx, parentLoopID, cmd)
 	select {
-	case l.CommandSink() <- cmd:
+	case commandSinkFor(l, cmd) <- cmd:
 		return nil
 	case <-l.DoneChan():
 		return &SessionError{Kind: SessionLoopExited}
@@ -1129,7 +1224,11 @@ func (s *Session) newLoopWithAdmission(parent loop.Provenance, cfg loop.Definiti
 	var foreignSID string
 	switch bound.Engine() {
 	case loop.EngineNative:
-		b, err = loopruntime.NewInMode(loopCtx, s.sessionID, loopID, parent, eventTarget, bound, startedMode)
+		var compactor loopruntime.Compactor
+		compactor, err = s.compactorFor(bound, loopID)
+		if err == nil {
+			b, err = loopruntime.NewInModeWithCompactor(loopCtx, s.sessionID, loopID, parent, eventTarget, bound, startedMode, compactor)
+		}
 	default:
 		if s.foreignBuild == nil {
 			release()
@@ -1223,7 +1322,7 @@ func (s *Session) newLoopWithAdmission(parent loop.Provenance, cfg loop.Definiti
 	// ctx param, so it publishes on the session lifetime (s.sessionCtx). The header
 	// (Coordinates/Cause + minted EventID/CreatedAt) was stamped above before the loop
 	// was built.
-	ev := event.LoopStarted{Header: startedHeader, ParentToolUseID: parentToolUseID, ForeignSID: foreignSID, InitialMode: string(startedMode), DisplayName: bound.DisplayName(), Description: bound.Description()}
+	ev := event.LoopStarted{Header: startedHeader, Runtime: runtimeForModel(liveModel), ParentToolUseID: parentToolUseID, ForeignSID: foreignSID, InitialMode: string(startedMode), DisplayName: bound.DisplayName(), Description: bound.Description()}
 	if admission != nil {
 		ev.InitialRequestID = admission.requestID
 	}
@@ -1453,6 +1552,9 @@ func newSessionTopology(ctx context.Context, topology Topology, newID idGenerato
 		hubOpts = append(hubOpts, hub.WithAppender(s.injectedEventAppender))
 	}
 	s.hub = hub.New(id, hubOpts...)
+	if err := s.bindSessionHustles(); err != nil {
+		return abort(err)
+	}
 	if s.snapshotPolicy != nil && s.ws != nil && s.wsCoordinator != nil {
 		s.checkpoints = newCheckpointController(checkpointControllerConfig{
 			SessionID: id, Policy: *s.snapshotPolicy, Store: s.ws, Root: s.wsRoot,
@@ -1565,7 +1667,7 @@ func (s *Session) interruptLoop(loopID uuid.UUID, l loop.Backend) {
 	timer := time.NewTimer(100 * time.Millisecond)
 	defer timer.Stop()
 	select {
-	case l.CommandSink() <- cmd:
+	case commandSinkFor(l, cmd) <- cmd:
 	case <-l.DoneChan():
 	case <-timer.C:
 	}
@@ -1689,6 +1791,58 @@ func (s *Session) Submit(ctx context.Context, input []content.Block) (uuid.UUID,
 // loop-targeted core submitToLoop with AgencyUser, exactly as Submit does for the active loop.
 func (s *Session) SubmitToLoop(ctx context.Context, loopID uuid.UUID, blocks []content.Block) (uuid.UUID, error) {
 	return s.submitToLoop(ctx, loopID, blocks, identity.AgencyUser, false)
+}
+
+// Compact requests manual compaction of the currently active loop. The active
+// id is sampled once, then routed through the exact-target implementation.
+func (s *Session) Compact(ctx context.Context) (uuid.UUID, error) {
+	s.loopsMu.RLock()
+	active := s.activeLoopID
+	s.loopsMu.RUnlock()
+	return s.CompactToLoop(ctx, active)
+}
+
+// CompactToLoop requests manual compaction of one exact live native loop. The
+// trusted session boundary owns user agency and command coordinates; callers
+// receive only the correlation id used by durable waiter outcomes.
+func (s *Session) CompactToLoop(ctx context.Context, loopID uuid.UUID) (uuid.UUID, error) {
+	if err := s.faultIfFaulted(); err != nil {
+		return uuid.UUID{}, err
+	}
+	s.loopsMu.RLock()
+	h, ok := s.loops[loopID]
+	s.loopsMu.RUnlock()
+	if !ok {
+		return uuid.UUID{}, &SessionError{Kind: SessionLoopNotFound}
+	}
+	if h.bound.Engine() != loop.EngineNative {
+		return uuid.UUID{}, &SessionError{Kind: SessionCompactionUnsupported}
+	}
+	if _, configured := h.bound.CompactionPolicy(); !configured {
+		return uuid.UUID{}, &SessionError{Kind: SessionCompactionUnsupported}
+	}
+	select {
+	case <-h.backend.DoneChan():
+		return uuid.UUID{}, &SessionError{Kind: SessionLoopExited}
+	default:
+	}
+	id, err := s.newCommandID()
+	if err != nil {
+		return uuid.UUID{}, err
+	}
+	cmd := command.Compact{
+		Header:      command.Header{CommandID: id, Agency: identity.AgencyUser, CreatedAt: s.stampNow()},
+		Coordinates: identity.Coordinates{SessionID: s.sessionID, LoopID: loopID},
+	}
+	s.appendCommand(ctx, loopID, cmd)
+	select {
+	case h.backend.CommandSink() <- cmd:
+		return id, nil
+	case <-ctx.Done():
+		return uuid.UUID{}, &SessionError{Kind: SessionContextDone, Cause: ctx.Err()}
+	case <-h.backend.DoneChan():
+		return uuid.UUID{}, &SessionError{Kind: SessionLoopExited}
+	}
 }
 
 // submitToLoop submits a UserInput to a SPECIFIC loop with the given Agency,
@@ -1923,13 +2077,7 @@ func (s *Session) stopOffloadGC() {
 // records the cause. FailWaiters is called OUTSIDE loopsMu (it takes the hub lock, which is
 // never held together with loopsMu).
 func (s *Session) faultWorkspaceInconsistent(cause error) {
-	s.loopsMu.Lock()
-	if !s.faulted {
-		s.faulted = true
-		s.faultErr = cause
-	}
-	s.loopsMu.Unlock()
-	s.hub.FailWaiters(cause)
+	s.latchSessionFault(cause)
 }
 
 // newWorkspaceBinding returns the tool.WorkspaceBinding to populate at a loop bind site, or
@@ -1962,26 +2110,57 @@ type shutdownTarget struct {
 //     is the atomicity NewLoop's registration check pairs with (it re-tests
 //     closing under the same lock): a loop is either already in this snapshot or
 //     refused by NewLoop — never registered after the snapshot is taken.
-//  2. Keep the checkpoint controller and hub open while graceful loop shutdown drains,
-//     so genuine terminals produced by active turns cross their configured boundary.
-//  3. defer sessionCancel as the FINAL backstop on ALL paths (graceful waits, an
-//     id-gen-skipped loop, or a ctx timeout) — it releases every loopCtx derived
-//     from sessionCtx. It is deferred (not called before the graceful waits) so it
-//     never hard-cancels loops mid-shutdown; it runs last, on every return.
-//  4. Send command.Shutdown to EVERY loop in the snapshot, recording each reached
+//  2. Close hustle admission and cancel queued/executing inference. Keep the
+//     checkpoint controller, hub, and session context open for owned cleanup.
+//  3. Send command.Shutdown to EVERY loop in the snapshot, recording each reached
 //     loop's (loop, ack) pair. Per loop: mint a CommandID; on id-gen failure SKIP
-//     that loop's graceful shutdown (the deferred sessionCancel hard-cancels it)
-//     rather than aborting the whole Shutdown. The send keeps Done/ctx escapes so
-//     an unbuffered send can never wedge; a loop already exited (Done) is skipped.
-//  5. Wait for every recorded ack, then cancel/join checkpoints, stop the hub, and
-//     release root/session leases in that order.
-//  6. Aggregate the first non-nil error (a loop's
-//     root ctx cancelled before cleanup finished), bounded by ctx and each loop's
-//     Done.
+//     that loop's graceful shutdown (the final sessionCancel hard-cancels it)
+//     rather than aborting the whole Shutdown. A loop already exited is skipped.
+//  4. Wait for every recorded ack, then join hustle terminal audit, finalizers,
+//     and blocking activity release through Controller.Drained.
+//  5. Stop/join checkpoints and offload GC, append SessionStopped/stop the hub,
+//     release root/session leases, and cancel sessionCtx last.
+//  6. Loop/checkpoint/hub phases have private deadlines derived from validated
+//     component bounds. Hustle audit, finalization, and worker drain use their own
+//     trusted inner bounds and are always joined; an outer deadline never detaches
+//     owned cleanup. Caller cancellation is diagnostic only.
 //
-// Calling Shutdown twice is safe: StopSession is idempotent, closing already true
-// is fine, and loops that already exited hit the <-Done cases.
+// Concurrent and repeated calls join one teardown owner and receive the same cleanup
+// result, augmented with each caller's own context error after cleanup completes.
 func (s *Session) Shutdown(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if hustleFinalizerOwnsSession(ctx, s) {
+		return &HustleShutdownReentryError{}
+	}
+	s.shutdownMu.Lock()
+	if s.shutdownStarted {
+		done := s.shutdownDone
+		s.shutdownMu.Unlock()
+		<-done
+		s.shutdownMu.Lock()
+		cleanupErr := s.shutdownErr
+		s.shutdownMu.Unlock()
+		return shutdownResult(cleanupErr, ctx.Err())
+	}
+	s.shutdownStarted = true
+	s.shutdownDone = make(chan struct{})
+	s.shutdownMu.Unlock()
+
+	cleanupErr := s.shutdown()
+	s.shutdownMu.Lock()
+	s.shutdownErr = cleanupErr
+	close(s.shutdownDone)
+	s.shutdownMu.Unlock()
+	return shutdownResult(cleanupErr, ctx.Err())
+}
+
+func (s *Session) shutdown() error {
+	shutdownRoot := context.Background()
+	if s.sessionCtx != nil {
+		shutdownRoot = context.WithoutCancel(s.sessionCtx)
+	}
 	// Serialize the closing latch with SetActiveLoop's durable append→visibility
 	// transaction. Once closing is visible, no active-loop change may start.
 	s.activeMu.Lock()
@@ -1996,84 +2175,55 @@ func (s *Session) Shutdown(ctx context.Context) error {
 	}
 	s.loopsMu.Unlock()
 	s.activeMu.Unlock()
-	// (3) Final backstop on every path: released last, after the graceful waits or
-	// on a ctx timeout. Deferred so it never hard-cancels loops mid-shutdown.
-	defer s.sessionCancel()
+	timeouts := s.resolveShutdownTimeouts(snapshot)
+	failures := make([]error, 0, 6)
+	failures = append(failures, s.closeHustles(shutdownRoot, timeouts.hustle))
+	targets, sendErr := s.sendLoopShutdowns(shutdownRoot, snapshot, timeouts.loopSend)
+	failures = append(failures, sendErr)
+	failures = append(failures, s.waitLoopShutdowns(shutdownRoot, snapshot, targets, timeouts.loopDrain))
+	s.waitHustlesDrained()
 
-	// Release the single-writer lease on every Shutdown return path, ONCE — deferred
-	// AFTER sessionCancel so it runs BEFORE it (LIFO): the graceful waits have completed
-	// (the journal's last append is durable) before ownership is relinquished, and the
-	// release happens before the root context is cancelled. Nil in headless mode (no-op).
-	defer s.releaseLease(ctx)
+	// From here onward every phase gets a fresh private deadline. A timeout in one
+	// component therefore cannot suppress checkpoint, durable-stop, or lease cleanup.
+	s.stopOffloadGC()
+	failures = append(failures, s.stopCheckpoints(shutdownRoot, timeouts.checkpoint))
+	failures = append(failures, s.stopHub(shutdownRoot, timeouts.hub))
+	s.releaseRootLease(shutdownRoot)
+	s.releaseLease(shutdownRoot)
+	if s.sessionCancel != nil {
+		s.sessionCancel()
+	}
+	return combineShutdownErrors(failures...)
+}
 
-	// Release the EXCLUSIVE workspace root lease AFTER the session-lease defer above so it
-	// runs BEFORE it (LIFO): work + checkpoints have stopped, the root lease is released,
-	// THEN the session lease. Nil-safe (per-session/shared/no placement). This deferred
-	// ordering realizes the design's teardown: stop work/checkpoints → release root lease
-	// → release session lease.
-	defer s.releaseRootLease(ctx)
+type shutdownErrorSet struct{ Causes []error }
 
-	// Registered last so it runs first on every return: genuine loop terminals drain
-	// through the still-open controller/hub; then automatic activity is canceled/joined,
-	// SessionStopped is appended/emitted, and only afterward do the lease defers run.
-	defer func() {
-		// Stop + join the offload-GC goroutine FIRST — before SessionStopped is appended
-		// (StopSession) and before the lease defers run — so a GC pass can never race the
-		// terminal append or outlive lease ownership.
-		s.stopOffloadGC()
-		if s.checkpoints != nil {
-			s.checkpoints.shutdown()
-		}
-		s.hub.StopSession(ctx)
-	}()
+func (e *shutdownErrorSet) Error() string   { return "session: shutdown cleanup failed" }
+func (e *shutdownErrorSet) Unwrap() []error { return e.Causes }
 
-	// (4) Send a graceful Shutdown to every loop in the snapshot.
-	targets := make([]shutdownTarget, 0, len(snapshot))
-	for _, ls := range snapshot {
-		id, err := s.newCommandID()
-		if err != nil {
-			// id-gen failure for ONE loop must not abort the whole Shutdown: skip
-			// its graceful shutdown; the deferred sessionCancel hard-cancels it.
-			continue
-		}
-		ack := make(chan error, 1)
-		cmd := command.Shutdown{Header: command.Header{CommandID: id, CreatedAt: s.stampNow()}, Ack: ack}
-		// Intent log (audit-only): one record per loop (the command is per-loop), appended
-		// BEFORE this loop's send; an append failure is logged and the fan-out proceeds. This
-		// is the shutdown-aware append: a typed lease-lost failure here is expected (ownership
-		// is relinquished during teardown) and logged below error, not as a false alarm.
-		s.appendShutdownCommand(ctx, ls.loopID, cmd)
-		select {
-		case ls.handle.backend.CommandSink() <- cmd:
-			targets = append(targets, shutdownTarget{loop: ls.handle.backend, ack: ack})
-		case <-ls.handle.backend.DoneChan():
-			// Loop already exited; nothing to wait for.
-		case <-ctx.Done():
-			return &SessionError{Kind: SessionContextDone, Cause: ctx.Err()}
+func combineShutdownErrors(causes ...error) error {
+	filtered := make([]error, 0, len(causes))
+	for _, cause := range causes {
+		if cause != nil {
+			filtered = append(filtered, cause)
 		}
 	}
-
-	// (5) Wait for each reached loop's ack, aggregating the first non-nil error.
-	var firstErr error
-	for _, t := range targets {
-		select {
-		case e := <-t.ack:
-			// e is non-nil when that loop's root ctx was cancelled before the actor
-			// finished cleanup. Keep the first such error to report.
-			if e != nil && firstErr == nil {
-				firstErr = e
-			}
-		case <-t.loop.DoneChan():
-			// Actor exited without (or before we read) an ack; nothing to wait for.
-		case <-ctx.Done():
-			return &SessionError{Kind: SessionContextDone, Cause: ctx.Err()}
-		}
+	switch len(filtered) {
+	case 0:
+		return nil
+	case 1:
+		return filtered[0]
+	default:
+		return &shutdownErrorSet{Causes: filtered}
 	}
+}
 
-	if firstErr != nil {
-		return &SessionError{Kind: SessionContextDone, Cause: firstErr}
+func shutdownResult(cleanupErr, callerErr error) error {
+	cause := combineShutdownErrors(cleanupErr, callerErr)
+	if cause == nil {
+		return nil
 	}
-	return nil
+	return &SessionError{Kind: SessionContextDone, Cause: cause}
 }
 
 // routeGate sends a fire-and-route gate command to the resolved target loop. These

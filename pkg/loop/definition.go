@@ -34,24 +34,29 @@ type InitialFingerprint struct {
 }
 
 type definitionState struct {
-	name              identity.AgentName
-	displayName       string
-	description       string
-	client            inference.Client
-	model             inference.Model
-	system            string
-	tools             []tool.Definition
-	permissionFactory PermissionFactory
-	middlewares       []tool.ToolMiddleware
-	limits            ToolLimits
-	engine            Engine
-	drainTimeout      time.Duration
-	runtimeContext    RuntimeContextProvider
-	delegates         []identity.AgentName
-	delegation        Delegation
-	modes             []Mode
-	initialMode       ModeName
-	policyRevision    string
+	name                identity.AgentName
+	displayName         string
+	description         string
+	client              inference.Client
+	model               inference.Model
+	system              string
+	tools               []tool.Definition
+	permissionFactory   PermissionFactory
+	middlewares         []tool.ToolMiddleware
+	limits              ToolLimits
+	engine              Engine
+	drainTimeout        time.Duration
+	runtimeContext      RuntimeContextProvider
+	delegates           []identity.AgentName
+	delegation          Delegation
+	modes               []Mode
+	initialMode         ModeName
+	policyRevision      string
+	contextCounter      inference.ContextCounter
+	counterCapability   inference.CounterCapability
+	inferenceCapability inference.InferenceCapability
+	contextObservation  ContextObservationPolicy
+	compaction          CompactionPolicy
 }
 
 type definitionOptions struct {
@@ -85,6 +90,9 @@ func Define(opts ...Option) (Definition, error) {
 		return Definition{}, &DefinitionError{Kind: DefinitionInvalidClient, Field: "client"}
 	}
 	if err := resolved.model.Validate(); err != nil {
+		return Definition{}, &DefinitionError{Kind: DefinitionInvalidModel, Field: "model", Cause: err}
+	}
+	if err := resolved.model.Key().Validate(); err != nil {
 		return Definition{}, &DefinitionError{Kind: DefinitionInvalidModel, Field: "model", Cause: err}
 	}
 	if !resolved.model.Sampling.Effort.Valid() {
@@ -132,6 +140,9 @@ func Define(opts ...Option) (Definition, error) {
 	if err := validateModes(resolved.modes, resolved.initialMode); err != nil {
 		return Definition{}, err
 	}
+	if err := validateContextDefinition(resolved); err != nil {
+		return Definition{}, err
+	}
 
 	state := resolved.definitionState
 	state.model = cloneModel(state.model)
@@ -144,6 +155,61 @@ func Define(opts ...Option) (Definition, error) {
 		state.drainTimeout = defaultDrainTimeout
 	}
 	return Definition{state: &state}, nil
+}
+
+func validateContextDefinition(resolved *definitionOptions) error {
+	_, hasCounter := resolved.seen["context_counter"]
+	_, hasCapability := resolved.seen["inference_capability"]
+	_, hasObservation := resolved.seen["context_observation"]
+	_, hasCompaction := resolved.seen["compaction"]
+	if hasObservation && hasCompaction {
+		return &DefinitionError{Kind: DefinitionConflictingContextPolicy, Field: "context_policy"}
+	}
+	if (hasCapability || hasObservation || hasCompaction) && !hasCounter {
+		return &DefinitionError{Kind: DefinitionMissingContextCounter, Field: "context_counter"}
+	}
+	if hasCounter && !hasCapability {
+		return &DefinitionError{Kind: DefinitionMissingInferenceCapability, Field: "inference_capability"}
+	}
+	if !hasCounter {
+		return nil
+	}
+	if !hasObservation && !hasCompaction {
+		return &DefinitionError{Kind: DefinitionMissingContextPolicy, Field: "context_policy"}
+	}
+	if nilLike(resolved.contextCounter) {
+		return &DefinitionError{Kind: DefinitionInvalidContextCounter, Field: "context_counter"}
+	}
+	capability := resolved.contextCounter.CounterCapability()
+	if err := capability.Validate(); err != nil {
+		return &DefinitionError{Kind: DefinitionInvalidContextCounter, Field: "context_counter", Cause: err}
+	}
+	if err := resolved.inferenceCapability.Validate(); err != nil {
+		return &DefinitionError{Kind: DefinitionInvalidInferenceCapability, Field: "inference_capability", Cause: err}
+	}
+	if err := inference.CompatibleCounter(resolved.inferenceCapability, capability); err != nil {
+		return &DefinitionError{Kind: DefinitionIncompatibleContextCounter, Field: "context_counter", Cause: err}
+	}
+	if hasCompaction {
+		if err := resolved.compaction.Validate(capability); err != nil {
+			return &DefinitionError{Kind: DefinitionInvalidCompaction, Field: "compaction", Cause: err}
+		}
+	}
+	if hasObservation {
+		if err := resolved.contextObservation.Validate(capability); err != nil {
+			return &DefinitionError{Kind: DefinitionInvalidContextObservation, Field: "context_observation", Cause: err}
+		}
+	}
+	for _, mode := range resolved.modes {
+		if zeroModel(mode.Model) {
+			continue
+		}
+		if err := validateContextTransportBinding(resolved.model, mode.Model); err != nil {
+			return &DefinitionError{Kind: DefinitionInvalidModeBinding, Field: "mode.model", Value: string(mode.Name), Cause: err}
+		}
+	}
+	resolved.counterCapability = capability
+	return nil
 }
 
 func indexString(index int) string { return strconv.Itoa(index) }
@@ -297,24 +363,42 @@ func (d Definition) PolicyRevision() string {
 	delegates := append([]identity.AgentName(nil), d.state.delegates...)
 	slices.SortFunc(delegates, func(a, b identity.AgentName) int { return strings.Compare(string(a), string(b)) })
 	projection := struct {
-		Name           identity.AgentName
-		Model          inference.Model
-		System         string
-		Tools          []toolPolicy
-		Limits         ToolLimits
-		Engine         Engine
-		DrainTimeout   time.Duration
-		Delegates      []identity.AgentName
-		Delegation     Delegation
-		Modes          []modePolicy
-		InitialMode    ModeName
-		PolicyRevision string
+		Name                identity.AgentName
+		Model               inference.Model
+		System              string
+		Tools               []toolPolicy
+		Limits              ToolLimits
+		Engine              Engine
+		DrainTimeout        time.Duration
+		Delegates           []identity.AgentName
+		Delegation          Delegation
+		Modes               []modePolicy
+		InitialMode         ModeName
+		PolicyRevision      string
+		CounterCapability   *inference.CounterCapability
+		InferenceCapability *inference.InferenceCapability
+		ContextObservation  *ContextObservationPolicy
+		Compaction          *CompactionPolicy
 	}{
 		Name: d.state.name, Model: cloneModel(d.state.model), System: d.state.system,
 		Tools: tools(d.state.tools), Limits: d.state.limits, Engine: d.state.engine,
 		DrainTimeout: d.state.drainTimeout, Delegates: delegates,
 		Delegation: d.state.delegation, Modes: modes, InitialMode: d.state.initialMode,
 		PolicyRevision: d.state.policyRevision,
+	}
+	if d.state.contextCounter != nil {
+		counter := d.state.counterCapability
+		capability := d.state.inferenceCapability
+		projection.CounterCapability = &counter
+		projection.InferenceCapability = &capability
+	}
+	if d.state.compaction.CountTimeout != 0 {
+		policy := d.state.compaction
+		projection.Compaction = &policy
+	}
+	if d.state.contextObservation.CountTimeout != 0 {
+		policy := d.state.contextObservation
+		projection.ContextObservation = &policy
 	}
 	encoded, err := json.Marshal(projection)
 	if err != nil {
@@ -492,6 +576,12 @@ type BoundDefinition interface {
 	Middlewares() []tool.ToolMiddleware
 	DrainTimeout() time.Duration
 	RuntimeContext() RuntimeContextProvider
+	ContextCounter() inference.ContextCounter
+	CounterCapability() (inference.CounterCapability, bool)
+	InferenceCapability() (inference.InferenceCapability, bool)
+	ContextObservationPolicy() (ContextObservationPolicy, bool)
+	CompactionPolicy() (CompactionPolicy, bool)
+	ValidateContextModel(inference.Model) error
 	Delegation() Delegation
 	Delegates() []identity.AgentName
 	boundDefinition()
@@ -514,6 +604,24 @@ func (b *boundDefinitionState) Permission() PermissionGate  { return b.permissio
 func (b *boundDefinitionState) DrainTimeout() time.Duration { return b.definition.drainTimeout }
 func (b *boundDefinitionState) RuntimeContext() RuntimeContextProvider {
 	return b.definition.runtimeContext
+}
+func (b *boundDefinitionState) ContextCounter() inference.ContextCounter {
+	return b.definition.contextCounter
+}
+func (b *boundDefinitionState) CounterCapability() (inference.CounterCapability, bool) {
+	return b.definition.counterCapability, b.definition.contextCounter != nil
+}
+func (b *boundDefinitionState) InferenceCapability() (inference.InferenceCapability, bool) {
+	return b.definition.inferenceCapability, b.definition.contextCounter != nil
+}
+func (b *boundDefinitionState) ContextObservationPolicy() (ContextObservationPolicy, bool) {
+	return b.definition.contextObservation, b.definition.contextObservation.CountTimeout != 0
+}
+func (b *boundDefinitionState) CompactionPolicy() (CompactionPolicy, bool) {
+	return b.definition.compaction, b.definition.compaction.CountTimeout != 0
+}
+func (b *boundDefinitionState) ValidateContextModel(model inference.Model) error {
+	return validateDefinitionContextModel(b.definition, model)
 }
 func (b *boundDefinitionState) Delegation() Delegation { return b.definition.delegation }
 func (b *boundDefinitionState) Delegates() []identity.AgentName {
@@ -585,6 +693,88 @@ func WithInference(client inference.Client, model inference.Model) Option {
 		o.client, o.model = client, cloneModel(model)
 		return nil
 	}
+}
+
+// WithContextCounter installs one fixed complete-request counter.
+func WithContextCounter(counter inference.ContextCounter) Option {
+	return func(o *definitionOptions) error {
+		if err := o.singleton("context_counter"); err != nil {
+			return err
+		}
+		o.contextCounter = counter
+		return nil
+	}
+}
+
+// WithInferenceCapability declares the fixed inference transport posture.
+func WithInferenceCapability(capability inference.InferenceCapability) Option {
+	return func(o *definitionOptions) error {
+		if err := o.singleton("inference_capability"); err != nil {
+			return err
+		}
+		o.inferenceCapability = capability
+		return nil
+	}
+}
+
+// WithContextObservation installs explicit hard-admission policy without
+// enabling conversation compaction.
+func WithContextObservation(policy ContextObservationPolicy) Option {
+	return func(o *definitionOptions) error {
+		if err := o.singleton("context_observation"); err != nil {
+			return err
+		}
+		o.contextObservation = policy
+		return nil
+	}
+}
+
+// WithCompaction installs explicit manual and optional automatic policy.
+func WithCompaction(policy CompactionPolicy) Option {
+	return func(o *definitionOptions) error {
+		if err := o.singleton("compaction"); err != nil {
+			return err
+		}
+		o.compaction = policy
+		return nil
+	}
+}
+
+// CompactionPolicy returns the frozen policy when configured.
+func (d Definition) CompactionPolicy() (CompactionPolicy, bool) {
+	if d.state == nil || d.state.compaction.CountTimeout == 0 {
+		return CompactionPolicy{}, false
+	}
+	return d.state.compaction, true
+}
+
+// ContextObservationPolicy returns the frozen observe-only policy when configured.
+func (d Definition) ContextObservationPolicy() (ContextObservationPolicy, bool) {
+	if d.state == nil || d.state.contextObservation.CountTimeout == 0 {
+		return ContextObservationPolicy{}, false
+	}
+	return d.state.contextObservation, true
+}
+
+// ValidateContextModel checks structural validity and the fixed transport binding.
+func (d Definition) ValidateContextModel(model inference.Model) error {
+	if d.state == nil {
+		return &DefinitionError{Kind: DefinitionInvalidModel, Field: "model"}
+	}
+	return validateDefinitionContextModel(d.state, model)
+}
+
+func validateDefinitionContextModel(state *definitionState, model inference.Model) error {
+	if err := model.Validate(); err != nil {
+		return err
+	}
+	if err := model.Key().Validate(); err != nil {
+		return err
+	}
+	if state.contextCounter == nil {
+		return nil
+	}
+	return validateContextTransportBinding(state.model, model)
 }
 
 // WithDisplayName sets the loop's user-facing presentation label. Purely
@@ -724,6 +914,9 @@ func validateModes(modes []Mode, initial ModeName) error {
 		seen[mode.Name] = struct{}{}
 		if !zeroModel(mode.Model) {
 			if err := mode.Model.Validate(); err != nil {
+				return &DefinitionError{Kind: DefinitionInvalidMode, Field: "mode.model", Value: string(mode.Name), Cause: err}
+			}
+			if err := mode.Model.Key().Validate(); err != nil {
 				return &DefinitionError{Kind: DefinitionInvalidMode, Field: "mode.model", Value: string(mode.Name), Cause: err}
 			}
 			if !mode.Model.Sampling.Effort.Valid() {

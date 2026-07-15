@@ -5,8 +5,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/core/uuid"
+	"github.com/looprig/harness/pkg/identity"
 )
 
 // fixedUUID builds a deterministic non-zero uuid from a single seed byte.

@@ -57,6 +57,53 @@ func TestDefineValidation(t *testing.T) {
 	}
 }
 
+func TestDefineRequiresDurableModelKey(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name      string
+		configure func(inference.Model) []Option
+		wantKind  DefinitionErrorKind
+		wantField inference.ModelKeyField
+	}{
+		{
+			name: "base model requires provider",
+			configure: func(model inference.Model) []Option {
+				return []Option{WithName("agent"), WithInference(&fakeLLM{}, model)}
+			},
+			wantKind:  DefinitionInvalidModel,
+			wantField: inference.ModelKeyFieldProvider,
+		},
+		{
+			name: "mode model requires provider",
+			configure: func(model inference.Model) []Option {
+				return []Option{
+					WithName("agent"), WithInference(&fakeLLM{}, testModel()),
+					WithModes(Mode{Name: "alternate", Model: model}), WithInitialMode("alternate"),
+				}
+			},
+			wantKind:  DefinitionInvalidMode,
+			wantField: inference.ModelKeyFieldProvider,
+		},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			model := testModel()
+			model.Provider = ""
+			_, err := Define(tt.configure(model)...)
+			var definitionErr *DefinitionError
+			if !errors.As(err, &definitionErr) || definitionErr.Kind != tt.wantKind {
+				t.Fatalf("Define error = %T %v, want *DefinitionError kind %q", err, err, tt.wantKind)
+			}
+			var keyErr *inference.ModelKeyValidationError
+			if !errors.As(err, &keyErr) || keyErr.Field != tt.wantField {
+				t.Fatalf("Define cause = %T %v, want *ModelKeyValidationError field %q", err, err, tt.wantField)
+			}
+		})
+	}
+}
+
 func TestDefinitionBindValidatesIDsBeforeFactories(t *testing.T) {
 	t.Parallel()
 	tests := []struct {

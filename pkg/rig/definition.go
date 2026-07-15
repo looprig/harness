@@ -4,6 +4,7 @@ import (
 	"strings"
 
 	"github.com/looprig/harness/internal/sessionruntime"
+	"github.com/looprig/harness/pkg/hustle"
 	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/harness/pkg/sessionstore"
@@ -11,6 +12,8 @@ import (
 
 type definitionState struct {
 	loops             []loop.Definition
+	hustles           []hustle.Definition
+	hustleLimits      HustleLimits
 	primers           []string
 	activePrimer      string
 	store             *sessionstore.Store
@@ -99,6 +102,12 @@ func Define(options ...Option) (*Rig, error) {
 			return nil, &DefinitionError{Kind: DefinitionInvalidLoop, Name: name}
 		}
 	}
+	if err := validateHustleRegistration(state); err != nil {
+		return nil, err
+	}
+	if err := validateCompactionHustles(state.loops, state.hustles); err != nil {
+		return nil, err
+	}
 	// Resolve the (at-most-one) workspace placement: canonicalize the root/base, derive the
 	// exclusive root lease name, and enforce non-nil dependencies. A workspace-requiring
 	// tool with NO placement makes the rig invalid.
@@ -130,8 +139,14 @@ func Define(options ...Option) (*Rig, error) {
 		// field so a placement change (mode or path) is a config change.
 		fields.WorkspaceRoot = placementFingerprint(placement, region)
 	}
-	fingerprint := frozenFingerprint(fields, state.loops, state.primers, state.activePrimer)
+	fingerprint := frozenFingerprintWithHustles(fields, state.loops, state.primers, state.activePrimer, state.hustles, state.hustleLimits)
 	lifecycleOptions := append([]sessionruntime.LifecycleOption(nil), state.lifecycleOptions...)
+	if len(state.hustles) > 0 {
+		lifecycleOptions = append(lifecycleOptions, sessionruntime.WithLifecycleHustles(
+			append([]hustle.Definition(nil), state.hustles...),
+			lifecycleHustleLimits(state.hustleLimits),
+		))
+	}
 	if placement.Configured() {
 		lifecycleOptions = append(lifecycleOptions, sessionruntime.WithLifecyclePlacement(placement))
 		policy := *state.snapshotPolicy
@@ -163,4 +178,69 @@ func Define(options ...Option) (*Rig, error) {
 		return nil, &DefinitionError{Kind: DefinitionInvalidSessionStore, Cause: err}
 	}
 	return &Rig{lifecycle: lifecycle}, nil
+}
+
+func lifecycleHustleLimits(limits HustleLimits) sessionruntime.HustleLimits {
+	return sessionruntime.HustleLimits{
+		BlockingConcurrent:   limits.BlockingConcurrent,
+		BlockingQueued:       limits.BlockingQueued,
+		BackgroundConcurrent: limits.BackgroundConcurrent,
+		BackgroundQueued:     limits.BackgroundQueued,
+		AuditTimeout:         limits.AuditTimeout,
+		FinalizationTimeout:  limits.FinalizationTimeout,
+		WorkerDrainTimeout:   limits.WorkerDrainTimeout,
+	}
+}
+
+func validateHustleRegistration(state *definitionState) error {
+	if len(state.hustles) == 0 {
+		if state.seen[keyHustleLimits] {
+			return &DefinitionError{Kind: DefinitionUnusedHustleLimits}
+		}
+		return nil
+	}
+	if !state.seen[keyHustleLimits] {
+		return &DefinitionError{Kind: DefinitionMissingHustleLimits}
+	}
+	seen := make(map[hustle.Name]struct{}, len(state.hustles))
+	for _, definition := range state.hustles {
+		name := definition.Name()
+		if name == "" || definition.PolicyRevision() == "" {
+			return &DefinitionError{Kind: DefinitionInvalidHustle, Name: string(name)}
+		}
+		if _, exists := seen[name]; exists {
+			return &DefinitionError{Kind: DefinitionDuplicateHustle, Name: string(name)}
+		}
+		seen[name] = struct{}{}
+	}
+	return nil
+}
+
+// validateCompactionHustles runs only after loop and hustle registration have
+// both been frozen and checked. Task 21 can enforce the definition-time lane and
+// model-source contract; Task 25's focused adapter owns concrete XML/output
+// validation and deliberately does not widen the generic hustle descriptor here.
+func validateCompactionHustles(loops []loop.Definition, definitions []hustle.Definition) error {
+	byName := make(map[hustle.Name]hustle.Definition, len(definitions))
+	for _, definition := range definitions {
+		byName[definition.Name()] = definition
+	}
+	for _, loopDefinition := range loops {
+		policy, configured := loopDefinition.CompactionPolicy()
+		if !configured {
+			continue
+		}
+		definition, exists := byName[policy.Hustle]
+		if !exists {
+			return &DefinitionError{Kind: DefinitionMissingCompactionHustle, Name: string(policy.Hustle)}
+		}
+		descriptor := definition.Descriptor()
+		if err := descriptor.Validate(); err != nil {
+			return &DefinitionError{Kind: DefinitionIncompatibleCompactionHustle, Name: string(policy.Hustle), Cause: err}
+		}
+		if descriptor.Participation != hustle.ParticipationBlocking || descriptor.ModelSource != hustle.ModelSourceCurrentLoop {
+			return &DefinitionError{Kind: DefinitionIncompatibleCompactionHustle, Name: string(policy.Hustle)}
+		}
+	}
+	return nil
 }

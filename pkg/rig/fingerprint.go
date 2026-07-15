@@ -3,11 +3,13 @@ package rig
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"sort"
 	"strings"
 
 	"github.com/looprig/harness/pkg/event"
+	"github.com/looprig/harness/pkg/hustle"
 	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/harness/pkg/tool"
 )
@@ -52,6 +54,12 @@ func fingerprintWithTopology(definition loop.BoundDefinition, fields ConfigFinge
 	return fingerprint
 }
 
+func fingerprintWithTopologyAndHustles(definition loop.BoundDefinition, fields ConfigFingerprintFields, definitions []loop.Definition, primers []string, active string, hustles []hustle.Definition, limits HustleLimits) event.ConfigFingerprint {
+	fingerprint := fingerprintWith(definition, fields)
+	fingerprint.TopologyRev = topologyRevisionWithHustles(definitions, primers, active, hustles, limits)
+	return fingerprint
+}
+
 // frozenFingerprint is the rig-time compatibility projection. It depends only on
 // immutable definitions and scalar rig fields, so restore can compare it immediately
 // after replay without constructing workspace or loop collaborators.
@@ -88,8 +96,96 @@ func frozenFingerprint(fields ConfigFingerprintFields, definitions []loop.Defini
 	}
 }
 
-func topologyRevision(definitions []loop.Definition, primers []string, active string) string {
+func frozenFingerprintWithHustles(fields ConfigFingerprintFields, definitions []loop.Definition, primers []string, active string, hustles []hustle.Definition, limits HustleLimits) event.ConfigFingerprint {
+	fingerprint := frozenFingerprint(fields, definitions, primers, active)
+	if len(hustles) > 0 {
+		fingerprint.TopologyRev = topologyRevisionWithHustles(definitions, primers, active, hustles, limits)
+	}
+	return fingerprint
+}
+
+func topologyRevisionWithHustles(definitions []loop.Definition, primers []string, active string, hustles []hustle.Definition, limits HustleLimits) string {
+	copyOfLimits := limits
+	return canonicalTopologyRevision(topologyRevisionInput{
+		definitions: definitions,
+		primers:     primers,
+		active:      active,
+		hustles:     hustles,
+		limits:      &copyOfLimits,
+	})
+}
+
+type topologyRevisionInput struct {
+	definitions []loop.Definition
+	primers     []string
+	active      string
+	hustles     []hustle.Definition
+	limits      *HustleLimits
+}
+
+func canonicalTopologyRevision(input topologyRevisionInput) string {
 	var material strings.Builder
+	writeLoopTopology(&material, input.definitions, input.primers, input.active)
+	legacyRevision := hexSHA256(material.String())
+	if input.limits == nil {
+		return legacyRevision
+	}
+	rows := make([]hustleTopologyRow, len(input.hustles))
+	for index, definition := range input.hustles {
+		rows[index] = hustleTopologyRow{Name: definition.Name(), PolicyRevision: definition.PolicyRevision()}
+	}
+	return hexSHA256Bytes(canonicalHustleTopologyMaterial(legacyRevision, rows, *input.limits))
+}
+
+type hustleTopologyRow struct {
+	Name           hustle.Name
+	PolicyRevision string
+}
+
+func canonicalHustleTopologyMaterial(legacyRevision string, rows []hustleTopologyRow, limits HustleLimits) []byte {
+	const encodingDomain string = "looprig/rig/hustle-topology/v1"
+	ordered := append([]hustleTopologyRow(nil), rows...)
+	sort.Slice(ordered, func(i, j int) bool {
+		if ordered[i].Name == ordered[j].Name {
+			return ordered[i].PolicyRevision < ordered[j].PolicyRevision
+		}
+		return ordered[i].Name < ordered[j].Name
+	})
+	material := appendCanonicalString(nil, encodingDomain)
+	material = appendCanonicalString(material, legacyRevision)
+	material = binary.BigEndian.AppendUint64(material, uint64(len(ordered)))
+	for _, row := range ordered {
+		material = appendCanonicalString(material, string(row.Name))
+		material = appendCanonicalString(material, row.PolicyRevision)
+	}
+	material = appendCanonicalInt64(material, int64(limits.BlockingConcurrent))
+	material = appendCanonicalInt64(material, int64(limits.BlockingQueued))
+	material = appendCanonicalInt64(material, int64(limits.BackgroundConcurrent))
+	material = appendCanonicalInt64(material, int64(limits.BackgroundQueued))
+	material = appendCanonicalInt64(material, int64(limits.AuditTimeout))
+	material = appendCanonicalInt64(material, int64(limits.FinalizationTimeout))
+	return appendCanonicalInt64(material, int64(limits.WorkerDrainTimeout))
+}
+
+func appendCanonicalString(material []byte, value string) []byte {
+	material = binary.BigEndian.AppendUint64(material, uint64(len(value)))
+	return append(material, value...)
+}
+
+func appendCanonicalInt64(material []byte, value int64) []byte {
+	// #nosec G115 -- canonical encoding preserves the signed value's two's-complement bit pattern.
+	return binary.BigEndian.AppendUint64(material, uint64(value))
+}
+
+func topologyRevision(definitions []loop.Definition, primers []string, active string) string {
+	return canonicalTopologyRevision(topologyRevisionInput{
+		definitions: definitions,
+		primers:     primers,
+		active:      active,
+	})
+}
+
+func writeLoopTopology(material *strings.Builder, definitions []loop.Definition, primers []string, active string) {
 	orderedDefinitions := append([]loop.Definition(nil), definitions...)
 	sort.Slice(orderedDefinitions, func(i, j int) bool { return orderedDefinitions[i].Name() < orderedDefinitions[j].Name() })
 	for _, candidate := range orderedDefinitions {
@@ -114,11 +210,14 @@ func topologyRevision(definitions []loop.Definition, primers []string, active st
 	}
 	material.WriteString("active:")
 	material.WriteString(active)
-	return hexSHA256(material.String())
 }
 
 func hexSHA256(value string) string {
-	sum := sha256.Sum256([]byte(value))
+	return hexSHA256Bytes([]byte(value))
+}
+
+func hexSHA256Bytes(value []byte) string {
+	sum := sha256.Sum256(value)
 	return hex.EncodeToString(sum[:])
 }
 

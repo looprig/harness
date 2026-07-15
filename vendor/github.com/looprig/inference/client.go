@@ -53,9 +53,3 @@ type Tool struct {
 	Description string
 	Schema      json.RawMessage
 }
-
-// Usage reports token consumption for the request.
-type Usage struct {
-	InputTokens  int
-	OutputTokens int
-}

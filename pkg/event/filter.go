@@ -36,6 +36,9 @@ func (s LoopScope) Matches(loopID uuid.UUID) bool {
 // before the bounded send, so a filtered-out firehose never enters the egress
 // buffer.
 func ShouldDeliver(filter EventFilter, ev Event) bool {
+	if ev == nil || ev.Visibility() != Public {
+		return false
+	}
 	if ev.Scope() == ScopeSession {
 		return true
 	}

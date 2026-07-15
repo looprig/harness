@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"reflect"
 	"sort"
 	"strings"
 	"sync"
@@ -43,10 +44,23 @@ func userMsg(text string) *content.UserMessage {
 	}}
 }
 
+func validStepMessages() content.AgenticMessages {
+	return content.AgenticMessages{&content.AIMessage{Message: content.Message{Role: content.RoleAssistant}}}
+}
+
 // hdr builds an event.Header carrying only the session id — the coordinates a
 // session-scoped catalog event needs.
 func hdr(sid uuid.UUID) event.Header {
 	return event.Header{Coordinates: identity.Coordinates{SessionID: sid}}
+}
+
+func mustApplyEvent(t *testing.T, meta SessionMeta, ev event.Event, seq uint64, now CatalogClock) (SessionMeta, bool) {
+	t.Helper()
+	updated, changed, err := applyEvent(meta, ev, seq, now)
+	if err != nil {
+		t.Fatalf("applyEvent(%T) error = %v", ev, err)
+	}
+	return updated, changed
 }
 
 // --- fakeKV: an in-memory storage.KV double with fault + conflict injection ---
@@ -156,7 +170,7 @@ type fakeOpener struct {
 	openErr error
 }
 
-func (o *fakeOpener) OpenEventReplayer(_ uuid.UUID, _ ReplayRequest) (journal.EventReplayer, error) {
+func (o *fakeOpener) OpenInternalEventReplayer(_ uuid.UUID, _ ReplayRequest) (journal.EventReplayer, error) {
 	if o.openErr != nil {
 		return nil, o.openErr
 	}
@@ -185,6 +199,56 @@ func (c *fakeEventCursor) Next(_ context.Context) (event.Event, uint64, error) {
 
 func (c *fakeEventCursor) Close() error { return nil }
 
+type repairSnapshotOpener struct {
+	snapshots  [][]event.Event
+	onFirstEOF func()
+	opens      int
+}
+
+func (o *repairSnapshotOpener) OpenInternalEventReplayer(_ uuid.UUID, _ ReplayRequest) (journal.EventReplayer, error) {
+	index := o.opens
+	if index >= len(o.snapshots) {
+		index = len(o.snapshots) - 1
+	}
+	o.opens++
+	var onEOF func()
+	if index == 0 {
+		onEOF = o.onFirstEOF
+	}
+	return &repairSnapshotReplayer{events: o.snapshots[index], onEOF: onEOF}, nil
+}
+
+type repairSnapshotReplayer struct {
+	events []event.Event
+	onEOF  func()
+}
+
+func (r *repairSnapshotReplayer) Open(_ context.Context, _ journal.ReplayRequest) (journal.EventCursor, error) {
+	return &repairSnapshotCursor{events: r.events, onEOF: r.onEOF}, nil
+}
+
+type repairSnapshotCursor struct {
+	events []event.Event
+	pos    int
+	onEOF  func()
+}
+
+func (c *repairSnapshotCursor) Next(_ context.Context) (event.Event, uint64, error) {
+	if c.pos < len(c.events) {
+		ev := c.events[c.pos]
+		c.pos++
+		return ev, uint64(c.pos), nil
+	}
+	if c.onEOF != nil {
+		callback := c.onEOF
+		c.onEOF = nil
+		callback()
+	}
+	return nil, 0, io.EOF
+}
+
+func (c *repairSnapshotCursor) Close() error { return nil }
+
 func TestWorkspacePointersFoldCheckpointAndRestoreIndependently(t *testing.T) {
 	t.Parallel()
 	sid := fixedUUID(0x71)
@@ -193,19 +257,19 @@ func TestWorkspacePointersFoldCheckpointAndRestoreIndependently(t *testing.T) {
 	refB := workspacestore.Ref("v1:sha256:" + strings.Repeat("b", 64))
 	meta := SessionMeta{}
 
-	meta, _ = applyEvent(meta, event.WorkspaceCheckpointed{
+	meta, _ = mustApplyEvent(t, meta, event.WorkspaceCheckpointed{
 		Header:      event.Header{Coordinates: identity.Coordinates{SessionID: sid}, EventID: eventA},
 		Ref:         string(refA),
 		Consistency: event.SnapshotQuiescent,
 		Trigger:     event.SnapshotTriggerManual,
 	}, 11, fixedClock(time.Time{}))
-	meta, _ = applyEvent(meta, event.WorkspaceCheckpointed{
+	meta, _ = mustApplyEvent(t, meta, event.WorkspaceCheckpointed{
 		Header:      event.Header{Coordinates: identity.Coordinates{SessionID: sid}, EventID: eventB},
 		Ref:         string(refB),
 		Consistency: event.SnapshotFuzzy,
 		Trigger:     event.SnapshotTriggerIdle,
 	}, 17, fixedClock(time.Time{}))
-	meta, _ = applyEvent(meta, event.WorkspaceRestored{
+	meta, _ = mustApplyEvent(t, meta, event.WorkspaceRestored{
 		Header: event.Header{Coordinates: identity.Coordinates{SessionID: sid}, EventID: restoreA},
 		Ref:    string(refA),
 	}, 23, fixedClock(time.Time{}))
@@ -221,7 +285,7 @@ func TestWorkspacePointersFoldCheckpointAndRestoreIndependently(t *testing.T) {
 
 	// A delayed catalog upsert may fold an older durable event after a newer one. Journal
 	// sequence, not arrival order or content identity, decides the pointer.
-	meta, _ = applyEvent(meta, event.WorkspaceCheckpointed{
+	meta, _ = mustApplyEvent(t, meta, event.WorkspaceCheckpointed{
 		Header:      event.Header{Coordinates: identity.Coordinates{SessionID: sid}, EventID: fixedUUID(0x70)},
 		Ref:         string(refA),
 		Consistency: event.SnapshotQuiescent,
@@ -332,7 +396,7 @@ func TestApplyEvent(t *testing.T) {
 		{
 			name:        "StepDone bumps LastActiveAt",
 			start:       SessionMeta{SessionID: sid},
-			ev:          event.StepDone{Header: hdr(sid)},
+			ev:          event.StepDone{Header: hdr(sid), Messages: validStepMessages()},
 			wantChanged: true,
 			check: func(t *testing.T, m SessionMeta) {
 				if !m.LastActiveAt.Equal(active) {
@@ -389,7 +453,7 @@ func TestApplyEvent(t *testing.T) {
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			got, changed := applyEvent(tt.start, tt.ev, 0, fixedClock(active))
+			got, changed := mustApplyEvent(t, tt.start, tt.ev, 0, fixedClock(active))
 			if changed != tt.wantChanged {
 				t.Fatalf("applyEvent changed = %v, want %v", changed, tt.wantChanged)
 			}
@@ -421,6 +485,7 @@ func TestApplyEventStatusFold(t *testing.T) {
 		ev          event.Event
 		seq         uint64
 		wantChanged bool
+		wantOrder   bool
 		check       func(*testing.T, SessionMeta)
 	}{
 		{
@@ -566,7 +631,7 @@ func TestApplyEventStatusFold(t *testing.T) {
 		{
 			name:        "StepDone records LastStep and bumps LastJournalSeq",
 			start:       SessionMeta{SessionID: sid, LastJournalSeq: 3},
-			ev:          event.StepDone{Header: hdr(sid)},
+			ev:          event.StepDone{Header: hdr(sid), Messages: validStepMessages()},
 			seq:         20,
 			wantChanged: true,
 			check: func(t *testing.T, m SessionMeta) {
@@ -594,11 +659,12 @@ func TestApplyEventStatusFold(t *testing.T) {
 			},
 		},
 		{
-			name:        "lower seq does not lower LastJournalSeq (monotonic max)",
+			name:        "lower additive seq requests authoritative repair",
 			start:       SessionMeta{SessionID: sid, State: StateIdle, LastJournalSeq: 100},
 			ev:          event.StepDone{Header: hdr(sid)},
 			seq:         5,
-			wantChanged: true,
+			wantChanged: false,
+			wantOrder:   true,
 			check: func(t *testing.T, m SessionMeta) {
 				if m.LastJournalSeq != 100 {
 					t.Errorf("LastJournalSeq = %d, want 100 (max wins)", m.LastJournalSeq)
@@ -610,7 +676,15 @@ func TestApplyEventStatusFold(t *testing.T) {
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			got, changed := applyEvent(tt.start, tt.ev, tt.seq, fixedClock(clock))
+			got, changed, err := applyEvent(tt.start, tt.ev, tt.seq, fixedClock(clock))
+			var ordering *CatalogOrderingError
+			if tt.wantOrder {
+				if !errors.As(err, &ordering) {
+					t.Fatalf("applyEvent error = %T %v, want *CatalogOrderingError", err, err)
+				}
+			} else if err != nil {
+				t.Fatalf("applyEvent error = %v", err)
+			}
 			if changed != tt.wantChanged {
 				t.Fatalf("applyEvent changed = %v, want %v", changed, tt.wantChanged)
 			}
@@ -641,7 +715,7 @@ func TestSessionMetaStatusRoundTrip(t *testing.T) {
 	stepEv := event.StepDone{Header: event.Header{
 		Coordinates: identity.Coordinates{SessionID: sid, LoopID: lid, TurnID: tid, StepID: fixedUUID(0x27)},
 		EventID:     fixedUUID(0x28),
-	}}
+	}, Messages: validStepMessages()}
 	turnSum, err := newEventSummary(turnEv, 10)
 	if err != nil {
 		t.Fatalf("newEventSummary(TurnDone) = %v", err)
@@ -918,7 +992,7 @@ func TestCatalogUpdateSemantics(t *testing.T) {
 	evs := []event.Event{
 		event.SessionStarted{Header: event.Header{Coordinates: identity.Coordinates{SessionID: sid}, CreatedAt: now}, Config: event.ConfigFingerprint{ModelID: "m"}},
 		event.TurnStarted{Header: hdr(sid), Message: userMsg("first task")},
-		event.LoopStarted{Header: hdr(sid)},
+		event.LoopStarted{Header: event.Header{Coordinates: identity.Coordinates{SessionID: sid, LoopID: fixedUUID(0x12)}}},
 		event.SessionStopped{Header: hdr(sid)},
 	}
 	for _, ev := range evs {
@@ -1027,7 +1101,7 @@ func TestCatalogGetAbsent(t *testing.T) {
 	if rev != 0 {
 		t.Errorf("rev = %d, want 0 for absent", rev)
 	}
-	if meta != (SessionMeta{}) {
+	if !reflect.DeepEqual(meta, SessionMeta{}) {
 		t.Errorf("meta = %+v, want zero for absent", meta)
 	}
 }
@@ -1218,10 +1292,12 @@ func TestCatalogConcurrentSameSession(t *testing.T) {
 
 	var wg sync.WaitGroup
 	for i := 0; i < n; i++ {
+		i := i
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if err := c.UpdateOnEvent(ctx, event.LoopStarted{Header: hdr(sid)}, 0); err != nil {
+			loopID := fixedUUID(byte(0x60 + i))
+			if err := c.UpdateOnEvent(ctx, event.LoopStarted{Header: event.Header{Coordinates: identity.Coordinates{SessionID: sid, LoopID: loopID}}}, 0); err != nil {
 				t.Errorf("concurrent UpdateOnEvent = %v, want nil (best-effort)", err)
 			}
 		}()
@@ -1261,7 +1337,7 @@ func TestCatalogRepair(t *testing.T) {
 		opener := &fakeOpener{events: []event.Event{
 			event.SessionStarted{Header: event.Header{Coordinates: identity.Coordinates{SessionID: sid}, CreatedAt: now}, Config: event.ConfigFingerprint{ModelID: "m"}},
 			event.TurnStarted{Header: hdr(sid), Message: userMsg("rebuilt title")},
-			event.LoopStarted{Header: hdr(sid)},
+			event.LoopStarted{Header: event.Header{Coordinates: identity.Coordinates{SessionID: sid, LoopID: fixedUUID(0x56)}}},
 		}}
 		c := store.OpenCatalog(WithCatalogClock(fixedClock(now)), WithCatalogReplayer(opener))
 
@@ -1314,4 +1390,64 @@ func TestCatalogRepair(t *testing.T) {
 			t.Errorf("error does not unwrap to errNoReplayer: %v", err)
 		}
 	})
+}
+
+func TestCatalogRepairDoesNotOverwriteNewerConcurrentProjection(t *testing.T) {
+	t.Parallel()
+	sid, loopID, turnID := fixedUUID(0x91), fixedUUID(0x92), fixedUUID(0x93)
+	started := event.SessionStarted{Header: event.Header{Coordinates: identity.Coordinates{SessionID: sid}}}
+	turnStarted := event.TurnStarted{Header: event.Header{Coordinates: identity.Coordinates{SessionID: sid, LoopID: loopID, TurnID: turnID}}}
+	turnDone := event.TurnDone{Header: event.Header{Coordinates: identity.Coordinates{SessionID: sid, LoopID: loopID, TurnID: turnID}}}
+	tests := []struct {
+		name       string
+		first      []event.Event
+		second     []event.Event
+		concurrent event.Event
+		seq        uint64
+		wantState  SessionState
+		wantSeq    uint64
+	}{
+		{
+			name:       "event appended after scan EOF forces a fresh authoritative scan",
+			first:      []event.Event{started, turnStarted},
+			second:     []event.Event{started, turnStarted, turnDone},
+			concurrent: turnDone,
+			seq:        3,
+			wantState:  StateIdle,
+			wantSeq:    3,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			store, err := Open(memstore.New())
+			if err != nil {
+				t.Fatalf("Open() error = %v", err)
+			}
+			opener := &repairSnapshotOpener{snapshots: [][]event.Event{tt.first, tt.second}}
+			catalog := store.OpenCatalog(WithCatalogReplayer(opener))
+			opener.onFirstEOF = func() {
+				if updateErr := catalog.UpdateOnEvent(context.Background(), tt.concurrent, tt.seq); updateErr != nil {
+					t.Errorf("concurrent UpdateOnEvent() error = %v", updateErr)
+				}
+			}
+			got, err := catalog.RepairCatalog(context.Background(), sid)
+			if err != nil {
+				t.Fatalf("RepairCatalog() error = %v", err)
+			}
+			if got.State != tt.wantState || got.LastJournalSeq != tt.wantSeq {
+				t.Errorf("RepairCatalog() state/seq = %q/%d, want %q/%d", got.State, got.LastJournalSeq, tt.wantState, tt.wantSeq)
+			}
+			stored, found, err := catalog.ReadMeta(context.Background(), sid)
+			if err != nil || !found {
+				t.Fatalf("ReadMeta() found=%v error=%v", found, err)
+			}
+			if stored.State != tt.wantState || stored.LastJournalSeq != tt.wantSeq {
+				t.Errorf("stored state/seq = %q/%d, want %q/%d", stored.State, stored.LastJournalSeq, tt.wantState, tt.wantSeq)
+			}
+			if opener.opens < 2 {
+				t.Errorf("repair opened %d snapshots, want at least 2", opener.opens)
+			}
+		})
+	}
 }

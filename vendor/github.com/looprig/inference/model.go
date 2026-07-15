@@ -14,19 +14,21 @@ type Model struct {
 	Provider  ProviderName
 	APIFormat APIFormat // which codec dialect speaks to this model (open label)
 	BaseURL   string
-	Name      string       // provider-specific model id sent on the wire
-	Origin    Origin       // provenance; zero value = OriginCustom (fail-safe)
-	Caps      Capabilities // local gating data, never sent on the wire
-	Sampling  Sampling     // default sampling; per-call overrides live on Request.Override
+	Name      string        // provider-specific model id sent on the wire
+	Origin    Origin        // provenance; zero value = OriginCustom (fail-safe)
+	Caps      Capabilities  // local gating data, never sent on the wire
+	Limits    ContextLimits // model context capacity; zero fields are unknown
+	Sampling  Sampling      // default sampling; per-call overrides live on Request.Override
 }
 
-// Validate performs STRUCTURAL validation only, returning a *ValidationError on the first
-// rule violated. It is deliberately provider-policy-free: it never rejects an unknown
+// Validate performs STRUCTURAL validation only, returning a typed validation error on the
+// first rule violated. It is deliberately provider-policy-free: it never rejects an unknown
 // Provider label, an unknown APIFormat label, or a provider/API-format pair. Fail-closed
 // known-provider validation belongs in the llm module or a consumer composition root.
 //
 // Rules:
 //   - Name must be non-empty.
+//   - Known context limits must not contradict the shared context window.
 //   - An empty BaseURL is allowed — it is a wildcard bound by the client at the trust
 //     boundary, not a claim.
 //   - A non-empty BaseURL must be syntactically safe: https, or http only for a loopback
@@ -37,6 +39,9 @@ type Model struct {
 func (m Model) Validate() error {
 	if m.Name == "" {
 		return &ValidationError{Field: "Name", Reason: "model name must not be empty"}
+	}
+	if err := m.Limits.Validate(); err != nil {
+		return err
 	}
 	// An empty BaseURL is a wildcard bound later by the client; only a non-empty base is
 	// checked for syntactic safety.
@@ -99,7 +104,7 @@ type ModelOption func(*Model)
 // CustomModel builds a user-asserted Model: it forces the four wire-relevant
 // fields — provider label, API format, endpoint, and model name — and leaves everything
 // else at its fail-safe zero value (Origin OriginCustom, all Capabilities false,
-// MaxContext 0, empty Sampling) unless an option opts in. The result is still
+// unknown ContextLimits, empty Sampling) unless an option opts in. The result is still
 // subject to Validate before use.
 func CustomModel(p ProviderName, f APIFormat, baseURL, name string, opts ...ModelOption) Model {
 	m := Model{
@@ -107,7 +112,7 @@ func CustomModel(p ProviderName, f APIFormat, baseURL, name string, opts ...Mode
 		APIFormat: f,
 		BaseURL:   baseURL,
 		Name:      name,
-		// Origin left zero (OriginCustom); Caps left zero (all-false); Sampling zero.
+		// Origin left zero (OriginCustom); Caps left zero (all-false); limits unknown; Sampling zero.
 	}
 	for _, opt := range opts {
 		opt(&m)
@@ -115,8 +120,10 @@ func CustomModel(p ProviderName, f APIFormat, baseURL, name string, opts ...Mode
 	return m
 }
 
-// WithMaxContext sets the model's advertised maximum context window (tokens).
-func WithMaxContext(n int) ModelOption { return func(m *Model) { m.Caps.MaxContext = n } }
+// WithContextLimits sets the model's advertised context capacity.
+func WithContextLimits(limits ContextLimits) ModelOption {
+	return func(m *Model) { m.Limits = limits }
+}
 
 // WithTools marks the model as tool-capable.
 func WithTools() ModelOption { return func(m *Model) { m.Caps.Tools = true } }
@@ -130,6 +137,19 @@ func WithThinking() ModelOption { return func(m *Model) { m.Caps.Thinking = true
 // WithSampling sets the model's default sampling. The argument is deep-copied so
 // the Model never aliases the caller's pointer/slice state.
 func WithSampling(s Sampling) ModelOption { return func(m *Model) { m.Sampling = s.Clone() } }
+
+// Key returns the model's stable provider namespace and provider model ID.
+// Call ModelKey.Validate where a fully resolved identity is required.
+func (m Model) Key() ModelKey {
+	return ModelKey{Provider: m.Provider, Model: m.Name}
+}
+
+// Clone returns an independent Model value, including pointer- and slice-bearing
+// sampling metadata.
+func (m Model) Clone() Model {
+	m.Sampling = m.Sampling.Clone()
+	return m
+}
 
 // cloneFloat64Ptr returns a fresh pointer to a copy of *p, or nil when p is nil.
 // Concrete (not generic) to honor the repo rule against `any` outside

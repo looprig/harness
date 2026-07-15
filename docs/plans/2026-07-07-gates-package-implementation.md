@@ -453,7 +453,7 @@ Add table-driven tests proving:
 Add tests proving:
 
 - `journal.NewGatePreparedRecord(event.GatePrepared{...}, gate.OpenPayload{...})` is a `JournalRecord`.
-- `sessionstore.OpenRecordReplayer` returns the private prepared record with payload.
+- `sessionstore.OpenInternalRecordReplayer` returns the private prepared record with payload.
 - `sessionstore.OpenEventReplayer` skips the private prepared record.
 
 **Step 3: Run tests and verify they fail**
@@ -524,7 +524,7 @@ In `pkg/sessionstore/journal.go`, add an envelope kind such as `gate_prepared`, 
 `journal.MarshalGatePreparedRecord` helper that writes both the prepared projection and
 `gate.MarshalPayload(payload.Payload)`.
 
-In `pkg/sessionstore/replay.go`, make `OpenRecordReplayer` decode `gate_prepared` as
+In `pkg/sessionstore/replay.go`, make `OpenInternalRecordReplayer` decode `gate_prepared` as
 `journal.GatePreparedRecord`, and make `OpenEventReplayer` skip it.
 
 Guardrail: never append `event.GatePrepared` through `journal.NewEventRecord` or

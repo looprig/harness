@@ -11,6 +11,7 @@ import (
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/gate"
 	"github.com/looprig/harness/pkg/tool"
+	"github.com/looprig/inference"
 )
 
 // schemaVersion is the current wire-envelope schema version stamped into every
@@ -20,15 +21,15 @@ import (
 // contract.
 const schemaVersion = 1
 
-// maxEventBytes caps the serialized size UnmarshalEvent accepts at the untrusted
-// restore boundary. An event's payload is small (header ids + capped strings) plus
+// maxEventBytes caps the serialized size MarshalEvent emits and UnmarshalEvent
+// accepts at durable boundaries. An event's payload is small (header ids + capped strings) plus
 // at most a committed step group, which is bounded by the block codec's own caps;
 // this envelope cap fails closed on absurd top-level input before any delegated
 // decode runs. Conservative starting value; tune to real history sizes later.
 const maxEventBytes = 16 << 20 // 16 MiB
 
-// EphemeralNotPersistableError is returned by MarshalEvent when handed an
-// Ephemeral event (TokenDelta, ToolCallStarted, ToolCallCompleted, InputQueued).
+// EphemeralNotPersistableError is returned by MarshalEvent when handed any
+// Ephemeral event.
 // The Ephemeral set is never persisted — it self-heals from a later authoritative
 // event and TokenDelta.Chunk has no durable codec — so the marshaler fails closed
 // rather than emit a lossy record. Type is the classify name of the rejected event
@@ -74,14 +75,28 @@ func (e *EventDecodeError) Error() string {
 }
 func (e *EventDecodeError) Unwrap() error { return e.Cause }
 
-// EventLimitError is returned when serialized input exceeds the envelope byte cap.
+// LegacyRuntimeMigrationError reports a v1 lifecycle payload that cannot be
+// migrated to the current ModelRuntime representation without guessing. Valid
+// pre-runtime LoopInferenceChanged records always carry model; accepting a
+// record with neither model nor runtime would silently erase the selected model.
+type LegacyRuntimeMigrationError struct {
+	Type   string
+	Field  string
+	Reason string
+}
+
+func (e *LegacyRuntimeMigrationError) Error() string {
+	return "event: cannot migrate legacy " + e.Type + " field " + e.Field + ": " + e.Reason
+}
+
+// EventLimitError is returned when an event codec input or output exceeds its cap.
 type EventLimitError struct {
 	Got int
 	Max int
 }
 
 func (e *EventLimitError) Error() string {
-	return fmt.Sprintf("event: input exceeds byte cap (%d > %d)", e.Got, e.Max)
+	return fmt.Sprintf("event: codec limit exceeded (%d > %d)", e.Got, e.Max)
 }
 
 // MarshalEvent encodes an Enduring event into the durable wire envelope: a JSON
@@ -97,27 +112,30 @@ func MarshalEvent(ev Event) ([]byte, error) {
 	if !ok {
 		return nil, &UnknownEventTypeError{Type: name}
 	}
+	if !ev.Visibility().Valid() {
+		return nil, &InvalidEventError{Event: EventName(name), Field: FieldVisibility, Rule: RuleInvalid}
+	}
 	if ev.Class() == Ephemeral {
 		return nil, &EphemeralNotPersistableError{Type: name}
 	}
-	// Unknown checkpoint metadata exists solely as the in-memory projection of a
-	// legacy record. Never emit it into a current journal (nor emit a checkpoint
-	// whose trigger/cause pairing is malformed).
-	if _, checkpoint := ev.(WorkspaceCheckpointed); checkpoint {
-		if err := validateEventBody(ev); err != nil {
-			return nil, err
-		}
-	}
-	if _, accepted := ev.(DelegateRequestAccepted); accepted {
-		if err := validateEventBody(ev); err != nil {
-			return nil, err
-		}
+	// Body validation is required at the durable write boundary. Identity is
+	// stamped by the publishing hub, but malformed lifecycle/runtime and committed
+	// step bodies must never be encoded into a journal record.
+	if err := validateEventBody(ev); err != nil {
+		return nil, err
 	}
 	payload, err := encodePayload(ev)
 	if err != nil {
 		return nil, err
 	}
-	return mergeEnvelope(name, payload)
+	out, err := mergeEnvelope(name, payload)
+	if err != nil {
+		return nil, err
+	}
+	if len(out) > maxEventBytes {
+		return nil, &EventLimitError{Got: len(out), Max: maxEventBytes}
+	}
+	return out, nil
 }
 
 // encodePayload marshals the concrete event's wire form (header + type-specific
@@ -139,7 +157,9 @@ func encodePayload(ev Event) ([]byte, error) {
 	case SessionStarted, SessionActive, SessionIdle, SessionStopped,
 		RestoreStarted, RestoreDone, WorkspaceCheckpointed, WorkspaceRestored,
 		ActiveLoopChanged, SecurityCeilingChanged,
-		LoopIdle, LoopStarted, DelegateRequestAccepted, LoopInferenceChanged, LoopModeChanged,
+		HustleStarted, HustleCompleted, HustleFailed,
+		LoopIdle, LoopStarted, DelegateRequestAccepted, LoopInferenceChanged, LoopModeChanged, ContextMeasured,
+		CompactionCommitted, CompactionRejected, CompactWaiterResolved, CompactWaiterRejected,
 		ForeignSessionBound, TurnRejected,
 		UserInputRequested, TurnInterrupted,
 		TurnStarted, TurnFoldedInto, InputCancelled, TurnDone,
@@ -315,6 +335,9 @@ func UnmarshalEvent(data []byte) (Event, error) {
 	if len(data) > maxEventBytes {
 		return nil, &EventLimitError{Got: len(data), Max: maxEventBytes}
 	}
+	if err := rejectDuplicateJSONKeys(data); err != nil {
+		return nil, &EventDecodeError{Cause: err}
+	}
 	var probe struct {
 		Type string `json:"type"`
 	}
@@ -331,6 +354,64 @@ func UnmarshalEvent(data []byte) (Event, error) {
 	return ev, nil
 }
 
+func rejectDuplicateJSONKeys(data []byte) error {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	token, err := decoder.Token()
+	if err != nil {
+		return err
+	}
+	return inspectJSONValue(decoder, token)
+}
+
+func inspectJSONValue(decoder *json.Decoder, token json.Token) error {
+	delim, ok := token.(json.Delim)
+	if !ok {
+		return nil
+	}
+	switch delim {
+	case '{':
+		seen := make(map[string]struct{})
+		for decoder.More() {
+			keyToken, err := decoder.Token()
+			if err != nil {
+				return err
+			}
+			key, ok := keyToken.(string)
+			if !ok {
+				return fmt.Errorf("non-string object key")
+			}
+			canonical := strings.ToLower(key)
+			if _, exists := seen[canonical]; exists {
+				return fmt.Errorf("duplicate field %q", key)
+			}
+			seen[canonical] = struct{}{}
+			valueToken, err := decoder.Token()
+			if err != nil {
+				return err
+			}
+			if err := inspectJSONValue(decoder, valueToken); err != nil {
+				return err
+			}
+		}
+		_, err := decoder.Token()
+		return err
+	case '[':
+		for decoder.More() {
+			valueToken, err := decoder.Token()
+			if err != nil {
+				return err
+			}
+			if err := inspectJSONValue(decoder, valueToken); err != nil {
+				return err
+			}
+		}
+		_, err := decoder.Token()
+		return err
+	default:
+		return fmt.Errorf("unexpected delimiter %q", delim)
+	}
+}
+
 // validateDecodedEvent preserves the one additive compatibility exception in the
 // event schema: checkpoints written before consistency/trigger existed decode with
 // both enum values unknown. Explicit zero values, partial metadata, and newly
@@ -338,6 +419,11 @@ func UnmarshalEvent(data []byte) (Event, error) {
 func validateDecodedEvent(ev Event, data []byte) error {
 	if err := validateEventIdentity(ev); err != nil {
 		return err
+	}
+	if legacy, err := missingLegacyRuntime(ev, data); err != nil {
+		return err
+	} else if legacy {
+		return nil
 	}
 	if _, ok := ev.(WorkspaceCheckpointed); ok {
 		presence, err := inspectCheckpointMetadata(data)
@@ -349,6 +435,57 @@ func validateDecodedEvent(ev Event, data []byte) error {
 		}
 	}
 	return validateEventBody(ev)
+}
+
+// missingLegacyRuntime preserves replay compatibility for lifecycle records
+// that never carried a resolved runtime. Legacy LoopInferenceChanged is not an
+// absence-only case: decodeLoopInferenceChanged migrates its model+effort payload
+// before validation. An explicitly present zero/invalid runtime continues
+// through strict validation.
+func missingLegacyRuntime(ev Event, data []byte) (bool, error) {
+	name := ""
+	switch ev.(type) {
+	case LoopStarted:
+		name = "LoopStarted"
+	case LoopModeChanged:
+		name = "LoopModeChanged"
+	default:
+		return false, nil
+	}
+	present, err := inspectTopLevelField(data, name, "runtime")
+	return !present, err
+}
+
+func inspectTopLevelField(data []byte, typeName, fieldName string) (bool, error) {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	if _, err := dec.Token(); err != nil {
+		return false, &EventDecodeError{Type: typeName, Cause: err}
+	}
+	present := false
+	for dec.More() {
+		keyToken, err := dec.Token()
+		if err != nil {
+			return false, &EventDecodeError{Type: typeName, Cause: err}
+		}
+		key, ok := keyToken.(string)
+		if !ok {
+			return false, &EventDecodeError{Type: typeName, Cause: fmt.Errorf("non-string object key")}
+		}
+		var value json.RawMessage
+		if err := dec.Decode(&value); err != nil {
+			return false, &EventDecodeError{Type: typeName, Cause: err}
+		}
+		if strings.EqualFold(key, fieldName) {
+			if present {
+				return false, &EventDecodeError{Type: typeName, Cause: fmt.Errorf("duplicate %s field", fieldName)}
+			}
+			present = true
+		}
+	}
+	if _, err := dec.Token(); err != nil {
+		return false, &EventDecodeError{Type: typeName, Cause: err}
+	}
+	return present, nil
 }
 
 type checkpointMetadataPresence struct {
@@ -426,6 +563,12 @@ func decodePayload(tag string, data []byte) (Event, error) {
 		return decodePlain[ActiveLoopChanged](tag, data)
 	case "SecurityCeilingChanged":
 		return decodePlain[SecurityCeilingChanged](tag, data)
+	case "HustleStarted":
+		return decodePlain[HustleStarted](tag, data)
+	case "HustleCompleted":
+		return decodePlain[HustleCompleted](tag, data)
+	case "HustleFailed":
+		return decodePlain[HustleFailed](tag, data)
 	case "LoopIdle":
 		return decodePlain[LoopIdle](tag, data)
 	case "LoopStarted":
@@ -433,9 +576,19 @@ func decodePayload(tag string, data []byte) (Event, error) {
 	case "DelegateRequestAccepted":
 		return decodePlain[DelegateRequestAccepted](tag, data)
 	case "LoopInferenceChanged":
-		return decodePlain[LoopInferenceChanged](tag, data)
+		return decodeLoopInferenceChanged(data)
 	case "LoopModeChanged":
 		return decodePlain[LoopModeChanged](tag, data)
+	case "ContextMeasured":
+		return decodePlain[ContextMeasured](tag, data)
+	case "CompactionCommitted":
+		return decodePlain[CompactionCommitted](tag, data)
+	case "CompactionRejected":
+		return decodePlain[CompactionRejected](tag, data)
+	case "CompactWaiterResolved":
+		return decodePlain[CompactWaiterResolved](tag, data)
+	case "CompactWaiterRejected":
+		return decodePlain[CompactWaiterRejected](tag, data)
 	case "ForeignSessionBound":
 		return decodePlain[ForeignSessionBound](tag, data)
 	case "TurnStarted":
@@ -469,6 +622,72 @@ func decodePayload(tag string, data []byte) (Event, error) {
 	default:
 		return nil, &UnknownEventTypeError{Type: tag}
 	}
+}
+
+type legacyModelCapsWire struct {
+	MaxContext int64
+}
+
+type legacyModelWire struct {
+	Provider inference.ProviderName
+	Name     string
+	Caps     legacyModelCapsWire
+}
+
+type legacyLoopInferenceChangedWire struct {
+	Header
+	Model  legacyModelWire  `json:"model"`
+	Effort inference.Effort `json:"effort,omitzero"`
+}
+
+// decodeLoopInferenceChanged accepts both v1 shapes. Current records carry the
+// resolved runtime directly. Pre-runtime v1 records carry a secret-free Model
+// plus effort; only the stable provider/name identity and MaxContext are durable
+// in the replacement shape, so endpoint, API dialect, capabilities, sampling,
+// and provenance are intentionally discarded.
+func decodeLoopInferenceChanged(data []byte) (Event, error) {
+	runtimePresent, err := inspectTopLevelField(data, "LoopInferenceChanged", "runtime")
+	if err != nil {
+		return nil, err
+	}
+	modelPresent, err := inspectTopLevelField(data, "LoopInferenceChanged", "model")
+	if err != nil {
+		return nil, err
+	}
+	if runtimePresent && modelPresent {
+		return nil, &EventDecodeError{Type: "LoopInferenceChanged", Cause: &LegacyRuntimeMigrationError{
+			Type: "LoopInferenceChanged", Field: "model/runtime", Reason: "both legacy and current payloads are present",
+		}}
+	}
+	if runtimePresent {
+		return decodePlain[LoopInferenceChanged]("LoopInferenceChanged", data)
+	}
+	if !modelPresent {
+		return nil, &EventDecodeError{Type: "LoopInferenceChanged", Cause: &LegacyRuntimeMigrationError{
+			Type: "LoopInferenceChanged", Field: "model", Reason: "missing model and runtime",
+		}}
+	}
+
+	var wire legacyLoopInferenceChangedWire
+	if err := json.Unmarshal(data, &wire); err != nil {
+		return nil, &EventDecodeError{Type: "LoopInferenceChanged", Cause: err}
+	}
+	if wire.Model.Caps.MaxContext < 0 {
+		return nil, &EventDecodeError{Type: "LoopInferenceChanged", Cause: &LegacyRuntimeMigrationError{
+			Type: "LoopInferenceChanged", Field: "model.Caps.MaxContext", Reason: "must not be negative",
+		}}
+	}
+	return LoopInferenceChanged{
+		Header: wire.Header,
+		Runtime: ModelRuntime{
+			Key: inference.ModelKey{
+				Provider: wire.Model.Provider,
+				Model:    wire.Model.Name,
+			},
+			Limits: inference.ContextLimits{WindowTokens: content.TokenCount(wire.Model.Caps.MaxContext)},
+			Effort: wire.Effort,
+		},
+	}, nil
 }
 
 // decodePlain decodes an event whose fields all round-trip through encoding/json
@@ -656,6 +875,10 @@ func unmarshalMessages(data []byte) (content.AgenticMessages, error) {
 	}
 	msgs := make(content.AgenticMessages, 0, len(raws))
 	for _, r := range raws {
+		if bytes.Equal(bytes.TrimSpace(r), []byte("null")) {
+			msgs = append(msgs, nil)
+			continue
+		}
 		m, err := unmarshalMessage(r)
 		if err != nil {
 			return nil, err

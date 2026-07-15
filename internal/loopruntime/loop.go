@@ -2,6 +2,7 @@ package loopruntime
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
@@ -14,6 +15,7 @@ import (
 	gatedomain "github.com/looprig/harness/pkg/gate"
 	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/loop"
+	"github.com/looprig/harness/pkg/tool"
 	"github.com/looprig/inference"
 )
 
@@ -32,6 +34,11 @@ type Loop struct {
 	Commands chan<- command.Command
 	Done     <-chan struct{}
 
+	// priorityCommands is the separately bounded Interrupt/Shutdown lane. Trusted
+	// session dispatch selects it through PriorityCommandSink; ordinary commands
+	// continue to use Commands and retain their existing FIFO channel semantics.
+	priorityCommands chan<- command.Command
+
 	// gateReg is the actor's gate-registration seam. A parked runner (or
 	// RequestUserInput on its behalf) sends a gateRegistration here and waits for
 	// the ack; runLoop installs the gate in loopState.pendingGates before closing
@@ -49,6 +56,14 @@ type Loop struct {
 
 // CommandSink returns the actor's command input.
 func (l *Loop) CommandSink() chan<- command.Command { return l.Commands }
+
+// PriorityCommandSink returns the bounded native Interrupt/Shutdown lane.
+func (l *Loop) PriorityCommandSink() chan<- command.Command {
+	if l.priorityCommands == nil {
+		return l.Commands
+	}
+	return l.priorityCommands
+}
 
 // DoneChan closes when the actor exits.
 func (l *Loop) DoneChan() <-chan struct{} { return l.Done }
@@ -74,6 +89,14 @@ type loopConfig struct {
 	// commands is the actor's inbound command channel (the send side is the public
 	// Loop.Commands). Closing it is a contract violation; stop via Shutdown.
 	commands <-chan command.Command
+
+	// priorityCommands is distinct from commands so emergency control is
+	// identifiable without consuming/reordering an ordinary command at a boundary.
+	priorityCommands <-chan command.Command
+
+	contextRequests chan contextMeasureRequest
+	contextResults  chan contextCountResult
+	contextOutcomes chan contextCompactionOutcomeRequest
 
 	// gateReg is the gate-registration channel. The actor is its sole reader; the
 	// per-turn goroutine hands the SEND side to runTurn so a parked tool can register
@@ -132,11 +155,6 @@ type loopConfig struct {
 	// SetLoopMode is refused with ChangeInvalidMode (which is correct for a modeless loop).
 	// ChangeLoopInference never consults it (it validates the model/effort values only).
 	bound loop.BoundDefinition
-
-	// faultProbe is the actor's post-emit durable-fault read (nil when no session is wired,
-	// e.g. loop-only tests): after publishing a change event the actor probes it and, on a
-	// non-nil fault, declines to apply the change (fail-secure, no partial apply).
-	faultProbe faultProbe
 }
 
 // idGenerator mints a fresh UUID for the loop's correlation IDs — the per-turn
@@ -156,28 +174,34 @@ type eventPublisher interface {
 }
 
 // executionBoundary is the optional native checkpoint seam implemented by the owning
-// session. Only already-committed StepDone and turn-terminal events are routed through it;
-// loop-only publishers need not implement it and retain the ordinary publish path.
+// session. Turn terminals are routed through it; context-mutating StepDone and
+// TurnFoldedInto use the committed-result refinement below.
 type executionBoundary interface {
 	CommitBoundary(context.Context, event.Event) error
+}
+
+// contextExecutionBoundary reports whether a context-mutating boundary event was
+// durably committed even when a later checkpoint step failed. This lets the actor
+// keep live history exactly aligned with the durable restore source.
+type contextExecutionBoundary interface {
+	CommitContextBoundary(context.Context, event.Event) (bool, error)
 }
 
 type executionAdmission interface {
 	EnterExecution(context.Context, uuid.UUID) (func(), error)
 }
 
-// faultProbe is the actor's narrow read of the session's durable-persistence fault latch.
-// After emitting a mode/inference change event the actor probes it: a non-nil result means
-// the change event's REQUIRED durable append failed (the hub faulted the session inline via
-// ReportFault, synchronously on this same actor goroutine), so the actor MUST NOT apply the
-// change (fail-secure — no live config more permissive than the durable log, and no partial
-// apply). It mirrors SetSecurityCeiling's emit-then-check-fault ordering. The loop depends
-// on this small interface (Dependency Inversion / Interface Segregation), type-asserted from
-// the event publisher exactly like gateRegistrar; a loop-only test wires a publisher that
-// does not satisfy it, so the probe is nil and the actor applies unconditionally (there is
-// no durable tap to fail).
-type faultProbe interface {
-	FaultErr() error
+// TurnStartCapability is the actor's opaque, one-shot authority to publish one
+// admitted turn's exact opening TurnStarted and later release its first-step reader.
+// Its committed result names the primary TurnStarted append; a later derived-session
+// transition may therefore return committed=true with a non-nil error.
+type TurnStartCapability interface {
+	PublishTurnStarted(context.Context, event.TurnStarted) (committed bool, err error)
+	Release()
+}
+
+type turnStartAdmission interface {
+	EnterTurnStart(context.Context, uuid.UUID) (TurnStartCapability, error)
 }
 
 type admissionFaultProbe interface {
@@ -197,6 +221,10 @@ type effectiveConfig struct {
 	effort inference.Effort
 	system string
 	tools  ToolSet
+}
+
+func modelRuntime(model inference.Model, effort inference.Effort) event.ModelRuntime {
+	return event.ModelRuntime{Key: model.Key(), Limits: model.Limits, Effort: effort}
 }
 
 const defaultDrainTimeout = 5 * time.Second
@@ -229,8 +257,27 @@ func New(loopCtx context.Context, sessionID, loopID uuid.UUID, parent loop.Prove
 // mode-selective spawn, so a child begins in the requested mode without a synthetic
 // LoopModeChanged. An unknown mode name fails with the same typed BindError Bind uses.
 func NewInMode(loopCtx context.Context, sessionID, loopID uuid.UUID, parent loop.Provenance, events eventPublisher, bound loop.BoundDefinition, initialMode loop.ModeName) (*Loop, error) {
+	return NewInModeWithCompactor(loopCtx, sessionID, loopID, parent, events, bound, initialMode, nil)
+}
+
+// NewInModeWithCompactor is the focused native composition seam for a loop whose
+// definition installs compaction. The caller supplies only the summary capability;
+// loopruntime derives the executor from the bound loop's own counter, capabilities,
+// and policy. Generic hustle selection and coordination remain private.
+func NewInModeWithCompactor(
+	loopCtx context.Context,
+	sessionID, loopID uuid.UUID,
+	parent loop.Provenance,
+	events eventPublisher,
+	bound loop.BoundDefinition,
+	initialMode loop.ModeName,
+	compactor Compactor,
+) (*Loop, error) {
 	cfg, err := configFromBound(bound, initialMode)
 	if err != nil {
+		return nil, err
+	}
+	if err := installCompactionExecutor(loopCtx, &cfg, compactor); err != nil {
 		return nil, err
 	}
 	resolved := initialMode
@@ -259,6 +306,9 @@ func newLoopWithSeed(loopCtx context.Context, sessionID, loopID uuid.UUID, paren
 	if err := cfg.Model.Validate(); err != nil {
 		return nil, &ConfigError{Kind: ConfigInvalidModel, Cause: err}
 	}
+	if err := cfg.Model.Key().Validate(); err != nil {
+		return nil, &ConfigError{Kind: ConfigInvalidModel, Cause: err}
+	}
 	if events == nil {
 		return nil, &ConfigError{Kind: ConfigMissingPublisher}
 	}
@@ -269,6 +319,9 @@ func newLoopWithSeed(loopCtx context.Context, sessionID, loopID uuid.UUID, paren
 	}
 	if cfg.now == nil {
 		cfg.now = time.Now
+	}
+	if cfg.compactionNow == nil {
+		cfg.compactionNow = time.Now
 	}
 	// The loop mints its own Enduring-event EventID + CreatedAt from the SAME id
 	// generator that mints its correlation ids (idGen) and its clock (now), so a
@@ -289,11 +342,11 @@ func newLoopWithSeed(loopCtx context.Context, sessionID, loopID uuid.UUID, paren
 	if !ok {
 		gates = nopGateRegistrar{}
 	}
-	// The durable-fault probe is the SAME session (via its exported FaultErr); a loop-only
-	// test publisher does not satisfy it, leaving fp nil (the actor then applies changes
-	// unconditionally — there is no durable tap to fail).
-	fp, _ := events.(faultProbe)
 	commands := make(chan command.Command)
+	priorityCommands := make(chan command.Command, compactionPriorityCommandCapacity)
+	contextRequests := make(chan contextMeasureRequest)
+	contextResults := make(chan contextCountResult, 1)
+	contextOutcomes := make(chan contextCompactionOutcomeRequest)
 	done := make(chan struct{})
 	// gateReg is unbuffered: registration is synchronous (the runner blocks on the
 	// ack), and the actor is the sole reader, selecting on it alongside commands.
@@ -307,21 +360,24 @@ func newLoopWithSeed(loopCtx context.Context, sessionID, loopID uuid.UUID, paren
 	//   - commits/drains: per-step commit and tool-continuation drain handshakes;
 	//     unbuffered because each is a synchronous request/reply the actor serializes.
 	lc := loopConfig{
-		loopCtx:      loopCtx,
-		cfg:          cfg,
-		commands:     commands,
-		gateReg:      gateReg,
-		snapshots:    snapshots,
-		internal:     make(chan turnResult, 1),
-		commits:      make(chan commitRequest),
-		drains:       make(chan drainRequest),
-		admissions:   make(chan admissionResult),
-		done:         done,
-		events:       events,
-		eventFactory: cfg.eventFactory,
-		gates:        gates,
-		bound:        bound,
-		faultProbe:   fp,
+		loopCtx:          loopCtx,
+		cfg:              cfg,
+		commands:         commands,
+		priorityCommands: priorityCommands,
+		contextRequests:  contextRequests,
+		contextResults:   contextResults,
+		contextOutcomes:  contextOutcomes,
+		gateReg:          gateReg,
+		snapshots:        snapshots,
+		internal:         make(chan turnResult, 1),
+		commits:          make(chan commitRequest),
+		drains:           make(chan drainRequest),
+		admissions:       make(chan admissionResult),
+		done:             done,
+		events:           events,
+		eventFactory:     cfg.eventFactory,
+		gates:            gates,
+		bound:            bound,
 	}
 	state := newLoopState(sessionID, loopID, parent)
 	// Seed the current turn-affecting configuration from the resolved runtimeConfig. New
@@ -335,6 +391,7 @@ func newLoopWithSeed(loopCtx context.Context, sessionID, loopID uuid.UUID, paren
 		system: cfg.System,
 		tools:  cfg.Tools,
 	}
+	state.runtime = modelRuntime(cfg.Model, cfg.Model.Sampling.Effort)
 	if seed != nil {
 		// Restore seed: come up with the folded committed history and turn count. The
 		// status stays loopIdle (newLoopState's zero default), so the resumed loop
@@ -343,9 +400,26 @@ func newLoopWithSeed(loopCtx context.Context, sessionID, loopID uuid.UUID, paren
 		// — so seeding msgs alone reproduces loopState exactly as it was committed.
 		state.msgs = cloneMessages(seed.Msgs)
 		state.turnIndex = seed.TurnIndex
+		if seed.HasRuntime {
+			state.runtime = seed.Runtime
+		}
+		state.context = seed.Context
+		state.hasContext = seed.HasContext
+		settings, _ := contextSettings(cfg)
+		if err := state.contextTracker.restore(
+			seed.Basis,
+			seed.HasBasis,
+			seed.Context,
+			seed.HasContext,
+			seed.AutomaticBasis,
+			seed.HasAutomaticBasis,
+			settings,
+		); err != nil {
+			return nil, err
+		}
 	}
 	go runLoop(lc, state)
-	return &Loop{Commands: commands, Done: done, gateReg: gateReg, snapshots: snapshots}, nil
+	return &Loop{Commands: commands, Done: done, priorityCommands: priorityCommands, gateReg: gateReg, snapshots: snapshots}, nil
 }
 
 type loopStatus int
@@ -407,13 +481,18 @@ type loopState struct {
 	// state — the things the actor mutates.
 	parent Provenance
 
-	turnIndex       event.TurnIndex
-	turnID          uuid.UUID // entity id for the active turn; zero when idle
-	causationID     uuid.UUID // active submit command's Header.ID; zero when idle
-	status          loopStatus
-	cancelTurn      context.CancelFunc
-	cancelAdmission context.CancelFunc
-	msgs            content.AgenticMessages // conversation history across turns
+	turnIndex         event.TurnIndex
+	turnID            uuid.UUID // entity id for the active turn; zero when idle
+	causationID       uuid.UUID // active submit command's Header.ID; zero when idle
+	status            loopStatus
+	cancelTurn        context.CancelFunc
+	cancelAdmission   context.CancelFunc
+	msgs              content.AgenticMessages // conversation history across turns
+	runtime           event.ModelRuntime
+	context           event.ContextMeasurement
+	hasContext        bool
+	contextTracker    contextTracker
+	contextGeneration uint64
 
 	// effective is the loop's CURRENT turn-affecting configuration (mode/model/effort/
 	// system/tools). startTurn captures a copy of it into the per-turn turnConfig, so a
@@ -509,6 +588,7 @@ type drainRequest struct {
 
 type admissionResult struct {
 	release func()
+	start   TurnStartCapability
 	err     error
 }
 
@@ -534,6 +614,11 @@ func runLoop(cfg loopConfig, state loopState) {
 	ctx := cfg.loopCtx
 	config := cfg.cfg
 	commands := cfg.commands
+	priorityCommands := cfg.priorityCommands
+	contextRequests := cfg.contextRequests
+	contextResults := cfg.contextResults
+	contextOutcomes := cfg.contextOutcomes
+	idleCompactionResults := make(chan idleCompactionCountResult, 1)
 	gateReg := cfg.gateReg
 	snapshots := cfg.snapshots
 	internal := cfg.internal
@@ -541,6 +626,12 @@ func runLoop(cfg loopConfig, state loopState) {
 	drains := cfg.drains
 	admissions := cfg.admissions
 	requestCancelActive := false
+	compactions := newCompactionControl(compactionControlWaiterCapacity)
+	var idleCompaction *idleCompactionPreparation
+	compactionFinalizations := newCompactionFinalizer(compactionFinalizerConfig{
+		Publisher: cfg.events, Factory: cfg.eventFactory, SessionID: state.sessionID, LoopID: state.id,
+		Now: config.compactionNow,
+	})
 
 	// publish sends a FULL-FIDELITY loop event to the session-level event fan-in.
 	// Producer identity is stamped here from loopState/the active turn (the actor IS
@@ -558,25 +649,19 @@ func runLoop(cfg loopConfig, state loopState) {
 	// This is also the single point that mints the persistence identity (EventID +
 	// CreatedAt) for every ENDURING event: stampLoopHeader fills the producer
 	// COORDINATES, then the Factory stamps EventID + CreatedAt for the Enduring class
-	// only — Ephemeral events (TokenDelta/ToolCall*/InputQueued) are never persisted,
-	// so they are published unstamped (which also avoids per-token crypto/rand). On a
-	// mint failure we FAIL SECURE: log loudly and SKIP publishing that Enduring event
+	// plus the low-volume CompactionStarted progress event. Other Ephemeral events
+	// (TokenDelta/ToolCall*/InputQueued) remain unstamped, avoiding per-token crypto/rand.
+	// On a mint failure we FAIL SECURE: log loudly and SKIP publishing the event
 	// rather than fan out a zero-EventID one (a journal would key on a zero
 	// idempotency key) or silently pretend it published.
 	stamp := func(ev event.Event) (event.Event, error) {
-		stamped := stampLoopHeader(ev, state.sessionID, state.id, state.turnID)
-		if stamped.Class() == event.Enduring {
-			h, err := cfg.eventFactory.Stamp(stamped.EventHeader())
-			if err != nil {
-				// A crypto/rand mint failure is catastrophic and astronomically rare; drop
-				// this Enduring event fail-secure (never publish a zero-EventID record). The
-				// hub raises SessionPersistenceFault for durable-append failures; a loop-side
-				// fault for this mint edge is a deferred refinement, not a Phase-7 gap.
-				slog.Error("event id mint failed; dropping Enduring loop event (fail-secure)",
-					"event", fmt.Sprintf("%T", stamped), "error", err)
-				return nil, err
-			}
-			stamped = withLoopHeader(stamped, h)
+		stamped, err := stampLoopEvent(ev, cfg.eventFactory, state.sessionID, state.id, state.turnID)
+		if err != nil {
+			// A crypto/rand mint failure is catastrophic and astronomically rare; drop
+			// the event fail-secure rather than publish a required zero EventID.
+			slog.Error("event id mint failed; dropping loop event (fail-secure)",
+				"event", fmt.Sprintf("%T", ev), "error", err)
+			return nil, err
 		}
 		return stamped, nil
 	}
@@ -589,15 +674,36 @@ func runLoop(cfg loopConfig, state loopState) {
 			slog.Error("loop event publish to session fan-in failed", "error", err)
 		}
 	}
-	commitBoundary := func(ev event.Event) error {
-		stamped, err := stamp(ev)
-		if err != nil {
-			return err
+	publishTurnStarted := func(ev event.TurnStarted, capability TurnStartCapability) (bool, error) {
+		if capability == nil {
+			err := cfg.events.PublishEventChecked(ctx, ev)
+			return err == nil, err
 		}
+		return capability.PublishTurnStarted(ctx, ev)
+	}
+	commitStampedBoundary := func(stamped event.Event) error {
 		if boundary, ok := cfg.events.(executionBoundary); ok {
 			return boundary.CommitBoundary(ctx, stamped)
 		}
-		return cfg.events.PublishEvent(ctx, stamped)
+		return cfg.events.PublishEventChecked(ctx, stamped)
+	}
+	commitStampedContextBoundary := func(stamped event.Event) (bool, error) {
+		if boundary, ok := cfg.events.(contextExecutionBoundary); ok {
+			return boundary.CommitContextBoundary(ctx, stamped)
+		}
+		if boundary, ok := cfg.events.(executionBoundary); ok {
+			err := boundary.CommitBoundary(ctx, stamped)
+			return err == nil, err
+		}
+		err := cfg.events.PublishEventChecked(ctx, stamped)
+		return err == nil, err
+	}
+	commitBoundary := func(ev event.Event) (event.Event, error) {
+		stamped, err := stamp(ev)
+		if err != nil {
+			return nil, err
+		}
+		return stamped, commitStampedBoundary(stamped)
 	}
 
 	// publishAcceptance is the narrow transactional publication path for managed
@@ -610,6 +716,257 @@ func runLoop(cfg loopConfig, state loopState) {
 			return err
 		}
 		return cfg.events.PublishEventChecked(ctx, withLoopHeader(ev, h))
+	}
+
+	reportCompactionFailure := func(waiterCommandIDs []uuid.UUID, err error) {
+		waiters := append([]uuid.UUID(nil), waiterCommandIDs...)
+		failure := compactionFailure{WaiterCommandIDs: waiters, Err: err}
+		if sink, ok := config.compactionSink.(compactionFailureSink); ok {
+			sink.ReportCompactionFailure(ctx, failure)
+			return
+		}
+		slog.Error("compaction coordination failed", "waiter_count", len(waiters), "error", err)
+	}
+
+	publishLaneFull := func(request command.Compact, attemptID event.CompactAttemptID) error {
+		commandID := request.CommandHeader().CommandID
+		rejected := event.CompactWaiterRejected{
+			Header: event.Header{
+				EventID: event.CompactWaiterReplyID(attemptID, commandID, false),
+				Cause:   identity.Cause{CommandID: commandID, Agency: request.CommandHeader().Agency},
+			},
+			AttemptID: attemptID,
+			Reason:    event.CompactRejectControlLaneFull,
+		}
+		stamped, err := stamp(rejected)
+		if err != nil {
+			return &CompactionCoordinationError{Kind: CompactionCoordinationOutcome, Cause: err}
+		}
+		if err := event.ValidateEvent(stamped); err != nil {
+			return &CompactionCoordinationError{Kind: CompactionCoordinationOutcome, Cause: err}
+		}
+		if err := cfg.events.PublishEventChecked(ctx, stamped); err != nil {
+			return &CompactionCoordinationError{Kind: CompactionCoordinationOutcome, Cause: err}
+		}
+		return nil
+	}
+
+	publishPreStartRejection := func(disposition compactionDisposition) error {
+		if disposition.Kind != compactionDispositionReject || disposition.Attempt == nil || !disposition.RejectReason.Valid() {
+			return &CompactionCoordinationError{Kind: CompactionCoordinationOutcome}
+		}
+		for _, commandID := range disposition.Attempt.WaiterCommandIDs {
+			rejected := event.CompactWaiterRejected{
+				Header: event.Header{
+					EventID: event.CompactWaiterReplyID(disposition.Attempt.AttemptID, commandID, false),
+					Cause:   identity.Cause{CommandID: commandID},
+				},
+				AttemptID: disposition.Attempt.AttemptID,
+				Reason:    disposition.RejectReason,
+			}
+			stamped, err := stamp(rejected)
+			if err != nil {
+				return &CompactionCoordinationError{Kind: CompactionCoordinationOutcome, Cause: err}
+			}
+			if err := event.ValidateEvent(stamped); err != nil {
+				return &CompactionCoordinationError{Kind: CompactionCoordinationOutcome, Cause: err}
+			}
+			if err := cfg.events.PublishEventChecked(ctx, stamped); err != nil {
+				return &CompactionCoordinationError{Kind: CompactionCoordinationOutcome, Cause: err}
+			}
+		}
+		return nil
+	}
+
+	dispatchCompactionBoundary := func(boundary compactionBoundaryKind, candidate *compactionExecutionCandidate) bool {
+		if config.compactionSink == nil {
+			return false
+		}
+		pending := compactions.pendingAttempt()
+		if idleCompaction != nil && pending != nil && pending.AttemptID == idleCompaction.attemptID &&
+			compactions.cancellationRejectReason() == event.CompactRejectUnspecified {
+			// This attempt owns an exact idle snapshot. A turn or drain that lands while
+			// its count is in flight must not replace it with a newer candidate.
+			return true
+		}
+		if pending != nil && pending.Basis == (event.ContextBasis{}) {
+			basis := state.contextTracker.currentBasis()
+			if candidate != nil {
+				basis = candidate.Measurement.Basis
+			}
+			if basis == (event.ContextBasis{}) && compactions.cancellationRejectReason() == event.CompactRejectUnspecified {
+				return false
+			}
+			if basis != (event.ContextBasis{}) {
+				if err := compactions.freezeBasis(pending.AttemptID, basis); err != nil {
+					reportCompactionFailure(pending.WaiterCommandIDs, err)
+					return false
+				}
+			}
+		}
+		disposition := compactions.atBoundary(boundary)
+		if disposition.Kind == compactionDispositionNone {
+			return true
+		}
+		if disposition.Kind == compactionDispositionReject {
+			if err := publishPreStartRejection(disposition); err != nil {
+				waiters := []uuid.UUID(nil)
+				if disposition.Attempt != nil {
+					waiters = disposition.Attempt.WaiterCommandIDs
+				}
+				reportCompactionFailure(waiters, err)
+				return false
+			}
+			return true
+		}
+		attempt := disposition.Attempt
+		if attempt == nil {
+			return false
+		}
+		attempt = compactions.markStarted(attempt.AttemptID, config.compactionNow())
+		if attempt == nil {
+			reportCompactionFailure(nil, &CompactionCoordinationError{Kind: CompactionCoordinationOutcome})
+			return false
+		}
+		disposition.Attempt = attempt
+		invoked := false
+		coordinateErr := publishCompactionStartedBeforeInference(
+			ctx, cfg.events, cfg.eventFactory, state.sessionID, state.id,
+			event.CompactionStarted{AttemptID: attempt.AttemptID, Reason: attempt.Reason, Basis: attempt.Basis},
+			func(inferCtx context.Context) error {
+				invoked = true
+				if candidate != nil {
+					if candidateSink, ok := config.compactionSink.(compactionCandidateSink); ok {
+						return candidateSink.CoordinateCompactionCandidate(inferCtx, disposition, *candidate)
+					}
+				}
+				return config.compactionSink.CoordinateCompaction(inferCtx, disposition)
+			},
+		)
+		if coordinateErr == nil {
+			return true
+		}
+		if !invoked && isFatalPublication(coordinateErr) {
+			compactions.abort(attempt.AttemptID)
+			reportCompactionFailure(attempt.WaiterCommandIDs, &CompactionCoordinationError{
+				Kind: CompactionCoordinationOutcome, Cause: coordinateErr,
+			})
+			return false
+		}
+		rejectReason := event.CompactRejectProgressPublication
+		if invoked {
+			rejectReason = event.CompactRejectExecutionFailed
+		}
+		_, finalizationErr := compactionFinalizations.Finalize(ctx, *attempt, compactionFinalizationProposal{RejectReason: rejectReason})
+		if finalizationErr != nil {
+			reportCompactionFailure(attempt.WaiterCommandIDs, finalizationErr)
+			return false
+		}
+		compactions.complete(attempt.AttemptID)
+		return false
+	}
+
+	startIdleCompactionPreparation := func(attemptID event.CompactAttemptID) bool {
+		if _, candidateAware := config.compactionSink.(compactionCandidateSink); !candidateAware {
+			return false
+		}
+		if _, awaitable := config.compactionSink.(contextCompactionAwaiter); !awaitable {
+			return false
+		}
+		settings, configured := contextSettings(config)
+		basis := state.contextTracker.currentBasis()
+		if !configured || config.ContextCounter == nil || basis.Revision == 0 || basis.ThroughEventID.IsZero() {
+			return false
+		}
+		transcript := cloneMessages(state.msgs)
+		tools := state.effective.tools
+		tools.Registry = append([]tool.InvokableTool(nil), tools.Registry...)
+		preparationCtx, cancelPreparation := context.WithCancel(ctx)
+		preparation := idleCompactionPreparation{
+			attemptID: attemptID, basis: basis, generation: state.contextGeneration,
+			cancel: cancelPreparation,
+			request: inference.Request{
+				Model: state.effective.model.Clone(), System: state.effective.system,
+				Messages: cloneMessages(transcript),
+			},
+			tools: tools, transcript: transcript,
+		}
+		idleCompaction = &preparation
+		go func(preparationCtx context.Context, prepared idleCompactionPreparation, admission contextAdmissionSettings) {
+			request := prepared.request
+			request.Tools = toolDefs(preparationCtx, prepared.tools.Registry)
+			runtimeRevision := revisionDigest(nil)
+			measurement, err := measureRequestContext(
+				preparationCtx, config.ContextCounter, config.CounterCapability, config.InferenceCapability,
+				admission, prepared.basis, request, runtimeRevision,
+			)
+			result := idleCompactionCountResult{
+				preparation: prepared,
+				candidate: compactionExecutionCandidate{
+					Measurement: measurement, Request: request, RuntimeRevision: runtimeRevision,
+					Transcript: cloneMessages(prepared.transcript),
+				},
+				err: err,
+			}
+			select {
+			case idleCompactionResults <- result:
+			case <-ctx.Done():
+			}
+		}(preparationCtx, preparation, settings)
+		return true
+	}
+
+	finalizeIdleCompactionRejection := func(preparation idleCompactionPreparation, reason event.CompactRejectReason) {
+		pending := compactions.pendingAttempt()
+		if pending == nil || pending.AttemptID != preparation.attemptID {
+			return
+		}
+		if err := compactions.freezeBasis(preparation.attemptID, preparation.basis); err != nil {
+			reportCompactionFailure(pending.WaiterCommandIDs, err)
+			return
+		}
+		attempt := compactions.pendingAttempt()
+		if attempt == nil {
+			return
+		}
+		attempt.StartedAt = config.compactionNow()
+		terminal, err := compactionFinalizations.Finalize(ctx, *attempt, compactionFinalizationProposal{RejectReason: reason})
+		if err != nil {
+			reportCompactionFailure(attempt.WaiterCommandIDs, err)
+			compactions.abort(attempt.AttemptID)
+			return
+		}
+		compactions.complete(attempt.AttemptID)
+		if rejected, ok := terminal.(event.CompactionRejected); ok && rejected.Reason == event.CompactionReasonAutomatic {
+			state.contextTracker.exhaustAutomatic(rejected.Basis, rejected.Reason, true)
+		}
+	}
+
+	awaitIdleCompaction := func(attemptID event.CompactAttemptID) {
+		awaiter, ok := config.compactionSink.(contextCompactionAwaiter)
+		if !ok {
+			return
+		}
+		go func() {
+			outcome, err := awaiter.AwaitCompaction(ctx, attemptID)
+			if err != nil {
+				reportCompactionFailure(nil, &contextCompactionAwaitError{AttemptID: attemptID, Cause: err})
+				return
+			}
+			reply := make(chan contextCompactionOutcomeReply, 1)
+			select {
+			case contextOutcomes <- contextCompactionOutcomeRequest{attemptID: attemptID, result: outcome, reply: reply}:
+			case <-ctx.Done():
+				return
+			}
+			select {
+			case response := <-reply:
+				if response.err != nil {
+					reportCompactionFailure(nil, response.err)
+				}
+			case <-ctx.Done():
+			}
+		}()
 	}
 
 	// emitLoopIdle announces the loop's running->idle transition: an Enduring,
@@ -666,14 +1023,14 @@ func runLoop(cfg loopConfig, state loopState) {
 		}
 	}
 
-	// installActiveTurn installs the active-turn fields on loopState and derives the
+	// installActiveTurn installs the active-turn fields on loopState after the opening
+	// event is durable, and derives the
 	// turn ctx from the loop ctx (submit commands carry no context, so a turn's
 	// lifetime is bounded by the loop's, not by any caller's API-call ctx). It then
-	// commits the initial UserMessage into loopState.msgs and emits
-	// event.TurnStarted at the SAME actor-owned point (Cause.LoopID carries
+	// commits the initial UserMessage into loopState.msgs. TurnStarted's Cause.LoopID carries
 	// qi.triggeredBy: set for a SubagentResult, zero for a UserInput). It returns the
 	// derived turn ctx and the defensive base clone the per-turn goroutine reads.
-	// This is the COMMIT-AND-ANNOUNCE half of starting a turn (distinct from
+	// This is the live-commit half of starting a turn (distinct from
 	// assembling the per-turn turnConfig).
 	installActiveTurn := func(turnID uuid.UUID, qi queuedInput) (context.Context, content.AgenticMessages) {
 		state.turnIndex++
@@ -683,31 +1040,17 @@ func runLoop(cfg loopConfig, state loopState) {
 		turnCtx, cancel := context.WithCancel(ctx)
 		state.cancelTurn = cancel
 
-		// base is a defensive CLONE of pre-turn history with its OWN backing array,
-		// taken BEFORE the initial UserMessage is committed (runTurn reads it
+		// base is a defensive deep clone of pre-turn history, taken BEFORE the
+		// initial UserMessage is committed (runTurn reads it
 		// concurrently while the actor keeps appending committed step groups).
 		base := cloneMessages(state.msgs)
 
 		// Loop-owned incremental commit: commit the initial UserMessage and emit
-		// TurnStarted (Message + Cause.CommandID = inputID + InputID = inputID) at the
-		// SAME actor-owned point, BEFORE runTurn starts.
+		// TurnStarted (Message + Cause.CommandID = inputID + InputID = inputID) was
+		// durably published immediately before this actor-owned mutation.
 		state.msgs = append(state.msgs, qi.msg)
-		publish(event.TurnStarted{
-			Header: event.Header{
-				Coordinates: identity.Coordinates{
-					SessionID: state.sessionID,
-					LoopID:    state.id,
-					TurnID:    state.turnID,
-				},
-				Cause: identity.Cause{
-					CommandID:   state.causationID,
-					Coordinates: identity.Coordinates{LoopID: qi.triggeredBy},
-					Agency:      qi.agency,
-				},
-			},
-			TurnIndex: state.turnIndex,
-			Message:   qi.msg,
-		})
+		state.context = event.ContextMeasurement{}
+		state.hasContext = false
 		return turnCtx, base
 	}
 
@@ -764,36 +1107,121 @@ func runLoop(cfg loopConfig, state loopState) {
 				return nil, &CommitError{Reason: CommitTurnCancelled, Cause: cctx.Err()}
 			}
 		}
+		var measure func(context.Context, inference.Request, string, *content.UserMessage, bool) error
+		if _, configured := contextSettings(config); configured && config.ContextCounter != nil {
+			measure = func(cctx context.Context, request inference.Request, runtimeRevision string, runtimeTail *content.UserMessage, continuation bool) error {
+				for {
+					reply := make(chan contextMeasureReply, 1)
+					req := contextMeasureRequest{ctx: cctx, request: request, runtimeTail: cloneUserMessage(runtimeTail), runtimeContextRevision: runtimeRevision, reply: reply}
+					select {
+					case cfg.contextRequests <- req:
+					case <-cctx.Done():
+						return normalizeContextCountError(request.Model.Key(), config.CounterCapability.Quality, cctx.Err())
+					}
+					var measured contextMeasureReply
+					select {
+					case measured = <-reply:
+					case <-cctx.Done():
+						return normalizeContextCountError(request.Model.Key(), config.CounterCapability.Quality, cctx.Err())
+					}
+					if measured.err != nil {
+						return measured.err
+					}
+					if measured.awaiter == nil {
+						return nil
+					}
+					outcome, err := measured.awaiter.AwaitCompaction(cctx, measured.attemptID)
+					if err != nil {
+						return &contextCompactionAwaitError{AttemptID: measured.attemptID, Cause: err}
+					}
+					outcomeReply := make(chan contextCompactionOutcomeReply, 1)
+					outcomeRequest := contextCompactionOutcomeRequest{attemptID: measured.attemptID, result: outcome, reply: outcomeReply}
+					select {
+					case cfg.contextOutcomes <- outcomeRequest:
+					case <-ctx.Done():
+						return &CompactionCoordinationError{Kind: CompactionCoordinationOutcome, Cause: ctx.Err()}
+					}
+					var disposition contextCompactionOutcomeReply
+					select {
+					case disposition = <-outcomeReply:
+					case <-ctx.Done():
+						return &CompactionCoordinationError{Kind: CompactionCoordinationOutcome, Cause: ctx.Err()}
+					}
+					if disposition.err != nil {
+						return disposition.err
+					}
+					if disposition.retry {
+						continue
+					}
+					switch disposition.disposition {
+					case contextCompactionAwaitRejected:
+						if !continuation {
+							switch disposition.rejectReason {
+							case event.CompactRejectInterrupted, event.CompactRejectShuttingDown, event.CompactRejectCanceled:
+								return &terminalCompactionCancellationError{Reason: disposition.rejectReason}
+							}
+							return nil
+						}
+						if disposition.continuationError != nil {
+							var summaryTooLarge *loop.SummaryTooLargeError
+							var unknownLimit *loop.ContextLimitUnknownError
+							if errors.As(disposition.continuationError, &summaryTooLarge) || errors.As(disposition.continuationError, &unknownLimit) {
+								return disposition.continuationError
+							}
+						}
+						if measured.measurement.InputTokens >= measured.measurement.InputLimit {
+							return &loop.ContextLimitError{Measurement: measured.measurement}
+						}
+						return nil
+					case contextCompactionAwaitCommitted:
+						if disposition.replacement == nil {
+							return &contextCompactionOutcomeError{AttemptID: measured.attemptID}
+						}
+						return &contextReplacementDirective{
+							AttemptID:   measured.attemptID,
+							Replacement: turnContextReplacement{Summary: cloneUserMessage(disposition.replacement.Summary)},
+						}
+					default:
+						return &contextCompactionAwaitError{AttemptID: measured.attemptID}
+					}
+				}
+			}
+		}
 		// model/system/tools come from the loop's CURRENT effective config (captured here,
 		// at turn start, into this per-turn value), so a change that landed since the last
 		// turn takes effect now while a change that lands DURING this turn does not. The
 		// remaining fields are immutable loop wiring, so they ride the frozen config.
 		return turnConfig{
-			base:           base,
-			runtimeContext: config.RuntimeContext,
-			model:          state.effective.model,
-			system:         state.effective.system,
-			tools:          state.effective.tools,
-			client:         config.Client,
-			gateReg:        gateReg,
-			idGen:          config.idGen,
-			admit:          admit,
-			firstAdmission: firstAdmission,
-			commit:         commit,
-			drainPending:   drainPending,
-			emit:           publish,
-			afterDrain:     config.afterDrain,
+			base:                    base,
+			runtimeContext:          config.RuntimeContext,
+			model:                   state.effective.model,
+			system:                  state.effective.system,
+			tools:                   state.effective.tools,
+			client:                  config.Client,
+			gateReg:                 gateReg,
+			idGen:                   config.idGen,
+			admit:                   admit,
+			firstAdmission:          firstAdmission,
+			measure:                 measure,
+			commit:                  commit,
+			drainPending:            drainPending,
+			emit:                    publish,
+			afterDrain:              config.afterDrain,
+			afterContextReplacement: config.afterContextReplacement,
 		}
 	}
 
 	// startTurn begins a turn FROM an accepted submit (qi). It is the single
 	// commit-then-start path shared by an idle submit and the on-idle inbox pop. It
-	// mints the TurnID, installs+commits+announces the turn (installActiveTurn),
+	// mints the TurnID, stamps and preflights the context mutation, durably publishes
+	// TurnStarted, then installs the corresponding live turn state,
 	// assembles the per-turn config (buildTurnConfig), then launches runTurn. It
-	// returns the new TurnID; on an id-gen failure it returns a non-nil error and
-	// starts nothing (the caller decides how to surface it). The actor is the sole
-	// caller, so it always runs with state.status idle.
-	startTurnWithIDAndAdmission := func(turnID uuid.UUID, qi queuedInput, firstAdmission func()) uuid.UUID {
+	// returns the new TurnID; when capability-backed opening-event preparation fails,
+	// it returns a non-nil error and starts nothing. When the opening event committed
+	// but its derived activity transition failed, it installs the matching live start
+	// and immediately terminates it as failed without entering inference. The actor is
+	// the sole caller, so it always runs with state.status idle.
+	startTurnWithIDAndAdmission := func(turnID uuid.UUID, qi queuedInput, firstAdmission func(), capability TurnStartCapability) (uuid.UUID, error) {
 		firstLease := newAdmissionLease(firstAdmission)
 		launched := false
 		defer func() {
@@ -804,11 +1232,52 @@ func runLoop(cfg loopConfig, state loopState) {
 		if firstLease != nil {
 			firstAdmission = firstLease.Release
 		}
+		started := event.TurnStarted{
+			Header: event.Header{
+				Coordinates: identity.Coordinates{SessionID: state.sessionID, LoopID: state.id, TurnID: turnID},
+				Cause: identity.Cause{
+					CommandID:   qi.inputID,
+					Coordinates: identity.Coordinates{LoopID: qi.triggeredBy},
+					Agency:      qi.agency,
+				},
+			},
+			TurnIndex: state.turnIndex + 1,
+			Message:   cloneUserMessage(qi.msg),
+		}
+		stamped, err := stamp(started)
+		if err != nil {
+			return uuid.UUID{}, err
+		}
+		started = stamped.(event.TurnStarted)
+		mutation, err := preflightContextMutation(state.contextTracker, state.contextGeneration, started.EventID, contextMutationHistory)
+		if err != nil {
+			return uuid.UUID{}, err
+		}
+		committed, publishErr := publishTurnStarted(started, capability)
+		if !committed {
+			return uuid.UUID{}, publishErr
+		}
+		mutation.commit(&state.contextTracker, &state.contextGeneration)
+		if idleCompaction != nil {
+			preparation := *idleCompaction
+			preparation.cancel()
+			idleCompaction = nil
+			finalizeIdleCompactionRejection(preparation, event.CompactRejectStaleBasis)
+		}
 		turnCtx, base := installActiveTurn(turnID, qi)
 		idx := state.turnIndex
+		cancel := state.cancelTurn
+		if publishErr != nil {
+			go func() {
+				defer cancel()
+				defer firstLease.Release()
+				internal <- turnResult{terminal: event.TurnFailed{TurnIndex: idx, Err: publishErr}}
+			}()
+			launched = true
+			return turnID, nil
+		}
 		ts := newTurnState(state.sessionID, state.id, turnID, idx, state.causationID, qi.msg)
 		turnCfg := buildTurnConfig(base, firstAdmission)
-		cancel := state.cancelTurn
 
 		go func() {
 			defer cancel()
@@ -828,22 +1297,23 @@ func runLoop(cfg loopConfig, state loopState) {
 			internal <- turnResult{terminal: terminal}
 		}()
 		launched = true
-		return turnID
+		return turnID, nil
 	}
-	startTurnWithID := func(turnID uuid.UUID, qi queuedInput) uuid.UUID {
-		return startTurnWithIDAndAdmission(turnID, qi, nil)
+	startTurnWithID := func(turnID uuid.UUID, qi queuedInput) (uuid.UUID, error) {
+		return startTurnWithIDAndAdmission(turnID, qi, nil, nil)
 	}
 	startTurn := func(qi queuedInput) (uuid.UUID, error) {
 		turnID, err := config.idGen()
 		if err != nil {
 			return uuid.UUID{}, &IDGenerationError{Cause: err}
 		}
-		return startTurnWithID(turnID, qi), nil
+		return startTurnWithID(turnID, qi)
 	}
 
-	// userMessageFromBlocks wraps submit blocks into the committed UserMessage form.
+	// userMessageFromBlocks wraps an owned clone of submit blocks into the committed
+	// UserMessage form. Command callers retain ownership of their input graph.
 	userMessageFromBlocks := func(blocks []content.Block) *content.UserMessage {
-		return &content.UserMessage{Message: content.Message{Role: content.RoleUser, Blocks: blocks}}
+		return &content.UserMessage{Message: content.Message{Role: content.RoleUser, Blocks: cloneBlocks(blocks)}}
 	}
 
 	// returnEntry resolves ONE removed-from-inbox entry as returned: it emits the
@@ -870,7 +1340,7 @@ func runLoop(cfg loopConfig, state loopState) {
 				},
 			},
 			Reason:  reason,
-			Message: qi.msg,
+			Message: cloneUserMessage(qi.msg),
 		})
 	}
 
@@ -1076,12 +1546,20 @@ func runLoop(cfg loopConfig, state loopState) {
 		admitCtx, cancel := context.WithCancel(ctx)
 		state.cancelAdmission = cancel
 		go func() {
-			release, err := admission.EnterExecution(admitCtx, state.id)
+			var result admissionResult
+			if startAdmission, supportsTurnStart := cfg.events.(turnStartAdmission); supportsTurnStart {
+				result.start, result.err = startAdmission.EnterTurnStart(admitCtx, state.id)
+				if result.start != nil {
+					result.release = result.start.Release
+				}
+			} else {
+				result.release, result.err = admission.EnterExecution(admitCtx, state.id)
+			}
 			select {
-			case admissions <- admissionResult{release: release, err: err}:
+			case admissions <- result:
 			case <-admitCtx.Done():
-				if release != nil {
-					release()
+				if result.release != nil {
+					result.release()
 				}
 			}
 		}()
@@ -1235,7 +1713,7 @@ func runLoop(cfg loopConfig, state loopState) {
 		endedTurnID := state.turnID
 		// The terminal publish must still carry this turn's correlation IDs (stamped by
 		// publish from state.turnID), so clear them only afterward.
-		boundaryErr := commitBoundary(result.terminal)
+		_, boundaryErr := commitBoundary(result.terminal)
 		if boundaryErr != nil {
 			slog.Error("turn boundary commit failed", "error", boundaryErr)
 		}
@@ -1290,6 +1768,23 @@ func runLoop(cfg loopConfig, state loopState) {
 	changeHeader := func() event.Header {
 		return event.Header{Coordinates: identity.Coordinates{SessionID: state.sessionID, LoopID: state.id}}
 	}
+	commitContextConfigurationChange := func(change event.Event) error {
+		stamped, err := stamp(change)
+		if err != nil {
+			return err
+		}
+		mutation, err := preflightContextMutation(state.contextTracker, state.contextGeneration, stamped.EventHeader().EventID, contextMutationRequestShape)
+		if err != nil {
+			return err
+		}
+		if err := cfg.events.PublishEventChecked(ctx, stamped); err != nil {
+			return err
+		}
+		mutation.commit(&state.contextTracker, &state.contextGeneration)
+		state.context = event.ContextMeasurement{}
+		state.hasContext = false
+		return nil
+	}
 
 	// applySetMode commits a SetLoopMode: it validates the mode name against the bound
 	// definition, emits LoopModeChanged, checks the durable-fault probe, then replaces the
@@ -1312,14 +1807,12 @@ func runLoop(cfg loopConfig, state loopState) {
 			return
 		}
 		next := effectiveConfig{mode: modeName, model: resolved.Model, effort: resolved.Model.Sampling.Effort, system: resolved.System, tools: resolveToolSetCaps(resolved.Tools)}
-		publish(event.LoopModeChanged{Header: changeHeader(), PreviousMode: string(state.effective.mode), Mode: string(modeName)})
-		if fp := cfg.faultProbe; fp != nil {
-			if ferr := fp.FaultErr(); ferr != nil {
-				c.Ack <- command.LoopChangeResult{Err: &loop.ChangeError{Kind: loop.ChangeDurableAppendFailed, Cause: ferr}}
-				return
-			}
+		if err := commitContextConfigurationChange(event.LoopModeChanged{Header: changeHeader(), PreviousMode: string(state.effective.mode), Mode: string(modeName), Runtime: modelRuntime(next.model, next.effort)}); err != nil {
+			c.Ack <- command.LoopChangeResult{Err: &loop.ChangeError{Kind: loop.ChangeDurableAppendFailed, Cause: err}}
+			return
 		}
 		state.effective = next
+		state.runtime = modelRuntime(next.model, next.effort)
 		c.Ack <- command.LoopChangeResult{Mode: string(next.mode), Model: next.model, Effort: next.effort}
 	}
 
@@ -1346,6 +1839,16 @@ func runLoop(cfg loopConfig, state loopState) {
 				c.Ack <- command.LoopChangeResult{Err: &loop.ChangeError{Kind: loop.ChangeInvalidModel, Cause: verr}}
 				return
 			}
+			if verr := model.Key().Validate(); verr != nil {
+				c.Ack <- command.LoopChangeResult{Err: &loop.ChangeError{Kind: loop.ChangeInvalidModel, Cause: verr}}
+				return
+			}
+			if cfg.bound != nil {
+				if verr := cfg.bound.ValidateContextModel(model); verr != nil {
+					c.Ack <- command.LoopChangeResult{Err: &loop.ChangeError{Kind: loop.ChangeInvalidModel, Cause: verr}}
+					return
+				}
+			}
 		}
 		if c.SetEffort {
 			effort = c.Effort
@@ -1356,159 +1859,209 @@ func runLoop(cfg loopConfig, state loopState) {
 		}
 		model.Sampling = model.Sampling.Clone()
 		model.Sampling.Effort = effort // bake effort into the model the request stamps
-		publish(event.LoopInferenceChanged{Header: changeHeader(), Model: model, Effort: effort})
-		if fp := cfg.faultProbe; fp != nil {
-			if ferr := fp.FaultErr(); ferr != nil {
-				c.Ack <- command.LoopChangeResult{Err: &loop.ChangeError{Kind: loop.ChangeDurableAppendFailed, Cause: ferr}}
-				return
-			}
+		if err := commitContextConfigurationChange(event.LoopInferenceChanged{Header: changeHeader(), Runtime: modelRuntime(model, effort)}); err != nil {
+			c.Ack <- command.LoopChangeResult{Err: &loop.ChangeError{Kind: loop.ChangeDurableAppendFailed, Cause: err}}
+			return
 		}
 		state.effective.model = model
 		state.effective.effort = effort
+		state.runtime = modelRuntime(model, effort)
 		c.Ack <- command.LoopChangeResult{Mode: string(state.effective.mode), Model: model, Effort: effort}
 	}
 
-	for {
-		select {
-		case cmd, ok := <-commands:
-			if !ok {
-				return
+	handleCommand := func(cmd command.Command) bool {
+		switch c := cmd.(type) {
+
+		case command.UserInput:
+			// Interactive input may queue behind a running turn (it later folds into a
+			// tool-continuation request or starts a later turn). The actor decides on
+			// its own live state — race-free — and PUBLISHES the typed outcome event
+			// (TurnStarted / InputQueued / TurnRejected) onto the session fan-in. A
+			// UserInput may be rejected, so bypassReject is false.
+			qi := queuedInput{inputID: c.CommandHeader().CommandID, agency: c.CommandHeader().Agency, msg: userMessageFromBlocks(c.Blocks), noFold: c.NoFold}
+			if c.Accepted != nil {
+				admitDelegate(c, qi)
+				return false
 			}
-			switch c := cmd.(type) {
+			decideSubmit(qi, false)
 
-			case command.UserInput:
-				// Interactive input may queue behind a running turn (it later folds into a
-				// tool-continuation request or starts a later turn). The actor decides on
-				// its own live state — race-free — and PUBLISHES the typed outcome event
-				// (TurnStarted / InputQueued / TurnRejected) onto the session fan-in. A
-				// UserInput may be rejected, so bypassReject is false.
-				qi := queuedInput{inputID: c.CommandHeader().CommandID, agency: c.CommandHeader().Agency, msg: userMessageFromBlocks(c.Blocks), noFold: c.NoFold}
-				if c.Accepted != nil {
-					admitDelegate(c, qi)
-					continue
-				}
-				decideSubmit(qi, false)
+		case command.SubagentResult:
+			// A hand-back from a finished subagent loop. triggeredBy is the producing
+			// CHILD loop id (Cause.LoopID), stamped on the resulting events — the
+			// command's embedded Coordinates.LoopID is the PARENT (this loop, the
+			// delivery target), NOT the wake token. bypassReject is true: a
+			// SubagentResult is NEVER rejected — it always starts (idle) or queues
+			// (running/shutting-down), so its quiescence {wake} token is always released
+			// by a resulting Enduring event, never off the publish path.
+			qi := queuedInput{
+				inputID:     c.CommandHeader().CommandID,
+				triggeredBy: c.Cause.LoopID,           // the CHILD loop (wake token)
+				agency:      c.CommandHeader().Agency, // a hand-back is machine; copy verbatim
+				msg:         userMessageFromBlocks(c.Blocks),
+			}
+			decideSubmit(qi, true)
 
-			case command.SubagentResult:
-				// A hand-back from a finished subagent loop. triggeredBy is the producing
-				// CHILD loop id (Cause.LoopID), stamped on the resulting events — the
-				// command's embedded Coordinates.LoopID is the PARENT (this loop, the
-				// delivery target), NOT the wake token. bypassReject is true: a
-				// SubagentResult is NEVER rejected — it always starts (idle) or queues
-				// (running/shutting-down), so its quiescence {wake} token is always released
-				// by a resulting Enduring event, never off the publish path.
-				qi := queuedInput{
-					inputID:     c.CommandHeader().CommandID,
-					triggeredBy: c.Cause.LoopID,           // the CHILD loop (wake token)
-					agency:      c.CommandHeader().Agency, // a hand-back is machine; copy verbatim
-					msg:         userMessageFromBlocks(c.Blocks),
-				}
-				decideSubmit(qi, true)
+		case command.CancelQueuedInput:
+			// Retract a still-queued submit. Resolved by the actor against its own
+			// inbox: if still queued it emits event.InputCancelled{CancelClientRetracted}
+			// and removes it; otherwise it is a no-op (already started/folded or never
+			// queued). Fire-and-forget — no reply channel.
+			cancelQueued(c)
 
-			case command.CancelQueuedInput:
-				// Retract a still-queued submit. Resolved by the actor against its own
-				// inbox: if still queued it emits event.InputCancelled{CancelClientRetracted}
-				// and removes it; otherwise it is a no-op (already started/folded or never
-				// queued). Fire-and-forget — no reply channel.
-				cancelQueued(c)
+		case command.CancelDelegateRequest:
+			cancelDelegateRequest(c)
 
-			case command.CancelDelegateRequest:
-				cancelDelegateRequest(c)
+		case command.SetLoopMode:
+			// Select a predeclared mode for the NEXT turn. Validated against the bound
+			// definition on the actor (the sole owner of effective state); the outcome
+			// (typed error or the committed mode/model/effort) is replied on the buffered
+			// Ack. A nil Ack violates the contract — log and drop rather than wedge.
+			if err := c.Validate(); err != nil {
+				slog.Warn("invalid SetLoopMode command", "error", err)
+				return false
+			}
+			applySetMode(c)
 
-			case command.SetLoopMode:
-				// Select a predeclared mode for the NEXT turn. Validated against the bound
-				// definition on the actor (the sole owner of effective state); the outcome
-				// (typed error or the committed mode/model/effort) is replied on the buffered
-				// Ack. A nil Ack violates the contract — log and drop rather than wedge.
-				if err := c.Validate(); err != nil {
-					slog.Warn("invalid SetLoopMode command", "error", err)
-					continue
-				}
-				applySetMode(c)
+		case command.ChangeLoopInference:
+			// Change only the model/effort for the NEXT turn, validated atomically.
+			if err := c.Validate(); err != nil {
+				slog.Warn("invalid ChangeLoopInference command", "error", err)
+				return false
+			}
+			applyChangeInference(c)
 
-			case command.ChangeLoopInference:
-				// Change only the model/effort for the NEXT turn, validated atomically.
-				if err := c.Validate(); err != nil {
-					slog.Warn("invalid ChangeLoopInference command", "error", err)
-					continue
+		case command.Compact:
+			admission, err := compactions.admit(c, config.idGen)
+			if err != nil {
+				reportCompactionFailure([]uuid.UUID{c.CommandHeader().CommandID}, err)
+				return false
+			}
+			if admission.Kind == compactionAdmissionLaneFull {
+				if err := publishLaneFull(c, admission.AttemptID); err != nil {
+					reportCompactionFailure([]uuid.UUID{c.CommandHeader().CommandID}, err)
 				}
-				applyChangeInference(c)
+				return false
+			}
+			// Idle is itself a safe turn boundary. A configured sink takes ownership
+			// immediately; while a turn is live, the request remains actor-owned until
+			// the next step/turn boundary below.
+			if state.status == loopIdle {
+				if admission.Kind == compactionAdmissionOpened && startIdleCompactionPreparation(admission.AttemptID) {
+					return false
+				}
+				dispatchCompactionBoundary(compactionBoundaryTurn, nil)
+			}
 
-			case command.Interrupt:
-				if err := c.Validate(); err != nil {
-					slog.Warn("invalid Interrupt command", "error", err)
-					continue
-				}
-				if state.cancelTurn != nil {
-					state.cancelTurn()
-					state.cancelTurn = nil
-					c.Ack <- true
-				} else if requestCancelActive {
-					// A targeted cancellation already cancelled this exact active turn,
-					// but its terminal has not reached the actor yet. An ordinary interrupt
-					// broadens the disposition: acknowledge it and clear the targeted-only
-					// continuation so the terminal uses the ordinary interrupt queue policy.
-					requestCancelActive = false
-					c.Ack <- true
-				} else if state.status == loopWaitingAdmission && state.cancelAdmission != nil {
-					// This loop is idle with accepted work waiting on session admission.
-					// Keep the existing cancellable waiter: loop-scoped admission rechecks
-					// every retained interrupt ref before returning. Ack false because no
-					// current turn was canceled; fan-out keeps this scope's provisional ref
-					// only when another target genuinely acknowledges cancellation.
-					retainUserQueuedInbox(uuid.UUID{})
-					c.Ack <- false
-				} else {
-					c.Ack <- false
-				}
+		case command.Interrupt:
+			if err := c.Validate(); err != nil {
+				slog.Warn("invalid Interrupt command", "error", err)
+				return false
+			}
+			compactions.interrupt()
+			if idleCompaction != nil {
+				idleCompaction.cancel()
+			}
+			if state.cancelTurn != nil {
+				state.cancelTurn()
+				state.cancelTurn = nil
+				c.Ack <- true
+			} else if requestCancelActive {
+				// A targeted cancellation already cancelled this exact active turn,
+				// but its terminal has not reached the actor yet. An ordinary interrupt
+				// broadens the disposition: acknowledge it and clear the targeted-only
+				// continuation so the terminal uses the ordinary interrupt queue policy.
+				requestCancelActive = false
+				c.Ack <- true
+			} else if state.status == loopWaitingAdmission && state.cancelAdmission != nil {
+				// This loop is idle with accepted work waiting on session admission.
+				// Keep the existing cancellable waiter: loop-scoped admission rechecks
+				// every retained interrupt ref before returning. Ack false because no
+				// current turn was canceled; fan-out keeps this scope's provisional ref
+				// only when another target genuinely acknowledges cancellation.
+				retainUserQueuedInbox(uuid.UUID{})
+				c.Ack <- false
+			} else {
+				c.Ack <- false
+			}
+			if state.status == loopIdle {
+				dispatchCompactionBoundary(compactionBoundaryTurn, nil)
+			}
 
-			case command.Shutdown:
-				if err := c.Validate(); err != nil {
-					slog.Warn("invalid Shutdown command", "error", err)
-				} else {
-					state.shutdownAcks = append(state.shutdownAcks, c.Ack)
-				}
-				if state.status == loopShuttingDown {
-					continue
-				}
-				wasRunning := state.status == loopRunning
-				wasWaitingAdmission := state.status == loopWaitingAdmission
-				state.status = loopShuttingDown
-				if state.cancelTurn != nil {
-					state.cancelTurn()
-					state.cancelTurn = nil
-				}
-				if wasWaitingAdmission && state.cancelAdmission != nil {
-					state.cancelAdmission()
-					state.cancelAdmission = nil
-					returnQueuedInbox(event.CancelTurnInterrupted, uuid.UUID{})
-					ackShutdowns(nil)
-					return
-				}
-				if !wasRunning {
-					// Idle shutdown: no turn is running. Return any still-queued input
-					// (it will never start) before stopping; in practice the inbox is
-					// empty when idle, but this guarantees nothing is silently dropped.
-					returnQueuedInbox(event.CancelTurnInterrupted, uuid.UUID{})
-					ackShutdowns(nil)
-					return
-				}
+		case command.Shutdown:
+			if err := c.Validate(); err != nil {
+				slog.Warn("invalid Shutdown command", "error", err)
+			} else {
+				state.shutdownAcks = append(state.shutdownAcks, c.Ack)
+			}
+			compactions.shutdown()
+			if idleCompaction != nil {
+				idleCompaction.cancel()
+			}
+			if state.status == loopShuttingDown {
+				return false
+			}
+			wasRunning := state.status == loopRunning
+			wasWaitingAdmission := state.status == loopWaitingAdmission
+			state.status = loopShuttingDown
+			if state.cancelTurn != nil {
+				state.cancelTurn()
+				state.cancelTurn = nil
+			}
+			if wasWaitingAdmission && state.cancelAdmission != nil {
+				state.cancelAdmission()
+				state.cancelAdmission = nil
+				returnQueuedInbox(event.CancelTurnInterrupted, uuid.UUID{})
+				dispatchCompactionBoundary(compactionBoundaryTurn, nil)
+				ackShutdowns(nil)
+				return true
+			}
+			if !wasRunning {
+				// Idle shutdown: no turn is running. Return any still-queued input
+				// (it will never start) before stopping; in practice the inbox is
+				// empty when idle, but this guarantees nothing is silently dropped.
+				returnQueuedInbox(event.CancelTurnInterrupted, uuid.UUID{})
+				dispatchCompactionBoundary(compactionBoundaryTurn, nil)
+				ackShutdowns(nil)
+				return true
+			}
 			// Turn goroutine is winding down; wait for internal below.
 
 			// Control commands are fire-and-route: no Validate, no Ack. routeControl
 			// delivers to the parked runner blocked on this ToolExecutionID iff a gate is open
 			// AND its kind accepts this command; any miss (unknown/stale ToolExecutionID, kind
 			// mismatch, duplicate after delivery) is silently dropped (fail-safe).
-			case command.ApproveToolCall:
-				routeControl(c, c.GateRoute)
+		case command.ApproveToolCall:
+			routeControl(c, c.GateRoute)
 
-			case command.DenyToolCall:
-				routeControl(c, c.GateRoute)
+		case command.DenyToolCall:
+			routeControl(c, c.GateRoute)
 
-			case command.ProvideUserInput:
-				routeControl(c, c.GateRoute)
+		case command.ProvideUserInput:
+			routeControl(c, c.GateRoute)
+		}
+		return false
+	}
+
+	for {
+		// One bounded priority poll precedes the ordinary select. The actor still
+		// enters the ordinary select every iteration, so an empty priority lane has
+		// zero effect and a sustained control stream cannot exclude ordinary work.
+		select {
+		case cmd, ok := <-priorityCommands:
+			if !ok || handleCommand(cmd) {
+				return
 			}
-
+		default:
+		}
+		select {
+		case cmd, ok := <-priorityCommands:
+			if !ok || handleCommand(cmd) {
+				return
+			}
+		case cmd, ok := <-commands:
+			if !ok || handleCommand(cmd) {
+				return
+			}
 		case reg := <-gateReg:
 			callID := reg.toolExecutionID()
 			gateID, err := cfg.gates.PrepareGateOpen(ctx, state.id, reg.gate, reg.payload)
@@ -1528,10 +2081,327 @@ func runLoop(cfg loopConfig, state loopState) {
 
 		case req := <-snapshots:
 			// Committed-state query: the actor is the SOLE owner of loopState.msgs +
-			// turnIndex, so a consistent read is served from here. Reply a DEFENSIVE clone
-			// (its own backing array) so the caller can never alias or race the live slice
-			// the actor keeps appending to. reply is buffered(1); the send never blocks.
+			// turnIndex, so a consistent read is served from here. Reply a DEFENSIVE deep
+			// clone so the caller can never alias or race the live history the actor keeps
+			// appending to. reply is buffered(1); the send never blocks.
 			req.reply <- loopSnapshot{msgs: cloneMessages(state.msgs), turnIndex: state.turnIndex}
+
+		case req := <-contextRequests:
+			settings, configured := contextSettings(config)
+			if !configured || config.ContextCounter == nil {
+				req.reply <- contextMeasureReply{err: &contextConfigurationStateError{Detail: "counter or policy missing"}}
+				continue
+			}
+			basis := state.contextTracker.currentBasis()
+			generation := state.contextGeneration
+			go func(request contextMeasureRequest, admission contextAdmissionSettings, measuredBasis event.ContextBasis, measuredGeneration uint64) {
+				measurement, err := measureRequestContext(
+					request.ctx,
+					config.ContextCounter,
+					config.CounterCapability,
+					config.InferenceCapability,
+					admission,
+					measuredBasis,
+					request.request,
+					request.runtimeContextRevision,
+				)
+				result := contextCountResult{request: request, measurement: measurement, generation: measuredGeneration, err: err}
+				select {
+				case contextResults <- result:
+				case <-request.ctx.Done():
+				case <-ctx.Done():
+				}
+			}(req, settings, basis, generation)
+
+		case result := <-idleCompactionResults:
+			preparing := idleCompaction
+			if preparing == nil || preparing.attemptID != result.preparation.attemptID ||
+				preparing.basis != result.preparation.basis || preparing.generation != result.preparation.generation {
+				continue
+			}
+			preparing.cancel()
+			idleCompaction = nil
+			pending := compactions.pendingAttempt()
+			if pending == nil || pending.AttemptID != result.preparation.attemptID {
+				// A pre-start interrupt/shutdown already resolved the transient slot.
+				continue
+			}
+			if reason := compactions.cancellationRejectReason(); reason != event.CompactRejectUnspecified {
+				dispatchCompactionBoundary(compactionBoundaryTurn, nil)
+				continue
+			}
+			currentBasis := state.contextTracker.currentBasis()
+			if currentBasis != result.preparation.basis || state.contextGeneration != result.preparation.generation {
+				finalizeIdleCompactionRejection(result.preparation, event.CompactRejectStaleBasis)
+				continue
+			}
+			if result.err != nil {
+				finalizeIdleCompactionRejection(result.preparation, compactionRejectReason(result.err))
+				continue
+			}
+			settings, configured := contextSettings(config)
+			if !configured {
+				finalizeIdleCompactionRejection(result.preparation, event.CompactRejectInternal)
+				continue
+			}
+			nextTracker := state.contextTracker
+			tracking, err := nextTracker.apply(result.candidate.Measurement, settings)
+			if err != nil {
+				finalizeIdleCompactionRejection(result.preparation, event.CompactRejectInternal)
+				continue
+			}
+			if tracking.MeasurementChanged {
+				measured, stampErr := stamp(event.ContextMeasured{Measurement: result.candidate.Measurement})
+				if stampErr != nil {
+					reportCompactionFailure(pending.WaiterCommandIDs, stampErr)
+					compactions.abort(pending.AttemptID)
+					continue
+				}
+				if validateErr := event.ValidateEvent(measured); validateErr != nil {
+					reportCompactionFailure(pending.WaiterCommandIDs, validateErr)
+					compactions.abort(pending.AttemptID)
+					continue
+				}
+				if publishErr := cfg.events.PublishEventChecked(ctx, measured); publishErr != nil {
+					reportCompactionFailure(pending.WaiterCommandIDs, publishErr)
+					compactions.abort(pending.AttemptID)
+					continue
+				}
+			}
+			state.contextTracker = nextTracker
+			state.context = result.candidate.Measurement
+			state.hasContext = true
+			if tracking.PressureChanged {
+				publish(event.ContextPressure{
+					Measurement: result.candidate.Measurement, Occupancy: tracking.Occupancy,
+					Previous: tracking.Previous, Current: tracking.Current,
+				})
+			}
+			if err := compactions.freezeBasis(pending.AttemptID, result.preparation.basis); err != nil {
+				reportCompactionFailure(pending.WaiterCommandIDs, err)
+				continue
+			}
+			if dispatchCompactionBoundary(compactionBoundaryTurn, &result.candidate) {
+				awaitIdleCompaction(pending.AttemptID)
+			}
+
+		case result := <-contextResults:
+			reply := func(response contextMeasureReply) {
+				result.request.reply <- response
+			}
+			if result.err != nil {
+				reply(contextMeasureReply{err: result.err})
+				continue
+			}
+			currentBasis := state.contextTracker.currentBasis()
+			if result.measurement.Basis != currentBasis || result.generation != state.contextGeneration {
+				reply(contextMeasureReply{err: &staleContextMeasurementError{Measured: result.measurement.Basis, Current: currentBasis}})
+				continue
+			}
+			settings, configured := contextSettings(config)
+			if !configured {
+				reply(contextMeasureReply{err: &contextConfigurationStateError{Detail: "policy removed while counting"}})
+				continue
+			}
+			nextTracker := state.contextTracker
+			tracking, err := nextTracker.apply(result.measurement, settings)
+			if err != nil {
+				reply(contextMeasureReply{err: err})
+				continue
+			}
+			if tracking.MeasurementChanged {
+				measured, stampErr := stamp(event.ContextMeasured{Measurement: result.measurement})
+				if stampErr != nil {
+					reply(contextMeasureReply{err: stampErr})
+					continue
+				}
+				if validateErr := event.ValidateEvent(measured); validateErr != nil {
+					reply(contextMeasureReply{err: validateErr})
+					continue
+				}
+				if publishErr := cfg.events.PublishEventChecked(ctx, measured); publishErr != nil {
+					reply(contextMeasureReply{err: publishErr})
+					continue
+				}
+			}
+			state.contextTracker = nextTracker
+			state.context = result.measurement
+			state.hasContext = true
+			if tracking.PressureChanged {
+				publish(event.ContextPressure{
+					Measurement: result.measurement,
+					Occupancy:   tracking.Occupancy,
+					Previous:    tracking.Previous,
+					Current:     tracking.Current,
+				})
+			}
+			executionCandidate := compactionExecutionCandidate{
+				Measurement: result.measurement, Request: result.request.request,
+				RuntimeTail: result.request.runtimeTail, RuntimeRevision: result.request.runtimeContextRevision,
+				Transcript: cloneMessages(state.msgs),
+			}
+			if compactions.pendingAtBoundary() {
+				pending := compactions.pendingAttempt()
+				awaiter, canAwait := config.compactionSink.(contextCompactionAwaiter)
+				if pending == nil || !canAwait {
+					reply(contextMeasureReply{measurement: result.measurement, err: tracking.AdmissionError})
+					continue
+				}
+				if pending.Basis == (event.ContextBasis{}) {
+					if freezeErr := compactions.freezeBasis(pending.AttemptID, result.measurement.Basis); freezeErr != nil {
+						reply(contextMeasureReply{measurement: result.measurement, err: freezeErr})
+						continue
+					}
+				}
+				coordinated := false
+				dispatch := func() { coordinated = dispatchCompactionBoundary(compactionBoundaryStep, &executionCandidate) }
+				if config.beforeCompactionBoundary != nil {
+					config.beforeCompactionBoundary(compactionBoundaryStep)
+				}
+				if arbitrateCompactionBoundary(priorityCommands, handleCommand, dispatch) {
+					return
+				}
+				if coordinated {
+					reply(contextMeasureReply{measurement: result.measurement, attemptID: pending.AttemptID, awaiter: awaiter})
+					continue
+				}
+			}
+			if tracking.AdmissionError != nil {
+				reply(contextMeasureReply{measurement: result.measurement, err: tracking.AdmissionError})
+				continue
+			}
+			if !tracking.TriggerAutomatic {
+				reply(contextMeasureReply{measurement: result.measurement})
+				continue
+			}
+			awaiter, canAwait := config.compactionSink.(contextCompactionAwaiter)
+			if !canAwait {
+				if tracking.Current == event.PressureHardLimit {
+					reply(contextMeasureReply{measurement: result.measurement, err: &loop.ContextLimitError{Measurement: result.measurement}})
+				} else {
+					reply(contextMeasureReply{measurement: result.measurement})
+				}
+				continue
+			}
+			commandID, idErr := config.idGen()
+			if idErr != nil || commandID.IsZero() {
+				coordinationErr := &CompactionCoordinationError{Kind: CompactionCoordinationAttemptID, Cause: idErr}
+				reportCompactionFailure(nil, coordinationErr)
+				if tracking.Current == event.PressureHardLimit {
+					reply(contextMeasureReply{measurement: result.measurement, err: &loop.ContextLimitError{Measurement: result.measurement}})
+				} else {
+					reply(contextMeasureReply{measurement: result.measurement})
+				}
+				continue
+			}
+			automatic := command.Compact{
+				Header:      command.Header{CommandID: commandID, Agency: identity.AgencyMachine, CreatedAt: config.now()},
+				Coordinates: identity.Coordinates{SessionID: state.sessionID, LoopID: state.id},
+			}
+			admission, admissionErr := compactions.admit(automatic, config.idGen)
+			if admissionErr != nil {
+				reportCompactionFailure([]uuid.UUID{commandID}, admissionErr)
+				if tracking.Current == event.PressureHardLimit {
+					reply(contextMeasureReply{measurement: result.measurement, err: &loop.ContextLimitError{Measurement: result.measurement}})
+				} else {
+					reply(contextMeasureReply{measurement: result.measurement})
+				}
+				continue
+			}
+			if admission.Kind == compactionAdmissionLaneFull {
+				if laneErr := publishLaneFull(automatic, admission.AttemptID); laneErr != nil {
+					reportCompactionFailure([]uuid.UUID{commandID}, laneErr)
+				}
+				if tracking.Current == event.PressureHardLimit {
+					reply(contextMeasureReply{measurement: result.measurement, err: &loop.ContextLimitError{Measurement: result.measurement}})
+				} else {
+					reply(contextMeasureReply{measurement: result.measurement})
+				}
+				continue
+			}
+			if freezeErr := compactions.freezeBasis(admission.AttemptID, result.measurement.Basis); freezeErr != nil {
+				reportCompactionFailure([]uuid.UUID{commandID}, freezeErr)
+				if tracking.Current == event.PressureHardLimit {
+					reply(contextMeasureReply{measurement: result.measurement, err: &loop.ContextLimitError{Measurement: result.measurement}})
+				} else {
+					reply(contextMeasureReply{measurement: result.measurement})
+				}
+				continue
+			}
+			coordinated := false
+			dispatch := func() { coordinated = dispatchCompactionBoundary(compactionBoundaryStep, &executionCandidate) }
+			if config.beforeCompactionBoundary != nil {
+				config.beforeCompactionBoundary(compactionBoundaryStep)
+			}
+			if arbitrateCompactionBoundary(priorityCommands, handleCommand, dispatch) {
+				return
+			}
+			if !coordinated {
+				if tracking.Current == event.PressureHardLimit {
+					reply(contextMeasureReply{measurement: result.measurement, err: &loop.ContextLimitError{Measurement: result.measurement}})
+				} else {
+					reply(contextMeasureReply{measurement: result.measurement})
+				}
+				continue
+			}
+			reply(contextMeasureReply{measurement: result.measurement, attemptID: admission.AttemptID, awaiter: awaiter})
+
+		case outcome := <-contextOutcomes:
+			attempt := compactions.pendingAttempt()
+			if attempt == nil || attempt.AttemptID != outcome.attemptID {
+				outcome.reply <- contextCompactionOutcomeReply{err: &contextCompactionOutcomeError{AttemptID: outcome.attemptID}}
+				continue
+			}
+			if reason := compactions.cancellationRejectReason(); reason != event.CompactRejectUnspecified {
+				outcome.result = rejectedCompactionResult(reason)
+			}
+			settings, configured := contextSettings(config)
+			proposal := outcome.result.Proposal
+			disposition := outcome.result.Disposition
+			if validationErr := validateContextCompactionProposal(attempt, outcome.result); validationErr != nil {
+				proposal = compactionFinalizationProposal{RejectReason: event.CompactRejectInternal}
+				disposition = contextCompactionAwaitRejected
+			}
+			var replacementPlan *actorContextReplacement
+			if proposal.Success != nil {
+				plan, replacementErr := prepareActorContextReplacement(state, *attempt, proposal.Success, settings)
+				if replacementErr != nil {
+					var stale *StaleCompactionError
+					rejectReason := event.CompactRejectInternal
+					if errors.As(replacementErr, &stale) {
+						rejectReason = event.CompactRejectStaleBasis
+					}
+					proposal = compactionFinalizationProposal{RejectReason: rejectReason}
+					disposition = contextCompactionAwaitRejected
+				} else {
+					replacementPlan = &plan
+				}
+			}
+			terminal, finalizationErr := compactionFinalizations.Finalize(ctx, *attempt, proposal)
+			if finalizationErr != nil {
+				reportCompactionFailure(attempt.WaiterCommandIDs, finalizationErr)
+				outcome.reply <- contextCompactionOutcomeReply{err: finalizationErr}
+				continue
+			}
+			var turnReplacement *turnContextReplacement
+			if committed, ok := terminal.(event.CompactionCommitted); ok {
+				if replacementPlan == nil {
+					outcome.reply <- contextCompactionOutcomeReply{err: &contextCompactionOutcomeError{AttemptID: outcome.attemptID}}
+					continue
+				}
+				replacementPlan.apply(&state, committed)
+				turnReplacement = &turnContextReplacement{Summary: cloneUserMessage(committed.Summary)}
+			}
+			compactions.complete(outcome.attemptID)
+			rejection, rejected := terminal.(event.CompactionRejected)
+			if rejected && rejection.Reason == event.CompactionReasonAutomatic {
+				state.contextTracker.exhaustAutomatic(rejection.Basis, rejection.Reason, true)
+			}
+			retry := configured && settings.Automatic && rejected && rejection.Reason == event.CompactionReasonManual && rejection.Basis == state.contextTracker.currentBasis()
+			outcome.reply <- contextCompactionOutcomeReply{
+				disposition: disposition, replacement: turnReplacement,
+				continuationError: outcome.result.ContinuationError, rejectReason: rejection.RejectReason, retry: retry,
+			}
 
 		case result := <-admissions:
 			state.cancelAdmission = nil
@@ -1579,7 +2449,16 @@ func runLoop(cfg loopConfig, state loopState) {
 				emitLoopIdle()
 				continue
 			}
-			startTurnWithIDAndAdmission(turnID, next, result.release)
+			if _, err := startTurnWithIDAndAdmission(turnID, next, result.release, result.start); err != nil {
+				state.status = loopIdle
+				if next.rejectOnStartFailure {
+					rejectSubmit(next, event.RejectInternal)
+				} else {
+					returnEntry(next, event.CancelTurnFailed, uuid.UUID{})
+				}
+				returnQueuedInbox(event.CancelTurnFailed, uuid.UUID{})
+				emitLoopIdle()
+			}
 
 		case req := <-drains:
 			// Tool-continuation drain: pop + clear the inbox into draining and reply the
@@ -1589,32 +2468,63 @@ func runLoop(cfg loopConfig, state loopState) {
 			// drained entries are now in draining and are resolved either by their
 			// TurnFoldedInto commit (below) or by returnQueuedInbox on an abnormal
 			// terminal — never silently lost.
+			dispatch := func() { dispatchCompactionBoundary(compactionBoundaryStep, nil) }
+			if compactions.pendingAtBoundary() {
+				if config.beforeCompactionBoundary != nil {
+					config.beforeCompactionBoundary(compactionBoundaryStep)
+				}
+				if arbitrateCompactionBoundary(priorityCommands, handleCommand, dispatch) {
+					return
+				}
+			} else {
+				dispatch()
+			}
 			req.reply <- drainInbox()
 
 		case req := <-commits:
 			// Loop-owned incremental commit: the actor is the SOLE mutator of
-			// loopState.msgs. It appends the completed step group AND emits the
-			// Enduring StepDone (or TurnFoldedInto, for a fold) at the SAME point, so
-			// the event is never a lie (it always reflects already-committed history).
+			// loopState.msgs. It stamps and preflights the context mutation, durably
+			// commits StepDone (or TurnFoldedInto), then applies the matching live
+			// history/basis mutation. A later checkpoint error still reports whether
+			// the trigger committed, preserving live/restore equivalence.
 			// The turn goroutine is parked in cfg.commit while this runs, so the
 			// StepDone emitted here always follows that step's TokenDeltas on the
 			// fan-in. Ack last so the runner only resumes after the event is published.
-			state.msgs = append(state.msgs, req.commit.Messages...)
-			var boundaryErr error
-			if _, ok := req.commit.Event.(event.StepDone); ok {
-				boundaryErr = commitBoundary(req.commit.Event)
-			} else {
-				publish(req.commit.Event)
+			stampedBoundary, boundaryErr := stamp(req.commit.Event)
+			var mutation contextMutation
+			if boundaryErr == nil {
+				mutation, boundaryErr = preflightContextMutation(state.contextTracker, state.contextGeneration, stampedBoundary.EventHeader().EventID, contextMutationHistory)
+			}
+			committed := false
+			if boundaryErr == nil {
+				committed, boundaryErr = commitStampedContextBoundary(stampedBoundary)
+			}
+			if committed {
+				state.msgs = append(state.msgs, req.commit.Messages...)
+				mutation.commit(&state.contextTracker, &state.contextGeneration)
+				state.context = event.ContextMeasurement{}
+				state.hasContext = false
 			}
 			// A folded user message is now committed: resolve its draining entry (its
 			// TurnFoldedInto was just emitted), so the abnormal-terminal return path
 			// does not also return it. StepDone commits carry no inbox entry.
-			if fi, ok := req.commit.Event.(event.TurnFoldedInto); ok {
+			if fi, ok := req.commit.Event.(event.TurnFoldedInto); ok && committed {
 				removeDraining(fi.Cause.CommandID)
 			}
 			req.ack <- boundaryErr
 
 		case result := <-internal:
+			dispatch := func() { dispatchCompactionBoundary(compactionBoundaryTurn, nil) }
+			if compactions.pendingAtBoundary() {
+				if config.beforeCompactionBoundary != nil {
+					config.beforeCompactionBoundary(compactionBoundaryTurn)
+				}
+				if arbitrateCompactionBoundary(priorityCommands, handleCommand, dispatch) {
+					return
+				}
+			} else {
+				dispatch()
+			}
 			if handleTurnResult(result) {
 				return
 			}
@@ -1636,7 +2546,7 @@ func runLoop(cfg loopConfig, state loopState) {
 				// wedged there and would never have produced a terminal anyway.
 				select {
 				case result := <-internal:
-					if err := commitBoundary(result.terminal); err != nil {
+					if _, err := commitBoundary(result.terminal); err != nil {
 						slog.Error("turn boundary commit failed during loop cancellation", "error", err)
 					}
 				case <-time.After(config.DrainTimeout):

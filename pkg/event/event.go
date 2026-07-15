@@ -3,7 +3,9 @@ package event
 import (
 	"time"
 
+	"github.com/looprig/core/content"
 	"github.com/looprig/core/uuid"
+	"github.com/looprig/harness/pkg/hustle"
 	"github.com/looprig/harness/pkg/identity"
 )
 
@@ -22,6 +24,7 @@ type Event interface {
 	Scope() Scope
 	EndsTurn() bool // turn-terminal: the last event this turn's per-turn stream carries
 	EventHeader() Header
+	Visibility() EventVisibility
 }
 
 // Reply is an event that is the direct outcome of a command, delivered on the normal
@@ -55,6 +58,18 @@ const (
 	ScopeSession Scope = iota
 	ScopeLoop
 )
+
+// EventVisibility controls whether an event may enter ordinary product streams.
+// Public is deliberately zero so legacy records remain public and byte-stable.
+type EventVisibility uint8
+
+const (
+	Public EventVisibility = iota
+	Internal
+)
+
+// Valid reports whether visibility belongs to the closed durable domain.
+func (v EventVisibility) Valid() bool { return v == Public || v == Internal }
 
 // CancelReason explains why a queued input left the loop queue without
 // committing. It is carried by InputCancelled.
@@ -100,11 +115,18 @@ type Header struct {
 	// (per design §444-446); InputQueued and TurnRejected carry Cause.CommandID but
 	// NOT Cause.Agency.
 	Cause identity.Cause `json:"cause,omitzero"`
+
+	// EventVisibility is omitted for Public so pre-visibility journals remain a
+	// byte-for-byte fixed point. Internal events always persist the non-zero tag.
+	EventVisibility EventVisibility `json:"visibility,omitzero"`
 }
 
 // EventHeader returns the embedded Header so every event satisfies Event without
 // per-type boilerplate.
 func (h Header) EventHeader() Header { return h }
+
+// Visibility returns the event's durable product-delivery classification.
+func (h Header) Visibility() EventVisibility { return h.EventVisibility }
 
 // Subscription is the consumer-facing handle to a session event fan-in: the
 // read+teardown contract a TUI/CLI (or a future journal) depends on, independent
@@ -165,6 +187,45 @@ func (sessionScoped) Scope() Scope { return ScopeSession }
 type loopScoped struct{}
 
 func (loopScoped) Scope() Scope { return ScopeLoop }
+
+// HustleRunDescriptor is the secret-free identity and resolved runtime of one
+// invocation. Started events carry a zero Runtime; terminal events carry the
+// resolved runtime whenever model resolution succeeded.
+type HustleRunDescriptor struct {
+	Definition hustle.DefinitionDescriptor `json:"definition"`
+	RunID      hustle.RunID                `json:"run_id"`
+	Runtime    ModelRuntime                `json:"runtime,omitzero"`
+}
+
+// HustleStarted durably records ownership before scheduler eligibility.
+type HustleStarted struct {
+	enduring
+	sessionScoped
+	Header
+	Run HustleRunDescriptor `json:"run"`
+}
+
+// HustleCompleted durably records one successful terminal outcome.
+type HustleCompleted struct {
+	enduring
+	sessionScoped
+	Header
+	Run      HustleRunDescriptor `json:"run"`
+	Duration time.Duration       `json:"duration,omitzero"`
+	Usage    *content.Usage      `json:"usage,omitempty"`
+}
+
+// HustleFailed durably records one bounded, security-safe failure outcome.
+type HustleFailed struct {
+	enduring
+	sessionScoped
+	Header
+	Run        HustleRunDescriptor `json:"run"`
+	Duration   time.Duration       `json:"duration,omitzero"`
+	Stage      hustle.Stage        `json:"stage"`
+	ReasonCode hustle.ReasonCode   `json:"reason_code"`
+	Usage      *content.Usage      `json:"usage,omitempty"`
+}
 
 // TurnIndex identifies a turn within one loop. Each loop numbers its own turns
 // from 0; it is not unique across loops in a multi-loop session.
@@ -311,6 +372,9 @@ type LoopStarted struct {
 	enduring
 	loopScoped
 	Header
+	// Runtime is the initial resolved model identity, limits, and effort. It is
+	// durable so restore and catalog repair never consult a mutable catalog.
+	Runtime ModelRuntime `json:"runtime,omitzero"`
 	// ParentToolUseID is the durable provider tool-use id of the Subagent tool call
 	// that spawned this loop (content.ToolUseBlock.ID), empty for loops not spawned by
 	// a tool call (e.g. the primary/root). It is the durable carrier that correlates a
@@ -359,6 +423,9 @@ func (SessionStarted) isEvent()          {}
 func (SessionActive) isEvent()           {}
 func (SessionIdle) isEvent()             {}
 func (SessionStopped) isEvent()          {}
+func (HustleStarted) isEvent()           {}
+func (HustleCompleted) isEvent()         {}
+func (HustleFailed) isEvent()            {}
 func (RestoreStarted) isEvent()          {}
 func (RestoreDone) isEvent()             {}
 func (RestoreErrored) isEvent()          {}

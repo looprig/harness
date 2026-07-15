@@ -456,14 +456,23 @@ func TestChangeInferenceValidation(t *testing.T) {
 	llm := &recordingLLM{chunks: []content.Chunk{textChunk("ok")}}
 
 	tests := []struct {
-		name string
-		cmd  command.ChangeLoopInference
-		kind loop.ChangeErrorKind
+		name           string
+		cmd            command.ChangeLoopInference
+		kind           loop.ChangeErrorKind
+		wantKeyFailure bool
 	}{
 		{
 			name: "empty model name is invalid",
 			cmd:  command.ChangeLoopInference{Model: inference.Model{Name: ""}, SetModel: true},
 			kind: loop.ChangeInvalidModel,
+		},
+		{
+			name: "empty model provider is invalid",
+			cmd: command.ChangeLoopInference{Model: inference.Model{
+				APIFormat: inference.APIFormatOpenAI, BaseURL: "http://localhost:1234", Name: "routed",
+			}, SetModel: true},
+			kind:           loop.ChangeInvalidModel,
+			wantKeyFailure: true,
 		},
 		{
 			name: "unknown effort is invalid",
@@ -487,6 +496,12 @@ func TestChangeInferenceValidation(t *testing.T) {
 			if !errors.As(res.Err, &ce) || ce.Kind != tt.kind {
 				t.Fatalf("err = %v, want %s", res.Err, tt.kind)
 			}
+			if tt.wantKeyFailure {
+				var keyErr *inference.ModelKeyValidationError
+				if !errors.As(res.Err, &keyErr) || keyErr.Field != inference.ModelKeyFieldProvider {
+					t.Fatalf("err cause = %T %v, want *ModelKeyValidationError for Provider", res.Err, res.Err)
+				}
+			}
 			runOneTurn(t, l, rec, "turn1")
 			if countInferenceChanged(rec.events()) != 0 {
 				t.Fatalf("LoopInferenceChanged emitted for an invalid change")
@@ -495,18 +510,23 @@ func TestChangeInferenceValidation(t *testing.T) {
 	}
 }
 
-// faultingPublisher is a recording publisher that ALSO satisfies faultProbe, so the actor
-// probes it after emitting a change event. FaultErr returns a fixed fault, simulating a
-// required-durable-append failure (which the hub raises inline via ReportFault).
+// faultingPublisher rejects checked change publication without recording the event.
 type faultingPublisher struct {
 	*recordingPublisher
 	fault error
 }
 
-func (f *faultingPublisher) FaultErr() error { return f.fault }
+func (f *faultingPublisher) PublishEventChecked(ctx context.Context, value event.Event) error {
+	switch value.(type) {
+	case event.LoopModeChanged, event.LoopInferenceChanged:
+		return f.fault
+	default:
+		return f.recordingPublisher.PublishEventChecked(ctx, value)
+	}
+}
 
-// TestChangeNotAppliedOnDurableFault proves the fail-secure post-emit fault check: when the
-// change event's durable append faulted the session, the actor replies
+// TestChangeNotAppliedOnDurableFault proves the fail-secure checked append path: when the
+// change event's durable append fails, the actor replies
 // ChangeDurableAppendFailed and does NOT apply the change (the next turn keeps the old
 // effort).
 func TestChangeNotAppliedOnDurableFault(t *testing.T) {
@@ -523,6 +543,9 @@ func TestChangeNotAppliedOnDurableFault(t *testing.T) {
 	var ce *loop.ChangeError
 	if !errors.As(res.Err, &ce) || ce.Kind != loop.ChangeDurableAppendFailed {
 		t.Fatalf("err = %v, want ChangeDurableAppendFailed", res.Err)
+	}
+	if got := countInferenceChanged(fp.events()); got != 0 {
+		t.Fatalf("LoopInferenceChanged events after checked publication failure = %d, want 0", got)
 	}
 	// The change was NOT applied: the next turn runs under the ORIGINAL (unset) effort.
 	runOneTurn(t, l, fp.recordingPublisher, "turn1")
@@ -558,8 +581,10 @@ func TestNewRestoredSeedsModeAndInference(t *testing.T) {
 			wantEffort: inference.EffortHigh,
 		},
 		{
-			name:       "restored mode plus inference override",
-			seed:       RestoredState{HasMode: true, Mode: "plan", HasInference: true, Model: swapTestModel("routed"), Effort: inference.EffortMax},
+			name: "restored mode plus inference override",
+			seed: RestoredState{HasMode: true, Mode: "plan", HasRuntime: true, Runtime: event.ModelRuntime{
+				Key: swapTestModel("routed").Key(), Effort: inference.EffortMax,
+			}},
 			wantSystem: "base\n\nplan-i",
 			wantModel:  "routed",
 			wantEffort: inference.EffortMax,
@@ -581,12 +606,7 @@ func TestNewRestoredSeedsModeAndInference(t *testing.T) {
 			ctx, cancel := context.WithCancel(context.Background())
 			t.Cleanup(cancel)
 			rec := &recordingPublisher{}
-			seed := tt.seed
-			if seed.HasInference {
-				// The fold bakes effort into the model's Sampling.Effort, mirroring the actor.
-				seed.Model.Sampling.Effort = seed.Effort
-			}
-			l, err := NewRestored(ctx, mustID(t), mustID(t), Provenance{}, rec, bound, seed)
+			l, err := NewRestored(ctx, mustID(t), mustID(t), Provenance{}, rec, bound, tt.seed)
 			if err != nil {
 				t.Fatalf("NewRestored: %v", err)
 			}

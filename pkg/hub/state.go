@@ -3,9 +3,9 @@ package hub
 import (
 	"errors"
 
+	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/identity"
-	"github.com/looprig/core/uuid"
 )
 
 // SessionPhase is the coarse quiescence phase of the whole session. SessionIdle is
@@ -23,13 +23,14 @@ const (
 // with no additional context fields.
 var ErrSessionStopped = errors.New("hub: session stopped")
 
-// activityKind distinguishes the two kinds of outstanding work so a busy loop and
-// a pending hand-back for the same uuid coexist as distinct set entries.
+// activityKind distinguishes outstanding work so a busy loop, a pending hand-back,
+// and a blocking hustle with the same uuid coexist as distinct set entries.
 type activityKind uint8
 
 const (
-	kindLoop activityKind = iota // {loop, LoopID}: a busy loop
-	kindWake                     // {wake, subagentLoopID}: a pending hand-back
+	kindLoop   activityKind = iota // {loop, LoopID}: a busy loop
+	kindWake                       // {wake, subagentLoopID}: a pending hand-back
+	kindHustle                     // {hustle, RunID}: a blocking one-shot invocation
 )
 
 // activityKey is the set key for one outstanding unit of work. Keying on {kind, id}

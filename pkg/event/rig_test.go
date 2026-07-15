@@ -15,17 +15,17 @@ func TestRigEventsRoundTrip(t *testing.T) {
 	sessionID, loopID, previousLoopID, activeLoopID := vID(t), vID(t), vID(t), vID(t)
 	sessionHeader := event.Header{Coordinates: identity.Coordinates{SessionID: sessionID}, EventID: vID(t)}
 	loopHeader := event.Header{Coordinates: identity.Coordinates{SessionID: sessionID, LoopID: loopID}, EventID: vID(t)}
-	model := inference.CustomModel("openai", "responses", "https://api.openai.com", "gpt-5")
+	runtime := event.ModelRuntime{Key: inference.ModelKey{Provider: "openai", Model: "gpt-5"}, Limits: inference.ContextLimits{WindowTokens: 128_000}, Effort: inference.EffortHigh}
 	tests := []struct {
 		name string
 		ev   event.Event
 	}{
 		{"active loop", event.ActiveLoopChanged{Header: sessionHeader, PreviousLoopID: previousLoopID, ActiveLoopID: activeLoopID}},
-		{"loop inference", event.LoopInferenceChanged{Header: loopHeader, Model: model, Effort: inference.EffortHigh}},
-		{"loop mode", event.LoopModeChanged{Header: loopHeader, PreviousMode: "plan", Mode: "build"}},
+		{"loop inference", event.LoopInferenceChanged{Header: loopHeader, Runtime: runtime}},
+		{"loop mode", event.LoopModeChanged{Header: loopHeader, PreviousMode: "plan", Mode: "build", Runtime: runtime}},
 		{"workspace restored", event.WorkspaceRestored{Header: sessionHeader, Ref: "v1:sha256:restored"}},
 		{"workspace checkpoint", event.WorkspaceCheckpointed{Header: sessionHeader, Ref: "v1:sha256:checkpoint", Consistency: event.SnapshotQuiescent, Trigger: event.SnapshotTriggerManual}},
-		{"loop started initial mode", event.LoopStarted{Header: loopHeader, InitialMode: "plan"}},
+		{"loop started initial mode", event.LoopStarted{Header: loopHeader, InitialMode: "plan", Runtime: runtime}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -48,22 +48,17 @@ func TestLoopInferenceChangedValidation(t *testing.T) {
 	t.Parallel()
 	sessionID, loopID := vID(t), vID(t)
 	h := event.Header{Coordinates: identity.Coordinates{SessionID: sessionID, LoopID: loopID}, EventID: vID(t)}
-	validModel := inference.CustomModel("test", "test", "", "model")
-	catalogModel := validModel
-	catalogModel.Origin = inference.OriginCatalog
-	maxSamplingModel := validModel
-	maxSamplingModel.Sampling.Effort = inference.EffortMax
+	validRuntime := event.ModelRuntime{Key: inference.ModelKey{Provider: "test", Model: "model"}, Limits: inference.ContextLimits{WindowTokens: 128_000}}
 	tests := []struct {
 		name      string
 		ev        event.LoopInferenceChanged
 		wantField event.FieldName
 	}{
-		{name: "custom origin and unset efforts", ev: event.LoopInferenceChanged{Header: h, Model: validModel, Effort: inference.EffortNone}},
-		{name: "catalog origin", ev: event.LoopInferenceChanged{Header: h, Model: catalogModel, Effort: inference.EffortHigh}},
-		{name: "maximum model sampling and event effort", ev: event.LoopInferenceChanged{Header: h, Model: maxSamplingModel, Effort: inference.EffortMax}},
-		{name: "invalid origin", ev: event.LoopInferenceChanged{Header: h, Model: func() inference.Model { m := validModel; m.Origin = inference.Origin(2); return m }()}, wantField: event.FieldModel},
-		{name: "invalid model sampling effort", ev: event.LoopInferenceChanged{Header: h, Model: func() inference.Model { m := validModel; m.Sampling.Effort = inference.Effort("extreme"); return m }()}, wantField: event.FieldModel},
-		{name: "invalid event effort", ev: event.LoopInferenceChanged{Header: h, Model: validModel, Effort: inference.Effort("extreme")}, wantField: event.FieldEffort},
+		{name: "valid runtime", ev: event.LoopInferenceChanged{Header: h, Runtime: validRuntime}},
+		{name: "maximum effort", ev: event.LoopInferenceChanged{Header: h, Runtime: event.ModelRuntime{Key: validRuntime.Key, Limits: validRuntime.Limits, Effort: inference.EffortMax}}},
+		{name: "invalid model key", ev: event.LoopInferenceChanged{Header: h, Runtime: event.ModelRuntime{Key: inference.ModelKey{Provider: "test"}}}, wantField: event.FieldModelKey},
+		{name: "invalid limits", ev: event.LoopInferenceChanged{Header: h, Runtime: event.ModelRuntime{Key: validRuntime.Key, Limits: inference.ContextLimits{WindowTokens: 10, MaxOutputTokens: 11}}}, wantField: event.FieldContextLimits},
+		{name: "invalid effort", ev: event.LoopInferenceChanged{Header: h, Runtime: event.ModelRuntime{Key: validRuntime.Key, Effort: inference.Effort("extreme")}}, wantField: event.FieldEffort},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -85,27 +80,27 @@ func TestLoopInferenceChangedValidation(t *testing.T) {
 	}
 }
 
-func TestLoopInferenceChangedRejectsMalformedWireDescriptor(t *testing.T) {
+func TestLoopInferenceChangedRejectsMalformedWireRuntime(t *testing.T) {
 	t.Parallel()
 	sessionID, loopID := vID(t), vID(t)
 	h := event.Header{Coordinates: identity.Coordinates{SessionID: sessionID, LoopID: loopID}, EventID: vID(t)}
-	validModel := inference.CustomModel("test", "test", "", "model")
-	invalidOrigin := validModel
-	invalidOrigin.Origin = inference.Origin(255)
-	invalidSampling := validModel
-	invalidSampling.Sampling.Effort = inference.Effort("invalid")
-	for _, model := range []inference.Model{invalidOrigin, invalidSampling} {
-		data, err := event.MarshalEvent(event.LoopInferenceChanged{Header: h, Model: model})
-		if err != nil {
-			t.Fatalf("MarshalEvent malformed fixture: %v", err)
-		}
+	tests := []struct {
+		name  string
+		wire  string
+		field event.FieldName
+	}{
+		{name: "missing key", wire: `{"key":{"Provider":"test"},"limits":{}}`, field: event.FieldModelKey},
+		{name: "invalid effort", wire: `{"key":{"Provider":"test","Model":"model"},"limits":{},"effort":"invalid"}`, field: event.FieldEffort},
+	}
+	for _, tt := range tests {
+		data := []byte(`{"type":"LoopInferenceChanged","v":1,"session_id":"` + h.SessionID.String() + `","loop_id":"` + h.LoopID.String() + `","event_id":"` + h.EventID.String() + `","runtime":` + tt.wire + `}`)
 		got, err := event.UnmarshalEvent(data)
 		if got != nil {
 			t.Errorf("UnmarshalEvent returned %#v on error", got)
 		}
 		var invalid *event.InvalidEventError
-		if !errors.As(err, &invalid) || invalid.Field != event.FieldModel || invalid.Rule != event.RuleInvalid {
-			t.Errorf("UnmarshalEvent error = %T %+v, want InvalidEventError Model/is invalid", err, err)
+		if !errors.As(err, &invalid) || invalid.Field != tt.field || invalid.Rule != event.RuleInvalid {
+			t.Errorf("UnmarshalEvent error = %T %+v, want InvalidEventError %s/is invalid", err, err, tt.field)
 		}
 	}
 }

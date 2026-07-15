@@ -35,9 +35,10 @@ type JournalPage struct {
 // in-process session — so any pod can serve a read and no live session need exist.
 //
 //   - ListSessions returns a stable-sorted, offset-paged slice of session summaries.
-//   - ReadStatus returns one session's projected status (no replay). It returns a
-//     SessionNotFoundError when the session has no catalog entry.
-//   - ReadJournal returns a cursor-paged slice of a session's Enduring events.
+//   - ReadStatus returns one session's public projected status (no replay). It
+//     returns a SessionNotFoundError when the session has no catalog entry.
+//   - ReadJournal returns a cursor-paged slice of the session's public Enduring
+//     events. Serve validates both event-bearing results again before writing.
 type Reader interface {
 	ListSessions(ctx context.Context, page Page) (SessionList, error)
 	ReadStatus(ctx context.Context, id uuid.UUID) (SessionStatus, error)
@@ -97,6 +98,9 @@ type statusEventWire struct {
 func (s StatusEvent) MarshalJSON() ([]byte, error) {
 	w := statusEventWire{JournalSeq: s.JournalSeq}
 	if s.Event != nil {
+		if err := validateStatusEvent(s); err != nil {
+			return nil, err
+		}
 		raw, err := event.MarshalEvent(s.Event)
 		if err != nil {
 			return nil, err

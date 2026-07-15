@@ -3,14 +3,14 @@ package event_test
 import (
 	"testing"
 
+	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/identity"
-	"github.com/looprig/core/uuid"
 )
 
 // TestReplyImplementations pins WHICH events are Reply (the direct, typed outcome
 // of a command, recognised by ReplyTo() == the issuer's command id). Exactly the
-// five submit-resolution events implement it; ReplyTo() must return the embedded
+// seven command-resolution events implement it; ReplyTo() must return the embedded
 // Header.Cause.CommandID verbatim. Any other event MUST NOT be a Reply, so the set
 // stays sealed to the command-outcome events.
 func TestReplyImplementations(t *testing.T) {
@@ -27,6 +27,8 @@ func TestReplyImplementations(t *testing.T) {
 		{"TurnRejected", event.TurnRejected{Header: event.Header{Cause: identity.Cause{CommandID: causationID}}}},
 		{"TurnFoldedInto", event.TurnFoldedInto{Header: event.Header{Cause: identity.Cause{CommandID: causationID}}}},
 		{"InputCancelled", event.InputCancelled{Header: event.Header{Cause: identity.Cause{CommandID: causationID}}}},
+		{"CompactWaiterResolved", event.CompactWaiterResolved{Header: event.Header{Cause: identity.Cause{CommandID: causationID}}}},
+		{"CompactWaiterRejected", event.CompactWaiterRejected{Header: event.Header{Cause: identity.Cause{CommandID: causationID}}}},
 	}
 	for _, tt := range isReply {
 		tt := tt
@@ -54,6 +56,9 @@ func TestReplyImplementations(t *testing.T) {
 		{"SessionStarted", event.SessionStarted{}},
 		{"LoopIdle", event.LoopIdle{}},
 		{"ToolCallStarted", event.ToolCallStarted{}},
+		{"CompactionStarted", event.CompactionStarted{}},
+		{"CompactionCommitted", event.CompactionCommitted{}},
+		{"CompactionRejected", event.CompactionRejected{}},
 	}
 	for _, tt := range notReply {
 		tt := tt
@@ -112,4 +117,6 @@ var (
 	_ event.Reply = event.TurnRejected{}
 	_ event.Reply = event.TurnFoldedInto{}
 	_ event.Reply = event.InputCancelled{}
+	_ event.Reply = event.CompactWaiterResolved{}
+	_ event.Reply = event.CompactWaiterRejected{}
 )

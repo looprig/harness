@@ -9,6 +9,7 @@ import (
 
 	"github.com/looprig/core/content"
 	"github.com/looprig/core/uuid"
+	"github.com/looprig/harness/pkg/hustle"
 	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/tool"
 	"github.com/looprig/inference"
@@ -183,14 +184,14 @@ func TestEventBodyJSONKeysAreStableSnakeCase(t *testing.T) {
 			wantKeys: []string{"previous_loop_id", "active_loop_id"},
 		},
 		{
-			name:     "LoopInferenceChanged carries model and effort",
-			event:    LoopInferenceChanged{Header: hdr, Model: inference.CustomModel("test", "test", "", "model"), Effort: inference.EffortHigh},
-			wantKeys: []string{"model", "effort"},
+			name:     "LoopInferenceChanged carries resolved runtime",
+			event:    LoopInferenceChanged{Header: hdr, Runtime: sampleRuntime()},
+			wantKeys: []string{"runtime"},
 		},
 		{
 			name:     "LoopModeChanged carries previous and selected modes",
-			event:    LoopModeChanged{Header: hdr, PreviousMode: "plan", Mode: "build"},
-			wantKeys: []string{"previous_mode", "mode"},
+			event:    LoopModeChanged{Header: hdr, PreviousMode: "plan", Mode: "build", Runtime: sampleRuntime()},
+			wantKeys: []string{"previous_mode", "mode", "runtime"},
 		},
 		{
 			name:     "WorkspaceCheckpointed carries snapshot metadata",
@@ -204,8 +205,8 @@ func TestEventBodyJSONKeysAreStableSnakeCase(t *testing.T) {
 		},
 		{
 			name:     "LoopStarted carries initial mode",
-			event:    LoopStarted{Header: hdr, InitialMode: "plan"},
-			wantKeys: []string{"initial_mode"},
+			event:    LoopStarted{Header: hdr, InitialMode: "plan", Runtime: sampleRuntime()},
+			wantKeys: []string{"initial_mode", "runtime"},
 		},
 	}
 
@@ -351,6 +352,35 @@ func sampleMessages() content.AgenticMessages {
 	}
 }
 
+func sampleRuntime() ModelRuntime {
+	return ModelRuntime{
+		Key:    inference.ModelKey{Provider: "openai", Model: "gpt-5"},
+		Limits: inference.ContextLimits{WindowTokens: 128_000, MaxOutputTokens: 16_384},
+		Effort: inference.EffortHigh,
+	}
+}
+
+func exhaustiveHustleDescriptor() hustle.DefinitionDescriptor {
+	var promptSHA [32]byte
+	promptSHA[0] = 1
+	return hustle.DefinitionDescriptor{
+		Name: "exhaustive", Participation: hustle.ParticipationBlocking,
+		ModelSource: hustle.ModelSourceCurrentLoop, PromptRevision: "prompt-v1",
+		PromptSHA256: promptSHA, PolicyRevision: "policy-v1", TimeoutNanos: int64(time.Second),
+		Limits: hustle.Limits{InputBytes: 1, OutputBytes: 1},
+	}
+}
+
+func exhaustiveHustleHeader() Header {
+	header := fullHeaderSession()
+	header.EventVisibility = Internal
+	return header
+}
+
+func exhaustiveHustleRun(runtime ModelRuntime) HustleRunDescriptor {
+	return HustleRunDescriptor{Definition: exhaustiveHustleDescriptor(), RunID: hustle.RunID(seededUUID(0x92)), Runtime: runtime}
+}
+
 // TestMarshalEventRoundTripEnduring is the exhaustive fidelity table: one instance
 // of every Enduring event type round-trips through MarshalEvent/UnmarshalEvent
 // deep-equal to the original. TurnFailed.Err and RestoreErrored.Err are compared
@@ -372,6 +402,9 @@ func TestMarshalEventRoundTripEnduring(t *testing.T) {
 		{"SessionActive", SessionActive{Header: fullHeaderSession()}},
 		{"SessionIdle", SessionIdle{Header: fullHeaderSession()}},
 		{"SessionStopped", SessionStopped{Header: fullHeaderSession()}},
+		{"HustleStarted", HustleStarted{Header: exhaustiveHustleHeader(), Run: exhaustiveHustleRun(ModelRuntime{})}},
+		{"HustleCompleted", HustleCompleted{Header: exhaustiveHustleHeader(), Run: exhaustiveHustleRun(sampleRuntime()), Duration: time.Second, Usage: &content.Usage{InputTokens: 2, OutputTokens: 1}}},
+		{"HustleFailed", HustleFailed{Header: exhaustiveHustleHeader(), Run: exhaustiveHustleRun(sampleRuntime()), Duration: time.Second, Stage: hustle.StageInference, ReasonCode: hustle.ReasonInference, Usage: &content.Usage{InputTokens: 2, OutputTokens: 1}}},
 		{"RestoreStarted", RestoreStarted{Header: fullHeaderSession()}},
 		{"RestoreDone", RestoreDone{Header: fullHeaderSession()}},
 		{"WorkspaceCheckpointed", WorkspaceCheckpointed{
@@ -389,14 +422,14 @@ func TestMarshalEventRoundTripEnduring(t *testing.T) {
 		{"SecurityCeilingChanged zero", SecurityCeilingChanged{Header: fullHeaderSession()}},
 		// RestoreErrored.Err handled in the dedicated err-projection test below.
 		{"LoopIdle", LoopIdle{Header: fullHeaderLoop()}},
-		{"LoopStarted", LoopStarted{Header: fullHeaderLoop()}},
-		{"LoopStarted with AgentName", LoopStarted{Header: loopHeaderWithAgent("operator")}},
-		{"LoopStarted with ParentToolUseID", LoopStarted{Header: fullHeaderLoop(), ParentToolUseID: "toolu_abc123"}},
-		{"LoopStarted with ForeignSID", LoopStarted{Header: fullHeaderLoop(), ForeignSID: "11111111-1111-1111-1111-111111111111"}},
-		{"LoopStarted with InitialMode", LoopStarted{Header: fullHeaderLoop(), InitialMode: "plan"}},
+		{"LoopStarted", LoopStarted{Header: fullHeaderLoop(), Runtime: sampleRuntime()}},
+		{"LoopStarted with AgentName", LoopStarted{Header: loopHeaderWithAgent("operator"), Runtime: sampleRuntime()}},
+		{"LoopStarted with ParentToolUseID", LoopStarted{Header: fullHeaderLoop(), ParentToolUseID: "toolu_abc123", Runtime: sampleRuntime()}},
+		{"LoopStarted with ForeignSID", LoopStarted{Header: fullHeaderLoop(), ForeignSID: "11111111-1111-1111-1111-111111111111", Runtime: sampleRuntime()}},
+		{"LoopStarted with InitialMode", LoopStarted{Header: fullHeaderLoop(), InitialMode: "plan", Runtime: sampleRuntime()}},
 		{"DelegateRequestAccepted", DelegateRequestAccepted{Header: eventHeaderWithCommand(fullHeaderLoop(), seededUUID(0x66))}},
-		{"LoopInferenceChanged", LoopInferenceChanged{Header: fullHeaderLoop(), Model: inference.CustomModel("openai", "responses", "https://api.openai.com", "gpt-5"), Effort: inference.EffortHigh}},
-		{"LoopModeChanged", LoopModeChanged{Header: fullHeaderLoop(), PreviousMode: "plan", Mode: "build"}},
+		{"LoopInferenceChanged", LoopInferenceChanged{Header: fullHeaderLoop(), Runtime: sampleRuntime()}},
+		{"LoopModeChanged", LoopModeChanged{Header: fullHeaderLoop(), PreviousMode: "plan", Mode: "build", Runtime: sampleRuntime()}},
 		{"ForeignSessionBound", ForeignSessionBound{Header: fullHeaderLoop(), ForeignSID: "sid"}},
 		{"TurnStarted", TurnStarted{Header: fullHeaderTurn(), TurnIndex: 7, Message: userMsg("hi")}},
 		{"StepDone", StepDone{Header: fullHeader(), Messages: sampleMessages()}},
@@ -675,7 +708,7 @@ func TestMarshalEventPermissionRequestedFullRequest(t *testing.T) {
 // without codec coverage changes the live count derived from classify+Class() and
 // fails TestMarshalEventCoversEveryEnduringType. A missed Enduring type is an
 // unpersistable event = silent restore data loss, which this guard forbids.
-const wantEnduringTypes = 28
+const wantEnduringTypes = 35
 
 // unionInstances is one instance of EVERY type in the sealed union (Enduring and
 // Ephemeral alike), mirroring TestClassifyExhaustive. The drift guard partitions
@@ -684,9 +717,13 @@ const wantEnduringTypes = 28
 func unionInstances() []Event {
 	return []Event{
 		SessionStarted{}, SessionActive{}, SessionIdle{}, SessionStopped{},
+		HustleStarted{Header: exhaustiveHustleHeader(), Run: exhaustiveHustleRun(ModelRuntime{})},
+		HustleCompleted{Header: exhaustiveHustleHeader(), Run: exhaustiveHustleRun(sampleRuntime())},
+		HustleFailed{Header: exhaustiveHustleHeader(), Run: exhaustiveHustleRun(sampleRuntime()), Stage: hustle.StageInference, ReasonCode: hustle.ReasonInference},
 		RestoreStarted{}, RestoreDone{}, RestoreErrored{}, WorkspaceCheckpointed{}, WorkspaceRestored{}, ActiveLoopChanged{},
 		SecurityCeilingChanged{},
 		LoopIdle{}, LoopStarted{}, DelegateRequestAccepted{}, LoopInferenceChanged{}, LoopModeChanged{}, ForeignSessionBound{},
+		CompactionStarted{}, CompactionCommitted{}, CompactionRejected{}, CompactWaiterResolved{}, CompactWaiterRejected{},
 		TokenDelta{}, TurnStarted{}, StepDone{}, TurnFoldedInto{}, InputCancelled{},
 		InputQueued{}, TurnRejected{}, TurnDone{}, TurnFailed{}, TurnInterrupted{},
 		PermissionRequested{}, PermissionDecided{}, UserInputRequested{}, ToolCallStarted{}, ToolCallCompleted{},
@@ -815,10 +852,10 @@ func TestUnmarshalEventRejectsMalformed(t *testing.T) {
 func FuzzDecodeEvent(f *testing.F) {
 	seedEvents := []Event{
 		SessionStarted{Header: fullHeaderSession(), Config: ConfigFingerprint{ModelID: "m"}},
-		LoopStarted{Header: fullHeaderLoop()},
+		LoopStarted{Header: fullHeaderLoop(), Runtime: sampleRuntime()},
 		ActiveLoopChanged{Header: fullHeaderSession(), ActiveLoopID: seededUUID(0x76)},
-		LoopInferenceChanged{Header: fullHeaderLoop(), Model: inference.CustomModel("test", "test", "", "model")},
-		LoopModeChanged{Header: fullHeaderLoop(), PreviousMode: "plan", Mode: "build"},
+		LoopInferenceChanged{Header: fullHeaderLoop(), Runtime: sampleRuntime()},
+		LoopModeChanged{Header: fullHeaderLoop(), PreviousMode: "plan", Mode: "build", Runtime: sampleRuntime()},
 		WorkspaceCheckpointed{Header: checkpointHeader(), Ref: "v1:sha256:x", Consistency: SnapshotFuzzy, Trigger: SnapshotTriggerManual},
 		WorkspaceRestored{Header: fullHeaderSession(), Ref: "v1:sha256:x"},
 		TurnStarted{Header: fullHeaderTurn(), TurnIndex: 1, Message: userMsg("hi")},

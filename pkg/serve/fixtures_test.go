@@ -248,8 +248,10 @@ func produceStatusRunning(t *testing.T) []byte {
 		LastJournalSeq: 7,
 		ActiveTurnID:   parseTestUUID(t, fixTurnID),
 		LastTurn:       &StatusEvent{JournalSeq: 7, Event: event.TurnDone{TurnIndex: 1}},
-		LastStep:       &StatusEvent{JournalSeq: 6, Event: event.StepDone{}},
-		UpdatedAt:      fixedInstant,
+		LastStep: &StatusEvent{JournalSeq: 6, Event: event.StepDone{Messages: content.AgenticMessages{
+			&content.AIMessage{Message: content.Message{Role: content.RoleAssistant}},
+		}}},
+		UpdatedAt: fixedInstant,
 	}
 	reader := &fakeReader{status: status}
 	srv := newServer[*fakeSession, fakeSessionOption](&fakeRig{}, reader, newConfig())

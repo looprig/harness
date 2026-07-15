@@ -1,5 +1,10 @@
 # Hustle Mechanism Implementation Plan
 
+> **Status:** Superseded by
+> `docs/plans/2026-07-12-hustle-token-compaction-implementation.md`. Do not
+> execute this partial plan: it predates the required core/inference/LLM
+> foundations, public manual compaction path, CLI restore reducer, and SWE wiring.
+
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
 **Goal:** Add bounded, session-owned, one-shot inference hustles and integrate the first `context.compact` consumer without turning hustles into loops.

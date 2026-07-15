@@ -70,6 +70,27 @@ func stampLoopHeader(ev event.Event, sessionID, loopID, turnID uuid.UUID) event.
 	case event.LoopInferenceChanged:
 		e.Header = fillLoopScoped(e.Header, sessionID, loopID)
 		return e
+	case event.ContextMeasured:
+		e.Header = fillLoopScoped(e.Header, sessionID, loopID)
+		return e
+	case event.ContextPressure:
+		e.Header = fillLoopScoped(e.Header, sessionID, loopID)
+		return e
+	case event.CompactionStarted:
+		e.Header = fillLoopScoped(e.Header, sessionID, loopID)
+		return e
+	case event.CompactionCommitted:
+		e.Header = fillLoopScoped(e.Header, sessionID, loopID)
+		return e
+	case event.CompactionRejected:
+		e.Header = fillLoopScoped(e.Header, sessionID, loopID)
+		return e
+	case event.CompactWaiterResolved:
+		e.Header = fillLoopScoped(e.Header, sessionID, loopID)
+		return e
+	case event.CompactWaiterRejected:
+		e.Header = fillLoopScoped(e.Header, sessionID, loopID)
+		return e
 	case event.InputQueued:
 		// Loop-scoped reply event: no turn exists yet (the input is only queued), so
 		// fill SessionID/LoopID and PRESERVE the producer-set Cause.CommandID == InputID.
@@ -93,12 +114,9 @@ func stampLoopHeader(ev event.Event, sessionID, loopID, turnID uuid.UUID) event.
 // write-back counterpart to stampLoopHeader: the publish chokepoint reads an
 // event's Header (already coordinate-stamped), mints its persistence identity
 // (EventID + CreatedAt) via the Factory, then writes the completed Header back
-// through here. It enumerates ONLY the ENDURING loop-event types — the only events
-// the chokepoint stamps; an Ephemeral or session-scoped event never reaches this
-// path, so the default returns ev unchanged (the sealed event interface has no
-// generic Header setter). The switch must list every Enduring loop event the loop
-// publishes; a missing case would silently drop the minted identity (default arm),
-// so a new Enduring loop event MUST be added here.
+// through here. It enumerates the ENDURING loop-event types plus the deliberately
+// factory-stamped low-volume CompactionStarted progress event. Other Ephemeral and
+// session-scoped events never reach this path, so the default returns ev unchanged.
 func withLoopHeader(ev event.Event, h event.Header) event.Event {
 	switch e := ev.(type) {
 	case event.TurnStarted:
@@ -120,6 +138,9 @@ func withLoopHeader(ev event.Event, h event.Header) event.Event {
 		e.Header = h
 		return e
 	case event.LoopInferenceChanged:
+		e.Header = h
+		return e
+	case event.ContextMeasured:
 		e.Header = h
 		return e
 	case event.TurnRejected:
@@ -146,9 +167,47 @@ func withLoopHeader(ev event.Event, h event.Header) event.Event {
 	case event.UserInputRequested:
 		e.Header = h
 		return e
+	case event.CompactionStarted:
+		e.Header = h
+		return e
+	case event.CompactionCommitted:
+		e.Header = h
+		return e
+	case event.CompactionRejected:
+		e.Header = h
+		return e
+	case event.CompactWaiterResolved:
+		e.Header = h
+		return e
+	case event.CompactWaiterRejected:
+		e.Header = h
+		return e
 	default:
 		return ev
 	}
+}
+
+func stampLoopEvent(ev event.Event, factory *event.Factory, sessionID, loopID, turnID uuid.UUID) (event.Event, error) {
+	stamped := stampLoopHeader(ev, sessionID, loopID, turnID)
+	if stamped.Class() != event.Enduring {
+		if _, ok := stamped.(event.CompactionStarted); !ok {
+			return stamped, nil
+		}
+	}
+	var h event.Header
+	var err error
+	switch value := stamped.(type) {
+	case event.CompactWaiterResolved:
+		h, err = factory.StampCompactWaiterResolved(value)
+	case event.CompactWaiterRejected:
+		h, err = factory.StampCompactWaiterRejected(value)
+	default:
+		h, err = factory.Stamp(stamped.EventHeader())
+	}
+	if err != nil {
+		return nil, err
+	}
+	return withLoopHeader(stamped, h), nil
 }
 
 // fillLoopScoped ensures SessionID + LoopID are present without disturbing the

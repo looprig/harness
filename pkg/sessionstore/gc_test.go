@@ -87,9 +87,9 @@ func putOrphans(t *testing.T, st *Store, id uuid.UUID, m int) []string {
 // *BlobUnavailableError).
 func assertReplayResolves(t *testing.T, st *Store, id uuid.UUID) {
 	t.Helper()
-	rr, err := st.OpenRecordReplayer(id, ReplayRequest{})
+	rr, err := st.OpenInternalRecordReplayer(id, ReplayRequest{})
 	if err != nil {
-		t.Fatalf("OpenRecordReplayer() err = %v", err)
+		t.Fatalf("OpenInternalRecordReplayer() err = %v", err)
 	}
 	cur, err := rr.Open(context.Background(), journal.ReplayRequest{})
 	if err != nil {

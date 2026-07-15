@@ -51,11 +51,25 @@ func resolveMode(bound loop.BoundDefinition, modeName loop.ModeName) (runtimeCon
 	}
 	model := mode.Model
 	limits := mode.ToolLimits
-	return runtimeConfig{
+	resolved := runtimeConfig{
 		Client: bound.Client(), Model: model, System: loop.EffectiveSystem(bound.System(), mode.Instructions), DrainTimeout: bound.DrainTimeout(),
 		AgentName: bound.Name(), Engine: bound.Engine(), RuntimeContext: bound.RuntimeContext(),
 		Tools: ToolSet{Permission: bound.Permission(), Registry: mode.Tools, Middlewares: bound.Middlewares(), MaxToolIterations: limits.Iterations, MaxToolCallsPerTurn: limits.Calls, MaxParallelToolCalls: limits.Parallel},
-	}, nil
+	}
+	if capability, configured := bound.CounterCapability(); configured {
+		resolved.ContextCounter = bound.ContextCounter()
+		resolved.CounterCapability = capability
+		resolved.InferenceCapability, _ = bound.InferenceCapability()
+	}
+	if policy, configured := bound.CompactionPolicy(); configured {
+		copyOfPolicy := policy
+		resolved.Compaction = &copyOfPolicy
+	}
+	if policy, configured := bound.ContextObservationPolicy(); configured {
+		copyOfPolicy := policy
+		resolved.ContextObservation = &copyOfPolicy
+	}
+	return resolved, nil
 }
 
 // requireBound rejects a nil (or typed-nil) bound definition with a typed BindError. The
@@ -103,11 +117,29 @@ type runtimeConfig struct {
 	// loop free of os/exec; the concrete provider is wired at the composition root.
 	RuntimeContext RuntimeContextProvider
 
+	ContextCounter      inference.ContextCounter
+	CounterCapability   inference.CounterCapability
+	InferenceCapability inference.InferenceCapability
+	ContextObservation  *loop.ContextObservationPolicy
+	Compaction          *loop.CompactionPolicy
+
+	// compactionSink is the internal ownership-transfer seam between the loop actor's
+	// bounded control coordinator and the typed compaction executor/finalizer wired by
+	// later implementation tasks. Nil leaves a request pending; it never consumes or
+	// drops the obligation. The field is unexported so consumers cannot inject an
+	// arbitrary runner through the public loop definition.
+	compactionSink compactionDispositionSink
+
 	// idGen mints the loop's correlation IDs: the per-turn TurnID, each StepID,
 	// and each tool-call ToolExecutionID. It is unexported, so the composition root cannot
 	// set it: New defaults it to uuid.New. It exists only as a test seam for
 	// exercising the crypto/rand failure branches.
 	idGen idGenerator
+
+	// compactionNow is the actor-private monotonic duration clock. It is separate
+	// from the event Factory's wall clock so EventID/CreatedAt minting and journal
+	// latency cannot move the canonical compaction duration cut point.
+	compactionNow event.Clock
 
 	// now is the clock the loop's event Factory mints CreatedAt from. It is
 	// unexported, so the composition root cannot set it: New defaults it to
@@ -130,4 +162,14 @@ type runtimeConfig struct {
 	// test can cancel the loop deterministically in the post-drain/pre-commit window
 	// to exercise the draining-buffer abnormal-return sweep.
 	afterDrain func()
+
+	// afterContextReplacement is a test-only turn-goroutine seam invoked after
+	// the replacement directive resets private request history. Production leaves
+	// it nil; tests pause the turn while the actor proves its durable projection.
+	afterContextReplacement func()
+
+	// beforeCompactionBoundary is a test-only synchronization seam invoked by the
+	// actor after selecting a safe boundary but before priority arbitration. It lets
+	// tests make both bounded command lanes ready without timing sleeps.
+	beforeCompactionBoundary func(compactionBoundaryKind)
 }

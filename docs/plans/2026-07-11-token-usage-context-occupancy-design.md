@@ -186,6 +186,23 @@ ContextTokens == provider's effective total prompt size
 ReasoningTokens <= OutputTokens
 ```
 
+Provider count scalars are presence-aware at the JSON boundary. An absent field
+uses that provider field's documented zero/default semantics, while an explicit
+JSON `null`, fractional value, negative value, or out-of-range integer is
+malformed and fails with a typed normalization error. This keeps a present empty
+usage object distinct from invalid scalar data.
+
+When Gemini reports `totalTokenCount`, the decoder validates it against
+`promptTokenCount + candidatesTokenCount + thoughtsTokenCount` with checked
+arithmetic. An absent total remains compatible with partial/gateway responses;
+an explicit zero is authoritative and must match the components. Provider totals
+are consistency checks only and are not stored as a sixth cumulative category.
+
+Normalization wraps the exact typed `content.UsageValidationError`. Known core
+field/reason pairs may receive a more specific normalization reason; an unknown
+future core invariant uses a non-lying generic validation reason and preserves
+the original field/reason through the cause chain.
+
 `inference.Usage` becomes an alias of `content.Usage`.
 
 ## §2 · Streaming result trailer (`inference`)
@@ -295,7 +312,7 @@ it and never redefine it:
 // namespace plus the provider's own model id. Not a display name, not a catalog
 // pointer, so replay/catalog repair never depends on a mutable external catalog.
 type ModelKey struct {
-	Provider string
+	Provider ProviderName
 	Model    string
 }
 ```
@@ -361,6 +378,7 @@ The dependencies enter a loop explicitly:
 loop.WithInference(client, model)
 loop.WithContextCounter(counter)
 loop.WithInferenceCapability(capability)
+loop.WithContextObservation(observationPolicy)
 loop.WithCompaction(policy)
 ```
 
@@ -378,8 +396,11 @@ identity—enter the loop policy revision and rig fingerprint: complete
 `CounterCapability`, estimator revision, complete `InferenceCapability`, and
 model limits. `WithCompaction` requires both options for manual and automatic
 compaction because success must count `PostContext`; automatic policy additionally
-validates its `CounterPolicy` quality requirement. A counter may be configured
-without compaction for observe-only measurement.
+validates its `CounterPolicy` quality requirement. A configured counter must own
+exactly one explicit admission policy: `WithContextObservation` for observe-only
+measurement or `WithCompaction` for compacting loops. The two policies are mutually
+exclusive so reservation, safety margin, and count timeout have one owner. There is
+no counter-only timeout default.
 
 The counter and inference capability are fixed collaborators of one bound loop;
 live model/mode changes do not replace them. The binding records the original
@@ -635,14 +656,87 @@ measurement, percentage, previous level, and new level. It fires on a level
 change rather than on every step. Current state is queryable from the loop/session
 view and reconstructable from enduring measurements/events.
 
+An observe-only loop has no automatic compaction thresholds. Its pressure state
+therefore transitions only between `PressureNormal` and `PressureHardLimit`; it
+never emits `PressureCompact` and never schedules compaction. It still publishes
+changed authoritative measurements and pressure transitions using its explicit
+observation policy.
+
 Harness defines no implicit threshold defaults. Consumers supply explicit
 values. SWE's calibrated values are fixed in §13: compact at 80%, rearm below
 60%. After an automatic attempt at one `ContextBasis`, another automatic attempt
 is suppressed until either the basis changes or successful compaction brings
-pressure below the rearm threshold. Manual requests are never suppressed by the
+pressure below the rearm threshold. Two states enforce that rule: Task 23's one
+pending/in-progress coordination slot transiently suppresses duplicate triggers
+while it exists, whereas the durable exhausted `automaticBasis` latch is set only
+after successful append of canonical
+`CompactionRejected{Reason: Automatic, Basis: B}`. Opening/admitting an Automatic
+attempt does not itself exhaust B. Manual requests are never suppressed by the
 automatic rearm latch.
 
 ## §8 · `Compact` command and control lane
+
+Compaction reasons are named `uint8` enums encoded as ordinary JSON numbers,
+matching the existing durable `pkg/event` enum convention. Zero is reserved and
+invalid; validators and codecs reject values outside the closed domains:
+
+```go
+type CompactionReason uint8
+
+const (
+	CompactionReasonUnspecified CompactionReason = iota
+	CompactionReasonManual
+	CompactionReasonAutomatic
+)
+
+type CompactRejectReason uint8
+
+const (
+	CompactRejectUnspecified CompactRejectReason = iota
+	CompactRejectControlLaneFull
+	CompactRejectShuttingDown
+	CompactRejectInterrupted
+	CompactRejectCanceled
+	CompactRejectStaleBasis
+	CompactRejectProgressPublication
+	CompactRejectUnavailable
+	CompactRejectExecutionFailed
+	CompactRejectInvalidSummary
+	CompactRejectContextCountFailed
+	CompactRejectSummaryTooLarge
+	CompactRejectInternal
+	CompactRejectContextLimitUnknown
+)
+```
+
+The canonical rejection mapping is fixed: full control waiters map to
+`CompactRejectControlLaneFull`; loop/control or hustle-lane closure during
+shutdown to `CompactRejectShuttingDown`; interrupt to
+`CompactRejectInterrupted`; caller/session cancellation to
+`CompactRejectCanceled`; actor basis/model/request-fingerprint CAS mismatch to
+`CompactRejectStaleBasis`; checked `CompactionStarted` validation/publication
+failure while the durable journal remains writable to
+`CompactRejectProgressPublication`; no configured/registered usable compactor
+to `CompactRejectUnavailable`; hustle queue/pre-ownership execution failure and
+adapter/inference failure to `CompactRejectExecutionFailed`; strict
+summary/domain validation to `CompactRejectInvalidSummary`; post-summary/request
+count failure or timeout to `CompactRejectContextCountFailed`; a valid summary
+still over the hard input limit to `CompactRejectSummaryTooLarge`; a successful,
+usable count with no resolved positive input limit/denominator
+(`ContextLimitUnknownError`) to `CompactRejectContextLimitUnknown`; and an
+otherwise unclassified recoverable internal failure after a valid `AttemptID`
+exists, while a structurally valid durable terminal can still be constructed and
+journaled, to `CompactRejectInternal`.
+
+`CompactionStarted` construction, validation, checked-publication, or ephemeral
+EventID mint/stamp failure maps to `CompactRejectProgressPublication` only while
+a valid canonical durable rejection can still be constructed and appended.
+Failure to mint a required `AttemptID` or durable terminal EventID, or any failure
+that makes a structurally valid canonical terminal impossible, is fatal
+infrastructure: fault/stop the session and complete in-process waiters with the
+typed infrastructure error, but never claim or journal `CompactionRejected`.
+The same no-false-rejection rule applies to fatal hub, session, and persistence
+failure.
 
 Manual and automatic compaction use one command:
 
@@ -696,16 +790,30 @@ Rules:
 - machine triggers coalesce to one pending attempt;
 - a user request joins an in-progress/pending compaction and observes its result;
   its command id is appended to `Waiters`;
+- `PendingCompaction.Reason` is immutable opener provenance and every canonical
+  terminal copies it: an automatic command joining a manual-opened attempt does
+  not change Manual to Automatic, while a manual command joining an
+  automatic-opened attempt observes that Automatic attempt;
 - queue fullness for `UserInput` cannot reject compaction;
 - `Interrupt` and `Shutdown` outrank compaction;
 - no unbounded express queue exists; the waiter slice is bounded by the lane; a
   command that cannot join a full `Waiters` slice is **immediately rejected** with
   `CompactWaiterRejected{Reason: CompactRejectControlLaneFull}` rather than dropped
-  or blocked — a journaled command always receives a terminal reply;
+  or blocked, using the existing pending `AttemptID` — a journaled command always
+  receives a terminal reply;
 - `Waiters` is kept in a **canonical order** — ascending command-`CreatedAt`, ties
   broken by command-UUID bytes — and admits each command id **at most once**; the
   ordering and uniqueness are what make reply regeneration deterministic; and
 - a control request is consumed only at a safe step/turn boundary.
+
+Only an opened canonical attempt can eventually have a canonical reason/basis
+outcome. Its admitted/minted `AttemptID` occupies the transient coordination slot
+and suppresses duplicates while pending/in progress, but does not set durable
+exhaustion. A machine trigger that merely joins a manual-opened attempt has not
+spent the unchanged basis's automatic-attempt allowance. After that shared manual
+attempt terminates, policy may open one Automatic attempt at the same basis.
+Conversely, a durably appended rejection of an Automatic-opened attempt remains
+Automatic even if manual waiters joined, and only then exhausts that basis.
 
 Once the actor freezes the basis and accepts the shared attempt, it emits one
 public live-progress event before invoking the compactor:
@@ -744,8 +852,8 @@ promised: the runtime faults/stops the session and completes in-process waiters
 with the typed infrastructure failure without claiming that a rejection was
 journaled. Once a start has published,
 **every** return path must end in exactly one canonical terminal: if the hustle
-adapter returns a pre-ownership error without invoking its finalizer (preflight,
-ID generation, lane full, or lane closed), the actor maps that typed error to a
+adapter returns a pre-ownership error without invoking its finalizer (preflight
+or lane closure after a valid coordination `AttemptID` exists), the actor maps that typed error to a
 `CompactRejectReason` and asks the actor to finalize rejection. The finalizer and
 the direct-error fallback use the same actor-owned, idempotent
 `finalizeCompaction(AttemptID, outcome)` transition. The actor records a terminal
@@ -754,6 +862,20 @@ terminal on every later request. Therefore a recovered callback panic before
 append permits fallback rejection, while a panic/error after a successful append
 cannot manufacture a second outcome. As elsewhere, a failed durable append
 faults the session and is not misreported as a successfully journaled terminal.
+
+Here “pre-attempt” waiter rejection means pre-*start* after coordination already
+minted a valid `AttemptID`; lane-full rejection cites the existing pending
+`AttemptID`. Failure before any `AttemptID` can be minted produces no durable
+`CompactWaiterRejected` and completes only through the typed in-process/routing
+infrastructure failure, consistent with the no-false-rejection rule above.
+Pre-start interrupt/shutdown or owner lane/control closure that rejects the
+owning pending attempt ends/clears its transient slot and does not exhaust the
+basis. A lane-full overflow *joining command* is different: its
+`CompactWaiterRejected` cites the existing pending `AttemptID` but leaves that
+pending/in-progress slot and all already-accepted waiters untouched; it does not
+exhaust the automatic basis. Fatal infrastructure without a canonical terminal
+likewise records no durable exhaustion; the session stops, and restore may retry
+because the journal contains no authoritative failed automatic attempt.
 
 ### Crash-consistent outcome
 
@@ -773,6 +895,7 @@ type CompactionCommitted struct {
 	Header
 	AttemptID        CompactAttemptID
 	WaiterCommandIDs []uuid.UUID // full canonical membership
+	Reason           CompactionReason
 	Basis            ContextBasis
 	Summary          *content.UserMessage
 	PostContext      ContextMeasurement
@@ -786,12 +909,18 @@ type CompactionRejected struct {
 	Header
 	AttemptID        CompactAttemptID
 	WaiterCommandIDs []uuid.UUID
+	Reason           CompactionReason
+	Basis            ContextBasis
 	RejectReason     CompactRejectReason
 	Duration         time.Duration
 }
 ```
 
-Exactly one of these is written per attempt. Because it already contains the full
+`Reason` and `Basis` are required durable identity on both canonical outcomes:
+the fixed numeric `CompactionReason` enum records manual versus automatic origin,
+and `Basis` records the exact active context the attempt targeted. Zero/unknown
+reasons and invalid bases are rejected by validation/codecs. Exactly one of these
+is written per attempt. Because it already contains the full
 waiter set, the per-command terminal replies are an **idempotent projection** of
 it — and each reply's event id is **derived deterministically** so replaying the
 repair can never append a duplicate:
@@ -971,7 +1100,7 @@ finalize AIMessage + tool results + usage
 → construct ContextReplacement{old Basis, Model, Fprint of the measurement}
 → actor CAS-validates {Basis, Model, RequestFingerprint}
 → measure Duration and mint CompactionCommitted/new ContextBasis
-→ construct CompactionCommitted{AttemptID, Waiters, old Basis, Summary, PostContext, Duration}
+→ construct CompactionCommitted{AttemptID, Waiters, Reason, old Basis, Summary, PostContext, Duration}
 → append CompactionCommitted durably
 → actor replaces loopState.msgs
 → acknowledge replacement to the turn goroutine
@@ -1090,14 +1219,33 @@ test results, and workspace state; unresolved questions; and concrete next actio
 Do not invent facts. Omit credentials, API keys, access tokens, private keys,
 authentication material, and unnecessary personal data.
 
-Return only one XML value with this exact structure and order, with no attributes,
-comments, code fence, preamble, or trailing text:
-<conversation_summary><goal>...</goal><constraints>...</constraints><decisions>...</decisions><state>...</state><open_items>...</open_items></conversation_summary>
+Return only one JSON object with exactly these fields, no markdown, preamble, or
+trailing JSON. Copy version, basis, model, and request_fingerprint exactly from
+the input, and place the summary XML in the JSON summary string:
+{"version":1,"basis":<exact input basis>,"model":<exact input model>,"request_fingerprint":"<exact input fingerprint>","summary":"<conversation_summary><goal>...</goal><constraints>...</constraints><decisions>...</decisions><state>...</state><open_items>...</open_items></conversation_summary>"}
 
 Escape XML metacharacters inside section text. Keep goal and state non-empty. Use
 an empty allowed section when there are no facts for that section. Stay within the
 supplied summary budget.
 ```
+
+The v1 adapter accepts only the named `uint8` wire version value 1 and strict
+lower-snake input/output objects. The input carries exact
+`{Basis,Model,RequestFingerprint}`, the complete typed transcript, and
+`MaxSummaryTokens`; the output must echo that identity byte-for-byte in canonical
+form before its XML is considered. Fingerprints are exactly 64 lowercase hex
+characters. Both directions reject unknown/missing/wrongly typed fields and
+trailing JSON values.
+
+The raw response byte cap comes from the bound hustle descriptor's `OutputBytes`
+and bounds the full JSON output envelope, whose `summary` string contains XML.
+The generic runtime checks it before the adapter receives output; the adapter
+may defensively recheck already-valid bytes before JSON or XML parsing. The
+summary generation budget uses normalized `hustle.Result.Usage.OutputTokens`:
+usage must be present and the output count non-zero, and the entire JSON envelope
+is conservatively charged against `MaxSummaryTokens`. This is distinct from Task
+26's post-replacement complete-request count; only that later check returns
+`SummaryTooLargeError{Measurement}`.
 
 `PromptRevision` changes when these instructions change; `ParserRevision`
 changes when the accepted XML grammar or rendering changes. Both enter the
@@ -1137,12 +1285,45 @@ Compaction has two different decisions:
 
 If the compaction hustle fails below the hard limit, history is unchanged and
 the turn may continue. If it fails at/above the hard limit, the next model call
-is rejected with a typed context-limit error.
+is rejected with a typed context-limit error. This soft-failure rule applies only
+to a real compaction attempt with a valid current measurement. A failed count
+never authorizes a changed candidate request from an older measurement: count
+failure, timeout, or cancellation before primary inference ends the turn with a
+typed `inference.ContextCountError` and no fabricated compaction attempt.
 
-A failed automatic attempt is recorded against the current `ContextBasis`.
-There is at most one automatic attempt per unchanged basis. A later context
-mutation may retry; failure does not disarm automatic compaction forever.
-Manual `/compact` may explicitly retry the same basis.
+Measurement and pressure publication precede policy. On an automatic loop, an
+eligible current basis consumes its one real machine compaction attempt and pauses
+primary inference at the safe boundary even when the measurement is already at or
+above the hard limit. The runtime does not emit `ContextLimitError` while that
+attempt is pending or in progress. Hard admission fails only when the loop is
+observe-only/manual-only, that basis already exhausted its automatic attempt,
+attempt admission cannot produce a real attempt, or the real attempt later
+rejects/fails without replacement while the unchanged measurement remains at or
+above the limit. Task 26 owns the post-attempt replacement/rejection continuation;
+a successful replacement is recounted before inference.
+
+A failed automatic attempt is durably recorded as
+`CompactionRejected{Reason: CompactionReasonAutomatic, Basis: currentBasis}`.
+There is at most one durably rejected automatic attempt per unchanged basis,
+including across restore. Admission/open/start only occupies Task 23's transient
+slot; the live exhausted latch is written only after observing a successfully
+appended canonical rejection with `ReasonAutomatic` and the exact basis.
+Coalescing into a manual-opened attempt does not consume it. A manual-opened rejection at
+that same basis remains `ReasonManual` and leaves automatic policy eligible to
+open its one attempt after the shared attempt ends. A manual trigger joining an
+automatic-opened attempt observes it, while its canonical rejection remains
+`ReasonAutomatic` and consumes the latch. A later context mutation advances the
+basis and makes the old latch irrelevant; failure does not disarm automatic
+compaction forever. Manual
+`/compact` may explicitly retry the same basis.
+
+Pre-start interrupt/shutdown or owner lane/control closure clears the owning
+transient slot without setting `automaticBasis`, so the unchanged live basis
+remains eligible. Lane-full rejection of an overflow joiner preserves the owning
+slot and accepted waiters and likewise does not exhaust the basis. Fatal
+infrastructure with no canonical terminal stops the session but also creates no
+durable exhausted latch. `CompactionCommitted` advances the basis, making any old
+basis latch unnecessary.
 
 After a successful replacement, the summary-based request is counted. If fixed
 system/tool/runtime context plus the summary still exceeds the hard limit, the
@@ -1213,6 +1394,27 @@ type LoopModeChanged struct {
 }
 ```
 
+The replay fold carries the latest `ContextBasis` independently from the latest
+`ContextMeasurement`. Every durable context mutation advances the basis even
+when it invalidates/clears the current measurement, and restore seeds that basis
+when `CurrentContext` is absent. Revisions therefore never restart at one after a
+restart, model change, or mode change. The fold also keeps only the latest
+automatic-attempt latch: a canonical
+`CompactionRejected{Reason: CompactionReasonAutomatic}` records its `Basis` as
+exhausted only after that canonical event was durably appended. Pending/opened/
+started attempts and per-waiter-only pre-start rejection do not restore as
+exhaustion. Because only an Automatic opener can produce that reason, a machine
+waiter coalesced into a Manual opener does not change the terminal reason, and a
+manual waiter coalesced into an Automatic opener does not change it either. A
+manual rejection therefore does not consume the latch. Any later basis advance
+makes that latch irrelevant. This is bounded latest-value state, not an unbounded
+attempt history.
+
+`CompactionCommitted` advances the active basis and needs no exhausted latch for
+the superseded basis. Fatal infrastructure with no canonical terminal contributes
+no latch on replay; restore remains eligible to retry because the durable history
+contains no authoritative failed attempt.
+
 `LoopStarted` likewise carries the initial resolved runtime. This makes replay
 and catalog repair independent of a mutable external model catalog, and gives the
 rig-lifecycle runtime the effort it needs without a second type. `inference.Effort`
@@ -1265,6 +1467,33 @@ replay-order-independent even if `ChangeLoopInference` installs arbitrarily many
 model keys. `hustle.TerminalStatus` is a fixed two-value set (completed/failed).
 
 ## §13 · Configuration
+
+Observe-only counting has its own explicit policy:
+
+```go
+type ContextObservationPolicy struct {
+	ReservedOutput content.TokenCount
+	SafetyMargin   content.TokenCount
+	CountTimeout   time.Duration
+}
+
+loop.WithContextObservation(policy)
+```
+
+`ReservedOutput` is non-zero, `CountTimeout` is positive and preserved exactly,
+and a heuristic counter requires a non-zero `SafetyMargin`. The policy requires
+both `WithContextCounter` and `WithInferenceCapability`, is mutually exclusive
+with `WithCompaction`, uses the same checked `ResolveContextLimits`, and enters
+the definition/rig policy fingerprint. Harness supplies no defaults.
+
+The public validation identities are fixed: `ContextObservationPolicyField` is
+the closed set `ReservedOutput`, `SafetyMargin`, and `CountTimeout`, and
+`ContextObservationPolicyError{Field}` reports policy validation. Definition
+validation wraps an invalid policy as `DefinitionInvalidContextObservation`,
+observation plus compaction as `DefinitionConflictingContextPolicy`, and a
+counter with neither policy as `DefinitionMissingContextPolicy`. Observation
+without a counter uses the existing `DefinitionMissingContextCounter`; a duplicate
+`WithContextObservation` uses the existing `DefinitionDuplicateOption`.
 
 The presence of `WithCompaction` installs manual compaction. Automatic behavior
 is explicit:
@@ -1326,7 +1555,7 @@ deterministic complete-request estimator, and these explicit values:
 | `CountTimeout` | `2s` | deadline for building/counting the complete next request |
 | hustle timeout | `90s` | separate deadline for the one LLM compaction call |
 | hustle input limit | `2 MiB` | bounds versioned transcript JSON |
-| hustle output limit | `64 KiB` | bounds XML before parsing/token validation |
+| hustle output limit | `64 KiB` | bounds the full JSON output envelope before adapter parsing/token validation |
 
 The two-second count timeout is not an inference timeout. SWE's estimator is
 in-process and normally completes in milliseconds; the deadline prevents a
@@ -1344,8 +1573,8 @@ remote counting endpoint for Chutes, Phala, or LM Studio.
 | `ContextPressure` | event | Ephemeral/Public | no | percentage level change |
 | `ContextMeasured` | event | Enduring/Public | yes | authoritative/replayable current measurement |
 | `CompactionStarted` | event | Ephemeral/Public | no | one live activity signal per accepted attempt; drives focused-loop status |
-| `CompactionCommitted` | event | Enduring/Public | yes | canonical success: context replacement, outcome + waiter membership, and elapsed duration (folded as the reset) |
-| `CompactionRejected` | event | Enduring/Public | yes | canonical failure: reject reason, full waiter membership, and elapsed duration |
+| `CompactionCommitted` | event | Enduring/Public | yes | canonical success: durable manual/automatic reason + attempted basis, context replacement, outcome + waiter membership, and elapsed duration (folded as the reset) |
+| `CompactionRejected` | event | Enduring/Public | yes | canonical failure: durable manual/automatic reason + attempted basis, reject reason, full waiter membership, and elapsed duration |
 | `CompactWaiterResolved` | event | Enduring/Public | yes | per-waiter success reply; deterministic id, idempotent projection |
 | `CompactWaiterRejected` | event | Enduring/Public | yes | per-waiter reject reply (failure/cancel/shutdown/stale-basis/lane-full) |
 
@@ -1369,6 +1598,45 @@ latest-value state, never as cumulative usage.
 - command validation/routing errors for missing coordinates or invalid agency.
 
 All errors unwrap their cause when applicable.
+
+`InvalidSummaryReason` is a closed string set: `wire`, `identity`,
+`output_shape`, `byte_limit`, `token_usage`, `token_limit`, `xml_syntax`,
+`xml_root`, `xml_structure`, and `xml_content`; zero and unknown values are
+invalid. `InvalidSummaryError` never includes raw output or transcript data.
+Root-name failures map to `xml_root`; attributes, comments, directives, wrapper
+or trailing values, missing/duplicate/unknown/out-of-order children, and nested
+elements map to `xml_structure` (malformed XML maps to `xml_syntax`); empty
+trimmed goal or state maps to `xml_content`. `SummaryTooLargeError` is defined
+with the domain now but reserved for the Task 26 complete-request hard-limit
+check, not the isolated hustle output-token budget.
+
+Generic hustle free-text extraction reports a bounded `OutputFailureReason` in
+the fixed order shape → empty text → full-envelope byte cap → JSON validity.
+`invalid_shape`/`empty_text` map to summary `output_shape`, `too_large` maps to
+`byte_limit`, and `invalid_json` maps to `wire`. These failures occur before the
+adapter validation callback, so the adapter maps them from the typed run outcome
+before caller product finalization; neither raw invalid output nor a generic
+runner reaches loopruntime.
+
+Before every primary inference the runtime counts the complete candidate request
+under the configured exact timeout. Count failure, timeout, or cancellation ends
+the turn as `TurnFailed` carrying or wrapping `inference.ContextCountError`;
+unknown or unresolvable limits end it with `ContextLimitUnknownError`; and a
+successful measurement with `InputTokens >= InputLimit` ends it with
+`ContextLimitError{Measurement}` unless an eligible automatic policy first owns a
+real compaction attempt for that basis. Measurement/pressure publish before that
+attempt, and primary inference pauses while it is pending/in progress. None of the
+terminal admission failures calls primary inference. Pre-request count failures
+have no compaction `AttemptID`, so they never fabricate
+`CompactionRejected`. `CompactRejectContextCountFailed` and
+`CompactRejectContextLimitUnknown` apply only after a real compaction attempt
+exists, including post-summary counting in the compaction finalization work.
+Immediate pre-start or control-lane-full `CompactWaiterRejected` remains a
+per-command reply after a valid coordination `AttemptID` exists and does not
+fabricate a canonical attempted basis; lane-full cites the existing pending
+attempt without clearing or modifying that owning attempt or its accepted
+waiters. Failure before any AttemptID is minted produces no durable waiter reply,
+only the typed in-process/routing infrastructure failure.
 
 ### Missing exact provider counters
 
