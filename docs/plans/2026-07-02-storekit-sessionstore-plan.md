@@ -406,7 +406,7 @@ Task-B4 writer, replay, compare); `FromSeq` starts inclusive; fences surface to
 `Blobs.Get` with SHA256 verified (mismatch → typed error, fail closed); missing blob →
 typed error.
 
-**Step 2:** Implement `Store.OpenEventReplayer` / `Store.OpenRecordReplayer` returning
+**Step 2:** Implement `Store.OpenEventReplayer` / `Store.OpenInternalRecordReplayer` returning
 implementations of the **unchanged** `journal.EventReplayer`/`journal.RecordReplayer`
 interfaces, reading `storekit.Cursor` + envelope decode + codec unmarshal.
 

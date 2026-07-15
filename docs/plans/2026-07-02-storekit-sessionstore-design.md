@@ -294,7 +294,7 @@ func Open(b Backend, opts ...Option) (*Store, error)
 func (s *Store) AcquireLease(ctx context.Context, id uuid.UUID) (journal.Lease, error)
 func (s *Store) OpenJournal(ctx context.Context, id uuid.UUID, l journal.Lease) (journal.SessionJournal, error)
 func (s *Store) OpenEventReplayer(id uuid.UUID) (journal.EventReplayer, error)
-func (s *Store) OpenRecordReplayer(id uuid.UUID) (journal.RecordReplayer, error)
+func (s *Store) OpenInternalRecordReplayer(id uuid.UUID) (journal.RecordReplayer, error)
 func (s *Store) Catalog() Catalog
 ```
 

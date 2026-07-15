@@ -3,6 +3,7 @@ package sessionstore
 import (
 	"context"
 	"errors"
+	"reflect"
 	"testing"
 	"time"
 
@@ -124,13 +125,36 @@ func TestEventReplayVisibilityAndPrivilegedSeam(t *testing.T) {
 		})
 	}
 
-	recordReplayer, err := store.OpenRecordReplayer(sid, ReplayRequest{FromSeq: 1})
+	recordReplayer, err := store.OpenInternalRecordReplayer(sid, ReplayRequest{FromSeq: 1})
 	if err != nil {
-		t.Fatalf("OpenRecordReplayer() error = %v", err)
+		t.Fatalf("OpenInternalRecordReplayer() error = %v", err)
 	}
 	records, _ := drainRecords(t, recordReplayer, journal.ReplayRequest{})
 	if len(records) != 7 {
 		t.Fatalf("raw records = %d, want fence plus all six events", len(records))
+	}
+}
+
+func TestRecordReplayMethodContract(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name       string
+		methodName string
+		want       bool
+	}{
+		{name: "ordinary raw replay method is absent", methodName: "OpenRecordReplayer", want: false},
+		{name: "privileged raw replay method is explicit", methodName: "OpenInternalRecordReplayer", want: true},
+		{name: "ordinary event replay remains available", methodName: "OpenEventReplayer", want: true},
+	}
+	storeType := reflect.TypeOf((*Store)(nil))
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			_, got := storeType.MethodByName(tt.methodName)
+			if got != tt.want {
+				t.Errorf("(*Store).%s present = %v, want %v", tt.methodName, got, tt.want)
+			}
+		})
 	}
 }
 

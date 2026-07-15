@@ -128,13 +128,14 @@ func (s *Store) OpenInternalEventReplayer(id uuid.UUID, req ReplayRequest) (jour
 	return &eventReplayer{ledger: s.backend.Ledger, blobs: s.backend.Blobs, name: name, fromSeq: req.FromSeq}, nil
 }
 
-// OpenRecordReplayer returns a read-side replayer over session id's ledger that
-// surfaces EVERY record — events, commands, AND fences — in ledger-sequence order,
-// the merged stream the transcript export consumes. Positioning comes from
-// req.FromSeq (inclusive). The returned value satisfies the unchanged
-// journal.RecordReplayer interface; its Open binds the ledger cursor. Construction
-// does no I/O, so it takes no context.
-func (s *Store) OpenRecordReplayer(id uuid.UUID, req ReplayRequest) (journal.RecordReplayer, error) {
+// OpenInternalRecordReplayer returns the privileged full read side used by restore
+// and storage maintenance. It surfaces EVERY record — public and internal events,
+// commands, and fences — in ledger-sequence order. Product-facing readers must use
+// OpenEventReplayer, which filters non-public event visibility. Positioning comes
+// from req.FromSeq (inclusive). The returned value satisfies journal.RecordReplayer's
+// full-stream contract; its Open binds the ledger cursor. Construction does no I/O,
+// so it takes no context.
+func (s *Store) OpenInternalRecordReplayer(id uuid.UUID, req ReplayRequest) (journal.RecordReplayer, error) {
 	name, err := sessionName(id)
 	if err != nil {
 		return nil, err

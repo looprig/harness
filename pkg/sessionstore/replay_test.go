@@ -228,7 +228,7 @@ func TestRecordReplayerReplaysAppended(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			rr, err := fx.store.OpenRecordReplayer(fx.id, ReplayRequest{FromSeq: tt.fromSeq})
+			rr, err := fx.store.OpenInternalRecordReplayer(fx.id, ReplayRequest{FromSeq: tt.fromSeq})
 			if err != nil {
 				t.Fatalf("OpenRecordReplayer() err = %v", err)
 			}
@@ -268,7 +268,7 @@ func TestRecordReplayerReplaysAppended(t *testing.T) {
 func TestRecordReplayerSurfacesFence(t *testing.T) {
 	t.Parallel()
 	fx := buildFixture(t, memstore.New())
-	rr, err := fx.store.OpenRecordReplayer(fx.id, ReplayRequest{FromSeq: 1})
+	rr, err := fx.store.OpenInternalRecordReplayer(fx.id, ReplayRequest{FromSeq: 1})
 	if err != nil {
 		t.Fatalf("OpenRecordReplayer() err = %v", err)
 	}
@@ -497,7 +497,7 @@ func TestReplayBlobResolution(t *testing.T) {
 			fx := buildFixture(t, backend)
 			tt.tamper(t, fx, backend)
 
-			rr, err := fx.store.OpenRecordReplayer(fx.id, ReplayRequest{FromSeq: fx.offloadSeq})
+			rr, err := fx.store.OpenInternalRecordReplayer(fx.id, ReplayRequest{FromSeq: fx.offloadSeq})
 			if err != nil {
 				t.Fatalf("OpenRecordReplayer() err = %v", err)
 			}
@@ -541,7 +541,7 @@ func TestReplayEmptySession(t *testing.T) {
 	}
 	id := newTestUUID(t)
 
-	rr, err := st.OpenRecordReplayer(id, ReplayRequest{FromSeq: 1})
+	rr, err := st.OpenInternalRecordReplayer(id, ReplayRequest{FromSeq: 1})
 	if err != nil {
 		t.Fatalf("OpenRecordReplayer() err = %v", err)
 	}
@@ -569,7 +569,7 @@ func TestReplayFollowUnsupported(t *testing.T) {
 
 	t.Run("record replayer", func(t *testing.T) {
 		t.Parallel()
-		rr, err := fx.store.OpenRecordReplayer(fx.id, ReplayRequest{FromSeq: 1})
+		rr, err := fx.store.OpenInternalRecordReplayer(fx.id, ReplayRequest{FromSeq: 1})
 		if err != nil {
 			t.Fatalf("OpenRecordReplayer() err = %v", err)
 		}
@@ -631,7 +631,7 @@ func TestReplayCursorCloseIdempotent(t *testing.T) {
 
 	t.Run("record cursor", func(t *testing.T) {
 		t.Parallel()
-		rr, err := fx.store.OpenRecordReplayer(fx.id, ReplayRequest{FromSeq: 1})
+		rr, err := fx.store.OpenInternalRecordReplayer(fx.id, ReplayRequest{FromSeq: 1})
 		if err != nil {
 			t.Fatalf("OpenRecordReplayer() err = %v", err)
 		}
@@ -798,7 +798,7 @@ func buildGateFixture(t *testing.T) fixture {
 func TestRecordReplayerReplaysGatePrepared(t *testing.T) {
 	t.Parallel()
 	fx := buildGateFixture(t)
-	rr, err := fx.store.OpenRecordReplayer(fx.id, ReplayRequest{FromSeq: 1})
+	rr, err := fx.store.OpenInternalRecordReplayer(fx.id, ReplayRequest{FromSeq: 1})
 	if err != nil {
 		t.Fatalf("OpenRecordReplayer() err = %v", err)
 	}

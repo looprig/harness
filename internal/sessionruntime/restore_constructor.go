@@ -157,7 +157,7 @@ func restoreTopologySession(
 	// step-1 setup step (parallel to the journal): a failure releases the lease and
 	// returns without a RestoreErrored, exactly like the journal-setup failure above (the
 	// first restore MUTATION, RestoreStarted, has not been written yet).
-	replayer, err := store.OpenRecordReplayer(sessionID, sessionstore.ReplayRequest{FromSeq: 0})
+	replayer, err := store.OpenInternalRecordReplayer(sessionID, sessionstore.ReplayRequest{FromSeq: 0})
 	if err != nil {
 		releaseLease(lease)
 		return nil, &RestoreError{Kind: RestoreReplayFailed, Cause: err}
