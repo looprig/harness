@@ -2,6 +2,7 @@ package session
 
 import (
 	"strconv"
+	"strings"
 
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/event"
@@ -74,7 +75,42 @@ func (e *TurnRejectedError) Error() string {
 type ConfigMismatchError struct{ Persisted, Live event.ConfigFingerprint }
 
 func (e *ConfigMismatchError) Error() string {
-	return "session: restore config mismatch: persisted model=" + e.Persisted.ModelID + " != live model=" + e.Live.ModelID + " (system/tool digests may also differ); pass WithAllowConfigMismatch to override"
+	changed := make([]string, 0, 10)
+	if e.Persisted.TopologyRev != e.Live.TopologyRev {
+		changed = append(changed, "topology")
+	}
+	if e.Persisted.AgentKind != e.Live.AgentKind {
+		changed = append(changed, configValueChange("agent kind", e.Persisted.AgentKind, e.Live.AgentKind))
+	}
+	if e.Persisted.ModelID != e.Live.ModelID {
+		changed = append(changed, configValueChange("model", e.Persisted.ModelID, e.Live.ModelID))
+	}
+	if e.Persisted.SystemPromptRev != e.Live.SystemPromptRev {
+		changed = append(changed, "system prompt")
+	}
+	if e.Persisted.ToolPolicyRev != e.Live.ToolPolicyRev {
+		changed = append(changed, "tool policy")
+	}
+	if e.Persisted.RuntimeSkills != e.Live.RuntimeSkills {
+		changed = append(changed, "runtime skills ("+strconv.FormatBool(e.Persisted.RuntimeSkills)+" -> "+strconv.FormatBool(e.Live.RuntimeSkills)+")")
+	}
+	if e.Persisted.WorkspaceRoot != e.Live.WorkspaceRoot {
+		changed = append(changed, configValueChange("workspace root", e.Persisted.WorkspaceRoot, e.Live.WorkspaceRoot))
+	}
+	if e.Persisted.AgentAdapter != e.Live.AgentAdapter {
+		changed = append(changed, configValueChange("agent adapter", e.Persisted.AgentAdapter, e.Live.AgentAdapter))
+	}
+	if e.Persisted.PermissionPosture != e.Live.PermissionPosture {
+		changed = append(changed, configValueChange("permission posture", e.Persisted.PermissionPosture, e.Live.PermissionPosture))
+	}
+	if e.Persisted.NativePermissionPolicyRev != e.Live.NativePermissionPolicyRev {
+		changed = append(changed, "native permission policy")
+	}
+	return "session: restore config mismatch: changed fields: " + strings.Join(changed, ", ") + "; pass WithAllowConfigMismatch to override"
+}
+
+func configValueChange(field, persisted, live string) string {
+	return field + " (" + strconv.Quote(persisted) + " -> " + strconv.Quote(live) + ")"
 }
 
 type AgentNameMismatchError struct{ Persisted, Configured identity.AgentName }
