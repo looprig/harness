@@ -3,6 +3,7 @@ package sessionruntime
 import (
 	"context"
 	"errors"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -14,6 +15,42 @@ import (
 	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/harness/pkg/tool"
 )
+
+func TestLoopHandleModeCatalogReturnsBaseAndNamedModesDefensively(t *testing.T) {
+	definition, err := loop.Define(
+		loop.WithName("planner"),
+		loop.WithInference(&stubLLM{}, validModel("model")),
+		loop.WithModes(loop.Mode{Name: "plan"}, loop.Mode{Name: "build"}),
+		loop.WithInitialMode("plan"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := NewTopology(context.Background(), Topology{
+		Definitions:  []loop.Definition{definition},
+		Primers:      []identity.AgentName{"planner"},
+		ActivePrimer: "planner",
+	}, WithFingerprintProvider(testFingerprintProvider))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = session.Shutdown(context.Background()) })
+
+	catalog, ok := session.ActiveLoop().(loop.ModeCatalog)
+	if !ok {
+		t.Fatal("native loop handle does not implement loop.ModeCatalog")
+	}
+	want := []loop.ModeName{"", "plan", "build"}
+	got := catalog.Modes()
+	if !slices.Equal(got, want) {
+		t.Fatalf("Modes() = %v, want %v", got, want)
+	}
+
+	got[0] = "mutated"
+	if again := catalog.Modes(); !slices.Equal(again, want) {
+		t.Fatalf("Modes() after caller mutation = %v, want defensive %v", again, want)
+	}
+}
 
 type activeFailAppender struct {
 	mu     sync.Mutex

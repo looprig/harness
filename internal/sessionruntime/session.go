@@ -528,6 +528,15 @@ func (h *loopHandle) Model() inference.Model {
 	return h.liveModel
 }
 
+func (h *loopHandle) Modes() []loop.ModeName {
+	boundModes := h.bound.Modes()
+	modes := make([]loop.ModeName, len(boundModes))
+	for i := range boundModes {
+		modes[i] = boundModes[i].Name
+	}
+	return modes
+}
+
 // setLiveView records the mode/model the loop actor committed, so Handle.Mode()/Model()
 // reflect the current selection after a successful change.
 func (h *loopHandle) setLiveView(mode loop.ModeName, model inference.Model) {

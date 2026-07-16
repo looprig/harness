@@ -14,6 +14,13 @@ type Handle interface {
 	Model() inference.Model
 }
 
+// ModeCatalog is the optional read-only selectable-mode view of a live loop.
+// The empty ModeName identifies the base mode. Implementations return a
+// defensive copy so callers cannot mutate the bound definition.
+type ModeCatalog interface {
+	Modes() []ModeName
+}
+
 // Controller is the trusted mutation surface of a live loop. Changes are applied
 // by the actor at a turn boundary; Task 9 provides that behavior.
 type Controller interface {
