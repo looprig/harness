@@ -293,11 +293,15 @@ type Binding struct {
 	Name       string
 	Server     client.Definition
 	Scope      Scope
-	Loop       loop.ID
+	Loop       uuid.UUID
 	Visibility LoopSelector
 	Required   bool
 }
 ```
+
+Harness has no `loop.ID` named type; Loop identity is a bare `uuid.UUID`
+(`identity.Coordinates`, `tool.Bindings.LoopID`). The adapter uses `uuid.UUID`
+unless Harness later introduces an alias.
 
 For Session scope, `Loop` is empty and `Visibility` decides which Loops may
 consume the binding. For Loop scope, `Loop` identifies exactly one owner and
@@ -551,6 +555,14 @@ catalog change requires a new immutable Harness toolset generation.
 Harness definitions and bound tool registries are immutable. The adapter must
 not mutate a live tool's name, schema, or implementation in place.
 
+None of this exists in Harness today and it is net-new Harness core work:
+`loop.BoundDefinition` is sealed and read-only, and the only post-construction
+change Harness supports is selecting a predeclared mode or inference at the
+next turn boundary (`SetLoopMode`, `ChangeLoopInference`). The boundary
+*detection* primitive does exist — `event.LoopIdle` and the hub idle
+machinery — and the apply-at-next-turn-boundary pattern is established. What
+is missing is the replacement capability itself.
+
 The integration therefore needs a protocol-neutral Harness capability for
 atomic external-toolset replacement:
 
@@ -660,9 +672,17 @@ Applications may define:
 The MCP server cannot self-declare that a call is approved. Tool annotations and
 metadata are untrusted policy input.
 
-The adapter may implement `tool.PermissionPrompter` to provide a redacted MCP
+The adapter implements `tool.PermissionPrompter` to provide a redacted MCP
 request summary. It must not place credentials, full request bodies, resource
 contents, or unbounded arguments into a gate or audit event.
+
+`tool.PermissionRequest` is currently sealed to `pkg/tool`: an external module
+cannot implement it, and the only available fallback is `tool.UnknownRequest`,
+which permits once-only approval scopes. The Harness stage of this work must
+add a protocol-neutral seam — a constructor or a generic external-capability
+request type — so an external adapter can supply a redacted summary with
+session- and workspace-scoped approvals. The seam must preserve the sealed
+contract's redaction guarantees.
 
 ## Elicitation
 
@@ -702,6 +722,13 @@ Harness needs protocol-neutral gate payloads for:
 
 These payloads belong in Harness because any integration may require structured
 human input. They contain no MCP-specific wire types.
+
+They are additive to `pkg/gate`: today the package defines only the
+`harness.permission` and `harness.ask_user` kinds, and while `gate.PromptSchema`
+already models typed form fields, there is no form-elicitation payload and no
+URL/open-browser payload. New `gate.Kind` and sealed `gate.Payload` variants are
+required, following the existing `{kind,data}` discriminator codec and
+fail-closed unknown-kind handling.
 
 The adapter translates between MCP elicitation schemas and Harness gates.
 Unsupported or unsafe schema constructs are declined with a classified error.
@@ -932,7 +959,14 @@ Credentials, tokens, raw headers, full environment values, resource contents,
 prompt bodies, and tool results are excluded.
 
 The detailed adoption and migration rules are defined in
-`2026-07-16-session-versioning-migration-design.md`.
+`2026-07-16-session-versioning-migration-design.md`. That design is not
+implemented: Harness today has only the one-shot `event.ConfigFingerprint`
+stamped at `SessionStarted` and the boolean `WithAllowConfigMismatch` restore
+override. The MCP module must not hard-depend on manifest, epoch, or drift
+types. Until the versioning work lands, the adapter degrades to contributing
+its secret-free identity digests to the existing fingerprint model, and the
+manifest integration stage is sequenced after (or alongside) the versioning
+implementation.
 
 ## Security model
 
@@ -1022,10 +1056,13 @@ The implementation plan should split the work into reviewable stages:
 3. Streamable HTTP and auth;
 4. discovery, catalogs, tools, resources, prompts, and limits;
 5. notifications, candidate generations, reconnect, and compatibility;
-6. protocol-neutral Harness form/URL gates and external-toolset replacement;
+6. protocol-neutral Harness seams: form/URL gates, the external
+   permission-request seam, and external-toolset replacement;
 7. `mcp/pkg/harness` Session/Loop ownership and tool adapter;
 8. TUI rendering for the new generic gates and status events;
-9. restore/configuration-manifest integration;
+9. restore/configuration-manifest integration (blocked on, or degraded until,
+   the session-versioning implementation; fingerprint-level identity in the
+   interim);
 10. optional sampling and legacy SSE compatibility.
 
 No stage should place MCP protocol types in Harness or make the TUI own client
