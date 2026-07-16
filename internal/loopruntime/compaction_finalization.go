@@ -8,7 +8,8 @@ import (
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/identity"
-	"github.com/looprig/inference"
+	contextcount "github.com/looprig/inference/contextcount"
+	model "github.com/looprig/inference/model"
 )
 
 // CompactionFinalizationErrorKind identifies the actor-owned transition that
@@ -62,7 +63,7 @@ func (e *CompactionFinalizationError) Unwrap() error { return e.Cause }
 // the actor is asked to own the terminal transition. Applying it to live
 // conversation state remains the responsibility of the replacement handshake.
 type compactionPreparedSuccess struct {
-	Model              inference.ModelKey
+	Model              model.ModelKey
 	RequestFingerprint [32]byte
 	Summary            *content.UserMessage
 	PostCount          compactionPostCount
@@ -72,10 +73,10 @@ type compactionPreparedSuccess struct {
 // secret-free request-shape template. The canonical basis and fingerprint do
 // not exist until the actor mints CompactionCommitted.
 type compactionPostCount struct {
-	Model       inference.ModelKey
+	Model       model.ModelKey
 	InputTokens content.TokenCount
 	InputLimit  content.TokenCount
-	Quality     inference.CountQuality
+	Quality     contextcount.CountQuality
 	Fingerprint contextFingerprintTemplate
 }
 

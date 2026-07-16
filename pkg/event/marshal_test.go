@@ -12,7 +12,7 @@ import (
 	"github.com/looprig/harness/pkg/hustle"
 	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/tool"
-	"github.com/looprig/inference"
+	model "github.com/looprig/inference/model"
 )
 
 // seededUUID builds a deterministic non-zero uuid from a single seed byte so the
@@ -354,9 +354,9 @@ func sampleMessages() content.AgenticMessages {
 
 func sampleRuntime() ModelRuntime {
 	return ModelRuntime{
-		Key:    inference.ModelKey{Provider: "openai", Model: "gpt-5"},
-		Limits: inference.ContextLimits{WindowTokens: 128_000, MaxOutputTokens: 16_384},
-		Effort: inference.EffortHigh,
+		Key:    model.ModelKey{Provider: "openai", Model: "gpt-5"},
+		Limits: model.ContextLimits{WindowTokens: 128_000, MaxOutputTokens: 16_384},
+		Effort: model.EffortHigh,
 	}
 }
 

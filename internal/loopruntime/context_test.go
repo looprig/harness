@@ -13,11 +13,13 @@ import (
 	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/inference"
+	contextcount "github.com/looprig/inference/contextcount"
+	model "github.com/looprig/inference/model"
 )
 
 type contextTestCounter struct {
-	capability inference.CounterCapability
-	count      inference.ContextCount
+	capability contextcount.CounterCapability
+	count      contextcount.ContextCount
 	err        error
 	block      bool
 	request    inference.Request
@@ -25,33 +27,33 @@ type contextTestCounter struct {
 	calledAt   time.Time
 }
 
-func (c *contextTestCounter) CountContext(ctx context.Context, request inference.Request) (inference.ContextCount, error) {
+func (c *contextTestCounter) CountContext(ctx context.Context, request inference.Request) (contextcount.ContextCount, error) {
 	c.calledAt = time.Now()
 	c.request = request
 	c.deadline, _ = ctx.Deadline()
 	if c.block {
 		<-ctx.Done()
-		return inference.ContextCount{}, ctx.Err()
+		return contextcount.ContextCount{}, ctx.Err()
 	}
 	if c.err != nil {
-		return inference.ContextCount{}, c.err
+		return contextcount.ContextCount{}, c.err
 	}
 	return c.count, nil
 }
 
-func (c *contextTestCounter) CounterCapability() inference.CounterCapability { return c.capability }
+func (c *contextTestCounter) CounterCapability() contextcount.CounterCapability { return c.capability }
 
-func contextTestCapability(quality inference.CountQuality) inference.CounterCapability {
-	return inference.CounterCapability{Transport: inference.CounterTransportLocal, Retention: inference.RetentionNone, TokenizerRev: "context-test-v1", Quality: quality}
+func contextTestCapability(quality contextcount.CountQuality) contextcount.CounterCapability {
+	return contextcount.CounterCapability{Transport: contextcount.CounterTransportLocal, Retention: contextcount.RetentionNone, TokenizerRev: "context-test-v1", Quality: quality}
 }
 
-func contextTestInferenceCapability() inference.InferenceCapability {
-	return inference.InferenceCapability{Transport: inference.InferenceTransportLocal, Retention: inference.RetentionNone}
+func contextTestInferenceCapability() contextcount.InferenceCapability {
+	return contextcount.InferenceCapability{Transport: contextcount.InferenceTransportLocal, Retention: contextcount.RetentionNone}
 }
 
 func contextTestRequest() inference.Request {
 	return inference.Request{
-		Model:    inference.Model{Provider: "test", APIFormat: inference.APIFormatOpenAI, BaseURL: "http://localhost:1234", Name: "primary", Limits: inference.ContextLimits{WindowTokens: 120, MaxInputTokens: 100, MaxOutputTokens: 30}},
+		Model:    model.Model{Provider: "test", APIFormat: model.APIFormatOpenAI, BaseURL: "http://localhost:1234", Name: "primary", Limits: testContextLimits{WindowTokens: 120, MaxInputTokens: 100, MaxOutputTokens: 30}},
 		System:   "system",
 		Messages: content.AgenticMessages{&content.UserMessage{Message: content.Message{Role: content.RoleUser, Blocks: []content.Block{&content.TextBlock{Text: "hello"}}}}},
 		Tools:    []inference.Tool{{Name: "read", Description: "read a file", Schema: []byte(`{"type":"object"}`)}},
@@ -76,7 +78,7 @@ func TestMeasureRequestContextCountsCompleteCandidate(t *testing.T) {
 		{
 			name: "complete request and exact limit",
 			counter: func() *contextTestCounter {
-				return &contextTestCounter{capability: contextTestCapability(inference.CountQualityExactLocal), count: inference.ContextCount{Model: request.Model.Key(), InputTokens: 61, Quality: inference.CountQualityExactLocal}}
+				return &contextTestCounter{capability: contextTestCapability(contextcount.CountQualityExactLocal), count: contextcount.ContextCount{Model: request.Model.Key(), InputTokens: 61, Quality: contextcount.CountQualityExactLocal}}
 			},
 			ctx:     func() (context.Context, context.CancelFunc) { return context.WithCancel(context.Background()) },
 			request: request, wantLimit: 95, wantTokens: 61,
@@ -84,12 +86,12 @@ func TestMeasureRequestContextCountsCompleteCandidate(t *testing.T) {
 		{
 			name: "unknown limit fails closed before count",
 			counter: func() *contextTestCounter {
-				return &contextTestCounter{capability: contextTestCapability(inference.CountQualityExactLocal), count: inference.ContextCount{Model: request.Model.Key(), InputTokens: 1, Quality: inference.CountQualityExactLocal}}
+				return &contextTestCounter{capability: contextTestCapability(contextcount.CountQualityExactLocal), count: contextcount.ContextCount{Model: request.Model.Key(), InputTokens: 1, Quality: contextcount.CountQualityExactLocal}}
 			},
 			ctx: func() (context.Context, context.CancelFunc) { return context.WithCancel(context.Background()) },
 			request: func() inference.Request {
 				value := request
-				value.Model.Limits = inference.ContextLimits{}
+				value.Model.Limits = testContextLimits{}
 				return value
 			}(),
 			wantErr: func(err error) bool { var target *loop.ContextLimitUnknownError; return errors.As(err, &target) },
@@ -97,28 +99,28 @@ func TestMeasureRequestContextCountsCompleteCandidate(t *testing.T) {
 		{
 			name: "counter failure is typed",
 			counter: func() *contextTestCounter {
-				return &contextTestCounter{capability: contextTestCapability(inference.CountQualityExactLocal), err: errors.New("counter unavailable")}
+				return &contextTestCounter{capability: contextTestCapability(contextcount.CountQualityExactLocal), err: errors.New("counter unavailable")}
 			},
 			ctx:     func() (context.Context, context.CancelFunc) { return context.WithCancel(context.Background()) },
 			request: request,
-			wantErr: func(err error) bool { var target *inference.ContextCountError; return errors.As(err, &target) },
+			wantErr: func(err error) bool { var target *contextcount.ContextCountError; return errors.As(err, &target) },
 		},
 		{
 			name: "timeout is typed",
 			counter: func() *contextTestCounter {
-				return &contextTestCounter{capability: contextTestCapability(inference.CountQualityExactLocal), block: true}
+				return &contextTestCounter{capability: contextTestCapability(contextcount.CountQualityExactLocal), block: true}
 			},
 			ctx:     func() (context.Context, context.CancelFunc) { return context.WithCancel(context.Background()) },
 			request: request,
 			wantErr: func(err error) bool {
-				var target *inference.ContextCountError
+				var target *contextcount.ContextCountError
 				return errors.As(err, &target) && errors.Is(err, context.DeadlineExceeded)
 			},
 		},
 		{
 			name: "parent cancellation is typed",
 			counter: func() *contextTestCounter {
-				return &contextTestCounter{capability: contextTestCapability(inference.CountQualityExactLocal), block: true}
+				return &contextTestCounter{capability: contextTestCapability(contextcount.CountQualityExactLocal), block: true}
 			},
 			ctx: func() (context.Context, context.CancelFunc) {
 				ctx, cancel := context.WithCancel(context.Background())
@@ -127,7 +129,7 @@ func TestMeasureRequestContextCountsCompleteCandidate(t *testing.T) {
 			},
 			request: request,
 			wantErr: func(err error) bool {
-				var target *inference.ContextCountError
+				var target *contextcount.ContextCountError
 				return errors.As(err, &target) && errors.Is(err, context.Canceled)
 			},
 		},
@@ -210,8 +212,8 @@ func TestContextTrackerPressureRearmAndAutomaticLatch(t *testing.T) {
 			tracker := contextTracker{}
 			for i, sample := range tt.samples {
 				measurement := event.ContextMeasurement{
-					Basis: event.ContextBasis{Revision: event.ContextRevision(sample.basis), ThroughEventID: uuid.UUID{sample.basis}}, Model: inference.ModelKey{Provider: "test", Model: "primary"},
-					RequestFingerprint: [32]byte{sample.basis}, InputTokens: sample.used, InputLimit: 100, Quality: inference.CountQualityExactLocal,
+					Basis: event.ContextBasis{Revision: event.ContextRevision(sample.basis), ThroughEventID: uuid.UUID{sample.basis}}, Model: model.ModelKey{Provider: "test", Model: "primary"},
+					RequestFingerprint: [32]byte{sample.basis}, InputTokens: sample.used, InputLimit: 100, Quality: contextcount.CountQualityExactLocal,
 				}
 				result, err := tracker.apply(measurement, tt.settings)
 				if err != nil {
@@ -237,8 +239,8 @@ func TestContextTrackerExhaustsOnlyDurableAutomaticRejection(t *testing.T) {
 	t.Parallel()
 	basis := event.ContextBasis{Revision: 5, ThroughEventID: uuid.UUID{5}}
 	measurement := event.ContextMeasurement{
-		Basis: basis, Model: inference.ModelKey{Provider: "test", Model: "primary"},
-		RequestFingerprint: [32]byte{5}, InputTokens: 80, InputLimit: 100, Quality: inference.CountQualityExactLocal,
+		Basis: basis, Model: model.ModelKey{Provider: "test", Model: "primary"},
+		RequestFingerprint: [32]byte{5}, InputTokens: 80, InputLimit: 100, Quality: contextcount.CountQualityExactLocal,
 	}
 	settings := contextAdmissionSettings{Automatic: true, CompactAt: 8_000, RearmBelow: 6_000}
 	tests := []struct {
@@ -275,8 +277,8 @@ func TestLiveAutomaticPreStartControlRejectionLeavesBasisEligible(t *testing.T) 
 	t.Parallel()
 	basis := event.ContextBasis{Revision: 5, ThroughEventID: uuid.UUID{5}}
 	measurement := event.ContextMeasurement{
-		Basis: basis, Model: inference.ModelKey{Provider: "test", Model: "primary"},
-		RequestFingerprint: [32]byte{5}, InputTokens: 80, InputLimit: 100, Quality: inference.CountQualityExactLocal,
+		Basis: basis, Model: model.ModelKey{Provider: "test", Model: "primary"},
+		RequestFingerprint: [32]byte{5}, InputTokens: 80, InputLimit: 100, Quality: contextcount.CountQualityExactLocal,
 	}
 	settings := contextAdmissionSettings{Automatic: true, CompactAt: 8_000, RearmBelow: 6_000}
 	tests := []struct {
@@ -316,8 +318,8 @@ func TestContextTrackerRestoreSuppressesOnlyRecordedAutomaticBasis(t *testing.T)
 	settings := contextAdmissionSettings{Automatic: true, CompactAt: 8_000, RearmBelow: 6_000}
 	basis := event.ContextBasis{Revision: 5, ThroughEventID: uuid.UUID{5}}
 	measurement := event.ContextMeasurement{
-		Basis: basis, Model: inference.ModelKey{Provider: "test", Model: "primary"},
-		RequestFingerprint: [32]byte{5}, InputTokens: 80, InputLimit: 100, Quality: inference.CountQualityExactLocal,
+		Basis: basis, Model: model.ModelKey{Provider: "test", Model: "primary"},
+		RequestFingerprint: [32]byte{5}, InputTokens: 80, InputLimit: 100, Quality: contextcount.CountQualityExactLocal,
 	}
 	tests := []struct {
 		name         string

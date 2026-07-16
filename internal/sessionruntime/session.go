@@ -22,7 +22,7 @@ import (
 	"github.com/looprig/harness/pkg/security"
 	"github.com/looprig/harness/pkg/tool"
 	"github.com/looprig/harness/pkg/workspacestore"
-	"github.com/looprig/inference"
+	model "github.com/looprig/inference/model"
 )
 
 type idGenerator func() (uuid.UUID, error)
@@ -507,12 +507,12 @@ type loopHandle struct {
 	// read lock. It is seeded at construction with the loop's starting selection.
 	liveMu    sync.RWMutex
 	liveMode  loop.ModeName
-	liveModel inference.Model
+	liveModel model.Model
 	stateMu   sync.RWMutex
 	state     tool.DelegateStatusValue
 }
 
-func runtimeForModel(model inference.Model) event.ModelRuntime {
+func runtimeForModel(model model.Model) event.ModelRuntime {
 	return event.ModelRuntime{Key: model.Key(), Limits: model.Limits, Effort: model.Sampling.Effort}
 }
 
@@ -522,7 +522,7 @@ func (h *loopHandle) Mode() loop.ModeName {
 	defer h.liveMu.RUnlock()
 	return h.liveMode
 }
-func (h *loopHandle) Model() inference.Model {
+func (h *loopHandle) Model() model.Model {
 	h.liveMu.RLock()
 	defer h.liveMu.RUnlock()
 	return h.liveModel
@@ -539,7 +539,7 @@ func (h *loopHandle) Modes() []loop.ModeName {
 
 // setLiveView records the mode/model the loop actor committed, so Handle.Mode()/Model()
 // reflect the current selection after a successful change.
-func (h *loopHandle) setLiveView(mode loop.ModeName, model inference.Model) {
+func (h *loopHandle) setLiveView(mode loop.ModeName, model model.Model) {
 	h.liveMu.Lock()
 	h.liveMode = mode
 	h.liveModel = model

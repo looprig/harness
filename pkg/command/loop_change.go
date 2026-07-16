@@ -1,6 +1,8 @@
 package command
 
-import "github.com/looprig/inference"
+import (
+	model "github.com/looprig/inference/model"
+)
 
 const (
 	CommandSetLoopMode         CommandName  = "SetLoopMode"
@@ -19,8 +21,8 @@ const (
 type LoopChangeResult struct {
 	Err    error
 	Mode   string
-	Model  inference.Model
-	Effort inference.Effort
+	Model  model.Model
+	Effort model.Effort
 }
 
 // SetLoopMode selects one predeclared loop mode. It is a CONTROL command carried on a
@@ -60,8 +62,8 @@ func (c SetLoopMode) Validate() error {
 // under. Ack is required and must be non-nil and buffered(1).
 type ChangeLoopInference struct {
 	Header
-	Model     inference.Model         `json:"model,omitzero"`
-	Effort    inference.Effort        `json:"effort,omitzero"`
+	Model     model.Model             `json:"model,omitzero"`
+	Effort    model.Effort            `json:"effort,omitzero"`
 	SetModel  bool                    `json:"set_model,omitzero"`
 	SetEffort bool                    `json:"set_effort,omitzero"`
 	Ack       chan<- LoopChangeResult `json:"-"` // live reply channel; no JSON representation

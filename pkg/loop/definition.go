@@ -15,6 +15,8 @@ import (
 	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/tool"
 	"github.com/looprig/inference"
+	contextcount "github.com/looprig/inference/contextcount"
+	model "github.com/looprig/inference/model"
 )
 
 const defaultDrainTimeout = 5 * time.Second
@@ -28,7 +30,7 @@ type Definition struct{ state *definitionState }
 // InitialFingerprint is the immutable, bind-free view needed by a rig to stamp and
 // compare compatibility before any runtime factories execute.
 type InitialFingerprint struct {
-	Model           inference.Model
+	Model           model.Model
 	EffectiveSystem string
 	ToolNames       []string
 }
@@ -38,7 +40,7 @@ type definitionState struct {
 	displayName         string
 	description         string
 	client              inference.Client
-	model               inference.Model
+	model               model.Model
 	system              string
 	tools               []tool.Definition
 	permissionFactory   PermissionFactory
@@ -52,9 +54,9 @@ type definitionState struct {
 	modes               []Mode
 	initialMode         ModeName
 	policyRevision      string
-	contextCounter      inference.ContextCounter
-	counterCapability   inference.CounterCapability
-	inferenceCapability inference.InferenceCapability
+	contextCounter      contextcount.ContextCounter
+	counterCapability   contextcount.CounterCapability
+	inferenceCapability contextcount.InferenceCapability
 	contextObservation  ContextObservationPolicy
 	compaction          CompactionPolicy
 }
@@ -187,7 +189,7 @@ func validateContextDefinition(resolved *definitionOptions) error {
 	if err := resolved.inferenceCapability.Validate(); err != nil {
 		return &DefinitionError{Kind: DefinitionInvalidInferenceCapability, Field: "inference_capability", Cause: err}
 	}
-	if err := inference.CompatibleCounter(resolved.inferenceCapability, capability); err != nil {
+	if err := contextcount.CompatibleCounter(resolved.inferenceCapability, capability); err != nil {
 		return &DefinitionError{Kind: DefinitionIncompatibleContextCounter, Field: "context_counter", Cause: err}
 	}
 	if hasCompaction {
@@ -277,7 +279,7 @@ func (d Definition) FingerprintInitial() InitialFingerprint {
 	if d.state == nil {
 		return InitialFingerprint{}
 	}
-	model := cloneModel(d.state.model)
+	selectedModel := cloneModel(d.state.model)
 	instructions := ""
 	definitions := d.state.tools
 	for _, mode := range d.state.modes {
@@ -285,10 +287,10 @@ func (d Definition) FingerprintInitial() InitialFingerprint {
 			continue
 		}
 		if !zeroModel(mode.Model) {
-			model = cloneModel(mode.Model)
+			selectedModel = cloneModel(mode.Model)
 		}
-		if mode.Effort != inference.EffortNone {
-			model.Sampling.Effort = mode.Effort
+		if mode.Effort != model.EffortNone {
+			selectedModel.Sampling.Effort = mode.Effort
 		}
 		instructions = mode.Instructions
 		if len(mode.Tools) > 0 {
@@ -305,7 +307,7 @@ func (d Definition) FingerprintInitial() InitialFingerprint {
 			}
 		}
 	}
-	return InitialFingerprint{Model: model, EffectiveSystem: EffectiveSystem(d.state.system, instructions), ToolNames: names}
+	return InitialFingerprint{Model: selectedModel, EffectiveSystem: EffectiveSystem(d.state.system, instructions), ToolNames: names}
 }
 
 // Delegation returns the immutable delegation policy.
@@ -330,8 +332,8 @@ func (d Definition) PolicyRevision() string {
 	}
 	type modePolicy struct {
 		Name         ModeName
-		Model        inference.Model
-		Effort       inference.Effort
+		Model        model.Model
+		Effort       model.Effort
 		Tools        []toolPolicy
 		ToolLimits   ToolLimits
 		Instructions string
@@ -364,7 +366,7 @@ func (d Definition) PolicyRevision() string {
 	slices.SortFunc(delegates, func(a, b identity.AgentName) int { return strings.Compare(string(a), string(b)) })
 	projection := struct {
 		Name                identity.AgentName
-		Model               inference.Model
+		Model               model.Model
 		System              string
 		Tools               []toolPolicy
 		Limits              ToolLimits
@@ -375,8 +377,8 @@ func (d Definition) PolicyRevision() string {
 		Modes               []modePolicy
 		InitialMode         ModeName
 		PolicyRevision      string
-		CounterCapability   *inference.CounterCapability
-		InferenceCapability *inference.InferenceCapability
+		CounterCapability   *contextcount.CounterCapability
+		InferenceCapability *contextcount.InferenceCapability
 		ContextObservation  *ContextObservationPolicy
 		Compaction          *CompactionPolicy
 	}{
@@ -525,18 +527,18 @@ func (d Definition) Bind(ctx context.Context, bindings tool.Bindings) (BoundDefi
 		if buildErr != nil {
 			return nil, buildErr
 		}
-		model := declared.Model
-		if zeroModel(model) {
-			model = d.state.model
+		selectedModel := declared.Model
+		if zeroModel(selectedModel) {
+			selectedModel = d.state.model
 		}
 		effort := declared.Effort
-		if effort == inference.EffortNone {
+		if effort == model.EffortNone {
 			effort = baseEffort
 		}
-		model = cloneModel(model)
-		model.Sampling.Effort = effort
+		selectedModel = cloneModel(selectedModel)
+		selectedModel.Sampling.Effort = effort
 		modes = append(modes, BoundMode{
-			Name: declared.Name, Model: model, Effort: effort,
+			Name: declared.Name, Model: selectedModel, Effort: effort,
 			Tools: instances, ToolLimits: resolveLimits(d.state.limits, declared.ToolLimits),
 			Instructions: declared.Instructions,
 		})
@@ -562,8 +564,8 @@ type BoundDefinition interface {
 	Description() string
 	Engine() Engine
 	Client() inference.Client
-	Model() inference.Model
-	Effort() inference.Effort
+	Model() model.Model
+	Effort() model.Effort
 	System() string
 	EffectiveSystem() string
 	Instructions() string
@@ -576,12 +578,12 @@ type BoundDefinition interface {
 	Middlewares() []tool.ToolMiddleware
 	DrainTimeout() time.Duration
 	RuntimeContext() RuntimeContextProvider
-	ContextCounter() inference.ContextCounter
-	CounterCapability() (inference.CounterCapability, bool)
-	InferenceCapability() (inference.InferenceCapability, bool)
+	ContextCounter() contextcount.ContextCounter
+	CounterCapability() (contextcount.CounterCapability, bool)
+	InferenceCapability() (contextcount.InferenceCapability, bool)
 	ContextObservationPolicy() (ContextObservationPolicy, bool)
 	CompactionPolicy() (CompactionPolicy, bool)
-	ValidateContextModel(inference.Model) error
+	ValidateContextModel(model.Model) error
 	Delegation() Delegation
 	Delegates() []identity.AgentName
 	boundDefinition()
@@ -605,13 +607,13 @@ func (b *boundDefinitionState) DrainTimeout() time.Duration { return b.definitio
 func (b *boundDefinitionState) RuntimeContext() RuntimeContextProvider {
 	return b.definition.runtimeContext
 }
-func (b *boundDefinitionState) ContextCounter() inference.ContextCounter {
+func (b *boundDefinitionState) ContextCounter() contextcount.ContextCounter {
 	return b.definition.contextCounter
 }
-func (b *boundDefinitionState) CounterCapability() (inference.CounterCapability, bool) {
+func (b *boundDefinitionState) CounterCapability() (contextcount.CounterCapability, bool) {
 	return b.definition.counterCapability, b.definition.contextCounter != nil
 }
-func (b *boundDefinitionState) InferenceCapability() (inference.InferenceCapability, bool) {
+func (b *boundDefinitionState) InferenceCapability() (contextcount.InferenceCapability, bool) {
 	return b.definition.inferenceCapability, b.definition.contextCounter != nil
 }
 func (b *boundDefinitionState) ContextObservationPolicy() (ContextObservationPolicy, bool) {
@@ -620,7 +622,7 @@ func (b *boundDefinitionState) ContextObservationPolicy() (ContextObservationPol
 func (b *boundDefinitionState) CompactionPolicy() (CompactionPolicy, bool) {
 	return b.definition.compaction, b.definition.compaction.CountTimeout != 0
 }
-func (b *boundDefinitionState) ValidateContextModel(model inference.Model) error {
+func (b *boundDefinitionState) ValidateContextModel(model model.Model) error {
 	return validateDefinitionContextModel(b.definition, model)
 }
 func (b *boundDefinitionState) Delegation() Delegation { return b.definition.delegation }
@@ -653,8 +655,8 @@ func (b *boundDefinitionState) selected() BoundMode {
 	mode, _ := b.Mode(b.InitialMode())
 	return mode
 }
-func (b *boundDefinitionState) Model() inference.Model      { return b.selected().Model }
-func (b *boundDefinitionState) Effort() inference.Effort    { return b.selected().Effort }
+func (b *boundDefinitionState) Model() model.Model          { return b.selected().Model }
+func (b *boundDefinitionState) Effort() model.Effort        { return b.selected().Effort }
 func (b *boundDefinitionState) Instructions() string        { return b.selected().Instructions }
 func (b *boundDefinitionState) Tools() []tool.InvokableTool { return b.selected().Tools }
 func (b *boundDefinitionState) ToolLimits() ToolLimits      { return b.selected().ToolLimits }
@@ -684,7 +686,7 @@ func WithName(name identity.AgentName) Option {
 		return nil
 	}
 }
-func WithInference(client inference.Client, model inference.Model) Option {
+func WithInference(client inference.Client, model model.Model) Option {
 	model = cloneModel(model)
 	return func(o *definitionOptions) error {
 		if err := o.singleton("inference"); err != nil {
@@ -696,7 +698,7 @@ func WithInference(client inference.Client, model inference.Model) Option {
 }
 
 // WithContextCounter installs one fixed complete-request counter.
-func WithContextCounter(counter inference.ContextCounter) Option {
+func WithContextCounter(counter contextcount.ContextCounter) Option {
 	return func(o *definitionOptions) error {
 		if err := o.singleton("context_counter"); err != nil {
 			return err
@@ -707,7 +709,7 @@ func WithContextCounter(counter inference.ContextCounter) Option {
 }
 
 // WithInferenceCapability declares the fixed inference transport posture.
-func WithInferenceCapability(capability inference.InferenceCapability) Option {
+func WithInferenceCapability(capability contextcount.InferenceCapability) Option {
 	return func(o *definitionOptions) error {
 		if err := o.singleton("inference_capability"); err != nil {
 			return err
@@ -757,14 +759,14 @@ func (d Definition) ContextObservationPolicy() (ContextObservationPolicy, bool) 
 }
 
 // ValidateContextModel checks structural validity and the fixed transport binding.
-func (d Definition) ValidateContextModel(model inference.Model) error {
+func (d Definition) ValidateContextModel(model model.Model) error {
 	if d.state == nil {
 		return &DefinitionError{Kind: DefinitionInvalidModel, Field: "model"}
 	}
 	return validateDefinitionContextModel(d.state, model)
 }
 
-func validateDefinitionContextModel(state *definitionState, model inference.Model) error {
+func validateDefinitionContextModel(state *definitionState, model model.Model) error {
 	if err := model.Validate(); err != nil {
 		return err
 	}

@@ -13,6 +13,8 @@ import (
 	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/tool"
 	"github.com/looprig/inference"
+	model "github.com/looprig/inference/model"
+	stream "github.com/looprig/inference/stream"
 )
 
 // turnState is the staged turn conversation owned by the turn goroutine. msgs
@@ -89,7 +91,7 @@ type turnConfig struct {
 	// assembled exactly as before. The provider contract is non-fatal — it never errors.
 	runtimeContext RuntimeContextProvider
 
-	model   inference.Model
+	model   model.Model
 	system  string
 	tools   ToolSet
 	client  inference.Client
@@ -565,7 +567,7 @@ func stepDoneEvent(st stepState) event.StepDone {
 // closeStream closes a stream reader, logging (but not surfacing) a close error:
 // a close failure must not change the turn's outcome, which is already decided by
 // the stream's content or a prior terminal.
-func closeStream(sr *inference.StreamReader[content.Chunk]) {
+func closeStream(sr *stream.StreamReader[content.Chunk]) {
 	if cerr := sr.Close(); cerr != nil {
 		slog.Warn("loop: stream close error", "error", cerr)
 	}

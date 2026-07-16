@@ -10,7 +10,7 @@ import (
 	"github.com/looprig/core/content"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/identity"
-	"github.com/looprig/inference"
+	model "github.com/looprig/inference/model"
 	"github.com/looprig/storage/memstore"
 )
 
@@ -18,8 +18,8 @@ func TestCatalogFoldsLoopUsageExactlyOnce(t *testing.T) {
 	t.Parallel()
 	sessionID := fixedUUID(0x30)
 	loopHigh, loopLow := fixedUUID(0x22), fixedUUID(0x11)
-	runtimeA := event.ModelRuntime{Key: inference.ModelKey{Provider: "provider-a", Model: "model-a"}, Limits: inference.ContextLimits{WindowTokens: 100}, Effort: inference.EffortLow}
-	runtimeB := event.ModelRuntime{Key: inference.ModelKey{Provider: "provider-b", Model: "model-b"}, Limits: inference.ContextLimits{WindowTokens: 200}, Effort: inference.EffortHigh}
+	runtimeA := event.ModelRuntime{Key: model.ModelKey{Provider: "provider-a", Model: "model-a"}, Limits: model.ContextLimits{WindowTokens: 100}, Effort: model.EffortLow}
+	runtimeB := event.ModelRuntime{Key: model.ModelKey{Provider: "provider-b", Model: "model-b"}, Limits: model.ContextLimits{WindowTokens: 200}, Effort: model.EffortHigh}
 	usageA := content.Usage{InputTokens: 10, OutputTokens: 2}
 	usageB := content.Usage{InputTokens: 20, OutputTokens: 4, CacheReadTokens: 5}
 	step := func(loopID [16]byte, usage content.Usage) event.StepDone {
@@ -158,7 +158,7 @@ func TestCatalogFoldsLoopUsageExactlyOnce(t *testing.T) {
 func TestCatalogRepairsAmbiguousStepOrdering(t *testing.T) {
 	t.Parallel()
 	sessionID, loopID := fixedUUID(0x50), fixedUUID(0x51)
-	runtime := event.ModelRuntime{Key: inference.ModelKey{Provider: "provider", Model: "model"}, Limits: inference.ContextLimits{WindowTokens: 100}}
+	runtime := event.ModelRuntime{Key: model.ModelKey{Provider: "provider", Model: "model"}, Limits: model.ContextLimits{WindowTokens: 100}}
 	usageA := content.Usage{InputTokens: 3, OutputTokens: 1}
 	usageB := content.Usage{InputTokens: 7, OutputTokens: 2}
 	step := func(usage content.Usage) event.StepDone {
@@ -239,7 +239,7 @@ func TestCatalogRepairsAmbiguousStepOrdering(t *testing.T) {
 func TestCatalogRepairRestoresLoopUsageMetadata(t *testing.T) {
 	t.Parallel()
 	sessionID, loopID := fixedUUID(0x40), fixedUUID(0x41)
-	runtime := event.ModelRuntime{Key: inference.ModelKey{Provider: "provider", Model: "model"}, Limits: inference.ContextLimits{WindowTokens: 100}, Effort: inference.EffortMedium}
+	runtime := event.ModelRuntime{Key: model.ModelKey{Provider: "provider", Model: "model"}, Limits: model.ContextLimits{WindowTokens: 100}, Effort: model.EffortMedium}
 	usage := content.Usage{InputTokens: 7, OutputTokens: 3}
 	tests := []struct {
 		name string
@@ -288,8 +288,8 @@ func TestCatalogRepairFoldsLegacyLifecycleWire(t *testing.T) {
 	sessionID, loopID := fixedUUID(0x60), fixedUUID(0x61)
 	eventID := fixedUUID(0x62)
 	prefix := `,"v":1,"session_id":"` + sessionID.String() + `","loop_id":"` + loopID.String() + `","event_id":"` + eventID.String() + `"`
-	current := event.ModelRuntime{Key: inference.ModelKey{Provider: "current", Model: "current-model"}, Limits: inference.ContextLimits{WindowTokens: 100}}
-	migrated := event.ModelRuntime{Key: inference.ModelKey{Provider: "legacy", Model: "legacy-model"}, Limits: inference.ContextLimits{WindowTokens: 64_000}, Effort: inference.EffortLow}
+	current := event.ModelRuntime{Key: model.ModelKey{Provider: "current", Model: "current-model"}, Limits: model.ContextLimits{WindowTokens: 100}}
+	migrated := event.ModelRuntime{Key: model.ModelKey{Provider: "legacy", Model: "legacy-model"}, Limits: model.ContextLimits{WindowTokens: 64_000}, Effort: model.EffortLow}
 	tests := []struct {
 		name       string
 		seed       event.Event

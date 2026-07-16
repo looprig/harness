@@ -7,13 +7,13 @@ import (
 	"github.com/looprig/core/content"
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/event"
-	"github.com/looprig/inference"
+	model "github.com/looprig/inference/model"
 )
 
 func validCompactionInput() CompactionInput {
 	return CompactionInput{
 		Basis:              event.ContextBasis{Revision: 3, ThroughEventID: uuid.UUID{1}},
-		Model:              inference.ModelKey{Provider: "provider", Model: "model"},
+		Model:              model.ModelKey{Provider: "provider", Model: "model"},
 		RequestFingerprint: [32]byte{1},
 		Transcript: content.AgenticMessages{&content.UserMessage{Message: content.Message{
 			Role: content.RoleUser, Blocks: []content.Block{&content.TextBlock{Text: "work"}},

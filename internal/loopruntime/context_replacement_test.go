@@ -9,7 +9,7 @@ import (
 	"github.com/looprig/core/content"
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/event"
-	"github.com/looprig/inference"
+	model "github.com/looprig/inference/model"
 )
 
 func TestContextReplacementIsNotAPublicLoopCapability(t *testing.T) {
@@ -46,7 +46,7 @@ func TestPrepareActorContextReplacementUsesFullMeasurementCAS(t *testing.T) {
 		{
 			name: "stale model",
 			mutate: func(state *loopState, _ *compactionPreparedSuccess) {
-				state.context.Model = inference.ModelKey{Provider: "test", Model: "changed"}
+				state.context.Model = model.ModelKey{Provider: "test", Model: "changed"}
 			},
 		},
 		{

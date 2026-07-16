@@ -6,7 +6,7 @@ import (
 	"testing"
 
 	"github.com/looprig/harness/pkg/tool"
-	"github.com/looprig/inference"
+	model "github.com/looprig/inference/model"
 )
 
 func TestModeValidation(t *testing.T) {
@@ -21,8 +21,8 @@ func TestModeValidation(t *testing.T) {
 		{name: "empty mode name", modes: []Mode{{Name: ""}}, initial: "plan", kind: DefinitionInvalidMode},
 		{name: "duplicate mode", modes: []Mode{{Name: "plan"}, {Name: "plan"}}, initial: "plan", kind: DefinitionDuplicateMode},
 		{name: "unknown initial", modes: []Mode{{Name: "plan"}}, initial: "build", kind: DefinitionInvalidInitialMode},
-		{name: "invalid effort", modes: []Mode{{Name: "plan", Effort: inference.Effort("huge")}}, initial: "plan", kind: DefinitionInvalidMode},
-		{name: "invalid model sampling effort", modes: []Mode{{Name: "plan", Model: modelWithEffort(inference.Effort("huge"))}}, initial: "plan", kind: DefinitionInvalidMode},
+		{name: "invalid effort", modes: []Mode{{Name: "plan", Effort: model.Effort("huge")}}, initial: "plan", kind: DefinitionInvalidMode},
+		{name: "invalid model sampling effort", modes: []Mode{{Name: "plan", Model: modelWithEffort(model.Effort("huge"))}}, initial: "plan", kind: DefinitionInvalidMode},
 		{name: "invalid limits", modes: []Mode{{Name: "plan", ToolLimits: ToolLimits{Parallel: -1}}}, initial: "plan", kind: DefinitionInvalidMode},
 		{name: "initial without modes", initial: "plan", kind: DefinitionInvalidInitialMode},
 	}
@@ -45,7 +45,7 @@ func TestModeValidation(t *testing.T) {
 
 func TestDefinitionRejectsInvalidBaseSamplingEffort(t *testing.T) {
 	t.Parallel()
-	_, err := Define(WithName("agent"), WithInference(&fakeLLM{}, modelWithEffort(inference.Effort("huge"))))
+	_, err := Define(WithName("agent"), WithInference(&fakeLLM{}, modelWithEffort(model.Effort("huge"))))
 	var definitionErr *DefinitionError
 	if !errors.As(err, &definitionErr) || definitionErr.Kind != DefinitionInvalidModel {
 		t.Fatalf("Define error = %T %v, want invalid model", err, err)
@@ -55,7 +55,7 @@ func TestDefinitionRejectsInvalidBaseSamplingEffort(t *testing.T) {
 func TestModeResolutionAndCopy(t *testing.T) {
 	t.Parallel()
 	modeTools := []tool.Definition{testToolDefinition("mode", nil, nil)}
-	modes := []Mode{{Name: "plan", Model: inference.Model{}, Effort: inference.EffortHigh, Tools: modeTools, ToolLimits: ToolLimits{Calls: 7}, Instructions: "plan more"}}
+	modes := []Mode{{Name: "plan", Model: model.Model{}, Effort: model.EffortHigh, Tools: modeTools, ToolLimits: ToolLimits{Calls: 7}, Instructions: "plan more"}}
 	d := mustDefinition(t, WithToolLimits(ToolLimits{Iterations: 3, Parallel: 2}), WithModes(modes...), WithInitialMode("plan"))
 	modes[0].Name = "changed"
 	modeTools[0] = testToolDefinition("changed", nil, nil)
@@ -67,7 +67,7 @@ func TestModeResolutionAndCopy(t *testing.T) {
 	if !ok {
 		t.Fatal("plan mode missing")
 	}
-	if mode.Model.Name != testModel().Name || mode.Effort != inference.EffortHigh || mode.Instructions != "plan more" {
+	if mode.Model.Name != testModel().Name || mode.Effort != model.EffortHigh || mode.Instructions != "plan more" {
 		t.Fatalf("resolved mode = %+v", mode)
 	}
 	if mode.ToolLimits != (ToolLimits{Iterations: 3, Calls: 7, Parallel: 2}) {
@@ -77,12 +77,12 @@ func TestModeResolutionAndCopy(t *testing.T) {
 
 func TestModeEffectiveEffortIsStampedIntoModel(t *testing.T) {
 	t.Parallel()
-	baseModel := modelWithEffort(inference.EffortLow)
+	baseModel := modelWithEffort(model.EffortLow)
 	d, err := Define(
 		WithName("agent"), WithInference(&fakeLLM{}, baseModel),
 		WithModes(
-			Mode{Name: "inherit", Model: modelWithEffort(inference.EffortMax)},
-			Mode{Name: "override", Effort: inference.EffortHigh},
+			Mode{Name: "inherit", Model: modelWithEffort(model.EffortMax)},
+			Mode{Name: "override", Effort: model.EffortHigh},
 		),
 		WithInitialMode("inherit"),
 	)
@@ -97,16 +97,16 @@ func TestModeEffectiveEffortIsStampedIntoModel(t *testing.T) {
 	inherit, _ := b.Mode("inherit")
 	override, _ := b.Mode("override")
 	for name, mode := range map[string]BoundMode{"base": base, "inherit": inherit} {
-		if mode.Effort != inference.EffortLow || mode.Model.Sampling.Effort != inference.EffortLow {
+		if mode.Effort != model.EffortLow || mode.Model.Sampling.Effort != model.EffortLow {
 			t.Errorf("%s effort = %q model effort = %q, want low", name, mode.Effort, mode.Model.Sampling.Effort)
 		}
 	}
-	if override.Effort != inference.EffortHigh || override.Model.Sampling.Effort != inference.EffortHigh {
+	if override.Effort != model.EffortHigh || override.Model.Sampling.Effort != model.EffortHigh {
 		t.Errorf("override effort = %q model effort = %q, want high", override.Effort, override.Model.Sampling.Effort)
 	}
 }
 
-func modelWithEffort(effort inference.Effort) inference.Model {
+func modelWithEffort(effort model.Effort) model.Model {
 	model := testModel()
 	model.Sampling.Effort = effort
 	return model

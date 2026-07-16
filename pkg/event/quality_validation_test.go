@@ -7,7 +7,7 @@ import (
 	"testing"
 
 	"github.com/looprig/core/content"
-	"github.com/looprig/inference"
+	model "github.com/looprig/inference/model"
 )
 
 func TestStepDoneMessageGroupValidation(t *testing.T) {
@@ -211,7 +211,7 @@ func TestModelRuntimeValidationBoundary(t *testing.T) {
 		wantErr bool
 	}{
 		{name: "valid", runtime: sampleRuntime()},
-		{name: "empty provider", runtime: ModelRuntime{Key: inference.ModelKey{Model: "model"}}, wantErr: true},
+		{name: "empty provider", runtime: ModelRuntime{Key: model.ModelKey{Model: "model"}}, wantErr: true},
 	}
 	for _, tt := range tests {
 		tt := tt

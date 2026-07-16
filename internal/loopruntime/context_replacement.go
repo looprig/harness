@@ -3,7 +3,7 @@ package loopruntime
 import (
 	"github.com/looprig/core/content"
 	"github.com/looprig/harness/pkg/event"
-	"github.com/looprig/inference"
+	model "github.com/looprig/inference/model"
 )
 
 // StaleCompactionError reports the complete measurement identity that failed
@@ -11,8 +11,8 @@ import (
 type StaleCompactionError struct {
 	ExpectedBasis              event.ContextBasis
 	ActualBasis                event.ContextBasis
-	ExpectedModel              inference.ModelKey
-	ActualModel                inference.ModelKey
+	ExpectedModel              model.ModelKey
+	ActualModel                model.ModelKey
 	ExpectedRequestFingerprint [32]byte
 	ActualRequestFingerprint   [32]byte
 }
@@ -39,7 +39,7 @@ func prepareActorContextReplacement(
 	actualFingerprint := state.context.RequestFingerprint
 	if success == nil || !state.hasContext || state.context.Basis != attempt.Basis || actualBasis != attempt.Basis ||
 		actualModel != success.Model || actualFingerprint != success.RequestFingerprint {
-		expectedModel := inference.ModelKey{}
+		expectedModel := model.ModelKey{}
 		expectedFingerprint := [32]byte{}
 		if success != nil {
 			expectedModel = success.Model

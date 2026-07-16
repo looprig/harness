@@ -11,7 +11,7 @@ import (
 	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/harness/pkg/security"
-	"github.com/looprig/inference"
+	model "github.com/looprig/inference/model"
 )
 
 type restoredHustleAuditErrorKind string
@@ -39,7 +39,7 @@ func (e *restoredHustleAuditError) Error() string {
 type restoredHustleInterrupted struct {
 	Name          hustle.Name
 	ModelSource   hustle.ModelSource
-	NamedModelKey inference.ModelKey
+	NamedModelKey model.ModelKey
 	Runs          uint64
 }
 
@@ -88,7 +88,7 @@ func projectRestoredHustleInterruptions(starts map[hustle.RunID]restoredHustleSt
 	type interruptedKey struct {
 		name          hustle.Name
 		modelSource   hustle.ModelSource
-		namedModelKey inference.ModelKey
+		namedModelKey model.ModelKey
 	}
 	counts := make(map[interruptedKey]uint64)
 	for _, start := range starts {
@@ -627,8 +627,8 @@ func advanceFoldedContextBasis(current event.ContextBasis, hasCurrent bool, even
 // RestoredContextModelMismatchError reports a replay projection that would
 // seed a current measurement under a different restored runtime model.
 type RestoredContextModelMismatchError struct {
-	Runtime     inference.ModelKey
-	Measurement inference.ModelKey
+	Runtime     model.ModelKey
+	Measurement model.ModelKey
 }
 
 func (e *RestoredContextModelMismatchError) Error() string {

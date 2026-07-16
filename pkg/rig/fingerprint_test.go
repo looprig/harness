@@ -12,6 +12,8 @@ import (
 	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/harness/pkg/tool"
 	"github.com/looprig/inference"
+	model "github.com/looprig/inference/model"
+	stream "github.com/looprig/inference/stream"
 )
 
 type stubLLM struct{}
@@ -19,12 +21,12 @@ type stubLLM struct{}
 func (*stubLLM) Invoke(context.Context, inference.Request) (*inference.Response, error) {
 	return nil, nil
 }
-func (*stubLLM) Stream(context.Context, inference.Request) (*inference.StreamReader[content.Chunk], error) {
+func (*stubLLM) Stream(context.Context, inference.Request) (*stream.StreamReader[content.Chunk], error) {
 	return nil, nil
 }
 
-func validModel(name string) inference.Model {
-	return inference.Model{Provider: "test", APIFormat: inference.APIFormatOpenAI, BaseURL: "http://localhost", Name: name}
+func validModel(name string) model.Model {
+	return model.Model{Provider: "test", APIFormat: model.APIFormatOpenAI, BaseURL: "http://localhost", Name: name}
 }
 
 func mustDefine(options ...loop.Option) loop.Definition {

@@ -14,6 +14,7 @@ import (
 	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/harness/pkg/tool"
 	"github.com/looprig/inference"
+	model "github.com/looprig/inference/model"
 )
 
 type selectiveCheckedFailurePublisher struct {
@@ -245,7 +246,7 @@ func TestContextRequestShapeOverflowPublishesNoChange(t *testing.T) {
 	}{
 		{name: "LoopModeChanged", run: func(t *testing.T, instance *Loop) command.LoopChangeResult { return sendSetMode(t, instance, "build") }, want: eventCount[event.LoopModeChanged]},
 		{name: "LoopInferenceChanged", run: func(t *testing.T, instance *Loop) command.LoopChangeResult {
-			return sendChange(t, instance, command.ChangeLoopInference{Effort: inference.EffortHigh, SetEffort: true})
+			return sendChange(t, instance, command.ChangeLoopInference{Effort: testEffortHigh, SetEffort: true})
 		}, want: eventCount[event.LoopInferenceChanged]},
 	}
 	for _, tt := range tests {
@@ -289,7 +290,7 @@ func TestContextMutationCheckedPublicationFailureIsAtomic(t *testing.T) {
 			return nil
 		}, want: eventCount[event.StepDone]},
 		{name: "LoopInferenceChanged", fail: func(value event.Event) bool { _, ok := value.(event.LoopInferenceChanged); return ok }, run: func(t *testing.T, instance *Loop) error {
-			return sendChange(t, instance, command.ChangeLoopInference{Effort: inference.EffortHigh, SetEffort: true}).Err
+			return sendChange(t, instance, command.ChangeLoopInference{Effort: testEffortHigh, SetEffort: true}).Err
 		}, want: eventCount[event.LoopInferenceChanged]},
 	}
 	for _, tt := range tests {
@@ -369,7 +370,7 @@ func TestContextRequestShapeCheckedPublicationFailureLeavesConfigUnchanged(t *te
 			name: "LoopInferenceChanged",
 			fail: func(value event.Event) bool { _, ok := value.(event.LoopInferenceChanged); return ok },
 			run: func(t *testing.T, instance *Loop) command.LoopChangeResult {
-				return sendChange(t, instance, command.ChangeLoopInference{Effort: inference.EffortHigh, SetEffort: true})
+				return sendChange(t, instance, command.ChangeLoopInference{Effort: testEffortHigh, SetEffort: true})
 			},
 			want: eventCount[event.LoopInferenceChanged],
 		},
@@ -398,7 +399,7 @@ func TestContextRequestShapeCheckedPublicationFailureLeavesConfigUnchanged(t *te
 			}
 			runOneTurn(t, instance, recorder, "after failure")
 			request := client.lastReq()
-			if request.Model.Sampling.Effort != inference.EffortLow || request.System != "base\n\nplan-i" {
+			if request.Model.Sampling.Effort != model.EffortLow || request.System != "base\n\nplan-i" {
 				t.Fatalf("request config after failure = effort %q system %q, want low initial plan", request.Model.Sampling.Effort, request.System)
 			}
 		})

@@ -8,7 +8,8 @@ import (
 	"github.com/looprig/core/content"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/hustle"
-	"github.com/looprig/inference"
+	contextcount "github.com/looprig/inference/contextcount"
+	model "github.com/looprig/inference/model"
 )
 
 // CounterPolicy selects the count qualities automatic compaction may trust.
@@ -66,7 +67,7 @@ func (e *CompactionPolicyError) Unwrap() error { return e.Cause }
 
 // Validate checks the policy against already-validated, I/O-free counter
 // metadata. It never calls CountContext.
-func (p CompactionPolicy) Validate(capability inference.CounterCapability) error {
+func (p CompactionPolicy) Validate(capability contextcount.CounterCapability) error {
 	if p.ReservedOutput == 0 {
 		return &CompactionPolicyError{Field: CompactionFieldReservedOutput}
 	}
@@ -79,7 +80,7 @@ func (p CompactionPolicy) Validate(capability inference.CounterCapability) error
 	if err := p.Hustle.Validate(); err != nil {
 		return &CompactionPolicyError{Field: CompactionFieldHustle, Cause: err}
 	}
-	if capability.Quality == inference.CountQualityHeuristicEstimate && p.SafetyMargin == 0 {
+	if capability.Quality == contextcount.CountQualityHeuristicEstimate && p.SafetyMargin == 0 {
 		return &CompactionPolicyError{Field: CompactionFieldSafetyMargin}
 	}
 	if !p.Automatic {
@@ -93,11 +94,11 @@ func (p CompactionPolicy) Validate(capability inference.CounterCapability) error
 	}
 	switch p.CounterPolicy {
 	case CounterPolicyRequireExact:
-		if capability.Quality != inference.CountQualityExactProvider && capability.Quality != inference.CountQualityExactLocal {
+		if capability.Quality != contextcount.CountQualityExactProvider && capability.Quality != contextcount.CountQualityExactLocal {
 			return &CompactionPolicyError{Field: CompactionFieldCounterPolicy}
 		}
 	case CounterPolicyAllowConservative:
-		if capability.Quality != inference.CountQualityExactProvider && capability.Quality != inference.CountQualityExactLocal && capability.Quality != inference.CountQualityHeuristicEstimate {
+		if capability.Quality != contextcount.CountQualityExactProvider && capability.Quality != contextcount.CountQualityExactLocal && capability.Quality != contextcount.CountQualityHeuristicEstimate {
 			return &CompactionPolicyError{Field: CompactionFieldCounterPolicy}
 		}
 	default:
@@ -118,7 +119,7 @@ func (e *ContextTransportBindingError) Error() string {
 	return "loop: context model changes fixed transport field " + e.Field
 }
 
-func validateContextTransportBinding(bound, candidate inference.Model) error {
+func validateContextTransportBinding(bound, candidate model.Model) error {
 	if bound.Provider != candidate.Provider {
 		return &ContextTransportBindingError{Field: "Provider", Bound: string(bound.Provider), Candidate: string(candidate.Provider)}
 	}
@@ -137,11 +138,11 @@ func validateContextTransportBinding(bound, candidate inference.Model) error {
 type RequestFingerprintInput struct {
 	SystemRevision         string
 	ToolPolicyRevision     string
-	Model                  inference.Model
+	Model                  model.Model
 	Basis                  event.ContextBasis
 	RuntimeContextRevision string
-	CounterCapability      inference.CounterCapability
-	InferenceCapability    inference.InferenceCapability
+	CounterCapability      contextcount.CounterCapability
+	InferenceCapability    contextcount.InferenceCapability
 }
 
 // RequestFingerprintError reports an invalid projection or marshal defect.

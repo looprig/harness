@@ -18,6 +18,8 @@ import (
 	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/harness/pkg/tool"
 	"github.com/looprig/inference"
+	model "github.com/looprig/inference/model"
+	stream "github.com/looprig/inference/stream"
 )
 
 // stubLLM is a controllable inference.Client for session tests.
@@ -45,7 +47,7 @@ func textChunk(s string) content.Chunk {
 func (s *stubLLM) Invoke(ctx context.Context, req inference.Request) (*inference.Response, error) {
 	return nil, errors.New("stubLLM.Invoke not used")
 }
-func (s *stubLLM) Stream(ctx context.Context, req inference.Request) (*inference.StreamReader[content.Chunk], error) {
+func (s *stubLLM) Stream(ctx context.Context, req inference.Request) (*stream.StreamReader[content.Chunk], error) {
 	i := 0
 	next := func() (content.Chunk, error) {
 		if i < len(s.chunks) {
@@ -62,7 +64,7 @@ func (s *stubLLM) Stream(ctx context.Context, req inference.Request) (*inference
 		}
 		return nil, io.EOF
 	}
-	return inference.NewStreamReader(next, nil), nil
+	return stream.NewStreamReader(next, nil), nil
 }
 
 // recordingSub drains a hub Subscription — the same consumer API the TUI/CLI use
@@ -139,13 +141,13 @@ func (r *recordingSub) waitTurnCausationID(d time.Duration) (uuid.UUID, bool) {
 	}
 }
 
-// validModel returns a minimal but VALID inference.Model (passes inference.Model.Validate): a
+// validModel returns a minimal but VALID model.Model (passes model.Model.Validate): a
 // known provider speaking a supported dialect at a loopback endpoint. It replaces the
 // retired ModelSpec in session tests that construct a loop.Definition.
-func validModel(name string) inference.Model {
-	return inference.Model{
-		Provider:  inference.ProviderName("lmstudio"),
-		APIFormat: inference.APIFormatOpenAI,
+func validModel(name string) model.Model {
+	return model.Model{
+		Provider:  model.ProviderName("lmstudio"),
+		APIFormat: model.APIFormatOpenAI,
 		BaseURL:   "http://localhost:1234",
 		Name:      name,
 	}

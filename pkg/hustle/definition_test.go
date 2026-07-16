@@ -14,6 +14,8 @@ import (
 	"github.com/looprig/core/content"
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/inference"
+	model "github.com/looprig/inference/model"
+	stream "github.com/looprig/inference/stream"
 )
 
 type testClient struct{ identity string }
@@ -22,7 +24,7 @@ func (*testClient) Invoke(context.Context, inference.Request) (*inference.Respon
 	return nil, nil
 }
 
-func (*testClient) Stream(context.Context, inference.Request) (*inference.StreamReader[content.Chunk], error) {
+func (*testClient) Stream(context.Context, inference.Request) (*stream.StreamReader[content.Chunk], error) {
 	return nil, nil
 }
 
@@ -48,26 +50,30 @@ type testResolveCause struct{ message string }
 
 func (e *testResolveCause) Error() string { return e.message }
 
-func validModel(name string) inference.Model {
+func validModel(name string) model.Model {
 	temperature := 0.25
 	topP := 0.9
 	maxTokens := 321
-	return inference.Model{
+	return model.Model{
 		Provider:  "test-provider",
 		APIFormat: "test-format",
 		BaseURL:   "https://models.example.invalid",
 		Name:      name,
-		Sampling: inference.Sampling{
+		Sampling: model.Sampling{
 			Temperature: &temperature,
 			TopP:        &topP,
 			MaxTokens:   &maxTokens,
 			Stop:        []string{"END"},
-			Effort:      inference.EffortMedium,
+			Effort:      model.EffortMedium,
 		},
 	}
 }
 
-func validNamedOptions(client inference.Client, model inference.Model) []Option {
+func zeroInferenceModel() model.Model { return model.Model{} }
+
+func invalidInferenceEffort() model.Effort { return model.Effort("bogus") }
+
+func validNamedOptions(client inference.Client, model model.Model) []Option {
 	return []Option{
 		WithName("conversation-compaction"),
 		WithParticipation(ParticipationBlocking),
@@ -101,14 +107,14 @@ func TestDefineValidDefinitions(t *testing.T) {
 		wantSource    ModelSource
 		wantPart      Participation
 		wantTimeout   time.Duration
-		wantNamedKey  inference.ModelKey
+		wantNamedKey  model.ModelKey
 		wantPromptRev string
 	}{
 		{
 			name: "named model", opts: validNamedOptions(client, validModel("named-model")),
 			wantName: "conversation-compaction", wantSource: ModelSourceNamed,
 			wantPart: ParticipationBlocking, wantTimeout: 2*time.Second + time.Nanosecond,
-			wantNamedKey:  inference.ModelKey{Provider: "test-provider", Model: "named-model"},
+			wantNamedKey:  model.ModelKey{Provider: "test-provider", Model: "named-model"},
 			wantPromptRev: "prompt-v1",
 		},
 		{
@@ -169,9 +175,9 @@ func TestDefineValidation(t *testing.T) {
 		{name: "missing model source", opts: withoutOption(validNamedOptions(client, model), 4), kind: DefinitionMissingModelSource},
 		{name: "nil named client", opts: replaceOption(validNamedOptions(client, model), 4, WithNamedInference(nil, model)), kind: DefinitionInvalidClient},
 		{name: "typed nil named client", opts: replaceOption(validNamedOptions(client, model), 4, WithNamedInference(typedNilClient, model)), kind: DefinitionInvalidClient},
-		{name: "invalid named model", opts: replaceOption(validNamedOptions(client, model), 4, WithNamedInference(client, inference.Model{})), kind: DefinitionInvalidModel},
+		{name: "invalid named model", opts: replaceOption(validNamedOptions(client, model), 4, WithNamedInference(client, zeroInferenceModel())), kind: DefinitionInvalidModel},
 		{name: "model missing durable provider", opts: replaceOption(validNamedOptions(client, model), 4, WithNamedInference(client, modelWithoutProvider(model))), kind: DefinitionInvalidModel},
-		{name: "invalid named model effort", opts: replaceOption(validNamedOptions(client, model), 4, WithNamedInference(client, modelWithEffort(model, inference.Effort("bogus")))), kind: DefinitionInvalidModel},
+		{name: "invalid named model effort", opts: replaceOption(validNamedOptions(client, model), 4, WithNamedInference(client, modelWithEffort(model, invalidInferenceEffort()))), kind: DefinitionInvalidModel},
 		{name: "named nan temperature", opts: replaceOption(validNamedOptions(client, model), 4, WithNamedInference(client, modelWithTemperature(model, math.NaN()))), kind: DefinitionInvalidModel, field: "model.sampling.temperature"},
 		{name: "named positive infinity temperature", opts: replaceOption(validNamedOptions(client, model), 4, WithNamedInference(client, modelWithTemperature(model, math.Inf(1)))), kind: DefinitionInvalidModel, field: "model.sampling.temperature"},
 		{name: "named negative infinity temperature", opts: replaceOption(validNamedOptions(client, model), 4, WithNamedInference(client, modelWithTemperature(model, math.Inf(-1)))), kind: DefinitionInvalidModel, field: "model.sampling.temperature"},
@@ -277,7 +283,7 @@ func TestDefinitionDescriptorIdentity(t *testing.T) {
 		{name: "model top p", opts: validNamedOptions(client, modelWithTopP(baseModel, 0.75))},
 		{name: "model max tokens", opts: validNamedOptions(client, modelWithMaxTokens(baseModel, 654))},
 		{name: "model stop", opts: validNamedOptions(client, modelWithStop(baseModel, []string{"STOP"}))},
-		{name: "model effort", opts: validNamedOptions(client, modelWithEffort(baseModel, inference.EffortLow))},
+		{name: "model effort", opts: validNamedOptions(client, modelWithEffort(baseModel, model.EffortLow))},
 		{name: "prompt bytes", opts: replaceOption(baseOptions, 5, WithSystemPrompt("Different prompt.", "prompt-v1"))},
 		{name: "prompt revision", opts: replaceOption(baseOptions, 5, WithSystemPrompt("Summarize the conversation.", "prompt-v2"))},
 		{name: "participation", opts: replaceOption(baseOptions, 1, WithParticipation(ParticipationBackground))},
@@ -428,7 +434,7 @@ func TestResolveInference(t *testing.T) {
 		{name: "resolver failure preserved", resolver: &testResolver{wantID: loopID, err: resolverCause}, ctx: context.Background(), loopID: loopID, kind: ResolveModelFailed, wantErr: true, wantCause: resolverCause},
 		{name: "nil resolved client", resolver: &testResolver{wantID: loopID, binding: InferenceBinding{Model: validModel("live")}}, ctx: context.Background(), loopID: loopID, kind: ResolveInvalidBinding, wantErr: true},
 		{name: "invalid resolved model", resolver: &testResolver{wantID: loopID, binding: InferenceBinding{Client: client}}, ctx: context.Background(), loopID: loopID, kind: ResolveInvalidBinding, wantErr: true},
-		{name: "invalid resolved model effort", resolver: &testResolver{wantID: loopID, binding: InferenceBinding{Client: client, Model: modelWithEffort(validModel("live"), inference.Effort("bogus"))}}, ctx: context.Background(), loopID: loopID, kind: ResolveInvalidBinding, wantErr: true},
+		{name: "invalid resolved model effort", resolver: &testResolver{wantID: loopID, binding: InferenceBinding{Client: client, Model: modelWithEffort(validModel("live"), model.Effort("bogus"))}}, ctx: context.Background(), loopID: loopID, kind: ResolveInvalidBinding, wantErr: true},
 		{name: "current nan temperature", resolver: &testResolver{wantID: loopID, binding: InferenceBinding{Client: client, Model: modelWithTemperature(validModel("live"), math.NaN())}}, ctx: context.Background(), loopID: loopID, kind: ResolveInvalidBinding, wantErr: true, noCause: true},
 		{name: "current positive infinity temperature", resolver: &testResolver{wantID: loopID, binding: InferenceBinding{Client: client, Model: modelWithTemperature(validModel("live"), math.Inf(1))}}, ctx: context.Background(), loopID: loopID, kind: ResolveInvalidBinding, wantErr: true, noCause: true},
 		{name: "current negative infinity temperature", resolver: &testResolver{wantID: loopID, binding: InferenceBinding{Client: client, Model: modelWithTemperature(validModel("live"), math.Inf(-1))}}, ctx: context.Background(), loopID: loopID, kind: ResolveInvalidBinding, wantErr: true, noCause: true},
@@ -525,37 +531,37 @@ func withoutOption(options []Option, index int) []Option {
 	return append(copyOf[:index], copyOf[index+1:]...)
 }
 
-func modelWithoutProvider(model inference.Model) inference.Model {
+func modelWithoutProvider(model model.Model) model.Model {
 	model.Provider = ""
 	return model
 }
 
-func modelWithTemperature(model inference.Model, value float64) inference.Model {
+func modelWithTemperature(model model.Model, value float64) model.Model {
 	model.Sampling.Temperature = &value
 	return model
 }
 
-func modelWithBaseURL(model inference.Model, value string) inference.Model {
+func modelWithBaseURL(model model.Model, value string) model.Model {
 	model.BaseURL = value
 	return model
 }
 
-func modelWithTopP(model inference.Model, value float64) inference.Model {
+func modelWithTopP(model model.Model, value float64) model.Model {
 	model.Sampling.TopP = &value
 	return model
 }
 
-func modelWithMaxTokens(model inference.Model, value int) inference.Model {
+func modelWithMaxTokens(model model.Model, value int) model.Model {
 	model.Sampling.MaxTokens = &value
 	return model
 }
 
-func modelWithStop(model inference.Model, value []string) inference.Model {
+func modelWithStop(model model.Model, value []string) model.Model {
 	model.Sampling.Stop = value
 	return model
 }
 
-func modelWithEffort(model inference.Model, effort inference.Effort) inference.Model {
+func modelWithEffort(model model.Model, effort model.Effort) model.Model {
 	model.Sampling.Effort = effort
 	return model
 }

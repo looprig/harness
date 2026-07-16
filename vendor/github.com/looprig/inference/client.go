@@ -5,27 +5,15 @@ import (
 	"encoding/json"
 
 	"github.com/looprig/core/content"
+	"github.com/looprig/inference/model"
+
+	"github.com/looprig/inference/stream"
 )
 
 // Client is the provider-neutral inference interface.
 type Client interface {
 	Invoke(ctx context.Context, req Request) (*Response, error)
-	Stream(ctx context.Context, req Request) (*StreamReader[content.Chunk], error)
-}
-
-// ProviderName is an opaque label identifying the backend a model/endpoint belongs to.
-// It carries no policy: inference does not define provider constants, provider auth
-// requirements, allowed wire formats, or default endpoints. Those belong to the llm module
-// or a consumer composition root. An empty ProviderName is a wildcard, not a claim.
-type ProviderName string
-
-// Endpoint is explicit client-binding metadata: the base URL the client is bound to plus
-// optional opaque provider/API-format labels. It carries no chat path — route shape belongs
-// to the injected Router. Empty label fields are wildcards, not claims.
-type Endpoint struct {
-	BaseURL   string
-	Provider  ProviderName
-	APIFormat APIFormat
+	Stream(ctx context.Context, req Request) (*stream.StreamReader[content.Chunk], error)
 }
 
 // Request is the provider-neutral inference request. It carries a secret-free
@@ -33,17 +21,17 @@ type Endpoint struct {
 // thread, the exposed tools, and an optional per-call sampling Override
 // (nil means use Model.Sampling).
 type Request struct {
-	Model    Model
+	Model    model.Model
 	System   string
 	Messages content.AgenticMessages
 	Tools    []Tool
-	Override *Sampling
+	Override *model.Sampling
 }
 
 // Response is the complete provider-neutral response.
 type Response struct {
 	Message *content.AIMessage
-	Usage   *Usage
+	Usage   *content.Usage
 	Model   string
 }
 

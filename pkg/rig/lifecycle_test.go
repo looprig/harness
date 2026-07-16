@@ -27,6 +27,8 @@ import (
 	"github.com/looprig/harness/pkg/tool"
 	"github.com/looprig/harness/pkg/workspacestore"
 	"github.com/looprig/inference"
+	model "github.com/looprig/inference/model"
+	stream "github.com/looprig/inference/stream"
 	storage "github.com/looprig/storage"
 	"github.com/looprig/storage/memstore"
 )
@@ -37,10 +39,10 @@ func (lifecycleLLM) Invoke(context.Context, inference.Request) (*inference.Respo
 	return nil, errors.New("Invoke not used")
 }
 
-func (lifecycleLLM) Stream(context.Context, inference.Request) (*inference.StreamReader[content.Chunk], error) {
+func (lifecycleLLM) Stream(context.Context, inference.Request) (*stream.StreamReader[content.Chunk], error) {
 	chunks := []content.Chunk{&content.TextChunk{Text: "done"}}
 	index := 0
-	return inference.NewStreamReader(func() (content.Chunk, error) {
+	return stream.NewStreamReader(func() (content.Chunk, error) {
 		if index == len(chunks) {
 			return nil, io.EOF
 		}
@@ -1098,8 +1100,8 @@ func TestRestoreReconstructsPrimerAndDelegateInferenceBeforeAdmission(t *testing
 		definition, err := loop.Define(
 			loop.WithName(identity.AgentName(name)), loop.WithInference(&stubLLM{}, validModel(name+"-base")),
 			loop.WithModes(
-				loop.Mode{Name: "plan", Model: validModel(name + "-plan"), Effort: inference.EffortLow},
-				loop.Mode{Name: "build", Model: validModel(name + "-build"), Effort: inference.EffortMedium},
+				loop.Mode{Name: "plan", Model: validModel(name + "-plan"), Effort: model.EffortLow},
+				loop.Mode{Name: "build", Model: validModel(name + "-build"), Effort: model.EffortMedium},
 			),
 			loop.WithInitialMode("plan"),
 			loop.WithDelegates(delegates...),
@@ -1138,13 +1140,13 @@ func TestRestoreReconstructsPrimerAndDelegateInferenceBeforeAdmission(t *testing
 	if err := primerController.SetMode(context.Background(), "build"); err != nil {
 		t.Fatal(err)
 	}
-	if err := primerController.Change(context.Background(), loop.ChangeModel(validModel("primer-routed")), loop.ChangeEffort(inference.EffortHigh)); err != nil {
+	if err := primerController.Change(context.Background(), loop.ChangeModel(validModel("primer-routed")), loop.ChangeEffort(model.EffortHigh)); err != nil {
 		t.Fatal(err)
 	}
 	if err := delegateController.SetMode(context.Background(), "build"); err != nil {
 		t.Fatal(err)
 	}
-	if err := delegateController.Change(context.Background(), loop.ChangeModel(validModel("delegate-routed")), loop.ChangeEffort(inference.EffortMax)); err != nil {
+	if err := delegateController.Change(context.Background(), loop.ChangeModel(validModel("delegate-routed")), loop.ChangeEffort(model.EffortMax)); err != nil {
 		t.Fatal(err)
 	}
 	if err := original.SetActiveLoop(context.Background(), delegateID); err != nil {
@@ -1160,7 +1162,7 @@ func TestRestoreReconstructsPrimerAndDelegateInferenceBeforeAdmission(t *testing
 		t.Fatal(err)
 	}
 	defer func() { _ = restored.Shutdown(context.Background()) }()
-	assertInference := func(label string, id uuid.UUID, wantModel string, wantEffort inference.Effort) {
+	assertInference := func(label string, id uuid.UUID, wantModel string, wantEffort model.Effort) {
 		t.Helper()
 		handle, ok := restored.Loop(id)
 		if !ok {
@@ -1171,8 +1173,8 @@ func TestRestoreReconstructsPrimerAndDelegateInferenceBeforeAdmission(t *testing
 			t.Fatalf("%s restored mode/model/effort = %q/%q/%q", label, handle.Mode(), model.Name, model.Sampling.Effort)
 		}
 	}
-	assertInference("primer", primerID, "primer-routed", inference.EffortHigh)
-	assertInference("delegate", delegateID, "delegate-routed", inference.EffortMax)
+	assertInference("primer", primerID, "primer-routed", model.EffortHigh)
+	assertInference("delegate", delegateID, "delegate-routed", model.EffortMax)
 	if restored.ActiveLoop().ID() != delegateID {
 		t.Fatalf("active loop = %v, want delegate %v", restored.ActiveLoop().ID(), delegateID)
 	}

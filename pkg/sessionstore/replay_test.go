@@ -18,7 +18,7 @@ import (
 	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/journal"
 	"github.com/looprig/harness/pkg/tool"
-	"github.com/looprig/inference"
+	model "github.com/looprig/inference/model"
 	"github.com/looprig/storage"
 	"github.com/looprig/storage/memstore"
 )
@@ -83,7 +83,7 @@ func buildFixture(t *testing.T, backend *storage.Composite) fixture {
 			Coordinates: identity.Coordinates{SessionID: id, LoopID: loopID},
 			EventID:     newTestUUID(t),
 		},
-		Runtime: event.ModelRuntime{Key: inference.ModelKey{Provider: "test", Model: "model"}},
+		Runtime: event.ModelRuntime{Key: model.ModelKey{Provider: "test", Model: "model"}},
 	}
 	interrupt := command.Interrupt{Header: command.Header{CommandID: newTestUUID(t)}}
 	// > replayThreshold once marshaled: forced down the offload path on append.
@@ -357,11 +357,11 @@ func TestEventReplayerNarrowsByLoop(t *testing.T) {
 	}
 	pLoop := event.LoopStarted{
 		Header:  event.Header{Coordinates: identity.Coordinates{SessionID: id, LoopID: primary}, EventID: newTestUUID(t)},
-		Runtime: event.ModelRuntime{Key: inference.ModelKey{Provider: "test", Model: "primary"}},
+		Runtime: event.ModelRuntime{Key: model.ModelKey{Provider: "test", Model: "primary"}},
 	}
 	sLoop := event.LoopStarted{
 		Header:  event.Header{Coordinates: identity.Coordinates{SessionID: id, LoopID: subagent}, EventID: newTestUUID(t)},
-		Runtime: event.ModelRuntime{Key: inference.ModelKey{Provider: "test", Model: "subagent"}},
+		Runtime: event.ModelRuntime{Key: model.ModelKey{Provider: "test", Model: "subagent"}},
 	}
 	pTurnDone := event.TurnDone{
 		Header:    event.Header{Coordinates: identity.Coordinates{SessionID: id, LoopID: primary, TurnID: pTurn}, EventID: newTestUUID(t)},

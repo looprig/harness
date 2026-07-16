@@ -8,6 +8,8 @@ import (
 
 	"github.com/looprig/core/content"
 	"github.com/looprig/inference"
+	model "github.com/looprig/inference/model"
+	stream "github.com/looprig/inference/stream"
 )
 
 // fakeLLM is a controllable inference.Client for tests.
@@ -23,13 +25,13 @@ func textChunk(s string) content.Chunk {
 	return &content.TextChunk{Text: s}
 }
 
-// testModel returns a minimal but VALID inference.Model (passes inference.Model.Validate):
+// testModel returns a minimal but VALID model.Model (passes model.Model.Validate):
 // a known provider speaking a supported wire dialect at a loopback endpoint. Tests
 // that only need a well-formed descriptor use it in place of the retired ModelSpec.
-func testModel() inference.Model {
-	return inference.Model{
-		Provider:  inference.ProviderName("lmstudio"),
-		APIFormat: inference.APIFormatOpenAI,
+func testModel() model.Model {
+	return model.Model{
+		Provider:  model.ProviderName("lmstudio"),
+		APIFormat: model.APIFormatOpenAI,
 		BaseURL:   "http://localhost:1234",
 		Name:      "m",
 	}
@@ -39,7 +41,7 @@ func (f *fakeLLM) Invoke(ctx context.Context, req inference.Request) (*inference
 	return nil, errors.New("fakeLLM.Invoke not used")
 }
 
-func (f *fakeLLM) Stream(ctx context.Context, req inference.Request) (*inference.StreamReader[content.Chunk], error) {
+func (f *fakeLLM) Stream(ctx context.Context, req inference.Request) (*stream.StreamReader[content.Chunk], error) {
 	if f.streamErr != nil {
 		return nil, f.streamErr
 	}
@@ -62,7 +64,7 @@ func (f *fakeLLM) Stream(ctx context.Context, req inference.Request) (*inference
 		}
 		return nil, io.EOF
 	}
-	return inference.NewStreamReader(next, nil), nil
+	return stream.NewStreamReader(next, nil), nil
 }
 
 // recordingLLM records each request it receives, then streams a fixed response.
@@ -75,7 +77,7 @@ type recordingLLM struct {
 func (r *recordingLLM) Invoke(ctx context.Context, req inference.Request) (*inference.Response, error) {
 	return nil, errors.New("recordingLLM.Invoke not used")
 }
-func (r *recordingLLM) Stream(ctx context.Context, req inference.Request) (*inference.StreamReader[content.Chunk], error) {
+func (r *recordingLLM) Stream(ctx context.Context, req inference.Request) (*stream.StreamReader[content.Chunk], error) {
 	r.mu.Lock()
 	r.reqs = append(r.reqs, req)
 	r.mu.Unlock()
@@ -88,7 +90,7 @@ func (r *recordingLLM) Stream(ctx context.Context, req inference.Request) (*infe
 		}
 		return nil, io.EOF
 	}
-	return inference.NewStreamReader(next, nil), nil
+	return stream.NewStreamReader(next, nil), nil
 }
 func (r *recordingLLM) lastReq() inference.Request {
 	r.mu.Lock()
@@ -102,6 +104,6 @@ type panicLLM struct{}
 func (panicLLM) Invoke(ctx context.Context, req inference.Request) (*inference.Response, error) {
 	return nil, errors.New("unused")
 }
-func (panicLLM) Stream(ctx context.Context, req inference.Request) (*inference.StreamReader[content.Chunk], error) {
+func (panicLLM) Stream(ctx context.Context, req inference.Request) (*stream.StreamReader[content.Chunk], error) {
 	panic("boom in Stream")
 }

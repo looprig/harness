@@ -19,6 +19,8 @@ import (
 	"github.com/looprig/harness/pkg/security"
 	"github.com/looprig/harness/pkg/tool"
 	"github.com/looprig/inference"
+	model "github.com/looprig/inference/model"
+	stream "github.com/looprig/inference/stream"
 )
 
 type livePermissionGate struct{ effect atomic.Uint32 }
@@ -130,8 +132,8 @@ type releasedFailureLLM struct {
 func (l *releasedFailureLLM) Invoke(context.Context, inference.Request) (*inference.Response, error) {
 	return nil, errors.New("releasedFailureLLM.Invoke not used")
 }
-func (l *releasedFailureLLM) Stream(context.Context, inference.Request) (*inference.StreamReader[content.Chunk], error) {
-	return inference.NewStreamReader(func() (content.Chunk, error) {
+func (l *releasedFailureLLM) Stream(context.Context, inference.Request) (*stream.StreamReader[content.Chunk], error) {
+	return stream.NewStreamReader(func() (content.Chunk, error) {
 		l.once.Do(func() { close(l.started) })
 		<-l.release
 		return nil, l.err
@@ -143,8 +145,8 @@ func delegateChildWithModes(name, finalText string) loop.Definition {
 		loop.WithName(identity.AgentName(name)),
 		loop.WithInference(&stubLLM{chunks: []content.Chunk{textChunk(finalText)}}, validModel(name)),
 		loop.WithModes(
-			loop.Mode{Name: "build", Effort: inference.EffortHigh, Instructions: "build-i"},
-			loop.Mode{Name: "review", Effort: inference.EffortLow, Instructions: "review-i"},
+			loop.Mode{Name: "build", Effort: testEffortHigh, Instructions: "build-i"},
+			loop.Mode{Name: "review", Effort: model.EffortLow, Instructions: "review-i"},
 		),
 		loop.WithInitialMode("build"),
 		loop.WithDrainTimeout(100*time.Millisecond),

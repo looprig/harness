@@ -10,13 +10,14 @@ import (
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/inference"
+	contextcount "github.com/looprig/inference/contextcount"
 )
 
 type compactionExecutorConfig struct {
 	Compactor           Compactor
-	Counter             inference.ContextCounter
-	CounterCapability   inference.CounterCapability
-	InferenceCapability inference.InferenceCapability
+	Counter             contextcount.ContextCounter
+	CounterCapability   contextcount.CounterCapability
+	InferenceCapability contextcount.InferenceCapability
 	Settings            contextAdmissionSettings
 	MaxSummaryTokens    content.TokenCount
 }
@@ -103,7 +104,7 @@ func nilCompactor(compactor Compactor) bool {
 	return compactor == nil || nilInterfaceImplementation(reflect.ValueOf(compactor))
 }
 
-func nilContextCounter(counter inference.ContextCounter) bool {
+func nilContextCounter(counter contextcount.ContextCounter) bool {
 	return counter == nil || nilInterfaceImplementation(reflect.ValueOf(counter))
 }
 
@@ -266,7 +267,7 @@ func compactionRejectReason(err error) event.CompactRejectReason {
 	if errors.As(err, &unknown) {
 		return event.CompactRejectContextLimitUnknown
 	}
-	var count *inference.ContextCountError
+	var count *contextcount.ContextCountError
 	if errors.As(err, &count) {
 		return event.CompactRejectContextCountFailed
 	}

@@ -3,7 +3,8 @@ package event
 import (
 	"github.com/looprig/core/content"
 	"github.com/looprig/core/uuid"
-	"github.com/looprig/inference"
+	contextcount "github.com/looprig/inference/contextcount"
+	model "github.com/looprig/inference/model"
 )
 
 // ContextRevision is the loop-local revision of the committed active context.
@@ -18,12 +19,12 @@ type ContextBasis struct {
 
 // ContextMeasurement is one authoritative complete-request input count.
 type ContextMeasurement struct {
-	Basis              ContextBasis           `json:"basis"`
-	Model              inference.ModelKey     `json:"model"`
-	RequestFingerprint [32]byte               `json:"request_fingerprint"`
-	InputTokens        content.TokenCount     `json:"input_tokens"`
-	InputLimit         content.TokenCount     `json:"input_limit"`
-	Quality            inference.CountQuality `json:"quality"`
+	Basis              ContextBasis              `json:"basis"`
+	Model              model.ModelKey            `json:"model"`
+	RequestFingerprint [32]byte                  `json:"request_fingerprint"`
+	InputTokens        content.TokenCount        `json:"input_tokens"`
+	InputLimit         content.TokenCount        `json:"input_limit"`
+	Quality            contextcount.CountQuality `json:"quality"`
 }
 
 // ContextField identifies an invalid structural measurement field.
@@ -78,10 +79,10 @@ func (m ContextMeasurement) Validate() error {
 	return nil
 }
 
-func validContextCountQuality(quality inference.CountQuality) bool {
-	return quality == inference.CountQualityExactProvider ||
-		quality == inference.CountQualityExactLocal ||
-		quality == inference.CountQualityHeuristicEstimate
+func validContextCountQuality(quality contextcount.CountQuality) bool {
+	return quality == contextcount.CountQualityExactProvider ||
+		quality == contextcount.CountQualityExactLocal ||
+		quality == contextcount.CountQualityHeuristicEstimate
 }
 
 // BasisPoints is a percentage scaled by 100. Values above 10_000 are invalid.

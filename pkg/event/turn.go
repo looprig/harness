@@ -2,16 +2,16 @@ package event
 
 import (
 	"github.com/looprig/core/content"
-	"github.com/looprig/inference"
+	model "github.com/looprig/inference/model"
 )
 
 // ModelRuntime is the single durable, secret-free description of the model
 // runtime selected for a loop. It deliberately excludes endpoint and catalog
 // data so journal replay and catalog repair do not depend on mutable config.
 type ModelRuntime struct {
-	Key    inference.ModelKey      `json:"key"`
-	Limits inference.ContextLimits `json:"limits"`
-	Effort inference.Effort        `json:"effort,omitzero"`
+	Key    model.ModelKey      `json:"key"`
+	Limits model.ContextLimits `json:"limits"`
+	Effort model.Effort        `json:"effort,omitzero"`
 }
 
 // LoopInferenceChanged durably selects the resolved secret-free runtime for

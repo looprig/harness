@@ -9,7 +9,7 @@ import (
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/hustle"
 	"github.com/looprig/harness/pkg/loop"
-	"github.com/looprig/inference"
+	model "github.com/looprig/inference/model"
 )
 
 func FuzzCompactionJSON(f *testing.F) {
@@ -21,7 +21,7 @@ func FuzzCompactionJSON(f *testing.F) {
 	fingerprint[0] = 1
 	input := loop.CompactionInput{
 		Basis: event.ContextBasis{Revision: 1, ThroughEventID: eventID},
-		Model: inference.ModelKey{Provider: "provider", Model: "model"}, RequestFingerprint: fingerprint,
+		Model: model.ModelKey{Provider: "provider", Model: "model"}, RequestFingerprint: fingerprint,
 		Transcript:       content.AgenticMessages{&content.UserMessage{Message: content.Message{Role: content.RoleUser}}},
 		MaxSummaryTokens: 16,
 	}

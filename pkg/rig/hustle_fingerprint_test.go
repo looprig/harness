@@ -9,6 +9,8 @@ import (
 	"github.com/looprig/harness/pkg/hustle"
 	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/inference"
+	model "github.com/looprig/inference/model"
+	stream "github.com/looprig/inference/stream"
 )
 
 type credentialedHustleClient struct{ credential string }
@@ -17,7 +19,7 @@ func (*credentialedHustleClient) Invoke(context.Context, inference.Request) (*in
 	return nil, nil
 }
 
-func (*credentialedHustleClient) Stream(context.Context, inference.Request) (*inference.StreamReader[content.Chunk], error) {
+func (*credentialedHustleClient) Stream(context.Context, inference.Request) (*stream.StreamReader[content.Chunk], error) {
 	return nil, nil
 }
 
@@ -26,7 +28,7 @@ type rigHustleSpec struct {
 	participation hustle.Participation
 	modelSource   hustle.ModelSource
 	client        inference.Client
-	model         inference.Model
+	model         model.Model
 	prompt        string
 	promptRev     string
 	policyRev     string

@@ -12,7 +12,7 @@ import (
 	"github.com/looprig/harness/pkg/hustle"
 	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/journal"
-	"github.com/looprig/inference"
+	model "github.com/looprig/inference/model"
 	"github.com/looprig/storage/memstore"
 )
 
@@ -66,7 +66,7 @@ func TestEventReplayVisibilityAndPrivilegedSeam(t *testing.T) {
 	publicBefore := event.SessionStarted{Header: event.Header{Coordinates: identity.Coordinates{SessionID: sid}, EventID: newTestUUID(t)}}
 	completedStart := replayHustleStarted(t, sid)
 	completedRun := completedStart.Run
-	completedRun.Runtime = event.ModelRuntime{Key: inference.ModelKey{Provider: "provider", Model: "model"}, Limits: inference.ContextLimits{WindowTokens: 100}}
+	completedRun.Runtime = event.ModelRuntime{Key: model.ModelKey{Provider: "provider", Model: "model"}, Limits: model.ContextLimits{WindowTokens: 100}}
 	completedHeader := completedStart.Header
 	completedHeader.EventID = newTestUUID(t)
 	completed := event.HustleCompleted{Header: completedHeader, Run: completedRun}

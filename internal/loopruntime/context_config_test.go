@@ -11,21 +11,27 @@ import (
 	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/harness/pkg/tool"
 	"github.com/looprig/inference"
+	contextcount "github.com/looprig/inference/contextcount"
+	model "github.com/looprig/inference/model"
 )
 
-type runtimeContextCounter struct{ capability inference.CounterCapability }
+type runtimeContextCounter struct {
+	capability contextcount.CounterCapability
+}
 
-func (*runtimeContextCounter) CountContext(context.Context, inference.Request) (inference.ContextCount, error) {
+func (*runtimeContextCounter) CountContext(context.Context, inference.Request) (contextcount.ContextCount, error) {
 	panic("unused")
 }
-func (c *runtimeContextCounter) CounterCapability() inference.CounterCapability { return c.capability }
+func (c *runtimeContextCounter) CounterCapability() contextcount.CounterCapability {
+	return c.capability
+}
 
 func contextBoundDefinition(t *testing.T, client inference.Client) loop.BoundDefinition {
 	t.Helper()
-	counter := &runtimeContextCounter{capability: inference.CounterCapability{Transport: inference.CounterTransportLocal, Retention: inference.RetentionNone, TokenizerRev: "v1", Quality: inference.CountQualityExactLocal}}
+	counter := &runtimeContextCounter{capability: contextcount.CounterCapability{Transport: contextcount.CounterTransportLocal, Retention: contextcount.RetentionNone, TokenizerRev: "v1", Quality: contextcount.CountQualityExactLocal}}
 	definition, err := loop.Define(
 		loop.WithName("agent"), loop.WithInference(client, testModel()), loop.WithContextCounter(counter),
-		loop.WithInferenceCapability(inference.InferenceCapability{Transport: inference.InferenceTransportLocal, Retention: inference.RetentionNone}),
+		loop.WithInferenceCapability(contextcount.InferenceCapability{Transport: contextcount.InferenceTransportLocal, Retention: contextcount.RetentionNone}),
 		loop.WithCompaction(loop.CompactionPolicy{ReservedOutput: 10, MaxSummaryTokens: 5, CountTimeout: 37*time.Millisecond + time.Nanosecond, Hustle: "context.compact"}),
 	)
 	if err != nil {
@@ -76,11 +82,11 @@ func TestConfigFromBoundCopiesObservationConfiguration(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			counter := &runtimeContextCounter{capability: inference.CounterCapability{Transport: inference.CounterTransportLocal, Retention: inference.RetentionNone, TokenizerRev: "v1", Quality: inference.CountQualityExactLocal}}
+			counter := &runtimeContextCounter{capability: contextcount.CounterCapability{Transport: contextcount.CounterTransportLocal, Retention: contextcount.RetentionNone, TokenizerRev: "v1", Quality: contextcount.CountQualityExactLocal}}
 			policy := loop.ContextObservationPolicy{ReservedOutput: 10, CountTimeout: 41*time.Millisecond + time.Nanosecond}
 			definition, err := loop.Define(
 				loop.WithName("agent"), loop.WithInference(&fakeLLM{}, testModel()), loop.WithContextCounter(counter),
-				loop.WithInferenceCapability(inference.InferenceCapability{Transport: inference.InferenceTransportLocal, Retention: inference.RetentionNone}),
+				loop.WithInferenceCapability(contextcount.InferenceCapability{Transport: contextcount.InferenceTransportLocal, Retention: contextcount.RetentionNone}),
 				loop.WithContextObservation(policy),
 			)
 			if err != nil {
@@ -113,9 +119,9 @@ func TestChangeInferenceRejectsContextTransportSwap(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
 		name   string
-		mutate func(*inference.Model)
+		mutate func(*model.Model)
 	}{
-		{name: "provider", mutate: func(model *inference.Model) { model.Provider = "other" }},
+		{name: "provider", mutate: func(model *model.Model) { model.Provider = "other" }},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

@@ -16,6 +16,7 @@ import (
 	"github.com/looprig/harness/pkg/hustle"
 	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/inference"
+	stream "github.com/looprig/inference/stream"
 )
 
 type shutdownHustleClient struct{ invoked chan struct{} }
@@ -26,7 +27,7 @@ func (c *shutdownHustleClient) Invoke(ctx context.Context, _ inference.Request) 
 	return nil, ctx.Err()
 }
 
-func (*shutdownHustleClient) Stream(context.Context, inference.Request) (*inference.StreamReader[content.Chunk], error) {
+func (*shutdownHustleClient) Stream(context.Context, inference.Request) (*stream.StreamReader[content.Chunk], error) {
 	return nil, &shutdownHustleStreamError{}
 }
 
@@ -50,7 +51,7 @@ func (c *ignoringShutdownHustleClient) Invoke(context.Context, inference.Request
 	return nil, context.Canceled
 }
 
-func (*ignoringShutdownHustleClient) Stream(context.Context, inference.Request) (*inference.StreamReader[content.Chunk], error) {
+func (*ignoringShutdownHustleClient) Stream(context.Context, inference.Request) (*stream.StreamReader[content.Chunk], error) {
 	return nil, &shutdownHustleStreamError{}
 }
 
@@ -61,7 +62,7 @@ func (c *gatedShutdownHustleClient) Invoke(ctx context.Context, _ inference.Requ
 	return nil, ctx.Err()
 }
 
-func (*gatedShutdownHustleClient) Stream(context.Context, inference.Request) (*inference.StreamReader[content.Chunk], error) {
+func (*gatedShutdownHustleClient) Stream(context.Context, inference.Request) (*stream.StreamReader[content.Chunk], error) {
 	return nil, &shutdownHustleStreamError{}
 }
 

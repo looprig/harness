@@ -9,7 +9,7 @@ import (
 	"github.com/looprig/core/content"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/identity"
-	"github.com/looprig/inference"
+	model "github.com/looprig/inference/model"
 )
 
 func TestUsageBearingEventsRoundTrip(t *testing.T) {
@@ -70,9 +70,9 @@ func TestModelRuntimeLifecycleRoundTrip(t *testing.T) {
 	sessionID, loopID := vID(t), vID(t)
 	header := event.Header{Coordinates: identity.Coordinates{SessionID: sessionID, LoopID: loopID}, EventID: vID(t)}
 	runtime := event.ModelRuntime{
-		Key:    inference.ModelKey{Provider: "openrouter", Model: "anthropic/claude-sonnet-4"},
-		Limits: inference.ContextLimits{WindowTokens: 200_000, MaxInputTokens: 180_000, MaxOutputTokens: 20_000},
-		Effort: inference.EffortHigh,
+		Key:    model.ModelKey{Provider: "openrouter", Model: "anthropic/claude-sonnet-4"},
+		Limits: model.ContextLimits{WindowTokens: 200_000, MaxInputTokens: 180_000, MaxOutputTokens: 20_000},
+		Effort: model.EffortHigh,
 	}
 	tests := []struct {
 		name string
@@ -104,17 +104,17 @@ func TestModelRuntimeValidation(t *testing.T) {
 	t.Parallel()
 	sessionID, loopID := vID(t), vID(t)
 	header := event.Header{Coordinates: identity.Coordinates{SessionID: sessionID, LoopID: loopID}, EventID: vID(t)}
-	valid := event.ModelRuntime{Key: inference.ModelKey{Provider: "provider", Model: "model"}, Limits: inference.ContextLimits{WindowTokens: 100}, Effort: inference.EffortLow}
+	valid := event.ModelRuntime{Key: model.ModelKey{Provider: "provider", Model: "model"}, Limits: model.ContextLimits{WindowTokens: 100}, Effort: model.EffortLow}
 	tests := []struct {
 		name      string
 		runtime   event.ModelRuntime
 		wantField event.FieldName
 	}{
 		{name: "valid runtime", runtime: valid},
-		{name: "missing provider", runtime: event.ModelRuntime{Key: inference.ModelKey{Model: "model"}}, wantField: event.FieldModelKey},
-		{name: "missing model", runtime: event.ModelRuntime{Key: inference.ModelKey{Provider: "provider"}}, wantField: event.FieldModelKey},
-		{name: "limit exceeds window", runtime: event.ModelRuntime{Key: valid.Key, Limits: inference.ContextLimits{WindowTokens: 10, MaxInputTokens: 11}}, wantField: event.FieldContextLimits},
-		{name: "invalid effort", runtime: event.ModelRuntime{Key: valid.Key, Effort: inference.Effort("extreme")}, wantField: event.FieldEffort},
+		{name: "missing provider", runtime: event.ModelRuntime{Key: model.ModelKey{Model: "model"}}, wantField: event.FieldModelKey},
+		{name: "missing model", runtime: event.ModelRuntime{Key: model.ModelKey{Provider: "provider"}}, wantField: event.FieldModelKey},
+		{name: "limit exceeds window", runtime: event.ModelRuntime{Key: valid.Key, Limits: model.ContextLimits{WindowTokens: 10, MaxInputTokens: 11}}, wantField: event.FieldContextLimits},
+		{name: "invalid effort", runtime: event.ModelRuntime{Key: valid.Key, Effort: model.Effort("extreme")}, wantField: event.FieldEffort},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -151,9 +151,9 @@ func TestLifecycleDecodeMigratesLegacyRuntime(t *testing.T) {
 	prefix := `,"v":1,"session_id":"` + sessionID.String() + `","loop_id":"` + loopID.String() + `","event_id":"` + eventID.String() + `"`
 	legacyModel := `,"model":{"Provider":"openai","APIFormat":"responses","BaseURL":"https://api.openai.com","Name":"gpt-legacy","Origin":0,"Caps":{"AcceptsImages":false,"MaxContext":128000,"Tools":true,"Thinking":true},"Sampling":{}},"effort":"high"`
 	wantMigrated := event.ModelRuntime{
-		Key:    inference.ModelKey{Provider: "openai", Model: "gpt-legacy"},
-		Limits: inference.ContextLimits{WindowTokens: 128_000},
-		Effort: inference.EffortHigh,
+		Key:    model.ModelKey{Provider: "openai", Model: "gpt-legacy"},
+		Limits: model.ContextLimits{WindowTokens: 128_000},
+		Effort: model.EffortHigh,
 	}
 	tests := []struct {
 		name        string

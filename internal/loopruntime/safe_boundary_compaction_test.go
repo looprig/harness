@@ -17,6 +17,8 @@ import (
 	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/harness/pkg/tool"
 	"github.com/looprig/inference"
+	contextcount "github.com/looprig/inference/contextcount"
+	model "github.com/looprig/inference/model"
 )
 
 type executorTestCompactor struct {
@@ -27,11 +29,11 @@ type executorTestCompactor struct {
 
 type typedNilExecutorCounter struct{}
 
-func (*typedNilExecutorCounter) CountContext(context.Context, inference.Request) (inference.ContextCount, error) {
+func (*typedNilExecutorCounter) CountContext(context.Context, inference.Request) (contextcount.ContextCount, error) {
 	panic("typed nil counter must not be called")
 }
 
-func (*typedNilExecutorCounter) CounterCapability() inference.CounterCapability {
+func (*typedNilExecutorCounter) CounterCapability() contextcount.CounterCapability {
 	panic("typed nil counter must not be called")
 }
 
@@ -115,21 +117,21 @@ func (c *executorTestCompactor) CompactAndFinalize(ctx context.Context, input lo
 }
 
 type executorDeadlineCounter struct {
-	capability  inference.CounterCapability
+	capability  contextcount.CounterCapability
 	calls       int
 	sawDeadline bool
 }
 
 type sequenceContextCounter struct {
 	mu         sync.Mutex
-	capability inference.CounterCapability
+	capability contextcount.CounterCapability
 	counts     []content.TokenCount
 	errs       []error
 	requests   []inference.Request
 }
 
 type gatedIdleContextCounter struct {
-	capability inference.CounterCapability
+	capability contextcount.CounterCapability
 	started    chan struct{}
 	release    chan struct{}
 	err        error
@@ -138,7 +140,7 @@ type gatedIdleContextCounter struct {
 
 type idleMutationContextCounter struct {
 	mu         sync.Mutex
-	capability inference.CounterCapability
+	capability contextcount.CounterCapability
 	calls      int
 	idleStart  chan struct{}
 	idleExit   chan struct{}
@@ -160,7 +162,7 @@ func (*preparationContextTool) InvokableRun(context.Context, string) (*tool.Tool
 	panic("preparation context tool must not run")
 }
 
-func (c *idleMutationContextCounter) CountContext(ctx context.Context, request inference.Request) (inference.ContextCount, error) {
+func (c *idleMutationContextCounter) CountContext(ctx context.Context, request inference.Request) (contextcount.ContextCount, error) {
 	c.mu.Lock()
 	c.calls++
 	call := c.calls
@@ -169,12 +171,12 @@ func (c *idleMutationContextCounter) CountContext(ctx context.Context, request i
 		close(c.idleStart)
 		<-ctx.Done()
 		close(c.idleExit)
-		return inference.ContextCount{}, ctx.Err()
+		return contextcount.ContextCount{}, ctx.Err()
 	}
-	return inference.ContextCount{Model: request.Model.Key(), InputTokens: 25, Quality: c.capability.Quality}, nil
+	return contextcount.ContextCount{Model: request.Model.Key(), InputTokens: 25, Quality: c.capability.Quality}, nil
 }
 
-func (c *idleMutationContextCounter) CounterCapability() inference.CounterCapability {
+func (c *idleMutationContextCounter) CounterCapability() contextcount.CounterCapability {
 	return c.capability
 }
 
@@ -207,39 +209,41 @@ func (s *idleCandidateRecordingSink) candidateCallCount() int {
 	return s.candidateCalls
 }
 
-func (c *gatedIdleContextCounter) CountContext(ctx context.Context, request inference.Request) (inference.ContextCount, error) {
+func (c *gatedIdleContextCounter) CountContext(ctx context.Context, request inference.Request) (contextcount.ContextCount, error) {
 	c.once.Do(func() { close(c.started) })
 	select {
 	case <-c.release:
 	case <-ctx.Done():
-		return inference.ContextCount{}, ctx.Err()
+		return contextcount.ContextCount{}, ctx.Err()
 	}
 	if c.err != nil {
-		return inference.ContextCount{}, c.err
+		return contextcount.ContextCount{}, c.err
 	}
-	return inference.ContextCount{Model: request.Model.Key(), InputTokens: 40, Quality: c.capability.Quality}, nil
+	return contextcount.ContextCount{Model: request.Model.Key(), InputTokens: 40, Quality: c.capability.Quality}, nil
 }
 
-func (c *gatedIdleContextCounter) CounterCapability() inference.CounterCapability {
+func (c *gatedIdleContextCounter) CounterCapability() contextcount.CounterCapability {
 	return c.capability
 }
 
-func (c *sequenceContextCounter) CountContext(_ context.Context, request inference.Request) (inference.ContextCount, error) {
+func (c *sequenceContextCounter) CountContext(_ context.Context, request inference.Request) (contextcount.ContextCount, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	index := len(c.requests)
 	c.requests = append(c.requests, request)
 	if index < len(c.errs) && c.errs[index] != nil {
-		return inference.ContextCount{}, c.errs[index]
+		return contextcount.ContextCount{}, c.errs[index]
 	}
 	count := c.counts[len(c.counts)-1]
 	if index < len(c.counts) {
 		count = c.counts[index]
 	}
-	return inference.ContextCount{Model: request.Model.Key(), InputTokens: count, Quality: c.capability.Quality}, nil
+	return contextcount.ContextCount{Model: request.Model.Key(), InputTokens: count, Quality: c.capability.Quality}, nil
 }
 
-func (c *sequenceContextCounter) CounterCapability() inference.CounterCapability { return c.capability }
+func (c *sequenceContextCounter) CounterCapability() contextcount.CounterCapability {
+	return c.capability
+}
 
 type outcomeErrorCompactor struct{ err error }
 
@@ -247,27 +251,27 @@ func (c outcomeErrorCompactor) CompactAndFinalize(ctx context.Context, _ loop.Co
 	return finalizer(ctx, CompactionOutcome{Err: c.err})
 }
 
-func (c *executorDeadlineCounter) CountContext(ctx context.Context, request inference.Request) (inference.ContextCount, error) {
+func (c *executorDeadlineCounter) CountContext(ctx context.Context, request inference.Request) (contextcount.ContextCount, error) {
 	c.calls++
 	_, c.sawDeadline = ctx.Deadline()
 	<-ctx.Done()
-	return inference.ContextCount{Model: request.Model.Key(), Quality: c.capability.Quality}, ctx.Err()
+	return contextcount.ContextCount{Model: request.Model.Key(), Quality: c.capability.Quality}, ctx.Err()
 }
 
-func (c *executorDeadlineCounter) CounterCapability() inference.CounterCapability {
+func (c *executorDeadlineCounter) CounterCapability() contextcount.CounterCapability {
 	return c.capability
 }
 
 func TestNewCompactionExecutorRejectsTypedNilCollaborators(t *testing.T) {
 	t.Parallel()
-	validCounter := &loopContextCounter{capability: contextTestCapability(inference.CountQualityExactLocal)}
+	validCounter := &loopContextCounter{capability: contextTestCapability(contextcount.CountQualityExactLocal)}
 	validCompactor := &executorTestCompactor{}
 	var nilCompactor *executorTestCompactor
 	var nilCounter *typedNilExecutorCounter
 	tests := []struct {
 		name      string
 		compactor Compactor
-		counter   inference.ContextCounter
+		counter   contextcount.ContextCounter
 		wantField string
 	}{
 		{name: "typed nil compactor", compactor: nilCompactor, counter: validCounter, wantField: "compactor"},
@@ -337,7 +341,7 @@ func TestIdleManualCompactionBuildsStableBaseCandidate(t *testing.T) {
 			t.Cleanup(cancel)
 			recorder := &recordingPublisher{}
 			counter := &sequenceContextCounter{
-				capability: contextTestCapability(inference.CountQualityExactLocal),
+				capability: contextTestCapability(contextcount.CountQualityExactLocal),
 				counts:     []content.TokenCount{40, 20},
 			}
 			compactor := &echoExecutorCompactor{summary: validFinalizationSummary()}
@@ -359,7 +363,7 @@ func TestIdleManualCompactionBuildsStableBaseCandidate(t *testing.T) {
 				t.Fatalf("newCompactionExecutor() error = %v", err)
 			}
 			model := testModel()
-			model.Limits = inference.ContextLimits{WindowTokens: 100, MaxInputTokens: 80, MaxOutputTokens: 20}
+			model.Limits = testContextLimits{WindowTokens: 100, MaxInputTokens: 80, MaxOutputTokens: 20}
 			basis := event.ContextBasis{Revision: 3, ThroughEventID: uuid.UUID{0x81}}
 			transcript := content.AgenticMessages{replacementTestMessage("committed history")}
 			actor, err := newRestoredWithConfig(ctx, uuid.UUID{0x82}, uuid.UUID{0x83}, recorder, runtimeConfig{
@@ -461,7 +465,7 @@ func TestIdleManualCompactionPreCountFailureRejectsWithoutStarting(t *testing.T)
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			counter := &sequenceContextCounter{
-				capability: contextTestCapability(inference.CountQualityExactLocal), errs: []error{tt.err},
+				capability: contextTestCapability(contextcount.CountQualityExactLocal), errs: []error{tt.err},
 			}
 			compactor := &echoExecutorCompactor{summary: validFinalizationSummary()}
 			actor, recorder, _ := newRestoredIdleCompactionActor(t, counter, counter.capability, compactor)
@@ -502,7 +506,7 @@ func TestIdleManualCompactionStalePreCountRejectsWithoutStarting(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			counter := &gatedIdleContextCounter{
-				capability: contextTestCapability(inference.CountQualityExactLocal),
+				capability: contextTestCapability(contextcount.CountQualityExactLocal),
 				started:    make(chan struct{}), release: make(chan struct{}),
 			}
 			compactor := &echoExecutorCompactor{summary: validFinalizationSummary()}
@@ -561,12 +565,12 @@ func TestIdleManualCompactionInterruptsPreCountWithoutStarting(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			ctx, cancel := context.WithCancel(context.Background())
 			t.Cleanup(cancel)
-			capability := contextTestCapability(inference.CountQualityExactLocal)
+			capability := contextTestCapability(contextcount.CountQualityExactLocal)
 			counter := &gatedIdleContextCounter{capability: capability, started: make(chan struct{}), release: make(chan struct{})}
 			sink := &idleCandidateRecordingSink{recordingCompactionSink: newRecordingCompactionSink()}
 			recorder := &recordingPublisher{}
 			model := testModel()
-			model.Limits = inference.ContextLimits{WindowTokens: 100, MaxInputTokens: 80, MaxOutputTokens: 20}
+			model.Limits = testContextLimits{WindowTokens: 100, MaxInputTokens: 80, MaxOutputTokens: 20}
 			actor, err := newRestoredWithConfig(ctx, uuid.UUID{0xa1}, uuid.UUID{0xa2}, recorder, runtimeConfig{
 				Client: &scriptedLLM{}, Model: model, ContextCounter: counter, CounterCapability: capability,
 				InferenceCapability: contextTestInferenceCapability(), DrainTimeout: 200 * time.Millisecond,
@@ -616,7 +620,7 @@ func TestIdleCompactionReservationBecomesStaleBeforeNewTurnMeasurement(t *testin
 			ctx, cancel := context.WithCancel(context.Background())
 			t.Cleanup(cancel)
 			recorder := &recordingPublisher{}
-			capability := contextTestCapability(inference.CountQualityExactLocal)
+			capability := contextTestCapability(contextcount.CountQualityExactLocal)
 			counter := &idleMutationContextCounter{capability: capability, idleStart: make(chan struct{}), idleExit: make(chan struct{})}
 			primarySawStale := make(chan bool, 1)
 			client := &scriptedLLM{scripts: [][]content.Chunk{{textChunk("next response")}}, onStreamN: map[int]func(){0: func() {
@@ -641,7 +645,7 @@ func TestIdleCompactionReservationBecomesStaleBeforeNewTurnMeasurement(t *testin
 				t.Fatalf("newCompactionExecutor() error = %v", err)
 			}
 			model := testModel()
-			model.Limits = inference.ContextLimits{WindowTokens: 100, MaxInputTokens: 80, MaxOutputTokens: 20}
+			model.Limits = testContextLimits{WindowTokens: 100, MaxInputTokens: 80, MaxOutputTokens: 20}
 			actor, err := newRestoredWithConfig(ctx, uuid.UUID{0xb1}, uuid.UUID{0xb2}, recorder, runtimeConfig{
 				Client: client, Model: model, ContextCounter: counter, CounterCapability: capability,
 				InferenceCapability: contextTestInferenceCapability(), DrainTimeout: 200 * time.Millisecond,
@@ -693,13 +697,13 @@ func TestIdleCompactionToolDefinitionsUsePreparationContext(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			ctx, cancel := context.WithCancel(context.Background())
 			t.Cleanup(cancel)
-			capability := contextTestCapability(inference.CountQualityExactLocal)
+			capability := contextTestCapability(contextcount.CountQualityExactLocal)
 			counter := &sequenceContextCounter{capability: capability, counts: []content.TokenCount{40}}
 			blocking := &preparationContextTool{started: make(chan struct{}), exited: make(chan struct{})}
 			sink := &idleCandidateRecordingSink{recordingCompactionSink: newRecordingCompactionSink()}
 			recorder := &recordingPublisher{}
 			model := testModel()
-			model.Limits = inference.ContextLimits{WindowTokens: 100, MaxInputTokens: 80, MaxOutputTokens: 20}
+			model.Limits = testContextLimits{WindowTokens: 100, MaxInputTokens: 80, MaxOutputTokens: 20}
 			actor, err := newRestoredWithConfig(ctx, uuid.UUID{0xc1}, uuid.UUID{0xc2}, recorder, runtimeConfig{
 				Client: &scriptedLLM{}, Model: model, Tools: agenticToolSet([]tool.InvokableTool{blocking}, 25, 100),
 				ContextCounter: counter, CounterCapability: capability, InferenceCapability: contextTestInferenceCapability(),
@@ -754,10 +758,10 @@ func TestIdleCompactionToolDefinitionsUsePreparationContext(t *testing.T) {
 
 func newRestoredIdleCompactionActor(
 	t *testing.T,
-	counter inference.ContextCounter,
-	capability inference.CounterCapability,
+	counter contextcount.ContextCounter,
+	capability contextcount.CounterCapability,
 	compactor Compactor,
-) (*Loop, *recordingPublisher, inference.Model) {
+) (*Loop, *recordingPublisher, model.Model) {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
@@ -771,7 +775,7 @@ func newRestoredIdleCompactionActor(
 		t.Fatalf("newCompactionExecutor() error = %v", err)
 	}
 	model := testModel()
-	model.Limits = inference.ContextLimits{WindowTokens: 100, MaxInputTokens: 80, MaxOutputTokens: 20}
+	model.Limits = testContextLimits{WindowTokens: 100, MaxInputTokens: 80, MaxOutputTokens: 20}
 	actor, err := newRestoredWithConfig(ctx, uuid.UUID{0x91}, uuid.UUID{0x92}, recorder, runtimeConfig{
 		Client: &scriptedLLM{}, Model: model, System: "stable system", DrainTimeout: 200 * time.Millisecond,
 		ContextCounter: counter, CounterCapability: capability, InferenceCapability: contextTestInferenceCapability(),
@@ -907,7 +911,7 @@ func TestCompactionExecutorCountsExactSummaryCandidateBeforeProposal(t *testing.
 	tests := []struct {
 		name         string
 		inputTokens  content.TokenCount
-		modelLimits  inference.ContextLimits
+		modelLimits  testContextLimits
 		countErr     error
 		outcomeErr   error
 		directErr    error
@@ -917,14 +921,14 @@ func TestCompactionExecutorCountsExactSummaryCandidateBeforeProposal(t *testing.
 		wantPrepared bool
 		wantCounts   int
 	}{
-		{name: "success prepares counted summary", inputTokens: 40, modelLimits: inference.ContextLimits{WindowTokens: 100, MaxInputTokens: 80, MaxOutputTokens: 20}, wantPrepared: true, wantCounts: 1},
-		{name: "summary at hard limit rejects too large", inputTokens: 80, modelLimits: inference.ContextLimits{WindowTokens: 100, MaxInputTokens: 80, MaxOutputTokens: 20}, wantReason: event.CompactRejectSummaryTooLarge, wantCause: "summary_too_large", wantCounts: 1},
-		{name: "post summary count failure rejects count failed", modelLimits: inference.ContextLimits{WindowTokens: 100, MaxInputTokens: 80, MaxOutputTokens: 20}, countErr: countErr, wantReason: event.CompactRejectContextCountFailed, wantCause: "context_count", wantCounts: 1},
-		{name: "post summary count timeout carries deadline and rejects count failed", modelLimits: inference.ContextLimits{WindowTokens: 100, MaxInputTokens: 80, MaxOutputTokens: 20}, timeoutCount: true, wantReason: event.CompactRejectContextCountFailed, wantCause: "context_count", wantCounts: 1},
+		{name: "success prepares counted summary", inputTokens: 40, modelLimits: testContextLimits{WindowTokens: 100, MaxInputTokens: 80, MaxOutputTokens: 20}, wantPrepared: true, wantCounts: 1},
+		{name: "summary at hard limit rejects too large", inputTokens: 80, modelLimits: testContextLimits{WindowTokens: 100, MaxInputTokens: 80, MaxOutputTokens: 20}, wantReason: event.CompactRejectSummaryTooLarge, wantCause: "summary_too_large", wantCounts: 1},
+		{name: "post summary count failure rejects count failed", modelLimits: testContextLimits{WindowTokens: 100, MaxInputTokens: 80, MaxOutputTokens: 20}, countErr: countErr, wantReason: event.CompactRejectContextCountFailed, wantCause: "context_count", wantCounts: 1},
+		{name: "post summary count timeout carries deadline and rejects count failed", modelLimits: testContextLimits{WindowTokens: 100, MaxInputTokens: 80, MaxOutputTokens: 20}, timeoutCount: true, wantReason: event.CompactRejectContextCountFailed, wantCause: "context_count", wantCounts: 1},
 		{name: "unknown input limit rejects limit unknown", inputTokens: 1, wantReason: event.CompactRejectContextLimitUnknown, wantCause: "limit_unknown"},
-		{name: "invalid adapter summary rejects invalid summary", modelLimits: inference.ContextLimits{WindowTokens: 100, MaxInputTokens: 80, MaxOutputTokens: 20}, outcomeErr: &loop.InvalidSummaryError{Reason: loop.InvalidSummaryXMLContent}, wantReason: event.CompactRejectInvalidSummary, wantCause: "invalid_summary"},
-		{name: "direct hustle failure rejects execution failed", modelLimits: inference.ContextLimits{WindowTokens: 100, MaxInputTokens: 80, MaxOutputTokens: 20}, directErr: executionErr, wantReason: event.CompactRejectExecutionFailed, wantCause: "execution"},
-		{name: "caller cancellation rejects canceled", modelLimits: inference.ContextLimits{WindowTokens: 100, MaxInputTokens: 80, MaxOutputTokens: 20}, directErr: context.Canceled, wantReason: event.CompactRejectCanceled, wantCause: "canceled"},
+		{name: "invalid adapter summary rejects invalid summary", modelLimits: testContextLimits{WindowTokens: 100, MaxInputTokens: 80, MaxOutputTokens: 20}, outcomeErr: &loop.InvalidSummaryError{Reason: loop.InvalidSummaryXMLContent}, wantReason: event.CompactRejectInvalidSummary, wantCause: "invalid_summary"},
+		{name: "direct hustle failure rejects execution failed", modelLimits: testContextLimits{WindowTokens: 100, MaxInputTokens: 80, MaxOutputTokens: 20}, directErr: executionErr, wantReason: event.CompactRejectExecutionFailed, wantCause: "execution"},
+		{name: "caller cancellation rejects canceled", modelLimits: testContextLimits{WindowTokens: 100, MaxInputTokens: 80, MaxOutputTokens: 20}, directErr: context.Canceled, wantReason: event.CompactRejectCanceled, wantCause: "canceled"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -941,9 +945,9 @@ func TestCompactionExecutorCountsExactSummaryCandidateBeforeProposal(t *testing.
 				compactor.outcome = CompactionOutcome{Value: output}
 			}
 			basicCounter := &loopContextCounter{
-				capability: contextTestCapability(inference.CountQualityExactLocal), counts: []content.TokenCount{tt.inputTokens}, err: tt.countErr,
+				capability: contextTestCapability(contextcount.CountQualityExactLocal), counts: []content.TokenCount{tt.inputTokens}, err: tt.countErr,
 			}
-			var counter inference.ContextCounter = basicCounter
+			var counter contextcount.ContextCounter = basicCounter
 			var deadlineCounter *executorDeadlineCounter
 			if tt.timeoutCount {
 				deadlineCounter = &executorDeadlineCounter{capability: basicCounter.capability}
@@ -963,7 +967,7 @@ func TestCompactionExecutorCountsExactSummaryCandidateBeforeProposal(t *testing.
 			candidate := compactionExecutionCandidate{
 				Measurement: event.ContextMeasurement{
 					Basis: basis, Model: model.Key(), RequestFingerprint: fingerprint,
-					InputTokens: 70, InputLimit: 80, Quality: inference.CountQualityExactLocal,
+					InputTokens: 70, InputLimit: 80, Quality: contextcount.CountQualityExactLocal,
 				},
 				Request: inference.Request{
 					Model: model, System: "system", Messages: content.AgenticMessages{replacementTestMessage("old transcript"), runtimeTail},
@@ -1002,7 +1006,7 @@ func TestCompactionExecutorCountsExactSummaryCandidateBeforeProposal(t *testing.
 					t.Fatalf("continuation error = %T %+v, want typed SummaryTooLargeError", result.ContinuationError, result.ContinuationError)
 				}
 			case "context_count":
-				var typed *inference.ContextCountError
+				var typed *contextcount.ContextCountError
 				if !errors.As(result.ContinuationError, &typed) {
 					t.Fatalf("continuation error = %T %+v, want typed ContextCountError", result.ContinuationError, result.ContinuationError)
 				}
@@ -1058,11 +1062,11 @@ func TestLoopCompactsToolContinuationAtPostStepBoundary(t *testing.T) {
 				{textChunk("continued")},
 			}}
 			counter := &loopContextCounter{
-				capability: contextTestCapability(inference.CountQualityExactLocal),
+				capability: contextTestCapability(contextcount.CountQualityExactLocal),
 				counts:     []content.TokenCount{40, 65, 20, 25},
 			}
 			model := testModel()
-			model.Limits = inference.ContextLimits{WindowTokens: 100, MaxInputTokens: 80, MaxOutputTokens: 20}
+			model.Limits = testContextLimits{WindowTokens: 100, MaxInputTokens: 80, MaxOutputTokens: 20}
 			settings := contextAdmissionSettings{ReservedOutput: 20, CompactAt: 8_000, RearmBelow: 6_000, CountTimeout: time.Second, Automatic: true}
 			executor, err := newCompactionExecutor(ctx, compactionExecutorConfig{
 				Compactor: &echoExecutorCompactor{summary: validFinalizationSummary()}, Counter: counter,
@@ -1131,10 +1135,10 @@ func TestLoopManualCompactionFreezesPostStepCandidate(t *testing.T) {
 				onStreamN: map[int]func(){0: func() { close(streamStarted); <-streamRelease }},
 			}
 			counter := &loopContextCounter{
-				capability: contextTestCapability(inference.CountQualityExactLocal), counts: []content.TokenCount{40, 65, 20, 25},
+				capability: contextTestCapability(contextcount.CountQualityExactLocal), counts: []content.TokenCount{40, 65, 20, 25},
 			}
 			model := testModel()
-			model.Limits = inference.ContextLimits{WindowTokens: 100, MaxInputTokens: 80, MaxOutputTokens: 20}
+			model.Limits = testContextLimits{WindowTokens: 100, MaxInputTokens: 80, MaxOutputTokens: 20}
 			settings := contextAdmissionSettings{ReservedOutput: 20, CountTimeout: time.Second}
 			compactor := &echoExecutorCompactor{summary: validFinalizationSummary()}
 			executor, err := newCompactionExecutor(ctx, compactionExecutorConfig{
@@ -1253,10 +1257,10 @@ func TestLoopCompactionRejectionAdmissionAtToolContinuation(t *testing.T) {
 				{toolUseChunk(0, "tool-1", "Echo", `{"value":1}`)}, {textChunk("continued")},
 			}}
 			counter := &sequenceContextCounter{
-				capability: contextTestCapability(inference.CountQualityExactLocal), counts: tt.counts, errs: tt.countErrs,
+				capability: contextTestCapability(contextcount.CountQualityExactLocal), counts: tt.counts, errs: tt.countErrs,
 			}
 			model := testModel()
-			model.Limits = inference.ContextLimits{WindowTokens: 100, MaxInputTokens: 80, MaxOutputTokens: 20}
+			model.Limits = testContextLimits{WindowTokens: 100, MaxInputTokens: 80, MaxOutputTokens: 20}
 			var compactor Compactor = &echoExecutorCompactor{summary: validFinalizationSummary()}
 			if tt.invalidSummary {
 				compactor = outcomeErrorCompactor{err: &loop.InvalidSummaryError{Reason: loop.InvalidSummaryXMLContent}}
@@ -1357,10 +1361,10 @@ func TestLoopTerminalCompactionRejectionPreservesProducedResponse(t *testing.T) 
 			recorder := &recordingPublisher{}
 			client := &scriptedLLM{scripts: [][]content.Chunk{{textChunk("original terminal bytes")}}}
 			counter := &sequenceContextCounter{
-				capability: contextTestCapability(inference.CountQualityExactLocal), counts: tt.counts, errs: tt.countErrs,
+				capability: contextTestCapability(contextcount.CountQualityExactLocal), counts: tt.counts, errs: tt.countErrs,
 			}
 			model := testModel()
-			model.Limits = inference.ContextLimits{WindowTokens: 100, MaxInputTokens: 80, MaxOutputTokens: 20}
+			model.Limits = testContextLimits{WindowTokens: 100, MaxInputTokens: 80, MaxOutputTokens: 20}
 			var compactor Compactor = &echoExecutorCompactor{summary: validFinalizationSummary()}
 			if tt.invalidSummary {
 				compactor = outcomeErrorCompactor{err: &loop.InvalidSummaryError{Reason: loop.InvalidSummaryXMLContent}}
@@ -1438,10 +1442,10 @@ func TestLoopTerminalResponseWaitsForCompactionAndRemainsUnchanged(t *testing.T)
 			recorder := &recordingPublisher{}
 			client := &scriptedLLM{scripts: [][]content.Chunk{{textChunk("original terminal bytes")}}}
 			counter := &loopContextCounter{
-				capability: contextTestCapability(inference.CountQualityExactLocal), counts: []content.TokenCount{40, 65, 20},
+				capability: contextTestCapability(contextcount.CountQualityExactLocal), counts: []content.TokenCount{40, 65, 20},
 			}
 			model := testModel()
-			model.Limits = inference.ContextLimits{WindowTokens: 100, MaxInputTokens: 80, MaxOutputTokens: 20}
+			model.Limits = testContextLimits{WindowTokens: 100, MaxInputTokens: 80, MaxOutputTokens: 20}
 			settings := contextAdmissionSettings{ReservedOutput: 20, CompactAt: 8_000, RearmBelow: 6_000, CountTimeout: time.Second, Automatic: true}
 			compactor := &gatedExecutorCompactor{summary: validFinalizationSummary(), started: make(chan struct{}), release: make(chan struct{})}
 			executor, err := newCompactionExecutor(ctx, compactionExecutorConfig{
@@ -1533,10 +1537,10 @@ func TestLoopTerminalCompactionCancellationPreemptsProducedResponse(t *testing.T
 			recorder := &recordingPublisher{}
 			client := &scriptedLLM{scripts: [][]content.Chunk{{textChunk("produced but canceled")}}}
 			counter := &loopContextCounter{
-				capability: contextTestCapability(inference.CountQualityExactLocal), counts: []content.TokenCount{40, 65},
+				capability: contextTestCapability(contextcount.CountQualityExactLocal), counts: []content.TokenCount{40, 65},
 			}
 			model := testModel()
-			model.Limits = inference.ContextLimits{WindowTokens: 100, MaxInputTokens: 80, MaxOutputTokens: 20}
+			model.Limits = testContextLimits{WindowTokens: 100, MaxInputTokens: 80, MaxOutputTokens: 20}
 			settings := contextAdmissionSettings{
 				ReservedOutput: 20, CompactAt: 8_000, RearmBelow: 6_000, CountTimeout: time.Second, Automatic: true,
 			}
@@ -1646,10 +1650,10 @@ func TestLoopStartedCompactionCancellationIsActorOwned(t *testing.T) {
 			t.Cleanup(cancel)
 			recorder := &recordingPublisher{}
 			counter := &loopContextCounter{
-				capability: contextTestCapability(inference.CountQualityExactLocal), counts: []content.TokenCount{65},
+				capability: contextTestCapability(contextcount.CountQualityExactLocal), counts: []content.TokenCount{65},
 			}
 			model := testModel()
-			model.Limits = inference.ContextLimits{WindowTokens: 100, MaxInputTokens: 80, MaxOutputTokens: 20}
+			model.Limits = testContextLimits{WindowTokens: 100, MaxInputTokens: 80, MaxOutputTokens: 20}
 			settings := contextAdmissionSettings{ReservedOutput: 20, CompactAt: 8_000, RearmBelow: 6_000, CountTimeout: time.Second, Automatic: true}
 			compactor := &lateSuccessExecutorCompactor{
 				summary: validFinalizationSummary(), started: make(chan struct{}), release: make(chan struct{}), finished: make(chan struct{}),

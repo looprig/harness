@@ -8,6 +8,8 @@ import (
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/tool"
 	"github.com/looprig/inference"
+	model "github.com/looprig/inference/model"
+	stream "github.com/looprig/inference/stream"
 )
 
 type fakeLLM struct{}
@@ -38,13 +40,13 @@ func (permissionGateStub) Grant(context.Context, string, string, tool.ApprovalSc
 	return nil
 }
 
-func (*fakeLLM) Stream(context.Context, inference.Request) (*inference.StreamReader[content.Chunk], error) {
+func (*fakeLLM) Stream(context.Context, inference.Request) (*stream.StreamReader[content.Chunk], error) {
 	return nil, errors.New("unused")
 }
 
-func testModel() inference.Model {
-	return inference.Model{
-		Provider: inference.ProviderName("lmstudio"), APIFormat: inference.APIFormatOpenAI,
+func testModel() model.Model {
+	return model.Model{
+		Provider: model.ProviderName("lmstudio"), APIFormat: model.APIFormatOpenAI,
 		BaseURL: "http://localhost:1234", Name: "m",
 	}
 }

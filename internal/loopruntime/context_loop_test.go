@@ -18,18 +18,21 @@ import (
 	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/harness/pkg/tool"
 	"github.com/looprig/inference"
+	contextcount "github.com/looprig/inference/contextcount"
+	model "github.com/looprig/inference/model"
+	stream "github.com/looprig/inference/stream"
 )
 
 type loopContextCounter struct {
 	mu         sync.Mutex
-	capability inference.CounterCapability
+	capability contextcount.CounterCapability
 	counts     []content.TokenCount
 	err        error
 	requests   []inference.Request
 }
 
 type gatedLoopContextCounter struct {
-	capability inference.CounterCapability
+	capability contextcount.CounterCapability
 	counts     []content.TokenCount
 	started    chan inference.Request
 	release    chan struct{}
@@ -37,7 +40,7 @@ type gatedLoopContextCounter struct {
 	requests   []inference.Request
 }
 
-func (c *gatedLoopContextCounter) CountContext(ctx context.Context, request inference.Request) (inference.ContextCount, error) {
+func (c *gatedLoopContextCounter) CountContext(ctx context.Context, request inference.Request) (contextcount.ContextCount, error) {
 	c.mu.Lock()
 	call := len(c.requests)
 	c.requests = append(c.requests, request)
@@ -47,7 +50,7 @@ func (c *gatedLoopContextCounter) CountContext(ctx context.Context, request infe
 		select {
 		case <-c.release:
 		case <-ctx.Done():
-			return inference.ContextCount{}, ctx.Err()
+			return contextcount.ContextCount{}, ctx.Err()
 		}
 	}
 	count := content.TokenCount(40)
@@ -58,43 +61,43 @@ func (c *gatedLoopContextCounter) CountContext(ctx context.Context, request infe
 		}
 		count = c.counts[index]
 	}
-	return inference.ContextCount{Model: request.Model.Key(), InputTokens: count, Quality: c.capability.Quality}, nil
+	return contextcount.ContextCount{Model: request.Model.Key(), InputTokens: count, Quality: c.capability.Quality}, nil
 }
 
-func (c *gatedLoopContextCounter) CounterCapability() inference.CounterCapability {
+func (c *gatedLoopContextCounter) CounterCapability() contextcount.CounterCapability {
 	return c.capability
 }
 
-func (c *gatedLoopContextCounter) models() []inference.ModelKey {
+func (c *gatedLoopContextCounter) models() []model.ModelKey {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	models := make([]inference.ModelKey, len(c.requests))
+	models := make([]model.ModelKey, len(c.requests))
 	for index, request := range c.requests {
 		models[index] = request.Model.Key()
 	}
 	return models
 }
 
-func (c *loopContextCounter) CountContext(_ context.Context, request inference.Request) (inference.ContextCount, error) {
+func (c *loopContextCounter) CountContext(_ context.Context, request inference.Request) (contextcount.ContextCount, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.requests = append(c.requests, request)
 	if c.err != nil {
-		return inference.ContextCount{}, c.err
+		return contextcount.ContextCount{}, c.err
 	}
 	index := len(c.requests) - 1
 	if index >= len(c.counts) {
 		index = len(c.counts) - 1
 	}
-	return inference.ContextCount{Model: request.Model.Key(), InputTokens: c.counts[index], Quality: c.capability.Quality}, nil
+	return contextcount.ContextCount{Model: request.Model.Key(), InputTokens: c.counts[index], Quality: c.capability.Quality}, nil
 }
 
-func (c *loopContextCounter) CounterCapability() inference.CounterCapability { return c.capability }
+func (c *loopContextCounter) CounterCapability() contextcount.CounterCapability { return c.capability }
 
-func (c *loopContextCounter) requestModels() []inference.ModelKey {
+func (c *loopContextCounter) requestModels() []model.ModelKey {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	models := make([]inference.ModelKey, len(c.requests))
+	models := make([]model.ModelKey, len(c.requests))
 	for index, request := range c.requests {
 		models[index] = request.Model.Key()
 	}
@@ -113,7 +116,7 @@ func (*contextOrderClient) Invoke(context.Context, inference.Request) (*inferenc
 	return nil, errors.New("contextOrderClient.Invoke not used")
 }
 
-func (c *contextOrderClient) Stream(_ context.Context, request inference.Request) (*inference.StreamReader[content.Chunk], error) {
+func (c *contextOrderClient) Stream(_ context.Context, request inference.Request) (*stream.StreamReader[content.Chunk], error) {
 	c.mu.Lock()
 	c.calls++
 	c.eventsAtCall = c.recorder.events()
@@ -121,7 +124,7 @@ func (c *contextOrderClient) Stream(_ context.Context, request inference.Request
 	c.requests = append(c.requests, request)
 	c.mu.Unlock()
 	emitted := false
-	return inference.NewStreamReader(func() (content.Chunk, error) {
+	return stream.NewStreamReader(func() (content.Chunk, error) {
 		if !emitted {
 			emitted = true
 			return textChunk("done"), nil
@@ -198,7 +201,7 @@ func TestLoopContextAdmissionBeforePrimaryInference(t *testing.T) {
 		{
 			name: "count failure blocks inference without measurement", countErr: errors.New("count failed"),
 			observation:     &loop.ContextObservationPolicy{ReservedOutput: 20, CountTimeout: 31 * time.Millisecond},
-			wantTerminalErr: func(err error) bool { var target *inference.ContextCountError; return errors.As(err, &target) },
+			wantTerminalErr: func(err error) bool { var target *contextcount.ContextCountError; return errors.As(err, &target) },
 		},
 		{
 			name: "automatic soft rejection continues", count: 65,
@@ -237,9 +240,9 @@ func TestLoopContextAdmissionBeforePrimaryInference(t *testing.T) {
 			if tt.name == "automatic soft rejection continues" {
 				counts = append(counts, 40)
 			}
-			counter := &loopContextCounter{capability: contextTestCapability(inference.CountQualityExactLocal), counts: counts, err: tt.countErr}
+			counter := &loopContextCounter{capability: contextTestCapability(contextcount.CountQualityExactLocal), counts: counts, err: tt.countErr}
 			model := testModel()
-			model.Limits = inference.ContextLimits{WindowTokens: 100, MaxInputTokens: 80, MaxOutputTokens: 20}
+			model.Limits = testContextLimits{WindowTokens: 100, MaxInputTokens: 80, MaxOutputTokens: 20}
 			config := runtimeConfig{
 				Client: client, Model: model, System: "system", DrainTimeout: 200 * time.Millisecond,
 				ContextCounter: counter, CounterCapability: counter.capability, InferenceCapability: contextTestInferenceCapability(),
@@ -314,12 +317,12 @@ func TestLoopContextAdmissionRecountsAfterSmallerModelChange(t *testing.T) {
 			recorder := &recordingPublisher{}
 			client := &contextOrderClient{recorder: recorder}
 			counter := &loopContextCounter{
-				capability: contextTestCapability(inference.CountQualityExactLocal),
+				capability: contextTestCapability(contextcount.CountQualityExactLocal),
 				counts:     []content.TokenCount{100, 100},
 			}
 			large := testModel()
 			large.Name = "large"
-			large.Limits = inference.ContextLimits{WindowTokens: 200, MaxInputTokens: 180, MaxOutputTokens: 20}
+			large.Limits = testContextLimits{WindowTokens: 200, MaxInputTokens: 180, MaxOutputTokens: 20}
 			config := runtimeConfig{
 				Client: client, Model: large, System: "system", DrainTimeout: 200 * time.Millisecond,
 				ContextCounter: counter, CounterCapability: counter.capability, InferenceCapability: contextTestInferenceCapability(),
@@ -335,7 +338,7 @@ func TestLoopContextAdmissionRecountsAfterSmallerModelChange(t *testing.T) {
 			}
 			smaller := large
 			smaller.Name = "small"
-			smaller.Limits = inference.ContextLimits{WindowTokens: 100, MaxInputTokens: 80, MaxOutputTokens: 20}
+			smaller.Limits = testContextLimits{WindowTokens: 100, MaxInputTokens: 80, MaxOutputTokens: 20}
 			if result := sendChange(t, actor, command.ChangeLoopInference{Model: smaller, SetModel: true}); result.Err != nil {
 				t.Fatalf("ChangeLoopInference error = %v", result.Err)
 			}
@@ -362,18 +365,18 @@ func TestLoopContextAdmissionRejectsStaleCountAcrossRuntimeChange(t *testing.T) 
 	t.Parallel()
 	tests := []struct {
 		name  string
-		apply func(*testing.T, *Loop, inference.Model) error
+		apply func(*testing.T, *Loop, model.Model) error
 	}{
 		{
 			name: "inference change",
-			apply: func(t *testing.T, actor *Loop, changed inference.Model) error {
+			apply: func(t *testing.T, actor *Loop, changed model.Model) error {
 				t.Helper()
 				return sendChange(t, actor, command.ChangeLoopInference{Model: changed, SetModel: true}).Err
 			},
 		},
 		{
 			name: "mode change",
-			apply: func(t *testing.T, actor *Loop, _ inference.Model) error {
+			apply: func(t *testing.T, actor *Loop, _ model.Model) error {
 				t.Helper()
 				return sendSetMode(t, actor, "changed").Err
 			},
@@ -382,12 +385,12 @@ func TestLoopContextAdmissionRejectsStaleCountAcrossRuntimeChange(t *testing.T) 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			capability := contextTestCapability(inference.CountQualityExactLocal)
+			capability := contextTestCapability(contextcount.CountQualityExactLocal)
 			counter := &gatedLoopContextCounter{capability: capability, started: make(chan inference.Request, 1), release: make(chan struct{})}
 			client := &contextOrderClient{}
 			base := testModel()
 			base.Name = "base"
-			base.Limits = inference.ContextLimits{WindowTokens: 100, MaxInputTokens: 80, MaxOutputTokens: 20}
+			base.Limits = testContextLimits{WindowTokens: 100, MaxInputTokens: 80, MaxOutputTokens: 20}
 			changed := base
 			changed.Name = "changed"
 			definition, err := loop.Define(
@@ -456,9 +459,9 @@ func TestRestoredLoopAdvancesBasisWithoutCurrentMeasurement(t *testing.T) {
 			t.Cleanup(cancel)
 			recorder := &recordingPublisher{}
 			client := &contextOrderClient{recorder: recorder}
-			counter := &loopContextCounter{capability: contextTestCapability(inference.CountQualityExactLocal), counts: []content.TokenCount{40}}
+			counter := &loopContextCounter{capability: contextTestCapability(contextcount.CountQualityExactLocal), counts: []content.TokenCount{40}}
 			model := testModel()
-			model.Limits = inference.ContextLimits{WindowTokens: 100, MaxInputTokens: 80, MaxOutputTokens: 20}
+			model.Limits = testContextLimits{WindowTokens: 100, MaxInputTokens: 80, MaxOutputTokens: 20}
 			config := runtimeConfig{
 				Client: client, Model: model, System: "system", DrainTimeout: 200 * time.Millisecond,
 				ContextCounter: counter, CounterCapability: counter.capability, InferenceCapability: contextTestInferenceCapability(),
@@ -502,15 +505,15 @@ func TestRestoredLoopFirstRequestUsesCompactedContextState(t *testing.T) {
 			t.Cleanup(cancel)
 			recorder := &recordingPublisher{}
 			client := &contextOrderClient{recorder: recorder}
-			capability := contextTestCapability(inference.CountQualityExactLocal)
+			capability := contextTestCapability(contextcount.CountQualityExactLocal)
 			counter := &loopContextCounter{capability: capability, counts: []content.TokenCount{40, 20}}
 			model := testModel()
-			model.Limits = inference.ContextLimits{WindowTokens: 100, MaxInputTokens: 80, MaxOutputTokens: 20}
+			model.Limits = testContextLimits{WindowTokens: 100, MaxInputTokens: 80, MaxOutputTokens: 20}
 			sink := newContextAwaitSink()
 			basis := event.ContextBasis{Revision: 10, ThroughEventID: uuid.UUID{0xd0}}
 			measurement := event.ContextMeasurement{
 				Basis: basis, Model: model.Key(), RequestFingerprint: [32]byte{0xd1},
-				InputTokens: 40, InputLimit: 60, Quality: inference.CountQualityExactLocal,
+				InputTokens: 40, InputLimit: 60, Quality: contextcount.CountQualityExactLocal,
 			}
 			summary := seededUser("restored summary")
 			restoredHistory := content.AgenticMessages{summary, seededAI("later committed answer")}
@@ -603,13 +606,13 @@ func TestLoopAutomaticCompactionRetriesAfterManualOpenedRejection(t *testing.T) 
 			t.Cleanup(cancel)
 			recorder := &recordingPublisher{}
 			client := &contextOrderClient{recorder: recorder}
-			capability := contextTestCapability(inference.CountQualityExactLocal)
+			capability := contextTestCapability(contextcount.CountQualityExactLocal)
 			counter := &gatedLoopContextCounter{
 				capability: capability, counts: []content.TokenCount{40, 40, 20},
 				started: make(chan inference.Request, 1), release: make(chan struct{}),
 			}
 			model := testModel()
-			model.Limits = inference.ContextLimits{WindowTokens: 100, MaxInputTokens: 80, MaxOutputTokens: 20}
+			model.Limits = testContextLimits{WindowTokens: 100, MaxInputTokens: 80, MaxOutputTokens: 20}
 			sink := newContextAwaitSink()
 			config := runtimeConfig{
 				Client: client, Model: model, System: "system", DrainTimeout: 200 * time.Millisecond,

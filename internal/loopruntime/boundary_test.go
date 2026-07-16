@@ -13,6 +13,7 @@ import (
 	"github.com/looprig/harness/pkg/command"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/inference"
+	stream "github.com/looprig/inference/stream"
 )
 
 type blockingExecutionBoundary struct {
@@ -39,7 +40,7 @@ func (panickingBoundaryInference) Invoke(context.Context, inference.Request) (*i
 	panic("inference invoke panic")
 }
 
-func (panickingBoundaryInference) Stream(context.Context, inference.Request) (*inference.StreamReader[content.Chunk], error) {
+func (panickingBoundaryInference) Stream(context.Context, inference.Request) (*stream.StreamReader[content.Chunk], error) {
 	panic("inference stream panic")
 }
 
@@ -56,7 +57,7 @@ func (g *gatedFirstInference) Invoke(context.Context, inference.Request) (*infer
 	return nil, errors.New("Invoke not used")
 }
 
-func (g *gatedFirstInference) Stream(ctx context.Context, _ inference.Request) (*inference.StreamReader[content.Chunk], error) {
+func (g *gatedFirstInference) Stream(ctx context.Context, _ inference.Request) (*stream.StreamReader[content.Chunk], error) {
 	if g.calls.Add(1) == 1 {
 		close(g.entered)
 		select {
@@ -66,7 +67,7 @@ func (g *gatedFirstInference) Stream(ctx context.Context, _ inference.Request) (
 		}
 	}
 	i := 0
-	return inference.NewStreamReader(func() (content.Chunk, error) {
+	return stream.NewStreamReader(func() (content.Chunk, error) {
 		if i == 0 {
 			i++
 			return textChunk("done"), nil

@@ -9,7 +9,7 @@ import (
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/gate"
 	"github.com/looprig/harness/pkg/identity"
-	"github.com/looprig/inference"
+	model "github.com/looprig/inference/model"
 )
 
 // vID mints a non-zero UUID for validation tests or fails.
@@ -38,7 +38,7 @@ func TestValidateEventValid(t *testing.T) {
 	loopH := event.Header{Coordinates: identity.Coordinates{SessionID: sess, LoopID: loop}, EventID: evID}
 	turnH := event.Header{Coordinates: identity.Coordinates{SessionID: sess, LoopID: loop, TurnID: turn}, EventID: evID}
 	stepH := event.Header{Coordinates: identity.Coordinates{SessionID: sess, LoopID: loop, TurnID: turn, StepID: step}, EventID: evID}
-	runtime := event.ModelRuntime{Key: inference.ModelKey{Provider: "test", Model: "model"}}
+	runtime := event.ModelRuntime{Key: model.ModelKey{Provider: "test", Model: "model"}}
 
 	tests := []struct {
 		name string

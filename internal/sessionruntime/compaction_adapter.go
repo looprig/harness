@@ -17,7 +17,7 @@ import (
 	"github.com/looprig/harness/pkg/hustle"
 	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/loop"
-	"github.com/looprig/inference"
+	model "github.com/looprig/inference/model"
 )
 
 type compactionHustleRunner interface {
@@ -165,8 +165,8 @@ type compactionBasisWire struct {
 }
 
 type compactionModelWire struct {
-	Provider inference.ProviderName `json:"provider"`
-	Model    string                 `json:"model"`
+	Provider model.ProviderName `json:"provider"`
+	Model    string             `json:"model"`
 }
 
 type compactionInputWire struct {
@@ -193,8 +193,8 @@ type compactionBasisDecodeWire struct {
 }
 
 type compactionModelDecodeWire struct {
-	Provider *inference.ProviderName `json:"provider"`
-	Model    *string                 `json:"model"`
+	Provider *model.ProviderName `json:"provider"`
+	Model    *string             `json:"model"`
 }
 
 func marshalCompactionInput(input loop.CompactionInput) (json.RawMessage, error) {
@@ -244,7 +244,7 @@ func unmarshalCompactionInput(raw []byte) (loop.CompactionInput, error) {
 	}
 	input := loop.CompactionInput{
 		Basis:              event.ContextBasis{Revision: *wire.Basis.Revision, ThroughEventID: throughEventID},
-		Model:              inference.ModelKey{Provider: *wire.Model.Provider, Model: *wire.Model.Model},
+		Model:              model.ModelKey{Provider: *wire.Model.Provider, Model: *wire.Model.Model},
 		RequestFingerprint: fingerprint, Transcript: transcript, MaxSummaryTokens: *wire.MaxSummaryTokens,
 	}
 	if err := input.Validate(); err != nil {

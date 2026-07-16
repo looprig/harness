@@ -9,6 +9,7 @@ import (
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/inference"
+	model "github.com/looprig/inference/model"
 )
 
 // mustUUID mints a UUID for tests or fails the test (crypto/rand should never
@@ -203,7 +204,7 @@ func TestRunStep(t *testing.T) {
 
 	t.Run("Stream() error returns terminal carrying the typed cause", func(t *testing.T) {
 		t.Parallel()
-		boom := &inference.ValidationError{Field: "x", Reason: "boom"}
+		boom := &model.ValidationError{Field: "x", Reason: "boom"}
 		client := &fakeLLM{streamErr: boom}
 		cfg := stepConfig{req: inference.Request{Model: testModel()}, client: client, emit: func(event.Event) {}}
 
@@ -213,9 +214,9 @@ func TestRunStep(t *testing.T) {
 		if !ok {
 			t.Fatalf("terminal = %T, want event.TurnFailed", res.terminal)
 		}
-		var ve *inference.ValidationError
+		var ve *model.ValidationError
 		if !errors.As(failed.Err, &ve) {
-			t.Fatalf("terminal.Err = %T, want *inference.ValidationError", failed.Err)
+			t.Fatalf("terminal.Err = %T, want *model.ValidationError", failed.Err)
 		}
 		if len(res.state.msgs) != 0 {
 			t.Errorf("msgs len = %d, want 0", len(res.state.msgs))
@@ -224,7 +225,7 @@ func TestRunStep(t *testing.T) {
 
 	t.Run("mid-stream Next error returns terminal carrying the typed cause", func(t *testing.T) {
 		t.Parallel()
-		boom := &inference.ValidationError{Field: "y", Reason: "midstream"}
+		boom := &model.ValidationError{Field: "y", Reason: "midstream"}
 		client := &fakeLLM{chunks: []content.Chunk{textChunk("partial")}, nextErr: boom}
 		cfg := stepConfig{req: inference.Request{Model: testModel()}, client: client, emit: func(event.Event) {}}
 
@@ -234,9 +235,9 @@ func TestRunStep(t *testing.T) {
 		if !ok {
 			t.Fatalf("terminal = %T, want event.TurnFailed", res.terminal)
 		}
-		var ve *inference.ValidationError
+		var ve *model.ValidationError
 		if !errors.As(failed.Err, &ve) {
-			t.Fatalf("terminal.Err = %T, want *inference.ValidationError", failed.Err)
+			t.Fatalf("terminal.Err = %T, want *model.ValidationError", failed.Err)
 		}
 	})
 

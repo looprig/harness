@@ -4,14 +4,14 @@ import (
 	"context"
 
 	"github.com/looprig/core/uuid"
-	"github.com/looprig/inference"
+	model "github.com/looprig/inference/model"
 )
 
 // Handle is the read-only identity and inference view of a live loop.
 type Handle interface {
 	ID() uuid.UUID
 	Mode() ModeName
-	Model() inference.Model
+	Model() model.Model
 }
 
 // ModeCatalog is the optional read-only selectable-mode view of a live loop.
@@ -38,29 +38,29 @@ type Controller interface {
 // Change is a sealed immutable loop-inference change. Runtime implementations
 // inspect the two read-only projections and validate a whole batch atomically.
 type Change interface {
-	InferenceModel() (inference.Model, bool)
-	InferenceEffort() (inference.Effort, bool)
+	InferenceModel() (model.Model, bool)
+	InferenceEffort() (model.Effort, bool)
 	change()
 }
 
-type modelChange struct{ model inference.Model }
+type modelChange struct{ model model.Model }
 
-func (modelChange) change()                                   {}
-func (c modelChange) InferenceModel() (inference.Model, bool) { return cloneModel(c.model), true }
-func (modelChange) InferenceEffort() (inference.Effort, bool) { return inference.EffortNone, false }
+func (modelChange) change()                               {}
+func (c modelChange) InferenceModel() (model.Model, bool) { return cloneModel(c.model), true }
+func (modelChange) InferenceEffort() (model.Effort, bool) { return model.EffortNone, false }
 
-type effortChange struct{ effort inference.Effort }
+type effortChange struct{ effort model.Effort }
 
-func (effortChange) change()                                     {}
-func (effortChange) InferenceModel() (inference.Model, bool)     { return inference.Model{}, false }
-func (c effortChange) InferenceEffort() (inference.Effort, bool) { return c.effort, true }
+func (effortChange) change()                                 {}
+func (effortChange) InferenceModel() (model.Model, bool)     { return model.Model{}, false }
+func (c effortChange) InferenceEffort() (model.Effort, bool) { return c.effort, true }
 
 // ChangeModel selects a new secret-free model descriptor. Controllers validate it
 // atomically with the other changes before applying anything.
-func ChangeModel(model inference.Model) Change { return modelChange{model: cloneModel(model)} }
+func ChangeModel(model model.Model) Change { return modelChange{model: cloneModel(model)} }
 
 // ChangeEffort selects a new inference effort. Controllers validate it atomically.
-func ChangeEffort(effort inference.Effort) Change { return effortChange{effort: effort} }
+func ChangeEffort(effort model.Effort) Change { return effortChange{effort: effort} }
 
 // ChangeErrorKind classifies why a SetMode or Change was refused. Every kind is a
 // fail-secure refusal: the change is NOT applied (no partial apply) and no enduring

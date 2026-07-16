@@ -139,9 +139,21 @@ github.com/invopop/jsonschema
 github.com/looprig/core/content
 github.com/looprig/core/content/streamaccumulator
 github.com/looprig/core/uuid
-# github.com/looprig/inference v0.2.0 => ../inference
+# github.com/looprig/inference v0.3.0 => ../inference
 ## explicit; go 1.26.4
 github.com/looprig/inference
+github.com/looprig/inference/codec
+github.com/looprig/inference/codec/anthropicapi
+github.com/looprig/inference/codec/geminiapi
+github.com/looprig/inference/codec/openaiapi
+github.com/looprig/inference/contextcount
+github.com/looprig/inference/failure
+github.com/looprig/inference/internal/usagenorm
+github.com/looprig/inference/model
+github.com/looprig/inference/stream
+github.com/looprig/inference/usage
+github.com/looprig/inference/wire/jsonbody
+github.com/looprig/inference/wire/sse
 # github.com/looprig/storage v0.2.0 => ../storage
 ## explicit; go 1.25.0
 github.com/looprig/storage
@@ -273,8 +285,6 @@ golang.org/x/exp/typeparams
 golang.org/x/mod/semver
 # golang.org/x/net v0.55.0
 ## explicit; go 1.25.0
-golang.org/x/net/html
-golang.org/x/net/html/atom
 golang.org/x/net/http/httpguts
 golang.org/x/net/http2
 golang.org/x/net/http2/hpack

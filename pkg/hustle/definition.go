@@ -13,6 +13,7 @@ import (
 
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/inference"
+	model "github.com/looprig/inference/model"
 )
 
 const (
@@ -64,7 +65,7 @@ type Limits struct {
 // InferenceBinding pairs a client with its validated, secret-free model.
 type InferenceBinding struct {
 	Client inference.Client
-	Model  inference.Model
+	Model  model.Model
 }
 
 // ModelResolver resolves the exact originating loop's live inference binding.
@@ -83,7 +84,7 @@ type DefinitionDescriptor struct {
 	Name                     Name
 	Participation            Participation
 	ModelSource              ModelSource
-	NamedModelKey            inference.ModelKey
+	NamedModelKey            model.ModelKey
 	NamedModelPolicyRevision string
 	PromptRevision           string
 	PromptSHA256             [sha256.Size]byte
@@ -128,7 +129,7 @@ func (d DefinitionDescriptor) Validate() error {
 		}
 		return nil
 	}
-	if d.NamedModelKey != (inference.ModelKey{}) || d.NamedModelPolicyRevision != "" {
+	if d.NamedModelKey != (model.ModelKey{}) || d.NamedModelPolicyRevision != "" {
 		return &DefinitionError{Kind: DefinitionInvalidModel, Field: "current_loop_model"}
 	}
 	return nil
@@ -225,7 +226,7 @@ func WithCurrentLoopModel() Option {
 }
 
 // WithNamedInference freezes a named client/model pair in the definition.
-func WithNamedInference(client inference.Client, model inference.Model) Option {
+func WithNamedInference(client inference.Client, model model.Model) Option {
 	return func(options *definitionOptions) error {
 		if err := options.singleton("model_source"); err != nil {
 			return err
@@ -336,7 +337,7 @@ const (
 	samplingEffortField      samplingField = "model.sampling.effort"
 )
 
-func invalidSamplingField(sampling inference.Sampling) samplingField {
+func invalidSamplingField(sampling model.Sampling) samplingField {
 	if nonFinite(sampling.Temperature) {
 		return samplingTemperatureField
 	}
@@ -390,7 +391,7 @@ func freezeDefinition(options *definitionOptions) (Definition, error) {
 	}}, nil
 }
 
-func digestModelPolicy(model inference.Model) (string, error) {
+func digestModelPolicy(model model.Model) (string, error) {
 	encoded, err := json.Marshal(model)
 	if err != nil {
 		return "", &RevisionError{Cause: err}

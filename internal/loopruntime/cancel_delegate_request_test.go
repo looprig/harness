@@ -12,6 +12,7 @@ import (
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/inference"
+	stream "github.com/looprig/inference/stream"
 )
 
 type cancelBarrierLLM struct {
@@ -25,8 +26,8 @@ type cancelBarrierLLM struct {
 func (*cancelBarrierLLM) Invoke(context.Context, inference.Request) (*inference.Response, error) {
 	return nil, nil
 }
-func (l *cancelBarrierLLM) Stream(ctx context.Context, _ inference.Request) (*inference.StreamReader[content.Chunk], error) {
-	return inference.NewStreamReader(func() (content.Chunk, error) {
+func (l *cancelBarrierLLM) Stream(ctx context.Context, _ inference.Request) (*stream.StreamReader[content.Chunk], error) {
+	return stream.NewStreamReader(func() (content.Chunk, error) {
 		l.startOnce.Do(func() { close(l.started) })
 		<-ctx.Done()
 		l.cancelOnce.Do(func() { close(l.cancelled) })

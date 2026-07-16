@@ -8,7 +8,6 @@ import (
 	"github.com/looprig/core/content"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/loop"
-	"github.com/looprig/inference"
 )
 
 // TestLoopStartedCarriesDisplayMetadata is the end-to-end proof that a newly started
@@ -56,8 +55,8 @@ func TestLoopStartedCarriesDisplayMetadata(t *testing.T) {
 			t.Cleanup(func() { _ = sub.Close() })
 
 			model := validModel("m")
-			model.Limits = inference.ContextLimits{WindowTokens: 64_000, MaxOutputTokens: 8_000}
-			model.Sampling.Effort = inference.EffortHigh
+			model.Limits = testContextLimits{WindowTokens: 64_000, MaxOutputTokens: 8_000}
+			model.Sampling.Effort = testEffortHigh
 			opts := append([]loop.Option{
 				loop.WithName("agent"),
 				loop.WithInference(&stubLLM{chunks: []content.Chunk{textChunk("y")}}, model),

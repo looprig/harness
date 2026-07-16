@@ -13,6 +13,8 @@ import (
 	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/harness/pkg/tool"
 	"github.com/looprig/inference"
+	model "github.com/looprig/inference/model"
+	stream "github.com/looprig/inference/stream"
 )
 
 type boundTestClient struct{}
@@ -20,7 +22,7 @@ type boundTestClient struct{}
 func (boundTestClient) Invoke(context.Context, inference.Request) (*inference.Response, error) {
 	return nil, errors.New("unused")
 }
-func (boundTestClient) Stream(context.Context, inference.Request) (*inference.StreamReader[content.Chunk], error) {
+func (boundTestClient) Stream(context.Context, inference.Request) (*stream.StreamReader[content.Chunk], error) {
 	return nil, errors.New("unused")
 }
 
@@ -31,7 +33,7 @@ func validCfg() loop.BoundDefinition {
 }
 
 func promptCfg(system, instructions string) loop.BoundDefinition {
-	opts := []loop.Option{loop.WithName("agent"), loop.WithInference(boundTestClient{}, inference.Model{Provider: "lmstudio", APIFormat: inference.APIFormatOpenAI, BaseURL: "http://localhost:1234", Name: "m"}), loop.WithSystem(system)}
+	opts := []loop.Option{loop.WithName("agent"), loop.WithInference(boundTestClient{}, model.Model{Provider: "lmstudio", APIFormat: model.APIFormatOpenAI, BaseURL: "http://localhost:1234", Name: "m"}), loop.WithSystem(system)}
 	if instructions != "" {
 		opts = append(opts, loop.WithModes(loop.Mode{Name: "mode", Instructions: instructions}), loop.WithInitialMode("mode"))
 	}

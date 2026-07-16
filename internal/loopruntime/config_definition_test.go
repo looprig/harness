@@ -7,14 +7,13 @@ import (
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/harness/pkg/tool"
-	"github.com/looprig/inference"
 )
 
 func TestConfigFromBoundUsesEffectivePromptAndEffort(t *testing.T) {
 	t.Parallel()
 	d, err := loop.Define(
 		loop.WithName("agent"), loop.WithInference(&fakeLLM{}, testModel()), loop.WithSystem("base system"),
-		loop.WithModes(loop.Mode{Name: "build", Effort: inference.EffortHigh, Instructions: "build instructions"}),
+		loop.WithModes(loop.Mode{Name: "build", Effort: testEffortHigh, Instructions: "build instructions"}),
 		loop.WithInitialMode("build"),
 	)
 	if err != nil {
@@ -36,7 +35,7 @@ func TestConfigFromBoundUsesEffectivePromptAndEffort(t *testing.T) {
 	if cfg.System != "base system\n\nbuild instructions" {
 		t.Errorf("System = %q", cfg.System)
 	}
-	if cfg.Model.Sampling.Effort != inference.EffortHigh {
+	if cfg.Model.Sampling.Effort != testEffortHigh {
 		t.Errorf("effort = %q, want high", cfg.Model.Sampling.Effort)
 	}
 }

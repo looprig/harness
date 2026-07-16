@@ -15,7 +15,8 @@ import (
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/hustle"
 	"github.com/looprig/harness/pkg/identity"
-	"github.com/looprig/inference"
+	contextcount "github.com/looprig/inference/contextcount"
+	model "github.com/looprig/inference/model"
 )
 
 func privacyUUID(seed byte) uuid.UUID {
@@ -50,7 +51,7 @@ func privacyHustleEvents(t *testing.T) []event.Event {
 		RunID:      hustle.RunID(privacyUUID(3)),
 	}
 	completedRun := run
-	completedRun.Runtime = event.ModelRuntime{Key: inference.ModelKey{Provider: "provider", Model: "model"}}
+	completedRun.Runtime = event.ModelRuntime{Key: model.ModelKey{Provider: "provider", Model: "model"}}
 	return []event.Event{
 		event.HustleStarted{Header: header, Run: run},
 		event.HustleCompleted{Header: header, Run: completedRun},
@@ -85,11 +86,11 @@ func privacyCompactionEvents() (event.CompactionStarted, event.CompactionCommitt
 		}},
 		PostContext: event.ContextMeasurement{
 			Basis:              basis,
-			Model:              inference.ModelKey{Provider: "provider", Model: "model"},
+			Model:              model.ModelKey{Provider: "provider", Model: "model"},
 			RequestFingerprint: [32]byte{1},
 			InputTokens:        1,
 			InputLimit:         100,
-			Quality:            inference.CountQualityExactLocal,
+			Quality:            contextcount.CountQualityExactLocal,
 		},
 	}
 	return started, committed

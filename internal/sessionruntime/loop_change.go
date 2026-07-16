@@ -6,7 +6,7 @@ import (
 	"github.com/looprig/harness/pkg/command"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/loop"
-	"github.com/looprig/inference"
+	model "github.com/looprig/inference/model"
 )
 
 // SetMode selects one predeclared loop mode for this loop, effective at the NEXT turn
@@ -113,7 +113,7 @@ func (h *loopHandle) deliverChange(ctx context.Context, cmd command.Command, ack
 // restored direct-inference model (else that mode's resolved model). It mirrors the actor's
 // effective-config precedence — a mode change resets the model, a later inference change
 // overrides it — so a restored loop's Handle reports what its next turn will run under.
-func liveViewFor(bound loop.BoundDefinition, ri restoredInference) (loop.ModeName, inference.Model) {
+func liveViewFor(bound loop.BoundDefinition, ri restoredInference) (loop.ModeName, model.Model) {
 	mode := bound.InitialMode()
 	if ri.HasMode {
 		mode = ri.Mode
@@ -128,7 +128,7 @@ func liveViewFor(bound loop.BoundDefinition, ri restoredInference) (loop.ModeNam
 	return mode, model
 }
 
-func applyModelRuntime(model inference.Model, runtime event.ModelRuntime) inference.Model {
+func applyModelRuntime(model model.Model, runtime event.ModelRuntime) model.Model {
 	model.Provider = runtime.Key.Provider
 	model.Name = runtime.Key.Model
 	model.Limits = runtime.Limits

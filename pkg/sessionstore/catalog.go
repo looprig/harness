@@ -18,7 +18,7 @@ import (
 	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/journal"
 	"github.com/looprig/harness/pkg/workspacestore"
-	"github.com/looprig/inference"
+	model "github.com/looprig/inference/model"
 	"github.com/looprig/storage"
 )
 
@@ -142,7 +142,7 @@ type SessionMeta struct {
 type HustleUsageAggregate struct {
 	Name            hustle.Name           `json:"name"`
 	ModelSource     hustle.ModelSource    `json:"model_source"`
-	NamedModelKey   inference.ModelKey    `json:"named_model_key,omitzero"`
+	NamedModelKey   model.ModelKey        `json:"named_model_key,omitzero"`
 	Runtime         event.ModelRuntime    `json:"runtime,omitzero"`
 	Status          hustle.TerminalStatus `json:"status"`
 	Runs            uint64                `json:"runs"`
@@ -797,7 +797,7 @@ type catalogHustleStart struct {
 type catalogHustleKey struct {
 	name          hustle.Name
 	modelSource   hustle.ModelSource
-	namedModelKey inference.ModelKey
+	namedModelKey model.ModelKey
 	status        hustle.TerminalStatus
 }
 
@@ -1234,7 +1234,7 @@ func validateHustleUsageAggregate(aggregate HustleUsageAggregate) error {
 				return &CatalogHustleError{Kind: CatalogHustleRuntimeMismatch}
 			}
 		}
-	} else if aggregate.NamedModelKey != (inference.ModelKey{}) {
+	} else if aggregate.NamedModelKey != (model.ModelKey{}) {
 		return &CatalogHustleError{Kind: CatalogHustleInvalidLifecycle}
 	} else if aggregate.Runtime != (event.ModelRuntime{}) {
 		return &CatalogHustleError{Kind: CatalogHustleRuntimeMismatch}
@@ -1245,7 +1245,7 @@ func validateHustleUsageAggregate(aggregate HustleUsageAggregate) error {
 type namedHustleRuntimeKey struct {
 	name          hustle.Name
 	modelSource   hustle.ModelSource
-	namedModelKey inference.ModelKey
+	namedModelKey model.ModelKey
 }
 
 func validateNamedHustleRuntimeConsistency(aggregates []HustleUsageAggregate) (int, error) {

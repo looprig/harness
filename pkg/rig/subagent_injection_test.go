@@ -13,6 +13,7 @@ import (
 	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/harness/pkg/sessionstore"
 	"github.com/looprig/inference"
+	stream "github.com/looprig/inference/stream"
 	"github.com/looprig/storage/memstore"
 )
 
@@ -32,7 +33,7 @@ func (c *captureLLM) Invoke(context.Context, inference.Request) (*inference.Resp
 	return nil, nil
 }
 
-func (c *captureLLM) Stream(_ context.Context, req inference.Request) (*inference.StreamReader[content.Chunk], error) {
+func (c *captureLLM) Stream(_ context.Context, req inference.Request) (*stream.StreamReader[content.Chunk], error) {
 	c.mu.Lock()
 	c.tools = req.Tools
 	c.mu.Unlock()
@@ -47,7 +48,7 @@ func (c *captureLLM) Stream(_ context.Context, req inference.Request) (*inferenc
 		}
 		return nil, io.EOF
 	}
-	return inference.NewStreamReader(next, nil), nil
+	return stream.NewStreamReader(next, nil), nil
 }
 
 func (c *captureLLM) waitTools(t *testing.T) []inference.Tool {

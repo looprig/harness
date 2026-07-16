@@ -11,7 +11,7 @@ import (
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/hustle"
 	"github.com/looprig/harness/pkg/identity"
-	"github.com/looprig/inference"
+	model "github.com/looprig/inference/model"
 )
 
 type recordingHustleIdleBoundary struct {
@@ -183,7 +183,7 @@ func TestPublishInternalEventCheckedBoundary(t *testing.T) {
 		Run:    valid.Run,
 	}
 	completed.EventID = mustID(t)
-	completed.Run.Runtime = event.ModelRuntime{Key: inference.ModelKey{Provider: "test", Model: "model"}}
+	completed.Run.Runtime = event.ModelRuntime{Key: model.ModelKey{Provider: "test", Model: "model"}}
 	failed := event.HustleFailed{
 		Header:     valid.Header,
 		Run:        valid.Run,
@@ -351,7 +351,7 @@ func TestOrdinaryPublicationRejectsPublicHustleLifecycle(t *testing.T) {
 	started.EventVisibility = event.Public
 	completed := event.HustleCompleted{Header: started.Header, Run: started.Run}
 	completed.EventID = mustID(t)
-	completed.Run.Runtime = event.ModelRuntime{Key: inference.ModelKey{Provider: "test", Model: "model"}}
+	completed.Run.Runtime = event.ModelRuntime{Key: model.ModelKey{Provider: "test", Model: "model"}}
 	failed := event.HustleFailed{
 		Header:     started.Header,
 		Run:        started.Run,
@@ -408,7 +408,7 @@ func TestOrdinaryPublicationRejectsHustleLifecyclePointers(t *testing.T) {
 	started.EventVisibility = event.Public
 	completed := event.HustleCompleted{Header: started.Header, Run: started.Run}
 	completed.EventID = mustID(t)
-	completed.Run.Runtime = event.ModelRuntime{Key: inference.ModelKey{Provider: "test", Model: "model"}}
+	completed.Run.Runtime = event.ModelRuntime{Key: model.ModelKey{Provider: "test", Model: "model"}}
 	failed := event.HustleFailed{
 		Header:     started.Header,
 		Run:        started.Run,

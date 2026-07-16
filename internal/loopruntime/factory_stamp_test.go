@@ -16,6 +16,7 @@ import (
 	"github.com/looprig/harness/pkg/hub"
 	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/inference"
+	stream "github.com/looprig/inference/stream"
 )
 
 type countingNoRunLLM struct{ calls atomic.Int32 }
@@ -24,9 +25,9 @@ func (c *countingNoRunLLM) Invoke(context.Context, inference.Request) (*inferenc
 	return nil, errors.New("countingNoRunLLM.Invoke not used")
 }
 
-func (c *countingNoRunLLM) Stream(context.Context, inference.Request) (*inference.StreamReader[content.Chunk], error) {
+func (c *countingNoRunLLM) Stream(context.Context, inference.Request) (*stream.StreamReader[content.Chunk], error) {
 	c.calls.Add(1)
-	return inference.NewStreamReader(func() (content.Chunk, error) { return nil, io.EOF }, nil), nil
+	return stream.NewStreamReader(func() (content.Chunk, error) { return nil, io.EOF }, nil), nil
 }
 
 type observedTurnStartCapability struct {

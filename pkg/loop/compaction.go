@@ -5,7 +5,7 @@ import (
 
 	"github.com/looprig/core/content"
 	"github.com/looprig/harness/pkg/event"
-	"github.com/looprig/inference"
+	model "github.com/looprig/inference/model"
 )
 
 // CompactionWireVersion identifies the concrete adapter JSON contract.
@@ -23,7 +23,7 @@ func (v CompactionWireVersion) Valid() bool { return v == CompactionWireV1 }
 // compaction hustle invocation.
 type CompactionInput struct {
 	Basis              event.ContextBasis
-	Model              inference.ModelKey
+	Model              model.ModelKey
 	RequestFingerprint [32]byte
 	Transcript         content.AgenticMessages
 	MaxSummaryTokens   content.TokenCount
@@ -32,7 +32,7 @@ type CompactionInput struct {
 // CompactionOutput is a validated summary tied to the exact input identity.
 type CompactionOutput struct {
 	Basis              event.ContextBasis
-	Model              inference.ModelKey
+	Model              model.ModelKey
 	RequestFingerprint [32]byte
 	Summary            *content.UserMessage
 }

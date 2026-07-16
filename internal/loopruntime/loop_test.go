@@ -15,6 +15,7 @@ import (
 	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/harness/pkg/tool"
 	"github.com/looprig/inference"
+	model "github.com/looprig/inference/model"
 )
 
 // mustID returns a fresh UUID or fails the test.
@@ -247,15 +248,15 @@ func TestNew_Validation(t *testing.T) {
 	})
 	t.Run("invalid model unwraps to ValidationError", func(t *testing.T) {
 		t.Parallel()
-		bad := inference.Model{} // empty Name — fails inference.Model.Validate (structural check)
+		bad := model.Model{} // empty Name — fails model.Model.Validate (structural check)
 		_, err := newWithConfig(ctx, sessionID, loopID, Provenance{}, noopPublisher{}, runtimeConfig{Client: &fakeLLM{}, Model: bad})
 		var ce *ConfigError
 		if !errors.As(err, &ce) || ce.Kind != ConfigInvalidModel {
 			t.Fatalf("err = %v, want *ConfigError{ConfigInvalidModel}", err)
 		}
-		var ve *inference.ValidationError
+		var ve *model.ValidationError
 		if !errors.As(err, &ve) {
-			t.Fatalf("err does not unwrap to *inference.ValidationError")
+			t.Fatalf("err does not unwrap to *model.ValidationError")
 		}
 	})
 	t.Run("nil publisher", func(t *testing.T) {
@@ -274,7 +275,7 @@ func TestNewRequiresDurableModelKey(t *testing.T) {
 	modelWithoutProvider.Provider = ""
 	tests := []struct {
 		name  string
-		model inference.Model
+		model model.Model
 	}{
 		{name: "empty provider", model: modelWithoutProvider},
 	}
@@ -289,8 +290,8 @@ func TestNewRequiresDurableModelKey(t *testing.T) {
 			if !errors.As(err, &configErr) || configErr.Kind != ConfigInvalidModel {
 				t.Fatalf("newWithConfig error = %T %v, want *ConfigError kind %q", err, err, ConfigInvalidModel)
 			}
-			var keyErr *inference.ModelKeyValidationError
-			if !errors.As(err, &keyErr) || keyErr.Field != inference.ModelKeyFieldProvider {
+			var keyErr *model.ModelKeyValidationError
+			if !errors.As(err, &keyErr) || keyErr.Field != model.ModelKeyFieldProvider {
 				t.Fatalf("newWithConfig cause = %T %v, want *ModelKeyValidationError for Provider", err, err)
 			}
 		})
@@ -765,7 +766,7 @@ func TestInterruptCancelsTurn(t *testing.T) {
 
 func TestTurnFailedProviderErrorTyped(t *testing.T) {
 	t.Parallel()
-	provErr := &inference.ValidationError{Field: "Model", Reason: "boom"}
+	provErr := &model.ValidationError{Field: "Model", Reason: "boom"}
 	l, rec, _ := newLoop(t, &fakeLLM{streamErr: provErr})
 	startTurn(t, l, rec, nil)
 	terminal := drainToTerminal(t, rec)
@@ -773,9 +774,9 @@ func TestTurnFailedProviderErrorTyped(t *testing.T) {
 	if !ok {
 		t.Fatalf("terminal = %T, want TurnFailed", terminal)
 	}
-	var ve *inference.ValidationError
+	var ve *model.ValidationError
 	if !errors.As(failed.Err, &ve) {
-		t.Fatalf("TurnFailed.Err = %T, want *inference.ValidationError", failed.Err)
+		t.Fatalf("TurnFailed.Err = %T, want *model.ValidationError", failed.Err)
 	}
 }
 

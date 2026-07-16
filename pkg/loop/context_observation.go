@@ -4,7 +4,7 @@ import (
 	"time"
 
 	"github.com/looprig/core/content"
-	"github.com/looprig/inference"
+	contextcount "github.com/looprig/inference/contextcount"
 )
 
 // ContextObservationPolicy owns hard-admission settings for a non-compacting
@@ -34,14 +34,14 @@ func (e *ContextObservationPolicyError) Error() string {
 }
 
 // Validate checks policy values against already-validated counter metadata.
-func (p ContextObservationPolicy) Validate(capability inference.CounterCapability) error {
+func (p ContextObservationPolicy) Validate(capability contextcount.CounterCapability) error {
 	if p.ReservedOutput == 0 {
 		return &ContextObservationPolicyError{Field: ContextObservationFieldReservedOutput}
 	}
 	if p.CountTimeout <= 0 {
 		return &ContextObservationPolicyError{Field: ContextObservationFieldCountTimeout}
 	}
-	if capability.Quality == inference.CountQualityHeuristicEstimate && p.SafetyMargin == 0 {
+	if capability.Quality == contextcount.CountQualityHeuristicEstimate && p.SafetyMargin == 0 {
 		return &ContextObservationPolicyError{Field: ContextObservationFieldSafetyMargin}
 	}
 	return nil

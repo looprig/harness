@@ -13,6 +13,8 @@ import (
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/inference"
+	contextcount "github.com/looprig/inference/contextcount"
+	model "github.com/looprig/inference/model"
 )
 
 type contextCompactionAwaitDisposition uint8
@@ -249,9 +251,9 @@ func contextSettings(config runtimeConfig) (contextAdmissionSettings, bool) {
 
 func measureRequestContext(
 	ctx context.Context,
-	counter inference.ContextCounter,
-	counterCapability inference.CounterCapability,
-	inferenceCapability inference.InferenceCapability,
+	counter contextcount.ContextCounter,
+	counterCapability contextcount.CounterCapability,
+	inferenceCapability contextcount.InferenceCapability,
 	settings contextAdmissionSettings,
 	basis event.ContextBasis,
 	request inference.Request,
@@ -291,8 +293,8 @@ func contextRequestFingerprint(
 	request inference.Request,
 	basis event.ContextBasis,
 	runtimeContextRevision string,
-	counterCapability inference.CounterCapability,
-	inferenceCapability inference.InferenceCapability,
+	counterCapability contextcount.CounterCapability,
+	inferenceCapability contextcount.InferenceCapability,
 ) ([32]byte, error) {
 	template, err := contextFingerprintTemplateForRequest(request, runtimeContextRevision, counterCapability, inferenceCapability)
 	if err != nil {
@@ -308,21 +310,21 @@ func contextRequestFingerprint(
 type contextFingerprintTemplate struct {
 	SystemRevision         string
 	ToolPolicyRevision     string
-	Model                  inference.Model
+	Model                  model.Model
 	RuntimeContextRevision string
-	CounterCapability      inference.CounterCapability
-	InferenceCapability    inference.InferenceCapability
+	CounterCapability      contextcount.CounterCapability
+	InferenceCapability    contextcount.InferenceCapability
 }
 
 func contextFingerprintTemplateForRequest(
 	request inference.Request,
 	runtimeContextRevision string,
-	counterCapability inference.CounterCapability,
-	inferenceCapability inference.InferenceCapability,
+	counterCapability contextcount.CounterCapability,
+	inferenceCapability contextcount.InferenceCapability,
 ) (contextFingerprintTemplate, error) {
 	toolShape, err := json.Marshal(struct {
 		Tools    []inference.Tool
-		Override *inference.Sampling
+		Override *model.Sampling
 	}{Tools: request.Tools, Override: request.Override})
 	if err != nil {
 		return contextFingerprintTemplate{}, &loop.RequestFingerprintError{Field: "ToolPolicyRevision", Cause: err}
@@ -362,26 +364,26 @@ func runtimeContextRevision(message *content.UserMessage) (string, error) {
 	return revisionDigest(encoded), nil
 }
 
-func normalizeContextCountError(model inference.ModelKey, quality inference.CountQuality, err error) error {
-	var typed *inference.ContextCountError
+func normalizeContextCountError(model model.ModelKey, quality contextcount.CountQuality, err error) error {
+	var typed *contextcount.ContextCountError
 	if errors.As(err, &typed) {
 		return err
 	}
-	return &inference.ContextCountError{Model: model, Quality: quality, Cause: err}
+	return &contextcount.ContextCountError{Model: model, Quality: quality, Cause: err}
 }
 
-func validateContextCount(model inference.ModelKey, quality inference.CountQuality, count inference.ContextCount) error {
+func validateContextCount(model model.ModelKey, quality contextcount.CountQuality, count contextcount.ContextCount) error {
 	if err := count.Model.Validate(); err != nil {
-		return &inference.ContextCountError{Model: count.Model, Quality: count.Quality, Cause: err}
+		return &contextcount.ContextCountError{Model: count.Model, Quality: count.Quality, Cause: err}
 	}
 	if count.Model != model {
-		return &inference.ContextCountError{Model: count.Model, Quality: count.Quality, Cause: inference.ErrContextCountModelMismatch}
+		return &contextcount.ContextCountError{Model: count.Model, Quality: count.Quality, Cause: contextcount.ErrContextCountModelMismatch}
 	}
-	if count.Quality != inference.CountQualityExactProvider && count.Quality != inference.CountQualityExactLocal && count.Quality != inference.CountQualityHeuristicEstimate {
-		return &inference.ContextCountError{Model: count.Model, Quality: count.Quality, Cause: inference.ErrContextCountQualityInvalid}
+	if count.Quality != contextcount.CountQualityExactProvider && count.Quality != contextcount.CountQualityExactLocal && count.Quality != contextcount.CountQualityHeuristicEstimate {
+		return &contextcount.ContextCountError{Model: count.Model, Quality: count.Quality, Cause: contextcount.ErrContextCountQualityInvalid}
 	}
 	if count.Quality != quality {
-		return &inference.ContextCountError{Model: count.Model, Quality: count.Quality, Cause: inference.ErrContextCountCapabilityQualityMismatch}
+		return &contextcount.ContextCountError{Model: count.Model, Quality: count.Quality, Cause: contextcount.ErrContextCountCapabilityQualityMismatch}
 	}
 	return nil
 }

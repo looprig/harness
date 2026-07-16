@@ -20,6 +20,7 @@ import (
 	"github.com/looprig/harness/pkg/tool"
 	"github.com/looprig/harness/pkg/workspacestore"
 	"github.com/looprig/inference"
+	stream "github.com/looprig/inference/stream"
 	"github.com/looprig/storage"
 	"github.com/looprig/storage/memstore"
 )
@@ -120,7 +121,7 @@ func (panickingInference) Invoke(context.Context, inference.Request) (*inference
 	panic("inference invoke panic")
 }
 
-func (panickingInference) Stream(context.Context, inference.Request) (*inference.StreamReader[content.Chunk], error) {
+func (panickingInference) Stream(context.Context, inference.Request) (*stream.StreamReader[content.Chunk], error) {
 	panic("inference stream panic")
 }
 

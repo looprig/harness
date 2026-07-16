@@ -9,6 +9,7 @@ import (
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/inference"
+	stream "github.com/looprig/inference/stream"
 )
 
 // StepIndex is the turn-local index of a step. Each turn numbers its own steps
@@ -170,7 +171,7 @@ func runStep(ctx context.Context, cfg stepConfig, turnIndex event.TurnIndex, st 
 // terminalUsage clones the authoritative provider usage captured at clean EOF.
 // A stream without terminal metadata remains unknown (nil), including a result
 // that reports other metadata but no usage.
-func terminalUsage(sr *inference.StreamReader[content.Chunk]) *content.Usage {
+func terminalUsage(sr *stream.StreamReader[content.Chunk]) *content.Usage {
 	result, ok := sr.Result()
 	if !ok || result.Usage == nil {
 		return nil

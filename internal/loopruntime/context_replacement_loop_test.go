@@ -14,7 +14,8 @@ import (
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/loop"
-	"github.com/looprig/inference"
+	contextcount "github.com/looprig/inference/contextcount"
+	model "github.com/looprig/inference/model"
 )
 
 type compactionTerminalFailurePublisher struct {
@@ -71,10 +72,10 @@ func TestLoopCompactionOutcomeAppliesReplacementAfterDurableCommit(t *testing.T)
 			publisher := &compactionTerminalFailurePublisher{recordingPublisher: recorder, err: errors.New("commit append failed")}
 			client := &contextOrderClient{recorder: recorder}
 			counter := &loopContextCounter{
-				capability: contextTestCapability(inference.CountQualityExactLocal), counts: []content.TokenCount{65, 20},
+				capability: contextTestCapability(contextcount.CountQualityExactLocal), counts: []content.TokenCount{65, 20},
 			}
 			model := testModel()
-			model.Limits = inference.ContextLimits{WindowTokens: 100, MaxInputTokens: 80, MaxOutputTokens: 20}
+			model.Limits = testContextLimits{WindowTokens: 100, MaxInputTokens: 80, MaxOutputTokens: 20}
 			sink := newContextAwaitSink()
 			config := runtimeConfig{
 				Client: client, Model: model, System: "system", DrainTimeout: 200 * time.Millisecond,
@@ -229,7 +230,7 @@ func TestLoopMalformedStartedCompactionFinalizesInternalRejection(t *testing.T) 
 		{
 			name: "zero success model",
 			mutate: func(result contextCompactionAwaitResult) contextCompactionAwaitResult {
-				result.Proposal.Success.Model = inference.ModelKey{}
+				result.Proposal.Success.Model = model.ModelKey{}
 				return result
 			},
 		},
@@ -243,7 +244,7 @@ func TestLoopMalformedStartedCompactionFinalizesInternalRejection(t *testing.T) 
 		{
 			name: "post context model differs from success model",
 			mutate: func(result contextCompactionAwaitResult) contextCompactionAwaitResult {
-				result.Proposal.Success.PostCount.Model = inference.ModelKey{Provider: "test", Model: "different"}
+				result.Proposal.Success.PostCount.Model = model.ModelKey{Provider: "test", Model: "different"}
 				return result
 			},
 		},
@@ -296,10 +297,10 @@ func TestLoopMalformedStartedCompactionFinalizesInternalRejection(t *testing.T) 
 			}
 			client := &contextOrderClient{recorder: recorder}
 			counter := &loopContextCounter{
-				capability: contextTestCapability(inference.CountQualityExactLocal), counts: []content.TokenCount{65, 20},
+				capability: contextTestCapability(contextcount.CountQualityExactLocal), counts: []content.TokenCount{65, 20},
 			}
 			model := testModel()
-			model.Limits = inference.ContextLimits{WindowTokens: 100, MaxInputTokens: 80, MaxOutputTokens: 20}
+			model.Limits = testContextLimits{WindowTokens: 100, MaxInputTokens: 80, MaxOutputTokens: 20}
 			sink := newContextAwaitSink()
 			sessionID, loopID := uuid.UUID{91}, uuid.UUID{92}
 			actor, err := newWithConfig(ctx, sessionID, loopID, Provenance{}, publisher, runtimeConfig{

@@ -7,38 +7,38 @@ import (
 
 	"github.com/looprig/core/content"
 	"github.com/looprig/harness/pkg/event"
-	"github.com/looprig/inference"
+	model "github.com/looprig/inference/model"
 )
 
 func TestResolveContextLimits(t *testing.T) {
 	t.Parallel()
-	model := inference.ModelKey{Provider: "provider", Model: "model"}
+	modelKey := model.ModelKey{Provider: "provider", Model: "model"}
 	tests := []struct {
 		name        string
-		limits      inference.ContextLimits
+		limits      model.ContextLimits
 		reserved    content.TokenCount
 		margin      content.TokenCount
 		want        ResolvedContextLimits
 		wantUnknown bool
 	}{
-		{name: "window only", limits: inference.ContextLimits{WindowTokens: 100}, reserved: 20, margin: 5, want: ResolvedContextLimits{ReservedOutput: 20, RawInputLimit: 80, InputLimit: 75}},
-		{name: "reserved clamped to max output", limits: inference.ContextLimits{WindowTokens: 100, MaxOutputTokens: 10}, reserved: 20, margin: 5, want: ResolvedContextLimits{ReservedOutput: 10, RawInputLimit: 90, InputLimit: 85}},
-		{name: "minimum nonzero input cap", limits: inference.ContextLimits{WindowTokens: 100, MaxInputTokens: 60}, reserved: 20, margin: 5, want: ResolvedContextLimits{ReservedOutput: 20, RawInputLimit: 60, InputLimit: 55}},
-		{name: "unknown window known input subtracts margin last", limits: inference.ContextLimits{MaxInputTokens: 60}, reserved: 20, margin: 5, want: ResolvedContextLimits{ReservedOutput: 20, RawInputLimit: 60, InputLimit: 55}},
-		{name: "unknown output preserves reservation", limits: inference.ContextLimits{WindowTokens: 100}, reserved: 20, want: ResolvedContextLimits{ReservedOutput: 20, RawInputLimit: 80, InputLimit: 80}},
-		{name: "unknown denominator", limits: inference.ContextLimits{}, reserved: 20, wantUnknown: true},
-		{name: "reservation consumes window", limits: inference.ContextLimits{WindowTokens: 20}, reserved: 20, wantUnknown: true},
-		{name: "margin consumes raw limit", limits: inference.ContextLimits{MaxInputTokens: 5}, reserved: 1, margin: 5, wantUnknown: true},
-		{name: "reservation exceeds unknown max and known window", limits: inference.ContextLimits{WindowTokens: 5}, reserved: 6, wantUnknown: true},
+		{name: "window only", limits: model.ContextLimits{WindowTokens: 100}, reserved: 20, margin: 5, want: ResolvedContextLimits{ReservedOutput: 20, RawInputLimit: 80, InputLimit: 75}},
+		{name: "reserved clamped to max output", limits: model.ContextLimits{WindowTokens: 100, MaxOutputTokens: 10}, reserved: 20, margin: 5, want: ResolvedContextLimits{ReservedOutput: 10, RawInputLimit: 90, InputLimit: 85}},
+		{name: "minimum nonzero input cap", limits: model.ContextLimits{WindowTokens: 100, MaxInputTokens: 60}, reserved: 20, margin: 5, want: ResolvedContextLimits{ReservedOutput: 20, RawInputLimit: 60, InputLimit: 55}},
+		{name: "unknown window known input subtracts margin last", limits: model.ContextLimits{MaxInputTokens: 60}, reserved: 20, margin: 5, want: ResolvedContextLimits{ReservedOutput: 20, RawInputLimit: 60, InputLimit: 55}},
+		{name: "unknown output preserves reservation", limits: model.ContextLimits{WindowTokens: 100}, reserved: 20, want: ResolvedContextLimits{ReservedOutput: 20, RawInputLimit: 80, InputLimit: 80}},
+		{name: "unknown denominator", limits: model.ContextLimits{}, reserved: 20, wantUnknown: true},
+		{name: "reservation consumes window", limits: model.ContextLimits{WindowTokens: 20}, reserved: 20, wantUnknown: true},
+		{name: "margin consumes raw limit", limits: model.ContextLimits{MaxInputTokens: 5}, reserved: 1, margin: 5, wantUnknown: true},
+		{name: "reservation exceeds unknown max and known window", limits: model.ContextLimits{WindowTokens: 5}, reserved: 6, wantUnknown: true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			got, err := ResolveContextLimits(model, tt.limits, tt.reserved, tt.margin)
+			got, err := ResolveContextLimits(modelKey, tt.limits, tt.reserved, tt.margin)
 			if tt.wantUnknown {
 				var target *ContextLimitUnknownError
-				if !errors.As(err, &target) || target.Model != model {
-					t.Fatalf("error = %T %v, want ContextLimitUnknownError for %v", err, err, model)
+				if !errors.As(err, &target) || target.Model != modelKey {
+					t.Fatalf("error = %T %v, want ContextLimitUnknownError for %v", err, err, modelKey)
 				}
 				return
 			}

@@ -11,7 +11,7 @@ import (
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/gate"
 	"github.com/looprig/harness/pkg/tool"
-	"github.com/looprig/inference"
+	model "github.com/looprig/inference/model"
 )
 
 // schemaVersion is the current wire-envelope schema version stamped into every
@@ -631,15 +631,15 @@ type legacyModelCapsWire struct {
 }
 
 type legacyModelWire struct {
-	Provider inference.ProviderName
+	Provider model.ProviderName
 	Name     string
 	Caps     legacyModelCapsWire
 }
 
 type legacyLoopInferenceChangedWire struct {
 	Header
-	Model  legacyModelWire  `json:"model"`
-	Effort inference.Effort `json:"effort,omitzero"`
+	Model  legacyModelWire `json:"model"`
+	Effort model.Effort    `json:"effort,omitzero"`
 }
 
 // decodeLoopInferenceChanged accepts both v1 shapes. Current records carry the
@@ -682,11 +682,11 @@ func decodeLoopInferenceChanged(data []byte) (Event, error) {
 	return LoopInferenceChanged{
 		Header: wire.Header,
 		Runtime: ModelRuntime{
-			Key: inference.ModelKey{
+			Key: model.ModelKey{
 				Provider: wire.Model.Provider,
 				Model:    wire.Model.Name,
 			},
-			Limits: inference.ContextLimits{WindowTokens: content.TokenCount(wire.Model.Caps.MaxContext)},
+			Limits: model.ContextLimits{WindowTokens: content.TokenCount(wire.Model.Caps.MaxContext)},
 			Effort: wire.Effort,
 		},
 	}, nil

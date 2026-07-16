@@ -5,7 +5,7 @@ import (
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/hustle"
 	"github.com/looprig/harness/pkg/identity"
-	"github.com/looprig/inference"
+	model "github.com/looprig/inference/model"
 )
 
 // EventName is the concrete event type name an InvalidEventError points at.
@@ -279,7 +279,7 @@ func validateOptionalUsage(name EventName, usage *content.Usage) error {
 }
 
 func zeroModelRuntime(runtime ModelRuntime) bool {
-	return runtime.Key == (inference.ModelKey{}) && runtime.Limits == (inference.ContextLimits{}) && runtime.Effort == inference.Effort("")
+	return runtime.Key == (model.ModelKey{}) && runtime.Limits == (model.ContextLimits{}) && runtime.Effort == model.Effort("")
 }
 
 func validateStepDoneMessages(messages content.AgenticMessages) error {

@@ -10,41 +10,44 @@ import (
 	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/harness/pkg/sessionstore"
 	"github.com/looprig/inference"
+	contextcount "github.com/looprig/inference/contextcount"
 	"github.com/looprig/storage/memstore"
 )
 
-type rigContextCounter struct{ capability inference.CounterCapability }
+type rigContextCounter struct {
+	capability contextcount.CounterCapability
+}
 
-func (*rigContextCounter) CountContext(_ context.Context, _ inference.Request) (inference.ContextCount, error) {
+func (*rigContextCounter) CountContext(_ context.Context, _ inference.Request) (contextcount.ContextCount, error) {
 	panic("unused")
 }
-func (c *rigContextCounter) CounterCapability() inference.CounterCapability { return c.capability }
+func (c *rigContextCounter) CounterCapability() contextcount.CounterCapability { return c.capability }
 
 type compactionFingerprintConfig struct {
-	counter   inference.CounterCapability
-	inference inference.InferenceCapability
+	counter   contextcount.CounterCapability
+	inference contextcount.InferenceCapability
 	policy    loop.CompactionPolicy
 }
 
 func neutralFingerprintConfig() compactionFingerprintConfig {
 	return compactionFingerprintConfig{
-		counter:   inference.CounterCapability{Transport: inference.CounterTransportLocal, Retention: inference.RetentionNone, TokenizerRev: "v1", Quality: inference.CountQualityExactLocal},
-		inference: inference.InferenceCapability{Transport: inference.InferenceTransportLocal, Retention: inference.RetentionNone},
+		counter:   contextcount.CounterCapability{Transport: contextcount.CounterTransportLocal, Retention: contextcount.RetentionNone, TokenizerRev: "v1", Quality: contextcount.CountQualityExactLocal},
+		inference: contextcount.InferenceCapability{Transport: contextcount.InferenceTransportLocal, Retention: contextcount.RetentionNone},
 		policy:    loop.CompactionPolicy{ReservedOutput: 10, MaxSummaryTokens: 5, CountTimeout: time.Millisecond, Hustle: "context.compact"},
 	}
 }
 
 func endpointFingerprintConfig() compactionFingerprintConfig {
-	identity := inference.SecurityIdentity{1}
+	identity := contextcount.SecurityIdentity{1}
 	return compactionFingerprintConfig{
-		counter: inference.CounterCapability{
-			Provider: "provider", Transport: inference.CounterTransportSeparateEndpoint,
-			SecurityIdentity: identity, Retention: inference.RetentionNone,
-			TokenizerRev: "v1", Quality: inference.CountQualityExactProvider,
+		counter: contextcount.CounterCapability{
+			Provider: "provider", Transport: contextcount.CounterTransportSeparateEndpoint,
+			SecurityIdentity: identity, Retention: contextcount.RetentionNone,
+			TokenizerRev: "v1", Quality: contextcount.CountQualityExactProvider,
 		},
-		inference: inference.InferenceCapability{
-			Provider: "provider", Transport: inference.InferenceTransportTLS,
-			SecurityIdentity: identity, Retention: inference.RetentionLogged,
+		inference: contextcount.InferenceCapability{
+			Provider: "provider", Transport: contextcount.InferenceTransportTLS,
+			SecurityIdentity: identity, Retention: contextcount.RetentionLogged,
 		},
 		policy: loop.CompactionPolicy{SafetyMargin: 1, ReservedOutput: 10, MaxSummaryTokens: 5, CountTimeout: time.Millisecond, Hustle: "context.compact"},
 	}
@@ -141,7 +144,7 @@ func TestCompactionTopologyFingerprintSensitivity(t *testing.T) {
 	}
 	tlsConfig := func() compactionFingerprintConfig {
 		config := neutralFingerprintConfig()
-		config.inference = inference.InferenceCapability{Provider: "provider", Transport: inference.InferenceTransportTLS, SecurityIdentity: inference.SecurityIdentity{1}, Retention: inference.RetentionNone}
+		config.inference = contextcount.InferenceCapability{Provider: "provider", Transport: contextcount.InferenceTransportTLS, SecurityIdentity: contextcount.SecurityIdentity{1}, Retention: contextcount.RetentionNone}
 		return config
 	}
 	tests := []struct {
@@ -150,15 +153,19 @@ func TestCompactionTopologyFingerprintSensitivity(t *testing.T) {
 		mutate func(*compactionFingerprintConfig)
 	}{
 		{name: "counter provider", base: providerConfig, mutate: func(c *compactionFingerprintConfig) { c.counter.Provider = "" }},
-		{name: "counter transport", base: endpointFingerprintConfig, mutate: func(c *compactionFingerprintConfig) { c.counter.Transport = inference.CounterTransportSameEndpoint }},
-		{name: "counter security identity", base: endpointFingerprintConfig, mutate: func(c *compactionFingerprintConfig) { c.counter.SecurityIdentity = inference.SecurityIdentity{2} }},
-		{name: "counter retention", base: endpointFingerprintConfig, mutate: func(c *compactionFingerprintConfig) { c.counter.Retention = inference.RetentionEphemeral }},
+		{name: "counter transport", base: endpointFingerprintConfig, mutate: func(c *compactionFingerprintConfig) { c.counter.Transport = contextcount.CounterTransportSameEndpoint }},
+		{name: "counter security identity", base: endpointFingerprintConfig, mutate: func(c *compactionFingerprintConfig) { c.counter.SecurityIdentity = contextcount.SecurityIdentity{2} }},
+		{name: "counter retention", base: endpointFingerprintConfig, mutate: func(c *compactionFingerprintConfig) { c.counter.Retention = contextcount.RetentionEphemeral }},
 		{name: "counter tokenizer revision", base: endpointFingerprintConfig, mutate: func(c *compactionFingerprintConfig) { c.counter.TokenizerRev = "v2" }},
-		{name: "counter quality", base: endpointFingerprintConfig, mutate: func(c *compactionFingerprintConfig) { c.counter.Quality = inference.CountQualityExactLocal }},
+		{name: "counter quality", base: endpointFingerprintConfig, mutate: func(c *compactionFingerprintConfig) { c.counter.Quality = contextcount.CountQualityExactLocal }},
 		{name: "inference provider", base: neutralFingerprintConfig, mutate: func(c *compactionFingerprintConfig) { c.inference.Provider = "other" }},
-		{name: "inference transport", base: tlsConfig, mutate: func(c *compactionFingerprintConfig) { c.inference.Transport = inference.InferenceTransportAttestedTLS }},
-		{name: "inference security identity", base: tlsConfig, mutate: func(c *compactionFingerprintConfig) { c.inference.SecurityIdentity = inference.SecurityIdentity{2} }},
-		{name: "inference retention", base: tlsConfig, mutate: func(c *compactionFingerprintConfig) { c.inference.Retention = inference.RetentionEphemeral }},
+		{name: "inference transport", base: tlsConfig, mutate: func(c *compactionFingerprintConfig) {
+			c.inference.Transport = contextcount.InferenceTransportAttestedTLS
+		}},
+		{name: "inference security identity", base: tlsConfig, mutate: func(c *compactionFingerprintConfig) {
+			c.inference.SecurityIdentity = contextcount.SecurityIdentity{2}
+		}},
+		{name: "inference retention", base: tlsConfig, mutate: func(c *compactionFingerprintConfig) { c.inference.Retention = contextcount.RetentionEphemeral }},
 		{name: "policy automatic", base: automaticFingerprintConfig, mutate: func(c *compactionFingerprintConfig) { c.policy.Automatic = false }},
 		{name: "policy counter policy", base: automaticFingerprintConfig, mutate: func(c *compactionFingerprintConfig) { c.policy.CounterPolicy = loop.CounterPolicyAllowConservative }},
 		{name: "policy compact threshold", base: automaticFingerprintConfig, mutate: func(c *compactionFingerprintConfig) { c.policy.CompactAt++ }},

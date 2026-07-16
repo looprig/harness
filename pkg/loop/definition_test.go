@@ -13,6 +13,8 @@ import (
 	"github.com/looprig/harness/pkg/security"
 	"github.com/looprig/harness/pkg/tool"
 	"github.com/looprig/inference"
+	model "github.com/looprig/inference/model"
+	stream "github.com/looprig/inference/stream"
 )
 
 func TestDefineValidation(t *testing.T) {
@@ -25,7 +27,7 @@ func TestDefineValidation(t *testing.T) {
 		{name: "missing name", opts: []Option{WithInference(&fakeLLM{}, testModel())}, kind: DefinitionMissingName},
 		{name: "missing client", opts: []Option{WithName("agent"), WithInference(nil, testModel())}, kind: DefinitionInvalidClient},
 		{name: "typed nil client", opts: []Option{WithName("agent"), WithInference((*nilInferenceClient)(nil), testModel())}, kind: DefinitionInvalidClient},
-		{name: "invalid model", opts: []Option{WithName("agent"), WithInference(&fakeLLM{}, inference.Model{})}, kind: DefinitionInvalidModel},
+		{name: "invalid model", opts: []Option{WithName("agent"), WithInference(&fakeLLM{}, model.Model{})}, kind: DefinitionInvalidModel},
 		{name: "nil option", opts: []Option{WithName("agent"), nil, WithInference(&fakeLLM{}, testModel())}, kind: DefinitionNilOption},
 		{name: "duplicate name", opts: []Option{WithName("a"), WithName("b"), WithInference(&fakeLLM{}, testModel())}, kind: DefinitionDuplicateOption},
 		{name: "negative limits", opts: []Option{WithName("a"), WithInference(&fakeLLM{}, testModel()), WithToolLimits(ToolLimits{Calls: -1})}, kind: DefinitionInvalidToolLimits},
@@ -61,42 +63,42 @@ func TestDefineRequiresDurableModelKey(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
 		name      string
-		configure func(inference.Model) []Option
+		configure func(model.Model) []Option
 		wantKind  DefinitionErrorKind
-		wantField inference.ModelKeyField
+		wantField model.ModelKeyField
 	}{
 		{
 			name: "base model requires provider",
-			configure: func(model inference.Model) []Option {
+			configure: func(model model.Model) []Option {
 				return []Option{WithName("agent"), WithInference(&fakeLLM{}, model)}
 			},
 			wantKind:  DefinitionInvalidModel,
-			wantField: inference.ModelKeyFieldProvider,
+			wantField: model.ModelKeyFieldProvider,
 		},
 		{
 			name: "mode model requires provider",
-			configure: func(model inference.Model) []Option {
+			configure: func(model model.Model) []Option {
 				return []Option{
 					WithName("agent"), WithInference(&fakeLLM{}, testModel()),
 					WithModes(Mode{Name: "alternate", Model: model}), WithInitialMode("alternate"),
 				}
 			},
 			wantKind:  DefinitionInvalidMode,
-			wantField: inference.ModelKeyFieldProvider,
+			wantField: model.ModelKeyFieldProvider,
 		},
 	}
 	for _, tt := range tests {
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			model := testModel()
-			model.Provider = ""
-			_, err := Define(tt.configure(model)...)
+			candidate := testModel()
+			candidate.Provider = ""
+			_, err := Define(tt.configure(candidate)...)
 			var definitionErr *DefinitionError
 			if !errors.As(err, &definitionErr) || definitionErr.Kind != tt.wantKind {
 				t.Fatalf("Define error = %T %v, want *DefinitionError kind %q", err, err, tt.wantKind)
 			}
-			var keyErr *inference.ModelKeyValidationError
+			var keyErr *model.ModelKeyValidationError
 			if !errors.As(err, &keyErr) || keyErr.Field != tt.wantField {
 				t.Fatalf("Define cause = %T %v, want *ModelKeyValidationError field %q", err, err, tt.wantField)
 			}
@@ -501,7 +503,7 @@ type nilInferenceClient struct{}
 func (*nilInferenceClient) Invoke(context.Context, inference.Request) (*inference.Response, error) {
 	return nil, nil
 }
-func (*nilInferenceClient) Stream(context.Context, inference.Request) (*inference.StreamReader[content.Chunk], error) {
+func (*nilInferenceClient) Stream(context.Context, inference.Request) (*stream.StreamReader[content.Chunk], error) {
 	return nil, nil
 }
 

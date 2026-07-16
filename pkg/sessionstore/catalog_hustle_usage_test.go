@@ -12,11 +12,11 @@ import (
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/hustle"
 	"github.com/looprig/harness/pkg/identity"
-	"github.com/looprig/inference"
+	model "github.com/looprig/inference/model"
 	"github.com/looprig/storage/memstore"
 )
 
-func catalogHustleDescriptor(t *testing.T, name hustle.Name, source hustle.ModelSource, key inference.ModelKey) hustle.DefinitionDescriptor {
+func catalogHustleDescriptor(t *testing.T, name hustle.Name, source hustle.ModelSource, key model.ModelKey) hustle.DefinitionDescriptor {
 	t.Helper()
 	descriptor := replayHustleDefinition(t)
 	descriptor.Name = name
@@ -46,12 +46,12 @@ func catalogHustlePair(sid uuid.UUID, descriptor hustle.DefinitionDescriptor, ru
 func TestFoldCatalogHustlesIsBoundedAndDeterministic(t *testing.T) {
 	t.Parallel()
 	sid := fixedUUID(0x70)
-	current := catalogHustleDescriptor(t, "z-current", hustle.ModelSourceCurrentLoop, inference.ModelKey{})
-	namedKey := inference.ModelKey{Provider: "provider", Model: "fixed"}
+	current := catalogHustleDescriptor(t, "z-current", hustle.ModelSourceCurrentLoop, model.ModelKey{})
+	namedKey := model.ModelKey{Provider: "provider", Model: "fixed"}
 	named := catalogHustleDescriptor(t, "a-named", hustle.ModelSourceNamed, namedKey)
-	runtimeA := event.ModelRuntime{Key: inference.ModelKey{Provider: "provider-a", Model: "model-a"}, Limits: inference.ContextLimits{WindowTokens: 100}}
-	runtimeB := event.ModelRuntime{Key: inference.ModelKey{Provider: "provider-b", Model: "model-b"}, Limits: inference.ContextLimits{WindowTokens: 200}}
-	namedRuntime := event.ModelRuntime{Key: namedKey, Limits: inference.ContextLimits{WindowTokens: 300}}
+	runtimeA := event.ModelRuntime{Key: model.ModelKey{Provider: "provider-a", Model: "model-a"}, Limits: model.ContextLimits{WindowTokens: 100}}
+	runtimeB := event.ModelRuntime{Key: model.ModelKey{Provider: "provider-b", Model: "model-b"}, Limits: model.ContextLimits{WindowTokens: 200}}
+	namedRuntime := event.ModelRuntime{Key: namedKey, Limits: model.ContextLimits{WindowTokens: 300}}
 	usageA := content.Usage{InputTokens: 10, OutputTokens: 2}
 	usageB := content.Usage{InputTokens: 20, OutputTokens: 4, CacheReadTokens: 3}
 	currentStartA, currentDoneA := catalogHustlePair(sid, current, 0x71, runtimeA, &usageA, false)
@@ -92,9 +92,9 @@ func TestFoldCatalogHustlesIsBoundedAndDeterministic(t *testing.T) {
 func TestFoldCatalogHustlesFailsClosed(t *testing.T) {
 	t.Parallel()
 	sid := fixedUUID(0x80)
-	namedKey := inference.ModelKey{Provider: "provider", Model: "fixed"}
+	namedKey := model.ModelKey{Provider: "provider", Model: "fixed"}
 	descriptor := catalogHustleDescriptor(t, "named", hustle.ModelSourceNamed, namedKey)
-	runtime := event.ModelRuntime{Key: namedKey, Limits: inference.ContextLimits{WindowTokens: 100}}
+	runtime := event.ModelRuntime{Key: namedKey, Limits: model.ContextLimits{WindowTokens: 100}}
 	usageMax := content.Usage{InputTokens: content.TokenCount(^uint64(0))}
 	usageOne := content.Usage{InputTokens: 1}
 	start, terminal := catalogHustlePair(sid, descriptor, 0x81, runtime, nil, false)
@@ -124,11 +124,11 @@ func TestFoldCatalogHustlesFailsClosed(t *testing.T) {
 			return value
 		}()}},
 		{name: "named runtime metadata differs for one fixed identity", events: func() []event.Event {
-			secondStart, secondTerminal := catalogHustlePair(sid, descriptor, 0x87, event.ModelRuntime{Key: namedKey, Limits: inference.ContextLimits{WindowTokens: 200}}, nil, false)
+			secondStart, secondTerminal := catalogHustlePair(sid, descriptor, 0x87, event.ModelRuntime{Key: namedKey, Limits: model.ContextLimits{WindowTokens: 200}}, nil, false)
 			return []event.Event{start, terminal, secondStart, secondTerminal}
 		}()},
 		{name: "named runtime metadata differs across terminal statuses", events: func() []event.Event {
-			failedStart, failedTerminal := catalogHustlePair(sid, descriptor, 0x89, event.ModelRuntime{Key: namedKey, Limits: inference.ContextLimits{WindowTokens: 200}}, nil, true)
+			failedStart, failedTerminal := catalogHustlePair(sid, descriptor, 0x89, event.ModelRuntime{Key: namedKey, Limits: model.ContextLimits{WindowTokens: 200}}, nil, true)
 			return []event.Event{start, terminal, failedStart, failedTerminal}
 		}()},
 		{name: "usage overflow", events: []event.Event{startMax, terminalMax, startOne, terminalOne}},
@@ -148,8 +148,8 @@ func TestFoldCatalogHustlesFailsClosed(t *testing.T) {
 func TestFoldCatalogHustleTerminalRejectsRunCountOverflow(t *testing.T) {
 	t.Parallel()
 	sid := fixedUUID(0xa0)
-	descriptor := catalogHustleDescriptor(t, "overflow", hustle.ModelSourceCurrentLoop, inference.ModelKey{})
-	runtime := event.ModelRuntime{Key: inference.ModelKey{Provider: "provider", Model: "model"}, Limits: inference.ContextLimits{WindowTokens: 100}}
+	descriptor := catalogHustleDescriptor(t, "overflow", hustle.ModelSourceCurrentLoop, model.ModelKey{})
+	runtime := event.ModelRuntime{Key: model.ModelKey{Provider: "provider", Model: "model"}, Limits: model.ContextLimits{WindowTokens: 100}}
 	start, terminalEvent := catalogHustlePair(sid, descriptor, 0xa1, runtime, nil, false)
 	terminal := terminalEvent.(event.HustleCompleted)
 	key := catalogHustleKey{name: descriptor.Name, modelSource: descriptor.ModelSource, status: hustle.TerminalStatusCompleted}
@@ -175,8 +175,8 @@ func TestFoldCatalogHustleTerminalRejectsRunCountOverflow(t *testing.T) {
 
 func TestReconcileNamedHustleRuntimesPropagatesAcrossStatuses(t *testing.T) {
 	t.Parallel()
-	key := inference.ModelKey{Provider: "provider", Model: "fixed"}
-	runtime := event.ModelRuntime{Key: key, Limits: inference.ContextLimits{WindowTokens: 100}}
+	key := model.ModelKey{Provider: "provider", Model: "fixed"}
+	runtime := event.ModelRuntime{Key: key, Limits: model.ContextLimits{WindowTokens: 100}}
 	completed := HustleUsageAggregate{Name: "named", ModelSource: hustle.ModelSourceNamed, NamedModelKey: key, Status: hustle.TerminalStatusCompleted, Runs: 1}
 	failed := HustleUsageAggregate{Name: "named", ModelSource: hustle.ModelSourceNamed, NamedModelKey: key, Status: hustle.TerminalStatusFailed, Runs: 1}
 	tests := []struct {
@@ -212,8 +212,8 @@ func TestReconcileNamedHustleRuntimesPropagatesAcrossStatuses(t *testing.T) {
 
 func TestHustleUsageAggregateCodecValidation(t *testing.T) {
 	t.Parallel()
-	key := inference.ModelKey{Provider: "provider", Model: "model"}
-	runtime := event.ModelRuntime{Key: key, Limits: inference.ContextLimits{WindowTokens: 100}}
+	key := model.ModelKey{Provider: "provider", Model: "model"}
+	runtime := event.ModelRuntime{Key: key, Limits: model.ContextLimits{WindowTokens: 100}}
 	valid := HustleUsageAggregate{Name: "  named  ", ModelSource: hustle.ModelSourceNamed, NamedModelKey: key, Runtime: runtime, Status: hustle.TerminalStatusCompleted, Runs: 1, CumulativeUsage: content.Usage{InputTokens: 2, OutputTokens: 1}}
 	tests := []struct {
 		name    string
@@ -244,10 +244,10 @@ func TestHustleUsageAggregateCodecValidation(t *testing.T) {
 			value := valid
 			value.Name = "current"
 			value.ModelSource = hustle.ModelSourceCurrentLoop
-			value.NamedModelKey = inference.ModelKey{}
+			value.NamedModelKey = model.ModelKey{}
 			return value
 		}()}}, wantErr: true},
-		{name: "named source missing key", meta: SessionMeta{Hustles: []HustleUsageAggregate{func() HustleUsageAggregate { value := valid; value.NamedModelKey = inference.ModelKey{}; return value }()}}, wantErr: true},
+		{name: "named source missing key", meta: SessionMeta{Hustles: []HustleUsageAggregate{func() HustleUsageAggregate { value := valid; value.NamedModelKey = model.ModelKey{}; return value }()}}, wantErr: true},
 		{name: "named runtime key mismatch", meta: SessionMeta{Hustles: []HustleUsageAggregate{func() HustleUsageAggregate {
 			value := valid
 			value.Runtime.Key.Model = "other"
@@ -319,8 +319,8 @@ func TestDecodeSessionMetaRejectsMalformedHustleJSON(t *testing.T) {
 func TestCatalogLiveAndRepairShareHustleAggregate(t *testing.T) {
 	t.Parallel()
 	sid := fixedUUID(0x90)
-	descriptor := catalogHustleDescriptor(t, "  current  ", hustle.ModelSourceCurrentLoop, inference.ModelKey{})
-	runtime := event.ModelRuntime{Key: inference.ModelKey{Provider: "provider", Model: "model"}, Limits: inference.ContextLimits{WindowTokens: 100}}
+	descriptor := catalogHustleDescriptor(t, "  current  ", hustle.ModelSourceCurrentLoop, model.ModelKey{})
+	runtime := event.ModelRuntime{Key: model.ModelKey{Provider: "provider", Model: "model"}, Limits: model.ContextLimits{WindowTokens: 100}}
 	usage := content.Usage{InputTokens: 8, OutputTokens: 2}
 	started, terminal := catalogHustlePair(sid, descriptor, 0x91, runtime, &usage, false)
 	events := []event.Event{event.SessionStarted{Header: hdr(sid)}, started, terminal}

@@ -8,7 +8,8 @@ import (
 	"github.com/looprig/core/content"
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/event"
-	"github.com/looprig/inference"
+	contextcount "github.com/looprig/inference/contextcount"
+	model "github.com/looprig/inference/model"
 )
 
 func TestContextObservationPolicyValidation(t *testing.T) {
@@ -19,7 +20,7 @@ func TestContextObservationPolicyValidation(t *testing.T) {
 	tests := []struct {
 		name       string
 		policy     ContextObservationPolicy
-		capability inference.CounterCapability
+		capability contextcount.CounterCapability
 		wantField  ContextObservationPolicyField
 	}{
 		{name: "exact counter", policy: valid, capability: exact},
@@ -124,8 +125,8 @@ func TestContextObservationPolicyFingerprint(t *testing.T) {
 func TestContextLimitErrorCarriesMeasurement(t *testing.T) {
 	t.Parallel()
 	measurement := event.ContextMeasurement{
-		Basis: event.ContextBasis{Revision: 1, ThroughEventID: uuid.UUID{1}}, Model: inference.ModelKey{Provider: "test", Model: "small"},
-		RequestFingerprint: [32]byte{1}, InputTokens: content.TokenCount(90), InputLimit: content.TokenCount(90), Quality: inference.CountQualityExactLocal,
+		Basis: event.ContextBasis{Revision: 1, ThroughEventID: uuid.UUID{1}}, Model: model.ModelKey{Provider: "test", Model: "small"},
+		RequestFingerprint: [32]byte{1}, InputTokens: content.TokenCount(90), InputLimit: content.TokenCount(90), Quality: contextcount.CountQualityExactLocal,
 	}
 	tests := []struct {
 		name        string

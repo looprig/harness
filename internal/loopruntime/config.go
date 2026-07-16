@@ -8,6 +8,8 @@ import (
 	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/inference"
+	contextcount "github.com/looprig/inference/contextcount"
+	model "github.com/looprig/inference/model"
 )
 
 // configFromBound resolves the immutable public contract into actor-private wiring for the
@@ -85,7 +87,7 @@ func requireBound(bound loop.BoundDefinition) error {
 // runtimeConfig is frozen actor wiring resolved from one BoundDefinition.
 type runtimeConfig struct {
 	Client       inference.Client // required — caller constructs via auto.New at composition root
-	Model        inference.Model  // secret-free model descriptor (name, endpoint, sampling) — stamped onto every Request; carries NO system prompt and NO secret
+	Model        model.Model      // secret-free model descriptor (name, endpoint, sampling) — stamped onto every Request; carries NO system prompt and NO secret
 	System       string           // per-agent system prompt — sent on every Request AND hashed into the config fingerprint; the connection secret rides the Client, never here
 	DrainTimeout time.Duration    // optional — bounds the hard-kill wait for a cancelled turn to drain; New defaults it to 5s
 
@@ -117,9 +119,9 @@ type runtimeConfig struct {
 	// loop free of os/exec; the concrete provider is wired at the composition root.
 	RuntimeContext RuntimeContextProvider
 
-	ContextCounter      inference.ContextCounter
-	CounterCapability   inference.CounterCapability
-	InferenceCapability inference.InferenceCapability
+	ContextCounter      contextcount.ContextCounter
+	CounterCapability   contextcount.CounterCapability
+	InferenceCapability contextcount.InferenceCapability
 	ContextObservation  *loop.ContextObservationPolicy
 	Compaction          *loop.CompactionPolicy
 

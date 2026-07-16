@@ -20,6 +20,7 @@ import (
 	"github.com/looprig/harness/pkg/sessionstore"
 	"github.com/looprig/harness/pkg/tool"
 	"github.com/looprig/inference"
+	model "github.com/looprig/inference/model"
 	"github.com/looprig/storage/memstore"
 )
 
@@ -183,7 +184,7 @@ func runtimeFromFingerprint(fp event.ConfigFingerprint) event.ModelRuntime {
 	if modelID == "" {
 		modelID = "test-model"
 	}
-	return event.ModelRuntime{Key: inference.ModelKey{Provider: "lmstudio", Model: modelID}}
+	return event.ModelRuntime{Key: model.ModelKey{Provider: "lmstudio", Model: modelID}}
 }
 
 // newOriginalHubNamed wires a journal-backed hub for an original run (the durable-tap

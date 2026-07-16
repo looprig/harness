@@ -16,7 +16,7 @@ import (
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/hustle"
 	"github.com/looprig/harness/pkg/loop"
-	"github.com/looprig/inference"
+	model "github.com/looprig/inference/model"
 )
 
 const validCompactionXML = `<conversation_summary><goal>ship &amp; verify</goal><constraints></constraints><decisions></decisions><state>ready</state><open_items></open_items></conversation_summary>`
@@ -378,7 +378,7 @@ func validCompactionInput(t *testing.T) loop.CompactionInput {
 	}
 	return loop.CompactionInput{
 		Basis:              event.ContextBasis{Revision: 3, ThroughEventID: eventID},
-		Model:              inference.ModelKey{Provider: "provider", Model: "model"},
+		Model:              model.ModelKey{Provider: "provider", Model: "model"},
 		RequestFingerprint: fingerprint,
 		Transcript: content.AgenticMessages{&content.UserMessage{Message: content.Message{
 			Role: content.RoleUser, Blocks: []content.Block{&content.TextBlock{Text: "hello"}},

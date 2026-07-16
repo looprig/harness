@@ -4,7 +4,7 @@ import (
 	"reflect"
 
 	"github.com/looprig/harness/pkg/tool"
-	"github.com/looprig/inference"
+	model "github.com/looprig/inference/model"
 )
 
 const (
@@ -27,8 +27,8 @@ type ToolLimits struct {
 // Define defensively copies Tools and the model's sampling values.
 type Mode struct {
 	Name         ModeName
-	Model        inference.Model
-	Effort       inference.Effort
+	Model        model.Model
+	Effort       model.Effort
 	Tools        []tool.Definition
 	ToolLimits   ToolLimits
 	Instructions string
@@ -38,16 +38,16 @@ type Mode struct {
 // Values returned by BoundDefinition are defensive copies.
 type BoundMode struct {
 	Name         ModeName
-	Model        inference.Model
-	Effort       inference.Effort
+	Model        model.Model
+	Effort       model.Effort
 	Tools        []tool.InvokableTool
 	ToolLimits   ToolLimits
 	Instructions string
 }
 
-func cloneModel(model inference.Model) inference.Model {
-	model.Sampling = model.Sampling.Clone()
-	return model
+func cloneModel(value model.Model) model.Model {
+	value.Sampling = value.Sampling.Clone()
+	return value
 }
 
 func cloneMode(mode Mode) Mode {
@@ -62,8 +62,8 @@ func cloneBoundMode(mode BoundMode) BoundMode {
 	return mode
 }
 
-func zeroModel(model inference.Model) bool {
-	return reflect.DeepEqual(model, inference.Model{})
+func zeroModel(value model.Model) bool {
+	return reflect.DeepEqual(value, model.Model{})
 }
 
 func resolveLimits(base, override ToolLimits) ToolLimits {

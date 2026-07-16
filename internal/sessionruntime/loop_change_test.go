@@ -16,6 +16,8 @@ import (
 	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/inference"
+	model "github.com/looprig/inference/model"
+	stream "github.com/looprig/inference/stream"
 )
 
 // modeCfg builds a mode-bearing definition so the loop controller has real modes to switch
@@ -26,8 +28,8 @@ func modeCfg(client inference.Client) loop.Definition {
 		loop.WithInference(client, validModel("base")),
 		loop.WithSystem("base"),
 		loop.WithModes(
-			loop.Mode{Name: "plan", Effort: inference.EffortLow, Instructions: "plan-i"},
-			loop.Mode{Name: "build", Effort: inference.EffortHigh, Instructions: "build-i"},
+			loop.Mode{Name: "plan", Effort: model.EffortLow, Instructions: "plan-i"},
+			loop.Mode{Name: "build", Effort: testEffortHigh, Instructions: "build-i"},
 			loop.Mode{Name: "swap", Model: validModel("swapped")},
 		),
 		loop.WithInitialMode("plan"),
@@ -81,7 +83,7 @@ func TestLoopControllerSetModeLiveAndEvent(t *testing.T) {
 		for _, e := range evs {
 			if mc, ok := e.(event.LoopModeChanged); ok && mc.PreviousMode == "plan" && mc.Mode == "swap" {
 				return !mc.EventHeader().EventID.IsZero() && mc.LoopID == s.ActiveLoopID() &&
-					mc.Runtime.Key == validModel("swapped").Key() && mc.Runtime.Effort == inference.EffortNone
+					mc.Runtime.Key == validModel("swapped").Key() && mc.Runtime.Effort == model.EffortNone
 			}
 		}
 		return false
@@ -99,10 +101,10 @@ func TestLoopControllerChangeLiveAndEvent(t *testing.T) {
 	t.Cleanup(func() { _ = sub.Close() })
 
 	ctrl, _ := s.LoopController(s.ActiveLoopID())
-	if err := ctrl.Change(context.Background(), loop.ChangeModel(validModel("routed")), loop.ChangeEffort(inference.EffortMax)); err != nil {
+	if err := ctrl.Change(context.Background(), loop.ChangeModel(validModel("routed")), loop.ChangeEffort(model.EffortMax)); err != nil {
 		t.Fatalf("Change: %v", err)
 	}
-	if ctrl.Model().Name != "routed" || ctrl.Model().Sampling.Effort != inference.EffortMax {
+	if ctrl.Model().Name != "routed" || ctrl.Model().Sampling.Effort != model.EffortMax {
 		t.Fatalf("post-change model/effort = %q/%q, want routed/max", ctrl.Model().Name, ctrl.Model().Sampling.Effort)
 	}
 	// Mode is unchanged by a direct inference change.
@@ -112,8 +114,8 @@ func TestLoopControllerChangeLiveAndEvent(t *testing.T) {
 	rec.waitFor(t, func(evs []event.Event) bool {
 		for _, e := range evs {
 			if ic, ok := e.(event.LoopInferenceChanged); ok {
-				return ic.Runtime.Key == (inference.ModelKey{Provider: validModel("routed").Provider, Model: "routed"}) &&
-					ic.Runtime.Effort == inference.EffortMax && !ic.EventHeader().EventID.IsZero()
+				return ic.Runtime.Key == (model.ModelKey{Provider: validModel("routed").Provider, Model: "routed"}) &&
+					ic.Runtime.Effort == model.EffortMax && !ic.EventHeader().EventID.IsZero()
 			}
 		}
 		return false
@@ -137,10 +139,10 @@ func TestLoopControllerRefusals(t *testing.T) {
 		{name: "invalid mode", call: func() error { return ctrl.SetMode(context.Background(), "nope") }, kind: loop.ChangeInvalidMode},
 		{name: "no changes", call: func() error { return ctrl.Change(context.Background()) }, kind: loop.ChangeNoChanges},
 		{name: "invalid model", call: func() error {
-			return ctrl.Change(context.Background(), loop.ChangeModel(inference.Model{Name: ""}))
+			return ctrl.Change(context.Background(), loop.ChangeModel(model.Model{Name: ""}))
 		}, kind: loop.ChangeInvalidModel},
 		{name: "invalid effort", call: func() error {
-			return ctrl.Change(context.Background(), loop.ChangeEffort(inference.Effort("turbo")))
+			return ctrl.Change(context.Background(), loop.ChangeEffort(model.Effort("turbo")))
 		}, kind: loop.ChangeInvalidEffort},
 	}
 	for _, tt := range tests {
@@ -190,7 +192,7 @@ func (r *recordingClient) Invoke(context.Context, inference.Request) (*inference
 	return nil, errors.New("recordingClient.Invoke not used")
 }
 
-func (r *recordingClient) Stream(_ context.Context, req inference.Request) (*inference.StreamReader[content.Chunk], error) {
+func (r *recordingClient) Stream(_ context.Context, req inference.Request) (*stream.StreamReader[content.Chunk], error) {
 	r.mu.Lock()
 	r.reqs = append(r.reqs, req)
 	r.mu.Unlock()
@@ -202,7 +204,7 @@ func (r *recordingClient) Stream(_ context.Context, req inference.Request) (*inf
 		}
 		return nil, io.EOF
 	}
-	return inference.NewStreamReader(next, nil), nil
+	return stream.NewStreamReader(next, nil), nil
 }
 
 func (r *recordingClient) first() (inference.Request, bool) {
@@ -221,7 +223,7 @@ type nopLoopPublisher struct{}
 func (nopLoopPublisher) PublishEvent(context.Context, event.Event) error        { return nil }
 func (nopLoopPublisher) PublishEventChecked(context.Context, event.Event) error { return nil }
 
-func inferModelWithEffort(name string, eff inference.Effort) inference.Model {
+func inferModelWithEffort(name string, eff model.Effort) model.Model {
 	m := validModel(name)
 	m.Sampling.Effort = eff
 	return m
@@ -245,7 +247,7 @@ func TestRestoreSeedingAgreesWithLiveView(t *testing.T) {
 		{name: "swap mode distinct model", ri: restoredInference{HasMode: true, Mode: "swap"}},
 		{
 			name: "inference override on a mode",
-			ri:   restoredInference{HasMode: true, Mode: "plan", HasRuntime: true, Runtime: runtimeForModel(inferModelWithEffort("routed", inference.EffortHigh))},
+			ri:   restoredInference{HasMode: true, Mode: "plan", HasRuntime: true, Runtime: runtimeForModel(inferModelWithEffort("routed", testEffortHigh))},
 		},
 	}
 	for _, tt := range tests {
@@ -304,9 +306,9 @@ func TestRestoreSeedingAgreesWithLiveView(t *testing.T) {
 func TestFoldLoopInferenceLastWriteWins(t *testing.T) {
 	t.Parallel()
 	modeChanged := func(prev, next string) event.Event {
-		return event.LoopModeChanged{Header: event.Header{Coordinates: identity.Coordinates{LoopID: [16]byte{1}}}, PreviousMode: prev, Mode: next, Runtime: runtimeForModel(inferModelWithEffort(next+"-model", inference.EffortLow))}
+		return event.LoopModeChanged{Header: event.Header{Coordinates: identity.Coordinates{LoopID: [16]byte{1}}}, PreviousMode: prev, Mode: next, Runtime: runtimeForModel(inferModelWithEffort(next+"-model", model.EffortLow))}
 	}
-	infChanged := func(name string, eff inference.Effort) event.Event {
+	infChanged := func(name string, eff model.Effort) event.Event {
 		return event.LoopInferenceChanged{Header: event.Header{Coordinates: identity.Coordinates{LoopID: [16]byte{1}}}, Runtime: runtimeForModel(inferModelWithEffort(name, eff))}
 	}
 
@@ -316,7 +318,7 @@ func TestFoldLoopInferenceLastWriteWins(t *testing.T) {
 		wantMode   loop.ModeName
 		hasMode    bool
 		wantModel  string
-		wantEffort inference.Effort
+		wantEffort model.Effort
 		hasRuntime bool
 	}{
 		{name: "no changes", events: nil, hasMode: false, hasRuntime: false},
@@ -327,26 +329,26 @@ func TestFoldLoopInferenceLastWriteWins(t *testing.T) {
 		},
 		{
 			name:       "inference after mode overrides",
-			events:     []event.Event{modeChanged("", "build"), infChanged("routed", inference.EffortHigh)},
+			events:     []event.Event{modeChanged("", "build"), infChanged("routed", testEffortHigh)},
 			wantMode:   "build",
 			hasMode:    true,
 			wantModel:  "routed",
-			wantEffort: inference.EffortHigh,
+			wantEffort: testEffortHigh,
 			hasRuntime: true,
 		},
 		{
 			name:       "mode after inference resets inference",
-			events:     []event.Event{infChanged("routed", inference.EffortHigh), modeChanged("", "plan")},
+			events:     []event.Event{infChanged("routed", testEffortHigh), modeChanged("", "plan")},
 			wantMode:   "plan",
 			hasMode:    true,
 			hasRuntime: true,
 		},
 		{
 			name:       "inference only, no mode change",
-			events:     []event.Event{infChanged("routed", inference.EffortMax)},
+			events:     []event.Event{infChanged("routed", model.EffortMax)},
 			hasMode:    false,
 			wantModel:  "routed",
-			wantEffort: inference.EffortMax,
+			wantEffort: model.EffortMax,
 			hasRuntime: true,
 		},
 	}
@@ -383,7 +385,7 @@ func TestFoldLoopInferenceSeedsInitialMode(t *testing.T) {
 	modeChanged := func(prev, next string) event.Event {
 		return event.LoopModeChanged{Header: event.Header{Coordinates: identity.Coordinates{LoopID: [16]byte{1}}}, PreviousMode: prev, Mode: next, Runtime: runtimeForModel(validModel("mode-model"))}
 	}
-	infChanged := func(name string, eff inference.Effort) event.Event {
+	infChanged := func(name string, eff model.Effort) event.Event {
 		return event.LoopInferenceChanged{Header: event.Header{Coordinates: identity.Coordinates{LoopID: [16]byte{1}}}, Runtime: runtimeForModel(inferModelWithEffort(name, eff))}
 	}
 	tests := []struct {
@@ -396,7 +398,7 @@ func TestFoldLoopInferenceSeedsInitialMode(t *testing.T) {
 		{name: "selected initial mode seeds baseline", events: []event.Event{started("review")}, wantMode: "review", hasMode: true, hasRuntime: true},
 		{name: "empty initial mode is definition default", events: []event.Event{started("")}, hasMode: false, hasRuntime: true},
 		{name: "later mode change overrides start mode", events: []event.Event{started("review"), modeChanged("review", "build")}, wantMode: "build", hasMode: true, hasRuntime: true},
-		{name: "inference override keeps start mode", events: []event.Event{started("review"), infChanged("routed", inference.EffortHigh)}, wantMode: "review", hasMode: true, hasRuntime: true},
+		{name: "inference override keeps start mode", events: []event.Event{started("review"), infChanged("routed", testEffortHigh)}, wantMode: "review", hasMode: true, hasRuntime: true},
 	}
 	for _, tt := range tests {
 		tt := tt
@@ -419,7 +421,7 @@ func TestFoldLoopInferenceUsesLegacyFallbacks(t *testing.T) {
 	loopID := uuid.UUID{2}
 	eventID := uuid.UUID{3}
 	prefix := `,"v":1,"session_id":"` + sessionID.String() + `","loop_id":"` + loopID.String() + `","event_id":"` + eventID.String() + `"`
-	currentRuntime := runtimeForModel(inferModelWithEffort("current", inference.EffortMedium))
+	currentRuntime := runtimeForModel(inferModelWithEffort("current", model.EffortMedium))
 	tests := []struct {
 		name       string
 		wire       string

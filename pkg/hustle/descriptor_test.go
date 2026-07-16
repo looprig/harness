@@ -4,7 +4,7 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/looprig/inference"
+	model "github.com/looprig/inference/model"
 )
 
 func descriptorFromOptions(t *testing.T, options []Option) DefinitionDescriptor {
@@ -23,11 +23,11 @@ func TestDefinitionDescriptorValidate(t *testing.T) {
 	zeroPromptHash := current
 	zeroPromptHash.PromptSHA256 = [32]byte{}
 	currentNamedKey := current
-	currentNamedKey.NamedModelKey = inference.ModelKey{Provider: "test", Model: "named"}
+	currentNamedKey.NamedModelKey = model.ModelKey{Provider: "test", Model: "named"}
 	currentNamedRevision := current
 	currentNamedRevision.NamedModelPolicyRevision = "named-policy"
 	namedMissingKey := named
-	namedMissingKey.NamedModelKey = inference.ModelKey{}
+	namedMissingKey.NamedModelKey = model.ModelKey{}
 	namedMissingRevision := named
 	namedMissingRevision.NamedModelPolicyRevision = ""
 	minimum := current

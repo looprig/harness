@@ -10,7 +10,7 @@ import (
 	"github.com/looprig/core/content"
 	"github.com/looprig/harness/pkg/command"
 	"github.com/looprig/harness/pkg/event"
-	"github.com/looprig/inference"
+	stream "github.com/looprig/inference/stream"
 )
 
 func ownershipMessages() content.AgenticMessages {
@@ -169,7 +169,7 @@ func TestRunTurnOwnsTurnDoneStepDoneAndHistoryGraphs(t *testing.T) {
 			usage := content.Usage{InputTokens: 11, OutputTokens: 7, ReasoningTokens: 3}
 			client := &scriptedLLM{
 				scripts: [][]content.Chunk{{textChunk("original")}},
-				results: []*inference.StreamResult{{Usage: &usage}},
+				results: []*stream.StreamResult{{Usage: &usage}},
 			}
 			cfg, state, recorder := newTurnFixture(
 				[]content.Block{&content.TextBlock{Text: "go"}}, nil, ToolSet{}, client, noGateReg(),

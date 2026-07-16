@@ -18,18 +18,20 @@ import (
 	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/inference"
+	contextcount "github.com/looprig/inference/contextcount"
+	stream "github.com/looprig/inference/stream"
 )
 
 type liveCompactionCounter struct {
 	mu         sync.Mutex
-	capability inference.CounterCapability
+	capability contextcount.CounterCapability
 	counts     []content.TokenCount
 	calls      int
 }
 
 type preStartCancellationCounter struct {
 	mu         sync.Mutex
-	capability inference.CounterCapability
+	capability contextcount.CounterCapability
 	gate       *preStartCountGate
 }
 
@@ -46,7 +48,7 @@ func (c *preStartCancellationCounter) arm() *preStartCountGate {
 	return gate
 }
 
-func (c *preStartCancellationCounter) CountContext(ctx context.Context, request inference.Request) (inference.ContextCount, error) {
+func (c *preStartCancellationCounter) CountContext(ctx context.Context, request inference.Request) (contextcount.ContextCount, error) {
 	c.mu.Lock()
 	gate := c.gate
 	c.gate = nil
@@ -55,30 +57,32 @@ func (c *preStartCancellationCounter) CountContext(ctx context.Context, request 
 		close(gate.started)
 		<-ctx.Done()
 		close(gate.exited)
-		return inference.ContextCount{}, ctx.Err()
+		return contextcount.ContextCount{}, ctx.Err()
 	}
-	return inference.ContextCount{Model: request.Model.Key(), InputTokens: 40, Quality: c.capability.Quality}, nil
+	return contextcount.ContextCount{Model: request.Model.Key(), InputTokens: 40, Quality: c.capability.Quality}, nil
 }
 
-func (c *preStartCancellationCounter) CounterCapability() inference.CounterCapability {
+func (c *preStartCancellationCounter) CounterCapability() contextcount.CounterCapability {
 	return c.capability
 }
 
-func (c *liveCompactionCounter) CountContext(_ context.Context, request inference.Request) (inference.ContextCount, error) {
+func (c *liveCompactionCounter) CountContext(_ context.Context, request inference.Request) (contextcount.ContextCount, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	index := c.calls
 	c.calls++
 	if len(c.counts) == 0 {
-		return inference.ContextCount{}, errors.New("test counter has no values")
+		return contextcount.ContextCount{}, errors.New("test counter has no values")
 	}
 	if index >= len(c.counts) {
 		index = len(c.counts) - 1
 	}
-	return inference.ContextCount{Model: request.Model.Key(), InputTokens: c.counts[index], Quality: c.capability.Quality}, nil
+	return contextcount.ContextCount{Model: request.Model.Key(), InputTokens: c.counts[index], Quality: c.capability.Quality}, nil
 }
 
-func (c *liveCompactionCounter) CounterCapability() inference.CounterCapability { return c.capability }
+func (c *liveCompactionCounter) CounterCapability() contextcount.CounterCapability {
+	return c.capability
+}
 
 type liveCompactionClient struct {
 	mu            sync.Mutex
@@ -133,13 +137,13 @@ func (c *liveCompactionClient) Invoke(_ context.Context, request inference.Reque
 	}, nil
 }
 
-func (c *liveCompactionClient) Stream(_ context.Context, _ inference.Request) (*inference.StreamReader[content.Chunk], error) {
+func (c *liveCompactionClient) Stream(_ context.Context, _ inference.Request) (*stream.StreamReader[content.Chunk], error) {
 	if c.streamStarted != nil {
 		close(c.streamStarted)
 		<-c.streamRelease
 	}
 	emitted := false
-	return inference.NewStreamReader(func() (content.Chunk, error) {
+	return stream.NewStreamReader(func() (content.Chunk, error) {
 		if emitted {
 			return nil, io.EOF
 		}
@@ -174,13 +178,13 @@ func TestNativeSessionCompactionReachesRegisteredFocusedHustle(t *testing.T) {
 				client.streamStarted = make(chan struct{})
 				client.streamRelease = make(chan struct{})
 			}
-			capability := inference.CounterCapability{
-				Transport: inference.CounterTransportLocal, Retention: inference.RetentionNone,
-				TokenizerRev: "live-exact-v1", Quality: inference.CountQualityExactLocal,
+			capability := contextcount.CounterCapability{
+				Transport: contextcount.CounterTransportLocal, Retention: contextcount.RetentionNone,
+				TokenizerRev: "live-exact-v1", Quality: contextcount.CountQualityExactLocal,
 			}
 			counter := &liveCompactionCounter{capability: capability, counts: tt.counts}
 			model := validModel("live-compaction")
-			model.Limits = inference.ContextLimits{WindowTokens: 100, MaxInputTokens: 80, MaxOutputTokens: 20}
+			model.Limits = testContextLimits{WindowTokens: 100, MaxInputTokens: 80, MaxOutputTokens: 20}
 			policy := loop.CompactionPolicy{
 				Automatic: tt.automatic, CounterPolicy: loop.CounterPolicyRequireExact,
 				CompactAt: 8_000, RearmBelow: 6_000, ReservedOutput: 20,
@@ -189,8 +193,8 @@ func TestNativeSessionCompactionReachesRegisteredFocusedHustle(t *testing.T) {
 			definition := mustDefine(
 				loop.WithName("agent"), loop.WithInference(client, model), loop.WithDrainTimeout(200*time.Millisecond),
 				loop.WithContextCounter(counter),
-				loop.WithInferenceCapability(inference.InferenceCapability{
-					Transport: inference.InferenceTransportLocal, Retention: inference.RetentionNone,
+				loop.WithInferenceCapability(contextcount.InferenceCapability{
+					Transport: contextcount.InferenceTransportLocal, Retention: contextcount.RetentionNone,
 				}),
 				loop.WithCompaction(policy),
 			)
@@ -301,14 +305,14 @@ func TestNativeSessionIdlePreStartCancellationPublishesWaiterOnly(t *testing.T) 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			client := &liveCompactionClient{invoked: make(chan struct{}, 1)}
-			capability := inference.CounterCapability{Transport: inference.CounterTransportLocal, Retention: inference.RetentionNone, TokenizerRev: "cancel-v1", Quality: inference.CountQualityExactLocal}
+			capability := contextcount.CounterCapability{Transport: contextcount.CounterTransportLocal, Retention: contextcount.RetentionNone, TokenizerRev: "cancel-v1", Quality: contextcount.CountQualityExactLocal}
 			counter := &preStartCancellationCounter{capability: capability}
 			model := validModel("pre-start-cancel")
-			model.Limits = inference.ContextLimits{WindowTokens: 100, MaxInputTokens: 80, MaxOutputTokens: 20}
+			model.Limits = testContextLimits{WindowTokens: 100, MaxInputTokens: 80, MaxOutputTokens: 20}
 			definition := mustDefine(
 				loop.WithName("agent"), loop.WithInference(client, model), loop.WithDrainTimeout(200*time.Millisecond),
 				loop.WithContextCounter(counter),
-				loop.WithInferenceCapability(inference.InferenceCapability{Transport: inference.InferenceTransportLocal, Retention: inference.RetentionNone}),
+				loop.WithInferenceCapability(contextcount.InferenceCapability{Transport: contextcount.InferenceTransportLocal, Retention: contextcount.RetentionNone}),
 				loop.WithCompaction(loop.CompactionPolicy{CounterPolicy: loop.CounterPolicyRequireExact, ReservedOutput: 20, MaxSummaryTokens: 10, CountTimeout: 2 * time.Second, Hustle: "context.compact"}),
 			)
 			lifecycle, err := newTestLifecycle(definition, newRestoreStore(t), WithLifecycleHustles([]hustle.Definition{testHustleDefinition(t, "context.compact")}, testHustleLimits()))

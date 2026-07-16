@@ -7,24 +7,25 @@ import (
 	"github.com/looprig/core/content"
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/event"
-	"github.com/looprig/inference"
+	contextcount "github.com/looprig/inference/contextcount"
+	model "github.com/looprig/inference/model"
 )
 
 func foldContextMeasurement(seed byte) event.ContextMeasurement {
 	return event.ContextMeasurement{
 		Basis: event.ContextBasis{Revision: event.ContextRevision(seed), ThroughEventID: uuid.UUID{seed}},
-		Model: inference.ModelKey{Provider: "provider", Model: "model"}, RequestFingerprint: [32]byte{seed},
-		InputTokens: content.TokenCount(seed), InputLimit: 100, Quality: inference.CountQualityExactLocal,
+		Model: model.ModelKey{Provider: "provider", Model: "model"}, RequestFingerprint: [32]byte{seed},
+		InputTokens: content.TokenCount(seed), InputLimit: 100, Quality: contextcount.CountQualityExactLocal,
 	}
 }
 
 func TestFoldLoopTracksAndInvalidatesContextMeasurement(t *testing.T) {
 	t.Parallel()
-	runtime := event.ModelRuntime{Key: inference.ModelKey{Provider: "provider", Model: "model"}, Limits: inference.ContextLimits{WindowTokens: 100}}
+	runtime := event.ModelRuntime{Key: model.ModelKey{Provider: "provider", Model: "model"}, Limits: testContextLimits{WindowTokens: 100}}
 	first := foldContextMeasurement(1)
 	second := foldContextMeasurement(2)
 	mismatched := second
-	mismatched.Model = inference.ModelKey{Provider: "other", Model: "model"}
+	mismatched.Model = model.ModelKey{Provider: "other", Model: "model"}
 	tests := []struct {
 		name    string
 		events  []event.Event
@@ -61,7 +62,7 @@ func TestFoldLoopTracksAndInvalidatesContextMeasurement(t *testing.T) {
 func TestFoldLoopCarriesContextBasisWithoutMeasurement(t *testing.T) {
 	t.Parallel()
 	measurement := foldContextMeasurement(10)
-	runtime := event.ModelRuntime{Key: measurement.Model, Limits: inference.ContextLimits{WindowTokens: 100}}
+	runtime := event.ModelRuntime{Key: measurement.Model, Limits: testContextLimits{WindowTokens: 100}}
 	mutationID := uuid.UUID{11}
 	tests := []struct {
 		name     string
@@ -124,7 +125,7 @@ func TestFoldLoopRestoresOnlyAutomaticAttemptLatch(t *testing.T) {
 func TestFoldLoopForRestoreRejectsContextModelMismatch(t *testing.T) {
 	t.Parallel()
 	bound := bindCfg(modeCfg(&stubLLM{}), uuid.UUID{1}, uuid.UUID{2})
-	measurementFor := func(model inference.Model) event.ContextMeasurement {
+	measurementFor := func(model model.Model) event.ContextMeasurement {
 		measurement := foldContextMeasurement(1)
 		measurement.Model = model.Key()
 		return measurement
@@ -195,7 +196,7 @@ func TestFoldLoopForRestoreRejectsContextModelMismatch(t *testing.T) {
 func TestRestoredContextConfigMismatchDisposition(t *testing.T) {
 	t.Parallel()
 	bound := bindCfg(modeCfg(&stubLLM{}), uuid.UUID{3}, uuid.UUID{4})
-	measurementFor := func(model inference.Model) event.ContextMeasurement {
+	measurementFor := func(model model.Model) event.ContextMeasurement {
 		measurement := foldContextMeasurement(3)
 		measurement.Model = model.Key()
 		return measurement

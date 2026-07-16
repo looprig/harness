@@ -8,15 +8,16 @@ import (
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/identity"
-	"github.com/looprig/inference"
+	contextcount "github.com/looprig/inference/contextcount"
+	model "github.com/looprig/inference/model"
 )
 
 func validContextMeasurement() event.ContextMeasurement {
 	return event.ContextMeasurement{
 		Basis:              event.ContextBasis{Revision: 1, ThroughEventID: uuid.UUID{9}},
-		Model:              inference.ModelKey{Provider: "provider", Model: "model"},
+		Model:              model.ModelKey{Provider: "provider", Model: "model"},
 		RequestFingerprint: [32]byte{1}, InputTokens: 80, InputLimit: 100,
-		Quality: inference.CountQualityExactProvider,
+		Quality: contextcount.CountQualityExactProvider,
 	}
 }
 
@@ -36,17 +37,17 @@ func TestContextMeasurementValidate(t *testing.T) {
 			value.Basis.ThroughEventID = uuid.UUID{}
 			return value
 		}(), wantErr: true},
-		{name: "zero model", measurement: func() event.ContextMeasurement { value := valid; value.Model = inference.ModelKey{}; return value }(), wantErr: true},
+		{name: "zero model", measurement: func() event.ContextMeasurement { value := valid; value.Model = model.ModelKey{}; return value }(), wantErr: true},
 		{name: "zero fingerprint", measurement: func() event.ContextMeasurement { value := valid; value.RequestFingerprint = [32]byte{}; return value }(), wantErr: true},
 		{name: "zero limit", measurement: func() event.ContextMeasurement { value := valid; value.InputLimit = 0; return value }(), wantErr: true},
 		{name: "unknown quality", measurement: func() event.ContextMeasurement {
 			value := valid
-			value.Quality = inference.CountQualityUnknown
+			value.Quality = contextcount.CountQualityUnknown
 			return value
 		}(), wantErr: true},
 		{name: "out of range quality", measurement: func() event.ContextMeasurement {
 			value := valid
-			value.Quality = inference.CountQuality(255)
+			value.Quality = contextcount.CountQuality(255)
 			return value
 		}(), wantErr: true},
 	}

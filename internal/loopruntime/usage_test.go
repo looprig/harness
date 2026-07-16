@@ -9,7 +9,7 @@ import (
 	"github.com/looprig/core/content"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/tool"
-	"github.com/looprig/inference"
+	stream "github.com/looprig/inference/stream"
 )
 
 func TestRunTurnAccountsAuthoritativeUsage(t *testing.T) {
@@ -18,7 +18,7 @@ func TestRunTurnAccountsAuthoritativeUsage(t *testing.T) {
 	tests := []struct {
 		name             string
 		scripts          [][]content.Chunk
-		results          []*inference.StreamResult
+		results          []*stream.StreamResult
 		tools            ToolSet
 		wantUsage        content.Usage
 		wantStepDones    int
@@ -29,7 +29,7 @@ func TestRunTurnAccountsAuthoritativeUsage(t *testing.T) {
 		{
 			name:             "one request attaches a defensive terminal result",
 			scripts:          [][]content.Chunk{{textChunk("done")}},
-			results:          []*inference.StreamResult{{Usage: &content.Usage{InputTokens: 11, OutputTokens: 7, ReasoningTokens: 3}}},
+			results:          []*stream.StreamResult{{Usage: &content.Usage{InputTokens: 11, OutputTokens: 7, ReasoningTokens: 3}}},
 			wantUsage:        content.Usage{InputTokens: 11, OutputTokens: 7, ReasoningTokens: 3},
 			wantStepDones:    1,
 			wantReported:     []bool{true},
@@ -41,7 +41,7 @@ func TestRunTurnAccountsAuthoritativeUsage(t *testing.T) {
 				{toolUseChunk(0, "call-1", "Echo", `{}`)},
 				{textChunk("done")},
 			},
-			results: []*inference.StreamResult{
+			results: []*stream.StreamResult{
 				{Usage: &content.Usage{InputTokens: 10, OutputTokens: 2}},
 				{Usage: &content.Usage{InputTokens: 20, OutputTokens: 4, CacheReadTokens: 5}},
 			},
@@ -54,7 +54,7 @@ func TestRunTurnAccountsAuthoritativeUsage(t *testing.T) {
 		{
 			name:             "missing terminal metadata remains unknown",
 			scripts:          [][]content.Chunk{{textChunk("done")}},
-			results:          []*inference.StreamResult{nil},
+			results:          []*stream.StreamResult{nil},
 			wantStepDones:    1,
 			wantReported:     []bool{false},
 			wantMessageUsage: content.Usage{},
@@ -65,7 +65,7 @@ func TestRunTurnAccountsAuthoritativeUsage(t *testing.T) {
 				{toolUseChunk(0, "call-1", "Echo", `{}`)},
 				{textChunk("done")},
 			},
-			results: []*inference.StreamResult{
+			results: []*stream.StreamResult{
 				{Usage: &content.Usage{InputTokens: maximum}},
 				{Usage: &content.Usage{InputTokens: 1}},
 			},

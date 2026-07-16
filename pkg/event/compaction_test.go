@@ -10,14 +10,15 @@ import (
 	"github.com/looprig/core/content"
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/identity"
-	"github.com/looprig/inference"
+	contextcount "github.com/looprig/inference/contextcount"
+	model "github.com/looprig/inference/model"
 )
 
 func validCompactionMeasurement(seed byte) ContextMeasurement {
 	return ContextMeasurement{
 		Basis: ContextBasis{Revision: ContextRevision(seed), ThroughEventID: uuid.UUID{seed}},
-		Model: inference.ModelKey{Provider: "provider", Model: "model"}, RequestFingerprint: [32]byte{seed},
-		InputTokens: content.TokenCount(seed), InputLimit: 100, Quality: inference.CountQualityExactLocal,
+		Model: model.ModelKey{Provider: "provider", Model: "model"}, RequestFingerprint: [32]byte{seed},
+		InputTokens: content.TokenCount(seed), InputLimit: 100, Quality: contextcount.CountQualityExactLocal,
 	}
 }
 

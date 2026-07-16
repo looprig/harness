@@ -9,30 +9,32 @@ import (
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/inference"
+	contextcount "github.com/looprig/inference/contextcount"
+	model "github.com/looprig/inference/model"
 )
 
 type policyCounter struct {
-	capability inference.CounterCapability
+	capability contextcount.CounterCapability
 	countCalls int
 }
 
-func (c *policyCounter) CountContext(context.Context, inference.Request) (inference.ContextCount, error) {
+func (c *policyCounter) CountContext(context.Context, inference.Request) (contextcount.ContextCount, error) {
 	c.countCalls++
 	panic("definition validation performed I/O")
 }
 
-func (c *policyCounter) CounterCapability() inference.CounterCapability { return c.capability }
+func (c *policyCounter) CounterCapability() contextcount.CounterCapability { return c.capability }
 
-func exactCounterCapability() inference.CounterCapability {
-	return inference.CounterCapability{Transport: inference.CounterTransportLocal, Retention: inference.RetentionNone, TokenizerRev: "exact-v1", Quality: inference.CountQualityExactLocal}
+func exactCounterCapability() contextcount.CounterCapability {
+	return contextcount.CounterCapability{Transport: contextcount.CounterTransportLocal, Retention: contextcount.RetentionNone, TokenizerRev: "exact-v1", Quality: contextcount.CountQualityExactLocal}
 }
 
-func heuristicCounterCapability() inference.CounterCapability {
-	return inference.CounterCapability{Transport: inference.CounterTransportLocal, Retention: inference.RetentionNone, TokenizerRev: "estimate-v1", Quality: inference.CountQualityHeuristicEstimate}
+func heuristicCounterCapability() contextcount.CounterCapability {
+	return contextcount.CounterCapability{Transport: contextcount.CounterTransportLocal, Retention: contextcount.RetentionNone, TokenizerRev: "estimate-v1", Quality: contextcount.CountQualityHeuristicEstimate}
 }
 
-func localInferenceCapability() inference.InferenceCapability {
-	return inference.InferenceCapability{Transport: inference.InferenceTransportLocal, Retention: inference.RetentionNone}
+func localInferenceCapability() contextcount.InferenceCapability {
+	return contextcount.InferenceCapability{Transport: contextcount.InferenceTransportLocal, Retention: contextcount.RetentionNone}
 }
 
 func manualCompactionPolicy() CompactionPolicy {
@@ -43,7 +45,7 @@ func automaticCompactionPolicy() CompactionPolicy {
 	return CompactionPolicy{Automatic: true, CounterPolicy: CounterPolicyAllowConservative, CompactAt: 8_000, RearmBelow: 6_000, ReservedOutput: 10, SafetyMargin: 2, MaxSummaryTokens: 5, CountTimeout: 17 * time.Millisecond, Hustle: "context.compact"}
 }
 
-func contextDefinitionOptions(counter inference.ContextCounter, capability inference.InferenceCapability, policy CompactionPolicy) []Option {
+func contextDefinitionOptions(counter contextcount.ContextCounter, capability contextcount.InferenceCapability, policy CompactionPolicy) []Option {
 	return []Option{WithName("agent"), WithInference(&fakeLLM{}, testModel()), WithContextCounter(counter), WithInferenceCapability(capability), WithCompaction(policy)}
 }
 
@@ -54,7 +56,7 @@ func TestCompactionPolicyValidation(t *testing.T) {
 	tests := []struct {
 		name       string
 		policy     CompactionPolicy
-		capability inference.CounterCapability
+		capability contextcount.CounterCapability
 		wantErr    bool
 	}{
 		{name: "manual exact", policy: manualCompactionPolicy(), capability: exact},
@@ -70,9 +72,9 @@ func TestCompactionPolicyValidation(t *testing.T) {
 			value := automaticCompactionPolicy()
 			value.CounterPolicy = CounterPolicyRequireExact
 			return value
-		}(), capability: func() inference.CounterCapability {
+		}(), capability: func() contextcount.CounterCapability {
 			value := exact
-			value.Quality = inference.CountQualityExactProvider
+			value.Quality = contextcount.CountQualityExactProvider
 			return value
 		}()},
 		{name: "automatic unknown counter policy", policy: func() CompactionPolicy {
@@ -119,8 +121,8 @@ func TestDefinitionContextOptionsAndCapabilityValidation(t *testing.T) {
 	validCounter := &policyCounter{capability: exactCounterCapability()}
 	separate := exactCounterCapability()
 	separate.Provider = "other"
-	separate.Transport = inference.CounterTransportSeparateEndpoint
-	separate.SecurityIdentity = inference.SecurityIdentity{1}
+	separate.Transport = contextcount.CounterTransportSeparateEndpoint
+	separate.SecurityIdentity = contextcount.SecurityIdentity{1}
 	tests := []struct {
 		name string
 		opts []Option
@@ -130,7 +132,7 @@ func TestDefinitionContextOptionsAndCapabilityValidation(t *testing.T) {
 		{name: "capability without counter", opts: []Option{WithName("agent"), WithInference(&fakeLLM{}, testModel()), WithInferenceCapability(localInferenceCapability())}, kind: DefinitionMissingContextCounter},
 		{name: "typed nil counter", opts: contextDefinitionOptions((*policyCounter)(nil), localInferenceCapability(), manualCompactionPolicy()), kind: DefinitionInvalidContextCounter},
 		{name: "invalid counter metadata", opts: contextDefinitionOptions(&policyCounter{}, localInferenceCapability(), manualCompactionPolicy()), kind: DefinitionInvalidContextCounter},
-		{name: "invalid inference metadata", opts: contextDefinitionOptions(validCounter, inference.InferenceCapability{}, manualCompactionPolicy()), kind: DefinitionInvalidInferenceCapability},
+		{name: "invalid inference metadata", opts: contextDefinitionOptions(validCounter, contextcount.InferenceCapability{}, manualCompactionPolicy()), kind: DefinitionInvalidInferenceCapability},
 		{name: "incompatible counter", opts: contextDefinitionOptions(&policyCounter{capability: separate}, localInferenceCapability(), manualCompactionPolicy()), kind: DefinitionIncompatibleContextCounter},
 		{name: "compaction missing counter and capability", opts: []Option{WithName("agent"), WithInference(&fakeLLM{}, testModel()), WithCompaction(manualCompactionPolicy())}, kind: DefinitionMissingContextCounter},
 	}
@@ -189,19 +191,19 @@ func TestContextTransportBinding(t *testing.T) {
 	base := testModel()
 	changed := base.Clone()
 	changed.Name = "other"
-	changed.Limits = inference.ContextLimits{WindowTokens: 200}
+	changed.Limits = model.ContextLimits{WindowTokens: 200}
 	changed.Caps.Tools = !changed.Caps.Tools
-	effort := inference.EffortHigh
+	effort := model.EffortHigh
 	changed.Sampling.Effort = effort
 	tests := []struct {
 		name      string
-		candidate inference.Model
+		candidate model.Model
 		wantErr   bool
 	}{
 		{name: "request shape changes allowed", candidate: changed},
-		{name: "provider change rejected", candidate: func() inference.Model { value := changed; value.Provider = "other"; return value }(), wantErr: true},
-		{name: "api format change rejected", candidate: func() inference.Model { value := changed; value.APIFormat = inference.APIFormatAnthropic; return value }(), wantErr: true},
-		{name: "base url change rejected", candidate: func() inference.Model { value := changed; value.BaseURL = "http://localhost:9999"; return value }(), wantErr: true},
+		{name: "provider change rejected", candidate: func() model.Model { value := changed; value.Provider = "other"; return value }(), wantErr: true},
+		{name: "api format change rejected", candidate: func() model.Model { value := changed; value.APIFormat = model.APIFormatAnthropic; return value }(), wantErr: true},
+		{name: "base url change rejected", candidate: func() model.Model { value := changed; value.BaseURL = "http://localhost:9999"; return value }(), wantErr: true},
 	}
 	definition, err := Define(contextDefinitionOptions(counter, localInferenceCapability(), manualCompactionPolicy())...)
 	if err != nil {
@@ -235,7 +237,7 @@ func TestRequestFingerprintSensitivity(t *testing.T) {
 	temperature := 0.5
 	input := RequestFingerprintInput{
 		SystemRevision: "system-v1", ToolPolicyRevision: "tools-v1", RuntimeContextRevision: "runtime-v1",
-		Model:             func() inference.Model { value := testModel(); value.Sampling.Temperature = &temperature; return value }(),
+		Model:             func() model.Model { value := testModel(); value.Sampling.Temperature = &temperature; return value }(),
 		Basis:             event.ContextBasis{Revision: 1, ThroughEventID: uuid.UUID{1}},
 		CounterCapability: exactCounterCapability(), InferenceCapability: localInferenceCapability(),
 	}
@@ -256,7 +258,7 @@ func TestRequestFingerprintSensitivity(t *testing.T) {
 		{name: "runtime context", mutate: func(v *RequestFingerprintInput) { v.RuntimeContextRevision = "runtime-v2" }},
 		{name: "counter provider", mutate: func(v *RequestFingerprintInput) { v.CounterCapability.Provider = "local-owner" }},
 		{name: "counter tokenizer", mutate: func(v *RequestFingerprintInput) { v.CounterCapability.TokenizerRev = "exact-v2" }},
-		{name: "inference retention", mutate: func(v *RequestFingerprintInput) { v.InferenceCapability.Retention = inference.RetentionUnknown }},
+		{name: "inference retention", mutate: func(v *RequestFingerprintInput) { v.InferenceCapability.Retention = contextcount.RetentionUnknown }},
 	}
 	for _, tt := range mutations {
 		t.Run(tt.name, func(t *testing.T) {

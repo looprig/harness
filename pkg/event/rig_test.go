@@ -7,7 +7,7 @@ import (
 
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/identity"
-	"github.com/looprig/inference"
+	model "github.com/looprig/inference/model"
 )
 
 func TestRigEventsRoundTrip(t *testing.T) {
@@ -15,7 +15,7 @@ func TestRigEventsRoundTrip(t *testing.T) {
 	sessionID, loopID, previousLoopID, activeLoopID := vID(t), vID(t), vID(t), vID(t)
 	sessionHeader := event.Header{Coordinates: identity.Coordinates{SessionID: sessionID}, EventID: vID(t)}
 	loopHeader := event.Header{Coordinates: identity.Coordinates{SessionID: sessionID, LoopID: loopID}, EventID: vID(t)}
-	runtime := event.ModelRuntime{Key: inference.ModelKey{Provider: "openai", Model: "gpt-5"}, Limits: inference.ContextLimits{WindowTokens: 128_000}, Effort: inference.EffortHigh}
+	runtime := event.ModelRuntime{Key: model.ModelKey{Provider: "openai", Model: "gpt-5"}, Limits: model.ContextLimits{WindowTokens: 128_000}, Effort: model.EffortHigh}
 	tests := []struct {
 		name string
 		ev   event.Event
@@ -48,17 +48,17 @@ func TestLoopInferenceChangedValidation(t *testing.T) {
 	t.Parallel()
 	sessionID, loopID := vID(t), vID(t)
 	h := event.Header{Coordinates: identity.Coordinates{SessionID: sessionID, LoopID: loopID}, EventID: vID(t)}
-	validRuntime := event.ModelRuntime{Key: inference.ModelKey{Provider: "test", Model: "model"}, Limits: inference.ContextLimits{WindowTokens: 128_000}}
+	validRuntime := event.ModelRuntime{Key: model.ModelKey{Provider: "test", Model: "model"}, Limits: model.ContextLimits{WindowTokens: 128_000}}
 	tests := []struct {
 		name      string
 		ev        event.LoopInferenceChanged
 		wantField event.FieldName
 	}{
 		{name: "valid runtime", ev: event.LoopInferenceChanged{Header: h, Runtime: validRuntime}},
-		{name: "maximum effort", ev: event.LoopInferenceChanged{Header: h, Runtime: event.ModelRuntime{Key: validRuntime.Key, Limits: validRuntime.Limits, Effort: inference.EffortMax}}},
-		{name: "invalid model key", ev: event.LoopInferenceChanged{Header: h, Runtime: event.ModelRuntime{Key: inference.ModelKey{Provider: "test"}}}, wantField: event.FieldModelKey},
-		{name: "invalid limits", ev: event.LoopInferenceChanged{Header: h, Runtime: event.ModelRuntime{Key: validRuntime.Key, Limits: inference.ContextLimits{WindowTokens: 10, MaxOutputTokens: 11}}}, wantField: event.FieldContextLimits},
-		{name: "invalid effort", ev: event.LoopInferenceChanged{Header: h, Runtime: event.ModelRuntime{Key: validRuntime.Key, Effort: inference.Effort("extreme")}}, wantField: event.FieldEffort},
+		{name: "maximum effort", ev: event.LoopInferenceChanged{Header: h, Runtime: event.ModelRuntime{Key: validRuntime.Key, Limits: validRuntime.Limits, Effort: model.EffortMax}}},
+		{name: "invalid model key", ev: event.LoopInferenceChanged{Header: h, Runtime: event.ModelRuntime{Key: model.ModelKey{Provider: "test"}}}, wantField: event.FieldModelKey},
+		{name: "invalid limits", ev: event.LoopInferenceChanged{Header: h, Runtime: event.ModelRuntime{Key: validRuntime.Key, Limits: model.ContextLimits{WindowTokens: 10, MaxOutputTokens: 11}}}, wantField: event.FieldContextLimits},
+		{name: "invalid effort", ev: event.LoopInferenceChanged{Header: h, Runtime: event.ModelRuntime{Key: validRuntime.Key, Effort: model.Effort("extreme")}}, wantField: event.FieldEffort},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

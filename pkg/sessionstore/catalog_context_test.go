@@ -11,15 +11,16 @@ import (
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/identity"
-	"github.com/looprig/inference"
+	contextcount "github.com/looprig/inference/contextcount"
+	model "github.com/looprig/inference/model"
 	"github.com/looprig/storage/memstore"
 )
 
 func catalogContextMeasurement(seed byte) event.ContextMeasurement {
 	return event.ContextMeasurement{
 		Basis: event.ContextBasis{Revision: event.ContextRevision(seed), ThroughEventID: uuid.UUID{seed}},
-		Model: inference.ModelKey{Provider: "provider", Model: "model"}, RequestFingerprint: [32]byte{seed},
-		InputTokens: 80, InputLimit: 100, Quality: inference.CountQualityExactLocal,
+		Model: model.ModelKey{Provider: "provider", Model: "model"}, RequestFingerprint: [32]byte{seed},
+		InputTokens: 80, InputLimit: 100, Quality: contextcount.CountQualityExactLocal,
 	}
 }
 
@@ -27,7 +28,7 @@ func TestCatalogFoldsLatestContextMeasurement(t *testing.T) {
 	t.Parallel()
 	loopID := uuid.UUID{8}
 	header := event.Header{Coordinates: identity.Coordinates{SessionID: uuid.UUID{7}, LoopID: loopID}}
-	runtime := event.ModelRuntime{Key: inference.ModelKey{Provider: "provider", Model: "model"}, Limits: inference.ContextLimits{WindowTokens: 100}}
+	runtime := event.ModelRuntime{Key: model.ModelKey{Provider: "provider", Model: "model"}, Limits: model.ContextLimits{WindowTokens: 100}}
 	first := catalogContextMeasurement(1)
 	second := catalogContextMeasurement(2)
 	tests := []struct {
@@ -344,9 +345,9 @@ func TestCatalogContextValidationAndRoundTrip(t *testing.T) {
 		{name: "empty projection with value sequence", meta: SessionMeta{Loops: []LoopUsageMeta{{LoopID: loopID, ContextSeq: 2, ContextValueSeq: 2}}}, wantErr: true},
 		{name: "value sequence exceeds watermark", meta: SessionMeta{Loops: []LoopUsageMeta{{LoopID: loopID, CurrentContext: measurement, ContextSeq: 2, ContextValueSeq: 3}}}, wantErr: true},
 		{name: "value sequence below mutation watermark", meta: SessionMeta{Loops: []LoopUsageMeta{{LoopID: loopID, CurrentContext: measurement, ContextSeq: 3, ContextValueSeq: 2}}}, wantErr: true},
-		{name: "value sequence not newer than runtime", meta: SessionMeta{Loops: []LoopUsageMeta{{LoopID: loopID, Runtime: event.ModelRuntime{Key: measurement.Model, Limits: inference.ContextLimits{WindowTokens: 100}}, RuntimeSeq: 2, RuntimeValueSeq: 2, CurrentContext: measurement, ContextSeq: 3, ContextValueSeq: 2}}}, wantErr: true},
+		{name: "value sequence not newer than runtime", meta: SessionMeta{Loops: []LoopUsageMeta{{LoopID: loopID, Runtime: event.ModelRuntime{Key: measurement.Model, Limits: model.ContextLimits{WindowTokens: 100}}, RuntimeSeq: 2, RuntimeValueSeq: 2, CurrentContext: measurement, ContextSeq: 3, ContextValueSeq: 2}}}, wantErr: true},
 		{name: "invalid nonzero measurement", meta: SessionMeta{Loops: []LoopUsageMeta{{LoopID: loopID, CurrentContext: func() event.ContextMeasurement { value := measurement; value.InputLimit = 0; return value }(), ContextSeq: 2, ContextValueSeq: 2}}}, wantErr: true},
-		{name: "measurement model mismatches runtime", meta: SessionMeta{Loops: []LoopUsageMeta{{LoopID: loopID, Runtime: event.ModelRuntime{Key: inference.ModelKey{Provider: "other", Model: "model"}, Limits: inference.ContextLimits{WindowTokens: 100}}, CurrentContext: measurement, ContextSeq: 2, ContextValueSeq: 2}}}, wantErr: true},
+		{name: "measurement model mismatches runtime", meta: SessionMeta{Loops: []LoopUsageMeta{{LoopID: loopID, Runtime: event.ModelRuntime{Key: model.ModelKey{Provider: "other", Model: "model"}, Limits: model.ContextLimits{WindowTokens: 100}}, CurrentContext: measurement, ContextSeq: 2, ContextValueSeq: 2}}}, wantErr: true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

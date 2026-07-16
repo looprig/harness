@@ -17,6 +17,7 @@ import (
 	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/harness/pkg/tool"
 	"github.com/looprig/inference"
+	model "github.com/looprig/inference/model"
 )
 
 // Loop is the handle to a running agent loop for internal packages.
@@ -217,13 +218,13 @@ type admissionFaultProbe interface {
 // model.Sampling.Effort so the request the turn builds carries it.
 type effectiveConfig struct {
 	mode   loop.ModeName
-	model  inference.Model
-	effort inference.Effort
+	model  model.Model
+	effort model.Effort
 	system string
 	tools  ToolSet
 }
 
-func modelRuntime(model inference.Model, effort inference.Effort) event.ModelRuntime {
+func modelRuntime(model model.Model, effort model.Effort) event.ModelRuntime {
 	return event.ModelRuntime{Key: model.Key(), Limits: model.Limits, Effort: effort}
 }
 

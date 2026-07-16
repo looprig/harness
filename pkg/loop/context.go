@@ -5,7 +5,7 @@ import (
 
 	"github.com/looprig/core/content"
 	"github.com/looprig/harness/pkg/event"
-	"github.com/looprig/inference"
+	model "github.com/looprig/inference/model"
 )
 
 // ResolvedContextLimits is the checked result of applying one loop policy to
@@ -20,7 +20,7 @@ type ResolvedContextLimits struct {
 // ContextLimitUnknownError reports that model metadata and policy do not yield
 // a safe non-zero input denominator.
 type ContextLimitUnknownError struct {
-	Model inference.ModelKey
+	Model model.ModelKey
 	Cause error
 }
 
@@ -51,7 +51,7 @@ func (e *OccupancyError) Error() string { return "loop: occupancy input limit mu
 
 // ResolveContextLimits applies explicit output reservation and safety margin to
 // known model limits without inventing values for unknown fields.
-func ResolveContextLimits(model inference.ModelKey, limits inference.ContextLimits, reservedOutput, safetyMargin content.TokenCount) (ResolvedContextLimits, error) {
+func ResolveContextLimits(model model.ModelKey, limits model.ContextLimits, reservedOutput, safetyMargin content.TokenCount) (ResolvedContextLimits, error) {
 	unknown := func(cause error) (ResolvedContextLimits, error) {
 		return ResolvedContextLimits{}, &ContextLimitUnknownError{Model: model, Cause: cause}
 	}

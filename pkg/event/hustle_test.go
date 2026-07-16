@@ -12,7 +12,7 @@ import (
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/hustle"
 	"github.com/looprig/harness/pkg/identity"
-	"github.com/looprig/inference"
+	model "github.com/looprig/inference/model"
 )
 
 func hustleUUID(seed byte) uuid.UUID {
@@ -58,7 +58,7 @@ func validHustleHeader(visibility EventVisibility) Header {
 }
 
 func validHustleRuntime() ModelRuntime {
-	return ModelRuntime{Key: inference.ModelKey{Provider: "test", Model: "model"}}
+	return ModelRuntime{Key: model.ModelKey{Provider: "test", Model: "model"}}
 }
 
 func TestEventVisibilityWireAndFilter(t *testing.T) {
@@ -189,7 +189,7 @@ func TestHustleLifecycleValidation(t *testing.T) {
 	validRun := validHustleRun(t, validRuntime)
 	zeroRuntimeRun := validHustleRun(t, ModelRuntime{})
 	currentWithNamedKey := validRun
-	currentWithNamedKey.Definition.NamedModelKey = inference.ModelKey{Provider: "forbidden", Model: "named"}
+	currentWithNamedKey.Definition.NamedModelKey = model.ModelKey{Provider: "forbidden", Model: "named"}
 	currentWithNamedRevision := validRun
 	currentWithNamedRevision.Definition.NamedModelPolicyRevision = "forbidden-named-policy"
 	reservedDefinition := validRun

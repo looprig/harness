@@ -13,6 +13,8 @@ import (
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/inference"
+	contextcount "github.com/looprig/inference/contextcount"
+	model "github.com/looprig/inference/model"
 )
 
 type compactionFinalizationPublisher struct {
@@ -262,7 +264,7 @@ func TestCompactionFinalizerCanonicalizesCommittedPostContextBasis(t *testing.T)
 				Now: func() time.Time { return attempt.StartedAt.Add(time.Second) },
 			})
 			success := &compactionPreparedSuccess{
-				Model: inference.ModelKey{Provider: "test", Model: "compactor"}, RequestFingerprint: [32]byte{1},
+				Model: model.ModelKey{Provider: "test", Model: "compactor"}, RequestFingerprint: [32]byte{1},
 				Summary: validFinalizationSummary(), PostCount: testCompactionPostCount(validFinalizationMeasurement(14)),
 			}
 
@@ -307,7 +309,7 @@ func TestCompactionFinalizerDerivesPostContextFromSecretFreeTemplate(t *testing.
 				Messages: content.AgenticMessages{replacementTestMessage("request content must not enter terminal")},
 				Tools:    []inference.Tool{{Name: "secret-tool-shape", Description: "not terminal content", Schema: json.RawMessage(`{"type":"object"}`)}},
 			}
-			counterCapability := contextTestCapability(inference.CountQualityExactLocal)
+			counterCapability := contextTestCapability(contextcount.CountQualityExactLocal)
 			inferenceCapability := contextTestInferenceCapability()
 			template, err := contextFingerprintTemplateForRequest(request, "runtime-revision", counterCapability, inferenceCapability)
 			if err != nil {
@@ -318,7 +320,7 @@ func TestCompactionFinalizerDerivesPostContextFromSecretFreeTemplate(t *testing.
 				Model: request.Model.Key(), RequestFingerprint: [32]byte{1}, Summary: validFinalizationSummary(),
 				PostCount: compactionPostCount{
 					Model: request.Model.Key(), InputTokens: 17, InputLimit: 80,
-					Quality: inference.CountQualityExactLocal, Fingerprint: template,
+					Quality: contextcount.CountQualityExactLocal, Fingerprint: template,
 				},
 			}
 			finalizer := newCompactionFinalizer(compactionFinalizerConfig{
@@ -461,11 +463,11 @@ func validFinalizationSummary() *content.UserMessage {
 func validFinalizationMeasurement(seed byte) event.ContextMeasurement {
 	return event.ContextMeasurement{
 		Basis:              event.ContextBasis{Revision: event.ContextRevision(seed), ThroughEventID: uuid.UUID{seed}},
-		Model:              inference.ModelKey{Provider: "test", Model: "compactor"},
+		Model:              model.ModelKey{Provider: "test", Model: "compactor"},
 		RequestFingerprint: [32]byte{seed},
 		InputTokens:        content.TokenCount(seed),
 		InputLimit:         100,
-		Quality:            inference.CountQualityExactLocal,
+		Quality:            contextcount.CountQualityExactLocal,
 	}
 }
 
@@ -478,7 +480,7 @@ func validPreparedFinalizationSuccess(seed byte) *compactionPreparedSuccess {
 }
 
 func testCompactionPostCount(measurement event.ContextMeasurement) compactionPostCount {
-	model := inference.Model{Provider: measurement.Model.Provider, Name: measurement.Model.Model}
+	model := model.Model{Provider: measurement.Model.Provider, Name: measurement.Model.Model}
 	template, err := contextFingerprintTemplateForRequest(
 		inference.Request{Model: model, System: "test compaction system"},
 		revisionDigest(nil),

@@ -12,11 +12,12 @@ import (
 	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/harness/pkg/tool"
 	"github.com/looprig/inference"
+	model "github.com/looprig/inference/model"
 )
 
 // swapTestModel returns a second VALID model with a distinct name so a mode/inference
 // swap is observable in the recorded request.
-func swapTestModel(name string) inference.Model {
+func swapTestModel(name string) model.Model {
 	m := testModel()
 	m.Name = name
 	return m
@@ -32,8 +33,8 @@ func modeDefinition(t *testing.T, client inference.Client) loop.BoundDefinition 
 		loop.WithInference(client, testModel()),
 		loop.WithSystem("base"),
 		loop.WithModes(
-			loop.Mode{Name: "plan", Effort: inference.EffortLow, Instructions: "plan-i"},
-			loop.Mode{Name: "build", Effort: inference.EffortHigh, Instructions: "build-i"},
+			loop.Mode{Name: "plan", Effort: model.EffortLow, Instructions: "plan-i"},
+			loop.Mode{Name: "build", Effort: testEffortHigh, Instructions: "build-i"},
 			loop.Mode{Name: "swap", Model: swapTestModel("swap-model")},
 		),
 		loop.WithInitialMode("plan"),
@@ -159,7 +160,7 @@ func TestSetModeAppliesAtNextTurnBoundary(t *testing.T) {
 	l, rec := newBoundLoop(t, llm, bound)
 
 	runOneTurn(t, l, rec, "turn1")
-	if got := llm.lastReq(); got.Model.Sampling.Effort != inference.EffortLow || got.System != "base\n\nplan-i" {
+	if got := llm.lastReq(); got.Model.Sampling.Effort != model.EffortLow || got.System != "base\n\nplan-i" {
 		t.Fatalf("turn1 request effort/system = %q/%q, want low/%q", got.Model.Sampling.Effort, got.System, "base\n\nplan-i")
 	}
 
@@ -173,7 +174,7 @@ func TestSetModeAppliesAtNextTurnBoundary(t *testing.T) {
 	blockUntilEvents(t, rec, func(evs []event.Event) bool { return hasModeChanged(evs, "plan", "build") })
 
 	runOneTurn(t, l, rec, "turn2")
-	if got := llm.lastReq(); got.Model.Sampling.Effort != inference.EffortHigh || got.System != "base\n\nbuild-i" {
+	if got := llm.lastReq(); got.Model.Sampling.Effort != testEffortHigh || got.System != "base\n\nbuild-i" {
 		t.Fatalf("turn2 request effort/system = %q/%q, want high/%q", got.Model.Sampling.Effort, got.System, "base\n\nbuild-i")
 	}
 
@@ -222,13 +223,13 @@ func TestSetModeResolvesByExactName(t *testing.T) {
 		mode       string
 		wantErr    bool
 		wantModel  string
-		wantEffort inference.Effort
+		wantEffort model.Effort
 		wantSystem string
 	}{
-		{name: "base mode via empty name", mode: "", wantModel: "m", wantEffort: inference.EffortNone, wantSystem: "base"},
-		{name: "plan mode", mode: "plan", wantModel: "m", wantEffort: inference.EffortLow, wantSystem: "base\n\nplan-i"},
-		{name: "build mode", mode: "build", wantModel: "m", wantEffort: inference.EffortHigh, wantSystem: "base\n\nbuild-i"},
-		{name: "swap mode distinct model", mode: "swap", wantModel: "swap-model", wantEffort: inference.EffortNone, wantSystem: "base"},
+		{name: "base mode via empty name", mode: "", wantModel: "m", wantEffort: model.EffortNone, wantSystem: "base"},
+		{name: "plan mode", mode: "plan", wantModel: "m", wantEffort: model.EffortLow, wantSystem: "base\n\nplan-i"},
+		{name: "build mode", mode: "build", wantModel: "m", wantEffort: testEffortHigh, wantSystem: "base\n\nbuild-i"},
+		{name: "swap mode distinct model", mode: "swap", wantModel: "swap-model", wantEffort: model.EffortNone, wantSystem: "base"},
 		{name: "unknown mode rejected", mode: "nope", wantErr: true},
 	}
 	for _, tt := range tests {
@@ -301,7 +302,7 @@ func TestChangeAppliedMidTurnDefersToNextTurn(t *testing.T) {
 	<-bt.started
 
 	// Land a SUCCESSFUL inference change while turn 1 is parked (the ack proves it applied).
-	if res := sendChange(t, l, command.ChangeLoopInference{Model: swapTestModel("routed"), SetModel: true, Effort: inference.EffortHigh, SetEffort: true}); res.Err != nil {
+	if res := sendChange(t, l, command.ChangeLoopInference{Model: swapTestModel("routed"), SetModel: true, Effort: testEffortHigh, SetEffort: true}); res.Err != nil {
 		t.Fatalf("mid-turn Change err = %v", res.Err)
 	}
 
@@ -316,7 +317,7 @@ func TestChangeAppliedMidTurnDefersToNextTurn(t *testing.T) {
 		t.Fatalf("turn 1 made %d LLM calls, want >= 2", len(reqs))
 	}
 	for i := 0; i < 2; i++ {
-		if reqs[i].Model.Name != "m" || reqs[i].Model.Sampling.Effort != inference.EffortNone {
+		if reqs[i].Model.Name != "m" || reqs[i].Model.Sampling.Effort != model.EffortNone {
 			t.Fatalf("turn1 request[%d] model/effort = %q/%q, want unchanged m/none (in-flight turn keeps captured config)",
 				i, reqs[i].Model.Name, reqs[i].Model.Sampling.Effort)
 		}
@@ -326,7 +327,7 @@ func TestChangeAppliedMidTurnDefersToNextTurn(t *testing.T) {
 	runOneTurn(t, l, rec, "turn2")
 	last := client.requests()
 	got := last[len(last)-1]
-	if got.Model.Name != "routed" || got.Model.Sampling.Effort != inference.EffortHigh {
+	if got.Model.Name != "routed" || got.Model.Sampling.Effort != testEffortHigh {
 		t.Fatalf("turn2 request model/effort = %q/%q, want routed/high", got.Model.Name, got.Model.Sampling.Effort)
 	}
 }
@@ -343,12 +344,12 @@ func TestChangeMixedBatchAtomicRejection(t *testing.T) {
 	}{
 		{
 			name: "valid model + invalid effort",
-			cmd:  command.ChangeLoopInference{Model: swapTestModel("routed"), SetModel: true, Effort: inference.Effort("turbo"), SetEffort: true},
+			cmd:  command.ChangeLoopInference{Model: swapTestModel("routed"), SetModel: true, Effort: model.Effort("turbo"), SetEffort: true},
 			kind: loop.ChangeInvalidEffort,
 		},
 		{
 			name: "invalid model + valid effort",
-			cmd:  command.ChangeLoopInference{Model: inference.Model{Name: ""}, SetModel: true, Effort: inference.EffortHigh, SetEffort: true},
+			cmd:  command.ChangeLoopInference{Model: model.Model{Name: ""}, SetModel: true, Effort: testEffortHigh, SetEffort: true},
 			kind: loop.ChangeInvalidModel,
 		},
 	}
@@ -368,7 +369,7 @@ func TestChangeMixedBatchAtomicRejection(t *testing.T) {
 			// Nothing applied: the next turn keeps the OLD model AND the OLD effort.
 			runOneTurn(t, l, rec, "turn")
 			got := llm.lastReq()
-			if got.Model.Name != "m" || got.Model.Sampling.Effort != inference.EffortLow {
+			if got.Model.Name != "m" || got.Model.Sampling.Effort != model.EffortLow {
 				t.Fatalf("after rejected mixed batch model/effort = %q/%q, want unchanged m/low", got.Model.Name, got.Model.Sampling.Effort)
 			}
 			if countInferenceChanged(rec.events()) != 0 {
@@ -411,18 +412,18 @@ func TestChangeInferenceAppliesAtNextTurnBoundary(t *testing.T) {
 
 	runOneTurn(t, l, rec, "turn1")
 
-	res := sendChange(t, l, command.ChangeLoopInference{Model: swapTestModel("routed"), SetModel: true, Effort: inference.EffortHigh, SetEffort: true})
+	res := sendChange(t, l, command.ChangeLoopInference{Model: swapTestModel("routed"), SetModel: true, Effort: testEffortHigh, SetEffort: true})
 	if res.Err != nil {
 		t.Fatalf("Change err = %v", res.Err)
 	}
-	if res.Model.Name != "routed" || res.Effort != inference.EffortHigh {
+	if res.Model.Name != "routed" || res.Effort != testEffortHigh {
 		t.Fatalf("result = %q/%q, want routed/high", res.Model.Name, res.Effort)
 	}
 	blockUntilEvents(t, rec, func(evs []event.Event) bool { return countInferenceChanged(evs) == 1 })
 
 	runOneTurn(t, l, rec, "turn2")
 	got := llm.lastReq()
-	if got.Model.Name != "routed" || got.Model.Sampling.Effort != inference.EffortHigh {
+	if got.Model.Name != "routed" || got.Model.Sampling.Effort != testEffortHigh {
 		t.Fatalf("turn2 model/effort = %q/%q, want routed/high", got.Model.Name, got.Model.Sampling.Effort)
 	}
 	// Mode (system prompt) unchanged by a direct inference change.
@@ -439,12 +440,12 @@ func TestChangeInferenceEffortOnlyKeepsModel(t *testing.T) {
 	bound := modeDefinition(t, llm)
 	l, rec := newBoundLoop(t, llm, bound)
 
-	if res := sendChange(t, l, command.ChangeLoopInference{Effort: inference.EffortMax, SetEffort: true}); res.Err != nil {
+	if res := sendChange(t, l, command.ChangeLoopInference{Effort: model.EffortMax, SetEffort: true}); res.Err != nil {
 		t.Fatalf("Change(effort) err = %v", res.Err)
 	}
 	runOneTurn(t, l, rec, "turn1")
 	got := llm.lastReq()
-	if got.Model.Name != "m" || got.Model.Sampling.Effort != inference.EffortMax {
+	if got.Model.Name != "m" || got.Model.Sampling.Effort != model.EffortMax {
 		t.Fatalf("model/effort = %q/%q, want m/max", got.Model.Name, got.Model.Sampling.Effort)
 	}
 }
@@ -463,20 +464,20 @@ func TestChangeInferenceValidation(t *testing.T) {
 	}{
 		{
 			name: "empty model name is invalid",
-			cmd:  command.ChangeLoopInference{Model: inference.Model{Name: ""}, SetModel: true},
+			cmd:  command.ChangeLoopInference{Model: model.Model{Name: ""}, SetModel: true},
 			kind: loop.ChangeInvalidModel,
 		},
 		{
 			name: "empty model provider is invalid",
-			cmd: command.ChangeLoopInference{Model: inference.Model{
-				APIFormat: inference.APIFormatOpenAI, BaseURL: "http://localhost:1234", Name: "routed",
+			cmd: command.ChangeLoopInference{Model: model.Model{
+				APIFormat: model.APIFormatOpenAI, BaseURL: "http://localhost:1234", Name: "routed",
 			}, SetModel: true},
 			kind:           loop.ChangeInvalidModel,
 			wantKeyFailure: true,
 		},
 		{
 			name: "unknown effort is invalid",
-			cmd:  command.ChangeLoopInference{Effort: inference.Effort("turbo"), SetEffort: true},
+			cmd:  command.ChangeLoopInference{Effort: model.Effort("turbo"), SetEffort: true},
 			kind: loop.ChangeInvalidEffort,
 		},
 		{
@@ -497,8 +498,8 @@ func TestChangeInferenceValidation(t *testing.T) {
 				t.Fatalf("err = %v, want %s", res.Err, tt.kind)
 			}
 			if tt.wantKeyFailure {
-				var keyErr *inference.ModelKeyValidationError
-				if !errors.As(res.Err, &keyErr) || keyErr.Field != inference.ModelKeyFieldProvider {
+				var keyErr *model.ModelKeyValidationError
+				if !errors.As(res.Err, &keyErr) || keyErr.Field != model.ModelKeyFieldProvider {
 					t.Fatalf("err cause = %T %v, want *ModelKeyValidationError for Provider", res.Err, res.Err)
 				}
 			}
@@ -539,7 +540,7 @@ func TestChangeNotAppliedOnDurableFault(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newWithConfig: %v", err)
 	}
-	res := sendChange(t, l, command.ChangeLoopInference{Effort: inference.EffortHigh, SetEffort: true})
+	res := sendChange(t, l, command.ChangeLoopInference{Effort: testEffortHigh, SetEffort: true})
 	var ce *loop.ChangeError
 	if !errors.As(res.Err, &ce) || ce.Kind != loop.ChangeDurableAppendFailed {
 		t.Fatalf("err = %v, want ChangeDurableAppendFailed", res.Err)
@@ -549,7 +550,7 @@ func TestChangeNotAppliedOnDurableFault(t *testing.T) {
 	}
 	// The change was NOT applied: the next turn runs under the ORIGINAL (unset) effort.
 	runOneTurn(t, l, fp.recordingPublisher, "turn1")
-	if got := llm.lastReq().Model.Sampling.Effort; got != inference.EffortNone {
+	if got := llm.lastReq().Model.Sampling.Effort; got != model.EffortNone {
 		t.Fatalf("effort after faulted change = %q, want unchanged (none)", got)
 	}
 }
@@ -564,37 +565,37 @@ func TestNewRestoredSeedsModeAndInference(t *testing.T) {
 		seed       RestoredState
 		wantSystem string
 		wantModel  string
-		wantEffort inference.Effort
+		wantEffort model.Effort
 	}{
 		{
 			name:       "restored base mode via empty name resolves base, not the initial mode",
 			seed:       RestoredState{HasMode: true, Mode: ""},
 			wantSystem: "base",
 			wantModel:  "m",
-			wantEffort: inference.EffortNone,
+			wantEffort: model.EffortNone,
 		},
 		{
 			name:       "restored mode only",
 			seed:       RestoredState{HasMode: true, Mode: "build"},
 			wantSystem: "base\n\nbuild-i",
 			wantModel:  "m",
-			wantEffort: inference.EffortHigh,
+			wantEffort: testEffortHigh,
 		},
 		{
 			name: "restored mode plus inference override",
 			seed: RestoredState{HasMode: true, Mode: "plan", HasRuntime: true, Runtime: event.ModelRuntime{
-				Key: swapTestModel("routed").Key(), Effort: inference.EffortMax,
+				Key: swapTestModel("routed").Key(), Effort: model.EffortMax,
 			}},
 			wantSystem: "base\n\nplan-i",
 			wantModel:  "routed",
-			wantEffort: inference.EffortMax,
+			wantEffort: model.EffortMax,
 		},
 		{
 			name:       "no fold resumes at initial mode",
 			seed:       RestoredState{},
 			wantSystem: "base\n\nplan-i",
 			wantModel:  "m",
-			wantEffort: inference.EffortLow,
+			wantEffort: model.EffortLow,
 		},
 	}
 	for _, tt := range tests {
@@ -652,7 +653,7 @@ func TestChangeRejectedWhileShuttingDown(t *testing.T) {
 	if !errors.As(res.Err, &ce) || ce.Kind != loop.ChangeLoopShuttingDown {
 		t.Fatalf("SetLoopMode while shutting down err = %v, want ChangeLoopShuttingDown", res.Err)
 	}
-	cres := sendChange(t, l, command.ChangeLoopInference{Effort: inference.EffortHigh, SetEffort: true})
+	cres := sendChange(t, l, command.ChangeLoopInference{Effort: testEffortHigh, SetEffort: true})
 	if !errors.As(cres.Err, &ce) || ce.Kind != loop.ChangeLoopShuttingDown {
 		t.Fatalf("Change while shutting down err = %v, want ChangeLoopShuttingDown", cres.Err)
 	}

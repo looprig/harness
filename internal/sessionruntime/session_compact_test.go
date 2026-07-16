@@ -11,22 +11,22 @@ import (
 	"github.com/looprig/harness/pkg/command"
 	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/loop"
-	"github.com/looprig/inference"
+	contextcount "github.com/looprig/inference/contextcount"
 )
 
 func compactDispatchDefinition(engine loop.Engine) loop.Definition {
 	definition := engineCfg(&stubLLM{}, engine, "system")
 	if engine == loop.EngineNative {
-		capability := inference.CounterCapability{
-			Transport: inference.CounterTransportLocal, Retention: inference.RetentionNone,
-			TokenizerRev: "dispatch-test-v1", Quality: inference.CountQualityExactLocal,
+		capability := contextcount.CounterCapability{
+			Transport: contextcount.CounterTransportLocal, Retention: contextcount.RetentionNone,
+			TokenizerRev: "dispatch-test-v1", Quality: contextcount.CountQualityExactLocal,
 		}
 		model := validModel("compact-dispatch")
-		model.Limits = inference.ContextLimits{WindowTokens: 100, MaxInputTokens: 80, MaxOutputTokens: 20}
+		model.Limits = testContextLimits{WindowTokens: 100, MaxInputTokens: 80, MaxOutputTokens: 20}
 		definition = mustDefine(
 			loop.WithName("agent"), loop.WithInference(&stubLLM{}, model), loop.WithSystem("system"),
 			loop.WithContextCounter(&liveCompactionCounter{capability: capability, counts: []content.TokenCount{20}}),
-			loop.WithInferenceCapability(inference.InferenceCapability{Transport: inference.InferenceTransportLocal, Retention: inference.RetentionNone}),
+			loop.WithInferenceCapability(contextcount.InferenceCapability{Transport: contextcount.InferenceTransportLocal, Retention: contextcount.RetentionNone}),
 			loop.WithCompaction(loop.CompactionPolicy{
 				CounterPolicy: loop.CounterPolicyRequireExact, ReservedOutput: 20,
 				MaxSummaryTokens: 10, CountTimeout: time.Second, Hustle: "context.compact",

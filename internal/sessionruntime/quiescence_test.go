@@ -11,6 +11,7 @@ import (
 	"github.com/looprig/harness/pkg/command"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/inference"
+	stream "github.com/looprig/inference/stream"
 )
 
 // drainSub reads from sub until the predicate is satisfied (returns true) or a
@@ -202,7 +203,7 @@ func (c *chainStubLLM) Invoke(context.Context, inference.Request) (*inference.Re
 	return nil, io.EOF
 }
 
-func (c *chainStubLLM) Stream(ctx context.Context, _ inference.Request) (*inference.StreamReader[content.Chunk], error) {
+func (c *chainStubLLM) Stream(ctx context.Context, _ inference.Request) (*stream.StreamReader[content.Chunk], error) {
 	c.mu.Lock()
 	n := c.calls
 	c.calls++
@@ -219,7 +220,7 @@ func (c *chainStubLLM) Stream(ctx context.Context, _ inference.Request) (*infere
 		}
 		return nil, io.EOF
 	}
-	return inference.NewStreamReader(next, nil), nil
+	return stream.NewStreamReader(next, nil), nil
 }
 
 // TestChainedTurnsEmitNoLoopIdleBetween proves the running->running transition: when

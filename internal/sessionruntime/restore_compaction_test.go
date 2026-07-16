@@ -15,7 +15,7 @@ import (
 	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/journal"
 	"github.com/looprig/harness/pkg/sessionstore"
-	"github.com/looprig/inference"
+	contextcount "github.com/looprig/inference/contextcount"
 	"github.com/looprig/storage"
 	"github.com/looprig/storage/memstore"
 )
@@ -567,7 +567,7 @@ func runRestoreRepairsMissingCompactWaiterExactlyOnce(t *testing.T) {
 	postContext := event.ContextMeasurement{
 		Basis: event.ContextBasis{Revision: 2, ThroughEventID: committedID},
 		Model: validModel("model-x").Key(), RequestFingerprint: [32]byte{0x55},
-		InputTokens: 20, InputLimit: 100, Quality: inference.CountQualityExactLocal,
+		InputTokens: 20, InputLimit: 100, Quality: contextcount.CountQualityExactLocal,
 	}
 	committed := event.CompactionCommitted{
 		Header:    event.Header{EventID: committedID, CreatedAt: fixedClock(), Coordinates: coordinates},
@@ -729,7 +729,7 @@ func runRestoreWaiterRepairAppendFailureIsFatalAndRetryable(t *testing.T) {
 		Summary: restoredCompactionSummary("summary"),
 		PostContext: event.ContextMeasurement{
 			Basis: event.ContextBasis{Revision: 2, ThroughEventID: committedID}, Model: validModel("model-x").Key(),
-			RequestFingerprint: [32]byte{0x64}, InputTokens: 20, InputLimit: 100, Quality: inference.CountQualityExactLocal,
+			RequestFingerprint: [32]byte{0x64}, InputTokens: 20, InputLimit: 100, Quality: contextcount.CountQualityExactLocal,
 		},
 	}
 	if err := h.PublishEvent(context.Background(), committed); err != nil {

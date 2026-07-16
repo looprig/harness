@@ -15,6 +15,8 @@ import (
 	"github.com/looprig/harness/pkg/hustle"
 	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/inference"
+	model "github.com/looprig/inference/model"
+	stream "github.com/looprig/inference/stream"
 )
 
 type runtimeTestClient struct {
@@ -27,7 +29,7 @@ func (c *runtimeTestClient) Invoke(ctx context.Context, request inference.Reques
 	return c.invoke(ctx, request)
 }
 
-func (*runtimeTestClient) Stream(context.Context, inference.Request) (*inference.StreamReader[content.Chunk], error) {
+func (*runtimeTestClient) Stream(context.Context, inference.Request) (*stream.StreamReader[content.Chunk], error) {
 	return nil, &runtimeUnexpectedStreamError{}
 }
 
@@ -123,19 +125,19 @@ func eventTypeName(ev event.Event) string {
 	}
 }
 
-func runtimeTestModel() inference.Model {
+func runtimeTestModel() model.Model {
 	temperature := 0.25
 	maxTokens := 37
-	return inference.Model{
+	return model.Model{
 		Provider:  "test-provider",
 		APIFormat: "test-format",
 		Name:      "test-model",
-		Limits:    inference.ContextLimits{WindowTokens: 4096, MaxOutputTokens: 512},
-		Sampling: inference.Sampling{
+		Limits:    model.ContextLimits{WindowTokens: 4096, MaxOutputTokens: 512},
+		Sampling: model.Sampling{
 			Temperature: &temperature,
 			MaxTokens:   &maxTokens,
 			Stop:        []string{"<done>"},
-			Effort:      inference.EffortHigh,
+			Effort:      model.EffortHigh,
 		},
 	}
 }

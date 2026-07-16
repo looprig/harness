@@ -9,7 +9,7 @@ import (
 	"github.com/looprig/core/content"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/identity"
-	"github.com/looprig/inference"
+	model "github.com/looprig/inference/model"
 	"github.com/looprig/storage/memstore"
 )
 
@@ -17,9 +17,9 @@ func TestSessionMetaRejectsInvalidLoopProjection(t *testing.T) {
 	t.Parallel()
 	loopLow, loopHigh := fixedUUID(0x11), fixedUUID(0x22)
 	validRuntime := event.ModelRuntime{
-		Key:    inference.ModelKey{Provider: "provider", Model: "model"},
-		Limits: inference.ContextLimits{WindowTokens: 100},
-		Effort: inference.EffortLow,
+		Key:    model.ModelKey{Provider: "provider", Model: "model"},
+		Limits: model.ContextLimits{WindowTokens: 100},
+		Effort: model.EffortLow,
 	}
 	validLoop := LoopUsageMeta{LoopID: loopLow, Runtime: validRuntime, RuntimeSeq: 2, RuntimeValueSeq: 1}
 	tests := []struct {
@@ -31,10 +31,10 @@ func TestSessionMetaRejectsInvalidLoopProjection(t *testing.T) {
 		{name: "duplicate loop id", meta: SessionMeta{Loops: []LoopUsageMeta{{LoopID: loopLow}, {LoopID: loopLow}}}},
 		{name: "runtime value sequence exceeds lifecycle sequence", meta: SessionMeta{Loops: []LoopUsageMeta{{LoopID: loopLow, RuntimeSeq: 1, RuntimeValueSeq: 2}}}},
 		{name: "legacy zero runtime has a value sequence", meta: SessionMeta{Loops: []LoopUsageMeta{{LoopID: loopLow, RuntimeSeq: 2, RuntimeValueSeq: 1}}}},
-		{name: "runtime provider is empty", meta: SessionMeta{Loops: []LoopUsageMeta{{LoopID: loopLow, Runtime: event.ModelRuntime{Key: inference.ModelKey{Model: "model"}}, RuntimeSeq: 1, RuntimeValueSeq: 1}}}},
-		{name: "runtime model is empty", meta: SessionMeta{Loops: []LoopUsageMeta{{LoopID: loopLow, Runtime: event.ModelRuntime{Key: inference.ModelKey{Provider: "provider"}}, RuntimeSeq: 1, RuntimeValueSeq: 1}}}},
-		{name: "runtime limits are invalid", meta: SessionMeta{Loops: []LoopUsageMeta{{LoopID: loopLow, Runtime: event.ModelRuntime{Key: validRuntime.Key, Limits: inference.ContextLimits{WindowTokens: 10, MaxInputTokens: 11}}, RuntimeSeq: 1, RuntimeValueSeq: 1}}}},
-		{name: "runtime effort is invalid", meta: SessionMeta{Loops: []LoopUsageMeta{{LoopID: loopLow, Runtime: event.ModelRuntime{Key: validRuntime.Key, Effort: inference.Effort("invalid")}, RuntimeSeq: 1, RuntimeValueSeq: 1}}}},
+		{name: "runtime provider is empty", meta: SessionMeta{Loops: []LoopUsageMeta{{LoopID: loopLow, Runtime: event.ModelRuntime{Key: model.ModelKey{Model: "model"}}, RuntimeSeq: 1, RuntimeValueSeq: 1}}}},
+		{name: "runtime model is empty", meta: SessionMeta{Loops: []LoopUsageMeta{{LoopID: loopLow, Runtime: event.ModelRuntime{Key: model.ModelKey{Provider: "provider"}}, RuntimeSeq: 1, RuntimeValueSeq: 1}}}},
+		{name: "runtime limits are invalid", meta: SessionMeta{Loops: []LoopUsageMeta{{LoopID: loopLow, Runtime: event.ModelRuntime{Key: validRuntime.Key, Limits: model.ContextLimits{WindowTokens: 10, MaxInputTokens: 11}}, RuntimeSeq: 1, RuntimeValueSeq: 1}}}},
+		{name: "runtime effort is invalid", meta: SessionMeta{Loops: []LoopUsageMeta{{LoopID: loopLow, Runtime: event.ModelRuntime{Key: validRuntime.Key, Effort: model.Effort("invalid")}, RuntimeSeq: 1, RuntimeValueSeq: 1}}}},
 		{name: "usage is invalid", meta: SessionMeta{Loops: []LoopUsageMeta{{LoopID: loopLow, CumulativeUsage: content.Usage{OutputTokens: 1, ReasoningTokens: 2}}}}},
 		{name: "valid projection", meta: SessionMeta{Loops: []LoopUsageMeta{validLoop}}},
 	}
@@ -151,7 +151,7 @@ func TestCatalogReadAllowsOpaqueEventJSONFields(t *testing.T) {
 func TestCatalogRepairReplacesInvalidCachedProjection(t *testing.T) {
 	t.Parallel()
 	sessionID, loopID := fixedUUID(0x44), fixedUUID(0x45)
-	runtime := event.ModelRuntime{Key: inference.ModelKey{Provider: "provider", Model: "model"}, Limits: inference.ContextLimits{WindowTokens: 100}}
+	runtime := event.ModelRuntime{Key: model.ModelKey{Provider: "provider", Model: "model"}, Limits: model.ContextLimits{WindowTokens: 100}}
 	tests := []struct {
 		name string
 	}{

@@ -4,7 +4,7 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/looprig/inference"
+	model "github.com/looprig/inference/model"
 )
 
 // ackErrKind classifies the reply-channel contract violation a Validate should report.
@@ -45,11 +45,11 @@ func TestChangeLoopInferenceValidate(t *testing.T) {
 		cmd  ChangeLoopInference
 		want ackErrKind
 	}{
-		{name: "happy path model change with ack", cmd: ChangeLoopInference{Model: inference.Model{Name: "m"}, SetModel: true, Ack: valid}, want: ackOK},
-		{name: "happy path effort change with ack", cmd: ChangeLoopInference{Effort: inference.EffortHigh, SetEffort: true, Ack: valid}, want: ackOK},
+		{name: "happy path model change with ack", cmd: ChangeLoopInference{Model: model.Model{Name: "m"}, SetModel: true, Ack: valid}, want: ackOK},
+		{name: "happy path effort change with ack", cmd: ChangeLoopInference{Effort: model.EffortHigh, SetEffort: true, Ack: valid}, want: ackOK},
 		{name: "no fields set is still structurally valid with ack", cmd: ChangeLoopInference{Ack: valid}, want: ackOK},
-		{name: "nil ack is rejected", cmd: ChangeLoopInference{Model: inference.Model{Name: "m"}, SetModel: true}, want: ackMissing},
-		{name: "unbuffered ack is rejected", cmd: ChangeLoopInference{SetEffort: true, Effort: inference.EffortHigh, Ack: make(chan LoopChangeResult)}, want: ackUnbuffered},
+		{name: "nil ack is rejected", cmd: ChangeLoopInference{Model: model.Model{Name: "m"}, SetModel: true}, want: ackMissing},
+		{name: "unbuffered ack is rejected", cmd: ChangeLoopInference{SetEffort: true, Effort: model.EffortHigh, Ack: make(chan LoopChangeResult)}, want: ackUnbuffered},
 	}
 	for _, tt := range tests {
 		tt := tt
