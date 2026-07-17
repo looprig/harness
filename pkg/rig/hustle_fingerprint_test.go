@@ -2,6 +2,7 @@ package rig
 
 import (
 	"context"
+	"encoding/json"
 	"testing"
 	"time"
 
@@ -34,6 +35,16 @@ type rigHustleSpec struct {
 	policyRev     string
 	timeout       time.Duration
 	limits        hustle.Limits
+	output        *inference.OutputSchema
+}
+
+func rigHustleOutput() *inference.OutputSchema {
+	return &inference.OutputSchema{
+		Name:        "classifier_result",
+		Description: "Return the classifier result",
+		Schema:      json.RawMessage(`{"type":"object","properties":{"allowed":{"type":"boolean"}},"required":["allowed"],"additionalProperties":false}`),
+		Strict:      true,
+	}
 }
 
 func defaultRigHustleSpec() rigHustleSpec {
@@ -43,6 +54,7 @@ func defaultRigHustleSpec() rigHustleSpec {
 		client:      &credentialedHustleClient{credential: "credential-a"}, model: validModel("named-model"),
 		prompt: "raw prompt alpha", promptRev: "prompt-v1", policyRev: "policy-v1",
 		timeout: time.Second, limits: hustle.Limits{InputBytes: 1024, OutputBytes: 512},
+		output: rigHustleOutput(),
 	}
 }
 
@@ -57,6 +69,9 @@ func defineRigHustle(t *testing.T, spec rigHustleSpec) hustle.Definition {
 		options = append(options, hustle.WithNamedInference(spec.client, spec.model))
 	} else {
 		options = append(options, hustle.WithCurrentLoopModel())
+	}
+	if spec.output != nil {
+		options = append(options, hustle.WithOutputSchema(*spec.output))
 	}
 	definition, err := hustle.Define(options...)
 	if err != nil {
@@ -126,6 +141,35 @@ func TestHustleTopologyFingerprintSensitivityAndExclusions(t *testing.T) {
 		{name: "prompt revision", definition: defineRigHustle(t, func() rigHustleSpec { value := baseSpec; value.promptRev = "prompt-v2"; return value }()), limits: baseLimits},
 		{name: "raw prompt behavior digest", definition: defineRigHustle(t, func() rigHustleSpec { value := baseSpec; value.prompt = "raw prompt beta"; return value }()), limits: baseLimits},
 		{name: "policy revision", definition: defineRigHustle(t, func() rigHustleSpec { value := baseSpec; value.policyRev = "policy-v2"; return value }()), limits: baseLimits},
+		{name: "output schema name", definition: defineRigHustle(t, func() rigHustleSpec {
+			value := baseSpec
+			output := value.output.Clone()
+			output.Name = "classifier_result_v2"
+			value.output = &output
+			return value
+		}()), limits: baseLimits},
+		{name: "output schema", definition: defineRigHustle(t, func() rigHustleSpec {
+			value := baseSpec
+			output := value.output.Clone()
+			output.Schema = json.RawMessage(`{"type":"object","properties":{"verdict":{"type":"string"}},"required":["verdict"],"additionalProperties":false}`)
+			value.output = &output
+			return value
+		}()), limits: baseLimits},
+		{name: "output description", definition: defineRigHustle(t, func() rigHustleSpec {
+			value := baseSpec
+			output := value.output.Clone()
+			output.Description = "Changed behavior"
+			value.output = &output
+			return value
+		}()), limits: baseLimits},
+		{name: "output strictness", definition: defineRigHustle(t, func() rigHustleSpec {
+			value := baseSpec
+			output := value.output.Clone()
+			output.Strict = false
+			value.output = &output
+			return value
+		}()), limits: baseLimits},
+		{name: "output absent", definition: defineRigHustle(t, func() rigHustleSpec { value := baseSpec; value.output = nil; return value }()), limits: baseLimits},
 		{name: "timeout", definition: defineRigHustle(t, func() rigHustleSpec { value := baseSpec; value.timeout++; return value }()), limits: baseLimits},
 		{name: "input bytes", definition: defineRigHustle(t, func() rigHustleSpec { value := baseSpec; value.limits.InputBytes++; return value }()), limits: baseLimits},
 		{name: "output bytes", definition: defineRigHustle(t, func() rigHustleSpec { value := baseSpec; value.limits.OutputBytes++; return value }()), limits: baseLimits},

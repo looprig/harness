@@ -12,6 +12,7 @@ import (
 	"github.com/looprig/harness/pkg/hustle"
 	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/tool"
+	"github.com/looprig/inference"
 	model "github.com/looprig/inference/model"
 )
 
@@ -368,10 +369,14 @@ func sampleRuntime() ModelRuntime {
 func exhaustiveHustleDescriptor() hustle.DefinitionDescriptor {
 	var promptSHA [32]byte
 	promptSHA[0] = 1
+	var outputSHA [32]byte
+	outputSHA[0] = 2
 	return hustle.DefinitionDescriptor{
 		Name: "exhaustive", Participation: hustle.ParticipationBlocking,
 		ModelSource: hustle.ModelSourceCurrentLoop, PromptRevision: "prompt-v1",
-		PromptSHA256: promptSHA, PolicyRevision: "policy-v1", TimeoutNanos: int64(time.Second),
+		PromptSHA256: promptSHA, OutputSchemaName: "result", OutputSchemaSHA256: outputSHA,
+		StructuredOutputRevision: inference.StructuredOutputRevision,
+		PolicyRevision:           "policy-v1", TimeoutNanos: int64(time.Second),
 		Limits: hustle.Limits{InputBytes: 1, OutputBytes: 1},
 	}
 }

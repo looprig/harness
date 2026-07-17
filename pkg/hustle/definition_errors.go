@@ -19,6 +19,7 @@ const (
 	DefinitionInvalidPromptRevision DefinitionErrorKind = "invalid_prompt_revision"
 	DefinitionMissingPolicyRevision DefinitionErrorKind = "missing_policy_revision"
 	DefinitionInvalidPolicyRevision DefinitionErrorKind = "invalid_policy_revision"
+	DefinitionInvalidOutputSchema   DefinitionErrorKind = "invalid_output_schema"
 )
 
 // DefinitionError reports a definition boundary failure without retaining raw

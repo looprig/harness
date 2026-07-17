@@ -1,7 +1,9 @@
 package hustle
 
 import (
+	"crypto/sha256"
 	"errors"
+	"strings"
 	"testing"
 
 	model "github.com/looprig/inference/model"
@@ -19,6 +21,7 @@ func descriptorFromOptions(t *testing.T, options []Option) DefinitionDescriptor 
 func TestDefinitionDescriptorValidate(t *testing.T) {
 	t.Parallel()
 	current := descriptorFromOptions(t, validCurrentOptions())
+	structured := descriptorFromOptions(t, append(validCurrentOptions(), WithOutputSchema(validOutputSchema())))
 	named := descriptorFromOptions(t, validNamedOptions(&testClient{}, validModel("named")))
 	zeroPromptHash := current
 	zeroPromptHash.PromptSHA256 = [32]byte{}
@@ -39,6 +42,24 @@ func TestDefinitionDescriptorValidate(t *testing.T) {
 	overInput.Limits.InputBytes++
 	overOutput := maximum
 	overOutput.Limits.OutputBytes++
+	missingOutputName := structured
+	missingOutputName.OutputSchemaName = ""
+	missingOutputDigest := structured
+	missingOutputDigest.OutputSchemaSHA256 = [sha256.Size]byte{}
+	missingOutputRevision := structured
+	missingOutputRevision.StructuredOutputRevision = ""
+	partialOutputName := current
+	partialOutputName.OutputSchemaName = "result"
+	partialOutputDigest := current
+	partialOutputDigest.OutputSchemaSHA256[0] = 1
+	partialOutputRevision := current
+	partialOutputRevision.StructuredOutputRevision = "structured-output/future"
+	invalidOutputName := structured
+	invalidOutputName.OutputSchemaName = "bad.name"
+	longOutputName := structured
+	longOutputName.OutputSchemaName = "a" + strings.Repeat("b", maxOutputSchemaNameBytes)
+	longOutputRevision := structured
+	longOutputRevision.StructuredOutputRevision = strings.Repeat("r", 129)
 	tests := []struct {
 		name    string
 		value   DefinitionDescriptor
@@ -46,6 +67,7 @@ func TestDefinitionDescriptorValidate(t *testing.T) {
 	}{
 		{name: "valid current", value: current},
 		{name: "valid named", value: named},
+		{name: "valid structured", value: structured},
 		{name: "minimum boundary", value: minimum},
 		{name: "maximum payload boundary", value: maximum},
 		{name: "zero descriptor", value: DefinitionDescriptor{}, wantErr: true},
@@ -66,6 +88,15 @@ func TestDefinitionDescriptorValidate(t *testing.T) {
 		{name: "current with named revision", value: currentNamedRevision, wantErr: true},
 		{name: "named missing key", value: namedMissingKey, wantErr: true},
 		{name: "named missing model policy", value: namedMissingRevision, wantErr: true},
+		{name: "structured missing output name", value: missingOutputName, wantErr: true},
+		{name: "structured missing output digest", value: missingOutputDigest, wantErr: true},
+		{name: "structured missing output revision", value: missingOutputRevision, wantErr: true},
+		{name: "partial output name", value: partialOutputName, wantErr: true},
+		{name: "partial output digest", value: partialOutputDigest, wantErr: true},
+		{name: "partial output revision", value: partialOutputRevision, wantErr: true},
+		{name: "invalid output name", value: invalidOutputName, wantErr: true},
+		{name: "long output name", value: longOutputName, wantErr: true},
+		{name: "long output revision", value: longOutputRevision, wantErr: true},
 	}
 	for _, tt := range tests {
 		testCase := tt
