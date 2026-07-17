@@ -55,6 +55,11 @@ func openURLGate() gate.Gate {
 		Subject:  gate.Subject{TurnID: gate.ID(mustUUID()), StepID: gate.ID(mustUUID())},
 		Prompt: gate.Prompt{
 			Title: "Authorize",
+			// The public, validated origin. These tests drive PrepareGateOpen
+			// directly, which is BELOW the OpenHostGate seam that derives this from
+			// the payload — so the envelope must carry it itself, and ValidateGate
+			// refuses it if it does not.
+			Origin: "https://idp.example",
 			Controls: []gate.Control{
 				{Action: gate.FormActionAccept, Label: "I have completed it"},
 				{Action: gate.FormActionDecline, Label: "Decline"},

@@ -10,6 +10,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -113,6 +114,144 @@ func formGate(t *testing.T) (gate.Gate, gate.FormPayload) {
 		},
 	}
 	return envelope, gate.FormPayload{Title: "Sign in", Schema: schema}
+}
+
+// openURLGate builds a host-owned open-url envelope and its payload. The URL is
+// the ephemeral action target: it carries the secrets, and it must never leave
+// the payload.
+func openURLGate(t *testing.T) (gate.Gate, gate.OpenURLPayload) {
+	t.Helper()
+	turnID, err := uuid.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	envelope := gate.Gate{
+		Kind:     gate.KindOpenURL,
+		Resolver: gate.ResolverSession,
+		Blocks:   gate.BlocksToolCall,
+		Effect:   gate.EffectResume,
+		Subject:  gate.Subject{TurnID: turnID},
+		Prompt: gate.Prompt{
+			Title: "Authorize access",
+			Controls: []gate.Control{
+				{Action: gate.FormActionAccept, Label: "Done"},
+				{Action: gate.FormActionDecline, Label: "Cancel"},
+			},
+		},
+	}
+	payload := gate.OpenURLPayload{
+		DisplayOrigin:      "https://github.com",
+		URL:                "https://github.com/login/oauth/authorize?state=SECRET&code_challenge=PKCE",
+		RequiresCompletion: true,
+	}
+	return envelope, payload
+}
+
+// TestGateHostPublishesTheValidatedOrigin is the renderer's contract. A client
+// sees only the public envelope, so the origin a human makes the trust decision
+// on has to be THERE — and it has to be the validated one from the payload, not
+// prose an opener wrote.
+func TestGateHostPublishesTheValidatedOrigin(t *testing.T) {
+	t.Parallel()
+	controller, host := gateHostSession(t)
+	envelope, payload := openURLGate(t)
+
+	gateID, err := host.OpenHostGate(context.Background(), controller.ActiveLoop().ID(), envelope, payload)
+	if err != nil {
+		t.Fatalf("OpenHostGate: %v", err)
+	}
+	t.Cleanup(func() { _ = host.CloseGate(context.Background(), gateID, gate.CloseAbandoned) })
+
+	gates := listGates(t, controller)
+	if len(gates) != 1 {
+		t.Fatalf("open gates = %d, want 1", len(gates))
+	}
+	published := gates[0]
+	if published.Prompt.Origin != payload.DisplayOrigin {
+		t.Errorf("published origin = %q, want %q", published.Prompt.Origin, payload.DisplayOrigin)
+	}
+	// The renderer can trust it structurally: what it was handed validates as a
+	// bare origin under the same rule the payload is held to.
+	if err := gate.ValidateGate(published); err != nil {
+		t.Errorf("published envelope does not validate: %v", err)
+	}
+	// The ephemeral action target is not on the envelope, in any field.
+	assertNoURL(t, published, payload.URL)
+}
+
+// TestGateHostDerivesTheProjectionFromThePayload is the divergence proof. An
+// opener that names one origin on the envelope and another in the payload — or
+// projects a schema it will not validate against — does not get a divergent
+// gate, because the session derives both from the payload rather than trusting
+// them. The divergent state is unrepresentable, not merely rejected.
+func TestGateHostDerivesTheProjectionFromThePayload(t *testing.T) {
+	t.Parallel()
+
+	t.Run("origin cannot diverge from the payload", func(t *testing.T) {
+		t.Parallel()
+		controller, host := gateHostSession(t)
+		envelope, payload := openURLGate(t)
+		// A lie: the envelope claims a host the payload never named.
+		envelope.Prompt.Origin = "https://evil.example"
+
+		gateID, err := host.OpenHostGate(context.Background(), controller.ActiveLoop().ID(), envelope, payload)
+		if err != nil {
+			t.Fatalf("OpenHostGate: %v", err)
+		}
+		t.Cleanup(func() { _ = host.CloseGate(context.Background(), gateID, gate.CloseAbandoned) })
+
+		published := listGates(t, controller)[0]
+		if published.Prompt.Origin != payload.DisplayOrigin {
+			t.Fatalf("published origin = %q, want the payload's %q", published.Prompt.Origin, payload.DisplayOrigin)
+		}
+	})
+
+	t.Run("schema cannot diverge from the payload", func(t *testing.T) {
+		t.Parallel()
+		controller, host := gateHostSession(t)
+		envelope, payload := formGate(t)
+		// A projection asking for a field the payload will never accept an answer
+		// for: a human would fill it in and have the answer rejected.
+		envelope.Prompt.Schema = gate.PromptSchema{Fields: []gate.Field{
+			{Name: "invented", Kind: gate.FieldText, Required: true},
+		}}
+
+		gateID, err := host.OpenHostGate(context.Background(), controller.ActiveLoop().ID(), envelope, payload)
+		if err != nil {
+			t.Fatalf("OpenHostGate: %v", err)
+		}
+		t.Cleanup(func() { _ = host.CloseGate(context.Background(), gateID, gate.CloseAbandoned) })
+
+		published := listGates(t, controller)[0]
+		if len(published.Prompt.Schema.Fields) != len(payload.Schema.Fields) {
+			t.Fatalf("published schema has %d field(s), want the payload's %d",
+				len(published.Prompt.Schema.Fields), len(payload.Schema.Fields))
+		}
+		for i, field := range published.Prompt.Schema.Fields {
+			if field.Name != payload.Schema.Fields[i].Name {
+				t.Errorf("published field %d = %q, want the payload's %q", i, field.Name, payload.Schema.Fields[i].Name)
+			}
+		}
+	})
+}
+
+// assertNoURL fails if the ephemeral action target appears anywhere in the
+// public envelope's serialized form. It searches the JSON rather than named
+// fields so a future field cannot quietly become a leak.
+func assertNoURL(t *testing.T, published gate.Gate, url string) {
+	t.Helper()
+	encoded, err := json.Marshal(published)
+	if err != nil {
+		t.Fatalf("marshal published gate: %v", err)
+	}
+	if strings.Contains(string(encoded), url) {
+		t.Fatalf("public envelope carries the action URL: %s", encoded)
+	}
+	for _, secret := range []string{"SECRET", "PKCE", "code_challenge", "/login/oauth"} {
+		if strings.Contains(string(encoded), secret) {
+			t.Fatalf("public envelope carries %q from the action URL: %s", secret, encoded)
+		}
+	}
 }
 
 func mustGateError(t *testing.T, err error, want session.GateErrorKind) {

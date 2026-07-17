@@ -227,19 +227,45 @@ func TestDisplayOriginValidatedOnDecode(t *testing.T) {
 func TestValidateGate(t *testing.T) {
 	t.Parallel()
 
+	bare := Prompt{Origin: "https://github.com"}
+
 	tests := []struct {
-		name    string
-		gate    Gate
-		wantErr bool
+		name     string
+		gate     Gate
+		wantErr  bool
+		wantKind GateValidationErrorKind
 	}{
 		{
 			name: "open-url gate not restorable",
-			gate: Gate{Kind: KindOpenURL, Restorable: false},
+			gate: Gate{Kind: KindOpenURL, Restorable: false, Prompt: bare},
 		},
 		{
-			name:    "open-url gate restorable is rejected",
-			gate:    Gate{Kind: KindOpenURL, Restorable: true},
-			wantErr: true,
+			name:     "open-url gate restorable is rejected",
+			gate:     Gate{Kind: KindOpenURL, Restorable: true, Prompt: bare},
+			wantErr:  true,
+			wantKind: GateRestorableNotAllowed,
+		},
+		{
+			// The envelope is all a renderer sees. An open-url gate with no origin
+			// asks a human to authorize an unnamed party.
+			name:     "open-url gate with no origin is rejected",
+			gate:     Gate{Kind: KindOpenURL},
+			wantErr:  true,
+			wantKind: GateOriginInvalid,
+		},
+		{
+			// The exact attack the payload-side check exists to stop, now closed on
+			// the envelope too: an action URL is not an origin.
+			name:     "open-url gate whose origin is an action URL is rejected",
+			gate:     Gate{Kind: KindOpenURL, Prompt: Prompt{Origin: "https://idp.example/authorize?state=SECRET"}},
+			wantErr:  true,
+			wantKind: GateOriginInvalid,
+		},
+		{
+			name:     "open-url gate with a non-http origin is rejected",
+			gate:     Gate{Kind: KindOpenURL, Prompt: Prompt{Origin: "javascript:alert(1)"}},
+			wantErr:  true,
+			wantKind: GateOriginInvalid,
 		},
 		// Every pre-existing kind must validate clean: this hook is additive and
 		// must not retroactively reject envelopes consumers already open.
@@ -248,6 +274,10 @@ func TestValidateGate(t *testing.T) {
 		{name: "ask-user gate not restorable", gate: Gate{Kind: KindAskUser}},
 		{name: "ask-user gate restorable", gate: Gate{Kind: KindAskUser, Restorable: true}},
 		{name: "form gate restorable", gate: Gate{Kind: KindForm, Restorable: true}},
+		// Origin is an open-url concept. This hook is additive and must not start
+		// policing an envelope field on kinds that never carried one.
+		{name: "form gate with an origin", gate: Gate{Kind: KindForm, Prompt: bare}},
+		{name: "permission gate with a junk origin", gate: Gate{Kind: KindPermission, Prompt: Prompt{Origin: "not a url"}}},
 		{name: "zero gate", gate: Gate{}},
 		{name: "unknown kind restorable", gate: Gate{Kind: Kind("whatever"), Restorable: true}},
 	}
@@ -267,8 +297,8 @@ func TestValidateGate(t *testing.T) {
 			if !errors.As(err, &validationErr) {
 				t.Fatalf("ValidateGate() error = %v, want *GateValidationError", err)
 			}
-			if validationErr.Kind != GateRestorableNotAllowed {
-				t.Fatalf("kind = %q, want %q", validationErr.Kind, GateRestorableNotAllowed)
+			if validationErr.Kind != tt.wantKind {
+				t.Fatalf("kind = %q, want %q", validationErr.Kind, tt.wantKind)
 			}
 		})
 	}

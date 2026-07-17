@@ -250,6 +250,10 @@ func (s *Session) PrepareGateOpen(ctx context.Context, loopID uuid.UUID, g gate.
 //     must hold, because an unanswerable or targetless prompt should never reach
 //     a human.
 //
+// It then DERIVES the trusted half of the public projection from the validated
+// payload (projectHostGatePrompt), so the envelope a renderer sees cannot
+// disagree with the payload a response is validated against.
+//
 // The caller MUST either AwaitGateAnswer or CloseGate; both free the slot.
 func (s *Session) OpenHostGate(ctx context.Context, loopID uuid.UUID, g gate.Gate, payload gate.Payload) (gate.ID, error) {
 	if !hostOwnedGate(g) {
@@ -258,6 +262,7 @@ func (s *Session) OpenHostGate(ctx context.Context, loopID uuid.UUID, g gate.Gat
 	if err := validateHostGatePayload(g.Kind, payload); err != nil {
 		return gate.ID{}, &GateError{Kind: GateKindMismatch, Cause: err}
 	}
+	g = projectHostGatePrompt(g, payload)
 
 	id, err := s.PrepareGateOpen(ctx, loopID, g, payload)
 	if err != nil {
@@ -274,6 +279,51 @@ func (s *Session) OpenHostGate(ctx context.Context, loopID uuid.UUID, g gate.Gat
 		return gate.ID{}, err
 	}
 	return id, nil
+}
+
+// projectHostGatePrompt derives the trusted half of a host gate's PUBLIC prompt
+// from its already-validated PRIVATE payload, and returns the corrected gate.
+//
+// The payload is the authoritative record of what was asked; Prompt is the
+// projection of it that a renderer sees. Nothing structural made the two agree:
+// an opener could pass one schema to be answered against and project a
+// different one, or name one origin in the payload and another on the envelope.
+// Rather than CHECK for that divergence and refuse it, this makes it
+// unrepresentable — the projected fields are overwritten from the payload, so
+// there is no value an opener can pass that produces a divergent envelope, and
+// no third state to test for. It is the same move PrepareGateOpen already makes
+// with Gate.ID and Gate.ResponsePolicy: fields the session owns are derived,
+// not accepted.
+//
+// Two fields, for two different reasons:
+//
+//   - Origin (open-url) is a SECURITY projection. It is validated as a bare
+//     origin by ValidateOpenURLPayload above and by gate.ValidateGate below, and
+//     a human's trust decision rests on it. Deriving it means the origin a human
+//     reads is necessarily the origin the opener declared and the journal
+//     recorded — an envelope naming "https://github.com" over a payload naming
+//     an attacker's host cannot be constructed.
+//   - Schema (form) is a UX projection. Divergence there was never a security
+//     hole — ParseFormAnswers validates against the payload, so a bogus
+//     projection costs a REJECTED answer, never an unvalidated one — but a
+//     rejected answer means a human filled in fields that were never going to be
+//     accepted. Deriving retires that bug class at the same seam.
+//
+// Title and Body are deliberately left alone: they are prose for a human, carry
+// no invariant a renderer or validator relies on, and an opener may legitimately
+// word the projection differently from the record.
+func projectHostGatePrompt(g gate.Gate, payload gate.Payload) gate.Gate {
+	switch g.Kind {
+	case gate.KindForm:
+		if form, ok := formPayloadFromGatePayload(payload); ok {
+			g.Prompt.Schema = form.Schema
+		}
+	case gate.KindOpenURL:
+		if openURL, ok := openURLPayloadFromGatePayload(payload); ok {
+			g.Prompt.Origin = openURL.DisplayOrigin
+		}
+	}
+	return g
 }
 
 // validateHostGatePayload reports whether payload is the right shape for kind and

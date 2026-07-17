@@ -18,9 +18,36 @@ const (
 )
 
 // Prompt is the user-facing content and schema for resolving a gate.
+//
+// It is the PUBLIC presentation projection: it travels on the gate envelope
+// (and therefore on event.GateOpened) while the payload stays private to the
+// opener and the session. A renderer sees only this.
+//
+// Every field a renderer must be able to TRUST — rather than treat as arbitrary
+// text an integration supplied — is derived from the private payload by the
+// session at open time (see the GateHost open path), never taken on the
+// caller's word. Origin and Schema are those fields; Title and Body are prose.
 type Prompt struct {
-	Title    string       `json:"title,omitempty"`
-	Body     string       `json:"body,omitempty"`
+	Title string `json:"title,omitempty"`
+	Body  string `json:"body,omitempty"`
+	// Origin is the validated bare origin an open-url gate asks a human to
+	// authorize, e.g. "https://github.com". It is the security-load-bearing part
+	// of such a prompt: it is the thing a human makes the trust decision on, so
+	// a renderer must be able to display it AS a validated origin.
+	//
+	// For a KindOpenURL gate it is REQUIRED and ValidateGate enforces that it is
+	// a bare origin — scheme and host, no path, query, fragment, or userinfo —
+	// with the same check that guards the durable OpenURLPayload.DisplayOrigin.
+	// That is what lets a renderer trust it structurally instead of by
+	// convention: an opener cannot smuggle a full action URL (with its `state`
+	// and PKCE parameters) into the place a human reads as "who am I trusting".
+	//
+	// It is NOT the action target. The ephemeral URL lives only on the private
+	// OpenURLPayload, reaches no durable record and no renderer, and opening it
+	// is the host's job.
+	//
+	// Other kinds leave it empty.
+	Origin   string       `json:"origin,omitempty"`
 	Schema   PromptSchema `json:"schema,omitzero"`
 	Controls []Control    `json:"controls,omitempty"`
 }

@@ -12,17 +12,27 @@ const (
 	// GateRestorableNotAllowed reports a gate marked Restorable whose kind can
 	// never be restored.
 	GateRestorableNotAllowed GateValidationErrorKind = "restorable_not_allowed"
+	// GateOriginInvalid reports a gate whose Prompt.Origin is missing or is not
+	// a bare origin, on a kind that requires one.
+	GateOriginInvalid GateValidationErrorKind = "origin_invalid"
 )
 
 // GateValidationError reports a gate envelope that violates a kind's invariants.
 type GateValidationError struct {
 	Kind     GateValidationErrorKind
 	GateKind Kind
+	Cause    error
 }
 
 func (e *GateValidationError) Error() string {
-	return fmt.Sprintf("gate: invalid %q gate (%s)", string(e.GateKind), string(e.Kind))
+	msg := fmt.Sprintf("gate: invalid %q gate (%s)", string(e.GateKind), string(e.Kind))
+	if e.Cause != nil {
+		return msg + ": " + e.Cause.Error()
+	}
+	return msg
 }
+
+func (e *GateValidationError) Unwrap() error { return e.Cause }
 
 // ValidateGate checks the envelope invariants that a gate's Kind implies. It is
 // called on the open path so an invariant cannot be violated by a caller who
@@ -32,16 +42,29 @@ func (e *GateValidationError) Error() string {
 // is an additive hook, not a retroactive schema check, and it must stay that way
 // unless an existing kind's contract is separately tightened.
 //
-// Today it enforces exactly one rule: an open-url gate may not be Restorable.
-// OpenURLPayload's action target is never journaled, so a "restored" open-url
-// gate would present a human with an origin and no URL to open — it would fail
-// open into a broken prompt. Restore must instead close it as unavailable and
-// let a live integration mint a fresh request.
+// Today it enforces two rules, both on open-url gates:
+//
+//   - It may not be Restorable. OpenURLPayload's action target is never
+//     journaled, so a "restored" open-url gate would present a human with an
+//     origin and no URL to open — it would fail open into a broken prompt.
+//     Restore must instead close it as unavailable and let a live integration
+//     mint a fresh request.
+//   - Prompt.Origin must be a bare origin. The envelope is the only thing a
+//     renderer sees, and the origin is what the human's trust decision is made
+//     on. Validating it HERE — with the same validateDisplayOrigin the durable
+//     payload uses, not a second opinion — is what makes "the envelope's origin
+//     is a real origin" a contract a renderer can rely on structurally, rather
+//     than a convention like an opener stuffing text into Prompt.Body. An
+//     open-url gate with no origin is a prompt that asks a human to authorize
+//     an unnamed party, so it is refused rather than rendered.
 func ValidateGate(g Gate) error {
 	switch g.Kind {
 	case KindOpenURL:
 		if g.Restorable {
 			return &GateValidationError{Kind: GateRestorableNotAllowed, GateKind: g.Kind}
+		}
+		if err := validateDisplayOrigin(g.Prompt.Origin); err != nil {
+			return &GateValidationError{Kind: GateOriginInvalid, GateKind: g.Kind, Cause: err}
 		}
 		return nil
 	default:
