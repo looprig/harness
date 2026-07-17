@@ -26,10 +26,18 @@ v1.6.1 (**approved by user 2026-07-16 for the mcp module only** — record in
 degrades to fingerprint-level identity).
 
 **Repos touched:** `looprig/mcp` (new git repo), `looprig/harness`
-(Phase 6, 9), `looprig/tui` (Phase 8). Commit per task in the repo the task
-touches. No `Co-Authored-By` trailers. Run `make fmt && make secure` and
+(Phase 6, 9), `looprig/tui` (Phase 8), `looprig/tests` (cross-module
+integration). Commit per task in the repo the task touches. No
+`Co-Authored-By` trailers. Run `make fmt && make secure` and
 `go test -race ./...` before every commit; integration tests are tagged
 `integration` and run with `go test -tags integration -race ./...`.
+
+**Cross-module integration tests live in `looprig/tests`**, not in `mcp`.
+That module already requires harness/core/inference/storage/fsstore with local
+replaces and owns the rig/session fixtures (`defineSessionRig`, `openFSStores`).
+Any test needing a real in-process Session belongs there — it keeps `mcp`'s
+dependency graph to the go-sdk plus the modules its adapter genuinely imports,
+and stops `mcp` vendoring harness internals.
 
 **Executor ground rules:**
 - TDD every task: failing test → minimal code → pass → commit.
@@ -647,7 +655,11 @@ Commit `feat(harness-adapter): elicitation and event bridging`.
 
 ### Task 7.6: Adapter integration suite
 
-**Files:** Create `pkg/harness/integration_test.go` (tagged).
+**Files:** Create `mcp_adapter_test.go` in the **`looprig/tests`** module
+(tagged `integration`, `package tests`) — NOT in `mcp`. A real in-process
+rig/session needs `storage`/`fsstore`, which `tests` already requires and
+`mcp` must not. Reuse that module's existing fixtures rather than forking
+rig/session setup.
 
 Cover the design §Harness integration tests list end-to-end with fixture
 servers + a real in-process rig/session: mixed scopes, selectors, delegate
@@ -655,7 +667,11 @@ non-inheritance, required/optional startup, permission gate flow, form + URL
 elicitation, mid-turn snapshot retention, idle adoption, removed/changed tool
 structured results, refresh failure retention, one-binding reconnect
 isolation, session+loop shutdown cleanup. Commit
-`test(harness-adapter): integration suite`.
+`test: cover the mcp harness adapter`.
+
+Driving this against a real rig — rather than scripted fakes — is what
+surfaced the `LoopIdle` agent-name defect, the restore-bindings gap, and the
+unreachable URL elicitation. Keep it real.
 
 **PHASE CHECKPOINT** in mcp repo.
 

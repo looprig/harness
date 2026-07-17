@@ -748,6 +748,19 @@ While an elicitation is pending:
 - the full action URL and query parameters are not written to journals or
   ordinary events.
 
+Form answers ARE recorded durably and unredacted. They are user-authored
+content, and Harness already journals such content verbatim
+(`command.UserInput` carries raw blocks); redacting only form answers would
+make the journal an incomplete record of a session it is meant to be the truth
+of. Answers remain bounded — a server authors the schema, so it must not be
+able to append an unbounded record — and the schema-level rejection of
+credential-soliciting fields is therefore the load-bearing control keeping
+secrets out of the journal.
+
+The open-url action target remains excluded. It is not user content: it carries
+the PKCE verifier, `state`, and sometimes a token. The durable display origin
+and the resolved action already record what the human did.
+
 Pending elicitation is tied to a live connection. Restore does not attempt to
 resume a stale server request from journal data; the old gate is resolved as
 unavailable, and a reconnected server may issue a new request.
