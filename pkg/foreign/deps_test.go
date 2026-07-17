@@ -41,7 +41,7 @@ func forbiddenForeignloopDependencies(r io.Reader) ([]string, error) {
 	return forbidden, nil
 }
 
-func foreignImportViolation(importPath string) string {
+func foreignImportViolation(importPath string, standardLibrary map[string]struct{}) string {
 	switch {
 	case isForbiddenForeignloopDependency(importPath):
 		return "imports extracted foreignloop module"
@@ -49,8 +49,11 @@ func foreignImportViolation(importPath string) string {
 		return "imports Harness internal package"
 	case importPath == oldForeignloopPackage || strings.HasPrefix(importPath, oldForeignloopPackage+"/"):
 		return "imports old concrete foreignloop package"
-	case !strings.Contains(strings.Split(importPath, "/")[0], "."):
+	}
+	if _, ok := standardLibrary[importPath]; ok {
 		return ""
+	}
+	switch {
 	case importPath == "github.com/looprig/core" || strings.HasPrefix(importPath, "github.com/looprig/core/"):
 		return ""
 	case strings.HasPrefix(importPath, "github.com/looprig/harness/pkg/"):
@@ -75,7 +78,31 @@ func harnessDependencyViolations(root, goBinary string) ([]string, error) {
 	return violations, nil
 }
 
-func foreignPackageImportViolations(dir string) ([]string, error) {
+func standardLibraryPackages(root, goBinary string) (map[string]struct{}, error) {
+	cmd := exec.Command(goBinary, "list", "-f={{.ImportPath}}", "std")
+	cmd.Dir = root
+	cmd.Env = append(os.Environ(), "GOWORK=off")
+	out, err := cmd.Output()
+	if err != nil {
+		message := ""
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			message = strings.TrimSpace(string(exitErr.Stderr))
+		}
+		return nil, fmt.Errorf("go list standard library packages: %w\n%s", err, message)
+	}
+	packages := make(map[string]struct{})
+	for _, line := range strings.Split(string(out), "\n") {
+		if importPath := strings.TrimSpace(line); importPath != "" {
+			packages[importPath] = struct{}{}
+		}
+	}
+	if len(packages) == 0 {
+		return nil, fmt.Errorf("go list standard library packages: empty result")
+	}
+	return packages, nil
+}
+
+func foreignPackageImportViolations(dir string, standardLibrary map[string]struct{}) ([]string, error) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return nil, fmt.Errorf("read pkg/foreign: %w", err)
@@ -95,7 +122,7 @@ func foreignPackageImportViolations(dir string) ([]string, error) {
 			if err != nil {
 				return nil, fmt.Errorf("parse %s import path %s: %w", entry.Name(), spec.Path.Value, err)
 			}
-			if reason := foreignImportViolation(importPath); reason != "" {
+			if reason := foreignImportViolation(importPath, standardLibrary); reason != "" {
 				violations = append(violations, fmt.Sprintf("%s imports %q: %s", entry.Name(), importPath, reason))
 			}
 		}
@@ -153,12 +180,22 @@ func TestForbiddenForeignloopDependencyClassifierAndParser(t *testing.T) {
 }
 
 func TestForeignPackageImportClassifier(t *testing.T) {
+	standardLibrary := map[string]struct{}{
+		"context":  {},
+		"net/http": {},
+	}
 	tests := []struct {
 		name       string
 		importPath string
 		want       string
 	}{
-		{name: "standard library", importPath: "context"},
+		{name: "standard library root", importPath: "context"},
+		{name: "standard library child", importPath: "net/http"},
+		{
+			name:       "dotless non-standard package",
+			importPath: "corp/private",
+			want:       "is outside pkg/foreign import allowlist",
+		},
 		{name: "core public package", importPath: "github.com/looprig/core/uuid"},
 		{name: "Harness public package", importPath: "github.com/looprig/harness/pkg/event"},
 		{
@@ -184,7 +221,7 @@ func TestForeignPackageImportClassifier(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := foreignImportViolation(tt.importPath); got != tt.want {
+			if got := foreignImportViolation(tt.importPath, standardLibrary); got != tt.want {
 				t.Fatalf("foreignImportViolation(%q) = %q, want %q", tt.importPath, got, tt.want)
 			}
 		})
@@ -206,8 +243,17 @@ func TestHarnessDependencyDirection(t *testing.T) {
 }
 
 func TestForeignPackageImportBoundary(t *testing.T) {
-	dir := filepath.Join(foreignTestModuleRoot(t), "pkg", "foreign")
-	violations, err := foreignPackageImportViolations(dir)
+	goBinary, err := exec.LookPath("go")
+	if err != nil {
+		t.Skip("go toolchain is unavailable")
+	}
+	root := foreignTestModuleRoot(t)
+	standardLibrary, err := standardLibraryPackages(root, goBinary)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(root, "pkg", "foreign")
+	violations, err := foreignPackageImportViolations(dir, standardLibrary)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -228,7 +274,7 @@ func TestForeignPackageImportBoundaryIncludesProductionAndTestFiles(t *testing.T
 		}
 	}
 
-	got, err := foreignPackageImportViolations(dir)
+	got, err := foreignPackageImportViolations(dir, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
