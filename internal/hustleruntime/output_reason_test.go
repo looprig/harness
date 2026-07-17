@@ -164,3 +164,75 @@ func TestExtractStructuredResultUsesNativeTextOnly(t *testing.T) {
 		})
 	}
 }
+
+func TestExtractStructuredResultEnforcesRawSemanticOutputLimit(t *testing.T) {
+	t.Parallel()
+	text := func(value string) content.Block { return &content.TextBlock{Text: value} }
+	thinking := func(value string) content.Block { return &content.ThinkingBlock{Thinking: value} }
+	terminal := func() content.Block {
+		return &content.ToolUseBlock{Name: inference.StructuredOutputToolName, Input: json.RawMessage(`{"summary":"ok"}`)}
+	}
+	response := func(finish stream.FinishReason, blocks ...content.Block) *inference.Response {
+		return &inference.Response{Message: &content.AIMessage{Message: content.Message{Role: content.RoleAssistant, Blocks: blocks}}, FinishReason: finish}
+	}
+	compact := `{"summary":"ok"}`
+	padded := "   " + compact + "   "
+	first := `   {"summary":`
+	second := `"ok"}   `
+	tests := []struct {
+		name          string
+		response      *inference.Response
+		limit         int
+		want          string
+		wantReason    OutputFailureReason
+		wantFinish    stream.FinishReason
+		wantMalformed bool
+	}{
+		{name: "padding exceeds raw limit", response: response(stream.FinishReasonStop, text(padded)), limit: len(compact), wantReason: OutputFailureTooLarge},
+		{name: "fragment sum exceeds raw limit", response: response(stream.FinishReasonUnknown, text(first), text(second)), limit: len(first) + len(second) - 1, wantReason: OutputFailureTooLarge},
+		{name: "exact raw boundary", response: response(stream.FinishReasonStop, text(padded)), limit: len(padded), want: compact},
+		{name: "thinking excluded from budget", response: response(stream.FinishReasonStop, thinking(strings.Repeat("private", 128)), text(compact)), limit: len(compact), want: compact},
+		{name: "length precedes oversized", response: response(stream.FinishReasonLength, text(padded)), limit: len(compact), wantFinish: stream.FinishReasonLength},
+		{name: "content filter precedes oversized", response: response(stream.FinishReasonContentFilter, text(padded)), limit: len(compact), wantFinish: stream.FinishReasonContentFilter},
+		{name: "tool use precedes oversized", response: response(stream.FinishReasonToolUse, text(padded)), limit: len(compact), wantFinish: stream.FinishReasonToolUse},
+		{name: "future reason precedes oversized", response: response(stream.FinishReason("future"), text(padded)), limit: len(compact), wantFinish: inference.StructuredOutputFinishReasonOther},
+		{name: "malformed JSON precedes oversized", response: response(stream.FinishReasonStop, text(strings.Repeat("not-json", 16))), limit: 1, wantMalformed: true},
+		{name: "ambiguous representation precedes oversized", response: response(stream.FinishReasonUnknown, text(padded), terminal()), limit: 1, wantMalformed: true},
+		{name: "zero limit fails closed", response: response(stream.FinishReasonStop, text(compact)), limit: 0, wantReason: OutputFailureTooLarge},
+		{name: "negative limit fails closed", response: response(stream.FinishReasonStop, text(compact)), limit: -1, wantReason: OutputFailureTooLarge},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			result, err := extractStructuredResult(tt.response, nil, tt.limit)
+			if tt.want != "" {
+				if err != nil || string(result.Output) != tt.want {
+					t.Fatalf("extractStructuredResult() = %s,%v, want %s,nil", result.Output, err, tt.want)
+				}
+				return
+			}
+			var outputErr *OutputError
+			if !errors.As(err, &outputErr) || !outputErr.Valid() {
+				t.Fatalf("error = %T %v, want valid OutputError", err, err)
+			}
+			if tt.wantReason != "" && outputErr.Reason != tt.wantReason {
+				t.Fatalf("reason = %q, want %q", outputErr.Reason, tt.wantReason)
+			}
+			if tt.wantFinish != "" {
+				var finishErr *inference.StructuredOutputFinishError
+				if !errors.As(err, &finishErr) || finishErr.Reason != tt.wantFinish {
+					t.Fatalf("error = %T %v, want finish %q", err, err, tt.wantFinish)
+				}
+			}
+			if tt.wantMalformed {
+				var malformedErr *inference.MalformedStructuredOutputError
+				if !errors.As(err, &malformedErr) {
+					t.Fatalf("error = %T %v, want MalformedStructuredOutputError", err, err)
+				}
+			}
+			if strings.Contains(err.Error(), compact) {
+				t.Fatalf("error leaked raw output: %v", err)
+			}
+		})
+	}
+}

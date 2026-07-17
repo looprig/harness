@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"math"
 	"reflect"
 	"time"
 
@@ -358,38 +359,82 @@ func extractResult(response *inference.Response, usage *content.Usage, outputLim
 }
 
 func extractStructuredResult(response *inference.Response, usage *content.Usage, outputLimit int) (hustle.Result, error) {
-	if response != nil && response.FinishReason == stream.FinishReasonToolUse {
-		return hustle.Result{}, &OutputError{Cause: &inference.StructuredOutputFinishError{Reason: stream.FinishReasonToolUse}}
+	if err := nativeStructuredFinishError(response); err != nil {
+		return hustle.Result{}, &OutputError{Cause: err}
 	}
 	output, err := inference.StructuredResult(response)
 	if err != nil {
 		return hustle.Result{}, &OutputError{Cause: err}
 	}
-	if !nativeStructuredText(response.Message) {
+	rawBytes, nativeText, overflow := nativeStructuredTextSize(response)
+	if !nativeText {
 		return hustle.Result{}, &OutputError{Reason: OutputFailureInvalidShape}
 	}
-	if len(output) > outputLimit {
+	if overflow || rawBytes > outputLimit {
 		return hustle.Result{}, &OutputError{Reason: OutputFailureTooLarge}
 	}
 	return hustle.Result{Output: output, Usage: usage}, nil
 }
 
-func nativeStructuredText(message *content.AIMessage) bool {
+func nativeStructuredFinishError(response *inference.Response) error {
+	if response == nil {
+		return nil
+	}
+	switch response.FinishReason {
+	case stream.FinishReasonLength, stream.FinishReasonContentFilter, stream.FinishReasonToolUse:
+		return &inference.StructuredOutputFinishError{Reason: response.FinishReason}
+	case stream.FinishReasonStop:
+		if containsNonNilToolUse(response.Message) {
+			return &inference.StructuredOutputFinishError{Reason: stream.FinishReasonStop}
+		}
+	case stream.FinishReasonUnknown:
+	default:
+		return &inference.StructuredOutputFinishError{Reason: inference.StructuredOutputFinishReasonOther}
+	}
+	return nil
+}
+
+func containsNonNilToolUse(message *content.AIMessage) bool {
 	if message == nil {
 		return false
 	}
-	text := false
 	for _, block := range message.Blocks {
-		switch typed := block.(type) {
-		case *content.TextBlock:
-			if typed != nil {
-				text = true
-			}
-		case *content.ToolUseBlock:
-			return false
+		if tool, ok := block.(*content.ToolUseBlock); ok && tool != nil {
+			return true
 		}
 	}
-	return text
+	return false
+}
+
+func nativeStructuredTextSize(response *inference.Response) (int, bool, bool) {
+	if response == nil || response.Message == nil || response.Message.Role != content.RoleAssistant {
+		return 0, false, false
+	}
+	textSeen := false
+	total := 0
+	for _, block := range response.Message.Blocks {
+		switch typed := block.(type) {
+		case *content.TextBlock:
+			if typed == nil {
+				return 0, false, false
+			}
+			textSeen = true
+			fragmentLength := len(typed.Text)
+			if fragmentLength > math.MaxInt-total {
+				return 0, true, true
+			}
+			total += fragmentLength
+		case *content.ThinkingBlock:
+			if typed == nil {
+				return 0, false, false
+			}
+		case *content.ToolUseBlock:
+			return 0, false, false
+		default:
+			return 0, false, false
+		}
+	}
+	return total, textSeen, false
 }
 
 func responseUsage(response *inference.Response) (*content.Usage, error) {

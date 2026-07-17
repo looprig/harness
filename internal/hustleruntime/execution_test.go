@@ -347,6 +347,34 @@ func TestRunAndFinalizeDoesNotRepairStructuredDomainFailure(t *testing.T) {
 	}
 }
 
+func TestRunAndFinalizeDoesNotRetryOversizedRawStructuredOutput(t *testing.T) {
+	t.Parallel()
+	compact := `{"summary":"ok"}`
+	client := &runtimeTestClient{invoke: func(context.Context, inference.Request) (*inference.Response, error) {
+		return &inference.Response{
+			Message: &content.AIMessage{Message: content.Message{Role: content.RoleAssistant, Blocks: []content.Block{
+				&content.TextBlock{Text: "   " + compact + "   "},
+			}}},
+			FinishReason: stream.FinishReasonStop,
+		}, nil
+	}}
+	definition := runtimeTestStructuredDefinition(t, "test.raw-structured-limit", client, runtimeStructuredTestModel(), runtimeTestOutputSchema(), len(compact))
+	controller := runtimeTestController(t, definition, &runtimeTestAudit{}, &runtimeTestFaults{}, &runtimeTestActivity{})
+	var validations atomic.Int32
+	err := controller.RunAndFinalize(context.Background(), runtimeRequest(t, definition.Name()), func(context.Context, hustle.Result) error {
+		validations.Add(1)
+		return nil
+	}, noOpFinalizer)
+	var runErr *RunError
+	var outputErr *OutputError
+	if !errors.As(err, &runErr) || runErr.Stage != hustle.StageOutput || !errors.As(err, &outputErr) || outputErr.Reason != OutputFailureTooLarge {
+		t.Fatalf("error = %T %v, want StageOutput too_large", err, err)
+	}
+	if client.invocations.Load() != 1 || validations.Load() != 0 {
+		t.Fatalf("calls = invoke:%d validate:%d, want 1,0 without retry", client.invocations.Load(), validations.Load())
+	}
+}
+
 func runtimeTestController(t *testing.T, definition hustle.BoundDefinition, audit *runtimeTestAudit, faults *runtimeTestFaults, activity ActivityTracker) *Controller {
 	t.Helper()
 	factory := event.NewFactory(uuid.New, func() time.Time { return time.Unix(123, 0).UTC() })

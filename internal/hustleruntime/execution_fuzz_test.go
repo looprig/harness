@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"math"
 	"testing"
 	"time"
 
@@ -91,7 +92,10 @@ func FuzzProviderOutputBoundary(f *testing.F) {
 		{shape: 3, role: string(content.RoleAssistant)},
 		{shape: 4, role: string(content.RoleAssistant)},
 		{shape: 5, role: string(content.RoleAssistant)},
+		{shape: 5, role: string(content.RoleAssistant), output: []byte(`{"ok":true}`), limit: 10},
+		{shape: 5, role: string(content.RoleAssistant), output: []byte(`{"ok":true}`), limit: 11},
 		{shape: 6, role: string(content.RoleAssistant), output: []byte(`{"ok":true}`), limit: 11, outputTokens: 2, reasoningTokens: 1},
+		{shape: 6, role: string(content.RoleAssistant), output: []byte(`     {}     `), limit: 2},
 		{shape: 6, role: string(content.RoleAssistant), output: []byte(`{} {}`), limit: 64},
 		{shape: 7, role: string(content.RoleAssistant), output: []byte(`{}`), limit: 64},
 		{shape: 8, role: string(content.RoleAssistant)},
@@ -130,7 +134,7 @@ func FuzzProviderOutputBoundary(f *testing.F) {
 			if !errors.As(structuredErr, &outputErr) || !outputErr.Valid() {
 				t.Fatalf("extractStructuredResult error = %T %v, want valid OutputError", structuredErr, structuredErr)
 			}
-		} else if len(structured.Output) == 0 || len(structured.Output) > int(limit) || !json.Valid(structured.Output) || structured.Output[0] != '{' {
+		} else if rawLength, valid := runtimeFuzzSemanticTextLength(response.Message); !valid || rawLength > int(limit) || len(structured.Output) == 0 || !json.Valid(structured.Output) || structured.Output[0] != '{' {
 			t.Fatalf("accepted structured output = %q limit=%d, want one bounded JSON object", structured.Output, limit)
 		}
 	})
@@ -177,7 +181,8 @@ func runtimeFuzzResponse(shape uint8, role content.Role, output string, outputTo
 		var block *content.TextBlock
 		message.Blocks = []content.Block{block}
 	case 5:
-		message.Blocks = []content.Block{&content.TextBlock{Text: output}, &content.TextBlock{Text: output}}
+		middle := len(output) / 2
+		message.Blocks = []content.Block{&content.TextBlock{Text: output[:middle]}, &content.TextBlock{Text: output[middle:]}}
 	case 6:
 		message.Blocks = []content.Block{&content.TextBlock{Text: output}}
 	case 7:
@@ -206,6 +211,31 @@ func runtimeFuzzResponse(shape uint8, role content.Role, output string, outputTo
 		message.Blocks = []content.Block{block}
 	}
 	return response
+}
+
+func runtimeFuzzSemanticTextLength(message *content.AIMessage) (int, bool) {
+	if message == nil || message.Role != content.RoleAssistant {
+		return 0, false
+	}
+	total := 0
+	textSeen := false
+	for _, block := range message.Blocks {
+		switch typed := block.(type) {
+		case *content.TextBlock:
+			if typed == nil || len(typed.Text) > math.MaxInt-total {
+				return 0, false
+			}
+			total += len(typed.Text)
+			textSeen = true
+		case *content.ThinkingBlock:
+			if typed == nil {
+				return 0, false
+			}
+		default:
+			return 0, false
+		}
+	}
+	return total, textSeen
 }
 
 func runtimeFuzzFinish(shape uint8) stream.FinishReason {
