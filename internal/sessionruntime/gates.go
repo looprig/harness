@@ -88,6 +88,43 @@ func (nopGateAppender) AppendGateResolved(context.Context, event.GateResolved) e
 	return nil
 }
 
+// hostOwnedGate reports whether a gate's answer belongs to the HOST that opened
+// it rather than to a loop.
+//
+// This is the distinction that decides how an answer is delivered.
+// translateGateResponse turns a permission or ask-user answer into a
+// command.Command addressed to entry.route.LoopID, because those gates park a
+// loop's turn and resuming it IS the answer. A form or open-url gate raised by an
+// integration (an MCP server's elicitation) parks no turn: the caller waiting on
+// it is the host's own blocked OpenGate call, which no loop command can reach.
+//
+// Both conditions are required, and the resolver is not redundant with the kind:
+//
+//   - The KIND must be one whose answer this session can validate against a
+//     schema and hand back as gate.Values. Only form and open-url qualify.
+//   - The RESOLVER must be gate.ResolverSession. ResolverSession has existed on
+//     the envelope since the gate contract was written and no production code
+//     ever produced one — it is the declared, unused name for exactly this case,
+//     so this fills a vacant seam rather than inventing one.
+//
+// A form gate marked ResolverLoop is therefore NOT host-owned and is refused at
+// answer time (GateKindMismatch) rather than silently delivered somewhere. There
+// is no loop-side form resolver to route it to, so accepting it would mean
+// dropping a human's answer on the floor.
+func hostOwnedGate(g gate.Gate) bool {
+	if g.Resolver != gate.ResolverSession {
+		return false
+	}
+	switch g.Kind {
+	case gate.KindForm, gate.KindOpenURL:
+		return true
+	case gate.KindPermission, gate.KindAskUser:
+		return false
+	default:
+		return false
+	}
+}
+
 // GateCaps bounds the live gate directory. The cap counts preparing + open +
 // claiming so failed activations cannot accumulate invisible prepared entries.
 // Zero means no cap.
@@ -166,7 +203,111 @@ func (s *Session) PrepareGateOpen(ctx context.Context, loopID uuid.UUID, g gate.
 	}
 
 	s.gates[gateID] = gateEntry{gate: g, payload: payload, coordinates: coords, state: gatePreparing}
+	// The answer slot is installed at PREPARE time, before the gate is public and
+	// therefore before anything can answer it. That ordering is what makes
+	// AwaitGateAnswer race-free: the opener learns its GateID here, calls
+	// ActivateGate, and only then blocks — by which point the slot that a
+	// concurrent RespondGate would write to already exists.
+	if hostOwnedGate(g) {
+		if s.gateAnswers == nil {
+			s.gateAnswers = make(map[gate.ID]chan gate.Answer)
+		}
+		s.gateAnswers[gateID] = make(chan gate.Answer, 1)
+	}
 	return gateID, nil
+}
+
+// AwaitGateAnswer blocks until a HOST-OWNED gate is answered and returns the
+// validated answer, including the form values that are deliberately absent from
+// every durable record.
+//
+// It is the host's half of the loop's command dispatch: the opener of a form or
+// open-url gate calls PrepareGateOpen, ActivateGate, then this. It returns a
+// typed *GateError{GateNotFound} for a gate that is not host-owned, was never
+// prepared, or whose answer was already taken — an answer is delivered exactly
+// once.
+//
+// The opener MUST either await or CloseGate, which is the same obligation
+// ActivateGate already places on it. Both paths free the slot.
+//
+// A ctx cancellation abandons the wait and frees the slot; it does NOT close the
+// gate, because the gate is durable state and ctx is the caller's. An opener that
+// gives up should CloseGate.
+func (s *Session) AwaitGateAnswer(ctx context.Context, id gate.ID) (gate.Answer, error) {
+	s.gatesMu.Lock()
+	slot, ok := s.gateAnswers[id]
+	s.gatesMu.Unlock()
+	if !ok {
+		return gate.Answer{}, &GateError{GateID: id, Kind: GateNotFound}
+	}
+
+	select {
+	case answer, ok := <-slot:
+		s.releaseGateAnswerSlot(id)
+		if !ok {
+			// CloseGate closed the slot: the gate was abandoned or withdrawn and
+			// will never be answered. Report it as gone rather than returning a
+			// zero Answer an opener could mistake for a real one.
+			return gate.Answer{}, &GateError{GateID: id, Kind: GateNotFound}
+		}
+		return answer, nil
+	case <-ctx.Done():
+		s.releaseGateAnswerSlot(id)
+		return gate.Answer{}, ctx.Err()
+	}
+}
+
+// releaseGateAnswerSlot drops a host-owned gate's delivery slot once its opener
+// is done with it. It does NOT close the channel — the opener is the reader, and
+// only CloseGate (which knows no answer is coming) closes. It is idempotent.
+func (s *Session) releaseGateAnswerSlot(id gate.ID) {
+	s.gatesMu.Lock()
+	defer s.gatesMu.Unlock()
+	delete(s.gateAnswers, id)
+}
+
+// closeGateAnswerSlotLocked closes and drops a host-owned gate's delivery slot,
+// waking an opener blocked in AwaitGateAnswer with GateNotFound.
+//
+// Closing is safe against a concurrent send for two independent reasons, and the
+// second is what this relies on. First, CloseGate and RespondGate can never both
+// act on one gate: both claim the entry by flipping it to gateClaiming under
+// gatesMu, and the loser returns GateNotReady. Second — and this is the guarantee
+// that does not depend on that protocol — deliverGateAnswer performs its send
+// while holding gatesMu, so once this has deleted the slot no sender can still
+// find it. The caller MUST hold gatesMu.
+func (s *Session) closeGateAnswerSlotLocked(id gate.ID) {
+	slot, ok := s.gateAnswers[id]
+	if !ok {
+		return
+	}
+	close(slot)
+	delete(s.gateAnswers, id)
+}
+
+// deliverGateAnswer hands a host-owned gate's answer to its opener.
+//
+// The send holds gatesMu, which is what makes closing a slot safe: a closer
+// (CloseGate or shutdown) removes the slot from the map under the same lock, so
+// this either finds it and sends, or does not find it and does nothing. There is
+// no interleaving in which it sends on a closed channel.
+//
+// Holding the lock across a channel send is safe here only because the send
+// cannot block: the slot is buffered with capacity one and written at most once
+// (RespondGate removes the directory entry before delivering, so no second
+// response can reach the same gate). The select/default is belt-and-braces — an
+// opener that has already given up costs a discarded value, not a stuck session.
+func (s *Session) deliverGateAnswer(id gate.ID, answer gate.Answer) {
+	s.gatesMu.Lock()
+	defer s.gatesMu.Unlock()
+	slot, ok := s.gateAnswers[id]
+	if !ok {
+		return
+	}
+	select {
+	case slot <- answer:
+	default:
+	}
 }
 
 // ActivateGate is called by the owner after its local blocker/continuation exists.
@@ -231,6 +372,7 @@ func (s *Session) CloseGate(ctx context.Context, id gate.ID, reason gate.CloseRe
 	case gatePreparing:
 		s.stopGateTimerLocked(id)
 		delete(s.gates, id)
+		s.closeGateAnswerSlotLocked(id)
 		s.gatesMu.Unlock()
 		return nil
 	case gateOpen:
@@ -258,6 +400,9 @@ func (s *Session) CloseGate(ctx context.Context, id gate.ID, reason gate.CloseRe
 	s.gatesMu.Lock()
 	s.stopGateTimerLocked(id)
 	delete(s.gates, id)
+	// An owner-closed gate is never answered, so its opener must not keep waiting
+	// on a slot nothing will ever write to.
+	s.closeGateAnswerSlotLocked(id)
 	s.gatesMu.Unlock()
 	return nil
 }
@@ -417,6 +562,12 @@ func (s *Session) RespondGate(ctx context.Context, response gate.GateResponse) e
 	delete(s.gates, response.GateID)
 	s.gatesMu.Unlock()
 
+	// Delivery happens after the durable commit and after the entry is gone, so a
+	// host-owned answer and a loop command are both unrepeatable.
+	if translated.answer != nil {
+		s.deliverGateAnswer(response.GateID, *translated.answer)
+		return nil
+	}
 	_ = s.dispatchGateCommand(entry, translated.cmd)
 	return nil
 }
@@ -493,8 +644,17 @@ func (s *Session) dispatchGateCommand(entry gateEntry, cmd command.Command) erro
 	return s.routeGate(s.sessionCtx, entry.route.LoopID, l, cmd)
 }
 
+// translatedGateResponse is the validated result of a response: what to deliver,
+// and what to durably record.
+//
+// Exactly one of cmd and answer is set. A loop-owned gate yields a cmd addressed
+// to the owning loop; a host-owned gate (hostOwnedGate) yields an answer for the
+// opener blocked in AwaitGateAnswer. The two are separate fields rather than one
+// interface because they are delivered through different seams and only the cmd
+// has a loop to fail to find.
 type translatedGateResponse struct {
 	cmd           command.Command
+	answer        *gate.Answer
 	audit         gate.ResponseAudit
 	approvalScope *tool.ApprovalScope
 }
@@ -519,8 +679,108 @@ func (s *Session) translateGateResponse(entry gateEntry, response gate.GateRespo
 		return s.translatePermissionResponse(hdr, route, entry.payload, response)
 	case gate.KindAskUser:
 		return s.translateAskUserResponse(hdr, route, response)
+	case gate.KindForm, gate.KindOpenURL:
+		// Both kinds are answerable only as host-owned gates. A form or open-url
+		// gate declaring ResolverLoop has no loop-side resolver to route to, so it
+		// is refused here rather than answered into a void.
+		if !hostOwnedGate(entry.gate) {
+			return translatedGateResponse{}, &GateError{GateID: response.GateID, Kind: GateKindMismatch}
+		}
+		if entry.gate.Kind == gate.KindForm {
+			return translateFormResponse(entry.payload, response)
+		}
+		return translateOpenURLResponse(response)
 	default:
 		return translatedGateResponse{}, &GateError{GateID: response.GateID, Kind: GateKindMismatch}
+	}
+}
+
+// translateFormResponse validates a form gate's response against the schema in
+// its PAYLOAD — the authoritative record of what was asked — and builds the live
+// answer plus the redacted durable audit.
+//
+// Accept is the only action that carries values. Decline and cancel are explicit
+// non-answers: they record that a human refused or that the request was
+// withdrawn, and any values submitted alongside them are ignored rather than
+// validated, because there is no answer to validate. Both actions must still
+// appear in the gate's Prompt.Controls (validateGateAction has already checked
+// that), so an integration cannot be declined against its will by a control it
+// never offered.
+func translateFormResponse(payload gate.Payload, response gate.GateResponse) (translatedGateResponse, error) {
+	formPayload, ok := formPayloadFromGatePayload(payload)
+	if !ok {
+		return translatedGateResponse{}, &GateError{GateID: response.GateID, Kind: GateKindMismatch}
+	}
+
+	switch response.Action {
+	case gate.FormActionAccept:
+		// ParseFormAnswers re-validates the schema before reading any value, so
+		// bounds, field kinds (FieldMultiSelect is refused), required fields,
+		// unknown fields, over-long values, and select options are all enforced
+		// here and not trusted from the opener.
+		answers, err := gate.ParseFormAnswers(formPayload.Schema, response.Values)
+		if err != nil {
+			return translatedGateResponse{}, &GateError{GateID: response.GateID, Kind: GateActionInvalid, Cause: err}
+		}
+		return translatedGateResponse{
+			answer: &gate.Answer{
+				GateID: response.GateID,
+				Action: response.Action,
+				Values: answers,
+				Source: response.Source,
+			},
+			audit: gate.NewFormAudit(formPayload.Schema, answers),
+		}, nil
+	case gate.FormActionDecline, gate.FormActionCancel:
+		return translatedGateResponse{
+			answer: &gate.Answer{
+				GateID: response.GateID,
+				Action: response.Action,
+				Source: response.Source,
+			},
+		}, nil
+	default:
+		return translatedGateResponse{}, &GateError{GateID: response.GateID, Kind: GateActionInvalid}
+	}
+}
+
+// translateOpenURLResponse builds the live answer for an open-url gate.
+//
+// It carries NO audit, and that is a deliberate omission rather than a gap. An
+// open-url answer has nothing to redact and nothing to add: the human either
+// reported completion or did not, which GateResolved.Action already records in
+// the clear, and the only other fact about the request — its DisplayOrigin — is
+// already durable in the payload. The URL itself must never reach a durable
+// record (gate.OpenURLPayload), and a decoded payload does not even have one. An
+// audit member here would be an empty struct whose only effect would be to add a
+// codec arm that could later be widened to hold the very thing that must not be
+// stored. A nil audit is the same choice permission "deny" already makes.
+func translateOpenURLResponse(response gate.GateResponse) (translatedGateResponse, error) {
+	switch response.Action {
+	case gate.FormActionAccept, gate.FormActionDecline, gate.FormActionCancel:
+		return translatedGateResponse{
+			answer: &gate.Answer{
+				GateID: response.GateID,
+				Action: response.Action,
+				Source: response.Source,
+			},
+		}, nil
+	default:
+		return translatedGateResponse{}, &GateError{GateID: response.GateID, Kind: GateActionInvalid}
+	}
+}
+
+func formPayloadFromGatePayload(payload gate.Payload) (gate.FormPayload, bool) {
+	switch v := payload.(type) {
+	case gate.FormPayload:
+		return v, true
+	case *gate.FormPayload:
+		if v == nil {
+			return gate.FormPayload{}, false
+		}
+		return *v, true
+	default:
+		return gate.FormPayload{}, false
 	}
 }
 

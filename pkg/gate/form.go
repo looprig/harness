@@ -3,6 +3,7 @@ package gate
 import (
 	"encoding/json"
 	"fmt"
+	"sort"
 )
 
 // Form gate response actions. They are the Control.Action / ResponseRequest.Action
@@ -237,6 +238,41 @@ func parseFormFieldAnswer(field Field, raw json.RawMessage) (string, error) {
 		return "", &FormAnswerError{Kind: FormAnswerOptionNotAllowed, Field: field.Name}
 	}
 	return value, nil
+}
+
+// NewFormAudit builds the durable, redacted audit for answers that already
+// satisfied ParseFormAnswers against schema.
+//
+// It is the single place the redaction rule of FormAudit is applied, so a caller
+// cannot journal a form answer without going through it. Every answered field
+// contributes its NAME; only FieldSelect and FieldConfirm additionally
+// contribute their VALUE, because only those values are drawn from a closed set
+// the schema already made durable. A FieldText value is dropped here — see
+// FormAudit for why that is a fail-closed choice rather than a lossy one.
+//
+// The schema drives the walk (not the answers map), so a field name that never
+// passed schema validation cannot reach the record.
+func NewFormAudit(schema PromptSchema, answers map[string]string) FormAudit {
+	audit := FormAudit{}
+	for _, field := range schema.Fields {
+		value, ok := answers[field.Name]
+		if !ok {
+			continue
+		}
+		audit.AnsweredFields = append(audit.AnsweredFields, field.Name)
+		switch field.Kind {
+		case FieldSelect, FieldConfirm:
+			if audit.Choices == nil {
+				audit.Choices = make(map[string]string)
+			}
+			audit.Choices[field.Name] = value
+		case FieldText, FieldMultiSelect:
+			// Free text is never journaled. FieldMultiSelect cannot reach a
+			// validated form answer at all (formAnswerableKind rejects it).
+		}
+	}
+	sort.Strings(audit.AnsweredFields)
+	return audit
 }
 
 func formOptionAllowed(field Field, value string) bool {

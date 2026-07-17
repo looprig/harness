@@ -293,6 +293,18 @@ type Session struct {
 	// Protected by gatesMu alongside gates.
 	gateTimers map[gate.ID]*time.Timer
 
+	// gateAnswers holds the live delivery slot for each HOST-OWNED gate, keyed by
+	// GateID. A loop-owned gate's answer becomes a command the loop consumes; a
+	// host-owned gate (see hostOwnedGate) has no loop to command, so its answer is
+	// handed back to the opener blocked in AwaitGateAnswer through this slot.
+	//
+	// Each channel is buffered with capacity one and written at most once, so
+	// RespondGate never blocks on a slow or absent opener. The map is protected by
+	// gatesMu alongside gates; the send happens after the durable append, outside
+	// the lock. A slot is created by PrepareGateOpen and removed by
+	// AwaitGateAnswer or CloseGate.
+	gateAnswers map[gate.ID]chan gate.Answer
+
 	// topology is the immutable set of loop definitions this session may instantiate,
 	// keyed by agent name. The delegation manager resolves a parent's requested delegate
 	// name to its child definition through it. It is set once at construction (New /
@@ -1517,6 +1529,7 @@ func newSessionTopology(ctx context.Context, topology Topology, newID idGenerato
 		// root wires the real journal+hub adapter via WithGateAppender.
 		gates:               map[gate.ID]gateEntry{},
 		gateTimers:          map[gate.ID]*time.Timer{},
+		gateAnswers:         map[gate.ID]chan gate.Answer{},
 		gateAppender:        nopGateAppender{},
 		checkpointAdmission: newCheckpointAdmissionGate(),
 	}

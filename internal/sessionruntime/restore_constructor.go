@@ -662,7 +662,11 @@ func buildRestoredSession(
 		gates:   cloneGateEntries(restoredGates),
 		// Gate directory: restored sessions own a journal-backed appender by default.
 		// Caller opts may replace it below for same-package tests.
-		gateTimers:          map[gate.ID]*time.Timer{},
+		gateTimers: map[gate.ID]*time.Timer{},
+		// Restored gates never get an answer slot: a host-owned gate is not
+		// restorable (its opener's blocked call did not survive the process), so
+		// foldRestoredGates resolves it unavailable rather than reinstalling it.
+		gateAnswers:         map[gate.ID]chan gate.Answer{},
 		gateAppender:        nopGateAppender{},
 		checkpointAdmission: newCheckpointAdmissionGate(),
 	}

@@ -182,6 +182,13 @@ func TestResponseAuditRoundTrip(t *testing.T) {
 			name:  "ask user",
 			audit: AskUserAudit{AnswerPreview: "yes, continue"},
 		},
+		{
+			name: "form",
+			audit: FormAudit{
+				AnsweredFields: []string{"env", "note", "sure"},
+				Choices:        map[string]string{"env": "prod", "sure": "true"},
+			},
+		},
 	}
 
 	for _, tt := range tests {
@@ -257,6 +264,7 @@ func TestResponseAuditExplicitNullDataFailsClosed(t *testing.T) {
 	}{
 		{name: "permission", data: `{"kind":"permission","data":null}`},
 		{name: "ask user", data: `{"kind":"ask_user","data":null}`},
+		{name: "form", data: `{"kind":"form","data":null}`},
 	}
 	for _, tt := range tests {
 		tt := tt

@@ -76,6 +76,33 @@ func TestGateEventRoundTrip(t *testing.T) {
 			},
 		},
 		{
+			name: "GateResolved with form audit",
+			ev: GateResolved{
+				Header: fullHeader(),
+				GateID: gate.ID(seededUUID(0x70)),
+				Reason: gate.CloseAnswered,
+				Action: gate.FormActionAccept,
+				Source: gate.ResponseSource{Kind: gate.ResponseFromUser},
+				Audit: gate.FormAudit{
+					AnsweredFields: []string{"env", "note"},
+					Choices:        map[string]string{"env": "prod"},
+				},
+			},
+		},
+		{
+			// An open-url gate resolves with NO audit: its action target must never
+			// be journaled and its outcome is already in Action. This is the
+			// open-url answer's durable shape, not a placeholder.
+			name: "GateResolved for an open-url completion carries no audit",
+			ev: GateResolved{
+				Header: fullHeader(),
+				GateID: gate.ID(seededUUID(0x70)),
+				Reason: gate.CloseAnswered,
+				Action: gate.FormActionAccept,
+				Source: gate.ResponseSource{Kind: gate.ResponseFromUser},
+			},
+		},
+		{
 			name: "GateResolved nil audit boundary",
 			ev: GateResolved{
 				Header: fullHeader(),
