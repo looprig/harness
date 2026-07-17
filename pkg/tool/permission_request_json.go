@@ -18,6 +18,9 @@ const (
 	typeWebSearch requestType = "web_search"
 	typeSkill     requestType = "skill_load"
 	typeUnknown   requestType = "unknown"
+	// typeExternal tags a request for a capability implemented outside this
+	// module, built via NewExternalRequest.
+	typeExternal requestType = "external"
 )
 
 // maxPermissionRequestBytes caps the serialized size accepted at the untrusted
@@ -130,6 +133,13 @@ func requestTag(r PermissionRequest) (requestType, error) {
 			return "", &NilPermissionRequestError{}
 		}
 		return typeUnknown, nil
+	case externalRequest:
+		return typeExternal, nil
+	case *externalRequest:
+		if v == nil {
+			return "", &NilPermissionRequestError{}
+		}
+		return typeExternal, nil
 	default:
 		return "", &UnknownPermissionRequestError{Type: r.ToolName()}
 	}
@@ -195,6 +205,8 @@ func UnmarshalPermissionRequest(data []byte) (PermissionRequest, error) {
 		return decodeRequest[SkillLoadRequest](data)
 	case typeUnknown:
 		return decodeRequest[UnknownRequest](data)
+	case typeExternal:
+		return decodeRequest[externalRequest](data)
 	default:
 		return nil, &UnknownPermissionRequestError{Type: string(probe.Type)}
 	}

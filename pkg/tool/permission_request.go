@@ -1,7 +1,10 @@
 package tool
 
 import (
+	"encoding/json"
 	"fmt"
+	"strings"
+	"unicode/utf8"
 
 	"github.com/looprig/harness/pkg/identity"
 )
@@ -172,6 +175,179 @@ func (UnknownRequest) permissionRequest()             {}
 func (r UnknownRequest) ToolName() string             { return r.Tool }
 func (r UnknownRequest) Description() string          { return r.Summary }
 func (UnknownRequest) AllowedScopes() []ApprovalScope { return []ApprovalScope{ScopeOnce} }
+
+// maxExternalDescriptionBytes bounds the redacted description accepted by
+// NewExternalRequest. It reuses the codec's existing maxPermissionRequestBytes
+// cap — the only sanctioned bound on a permission request's redacted text —
+// with headroom for the tool name, the "type" tag, and JSON escaping (a
+// worst-case string can escape to 6 bytes per input byte). An externalRequest
+// therefore ALWAYS marshals under the codec cap, so a request that a caller
+// successfully constructs can never fail closed later at the restore boundary.
+//
+// Anything longer is truncated, not rejected: an over-long description is a
+// caller sizing bug, not an attack the gate should fail on, and the request
+// still carries a usable prompt. The bound is what makes the sealed contract's
+// guarantee hold for a caller outside this package.
+const maxExternalDescriptionBytes = maxPermissionRequestBytes / 8
+
+// ExternalRequestErrorKind classifies a rejected NewExternalRequest argument.
+type ExternalRequestErrorKind string
+
+const (
+	// ExternalToolNameEmpty reports an empty or whitespace-only tool name.
+	ExternalToolNameEmpty ExternalRequestErrorKind = "tool_name_empty"
+	// ExternalScopesEmpty reports an empty or nil scope set. A request that
+	// offers no scope is unapprovable, so it fails closed rather than silently
+	// degrading to ScopeOnce.
+	ExternalScopesEmpty ExternalRequestErrorKind = "scopes_empty"
+	// ExternalScopeInvalid reports a scope outside the valid set.
+	ExternalScopeInvalid ExternalRequestErrorKind = "scope_invalid"
+)
+
+// ExternalRequestError reports an invalid NewExternalRequest argument.
+type ExternalRequestError struct {
+	Kind ExternalRequestErrorKind
+}
+
+func (e *ExternalRequestError) Error() string {
+	return fmt.Sprintf("tool: invalid external permission request (%s)", string(e.Kind))
+}
+
+// externalRequest is the approval prompt for a capability implemented OUTSIDE
+// this module (an MCP tool, another protocol adapter). It is package-private and
+// reachable only through NewExternalRequest: the sealed PermissionRequest
+// interface stays sealed, and this is a validating CONSTRUCTOR, not an escape
+// hatch. An external caller gets to supply a redacted summary and the scopes its
+// capability can safely persist; it does not get to supply behavior.
+//
+// Summary is already redacted by the caller (the adapter is the only party that
+// can tell a safe summary from raw arguments) and is bounded + normalized here,
+// so this type upholds the same Description() contract as every sibling: a
+// prompt body, never raw args. It mirrors UnknownRequest.Summary, whose role it
+// generalizes.
+//
+// Scopes is what distinguishes this from UnknownRequest: an external capability
+// with a stable permission identity (e.g. "mcp:<binding>:<raw-tool>") CAN be
+// safely session- or workspace-persisted, which UnknownRequest's fail-secure
+// ScopeOnce-only set cannot express.
+//
+// The type is persisted through an explicit wire form (externalRequestData), not
+// struct tags, so the durable record carries the STABLE scope strings rather
+// than the ApprovalScope iota values — renumbering the enum must never silently
+// re-interpret an old journal.
+type externalRequest struct {
+	Tool    string
+	Summary string
+	Scopes  []ApprovalScope
+}
+
+// NewExternalRequest builds a PermissionRequest for capabilities implemented
+// outside this module (e.g. MCP tools). description must ALREADY be redacted by
+// the caller — this constructor bounds and normalizes it but cannot tell a safe
+// summary from a leaked secret. scopes are validated and defensively copied.
+//
+// It fails closed on an empty tool name, an empty scope set, or a scope outside
+// the valid set.
+func NewExternalRequest(toolName, description string, scopes []ApprovalScope) (PermissionRequest, error) {
+	name := strings.TrimSpace(toolName)
+	if name == "" {
+		return nil, &ExternalRequestError{Kind: ExternalToolNameEmpty}
+	}
+	if len(scopes) == 0 {
+		return nil, &ExternalRequestError{Kind: ExternalScopesEmpty}
+	}
+	copied := make([]ApprovalScope, 0, len(scopes))
+	for _, scope := range scopes {
+		if _, ok := ApprovalScopeValue(scope); !ok {
+			return nil, &ExternalRequestError{Kind: ExternalScopeInvalid}
+		}
+		copied = append(copied, scope)
+	}
+	return externalRequest{
+		Tool:    name,
+		Summary: boundDescription(strings.TrimSpace(description)),
+		Scopes:  copied,
+	}, nil
+}
+
+// boundDescription truncates s to maxExternalDescriptionBytes without splitting
+// a UTF-8 rune, so a bounded description is still valid UTF-8 and cannot produce
+// a mangled prompt or a replacement-character audit record.
+func boundDescription(s string) string {
+	if len(s) <= maxExternalDescriptionBytes {
+		return s
+	}
+	cut := maxExternalDescriptionBytes
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut]
+}
+
+func (externalRequest) permissionRequest()    {}
+func (r externalRequest) ToolName() string    { return r.Tool }
+func (r externalRequest) Description() string { return r.Summary }
+
+// AllowedScopes returns a fresh slice per call so a caller can never mutate the
+// request's approved scope set through a retained reference.
+func (r externalRequest) AllowedScopes() []ApprovalScope {
+	out := make([]ApprovalScope, len(r.Scopes))
+	copy(out, r.Scopes)
+	return out
+}
+
+// externalRequestData is the durable wire form of an externalRequest. Scopes are
+// the STABLE ApprovalScopeValue strings, never the enum's iota values.
+type externalRequestData struct {
+	Tool    string   `json:"tool"`
+	Summary string   `json:"summary,omitempty"`
+	Scopes  []string `json:"scopes"`
+}
+
+// MarshalJSON writes the explicit wire form. A scope with no stable string is
+// unrepresentable and fails closed rather than being dropped, which would
+// silently widen or narrow what a restored request offers.
+func (r externalRequest) MarshalJSON() ([]byte, error) {
+	scopes := make([]string, 0, len(r.Scopes))
+	for _, scope := range r.Scopes {
+		value, ok := ApprovalScopeValue(scope)
+		if !ok {
+			return nil, &ExternalRequestError{Kind: ExternalScopeInvalid}
+		}
+		scopes = append(scopes, value)
+	}
+	return json.Marshal(externalRequestData{Tool: r.Tool, Summary: r.Summary, Scopes: scopes})
+}
+
+// UnmarshalJSON reconstructs an externalRequest from the wire form. Restore is
+// an UNTRUSTED boundary, so it re-applies every NewExternalRequest invariant
+// rather than trusting the record: a journal that names an unknown scope, no
+// scopes, or no tool is rejected instead of yielding a request whose
+// AllowedScopes silently differ from what the human originally approved.
+func (r *externalRequest) UnmarshalJSON(data []byte) error {
+	var raw externalRequestData
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	if strings.TrimSpace(raw.Tool) == "" {
+		return &ExternalRequestError{Kind: ExternalToolNameEmpty}
+	}
+	if len(raw.Scopes) == 0 {
+		return &ExternalRequestError{Kind: ExternalScopesEmpty}
+	}
+	scopes := make([]ApprovalScope, 0, len(raw.Scopes))
+	for _, value := range raw.Scopes {
+		scope, ok := ParseApprovalScopeValue(value)
+		if !ok {
+			return &ExternalRequestError{Kind: ExternalScopeInvalid}
+		}
+		scopes = append(scopes, scope)
+	}
+	r.Tool = raw.Tool
+	r.Summary = boundDescription(raw.Summary)
+	r.Scopes = scopes
+	return nil
+}
 
 // skillHashPrefixLen is the number of leading hex characters of a skill body's
 // SHA-256 surfaced in the human gate prompt. A short prefix is enough for a
