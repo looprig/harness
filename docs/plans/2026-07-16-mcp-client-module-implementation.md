@@ -462,6 +462,23 @@ in generation warnings + catalog identity. Commit
 > its loopruntime handling (`internal/loopruntime`, `internal/sessionruntime`)
 > — the SetLoopMode next-turn-boundary path is the template for Task 6.3.
 
+> **As-built note (Phase 6 landed).** Two things this brief did not anticipate,
+> both discovered by building it:
+>
+> 1. **There is no "pending stash".** `applySetMode` mutates `state.effective`
+>    immediately; next-turn semantics come from `buildTurnConfig` snapshotting
+>    config per-turn, and `tools` is already in that snapshot. Mid-turn
+>    retention therefore holds **by construction** — no boundary machinery was
+>    added. The subtle bug that did exist: `configForMode` returns declared
+>    tools only, so `SetMode` silently uninstalled every external tool until
+>    `applySetMode` learned to recompose.
+> 2. **Raising a gate was never the gap — answering one was.** Form/open-url
+>    gates are *host-owned*: their answer belongs to the integration blocked in
+>    `OpenGate`, not to a loop, and `dispatchGateCommand` routes only to loops.
+>    The answer route (`gate.ResolverSession` + `Session.AwaitGateAnswer`), the
+>    public `session.GateHost` surface, and the validated `Prompt.Origin` all
+>    had to be built before elicitation could reach a human at all.
+
 ### Task 6.1: Form and open-URL gate payloads
 
 **Files:** Modify `pkg/gate/gate.go` (kinds), `pkg/gate/payload.go`; create
@@ -764,6 +781,42 @@ Write `mcp/README.md` (module overview, composition example, transport matrix,
 security posture). Final commits.
 
 ---
+
+## As-built: what this plan got wrong
+
+Recorded because the corrections cost real time and the next reader should not
+re-derive them.
+
+- **The plan's seam sketches were wrong in three places.** `tool.ToolResult` has
+  no `IsError` field (harness's convention is an `"error: "`-prefixed result
+  string; `InvokableRun` never returns a Go error). `command.ReplaceLoopExternalTools`
+  is not the adapter's seam — it carries *built* tools, which needs bind-time
+  `Bindings` only the session owns; the real seam is `loop.ExternalToolInstaller`.
+  The hub is not the subscription seam — it returns a concrete type; the
+  `session.Session` shape is.
+- **Two `Deps` in the plan cannot exist.** `TokenStore`/`BrowserOpener` feed
+  `auth.NewOAuthProvider` *before* a Binding exists; the Manager only dials an
+  already-sealed transport.
+- **`Deps.SessionID` was never needed for identity.** A `BindingIdentity` is
+  per-binding config + negotiated server identity + adopted catalog — no fact
+  about a Session. The requirement made the digest impossible to stamp at
+  creation (`Manager` couldn't exist before `NewSession`, which is where the
+  fingerprint is stamped), guaranteeing a spurious mismatch on every restore.
+- **Integration tests belong in `looprig/tests`**, not `mcp` — see above.
+
+## The recurring defect shape
+
+Nine instances across this program, four of them security claims: **a doc
+asserting a property of the whole, while the code establishes it for only some
+of its inputs.** Examples: `AgentName` documented as riding every loop event
+(it rode none); `loopHandle.bindings` documented as zero for foreign loops (it
+never was — producing a dead guard and an unbounded hang); `Prompt.Body`
+documented as naming "the ORIGIN, never the URL" while being built from a
+server-authored string that could carry either; "a drop is never silent" above
+code that dropped silently past a cap.
+
+Worth a review checklist item: when a comment claims a property, check it for
+**every** input — especially the server-authored ones.
 
 ## Execution notes
 
