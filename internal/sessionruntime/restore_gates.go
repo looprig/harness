@@ -157,9 +157,10 @@ func appendRestoreUnavailableGates(ctx context.Context, j journal.SessionJournal
 			return &RestoreError{Kind: RestoreIDGenerationFailed, Cause: err}
 		}
 		resolved := event.GateResolved{
-			Header: stamped,
-			GateID: open.Gate.ID,
-			Reason: gate.CloseRestoreUnavailable,
+			Header:   stamped,
+			GateID:   open.Gate.ID,
+			Resolver: open.Gate.Resolver,
+			Reason:   gate.CloseRestoreUnavailable,
 		}
 		if _, err := j.Append(ctx, journal.NewEventRecord(resolved)); err != nil {
 			return err
