@@ -44,10 +44,10 @@ the completeness check when Harness deletes `pkg/foreignloop`.
 | `pkg/foreignloop/decode_stream_test.go` | `driver/claude` | Port Claude stream fixture coverage. |
 | `pkg/foreignloop/decode_transcript.go` | `driver/claude` | Port authoritative Claude history decoding without the obsolete turn offset. |
 | `pkg/foreignloop/decode_transcript_test.go` | `driver/claude` | Port transcript fixture and golden-projection coverage. |
-| `pkg/foreignloop/errors.go` | `driver` | Move spawn, decode, exit, result, protocol, and transcript/history errors to `driver`; rehome config, busy-session, and snapshot errors in `backend`. |
+| `pkg/foreignloop/errors.go` | `driver` | Move spawn, process-exit, stream-decode, and authoritative-history errors to `driver`; rehome `ForeignResultError`, `ForeignProtocolError`, config, lock/busy, and snapshot errors in `backend`. |
 | `pkg/foreignloop/export.go` | `delete` | Delete after the Claude decoder moves. `DecodeStream` has no public replacement; `driver/claude` calls its own unexported decoder. |
 | `pkg/foreignloop/fake_test.go` | `backend` | Port shared backend actor, publisher, stream, and ID test fakes. |
-| `pkg/foreignloop/foreignloop.go` | `driver` | Move neutral agent, turn, stream, event, kind, and posture contracts to `driver`; move `SIDMode` to `backend` and `EventPublisher` to `harness/pkg/foreign`. |
+| `pkg/foreignloop/foreignloop.go` | `driver` | Move neutral agent, turn, stream, event, kind, and posture contracts to `driver`; move `SIDMode` to `backend`, and move both `EventPublisher` and `Builder` to `harness/pkg/foreign`. |
 | `pkg/foreignloop/foreignloop_test.go` | `driver` | Port zero-value and neutral turn-contract coverage; backend-only enum coverage follows `SIDMode`. |
 | `pkg/foreignloop/header.go` | `backend` | Port Harness event-header projection. |
 | `pkg/foreignloop/lock.go` | `backend` | Port per-session and temporary late-bound process locks. |
