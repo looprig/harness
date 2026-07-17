@@ -67,6 +67,11 @@ const (
 	FieldSource           FieldName = "Source"
 	FieldGeneration       FieldName = "Generation"
 	FieldTools            FieldName = "Tools"
+	// FieldIntegrationName names IntegrationStatus.Name. It is not spelled
+	// "FieldName": that identifier is this file's FieldName TYPE.
+	FieldIntegrationName FieldName = "Name"
+	FieldState           FieldName = "State"
+	FieldDetail          FieldName = "Detail"
 	// FieldType names the whole event (not one coordinate) on the fail-secure
 	// unknown-type path, paired with RuleUnknownType.
 	FieldType FieldName = "Type"
@@ -163,6 +168,8 @@ func validateEventBody(ev Event) error {
 		return validateModelRuntime("LoopModeChanged", e.Runtime)
 	case LoopExternalToolsetChanged:
 		return validateExternalToolset(e)
+	case IntegrationStatus:
+		return validateIntegrationStatus(e)
 	case LoopStarted:
 		return validateModelRuntime("LoopStarted", e.Runtime)
 	case ContextMeasured:
@@ -338,6 +345,40 @@ func isLowerHex(s string, n int) bool {
 // claiming two identically named tools describes a state the runtime never installs.
 // An EMPTY Tools list is valid and meaningful: it durably records a slot cleared to
 // nothing.
+// validateIntegrationStatus enforces IntegrationStatus's bounds and its closed
+// State enum at the publish boundary.
+//
+// It is the whole reason the event is safe to define for a producer that lives
+// outside this module. Source, Name, and Detail all originate in an integration
+// Harness does not own, and Detail is the field an integration fills from a
+// failure it observed — which is to say, from text a third-party server
+// influenced. Bounding them here means a hostile or buggy integration cannot
+// grow an event without limit, and rejecting an undeclared State means an unset
+// or garbage state fails closed rather than rendering as whatever the zero value
+// happens to sit next to.
+func validateIntegrationStatus(e IntegrationStatus) error {
+	const name EventName = "IntegrationStatus"
+	if e.Source == "" {
+		return &InvalidEventError{Event: name, Field: FieldSource, Rule: RuleRequired}
+	}
+	if len(e.Source) > MaxIntegrationSourceBytes {
+		return &InvalidEventError{Event: name, Field: FieldSource, Rule: RuleInvalid}
+	}
+	if e.Name == "" {
+		return &InvalidEventError{Event: name, Field: FieldIntegrationName, Rule: RuleRequired}
+	}
+	if len(e.Name) > MaxIntegrationNameBytes {
+		return &InvalidEventError{Event: name, Field: FieldIntegrationName, Rule: RuleInvalid}
+	}
+	if !e.State.Valid() {
+		return &InvalidEventError{Event: name, Field: FieldState, Rule: RuleInvalid}
+	}
+	if len(e.Detail) > MaxIntegrationDetailBytes {
+		return &InvalidEventError{Event: name, Field: FieldDetail, Rule: RuleInvalid}
+	}
+	return nil
+}
+
 func validateExternalToolset(e LoopExternalToolsetChanged) error {
 	const name EventName = "LoopExternalToolsetChanged"
 	if e.Source == "" {
@@ -489,6 +530,10 @@ func classify(ev Event) (name string, profile idProfile, ok bool) {
 		return "WorkspaceRestored", sessionProfile(), true
 	case ActiveLoopChanged:
 		return "ActiveLoopChanged", sessionProfile(), true
+	case IntegrationStatus:
+		// Session-scoped: an integration is a session-global resource, not a
+		// loop's. Same shape as SecurityLimitChanged — only SessionID set.
+		return "IntegrationStatus", sessionProfile(), true
 	case SecurityLimitChanged:
 		// Session-scoped: a session-global ceiling clamp appended when the operator
 		// changes it (same shape as WorkspaceCheckpointed) — only SessionID set. Level is
