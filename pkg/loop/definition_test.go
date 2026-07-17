@@ -1,9 +1,13 @@
 package loop
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"slices"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -453,6 +457,253 @@ func TestFingerprintInitialNormalizesProducedToolNames(t *testing.T) {
 	fingerprint := mustDefinition(t, WithTools(bundle)).FingerprintInitial()
 	if got, want := fingerprint.ToolNames, []string{"Write", "Read"}; !slices.Equal(got, want) {
 		t.Fatalf("FingerprintInitial().ToolNames = %q, want %q", got, want)
+	}
+}
+
+func TestOutputSchemaOptionIsImmutableAcrossDefinitionLifecycle(t *testing.T) {
+	t.Parallel()
+	input := testOutputSchema()
+	want := input.Clone()
+	option := WithOutputSchema(input)
+	input.Name = "mutated_before_define"
+	input.Description = "mutated before define"
+	input.Schema[0] = '['
+	input.Strict = false
+
+	definition := mustDefinition(t,
+		option,
+		WithModes(Mode{Name: "plan"}, Mode{Name: "build", Instructions: "build"}),
+		WithInitialMode("plan"),
+	)
+	bound, err := definition.Bind(context.Background(), validToolBindings(t))
+	if err != nil {
+		t.Fatalf("Bind() error = %v", err)
+	}
+	assertOutputSchemaEqual(t, bound, want)
+
+	first, _ := bound.OutputSchema()
+	first.Name = "mutated_accessor"
+	first.Description = "mutated accessor"
+	first.Schema[0] = '['
+	first.Strict = false
+	assertOutputSchemaEqual(t, bound, want)
+
+	selected, err := SelectBoundMode(bound, "build")
+	if err != nil {
+		t.Fatalf("SelectBoundMode() error = %v", err)
+	}
+	assertOutputSchemaEqual(t, selected, want)
+
+	reused := mustDefinition(t, option)
+	reusedBound, err := reused.Bind(context.Background(), validToolBindings(t))
+	if err != nil {
+		t.Fatalf("Bind(reused option) error = %v", err)
+	}
+	assertOutputSchemaEqual(t, reusedBound, want)
+}
+
+func TestOutputSchemaDefinitionValidation(t *testing.T) {
+	t.Parallel()
+	valid := testOutputSchema()
+	tests := []struct {
+		name       string
+		opts       []Option
+		kind       DefinitionErrorKind
+		wantSchema bool
+	}{
+		{
+			name: "duplicate option",
+			opts: []Option{WithName("agent"), WithInference(&fakeLLM{}, testModel()),
+				WithOutputSchema(valid), WithOutputSchema(valid)},
+			kind: DefinitionDuplicateOption,
+		},
+		{
+			name: "invalid portable schema",
+			opts: []Option{WithName("agent"), WithInference(&fakeLLM{}, testModel()), WithOutputSchema(inference.OutputSchema{
+				Name: "result", Schema: json.RawMessage(`{"type":"array"}`),
+			})},
+			kind:       DefinitionInvalidOutputSchema,
+			wantSchema: true,
+		},
+		{
+			name: "reserved schema name",
+			opts: []Option{WithName("agent"), WithInference(&fakeLLM{}, testModel()), WithOutputSchema(inference.OutputSchema{
+				Name: inference.StructuredOutputToolName, Schema: valid.Schema,
+			})},
+			kind:       DefinitionInvalidOutputSchema,
+			wantSchema: true,
+		},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			_, err := Define(tt.opts...)
+			var definitionErr *DefinitionError
+			if !errors.As(err, &definitionErr) || definitionErr.Kind != tt.kind {
+				t.Fatalf("Define() error = %T %v, want *DefinitionError kind %q", err, err, tt.kind)
+			}
+			if tt.wantSchema {
+				var schemaErr *inference.SchemaValidationError
+				if definitionErr.Field != "output_schema" || !errors.As(err, &schemaErr) {
+					t.Fatalf("Define() error = %#v, want output_schema wrapping *SchemaValidationError", definitionErr)
+				}
+			}
+		})
+	}
+}
+
+func TestOutputSchemaValidationErrorDoesNotExposeRawSchema(t *testing.T) {
+	t.Parallel()
+	const secret = "loop-output-schema-secret"
+	output := inference.OutputSchema{
+		Name:   "result",
+		Schema: json.RawMessage(`{"type":"object","properties":{},"required":[],"additionalProperties":false,"` + secret + `":true}`),
+	}
+	_, err := Define(WithName("agent"), WithInference(&fakeLLM{}, testModel()), WithOutputSchema(output))
+	var definitionErr *DefinitionError
+	if !errors.As(err, &definitionErr) || definitionErr.Kind != DefinitionInvalidOutputSchema {
+		t.Fatalf("Define() error = %T %v, want invalid output schema", err, err)
+	}
+	if strings.Contains(err.Error(), secret) || strings.Contains(fmt.Sprint(definitionErr.Cause), secret) {
+		t.Fatalf("validation error exposed raw schema: %v / %v", err, definitionErr.Cause)
+	}
+}
+
+func TestDefinitionRejectsReservedProducedToolName(t *testing.T) {
+	t.Parallel()
+	reserved := func(definitionName string, names ...string) tool.Definition {
+		return tool.NewBundleDefinition(definitionName, names, 0, func(context.Context, tool.Bindings) ([]tool.InvokableTool, error) {
+			return nil, nil
+		})
+	}
+	tests := []struct {
+		name string
+		opts []Option
+	}{
+		{name: "base first", opts: []Option{WithTools(reserved("base", inference.StructuredOutputToolName, "Read"))}},
+		{name: "base after ordinary definition", opts: []Option{WithTools(
+			reserved("ordinary", "Read"), reserved("reserved", "Write", inference.StructuredOutputToolName),
+		)}},
+		{name: "noninitial mode", opts: []Option{
+			WithModes(Mode{Name: "plan"}, Mode{Name: "build", Tools: []tool.Definition{reserved("mode", inference.StructuredOutputToolName)}}),
+			WithInitialMode("plan"),
+		}},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			_, err := Define(append([]Option{WithName("agent"), WithInference(&fakeLLM{}, testModel())}, tt.opts...)...)
+			assertReservedToolDefinitionError(t, err)
+		})
+	}
+}
+
+func TestBindRejectsReservedInjectedProducedToolName(t *testing.T) {
+	t.Parallel()
+	definition := mustDefinition(t, WithDelegates("worker"))
+	bindings := validToolBindings(t)
+	bindings.ExtraTools = []tool.Definition{tool.NewBundleDefinition(
+		"injected", []string{"Subagent", inference.StructuredOutputToolName}, 0,
+		func(context.Context, tool.Bindings) ([]tool.InvokableTool, error) { return nil, nil },
+	)}
+	_, err := definition.Bind(context.Background(), bindings)
+	var bindErr *BindError
+	if !errors.As(err, &bindErr) || bindErr.Kind != BindInvalidDefinition {
+		t.Fatalf("Bind() error = %T %v, want BindInvalidDefinition", err, err)
+	}
+	assertReservedToolDefinitionError(t, err)
+}
+
+func TestOutputSchemaPolicyIdentity(t *testing.T) {
+	t.Parallel()
+	baseOutput := testOutputSchema()
+	define := func(output inference.OutputSchema) Definition {
+		return mustDefinition(t, WithOutputSchema(output))
+	}
+	base := define(baseOutput)
+	sameWhitespace := baseOutput.Clone()
+	sameWhitespace.Schema = json.RawMessage(`{
+		"type":"object", "properties":{"answer":{"type":"string"}},
+		"required":["answer"], "additionalProperties":false
+	}`)
+	if base.PolicyRevision() != define(sameWhitespace).PolicyRevision() {
+		t.Fatal("insignificant schema whitespace changed PolicyRevision")
+	}
+	if base.state.outputPolicy == nil || base.state.outputPolicy.Name != baseOutput.Name ||
+		base.state.outputPolicy.Revision != inference.StructuredOutputRevision ||
+		base.state.outputPolicy.SHA256 == ([32]byte{}) {
+		t.Fatalf("output identity = %#v, want bounded name/digest/current revision", base.state.outputPolicy)
+	}
+	revisedState := *base.state
+	revisedIdentity := *base.state.outputPolicy
+	revisedIdentity.Revision = "structured-output/v2"
+	revisedState.outputPolicy = &revisedIdentity
+	if revised := (Definition{state: &revisedState}).PolicyRevision(); revised == base.PolicyRevision() {
+		t.Fatalf("PolicyRevision() ignored structured-output revision drift: %q", revised)
+	}
+
+	changedName := baseOutput.Clone()
+	changedName.Name = "other_result"
+	changedDescription := baseOutput.Clone()
+	changedDescription.Description = "other guidance"
+	changedSchema := baseOutput.Clone()
+	changedSchema.Schema = json.RawMessage(`{"type":"object","properties":{"answer":{"type":"boolean"}},"required":["answer"],"additionalProperties":false}`)
+	changedStrict := baseOutput.Clone()
+	changedStrict.Strict = false
+	for _, tt := range []struct {
+		name   string
+		output inference.OutputSchema
+	}{
+		{name: "name", output: changedName},
+		{name: "description", output: changedDescription},
+		{name: "schema", output: changedSchema},
+		{name: "strict", output: changedStrict},
+	} {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			if got := define(tt.output).PolicyRevision(); got == base.PolicyRevision() {
+				t.Fatalf("PolicyRevision() unchanged: %q", got)
+			}
+		})
+	}
+
+	withoutOutput := mustDefinition(t)
+	withoutOutputAgain := mustDefinition(t)
+	if withoutOutput.PolicyRevision() != withoutOutputAgain.PolicyRevision() || withoutOutput.state.outputPolicy != nil {
+		t.Fatal("absent output changed legacy policy behavior")
+	}
+}
+
+func testOutputSchema() inference.OutputSchema {
+	return inference.OutputSchema{
+		Name:        "loop_result",
+		Description: "final result guidance",
+		Schema:      json.RawMessage(`{"type":"object","properties":{"answer":{"type":"string"}},"required":["answer"],"additionalProperties":false}`),
+		Strict:      true,
+	}
+}
+
+func assertOutputSchemaEqual(t *testing.T, bound BoundDefinition, want inference.OutputSchema) {
+	t.Helper()
+	got, ok := bound.OutputSchema()
+	if !ok || got == nil {
+		t.Fatal("OutputSchema() = absent, want configured output")
+	}
+	if got.Name != want.Name || got.Description != want.Description || got.Strict != want.Strict || !bytes.Equal(got.Schema, want.Schema) {
+		t.Fatalf("OutputSchema() = %#v, want %#v", got, want)
+	}
+}
+
+func assertReservedToolDefinitionError(t *testing.T, err error) {
+	t.Helper()
+	var definitionErr *DefinitionError
+	if !errors.As(err, &definitionErr) || definitionErr.Kind != DefinitionReservedToolName {
+		t.Fatalf("error = %T %v, want DefinitionReservedToolName", err, err)
+	}
+	if definitionErr.Value != "" {
+		t.Fatalf("reserved-name error retained a value: %#v", definitionErr)
 	}
 }
 

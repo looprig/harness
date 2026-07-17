@@ -1,6 +1,7 @@
 package loop
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -59,6 +60,16 @@ type definitionState struct {
 	inferenceCapability contextcount.InferenceCapability
 	contextObservation  ContextObservationPolicy
 	compaction          CompactionPolicy
+	output              *inference.OutputSchema
+	outputPolicy        *outputPolicyIdentity
+}
+
+// outputPolicyIdentity is the bounded, secret-free behavioral identity of one
+// final-output policy. Raw descriptions and schemas remain in definitionState.output.
+type outputPolicyIdentity struct {
+	Name     string
+	SHA256   [sha256.Size]byte
+	Revision string
 }
 
 type definitionOptions struct {
@@ -145,6 +156,11 @@ func Define(opts ...Option) (Definition, error) {
 	if err := validateContextDefinition(resolved); err != nil {
 		return Definition{}, err
 	}
+	if resolved.output != nil {
+		if err := inference.ValidateOutputSchema(*resolved.output); err != nil {
+			return Definition{}, &DefinitionError{Kind: DefinitionInvalidOutputSchema, Field: "output_schema", Cause: err}
+		}
+	}
 
 	state := resolved.definitionState
 	state.model = cloneModel(state.model)
@@ -152,6 +168,15 @@ func Define(opts ...Option) (Definition, error) {
 	state.middlewares = append([]tool.ToolMiddleware(nil), state.middlewares...)
 	state.delegates = dedupeDelegates(state.delegates)
 	state.modes = cloneModes(state.modes)
+	if state.output != nil {
+		clone := state.output.Clone()
+		state.output = &clone
+		identity, err := newOutputPolicyIdentity(clone, inference.StructuredOutputRevision)
+		if err != nil {
+			return Definition{}, err
+		}
+		state.outputPolicy = &identity
+	}
 	state.limits = defaultLimits(state.limits)
 	if state.drainTimeout == 0 {
 		state.drainTimeout = defaultDrainTimeout
@@ -381,12 +406,14 @@ func (d Definition) PolicyRevision() string {
 		InferenceCapability *contextcount.InferenceCapability
 		ContextObservation  *ContextObservationPolicy
 		Compaction          *CompactionPolicy
+		OutputPolicy        *outputPolicyIdentity `json:",omitempty"`
 	}{
 		Name: d.state.name, Model: cloneModel(d.state.model), System: d.state.system,
 		Tools: tools(d.state.tools), Limits: d.state.limits, Engine: d.state.engine,
 		DrainTimeout: d.state.drainTimeout, Delegates: delegates,
 		Delegation: d.state.delegation, Modes: modes, InitialMode: d.state.initialMode,
 		PolicyRevision: d.state.policyRevision,
+		OutputPolicy:   d.state.outputPolicy,
 	}
 	if d.state.contextCounter != nil {
 		counter := d.state.counterCapability
@@ -414,6 +441,35 @@ func (d Definition) PolicyRevision() string {
 	return hex.EncodeToString(sum[:])
 }
 
+// newOutputPolicyIdentity hashes the deterministic model-facing output policy.
+// Compact schema JSON makes insignificant whitespace identity-neutral. Name and
+// the implementation revision remain separate bounded inputs.
+func newOutputPolicyIdentity(output inference.OutputSchema, revision string) (outputPolicyIdentity, error) {
+	var compactSchema bytes.Buffer
+	if err := json.Compact(&compactSchema, output.Schema); err != nil {
+		cause := &inference.SchemaValidationError{Field: inference.SchemaFieldSchema, ReasonCode: inference.SchemaReasonMalformed}
+		return outputPolicyIdentity{}, &DefinitionError{Kind: DefinitionInvalidOutputSchema, Field: "output_schema", Cause: cause}
+	}
+	projection := struct {
+		Description string          `json:"description"`
+		Schema      json.RawMessage `json:"schema"`
+		Strict      bool            `json:"strict"`
+	}{
+		Description: output.Description,
+		Schema:      compactSchema.Bytes(),
+		Strict:      output.Strict,
+	}
+	encoded, err := json.Marshal(projection)
+	if err != nil {
+		return outputPolicyIdentity{}, &DefinitionError{Kind: DefinitionInvalidOutputSchema, Field: "output_schema"}
+	}
+	return outputPolicyIdentity{
+		Name:     output.Name,
+		SHA256:   sha256.Sum256(encoded),
+		Revision: revision,
+	}, nil
+}
+
 // Bind creates fresh session-specific collaborators and resolves every declared mode.
 func (d Definition) Bind(ctx context.Context, bindings tool.Bindings) (BoundDefinition, error) {
 	if d.state == nil {
@@ -432,6 +488,9 @@ func (d Definition) Bind(ctx context.Context, bindings tool.Bindings) (BoundDefi
 	}
 	if d.state.permissionFactory != nil && nilLike(bindings.SecurityLimit) {
 		return nil, &BindError{Kind: BindInvalidSecurityLimit, Index: -1}
+	}
+	if err := validateDefinitionTools(bindings.ExtraTools, "bindings.extra_tools"); err != nil {
+		return nil, &BindError{Kind: BindInvalidDefinition, Index: -1, Cause: err}
 	}
 
 	type builtDefinition struct {
@@ -583,6 +642,7 @@ type BoundDefinition interface {
 	InferenceCapability() (contextcount.InferenceCapability, bool)
 	ContextObservationPolicy() (ContextObservationPolicy, bool)
 	CompactionPolicy() (CompactionPolicy, bool)
+	OutputSchema() (*inference.OutputSchema, bool)
 	ValidateContextModel(model.Model) error
 	Delegation() Delegation
 	Delegates() []identity.AgentName
@@ -621,6 +681,13 @@ func (b *boundDefinitionState) ContextObservationPolicy() (ContextObservationPol
 }
 func (b *boundDefinitionState) CompactionPolicy() (CompactionPolicy, bool) {
 	return b.definition.compaction, b.definition.compaction.CountTimeout != 0
+}
+func (b *boundDefinitionState) OutputSchema() (*inference.OutputSchema, bool) {
+	if b.definition.output == nil {
+		return nil, false
+	}
+	clone := b.definition.output.Clone()
+	return &clone, true
 }
 func (b *boundDefinitionState) ValidateContextModel(model model.Model) error {
 	return validateDefinitionContextModel(b.definition, model)
@@ -813,6 +880,20 @@ func WithSystem(system string) Option {
 		return nil
 	}
 }
+
+// WithOutputSchema freezes one optional provider-neutral final-output policy.
+// The option owns a clone immediately, and clones again whenever it is applied.
+func WithOutputSchema(output inference.OutputSchema) Option {
+	frozen := output.Clone()
+	return func(o *definitionOptions) error {
+		if err := o.singleton("output_schema"); err != nil {
+			return err
+		}
+		clone := frozen.Clone()
+		o.output = &clone
+		return nil
+	}
+}
 func WithTools(defs ...tool.Definition) Option {
 	defs = append([]tool.Definition(nil), defs...)
 	return func(o *definitionOptions) error { o.tools = append(o.tools, defs...); return nil }
@@ -950,6 +1031,11 @@ func validateDefinitionTools(defs []tool.Definition, field string) error {
 	for index, def := range defs {
 		if nilLike(def) || strings.TrimSpace(def.Name()) == "" {
 			return &DefinitionError{Kind: DefinitionInvalidTool, Field: field, Value: indexString(index)}
+		}
+		for _, name := range def.ProducedToolNames() {
+			if strings.TrimSpace(name) == inference.StructuredOutputToolName {
+				return &DefinitionError{Kind: DefinitionReservedToolName, Field: field}
+			}
 		}
 	}
 	return nil

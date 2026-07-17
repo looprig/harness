@@ -2,6 +2,7 @@ package rig
 
 import (
 	"context"
+	"encoding/json"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -533,6 +534,41 @@ func TestTopologyRevisionIncludesNoninitialModeProducedToolMetadata(t *testing.T
 	b := frozenFingerprint(ConfigFingerprintFields{}, []loop.Definition{define("Inspect")}, []string{"primer"}, "primer")
 	if a.TopologyRev == b.TopologyRev {
 		t.Fatal("TopologyRev ignored noninitial-mode produced-name drift")
+	}
+}
+
+func TestLoopOutputPolicyFingerprintAgreementAndDrift(t *testing.T) {
+	t.Parallel()
+	output := inference.OutputSchema{
+		Name:        "loop_result",
+		Description: "final guidance",
+		Schema:      json.RawMessage(`{"type":"object","properties":{"answer":{"type":"string"}},"required":["answer"],"additionalProperties":false}`),
+		Strict:      true,
+	}
+	define := func(output *inference.OutputSchema) loop.Definition {
+		options := []loop.Option{loop.WithName("agent"), loop.WithInference(&stubLLM{}, validModel("model"))}
+		if output != nil {
+			options = append(options, loop.WithOutputSchema(*output))
+		}
+		return mustDefine(options...)
+	}
+	configured := define(&output)
+	bound := bindFingerprintDefinition(configured)
+	frozen := frozenFingerprint(ConfigFingerprintFields{}, []loop.Definition{configured}, []string{"agent"}, "agent")
+	live := fingerprintWithTopology(bound, ConfigFingerprintFields{}, []loop.Definition{configured}, []string{"agent"}, "agent")
+	if !frozen.Equal(live) {
+		t.Fatalf("frozen fingerprint = %+v, live = %+v", frozen, live)
+	}
+
+	absent := frozenFingerprint(ConfigFingerprintFields{}, []loop.Definition{define(nil)}, []string{"agent"}, "agent")
+	if absent.TopologyRev == frozen.TopologyRev {
+		t.Fatal("TopologyRev ignored output policy presence")
+	}
+	changed := output.Clone()
+	changed.Description = "different guidance"
+	drifted := frozenFingerprint(ConfigFingerprintFields{}, []loop.Definition{define(&changed)}, []string{"agent"}, "agent")
+	if drifted.TopologyRev == frozen.TopologyRev {
+		t.Fatal("TopologyRev ignored output policy drift")
 	}
 }
 
