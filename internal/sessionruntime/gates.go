@@ -3,6 +3,7 @@ package sessionruntime
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"time"
 
 	"github.com/looprig/core/uuid"
@@ -215,6 +216,104 @@ func (s *Session) PrepareGateOpen(ctx context.Context, loopID uuid.UUID, g gate.
 		s.gateAnswers[gateID] = make(chan gate.Answer, 1)
 	}
 	return gateID, nil
+}
+
+// OpenHostGate opens a HOST-OWNED gate and returns its id, ready to be awaited.
+//
+// It is the ONLY gate-opening entry point on the published session.GateHost
+// contract, and it is deliberately not PrepareGateOpen. PrepareGateOpen takes an
+// arbitrary kind, resolver, payload, and — through the ActivateGate route that
+// must follow it — an arbitrary target loop, which together are exactly the
+// loop-owned command path (dispatchGateCommand). A host must not be able to
+// reach that: minting an "approve this tool call" gate against someone else's
+// loop is not a capability an integration should acquire by being able to ask a
+// human a question. This entry point takes the same arguments minus the route
+// and refuses everything that is not host-owned, so the loop path is unreachable
+// through it by construction rather than by convention.
+//
+// It collapses prepare and activate into one call, which is safe precisely
+// because the gate is host-owned. The two phases exist so a LOOP can install its
+// blocker while the gate is still private; a host's blocker is the answer slot,
+// and PrepareGateOpen installs that itself. There is no window here for the
+// opener to miss.
+//
+// Every rejection is a *GateError{GateKindMismatch}, checked BEFORE anything is
+// journaled:
+//
+//   - hostOwnedGate — the same predicate that governs answer time, so open time
+//     and answer time cannot drift apart. A form gate declaring ResolverLoop is
+//     refused here rather than accepted and then refused after a human has
+//     already answered it.
+//   - the payload must match the kind, so a form gate cannot be opened with an
+//     open-url payload (which would strand its answer at ParseFormAnswers).
+//   - the payload's own invariants (ValidateFormSchema / ValidateOpenURLPayload)
+//     must hold, because an unanswerable or targetless prompt should never reach
+//     a human.
+//
+// The caller MUST either AwaitGateAnswer or CloseGate; both free the slot.
+func (s *Session) OpenHostGate(ctx context.Context, loopID uuid.UUID, g gate.Gate, payload gate.Payload) (gate.ID, error) {
+	if !hostOwnedGate(g) {
+		return gate.ID{}, &GateError{Kind: GateKindMismatch}
+	}
+	if err := validateHostGatePayload(g.Kind, payload); err != nil {
+		return gate.ID{}, &GateError{Kind: GateKindMismatch, Cause: err}
+	}
+
+	id, err := s.PrepareGateOpen(ctx, loopID, g, payload)
+	if err != nil {
+		return gate.ID{}, err
+	}
+	// The route carries only the gate id. A host-owned answer is delivered to the
+	// opener's slot and never translated into a command, so there is no loop to
+	// address — and leaving LoopID zero means that even a future miswiring would
+	// fail to find a loop rather than reach the wrong one.
+	if err := s.ActivateGate(ctx, id, gate.Route{GateID: id}); err != nil {
+		// The gate never became public, so nothing can answer it. Drop it so a
+		// failed open leaves neither a directory entry nor an answer slot behind.
+		_ = s.CloseGate(ctx, id, gate.CloseAbandoned)
+		return gate.ID{}, err
+	}
+	return id, nil
+}
+
+// validateHostGatePayload reports whether payload is the right shape for kind and
+// satisfies that shape's own invariants. It fails closed: a kind with no
+// host-owned payload is rejected rather than opened unvalidated.
+func validateHostGatePayload(kind gate.Kind, payload gate.Payload) error {
+	switch kind {
+	case gate.KindForm:
+		form, ok := formPayloadFromGatePayload(payload)
+		if !ok {
+			return errHostGatePayloadMismatch
+		}
+		return gate.ValidateFormSchema(form.Schema)
+	case gate.KindOpenURL:
+		openURL, ok := openURLPayloadFromGatePayload(payload)
+		if !ok {
+			return errHostGatePayloadMismatch
+		}
+		return gate.ValidateOpenURLPayload(openURL)
+	default:
+		return errHostGatePayloadMismatch
+	}
+}
+
+// errHostGatePayloadMismatch reports a payload whose type does not match the
+// gate kind it was offered for.
+var errHostGatePayloadMismatch = errors.New("sessionruntime: gate payload does not match gate kind")
+
+func openURLPayloadFromGatePayload(payload gate.Payload) (gate.OpenURLPayload, bool) {
+	switch v := payload.(type) {
+	case gate.OpenURLPayload:
+		return v, true
+	case *gate.OpenURLPayload:
+		if v == nil {
+			return gate.OpenURLPayload{}, false
+		}
+		return *v, true
+	default:
+		return gate.OpenURLPayload{}, false
+	}
 }
 
 // AwaitGateAnswer blocks until a HOST-OWNED gate is answered and returns the

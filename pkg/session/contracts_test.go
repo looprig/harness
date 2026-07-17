@@ -16,6 +16,18 @@ import (
 	"github.com/looprig/harness/pkg/session"
 )
 
+// publicSessionContracts are the contract interfaces pkg/session is allowed to
+// export. Everything else it exports must be an error type: the package is
+// contracts plus errors, and construction belongs to rig.
+//
+// GateHost is separate from the two session views on purpose — it is the
+// integration host's end of a gate, not an operator's view of a session — and it
+// is listed here rather than folded into SessionController for the reasons on the
+// type itself.
+var publicSessionContracts = map[string]bool{
+	"Session": true, "SessionController": true, "GateHost": true,
+}
+
 var forbiddenSessionSurface = map[string]bool{
 	"New": true, "Restore": true, "Compile": true, "Runner": true, "Option": true, "CompileOption": true,
 }
@@ -115,7 +127,7 @@ func TestPublicSessionContainsOnlyContractsAndErrors(t *testing.T) {
 							continue
 						}
 						name := named.Name.Name
-						if name != "Session" && name != "SessionController" && !strings.HasSuffix(name, "Error") && !strings.HasSuffix(name, "ErrorKind") {
+						if !publicSessionContracts[name] && !strings.HasSuffix(name, "Error") && !strings.HasSuffix(name, "ErrorKind") {
 							t.Errorf("pkg/session exports non-contract, non-error type %s", name)
 						}
 					case *ast.ValueSpec:

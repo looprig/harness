@@ -49,6 +49,50 @@ func ValidateGate(g Gate) error {
 	}
 }
 
+// OpenURLPayloadErrorKind classifies a rejected open-url payload.
+type OpenURLPayloadErrorKind string
+
+const (
+	// OpenURLTargetMissing reports an open-url payload with no action URL.
+	OpenURLTargetMissing OpenURLPayloadErrorKind = "target_missing"
+)
+
+// OpenURLPayloadError reports an open-url payload that cannot be acted on.
+type OpenURLPayloadError struct {
+	Kind OpenURLPayloadErrorKind
+}
+
+func (e *OpenURLPayloadError) Error() string {
+	return fmt.Sprintf("gate: invalid open-url payload (%s)", string(e.Kind))
+}
+
+// ValidateOpenURLPayload reports whether p is a live, well-formed open-url
+// request. It is the open-url counterpart of ValidateFormSchema: the check an
+// opener runs BEFORE a gate exists, so a broken request is refused instead of
+// shown to a human.
+//
+// Two rules, and both are load-bearing:
+//
+//   - DisplayOrigin must be a bare, journal-safe origin. This is the same check
+//     the codec applies, hoisted to the open path because the codec is not
+//     always on it — a session with no journal (the nop appender) would
+//     otherwise render whatever an integration passed straight to a human, which
+//     is precisely the trust decision the origin exists to inform.
+//   - URL must be present. A decoded OpenURLPayload always has an empty URL (the
+//     action target is never journaled), so an empty URL here means the request
+//     is a restored or half-built one with nothing to open. Refusing it is the
+//     same fail-closed rule ValidateGate applies to a Restorable open-url gate:
+//     an origin with no target is a broken prompt, not a degraded one.
+func ValidateOpenURLPayload(p OpenURLPayload) error {
+	if err := validateDisplayOrigin(p.DisplayOrigin); err != nil {
+		return err
+	}
+	if p.URL == "" {
+		return &OpenURLPayloadError{Kind: OpenURLTargetMissing}
+	}
+	return nil
+}
+
 // originErrorKind classifies a rejected DisplayOrigin.
 type originErrorKind string
 
