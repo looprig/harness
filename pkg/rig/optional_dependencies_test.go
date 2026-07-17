@@ -1,22 +1,185 @@
 package rig
 
 import (
+	"bufio"
+	"fmt"
 	"go/parser"
 	"go/token"
+	"io"
 	"io/fs"
+	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
+	"testing/fstest"
 )
 
-func TestHarnessDoesNotImportOptionalToolOrConfinementModules(t *testing.T) {
+func validateForeignloopCoverage(tracked []string, manifest io.Reader, root fs.FS) error {
+	sources, err := foreignloopManifestSources(manifest)
+	if err != nil {
+		return err
+	}
+	seen := make(map[string]bool, len(sources))
+	var problems []string
+	for _, source := range sources {
+		if seen[source] {
+			problems = append(problems, "duplicate manifest source: "+source)
+			continue
+		}
+		seen[source] = true
+		info, err := fs.Stat(root, source)
+		if err != nil {
+			if os.IsNotExist(err) {
+				problems = append(problems, "manifest source does not exist: "+source)
+				continue
+			}
+			return fmt.Errorf("stat manifest source %s: %w", source, err)
+		}
+		if !info.Mode().IsRegular() {
+			problems = append(problems, "manifest source is not a regular file: "+source)
+		}
+	}
+	for _, source := range tracked {
+		info, err := fs.Stat(root, source)
+		if err != nil {
+			return fmt.Errorf("stat tracked source %s: %w", source, err)
+		}
+		if info.Mode().IsRegular() && !seen[source] {
+			problems = append(problems, "missing manifest entry: "+source)
+		}
+	}
+	if len(problems) > 0 {
+		sort.Strings(problems)
+		return fmt.Errorf("foreignloop coverage manifest:\n%s", strings.Join(problems, "\n"))
+	}
+	return nil
+}
+
+func foreignloopManifestSources(r io.Reader) ([]string, error) {
+	scanner := bufio.NewScanner(r)
+	foundHeader := false
+	var sources []string
+	for scanner.Scan() {
+		columns := strings.Split(scanner.Text(), "|")
+		if len(columns) < 3 {
+			continue
+		}
+		first := strings.TrimSpace(columns[1])
+		if first == "Source file" {
+			foundHeader = true
+			continue
+		}
+		if !foundHeader {
+			continue
+		}
+		first = strings.Trim(strings.TrimSpace(first), "`")
+		if strings.HasPrefix(first, "pkg/foreignloop/") {
+			sources = append(sources, first)
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("scan foreignloop coverage manifest: %w", err)
+	}
+	if !foundHeader {
+		return nil, fmt.Errorf("foreignloop coverage manifest: Source file table not found")
+	}
+	return sources, nil
+}
+
+func trackedForeignloopFiles(root string) ([]string, error) {
+	cmd := exec.Command("git", "-C", root, "ls-files", "--", "pkg/foreignloop")
+	out, err := cmd.Output()
+	if err != nil {
+		return nil, fmt.Errorf("list tracked pkg/foreignloop files: %w", err)
+	}
+	var files []string
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		if line != "" {
+			files = append(files, line)
+		}
+	}
+	return files, nil
+}
+
+func TestForeignloopCoverageValidator(t *testing.T) {
+	files := fstest.MapFS{
+		"pkg/foreignloop/first.go":  {},
+		"pkg/foreignloop/second.go": {},
+	}
+	tests := []struct {
+		name     string
+		tracked  []string
+		manifest string
+		want     string
+	}{
+		{
+			name:    "missing tracked source",
+			tracked: []string{"pkg/foreignloop/first.go", "pkg/foreignloop/second.go"},
+			manifest: "| Source file | Final owner | Migration note |\n" +
+				"|---|---|---|\n" +
+				"| `pkg/foreignloop/first.go` | `backend` | Move. |\n",
+			want: "missing manifest entry: pkg/foreignloop/second.go",
+		},
+		{
+			name:    "duplicate source",
+			tracked: []string{"pkg/foreignloop/first.go"},
+			manifest: "| Source file | Final owner | Migration note |\n" +
+				"|---|---|---|\n" +
+				"| `pkg/foreignloop/first.go` | `backend` | Move. |\n" +
+				"| `pkg/foreignloop/first.go` | `backend` | Move again. |\n",
+			want: "duplicate manifest source: pkg/foreignloop/first.go",
+		},
+		{
+			name:    "source does not exist",
+			tracked: []string{"pkg/foreignloop/first.go"},
+			manifest: "| Source file | Final owner | Migration note |\n" +
+				"|---|---|---|\n" +
+				"| `pkg/foreignloop/first.go` | `backend` | Move. |\n" +
+				"| `pkg/foreignloop/ghost.go` | `backend` | Move. |\n",
+			want: "manifest source does not exist: pkg/foreignloop/ghost.go",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateForeignloopCoverage(tt.tracked, strings.NewReader(tt.manifest), files)
+			if err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("validateForeignloopCoverage() error = %v, want containing %q", err, tt.want)
+			}
+		})
+	}
+}
+
+func TestForeignloopCoverageManifestCompleteness(t *testing.T) {
+	root := optionalDependenciesModuleRoot(t)
+	tracked, err := trackedForeignloopFiles(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest, err := os.Open(filepath.Join(root, "docs", "plans", "2026-07-17-foreignloop-extraction-coverage.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = manifest.Close() })
+	if err := validateForeignloopCoverage(tracked, manifest, os.DirFS(root)); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func optionalDependenciesModuleRoot(t *testing.T) string {
+	t.Helper()
 	_, filename, _, ok := runtime.Caller(0)
 	if !ok {
 		t.Fatal("locate dependency boundary test")
 	}
-	root := filepath.Clean(filepath.Join(filepath.Dir(filename), "..", ".."))
+	return filepath.Clean(filepath.Join(filepath.Dir(filename), "..", ".."))
+}
+
+func TestHarnessDoesNotImportOptionalToolOrConfinementModules(t *testing.T) {
+	root := optionalDependenciesModuleRoot(t)
 	forbidden := []string{
 		"github.com/looprig/tools",
 		"github.com/looprig/sandbox",
