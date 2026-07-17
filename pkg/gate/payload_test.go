@@ -31,6 +31,15 @@ func TestPayloadRoundTrip(t *testing.T) {
 			name:    "resume input",
 			payload: ResumeInputPayload{InputID: fixedID, Preview: "..."},
 		},
+		{
+			name: "form",
+			payload: FormPayload{Title: "Sign in", Body: "Enter your account", Schema: PromptSchema{
+				Fields: []Field{{Name: "account", Label: "Account", Kind: FieldText, Required: true}},
+			}},
+		},
+		// OpenURLPayload is intentionally absent: its round-trip is lossy by
+		// design (the URL is never journaled), so it cannot satisfy this table's
+		// exact-equality assertion. See openurl_payload_test.go.
 	}
 
 	for _, tt := range tests {

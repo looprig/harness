@@ -12,6 +12,9 @@ const (
 	FieldSelect FieldKind = "select"
 	// FieldMultiSelect accepts multiple values from a fixed option list.
 	FieldMultiSelect FieldKind = "multi_select"
+	// FieldConfirm accepts a boolean confirmation. A schema whose only field is
+	// a FieldConfirm is the confirmation-only request.
+	FieldConfirm FieldKind = "confirm"
 )
 
 // Prompt is the user-facing content and schema for resolving a gate.

@@ -130,6 +130,12 @@ func (s *Session) PrepareGateOpen(ctx context.Context, loopID uuid.UUID, g gate.
 	if err := s.checkGateCap(); err != nil {
 		return gate.ID{}, err
 	}
+	// Kind-implied envelope invariants (e.g. an open-url gate may not be
+	// Restorable). Every pre-existing kind validates clean, so this rejects only
+	// envelopes that were already incoherent.
+	if err := gate.ValidateGate(g); err != nil {
+		return gate.ID{}, &GateError{Kind: GateKindMismatch, Cause: err}
+	}
 	policy, err := s.resolveGatePolicy(g)
 	if err != nil {
 		return gate.ID{}, err

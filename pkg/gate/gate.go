@@ -30,6 +30,19 @@ const (
 	KindPermission Kind = "harness.permission"
 	// KindAskUser is an explicit user-question gate.
 	KindAskUser Kind = "harness.ask_user"
+	// KindForm is a structured human-input gate: a bounded set of typed fields
+	// (including a confirmation-only field) answered by a human or by policy. It
+	// is protocol-neutral — any integration that needs structured human input
+	// opens one.
+	KindForm Kind = "harness.form"
+	// KindOpenURL is a gate asking a human to open an action URL out-of-band
+	// (typically a browser) and, when RequiresCompletion is set, to report back.
+	//
+	// An open-url gate is inherently EPHEMERAL: its action target is bound to a
+	// live out-of-band exchange and is deliberately never journaled (see
+	// OpenURLPayload), so it can never be restored. ValidateGate rejects an
+	// open-url gate marked Restorable.
+	KindOpenURL Kind = "harness.open_url"
 )
 
 const (

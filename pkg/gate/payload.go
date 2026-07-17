@@ -18,6 +18,8 @@ const (
 	payloadKindPermission  payloadKind = "permission"
 	payloadKindAskUser     payloadKind = "ask_user"
 	payloadKindResumeInput payloadKind = "resume_input"
+	payloadKindForm        payloadKind = "form"
+	payloadKindOpenURL     payloadKind = "open_url"
 )
 
 var (
@@ -53,10 +55,53 @@ type ResumeInputPayload struct {
 	Preview string    `json:"preview,omitempty"`
 }
 
+// FormPayload carries a bounded, structured human-input request.
+//
+// It is the AUTHORITATIVE record of what was asked, mirroring how
+// AskUserPayload carries the question that Gate.Prompt merely renders: the
+// Prompt is a presentation projection an opener derives from this payload,
+// while the payload is what a response is validated against (ParseFormAnswers)
+// and what the journal durably records. The two are deliberately not the same
+// field — Prompt is public envelope, the payload is private.
+//
+// Schema is bounded and restricted to the answerable field kinds; see
+// ValidateFormSchema. It is validated at BOTH codec boundaries, so a malformed
+// schema can neither be journaled nor restored.
+type FormPayload struct {
+	Title  string       `json:"title,omitempty"`
+	Body   string       `json:"body,omitempty"`
+	Schema PromptSchema `json:"schema,omitzero"`
+}
+
+// OpenURLPayload asks a human to open an action URL out-of-band.
+//
+// URL is the EPHEMERAL action target. An authorization URL carries secrets —
+// OAuth `state`, a PKCE challenge, one-time codes — so it MUST NOT reach a
+// journal, an event, or an audit record. That exclusion is STRUCTURAL, not
+// remembered: the field is `json:"-"`, and the codec marshals
+// openURLPayloadData, a type that HAS NO URL FIELD at all. Both boundaries have
+// to be deleted for a URL to leak. A decoded OpenURLPayload therefore ALWAYS has
+// an empty URL, which is exactly why an open-url gate may not be Restorable
+// (enforced by ValidateGate) — the action target cannot survive a restore, and a
+// reconnecting integration must mint a fresh one.
+//
+// DisplayOrigin is the durable, journal-safe origin shown to the human, e.g.
+// "https://github.com". It is validated as a BARE origin (scheme + host only) at
+// both codec boundaries: without that check a caller could defeat the whole
+// design by passing the full action URL as the "origin".
+type OpenURLPayload struct {
+	DisplayOrigin string `json:"display_origin,omitempty"`
+	// URL is never serialized. See the type doc.
+	URL                string `json:"-"`
+	RequiresCompletion bool   `json:"requires_completion,omitzero"`
+}
+
 func (OpenPayload) payload()        {}
 func (PermissionPayload) payload()  {}
 func (AskUserPayload) payload()     {}
 func (ResumeInputPayload) payload() {}
+func (FormPayload) payload()        {}
+func (OpenURLPayload) payload()     {}
 
 // UnknownPayloadKindError is returned when a payload wrapper names no known kind.
 type UnknownPayloadKindError struct {
@@ -107,6 +152,15 @@ type payloadWrapper struct {
 type openPayloadData struct {
 	GateID  ID              `json:"gate_id,omitzero"`
 	Payload json.RawMessage `json:"payload"`
+}
+
+// openURLPayloadData is the DURABLE form of an OpenURLPayload. It deliberately
+// has no URL field — that omission is the mechanism by which the ephemeral
+// action target (and the secrets in its query string) is kept out of journals,
+// events, and audit records. Do not add one.
+type openURLPayloadData struct {
+	DisplayOrigin      string `json:"display_origin,omitempty"`
+	RequiresCompletion bool   `json:"requires_completion,omitzero"`
 }
 
 // MarshalPayload encodes a sealed payload as a {kind,data} discriminator wrapper.
@@ -176,6 +230,20 @@ func payloadTag(payload Payload) (payloadKind, error) {
 			return "", &NilPayloadError{}
 		}
 		return payloadKindResumeInput, nil
+	case FormPayload:
+		return payloadKindForm, nil
+	case *FormPayload:
+		if v == nil {
+			return "", &NilPayloadError{}
+		}
+		return payloadKindForm, nil
+	case OpenURLPayload:
+		return payloadKindOpenURL, nil
+	case *OpenURLPayload:
+		if v == nil {
+			return "", &NilPayloadError{}
+		}
+		return payloadKindOpenURL, nil
 	default:
 		return "", &UnknownPayloadKindError{Kind: fmt.Sprintf("%T", payload)}
 	}
@@ -204,6 +272,23 @@ func marshalPayloadData(kind payloadKind, payload Payload) (json.RawMessage, err
 		return marshalPayloadJSON(kind, askUserPayloadValue(payload))
 	case payloadKindResumeInput:
 		return marshalPayloadJSON(kind, resumeInputPayloadValue(payload))
+	case payloadKindForm:
+		v := formPayloadValue(payload)
+		if err := ValidateFormSchema(v.Schema); err != nil {
+			return nil, &PayloadEncodeError{Kind: string(kind), Cause: err}
+		}
+		return marshalPayloadJSON(kind, v)
+	case payloadKindOpenURL:
+		v := openURLPayloadValue(payload)
+		if err := validateDisplayOrigin(v.DisplayOrigin); err != nil {
+			return nil, &PayloadEncodeError{Kind: string(kind), Cause: err}
+		}
+		// openURLPayloadData has no URL field: the ephemeral action target is
+		// dropped here by construction, not by remembering to clear it.
+		return marshalPayloadJSON(kind, openURLPayloadData{
+			DisplayOrigin:      v.DisplayOrigin,
+			RequiresCompletion: v.RequiresCompletion,
+		})
 	default:
 		return nil, &UnknownPayloadKindError{Kind: string(kind)}
 	}
@@ -242,6 +327,32 @@ func unmarshalPayloadData(kind payloadKind, data json.RawMessage) (Payload, erro
 			return nil, &PayloadDecodeError{Kind: string(kind), Cause: err}
 		}
 		return payload, nil
+	case payloadKindForm:
+		var payload FormPayload
+		if err := decodeStrict(data, &payload); err != nil {
+			return nil, &PayloadDecodeError{Kind: string(kind), Cause: err}
+		}
+		// Restore is an untrusted boundary: re-validate rather than trust that
+		// whatever wrote the record enforced the bounds.
+		if err := ValidateFormSchema(payload.Schema); err != nil {
+			return nil, &PayloadDecodeError{Kind: string(kind), Cause: err}
+		}
+		return payload, nil
+	case payloadKindOpenURL:
+		// decodeStrict + a data type with no URL field means a record carrying a
+		// "url" key is REJECTED, not silently accepted and dropped.
+		var raw openURLPayloadData
+		if err := decodeStrict(data, &raw); err != nil {
+			return nil, &PayloadDecodeError{Kind: string(kind), Cause: err}
+		}
+		if err := validateDisplayOrigin(raw.DisplayOrigin); err != nil {
+			return nil, &PayloadDecodeError{Kind: string(kind), Cause: err}
+		}
+		// URL is intentionally left zero: it was never journaled.
+		return OpenURLPayload{
+			DisplayOrigin:      raw.DisplayOrigin,
+			RequiresCompletion: raw.RequiresCompletion,
+		}, nil
 	default:
 		return nil, &UnknownPayloadKindError{Kind: string(kind)}
 	}
@@ -293,6 +404,28 @@ func resumeInputPayloadValue(payload Payload) ResumeInputPayload {
 	case ResumeInputPayload:
 		return v
 	case *ResumeInputPayload:
+		return *v
+	default:
+		panic("gate: internal payload type mismatch")
+	}
+}
+
+func formPayloadValue(payload Payload) FormPayload {
+	switch v := payload.(type) {
+	case FormPayload:
+		return v
+	case *FormPayload:
+		return *v
+	default:
+		panic("gate: internal payload type mismatch")
+	}
+}
+
+func openURLPayloadValue(payload Payload) OpenURLPayload {
+	switch v := payload.(type) {
+	case OpenURLPayload:
+		return v
+	case *OpenURLPayload:
 		return *v
 	default:
 		panic("gate: internal payload type mismatch")
