@@ -2,14 +2,14 @@ package gate
 
 import (
 	"encoding/json"
+	"errors"
 	"reflect"
 	"strings"
 	"testing"
 )
 
 // auditFormSchema is a schema with one field of every answerable kind, so a test
-// can assert the redaction rule discriminates between them rather than applying
-// uniformly.
+// can assert every kind's answer reaches the durable record.
 func auditFormSchema() PromptSchema {
 	return PromptSchema{Fields: []Field{
 		{Name: "note", Kind: FieldText},
@@ -18,95 +18,79 @@ func auditFormSchema() PromptSchema {
 	}}
 }
 
-// TestNewFormAuditRedactsFreeTextButKeepsClosedSetChoices is the central
-// security assertion for FormAudit: the durable audit records WHICH fields were
-// answered and WHAT was chosen from a closed set, and never the text a human
-// typed.
-func TestNewFormAuditRedactsFreeTextButKeepsClosedSetChoices(t *testing.T) {
+// TestNewFormAuditRecordsEveryAnswerIncludingFreeText pins the contract: a form
+// audit is the durable record of what a human said, and free text is recorded
+// verbatim rather than withheld — consistent with command.UserInput, which
+// already journals user-authored text block for block.
+func TestNewFormAuditRecordsEveryAnswerIncludingFreeText(t *testing.T) {
 	t.Parallel()
 
-	const secret = "CANARY-my-passphrase-hunter2"
-	answers := map[string]string{"note": secret, "env": "prod", "sure": "true"}
+	const typed = "the staging box was already broken when I got here"
+	answers := map[string]string{"note": typed, "env": "prod", "sure": "true"}
 
 	audit := NewFormAudit(auditFormSchema(), answers)
 
-	// Every answered field is named...
-	wantFields := []string{"env", "note", "sure"}
-	if !reflect.DeepEqual(audit.AnsweredFields, wantFields) {
-		t.Errorf("AnsweredFields = %v, want %v (sorted, all answered fields)", audit.AnsweredFields, wantFields)
-	}
-	// ...but only the closed-set fields carry a value.
-	wantChoices := map[string]string{"env": "prod", "sure": "true"}
-	if !reflect.DeepEqual(audit.Choices, wantChoices) {
-		t.Errorf("Choices = %v, want %v (select and confirm only)", audit.Choices, wantChoices)
-	}
-	if _, ok := audit.Choices["note"]; ok {
-		t.Error("Choices carries the free-text field: a FieldText answer must never be recorded")
+	want := map[string]string{"note": typed, "env": "prod", "sure": "true"}
+	if !reflect.DeepEqual(audit.Values, want) {
+		t.Errorf("Values = %v, want every answer including the free text %q", audit.Values, typed)
 	}
 
-	// The decisive check: the typed text must not survive into the record in ANY
-	// form, including truncated or nested somewhere unexpected.
+	// The decisive check: the text must survive INTO the durable encoding, intact
+	// and untruncated.
 	encoded, err := MarshalResponseAudit(audit)
 	if err != nil {
 		t.Fatalf("MarshalResponseAudit() error = %v", err)
 	}
-	if strings.Contains(string(encoded), "CANARY") {
-		t.Fatalf("the free-text answer reached the durable audit record: %s", encoded)
+	if !strings.Contains(string(encoded), typed) {
+		t.Fatalf("the durable audit record dropped the user's answer: %s", encoded)
 	}
 }
 
 // TestNewFormAuditOmitsUnansweredFields proves an optional field left blank is
-// not reported as answered.
+// not invented as an empty answer.
 func TestNewFormAuditOmitsUnansweredFields(t *testing.T) {
 	t.Parallel()
 
 	audit := NewFormAudit(auditFormSchema(), map[string]string{"env": "dev"})
 
-	if !reflect.DeepEqual(audit.AnsweredFields, []string{"env"}) {
-		t.Errorf("AnsweredFields = %v, want only the answered field", audit.AnsweredFields)
-	}
-	if len(audit.Choices) != 1 || audit.Choices["env"] != "dev" {
-		t.Errorf("Choices = %v, want only env=dev", audit.Choices)
+	if !reflect.DeepEqual(audit.Values, map[string]string{"env": "dev"}) {
+		t.Errorf("Values = %v, want only the answered field", audit.Values)
 	}
 }
 
 // TestNewFormAuditIgnoresValuesWithNoSchemaField proves the walk is driven by the
-// schema, not the answers map, so a name that never passed schema validation
-// cannot reach a durable record.
+// schema, not the answers map, so a name the schema never declared cannot reach a
+// durable record.
 func TestNewFormAuditIgnoresValuesWithNoSchemaField(t *testing.T) {
 	t.Parallel()
 
 	audit := NewFormAudit(auditFormSchema(), map[string]string{
 		"env":      "dev",
-		"smuggled": "CANARY-not-in-schema",
+		"smuggled": "never-declared",
 	})
 
-	for _, name := range audit.AnsweredFields {
-		if name == "smuggled" {
-			t.Fatal("a field absent from the schema reached AnsweredFields")
-		}
-	}
-	if _, ok := audit.Choices["smuggled"]; ok {
-		t.Fatal("a field absent from the schema reached Choices")
+	if _, ok := audit.Values["smuggled"]; ok {
+		t.Fatal("a field absent from the schema reached the durable audit")
 	}
 }
 
-// TestFormAuditRoundTripsThroughTheSealedCodec proves the new union member is
-// registered in every codec arm: tag, marshal, and unmarshal.
+// TestFormAuditRoundTripsThroughTheSealedCodec proves the union member is
+// registered in every codec arm — tag, marshal, unmarshal — and that a user's
+// answer survives the round trip byte for byte.
 func TestFormAuditRoundTripsThroughTheSealedCodec(t *testing.T) {
 	t.Parallel()
 
-	original := FormAudit{
-		AnsweredFields: []string{"env", "sure"},
-		Choices:        map[string]string{"env": "prod", "sure": "false"},
-	}
+	original := FormAudit{Values: map[string]string{
+		"note": "a sentence with \"quotes\", a comma, and a ünicode ✓",
+		"env":  "prod",
+		"sure": "false",
+	}}
 
 	data, err := MarshalResponseAudit(original)
 	if err != nil {
 		t.Fatalf("MarshalResponseAudit() error = %v", err)
 	}
 
-	// The wrapper must name the form kind, so a decoder can discriminate.
 	var wrapper struct {
 		Kind string `json:"kind"`
 	}
@@ -131,7 +115,7 @@ func TestFormAuditRoundTripsThroughTheSealedCodec(t *testing.T) {
 func TestFormAuditPointerRoundTripsAndNilFailsClosed(t *testing.T) {
 	t.Parallel()
 
-	data, err := MarshalResponseAudit(&FormAudit{AnsweredFields: []string{"env"}})
+	data, err := MarshalResponseAudit(&FormAudit{Values: map[string]string{"env": "dev"}})
 	if err != nil {
 		t.Fatalf("MarshalResponseAudit(*FormAudit) error = %v", err)
 	}
@@ -139,7 +123,7 @@ func TestFormAuditPointerRoundTripsAndNilFailsClosed(t *testing.T) {
 	if err != nil {
 		t.Fatalf("UnmarshalResponseAudit() error = %v", err)
 	}
-	if !reflect.DeepEqual(got, FormAudit{AnsweredFields: []string{"env"}}) {
+	if !reflect.DeepEqual(got, FormAudit{Values: map[string]string{"env": "dev"}}) {
 		t.Errorf("pointer round trip = %#v", got)
 	}
 
@@ -149,9 +133,8 @@ func TestFormAuditPointerRoundTripsAndNilFailsClosed(t *testing.T) {
 	}
 }
 
-// TestFormAuditMalformedDataFailsClosed proves the form arm decodes strictly:
-// an unknown key is rejected rather than silently dropped, which is what keeps a
-// widened record from being accepted by an older reader.
+// TestFormAuditMalformedDataFailsClosed proves the form arm decodes strictly: an
+// unknown key is rejected rather than silently dropped.
 func TestFormAuditMalformedDataFailsClosed(t *testing.T) {
 	t.Parallel()
 
@@ -159,8 +142,8 @@ func TestFormAuditMalformedDataFailsClosed(t *testing.T) {
 		name string
 		data string
 	}{
-		{name: "unknown field", data: `{"kind":"form","data":{"answered_fields":["a"],"values":{"a":"b"}}}`},
-		{name: "wrong type", data: `{"kind":"form","data":{"answered_fields":"not-a-list"}}`},
+		{name: "unknown field", data: `{"kind":"form","data":{"values":{"a":"b"},"choices":{"a":"b"}}}`},
+		{name: "wrong type", data: `{"kind":"form","data":{"values":"not-a-map"}}`},
 		{name: "null data", data: `{"kind":"form","data":null}`},
 	}
 
@@ -172,5 +155,113 @@ func TestFormAuditMalformedDataFailsClosed(t *testing.T) {
 				t.Fatalf("UnmarshalResponseAudit(%s) succeeded, want a typed decode error", tt.data)
 			}
 		})
+	}
+}
+
+// TestValidateFormAuditBoundsAtTheBoundary pins the exact bounds. Unredacted is
+// not unbounded: a third-party schema author must not be able to append an
+// arbitrarily large record to the journal.
+func TestValidateFormAuditBoundsAtTheBoundary(t *testing.T) {
+	t.Parallel()
+
+	valuesOfSize := func(n int) map[string]string {
+		out := make(map[string]string, n)
+		for i := 0; i < n; i++ {
+			out[strings.Repeat("x", i+1)] = "v"
+		}
+		return out
+	}
+
+	tests := []struct {
+		name    string
+		audit   FormAudit
+		wantErr FormAuditErrorKind
+	}{
+		{name: "empty is fine", audit: FormAudit{}},
+		{name: "value at the limit", audit: FormAudit{Values: map[string]string{"a": strings.Repeat("x", maxFormValueBytes)}}},
+		{
+			name:    "value one over the limit",
+			audit:   FormAudit{Values: map[string]string{"a": strings.Repeat("x", maxFormValueBytes+1)}},
+			wantErr: FormAuditValueTooLong,
+		},
+		{name: "name at the limit", audit: FormAudit{Values: map[string]string{strings.Repeat("n", maxFormFieldNameBytes): "v"}}},
+		{
+			name:    "name one over the limit",
+			audit:   FormAudit{Values: map[string]string{strings.Repeat("n", maxFormFieldNameBytes+1): "v"}},
+			wantErr: FormAuditFieldNameTooLong,
+		},
+		{name: "count at the limit", audit: FormAudit{Values: valuesOfSize(maxFormFields)}},
+		{
+			name:    "count one over the limit",
+			audit:   FormAudit{Values: valuesOfSize(maxFormFields + 1)},
+			wantErr: FormAuditTooManyValues,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			err := ValidateFormAuditBounds(tt.audit)
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Fatalf("ValidateFormAuditBounds() error = %v, want nil", err)
+				}
+				return
+			}
+			var boundsErr *FormAuditError
+			if !errors.As(err, &boundsErr) {
+				t.Fatalf("ValidateFormAuditBounds() error = %v, want *FormAuditError", err)
+			}
+			if boundsErr.Kind != tt.wantErr {
+				t.Errorf("error kind = %q, want %q", boundsErr.Kind, tt.wantErr)
+			}
+		})
+	}
+}
+
+// TestFormAuditBoundsEnforcedAtBothCodecBoundaries proves an oversized record can
+// neither be journaled nor read back. The decode half is what protects a reader
+// from a record some other writer produced.
+func TestFormAuditBoundsEnforcedAtBothCodecBoundaries(t *testing.T) {
+	t.Parallel()
+
+	oversized := FormAudit{Values: map[string]string{"note": strings.Repeat("x", maxFormValueBytes+1)}}
+	if _, err := MarshalResponseAudit(oversized); err == nil {
+		t.Fatal("MarshalResponseAudit() journaled an oversized form audit")
+	}
+
+	// A record written by something that did not enforce the bounds must be
+	// rejected on the way back in, not trusted.
+	forged, err := json.Marshal(responseAuditWrapper{
+		Kind: responseAuditKindForm,
+		Data: json.RawMessage(`{"values":{"note":"` + strings.Repeat("x", maxFormValueBytes+1) + `"}}`),
+	})
+	if err != nil {
+		t.Fatalf("json.Marshal(forged): %v", err)
+	}
+	if _, err := UnmarshalResponseAudit(forged); err == nil {
+		t.Fatal("UnmarshalResponseAudit() accepted an oversized form audit record")
+	}
+}
+
+// TestParseFormAnswersBoundsMatchTheAuditBounds proves the two halves agree: an
+// answer ParseFormAnswers accepts always survives ValidateFormAuditBounds, so the
+// audit bound can never reject a legitimately answered form.
+func TestParseFormAnswersBoundsMatchTheAuditBounds(t *testing.T) {
+	t.Parallel()
+
+	atLimit, err := json.Marshal(strings.Repeat("x", maxFormValueBytes))
+	if err != nil {
+		t.Fatalf("json.Marshal: %v", err)
+	}
+	schema := PromptSchema{Fields: []Field{{Name: "note", Kind: FieldText}}}
+
+	answers, err := ParseFormAnswers(schema, map[string]json.RawMessage{"note": atLimit})
+	if err != nil {
+		t.Fatalf("ParseFormAnswers() rejected an answer at the limit: %v", err)
+	}
+	if err := ValidateFormAuditBounds(NewFormAudit(schema, answers)); err != nil {
+		t.Fatalf("an answer ParseFormAnswers accepted was refused by the audit bounds: %v", err)
 	}
 }

@@ -31,17 +31,12 @@ type GateResponse struct {
 // Answer is the validated result of answering a HOST-OWNED gate, delivered live
 // to the opener that is blocked on it.
 //
-// It is deliberately NOT a durable record and has no JSON codec. A gate answered
-// on behalf of a loop turns into a command, which the loop consumes in memory;
-// this is the same thing for a gate whose opener is the host itself. What
-// survives the process is the GateResolved event and its redacted FormAudit —
-// never Values.
-//
-// Values is the whole reason the two are separate. It carries the answers keyed
-// by schema field name, exactly as ParseFormAnswers produced them, INCLUDING
-// free text a human typed. That is what an opener asked for and must act on, and
-// it is precisely what must not enter a journal (see FormAudit). Keeping it off
-// every durable type makes that structural rather than remembered.
+// It is a LIVE delivery type, not a durable record, and has no JSON codec. A gate
+// answered on behalf of a loop turns into a command the loop consumes in memory;
+// this is the same thing for a gate whose opener is the host itself. What survives
+// the process is the GateResolved event and its FormAudit, which records the same
+// answers durably (see FormAudit) — so the two are separate because they travel
+// differently, not because one hides something from the other.
 type Answer struct {
 	GateID ID
 	Action string

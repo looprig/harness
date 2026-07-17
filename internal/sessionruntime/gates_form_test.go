@@ -168,11 +168,9 @@ func TestRespondFormGateAcceptDeliversValuesToTheOpener(t *testing.T) {
 	if !ok {
 		t.Fatalf("resolved audit = %#v, want gate.FormAudit", resolved[0].Audit)
 	}
-	if !reflect.DeepEqual(audit.Choices, map[string]string{"env": "prod", "sure": "true"}) {
-		t.Errorf("audit choices = %v", audit.Choices)
-	}
-	if _, leaked := audit.Choices["note"]; leaked {
-		t.Error("the free-text answer reached the durable audit")
+	// The durable audit records the same answers the opener was handed.
+	if !reflect.DeepEqual(audit.Values, want) {
+		t.Errorf("audit values = %v, want %v (the answers, recorded as user content)", audit.Values, want)
 	}
 	// The gate is gone, so it cannot be answered twice.
 	if len(s.ListGates(context.Background())) != 0 {
@@ -180,19 +178,23 @@ func TestRespondFormGateAcceptDeliversValuesToTheOpener(t *testing.T) {
 	}
 }
 
-// TestRespondFormGateFreeTextNeverReachesADurableRecord probes every durable
-// artifact a form answer touches with a canary, proving the redaction is not
-// merely a property of one struct field.
-func TestRespondFormGateFreeTextNeverReachesADurableRecord(t *testing.T) {
+// TestRespondFormGateFreeTextReachesTheDurableRecord pins the journal contract
+// end to end: what a human typed into a form is durably recorded, intact, on the
+// GateResolved event that closes the gate.
+//
+// This is the same standard the session already holds itself to for chat input —
+// command.UserInput journals its blocks verbatim — and it is what makes the
+// journal a complete account of a session a form answer helped shape.
+func TestRespondFormGateFreeTextReachesTheDurableRecord(t *testing.T) {
 	t.Parallel()
 	s, app, _, _ := gateSession(t)
 	id := openHostGate(t, s, formGate(), gate.FormPayload{Schema: formSchema()})
 
-	const canary = "CANARY-typed-by-a-human"
+	const typed = "rolling back: the migration locked the users table"
 	if err := s.RespondGate(context.Background(), gate.GateResponse{
 		GateID: id,
 		Action: gate.FormActionAccept,
-		Values: rawValues(t, map[string]any{"note": canary, "env": "dev"}),
+		Values: rawValues(t, map[string]any{"note": typed, "env": "dev"}),
 	}); err != nil {
 		t.Fatalf("RespondGate() error = %v", err)
 	}
@@ -201,23 +203,23 @@ func TestRespondFormGateFreeTextNeverReachesADurableRecord(t *testing.T) {
 	if len(resolved) != 1 {
 		t.Fatalf("appender recorded %d resolved events, want 1", len(resolved))
 	}
+	audit, ok := resolved[0].Audit.(gate.FormAudit)
+	if !ok {
+		t.Fatalf("resolved audit = %#v, want gate.FormAudit", resolved[0].Audit)
+	}
+	want := map[string]string{"note": typed, "env": "dev"}
+	if !reflect.DeepEqual(audit.Values, want) {
+		t.Errorf("audit values = %v, want %v", audit.Values, want)
+	}
 
-	// The audit as it would be journaled.
+	// The record as the journal would actually write it: the answer must survive
+	// the codec, not merely sit on an in-memory struct.
 	auditJSON, err := gate.MarshalResponseAudit(resolved[0].Audit)
 	if err != nil {
 		t.Fatalf("MarshalResponseAudit() error = %v", err)
 	}
-	if strings.Contains(string(auditJSON), canary) {
-		t.Errorf("the audit record carries the typed text: %s", auditJSON)
-	}
-
-	// The resolved event as a whole.
-	eventJSON, err := json.Marshal(resolved[0])
-	if err != nil {
-		t.Fatalf("json.Marshal(GateResolved): %v", err)
-	}
-	if strings.Contains(string(eventJSON), canary) {
-		t.Errorf("the GateResolved event carries the typed text: %s", eventJSON)
+	if !strings.Contains(string(auditJSON), typed) {
+		t.Errorf("the durable audit record dropped the user's answer: %s", auditJSON)
 	}
 }
 

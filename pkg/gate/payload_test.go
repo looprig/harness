@@ -184,10 +184,11 @@ func TestResponseAuditRoundTrip(t *testing.T) {
 		},
 		{
 			name: "form",
-			audit: FormAudit{
-				AnsweredFields: []string{"env", "note", "sure"},
-				Choices:        map[string]string{"env": "prod", "sure": "true"},
-			},
+			audit: FormAudit{Values: map[string]string{
+				"note": "a free-text answer, recorded as user content",
+				"env":  "prod",
+				"sure": "true",
+			}},
 		},
 	}
 

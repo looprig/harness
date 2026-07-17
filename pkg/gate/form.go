@@ -3,7 +3,6 @@ package gate
 import (
 	"encoding/json"
 	"fmt"
-	"sort"
 )
 
 // Form gate response actions. They are the Control.Action / ResponseRequest.Action
@@ -240,18 +239,62 @@ func parseFormFieldAnswer(field Field, raw json.RawMessage) (string, error) {
 	return value, nil
 }
 
-// NewFormAudit builds the durable, redacted audit for answers that already
-// satisfied ParseFormAnswers against schema.
+// FormAuditErrorKind classifies a rejected form audit record.
+type FormAuditErrorKind string
+
+const (
+	// FormAuditTooManyValues reports more than maxFormFields answers.
+	FormAuditTooManyValues FormAuditErrorKind = "too_many_values"
+	// FormAuditFieldNameTooLong reports an over-long answer field name.
+	FormAuditFieldNameTooLong FormAuditErrorKind = "field_name_too_long"
+	// FormAuditValueTooLong reports an answer exceeding maxFormValueBytes.
+	FormAuditValueTooLong FormAuditErrorKind = "value_too_long"
+)
+
+// FormAuditError reports a form audit whose contents exceed the durable bounds.
+type FormAuditError struct {
+	Kind  FormAuditErrorKind
+	Field string
+}
+
+func (e *FormAuditError) Error() string {
+	if e.Field == "" {
+		return fmt.Sprintf("gate: invalid form audit (%s)", string(e.Kind))
+	}
+	return fmt.Sprintf("gate: invalid form audit field %q (%s)", e.Field, string(e.Kind))
+}
+
+// ValidateFormAuditBounds reports whether a FormAudit is small enough to journal.
 //
-// It is the single place the redaction rule of FormAudit is applied, so a caller
-// cannot journal a form answer without going through it. Every answered field
-// contributes its NAME; only FieldSelect and FieldConfirm additionally
-// contribute their VALUE, because only those values are drawn from a closed set
-// the schema already made durable. A FieldText value is dropped here — see
-// FormAudit for why that is a fail-closed choice rather than a lossy one.
+// A form audit records user-authored content verbatim (see FormAudit), and the
+// schema that solicited it is authored by a third party. Bounding it is therefore
+// what keeps "the journal records what the human said" from becoming "a hostile
+// integration can append whatever it likes to the journal". The bounds are the
+// same ones ParseFormAnswers applies on the way in — an answer that passed it
+// always passes this — and they are re-checked at both codec boundaries so a
+// record that was never parsed (a forged or corrupted one) can be neither
+// written nor read back.
+func ValidateFormAuditBounds(audit FormAudit) error {
+	if len(audit.Values) > maxFormFields {
+		return &FormAuditError{Kind: FormAuditTooManyValues}
+	}
+	for name, value := range audit.Values {
+		if len(name) > maxFormFieldNameBytes {
+			return &FormAuditError{Kind: FormAuditFieldNameTooLong, Field: name}
+		}
+		if len(value) > maxFormValueBytes {
+			return &FormAuditError{Kind: FormAuditValueTooLong, Field: name}
+		}
+	}
+	return nil
+}
+
+// NewFormAudit builds the durable audit for answers that already satisfied
+// ParseFormAnswers against schema.
 //
-// The schema drives the walk (not the answers map), so a field name that never
-// passed schema validation cannot reach the record.
+// The schema drives the walk (not the answers map), so a field name the schema
+// never declared cannot reach a durable record even if a caller puts one in
+// answers.
 func NewFormAudit(schema PromptSchema, answers map[string]string) FormAudit {
 	audit := FormAudit{}
 	for _, field := range schema.Fields {
@@ -259,19 +302,11 @@ func NewFormAudit(schema PromptSchema, answers map[string]string) FormAudit {
 		if !ok {
 			continue
 		}
-		audit.AnsweredFields = append(audit.AnsweredFields, field.Name)
-		switch field.Kind {
-		case FieldSelect, FieldConfirm:
-			if audit.Choices == nil {
-				audit.Choices = make(map[string]string)
-			}
-			audit.Choices[field.Name] = value
-		case FieldText, FieldMultiSelect:
-			// Free text is never journaled. FieldMultiSelect cannot reach a
-			// validated form answer at all (formAnswerableKind rejects it).
+		if audit.Values == nil {
+			audit.Values = make(map[string]string, len(answers))
 		}
+		audit.Values[field.Name] = value
 	}
-	sort.Strings(audit.AnsweredFields)
 	return audit
 }
 

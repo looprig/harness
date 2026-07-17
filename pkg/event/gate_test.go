@@ -83,10 +83,10 @@ func TestGateEventRoundTrip(t *testing.T) {
 				Reason: gate.CloseAnswered,
 				Action: gate.FormActionAccept,
 				Source: gate.ResponseSource{Kind: gate.ResponseFromUser},
-				Audit: gate.FormAudit{
-					AnsweredFields: []string{"env", "note"},
-					Choices:        map[string]string{"env": "prod"},
-				},
+				Audit: gate.FormAudit{Values: map[string]string{
+					"note": "free text, journaled as user content",
+					"env":  "prod",
+				}},
 			},
 		},
 		{

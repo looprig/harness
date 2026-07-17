@@ -34,42 +34,41 @@ type AskUserAudit struct {
 	AnswerPreview string `json:"answer_preview,omitempty"`
 }
 
-// FormAudit is the durable, redacted record of how a form gate was answered.
+// FormAudit is the durable record of how a form gate was answered: the answers
+// themselves, keyed by schema field name.
 //
-// It carries WHICH fields were answered and, for closed-set fields only, WHAT
-// was chosen. It deliberately carries NO free text.
+// It records USER-AUTHORED CONTENT verbatim, including free text, and that is
+// deliberate. A journal is meant to be the durable truth of a session, and a
+// human's form answer shaped that session as surely as anything they typed into
+// chat — which command.UserInput already records verbatim, block for block. A
+// form answer that reached a durable record only as "a field was answered" would
+// make the journal an incomplete account of its own session. Recording the
+// answer is the norm here; withholding it would be the outlier.
 //
-// The line is drawn where PermissionAudit draws it. That type stores
-// AcceptedGrantDescriptions — not the grant tokens the responder submitted, but
-// the descriptions the REQUEST already declared, selected by the answer. The
-// audit therefore reveals a human's CHOICE among options that were already
-// durable, and adds no new attacker- or user-controlled bytes to the journal.
-// FormAudit applies the same rule:
+// This is NOT a licence to journal secrets, and two controls keep them out:
 //
-//   - AnsweredFields holds schema field names. A field name is already durable
-//     inside FormPayload.Schema, so recording it discloses nothing new.
-//   - Choices holds values for FieldSelect and FieldConfirm only. A select value
-//     is one of the options the schema already declared; a confirm value is
-//     "true" or "false". Both are closed sets that were already journaled, so
-//     recording the chosen member is exactly the PermissionAudit precedent.
-//   - A FieldText answer is NEVER recorded, not even truncated. It is unbounded
-//     text typed by a human in response to a prompt an integration chose. A form
-//     is drivable by a third party (an MCP server's elicitation), so "describe
-//     the problem" and "paste your API key" are the same code path from here.
-//     Journals outlive the trust decision that produced them, so the fail-closed
-//     answer is that free text does not enter one. That a text field was
-//     answered at all is recorded via AnsweredFields; what it said is not.
+//   - Credential-soliciting fields are refused before a form is ever opened, so
+//     the answer to one never exists. That rejection lives with the integration
+//     that translates a third-party request into a schema (MCP design
+//     §Elicitation); it is the load-bearing control, not this type.
+//   - An authorization target is not user content and never becomes one. See
+//     OpenURLPayload: a URL carrying a PKCE verifier or `state` is structurally
+//     excluded from every durable type, and sensitive authorization goes through
+//     an open-url gate rather than a form field.
 //
-// AskUserAudit.AnswerPreview is NOT a precedent for doing otherwise. It predates
-// this type, its question is authored by the session's own agent rather than by
-// a remote integration, and it is not a reason to widen a new record.
+// Unredacted is not unbounded. A form schema is authored by a third party, so a
+// hostile or buggy integration must not be able to append an unbounded record to
+// the journal. Values is bounded on BOTH codec boundaries by
+// ValidateFormAuditBounds: at most maxFormFields entries, each name at most
+// maxFormFieldNameBytes and each value at most maxFormValueBytes. Those are the
+// same bounds ParseFormAnswers enforces on the way in, re-checked here so a
+// record that was never parsed cannot be journaled or restored either.
 type FormAudit struct {
-	// AnsweredFields lists the schema field names that received a value, sorted
-	// for a stable durable record. A field left empty and not required is absent.
-	AnsweredFields []string `json:"answered_fields,omitempty"`
-	// Choices maps a field name to the closed-set value chosen for it. Only
-	// FieldSelect and FieldConfirm fields appear; FieldText never does.
-	Choices map[string]string `json:"choices,omitempty"`
+	// Values holds the submitted answers keyed by field name, exactly as
+	// ParseFormAnswers produced them (a confirm answer is "true"/"false"). Only
+	// names declared by the form's schema appear. JSON object keys marshal in
+	// sorted order, so the durable record is stable.
+	Values map[string]string `json:"values,omitempty"`
 }
 
 func (PermissionAudit) responseAudit() {}
@@ -194,7 +193,14 @@ func marshalResponseAuditData(kind responseAuditKind, audit ResponseAudit) (json
 	case responseAuditKindAskUser:
 		return marshalResponseAuditJSON(kind, askUserAuditValue(audit))
 	case responseAuditKindForm:
-		return marshalResponseAuditJSON(kind, formAuditValue(audit))
+		v := formAuditValue(audit)
+		// A form audit carries third-party-solicited user content, so its bounds
+		// are enforced here rather than trusted from the caller: an oversized
+		// record must not reach the journal at all.
+		if err := ValidateFormAuditBounds(v); err != nil {
+			return nil, &ResponseAuditEncodeError{Kind: string(kind), Cause: err}
+		}
+		return marshalResponseAuditJSON(kind, v)
 	default:
 		return nil, &UnknownResponseAuditKindError{Kind: string(kind)}
 	}
@@ -217,6 +223,11 @@ func unmarshalResponseAuditData(kind responseAuditKind, data json.RawMessage) (R
 	case responseAuditKindForm:
 		var audit FormAudit
 		if err := decodeStrict(data, &audit); err != nil {
+			return nil, &ResponseAuditDecodeError{Kind: string(kind), Cause: err}
+		}
+		// Restore is an untrusted boundary: re-validate rather than trust that
+		// whatever wrote the record enforced the bounds.
+		if err := ValidateFormAuditBounds(audit); err != nil {
 			return nil, &ResponseAuditDecodeError{Kind: string(kind), Cause: err}
 		}
 		return audit, nil

@@ -796,7 +796,7 @@ func (s *Session) translateGateResponse(entry gateEntry, response gate.GateRespo
 
 // translateFormResponse validates a form gate's response against the schema in
 // its PAYLOAD — the authoritative record of what was asked — and builds the live
-// answer plus the redacted durable audit.
+// answer plus the durable audit that records it.
 //
 // Accept is the only action that carries values. Decline and cancel are explicit
 // non-answers: they record that a human refused or that the request was
