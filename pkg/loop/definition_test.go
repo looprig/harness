@@ -600,13 +600,39 @@ func TestDefinitionRejectsReservedProducedToolName(t *testing.T) {
 	}
 }
 
+func TestIsReservedToolNameMatchesOnlyControlName(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+		want bool
+	}{
+		{name: inference.StructuredOutputToolName, want: true},
+		{name: " " + inference.StructuredOutputToolName},
+		{name: inference.StructuredOutputToolName + " "},
+		{name: "ordinary"},
+		{name: ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := IsReservedToolName(tt.name); got != tt.want {
+				t.Fatalf("IsReservedToolName(%q) = %v, want %v", tt.name, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestBindRejectsReservedInjectedProducedToolName(t *testing.T) {
 	t.Parallel()
 	definition := mustDefinition(t, WithDelegates("worker"))
 	bindings := validToolBindings(t)
+	builds := 0
 	bindings.ExtraTools = []tool.Definition{tool.NewBundleDefinition(
 		"injected", []string{"Subagent", inference.StructuredOutputToolName}, 0,
-		func(context.Context, tool.Bindings) ([]tool.InvokableTool, error) { return nil, nil },
+		func(context.Context, tool.Bindings) ([]tool.InvokableTool, error) {
+			builds++
+			return nil, nil
+		},
 	)}
 	_, err := definition.Bind(context.Background(), bindings)
 	var bindErr *BindError
@@ -614,6 +640,28 @@ func TestBindRejectsReservedInjectedProducedToolName(t *testing.T) {
 		t.Fatalf("Bind() error = %T %v, want BindInvalidDefinition", err, err)
 	}
 	assertReservedToolDefinitionError(t, err)
+	if builds != 0 {
+		t.Fatalf("injected factory ran %d times, want validation before binding mutation", builds)
+	}
+}
+
+func TestOutputSchemaDoesNotAddBoundToolsOrRequirements(t *testing.T) {
+	t.Parallel()
+	definition := mustDefinition(t, WithOutputSchema(testOutputSchema()))
+	if got := definition.ToolRequirements(); got != 0 {
+		t.Fatalf("ToolRequirements() = %v, want no terminal-tool permission requirements", got)
+	}
+	bound, err := definition.Bind(context.Background(), validToolBindings(t))
+	if err != nil {
+		t.Fatalf("Bind() error = %v", err)
+	}
+	base, ok := bound.Mode("")
+	if !ok {
+		t.Fatal("base mode missing")
+	}
+	if len(base.Tools) != 0 {
+		t.Fatalf("bound executable tools = %#v, want none for output policy", base.Tools)
+	}
 }
 
 func TestOutputSchemaPolicyIdentity(t *testing.T) {

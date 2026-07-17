@@ -7,6 +7,7 @@ import (
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/harness/pkg/tool"
+	"github.com/looprig/inference"
 )
 
 // The handle satisfies the optional installer interface, so an application holding the
@@ -113,6 +114,20 @@ func (h *loopHandle) ReplaceExternalTools(ctx context.Context, set loop.External
 // external tool can therefore never ESCALATE a loop's privileges — it is offered
 // exactly the bindings the declared tools were bound with, and nothing more.
 func (h *loopHandle) buildExternalTools(ctx context.Context, set loop.ExternalToolset) ([]tool.InvokableTool, []event.ExternalToolIdentity, error) {
+	// Validate the complete immutable name projection before invoking any factory.
+	// That keeps rejection atomic even when a reserved definition follows valid
+	// definitions whose factories have observable work.
+	for _, def := range set.Definitions {
+		if def == nil {
+			return nil, nil, &loop.ChangeError{Kind: loop.ChangeExternalBuildFailed}
+		}
+		for _, name := range def.ProducedToolNames() {
+			if loop.IsReservedToolName(name) {
+				return nil, nil, &loop.ChangeError{Kind: loop.ChangeExternalToolCollision, Tool: inference.StructuredOutputToolName}
+			}
+		}
+	}
+
 	var built []tool.InvokableTool
 	var identities []event.ExternalToolIdentity
 	seen := make(map[string]struct{})
@@ -134,6 +149,9 @@ func (h *loopHandle) buildExternalTools(ctx context.Context, set loop.ExternalTo
 			}
 			if info == nil || info.Name == "" {
 				return nil, nil, &loop.ChangeError{Kind: loop.ChangeExternalBuildFailed, Tool: def.Name()}
+			}
+			if loop.IsReservedToolName(info.Name) {
+				return nil, nil, &loop.ChangeError{Kind: loop.ChangeExternalToolCollision, Tool: inference.StructuredOutputToolName}
 			}
 			digest, digestErr := tool.SchemaDigest(info.Schema)
 			if digestErr != nil {

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/looprig/core/content"
@@ -93,6 +94,91 @@ func TestResolveTurnOutputStrategy(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestTerminalOutputToolUsesReservedControlIdentityAndClonesSchema(t *testing.T) {
+	t.Parallel()
+	output := testLoopOutput()
+	output.Name = "public_result_name"
+	toolDefinition := terminalOutputTool(output)
+	if toolDefinition.Name != inference.StructuredOutputToolName {
+		t.Fatalf("terminal tool name = %q, want reserved control name", toolDefinition.Name)
+	}
+	if toolDefinition.Description != output.Description {
+		t.Fatalf("terminal tool description = %q, want %q", toolDefinition.Description, output.Description)
+	}
+	if !reflect.DeepEqual(toolDefinition.Schema, output.Schema) {
+		t.Fatalf("terminal tool schema = %s, want %s", toolDefinition.Schema, output.Schema)
+	}
+	toolDefinition.Schema[0] = '['
+	if output.Schema[0] == '[' {
+		t.Fatal("terminal tool schema aliases output schema")
+	}
+
+	// Empty descriptions are valid for ordinary model-facing tools, so the
+	// fallback preserves that convention instead of inventing policy text.
+	output.Description = ""
+	if got := terminalOutputTool(output).Description; got != "" {
+		t.Fatalf("empty output description became %q, want empty", got)
+	}
+}
+
+func TestResolveTurnOutputRejectsReservedOrdinaryToolWithoutOutput(t *testing.T) {
+	t.Parallel()
+	_, err := resolveTurnOutput(testModel(), nil, []inference.Tool{{Name: inference.StructuredOutputToolName}})
+	var conflict *inference.StructuredOutputConflictError
+	if !errors.As(err, &conflict) || conflict.Feature != "reserved_structured_output_tool" {
+		t.Fatalf("resolveTurnOutput() error = %T %v, want reserved-name conflict", err, err)
+	}
+}
+
+func TestResolveTurnOutputRejectsInvalidSchemaWithoutRawSchema(t *testing.T) {
+	t.Parallel()
+	const secret = "terminal-schema-secret"
+	tests := []struct {
+		name   string
+		schema json.RawMessage
+	}{
+		{name: "nil", schema: nil},
+		{name: "malformed", schema: json.RawMessage(`{"type":"object","` + secret)},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			output := testLoopOutput()
+			output.Schema = tt.schema
+			_, err := resolveTurnOutput(outputModel(model.Capabilities{Tools: true}), &output, nil)
+			var schemaErr *inference.SchemaValidationError
+			if !errors.As(err, &schemaErr) {
+				t.Fatalf("resolveTurnOutput() error = %T %v, want SchemaValidationError", err, err)
+			}
+			if strings.Contains(err.Error(), secret) {
+				t.Fatalf("schema validation error exposed raw schema: %v", err)
+			}
+		})
+	}
+}
+
+func TestTerminalOutputPlanDoesNotMutateExecutableToolRegistry(t *testing.T) {
+	t.Parallel()
+	ordinary := &echoTool{name: "Echo", output: "ok"}
+	registry := []tool.InvokableTool{ordinary}
+	defs := toolDefs(context.Background(), registry)
+	output := testLoopOutput()
+	plan, err := resolveTurnOutput(outputModel(model.Capabilities{Tools: true}), &output, defs)
+	if err != nil {
+		t.Fatalf("resolveTurnOutput() error = %v", err)
+	}
+	request := plan.apply(inference.Request{})
+	if len(request.Tools) != 2 || request.Tools[1].Name != inference.StructuredOutputToolName {
+		t.Fatalf("model-facing tools = %#v, want ordinary then terminal", request.Tools)
+	}
+	if len(registry) != 1 || registry[0] != ordinary {
+		t.Fatalf("executable registry mutated: %#v", registry)
+	}
+	if lookupTool(context.Background(), registry, inference.StructuredOutputToolName) != nil {
+		t.Fatal("reserved terminal definition became executable")
 	}
 }
 

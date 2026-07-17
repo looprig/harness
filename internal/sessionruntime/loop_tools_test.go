@@ -356,6 +356,41 @@ func TestReplaceExternalToolsRejectsDuplicateWithinBatch(t *testing.T) {
 	}
 }
 
+func TestReplaceExternalToolsRejectsReservedNameBeforeBuildingBatch(t *testing.T) {
+	t.Parallel()
+	s := newToolSession(t)
+	installer := installerFor(t, s)
+
+	var builds int
+	definition := func(name string) tool.Definition {
+		return tool.NewDefinition(name, 0, func(context.Context, tool.Bindings) ([]tool.InvokableTool, error) {
+			builds++
+			return []tool.InvokableTool{&extStubTool{name: name}}, nil
+		})
+	}
+	err := installer.ReplaceExternalTools(context.Background(), loop.ExternalToolset{
+		Source: "mcp", Generation: "g1",
+		Definitions: []tool.Definition{definition("safe"), definition(inference.StructuredOutputToolName)},
+	})
+	var changeErr *loop.ChangeError
+	if !errors.As(err, &changeErr) || changeErr.Kind != loop.ChangeExternalToolCollision {
+		t.Fatalf("err = %T %v, want ChangeExternalToolCollision", err, err)
+	}
+	if changeErr.Tool != inference.StructuredOutputToolName {
+		t.Fatalf("ChangeError.Tool = %q, want reserved name", changeErr.Tool)
+	}
+	if builds != 0 {
+		t.Fatalf("external factories ran %d times, want preflight rejection before any build", builds)
+	}
+
+	// A failed reserved-name generation cannot partially occupy the source slot.
+	if err := installer.ReplaceExternalTools(context.Background(), loop.ExternalToolset{
+		Source: "mcp", Generation: "g2", Definitions: []tool.Definition{extDefinition("safe")},
+	}); err != nil {
+		t.Fatalf("valid generation after reserved collision: %v", err)
+	}
+}
+
 // TestReplaceExternalToolsValidatesRequest covers the boundary validation: an unnamed
 // source or generation is refused before anything is built.
 func TestReplaceExternalToolsValidatesRequest(t *testing.T) {

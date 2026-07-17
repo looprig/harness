@@ -4,6 +4,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/looprig/core/content"
+	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/inference"
 	model "github.com/looprig/inference/model"
 	stream "github.com/looprig/inference/stream"
@@ -29,6 +30,9 @@ type turnOutputPlan struct {
 
 func resolveTurnOutput(current model.Model, configured *inference.OutputSchema, ordinary []inference.Tool) (turnOutputPlan, error) {
 	plan := turnOutputPlan{strategy: outputStrategyNone, tools: cloneInferenceTools(ordinary)}
+	if err := validateReservedOutputTools(ordinary); err != nil {
+		return turnOutputPlan{}, err
+	}
 	if configured == nil {
 		return plan, nil
 	}
@@ -54,12 +58,19 @@ func resolveTurnOutput(current model.Model, configured *inference.OutputSchema, 
 
 	plan.strategy = outputStrategyTerminalTool
 	plan.toolChoice = inference.ToolChoiceRequired
-	plan.tools = append(plan.tools, inference.Tool{
+	plan.tools = append(plan.tools, terminalOutputTool(output))
+	return plan, nil
+}
+
+// terminalOutputTool builds the request-only control definition used by the
+// portability fallback. Empty descriptions are valid for model-facing tools, so
+// they remain empty rather than acquiring Harness-authored policy text.
+func terminalOutputTool(output inference.OutputSchema) inference.Tool {
+	return inference.Tool{
 		Name:        inference.StructuredOutputToolName,
 		Description: output.Description,
 		Schema:      append([]byte(nil), output.Schema...),
-	})
-	return plan, nil
+	}
 }
 
 func structuredOutputModelDiagnostic(name string) string {
@@ -79,13 +90,19 @@ func structuredOutputModelDiagnostic(name string) string {
 func validateOrdinaryOutputTools(tools []inference.Tool) error {
 	seen := make(map[string]struct{}, len(tools))
 	for _, definition := range tools {
-		if definition.Name == inference.StructuredOutputToolName {
-			return &inference.StructuredOutputConflictError{Feature: "reserved_structured_output_tool"}
-		}
 		if _, exists := seen[definition.Name]; exists {
 			return &inference.StructuredOutputConflictError{Feature: "duplicate_tool_name"}
 		}
 		seen[definition.Name] = struct{}{}
+	}
+	return validateReservedOutputTools(tools)
+}
+
+func validateReservedOutputTools(tools []inference.Tool) error {
+	for _, definition := range tools {
+		if loop.IsReservedToolName(definition.Name) {
+			return &inference.StructuredOutputConflictError{Feature: "reserved_structured_output_tool"}
+		}
 	}
 	return nil
 }
@@ -141,7 +158,7 @@ func validateNativeStep(
 			return nil, false, &inference.StructuredOutputFinishError{Reason: inference.StructuredOutputFinishReasonOther}
 		}
 		for _, call := range calls {
-			if call.Name == inference.StructuredOutputToolName {
+			if loop.IsReservedToolName(call.Name) {
 				return nil, false, &inference.StructuredOutputConflictError{Feature: "native_terminal_tool"}
 			}
 			if !validToolCall(call) {

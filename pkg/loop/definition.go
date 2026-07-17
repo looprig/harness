@@ -544,6 +544,10 @@ func (d Definition) Bind(ctx context.Context, bindings tool.Bindings) (BoundDefi
 				if info == nil || strings.TrimSpace(info.Name) == "" {
 					return nil, &BindError{Kind: BindInvalidToolInfo, Name: name, Index: toolIndex}
 				}
+				if IsReservedToolName(info.Name) {
+					return nil, &BindError{Kind: BindInvalidToolInfo, Name: info.Name, Index: toolIndex,
+						Cause: &DefinitionError{Kind: DefinitionReservedToolName, Field: "built_tool_info"}}
+				}
 				if _, exists := toolNames[info.Name]; exists {
 					return nil, &BindError{Kind: BindDuplicateToolName, Name: info.Name, Index: toolIndex}
 				}
@@ -1033,12 +1037,19 @@ func validateDefinitionTools(defs []tool.Definition, field string) error {
 			return &DefinitionError{Kind: DefinitionInvalidTool, Field: field, Value: indexString(index)}
 		}
 		for _, name := range def.ProducedToolNames() {
-			if strings.TrimSpace(name) == inference.StructuredOutputToolName {
+			if IsReservedToolName(name) {
 				return &DefinitionError{Kind: DefinitionReservedToolName, Field: field}
 			}
 		}
 	}
 	return nil
+}
+
+// IsReservedToolName reports whether name is Harness's exact model-facing
+// structured-output control name. It deliberately does not trim: surrounding
+// whitespace is invalid ordinary tool metadata, but it is not the reserved name.
+func IsReservedToolName(name string) bool {
+	return name == inference.StructuredOutputToolName
 }
 
 func cloneModes(modes []Mode) []Mode {
