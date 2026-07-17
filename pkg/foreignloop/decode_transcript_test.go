@@ -19,10 +19,10 @@ type transcriptProjectionGolden struct {
 	Snapshot         content.AgenticMessages   `json:"snapshot"`
 }
 
-type transcriptErrorGolden struct {
-	Error     string `json:"error"`
-	ErrorType string `json:"error_type"`
-	Cause     string `json:"cause"`
+type missingHistoryGolden struct {
+	Available bool                      `json:"available"`
+	Steps     []content.AgenticMessages `json:"steps"`
+	Cause     string                    `json:"cause"`
 }
 
 func userMessage(text string) *content.UserMessage {
@@ -157,9 +157,9 @@ func TestDecodeTranscriptMissingFileGolden(t *testing.T) {
 		t.Errorf("errors.Is(error, os.ErrNotExist) = false: %v", err)
 	}
 
-	gotJSON := canonicalJSON(t, transcriptErrorGolden{
-		Error:     err.Error(),
-		ErrorType: "TranscriptUnavailableError",
+	gotJSON := canonicalJSON(t, missingHistoryGolden{
+		Available: false,
+		Steps:     got,
 		Cause:     "not_exist",
 	})
 	if wantJSON := readGolden(t, "missing"); !bytes.Equal(gotJSON, wantJSON) {
