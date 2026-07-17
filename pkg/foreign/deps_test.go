@@ -9,7 +9,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -17,6 +16,7 @@ import (
 )
 
 const (
+	harnessModulePath          = "github.com/looprig/harness"
 	extractedForeignloopModule = "github.com/looprig/foreignloop"
 	harnessInternalPrefix      = "github.com/looprig/harness/internal"
 	oldForeignloopPackage      = "github.com/looprig/harness/pkg/foreignloop"
@@ -131,13 +131,103 @@ func foreignPackageImportViolations(dir string, standardLibrary map[string]struc
 	return violations, nil
 }
 
+func findHarnessModuleRoot(start string) (string, error) {
+	start, err := filepath.Abs(start)
+	if err != nil {
+		return "", fmt.Errorf("resolve Harness module search path %q: %w", start, err)
+	}
+	for dir := start; ; dir = filepath.Dir(dir) {
+		goMod := filepath.Join(dir, "go.mod")
+		contents, err := os.ReadFile(goMod)
+		switch {
+		case err == nil && goModModulePath(contents) == harnessModulePath:
+			return dir, nil
+		case err != nil && !os.IsNotExist(err):
+			return "", fmt.Errorf("read %s: %w", goMod, err)
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			break
+		}
+	}
+	return "", fmt.Errorf("find module %q from %s: no matching go.mod", harnessModulePath, start)
+}
+
+func goModModulePath(contents []byte) string {
+	scanner := bufio.NewScanner(strings.NewReader(string(contents)))
+	for scanner.Scan() {
+		line, _, _ := strings.Cut(scanner.Text(), "//")
+		fields := strings.Fields(line)
+		if len(fields) != 2 || fields[0] != "module" {
+			continue
+		}
+		if unquoted, err := strconv.Unquote(fields[1]); err == nil {
+			return unquoted
+		}
+		return fields[1]
+	}
+	return ""
+}
+
+func harnessSourceImportViolations(root string) ([]string, error) {
+	var violations []string
+	err := filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if entry.IsDir() {
+			if path == root {
+				return nil
+			}
+			if entry.Name() == "vendor" || strings.HasPrefix(entry.Name(), ".") {
+				return filepath.SkipDir
+			}
+			_, err := os.Stat(filepath.Join(path, "go.mod"))
+			switch {
+			case err == nil:
+				return filepath.SkipDir
+			case !os.IsNotExist(err):
+				return err
+			}
+			return nil
+		}
+		if filepath.Ext(path) != ".go" {
+			return nil
+		}
+		file, err := parser.ParseFile(token.NewFileSet(), path, nil, parser.ImportsOnly)
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(root, path)
+		if err != nil {
+			return err
+		}
+		for _, spec := range file.Imports {
+			importPath, err := strconv.Unquote(spec.Path.Value)
+			if err != nil {
+				return err
+			}
+			if isForbiddenForeignloopDependency(importPath) {
+				violations = append(violations, fmt.Sprintf("%s imports %q", filepath.ToSlash(rel), importPath))
+			}
+		}
+		return nil
+	})
+	sort.Strings(violations)
+	return violations, err
+}
+
 func foreignTestModuleRoot(t *testing.T) string {
 	t.Helper()
-	_, filename, _, ok := runtime.Caller(0)
-	if !ok {
-		t.Fatal("locate pkg/foreign dependency test")
+	workingDir, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("get pkg/foreign test working directory: %v", err)
 	}
-	return filepath.Clean(filepath.Join(filepath.Dir(filename), "..", ".."))
+	root, err := findHarnessModuleRoot(workingDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return root
 }
 
 func TestForbiddenForeignloopDependencyClassifierAndParser(t *testing.T) {
@@ -242,6 +332,16 @@ func TestHarnessDependencyDirection(t *testing.T) {
 	}
 }
 
+func TestHarnessSourceImportBoundary(t *testing.T) {
+	violations, err := harnessSourceImportViolations(foreignTestModuleRoot(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, violation := range violations {
+		t.Errorf("Harness source imports forbidden module package: %s", violation)
+	}
+}
+
 func TestForeignPackageImportBoundary(t *testing.T) {
 	goBinary, err := exec.LookPath("go")
 	if err != nil {
@@ -284,5 +384,69 @@ func TestForeignPackageImportBoundaryIncludesProductionAndTestFiles(t *testing.T
 	}
 	if strings.Join(got, "\n") != strings.Join(want, "\n") {
 		t.Fatalf("foreignPackageImportViolations() = %v, want %v", got, want)
+	}
+}
+
+func TestHarnessModuleRootDiscovery(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "go.mod"), []byte("module github.com/looprig/harness\n\ngo 1.26.4\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	nested := filepath.Join(root, "pkg", "foreign")
+	if err := os.MkdirAll(nested, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := findHarnessModuleRoot(nested)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != root {
+		t.Fatalf("findHarnessModuleRoot() = %q, want %q", got, root)
+	}
+}
+
+func TestHarnessModuleRootRejectsWrongModule(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "go.mod"), []byte("module github.com/example/other\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	nested := filepath.Join(root, "pkg", "foreign")
+	if err := os.MkdirAll(nested, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := findHarnessModuleRoot(nested)
+	if err == nil || !strings.Contains(err.Error(), "github.com/looprig/harness") {
+		t.Fatalf("findHarnessModuleRoot() error = %v, want missing Harness module error", err)
+	}
+}
+
+func TestHarnessSourceImportBoundaryIncludesBuildTaggedFiles(t *testing.T) {
+	root := t.TempDir()
+	files := map[string]string{
+		"pkg/tagged/foreign_plan9_test.go": "//go:build plan9\n\npackage tagged\nimport _ \"github.com/looprig/foreignloop/codex\"\n",
+		"vendor/ignored/ignored.go":        "package ignored\nimport _ \"github.com/looprig/foreignloop\"\n",
+		".worktrees/ignored/leak.go":       "package ignored\nimport _ \"github.com/looprig/foreignloop\"\n",
+		"nested/go.mod":                    "module github.com/example/nested\n",
+		"nested/ignored/leak.go":           "package ignored\nimport _ \"github.com/looprig/foreignloop\"\n",
+	}
+	for rel, contents := range files {
+		path := filepath.Join(root, filepath.FromSlash(rel))
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	got, err := harnessSourceImportViolations(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{`pkg/tagged/foreign_plan9_test.go imports "github.com/looprig/foreignloop/codex"`}
+	if strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("harnessSourceImportViolations() = %v, want %v", got, want)
 	}
 }
