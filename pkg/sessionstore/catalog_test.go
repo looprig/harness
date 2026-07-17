@@ -476,6 +476,15 @@ func TestApplyEventStatusFold(t *testing.T) {
 	sid := fixedUUID(0x01)
 	tid := fixedUUID(0x0A)
 	gid := fixedUUID(0x0B)
+	// A loop/step/event identity so the summarized turn/step events (below) satisfy
+	// their identity profile: MarshalEvent (via summarize) now validates identity, so
+	// a turn event needs SessionID+LoopID+TurnID and a step event also a StepID, both
+	// with an EventID — the same rule UnmarshalEvent enforces on the way back in.
+	lid := fixedUUID(0x0C)
+	stid := fixedUUID(0x0E)
+	eid := fixedUUID(0x0D)
+	turnFold := event.Header{Coordinates: identity.Coordinates{SessionID: sid, LoopID: lid, TurnID: tid}, EventID: eid}
+	stepFold := event.Header{Coordinates: identity.Coordinates{SessionID: sid, LoopID: lid, TurnID: tid, StepID: stid}, EventID: eid}
 	created := time.Date(2026, 7, 8, 8, 0, 0, 0, time.UTC)
 	clock := time.Date(2026, 7, 8, 9, 0, 0, 0, time.UTC)
 
@@ -571,7 +580,7 @@ func TestApplyEventStatusFold(t *testing.T) {
 		{
 			name:        "TurnDone folds to idle, records LastTurn, clears ActiveTurnID",
 			start:       SessionMeta{SessionID: sid, State: StateRunning, ActiveTurnID: tid},
-			ev:          event.TurnDone{Header: hdrTurn(sid, tid)},
+			ev:          event.TurnDone{Header: turnFold},
 			seq:         10,
 			wantChanged: true,
 			check: func(t *testing.T, m SessionMeta) {
@@ -589,7 +598,7 @@ func TestApplyEventStatusFold(t *testing.T) {
 		{
 			name:        "TurnFailed folds to failed and records LastTurn",
 			start:       SessionMeta{SessionID: sid, State: StateRunning},
-			ev:          event.TurnFailed{Header: hdrTurn(sid, tid)},
+			ev:          event.TurnFailed{Header: turnFold},
 			seq:         11,
 			wantChanged: true,
 			check: func(t *testing.T, m SessionMeta) {
@@ -631,7 +640,7 @@ func TestApplyEventStatusFold(t *testing.T) {
 		{
 			name:        "StepDone records LastStep and bumps LastJournalSeq",
 			start:       SessionMeta{SessionID: sid, LastJournalSeq: 3},
-			ev:          event.StepDone{Header: hdr(sid), Messages: validStepMessages()},
+			ev:          event.StepDone{Header: stepFold, Messages: validStepMessages()},
 			seq:         20,
 			wantChanged: true,
 			check: func(t *testing.T, m SessionMeta) {

@@ -140,7 +140,7 @@ func TestHandleEventsStreamsEnduring(t *testing.T) {
 	t.Parallel()
 
 	sid := parseTestUUID(t, eventsSIDStr)
-	ev := event.TurnDone{TurnIndex: 1}
+	ev := event.TurnDone{Header: fixTurnHeader, TurnIndex: 1}
 	want, err := event.MarshalEvent(ev)
 	if err != nil {
 		t.Fatalf("MarshalEvent(TurnDone) error = %v", err)
@@ -197,7 +197,7 @@ func TestHandleEventsZeroSeqEnduring(t *testing.T) {
 	t.Parallel()
 
 	sid := parseTestUUID(t, eventsSIDStr)
-	ev := event.TurnDone{TurnIndex: 1}
+	ev := event.TurnDone{Header: fixTurnHeader, TurnIndex: 1}
 	want, err := event.MarshalEvent(ev)
 	if err != nil {
 		t.Fatalf("MarshalEvent(TurnDone) error = %v", err)
@@ -418,7 +418,7 @@ func TestHandleEventsSkipsUnrecognizedEphemeral(t *testing.T) {
 
 	sid := parseTestUUID(t, eventsSIDStr)
 	eph := event.TokenDelta{TurnIndex: 1} // nil Chunk => unrepresentable => skipped
-	end := event.TurnDone{TurnIndex: 2}
+	end := event.TurnDone{Header: fixTurnHeader, TurnIndex: 2}
 	want, err := event.MarshalEvent(end)
 	if err != nil {
 		t.Fatalf("MarshalEvent(TurnDone) error = %v", err)
@@ -515,7 +515,7 @@ func TestHandleEventsWriteError(t *testing.T) {
 	done := runEvents(srv, rec, eventsRequest(t, context.Background(), eventsSIDStr))
 
 	// A single enduring delivery drives one w.Write, which fails; the loop must return.
-	sub.ch <- event.Delivery{Event: event.TurnDone{TurnIndex: 1}, JournalSeq: 1}
+	sub.ch <- event.Delivery{Event: event.TurnDone{Header: fixTurnHeader, TurnIndex: 1}, JournalSeq: 1}
 	select {
 	case <-done:
 	case <-time.After(streamDeadline):

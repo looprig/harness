@@ -41,7 +41,7 @@ func FuzzEphemeralFrameDecode(f *testing.F) {
 
 	// A real durable envelope (event.MarshalEvent of an Enduring TurnDone): the exact
 	// bytes that ride in an enduringFrame's inner "event" field.
-	if raw, err := event.MarshalEvent(event.TurnDone{TurnIndex: 1}); err == nil {
+	if raw, err := event.MarshalEvent(event.TurnDone{Header: fixTurnHeader, TurnIndex: 1}); err == nil {
 		f.Add(raw)
 	}
 

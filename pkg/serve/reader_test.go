@@ -60,7 +60,7 @@ func TestStatusEventMarshalJSON(t *testing.T) {
 		},
 		{
 			name:        "enduring event carries codec type tag",
-			se:          StatusEvent{JournalSeq: 9, Event: event.TurnDone{}},
+			se:          StatusEvent{JournalSeq: 9, Event: event.TurnDone{Header: fixTurnHeader}},
 			wantSeq:     9,
 			wantEventOK: true,
 			wantType:    "TurnDone",

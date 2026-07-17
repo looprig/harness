@@ -40,7 +40,18 @@ type GateResolved struct {
 	enduring
 	loopScoped
 	Header
-	GateID        gate.ID             `json:"gate_id,omitzero"`
+	GateID gate.ID `json:"gate_id,omitzero"`
+	// Resolver is the self-contained scope discriminator the DECODER needs to pick
+	// this record's identity profile. GatePrepared and GateOpened embed the full
+	// gate.Gate (whose Resolver already names the owner), but GateResolved carries
+	// only the GateID and coordinates — so without this field a decoded GateResolved
+	// could not tell a host-owned gate (SessionID required; loop/turn/step optional)
+	// from a loop-owned one (full step profile). It is additive and omitempty: an old
+	// record written before this field existed decodes with an empty Resolver and is
+	// validated under the strict loop-owned profile, matching every gate record that
+	// could ever restore before this change. It is named Resolver (a plain field, not
+	// a promoted method) — unlike ApprovalScope, no mixin promotes a Resolver() method.
+	Resolver      gate.ResolverKind   `json:"resolver,omitempty"`
 	Reason        gate.CloseReason    `json:"reason,omitempty"`
 	Action        string              `json:"action,omitempty"`
 	ApprovalScope tool.ApprovalScope  `json:"scope,omitzero"`

@@ -134,8 +134,8 @@ func TestServerHandleStatus(t *testing.T) {
 			State:          state,
 			LastJournalSeq: 7,
 			ActiveTurnID:   turnID,
-			LastTurn:       &StatusEvent{JournalSeq: 7, Event: event.SessionStarted{}},
-			LastStep:       &StatusEvent{JournalSeq: 6, Event: event.SessionStarted{}},
+			LastTurn:       &StatusEvent{JournalSeq: 7, Event: event.SessionStarted{Header: fixSessionHeader}},
+			LastStep:       &StatusEvent{JournalSeq: 6, Event: event.SessionStarted{Header: fixSessionHeader}},
 		}
 	}
 
@@ -218,7 +218,7 @@ func TestServerHandleJournal(t *testing.T) {
 	sid := parseTestUUID(t, sidStr)
 
 	sample := EventJournalPage{
-		Events:         []StatusEvent{{JournalSeq: 3, Event: event.SessionStarted{}}},
+		Events:         []StatusEvent{{JournalSeq: 3, Event: event.SessionStarted{Header: fixSessionHeader}}},
 		NextJournalSeq: 4,
 		Done:           false,
 	}

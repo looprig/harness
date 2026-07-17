@@ -1,1 +1,1 @@
-{"events":[{"journal_seq":3,"event":{"turn_index":1,"type":"TurnDone","v":1}}],"next_journal_seq":4,"done":false}
+{"events":[{"journal_seq":3,"event":{"created_at":"2026-07-08T12:00:00Z","event_id":"00000000-0000-0000-0000-000000000000","loop_id":"00000000-0000-0000-0000-000000000000","session_id":"00000000-0000-0000-0000-000000000000","turn_id":"00000000-0000-0000-0000-000000000000","turn_index":1,"type":"TurnDone","v":1}}],"next_journal_seq":4,"done":false}

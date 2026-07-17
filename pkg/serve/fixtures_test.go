@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/looprig/core/content"
+	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/identity"
 )
@@ -36,8 +37,33 @@ const (
 	fixSessionID = "11111111-1111-1111-1111-111111111111"
 	fixCommandID = "22222222-2222-2222-2222-222222222222"
 	fixTurnID    = "33333333-3333-3333-3333-333333333333"
+	fixLoopID    = "44444444-4444-4444-4444-444444444444"
+	fixStepID    = "66666666-6666-6666-6666-666666666666"
 	fixGateID    = "88888888-8888-8888-8888-888888888888"
 	fixEventID   = "55555555-5555-5555-5555-555555555555"
+)
+
+// Valid producer identities for events that reach MarshalEvent. MarshalEvent is the
+// durable-envelope authority and validates identity, so an SSE/status fixture must
+// carry a restorable header (session/loop/turn/step per scope) rather than a bare
+// one — a bare event is not a shape production ever streams. Every uuid here is
+// pinned to the zero uuid by the normalizer, so golden fixtures stay deterministic.
+var (
+	fixSessionHeader = event.Header{
+		Coordinates: identity.Coordinates{SessionID: uuid.MustParse(fixSessionID)},
+		EventID:     uuid.MustParse(fixEventID),
+		CreatedAt:   fixedInstant,
+	}
+	fixTurnHeader = event.Header{
+		Coordinates: identity.Coordinates{SessionID: uuid.MustParse(fixSessionID), LoopID: uuid.MustParse(fixLoopID), TurnID: uuid.MustParse(fixTurnID)},
+		EventID:     uuid.MustParse(fixEventID),
+		CreatedAt:   fixedInstant,
+	}
+	fixStepHeader = event.Header{
+		Coordinates: identity.Coordinates{SessionID: uuid.MustParse(fixSessionID), LoopID: uuid.MustParse(fixLoopID), TurnID: uuid.MustParse(fixTurnID), StepID: uuid.MustParse(fixStepID)},
+		EventID:     uuid.MustParse(fixEventID),
+		CreatedAt:   fixedInstant,
+	}
 )
 
 // fixedInstant is the single timestamp every timestamp-bearing fixture is fed. It
@@ -247,8 +273,8 @@ func produceStatusRunning(t *testing.T) []byte {
 		State:          "running",
 		LastJournalSeq: 7,
 		ActiveTurnID:   parseTestUUID(t, fixTurnID),
-		LastTurn:       &StatusEvent{JournalSeq: 7, Event: event.TurnDone{TurnIndex: 1}},
-		LastStep: &StatusEvent{JournalSeq: 6, Event: event.StepDone{Messages: content.AgenticMessages{
+		LastTurn:       &StatusEvent{JournalSeq: 7, Event: event.TurnDone{Header: fixTurnHeader, TurnIndex: 1}},
+		LastStep: &StatusEvent{JournalSeq: 6, Event: event.StepDone{Header: fixStepHeader, Messages: content.AgenticMessages{
 			&content.AIMessage{Message: content.Message{Role: content.RoleAssistant}},
 		}}},
 		UpdatedAt: fixedInstant,
@@ -263,7 +289,7 @@ func produceStatusRunning(t *testing.T) []byte {
 func produceJournalPage(t *testing.T) []byte {
 	t.Helper()
 	page := EventJournalPage{
-		Events:         []StatusEvent{{JournalSeq: 3, Event: event.TurnDone{TurnIndex: 1}}},
+		Events:         []StatusEvent{{JournalSeq: 3, Event: event.TurnDone{Header: fixTurnHeader, TurnIndex: 1}}},
 		NextJournalSeq: 4,
 		Done:           false,
 	}
@@ -287,7 +313,7 @@ func produceError(status int, code, message string, retryable bool) func(t *test
 
 func produceEnduringFrame(t *testing.T) []byte {
 	t.Helper()
-	ev := event.TurnDone{Header: fixedHeader(t), TurnIndex: 1}
+	ev := event.TurnDone{Header: fixTurnHeader, TurnIndex: 1}
 	frame, ok := encodeDelivery(event.Delivery{Event: ev, JournalSeq: 42})
 	if !ok {
 		t.Fatal("encodeDelivery skipped the enduring delivery")

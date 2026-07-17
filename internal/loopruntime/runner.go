@@ -403,7 +403,7 @@ func askPermission(
 	// never blocks). ack carries the session-minted GateID or the prepare/activate error.
 	reply := make(chan command.Command, 1)
 	ack := make(chan gateInstallAck, 1)
-	g := permissionGate(r.callID, req)
+	g := stampGateSubjectProvenance(ctx, permissionGate(r.callID, req))
 	payload := gatedomain.PermissionPayload{Request: req}
 
 	select {

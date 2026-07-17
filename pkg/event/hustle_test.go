@@ -128,7 +128,12 @@ func TestMarshalEventVisibilityBoundary(t *testing.T) {
 		testCase := tt
 		t.Run(testCase.name, func(t *testing.T) {
 			t.Parallel()
-			_, err := MarshalEvent(SessionStarted{Header: Header{EventVisibility: testCase.visibility}})
+			// A valid session identity so only the visibility boundary is under test —
+			// MarshalEvent validates identity too, so a bare header would fail on
+			// EventID/SessionID before the visibility check this case targets.
+			hdr := fullHeaderSession()
+			hdr.EventVisibility = testCase.visibility
+			_, err := MarshalEvent(SessionStarted{Header: hdr})
 			if (err != nil) != testCase.wantErr {
 				t.Fatalf("MarshalEvent() error = %v, wantErr %v", err, testCase.wantErr)
 			}

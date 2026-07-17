@@ -3,6 +3,7 @@ package event
 import (
 	"github.com/looprig/core/content"
 	"github.com/looprig/core/uuid"
+	"github.com/looprig/harness/pkg/gate"
 	"github.com/looprig/harness/pkg/hustle"
 	"github.com/looprig/harness/pkg/identity"
 	model "github.com/looprig/inference/model"
@@ -505,7 +506,7 @@ func toolExecutionID(ev Event) uuid.UUID {
 // half-registered — there is exactly one place to add it. An unknown type renders
 // as "Event" with ok==false (ValidateEvent rejects it fail-secure).
 func classify(ev Event) (name string, profile idProfile, ok bool) {
-	switch ev.(type) {
+	switch e := ev.(type) {
 	case SessionStarted:
 		return "SessionStarted", sessionProfile(), true
 	case SessionActive:
@@ -609,11 +610,14 @@ func classify(ev Event) (name string, profile idProfile, ok bool) {
 	case ToolCallCompleted:
 		return "ToolCallCompleted", toolProfile(), true
 	case GatePrepared:
-		return "GatePrepared", stepProfile(), true
+		// Gate identity varies by how the gate was raised, so the profile is selected
+		// from the embedded gate's resolver rather than fixed per type. GatePrepared and
+		// GateOpened carry the full gate.Gate; GateResolved carries its own Resolver tag.
+		return "GatePrepared", gateIdentityProfile(e.Gate.Resolver), true
 	case GateOpened:
-		return "GateOpened", stepProfile(), true
+		return "GateOpened", gateIdentityProfile(e.Gate.Resolver), true
 	case GateResolved:
-		return "GateResolved", stepProfile(), true
+		return "GateResolved", gateIdentityProfile(e.Resolver), true
 	default:
 		return "Event", idProfile{}, false
 	}
@@ -643,6 +647,39 @@ func inputCancelledProfile() idProfile {
 // stepProfile: step events (TokenDelta/StepDone) — SessionID+LoopID+TurnID+StepID set.
 func stepProfile() idProfile {
 	return idProfile{requireSession: true, requireLoop: true, requireTurn: true, requireStep: true}
+}
+
+// gateIdentityProfile selects a gate event's identity contract from the resolver
+// that owns it. The three gate events are loopScoped (Scope()==ScopeLoop) but the
+// coordinates a gate legitimately carries depend on HOW it was raised, so a single
+// per-type profile is wrong:
+//
+//   - Host-owned gates (gate.ResolverSession — a form/open-url elicitation raised by
+//     an integration through GateHost.OpenHostGate) belong to no turn or step, and
+//     a startup elicitation belongs to no loop either. Their only guaranteed
+//     coordinate is the SessionID; LoopID/TurnID/StepID are OPTIONAL (a
+//     loop-attributed elicitation carries a LoopID, startup carries none).
+//   - Loop-owned gates (gate.ResolverLoop — permission/ask-user) keep the FULL step
+//     profile: a permission gate that parks a tool call without a step is malformed
+//     and must fail, exactly as before.
+//
+// An empty/unknown resolver fails SECURE to the strict loop-owned profile — the same
+// contract every gate record enforced before host-owned gates were distinguished, so
+// a record written before the discriminator existed is held to the stricter rule.
+func gateIdentityProfile(resolver gate.ResolverKind) idProfile {
+	if resolver == gate.ResolverSession {
+		return hostGateProfile()
+	}
+	return stepProfile()
+}
+
+// hostGateProfile: host-owned gates require only a SessionID. LoopID/TurnID/StepID
+// are unconstrained (neither required nor forbidden), so a loop-attributed
+// elicitation may carry a LoopID and a startup one need not. The universal
+// StepID⇒TurnID rule in checkProfile still applies. It mirrors the way
+// inputCancelledProfile makes an inner coordinate optional rather than forbidden.
+func hostGateProfile() idProfile {
+	return idProfile{requireSession: true}
 }
 
 // toolProfile: the five tool-interaction events — full quartet set plus a required

@@ -118,9 +118,19 @@ func MarshalEvent(ev Event) ([]byte, error) {
 	if ev.Class() == Ephemeral {
 		return nil, &EphemeralNotPersistableError{Type: name}
 	}
-	// Body validation is required at the durable write boundary. Identity is
-	// stamped by the publishing hub, but malformed lifecycle/runtime and committed
-	// step bodies must never be encoded into a journal record.
+	// Both identity AND body validation are required at the durable write boundary.
+	// Validating only the body on write was the write/read asymmetry that let a
+	// zero-coordinate gate marshal clean and poison a future restore: the decode path
+	// validates full identity, so an event that violates its identity profile must be
+	// REFUSED here — at open time — rather than silently persisted to break replay.
+	// Every event reaching this boundary already has its coordinates stamped (the hub
+	// stamps lifecycle/loop/turn/step events; the gate open path in
+	// sessionruntime/gates.go stamps GatePrepared/GateOpened/GateResolved before
+	// append), so this rejects only genuinely malformed identity, never a legitimate
+	// pre-stamp marshal.
+	if err := validateEventIdentity(ev); err != nil {
+		return nil, err
+	}
 	if err := validateEventBody(ev); err != nil {
 		return nil, err
 	}
@@ -774,6 +784,7 @@ func decodeRestoreErrored(data []byte) (Event, error) {
 type gateResolvedWire struct {
 	Header
 	GateID        gate.ID             `json:"gate_id,omitzero"`
+	Resolver      gate.ResolverKind   `json:"resolver,omitempty"`
 	Reason        gate.CloseReason    `json:"reason,omitempty"`
 	Action        string              `json:"action,omitempty"`
 	ApprovalScope tool.ApprovalScope  `json:"scope,omitzero"`
@@ -793,6 +804,7 @@ func marshalGateResolved(e GateResolved) ([]byte, error) {
 	out, err := json.Marshal(gateResolvedWire{
 		Header:        e.Header,
 		GateID:        e.GateID,
+		Resolver:      e.Resolver,
 		Reason:        e.Reason,
 		Action:        e.Action,
 		ApprovalScope: e.ApprovalScope,
@@ -813,6 +825,7 @@ func decodeGateResolved(data []byte) (Event, error) {
 	ev := GateResolved{
 		Header:        w.Header,
 		GateID:        w.GateID,
+		Resolver:      w.Resolver,
 		Reason:        w.Reason,
 		Action:        w.Action,
 		ApprovalScope: w.ApprovalScope,

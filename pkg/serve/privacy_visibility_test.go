@@ -107,7 +107,7 @@ func TestStatusEventMarshalJSONRejectsNonPublicVisibility(t *testing.T) {
 		visibility event.EventVisibility
 	}{
 		{name: "nil event remains omittable"},
-		{name: "normal public event", ev: event.SessionStarted{}},
+		{name: "normal public event", ev: event.SessionStarted{Header: fixSessionHeader}},
 		{name: "public compaction committed", ev: committed},
 		{name: "internal hustle started", ev: internal[0], wantErr: true, visibility: event.Internal},
 		{name: "internal hustle completed", ev: internal[1], wantErr: true, visibility: event.Internal},
@@ -208,7 +208,7 @@ func TestEncodeDeliveryRejectsNonPublicVisibility(t *testing.T) {
 		{name: "unknown visibility skipped", ev: event.SessionStarted{Header: event.Header{EventVisibility: event.EventVisibility(99)}}},
 		{name: "public compaction started encoded", ev: started, want: true},
 		{name: "public compaction committed encoded", ev: committed, want: true},
-		{name: "normal public event encoded", ev: event.TurnDone{}, want: true},
+		{name: "normal public event encoded", ev: event.TurnDone{Header: fixTurnHeader}, want: true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

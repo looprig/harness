@@ -22,9 +22,14 @@ func TestCatalogFoldsLoopUsageExactlyOnce(t *testing.T) {
 	runtimeB := event.ModelRuntime{Key: model.ModelKey{Provider: "provider-b", Model: "model-b"}, Limits: model.ContextLimits{WindowTokens: 200}, Effort: model.EffortHigh}
 	usageA := content.Usage{InputTokens: 10, OutputTokens: 2}
 	usageB := content.Usage{InputTokens: 20, OutputTokens: 4, CacheReadTokens: 5}
+	// A step event carries the full step quartet plus an EventID: MarshalEvent (called
+	// by the catalog's summarize) validates identity, so a StepDone stamped with only
+	// session+loop can no longer be summarized. The turn/step/event ids are fixed —
+	// the usage fold keys on the loop id, so a constant turn/step does not perturb it.
+	turnID, stepID, eventID := fixedUUID(0x3A), fixedUUID(0x3B), fixedUUID(0x3C)
 	step := func(loopID [16]byte, usage content.Usage) event.StepDone {
 		return event.StepDone{
-			Header: event.Header{Coordinates: identity.Coordinates{SessionID: sessionID, LoopID: loopID}},
+			Header: event.Header{Coordinates: identity.Coordinates{SessionID: sessionID, LoopID: loopID, TurnID: turnID, StepID: stepID}, EventID: eventID},
 			Messages: content.AgenticMessages{&content.AIMessage{
 				Message: content.Message{Role: content.RoleAssistant},
 				Usage:   &usage,

@@ -754,12 +754,13 @@ func (s *Session) buildGateResolved(entry gateEntry, response gate.GateResponse,
 		return event.GateResolved{}, &GateError{GateID: response.GateID, Kind: GateAppendFailed, Cause: err}
 	}
 	resolved := event.GateResolved{
-		Header: stamped,
-		GateID: response.GateID,
-		Reason: gate.CloseAnswered,
-		Action: response.Action,
-		Source: response.Source,
-		Audit:  audit,
+		Header:   stamped,
+		GateID:   response.GateID,
+		Resolver: entry.gate.Resolver,
+		Reason:   gate.CloseAnswered,
+		Action:   response.Action,
+		Source:   response.Source,
+		Audit:    audit,
 	}
 	if approvalScope != nil {
 		resolved.ApprovalScope = *approvalScope
@@ -776,9 +777,10 @@ func (s *Session) buildGateClosed(entry gateEntry, id gate.ID, reason gate.Close
 		return event.GateResolved{}, &GateError{GateID: id, Kind: GateAppendFailed, Cause: err}
 	}
 	return event.GateResolved{
-		Header: stamped,
-		GateID: id,
-		Reason: reason,
+		Header:   stamped,
+		GateID:   id,
+		Resolver: entry.gate.Resolver,
+		Reason:   reason,
 	}, nil
 }
 

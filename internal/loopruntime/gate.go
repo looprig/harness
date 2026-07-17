@@ -222,7 +222,7 @@ func RequestUserInput(ctx context.Context, question string, choices []string) (s
 	// sole reader). ack is unbuffered: the actor closes it to signal installation.
 	reply := make(chan command.Command, 1)
 	ack := make(chan gateInstallAck, 1)
-	g := askUserGate(callID, question, choices)
+	g := stampGateSubjectProvenance(ctx, askUserGate(callID, question, choices))
 	payload := gatedomain.AskUserPayload{Question: question, Choices: choices}
 
 	// Register synchronously, ctx-aware: no wedge if the actor is gone or the turn
@@ -267,6 +267,28 @@ type GateReplyMismatchError struct{ ToolExecutionID uuid.UUID }
 
 func (e *GateReplyMismatchError) Error() string {
 	return "loop: gate reply did not match expected ProvideUserInput for call " + e.ToolExecutionID.String()
+}
+
+// stampGateSubjectProvenance fills a loop-owned gate's Subject with the running
+// step's turn and step ids, read from the tool-execution provenance on ctx.
+//
+// A permission/ask-user gate is loop-owned and journaled as a step-scoped record
+// (GatePrepared/GateOpened/GateResolved). Its Subject previously carried only the
+// ToolExecutionID, so PrepareGateOpen stamped the durable event with a zero
+// TurnID/StepID — an identity a step-scoped gate record cannot satisfy, which both
+// makes the marshaler refuse it at the durable boundary and makes any session that
+// opened one unrestorable. The running step's coordinates are unambiguous in the
+// batch context (turn.go wraps it with WithProvenance at the step boundary, the
+// same seam that stamps ToolCallStarted), so a gate opened during tool execution
+// carries the real turn/step. If provenance is somehow absent the Subject stays
+// zero and the gate fails closed at the durable boundary rather than poisoning a
+// future restore.
+func stampGateSubjectProvenance(ctx context.Context, g gatedomain.Gate) gatedomain.Gate {
+	if prov, ok := ProvenanceFrom(ctx); ok {
+		g.Subject.TurnID = prov.TurnID
+		g.Subject.StepID = prov.StepID
+	}
+	return g
 }
 
 func permissionGate(callID uuid.UUID, req tool.PermissionRequest) gatedomain.Gate {
