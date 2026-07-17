@@ -12,6 +12,7 @@ import (
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/journal"
 	"github.com/looprig/harness/pkg/loop"
+	"github.com/looprig/harness/pkg/tool"
 )
 
 // fakeSessionJournal is a no-op journal.SessionJournal whose Append always succeeds. It
@@ -72,7 +73,7 @@ func TestCodexForeignRestoreRecoversSIDFromForeignSessionBound(t *testing.T) {
 	restoreCtx, restoreCancel := context.WithCancel(context.Background())
 	t.Cleanup(restoreCancel)
 
-	s, err := buildRestoredSession(restoreCtx, restoreCancel, c, sessionID, rootLoopID,
+	s, err := buildRestoredSession(restoreCtx, restoreCancel, c, tool.Bindings{SessionID: sessionID, LoopID: rootLoopID}, sessionID, rootLoopID,
 		foreignSID, 0, 0, false, folded, restoredInference{}, nil, fakeSessionJournal{}, fac, uuid.New, time.Now,
 		WithForeignBuilders(builder.build, builder.buildRestored))
 	if err != nil {
@@ -128,7 +129,7 @@ func TestCodexForeignRestoreFailsClosedWithoutSIDSource(t *testing.T) {
 	restoreCtx, restoreCancel := context.WithCancel(context.Background())
 	t.Cleanup(restoreCancel)
 
-	s, err := buildRestoredSession(restoreCtx, restoreCancel, c, sessionID, rootLoopID,
+	s, err := buildRestoredSession(restoreCtx, restoreCancel, c, tool.Bindings{SessionID: sessionID, LoopID: rootLoopID}, sessionID, rootLoopID,
 		foreignSID, 0, 0, false, folded, restoredInference{}, nil, fakeSessionJournal{}, event.NewFactory(uuid.New, time.Now), uuid.New, time.Now,
 		WithForeignBuilders(builder.build, builder.buildRestored))
 	if s != nil {
@@ -239,7 +240,7 @@ func TestForeignRestore(t *testing.T) {
 				opts = append(opts, WithForeignBuilders(builder.build, builder.buildRestored))
 			}
 
-			s, err := buildRestoredSession(restoreCtx, restoreCancel, c, sessionID, rootLoopID,
+			s, err := buildRestoredSession(restoreCtx, restoreCancel, c, tool.Bindings{SessionID: sessionID, LoopID: rootLoopID}, sessionID, rootLoopID,
 				tt.foreignSID, 0, 0, false, folded, restoredInference{}, nil, fakeSessionJournal{}, fac, uuid.New, time.Now, opts...)
 
 			if tt.wantErr {

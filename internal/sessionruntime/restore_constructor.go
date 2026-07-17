@@ -394,7 +394,7 @@ func restoreTopologySession(
 	// stamped it on LoopStarted; late-bound adapters record it with ForeignSessionBound.
 	// buildRestoredSession fails closed on an empty sid for a foreign engine.
 	foreignSID := findForeignSID(rootEvents)
-	s, err := buildRestoredSession(sessionCtx, sessionCancel, bound, sessionID, rootLoopID, foreignSID, spawnedCount, securityLevel, hasSecurityLimit, folded, activeInference, restoredGates.open, j, factory, newID, now, leaseOpts...)
+	s, err := buildRestoredSession(sessionCtx, sessionCancel, bound, activePlan.bindings, sessionID, rootLoopID, foreignSID, spawnedCount, securityLevel, hasSecurityLimit, folded, activeInference, restoredGates.open, j, factory, newID, now, leaseOpts...)
 	if err != nil {
 		if constructionCleanupOwned(err) {
 			return nil, err
@@ -622,10 +622,15 @@ func attachAndActivate(s *Session, all []event.Event, plans []loopPlan, rootLoop
 // seeded (NewRestored) with the folded committed state under its ORIGINAL id, idle. It
 // publishes NO SessionStarted and spawns NO empty loop — both are the deliberate
 // difference from New.
+//
+// bindings MUST be the tool.Bindings cfg was bound with (activePlan.bindings); it is
+// retained on the root's handle so a later external-toolset replacement builds against the
+// same capabilities the declared tools were given.
 func buildRestoredSession(
 	sessionCtx context.Context,
 	sessionCancel context.CancelFunc,
 	cfg loop.BoundDefinition,
+	bindings tool.Bindings,
 	sessionID, rootLoopID uuid.UUID,
 	foreignSID string,
 	spawnedCount int,
@@ -762,7 +767,14 @@ func buildRestoredSession(
 		return abort(restoreErr)
 	}
 	liveMode, liveModel := liveViewFor(cfg, ri)
-	s.loops[rootLoopID] = &loopHandle{id: rootLoopID, owner: s, bound: cfg, backend: l, parent: loop.Provenance{}, cancel: cancel, liveMode: liveMode, liveModel: liveModel, state: tool.DelegateStatusIdle}
+	// bindings is activePlan.bindings — the EXACT tool.Bindings cfg was bound with in
+	// planLoops (same SecurityLimit source, the same WorkspaceBinding instance, and this
+	// loop's scoped delegate controller). Retaining it here is what lets a later
+	// ReplaceExternalTools build its tools with the capabilities the declared tools got,
+	// exactly as the live path (session.go) and attachRestoredLoop do for every other loop.
+	// Dropping it would leave a restored root unable to build ANY external tool that
+	// declares a requirement, and would hand the rest a separate observation set.
+	s.loops[rootLoopID] = &loopHandle{id: rootLoopID, owner: s, bound: cfg, bindings: bindings, backend: l, parent: loop.Provenance{}, cancel: cancel, liveMode: liveMode, liveModel: liveModel, state: tool.DelegateStatusIdle}
 	s.activeLoopID = rootLoopID
 	return s, nil
 }

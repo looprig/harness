@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
+	"sync"
 	"testing"
 	"time"
 
@@ -14,7 +16,9 @@ import (
 	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/harness/pkg/tool"
+	"github.com/looprig/inference"
 	model "github.com/looprig/inference/model"
+	stream "github.com/looprig/inference/stream"
 )
 
 // extStubTool is a minimal external tool with a fixed name and schema.
@@ -77,6 +81,191 @@ func newToolSession(t *testing.T) *Session {
 	}
 	t.Cleanup(func() { _ = s.Shutdown(context.Background()) })
 	return s
+}
+
+// countingExtTool is an external tool that records how often it actually ran.
+type countingExtTool struct {
+	name string
+	mu   sync.Mutex
+	n    int
+}
+
+func (c *countingExtTool) Info(context.Context) (*tool.ToolInfo, error) {
+	return &tool.ToolInfo{Name: c.name, Desc: "d", Schema: json.RawMessage(`{"type":"object"}`)}, nil
+}
+
+func (c *countingExtTool) InvokableRun(context.Context, string) (*tool.ToolResult, error) {
+	c.mu.Lock()
+	c.n++
+	c.mu.Unlock()
+	return &tool.ToolResult{Content: []content.Block{&content.TextBlock{Text: "ok"}}}, nil
+}
+
+func (c *countingExtTool) count() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.n
+}
+
+// scriptedToolLLM streams a call to toolName on its FIRST request and plain text on every
+// one after, so a single Submit drives exactly one external-tool execution and then
+// terminates. stubLLM cannot do this: it replays the same chunks on every stream, so a
+// tool-use chunk would re-issue forever.
+type scriptedToolLLM struct {
+	toolName string
+	mu       sync.Mutex
+	calls    int
+}
+
+func (s *scriptedToolLLM) Invoke(context.Context, inference.Request) (*inference.Response, error) {
+	return nil, errors.New("scriptedToolLLM.Invoke not used")
+}
+
+func (s *scriptedToolLLM) Stream(context.Context, inference.Request) (*stream.StreamReader[content.Chunk], error) {
+	s.mu.Lock()
+	first := s.calls == 0
+	s.calls++
+	s.mu.Unlock()
+
+	chunks := []content.Chunk{textChunk("done")}
+	if first {
+		chunks = []content.Chunk{&content.ToolUseChunk{Index: 0, ID: "call-1", Name: s.toolName, InputJSON: `{}`}}
+	}
+	i := 0
+	next := func() (content.Chunk, error) {
+		if i < len(chunks) {
+			c := chunks[i]
+			i++
+			return c, nil
+		}
+		return nil, io.EOF
+	}
+	return stream.NewStreamReader(next, nil), nil
+}
+
+// capturingDefinition records the tool.Bindings its factory was handed, and declares
+// `requires` so tool.Definition.Build enforces them against those bindings. It is the
+// probe for what a loop was actually provisioned with, as an external definition sees it.
+type capturingDefinition struct {
+	mu   sync.Mutex
+	seen tool.Bindings
+	got  bool
+}
+
+func (c *capturingDefinition) definition(t tool.InvokableTool, name string, requires tool.Requirements) tool.Definition {
+	return tool.NewDefinition(name, requires, func(_ context.Context, b tool.Bindings) ([]tool.InvokableTool, error) {
+		c.mu.Lock()
+		c.seen, c.got = b, true
+		c.mu.Unlock()
+		return []tool.InvokableTool{t}, nil
+	})
+}
+
+func (c *capturingDefinition) bindings(t *testing.T) tool.Bindings {
+	t.Helper()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.got {
+		t.Fatal("the factory was never called: nothing was built")
+	}
+	return c.seen
+}
+
+// TestRestoredRootLoopBindsExternalTools is the restored root's provisioning: a root loop
+// brought up by Restore must carry the SAME tool.Bindings its declared tools were bound
+// with in planLoops, so a later external-toolset replacement builds against the
+// capabilities the loop actually has.
+//
+// This is not a cosmetic field. loopHandle.buildExternalTools calls def.Build(ctx,
+// h.bindings), and Build validates a definition's Requirements against those bindings. A
+// restored root with zero bindings therefore cannot build ANY external definition that
+// declares a requirement — it fails closed with a *tool.MissingBindingError, and MCP tools
+// (which is what the external-toolset seam exists for) can never be installed on a
+// restored session at all. It also silently defeats loop_tools.go's stated invariant that
+// "production builds full tool.Bindings for every engine".
+//
+// RequiresDelegateController is the probe: planLoops binds every loop with a non-nil
+// scoped controller regardless of whether a workspace is configured, so this asserts the
+// binding is threaded without needing a materialized workspace.
+//
+// Mutation check: drop `bindings: bindings` from the &loopHandle{} literal in
+// buildRestoredSession (restore_constructor.go) and the install fails with
+// ChangeExternalBuildFailed wrapping MissingBindingError; the identity assertions below
+// then read a zero SessionID/LoopID.
+func TestRestoredRootLoopBindsExternalTools(t *testing.T) {
+	store := newRestoreStore(t)
+	// restoreCfg plus an auto-approving permission gate: without one the loop's
+	// fail-secure default denies the call, and an installed tool that is never dispatched
+	// would make the execution assertion below vacuous. It still fingerprints identically
+	// to restoreCfg (testFingerprintProvider reads model + system + tool names, none of
+	// which this changes), so the restore takes the matching-config path and is exercising
+	// the bindings rather than a mismatch.
+	definition := func(client inference.Client) loop.Definition {
+		return mustDefine(
+			loop.WithName("agent"),
+			loop.WithInference(client, validModel("model-x")),
+			loop.WithSystem("be helpful"),
+			loop.WithDrainTimeout(200*time.Millisecond),
+			loop.WithPolicyRevision("test"),
+			loop.WithPermissionFactory(func(context.Context, tool.Bindings) (loop.PermissionGate, error) {
+				return newLivePermissionGate(loop.EffectAutoApprove), nil
+			}),
+		)
+	}
+
+	fp := fingerprintFromDefinition(restoreCfg(&stubLLM{}, "model-x", "be helpful"))
+	orig := buildOriginalRun(t, store, fp, restoreCfg(&stubLLM{chunks: []content.Chunk{textChunk("reply")}}, "model-x", "be helpful"), 1)
+	handOver(t, orig.lease)
+
+	// The restored session's client calls the external tool on its first turn, so the
+	// install is proven by execution rather than by the registry's own bookkeeping.
+	ext := &countingExtTool{name: "mcp_tool"}
+	s, err := restoreTestSession(context.Background(), definition(&scriptedToolLLM{toolName: "mcp_tool"}),
+		orig.sessionID, store)
+	if err != nil {
+		t.Fatalf("Restore: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Shutdown(context.Background()) })
+
+	// The restored ROOT loop is the subject: Restore brings it up under its original id.
+	if s.ActiveLoopID() != orig.rootLoopID {
+		t.Fatalf("restored active loop = %v, want the root %v", s.ActiveLoopID(), orig.rootLoopID)
+	}
+	installer := installerFor(t, s)
+
+	// A definition that DECLARES a requirement — the case a zero-bindings root cannot
+	// serve. This is the shape a real MCP toolset has.
+	capture := &capturingDefinition{}
+	if err := installer.ReplaceExternalTools(context.Background(), loop.ExternalToolset{
+		Source: "mcp", Generation: "g1",
+		Definitions: []tool.Definition{capture.definition(ext, "mcp_tool", tool.RequiresDelegateController)},
+	}); err != nil {
+		t.Fatalf("a restored root could not install an external toolset: %v", err)
+	}
+
+	// The bindings the external factory was handed are the restored loop's own identity —
+	// not a zero value, and not some other loop's.
+	got := capture.bindings(t)
+	if got.SessionID != orig.sessionID {
+		t.Errorf("external Bindings.SessionID = %v, want the restored session %v", got.SessionID, orig.sessionID)
+	}
+	if got.LoopID != orig.rootLoopID {
+		t.Errorf("external Bindings.LoopID = %v, want the restored root %v", got.LoopID, orig.rootLoopID)
+	}
+	// Delegate is the requirement this definition declared, so Build's attenuation carries
+	// it through. (SecurityLimit/Workspace are deliberately NOT asserted: attenuateBindings
+	// passes a factory only SessionID, LoopID, and what it declared.)
+	if got.Delegate == nil {
+		t.Error("external Bindings.Delegate is nil: the restored root was bound without its scoped controller")
+	}
+
+	// Installed AND runnable: the next turn on the restored loop dispatches a model tool
+	// call to the instance the factory built. An install that cannot be executed would be
+	// bookkeeping, not a tool.
+	submitAndDrain(t, s, []content.Block{&content.TextBlock{Text: "use the tool"}})
+	if n := ext.count(); n != 1 {
+		t.Errorf("the installed external tool ran %d times, want 1 — a restored loop's external tool must be dispatchable, not just advertised", n)
+	}
 }
 
 // TestReplaceExternalToolsBuildFailureIsAtomic is the no-partial-swap property: when ANY
