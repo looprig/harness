@@ -8,7 +8,6 @@ import (
 
 	"github.com/looprig/core/content"
 	"github.com/looprig/core/uuid"
-	"github.com/looprig/harness/internal/runtimecontract"
 	"github.com/looprig/harness/pkg/command"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/identity"
@@ -144,7 +143,7 @@ func (l *Loop) handleTurnCommand(loopCtx context.Context, cmd command.Command, c
 	cancel context.CancelFunc, pub func(event.Event), result chan turnOutcome) (done, exit bool) {
 	switch c := cmd.(type) {
 	case command.UserInput:
-		if len(l.pending) >= runtimecontract.ManagedInputQueueCapacity {
+		if len(l.pending) >= loop.ManagedInputQueueCapacity {
 			pub(event.TurnRejected{Header: event.Header{Cause: identity.Cause{CommandID: c.CommandID}}, Reason: event.RejectQueueFull})
 			if c.Accepted != nil {
 				c.Accepted <- &loop.InputRejectedError{Reason: event.RejectQueueFull}

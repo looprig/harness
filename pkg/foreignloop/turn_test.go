@@ -12,7 +12,6 @@ import (
 
 	"github.com/looprig/core/content"
 	"github.com/looprig/core/uuid"
-	"github.com/looprig/harness/internal/runtimecontract"
 	"github.com/looprig/harness/pkg/command"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/identity"
@@ -487,7 +486,7 @@ func TestManagedForeignQueueRejectsEntrySixtyFiveBeforeAcceptance(t *testing.T) 
 	l, _ := newTestLoop(t, Spec{Agent: agent}, pub)
 	submitUserInput(t, l, "A")
 	_ = awaitFIFOSpawn(t, agent)
-	for i := 0; i < runtimecontract.ManagedInputQueueCapacity; i++ {
+	for i := 0; i < loop.ManagedInputQueueCapacity; i++ {
 		if _, err := sendManagedForeignResult(t, l, fmt.Sprintf("queued-%d", i)); err != nil {
 			t.Fatalf("queue entry %d: %v", i+1, err)
 		}
