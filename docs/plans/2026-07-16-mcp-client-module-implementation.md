@@ -152,7 +152,11 @@ func (d Definition) Validate() error   // FailureInvalidConfig on any violation
 type TransportFactory interface {
     Kind() string
     RedactedOrigin() string
-    connect(ctx context.Context, deps transportDeps) (protoConn, error) // unexported seam
+    // Connect is exported but sealed by construction: its signature uses
+    // internal/protocol types, so only packages inside this module
+    // (pkg/transport/*) can implement it. Task 1.2 creates internal/protocol
+    // as a stub (Conn with Close; empty ConnectConfig); Task 1.4 fleshes it out.
+    Connect(ctx context.Context, cfg protocol.ConnectConfig) (protocol.Conn, error)
 }
 ```
 
