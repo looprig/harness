@@ -26,6 +26,15 @@ type ConfigFingerprintFields struct {
 	Posture string
 	// NativePermissionPolicyRev is the digest of native permission configuration.
 	NativePermissionPolicyRev string
+	// ExternalCapabilityRev is the digest of the identity of external capabilities
+	// the composition root attached to the session — tools served by processes
+	// Harness does not own, such as MCP servers. Empty means none, which is what
+	// keeps it additive for every rig that attaches nothing.
+	//
+	// The rig neither computes nor interprets it: only the composition root knows
+	// what it attached. The canonical producer is github.com/looprig/mcp's
+	// mcpharness.Manager.ConfigDigest, taken after the Manager has started.
+	ExternalCapabilityRev string
 }
 
 // FingerprintFrom derives the stable, secret-free behavior fingerprint of a bound loop.
@@ -45,6 +54,7 @@ func fingerprintWith(definition loop.BoundDefinition, fields ConfigFingerprintFi
 	fingerprint.AgentAdapter = fields.AdapterID
 	fingerprint.PermissionPosture = fields.Posture
 	fingerprint.NativePermissionPolicyRev = fields.NativePermissionPolicyRev
+	fingerprint.ExternalCapabilityRev = fields.ExternalCapabilityRev
 	return fingerprint
 }
 
@@ -93,6 +103,7 @@ func frozenFingerprint(fields ConfigFingerprintFields, definitions []loop.Defini
 		AgentAdapter:              fields.AdapterID,
 		PermissionPosture:         fields.Posture,
 		NativePermissionPolicyRev: fields.NativePermissionPolicyRev,
+		ExternalCapabilityRev:     fields.ExternalCapabilityRev,
 	}
 }
 

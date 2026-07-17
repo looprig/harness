@@ -543,3 +543,43 @@ func TestTopologyRevisionIncludesNoninitialModeProducedToolMetadata(t *testing.T
 // the construction cfg is non-empty, and (2) a SessionStarted published through the
 // session's own hub with that Config is delivered to a subscriber carrying the
 // fingerprint intact.
+
+// TestExternalCapabilityRevReachesBothFingerprintPaths pins the property that
+// makes the field usable at all: the two derivations must agree.
+//
+// There are two, and they exist for good reasons that make them easy to drift
+// apart. fingerprintWith runs at session creation, from a BOUND definition, and
+// stamps what SessionStarted records. frozenFingerprint runs at RESTORE, from
+// immutable definitions alone, so a restore can compare before it constructs
+// workspace or loop collaborators. A field added to one and forgotten in the
+// other is the worst possible outcome for this type: every restore would compare
+// a fingerprint that was never stamped, and reject a session nobody changed —
+// or, in the other direction, silently accept drift.
+func TestExternalCapabilityRevReachesBothFingerprintPaths(t *testing.T) {
+	t.Parallel()
+
+	const rev = "aa08cfe9f431598f187f5bec202f211f3bc50325ec3e0415b63aabdcdbf9b5fd"
+	fields := ConfigFingerprintFields{ExternalCapabilityRev: rev}
+	def := fpConfig("gpt-4o-2024", "You are a helpful assistant.", "Read")
+
+	bound := fingerprintWithDefinition(def, fields)
+	if bound.ExternalCapabilityRev != rev {
+		t.Errorf("fingerprintWith ExternalCapabilityRev = %q, want %q: the field a session is STAMPED with is dropped", bound.ExternalCapabilityRev, rev)
+	}
+
+	frozen := frozenFingerprint(fields, []loop.Definition{def}, []string{"agent"}, "agent")
+	if frozen.ExternalCapabilityRev != rev {
+		t.Errorf("frozenFingerprint ExternalCapabilityRev = %q, want %q: the field a RESTORE compares is dropped, so every restore of a session with MCP would spuriously mismatch", frozen.ExternalCapabilityRev, rev)
+	}
+
+	// Empty stays empty on both paths: a rig that attaches no external capability
+	// must produce a fingerprint that compares Equal to a journal predating the
+	// field.
+	none := ConfigFingerprintFields{}
+	if got := fingerprintWithDefinition(def, none).ExternalCapabilityRev; got != "" {
+		t.Errorf("fingerprintWith with no external capability = %q, want empty", got)
+	}
+	if got := frozenFingerprint(none, []loop.Definition{def}, []string{"agent"}, "agent").ExternalCapabilityRev; got != "" {
+		t.Errorf("frozenFingerprint with no external capability = %q, want empty", got)
+	}
+}
