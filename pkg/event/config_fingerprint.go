@@ -58,6 +58,30 @@ type ConfigFingerprint struct {
 	// or a caller that does not inject it. A change is a behavior change that must
 	// not resume unnoticed.
 	NativePermissionPolicyRev string `json:"native_permission_policy_rev,omitzero"`
+	// ExternalCapabilityRev is a content digest over the identity of the EXTERNAL
+	// capabilities an application attached to this session — tools, prompts and
+	// resources served by processes Harness does not own, such as MCP servers.
+	// Empty means the session had none, which is what makes the field additive:
+	// a journal written before it existed decodes it empty and compares Equal to
+	// a live config that also has none.
+	//
+	// Harness neither computes nor interprets it. It is supplied by the
+	// composition root, which is the only layer that knows what it attached; the
+	// canonical producer today is github.com/looprig/mcp's
+	// mcpharness.Manager.ConfigDigest. Harness's part of the contract is the two
+	// properties every other Rev field here has: it is a digest, so it carries
+	// identity and not the configuration — a server's credentials, headers, and
+	// environment must never reach a journal — and it is compared, never parsed.
+	//
+	// It is ONE opaque string rather than a structured manifest deliberately.
+	// The richer model — per-binding manifests, configuration epochs, and typed
+	// drift — is specified in docs/plans/2026-07-16-session-versioning-migration-design.md
+	// and is NOT implemented. Until it is, external capability drift is reported
+	// through the same one-shot mechanism as every other config change: a
+	// fingerprint mismatch at restore, which sessionruntime's
+	// WithAllowConfigMismatch decides on. A field that promised more than that
+	// would be a promise nothing here keeps.
+	ExternalCapabilityRev string `json:"external_capability_rev,omitzero"`
 }
 
 // Equal reports whether two fingerprints identify the same configuration: true iff
@@ -74,5 +98,6 @@ func (f ConfigFingerprint) Equal(other ConfigFingerprint) bool {
 		f.WorkspaceRoot == other.WorkspaceRoot &&
 		f.AgentAdapter == other.AgentAdapter &&
 		f.PermissionPosture == other.PermissionPosture &&
-		f.NativePermissionPolicyRev == other.NativePermissionPolicyRev
+		f.NativePermissionPolicyRev == other.NativePermissionPolicyRev &&
+		f.ExternalCapabilityRev == other.ExternalCapabilityRev
 }

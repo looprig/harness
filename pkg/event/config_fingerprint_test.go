@@ -19,6 +19,9 @@ func fullFingerprint() event.ConfigFingerprint {
 		WorkspaceRoot:     "/home/user/repo",
 		AgentAdapter:      "claude",
 		PermissionPosture: "default",
+		// A digest over the application's external capabilities (an MCP
+		// configuration), as mcpharness.Manager.ConfigDigest produces.
+		ExternalCapabilityRev: "aa08cfe9f431598f187f5bec202f211f",
 	}
 }
 
@@ -46,6 +49,8 @@ func TestConfigFingerprintEqual(t *testing.T) {
 	diffAdapter.AgentAdapter = "codex"
 	diffPosture := base
 	diffPosture.PermissionPosture = "acceptEdits"
+	diffExternal := base
+	diffExternal.ExternalCapabilityRev = "other-mcp-digest"
 
 	tests := []struct {
 		name string
@@ -62,6 +67,7 @@ func TestConfigFingerprintEqual(t *testing.T) {
 		{"WorkspaceRoot differs", base, diffWorkspaceRoot, false},
 		{"AgentAdapter differs", base, diffAdapter, false},
 		{"PermissionPosture differs", base, diffPosture, false},
+		{"ExternalCapabilityRev differs", base, diffExternal, false},
 		{"zero vs full differs", event.ConfigFingerprint{}, base, false},
 	}
 	for _, tt := range tests {
@@ -98,6 +104,91 @@ func TestConfigFingerprint_NativePermissionPolicyRev(t *testing.T) {
 	}
 }
 
+// TestConfigFingerprint_ExternalCapabilityRev asserts the external-capability
+// digest field participates in Equal: two records that differ only in it are not
+// Equal, two that share it are, and it evolves additively (empty vs empty Equal).
+func TestConfigFingerprint_ExternalCapabilityRev(t *testing.T) {
+	t.Parallel()
+	a := event.ConfigFingerprint{ExternalCapabilityRev: "aaa"}
+	b := event.ConfigFingerprint{ExternalCapabilityRev: "bbb"}
+	if a.Equal(b) {
+		t.Errorf("different ExternalCapabilityRev must not be Equal: an MCP catalog change must not resume unnoticed")
+	}
+	if !a.Equal(event.ConfigFingerprint{ExternalCapabilityRev: "aaa"}) {
+		t.Errorf("same ExternalCapabilityRev must be Equal")
+	}
+	// The empty-means-none contract: a session with no external capability must
+	// not be distinguishable from another that also has none.
+	if !(event.ConfigFingerprint{}).Equal(event.ConfigFingerprint{}) {
+		t.Errorf("empty fingerprints must be Equal")
+	}
+	// Empty is not merely equal to empty — it must DIFFER from any digest, or
+	// "no MCP configured" and "this MCP configured" would restore into each
+	// other.
+	if (event.ConfigFingerprint{}).Equal(a) {
+		t.Errorf("a fingerprint with no external capability must not equal one that has some")
+	}
+}
+
+// TestConfigFingerprintOldJournalHasNoExternalCapability is the additive
+// property that matters for this field specifically, stated as the migration it
+// describes: a journal written BEFORE ExternalCapabilityRev existed must still
+// restore against a live config that has no external capability.
+//
+// It is separate from TestConfigFingerprintOldRecordCompat because it is a
+// different claim about a different vintage of record — that test's "old" JSON
+// predates RuntimeSkills and WorkspaceRoot, and a field added later has to prove
+// its own compatibility rather than inherit theirs.
+func TestConfigFingerprintOldJournalHasNoExternalCapability(t *testing.T) {
+	t.Parallel()
+
+	// A journal record written by a build that had every field EXCEPT
+	// external_capability_rev. This is the realistic worst case: a fully
+	// populated old record, not a sparse one, so the test cannot pass merely
+	// because most fields were empty on both sides.
+	oldJSON := `{"topology_rev":"topo1","agent_kind":"primary","model_id":"claude-test",` +
+		`"system_prompt_rev":"abc123","tool_policy_rev":"def456","runtime_skills":true,` +
+		`"workspace_root":"/home/user/repo","agent_adapter":"claude",` +
+		`"permission_posture":"default","native_permission_policy_rev":"perm1"}`
+
+	var fromOld event.ConfigFingerprint
+	if err := json.Unmarshal([]byte(oldJSON), &fromOld); err != nil {
+		t.Fatalf("json.Unmarshal(old record): %v", err)
+	}
+	if fromOld.ExternalCapabilityRev != "" {
+		t.Errorf("ExternalCapabilityRev decoded from an old record = %q, want \"\" (absent key)", fromOld.ExternalCapabilityRev)
+	}
+
+	// The same config, re-derived today by an application that attaches no
+	// external capability (no MCP manager, or a manager with no bindings — both
+	// contribute the empty string).
+	today := event.ConfigFingerprint{
+		TopologyRev:               "topo1",
+		AgentKind:                 "primary",
+		ModelID:                   "claude-test",
+		SystemPromptRev:           "abc123",
+		ToolPolicyRev:             "def456",
+		RuntimeSkills:             true,
+		WorkspaceRoot:             "/home/user/repo",
+		AgentAdapter:              "claude",
+		PermissionPosture:         "default",
+		NativePermissionPolicyRev: "perm1",
+	}
+	if !fromOld.Equal(today) {
+		t.Errorf("an old journal record %+v is not Equal to the same config re-derived today %+v:\n"+
+			"adding ExternalCapabilityRev broke restore for every session that predates it", fromOld, today)
+	}
+
+	// And the inverse, which is the whole point of adding the field: the same
+	// old record must NOT be Equal to a config that now attaches MCP. That is
+	// drift, and it is exactly what WithAllowConfigMismatch exists to decide on.
+	withMCP := today
+	withMCP.ExternalCapabilityRev = "55b53f0b46cc411ac1abdc533628d8a4"
+	if fromOld.Equal(withMCP) {
+		t.Errorf("an old record with no external capability compared Equal to a config that attaches one: the drift is invisible")
+	}
+}
+
 // TestConfigFingerprintJSONRoundTrip asserts a ConfigFingerprint survives a JSON
 // round-trip with snake_case keys, and that a zero fingerprint omits every field
 // (omitzero) so an empty fingerprint adds nothing to the SessionStarted journal
@@ -115,6 +206,7 @@ func TestConfigFingerprintJSONRoundTrip(t *testing.T) {
 		{"workspace root only", event.ConfigFingerprint{WorkspaceRoot: "/r"}},
 		{"agent adapter only", event.ConfigFingerprint{AgentAdapter: "claude"}},
 		{"permission posture only", event.ConfigFingerprint{PermissionPosture: "default"}},
+		{"external capability only", event.ConfigFingerprint{ExternalCapabilityRev: "d1ge57"}},
 	}
 	for _, tt := range tests {
 		tt := tt
