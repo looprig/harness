@@ -493,12 +493,18 @@ type eventAppender interface {
 // provenance of the turn/step that spawned it (zero for a root loop), and
 // the cancel for this loop's loopCtx (a session-owned backstop).
 type loopHandle struct {
-	id      uuid.UUID
-	owner   *Session
-	bound   loop.BoundDefinition
-	backend loop.Backend
-	parent  loop.Provenance
-	cancel  context.CancelFunc
+	id    uuid.UUID
+	owner *Session
+	bound loop.BoundDefinition
+	// bindings is the EXACT tool.Bindings this loop was bound with, retained so
+	// ReplaceExternalTools builds external tools with the same capabilities (and the same
+	// WorkspaceObservations instance) the declared tools received. It is the zero value for
+	// a foreign loop, whose toolset harness does not own — ReplaceExternalTools refuses
+	// there with ChangeExternalToolsUnsupported.
+	bindings tool.Bindings
+	backend  loop.Backend
+	parent   loop.Provenance
+	cancel   context.CancelFunc
 
 	// liveMu guards the live view (liveMode/liveModel) — the CURRENT selection
 	// Handle.Mode()/Model() report. The loop actor is the authoritative owner of the
@@ -568,8 +574,9 @@ func (h *loopHandle) mechanicalState() tool.DelegateStatusValue {
 func (h *loopHandle) Interrupt(ctx context.Context) error { return h.owner.interruptSubtree(ctx, h.id) }
 
 type preparedLoop struct {
-	id    uuid.UUID
-	bound loop.BoundDefinition
+	id       uuid.UUID
+	bound    loop.BoundDefinition
+	bindings tool.Bindings
 }
 
 type loopEventPublisher interface {
@@ -1143,16 +1150,18 @@ func (s *Session) newLoopWithAdmission(parent loop.Provenance, cfg loop.Definiti
 
 	var loopID uuid.UUID
 	var bound loop.BoundDefinition
+	var bindings tool.Bindings
 	var err error
 	if prepared != nil {
-		loopID, bound = prepared.id, prepared.bound
+		loopID, bound, bindings = prepared.id, prepared.bound, prepared.bindings
 	} else {
 		loopID, err = s.newID()
 		if err != nil {
 			release()
 			return uuid.UUID{}, &SessionError{Kind: SessionLoopIDGenerationFailed, Cause: err}
 		}
-		bound, err = cfg.Bind(s.sessionCtx, tool.Bindings{SessionID: s.sessionID, LoopID: loopID, SecurityLimit: s.securityLimitState(), Workspace: s.newWorkspaceBinding(), Delegate: s.delegation.controllerFor(loopID, cfg), ExtraTools: delegateExtraTools(cfg, s.delegation)})
+		bindings = tool.Bindings{SessionID: s.sessionID, LoopID: loopID, SecurityLimit: s.securityLimitState(), Workspace: s.newWorkspaceBinding(), Delegate: s.delegation.controllerFor(loopID, cfg), ExtraTools: delegateExtraTools(cfg, s.delegation)}
+		bound, err = cfg.Bind(s.sessionCtx, bindings)
 		if err != nil {
 			release()
 			return uuid.UUID{}, err
@@ -1317,7 +1326,7 @@ func (s *Session) newLoopWithAdmission(parent loop.Provenance, cfg loop.Definiti
 		// the child is mechanically running even before TurnStarted is released.
 		initialState = tool.DelegateStatusRunning
 	}
-	s.loops[loopID] = &loopHandle{id: loopID, owner: s, bound: bound, backend: b, parent: parent, cancel: cancel, liveMode: startedMode, liveModel: liveModel, state: initialState}
+	s.loops[loopID] = &loopHandle{id: loopID, owner: s, bound: bound, bindings: bindings, backend: b, parent: parent, cancel: cancel, liveMode: startedMode, liveModel: liveModel, state: initialState}
 	s.loopsMu.Unlock()
 
 	// Announce the new loop to subscribers active at creation time. Published AFTER
@@ -1605,11 +1614,12 @@ func newSessionTopology(ctx context.Context, topology Topology, newID idGenerato
 		if mintErr != nil {
 			return abort(&SessionError{Kind: SessionLoopIDGenerationFailed, Cause: mintErr})
 		}
-		bound, bindErr := definition.Bind(sessionCtx, tool.Bindings{SessionID: id, LoopID: loopID, SecurityLimit: s.securityLimitState(), Workspace: s.newWorkspaceBinding(), Delegate: s.delegation.controllerFor(loopID, definition), ExtraTools: delegateExtraTools(definition, s.delegation)})
+		bindings := tool.Bindings{SessionID: id, LoopID: loopID, SecurityLimit: s.securityLimitState(), Workspace: s.newWorkspaceBinding(), Delegate: s.delegation.controllerFor(loopID, definition), ExtraTools: delegateExtraTools(definition, s.delegation)}
+		bound, bindErr := definition.Bind(sessionCtx, bindings)
 		if bindErr != nil {
 			return abort(bindErr)
 		}
-		prepared = append(prepared, preparedPrimer{name: name, def: definition, loop: preparedLoop{id: loopID, bound: bound}})
+		prepared = append(prepared, preparedPrimer{name: name, def: definition, loop: preparedLoop{id: loopID, bound: bound, bindings: bindings}})
 	}
 	if len(prepared) == 0 {
 		return abort(&SessionError{Kind: SessionLoopNotFound})

@@ -733,6 +733,17 @@ func foldLoop(events []event.Event) foldResult {
 			contextMeasurement = event.ContextMeasurement{}
 			hasContext = false
 			advanceBasis(e.Header)
+		case event.LoopExternalToolsetChanged:
+			// The tools ride in the inference request, so replacing them invalidates any
+			// cached context measurement — the live actor commits this event through the
+			// same context-mutation path as a mode change. The fold MUST mirror that or a
+			// restored loop's context basis would disagree with the one the live loop had.
+			// Deliberately no runtime/mode change: an external replacement touches neither.
+			// The toolset itself is NOT restored — external tools are live resources, so the
+			// slot comes up empty and the application re-installs.
+			contextMeasurement = event.ContextMeasurement{}
+			hasContext = false
+			advanceBasis(e.Header)
 		case event.ContextMeasured:
 			contextMeasurement = e.Measurement
 			hasContext = true

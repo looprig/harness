@@ -502,6 +502,13 @@ type loopState struct {
 	// resolved runtimeConfig (New) or the restore-folded mode/inference (NewRestored).
 	effective effectiveConfig
 
+	// external is the loop's external tool slot, keyed by source. It composes with the
+	// CURRENT mode's declared tools into effective.tools.Registry; every write to it and
+	// every mode change recompose that registry, so the two can never disagree. It starts
+	// empty on New AND on NewRestored — external tools are live resources, never restored
+	// from journal bytes; the composing application re-installs after restore.
+	external externalSlots
+
 	// inbox is the actor-owned pending-input queue for accepted
 	// UserInput/SubagentResult that could not start immediately (a turn was
 	// running). Only the actor (runLoop) appends/removes/clears it — no locks. On
@@ -541,6 +548,7 @@ func newLoopState(sessionID, loopID uuid.UUID, parent Provenance) loopState {
 		sessionID:    sessionID,
 		parent:       parent,
 		pendingGates: make(map[gatedomain.ID]pendingGate),
+		external:     make(externalSlots),
 	}
 }
 
@@ -1807,7 +1815,12 @@ func runLoop(cfg loopConfig, state loopState) {
 			c.Ack <- command.LoopChangeResult{Err: &loop.ChangeError{Kind: loop.ChangeInvalidMode, Mode: modeName, Cause: err}}
 			return
 		}
-		next := effectiveConfig{mode: modeName, model: resolved.Model, effort: resolved.Model.Sampling.Effort, system: resolved.System, tools: resolveToolSetCaps(resolved.Tools)}
+		// Recompose the external slot onto the NEW mode's declared tools. Without this a
+		// mode change would silently uninstall every externally installed tool, because
+		// resolved.Tools carries only the definition's declared registry.
+		nextTools := resolveToolSetCaps(resolved.Tools)
+		nextTools.Registry = composeRegistry(resolved.Tools.Registry, state.external)
+		next := effectiveConfig{mode: modeName, model: resolved.Model, effort: resolved.Model.Sampling.Effort, system: resolved.System, tools: nextTools}
 		if err := commitContextConfigurationChange(event.LoopModeChanged{Header: changeHeader(), PreviousMode: string(state.effective.mode), Mode: string(modeName), Runtime: modelRuntime(next.model, next.effort)}); err != nil {
 			c.Ack <- command.LoopChangeResult{Err: &loop.ChangeError{Kind: loop.ChangeDurableAppendFailed, Cause: err}}
 			return
@@ -1815,6 +1828,57 @@ func runLoop(cfg loopConfig, state loopState) {
 		state.effective = next
 		state.runtime = modelRuntime(next.model, next.effort)
 		c.Ack <- command.LoopChangeResult{Mode: string(next.mode), Model: next.model, Effort: next.effort}
+	}
+
+	// applyReplaceExternalTools commits a ReplaceLoopExternalTools: it checks the incoming
+	// toolset for a name collision against ANOTHER source's installed tools, emits
+	// LoopExternalToolsetChanged, checks the durable-fault probe, then swaps the source's
+	// slot and recomposes the effective registry — so the change is atomic and takes effect
+	// only at the next turn (the running turn already snapshotted its own tools). A
+	// shutting-down loop, a collision, or a durable-append fault refuses with a typed
+	// *loop.ChangeError and applies nothing: state.external and state.effective are
+	// untouched on every refusal, so the PRIOR generation stays installed.
+	//
+	// Collisions against the loop's DECLARED tools are refused earlier, by the session
+	// before the command is sent — that check needs each tool's Info(), which may perform
+	// I/O and must never run on the actor goroutine. This arm re-checks only what the actor
+	// alone knows: the other sources' slots.
+	applyReplaceExternalTools := func(c command.ReplaceLoopExternalTools) {
+		if state.status == loopShuttingDown {
+			c.Ack <- command.LoopToolsResult{Err: &loop.ChangeError{Kind: loop.ChangeLoopShuttingDown}}
+			return
+		}
+		if name, collides := state.external.collides(c.Source, c.Identities); collides {
+			c.Ack <- command.LoopToolsResult{Err: &loop.ChangeError{Kind: loop.ChangeExternalToolCollision, Tool: name}}
+			return
+		}
+		// Re-resolve the CURRENT mode's declared tools from the bound definition rather
+		// than reusing effective.tools.Registry, which already has the OLD generation
+		// composed into it — composing onto that would accumulate stale tools.
+		resolved, err := configForMode(cfg.bound, state.effective.mode)
+		if err != nil {
+			c.Ack <- command.LoopToolsResult{Err: &loop.ChangeError{Kind: loop.ChangeInvalidMode, Mode: state.effective.mode, Cause: err}}
+			return
+		}
+		if err := commitContextConfigurationChange(event.LoopExternalToolsetChanged{
+			Header: changeHeader(), Source: c.Source, Generation: c.Generation, Tools: c.Identities,
+		}); err != nil {
+			c.Ack <- command.LoopToolsResult{Err: &loop.ChangeError{Kind: loop.ChangeDurableAppendFailed, Cause: err}}
+			return
+		}
+		next := state.external.clone()
+		if len(c.Tools) == 0 {
+			delete(next, c.Source)
+		} else {
+			next[c.Source] = externalGeneration{
+				generation: c.Generation,
+				tools:      append([]tool.InvokableTool(nil), c.Tools...),
+				identities: append([]event.ExternalToolIdentity(nil), c.Identities...),
+			}
+		}
+		state.external = next
+		state.effective.tools.Registry = composeRegistry(resolved.Tools.Registry, state.external)
+		c.Ack <- command.LoopToolsResult{Generation: c.Generation, Installed: len(c.Tools)}
 	}
 
 	// applyChangeInference commits a ChangeLoopInference: it folds the requested model/effort
@@ -1930,6 +1994,17 @@ func runLoop(cfg loopConfig, state loopState) {
 				return false
 			}
 			applyChangeInference(c)
+
+		case command.ReplaceLoopExternalTools:
+			// Replace one source's external toolset for the NEXT turn. The tools arrive
+			// already built (the session owns the bindings and does the I/O); the actor
+			// only checks what it alone owns, journals the identity record, and swaps.
+			// A malformed command violates the contract — log and drop rather than wedge.
+			if err := c.Validate(); err != nil {
+				slog.Warn("invalid ReplaceLoopExternalTools command", "error", err)
+				return false
+			}
+			applyReplaceExternalTools(c)
 
 		case command.Compact:
 			admission, err := compactions.admit(c, config.idGen)

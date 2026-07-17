@@ -70,6 +70,12 @@ func stampLoopHeader(ev event.Event, sessionID, loopID, turnID uuid.UUID) event.
 	case event.LoopInferenceChanged:
 		e.Header = fillLoopScoped(e.Header, sessionID, loopID)
 		return e
+	case event.LoopExternalToolsetChanged:
+		// An external toolset replacement is loop-scoped for the same reason a mode change
+		// is: it applies to the loop and takes effect at the next turn boundary, so the
+		// active turn id is deliberately NOT stamped.
+		e.Header = fillLoopScoped(e.Header, sessionID, loopID)
+		return e
 	case event.ContextMeasured:
 		e.Header = fillLoopScoped(e.Header, sessionID, loopID)
 		return e
@@ -138,6 +144,9 @@ func withLoopHeader(ev event.Event, h event.Header) event.Event {
 		e.Header = h
 		return e
 	case event.LoopInferenceChanged:
+		e.Header = h
+		return e
+	case event.LoopExternalToolsetChanged:
 		e.Header = h
 		return e
 	case event.ContextMeasured:

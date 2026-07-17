@@ -47,7 +47,7 @@ func RestoreTopology(ctx context.Context, topology Topology, sessionID uuid.UUID
 	return restoreTopologySession(ctx, topology, sessionID, store, uuid.New, time.Now, opts...)
 }
 
-func (s *Session) attachRestoredLoop(started event.LoopStarted, parent loop.Provenance, bound loop.BoundDefinition, folded foldResult, ri restoredInference, foreignSID string) error {
+func (s *Session) attachRestoredLoop(started event.LoopStarted, parent loop.Provenance, bound loop.BoundDefinition, bindings tool.Bindings, folded foldResult, ri restoredInference, foreignSID string) error {
 	loopCtx, cancel := context.WithCancel(s.sessionCtx)
 	var backend loop.Backend
 	var err error
@@ -77,7 +77,7 @@ func (s *Session) attachRestoredLoop(started event.LoopStarted, parent loop.Prov
 	}
 	liveMode, liveModel := liveViewFor(bound, ri)
 	s.loopsMu.Lock()
-	s.loops[started.LoopID] = &loopHandle{id: started.LoopID, owner: s, bound: bound, backend: backend, parent: parent, cancel: cancel, liveMode: liveMode, liveModel: liveModel, state: tool.DelegateStatusIdle}
+	s.loops[started.LoopID] = &loopHandle{id: started.LoopID, owner: s, bound: bound, bindings: bindings, backend: backend, parent: parent, cancel: cancel, liveMode: liveMode, liveModel: liveModel, state: tool.DelegateStatusIdle}
 	s.loopsMu.Unlock()
 	return nil
 }
@@ -453,8 +453,14 @@ func runRestoreFailureCleanup(timeout time.Duration, appendErrored func(context.
 type loopPlan struct {
 	started event.LoopStarted
 	bound   loop.BoundDefinition
-	events  []event.Event
-	folded  foldResult
+	// bindings is the EXACT tool.Bindings this loop was bound with. It is retained so a
+	// later external-toolset replacement builds its tools with the same capabilities (and
+	// the same WorkspaceObservations instance) the declared tools got — rebuilding a fresh
+	// binding would hand external tools a separate observation set and break TOCTOU
+	// tracking across the toolset.
+	bindings tool.Bindings
+	events   []event.Event
+	folded   foldResult
 }
 
 // discoverRoots scans the full UNNARROWED replay for every LoopStarted, collecting the
@@ -533,7 +539,8 @@ func planLoops(sessionCtx context.Context, sessionID uuid.UUID, topology Topolog
 			// invents a missing definition here).
 			return nil, loopPlan{}, &RestoreError{Kind: RestoreLoopFailed, Cause: &AgentNameMismatchError{Persisted: started.AgentName}}
 		}
-		bound, bindErr := definition.Bind(sessionCtx, tool.Bindings{SessionID: sessionID, LoopID: started.LoopID, SecurityLimit: securityLimitSource, Workspace: wsBind(), Delegate: manager.controllerFor(started.LoopID, definition), ExtraTools: delegateExtraTools(definition, manager)})
+		bindings := tool.Bindings{SessionID: sessionID, LoopID: started.LoopID, SecurityLimit: securityLimitSource, Workspace: wsBind(), Delegate: manager.controllerFor(started.LoopID, definition), ExtraTools: delegateExtraTools(definition, manager)}
+		bound, bindErr := definition.Bind(sessionCtx, bindings)
 		if bindErr != nil {
 			return nil, loopPlan{}, &RestoreError{Kind: RestoreLoopFailed, Cause: bindErr}
 		}
@@ -550,7 +557,7 @@ func planLoops(sessionCtx context.Context, sessionID uuid.UUID, topology Topolog
 		}
 		boundByLoop[started.LoopID] = bound
 		loopEvents := eventsFromRecords(allRecords, started.LoopID)
-		plans = append(plans, loopPlan{started: started, bound: bound, events: loopEvents})
+		plans = append(plans, loopPlan{started: started, bound: bound, bindings: bindings, events: loopEvents})
 		if started.LoopID == roots[topology.ActivePrimer].LoopID {
 			activeIndex = len(plans) - 1
 		}
@@ -585,7 +592,7 @@ func attachAndActivate(s *Session, all []event.Event, plans []loopPlan, rootLoop
 			continue
 		}
 		parent := loop.Provenance{LoopID: plan.started.Cause.Coordinates.LoopID, TurnID: plan.started.Cause.Coordinates.TurnID, StepID: plan.started.Cause.Coordinates.StepID}
-		if err := s.attachRestoredLoop(plan.started, parent, plan.bound, plan.folded, foldLoopInference(plan.events), findForeignSID(plan.events)); err != nil {
+		if err := s.attachRestoredLoop(plan.started, parent, plan.bound, plan.bindings, plan.folded, foldLoopInference(plan.events), findForeignSID(plan.events)); err != nil {
 			return err
 		}
 	}
