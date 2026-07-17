@@ -6,9 +6,11 @@ This design extracts the existing foreign-loop backend and its Claude and Codex
 drivers from `github.com/looprig/harness` into a dedicated optional module,
 `github.com/looprig/foreignloop`.
 
-This is deliberately a mechanical ownership change. It does not introduce ACP,
+This is a structural ownership change with one deliberate package-boundary
+refinement: the generic stream contract stops exposing Claude's transcript path
+and instead exposes provider-neutral committed history. It does not introduce ACP,
 redesign the loop engine selector, change event or journal formats, or alter
-foreign-loop behavior.
+foreign-loop runtime behavior.
 
 The extraction preserves runtime behavior but is not Go source-compatible for
 consumers of `harness/pkg/foreignloop`: concrete backend and driver imports move
@@ -120,6 +122,8 @@ backend ────────────────┘
    ├──▶ harness/pkg/loop and harness/pkg/event
    └──▶ looprig/core
 
+driver ──▶ looprig/core/content
+
 harness ──X──▶ github.com/looprig/foreignloop
 
 tests ──▶ harness
@@ -190,13 +194,20 @@ type History struct {
 
 type Stream interface {
 	Events() <-chan Event
-	History(sinceTurn uint64) (History, error)
+	History() (History, error)
 	Close() error
 }
 ```
 
 `History` is called after `Close`, preserving the current process-drain then
 transcript-read ordering.
+
+The current backend computes `int(cur)-1` and passes it to
+`decodeTranscriptTail`, but that decoder explicitly ignores the value and reads
+the complete transcript. The new public contract therefore does not expose an
+unused `sinceTurn` parameter. `History()` reads the complete authoritative history
+in the first release. True tail reads require a later behavioral design and a new
+contract justified by an actual consumer.
 
 - Claude owns transcript-path derivation and JSONL decoding in `driver/claude`.
   It returns `Available: true` with the decoded authoritative steps. A read or
@@ -212,6 +223,26 @@ transcript-read ordering.
 
 No provider path, transcript wire type, or transcript decoder is exposed through
 `driver` or retained in `backend`.
+
+`History.Steps` maps directly to today's decoder result:
+`decodeTranscriptTail` returns `[]content.AgenticMessages`, and `commitTurn`
+publishes one `StepDone` per element before appending every element to the committed
+snapshot. The move changes the owner of decoding, not the decoded value shape,
+grouping, ordering, fallback, or published event bodies.
+
+Before moving the decoder, its existing transcript fixtures are used to commit
+golden expectations for:
+
+- the exact grouped `[]content.AgenticMessages` value;
+- the ordered `StepDone.Messages` bodies produced from those groups;
+- the final flattened committed snapshot; and
+- malformed-line, sidechain, missing-file, and empty-history behavior.
+
+The new `driver/claude` tests consume the same input bytes and must match those
+goldens exactly. During the migration overlap, a parity test runs the old decoder
+and the new driver implementation over the same fixtures and compares the complete
+Go values and canonical event JSON. The old decoder is removed only after parity
+passes. Transcript input bytes are never rewritten by the extraction.
 
 ## Backend package
 
@@ -253,8 +284,30 @@ the executable path and copied environment, do not move into `backend.Config`.
 Removing them is a source-level cleanup only and must not change child-process
 configuration.
 
-The existing `BuildWith` and `BuildRestoredWith` composition pattern remains,
-returning `foreign.Builder` and `foreign.RestoredBuilder` respectively.
+The consumer-facing backend API is explicit:
+
+```go
+type Config struct {
+	Agent   driver.Agent
+	Cwd     string
+	Posture driver.PermissionPosture
+	SIDMode SIDMode
+}
+
+func BuildWith(cfg Config) foreign.Builder
+func BuildRestoredWith(cfg Config) foreign.RestoredBuilder
+```
+
+The composition pattern remains, but `BuildWith` and `BuildRestoredWith` now take
+`backend.Config` instead of the old `foreignloop.Spec`. This is the exact product
+migration boundary. Validation remains eager and typed at agent/config resolution
+where possible, while builder invocation revalidates required runtime wiring
+fail-closed as it does today.
+
+The current root `export.go` exists only to expose the package-private Claude
+stream decoder to the nested Claude package. It does not move. Once decoding lives
+inside `driver/claude`, that package calls its own unexported decoder directly and
+`DecodeStream` is removed without a public replacement.
 
 ### Error ownership
 
@@ -299,9 +352,22 @@ A dependency-guard test must fail if:
 
 ## Repository quality and security gates
 
-The new repository copies the applicable Harness development policy into its own
-`CLAUDE.md`, with `AGENTS.md` pointing to it. In particular, external dependencies
-still require explicit approval and all external process and wire inputs are
+The new repository writes a focused `CLAUDE.md` from the applicable Harness
+principles, with `AGENTS.md` pointing to it. This is not a wholesale copy. It keeps
+the interface, dependency-inversion, validation, least-privilege, process, path,
+context-bound, testing, vendoring, and secure-build rules relevant to foreignloop.
+Harness-only ACI, TEE, storage, provider, and unrelated approved-dependency entries
+are omitted.
+
+The initial approved dependency list names only what this module actually uses:
+
+- `github.com/looprig/core` for content and UUID values;
+- `github.com/looprig/harness` for the public foreign, loop, command, event, and
+  identity contracts; and
+- `gosec`, `govulncheck`, and `staticcheck` as development tools.
+
+Any later runtime dependency still requires explicit approval in the foreignloop
+repository. All child-process, transcript, environment, path, and wire inputs are
 treated as untrusted.
 
 The module `go.mod` declares the same toolchain-managed development tools used by
@@ -356,6 +422,9 @@ Tests move with the behavior they verify:
   bounded contexts.
 - Stream and transcript parsers retain fuzz targets with malformed, truncated,
   oversized, and unknown-message inputs.
+- Claude transcript tests retain the pre-move golden value/event snapshots and
+  prove `driver.Stream.History()` is exactly equivalent to the prior decoder and
+  commit projection.
 - Harness session-runtime tests that verify builder selection, missing-builder
   failures, journal folding, and restore seed construction remain in Harness and
   use seam fakes rather than importing the external backend.
@@ -432,8 +501,14 @@ Harness never waits on or imports the foreignloop release.
 - The new package graph matches the dependency direction above.
 - `driver/claude` owns Claude transcript decoding; backend contains no provider-
   specific transcript path or wire decoder.
+- `History()` returns the same grouped messages, `StepDone` bodies, fallback
+  behavior, and committed snapshot as the pre-extraction decoder/commit path on
+  the shared golden corpus.
 - Driver packages do not import backend, Harness event, or Harness session
   packages.
+- `BuildWith(backend.Config)` and `BuildRestoredWith(backend.Config)` are the
+  documented consumer migration surface; the old `Spec` and `DecodeStream` export
+  do not survive accidentally.
 - Native and foreign backends use the same public managed-input capacity constant.
 - Claude and Codex behavior, event sequences, transcripts, locks, cancellation,
   and restore behavior remain compatible with the pre-extraction implementation.
