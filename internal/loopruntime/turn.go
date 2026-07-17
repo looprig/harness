@@ -285,6 +285,18 @@ func runTurn(ctx context.Context, cfg turnConfig, ts turnState) event.Event {
 		// runStep owns the LLM cycle: stream → exactly one AIMessage into st.msgs[0].
 		res := runStepWithAdmission(ctx, stepConfig{req: req, client: cfg.client, emit: cfg.emit}, ts.index, st, releaseAdmission)
 		if res.terminal != nil {
+			// A clean native stream with no semantic blocks is still an output-stage
+			// result: finish metadata takes precedence (length/filter/tool_use), while
+			// stop/unknown are classified by the shared extractor as empty structured
+			// output. Legacy turns retain their historical EmptyResponseError.
+			if outputPlan.strategy == outputStrategyNative && res.streamResult != nil {
+				empty := res.state.blocks.AIMessage()
+				empty.Usage = cloneUsage(res.streamResult.Usage)
+				_, _, outputErr := validateNativeStep(empty, res.state.blocks.ToolUses(), res.streamResult)
+				if outputErr != nil {
+					return event.TurnFailed{TurnIndex: ts.index, Err: outputErr}
+				}
+			}
 			// The in-flight step never completed: discard it (it was never added to
 			// ts.msgs and never committed) and return the terminal. Committed steps
 			// stay in loopState.msgs.
@@ -292,14 +304,31 @@ func runTurn(ctx context.Context, cfg turnConfig, ts turnState) event.Event {
 		}
 		st = res.state
 		aiMsg := st.msgs[0].(*content.AIMessage)
+
+		// Raw executable tool-use view (unsanitized Input) for this step. Native
+		// structured output validates finish metadata and the final representation
+		// here, before usage accounting, staged-message append, tool execution,
+		// StepDone commit, candidate measurement, or TurnDone publication. This is
+		// the current-step atomicity boundary: a rejected final leaves prior commits
+		// intact but makes the staged invalid step wholly unobservable.
+		toolUses := st.blocks.ToolUses()
+		if outputPlan.strategy == outputStrategyNative {
+			canonical, final, outputErr := validateNativeStep(aiMsg, toolUses, res.streamResult)
+			if outputErr != nil {
+				return event.TurnFailed{TurnIndex: ts.index, Err: outputErr}
+			}
+			if final {
+				aiMsg = canonical
+				st.msgs[0] = canonical
+				toolUses = nil
+			}
+		}
+
 		turnUsage, usageErr := addTurnUsage(ts.usage, aiMsg.Usage)
 		if usageErr != nil {
 			return event.TurnFailed{TurnIndex: ts.index, Err: usageErr}
 		}
 		ts.usage = turnUsage
-
-		// Raw executable tool-use view (unsanitized Input) for this step.
-		toolUses := st.blocks.ToolUses()
 
 		// Text-only completion ALWAYS wins, regardless of iteration count: the runaway
 		// cap is only checked when the model wants ANOTHER tool batch. The step's group

@@ -3,8 +3,10 @@ package loopruntime
 import (
 	"unicode/utf8"
 
+	"github.com/looprig/core/content"
 	"github.com/looprig/inference"
 	model "github.com/looprig/inference/model"
+	stream "github.com/looprig/inference/stream"
 )
 
 type outputStrategy uint8
@@ -113,4 +115,50 @@ func cloneInferenceTools(tools []inference.Tool) []inference.Tool {
 		clone[i].Schema = append([]byte(nil), tools[i].Schema...)
 	}
 	return clone
+}
+
+// validateNativeStep applies the native-output finish contract before the turn
+// actor observes any part of the current step. A complete ordinary tool batch
+// is a continuation; a no-tool response must be a valid text representation and
+// is canonicalized to one compact JSON TextBlock. Reserved terminal-tool frames
+// belong only to the fallback strategy and fail closed here.
+func validateNativeStep(
+	message *content.AIMessage,
+	calls []content.ToolUseBlock,
+	result *stream.StreamResult,
+) (*content.AIMessage, bool, error) {
+	if result == nil {
+		return nil, false, &inference.StructuredOutputFinishError{Reason: inference.StructuredOutputFinishReasonOther}
+	}
+
+	response := &inference.Response{Message: message, FinishReason: result.FinishReason}
+	if len(calls) > 0 {
+		if result.FinishReason != stream.FinishReasonToolUse {
+			_, err := inference.StructuredResult(response)
+			if err != nil {
+				return nil, false, err
+			}
+			return nil, false, &inference.StructuredOutputFinishError{Reason: inference.StructuredOutputFinishReasonOther}
+		}
+		for _, call := range calls {
+			if call.Name == inference.StructuredOutputToolName {
+				return nil, false, &inference.StructuredOutputConflictError{Feature: "native_terminal_tool"}
+			}
+			if !validToolCall(call) {
+				return nil, false, &inference.StructuredOutputConflictError{Feature: "incomplete_tool_call"}
+			}
+		}
+		return nil, false, nil
+	}
+
+	raw, err := inference.StructuredResult(response)
+	if err != nil {
+		return nil, false, err
+	}
+	canonical := &content.AIMessage{Message: content.Message{
+		Role:   content.RoleAssistant,
+		Blocks: []content.Block{&content.TextBlock{Text: string(raw)}},
+	}}
+	canonical.Usage = cloneUsage(message.Usage)
+	return canonical, true, nil
 }

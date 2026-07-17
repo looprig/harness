@@ -12,6 +12,7 @@ import (
 	"github.com/looprig/harness/pkg/tool"
 	"github.com/looprig/inference"
 	model "github.com/looprig/inference/model"
+	stream "github.com/looprig/inference/stream"
 )
 
 func testLoopOutput() inference.OutputSchema {
@@ -140,6 +141,10 @@ func TestRunTurnOutputStrategyIsStableAcrossContinuation(t *testing.T) {
 		scripts: [][]content.Chunk{
 			{toolUseChunk(0, "call-1", "Echo", `{}`)},
 			{textChunk(`{"answer":"done"}`)},
+		},
+		results: []*stream.StreamResult{
+			{FinishReason: stream.FinishReasonToolUse},
+			{FinishReason: stream.FinishReasonStop},
 		},
 	}
 	cfg, state, _ := newTurnFixture(nil, nil, ToolSet{
