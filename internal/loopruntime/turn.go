@@ -94,6 +94,7 @@ type turnConfig struct {
 	model   model.Model
 	system  string
 	tools   ToolSet
+	output  *inference.OutputSchema
 	client  inference.Client
 	gateReg chan<- gateRegistration
 	idGen   idGenerator
@@ -220,6 +221,10 @@ func runTurn(ctx context.Context, cfg turnConfig, ts turnState) event.Event {
 	}
 	identity := turnIdentity{sessionID: ts.sessionID, loopID: ts.loopID, turnID: ts.id}
 	defs := toolDefs(ctx, cfg.tools.Registry)
+	outputPlan, err := resolveTurnOutput(cfg.model, cfg.output, defs)
+	if err != nil {
+		return event.TurnFailed{TurnIndex: ts.index, Err: err}
+	}
 
 	// Consult the runtime-context provider ONCE per turn, here on the turn goroutine
 	// (never the actor — the provider may run git, which must not stall the serialized
@@ -240,7 +245,7 @@ func runTurn(ctx context.Context, cfg turnConfig, ts turnState) event.Event {
 		// model sees fresh date/cwd/git at the very end of the input every step. The
 		// tail is transient: it is part of the REQUEST only, never of ts.msgs/base, so
 		// committed history never grows with it and the cached System prompt is untouched.
-		req := turnInferenceRequest(cfg, ts, runtimeTail, defs)
+		req := turnInferenceRequest(cfg, ts, runtimeTail, outputPlan)
 		if candidateMeasured {
 			candidateMeasured = false
 		} else {
@@ -251,7 +256,7 @@ func runTurn(ctx context.Context, cfg turnConfig, ts turnState) event.Event {
 				if cfg.afterContextReplacement != nil {
 					cfg.afterContextReplacement()
 				}
-				req = turnInferenceRequest(cfg, ts, runtimeTail, defs)
+				req = turnInferenceRequest(cfg, ts, runtimeTail, outputPlan)
 			}
 		}
 
@@ -306,7 +311,7 @@ func runTurn(ctx context.Context, cfg turnConfig, ts turnState) event.Event {
 				// actor committed/emitted this final step: treat as interrupt.
 				return event.TurnInterrupted{TurnIndex: ts.index}
 			}
-			candidate := turnInferenceRequest(cfg, ts, runtimeTail, defs)
+			candidate := turnInferenceRequest(cfg, ts, runtimeTail, outputPlan)
 			if _, measureErr := measureTurnCandidate(ctx, cfg, candidate, runtimeRevision, runtimeTail, false); measureErr != nil {
 				return measureTurnFailure(ctx, ts.index, measureErr)
 			}
@@ -366,7 +371,7 @@ func runTurn(ctx context.Context, cfg turnConfig, ts turnState) event.Event {
 			// already committed stay in loopState.msgs.
 			return event.TurnInterrupted{TurnIndex: ts.index}
 		}
-		candidate := turnInferenceRequest(cfg, ts, runtimeTail, defs)
+		candidate := turnInferenceRequest(cfg, ts, runtimeTail, outputPlan)
 		directive, measureErr := measureTurnCandidate(ctx, cfg, candidate, runtimeRevision, runtimeTail, true)
 		if measureErr != nil {
 			return measureTurnFailure(ctx, ts.index, measureErr)
@@ -398,11 +403,11 @@ func runTurn(ctx context.Context, cfg turnConfig, ts turnState) event.Event {
 	}
 }
 
-func turnInferenceRequest(cfg turnConfig, state turnState, runtimeTail *content.UserMessage, definitions []inference.Tool) inference.Request {
-	return inference.Request{
+func turnInferenceRequest(cfg turnConfig, state turnState, runtimeTail *content.UserMessage, output turnOutputPlan) inference.Request {
+	return output.apply(inference.Request{
 		Model: cfg.model, System: cfg.system,
-		Messages: requestMessages(cfg.base, state.msgs, runtimeTail), Tools: definitions,
-	}
+		Messages: requestMessages(cfg.base, state.msgs, runtimeTail),
+	})
 }
 
 func measureTurnCandidate(
