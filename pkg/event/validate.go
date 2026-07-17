@@ -64,6 +64,9 @@ const (
 	FieldSummary          FieldName = "Summary"
 	FieldPostContext      FieldName = "PostContext"
 	FieldCommittedEventID FieldName = "CommittedEventID"
+	FieldSource           FieldName = "Source"
+	FieldGeneration       FieldName = "Generation"
+	FieldTools            FieldName = "Tools"
 	// FieldType names the whole event (not one coordinate) on the fail-secure
 	// unknown-type path, paired with RuleUnknownType.
 	FieldType FieldName = "Type"
@@ -158,6 +161,8 @@ func validateEventBody(ev Event) error {
 		return validateModelRuntime("LoopInferenceChanged", e.Runtime)
 	case LoopModeChanged:
 		return validateModelRuntime("LoopModeChanged", e.Runtime)
+	case LoopExternalToolsetChanged:
+		return validateExternalToolset(e)
 	case LoopStarted:
 		return validateModelRuntime("LoopStarted", e.Runtime)
 	case ContextMeasured:
@@ -295,6 +300,73 @@ func validateStepDoneMessages(messages content.AgenticMessages) error {
 		if !toolResultOK || toolResult == nil || toolResult.Role != content.RoleTool {
 			return &InvalidEventError{Event: "StepDone", Field: FieldMessages, Rule: RuleInvalid}
 		}
+	}
+	return nil
+}
+
+// Bounds for LoopExternalToolsetChanged. External toolsets are third-party supplied,
+// so every string that reaches the journal is length-capped and the tool list is
+// count-capped: a hostile or buggy MCP server must not be able to append an unbounded
+// record to the durable log.
+const (
+	maxExternalSourceLen     = 64
+	maxExternalGenerationLen = 128
+	maxExternalToolNameLen   = 128
+	maxExternalTools         = 512
+	schemaDigestHexLen       = 64 // hex SHA-256
+)
+
+// isLowerHex reports whether s is exactly n lowercase-hex characters. The digest is
+// produced by SchemaDigest, so anything else means a hand-built or tampered record.
+func isLowerHex(s string, n int) bool {
+	if len(s) != n {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+// validateExternalToolset enforces the durable shape of LoopExternalToolsetChanged:
+// a non-empty bounded Source and Generation, a bounded tool list, and per-tool a
+// non-empty bounded Name plus a well-formed hex SHA-256 digest. Duplicate tool names
+// are rejected — the slot's whole purpose is a collision-free registry, so a record
+// claiming two identically named tools describes a state the runtime never installs.
+// An EMPTY Tools list is valid and meaningful: it durably records a slot cleared to
+// nothing.
+func validateExternalToolset(e LoopExternalToolsetChanged) error {
+	const name EventName = "LoopExternalToolsetChanged"
+	if e.Source == "" {
+		return &InvalidEventError{Event: name, Field: FieldSource, Rule: RuleRequired}
+	}
+	if len(e.Source) > maxExternalSourceLen {
+		return &InvalidEventError{Event: name, Field: FieldSource, Rule: RuleInvalid}
+	}
+	if e.Generation == "" {
+		return &InvalidEventError{Event: name, Field: FieldGeneration, Rule: RuleRequired}
+	}
+	if len(e.Generation) > maxExternalGenerationLen {
+		return &InvalidEventError{Event: name, Field: FieldGeneration, Rule: RuleInvalid}
+	}
+	if len(e.Tools) > maxExternalTools {
+		return &InvalidEventError{Event: name, Field: FieldTools, Rule: RuleInvalid}
+	}
+	seen := make(map[string]struct{}, len(e.Tools))
+	for _, t := range e.Tools {
+		if t.Name == "" || len(t.Name) > maxExternalToolNameLen {
+			return &InvalidEventError{Event: name, Field: FieldTools, Rule: RuleInvalid}
+		}
+		if !isLowerHex(t.SchemaDigest, schemaDigestHexLen) {
+			return &InvalidEventError{Event: name, Field: FieldTools, Rule: RuleInvalid}
+		}
+		if _, dup := seen[t.Name]; dup {
+			return &InvalidEventError{Event: name, Field: FieldTools, Rule: RuleInvalid}
+		}
+		seen[t.Name] = struct{}{}
 	}
 	return nil
 }
@@ -441,6 +513,8 @@ func classify(ev Event) (name string, profile idProfile, ok bool) {
 		return "LoopInferenceChanged", loopProfile(), true
 	case LoopModeChanged:
 		return "LoopModeChanged", loopProfile(), true
+	case LoopExternalToolsetChanged:
+		return "LoopExternalToolsetChanged", loopProfile(), true
 	case ContextMeasured:
 		return "ContextMeasured", loopProfile(), true
 	case ContextPressure:

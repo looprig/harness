@@ -40,6 +40,7 @@ var (
 	_ Event = DelegateRequestAccepted{}
 	_ Event = LoopInferenceChanged{}
 	_ Event = LoopModeChanged{}
+	_ Event = LoopExternalToolsetChanged{}
 	_ Event = ForeignSessionBound{}
 	_ Event = CompactionStarted{}
 	_ Event = CompactionCommitted{}

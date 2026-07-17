@@ -33,6 +33,36 @@ type LoopModeChanged struct {
 	Runtime      ModelRuntime `json:"runtime,omitzero"`
 }
 
+// ExternalToolIdentity is the durable, secret-free identity of ONE external tool
+// installed into a loop's external slot. Name is the model-facing tool name;
+// SchemaDigest is the hex SHA-256 of the tool's compacted argument JSON Schema.
+// The schema itself is deliberately NOT recorded: an external schema is attacker-
+// or third-party-supplied and may carry descriptions, defaults, or examples that
+// embed secrets, so only its digest crosses into the journal.
+type ExternalToolIdentity struct {
+	Name         string `json:"name"`
+	SchemaDigest string `json:"schema_digest"`
+}
+
+// LoopExternalToolsetChanged durably records that a loop's external tool slot for
+// one Source was REPLACED, effective at the loop's next turn boundary. It records
+// identity only (Source + Generation + per-tool name/schema digest) — never the
+// tool factories and never the schemas themselves.
+//
+// It is deliberately NOT a restore input: external tools are live resources (an MCP
+// connection cannot be rebuilt from journal bytes), so a restored loop comes up with
+// an EMPTY external slot and the composing application re-installs. The event exists
+// for audit, drift detection, and catalog projection — replay folds it for its
+// runtime identity only, never to reconstruct tools.
+type LoopExternalToolsetChanged struct {
+	enduring
+	loopScoped
+	Header
+	Source     string                 `json:"source"`
+	Generation string                 `json:"generation"`
+	Tools      []ExternalToolIdentity `json:"tools,omitempty"`
+}
+
 // TurnStarted is emitted when runLoop commits a turn's initial UserMessage. It is
 // the first enduring turn event. Header.Cause.CommandID is the submit command id.
 // Message is the exact UserMessage committed as the first message of the turn.
@@ -191,6 +221,8 @@ func (TurnFailed) isEvent()           {}
 func (TurnInterrupted) isEvent()      {}
 func (LoopInferenceChanged) isEvent() {}
 func (LoopModeChanged) isEvent()      {}
+
+func (LoopExternalToolsetChanged) isEvent() {}
 
 // isReply marks the command-outcome events. Together with InputQueued/TurnRejected
 // (declared above) these are exactly the five Reply events: a command issuer

@@ -194,6 +194,11 @@ func TestEventBodyJSONKeysAreStableSnakeCase(t *testing.T) {
 			wantKeys: []string{"previous_mode", "mode", "runtime"},
 		},
 		{
+			name:     "LoopExternalToolsetChanged carries source, generation and tool identities",
+			event:    LoopExternalToolsetChanged{Header: hdr, Source: "mcp", Generation: "gen-1", Tools: []ExternalToolIdentity{{Name: "search", SchemaDigest: sampleDigest()}}},
+			wantKeys: []string{"source", "generation", "tools"},
+		},
+		{
 			name:     "WorkspaceCheckpointed carries snapshot metadata",
 			event:    WorkspaceCheckpointed{Header: hdr, Ref: "v1:sha256:x", Consistency: SnapshotQuiescent, Trigger: SnapshotTriggerStepDone},
 			wantKeys: []string{"ref", "consistency", "trigger"},
@@ -430,6 +435,8 @@ func TestMarshalEventRoundTripEnduring(t *testing.T) {
 		{"DelegateRequestAccepted", DelegateRequestAccepted{Header: eventHeaderWithCommand(fullHeaderLoop(), seededUUID(0x66))}},
 		{"LoopInferenceChanged", LoopInferenceChanged{Header: fullHeaderLoop(), Runtime: sampleRuntime()}},
 		{"LoopModeChanged", LoopModeChanged{Header: fullHeaderLoop(), PreviousMode: "plan", Mode: "build", Runtime: sampleRuntime()}},
+		{"LoopExternalToolsetChanged", LoopExternalToolsetChanged{Header: fullHeaderLoop(), Source: "mcp", Generation: "gen-1", Tools: []ExternalToolIdentity{{Name: "search", SchemaDigest: sampleDigest()}, {Name: "fetch", SchemaDigest: sampleDigest()}}}},
+		{"LoopExternalToolsetChanged with an EMPTY toolset (a cleared slot)", LoopExternalToolsetChanged{Header: fullHeaderLoop(), Source: "mcp", Generation: "gen-2"}},
 		{"ForeignSessionBound", ForeignSessionBound{Header: fullHeaderLoop(), ForeignSID: "sid"}},
 		{"TurnStarted", TurnStarted{Header: fullHeaderTurn(), TurnIndex: 7, Message: userMsg("hi")}},
 		{"StepDone", StepDone{Header: fullHeader(), Messages: sampleMessages()}},
@@ -708,7 +715,7 @@ func TestMarshalEventPermissionRequestedFullRequest(t *testing.T) {
 // without codec coverage changes the live count derived from classify+Class() and
 // fails TestMarshalEventCoversEveryEnduringType. A missed Enduring type is an
 // unpersistable event = silent restore data loss, which this guard forbids.
-const wantEnduringTypes = 35
+const wantEnduringTypes = 36
 
 // unionInstances is one instance of EVERY type in the sealed union (Enduring and
 // Ephemeral alike), mirroring TestClassifyExhaustive. The drift guard partitions
@@ -722,7 +729,8 @@ func unionInstances() []Event {
 		HustleFailed{Header: exhaustiveHustleHeader(), Run: exhaustiveHustleRun(sampleRuntime()), Stage: hustle.StageInference, ReasonCode: hustle.ReasonInference},
 		RestoreStarted{}, RestoreDone{}, RestoreErrored{}, WorkspaceCheckpointed{}, WorkspaceRestored{}, ActiveLoopChanged{},
 		SecurityLimitChanged{},
-		LoopIdle{}, LoopStarted{}, DelegateRequestAccepted{}, LoopInferenceChanged{}, LoopModeChanged{}, ForeignSessionBound{},
+		LoopIdle{}, LoopStarted{}, DelegateRequestAccepted{}, LoopInferenceChanged{}, LoopModeChanged{},
+		LoopExternalToolsetChanged{}, ForeignSessionBound{},
 		CompactionStarted{}, CompactionCommitted{}, CompactionRejected{}, CompactWaiterResolved{}, CompactWaiterRejected{},
 		TokenDelta{}, TurnStarted{}, StepDone{}, TurnFoldedInto{}, InputCancelled{},
 		InputQueued{}, TurnRejected{}, TurnDone{}, TurnFailed{}, TurnInterrupted{},
@@ -856,6 +864,7 @@ func FuzzDecodeEvent(f *testing.F) {
 		ActiveLoopChanged{Header: fullHeaderSession(), ActiveLoopID: seededUUID(0x76)},
 		LoopInferenceChanged{Header: fullHeaderLoop(), Runtime: sampleRuntime()},
 		LoopModeChanged{Header: fullHeaderLoop(), PreviousMode: "plan", Mode: "build", Runtime: sampleRuntime()},
+		LoopExternalToolsetChanged{Header: fullHeaderLoop(), Source: "mcp", Generation: "gen-1", Tools: []ExternalToolIdentity{{Name: "search", SchemaDigest: sampleDigest()}}},
 		WorkspaceCheckpointed{Header: checkpointHeader(), Ref: "v1:sha256:x", Consistency: SnapshotFuzzy, Trigger: SnapshotTriggerManual},
 		WorkspaceRestored{Header: fullHeaderSession(), Ref: "v1:sha256:x"},
 		TurnStarted{Header: fullHeaderTurn(), TurnIndex: 1, Message: userMsg("hi")},
@@ -964,4 +973,9 @@ func loopHeaderWithAgent(name identity.AgentName) Header {
 	h := fullHeaderLoop()
 	h.AgentName = name
 	return h
+}
+
+// sampleDigest is a well-formed hex SHA-256, the only digest shape the validator accepts.
+func sampleDigest() string {
+	return "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 }
